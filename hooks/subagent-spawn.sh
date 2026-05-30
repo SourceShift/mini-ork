@@ -25,7 +25,7 @@
 set -uo pipefail
 
 MINI_ORK_ROOT="${MINI_ORK_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
-DB="${MINI_ORK_DB:-${AGENTFLOW_DB:-${AGENTFLOW_DIR:-${MINI_ORK_HOME:-.mini-ork}}/state.db}}"
+DB="${MINI_ORK_DB:-${MINI_ORK_HOME:-.mini-ork}/state.db}"
 
 payload=""
 if [ ! -t 0 ]; then
@@ -39,10 +39,9 @@ emit_continue() {
 [ -f "$DB" ] || { emit_continue; exit 0; }
 
 # Resolve the linkage. Prefer mini-ork-injected env vars; fall back to
-# legacy AGENTFLOW_* vars and CLAUDE_SESSION_ID.
-parent_run_id="${MINI_ORK_RUN_ID:-${AGENTFLOW_RUN_ID:-}}"
-parent_dispatch_id="${MINI_ORK_DISPATCH_ID:-${AGENTFLOW_DISPATCH_ID:-}}"
-parent_session="${MINI_ORK_PARENT_CLAUDE_SESSION:-${AGENTFLOW_PARENT_CLAUDE_SESSION:-${CLAUDE_SESSION_ID:-}}}"
+parent_run_id="${MINI_ORK_RUN_ID:-}"
+parent_dispatch_id="${MINI_ORK_DISPATCH_ID:-}"
+parent_session="${MINI_ORK_PARENT_CLAUDE_SESSION:-${CLAUDE_SESSION_ID:-}}"
 
 if [ -z "$parent_session" ]; then
   emit_continue

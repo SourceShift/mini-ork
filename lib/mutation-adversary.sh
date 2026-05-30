@@ -22,7 +22,7 @@ mo_run_mutation_adversary() {
   local mutations_json="$iter_dir/mutations.json"
   mkdir -p "$iter_dir"
 
-  local _db="${MINI_ORK_DB:-$AGENTFLOW_DIR/state.db}"
+  local _db="${MINI_ORK_DB:-$MINI_ORK_HOME/state.db}"
   local kickoff_rel
   kickoff_rel=$(sqlite3 "$_db" \
     "SELECT kickoff_path FROM epics WHERE id='$epic';" 2>/dev/null)

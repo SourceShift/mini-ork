@@ -11,12 +11,12 @@ set -uo pipefail
 
 MINI_ORK_ROOT="${MINI_ORK_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 
-# Caller exports: AGENTFLOW_DIR, MINI_ORK_DIR, JOB_ID, REPO_ROOT
+# Caller exports: MINI_ORK_HOME, JOB_ID, REPO_ROOT
 
 # ─── Schema bootstrap (idempotent) ──────────────────────────────────────
 # Called once on first source. Creates the table if missing.
 mo_cache_init_schema() {
-  local _db="${MINI_ORK_DB:-$AGENTFLOW_DIR/state.db}"
+  local _db="${MINI_ORK_DB:-${MINI_ORK_HOME:-.mini-ork}/state.db}"
   sqlite3 "$_db" <<'SQL'
 CREATE TABLE IF NOT EXISTS mini_orch_sessions (
   uuid           TEXT PRIMARY KEY,
@@ -97,7 +97,7 @@ mo_cache_hash_bundle() {
 #   if [ -n "$hit_path" ]; then ...
 mo_cache_lookup() {
   local stage="$1" epic="$2" iter="$3" input_hash="$4"
-  local _db="${MINI_ORK_DB:-$AGENTFLOW_DIR/state.db}"
+  local _db="${MINI_ORK_DB:-${MINI_ORK_HOME:-.mini-ork}/state.db}"
   sqlite3 "$_db" "
     SELECT output_path FROM mini_orch_sessions
     WHERE epic_id = '$epic'
@@ -114,7 +114,7 @@ mo_cache_lookup() {
 # Bump reused_count on the row that just served the hit.
 mo_cache_record_hit() {
   local stage="$1" epic="$2" iter="$3" input_hash="$4"
-  local _db="${MINI_ORK_DB:-$AGENTFLOW_DIR/state.db}"
+  local _db="${MINI_ORK_DB:-${MINI_ORK_HOME:-.mini-ork}/state.db}"
   sqlite3 "$_db" "
     UPDATE mini_orch_sessions
        SET reused_count = reused_count + 1,
@@ -148,7 +148,7 @@ import datetime as d
 print((d.datetime.utcnow() + d.timedelta(days=30)).strftime('%Y-%m-%dT%H:%M:%fZ'))
 " 2>/dev/null || date -u -v+30d +"%Y-%m-%dT%H:%M:%fZ" 2>/dev/null || echo "2099-01-01T00:00:00.000Z")
 
-  local _db="${MINI_ORK_DB:-$AGENTFLOW_DIR/state.db}"
+  local _db="${MINI_ORK_DB:-${MINI_ORK_HOME:-.mini-ork}/state.db}"
   sqlite3 "$_db" "
     INSERT INTO mini_orch_sessions
       (uuid, job_id, epic_id, iter, stage, input_hash, status,
@@ -179,7 +179,7 @@ mo_cache_costline_from_log() {
 # ─── GC ─────────────────────────────────────────────────────────────────
 # Best-effort cleanup. Called at start of dispatch; cheap (indexed).
 mo_cache_gc() {
-  local _db="${MINI_ORK_DB:-$AGENTFLOW_DIR/state.db}"
+  local _db="${MINI_ORK_DB:-${MINI_ORK_HOME:-.mini-ork}/state.db}"
   sqlite3 "$_db" "
     DELETE FROM mini_orch_sessions
     WHERE expires_at <= strftime('%Y-%m-%dT%H:%M:%fZ','now');
@@ -189,7 +189,7 @@ mo_cache_gc() {
 # ─── Stats line for COMPLETION_REPORT.md ────────────────────────────────
 mo_cache_run_summary() {
   local job="$1"
-  local _db="${MINI_ORK_DB:-$AGENTFLOW_DIR/state.db}"
+  local _db="${MINI_ORK_DB:-${MINI_ORK_HOME:-.mini-ork}/state.db}"
   sqlite3 "$_db" -column -header "
     SELECT
       stage,

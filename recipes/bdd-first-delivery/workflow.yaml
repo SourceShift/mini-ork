@@ -1,0 +1,110 @@
+version: "0.1.0"
+task_class: bdd_first_delivery
+description: "BDD-first multi-epic delivery: decompose → parallel (spec_author + implementer) → bdd_runner → reviewer → publisher"
+
+nodes:
+  - name: decomposer
+    type: planner
+    model_lane: planner
+    prompt_ref: prompts/decomposer.md
+    dispatch_mode: serial
+
+  - name: spec_author
+    type: planner
+    model_lane: spec_author
+    prompt_ref: prompts/spec_author.md
+    dispatch_mode: partitioned
+    partition_key: sub_epic_id
+
+  - name: implementer
+    type: implementer
+    model_lane: worker
+    prompt_ref: prompts/implementer.md
+    dispatch_mode: partitioned
+    partition_key: sub_epic_id
+    gates:
+      - scope_gate
+      - budget_gate
+
+  - name: bdd_runner
+    type: verifier
+    verifier_ref: verifiers/playwright_runner.sh
+    dispatch_mode: partitioned
+    partition_key: sub_epic_id
+
+  - name: spec_reviewer
+    type: reviewer
+    model_lane: spec_reviewer
+    prompt_ref: prompts/spec_reviewer.md
+    dispatch_mode: partitioned
+    partition_key: sub_epic_id
+
+  - name: reviewer
+    type: reviewer
+    model_lane: reviewer
+    prompt_ref: prompts/reviewer.md
+    dispatch_mode: serial
+
+  - name: self_correction
+    type: implementer
+    model_lane: worker
+    prompt_ref: prompts/self_correction.md
+    dispatch_mode: serial
+
+  - name: publisher
+    type: publisher
+    dispatch_mode: serial
+    gates:
+      - deployment_gate
+
+  - name: rollback
+    type: rollback
+    dispatch_mode: serial
+
+edges:
+  - from: decomposer
+    to: spec_author
+    edge_type: depends_on
+
+  - from: decomposer
+    to: implementer
+    edge_type: depends_on
+
+  - from: spec_author
+    to: spec_reviewer
+    edge_type: verifies
+
+  - from: implementer
+    to: bdd_runner
+    edge_type: verifies
+
+  - from: bdd_runner
+    to: reviewer
+    edge_type: depends_on
+
+  - from: spec_reviewer
+    to: reviewer
+    edge_type: depends_on
+
+  - from: reviewer
+    to: self_correction
+    edge_type: retries
+
+  - from: self_correction
+    to: bdd_runner
+    edge_type: depends_on
+
+  - from: reviewer
+    to: publisher
+    edge_type: depends_on
+
+  - from: bdd_runner
+    to: rollback
+    edge_type: escalates_to
+
+  - from: reviewer
+    to: rollback
+    edge_type: escalates_to
+
+max_self_correction_iterations: 3
+rollback_strategy: revert_branch

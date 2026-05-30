@@ -1,0 +1,14 @@
+task_class: code_fix
+expected_artifact: patch
+
+success_verifiers:
+  - verifiers/typecheck.sh
+  - verifiers/test.sh
+
+failure_policy: request_changes
+
+rollback_policy: >
+  git checkout HEAD -- <changed-files>
+  if reviewer rejects after 3 iterations.
+  Triggered automatically by the rollback node when
+  reviewer verdict=ESCALATE or iteration cap reached.
