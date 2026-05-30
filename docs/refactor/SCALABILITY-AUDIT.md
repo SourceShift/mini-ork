@@ -88,6 +88,8 @@ single server. Each is bounded effort (≤2 weeks total).
 | **D-008b** | Planner LLM emits `decomposition[].node_type=""` (empty string) → `.get('node_type', 'implementer')` fallback skipped because key exists → all 7 nodes log `[warn] unknown node_type=` and skip silently | dogfood-run | Strengthen planner prompt to REQUIRE explicit node_type per step + post-process validation that rejects plan if any decomposition entry has empty node_type | 1 h |
 | **D-009** | `task_runs.cost_usd` never updated from `llm_dispatch` cost reports — billing visibility broken (audit run showed cost_usd=0.0 despite firing the planner LLM call) | dogfood-run | In mini-ork-plan + mini-ork-execute, after each successful llm_dispatch, UPDATE task_runs SET cost_usd = cost_usd + <call_cost> WHERE id = $MINI_ORK_RUN_ID | 1.5 h |
 | **D-010** | Classifier picks first lex-matching task_class instead of best-match — when 3 classes hit on the same kickoff, lex order (alphabetical filename) wins instead of keyword-hit count. Required tactical workaround for this dogfood run: rename `refactor-audit.yaml` → `0-refactor-audit.yaml` so it sorts first | dogfood-run | Rank task_class matches by `hit_count` (number of matching keywords/regex from `matches.{keywords,regex}`); pick highest; tiebreak by filename lex | 1.5 h |
+| **D-011** | Planner LLM wraps JSON output in markdown code fences (```json …```) or prefixes prose like "Here is the plan:" → `json.loads()` fails with `Expecting value: line 1 column 1 (char 0)` → plan rejected as `parse_error`. Hit on retry-dogfood run-1780171951-44447 after D-008b enforcement landed | retry-dogfood | Strip markdown fences + leading prose before parsing: `re.sub(r'^.*?```json\\s*\\n', '', txt, flags=re.S); re.sub(r'\\n```.*$', '', txt, flags=re.S)`. Better long-term: use Anthropic's tool_use forced-structured-output to constrain the model to emit JSON natively. | 2 h |
+| **D-012** | Failed-plan LLM calls don't increment `task_runs.cost_usd` — D-009 placeholder cost only fires on success path. The retry-dogfood made a real planner LLM call that returned non-JSON, but `cost_usd` stayed 0.0 (the call DID cost money). | retry-dogfood | Move cost increment to BEFORE the validation gate; cost is paid the moment the LLM responds regardless of whether the response is usable | 30 min |
 
 **Total v0.2 effort:** ~24 hours (4 new findings from real dogfood add
 8h on top of the original 16h). Each is independent; can ship as
@@ -117,6 +119,22 @@ self-dispatch surfaces 4 framework gaps that Agent-tool composition
 missed. The meta-loop closes when these 4 P1s + the original 9 P1s ship
 as v0.2 — at which point a second dogfood run produces audit content,
 not just bug signal.
+
+### Retry dogfood (run-1780171951-44447) after D-010/D-008/D-008b/D-009 fixes
+
+Re-ran with all 4 v0.2-pt1 fixes applied + tests green (436/437 OK):
+
+- classify → ✓ refactor-audit (D-010 rank-by-hits live; no rename hack)
+- plan → ✗ "PLAN REJECTED: planner emitted non-JSON output" (D-011 NEW)
+- execute → never reached
+- cost_usd → 0.0 despite real LLM call (D-012 NEW)
+- Cost: ~$0.02-0.05 burned on the failed planner call (LLM rate-card
+  estimate); not propagated to billing
+
+**2 NEW findings from retry** (D-011 + D-012). v0.2 bucket now 15 P1s.
+The meta-loop continues to surface gaps each pass — exactly the
+self-improvement signal the framework promises. Next retry should land
+after D-011 fence-strip + D-012 always-charge propagation.
 
 ---
 
