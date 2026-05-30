@@ -1,8 +1,8 @@
 # Example 01 — Hello World: Add a CHANGELOG Entry
 
-The smallest possible mini-ork delivery. One epic, one file changed, no
-external services. Use this to verify your install before trying anything
-bigger.
+The smallest possible mini-ork task. One file changed, no external services.
+Use this to verify your install and confirm the `code-fix` recipe runs end-to-end
+before trying anything larger.
 
 ## Prerequisites
 
@@ -19,11 +19,11 @@ bigger.
 ```bash
 # From the root of any git repo that has a CHANGELOG.md:
 cp ~/ps/mini-ork/examples/01-hello-world/kickoff.md ./kickoff.md
-mini-ork deliver kickoff.md
+mini-ork run code-fix kickoff.md
 ```
 
-Expected wall-clock time: **< 60 seconds**.
-Expected cost: **~$0.004** (single Sonnet worker, ~1 K tokens).
+Expected wall-clock time: **2 – 5 minutes**.
+Expected cost: **~$0.10 – $0.25** (planner + implementer + reviewer, Sonnet/Sonnet/Opus).
 
 ## What Happens
 
@@ -31,37 +31,42 @@ Expected cost: **~$0.004** (single Sonnet worker, ~1 K tokens).
 kickoff.md
     │
     ▼
-decomposer (Opus) — seeds 1 epic: "add-changelog-entry"
+classifier — detects task_class=code_fix (confidence ≥ 0.90)
     │
     ▼
-worker (Sonnet) — edits CHANGELOG.md, adds entry under [Unreleased]
+planner (Sonnet) — emits plan.json: 1 step, edits CHANGELOG.md
     │
     ▼
-spec-reviewer — reads diff, approves (3-line change, no issues)
+implementer (Sonnet) — applies Edit to CHANGELOG.md, emits implementer_summary.json
     │
-    ▼
-bdd-runner — runs 2 scenarios:
-  1. [Unreleased] section has ≥1 new bullet
-  2. Only CHANGELOG.md is in the diff
-    │ PASS
-    ▼
-auto-merge — fast-forwards branch onto main
+    ├──▶ verifier/typecheck.sh — auto-detects no typecheck tool → PASS (skipped)
     │
-    ▼
-state.db — verdict=PASS recorded
+    └──▶ verifier/test.sh — detects npm test if present, else skipped → PASS
+              │
+              ▼
+reviewer (Opus) — reads diff + verifier results → verdict=APPROVE
+              │
+              ▼
+publisher — commits CHANGELOG.md on feature branch
+              │
+              ▼
+state.db — verdict=APPROVE recorded
 ```
 
 ## Verification
 
-After `mini-ork deliver` exits 0:
+After `mini-ork run code-fix` exits 0:
 
 ```bash
 # Confirm the entry was added:
 grep -A5 "\[Unreleased\]" CHANGELOG.md
 
-# Inspect the run in state.db:
+# Inspect the run log:
+ls .mini-ork/runs/
+
+# Inspect the run in state.db (if mini-ork init was run in this repo):
 sqlite3 .mini-ork/state.db \
-  "SELECT id, status, verdict, cost_usd FROM epics ORDER BY created_at DESC LIMIT 1;"
+  "SELECT id, status, verdict, cost_usd FROM runs ORDER BY created_at DESC LIMIT 1;"
 ```
 
 ## Troubleshooting
@@ -70,7 +75,17 @@ sqlite3 .mini-ork/state.db \
 |---|---|---|
 | `mini-ork: command not found` | install.sh not run | `bash ~/ps/mini-ork/install.sh` |
 | `sqlite3: command not found` | sqlite3 missing | `brew install sqlite3` / `apt install sqlite3` |
-| `state.db not found` after deliver | `mini-ork init` skipped | run `mini-ork init` in the project root first |
+| `no recipe found: code-fix` | recipes dir not on path | check `MINI_ORK_ROOT` points to `~/ps/mini-ork` |
 | Worker exits non-zero | `claude` CLI not authenticated | `claude auth login` |
-| BDD FAIL: "no other file modified" | Worker touched extra file | Check worker diff; set stricter scope in kickoff |
-| Cost higher than expected | Wrong model routed | Add `model: claude-sonnet-4-5` to kickoff under `## Model Preference` |
+| Reviewer issues REQUEST_CHANGES | Worker touched extra file | check kickoff scope; set `MINI_ORK_TYPECHECK_CMD=""` to skip typecheck |
+| Cost higher than expected | Wrong model lane routed | add `model_lane: worker: claude-sonnet-4-5` override in kickoff |
+
+## What changed from v0.0
+
+- Command changed from `mini-ork deliver kickoff.md` to `mini-ork run code-fix kickoff.md`.
+- The `code-fix` recipe now drives the run via `workflow.yaml` (explicit node graph).
+- Verifier scripts (`typecheck.sh`, `test.sh`) replaced the old inline BDD runner.
+- Reviewer prompt is now the generic `recipes/code-fix/prompts/reviewer.md` — no
+  project-specific rules baked in.
+- Cost estimate updated: planner + reviewer adds ~$0.10 overhead vs the old
+  single-worker path, but review quality is substantially higher.

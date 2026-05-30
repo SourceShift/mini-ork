@@ -18,14 +18,14 @@ MINI_ORK_ROOT="${MINI_ORK_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 : "${MO_WORKTREE:?}"
 : "${MO_RUN_DIR:?}"
 : "${MO_ITER:?}"
-: "${MO_AGENTFLOW_DIR:?}"
+: "${MINI_ORK_HOME:?}"
 MO_FEEDBACK="${MO_FEEDBACK:-}"
 MO_JOB="${MO_JOB:-unknown-job}"
 # Resume support — if set, claude will be invoked with --resume <id> to
 # continue a prior worker session that hit gtimeout (exit 124/137).
 MO_RESUME_SESSION_ID="${MO_RESUME_SESSION_ID:-}"
 
-REPO_ROOT="${REPO_ROOT:-$(cd "$MO_AGENTFLOW_DIR/.." && pwd)}"
+REPO_ROOT="${REPO_ROOT:-$(cd "$MINI_ORK_HOME/.." && pwd)}"
 ITER_DIR="$MO_RUN_DIR/iter-$MO_ITER"
 mkdir -p "$ITER_DIR"
 
@@ -56,7 +56,7 @@ if [ -n "$ENV_SCRIPT" ] && [ ! -f "$ENV_SCRIPT" ]; then
 fi
 
 # ─── Resolve kickoff path from state.db ─────────────────────────────────
-STATE_DB="${MINI_ORK_DB:-$MO_AGENTFLOW_DIR/state.db}"
+STATE_DB="${MINI_ORK_DB:-$MINI_ORK_HOME/state.db}"
 KICKOFF_REL=$(sqlite3 "$STATE_DB" \
   "SELECT kickoff_path FROM epics WHERE id='$MO_EPIC';" 2>/dev/null)
 if [ -z "$KICKOFF_REL" ]; then
@@ -69,9 +69,9 @@ echo "    kickoff: $KICKOFF_REL"
 
 # ─── Resolve config dirs ─────────────────────────────────────────────────
 MINI_ORK_HOME="${MINI_ORK_HOME:-.mini-ork}"
-SCOPE_FILE="${MINI_ORK_SCOPE_FILE:-$MO_AGENTFLOW_DIR/config/scope-patterns.yaml}"
-AGENTS_FILE="${MINI_ORK_AGENTS_FILE:-$MO_AGENTFLOW_DIR/config/agents.yaml}"
-INBOX_DIR="$MO_AGENTFLOW_DIR/INBOX"
+SCOPE_FILE="${MINI_ORK_SCOPE_FILE:-$MINI_ORK_HOME/config/scope-patterns.yaml}"
+AGENTS_FILE="${MINI_ORK_AGENTS_FILE:-$MINI_ORK_HOME/config/agents.yaml}"
+INBOX_DIR="$MINI_ORK_HOME/INBOX"
 mkdir -p "$INBOX_DIR"
 
 # ─── Install scope-sentinel pre-commit hook (best-effort) ────────────────
@@ -89,10 +89,10 @@ SCOPE_PATTERNS=$(awk -v id="$MO_EPIC" '
   in_epic && /^  [A-Za-z]/ { in_epic = 0; in_pat = 0 }
 ' "$SCOPE_FILE" 2>/dev/null)
 
-if [ -n "$SCOPE_PATTERNS" ] && [ -x "$MO_AGENTFLOW_DIR/hooks/install-scope-sentinel.sh" ]; then
+if [ -n "$SCOPE_PATTERNS" ] && [ -x "$MINI_ORK_HOME/hooks/install-scope-sentinel.sh" ]; then
   TMP_SCOPE=$(mktemp)
   printf '%s\n' "$SCOPE_PATTERNS" > "$TMP_SCOPE"
-  bash "$MO_AGENTFLOW_DIR/hooks/install-scope-sentinel.sh" \
+  bash "$MINI_ORK_HOME/hooks/install-scope-sentinel.sh" \
     "$MO_WORKTREE" "$MO_EPIC" "$TMP_SCOPE" 2>&1 | sed 's/^/   /' || true
   rm -f "$TMP_SCOPE"
 fi

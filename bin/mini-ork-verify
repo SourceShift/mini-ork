@@ -1,0 +1,219 @@
+#!/usr/bin/env bash
+# mini-ork-verify — Verifier dispatcher: runs artifact_contract verifiers + gates.
+#
+# Reads artifact_contract from plan.json (or $MINI_ORK_PLAN_PATH), executes each
+# verifier script in artifact_contract.success_verifiers[], then runs all
+# registered gates via lib/gate_registry.sh:gate_run_all.
+#
+# Inputs:
+#   $1  artifact_path (the primary output to verify)
+#
+# Outputs (stdout, JSON):
+#   {
+#     "verdict": "pass|fail|partial",
+#     "results": [{"verifier": "<name>", "pass": true, "evidence_path": "<path>"}]
+#   }
+#
+# Verifier scripts are looked up in order:
+#   1. recipes/<recipe>/verifiers/<name>.sh
+#   2. ${MINI_ORK_HOME}/verifiers/<name>.sh
+#   3. ${MINI_ORK_ROOT}/verifiers/<name>.sh
+#
+# Flags:
+#   --plan <plan.json>    Explicit plan path (default: auto-detect)
+#   --task-class <name>   Override task class for gate selection
+#   --dry-run             Print verifiers that would run; do not execute
+#   --help
+
+set -Eeuo pipefail
+
+MINI_ORK_ROOT="${MINI_ORK_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+export MINI_ORK_ROOT
+
+# ── lib guards ────────────────────────────────────────────────────────────────
+_require_lib() {
+  local lib="$MINI_ORK_ROOT/lib/${1}.sh"
+  if [ ! -f "$lib" ]; then
+    echo "lib/${1}.sh not yet present (P1 in flight?)" >&2; exit 3
+  fi
+  # shellcheck source=/dev/null
+  source "$lib"
+}
+
+# ── arg parsing ───────────────────────────────────────────────────────────────
+ARTIFACT_PATH=""
+PLAN_PATH="${MINI_ORK_PLAN_PATH:-}"
+TASK_CLASS="${MINI_ORK_TASK_CLASS:-}"
+DRY_RUN="${MINI_ORK_DRY_RUN:-0}"
+
+_usage() {
+  cat <<'EOF'
+Usage: mini-ork verify <artifact-path> [--plan <plan.json>] [--task-class <name>] [--dry-run]
+
+Run artifact verifiers and gates. Emits JSON verdict on stdout.
+
+Options:
+  --plan <path>         Path to plan.json containing artifact_contract
+  --task-class <name>   Override task class for gate selection
+  --dry-run             List verifiers; do not execute them
+  --help                Show this help
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --help|-h)     _usage; exit 0 ;;
+    --dry-run)     DRY_RUN=1; shift ;;
+    --plan)        PLAN_PATH="${2:?--plan requires a path}"; shift 2 ;;
+    --task-class)  TASK_CLASS="${2:?--task-class requires a value}"; shift 2 ;;
+    -*)            echo "Unknown flag: $1. Try --help" >&2; exit 2 ;;
+    *)
+      if [ -z "$ARTIFACT_PATH" ]; then ARTIFACT_PATH="$1"; shift
+      else echo "Unexpected argument: $1" >&2; exit 2
+      fi
+      ;;
+  esac
+done
+
+# ── env setup ─────────────────────────────────────────────────────────────────
+MINI_ORK_HOME="${MINI_ORK_HOME:-$(pwd)/.mini-ork}"
+MINI_ORK_DB="${MINI_ORK_DB:-$MINI_ORK_HOME/state.db}"
+export MINI_ORK_HOME MINI_ORK_DB
+
+# ── resolve plan path ─────────────────────────────────────────────────────────
+if [ -z "$PLAN_PATH" ]; then
+  PLAN_PATH=$(find "$MINI_ORK_HOME/runs" -name "plan.json" -print0 2>/dev/null \
+    | xargs -0 ls -1t 2>/dev/null | head -1 || true)
+fi
+
+# ── extract verifiers from artifact_contract ──────────────────────────────────
+declare -a VERIFIER_NAMES=()
+if [ -n "$PLAN_PATH" ] && [ -f "$PLAN_PATH" ]; then
+  [ -z "$TASK_CLASS" ] && TASK_CLASS=$(python3 -c "
+import sys, json
+with open(sys.argv[1]) as f:
+    p = json.load(f)
+print(p.get('task_class', 'generic'))
+" "$PLAN_PATH" 2>/dev/null || echo "generic")
+
+  mapfile -t VERIFIER_NAMES < <(python3 - "$PLAN_PATH" <<'PY'
+import sys, json
+with open(sys.argv[1]) as f:
+    p = json.load(f)
+for v in p.get("artifact_contract", {}).get("success_verifiers", []):
+    print(v)
+PY
+  )
+fi
+TASK_CLASS="${TASK_CLASS:-generic}"
+
+# ── trace start ───────────────────────────────────────────────────────────────
+TRACE_ID="tr-verify-$(date +%s)-$$"
+if [ "$DRY_RUN" -eq 0 ]; then
+  _require_lib trace_store
+  trace_write "{\"trace_id\":\"$TRACE_ID\",\"task_class\":\"${TASK_CLASS}\",\"status\":\"running\"}" >/dev/null 2>&1 || true
+fi
+
+# ── find verifier script ───────────────────────────────────────────────────────
+_find_verifier_script() {
+  local name="$1"
+  local script=""
+
+  # 1. Recipe-level
+  if [ -n "${MINI_ORK_RECIPE:-}" ]; then
+    script="$MINI_ORK_ROOT/recipes/${MINI_ORK_RECIPE}/verifiers/${name}.sh"
+    [ -f "$script" ] && { echo "$script"; return; }
+  fi
+  # 2. Project-level (user-supplied)
+  script="$MINI_ORK_HOME/verifiers/${name}.sh"
+  [ -f "$script" ] && { echo "$script"; return; }
+  # 3. Framework-level
+  script="$MINI_ORK_ROOT/verifiers/${name}.sh"
+  [ -f "$script" ] && { echo "$script"; return; }
+
+  echo ""
+}
+
+# ── run verifiers ─────────────────────────────────────────────────────────────
+RESULTS=()
+PASS_COUNT=0
+FAIL_COUNT=0
+
+for verifier_name in "${VERIFIER_NAMES[@]}"; do
+  [ -z "$verifier_name" ] && continue
+
+  verifier_script=$(_find_verifier_script "$verifier_name")
+  EVIDENCE_DIR="$MINI_ORK_HOME/runs/evidence"
+  mkdir -p "$EVIDENCE_DIR"
+  EVIDENCE_PATH="$EVIDENCE_DIR/${verifier_name}-$(date +%s).log"
+
+  if [ "$DRY_RUN" -eq 1 ]; then
+    echo "[dry-run] verifier: $verifier_name → ${verifier_script:-NOT_FOUND}"
+    RESULTS+=("{\"verifier\":\"${verifier_name}\",\"pass\":null,\"evidence_path\":\"dry-run\"}")
+    continue
+  fi
+
+  if [ -z "$verifier_script" ]; then
+    echo "  [warn] verifier script not found: ${verifier_name}" >&2
+    RESULTS+=("{\"verifier\":\"${verifier_name}\",\"pass\":false,\"evidence_path\":\"script_not_found\"}")
+    FAIL_COUNT=$((FAIL_COUNT+1))
+    continue
+  fi
+
+  echo "  running verifier: $verifier_name"
+  if ARTIFACT_PATH="$ARTIFACT_PATH" bash "$verifier_script" > "$EVIDENCE_PATH" 2>&1; then
+    echo "    [pass]"
+    RESULTS+=("{\"verifier\":\"${verifier_name}\",\"pass\":true,\"evidence_path\":\"${EVIDENCE_PATH}\"}")
+    PASS_COUNT=$((PASS_COUNT+1))
+  else
+    echo "    [fail] evidence: $EVIDENCE_PATH"
+    RESULTS+=("{\"verifier\":\"${verifier_name}\",\"pass\":false,\"evidence_path\":\"${EVIDENCE_PATH}\"}")
+    FAIL_COUNT=$((FAIL_COUNT+1))
+  fi
+done
+
+# ── gate evaluation ───────────────────────────────────────────────────────────
+GATE_VERDICT="pass"
+if [ "$DRY_RUN" -eq 0 ] && [ -f "$MINI_ORK_ROOT/lib/gate_registry.sh" ]; then
+  _require_lib gate_registry
+  if ! gate_run_all "$TASK_CLASS" "$ARTIFACT_PATH" >> "$EVIDENCE_DIR/gates-$(date +%s).log" 2>&1; then
+    GATE_VERDICT="fail"
+    FAIL_COUNT=$((FAIL_COUNT+1))
+    RESULTS+=("{\"verifier\":\"__gates__\",\"pass\":false,\"evidence_path\":\"gate_registry\"}")
+  else
+    RESULTS+=("{\"verifier\":\"__gates__\",\"pass\":true,\"evidence_path\":\"gate_registry\"}")
+  fi
+fi
+
+# ── compute final verdict ─────────────────────────────────────────────────────
+if [ "$DRY_RUN" -eq 1 ]; then
+  VERDICT="dry-run"
+elif [ "$FAIL_COUNT" -eq 0 ] && [ "$GATE_VERDICT" = "pass" ]; then
+  VERDICT="pass"
+elif [ "$PASS_COUNT" -eq 0 ]; then
+  VERDICT="fail"
+else
+  VERDICT="partial"
+fi
+
+# ── emit JSON result ──────────────────────────────────────────────────────────
+RESULTS_JSON=$(IFS=','; echo "${RESULTS[*]}")
+cat <<JSON
+{
+  "verdict": "${VERDICT}",
+  "artifact_path": "${ARTIFACT_PATH:-}",
+  "task_class": "${TASK_CLASS}",
+  "pass_count": ${PASS_COUNT},
+  "fail_count": ${FAIL_COUNT},
+  "results": [${RESULTS_JSON}]
+}
+JSON
+
+# ── trace end ─────────────────────────────────────────────────────────────────
+STATUS="success"
+[ "$VERDICT" = "fail" ] && STATUS="failure"
+if [ "$DRY_RUN" -eq 0 ]; then
+  trace_write "{\"trace_id\":\"$TRACE_ID\",\"task_class\":\"${TASK_CLASS}\",\"status\":\"${STATUS}\",\"verifier_output\":\"{\\\"verdict\\\":\\\"${VERDICT}\\\"}\"}" >/dev/null 2>&1 || true
+fi
+
+[ "$VERDICT" = "fail" ] && exit 1 || exit 0

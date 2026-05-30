@@ -11,6 +11,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MIGRATIONS_DIR="${SCRIPT_DIR}/migrations"
+VIEWS_DIR="${SCRIPT_DIR}/views"
 
 # Resolve DB path
 MINI_ORK_HOME="${MINI_ORK_HOME:-${PWD}}"
@@ -39,11 +40,41 @@ for migration_file in $(ls "$MIGRATIONS_DIR"/*.sql | sort); do
   fi
 done
 
+# Apply views in lex order, idempotently.
+# Views use CREATE VIEW IF NOT EXISTS so re-applying is safe.
+# We also track them in schema_migrations so `mini-ork doctor` can
+# report which view files have been applied.
+if [ -d "$VIEWS_DIR" ]; then
+  for view_file in $(ls "$VIEWS_DIR"/*.sql 2>/dev/null | sort); do
+    viewfilename="$(basename "$view_file")"
+
+    already_applied=$(sqlite3 "$DB" \
+      "SELECT COUNT(*) FROM schema_migrations WHERE filename='${viewfilename}';" 2>/dev/null || echo "0")
+
+    if [ "$already_applied" = "1" ]; then
+      echo "  [skip] $viewfilename — already applied"
+    else
+      echo "  [apply view] $viewfilename"
+      sqlite3 "$DB" < "$view_file"
+      sqlite3 "$DB" \
+        "INSERT OR IGNORE INTO schema_migrations(filename, applied_at, checksum) VALUES ('${viewfilename}', strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'view-v1');"
+      echo "  [ok]   $viewfilename"
+    fi
+  done
+else
+  echo "  [info] No views dir found at $VIEWS_DIR — skipping"
+fi
+
 # Validate: at least 20 CREATE TABLE statements in final schema
 table_count=$(sqlite3 "$DB" ".schema" | grep -c "CREATE TABLE")
 if [ "$table_count" -lt 20 ]; then
   echo "[mini-ork init] ERROR: expected >= 20 tables, found ${table_count}. Aborting." >&2
   exit 1
+fi
+# After 0009–0012 are applied the count should be >= 45.
+# Emit a warning (non-fatal) if the redesign migrations appear missing.
+if [ "$table_count" -lt 45 ]; then
+  echo "[mini-ork init] WARNING: expected >= 45 tables after full apply, found ${table_count}. Redesign migrations (0009–0012) may not have been applied yet."
 fi
 
 echo "[mini-ork init] Done. Tables: ${table_count}"

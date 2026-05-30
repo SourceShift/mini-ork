@@ -1,0 +1,67 @@
+version: "0.1.0"
+task_class: bdd_first_delivery
+
+# The artifact produced by this recipe is composite: multiple patches (one
+# per sub-epic) plus the Playwright spec files that serve as the executable
+# acceptance criterion.
+artifact:
+  type: composite
+  components:
+    - name: implementation_patches
+      description: >
+        One git branch per sub-epic, each containing the implementation
+        commits produced by the implementer node. These are merged to the
+        base branch by the publisher node on APPROVE.
+      format: git_branch
+      required: true
+
+    - name: playwright_specs
+      description: >
+        One Playwright spec file per sub-epic, written by spec_author and
+        approved by spec_reviewer. Located at e2e/<sub_epic_id>.spec.ts
+        relative to the repo root.
+      format: typescript_file
+      path_pattern: "e2e/{sub_epic_id}.spec.ts"
+      required: true
+
+    - name: bdd_verdicts
+      description: >
+        JSON verdict files emitted by bdd_runner for each sub-epic, one per
+        implementation iteration. Located in the run directory.
+      format: json
+      path_pattern: "runs/{job_id}/{sub_epic_id}/iter-{n}/bdd-verdict.json"
+      required: true
+
+    - name: reviewer_verdict
+      description: >
+        Aggregate reviewer verdict covering all sub-epics. APPROVE triggers
+        publisher; REQUEST_CHANGES triggers self_correction; ESCALATE triggers
+        rollback.
+      format: json
+      path_pattern: "runs/{job_id}/aggregate-verdict.json"
+      required: true
+
+# Verifiers that must all pass before publisher is allowed to run.
+verifiers:
+  - name: bdd_runner
+    ref: verifiers/playwright_runner.sh
+    description: >
+      Runs npx playwright test against each sub-epic's spec file from within
+      the implementer's worktree. All sub-epics must reach verdict=PASS (or
+      verdict=PASS skipped=true for BE-only sub-epics).
+    required: true
+
+  - name: reviewer
+    ref: prompts/reviewer.md
+    description: >
+      Aggregate LLM reviewer that reads all sub-epic outputs together and
+      emits APPROVE | REQUEST_CHANGES | ESCALATE. Verdict is the gate for
+      the publisher node.
+    required: true
+
+# Rollback contract: if rollback node fires, revert all sub-epic branches
+# that had been fast-forward merged to the base branch during this job.
+rollback:
+  strategy: revert_branch
+  scope: all_sub_epics_in_job
+  max_revert_age_hours: 24

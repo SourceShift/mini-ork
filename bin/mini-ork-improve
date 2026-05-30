@@ -1,0 +1,136 @@
+#!/usr/bin/env bash
+# mini-ork-improve — Evolution dispatcher: reads recent group_performance_history
+# from memory tables and calls lib/group_evolver.sh:group_propose to generate
+# WorkflowCandidates.
+#
+# Candidates are stored in the workflow_candidates table (created by P3 in
+# 0011_evolution.sql). Candidate IDs are emitted on stdout for the next
+# step in the evolution loop (eval → promote).
+#
+# Flags:
+#   --task-class <name>   Scope improvement to one task class
+#   --limit <n>           Max candidates to generate (default: 3)
+#   --dry-run             Print what group_evolver would receive; no proposals
+#   --help
+
+set -Eeuo pipefail
+
+MINI_ORK_ROOT="${MINI_ORK_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+export MINI_ORK_ROOT
+
+# ── lib guards ────────────────────────────────────────────────────────────────
+_require_lib() {
+  local lib="$MINI_ORK_ROOT/lib/${1}.sh"
+  if [ ! -f "$lib" ]; then
+    echo "lib/${1}.sh not yet present (P1 in flight?)" >&2; exit 3
+  fi
+  # shellcheck source=/dev/null
+  source "$lib"
+}
+
+# ── arg parsing ───────────────────────────────────────────────────────────────
+TASK_CLASS_FILTER=""
+CANDIDATE_LIMIT=3
+DRY_RUN="${MINI_ORK_DRY_RUN:-0}"
+
+_usage() {
+  cat <<'EOF'
+Usage: mini-ork improve [--task-class <name>] [--limit <n>] [--dry-run]
+
+Read recent group performance history and propose WorkflowCandidates for
+evaluation and potential promotion.
+
+Outputs candidate IDs on stdout (one per line) for use with:
+  mini-ork eval   --candidate <id>
+  mini-ork promote --candidate <id>
+
+Options:
+  --task-class <name>   Scope to one task class (default: all classes)
+  --limit <n>           Max candidates to generate (default: 3)
+  --dry-run             Show performance summary; do not generate proposals
+  --help                Show this help
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --help|-h)     _usage; exit 0 ;;
+    --dry-run)     DRY_RUN=1; shift ;;
+    --task-class)  TASK_CLASS_FILTER="${2:?--task-class requires a value}"; shift 2 ;;
+    --limit)       CANDIDATE_LIMIT="${2:?--limit requires a number}"; shift 2 ;;
+    -*)            echo "Unknown flag: $1. Try --help" >&2; exit 2 ;;
+    *)             echo "Unexpected argument: $1. Try --help" >&2; exit 2 ;;
+  esac
+done
+
+# ── env setup ─────────────────────────────────────────────────────────────────
+MINI_ORK_HOME="${MINI_ORK_HOME:-$(pwd)/.mini-ork}"
+MINI_ORK_DB="${MINI_ORK_DB:-$MINI_ORK_HOME/state.db}"
+export MINI_ORK_HOME MINI_ORK_DB
+
+# ── trace start ───────────────────────────────────────────────────────────────
+TRACE_ID="tr-improve-$(date +%s)-$$"
+if [ "$DRY_RUN" -eq 0 ]; then
+  _require_lib trace_store
+  trace_write "{\"trace_id\":\"$TRACE_ID\",\"task_class\":\"__improve__\",\"status\":\"running\"}" >/dev/null 2>&1 || true
+fi
+
+# ── read group performance history ───────────────────────────────────────────
+PERF_SUMMARY=""
+if [ -f "$MINI_ORK_DB" ]; then
+  FILTER_SQL=""
+  [ -n "$TASK_CLASS_FILTER" ] && FILTER_SQL=" WHERE task_class='${TASK_CLASS_FILTER}'"
+  PERF_SUMMARY=$(sqlite3 "$MINI_ORK_DB" -json "
+    SELECT
+      task_class,
+      COUNT(*) AS total_runs,
+      SUM(CASE WHEN status='success' THEN 1 ELSE 0 END) AS successes,
+      AVG(CAST(duration_ms AS REAL)) AS avg_duration_ms,
+      AVG(CAST(cost_usd AS REAL)) AS avg_cost_usd
+    FROM execution_traces
+    ${FILTER_SQL}
+    GROUP BY task_class
+    ORDER BY total_runs DESC
+    LIMIT 20;
+  " 2>/dev/null || echo "[]")
+fi
+
+if [ "$DRY_RUN" -eq 1 ]; then
+  echo "[dry-run] performance summary:"
+  echo "$PERF_SUMMARY" | python3 -m json.tool 2>/dev/null || echo "$PERF_SUMMARY"
+  echo ""
+  echo "[dry-run] would call group_evolver with limit=${CANDIDATE_LIMIT}"
+  [ -n "$TASK_CLASS_FILTER" ] && echo "[dry-run] scope: task_class=${TASK_CLASS_FILTER}"
+  exit 0
+fi
+
+# ── dispatch to group_evolver ─────────────────────────────────────────────────
+_require_lib group_evolver
+
+echo "=== mini-ork improve ==="
+echo "    scope:    ${TASK_CLASS_FILTER:-all}"
+echo "    limit:    ${CANDIDATE_LIMIT}"
+echo ""
+
+EVOLVER_ARGS=(--limit "$CANDIDATE_LIMIT" --perf-json "$PERF_SUMMARY")
+[ -n "$TASK_CLASS_FILTER" ] && EVOLVER_ARGS+=(--task-class "$TASK_CLASS_FILTER")
+
+# group_propose emits candidate IDs (one per line) on stdout
+CANDIDATE_IDS=$(group_propose "${EVOLVER_ARGS[@]}")
+
+if [ -z "$CANDIDATE_IDS" ]; then
+  echo "improve: group_evolver produced no candidates (system may already be near-optimal)"
+else
+  echo "Proposed candidates:"
+  while IFS= read -r cid; do
+    [ -z "$cid" ] && continue
+    echo "  candidate_id=${cid}"
+  done <<< "$CANDIDATE_IDS"
+  echo ""
+  echo "Next: mini-ork eval --candidate <id>  (then: mini-ork promote --candidate <id>)"
+  # Emit raw IDs last for machine consumption
+  echo "$CANDIDATE_IDS"
+fi
+
+# ── trace end ─────────────────────────────────────────────────────────────────
+trace_write "{\"trace_id\":\"$TRACE_ID\",\"task_class\":\"__improve__\",\"status\":\"success\"}" >/dev/null 2>&1 || true
