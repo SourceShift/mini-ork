@@ -1,0 +1,212 @@
+#!/usr/bin/env bash
+# mini-ork scaffold-from-decompose — bulk-create worktrees + state.db
+# rows + scope-patterns.yaml + agents.yaml entries from a validated
+# decompose.json. Wraps scaffold-epic per sub-epic.
+#
+# Usage:
+#   mini-ork scaffold <decompose.json> <job-id> [--force]
+
+set -Eeuo pipefail
+
+MINI_ORK_ROOT="${MINI_ORK_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+REPO_ROOT="${REPO_ROOT:-$(pwd)}"
+MINI_ORK_HOME="${MINI_ORK_HOME:-.mini-ork}"
+
+if [ $# -lt 2 ]; then
+  cat <<EOF
+Usage: $0 <decompose.json> <job-id> [--force] [--yaml-only] [--scaffold-only]
+
+Bulk-scaffold sub-epics from a decompose.json output.
+Writes scope-patterns.yaml + agents.yaml entries, then runs scaffold-epic
+once per sub-epic.
+
+Caller is responsible for committing yaml + kickoff to main BEFORE this
+runs (so worktrees cut from main inherit the changes).
+EOF
+  exit 1
+fi
+
+DECOMPOSE_JSON="$1"
+JOB_ID="$2"
+FORCE_FLAG=""
+YAML_ONLY=0
+SCAFFOLD_ONLY=0
+shift 2
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --force)         FORCE_FLAG="--force"; shift ;;
+    --yaml-only)     YAML_ONLY=1; shift ;;
+    --scaffold-only) SCAFFOLD_ONLY=1; shift ;;
+    *) echo "unknown flag: $1" >&2; exit 2 ;;
+  esac
+done
+
+[ -f "$DECOMPOSE_JSON" ] || { echo "ERROR: $DECOMPOSE_JSON not found" >&2; exit 2; }
+PARENT_EPIC=$(jq -r '.parent_epic_id' "$DECOMPOSE_JSON")
+GROUP_ID="group-$JOB_ID"
+WT_BASE_DIR="${MO_WORKTREE_BASE:-${HOME}/worktrees}"
+
+SCOPE_FILE="${MINI_ORK_SCOPE_FILE:-${REPO_ROOT}/${MINI_ORK_HOME}/config/scope-patterns.yaml}"
+AGENTS_FILE="${MINI_ORK_AGENTS_FILE:-${REPO_ROOT}/${MINI_ORK_HOME}/config/agents.yaml}"
+[ -f "$SCOPE_FILE" ]  || { echo "ERROR: $SCOPE_FILE missing (set MINI_ORK_SCOPE_FILE or create ${MINI_ORK_HOME}/config/scope-patterns.yaml)"  >&2; exit 3; }
+[ -f "$AGENTS_FILE" ] || { echo "ERROR: $AGENTS_FILE missing (set MINI_ORK_AGENTS_FILE or create ${MINI_ORK_HOME}/config/agents.yaml)" >&2; exit 3; }
+
+# ─── 1. Append scope-patterns.yaml + agents.yaml entries per sub-epic ──
+if [ "$SCAFFOLD_ONLY" = 0 ]; then
+DECOMPOSE_MARKER="# AUTO-GENERATED via mini-ork scaffold — $JOB_ID"
+
+if grep -qF "$DECOMPOSE_MARKER" "$SCOPE_FILE"; then
+  echo "[scaffold] scope-patterns already has $JOB_ID block — skip yaml inject" >&2
+else
+  TMP_BLOCK=$(mktemp)
+  {
+    echo
+    echo "  $DECOMPOSE_MARKER"
+    jq -r --arg job "$JOB_ID" '
+      .sub_epics[] |
+      .id as $id |
+      ($id | ascii_downcase) as $idlc |
+      ("e2e/_specs/" + $idlc + ".trace-spec.yaml") as $tracepath |
+      ((.scope_globs // []) +
+        (if (.scope_globs // [] | any(. == $tracepath)) then [] else [$tracepath] end)
+      ) as $globs |
+      "  " + $id + ":\n" +
+      "    patterns:\n" +
+      ([$globs[] | "      - \"" + . + "\""] | join("\n")) + "\n" +
+      (if (.depends_on // [] | length) > 0
+        then "    depends_on:\n" +
+             ([.depends_on[] | "      - \"" + . + "\""] | join("\n")) + "\n"
+        else "" end) +
+      "    rationale: \"" + (.rationale // .title | gsub("\""; "\\\"")) + "\""
+    ' "$DECOMPOSE_JSON"
+  } > "$TMP_BLOCK"
+
+  if grep -qE '^(defaults|cutover):' "$SCOPE_FILE"; then
+    awk -v insert_file="$TMP_BLOCK" '
+      /^(defaults|cutover):/ && !done {
+        while ((getline line < insert_file) > 0) print line
+        close(insert_file)
+        done=1
+      }
+      { print }
+    ' "$SCOPE_FILE" > "$SCOPE_FILE.tmp" && mv "$SCOPE_FILE.tmp" "$SCOPE_FILE"
+  else
+    cat "$TMP_BLOCK" >> "$SCOPE_FILE"
+  fi
+  rm -f "$TMP_BLOCK"
+  echo "[scaffold] appended $(jq -r '.sub_epics | length' "$DECOMPOSE_JSON") epic(s) to scope-patterns.yaml" >&2
+fi
+
+if grep -qF "$DECOMPOSE_MARKER" "$AGENTS_FILE"; then
+  echo "[scaffold] agents.yaml already has $JOB_ID block — skip yaml inject" >&2
+else
+  TMP_BLOCK=$(mktemp)
+  DEFAULT_WORKER="${MO_DEFAULT_WORKER_LANE:-glm}"
+  {
+    echo
+    echo "  $DECOMPOSE_MARKER"
+    jq -r --arg w "$DEFAULT_WORKER" '
+      .sub_epics[] |
+      "  " + .id + ":\n" +
+      "    worker: " + $w
+    ' "$DECOMPOSE_JSON"
+  } > "$TMP_BLOCK"
+
+  if grep -qE '^(defaults|cutover):' "$AGENTS_FILE"; then
+    awk -v insert_file="$TMP_BLOCK" '
+      /^(defaults|cutover):/ && !done {
+        while ((getline line < insert_file) > 0) print line
+        close(insert_file)
+        done=1
+      }
+      { print }
+    ' "$AGENTS_FILE" > "$AGENTS_FILE.tmp" && mv "$AGENTS_FILE.tmp" "$AGENTS_FILE"
+  else
+    cat "$TMP_BLOCK" >> "$AGENTS_FILE"
+  fi
+  rm -f "$TMP_BLOCK"
+  echo "[scaffold] appended $JOB_ID block to agents.yaml" >&2
+fi
+
+fi  # end SCAFFOLD_ONLY=0 gate
+
+[ "$YAML_ONLY" = 1 ] && { echo "[scaffold] --yaml-only: done (skipping scaffold)." >&2; exit 0; }
+
+# ─── 2. Per-sub-epic scaffold-epic invocations ──────────────────────────
+PARENT_KICKOFF_DIR=$(dirname "$DECOMPOSE_JSON")
+n_subepics=$(jq -r '.sub_epics | length' "$DECOMPOSE_JSON")
+echo "[scaffold] scaffolding $n_subepics sub-epics for job=$JOB_ID" >&2
+
+jq -c '.sub_epics[]' "$DECOMPOSE_JSON" | while read -r sub; do
+  sid=$(echo "$sub" | jq -r '.id')
+  stitle=$(echo "$sub" | jq -r '.title')
+  sbranch=$(echo "$sub" | jq -r '.branch')
+  fkind=$(echo "$sub" | jq -r '.feature_kind // empty')
+  kind_flag=()
+  case "$fkind" in
+    fe|be|llm|data|sandbox|doc|mixed) kind_flag=(--epic-kind "$fkind") ;;
+  esac
+
+  kickoff_path=$(ls -1 "$PARENT_KICKOFF_DIR/${sid}_"*.md 2>/dev/null | head -1)
+  if [ -z "$kickoff_path" ]; then
+    echo "[scaffold] WARN: no kickoff file for $sid (expected ${sid}_*.md) — skipping" >&2
+    continue
+  fi
+  kickoff_rel="${kickoff_path#$REPO_ROOT/}"
+
+  if [ "${MINIORCH_KICKOFF_LINT_DISABLED:-0}" != "1" ]; then
+    if [ -x "$MINI_ORK_ROOT/lib/kickoff-path-lint.sh" ] \
+       && [ "${MINIORCH_PATH_LINT_DISABLED:-0}" != "1" ]; then
+      if ! "$MINI_ORK_ROOT/lib/kickoff-path-lint.sh" "$kickoff_path" >/dev/null 2>&1; then
+        echo "[scaffold] WARN $sid kickoff has stale paths" >&2
+        if [ "${MINIORCH_KICKOFF_LINT_STRICT:-1}" = "1" ]; then
+          echo "   blocking scaffold (set MINIORCH_KICKOFF_LINT_STRICT=0 to warn-only)" >&2
+          continue
+        fi
+      fi
+    fi
+
+    if [ -x "$MINI_ORK_ROOT/lib/dod-probe-lint.sh" ] \
+       && [ "${MINIORCH_DOD_LINT_DISABLED:-0}" != "1" ]; then
+      if ! "$MINI_ORK_ROOT/lib/dod-probe-lint.sh" "$kickoff_path" >/dev/null 2>&1; then
+        echo "[scaffold] WARN $sid DoD has only lexical probes" >&2
+        if [ "${MINIORCH_KICKOFF_LINT_STRICT:-1}" = "1" ]; then
+          echo "   blocking scaffold" >&2
+          continue
+        fi
+      fi
+    fi
+  fi
+
+  letter=$(echo "$sid" | sed -E "s/^${PARENT_EPIC}-//" | tr '[:upper:]' '[:lower:]')
+  worktree_path="$WT_BASE_DIR/${JOB_ID}-${letter}"
+
+  echo "[scaffold] scaffold $sid → $worktree_path (kind=${fkind:-unset})" >&2
+
+  # scaffold-epic is project-specific — this is a placeholder.
+  # Caller must provide scaffold-epic.sh in PATH or as $MINI_ORK_ROOT/lib/scaffold-epic.sh
+  SCAFFOLD_EPIC="${MINI_ORK_ROOT}/lib/scaffold-epic.sh"
+  if [ ! -x "$SCAFFOLD_EPIC" ]; then
+    echo "[scaffold] WARN: $SCAFFOLD_EPIC not found — skipping worktree creation for $sid" >&2
+    echo "[scaffold]   To scaffold manually:"
+    echo "[scaffold]     git worktree add $worktree_path -b $sbranch"
+    continue
+  fi
+  "$SCAFFOLD_EPIC" \
+    --job       "$JOB_ID" \
+    --epic      "$sid" \
+    --title     "$stitle" \
+    --branch    "$sbranch" \
+    --worktree-path "$worktree_path" \
+    --kickoff   "$kickoff_rel" \
+    --group     "$GROUP_ID" \
+    --worker    "${MO_DEFAULT_WORKER_LANE:-glm}" \
+    --reviewer  "auto" \
+    --days      "0.5" \
+    --notes     "decomposed from $PARENT_EPIC" \
+    "${kind_flag[@]}" \
+    $FORCE_FLAG \
+    || { echo "[scaffold] scaffold-epic FAILED for $sid" >&2; exit 5; }
+done
+
+echo "[scaffold] done. Next: mini-ork run $JOB_ID" >&2

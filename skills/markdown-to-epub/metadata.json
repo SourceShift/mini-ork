@@ -1,0 +1,11 @@
+{
+  "version": "1.0.0",
+  "organization": "Engineering",
+  "date": "May 2026",
+  "abstract": "Convert assembled book markdown to EPUB3 format using pandoc. Handles LaTeX math (MathML), Mermaid diagrams (SVG pre-render via mmdc), syntax-highlighted code fences (skylighting), and CSS theme injection.",
+  "references": [
+    "https://pandoc.org/MANUAL.html#epubs",
+    "https://github.com/raghur/mermaid-filter",
+    "https://www.w3.org/TR/epub-33/"
+  ]
+}

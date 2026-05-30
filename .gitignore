@@ -1,0 +1,24 @@
+# Dependencies
+node_modules/
+
+# State + secrets
+*.db
+.env
+.env.local
+.mini-ork/runs/
+.mini-ork/INBOX/
+.mini-ork/locks/
+.mini-ork/secrets/
+
+# Build artifacts
+dist/
+
+# Temp + logs
+/tmp/
+*.log
+
+# OS
+.DS_Store
+
+# Editor / tooling
+.claude/settings.local.json

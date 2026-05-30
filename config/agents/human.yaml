@@ -1,0 +1,27 @@
+# mini-ork agent config — human
+# Role bindings + budget caps + provider env wiring.
+# Override per-project via $MINI_ORK_HOME/config/agents/human.yaml
+
+id: human
+display: "Human escalation"
+description: |
+  Orchestrator escalates immediately, no worker spawned. Used for decision spikes,
+  high-stakes cutovers, and any epic where the rationale says "humans only".
+
+env_script: ""
+model_arg: ""
+budget_usd: 0
+
+role: human
+escalate_only: true                           # spawn-worker.sh refuses to launch
+
+capabilities:
+  - escalation
+  - decision-spike
+
+tier:
+  speed: 0
+  precision: 4
+
+fallback_above: null
+fallback_below: null

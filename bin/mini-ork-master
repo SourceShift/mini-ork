@@ -1,0 +1,342 @@
+#!/usr/bin/env bash
+# mini-ork master — v3 Layer 3 master agent loop.
+#
+# Usage:
+#   mini-ork master <feature> [--max-routes N] [--dry-run]
+
+set -Eeuo pipefail
+
+MINI_ORK_ROOT="${MINI_ORK_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+REPO_ROOT="${REPO_ROOT:-$(pwd)}"
+MINI_ORK_HOME="${MINI_ORK_HOME:-.mini-ork}"
+MINI_ORK_DB="${MINI_ORK_DB:-${REPO_ROOT}/${MINI_ORK_HOME}/state.db}"
+STATE_DB="$MINI_ORK_DB"
+export STATE_DB
+
+feature="${1:?feature required}"
+shift || true
+max_routes=3
+dry_run="${MO_DRY_RUN:-0}"
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --max-routes) max_routes="$2"; shift 2 ;;
+    --dry-run)    dry_run=1; shift ;;
+    *) echo "ERR: unknown flag $1" >&2; exit 2 ;;
+  esac
+done
+
+cd "$REPO_ROOT"
+
+source "$MINI_ORK_ROOT/lib/memory.sh"
+
+MO_CYCLE_ID="${MO_CYCLE_ID:-cycle-$(date +%Y%m%d-%H%M%S)}"
+hunter_timeout="${MASTER_HUNTER_TIMEOUT:-1500}"
+
+date_slug="$(date +%Y%m%d-%H%M%S)"
+artifact_dir="${MINI_ORK_HOME}/mini-ork/runs/master/${feature}/${date_slug}"
+mkdir -p "$artifact_dir"
+
+scripts_dir="$MINI_ORK_ROOT/lib/providers"
+prompts_dir="$MINI_ORK_ROOT/prompts"
+
+echo "[master] feature=$feature cycle=$MO_CYCLE_ID max_routes=$max_routes dry_run=$dry_run"
+
+# ─── pick top community ───────────────────────────────────────────────────────
+
+top_community=$(sqlite3 -separator $'\x1f' "$STATE_DB" "
+  SELECT community_id, member_node_ids, score, rank
+  FROM communities
+  WHERE feature = '$feature' AND invalidated_at IS NULL
+  ORDER BY rank ASC
+  LIMIT 1
+")
+
+if [[ -z "$top_community" ]]; then
+  echo "[master] no communities for $feature — run communities analysis first" >&2
+  if [[ "$dry_run" == "1" ]]; then
+    top_community="C-${feature}-stub"$'\x1f'"[\"fn:stub:resumePlan\",\"fn:stub:startSandbox\",\"fn:stub:emit\"]"$'\x1f'"0.91"$'\x1f'"1"
+    echo "[master] DRY-RUN: synthesized stub community" >&2
+  else
+    exit 0
+  fi
+fi
+
+IFS=$'\x1f' read -r community_id member_nodes_json score rank <<< "$top_community"
+echo "[master] selected community: $community_id (rank $rank, score $score)"
+
+# ─── pick top routes within this community ───────────────────────────────────
+
+routes_json="$artifact_dir/routes.json"
+python3 - "$STATE_DB" "$member_nodes_json" "$max_routes" "$routes_json" "$dry_run" <<'PY'
+import json, sqlite3, sys
+db, members_json, max_n_str, out_path, dry_run_str = sys.argv[1:6]
+max_n = int(max_n_str)
+dry_run = dry_run_str == "1"
+
+member_ids = json.loads(members_json)
+if not member_ids:
+    json.dump([], open(out_path,"w"))
+    sys.exit(0)
+
+con = sqlite3.connect(db)
+placeholders = ",".join(["?"] * len(member_ids))
+rows = con.execute(
+    f"SELECT node_id, file_path, symbol_name, mutating, callees_json "
+    f"FROM node_annotations WHERE node_id IN ({placeholders}) "
+    f"ORDER BY mutating DESC, file_path",
+    member_ids
+).fetchall()
+
+if not rows and dry_run:
+    rows = [
+        ("fn:stub:resumePlan",     "server/planGen.ts", "resumePlanFromSession", 1, "[]"),
+        ("fn:stub:startSandbox",   "server/sandboxService.ts", "startSandbox", 1, "[]"),
+        ("fn:stub:emit",           "server/socket.ts", "emitResumed", 1, "[]"),
+    ]
+
+routes = []
+for r in rows[:max_n]:
+    routes.append({
+        "route_id": f"R-{r[0]}",
+        "nodes": [{"node_id": r[0], "file_path": r[1], "symbol_name": r[2], "mutating": bool(r[3])}],
+        "mutation_score": int(r[3]),
+    })
+
+json.dump(routes, open(out_path,"w"), indent=2)
+print(f"[master] {len(routes)} route(s) picked", file=sys.stderr)
+con.close()
+PY
+
+routes_count=$(python3 -c "import json; print(len(json.load(open('$routes_json'))))")
+[[ "$routes_count" == "0" ]] && { echo "[master] no routes — exiting"; exit 0; }
+
+# ─── per-route: validate → review → optionally fix → review ─────────────────
+
+route_idx=0
+python3 -c "
+import json
+for r in json.load(open('$routes_json')):
+    print(r['route_id'])
+" | while read -r route_id; do
+  route_idx=$((route_idx + 1))
+  echo ""
+  echo "[master] === route ${route_idx}/${routes_count}: $route_id ==="
+
+  route_dir="$artifact_dir/${route_idx}-${route_id//[\/:]/_}"
+  mkdir -p "$route_dir"
+
+  python3 - "$routes_json" "$route_id" > "$route_dir/route-nodes.json" <<'PY'
+import json, sys
+routes = json.load(open(sys.argv[1]))
+rid = sys.argv[2]
+for r in routes:
+    if r["route_id"] == rid:
+        json.dump(r["nodes"], sys.stdout)
+        sys.exit(0)
+PY
+
+  validator_report="$route_dir/validator.ndjson"
+  validator_prompt="$route_dir/validator.prompt.md"
+  git_head=$(git rev-parse HEAD)
+
+  recent_commits=$(git log --since='24 hours' --pretty='%h %s' 2>/dev/null | head -10 || echo "(no recent commits)")
+
+  route_nodes_json=$(cat "$route_dir/route-nodes.json")
+
+  if [ -f "$prompts_dir/refactor-validator.md" ]; then
+    python3 - "$prompts_dir/refactor-validator.md" "$MO_CYCLE_ID" "$git_head" \
+      "$community_id" "$route_dir/validator.ndjson" "$route_nodes_json" \
+      "$recent_commits" \
+      > "$validator_prompt" <<'PY'
+import sys
+(tmpl, cycle, head, comm_id, report, route_nodes, commits) = sys.argv[1:8]
+text = open(tmpl).read()
+out = (text
+       .replace("{{CYCLE_ID}}", cycle)
+       .replace("{{GIT_HEAD}}", head)
+       .replace("{{COMMUNITY_ID}}", comm_id)
+       .replace("{{REPORT_PATH}}", report)
+       .replace("{{ROUTE_NODES_JSON}}", route_nodes)
+       .replace("{{RECENT_COMMITS}}", commits))
+sys.stdout.write(out)
+PY
+  else
+    echo "# Validator prompt for $community_id route $route_id" > "$validator_prompt"
+    echo "Route nodes: $route_nodes_json" >> "$validator_prompt"
+    echo "Recent commits: $recent_commits" >> "$validator_prompt"
+  fi
+
+  if [[ "$dry_run" == "1" ]]; then
+    cat > "$validator_report" <<EOF
+{"lens":"validator","route_path":"stub-route","community_id":"$community_id","verdict":"fatal","reasoning":"dry-run stub","bugs":[{"node_id":"fn:stub:resumePlan","violation":"dry-run stub bug","evidence":"src/stub:1","evidence_kind":"code","fix_suggestion":"stub fix","confidence":0.6}],"evidence_files":["src/stub:1"],"evidence_sha":"$git_head"}
+EOF
+    echo "[master:validator] DRY-RUN stub written"
+  else
+    source "$MINI_ORK_ROOT/lib/llm-dispatch.sh"
+    mo_llm_dispatch "sonnet" "$(cat "$validator_prompt")" \
+      "$route_dir/validator.raw.txt" "$hunter_timeout" 60 || true
+    grep -E '^\{.*"lens":\s*"validator"' "$route_dir/validator.raw.txt" > "$validator_report" || true
+  fi
+
+  validator_verdict=$(python3 -c "
+import json
+for line in open('$validator_report'):
+    line = line.strip()
+    if line:
+        d = json.loads(line)
+        print(d.get('verdict','retry'))
+        break
+" 2>/dev/null || echo "retry")
+
+  python3 - "$validator_report" "$community_id" "$MO_CYCLE_ID" "$git_head" "$route_dir/persist-validation.log" <<'PY'
+import json, sqlite3, sys, time, uuid, os
+report, comm_id, cycle, head, log = sys.argv[1:6]
+try:
+    line = next((l.strip() for l in open(report) if l.strip()), "")
+    verdict_obj = json.loads(line) if line else {}
+except (FileNotFoundError, json.JSONDecodeError):
+    verdict_obj = {}
+db = os.environ.get("MO_STATE_DB", os.environ.get("MINI_ORK_DB", ".mini-ork/state.db"))
+con = sqlite3.connect(db)
+val_id = f"V-{uuid.uuid4().hex[:12]}"
+now = int(time.time())
+con.execute("""
+  INSERT INTO validations (
+    validation_id, route_path, community_id, node_ids_json, verdict,
+    bugs_json, evidence_files_json, evidence_sha, validated_at, cycle_id,
+    via_gate, reflection_at, reflection_sha, reflected_substrate,
+    reflection_status, reflection_last_check
+  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+""", (
+    val_id,
+    verdict_obj.get("route_path","unknown"),
+    comm_id,
+    json.dumps([b.get("node_id") for b in verdict_obj.get("bugs",[])] or []),
+    verdict_obj.get("verdict","retry"),
+    json.dumps(verdict_obj.get("bugs",[])),
+    json.dumps(verdict_obj.get("evidence_files",[])),
+    head,
+    now, cycle,
+    "verifier_run_gate", now, head, '{"cited_files":[]}',
+    "fresh", now,
+))
+con.commit()
+con.close()
+with open(log,"w") as f:
+    f.write(f"validation persisted: {val_id} verdict={verdict_obj.get('verdict')}\n")
+print(f"[master] validation persisted: {val_id}", file=sys.stderr)
+PY
+
+  if [[ "$validator_verdict" == "fatal" ]]; then
+    echo "[master] verdict=fatal → dispatching Fix agent"
+    fix_report="$route_dir/fix.json"
+    fix_prompt="$route_dir/fix.prompt.md"
+    validation_json=$(cat "$validator_report")
+    module_frame_json='[]'
+
+    if [ -f "$prompts_dir/refactor-fix.md" ]; then
+      python3 - "$prompts_dir/refactor-fix.md" "$MO_CYCLE_ID" "$git_head" \
+        "fix-${route_id}" "$fix_report" "$validation_json" "$module_frame_json" \
+        > "$fix_prompt" <<'PY'
+import sys
+(tmpl, cycle, head, vid, report, val_json, frame_json) = sys.argv[1:8]
+text = open(tmpl).read()
+out = (text
+       .replace("{{CYCLE_ID}}", cycle)
+       .replace("{{GIT_HEAD}}", head)
+       .replace("{{VALIDATION_ID}}", vid)
+       .replace("{{REPORT_PATH}}", report)
+       .replace("{{VALIDATION_JSON}}", val_json)
+       .replace("{{MODULE_FRAME}}", frame_json))
+sys.stdout.write(out)
+PY
+    else
+      echo "# Fix prompt for $route_id" > "$fix_prompt"
+      echo "Validation: $validation_json" >> "$fix_prompt"
+    fi
+
+    if [[ "$dry_run" == "1" ]]; then
+      python3 - "$fix_report" "$route_id" <<'PY'
+import json, sys
+out_path, rid = sys.argv[1], sys.argv[2]
+obj = {
+    "lens": "fix",
+    "validation_id": f"fix-{rid}",
+    "patch_diff": "--- a/stub.ts\n+++ b/stub.ts\n@@ -1 +1 @@\n-old\n+new\n",
+    "frame_check": "pass",
+    "frame_violations": [],
+    "functoriality_check": "pass",
+    "call_graph_delta": {"added_edges": [], "removed_edges": []},
+    "test_gate_cmd": "npx tsc --noEmit stub.ts",
+    "rationale": "dry-run stub patch",
+    "estimated_loc_delta": 1,
+    "confidence": 0.7
+}
+json.dump(obj, open(out_path,"w"), indent=2)
+PY
+      echo "[master:fix] DRY-RUN stub patch written"
+    else
+      source "$MINI_ORK_ROOT/lib/llm-dispatch.sh"
+      mo_llm_dispatch "kimi" "$(cat "$fix_prompt")" \
+        "$route_dir/fix.raw.txt" "$hunter_timeout" 60 || true
+      python3 -c "
+import json, sys, re
+raw = open('$route_dir/fix.raw.txt').read()
+m = re.search(r'\{.*\}', raw, re.DOTALL)
+if m:
+    try:
+        obj = json.loads(m.group(0))
+        json.dump(obj, open('$fix_report','w'), indent=2)
+    except json.JSONDecodeError:
+        pass
+" 2>/dev/null || true
+    fi
+
+    python3 - "$fix_report" "$MO_CYCLE_ID" "$git_head" "$route_dir/persist-fix.log" <<'PY'
+import json, sqlite3, sys, time, uuid, os
+fix_path, cycle, head, log = sys.argv[1:5]
+try:
+    obj = json.load(open(fix_path))
+except (FileNotFoundError, json.JSONDecodeError):
+    obj = {}
+db = os.environ.get("MO_STATE_DB", os.environ.get("MINI_ORK_DB", ".mini-ork/state.db"))
+con = sqlite3.connect(db)
+last_val = con.execute(
+    "SELECT validation_id FROM validations WHERE cycle_id=? ORDER BY validation_id DESC LIMIT 1",
+    (cycle,)
+).fetchone()
+val_id = last_val[0] if last_val else None
+if not val_id:
+    with open(log,"w") as f: f.write("no validation found\n")
+    sys.exit(0)
+fix_id = f"F-{uuid.uuid4().hex[:12]}"
+now = int(time.time())
+con.execute("""
+  INSERT INTO fixes (
+    fix_id, validation_id, patch, frame_check, functoriality_check,
+    test_result, commit_sha, shipped_at,
+    via_gate, reflection_at, reflection_sha, reflected_substrate,
+    reflection_status, reflection_last_check
+  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+""", (
+    fix_id, val_id,
+    obj.get("patch_diff","")[:5000],
+    obj.get("frame_check","fail"),
+    obj.get("functoriality_check","skipped"),
+    None, None, None,
+    "fix_attempt_gate", now, head, '{"cited_files":[]}',
+    "fresh", now,
+))
+con.commit()
+con.close()
+with open(log,"w") as f:
+    f.write(f"fix persisted: {fix_id} -> val {val_id}\n")
+print(f"[master] fix persisted: {fix_id}", file=sys.stderr)
+PY
+  fi
+
+done
+
+echo ""
+echo "[master] DONE — $routes_count route(s) processed for community $community_id"
+echo "[master] next: run cascade analysis to check cross-community invalidation"

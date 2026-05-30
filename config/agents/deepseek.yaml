@@ -1,0 +1,34 @@
+# mini-ork agent config — deepseek
+# Role bindings + budget caps + provider env wiring.
+# Override per-project via $MINI_ORK_HOME/config/agents/deepseek.yaml
+
+id: deepseek
+display: "DeepSeek-V4-Pro"
+description: |
+  High-context reasoner. 1M token context, CLAUDE_CODE_EFFORT_LEVEL=max. Use for
+  large multi-file analysis, BE refactors that need whole-tree view, epics where
+  total prompt context > 100K tokens. Mid-tier cost.
+
+env_script: "${AGENT_SCRIPTS_DIR:-$HOME/ps/scripts}/cl_deepseek.sh"
+model_arg: ""
+budget_usd: null               # DeepSeek pricing not via Anthropic tracker
+
+role: worker
+escalate_only: false
+
+capabilities:
+  - large-context
+  - whole-tree-analysis
+  - reasoning
+  - refactor
+  - test-mandatory
+  - observability
+  - llm
+
+tier:
+  speed: 2
+  precision: 4
+  max_context_tokens: 1000000
+
+fallback_above: sonnet
+fallback_below: glm

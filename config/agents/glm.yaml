@@ -1,0 +1,47 @@
+# mini-ork agent config — glm
+# Role bindings + budget caps + provider env wiring.
+# Override per-project via $MINI_ORK_HOME/config/agents/glm.yaml
+
+# Catalog entry — sourced by lib/agent-catalog.sh, replaces the inline `case`
+# in spawn-worker.sh. One file per agent so adding a worker is a copy-edit-commit
+# cycle, not a code change.
+id: glm
+display: "GLM 5.1"
+description: |
+  Slow but very precise. Best correctness on implementation. Use when correctness
+  > speed: critical-path infra, security, mappers, contracts.
+
+# How to launch the worker. `env_script` is sourced by spawn-worker.sh; it sets
+# the auth env (model API base, key) before `claude` is exec'd. Anthropic-native
+# agents (sonnet/opus) leave this empty — they use CLAUDE_CODE_OAUTH_TOKEN /
+# ANTHROPIC_API_KEY from the parent env directly.
+env_script: "${AGENT_SCRIPTS_DIR:-$HOME/ps/scripts}/cl_glm.sh"
+model_arg: ""                    # empty = provider default
+budget_usd: null                 # null = uncapped (flat-plan provider)
+
+role: worker                     # worker | reviewer | brain | human
+escalate_only: false             # true for `human`
+
+# Capability tags for capability-driven dispatch (Step 3). Brain matches an
+# epic's required_capabilities against this set when picking a worker. Free-form
+# strings — start small, expand as the orchestrator learns to use them.
+capabilities:
+  - refactor
+  - infra
+  - contracts
+  - security
+  - precision
+  - test-mandatory
+  - observability
+
+# Tier scalars (0-4) for tie-breaking when multiple agents satisfy capabilities.
+tier:
+  speed: 1
+  precision: 4
+  max_context_tokens: 256000
+
+# Fallback chain on 2× REQUEST_CHANGES from this agent. `fallback_above` is the
+# next-precision tier (escalate UP); `fallback_below` is documented but unused
+# at runtime — orch never escalates DOWN.
+fallback_above: deepseek
+fallback_below: kimi

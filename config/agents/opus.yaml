@@ -1,0 +1,33 @@
+# mini-ork agent config — opus
+# Role bindings + budget caps + provider env wiring.
+# Override per-project via $MINI_ORK_HOME/config/agents/opus.yaml
+
+id: opus
+display: "Claude Opus 4.7"
+description: |
+  Brain / reviewer only. Never coder. Used for orchestrator decisions, supervisor
+  checkpoints, escalation analysis.
+
+env_script: ""
+model_arg: "--model claude-opus-4-7"
+
+budget_usd: 15.00                             # pay-per-use cap; OAuth not used here
+budget_usd_pay_per_use: 15.00
+auth_modes: [oauth, api_key]
+
+role: brain                                   # also acts as reviewer (set per-epic)
+escalate_only: false
+
+capabilities:
+  - architecture
+  - judgment
+  - escalation-analysis
+  - reviewer
+
+tier:
+  speed: 1
+  precision: 4
+  max_context_tokens: 200000
+
+fallback_above: null                          # top of the precision ladder
+fallback_below: sonnet

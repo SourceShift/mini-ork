@@ -1,0 +1,263 @@
+#!/usr/bin/env bash
+# mini-ork deliver — one command, kickoff to merged code.
+#
+# Pipeline:
+#   1. (optional) Decompose monolithic kickoff via DeepSeek L1
+#   2. Auto-write per-sub-epic kickoffs + yaml fragments
+#   3. Commit yaml + kickoffs to main (so worktrees see them)
+#   4. Bulk-scaffold worktrees + state.db rows
+#   5. Dispatch the loop (parallel workers + reviewer + BDD + auto-merge)
+#
+# Usage:
+#   mini-ork deliver <kickoff.md> [options]
+#
+# Options:
+#   --parent-id <ID>      override derived parent epic ID (default: from filename)
+#   --job-id    <slug>    override derived job id (default: from filename)
+#   --branch-base <name>  override branch prefix (default: feat/<job-id>)
+#   --max-iter  <N>       passed to run (default 3)
+#   --no-decompose        skip L1 — treat input as a single hand-written kickoff
+#   --no-commit           skip auto-commit step (caller commits manually)
+#   --no-dispatch         scaffold only; don't run the loop
+#   --bg                  background the dispatch (nohup)
+#   --dry-run             plan only, no side-effects
+#
+# Default behavior: full pipeline, foreground dispatch, auto-commit yaml/kickoffs.
+
+set -Eeuo pipefail
+
+MINI_ORK_ROOT="${MINI_ORK_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="${REPO_ROOT:-$(pwd)}"
+MINI_ORK_HOME="${MINI_ORK_HOME:-.mini-ork}"
+
+# Mirror run: local provider env scripts override $HOME/ps/scripts when present
+if [ -z "${AGENT_SCRIPTS_DIR:-}" ] && [ -f "$MINI_ORK_ROOT/lib/providers/cl_deepseek.sh" ]; then
+  export AGENT_SCRIPTS_DIR="$MINI_ORK_ROOT/lib/providers"
+fi
+
+# ─── arg parsing ────────────────────────────────────────────────────────
+[ $# -ge 1 ] || { sed -n 's/^# \{0,1\}//p' "$0" | head -25; exit 1; }
+KICKOFF="$1"; shift
+PARENT_ID=""
+JOB_ID=""
+BRANCH_BASE=""
+MAX_ITER=3
+DECOMPOSE=1
+DO_COMMIT=1
+DO_DISPATCH=1
+BG=0
+DRY=0
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --parent-id)    PARENT_ID="$2"; shift 2 ;;
+    --job-id)       JOB_ID="$2"; shift 2 ;;
+    --branch-base)  BRANCH_BASE="$2"; shift 2 ;;
+    --max-iter)     MAX_ITER="$2"; shift 2 ;;
+    --no-decompose) DECOMPOSE=0; shift ;;
+    --no-commit)    DO_COMMIT=0; shift ;;
+    --no-dispatch)  DO_DISPATCH=0; shift ;;
+    --bg)           BG=1; shift ;;
+    --dry-run)      DRY=1; shift ;;
+    *) echo "unknown flag: $1" >&2; exit 2 ;;
+  esac
+done
+
+[[ "$KICKOFF" = /* ]] || KICKOFF="$REPO_ROOT/$KICKOFF"
+[ -f "$KICKOFF" ] || { echo "ERROR: kickoff not found: $KICKOFF" >&2; exit 3; }
+
+# ─── derive defaults ────────────────────────────────────────────────────
+KICKOFF_BASENAME=$(basename "$KICKOFF" .md)
+if [ -z "$PARENT_ID" ]; then
+  PARENT_ID="${KICKOFF_BASENAME%%_*}"
+fi
+if [ -z "$JOB_ID" ]; then
+  JOB_ID=$(echo "$PARENT_ID" | tr '[:upper:]' '[:lower:]')
+fi
+if [ -z "$BRANCH_BASE" ]; then
+  BRANCH_BASE="feat/$JOB_ID"
+fi
+
+# ─── banner ─────────────────────────────────────────────────────────────
+cat <<EOF
+─────────────────────────────────────────────────────────────────
+ mini-ork deliver
+─────────────────────────────────────────────────────────────────
+ kickoff:      $KICKOFF
+ parent_id:    $PARENT_ID
+ job_id:       $JOB_ID
+ branch_base:  $BRANCH_BASE
+ max_iter:     $MAX_ITER
+ decompose:    $([ "$DECOMPOSE" = 1 ] && echo yes || echo no)
+ auto-commit:  $([ "$DO_COMMIT" = 1 ] && echo yes || echo no)
+ dispatch:     $([ "$DO_DISPATCH" = 1 ] && echo yes || echo no)
+ background:   $([ "$BG" = 1 ] && echo yes || echo no)
+ dry-run:      $([ "$DRY" = 1 ] && echo yes || echo no)
+─────────────────────────────────────────────────────────────────
+EOF
+
+# Pre-flight: working tree must be clean OR have only the kickoff committed
+if [ "$DO_COMMIT" = 1 ]; then
+  if [ -n "$(git status --porcelain | grep -v "^?? " | grep -v "$KICKOFF_BASENAME" || true)" ]; then
+    echo "[deliver] WARN: working tree has staged/unstaged changes outside the kickoff." >&2
+    echo "[deliver] auto-commit will ONLY stage decompose artifacts + yaml, not unrelated WIP." >&2
+    if [ -t 0 ]; then
+      git status --short
+      echo
+      read -r -p "Continue anyway? [y/N] " yn
+      [ "$yn" = "y" ] || [ "$yn" = "Y" ] || exit 4
+    else
+      echo "[deliver] non-interactive — continuing (pass --no-commit to suppress)" >&2
+    fi
+  fi
+fi
+
+# Execution gate — optional, disabled if not present
+MINI_ORK_DB="${MINI_ORK_DB:-${REPO_ROOT}/${MINI_ORK_HOME}/state.db}"
+if [ "${MINIORCH_GATE_DISABLED:-0}" != "1" ] \
+   && [ -x "$MINI_ORK_ROOT/lib/execution-gate.sh" ]; then
+  echo
+  echo "▶ Step 0: pre-dispatch gate..."
+  GATE_OUT=$(EXECUTION_GATE_SKIP_TYPECHECK="${MINIORCH_GATE_SKIP_TYPECHECK:-}" \
+    "$MINI_ORK_ROOT/lib/execution-gate.sh" "$PARENT_ID" "$REPO_ROOT" "$KICKOFF" 2>&1) || true
+  GATE_RC=$?
+  if [ "$GATE_RC" -eq 0 ]; then
+    echo "[deliver] gate ok"
+  else
+    echo "[deliver] gate BLOCKED:" >&2
+    printf '%s\n' "$GATE_OUT" >&2
+    if [ -t 0 ]; then
+      read -r -p "Override and continue anyway? [y/N] " yn
+      [ "$yn" = "y" ] || [ "$yn" = "Y" ] || exit 6
+    else
+      echo "[deliver] non-interactive — pass MINIORCH_GATE_DISABLED=1 to override" >&2
+      exit 6
+    fi
+  fi
+fi
+
+[ "$DRY" = 1 ] && { echo "DRY RUN — exiting before any side effects."; exit 0; }
+
+# ─── 1. decompose (optional) ────────────────────────────────────────────
+KICKOFF_DIR=$(dirname "$KICKOFF")
+DECOMPOSE_JSON="$KICKOFF_DIR/${PARENT_ID}.decompose.json"
+
+if [ "$DECOMPOSE" = 1 ]; then
+  echo
+  echo "▶ Step 1: decompose $PARENT_ID..."
+  "$SCRIPT_DIR/mini-ork-decompose" "$KICKOFF" "$PARENT_ID" "$BRANCH_BASE"
+  [ -f "$DECOMPOSE_JSON" ] || { echo "[deliver] decompose did not emit $DECOMPOSE_JSON" >&2; exit 5; }
+  N_SUB=$(jq -r '.sub_epics | length' "$DECOMPOSE_JSON")
+  echo "[deliver] decompose ok — $N_SUB sub-epics"
+else
+  echo
+  echo "▶ Step 1: skip decompose (--no-decompose); building 1-sub-epic plan from $PARENT_ID"
+  jq -n \
+    --arg pid "$PARENT_ID" \
+    --arg br "$BRANCH_BASE" \
+    --arg kp "${KICKOFF#$REPO_ROOT/}" \
+    '{
+      parent_epic_id: $pid,
+      parent_kickoff: $kp,
+      sub_epics: [{
+        id: $pid,
+        title: $pid,
+        rationale: "single-track delivery (no decompose)",
+        scope_globs: ["**"],
+        branch: $br,
+        depends_on: [],
+        dod_probes: ["test -d ."],
+        estimated_iters: 1
+      }],
+      coverage_summary: "single-track"
+    }' > "$DECOMPOSE_JSON"
+  cp "$KICKOFF" "$KICKOFF_DIR/${PARENT_ID}_kickoff.md" 2>/dev/null || true
+fi
+
+# ─── 2. auto-commit yaml + kickoffs (BEFORE scaffold) ───────────────────
+if [ "$DO_COMMIT" = 1 ]; then
+  echo
+  echo "▶ Step 2: stage decompose artifacts + auto-commit"
+  git add "$DECOMPOSE_JSON" "$KICKOFF_DIR"/*"_"*.md 2>/dev/null || true
+
+  if command -v jq >/dev/null 2>&1 && [ -f "$DECOMPOSE_JSON" ]; then
+    jq -r '.sub_epics[].id' "$DECOMPOSE_JSON" 2>/dev/null | while read -r sid; do
+      if [ -z "$sid" ]; then continue; fi
+      spec_lower="e2e/_specs/$(echo "$sid" | tr '[:upper:]' '[:lower:]').trace-spec.yaml"
+      if [ -f "$spec_lower" ]; then git add "$spec_lower" 2>/dev/null || true; fi
+    done
+  fi
+
+  if ! git diff --cached --quiet; then
+    git commit -m "chore(mini-ork): kickoffs + trace-spec stubs for $PARENT_ID decomposition" >/dev/null
+    echo "[deliver] committed kickoffs"
+  else
+    echo "[deliver] no kickoff changes to commit"
+  fi
+fi
+
+# ─── 3a. yaml inject (scope-patterns + agents.yaml) ────────────────────
+echo
+echo "▶ Step 3a: inject yaml fragments"
+"$SCRIPT_DIR/mini-ork-scaffold" "$DECOMPOSE_JSON" "$JOB_ID" --yaml-only
+
+MINI_ORK_SCOPE_FILE="${MINI_ORK_SCOPE_FILE:-${REPO_ROOT}/${MINI_ORK_HOME}/config/scope-patterns.yaml}"
+MINI_ORK_AGENTS_FILE="${MINI_ORK_AGENTS_FILE:-${REPO_ROOT}/${MINI_ORK_HOME}/config/agents.yaml}"
+
+if [ "$DO_COMMIT" = 1 ]; then
+  git add "$MINI_ORK_SCOPE_FILE" "$MINI_ORK_AGENTS_FILE" 2>/dev/null || true
+  if ! git diff --cached --quiet; then
+    git commit -m "chore(mini-ork): scope-patterns + agents.yaml for $JOB_ID" >/dev/null
+    echo "[deliver] committed yaml updates"
+  fi
+fi
+
+# ─── 3b. scaffold worktrees ─────────────────────────────────────────────
+echo
+echo "▶ Step 3b: scaffold worktrees"
+"$SCRIPT_DIR/mini-ork-scaffold" "$DECOMPOSE_JSON" "$JOB_ID" --scaffold-only
+
+# ─── 4. dispatch ────────────────────────────────────────────────────────
+if [ "$DO_DISPATCH" = 0 ]; then
+  echo
+  echo "✓ scaffolded but did NOT dispatch (--no-dispatch). To run:"
+  echo "    mini-ork run $JOB_ID --max-iter $MAX_ITER"
+  exit 0
+fi
+
+echo
+echo "▶ Step 4: dispatch the loop"
+LOG="$REPO_ROOT/${MINI_ORK_HOME}/mini-ork/runs/$JOB_ID/orchestrator.log"
+mkdir -p "$(dirname "$LOG")"
+
+if [ "$BG" = 1 ]; then
+  nohup "$SCRIPT_DIR/mini-ork-run" "$JOB_ID" --max-iter "$MAX_ITER" > "$LOG" 2>&1 &
+  ORCH_PID=$!
+  echo "$ORCH_PID" > "$REPO_ROOT/${MINI_ORK_HOME}/mini-ork/runs/$JOB_ID/orchestrator.pid"
+  echo "[deliver] backgrounded — pid=$ORCH_PID"
+  echo "[deliver]   log:  $LOG"
+  echo "[deliver]   wait: tail -F $LOG"
+  echo "[deliver]   stop: kill -TERM $ORCH_PID"
+else
+  echo "[deliver] running foreground — Ctrl-C to interrupt"
+  "$SCRIPT_DIR/mini-ork-run" "$JOB_ID" --max-iter "$MAX_ITER"
+  RUN_RC=$?
+
+  # Master acceptance probe
+  if [ "$RUN_RC" -eq 0 ] && [ -x "$MINI_ORK_ROOT/lib/master-acceptance.sh" ] \
+     && [ "${MINIORCH_MASTER_PROBE_DISABLED:-0}" != "1" ]; then
+    echo
+    echo "▶ Step 5: master acceptance probe"
+    RUN_DIR_MA="$REPO_ROOT/${MINI_ORK_HOME}/mini-ork/runs/$JOB_ID"
+    mkdir -p "$RUN_DIR_MA"
+    set +e
+    "$MINI_ORK_ROOT/lib/master-acceptance.sh" "$KICKOFF" "$RUN_DIR_MA" 2>&1 | tee "$RUN_DIR_MA/master-acceptance.log"
+    MA_RC=${PIPESTATUS[0]}
+    set -e
+    if [ "$MA_RC" -gt 0 ]; then
+      echo "[deliver] master-acceptance failed — see $RUN_DIR_MA/master-acceptance.{json,log}" >&2
+      exit 7
+    fi
+  fi
+fi

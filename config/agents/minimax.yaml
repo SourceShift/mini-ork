@@ -1,0 +1,31 @@
+# mini-ork agent config — minimax
+# Role bindings + budget caps + provider env wiring.
+# Override per-project via $MINI_ORK_HOME/config/agents/minimax.yaml
+
+id: minimax
+display: "MiniMax M2.7"
+description: |
+  Blazingly fast but dumb. Only when spec is bulletproof — zero ambiguity. Use
+  for trivial boilerplate, JSON copy, basic CRUD.
+
+env_script: "${AGENT_SCRIPTS_DIR:-$HOME/ps/scripts}/cl_minimax.sh"
+model_arg: ""
+budget_usd: null
+
+role: worker
+escalate_only: false
+
+capabilities:
+  - boilerplate
+  - copy
+  - bulletproof-spec
+  - test-mandatory
+  - observability
+
+tier:
+  speed: 4
+  precision: 1
+  max_context_tokens: 128000
+
+fallback_above: kimi
+fallback_below: null

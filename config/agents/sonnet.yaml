@@ -1,0 +1,42 @@
+# mini-ork agent config — sonnet
+# Role bindings + budget caps + provider env wiring.
+# Override per-project via $MINI_ORK_HOME/config/agents/sonnet.yaml
+
+id: sonnet
+display: "Claude Sonnet 4.6"
+description: |
+  Reviewer (default) + worker for epics needing Anthropic depth. Architectural
+  judgment, not raw throughput.
+
+env_script: ""                                # uses parent env directly
+model_arg: "--model claude-sonnet-4-6"
+
+# Auth-conditional budget. spawn-worker.sh inspects CLAUDE_CODE_OAUTH_TOKEN at
+# launch time:
+#   • OAuth token present → flat-plan, no $ tracking → use `budget_usd: null`
+#   • OAuth absent, ANTHROPIC_API_KEY present → pay-per-use → use
+#     `budget_usd_pay_per_use` as the per-run cap
+# The catalog can't fully express the conditional, so spawn-worker keeps a tiny
+# branch for sonnet/opus. Encoded here for documentation + future loaders.
+budget_usd: null
+budget_usd_pay_per_use: 20.00
+auth_modes: [oauth, api_key]
+
+role: worker                                  # also acts as reviewer (set per-epic)
+escalate_only: false
+
+capabilities:
+  - architecture
+  - reviewer
+  - large-context
+  - judgment
+  - test-mandatory
+  - observability
+
+tier:
+  speed: 2
+  precision: 4
+  max_context_tokens: 200000
+
+fallback_above: opus
+fallback_below: deepseek
