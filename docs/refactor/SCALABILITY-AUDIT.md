@@ -136,6 +136,43 @@ The meta-loop continues to surface gaps each pass — exactly the
 self-improvement signal the framework promises. Next retry should land
 after D-011 fence-strip + D-012 always-charge propagation.
 
+### Retry dogfood DF3 (run-1780180826-46384) after D-011/D-012 fixes
+
+Re-ran with v0.2-pt2 fixes (markdown fence strip + cost-charge-above-gate):
+
+- classify → ✓ refactor-audit
+- plan → ✗ "LLM dispatch failed for planner node" (DIFFERENT failure!)
+- execute → never reached
+- cost_usd → **0.05** (D-012 fix CONFIRMED LIVE — failure path now charges)
+- Cost: $0.05 captured (placeholder; real claude cost extraction is v0.2.1)
+
+**2 MORE NEW findings** from this retry — the recursive pattern continues:
+
+| ID | Title | Source | Fix sketch | Effort |
+|---|---|---|---|---|
+| **D-013** | `lib/llm-dispatch.sh:llm_dispatch` shim eagerly deletes the tmp out-file on failure path → no forensics. When real claude CLI errors (rate limit, API quota, model outage), the error trace is gone. | DF3-dogfood | Move `rm -f "$_tmp_out"` to a conditional that only fires on success; on failure, mv to `${MINI_ORK_HOME}/runs/<run>/llm-failure-<ts>.log` for inspection | 30 min |
+| **D-014** | Shim silences claude CLI stderr via `mo_llm_dispatch >/dev/null 2>&1` — when call fails, caller sees only "LLM dispatch failed" with NO underlying reason (rate limit? auth? model unavailable?). DF3 hit this — can't diagnose root cause without disabling redirect | DF3-dogfood | Capture stderr to a `.err` file alongside the out-file; on failure, cat the last 20 lines to stderr (or log to $MINI_ORK_HOME/runs/<run>/llm-stderr.log) | 30 min |
+
+**Pattern observed across 3 dogfood cycles:**
+
+| Pass | Cycle | New findings | Convergence signal |
+|---|---|---|---|
+| 1 | Agent-tool composition (Pass 1) | 31 | baseline |
+| 2 | DF1 v0.1.2 (Pass 2) | 4 (D-007/008/008b/009/010 = 5 IDs but D-007 was Codex-found in Pass 1) | gap-discovery via real dispatch |
+| 3 | DF2 v0.2-pt1 (Pass 3) | 2 (D-011/012) | smaller surface; still finding |
+| 4 | DF3 v0.2-pt2 (Pass 4) | 2 (D-013/014) | smaller surface; still finding |
+| **Projected** Pass 5+ | DF4 v0.2-pt3 | 1-2 | trending toward convergence |
+| **Projected** Pass 6+ | DF5 v0.2-pt4 | 0-1 | near-convergence |
+
+Each cycle costs ~$0.05-0.50 LLM (failed calls) + 1-3h fix work. Total
+trajectory: ~$3-10 LLM + 15-25 eng-hours to reach convergence (audit
+produces real content). v0.2 P1 bucket now 17 items.
+
+**The recursive pattern IS the framework's strongest design proof.**
+Each retry exercises a deeper code path; each newly-surfaced gap is
+real-world evidence that static analysis missed. The framework is
+literally auditing itself by trying to run itself.
+
 ---
 
 ## P1 — security followups (separate from scale audit)
