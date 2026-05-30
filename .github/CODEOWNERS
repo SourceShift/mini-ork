@@ -1,0 +1,33 @@
+# mini-ork CODEOWNERS
+# https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-security/customizing-your-repository/about-code-owners
+#
+# Match patterns require approval from the listed handle(s) before a PR can merge.
+# Replace `@PROJECT_LEAD` with the actual GitHub handle once known.
+
+# Default — lead maintainer must approve any PR
+*                              @PROJECT_LEAD
+
+# Framework primitives — extra scrutiny
+/bin/                          @PROJECT_LEAD
+/lib/                          @PROJECT_LEAD
+/db/migrations/                @PROJECT_LEAD
+/schemas/                      @PROJECT_LEAD
+/hooks/                        @PROJECT_LEAD
+
+# Safety-critical paths — explicit lead approval required
+/docs/SAFETY.md                @PROJECT_LEAD
+/db/migrations/0012_safety.sql @PROJECT_LEAD
+/lib/gate_registry.sh          @PROJECT_LEAD
+/lib/promotion_gate.sh         @PROJECT_LEAD
+/lib/version_registry.sh       @PROJECT_LEAD
+
+# Recipes — user-land, looser ownership (any reviewer can approve)
+/recipes/                      @PROJECT_LEAD
+
+# Docs / governance — lead + any reviewer
+/README.md                     @PROJECT_LEAD
+/CHANGELOG.md                  @PROJECT_LEAD
+/GOVERNANCE.md                 @PROJECT_LEAD
+/MAINTAINERS.md                @PROJECT_LEAD
+/ROADMAP.md                    @PROJECT_LEAD
+/RELEASING.md                  @PROJECT_LEAD

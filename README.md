@@ -1,23 +1,41 @@
 # mini-ork
 
-mini-ork is a task operating system for agents. It receives a goal, classifies the work, chooses a workflow, dispatches specialized agents, verifies artifacts, and stores execution experience for self-improvement. It does NOT ship opinions on what your pipeline should look like — pipeline shapes live in `recipes/` as composable user-land examples.
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+[![Version](https://img.shields.io/badge/version-0.1.1-green.svg)](CHANGELOG.md)
+[![CI](https://img.shields.io/badge/CI-shellcheck%20%2B%20smoke-yellow.svg)](.github/workflows/ci.yml)
+[![Status](https://img.shields.io/badge/status-early%20preview-orange.svg)](ROADMAP.md)
+
+mini-ork is a **task operating system for agents**. It receives a goal, classifies the work, chooses a workflow, dispatches specialized agents, verifies artifacts, and stores execution experience for self-improvement. It does NOT ship opinions on what your pipeline should look like — pipeline shapes live in [`recipes/`](./recipes/) as composable user-land examples.
+
+> ⚡ **60-second demo (no API keys):** `bash examples/00-demo.sh` — bootstraps a throwaway project, runs the loop in dry-run mode, prints the `task_runs` row.
 
 ---
 
 ## Quickstart
 
 ```bash
-# 1. Install
+# 1. Install (creates symlink in $HOME/.local/bin or /usr/local/bin)
 bash install.sh
 
-# 2. Initialize a repo
+# 2. Initialize a project (creates .mini-ork/ + seeds state.db + task_classes)
+cd ~/my-project
 mini-ork init
 
-# 3. Run a recipe
-mini-ork run code-fix examples/01-hello-world/kickoff.md
+# 3. Write a kickoff (or copy an example)
+cp ~/ps/mini-ork/examples/01-hello-world/kickoff.md ./kickoff.md
+
+# 4. Run a recipe (dry-run first, no API keys needed)
+MINI_ORK_DRY_RUN=1 mini-ork run code-fix ./kickoff.md
+
+# 5. For real LLM calls (needs `claude` CLI authenticated)
+mini-ork run code-fix ./kickoff.md
 ```
 
-`mini-ork run` exits 0 on verified artifact, 1 on gate failure or escalation. All state is in `${MINI_ORK_DB}` (default: `.mini-ork/state.db`).
+`mini-ork run` exits 0 on verified artifact, 1 on gate failure or escalation. All state is in `${MINI_ORK_DB}` (default: `.mini-ork/state.db`). Inspect with:
+
+```bash
+sqlite3 .mini-ork/state.db "SELECT id, task_class, recipe, status, verdict FROM task_runs ORDER BY created_at DESC LIMIT 5;"
+```
 
 ---
 
