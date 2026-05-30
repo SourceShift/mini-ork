@@ -78,7 +78,7 @@ case "$sub" in
     done
     ;;
 
-  version) echo "mini-ork 0.1.0 (universal task loop runtime)" ;;
+  version) echo "mini-ork 0.1.1 (universal task loop runtime)" ;;
 
   help|--help|-h)
     cat <<'EOF'
