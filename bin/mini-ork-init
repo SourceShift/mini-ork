@@ -42,6 +42,10 @@ do
   fi
 done
 
+# SEC P1-001: secrets/ must be owner-only — never world-readable.
+# Idempotent + safe on re-run.
+chmod 700 "$MINI_ORK_HOME/secrets" 2>/dev/null || _warn "chmod 700 secrets/ failed (filesystem doesn't support unix perms?)"
+
 echo ""
 
 # ── 2. Copy default config files ──────────────────────────────────────────────

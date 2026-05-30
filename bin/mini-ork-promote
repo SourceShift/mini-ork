@@ -84,10 +84,10 @@ CANDIDATE_STATUS=""
 UTILITY_DELTA=""
 if [ -f "$MINI_ORK_DB" ]; then
   CANDIDATE_STATUS=$(sqlite3 "$MINI_ORK_DB" \
-    "SELECT eval_status FROM workflow_candidates WHERE id='${CANDIDATE_ID}' LIMIT 1;" \
+    "SELECT eval_status FROM workflow_candidates WHERE candidate_id='${CANDIDATE_ID}' LIMIT 1;" \
     2>/dev/null || true)
   UTILITY_DELTA=$(sqlite3 "$MINI_ORK_DB" \
-    "SELECT utility_delta FROM workflow_candidates WHERE id='${CANDIDATE_ID}' LIMIT 1;" \
+    "SELECT utility_delta FROM workflow_candidates WHERE candidate_id='${CANDIDATE_ID}' LIMIT 1;" \
     2>/dev/null || echo "0")
 fi
 
