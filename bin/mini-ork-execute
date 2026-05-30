@@ -108,15 +108,49 @@ with open(sys.argv[1]) as f:
 print(p.get('task_class', 'generic'))
 " "$PLAN_PATH" 2>/dev/null || echo "generic")
 
-# Extract decomposition nodes
-mapfile -t NODE_IDS < <(python3 - "$PLAN_PATH" <<'PY'
+# Extract nodes — D-008 fix: workflow.yaml.nodes[] is the authoritative DAG.
+# Falls back to plan.json.decomposition[] only when no workflow.yaml is set
+# (e.g. ad-hoc runs without a recipe).
+# Emit format: <node_id>\t<node_type>\t<description>\t<prompt_ref>
+# (TAB separator, not '::' — bash IFS treats every char as a separator so
+#  '::' was equivalent to ':' and produced 5+ fields from 3 — D-008 cascade)
+NODE_SOURCE=""
+if [ -n "${WORKFLOW:-}" ] && [ -f "${WORKFLOW:-}" ]; then
+  NODE_SOURCE="workflow.yaml"
+  mapfile -t NODE_IDS < <(python3 - "$WORKFLOW" <<'PY'
+import sys, yaml
+with open(sys.argv[1]) as f:
+    wf = yaml.safe_load(f) or {}
+for n in wf.get("nodes", []) or []:
+    name = n.get("name", "")
+    typ  = n.get("type", "")
+    desc = n.get("description", "") or name
+    pref = n.get("prompt_ref", "") or ""
+    if not name or not typ:
+        continue
+    # Strip any tabs from user fields (separator collision)
+    desc = desc.replace("\t", " ")
+    pref = pref.replace("\t", " ")
+    print(f"{name}\t{typ}\t{desc}\t{pref}")
+PY
+  )
+else
+  NODE_SOURCE="plan.json.decomposition"
+  mapfile -t NODE_IDS < <(python3 - "$PLAN_PATH" <<'PY'
 import sys, json
 with open(sys.argv[1]) as f:
     p = json.load(f)
 for step in p.get("decomposition", []):
-    print(f"{step['id']}::{step.get('node_type','implementer')}::{step.get('description','')}")
+    nid = step.get('id', '')
+    ntyp = step.get('node_type') or 'implementer'  # explicit None/empty → implementer
+    if not nid or not ntyp:
+        continue
+    desc = (step.get('description','') or '').replace("\t"," ")
+    print(f"{nid}\t{ntyp}\t{desc}\t")
 PY
-)
+  )
+fi
+echo "    nodes:    ${#NODE_IDS[@]} (from ${NODE_SOURCE})"
 
 # ── trace start ───────────────────────────────────────────────────────────────
 TRACE_ID="tr-execute-$(date +%s)-$$"
@@ -263,7 +297,7 @@ case "$DISPATCH_MODE" in
   parallel)
     PIDS=()
     for entry in "${NODE_IDS[@]}"; do
-      IFS='::' read -r node_id node_type node_desc <<< "$entry"
+      IFS=$'\t' read -r node_id node_type node_desc node_prompt_ref <<< "$entry"
       ( _dispatch_node "$node_id" "$node_type" "$node_desc" ) &
       PIDS+=($!)
     done
@@ -275,7 +309,7 @@ case "$DISPATCH_MODE" in
     # Group by node_type; run groups serially, nodes within group in parallel
     declare -A TYPE_GROUPS
     for entry in "${NODE_IDS[@]}"; do
-      IFS='::' read -r node_id node_type node_desc <<< "$entry"
+      IFS=$'\t' read -r node_id node_type node_desc node_prompt_ref <<< "$entry"
       TYPE_GROUPS[$node_type]+="${node_id}::${node_type}::${node_desc}"$'\n'
     done
     for node_type in planner researcher implementer reviewer verifier reflector publisher rollback; do
@@ -296,7 +330,7 @@ case "$DISPATCH_MODE" in
     # Run all in parallel; first success stops remaining (best-effort)
     PIDS=()
     for entry in "${NODE_IDS[@]}"; do
-      IFS='::' read -r node_id node_type node_desc <<< "$entry"
+      IFS=$'\t' read -r node_id node_type node_desc node_prompt_ref <<< "$entry"
       ( _dispatch_node "$node_id" "$node_type" "$node_desc" ) &
       PIDS+=($!)
     done
@@ -306,7 +340,7 @@ case "$DISPATCH_MODE" in
     ;;
   serial|*)
     for entry in "${NODE_IDS[@]}"; do
-      IFS='::' read -r node_id node_type node_desc <<< "$entry"
+      IFS=$'\t' read -r node_id node_type node_desc node_prompt_ref <<< "$entry"
       _dispatch_node "$node_id" "$node_type" "$node_desc" || FAIL_COUNT=$((FAIL_COUNT+1))
     done
     ;;
@@ -323,6 +357,32 @@ if [ "$FAIL_COUNT" -gt 0 ]; then
   echo "" >&2
   echo "execute: ${FAIL_COUNT} node(s) failed" >&2
   exit 1
+fi
+
+# D-009 cost propagation — placeholder $0.01 per dispatched node until
+# claude --output-format json cost extraction lands (v0.2.1).
+# Counts dispatched nodes (those NOT skipped by planner-type or filter).
+if [ "$DRY_RUN" -eq 0 ] && [ -f "$MINI_ORK_DB" ] && [ -n "${MINI_ORK_RUN_ID:-}" ]; then
+  DISPATCHED_COUNT="${#NODE_IDS[@]}"
+  python3 - "$MINI_ORK_DB" "$MINI_ORK_RUN_ID" "$DISPATCHED_COUNT" <<'PY'
+import sqlite3, sys, time
+db, run_id, count = sys.argv[1], sys.argv[2], int(sys.argv[3])
+con = sqlite3.connect(db)
+con.execute("PRAGMA journal_mode=WAL")
+try:
+    con.execute("""
+        UPDATE task_runs
+        SET cost_usd = COALESCE(cost_usd,0) + ?,
+            status   = 'reviewing',
+            updated_at = ?
+        WHERE id = ?
+    """, (count * 0.01, int(time.time()), run_id))
+    con.commit()
+except sqlite3.OperationalError as e:
+    print(f"[warn] task_runs cost update skipped: {e}", file=sys.stderr)
+finally:
+    con.close()
+PY
 fi
 
 echo ""

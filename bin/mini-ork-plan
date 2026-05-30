@@ -197,23 +197,50 @@ PLAN_JSON=$(llm_dispatch \
   exit 1
 }
 
-# ── validate verifier_contract is present ─────────────────────────────────────
+# ── validate plan JSON (D-008b: also check decomposition[].node_type) ─────────
 HAS_VERIFIER=$(echo "$PLAN_JSON" | python3 -c "
 import sys, json
+NODE_TYPES = {'planner','researcher','implementer','reviewer','verifier','reflector','publisher','rollback'}
 try:
     p = json.load(sys.stdin)
     vc = p.get('verifier_contract', {})
     checks = vc.get('checks', [])
-    print('ok' if checks else 'missing')
+    if not checks:
+        print('missing_verifier_contract'); sys.exit(0)
+    # D-008b: every decomposition step must have a non-empty, valid node_type
+    bad_steps = []
+    for i, step in enumerate(p.get('decomposition', []) or []):
+        nt = (step.get('node_type') or '').strip()
+        if not nt:
+            bad_steps.append(f'step[{i}] {step.get(\"id\",\"?\")}: empty node_type')
+        elif nt not in NODE_TYPES:
+            bad_steps.append(f'step[{i}] {step.get(\"id\",\"?\")}: node_type={nt!r} not in {sorted(NODE_TYPES)}')
+    if bad_steps:
+        print('bad_node_types:' + '|'.join(bad_steps), file=sys.stderr)
+        print('bad_node_types'); sys.exit(0)
+    print('ok')
 except Exception as e:
     print(f'parse_error:{e}', file=sys.stderr)
-    print('missing')
-" 2>/dev/null || echo "missing")
+    print('parse_error')
+" 2>&1 | tail -1)
 
-if [ "$HAS_VERIFIER" != "ok" ]; then
+if [ "$HAS_VERIFIER" = "missing_verifier_contract" ]; then
   echo "PLAN REJECTED: verifier_contract.checks is missing or empty." >&2
   echo "A plan is not complete until success-check is defined." >&2
   trace_write "{\"trace_id\":\"$TRACE_ID\",\"task_class\":\"${TASK_CLASS}\",\"status\":\"failure\",\"reviewer_verdict\":\"missing_verifier_contract\"}" >/dev/null 2>&1 || true
+  exit 1
+fi
+
+if [ "$HAS_VERIFIER" = "bad_node_types" ]; then
+  echo "PLAN REJECTED: one or more decomposition[].node_type values are empty or invalid (D-008b)." >&2
+  echo "Each step must declare node_type as one of: planner|researcher|implementer|reviewer|verifier|reflector|publisher|rollback" >&2
+  trace_write "{\"trace_id\":\"$TRACE_ID\",\"task_class\":\"${TASK_CLASS}\",\"status\":\"failure\",\"reviewer_verdict\":\"bad_node_types\"}" >/dev/null 2>&1 || true
+  exit 1
+fi
+
+if [ "$HAS_VERIFIER" = "parse_error" ]; then
+  echo "PLAN REJECTED: planner emitted non-JSON output." >&2
+  trace_write "{\"trace_id\":\"$TRACE_ID\",\"task_class\":\"${TASK_CLASS}\",\"status\":\"failure\",\"reviewer_verdict\":\"parse_error\"}" >/dev/null 2>&1 || true
   exit 1
 fi
 
@@ -240,9 +267,12 @@ con.execute("PRAGMA journal_mode=WAL")
 now = int(time.time())
 
 try:
+    # D-009: increment cost_usd. Placeholder $0.05 per planner call until
+    # claude --output-format json cost extraction lands (v0.2.1).
     con.execute("""
         UPDATE task_runs
-        SET plan_path=?, plan_hash=?, status='planned', updated_at=?
+        SET plan_path=?, plan_hash=?, status='planned', updated_at=?,
+            cost_usd=COALESCE(cost_usd,0) + 0.05
         WHERE id=?
     """, (plan_path, plan_hash, now, run_id))
     if con.execute("SELECT changes()").fetchone()[0] == 0:
