@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mini-ork/schemas/artifact_contract.schema.json",
+  "title": "ArtifactContract",
+  "description": "Declares what a task class must produce, how it is verified, and what happens on failure or rollback. One contract per task_class; referenced by task_class.artifact_contract_ref.",
+  "type": "object",
+  "required": ["task_class", "expected_artifact", "failure_policy"],
+  "additionalProperties": false,
+  "properties": {
+    "task_class": {
+      "type": "string",
+      "description": "The task_class this contract governs. Must match task_class.schema.json name.",
+      "pattern": "^[a-z][a-z0-9_-]*$"
+    },
+    "expected_artifact": {
+      "type": "string",
+      "description": "The primary artifact kind this class produces. patch=git diff/PR, prose=markdown/doc, plan=structured plan doc, image=generated image, data=structured data file, composite=combination of the above.",
+      "enum": ["patch", "prose", "plan", "image", "data", "composite"]
+    },
+    "success_verifiers": {
+      "type": "array",
+      "description": "Ordered list of verifier names (must exist in verifier_contract registry) that all must pass for the artifact to be accepted. Evaluated in sequence; first fail short-circuits.",
+      "items": { "type": "string" },
+      "default": []
+    },
+    "failure_policy": {
+      "type": "string",
+      "description": "What to do when a verifier fails: request_changes (send back to implementer), escalate (open inbox item for human), rollback (invoke rollback_policy immediately).",
+      "enum": ["request_changes", "escalate", "rollback"]
+    },
+    "rollback_policy": {
+      "type": "string",
+      "description": "Name of the rollback procedure to execute when failure_policy=rollback or a hard-fail gate fires. Must reference a workflow node of type 'rollback' or a named rollback script.",
+      "default": ""
+    },
+    "artifact_path_template": {
+      "type": "string",
+      "description": "Template for the expected output path. Supports {run_id}, {task_class}, {timestamp} substitutions. Used by verifiers to locate the artifact.",
+      "default": ".mini-ork/artifacts/{run_id}/{task_class}"
+    },
+    "max_size_bytes": {
+      "type": "integer",
+      "description": "Maximum allowed artifact size in bytes. 0 = no limit.",
+      "minimum": 0,
+      "default": 0
+    },
+    "retention_days": {
+      "type": "integer",
+      "description": "How many days to retain artifacts in artifact_memory before purging. 0 = retain indefinitely.",
+      "minimum": 0,
+      "default": 30
+    },
+    "description": {
+      "type": "string",
+      "description": "Human-readable summary of what this contract enforces."
+    },
+    "tags": {
+      "type": "array",
+      "items": { "type": "string" },
+      "default": []
+    }
+  }
+}

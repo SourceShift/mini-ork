@@ -83,3 +83,89 @@ esac
 3. Add the API key env var to `docs/CONFIG.md` and `.gitignore`.
 
 No other changes needed. The orchestrator calls `dispatch_model` uniformly.
+
+---
+
+## Per-Node Model Lanes in workflow.yaml
+
+In v0.1, nodes declare a `model_lane` rather than a hard-coded model name. The lane resolves to a model via `${MINI_ORK_HOME}/config/agents/<lane>.yaml`.
+
+```yaml
+# recipes/code-fix/workflow.yaml (excerpt)
+nodes:
+  - id: plan
+    type: planner
+    model_lane: architect      # → config/agents/architect.yaml → claude-opus-4
+
+  - id: impl
+    type: implementer
+    model_lane: worker         # → config/agents/worker.yaml → claude-sonnet-4-5
+
+  - id: verify
+    type: verifier
+    model_lane: cheapfast      # → config/agents/cheapfast.yaml → glm-4
+
+  - id: review
+    type: reviewer
+    model_lane: architect      # same lane, same model
+```
+
+Lane → model resolution:
+
+```
+workflow.yaml  →  model_lane: architect
+                     ↓
+config/agents/architect.yaml  →  model: claude-opus-4
+                                  provider: anthropic
+                     ↓
+lib/agent_registry.sh:agent_resolve()
+                     ↓
+lib/llm-dispatch.sh:dispatch_model("claude-opus-4", prompt_file)
+```
+
+To change the model for all `architect`-lane nodes across all recipes, edit `config/agents/architect.yaml`. No `workflow.yaml` changes needed.
+
+**Per-run override (env):**
+
+```bash
+MINI_ORK_LANE_ARCHITECT_MODEL=claude-opus-4 mini-ork run code-fix kickoff.md
+```
+
+**Per-recipe override (workflow.yaml):**
+
+```yaml
+nodes:
+  - id: plan
+    type: planner
+    model_lane: architect
+    model_override: deepseek-v3   # overrides the lane binding for this node only
+```
+
+---
+
+## Bounded Autonomy Note — Promotion Gate Model
+
+The `promotion_gate` and `human_gate` decisions must use a high-quality model. Do not assign `cheapfast` or `budget` lanes to nodes that make promotion decisions.
+
+```yaml
+# recipes/code-fix/workflow.yaml — correct
+nodes:
+  - id: promote
+    type: reviewer              # reviewer type is the closest match for promotion reasoning
+    model_lane: architect       # opus-class — required for rung 6-7 decisions
+    gates: [promotion_gate]
+```
+
+The `promotion_gate` in `lib/promotion_gate.sh` enforces this at runtime:
+
+```bash
+# lib/promotion_gate.sh (excerpt)
+local lane
+lane=$(agent_registry_get_lane "$node_id")
+if [[ "$lane" == "cheapfast" || "$lane" == "budget" ]]; then
+  echo "PROMOTION_GATE_ERROR: promotion decisions require architect or worker lane"
+  exit 1
+fi
+```
+
+If the lane check fails, the promotion is blocked and written to `audit_log` with `result=rejected` and `reason=insufficient_model_lane`.

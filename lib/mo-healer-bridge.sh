@@ -32,7 +32,7 @@ set -uo pipefail
 
 MINI_ORK_ROOT="${MINI_ORK_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 
-# Caller exports: AGENTFLOW_DIR, WORKTREE, EPIC_STATUS, JOB_ID, JOB_RUN_DIR
+# Caller exports: MINI_ORK_HOME, WORKTREE, EPIC_STATUS, JOB_ID, JOB_RUN_DIR
 
 mo_run_healer_on_escalate() {
   local epic="$1"
