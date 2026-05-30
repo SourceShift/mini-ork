@@ -11,6 +11,65 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.1.1] - 2026-05-30
+
+### Added — OSS-readiness deltas
+
+- `GOVERNANCE.md` — lazy-consensus single-maintainer model + reviewer/lead-maintainer path
+- `MAINTAINERS.md` — current maintainers list (template; replace handle when forking)
+- `SUPPORT.md` — help-channels priority list + scope-of-support clarity
+- `ROADMAP.md` — v0.2 / v0.3 / v1.0 buckets + explicit out-of-scope list
+- `RELEASING.md` — SemVer policy + cut-release recipe + deprecation policy
+- `.github/CODEOWNERS` — safety-critical paths require explicit lead approval
+- `.pre-commit-config.yaml` — shellcheck + bash-syntax + schema-validate hooks
+- `examples/00-demo.sh` — 60-second runnable demo (dry-run, no API keys needed)
+- README badges (license / version / CI / status) + "60-second demo" callout
+
+### Fixed — universal-loop integration bugs surfaced by end-to-end smoke
+
+- (schema) Added migration `0013_task_runs.sql` — universal-loop runtime needs a
+  table distinct from the the host application-shape `runs` table (which requires `epic_id` FK)
+- (classify) Now writes to `task_runs` (was: `runs`, which failed FK + column mismatch)
+- (classify) Matchers tolerate BOTH flat `matches: [kw...]` AND structured
+  `matches: { keywords, regex }` shapes — recipes had inconsistent schemas
+- (plan) Replaced sed-based `{{KICKOFF_CONTENT}}` substitution (crashed on
+  multi-line markdown) with python `str.replace` — hermetic
+- (plan) Dry-run writes placeholder JSON to `OUT_FILE` so downstream verify can
+  read it; diagnostics moved to stderr (stdout reserved for `plan_path=…`)
+- (dispatcher) Top-level `mini-ork run` captures classify+plan stdout to thread
+  `MINI_ORK_TASK_CLASS` + `MINI_ORK_PLAN_PATH` into subsequent steps via env
+- (dispatcher) Pre-allocates `MINI_ORK_RUN_ID` so all 4 steps write to the same
+  `task_runs` row
+- (init) Seeds `config/task_classes/` from `recipes/*/task_class.yaml` on
+  bootstrap so the classifier matches on a fresh project
+- (init) Updated "next steps" hints: `deliver` → `mini-ork run <recipe> <kickoff>`
+- (agents.yaml) Added canonical loop-role lanes (planner, worker, reviewer,
+  verifier, reflector, publisher, rollback, researcher) — workflow.yaml refs now resolve
+- (bin/) Added `bin/mini-ork-invoke-prompt` — single-prompt LLM helper for
+  recipe-internal sub-steps (was referenced by bdd-first-delivery but never built)
+- (bdd-first) Fixed `lib/dispatch.sh` invoke-prompt path: `MINI_ORK_HOME/bin` →
+  `MINI_ORK_ROOT/bin` (helper lives in framework dir, not user's project home)
+
+### Known issues (deferred to v0.1.2)
+
+- `mini-ork-verify` exits 1 in dry-run when no artifact is produced — harmless
+  but makes CI green-state ambiguous; needs explicit dry-run code path
+- `recipes/bdd-first-delivery/task_class.yaml` uses top-level `keywords:` instead
+  of the canonical `matches: { keywords: [...] }` shape; classifier handles both
+  but should be normalized
+
+### Verified
+
+- 72 sqlite tables across 13 migrations apply cleanly (idempotent)
+- 61/61 bash -n syntax check across all bin/lib/hooks/tests/recipe scripts
+- `tests/smoke.sh`: 97/97 OK
+- `bash examples/00-demo.sh` runs end-to-end in dry-run; produces a `task_runs`
+  row with `task_class=code-fix`, `recipe=code-fix`, `status=classified`
+- 0 domain leaks (`the host application`, `jisawru`, `100.74.239.22`, etc.)
+- 0 legacy env-var refs (`AGENTFLOW_*`, `MO_AGENTFLOW_*`)
+
+---
+
 ## [0.1.0-redesign] - 2026-05-30
 
 ### BREAKING — full architectural rewrite

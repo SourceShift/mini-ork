@@ -3,9 +3,9 @@
 -- Apply via: mini-ork init OR sqlite3 $MINI_ORK_DB < db/migrations/0013_task_runs.sql
 --
 -- ## Why this table exists separately from `runs`:
--- `runs` (migration 0001_core.sql) is the the host application-shape lifecycle: epic → run → iter,
+-- `runs` (migration 0001_core.sql) is the multi-epic lifecycle: epic → run → iter,
 -- with epic_id FK + worktree branches. That schema fits the bdd-first-delivery recipe
--- shape and other multi-epic pipelines.
+-- shape and other pipelines that decompose a kickoff into parallel sub-epics.
 --
 -- `task_runs` is the universal-task-loop runtime shape (book Ch 4): each kickoff is
 -- a single task that flows classify → plan → execute → verify → reflect → improve.
