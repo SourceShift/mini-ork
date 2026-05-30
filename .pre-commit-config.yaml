@@ -1,0 +1,44 @@
+# mini-ork pre-commit hooks
+#
+# Install:
+#   pip install pre-commit
+#   pre-commit install
+#
+# Run manually:
+#   pre-commit run --all-files
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-json
+      - id: check-merge-conflict
+      - id: check-added-large-files
+        args: ['--maxkb=500']
+      - id: detect-private-key
+
+  - repo: https://github.com/shellcheck-py/shellcheck-py
+    rev: v0.10.0.1
+    hooks:
+      - id: shellcheck
+        # mini-ork shell style is bash-only; suppress sh-only warnings.
+        args: ['--severity=warning', '--shell=bash']
+        # Lib files are sourced — disable SC2034 (unused vars set by caller).
+        files: '(bin/|lib/|hooks/|tests/|recipes/.*/(verifiers|lib)/).*\.sh$'
+
+  - repo: local
+    hooks:
+      - id: bash-syntax
+        name: bash -n on shell scripts
+        entry: bash -c 'for f in "$@"; do bash -n "$f" || exit 1; done' --
+        language: system
+        types: [shell]
+
+      - id: schema-validate-yaml
+        name: validate task_class.yaml + workflow.yaml against schemas
+        entry: bash -c 'command -v check-jsonschema >/dev/null || { echo "skip: check-jsonschema not installed"; exit 0; }; for f in "$@"; do case "$f" in *workflow.yaml) check-jsonschema --schemafile schemas/workflow.schema.json "$f" ;; *task_class.yaml) check-jsonschema --schemafile schemas/task_class.schema.json "$f" ;; esac; done' --
+        language: system
+        files: '(workflow|task_class)\.yaml$'
