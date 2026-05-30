@@ -1,13 +1,31 @@
-# mini-ork lane assignments — which model runs which role
+# mini-ork lane assignments — which model runs which role.
+#
+# Lanes are referenced by workflow.yaml node.model_lane fields.
+# Recipes may use canonical loop-role names (planner, worker, reviewer, …) OR
+# stage-specific names (spec_author, spec_reviewer, decomposer, …).
+#
+# Override per-project at $MINI_ORK_HOME/config/agents.yaml.
 lanes:
-  worker_default: sonnet
-  reviewer_default: opus
+  # Canonical loop-role lanes — used by most generic recipes including code-fix.
+  planner: opus
+  researcher: sonnet
+  implementer: sonnet
+  worker: sonnet          # alias for implementer in workflows that use generic "worker"
+  reviewer: opus
+  verifier: sonnet
+  reflector: opus
+  publisher: sonnet
+  rollback: sonnet
+  # Stage-specific lanes — used by multi-stage recipes such as bdd-first-delivery.
   decomposer: deepseek
-  healer: opus
-  brain: opus
   spec_author: sonnet
   spec_reviewer: opus
   bdd_runner: sonnet
+  healer: opus
+  brain: opus
+  # Legacy aliases for backward-compat with v0.0-shape pipelines.
+  worker_default: sonnet
+  reviewer_default: opus
 budget:
   per_epic_usd: 5.00
   per_run_usd: 0.50

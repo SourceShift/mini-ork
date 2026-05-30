@@ -50,6 +50,24 @@ echo "--- Copying default config ---"
 
 CONFIG_SRC="$MINI_ORK_REPO/config"
 CONFIG_DEST="$MINI_ORK_HOME/config"
+TASK_CLASSES_DEST="$CONFIG_DEST/task_classes"
+mkdir -p "$TASK_CLASSES_DEST"
+
+# Seed task_classes/ from every recipe's task_class.yaml so the classifier has
+# something to match against on first run.
+for recipe_dir in "$MINI_ORK_REPO"/recipes/*/; do
+  [ -d "$recipe_dir" ] || continue
+  recipe_name="$(basename "$recipe_dir")"
+  src_yaml="$recipe_dir/task_class.yaml"
+  [ -f "$src_yaml" ] || continue
+  dest_yaml="$TASK_CLASSES_DEST/${recipe_name}.yaml"
+  if [ ! -f "$dest_yaml" ]; then
+    cp "$src_yaml" "$dest_yaml"
+    _ok "task_class seeded: ${recipe_name}.yaml"
+  else
+    _ok "task_class ${recipe_name}.yaml already present"
+  fi
+done
 
 # agents.yaml
 if [[ -f "$CONFIG_SRC/agents.yaml" ]]; then
@@ -177,15 +195,18 @@ echo "=== mini-ork ready in $PROJECT_ROOT ==="
 echo ""
 echo "Next steps:"
 echo "  1. Review and edit   $MINI_ORK_HOME/config/agents.yaml"
-echo "     (model routing, max_iters, max_lanes)"
+echo "     (model lane assignments + budget caps)"
 echo ""
-echo "  2. Write your first kickoff:"
-echo "     cp ~/ps/mini-ork/examples/01-hello-world/kickoff.md ./kickoff.md"
+echo "  2. (Optional) seed extra task_classes:"
+echo "     ls $MINI_ORK_HOME/config/task_classes/"
+echo ""
+echo "  3. Write your first kickoff:"
+echo "     cp $MINI_ORK_REPO/examples/01-hello-world/kickoff.md ./kickoff.md"
 echo "     # edit kickoff.md for your project"
 echo ""
-echo "  3. Deliver:"
-echo "     mini-ork deliver kickoff.md"
+echo "  4. Run via the universal task loop:"
+echo "     mini-ork run code-fix ./kickoff.md"
 echo ""
-echo "  4. Inspect state:"
-echo "     sqlite3 .mini-ork/state.db 'SELECT id,status,verdict FROM epics;'"
+echo "  5. Inspect state:"
+echo "     sqlite3 .mini-ork/state.db 'SELECT id,task_class,status,verdict FROM task_runs;'"
 echo ""

@@ -101,20 +101,24 @@ if [ -d "$TASK_CLASSES_DIR" ]; then
     # Extract class name from filename (strip path + .yaml)
     candidate_class=$(basename "$yaml_file" .yaml)
 
-    # Use yq if available, else python3 yaml parser fallback
-    if command -v yq >/dev/null 2>&1; then
-      # yq reads the matches[] array; each entry is a regex/keyword
-      mapfile -t patterns < <(yq e '.matches[]' "$yaml_file" 2>/dev/null || true)
-    else
-      mapfile -t patterns < <(python3 - "$yaml_file" <<'PY'
+    # Python fallback handles BOTH shapes:
+    #   matches: [ "kw1", "kw2" ]                            (flat list)
+    #   matches: { keywords: [...], regex: [...], path_globs: [...] }  (structured)
+    mapfile -t patterns < <(python3 - "$yaml_file" <<'PY'
 import sys, yaml
 with open(sys.argv[1]) as f:
     data = yaml.safe_load(f) or {}
-for p in data.get('matches', []):
-    print(p)
+m = data.get('matches', [])
+if isinstance(m, dict):
+    for p in m.get('keywords', []) or []:
+        print(p)
+    for p in m.get('regex', []) or []:
+        print(p)
+elif isinstance(m, list):
+    for p in m:
+        print(p)
 PY
-      )
-    fi
+    )
 
     matched=0
     for pattern in "${patterns[@]}"; do
@@ -155,27 +159,35 @@ fi
 
 # ── DB write ──────────────────────────────────────────────────────────────────
 if [ -f "$MINI_ORK_DB" ]; then
-  RUN_ID="run-$(date +%s)-$$"
-  python3 - "$MINI_ORK_DB" "$RUN_ID" "$TASK_CLASS" "$RESOLVED_WF_VERSION" "$KICKOFF" <<'PY'
+  RUN_ID="${MINI_ORK_RUN_ID:-run-$(date +%s)-$$}"
+  export MINI_ORK_RUN_ID="$RUN_ID"
+  RECIPE="${MINI_ORK_RECIPE:-}"
+  python3 - "$MINI_ORK_DB" "$RUN_ID" "$TASK_CLASS" "$RESOLVED_WF_VERSION" "$KICKOFF" "$RECIPE" <<'PY'
 import sqlite3, sys, time
 
-db, run_id, task_class, wf_version, kickoff = sys.argv[1:]
+db, run_id, task_class, wf_version, kickoff, recipe = sys.argv[1:]
 con = sqlite3.connect(db)
 con.execute("PRAGMA journal_mode=WAL")
 now = int(time.time())
 
-# Upsert into runs table; P3 creates the schema — tolerate missing table gracefully
+# Upsert into task_runs (universal task loop runtime); tolerate missing table gracefully
 try:
     con.execute("""
-        INSERT OR REPLACE INTO runs
-            (id, task_class, workflow_version, kickoff_path, status, created_at, updated_at)
-        VALUES (?, ?, ?, ?, 'classified', ?, ?)
-    """, (run_id, task_class, wf_version, kickoff, now, now))
+        INSERT INTO task_runs
+            (id, task_class, recipe, workflow_version, kickoff_path, status, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, 'classified', ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+            task_class=excluded.task_class,
+            recipe=excluded.recipe,
+            workflow_version=excluded.workflow_version,
+            kickoff_path=excluded.kickoff_path,
+            status='classified',
+            updated_at=excluded.updated_at
+    """, (run_id, task_class, recipe or None, wf_version, kickoff, now, now))
     con.commit()
     print(f"run_id={run_id}")
 except sqlite3.OperationalError as e:
-    # Table doesn't exist yet (P3 not run) — emit warning, continue
-    print(f"[warn] runs table not yet created ({e}); DB write skipped", file=sys.stderr)
+    print(f"[warn] task_runs table not yet created ({e}); DB write skipped", file=sys.stderr)
 finally:
     con.close()
 PY
