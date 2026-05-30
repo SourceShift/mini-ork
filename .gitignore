@@ -22,3 +22,5 @@ dist/
 
 # Editor / tooling
 .claude/settings.local.json
+
+.mini-ork/state.db

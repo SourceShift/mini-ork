@@ -5,8 +5,25 @@ description: >
   independently-workable sub-epics, generates Playwright specs per sub-epic,
   implements in parallel, verifies against specs, and merges on reviewer APPROVE.
 
-# Keywords the framework uses to auto-route kickoffs to this recipe.
-# A kickoff matches if it hits >=2 of these.
+# Canonical matcher shape — `matches: { keywords: [...], regex: [...] }` —
+# matches schemas/task_class.schema.json. Classifier handles BOTH this and
+# legacy top-level `keywords:` (kept below for back-compat).
+matches:
+  keywords:
+    - multi-epic
+    - parallel
+    - playwright
+    - e2e
+    - bdd
+    - gherkin
+    - ui
+    - frontend
+    - decompose
+    - sub-epic
+    - settings page
+  regex: []
+
+# Legacy back-compat keywords (top-level form pre-canonical).
 keywords:
   - multi-epic
   - parallel
