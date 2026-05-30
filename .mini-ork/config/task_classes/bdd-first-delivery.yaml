@@ -1,0 +1,56 @@
+name: bdd_first_delivery
+version: "0.1.0"
+description: >
+  BDD-first parallel delivery: decomposes a multi-concern kickoff into
+  independently-workable sub-epics, generates Playwright specs per sub-epic,
+  implements in parallel, verifies against specs, and merges on reviewer APPROVE.
+
+# Canonical matcher shape — `matches: { keywords: [...], regex: [...] }` —
+# matches schemas/task_class.schema.json. Classifier handles BOTH this and
+# legacy top-level `keywords:` (kept below for back-compat).
+matches:
+  keywords:
+    - multi-epic
+    - parallel
+    - playwright
+    - e2e
+    - bdd
+    - gherkin
+    - ui
+    - frontend
+    - decompose
+    - sub-epic
+    - settings page
+  regex: []
+
+# Legacy back-compat keywords (top-level form pre-canonical).
+keywords:
+  - multi-epic
+  - parallel
+  - playwright
+  - e2e
+  - bdd
+  - ui
+  - frontend
+  - decompose
+
+# Kickoff shape: must be a single markdown file describing the goal.
+kickoff_shape: single_file
+
+# Min files touched for this recipe to be worthwhile.
+# Below this threshold, prefer recipes/code-fix instead.
+min_scope_files: 3
+
+# Max sub-epics the decomposer will emit.
+max_sub_epics: 7
+
+# Cost model (informational, used by cost estimator).
+cost_model:
+  min_usd: 5
+  max_usd: 15
+  per_sub_epic_usd: 2
+
+# Runtime model (informational).
+runtime_model:
+  min_minutes: 15
+  max_minutes: 60
