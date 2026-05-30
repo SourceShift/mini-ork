@@ -128,3 +128,67 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
     mo_llm_smoke "$m" || true
   done
 fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Universal-loop flag-based shim — fixes audit finding D-007.
+#
+# bin/mini-ork-{plan,execute,invoke-prompt} call `llm_dispatch` with
+# --task-class X --node-type Y --prompt-text Z (returning text on stdout).
+# The legacy mo_llm_dispatch uses positional <model> <prompt> <out-file>.
+# This shim translates between them.
+#
+# Resolves model from $MINI_ORK_HOME/config/agents.yaml lanes.<node-type>
+# (falling back to lanes.worker, then $MINI_ORK_DEFAULT_MODEL, then sonnet).
+# ─────────────────────────────────────────────────────────────────────────────
+llm_dispatch() {
+  local task_class="" node_type="" prompt_text="" out_file="" model_override=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --task-class)  task_class="$2";     shift 2 ;;
+      --node-type)   node_type="$2";      shift 2 ;;
+      --prompt-text) prompt_text="$2";    shift 2 ;;
+      --out)         out_file="$2";       shift 2 ;;
+      --model)       model_override="$2"; shift 2 ;;
+      *)             shift ;;
+    esac
+  done
+
+  # Resolve model: explicit override > agents.yaml lane lookup > env default > sonnet
+  local model="${model_override:-${MINI_ORK_DEFAULT_MODEL:-sonnet}}"
+  if [ -z "$model_override" ] && [ -n "$node_type" ]; then
+    local _agents_yaml="${MINI_ORK_HOME:-.mini-ork}/config/agents.yaml"
+    [ ! -f "$_agents_yaml" ] && _agents_yaml="$MINI_ORK_ROOT/config/agents.yaml"
+    if [ -f "$_agents_yaml" ]; then
+      local _resolved
+      _resolved=$(python3 - "$_agents_yaml" "$node_type" 2>/dev/null <<'PY'
+import sys, yaml
+try:
+    d = yaml.safe_load(open(sys.argv[1])) or {}
+    lanes = d.get('lanes', {})
+    print(lanes.get(sys.argv[2]) or lanes.get('worker') or lanes.get('worker_default') or 'sonnet')
+except Exception:
+    print('sonnet')
+PY
+      )
+      [ -n "$_resolved" ] && model="$_resolved"
+    fi
+  fi
+
+  # Allocate tmp out-file when caller wants stdout (default for universal-loop)
+  local _tmp_out=""
+  if [ -z "$out_file" ]; then
+    _tmp_out=$(mktemp -t mo-llm-XXXXXX)
+    out_file="$_tmp_out"
+  fi
+
+  # Dispatch via legacy positional API; emit captured stdout
+  if mo_llm_dispatch "$model" "$prompt_text" "$out_file" >/dev/null 2>&1; then
+    cat "$out_file"
+    [ -n "$_tmp_out" ] && rm -f "$_tmp_out"
+    return 0
+  else
+    local rc=$?
+    [ -n "$_tmp_out" ] && rm -f "$_tmp_out"
+    return $rc
+  fi
+}
