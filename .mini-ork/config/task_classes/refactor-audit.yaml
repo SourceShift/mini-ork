@@ -1,0 +1,42 @@
+name: refactor_audit
+version: "0.1.0"
+description: >
+  Multi-lens audit of a codebase for scalability, security, performance,
+  or architectural-shape concerns. Produces a ranked findings synthesis
+  with one report per lens.
+
+# Canonical matcher shape (matches schemas/task_class.schema.json).
+matches:
+  keywords:
+    - audit
+    - refactor
+    - scalability
+    - bottleneck
+    - tech debt
+    - architecture review
+    - code review
+    - scaling
+    - performance audit
+    - security audit
+    - review codebase
+    - review repo
+  regex: []
+
+artifact_contract_ref: artifact_contract.yaml
+default_workflow: workflow.yaml
+
+default_gates:
+  - budget_gate
+  - scope_gate
+
+risk_class: low   # Audit is read-only analysis; no code mutation by default.
+
+# Cost model (informational; budget_gate enforces).
+cost_model:
+  min_usd: 1
+  max_usd: 40
+  per_lens_usd: 5
+
+runtime_model:
+  min_minutes: 3
+  max_minutes: 60

@@ -1,0 +1,8 @@
+# Scope patterns — glob patterns each lane may modify
+lanes:
+  frontend:
+    allow: ["src/**/*.tsx", "src/**/*.ts", "tests/e2e/**"]
+    deny: ["server/**", "db/**"]
+  backend:
+    allow: ["server/**/*.ts", "server/tests/**"]
+    deny: ["src/**", "public/**"]
