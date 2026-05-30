@@ -77,7 +77,7 @@ bfd_synth_spec() {
     WORKDIR="${worktree}" \
     FEEDBACK_FILE="${feedback}" \
     ITER="${sub_iter}" \
-      "${MINI_ORK_HOME}/bin/mini-ork-invoke-prompt" \
+      "${MINI_ORK_ROOT}/bin/mini-ork-invoke-prompt" \
       > "${spec_log}" 2>&1 || {
         printf '[bfd-dispatch] spec_author infra failure sub_epic=%s iter=%s\n' "${sub_epic_id}" "${sub_iter}" >&2
         return 1
@@ -108,7 +108,7 @@ bfd_synth_spec() {
     WORKDIR="${worktree}" \
     SPEC_PATH="${spec_file}" \
     ITER="${sub_iter}" \
-      "${MINI_ORK_HOME}/bin/mini-ork-invoke-prompt" \
+      "${MINI_ORK_ROOT}/bin/mini-ork-invoke-prompt" \
       > "${review_log}" 2>&1 || {
         printf '[bfd-dispatch] spec_reviewer infra failure sub_epic=%s iter=%s\n' "${sub_epic_id}" "${sub_iter}" >&2
         return 1
@@ -183,7 +183,7 @@ bfd_dispatch_parallel() {
       SUB_EPIC_ID="${sub_epic_id}" \
       WORKDIR="${worktree}" \
       ITER=1 \
-        "${MINI_ORK_HOME}/bin/mini-ork-invoke-prompt" \
+        "${MINI_ORK_ROOT}/bin/mini-ork-invoke-prompt" \
         >> "${log}" 2>&1
     ) > "${log}" 2>&1 &
 

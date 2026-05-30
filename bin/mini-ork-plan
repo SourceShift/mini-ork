@@ -92,8 +92,10 @@ TASK_CLASS="${TASK_CLASS:-generic}"
 WORKFLOW="${MINI_ORK_WORKFLOW:-}"
 
 # ── resolve output path ───────────────────────────────────────────────────────
+# Reuse MINI_ORK_RUN_ID from the dispatcher if present; else allocate one and export
+RUN_ID="${MINI_ORK_RUN_ID:-run-$(date +%s)-$$}"
+export MINI_ORK_RUN_ID="$RUN_ID"
 if [ -z "$OUT_FILE" ]; then
-  RUN_ID="run-$(date +%s)-$$"
   RUN_DIR="$MINI_ORK_HOME/runs/$RUN_ID"
   mkdir -p "$RUN_DIR"
   OUT_FILE="$RUN_DIR/plan.json"
@@ -151,15 +153,25 @@ fi
 # ── LLM dispatch ──────────────────────────────────────────────────────────────
 _require_lib llm-dispatch
 
-KICKOFF_CONTENT=$(cat "$KICKOFF")
-PROMPT_TEXT=$(sed "s|{{KICKOFF_CONTENT}}|${KICKOFF_CONTENT}|g" "$PLANNER_PROMPT_FILE")
+# Substitute {{KICKOFF_CONTENT}} via python str.replace — sed crashes on multi-line
+# payloads (newlines + metacharacters break the sed expression). Python is hermetic.
+PROMPT_TEXT=$(python3 - "$PLANNER_PROMPT_FILE" "$KICKOFF" <<'PY'
+import sys, pathlib
+tpl  = pathlib.Path(sys.argv[1]).read_text()
+body = pathlib.Path(sys.argv[2]).read_text()
+print(tpl.replace("{{KICKOFF_CONTENT}}", body), end="")
+PY
+)
 # Clean up inline tmpfile if we created it
 [ -n "${_PLANNER_TMPFILE:-}" ] && rm -f "$_PLANNER_TMPFILE"
 
 if [ "$DRY_RUN" -eq 1 ]; then
-  echo "[dry-run] would invoke LLM planner with task_class=${TASK_CLASS}"
-  echo "[dry-run] would write plan to: $OUT_FILE"
-  cat <<'JSON'
+  # Diagnostic lines on stderr — stdout is reserved for downstream JSON consumers
+  echo "[dry-run] would invoke LLM planner with task_class=${TASK_CLASS}" >&2
+  echo "[dry-run] would write plan to: $OUT_FILE" >&2
+  # Write the placeholder plan to OUT_FILE so execute/verify can still consume it
+  mkdir -p "$(dirname "$OUT_FILE")"
+  cat > "$OUT_FILE" <<'JSON'
 {
   "objective": "<dry-run: not generated>",
   "assumptions": [],
@@ -170,6 +182,8 @@ if [ "$DRY_RUN" -eq 1 ]; then
   "verifier_contract": { "checks": [{ "id": "dry-run", "description": "dry-run placeholder" }] }
 }
 JSON
+  echo "plan_path=${OUT_FILE}"
+  echo "task_class=${TASK_CLASS}"
   exit 0
 fi
 
@@ -227,16 +241,16 @@ now = int(time.time())
 
 try:
     con.execute("""
-        UPDATE runs
+        UPDATE task_runs
         SET plan_path=?, plan_hash=?, status='planned', updated_at=?
         WHERE id=?
     """, (plan_path, plan_hash, now, run_id))
     if con.execute("SELECT changes()").fetchone()[0] == 0:
         con.execute("""
-            INSERT OR IGNORE INTO runs
-                (id, task_class, plan_path, plan_hash, status, created_at, updated_at)
-            VALUES (?, ?, ?, ?, 'planned', ?, ?)
-        """, (run_id, task_class, plan_path, plan_hash, now, now))
+            INSERT OR IGNORE INTO task_runs
+                (id, task_class, plan_path, plan_hash, kickoff_path, status, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, 'planned', ?, ?)
+        """, (run_id, task_class, plan_path, plan_hash, "", now, now))
     con.commit()
 except sqlite3.OperationalError as e:
     print(f"[warn] DB write skipped: {e}", file=sys.stderr)

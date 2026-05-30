@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+# mini-ork-invoke-prompt — single-prompt LLM invocation helper for recipe scripts.
+#
+# A recipe's lib/dispatch.sh (or any other recipe-internal helper) can call this
+# to fire ONE prompt against the configured LLM lane without owning the whole
+# planner/execute lifecycle. Useful for stage-internal sub-steps like
+# spec_author or spec_reviewer that compose under the recipe's own orchestration.
+#
+# Inputs (via env, NOT positional args — easier to pipe from caller):
+#   MINI_ORK_PROMPT_FILE   path to the prompt .md (REQUIRED)
+#   MINI_ORK_NODE_TYPE     node-type tag for tracing (default: "implementer")
+#   MINI_ORK_TASK_CLASS    task class for llm-dispatch routing (default: "generic")
+#   MINI_ORK_RECIPE        recipe name (for trace tagging, optional)
+#   MINI_ORK_RUN_ID        parent run_id for trace correlation (optional)
+#
+# Placeholder substitution: any {{ENV_VAR}} in the prompt file is replaced with
+# the corresponding shell env var's value at invocation time. Use python
+# str.replace under the hood (sed crashes on multi-line payloads).
+#
+# Output: stdout = raw LLM response. Caller is responsible for parsing.
+# Exit codes: 0 on success, 1 on LLM failure, 2 on bad args, 3 on lib missing.
+set -Eeuo pipefail
+
+MINI_ORK_ROOT="${MINI_ORK_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+export MINI_ORK_ROOT
+
+PROMPT_FILE="${MINI_ORK_PROMPT_FILE:?MINI_ORK_PROMPT_FILE required}"
+NODE_TYPE="${MINI_ORK_NODE_TYPE:-implementer}"
+TASK_CLASS="${MINI_ORK_TASK_CLASS:-generic}"
+
+[ -f "$PROMPT_FILE" ] || { echo "prompt not found: $PROMPT_FILE" >&2; exit 2; }
+
+# ── lib guards ────────────────────────────────────────────────────────────────
+_require_lib() {
+  local lib="$MINI_ORK_ROOT/lib/${1}.sh"
+  [ -f "$lib" ] || { echo "lib/${1}.sh not present" >&2; exit 3; }
+  # shellcheck source=/dev/null
+  source "$lib"
+}
+_require_lib llm-dispatch
+
+# ── placeholder substitution ──────────────────────────────────────────────────
+# Replace {{VAR}} with $VAR for every UPPER_CASE env var currently exported.
+# Python is used (sed crashes on multi-line values).
+PROMPT_TEXT=$(python3 - "$PROMPT_FILE" <<'PY'
+import os, re, sys, pathlib
+
+tpl = pathlib.Path(sys.argv[1]).read_text()
+
+def sub(match):
+    name = match.group(1)
+    return os.environ.get(name, match.group(0))
+
+out = re.sub(r"\{\{([A-Z][A-Z0-9_]*)\}\}", sub, tpl)
+sys.stdout.write(out)
+PY
+)
+
+# ── trace start ───────────────────────────────────────────────────────────────
+TRACE_ID="tr-invoke-$(date +%s)-$$"
+if [ -f "$MINI_ORK_ROOT/lib/trace_store.sh" ] && [ -n "${MINI_ORK_DB:-}" ]; then
+  _require_lib trace_store
+  trace_write "{\"trace_id\":\"$TRACE_ID\",\"task_class\":\"${TASK_CLASS}\",\"status\":\"running\",\"prompt_version_hash\":\"$(echo -n "$PROMPT_TEXT" | shasum | cut -c1-16)\"}" >/dev/null 2>&1 || true
+fi
+
+# ── invoke ────────────────────────────────────────────────────────────────────
+RESPONSE=$(llm_dispatch \
+  --task-class "$TASK_CLASS" \
+  --node-type "$NODE_TYPE" \
+  --prompt-text "$PROMPT_TEXT" 2>&1) || {
+  echo "[invoke-prompt] LLM dispatch failed for $NODE_TYPE" >&2
+  trace_write "{\"trace_id\":\"$TRACE_ID\",\"status\":\"failure\"}" >/dev/null 2>&1 || true
+  exit 1
+}
+
+printf '%s\n' "$RESPONSE"
+
+trace_write "{\"trace_id\":\"$TRACE_ID\",\"status\":\"success\"}" >/dev/null 2>&1 || true

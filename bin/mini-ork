@@ -14,7 +14,8 @@ case "$sub" in
     exec "$MINI_ORK_ROOT/bin/mini-ork-$sub" "$@" ;;
 
   # Convenience: run is a recipe-level entry
-  # Looks up workflow.yaml in recipes/<name>/, then walks classify→plan→execute→verify
+  # Walks classify → plan → execute → verify. Each step's output (key=value
+  # lines on stdout) is parsed to thread state into the next step's env.
   run)
     recipe="${1:?recipe name required}"; shift
     [ -d "$MINI_ORK_ROOT/recipes/$recipe" ] || {
@@ -23,10 +24,34 @@ case "$sub" in
     export MINI_ORK_RECIPE="$recipe"
     export MINI_ORK_WORKFLOW="$MINI_ORK_ROOT/recipes/$recipe/workflow.yaml"
     kickoff="${1:?kickoff.md path required}"; shift || true
-    "$MINI_ORK_ROOT/bin/mini-ork-classify" "$kickoff" && \
-    "$MINI_ORK_ROOT/bin/mini-ork-plan"     "$kickoff" && \
-    "$MINI_ORK_ROOT/bin/mini-ork-execute"  "$kickoff" && \
-    "$MINI_ORK_ROOT/bin/mini-ork-verify"
+    [ -f "$kickoff" ] || { echo "kickoff not found: $kickoff" >&2; exit 2; }
+    # Pre-allocate a shared run_id so every step writes to the same task_runs row.
+    export MINI_ORK_RUN_ID="${MINI_ORK_RUN_ID:-run-$(date +%s)-$$}"
+
+    # ── classify ───────────────────────────────────────────────────────────────
+    classify_out=$("$MINI_ORK_ROOT/bin/mini-ork-classify" "$kickoff") || exit $?
+    printf '%s\n' "$classify_out"
+    MINI_ORK_TASK_CLASS=$(printf '%s\n' "$classify_out" | grep -E '^task_class=' | head -1 | cut -d= -f2)
+    export MINI_ORK_TASK_CLASS
+
+    # ── plan ───────────────────────────────────────────────────────────────────
+    plan_out=$("$MINI_ORK_ROOT/bin/mini-ork-plan" "$kickoff") || exit $?
+    printf '%s\n' "$plan_out"
+    MINI_ORK_PLAN_PATH=$(printf '%s\n' "$plan_out" | grep -E '^plan_path=' | head -1 | cut -d= -f2)
+    export MINI_ORK_PLAN_PATH
+
+    # ── execute (plan path passed via env, not positional) ─────────────────────
+    execute_out=$("$MINI_ORK_ROOT/bin/mini-ork-execute") || exit $?
+    printf '%s\n' "$execute_out"
+    MINI_ORK_ARTIFACT_PATH=$(printf '%s\n' "$execute_out" | grep -E '^artifact_path=' | head -1 | cut -d= -f2)
+    export MINI_ORK_ARTIFACT_PATH
+
+    # ── verify ─────────────────────────────────────────────────────────────────
+    if [ -n "${MINI_ORK_ARTIFACT_PATH:-}" ]; then
+      "$MINI_ORK_ROOT/bin/mini-ork-verify" "$MINI_ORK_ARTIFACT_PATH"
+    else
+      "$MINI_ORK_ROOT/bin/mini-ork-verify"
+    fi
     ;;
 
   doctor)
