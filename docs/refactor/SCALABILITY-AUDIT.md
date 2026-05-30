@@ -84,9 +84,39 @@ single server. Each is bounded effort (≤2 weeks total).
 | **G-007** | `mo_events_archive` defined but never populated | GLM | INSERT-then-DELETE sweep trigger or cron script | 2 h |
 | **G-016** | `agents.yaml` budget caps declared but never enforced | GLM + Codex | In `mo_llm_dispatch`, query `SUM(cost_usd)` per epic before each call; abort on cap | 2 h |
 | **G-022** | `max_lanes: 4` config never consumed by dispatcher | GLM | Read `max_lanes` in `bin/mini-ork-execute` parallel mode; cap with semaphore | 2 h |
+| **D-008** | execute reads node DAG from `plan.json.decomposition[]` instead of `workflow.yaml.nodes[]` — workflow.yaml is design-doc-only, never dispatched | dogfood-run | Make execute parse workflow.yaml directly for node-type/model-lane/prompt-ref; treat plan.json as runtime params not topology | 4 h |
+| **D-008b** | Planner LLM emits `decomposition[].node_type=""` (empty string) → `.get('node_type', 'implementer')` fallback skipped because key exists → all 7 nodes log `[warn] unknown node_type=` and skip silently | dogfood-run | Strengthen planner prompt to REQUIRE explicit node_type per step + post-process validation that rejects plan if any decomposition entry has empty node_type | 1 h |
+| **D-009** | `task_runs.cost_usd` never updated from `llm_dispatch` cost reports — billing visibility broken (audit run showed cost_usd=0.0 despite firing the planner LLM call) | dogfood-run | In mini-ork-plan + mini-ork-execute, after each successful llm_dispatch, UPDATE task_runs SET cost_usd = cost_usd + <call_cost> WHERE id = $MINI_ORK_RUN_ID | 1.5 h |
+| **D-010** | Classifier picks first lex-matching task_class instead of best-match — when 3 classes hit on the same kickoff, lex order (alphabetical filename) wins instead of keyword-hit count. Required tactical workaround for this dogfood run: rename `refactor-audit.yaml` → `0-refactor-audit.yaml` so it sorts first | dogfood-run | Rank task_class matches by `hit_count` (number of matching keywords/regex from `matches.{keywords,regex}`); pick highest; tiebreak by filename lex | 1.5 h |
 
-**Total v0.2 effort:** ~16 hours. Each is independent; can ship as
-9 separate commits or one bundled v0.2 release.
+**Total v0.2 effort:** ~24 hours (4 new findings from real dogfood add
+8h on top of the original 16h). Each is independent; can ship as
+13 separate commits or one bundled v0.2 release.
+
+### Dogfood signal (these 4 findings came from THIS audit's own meta-run)
+
+A real `mini-ork run refactor-audit kickoffs/scale-refactor-mini-ork.md`
+was attempted with the v0.1.2 framework + D-007 shim. Result:
+
+- classify → ✓ (after D-010 workaround: rename to lex-first)
+- plan → ✓ once (planner LLM emitted valid JSON) / ✗ once (planner LLM
+  omitted `verifier_contract.checks` and got rejected — confirms LLM
+  output is non-deterministic; need retry or JSON-mode enforcement)
+- execute → emitted 7 `[warn] unknown node_type=` lines for 7 workflow
+  nodes; all skipped (D-008 + D-008b — workflow.yaml not parsed, plan.json
+  decomposition emitted empty node_types)
+- verify → no artifact to verify; passthrough
+- Cost: $0.00 reported in `task_runs.cost_usd` despite a real planner LLM
+  call having fired (D-009 — cost not propagated)
+- Net: 7 lens nodes intended; 0 actually dispatched. Audit content NOT
+  produced via mini-ork dispatch; the Agent-tool composition (this doc's
+  31 original findings) remains the only audit deliverable for v0.1.2.
+
+**The dogfood ITSELF is the audit's strongest signal:** real
+self-dispatch surfaces 4 framework gaps that Agent-tool composition
+missed. The meta-loop closes when these 4 P1s + the original 9 P1s ship
+as v0.2 — at which point a second dogfood run produces audit content,
+not just bug signal.
 
 ---
 
