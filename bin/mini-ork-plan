@@ -187,15 +187,54 @@ JSON
   exit 0
 fi
 
-PLAN_JSON=$(llm_dispatch \
+PLAN_JSON_RAW=$(llm_dispatch \
   --task-class "$TASK_CLASS" \
   --node-type "planner" \
   --prompt-text "$PROMPT_TEXT" \
   2>&1) || {
   echo "LLM dispatch failed for planner node" >&2
   trace_write "{\"trace_id\":\"$TRACE_ID\",\"task_class\":\"${TASK_CLASS}\",\"status\":\"failure\"}" >/dev/null 2>&1 || true
+  # D-012: charge cost even on failure (LLM was called, money was spent).
+  # Note: this counts as a billable attempt; the success-path increment in
+  # the DB-write block below is GATED out for the failure case.
+  if [ -f "$MINI_ORK_DB" ] && [ -n "${RUN_ID:-}" ]; then
+    python3 -c "
+import sqlite3, sys, time
+con = sqlite3.connect(sys.argv[1])
+con.execute('PRAGMA journal_mode=WAL')
+con.execute(\"UPDATE task_runs SET cost_usd=COALESCE(cost_usd,0)+0.05, updated_at=? WHERE id=?\", (int(time.time()), sys.argv[2]))
+con.commit(); con.close()
+" "$MINI_ORK_DB" "$RUN_ID" 2>/dev/null || true
+  fi
   exit 1
 }
+
+# D-011: strip markdown fences + leading prose before json.loads.
+# Planner LLMs frequently wrap output in ```json ... ``` despite explicit
+# 'no markdown fences' instruction. Tolerate both fenced + bare JSON.
+PLAN_JSON=$(printf '%s' "$PLAN_JSON_RAW" | python3 -c "
+import sys, re
+txt = sys.stdin.read()
+# Strip everything before the first { and after the last }
+m = re.search(r'\{.*\}', txt, flags=re.S)
+if m:
+    txt = m.group(0)
+sys.stdout.write(txt)
+")
+
+# D-012: charge cost-of-call NOW (after LLM returned, before validation).
+# Failed validation still owes the LLM call's cost. The success-path block
+# below skips the duplicate charge by setting MO_PLAN_COST_CHARGED=1.
+if [ -f "$MINI_ORK_DB" ] && [ -n "${RUN_ID:-}" ]; then
+  python3 -c "
+import sqlite3, sys, time
+con = sqlite3.connect(sys.argv[1])
+con.execute('PRAGMA journal_mode=WAL')
+con.execute(\"UPDATE task_runs SET cost_usd=COALESCE(cost_usd,0)+0.05, updated_at=? WHERE id=?\", (int(time.time()), sys.argv[2]))
+con.commit(); con.close()
+" "$MINI_ORK_DB" "$RUN_ID" 2>/dev/null || true
+  export MO_PLAN_COST_CHARGED=1
+fi
 
 # ── validate plan JSON (D-008b: also check decomposition[].node_type) ─────────
 HAS_VERIFIER=$(echo "$PLAN_JSON" | python3 -c "
@@ -267,12 +306,12 @@ con.execute("PRAGMA journal_mode=WAL")
 now = int(time.time())
 
 try:
-    # D-009: increment cost_usd. Placeholder $0.05 per planner call until
-    # claude --output-format json cost extraction lands (v0.2.1).
+    # D-012: cost was charged above the validation gate (so failed plans
+    # also count). DO NOT double-charge here. The success-path UPDATE
+    # only sets status + plan_path + plan_hash.
     con.execute("""
         UPDATE task_runs
-        SET plan_path=?, plan_hash=?, status='planned', updated_at=?,
-            cost_usd=COALESCE(cost_usd,0) + 0.05
+        SET plan_path=?, plan_hash=?, status='planned', updated_at=?
         WHERE id=?
     """, (plan_path, plan_hash, now, run_id))
     if con.execute("SELECT changes()").fetchone()[0] == 0:
