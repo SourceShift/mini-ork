@@ -92,18 +92,22 @@ if [ "$DRY_RUN" -eq 0 ]; then
   trace_write "{\"trace_id\":\"$TRACE_ID\",\"task_class\":\"__classify__\",\"status\":\"running\",\"workflow_version_id\":\"classify-start\"}" >/dev/null 2>&1 || true
 fi
 
-# ── classification ────────────────────────────────────────────────────────────
+# ── classification (D-010 fix: rank-by-hit-count, not lex-first) ──────────────
+# For each task_class yaml, count how many of its patterns match the kickoff.
+# Pick the class with the highest hit count. Tiebreak: lex order (deterministic).
+# Falls back to 'generic' if no class matches at all.
 KICKOFF_TEXT=$(cat "$KICKOFF")
 TASK_CLASS="generic"
+BEST_HITS=0
 
 if [ -d "$TASK_CLASSES_DIR" ]; then
   while IFS= read -r -d '' yaml_file; do
-    # Extract class name from filename (strip path + .yaml)
     candidate_class=$(basename "$yaml_file" .yaml)
 
     # Python fallback handles BOTH shapes:
     #   matches: [ "kw1", "kw2" ]                            (flat list)
     #   matches: { keywords: [...], regex: [...], path_globs: [...] }  (structured)
+    # Also tolerates legacy TOP-LEVEL `keywords:` form (recipes/bdd-first-delivery).
     mapfile -t patterns < <(python3 - "$yaml_file" <<'PY'
 import sys, yaml
 with open(sys.argv[1]) as f:
@@ -117,19 +121,25 @@ if isinstance(m, dict):
 elif isinstance(m, list):
     for p in m:
         print(p)
+# Legacy top-level keywords (back-compat)
+for p in data.get('keywords', []) or []:
+    print(p)
 PY
     )
 
-    matched=0
+    # Count hits — NOT break-on-first (D-010 fix)
+    hits=0
     for pattern in "${patterns[@]}"; do
+      [ -z "$pattern" ] && continue
       if echo "$KICKOFF_TEXT" | grep -qiE "$pattern" 2>/dev/null; then
-        matched=1; break
+        hits=$((hits + 1))
       fi
     done
 
-    if [ "$matched" -eq 1 ]; then
+    # Strict greater-than means lex-first wins on ties (find | sort -z order)
+    if [ "$hits" -gt "$BEST_HITS" ]; then
+      BEST_HITS="$hits"
       TASK_CLASS="$candidate_class"
-      break
     fi
   done < <(find "$TASK_CLASSES_DIR" -maxdepth 1 -name '*.yaml' -print0 2>/dev/null | sort -z)
 fi
