@@ -83,7 +83,7 @@ fi
 CANDIDATE_WORKFLOW=""
 if [ -f "$MINI_ORK_DB" ]; then
   CANDIDATE_WORKFLOW=$(sqlite3 "$MINI_ORK_DB" \
-    "SELECT workflow_yaml FROM workflow_candidates WHERE id='${CANDIDATE_ID}' LIMIT 1;" \
+    "SELECT workflow_yaml FROM workflow_candidates WHERE candidate_id='${CANDIDATE_ID}' LIMIT 1;" \
     2>/dev/null || true)
 fi
 
