@@ -1,0 +1,191 @@
+#!/usr/bin/env bash
+# mini-ork-init — scaffold .mini-ork/ in the current project
+# Run from the project root: mini-ork init  (or: bash path/to/mini-ork-init)
+# Idempotent — safe to re-run.
+set -Eeuo pipefail
+
+MINI_ORK_REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PROJECT_ROOT="$(pwd)"
+
+# Allow caller to override the home dir (used in tests)
+MINI_ORK_HOME="${MINI_ORK_HOME:-$PROJECT_ROOT/.mini-ork}"
+export MINI_ORK_HOME
+export MINI_ORK_DB="$MINI_ORK_HOME/state.db"
+
+PASS=0; WARN=0
+_ok()   { echo "  [OK]   $*"; PASS=$((PASS+1)); }
+_warn() { echo "  [WARN] $*"; WARN=$((WARN+1)); }
+
+echo "=== mini-ork init ==="
+echo "    project: $PROJECT_ROOT"
+echo "    home:    $MINI_ORK_HOME"
+echo ""
+
+# ── 1. Create directory structure ─────────────────────────────────────────────
+
+echo "--- Creating .mini-ork/ structure ---"
+
+for dir in \
+  "$MINI_ORK_HOME" \
+  "$MINI_ORK_HOME/kickoffs" \
+  "$MINI_ORK_HOME/INBOX" \
+  "$MINI_ORK_HOME/runs" \
+  "$MINI_ORK_HOME/locks" \
+  "$MINI_ORK_HOME/secrets" \
+  "$MINI_ORK_HOME/config"
+do
+  if [[ ! -d "$dir" ]]; then
+    mkdir -p "$dir"
+    _ok "created $(basename "$dir")/"
+  else
+    _ok "$(basename "$dir")/ already exists"
+  fi
+done
+
+echo ""
+
+# ── 2. Copy default config files ──────────────────────────────────────────────
+
+echo "--- Copying default config ---"
+
+CONFIG_SRC="$MINI_ORK_REPO/config"
+CONFIG_DEST="$MINI_ORK_HOME/config"
+
+# agents.yaml
+if [[ -f "$CONFIG_SRC/agents.yaml" ]]; then
+  if [[ ! -f "$CONFIG_DEST/agents.yaml" ]]; then
+    cp "$CONFIG_SRC/agents.yaml" "$CONFIG_DEST/agents.yaml"
+    _ok "agents.yaml copied to config/"
+  else
+    _ok "agents.yaml already present — not overwritten"
+  fi
+else
+  # Create a minimal default if the repo copy doesn't exist yet
+  if [[ ! -f "$CONFIG_DEST/agents.yaml" ]]; then
+    cat > "$CONFIG_DEST/agents.yaml" <<'YAML'
+# mini-ork agent configuration
+# Edit to customise model routing, iteration caps, and lane parallelism.
+
+defaults:
+  max_iters: 3          # max worker+review cycles per epic before escalation
+  max_lanes: 4          # max parallel lanes (epics running simultaneously)
+
+models:
+  decomposer:   claude-opus-4       # parses kickoff, seeds epics
+  worker:       claude-sonnet-4-5   # default implementation model
+  reviewer:     claude-opus-4       # adversarial diff reviewer
+  healer:       claude-sonnet-4-5   # self-heal on BDD failure
+  hunter:       glm-4               # cheap parallel scan (bug-hunt mode)
+
+# Per-complexity overrides:
+complexity:
+  low:    { worker: claude-sonnet-4-5 }
+  medium: { worker: claude-sonnet-4-5 }
+  high:   { worker: claude-opus-4     }
+YAML
+    _ok "agents.yaml created (default)"
+  fi
+fi
+
+# scope-patterns.yaml.example
+if [[ -f "$CONFIG_SRC/scope-patterns.yaml.example" ]]; then
+  if [[ ! -f "$CONFIG_DEST/scope-patterns.yaml.example" ]]; then
+    cp "$CONFIG_SRC/scope-patterns.yaml.example" "$CONFIG_DEST/scope-patterns.yaml.example"
+    _ok "scope-patterns.yaml.example copied to config/"
+  else
+    _ok "scope-patterns.yaml.example already present"
+  fi
+else
+  # Emit example even if repo source not present
+  if [[ ! -f "$CONFIG_DEST/scope-patterns.yaml.example" ]]; then
+    cat > "$CONFIG_DEST/scope-patterns.yaml.example" <<'YAML'
+# Scope pattern configuration — copy to scope-patterns.yaml and edit.
+#
+# Patterns listed under 'deny' are checked against each epic's proposed
+# file writes.  If an epic touches a denied path, the lane is rejected
+# before the worker runs.
+#
+# Use glob syntax (fnmatch).  Leading '!' negates a pattern.
+
+deny:
+  - "*.env"
+  - "*.env.*"
+  - ".mini-ork/**"
+  - "node_modules/**"
+  - "dist/**"
+  - "*.db"
+
+# Per-epic file-touch limits (0 = unlimited):
+limits:
+  max_files_per_epic: 20
+YAML
+    _ok "scope-patterns.yaml.example created"
+  fi
+fi
+
+echo ""
+
+# ── 3. Initialise state.db ────────────────────────────────────────────────────
+
+echo "--- Initialising state.db ---"
+
+DB_INIT="$MINI_ORK_REPO/db/init.sh"
+if [[ -f "$DB_INIT" ]]; then
+  if bash "$DB_INIT" >/dev/null 2>&1; then
+    _ok "state.db initialised via db/init.sh"
+  else
+    _warn "db/init.sh exited non-zero — state.db may be incomplete"
+  fi
+else
+  _warn "db/init.sh not found — state.db not created (run after other agents land db/)"
+fi
+
+echo ""
+
+# ── 4. Update .gitignore ──────────────────────────────────────────────────────
+
+echo "--- Updating .gitignore ---"
+
+GITIGNORE="$PROJECT_ROOT/.gitignore"
+GITIGNORE_ENTRIES=(
+  ".mini-ork/state.db"
+  ".mini-ork/runs/"
+  ".mini-ork/INBOX/"
+  ".mini-ork/secrets/"
+  ".mini-ork/locks/"
+)
+
+if [[ ! -f "$GITIGNORE" ]]; then
+  touch "$GITIGNORE"
+  _ok "created .gitignore"
+fi
+
+for entry in "${GITIGNORE_ENTRIES[@]}"; do
+  if grep -qxF "$entry" "$GITIGNORE" 2>/dev/null; then
+    _ok ".gitignore: $entry (already present)"
+  else
+    printf '\n%s\n' "$entry" >> "$GITIGNORE"
+    _ok ".gitignore: added $entry"
+  fi
+done
+
+echo ""
+
+# ── Summary + next steps ──────────────────────────────────────────────────────
+
+echo "=== mini-ork ready in $PROJECT_ROOT ==="
+echo ""
+echo "Next steps:"
+echo "  1. Review and edit   $MINI_ORK_HOME/config/agents.yaml"
+echo "     (model routing, max_iters, max_lanes)"
+echo ""
+echo "  2. Write your first kickoff:"
+echo "     cp ~/ps/mini-ork/examples/01-hello-world/kickoff.md ./kickoff.md"
+echo "     # edit kickoff.md for your project"
+echo ""
+echo "  3. Deliver:"
+echo "     mini-ork deliver kickoff.md"
+echo ""
+echo "  4. Inspect state:"
+echo "     sqlite3 .mini-ork/state.db 'SELECT id,status,verdict FROM epics;'"
+echo ""

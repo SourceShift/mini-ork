@@ -1,0 +1,41 @@
+mini-ork
+Copyright 2026 The mini-ork Authors
+
+This product includes software developed by The mini-ork Authors
+(https://github.com/ork-ai/mini-ork).
+
+---
+
+THIRD-PARTY LICENSES
+
+sqlite3
+  License: Public Domain
+  The sqlite3 binary is invoked as an external process and is not bundled
+  with this software. SQLite is in the public domain:
+  https://www.sqlite.org/copyright.html
+
+jq
+  License: MIT
+  The jq binary is invoked as an external process and is not bundled
+  with this software.
+  Copyright (C) 2012 Stephen Dolan
+  https://github.com/jqlang/jq/blob/master/COPYING
+
+Claude Code SDK / claude CLI
+  License: Anthropic Terms of Service
+  The `claude` CLI is invoked as an external process. Use of the Claude
+  API is governed by Anthropic's Terms of Service and Usage Policies:
+  https://www.anthropic.com/legal/consumer-terms
+  https://www.anthropic.com/legal/usage-policy
+
+bash
+  License: GNU GPL v3 (invoked, not bundled)
+  bash is invoked as an external interpreter. It is not linked into or
+  distributed with this software. No GPL obligations are incurred.
+  https://www.gnu.org/software/bash/
+
+git
+  License: GNU GPL v2 (invoked, not bundled)
+  git is invoked as an external process. It is not linked into or
+  distributed with this software.
+  https://git-scm.com/about/free-and-open-source

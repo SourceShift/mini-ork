@@ -1,0 +1,14 @@
+# mini-ork lane assignments — which model runs which role
+lanes:
+  worker_default: sonnet
+  reviewer_default: opus
+  decomposer: deepseek
+  healer: opus
+  brain: opus
+  spec_author: sonnet
+  spec_reviewer: opus
+  bdd_runner: sonnet
+budget:
+  per_epic_usd: 5.00
+  per_run_usd: 0.50
+  daily_cap_usd: 50.00

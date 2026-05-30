@@ -1,0 +1,560 @@
+#!/usr/bin/env bash
+# mini-ork run — scoped multi-epic loop with reviewer feedback.
+#
+# Usage:
+#   mini-ork run <job-id> [--epics A,B,C] [--max-iter N] [--dry-run]
+#
+# Job-id convention: a directory name under .mini-ork/mini-ork/runs/.
+# Epic resolution (in order):
+#   1. --epics A,B,C   → explicit list
+#   2. group_id match   → epics WHERE group_id='group-<job-id>'
+#   3. prefix fallback  → epics WHERE id LIKE '<JOB_ID_UPPER>-%'
+#
+# Env:
+#   MO_REVIEWER_BUDGET_USD   default 5.00
+#   MO_WORKER_TIMEOUT_MIN    default = per-epic budget (glm=30 default)
+#   MO_DEFAULT_WORKER_LANE   default worker model (default: glm)
+#   MO_DECOMPOSE_LANE        L1 decomposer lane (default: glm)
+#   MO_SPEC_AUTHOR_LANE      Spec author lane (default: glm)
+#   MO_REVIEWER_LANE         Reviewer lane for complex epics (default: glm)
+#   MO_REVIEWER_LANE_TRIVIAL Reviewer lane for trivial epics (default: glm)
+
+set -uo pipefail
+
+# ─── Paths ──────────────────────────────────────────────────────────────
+MINI_ORK_ROOT="${MINI_ORK_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+MINI_ORK_DIR="$MINI_ORK_ROOT"
+REPO_ROOT="${REPO_ROOT:-$(pwd)}"
+MINI_ORK_HOME="${MINI_ORK_HOME:-.mini-ork}"
+
+MINI_ORK_DB="${MINI_ORK_DB:-${REPO_ROOT}/${MINI_ORK_HOME}/state.db}"
+
+# ─── Local provider env scripts ─────────────────────────────────────────
+if [ -z "${AGENT_SCRIPTS_DIR:-}" ] && [ -f "$MINI_ORK_ROOT/lib/providers/cl_deepseek.sh" ]; then
+  export AGENT_SCRIPTS_DIR="$MINI_ORK_ROOT/lib/providers"
+  echo "[mini-ork] AGENT_SCRIPTS_DIR=$AGENT_SCRIPTS_DIR (local provider scripts)" >&2
+fi
+
+# shellcheck source=lib/dispatch.sh
+source "$MINI_ORK_DIR/lib/dispatch.sh"
+# shellcheck source=lib/finalize.sh
+source "$MINI_ORK_DIR/lib/finalize.sh"
+# shellcheck source=lib/rebase-guard.sh
+source "$MINI_ORK_DIR/lib/rebase-guard.sh"
+# shellcheck source=lib/scope-overlap.sh
+source "$MINI_ORK_DIR/lib/scope-overlap.sh"
+# shellcheck source=lib/auto-merge.sh
+source "$MINI_ORK_DIR/lib/auto-merge.sh"
+
+# ─── Lib hot-reload (mtime fingerprint) ─────────────────────────────────
+_mo_lib_mtime_fingerprint() {
+  local total=0 m
+  for f in "$MINI_ORK_DIR"/lib/*.sh; do
+    m=$(stat -f %m "$f" 2>/dev/null || stat -c %Y "$f" 2>/dev/null || echo 0)
+    total=$((total + m))
+  done
+  echo "$total"
+}
+_MO_LIB_FINGERPRINT="$(_mo_lib_mtime_fingerprint 2>/dev/null || echo 0)"
+_mo_lib_hot_reload_check() {
+  [ "${MO_DISABLE_LIB_HOT_RELOAD:-0}" = "1" ] && return 0
+  local cur
+  cur=$(_mo_lib_mtime_fingerprint 2>/dev/null || echo 0)
+  if [ "$cur" != "$_MO_LIB_FINGERPRINT" ]; then
+    echo "[mini-ork] lib mtime changed — re-sourcing lib files" >&2
+    source "$MINI_ORK_DIR/lib/dispatch.sh"
+    source "$MINI_ORK_DIR/lib/finalize.sh"
+    source "$MINI_ORK_DIR/lib/rebase-guard.sh"
+    source "$MINI_ORK_DIR/lib/scope-overlap.sh"
+    source "$MINI_ORK_DIR/lib/auto-merge.sh"
+    _MO_LIB_FINGERPRINT="$cur"
+    echo "[mini-ork] lib hot-reload complete — fingerprint=$cur" >&2
+  fi
+}
+
+# ─── Args ───────────────────────────────────────────────────────────────
+usage() { sed -n 's/^# \{0,1\}//p' "$0" | head -20; exit "${1:-0}"; }
+
+[ $# -ge 1 ] || usage 1
+[ "$1" = "-h" ] || [ "$1" = "--help" ] && usage 0
+
+JOB_ID="$1"; shift
+EPICS_FILTER=""
+MAX_ITER=3
+DRY_RUN=0
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --epics)    EPICS_FILTER="$2"; shift 2 ;;
+    --max-iter) MAX_ITER="$2";     shift 2 ;;
+    --dry-run)  DRY_RUN=1;         shift ;;
+    *) echo "unknown flag: $1" >&2; exit 1 ;;
+  esac
+done
+
+# Export for sourced libs
+export REPO_ROOT MINI_ORK_DIR MINI_ORK_DB JOB_ID MAX_ITER
+# AGENTFLOW_DIR compatibility alias (used by dispatch.sh internals)
+export AGENTFLOW_DIR="${REPO_ROOT}/${MINI_ORK_HOME}"
+
+# ─── Resolve epic list ──────────────────────────────────────────────────
+resolve_epics() {
+  if [ -n "$EPICS_FILTER" ]; then
+    echo "$EPICS_FILTER" | tr ',' '\n'
+    return
+  fi
+  local group_id="group-$JOB_ID"
+  local by_group
+  by_group=$(sqlite3 "$MINI_ORK_DB" \
+    "SELECT id FROM epics WHERE group_id='${group_id}' AND archived_at IS NULL ORDER BY id;" 2>/dev/null)
+  if [ -n "$by_group" ]; then
+    echo "$by_group"
+    return
+  fi
+  local prefix="${JOB_ID^^}-"
+  sqlite3 "$MINI_ORK_DB" \
+    "SELECT id FROM epics WHERE id LIKE '${prefix}%' AND archived_at IS NULL ORDER BY id;"
+}
+
+mapfile -t EPICS < <(resolve_epics)
+[ "${#EPICS[@]}" -gt 0 ] || { echo "ERROR: no epics resolved for job $JOB_ID" >&2; exit 2; }
+
+# Resolve worktrees up front
+declare -A WORKTREE
+for epic in "${EPICS[@]}"; do
+  kickoff=$(sqlite3 "$MINI_ORK_DB" "SELECT kickoff_path FROM epics WHERE id='$epic';")
+  branch=$(grep -E '^>?[[:space:]]*\*\*Branch:\*\*' "$REPO_ROOT/$kickoff" 2>/dev/null | head -1 | sed -E 's/^[^`]*`([^`]+)`.*/\1/')
+  if [ -z "$branch" ]; then echo "ERROR: no branch in kickoff for $epic" >&2; exit 3; fi
+  wt=$(git -C "$REPO_ROOT" worktree list --porcelain | awk -v b="refs/heads/$branch" '
+    /^worktree / { p = substr($0, 10) }
+    /^branch / && $2 == b { print p; exit }
+  ')
+  if [ -z "$wt" ]; then echo "ERROR: no worktree for branch $branch (epic $epic)" >&2; exit 4; fi
+  WORKTREE["$epic"]="$wt"
+done
+
+# ─── Banner ─────────────────────────────────────────────────────────────
+cat <<EOF
+─────────────────────────────────────────────────────────────────
+ mini-ork run                                      job=$JOB_ID
+─────────────────────────────────────────────────────────────────
+ epics:    ${EPICS[*]}
+ max-iter: $MAX_ITER
+ reviewer: ${MO_REVIEWER_LANE:-glm}
+EOF
+for epic in "${EPICS[@]}"; do
+  printf '   %-6s worktree=%s\n' "$epic" "${WORKTREE[$epic]}"
+done
+echo "─────────────────────────────────────────────────────────────────"
+
+if [ "$DRY_RUN" -eq 1 ]; then echo "DRY RUN — exiting before dispatch."; exit 0; fi
+
+JOB_RUN_DIR="$MINI_ORK_DIR/runs/$JOB_ID"
+mkdir -p "$JOB_RUN_DIR"
+date -u +"%FT%TZ" > "$JOB_RUN_DIR/started_at"
+
+# ─── Per-epic dispatch mutex ────────────────────────────────────────────
+declare -a _LOCK_DIRS=()
+_acquire_epic_lock() {
+  local epic="$1"
+  local lock_dir="$JOB_RUN_DIR/.lock-$epic"
+  if ! mkdir "$lock_dir" 2>/dev/null; then
+    if [ -f "$lock_dir/pid" ] && ! kill -0 "$(cat "$lock_dir/pid" 2>/dev/null)" 2>/dev/null; then
+      echo "[mini-ork] reaping stale lock $lock_dir from dead pid $(cat "$lock_dir/pid" 2>/dev/null)" >&2
+      rm -rf "$lock_dir"
+      mkdir "$lock_dir" || { echo "[mini-ork] $epic: lock contention even after reap — exit 0" >&2; return 1; }
+    else
+      local holder; holder=$(cat "$lock_dir/pid" 2>/dev/null || echo "?")
+      echo "[mini-ork] $epic: another orch holds lock (pid=$holder) — exit 0" >&2
+      return 1
+    fi
+  fi
+  echo "$$" > "$lock_dir/pid"
+  _LOCK_DIRS+=("$lock_dir")
+  return 0
+}
+_LOCK_PARENT_PID=$$
+_release_epic_locks() {
+  if [ "${BASHPID:-$$}" != "$_LOCK_PARENT_PID" ]; then
+    return 0
+  fi
+  for d in "${_LOCK_DIRS[@]}"; do rm -rf "$d"; done
+}
+trap _release_epic_locks EXIT INT TERM
+
+for epic in "${EPICS[@]}"; do
+  if ! _acquire_epic_lock "$epic"; then
+    exit 0
+  fi
+done
+
+# Clean phantom-orphan iter-* dirs from prior crashed runs
+for epic in "${EPICS[@]}"; do
+  epic_run_dir="$JOB_RUN_DIR/$epic"
+  [ -d "$epic_run_dir" ] || continue
+  for iter_dir in "$epic_run_dir"/iter-*/; do
+    [ -d "$iter_dir" ] || continue
+    if [ -z "$(ls -A "$iter_dir" 2>/dev/null)" ]; then
+      rmdir "$iter_dir" 2>/dev/null && \
+        echo "[mini-ork] cleaned empty iter dir: $iter_dir" >&2
+    fi
+  done
+done
+
+# Best-effort GC of expired cache rows
+mo_cache_gc || true
+
+# ─── Unified tracking: open a runs row per epic at dispatch start ───────
+declare -A EPIC_RUN_ID
+for epic in "${EPICS[@]}"; do
+  EPIC_RUN_ID["$epic"]=$(mo_runs_open "$epic" "${WORKTREE[$epic]}" 2>/dev/null || echo "")
+done
+
+# ─── Scope manifest write (capability scoping) ────────────────────────
+for epic in "${EPICS[@]}"; do
+  _mo_run_dir_now="$JOB_RUN_DIR/$epic"
+  mkdir -p "$_mo_run_dir_now"
+  mo_write_scope_manifest "$epic" "$_mo_run_dir_now" 2>/dev/null || true
+done
+
+# ─── Branch quarantine ─────────────────────────────────────────────────
+for epic in "${EPICS[@]}"; do
+  mo_quarantine_check_and_reset "$epic" "${WORKTREE[$epic]}" 2>/dev/null || true
+done
+
+# ─── Stale-base auto-rebase (dispatch-time) ─────────────────────────────
+for epic in "${EPICS[@]}"; do
+  mo_rebase_branch_onto_main "$epic" "${WORKTREE[$epic]}" dispatch || true
+done
+
+# ─── Phase A.4: precondition gate ─────────────────────────────────────
+declare -A EPIC_PRECOND_PASS
+for epic in "${EPICS[@]}"; do
+  if mo_check_preconditions "$epic" "${WORKTREE[$epic]}"; then
+    EPIC_PRECOND_PASS["$epic"]=1
+  else
+    echo "[mini-ork] PRECONDITION FAIL for $epic" >&2
+    EPIC_PRECOND_PASS["$epic"]=0
+  fi
+done
+
+# ─── Phase A.1.5: scope-overlap check ────────────────────────────────
+MO_SCOPE_OVERLAP=0
+if [ "${MO_SERIALIZE_ON_OVERLAP:-1}" -eq 1 ]; then
+  if ! mo_check_scope_overlap; then
+    MO_SCOPE_OVERLAP=1
+  fi
+else
+  mo_check_scope_overlap || true
+fi
+
+# ─── Phase A.2: spec synthesis sub-loop ───────────────────────────────
+declare -A EPIC_SPEC_STATE
+
+_mo_run_one_spec_synth() {
+  local epic="$1" wt="$2" state_dir="$3"
+  local existing
+  existing=$(mo_spec_exists "$epic" "$wt")
+  if [ -n "$existing" ]; then
+    echo "[mini-ork] spec already exists for $epic: $existing — skipping synth"
+    printf 'READY|%s\n' "$existing" > "$state_dir/$epic"
+    return 0
+  fi
+  echo "[mini-ork] === spec-synth $epic dispatched ==========================================" >&2
+  local out rc
+  out=$(mo_synth_spec "$epic" "$wt"); rc=$?
+  mkdir -p "$state_dir"
+  if [ "$rc" -eq 0 ]; then
+    if [ "$out" = "SKIPPED" ]; then
+      printf 'SKIPPED|\n' > "$state_dir/$epic"
+    else
+      printf 'READY|%s\n' "$out" > "$state_dir/$epic"
+    fi
+  else
+    printf 'ESCALATE|rc=%s\n' "$rc" > "$state_dir/$epic"
+  fi
+}
+
+if [ "${MO_SKIP_SPEC_SYNTH:-0}" -ne 1 ]; then
+  _spec_state_dir="$JOB_RUN_DIR/.spec-synth-state"
+  rm -rf "$_spec_state_dir" && mkdir -p "$_spec_state_dir"
+
+  _partition_count=1
+  if [ "$MO_SCOPE_OVERLAP" -eq 1 ]; then
+    _partition_count=$(mo_partition_count 2>/dev/null || echo 1)
+  fi
+
+  if [ "$MO_SCOPE_OVERLAP" -eq 1 ] && [ "${_partition_count:-1}" -ge 2 ]; then
+    echo "[mini-ork] spec-synth PARTITIONED across $_partition_count group(s)"
+    _partitions_json=$(jq -c '.partitions' "$JOB_RUN_DIR/scope-overlap.json" 2>/dev/null || echo '[]')
+    for ((_p = 0; _p < _partition_count; _p++)); do
+      (
+        mapfile -t _partition_epics < <(echo "$_partitions_json" | jq -r ".[$_p] | .[]")
+        for _pe in "${_partition_epics[@]}"; do
+          local_match=0
+          for _e in "${EPICS[@]}"; do
+            if [ "$_e" = "$_pe" ]; then local_match=1; break; fi
+          done
+          [ "$local_match" -eq 0 ] && continue
+          _mo_run_one_spec_synth "$_pe" "${WORKTREE[$_pe]}" "$_spec_state_dir"
+        done
+      ) &
+    done
+    wait
+  else
+    _max_par="${MO_SPEC_SYNTH_PARALLEL:-6}"
+    if [ "$MO_SCOPE_OVERLAP" -eq 1 ]; then
+      _max_par=1
+      echo "[mini-ork] spec-synth SERIALIZED — overlap detected" >&2
+    fi
+    _running=0
+    _total=0
+    echo "[mini-ork] spec-synth: dispatching ${#EPICS[@]} epic(s) in parallel (max=$_max_par)"
+    _ss_stagger="${MO_SPEC_SYNTH_STAGGER_SEC:-3}"
+    _ss_first=1
+    for epic in "${EPICS[@]}"; do
+      if [ "$_ss_first" = 0 ] && [ "$_ss_stagger" -gt 0 ]; then
+        sleep "$_ss_stagger"
+      fi
+      _ss_first=0
+      ( _mo_run_one_spec_synth "$epic" "${WORKTREE[$epic]}" "$_spec_state_dir" ) &
+      _running=$((_running + 1))
+      _total=$((_total + 1))
+      if [ "$_running" -ge "$_max_par" ]; then
+        wait -n
+        _running=$((_running - 1))
+      fi
+    done
+    wait
+  fi
+  echo "[mini-ork] spec-synth: all $_total epic(s) complete"
+
+  for epic in "${EPICS[@]}"; do
+    state_file="$_spec_state_dir/$epic"
+    if [ ! -f "$state_file" ]; then
+      EPIC_SPEC_STATE["$epic"]="ESCALATE"
+      continue
+    fi
+    state_line=$(cat "$state_file")
+    case "$state_line" in
+      READY*)   EPIC_SPEC_STATE["$epic"]="READY" ;;
+      SKIPPED*) EPIC_SPEC_STATE["$epic"]="SKIPPED" ;;
+      ESCALATE*)
+        EPIC_SPEC_STATE["$epic"]="ESCALATE"
+        echo "[mini-ork] spec-synth ESCALATE for $epic"
+        ;;
+      *)
+        echo "[mini-ork] spec-synth: unknown state for $epic: $state_line"
+        EPIC_SPEC_STATE["$epic"]="ESCALATE"
+        ;;
+    esac
+  done
+else
+  echo "[mini-ork] MO_SKIP_SPEC_SYNTH=1 — using existing specs only"
+  for epic in "${EPICS[@]}"; do EPIC_SPEC_STATE["$epic"]="READY"; done
+fi
+
+# ─── Iter loop ──────────────────────────────────────────────────────────
+declare -A EPIC_STATUS
+declare -A EPIC_FEEDBACK_FILE
+
+for epic in "${EPICS[@]}"; do
+  if [ "${EPIC_PRECOND_PASS[$epic]:-1}" -eq 0 ]; then
+    EPIC_STATUS["$epic"]="ESCALATE"
+    mo_set_epic_status "$epic" "escalated"
+    EPIC_FEEDBACK_FILE["$epic"]=""
+    continue
+  fi
+  case "${EPIC_SPEC_STATE[$epic]:-READY}" in
+    ESCALATE)
+      EPIC_STATUS["$epic"]="ESCALATE"
+      mo_set_epic_status "$epic" "escalated"
+      ;;
+    *)
+      EPIC_STATUS["$epic"]="PENDING"
+      ;;
+  esac
+  EPIC_FEEDBACK_FILE["$epic"]=""
+done
+
+for ((iter = 1; iter <= MAX_ITER; iter++)); do
+  _mo_lib_hot_reload_check
+  echo
+  echo "=== iter-$iter ============================================="
+
+  declare -a ROUND_PIDS=()
+  declare -a ROUND_EPICS=()
+  _spawn_stagger_sec="${MO_WORKER_SPAWN_STAGGER_SEC:-5}"
+  _first_spawn=1
+  for epic in "${EPICS[@]}"; do
+    case "${EPIC_STATUS[$epic]}" in
+      PENDING|REQUEST_CHANGES)
+        if [ "$_first_spawn" = 0 ] && [ "$_spawn_stagger_sec" -gt 0 ]; then
+          sleep "$_spawn_stagger_sec"
+        fi
+        _first_spawn=0
+        feedback="${EPIC_FEEDBACK_FILE[$epic]}"
+        pid=$(mo_spawn_worker "$epic" "${WORKTREE[$epic]}" "$iter" "$feedback")
+        ROUND_PIDS+=("$pid")
+        ROUND_EPICS+=("$epic")
+        ;;
+      SELF_CORRECTED)
+        echo "[mini-ork] $epic skipping worker — using last iter's self-correction patch"
+        ROUND_EPICS+=("$epic")
+        ;;
+      APPROVE|ESCALATE)
+        echo "[mini-ork] skip $epic (${EPIC_STATUS[$epic]})"
+        ;;
+    esac
+  done
+  if [ "${#ROUND_PIDS[@]}" -eq 0 ]; then
+    echo "[mini-ork] nothing to do this iter — all epics terminal"
+    break
+  fi
+
+  echo "[mini-ork] iter-$iter dispatched ${#ROUND_PIDS[@]} workers — waiting..."
+  mo_wait_all "${ROUND_PIDS[@]}"
+
+  for epic in "${ROUND_EPICS[@]}"; do
+    if ! mo_rebase_branch_onto_main "$epic" "${WORKTREE[$epic]}" mid-run; then
+      mo_write_stale_base_marker "$epic" "$iter" 2>/dev/null || true
+    fi
+  done
+
+  for epic in "${ROUND_EPICS[@]}"; do
+    mo_restore_pre_existing_deletes "$epic" "${WORKTREE[$epic]}" "$iter" || true
+    mo_revert_out_of_scope_files "$epic" "${WORKTREE[$epic]}" "$iter" || true
+    mo_check_no_verify_bypass "$epic" "${WORKTREE[$epic]}" "$iter" || true
+    mo_check_invariants "$epic" "${WORKTREE[$epic]}" "$iter" || true
+    mo_check_governance "$epic" "${WORKTREE[$epic]}" "$iter" || true
+    mo_emit_drift_telemetry "$epic" "$iter"
+    if [ "${MO_SKIP_RUBRIC:-0}" -ne 1 ]; then
+      mo_run_rubric_prescreen "$epic" "${WORKTREE[$epic]}" "$iter" || true
+    fi
+    if [ "${MO_SKIP_TYPECHECK:-0}" -ne 1 ]; then
+      mo_run_typecheck_gate "$epic" "${WORKTREE[$epic]}" "$iter" || true
+    fi
+  done
+
+  for epic in "${ROUND_EPICS[@]}"; do
+    if mo_run_review_with_cascade "$epic" "${WORKTREE[$epic]}" "$iter"; then
+      :
+    else
+      echo "[mini-ork] WARN review failed for $epic — marking ESCALATE"
+      EPIC_STATUS["$epic"]="ESCALATE"
+      continue
+    fi
+    v="$(mo_verdict "$epic" "$iter")"
+
+    if [ "$v" = "APPROVE" ]; then
+      mo_run_bdd "$epic" "${WORKTREE[$epic]}" "$iter"
+      bdd_rc=$?
+      if [ "$bdd_rc" -eq 3 ]; then
+        echo "[mini-ork] $epic iter-$iter BDD INFRA_FAIL (exit=3) — ESCALATE" >&2
+        v="ESCALATE"
+        mkdir -p "${WORKTREE[$epic]}/${MINI_ORK_HOME}/INBOX"
+        cat > "${WORKTREE[$epic]}/${MINI_ORK_HOME}/INBOX/$epic-bdd-infra-fail-$(date +%s).md" <<INBOX_EOF
+# BDD infra failure — $epic iter-$iter
+
+The bdd-runner guard tripped (exit_code=3). Infrastructure failure.
+Likely root cause: stale worktree base.
+
+**Suggested fix:** rebase this branch onto main:
+  cd $(printf '%s' "${WORKTREE[$epic]}")
+  git rebase main
+  # then re-dispatch via mini-ork run
+INBOX_EOF
+      else
+        if [ "$bdd_rc" -ne 0 ]; then
+          echo "[mini-ork] WARN BDD runner non-zero exit for $epic iter=$iter" >&2
+        fi
+        bv="$(mo_bdd_verdict "$epic" "$iter")"
+        if [ "$bv" = "FAIL" ]; then
+          echo "[mini-ork] $epic iter-$iter BDD=$bv → downgrading APPROVE → REQUEST_CHANGES"
+          v="REQUEST_CHANGES"
+          if [ "${MO_SKIP_REFLECTION:-0}" -ne 1 ]; then
+            mo_run_reflection_refiner "$epic" "${WORKTREE[$epic]}" "$iter" || true
+          fi
+          if [ "${MO_SKIP_SELF_CORRECTION:-0}" -ne 1 ]; then
+            mo_synthesize_bdd_verdict_for_l6 "$epic" "$iter" || true
+          fi
+        fi
+      fi
+    fi
+
+    EPIC_STATUS["$epic"]="$v"
+    echo "[mini-ork] $epic iter-$iter verdict=$v"
+    mo_runs_update_progress "${EPIC_RUN_ID[$epic]:-}" "$v" 2>/dev/null || true
+    case "$v" in
+      REQUEST_CHANGES)
+        fb="$(mo_feedback_file "$epic" "$iter")"
+        mo_append_bdd_feedback "$epic" "$iter" "$fb"
+        mo_append_reflection_to_feedback "$epic" "$iter" "$fb"
+        mo_append_rubric_to_feedback "$epic" "$iter" "$fb"
+        EPIC_FEEDBACK_FILE["$epic"]="$fb"
+
+        if mo_self_correction_eligible "$epic" "$iter"; then
+          if mo_run_self_correction "$epic" "${WORKTREE[$epic]}" "$iter"; then
+            EPIC_STATUS["$epic"]="SELF_CORRECTED"
+          fi
+        fi
+        ;;
+      APPROVE)
+        mo_set_epic_status "$epic" "in review"
+        ;;
+      ESCALATE)
+        if mo_run_healer_on_escalate "$epic" "$JOB_RUN_DIR/$epic" 2>/dev/null; then
+          echo "[mini-ork] healer recovered $epic — re-queuing as PENDING" >&2
+          EPIC_STATUS["$epic"]="PENDING"
+          mo_set_epic_status "$epic" "in progress"
+        else
+          mo_set_epic_status "$epic" "escalated"
+        fi
+        ;;
+    esac
+  done
+
+  pending=0
+  for epic in "${EPICS[@]}"; do
+    case "${EPIC_STATUS[$epic]}" in
+      PENDING|REQUEST_CHANGES) pending=$((pending+1)) ;;
+    esac
+  done
+  if [ "$pending" -eq 0 ]; then
+    echo "[mini-ork] all epics terminal — exit loop"
+    break
+  fi
+done
+
+date -u +"%FT%TZ" > "$JOB_RUN_DIR/ended_at"
+
+for epic in "${EPICS[@]}"; do
+  mo_runs_close "${EPIC_RUN_ID[$epic]:-}" "$epic" "${EPIC_STATUS[$epic]:-UNKNOWN}" 2>/dev/null || true
+done
+
+# ─── Finalize ───────────────────────────────────────────────────────────
+report=$(mo_finalize)
+echo
+echo "─────────────────────────────────────────────────────────────────"
+echo " mini-ork DONE                                       job=$JOB_ID"
+echo "─────────────────────────────────────────────────────────────────"
+for epic in "${EPICS[@]}"; do
+  printf '   %-6s %s\n' "$epic" "${EPIC_STATUS[$epic]}"
+done
+echo
+echo " report: $report"
+
+# ─── Auto-chain hook ────────────────────────────────────────────────────
+if [ "${MO_AUTO_CHAIN:-0}" = "1" ]; then
+  COORD_LOG="$MINI_ORK_DB/../mini-ork/runs/$JOB_ID/wave-coordinator-autochain.log"
+  echo " auto-chain: launching wave-coordinator --loop (log=$COORD_LOG)"
+  MO_REVIEWER_LANE="${MO_REVIEWER_LANE:-glm}" \
+  MO_REVIEWER_LANE_TRIVIAL="${MO_REVIEWER_LANE_TRIVIAL:-glm}" \
+  MO_RUBRIC_LANE="${MO_RUBRIC_LANE:-kimi}" \
+    nohup bash "$MINI_ORK_DIR/bin/mini-ork-wave-coordinator" "$JOB_ID" \
+      --loop "${WAVE_LOOP_INTERVAL_SEC:-600}" \
+      --max-parallel "${WAVE_MAX_PARALLEL:-3}" \
+      --max-iter "${MO_AUTO_CHAIN_MAX_ITER:-4}" \
+      > "$COORD_LOG" 2>&1 &
+  echo " auto-chain: coordinator pid=$!"
+fi

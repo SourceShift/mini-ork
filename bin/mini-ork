@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# mini-ork — multi-agent code orchestration framework
+set -Eeuo pipefail
+MINI_ORK_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+export MINI_ORK_ROOT
+sub="${1:-help}"; shift || true
+case "$sub" in
+  deliver|decompose|run|scaffold|orchestrator|master|init) exec "$MINI_ORK_ROOT/bin/mini-ork-$sub" "$@" ;;
+  doctor) for d in bash sqlite3 jq git claude; do command -v "$d" >/dev/null && echo "[OK] $d" || echo "[MISSING] $d"; done ;;
+  version) echo "mini-ork 0.1.0" ;;
+  help|--help|-h) echo "Usage: mini-ork <deliver|decompose|run|scaffold|init|doctor|version> [args...]" ;;
+  *) echo "Unknown subcommand: $sub. Try: mini-ork help" >&2; exit 2 ;;
+esac
