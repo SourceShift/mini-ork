@@ -1,23 +1,25 @@
-# mini-ork — Multi-Agent Code Orchestration Framework
+# mini-ork
 
-**mini-ork** is a declarative, multi-agent orchestration system that decomposes a markdown kickoff spec into parallel work lanes, runs adversarial review, gates merge on executable BDD specs, and auto-merges validated code — all from a single command. Built on the Claude Code SDK, bash, and sqlite3; no application server, no Docker daemon, no managed cloud required. Use it to ship large features, run multi-model refactors, build self-evolving systems, or coordinate specialist agents across any codebase.
+mini-ork is a task operating system for agents. It receives a goal, classifies the work, chooses a workflow, dispatches specialized agents, verifies artifacts, and stores execution experience for self-improvement. It does NOT ship opinions on what your pipeline should look like — pipeline shapes live in `recipes/` as composable user-land examples.
+
+---
 
 ## Quickstart
 
 ```bash
 # 1. Install
-git clone https://github.com/ork-ai/mini-ork ~/ps/mini-ork
-cd ~/ps/mini-ork && make install   # copies bin/mini-ork to ~/.local/bin, writes ~/.mini-ork/config
+bash install.sh
 
 # 2. Initialize a repo
-cd ~/my-project
-mini-ork init                      # writes .mini-ork/agents.yaml + .mini-ork/config.env
+mini-ork init
 
-# 3. Deliver
-mini-ork deliver kickoff.md        # decompose → workers → review → BDD → merge
+# 3. Run a recipe
+mini-ork run code-fix examples/01-hello-world/kickoff.md
 ```
 
-`mini-ork deliver` exits 0 on clean merge, 1 on unresolved gate failure. All intermediate state is in `.mini-ork/state.db`.
+`mini-ork run` exits 0 on verified artifact, 1 on gate failure or escalation. All state is in `${MINI_ORK_DB}` (default: `.mini-ork/state.db`).
+
+---
 
 ## Architecture
 
@@ -25,107 +27,162 @@ mini-ork deliver kickoff.md        # decompose → workers → review → BDD �
 kickoff.md
     │
     ▼
-┌─────────────────────────────────────────────────┐
-│  decomposer (Opus)                              │
-│  parse kickoff → seed epics → assign lanes      │
-└───────────────────┬─────────────────────────────┘
-                    │  N epics claimed
-                    ▼
-┌─────────────────────────────────────────────────┐
-│  scaffold                                       │
-│  mkdir worktrees, write per-epic context files  │
-└───────────────────┬─────────────────────────────┘
-                    │
-                    ▼  (parallel, one lane per epic)
-┌─────────────────────────────────────────────────┐
-│  run-loop                                       │
-│  ┌──────────┐  ┌──────────┐  ┌───────────────┐ │
-│  │ worker   │  │ reviewer │  │  BDD spec     │ │
-│  │ (Sonnet/ │→ │ (Opus/   │→ │  author +     │ │
-│  │  GLM/    │  │  Kimi)   │  │  runner       │ │
-│  │  DeepSeek│  └──────────┘  └───────┬───────┘ │
-│  └──────────┘                        │ pass/fail│
-│                              ┌───────▼───────┐  │
-│                              │  self-heal    │  │
-│                              │  (Sonnet)     │  │
-│                              └───────────────┘  │
-└───────────────────┬─────────────────────────────┘
-                    │  all lanes: verdict=PASS
-                    ▼
-┌─────────────────────────────────────────────────┐
-│  auto-merge                                     │
-│  rebase-guard → conflict check → git merge      │
-└───────────────────┬─────────────────────────────┘
-                    │
-                    ▼
-              state.db  (full audit trail)
+┌──────────────────────────────────────────────────────────────────┐
+│  classify                                                        │
+│  task_class + risk + artifact_contract + verifier_contract       │
+└───────────────────────┬──────────────────────────────────────────┘
+                        │
+                        ▼
+┌──────────────────────────────────────────────────────────────────┐
+│  plan                                                            │
+│  objective · decomposition · dependencies · risk · verifier def  │
+└───────────────────────┬──────────────────────────────────────────┘
+                        │
+                        ▼
+┌──────────────────────────────────────────────────────────────────┐
+│  execute   (workflow.yaml DAG — dispatched per recipe)           │
+│                                                                  │
+│  ┌──────────┐  ┌────────────┐  ┌──────────────┐  ┌──────────┐  │
+│  │ planner  │→ │ researcher │→ │ implementer  │→ │ reviewer │  │
+│  └──────────┘  └────────────┘  └──────────────┘  └────┬─────┘  │
+│                                                        │        │
+│  ┌────────────┐  ┌───────────┐  ┌───────────┐         │        │
+│  │ reflector  │  │ publisher │  │ rollback  │ ←────── │        │
+│  └────────────┘  └───────────┘  └───────────┘         │        │
+│                                              ┌─────────┘        │
+│                                              ▼                   │
+│                                       ┌──────────┐              │
+│                                       │ verifier │              │
+│                                       └──────────┘              │
+└───────────────────────┬──────────────────────────────────────────┘
+                        │
+                        ▼
+┌──────────────────────────────────────────────────────────────────┐
+│  verify   (gates — deterministic / reviewer / human / budget)    │
+└───────────────────────┬──────────────────────────────────────────┘
+                        │
+                        ▼
+┌──────────────────────────────────────────────────────────────────┐
+│  reflect                                                         │
+│  ExecutionTrace → TextualGradient → PatternRecord                │
+└───────────────────────┬──────────────────────────────────────────┘
+                        │
+                        ▼
+┌──────────────────────────────────────────────────────────────────┐
+│  improve                                                         │
+│  WorkflowCandidates → BenchmarkSuite → PromotionGate             │
+│  → VersionRegistry (with rollback pointer)                       │
+└──────────────────────────────────────────────────────────────────┘
 ```
 
-**lib/ scripts:** `dispatch` · `memory` · `auto-merge` · `bdd-runner` · `spec-author` · `spec-reviewer` · `rebase-guard` · `scope-overlap` · `llm-dispatch` · `contract` · `self-correction` · `cache` · `healer` · `finalize`
+---
 
-## Concepts
+## What ships in the framework vs. what lives in recipes
 
-- **Epics** — units of work seeded from the kickoff. Each epic maps to one git worktree and one worker agent. Epics have a `verdict` column: `pending | pass | fail | escalated`.
-- **Runs** — a single `mini-ork deliver` invocation. Identified by a UUID stored in `runs.id`. All epics, events, and verdicts are scoped to a run.
-- **Iters** — worker + review cycles within an epic. Max iters is configurable (`agents.yaml: max_iters`). Self-heal consumes one iter slot.
-- **Lanes** — parallel execution tracks. One lane = one epic claim = one Claude Code subprocess. Lanes share nothing except the sqlite state.db (write-serialized via WAL).
-- **Verdicts** — the outcome of a BDD spec run: `PASS | FAIL | SKIP | ESCALATED`. A verdict of `PASS` on all epics unlocks auto-merge. `ESCALATED` writes to `.mini-ork/INBOX/` for human triage.
+### FRAMEWORK — zero opinions on pipeline shape
 
-## Lifecycle
+The framework ships the universal loop and its primitives. Nothing in `lib/` or `bin/` knows about your domain.
 
-1. **kickoff** — user writes `kickoff.md` describing the feature, acceptance criteria, and any model preferences.
-2. **seed** — decomposer (Opus) parses kickoff, inserts N rows into `epics` with `status=pending`.
-3. **claim** — each lane subprocess atomically claims one epic (`UPDATE epics SET status='claimed' WHERE status='pending' LIMIT 1`).
-4. **spawn worker** — `llm-dispatch` selects model by epic `complexity` tag; Claude Code SDK subprocess runs the implementation.
-5. **review** — spec-reviewer (Opus or Kimi) reads diff + kickoff constraints; writes structured feedback to `epic_reviews`.
-6. **gate** — BDD spec author writes Gherkin scenarios; `bdd-runner` executes them. Pass → verdict=PASS. Fail → self-heal iter or escalate.
-7. **merge** — `auto-merge` rebases each worktree branch onto main via `rebase-guard`, resolves non-conflicting hunks, commits with audit metadata from state.db.
+| Primitive | Location | Purpose |
+|---|---|---|
+| Universal loop | `bin/mini-ork-{classify,plan,execute,verify,reflect,improve}` | 6-stage lifecycle |
+| 8 node-type interfaces | `lib/agent_registry.sh` | planner / researcher / implementer / reviewer / verifier / reflector / publisher / rollback |
+| 6 edge-type semantics | `schemas/workflow.schema.json` | depends_on / supplies_context_to / verifies / blocks / retries / escalates_to |
+| 6 gate types | `lib/gate_registry.sh` | deterministic / reviewer / human / budget / scope / deployment |
+| 8 memory namespaces | `db/migrations/` | task / workflow / agent_performance / failure / recovery / user_preference / artifact / benchmark |
+| Task-class registry | `${MINI_ORK_HOME}/config/task_classes/*.yaml` | typed task definitions |
+| Workflow registry | `recipes/<recipe>/workflow.yaml` | versioned DAGs |
+| Benchmark suite | `lib/benchmark_suite.sh` | eval harness |
+| Promotion gate | `lib/promotion_gate.sh` | utility_delta + benchmark gate |
+| Version registry | `lib/version_registry.sh` | promote / quarantine / rollback |
+| Group evolver | `lib/group_evolver.sh` | workflow candidate generation |
+| Experience memory | `lib/trace_store.sh` + `lib/gradient_extractor.sh` + `lib/pattern_store.sh` | store, extract, surface |
 
-## Models + Cost
+### RECIPES — opinions live here
 
-| Model | Role | Typical cost / epic | Notes |
-|---|---|---|---|
-| `claude-opus-4` | decomposer, reviewer, escalation | $0.15 – $0.60 | High reasoning, used sparingly |
-| `claude-sonnet-4-5` | worker (default), self-heal | $0.03 – $0.12 | Best cost/quality for implementation |
-| `glm-4` | hunter (bug/perf scan), heavy grep | ~$0.01 – $0.04 | Fast, cheap for structured analysis |
-| `kimi-k2` | reviewer (alt), long-context diff | ~$0.02 – $0.08 | Strong at 128K diffs |
-| `deepseek-v3` | worker (alt, budget mode) | ~$0.005 – $0.02 | Cheapest; good for boilerplate-heavy epics |
+Recipes are user-land workflow definitions. They compose framework primitives into pipeline shapes.
 
-Cost varies with epic complexity and iter count. A typical 5-epic delivery runs $0.30 – $2.00 total.
+| Recipe | Location | Shape |
+|---|---|---|
+| `code-fix` | `recipes/code-fix/` | minimal reference: classify → plan → implement → verify |
+| `bdd-first-delivery` | `recipes/bdd-first-delivery/` | full: decompose → workers → BDD spec → review → merge |
+
+Add your own under `recipes/<name>/` — see [docs/EXTENSION.md](docs/EXTENSION.md).
+
+---
+
+## 4 Extension Points
+
+Extensions do not require forking the framework. See [docs/EXTENSION.md](docs/EXTENSION.md) for full examples.
+
+1. **WorkflowGraph** — add nodes and edges by writing a `workflow.yaml` in your recipe. Validated against `schemas/workflow.schema.json`.
+2. **AgentRegistry** — register new roles or model bindings via `lib/agent_registry.sh:agent_register`. No code change.
+3. **VerifierRegistry** — drop a `<name>.sh` script under `${MINI_ORK_HOME}/verifiers/` or `recipes/<recipe>/verifiers/` and reference it in `workflow.yaml`.
+4. **ExperienceMemory** — add new namespaces via DB migrations or override `lib/context_assembler.sh` per task class.
+
+---
+
+## Bounded Autonomy
+
+Self-improvement is evidence-gated, not free-running. Changes are ranked by risk:
+
+| Rung | Mutation | Gate required |
+|---|---|---|
+| 1 | Tune prompt wording | None — always safe |
+| 2 | Tune retrieval / context assembly | None — always safe |
+| 3 | Tune workflow graph edges | Benchmark pass |
+| 4 | Tune agent role definitions | Benchmark pass |
+| 5 | Tune verifier selection | Benchmark pass |
+| 6 | Propose code changes to mini-ork itself | Benchmark pass + human review |
+| 7 | Promote runtime changes | Benchmark pass + human gate + `version_clear_quarantine` if previously quarantined |
+
+See [docs/SAFETY.md](docs/SAFETY.md) for immutable constraints and the PromotionGate contract.
+
+---
 
 ## Roadmap
 
-### v0.1 (current)
-- `deliver` command: decompose → workers → review → BDD → merge
-- sqlite state.db with full run audit trail
-- `llm-dispatch` with Sonnet/Opus/GLM routing
-- Self-heal on BDD failure (1 iter)
-- `INBOX/` escalation for unresolvable failures
+### v0.1 (current — this release)
+
+- Universal 6-stage loop (`classify → plan → execute → verify → reflect → improve`)
+- 13 framework primitives in `lib/`
+- 8 `bin/` entrypoints
+- 4 new schemas + 4 new migrations (memory namespaces, benchmarks, evolution, safety)
+- `recipes/code-fix/` reference recipe
+- `recipes/bdd-first-delivery/` ported from v0.0 BDD pipeline as a recipe
 
 ### v0.2
-- `mini-ork resume <run-id>` — continue interrupted run from last checkpoint
-- Kimi + DeepSeek provider wrappers
-- Parallel lane cap (`--max-lanes N`)
-- `mini-ork inspect <epic-id>` — show iter trace + model costs
-- Scope-overlap detector (prevents two epics touching same file)
+
+- `mini-ork resume <run-id>` — continue interrupted loop from last checkpoint
+- `mini-ork inspect <task-id>` — trace viewer (iter log, model costs, gradient log)
+- Per-recipe benchmark fixtures
+- Speculative dispatch mode (multiple workflow candidates compete before selection)
+- Parallel lane cap + scope-conflict detector
 
 ### v1.0
-- Plugin hooks (`pre-worker`, `post-review`, `on-escalate`)
-- Cost budget enforcement (`--budget 5.00`)
+
 - Web dashboard (read-only, sqlite-backed)
-- `mini-ork replay` — re-run a specific epic against current HEAD
+- `mini-ork replay <task-id>` — re-run a specific task against current HEAD
+- Plugin hooks system (pre-node, post-node, on-gate-fail)
+- Cost budget enforcement (`--budget 5.00`)
+- Built-in recipes: `research-synthesis`, `blog-post`, `ui-audit`, `db-migration`, `ops-runbook`
+
+---
 
 ## Dependencies
 
 | Dep | Version | Purpose |
 |---|---|---|
-| bash | 4.0+ | runtime shell (arrays, `mapfile`, `[[ ]]`) |
-| sqlite3 | 3.35+ | state.db; WAL mode required |
-| jq | 1.6+ | JSON parsing for LLM responses |
-| git | 2.28+ | worktrees, merge, rebase |
-| claude CLI | 2.1+ | `claude --print` subprocess workers |
+| bash | 4.0+ | arrays, `mapfile`, `[[ ]]`, process substitution |
+| sqlite3 | 3.35+ | state.db — WAL mode required |
+| jq | 1.6+ | JSON parsing for LLM responses and schema validation |
+| yq | 4.0+ | YAML config parsing (`task_classes/*.yaml`, `workflow.yaml`) |
+| git | 2.28+ | worktrees, merge, rebase, branch quarantine |
+| claude CLI | 2.1+ | `claude --print` subprocess agents |
 
-All deps invoked as external processes — nothing is bundled.
+All deps invoked as external processes — nothing is bundled. Run `bash install.sh --check` to verify deps before first use.
+
+---
 
 ## License
 

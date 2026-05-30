@@ -1,13 +1,90 @@
 #!/usr/bin/env bash
-# mini-ork — multi-agent code orchestration framework
+# mini-ork — task operating system for agents (universal task loop runtime)
+# Classify → Plan → Execute → Verify → Reflect → Improve
 set -Eeuo pipefail
-MINI_ORK_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+MINI_ORK_ROOT="${MINI_ORK_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 export MINI_ORK_ROOT
+
 sub="${1:-help}"; shift || true
+
 case "$sub" in
-  deliver|decompose|run|scaffold|orchestrator|master|init) exec "$MINI_ORK_ROOT/bin/mini-ork-$sub" "$@" ;;
-  doctor) for d in bash sqlite3 jq git claude; do command -v "$d" >/dev/null && echo "[OK] $d" || echo "[MISSING] $d"; done ;;
-  version) echo "mini-ork 0.1.0" ;;
-  help|--help|-h) echo "Usage: mini-ork <deliver|decompose|run|scaffold|init|doctor|version> [args...]" ;;
+  # Universal loop subcommands
+  classify|plan|execute|verify|reflect|improve|eval|promote|init)
+    exec "$MINI_ORK_ROOT/bin/mini-ork-$sub" "$@" ;;
+
+  # Convenience: run is a recipe-level entry
+  # Looks up workflow.yaml in recipes/<name>/, then walks classify→plan→execute→verify
+  run)
+    recipe="${1:?recipe name required}"; shift
+    [ -d "$MINI_ORK_ROOT/recipes/$recipe" ] || {
+      echo "no recipe: $recipe (ls $MINI_ORK_ROOT/recipes/)" >&2; exit 2
+    }
+    export MINI_ORK_RECIPE="$recipe"
+    export MINI_ORK_WORKFLOW="$MINI_ORK_ROOT/recipes/$recipe/workflow.yaml"
+    kickoff="${1:?kickoff.md path required}"; shift || true
+    "$MINI_ORK_ROOT/bin/mini-ork-classify" "$kickoff" && \
+    "$MINI_ORK_ROOT/bin/mini-ork-plan"     "$kickoff" && \
+    "$MINI_ORK_ROOT/bin/mini-ork-execute"  "$kickoff" && \
+    "$MINI_ORK_ROOT/bin/mini-ork-verify"
+    ;;
+
+  doctor)
+    echo "=== mini-ork doctor ==="
+    for d in bash sqlite3 jq git yq curl claude python3; do
+      command -v "$d" >/dev/null && echo "  [OK]      $d" || echo "  [MISSING] $d"
+    done
+    [ -n "${MINI_ORK_HOME:-}" ] \
+      && echo "  [OK]      MINI_ORK_HOME=$MINI_ORK_HOME" \
+      || echo "  [WARN]    MINI_ORK_HOME unset (default: <project>/.mini-ork)"
+    [ -n "${MINI_ORK_DB:-}" ] \
+      && echo "  [OK]      MINI_ORK_DB=$MINI_ORK_DB" \
+      || echo "  [WARN]    MINI_ORK_DB unset (default: \$MINI_ORK_HOME/state.db)"
+    echo ""
+    echo "Lib presence:"
+    for lib in trace_store llm-dispatch gate_registry group_evolver \
+                reflection_pipeline benchmark_suite utility_function \
+                promotion_gate version_registry; do
+      if [ -f "$MINI_ORK_ROOT/lib/${lib}.sh" ]; then
+        echo "  [OK]      lib/${lib}.sh"
+      else
+        echo "  [MISSING] lib/${lib}.sh (P1 in flight?)"
+      fi
+    done
+    ;;
+
+  version) echo "mini-ork 0.1.0 (universal task loop runtime)" ;;
+
+  help|--help|-h)
+    cat <<'EOF'
+mini-ork — task operating system for agents (v0.1)
+
+Universal loop subcommands:
+  classify <kickoff.md>          Route kickoff to a task_class
+  plan <kickoff.md>              Generate plan (decomposition + verifier contract)
+  execute [<plan.json>]          Dispatch to workflow nodes (planner/researcher/
+                                   implementer/reviewer/verifier/reflector/
+                                   publisher/rollback)
+  verify <artifact-path>         Run verifiers + gates for the artifact contract
+  reflect [--since <timestamp>]  Extract gradients + patterns from recent runs
+  improve                        Propose workflow candidates via group_evolver
+  eval --candidate <id>          Run benchmark suite against a workflow candidate
+  promote --candidate <id>       Promotion gate decision (promote|quarantine)
+
+Recipe runner:
+  run <recipe-name> <kickoff.md> Walks classify → plan → execute → verify
+
+Lifecycle:
+  init                           Bootstrap project (creates .mini-ork/)
+  doctor                         Check deps + env vars + lib presence
+  version
+
+Environment:
+  MINI_ORK_HOME   project home dir  (default: .mini-ork/)
+  MINI_ORK_DB     sqlite3 state db  (default: $MINI_ORK_HOME/state.db)
+  MINI_ORK_DRY_RUN  set to 1 for dry-run mode on all subcommands
+EOF
+    ;;
+
   *) echo "Unknown subcommand: $sub. Try: mini-ork help" >&2; exit 2 ;;
 esac

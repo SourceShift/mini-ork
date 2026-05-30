@@ -16,7 +16,7 @@ mo_finalize() {
   : "${MINI_ORCH_DIR:?}"
   : "${JOB_ID:?}"
 
-  local agentflow_dir="${AGENTFLOW_DIR:-${MINI_ORK_HOME:-.mini-ork}}"
+  local agentflow_dir="${MINI_ORK_HOME:-.mini-ork}"
   local state_db="${MINI_ORK_DB:-${agentflow_dir}/state.db}"
 
   local job_run_dir="$MINI_ORCH_DIR/runs/$JOB_ID"

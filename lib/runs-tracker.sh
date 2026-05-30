@@ -19,9 +19,9 @@ set -uo pipefail
 
 MINI_ORK_ROOT="${MINI_ORK_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 
-# Caller exports: AGENTFLOW_DIR (compat alias for MINI_ORK_HOME path)
+# Caller exports: MINI_ORK_HOME (compat alias for MINI_ORK_HOME path)
 
-_MO_DB="${MINI_ORK_DB:-${AGENTFLOW_DB:-${AGENTFLOW_DIR:-}/state.db}}"
+_MO_DB="${MINI_ORK_DB:-${MINI_ORK_HOME:-.mini-ork}/state.db}"
 
 # One-shot defensive migration: best-effort upgrade of older state.db files
 # that predate the orch_dispatches table. Canonical migration lives at

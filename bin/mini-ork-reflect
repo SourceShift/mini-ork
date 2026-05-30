@@ -1,0 +1,116 @@
+#!/usr/bin/env bash
+# mini-ork-reflect — Reflection trigger: extracts patterns and suggested promotions
+# from recent execution traces.
+#
+# Delegates to lib/reflection_pipeline.sh:reflection_run
+#
+# Inputs:
+#   --since <timestamp>   ISO-8601 or unix timestamp (default: 24h ago)
+#
+# Outputs (stdout):
+#   Summary of patterns detected and suggested workflow promotions.
+#
+# Flags:
+#   --since <timestamp>   Start of analysis window (default: 24h ago)
+#   --task-class <name>   Limit reflection to a specific task class
+#   --dry-run             Print what would be analyzed; do not invoke LLM
+#   --help
+
+set -Eeuo pipefail
+
+MINI_ORK_ROOT="${MINI_ORK_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+export MINI_ORK_ROOT
+
+# ── lib guards ────────────────────────────────────────────────────────────────
+_require_lib() {
+  local lib="$MINI_ORK_ROOT/lib/${1}.sh"
+  if [ ! -f "$lib" ]; then
+    echo "lib/${1}.sh not yet present (P1 in flight?)" >&2; exit 3
+  fi
+  # shellcheck source=/dev/null
+  source "$lib"
+}
+
+# ── arg parsing ───────────────────────────────────────────────────────────────
+SINCE=""
+TASK_CLASS_FILTER=""
+DRY_RUN="${MINI_ORK_DRY_RUN:-0}"
+
+_usage() {
+  cat <<'EOF'
+Usage: mini-ork reflect [--since <timestamp>] [--task-class <name>] [--dry-run]
+
+Run the reflection pipeline over recent execution traces to extract gradient
+signals, recurring patterns, and suggested workflow promotions.
+
+Options:
+  --since <timestamp>   Start of analysis window (ISO-8601 or unix ts, default: 24h ago)
+  --task-class <name>   Limit reflection to traces of this task class
+  --dry-run             Show trace count that would be analyzed; skip LLM
+  --help                Show this help
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --help|-h)     _usage; exit 0 ;;
+    --dry-run)     DRY_RUN=1; shift ;;
+    --since)       SINCE="${2:?--since requires a value}"; shift 2 ;;
+    --task-class)  TASK_CLASS_FILTER="${2:?--task-class requires a value}"; shift 2 ;;
+    -*)            echo "Unknown flag: $1. Try --help" >&2; exit 2 ;;
+    *)             echo "Unexpected argument: $1. Try --help" >&2; exit 2 ;;
+  esac
+done
+
+# ── env setup ─────────────────────────────────────────────────────────────────
+MINI_ORK_HOME="${MINI_ORK_HOME:-$(pwd)/.mini-ork}"
+MINI_ORK_DB="${MINI_ORK_DB:-$MINI_ORK_HOME/state.db}"
+export MINI_ORK_HOME MINI_ORK_DB
+
+# Default since = 24h ago
+if [ -z "$SINCE" ]; then
+  if date -v -24H +%s >/dev/null 2>&1; then
+    # macOS
+    SINCE=$(date -v -24H +%s)
+  else
+    # GNU
+    SINCE=$(date -d '24 hours ago' +%s 2>/dev/null || echo "0")
+  fi
+fi
+
+# ── trace start ───────────────────────────────────────────────────────────────
+TRACE_ID="tr-reflect-$(date +%s)-$$"
+if [ "$DRY_RUN" -eq 0 ]; then
+  _require_lib trace_store
+  trace_write "{\"trace_id\":\"$TRACE_ID\",\"task_class\":\"__reflect__\",\"status\":\"running\"}" >/dev/null 2>&1 || true
+fi
+
+# ── dry-run: count traces ─────────────────────────────────────────────────────
+if [ "$DRY_RUN" -eq 1 ]; then
+  COUNT=0
+  if [ -f "$MINI_ORK_DB" ]; then
+    FILTER_SQL=""
+    [ -n "$TASK_CLASS_FILTER" ] && FILTER_SQL=" AND task_class='${TASK_CLASS_FILTER}'"
+    COUNT=$(sqlite3 "$MINI_ORK_DB" \
+      "SELECT COUNT(*) FROM execution_traces WHERE created_at >= ${SINCE}${FILTER_SQL};" 2>/dev/null || echo 0)
+  fi
+  echo "[dry-run] would analyze ${COUNT} trace(s) since ${SINCE}"
+  [ -n "$TASK_CLASS_FILTER" ] && echo "[dry-run] filter: task_class=${TASK_CLASS_FILTER}"
+  exit 0
+fi
+
+# ── dispatch to reflection_pipeline ──────────────────────────────────────────
+_require_lib reflection_pipeline
+
+echo "=== mini-ork reflect ==="
+echo "    since:   $SINCE"
+echo "    filter:  ${TASK_CLASS_FILTER:-all}"
+echo ""
+
+REFLECT_ARGS=(--since "$SINCE")
+[ -n "$TASK_CLASS_FILTER" ] && REFLECT_ARGS+=(--task-class "$TASK_CLASS_FILTER")
+
+reflection_run "${REFLECT_ARGS[@]}"
+
+# ── trace end ─────────────────────────────────────────────────────────────────
+trace_write "{\"trace_id\":\"$TRACE_ID\",\"task_class\":\"__reflect__\",\"status\":\"success\"}" >/dev/null 2>&1 || true

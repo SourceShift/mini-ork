@@ -10,7 +10,7 @@ set -uo pipefail
 
 MINI_ORK_ROOT="${MINI_ORK_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 
-# Caller exports: AGENTFLOW_DIR, REPO_ROOT, MINI_ORK_HOME
+# Caller exports: MINI_ORK_HOME, REPO_ROOT, MINI_ORK_HOME
 
 # Args: epic worktree iter
 # Writes: <iter-dir>/rubric.json
@@ -22,7 +22,7 @@ mo_run_rubric_prescreen() {
   local rubric_path="$iter_dir/rubric.json"
   mkdir -p "$iter_dir"
 
-  local _db="${MINI_ORK_DB:-$AGENTFLOW_DIR/state.db}"
+  local _db="${MINI_ORK_DB:-$MINI_ORK_HOME/state.db}"
   local kickoff_rel
   kickoff_rel=$(sqlite3 "$_db" \
     "SELECT kickoff_path FROM epics WHERE id='$epic';" 2>/dev/null)

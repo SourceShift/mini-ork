@@ -1,3 +1,8 @@
+-- ## Lineage: originally an internal v2/v3 refactor-harness schema.
+-- ## In mini-ork OSS these are generic primitives: Hoare-triple specs,
+-- ## Pareto-optimal candidate scoring, atomic-PR DAGs, validation cascades,
+-- ## reflection basins. Usable by any refactor/validation recipe.
+--
 -- mini-ork migration 0007 — V3 validation layers
 -- Apply via: mini-ork init OR sqlite3 $MINI_ORK_DB < db/migrations/0007_v3_validation_layers.sql
 BEGIN;

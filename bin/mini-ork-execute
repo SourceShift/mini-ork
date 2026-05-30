@@ -1,0 +1,329 @@
+#!/usr/bin/env bash
+# mini-ork-execute — Executor dispatcher: reads workflow.yaml + plan, dispatches
+# per node-type to the appropriate recipe handler.
+#
+# Node types dispatched:
+#   planner      → already done (plan step) — skip
+#   researcher   → recipe's researcher prompt via context_assemble
+#   implementer  → recipe's implementer prompt; tracks files_written
+#   reviewer     → recipe's reviewer prompt; parses verdict
+#   verifier     → runs each verifier from artifact_contract.success_verifiers[]
+#   reflector    → invokes reflection_pipeline
+#   publisher    → calls lib/auto-merge.sh
+#   rollback     → calls lib/version_registry.sh:version_registry rollback
+#
+# Each execution writes an ExecutionTrace via lib/trace_store.sh.
+# Respects DispatchMode from workflow node config:
+#   serial | parallel | partitioned | speculative
+#
+# Inputs:
+#   $1  plan.json path (optional — reads $MINI_ORK_PLAN_PATH env or last plan in runs/)
+#
+# Flags:
+#   --node-type <type>   Execute only nodes of this type
+#   --dispatch-mode <m>  Override dispatch mode (serial|parallel|partitioned|speculative)
+#   --dry-run            Print dispatch plan; do not invoke LLM or run scripts
+#   --help
+
+set -Eeuo pipefail
+
+MINI_ORK_ROOT="${MINI_ORK_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+export MINI_ORK_ROOT
+
+# ── lib guards ────────────────────────────────────────────────────────────────
+_require_lib() {
+  local lib="$MINI_ORK_ROOT/lib/${1}.sh"
+  if [ ! -f "$lib" ]; then
+    echo "lib/${1}.sh not yet present (P1 in flight?)" >&2; exit 3
+  fi
+  # shellcheck source=/dev/null
+  source "$lib"
+}
+
+# ── arg parsing ───────────────────────────────────────────────────────────────
+PLAN_PATH="${MINI_ORK_PLAN_PATH:-}"
+FILTER_NODE_TYPE=""
+DISPATCH_MODE_OVERRIDE=""
+DRY_RUN="${MINI_ORK_DRY_RUN:-0}"
+
+_usage() {
+  cat <<'EOF'
+Usage: mini-ork execute [<plan.json>] [--node-type <type>] [--dispatch-mode <mode>] [--dry-run]
+
+Dispatch plan steps to node-type handlers.
+
+Node types: planner | researcher | implementer | reviewer | verifier |
+            reflector | publisher | rollback
+
+Dispatch modes: serial | parallel | partitioned | speculative
+
+Options:
+  --node-type <type>        Execute only nodes of this type (filter)
+  --dispatch-mode <mode>    Override workflow dispatch mode
+  --dry-run                 Print what would be dispatched; no LLM calls
+  --help                    Show this help
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --help|-h)          _usage; exit 0 ;;
+    --dry-run)          DRY_RUN=1; shift ;;
+    --node-type)        FILTER_NODE_TYPE="${2:?--node-type requires a value}"; shift 2 ;;
+    --dispatch-mode)    DISPATCH_MODE_OVERRIDE="${2:?--dispatch-mode requires a value}"; shift 2 ;;
+    -*)                 echo "Unknown flag: $1. Try --help" >&2; exit 2 ;;
+    *)
+      if [ -z "$PLAN_PATH" ]; then PLAN_PATH="$1"; shift
+      else echo "Unexpected argument: $1" >&2; exit 2
+      fi
+      ;;
+  esac
+done
+
+# ── resolve plan path ─────────────────────────────────────────────────────────
+MINI_ORK_HOME="${MINI_ORK_HOME:-$(pwd)/.mini-ork}"
+MINI_ORK_DB="${MINI_ORK_DB:-$MINI_ORK_HOME/state.db}"
+export MINI_ORK_HOME MINI_ORK_DB
+
+if [ -z "$PLAN_PATH" ]; then
+  # Find most recent plan.json in runs/
+  PLAN_PATH=$(find "$MINI_ORK_HOME/runs" -name "plan.json" -print0 2>/dev/null \
+    | xargs -0 ls -1t 2>/dev/null | head -1 || true)
+fi
+[ -z "$PLAN_PATH" ] && { echo "No plan.json found. Run: mini-ork plan <kickoff.md>" >&2; exit 2; }
+[ -f "$PLAN_PATH" ]  || { echo "plan not found: $PLAN_PATH" >&2; exit 2; }
+
+# ── resolve workflow ──────────────────────────────────────────────────────────
+WORKFLOW="${MINI_ORK_WORKFLOW:-}"
+if [ -z "$WORKFLOW" ] && [ -n "${MINI_ORK_RECIPE:-}" ]; then
+  WORKFLOW="$MINI_ORK_ROOT/recipes/${MINI_ORK_RECIPE}/workflow.yaml"
+fi
+
+# ── parse plan ────────────────────────────────────────────────────────────────
+RUN_DIR="$(dirname "$PLAN_PATH")"
+TASK_CLASS=$(python3 -c "
+import sys, json
+with open(sys.argv[1]) as f:
+    p = json.load(f)
+print(p.get('task_class', 'generic'))
+" "$PLAN_PATH" 2>/dev/null || echo "generic")
+
+# Extract decomposition nodes
+mapfile -t NODE_IDS < <(python3 - "$PLAN_PATH" <<'PY'
+import sys, json
+with open(sys.argv[1]) as f:
+    p = json.load(f)
+for step in p.get("decomposition", []):
+    print(f"{step['id']}::{step.get('node_type','implementer')}::{step.get('description','')}")
+PY
+)
+
+# ── trace start ───────────────────────────────────────────────────────────────
+TRACE_ID="tr-execute-$(date +%s)-$$"
+if [ "$DRY_RUN" -eq 0 ]; then
+  _require_lib trace_store
+  trace_write "{\"trace_id\":\"$TRACE_ID\",\"task_class\":\"${TASK_CLASS}\",\"status\":\"running\"}" >/dev/null 2>&1 || true
+fi
+
+# ── dispatch mode resolution ──────────────────────────────────────────────────
+DISPATCH_MODE="serial"
+if [ -n "$DISPATCH_MODE_OVERRIDE" ]; then
+  DISPATCH_MODE="$DISPATCH_MODE_OVERRIDE"
+elif [ -n "$WORKFLOW" ] && [ -f "$WORKFLOW" ] && command -v yq >/dev/null 2>&1; then
+  DISPATCH_MODE=$(yq e '.dispatch_mode // "serial"' "$WORKFLOW" 2>/dev/null || echo "serial")
+fi
+
+_dispatch_node() {
+  local node_id="$1" node_type="$2" node_desc="$3"
+
+  if [ -n "$FILTER_NODE_TYPE" ] && [ "$node_type" != "$FILTER_NODE_TYPE" ]; then
+    return 0
+  fi
+
+  if [ "$DRY_RUN" -eq 1 ]; then
+    echo "[dry-run] would dispatch node_id=${node_id} node_type=${node_type}: ${node_desc}"
+    return 0
+  fi
+
+  echo "==> dispatch node_id=${node_id} type=${node_type}"
+
+  # Locate recipe prompt for this node type
+  RECIPE_DIR=""
+  [ -n "${MINI_ORK_RECIPE:-}" ] && RECIPE_DIR="$MINI_ORK_ROOT/recipes/${MINI_ORK_RECIPE}"
+  PROMPT_FILE="${RECIPE_DIR:+$RECIPE_DIR/prompts/${node_type}.md}"
+
+  NODE_TRACE_ID="tr-${node_type}-$(date +%s)-$$"
+
+  case "$node_type" in
+    planner)
+      # Already handled by mini-ork-plan — log and skip
+      echo "  [skip] planner node handled by mini-ork-plan"
+      ;;
+
+    researcher)
+      _require_lib llm-dispatch
+      [ -f "${PROMPT_FILE:-}" ] || PROMPT_FILE="$MINI_ORK_ROOT/prompts/researcher.md"
+      CONTEXT_FILE="$RUN_DIR/context-${node_id}.json"
+      # Assemble context from plan + kickoff
+      PLAN_CONTENT=$(cat "$PLAN_PATH")
+      PROMPT_CONTENT="Task: ${node_desc}\n\nPlan context:\n${PLAN_CONTENT}"
+      RESULT=$(llm_dispatch \
+        --task-class "$TASK_CLASS" \
+        --node-type "researcher" \
+        --prompt-text "$PROMPT_CONTENT" 2>&1) || { echo "researcher dispatch failed" >&2; return 1; }
+      echo "$RESULT" > "$CONTEXT_FILE"
+      echo "  [ok] researcher context → $CONTEXT_FILE"
+      trace_write "{\"trace_id\":\"$NODE_TRACE_ID\",\"task_class\":\"${TASK_CLASS}\",\"status\":\"success\",\"final_artifact_ref\":\"${CONTEXT_FILE}\"}" >/dev/null 2>&1 || true
+      ;;
+
+    implementer)
+      _require_lib llm-dispatch
+      [ -f "${PROMPT_FILE:-}" ] || PROMPT_FILE="$MINI_ORK_ROOT/prompts/implementer.md"
+      IMPL_LOG="$RUN_DIR/impl-${node_id}.log"
+      PLAN_CONTENT=$(cat "$PLAN_PATH")
+      PROMPT_CONTENT="Implement: ${node_desc}\n\nPlan:\n${PLAN_CONTENT}"
+      RESULT=$(llm_dispatch \
+        --task-class "$TASK_CLASS" \
+        --node-type "implementer" \
+        --prompt-text "$PROMPT_CONTENT" 2>&1) || { echo "implementer dispatch failed" >&2; return 1; }
+      echo "$RESULT" > "$IMPL_LOG"
+      echo "  [ok] implementer output → $IMPL_LOG"
+      trace_write "{\"trace_id\":\"$NODE_TRACE_ID\",\"task_class\":\"${TASK_CLASS}\",\"status\":\"success\",\"final_artifact_ref\":\"${IMPL_LOG}\"}" >/dev/null 2>&1 || true
+      ;;
+
+    reviewer)
+      _require_lib llm-dispatch
+      [ -f "${PROMPT_FILE:-}" ] || PROMPT_FILE="$MINI_ORK_ROOT/prompts/reviewer.md"
+      REVIEW_FILE="$RUN_DIR/review-${node_id}.json"
+      PLAN_CONTENT=$(cat "$PLAN_PATH")
+      PROMPT_CONTENT="Review the implementation for: ${node_desc}\n\nPlan:\n${PLAN_CONTENT}\n\nRespond with JSON: {\"verdict\": \"pass|fail|needs_revision\", \"notes\": []}"
+      RESULT=$(llm_dispatch \
+        --task-class "$TASK_CLASS" \
+        --node-type "reviewer" \
+        --prompt-text "$PROMPT_CONTENT" 2>&1) || { echo "reviewer dispatch failed" >&2; return 1; }
+      echo "$RESULT" > "$REVIEW_FILE"
+      VERDICT=$(echo "$RESULT" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('verdict','unknown'))" 2>/dev/null || echo "unknown")
+      echo "  [ok] reviewer verdict=${VERDICT} → $REVIEW_FILE"
+      trace_write "{\"trace_id\":\"$NODE_TRACE_ID\",\"task_class\":\"${TASK_CLASS}\",\"status\":\"success\",\"reviewer_verdict\":\"${VERDICT}\"}" >/dev/null 2>&1 || true
+      ;;
+
+    verifier)
+      # Delegate to mini-ork-verify for the artifact_contract
+      ARTIFACT_PATH=$(python3 -c "
+import sys, json
+with open(sys.argv[1]) as f:
+    p = json.load(f)
+outputs = p.get('artifact_contract', {}).get('outputs', [])
+print(outputs[0] if outputs else '')
+" "$PLAN_PATH" 2>/dev/null || echo "")
+      if [ -n "$ARTIFACT_PATH" ]; then
+        "$MINI_ORK_ROOT/bin/mini-ork-verify" "$ARTIFACT_PATH" || {
+          echo "  [fail] verifier node failed for $ARTIFACT_PATH" >&2; return 1
+        }
+      else
+        echo "  [warn] verifier node: no outputs in artifact_contract"
+      fi
+      ;;
+
+    reflector)
+      "$MINI_ORK_ROOT/bin/mini-ork-reflect" || true
+      ;;
+
+    publisher)
+      AUTO_MERGE="$MINI_ORK_ROOT/lib/auto-merge.sh"
+      if [ ! -f "$AUTO_MERGE" ]; then
+        echo "lib/auto-merge.sh not yet present (P1 in flight?)" >&2; exit 3
+      fi
+      bash "$AUTO_MERGE" || { echo "publisher: auto-merge failed" >&2; return 1; }
+      echo "  [ok] publisher: auto-merge complete"
+      ;;
+
+    rollback)
+      _require_lib version_registry
+      version_registry rollback || { echo "rollback: version_registry rollback failed" >&2; return 1; }
+      echo "  [ok] rollback complete"
+      ;;
+
+    *)
+      echo "  [warn] unknown node_type=${node_type} for node_id=${node_id} — skipping"
+      ;;
+  esac
+}
+
+# ── dispatch loop ─────────────────────────────────────────────────────────────
+echo "=== mini-ork execute ==="
+echo "    plan:     $PLAN_PATH"
+echo "    dispatch: $DISPATCH_MODE"
+echo "    filter:   ${FILTER_NODE_TYPE:-all}"
+echo ""
+
+FAIL_COUNT=0
+
+case "$DISPATCH_MODE" in
+  parallel)
+    PIDS=()
+    for entry in "${NODE_IDS[@]}"; do
+      IFS='::' read -r node_id node_type node_desc <<< "$entry"
+      ( _dispatch_node "$node_id" "$node_type" "$node_desc" ) &
+      PIDS+=($!)
+    done
+    for pid in "${PIDS[@]}"; do
+      wait "$pid" || FAIL_COUNT=$((FAIL_COUNT+1))
+    done
+    ;;
+  partitioned)
+    # Group by node_type; run groups serially, nodes within group in parallel
+    declare -A TYPE_GROUPS
+    for entry in "${NODE_IDS[@]}"; do
+      IFS='::' read -r node_id node_type node_desc <<< "$entry"
+      TYPE_GROUPS[$node_type]+="${node_id}::${node_type}::${node_desc}"$'\n'
+    done
+    for node_type in planner researcher implementer reviewer verifier reflector publisher rollback; do
+      [ -z "${TYPE_GROUPS[$node_type]:-}" ] && continue
+      PIDS=()
+      while IFS= read -r entry; do
+        [ -z "$entry" ] && continue
+        IFS='::' read -r node_id nt node_desc <<< "$entry"
+        ( _dispatch_node "$node_id" "$nt" "$node_desc" ) &
+        PIDS+=($!)
+      done <<< "${TYPE_GROUPS[$node_type]}"
+      for pid in "${PIDS[@]}"; do
+        wait "$pid" || FAIL_COUNT=$((FAIL_COUNT+1))
+      done
+    done
+    ;;
+  speculative)
+    # Run all in parallel; first success stops remaining (best-effort)
+    PIDS=()
+    for entry in "${NODE_IDS[@]}"; do
+      IFS='::' read -r node_id node_type node_desc <<< "$entry"
+      ( _dispatch_node "$node_id" "$node_type" "$node_desc" ) &
+      PIDS+=($!)
+    done
+    for pid in "${PIDS[@]}"; do
+      wait "$pid" || true  # speculative: failures are non-fatal
+    done
+    ;;
+  serial|*)
+    for entry in "${NODE_IDS[@]}"; do
+      IFS='::' read -r node_id node_type node_desc <<< "$entry"
+      _dispatch_node "$node_id" "$node_type" "$node_desc" || FAIL_COUNT=$((FAIL_COUNT+1))
+    done
+    ;;
+esac
+
+# ── trace end + result ────────────────────────────────────────────────────────
+if [ "$DRY_RUN" -eq 0 ]; then
+  STATUS="success"
+  [ "$FAIL_COUNT" -gt 0 ] && STATUS="failure"
+  trace_write "{\"trace_id\":\"$TRACE_ID\",\"task_class\":\"${TASK_CLASS}\",\"status\":\"${STATUS}\"}" >/dev/null 2>&1 || true
+fi
+
+if [ "$FAIL_COUNT" -gt 0 ]; then
+  echo "" >&2
+  echo "execute: ${FAIL_COUNT} node(s) failed" >&2
+  exit 1
+fi
+
+echo ""
+echo "execute: all nodes complete"

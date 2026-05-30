@@ -1,0 +1,149 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mini-ork/schemas/workflow.schema.json",
+  "title": "WorkflowDefinition",
+  "description": "Defines a named, versioned workflow as a directed graph of agent nodes. Stored as YAML in recipes/workflows/; validated by mini-ork on load.",
+  "type": "object",
+  "required": ["version", "task_class", "nodes", "edges"],
+  "additionalProperties": false,
+  "properties": {
+    "version": {
+      "type": "string",
+      "description": "Semantic or sequential version string, e.g. '1.0.0' or '0009'.",
+      "pattern": "^[a-zA-Z0-9._-]+$"
+    },
+    "task_class": {
+      "type": "string",
+      "description": "The task_class this workflow serves (must match a task_class.schema.json name).",
+      "minLength": 1
+    },
+    "nodes": {
+      "type": "array",
+      "description": "Agent nodes in this workflow. Each node maps to a single agent invocation.",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/WorkflowNode"
+      }
+    },
+    "edges": {
+      "type": "array",
+      "description": "Directed edges connecting nodes. The graph must be a DAG (no cycles).",
+      "items": {
+        "$ref": "#/$defs/WorkflowEdge"
+      }
+    },
+    "rollback_strategy": {
+      "type": "string",
+      "description": "Name of the rollback node to invoke if a hard-fail gate fires. Must reference a node name with type 'rollback'.",
+      "default": ""
+    },
+    "description": {
+      "type": "string",
+      "description": "Human-readable description of what this workflow accomplishes."
+    },
+    "tags": {
+      "type": "array",
+      "items": { "type": "string" }
+    }
+  },
+  "$defs": {
+    "WorkflowNode": {
+      "type": "object",
+      "required": ["name", "type", "dispatch_mode"],
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Unique node identifier within this workflow.",
+          "pattern": "^[a-z][a-z0-9_-]*$"
+        },
+        "type": {
+          "type": "string",
+          "description": "Agent role this node fills.",
+          "enum": [
+            "planner",
+            "researcher",
+            "implementer",
+            "reviewer",
+            "verifier",
+            "reflector",
+            "publisher",
+            "rollback"
+          ]
+        },
+        "model_lane": {
+          "type": "string",
+          "description": "Model or lane hint, e.g. 'opus', 'sonnet', 'haiku', 'glm', 'kimi'. Resolved against agent_version registry at runtime.",
+          "default": "sonnet"
+        },
+        "dispatch_mode": {
+          "type": "string",
+          "description": "How this node's work units are dispatched: serial (one by one), parallel (all at once), partitioned (sharded by input key), speculative (race N copies; first wins).",
+          "enum": ["serial", "parallel", "partitioned", "speculative"]
+        },
+        "gates": {
+          "type": "array",
+          "description": "Gate IDs that must pass before this node is considered done. References registered_gates(gate_id).",
+          "items": { "type": "string" },
+          "default": []
+        },
+        "prompt_ref": {
+          "type": "string",
+          "description": "Path (relative to repo root) or key of the prompt template for this node.",
+          "default": ""
+        },
+        "timeout_minutes": {
+          "type": "integer",
+          "description": "Hard timeout for this node in minutes. 0 = inherit workflow default.",
+          "minimum": 0,
+          "default": 0
+        },
+        "max_cost_usd": {
+          "type": "number",
+          "description": "Per-invocation cost ceiling in USD. 0 = no per-node cap.",
+          "minimum": 0,
+          "default": 0
+        },
+        "retries": {
+          "type": "integer",
+          "description": "How many times to retry this node on failure before escalating.",
+          "minimum": 0,
+          "maximum": 5,
+          "default": 1
+        }
+      }
+    },
+    "WorkflowEdge": {
+      "type": "object",
+      "required": ["from", "to", "edge_type"],
+      "additionalProperties": false,
+      "properties": {
+        "from": {
+          "type": "string",
+          "description": "Source node name (must match a node.name in this workflow)."
+        },
+        "to": {
+          "type": "string",
+          "description": "Target node name (must match a node.name in this workflow)."
+        },
+        "edge_type": {
+          "type": "string",
+          "description": "Semantic relationship between from and to nodes.",
+          "enum": [
+            "depends_on",
+            "supplies_context_to",
+            "verifies",
+            "blocks",
+            "retries",
+            "escalates_to"
+          ]
+        },
+        "condition": {
+          "type": "string",
+          "description": "Optional CEL/shell expression that must evaluate to truthy for this edge to activate. Empty string = unconditional.",
+          "default": ""
+        }
+      }
+    }
+  }
+}

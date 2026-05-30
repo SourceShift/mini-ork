@@ -32,7 +32,7 @@ MINI_ORK_ROOT="${MINI_ORK_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 # ── Cross-job mutex helpers ────────────────────────────────────────────────
 # mkdir-based mutex — atomic, portable across macOS/Linux without
 # requiring util-linux flock. Stale-lock cleanup uses PID liveness check.
-_mo_main_lock_dir() { echo "${AGENTFLOW_DIR:-${MINI_ORK_HOME:-.mini-ork}}/locks"; }
+_mo_main_lock_dir() { echo "${MINI_ORK_HOME:-.mini-ork}/locks"; }
 _mo_main_lock_path() { echo "$(_mo_main_lock_dir)/main-merge.lock"; }
 
 _mo_acquire_main_mutex() {
@@ -89,7 +89,7 @@ _mo_stash_colliding_untracked() {
   [ -n "$added_in_branch" ] || return 0
 
   local moved_count=0
-  local stash_base="${AGENTFLOW_DIR:-${MINI_ORK_HOME:-.mini-ork}}"
+  local stash_base="${MINI_ORK_HOME:-.mini-ork}"
   local stash_dir="$stash_base/auto-merge-stash/$JOB_ID/${epic}-$(date +%Y%m%d-%H%M%S)"
   while IFS= read -r path; do
     [ -n "$path" ] || continue
@@ -122,7 +122,7 @@ mo_auto_merge() {
   : "${MINI_ORCH_DIR:?}"
   : "${JOB_ID:?}"
 
-  local agentflow_dir="${AGENTFLOW_DIR:-${MINI_ORK_HOME:-.mini-ork}}"
+  local agentflow_dir="${MINI_ORK_HOME:-.mini-ork}"
   local state_db="${MINI_ORK_DB:-${agentflow_dir}/state.db}"
 
   local job_run_dir="$MINI_ORCH_DIR/runs/$JOB_ID"

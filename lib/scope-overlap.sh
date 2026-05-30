@@ -112,7 +112,7 @@ mo_get_epic_symbols_for_file() {
 # did not declare symbols (FALL BACK to serialize).
 mo_symbols_disjoint_for_file() {
   local file="$1" epic_a="$2" epic_b="$3"
-  local yaml="${AGENTFLOW_DIR:-${MINI_ORK_HOME:-.mini-ork}}/config/scope-patterns.yaml"
+  local yaml="${MINI_ORK_HOME:-${MINI_ORK_HOME:-.mini-ork}}/config/scope-patterns.yaml"
   [ -f "$yaml" ] || return 1
 
   local syms_a syms_b
@@ -129,7 +129,7 @@ mo_symbols_disjoint_for_file() {
 }
 
 # ─── Scope-overlap checker ──────────────────────────────────────────────
-# Globals: EPICS (array), REPO_ROOT, AGENTFLOW_DIR, JOB_RUN_DIR
+# Globals: EPICS (array), REPO_ROOT, MINI_ORK_HOME, JOB_RUN_DIR
 # Returns:
 #   0 — no shared-trunk overlap (or MO_SERIALIZE_ON_OVERLAP=0)
 #   1 — shared-trunk overlap detected AND MO_SERIALIZE_ON_OVERLAP=1
@@ -138,7 +138,7 @@ mo_symbols_disjoint_for_file() {
 #   Writes <JOB_RUN_DIR>/scope-overlap.json when overlap found.
 #   Prints overlap warnings to stderr.
 mo_check_scope_overlap() {
-  local yaml="${AGENTFLOW_DIR:-${MINI_ORK_HOME:-.mini-ork}}/config/scope-patterns.yaml"
+  local yaml="${MINI_ORK_HOME:-${MINI_ORK_HOME:-.mini-ork}}/config/scope-patterns.yaml"
   if [ ! -f "$yaml" ]; then
     echo "[mini-ork] WARN: scope-patterns.yaml not found — skipping overlap check" >&2
     return 0

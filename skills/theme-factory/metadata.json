@@ -1,9 +1,0 @@
-{
-  "version": "1.0.0",
-  "organization": "Engineering",
-  "date": "May 2026",
-  "abstract": "Professional font and color themes for book exports. Each theme includes color palettes, font pairings, and format-specific styling (EPUB CSS, DOCX reference-doc). 3 themes shipped (Modern Minimalist, Ocean Depths, Tech Innovation); 10 available upstream.",
-  "references": [
-    "https://github.com/ComposioHQ/awesome-claude-skills/tree/master/theme-factory"
-  ]
-}

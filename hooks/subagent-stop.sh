@@ -17,7 +17,7 @@
 set -uo pipefail
 
 MINI_ORK_ROOT="${MINI_ORK_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
-DB="${MINI_ORK_DB:-${AGENTFLOW_DB:-${AGENTFLOW_DIR:-${MINI_ORK_HOME:-.mini-ork}}/state.db}}"
+DB="${MINI_ORK_DB:-${MINI_ORK_HOME:-.mini-ork}/state.db}"
 
 payload=""
 if [ ! -t 0 ]; then
@@ -27,7 +27,7 @@ fi
 emit_continue() { printf '{"continue": true}\n'; }
 [ -f "$DB" ] || { emit_continue; exit 0; }
 
-parent_session="${MINI_ORK_PARENT_CLAUDE_SESSION:-${AGENTFLOW_PARENT_CLAUDE_SESSION:-${CLAUDE_SESSION_ID:-}}}"
+parent_session="${MINI_ORK_PARENT_CLAUDE_SESSION:-${CLAUDE_SESSION_ID:-}}"
 [ -z "$parent_session" ] && { emit_continue; exit 0; }
 
 extract_field() {

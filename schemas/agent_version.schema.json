@@ -1,0 +1,111 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mini-ork/schemas/agent_version.schema.json",
+  "title": "AgentVersionRecord",
+  "description": "Describes a specific, pinned version of an agent: its model, tools, prompt hash, and observed performance characteristics. Stored in config/agents/ and mirrored to agent_performance_memory.",
+  "type": "object",
+  "required": ["role", "model", "provider"],
+  "additionalProperties": false,
+  "properties": {
+    "role": {
+      "type": "string",
+      "description": "The agent role this version fulfils. Must match a node.type enum value in workflow.schema.json.",
+      "enum": [
+        "planner",
+        "researcher",
+        "implementer",
+        "reviewer",
+        "verifier",
+        "reflector",
+        "publisher",
+        "rollback"
+      ]
+    },
+    "model": {
+      "type": "string",
+      "description": "Model identifier, e.g. 'claude-sonnet-4-6', 'gemini-2.0-flash', 'gpt-4o'.",
+      "minLength": 1
+    },
+    "provider": {
+      "type": "string",
+      "description": "Model provider, e.g. 'anthropic', 'google', 'openai', 'mistral'.",
+      "minLength": 1
+    },
+    "tools": {
+      "type": "array",
+      "description": "Tool names available to this agent version, e.g. 'bash', 'read_file', 'web_search'.",
+      "items": { "type": "string" },
+      "default": []
+    },
+    "prompt_hash": {
+      "type": "string",
+      "description": "SHA-256 (hex, first 16 chars acceptable) of the canonical prompt template for this agent version. Used for detecting prompt drift.",
+      "pattern": "^[0-9a-f]{8,64}$",
+      "default": ""
+    },
+    "task_classes": {
+      "type": "array",
+      "description": "Task classes this agent version is approved to handle. Empty = all classes permitted.",
+      "items": { "type": "string" },
+      "default": []
+    },
+    "cost_profile": {
+      "type": "object",
+      "description": "Billing rates for this model, used for budget gate calculations.",
+      "additionalProperties": false,
+      "properties": {
+        "input_per_1m_usd": {
+          "type": "number",
+          "description": "Cost in USD per 1 million input tokens.",
+          "minimum": 0
+        },
+        "output_per_1m_usd": {
+          "type": "number",
+          "description": "Cost in USD per 1 million output tokens.",
+          "minimum": 0
+        },
+        "cached_input_per_1m_usd": {
+          "type": "number",
+          "description": "Discounted rate for cache-hit input tokens. 0 = no caching discount available.",
+          "minimum": 0,
+          "default": 0
+        }
+      },
+      "required": ["input_per_1m_usd", "output_per_1m_usd"]
+    },
+    "context_window": {
+      "type": "integer",
+      "description": "Maximum context window in tokens for this model.",
+      "minimum": 1024,
+      "default": 200000
+    },
+    "success_rate": {
+      "type": "number",
+      "description": "Observed success rate (0.0–1.0) computed from agent_performance_memory. Updated by the evolution engine; 0 = no data yet.",
+      "minimum": 0.0,
+      "maximum": 1.0,
+      "default": 0.0
+    },
+    "known_failure_modes": {
+      "type": "array",
+      "description": "Short descriptions of recurring failure patterns observed for this agent version, sourced from failure_memory.",
+      "items": { "type": "string" },
+      "default": []
+    },
+    "version_tag": {
+      "type": "string",
+      "description": "Optional semver or date-based tag for this record, e.g. 'v1.2.0' or '2026-05-30'.",
+      "default": ""
+    },
+    "deprecated": {
+      "type": "boolean",
+      "description": "If true, this agent version should not be selected for new runs.",
+      "default": false
+    },
+    "notes": {
+      "type": "string",
+      "description": "Free-text notes about this version, e.g. reasons for deprecation.",
+      "default": ""
+    }
+  }
+}

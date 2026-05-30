@@ -1,0 +1,249 @@
+#!/usr/bin/env bash
+# mini-ork-plan — Planner node: reads task_class + kickoff, generates plan JSON.
+#
+# Plan outputs (per architecture spec Ch 7):
+#   objective          string
+#   assumptions        string[]
+#   decomposition      {id, description, node_type, depends_on[]}[]
+#   dependencies       {from, to}[]
+#   risk_notes         string[]
+#   artifact_contract  {outputs[], success_verifiers[]}
+#   verifier_contract  {checks[]}          ← REQUIRED (plan rejected without it)
+#
+# Inputs:
+#   $1  kickoff.md path (required)
+#
+# Env:
+#   MINI_ORK_TASK_CLASS     Set by mini-ork-classify (or pass --task-class)
+#   MINI_ORK_WORKFLOW       Path to active workflow.yaml
+#   MINI_ORK_RECIPE         Active recipe name
+#
+# Flags:
+#   --task-class <name>     Override task class
+#   --out <plan.json>       Write plan to file (default: .mini-ork/runs/<run>/plan.json)
+#   --dry-run               Print plan to stdout; do not write to DB or file
+#   --help
+
+set -Eeuo pipefail
+
+MINI_ORK_ROOT="${MINI_ORK_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+export MINI_ORK_ROOT
+
+# ── lib guards ────────────────────────────────────────────────────────────────
+_require_lib() {
+  local lib="$MINI_ORK_ROOT/lib/${1}.sh"
+  if [ ! -f "$lib" ]; then
+    echo "lib/${1}.sh not yet present (P1 in flight?)" >&2; exit 3
+  fi
+  # shellcheck source=/dev/null
+  source "$lib"
+}
+
+# ── arg parsing ───────────────────────────────────────────────────────────────
+KICKOFF=""
+TASK_CLASS="${MINI_ORK_TASK_CLASS:-}"
+OUT_FILE=""
+DRY_RUN="${MINI_ORK_DRY_RUN:-0}"
+
+_usage() {
+  cat <<'EOF'
+Usage: mini-ork plan <kickoff.md> [--task-class <name>] [--out <plan.json>] [--dry-run]
+
+Generate a structured plan JSON from a kickoff file.
+
+The plan MUST include a verifier_contract (checks[]) — planning fails if missing.
+
+Outputs:
+  <out-file>   JSON plan written to .mini-ork/runs/<run>/plan.json (or --out path)
+  stdout       plan path on success
+
+Options:
+  --task-class <name>   Override task_class (default: $MINI_ORK_TASK_CLASS)
+  --out <path>          Write plan to this path instead of default
+  --dry-run             Print plan JSON to stdout; do not write files or DB
+  --help                Show this help
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --help|-h)     _usage; exit 0 ;;
+    --dry-run)     DRY_RUN=1; shift ;;
+    --task-class)  TASK_CLASS="${2:?--task-class requires a value}"; shift 2 ;;
+    --out)         OUT_FILE="${2:?--out requires a path}"; shift 2 ;;
+    -*)            echo "Unknown flag: $1. Try --help" >&2; exit 2 ;;
+    *)
+      if [ -z "$KICKOFF" ]; then KICKOFF="$1"; shift
+      else echo "Unexpected argument: $1" >&2; exit 2
+      fi
+      ;;
+  esac
+done
+
+[ -z "$KICKOFF" ] && { _usage; exit 2; }
+[ -f "$KICKOFF" ] || { echo "kickoff not found: $KICKOFF" >&2; exit 2; }
+
+# ── env setup ─────────────────────────────────────────────────────────────────
+MINI_ORK_HOME="${MINI_ORK_HOME:-$(pwd)/.mini-ork}"
+MINI_ORK_DB="${MINI_ORK_DB:-$MINI_ORK_HOME/state.db}"
+export MINI_ORK_HOME MINI_ORK_DB
+
+TASK_CLASS="${TASK_CLASS:-generic}"
+WORKFLOW="${MINI_ORK_WORKFLOW:-}"
+
+# ── resolve output path ───────────────────────────────────────────────────────
+if [ -z "$OUT_FILE" ]; then
+  RUN_ID="run-$(date +%s)-$$"
+  RUN_DIR="$MINI_ORK_HOME/runs/$RUN_ID"
+  mkdir -p "$RUN_DIR"
+  OUT_FILE="$RUN_DIR/plan.json"
+fi
+
+# ── trace start ───────────────────────────────────────────────────────────────
+TRACE_ID="tr-plan-$(date +%s)-$$"
+if [ "$DRY_RUN" -eq 0 ]; then
+  _require_lib trace_store
+  trace_write "{\"trace_id\":\"$TRACE_ID\",\"task_class\":\"${TASK_CLASS}\",\"status\":\"running\"}" >/dev/null 2>&1 || true
+fi
+
+# ── resolve planner prompt ────────────────────────────────────────────────────
+# Look for planner prompt in: recipe > workflow > built-in fallback
+PLANNER_PROMPT_FILE=""
+if [ -n "${MINI_ORK_RECIPE:-}" ]; then
+  PLANNER_PROMPT_FILE="$MINI_ORK_ROOT/recipes/${MINI_ORK_RECIPE}/prompts/planner.md"
+fi
+if [ ! -f "${PLANNER_PROMPT_FILE:-}" ] && [ -n "$WORKFLOW" ]; then
+  WORKFLOW_DIR="$(dirname "$WORKFLOW")"
+  PLANNER_PROMPT_FILE="$WORKFLOW_DIR/prompts/planner.md"
+fi
+if [ ! -f "${PLANNER_PROMPT_FILE:-}" ]; then
+  PLANNER_PROMPT_FILE="$MINI_ORK_ROOT/prompts/planner.md"
+fi
+if [ ! -f "${PLANNER_PROMPT_FILE:-}" ]; then
+  # Inline fallback prompt — covers cold-start before prompts/ are populated
+  PLANNER_PROMPT_FILE="$(mktemp /tmp/mini-ork-planner-XXXXXX.md)"
+  _PLANNER_TMPFILE="$PLANNER_PROMPT_FILE"
+  cat > "$PLANNER_PROMPT_FILE" <<'PROMPT'
+You are a meticulous task planner. Given the kickoff document below, produce a
+structured plan in JSON.
+
+The JSON MUST have these top-level keys:
+  objective          (string)
+  assumptions        (string[])
+  decomposition      ({id, description, node_type, depends_on[]}[])
+    node_type must be one of: planner | researcher | implementer | reviewer |
+                               verifier | reflector | publisher | rollback
+  dependencies       ({from, to}[])
+  risk_notes         (string[])
+  artifact_contract  ({outputs: string[], success_verifiers: string[]})
+  verifier_contract  ({checks: {id, description, command?}[]})
+
+IMPORTANT: verifier_contract.checks must contain at least one item.
+A plan without a verifier_contract is INVALID.
+
+Respond with ONLY valid JSON. No markdown fences, no prose.
+
+--- KICKOFF ---
+{{KICKOFF_CONTENT}}
+PROMPT
+fi
+
+# ── LLM dispatch ──────────────────────────────────────────────────────────────
+_require_lib llm-dispatch
+
+KICKOFF_CONTENT=$(cat "$KICKOFF")
+PROMPT_TEXT=$(sed "s|{{KICKOFF_CONTENT}}|${KICKOFF_CONTENT}|g" "$PLANNER_PROMPT_FILE")
+# Clean up inline tmpfile if we created it
+[ -n "${_PLANNER_TMPFILE:-}" ] && rm -f "$_PLANNER_TMPFILE"
+
+if [ "$DRY_RUN" -eq 1 ]; then
+  echo "[dry-run] would invoke LLM planner with task_class=${TASK_CLASS}"
+  echo "[dry-run] would write plan to: $OUT_FILE"
+  cat <<'JSON'
+{
+  "objective": "<dry-run: not generated>",
+  "assumptions": [],
+  "decomposition": [],
+  "dependencies": [],
+  "risk_notes": [],
+  "artifact_contract": { "outputs": [], "success_verifiers": [] },
+  "verifier_contract": { "checks": [{ "id": "dry-run", "description": "dry-run placeholder" }] }
+}
+JSON
+  exit 0
+fi
+
+PLAN_JSON=$(llm_dispatch \
+  --task-class "$TASK_CLASS" \
+  --node-type "planner" \
+  --prompt-text "$PROMPT_TEXT" \
+  2>&1) || {
+  echo "LLM dispatch failed for planner node" >&2
+  trace_write "{\"trace_id\":\"$TRACE_ID\",\"task_class\":\"${TASK_CLASS}\",\"status\":\"failure\"}" >/dev/null 2>&1 || true
+  exit 1
+}
+
+# ── validate verifier_contract is present ─────────────────────────────────────
+HAS_VERIFIER=$(echo "$PLAN_JSON" | python3 -c "
+import sys, json
+try:
+    p = json.load(sys.stdin)
+    vc = p.get('verifier_contract', {})
+    checks = vc.get('checks', [])
+    print('ok' if checks else 'missing')
+except Exception as e:
+    print(f'parse_error:{e}', file=sys.stderr)
+    print('missing')
+" 2>/dev/null || echo "missing")
+
+if [ "$HAS_VERIFIER" != "ok" ]; then
+  echo "PLAN REJECTED: verifier_contract.checks is missing or empty." >&2
+  echo "A plan is not complete until success-check is defined." >&2
+  trace_write "{\"trace_id\":\"$TRACE_ID\",\"task_class\":\"${TASK_CLASS}\",\"status\":\"failure\",\"reviewer_verdict\":\"missing_verifier_contract\"}" >/dev/null 2>&1 || true
+  exit 1
+fi
+
+# ── write plan ────────────────────────────────────────────────────────────────
+mkdir -p "$(dirname "$OUT_FILE")"
+echo "$PLAN_JSON" > "$OUT_FILE"
+
+echo "plan_path=${OUT_FILE}"
+echo "task_class=${TASK_CLASS}"
+
+# ── DB write ──────────────────────────────────────────────────────────────────
+if [ -f "$MINI_ORK_DB" ]; then
+  PLAN_HASH=$(echo "$PLAN_JSON" | python3 -c "import sys,hashlib; print(hashlib.sha256(sys.stdin.read().encode()).hexdigest()[:16])")
+  python3 - "$MINI_ORK_DB" "${RUN_ID:-}" "$TASK_CLASS" "$OUT_FILE" "$PLAN_HASH" <<'PY'
+import sqlite3, sys, time
+
+db, run_id, task_class, plan_path, plan_hash = sys.argv[1:]
+if not run_id:
+    print("[info] run_id not set; skipping run row update", file=sys.stderr)
+    sys.exit(0)
+
+con = sqlite3.connect(db)
+con.execute("PRAGMA journal_mode=WAL")
+now = int(time.time())
+
+try:
+    con.execute("""
+        UPDATE runs
+        SET plan_path=?, plan_hash=?, status='planned', updated_at=?
+        WHERE id=?
+    """, (plan_path, plan_hash, now, run_id))
+    if con.execute("SELECT changes()").fetchone()[0] == 0:
+        con.execute("""
+            INSERT OR IGNORE INTO runs
+                (id, task_class, plan_path, plan_hash, status, created_at, updated_at)
+            VALUES (?, ?, ?, ?, 'planned', ?, ?)
+        """, (run_id, task_class, plan_path, plan_hash, now, now))
+    con.commit()
+except sqlite3.OperationalError as e:
+    print(f"[warn] DB write skipped: {e}", file=sys.stderr)
+finally:
+    con.close()
+PY
+fi
+
+# ── trace end ─────────────────────────────────────────────────────────────────
+trace_write "{\"trace_id\":\"$TRACE_ID\",\"task_class\":\"${TASK_CLASS}\",\"status\":\"success\",\"final_artifact_ref\":\"${OUT_FILE}\"}" >/dev/null 2>&1 || true

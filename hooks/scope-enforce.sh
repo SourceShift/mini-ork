@@ -22,7 +22,6 @@
 #      <run_dir>/scope-manifest.json
 #   2. MINI_ORK_DISPATCH_ID env → orch_dispatches.run_dir →
 #      <run_dir>/scope-manifest.json
-#   3. Legacy AGENTFLOW_RUN_DIR / AGENTFLOW_DISPATCH_ID fallback
 #
 # Decision:
 #   - If file_path matches any allowlist glob → continue:true
@@ -47,20 +46,20 @@ file_path=$(echo "$input" | jq -r '.tool_input.file_path // .tool_input.path // 
 
 [ -z "$file_path" ] && { ALLOW_OUTPUT; exit 0; }
 
-# Resolve manifest — prefer new MINI_ORK_* env, fall back to AGENTFLOW_*
+# Resolve manifest via MINI_ORK_* env
 manifest=""
-run_dir="${MINI_ORK_RUN_DIR:-${AGENTFLOW_RUN_DIR:-}}"
-dispatch_id="${MINI_ORK_DISPATCH_ID:-${AGENTFLOW_DISPATCH_ID:-}}"
+run_dir="${MINI_ORK_RUN_DIR:-}"
+dispatch_id="${MINI_ORK_DISPATCH_ID:-}"
 
 if [ -n "$run_dir" ] && [ -f "$run_dir/scope-manifest.json" ]; then
   manifest="$run_dir/scope-manifest.json"
 elif [ -n "$dispatch_id" ]; then
-  db="${MINI_ORK_DB:-${AGENTFLOW_DB:-${AGENTFLOW_DIR:-${MINI_ORK_HOME:-.mini-ork}}/state.db}}"
+  db="${MINI_ORK_DB:-${MINI_ORK_HOME:-.mini-ork}/state.db}"
   if [ -f "$db" ]; then
     found_run_dir=$(sqlite3 "$db" \
       "SELECT run_dir FROM orch_dispatches WHERE id=$dispatch_id;" 2>/dev/null || true)
     if [ -n "$found_run_dir" ]; then
-      agentflow_dir="${AGENTFLOW_DIR:-${MINI_ORK_HOME:-.mini-ork}}"
+      agentflow_dir="${MINI_ORK_HOME:-.mini-ork}"
       candidate="${agentflow_dir}/$found_run_dir/scope-manifest.json"
       [ -f "$candidate" ] && manifest="$candidate"
     fi

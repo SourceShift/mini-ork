@@ -1,0 +1,66 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mini-ork/schemas/verifier_contract.schema.json",
+  "title": "VerifierContract",
+  "description": "Specifies how a single verification step is executed and what constitutes a pass. Referenced by artifact_contract.success_verifiers and workflow node gates.",
+  "type": "object",
+  "required": ["name", "kind"],
+  "additionalProperties": false,
+  "properties": {
+    "name": {
+      "type": "string",
+      "description": "Unique verifier name across the registry. Used as reference key in artifact_contract.",
+      "pattern": "^[a-z][a-z0-9_-]*$",
+      "minLength": 2
+    },
+    "kind": {
+      "type": "string",
+      "description": "Execution mode: deterministic (pure script/binary, exit code checked), reviewer (LLM review agent returns structured verdict), llm_judge (LLM rates artifact on rubric, pass if score >= threshold), external (HTTP callback to external CI/CD system).",
+      "enum": ["deterministic", "reviewer", "llm_judge", "external"]
+    },
+    "script": {
+      "type": "string",
+      "description": "For kind=deterministic: path to executable script or shell command string. For kind=external: URL template. For kind=reviewer|llm_judge: prompt_ref key. Supports {artifact_path} and {evidence_path} substitutions.",
+      "default": ""
+    },
+    "pass_codes": {
+      "type": "array",
+      "description": "Exit codes that count as a pass for kind=deterministic. Default [0].",
+      "items": { "type": "integer" },
+      "default": [0],
+      "minItems": 1
+    },
+    "timeout_seconds": {
+      "type": "integer",
+      "description": "Wall-clock timeout for this verifier. Default 120.",
+      "minimum": 1,
+      "default": 120
+    },
+    "evidence_path_template": {
+      "type": "string",
+      "description": "Template for where to write verifier output (test reports, coverage XML, judge scores). Supports {run_id} and {verifier_name} substitutions.",
+      "default": ".mini-ork/evidence/{run_id}/{verifier_name}.json"
+    },
+    "min_score": {
+      "type": "number",
+      "description": "For kind=llm_judge: minimum score (0.0–1.0) required to pass.",
+      "minimum": 0.0,
+      "maximum": 1.0,
+      "default": 0.7
+    },
+    "rubric_ref": {
+      "type": "string",
+      "description": "For kind=llm_judge: path to rubric YAML file defining scoring criteria.",
+      "default": ""
+    },
+    "description": {
+      "type": "string",
+      "description": "Human-readable description of what this verifier checks."
+    },
+    "tags": {
+      "type": "array",
+      "items": { "type": "string" },
+      "default": []
+    }
+  }
+}

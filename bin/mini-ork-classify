@@ -1,0 +1,187 @@
+#!/usr/bin/env bash
+# mini-ork-classify — Task Router: reads a kickoff.md and routes it to a task_class.
+#
+# Inputs:
+#   $1  kickoff.md path (required)
+#
+# Outputs:
+#   stdout: task_class=<name>
+#   DB:     runs row updated with task_class (unless --dry-run)
+#
+# Classification logic:
+#   Matches kickoff text against ${MINI_ORK_HOME}/config/task_classes/*.yaml
+#   Each yaml has a `matches:` block with keyword/regex patterns.
+#   First file whose patterns produce a match wins.
+#   Falls back to task_class "generic" if no yaml matches.
+#
+# Flags:
+#   --workflow-version <ver>  Override the default workflow version for the class
+#   --dry-run                 Classify and print result; do NOT write to DB
+#   --help
+
+set -Eeuo pipefail
+
+MINI_ORK_ROOT="${MINI_ORK_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+export MINI_ORK_ROOT
+
+# ── lib guards ────────────────────────────────────────────────────────────────
+_require_lib() {
+  local lib="$MINI_ORK_ROOT/lib/${1}.sh"
+  if [ ! -f "$lib" ]; then
+    echo "lib/${1}.sh not yet present (P1 in flight?)" >&2; exit 3
+  fi
+  # shellcheck source=/dev/null
+  source "$lib"
+}
+
+# ── arg parsing ───────────────────────────────────────────────────────────────
+KICKOFF=""
+WORKFLOW_VERSION=""
+DRY_RUN="${MINI_ORK_DRY_RUN:-0}"
+
+_usage() {
+  cat <<'EOF'
+Usage: mini-ork classify <kickoff.md> [--workflow-version <ver>] [--dry-run]
+
+Classify a kickoff file into a task_class by matching against
+config/task_classes/*.yaml pattern files.
+
+Outputs:
+  task_class=<name>  (stdout)
+  runs table row     (DB, unless --dry-run)
+
+Options:
+  --workflow-version <ver>  Override default workflow version for this class
+  --dry-run                 Print classification; do not write DB
+  --help                    Show this help
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --help|-h)       _usage; exit 0 ;;
+    --dry-run)       DRY_RUN=1; shift ;;
+    --workflow-version) WORKFLOW_VERSION="${2:?--workflow-version requires a value}"; shift 2 ;;
+    -*)              echo "Unknown flag: $1. Try --help" >&2; exit 2 ;;
+    *)
+      if [ -z "$KICKOFF" ]; then KICKOFF="$1"; shift
+      else echo "Unexpected argument: $1" >&2; exit 2
+      fi
+      ;;
+  esac
+done
+
+[ -z "$KICKOFF" ] && { _usage; exit 2; }
+[ -f "$KICKOFF" ] || { echo "kickoff not found: $KICKOFF" >&2; exit 2; }
+
+# ── env setup ─────────────────────────────────────────────────────────────────
+MINI_ORK_HOME="${MINI_ORK_HOME:-$(pwd)/.mini-ork}"
+MINI_ORK_DB="${MINI_ORK_DB:-$MINI_ORK_HOME/state.db}"
+export MINI_ORK_HOME MINI_ORK_DB
+
+TASK_CLASSES_DIR="${MINI_ORK_HOME}/config/task_classes"
+if [ ! -d "$TASK_CLASSES_DIR" ]; then
+  # Fall back to repo-level config
+  TASK_CLASSES_DIR="$MINI_ORK_ROOT/config/task_classes"
+fi
+
+# ── trace start ───────────────────────────────────────────────────────────────
+TRACE_ID="tr-classify-$(date +%s)-$$"
+if [ "$DRY_RUN" -eq 0 ]; then
+  _require_lib trace_store
+  trace_write "{\"trace_id\":\"$TRACE_ID\",\"task_class\":\"__classify__\",\"status\":\"running\",\"workflow_version_id\":\"classify-start\"}" >/dev/null 2>&1 || true
+fi
+
+# ── classification ────────────────────────────────────────────────────────────
+KICKOFF_TEXT=$(cat "$KICKOFF")
+TASK_CLASS="generic"
+
+if [ -d "$TASK_CLASSES_DIR" ]; then
+  while IFS= read -r -d '' yaml_file; do
+    # Extract class name from filename (strip path + .yaml)
+    candidate_class=$(basename "$yaml_file" .yaml)
+
+    # Use yq if available, else python3 yaml parser fallback
+    if command -v yq >/dev/null 2>&1; then
+      # yq reads the matches[] array; each entry is a regex/keyword
+      mapfile -t patterns < <(yq e '.matches[]' "$yaml_file" 2>/dev/null || true)
+    else
+      mapfile -t patterns < <(python3 - "$yaml_file" <<'PY'
+import sys, yaml
+with open(sys.argv[1]) as f:
+    data = yaml.safe_load(f) or {}
+for p in data.get('matches', []):
+    print(p)
+PY
+      )
+    fi
+
+    matched=0
+    for pattern in "${patterns[@]}"; do
+      if echo "$KICKOFF_TEXT" | grep -qiE "$pattern" 2>/dev/null; then
+        matched=1; break
+      fi
+    done
+
+    if [ "$matched" -eq 1 ]; then
+      TASK_CLASS="$candidate_class"
+      break
+    fi
+  done < <(find "$TASK_CLASSES_DIR" -maxdepth 1 -name '*.yaml' -print0 2>/dev/null | sort -z)
+fi
+
+# ── workflow version resolution ───────────────────────────────────────────────
+if [ -n "$WORKFLOW_VERSION" ]; then
+  RESOLVED_WF_VERSION="$WORKFLOW_VERSION"
+else
+  # Check for a default_workflow_version in the class yaml
+  yaml_file="$TASK_CLASSES_DIR/${TASK_CLASS}.yaml"
+  if [ -f "$yaml_file" ] && command -v yq >/dev/null 2>&1; then
+    RESOLVED_WF_VERSION=$(yq e '.default_workflow_version // "latest"' "$yaml_file" 2>/dev/null || echo "latest")
+  else
+    RESOLVED_WF_VERSION="latest"
+  fi
+fi
+
+# ── output ────────────────────────────────────────────────────────────────────
+echo "task_class=${TASK_CLASS}"
+echo "workflow_version=${RESOLVED_WF_VERSION}"
+echo "kickoff=${KICKOFF}"
+
+if [ "$DRY_RUN" -eq 1 ]; then
+  echo "[dry-run] would write task_class=${TASK_CLASS} to DB run row"
+  exit 0
+fi
+
+# ── DB write ──────────────────────────────────────────────────────────────────
+if [ -f "$MINI_ORK_DB" ]; then
+  RUN_ID="run-$(date +%s)-$$"
+  python3 - "$MINI_ORK_DB" "$RUN_ID" "$TASK_CLASS" "$RESOLVED_WF_VERSION" "$KICKOFF" <<'PY'
+import sqlite3, sys, time
+
+db, run_id, task_class, wf_version, kickoff = sys.argv[1:]
+con = sqlite3.connect(db)
+con.execute("PRAGMA journal_mode=WAL")
+now = int(time.time())
+
+# Upsert into runs table; P3 creates the schema — tolerate missing table gracefully
+try:
+    con.execute("""
+        INSERT OR REPLACE INTO runs
+            (id, task_class, workflow_version, kickoff_path, status, created_at, updated_at)
+        VALUES (?, ?, ?, ?, 'classified', ?, ?)
+    """, (run_id, task_class, wf_version, kickoff, now, now))
+    con.commit()
+    print(f"run_id={run_id}")
+except sqlite3.OperationalError as e:
+    # Table doesn't exist yet (P3 not run) — emit warning, continue
+    print(f"[warn] runs table not yet created ({e}); DB write skipped", file=sys.stderr)
+finally:
+    con.close()
+PY
+fi
+
+# ── trace end ─────────────────────────────────────────────────────────────────
+if [ "$DRY_RUN" -eq 0 ]; then
+  trace_write "{\"trace_id\":\"$TRACE_ID\",\"task_class\":\"${TASK_CLASS}\",\"status\":\"success\"}" >/dev/null 2>&1 || true
+fi

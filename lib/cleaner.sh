@@ -20,9 +20,9 @@ set -euo pipefail
 MINI_ORK_ROOT="${MINI_ORK_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 REPO_ROOT="${REPO_ROOT:-$(git -C "$MINI_ORK_ROOT" rev-parse --show-toplevel 2>/dev/null || pwd)}"
 MINI_ORK_HOME="${MINI_ORK_HOME:-.mini-ork}"
-AGENTFLOW_DIR="${AGENTFLOW_DIR:-$REPO_ROOT/$MINI_ORK_HOME}"
-SCOPE_CARD_FILE="$AGENTFLOW_DIR/AGENT_SCOPE_CARD.md"
-LOCK_FILE="$AGENTFLOW_DIR/locks/cleaner.lock"
+MINI_ORK_HOME="${MINI_ORK_HOME:-$REPO_ROOT/$MINI_ORK_HOME}"
+SCOPE_CARD_FILE="$MINI_ORK_HOME/AGENT_SCOPE_CARD.md"
+LOCK_FILE="$MINI_ORK_HOME/locks/cleaner.lock"
 
 DETECTIVE_JSON="${1:-}"
 OUTPUT_DIR="${2:-}"
@@ -196,7 +196,7 @@ git checkout -b "$BRANCH" 2>&1 | tail -2 >&2
 
 # ─── 2. Build cleaner prompt ──────────────────────────────────────────────
 PROMPT_FILE="$OUTPUT_DIR/prompt.md"
-INBOX_DIR="$AGENTFLOW_DIR/INBOX"
+INBOX_DIR="$MINI_ORK_HOME/INBOX"
 cat >"$PROMPT_FILE" <<EOF
 You are the **mini-ork cleaner** — a single-shot agent that fixes a cross-cutting
 blocker on main so paused epics can resume.
@@ -269,10 +269,10 @@ When done, commit and STOP. The orchestrator picks up the rest.
 EOF
 
 # Append optional memory block from insforge-pre-task hook if available
-if [ -x "$AGENTFLOW_DIR/hooks/insforge-pre-task.sh" ]; then
+if [ -x "$MINI_ORK_HOME/hooks/insforge-pre-task.sh" ]; then
   insforge_query="cleaner $CLASSIFICATION baseline"
-  memory_block=$(AGENTFLOW_CALLER="cleaner:${EPIC_ID}:${CLASSIFICATION}" \
-    bash "$AGENTFLOW_DIR/hooks/insforge-pre-task.sh" "$insforge_query" 3 2>/dev/null || echo "")
+  memory_block=$(MINI_ORK_CALLER="cleaner:${EPIC_ID}:${CLASSIFICATION}" \
+    bash "$MINI_ORK_HOME/hooks/insforge-pre-task.sh" "$insforge_query" 3 2>/dev/null || echo "")
   if [ -n "$memory_block" ] && ! echo "$memory_block" | grep -qE "no insforge-context matches|insforge sdk not installed"; then
     echo "" >> "$PROMPT_FILE"
     echo "$memory_block" >> "$PROMPT_FILE"
@@ -342,7 +342,7 @@ echo "[cleaner] worker produced $COMMITS_AHEAD commit(s)" >&2
 GAUNTLET_OUT="$OUTPUT_DIR/gauntlet"
 GAUNTLET_SH="$MINI_ORK_ROOT/lib/gauntlet.sh"
 if [ ! -f "$GAUNTLET_SH" ]; then
-  GAUNTLET_SH="$AGENTFLOW_DIR/lib/gauntlet.sh"
+  GAUNTLET_SH="$MINI_ORK_HOME/lib/gauntlet.sh"
 fi
 
 echo "[cleaner] running gauntlet on cleaner branch" >&2

@@ -1,0 +1,85 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mini-ork/schemas/task_class.schema.json",
+  "title": "TaskClassDefinition",
+  "description": "Declares a task class — a named category of work with its default workflow, routing matchers, and risk classification. Stored as YAML in recipes/task_classes/.",
+  "type": "object",
+  "required": ["name", "description", "default_workflow", "risk_class"],
+  "additionalProperties": false,
+  "properties": {
+    "name": {
+      "type": "string",
+      "description": "Canonical task class identifier, snake_case. Must be unique across the registry.",
+      "pattern": "^[a-z][a-z0-9_-]*$",
+      "minLength": 2
+    },
+    "description": {
+      "type": "string",
+      "description": "Human-readable explanation of what kinds of tasks belong to this class.",
+      "minLength": 10
+    },
+    "artifact_contract_ref": {
+      "type": "string",
+      "description": "Name of the artifact_contract (must match artifact_contract.schema.json task_class) that governs outputs for this class.",
+      "default": ""
+    },
+    "default_workflow": {
+      "type": "string",
+      "description": "Name of the workflow (must exist in workflow registry) used when no override is provided.",
+      "minLength": 1
+    },
+    "matches": {
+      "type": "object",
+      "description": "Routing matchers. The task router evaluates these in order: keywords → regex → path_globs. First match wins.",
+      "additionalProperties": false,
+      "properties": {
+        "keywords": {
+          "type": "array",
+          "description": "Case-insensitive keywords found in the task title or description that suggest this class.",
+          "items": { "type": "string" },
+          "default": []
+        },
+        "regex": {
+          "type": "array",
+          "description": "POSIX ERE patterns applied to the task title + description concatenation.",
+          "items": { "type": "string" },
+          "default": []
+        },
+        "path_globs": {
+          "type": "array",
+          "description": "Glob patterns matched against files expected to be touched. Useful for routing by filesystem scope.",
+          "items": { "type": "string" },
+          "default": []
+        }
+      }
+    },
+    "default_gates": {
+      "type": "array",
+      "description": "Gate IDs applied by default to every run of this class. Can be augmented per-workflow-node.",
+      "items": { "type": "string" },
+      "default": []
+    },
+    "risk_class": {
+      "type": "string",
+      "description": "Risk tier: low (auto-promote ok), medium (shadow + benchmark before promote), high (human gate required), critical (dual human approval + immutable safety constraint check).",
+      "enum": ["low", "medium", "high", "critical"]
+    },
+    "max_parallel_runs": {
+      "type": "integer",
+      "description": "Maximum concurrent runs of this class. 0 = unlimited.",
+      "minimum": 0,
+      "default": 0
+    },
+    "budget_cap_usd": {
+      "type": "number",
+      "description": "Per-run cost ceiling in USD. 0 = inherit global default.",
+      "minimum": 0,
+      "default": 0
+    },
+    "tags": {
+      "type": "array",
+      "items": { "type": "string" },
+      "default": []
+    }
+  }
+}

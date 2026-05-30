@@ -38,8 +38,8 @@ if [ ! -d "$RUN_DIR" ]; then
 fi
 
 MINI_ORK_HOME="${MINI_ORK_HOME:-.mini-ork}"
-AGENTFLOW_DIR="${AGENTFLOW_DIR:-${MINI_ORK_HOME}}"
-DB="${MINI_ORK_DB:-$AGENTFLOW_DIR/state.db}"
+MINI_ORK_HOME="${MINI_ORK_HOME}"
+DB="${MINI_ORK_DB:-$MINI_ORK_HOME/state.db}"
 RETRIEVE="$MINI_ORK_ROOT/lib/memory-retrieve.sh"
 STORE="$MINI_ORK_ROOT/lib/memory-store.sh"
 

@@ -1,0 +1,23 @@
+name: code_fix
+description: "Single-patch code change: bug fix, small feature, refactor of a single function"
+
+artifact_contract_ref: artifact_contract.yaml
+default_workflow: workflow.yaml
+
+matches:
+  keywords:
+    - fix
+    - bug
+    - patch
+    - update
+    - refactor
+  path_globs:
+    - "**/*"
+  regex: []
+
+default_gates:
+  - scope_gate
+  - budget_gate
+  - deployment_gate
+
+risk_class: medium
