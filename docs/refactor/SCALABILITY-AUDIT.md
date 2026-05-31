@@ -344,7 +344,32 @@ D-01/D-04 land.
 
 | Pass | Cycle | Notes |
 |---|---|---|
-| pt-8 | (DF9 pending) | Closes ★★★ G-002 + ★★ D-04 + D-01 + D-02 + D-029 cost-flow. DF9 will validate real cost > $0.01 placeholder and prompt-cache reduces per-call tokens. |
+| pt-8 | DF9 ran | Closes ★★★ G-002 + ★★ D-04 + D-01 + D-02 + D-029 cost-flow. DF9 confirmed: real cost $5.68 (vs $0.10 placeholder), wall time 11min (vs DF7's 23min), all 9 nodes ran, verifier `[pass]`, publisher fired. |
+
+### DF9 retry — full execute traversal with pt-8 fixes (2 new findings)
+
+DF9 was the first cycle to reach publisher node + verifier `[pass]`.
+Cost flow proven: $5.68 captured vs $0.10 placeholder (56× more
+accurate). 11min wall time vs DF7's 23min (52% reduction from D-02
+sonnet + G-002 lane cache + D-01 prompt cache).
+
+| ID | Title | Source | Fix sketch | Status |
+|---|---|---|---|---|
+| **D-037** | publisher's `lib/auto-merge.sh` is intended to be SOURCED not BASH-EXECUTED — direct invocation defines `mo_auto_merge()` but never calls it. execute's publisher case ran the script, succeeded (no errors), but no actual publish happened. Also: recipe `artifact_contract.yaml` had no `outputs[]` field declaring canonical paths. | DF9 dogfood | execute publisher: read `source_artifact` + `outputs[]` from recipe's artifact_contract.yaml; copy synthesis.md to each output path; `git add + commit` with mini-ork identity. Recipe: add `outputs: [docs/refactor/synthesis-latest.md]`. | **fixed pt-9** |
+| **D-038** | execute dispatched ALL nodes in NODE_IDS list regardless of `edge_type` — rollback ran AFTER publisher succeeded even though edge declaration is `escalates_to` (conditional on upstream failure). Treats all edges as ordering hints. | DF9 dogfood | execute `_dispatch_node`: skip `rollback` node when `FAIL_COUNT==0` at the time we reach it — no upstream failure means escalates_to doesn't fire. | **fixed pt-9** |
+
+### v0.2-pt9 — close the dogfood loop (D-037 + D-038)
+
+After pt-9, the framework can publish its own audit results to a
+canonical path + git-commit them without a human in the middle. The
+loop is end-to-end self-sustaining: kickoff → planner → 4 parallel
+lenses → synthesizer → verifier → publisher (real git commit) → DONE.
+
+**Convergence trajectory after pt-9:**
+
+| Pass | Cycle | Notes |
+|---|---|---|
+| pt-9 | (DF10 pending) | First cycle that should self-commit synthesis to `docs/refactor/synthesis-latest.md` + skip rollback when no failures. Validates publisher round-trip end-to-end. |
 
 
 
