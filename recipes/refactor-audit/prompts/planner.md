@@ -53,6 +53,14 @@ those break the parser. Emit ONE `{ ... }` and STOP.
   depend on planner; the reviewer-synthesizer must depend on all 4 lenses
 - `risk_notes` (string[]) — what could go wrong
 - `artifact_contract` (`{outputs: string[], success_verifiers: string[]}`)
+  - **STRICT (D-018)**: `success_verifiers` MUST be filenames matching
+    `verifiers/*.sh` that the framework can shell-execute, NOT natural-language
+    sentences. For this recipe the only valid entry is `verifiers/lens-completeness.sh`.
+    Express acceptance criteria as `verifier_contract.checks[]` entries
+    (those CAN be natural-language with optional `command` field) — NOT in
+    `success_verifiers`.
+    Wrong: `"All 4 lens-*.md files exist..."`
+    Right: `"verifiers/lens-completeness.sh"`
 - `verifier_contract` (`{checks: [{id, description, command?}]}`) —
   REQUIRED. At minimum: "all 4 lens reports exist and non-empty",
   "synthesis cross-references all 4 lenses", "each finding cites
