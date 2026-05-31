@@ -249,6 +249,35 @@ structural defects.
 **pt-6 fixes 5 of the 11 DF7 findings** (D-024 + D-026 + D-030 + D-031
 + D-033). D-027/D-028 + D-023 to pt-6.5. D-029 to v0.2.1. D-034 to v0.3.
 
+### v0.2-pt7 — Class A leverage-top-5 from audit (5 audit-flagged fixes)
+
+After pt-6 closed the meta-pipeline, pt-7 ships the highest-leverage
+real bottleneck fixes the audit surfaced. Each closes 1+ audit findings:
+
+| pt-7 fix | Closes | Site | What |
+|---|---|---|---|
+| WAL @ init + busy_timeout @ each open | F-10, F-11, R1, **K-01** | db/init.sh, lib/trace_store.sh (3 sites), lib/llm-dispatch.sh, lib/reflection_pipeline.sh (2 sites) | `PRAGMA journal_mode=WAL` (persistent) + `PRAGMA busy_timeout=5000` (per-connection at every hot path). Audit's **#1 highest-leverage fix**. |
+| Concurrency cap on parallel dispatch | F-28, R3, **G-022** | bin/mini-ork-execute (`_maybe_flush_batch_at_cap`) | `MINI_ORK_MAX_PARALLEL` env (default 4). Flush batch when cap hit, then continue. Prevents API rate-limit cascades + OS process-table saturation. |
+| execution_traces indexes | F-27, R4 | lib/trace_store.sh (CREATE INDEX block) | 3 indexes added: task_class, status, created_at DESC. (Note: migration 0010 already had these; trace_store.sh inline now matches.) |
+| Reflection pipeline LIMIT | F-15, F-17, F-18, R6, **K-04** | lib/reflection_pipeline.sh (`reflection_extract_gradients` + `reflection_deduplicate`) | `MO_REFLECTION_BATCH=500` (trace fetch cap) + `MO_DEDUP_BATCH=10000` (dedup memory cap). Was O(table) memory bomb at 10M+ rows. |
+| Cost circuit breaker | R10, **G-016** | lib/llm-dispatch.sh | Before each dispatch: SUM(cost_usd) WHERE created_at >= 24h ago vs `MO_DAILY_BUDGET_USD` (default $50). Exit 42 with `[cost_circuit_open]` marker if exceeded. |
+
+**New finding from pt-7 smoke test:**
+
+| ID | Title | Source | Fix sketch | Status |
+|---|---|---|---|---|
+| **D-035** | `trace_store.sh:42-61` inline `CREATE TABLE IF NOT EXISTS execution_traces` declares `prompt_version` column; migration `db/migrations/0010_*` schema lacks it. `trace_write` INSERT references prompt_version → `OperationalError: table execution_traces has no column named prompt_version`. Schema drift between inline + migration | pt-7 smoke | Add migration `db/migrations/0014_add_prompt_version_to_execution_traces.sql` with `ALTER TABLE execution_traces ADD COLUMN prompt_version TEXT` (idempotent via PRAGMA table_info check) | deferred pt-7.5 |
+
+**Convergence trajectory after pt-7:**
+
+| Pass | Cycle | New findings | Notes |
+|---|---|---:|---|
+| **pt-7 smoke** | | **+1** | D-035 schema-drift — pre-existing, surfaced by smoke not by DF cycle |
+
+**v0.2 P1 backlog status after pt-7:** 22/22 closed (K-01, G-009, K-04,
+G-016, G-022 + all 17 previously closed). v0.2 scale-ready bucket
+complete.
+
 
 
 DF6 SPIKE is not a regression — it's expected when the framework crosses a
