@@ -17,9 +17,12 @@ MINI_ORK_ROOT="${MINI_ORK_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 _PATTERN_ON_NEW_HOOKS=()
 
 _pattern_ensure_table() {
+  # v0.2-pt10 G-003 DDL session guard
+  [ "${_MO_PATTERN_SCHEMA_INIT:-0}" = "1" ] && return 0
   python3 - "${MINI_ORK_DB:?MINI_ORK_DB unset}" <<'PY'
 import sqlite3, sys
 con = sqlite3.connect(sys.argv[1])
+con.execute("PRAGMA busy_timeout=5000")
 con.execute("""
     CREATE TABLE IF NOT EXISTS pattern_records (
         pattern_id         TEXT PRIMARY KEY,
@@ -39,6 +42,8 @@ con.execute("""
 con.commit()
 con.close()
 PY
+  _MO_PATTERN_SCHEMA_INIT=1
+  export _MO_PATTERN_SCHEMA_INIT
 }
 
 # desc: Store or upsert a pattern record. If pattern_id already exists,
