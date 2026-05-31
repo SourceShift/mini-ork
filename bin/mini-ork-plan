@@ -263,9 +263,24 @@ except Exception as e:
     print('parse_error')
 " 2>&1 | tail -1)
 
+# D-015: preserve raw LLM output for inspection on any rejection.
+# Write to runs/<run>/plan-failure-<verdict>.raw.txt so future runs can
+# inspect what the planner actually returned + iterate on the prompt.
+_d015_preserve_raw() {
+  local verdict="$1"
+  if [ -n "${MINI_ORK_HOME:-}" ] && [ -n "${RUN_ID:-}" ]; then
+    local _dir="${MINI_ORK_HOME}/runs/${RUN_ID}"
+    mkdir -p "$_dir" 2>/dev/null
+    printf '%s' "${PLAN_JSON_RAW:-}" > "$_dir/plan-failure-${verdict}.raw.txt" 2>/dev/null
+    printf '%s' "${PLAN_JSON:-}"     > "$_dir/plan-failure-${verdict}.sanitized.txt" 2>/dev/null
+    echo "[D-015 forensics preserved at $_dir/plan-failure-${verdict}.*]" >&2
+  fi
+}
+
 if [ "$HAS_VERIFIER" = "missing_verifier_contract" ]; then
   echo "PLAN REJECTED: verifier_contract.checks is missing or empty." >&2
   echo "A plan is not complete until success-check is defined." >&2
+  _d015_preserve_raw "missing_verifier_contract"
   trace_write "{\"trace_id\":\"$TRACE_ID\",\"task_class\":\"${TASK_CLASS}\",\"status\":\"failure\",\"reviewer_verdict\":\"missing_verifier_contract\"}" >/dev/null 2>&1 || true
   exit 1
 fi
@@ -273,12 +288,14 @@ fi
 if [ "$HAS_VERIFIER" = "bad_node_types" ]; then
   echo "PLAN REJECTED: one or more decomposition[].node_type values are empty or invalid (D-008b)." >&2
   echo "Each step must declare node_type as one of: planner|researcher|implementer|reviewer|verifier|reflector|publisher|rollback" >&2
+  _d015_preserve_raw "bad_node_types"
   trace_write "{\"trace_id\":\"$TRACE_ID\",\"task_class\":\"${TASK_CLASS}\",\"status\":\"failure\",\"reviewer_verdict\":\"bad_node_types\"}" >/dev/null 2>&1 || true
   exit 1
 fi
 
 if [ "$HAS_VERIFIER" = "parse_error" ]; then
   echo "PLAN REJECTED: planner emitted non-JSON output." >&2
+  _d015_preserve_raw "parse_error"
   trace_write "{\"trace_id\":\"$TRACE_ID\",\"task_class\":\"${TASK_CLASS}\",\"status\":\"failure\",\"reviewer_verdict\":\"parse_error\"}" >/dev/null 2>&1 || true
   exit 1
 fi
