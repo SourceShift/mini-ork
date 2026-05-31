@@ -153,7 +153,15 @@ for verifier_name in "${VERIFIER_NAMES[@]}"; do
   verifier_script=$(_find_verifier_script "$verifier_name")
   EVIDENCE_DIR="$MINI_ORK_HOME/runs/evidence"
   mkdir -p "$EVIDENCE_DIR"
-  EVIDENCE_PATH="$EVIDENCE_DIR/${verifier_name}-$(date +%s).log"
+  # D-036: normalize raw `verifiers/lens-completeness.sh` → `lens-completeness`
+  # for the EVIDENCE_PATH stem too. D-026 fixed the script-LOOKUP path but
+  # the EVIDENCE_PATH still used raw name → tried writing
+  # `evidence/verifiers/lens-completeness.sh-<ts>.log` and `verifiers/`
+  # subdir doesn't exist → write fails → status=failed even though
+  # verifier ran fine.
+  _stem="${verifier_name#verifiers/}"
+  _stem="${_stem%.sh}"
+  EVIDENCE_PATH="$EVIDENCE_DIR/${_stem}-$(date +%s).log"
 
   if [ "$DRY_RUN" -eq 1 ]; then
     echo "[dry-run] verifier: $verifier_name → ${verifier_script:-NOT_FOUND}"

@@ -278,6 +278,50 @@ real bottleneck fixes the audit surfaced. Each closes 1+ audit findings:
 G-016, G-022 + all 17 previously closed). v0.2 scale-ready bucket
 complete.
 
+### DF8 retry — meta-pipeline + audit content validation (1 new finding + 5 new P1 candidates)
+
+DF8 ran after v0.2-pt6 + pt-7. All 5 pt-6 meta-pipeline fixes PROVEN:
+
+| Validation | DF7 → DF8 | Δ |
+|---|---|---|
+| lens-glm.md  | 4.1KB stub → 11.8KB real | +7.7KB |
+| lens-kimi.md | 3.7KB stub → 26.2KB real | +22.5KB |
+| lens-codex.md | 5.0KB stub → 24.7KB real | +19.7KB |
+| lens-opus.md | 3.6KB stub → 18.2KB real | +14.6KB |
+| synthesis.md | 5.5KB meta-review → 18.2KB real synthesis | +12.7KB |
+| Wall time | 23min sequential → 13min parallel | -43% |
+| Cost | $0.10 captured | $0.10 (D-029 unchanged) |
+
+Each lens now has a `.stdout.md` sibling (3.7-5.6KB) preserving the
+handoff summary as forensics. D-033 worked exactly as designed.
+
+DF8 also discovered **5 new Class-A P1 candidates** the previous
+audit cycles couldn't surface (because content was lost to clobber):
+
+| Finding | Lens consensus | Action |
+|---|---|---|
+| **G-002 + K-07 + D-06** ★★★ | YAML lane resolution forks python3 per dispatch | Session-cache `agents.yaml` lanes |
+| **D-04 + D-15 + D-10 + G-021** ★★ | `--output-format text` blocks cost extraction | Switch to JSON + parse total_cost_usd |
+| **D-01** | `mo_emit_cache_flags` never called on main dispatch path | Add before claude --print |
+| **D-02** | Opus on 6/10 roles | Downgrade planner/reflector/healer to Sonnet |
+| **G-003 + K-02 + K-09 + G-004** ★★ | `_ensure_table` DDL on every call | Session-flag guard |
+
+| ID | Title | Source | Fix sketch | Status |
+|---|---|---|---|---|
+| **D-036** | mini-ork-verify: `_find_verifier_script` D-026 fix normalized name for SCRIPT LOOKUP, but `EVIDENCE_PATH` constructor still uses raw `verifiers/lens-completeness.sh` → tries writing `.mini-ork/runs/evidence/verifiers/lens-completeness.sh-<ts>.log` and `verifiers/` subdir doesn't exist → write fails | DF8 dogfood | mini-ork-verify: normalize verifier_name → stem before EVIDENCE_PATH construction (same as D-026 fix in `_find_verifier_script`) | **fixed pt-7.5** |
+
+**Convergence trajectory after DF8:**
+
+| Pass | Cycle | New findings | Notes |
+|---|---|---:|---|
+| **9** | **DF8** | **+1 meta (D-036) + 5 new Class-A P1 candidates** | First cycle where audit content survived intact → unlocks Class-A discovery beyond pt-7's already-closed top-5. Trajectory: META-LAYER convergence (DF7→DF8 = 7→1), Class-A surface expansion (now visible because pipeline preserves content). |
+
+**Phase tracker:** Phase A (dogfood convergence) **converged on
+meta-pipeline**. Phase D **v0.2 P1 22/22 closed**; 5 new P1
+candidates from DF8 audit form v0.2.1 backlog: G-002/K-07/D-06
+YAML cache, D-04/D-15/D-10 cost extraction, D-01 prompt-cache
+wiring, D-02 model downgrade, G-003/K-02/K-09/G-004 DDL guard.
+
 
 
 DF6 SPIKE is not a regression — it's expected when the framework crosses a
