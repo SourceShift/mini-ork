@@ -454,6 +454,13 @@ FAIL_COUNT=0
 # batch then run alone.  Global DISPATCH_MODE override (--dispatch-mode
 # flag) forces the choice; otherwise honor per-node `dispatch_mode` from
 # workflow.yaml (5th tab-field).
+#
+# v0.2-pt7 (R3/F-28): concurrency cap via MINI_ORK_MAX_PARALLEL (default
+# 4). Without this, parallel mode spawns N simultaneous claude processes
+# saturating LLM API rate limits + OS process table. Cap is enforced by
+# flushing the batch when it reaches the limit (block-then-continue).
+MINI_ORK_MAX_PARALLEL="${MINI_ORK_MAX_PARALLEL:-4}"
+
 _flush_parallel_batch() {
   local pids_var="$1"
   local pid
@@ -462,12 +469,23 @@ _flush_parallel_batch() {
   eval "${pids_var}=()"
 }
 
+# v0.2-pt7 (R3/F-28): if batch hits MAX_PARALLEL, flush before adding more.
+_maybe_flush_batch_at_cap() {
+  local pids_var="$1"
+  local current_count
+  eval "current_count=\${#${pids_var}[@]}"
+  if [ "$current_count" -ge "$MINI_ORK_MAX_PARALLEL" ]; then
+    _flush_parallel_batch "$pids_var"
+  fi
+}
+
 case "$DISPATCH_MODE" in
   parallel)
     # Global override → all in parallel (legacy behavior)
     PIDS=()
     for entry in "${NODE_IDS[@]}"; do
       IFS=$'\t' read -r node_id node_type node_desc node_prompt_ref node_dmode <<< "$entry"
+      _maybe_flush_batch_at_cap PIDS
       ( _dispatch_node "$node_id" "$node_type" "$node_desc" "$node_prompt_ref" ) &
       PIDS+=($!)
     done
@@ -496,6 +514,7 @@ case "$DISPATCH_MODE" in
     PIDS=()
     for entry in "${NODE_IDS[@]}"; do
       IFS=$'\t' read -r node_id node_type node_desc node_prompt_ref node_dmode <<< "$entry"
+      _maybe_flush_batch_at_cap PIDS
       ( _dispatch_node "$node_id" "$node_type" "$node_desc" "$node_prompt_ref" ) &
       PIDS+=($!)
     done
