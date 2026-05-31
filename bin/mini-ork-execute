@@ -178,24 +178,40 @@ elif [ -n "$WORKFLOW" ] && [ -f "$WORKFLOW" ] && command -v yq >/dev/null 2>&1; 
   DISPATCH_MODE=$(yq e '.dispatch_mode // "serial"' "$WORKFLOW" 2>/dev/null || echo "serial")
 fi
 
-# D-022: per-node cost charge helper. Increments task_runs.cost_usd by
-# $0.01 placeholder after each successful LLM call. Real claude
-# --output-format json cost extraction lands in v0.2.1.
+# D-022 (v0.2-pt8 with D-029 real-cost integration): per-node cost
+# charge helper. v0.2-pt7 used a flat $0.01 placeholder; pt-8 now
+# reads the .cost sidecar emitted by lib/llm-dispatch.sh's JSON-output
+# post-processor (D-04 fix). Falls back to $0.01 if sidecar missing
+# (executable-wrapper lanes like codex/gemini OR JSON parse failed).
+#
+# Caller passes optional 1st arg = path to cost sidecar file
+# (e.g. "${out_file}.cost"). Empty/missing → fallback $0.01.
 _d022_charge_node_cost() {
   [ "$DRY_RUN" -eq 1 ] && return 0
   [ -z "${MINI_ORK_DB:-}" ] && return 0
   [ -z "${MINI_ORK_RUN_ID:-}" ] && return 0
   [ ! -f "$MINI_ORK_DB" ] && return 0
+  local _cost_file="${1:-}"
+  local _cost="0.01"
+  if [ -n "$_cost_file" ] && [ -f "$_cost_file" ]; then
+    local _raw
+    _raw=$(cat "$_cost_file" 2>/dev/null)
+    # Sanity check: must parse as positive float
+    if [ -n "$_raw" ] && python3 -c "import sys; v=float('$_raw'); sys.exit(0 if v>0 and v<10 else 1)" 2>/dev/null; then
+      _cost="$_raw"
+    fi
+  fi
   python3 -c "
 import sqlite3, sys, time
 con = sqlite3.connect(sys.argv[1])
 con.execute('PRAGMA journal_mode=WAL')
+con.execute('PRAGMA busy_timeout=5000')
 try:
-    con.execute('UPDATE task_runs SET cost_usd = COALESCE(cost_usd,0) + 0.01, updated_at = ? WHERE id = ?', (int(time.time()), sys.argv[2]))
+    con.execute('UPDATE task_runs SET cost_usd = COALESCE(cost_usd,0) + ?, updated_at = ? WHERE id = ?', (float(sys.argv[3]), int(time.time()), sys.argv[2]))
     con.commit()
 finally:
     con.close()
-" "$MINI_ORK_DB" "$MINI_ORK_RUN_ID" 2>/dev/null || true
+" "$MINI_ORK_DB" "$MINI_ORK_RUN_ID" "$_cost" 2>/dev/null || true
 }
 
 # D-021: status transition helper. Updates task_runs.status at phase boundaries.
@@ -307,7 +323,7 @@ _dispatch_node() {
       trace_write "{\"trace_id\":\"$NODE_TRACE_ID\",\"task_class\":\"${TASK_CLASS}\",\"status\":\"success\",\"final_artifact_ref\":\"${CONTEXT_FILE}\"}" >/dev/null 2>&1 || true
       # D-022: charge per-node cost. Placeholder $0.01/node until v0.2.1
       # extracts real claude --output-format json cost.
-      _d022_charge_node_cost
+      _d022_charge_node_cost "${MINI_ORK_RUN_DIR}/.last-llm-cost"
       ;;
 
     implementer)
@@ -327,7 +343,7 @@ _dispatch_node() {
       echo "$RESULT" > "$IMPL_LOG"
       echo "  [ok] implementer output → $IMPL_LOG"
       trace_write "{\"trace_id\":\"$NODE_TRACE_ID\",\"task_class\":\"${TASK_CLASS}\",\"status\":\"success\",\"final_artifact_ref\":\"${IMPL_LOG}\"}" >/dev/null 2>&1 || true
-      _d022_charge_node_cost
+      _d022_charge_node_cost "${MINI_ORK_RUN_DIR}/.last-llm-cost"
       ;;
 
     reviewer)
@@ -377,7 +393,7 @@ _dispatch_node() {
       VERDICT=$(echo "$RESULT" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('verdict','unknown'))" 2>/dev/null || echo "unknown")
       echo "  [ok] reviewer verdict=${VERDICT} → $REVIEW_FILE"
       trace_write "{\"trace_id\":\"$NODE_TRACE_ID\",\"task_class\":\"${TASK_CLASS}\",\"status\":\"success\",\"reviewer_verdict\":\"${VERDICT}\"}" >/dev/null 2>&1 || true
-      _d022_charge_node_cost
+      _d022_charge_node_cost "${MINI_ORK_RUN_DIR}/.last-llm-cost"
       ;;
 
     verifier)

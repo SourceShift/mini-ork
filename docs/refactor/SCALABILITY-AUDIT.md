@@ -322,6 +322,30 @@ candidates from DF8 audit form v0.2.1 backlog: G-002/K-07/D-06
 YAML cache, D-04/D-15/D-10 cost extraction, D-01 prompt-cache
 wiring, D-02 model downgrade, G-003/K-02/K-09/G-004 DDL guard.
 
+### v0.2-pt8 — DF8-surfaced top-4 of 5 (G-003 DDL guard deferred to pt-8.5)
+
+After DF8 produced real consensus-marked findings, pt-8 ships the 4
+highest-ROI items from the audit's own Top 5 Immediate Wins.
+
+| pt-8 fix | Closes | Site | What |
+|---|---|---|---|
+| D-02 model downgrades | D-02 + D-12 | config/agents.yaml | `planner: opus → sonnet`, `reflector: opus → sonnet`, `healer: opus → sonnet`. Kept Opus on reviewer/spec_reviewer/brain. Codex math: ~$12K-18K/day saved at 100K runs/day. |
+| G-002 lane cache (★★★) | G-002 + K-07 + D-06 | lib/llm-dispatch.sh | Bash `_MO_LANE_CACHE` assoc array memoizes node_type → model. Was python3 YAML fork per dispatch. |
+| D-01 prompt-cache wiring | D-01 | lib/llm-dispatch.sh | Source `lib/lane-helpers.sh` + call `mo_emit_cache_flags` before claude --print. Was only wired in reflection-refiner/mutation-adversary/rubric-prescreen, not main path. 60-70% input-token discount on stable system prompts. |
+| D-04 cost extraction (★★) | D-04 + D-15 + D-10 + D-029 | lib/llm-dispatch.sh + bin/mini-ork-execute | Switch claude `--output-format text → json`; post-process extracts `.result` to out_file + `.total_cost_usd` to `${out_file}.cost` sidecar; `${MINI_ORK_RUN_DIR}/.last-llm-cost` exposes to execute. `_d022_charge_node_cost` reads sidecar real cost (vs $0.01 placeholder), falls back to placeholder if sidecar missing (codex/gemini executable lanes). |
+
+**Deferred to pt-8.5:** G-003+K-02+K-09+G-004 (★★ DDL session guard
+across 5 `_ensure_table` functions in gate_registry/version_registry/
+promotion_gate/pattern_store/benchmark_suite). Mechanical sed sweep
+but spread across many files; lower ROI than top-4 once D-02/G-002/
+D-01/D-04 land.
+
+**Convergence trajectory after pt-8:**
+
+| Pass | Cycle | Notes |
+|---|---|---|
+| pt-8 | (DF9 pending) | Closes ★★★ G-002 + ★★ D-04 + D-01 + D-02 + D-029 cost-flow. DF9 will validate real cost > $0.01 placeholder and prompt-cache reduces per-call tokens. |
+
 
 
 DF6 SPIKE is not a regression — it's expected when the framework crosses a
