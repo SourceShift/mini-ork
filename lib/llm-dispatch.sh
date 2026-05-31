@@ -181,14 +181,42 @@ PY
     out_file="$_tmp_out"
   fi
 
-  # Dispatch via legacy positional API; emit captured stdout
-  if mo_llm_dispatch "$model" "$prompt_text" "$out_file" >/dev/null 2>&1; then
+  # D-014: capture stderr to .err.log alongside out-file so failure causes
+  # (rate limit / auth / model unavailable / prompt too long) are diagnosable.
+  # mo_llm_dispatch already writes its own .err.log via convention, but our
+  # outer wrapper captures the same stream explicitly here.
+  local _err_file="${out_file}.shim.err"
+
+  # Dispatch via legacy positional API; capture stderr; emit captured stdout.
+  if mo_llm_dispatch "$model" "$prompt_text" "$out_file" >/dev/null 2>"$_err_file"; then
     cat "$out_file"
+    # D-013: clean tmp out-file ONLY on success. The .err is empty here.
     [ -n "$_tmp_out" ] && rm -f "$_tmp_out"
+    rm -f "$_err_file"
     return 0
   else
     local rc=$?
-    [ -n "$_tmp_out" ] && rm -f "$_tmp_out"
-    return $rc
+    # D-014: surface last 20 lines of claude CLI stderr to caller's stderr
+    # so the framework's caller can see the actual error, not just rc=1.
+    if [ -s "$_err_file" ] || [ -s "${out_file}.err.log" ]; then
+      echo "[llm_dispatch FAIL model=${model} rc=${rc}]" >&2
+      [ -s "$_err_file" ] && tail -20 "$_err_file" >&2
+      [ -s "${out_file}.err.log" ] && tail -20 "${out_file}.err.log" >&2
+    fi
+    # D-013: PRESERVE tmp_out + err.log on failure for forensics.
+    # Move to runs/<run>/llm-failure-<ts>.* so they survive shim cleanup.
+    if [ -n "$_tmp_out" ] && [ -n "${MINI_ORK_RUN_ID:-}" ] && [ -n "${MINI_ORK_HOME:-}" ]; then
+      local _forensic_dir="${MINI_ORK_HOME}/runs/${MINI_ORK_RUN_ID}/llm-failures"
+      mkdir -p "$_forensic_dir" 2>/dev/null
+      local _ts; _ts=$(date +%s)
+      mv "$_tmp_out"  "$_forensic_dir/${_ts}-${model}.out"  2>/dev/null || rm -f "$_tmp_out"
+      [ -f "$_err_file" ]               && mv "$_err_file"               "$_forensic_dir/${_ts}-${model}.shim.err" 2>/dev/null
+      [ -f "${out_file}.err.log" ]      && mv "${out_file}.err.log"      "$_forensic_dir/${_ts}-${model}.err.log"  2>/dev/null
+      echo "[llm_dispatch forensics → $_forensic_dir/${_ts}-${model}.*]" >&2
+    elif [ -n "$_tmp_out" ]; then
+      # No run-dir to preserve into; at least leave on tmp + tell caller
+      echo "[llm_dispatch forensics retained at $_tmp_out (no MINI_ORK_RUN_ID/HOME set)]" >&2
+    fi
+    return "$rc"
   fi
 }
