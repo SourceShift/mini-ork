@@ -15,9 +15,14 @@
 MINI_ORK_ROOT="${MINI_ORK_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 
 _ver_ensure_table() {
+  # v0.2-pt10 (G-003+K-02 ★★ DDL session guard): skip CREATE TABLE
+  # idempotency check after first successful run per process. Subshells
+  # inherit via `export`, so parallel dispatch batches don't re-init.
+  [ "${_MO_VER_SCHEMA_INIT:-0}" = "1" ] && return 0
   python3 - "${MINI_ORK_DB:?MINI_ORK_DB unset}" <<'PY'
 import sqlite3, sys
 con = sqlite3.connect(sys.argv[1])
+con.execute("PRAGMA busy_timeout=5000")
 con.execute("""
     CREATE TABLE IF NOT EXISTS version_registry (
         version_id               TEXT PRIMARY KEY,
@@ -38,6 +43,8 @@ con.execute("""
 con.commit()
 con.close()
 PY
+  _MO_VER_SCHEMA_INIT=1
+  export _MO_VER_SCHEMA_INIT
 }
 
 # desc: Register a new version record. payload must include: name, version string.

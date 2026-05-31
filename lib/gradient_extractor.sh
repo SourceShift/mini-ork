@@ -22,9 +22,12 @@ MINI_ORK_ROOT="${MINI_ORK_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 
 # Ensure gradient_records table exists.
 _gradient_ensure_table() {
+  # v0.2-pt10 G-003 DDL session guard
+  [ "${_MO_GRADIENT_SCHEMA_INIT:-0}" = "1" ] && return 0
   python3 - "${MINI_ORK_DB:?MINI_ORK_DB unset}" <<'PY'
 import sqlite3, sys
 con = sqlite3.connect(sys.argv[1])
+con.execute("PRAGMA busy_timeout=5000")
 con.execute("""
     CREATE TABLE IF NOT EXISTS gradient_records (
         gradient_id   TEXT PRIMARY KEY,
@@ -40,6 +43,8 @@ con.execute("""
 con.commit()
 con.close()
 PY
+  _MO_GRADIENT_SCHEMA_INIT=1
+  export _MO_GRADIENT_SCHEMA_INIT
 }
 
 # Default LLM-based extractor prompt template (heredoc — not in prompts/).

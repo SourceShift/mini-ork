@@ -16,9 +16,12 @@
 MINI_ORK_ROOT="${MINI_ORK_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 
 _agent_ensure_tables() {
+  # v0.2-pt10 G-003 DDL session guard
+  [ "${_MO_AGENT_SCHEMA_INIT:-0}" = "1" ] && return 0
   python3 - "${MINI_ORK_DB:?MINI_ORK_DB unset}" <<'PY'
 import sqlite3, sys
 con = sqlite3.connect(sys.argv[1])
+con.execute("PRAGMA busy_timeout=5000")
 con.executescript("""
     CREATE TABLE IF NOT EXISTS agent_registry (
         version_id           TEXT PRIMARY KEY,
@@ -40,6 +43,8 @@ con.executescript("""
 con.commit()
 con.close()
 PY
+  _MO_AGENT_SCHEMA_INIT=1
+  export _MO_AGENT_SCHEMA_INIT
 }
 
 # desc: Register a new agent version record for role. Returns version_id on stdout.
