@@ -153,20 +153,43 @@ Re-ran with v0.2-pt2 fixes (markdown fence strip + cost-charge-above-gate):
 | **D-013** | `lib/llm-dispatch.sh:llm_dispatch` shim eagerly deletes the tmp out-file on failure path → no forensics. When real claude CLI errors (rate limit, API quota, model outage), the error trace is gone. | DF3-dogfood | Move `rm -f "$_tmp_out"` to a conditional that only fires on success; on failure, mv to `${MINI_ORK_HOME}/runs/<run>/llm-failure-<ts>.log` for inspection | 30 min |
 | **D-014** | Shim silences claude CLI stderr via `mo_llm_dispatch >/dev/null 2>&1` — when call fails, caller sees only "LLM dispatch failed" with NO underlying reason (rate limit? auth? model unavailable?). DF3 hit this — can't diagnose root cause without disabling redirect | DF3-dogfood | Capture stderr to a `.err` file alongside the out-file; on failure, cat the last 20 lines to stderr (or log to $MINI_ORK_HOME/runs/<run>/llm-stderr.log) | 30 min |
 
-**Pattern observed across 3 dogfood cycles:**
+**Pattern observed across 4 dogfood cycles (convergence trajectory CONFIRMED):**
 
 | Pass | Cycle | New findings | Convergence signal |
-|---|---|---|---|
-| 1 | Agent-tool composition (Pass 1) | 31 | baseline |
-| 2 | DF1 v0.1.2 (Pass 2) | 4 (D-007/008/008b/009/010 = 5 IDs but D-007 was Codex-found in Pass 1) | gap-discovery via real dispatch |
-| 3 | DF2 v0.2-pt1 (Pass 3) | 2 (D-011/012) | smaller surface; still finding |
-| 4 | DF3 v0.2-pt2 (Pass 4) | 2 (D-013/014) | smaller surface; still finding |
-| **Projected** Pass 5+ | DF4 v0.2-pt3 | 1-2 | trending toward convergence |
-| **Projected** Pass 6+ | DF5 v0.2-pt4 | 0-1 | near-convergence |
+|---|---|---:|---|
+| 1 | Agent-tool composition | 31 | baseline |
+| 2 | DF1 v0.1.2 | 4 | gap-discovery via real dispatch |
+| 3 | DF2 v0.2-pt1 | 2 | smaller surface; still finding |
+| 4 | DF3 v0.2-pt2 | 2 | smaller surface; still finding |
+| 5 | DF4 v0.2-pt3 | **1** (D-015) | **convergence trajectory live: 4→2→2→1** |
+| Projected DF5 v0.2-pt4 | | 0-1 | near-convergence |
+| Projected DF6 v0.2-pt5 | | 0 | converged: audit produces real content |
 
 Each cycle costs ~$0.05-0.50 LLM (failed calls) + 1-3h fix work. Total
 trajectory: ~$3-10 LLM + 15-25 eng-hours to reach convergence (audit
-produces real content). v0.2 P1 bucket now 17 items.
+produces real content). v0.2 P1 bucket now 18 items.
+
+### DF4 retry (run-1780212784-13761) after D-013/D-014 fixes
+
+Re-ran with v0.2-pt3 fixes (shim forensics + claude stderr surface):
+
+- classify → ✓ refactor-audit
+- plan → ✗ "PLAN REJECTED: planner emitted non-JSON output"
+- D-013/D-014 paths DID NOT fire (llm_dispatch SUCCEEDED at the shim level;
+  failure was in mini-ork-plan's downstream JSON validation)
+- D-011 regex `\{.*\}` did NOT recover the planner's output into valid JSON
+  → bypassed and rejected as parse_error
+- D-012 cost charge fired ($0.05 captured)
+
+| ID | Title | Source | Fix sketch | Effort |
+|---|---|---|---|---|
+| **D-015** | `bin/mini-ork-plan` rejects plan without preserving raw LLM output for inspection. When validation fails (`parse_error` or `bad_node_types`), the unparseable PLAN_JSON_RAW is lost — can't determine WHAT the LLM actually returned to improve the prompt | DF4-dogfood | Same shape as D-013: on validation reject, write `$PLAN_JSON_RAW` to `${MINI_ORK_HOME}/runs/${MINI_ORK_RUN_ID}/plan-failure-<verdict>.raw.txt` before exit 1. Also write to `task_runs.notes` column for queryable visibility | 30 min |
+
+**Note on D-011's incomplete fix:** the regex `re.search(r'\{.*\}', txt, flags=re.S)`
+extracts the first-to-last brace, which works for fenced JSON but fails when
+the LLM emits NO braces at all (pure prose) or unmatched braces. Stronger
+fix: use Anthropic tool_use forced-structured-output (deferred to v0.2.1)
+OR retry the plan call with a stronger "JSON ONLY" instruction.
 
 **The recursive pattern IS the framework's strongest design proof.**
 Each retry exercises a deeper code path; each newly-surfaced gap is
