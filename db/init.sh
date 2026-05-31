@@ -23,6 +23,19 @@ mkdir -p "$DB_DIR"
 
 echo "[mini-ork init] DB: $DB"
 
+# v0.2-pt7 (closes audit F-10/F-11/R1):
+# Enable WAL journaling at init time. WAL is a PERSISTENT pragma
+# (stored in the DB file header), so all subsequent opens inherit it
+# without per-connection setup. This single change moves SQLite from
+# DELETE journal mode (full exclusive lock on every write, serializing
+# readers with writers) to WAL (concurrent reads during writes) — the
+# audit's #1 highest-leverage fix (Opus R1, GLM F-10, F-11).
+#
+# Per-connection busy_timeout still needs setting at each open site
+# (it's per-connection, not persistent) — handled in hot-path Python
+# heredocs inline (trace_store/cache/runs-tracker).
+sqlite3 "$DB" "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=5000;" >/dev/null 2>&1 || true
+
 # Apply each migration in lex order
 for migration_file in $(ls "$MIGRATIONS_DIR"/*.sql | sort); do
   filename="$(basename "$migration_file")"
