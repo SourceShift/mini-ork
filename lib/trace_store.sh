@@ -38,6 +38,10 @@ trace_id = p.get("trace_id") or f"tr-{uuid.uuid4().hex[:16]}"
 now = int(time.time())
 
 con = sqlite3.connect(db)
+# v0.2-pt7 (F-11/R1): per-connection busy_timeout — handle SQLITE_BUSY
+# under concurrent worker access instead of silent data loss (was rc=5
+# with no retry).
+con.execute("PRAGMA busy_timeout=5000")
 con.execute("""
     CREATE TABLE IF NOT EXISTS execution_traces (
         trace_id            TEXT PRIMARY KEY,
@@ -59,6 +63,14 @@ con.execute("""
         created_at          INTEGER NOT NULL
     )
 """)
+# v0.2-pt7 (F-27/R4): indexes on the 3 hot-query columns. Without
+# these, every trace_query at 100K+ rows is a full-table scan.
+# (Audit GLM F-27: "execution_traces inline: zero indexes on key
+# columns" — task_class, status, created_at are equality/ORDER BY
+# targets at lib/trace_store.sh:138.)
+con.execute("CREATE INDEX IF NOT EXISTS idx_et_task_class ON execution_traces(task_class)")
+con.execute("CREATE INDEX IF NOT EXISTS idx_et_status     ON execution_traces(status)")
+con.execute("CREATE INDEX IF NOT EXISTS idx_et_created    ON execution_traces(created_at DESC)")
 con.execute("""
     INSERT INTO execution_traces (
         trace_id, task_class, prompt_version, context_bundle_hash,
@@ -105,6 +117,7 @@ trace_get() {
 import sqlite3, json, sys
 db, trace_id = sys.argv[1], sys.argv[2]
 con = sqlite3.connect(db)
+con.execute("PRAGMA busy_timeout=5000")  # v0.2-pt7 F-11
 con.row_factory = sqlite3.Row
 row = con.execute(
     "SELECT * FROM execution_traces WHERE trace_id=?", (trace_id,)
@@ -118,16 +131,18 @@ PY
 #       Flags: --task-class X, --status Y, --since EPOCH_SECS
 trace_query() {
   local task_class="" status="" since="0"
+  local limit="${MO_TRACE_QUERY_LIMIT:-1000}"  # v0.2-pt7 R6/F-17
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --task-class) task_class="$2"; shift 2 ;;
       --status)     status="$2";     shift 2 ;;
       --since)      since="$2";      shift 2 ;;
+      --limit)      limit="$2";      shift 2 ;;
       *) shift ;;
     esac
   done
   python3 - "${MINI_ORK_DB:?MINI_ORK_DB unset}" \
-            "$task_class" "$status" "$since" <<'PY'
+            "$task_class" "$status" "$since" "$limit" <<'PY'
 import sqlite3, json, sys
 db, task_class, status, since = sys.argv[1:5]
 clauses, params = ["created_at >= ?"], [int(since)]
@@ -135,8 +150,14 @@ if task_class:
     clauses.append("task_class = ?"); params.append(task_class)
 if status:
     clauses.append("status = ?");     params.append(status)
-sql = "SELECT * FROM execution_traces WHERE " + " AND ".join(clauses) + " ORDER BY created_at DESC"
+# v0.2-pt7 (R6/F-17): cap fetchall to MO_TRACE_QUERY_LIMIT rows (default
+# 1000). Unbounded fetchall on 10M-row execution_traces OOMs the
+# process — was a pinned 10M/day failure in Opus §3.
+limit = int(sys.argv[5]) if len(sys.argv) > 5 else 1000
+sql = "SELECT * FROM execution_traces WHERE " + " AND ".join(clauses) + " ORDER BY created_at DESC LIMIT ?"
+params.append(limit)
 con = sqlite3.connect(db)
+con.execute("PRAGMA busy_timeout=5000")  # v0.2-pt7 F-11
 con.row_factory = sqlite3.Row
 rows = con.execute(sql, params).fetchall()
 con.close()
