@@ -209,17 +209,55 @@ con.commit(); con.close()
   exit 1
 }
 
-# D-011: strip markdown fences + leading prose before json.loads.
-# Planner LLMs frequently wrap output in ```json ... ``` despite explicit
-# 'no markdown fences' instruction. Tolerate both fenced + bare JSON.
+# D-011 + D-016: extract the FIRST top-level balanced JSON object.
+#
+# D-011 (markdown fences): planner LLMs wrap output in ```json ... ``` despite
+#   explicit 'no markdown fences' instruction.
+# D-016 (z-insight bleed): when claude CLI is invoked from inside a project
+#   whose CLAUDE.md mandates a trailing <z-insight>{...}</z-insight> block,
+#   the spawned session inherits that instruction and emits z-insight AFTER
+#   the requested JSON — confirmed via D-015 forensics on DF5 run-1780214621.
+#
+# A naive `re.search(r'\{.*\}', flags=re.S)` is GREEDY across BOTH objects →
+# concatenates plan-json + z-insight-json into invalid combined blob.
+# Balanced-brace parser finds the FIRST top-level object only.
 PLAN_JSON=$(printf '%s' "$PLAN_JSON_RAW" | python3 -c "
-import sys, re
+import sys
 txt = sys.stdin.read()
-# Strip everything before the first { and after the last }
-m = re.search(r'\{.*\}', txt, flags=re.S)
-if m:
-    txt = m.group(0)
-sys.stdout.write(txt)
+
+# Skip ahead to the first { (drop any leading prose / markdown fences)
+i = txt.find('{')
+if i < 0:
+    sys.stdout.write(txt)  # no JSON-like content; let downstream parser fail
+    sys.exit(0)
+
+# Walk balanced braces with string-literal awareness (so {} inside strings
+# don't throw the depth count off).
+depth = 0
+in_str = False
+esc = False
+end = -1
+for j in range(i, len(txt)):
+    c = txt[j]
+    if in_str:
+        if esc:
+            esc = False
+        elif c == '\\\\':
+            esc = True
+        elif c == '\"':
+            in_str = False
+        continue
+    if c == '\"':
+        in_str = True
+    elif c == '{':
+        depth += 1
+    elif c == '}':
+        depth -= 1
+        if depth == 0:
+            end = j
+            break
+
+sys.stdout.write(txt[i:end+1] if end > 0 else txt[i:])
 ")
 
 # D-012: charge cost-of-call NOW (after LLM returned, before validation).
