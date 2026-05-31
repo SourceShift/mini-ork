@@ -58,8 +58,32 @@ mo_llm_dispatch() {
     TIMEOUT_CMD="timeout"
   fi
 
+  # v0.2-pt8 (D-01): prompt-cache flags. Source lane-helpers + emit
+  # cache flags before claude --print. Anthropic prompt cache is 60-70%
+  # input-token discount when system prompt is stable — was missing on
+  # main dispatch path (only wired into reflection-refiner /
+  # mutation-adversary / rubric-prescreen).
+  local _cache_flags=()
+  if [ -f "$MINI_ORK_ROOT/lib/lane-helpers.sh" ]; then
+    # shellcheck source=lib/lane-helpers.sh
+    source "$MINI_ORK_ROOT/lib/lane-helpers.sh" 2>/dev/null || true
+    if declare -f mo_emit_cache_flags >/dev/null 2>&1; then
+      mo_emit_cache_flags _cache_flags || true
+    fi
+  fi
+
+  # v0.2-pt8 (D-04+D-15+D-10 ★★): switch to --output-format json so we
+  # capture .total_cost_usd. Post-process extracts .result to out_file
+  # + .total_cost_usd to ${out_file}.cost sidecar. Falls back to text
+  # passthrough if jq fails (model not emitting JSON envelope) so
+  # existing dispatches stay backward-compat. Disable opt-out via
+  # MO_LLM_FORMAT=text.
+  local _format="${MO_LLM_FORMAT:-json}"
+  local _raw_out="${out_file}.raw"
+
   if _mo_llm_is_executable "$model"; then
     # Executable wrapper: cl_codex.sh / cl_gemini.sh handle their own CLI
+    # (these don't support --output-format json universally → keep text)
     if [[ -n "$TIMEOUT_CMD" ]]; then
       "$TIMEOUT_CMD" --kill-after=60 "$timeout_s" \
         "$cl_script" --print --output-format text "$prompt" \
@@ -80,10 +104,11 @@ mo_llm_dispatch() {
         "$TIMEOUT_CMD" --kill-after=60 "$timeout_s" claude \
           --print \
           --permission-mode bypassPermissions \
-          --output-format text \
+          --output-format "$_format" \
           --max-turns "$max_turns" \
+          "${_cache_flags[@]}" \
           "$prompt"
-      ) > "$out_file" 2>"$err_log" || return $?
+      ) > "$_raw_out" 2>"$err_log" || { local _rc=$?; mv "$_raw_out" "$out_file" 2>/dev/null; return $_rc; }
     else
       (
         set +u
@@ -92,10 +117,23 @@ mo_llm_dispatch() {
         claude \
           --print \
           --permission-mode bypassPermissions \
-          --output-format text \
+          --output-format "$_format" \
           --max-turns "$max_turns" \
+          "${_cache_flags[@]}" \
           "$prompt"
-      ) > "$out_file" 2>"$err_log" || return $?
+      ) > "$_raw_out" 2>"$err_log" || { local _rc=$?; mv "$_raw_out" "$out_file" 2>/dev/null; return $_rc; }
+    fi
+
+    # D-04 post-process: extract .result + .total_cost_usd from claude
+    # JSON envelope. If jq fails or output isn't JSON (legacy/text mode),
+    # pass through raw — backward-compat for any caller expecting raw text.
+    if [ "$_format" = "json" ] && command -v jq >/dev/null 2>&1 && \
+       jq -e . "$_raw_out" >/dev/null 2>&1; then
+      jq -r '.result // .' "$_raw_out" > "$out_file"
+      jq -r '.total_cost_usd // 0' "$_raw_out" > "${out_file}.cost" 2>/dev/null || true
+      rm -f "$_raw_out"
+    else
+      mv "$_raw_out" "$out_file"
     fi
   fi
   return 0
@@ -182,11 +220,20 @@ finally:
   # Resolve model: explicit override > agents.yaml lane lookup > env default > sonnet
   local model="${model_override:-${MINI_ORK_DEFAULT_MODEL:-sonnet}}"
   if [ -z "$model_override" ] && [ -n "$node_type" ]; then
-    local _agents_yaml="${MINI_ORK_HOME:-.mini-ork}/config/agents.yaml"
-    [ ! -f "$_agents_yaml" ] && _agents_yaml="$MINI_ORK_ROOT/config/agents.yaml"
-    if [ -f "$_agents_yaml" ]; then
-      local _resolved
-      _resolved=$(python3 - "$_agents_yaml" "$node_type" 2>/dev/null <<'PY'
+    # v0.2-pt8 (G-002+K-07+D-06 ★★★ triple-consensus): cache agents.yaml
+    # lane resolution per-session. Was: every llm_dispatch call forked a
+    # python3 process to yaml.safe_load + dict lookup. At 100K dispatches/
+    # day = 100K python3 forks. Cache via bash assoc array keyed on
+    # node_type → model.
+    declare -gA _MO_LANE_CACHE 2>/dev/null || true
+    if [ -n "${_MO_LANE_CACHE[$node_type]:-}" ]; then
+      model="${_MO_LANE_CACHE[$node_type]}"
+    else
+      local _agents_yaml="${MINI_ORK_HOME:-.mini-ork}/config/agents.yaml"
+      [ ! -f "$_agents_yaml" ] && _agents_yaml="$MINI_ORK_ROOT/config/agents.yaml"
+      if [ -f "$_agents_yaml" ]; then
+        local _resolved
+        _resolved=$(python3 - "$_agents_yaml" "$node_type" 2>/dev/null <<'PY'
 import sys, yaml
 try:
     d = yaml.safe_load(open(sys.argv[1])) or {}
@@ -195,8 +242,11 @@ try:
 except Exception:
     print('sonnet')
 PY
-      )
-      [ -n "$_resolved" ] && model="$_resolved"
+        )
+        [ -n "$_resolved" ] && model="$_resolved"
+      fi
+      # Cache the resolution (even fallback) so the next call is free
+      _MO_LANE_CACHE[$node_type]="$model"
     fi
   fi
 
@@ -216,6 +266,14 @@ PY
   # Dispatch via legacy positional API; capture stderr; emit captured stdout.
   if mo_llm_dispatch "$model" "$prompt_text" "$out_file" >/dev/null 2>"$_err_file"; then
     cat "$out_file"
+    # v0.2-pt8 (D-04 wiring): expose .cost sidecar to caller via well-known
+    # path. mo_llm_dispatch writes ${out_file}.cost when JSON output parses;
+    # publish to ${MINI_ORK_RUN_DIR}/.last-llm-cost so execute's
+    # _d022_charge_node_cost can read real cost vs $0.01 placeholder.
+    if [ -f "${out_file}.cost" ] && [ -n "${MINI_ORK_RUN_DIR:-}" ]; then
+      cp "${out_file}.cost" "${MINI_ORK_RUN_DIR}/.last-llm-cost" 2>/dev/null || true
+      rm -f "${out_file}.cost"
+    fi
     # D-013: clean tmp out-file ONLY on success. The .err is empty here.
     [ -n "$_tmp_out" ] && rm -f "$_tmp_out"
     rm -f "$_err_file"
