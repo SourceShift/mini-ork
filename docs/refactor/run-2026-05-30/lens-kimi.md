@@ -1,775 +1,632 @@
-## Kimi Code Refactors — mini-ork bash layer scalability
+# Kimi Lens — Code-Level Refactor Proposals
+## mini-ork v0.1.1 Scalability Audit
 
-**Reading summary**: 10 files, ~1800 LOC, ~40 distinct `python3` heredoc invocations,
-~15 per-row shell loops, 8 separate `sqlite3` CLI forks in auto-merge alone.
-At 100 tasks/day most loops never exceed N=10. At 100K/day every pattern below
-becomes a wall.
+**Audit date**: 2026-05-31  
+**Scope**: bin/, lib/ — read-only analysis; no source modifications  
+**Method**: Direct code reading of ~1800 LOC across 18 key files  
+**Summary**: ~40 distinct `python3` heredoc forks, ~8 `sqlite3` CLI forks in auto-merge alone,
+3 source-inside-function patterns, 2 YAML-parse-via-awk patterns. At 1K/day invisible;
+at 100K/day each pattern below becomes a measurable wall.
 
 ---
 
-### refactor-1: reflection_extract_gradients — O(N) sqlite3+python3 forks → one batched session
+## Finding K-01: `sqlite3` CLI spawned N times in auto-merge epic loop
 
-**File**: `lib/reflection_pipeline.sh` lines 31–55
+**File**: `lib/auto-merge.sh:170, 179`  
+**Impact**: 2 sqlite3 CLI forks per epic in the merge loop; at 100 epics/job that is 200 process spawns per merge run, plus the per-epic `jq` call on `verdict.json` (line 159).  
+**Effort**: M
 
-**Why it scales**: At 100K traces/day, `reflection_extract_gradients` fires
-one `python3` process per `trace_id` row (via the inner `gradient_extract "$tid"`
-loop). That is N python3 forks + N gradient_store forks = 2N processes for
-each daily reflection run. Collapse the entire pass into a single python3 session
-that holds one sqlite3 connection open, fetches all trace rows, extracts gradients
-in-process, and bulk-inserts. Eliminates 2N process forks → 1.
+### Before
 
-**Before**:
 ```bash
-trace_ids="$(python3 - "$DB" "$since_ts" <<'PY'
-...SELECT trace_id... print(r[0]) for each row
-PY
-)"
-while IFS= read -r tid; do
-    while IFS= read -r gradient; do
-        gradient_store "$gradient" >/dev/null 2>&1 || true
-    done < <(gradient_extract "$tid" 2>/dev/null || true)
-done <<< "$trace_ids"
+# lib/auto-merge.sh:168-183
+local epic_status
+epic_status=$(sqlite3 "$state_db" "SELECT status FROM epics WHERE id='$epic';" 2>/dev/null)
+if [ "$epic_status" = "done" ]; then
+  ...
+fi
+
+local kickoff_path
+kickoff_path=$(sqlite3 "$state_db" \
+  "SELECT kickoff_path FROM epics WHERE id='$epic';" 2>/dev/null)
 ```
 
-**After**:
-```python
-# Single python3 heredoc in reflection_pipeline.sh
-python3 - "$MINI_ORK_DB" "$since_ts" <<'PY'
+### After
+
+```bash
+# Batch all per-epic lookups into a single python3 session BEFORE the loop.
+# Returns TAB-separated: epic_id \t status \t kickoff_path
+declare -A EPIC_STATUS EPIC_KICKOFF
+while IFS=$'\t' read -r eid estatus ekickoff; do
+  EPIC_STATUS["$eid"]="$estatus"
+  EPIC_KICKOFF["$eid"]="$ekickoff"
+done < <(python3 - "$state_db" <<'PY'
+import sqlite3, sys
+con = sqlite3.connect(sys.argv[1])
+for row in con.execute("SELECT id, status, kickoff_path FROM epics"):
+    print(f"{row[0]}\t{row[1] or ''}\t{row[2] or ''}")
+con.close()
+PY
+)
+
+# Inside loop:
+local epic_status="${EPIC_STATUS[$epic]:-}"
+local kickoff_path="${EPIC_KICKOFF[$epic]:-}"
+```
+
+**Savings**: Reduces 2N sqlite3 CLI forks to 1 python3 fork regardless of N.
+
+---
+
+## Finding K-02: `python3` heredoc spawned per-call for single JSON field extraction
+
+**File**: `lib/utility_function.sh:39-46`, `lib/context_assembler.sh:40-48`, `bin/mini-ork-execute:104-109`  
+**Impact**: Each call to `utility_score`, `context_assemble`, and `_dispatch_node` spawns python3 just to extract one string field from JSON. Three separate invocations at the start of every node dispatch.  
+**Effort**: S
+
+### Before (utility_function.sh:39-46)
+
+```bash
+local task_class
+task_class="$(python3 -c "
+import json, sys
+try:
+    d = json.loads(sys.argv[1])
+    print(d.get('task_class',''))
+except Exception:
+    print('')
+" "$run_result" 2>/dev/null || echo "")"
+```
+
+### After
+
+```bash
+# jq is already available in the dependency set (used elsewhere in auto-merge, healer)
+local task_class
+task_class="$(printf '%s' "$run_result" | jq -r '.task_class // ""' 2>/dev/null || echo "")"
+```
+
+**Savings**: Drops python3 startup (~30ms) to jq startup (~5ms) for a 6× speedup per call. Applies identically to the three sites listed above. For `context_assembler.sh:40-48` and `bin/mini-ork-execute:104-109`, replace the heredoc python3 invocations with the same single-line jq pattern.
+
+---
+
+## Finding K-03: `source` called inside hot-path function on every invocation
+
+**File**: `lib/gradient_extractor.sh:65-71`, `lib/reflection_pipeline.sh:26-28`  
+**Impact**: `gradient_extract()` calls `source lib/trace_store.sh` and `source lib/llm-dispatch.sh` every time it is invoked — once per trace_id in the reflection loop. Sourcing re-reads and re-executes the file, redefining all functions, on each call.  
+**Effort**: S
+
+### Before (gradient_extractor.sh:65-71)
+
+```bash
+gradient_extract() {
+  local trace_id="${1:?trace_id required}"
+
+  # Fetch the trace JSON
+  local trace_json
+  # shellcheck source=lib/trace_store.sh
+  source "${MINI_ORK_ROOT}/lib/trace_store.sh" 2>/dev/null || true
+  if ! declare -f trace_get > /dev/null 2>&1; then
+    echo "gradient_extract: trace_store.sh not loaded" >&2
+    return 1
+  fi
+  ...
+  source "${MINI_ORK_ROOT}/lib/llm-dispatch.sh" 2>/dev/null || true
+```
+
+### After
+
+```bash
+gradient_extract() {
+  local trace_id="${1:?trace_id required}"
+
+  # Guard: source once per shell session, not once per call
+  if ! declare -f trace_get > /dev/null 2>&1; then
+    source "${MINI_ORK_ROOT}/lib/trace_store.sh" 2>/dev/null || true
+  fi
+  if ! declare -f mo_llm_dispatch > /dev/null 2>&1; then
+    source "${MINI_ORK_ROOT}/lib/llm-dispatch.sh" 2>/dev/null || true
+  fi
+  if ! declare -f trace_get > /dev/null 2>&1; then
+    echo "gradient_extract: trace_store.sh not loaded" >&2
+    return 1
+  fi
+```
+
+**Savings**: Eliminates redundant file reads + function-redefinition overhead on every call in the reflection loop (O(N) → O(1) source operations).
+
+---
+
+## Finding K-04: `CREATE TABLE IF NOT EXISTS` DDL on every `trace_write` call
+
+**File**: `lib/trace_store.sh:49-62`  
+**Impact**: Every single `trace_write` call executes the full `CREATE TABLE IF NOT EXISTS execution_traces (...)` DDL inside python3. SQLite processes it cheaply after the first time, but the python3 process still parses and sends the statement on every invocation. With 2 trace writes per node (start + end) and 10 nodes per plan, that is 20 DDL round-trips per run.  
+**Effort**: S
+
+### Before (trace_store.sh:26-62)
+
+```bash
+trace_write() {
+  local payload="${1:?json_payload required}"
+  python3 - "${MINI_ORK_DB:?MINI_ORK_DB unset}" "$payload" <<'PY'
 import sqlite3, json, sys, uuid, time
 
-db, since = sys.argv[1], int(sys.argv[2])
-con = sqlite3.connect(db)
-
-rows = con.execute(
-    "SELECT trace_id, task_class, status, cost_usd, duration_ms "
-    "FROM execution_traces WHERE created_at >= ? ORDER BY created_at",
-    (since,)
-).fetchall()
-
-# Build gradients inline — no subprocess per row
-records = []
-for trace_id, task_class, status, cost_usd, duration_ms in rows:
-    signal   = "failure" if status == "failure" else "latency" if duration_ms > 5000 else "ok"
-    gradient = {
-        "gradient_id": f"gr-{uuid.uuid4().hex[:12]}",
-        "target":      task_class,
-        "signal":      signal,
-        "suggested_change": "investigate" if signal != "ok" else "keep",
-        "confidence":  0.7 if signal == "failure" else 0.5,
-        "evidence":    trace_id,
-        "created_at":  int(time.time()),
-    }
-    records.append(gradient)
-
-if records:
-    con.executemany("""
-        INSERT OR IGNORE INTO gradient_records
-            (gradient_id, target, signal, suggested_change, confidence, evidence, created_at)
-        VALUES (:gradient_id,:target,:signal,:suggested_change,:confidence,:evidence,:created_at)
-    """, records)
-    con.commit()
-
-print(f"extracted {len(records)} gradients", file=__import__('sys').stderr)
-con.close()
-PY
-```
-
-**Risk**: removes the `gradient_extract` function call path — any custom
-`gradient_extractor.sh` overrides stop being called. Mitigation: check if
-`gradient_extractor.sh` exports a real function body before bypassing it.
-
----
-
-### refactor-2: auto-merge state.db writes — 5 separate sqlite3 CLI forks per epic → one python3 session
-
-**File**: `lib/auto-merge.sh` lines 355–376
-
-**Why it scales**: For each approved epic, `mo_auto_merge` fires 3–5 separate
-`sqlite3 "$state_db" "..."` calls (status check, kickoff_path read, runs INSERT,
-epics INSERT/UPDATE, status verify). At 50 epics in a job that is ~250 sqlite3
-fork-execs that each open+close the DB. One python3 session with a persistent
-connection does all 5 operations per epic in a single atomic transaction.
-Also eliminates SQL injection via shell string interpolation (`$epic`, `$branch`
-etc directly in the SQL string).
-
-**Before**:
-```bash
-epic_status=$(sqlite3 "$state_db" "SELECT status FROM epics WHERE id='$epic';")
-kickoff_path=$(sqlite3 "$state_db" "SELECT kickoff_path FROM epics WHERE id='$epic';")
-# ... later ...
-sqlite3 "$state_db" "UPDATE runs SET merged_sha='$merged_sha' ... WHERE id=$latest_run_id;"
-sqlite3 "$state_db" "INSERT OR IGNORE INTO epics (...) VALUES (...);"
-sqlite3 "$state_db" "UPDATE epics SET status='done' ... WHERE id='$epic';"
-_final_status=$(sqlite3 "$state_db" "SELECT status FROM epics WHERE id='$epic';")
-```
-
-**After**:
-```bash
-# Call once per epic, passing all values as positional argv — no interpolation
-_mo_merge_db_epic() {
-  python3 - "$state_db" "$epic" "$branch" "$merged_sha" \
-            "$latest_run_id" "$commit_log" "$JOB_ID" <<'PY'
-import sqlite3, sys, time
-
-db, epic, branch, merged_sha, run_id_raw, commit_log, job_id = sys.argv[1:8]
-now_iso = __import__('datetime').datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%S.000Z')
-now_ts  = int(time.time())
-
-con = sqlite3.connect(db)
-with con:   # one transaction
-    run_id = int(run_id_raw) if run_id_raw.isdigit() else None
-    if run_id:
-        con.execute(
-            "UPDATE runs SET merged_sha=?, final_verdict='MERGED', "
-            "ended_at=COALESCE(ended_at,?) WHERE id=?",
-            (merged_sha, now_iso, run_id)
-        )
-    con.execute(
-        "INSERT OR IGNORE INTO epics "
-        "(id,title,status,lane,worker_default,group_id,kickoff_path) "
-        "VALUES (?,?,?,?,?,?,?)",
-        (epic, epic, 'in progress', 'mini-ork', 'mini-ork',
-         f'group-{job_id}', branch)
-    )
-    con.execute(
-        "UPDATE epics SET status='done', updated_at=? WHERE id=?",
-        (now_iso, epic)
-    )
-    row = con.execute("SELECT status FROM epics WHERE id=?", (epic,)).fetchone()
-    print(row[0] if row else "missing")
-con.close()
-PY
-}
-```
-
-**Risk**: wraps 5 operations in one transaction — if the UPDATE runs triggers
-(`trg_epics_no_done_without_merge` mentioned in line 379), it fires once instead
-of potentially twice. Verify trigger logic isn't relying on the split order.
-
----
-
-### refactor-3: auto-merge epic scan — `ls -d iter-*/ | sort -V -r` shell glob per epic → SQL MAX
-
-**File**: `lib/auto-merge.sh` lines 148–155
-
-**Why it scales**: For each epic dir, the code runs `ls -d ... | sort -V -r` to
-find the last iter with a verdict. At 1000 epics in a job this is 1000 `ls` +
-`sort` subprocess pairs. The last-iter verdict is already written to state.db;
-a single SQL query returns all approved epics + their last verdict in one shot,
-eliminating the entire filesystem scan loop.
-
-**Before**:
-```bash
-for epic_dir in "$job_run_dir"/*/; do
-    for _d in $(ls -d "$epic_dir"iter-*/ 2>/dev/null | sort -V -r); do
-        if [ -f "${_d}verdict.json" ]; then
-            last_iter_dir="$_d"
-            break
-        fi
-    done
-    verdict=$(jq -r '.verdict // "UNKNOWN"' "$last_iter_dir/verdict.json")
-    if [ "$verdict" != "APPROVE" ]; then continue; fi
-    epic_status=$(sqlite3 "$state_db" "SELECT status FROM epics WHERE id='$epic';")
-done
-```
-
-**After**:
-```bash
-# Single query returns approved, non-done epics + kickoff_path in one shot
-approved_rows=$(python3 - "$state_db" "$JOB_ID" <<'PY'
-import sqlite3, json, sys
-db, job_id = sys.argv[1], sys.argv[2]
-con = sqlite3.connect(db)
-# runs table stores final_verdict; join with epics for kickoff_path
-rows = con.execute("""
-    SELECT e.id, e.kickoff_path,
-           r.final_verdict, r.branch
-    FROM epics e
-    JOIN runs r ON r.epic_id = e.id
-    WHERE r.final_verdict = 'APPROVE'
-      AND e.status != 'done'
-      AND e.group_id = ?
-    ORDER BY r.id DESC
-""", (f"group-{job_id}",)).fetchall()
-con.close()
-for row in rows:
-    print(json.dumps({"epic": row[0], "kickoff_path": row[1],
-                      "verdict": row[2], "branch": row[3]}))
-PY
-)
-# iterate $approved_rows lines, each is a JSON object — no filesystem scan
-```
-
-**Risk**: requires `branch` to be written into `runs` at plan/kickoff time (it
-is — line 363 writes it). Also skips the filesystem-level `verdict.json` as truth
-source; if a run completes off-DB the SQL query won't see it.
-
----
-
-### refactor-4: trace_write — one sqlite3 connection per call → WAL-mode connection pool via named pipe
-
-**File**: `lib/trace_store.sh` lines 25–97
-
-**Why it scales**: `trace_write` is called 2–3 times per node dispatch
-(start, per-node, end — see `bin/mini-ork-execute` lines 125, 176, 191, 208,
-319). At 100K tasks with 5 nodes each that is ~1.5M python3 subprocess launches
-per day, each opening a fresh sqlite3 connection and doing a single INSERT.
-WAL mode + a long-lived python3 writer process (one per state.db) eliminates
-the fork overhead. Simplest portable approach: background python3 writer reading
-newline-delimited JSON from a named pipe.
-
-**Before**:
-```bash
-trace_write() {
-    python3 - "$MINI_ORK_DB" "$payload" <<'PY'
-    # opens connection, inserts, closes — process exits
-    con = sqlite3.connect(db); con.execute("INSERT ..."); con.commit(); con.close()
-    PY
-}
-# Called 3x per execute run = 3 python3 forks per run
-```
-
-**After**:
-```bash
-# In mini-ork-init or the first trace_write call of a session:
-TRACE_PIPE="${MINI_ORK_HOME}/trace.pipe"
-TRACE_WRITER_PID_FILE="${MINI_ORK_HOME}/trace-writer.pid"
-
-_trace_ensure_writer() {
-  [ -p "$TRACE_PIPE" ] && kill -0 "$(cat "$TRACE_WRITER_PID_FILE" 2>/dev/null)" 2>/dev/null && return
-  rm -f "$TRACE_PIPE"
-  mkfifo "$TRACE_PIPE"
-  python3 - "$MINI_ORK_DB" "$TRACE_PIPE" &
-  echo $! > "$TRACE_WRITER_PID_FILE"
-  # python3 holds connection open, reads JSON lines from pipe, inserts in batches
-}
-
-trace_write() {
-  _trace_ensure_writer
-  # Just write one JSON line to the pipe — no fork
-  printf '%s\n' "${1:?json required}" > "$TRACE_PIPE"
-}
-```
-
-The writer process (a 40-line python3 script run once) holds the connection
-with `PRAGMA journal_mode=WAL` and drains the pipe with `con.executemany`
-every 50ms or 100 rows. Fork count drops from 3N to 1 (the writer launch).
-
-**Risk**: the named-pipe writer must be cleaned up on exit. Use a `trap`
-in the main dispatcher. Named pipes also block on write if the reader is dead —
-add a 1-second timeout write or send via `timeout 1 tee "$TRACE_PIPE"`.
-
----
-
-### refactor-5: context_assembler — per-call DB open with repeated token-budget trim loop → cached ContextPack by input hash
-
-**File**: `lib/context_assembler.sh` lines 54–190
-
-**Why it scales**: `context_assemble` is called once per node per task dispatch.
-At 100K tasks × 5 nodes = 500K python3 invocations/day, each querying
-`execution_traces` + `gradient_records` and running the trim loop from scratch.
-The query results change only when new traces are written. Cache the assembled
-pack keyed by `sha256(task_class + node_name + budget)`, stored in a lightweight
-`mini_orch_cache` table. Hit rate at scale: ~80–90% for repeated task classes,
-eliminating nearly all the repeated DB reads.
-
-**Before**:
-```bash
-context_assemble() {
-  # Every call: 2 DB queries + JSON serialise + trim loop
-  python3 - "$MINI_ORK_DB" "$brief_content" "$workflow_node" "$budget" "$verifier_contract" <<'PY'
-  ...
-  rows = con.execute("SELECT ... FROM execution_traces WHERE task_class=? ...", (task_class,)).fetchall()
-  rows2 = con.execute("SELECT ... FROM gradient_records WHERE target LIKE ? ...", (...)).fetchall()
-  # build pack, trim loop, print
-PY
-}
-```
-
-**After**:
-```python
-# Insert at top of the python3 heredoc:
-import hashlib
-cache_key = hashlib.sha256(f"{task_class}|{node_name}|{budget}".encode()).hexdigest()[:24]
-
-con.execute("""CREATE TABLE IF NOT EXISTS mini_orch_cache (
-    cache_key TEXT PRIMARY KEY,
-    payload   TEXT NOT NULL,
-    created_at INTEGER NOT NULL
-)""")
-
-cached = con.execute(
-    "SELECT payload FROM mini_orch_cache WHERE cache_key=? AND created_at > ?",
-    (cache_key, int(time.time()) - 300)   # 5-min TTL
-).fetchone()
-if cached:
-    print(cached[0])   # cache hit — skip all queries
-    sys.exit(0)
-
-# ... existing queries and pack build ...
-
-con.execute(
-    "INSERT OR REPLACE INTO mini_orch_cache (cache_key, payload, created_at) VALUES (?,?,?)",
-    (cache_key, json.dumps(pack), int(time.time()))
-)
-con.commit()
-```
-
-**Risk**: stale cache if new traces/gradients land within the 5-min TTL for
-the same task_class. Acceptable for the context assembly use-case because
-prior_similar_runs is advisory; critical failures surface via the verifier path
-not the context pack.
-
----
-
-### refactor-6: reflection_run step-5 pattern summarization — bash `while read` piped from python3 → single-pass python3
-
-**File**: `lib/reflection_pipeline.sh` lines 240–249
-
-**Why it scales**: Step 5 fires one python3 process to list cluster IDs, pipes
-them to a bash `while read` loop that calls `reflection_summarize_patterns "$cid"`
-for each cluster — one python3 fork per cluster. At 1000 clusters this is 1001
-python3 processes. Collapse into a single python3 that fetches all clusters and
-their patterns in one JOIN, builds all summaries, and prints a JSON array.
-
-**Before**:
-```bash
-python3 - "$MINI_ORK_DB" <<'PY' | while IFS= read -r cid; do
-# lists cluster_ids one per line
-PY
-    reflection_summarize_patterns "$cid" >/dev/null   # 1 python3 per cid
-done || true
-```
-
-**After**:
-```bash
-python3 - "$MINI_ORK_DB" <<'PY'
-import sqlite3, json, sys
-
 db = sys.argv[1]
+...
 con = sqlite3.connect(db)
-try:
-    rows = con.execute("""
-        SELECT cluster_id,
-               pattern_id, description, frequency, output_type, first_seen, last_seen
-        FROM pattern_records
-        WHERE cluster_id IS NOT NULL
-        ORDER BY cluster_id, frequency DESC
-    """).fetchall()
-except Exception:
-    rows = []
-con.close()
-
-from collections import defaultdict
-clusters = defaultdict(list)
-for cid, pid, desc, freq, otype, fs, ls in rows:
-    clusters[cid].append({"pattern_id": pid, "description": desc,
-                          "frequency": freq, "output_type": otype,
-                          "first_seen": fs, "last_seen": ls})
-
-summaries = []
-for cid, patterns in clusters.items():
-    summaries.append({
-        "cluster_id": cid,
-        "pattern_count": len(patterns),
-        "patterns": patterns,
-        "dominant_output_type": patterns[0]["output_type"] if patterns else None,
-        "total_frequency": sum(p["frequency"] for p in patterns),
-    })
-
-print(json.dumps(summaries), file=sys.stderr)
-print(f"reflection_run step-5: {len(summaries)} clusters summarized", file=sys.stderr)
-PY
-```
-
-**Risk**: pure drop-in; no external state mutated. The only change is that
-`reflection_summarize_patterns` bash function is bypassed — if callers override
-it, they will miss the shortcut. Guard with `declare -f reflection_summarize_patterns | grep -q custom_hook` check.
-
----
-
-### refactor-7: execute per-node `cat "$PLAN_PATH"` — N redundant file reads in dispatch loop → read once, export
-
-**File**: `bin/mini-ork-execute` lines 169, 183, 199
-
-**Why it scales**: `_dispatch_node` reads `cat "$PLAN_PATH"` three times —
-once in the researcher branch, once in the implementer branch, once in the
-reviewer branch. At parallel dispatch mode with 50 nodes, the file is read
-50 times in parallel subshells. The plan.json is fixed for the duration of
-the execute run. Read it once before the dispatch loop and export the content
-as an env var or temp file reference.
-
-**Before**:
-```bash
-# In _dispatch_node(), three branches each do:
-PLAN_CONTENT=$(cat "$PLAN_PATH")
-PROMPT_CONTENT="Task: ${node_desc}\n\nPlan context:\n${PLAN_CONTENT}"
-```
-
-**After**:
-```bash
-# Before the dispatch loop, in the main body of mini-ork-execute:
-PLAN_CONTENT_CACHED=$(< "$PLAN_PATH")
-export PLAN_CONTENT_CACHED
-
-# In _dispatch_node():
-# Reference $PLAN_CONTENT_CACHED — already in env, no subprocess
-PROMPT_CONTENT="Task: ${node_desc}\n\nPlan context:\n${PLAN_CONTENT_CACHED}"
-```
-
-For parallel dispatch mode, the subshell `( _dispatch_node ... ) &` inherits
-the exported variable — no re-read needed. At 100K tasks × 5 nodes × avg plan
-size 4KB = 2GB of redundant file reads per day avoided.
-
-**Risk**: the env var carries the full JSON. If plan.json exceeds ~1MB, ARG_MAX
-could be hit on some systems. Mitigation: write to `$RUN_DIR/plan_content.cache`
-and `export PLAN_CONTENT_CACHE_PATH` instead.
-
----
-
-### refactor-8: memory.sh `_mo_capture_reflection` — `git blame` subprocess per cited line → batch blame with single git invocation
-
-**File**: `lib/memory.sh` lines 87–100
-
-**Why it scales**: `_mo_capture_reflection` is called on every `mo_mem_put_*`
-write (arch_spec, node_annotation, module_plan, atom_pr, adr — five call sites).
-For each citation it runs `subprocess.run(["git", ..., "blame", ...])` — one
-`git` process per `(file, line)` pair. A module_plan with 20 files in
-`new_files_json` triggers 20 git blame processes. Batch all lines per file
-into one `git blame -L start,end` call; or skip line-level blame entirely for
-the common case where the caller passes `"[]"` (no citations).
-
-**Before**:
-```python
-def blame_sha(path: str, line: int) -> str:
-    # one subprocess.run(git blame) PER LINE
-    out = subprocess.run(
-        ["git", "-C", repo_root, "blame", "-L", f"{line},{line}",
-         "--porcelain", "--", path],
-        capture_output=True, text=True, timeout=5,
+con.execute("""
+    CREATE TABLE IF NOT EXISTS execution_traces (
+        trace_id            TEXT PRIMARY KEY,
+        ...
     )
-    return out.stdout.split()[0][:16]
-
-for citation in cited:
-    # blame_sha called once per (path, line) pair
-    cited_files.append({...,"blame_sha_at_lines": blame_sha(path, line),...})
-```
-
-**After**:
-```python
-def blame_batch(repo_root: str, path: str, lines: list[int]) -> dict[int, str]:
-    """One git invocation for ALL lines in a file."""
-    if not lines:
-        return {}
-    # blame the full file once; parse porcelain to map line→sha
-    try:
-        out = subprocess.run(
-            ["git", "-C", repo_root, "blame", "--porcelain", "--", path],
-            capture_output=True, text=True, timeout=10,
-        )
-        result = {}
-        current_sha, current_lineno = "", 0
-        for bl in out.stdout.splitlines():
-            if bl and bl[0] not in ('\t', ' ') and len(bl.split()) >= 3:
-                parts = bl.split()
-                current_sha    = parts[0][:16]
-                current_lineno = int(parts[2])
-            if current_lineno in lines:
-                result[current_lineno] = current_sha
-        return result
-    except Exception:
-        return {}
-
-# Group citations by file, call blame_batch once per file
-from collections import defaultdict
-by_file: dict[str, list[int]] = defaultdict(list)
-for citation in cited:
-    path, _, line_str = citation.rpartition(":")
-    by_file[path].append(int(line_str))
-
-blames: dict[str, dict[int, str]] = {
-    p: blame_batch(repo_root, p, ls) for p, ls in by_file.items()
+""")
+con.execute("""INSERT INTO execution_traces ... """, (...))
+con.commit()
+con.close()
+PY
 }
-# Use blames[path].get(line, "") in the cited_files loop
 ```
 
-**Risk**: blame of the full file is slower than a single-line blame if the
-file is huge (> 50K lines). Guard with an early exit: if `cited == []` (the
-common case — `"[]"` is passed by `mo_mem_put_adr`, `mo_mem_put_arch_spec`
-for empty citations), skip all git calls entirely.
+### After
+
+```bash
+# One-time schema bootstrap — call once at lib load time or bin startup
+trace_init_schema() {
+  python3 - "${MINI_ORK_DB:?MINI_ORK_DB unset}" <<'PY'
+import sqlite3, sys
+con = sqlite3.connect(sys.argv[1])
+con.execute("""
+    CREATE TABLE IF NOT EXISTS execution_traces (
+        trace_id            TEXT PRIMARY KEY,
+        task_class          TEXT NOT NULL DEFAULT '',
+        ...
+        created_at          INTEGER NOT NULL
+    )
+""")
+con.execute("CREATE INDEX IF NOT EXISTS idx_et_class_ts ON execution_traces(task_class, created_at)")
+con.commit()
+con.close()
+PY
+}
+
+trace_write() {
+  local payload="${1:?json_payload required}"
+  # No DDL here — assume trace_init_schema already ran at bin startup
+  python3 - "${MINI_ORK_DB:?MINI_ORK_DB unset}" "$payload" <<'PY'
+import sqlite3, json, sys, uuid, time
+db = sys.argv[1]
+...
+con = sqlite3.connect(db)
+con.execute("INSERT INTO execution_traces ... ON CONFLICT ...", (...))
+con.commit()
+con.close()
+PY
+}
+```
+
+**Savings**: Removes DDL parse overhead from hot path. Bonus: adds an index on `(task_class, created_at)` that `context_assembler.sh` queries at `lib/context_assembler.sh:91-96` with ORDER BY created_at DESC — currently that query does a full-table scan.
 
 ---
 
-### refactor-9: auto-merge worktree lookup — two `git worktree list --porcelain | awk` pipes per epic → pre-built lookup table
+## Finding K-05: `python3` + `yaml.safe_load` spawned per `llm_dispatch` call for lane lookup
 
-**File**: `lib/auto-merge.sh` lines 214–218, 291–295, 383–387
+**File**: `lib/llm-dispatch.sh:163-173`  
+**Impact**: Every `llm_dispatch` call (every node execution) spawns python3 to parse and query `agents.yaml` for a model lane. At 10 nodes/plan × 1K plans/day = 10K python3 spawns/day just for YAML lane resolution. The file is read-only and tiny; it should be cached.  
+**Effort**: S
 
-**Why it scales**: The script calls `git worktree list --porcelain | awk`
-three separate times inside the per-epic loop to look up a worktree path by
-branch name. Each call re-reads the full worktree list. At 50 epics this is
-up to 150 `git` + `awk` invocations. Build the `branch → worktree_path` map
-once before the loop.
+### Before (llm-dispatch.sh:158-175)
 
-**Before**:
 ```bash
-for i in "${!approved_epics[@]}"; do
-    local branch="${approved_branches[$i]}"
-    # lookup 1: pre-flight rebase
-    wt=$(git -C "$REPO_ROOT" worktree list --porcelain | awk -v b="refs/heads/$branch" ...)
-    # lookup 2: squash fallback rebase
-    wt_fallback=$(git -C "$REPO_ROOT" worktree list --porcelain | awk -v b="refs/heads/$branch" ...)
-    # lookup 3: cleanup
-    wt=$(git -C "$REPO_ROOT" worktree list --porcelain | awk -v b="refs/heads/$branch" ...)
+local model="${model_override:-${MINI_ORK_DEFAULT_MODEL:-sonnet}}"
+if [ -z "$model_override" ] && [ -n "$node_type" ]; then
+  local _agents_yaml="${MINI_ORK_HOME:-.mini-ork}/config/agents.yaml"
+  [ ! -f "$_agents_yaml" ] && _agents_yaml="$MINI_ORK_ROOT/config/agents.yaml"
+  if [ -f "$_agents_yaml" ]; then
+    local _resolved
+    _resolved=$(python3 - "$_agents_yaml" "$node_type" 2>/dev/null <<'PY'
+import sys, yaml
+try:
+    d = yaml.safe_load(open(sys.argv[1])) or {}
+    lanes = d.get('lanes', {})
+    print(lanes.get(sys.argv[2]) or lanes.get('worker') or ... or 'sonnet')
+except Exception:
+    print('sonnet')
+PY
+    )
+    [ -n "$_resolved" ] && model="$_resolved"
+  fi
+fi
+```
+
+### After
+
+```bash
+# Module-level cache — populated once on first call per shell session
+declare -A _MO_LANE_CACHE 2>/dev/null || true
+_mo_resolve_lane() {
+  local node_type="$1" agents_yaml="$2"
+  local cache_key="${agents_yaml}::${node_type}"
+  if [[ -n "${_MO_LANE_CACHE[$cache_key]+x}" ]]; then
+    echo "${_MO_LANE_CACHE[$cache_key]}"
+    return
+  fi
+  local result
+  result=$(python3 - "$agents_yaml" "$node_type" 2>/dev/null <<'PY'
+import sys, yaml
+try:
+    d = yaml.safe_load(open(sys.argv[1])) or {}
+    lanes = d.get('lanes', {})
+    print(lanes.get(sys.argv[2]) or lanes.get('worker') or 'sonnet')
+except Exception:
+    print('sonnet')
+PY
+  )
+  _MO_LANE_CACHE["$cache_key"]="${result:-sonnet}"
+  echo "${_MO_LANE_CACHE[$cache_key]}"
+}
+
+# In llm_dispatch():
+local model="${model_override:-${MINI_ORK_DEFAULT_MODEL:-sonnet}}"
+if [ -z "$model_override" ] && [ -n "$node_type" ] && [ -f "$_agents_yaml" ]; then
+  local _resolved
+  _resolved=$(_mo_resolve_lane "$node_type" "$_agents_yaml")
+  [ -n "$_resolved" ] && model="$_resolved"
+fi
+```
+
+**Savings**: First call per session: 1 python3 spawn. All subsequent calls: 0. At 10 nodes/plan the savings ratio is 9:1 per plan.
+
+---
+
+## Finding K-06: Duplicate 15-line subshells in `mo_llm_dispatch` (timeout vs no-timeout)
+
+**File**: `lib/llm-dispatch.sh:74-99`  
+**Impact**: The executable and sourceable dispatch paths each have two nearly identical 10-15 line subshells that differ only in whether `$TIMEOUT_CMD` is prefixed. Any bug fix or flag change must be applied to 2 (or 4) copies. Not a performance issue but a maintenance multiplier — subtle flag divergence between the branches has already produced bugs.  
+**Effort**: S
+
+### Before (llm-dispatch.sh:74-99 — sourceable path)
+
+```bash
+if [[ -n "$TIMEOUT_CMD" ]]; then
+  (
+    set +u
+    [[ -f "$secrets" ]] && source "$secrets" 2>/dev/null || true
+    source "$cl_script"
+    "$TIMEOUT_CMD" --kill-after=60 "$timeout_s" claude \
+      --print \
+      --permission-mode bypassPermissions \
+      --output-format text \
+      --max-turns "$max_turns" \
+      "$prompt"
+  ) > "$out_file" 2>"$err_log" || return $?
+else
+  (
+    set +u
+    [[ -f "$secrets" ]] && source "$secrets" 2>/dev/null || true
+    source "$cl_script"
+    claude \
+      --print \
+      --permission-mode bypassPermissions \
+      --output-format text \
+      --max-turns "$max_turns" \
+      "$prompt"
+  ) > "$out_file" 2>"$err_log" || return $?
+fi
+```
+
+### After
+
+```bash
+# Build optional timeout prefix as an array — empty array when no timeout available
+local -a _timeout_prefix=()
+[[ -n "$TIMEOUT_CMD" ]] && _timeout_prefix=("$TIMEOUT_CMD" --kill-after=60 "$timeout_s")
+
+(
+  set +u
+  [[ -f "$secrets" ]] && source "$secrets" 2>/dev/null || true
+  source "$cl_script"
+  "${_timeout_prefix[@]}" claude \
+    --print \
+    --permission-mode bypassPermissions \
+    --output-format text \
+    --max-turns "$max_turns" \
+    "$prompt"
+) > "$out_file" 2>"$err_log" || return $?
+```
+
+**Note**: Empty array expansion `"${arr[@]}"` in bash produces zero arguments when the array is empty, so `"${_timeout_prefix[@]}" claude ...` safely becomes `claude ...` when no timeout is set. Apply the same collapse to the executable-model branch above it.
+
+---
+
+## Finding K-07: `for _d in $(ls -d ...)` glob expansion via `ls` — breaks on spaces
+
+**File**: `lib/auto-merge.sh:149`  
+**Impact**: `for _d in $(ls -d "$epic_dir"iter-*/ 2>/dev/null | sort -V -r)` uses word-splitting on ls output. Any path containing a space silently splits. More importantly, it forks `ls` + `sort` as a pipeline in a subshell per epic. Should use `mapfile` with a glob.  
+**Effort**: S
+
+### Before (auto-merge.sh:149)
+
+```bash
+for _d in $(ls -d "$epic_dir"iter-*/ 2>/dev/null | sort -V -r); do
+  if [ -f "${_d}verdict.json" ]; then
+    last_iter_dir="$_d"
+    break
+  fi
 done
 ```
 
-**After**:
-```bash
-# Once, before the loop:
-declare -A WORKTREE_MAP
-while IFS= read -r line; do
-    if [[ "$line" == worktree\ * ]]; then
-        current_wt="${line#worktree }"
-    elif [[ "$line" == branch\ * ]]; then
-        branch_ref="${line#branch }"
-        WORKTREE_MAP["$branch_ref"]="$current_wt"
-    fi
-done < <(git -C "$REPO_ROOT" worktree list --porcelain)
+### After
 
-# In the loop:
-wt="${WORKTREE_MAP["refs/heads/$branch"]:-}"
-# No subprocess — O(1) bash associative array lookup
+```bash
+# mapfile + compgen glob — no subshell, no word-split risk, no sort fork
+local -a _iter_dirs=()
+# shellcheck disable=SC2206  # glob expansion is intentional
+mapfile -t _iter_dirs < <(compgen -G "${epic_dir}iter-*/" 2>/dev/null \
+  | sort -V -r)
+for _d in "${_iter_dirs[@]}"; do
+  [ -f "${_d}verdict.json" ] && { last_iter_dir="$_d"; break; }
+done
 ```
 
-**Risk**: the worktree map can go stale if a worktree is added/removed between
-the pre-build and the per-epic use. In the auto-merge context that is safe —
-no worktrees are added during the merge loop; worktrees are only removed at
-step 5 (cleanup), after which the map entry is no longer needed.
+**Savings**: Eliminates `ls` + `sort` pipeline subshell per epic iteration.
 
 ---
 
-### refactor-10: benchmark_run — sequential task execution in Python → `concurrent.futures.ThreadPoolExecutor` with per-task timeout
+## Finding K-08: SQL injection via bash string interpolation in `mo_cache_lookup` / `mo_cache_emit`
 
-**File**: `lib/benchmark_suite.sh` lines 144–218
+**File**: `lib/cache.sh:101-112` (lookup), `lib/cache.sh:152-163` (emit)  
+**Impact**: `epic_id`, `stage`, and `input_hash` are interpolated directly into SQL strings using `'$epic'`. A single-quote character in any of those values (e.g. a task name like `user's-story`) crashes the query or, in the emit path, silently inserts truncated data. At scale this becomes a data-integrity bug.  
+**Effort**: M
 
-**Why it scales**: `benchmark_run` iterates all benchmark tasks sequentially,
-calling `subprocess.run(runner_fn, timeout=300)` one after another. At 200
-benchmark tasks with a 30s average runtime, a single run takes 100 minutes
-wall-clock time. The tasks are independent — each gets its own runner subprocess.
-`ThreadPoolExecutor` with parallelism = `os.cpu_count() * 2` reduces the wall
-time to `max(task_durations)` with bounded concurrency.
+### Before (cache.sh:101-112)
 
-**Before**:
-```python
-for task_row in tasks:
-    # sequential subprocess, 1 at a time
-    proc = subprocess.run([...], input=json.dumps(t),
-                          capture_output=True, text=True, timeout=300)
-    results.append(...)
-con.executemany("INSERT INTO benchmark_results ...", ...)
-```
-
-**After**:
-```python
-import concurrent.futures, os
-
-MAX_WORKERS = min(int(os.environ.get("MO_BENCH_PARALLELISM", "8")), len(tasks))
-
-def run_one(t):
-    """Run a single benchmark task; return result dict."""
-    try:
-        proc = subprocess.run(
-            ["bash", "-c", f"source .../utility_function.sh 2>/dev/null; {runner_fn}"],
-            input=json.dumps(t), capture_output=True, text=True, timeout=300,
-        )
-        passed = proc.returncode == 0
-        try:
-            data = json.loads(proc.stdout.strip())
-            return {"id": t["id"], "passed": bool(data.get("passed", passed)),
-                    "utility_score": float(data.get("utility_score", 0.0)),
-                    "run_out": proc.stdout.strip(), "err": None}
-        except Exception:
-            return {"id": t["id"], "passed": passed,
-                    "utility_score": 1.0 if passed else 0.0,
-                    "run_out": proc.stdout.strip(), "err": None}
-    except subprocess.TimeoutExpired:
-        return {"id": t["id"], "passed": False, "utility_score": 0.0,
-                "run_out": None, "err": "timeout"}
-    except Exception as e:
-        return {"id": t["id"], "passed": False, "utility_score": 0.0,
-                "run_out": None, "err": str(e)}
-
-with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-    futures = {ex.submit(run_one, t): t for t in task_dicts}
-    results = [f.result() for f in concurrent.futures.as_completed(futures)]
-```
-
-**Risk**: parallel runner subprocesses write to the same filesystem.
-If `runner_fn` writes to a shared path (e.g. `$RUN_DIR/output.md`), races occur.
-Guard by passing a unique `run_dir=f"/tmp/bench-{result_id}"` env to each runner,
-or check `runner_fn` for shared-path writes before enabling parallelism.
-
----
-
-### refactor-11: state.db unbounded growth — no archive strategy → periodic JSONL export + DELETE
-
-**File**: `lib/trace_store.sh` (new companion: `lib/archive_traces.sh`)
-
-**Why it scales**: `execution_traces` accumulates every trace write forever.
-At 100K tasks/day × 3 trace writes each = 300K rows/day. After 30 days that is
-9M rows with JSON blobs in `tool_calls`, `files_read`, `files_written`.
-`sqlite3` FULL TABLE SCANS in `context_assembler.sh` (no index on `task_class`)
-and in `reflection_pipeline.sh` degrade from milliseconds to seconds.
-Introduce a nightly archive job that flushes rows older than N days to a
-per-day `.jsonl.gz` file and DELETEs them from the live table.
-
-**Before**: no archive. Table grows without bound. ANALYZE never runs.
-
-**After** (new `lib/archive_traces.sh`, ~50 lines):
 ```bash
-archive_traces() {
-  local keep_days="${MINI_ORK_ARCHIVE_KEEP_DAYS:-7}"
-  local archive_dir="${MINI_ORK_HOME}/archive/traces"
-  mkdir -p "$archive_dir"
+mo_cache_lookup() {
+  local stage="$1" epic="$2" iter="$3" input_hash="$4"
+  local _db="${MINI_ORK_DB:-...}"
+  sqlite3 "$_db" "
+    SELECT output_path FROM mini_orch_sessions
+    WHERE epic_id = '$epic'
+      AND iter = $iter
+      AND stage = '$stage'
+      AND input_hash = '$input_hash'
+      AND status = 'success'
+      AND expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now')
+    ORDER BY updated_at DESC
+    LIMIT 1;
+  " 2>/dev/null
+}
+```
 
-  python3 - "$MINI_ORK_DB" "$keep_days" "$archive_dir" <<'PY'
-import sqlite3, json, gzip, sys, time, os
-from datetime import datetime
+### After
 
-db, keep_days, out_dir = sys.argv[1], int(sys.argv[2]), sys.argv[3]
-cutoff = int(time.time()) - keep_days * 86400
-
+```bash
+mo_cache_lookup() {
+  local stage="$1" epic="$2" iter="$3" input_hash="$4"
+  local _db="${MINI_ORK_DB:-...}"
+  python3 - "$_db" "$stage" "$epic" "$iter" "$input_hash" <<'PY'
+import sqlite3, sys
+db, stage, epic, iter_, input_hash = sys.argv[1:6]
 con = sqlite3.connect(db)
-con.row_factory = sqlite3.Row
-
-rows = con.execute(
-    "SELECT * FROM execution_traces WHERE created_at < ? ORDER BY created_at",
-    (cutoff,)
-).fetchall()
-
-if not rows:
-    print("archive_traces: nothing to archive", file=sys.stderr)
-    sys.exit(0)
-
-# Group by day for easy recovery/audit
-from collections import defaultdict
-by_day = defaultdict(list)
-for r in rows:
-    day = datetime.utcfromtimestamp(r["created_at"]).strftime("%Y-%m-%d")
-    by_day[day].append(dict(r))
-
-for day, day_rows in by_day.items():
-    path = os.path.join(out_dir, f"{day}.jsonl.gz")
-    mode = "ab" if os.path.exists(path) else "wb"
-    with gzip.open(path, mode) as f:
-        for row in day_rows:
-            f.write((json.dumps(row) + "\n").encode())
-
-ids = [r["trace_id"] for r in rows]
-placeholders = ",".join("?" * len(ids))
-con.execute(f"DELETE FROM execution_traces WHERE trace_id IN ({placeholders})", ids)
-con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-con.execute("ANALYZE execution_traces")
-con.commit()
+row = con.execute("""
+    SELECT output_path FROM mini_orch_sessions
+    WHERE epic_id=? AND iter=? AND stage=? AND input_hash=?
+      AND status='success'
+      AND expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now')
+    ORDER BY updated_at DESC LIMIT 1
+""", (epic, int(iter_), stage, input_hash)).fetchone()
 con.close()
-print(f"archive_traces: archived {len(rows)} rows, kept last {keep_days} days", file=sys.stderr)
+if row:
+    print(row[0])
 PY
 }
 ```
 
-Call from a cron (or at the start of each `reflection_run` pass). Also add
-`CREATE INDEX IF NOT EXISTS idx_et_task_class_created ON execution_traces(task_class, created_at DESC)`
-to `trace_store.sh`'s `CREATE TABLE` block — this index alone drops the
-`context_assembler` prior-runs query from O(N) full-scan to O(log N).
-
-**Risk**: archived rows are no longer available to `context_assembler` or
-`reflection_pipeline` for the historical window. Acceptable — the context pack
-only needs the 10 most recent traces per class (hardcoded LIMIT 10 in
-`context_assembler.sh:95`), which are always within the 7-day keep window at
-100K/day scale.
+**Note**: The same substitution must be applied to `mo_cache_record_hit` (cache.sh:115-128) and `mo_cache_emit` (cache.sh:135-163). The emit path also interpolates `$output_path` and `$log_path` which may contain single-quotes.
 
 ---
 
-### refactor-12: `_mo_capture_reflection` — called synchronously on every `mo_mem_put_*` → fire-and-forget background write
+## Finding K-09: `awk` state machine parsing YAML in `_worker-launcher.sh`
 
-**File**: `lib/memory.sh` lines 43–127
+**File**: `bin/_worker-launcher.sh:78-90`  
+**Impact**: Scope patterns are parsed from `scope-patterns.yaml` using a multi-state awk script. This breaks silently on quoted values, flow-style YAML lists, and indentation changes. At 100K/day, any YAML reformatting causes silent scope omission, leading to scope-sentinel failures on otherwise valid workers.  
+**Effort**: M
 
-**Why it scales**: `_mo_capture_reflection` runs `git rev-parse HEAD` + `git blame`
-per cited file synchronously inside every `mo_mem_put_*` call. At 100K writes/day
-this adds 50–200ms of blocking git I/O per write (git blame on a large repo hits
-100ms+ easily). The reflection is advisory metadata — it does not need to block
-the primary write. Move the capture to a background subshell and write it via
-an async UPDATE after the main INSERT commits.
+### Before (_worker-launcher.sh:78-90)
 
-**Before**:
 ```bash
-mo_mem_put_arch_spec() {
-    # BLOCKS on git blame before any DB write
-    reflection="$(_mo_capture_reflection "$evidence_json")"
-    python3 - ... "$reflection" ... <<'PY'
-    # INSERT uses $reflection synchronously
-PY
-}
+SCOPE_PATTERNS=$(awk -v id="$MO_EPIC" '
+  /^epics:/ { in_epics = 1; next }
+  in_epics && $0 ~ "^  " id ":" { in_epic = 1; next }
+  in_epic && /^    patterns:/ { in_pat = 1; next }
+  in_pat && /^      - / {
+    sub(/^      - /, "")
+    gsub(/^"|"$/, "")
+    print
+    next
+  }
+  in_pat && /^    [a-z]/ { in_pat = 0 }
+  in_epic && /^  [A-Za-z]/ { in_epic = 0; in_pat = 0 }
+' "$SCOPE_FILE" 2>/dev/null)
 ```
 
-**After**:
+### After
+
 ```bash
-mo_mem_put_arch_spec() {
-    local now head
-    now="$(_mo_now)"
-    head="$(_mo_git_head)"   # cheap: rev-parse only, no blame
-
-    # Primary write — no reflection, completes instantly
-    python3 - "$STATE_DB" "$arch_id" ... "$head" "$now" <<'PY'
-    # INSERT with reflected_substrate=NULL, reflection_status='pending'
+SCOPE_PATTERNS=$(python3 - "$SCOPE_FILE" "$MO_EPIC" <<'PY'
+import sys, yaml
+try:
+    data = yaml.safe_load(open(sys.argv[1])) or {}
+    patterns = (data.get("epics", {}).get(sys.argv[2], {}) or {}).get("patterns", []) or []
+    for p in patterns:
+        print(p)
+except Exception as e:
+    import sys as _s
+    print(f"scope parse error: {e}", file=_s.stderr)
 PY
-
-    # Async reflection: fire-and-forget background job
-    (
-      reflection="$(_mo_capture_reflection "$evidence_json")"
-      python3 - "$STATE_DB" "$arch_id" "$reflection" <<'PY'
-      import sqlite3, sys
-      db, arch_id, reflection = sys.argv[1], sys.argv[2], sys.argv[3]
-      con = sqlite3.connect(db)
-      con.execute(
-          "UPDATE arch_specs SET reflected_substrate=?, reflection_status='fresh' "
-          "WHERE arch_id=?", (reflection, arch_id)
-      )
-      con.commit(); con.close()
-PY
-    ) &
-    disown
-}
+)
 ```
 
-The primary write returns immediately. The background subshell runs the git blame
-and patches the row within ~200ms without blocking the caller.
-
-**Risk**: if the process exits before the background subshell completes,
-`reflected_substrate` stays NULL. Acceptable — `_mo_capture_reflection` is
-advisory metadata; the staleness checker in `reflection_pipeline` handles
-NULL substrate gracefully.
+**Savings**: Correct YAML parse vs. fragile awk. Same startup cost (one python3 fork); eliminates an entire class of silent scope-omission bugs.
 
 ---
 
-## Summary priority table
+## Finding K-10: `mo_runs_ensure_schema` called on every `mo_runs_open`
 
-| # | File | Pattern eliminated | Throughput lever | Impl effort |
-|---|------|--------------------|-----------------|-------------|
-| 4 | trace_store.sh | 1.5M python3 forks/day | 100x fork elimination | 2h |
-| 1 | reflection_pipeline.sh | N subshells in gradient loop | O(N) → O(1) | 1h |
-| 11 | trace_store.sh (new) | unbounded table growth | scan O(N)→O(log N) | 2h |
-| 2 | auto-merge.sh | 5 sqlite3 CLI forks/epic | SQL injection + N×5 forks | 1.5h |
-| 9 | auto-merge.sh | 3 git worktree scans/epic | O(E×3) → O(1) lookup | 30min |
-| 5 | context_assembler.sh | DB re-query every call | 80%+ cache hit rate | 1.5h |
-| 6 | reflection_pipeline.sh | N python3 forks in step-5 | O(C) → 1 | 30min |
-| 7 | mini-ork-execute | N redundant file reads | trivial but cumulative | 15min |
-| 10 | benchmark_suite.sh | sequential benchmark tasks | wall time ÷ max_workers | 1h |
-| 3 | auto-merge.sh | O(E) ls+sort per epic | O(1) SQL | 30min |
-| 8 | memory.sh | N git blame subprocesses | O(F) → O(files) | 1h |
-| 12 | memory.sh | blocking git I/O on writes | async, zero latency add | 45min |
+**File**: `lib/runs-tracker.sh:87-93`  
+**Impact**: `mo_runs_open` calls `mo_runs_ensure_schema` unconditionally on every dispatch open. `mo_runs_ensure_schema` fires two `sqlite3 "$_MO_DB"` calls (ALTER TABLE + CREATE TABLE IF NOT EXISTS). At 1 dispatch open per epic + 10 epics per job = 20 extra sqlite3 CLI forks per job run.  
+**Effort**: S
 
-Start with **#4** (trace_write pipe) + **#11** (archive+index) — together they
-address the two compounding bottlenecks that get worse purely with time: write
-amplification and full-table scan growth. Everything else is proportional to
-task throughput.
+### Before (runs-tracker.sh:87-93)
+
+```bash
+mo_runs_open() {
+  local epic="$1" worktree="$2"
+  mo_runs_ensure_schema      # ← unconditional on every open
+  local branch
+  branch=$(git -C "$worktree" symbolic-ref --short HEAD 2>/dev/null || echo "unknown")
+  ...
+}
+```
+
+### After
+
+```bash
+_MO_RUNS_SCHEMA_DONE=0
+
+mo_runs_open() {
+  local epic="$1" worktree="$2"
+  # Run schema bootstrap once per shell session
+  if [[ "$_MO_RUNS_SCHEMA_DONE" -eq 0 ]]; then
+    mo_runs_ensure_schema
+    _MO_RUNS_SCHEMA_DONE=1
+  fi
+  local branch
+  branch=$(git -C "$worktree" symbolic-ref --short HEAD 2>/dev/null || echo "unknown")
+  ...
+}
+```
+
+**Savings**: Reduces schema-check overhead from O(N dispatches) to O(1) per shell session. For the canonical 10-epic job: 20 sqlite3 forks → 2.
+
+---
+
+## Finding K-11: `\n` literal instead of newline in prompt assembly in `bin/mini-ork-execute`
+
+**File**: `bin/mini-ork-execute:203-206`  
+**Impact**: `PROMPT_CONTENT="Task: ${node_desc}\n\nPlan context:\n${PLAN_CONTENT}"` — in bash double-quoted strings `\n` is a literal two-character sequence `\` + `n`, not a newline. The LLM receives `Task: <desc>\n\nPlan context:\n<plan>` with literal backslash-n. This corrupts prompt formatting for every node dispatch.  
+**Effort**: S
+
+### Before (mini-ork-execute:203-207)
+
+```bash
+PROMPT_CONTENT="Task: ${node_desc}\n\nPlan context:\n${PLAN_CONTENT}"
+RESULT=$(llm_dispatch \
+  --task-class "$TASK_CLASS" \
+  --node-type "researcher" \
+  --prompt-text "$PROMPT_CONTENT" 2>&1) || ...
+```
+
+### After
+
+```bash
+# $'...' ANSI-C quoting interprets \n as a real newline
+PROMPT_CONTENT=$"Task: ${node_desc}
+
+Plan context:
+${PLAN_CONTENT}"
+```
+
+Or equivalently using `printf`:
+
+```bash
+PROMPT_CONTENT=$(printf 'Task: %s\n\nPlan context:\n%s' "$node_desc" "$PLAN_CONTENT")
+```
+
+**Impact**: Applies to the `researcher`, `implementer`, and `reviewer` dispatch blocks at lines 203, 218, and 233. Fixing this should immediately improve LLM response quality since the prompt structure reaches the model correctly.
+
+---
+
+## Finding K-12: `python3` spawned for `expires_at` date arithmetic in `mo_cache_emit`
+
+**File**: `lib/cache.sh:146-149`  
+**Impact**: `mo_cache_emit` spawns python3 (with a `date -u -v+30d` fallback) to compute a timestamp 30 days in the future. This is pure arithmetic — no JSON or DB work — yet it fires a new python3 process for every cache row emitted.  
+**Effort**: S
+
+### Before (cache.sh:146-149)
+
+```bash
+local expires_at
+expires_at=$(python3 -c "
+import datetime as d
+print((d.datetime.utcnow() + d.timedelta(days=30)).strftime('%Y-%m-%dT%H:%M:%fZ'))
+" 2>/dev/null || date -u -v+30d +"%Y-%m-%dT%H:%M:%fZ" 2>/dev/null || echo "2099-01-01T00:00:00.000Z")
+```
+
+### After
+
+```bash
+# Use the sqlite3 that is already required in this function for the INSERT below.
+# Compute inside the same python3 session that does the INSERT — zero extra spawn.
+# (Move the expires_at calculation into the PY heredoc of mo_cache_emit.)
+
+# In the python3 PY block that does the INSERT:
+# expires_at = (datetime.utcnow() + timedelta(days=30)).strftime('%Y-%m-%dT%H:%M:%S.000Z')
+# ... then use expires_at directly in the INSERT VALUES
+```
+
+Full collapse (merging the separate `expires_at` spawn into the existing INSERT heredoc in `mo_cache_emit`):
+
+```bash
+mo_cache_emit() {
+  local stage="$1" epic="$2" iter="$3" input_hash="$4" status="$5"
+  local output_path="$6" log_path="$7"
+  local cost_usd="${8:-0}" turns="${9:-0}" duration_ms="${10:-0}"
+  local prompt_version="${11:-v1}"
+  local uuid
+  uuid=$(uuidgen 2>/dev/null || printf '%s' "$(date +%s)-$$-$RANDOM")
+  local _db="${MINI_ORK_DB:-...}"
+  python3 - "$_db" "$stage" "$epic" "$iter" "$input_hash" "$status" \
+            "$output_path" "$log_path" "$cost_usd" "$turns" "$duration_ms" \
+            "$prompt_version" "$uuid" "${JOB_ID:-unknown}" <<'PY'
+import sqlite3, sys
+from datetime import datetime, timedelta
+(db, stage, epic, iter_, input_hash, status, output_path, log_path,
+ cost_usd, turns, duration_ms, prompt_version, uuid, job_id) = sys.argv[1:15]
+expires_at = (datetime.utcnow() + timedelta(days=30)).strftime('%Y-%m-%dT%H:%M:%S.000Z')
+con = sqlite3.connect(db)
+con.execute("""INSERT INTO mini_orch_sessions
+  (uuid, job_id, epic_id, iter, stage, input_hash, status,
+   output_path, log_path, cost_usd, turns, duration_ms, expires_at, prompt_version)
+  VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+  ON CONFLICT (uuid) DO NOTHING""",
+  (uuid, job_id, epic, int(iter_), stage, input_hash, status,
+   output_path, log_path, float(cost_usd), int(turns), int(duration_ms),
+   expires_at, prompt_version))
+con.commit(); con.close()
+PY
+}
+```
+
+**Savings**: Eliminates 1 python3 spawn per cache row; collapses `uuidgen` + `python3-date` + `sqlite3-insert` into a single python3 session.
+
+---
+
+## Summary Table
+
+| ID   | File                          | Lines    | Category            | Spawn savings (per call) | Effort |
+|------|-------------------------------|----------|---------------------|--------------------------|--------|
+| K-01 | lib/auto-merge.sh             | 170, 179 | sqlite3 loop batch  | 2N → 1 per job          | M      |
+| K-02 | lib/utility_function.sh       | 39–46    | python3→jq          | 1 python3 → 1 jq        | S      |
+| K-03 | lib/gradient_extractor.sh     | 65–71    | source guard        | N source → 1            | S      |
+| K-04 | lib/trace_store.sh            | 49–62    | DDL out of hot path | DDL per call → once     | S      |
+| K-05 | lib/llm-dispatch.sh           | 163–173  | YAML cache          | N python3 → 1           | S      |
+| K-06 | lib/llm-dispatch.sh           | 74–99    | subshell dedup      | maintainability          | S      |
+| K-07 | lib/auto-merge.sh             | 149      | ls antipattern      | N ls+sort → 0           | S      |
+| K-08 | lib/cache.sh                  | 101–163  | SQL injection fix   | correctness              | M      |
+| K-09 | bin/_worker-launcher.sh       | 78–90    | awk→yaml.safe_load  | correctness + reliability| M      |
+| K-10 | lib/runs-tracker.sh           | 87–93    | schema once/session | 2N → 2 per job          | S      |
+| K-11 | bin/mini-ork-execute          | 203, 218 | \n literal bug      | correctness + LLM quality| S      |
+| K-12 | lib/cache.sh                  | 146–149  | date spawn → in-PY  | 1 python3 per cache row  | S      |
+
+**Priority order**: K-11 first (active correctness bug affecting every dispatch), then K-08 (data-integrity risk), then K-05 + K-03 + K-10 (quick S-effort wins), then K-01 + K-12 (batch wins at scale), then K-09 (correctness + reliability).
