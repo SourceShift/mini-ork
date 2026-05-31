@@ -27,9 +27,12 @@ _VALID_GATE_TYPES=(
 )
 
 _gate_ensure_table() {
+  # v0.2-pt10 G-003 DDL session guard
+  [ "${_MO_GATE_SCHEMA_INIT:-0}" = "1" ] && return 0
   python3 - "${MINI_ORK_DB:?MINI_ORK_DB unset}" <<'PY'
 import sqlite3, sys
 con = sqlite3.connect(sys.argv[1])
+con.execute("PRAGMA busy_timeout=5000")
 con.execute("""
     CREATE TABLE IF NOT EXISTS gate_registry (
         gate_id             TEXT PRIMARY KEY,
@@ -44,6 +47,8 @@ con.execute("""
 con.commit()
 con.close()
 PY
+  _MO_GATE_SCHEMA_INIT=1
+  export _MO_GATE_SCHEMA_INIT
 }
 
 # desc: Register a gate. condition_fn_or_path is either a bash function name

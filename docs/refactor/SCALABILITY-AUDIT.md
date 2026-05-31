@@ -369,7 +369,52 @@ lenses → synthesizer → verifier → publisher (real git commit) → DONE.
 
 | Pass | Cycle | Notes |
 |---|---|---|
-| pt-9 | (DF10 pending) | First cycle that should self-commit synthesis to `docs/refactor/synthesis-latest.md` + skip rollback when no failures. Validates publisher round-trip end-to-end. |
+| pt-9 | DF10 ran | First cycle that self-committed synthesis to `docs/refactor/synthesis-latest.md` + skipped rollback when no failures. Commit `cf33521` authored by `mini-ork <mini-ork@local>` — proves end-to-end self-publishing. Wall time 12min, cost $4.72. |
+
+### DF10 validation — end-to-end self-publishing loop closed
+
+All 5 criteria PASSED in DF10:
+1. NEW git commit by `mini-ork <mini-ork@local>` → `cf33521`
+2. `docs/refactor/synthesis-latest.md` written (20496 bytes)
+3. Log evidence: `[ok] publisher: published docs/refactor/synthesis-latest.md (committed)` + `[skip] rollback — no failures (escalates_to edge not triggered)`
+4. Real cost $4.72 captured (similar to DF9's $5.68)
+5. Wall time 12min
+
+Cross-cycle finding-count trend shows AUDIT FINDINGS SHRINKING per
+cycle as fixes land. No NEW META findings from DF9→DF10. Phase A
+proven self-improving — each cycle's fixes reduce next cycle's findings.
+
+### v0.2-pt10 — G-003 DDL session guard across 8 _ensure_table sites
+
+After Phase A converged, pt-10 closes the remaining audit-flagged
+quality finding: `_ensure_table` DDL runs on every function call
+across 8 lib/ functions. At 100K dispatches/day, that's ~M sqlite3
+forks/day spent on no-op schema checks (audit finding F-01: highest-
+leverage per-call overhead).
+
+| File | Function | Call sites | Flag |
+|---|---|---:|---|
+| lib/version_registry.sh | _ver_ensure_table | 7 | _MO_VER_SCHEMA_INIT |
+| lib/runs-tracker.sh | mo_runs_ensure_schema | 1 (hot path, every dispatch) | _MO_RUNS_SCHEMA_INIT |
+| lib/agent_registry.sh | _agent_ensure_tables | 4 | _MO_AGENT_SCHEMA_INIT |
+| lib/benchmark_suite.sh | _bench_ensure_tables | 4 | _MO_BENCH_SCHEMA_INIT |
+| lib/gate_registry.sh | _gate_ensure_table | 3 | _MO_GATE_SCHEMA_INIT |
+| lib/promotion_gate.sh | _promo_ensure_tables | 2 | _MO_PROMO_SCHEMA_INIT |
+| lib/pattern_store.sh | _pattern_ensure_table | 1 | _MO_PATTERN_SCHEMA_INIT |
+| lib/gradient_extractor.sh | _gradient_ensure_table | 1 | _MO_GRADIENT_SCHEMA_INIT |
+
+Pattern (uniform across all 8): `[ "${_MO_X_SCHEMA_INIT:-0}" = "1" ]
+&& return 0` early-return at function top + `_MO_X_SCHEMA_INIT=1;
+export _MO_X_SCHEMA_INIT` after successful schema init. Also added
+`PRAGMA busy_timeout=5000` to each Python heredoc (F-11 cleanup —
+formerly only on hot-path trace_store/cache sites).
+
+Smoke verified: second call returns without forking python3;
+subshells inherit flag via `export`.
+
+**v0.2 P1 backlog status after pt-10:** 22/22 original + 4 v0.2.1 +
+2 v0.2.2 + 1 v0.2.3 (G-003) closed. **29 total P1 audit findings
+shipped.**
 
 
 
