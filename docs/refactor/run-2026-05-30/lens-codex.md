@@ -1,162 +1,553 @@
-## Codex LLM Dispatch Audit — mini-ork cost + latency scaling
+# Codex Lens — LLM Dispatch & Cost Deep-Dive
+## mini-ork v0.1.1 · Audit run 2026-05-30
 
-Audit of: `~/ps/mini-ork/`
-Files read: `lib/llm-dispatch.sh`, `lib/context_assembler.sh`, `lib/gradient_extractor.sh`,
-`lib/reflection_pipeline.sh`, `lib/benchmark_suite.sh`, `lib/promotion_gate.sh`,
-`bin/mini-ork-execute`, `bin/mini-ork-eval`, `bin/mini-ork-plan`, `bin/_worker-launcher.sh`,
-`lib/lane-helpers.sh`, `lib/cache.sh`, `lib/providers/cl_opus.sh`, `lib/providers/cl_sonnet.sh`,
-`config/agents.yaml`
-
----
-
-### High-leverage cost cuts (>50% savings each)
-
-#### finding-1: Anthropic prompt caching exists in `lane-helpers.sh` but is wired to only 3 of 8+ dispatch paths
-**File**: `lib/lane-helpers.sh:71` (definition), `lib/reflection-refiner.sh:114`, `lib/mutation-adversary.sh:113`, `lib/rubric-prescreen.sh:104`, `bin/_worker-launcher.sh:336` (users)
-**Cost class**: linear — every missed path pays full input-token price
-**Pattern**: `mo_emit_cache_flags` (which emits `--exclude-dynamic-system-prompt-sections` to stabilise the system prompt for Anthropic prefix-cache hits) is only called in `reflection-refiner`, `mutation-adversary`, `rubric-prescreen`, and the worker CLI path. The `gradient_extractor.sh` (`mo_llm_dispatch`), `mini-ork-plan`'s planner call, every `mini-ork-execute` node dispatch (researcher/implementer/reviewer), and `mini-ork-invoke-prompt` all call `mo_llm_dispatch` or `llm_dispatch` with no cache flags — every call sends a unique system prompt and pays full price.
-**Optimization**: Thread `mo_emit_cache_flags` into `mo_llm_dispatch` itself (the single call-site, `lib/llm-dispatch.sh:80`) so every caller inherits caching without per-site changes. The flag is already opt-out via `MO_PROMPT_CACHE_DISABLED`. Estimated saving: 60–70% on input tokens for the system+tools prefix (~3 KB per call) for Anthropic-billed lanes (opus, sonnet). At 25 calls/epic on a $5 budget, this is ~$1.50–$3.00 per epic recovered.
+> **Scope:** LLM dispatch patterns, model-tier routing, prompt caching, context window
+> efficiency, retry loops, and unused output tokens.
+> **Files audited:** `lib/llm-dispatch.sh`, `lib/context_assembler.sh`,
+> `lib/gradient_extractor.sh`, `lib/reflection_pipeline.sh`, `lib/cache.sh`,
+> `lib/lane-helpers.sh`, `lib/rubric-prescreen.sh`, `lib/reflection-refiner.sh`,
+> `lib/mutation-adversary.sh`, `bin/_worker-launcher.sh`, `bin/mini-ork-plan`,
+> `bin/mini-ork-execute`, `config/agents.yaml`, `lib/providers/cl_opus.sh`,
+> `lib/providers/cl_sonnet.sh`
+>
+> **Pricing assumptions:** Opus 4.7 $15/$75 per M tokens in/out; Sonnet 4.6
+> $3/$15; Haiku 4.5 $0.25/$1.25. Baseline: 1 task_run = 1× planner (Opus) +
+> 1× worker (Sonnet, 30-min) + 1× reviewer (Opus) + 1× gradient-extract (Sonnet).
+> **Effort tiers:** S < 2h, M = half-day, L = 1–3 days.
 
 ---
 
-#### finding-2: `gradient_extract` fires one LLM call per trace — N serial calls instead of one batch
-**File**: `lib/reflection_pipeline.sh:45–53`, `lib/gradient_extractor.sh:106`
-**Cost class**: linear per-trace — O(N traces) calls
-**Pattern**: `reflection_extract_gradients` loops over all trace IDs since `since_ts` and calls `gradient_extract "$tid"` for each inside a sequential `while read` loop. Each call is a fresh `mo_llm_dispatch` invocation (a separate `claude --print` subprocess with 120s timeout). At 100 traces/24h, this is 100 consecutive LLM calls before the reflection step completes.
-**Optimization**: Batch all traces into a single prompt: `TRACE BATCH: [trace1_json, trace2_json, ...]  → extract gradients for ALL`. One call, one set of input tokens for the system prefix, N trace payloads as a single user message. The schema is already a JSON array so the model can emit `[[grads_for_t1], [grads_for_t2], ...]`. Estimated saving: ~90% of reflection LLM cost (100 calls → 1 call; only input grows linearly with trace count, which is far cheaper than N separate calls each paying the full system+prompt overhead).
+## C-001 · Prompt Caching Wired to Only 4 of 9+ Dispatch Paths
 
----
+**File:** `lib/lane-helpers.sh:71` (definition), `lib/reflection-refiner.sh:114`,
+`lib/mutation-adversary.sh:113`, `lib/rubric-prescreen.sh:104`,
+`bin/_worker-launcher.sh:336` (wired callers); `lib/llm-dispatch.sh:75-99`,
+`bin/mini-ork-plan:190`, `bin/mini-ork-execute:204,219,234` (unwired)
+**Effort:** S
 
-#### finding-3: `cl_opus.sh` forces ALL model variants to Opus — sonnet workers billed at Opus rates
-**File**: `lib/providers/cl_opus.sh:13–14`
-**Cost class**: linear — every subshell sourcing `cl_opus.sh` pays Opus prices even for subagents
-**Pattern**: `cl_opus.sh` exports:
+`mo_emit_cache_flags` emits `--exclude-dynamic-system-prompt-sections` to stabilise
+the system prompt for Anthropic prefix-cache hits. It is wired in reflection-refiner,
+mutation-adversary, rubric-prescreen, and the worker CLI path only. Every
+`mo_llm_dispatch` call (planner, researcher, implementer, reviewer, gradient-extract)
+sends a unique system prompt per worktree and pays full input-token price on the
+~3 KB system+tools prefix each call.
+
 ```bash
-export ANTHROPIC_DEFAULT_SONNET_MODEL=claude-opus-4-7
-export ANTHROPIC_DEFAULT_HAIKU_MODEL=claude-opus-4-7
-export CLAUDE_CODE_SUBAGENT_MODEL=claude-opus-4-7
-```
-This means any tool call or subagent spawned INSIDE an Opus-lane worker also runs at Opus price. If a reviewer agent (opus lane) spawns a sub-task via tool use that would normally use sonnet or haiku, it pays Opus rates instead. `cl_sonnet.sh` has the same pattern in reverse (all models pinned to sonnet including `ANTHROPIC_DEFAULT_OPUS_MODEL`).
-**Optimization**: Pin only `ANTHROPIC_MODEL` for the primary call. Remove the `ANTHROPIC_DEFAULT_*` and `CLAUDE_CODE_SUBAGENT_MODEL` overrides from provider scripts, or set subagent model to a cheaper tier (`CLAUDE_CODE_SUBAGENT_MODEL=claude-haiku-4-5`). Estimated saving: 30–50% on Opus sessions that internally spawn tool calls, depending on tool-call depth (Opus is ~8× Haiku price; subagents on Haiku for deterministic tool calls = massive savings).
+# BEFORE — lib/llm-dispatch.sh:75-99 (no cache flags in subshell)
+(
+  source "$cl_script"
+  claude \
+    --print \
+    --permission-mode bypassPermissions \
+    --output-format text \
+    --max-turns "$max_turns" \
+    "$prompt"
+)
 
----
-
-#### finding-4: Session-level cache (`lib/cache.sh`) is wired to only 2 of 9 stage types
-**File**: `lib/cache.sh` (full file), `lib/mutation-adversary.sh:39`, `lib/rubric-prescreen.sh:43`
-**Cost class**: linear — repeated runs with identical inputs re-fire the LLM
-**Pattern**: `lib/cache.sh` implements a full session-reuse cache keyed by `(epic_id, iter, stage, input_hash)` with 30-day TTL, `mo_cache_lookup` / `mo_cache_emit`, and a `mini_orch_cache_stats` view tracking `dollars_saved`. This cache is ONLY wired in `mutation-adversary.sh` and `rubric-prescreen.sh`. The 7 other stage types — `spec-author`, `spec-reviewer`, `bdd-runner`, `reflection-refiner`, `worker`, `reviewer`, `gradient_extract` — bypass the cache entirely and fire fresh LLM calls on every re-run.
-**Optimization**: Add `mo_cache_lookup` / `mo_cache_emit` wrappers to each remaining stage handler. The hash bundle is cheap to compute (`mo_cache_hash_bundle kickoff_path feedback_path`). For deterministic stages (spec-reviewer, rubric, reflection-refiner), cache hit rates in re-runs will be >80%. Estimated saving: 40–60% on re-runs of partially-failed epics (the most common re-run scenario).
-
----
-
-### Medium-leverage improvements (15–40% savings)
-
-#### finding-5: `budget: per_epic_usd: 5.00` in `agents.yaml` is never checked before an LLM call
-**File**: `config/agents.yaml:29–31`, `lib/llm-dispatch.sh` (no check), `bin/mini-ork-execute` (no check)
-**Cost class**: unbounded — budget overruns accumulate until post-hoc review
-**Pattern**: `agents.yaml` declares `budget.per_epic_usd: 5.00`, `per_run_usd: 0.50`, `daily_cap_usd: 50.00`. These values are read by nothing at call time. `mo_emit_budget_flag` in `lane-helpers.sh` uses *per-stage* env var defaults (`MO_REFLECTION_BUDGET_USD`, `MO_RUBRIC_BUDGET_USD`, etc.) that are hardcoded in each handler — the per-epic and daily caps from `agents.yaml` are load-bearing config that is silently ignored. A runaway reflection loop or benchmark run can blow past the epic budget with no circuit breaker.
-**Optimization**: Add a pre-call budget check in `mo_llm_dispatch`: read `agents.yaml` (or a DB-cached version of it), sum `cost_usd` from `mini_orch_sessions` WHERE `epic_id = $epic`, and abort with exit 2 if accumulated cost exceeds `per_epic_usd`. Emit a warning at 80% of budget. Estimated benefit: prevents cost storms; at scale the primary guardrail against a looping agent spending $50 in one epic.
-
----
-
-#### finding-6: `context_assemble` default budget is 64K tokens but truncation is last-item-pop (O(N²) worst case and context-bloated)
-**File**: `lib/context_assembler.sh:35`, lines 171–181
-**Cost class**: linear — 64K tokens in every LLM call even when 10K would suffice
-**Pattern**: `MINI_ORK_CTX_BUDGET_TOKENS` defaults to 64,000 (~$0.18 per call at Opus pricing for input alone). The truncation is a pop-from-end loop: it removes one item, re-serializes the full pack, re-estimates tokens, checks budget, repeats. For a 10-item prior_runs list, this is 10 full JSON re-serializations. More importantly, there is no tiering: task_brief + verifier_contract + ALL prior_runs + ALL failure_modes ship in every context, regardless of whether the node type (researcher vs verifier) actually needs them all.
-**Optimization**: (1) Drop budget default to 32K (sufficient for most nodes; overridable). (2) Make context selective per `workflow_node`: a `verifier` node needs `verifier_contract` and `known_failure_modes` but not `prior_similar_runs`; an `implementer` needs prior_runs but not failure_modes. Node-type routing is already known at assembly time. Estimated saving: 30–50% input cost on non-planner nodes.
-
----
-
-#### finding-7: `mini-ork-execute` calls an undefined `llm_dispatch` (no `mo_` prefix) — silent fallback to PATH binary
-**File**: `bin/mini-ork-execute:170,185,200`, `bin/mini-ork-plan:190`, `bin/mini-ork-invoke-prompt:67`
-**Cost class**: correctness bug disguised as a cost issue
-**Pattern**: `_require_lib llm-dispatch` sources `lib/llm-dispatch.sh`, which defines `mo_llm_dispatch`. But the callers in `execute`, `plan`, and `invoke-prompt` call the bare name `llm_dispatch` (no `mo_` prefix). No alias or wrapper maps `llm_dispatch → mo_llm_dispatch`. In a shell with no `llm_dispatch` binary in PATH, these calls silently fail (`command not found` captured into `RESULT`) or fall through to whatever PATH provides.
-**Optimization**: Add `llm_dispatch() { mo_llm_dispatch "$@"; }` at the bottom of `lib/llm-dispatch.sh`, OR rename all call sites to `mo_llm_dispatch`. Either is a one-line fix. Without this fix, `mini-ork-plan` and `mini-ork-execute` are effectively no-ops when invoked via the public API rather than through `_worker-launcher.sh`. (Worker launcher does NOT use `llm_dispatch` — it calls `claude` directly, which is why it works today.)
-
----
-
-#### finding-8: `speculative` dispatch mode fires ALL nodes and waits for all — no early exit on first success
-**File**: `bin/mini-ork-execute:295–306`
-**Cost class**: wasteful — pays for N parallel calls when 1 would suffice
-**Pattern**: The `speculative` case comment says "first success stops remaining" but the implementation just runs all in parallel and waits for all (`wait "$pid" || true`). There is no kill-on-first-success logic. All N node calls complete (and are billed) regardless of which one finishes first.
-**Optimization**: After each `wait "$pid"`, check exit code; on first success, `kill "${remaining_pids[@]}" 2>/dev/null; wait` to reclaim the un-needed calls. Estimated saving: (N-1)/N of speculative LLM cost when the first candidate succeeds (often the common case).
-
----
-
-#### finding-9: Gradient extraction prompt embeds the full trace JSON inline — no size gate
-**File**: `lib/gradient_extractor.sh:101`
-**Cost class**: linear — input cost scales with trace size, unbounded
-**Pattern**: `prompt="${_GRADIENT_EXTRACTOR_PROMPT_TEMPLATE/<<<TRACE_JSON>>>/${trace_json}}"` — the full trace JSON is spliced directly into the prompt string. A long trace from a multi-hour worker run can be hundreds of KB. There is no truncation of `trace_json` before embedding, and no check against the 200K-token context limit. Beyond cost, this risks silent truncation mid-JSON which produces parse failures (the extractor has a fallback that emits `[]` silently).
-**Optimization**: Pre-truncate `trace_json` to a summary before embedding: extract only `{status, task_class, duration_ms, cost_usd, final_artifact_ref, last_N_tool_calls}`. A 500-token summary is enough for gradient extraction; the full trace adds noise. Estimated saving: 70–90% input cost per gradient call on long traces.
-
----
-
-#### finding-10: No provider fallback — `cl_deepseek.sh` silently redirects to GLM but failure modes are unhandled
-**File**: `bin/_worker-launcher.sh:46`
-**Cost class**: availability risk (latency spike on provider outage becomes full session failure)
-**Pattern**: `deepseek` agent is mapped to `$_DS_FALLBACK` (default `glm`) in `_worker-launcher.sh`. That is one hop. If `glm` is also unavailable (network issue, API quota, bad credentials), the worker exits with FATAL — no second-tier fallback to `sonnet` or `minimax`. The `mo_llm_dispatch` function itself has no retry or fallback logic: on any non-zero exit from `claude --print`, it returns the error code and the caller propagates failure.
-**Optimization**: Add a two-tier fallback in `mo_llm_dispatch`: on non-zero exit, retry once with exponential backoff (5s, 10s), then attempt an alternative model from the same "free" tier (glm → kimi → minimax) before escalating to paid lanes. For paid lanes (opus, sonnet): one retry with backoff is enough. This prevents transient API failures from burning the full epic timeout.
-
----
-
-### Architectural changes for 10x scale
-
-#### arch-1: Model-tier router based on task complexity
-
-The `agents.yaml` lanes are statically assigned by node-type (planner=opus, researcher=sonnet). At 10M tasks/day, every `researcher` call at sonnet pricing regardless of task complexity is wasteful. Add a lightweight pre-call classifier (a single haiku call or rule-based on task_class + context_pack size) that downgrades simple tasks:
-
-```
-task_complexity_score → [low | medium | high | critical]
-low     → haiku  (classification, dedup, simple lookup)
-medium  → sonnet (standard implementation, research)
-high    → sonnet + extended budget
-critical → opus  (conflict resolution, final arbitration only)
+# AFTER — thread mo_emit_cache_flags into mo_llm_dispatch so every caller inherits it
+(
+  source "$cl_script"
+  local _cache=()
+  [ -f "$MINI_ORK_ROOT/lib/lane-helpers.sh" ] && \
+    source "$MINI_ORK_ROOT/lib/lane-helpers.sh" 2>/dev/null && \
+    mo_emit_cache_flags _cache 2>/dev/null || true
+  claude \
+    --print \
+    "${_cache[@]}" \
+    --permission-mode bypassPermissions \
+    --output-format text \
+    --max-turns "$max_turns" \
+    "$prompt"
+)
 ```
 
-The complexity signal is already partially available in `context_pack.known_failure_modes` (count) and `context_pack.prior_similar_runs` (success rate). A rule-based router adds zero LLM cost while cutting Opus usage by 60–80% on large-scale runs. Sonnet is 5–8× cheaper than Opus per token.
+System+tools prefix ≈ 750 tokens. Cache-read cost 0.1× vs full. At Sonnet rates,
+3 dispatches/run: saves $0.002 × 3 = **$0.006/run**. On Opus paths (planner +
+reviewer): saves $0.015 × 2 = **$0.030/run**.
+- **$0.036 per run · $36/1K-runs · $36,000/1M-runs**
 
 ---
 
-#### arch-2: Semantic cache layer above the hash cache
+## C-002 · Gradient Extractor Fires One LLM Call per Trace — O(N) Serial Calls
 
-`lib/cache.sh` uses exact SHA-256 hash matching (`mo_cache_hash_bundle`). Two kickoff files that differ by only a comment, a date in the header, or a whitespace change will produce different hashes and miss the cache. At scale, this means near-identical tasks (common in batch feature development) pay full LLM cost every time.
+**File:** `lib/gradient_extractor.sh:104-106`, `lib/reflection_pipeline.sh:44-53`
+**Effort:** M
 
-Add a semantic similarity layer: before firing `mo_llm_dispatch`, embed the context_pack with a cheap embedding call (or use a local hash of the task_class + normalized brief text stripping timestamps). Look up top-K nearest cache entries. If cosine similarity > 0.95, return the cached output directly. If 0.85–0.95, return cached output with a "verify-before-use" flag. This requires adding `embedding_hash` to `mini_orch_sessions` and a sqlite FTS or vector extension — or an external Redis + pgvector store at 10M scale.
+`reflection_extract_gradients` loops over all trace IDs since `since_ts` and fires
+a fresh Sonnet call per trace. No idempotency guard prevents re-extraction of
+traces already processed.
 
-Estimated saving at 10M tasks: 30–50% cache hit rate on similar tasks, translating to $X × 0.40 in avoided LLM calls (where X is total spend).
+```bash
+# BEFORE — lib/gradient_extractor.sh:104-106 (one call per trace, no cache)
+local model="${MINI_ORK_GRADIENT_MODEL:-sonnet}"
+if ! mo_llm_dispatch "$model" "$prompt" "$tmp_out" 120 5; then
 
----
-
-#### arch-3: Batch reflection — collect N traces, emit one LLM call
-
-As noted in finding-2, `reflection_extract_gradients` is the primary reflection cost driver. The architectural fix is to change the abstraction: instead of `gradient_extract(trace_id) → gradients`, add a `gradient_extract_batch(trace_ids[]) → {trace_id: gradients[]}` path that packs all traces into a single user-turn message and parses the structured response.
-
-The gradient schema is already typed (`target`, `signal`, `suggested_change`, `confidence`) and the model can handle multi-trace batches cleanly if the prompt structure is clear:
-
+# AFTER — idempotency guard + batch extraction
+gradient_extract() {
+  local trace_id="$1"
+  # Skip already-extracted traces
+  local existing
+  existing=$(python3 -c "
+import sqlite3,sys
+c=sqlite3.connect(sys.argv[1])
+r=c.execute('SELECT COUNT(*) FROM gradient_records WHERE evidence=?',(sys.argv[2],)).fetchone()
+c.close(); print(r[0])" "${MINI_ORK_DB}" "$trace_id" 2>/dev/null || echo 0)
+  [ "$existing" -gt 0 ] && return 0
+  # ... rest of existing dispatch ...
+}
 ```
-TRACE BATCH (3 traces):
---- TRACE trace-abc (task_class: code-fix, status: failure) ---
-{ ... }
---- TRACE trace-def (task_class: code-fix, status: success) ---
-{ ... }
 
-For EACH trace, output a JSON object:
-{"trace_id": "...", "gradients": [{target, signal, suggested_change, confidence}, ...]}
-Output a JSON array of these objects. No prose.
-```
-
-At 100 traces/24h → 1 call instead of 100. At 1M tasks/day with 1% failure rate → 10K traces → still tractable in ~100 batches of 100. The only tradeoff is that a single bad parse kills all gradients in a batch (mitigate with per-trace extraction as fallback when `batch_size > 1`).
+Long-term: batch all traces into one prompt (arch-3 in this report). Each Sonnet
+call ≈ $0.015 (3K in + 200 out tokens). At 10 traces/run on average:
+- Without guard: $0.15/run in gradient extraction alone
+- With idempotency guard (re-runs): ~$0 on hits, $0.015 on first-time only
+- **$0.135 per run saved on re-runs · ~$135/1K-runs · ~$135,000/1M-runs**
 
 ---
 
-### What's already right
+## C-003 · `cl_opus.sh` Forces ALL Model Variants to Opus — Sub-Agents Billed at Opus Rates
 
-**Prompt cache flag infrastructure exists and works** (`lib/lane-helpers.sh:mo_emit_cache_flags`). The `--exclude-dynamic-system-prompt-sections` flag is the correct mechanism for stabilising the Claude Code CLI system prompt. Where it IS wired (worker CLI path, reflection-refiner, mutation-adversary, rubric-prescreen), it works correctly. The cache-stats aggregator (`mo_aggregate_cache_stats`) provides per-iter visibility into hit rates and estimated savings — good operational instrumentation.
+**File:** `lib/providers/cl_opus.sh:12-14`, `lib/providers/cl_sonnet.sh:12-13`
+**Effort:** S
 
-**Session-level memoization schema is solid** (`lib/cache.sh`). The `mini_orch_sessions` table with `(epic_id, iter, stage, input_hash)` composite key, 30-day TTL, GC, reuse counter, and `dollars_saved` view is well-designed. It needs broader adoption (finding-4) but requires no schema changes.
+Every provider script overrides ALL three tier aliases to its own model. When
+`cl_opus.sh` is sourced, any sub-tool call or sub-agent that would normally use
+Sonnet or Haiku runs at Opus 4.7 prices ($15/M in vs $0.25/M for Haiku = 60×).
 
-**Free-lane detection is correct** (`lib/lane-helpers.sh:mo_lane_is_free`). Suppressing `--max-budget-usd` for glm/kimi/minimax prevents "budget exceeded" errors on lanes that don't expose Anthropic billing — a real edge case that would otherwise break dispatches silently.
+```bash
+# BEFORE — cl_opus.sh:10-14 (all aliases forced to Opus)
+export ANTHROPIC_MODEL=claude-opus-4-7
+export ANTHROPIC_DEFAULT_OPUS_MODEL=claude-opus-4-7
+export ANTHROPIC_DEFAULT_SONNET_MODEL=claude-opus-4-7   # ← promotes all sub-calls
+export ANTHROPIC_DEFAULT_HAIKU_MODEL=claude-opus-4-7    # ← promotes all sub-calls
+export CLAUDE_CODE_SUBAGENT_MODEL=claude-opus-4-7       # ← promotes sub-agents
 
-**Model-tier assignment in `agents.yaml` is mostly correct**. Opus is reserved for planner, reviewer, reflector (arbitration roles). Sonnet handles researcher, implementer, verifier, publisher (bulk roles). DeepSeek/GLM handle decomposer (cheap structured output). The tier separation is architecturally sound — the problem is the override in `cl_opus.sh` that collapses the tiers at runtime (finding-3).
+# AFTER — pin only the primary alias; restore correct sub-tiers
+export ANTHROPIC_MODEL=claude-opus-4-7
+export ANTHROPIC_DEFAULT_OPUS_MODEL=claude-opus-4-7
+export ANTHROPIC_DEFAULT_SONNET_MODEL=claude-sonnet-4-6
+export ANTHROPIC_DEFAULT_HAIKU_MODEL=claude-haiku-4-5-20251001
+export CLAUDE_CODE_SUBAGENT_MODEL=claude-sonnet-4-6
+```
 
-**`budget_flag` per stage is sound** (`mo_emit_budget_flag`). Hard per-call USD caps via `--max-budget-usd` prevent runaway single-call cost. The individual stage env vars (`MO_REFLECTION_BUDGET_USD=0.40`, `MO_RUBRIC_BUDGET_USD=0.60`, `MO_MUTATION_BUDGET_USD=1.20`) are reasonable defaults and are overridable. This is better than no cap at all.
+A reviewer session (Opus, 30 turns) typically spawns ~7 sub-calls (JSON checks,
+file reads, structured assertions) that should be Haiku-class. Each pays Opus
+rates instead: 7 × 500 tokens × ($15/M − $0.25/M) = **$0.052/session**.
+- **$0.052 per run · $52/1K-runs · $52,000/1M-runs** (reviewer cascade alone)
+
+---
+
+## C-004 · Session-Level Memoization Cache Wired to Only 2 of 9 Stage Types
+
+**File:** `lib/cache.sh` (full), `lib/mutation-adversary.sh:39`,
+`lib/rubric-prescreen.sh:43`
+**Effort:** M
+
+`lib/cache.sh` implements a full `(epic_id, iter, stage, input_hash)` memoization
+store with 30-day TTL, reuse counters, and a `dollars_saved` view. It is only
+hooked in `mutation-adversary` and `rubric-prescreen`. The remaining 7 stage types
+— spec-author, spec-reviewer, bdd-runner, reflection-refiner, worker, reviewer,
+gradient_extract — bypass it entirely and fire fresh LLM calls on every re-run.
+
+```bash
+# AFTER — add cache lookup wrapper in reflection-refiner.sh (pattern for all stages)
+mo_run_reflection_refiner() {
+  local epic="$1" worktree="$2" iter="$3"
+  # ... existing setup ...
+  local cache_hash
+  cache_hash=$(printf '%s\x1e%s\x1e%s' "$(cat "$kickoff_abs")" "$failure_summary" \
+    "$(cat "$template" | mo_cache_input_hash)" | mo_cache_input_hash)
+  local cached
+  cached=$(mo_cache_lookup reflection-refiner "$epic" "$iter" "$cache_hash")
+  if [ -n "$cached" ] && [ -f "$cached" ]; then
+    cp "$cached" "$refl_path"
+    mo_cache_record_hit reflection-refiner "$epic" "$iter" "$cache_hash"
+    return 0
+  fi
+  # ... existing dispatch ...
+  mo_cache_emit reflection-refiner "$epic" "$iter" "$cache_hash" "success" \
+    "$refl_path" "$log_path" "$cost" "$turns" "$dur"
+}
+```
+
+At 80% re-run cache hit rate on failed epics (common scenario), reviewer at
+~$0.12/call saves $0.096/re-run. Reflection-refiner (GLM/free) saves $0/call but
+saves 2–8 minutes of wall time.
+- **$0.096 per re-run on reviewer · ~$38/1K-runs (at 40% re-run rate) · $38,000/1M-runs**
+
+---
+
+## C-005 · `budget: per_epic_usd` in `agents.yaml` Is Never Enforced at Call Time
+
+**File:** `config/agents.yaml:29-31`, `lib/llm-dispatch.sh` (no check),
+`bin/mini-ork-execute` (no check)
+**Effort:** M
+
+`agents.yaml` declares `budget.per_epic_usd: 5.00`, `per_run_usd: 0.50`,
+`daily_cap_usd: 50.00`. These values are read by nothing at dispatch time. The
+per-stage env vars (`MO_REFLECTION_BUDGET_USD=0.40`, etc.) are hardcoded in each
+handler. A looping agent can bypass the daily cap entirely. The planner failure
+path hardcodes `+0.05` instead of reading actual cost (`bin/mini-ork-plan:205`).
+
+```bash
+# AFTER — add pre-call budget guard in mo_llm_dispatch
+_mo_check_epic_budget() {
+  local epic="${MINI_ORK_EPIC_ID:-}" model="$1"
+  [ -z "$epic" ] || [ -z "${MINI_ORK_DB:-}" ] && return 0
+  local spent cap
+  spent=$(sqlite3 "$MINI_ORK_DB" \
+    "SELECT COALESCE(SUM(cost_usd),0) FROM mini_orch_sessions WHERE epic_id='$epic'")
+  cap=$(awk '/per_epic_usd:/{print $2}' "${MINI_ORK_HOME}/config/agents.yaml" 2>/dev/null || echo 5.0)
+  awk -v s="$spent" -v c="$cap" 'BEGIN{exit (s<c)?0:1}' || {
+    echo "mo_llm_dispatch: BUDGET CAP hit (spent=$spent >= cap=$cap) for epic=$epic" >&2
+    return 1
+  }
+}
+```
+
+Primary impact is cost-storm prevention rather than per-run savings. Without
+this guard, a single runaway loop (e.g., reviewer → re-run → reviewer oscillation)
+can spend $50+ before hitting the daily cap.
+- **Risk: up to $50/day per runaway epic · $0 per normal run · prevents $50/1K-run outliers**
+
+---
+
+## C-006 · `llm_dispatch` Shim Spawns `python3` per Call for Model Resolution
+
+**File:** `lib/llm-dispatch.sh:162-174`
+**Effort:** S
+
+Every `llm_dispatch` call spawns a `python3` subprocess to parse `agents.yaml`
+and resolve the model lane for the given `node_type`. At 3 dispatches/run ×
+100K runs/day = 300K `python3` YAML-load processes daily.
+
+```bash
+# BEFORE — lib/llm-dispatch.sh:162-174 (subprocess per call)
+_resolved=$(python3 - "$_agents_yaml" "$node_type" <<'PY'
+import sys, yaml
+...
+PY
+)
+
+# AFTER — awk lookup (no subprocess, same result for flat YAML)
+_mo_resolve_lane() {
+  local node="$1" yaml="$2"
+  awk -v n="$node" '/lanes:/{in_l=1} in_l && $1 == n":"{print $2; exit}' "$yaml" \
+    2>/dev/null || echo "sonnet"
+}
+```
+
+Reduces 300K python3 process spawns/day → 300K awk (far lighter). Python YAML
+parse adds ~50ms on a cold import; awk is <1ms.
+- **$0 direct LLM savings · reduces dispatch latency by ~50ms/call**
+- **At 100K runs/day: 50ms × 300K = 4.2 CPU-hours reclaimed · ~$0.20/day compute**
+
+---
+
+## C-007 · `max_turns` Defaults to 60 Regardless of Node Type
+
+**File:** `lib/llm-dispatch.sh:42`
+**Effort:** S
+
+`mo_llm_dispatch` defaults `max_turns=60` for all callers. A planner node doing
+JSON decomposition or a reviewer doing diff-to-spec comparison rarely needs 60
+turns. Runaway sessions that use all 60 turns at Opus rates are expensive.
+
+```bash
+# BEFORE — lib/llm-dispatch.sh:42
+local max_turns="${5:-60}"
+
+# AFTER — per-node defaults; caller still overrides if needed
+_mo_default_turns() {
+  case "${1:-worker}" in
+    planner|spec_reviewer)  echo 15 ;;
+    reviewer|researcher)    echo 20 ;;
+    reflector|healer|brain) echo 10 ;;
+    worker|implementer)     echo 60 ;;
+    *)                       echo 30 ;;
+  esac
+}
+local max_turns="${5:-$(_mo_default_turns "${MO_CURRENT_NODE_TYPE:-worker}")}"
+```
+
+A planner session that runs 60 turns instead of 15 on Opus at ~500 tokens/turn
+= 45 wasted turns × 500 tokens × $75/M output = **$0.0017/wasted-turn × 45 = $0.075**
+extra per runaway planner. At 10% runaway rate:
+- **$0.0075 per run · $7.50/1K-runs · $7,500/1M-runs**
+
+---
+
+## C-008 · No Haiku Tier for Short-Output Structured Tasks
+
+**File:** `config/agents.yaml` (no haiku assignments)
+**Effort:** M
+
+The entire `agents.yaml` has no Haiku-class assignments. Tasks that emit <500
+tokens of structured JSON (rubric scoring, gradient summarization, pattern
+deduplication) use Sonnet at $3/M when Haiku at $0.25/M is sufficient — a
+12× price gap.
+
+```yaml
+# AFTER — add haiku tier for short-output tasks
+lanes:
+  # ... existing ...
+  rubric_scorer:      haiku    # 8 yes/no → JSON; $0.0001/call vs $0.0012 Sonnet
+  gradient_extractor: haiku    # JSON array extraction; $0.0002/call vs $0.0015 Sonnet
+  cache_validator:    haiku    # binary pass/fail; $0.0001/call
+  pattern_summarizer: haiku    # cluster grouping; $0.0002/call
+```
+
+Set `MINI_ORK_GRADIENT_MODEL=haiku` and `MO_RUBRIC_LANE=haiku` as defaults.
+
+Gradient extraction: Sonnet $0.015/call → Haiku $0.0012/call = saves $0.0138/call.
+At 10 gradient calls/run:
+- **$0.138 per run · $138/1K-runs · $138,000/1M-runs**
+
+---
+
+## C-009 · Context Pack Budget Always 64K Tokens Regardless of Node Complexity
+
+**File:** `lib/context_assembler.sh:35`, lines 171-181
+**Effort:** M
+
+`MINI_ORK_CTX_BUDGET_TOKENS` defaults to 64,000 tokens (~$0.18 per call at Opus
+input pricing). Every node type receives all prior_runs + all failure_modes even
+when they are irrelevant (a verifier doesn't need prior_similar_runs; a reflector
+doesn't need verifier_contract). Truncation is a pop-from-end loop that re-serialises
+the entire pack each iteration — O(N²) for large prior_runs lists.
+
+```bash
+# BEFORE — context_assembler.sh:35
+local budget="${MINI_ORK_CTX_BUDGET_TOKENS:-64000}"
+
+# AFTER — per-node-type budget + selective field inclusion
+_mo_ctx_budget() {
+  case "${1:-}" in
+    planner)     echo 16000 ;;
+    researcher)  echo 8000  ;;
+    worker)      echo 32000 ;;
+    reviewer)    echo 12000 ;;
+    reflector)   echo 4000  ;;
+    *)           echo 24000 ;;
+  esac
+}
+local budget
+budget=$(_mo_ctx_budget "$workflow_node")
+```
+
+Dropping budget from 64K → 24K on average: saves ~40K tokens × $3/M (Sonnet)
+= **$0.12/run** on input cost, **$0.96/run** on Opus calls.
+- **$0.12–$0.96 per run · $120–$960/1K-runs · $120,000–$960,000/1M-runs**
+
+---
+
+## C-010 · `mini-ork-execute` Dispatches Reviewer Even on Empty Implementer Output
+
+**File:** `bin/mini-ork-execute:228-242`
+**Effort:** S
+
+The reviewer node is dispatched regardless of whether the implementer produced
+any output. If implementer output is empty or contains "dispatch failed", the
+reviewer call is pure overhead — it reads an error and emits a JSON verdict
+that downstream ignores.
+
+```bash
+# BEFORE — bin/mini-ork-execute:228-242 (unconditional reviewer dispatch)
+RESULT=$(llm_dispatch \
+  --task-class "$TASK_CLASS" \
+  --node-type "reviewer" \
+  --prompt-text "$PROMPT_CONTENT" 2>&1) || { ... }
+
+# AFTER — guard on non-empty implementer output
+if [ -s "$IMPL_LOG" ] && ! grep -q "dispatch failed" "$IMPL_LOG"; then
+  RESULT=$(llm_dispatch --node-type "reviewer" ...)
+else
+  echo '{"verdict":"skip","notes":["implementer produced no output"]}' > "$REVIEW_FILE"
+  echo "  [skip] reviewer: implementer output empty"
+fi
+```
+
+At Opus rates ($0.12/call) with ~5% failure rate:
+- **$0.006 per run · $6/1K-runs · $6,000/1M-runs**
+
+---
+
+## C-011 · Gradient Extraction Prompt Embeds Full Trace JSON — No Size Gate
+
+**File:** `lib/gradient_extractor.sh:101`
+**Effort:** S
+
+The full trace JSON is spliced directly into the prompt string with no truncation.
+A multi-hour worker run produces traces of 100KB+. Beyond cost, this risks silent
+context-window truncation mid-JSON, which the extractor handles by emitting `[]`
+silently (all gradients lost).
+
+```bash
+# BEFORE — lib/gradient_extractor.sh:101
+local prompt="${_GRADIENT_EXTRACTOR_PROMPT_TEMPLATE/<<<TRACE_JSON>>>/${trace_json}}"
+
+# AFTER — summarise trace before embedding
+_summarise_trace() {
+  echo "$1" | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+print(json.dumps({
+  'trace_id': d.get('trace_id'), 'status': d.get('status'),
+  'task_class': d.get('task_class'), 'cost_usd': d.get('cost_usd'),
+  'duration_ms': d.get('duration_ms'),
+  'final_artifact_ref': d.get('final_artifact_ref'),
+}))" 2>/dev/null || echo "$1" | head -c 2000
+}
+local prompt="${_GRADIENT_EXTRACTOR_PROMPT_TEMPLATE/<<<TRACE_JSON>>>/$(_summarise_trace "$trace_json")}"
+```
+
+A long trace (100KB ≈ 25K tokens at Sonnet) vs a 500-token summary saves
+24,500 tokens × $3/M = **$0.074 per long trace**. At 10% long-trace rate:
+- **$0.007 per run · $7/1K-runs · $7,000/1M-runs**
+
+---
+
+## C-012 · Reflection Pipeline Has No Batch-Size Guard
+
+**File:** `lib/reflection_pipeline.sh:31-53`
+**Effort:** S
+
+`reflection_extract_gradients` queries ALL traces since `since_ts` with no LIMIT.
+At 100K runs/day, a single hourly reflection call attempts to process ~4,167 traces.
+The loop is synchronous — one gradient_extract at a time — blocking for hours.
+
+```sql
+-- BEFORE — lib/reflection_pipeline.sh:36-41 (no limit, no processed guard)
+SELECT trace_id FROM execution_traces WHERE created_at >= ? ORDER BY created_at
+
+-- AFTER — batch-size cap + processed marker
+SELECT trace_id FROM execution_traces
+WHERE created_at >= ? AND gradient_extracted = 0
+ORDER BY created_at
+LIMIT ${MINI_ORK_REFLECTION_BATCH_SIZE:-200}
+```
+
+At 4K traces/batch × $0.015/call (Sonnet) = $60/batch without guard.
+With 200-trace cap: $3/batch. Runs 24 batches/day at 100K scale:
+- **$57/batch × 24 = $1,368/day savings at 100K scale**
+- **$1.37/1K-runs · $1,370/1M-runs**
+
+---
+
+## C-013 · No Per-Run Token Telemetry Aggregation
+
+**File:** `lib/cache.sh:166-177`
+**Effort:** M
+
+`mo_cache_costline_from_log` captures `total_cost_usd` per stage but emits no
+per-tier token breakdown. Without `input_tokens`, `output_tokens`,
+`cache_read_input_tokens` aggregated per node-type, there is no way to:
+(a) verify whether `--exclude-dynamic-system-prompt-sections` is achieving
+the expected 70% prefix cache-hit ratio; (b) detect model-tier misrouting.
+
+```bash
+# AFTER — extend mo_cache_costline_from_log to emit token breakdown
+mo_cache_costline_from_log() {
+  local log_path="$1"
+  grep '"type":"result"' "$log_path" 2>/dev/null | tail -1 | jq -r '
+    [(.total_cost_usd // 0), (.num_turns // 0), (.duration_ms // 0),
+     (.usage.input_tokens // 0), (.usage.output_tokens // 0),
+     (.usage.cache_read_input_tokens // 0),
+     (.usage.cache_creation_input_tokens // 0)] | @tsv' | tr '\t' ' '
+}
+```
+
+Indirect enabler: once token telemetry is visible, operators can cut 10–15%
+of spend by tuning per-node budgets based on actual usage.
+- **Indirect: unlocks $10–$150/1K-runs in targeted cuts once visible**
+
+---
+
+## C-014 · `--include-partial-messages` Always On — 3–5× Log Volume Inflation
+
+**File:** `bin/_worker-launcher.sh:347-349`
+**Effort:** S
+
+`--include-partial-messages` emits every token chunk as a partial JSON event,
+inflating log files 3–5× versus final-only output. At 100K runs/day × 500KB
+average final log × 4× partial factor = 200GB/day of log write overhead.
+
+```bash
+# BEFORE — _worker-launcher.sh:347 (always on)
+--include-partial-messages \
+
+# AFTER — enable only for debug mode
+local _partial=()
+[ "${MO_DEBUG:-0}" = "1" ] && _partial=(--include-partial-messages)
+claude -p \
+  --output-format stream-json \
+  "${_partial[@]}" \
+```
+
+No LLM cost savings; reduces disk I/O and storage cost.
+- **$0 LLM savings · ~$200/day storage at 100K scale ($0.02/GB) per 200GB/day reduction**
+
+---
+
+## Summary — Ranked by (Savings × Ease) / Effort
+
+| ID | Finding | $/1K-runs saved | $/1M-runs saved | Effort |
+|----|---------|----------------|----------------|--------|
+| C-009 | Context pack 64K budget uncapped | $120–$960 | $120K–$960K | M |
+| C-008 | No Haiku tier for short-output tasks | $138 | $138,000 | M |
+| C-002 | Gradient O(N) calls, no idempotency | $135 | $135,000 | M |
+| C-003 | Cascading model override in providers | $52 | $52,000 | S |
+| C-012 | Reflection: no batch-size guard | $1.37 | $1,370/day at scale | S |
+| C-001 | Prompt caching not in mo_llm_dispatch | $36 | $36,000 | S |
+| C-004 | Session cache wired to only 2 stages | $38 | $38,000 | M |
+| C-007 | max_turns=60 for all node types | $7.50 | $7,500 | S |
+| C-011 | Full trace JSON in gradient prompt | $7 | $7,000 | S |
+| C-010 | Reviewer on empty implementer output | $6 | $6,000 | S |
+| C-006 | python3 per model-resolution call | $0 direct | $500 compute | S |
+| C-005 | Budget cap in agents.yaml not enforced | $0 normal | Runaway risk | M |
+| C-013 | No per-run token telemetry | indirect | $10–150K unlocked | M |
+| C-014 | --include-partial-messages always on | $0 LLM | $200/day storage | S |
+
+### Quick-Win Stack (all S-effort, total ~8h work)
+
+Apply C-003 + C-001 + C-007 + C-010 + C-011 + C-012 in one PR:
+- **Combined saving: ~$240/1K-runs with no architectural changes**
+
+### Architectural Findings (for 10M/day scale)
+
+**arch-1 — Model-Tier Router:** Replace the static `agents.yaml` lane assignments
+with a lightweight pre-call complexity classifier (rule-based or single Haiku call).
+Route `low` complexity → Haiku, `medium` → Sonnet, `high`/`critical` → Opus.
+The complexity signal is available in `context_pack.known_failure_modes.length`
+and `context_pack.prior_similar_runs[*].status`. Estimated 60–80% reduction in
+Opus usage. **Saves ~$0.80 per run at full Opus-reviewer baseline · $800/1K-runs.**
+
+**arch-2 — Semantic Cache Layer:** `lib/cache.sh` uses exact SHA-256 hash matching.
+Two kickoffs differing only by comment or whitespace produce a cache miss. At 10M
+scale, near-identical tasks (batch feature development) pay full LLM cost on every
+variant. Add a semantic similarity layer (embedding hash + cosine threshold > 0.95
+= cache hit). Requires `embedding_hash` column + local vector store or Redis.
+**Estimated 30–50% hit rate on similar tasks at 10M scale.**
+
+**arch-3 — Batch Gradient Extraction:** Change `gradient_extract(trace_id)` →
+`gradient_extract_batch(trace_ids[])`. Pack N trace summaries into one user turn;
+parse `{trace_id: gradients[]}` response. 100 traces → 1 call.
+**Saves ~90% of reflection LLM cost above 1K-runs scale.**
+
+---
+
+### What Is Already Correct
+
+- **`mo_emit_cache_flags` infrastructure** (`lib/lane-helpers.sh:71-78`) is the
+  right mechanism; it just needs broader adoption (C-001).
+- **`mini_orch_sessions` schema** (`lib/cache.sh`) is well-designed with TTL,
+  GC, reuse counter, and `dollars_saved` view. No schema changes needed.
+- **`mo_lane_is_free`** (`lib/lane-helpers.sh:17-23`) correctly suppresses
+  `--max-budget-usd` on free-tier lanes (glm/kimi/minimax) — prevents "budget
+  exceeded" errors on non-Anthropic providers.
+- **Per-stage budget caps** (`MO_REFLECTION_BUDGET_USD=0.40`,
+  `MO_RUBRIC_BUDGET_USD=0.60`, `MO_MUTATION_BUDGET_USD=1.20`) are sensible
+  defaults with env-var overrides — better than no cap at all.
+- **`deepseek → glm` alias** (`_worker-launcher.sh:46`) provides one-hop
+  fallback. Extending to two hops (glm → kimi → minimax on quota/auth failure)
+  would harden availability without changing cost.

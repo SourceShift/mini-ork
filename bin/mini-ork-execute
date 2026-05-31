@@ -167,6 +167,45 @@ elif [ -n "$WORKFLOW" ] && [ -f "$WORKFLOW" ] && command -v yq >/dev/null 2>&1; 
   DISPATCH_MODE=$(yq e '.dispatch_mode // "serial"' "$WORKFLOW" 2>/dev/null || echo "serial")
 fi
 
+# D-022: per-node cost charge helper. Increments task_runs.cost_usd by
+# $0.01 placeholder after each successful LLM call. Real claude
+# --output-format json cost extraction lands in v0.2.1.
+_d022_charge_node_cost() {
+  [ "$DRY_RUN" -eq 1 ] && return 0
+  [ -z "${MINI_ORK_DB:-}" ] && return 0
+  [ -z "${MINI_ORK_RUN_ID:-}" ] && return 0
+  [ ! -f "$MINI_ORK_DB" ] && return 0
+  python3 -c "
+import sqlite3, sys, time
+con = sqlite3.connect(sys.argv[1])
+con.execute('PRAGMA journal_mode=WAL')
+try:
+    con.execute('UPDATE task_runs SET cost_usd = COALESCE(cost_usd,0) + 0.01, updated_at = ? WHERE id = ?', (int(time.time()), sys.argv[2]))
+    con.commit()
+finally:
+    con.close()
+" "$MINI_ORK_DB" "$MINI_ORK_RUN_ID" 2>/dev/null || true
+}
+
+# D-021: status transition helper. Updates task_runs.status at phase boundaries.
+_d021_set_status() {
+  local _new_status="$1"
+  [ "$DRY_RUN" -eq 1 ] && return 0
+  [ -z "${MINI_ORK_DB:-}" ] && return 0
+  [ -z "${MINI_ORK_RUN_ID:-}" ] && return 0
+  [ ! -f "$MINI_ORK_DB" ] && return 0
+  python3 -c "
+import sqlite3, sys, time
+con = sqlite3.connect(sys.argv[1])
+con.execute('PRAGMA journal_mode=WAL')
+try:
+    con.execute('UPDATE task_runs SET status = ?, updated_at = ? WHERE id = ?', (sys.argv[3], int(time.time()), sys.argv[2]))
+    con.commit()
+finally:
+    con.close()
+" "$MINI_ORK_DB" "$MINI_ORK_RUN_ID" "$_new_status" 2>/dev/null || true
+}
+
 _dispatch_node() {
   local node_id="$1" node_type="$2" node_desc="$3"
 
@@ -197,7 +236,16 @@ _dispatch_node() {
     researcher)
       _require_lib llm-dispatch
       [ -f "${PROMPT_FILE:-}" ] || PROMPT_FILE="$MINI_ORK_ROOT/prompts/researcher.md"
-      CONTEXT_FILE="$RUN_DIR/context-${node_id}.json"
+      # D-020: if recipe has a `lens-completeness.sh`-style verifier expecting
+      # lens-*.md files, write markdown not JSON. Heuristic: node_id ending
+      # in `_lens` or `-lens` → output as lens-<short>.md (matching the
+      # recipe's verifier glob). Otherwise default JSON context shape.
+      local _norm_id="${node_id%_lens}"; _norm_id="${_norm_id%-lens}"
+      if [[ "$node_id" == *_lens || "$node_id" == *-lens ]]; then
+        CONTEXT_FILE="$RUN_DIR/lens-${_norm_id}.md"
+      else
+        CONTEXT_FILE="$RUN_DIR/context-${node_id}.json"
+      fi
       # Assemble context from plan + kickoff
       PLAN_CONTENT=$(cat "$PLAN_PATH")
       PROMPT_CONTENT="Task: ${node_desc}\n\nPlan context:\n${PLAN_CONTENT}"
@@ -206,8 +254,11 @@ _dispatch_node() {
         --node-type "researcher" \
         --prompt-text "$PROMPT_CONTENT" 2>&1) || { echo "researcher dispatch failed" >&2; return 1; }
       echo "$RESULT" > "$CONTEXT_FILE"
-      echo "  [ok] researcher context → $CONTEXT_FILE"
+      echo "  [ok] researcher output → $CONTEXT_FILE"
       trace_write "{\"trace_id\":\"$NODE_TRACE_ID\",\"task_class\":\"${TASK_CLASS}\",\"status\":\"success\",\"final_artifact_ref\":\"${CONTEXT_FILE}\"}" >/dev/null 2>&1 || true
+      # D-022: charge per-node cost. Placeholder $0.01/node until v0.2.1
+      # extracts real claude --output-format json cost.
+      _d022_charge_node_cost
       ;;
 
     implementer)
@@ -228,7 +279,13 @@ _dispatch_node() {
     reviewer)
       _require_lib llm-dispatch
       [ -f "${PROMPT_FILE:-}" ] || PROMPT_FILE="$MINI_ORK_ROOT/prompts/reviewer.md"
-      REVIEW_FILE="$RUN_DIR/review-${node_id}.json"
+      # D-020: synthesizer-style reviewers (node_id contains "synth") write
+      # synthesis.md (the recipe's expected artifact) instead of review-*.json.
+      if [[ "$node_id" == *synth* ]]; then
+        REVIEW_FILE="$RUN_DIR/synthesis.md"
+      else
+        REVIEW_FILE="$RUN_DIR/review-${node_id}.json"
+      fi
       PLAN_CONTENT=$(cat "$PLAN_PATH")
       PROMPT_CONTENT="Review the implementation for: ${node_desc}\n\nPlan:\n${PLAN_CONTENT}\n\nRespond with JSON: {\"verdict\": \"pass|fail|needs_revision\", \"notes\": []}"
       RESULT=$(llm_dispatch \
@@ -239,6 +296,7 @@ _dispatch_node() {
       VERDICT=$(echo "$RESULT" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('verdict','unknown'))" 2>/dev/null || echo "unknown")
       echo "  [ok] reviewer verdict=${VERDICT} → $REVIEW_FILE"
       trace_write "{\"trace_id\":\"$NODE_TRACE_ID\",\"task_class\":\"${TASK_CLASS}\",\"status\":\"success\",\"reviewer_verdict\":\"${VERDICT}\"}" >/dev/null 2>&1 || true
+      _d022_charge_node_cost
       ;;
 
     verifier)
@@ -270,12 +328,26 @@ print(outputs[0] if outputs else '')
       fi
       bash "$AUTO_MERGE" || { echo "publisher: auto-merge failed" >&2; return 1; }
       echo "  [ok] publisher: auto-merge complete"
+      # D-021: transition to 'published' on successful publisher dispatch.
+      _d021_set_status "published"
       ;;
 
     rollback)
+      # D-019 fix: version_registry.sh exposes version_rollback() (snake_case),
+      # not a binary called `version_registry`. Source the lib + call the
+      # function with the correct kind+name signature.
       _require_lib version_registry
-      version_registry rollback || { echo "rollback: version_registry rollback failed" >&2; return 1; }
-      echo "  [ok] rollback complete"
+      # Best-effort rollback: try workflow first, then agent; succeed if either
+      # finds a previous_stable to revert to. No-op silently if no version exists.
+      if declare -f version_rollback >/dev/null; then
+        version_rollback workflow "${MINI_ORK_RECIPE:-default}" 2>/dev/null \
+          || version_rollback agent default 2>/dev/null \
+          || echo "  [ok] rollback: nothing to revert (no prior promoted version)" >&2
+        echo "  [ok] rollback complete"
+      else
+        echo "rollback: version_rollback function not found in lib/version_registry.sh" >&2
+        return 1
+      fi
       ;;
 
     *)
@@ -290,6 +362,9 @@ echo "    plan:     $PLAN_PATH"
 echo "    dispatch: $DISPATCH_MODE"
 echo "    filter:   ${FILTER_NODE_TYPE:-all}"
 echo ""
+
+# D-021: status='executing' as we enter the dispatch loop.
+_d021_set_status "executing"
 
 FAIL_COUNT=0
 
@@ -356,6 +431,8 @@ fi
 if [ "$FAIL_COUNT" -gt 0 ]; then
   echo "" >&2
   echo "execute: ${FAIL_COUNT} node(s) failed" >&2
+  # D-021: failure status transition (overrides any 'reviewing' from D-009 block)
+  _d021_set_status "failed"
   exit 1
 fi
 

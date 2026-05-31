@@ -191,6 +191,39 @@ the LLM emits NO braces at all (pure prose) or unmatched braces. Stronger
 fix: use Anthropic tool_use forced-structured-output (deferred to v0.2.1)
 OR retry the plan call with a stronger "JSON ONLY" instruction.
 
+### DF6 retry — first full-execute traversal (5 new findings)
+
+Re-ran after v0.2-pt4 (D-016 balanced-brace + D-017 enum-strict-prompt).
+DF6 was the FIRST cycle where the framework completed the full execute
+path: 4 researcher lens dispatches + 1 reviewer synthesizer (5 real LLM
+calls, ~27 min wall, est ~$0.50-1.50). Findings concentrated in the
+never-before-exercised verifier + rollback + status code paths.
+
+| ID | Title | Source | Fix sketch | Effort |
+|---|---|---|---|---|
+| **D-018** | Planner emits NATURAL-LANGUAGE SENTENCES in `success_verifiers` array (e.g. "All 4 lens-*.md files exist..."); execute treats each as a script-name lookup → all 7 failed with `[warn] verifier script not found:` | DF6 dogfood | Planner prompt: constrain `success_verifiers` to filenames matching `verifiers/*.sh` (point at recipe's actual verifier scripts); execute: reject natural-language entries with explicit error | 30 min |
+| **D-019** | Rollback node tries `version_registry rollback` as bash command; fails `command not found` because version_registry is a SOURCED FUNCTION in lib/version_registry.sh, not a binary on $PATH | DF6 dogfood | execute: source `$MINI_ORK_ROOT/lib/version_registry.sh` before calling rollback; OR refactor rollback to call `mini-ork promote --rollback <run-id>` | 15 min |
+| **D-020** | Execute writes researcher lens output as `context-{name}.json` but recipe `verifiers/lens-completeness.sh` expects `lens-{name}.md` files. Output filename + format mismatch — verifier never sees the lens reports the framework JUST PRODUCED | DF6 dogfood | execute: when node has type=researcher AND recipe has `verifiers/lens-completeness.sh`, write output as `lens-{node_id}.md` (markdown) not `context-{node_id}.json`. Recipe authors signal format via workflow.yaml `output_format: markdown\|json` hint | 45 min |
+| **D-021** | `task_runs.status` stuck at 'planned' through entire execute lifecycle. Should transition: planned → executing → verifying → reviewing → published OR failed. Currently the field is set ONCE by plan, never updated by execute/verify/publish | DF6 dogfood | execute: UPDATE task_runs.status at each phase boundary; verify: UPDATE on completion; publisher: UPDATE to 'published' on success | 30 min |
+| **D-022** | Per-node LLM cost not charged. DF6 fired 5 real LLM calls (4 lens + 1 synthesizer) but `task_runs.cost_usd` stayed at $0.05 (the D-009 plan-step placeholder). Each dispatched node should increment cost via D-009-shape UPDATE | DF6 dogfood | execute: after each successful `llm_dispatch`-via-shim call, UPDATE task_runs.cost_usd += $0.01 placeholder (D-009 shape); real cost extraction is v0.2.1 | 20 min |
+
+**Convergence trajectory update — DF6 SPIKE explained:**
+
+| Pass | Cycle | New findings | Phase boundary crossed |
+|---|---|---:|---|
+| 1 | Agent-tool | 31 | baseline |
+| 2 | DF1 | +4 | classify+plan reached |
+| 3 | DF2 | +2 | plan rejection surface |
+| 4 | DF3 | +2 | shim observability surface |
+| 5 | DF4 | +1 | forensics-discovery confirmed |
+| 6 | DF5 | +2 | root cause D-016 + recipe D-017 |
+| **7** | **DF6** | **+5** | **first full execute traversal — new code regions opened (verifier/rollback/status/cost wiring)** |
+| Projected DF7 v0.2-pt5 | | 1-3 | verifier+rollback+status fixes should produce convergence on those paths |
+
+DF6 SPIKE is not a regression — it's expected when the framework crosses a
+phase boundary into a previously-unexercised code region. v0.2 P1 bucket
+now 22 items; 12 closed.
+
 **The recursive pattern IS the framework's strongest design proof.**
 Each retry exercises a deeper code path; each newly-surfaced gap is
 real-world evidence that static analysis missed. The framework is
