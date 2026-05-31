@@ -115,20 +115,28 @@ if [ "$DRY_RUN" -eq 0 ]; then
 fi
 
 # ── find verifier script ───────────────────────────────────────────────────────
+# D-026: planner emits `verifiers/lens-completeness.sh` per recipe planner
+# prompt (D-018), but legacy `_find_verifier_script` appended `.sh` to the
+# raw name, producing `verifiers/lens-completeness.sh.sh` — never found.
+# Normalize: strip leading `verifiers/` prefix + trailing `.sh` suffix, then
+# look up `{recipe-or-home-or-root}/verifiers/{stem}.sh`.
 _find_verifier_script() {
-  local name="$1"
+  local raw="$1"
+  local stem="$raw"
+  stem="${stem#verifiers/}"
+  stem="${stem%.sh}"
   local script=""
 
   # 1. Recipe-level
   if [ -n "${MINI_ORK_RECIPE:-}" ]; then
-    script="$MINI_ORK_ROOT/recipes/${MINI_ORK_RECIPE}/verifiers/${name}.sh"
+    script="$MINI_ORK_ROOT/recipes/${MINI_ORK_RECIPE}/verifiers/${stem}.sh"
     [ -f "$script" ] && { echo "$script"; return; }
   fi
   # 2. Project-level (user-supplied)
-  script="$MINI_ORK_HOME/verifiers/${name}.sh"
+  script="$MINI_ORK_HOME/verifiers/${stem}.sh"
   [ -f "$script" ] && { echo "$script"; return; }
   # 3. Framework-level
-  script="$MINI_ORK_ROOT/verifiers/${name}.sh"
+  script="$MINI_ORK_ROOT/verifiers/${stem}.sh"
   [ -f "$script" ] && { echo "$script"; return; }
 
   echo ""
