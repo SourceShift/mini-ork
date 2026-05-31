@@ -29,6 +29,11 @@ _MO_DB="${MINI_ORK_DB:-${MINI_ORK_HOME:-.mini-ork}/state.db}"
 # CREATE IF NOT EXISTS lets installs that haven't run the migration runner
 # still get the right shape. Idempotent.
 mo_runs_ensure_schema() {
+  # v0.2-pt10 G-003 DDL session guard: was the highest-leverage offender
+  # per audit F-01 ("300K wasted sqlite3 forks/day at 100K dispatch volume
+  # for schema checks that are always no-ops after the first call").
+  # 3 sqlite3 forks per call × every mo_runs_open invocation.
+  [ "${_MO_RUNS_SCHEMA_INIT:-0}" = "1" ] && return 0
   for col in claude_session_id zellij_session_name; do
     sqlite3 "$_MO_DB" \
       "ALTER TABLE runs ADD COLUMN $col TEXT;" 2>/dev/null || true
@@ -56,6 +61,8 @@ mo_runs_ensure_schema() {
     CREATE INDEX IF NOT EXISTS idx_orch_dispatches_status  ON orch_dispatches(status);
     CREATE INDEX IF NOT EXISTS idx_orch_dispatches_session ON orch_dispatches(claude_session_id);
   " 2>/dev/null || true
+  _MO_RUNS_SCHEMA_INIT=1
+  export _MO_RUNS_SCHEMA_INIT
 }
 
 # Best-effort lookup of the Claude session UUID for the zellij session
