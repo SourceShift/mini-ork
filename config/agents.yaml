@@ -6,23 +6,29 @@
 #
 # Override per-project at $MINI_ORK_HOME/config/agents.yaml.
 lanes:
+  # v0.2-pt8 (D-02): downgrade Opus → Sonnet on roles where audit
+  # consensus said Opus was overkill. Kept Opus on reviewer/spec_reviewer/
+  # brain (these need cross-model dissent + final verdict quality).
+  # Planner/reflector/healer downgraded — Codex math: ~$12K-18K/day
+  # saved at 100K runs scale.
+  #
   # Canonical loop-role lanes — used by most generic recipes including code-fix.
-  planner: opus
+  planner: sonnet         # was opus — D-02 v0.2-pt8 downgrade
   researcher: sonnet
   implementer: sonnet
   worker: sonnet          # alias for implementer in workflows that use generic "worker"
-  reviewer: opus
+  reviewer: opus          # keep opus — final verdict quality
   verifier: sonnet
-  reflector: opus
+  reflector: sonnet       # was opus — D-02 v0.2-pt8 downgrade (pattern-extraction, not creative)
   publisher: sonnet
   rollback: sonnet
   # Stage-specific lanes — used by multi-stage recipes such as bdd-first-delivery.
   decomposer: deepseek
   spec_author: sonnet
-  spec_reviewer: opus
+  spec_reviewer: opus     # keep opus — cross-model dissent
   bdd_runner: sonnet
-  healer: opus
-  brain: opus
+  healer: sonnet          # was opus — D-02 v0.2-pt8 downgrade (recovery patterns, not arch)
+  brain: opus             # keep opus — orchestration-level decisions
   # Legacy aliases for backward-compat with v0.0-shape pipelines.
   worker_default: sonnet
   reviewer_default: opus
