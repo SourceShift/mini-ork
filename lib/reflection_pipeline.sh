@@ -28,12 +28,18 @@ reflection_extract_gradients() {
   source "${MINI_ORK_ROOT}/lib/trace_store.sh" 2>/dev/null || true
 
   local trace_ids
-  trace_ids="$(python3 - "${MINI_ORK_DB:?MINI_ORK_DB unset}" "$since_ts" <<'PY'
+  # v0.2-pt7 (R6/F-17): bounded fetchall — unbounded SELECT * FROM
+  # execution_traces with no LIMIT was an O(N) memory bomb at 10M
+  # rows/day. Default cap MO_REFLECTION_BATCH=500 traces/run; rerun
+  # reflection_extract_gradients with newer since_ts to process more.
+  local _batch="${MO_REFLECTION_BATCH:-500}"
+  trace_ids="$(python3 - "${MINI_ORK_DB:?MINI_ORK_DB unset}" "$since_ts" "$_batch" <<'PY'
 import sqlite3, json, sys
 con = sqlite3.connect(sys.argv[1])
+con.execute("PRAGMA busy_timeout=5000")  # v0.2-pt7 F-11
 rows = con.execute(
-    "SELECT trace_id FROM execution_traces WHERE created_at >= ? ORDER BY created_at",
-    (int(sys.argv[2]),)
+    "SELECT trace_id FROM execution_traces WHERE created_at >= ? ORDER BY created_at LIMIT ?",
+    (int(sys.argv[2]), int(sys.argv[3]))
 ).fetchall()
 con.close()
 for r in rows:
@@ -59,16 +65,23 @@ PY
 #       keeping highest confidence). gradients_table defaults to "gradient_records".
 reflection_deduplicate() {
   local gradients_table="${1:-gradient_records}"
-  python3 - "${MINI_ORK_DB:?MINI_ORK_DB unset}" "$gradients_table" <<'PY'
+  # v0.2-pt7 (R6/F-18): bounded fetchall to prevent OOM at 10M+ rows.
+  # Default cap MO_DEDUP_BATCH=10000; oldest-first ordering ensures
+  # repeated runs eventually process the whole table without OOM.
+  local _batch="${MO_DEDUP_BATCH:-10000}"
+  python3 - "${MINI_ORK_DB:?MINI_ORK_DB unset}" "$gradients_table" "$_batch" <<'PY'
 import sqlite3, json, sys
-db, tbl = sys.argv[1], sys.argv[2]
+db, tbl, batch = sys.argv[1], sys.argv[2], int(sys.argv[3])
 con = sqlite3.connect(db)
+con.execute("PRAGMA busy_timeout=5000")  # v0.2-pt7 F-11
 # Find duplicate (target, signal) groups — keep highest confidence row.
+# LIMIT prevents O(table) memory bomb; repeated runs process all rows.
 rows = con.execute(f"""
     SELECT gradient_id, target, signal, suggested_change, confidence, evidence
     FROM {tbl}
     ORDER BY target, signal, confidence DESC
-""").fetchall()
+    LIMIT ?
+""", (batch,)).fetchall()
 
 seen = {}
 to_delete = []

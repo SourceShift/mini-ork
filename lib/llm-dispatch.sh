@@ -153,6 +153,32 @@ llm_dispatch() {
     esac
   done
 
+  # v0.2-pt7 (R10): cost circuit breaker. Check accumulated daily spend
+  # against MO_DAILY_BUDGET_USD before dispatching. Default cap: $50/day.
+  # Returns non-zero with `[cost_circuit_open]` marker if exceeded so the
+  # caller's $? check trips, halting the run gracefully.
+  if [ -n "${MINI_ORK_DB:-}" ] && [ -f "${MINI_ORK_DB:-}" ]; then
+    local _budget="${MO_DAILY_BUDGET_USD:-50}"
+    local _spent_today
+    _spent_today=$(python3 -c "
+import sqlite3, sys, time
+con = sqlite3.connect(sys.argv[1])
+con.execute('PRAGMA busy_timeout=5000')
+cutoff = int(time.time()) - 86400
+try:
+    row = con.execute('SELECT COALESCE(SUM(cost_usd),0) FROM task_runs WHERE created_at >= ?', (cutoff,)).fetchone()
+    print(f'{row[0]:.4f}')
+except sqlite3.OperationalError:
+    print('0')
+finally:
+    con.close()
+" "$MINI_ORK_DB" 2>/dev/null || echo "0")
+    if python3 -c "import sys; sys.exit(0 if float('$_spent_today') >= float('$_budget') else 1)" 2>/dev/null; then
+      echo "[cost_circuit_open] spent_today=\$$_spent_today budget=\$$_budget — halting dispatch" >&2
+      return 42
+    fi
+  fi
+
   # Resolve model: explicit override > agents.yaml lane lookup > env default > sonnet
   local model="${model_override:-${MINI_ORK_DEFAULT_MODEL:-sonnet}}"
   if [ -z "$model_override" ] && [ -n "$node_type" ]; then
