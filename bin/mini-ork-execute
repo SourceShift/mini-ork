@@ -101,6 +101,12 @@ fi
 
 # ── parse plan ────────────────────────────────────────────────────────────────
 RUN_DIR="$(dirname "$PLAN_PATH")"
+
+# D-031: propagate run dir to subagent subshells so claude `--print` calls
+# can find $MINI_ORK_RUN_DIR when writing lens-*.md / synthesis.md via Write
+# tool. Without this, subagents pick their own (often stale) run dir based
+# on filesystem scan, breaking the recipe's expected artifact layout.
+export MINI_ORK_RUN_DIR="$RUN_DIR"
 TASK_CLASS=$(python3 -c "
 import sys, json
 with open(sys.argv[1]) as f:
@@ -117,6 +123,10 @@ print(p.get('task_class', 'generic'))
 NODE_SOURCE=""
 if [ -n "${WORKFLOW:-}" ] && [ -f "${WORKFLOW:-}" ]; then
   NODE_SOURCE="workflow.yaml"
+  # D-024: emit per-node dispatch_mode as 5th field so we can run nodes
+  # marked `dispatch_mode: parallel` concurrently (was: all nodes ran
+  # under single global DISPATCH_MODE, so workflow-yaml-marked-parallel
+  # nodes ran serially anyway — 4 lens took 15min instead of 5min).
   mapfile -t NODE_IDS < <(python3 - "$WORKFLOW" <<'PY'
 import sys, yaml
 with open(sys.argv[1]) as f:
@@ -126,12 +136,13 @@ for n in wf.get("nodes", []) or []:
     typ  = n.get("type", "")
     desc = n.get("description", "") or name
     pref = n.get("prompt_ref", "") or ""
+    dmode = n.get("dispatch_mode", "") or "serial"
     if not name or not typ:
         continue
     # Strip any tabs from user fields (separator collision)
     desc = desc.replace("\t", " ")
     pref = pref.replace("\t", " ")
-    print(f"{name}\t{typ}\t{desc}\t{pref}")
+    print(f"{name}\t{typ}\t{desc}\t{pref}\t{dmode}")
 PY
   )
 else
@@ -146,7 +157,7 @@ for step in p.get("decomposition", []):
     if not nid or not ntyp:
         continue
     desc = (step.get('description','') or '').replace("\t"," ")
-    print(f"{nid}\t{ntyp}\t{desc}\t")
+    print(f"{nid}\t{ntyp}\t{desc}\t\tserial")
 PY
   )
 fi
@@ -207,7 +218,7 @@ finally:
 }
 
 _dispatch_node() {
-  local node_id="$1" node_type="$2" node_desc="$3"
+  local node_id="$1" node_type="$2" node_desc="$3" node_prompt_ref="${4:-}"
 
   if [ -n "$FILTER_NODE_TYPE" ] && [ "$node_type" != "$FILTER_NODE_TYPE" ]; then
     return 0
@@ -220,10 +231,25 @@ _dispatch_node() {
 
   echo "==> dispatch node_id=${node_id} type=${node_type}"
 
-  # Locate recipe prompt for this node type
+  # Locate recipe prompt for this node.
+  # D-030: prefer per-node `prompt_ref` from workflow.yaml (e.g. recipe's
+  # `prompts/synthesis.md` for the synthesizer node), fall back to type-
+  # default (`prompts/${node_type}.md`).  Resolves the reviewer-vs-
+  # synthesizer node-type collapse where reviewer hard-coded a
+  # `Review the implementation` envelope and ignored the recipe's
+  # synthesis prompt entirely.
   RECIPE_DIR=""
   [ -n "${MINI_ORK_RECIPE:-}" ] && RECIPE_DIR="$MINI_ORK_ROOT/recipes/${MINI_ORK_RECIPE}"
-  PROMPT_FILE="${RECIPE_DIR:+$RECIPE_DIR/prompts/${node_type}.md}"
+  PROMPT_FILE=""
+  if [ -n "$node_prompt_ref" ] && [ -n "$RECIPE_DIR" ]; then
+    # prompt_ref is recipe-relative (e.g. "prompts/synthesis.md")
+    local _candidate="$RECIPE_DIR/$node_prompt_ref"
+    [ -f "$_candidate" ] && PROMPT_FILE="$_candidate"
+  fi
+  if [ -z "$PROMPT_FILE" ] && [ -n "$RECIPE_DIR" ]; then
+    local _default="$RECIPE_DIR/prompts/${node_type}.md"
+    [ -f "$_default" ] && PROMPT_FILE="$_default"
+  fi
 
   NODE_TRACE_ID="tr-${node_type}-$(date +%s)-$$"
 
@@ -246,15 +272,38 @@ _dispatch_node() {
       else
         CONTEXT_FILE="$RUN_DIR/context-${node_id}.json"
       fi
-      # Assemble context from plan + kickoff
+      # D-030: prepend recipe prompt as system context so lens-specific
+      # instructions (which stance, output format, finding-count target)
+      # actually reach the model. Without this, all 4 researcher nodes
+      # received the same generic Task/Plan prompt — lens differentiation
+      # came only from node_desc.
+      local _prepend=""
+      if [ -f "${PROMPT_FILE:-}" ]; then
+        _prepend=$'\n\n--- Recipe prompt (system context) ---\n'"$(cat "$PROMPT_FILE")"$'\n--- /recipe prompt ---\n\n'
+      fi
       PLAN_CONTENT=$(cat "$PLAN_PATH")
-      PROMPT_CONTENT="Task: ${node_desc}\n\nPlan context:\n${PLAN_CONTENT}"
+      PROMPT_CONTENT="${_prepend}Task: ${node_desc}\n\nPlan context:\n${PLAN_CONTENT}\n\nWrite your output to: ${CONTEXT_FILE}"
       RESULT=$(llm_dispatch \
         --task-class "$TASK_CLASS" \
         --node-type "researcher" \
         --prompt-text "$PROMPT_CONTENT" 2>&1) || { echo "researcher dispatch failed" >&2; return 1; }
-      echo "$RESULT" > "$CONTEXT_FILE"
-      echo "  [ok] researcher output → $CONTEXT_FILE"
+      # D-033: preserve agent's tool-call Writes — if agent wrote real
+      # content via Write/Edit to $CONTEXT_FILE, don't clobber it with
+      # the orchestrator's STDOUT capture (which is just the handoff
+      # summary). Heuristic: agent-Write file is typically 5-50x larger
+      # than the STDOUT summary. Compare sizes; if file already bigger,
+      # skip the echo + dump STDOUT to {CONTEXT_FILE}.stdout.md as
+      # forensics.
+      local _result_bytes="${#RESULT}"
+      local _existing_bytes=0
+      [ -f "$CONTEXT_FILE" ] && _existing_bytes=$(wc -c < "$CONTEXT_FILE" | tr -d ' ')
+      if [ "$_existing_bytes" -gt "$_result_bytes" ] && [ "$_existing_bytes" -gt 512 ]; then
+        echo "  [ok] preserving agent Write at $CONTEXT_FILE ($_existing_bytes bytes; STDOUT $_result_bytes → ${CONTEXT_FILE}.stdout.md)"
+        echo "$RESULT" > "${CONTEXT_FILE}.stdout.md"
+      else
+        echo "$RESULT" > "$CONTEXT_FILE"
+        echo "  [ok] researcher output → $CONTEXT_FILE"
+      fi
       trace_write "{\"trace_id\":\"$NODE_TRACE_ID\",\"task_class\":\"${TASK_CLASS}\",\"status\":\"success\",\"final_artifact_ref\":\"${CONTEXT_FILE}\"}" >/dev/null 2>&1 || true
       # D-022: charge per-node cost. Placeholder $0.01/node until v0.2.1
       # extracts real claude --output-format json cost.
@@ -266,7 +315,11 @@ _dispatch_node() {
       [ -f "${PROMPT_FILE:-}" ] || PROMPT_FILE="$MINI_ORK_ROOT/prompts/implementer.md"
       IMPL_LOG="$RUN_DIR/impl-${node_id}.log"
       PLAN_CONTENT=$(cat "$PLAN_PATH")
-      PROMPT_CONTENT="Implement: ${node_desc}\n\nPlan:\n${PLAN_CONTENT}"
+      local _prepend=""
+      if [ -f "${PROMPT_FILE:-}" ]; then
+        _prepend=$'\n\n--- Recipe prompt (system context) ---\n'"$(cat "$PROMPT_FILE")"$'\n--- /recipe prompt ---\n\n'
+      fi
+      PROMPT_CONTENT="${_prepend}Implement: ${node_desc}\n\nPlan:\n${PLAN_CONTENT}"
       RESULT=$(llm_dispatch \
         --task-class "$TASK_CLASS" \
         --node-type "implementer" \
@@ -274,6 +327,7 @@ _dispatch_node() {
       echo "$RESULT" > "$IMPL_LOG"
       echo "  [ok] implementer output → $IMPL_LOG"
       trace_write "{\"trace_id\":\"$NODE_TRACE_ID\",\"task_class\":\"${TASK_CLASS}\",\"status\":\"success\",\"final_artifact_ref\":\"${IMPL_LOG}\"}" >/dev/null 2>&1 || true
+      _d022_charge_node_cost
       ;;
 
     reviewer)
@@ -281,18 +335,45 @@ _dispatch_node() {
       [ -f "${PROMPT_FILE:-}" ] || PROMPT_FILE="$MINI_ORK_ROOT/prompts/reviewer.md"
       # D-020: synthesizer-style reviewers (node_id contains "synth") write
       # synthesis.md (the recipe's expected artifact) instead of review-*.json.
+      local _is_synth=0
       if [[ "$node_id" == *synth* ]]; then
         REVIEW_FILE="$RUN_DIR/synthesis.md"
+        _is_synth=1
       else
         REVIEW_FILE="$RUN_DIR/review-${node_id}.json"
       fi
+      # D-030: use recipe's prompt_ref instead of hardcoding a review-style
+      # envelope. The synthesizer needs the recipe's compose-instructions
+      # (read 4 lenses, dedupe findings, rank by ROI, produce Top-10 + scale
+      # timeline) — not "Respond with JSON {verdict}". Previous behavior
+      # collapsed synthesizer into reviewer and produced a meta-review of
+      # the prompt instead of an actual synthesis.
       PLAN_CONTENT=$(cat "$PLAN_PATH")
-      PROMPT_CONTENT="Review the implementation for: ${node_desc}\n\nPlan:\n${PLAN_CONTENT}\n\nRespond with JSON: {\"verdict\": \"pass|fail|needs_revision\", \"notes\": []}"
+      local _prepend=""
+      if [ -f "${PROMPT_FILE:-}" ]; then
+        _prepend=$'\n\n--- Recipe prompt (system context) ---\n'"$(cat "$PROMPT_FILE")"$'\n--- /recipe prompt ---\n\n'
+      fi
+      if [ "$_is_synth" -eq 1 ]; then
+        # Synthesizer: write markdown to synthesis.md; no verdict envelope.
+        PROMPT_CONTENT="${_prepend}Synthesize for: ${node_desc}\n\nPlan:\n${PLAN_CONTENT}\n\nWrite your synthesis to: ${REVIEW_FILE}"
+      else
+        # Classic reviewer: verdict-JSON envelope expected.
+        PROMPT_CONTENT="${_prepend}Review the implementation for: ${node_desc}\n\nPlan:\n${PLAN_CONTENT}\n\nRespond with JSON: {\"verdict\": \"pass|fail|needs_revision\", \"notes\": []}"
+      fi
       RESULT=$(llm_dispatch \
         --task-class "$TASK_CLASS" \
         --node-type "reviewer" \
         --prompt-text "$PROMPT_CONTENT" 2>&1) || { echo "reviewer dispatch failed" >&2; return 1; }
-      echo "$RESULT" > "$REVIEW_FILE"
+      # D-033: same preserve-agent-Write logic as researcher
+      local _result_bytes="${#RESULT}"
+      local _existing_bytes=0
+      [ -f "$REVIEW_FILE" ] && _existing_bytes=$(wc -c < "$REVIEW_FILE" | tr -d ' ')
+      if [ "$_existing_bytes" -gt "$_result_bytes" ] && [ "$_existing_bytes" -gt 512 ]; then
+        echo "  [ok] preserving agent Write at $REVIEW_FILE ($_existing_bytes bytes; STDOUT $_result_bytes → ${REVIEW_FILE}.stdout.md)"
+        echo "$RESULT" > "${REVIEW_FILE}.stdout.md"
+      else
+        echo "$RESULT" > "$REVIEW_FILE"
+      fi
       VERDICT=$(echo "$RESULT" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('verdict','unknown'))" 2>/dev/null || echo "unknown")
       echo "  [ok] reviewer verdict=${VERDICT} → $REVIEW_FILE"
       trace_write "{\"trace_id\":\"$NODE_TRACE_ID\",\"task_class\":\"${TASK_CLASS}\",\"status\":\"success\",\"reviewer_verdict\":\"${VERDICT}\"}" >/dev/null 2>&1 || true
@@ -368,56 +449,81 @@ _d021_set_status "executing"
 
 FAIL_COUNT=0
 
+# D-024: per-node dispatch.  Walk nodes left-to-right; consecutive
+# `parallel` nodes form one batch (& + wait); `serial` nodes flush the
+# batch then run alone.  Global DISPATCH_MODE override (--dispatch-mode
+# flag) forces the choice; otherwise honor per-node `dispatch_mode` from
+# workflow.yaml (5th tab-field).
+_flush_parallel_batch() {
+  local pids_var="$1"
+  local pid
+  # shellcheck disable=SC2086
+  eval "for pid in \"\${${pids_var}[@]}\"; do wait \"\$pid\" || FAIL_COUNT=\$((FAIL_COUNT+1)); done"
+  eval "${pids_var}=()"
+}
+
 case "$DISPATCH_MODE" in
   parallel)
+    # Global override → all in parallel (legacy behavior)
     PIDS=()
     for entry in "${NODE_IDS[@]}"; do
-      IFS=$'\t' read -r node_id node_type node_desc node_prompt_ref <<< "$entry"
-      ( _dispatch_node "$node_id" "$node_type" "$node_desc" ) &
+      IFS=$'\t' read -r node_id node_type node_desc node_prompt_ref node_dmode <<< "$entry"
+      ( _dispatch_node "$node_id" "$node_type" "$node_desc" "$node_prompt_ref" ) &
       PIDS+=($!)
     done
-    for pid in "${PIDS[@]}"; do
-      wait "$pid" || FAIL_COUNT=$((FAIL_COUNT+1))
-    done
+    _flush_parallel_batch PIDS
     ;;
   partitioned)
     # Group by node_type; run groups serially, nodes within group in parallel
     declare -A TYPE_GROUPS
     for entry in "${NODE_IDS[@]}"; do
-      IFS=$'\t' read -r node_id node_type node_desc node_prompt_ref <<< "$entry"
-      TYPE_GROUPS[$node_type]+="${node_id}::${node_type}::${node_desc}"$'\n'
+      IFS=$'\t' read -r node_id node_type node_desc node_prompt_ref node_dmode <<< "$entry"
+      TYPE_GROUPS[$node_type]+="${entry}"$'\n'
     done
     for node_type in planner researcher implementer reviewer verifier reflector publisher rollback; do
       [ -z "${TYPE_GROUPS[$node_type]:-}" ] && continue
       PIDS=()
-      while IFS= read -r entry; do
-        [ -z "$entry" ] && continue
-        IFS='::' read -r node_id nt node_desc <<< "$entry"
-        ( _dispatch_node "$node_id" "$nt" "$node_desc" ) &
+      while IFS= read -r e; do
+        [ -z "$e" ] && continue
+        IFS=$'\t' read -r nid nt nd npr ndm <<< "$e"
+        ( _dispatch_node "$nid" "$nt" "$nd" "$npr" ) &
         PIDS+=($!)
       done <<< "${TYPE_GROUPS[$node_type]}"
-      for pid in "${PIDS[@]}"; do
-        wait "$pid" || FAIL_COUNT=$((FAIL_COUNT+1))
-      done
+      _flush_parallel_batch PIDS
     done
     ;;
   speculative)
-    # Run all in parallel; first success stops remaining (best-effort)
     PIDS=()
     for entry in "${NODE_IDS[@]}"; do
-      IFS=$'\t' read -r node_id node_type node_desc node_prompt_ref <<< "$entry"
-      ( _dispatch_node "$node_id" "$node_type" "$node_desc" ) &
+      IFS=$'\t' read -r node_id node_type node_desc node_prompt_ref node_dmode <<< "$entry"
+      ( _dispatch_node "$node_id" "$node_type" "$node_desc" "$node_prompt_ref" ) &
       PIDS+=($!)
     done
     for pid in "${PIDS[@]}"; do
-      wait "$pid" || true  # speculative: failures are non-fatal
+      wait "$pid" || true
     done
     ;;
   serial|*)
+    # D-024: honor per-node `dispatch_mode: parallel` from workflow.yaml.
+    # Walk in order; batch consecutive `parallel` nodes; flush batch on
+    # any `serial` node, then run that serial node alone.
+    PIDS=()
     for entry in "${NODE_IDS[@]}"; do
-      IFS=$'\t' read -r node_id node_type node_desc node_prompt_ref <<< "$entry"
-      _dispatch_node "$node_id" "$node_type" "$node_desc" || FAIL_COUNT=$((FAIL_COUNT+1))
+      IFS=$'\t' read -r node_id node_type node_desc node_prompt_ref node_dmode <<< "$entry"
+      case "${node_dmode:-serial}" in
+        parallel)
+          ( _dispatch_node "$node_id" "$node_type" "$node_desc" "$node_prompt_ref" ) &
+          PIDS+=($!)
+          ;;
+        *)
+          # Flush any pending parallel batch first
+          [ "${#PIDS[@]}" -gt 0 ] && _flush_parallel_batch PIDS
+          _dispatch_node "$node_id" "$node_type" "$node_desc" "$node_prompt_ref" || FAIL_COUNT=$((FAIL_COUNT+1))
+          ;;
+      esac
     done
+    # Drain any trailing parallel batch
+    [ "${#PIDS[@]}" -gt 0 ] && _flush_parallel_batch PIDS
     ;;
 esac
 

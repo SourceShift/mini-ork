@@ -218,7 +218,38 @@ never-before-exercised verifier + rollback + status code paths.
 | 5 | DF4 | +1 | forensics-discovery confirmed |
 | 6 | DF5 | +2 | root cause D-016 + recipe D-017 |
 | **7** | **DF6** | **+5** | **first full execute traversal — new code regions opened (verifier/rollback/status/cost wiring)** |
-| Projected DF7 v0.2-pt5 | | 1-3 | verifier+rollback+status fixes should produce convergence on those paths |
+| **8** | **DF7** | **+7** | **first cycle producing real 4-lens+synth content → exposed every meta-pipeline defect that partial-execution had masked (env propagation, output routing, prompt resolution, reviewer/synthesizer collapse)** |
+| Projected DF8 v0.2-pt6 | | 1-3 | meta-pipeline fixes (D-024/D-026/D-030/D-031/D-033) should preserve all 4 lens content; new findings only from now-exercised parallel-batching + agent-Write-preservation code |
+
+### DF7 retry — meta-pipeline collapse exposed (7 new findings)
+
+DF7 finally produced actual lens content (`refactor-audit-20260531/lens-glm.md`
+22 KB, 514 lines, 28 findings; `lens-opus.md` 16 KB, 313 lines, 10 numbered Rs).
+But the meta-pipeline (output routing, env propagation, reviewer/synthesizer
+dispatch) revealed deep collapse: kimi+codex real work LOST to STDOUT-overwrite,
+synthesizer ran as meta-reviewer of its own prompt, MINI_ORK_RUN_DIR never
+reached subagents, false-rollback fired. DF7 was simultaneously the
+framework's deepest self-audit AND the cycle that exposed its most
+structural defects.
+
+| ID | Title | Source | Fix sketch | Status |
+|---|---|---|---|---|
+| **D-023** | `llm_dispatch` table doesn't exist (state.db has `llm_calls` instead). D-022 cost-charge writes to task_runs aggregate; no per-call ledger for forensics | DF7 | Rename to llm_calls OR add llm_dispatch alias view | deferred pt-6.5 |
+| **D-024** | Per-node `dispatch_mode: parallel` in workflow.yaml IGNORED — execute reads global DISPATCH_MODE only. 4 lens nodes ran sequentially 15min instead of parallel 5min | DF7 | Parse per-node dispatch_mode (5th tab-field); batch consecutive parallel-marked; flush on serial | **fixed pt-6** |
+| **D-026** | `_find_verifier_script` in mini-ork-verify appends `.sh` to raw name; planner emits `verifiers/lens-completeness.sh` → lookup tries `verifiers/lens-completeness.sh.sh` → never found → false rollback every cycle | DF7 | mini-ork-verify: strip `verifiers/` prefix + `.sh` suffix before lookup | **fixed pt-6** |
+| **D-027** | Rollback fires on verifier-script-NOT-FOUND (env error) — should be NEAR-MISS not rollback trigger. Lost publisher work | DF7 | Distinguish FAILURE from ENV-ERROR; ENV-ERROR → warn+skip not rollback | deferred pt-6.5 |
+| **D-028** | status=failed despite all substantive work succeeding | DF7 | Same fix as D-027 | (with D-027) |
+| **D-029** | Cost $0.10 captured vs real ~$0.50-1.50 (5-15× underbill) | DF7 | v0.2.1: parse claude --output-format json total_cost | deferred v0.2.1 |
+| **D-030** | Reviewer node IGNORES recipe's `prompt_ref`; hardcodes "Review the implementation … Respond with JSON {verdict}". Synthesizer ran as meta-reviewer of its own prompt | DF7 | Honor per-node prompt_ref; for synthesizer (node_id contains "synth"), skip verdict envelope | **fixed pt-6** |
+| **D-031** | MINI_ORK_RUN_DIR env var NOT propagated to subagent subshells — agents pick stale dirs from filesystem scan | DF7 | `export MINI_ORK_RUN_DIR="$RUN_DIR"` before llm_dispatch | **fixed pt-6** |
+| **D-032** | claude `--print --output-format text` captures only STDOUT; agent tool-call Writes invisible to orchestrator's RESULT capture | DF7 | (informational, root for D-033) | (covered by D-033) |
+| **D-033** | Orchestrator overwrites agent tool-call Writes — `echo "$RESULT" > "$CONTEXT_FILE"` clobbers real lens content | DF7 | Before overwriting, check file already exists + larger than RESULT; preserve + dump STDOUT to `{CONTEXT_FILE}.stdout.md` | **fixed pt-6** |
+| **D-034** | No checkpoint/resume. System restart mid-cycle = all in-flight work orphans (status='executing' forever), next invocation starts from scratch | observation | Add `mini-ork resume <run_id>` reading executing-status rows + replaying from artifact-presence check | deferred v0.3 |
+
+**pt-6 fixes 5 of the 11 DF7 findings** (D-024 + D-026 + D-030 + D-031
++ D-033). D-027/D-028 + D-023 to pt-6.5. D-029 to v0.2.1. D-034 to v0.3.
+
+
 
 DF6 SPIKE is not a regression — it's expected when the framework crosses a
 phase boundary into a previously-unexercised code region. v0.2 P1 bucket
