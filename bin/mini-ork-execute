@@ -240,6 +240,17 @@ _dispatch_node() {
     return 0
   fi
 
+  # D-038 (v0.2-pt9): respect `edge_type: escalates_to` semantics for
+  # rollback nodes. Recipe edges declare rollback as conditional
+  # (escalates_to from verifier/synthesizer) but execute previously
+  # dispatched it unconditionally because it's in NODE_IDS. Fix: skip
+  # rollback if FAIL_COUNT==0 at the time we reach it — no upstream
+  # failure means escalates_to doesn't fire.
+  if [ "$node_type" = "rollback" ] && [ "${FAIL_COUNT:-0}" -eq 0 ]; then
+    echo "  [skip] rollback — no failures (escalates_to edge not triggered)"
+    return 0
+  fi
+
   if [ "$DRY_RUN" -eq 1 ]; then
     echo "[dry-run] would dispatch node_id=${node_id} node_type=${node_type}: ${node_desc}"
     return 0
@@ -419,12 +430,95 @@ print(outputs[0] if outputs else '')
       ;;
 
     publisher)
-      AUTO_MERGE="$MINI_ORK_ROOT/lib/auto-merge.sh"
-      if [ ! -f "$AUTO_MERGE" ]; then
-        echo "lib/auto-merge.sh not yet present (P1 in flight?)" >&2; exit 3
+      # D-037 (v0.2-pt9): publisher now actually publishes the artifact.
+      # Reads recipe's artifact_contract.yaml `source_artifact` (file in
+      # $MINI_ORK_RUN_DIR) + `outputs[]` (canonical repo paths) and
+      # copies + git-commits each. Closes the dogfood loop: framework
+      # can now ship its own outputs to canonical locations without a
+      # human in the middle.
+      #
+      # Legacy auto-merge.sh path (multi-epic git-branch squash-merge)
+      # still loads as a sourceable library when JOB_ID + REPO_ROOT +
+      # MINI_ORCH_DIR are set — that's the mini-orch deliver.sh flow,
+      # NOT the single-recipe direct-run flow. For single-recipe runs
+      # we take the artifact-contract publish path.
+      local _contract="$MINI_ORK_ROOT/recipes/${MINI_ORK_RECIPE:-}/artifact_contract.yaml"
+      if [ ! -f "$_contract" ]; then
+        echo "  [warn] publisher: no artifact_contract.yaml at $_contract — skipping" >&2
+        return 0
       fi
-      bash "$AUTO_MERGE" || { echo "publisher: auto-merge failed" >&2; return 1; }
-      echo "  [ok] publisher: auto-merge complete"
+      local _src_name _outputs
+      _src_name=$(python3 -c "
+import yaml, sys
+try:
+    d = yaml.safe_load(open('$_contract')) or {}
+    print(d.get('source_artifact', 'synthesis.md'))
+except Exception:
+    print('synthesis.md')
+" 2>/dev/null)
+      _outputs=$(python3 -c "
+import yaml, sys
+try:
+    d = yaml.safe_load(open('$_contract')) or {}
+    outs = d.get('outputs') or []
+    for o in outs:
+        print(o)
+except Exception:
+    pass
+" 2>/dev/null)
+      if [ -z "$_outputs" ]; then
+        echo "  [warn] publisher: artifact_contract.yaml has no outputs[] — skipping publish" >&2
+        _d021_set_status "published"
+        return 0
+      fi
+      local _src="$RUN_DIR/$_src_name"
+      if [ ! -f "$_src" ]; then
+        echo "  [warn] publisher: expected source artifact missing: $_src" >&2
+        return 1
+      fi
+      local _published_count=0
+      local _failed_count=0
+      while IFS= read -r _out; do
+        [ -z "$_out" ] && continue
+        local _dst="$MINI_ORK_ROOT/$_out"
+        mkdir -p "$(dirname "$_dst")"
+        if cp "$_src" "$_dst"; then
+          # Stage + commit. mini-ork acts as its own committer identity.
+          if (cd "$MINI_ORK_ROOT" && \
+              git add "$_out" 2>/dev/null && \
+              git -c user.email=mini-ork@local -c user.name=mini-ork \
+                  commit -q -m "audit(${MINI_ORK_RECIPE:-unknown}): publish synthesis from $MINI_ORK_RUN_ID
+
+Run: $MINI_ORK_RUN_ID
+Recipe: ${MINI_ORK_RECIPE:-unknown}
+Source: $_src ($(wc -c < "$_src" | tr -d ' ') bytes)
+Output: $_out
+Dispatched by mini-ork-execute publisher node (D-037 v0.2-pt9).
+" 2>&1 | tail -3); then
+            echo "  [ok] publisher: published $_out (committed)"
+            _published_count=$((_published_count + 1))
+          else
+            # Commit may fail with "nothing to commit" if dst already
+            # matches src — that's an OK no-op, not a failure.
+            local _git_status=$(cd "$MINI_ORK_ROOT" && git status --porcelain "$_out" 2>/dev/null)
+            if [ -z "$_git_status" ]; then
+              echo "  [ok] publisher: $_out unchanged from prior cycle (no-op commit)"
+              _published_count=$((_published_count + 1))
+            else
+              echo "  [warn] publisher: copy OK but commit failed for $_out" >&2
+              _failed_count=$((_failed_count + 1))
+            fi
+          fi
+        else
+          echo "  [fail] publisher: cp failed for $_out" >&2
+          _failed_count=$((_failed_count + 1))
+        fi
+      done <<< "$_outputs"
+      if [ "$_failed_count" -gt 0 ]; then
+        echo "  [fail] publisher: $_failed_count of $((_published_count + _failed_count)) outputs failed" >&2
+        return 1
+      fi
+      echo "  [ok] publisher: $_published_count artifact(s) published"
       # D-021: transition to 'published' on successful publisher dispatch.
       _d021_set_status "published"
       ;;
