@@ -80,16 +80,29 @@ if [ "$DRY_RUN" -eq 0 ]; then
 fi
 
 # ── resolve candidate workflow ────────────────────────────────────────────────
+# v0.2-pt33 (Phase E gap closure, 2026-06-01): workflow_candidates has NO
+# `workflow_yaml` column. The YAML lives in workflow_memory.yaml_blob
+# referenced by workflow_candidates.base_workflow_version_id. JOIN to fetch.
 CANDIDATE_WORKFLOW=""
+CANDIDATE_MUTATIONS=""
 if [ -f "$MINI_ORK_DB" ]; then
-  CANDIDATE_WORKFLOW=$(sqlite3 "$MINI_ORK_DB" \
-    "SELECT workflow_yaml FROM workflow_candidates WHERE candidate_id='${CANDIDATE_ID}' LIMIT 1;" \
+  CANDIDATE_WORKFLOW=$(sqlite3 "$MINI_ORK_DB" "
+    SELECT wm.yaml_blob
+    FROM workflow_candidates wc
+    JOIN workflow_memory wm ON wc.base_workflow_version_id = wm.workflow_version_id
+    WHERE wc.candidate_id = '${CANDIDATE_ID}'
+    LIMIT 1;
+  " 2>/dev/null || true)
+  CANDIDATE_MUTATIONS=$(sqlite3 "$MINI_ORK_DB" \
+    "SELECT mutations FROM workflow_candidates WHERE candidate_id='${CANDIDATE_ID}' LIMIT 1;" \
     2>/dev/null || true)
 fi
 
 if [ -z "$CANDIDATE_WORKFLOW" ]; then
   echo "Candidate not found in DB: ${CANDIDATE_ID}" >&2
-  echo "Run 'mini-ork improve' first to generate candidates." >&2
+  echo "Either the candidate_id is wrong OR its base_workflow_version_id" >&2
+  echo "doesn't have a matching workflow_memory row (FK gap)." >&2
+  echo "Run 'mini-ork improve' first to generate candidates with proper baselines." >&2
   exit 2
 fi
 
