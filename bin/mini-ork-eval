@@ -116,7 +116,13 @@ echo "    suite:     ${SUITE_NAME}"
 echo ""
 
 if [ "$DRY_RUN" -eq 1 ]; then
-  benchmark_list_tasks --suite "$SUITE_NAME"
+  # v0.2-pt34 (Phase E gap closure, 2026-06-01): the public API in
+  # lib/benchmark_suite.sh is benchmark_list (per the module docstring).
+  # Previous call to benchmark_list_tasks was a pre-implementation
+  # placeholder. Also benchmark_list takes --task-class not --suite.
+  # Map suite name → task_class for now (1:1 until a benchmark_suites
+  # table arrives in a future patch).
+  benchmark_list --task-class "$SUITE_NAME"
   echo "[dry-run] would run each task with candidate workflow=${CANDIDATE_ID}"
   exit 0
 fi
