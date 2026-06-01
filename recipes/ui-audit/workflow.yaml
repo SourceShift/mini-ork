@@ -1,0 +1,37 @@
+version: "0.1.0"
+task_class: ui_audit
+description: >
+  5-lens UI audit — a11y/perf/visual/interaction/edge-cases run in parallel
+  across DISTINCT model families (glm/kimi/codex/opus/minimax). Synthesizer
+  ranks findings by severity (P0..P3) with file:line anchors + fix sketches.
+
+nodes:
+  - { name: planner,         type: planner,    model_lane: planner,       prompt_ref: prompts/planner.md,             dispatch_mode: serial }
+  - { name: a11y_lens,       type: researcher, model_lane: glm_lens,      prompt_ref: prompts/lens-a11y.md,           dispatch_mode: parallel, gates: [budget_gate] }
+  - { name: perf_lens,       type: researcher, model_lane: kimi_lens,     prompt_ref: prompts/lens-perf.md,           dispatch_mode: parallel, gates: [budget_gate] }
+  - { name: visual_lens,     type: researcher, model_lane: codex_lens,    prompt_ref: prompts/lens-visual.md,         dispatch_mode: parallel, gates: [budget_gate] }
+  - { name: interaction_lens,type: researcher, model_lane: opus_lens,     prompt_ref: prompts/lens-interaction.md,    dispatch_mode: parallel, gates: [budget_gate] }
+  - { name: edge_lens,       type: researcher, model_lane: minimax_lens,  prompt_ref: prompts/lens-edge.md,           dispatch_mode: parallel, gates: [budget_gate] }
+  - { name: synthesizer,     type: reviewer,   model_lane: reviewer,      prompt_ref: prompts/synthesis.md,           dispatch_mode: serial,   gates: [budget_gate] }
+  - { name: findings_completeness, type: verifier, verifier_ref: verifiers/findings-completeness.sh, dispatch_mode: serial }
+  - { name: publisher,       type: publisher,  prompt_ref: null, dispatch_mode: serial, gates: [scope_gate] }
+  - { name: rollback,        type: rollback,   prompt_ref: null, dispatch_mode: serial }
+
+edges:
+  - { from: planner, to: a11y_lens,        edge_type: depends_on }
+  - { from: planner, to: perf_lens,        edge_type: depends_on }
+  - { from: planner, to: visual_lens,      edge_type: depends_on }
+  - { from: planner, to: interaction_lens, edge_type: depends_on }
+  - { from: planner, to: edge_lens,        edge_type: depends_on }
+  - { from: a11y_lens,        to: synthesizer, edge_type: supplies_context_to }
+  - { from: perf_lens,        to: synthesizer, edge_type: supplies_context_to }
+  - { from: visual_lens,      to: synthesizer, edge_type: supplies_context_to }
+  - { from: interaction_lens, to: synthesizer, edge_type: supplies_context_to }
+  - { from: edge_lens,        to: synthesizer, edge_type: supplies_context_to }
+  - { from: synthesizer, to: findings_completeness, edge_type: verifies }
+  - { from: findings_completeness, to: publisher, edge_type: depends_on }
+  - { from: synthesizer, to: rollback, edge_type: escalates_to }
+  - { from: findings_completeness, to: rollback, edge_type: escalates_to }
+
+rollback_strategy: keep_lens_reports_discard_findings
+max_self_correction_iterations: 2
