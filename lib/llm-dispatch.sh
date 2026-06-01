@@ -225,9 +225,22 @@ finally:
     # python3 process to yaml.safe_load + dict lookup. At 100K dispatches/
     # day = 100K python3 forks. Cache via bash assoc array keyed on
     # node_type → model.
-    declare -gA _MO_LANE_CACHE 2>/dev/null || true
-    if [ -n "${_MO_LANE_CACHE[$node_type]:-}" ]; then
-      model="${_MO_LANE_CACHE[$node_type]}"
+    # v0.2-pt20 (W5 from refactor-audit synthesis Section 2.5): switch from
+    # `declare -gA _MO_LANE_CACHE` (assoc array — process-local) to per-key
+    # exported env vars so subshells `( _dispatch_node ) &` in parallel
+    # dispatch INHERIT the cache instead of re-parsing yaml.safe_load each.
+    # At MINI_ORK_MAX_PARALLEL=4, was forking 4 redundant python3
+    # processes per node-type batch.
+    #
+    # Key sanitisation (K-11): hyphens in lane names like `research-synthesis`
+    # would blow up bash variable assignment. Convert to `_MO_LANE_<UPPER>`
+    # with hyphens → underscores.
+    local _safe_key
+    _safe_key="_MO_LANE_${node_type^^}"
+    _safe_key="${_safe_key//-/_}"
+    local _cached_model="${!_safe_key:-}"
+    if [ -n "$_cached_model" ]; then
+      model="$_cached_model"
     else
       local _agents_yaml="${MINI_ORK_HOME:-.mini-ork}/config/agents.yaml"
       [ ! -f "$_agents_yaml" ] && _agents_yaml="$MINI_ORK_ROOT/config/agents.yaml"
@@ -245,8 +258,9 @@ PY
         )
         [ -n "$_resolved" ] && model="$_resolved"
       fi
-      # Cache the resolution (even fallback) so the next call is free
-      _MO_LANE_CACHE[$node_type]="$model"
+      # Cache the resolution via export — subshells inherit. Cover both keyed-
+      # by-original-name (legacy callers) and keyed-by-safe-name (new path).
+      export "$_safe_key=$model"
     fi
   fi
 
