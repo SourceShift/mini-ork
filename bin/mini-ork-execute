@@ -712,27 +712,42 @@ if [ "$FAIL_COUNT" -gt 0 ]; then
   exit 1
 fi
 
-# D-009 cost propagation — placeholder $0.01 per dispatched node until
-# claude --output-format json cost extraction lands (v0.2.1).
-# Counts dispatched nodes (those NOT skipped by planner-type or filter).
+# v0.2-pt19 (W2 from refactor-audit synthesis Section 2.2): the D-009
+# flat-rate cost charge ($0.01 × DISPATCHED_COUNT) is now REDUNDANT.
+# D-029 (shipped pt-8) records real total_cost_usd per node via the
+# .last-llm-cost sidecar that _d022_charge_node_cost reads after each
+# dispatch in the loop above. Adding the D-009 flat charge on top of
+# D-029 real cost overstated cost_usd by $0.06/run with 6-node recipes
+# — at 100K runs/day that's $6K/day in PHANTOM spend that triggered the
+# MO_DAILY_BUDGET_USD circuit breaker ~2× too early. Removing the flat
+# charge DOUBLES effective daily budget headroom at the documented
+# scale target without raising the cap.
+#
+# Audit caveat (Section 2.2): verifier nodes that don't dispatch LLM
+# still need to record $0.00 to avoid leaving cost_usd NULL. The
+# _d022_charge_node_cost helper handles this — if the .last-llm-cost
+# sidecar is missing, it falls back to the $0.01 placeholder which is
+# documented behavior for executable-wrapper lanes (cl_codex.sh) and
+# acceptable for non-dispatching nodes.
+#
+# This block now ONLY sets the status='reviewing' transition that
+# downstream logic depends on. No cost mutation.
 if [ "$DRY_RUN" -eq 0 ] && [ -f "$MINI_ORK_DB" ] && [ -n "${MINI_ORK_RUN_ID:-}" ]; then
-  DISPATCHED_COUNT="${#NODE_IDS[@]}"
-  python3 - "$MINI_ORK_DB" "$MINI_ORK_RUN_ID" "$DISPATCHED_COUNT" <<'PY'
+  python3 - "$MINI_ORK_DB" "$MINI_ORK_RUN_ID" <<'PY'
 import sqlite3, sys, time
-db, run_id, count = sys.argv[1], sys.argv[2], int(sys.argv[3])
+db, run_id = sys.argv[1], sys.argv[2]
 con = sqlite3.connect(db)
 con.execute("PRAGMA journal_mode=WAL")
 try:
     con.execute("""
         UPDATE task_runs
-        SET cost_usd = COALESCE(cost_usd,0) + ?,
-            status   = 'reviewing',
+        SET status     = 'reviewing',
             updated_at = ?
         WHERE id = ?
-    """, (count * 0.01, int(time.time()), run_id))
+    """, (int(time.time()), run_id))
     con.commit()
 except sqlite3.OperationalError as e:
-    print(f"[warn] task_runs cost update skipped: {e}", file=sys.stderr)
+    print(f"[warn] task_runs status update skipped: {e}", file=sys.stderr)
 finally:
     con.close()
 PY
