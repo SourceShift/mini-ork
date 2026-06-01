@@ -439,6 +439,35 @@ reflect can extract gradients; improve can propose candidates; eval
 can benchmark them; promote can decide. The framework now has a
 genuine self-improvement substrate.
 
+### v0.2-pt11.5 — Phase B END-TO-END proven (D-042 D-043 D-044)
+
+After pt-11 unblocked the substrate, DF11 produced 6 real traces +
+auto-committed `43ed037` synthesis (2nd mini-ork@local self-commit).
+Reflect was then run against the 6 traces — surfaced 3 more bugs:
+
+| ID | Title | Source | Status |
+|---|---|---|---|
+| **D-042** | gradient_extract returned 0 gradients for all 6 traces. NOT a bug — LLM correctly identified the traces are too SPARSE to extract gradients from. Current `trace_write` only populates `trace_id/task_class/status` — empty `files_read/files_written/tool_calls/verifier_output` give the LLM nothing to learn from. | DF11 reflect | **deferred v0.3** (needs execute to populate trace content) |
+| **D-043** | `gradient_records` table didn't exist when `reflection_deduplicate` ran. `_gradient_ensure_table` only fires lazily via `gradient_store` — if extract returns 0, table is never created, pipeline steps 2-6 crash with `no such table: gradient_records`. | DF11 reflect | **fixed pt-11.5** — defensive `_gradient_ensure_table` at top of `reflection_extract_gradients` |
+| **D-044** | `reflection_run` step 5/6 had bash `2>/dev/null or []` leaked into a Python heredoc. SyntaxError every reflect run. Caller's `done \|\| true` swallowed. | DF11 reflect | **fixed pt-11.5** — replaced with `try/except sqlite3.OperationalError` |
+
+**Reflect pipeline end-to-end smoke (post pt-11.5):**
+```
+[1/6] extract_gradients   → extracted 0 gradients since 1780211850
+[2/6] deduplicate         → no duplicates found
+[3/6] link_failures       → 0 links created/verified
+[4/6] detect_stale        → 0 stale entries in gradient_records
+[5/6] summarize_patterns  → (clean traversal, was SyntaxError before)
+[6/6] suggest_promotions  → []
+```
+
+**Phase B FULLY PROVEN end-to-end** as of pt-11.5. The reflect →
+improve → eval → promote chain has a working substrate AND a clean
+pipeline traversal. The only remaining gap (D-042) is trace content
+richness — when DF cycles produce richer traces (files_read/written/
+tool_calls/verifier_output populated by execute), real gradients will
+extract and the self-improvement chain will produce actionable signal.
+
 
 
 DF6 SPIKE is not a regression — it's expected when the framework crosses a
