@@ -13,6 +13,10 @@ case "$sub" in
   classify|plan|execute|verify|reflect|improve|eval|promote|init)
     exec "$MINI_ORK_ROOT/bin/mini-ork-$sub" "$@" ;;
 
+  # Phase C: trajectory metrics across DF cycles (v0.2-pt13)
+  metrics)
+    exec "$MINI_ORK_ROOT/bin/mini-ork-metrics" "$@" ;;
+
   # Convenience: run is a recipe-level entry
   # Walks classify → plan → execute → verify. Each step's output (key=value
   # lines on stdout) is parsed to thread state into the next step's env.
