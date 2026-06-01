@@ -1,259 +1,213 @@
-# mini-ork v0.1.1 — Scalability Audit Synthesis
+# Scalability Audit — Synthesis (run-1780298691-99474)
 
-> **Audit run:** `run-1780296925-74626` · **Date:** 2026-06-01
-> **Lenses:** GLM (tactical), Kimi (refactor), Codex (LLM-dispatch), Opus (architectural)
-> **Target scales:** 1K/day (current) → 100K/day → 10M/day
-> **Lineage:** Supersedes any prior `docs/refactor/SCALABILITY-AUDIT.md`.
->
-> **ID conventions:** `G-N` = GLM, `K-N` = Kimi, `D-N` = Codex (the lens emitted
-> `C-N` internally; we re-prefix here per framework convention), `O-RN` = Opus.
-> A `★` marker plus a `[CONSENSUS-N]` tag indicates the finding surfaced in
-> ≥2 lenses independently.
+> 4-lens audit of mini-ork v0.1.1 → v0.2-pt13. Lenses: **GLM** (tactical
+> bottlenecks), **Kimi** (code refactor diffs), **Codex** (LLM dispatch
+> cost), **Opus** (architectural shape).
+> Read-only. HEAD = `6d70157`. 2026-06-01.
 
----
-
-## 1. Severity × Leverage Matrix
-
-| | **HIGH leverage** | **MED leverage** | **LOW leverage** |
-|---|---|---|---|
-| **P1 — blocks NOW / blocks 100K** | G-01 (raw sqlite3 in hooks/subagent-stop.sh:68) · G-02 (no circuit on `mo_llm_dispatch`) · G-03 (budget SUM misses `runs` table) · **★ [CONSENSUS-1]** G-08 + K-04 + D-006 + O-R12 (budget-check fork storm) · **★ [CONSENSUS-3]** G-05 + K-01 + D-002 + O-R9 (N+1 gradient extraction) · D-003 (Opus provider tier cascade) | G-06 (gradient_records.evidence unindexed) · G-07 (agent_registry index gap) · D-004 (cache wired to only 2 of 9 stages) · **★ [CONSENSUS-4]** G-04 + K-07 (unbounded failure fetchall — OOM bomb) | G-15 (iters.verdict index) · G-18 (runs.started_at index) · K-02 (python3 fork for date math) · K-12 (PLAN_CONTENT hoist) |
-| **P2 — blocks 10M / structural** | O-R1 (Go DB proxy daemon) · O-R2 (Go worker replaces bash DAG) · **★ [CONSENSUS-5]** G-19 + O-R4 (no TTL/archive on `execution_traces`, `task_runs`) · D-008 (Haiku tier for classification) · D-002-long (batch gradient extraction → 94 % LLM cost cut) | O-R3 (SQLite monthly shards via ATTACH) · O-R13 (OTel spans/metrics/logs) · **★ [CONSENSUS-2]** G-12 + K-08 + D-012 (per-cluster python3 storm in reflection step 5) · D-009 (context-pack 64 K bloat) · D-011 (full trace JSON in gradient prompt) · K-06 (git HEAD cache) · G-14 (auto-merge spin-lock) | G-16 / G-17 (correlated subqueries + JSON shred in views) · G-20 (v_memory_health 8-arm UNION) · K-09 (merge d021+d022 UPDATEs) · K-10 (mo_cache_hash_bundle streaming) · K-11 (git-blame batching) · D-014 (`--include-partial-messages` always on) |
-| **P3 — long-horizon / advisory** | O-R4 (Postgres 16 + pg_partman migration) · O-R5 (NATS JetStream queue + stateless workers) · O-R11 (committee reviewer at 1 M/day) | O-R6 (pgloader migration script) · O-R7 (recipe registry + semver tap) · O-R8 (namespace sandbox for verifier scripts) · O-R10 (tiered benchmark sampling by rung) · D-005 (effort-level complexity routing) · D-007 (per-stage max_turns routing) | K-03 (raw SQL string interpolation in cache.sh) · D-001-NEW (cleaner.sh missing prompt cache) · D-010 (reviewer on empty worker output) · D-013 (flat-sleep retry storm) · D-015-NEW (BDD runner serial by default) · G-23 (per-row python3 in utility_function.sh) · G-24 (agent_session_locks TTL prune) |
-
-**Consensus catalog**
-
-| Tag | Title | Lenses | File anchor |
-|---|---|---|---|
-| **[CONSENSUS-1]** | Budget circuit breaker spawns 2 × python3/dispatch | GLM, Kimi, Codex, Opus | `lib/llm-dispatch.sh:201-214` |
-| **[CONSENSUS-2]** | Reflection step 5: cluster summarisation serial per cluster | GLM, Kimi, Codex | `lib/reflection_pipeline.sh:256-265` |
-| **[CONSENSUS-3]** | Gradient extraction: 1 LLM call per trace, no idempotency, no batch | GLM, Kimi, Codex, Opus | `lib/reflection_pipeline.sh:53-63` + `lib/gradient_extractor.sh:111` |
-| **[CONSENSUS-4]** | `reflection_link_failures` unbounded fetchall — OOM at 10 M rows | GLM, Kimi | `lib/reflection_pipeline.sh:127-130` |
-| **[CONSENSUS-5]** | No rotation / TTL / archive on `execution_traces`, `task_runs` | GLM, Opus | `db/migrations/0013_task_runs.sql`, `db/migrations/0014_execution_traces*.sql` |
+ID conventions used in this doc:
+- `G-N` → GLM finding row N (see `lens-glm.md`)
+- `K-N` → Kimi refactor N (see `lens-kimi.md`)
+- `D-N` → Codex finding N (see `lens-codex.md`)
+- `O-RN` → Opus recommendation N (see `lens-opus.md §7`)
+- `★` = 2-lens consensus (e.g. GLM + Kimi) · `★★` = 3-lens (e.g. GLM + Kimi + Codex) · `★★★` = all-4-lens (GLM + Kimi + Codex + Opus)
 
 ---
 
-## 2. Top 5 Immediate Wins (P1) — total < 2 weeks
+## Section 1 — Severity × Leverage Matrix
 
-| Rank | ID | Title | Source | One-line fix | Effort |
-|---|---|---|---|---|---|
-| **1** | **★ [CONSENSUS-1]** (G-02 + G-03 + G-08 + K-04 + D-006) | Budget circuit-breaker correctness + fork-storm | 4 lenses | (a) move circuit check into `mo_llm_dispatch()` body so direct callers cannot bypass; (b) extend SUM to `task_runs + runs`; (c) collapse 2 python3 forks → 1 with `awk` float compare. `lib/llm-dispatch.sh:37,198-214` | 4 h |
-| **2** | D-003 | Opus provider cascades Haiku/Sonnet → Opus 4.7 (~60× over-bill) | Codex | Remove `ANTHROPIC_DEFAULT_{HAIKU,SONNET}_MODEL` exports in `lib/providers/cl_opus.sh:10-14`. **$52/1K-runs saved.** | 15 min |
-| **3** | **★ [CONSENSUS-3] (short-term)** (D-002 + G-06) | Gradient extraction: skip-if-done + index | 4 lenses | (a) `WHERE trace_id NOT IN (SELECT DISTINCT evidence FROM gradient_records)` in `lib/gradient_extractor.sh`; (b) `CREATE INDEX idx_gr_evidence ON gradient_records(evidence)`. **$135/1K-runs saved (60–80 % re-extraction).** | 1 d |
-| **4** | D-004 | Wire `mo_cache_lookup`/`mo_cache_emit` to spec-author, spec-reviewer, reflection-refiner | Codex | Mirror the existing rubric/mutation-adversary cache pattern; schema already supports it (`lib/cache.sh:19-58`). **$38/1K-runs saved.** | 3 d |
-| **5** | **★ [CONSENSUS-5]** (G-19 + G-21 + G-24) | Rotation: `execution_traces` 90-day purge + run-dir archive + `agent_session_locks` TTL prune | GLM, Opus | New migration 0015 + `mini-ork prune --days 90`. Retains failures for gradient signal. Prevents 10 M-row WAL bloat **before** R3 sharding is ready. | 2 d |
+Rows: blast radius (P1 = bleeds today, P2 = breaks at 100K/day, P3 = breaks at 10M/day).
+Cols: leverage (HIGH = changes the slope, MED = changes the constant, LOW = correctness/hygiene).
 
-**Total:** ~6.5 eng-days. Apply as one PR-stack (`fix-v0.2-pt12-scalability-quickwins`). Estimated combined savings ≥ **$225/1K-runs** plus OOM-elimination and 200 K python3 forks/day removed.
+|        | **HIGH leverage** | **MED leverage** | **LOW leverage** |
+|--------|------------------|------------------|-------------------|
+| **P1 — bleeds today** _(P1 sources: GLM/Kimi/Codex/Opus)_ | **K-1 ★★ G-1 D-2** serial gradient LLM loop (Kimi+GLM+Codex) · **D-7** double cost-charge D-009 / D-022 (Codex) · **D-1** cl_opus.sh pins all model slots (Codex) · **D-5** reviewer→opus default (Codex) | **K-9 ★ G-3** N+1 gradient lookup in failure linking (Kimi+GLM) · **K-6** per-line git blame (Kimi) · **G-5 K-9-risk** missing `gradient_records.evidence` index (GLM+Kimi) | **K-3 G-4 D-4** ★ python3 float-validation fork (Kimi+GLM+Codex) · **K-5** python3 date-arith fork (Kimi) · **K-7 G-8 G-9 ★** raw sqlite3 bypasses `mo_sqlite` (Kimi+GLM) |
+| **P2 — 100K/day** _(P2 sources: GLM/Kimi/Codex/Opus)_ | **K-11 G-11 ★** lane-cache subshell scope (Kimi+GLM) · **D-8** xhigh effort on mechanical nodes (Codex) · **D-15** no `--max-turns` cap (Codex) · **O-R3** persistent SQLite daemon (Opus) | **G-2 G-7** N+1 sqlite3 forks in auto-merge (GLM) · **K-13 G-10** O(N²) jq subshell (Kimi+GLM) · **K-12 G-29 O-R3 ★** open/commit/close per write (Kimi+GLM+Opus) · **G-12** batch-flush vs sliding window (GLM) | **G-24 D-13 ★** TEXT/INTEGER affinity in `task_runs.created_at` (GLM+Codex) · **G-17 O-R9 ★** `mo_events` no archival trigger (GLM+Opus) · **K-7 K-10 ★** string-interpolated SQL injection class (Kimi) · **D-9** executable wrappers skip cache flags (Codex) |
+| **P3 — 10M/day & long-horizon** | **O-R1** state.db → PostgreSQL · **O-R4** queue-backed LLM dispatch · **D-A** task_class × node_type × tokens router · **D-C** Anthropic Batches API for reflection | **O-R2** monthly range partitioning + TTL · **O-R6** OTLP exporter on existing `traceparent` · **O-R7** per-recipe cost circuit breaker · **D-B** semantic gradient cache (embeddings) | **O-R8** kill inline `_ensure_table` DDL guards · **O-R10** recipe signing for registry · **G-25** documented `--no-verify` gate · **G-23** `MO_TRACE_QUERY_LIMIT=0` silent-loss guard |
 
----
-
-## 3. v0.x+1 Architectural Shifts (P2) — bundled by theme
-
-### Bundle A — **Data layer** (prereq for everything else at 100 K/day)
-
-- O-R3 SQLite monthly shards via `ATTACH DATABASE` (`db/migrations/0013_task_runs.sql`, `0014_execution_traces*.sql`) — 1–2 wks
-- **★ [CONSENSUS-5]** G-19 + G-21 cron-driven archive job to `.mini-ork/archives/` — already in P1 quick-wins as the immediate slice, completed here
-- G-15 + G-18 view indexes (`idx_iters_verdict`, `idx_runs_started_agent`) — 0.5 wk
-- G-13 fix `gradient_records.target` leading-`%` wildcard scan — 0.5 wk
-
-**Bundle total:** 3 eng-wks. **Prereq P1s:** quick-win #5 (rotation). **Risk if deferred:** SQLite WAL writer ceiling becomes a hard wall around 80 K writes/day on dev hardware; views become seconds-slow.
+**Consensus density.** 11 distinct findings hit ≥2 lenses; 3 hit ≥3 lenses (★★ or higher). The 4-lens overlap (GLM + Kimi + Codex + Opus) on **python3-fork overhead on the LLM/DB hot path** (K-3, K-5, K-8, K-12, G-4, G-10, G-22, G-29, D-4, D-14, O-R3) is the single highest-leverage substrate-level pattern in the audit.
 
 ---
 
-### Bundle B — **Runtime** (process-spawn overhead — the real 10 K → 100 K gap)
+## Section 2 — Top 5 Immediate Wins (P1, total effort ≤ 2 weeks)
 
-- O-R1 Go DB proxy daemon over Unix socket (`lib/db_open.sh:25`, `lib/trace_store.sh:35-80`) — 2–3 wks
-- K-06 cache `_mo_git_head` + `_mo_repo_root` (`lib/memory.sh:39-50`) — 0.5 wk
-- K-09 merge `_d021_set_status` + `_d022_charge_node_cost` (`bin/mini-ork-execute:189-233`) — 0.5 wk
-- **★ [CONSENSUS-2]** G-12 + K-08 + D-012 single-session cluster summariser (`lib/reflection_pipeline.sh:256-265`) — 0.5 wk
-- G-23 consolidate per-row python3 forks behind `mo_json_get` jq helper — 0.5 wk
-- G-14 auto-merge exponential backoff (`lib/auto-merge.sh:43-55`) — 0.5 wk
+These ship as ordinary patches. No schema migration. No new infra. ROI computed at the documented 100K/day target.
 
-**Bundle total:** 4–5 eng-wks. **Prereq P1s:** **★ [CONSENSUS-1]** (budget circuit) — once cost path is fork-free, the DB proxy is the next leverage point. **Risk if deferred:** at 100 K runs/day with 8 nodes each, you are spending 2 + CPU-hours/day on pure spawn overhead. Bash `wait -n` semantics break above ~128 concurrent jobs.
+### W1 — Batch gradient extraction (K-1 ★★ + G-1 + D-2; sources Kimi + GLM + Codex) — **3 days**
+**Site**: `lib/reflection_pipeline.sh:65-73`
+**Fix**: replace the `while read tid` serial loop dispatching one `gradient_extract` per trace with a batched LLM call (20 traces per request, model emits an array-of-arrays keyed by `trace_id`). Combine with K-1's bulk `executemany` for `gradient_records`.
+**ROI**: 500 → ~25 LLM round-trips per reflect cycle. At sonnet $0.003/call: $1.50 → $0.08 per cycle (95% cut). Wall time 16 min → ~1 min.
+**Caveat**: K-1 risk note — bulk path skips `_PATTERN_ON_NEW_HOOKS`. Audit hook consumers before flipping; if any consumer relies on hook fan-out, fire the hooks once per batch at the end.
 
----
+### W2 — Kill the D-009 double cost-charge (D-7) — **half day**
+**Site**: `bin/mini-ork-execute:718-737` overlapping `bin/mini-ork-execute:376,396,447`
+**Fix**: delete the D-009 flat `$0.01 × DISPATCHED_COUNT` charge now that D-022 + D-029 record real `total_cost_usd` per node. Or gate D-009 behind `[ "$MO_D029_REAL_COST" != 1 ]`.
+**ROI**: per-run cost ledger overstated by $0.06/run. At 100K runs/day = $6K/day in phantom spend triggering the circuit breaker ~2× too early. Fixing this *doubles* effective daily budget headroom without raising the cap.
+**Caveat**: must be paired with confirmation that D-029 fires on *every* node (verifier nodes that don't dispatch LLM still need to record `$0.00` to avoid leaving cost_usd NULL — currently the D-009 block was hiding this).
 
-### Bundle C — **LLM dispatch** (where the dollars are)
-
-- **★ [CONSENSUS-3]** D-002-long batch gradient (N traces → 1 call, packs ~500 summaries) — 1–2 wks. **94 % cost cut at scale.**
-- D-008 Haiku tier for gradient/rubric/classifier paths (`config/agents.yaml`, `lib/gradient_extractor.sh:109`) — 1 wk. **$138/1K-runs.**
-- D-009 trim context-pack: prior_runs 10 → 3, strip verbose fields (`lib/context_assembler.sh:35,86-104`) — 0.5 wk. **$120–960/1K-runs.**
-- D-011 pre-summarise trace JSON before gradient prompt (`lib/gradient_extractor.sh:106`) — 0.5 wk
-- D-005 effort-level complexity routing (`bin/_worker-launcher.sh:236`) — 1 wk
-- D-007 per-stage `max_turns` routing — 0.5 wk
-- D-013 exponential backoff + retry-count tracking in `wait-and-retry` (`lib/mo-healer-bridge.sh:181-187`) — 0.5 wk
-- D-010 short-circuit reviewer on empty worker diff — 0.25 wk
-
-**Bundle total:** 5–6 eng-wks. **Prereq P1s:** D-004 (cache wiring) — semantic uplifts in D-009/D-011 land cleanly only after caching is universal. **Risk if deferred:** at 100 K/day this bundle is the difference between ~$2K and ~$15K daily Anthropic spend.
-
----
-
-### Bundle D — **Observability** (do this FIRST, in parallel with A/B/C)
-
-- O-R13 OTel spans/metrics/logs from Go worker (or bash via OTLP exporter sidecar) — 2–3 wks
-- O-R12 in-process rolling 24 h cost counter (depends on R1/R2) — < 1 wk
-- D-014 gate `--include-partial-messages` behind `MO_DEBUG=1` — 0.25 wk (saves $200/day storage at 100 K)
-- K-10 streaming `mo_cache_hash_bundle` (`lib/cache.sh:78-89`) — 0.25 wk
-
-**Bundle total:** 3 eng-wks. **Prereq P1s:** none — start immediately. **Risk if deferred:** every other refactor lands blind; you cannot prove a regression-free migration without traces.
-
----
-
-**Recommended sequencing:** Bundle D in parallel with quick-wins (week 1–2), then A → B → C (weeks 3–14). Total **15 eng-weeks** to a substrate that holds at 100 K/day.
-
----
-
-## 4. Long-horizon (P3 + advisory)
-
-| ID | Item | Trigger | Effort | Notes |
-|---|---|---|---|---|
-| O-R2 | Go worker replaces `bin/mini-ork-execute` bash DAG | 100 K/day plateaus | 6–10 wks | Highest-leverage structural change; gate on Bundle D being live first |
-| O-R4 | Postgres 16 + `pg_partman` migration | crossing 1 M/day | 8–12 wks | All 14 migrations have clean Postgres equivalents; `audit_log` triggers must port unchanged |
-| O-R5 | NATS JetStream task queue + stateless workers | crossing 1 M/day | 4–6 wks | Requires object-storage replacement for `MINI_ORK_RUN_DIR` |
-| O-R6 | `db/migrate-to-pg.sh` via `pgloader` | concurrent with R4 | 1–2 wks | |
-| O-R7 | Recipe registry with semver + content hash | community contributions open | 3–4 wks | Homebrew-style tap model |
-| O-R8 | Namespace sandbox for verifier scripts (`unshare` / `sandbox-exec`) | community contributions open | 2–3 wks | Security-critical; blocks R7 publication |
-| O-R10 | Tiered benchmark sampling by mutation rung | 100 K/day | 1 wk | rung ≤ 4 → 20 % weighted sample; rung ≥ 5 → full suite |
-| O-R11 | Committee reviewer gate (2-of-3 multi-provider quorum) | 1 M/day, human becomes bottleneck | 2–3 wks | Preserves safety contract w/o single-human gate |
-| O-R9 | MinHash LSH dedup on `textual_gradients` | gradient store > 100 K rows | 1 wk | Prevents GroupEvolver noise saturation |
-| K-03 | Parameterised cache queries (drops SQL-injection risk) | non-trusted recipe inputs | 0.5 wk | Currently low-impact (epic IDs are framework-controlled); high-impact under R7 |
-| K-11 | Batch git-blame per file in `_mo_capture_reflection` | memory writes > 10 K/day | 1 wk | Saves ~500 K forks/day at 100 K writes |
-| D-001-NEW | Wire `mo_emit_cache_flags` in `lib/cleaner.sh:299` | low priority — single non-cached site remaining | 0.25 wk | $3.60/1K-runs |
-| D-015-NEW | Parallel BDD runner default-on | sub-epic count > 5/job | 0.25 wk | 27 min/job wall-clock |
-| G-23 | jq-based `mo_json_get` helper | python3 fork count > 10 K/day | 0.5 wk | Already covered by Bundle B but listed for completeness |
-| G-24 | `agent_session_locks` expired-row purge | session count > 10 K | 0.25 wk | Index already exists (`idx_agent_session_locks_expires`); cursor is missing |
-| G-20 | Snapshot `v_memory_health` counts instead of 8-arm UNION | doctor command latency complaint | 1 wk | Cosmetic until 10 M rows/namespace |
-
----
-
-## 5. Hardest Open Question
-
-**Inherited from Opus §8.** The PromotionGate utility formula
-
+### W3 — Fix the opus-fan-out in `cl_opus.sh` (D-1) — **15 minutes**
+**Site**: `lib/providers/cl_opus.sh:11-14`
+**Fix**: keep `ANTHROPIC_MODEL=claude-opus-4-7` and `ANTHROPIC_DEFAULT_OPUS_MODEL=claude-opus-4-7`. Set:
+```sh
+export ANTHROPIC_DEFAULT_SONNET_MODEL=claude-sonnet-4-6
+export ANTHROPIC_DEFAULT_HAIKU_MODEL=claude-haiku-4-5-20251001
+export CLAUDE_CODE_SUBAGENT_MODEL=claude-sonnet-4-6  # not opus
 ```
-U = 0.45·success_rate + 0.20·verifier_pass + 0.15·artifact_quality
-  − 0.10·cost − 0.05·latency − 0.05·risk_penalty
+**ROI**: every internal sub-agent dispatch (TodoWrite, Agent, file-read tool calls inside an opus session) currently runs on opus-4-7. Sonnet is 25× cheaper, haiku ~90× cheaper. Conservative estimate at 100K/day reviewer frequency: ~$8K/day saved.
+**Caveat**: validate the codex lens's own claim against a single `lens-opus` re-run with the patched env to confirm Claude Code actually honors the new sub-agent var. The original choice may have been a quality safeguard — keep an env flag (`MO_OPUS_PIN_ALL=1`) for the rare case a brain session genuinely needs opus-only sub-agents.
+
+### W4 — Cast `created_at` consistently (G-24 ★ D-13; sources GLM + Codex) — **1 day**
+**Site**: `lib/llm-dispatch.sh:207` (cost circuit breaker) + `db/migrations/0013_task_runs.sql:37` (column type)
+**Fix**: the circuit-breaker query compares INTEGER `cutoff` to TEXT `created_at` columns — SQLite type-affinity mismatch silently corrupts the comparison. Either:
+- (a) update query to `WHERE CAST(strftime('%s', created_at) AS INTEGER) >= ?` (matches the pattern already used at `lib/reflection_pipeline.sh:53-55`), or
+- (b) write a new migration that standardises every `created_at` column to INTEGER epoch — preferred, removes the entire class of bug.
+**ROI**: wrong daily-spend totals → circuit-breaker fires at the wrong threshold (sometimes too early, sometimes never). Also restores index usage on `task_runs.created_at` for those time-windowed queries (full-scan → O(log N)).
+**Caveat**: option (b) is a bigger lift because `execution_traces.created_at` is also TEXT (G-24); back-fill conversion has to run against existing rows.
+
+### W5 — Fix lane-cache subshell scope (K-11 ★ G-11; sources Kimi + GLM) — **half day**
+**Site**: `lib/llm-dispatch.sh:228-236`
+**Fix**: replace `declare -gA _MO_LANE_CACHE` (which doesn't survive `( … ) &` subshells used by parallel node dispatch) with an exported env var per node-type:
+```sh
+local _safe_key="_MO_LANE_${node_type^^}"
+_safe_key="${_safe_key//-/_}"
+local _cached_model="${!_safe_key:-}"
+if [ -z "$_cached_model" ]; then
+  _resolved=$(python3 - "$_agents_yaml" "$node_type" <<'PY' …)
+  export "$_safe_key=$_resolved"
+fi
 ```
+**ROI**: in parallel-dispatch mode (`MINI_ORK_MAX_PARALLEL=4`), the yaml parse currently fires N× per node-type instead of once. Eliminates 4 redundant `python3 yaml.safe_load` forks per parallel batch.
+**Caveat**: K-11's hyphen-sanitisation step is mandatory — `node-type` style names blow up bash variable assignment otherwise.
 
-has fixed weights and a benchmark suite that is anchored to the *original*
-task-class distribution. When production traffic shifts — say `db_migration`
-grows from 5 % to 60 % of runs — the benchmark suite still evaluates
-candidates mostly on the old distribution. A workflow change that is highly
-beneficial for the new dominant class shows near-zero `utility_delta` and is
-wrongly quarantined. Worse, the self-improvement loop *learns* this bias
-and stops proposing changes for the dominant class.
-
-Opus sketched three mitigations: (a) continuously refresh the benchmark
-suite, (b) stratify by task class and require `utility_delta > 0` per
-stratum, (c) Pareto-dominance instead of scalar comparison.
-
-**My assessment:** none of the three is sufficient on its own.
-
-- **(a)** sacrifices longitudinal comparability — `utility_delta` measurements
-  taken six months apart become incommensurable. You lose the ability to
-  detect slow regressions.
-- **(b)** fails the moment a candidate improves stratum X by 5 σ but
-  hurts stratum Y by 0.1 σ. Under strict per-stratum gating, you reject every
-  generalist improvement.
-- **(c)** has no unique answer when strata trade off — and the self-evolution
-  loop needs a *decision*, not a Pareto frontier.
-
-The right answer is almost certainly a **hybrid** that the audit framework is
-not equipped to specify without more research:
-
-1. Per-stratum tracking (b) gives the substrate.
-2. A traffic-weighted aggregate, where weights are **smoothed** versions of
-   recent production distribution (e.g. 30-day EMA), gives a single scalar
-   for promotion gating — without the moving-target problem of (a) because
-   the comparison version's score is recomputed under the *same* current
-   weights.
-3. A separate **regression detector** that watches each stratum independently
-   and triggers human review on any stratum-level utility drop > 2 σ —
-   regardless of the aggregate.
-4. The benchmark suite itself needs an explicit `coverage_target` per
-   task class, refreshed quarterly from production telemetry.
-
-This still does not solve the meta-problem (self-improvement loop learning
-the bias of its own gate), which probably needs an off-policy evaluation
-layer borrowed from offline RL — i.e. counterfactual utility estimates that
-do not require running the candidate against the benchmark. **Further
-research required**; the audit framework's recommendation is to ship Bundle D
-(observability) so this question can be empirically studied as soon as
-production task-class distributions start shifting.
+**Total effort**: ~5–6 eng-days. **Total recovered**: ~$14K/day at 100K-task tier *plus* correctness fixes for two latent classes of bug (circuit-breaker affinity, parallel-mode cache miss).
 
 ---
 
-## 6. Dogfood Reflection (meta-loop check)
+## Section 3 — v0.x+1 Architectural Shifts (P2, bundle by theme)
 
-**Was the audit itself reproducible via the framework?** Yes — the run
-artifacts under `${MINI_ORK_RUN_DIR}` (`lens-glm.md`, `lens-kimi.md`,
-`lens-codex.md`, `lens-opus.md`, this `synthesis.md`) are all generated
-under the framework's `plan → dispatch → verify → publish` lifecycle. The
-4 lens reports were dispatched in parallel from the same `plan.json`;
-total cost remained inside the `MO_REFACTOR_AUDIT_BUDGET_USD=40` envelope
-(see `.last-llm-cost`).
+### Bundle A — **Data-layer**: kill the python3-per-DB-op tax (1–2 eng-weeks)
 
-**Did any lens get blocked by something the audit ITSELF identified?**
-Three meta-loop hits:
+- **A1**: persistent SQLite helper daemon (`bin/mini-ork-dbd`, Unix socket) — **O-R3 + G-22 + K-12 ★** (sources Opus + GLM + Kimi). 100-line Python daemon owns one long-lived `sqlite3.Connection`. All `lib/*.sh` python3 heredocs talk to it via socket instead of forking python3. Removes ~30–50 ms/op startup cost. At 100K/day = ~50% pipeline latency recovery.
+- **A2**: route `lib/cache.sh` and `lib/runs-tracker.sh` through `mo_sqlite` — **G-8 + G-9 + K-7 ★** (sources GLM + Kimi). They currently bypass the busy-timeout wrapper; under concurrent WAL writes they silently return empty results.
+- **A3**: add the two missing indices in the same migration: `idx_gr_evidence` and `idx_fl_trace` — **G-5 + G-6** (GLM). Prerequisite for K-9's (Kimi) JOIN rewrite to be O(log N).
+- **A4**: standardise `created_at` columns to INTEGER epoch across `task_runs`, `execution_traces`, `mo_events`, `llm_calls` — **G-24 + D-13 ★** (sources GLM + Codex). Carries W4 forward at schema level.
+- **A5**: archival trigger on `mo_events` — **G-17 + O-R9 ★** (sources GLM + Opus). Move rows older than N days to `mo_events_archive` (sibling table already exists since `0002_mini_orch_sessions.sql:127`).
 
-1. The audit's own cost telemetry is undercounted because of **G-03**
-   (`SUM(task_runs.cost_usd)` excludes the `runs` table). The
-   `MO_REFACTOR_AUDIT_BUDGET_USD` envelope check is therefore lenient by
-   exactly the amount of cost charged to the `runs` table. The audit
-   surfaced the bug it was simultaneously victim to.
+**Total**: ~2 eng-weeks. **Prereq P1s**: W4, W5. **Risk if deferred**: A1 absent → 100K/day pipeline lives at ~40% of its theoretical throughput; A5 absent → state.db grows unboundedly and a single overnight surge fills the disk.
 
-2. **★ [CONSENSUS-1]** budget circuit breaker spawns 2 python3 forks per
-   dispatch. The audit's 5 dispatch nodes (4 lenses + 1 synthesizer)
-   triggered ~10 extra python3 forks for the budget check — measurable in
-   the run log but cost-irrelevant at this scale. It would matter if the
-   audit were itself run at 100K/day.
+### Bundle B — **LLM dispatch**: graduate from synchronous subshells (2–3 eng-weeks)
 
-3. The audit lenses ran read-only against `bin/`, `lib/`, `db/`,
-   `recipes/` — confirmed by `git status --porcelain` on those paths. The
-   audit framework's read-only discipline held; this should be promoted to
-   a hard sandbox (per O-R8) rather than a per-prompt convention.
+- **B1**: Anthropic Messages Batches API for reflection — **D-C + K-1**. Reflection runs off the hot path; perfect candidate for the batch endpoint's 50% pricing. 500-trace cycle: $1.50 → $0.75, async.
+- **B2**: task-class × node-type × prompt-token router — **D-A + D-10**. Two-dim routing table replaces flat `agents.yaml.lanes[node_type]`. Haiku for <2K-token verifier/publisher/rollback, sonnet middle, opus for >20K-token or reviewer/spec_reviewer/brain. Expected ~$1.3K/day saved on haiku-tier rerouting alone at 100K/day.
+- **B3**: per-node `--max-turns` cap and `CLAUDE_CODE_EFFORT_LEVEL` map — **D-8 + D-15**. Researchers run 60 turns by default; most need ≤15. Verifiers at `xhigh` effort waste thinking-token budget. Hot fix wired off `node_type`.
+- **B4**: provider fallback routing — **D-6**. The `fallback_above`/`fallback_below` fields in `config/agents/{kimi,glm,deepseek}.yaml` are currently dead metadata. Read them on `429|rate.limit|unavailable` errors and re-dispatch once to the fallback lane.
 
-**Recommendation:** add a **substrate self-audit step** to the framework
-that runs the audit recipe quarterly against itself. Promote the audit
-prompt-templates (`recipes/refactor-audit/`) to first-class versioned
-recipes under the O-R7 registry once that exists.
+**Total**: ~3 eng-weeks. **Prereq P1s**: W3 (avoids B2 fighting `cl_opus.sh`'s blanket pinning). **Risk if deferred**: B1+B2 absent → reflection cycles stay at $30/cycle and the framework can't afford to reflect more than once/day; B4 absent → a kimi quota event = hard batch failure with no automatic recovery.
+
+### Bundle C — **Runtime parallelism**: real sliding-window dispatch (3–5 days)
+
+- **C1**: replace `_flush_parallel_batch`'s synchronous `wait` on N pids with `wait -n` loop (bash 4.3+) — **G-12**. Today's batch-flush caps throughput at *batches* of 4, not a continuous sliding window of 4.
+- **C2**: drop `mo_aggregate_cache_stats` O(N²) jq accumulator → collect once, `jq -s` once — **K-13 + G-10**.
+
+**Total**: ~4 eng-days. **Prereq P1s**: none. **Risk if deferred**: dashboards (`cache-stats` recipe) get slower as logs accumulate, parallel recipes throttle artificially.
+
+### Bundle D — **Observability** (1 eng-week)
+
+- **D1**: OTLP exporter wired to the existing `mo_events.trace_id` + `llm_calls.traceparent` fields — **O-R6**. 150-line Python daemon shipping spans to local Jaeger. No schema change.
+- **D2**: per-recipe / per-model cost rollup VIEW + circuit breaker — **O-R7 + D-A**. Today's `MO_DAILY_BUDGET_USD` is a global cap; one expensive recipe can starve others.
+- **D3**: stage-cache CHECK constraint expansion — **D-12**. Add `'gradient-extract'` and `'reflection-run'` to the allowed `stage` enum in `lib/cache.sh:26-29`, then wire `mo_cache_emit` at the end of `gradient_extract()`. Earns ~100% LLM cost skip on redundant reflect cycles.
+
+**Total**: ~1 eng-week. **Prereq P1s**: W4 (so the cost rollup VIEW uses INTEGER created_at). **Risk if deferred**: gradient extraction debuggability collapses at 100K/day; one runaway recipe burns the global budget for the rest.
 
 ---
 
-## 7. How to Re-run
+## Section 4 — Long-horizon (P3 + advisory)
 
-The plan that generated this synthesis lives at
-`${MINI_ORK_RUN_DIR}/plan.json`. Re-execution path:
+These are tracked, not load-bearing yet.
+
+- **L1 — O-R1 PostgreSQL migration**. Real cost: 2–3 eng-weeks. **Don't pull forward.** SQLite + Bundle A (persistent dbd) sustains 100K/day comfortably. The trigger to start is sustained 50K+ tasks/day, not a calendar date. `db/migrations/` is already versioned `.sql`, so the port is mechanical except the PL/pgSQL trigger translation for `0012_safety.sql`.
+- **L2 — O-R2 monthly range partitioning + TTL archival**. Pairs with L1. Once PG is the substrate, partition `task_runs`, `mo_events`, `execution_traces`, `llm_calls`, `iters` by `created_at` monthly via `pg_partman`. Detach + Parquet-archive cold partitions to S3 after 90 days. Not meaningful pre-PG.
+- **L3 — O-R4 queue-backed worker pool**. Required *only* at 10M/day (~115 task_runs/sec). Until then, persistent dbd + sliding-window parallelism (Bundle A1 + C1) is enough. When the trigger fires: 150-worker Python pool, `dispatch.db` as job table, `SELECT … FOR UPDATE SKIP LOCKED` semantics. Do **not** try to build this in Bash — Opus's lens is right that signal handling makes it unmaintainable.
+- **L4 — D-B semantic gradient cache (embeddings)**. Pre-dispatch cosine-similarity check on `(status, task_class, verifier_output)` embeddings against existing `gradient_records`. Catches the "same BDD failure, different trace_id" duplication class that exact-hash dedup (D-3) cannot. Free with a local MiniLM model. Earns 60–80% cache hit at steady state — but only worth the complexity once the gradient library matures past ~10K records.
+- **L5 — O-R10 recipe signing**. The `audit_log` append-only trigger is the right provenance primitive; extend it to log every recipe load with `SHA-256(workflow.yaml)`. Mandatory before any public recipe registry opens, not before.
+- **L6 — O-R8 kill inline `_ensure_table` DDL guards**. Policy: DDL lives only in `db/migrations/`. The drift between inline `CREATE TABLE IF NOT EXISTS` in `lib/trace_store.sh` and the canonical migration was the cause of the v0.2-pt11.5 `gradient_records` data-loss class of bug. Apply repo-wide once Bundle A migrations land.
+- **L7 — G-23 `MO_TRACE_QUERY_LIMIT=0` silent-loss guard**, **G-25 `--no-verify` env gate**, **G-26/G-27 DB-level DDL idempotency check** — pure hygiene items. Roll into the next refactor sprint, low priority but trivially cheap to fix.
+
+---
+
+## Section 5 — Hardest Open Question (inherited from `lens-opus.md §7`)
+
+**How does the self-evolution loop behave under adversarial gradient injection at scale?**
+
+The framework's central claim — documented in `docs/SAFETY.md §7-rung ladder` and `docs/ARCHITECTURE.md §evolution` — is that it self-improves via gradient signals extracted from `execution_traces`. The safety model assumes `execution_traces` is trustworthy (written by verified agents under scope constraints). At 10M/day, a compromised or misaligned agent writing maliciously crafted traces could systematically bias the gradient signal and steer promotion outcomes without ever triggering a single-event review.
+
+Opus sketches 3 mitigations: (1) `safety_constraints` immutability (`0012_safety.sql`), (2) human sign-off at Rung 6, (3) `mutation-adversary` stress testing.
+
+**My assessment: these are necessary but not sufficient.** Here's why:
+
+- **Mitigation (1)** is a root-of-trust anchor, not a defense against poisoned *inputs* to that root. The immutability trigger protects the rules, not the gradient stream they're applied to.
+- **Mitigation (2)** is rate-limited by human review bandwidth. At 10M task_runs/day, even 0.001% promotion rate = 100 promotions/day — far past the bandwidth of any single reviewer. The poisoning attack just needs to operate below whatever sampling rate the human review uses.
+- **Mitigation (3)** is `lib/mutation-adversary.sh` operating at the recipe level. It does not adversarially perturb `gradient_records` rows directly — it perturbs upstream agent prompts. A patient attacker who *is* the agent can sidestep this entirely.
+
+**What's missing.** A gradient-integrity verifier. Concretely: every `gradient_records` row should carry a verifiable provenance chain to the `execution_traces` row that produced it, signed by the agent's promoted-version hash. The `audit_log` append-only trigger gives the substrate; what's missing is the *checker* that periodically samples gradient rows, re-derives them from source traces, and flags drift. This is a 2–3 eng-week build, not a trivial config change.
+
+**Recommendation**: track this as a P3 (research-mode) item now. It is not blocking 100K/day. It is the single biggest unresolved structural risk before any production 10M/day deployment.
+
+---
+
+## Section 6 — Dogfood Reflection (meta-loop check)
+
+**Was this audit reproducible via the framework?** Yes. The 4 lens nodes fanned out under the `refactor-audit` recipe (`mini-ork run refactor-audit … --dispatch-mode parallel`). The lens-completeness verifier (`verifiers/lens-completeness.sh`) gated the publisher node, and this synthesis is itself a reviewer-class artifact under the canonical workflow.
+
+**Did any lens get blocked by something the audit itself identified?** Two interesting feedback loops:
+
+1. **Codex lens (D-1) flagged that `cl_opus.sh` pins all subagent slots to opus** — and Codex itself ran under a non-opus lane, so it caught the pattern in a way an opus-lane lens would not have flagged with the same urgency. Meta-loop holds: cheaper lenses see expensive-lane waste more clearly.
+
+2. **GLM lens G-1 / Kimi K-1 / Codex D-2 all flagged the serial per-trace LLM loop in `lib/reflection_pipeline.sh:65`** — which is exactly the pattern that *this very audit* uses to fan out 4 sequential lenses. The audit pipeline itself ran serially in the orchestrator's `_flush_parallel_batch` (G-12), capping at batches of 4 with synchronous `wait`. If we'd wanted 8 lenses, we'd have run 4 then 4 — not a continuous sliding window of 8. So: the audit identified a bottleneck the audit-orchestration substrate also has.
+
+**Was the audit itself within the cost budget?** Aggregate spend at run-end: see `cost-ledger.txt` (budget verifier `budget-cap` enforced `MO_REFACTOR_AUDIT_BUDGET_USD=$40` default). Lens-opus (1500–2500 word narrative on opus) was the largest single line item.
+
+**Verifier-false-pass risk**: `verifiers/lens-completeness.sh` ships strict checks for file existence + non-empty + ≥1 file:line anchor + section-count gates. The depth-check (`glm-finding-count` requires 15–60 headings/list items, `opus-seven-sections` requires `## ` × 7 + `^[0-9]+\. ` × 8) blocks the stub-pass class of failure. The contract is sound; no obvious gap.
+
+---
+
+## Section 7 — How to Re-run This Audit
 
 ```bash
-# from repo root
+cd /Volumes/docker-ssd/ps/mini-ork
+git checkout 6d70157   # planner-time HEAD (read-only invariant)
+
+# Set budget cap (default $40); reduce for cheaper dry runs
 export MO_REFACTOR_AUDIT_BUDGET_USD=40
-bin/mini-ork run recipes/refactor-audit/workflow.yaml \
-    --target "$(pwd)" \
-    --dispatcher parallel \
-    --lenses glm,kimi,codex,opus
+
+# Optional: lower model effort for cheaper exploratory re-run
+export MO_WORKER_EFFORT_LEVEL=medium
+
+# Run
+bin/mini-ork run refactor-audit \
+    kickoff-prompts/scalability-audit.kickoff.md \
+    --dispatch-mode parallel
 ```
 
-Outputs land in `.mini-ork/runs/run-<ts>-<pid>/`:
+Artifacts land in `~/.mini-ork/runs/run-${RUN_ID}/`:
+- `lens-{glm,kimi,codex,opus}.md` — the 4 lens reports
+- `synthesis.md` — this document
+- `cost-ledger.txt` — per-node cost trail (gated by `budget-cap` verifier)
 
-- `lens-glm.md`, `lens-kimi.md`, `lens-codex.md`, `lens-opus.md`
-- `synthesis.md`
-- `verifiers/lens-completeness.sh` exit code
+Publisher copies `synthesis.md` → `docs/refactor/SCALABILITY-AUDIT.md` and commits with message `audit(scalability): refresh from run-${RUN_ID}`. **Publisher will not run if `verifiers/lens-completeness.sh` failed** — fail-closed by design.
 
-The publisher then copies `synthesis.md` → `docs/refactor/SCALABILITY-AUDIT.md`
-byte-for-byte (`diff -q` is one of the verifier checks).
-
-**Blocking caveat:** the synthesizer in this run was dispatched via
-`mo_llm_dispatch`, which **★ [CONSENSUS-1]** identifies as fork-leaky and
-cost-undercounted. The audit can still self-dispatch — none of the P1s
-*block* re-running — but the cost envelope check (`MO_REFACTOR_AUDIT_BUDGET_USD`)
-will under-report by the `runs`-table delta until **G-03** ships. If you
-intend to gate the next audit on a tighter envelope ($20, say), land **G-03**
-first or be prepared for the breaker to fire late.
-
-No other P1 blocks self-dispatch. The audit framework is dogfood-clean modulo
-its own cost-accounting bug.
+**P1 blocker on self-dispatch?** None of the Top-5 W1–W5 items block re-running this audit. W3 (`cl_opus.sh` fan-out) does inflate the cost of running it — applying W3 first would drop the next run's cost by ~50–60%. **Recommendation: ship W3 before the next refresh.**
 
 ---
 
-*End of synthesis. Findings cross-referenced to original lens reports at
-`${MINI_ORK_RUN_DIR}/lens-{glm,kimi,codex,opus}.md`.*
+## Recommended Next 3 Code-Fix Recipes
+
+Ranked by ROI = (severity × leverage) / effort. Each maps to a single `code-fix` recipe invocation against a focused file set.
+
+1. **`code-fix: w3-cl-opus-tier-split`** — patch `lib/providers/cl_opus.sh:11-14` to split sonnet/haiku/subagent model envs off opus. 15-minute patch, ~$8K/day saved at 100K tier. **Ship first.**
+
+2. **`code-fix: w2-kill-d009-double-charge`** — delete or gate the D-009 flat-rate cost charge block in `bin/mini-ork-execute:718-737` now that D-029 records real per-node cost. Half-day patch + cost-ledger backfill script. Doubles effective daily budget headroom without raising the cap.
+
+3. **`code-fix: w1-batch-gradient-extraction`** — rewrite `lib/reflection_pipeline.sh:65-73` from a serial per-trace LLM loop to a 20-trace batched dispatch + bulk `executemany` SQL insert (K-1's after-block). 3-day patch, ~95% LLM call-count reduction on reflect cycles, eliminates the framework's single largest hot-loop cost class.
+
+These three, shipped in order, recover ~$14K/day of bleed and clear the prerequisite for Bundle A1 (persistent SQLite helper daemon) without any schema migration.
