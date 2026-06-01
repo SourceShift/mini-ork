@@ -32,6 +32,16 @@ lanes:
   # Legacy aliases for backward-compat with v0.0-shape pipelines.
   worker_default: sonnet
   reviewer_default: opus
+  # v0.2-pt14 (D-047): heterogeneous-family lens lanes. Per Nasser 2026
+  # (arxiv:2601.05114) Krippendorff α=0.042 across same-family judges —
+  # multi-agent review only achieves Rajan 2025's submodularity gain when
+  # pairwise ρ stays low. Each lens lane maps to a DISTINCT model family
+  # so 4 named lenses (glm/kimi/codex/opus) actually run on 4 families,
+  # not 3-of-4 collapsed to Sonnet via decomposer/spec_author/worker mapping.
+  glm_lens: glm          # Zhipu
+  kimi_lens: kimi        # Moonshot
+  codex_lens: codex      # OpenAI Codex (executable wrapper)
+  opus_lens: opus        # Anthropic (kept — different role: deep arch)
 budget:
   per_epic_usd: 5.00
   per_run_usd: 0.50
