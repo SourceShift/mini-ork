@@ -15,42 +15,119 @@ node types, 6 edge types, 6 gates, 8 memory namespaces); pipeline shapes
 live in `recipes/`. Two reference recipes ship: `code-fix` (minimal) and
 `bdd-first-delivery` (multi-stage migration target for the literal port).
 
-## Next (v0.2 — Q3 2026 target)
+### v0.2.0 — 2026-06-01 (current)
 
-The memory + reflection layer becomes live, not just stubbed:
+Dogfood-converged + self-publishing + positioning-grounded. The framework
+now audits itself, publishes its own synthesis to a canonical path under a
+`mini-ork@local` git identity, and routes lens nodes to **4 distinct model
+families** by configuration (meeting the heterogeneity precondition for
+[Rajan 2025](https://arxiv.org/abs/2511.16708)'s submodularity proof).
 
-- `lib/reflection_pipeline.sh` actually runs background gradient extraction
-  on completed runs (currently the primitive exists but isn't wired into the
-  bin loop).
-- `lib/pattern_store.sh` detects emergent patterns across runs and surfaces
-  them as proposed workflow changes.
-- `lib/benchmark_suite.sh` gains a built-in seed task set (one per task class)
-  so users can `mini-ork eval --candidate <id>` against shipped benchmarks
-  immediately after install.
-- More starter recipes per the book's task-class table:
-  - `recipes/research-synthesis/`
-  - `recipes/blog-post/`
-  - `recipes/ui-audit/`
-  - `recipes/db-migration/`
-  - `recipes/ops-runbook/`
+**Phase A — Dogfood convergence + self-publishing** ✓
+- 3 mini-ork@local auto-commits across DF10/11/12
+- Publisher node reads `artifact_contract.outputs[]`, copies synthesis to
+  canonical paths, `git commit` under framework identity (D-037)
+- Conditional rollback honors `edge_type: escalates_to` (D-038)
 
-## Later (v0.3+ — Q4 2026 / 2027)
+**Phase B — Substrate + rich content** ✓ (pipeline + content; gradient
+extraction prompt-tuning is D-048, deferred)
+- Migration 0014 relaxes `execution_traces.run_id NOT NULL` (D-039) +
+  widens status check to include `pending`
+- `trace_store.sh` INSERT realigned to migration 0010's actual column
+  schema (was using `prompt_version` instead of `prompt_version_hash`)
+- `_trace_write_node_rich` helper populates `files_written` +
+  `cost_usd` per dispatch (D-042); reflect pipeline traverses 6 stages
+  clean
 
-The evolution + promotion layer becomes live:
+**Phase C — Measurable improvement** ✓ scaffold
+- `mini-ork metrics --recipe <name>` emits markdown/JSON cross-cycle
+  trajectory: cost trend, wall-time trend, trace density, gradient yield
+- 12 dogfood cycles tracked, $24.31 cumulative cost
+
+**Phase D — Scale-ready primitives** ✓
+- WAL + busy_timeout per-connection (R1 / F-10 / F-11 / K-01)
+- Concurrency cap on parallel dispatch via `MINI_ORK_MAX_PARALLEL` (R3 / F-28)
+- Reflection batch LIMIT (R6 / F-15 / F-17 / F-18 / K-04)
+- Cost circuit breaker `MO_DAILY_BUDGET_USD` (R10 / G-016)
+- `execution_traces` indexes (R4 / F-27)
+- 8 `_ensure_table` DDL session guards (G-003 ★★ consensus)
+- `--output-format json` real cost extraction with `.last-llm-cost`
+  sidecar (D-04 / D-29)
+- 36 audit-flagged P1s closed across 30 commits
+
+**Phase F — OSS publish** ✓
+- Public at https://github.com/SourceShift/mini-ork (Apache 2.0)
+- CI green: shellcheck (`--severity=error` blocks, `--severity=warning`
+  advisory) + smoke test on every push
+
+**Phase G — Positioning lock-in** ✓
+- 4-distinct-family lens routing in `recipes/refactor-audit/workflow.yaml`
+  (D-047): glm_lens→glm, kimi_lens→kimi, codex_lens→codex, opus_lens→opus
+- `docs/positioning/why-mini-ork.md` captures 6-paper literature grounding
+  ([Nasser 2026](https://arxiv.org/abs/2601.05114) + [Rajan 2025](https://arxiv.org/abs/2511.16708) + [Karanam 2025](https://arxiv.org/abs/2512.21352) + [Zietsman 2026](https://arxiv.org/abs/2603.25773) + [Shehata 2026](https://arxiv.org/abs/2604.27274) + [Song 2026](https://arxiv.org/abs/2603.21454))
+- README top-of-fold positioning section + 7-axis comparison vs
+  single-vendor agent SDKs (Claude Code / OpenAI Agents SDK / LangGraph)
+
+**Phase E — Evolution + promotion** — NOT in v0.2 (was originally scheduled
+but the v0.2 arc focused on Phase A→G durability; E moves to v0.3).
+
+## Next (v0.3 — Q3 2026 target)
+
+The literature-grounded gaps from the positioning doc + the deferred
+items from v0.2:
+
+### Calibration + adversarial gates (the positioning-doc honest-gaps list)
+
+- **Krippendorff α calibration gate** per Nasser 2026: compute α across
+  deliberators' first-round proposals; below 0.4 → escalate to human review
+  rather than vote on it
+- **Adversarial fabricated-bug injection** per [Agarwal 2026 *Refute-or-Promote*](https://arxiv.org/abs/2604.19049):
+  plant N known-fake bugs in the audit input; measure validator
+  false-positive survival rate as the quality signal
+- **Wireheading check on validators**: verify the validator actually read
+  the cited file (Read/Grep tool calls in trace) before upholding severity.
+  Already partly there via D-042 rich `files_read` capture — the gate isn't
+  enforced yet
+- **Honest confidence intervals on every claim** per [Dai 2025 *Semantic Triangulation*](https://arxiv.org/abs/2511.12288):
+  not "P1" but "P1 ± 1 (95% CI: [P0, P2]) per N=4 validators with κ=0.3"
+
+### Evolution + promotion layer (deferred from v0.2)
 
 - `lib/group_evolver.sh` proposes workflow candidates based on accumulated
-  trace + pattern data; `mini-ork improve` materializes them.
+  trace + gradient data; `mini-ork improve` materialises them
 - `lib/promotion_gate.sh` enforces utility-delta + benchmark-pass + safety
-  checks before promoting a candidate to the active workflow.
+  checks before promoting a candidate to the active workflow
 - `lib/version_registry.sh` exposes rollback as a first-class CLI verb:
-  `mini-ork rollback <workflow|agent> <name>`.
-- A web dashboard (separate repo) reads state.db read-only for visualisation
-  of: task_runs by status, agent performance trends, candidate utility deltas,
-  pending promotions awaiting human gate.
+  `mini-ork rollback <workflow|agent> <name>`
+
+### Substrate
+
+- D-048: gradient_extract prompt-tuning — extract returns 0 even on rich
+  traces because audit-recipe traces are coordination-shaped not
+  algorithmic. Prompt needs to ask "what would improve this recipe?"
+  not "what algorithm needs fixing?", OR reflect should treat
+  `synthesis.md` as the recipe-level gradient signal
+- D-045: `task_runs.ended_at` is never set by D-021 status helper —
+  metric trajectory shows pre-v0.2 cycles with multi-thousand-min wall
+  time
+
+### Recipe portfolio
+
+- `recipes/research-synthesis/` — multi-source paper synthesis
+- `recipes/blog-post/` — long-form writing with iterative review
+- `recipes/ui-audit/` — design-doc + screenshot lens triangulation
+- `recipes/db-migration/` — schema-change with safety-gate
+- `recipes/ops-runbook/` — incident-response playbook generator
+
+### Web dashboard (separate repo)
+
+Reads `state.db` read-only for visualisation: task_runs by status, agent
+performance trends, candidate utility deltas, pending promotions awaiting
+human gate.
 
 ## Eventually (v1.0)
 
-- Hardened multi-machine state (PostgreSQL backend as an alternative to
+- Hardened multi-machine state (Postgres backend as an alternative to
   sqlite for teams; same schema)
 - A standard plugin protocol so third-party verifier scripts can be installed
   via `mini-ork plugin install <name>`
@@ -82,4 +159,4 @@ These have been considered and intentionally excluded:
 
 ## Last updated
 
-2026-05-30 (initial)
+2026-06-01 — v0.2.0 ship + Phase G positioning lock-in
