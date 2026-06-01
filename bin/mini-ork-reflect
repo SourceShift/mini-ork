@@ -107,10 +107,17 @@ echo "    since:   $SINCE"
 echo "    filter:  ${TASK_CLASS_FILTER:-all}"
 echo ""
 
-REFLECT_ARGS=(--since "$SINCE")
-[ -n "$TASK_CLASS_FILTER" ] && REFLECT_ARGS+=(--task-class "$TASK_CLASS_FILTER")
+# v0.2-pt11 (D-040): reflection_run takes ONE positional arg `since_ts`,
+# not --since flag. Old code passed (--since "$SINCE") as 2 args → first
+# arg "--since" hit `int(sys.argv[2])` in extract_gradients and threw
+# ValueError. Pass SINCE directly.
+# (TASK_CLASS_FILTER isn't yet plumbed into reflection_run — separate
+# follow-up; emit a warn so caller knows.)
+if [ -n "$TASK_CLASS_FILTER" ]; then
+  echo "  [warn] --task-class filter not yet implemented in reflection_run; ignoring" >&2
+fi
 
-reflection_run "${REFLECT_ARGS[@]}"
+reflection_run "$SINCE"
 
 # ── trace end ─────────────────────────────────────────────────────────────────
 trace_write "{\"trace_id\":\"$TRACE_ID\",\"task_class\":\"__reflect__\",\"status\":\"success\"}" >/dev/null 2>&1 || true
