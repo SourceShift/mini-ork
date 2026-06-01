@@ -112,11 +112,15 @@ echo "    scope:    ${TASK_CLASS_FILTER:-all}"
 echo "    limit:    ${CANDIDATE_LIMIT}"
 echo ""
 
-EVOLVER_ARGS=(--limit "$CANDIDATE_LIMIT" --perf-json "$PERF_SUMMARY")
-[ -n "$TASK_CLASS_FILTER" ] && EVOLVER_ARGS+=(--task-class "$TASK_CLASS_FILTER")
+# v0.2-pt27 (D-051 fix, 2026-06-01): group_propose takes POSITIONAL
+# history_json $1 + reads MINI_ORK_GROUP_CANDIDATES env for n_candidates —
+# previous code passed --limit/--perf-json flags which became literal
+# "--limit" $1, failing JSON parse at "Expecting value: line 1 column 1".
+# Task-class scoping already baked into $PERF_SUMMARY via FILTER_SQL above.
+export MINI_ORK_GROUP_CANDIDATES="$CANDIDATE_LIMIT"
 
 # group_propose emits candidate IDs (one per line) on stdout
-CANDIDATE_IDS=$(group_propose "${EVOLVER_ARGS[@]}")
+CANDIDATE_IDS=$(group_propose "$PERF_SUMMARY")
 
 if [ -z "$CANDIDATE_IDS" ]; then
   echo "improve: group_evolver produced no candidates (system may already be near-optimal)"
