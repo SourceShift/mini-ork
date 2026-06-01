@@ -295,6 +295,11 @@ print(json.dumps(obj))
 }
 
 # D-021: status transition helper. Updates task_runs.status at phase boundaries.
+# v0.2-pt24 (D-045 fix, 2026-06-01): also set ended_at when transitioning to
+# a terminal status (published / failed / completed / approved). Previously
+# ended_at stayed NULL forever → mini-ork-metrics showed multi-thousand-minute
+# wall times computed as (now - started_at) for cycles that had completed
+# days earlier. False signal in trajectory metrics.
 _d021_set_status() {
   local _new_status="$1"
   [ "$DRY_RUN" -eq 1 ] && return 0
@@ -305,8 +310,19 @@ _d021_set_status() {
 import sqlite3, sys, time
 con = sqlite3.connect(sys.argv[1])
 con.execute('PRAGMA journal_mode=WAL')
+new_status = sys.argv[3]
+# Match the actual CHECK constraint in migration 0010_runs.sql:
+# status IN ('classified','planned','executing','verifying','reviewing',
+#            'published','rolled_back','failed')
+TERMINAL = {'published', 'rolled_back', 'failed'}
 try:
-    con.execute('UPDATE task_runs SET status = ?, updated_at = ? WHERE id = ?', (sys.argv[3], int(time.time()), sys.argv[2]))
+    if new_status in TERMINAL:
+        con.execute(
+            'UPDATE task_runs SET status = ?, updated_at = ?, ended_at = COALESCE(ended_at, ?) WHERE id = ?',
+            (new_status, int(time.time()), int(time.time()), sys.argv[2])
+        )
+    else:
+        con.execute('UPDATE task_runs SET status = ?, updated_at = ? WHERE id = ?', (new_status, int(time.time()), sys.argv[2]))
     con.commit()
 finally:
     con.close()
