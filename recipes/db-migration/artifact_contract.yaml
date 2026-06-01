@@ -1,0 +1,38 @@
+version: "0.1.0"
+recipe: db_migration
+
+outputs:
+  - path: "${MINI_ORK_RUN_DIR}/migration-plan.md"
+    description: Sequenced migration plan — idempotent forward SQL + reversal SQL + smoke scripts + risk summary.
+    mime: text/markdown
+    required: true
+
+  - path: "${MINI_ORK_RUN_DIR}/lens-integrity.md"
+    description: GLM lens — column-type compat, NULL/CHECK constraint handling, FK preservation.
+    mime: text/markdown
+    required: true
+
+  - path: "${MINI_ORK_RUN_DIR}/lens-rollback.md"
+    description: Kimi lens — reversibility per step, data-recovery path if migration fails mid-flight.
+    mime: text/markdown
+    required: true
+
+  - path: "${MINI_ORK_RUN_DIR}/lens-perf.md"
+    description: Codex lens — index cost, lock time, table-size implications, online-DDL options.
+    mime: text/markdown
+    required: true
+
+  - path: "${MINI_ORK_RUN_DIR}/lens-compat.md"
+    description: Opus lens — application-code compat, ORM expectations, downstream consumer impact.
+    mime: text/markdown
+    required: true
+
+  - path: "${MINI_ORK_RUN_DIR}/lens-edge.md"
+    description: MiniMax lens — weird existing rows that break the migration (very old data, mixed encodings, NULL where not expected).
+    mime: text/markdown
+    required: true
+
+success_verifiers:
+  - verifiers/migration-completeness.sh
+
+risk_class: high
