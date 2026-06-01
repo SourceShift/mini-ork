@@ -214,6 +214,45 @@ finally:
 " "$MINI_ORK_DB" "$MINI_ORK_RUN_ID" "$_cost" 2>/dev/null || true
 }
 
+# D-042 (v0.2-pt12): build a rich trace_write payload for a node.
+# Args: trace_id status node_type output_file [reviewer_verdict]
+# Reads cost from ${MINI_ORK_RUN_DIR}/.last-llm-cost when present.
+# Populates files_written + cost_usd + final_artifact_ref so reflect's
+# gradient_extract has real signal (vs. empty traces that the LLM
+# correctly evaluated as "nothing to learn from" — D-042 root cause).
+_trace_write_node_rich() {
+  local _trace_id="$1" _status="$2" _node_type="$3" _output_file="${4:-}" _verdict="${5:-}"
+  local _cost="0"
+  if [ -n "${MINI_ORK_RUN_DIR:-}" ] && [ -f "${MINI_ORK_RUN_DIR}/.last-llm-cost" ]; then
+    _cost=$(cat "${MINI_ORK_RUN_DIR}/.last-llm-cost" 2>/dev/null | tr -d '[:space:]' || echo "0")
+    [ -z "$_cost" ] && _cost="0"
+  fi
+  # Compose JSON payload via python3 for proper escaping.
+  local _payload
+  _payload=$(python3 -c "
+import json, sys, os
+trace_id, status, node_type, output_file, verdict, cost, task_class = sys.argv[1:8]
+obj = {
+    'trace_id': trace_id,
+    'task_class': task_class,
+    'status': status,
+    'cost_usd': float(cost) if cost else 0.0,
+    'tool_calls': '[]',
+    'files_read': '[]',
+    'files_written': json.dumps([output_file]) if output_file else '[]',
+}
+if output_file:
+    obj['final_artifact_ref'] = output_file
+if verdict:
+    obj['reviewer_verdict'] = verdict
+obj['verifier_output'] = json.dumps({'node_type': node_type})
+print(json.dumps(obj))
+" "$_trace_id" "$_status" "$_node_type" "$_output_file" "$_verdict" "$_cost" "${TASK_CLASS:-generic}" 2>/dev/null)
+  if [ -n "$_payload" ]; then
+    trace_write "$_payload" >/dev/null 2>&1 || true
+  fi
+}
+
 # D-021: status transition helper. Updates task_runs.status at phase boundaries.
 _d021_set_status() {
   local _new_status="$1"
@@ -331,9 +370,9 @@ _dispatch_node() {
         echo "$RESULT" > "$CONTEXT_FILE"
         echo "  [ok] researcher output → $CONTEXT_FILE"
       fi
-      trace_write "{\"trace_id\":\"$NODE_TRACE_ID\",\"task_class\":\"${TASK_CLASS}\",\"status\":\"success\",\"final_artifact_ref\":\"${CONTEXT_FILE}\"}" >/dev/null 2>&1 || true
-      # D-022: charge per-node cost. Placeholder $0.01/node until v0.2.1
-      # extracts real claude --output-format json cost.
+      # D-042: rich trace payload — files_written + cost_usd + final_artifact_ref
+      # gives reflect's gradient_extract real signal to learn from.
+      _trace_write_node_rich "$NODE_TRACE_ID" "success" "researcher" "$CONTEXT_FILE" ""
       _d022_charge_node_cost "${MINI_ORK_RUN_DIR}/.last-llm-cost"
       ;;
 
@@ -353,7 +392,8 @@ _dispatch_node() {
         --prompt-text "$PROMPT_CONTENT" 2>&1) || { echo "implementer dispatch failed" >&2; return 1; }
       echo "$RESULT" > "$IMPL_LOG"
       echo "  [ok] implementer output → $IMPL_LOG"
-      trace_write "{\"trace_id\":\"$NODE_TRACE_ID\",\"task_class\":\"${TASK_CLASS}\",\"status\":\"success\",\"final_artifact_ref\":\"${IMPL_LOG}\"}" >/dev/null 2>&1 || true
+      # D-042 rich trace payload
+      _trace_write_node_rich "$NODE_TRACE_ID" "success" "implementer" "$IMPL_LOG" ""
       _d022_charge_node_cost "${MINI_ORK_RUN_DIR}/.last-llm-cost"
       ;;
 
@@ -403,7 +443,8 @@ _dispatch_node() {
       fi
       VERDICT=$(echo "$RESULT" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('verdict','unknown'))" 2>/dev/null || echo "unknown")
       echo "  [ok] reviewer verdict=${VERDICT} → $REVIEW_FILE"
-      trace_write "{\"trace_id\":\"$NODE_TRACE_ID\",\"task_class\":\"${TASK_CLASS}\",\"status\":\"success\",\"reviewer_verdict\":\"${VERDICT}\"}" >/dev/null 2>&1 || true
+      # D-042 rich trace payload — reviewer/synthesizer node
+      _trace_write_node_rich "$NODE_TRACE_ID" "success" "reviewer" "$REVIEW_FILE" "$VERDICT"
       _d022_charge_node_cost "${MINI_ORK_RUN_DIR}/.last-llm-cost"
       ;;
 
