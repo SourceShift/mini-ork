@@ -1,0 +1,39 @@
+version: "0.1.0"
+recipe: blog_post
+
+outputs:
+  - path: "${MINI_ORK_RUN_DIR}/draft.md"
+    description: Final blog post draft, ready for human polish + publish.
+    mime: text/markdown
+    required: true
+
+  - path: "${MINI_ORK_RUN_DIR}/lens-editor.md"
+    description: GLM lens — structural editorial pass (headline, lede, flow).
+    mime: text/markdown
+    required: true
+
+  - path: "${MINI_ORK_RUN_DIR}/lens-researcher.md"
+    description: Kimi lens — claim grounding + citation suggestions.
+    mime: text/markdown
+    required: true
+
+  - path: "${MINI_ORK_RUN_DIR}/lens-narrative.md"
+    description: Codex lens — narrative flow, transitions, hook coherence.
+    mime: text/markdown
+    required: true
+
+  - path: "${MINI_ORK_RUN_DIR}/lens-audience.md"
+    description: Opus lens — audience fit, jargon density, accessibility.
+    mime: text/markdown
+    required: true
+
+  - path: "${MINI_ORK_RUN_DIR}/lens-counter.md"
+    description: MiniMax lens — counter-argument + steelmans + likely
+      objections from skeptical reader.
+    mime: text/markdown
+    required: true
+
+success_verifiers:
+  - verifiers/draft-completeness.sh
+
+risk_class: low
