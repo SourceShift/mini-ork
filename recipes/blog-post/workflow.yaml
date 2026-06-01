@@ -1,0 +1,41 @@
+version: "0.1.0"
+task_class: blog_post
+description: >
+  Multi-perspective blog drafting — 5 lens stances run in parallel across
+  DISTINCT model families (editor/researcher/narrative/audience/counter on
+  glm/kimi/codex/opus/minimax), 1 synthesis pass composes the final draft.
+
+# 5-family panel — per Rajan 2025 + Nasser 2026 (arxiv:2511.16708 +
+# arxiv:2601.05114), low pairwise correlation is the precondition for
+# multi-agent review's submodularity gain. Same lens names map to distinct
+# model lanes via config/agents.yaml.
+nodes:
+  - { name: planner,         type: planner,    model_lane: planner,        prompt_ref: prompts/planner.md,           dispatch_mode: serial }
+  - { name: editor_lens,     type: researcher, model_lane: glm_lens,       prompt_ref: prompts/lens-editor.md,       dispatch_mode: parallel, gates: [budget_gate] }
+  - { name: researcher_lens, type: researcher, model_lane: kimi_lens,      prompt_ref: prompts/lens-researcher.md,   dispatch_mode: parallel, gates: [budget_gate] }
+  - { name: narrative_lens,  type: researcher, model_lane: codex_lens,     prompt_ref: prompts/lens-narrative.md,    dispatch_mode: parallel, gates: [budget_gate] }
+  - { name: audience_lens,   type: researcher, model_lane: opus_lens,      prompt_ref: prompts/lens-audience.md,     dispatch_mode: parallel, gates: [budget_gate] }
+  - { name: counter_lens,    type: researcher, model_lane: minimax_lens,   prompt_ref: prompts/lens-counter.md,      dispatch_mode: parallel, gates: [budget_gate] }
+  - { name: synthesizer,     type: reviewer,   model_lane: reviewer,       prompt_ref: prompts/synthesis.md,         dispatch_mode: serial,   gates: [budget_gate] }
+  - { name: draft_completeness, type: verifier, verifier_ref: verifiers/draft-completeness.sh, dispatch_mode: serial }
+  - { name: publisher,       type: publisher,  prompt_ref: null, dispatch_mode: serial, gates: [scope_gate] }
+  - { name: rollback,        type: rollback,   prompt_ref: null, dispatch_mode: serial }
+
+edges:
+  - { from: planner, to: editor_lens,     edge_type: depends_on }
+  - { from: planner, to: researcher_lens, edge_type: depends_on }
+  - { from: planner, to: narrative_lens,  edge_type: depends_on }
+  - { from: planner, to: audience_lens,   edge_type: depends_on }
+  - { from: planner, to: counter_lens,    edge_type: depends_on }
+  - { from: editor_lens,     to: synthesizer, edge_type: supplies_context_to }
+  - { from: researcher_lens, to: synthesizer, edge_type: supplies_context_to }
+  - { from: narrative_lens,  to: synthesizer, edge_type: supplies_context_to }
+  - { from: audience_lens,   to: synthesizer, edge_type: supplies_context_to }
+  - { from: counter_lens,    to: synthesizer, edge_type: supplies_context_to }
+  - { from: synthesizer, to: draft_completeness, edge_type: verifies }
+  - { from: draft_completeness, to: publisher, edge_type: depends_on }
+  - { from: synthesizer, to: rollback, edge_type: escalates_to }
+  - { from: draft_completeness, to: rollback, edge_type: escalates_to }
+
+rollback_strategy: keep_lens_reports_discard_draft
+max_self_correction_iterations: 2

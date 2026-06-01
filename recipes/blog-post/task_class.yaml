@@ -1,0 +1,41 @@
+name: blog_post
+version: "0.1.0"
+description: >
+  5-lens collaborative blog post drafting. Each lens contributes from a
+  distinct perspective (editor / researcher / narrative-flow / audience-fit /
+  counter-argument) routed to a DIFFERENT model family. Synthesizer composes
+  the final draft. Per Rajan 2025 / Nasser 2026 heterogeneous-family
+  principle: same-family panels collapse to coalition; cross-family panels
+  preserve perspective independence.
+
+matches:
+  keywords:
+    - blog post
+    - blog draft
+    - draft a post
+    - launch post
+    - announcement post
+    - write a post about
+    - write an article about
+    - content marketing
+    - thought-leadership piece
+    - product launch announcement
+  regex: []
+
+artifact_contract_ref: artifact_contract.yaml
+default_workflow: workflow.yaml
+
+default_gates:
+  - budget_gate
+  - scope_gate
+
+risk_class: low
+
+cost_model:
+  min_usd: 1.50
+  max_usd: 8.00
+  per_lens_usd: 0.80
+
+runtime_model:
+  min_minutes: 3
+  max_minutes: 12
