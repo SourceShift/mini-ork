@@ -119,21 +119,39 @@ echo ""
 # Task-class scoping already baked into $PERF_SUMMARY via FILTER_SQL above.
 export MINI_ORK_GROUP_CANDIDATES="$CANDIDATE_LIMIT"
 
-# group_propose emits candidate IDs (one per line) on stdout
-CANDIDATE_IDS=$(group_propose "$PERF_SUMMARY")
+# group_propose emits CANDIDATE-OBJECT-PER-LINE JSON on stdout (despite the
+# variable name "CANDIDATE_IDS" — historically the design intent was IDs,
+# but pt-32 confirmed implementation actually emits objects).
+CANDIDATE_LINES=$(group_propose "$PERF_SUMMARY")
 
-if [ -z "$CANDIDATE_IDS" ]; then
+if [ -z "$CANDIDATE_LINES" ]; then
   echo "improve: group_evolver produced no candidates (system may already be near-optimal)"
 else
+  # v0.2-pt32 (Phase E gap closure): pipe each candidate JSON through
+  # workflow_candidate_store. Auto-bootstraps the baseline workflow_memory
+  # row + persists the workflow_candidates row. Until pt-32 this was a
+  # no-op — proposals existed only in stdout.
+  _require_lib workflow_lifecycle
+
   echo "Proposed candidates:"
-  while IFS= read -r cid; do
-    [ -z "$cid" ] && continue
+  STORED_IDS=()
+  while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    cid=$(workflow_candidate_store "$line" 2>/dev/null) || {
+      echo "  ✗ failed to store candidate (see stderr)" >&2
+      workflow_candidate_store "$line" 2>&1 | head -3 >&2
+      continue
+    }
     echo "  candidate_id=${cid}"
-  done <<< "$CANDIDATE_IDS"
+    STORED_IDS+=("$cid")
+  done <<< "$CANDIDATE_LINES"
   echo ""
+  echo "Persisted ${#STORED_IDS[@]} candidate(s) to workflow_candidates table."
   echo "Next: mini-ork eval --candidate <id>  (then: mini-ork promote --candidate <id>)"
   # Emit raw IDs last for machine consumption
-  echo "$CANDIDATE_IDS"
+  for cid in "${STORED_IDS[@]}"; do
+    echo "$cid"
+  done
 fi
 
 # ── trace end ─────────────────────────────────────────────────────────────────
