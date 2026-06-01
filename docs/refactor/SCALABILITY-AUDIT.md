@@ -656,3 +656,48 @@ artifact rather than a one-shot doc.
 - Next audit: schedule via `recipes/refactor-audit/` on every v0.x
   release tag, OR on-demand when the rate-of-change of `audit_log`
   exceeds threshold (signal that complexity has grown)
+
+### v0.2-pt18/19/20 — Top-5 audit follow-up (W3 + W2 + W5 shipped, W4 false-positive)
+
+After DF12's synthesis (`docs/refactor/synthesis-latest.md`) flagged 5
+immediate wins ranked by ROI, this commit arc closes 3 of 5:
+
+**pt-18 W3 — `cl_opus.sh` sub-agent tier split** (commit `1dd9593`, 15min):
+ANTHROPIC_DEFAULT_SONNET/HAIKU_MODEL + CLAUDE_CODE_SUBAGENT_MODEL no
+longer pinned to Opus when cl_opus.sh sources. ~$8K/day saved at 100K
+tier. Override knob `MO_OPUS_PIN_ALL=1` for legacy behavior.
+
+**pt-19 W2 — Kill D-009 double cost-charge** (commit `3ced30d`, half day):
+removed redundant flat `$0.01 × DISPATCHED_COUNT` charge at end-of-run.
+D-029 already records real total_cost_usd per node since pt-8. Phantom
+spend eliminated → MO_DAILY_BUDGET_USD headroom doubles. Status='reviewing'
+transition preserved.
+
+**pt-20 W5 — Lane-cache subshell-scope** (commit `???`, half day):
+`declare -gA _MO_LANE_CACHE` doesn't survive `( _dispatch_node ) &`
+subshell forks. Switched to per-key `export _MO_LANE_<NAME>=…` so
+parallel dispatch batches inherit the cache. Eliminates 4 redundant
+`python3 yaml.safe_load` forks per parallel batch.
+
+**W4 — created_at TEXT/INTEGER cast** (NOT SHIPPED — FALSE POSITIVE):
+the synthesis claimed `task_runs.created_at` is TEXT, causing
+type-affinity mismatch in the cost circuit breaker. **Verified false**:
+migration `db/migrations/0013_task_runs.sql:37` declares `created_at
+INTEGER NOT NULL`. Sample rows confirm `typeof(created_at)=integer`.
+Lens hallucinated the bug. (Mirror pattern of the Rajan 2025
+false-negative documented at `docs/research/citation-verification-2026-06-01.md`
+— lenses can produce both false negatives AND false positives;
+audit recommendations require independent verification before execution.)
+
+**W1 — Batch gradient extraction** (DEFERRED to v0.3): the W1 ROI
+($1.4K/day, 95% reflect-cycle cost cut) is CONTINGENT on
+gradient_extract actually producing signal. Currently D-048
+(gradient_extract returns 0 even on rich traces) blocks the
+upstream — until that's fixed, W1 just makes an empty pipeline
+cheaper. Sequence: D-048 prompt-tuning first → then W1 batch
+rewrite.
+
+**Audit verification trail summary** — false-positive rate so far:
+1 of 5 (20%) on W-class recommendations. Will track over future
+DF cycles; pattern suggests routing audit recommendations through a
+verifier-script BEFORE consuming them mechanically.
