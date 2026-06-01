@@ -38,6 +38,18 @@ jobs:
           echo ""
           echo "::notice::shellcheck warning count: $WARN_COUNT (advisory, non-blocking)"
 
+      # v0.2-pt17: lint catches direct `claude --print` callers missing the
+      # permission-bypass flag. Advisory (not blocking) so accidental drift
+      # surfaces in PR review without failing CI on legitimate edge cases.
+      # See docs/PERMISSION-FLAG.md for the failure signature + fix flavors.
+      - name: Lint claude permission flags
+        continue-on-error: true
+        run: |
+          bash bin/mo-check-claude-invocations || {
+            echo "::warning::Direct claude --print invocations missing permission-bypass flag — see docs/PERMISSION-FLAG.md"
+            exit 0   # advisory only
+          }
+
   smoke:
     name: smoke test
     runs-on: ubuntu-latest
