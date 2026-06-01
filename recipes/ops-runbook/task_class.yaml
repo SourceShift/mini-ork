@@ -1,0 +1,39 @@
+name: ops_runbook
+version: "0.1.0"
+description: >
+  5-lens incident runbook generation. Each lens contributes a distinct
+  operational stance (detection / containment / diagnosis / recovery /
+  prevention) routed to a DIFFERENT model family. Synthesizer composes
+  a runnable runbook with explicit commands + verification steps + rollback.
+
+matches:
+  keywords:
+    - runbook
+    - playbook
+    - incident response
+    - on-call guide
+    - operational guide
+    - SOP
+    - standard operating procedure
+    - SRE runbook
+    - troubleshooting guide
+    - "if X happens, do Y"
+  regex: []
+
+artifact_contract_ref: artifact_contract.yaml
+default_workflow: workflow.yaml
+
+default_gates:
+  - budget_gate
+  - scope_gate
+
+risk_class: medium    # Runbooks affect prod ops — wrong recipe = wrong response.
+
+cost_model:
+  min_usd: 2.00
+  max_usd: 10.00
+  per_lens_usd: 1.00
+
+runtime_model:
+  min_minutes: 4
+  max_minutes: 12

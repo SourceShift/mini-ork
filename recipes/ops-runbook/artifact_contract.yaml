@@ -1,0 +1,38 @@
+version: "0.1.0"
+recipe: ops_runbook
+
+outputs:
+  - path: "${MINI_ORK_RUN_DIR}/runbook.md"
+    description: Runnable runbook — detection → containment → diagnosis → recovery → prevention, each step with command + verify + rollback.
+    mime: text/markdown
+    required: true
+
+  - path: "${MINI_ORK_RUN_DIR}/lens-detection.md"
+    description: GLM lens — symptoms, alert routes, dashboards, log queries.
+    mime: text/markdown
+    required: true
+
+  - path: "${MINI_ORK_RUN_DIR}/lens-containment.md"
+    description: Kimi lens — blast-radius limiting actions, kill-switches, traffic shifts.
+    mime: text/markdown
+    required: true
+
+  - path: "${MINI_ORK_RUN_DIR}/lens-diagnosis.md"
+    description: Codex lens — debugging ladder, "what to check" tree, log grep recipes.
+    mime: text/markdown
+    required: true
+
+  - path: "${MINI_ORK_RUN_DIR}/lens-recovery.md"
+    description: Opus lens — restoration sequence with rollback per step, expected outputs.
+    mime: text/markdown
+    required: true
+
+  - path: "${MINI_ORK_RUN_DIR}/lens-prevention.md"
+    description: MiniMax lens — postmortem prompts, prevention via guard-rails, test additions.
+    mime: text/markdown
+    required: true
+
+success_verifiers:
+  - verifiers/runbook-completeness.sh
+
+risk_class: medium

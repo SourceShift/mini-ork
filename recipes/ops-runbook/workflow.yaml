@@ -1,0 +1,37 @@
+version: "0.1.0"
+task_class: ops_runbook
+description: >
+  5-lens runbook generation — detection/containment/diagnosis/recovery/prevention
+  in parallel across DISTINCT model families (glm/kimi/codex/opus/minimax).
+  Synthesizer composes a runnable, sequenced runbook with verification steps.
+
+nodes:
+  - { name: planner,           type: planner,    model_lane: planner,       prompt_ref: prompts/planner.md,              dispatch_mode: serial }
+  - { name: detection_lens,    type: researcher, model_lane: glm_lens,      prompt_ref: prompts/lens-detection.md,       dispatch_mode: parallel, gates: [budget_gate] }
+  - { name: containment_lens,  type: researcher, model_lane: kimi_lens,     prompt_ref: prompts/lens-containment.md,     dispatch_mode: parallel, gates: [budget_gate] }
+  - { name: diagnosis_lens,    type: researcher, model_lane: codex_lens,    prompt_ref: prompts/lens-diagnosis.md,       dispatch_mode: parallel, gates: [budget_gate] }
+  - { name: recovery_lens,     type: researcher, model_lane: opus_lens,     prompt_ref: prompts/lens-recovery.md,        dispatch_mode: parallel, gates: [budget_gate] }
+  - { name: prevention_lens,   type: researcher, model_lane: minimax_lens,  prompt_ref: prompts/lens-prevention.md,      dispatch_mode: parallel, gates: [budget_gate] }
+  - { name: synthesizer,       type: reviewer,   model_lane: reviewer,      prompt_ref: prompts/synthesis.md,            dispatch_mode: serial,   gates: [budget_gate] }
+  - { name: runbook_completeness, type: verifier, verifier_ref: verifiers/runbook-completeness.sh, dispatch_mode: serial }
+  - { name: publisher,         type: publisher,  prompt_ref: null, dispatch_mode: serial, gates: [scope_gate] }
+  - { name: rollback,          type: rollback,   prompt_ref: null, dispatch_mode: serial }
+
+edges:
+  - { from: planner, to: detection_lens,   edge_type: depends_on }
+  - { from: planner, to: containment_lens, edge_type: depends_on }
+  - { from: planner, to: diagnosis_lens,   edge_type: depends_on }
+  - { from: planner, to: recovery_lens,    edge_type: depends_on }
+  - { from: planner, to: prevention_lens,  edge_type: depends_on }
+  - { from: detection_lens,   to: synthesizer, edge_type: supplies_context_to }
+  - { from: containment_lens, to: synthesizer, edge_type: supplies_context_to }
+  - { from: diagnosis_lens,   to: synthesizer, edge_type: supplies_context_to }
+  - { from: recovery_lens,    to: synthesizer, edge_type: supplies_context_to }
+  - { from: prevention_lens,  to: synthesizer, edge_type: supplies_context_to }
+  - { from: synthesizer, to: runbook_completeness, edge_type: verifies }
+  - { from: runbook_completeness, to: publisher, edge_type: depends_on }
+  - { from: synthesizer, to: rollback, edge_type: escalates_to }
+  - { from: runbook_completeness, to: rollback, edge_type: escalates_to }
+
+rollback_strategy: keep_lens_reports_discard_runbook
+max_self_correction_iterations: 2
