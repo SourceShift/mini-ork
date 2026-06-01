@@ -37,8 +37,11 @@ reflection_extract_gradients() {
 import sqlite3, json, sys
 con = sqlite3.connect(sys.argv[1])
 con.execute("PRAGMA busy_timeout=5000")  # v0.2-pt7 F-11
+# v0.2-pt11 (D-039 follow): execution_traces.created_at is TEXT (ISO-8601
+# per migration 0010 default), caller passes unix-ts INT — compare via
+# strftime('%s', created_at) cast to int.
 rows = con.execute(
-    "SELECT trace_id FROM execution_traces WHERE created_at >= ? ORDER BY created_at LIMIT ?",
+    "SELECT trace_id FROM execution_traces WHERE CAST(strftime('%s', created_at) AS INTEGER) >= ? ORDER BY created_at LIMIT ?",
     (int(sys.argv[2]), int(sys.argv[3]))
 ).fetchall()
 con.close()
