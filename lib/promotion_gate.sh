@@ -76,14 +76,17 @@ record_id = f"pr-{uuid.uuid4().hex[:16]}"
 con = sqlite3.connect(db)
 con.row_factory = sqlite3.Row
 
-# Fetch most recent benchmark run for this candidate
+# Fetch most recent benchmark run for this candidate.
+# v0.2-pt35 (Phase E gap closure, 2026-06-02): real benchmark_results
+# column is `pass` (INTEGER 0/1 bool), NOT `passed`. Patched both
+# aliases + the result-dict key consumed below.
 brun = con.execute("""
     SELECT candidate_id, passed, avg_utility_score, all_pass, total_tasks
     FROM (
         SELECT candidate_id,
-               SUM(passed) as passed,
+               SUM(pass) as passed,
                AVG(utility_score) as avg_utility_score,
-               MIN(passed) as all_pass,
+               MIN(pass) as all_pass,
                COUNT(*) as total_tasks
         FROM benchmark_results WHERE candidate_id=?
         GROUP BY candidate_id
@@ -146,16 +149,35 @@ result = {
     "safety_violations": safety_violations,
 }
 
+# v0.2-pt35 (Phase E gap closure, 2026-06-02): real schema columns are
+# promotion_id (PK), candidate_id, from_version_id, to_version_id,
+# utility_before, utility_after, benchmark_run_id, rationale, decision,
+# decided_at, decided_by. Previous code wrote `record_id` +
+# `safety_violations` + `evaluated_at` from a divergent draft.
+# from_version_id + to_version_id are required NOT NULL FKs to
+# workflow_memory — resolve via the candidate's base_workflow_version_id
+# (from_ = baseline; to_ = baseline + candidate mutations applied — for
+# now both reference the baseline since we don't yet materialize a new
+# workflow_memory row per candidate).
+base_ver_row = con.execute(
+    "SELECT base_workflow_version_id FROM workflow_candidates WHERE candidate_id=?",
+    (cid,)
+).fetchone()
+base_ver = base_ver_row[0] if base_ver_row else None
+if not base_ver:
+    print(f"promotion_evaluate: candidate {cid} has no base_workflow_version_id", file=sys.stderr)
+    sys.exit(1)
+
 con.execute("""
     INSERT INTO promotion_records
-        (record_id, candidate_id, decision, rationale,
+        (promotion_id, candidate_id, from_version_id, to_version_id,
          utility_before, utility_after, benchmark_run_id,
-         safety_violations, evaluated_at)
-    VALUES (?,?,?,?,?,?,?,?,?)
+         rationale, decision, decided_by)
+    VALUES (?,?,?,?,?,?,?,?,?,?)
 """, (
-    record_id, cid, decision, rationale,
-    utility_before, utility_after, cid,
-    json.dumps(safety_violations), now,
+    record_id, cid, base_ver, base_ver,
+    utility_before, utility_after, None,
+    rationale, decision, "gate",
 ))
 con.commit()
 con.close()

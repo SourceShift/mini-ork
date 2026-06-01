@@ -178,9 +178,16 @@ now = int(time.time())
 try:
     con.execute("""
         UPDATE workflow_candidates
-        SET utility_delta=?, tasks_evaluated=?, eval_status='evaluated', updated_at=?
-        WHERE id=?
-    """, (float(utility_delta), int(task_count), now, candidate_id))
+        SET utility_delta = ?,
+            status        = 'shadow'
+        WHERE candidate_id = ?
+    """, (float(utility_delta), candidate_id))
+    # v0.2-pt35 (Phase E gap closure, 2026-06-02): the schema has no
+    # `eval_status` / `tasks_evaluated` / `updated_at` columns. Real schema:
+    # candidate_id (PK), base_workflow_version_id (FK), mutations, status enum,
+    # benchmark_summary_id, utility_delta, created_by, created_at.
+    # State transition: candidate -> shadow on eval completion. Promotion
+    # gate keys off status='shadow' (or 'candidate' with --force).
     con.commit()
 except sqlite3.OperationalError as e:
     print(f"[warn] DB update skipped: {e}", file=sys.stderr)
