@@ -1,0 +1,41 @@
+name: research_synthesis
+version: "0.1.0"
+description: >
+  Multi-lens research synthesis on a topic / question. Four researcher
+  lenses (web search, literature review, code-pattern survey, deep
+  narrative) dispatched to DISTINCT model families; one synthesizer
+  composes a ranked consensus + dissent doc. Non-audit demonstration
+  of the heterogeneous-family multi-agent pattern.
+
+matches:
+  keywords:
+    - research
+    - synthesis
+    - literature review
+    - survey
+    - investigate
+    - find out
+    - what does the literature say
+    - state of the art
+    - SOTA
+    - background research
+    - deep research
+  regex: []
+
+artifact_contract_ref: artifact_contract.yaml
+default_workflow: workflow.yaml
+
+default_gates:
+  - budget_gate
+  - scope_gate
+
+risk_class: low   # Research is read-only synthesis; no code mutation.
+
+cost_model:
+  min_usd: 2
+  max_usd: 30
+  per_lens_usd: 4
+
+runtime_model:
+  min_minutes: 5
+  max_minutes: 45

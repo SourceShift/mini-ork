@@ -1,0 +1,39 @@
+version: "0.1.0"
+task_class: research_synthesis
+description: >
+  Multi-model research synthesis — 4 lens stances run in parallel
+  across DISTINCT model families (web/lit/code/narrative on
+  glm/kimi/codex/opus), 1 synthesis pass composes consensus +
+  dissent into a ranked research doc.
+
+# Each lens routes to its NAMED family lane (mirrors refactor-audit
+# v0.2-pt14 D-047 fix). Per Rajan 2025 + Nasser 2026: low pairwise
+# correlation between voters is the precondition for multi-agent
+# review's submodularity gain.
+nodes:
+  - { name: planner,        type: planner,     model_lane: planner,       prompt_ref: prompts/planner.md,         dispatch_mode: serial }
+  - { name: glm_lens,       type: researcher,  model_lane: glm_lens,      prompt_ref: prompts/lens-glm-web.md,    dispatch_mode: parallel, gates: [budget_gate] }
+  - { name: kimi_lens,      type: researcher,  model_lane: kimi_lens,     prompt_ref: prompts/lens-kimi-lit.md,   dispatch_mode: parallel, gates: [budget_gate] }
+  - { name: codex_lens,     type: researcher,  model_lane: codex_lens,    prompt_ref: prompts/lens-codex-code.md, dispatch_mode: parallel, gates: [budget_gate] }
+  - { name: opus_lens,      type: researcher,  model_lane: opus_lens,     prompt_ref: prompts/lens-opus-narrative.md, dispatch_mode: parallel, gates: [budget_gate] }
+  - { name: synthesizer,    type: reviewer,    model_lane: reviewer,      prompt_ref: prompts/synthesis.md,       dispatch_mode: serial,   gates: [budget_gate] }
+  - { name: source_completeness, type: verifier, verifier_ref: verifiers/source-completeness.sh, dispatch_mode: serial }
+  - { name: publisher,      type: publisher,   prompt_ref: null, dispatch_mode: serial, gates: [scope_gate] }
+  - { name: rollback,       type: rollback,    prompt_ref: null, dispatch_mode: serial }
+
+edges:
+  - { from: planner, to: glm_lens,   edge_type: depends_on }
+  - { from: planner, to: kimi_lens,  edge_type: depends_on }
+  - { from: planner, to: codex_lens, edge_type: depends_on }
+  - { from: planner, to: opus_lens,  edge_type: depends_on }
+  - { from: glm_lens,   to: synthesizer, edge_type: supplies_context_to }
+  - { from: kimi_lens,  to: synthesizer, edge_type: supplies_context_to }
+  - { from: codex_lens, to: synthesizer, edge_type: supplies_context_to }
+  - { from: opus_lens,  to: synthesizer, edge_type: supplies_context_to }
+  - { from: synthesizer, to: source_completeness, edge_type: verifies }
+  - { from: source_completeness, to: publisher, edge_type: depends_on }
+  - { from: synthesizer, to: rollback, edge_type: escalates_to }
+  - { from: source_completeness, to: rollback, edge_type: escalates_to }
+
+rollback_strategy: keep_lens_reports_discard_synthesis
+max_self_correction_iterations: 2
