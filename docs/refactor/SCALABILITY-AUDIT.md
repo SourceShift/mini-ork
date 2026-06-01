@@ -468,6 +468,45 @@ richness — when DF cycles produce richer traces (files_read/written/
 tool_calls/verifier_output populated by execute), real gradients will
 extract and the self-improvement chain will produce actionable signal.
 
+### v0.2-pt12 — D-042 rich trace_write content (Phase B value-generating)
+
+`_trace_write_node_rich` helper composes a rich JSON payload per node
+dispatch with files_written + cost_usd + final_artifact_ref +
+reviewer_verdict. Researcher/implementer/reviewer call sites upgraded.
+Smoke verified: rich trace lands with cost=0.42, files_written
+populated. After next DF cycle, gradient_extract has signal to work
+with — Phase B becomes value-generating, not just pipeline-functional.
+
+### v0.2-pt13 — Phase C scaffold (`mini-ork metrics`)
+
+New `bin/mini-ork-metrics` queries state.db for task_runs +
+execution_traces + gradient_records → emits markdown table (default)
+or JSON (`--format json`) showing cross-cycle trajectory: cost trend,
+wall-time trend, trace density, gradient yield. Wired into dispatcher.
+
+Smoke across 12 refactor-audit cycles (the dogfood arc DF1→DF12):
+- $17.10 total cost
+- 9 execution_traces (pre-pt12)
+- 0 gradients (pre-DF12 with rich content)
+
+Phase C SCAFFOLD SHIPPED. Completion: cross-DF delta auto-detect
+(regression flag) + Loki/Tempo span integration → next session.
+
+### Phase F milestone — OSS publish + CI green
+
+2026-06-01: framework migrated to **https://github.com/SourceShift/mini-ork**
+(public, Apache 2.0). amirkhakshour/mini-ork archived (legacy clone
+preserved read-only for citation continuity).
+
+CI pipeline split into two tiers:
+- `shellcheck --severity=error` PR-blocking (codebase clean, exit 0)
+- `shellcheck --severity=warning` advisory (144 historical warnings
+  visible in run summary, non-blocking — incremental cleanup)
+- `bash tests/smoke.sh` (103 OK / 0 SKIP / 0 FAIL locally)
+
+CI green at commit `86892e0` (run 26741593759, 49s). The framework
+now has working public CI gating every commit.
+
 
 
 DF6 SPIKE is not a regression — it's expected when the framework crosses a
