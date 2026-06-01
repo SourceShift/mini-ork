@@ -65,35 +65,42 @@ try:
 except json.JSONDecodeError as e:
     print(f"benchmark_add: invalid JSON: {e}", file=sys.stderr)
     sys.exit(1)
-if not t.get("id") or not t.get("task_class"):
-    print("benchmark_add: id and task_class required", file=sys.stderr)
+# v0.2-pt35 (Phase E gap closure, 2026-06-02): real schema columns are
+# benchmark_id, task_class, input_payload, expected_artifact_hash,
+# expected_criteria, success_verifiers, baseline_utility_score, source,
+# created_at (TEXT default-now). Previous code wrote to `id` + `input` +
+# `expected_artifact_hash_or_criteria` which drifted from migration 0011.
+bench_id = t.get("benchmark_id") or t.get("id")
+if not bench_id or not t.get("task_class"):
+    print("benchmark_add: benchmark_id (or id) + task_class required", file=sys.stderr)
     sys.exit(1)
-now = int(time.time())
 con = sqlite3.connect(db)
 con.execute("""
     INSERT INTO benchmark_tasks
-        (id, task_class, input, expected_artifact_hash_or_criteria,
-         success_verifiers, baseline_utility_score, source, created_at)
+        (benchmark_id, task_class, input_payload,
+         expected_artifact_hash, expected_criteria,
+         success_verifiers, baseline_utility_score, source)
     VALUES (?,?,?,?,?,?,?,?)
-    ON CONFLICT(id) DO UPDATE SET
+    ON CONFLICT(benchmark_id) DO UPDATE SET
         task_class=excluded.task_class,
-        input=excluded.input,
-        expected_artifact_hash_or_criteria=excluded.expected_artifact_hash_or_criteria,
+        input_payload=excluded.input_payload,
+        expected_artifact_hash=excluded.expected_artifact_hash,
+        expected_criteria=excluded.expected_criteria,
         success_verifiers=excluded.success_verifiers,
         baseline_utility_score=excluded.baseline_utility_score
 """, (
-    t["id"],
+    bench_id,
     t["task_class"],
-    json.dumps(t.get("input", {})),
-    t.get("expected_artifact_hash_or_criteria"),
+    json.dumps(t.get("input_payload") or t.get("input") or {}),
+    t.get("expected_artifact_hash") or t.get("expected_artifact_hash_or_criteria") or "",
+    json.dumps(t.get("expected_criteria") or {}),
     json.dumps(t.get("success_verifiers", [])),
     float(t.get("baseline_utility_score", 0.0)),
-    t.get("source"),
-    now,
+    t.get("source") or "human",
 ))
 con.commit()
 con.close()
-print(t["id"])
+print(bench_id)
 PY
 }
 
@@ -115,10 +122,10 @@ con = sqlite3.connect(db)
 con.row_factory = sqlite3.Row
 if tc:
     rows = con.execute(
-        "SELECT * FROM benchmark_tasks WHERE task_class=? ORDER BY id", (tc,)
+        "SELECT * FROM benchmark_tasks WHERE task_class=? ORDER BY benchmark_id", (tc,)
     ).fetchall()
 else:
-    rows = con.execute("SELECT * FROM benchmark_tasks ORDER BY task_class, id").fetchall()
+    rows = con.execute("SELECT * FROM benchmark_tasks ORDER BY task_class, benchmark_id").fetchall()
 con.close()
 print(json.dumps([dict(r) for r in rows]))
 PY
