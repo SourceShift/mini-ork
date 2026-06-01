@@ -1,8 +1,8 @@
 # mini-ork
 
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-0.1.1-green.svg)](CHANGELOG.md)
-[![CI](https://img.shields.io/badge/CI-shellcheck%20%2B%20smoke-yellow.svg)](.github/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/SourceShift/mini-ork?label=release&color=green)](https://github.com/SourceShift/mini-ork/releases/latest)
+[![CI](https://github.com/SourceShift/mini-ork/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/SourceShift/mini-ork/actions/workflows/ci.yml)
 [![Status](https://img.shields.io/badge/status-early%20preview-orange.svg)](ROADMAP.md)
 
 mini-ork is a **task operating system for agents**. It receives a goal, classifies the work, chooses a workflow, dispatches specialized agents, verifies artifacts, and stores execution experience for self-improvement. It does NOT ship opinions on what your pipeline should look like — pipeline shapes live in [`recipes/`](./recipes/) as composable user-land examples.

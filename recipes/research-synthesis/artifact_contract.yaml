@@ -1,0 +1,19 @@
+task_class: research_synthesis
+expected_artifact: composite   # 4 lens reports + 1 synthesis markdown
+
+success_verifiers:
+  - verifiers/source-completeness.sh
+
+failure_policy: request_changes
+rollback_policy: >
+  Keep the 4 lens reports under runs/<id>/lens-*.md for inspection;
+  discard the synthesis if it failed verification. Lens reports remain
+  individually consumable as research notes.
+
+# Publisher path. Each cycle's synthesis is preserved in git history;
+# downstream consumers can link to the latest stable + the per-run
+# artifacts. Override per kickoff via `outputs:` field in kickoff if
+# desired (future v0.3 — kickoff-level overrides).
+source_artifact: synthesis.md
+outputs:
+  - docs/research/synthesis-latest.md
