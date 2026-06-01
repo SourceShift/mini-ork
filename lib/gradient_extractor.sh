@@ -132,20 +132,55 @@ raw = re.sub(r'^```[a-z]*\n?', '', raw, flags=re.MULTILINE)
 raw = re.sub(r'\n?```$', '', raw, flags=re.MULTILINE)
 raw = raw.strip()
 
+def _extract_objects_balanced(text):
+    """v0.2-pt24: brace-balanced extraction from possibly-truncated JSON
+    array output. Walks the buffer object-by-object via raw_decode so a
+    missing closing ] doesn't lose every gradient. Observed 2026-06-01:
+    MiniMax-M3 produced 4 valid gradients but stopped mid-array before
+    emitting ']' — the previous non-greedy regex /\[.*?\]/ failed to
+    match and we lost ALL of them."""
+    decoder = json.JSONDecoder()
+    objs = []
+    # Locate the first '[' or '{' — start of array or naked-objects stream.
+    i = text.find('[')
+    if i < 0:
+        i = text.find('{')
+    if i < 0:
+        return objs
+    # If we found a '[', advance past it.
+    if text[i] == '[':
+        i += 1
+    n = len(text)
+    while i < n:
+        # Skip whitespace + commas
+        while i < n and text[i] in ' \t\n\r,':
+            i += 1
+        if i >= n or text[i] == ']':
+            break
+        try:
+            obj, end = decoder.raw_decode(text, i)
+        except json.JSONDecodeError:
+            break
+        if isinstance(obj, dict):
+            objs.append(obj)
+        i = end
+    return objs
+
 try:
     items = json.loads(raw)
     if not isinstance(items, list):
         items = []
 except json.JSONDecodeError:
-    # Try to find array inside response
+    # First try the legacy non-greedy regex (still works for properly-closed arrays)
     m = re.search(r'\[.*?\]', raw, re.DOTALL)
     if m:
         try:
             items = json.loads(m.group())
         except Exception:
-            items = []
+            items = _extract_objects_balanced(raw)
     else:
-        items = []
+        # No closing ] anywhere — fall through to brace-balanced extraction.
+        items = _extract_objects_balanced(raw)
 
 for item in items:
     if not isinstance(item, dict):
