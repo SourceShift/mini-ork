@@ -27,6 +27,17 @@ reflection_extract_gradients() {
   # shellcheck source=lib/trace_store.sh
   source "${MINI_ORK_ROOT}/lib/trace_store.sh" 2>/dev/null || true
 
+  # v0.2-pt11.5 (D-043): defensive table-ensure. `_gradient_ensure_table`
+  # was only fired lazily by `gradient_store`. If LLM extracts 0
+  # gradients (legitimate when traces are sparse), `gradient_store` is
+  # never called, table never created, and downstream pipeline steps
+  # (deduplicate / detect_stale / suggest_promotions) crash with
+  # "no such table: gradient_records". Pre-create at extract start
+  # so the pipeline can traverse cleanly even on empty-gradient runs.
+  if declare -f _gradient_ensure_table >/dev/null 2>&1; then
+    _gradient_ensure_table 2>/dev/null || true
+  fi
+
   local trace_ids
   # v0.2-pt7 (R6/F-17): bounded fetchall — unbounded SELECT * FROM
   # execution_traces with no LIMIT was an O(N) memory bomb at 10M
@@ -256,7 +267,10 @@ reflection_run() {
   python3 - "${MINI_ORK_DB:?MINI_ORK_DB unset}" <<'PY' | while IFS= read -r cid; do
 import sqlite3, sys
 con = sqlite3.connect(sys.argv[1])
-rows = con.execute("SELECT DISTINCT cluster_id FROM pattern_records WHERE cluster_id IS NOT NULL").fetchall() 2>/dev/null or []
+try:
+    rows = con.execute("SELECT DISTINCT cluster_id FROM pattern_records WHERE cluster_id IS NOT NULL").fetchall() or []
+except sqlite3.OperationalError:
+    rows = []  # v0.2-pt11.5 (D-044): bash `2>/dev/null` syntax was leaked into Python heredoc
 con.close()
 for r in rows:
     print(r[0])
