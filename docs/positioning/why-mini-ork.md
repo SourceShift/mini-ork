@@ -123,6 +123,27 @@ mini-ork metrics --recipe refactor-audit --format json | jq '.totals'
 
 Phase C scaffold. Cross-cycle delta auto-detect coming in v0.3.
 
+## Citation-honesty audit trail (2026-06-01)
+
+The DF14 dogfood cycle of `research-synthesis` ran 4 distinct-family lenses
+against this positioning doc's argument. **The synthesis flagged the
+Rajan 2025 and Nasser 2026 citations as unverifiable by any lens** — all
+4 lenses' web-search tools failed to surface the papers.
+
+WebFetch verification against arxiv.org confirmed both citations are
+**real and accurate**:
+
+- [arxiv:2511.16708](https://arxiv.org/abs/2511.16708) "Multi-Agent Code Verification via Information Theory" by Shreshth Rajan — exact-match on title, submodularity claim, 4 specialists, ρ=0.05-0.25, 39.7-pp gain.
+- [arxiv:2601.05114](https://arxiv.org/abs/2601.05114) "Evaluative Fingerprints" by Wajid Nasser — exact-match on Krippendorff α=0.042, evaluative-fingerprints concept, harshness/leniency axis.
+
+The lens false-negatives are a known limitation: training-cutoffs and
+web-search indexing predate Nov 2025+ papers. The lens prompts forbid
+fabricating citations (must emit `[lookup: <query>]` placeholder), so the
+panel honestly flagged the gap rather than hallucinate. External
+WebFetch then closes the loop.
+
+Full audit trail: [`docs/research/citation-verification-2026-06-01.md`](../research/citation-verification-2026-06-01.md)
+
 ## Where mini-ork is honest about what it isn't (yet)
 
 - **Krippendorff α calibration gate** — not built. Reviewer pool currently
