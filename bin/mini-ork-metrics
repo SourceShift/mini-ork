@@ -1,0 +1,182 @@
+#!/usr/bin/env bash
+# mini-ork-metrics — Phase C: emit cross-DF trajectory metrics.
+#
+# v0.2-pt13: queries state.db for task_runs + execution_traces + gradient_records
+# and emits a markdown table (default) or JSON (--format=json) showing
+# the framework's self-improvement trajectory.
+#
+# Useful for: cross-cycle comparison, finding-discovery rate, cost trend,
+# wall-time trend, gradient-extraction signal strength.
+#
+# Usage:
+#   mini-ork metrics                          → markdown table, all recipes, last 7d
+#   mini-ork metrics --recipe refactor-audit  → filter to one recipe
+#   mini-ork metrics --since EPOCH            → time-bounded
+#   mini-ork metrics --format json            → JSON output for piping
+#   mini-ork metrics --help
+
+set -Eeuo pipefail
+
+MINI_ORK_ROOT="${MINI_ORK_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+export MINI_ORK_ROOT
+MINI_ORK_HOME="${MINI_ORK_HOME:-$(pwd)/.mini-ork}"
+MINI_ORK_DB="${MINI_ORK_DB:-$MINI_ORK_HOME/state.db}"
+
+RECIPE_FILTER=""
+SINCE=""
+FORMAT="markdown"
+
+_usage() {
+  cat <<'EOF'
+Usage: mini-ork metrics [--recipe <name>] [--since <epoch>] [--format markdown|json]
+
+Emit cross-cycle trajectory metrics from state.db. Reads task_runs +
+execution_traces + gradient_records to show the framework's self-
+improvement signal over time.
+
+Options:
+  --recipe <name>      Filter to one recipe (e.g. refactor-audit)
+  --since <epoch>      Unix timestamp lower bound (default: 7 days ago)
+  --format markdown    Markdown table (default; pretty-prints to terminal)
+  --format json        JSON array (pipeable, e.g. mini-ork metrics --format json | jq ...)
+  --help               This message
+
+Phase C deliverable. Trajectory measurement enables the framework's
+"measurable improvement" claim — without this, claims of self-
+improvement are narrative not numeric.
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --help|-h)   _usage; exit 0 ;;
+    --recipe)    RECIPE_FILTER="$2"; shift 2 ;;
+    --since)     SINCE="$2"; shift 2 ;;
+    --format)    FORMAT="$2"; shift 2 ;;
+    *)           echo "Unknown flag: $1" >&2; _usage; exit 2 ;;
+  esac
+done
+
+# Default since: 7 days ago
+if [ -z "$SINCE" ]; then
+  SINCE=$(date -v -7d +%s 2>/dev/null || date -d '7 days ago' +%s 2>/dev/null || echo "0")
+fi
+
+[ -f "$MINI_ORK_DB" ] || { echo "no state.db at $MINI_ORK_DB" >&2; exit 1; }
+
+# Compose recipe filter clause
+_recipe_clause=""
+if [ -n "$RECIPE_FILTER" ]; then
+  _recipe_clause="AND recipe='$RECIPE_FILTER'"
+fi
+
+# Query: per-cycle metrics from task_runs joined to trace + gradient counts
+_data=$(python3 - "$MINI_ORK_DB" "$SINCE" "$RECIPE_FILTER" <<'PY'
+import sqlite3, json, sys
+db, since, recipe_filter = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+con = sqlite3.connect(db)
+con.execute("PRAGMA busy_timeout=5000")
+
+# Per-cycle: id, recipe, status, cost_usd, created_at, ended_at, wall_secs,
+# trace_count (from execution_traces created during this cycle's window),
+# gradient_count (from gradient_records — currently global, not per-cycle)
+clause = "WHERE created_at >= ?"
+params = [since]
+if recipe_filter:
+    clause += " AND recipe = ?"
+    params.append(recipe_filter)
+
+rows = con.execute(f"""
+    SELECT id, recipe, status, cost_usd, created_at,
+           COALESCE(ended_at, strftime('%s','now')) AS ended_at_or_now
+    FROM task_runs
+    {clause}
+    ORDER BY created_at ASC
+""", params).fetchall()
+
+# Total trace + gradient counts (global, since the trace table doesn't
+# link back to task_runs.id directly — runs is a separate table).
+trace_total = con.execute(
+    "SELECT COUNT(*) FROM execution_traces WHERE CAST(strftime('%s', created_at) AS INTEGER) >= ?",
+    (since,)
+).fetchone()[0]
+
+try:
+    grad_total = con.execute("SELECT COUNT(*) FROM gradient_records").fetchone()[0]
+except sqlite3.OperationalError:
+    grad_total = 0
+
+con.close()
+
+cycles = []
+for r in rows:
+    rid, recipe, status, cost, created, ended = r
+    cycles.append({
+        "id": rid,
+        "recipe": recipe or "",
+        "status": status,
+        "cost_usd": float(cost or 0),
+        "created_at": int(created),
+        "ended_at": int(ended) if ended else 0,
+        "wall_secs": (int(ended) - int(created)) if ended else 0,
+    })
+
+print(json.dumps({
+    "cycles": cycles,
+    "totals": {
+        "cycle_count": len(cycles),
+        "total_cost_usd": sum(c["cost_usd"] for c in cycles),
+        "trace_count": trace_total,
+        "gradient_count": grad_total,
+    },
+    "since": since,
+    "recipe_filter": recipe_filter or "ALL",
+}))
+PY
+)
+
+if [ "$FORMAT" = "json" ]; then
+  echo "$_data"
+  exit 0
+fi
+
+# Default: markdown rendering via python (cleanest)
+python3 - <<PY
+import json, sys, datetime
+d = json.loads("""$_data""")
+cycles = d["cycles"]
+totals = d["totals"]
+
+print("# mini-ork trajectory")
+print()
+print(f"**Recipe filter:** {d['recipe_filter']}  ")
+print(f"**Window:** since {datetime.datetime.fromtimestamp(d['since']).isoformat()}  ")
+print(f"**Cycles:** {totals['cycle_count']}  ")
+print(f"**Total cost:** \${totals['total_cost_usd']:.4f}  ")
+print(f"**Total traces:** {totals['trace_count']}  ")
+print(f"**Total gradients:** {totals['gradient_count']}")
+print()
+
+if not cycles:
+    print("_No cycles in window._")
+    sys.exit(0)
+
+print("| # | Run ID | Recipe | Status | Cost \$ | Wall (min) | Created |")
+print("|---|--------|--------|--------|---------|------------|---------|")
+for i, c in enumerate(cycles, 1):
+    wall_min = c["wall_secs"] / 60.0
+    created = datetime.datetime.fromtimestamp(c["created_at"]).strftime("%Y-%m-%d %H:%M")
+    print(f"| {i} | \`{c['id'][:24]}\` | {c['recipe']} | {c['status']} | {c['cost_usd']:.4f} | {wall_min:.1f} | {created} |")
+
+print()
+print("## Trajectory signal")
+print()
+if len(cycles) >= 2:
+    first, last = cycles[0], cycles[-1]
+    cost_delta = last["cost_usd"] - first["cost_usd"]
+    wall_delta = (last["wall_secs"] - first["wall_secs"]) / 60.0
+    print(f"- Cost trend: first \${first['cost_usd']:.2f} → last \${last['cost_usd']:.2f} (Δ \${cost_delta:+.2f})")
+    print(f"- Wall trend: first {first['wall_secs']/60:.1f}min → last {last['wall_secs']/60:.1f}min (Δ {wall_delta:+.1f}min)")
+print(f"- Trace density: {totals['trace_count']/max(totals['cycle_count'],1):.1f} traces/cycle avg")
+print(f"- Gradient yield: {totals['gradient_count']} gradients across {totals['cycle_count']} cycles")
+PY
