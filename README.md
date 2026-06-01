@@ -7,6 +7,8 @@
 
 mini-ork is a **task operating system for agents**. It receives a goal, classifies the work, chooses a workflow, dispatches specialized agents, verifies artifacts, and stores execution experience for self-improvement. It does NOT ship opinions on what your pipeline should look like — pipeline shapes live in [`recipes/`](./recipes/) as composable user-land examples.
 
+> 🧭 **Why mini-ork vs Claude Code / OpenAI Agents SDK / LangGraph dynamic workflows:** see [`docs/positioning/why-mini-ork.md`](docs/positioning/why-mini-ork.md). TL;DR: most agent frameworks ship multi-agent review where **every agent is the same model family**. That's the [evaluative coalition bias](https://blog.sourceshift.io/p/we-ran-a-3-source-bug-hunt-then-we-realised-our-validators-were-all-claude) the literature ([Nasser 2026](https://arxiv.org/abs/2601.05114), [Rajan 2025](https://arxiv.org/abs/2511.16708)) flags as the failure mode. mini-ork dispatches lenses to **distinct families by configuration** (GLM, Kimi, Codex, Opus, DeepSeek, MiniMax) — the heterogeneity precondition for Rajan's submodularity proof, met by construction.
+
 > ⚡ **60-second demo (no API keys):** `bash examples/00-demo.sh` — bootstraps a throwaway project, runs the loop in dry-run mode, prints the `task_runs` row.
 
 ---

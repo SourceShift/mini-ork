@@ -7,10 +7,15 @@ description: >
 
 nodes:
   - { name: planner,        type: planner,     model_lane: planner,      prompt_ref: prompts/planner.md,  dispatch_mode: serial }
-  - { name: glm_lens,       type: researcher,  model_lane: decomposer,   prompt_ref: prompts/lens-glm.md,    dispatch_mode: parallel, gates: [budget_gate] }
-  - { name: kimi_lens,      type: researcher,  model_lane: spec_author,  prompt_ref: prompts/lens-kimi.md,   dispatch_mode: parallel, gates: [budget_gate] }
-  - { name: codex_lens,     type: researcher,  model_lane: worker,       prompt_ref: prompts/lens-codex.md,  dispatch_mode: parallel, gates: [budget_gate] }
-  - { name: opus_lens,      type: researcher,  model_lane: reviewer,     prompt_ref: prompts/lens-opus.md,   dispatch_mode: parallel, gates: [budget_gate] }
+  # v0.2-pt14 (D-047): each lens routes to its NAMED family lane for true
+  # heterogeneous-family multi-agent review (per Rajan 2025 ρ<0.25 +
+  # Nasser 2026 harshness diversity). Was: 3 of 4 lenses collapsed to
+  # Sonnet via decomposer/spec_author/worker mapping — coalition by
+  # accident. Now: glm/kimi/codex/opus dispatch to 4 distinct families.
+  - { name: glm_lens,       type: researcher,  model_lane: glm_lens,     prompt_ref: prompts/lens-glm.md,    dispatch_mode: parallel, gates: [budget_gate] }
+  - { name: kimi_lens,      type: researcher,  model_lane: kimi_lens,    prompt_ref: prompts/lens-kimi.md,   dispatch_mode: parallel, gates: [budget_gate] }
+  - { name: codex_lens,     type: researcher,  model_lane: codex_lens,   prompt_ref: prompts/lens-codex.md,  dispatch_mode: parallel, gates: [budget_gate] }
+  - { name: opus_lens,      type: researcher,  model_lane: opus_lens,    prompt_ref: prompts/lens-opus.md,   dispatch_mode: parallel, gates: [budget_gate] }
   - { name: synthesizer,    type: reviewer,    model_lane: reviewer,     prompt_ref: prompts/synthesis.md,    dispatch_mode: serial,   gates: [budget_gate] }
   - { name: lens_completeness, type: verifier, verifier_ref: verifiers/lens-completeness.sh, dispatch_mode: serial }
   - { name: publisher,      type: publisher,   prompt_ref: null, dispatch_mode: serial, gates: [scope_gate] }
