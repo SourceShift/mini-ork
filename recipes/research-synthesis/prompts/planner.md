@@ -53,6 +53,24 @@ Respond with **ONLY ONE top-level JSON object**, nothing else:
   - `success_verifiers` MUST be filenames matching `verifiers/*.sh`.
     For this recipe the only valid entry is
     `verifiers/source-completeness.sh`.
+  - Express ACCEPTANCE CRITERIA in natural language as
+    `verifier_contract.checks[]` entries (next field below), NOT as
+    sentences in `success_verifiers`.
+- `verifier_contract` (`{checks: [{id, description, command?}]}`) —
+  **REQUIRED**. The plan is rejected by the framework's plan
+  validator if this field is missing or empty. At minimum, include:
+  - `{id: "lenses-exist", description: "All 4 lens reports
+    (lens-glm.md, lens-kimi.md, lens-codex.md, lens-opus.md) exist
+    in ${MINI_ORK_RUN_DIR} and are non-empty (≥20 lines each)"}`
+  - `{id: "synthesis-cross-refs", description: "synthesis.md exists
+    and cross-references all 4 lens names by lens-prefix"}`
+  - `{id: "min-citations-per-lens", description: "Each lens-*.md
+    cites ≥5 sources (≥3 for opus narrative lens)"}`
+  - `{id: "consensus-markers", description: "synthesis.md uses ★
+    consensus markers where ≥2 lenses converge (soft signal — 0 is
+    acceptable for genuinely disputed topics)"}`
+  - Optional `command` field on a check makes it deterministically
+    checkable by the verifier; without it, it's an LLM-judged check.
 
 ## Topic context
 
