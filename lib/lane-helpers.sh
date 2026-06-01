@@ -133,3 +133,51 @@ mo_aggregate_cache_stats() {
       per_file: $breakdown
     }' > "$stats_file"
 }
+
+# ─────────────────────────────────────────────────────────────────────
+# mo_claude_print — canonical claude --print wrapper with permission
+# bypass + cache flags + max-turns baked in. Direct callers should use
+# this instead of invoking `claude --print` directly, so the permission
+# flag can't be accidentally dropped.
+#
+# v0.2-pt17 (per upstream-improvement proposal 2026-06-01): same fix-
+# class as D-2 in refactor-audit synthesis 2026-05-31 ("4 direct claude
+# -p callers bypass the daily cost circuit breaker"). This wrapper +
+# bin/mo-check-claude-invocations lint together close the gap upstream
+# AND give downstream dispatchers a 1-line migration target:
+#   claude --print "$prompt"   →   mo_claude_print "$prompt"
+#
+# Signature: mo_claude_print <prompt> [extra_args...]
+# Env knobs:
+#   MO_CLAUDE_MAX_TURNS         (default 40)
+#   MO_CLAUDE_OUTPUT_FORMAT     (default text; set json for cost extract)
+#   MO_PROMPT_CACHE_DISABLED    (=1 to skip cache flags)
+#
+# Returns claude's exit code; stdout = claude stdout, stderr = claude
+# stderr. Caller redirects as needed.
+#
+# NOTE: this wrapper does NOT source provider env-files (cl_*.sh).
+# Caller is expected to have already sourced the right provider in a
+# subshell. This wrapper just owns the FLAG discipline.
+mo_claude_print() {
+  local prompt="${1:?prompt required}"
+  shift || true
+
+  local _max_turns="${MO_CLAUDE_MAX_TURNS:-40}"
+  local _format="${MO_CLAUDE_OUTPUT_FORMAT:-text}"
+
+  # Cache flags via mo_emit_cache_flags (defined above in this file).
+  local -a _cache_flags=()
+  if declare -f mo_emit_cache_flags >/dev/null 2>&1; then
+    mo_emit_cache_flags _cache_flags || true
+  fi
+
+  claude \
+    --print \
+    --permission-mode bypassPermissions \
+    --output-format "$_format" \
+    --max-turns "$_max_turns" \
+    "${_cache_flags[@]}" \
+    "$@" \
+    "$prompt"
+}
