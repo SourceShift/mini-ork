@@ -78,7 +78,18 @@ mo_llm_dispatch() {
   # passthrough if jq fails (model not emitting JSON envelope) so
   # existing dispatches stay backward-compat. Disable opt-out via
   # MO_LLM_FORMAT=text.
+  #
+  # v0.2-pt23 (D-048 fix, 2026-06-01): when MO_TRACE_RICH=1, switch to
+  # --output-format stream-json so we can additionally parse tool_use
+  # events into a .tool-summary sidecar — populates tool_calls + files_read
+  # for execution_traces (was hardcoded [] at bin/mini-ork-execute:240-241,
+  # the single confirmed D-048 root cause per
+  # .agentflow/mini-orch/handoffs/20260601-2100-minimax-gateway-perf-report.md).
   local _format="${MO_LLM_FORMAT:-json}"
+  local _capture_trace="${MO_TRACE_RICH:-0}"
+  if [ "$_capture_trace" = "1" ] && [ "$_format" = "json" ]; then
+    _format="stream-json"
+  fi
   local _raw_out="${out_file}.raw"
 
   if _mo_llm_is_executable "$model"; then
@@ -96,6 +107,10 @@ mo_llm_dispatch() {
     # Sourceable env-export: must run claude in subshell with cl_*.sh sourced
     local secrets="${MINI_ORK_SECRETS:-${MINI_ORK_HOME:-.mini-ork}/config/secrets.local.sh}"
 
+    # v0.2-pt23: stream-json mode requires --verbose per claude CLI contract.
+    local _verbose_flag=()
+    [ "$_format" = "stream-json" ] && _verbose_flag=(--verbose)
+
     if [[ -n "$TIMEOUT_CMD" ]]; then
       (
         set +u  # secrets file may reference unset vars
@@ -105,6 +120,7 @@ mo_llm_dispatch() {
           --print \
           --permission-mode bypassPermissions \
           --output-format "$_format" \
+          "${_verbose_flag[@]}" \
           --max-turns "$max_turns" \
           "${_cache_flags[@]}" \
           "$prompt"
@@ -118,10 +134,95 @@ mo_llm_dispatch() {
           --print \
           --permission-mode bypassPermissions \
           --output-format "$_format" \
+          "${_verbose_flag[@]}" \
           --max-turns "$max_turns" \
           "${_cache_flags[@]}" \
           "$prompt"
       ) > "$_raw_out" 2>"$err_log" || { local _rc=$?; mv "$_raw_out" "$out_file" 2>/dev/null; return $_rc; }
+    fi
+
+    # v0.2-pt23: stream-json post-process — parse line-delimited events,
+    # extract final .result + .total_cost_usd + tool_calls + files_read.
+    if [ "$_format" = "stream-json" ]; then
+      python3 - "$_raw_out" "$out_file" "$err_log" <<'PY' || { local _rc=$?; mv "$_raw_out" "$out_file" 2>/dev/null; return $_rc; }
+import json, sys, os
+raw_path, out_path, err_path = sys.argv[1:4]
+result_text = None
+total_cost_usd = 0.0
+is_error_flag = False
+api_error_status = None
+tool_calls = []
+files_read = []
+files_written = []
+session_id = None
+try:
+    with open(raw_path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            et = obj.get('type')
+            if et == 'result':
+                result_text = obj.get('result')
+                total_cost_usd = float(obj.get('total_cost_usd', 0.0) or 0.0)
+                is_error_flag = bool(obj.get('is_error', False))
+                api_error_status = obj.get('api_error_status')
+                session_id = obj.get('session_id', session_id)
+            elif et == 'system' and obj.get('subtype') == 'init':
+                session_id = obj.get('session_id', session_id)
+            elif et == 'assistant':
+                msg = obj.get('message', {}) or {}
+                for block in msg.get('content', []) or []:
+                    if not isinstance(block, dict):
+                        continue
+                    if block.get('type') == 'tool_use':
+                        name = block.get('name', 'unknown')
+                        inp = block.get('input', {}) or {}
+                        tool_calls.append({'tool': name, 'input': inp})
+                        if name == 'Read':
+                            fp = inp.get('file_path')
+                            if fp and fp not in files_read:
+                                files_read.append(fp)
+                        elif name in ('Write', 'Edit', 'NotebookEdit'):
+                            fp = inp.get('file_path')
+                            if fp and fp not in files_written:
+                                files_written.append(fp)
+except Exception as e:
+    sys.stderr.write(f"stream-json post-process error: {e}\n")
+    with open(err_path, 'a') as ef:
+        ef.write(f"stream-json post-process error: {e}\n")
+    sys.exit(2)
+
+# is_error guard (same shape as v0.2-pt22, applied to stream-json result)
+if is_error_flag:
+    with open(err_path, 'a') as ef:
+        ef.write(f"mo_llm_dispatch: provider returned is_error=true (api_status={api_error_status})\n")
+        ef.write(f"result: {result_text or 'no error message'}\n")
+    sys.exit(3)
+
+with open(out_path, 'w') as f:
+    f.write((result_text or '') + ('\n' if result_text and not result_text.endswith('\n') else ''))
+with open(out_path + '.cost', 'w') as f:
+    f.write(f"{total_cost_usd}\n")
+with open(out_path + '.tool-summary', 'w') as f:
+    json.dump({
+        'session_id': session_id,
+        'tool_calls': tool_calls,
+        'files_read': files_read,
+        'files_written': files_written,
+    }, f)
+PY
+      local _post_rc=$?
+      if [ $_post_rc -ne 0 ]; then
+        rm -f "$_raw_out"
+        return $_post_rc
+      fi
+      rm -f "$_raw_out"
+      return 0
     fi
 
     # D-04 post-process: extract .result + .total_cost_usd from claude
