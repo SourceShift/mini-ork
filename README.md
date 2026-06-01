@@ -7,9 +7,72 @@
 
 mini-ork is a **task operating system for agents**. It receives a goal, classifies the work, chooses a workflow, dispatches specialized agents, verifies artifacts, and stores execution experience for self-improvement. It does NOT ship opinions on what your pipeline should look like — pipeline shapes live in [`recipes/`](./recipes/) as composable user-land examples.
 
-> 🧭 **Why mini-ork vs Claude Code / OpenAI Agents SDK / LangGraph dynamic workflows:** see [`docs/positioning/why-mini-ork.md`](docs/positioning/why-mini-ork.md). TL;DR: most agent frameworks ship multi-agent review where **every agent is the same model family**. That's the [evaluative coalition bias](https://blog.sourceshift.io/p/we-ran-a-3-source-bug-hunt-then-we-realised-our-validators-were-all-claude) the literature ([Nasser 2026](https://arxiv.org/abs/2601.05114), [Rajan 2025](https://arxiv.org/abs/2511.16708)) flags as the failure mode. mini-ork dispatches lenses to **distinct families by configuration** (GLM, Kimi, Codex, Opus, DeepSeek, MiniMax) — the heterogeneity precondition for Rajan's submodularity proof, met by construction.
-
 > ⚡ **60-second demo (no API keys):** `bash examples/00-demo.sh` — bootstraps a throwaway project, runs the loop in dry-run mode, prints the `task_runs` row.
+
+---
+
+## Why heterogeneous-family multi-agent (the load-bearing claim)
+
+**Most agent frameworks ship multi-agent review where every agent is the same model family.** That's the [evaluative coalition](https://blog.sourceshift.io/p/we-ran-a-3-source-bug-hunt-then-we-realised-our-validators-were-all-claude) failure mode the literature has now named, measured, and assigned harshness coefficients to. A panel of four Sonnets isn't four independent judges — it's one disposition amplified four times.
+
+mini-ork is built around the opposite prior: **dispatch lenses to distinct model families by configuration.** Every recipe-level decision (audit, review, synthesis, verification) routes through agents from different vendor families so that **pairwise correlation between voters stays low** — the precondition multi-agent review actually needs to outperform a single agent.
+
+### The literature this rests on
+
+| Paper | What it proves |
+|---|---|
+| [Nasser 2026](https://arxiv.org/abs/2601.05114) — *Evaluative Fingerprints* | 9-judge eval, 3240 ratings: Krippendorff α = **0.042** across same-family panels. Claude-Opus harshness −0.429, Gemini-3-Pro +0.262. Same family ≠ neutral. |
+| [Rajan 2025](https://arxiv.org/abs/2511.16708) — *CodeX-Verify* | Submodularity proof: multi-agent review catches strictly more bugs **iff** pairwise ρ < 0.25. **Heterogeneity isn't an optimisation — it's the precondition for the proof.** |
+| [Karanam 2025](https://arxiv.org/abs/2512.21352) | GPT-4o + Gemini 2.5 + Grok 2 panel: each persona catches a different ~88% of bugs, only ~12% overlap. |
+| [Zietsman 2026](https://arxiv.org/abs/2603.25773) — *Specification as Quality Gate* | AI-reviewing-AI without an executable specification is **structurally** circular. |
+| [Shehata 2026](https://arxiv.org/abs/2604.27274) — *Inverse-Wisdom Law* | "Consensus Paradox": homogeneous agents prioritise internal agreement over external truth. |
+| [Song 2026](https://arxiv.org/abs/2603.21454) — *Cross-Context Verification* | Repeating verification within one session **degrades** accuracy. False positives accrete faster than true ones get found. |
+
+### The detection-fingerprint test
+
+> "List the model families behind every hunter and every validator. If the list reads 'Sonnet, Sonnet, Sonnet, Sonnet, Opus' you have an evaluative coalition, not an audit."
+
+Run this test on any agent framework you're evaluating. mini-ork passes by construction:
+
+```yaml
+# config/agents.yaml — recipe-level lane assignment
+lanes:
+  # 4-family heterogeneous audit lenses
+  glm_lens:    glm          # Zhipu
+  kimi_lens:   kimi          # Moonshot
+  codex_lens:  codex          # OpenAI Codex
+  opus_lens:   opus          # Anthropic
+  # cross-family synthesizer
+  reviewer:   opus           # Anthropic (different role: arbiter)
+  decomposer: deepseek       # DeepSeek (different family for planning)
+```
+
+7 model-family wrappers ship out of the box at [`lib/providers/`](lib/providers/): `cl_{glm,kimi,codex,deepseek,opus,sonnet,minimax}.sh`. The audit recipe at [`recipes/refactor-audit/`](recipes/refactor-audit/) uses all 4 distinct families per cycle, verified end-to-end.
+
+### What you trade for what
+
+| You give up | You get |
+|---|---|
+| The convenience of one vendor's billing | Cross-family bias diversity (Nasser 2026) |
+| Same-vendor caching tricks | Submodularity-valid multi-agent review (Rajan 2025) |
+| Single-vendor SLA | Independence of failure modes — one vendor outage doesn't kill the cycle |
+| Uniform model behavior | Persona-differentiated bug catches (Karanam 2025) |
+
+### How it compares to Claude Code / OpenAI Agents SDK / LangGraph dynamic workflows
+
+| Axis | Single-vendor agent SDKs | mini-ork |
+|---|---|---|
+| Agent diversity | All same family (Sonnet/Opus, or GPT-4/o1, etc) | 7 families configurable per lane |
+| State persistence | Per-session, ephemeral | `state.db` (SQLite) across runs |
+| Trajectory measurement | None | `mini-ork metrics` cross-cycle |
+| Executable specification | Model decides what's good | `verifiers/*.sh` deterministic gates |
+| Self-publishing | Output stays in session log | Publisher node `git commit` under `mini-ork@local` |
+| Cross-cycle improvement | Each session starts from zero | reflect → improve → eval → promote chain |
+| Reproducibility | Run-to-run drift | Deterministic given same kickoff |
+
+**Composition, not competition:** mini-ork dispatches Claude Code, codex, gemini-cli, GLM, Kimi etc as worker agents. The framework is the operating system; the vendor SDKs are the engines.
+
+📖 **Deeper writeup:** [`docs/positioning/why-mini-ork.md`](docs/positioning/why-mini-ork.md) — 6-paper lit review + 5 verifiable claims + honest "what we haven't built yet" section.
 
 ---
 
