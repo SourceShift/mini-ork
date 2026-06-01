@@ -53,22 +53,13 @@ for f in "${FILES[@]}"; do
   # Use grep -n to keep line numbers; filter out comment lines.
   while IFS=':' read -r lineno rest; do
     [ -z "$lineno" ] && continue
-    # Skip comment lines (any leading whitespace, then '#').
-    # NOTE: previous version used `${rest##*( )}` extglob whitespace-strip,
-    # but that silently no-ops without `shopt -s extglob` enabled — so
-    # indented comments slipped through. Use bash regex instead.
-    if [[ "$rest" =~ ^[[:space:]]*\# ]]; then
-      continue
-    fi
-    # Skip lines that are echo/printf string arguments. The line shape
-    # `    echo "...claude --print..."` appears in error-message text
-    # inside dispatchers (e.g. documenting the silent-failure mode) —
-    # not an actual invocation. Match leading-whitespace + verb.
-    if [[ "$rest" =~ ^[[:space:]]*(echo|printf)[[:space:]] ]]; then
-      continue
-    fi
-    # Doc-comment heuristic — `#` BEFORE the claude word means it's
-    # in a comment fragment (e.g. `cmd  # claude --print example`).
+    # Strip leading whitespace from rest to test comment
+    trimmed="${rest##*( )}"
+    case "$trimmed" in
+      \#*) continue ;;  # comment line
+    esac
+    # Doc-comment heuristic — line containing `# ...` BEFORE the claude word
+    # (e.g. `# Example: claude --print ...`) — skip.
     pre_claude="${rest%%claude*}"
     case "$pre_claude" in
       *\#*) continue ;;
