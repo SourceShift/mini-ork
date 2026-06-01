@@ -42,6 +42,15 @@ lanes:
   kimi_lens: kimi        # Moonshot
   codex_lens: codex      # OpenAI Codex (executable wrapper)
   opus_lens: opus        # Anthropic (kept — different role: deep arch)
+  # v0.2-pt26 (2026-06-01): MiniMax-M3 lens. Verified end-to-end this
+  # session — produced 4 faithful/actionable/calibrated gradients on
+  # the gradient_extract synthetic-trace test (Opus 4.7 cross-family
+  # review: COMPETENT). Cost $0.31 / 46s / 56k input tokens / 1050 output.
+  # 5th distinct family further lowers pairwise ρ across the panel
+  # per Rajan 2025 submodularity argument. Recipes opt in via
+  # node.model_lane: minimax_lens (NOT auto-added to existing 4-lens
+  # workflows — that's a per-recipe cost-budget decision).
+  minimax_lens: minimax  # MiniMax (Anthropic-compatible gateway, M3)
 budget:
   per_epic_usd: 5.00
   per_run_usd: 0.50
