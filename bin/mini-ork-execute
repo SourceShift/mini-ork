@@ -107,6 +107,13 @@ RUN_DIR="$(dirname "$PLAN_PATH")"
 # tool. Without this, subagents pick their own (often stale) run dir based
 # on filesystem scan, breaking the recipe's expected artifact layout.
 export MINI_ORK_RUN_DIR="$RUN_DIR"
+
+# v0.2-pt23 (D-048 fix): enable rich-trace capture in lib/llm-dispatch.sh
+# so every dispatch emits a `.tool-summary` sidecar with tool_calls +
+# files_read parsed from claude stream-json. Consumed by
+# _trace_write_node_rich below — populates execution_traces.tool_calls /
+# files_read (previously hardcoded []). Opt-out via MO_TRACE_RICH=0.
+export MO_TRACE_RICH="${MO_TRACE_RICH:-1}"
 TASK_CLASS=$(python3 -c "
 import sys, json
 with open(sys.argv[1]) as f:
@@ -215,11 +222,18 @@ finally:
 }
 
 # D-042 (v0.2-pt12): build a rich trace_write payload for a node.
-# Args: trace_id status node_type output_file [reviewer_verdict]
+# Args: trace_id status node_type output_file [reviewer_verdict] [tool_summary_path]
 # Reads cost from ${MINI_ORK_RUN_DIR}/.last-llm-cost when present.
 # Populates files_written + cost_usd + final_artifact_ref so reflect's
 # gradient_extract has real signal (vs. empty traces that the LLM
 # correctly evaluated as "nothing to learn from" — D-042 root cause).
+#
+# v0.2-pt23 (D-048 fix, 2026-06-01): when ${output_file}.tool-summary
+# sidecar exists (emitted by llm-dispatch.sh in MO_TRACE_RICH=1 mode),
+# extract tool_calls + files_read from it and merge into the payload.
+# Previously hardcoded '[]' literal strings — the single confirmed
+# D-048 root cause per opus cross-family validation of MiniMax-M3
+# gradient_extract output on synthetic rich-shape trace (2026-06-01).
 _trace_write_node_rich() {
   local _trace_id="$1" _status="$2" _node_type="$3" _output_file="${4:-}" _verdict="${5:-}"
   local _cost="0"
@@ -227,19 +241,46 @@ _trace_write_node_rich() {
     _cost=$(cat "${MINI_ORK_RUN_DIR}/.last-llm-cost" 2>/dev/null | tr -d '[:space:]' || echo "0")
     [ -z "$_cost" ] && _cost="0"
   fi
+  # v0.2-pt23: tool-summary sidecar — emitted by lib/llm-dispatch.sh stream-json
+  # post-process when MO_TRACE_RICH=1. Located next to output_file as a sibling.
+  local _tool_summary=""
+  if [ -n "$_output_file" ] && [ -f "${_output_file}.tool-summary" ]; then
+    _tool_summary="${_output_file}.tool-summary"
+  fi
   # Compose JSON payload via python3 for proper escaping.
   local _payload
   _payload=$(python3 -c "
 import json, sys, os
-trace_id, status, node_type, output_file, verdict, cost, task_class = sys.argv[1:8]
+trace_id, status, node_type, output_file, verdict, cost, task_class, tool_summary_path = sys.argv[1:9]
+
+tool_calls = []
+files_read = []
+files_written_extra = []
+if tool_summary_path and os.path.isfile(tool_summary_path):
+    try:
+        with open(tool_summary_path) as f:
+            ts = json.load(f)
+        tool_calls = ts.get('tool_calls') or []
+        files_read = ts.get('files_read') or []
+        files_written_extra = ts.get('files_written') or []
+    except Exception as e:
+        sys.stderr.write(f'tool-summary parse error: {e}\n')
+
+files_written = []
+if output_file:
+    files_written.append(output_file)
+for fw in files_written_extra:
+    if fw and fw not in files_written:
+        files_written.append(fw)
+
 obj = {
     'trace_id': trace_id,
     'task_class': task_class,
     'status': status,
     'cost_usd': float(cost) if cost else 0.0,
-    'tool_calls': '[]',
-    'files_read': '[]',
-    'files_written': json.dumps([output_file]) if output_file else '[]',
+    'tool_calls': json.dumps(tool_calls),
+    'files_read': json.dumps(files_read),
+    'files_written': json.dumps(files_written) if files_written else '[]',
 }
 if output_file:
     obj['final_artifact_ref'] = output_file
@@ -247,7 +288,7 @@ if verdict:
     obj['reviewer_verdict'] = verdict
 obj['verifier_output'] = json.dumps({'node_type': node_type})
 print(json.dumps(obj))
-" "$_trace_id" "$_status" "$_node_type" "$_output_file" "$_verdict" "$_cost" "${TASK_CLASS:-generic}" 2>/dev/null)
+" "$_trace_id" "$_status" "$_node_type" "$_output_file" "$_verdict" "$_cost" "${TASK_CLASS:-generic}" "$_tool_summary" 2>/dev/null)
   if [ -n "$_payload" ]; then
     trace_write "$_payload" >/dev/null 2>&1 || true
   fi
