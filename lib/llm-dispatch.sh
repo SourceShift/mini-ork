@@ -129,6 +129,23 @@ mo_llm_dispatch() {
     # pass through raw — backward-compat for any caller expecting raw text.
     if [ "$_format" = "json" ] && command -v jq >/dev/null 2>&1 && \
        jq -e . "$_raw_out" >/dev/null 2>&1; then
+      # v0.2-pt22 (2026-06-01): detect wrapper-hides-error class.
+      # Observed: MiniMax-M2.7 401 returned subtype:"success" + is_error:true
+      # + result:"Not logged in · Please run /login". Without this guard the
+      # error string flows downstream as a "successful" model response —
+      # gradient_extract parses garbage, returns [], silent D-048 contributor.
+      # Perf report: .agentflow/mini-orch/handoffs/20260601-2100-minimax-gateway-perf-report.md
+      if jq -e '.is_error == true' "$_raw_out" >/dev/null 2>&1; then
+        local _api_status _err_msg
+        _api_status=$(jq -r '.api_error_status // "unknown"' "$_raw_out")
+        _err_msg=$(jq -r '.result // "no error message"' "$_raw_out")
+        {
+          echo "mo_llm_dispatch: provider returned is_error=true (api_status=$_api_status)"
+          echo "result: $_err_msg"
+        } >> "$err_log"
+        rm -f "$_raw_out"
+        return 3
+      fi
       jq -r '.result // .' "$_raw_out" > "$out_file"
       jq -r '.total_cost_usd // 0' "$_raw_out" > "${out_file}.cost" 2>/dev/null || true
       rm -f "$_raw_out"
