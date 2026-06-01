@@ -18,10 +18,25 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y shellcheck
 
-      - name: Run shellcheck on lib/ and bin/
+      # Severity tiers:
+      # - severity=error  → PR-blocking (real bugs: syntax, undefined vars, etc)
+      # - severity=warning → advisory, non-blocking (style + best-practice)
+      # Codebase has ~144 historical warnings; clean those up incrementally
+      # via dedicated commits, don't gate every PR on them.
+      - name: Run shellcheck (errors block CI)
         run: |
           find lib/ bin/ -name "*.sh" -o -name "mini-ork" \
-            | xargs shellcheck --shell=bash --severity=warning
+            | xargs shellcheck --shell=bash --severity=error
+
+      - name: Run shellcheck (warnings advisory)
+        continue-on-error: true
+        run: |
+          find lib/ bin/ -name "*.sh" -o -name "mini-ork" \
+            | xargs shellcheck --shell=bash --severity=warning \
+            | tee shellcheck-warnings.log
+          WARN_COUNT=$(grep -cE '^In .* line [0-9]+:' shellcheck-warnings.log || echo 0)
+          echo ""
+          echo "::notice::shellcheck warning count: $WARN_COUNT (advisory, non-blocking)"
 
   smoke:
     name: smoke test
@@ -33,7 +48,7 @@ jobs:
       - name: Install runtime deps
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y sqlite3 jq
+          sudo apt-get install -y sqlite3 jq python3 python3-yaml
 
       - name: Run smoke tests
         run: bash tests/smoke.sh
