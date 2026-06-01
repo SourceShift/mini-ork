@@ -416,6 +416,29 @@ subshells inherit flag via `export`.
 2 v0.2.2 + 1 v0.2.3 (G-003) closed. **29 total P1 audit findings
 shipped.**
 
+### v0.2-pt11 — Phase B data substrate unblocked (D-039 + D-040)
+
+Phase B inventory survey revealed all 3 bins exist (reflect/improve/eval)
++ functional + integrated. But probe revealed Phase B was DEAD ON
+ARRIVAL — substrate empty. Root cause: 2 silent bugs blocking the
+entire reflect→improve→eval→promote pipeline since framework inception.
+
+| ID | Title | Source | Fix | Status |
+|---|---|---|---|---|
+| **D-039** | `execution_traces` table EMPTY after 10+ DF cycles. Migration 0010's schema (`prompt_version_hash`, `created_at TEXT`, `run_id NOT NULL` FK) ≠ trace_store.sh inline INSERT statement (`prompt_version`, `created_at INTEGER`, no run_id, 16 placeholders vs 15 cols). `CREATE TABLE IF NOT EXISTS` no-op'd because table existed; every INSERT silently raised OperationalError (caller's `2>/dev/null \|\| true` swallowed). Self-improvement chain completely blocked: reflect/improve/eval/promote had no data to consume. | pt-11 probe | (a) New migration 0014 widens `status` check to include 'pending' + makes `run_id` nullable (FK still enforced when populated) (b) Rewrite trace_store.sh INSERT to match real schema: drop broken inline CREATE; use `prompt_version_hash`; skip `created_at` (TEXT default DOES the right thing); skip `run_id` (now nullable). | **fixed pt-11** |
+| **D-040** | `bin/mini-ork-reflect` calls `reflection_run --since "$SINCE"` but `reflection_run` takes ONE positional arg `since_ts`. Result: `int(sys.argv[2])` got `'--since'` literal → ValueError every invocation. Reflect pipeline never ran. | pt-11 probe | bin/mini-ork-reflect: pass `$SINCE` directly: `reflection_run "$SINCE"`. Also warn that `--task-class` filter isn't yet plumbed (separate follow-up). | **fixed pt-11** |
+| **D-041** | `reflection_extract_gradients` compares `created_at >= ?` with caller passing unix-ts INT, but column is TEXT ISO-8601 (per migration 0010). SQLite would compare alphabetically — '2026-...' > '17802...' would return true by luck but `<` would silently misfire. | pt-11 probe (paired with D-039) | reflection_pipeline.sh: `CAST(strftime('%s', created_at) AS INTEGER) >= ?` for proper time comparison. | **fixed pt-11** |
+
+**Smoke verified pt-11**:
+- `trace_write` now lands rows (first time since framework inception). Smoke test wrote `test-pt11-real-write` row, verified count=1 in DB.
+- `reflect --dry-run` correctly returns 1 trace count.
+- All 3 bash files syntax-clean. Migration 0014 applied cleanly to local state.db.
+
+Phase B is now UNBLOCKED. Future DF cycles will produce real traces;
+reflect can extract gradients; improve can propose candidates; eval
+can benchmark them; promote can decide. The framework now has a
+genuine self-improvement substrate.
+
 
 
 DF6 SPIKE is not a regression — it's expected when the framework crosses a

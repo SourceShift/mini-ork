@@ -39,45 +39,23 @@ now = int(time.time())
 
 con = sqlite3.connect(db)
 # v0.2-pt7 (F-11/R1): per-connection busy_timeout — handle SQLITE_BUSY
-# under concurrent worker access instead of silent data loss (was rc=5
-# with no retry).
+# under concurrent worker access instead of silent data loss.
 con.execute("PRAGMA busy_timeout=5000")
-con.execute("""
-    CREATE TABLE IF NOT EXISTS execution_traces (
-        trace_id            TEXT PRIMARY KEY,
-        task_class          TEXT NOT NULL DEFAULT '',
-        prompt_version      TEXT,
-        context_bundle_hash TEXT,
-        tool_calls          TEXT DEFAULT '[]',
-        files_read          TEXT DEFAULT '[]',
-        files_written       TEXT DEFAULT '[]',
-        verifier_output     TEXT DEFAULT '{}',
-        reviewer_verdict    TEXT,
-        cost_usd            REAL DEFAULT 0.0,
-        duration_ms         INTEGER DEFAULT 0,
-        final_artifact_ref  TEXT,
-        status              TEXT NOT NULL DEFAULT 'success'
-                                CHECK(status IN ('success','failure','pending')),
-        workflow_version_id TEXT,
-        agent_version_id    TEXT,
-        created_at          INTEGER NOT NULL
-    )
-""")
-# v0.2-pt7 (F-27/R4): indexes on the 3 hot-query columns. Without
-# these, every trace_query at 100K+ rows is a full-table scan.
-# (Audit GLM F-27: "execution_traces inline: zero indexes on key
-# columns" — task_class, status, created_at are equality/ORDER BY
-# targets at lib/trace_store.sh:138.)
-con.execute("CREATE INDEX IF NOT EXISTS idx_et_task_class ON execution_traces(task_class)")
-con.execute("CREATE INDEX IF NOT EXISTS idx_et_status     ON execution_traces(status)")
-con.execute("CREATE INDEX IF NOT EXISTS idx_et_created    ON execution_traces(created_at DESC)")
+# v0.2-pt11 (D-039): the inline CREATE TABLE IF NOT EXISTS was a BUG —
+# its column names + types didn't match migration 0010 (prompt_version
+# vs prompt_version_hash, created_at INTEGER vs TEXT) AND the INSERT
+# below targeted columns that don't exist in the real schema. The CREATE
+# IF NOT EXISTS no-op'd because the table already existed from 0010,
+# but every INSERT silently failed (caller uses 2>/dev/null || true).
+# Result: execution_traces stayed EMPTY across 10+ DF cycles.
+# Migration 0010 + 0014 own the schema authoritatively now.
 con.execute("""
     INSERT INTO execution_traces (
-        trace_id, task_class, prompt_version, context_bundle_hash,
+        trace_id, task_class, prompt_version_hash, context_bundle_hash,
         tool_calls, files_read, files_written, verifier_output,
         reviewer_verdict, cost_usd, duration_ms, final_artifact_ref,
-        status, workflow_version_id, agent_version_id, created_at
-    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        status, workflow_version_id, agent_version_id
+    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     ON CONFLICT(trace_id) DO UPDATE SET
         status=excluded.status,
         verifier_output=excluded.verifier_output,
@@ -88,8 +66,8 @@ con.execute("""
 """, (
     trace_id,
     p.get("task_class", ""),
-    p.get("prompt_version"),
-    p.get("context_bundle_hash"),
+    p.get("prompt_version", "") or "",
+    p.get("context_bundle_hash", "") or "",
     json.dumps(p.get("tool_calls", [])),
     json.dumps(p.get("files_read", [])),
     json.dumps(p.get("files_written", [])),
@@ -100,8 +78,7 @@ con.execute("""
     p.get("final_artifact_ref"),
     p.get("status", "success"),
     p.get("workflow_version_id"),
-    p.get("agent_version_id"),
-    now,
+    p.get("agent_version_id", "") or "",
 ))
 con.commit()
 con.close()
