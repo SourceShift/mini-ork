@@ -80,11 +80,16 @@ MINI_ORK_DB="${MINI_ORK_DB:-$MINI_ORK_HOME/state.db}"
 export MINI_ORK_HOME MINI_ORK_DB
 
 # ── pre-flight: candidate must exist and be evaluated ─────────────────────────
+# v0.2-pt35 (Phase E gap closure, 2026-06-02): workflow_candidates has NO
+# `eval_status` column. Actual `status` column is enum
+# {candidate, shadow, promoted, quarantined, deprecated}. State machine:
+# candidate (just proposed) → shadow (eval done) → promoted | quarantined.
+# Use that as the eval-completion gate (status='shadow').
 CANDIDATE_STATUS=""
 UTILITY_DELTA=""
 if [ -f "$MINI_ORK_DB" ]; then
   CANDIDATE_STATUS=$(sqlite3 "$MINI_ORK_DB" \
-    "SELECT eval_status FROM workflow_candidates WHERE candidate_id='${CANDIDATE_ID}' LIMIT 1;" \
+    "SELECT status FROM workflow_candidates WHERE candidate_id='${CANDIDATE_ID}' LIMIT 1;" \
     2>/dev/null || true)
   UTILITY_DELTA=$(sqlite3 "$MINI_ORK_DB" \
     "SELECT utility_delta FROM workflow_candidates WHERE candidate_id='${CANDIDATE_ID}' LIMIT 1;" \
@@ -100,13 +105,21 @@ fi
 if [ "$CANDIDATE_STATUS" = "quarantined" ]; then
   echo "Candidate is quarantined: ${CANDIDATE_ID}" >&2
   echo "Cannot promote a quarantined candidate." >&2
-  echo "To unblock: remove quarantine status from workflow_candidates table." >&2
+  echo "To unblock: clear quarantine via direct workflow_candidates UPDATE." >&2
   exit 2
 fi
 
-if [ "$CANDIDATE_STATUS" != "evaluated" ] && [ "$FORCE_PROMOTE" -eq 0 ]; then
+if [ "$CANDIDATE_STATUS" = "promoted" ]; then
+  echo "Candidate already promoted: ${CANDIDATE_ID}" >&2
+  exit 0
+fi
+
+# Eval-done gate: status='shadow' means eval completed (sets shadow during
+# benchmark dispatch). 'candidate' = no eval yet.
+if [ "$CANDIDATE_STATUS" = "candidate" ] && [ "$FORCE_PROMOTE" -eq 0 ]; then
   echo "Candidate has not been evaluated: ${CANDIDATE_ID} (status=${CANDIDATE_STATUS})" >&2
   echo "Run: mini-ork eval --candidate ${CANDIDATE_ID}" >&2
+  echo "OR --force to skip evaluation (emergency promotion)" >&2
   exit 2
 fi
 
@@ -127,11 +140,16 @@ echo "    utility_delta: ${UTILITY_DELTA}"
 echo "    force:         ${FORCE_PROMOTE}"
 echo ""
 
-PROMOTE_ARGS=(--candidate-id "$CANDIDATE_ID" --utility-delta "$UTILITY_DELTA")
-[ "$FORCE_PROMOTE" -eq 1 ] && PROMOTE_ARGS+=(--force)
-[ "$DRY_RUN"       -eq 1 ] && PROMOTE_ARGS+=(--dry-run)
+# v0.2-pt35 (Phase E gap closure, 2026-06-02): promotion_evaluate takes
+# POSITIONAL $1=candidate_id (per lib/promotion_gate.sh:promotion_evaluate
+# signature). Previous code passed --candidate-id flag which became
+# literal "$candidate_id" = "--candidate-id" — same shape as pt-27
+# group_propose arg-mismatch bug. Force + dry-run threaded via env vars
+# the lib reads internally (MINI_ORK_REQUIRE_HUMAN_APPROVAL etc).
+export MINI_ORK_PROMOTE_FORCE="$FORCE_PROMOTE"
+export MINI_ORK_PROMOTE_DRY_RUN="$DRY_RUN"
 
-DECISION_JSON=$(promotion_evaluate "${PROMOTE_ARGS[@]}")
+DECISION_JSON=$(promotion_evaluate "$CANDIDATE_ID")
 DECISION=$(echo "$DECISION_JSON" | python3 -c "
 import sys, json
 try:
