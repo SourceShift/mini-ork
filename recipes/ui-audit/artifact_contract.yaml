@@ -1,0 +1,38 @@
+version: "0.1.0"
+recipe: ui_audit
+
+outputs:
+  - path: "${MINI_ORK_RUN_DIR}/findings.md"
+    description: Ranked audit findings — severity P0..P3, file:line anchors, fix sketches.
+    mime: text/markdown
+    required: true
+
+  - path: "${MINI_ORK_RUN_DIR}/lens-a11y.md"
+    description: GLM lens — WCAG 2.2 AA conformance + screen-reader path + keyboard-nav findings.
+    mime: text/markdown
+    required: true
+
+  - path: "${MINI_ORK_RUN_DIR}/lens-perf.md"
+    description: Kimi lens — render perf, bundle size, CLS / LCP / INP regressions.
+    mime: text/markdown
+    required: true
+
+  - path: "${MINI_ORK_RUN_DIR}/lens-visual.md"
+    description: Codex lens — design-token violations, spacing / color / typography drift.
+    mime: text/markdown
+    required: true
+
+  - path: "${MINI_ORK_RUN_DIR}/lens-interaction.md"
+    description: Opus lens — interaction-model coherence, focus traps, gesture conflicts, mobile-vs-desktop divergence.
+    mime: text/markdown
+    required: true
+
+  - path: "${MINI_ORK_RUN_DIR}/lens-edge.md"
+    description: MiniMax lens — edge cases (empty / loading / error / 0-results / very-long-content / RTL / overflow).
+    mime: text/markdown
+    required: true
+
+success_verifiers:
+  - verifiers/findings-completeness.sh
+
+risk_class: low
