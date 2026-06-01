@@ -100,15 +100,47 @@ KICKOFF_TEXT=$(cat "$KICKOFF")
 TASK_CLASS="generic"
 BEST_HITS=0
 
+# v0.2-pt25 (D-050 fix, 2026-06-01): scan BOTH legacy config/task_classes/*.yaml
+# AND recipes/*/task_class.yaml. Previously only the legacy dir was scanned,
+# which doesn't exist in this repo — every dispatch fell back to 'generic',
+# masking real recipe matches like research-synthesis (literature review / SOTA / etc).
+# For recipe-local files the class name comes from the yaml's `name:` field,
+# not the basename (which would always be the literal string "task_class").
+declare -a CANDIDATE_FILES=()
 if [ -d "$TASK_CLASSES_DIR" ]; then
   while IFS= read -r -d '' yaml_file; do
-    candidate_class=$(basename "$yaml_file" .yaml)
+    CANDIDATE_FILES+=("$yaml_file")
+  done < <(find "$TASK_CLASSES_DIR" -maxdepth 1 -name '*.yaml' -print0 2>/dev/null | sort -z)
+fi
+RECIPES_DIR_RESOLVED="${MINI_ORK_HOME}/recipes"
+[ ! -d "$RECIPES_DIR_RESOLVED" ] && RECIPES_DIR_RESOLVED="$MINI_ORK_ROOT/recipes"
+if [ -d "$RECIPES_DIR_RESOLVED" ]; then
+  while IFS= read -r -d '' yaml_file; do
+    CANDIDATE_FILES+=("$yaml_file")
+  done < <(find "$RECIPES_DIR_RESOLVED" -maxdepth 2 -name 'task_class.yaml' -print0 2>/dev/null | sort -z)
+fi
 
-    # Python fallback handles BOTH shapes:
-    #   matches: [ "kw1", "kw2" ]                            (flat list)
-    #   matches: { keywords: [...], regex: [...], path_globs: [...] }  (structured)
-    # Also tolerates legacy TOP-LEVEL `keywords:` form (recipes/bdd-first-delivery).
-    mapfile -t patterns < <(python3 - "$yaml_file" <<'PY'
+for yaml_file in "${CANDIDATE_FILES[@]}"; do
+  # Recipe-local files use the yaml's `name:` field as the class name.
+  # Legacy files in TASK_CLASSES_DIR use the basename.
+  if [[ "$yaml_file" == */recipes/*/task_class.yaml ]]; then
+    candidate_class=$(python3 -c "
+import sys, yaml, os
+with open(sys.argv[1]) as f:
+    d = yaml.safe_load(f) or {}
+n = (d.get('name') or os.path.basename(os.path.dirname(sys.argv[1]))).strip()
+print(n)
+" "$yaml_file" 2>/dev/null)
+    [ -z "$candidate_class" ] && candidate_class=$(basename "$(dirname "$yaml_file")")
+  else
+    candidate_class=$(basename "$yaml_file" .yaml)
+  fi
+
+  # Python fallback handles BOTH shapes:
+  #   matches: [ "kw1", "kw2" ]                            (flat list)
+  #   matches: { keywords: [...], regex: [...], path_globs: [...] }  (structured)
+  # Also tolerates legacy TOP-LEVEL `keywords:` form (recipes/bdd-first-delivery).
+  mapfile -t patterns < <(python3 - "$yaml_file" <<'PY'
 import sys, yaml
 with open(sys.argv[1]) as f:
     data = yaml.safe_load(f) or {}
@@ -125,24 +157,23 @@ elif isinstance(m, list):
 for p in data.get('keywords', []) or []:
     print(p)
 PY
-    )
+  )
 
-    # Count hits — NOT break-on-first (D-010 fix)
-    hits=0
-    for pattern in "${patterns[@]}"; do
-      [ -z "$pattern" ] && continue
-      if echo "$KICKOFF_TEXT" | grep -qiE "$pattern" 2>/dev/null; then
-        hits=$((hits + 1))
-      fi
-    done
-
-    # Strict greater-than means lex-first wins on ties (find | sort -z order)
-    if [ "$hits" -gt "$BEST_HITS" ]; then
-      BEST_HITS="$hits"
-      TASK_CLASS="$candidate_class"
+  # Count hits — NOT break-on-first (D-010 fix)
+  hits=0
+  for pattern in "${patterns[@]}"; do
+    [ -z "$pattern" ] && continue
+    if echo "$KICKOFF_TEXT" | grep -qiE "$pattern" 2>/dev/null; then
+      hits=$((hits + 1))
     fi
-  done < <(find "$TASK_CLASSES_DIR" -maxdepth 1 -name '*.yaml' -print0 2>/dev/null | sort -z)
-fi
+  done
+
+  # Strict greater-than means lex-first wins on ties
+  if [ "$hits" -gt "$BEST_HITS" ]; then
+    BEST_HITS="$hits"
+    TASK_CLASS="$candidate_class"
+  fi
+done
 
 # ── workflow version resolution ───────────────────────────────────────────────
 if [ -n "$WORKFLOW_VERSION" ]; then
