@@ -27,8 +27,9 @@ _MO_LLM_EXECUTABLE_MODELS=(codex gemini)
 
 _mo_llm_is_executable() {
   local model="$1"
-  for m in "${_MO_LLM_EXECUTABLE_MODELS[@]}"; do
-    [[ "$m" == "$model" ]] && return 0
+  local _m
+  for _m in "${_MO_LLM_EXECUTABLE_MODELS[@]}"; do
+    [[ "$_m" == "$model" ]] && return 0
   done
   return 1
 }
@@ -40,8 +41,9 @@ _MO_LLM_GATEWAY_MODELS=(minimax glm kimi deepseek)
 
 _mo_llm_is_gateway() {
   local model="$1"
-  for m in "${_MO_LLM_GATEWAY_MODELS[@]}"; do
-    [[ "$m" == "$model" ]] && return 0
+  local _m
+  for _m in "${_MO_LLM_GATEWAY_MODELS[@]}"; do
+    [[ "$_m" == "$model" ]] && return 0
   done
   return 1
 }
