@@ -163,7 +163,23 @@ PY
   if echo "$extracted" | jq -e '.pass' >/dev/null 2>&1; then
     echo "$extracted" | jq -c '.' > "$rubric_path"
   else
-    jq -n '{pass: false, score: -1, parse_error: true, items: []}' > "$rubric_path"
+    # 2026-06-02: Preserve LLM output snippet in parse_error case so the
+    # operator can diagnose why all 4 extraction strategies missed.
+    # Forensic context: libwit WAVE 3a + 3b shipped 8/8 sub-epics via
+    # manual squash-merge rescue because every iter aborted at this exact
+    # branch with no diagnostic. See docs/fixes/20260602-reviewer-silent-die.md
+    # for the broader 4-fix cascade (stream-json → json, json-schema, soft-fail,
+    # this diagnostic). This is the smallest fix, applied first as a
+    # no-regression-risk down payment.
+    local _diag_snippet=""
+    if [ -n "$result_text" ]; then
+      _diag_snippet=$(printf '%s' "$result_text" | tail -c 800)
+    fi
+    jq -n --arg diag "$_diag_snippet" --arg log_path "$log_path" \
+      '{pass: false, score: -1, parse_error: true, items: [],
+        parse_error_diagnostic: $diag,
+        parse_error_log_hint: ("inspect last 200 lines of " + $log_path)}' \
+      > "$rubric_path"
   fi
 
   local score pass
