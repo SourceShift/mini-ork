@@ -102,27 +102,36 @@ mo_run_rubric_prescreen() {
     command -v timeout >/dev/null 2>&1 && [ -z "$_TIMEOUT_BIN" ] && _TIMEOUT_BIN=timeout
     local _cache_flag=()
     mo_emit_cache_flags _cache_flag 2>/dev/null || true
+    # Fix #1+#2 (2026-06-03): switch to --output-format json + --json-schema.
+    # Stream-json with thinking_delta sequences caused all 4 extraction strategies
+    # to fall through to parse_error:true (insforge memory id=1253). Single-result
+    # json wrapper with schema constraint forces the model into structured output
+    # so the extractor has one canonical path (jq -r '.result' log_path).
+    local _RUBRIC_SCHEMA='{"type":"object","properties":{"pass":{"type":"boolean"},"score":{"type":"integer","minimum":0,"maximum":8},"items":{"type":"array","items":{"type":"object","properties":{"label":{"type":"string"},"verdict":{"type":"string","enum":["PASS","FAIL","SKIP"]},"note":{"type":"string"}},"required":["label","verdict"]}}},"required":["pass","score","items"]}'
     ${_TIMEOUT_BIN:-} ${_TIMEOUT_BIN:+--kill-after=30s $_TO} claude -p \
       "${_cache_flag[@]}" \
       "${_budget_flag[@]}" \
-      --output-format stream-json \
-      --verbose \
-      --include-partial-messages \
+      --output-format json \
+      --json-schema "$_RUBRIC_SCHEMA" \
       --dangerously-skip-permissions \
       --permission-mode acceptEdits \
       "$(cat "$prompt_path")" \
       > "$log_path" 2>&1
   ) || true
 
-  # Extract JSON via all-turns scan (see spec-reviewer.sh comment about
-  # stop-hook clobbering .result with checklist text).
+  # Extract JSON. Primary path: --output-format json wrapper has model output
+  # in .result field. Fallback: legacy stream-json shape (in case of mixed
+  # deployment).
   local result_text
-  result_text=$(jq -r '
-    select(.type=="assistant")
-    | .message.content[]?
-    | select(.type=="text")
-    | .text
-  ' "$log_path" 2>/dev/null)
+  result_text=$(jq -r '.result // empty' "$log_path" 2>/dev/null)
+  if [ -z "$result_text" ]; then
+    result_text=$(jq -r '
+      select(.type=="assistant")
+      | .message.content[]?
+      | select(.type=="text")
+      | .text
+    ' "$log_path" 2>/dev/null)
+  fi
   if [ -z "$result_text" ]; then
     result_text=$(grep '"type":"result"' "$log_path" | tail -1 | jq -r '.result // empty' 2>/dev/null)
   fi
