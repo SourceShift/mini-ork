@@ -1,0 +1,124 @@
+#!/usr/bin/env bash
+# mini-ork-topology — query + compute panel-topology telemetry.
+# Part of E-MO-01 (epic catalogue 2026-06-02-2100).
+#
+# Usage:
+#   mini-ork topology                                  # summary across all recipes
+#   mini-ork topology --recipe refactor-audit          # per-recipe history
+#   mini-ork topology --compute <panel_run_id> <recipe> # ad-hoc measurement
+#   mini-ork topology --backfill                        # measure all existing traces
+
+set -Eeuo pipefail
+
+MINI_ORK_ROOT="${MINI_ORK_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+export MINI_ORK_ROOT
+MINI_ORK_HOME="${MINI_ORK_HOME:-$MINI_ORK_ROOT/.mini-ork}"
+MINI_ORK_DB="${MINI_ORK_DB:-$MINI_ORK_HOME/state.db}"
+export MINI_ORK_HOME MINI_ORK_DB
+
+_usage() {
+  cat >&2 <<USAGE
+Usage:
+  mini-ork topology [--recipe <name>]
+  mini-ork topology --compute <panel_run_id> <recipe>
+  mini-ork topology --backfill
+USAGE
+  exit 2
+}
+
+RECIPE=""
+COMPUTE=0
+BACKFILL=0
+PANEL_RUN_ID=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --recipe)   RECIPE="${2:?--recipe requires a value}"; shift 2 ;;
+    --compute)  COMPUTE=1; PANEL_RUN_ID="${2:?--compute requires panel_run_id}"; RECIPE="${3:-generic}"; shift 3 ;;
+    --backfill) BACKFILL=1; shift ;;
+    --help|-h)  _usage ;;
+    *)          _usage ;;
+  esac
+done
+
+# shellcheck source=lib/topology_metrics.sh
+source "$MINI_ORK_ROOT/lib/topology_metrics.sh"
+
+if [ "$COMPUTE" -eq 1 ]; then
+  echo "=== mini-ork topology — ad-hoc measurement ==="
+  echo "    panel_run_id: $PANEL_RUN_ID"
+  echo "    recipe:       $RECIPE"
+  echo
+  echo "    rho:   $(measure_rho "$PANEL_RUN_ID")"
+  echo "    C:     $(measure_C   "$PANEL_RUN_ID")"
+  echo "    I:     $(measure_I   "$PANEL_RUN_ID")"
+  echo
+  echo "Persisting to panel_topology_telemetry..."
+  TELEMETRY_ID=$(measure_topology "$PANEL_RUN_ID" "$RECIPE")
+  echo "telemetry_id=$TELEMETRY_ID"
+  exit 0
+fi
+
+if [ "$BACKFILL" -eq 1 ]; then
+  echo "=== mini-ork topology — backfill from execution_traces ==="
+  # Extract distinct run_ids from trace_id suffixes
+  panel_ids=$(sqlite3 "$MINI_ORK_DB" "
+    SELECT DISTINCT
+      CASE
+        WHEN run_id IS NOT NULL THEN CAST(run_id AS TEXT)
+        ELSE substr(trace_id, instr(trace_id, '-')+1)
+      END AS panel_run_id
+    FROM execution_traces
+    WHERE trace_id IS NOT NULL
+    LIMIT 50;
+  " 2>/dev/null | sort -u | head -20)
+
+  count=0
+  for prid in $panel_ids; do
+    [ -z "$prid" ] && continue
+    # Find a representative recipe (task_class) for this panel_run
+    recipe=$(sqlite3 "$MINI_ORK_DB" "
+      SELECT task_class FROM execution_traces
+      WHERE trace_id LIKE '%${prid}%' LIMIT 1;
+    " 2>/dev/null || echo "generic")
+    [ -z "$recipe" ] && recipe="generic"
+    telemetry_id=$(measure_topology "$prid" "$recipe" 2>/dev/null || echo "skip")
+    echo "  $prid → $recipe → $telemetry_id"
+    count=$((count + 1))
+  done
+  echo "Backfilled $count panel_runs."
+  exit 0
+fi
+
+# Default: summary
+echo "=== mini-ork topology — summary ==="
+if [ -n "$RECIPE" ]; then
+  echo "    recipe filter: $RECIPE"
+  sqlite3 -box "$MINI_ORK_DB" "
+    SELECT recipe, rho, context_distance AS C, inductive_distance AS I,
+           quadrant, agent_count, n_traces,
+           substr(computed_at, 1, 19) AS at
+    FROM panel_topology_telemetry
+    WHERE recipe = '${RECIPE}'
+    ORDER BY computed_at DESC LIMIT 20;
+  " 2>&1
+else
+  echo "    (all recipes; latest 20)"
+  sqlite3 -box "$MINI_ORK_DB" "
+    SELECT recipe, rho, context_distance AS C, inductive_distance AS I,
+           quadrant, agent_count, n_traces,
+           substr(computed_at, 1, 19) AS at
+    FROM panel_topology_telemetry
+    ORDER BY computed_at DESC LIMIT 20;
+  " 2>&1
+fi
+
+echo
+echo "=== Quadrant distribution ==="
+sqlite3 -box "$MINI_ORK_DB" "
+  SELECT quadrant, COUNT(*) AS cycles, AVG(rho) AS avg_rho,
+         AVG(context_distance) AS avg_C, AVG(inductive_distance) AS avg_I
+  FROM panel_topology_telemetry
+  GROUP BY quadrant
+  ORDER BY cycles DESC;
+" 2>&1
