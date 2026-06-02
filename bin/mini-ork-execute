@@ -619,6 +619,20 @@ Dispatched by mini-ork-execute publisher node (D-037 v0.2-pt9).
       echo "  [ok] publisher: $_published_count artifact(s) published"
       # D-021: transition to 'published' on successful publisher dispatch.
       _d021_set_status "published"
+
+      # E-MO-01 (epic catalogue 2026-06-02-2100): measure realised panel
+      # topology (ρ, C, I) post-cycle. Best-effort — never fails the run.
+      if [ -n "${MINI_ORK_RUN_ID:-}" ]; then
+        if [ -f "$MINI_ORK_ROOT/lib/topology_metrics.sh" ]; then
+          # shellcheck source=lib/topology_metrics.sh
+          source "$MINI_ORK_ROOT/lib/topology_metrics.sh" 2>/dev/null || true
+          if declare -f measure_topology > /dev/null 2>&1; then
+            local _ttid
+            _ttid=$(measure_topology "$MINI_ORK_RUN_ID" "${TASK_CLASS:-generic}" 2>/dev/null || echo "")
+            [ -n "$_ttid" ] && echo "  [topology] $_ttid"
+          fi
+        fi
+      fi
       ;;
 
     rollback)
