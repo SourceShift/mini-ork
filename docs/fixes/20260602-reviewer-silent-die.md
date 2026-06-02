@@ -1,5 +1,44 @@
 # Fix-Spec — reviewer silent-die failure mode
 
+> ## ⚠️ CORRECTION (2026-06-02 22:05 UTC)
+>
+> **Root cause re-attributed.** Forensic inspection of libwit's
+> `.agentflow/mini-orch/runs/.../W3B-C/iter-1/` showed `review.log` and
+> `verdict.json` were ABSENT — but `rubric.json` was present with
+> `{"pass": false, "score": -1, "parse_error": true, "items": []}`.
+> The iter never reached the reviewer phase. **The real failure is in
+> `lib/rubric-prescreen.sh:144-205` parser**, not `lib/review.sh`.
+>
+> Rubric pre-screen dispatches with `--output-format stream-json` and tries
+> 4 fallback strategies to extract `{pass:..,score:..}` from the
+> stream-json log. When the LLM emits long thinking_delta sequences with
+> no clean structured-output JSON in the final result, all 4 fall through
+> and the parser writes the `parse_error:true` sentinel. The orch then
+> aborts the iter at the rubric gate, BEFORE reviewer dispatch.
+>
+> Fixes A-E below are still valid hygiene for `lib/review.sh` (since the
+> reviewer dispatch is also stream-json-fragile), but the load-bearing
+> recurring blocker is one layer earlier. Recommended cascade:
+>
+> 1. **Switch rubric to `--output-format json`** (not stream-json) — rubric
+>    doesn't need partial streaming; single result wrapper has 1 known
+>    extraction path
+> 2. **Add `--json-schema` constraint** with `{pass:bool, score:int, items:[]}`
+>    so the model can't drift into prose
+> 3. **Preserve LLM output snippet in parse_error case** — currently invisible
+>    when parser fails
+> 4. **Soft-fail rubric parse errors** — heuristic gate, not load-bearing;
+>    parse_error=true should fall through to reviewer, not abort iter
+>
+> Downstream insforge memory `id=1253` documents the corrected diagnosis
+> with file:line evidence. Fix is approximately 30-60min surgical edit to
+> `lib/rubric-prescreen.sh`.
+
+---
+
+## Original fix-spec (still relevant for review.sh hygiene)
+
+
 **Date observed:** 2026-06-02 across ~3 hours of dispatch (WAVE 3a 5/5 + WAVE 3b 3/3 sub-epics, every iteration)
 **Downstream incident:** libwit `researcher` repo — SELF-EVOLVING-WAVE-3A-MEMORY-CLUSTER + SELF-EVOLVING-WAVE-3B-CAPSULE-EVIDENCE
 **Affected runtime:** `.agentflow/lib/review.sh` reviewer phase (after worker emits commits, before auto-merge)
