@@ -184,10 +184,19 @@ print(d.get('version_id', ''))
     fi
 
     echo "Registering version: ${NEW_VERSION}"
-    version_register \
-      --version-id "$NEW_VERSION" \
-      --candidate-id "$CANDIDATE_ID" \
-      --status "active" || {
+    # v0.2-pt36: version_register takes POSITIONAL <kind> <json_payload>
+    # per lib signature, NOT --flag args. Same shape as pt-27/pt-35
+    # arg-mismatch class.
+    VERSION_PAYLOAD=$(python3 -c "
+import json, sys
+print(json.dumps({
+    'version_id': sys.argv[1],
+    'name': sys.argv[2],
+    'status': 'stable',
+    'utility_score': float(sys.argv[3] or 0),
+}))
+" "$NEW_VERSION" "$CANDIDATE_ID" "${UTILITY_DELTA:-0}")
+    version_register "workflow" "$VERSION_PAYLOAD" || {
       echo "version_register failed" >&2
       trace_write "{\"trace_id\":\"$TRACE_ID\",\"task_class\":\"__promote__\",\"status\":\"failure\"}" >/dev/null 2>&1 || true
       exit 1
@@ -200,11 +209,13 @@ db, candidate_id, new_version = sys.argv[1:]
 con = sqlite3.connect(db)
 con.execute("PRAGMA journal_mode=WAL")
 try:
+    # v0.2-pt36: real columns are status (enum), no promoted_version or
+    # updated_at. version_registry tracks the registered version separately.
     con.execute("""
         UPDATE workflow_candidates
-        SET eval_status='promoted', promoted_version=?, updated_at=?
-        WHERE id=?
-    """, (new_version, int(time.time()), candidate_id))
+        SET status = 'promoted'
+        WHERE candidate_id = ?
+    """, (candidate_id,))
     con.commit()
     print(f"[ok] candidate {candidate_id} promoted as version {new_version}")
 except sqlite3.OperationalError as e:
@@ -222,11 +233,13 @@ db, candidate_id = sys.argv[1:]
 con = sqlite3.connect(db)
 con.execute("PRAGMA journal_mode=WAL")
 try:
+    # v0.2-pt36: real columns are status (enum {candidate,shadow,promoted,
+    # quarantined,deprecated}); no updated_at. WHERE keys candidate_id PK.
     con.execute("""
         UPDATE workflow_candidates
-        SET eval_status='quarantined', updated_at=?
-        WHERE id=?
-    """, (int(time.time()), candidate_id))
+        SET status = 'quarantined'
+        WHERE candidate_id = ?
+    """, (candidate_id,))
     con.commit()
     print(f"[quarantined] candidate {candidate_id} is blocked from re-evaluation")
 except sqlite3.OperationalError as e:
