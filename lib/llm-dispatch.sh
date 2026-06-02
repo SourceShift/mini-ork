@@ -33,6 +33,19 @@ _mo_llm_is_executable() {
   return 1
 }
 
+# v0.2-pt38 (E-MO-19, 2026-06-02): models that route through non-Anthropic
+# gateway endpoints. These don't stream `stream-json` events properly,
+# so we downgrade their output format to `json` even when MO_TRACE_RICH=1.
+_MO_LLM_GATEWAY_MODELS=(minimax glm kimi deepseek)
+
+_mo_llm_is_gateway() {
+  local model="$1"
+  for m in "${_MO_LLM_GATEWAY_MODELS[@]}"; do
+    [[ "$m" == "$model" ]] && return 0
+  done
+  return 1
+}
+
 # mo_llm_dispatch <model> <prompt> <out_file> [timeout_s] [max_turns]
 mo_llm_dispatch() {
   local model="${1:?model required}"
@@ -89,6 +102,23 @@ mo_llm_dispatch() {
   local _capture_trace="${MO_TRACE_RICH:-0}"
   if [ "$_capture_trace" = "1" ] && [ "$_format" = "json" ]; then
     _format="stream-json"
+  fi
+
+  # v0.2-pt38 (E-MO-19, 2026-06-02): gateway-detection bypass for stream-json.
+  # Observed 2026-06-01 perf report: MO_TRACE_RICH=1 + cl_minimax/cl_glm
+  # hangs to SIGTERM @ 90s because gateway endpoints (api.minimax.io,
+  # api.z.ai for GLM) don't stream `stream-json` events the way native
+  # Anthropic does — client waits for type=result line that never arrives.
+  # Force-fallback to `json` mode for known-gateway models. Native
+  # Anthropic (opus/sonnet/opus_oauth) keeps rich-trace capture.
+  # Override: MO_FORCE_STREAM_JSON_ON_GATEWAY=1 keeps stream-json on for
+  # gateways (e.g. when testing a fixed gateway).
+  if [ "$_format" = "stream-json" ] && \
+     [ "${MO_FORCE_STREAM_JSON_ON_GATEWAY:-0}" != "1" ] && \
+     _mo_llm_is_gateway "$model"; then
+    _format="json"
+    # Stash the override reason in err_log later (after err_log is defined)
+    : "$model is a gateway model — downgrading to json output to avoid stream-json hang"
   fi
   local _raw_out="${out_file}.raw"
 
