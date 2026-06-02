@@ -148,14 +148,42 @@ import sqlite3, json, sys, time, uuid, subprocess, os
 db, cid, runner_fn = sys.argv[1], sys.argv[2], sys.argv[3]
 now = int(time.time())
 
+# v0.2-pt36 (Phase E live-dispatch fix, 2026-06-02): real schema columns
+# differ from this code's previous draft. Real benchmark_results:
+#   result_id (PK), benchmark_id (FK), candidate_id, run_id (NOT NULL FK),
+#   pass (0/1), utility_score, evidence_path, ran_at.
+# Previous code wrote benchmark_task_id / run_output / passed / error_message
+# — none of which exist. Also no ON CONFLICT composite. Patched.
+# Synthesize a runs.id row for the FK; mark agent='benchmark'.
 con = sqlite3.connect(db)
+con.row_factory = sqlite3.Row
 tasks = con.execute("SELECT * FROM benchmark_tasks").fetchall()
-cols  = [d[0] for d in con.execute("SELECT * FROM benchmark_tasks LIMIT 0").description or []]
+
+# Create a runs row to satisfy benchmark_results.run_id NOT NULL FK.
+# Bootstrap path: epics → runs → benchmark_results. The benchmark epic is
+# a synthetic placeholder (one per candidate) that exists only to satisfy
+# the FK chain. v0.2-pt36.
+BENCHMARK_EPIC_ID = f"benchmark-{cid[:16]}"
+con.execute("""
+    INSERT INTO epics (id, title, status, notes)
+    VALUES (?, ?, 'in progress', 'synthetic — benchmark FK bootstrap')
+    ON CONFLICT(id) DO NOTHING
+""", (BENCHMARK_EPIC_ID, f"Benchmark run for candidate {cid}"))
+run_id = con.execute("""
+    INSERT INTO runs (epic_id, run_dir, branch, baseline_sha, agent, final_verdict)
+    VALUES (?, ?, ?, ?, ?, NULL)
+""", (
+    BENCHMARK_EPIC_ID,
+    f"benchmark/{cid}/{uuid.uuid4().hex[:8]}",
+    "main",
+    "benchmark-synthetic",
+    "mini-ork",
+)).lastrowid
 
 results = []
 for task_row in tasks:
-    t = dict(zip(cols, task_row))
-    tid    = t["id"]
+    t = dict(task_row)
+    tid       = t["benchmark_id"]
     result_id = f"br-{cid[:8]}-{tid[:8]}-{uuid.uuid4().hex[:6]}"
     run_out, passed, util_score, err_msg = None, False, 0.0, None
 
@@ -186,25 +214,23 @@ for task_row in tasks:
     else:
         # No runner configured — mark as skipped with neutral score
         run_out = json.dumps({"skipped": True, "reason": "no MINI_ORK_WORKFLOW_RUNNER_FN set"})
-        util_score = t.get("baseline_utility_score", 0.0)
+        util_score = float(t.get("baseline_utility_score", 0.0) or 0.0)
         passed = False
         err_msg = "runner not configured"
 
+    # evidence_path: where the runner output landed. For now stash run_out
+    # there (it's TEXT). When a real runner writes to a file path, the
+    # caller can put that path here instead.
+    evidence_path = run_out or ""
     con.execute("""
         INSERT INTO benchmark_results
-            (result_id, candidate_id, benchmark_task_id, run_output,
-             passed, utility_score, error_message, ran_at)
-        VALUES (?,?,?,?,?,?,?,?)
-        ON CONFLICT(candidate_id, benchmark_task_id) DO UPDATE SET
-            run_output=excluded.run_output,
-            passed=excluded.passed,
-            utility_score=excluded.utility_score,
-            error_message=excluded.error_message,
-            ran_at=excluded.ran_at
-    """, (result_id, cid, tid, run_out, int(passed), util_score, err_msg, now))
+            (result_id, benchmark_id, candidate_id, run_id,
+             pass, utility_score, evidence_path)
+        VALUES (?,?,?,?,?,?,?)
+    """, (result_id, tid, cid, run_id, int(bool(passed)), util_score, evidence_path))
 
     results.append({
-        "benchmark_task_id": tid,
+        "benchmark_id": tid,
         "task_class": t["task_class"],
         "passed": passed,
         "utility_score": util_score,
