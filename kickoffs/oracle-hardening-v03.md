@@ -1,11 +1,34 @@
 # Epic — Oracle Hardening for v0.3
 
-**Status:** ready for dispatch (decomposable into 3 waves × 2-3 sub-epics each)
+**Status:** Wave 1 CLOSED + W2-B shipped (2026-06-05 autopilot pass). W2-A + Wave 3 pending.
 **Target:** `~/ps/mini-ork/` (upstream framework)
 **Prereqs landed:** 5-commit OSS push (origin range `82164b1..72e54a3`) — recipe family-diversity swap + 2 self-audit synthesis publishes + 2 fix-specs + example kickoff
 **Estimated total effort:** ~9-12 dev-days across 3 waves (Waves 1+2 parallelizable; Wave 3 sequential)
 **Audit synthesis driving this:** `docs/refactor/synthesis-latest.md` (run-1780604422-58608)
 **Research brief grounding 9 papers:** companion at downstream `docs/_meta/research/20260605-self-evolution-oracle-arxiv-summaries.md`
+
+## Shipped (2026-06-05)
+
+| Sub-epic | Status | Commit | Deliverable |
+|---|---|---|---|
+| W1-A docs/positioning honesty patch | ✅ | `615d899` | `docs/positioning/why-mini-ork.md` "Self-evolution is class-restricted" section + 2-row taxonomy + Zenil/Setlur/DeVilling citations |
+| W1-B ρ + family-diversity hard-block | ✅ primitive | `f7890a7` | `lib/coalition_gate.sh::mo_check_panel_coalition` — COALITION_ABORT when ρ ≥ 0.25 OR family_count < lens_count. Wire-up follow-up |
+| W1-C CW-POR diagnostic | ✅ primitive | `33ba189` | `lib/cw_por.sh::mo_compute_cw_por` — orthogonal panel-health to Krippendorff α |
+| W1-D selective-feedback conjunction | ✅ primitive | `94d3cfe` | `lib/promotion_gate.sh::mo_promote_synthesis_gate` — panel_score + CW-POR + structural ALL three required for synthesis-class auto-promote |
+| W2-B adaptive stability detection | ✅ primitive | `3dc65ca` | `lib/adaptive_stability.sh::mo_check_panel_stability` — round-over-round drift drives HALT/CONTINUE |
+| W2-A held-out anchor corpus | ⏸ | — | Hand-author per recipe (judgment-heavy — corpus selection is recipe-specific) |
+| W3 mechanical citation+coverage verifier | ⏸ | — | 2-3 week sub-decomposition into 5-8 atoms — dedicated planning pass |
+
+All 5 shipped primitives include inline self-test fixtures (4 each, 20 total) and pass on first run. Wire-up into `bin/mini-ork-execute` is deferred for the next session because it requires touching the 828-LOC central dispatcher and would benefit from a 3-subagent consensus pass first.
+
+## Dispatch path findings (filed as fix-spec)
+
+The original autopilot intent was to dispatch each Wave 1 sub-epic via `bin/mini-ork run code-fix kickoffs/oracle-w1-*.md` — using mini-ork itself to ship its own improvements. Two blockers surfaced:
+
+1. **Classifier ignores the explicit recipe arg** — `bin/mini-ork run code-fix <kickoff>` invokes the classifier which routes `task_class=generic` despite the explicit `code-fix` positional. Planner then fails downstream because the `code_fix` verifier contract isn't loaded against the `generic` task class.
+2. **D-015 plan-rejection for pure-docs kickoffs** — the `code_fix` recipe planner rejects any plan whose `verifier_contract.checks` is empty. Pure-docs kickoffs (W1-A grep-based success criteria) don't fit the shell-runnable assertion contract even though grep checks ARE shell-runnable.
+
+Filed at `docs/fixes/20260604-dispatch-classifier-overrides-explicit-recipe.md` with two proposed paths (honor explicit arg + add `recipes/docs/` task class). Until these land, the dogfood loop is unable to ship Wave-1-class single-purpose primitives; hand-implementation is the cheap fallback.
 
 ---
 
