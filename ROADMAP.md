@@ -71,10 +71,60 @@ extraction prompt-tuning is D-048, deferred)
 **Phase E — Evolution + promotion** — NOT in v0.2 (was originally scheduled
 but the v0.2 arc focused on Phase A→G durability; E moves to v0.3).
 
-## Next (v0.3 — Q3 2026 target)
+### v0.3.0-rc1 — 2026-06-05 (in flight)
 
-The literature-grounded gaps from the positioning doc + the deferred
-items from v0.2:
+**Oracle Hardening, Wave 1 + Wave 2 partial.** Shipped as 5 self-contained
+primitives in `lib/` plus a positioning honesty patch. Wire-up into
+`bin/mini-ork-execute` is deferred; recipes can opt-in at their own pace
+by sourcing the libraries from a verifier node.
+
+Grounded in 9-paper research brief synthesizing the self-evolution oracle
+question:
+[Zenil 2026](https://arxiv.org/abs/2601.05280) +
+[DeVilling 2025](https://arxiv.org/abs/2510.21861) +
+[Adapala 2025](https://arxiv.org/abs/2509.10509) +
+[Wang 2026](https://arxiv.org/abs/2601.05184) +
+[Hu et al 2025](https://arxiv.org/abs/2510.12697) +
+[Bertalanič 2026](https://arxiv.org/abs/2605.00914) +
+[Agarwal & Khanna 2025](https://arxiv.org/abs/2504.00374) +
+[Sistla 2025](https://arxiv.org/abs/2509.26546) +
+[Setlur 2025](https://arxiv.org/abs/2502.12118).
+
+| Sub-epic | Status | Commit | Deliverable |
+|---|---|---|---|
+| W1-A docs/positioning honesty patch | ✅ | `615d899` | `docs/positioning/why-mini-ork.md` "Self-evolution is class-restricted" section + 2-row taxonomy table + Zenil/Setlur/DeVilling citations |
+| W1-B coalition gate primitive | ✅ | `f7890a7` | `lib/coalition_gate.sh::mo_check_panel_coalition` — emits COALITION_ABORT when ρ ≥ MO_RHO_THRESHOLD (default 0.25) OR family_count < lens_count. Rajan 2025 + Bertalanič 2026 grounded |
+| W1-C CW-POR diagnostic primitive | ✅ | `33ba189` | `lib/cw_por.sh::mo_compute_cw_por` — orthogonal panel-health metric to Krippendorff α (Agarwal & Khanna 2025) |
+| W1-D selective-feedback conjunction | ✅ | `94d3cfe` | `lib/promotion_gate.sh::mo_promote_synthesis_gate` — synthesis-class auto-promote requires panel_score + CW-POR + structural signal ALL three (Adapala 2025) |
+| W2-B adaptive stability detection | ✅ | `3dc65ca` | `lib/adaptive_stability.sh::mo_check_panel_stability` — round-over-round verdict drift drives HALT/CONTINUE between debate rounds (Hu et al 2025) |
+| W2-A held-out anchor corpus | ⏸ | — | Hand-author per recipe — judgment-heavy corpus selection (Wang 2026) |
+| W3 mechanical citation+coverage verifier | ⏸ | — | 2-3 week sub-decomposition into 5-8 atoms (Sistla 2025 + Ficek 2025) |
+
+All 5 shipped primitives include inline self-test fixtures (4 each, 20 total) that pass on first run. Run any of them directly to see the verdicts:
+
+```
+$ bash lib/cw_por.sh
+$ bash lib/promotion_gate.sh
+$ bash lib/coalition_gate.sh
+$ bash lib/adaptive_stability.sh
+```
+
+Two new framework phases added by this work:
+
+- **Phase N — Promotion-class taxonomy enforced.** The positioning doc now makes the deterministic-oracle vs LLM-judged-only split explicit. `mo_promote_synthesis_gate` is the executable form of that split.
+- **Phase O — Panel-failure detection.** Three orthogonal diagnostics now exist: ρ + family-diversity (coalition_gate), CW-POR (cw_por), round-stability drift (adaptive_stability). Each fail-opens when it can't measure — no silent blocking.
+
+Tracking epic: `kickoffs/oracle-hardening-v03.md`.
+
+Dispatch path findings filed at `docs/fixes/20260604-dispatch-classifier-overrides-explicit-recipe.md` — the `bin/mini-ork run <recipe>` path needs to honor the explicit recipe arg + a new `recipes/docs/` task class needs to ship before pure-docs kickoffs can dispatch through the canonical dogfood loop.
+
+## Next (v0.3 final + v0.4 — Q3-Q4 2026 target)
+
+Wire-up + remaining oracle-hardening gaps:
+
+- **Wave 1 wire-up** — source the 5 lib primitives in `bin/mini-ork-execute` so they enforce automatically. Requires touching the 828-LOC central dispatcher; deserves a 3-subagent consensus pass first.
+- **Wave 2-A** — per-recipe held-out anchor corpus (Wang 2026). Hand-author per synthesis recipe; corpus selection is judgment-heavy.
+- **Wave 3** — `lib/citation-verifier-mechanical.sh` recall-floor oracle for `refactor_audit` findings (Sistla 2025 + Ficek 2025). 2-3 week sub-decomposition.
 
 ### Calibration + adversarial gates (the positioning-doc honest-gaps list)
 
