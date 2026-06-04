@@ -123,6 +123,51 @@ mini-ork metrics --recipe refactor-audit --format json | jq '.totals'
 
 Phase C scaffold. Cross-cycle delta auto-detect coming in v0.3.
 
+## Self-evolution is class-restricted (don't oversell)
+
+mini-ork's `promote` chain (reflect → improve → eval → promote via
+`version_registry`) is a real durable substrate for cross-cycle learning.
+But the *self-improving* claim has a class-restricted truth — and pretending
+otherwise is the failure mode this section exists to prevent.
+
+The framework supports two task-class families with **fundamentally
+different promotion contracts**:
+
+| Task class | Oracle | Auto-promote via `mini-ork promote`? |
+|---|---|---|
+| Deterministic | External ground truth (typecheck, test suite, schema validator, migration replay). The verifier returns rc=0/1; the oracle is not the framework. | **Yes.** `code_fix`, `db_migration` — auto-promote on green verifier. |
+| LLM-judged only | No external oracle. The promotion gate is the same family distribution that produced the candidate. | **No — operator review required.** `research_synthesis`, `refactor_audit`, `blog-post`, `ui-audit`, `ops-runbook` are **manual-promote-only**: the operator reads the synthesis and decides. |
+
+The reason for the split is mathematical, not stylistic:
+
+- **Zenil 2026** ([arxiv:2601.05280](https://arxiv.org/abs/2601.05280))
+  formally proves that recursive self-evolution without an external
+  grounding signal `α_t` yields degenerative dynamics in the limit
+  (entropy decay + distributional drift). For deterministic task classes
+  the verifier *is* the `α_t`. For synthesis classes, no such signal
+  exists in the loop — promotion driven by LLM rubric scoring is the
+  closed system Zenil's theorem applies to.
+- **Setlur 2025** ([arxiv:2502.12118](https://arxiv.org/abs/2502.12118),
+  ICML, 82 citations) demonstrates empirically that test-time-compute
+  scaling without external verification is suboptimal at every compute
+  budget tested.
+- **DeVilling 2025** ([arxiv:2510.21861](https://arxiv.org/abs/2510.21861))
+  studies 144 recursive self-evaluation sequences and finds that "model
+  reviewing its own output" is reformulation, not progress — no
+  monotonic quality gain across iterations.
+
+Synthesis-class recipes still get the full mini-ork substrate (state.db
+trajectory, gradient extraction, candidate scoring, panel verdicts) — what
+they don't get is auto-promotion. The operator stays in the loop because
+the framework refuses to fabricate an oracle it doesn't have.
+
+The v0.3 oracle-hardening epic ([`kickoffs/oracle-hardening-v03.md`](../../kickoffs/oracle-hardening-v03.md))
+introduces three diagnostics that make this contract enforceable rather
+than documentary: a ρ hard-block gate (Bertalanič 2026 family-diversity
+precondition becomes load-bearing), a CW-POR authority-capture detector
+(Agarwal & Khanna 2025), and a selective-feedback conjunction in
+`promotion_gate.sh` (Adapala 2025 Anti-Ouroboros).
+
 ## Citation-honesty audit trail (2026-06-01)
 
 The DF14 dogfood cycle of `research-synthesis` ran 4 distinct-family lenses
