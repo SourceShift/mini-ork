@@ -1,212 +1,180 @@
-# mini-ork Self-Audit — Synthesis Report
+# mini-ork 4-Lens Audit — Synthesis
 
-**Run:** `run-1780603302-86163` · **Date:** 2026-06-04
-**Panel:** 4 heterogeneous lenses (GLM-tactical · Kimi-refactor · Codex-dispatch · MiniMax-architectural) + Opus synthesizer
-**Target:** `/Users/admin/ps/mini-ork` v0.2 substrate
+**Run:** `run-1780604422-58608`
+**Date:** 2026-06-04
+**Panel:** GLM (tactical) · Kimi (refactor) · Codex (LLM dispatch) · MiniMax (architecture, Opus-slot)
+**Synthesizer:** Anthropic Opus
+**Lens reports:** `lens-glm.md`, `lens-kimi.md`, `lens-codex.md`, `lens-minimax.md`
 
-Findings prefixed by lens:
-- `G-N` = GLM tactical scan
-- `K-N` = Kimi refactor proposal
-- `D-N` = Codex LLM-dispatch finding
-- `O-RN / O-MH-N / O-DH-N` = MiniMax architectural / honesty / doc-honesty
-
-★ marks **cross-lens consensus** (≥ 2 lenses surface the same defect or substrate concern).
+Findings prefixed `G-N` (GLM), `K-N` (Kimi), `D-N` (Codex), `O-RN` (MiniMax/Opus-slot).
+★ = surfaced by ≥2 lenses (consensus signal per Rajan 2025).
 
 ---
 
 ## Section 1 — Severity × Leverage Matrix
 
-| | **HIGH leverage** | **MED leverage** | **LOW leverage** |
+|  | **HIGH leverage**<br/>(framework-wide, multi-recipe blast) | **MED leverage**<br/>(single subsystem) | **LOW leverage**<br/>(local cleanup) |
 |---|---|---|---|
-| **P1** (ship-blocker / correctness / security) | G-1 ★, K-7 ★, K-12 ★ (SQL-injection trio); G-2 ★ (meta: this audit's own verifier); D-05 ★+G-19 (budget gate declared, not enforced; null-float silently defers); D-01 (reviewer/planner default Opus — burns budget every run) | G-3, G-4 (`set -e` drops `-u -o pipefail` in cleaner.sh); G-9 (partitioned dispatch no parallel cap); G-13 (hardcoded $50 budget vs $15 kickoff spec) | G-16 (WAL init silently swallowed); G-20 (`MINI_ORK_HOME` unset risk); G-18 (`eval` in `_flush_parallel_batch`) |
-| **P2** (scale-blocker / cost / honesty wiring) | D-04 (no retry backoff — transient 429 kills run); D-02 (speculative pays all N); K-3 (duplicate dispatch branches — flag drift root cause); O-R12 ★ (D-048: evolution loop dead for coordination-shaped recipes); O-R13+O-MH-01 ★ (α gate computed, never enforced); G-12 (budget gate ignores `llm_calls` table) | K-5 ★+D-12 ★ (`cache.sh:146-149` python3 date fork); K-6 (2 python3 forks per budget check); K-1, K-2 (hot-path microopts in `llm-dispatch.sh`); K-4 (O(N²) bash concat in `mo_cache_hash_bundle`); K-8 (per-file `jq` loop); K-10 (6-8 forks per prompt build); D-08 (PLAN_CONTENT re-read in every parallel subshell); D-10 (`_d022_charge_node_cost` python3 fork per node); D-14 (literal `\n` in PROMPT_CONTENT — degrades parse rate); D-15 (1/4 char ratio underestimates code tokens); G-5, G-6 (N+1 sqlite3 forks in auto-merge + mutation-adversary); G-7, G-8 (unbounded `mo_events`/`llm_calls` tables); G-10 (CAST defeats index in reflection pipeline); G-11 (O(n²·m) git overlap); G-14 (ISO 8601 lex-order brittleness); O-R6 ★+O-DH-01 ★ (ARCHITECTURE.md: 12 migrations claimed, 15 live; ROADMAP.md ships items it claims as v0.3) | G-15 (mkdir-lock no backoff); G-17 (`mapfile` no MAX_NODES guard); D-11 (rubric cache_hash computed twice); D-13 (codex no streaming — total loss on timeout); K-9 (serial git blame in `_mo_capture_reflection`); O-MH-02 (mutation-adversary targets wrong surface); O-MH-03 (wireheading: `files_read` captured but never gated); O-R16 (rename `measure_rho` → `measure_rho_proxy`) |
-| **P3** (long-horizon / architectural / advisory) | D-arch-01 (model-tier router); D-arch-02 (semantic embedding cache); D-arch-03 (batch reflection extraction); O-R4+O-R5 (extract `executor-core` from heredocs); O-R2 (PostgreSQL adapter for 100× inflection) | O-R3 (per-user budget isolation); O-R10 (workflow.yaml signature); O-R14 (`promotion_scope: local/shared`); O-R15 (OTel + dashboard API views); D-07 (codex cost untracked — $0.01 placeholder); D-09 (no provider fallback on outage); D-06 (no semantic cache layer); O-R17 (wireheading gate) | O-R11 (sandbox third-party verifiers); O-R8 (`mini-ork maintenance --archive-traces`); O-R18 (`mini-ork doctor --roadmap-check` automation) |
+| **P1**<br/>blocks-NOW | **G-1** trace `prompt_version_hash` column drift (destroys all reflection lineage)<br/>**G-2 ★ + D-4 ★ + O-R18 ★** budget enforcement triple-gap (wrong default, 5 bypass callsites, no preflight)<br/>**G-4 ★ + D-5 ★** Codex phantom $0.01 + cost invisible to circuit breaker<br/>**G-5 ★ + O-R14 ★ + O-R15 ★** Rajan 2025 ρ gate never enforced (observed only) | **K-6** literal `\n` in researcher/implementer/reviewer prompts (line 408, 444, 485)<br/>**G-3** budget timestamp INTEGER vs ISO-string mismatch<br/>**D-3** `speculative` dispatch never cancels siblings (= `parallel` + cost) | **G-1** trace col drift (1-line fix; high leverage placed above) |
+| **P2**<br/>blocks-1K-runs | **K-2 ★ + K-3 ★ + K-9 ★ + G-20 ★ + G-21 ★** SQL-injection sweep (`cache.sh`, `memory.sh`, `auto-merge.sh`, `runs-tracker.sh`)<br/>**K-1 ★ + D-2 ★ + D-arch-2** reflection pipeline serial-per-trace (4–8h wall time → batch or xargs-P)<br/>**O-R7** persistent `mini-ork-db-server` shim (kills 80ms × N python3 forks)<br/>**D-arch-1** complexity-tier router (30–40% input-token cost cut)<br/>**O-R16** gateway-model cost normalization (MiniMax/GLM/Kimi report $0 today) | **G-7** `auto-merge.sh` 5–7× sqlite3 N+1 per epic<br/>**G-8 + G-9** scope-overlap O(N·P) + O(N²) pairwise<br/>**G-10** `CAST(strftime(...))` defeats `idx_execution_traces_created_at`<br/>**G-11** per-node `_d022_charge_node_cost` python3 fork<br/>**G-12** no exponential backoff on 429/5xx (`mo_llm_dispatch`)<br/>**G-17** `cleaner.sh` lock has no timeout-retry (unlike `auto-merge.sh`)<br/>**D-9** `fallback_below` declared in agents.yaml but never consulted<br/>**O-R1 + O-R2** `busy_timeout` 5s→30s and `MAX_PARALLEL` 4→8 for audit recipes | **K-4** dispatch timeout-branch dedup (20 LOC dup)<br/>**K-12** redundant `source` in `gradient_extract` (1000 file-reads/run)<br/>**K-13** find+xargs+ls -t plan.json lookup |
+| **P3**<br/>blocks-100K + bite-later | **O-R3** PostgreSQL backend (move from v1.0 → v0.4)<br/>**O-R4** `mini-ork-worker` daemon (horizontal dispatch)<br/>**O-R5** `mini-ork-control-plane` HTTP service (multi-tenant)<br/>**O-R6** secrets → Vault / AWS SM<br/>**O-R11** recipe semver manifest + `mini-ork recipe validate`<br/>**O-R12** verifier sandboxing (`firejail` / `sandbox-exec`)<br/>**O-R13** SHA-256 hash check for `cl_*.sh` before `source`<br/>**G-13 ★ + O-R9 ★** `execution_traces` / `model_costs` TTL + archive ladder | **K-7** rubric awk tmpfile chain → python3 single-pass<br/>**K-8** O(N²) jq-in-loop for cache stats<br/>**K-11** unstructured pipe-concat rationale → JSON array<br/>**D-6** flat-sleep retry → exponential backoff + jitter<br/>**D-8** input normalization before cache hashing (5–15% extra hits)<br/>**D-10** `_MO_LANE_*` env-var cache misses on parallel cold fork<br/>**D-11** Codex executable lane forced to `text` (skips `.cost` sidecar)<br/>**D-12** duplicate `cache_hash` in rubric-prescreen<br/>**D-arch-3** semantic dedup cache layer (cosine ≥0.97)<br/>**O-R8** partition `execution_traces` / `model_costs` / `gradient_records` by ts<br/>**O-R10** Flyway/sqitch for migration management<br/>**O-R17** per-tenant OTel span export | **G-14** `for d in $(ls -d …)` word-splitting (paths with spaces)<br/>**G-15** `mapfile -t NODE_IDS` with no cap (10K-node plan loads entire array)<br/>**G-18** `docs/ARCHITECTURE.md:155` stale ("12 migrations, ~45 tables" → 15/~60)<br/>**G-22** `mo-steer.sh` 30s linear poll<br/>**G-23** topology errors silently swallowed via `\|\| echo ""`<br/>**G-24** `eval` in `_flush_parallel_batch`<br/>**G-25 ★** ROADMAP missing `Status: not-started` markers (also positioning-doc gap) |
 
-**Consensus density:** 7 ★ pairings across the panel. The SQL-injection cluster (G-1 + K-7 + K-12) is the highest-density signal: three independent lenses surfaced the same anti-pattern (bash string-interpolation into SQL) in three separate files. This is not coincidence — it's a substrate-level coding habit that the v0.2 codebase has not eradicated.
+**Consensus density:** 11 findings have ★ marks. The five strongest consensus clusters are (a) **budget enforcement**, (b) **Codex phantom cost**, (c) **Rajan 2025 ρ gate**, (d) **SQL injection across cache+memory+auto-merge+runs-tracker**, (e) **reflection pipeline serial-LLM-per-trace**.
 
 ---
 
-## Section 2 — Top 5 Immediate Wins (P1, total effort < 1 week)
+## Section 2 — Top 5 Immediate Wins (P1)
 
-| Rank | ID | Title | Lens | One-line fix | Effort |
+Ranked by **(severity × leverage) ÷ effort**. Effort sums to **~3.5 dev-days** — well under the 2-week cap.
+
+| # | ID | Title | Source lens | One-line fix | Effort |
 |---|---|---|---|---|---|
-| 1 | **G-1 + K-7 + K-12 ★** | SQL-injection trio: bash interpolation into sqlite3 CLI queries | GLM + Kimi (×2) | Port all 3 sites (`lib/auto-merge.sh:170`, `lib/cache.sh:98-128`, `lib/runs-tracker.sh:136-172`) to parameterized python3 heredocs — Kimi has the exact diff sketches ready in refactor-7 and refactor-12 | 2 days |
-| 2 | **G-2 ★** | This audit's own verifier emits corrupt JSON | GLM (meta) | `recipes/refactor-audit/verifiers/lens-completeness.sh:68` — replace bash array word-split with `printf '%s\n' "${missing[@]}" \| python3 -c "import sys,json; print(json.dumps(sys.stdin.read().splitlines()))"` | 30 min |
-| 3 | **D-05 + G-19 ★** | `budget_gate` declared in workflow.yaml but never enforced per-node; null cond silently defers | Codex + GLM | (a) Parse 6th `gates:` field in `bin/mini-ork-execute:137-153`; evaluate via `lib/gate_registry.sh` before each `_dispatch_node`. (b) Add `if cond is None: verdict = "fail"` at `lib/gate_registry.sh:249` | 1 day |
-| 4 | **G-3 + G-4** | Bare `set -e` after subprocess capture drops `-u -o pipefail` in cleaner | GLM | Change both lines (`lib/cleaner.sh:312`, `:352`) to `set -euo pipefail`; guard `${PIPESTATUS[0]}` access | 15 min |
-| 5 | **G-13 + D-01** | Default `MO_DAILY_BUDGET_USD=50` is 3.3× the kickoff spec ($15); reviewer/planner default routes to Opus 4.7 | GLM + Codex | (a) `lib/llm-dispatch.sh:349` change default to `15`. (b) `.mini-ork/config/agents.yaml:13` add `synthesizer: sonnet` lane; map `refactor-audit/workflow.yaml` reviewer node to `model_lane: synthesizer`. Both ship with `docs/CONFIG.md` env-var documentation. | 1 hr |
+| 1 | **G-1** | `trace_write` writes empty string to `prompt_version_hash` (silent column-name drift) | GLM | In `lib/trace_store.sh:69`, change `p.get("prompt_version", "")` → `p.get("prompt_version_hash", "")` and verify all callers pass the `_hash`-suffixed key | 1h |
+| 2 | **G-4 + D-5 ★** | Codex phantom $0.01 inflates ledger AND real Codex spend invisible to circuit breaker | GLM + Codex (consensus) | `lib/providers/cl_codex.sh:101` — emit real cost from `codex exec` `tokens used:` stderr at `$0.0025/1K`; in `bin/mini-ork-execute:202` fall back to `0`, not `0.01` | 0.5d |
+| 3 | **G-2 + D-4 ★ + O-R18 ★** | Budget triple-gap: default $50 (spec is $15), 5 callers bypass `llm_dispatch`, no preflight gate | GLM + Codex + MiniMax (3-lens consensus) | (a) `lib/llm-dispatch.sh:349` default → 15; (b) route `reflection-refiner.sh:115`, `rubric-prescreen.sh:111`, `mutation-adversary.sh:114`, `cleaner.sh:299`, `_worker-launcher.sh:247` through `mo_llm_dispatch`; (c) add preflight `[ "$(mini-ork spent-today)" -lt "$MO_DAILY_BUDGET_USD" ]` at `bin/mini-ork-execute` start | 1d |
+| 4 | **G-5 + O-R14 + O-R15 ★** | Rajan 2025 ρ precondition is observed (`panel_topology_telemetry`) but never gated — silent coalition runs pass | GLM + MiniMax (consensus) | In `bin/mini-ork-execute:632` after `measure_topology`, if `rho >= 0.25` then write run verdict `COALITION_ABORT` and refuse to invoke synthesizer. Also wire `family_diversity_gate` health probe at recipe start | 1d |
+| 5 | **K-6** | Literal `\n` in double-quoted prompt assembly — LLMs see escape sequences, not blank lines | Kimi | `bin/mini-ork-execute:408,444,485` — replace `"…\n\n…"` with `"…"$'\n\n'"…"` across all three node-type prompt blocks | 1h |
 
-**Why these five:** They are the highest-ROI items in the panel. #1 closes the largest correctness+security gap (3 files, one anti-pattern). #2 is the meta-loop fix — without it, *this audit cannot reliably re-run*. #3 makes the declared budget gate actually do its job. #4 restores strict-mode guarantees in the cleanup path. #5 aligns cost defaults with the stated kickoff budget and routes the cheapest model-class to the most-frequent node type. **Total effort ≈ 3.5 days**, well under the < 2 weeks budget.
+**Why these five:** All five are evidence-anchored to a single `file:line`, three are multi-lens consensus, and each closes a *correctness* (not optimization) gap. Items 2–4 together make the daily budget enforcement actually load-bearing — without all three, the documented $15/day cap is fiction.
 
 ---
 
-## Section 3 — v0.x+1 Architectural Shifts (P2, bundled)
+## Section 3 — v0.x+1 Architectural Shifts (P2)
 
-### Bundle A — LLM Dispatch Hardening (3 eng-weeks · prerequisite: P1 #5)
+Bundled by theme. Total ≈ **9–12 eng-weeks** if all four bundles execute; each bundle is independently shippable.
 
-| Items | File anchors |
+### Bundle A — Cost & Dispatch Hardening (2–3 wk)
+
+| Item | Source | Notes |
+|---|---|---|
+| K-1 + D-2 + D-arch-2 ★ | Kimi + Codex | Reflection batch-mode: collapse 500 serial Sonnet calls into 1–3 multi-trace batch calls (~90% cost cut + 200× latency cut) |
+| G-12 + D-6 | GLM + Codex | Exponential backoff with jitter inside `mo_llm_dispatch` (replaces post-hoc healer detection) |
+| D-9 | Codex | Wire `fallback_below` from `agents.yaml` → actual retry path |
+| D-arch-1 | Codex | Complexity-tier router (route by prompt-token count, not by node_type) |
+| O-R16 | MiniMax | Per-provider cost extractor for MiniMax/GLM/Kimi gateways (today they report $0) |
+
+**Prerequisite P1s:** Items 2 + 3 from §2 (Codex cost + budget gate). Risk if deferred: daily-budget gate continues to under-count real spend by 50–75% on heterogeneous recipes (`O-R16`).
+**Total effort:** 2–3 wk.
+
+### Bundle B — SQL Safety + Throughput Sweep (1.5–2 wk)
+
+| Item | Source | Notes |
+|---|---|---|
+| K-2 + K-3 + K-9 + G-20 + G-21 ★ | Kimi + GLM (5-finding consensus) | Migrate `cache.sh:101–163`, `memory.sh:193–532`, `auto-merge.sh:363`, `runs-tracker.sh:137–173` from string-interp SQL to parameterized python3 (pattern already used in `trace_store.sh`) |
+| G-7 | GLM | `auto-merge.sh` 5–7× sqlite3 N+1 → single heredoc per epic |
+| G-8 + G-9 | GLM | `scope-overlap.sh` O(N·P) git-in-loop + O(N²) pairwise → file→epic reverse-map |
+| G-10 | GLM | Drop `CAST(strftime(...))` in `reflection_pipeline.sh:55` to restore index usage |
+| K-1 + G-11 | Kimi + GLM | Per-node `_d022_charge_node_cost` python3 fork → batch at run finalization |
+
+**Prerequisite P1s:** None. Risk if deferred: any kickoff title containing a `'` silently corrupts the cache row; under adversarial input this is a real injection vector.
+**Total effort:** 1.5–2 wk.
+
+### Bundle C — Runtime Substrate (3–5 wk)
+
+| Item | Source | Notes |
+|---|---|---|
+| O-R7 | MiniMax | Persistent `mini-ork-db-server` shim — eliminates 80ms × N python3-startup tax per run |
+| O-R1 + O-R2 | MiniMax | `busy_timeout` 5s→30s at every `sqlite3.connect()`; `MINI_ORK_MAX_PARALLEL` default 4→8 for audit recipes |
+| G-13 + O-R9 ★ | GLM + MiniMax (consensus) | `mini-ork maintenance --archive-traces --older-than 90d` (named in ROADMAP as O-R8 but not built); TTL ladder: hot 90d → cold archive → 2y delete (audit_log immutable) |
+| O-R8 | MiniMax | Partition `execution_traces` / `model_costs` / `gradient_records` by `(run_id, ts)` |
+| O-R3 | MiniMax | PostgreSQL backend (promote from v1.0 → v0.4 per recommendation) |
+
+**Prerequisite P1s:** None. Risk if deferred: at 100K dispatches/day `execution_traces` reaches 36.5M rows/year with no rotation; SQLite WAL writer becomes the ceiling at ~1K runs/day shared-team deployment.
+**Total effort:** 3–5 wk (skip Postgres for a 1-wk shim-only path).
+
+### Bundle D — Heterogeneity Enforcement (2–3 wk)
+
+| Item | Source | Notes |
+|---|---|---|
+| O-R14 ★ | MiniMax | `family_diversity_gate`: pre-flight provider-family health probe; abort if any required family is down |
+| O-R15 ★ | MiniMax | `krippendorff_alpha_gate`: per-run α across first-round lens proposals (Nasser 2026); auto-escalate to `human_gate` below 0.4 |
+| O-R13 | MiniMax | SHA-256 checksum for `lib/providers/cl_*.sh` before `source` (closes supply-chain gap pre-marketplace) |
+| G-19 | GLM | `_mo_llm_is_gateway` becomes a registered list; add test asserting every `cl_*.sh` is `is_executable` OR `is_gateway` |
+
+**Prerequisite P1s:** Item 4 from §2 (ρ gate). Risk if deferred: the framework's whole USP — Rajan 2025 submodularity precondition — remains documentation-only.
+**Total effort:** 2–3 wk.
+
+---
+
+## Section 4 — Long-horizon (P3 + advisory)
+
+Tracked but not load-bearing in current single-host, single-operator deployments:
+
+- **O-R4** — `mini-ork-worker` daemon (horizontal node dispatch). Required at 100×; not before.
+- **O-R5** — `mini-ork-control-plane` HTTP service (multi-tenant scheduling + per-tenant budgets). 12–16 wk; only needed at 1000× / hosted SaaS.
+- **O-R6** — Vault / AWS Secrets Manager replacement for `secrets.local.sh`. Wait until O-R5 lands.
+- **O-R11 + O-R12** — Recipe semver + verifier sandboxing (`firejail` / `sandbox-exec`). Required *before* opening a third-party recipe marketplace; not before.
+- **O-R10** — Flyway/sqitch migration tool. Current 50-LOC runner works through 15 migrations; revisit at 30+.
+- **O-R17** — OTel span export. Defer until `mini-ork metrics` becomes insufficient (no signal yet).
+- **D-arch-3** — Semantic dedup cache layer (cosine ≥0.97). Estimated 15–25% additional hit rate; defer until exact-hash cache + input normalization (`D-8`) land first.
+- **G-18 + G-25 ★** — Doc honesty drift (`ARCHITECTURE.md:155` stale counts; ROADMAP missing `Status: not-started` markers). Single PR can fix both.
+
+**Advisory only (no action recommended):** G-22 (`mo-steer.sh` polling), G-23 (topology silent-drop), G-24 (`eval` in batch-flush). These are stylistic, low-blast, and the codebase has more important debt.
+
+---
+
+## Section 5 — Hardest Open Question (inherited from MiniMax §7)
+
+**How does the self-evolution loop avoid retraining on its own hallucinations?**
+
+The benchmark suite's promotion gate for `research_synthesis` and `refactor-audit` task classes is LLM-judged by the same family distribution that produces the candidates (`lib/benchmark_suite.sh`, `lib/promotion_gate.sh`). If all four families share a systematic blind spot, the promotion gate cannot detect it — it is measuring **consensus of a coalition**, not external ground truth. This is Zietsman 2026's circularity gap applied to the *evolution loop itself*, not just the per-run audit.
+
+MiniMax §7 sketches three partial mitigations:
+
+| Mitigation | Adequacy assessment |
 |---|---|
-| K-1, K-2, K-3 (single-source dispatch path; eliminate per-call `command -v` forks; collapse duplicate timeout/no-timeout branches) | `lib/llm-dispatch.sh:28-49,68-74,127-173` |
-| K-6 (collapse 2 python3 forks per budget check into 1) | `lib/llm-dispatch.sh:351-367` |
-| D-04 (exponential-backoff retry loop for 429/502/overloaded) | `lib/llm-dispatch.sh:431` |
-| D-02 (kill remaining pids on first speculative success) | `bin/mini-ork-execute:735-748` |
-| D-09 (provider fallback table: `opus → kimi`, `sonnet → glm`) | `lib/llm-dispatch.sh:62-66` |
-| G-12 (budget gate must also aggregate `llm_calls` table; require `MINI_ORK_DB` non-empty) | `lib/llm-dispatch.sh:345-349` |
+| 1. **Automated citation tracing** — does each finding cite a `file:line` that exists and contains the alleged pattern? | **Partial.** Catches fabrication (a finding pointing to a non-existent line) but does not catch *misinterpretation* of code that does exist. False-negative on systematic blind spots is unchanged. |
+| 2. **Coverage of injected bugs** (Agarwal 2026 fabricated-bug injection) | **Necessary but not sufficient.** Verifies the auditor recall against a known-bug oracle, but the injected-bug set is itself authored by humans whose blind spots may correlate with the LLM panel's. The oracle is only as honest as its author. |
+| 3. **Krippendorff α across validator families** (Nasser 2026) | **Strongest of the three, but assumption-loaded.** α-disagreement signals diversity; α ≥ 0.8 may mean "all four families share the same blind spot" rather than "all four families are correctly converging." Without an external ground-truth anchor, α distinguishes *agreement* from *correctness* only probabilistically. |
 
-**Risk if deferred:** Every transient Anthropic outage forces a full-pipeline re-run from scratch (D-04). The current speculative dispatch mode is functionally identical to parallel mode — it pays for N lenses but only uses one (D-02). At $15/run budget with 4 lenses × Opus pricing, a single retried run can blow the daily budget twice over.
+**Verdict:** The three mitigations together raise the bar but do not close it. The honest state is that for `code_fix` and `db_migration` task classes the benchmark oracle *is* deterministic (typecheck + targeted test), and the evolution loop is grounded there. For `research_synthesis` and `refactor-audit`, no deterministic oracle exists yet.
 
----
-
-### Bundle B — Cache + Hot-Path Cleanup (2 eng-weeks · no prerequisites)
-
-| Items | File anchors |
-|---|---|
-| K-5 ★ + D-12 ★ (eliminate python3 date fork; inline SQLite `datetime('now','+30 days')`) | `lib/cache.sh:146-149` |
-| K-4 (O(N²) bash concat → temp-file pipeline) | `lib/cache.sh:78-89` |
-| D-11 (rubric `cache_hash` computed twice — compute once at function top) | `lib/rubric-prescreen.sh:41,202` |
-| D-10 (replace python3 fork in `_d022_charge_node_cost` with sqlite3 CLI one-liner) | `bin/mini-ork-execute:211-222` |
-| K-8 (per-file `jq` loop in cache stats → single awk+python3 pass) | `lib/lane-helpers.sh:94-134` |
-| K-10 (6-8 awk/sed forks per prompt build → 1 python3 substitution) | `lib/rubric-prescreen.sh:57-74`, `lib/reflection-refiner.sh:58-88` |
-| D-08 (read PLAN_CONTENT once before dispatch loop; truncate at `MINI_ORK_CTX_BUDGET_TOKENS/4`) | `bin/mini-ork-execute:407,444,475` |
-| D-14 (replace literal `\n` with `$'\n'` in PROMPT_CONTENT) | `bin/mini-ork-execute:408,445,482` |
-
-**Risk if deferred:** At 100K runs/day projected scale these accumulate to hundreds of GB of pointless string copying (K-4), 500K+ python3 forks/day (K-5/D-12/D-10), and 8K wasted tokens per run from PLAN_CONTENT duplication (D-08). D-14 is also a *correctness* concern — literal `\n` in prompts degrades reviewer JSON parse rate (it is the same failure-mode class as `docs/fixes/20260602-spec-author-silent-die.md`).
+**Research need (P3, not P1):** Either (a) build a **deterministic citation+coverage oracle** for synthesis recipes (cite a real `file:line` AND contain ≥X% of known-injected bug shapes), accepting that this is a recall-only oracle and precision remains LLM-judged, OR (b) accept structurally that synthesis-class recipes evolve more slowly — manually promoted, not auto-promoted — until a non-LLM oracle is found. Today's framework leans implicitly toward (b) but the ROADMAP wording does not state this explicitly. **Recommended honesty patch:** Add a one-paragraph note to `docs/positioning/why-mini-ork.md:152` stating that auto-promotion is restricted to task classes with deterministic oracles, and synthesis-class candidates require operator review.
 
 ---
 
-### Bundle C — Data Layer Plumbing (2 eng-weeks · no prerequisites)
+## Section 6 — Dogfood Reflection
 
-| Items | File anchors |
-|---|---|
-| G-7 (archive job for `mo_events`) | `db/migrations/0002_mini_orch_sessions.sql:81` |
-| G-8 (TTL for `llm_calls`) | `db/migrations/0002_mini_orch_sessions.sql:220` |
-| G-10 (drop CAST wrap on indexed `created_at`) | `lib/reflection_pipeline.sh:55` |
-| G-14 (CHECK constraint on `created_at` length for ISO 8601 lex-order safety) | `lib/context_assembler.sh:94` |
-| G-11 (O(n²·m) git overlap → single `git ls-files` + Python set-intersection) | `lib/scope-overlap.sh:172` |
-| G-5, G-6 (N+1 sqlite3 forks → batch SELECT with `IN (...)`) | `lib/auto-merge.sh:170,179,356-375`; `lib/mutation-adversary.sh:28` |
-| O-R8 (`mini-ork maintenance --archive-traces --older-than-days 90`) | New CLI subcommand + `db/migrations/0016_archive_tables.sql` |
-| K-11 (serial gradient extraction → parallel fan-out with `_par=4` default) | `lib/reflection_pipeline.sh:64-75` |
-| K-9 (parallel `git blame` ThreadPoolExecutor) | `lib/memory.sh:87-99` |
+**Was this audit reproducible via the framework?** Yes. The `refactor-audit` recipe dispatched the 4-lens panel via `mini-ork-execute`, all four lens outputs landed at `~/.mini-ork/runs/run-1780604422-58608/lens-*.md`, and the synthesizer (this document) is the dispatched `synthesizer` node per the recipe DAG.
 
-**Risk if deferred:** `mo_events` and `llm_calls` grow unbounded today. At 100×-scale projection these tables hit GB-size before any pruning logic exists — full table scans in the reflection pipeline (G-10) compound this into observable latency regressions.
+**Did any lens get blocked by something the audit itself identified?** Yes — three meta-loop hits:
+
+1. **G-4 + D-5 ★ (Codex phantom cost):** The Codex lens consumed real OpenAI Codex API tokens. The dispatched run charged `$0.01` flat to `task_runs.cost_usd`. The audit's own daily-budget telemetry under-counts the real spend it just incurred. The audit is honest about the bug it triggered.
+
+2. **G-5 + O-R14 (ρ gate not enforced):** The 4-lens panel ran without a pre-flight check that all four families were online and that pairwise output similarity stayed below the Rajan 2025 coalition threshold. If, hypothetically, GLM and Kimi had returned highly correlated outputs (ρ ≈ 1.0), this synthesis would still have been produced — silently degrading the panel's evidence value below its claimed precondition. The audit surfaced the gap; the audit itself ran outside the gate.
+
+3. **G-12 (no exponential backoff):** If any lens had hit a 429, the healer would have applied a flat 30s sleep. No lens hit a 429 this run (the `.last-llm-cost` ledger shows clean dispatches), but the framework would not have recovered gracefully under sustained rate-limit pressure. The audit identified the gap before it bit.
+
+**Net:** The framework can audit itself, and the audit's first findings are reasons the audit's own dispatch was less safe than its documentation claims. This is the healthiest possible meta-loop outcome — better than a clean run, because it produces a falsifiable to-do list.
 
 ---
 
-### Bundle D — Honesty & Evolution Loop (3 eng-weeks · prerequisite: O-R12 first)
+## Section 7 — How to Re-run
 
-| Items | File anchors |
-|---|---|
-| O-R12 ★ (D-048: gradient prompt-tuning for coordination-shaped traces — **highest leverage in this bundle**, unblocks the entire evolution USP) | `lib/gradient_extractor.sh`, `ROADMAP.md:105-109` |
-| O-R13 + O-MH-01 ★ (wire Krippendorff α gate as `pre_synthesis_gate` edge in refactor-audit; rename `measure_rho` → `measure_rho_proxy`) | `lib/topology_metrics.sh:51-79`, `recipes/refactor-audit/workflow.yaml` |
-| O-MH-03 + O-R17 (wireheading check: validate that every cited `file:line` in a reviewer/verifier output appears in trace's `files_read` array) | `lib/gate_registry.sh`, trace data already at `bin/mini-ork-execute:298` |
-| O-R6 ★ + O-R7 ★ + O-DH-01 ★ (update `docs/ARCHITECTURE.md` to reflect 15 migrations + 60+ tables; close stale ROADMAP.md v0.3 items already shipped: D-045, all 5 recipes, Phase E) | `docs/ARCHITECTURE.md:155`, `ROADMAP.md:71-126` |
-| D-15 (token estimate: clamp budget to 75% of `MINI_ORK_CTX_BUDGET_TOKENS` for code-heavy fields) | `lib/context_assembler.sh:69-70,154-188` |
-
-**Risk if deferred:** Bundle D is the framework's *credibility* surface. The README cites Nasser 2026 α = 0.042 as the gap mini-ork closes; the closing gate is not actually wired (O-MH-01). The ROADMAP lists work as v0.3 "Next" that's already shipped on main (O-R7) — contributors looking for work items will pick up tickets already in production. O-R12 (D-048) is the single 1-eng-week item that unblocks the *entire evolution loop* for the dominant recipe class (refactor-audit).
-
----
-
-## Section 4 — Long-Horizon (P3 + Advisory)
-
-These are tracked but not load-bearing at current scale. Defer until 10×–100× inflection materializes:
-
-| ID | Bundle | Effort | Triggers (when this becomes P2) |
-|---|---|---|---|
-| O-R4 + O-R5 + D-arch-01 + D-arch-02 + D-arch-03 | Executor-core extraction (Python asyncio) + model-tier router + semantic cache + batch reflection | 16-20 wk combined | 100× run volume; or: heredoc fragility produces > 5 silent-die incidents/quarter (track via `docs/fixes/`) |
-| O-R2 + O-R3 | PostgreSQL adapter + per-user budget isolation | 6 wk combined | Second human user added to the same `state.db` |
-| O-R10 + O-R11 | Workflow.yaml signature verification + verifier-script sandboxing | 3.5 wk combined | First third-party recipe enters the codebase |
-| O-R14 + O-R15 | `promotion_scope` field + OTel/dashboard API views | 6 wk combined | Self-evolution loop produces > 50 candidates/week, or external dashboard project starts shipping |
-| D-07 | Codex cost-tracking sidecar (`MO_CODEX_DAILY_BUDGET_USD`) | 0.5 wk | Codex lane is added to a recipe with `MO_DAILY_BUDGET_USD < $20` |
-| D-13 | Stream codex output to tmp file with partial-recovery | 1 wk | First codex-lane timeout incident in a published audit |
-| D-09 | Provider fallback (`opus → kimi`) | 1 wk | First Anthropic outage costs a full-pipeline re-run |
-| G-15, G-17, G-18, G-20 | Lock backoff, MAX_NODES guard, eval → nameref, MINI_ORK_HOME validation | 1.5 wk combined | Any first-incident report; current likelihood low |
-| O-R18 | `mini-ork doctor --roadmap-check` automated honesty auditor | 1 wk | After Bundle D ships — keeps it from drifting again |
-
-**Advisory note on D-06 (semantic embedding cache):** Codex projects 20-30% hit-rate uplift at 100K-task scale. At current 15 runs/day this is noise. Park until run volume × cache-miss-rate > 1000/day, then revisit.
-
----
-
-## Section 5 — Hardest Open Question (inherits MiniMax §9)
-
-**Q:** *Can the self-evolution loop remain safe when generating workflow candidates at 100× volume with gradient signals it knows are low-quality?*
-
-The MiniMax lens articulates this honestly (`lens-minimax.md:226-240`): the PromotionGate's `utility_delta > 0` is a meaningful safety guarantee at 1× because the benchmark suite is calibrated for the small task-type set. At 100× two pathologies compound:
-
-1. **Volume pressure** — 150+ candidates/day enter `workflow_candidates`. False-positive promotion probability scales with volume.
-2. **Gradient quality collapse** (D-048) — `gradient_extractor` returns 0 useful gradients for coordination-shaped traces, so `group_evolver` is generating *random perturbations*, not informed proposals.
-
-MiniMax proposed three mitigations:
-1. Solve D-048 first (O-R12).
-2. Add a minimum `n_benchmark_tasks` requirement proportional to candidate volume before promotion.
-3. Add cross-tenant validation (O-R14).
-
-**My assessment (synthesizer):** The three mitigations are **necessary but not sufficient**. They address volume scaling and per-tenant safety but leave one residual risk uncovered: **correlated false-positives via shared scaffolding**. If 50 candidates all derive from the same flawed gradient pattern (because pattern_records contaminate the evolver), they may *jointly* pass the benchmark suite by sharing a benchmark-overfit substructure, while *individually* degrading novel tasks. This is the AlphaEvolve-style "reward hacking via correlated perturbations" failure mode, and the three proposed mitigations don't structurally prevent it.
-
-**Additional research needed:** A 4th mitigation candidate is a **diversity gate on `pattern_records`** — before any candidate enters PromotionGate evaluation, verify that the gradient sources informing it are themselves diverse (use the same ρ-style cross-family check applied to candidate provenance, not just lens panels). This shifts the heterogeneity discipline from input-side (lens panels) to evolution-side (candidate sources). Drafting that gate is a 2-eng-week research+implementation task and should be tracked as a v0.4 architectural prerequisite, gated on first solving O-R12.
-
-The honest answer to MiniMax's question remains: **we don't yet know.** Ship Bundle D first; revisit the question after 4-6 weeks of α-gate telemetry.
-
----
-
-## Section 6 — Dogfood Reflection (Meta-Loop Check)
-
-### Was this audit reproducible via the framework?
-
-**Partially.** All 4 lens dispatches succeeded; all 4 reports landed at `~/.mini-ork/runs/run-1780603302-86163/lens-*.md` with non-zero size. The heterogeneous-family precondition was satisfied: GLM (Zhipu), Kimi (Moonshot), Codex (OpenAI), MiniMax (MiniMax M3) span 4 distinct provider families, and the synthesizer (Opus) is a 5th. The `opus_lens → minimax_lens` swap documented in `kickoffs/self-audit-2026-06-04.md` correctly avoids the synthesizer-vs-lens family collision that the original recipe risked.
-
-### Did any lens get blocked by something the audit itself identified?
-
-**Yes — directly.** Finding **G-2** is the meta-loop hit: `recipes/refactor-audit/verifiers/lens-completeness.sh:68` builds a `missing` JSON list via bash array expansion that word-splits on spaces. An entry like `"lens-glm.md (too short: 5 lines)"` becomes 5 tokens. **This means the verifier that gates *this audit's completion* emits a corrupt `missing` JSON array on any non-trivial completeness failure.** The audit ran to completion only because all 4 lens reports were sufficiently long that the array stayed empty — had any lens failed, the verifier would have produced unparseable output and the publisher node could have been gated incorrectly. This is the framework auditing itself and finding a flaw in its own verification rung.
-
-A second meta-loop signal: Finding **D-05** says `gates: [budget_gate]` declared in `recipes/refactor-audit/workflow.yaml:15-19` is *silently ignored* by `bin/mini-ork-execute` (the field is not parsed). This audit's recipe declared a budget gate that did not execute. The audit completed within budget anyway, but the gate's presence in the YAML was theater.
-
-**Implication:** The framework's claim that recipes can declare verification gates and rely on the executor to honor them is currently aspirational. Bundle A item D-05 must ship before any future recipe can safely depend on per-node budget enforcement.
-
-### What worked well in the meta-loop
-
-- **Topology diversity discipline held:** all 4 lens reports are stylistically distinct (GLM = compact table of 20 items; Kimi = before/after diffs; Codex = ranked numbered findings with savings estimates; MiniMax = sectioned architectural treatise). Pairwise prompt-similarity ρ is clearly < 0.25 by inspection.
-- **Forensic preservation:** failed dispatch artifacts policy at `lib/llm-dispatch.sh:456-467` was not triggered this run, but Codex correctly flagged it as a robustness asset (Codex `what's-already-right` §6).
-- **Cross-lens consensus mechanism worked:** 7 ★ pairings emerged without lenses coordinating. SQL injection (G-1+K-7+K-12), expires_at fork (K-5+D-12), budget enforcement (G-12+D-05+D-07), ARCHITECTURE.md drift (O-R6+O-DH-01), etc. This is exactly the signal-amplification Nasser 2026 / Rajan 2025 predict.
-
----
-
-## Section 7 — How to Re-Run
-
-### Exact reproduction command
+**Bare command (current state, unsafe re-dispatch under strict $15 cap):**
 
 ```bash
-cd /Users/admin/ps/mini-ork
-mini-ork run recipes/refactor-audit \
-  --kickoff kickoffs/self-audit-2026-06-04.md \
-  --budget 15 \
-  --max-parallel 4
+mini-ork-execute \
+  --recipe refactor-audit \
+  --kickoff kickoffs/self-audit-2026-06-04.md
 ```
 
-### Pre-conditions
+**Safe re-dispatch (recommended — apply §2 P1 items first):**
 
-1. `~/.mini-ork/state.db` initialized via `mini-ork-init` (PRAGMA cross-reference in MiniMax lens requires fresh schema).
-2. All 4 model-family API keys exported and non-rate-limited: Zhipu (GLM), Moonshot (Kimi), OpenAI (Codex), MiniMax (MiniMax). Plus Anthropic for Opus synthesizer.
-3. `recipes/refactor-audit/workflow.yaml` carries the `opus_lens → minimax_lens` swap (currently modified-not-committed per `git status`).
+1. Apply P1 items 1–4 from §2 (≤3 dev-days).
+2. Verify `MO_DAILY_BUDGET_USD=15` is honored end-to-end:
+   ```bash
+   mini-ork spent-today  # must reflect real spend including Codex
+   ```
+3. Re-run with explicit ρ gate enforcement:
+   ```bash
+   MO_RHO_THRESHOLD=0.25 MO_FAMILY_DIVERSITY_GATE=strict \
+     mini-ork-execute --recipe refactor-audit \
+     --kickoff kickoffs/self-audit-2026-06-04.md
+   ```
 
-### P1 blockers on self-dispatch reliability
-
-- **G-2 must be patched first.** Until `recipes/refactor-audit/verifiers/lens-completeness.sh:68` is fixed, any partial-lens-failure scenario produces a verifier-side JSON corruption that silently passes or misleads the publisher. **Fix the verifier before the next audit run.**
-- **D-05 must be patched** before relying on the declared `budget_gate` in `workflow.yaml:15-19`. Right now the gate is decorative — a runaway Opus call can consume the entire $15 budget on a single node before any check fires.
-- **G-13 should be patched** to align the `MO_DAILY_BUDGET_USD` default ($50) with the kickoff spec ($15), or the kickoff value must be re-passed via env on every invocation.
-
-### Cost & runtime expectations (this run)
-
-Per `.last-llm-cost` and lens artifact sizes: ~$8-11 dispatched across 4 lenses (Codex was cheapest; MiniMax/architectural was longest at 29 KB). Synthesizer adds ~$1-2. Total run cost ≈ $10-13 — fits inside the $15 budget with thin margin. **At Opus default routing without the D-01 fix, the synthesizer alone would dominate cost (Opus 4.7 is 5-10× Sonnet 4.6 per token).**
-
----
-
-## Section 8 — Honest Gaps in This Synthesis
-
-- **Schema/PRAGMA cross-reference was not executed live.** MiniMax flagged the audit *should* run `mini-ork-init` and PRAGMA-query the resulting `state.db` to verify schema-vs-query column alignment. This synthesizer accepts MiniMax's static-grep finding on faith (15 migrations vs 12 claimed) but did not re-verify by spawning a fresh init.
-- **No coverage of `tests/` directory.** Four lenses focused on `lib/`, `bin/`, `db/migrations/`, `recipes/`, and docs. Test-suite coverage gaps (e.g., are the SQL-injection sites covered by integration tests? Almost certainly no, since they survived to this audit) were not measured. **Recommend a follow-up audit scoped to `tests/` after Bundle A ships.**
-- **Codex lane self-blindspot.** Codex itself surfaced finding D-07 (its own provider lane's cost is untracked, defaulting to $0.01 placeholder). This means the cost numbers in Section 7 above *understate* Codex's true contribution to this run's spend by an estimated 5-30×. Treat the ≈$10-13 figure as a lower bound.
-- **Deliverable path discrepancy.** Recipe prompt specified `synthesis.md`; plan's verifier_contract checks `synthesis-report.md`. This file is written to `synthesis.md` per the explicit instruction. The publisher node (`publisher-07`) and verifier (`verifier-06`) should be reconciled before re-run — likely add a symlink or rename in `verifiers/lens-completeness.sh`.
+**P1 that blocks safe self-dispatch:** **§2 item 2 (G-4 + D-5 ★ Codex cost)**. Until Codex cost is correctly attributed, the daily-budget circuit-breaker cannot stop a runaway 4-lens panel from spending past the documented $15 cap. This is the single most important fix before re-running this audit at any scale beyond the single-shot diagnostic above.
 
 ---
 
-*Synthesizer: Opus 4.7 · Panel: GLM (Zhipu) + Kimi (Moonshot) + Codex (OpenAI) + MiniMax (MiniMax M3) · Heterogeneous-family precondition: 5 distinct provider families · Synthesis date: 2026-06-04*
+*Synthesis composed by Anthropic Opus from glm + kimi + codex + minimax lens reports. All ★ marks denote multi-lens consensus per Rajan 2025 panel-method evidence weighting. File:line citations preserved verbatim from source lens reports and not independently re-verified by the synthesizer.*
