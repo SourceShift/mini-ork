@@ -186,8 +186,16 @@ You are the arbiter of a 4-lens drift-audit panel. Each lens audited
 README.md against a different axis and emitted JSON. Synthesize them
 into ONE final verdict.
 
+The verdict is THREE-VALUED: NO_DRIFT | DRIFT | INDETERMINATE.
+
 Rules:
-- If ALL 4 lenses say NO_DRIFT → final NO_DRIFT.
+- If ALL 4 lenses have confidence == 0.0 OR carry an "error" field
+  (parse failure / provider timeout / empty output) → final
+  INDETERMINATE. "Absence of evidence is not evidence of absence" —
+  refuse to fabricate NO_DRIFT from a broken pipeline. Capture which
+  lenses failed in "notes".
+- If ALL 4 lenses say NO_DRIFT AND at least 1 lens has confidence ≥ 0.5
+  → final NO_DRIFT. (At least one lens must have actually run.)
 - If 1+ lens says DRIFT with confidence ≥ 0.6 → final DRIFT.
 - If 1+ lens says DRIFT but with confidence < 0.6 → final NO_DRIFT,
   but capture the low-confidence flag in "notes".
@@ -203,18 +211,19 @@ $(cat "$RUN_DIR/lens-glm_lens.json")
 Emit strict JSON on stdout:
 
 {
-  "verdict": "NO_DRIFT" | "DRIFT",
+  "verdict": "NO_DRIFT" | "DRIFT" | "INDETERMINATE",
   "lens_verdicts": {
-    "codex_lens":   "NO_DRIFT" | "DRIFT",
-    "kimi_lens":    "NO_DRIFT" | "DRIFT",
-    "minimax_lens": "NO_DRIFT" | "DRIFT",
-    "glm_lens":     "NO_DRIFT" | "DRIFT"
+    "codex_lens":   "NO_DRIFT" | "DRIFT" | "FAILED",
+    "kimi_lens":    "NO_DRIFT" | "DRIFT" | "FAILED",
+    "minimax_lens": "NO_DRIFT" | "DRIFT" | "FAILED",
+    "glm_lens":     "NO_DRIFT" | "DRIFT" | "FAILED"
   },
+  "responsive_lens_count": <int 0..4 — how many lenses produced non-error output>,
   "drifted_claims": [
     { "claim": "...", "evidence": "...", "suggested_fix": "...",
       "lenses_flagged": ["..."] }
   ],
-  "notes": "<low-confidence flags or split verdicts>"
+  "notes": "<low-confidence flags, split verdicts, OR list of failed lenses>"
 }
 EOF
 )
@@ -226,13 +235,15 @@ arbiter_json="$RUN_DIR/arbiter.json"
   timeout 120 claude --print --output-format text "$arbiter_prompt" < /dev/null 2>"$RUN_DIR/arbiter.err" > "$arbiter_raw"
 )
 
-python3 - "$arbiter_raw" > "$arbiter_json" 2>>"$RUN_DIR/arbiter.err" <<'PY'
-import json, re, sys
+python3 - "$arbiter_raw" "$RUN_DIR" > "$arbiter_json" 2>>"$RUN_DIR/arbiter.err" <<'PY'
+import json, os, re, sys
 try:
     with open(sys.argv[1]) as f:
         raw = f.read()
 except Exception:
     raw = ""
+
+run_dir = sys.argv[2]
 
 # Try ```json``` fence first (most explicit signal).
 m = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', raw, re.DOTALL)
@@ -251,8 +262,50 @@ if brace_pos >= 0:
         parsed = None
 
 if parsed is None:
-    parsed = {"verdict": "NO_DRIFT", "lens_verdicts": {}, "drifted_claims": [],
-              "notes": "arbiter output unparseable — fail-open"}
+    parsed = {"verdict": "INDETERMINATE", "lens_verdicts": {}, "drifted_claims": [],
+              "responsive_lens_count": 0,
+              "notes": "arbiter output unparseable — INDETERMINATE (caller decides fail-open vs block)"}
+
+# Post-process safety net (Layer-2b honesty rule): if every lens
+# returned confidence=0 OR carried an error field, force verdict to
+# INDETERMINATE regardless of what the arbiter said. The arbiter
+# might fabricate NO_DRIFT when no lens has evidence; this gate
+# refuses to let absence-of-evidence be reported as
+# evidence-of-absence.
+responsive = 0
+failed_lenses = []
+for lens in ("codex_lens", "kimi_lens", "minimax_lens", "glm_lens"):
+    p = os.path.join(run_dir, f"lens-{lens}.json")
+    if not os.path.exists(p):
+        failed_lenses.append(lens)
+        continue
+    try:
+        with open(p) as f:
+            d = json.load(f)
+        conf = float(d.get("confidence", 0))
+        has_err = bool(d.get("error"))
+        if has_err or conf == 0.0:
+            failed_lenses.append(lens)
+        else:
+            responsive += 1
+    except Exception:
+        failed_lenses.append(lens)
+
+parsed.setdefault("responsive_lens_count", responsive)
+
+if responsive == 0:
+    # All lenses failed. Honest verdict is INDETERMINATE.
+    parsed["verdict"] = "INDETERMINATE"
+    note = parsed.get("notes") or ""
+    failure_msg = f"all 4 lenses failed (no responsive output): {', '.join(failed_lenses)}"
+    if failure_msg not in note:
+        parsed["notes"] = (note + " | " if note else "") + failure_msg
+elif parsed.get("verdict") not in ("NO_DRIFT", "DRIFT", "INDETERMINATE"):
+    # Arbiter emitted an unknown verdict; promote to INDETERMINATE
+    # rather than guess.
+    parsed["verdict"] = "INDETERMINATE"
+    parsed["notes"] = (parsed.get("notes", "") + " | arbiter emitted unknown verdict, promoted to INDETERMINATE").strip(" |")
+
 print(json.dumps(parsed))
 PY
 

@@ -98,6 +98,30 @@ if [ "$gate_verdict" != "PANEL_NEEDED" ]; then
   exit 0
 fi
 
+# ── Layer 2a.5 — providers-doctor (cheap pre-flight liveness probe) ────────
+# Avoids burning 4 × 90s timeouts when the lens providers are all down.
+if [ -x "$REPO_ROOT/scripts/readme-drift-providers-doctor.sh" ] \
+   && [ "${MO_README_DOCTOR_SKIP:-0}" != "1" ]; then
+  echo "pre-push: running Layer 2a.5 (providers-doctor pre-flight)…"
+  doctor_out=$(bash "$REPO_ROOT/scripts/readme-drift-providers-doctor.sh" 2>/dev/null)
+  doctor_viable=$(echo "$doctor_out" | jq -r '.viable // false' 2>/dev/null)
+  doctor_count=$(echo "$doctor_out" | jq -r '.responsive_count // 0' 2>/dev/null)
+  doctor_threshold=$(echo "$doctor_out" | jq -r '.threshold // 2' 2>/dev/null)
+  echo "  doctor: viable=$doctor_viable responsive=$doctor_count/${doctor_threshold}"
+  if [ "$doctor_viable" != "true" ]; then
+    echo "⚠ pre-push: panel pre-flight FAILED — <$doctor_threshold lens providers responsive."
+    echo "  Skipping the 4-lens panel (would burn ~360s on guaranteed-empty calls)."
+    if [ "${MO_README_PANEL_INDETERMINATE:-fail-open}" = "block" ]; then
+      echo "  MO_README_PANEL_INDETERMINATE=block — push BLOCKED on panel_unavailable."
+      echo "  Fix provider auth (rotate keys / check gateway URLs in lib/providers/cl_*.sh)"
+      echo "  OR clear the env flag for fail-open behavior."
+      exit 1
+    fi
+    echo "  Treating as fail-open (set MO_README_PANEL_INDETERMINATE=block for strict)."
+    exit 0
+  fi
+fi
+
 # ── Layer 2b — 4-lens panel + opus arbiter ─────────────────────────────────
 echo "pre-push: running Layer 2b (4-lens panel + opus arbiter — wall ~30-60s)…"
 panel_out=$(bash "$REPO_ROOT/scripts/readme-drift-panel.sh" 2>/dev/null)
@@ -120,6 +144,21 @@ if [ "$panel_verdict" = "DRIFT" ]; then
   echo "    - MO_README_DRIFT_SKIP=1 git push  (skip ALL drift checks)"
   echo "    - git push --no-verify             (skip ALL git hooks)"
   exit 1
+fi
+
+if [ "$panel_verdict" = "INDETERMINATE" ]; then
+  echo
+  echo "⚠ pre-push: panel returned INDETERMINATE (lens pipeline broken — no actionable signal)."
+  echo "  Report: $panel_report"
+  if [ "${MO_README_PANEL_INDETERMINATE:-fail-open}" = "block" ]; then
+    echo "  MO_README_PANEL_INDETERMINATE=block — push BLOCKED."
+    echo "  Either fix providers (rotate API keys / check gateway URLs in lib/providers/cl_*.sh)"
+    echo "  OR clear the env flag for fail-open behavior."
+    exit 1
+  fi
+  echo "  MO_README_PANEL_INDETERMINATE not set to 'block' — fail-open, push proceeds."
+  echo "  (Set MO_README_PANEL_INDETERMINATE=block to make this a hard block.)"
+  exit 0
 fi
 
 echo "✓ pre-push: panel clean — push proceeds."

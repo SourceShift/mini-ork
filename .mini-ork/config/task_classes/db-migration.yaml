@@ -1,0 +1,45 @@
+name: db_migration
+version: "0.1.0"
+description: >
+  5-lens DB schema-migration auditor + planner. Each lens reviews a distinct
+  risk axis (data-integrity / rollback-safety / perf-impact / business-logic
+  compat / edge-case data) routed to a DIFFERENT model family. Synthesizer
+  produces a migration plan with idempotent + reversible SQL + smoke
+  scripts. Per Rajan 2025 / Nasser 2026 heterogeneous-family principle.
+
+matches:
+  keywords:
+    - migration
+    - schema migration
+    - add column
+    - drop column
+    - alter table
+    - DDL change
+    - postgres migration
+    - mysql migration
+    - sqlite migration
+    - backfill
+    - data migration
+    - schema change
+    - knex migration
+    - prisma migration
+    - alembic migration
+  regex: []
+
+artifact_contract_ref: artifact_contract.yaml
+default_workflow: workflow.yaml
+
+default_gates:
+  - budget_gate
+  - scope_gate
+
+risk_class: high   # Migrations are durable + can data-loss + can lock tables.
+
+cost_model:
+  min_usd: 2.50
+  max_usd: 12.00
+  per_lens_usd: 1.20
+
+runtime_model:
+  min_minutes: 5
+  max_minutes: 15
