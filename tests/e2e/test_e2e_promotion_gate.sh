@@ -41,6 +41,11 @@ export MINI_ORK_DB="$TEST_DIR/home/state.db"
 mkdir -p "$MINI_ORK_HOME"
 trap 'rm -rf "$TEST_DIR"' EXIT
 
+# Seed schema — e2e tests must apply migrations before any lib write.
+# shellcheck source=/dev/null
+source "$MINI_ORK_ROOT/tests/lib/setup_state_db.sh"
+test_apply_migrations >/dev/null
+
 # shellcheck source=/dev/null
 source "$MINI_ORK_ROOT/lib/benchmark_suite.sh"
 # shellcheck source=/dev/null
@@ -84,19 +89,45 @@ con.executescript("""
         UNIQUE(candidate_id, benchmark_task_id)
     );
 """)
-# Add a benchmark_task row (idempotent)
+# Add a benchmark_task row (idempotent). Schema columns per migration 0010+0011:
+# benchmark_id (PK), task_class, baseline_utility_score, source, created_at.
+# `id` was renamed to `benchmark_id` in v0.2-pt35 (Phase E gap closure
+# 2026-06-02). source has CHECK constraint IN ('human', 'synthetic').
 con.execute("""
     INSERT OR IGNORE INTO benchmark_tasks
-        (id, task_class, baseline_utility_score, created_at)
-    VALUES (?, 'code-fix', 0.40, ?)
-""", (f"bt-for-{cid[:8]}", now))
-# Seed one result row
+        (benchmark_id, task_class, baseline_utility_score, source)
+    VALUES (?, 'code-fix', 0.40, 'synthetic')
+""", (f"bt-for-{cid[:8]}",))
+# promotion_evaluate requires workflow_candidates row (looks up
+# base_workflow_version_id by candidate_id and exits 1 silently if missing).
+# workflow_candidates FKs base_workflow_version_id → workflow_memory.
+# Seed both — workflow_memory with a minimal candidate row, then
+# workflow_candidates linking the candidate_id to it.
+con.execute("""
+    INSERT OR IGNORE INTO workflow_memory
+        (workflow_version_id, workflow_name, yaml_hash, yaml_blob)
+    VALUES ('test-wf-v1', 'test-workflow', 'deadbeef', '# test')
+""")
+con.execute("""
+    INSERT OR IGNORE INTO workflow_candidates
+        (candidate_id, base_workflow_version_id, created_by)
+    VALUES (?, 'test-wf-v1', 'human')
+""", (cid,))
+# benchmark_results requires a runs row (FK CASCADE). Seed a minimal one
+# the first time and reuse its id thereafter — guard with INSERT OR IGNORE.
+con.execute("""
+    INSERT OR IGNORE INTO runs (id, agent, final_verdict)
+    VALUES (1, 'test', 'APPROVE')
+""")
+# Seed one result row using the REAL migration-0010 schema:
+#   result_id (PK), benchmark_id (FK), candidate_id, run_id (FK to runs.id INT),
+#   pass (CHECK 0|1), utility_score, evidence_path, ran_at TEXT.
 rid = f"br-{uuid.uuid4().hex[:12]}"
 con.execute("""
     INSERT OR REPLACE INTO benchmark_results
-        (result_id, candidate_id, benchmark_task_id, passed, utility_score, ran_at)
-    VALUES (?,?,?,?,?,?)
-""", (rid, cid, f"bt-for-{cid[:8]}", all_pass, util, now))
+        (result_id, benchmark_id, candidate_id, run_id, pass, utility_score, evidence_path)
+    VALUES (?,?,?,?,?,?,?)
+""", (rid, f"bt-for-{cid[:8]}", cid, 1, int(all_pass), util, ''))
 con.commit()
 con.close()
 PY
@@ -110,7 +141,9 @@ import sqlite3, sys
 db, cid = sys.argv[1], sys.argv[2]
 con = sqlite3.connect(db)
 row = con.execute(
-    "SELECT decision FROM promotion_records WHERE candidate_id=? ORDER BY evaluated_at DESC LIMIT 1",
+    # v0.2-pt35: promotion_records.evaluated_at was renamed to decided_at
+    # in the Phase E schema-alignment fix (migration 0011 follow-up).
+    "SELECT decision FROM promotion_records WHERE candidate_id=? ORDER BY decided_at DESC LIMIT 1",
     (cid,)
 ).fetchone()
 con.close()
