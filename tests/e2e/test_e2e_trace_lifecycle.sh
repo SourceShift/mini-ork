@@ -108,7 +108,7 @@ echo ""
 echo "--- trace_get: prompt_version + workflow_version_id on full-row trace ---"
 
 ROW2="$(trace_get "$TID2" 2>/dev/null)"
-PV="$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('prompt_version',''))" "$ROW2" 2>/dev/null)"
+PV="$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('prompt_version_hash',''))" "$ROW2" 2>/dev/null)"
 WV="$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('workflow_version_id',''))" "$ROW2" 2>/dev/null)"
 _assert "trace_get: prompt_version populated" '[[ "$PV" == "v1.2" ]]'
 _assert "trace_get: workflow_version_id populated" '[[ "$WV" == "wf-v2" ]]'
