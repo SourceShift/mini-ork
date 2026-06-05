@@ -115,14 +115,17 @@ ${lens_suffix}"
   (
     if [ "$provider" = "codex" ]; then
       # cl_codex.sh is executable, not sourceable.
-      printf '%s' "$prompt" | timeout 90 "$provider_path" --print --output-format text 2>"$err_file" > "$out_file.raw"
+      timeout 90 "$provider_path" --print --output-format text "$prompt" < /dev/null 2>"$err_file" > "$out_file.raw"
     else
       source "$provider_path" 2>/dev/null
-      printf '%s' "$prompt" | timeout 90 claude --print --output-format text 2>"$err_file" > "$out_file.raw"
+      timeout 90 claude --print --output-format text "$prompt" < /dev/null 2>"$err_file" > "$out_file.raw"
     fi
   )
 
-  # Strip markdown code fences if present, then validate JSON.
+  # Strip markdown code fences if present, then extract the FIRST complete
+  # JSON object via JSONDecoder.raw_decode (NOT a greedy regex — providers
+  # like Codex/Opus append `<z-insight>` telemetry blocks AFTER the JSON,
+  # and a greedy `{.*}` would mash both into one unparseable string).
   python3 - "$out_file.raw" "$lens_name" > "$out_file" 2>>"$err_file" <<'PY'
 import json, re, sys
 raw_path, lens = sys.argv[1], sys.argv[2]
@@ -131,27 +134,39 @@ try:
         raw = f.read()
 except Exception:
     raw = ""
-# Strip ```json ... ``` fences
+
+# First, try to strip a markdown ```json ... ``` fence if present.
 m = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', raw, re.DOTALL)
 if m:
     raw = m.group(1)
+
+# Then locate the first '{' and let JSONDecoder.raw_decode walk forward
+# until it has a complete object. Anything after that (z-insight, prose,
+# trailing thinking blocks) is ignored.
+parsed = None
+err = None
+brace_pos = raw.find('{')
+if brace_pos >= 0:
+    try:
+        obj, _end = json.JSONDecoder().raw_decode(raw[brace_pos:])
+        parsed = obj
+    except Exception as e:
+        err = f"raw_decode failed: {e}"
 else:
-    m = re.search(r'(\{.*\})', raw, re.DOTALL)
-    if m:
-        raw = m.group(1)
-try:
-    parsed = json.loads(raw)
+    err = "no '{' found in lens output"
+
+if parsed is None:
+    print(json.dumps({
+        "lens": lens, "verdict": "NO_DRIFT",
+        "drifted_claims": [], "confidence": 0.0,
+        "error": err or "parse failed"
+    }))
+else:
     parsed.setdefault("lens", lens)
     parsed.setdefault("verdict", "NO_DRIFT")
     parsed.setdefault("drifted_claims", [])
     parsed.setdefault("confidence", 0.5)
     print(json.dumps(parsed))
-except Exception as e:
-    print(json.dumps({
-        "lens": lens, "verdict": "NO_DRIFT",
-        "drifted_claims": [], "confidence": 0.0,
-        "error": f"parse failed: {e}"
-    }))
 PY
 }
 
@@ -208,7 +223,7 @@ arbiter_raw="$RUN_DIR/arbiter.raw"
 arbiter_json="$RUN_DIR/arbiter.json"
 (
   source "$MINI_ORK_ROOT/lib/providers/cl_opus.sh" 2>/dev/null
-  printf '%s' "$arbiter_prompt" | timeout 120 claude --print --output-format text 2>"$RUN_DIR/arbiter.err" > "$arbiter_raw"
+  timeout 120 claude --print --output-format text "$arbiter_prompt" < /dev/null 2>"$RUN_DIR/arbiter.err" > "$arbiter_raw"
 )
 
 python3 - "$arbiter_raw" > "$arbiter_json" 2>>"$RUN_DIR/arbiter.err" <<'PY'
@@ -218,16 +233,24 @@ try:
         raw = f.read()
 except Exception:
     raw = ""
+
+# Try ```json``` fence first (most explicit signal).
 m = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', raw, re.DOTALL)
 if m:
     raw = m.group(1)
-else:
-    m = re.search(r'(\{.*\})', raw, re.DOTALL)
-    if m:
-        raw = m.group(1)
-try:
-    parsed = json.loads(raw)
-except Exception:
+
+# Locate first '{' and walk forward with raw_decode — ignore any trailing
+# <z-insight> blocks, prose, or thinking output that some providers
+# append after the JSON.
+parsed = None
+brace_pos = raw.find('{')
+if brace_pos >= 0:
+    try:
+        parsed, _end = json.JSONDecoder().raw_decode(raw[brace_pos:])
+    except Exception:
+        parsed = None
+
+if parsed is None:
     parsed = {"verdict": "NO_DRIFT", "lens_verdicts": {}, "drifted_claims": [],
               "notes": "arbiter output unparseable — fail-open"}
 print(json.dumps(parsed))
