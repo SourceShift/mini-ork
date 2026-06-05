@@ -239,7 +239,7 @@ See [docs/SAFETY.md](docs/SAFETY.md) for immutable constraints and the Promotion
 The full release log lives in [`ROADMAP.md`](ROADMAP.md) — every section dated and per-commit-attributed. Current shipped totals (regenerable via `mini-ork doctor`):
 
 - 6-stage universal loop (`classify → plan → execute → verify → reflect → improve`) + 4 extension entrypoints (`eval`, `improve`, `promote`, `topology`)
-- 39 framework primitives in `lib/` (incl. 6 oracle-hardening libs added 2026-06-05)
+- 40 framework primitives in `lib/` (incl. 6 oracle-hardening libs + `gate_bootstrap.sh` for the v0.3-rc1 central wire-up, added 2026-06-05)
 - 13 user-facing `bin/mini-ork*` entrypoints
 - 15 schema migrations under `db/migrations/` (memory namespaces, benchmarks, evolution, safety, panel topology telemetry)
 - 9 recipes shipped — see Recipes table above
