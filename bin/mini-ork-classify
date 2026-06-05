@@ -82,6 +82,19 @@ done
 [ -z "$KICKOFF" ] && { _usage; exit 2; }
 [ -f "$KICKOFF" ] || { echo "kickoff not found: $KICKOFF" >&2; exit 2; }
 
+# v0.2-pt37 (2026-06-05): DoS guard — reject oversized kickoffs before the
+# keyword-scan loop reads them into shell memory. The classifier's grep
+# loop is O(patterns × file_size); a 10MB kickoff stalls >30s even on a
+# fast machine. Cap at MO_MAX_KICKOFF_BYTES (default 1MB) which comfortably
+# fits any human-written task brief.
+MO_MAX_KICKOFF_BYTES="${MO_MAX_KICKOFF_BYTES:-1048576}"
+_kickoff_bytes=$(wc -c < "$KICKOFF" 2>/dev/null || echo 0)
+if [ "$_kickoff_bytes" -gt "$MO_MAX_KICKOFF_BYTES" ]; then
+  echo "classify: kickoff exceeds MO_MAX_KICKOFF_BYTES (${_kickoff_bytes} > ${MO_MAX_KICKOFF_BYTES})" >&2
+  echo "  Either trim the kickoff OR raise the cap via MO_MAX_KICKOFF_BYTES=<bytes>" >&2
+  exit 2
+fi
+
 # ── env setup ─────────────────────────────────────────────────────────────────
 MINI_ORK_HOME="${MINI_ORK_HOME:-$(pwd)/.mini-ork}"
 MINI_ORK_DB="${MINI_ORK_DB:-$MINI_ORK_HOME/state.db}"
