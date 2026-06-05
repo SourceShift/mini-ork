@@ -48,22 +48,70 @@ PY
 }
 
 # Default LLM-based extractor prompt template (heredoc — not in prompts/).
-_GRADIENT_EXTRACTOR_PROMPT_TEMPLATE='You are a workflow improvement analyst.
+#
+# v0.2-pt36 (D-048 fix, 2026-06-05): the original prompt asked "what
+# algorithm needs fixing?" against traces that are mostly COORDINATION-
+# SHAPED (audit recipes dispatching 4 lens nodes + a synthesizer; panel
+# reviewers debating; doc-edit recipes). On those traces the extractor
+# returned [] every cycle because the trace doesn't describe an
+# algorithm at all — it describes who-dispatched-what.
+#
+# Reframed to ask "what about THIS RECIPE'S design would have made the
+# OUTCOME better?" with a 5-target taxonomy that covers both
+# algorithmic shapes (per-node improvements) AND coordination shapes
+# (lens choices, synthesizer aggregation, verifier contract,
+# recipe-level dispatch shape).
+_GRADIENT_EXTRACTOR_PROMPT_TEMPLATE='You are a recipe-design improvement analyst.
 
 Given the execution trace below, extract 0 to 5 textual gradients — specific,
-actionable improvement signals for workflow nodes, agent prompts, or edges.
+actionable improvement signals. The trace may describe an algorithmic
+workflow (planner → implementer → verifier) OR a coordination workflow
+(4 lenses → synthesizer → publisher). Find what about THIS RECIPE design
+would have made the outcome better.
+
+Five target families (pick the most specific that fits each gradient):
+
+  1. "workflow.node.<name>"           — algorithmic improvement to one node
+                                        (e.g. planner missed a step, verifier
+                                        accepted a bad artifact)
+  2. "agent.<role>.prompt"            — prompt-level improvement (e.g. the
+                                        lens prompt produced shallow output;
+                                        the synthesizer prompt missed an axis)
+  3. "workflow.edge.<name>"           — dependency / sequencing refinement
+                                        (e.g. depends_on should be
+                                        supplies_context_to; this edge needs
+                                        a retries policy)
+  4. "verifier.<name>"                — verifier-script logic gap
+                                        (e.g. the grep-assert missed a
+                                        boundary condition)
+  5. "workflow.recipe.<recipe_name>"  — RECIPE-LEVEL shape suggestion when
+                                        the issue is the dispatch topology
+                                        itself, not any single node (e.g.
+                                        the 4-lens panel has 2 lenses in the
+                                        same family; the synthesizer should
+                                        be a different family from any lens;
+                                        a missing publisher node lets
+                                        artifacts vanish from the audit)
 
 TRACE:
 <<<TRACE_JSON>>>
 
+Important: if the trace is from a coordination-shaped recipe (audit,
+synthesis, multi-lens debate), prefer "workflow.recipe.<name>" or
+"agent.<role>.prompt" gradients — those are where the leverage actually
+lives. Do NOT respond with [] just because no algorithmic bug stands out;
+coordination shapes ALWAYS have a recipe-design improvement to surface
+(family-diversity, verifier contract, synthesis aggregation, etc).
+
 Respond ONLY with a JSON array of gradient objects. Each object must have:
-  "target"          : string — "workflow.node.<name>" | "agent.<role>.prompt" | "workflow.edge.<name>"
+  "target"          : string — one of the 5 target families above
   "signal"          : string — what was observed (1-2 sentences)
   "suggested_change": string — concrete recommendation (1-2 sentences)
   "confidence"      : number — 0.0 to 1.0
 
-If no improvements are identifiable, respond with [].
-No prose, no markdown fences, only the JSON array.'
+If after honest analysis you genuinely find nothing to improve (rare —
+audit yourself before defaulting), respond with []. No prose, no markdown
+fences, only the JSON array.'
 
 # desc: Extract gradients from a trace via LLM (or custom override function).
 #       Emits one JSON gradient object per stdout line; empty if none found.
