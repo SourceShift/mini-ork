@@ -32,8 +32,29 @@ case "$sub" in
     # Pre-allocate a shared run_id so every step writes to the same task_runs row.
     export MINI_ORK_RUN_ID="${MINI_ORK_RUN_ID:-run-$(date +%s)-$$}"
 
+    # Derive the task_class from the recipe's task_class.yaml::name when
+    # present, falling back to the recipe directory name with hyphens
+    # converted to underscores. This makes the explicit recipe arg win
+    # over the classifier's keyword-count routing — fixes the
+    # 2026-06-04 bug where `mini-ork run code-fix <kickoff>` silently
+    # wrote task_class=generic when the kickoff had few code-fix
+    # keywords. See docs/fixes/20260604-dispatch-classifier-overrides-explicit-recipe.md.
+    recipe_tc_yaml="$MINI_ORK_ROOT/recipes/$recipe/task_class.yaml"
+    if [ -f "$recipe_tc_yaml" ] && command -v python3 >/dev/null 2>&1; then
+      derived_class=$(python3 -c "
+import sys, yaml
+try:
+    with open(sys.argv[1]) as f:
+        d = yaml.safe_load(f) or {}
+    print((d.get('name') or '').strip())
+except Exception:
+    pass
+" "$recipe_tc_yaml" 2>/dev/null)
+    fi
+    [ -z "${derived_class:-}" ] && derived_class="${recipe//-/_}"
+
     # ── classify ───────────────────────────────────────────────────────────────
-    classify_out=$("$MINI_ORK_ROOT/bin/mini-ork-classify" "$kickoff") || exit $?
+    classify_out=$("$MINI_ORK_ROOT/bin/mini-ork-classify" --task-class "$derived_class" "$kickoff") || exit $?
     printf '%s\n' "$classify_out"
     MINI_ORK_TASK_CLASS=$(printf '%s\n' "$classify_out" | grep -E '^task_class=' | head -1 | cut -d= -f2)
     export MINI_ORK_TASK_CLASS
