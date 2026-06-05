@@ -38,16 +38,16 @@ Run this test on any agent framework you're evaluating. mini-ork passes by const
 # config/agents.yaml — recipe-level lane assignment
 lanes:
   # 4-family heterogeneous audit lenses
-  glm_lens:    glm          # Zhipu
-  kimi_lens:   kimi          # Moonshot
-  codex_lens:  codex          # OpenAI Codex
-  opus_lens:   opus          # Anthropic
-  # cross-family synthesizer
-  reviewer:   opus           # Anthropic (different role: arbiter)
-  decomposer: deepseek       # DeepSeek (different family for planning)
+  glm_lens:     glm         # Zhipu
+  kimi_lens:    kimi        # Moonshot
+  codex_lens:   codex       # OpenAI Codex
+  minimax_lens: minimax     # MiniMax (M3, Anthropic-compatible gateway)
+  # cross-family synthesizer (different role from lenses: arbiter)
+  reviewer:     opus        # Anthropic
+  decomposer:   deepseek    # DeepSeek (different family for planning)
 ```
 
-7 model-family wrappers ship out of the box at [`lib/providers/`](lib/providers/): `cl_{glm,kimi,codex,deepseek,opus,sonnet,minimax}.sh`. The audit recipe at [`recipes/refactor-audit/`](recipes/refactor-audit/) uses all 4 distinct families per cycle, verified end-to-end.
+7 model-family wrappers ship out of the box at [`lib/providers/`](lib/providers/): `cl_{glm,kimi,codex,deepseek,opus,sonnet,minimax}.sh`. The audit recipe at [`recipes/refactor-audit/`](recipes/refactor-audit/) uses all 4 distinct lens families per cycle (glm + kimi + codex + minimax) with opus as the cross-family meta-reviewer, verified end-to-end on 2026-06-04 (see [the upstream self-audit](docs/refactor/synthesis-latest.md)).
 
 ### What you trade for what
 
@@ -169,9 +169,10 @@ The framework ships the universal loop and its primitives. Nothing in `lib/` or 
 | Primitive | Location | Purpose |
 |---|---|---|
 | Universal loop | `bin/mini-ork-{classify,plan,execute,verify,reflect,improve}` | 6-stage lifecycle |
-| 8 node-type interfaces | `lib/agent_registry.sh` | planner / researcher / implementer / reviewer / verifier / reflector / publisher / rollback |
+| 8 node-type interfaces | `schemas/workflow.schema.json` + `bin/mini-ork-execute` | planner / researcher / implementer / reviewer / verifier / reflector / publisher / rollback |
+| Agent version registry | `lib/agent_registry.sh` | per-role agent versions (model, provider, tools, success_rate, known_failure_modes) |
 | 6 edge-type semantics | `schemas/workflow.schema.json` | depends_on / supplies_context_to / verifies / blocks / retries / escalates_to |
-| 6 gate types | `lib/gate_registry.sh` | deterministic / reviewer / human / budget / scope / deployment |
+| 6 built-in gate types + `custom` | `lib/gate_registry.sh` | deterministic_verifier / reviewer_gate / human_gate / budget_gate / scope_gate / deployment_gate + `custom` escape hatch |
 | 8 memory namespaces | `db/migrations/` | task / workflow / agent_performance / failure / recovery / user_preference / artifact / benchmark |
 | Task-class registry | `${MINI_ORK_HOME}/config/task_classes/*.yaml` | typed task definitions |
 | Workflow registry | `recipes/<recipe>/workflow.yaml` | versioned DAGs |
@@ -183,12 +184,19 @@ The framework ships the universal loop and its primitives. Nothing in `lib/` or 
 
 ### RECIPES — opinions live here
 
-Recipes are user-land workflow definitions. They compose framework primitives into pipeline shapes.
+Recipes are user-land workflow definitions. They compose framework primitives into pipeline shapes. 9 recipes ship today; 7 of them dispatch a 4–5 lens panel across DISTINCT model families per cycle (Rajan 2025 ρ-precondition by construction).
 
 | Recipe | Location | Shape |
 |---|---|---|
-| `code-fix` | `recipes/code-fix/` | minimal reference: classify → plan → implement → verify |
-| `bdd-first-delivery` | `recipes/bdd-first-delivery/` | full: decompose → workers → BDD spec → review → merge |
+| `code-fix` | `recipes/code-fix/` | Single-patch fix with typecheck, test, and reviewer gates. Minimal reference recipe. |
+| `bdd-first-delivery` | `recipes/bdd-first-delivery/` | BDD-first multi-epic delivery: decompose → parallel (spec_author + implementer) → bdd_runner → reviewer → publisher. |
+| `docs` | `recipes/docs/` | Single-doc edit verified by grep-pattern assertions + relative-link integrity. No typecheck / test / rollback (docs edits are reversed via `git restore`). |
+| `refactor-audit` | `recipes/refactor-audit/` | 4 lens stances run in parallel (glm/kimi/codex/minimax) with opus as meta-reviewer (synthesizer). The framework's own self-audit recipe. |
+| `research-synthesis` | `recipes/research-synthesis/` | 4-lens research synthesis (web/lit/code/narrative on distinct families) → synthesizer → publisher. |
+| `blog-post` | `recipes/blog-post/` | 5-lens blog drafting (editor / researcher / narrative / audience / counter) in parallel across distinct families. |
+| `db-migration` | `recipes/db-migration/` | 5-lens migration audit + plan: integrity / rollback / perf / compat / edge-data in parallel across distinct families. |
+| `ops-runbook` | `recipes/ops-runbook/` | 5-lens runbook generation: detection / containment / diagnosis / recovery / prevention across distinct families. |
+| `ui-audit` | `recipes/ui-audit/` | 5-lens UI audit: a11y / perf / visual / interaction / edge-cases across distinct families. |
 
 Add your own under `recipes/<name>/` — see [docs/EXTENSION.md](docs/EXTENSION.md).
 
@@ -225,30 +233,23 @@ See [docs/SAFETY.md](docs/SAFETY.md) for immutable constraints and the Promotion
 
 ## Roadmap
 
-### v0.1 (current — this release)
+**Current: v0.3.0-rc1** (in flight, 2026-06-05) — oracle-hardening primitives shipped: `coalition_gate.sh`, `cw_por.sh`, `mo_promote_synthesis_gate`, `adaptive_stability.sh`. Self-evolution is now explicitly class-restricted (`docs/positioning/why-mini-ork.md` §"Self-evolution is class-restricted").
 
-- Universal 6-stage loop (`classify → plan → execute → verify → reflect → improve`)
-- 13 framework primitives in `lib/`
-- 8 `bin/` entrypoints
-- 4 new schemas + 4 new migrations (memory namespaces, benchmarks, evolution, safety)
-- `recipes/code-fix/` reference recipe
-- `recipes/bdd-first-delivery/` ported from v0.0 BDD pipeline as a recipe
+The full release log lives in [`ROADMAP.md`](ROADMAP.md) — every section dated and per-commit-attributed. Current shipped totals (regenerable via `mini-ork doctor`):
 
-### v0.2
+- 6-stage universal loop (`classify → plan → execute → verify → reflect → improve`) + 4 extension entrypoints (`eval`, `improve`, `promote`, `topology`)
+- 38 framework primitives in `lib/` (incl. 5 oracle-hardening libs added 2026-06-05)
+- 13 user-facing `bin/mini-ork*` entrypoints
+- 15 schema migrations under `db/migrations/` (memory namespaces, benchmarks, evolution, safety, panel topology telemetry)
+- 9 recipes shipped — see Recipes table above
+- 7 model-family providers under `lib/providers/`
 
-- `mini-ork resume <run-id>` — continue interrupted loop from last checkpoint
-- `mini-ork inspect <task-id>` — trace viewer (iter log, model costs, gradient log)
-- Per-recipe benchmark fixtures
-- Speculative dispatch mode (multiple workflow candidates compete before selection)
-- Parallel lane cap + scope-conflict detector
+Next-up work tracks (see [`ROADMAP.md`](ROADMAP.md) for detail):
 
-### v1.0
-
-- Web dashboard (read-only, sqlite-backed)
-- `mini-ork replay <task-id>` — re-run a specific task against current HEAD
-- Plugin hooks system (pre-node, post-node, on-gate-fail)
-- Cost budget enforcement (`--budget 5.00`)
-- Built-in recipes: `research-synthesis`, `blog-post`, `ui-audit`, `db-migration`, `ops-runbook`
+- Wire the 5 oracle-hardening primitives into `bin/mini-ork-execute` as enforced gates (currently opt-in libraries)
+- Wave 2-A held-out anchor corpus per synthesis recipe (Wang 2026)
+- Wave 3 mechanical citation+coverage verifier (Sistla 2025 + Ficek 2025)
+- Krippendorff α calibration gate + adversarial fabricated-bug injection (the v0.2 honest-gaps list)
 
 ---
 
@@ -263,7 +264,7 @@ See [docs/SAFETY.md](docs/SAFETY.md) for immutable constraints and the Promotion
 | git | 2.28+ | worktrees, merge, rebase, branch quarantine |
 | claude CLI | 2.1+ | `claude --print` subprocess agents |
 
-All deps invoked as external processes — nothing is bundled. Run `bash install.sh --check` to verify deps before first use.
+All deps invoked as external processes — nothing is bundled. Run `mini-ork doctor` after installation to verify every dep is present + reachable.
 
 ---
 
