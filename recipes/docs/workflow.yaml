@@ -1,0 +1,42 @@
+version: "0.1.0"
+task_class: docs
+description: "Single-doc edit verified by grep-pattern assertions + relative-link integrity. No typecheck, no test, no rollback (docs edits are reversed via git restore)."
+
+nodes:
+  - name: planner
+    type: planner
+    model_lane: planner
+    prompt_ref: prompts/planner.md
+    dispatch_mode: serial
+
+  - name: doc_editor
+    type: implementer
+    model_lane: worker
+    prompt_ref: prompts/doc-editor.md
+    dispatch_mode: serial
+    gates:
+      - scope_gate
+
+  - name: grep_assert
+    type: verifier
+    prompt_ref: null
+    verifier_ref: verifiers/grep-assert.sh
+    dispatch_mode: serial
+
+  - name: link_verifier
+    type: verifier
+    prompt_ref: null
+    verifier_ref: verifiers/link-verifier.sh
+    dispatch_mode: serial
+
+  - name: publisher
+    type: publisher
+    prompt_ref: null
+    dispatch_mode: serial
+
+edges:
+  - { from: planner,       to: doc_editor,     edge_type: depends_on }
+  - { from: doc_editor,    to: grep_assert,    edge_type: verifies   }
+  - { from: doc_editor,    to: link_verifier,  edge_type: verifies   }
+  - { from: grep_assert,   to: publisher,      edge_type: depends_on }
+  - { from: link_verifier, to: publisher,      edge_type: depends_on }
