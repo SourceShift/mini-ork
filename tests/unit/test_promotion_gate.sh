@@ -54,6 +54,28 @@ _ver_ensure_table 2>/dev/null || true
 _gate_ensure_table 2>/dev/null || true
 _promo_ensure_tables 2>/dev/null || true
 
+# Seed workflow_memory + workflow_candidates rows for every candidate_id
+# this test exercises. promotion_evaluate's first SELECT looks up
+# base_workflow_version_id by candidate_id; if no row exists, it exits 1
+# silently (2>/dev/null in the test swallows the stderr).
+python3 - "$MINI_ORK_DB" <<'PY'
+import sqlite3, sys
+con = sqlite3.connect(sys.argv[1])
+con.execute("""
+    INSERT OR IGNORE INTO workflow_memory
+        (workflow_version_id, workflow_name, yaml_hash, yaml_blob)
+    VALUES ('test-wf-v1', 'test-wf', 'deadbeef', '# test')
+""")
+for cid in ['cand-no-bench', 'cand-human', 'cand-approve', 'cand-persist']:
+    con.execute("""
+        INSERT OR IGNORE INTO workflow_candidates
+            (candidate_id, base_workflow_version_id, created_by)
+        VALUES (?, 'test-wf-v1', 'human')
+    """, (cid,))
+con.commit()
+con.close()
+PY
+
 echo ""
 echo "--- happy path: no benchmark results → promotion_evaluate returns quarantined or rejected ---"
 

@@ -47,7 +47,7 @@ echo "--- happy path: benchmark_add inserts a task and returns its id ---"
 BID="$(benchmark_add '{"id":"bt-001","task_class":"unit-test","input":{"x":1},"baseline_utility_score":0.5}' 2>/dev/null)"
 _assert_eq "benchmark_add returns the task id" "$BID" "bt-001"
 
-ROW="$(sqlite3 "$TEST_DB" "SELECT COUNT(*) FROM benchmark_tasks WHERE id='bt-001';" 2>/dev/null || echo 0)"
+ROW="$(sqlite3 "$TEST_DB" "SELECT COUNT(*) FROM benchmark_tasks WHERE benchmark_id='bt-001';" 2>/dev/null || echo 0)"
 _assert_eq "benchmark_add writes row to DB" "$ROW" "1"
 
 echo ""
@@ -111,9 +111,11 @@ fi
 echo ""
 echo "--- edge case: benchmark_run with empty task table returns 0 total_tasks ---"
 
-# Fresh DB with no tasks
+# Fresh DB with no tasks — apply migrations so benchmark_run sees the
+# canonical schema (not the _bench_ensure_tables fake one).
 TEST_DB2=$(mktemp /tmp/mini-ork-test2-XXXXXX.db)
 MINI_ORK_DB="$TEST_DB2"
+test_apply_migrations >/dev/null
 benchmark_add '{"id":"empty-seed","task_class":"dummy"}' >/dev/null 2>&1
 # Delete it so table is empty
 sqlite3 "$TEST_DB2" "DELETE FROM benchmark_tasks;" 2>/dev/null

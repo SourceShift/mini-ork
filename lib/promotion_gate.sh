@@ -197,19 +197,49 @@ promotion_approve() {
     "$candidate_id" "$approver" "$rationale" <<'PY'
 import sqlite3, json, sys, time
 db, cid, approver, rationale = sys.argv[1:5]
-now = int(time.time())
 con = sqlite3.connect(db)
+# v0.2-pt37 (2026-06-05): real schema (migration 0011) uses
+# decided_at TEXT (ISO timestamp via strftime) and decided_by TEXT
+# (CHECK IN ('gate','human')). The previous body wrote `approver`,
+# `approval_rationale`, `approved_at` — three columns that don't
+# exist on the real promotion_records table. The
+# CREATE-IF-NOT-EXISTS in _promo_ensure_tables was a no-op against
+# the migration-seeded schema, so every UPDATE failed with rc=0 +
+# 0 rowcount, and the function exited 1 silently.
+#
+# Map: approver → decided_by ('human' literal), approval_rationale →
+# rationale (single column), approved_at → decided_at (let SQLite
+# default fire via strftime).
 updated = con.execute("""
     UPDATE promotion_records
-    SET decision='promoted', approver=?, approval_rationale=?, approved_at=?
+    SET decision='promoted',
+        decided_by='human',
+        rationale=?,
+        decided_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
     WHERE candidate_id=? AND decision='pending_human_approval'
-""", (approver, rationale, now, cid)).rowcount
+""", (rationale, cid)).rowcount
+# Capture decided_at for return payload.
+decided_at = None
+if updated:
+    row = con.execute(
+        "SELECT decided_at FROM promotion_records WHERE candidate_id=? AND decision='promoted' ORDER BY decided_at DESC LIMIT 1",
+        (cid,)
+    ).fetchone()
+    decided_at = row[0] if row else None
 con.commit()
 con.close()
 if updated == 0:
     print(f"promotion_approve: no pending approval found for {cid}", file=sys.stderr)
     sys.exit(1)
-print(json.dumps({"candidate_id": cid, "decision": "promoted", "approver": approver, "approved_at": now}))
+# Maintain caller-facing JSON contract: keep `approver` + `approved_at`
+# keys in the response (callers may key off them); back them with the
+# decided_by/decided_at values.
+print(json.dumps({
+    "candidate_id": cid,
+    "decision": "promoted",
+    "approver": approver,
+    "approved_at": decided_at,
+}))
 PY
 }
 
