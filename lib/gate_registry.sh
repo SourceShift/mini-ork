@@ -23,6 +23,7 @@ _VALID_GATE_TYPES=(
   budget_gate
   scope_gate
   deployment_gate
+  liveness_gate
   custom
 )
 
@@ -157,6 +158,37 @@ try:
 except Exception:
     print("defer")
 PY
+      ;;
+    liveness_gate)
+      # Behavioral circuit breaker bridge. condition is unused — the gate
+      # always invokes mo_check_liveness_breaker from lib/circuit_breaker.sh
+      # with run_id parsed from context. Maps PROCEED/PROBE→pass,
+      # LIVENESS_TRIP→fail. Tunables come from MO_CB_* env vars, not the
+      # gate condition string (matches W1 primitive ergonomics).
+      local _run_id
+      _run_id=$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('run_id',''))" "$context" 2>/dev/null)
+      if [[ -z "$_run_id" ]]; then
+        echo "defer"
+      else
+        # shellcheck source=lib/circuit_breaker.sh
+        if [[ -f "${MINI_ORK_ROOT}/lib/circuit_breaker.sh" ]]; then
+          source "${MINI_ORK_ROOT}/lib/circuit_breaker.sh" 2>/dev/null || true
+          if declare -f mo_check_liveness_breaker >/dev/null 2>&1; then
+            local _cb_out _cb_verdict
+            _cb_out=$(mo_check_liveness_breaker "$_run_id" 2>/dev/null || true)
+            _cb_verdict=$(echo "$_cb_out" | python3 -c "import json,sys; d=json.load(sys.stdin) if sys.stdin else {}; print(d.get('verdict','PROCEED'))" 2>/dev/null || echo "PROCEED")
+            case "$_cb_verdict" in
+              LIVENESS_TRIP) echo "fail" ;;
+              PROCEED|PROBE) echo "pass" ;;
+              *)             echo "defer" ;;
+            esac
+          else
+            echo "defer"
+          fi
+        else
+          echo "defer"
+        fi
+      fi
       ;;
     deployment_gate|reviewer_gate|deterministic_verifier|custom)
       # condition is a bash function name or script path
