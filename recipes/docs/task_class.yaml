@@ -1,0 +1,28 @@
+name: docs
+description: "Documentation-only edit: positioning docs, READMEs, roadmaps, taxonomy patches, single-doc fixes verified via grep assertions + link integrity."
+
+artifact_contract_ref: artifact_contract.yaml
+default_workflow: workflow.yaml
+
+matches:
+  keywords:
+    - documentation
+    - positioning
+    - readme
+    - roadmap
+    - taxonomy
+    - honesty patch
+    - docs/
+    - markdown
+  path_globs:
+    - "**/*.md"
+    - "**/*.rst"
+    - "**/*.mdx"
+  regex:
+    - "## Grep Assertions"
+    - "Pure[- ]docs"
+
+default_gates:
+  - scope_gate
+
+risk_class: low
