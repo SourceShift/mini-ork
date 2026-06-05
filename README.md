@@ -172,7 +172,8 @@ The framework ships the universal loop and its primitives. Nothing in `lib/` or 
 | 8 node-type interfaces | `schemas/workflow.schema.json` + `bin/mini-ork-execute` | planner / researcher / implementer / reviewer / verifier / reflector / publisher / rollback |
 | Agent version registry | `lib/agent_registry.sh` | per-role agent versions (model, provider, tools, success_rate, known_failure_modes) |
 | 6 edge-type semantics | `schemas/workflow.schema.json` | depends_on / supplies_context_to / verifies / blocks / retries / escalates_to |
-| 6 built-in gate types + `custom` | `lib/gate_registry.sh` | deterministic_verifier / reviewer_gate / human_gate / budget_gate / scope_gate / deployment_gate + `custom` escape hatch |
+| 7 built-in gate types + `custom` | `lib/gate_registry.sh` | deterministic_verifier / reviewer_gate / human_gate / budget_gate / scope_gate / deployment_gate / liveness_gate + `custom` escape hatch |
+| Behavioral circuit breaker | `lib/circuit_breaker.sh` | three orthogonal stagnation signals (artifact-hash invariance / verdict-stuck / cost-burn-without-write) with CLOSED→OPEN→HALF_OPEN state machine. Behavioral complement to the `MO_DAILY_BUDGET_USD` cost-CB (v0.2 Phase D) |
 | 8 memory namespaces | `db/migrations/` | task / workflow / agent_performance / failure / recovery / user_preference / artifact / benchmark |
 | Task-class registry | `${MINI_ORK_HOME}/config/task_classes/*.yaml` | typed task definitions |
 | Workflow registry | `recipes/<recipe>/workflow.yaml` | versioned DAGs |
