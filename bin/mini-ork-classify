@@ -15,6 +15,12 @@
 #   Falls back to task_class "generic" if no yaml matches.
 #
 # Flags:
+#   --task-class <name>       Force task_class (skip keyword-count routing).
+#                             Used by `bin/mini-ork run <recipe>` to honor the
+#                             explicit recipe arg — fixes the bug where
+#                             keyword classification overrode the user's
+#                             explicit recipe choice (filed at
+#                             docs/fixes/20260604-dispatch-classifier-overrides-explicit-recipe.md).
 #   --workflow-version <ver>  Override the default workflow version for the class
 #   --dry-run                 Classify and print result; do NOT write to DB
 #   --help
@@ -37,6 +43,7 @@ _require_lib() {
 # ── arg parsing ───────────────────────────────────────────────────────────────
 KICKOFF=""
 WORKFLOW_VERSION=""
+FORCE_TASK_CLASS=""
 DRY_RUN="${MINI_ORK_DRY_RUN:-0}"
 
 _usage() {
@@ -61,6 +68,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --help|-h)       _usage; exit 0 ;;
     --dry-run)       DRY_RUN=1; shift ;;
+    --task-class)    FORCE_TASK_CLASS="${2:?--task-class requires a value}"; shift 2 ;;
     --workflow-version) WORKFLOW_VERSION="${2:?--workflow-version requires a value}"; shift 2 ;;
     -*)              echo "Unknown flag: $1. Try --help" >&2; exit 2 ;;
     *)
@@ -96,9 +104,22 @@ fi
 # For each task_class yaml, count how many of its patterns match the kickoff.
 # Pick the class with the highest hit count. Tiebreak: lex order (deterministic).
 # Falls back to 'generic' if no class matches at all.
+#
+# Explicit-override path: when --task-class is passed (typically by
+# `bin/mini-ork run <recipe>` deriving the class from the recipe's
+# task_class.yaml::name), skip keyword scanning entirely. The operator's
+# explicit recipe arg ALWAYS wins over keyword routing — closes the
+# 2026-06-04 bug where `bin/mini-ork run code-fix <kickoff>` silently
+# wrote task_class=generic when the kickoff happened to have few code-fix
+# keywords.
 KICKOFF_TEXT=$(cat "$KICKOFF")
 TASK_CLASS="generic"
 BEST_HITS=0
+
+if [ -n "$FORCE_TASK_CLASS" ]; then
+  TASK_CLASS="$FORCE_TASK_CLASS"
+  BEST_HITS=-1   # sentinel meaning "explicit override, did not scan"
+fi
 
 # v0.2-pt25 (D-050 fix, 2026-06-01): scan BOTH legacy config/task_classes/*.yaml
 # AND recipes/*/task_class.yaml. Previously only the legacy dir was scanned,
@@ -107,6 +128,11 @@ BEST_HITS=0
 # For recipe-local files the class name comes from the yaml's `name:` field,
 # not the basename (which would always be the literal string "task_class").
 declare -a CANDIDATE_FILES=()
+
+# Skip the entire scan when --task-class was forced — the operator has
+# already named the task class explicitly and no keyword-count routing
+# could overrule them.
+if [ -z "$FORCE_TASK_CLASS" ]; then
 if [ -d "$TASK_CLASSES_DIR" ]; then
   while IFS= read -r -d '' yaml_file; do
     CANDIDATE_FILES+=("$yaml_file")
@@ -174,6 +200,7 @@ PY
     TASK_CLASS="$candidate_class"
   fi
 done
+fi  # end FORCE_TASK_CLASS skip
 
 # ── workflow version resolution ───────────────────────────────────────────────
 if [ -n "$WORKFLOW_VERSION" ]; then
