@@ -152,16 +152,37 @@ Wire-up + remaining oracle-hardening gaps:
 - `lib/version_registry.sh` exposes rollback as a first-class CLI verb:
   `mini-ork rollback <workflow|agent> <name>`
 
-### Substrate
+### Substrate ✓ closed in v0.2-pt24..pt36
 
-- D-048: gradient_extract prompt-tuning — extract returns 0 even on rich
-  traces because audit-recipe traces are coordination-shaped not
-  algorithmic. Prompt needs to ask "what would improve this recipe?"
-  not "what algorithm needs fixing?", OR reflect should treat
-  `synthesis.md` as the recipe-level gradient signal
-- D-045: `task_runs.ended_at` is never set by D-021 status helper —
-  metric trajectory shows pre-v0.2 cycles with multi-thousand-min wall
-  time
+- ✅ D-048 (v0.2-pt36, 2026-06-05): gradient_extract prompt reframed
+  from "what algorithm needs fixing?" → "what about this RECIPE'S
+  design would have made the OUTCOME better?" with a 5-target taxonomy
+  covering both algorithmic (per-node) AND coordination (recipe-level)
+  shapes. Audit-recipe traces now produce signal instead of `[]`.
+- ✅ D-045 (v0.2-pt24, 2026-06-01): `task_runs.ended_at` now set by
+  `_d021_set_status` helper when transitioning to terminal status
+  (published / rolled_back / failed). Metric trajectory wall-times
+  accurate again.
+
+### Drift detection — operator follow-ups (v0.3.x)
+
+- INDETERMINATE verdict for the L2b drift panel (closed 2026-06-05):
+  panel arbiter now emits 3-valued `NO_DRIFT | DRIFT | INDETERMINATE`
+  with a post-process safety net that overrides arbiter NO_DRIFT to
+  INDETERMINATE when all 4 lenses returned confidence=0 OR errored.
+  Pre-push hook treats INDETERMINATE as fail-open by default,
+  block-on `MO_README_PANEL_INDETERMINATE=block`.
+- providers-doctor pre-flight (closed 2026-06-05):
+  `scripts/readme-drift-providers-doctor.sh` probes each lens provider
+  with a 1-token prompt before the panel fires. If <
+  `MO_DRIFT_MIN_RESPONSIVE_LENSES` (default 2) respond within
+  `MO_DRIFT_PROBE_TIMEOUT_SEC` (default 20s), panel is skipped with
+  `reason=panel_unavailable`. Cuts ~360s wasted-timeout wall to ~30s.
+- Provider triage playbook at
+  [`docs/operator/provider-triage.md`](docs/operator/provider-triage.md)
+  documents 6-step diagnosis + remediation for the
+  "kimi/glm/minimax/codex all silent-failing" environment-side issues
+  surfaced during the 2026-06-05 live-smoke session.
 
 ### Recipe portfolio
 
