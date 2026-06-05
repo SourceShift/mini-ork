@@ -27,6 +27,12 @@ export MINI_ORK_DB="$TEST_DB"
 export MINI_ORK_HOME=$(mktemp -d)
 trap 'rm -f "$TEST_DB"; rm -rf "$MINI_ORK_HOME"' EXIT
 
+# Apply migrations so trace_store/gradient_extractor find execution_traces +
+# gradient tables on first call.
+# shellcheck source=/dev/null
+source "$MINI_ORK_ROOT/tests/lib/setup_state_db.sh"
+test_apply_migrations || { echo "skip: migrations failed to apply"; exit 0; }
+
 # Stub out LLM dispatch — gradient_extractor falls back to override fn when set
 _test_gradient_extractor_stub() {
   local _trace_id="$1"

@@ -31,6 +31,13 @@ export MINI_ORK_DB="$TEST_DB"
 export MINI_ORK_HOME=$(mktemp -d)
 trap 'rm -f "$TEST_DB"; rm -rf "$MINI_ORK_HOME"' EXIT
 
+# Apply migrations so promotion_evaluate finds workflow_candidates +
+# benchmark_results + promotion_records (the columns its INSERT/SELECT
+# needs that don't get created by the per-lib _ensure_table helpers).
+# shellcheck source=/dev/null
+source "$MINI_ORK_ROOT/tests/lib/setup_state_db.sh"
+test_apply_migrations || { echo "skip: migrations failed to apply"; exit 0; }
+
 # Load deps
 # shellcheck source=/dev/null
 source "$MINI_ORK_ROOT/lib/benchmark_suite.sh"
