@@ -39,6 +39,11 @@ export MINI_ORK_DB="$TEST_DIR/home/state.db"
 mkdir -p "$MINI_ORK_HOME"
 trap 'rm -rf "$TEST_DIR"' EXIT
 
+# Seed schema — e2e tests must apply migrations before any lib write.
+# shellcheck source=/dev/null
+source "$MINI_ORK_ROOT/tests/lib/setup_state_db.sh"
+test_apply_migrations >/dev/null
+
 # shellcheck source=/dev/null
 source "$MINI_ORK_ROOT/lib/trace_store.sh"
 # shellcheck source=/dev/null
