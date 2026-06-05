@@ -89,30 +89,38 @@ existing = con.execute(
 is_new = existing is None
 
 if is_new:
+    # v0.2-pt37 (2026-06-05): real schema (migration 0011) has
+    # pattern_id, description, evidence_trace_ids, frequency,
+    # first_seen TEXT (ISO via strftime), last_seen TEXT, output_type
+    # (CHECK 5-tuple), promoted_to FK. No cluster_id column — the
+    # previous body referenced it and every INSERT silently failed
+    # with `no such column: cluster_id`.
     con.execute("""
         INSERT INTO pattern_records
-            (pattern_id, description, evidence_trace_ids, frequency, first_seen, last_seen, output_type, cluster_id)
-        VALUES (?,?,?,?,?,?,?,?)
+            (pattern_id, description, evidence_trace_ids, frequency,
+             first_seen, last_seen, output_type)
+        VALUES (?,?,?,?,
+                strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+                strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+                ?)
     """, (
         pid,
         p.get("description", ""),
         json.dumps(new_evidence),
         int(p.get("frequency", 1)),
-        int(p.get("first_seen", now)),
-        now,
         output_type,
-        p.get("cluster_id"),
     ))
 else:
     freq       = existing[0] + 1
     old_ev     = json.loads(existing[1]) if existing[1] else []
     merged_ev  = list(dict.fromkeys(old_ev + new_evidence))  # dedupe, preserve order
-    first_seen = existing[2]
     con.execute("""
         UPDATE pattern_records
-        SET frequency=?, evidence_trace_ids=?, last_seen=?, output_type=?, cluster_id=?
+        SET frequency=?, evidence_trace_ids=?,
+            last_seen=strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+            output_type=?
         WHERE pattern_id=?
-    """, (freq, json.dumps(merged_ev), now, output_type, p.get("cluster_id"), pid))
+    """, (freq, json.dumps(merged_ev), output_type, pid))
 
 con.commit()
 con.close()
