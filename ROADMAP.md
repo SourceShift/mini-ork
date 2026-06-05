@@ -133,11 +133,23 @@ Wire-up + remaining oracle-hardening gaps:
     [`docs/architecture/oracle-gates-wiring.md`](docs/architecture/oracle-gates-wiring.md).
     Smoke-verified: coalition shim against 4-same-family fixture
     returns rc=1 + COALITION_ABORT JSON.
-  - ⏸ **Central dispatcher wire-up** still pending — sourcing the
-    primitives directly in `bin/mini-ork-execute` so they enforce
-    automatically without per-recipe opt-in. Requires touching the
-    828-LOC central dispatcher; deserves a 3-subagent consensus pass
-    first.
+  - ✅ **Central dispatcher wire-up** (2026-06-05): `lib/gate_bootstrap.sh`
+    auto-registers all 4 oracle gates with stable gate_ids
+    (`oracle-{coalition,panel-health,synthesis-promote,stability}`) +
+    task_class_filter=NULL (framework-wide). `bin/mini-ork-execute`'s
+    publisher case-branch now sources gate_bootstrap + invokes
+    `gate_run_all` BEFORE the artifact-publish loop fires. Any safety
+    gate that returns `fail` flips `safety_violation=true` →
+    publisher returns rc=1 with `[BLOCK] oracle-gates: safety_violation`
+    log → no artifact escapes the framework boundary. Escape hatch:
+    `MO_ORACLE_GATES_AUTO=0`.
+    Decision tree: 3-subagent consensus (Security / Reliability /
+    Maintainability) UNANIMOUS on path (b) — single chokepoint at
+    measure_topology slot. Decision doc embedded in commit message of
+    the wire-up commit. Integration test
+    `tests/integration/test_oracle_gates_auto_wire.sh` pins the
+    contract (2 fixtures green, 2 deferred placeholders for follow-up
+    coverage).
 - **Wave 2-A** — per-recipe held-out anchor corpus (Wang 2026). Hand-author per synthesis recipe; corpus selection is judgment-heavy.
 - **Wave 3** — `lib/citation-verifier-mechanical.sh` recall-floor oracle for `refactor_audit` findings (Sistla 2025 + Ficek 2025). 2-3 week sub-decomposition.
 
