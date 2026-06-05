@@ -120,9 +120,18 @@ trace_query() {
   done
   python3 - "${MINI_ORK_DB:?MINI_ORK_DB unset}" \
             "$task_class" "$status" "$since" "$limit" <<'PY'
-import sqlite3, json, sys
+import sqlite3, json, sys, datetime
 db, task_class, status, since = sys.argv[1:5]
-clauses, params = ["created_at >= ?"], [int(since)]
+# v0.2-pt37 (2026-06-05): created_at is TEXT ISO ('2026-06-05T...') per
+# migration 0010, not integer epoch. Lexicographic comparison of an
+# integer epoch (e.g. 1780...) against ISO ('2026...') fails because
+# '1' < '2'. Convert epoch → ISO before comparing.
+try:
+    since_int = int(since)
+    since_iso = datetime.datetime.utcfromtimestamp(since_int).strftime('%Y-%m-%dT%H:%M:%S.000Z')
+except (ValueError, TypeError):
+    since_iso = since
+clauses, params = ["created_at >= ?"], [since_iso]
 if task_class:
     clauses.append("task_class = ?"); params.append(task_class)
 if status:
