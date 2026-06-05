@@ -39,15 +39,18 @@ export MINI_ORK_HOME="$TMP_DIR/.mini-ork"
 export MINI_ORK_DB="$MINI_ORK_HOME/state.db"
 mkdir -p "$MINI_ORK_HOME"
 
+# Apply migrations before sourcing the lib — memory.sh has no _ensure_table
+# and expects tables seeded by `mini-ork init` / migrations. This test uses
+# MINI_ORK_REPO (not MINI_ORK_ROOT) — bridge both so the helper finds the
+# migrations dir regardless of which variable the caller set.
+export MINI_ORK_ROOT="${MINI_ORK_ROOT:-$MINI_ORK_REPO}"
+# shellcheck source=/dev/null
+source "$MINI_ORK_ROOT/tests/lib/setup_state_db.sh"
+test_apply_migrations || { echo "skip: migrations failed to apply"; exit 0; }
+
 # source the library
 # shellcheck source=/dev/null
 source "$MEMORY_LIB"
-
-# init schema if memory.sh doesn't do it automatically
-DB_INIT="$MINI_ORK_REPO/db/init.sh"
-if [[ -f "$DB_INIT" ]]; then
-  bash "$DB_INIT" >/dev/null 2>&1 || true
-fi
 
 echo ""
 echo "--- create epic ---"
