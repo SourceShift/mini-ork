@@ -124,7 +124,20 @@ Dispatch path findings filed at `docs/fixes/20260604-dispatch-classifier-overrid
 
 Wire-up + remaining oracle-hardening gaps:
 
-- **Wave 1 wire-up** — source the 5 lib primitives in `bin/mini-ork-execute` so they enforce automatically. Requires touching the 828-LOC central dispatcher; deserves a 3-subagent consensus pass first.
+- **Wave 1 wire-up** —
+  - ✅ **Light-touch recipe opt-in** (2026-06-05): 4 thin gate shims
+    shipped under `gates/{coalition,panel-health,stability,
+    synthesis-promote}.sh`. Recipes register them via `gate_register
+    custom <path> <task_class>` and list `custom` in node `gates: []`
+    in workflow.yaml. Full guide at
+    [`docs/architecture/oracle-gates-wiring.md`](docs/architecture/oracle-gates-wiring.md).
+    Smoke-verified: coalition shim against 4-same-family fixture
+    returns rc=1 + COALITION_ABORT JSON.
+  - ⏸ **Central dispatcher wire-up** still pending — sourcing the
+    primitives directly in `bin/mini-ork-execute` so they enforce
+    automatically without per-recipe opt-in. Requires touching the
+    828-LOC central dispatcher; deserves a 3-subagent consensus pass
+    first.
 - **Wave 2-A** — per-recipe held-out anchor corpus (Wang 2026). Hand-author per synthesis recipe; corpus selection is judgment-heavy.
 - **Wave 3** — `lib/citation-verifier-mechanical.sh` recall-floor oracle for `refactor_audit` findings (Sistla 2025 + Ficek 2025). 2-3 week sub-decomposition.
 
