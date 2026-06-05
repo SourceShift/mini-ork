@@ -39,6 +39,11 @@ export MINI_ORK_DB="$TEST_DIR/home/state.db"
 mkdir -p "$MINI_ORK_HOME"
 trap 'rm -rf "$TEST_DIR"' EXIT
 
+# Seed schema — e2e tests must apply migrations before any lib write.
+# shellcheck source=/dev/null
+source "$MINI_ORK_ROOT/tests/lib/setup_state_db.sh"
+test_apply_migrations >/dev/null
+
 # shellcheck source=/dev/null
 source "$MINI_ORK_ROOT/lib/benchmark_suite.sh"
 # shellcheck source=/dev/null
@@ -54,7 +59,7 @@ benchmark_add '{
   "expected_artifact_hash_or_criteria": "tests_pass",
   "success_verifiers": ["pytest"],
   "baseline_utility_score": 0.50,
-  "source": "regression_suite"
+  "source": "synthetic"
 }' >/dev/null 2>&1
 
 benchmark_add '{
@@ -64,7 +69,7 @@ benchmark_add '{
   "expected_artifact_hash_or_criteria": "lint_clean",
   "success_verifiers": ["flake8","pytest"],
   "baseline_utility_score": 0.55,
-  "source": "regression_suite"
+  "source": "synthetic"
 }' >/dev/null 2>&1
 
 benchmark_add '{
@@ -74,7 +79,7 @@ benchmark_add '{
   "expected_artifact_hash_or_criteria": "non_empty_result",
   "success_verifiers": [],
   "baseline_utility_score": 0.40,
-  "source": "manual"
+  "source": "human"
 }' >/dev/null 2>&1
 
 TASK_COUNT="$(python3 - "$MINI_ORK_DB" <<'PY'

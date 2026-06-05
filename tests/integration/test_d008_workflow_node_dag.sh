@@ -51,13 +51,22 @@ else
   _fail "$EMPTY_TYPES dispatch lines have empty node_type (D-008b regression)"
 fi
 
-# Assertion 4: D-010 classifier ranking — kickoff with 'audit' + 'scalability' + 'refactor'
-# keywords should route to refactor-audit (not bdd-first or code-fix which also have some)
+# Assertion 4: classifier routing — kickoff with 'audit' + 'scalability' + 'refactor'
+# keywords should route to refactor-audit (not bdd-first or code-fix which also have some).
+#
+# Convention update (2026-06-05 Path A fix at commit 2c12d9d): when invoked
+# via `mini-ork run <recipe> <kickoff>`, the dispatcher derives task_class
+# from recipes/<recipe>/task_class.yaml::name (which uses underscores —
+# e.g. refactor_audit, code_fix). When invoked via `mini-ork classify`
+# without an explicit recipe, the keyword-count classifier returns the
+# yaml::name verbatim (also underscored after the D-050 fix). So the
+# test accepts EITHER form to remain valid under both Path A invocations
+# and pre-Path-A direct-classify invocations.
 TASK_CLASS=$(echo "$OUT" | grep -E '^task_class=' | head -1 | cut -d= -f2)
-if [ "$TASK_CLASS" = "refactor-audit" ]; then
-  _ok "classifier routed to refactor-audit (D-010 rank-by-hits working)"
+if [ "$TASK_CLASS" = "refactor-audit" ] || [ "$TASK_CLASS" = "refactor_audit" ]; then
+  _ok "classifier routed to refactor-audit / refactor_audit (D-010 + Path A both honored)"
 else
-  _fail "classifier routed to $TASK_CLASS (expected refactor-audit) — D-010 regression"
+  _fail "classifier routed to $TASK_CLASS (expected refactor-audit OR refactor_audit) — regression"
 fi
 
 echo ""
