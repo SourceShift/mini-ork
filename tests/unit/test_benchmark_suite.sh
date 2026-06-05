@@ -31,6 +31,13 @@ export MINI_ORK_DB="$TEST_DB"
 export MINI_ORK_HOME=$(mktemp -d)
 trap 'rm -f "$TEST_DB"; rm -rf "$MINI_ORK_HOME"' EXIT
 
+# Apply migrations so libs without _ensure_table helpers (post-D-039) work
+# in isolation, and libs that DO have _ensure_table get a clean canonical
+# schema rather than racing on first-call DDL.
+# shellcheck source=/dev/null
+source "$MINI_ORK_ROOT/tests/lib/setup_state_db.sh"
+test_apply_migrations || { echo "skip: migrations failed to apply"; exit 0; }
+
 # shellcheck source=/dev/null
 source "$LIB"
 
