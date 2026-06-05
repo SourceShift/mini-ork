@@ -74,10 +74,11 @@ REASON: <one short sentence>
 EOF
 )
 
-# Source the minimax wrapper in a subshell, fire claude --print.
+# Source the minimax wrapper in a subshell, fire claude --print with
+# prompt as POSITIONAL ARG (claude --print does not read stdin).
 out=$(
   source "$MINI_ORK_ROOT/lib/providers/cl_minimax.sh" 2>/dev/null
-  printf '%s' "$prompt" | timeout 45 claude --print --output-format text 2>/dev/null
+  timeout 45 claude --print --output-format text "$prompt" < /dev/null 2>/dev/null
 )
 rc=$?
 if [ $rc -ne 0 ] || [ -z "$out" ]; then
