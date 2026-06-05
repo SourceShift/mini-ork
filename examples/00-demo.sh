@@ -67,9 +67,21 @@ echo ""
 
 # ── 5. inspect task_runs ──────────────────────────────────────────────────────
 echo "── 5. inspect task_runs ────────────────────────────────────────────"
-sqlite3 -header "$MINI_ORK_DB" \
-  "SELECT id, task_class, recipe, status, verdict FROM task_runs;" \
-  | sed 's/^/  /'
+rows=$(sqlite3 "$MINI_ORK_DB" "SELECT COUNT(*) FROM task_runs;" 2>/dev/null || echo 0)
+if [ "$rows" -eq 0 ]; then
+  if [ "$MINI_ORK_DRY_RUN" = "1" ]; then
+    echo "  (no task_runs row in dry-run mode — bin/mini-ork-classify"
+    echo "   early-exits before INSERT when MINI_ORK_DRY_RUN=1, by design;"
+    echo "   set MINI_ORK_DRY_RUN=0 to populate the row via real LLM calls)"
+  else
+    echo "  (task_runs is empty — classify step did not reach INSERT;"
+    echo "   check $MINI_ORK_HOME/runs/ for run-id logs)"
+  fi
+else
+  sqlite3 -header "$MINI_ORK_DB" \
+    "SELECT id, task_class, recipe, status, verdict FROM task_runs;" \
+    | sed 's/^/  /'
+fi
 echo ""
 
 echo "==> demo complete. Set MINI_ORK_DRY_RUN=0 to invoke real LLM calls."

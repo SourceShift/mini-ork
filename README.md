@@ -7,7 +7,7 @@
 
 mini-ork is a **task operating system for agents**. It receives a goal, classifies the work, chooses a workflow, dispatches specialized agents, verifies artifacts, and stores execution experience for self-improvement. It does NOT ship opinions on what your pipeline should look like — pipeline shapes live in [`recipes/`](./recipes/) as composable user-land examples.
 
-> ⚡ **60-second demo (no API keys):** `bash examples/00-demo.sh` — bootstraps a throwaway project, runs the loop in dry-run mode, prints the `task_runs` row.
+> ⚡ **10-second demo (no API keys):** `bash examples/00-demo.sh` — bootstraps a throwaway project, walks the classify → plan → execute → verify loop in dry-run mode (no LLM calls), prints the dispatched node sequence + the plan path that *would* be written. Set `MINI_ORK_DRY_RUN=0` to fire real LLM calls and populate the `task_runs` row.
 
 ---
 
