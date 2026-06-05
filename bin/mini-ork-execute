@@ -540,6 +540,70 @@ print(outputs[0] if outputs else '')
       # MINI_ORCH_DIR are set — that's the mini-orch deliver.sh flow,
       # NOT the single-recipe direct-run flow. For single-recipe runs
       # we take the artifact-contract publish path.
+
+      # ── ORACLE-GATES PRE-PUBLISH HOOK (Phase N + O wire-up) ──────────
+      # v0.3-rc1 (2026-06-05): fire the 4 oracle gates ONCE per cycle
+      # BEFORE we commit any artifact out of the framework boundary.
+      # Per 3-subagent consensus (b) at docs/architecture/
+      # oracle-gates-wiring.md — fires post-lens-batch, pre-publisher,
+      # mirroring the measure_topology pattern below.
+      #
+      # Fail-open philosophy: every gate shim returns rc=2 (defer) on
+      # missing context / unloadable lib / missing panel_run_id. Only
+      # a definitive `fail` from a --safety gate flips
+      # summary.safety_violation=true and hard-blocks the publish.
+      #
+      # Skip if MO_ORACLE_GATES_AUTO=0 OR there's no DB available —
+      # backward-compat escape hatch for legacy callers.
+      if [ "${MO_ORACLE_GATES_AUTO:-1}" = "1" ] \
+         && [ -n "${MINI_ORK_RUN_ID:-}" ] \
+         && [ -n "${MINI_ORK_DB:-}" ] \
+         && [ -f "$MINI_ORK_ROOT/lib/gate_bootstrap.sh" ]; then
+        # shellcheck source=lib/gate_bootstrap.sh
+        source "$MINI_ORK_ROOT/lib/gate_bootstrap.sh" 2>/dev/null || true
+        if declare -f mo_bootstrap_oracle_gates > /dev/null 2>&1; then
+          mo_bootstrap_oracle_gates 2>/dev/null || true
+        fi
+        # shellcheck source=lib/gate_registry.sh
+        source "$MINI_ORK_ROOT/lib/gate_registry.sh" 2>/dev/null || true
+        if declare -f gate_run_all > /dev/null 2>&1; then
+          local _gate_ctx
+          _gate_ctx=$(python3 -c "
+import json, sys
+print(json.dumps({
+    'panel_run_id': '${MINI_ORK_RUN_ID}',
+    'recipe':       '${MINI_ORK_RECIPE:-unknown}',
+    'task_class':   '${TASK_CLASS:-generic}',
+    # verdict_file is recipe-specific; absent → cw_por + synthesis-promote
+    # fail-open with verdict=indeterminate. Recipes that want to enforce
+    # these gates should write a verdict file to $RUN_DIR/panel-verdict.json
+    # before the publisher fires.
+    'verdict_file': '${MINI_ORK_RUN_DIR:-${MINI_ORK_HOME}/runs/${MINI_ORK_RUN_ID}}/panel-verdict.json',
+    'current_round': 1,
+}))
+")
+          local _gate_verdict
+          _gate_verdict=$(gate_run_all "${TASK_CLASS:-generic}" "$_gate_ctx" 2>/dev/null || echo '{}')
+          local _safety_violation
+          _safety_violation=$(echo "$_gate_verdict" | python3 -c "
+import json, sys
+try:
+    print(json.load(sys.stdin).get('safety_violation', False))
+except Exception:
+    print(False)
+" 2>/dev/null)
+          if [ "$_safety_violation" = "True" ]; then
+            echo "  [BLOCK] oracle-gates: safety_violation — publish refused (COALITION_ABORT or equivalent)"
+            echo "  Set MO_ORACLE_GATES_AUTO=0 to bypass, OR fix the panel composition / verdict file."
+            echo "  Gate verdict JSON: $_gate_verdict" | head -c 500
+            echo
+            return 1
+          fi
+          echo "  [ok] oracle-gates: pre-publish pass"
+        fi
+      fi
+      # ─────────────────────────────────────────────────────────────────
+
       local _contract="$MINI_ORK_ROOT/recipes/${MINI_ORK_RECIPE:-}/artifact_contract.yaml"
       if [ ! -f "$_contract" ]; then
         echo "  [warn] publisher: no artifact_contract.yaml at $_contract — skipping" >&2
