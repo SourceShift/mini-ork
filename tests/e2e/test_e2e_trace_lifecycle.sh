@@ -41,6 +41,13 @@ mkdir -p "$MINI_ORK_HOME/runs"
 
 trap 'rm -rf "$TEST_DIR"' EXIT
 
+# Seed schema — e2e tests must apply migrations before any lib write
+# (trace_store.sh / benchmark_suite.sh / promotion_gate.sh / reflection
+# all assume `mini-ork init` ran first to create their tables).
+# shellcheck source=/dev/null
+source "$MINI_ORK_ROOT/tests/lib/setup_state_db.sh"
+test_apply_migrations >/dev/null
+
 # source the lib
 # shellcheck source=/dev/null
 source "$LIB"
