@@ -110,9 +110,11 @@ echo "--- benchmark_run with stub runner: all tasks scored ---"
 STUB_RUNNER_FILE="$TEST_DIR/stub_runner.sh"
 cat > "$STUB_RUNNER_FILE" <<'STUB'
 #!/usr/bin/env bash
-# Read task JSON from stdin
+# Read task JSON from stdin. v0.2-pt35 renamed `id` → `benchmark_id`
+# in the real schema; benchmark_run pipes rows as-they-are so the
+# stub must read benchmark_id (fall back to legacy `id` for safety).
 INPUT="$(cat)"
-ID="$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('id',''))" "$INPUT" 2>/dev/null || echo '')"
+ID="$(python3 -c "import json,sys; d=json.loads(sys.argv[1]); print(d.get('benchmark_id') or d.get('id') or '')" "$INPUT" 2>/dev/null || echo '')"
 # bt-003 deliberately fails to test partial-pass case
 if [[ "$ID" == "bt-003" ]]; then
   echo '{"passed": false, "utility_score": 0.30, "output": "no results"}'

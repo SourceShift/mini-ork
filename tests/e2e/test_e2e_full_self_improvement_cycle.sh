@@ -170,6 +170,29 @@ for line in sys.stdin:
 _assert "Step 4: >= 1 WorkflowCandidate proposed" '[[ -n "${CAND_ID:-}" ]]'
 _assert "Step 4: candidate_id starts with wc-" '[[ "${CAND_ID:-}" == wc-* ]]'
 
+# group_propose only PRINTS the candidate to stdout — it does not persist
+# to workflow_candidates. promotion_evaluate (Step 6) reads the
+# candidate's base_workflow_version_id from workflow_candidates and exits
+# 1 silently if missing. Seed both workflow_memory (FK target) +
+# workflow_candidates rows so the downstream chain can complete.
+python3 - "$MINI_ORK_DB" "$CAND_ID" <<'PY'
+import sqlite3, sys
+db, cid = sys.argv[1], sys.argv[2]
+con = sqlite3.connect(db)
+con.execute("""
+    INSERT OR IGNORE INTO workflow_memory
+        (workflow_version_id, workflow_name, yaml_hash, yaml_blob)
+    VALUES ('wf-baseline', 'baseline', 'd', '#')
+""")
+con.execute("""
+    INSERT OR IGNORE INTO workflow_candidates
+        (candidate_id, base_workflow_version_id, created_by)
+    VALUES (?, 'wf-baseline', 'evolution_engine')
+""", (cid,))
+con.commit()
+con.close()
+PY
+
 echo ""
 echo "=== Step 5: BENCHMARK — run candidate through suite ==="
 
