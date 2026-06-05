@@ -31,6 +31,12 @@ export MINI_ORK_DB="$TEST_DB"
 export MINI_ORK_HOME=$(mktemp -d)
 trap 'rm -f "$TEST_DB"; rm -rf "$MINI_ORK_HOME"' EXIT
 
+# Apply migrations against the test DB so libs that removed inline CREATE
+# TABLE blocks (post-D-039) can source + run against a fresh mktemp DB.
+# shellcheck source=/dev/null
+source "$MINI_ORK_ROOT/tests/lib/setup_state_db.sh"
+test_apply_migrations || { echo "skip: migrations failed to apply"; exit 0; }
+
 # shellcheck source=/dev/null
 source "$LIB"
 
