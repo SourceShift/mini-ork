@@ -1,17 +1,24 @@
 #!/usr/bin/env bash
-# gate_bootstrap.sh — auto-register the 4 oracle gates at framework boot.
+# gate_bootstrap.sh — auto-register the 5 oracle gates at framework boot.
 #
 # Per 3-subagent consensus (2026-06-05, recorded in
 # docs/architecture/oracle-gates-wiring.md): the central wire-up fires
-# all 4 oracle gates once-per-cycle at a single chokepoint inside
+# all oracle gates once-per-cycle at a single chokepoint inside
 # bin/mini-ork-execute (modeled on the measure_topology call site).
 # That chokepoint requires the gates to be REGISTERED in the gate_registry
 # table before gate_run_all can dispatch them. This bootstrap runs at the
-# top of the publisher case-branch and idempotently inserts the 4 gate
+# top of the publisher case-branch and idempotently inserts the gate
 # records.
 #
+# Roster (as of 2026-06-06):
+#   oracle-coalition          — ρ + family-diversity (lib/coalition_gate.sh)
+#   oracle-panel-health       — CW-POR diagnostic (lib/cw_por.sh)
+#   oracle-synthesis-promote  — selective-feedback conjunction (lib/promotion_gate.sh)
+#   oracle-stability          — round-over-round verdict drift (lib/adaptive_stability.sh)
+#   oracle-liveness           — behavioral circuit breaker (lib/circuit_breaker.sh)
+#
 # Public API:
-#   mo_bootstrap_oracle_gates  → registers the 4 gates if not already
+#   mo_bootstrap_oracle_gates  → registers the 5 gates if not already
 #                                 present. Idempotent. rc=0 even on
 #                                 partial failures (fail-open).
 
@@ -31,7 +38,7 @@ mo_bootstrap_oracle_gates() {
   fi
   _gate_ensure_table 2>/dev/null || return 0
 
-  # Idempotency: skip if all 4 already registered.
+  # Idempotency: skip if all 5 already registered.
   local _existing
   _existing=$(python3 - "${MINI_ORK_DB}" <<'PY'
 import sqlite3, sys
@@ -46,7 +53,7 @@ except Exception:
 con.close()
 PY
 )
-  if [ "${_existing:-0}" -ge 4 ]; then
+  if [ "${_existing:-0}" -ge 5 ]; then
     return 0
   fi
 
@@ -60,6 +67,11 @@ PY
   gate_register "custom" "$_root/gates/panel-health.sh"      "" --safety >/dev/null 2>&1 || true
   gate_register "custom" "$_root/gates/synthesis-promote.sh" "" --safety >/dev/null 2>&1 || true
   gate_register "custom" "$_root/gates/stability.sh"         ""           >/dev/null 2>&1 || true
+  # liveness is --safety because a tripped behavioral CB means the recipe
+  # is burning cost without progress; allowing publish in that state
+  # would let unbounded spend continue. fail-open via the shim's exit-2
+  # branch when the lib can't load or context lacks run_id.
+  gate_register "custom" "$_root/gates/liveness.sh"          "" --safety >/dev/null 2>&1 || true
 
   # Rename to stable gate_ids so future bootstrap calls see them.
   python3 - "${MINI_ORK_DB}" "$_root" <<'PY'
@@ -71,6 +83,7 @@ mapping = {
     f"{root}/gates/panel-health.sh":      "oracle-panel-health",
     f"{root}/gates/synthesis-promote.sh": "oracle-synthesis-promote",
     f"{root}/gates/stability.sh":         "oracle-stability",
+    f"{root}/gates/liveness.sh":          "oracle-liveness",
 }
 try:
     for cond, new_id in mapping.items():
@@ -125,12 +138,12 @@ PY
   echo "── self-test: cold call ──"
   mo_bootstrap_oracle_gates
   N1=$(sqlite3 "$MINI_ORK_DB" "SELECT COUNT(*) FROM gate_registry WHERE gate_id LIKE 'oracle-%';")
-  [ "$N1" -eq 4 ] && echo "  [OK] cold registered $N1/4" || { echo "  [FAIL] got $N1 want 4"; exit 1; }
+  [ "$N1" -eq 5 ] && echo "  [OK] cold registered $N1/5" || { echo "  [FAIL] got $N1 want 5"; exit 1; }
 
   echo "── self-test: warm call (idempotent) ──"
   mo_bootstrap_oracle_gates
   N2=$(sqlite3 "$MINI_ORK_DB" "SELECT COUNT(*) FROM gate_registry WHERE gate_id LIKE 'oracle-%';")
-  [ "$N2" -eq 4 ] && echo "  [OK] warm stays at $N2/4" || { echo "  [FAIL] got $N2 want 4"; exit 1; }
+  [ "$N2" -eq 5 ] && echo "  [OK] warm stays at $N2/5" || { echo "  [FAIL] got $N2 want 5"; exit 1; }
 
   sqlite3 "$MINI_ORK_DB" "SELECT gate_id FROM gate_registry WHERE gate_id LIKE 'oracle-%' ORDER BY gate_id;"
   echo "self-test passed."
