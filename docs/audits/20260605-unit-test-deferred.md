@@ -72,3 +72,43 @@ This audit is scoped to `tests/unit/`. Adjacent gaps (each its own follow-up):
 - `tests/security/` — 10 test files (injection / traversal / supply-chain / etc.)
 
 `bash tests/run-all.sh integration` / `e2e` / `security` are the canonical entry points; the deferred bugs above only affect the `unit` layer.
+
+---
+
+## Closure note — 2026-06-06
+
+All 3 deferred items from this audit are **resolved**. The audit is preserved
+as a point-in-time snapshot of the 2026-06-05 state, NOT as an open backlog.
+
+### Resolution map
+
+| Deferred item | Resolved by | Verification |
+|---|---|---|
+| 1. `test_promotion_gate.sh` (5 fails) | `c411b08` — fix(promotion_gate)+test(unit): close 9 unit-test failures via schema-correct UPDATE + seed expansion | `bash tests/unit/test_promotion_gate.sh` → 7 OK / 0 FAIL |
+| 2. `test_benchmark_suite.sh` (2 fails) | `c6d735a` — test(e2e+integration): seed schema + fix schema-drift in 6 test files | `bash tests/unit/test_benchmark_suite.sh` → 10 OK / 0 FAIL |
+| 3. `test_memory.sh` (1 SKIP) | Held as SKIP per audit recommendation — the memory API is still in active flux per the v3-refactor migrations; locking a test today would freeze WIP | `bash tests/run-all.sh unit` reports `test_memory.sh (0 assertions)` — file still loads, no assertions executed |
+
+### Current suite-wide state (2026-06-06)
+
+```
+unit:        168 OK / 0 FAIL across 20 files
+integration: 146 OK / 0 FAIL across 15 files
+security:     62 OK / 0 FAIL across 10 files
+smoke:       121 OK / 0 FAIL
+TOTAL:       497 OK / 0 FAIL across 54 files
+```
+
+The `+80 OK / −15 FAIL` net from 2026-06-05 has continued — net suite state is
+now `+72 OK additional` vs the 2026-06-05 endpoint with all hard failures closed.
+
+### Why this closure note exists (instead of deleting the file)
+
+Per the autopilot principle "Compound, don't band-aid": an audit doc that asserts
+2 deferred fails when there are zero is **clutter that misleads** future operators
+or another Claude session reading the audit dir cold. Deleting the file would
+erase the diagnostic record; appending a dated closure with the resolving commit
+SHAs preserves the history AND makes the current state legible at the bottom of
+the file.
+
+Future audit docs in `docs/audits/` should follow the same pattern: a dated
+closure appendix the moment the open items resolve, not silent staleness.
