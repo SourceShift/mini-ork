@@ -12,9 +12,9 @@
 #   2. With MO_ORACLE_GATES_AUTO=1 + diverse-family panel (4 distinct
 #      families), dispatch reaches the synthesizer node without abort.
 #
-#   3. With MO_ORACLE_GATES_AUTO=0 (default) OR unset, the existing
-#      dispatch behavior is unchanged for ALL 9 recipes — no oracle
-#      gate fires automatically. This is the backward-compat invariant.
+#   3. With MO_ORACLE_GATES_AUTO=0, the existing dispatch behavior is
+#      unchanged — the publisher escape hatch bypasses automatic oracle
+#      gates even when panel traces would otherwise block.
 #
 #   4. With MO_ORACLE_GATES_AUTO=1 + a recipe whose state.db has no
 #      panel-shaped traces (single-node code-fix), the coalition gate
@@ -23,12 +23,6 @@
 #
 # Exit 0 = all 4 fixtures pass. Exit 1 = any fixture failed.
 #
-# NOTE: This test is INTENTIONALLY skip-pending until the wire-up
-# lands. The skip emits a clear marker so the suite stays at 503/0
-# until the implementation arrives. After wire-up, flip the
-# WIRE_UP_LANDED guard at the top to "1" and the assertions become
-# live.
-
 set -uo pipefail
 
 MINI_ORK_ROOT="${MINI_ORK_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
@@ -167,21 +161,53 @@ _assert "Fixture 2: diverse-family panel → safety_violation=false (coalition p
 
 # ── Fixture 3: auto-wire OFF → backward-compat (no gate fires) ──────────────
 echo
-echo "--- Fixture 3: MO_ORACLE_GATES_AUTO=0 (default) → backward-compat unchanged ──"
+echo "--- Fixture 3: MO_ORACLE_GATES_AUTO=0 → backward-compat unchanged ──"
 
-# With auto-off, the same call should not produce any oracle-specific
-# signal. The pre-wire-up state is: gate_registry has no oracle gates
-# unless recipes explicitly register them.
-# Sanity: even after our explicit register above, the wire-up MUST
-# expose a way to disable (env flag) so existing recipes that opt out
-# get unchanged behavior. This fixture pins that escape hatch.
-_skip "Fixture 3 deferred until wire-up exposes MO_ORACLE_GATES_AUTO env flag — placeholder"
+# A collision panel would block the publisher if the auto-wire hook ran.
+# Use a missing recipe so the publisher reaches the hook, then exits via
+# the existing "no artifact_contract.yaml" no-op path without writing repo
+# files or committing anything.
+RUN_DIR="$TEST_DIR/runs/run-fixture-auto-off"
+mkdir -p "$RUN_DIR"
+PLAN_PATH="$RUN_DIR/plan.json"
+cat > "$PLAN_PATH" <<'JSON'
+{
+  "objective": "Exercise publisher escape hatch",
+  "task_class": "refactor_audit",
+  "decomposition": [
+    {"id": "publish", "description": "Publish synthetic artifact", "node_type": "publisher", "depends_on": []}
+  ]
+}
+JSON
+
+set +e
+fixture3_out=$(
+  MO_ORACLE_GATES_AUTO=0 \
+  MINI_ORK_RUN_ID=run-fixture-collision \
+  MINI_ORK_RECIPE=__missing_oracle_gate_test_recipe__ \
+  MINI_ORK_PLAN_PATH="$PLAN_PATH" \
+  "$MINI_ORK_ROOT/bin/mini-ork-execute" --node-type publisher 2>&1
+)
+fixture3_rc=$?
+set +e
+fixture3_block=$(printf '%s' "$fixture3_out" | grep -c "oracle-gates: safety_violation" || true)
+_assert "Fixture 3: auto-off publisher exits 0" \
+  '[[ "$fixture3_rc" -eq 0 ]]'
+_assert "Fixture 3: auto-off publisher does not emit oracle block" \
+  '[[ "$fixture3_block" -eq 0 ]]'
 
 # ── Fixture 4: single-node code-fix → fail-open ──────────────────────────────
 echo
 echo "--- Fixture 4: single-node code-fix recipe + auto-wire ON → coalition gate fail-opens ──"
 
-_skip "Fixture 4 deferred until wire-up wires coalition gate at the right node-type — placeholder"
+context=$(printf '{"panel_run_id":"run-fixture-single-node","recipe":"code-fix","task_class":"code_fix","current_round":1}')
+verdict_out=$(gate_run_all "code_fix" "$context" 2>/dev/null)
+fixture4_safety=$(echo "$verdict_out" | jq -r '.safety_violation // false' 2>/dev/null)
+fixture4_gate_count=$(echo "$verdict_out" | jq -r '.gate_count // 0' 2>/dev/null)
+_assert "Fixture 4: single-node code-fix sees registered oracle gates" \
+  '[[ "${fixture4_gate_count:-0}" -ge 5 ]]'
+_assert "Fixture 4: single-node code-fix → safety_violation=false (fail-open)" \
+  '[[ "$fixture4_safety" == "false" ]]'
 
 echo
 echo "── Results: ${PASS} OK  ${SKIP} SKIP  ${FAIL} FAIL ──"
