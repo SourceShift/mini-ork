@@ -68,8 +68,15 @@ extraction prompt-tuning is D-048, deferred)
 - README top-of-fold positioning section + 7-axis comparison vs
   single-vendor agent SDKs (Claude Code / OpenAI Agents SDK / LangGraph)
 
-**Phase E — Evolution + promotion** — NOT in v0.2 (was originally scheduled
-but the v0.2 arc focused on Phase A→G durability; E moves to v0.3).
+**Phase E — Evolution + promotion** ✓ in v0.3-rc1
+- LIVE-validated on 2026-06-07 with `PHASE_E_PROVIDER=codex`:
+  `benchmark_run` dispatched two real model-scored tasks, persisted
+  `benchmark_results`, then `promotion_evaluate` persisted the resulting
+  `promotion_records` decision. Evidence:
+  `docs/_meta/phase-e-live-validation-20260607-125311.md`.
+- The candidate was rejected because one benchmark failed, which is the
+  expected promotion-gate behavior; the validated contract is the live
+  improve → benchmark → eval → promote chain and its DB writes.
 
 ### v0.3.0-rc1 — 2026-06-05 (in flight)
 
@@ -98,6 +105,7 @@ question:
 | W1-D selective-feedback conjunction | ✅ | `94d3cfe` | `lib/promotion_gate.sh::mo_promote_synthesis_gate` — synthesis-class auto-promote requires panel_score + CW-POR + structural signal ALL three (Adapala 2025) |
 | W2-B adaptive stability detection | ✅ | `3dc65ca` | `lib/adaptive_stability.sh::mo_check_panel_stability` — round-over-round verdict drift drives HALT/CONTINUE between debate rounds (Hu et al 2025) |
 | W2-C behavioral circuit breaker | ✅ | `fa93340` | `lib/circuit_breaker.sh::mo_check_liveness_breaker` — three orthogonal stagnation signals (artifact-hash invariance / verdict-stuck / cost-burn-without-write) with CLOSED→OPEN→HALF_OPEN state machine. Behavioral complement to v0.2 Phase D cost-CB (`MO_DAILY_BUDGET_USD`). Registered as 7th gate type `liveness_gate` in `gate_registry.sh`. Closes the failure mode where spend is under the cap but the recipe is making zero forward progress (reviewer rejecting the same patch every cycle). Ralph-equivalent of `CB_NO_PROGRESS_THRESHOLD` / `CB_SAME_ERROR_THRESHOLD` / `CB_COOLDOWN_MINUTES` (ralph-claude-code v0.11.5). Covered by `tests/unit/test_circuit_breaker.sh` (10 assertions, all green). |
+| Phase E LIVE validation | ✅ | pending | `tests/live/phase_e_live_validation.sh` — on-demand live harness for improve → benchmark → eval → promote. Run `PHASE_E_PROVIDER=codex bash tests/live/phase_e_live_validation.sh`; 2026-06-07 report: `docs/_meta/phase-e-live-validation-20260607-125311.md` (8 OK / 0 FAIL). |
 | W2-A held-out anchor corpus | ⏸ | — | Hand-author per recipe — judgment-heavy corpus selection (Wang 2026) |
 | W3 mechanical citation+coverage verifier | ⏸ | — | 2-3 week sub-decomposition into 5-8 atoms (Sistla 2025 + Ficek 2025) |
 
