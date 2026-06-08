@@ -57,3 +57,7 @@ Single JSON object on stdout:
 - Don't write the runbook content.
 - Don't speculate on root causes — diagnosis_lens does that.
 - Don't run commands — this is a planning step.
+
+--- kickoff brief ---
+
+{{KICKOFF_CONTENT}}

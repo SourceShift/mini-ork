@@ -68,24 +68,68 @@ fi
 
 # Invoke codex exec. The `--skip-git-repo-check` flag avoids the prompt
 # that codex emits when not in a git repo; we may run from /tmp / .mini-ork/runs/.
-# Capture stdout; codex writes its own status to stderr which we let through.
-# Note: codex exec output shape:
-#   - default: streaming text to stdout (assistant message + tool calls inline)
-#   - we extract just the text by piping through a simple grep filter that
-#     skips lines starting with `[codex]` (status) and `tokens used:` (footer)
-RAW_OUT=$(codex exec --skip-git-repo-check "$PROMPT" 2>&1) || {
+# `--output-last-message` gives mini-ork the assistant body instead of the
+# terminal transcript (prompt + status + hooks), which would confuse downstream
+# JSON extraction. Default to workspace-write because implementer nodes must be
+# able to edit the scenario project; operators can override with CODEX_SANDBOX.
+_CODEX_LAST_MESSAGE="$(mktemp -t mini-ork-codex-last.XXXXXX)"
+_CODEX_SANDBOX="${CODEX_SANDBOX:-workspace-write}"
+RAW_OUT=$(codex exec \
+  --skip-git-repo-check \
+  --sandbox "$_CODEX_SANDBOX" \
+  --output-last-message "$_CODEX_LAST_MESSAGE" \
+  "$PROMPT" 2>&1) || {
   echo "[cl_codex] codex exec failed with rc=$? — see stderr for cause" >&2
   echo "$RAW_OUT" >&2
+  rm -f "$_CODEX_LAST_MESSAGE"
   exit 4
 }
+if [ -s "$_CODEX_LAST_MESSAGE" ]; then
+  RAW_OUT="$(cat "$_CODEX_LAST_MESSAGE")"
+fi
+rm -f "$_CODEX_LAST_MESSAGE"
 
-# Strip codex's wrapper lines so downstream parsers see a clean text body.
-# Keep everything except status banners and final-token-count footer.
-CLEAN=$(echo "$RAW_OUT" | grep -vE '^\[20[0-9]{2}-[0-9]{2}-[0-9]{2}T' \
-                       | grep -vE '^tokens used:' \
-                       | grep -vE '^User instructions:' \
-                       | grep -vE '^OpenAI Codex' \
-                       || echo "$RAW_OUT")
+# Strip codex's transcript envelope so downstream parsers see the assistant
+# body only. Codex CLI can emit:
+#
+#   user
+#   <full prompt, including JSON examples>
+#   codex
+#   <assistant answer>
+#
+# If we pass that whole transcript through, mini-ork-plan's balanced JSON
+# extractor sees the prompt's example JSON before the actual answer. Keep text
+# after the final bare `codex` marker when present, then remove status lines.
+CLEAN=$(RAW_OUT="$RAW_OUT" python3 - <<'PY'
+import re, sys
+import os
+txt = os.environ.get("RAW_OUT", "")
+lines = txt.splitlines()
+last_codex = -1
+for i, line in enumerate(lines):
+    if line.strip() == "codex":
+        last_codex = i
+if last_codex >= 0:
+    lines = lines[last_codex + 1:]
+drop = (
+    re.compile(r"^\[20[0-9]{2}-[0-9]{2}-[0-9]{2}T"),
+    re.compile(r"^tokens used:"),
+    re.compile(r"^User instructions:"),
+    re.compile(r"^OpenAI Codex"),
+    re.compile(r"^Reading additional input from stdin"),
+    re.compile(r"^[-]{8,}$"),
+    re.compile(r"^(workdir|model|provider|approval|sandbox|reasoning|session id):"),
+    re.compile(r"^hook: "),
+)
+kept = []
+for line in lines:
+    if any(rx.search(line) for rx in drop):
+        continue
+    kept.append(line)
+print("\n".join(kept).strip())
+PY
+)
+[ -z "$CLEAN" ] && CLEAN="$RAW_OUT"
 
 if [ "$FORMAT" = "json" ]; then
   # Emit a minimal claude-shaped JSON envelope so downstream jq parser

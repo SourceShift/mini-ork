@@ -43,3 +43,7 @@ else (no prose preamble, no markdown fence):
   this prevents scope drift in lens contributions.
 - `verifier_contract.checks` is consumed by `verifiers/draft-completeness.sh`
   — keep it executable + greppable.
+
+--- kickoff brief ---
+
+{{KICKOFF_CONTENT}}

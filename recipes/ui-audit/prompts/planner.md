@@ -59,3 +59,7 @@ Single JSON object on stdout, no preamble:
 - Don't run the audit. Lenses do that.
 - Don't pick the surfaces — extract them verbatim from the kickoff.
 - Don't fabricate URLs.
+
+--- kickoff brief ---
+
+{{KICKOFF_CONTENT}}
