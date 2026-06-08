@@ -1,0 +1,45 @@
+name: post_mvp_delivery
+version: "0.1.0"
+description: >
+  Discovery-first product delivery for post-MVP work. The workflow researches
+  implementation details, product tradeoffs, integration risks, and validation
+  strategy before asking the user to choose an option and continuing delivery.
+
+matches:
+  keywords:
+    - post mvp
+    - post-mvp
+    - production product
+    - product delivery
+    - build product
+    - deliver product
+    - discover implementation details
+    - research before implementation
+    - provide options
+    - ask user to choose
+    - product roadmap
+  regex:
+    - "(?i)deliver .*post[- ]mvp"
+    - "(?i)research .*implementation details"
+    - "(?i)provide .*options .*user"
+
+artifact_contract_ref: artifact_contract.yaml
+default_workflow: workflow.yaml
+
+default_gates:
+  - budget_gate
+  - scope_gate
+
+risk_class: high
+
+cost_model:
+  min_usd: 5
+  max_usd: 60
+  per_lens_usd: 5
+
+runtime_model:
+  min_minutes: 20
+  max_minutes: 120
+
+kickoff_shape: single_file
+human_decision_required: true
