@@ -8,17 +8,10 @@ import subprocess
 import tempfile
 from pathlib import Path
 
+from mini_ork import MiniOrk, ProviderPolicy, RunRequest, RunResult
+
 from .catalog import expected_task_class
 from .model import RunConfig, Scenario, ScenarioResult
-from .provider_policy import provider_policy
-
-
-def extract_last_value(output: str, prefix: str) -> str:
-    value = ""
-    for line in output.splitlines():
-        if line.startswith(prefix):
-            value = line.split("=", 1)[1]
-    return value
 
 
 def seed_project(root: Path, tmp_project: Path, scenario: Scenario) -> None:
@@ -54,27 +47,22 @@ class ScenarioExecutor:
         try:
             subprocess.run(["git", "init", "-q"], cwd=tmp_project, env=env, check=True)
             seed_project(self.root, tmp_project, scenario)
-            subprocess.run(
-                [str(self.root / "bin" / "mini-ork"), "init"],
-                cwd=tmp_project,
-                env=env,
-                check=True,
-                stdout=subprocess.DEVNULL,
-            )
 
-            provider_policy(self.config.provider_policy).apply(Path(env["MINI_ORK_HOME"]))
-            command = self._command(scenario)
-            completed = subprocess.run(
-                command,
-                cwd=tmp_project,
-                env=env,
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                timeout=self.config.timeout_seconds,
+            client = MiniOrk(root=self.root, home=tmp_project / ".mini-ork")
+            policy = ProviderPolicy.codex_only() if self.config.provider_policy == "codex-only" else None
+            result = client.run(
+                RunRequest(
+                    kickoff=scenario.kickoff,
+                    recipe=None if self.config.md_only else scenario.recipe,
+                    mode=self.config.mode,
+                    cwd=tmp_project,
+                    provider_policy=policy,
+                    timeout_seconds=self.config.timeout_seconds,
+                    extra_env={"MINI_ORK_NO_COLOR": "1"},
+                )
             )
-            output_log.write_text(completed.stdout, encoding="utf-8")
-            return self._result(scenario, completed.returncode, completed.stdout, output_log, tmp_project)
+            output_log.write_text(result.output, encoding="utf-8")
+            return self._result(scenario, result, output_log, tmp_project)
         except subprocess.TimeoutExpired as exc:
             partial = exc.stdout or ""
             output_log.write_text(partial, encoding="utf-8")
@@ -112,34 +100,26 @@ class ScenarioExecutor:
         )
         return env
 
-    def _command(self, scenario: Scenario) -> list[str]:
-        if self.config.md_only:
-            return [str(self.root / "bin" / "mini-ork"), "run", str(scenario.kickoff)]
-        return [str(self.root / "bin" / "mini-ork"), "run", scenario.recipe, str(scenario.kickoff)]
-
     def _result(
         self,
         scenario: Scenario,
-        returncode: int,
-        output: str,
+        run_result: RunResult,
         output_log: Path,
         tmp_project: Path,
     ) -> ScenarioResult:
         expected = expected_task_class(self.root, scenario.recipe)
-        actual = extract_last_value(output, "task_class=")
-        plan = extract_last_value(output, "plan_path=")
-        has_verification = '"verdict"' in output or "[ok] verifier_ref" in output
-        ok = returncode == 0 and actual == expected and has_verification
+        actual = run_result.task_class
+        has_verification = '"verdict"' in run_result.output or "[ok] verifier_ref" in run_result.output
+        ok = run_result.returncode == 0 and actual == expected and has_verification
         return ScenarioResult(
             scenario=scenario,
             ok=ok,
-            returncode=returncode,
+            returncode=run_result.returncode,
             expected_task_class=expected,
             actual_task_class=actual,
-            output=output,
+            output=run_result.output,
             output_log=output_log,
             tmp_project=tmp_project,
-            plan_path=Path(plan) if plan else None,
+            plan_path=run_result.plan_path,
             error="" if ok else "missing expected task class, rc=0, or verification evidence",
         )
-

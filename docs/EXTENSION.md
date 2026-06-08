@@ -2,6 +2,25 @@
 
 mini-ork has 4 canonical extension points. None require forking the framework. All extensions live in user-land config dirs or recipe dirs.
 
+For Python-first integrations, start with [`docs/PYTHON_FRAMEWORK.md`](PYTHON_FRAMEWORK.md).
+The Python facade exposes typed `RunRequest`, `RunResult`, `WorkflowSpec`,
+`RecipeSpec`, `ProviderPolicy`, and `ExtensionRegistry` objects while preserving
+the existing recipe directory format underneath.
+
+```python
+from pathlib import Path
+from mini_ork import MiniOrk, RunRequest
+
+result = MiniOrk().run(RunRequest(kickoff=Path("kickoff.md"), recipe="docs"))
+print(result.command)
+print(result.plan_path)
+print(result.retained_home)
+```
+
+`RunRequest` auto-initializes `.mini-ork/` by default when embedding from
+Python. Set `auto_init=False` if your host application manages bootstrap
+explicitly.
+
 ---
 
 ## 1. WorkflowGraph
