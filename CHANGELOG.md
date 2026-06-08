@@ -11,6 +11,29 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.3.0-rc1] - 2026-06-08
+
+### Added
+
+- Python framework facade: importable `mini_ork` package with typed run,
+  workflow, recipe, provider-policy, and extension contracts.
+- Production scenario framework for real markdown kickoffs across the shipped
+  recipe catalog.
+- Dispatcher run-profile enrichment: `mini-ork run` now writes
+  `run_profile.json`, emits profile questions before planning, and supports
+  `MINI_ORK_PROFILE_STRICT=1` for high-risk incomplete profiles.
+- Live Phase E Codex validation report for improve -> benchmark -> eval ->
+  promote.
+
+### Verified
+
+- Full test pyramid: 57 files, 525 assertions, 0 failures.
+- Production scenario sweeps: 9/9 explicit recipe and 9/9 markdown-only
+  dispatcher dry-runs passed with Codex-only provider policy.
+- Phase E live harness: 8 OK / 0 FAIL using `PHASE_E_PROVIDER=codex`.
+
+---
+
 ## [0.1.1] - 2026-05-30
 
 ### Added — OSS-readiness deltas
