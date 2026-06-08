@@ -82,7 +82,7 @@ mo_llm_dispatch() {
   if [ -f "$MINI_ORK_ROOT/lib/lane-helpers.sh" ]; then
     # shellcheck source=lib/lane-helpers.sh
     source "$MINI_ORK_ROOT/lib/lane-helpers.sh" 2>/dev/null || true
-    if declare -f mo_emit_cache_flags >/dev/null 2>&1; then
+    if declare -f mo_emit_cache_flags >/dev/null 2>&1 && ! _mo_llm_is_gateway "$model"; then
       mo_emit_cache_flags _cache_flags || true
     fi
   fi

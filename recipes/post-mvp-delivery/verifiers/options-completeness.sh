@@ -17,11 +17,12 @@ missing=()
 [ -f "$OPTIONS_FILE" ] || missing+=("options.md")
 
 if [ -f "$OPTIONS_FILE" ]; then
-  for pattern in "Option" "Recommendation" "Tradeoff" "Risk" "Validation" "Decision"; do
-    if ! grep -qi "$pattern" "$OPTIONS_FILE"; then
-      missing+=("$pattern")
-    fi
-  done
+  grep -qi "Option" "$OPTIONS_FILE" || missing+=("Option")
+  grep -Eqi "Recommend(ed|ation)?" "$OPTIONS_FILE" || missing+=("Recommendation")
+  grep -qi "Tradeoff" "$OPTIONS_FILE" || missing+=("Tradeoff")
+  grep -qi "Risk" "$OPTIONS_FILE" || missing+=("Risk")
+  grep -qi "Validation" "$OPTIONS_FILE" || missing+=("Validation")
+  grep -qi "Decision" "$OPTIONS_FILE" || missing+=("Decision")
 fi
 
 python3 - "$OPTIONS_FILE" "${missing[@]}" <<'PY'
