@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Regression: refactor-audit verifier must match the workflow's current
-# glm/kimi/codex/minimax lens roster, not the older glm/kimi/codex/opus shape.
+# Regression: refactor-audit verifier must match the durable
+# glm/kimi/codex/opus lens roster.
 set -uo pipefail
 
 MINI_ORK_ROOT="${MINI_ORK_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
@@ -25,7 +25,7 @@ write_lens() {
   done
 }
 
-for lens in glm kimi codex minimax; do
+for lens in glm kimi codex opus; do
   write_lens "$lens"
 done
 
@@ -33,7 +33,7 @@ cat > "$MINI_ORK_RUN_DIR/synthesis.md" <<'MD'
 # Refactor synthesis
 
 The synthesis cross-references lens-glm, lens-kimi, lens-codex, and
-lens-minimax findings before ranking the final recommendations.
+lens-opus findings before ranking the final recommendations.
 MD
 
 OUT="$(bash "$MINI_ORK_ROOT/recipes/refactor-audit/verifiers/lens-completeness.sh" 2>&1)"
@@ -46,18 +46,18 @@ fi
 
 VERDICT="$(printf '%s' "$OUT" | jq -r '.pass // false' 2>/dev/null || echo false)"
 if [ "$VERDICT" = "true" ]; then
-  _ok "lens-completeness accepts glm/kimi/codex/minimax roster"
+  _ok "lens-completeness accepts glm/kimi/codex/opus roster"
 else
   _fail "lens-completeness rejected current roster: $OUT"
 fi
 
-if printf '%s' "$OUT" | grep -q 'lens-opus'; then
-  _fail "verifier output still references stale lens-opus"
+if printf '%s' "$OUT" | grep -q 'lens-minimax'; then
+  _fail "verifier output still references stale lens-minimax"
 else
-  _ok "verifier output does not reference stale lens-opus"
+  _ok "verifier output does not reference stale lens-minimax"
 fi
 
 echo
-echo "── Results: ${PASS} OK  ${FAIL} FAIL ──"
+echo "-- Results: ${PASS} OK  ${FAIL} FAIL --"
 [ "$FAIL" -eq 0 ] || exit 1
 exit 0
