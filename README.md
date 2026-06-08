@@ -190,6 +190,7 @@ The framework ships the universal loop and its primitives. Nothing in `lib/` or 
 | Version registry | `lib/version_registry.sh` | promote / quarantine / rollback |
 | Group evolver | `lib/group_evolver.sh` | workflow candidate generation |
 | Experience memory | `lib/trace_store.sh` + `lib/gradient_extractor.sh` + `lib/pattern_store.sh` | store, extract, surface |
+| Recursive orchestration | `bin/mini-ork-spawn` + `lib/recursive_orchestration.sh` | bounded parent/child mini-ork delegation with lineage, events, and policy limits |
 
 ### RECIPES — opinions live here
 
@@ -202,6 +203,7 @@ Recipes are user-land workflow definitions. They compose framework primitives in
 | `docs` | `recipes/docs/` | Single-doc edit verified by grep-pattern assertions + relative-link integrity. No typecheck / test / rollback (docs edits are reversed via `git restore`). |
 | `refactor-audit` | `recipes/refactor-audit/` | 4 lens stances run in parallel (glm/kimi/codex/opus), with Opus preserved as the architectural-shape lens. The framework's own self-audit recipe. |
 | `research-synthesis` | `recipes/research-synthesis/` | 4-lens research synthesis (web/lit/code/narrative on distinct families) → synthesizer → publisher. |
+| `post-mvp-delivery` | `recipes/post-mvp-delivery/` | Discovery-first post-MVP product delivery: parallel product/architecture/integration/validation research → options for user choice → selected-option gate → implementation. |
 | `blog-post` | `recipes/blog-post/` | 5-lens blog drafting (editor / researcher / narrative / audience / counter) in parallel across distinct families. |
 | `db-migration` | `recipes/db-migration/` | 5-lens migration audit + plan: integrity / rollback / perf / compat / edge-data in parallel across distinct families. |
 | `ops-runbook` | `recipes/ops-runbook/` | 5-lens runbook generation: detection / containment / diagnosis / recovery / prevention across distinct families. |
@@ -246,10 +248,10 @@ See [docs/SAFETY.md](docs/SAFETY.md) for immutable constraints and the Promotion
 
 The full release log lives in [`ROADMAP.md`](ROADMAP.md) — every section dated and per-commit-attributed. Current shipped totals (regenerable via `mini-ork doctor`):
 
-- 6-stage universal loop (`classify → plan → execute → verify → reflect → improve`) + 4 extension entrypoints (`eval`, `improve`, `promote`, `topology`)
-- 40 framework primitives in `lib/` (incl. 6 oracle-hardening libs + `gate_bootstrap.sh` for the v0.3-rc1 central wire-up, added 2026-06-05)
-- 13 user-facing `bin/mini-ork*` entrypoints
-- 15 schema migrations under `db/migrations/` (memory namespaces, benchmarks, evolution, safety, panel topology telemetry)
+- 6-stage universal loop (`classify → plan → execute → verify → reflect → improve`) + 5 extension entrypoints (`eval`, `improve`, `promote`, `topology`, `spawn`)
+- 41 framework primitives in `lib/` (incl. 6 oracle-hardening libs + `gate_bootstrap.sh` for the v0.3-rc1 central wire-up, added 2026-06-05)
+- 14 user-facing `bin/mini-ork*` entrypoints
+- 16 schema migrations under `db/migrations/` (memory namespaces, benchmarks, evolution, safety, panel topology telemetry, recursive orchestration)
 - 9 recipes shipped — see Recipes table above
 - 7 model-family providers under `lib/providers/`
 

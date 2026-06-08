@@ -156,7 +156,9 @@ if [[ -f "$DB_INIT" ]]; then
   if bash "$DB_INIT" >/dev/null 2>&1; then
     _ok "state.db initialised via db/init.sh"
   else
-    _warn "db/init.sh exited non-zero — state.db may be incomplete"
+    echo "  [FAIL] db/init.sh exited non-zero — state.db was not initialized" >&2
+    echo "         Refusing to continue with an incomplete or unsafe mini-ork home." >&2
+    exit 1
   fi
 else
   _warn "db/init.sh not found — state.db not created (run after other agents land db/)"

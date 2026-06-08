@@ -9,6 +9,25 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Bounded recursive orchestration primitive: `mini-ork spawn` can approve and
+  execute child mini-ork runs under an isolated child workspace while recording
+  lineage, event-log, artifact-edge, and merge-decision tables.
+- Python facade support for recursive delegation via `SpawnRequest` and
+  `MiniOrk.spawn(...)`.
+- Recursive validation coverage: integration, security, e2e, and live Python
+  validation scenarios for parent -> child -> grandchild delegation without
+  Anthropic-family provider calls.
+
+### Verified
+
+- Full test pyramid: 60 files, 543 assertions, 0 failures.
+- Recursive focused tests: `test_bin_spawn.sh` 9 OK, recursive spawn security 3
+  OK, recursive e2e 6 OK.
+- Live recursive validation: `PYTHONPATH=. python3 tests/live/recursive_live_validation.py`
+  passed with root -> child -> grandchild lineage and 2 completed child events.
+
 ---
 
 ## [0.3.0-rc1] - 2026-06-08
