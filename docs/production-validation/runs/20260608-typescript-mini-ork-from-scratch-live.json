@@ -1,0 +1,107 @@
+{
+  "ok": false,
+  "preflight_ok": true,
+  "provider_presence": {
+    "MINIMAX_API_KEY": true,
+    "GLM_API_KEY": true,
+    "KIMI_API_KEY": true
+  },
+  "cli_presence": {
+    "codex": true,
+    "claude": true,
+    "node": true,
+    "npm": true,
+    "tsc": true
+  },
+  "project": "/var/folders/kc/1h62xjm128gb_x1n09c4v90m0000gn/T/mini-ork-ts-from-scratch-zq3u4jlw",
+  "home": "/var/folders/kc/1h62xjm128gb_x1n09c4v90m0000gn/T/mini-ork-ts-from-scratch-zq3u4jlw/.mini-ork",
+  "workspace_preserved": true,
+  "run_id": "live-ts-root",
+  "steps": {
+    "parent_run": {
+      "ok": false,
+      "returncode": 1,
+      "task_class": "code_fix",
+      "plan_path": "",
+      "output_tail": "task_class=code_fix\nworkflow_version=latest\nkickoff=/Volumes/docker-ssd/ps/mini-ork-recursive/docs/production-validation/kickoffs/typescript-mini-ork-from-scratch.md\nrun_id=live-ts-root\nprofile_path=/var/folders/kc/1h62xjm128gb_x1n09c4v90m0000gn/T/mini-ork-ts-from-scratch-zq3u4jlw/.mini-ork/runs/live-ts-root/run_profile.json\nprofile_status=ready\nprofile_confidence=0.90\nLLM dispatch failed for planner node\n"
+    },
+    "recursive_spawns": {
+      "architecture_child": {
+        "ok": false,
+        "status": "blocked_parent_failed"
+      },
+      "learning_grandchild": {
+        "ok": false,
+        "status": "blocked_parent_failed"
+      }
+    },
+    "generated_project_checks": {
+      "typecheck": {
+        "returncode": null,
+        "output": "blocked: parent planner failed"
+      },
+      "test": {
+        "returncode": null,
+        "output": "blocked: parent planner failed"
+      },
+      "cli": {
+        "returncode": null,
+        "output": "blocked: parent planner failed"
+      }
+    },
+    "learning_validation": {
+      "reflect": {
+        "returncode": null,
+        "output": "blocked: parent planner failed"
+      },
+      "improve": {
+        "returncode": null,
+        "output": "blocked: parent planner failed"
+      }
+    }
+  },
+  "artifacts": {
+    "package.json": false,
+    "tsconfig.json": false,
+    "src/types.ts": false,
+    "src/profile.ts": false,
+    "src/planner.ts": false,
+    "src/orchestrator.ts": false,
+    "src/learning.ts": false,
+    "src/cli.ts": false,
+    "tests/orchestrator.test.ts": false
+  },
+  "db": {
+    "task_runs": 1,
+    "execution_traces": 2,
+    "run_spawns": 0,
+    "gradient_records": 0,
+    "workflow_candidates": 0
+  },
+  "diagnostics": [
+    {
+      "path": ".mini-ork/runs/live-ts-root/llm-failures/1780929646-glm.err.log",
+      "bytes": "0",
+      "tail": ""
+    },
+    {
+      "path": ".mini-ork/runs/live-ts-root/llm-failures/1780929646-glm.shim.err",
+      "bytes": "0",
+      "tail": ""
+    },
+    {
+      "path": ".mini-ork/runs/live-ts-root/llm-failures/1780929646-glm.out",
+      "bytes": "828",
+      "tail": "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":true,\"api_error_status\":401,\"duration_ms\":200947,\"duration_api_ms\":0,\"num_turns\":1,\"result\":\"Failed to authenticate. API Error: 401 {\\\"error\\\":{\\\"message\\\":\\\"token expired or incorrect\\\",\\\"type\\\":\\\"401\\\"}}\",\"stop_reason\":\"stop_sequence\",\"session_id\":\"f8c01f6c-8086-46cb-ac17-5053cf7eb8f0\",\"total_cost_usd\":0,\"usage\":{\"input_tokens\":0,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":0,\"server_tool_use\":{\"web_search_requests\":0,\"web_fetch_requests\":0},\"service_tier\":\"standard\",\"cache_creation\":{\"ephemeral_1h_input_tokens\":0,\"ephemeral_5m_input_tokens\":0},\"inference_geo\":\"\",\"iterations\":[],\"speed\":\"standard\"},\"modelUsage\":{},\"permission_denials\":[],\"terminal_reason\":\"completed\",\"fast_mode_state\":\"off\",\"uuid\":\"48b9766c-9fcb-4e7e-ba23-154fd128826a\"}\n"
+    },
+    {
+      "path": ".mini-ork/runs/live-ts-root/run_profile.json",
+      "bytes": "2085",
+      "tail": "{\n  \"artifact_destination\": [],\n  \"budget_cap_usd\": null,\n  \"confidence\": 0.9,\n  \"human_questions\": [],\n  \"kickoff_path\": \"/Volumes/docker-ssd/ps/mini-ork-recursive/docs/production-validation/kickoffs/typescript-mini-ork-from-scratch.md\",\n  \"profile_status\": \"ready\",\n  \"provider_policy\": {\n    \"env\": {\n      \"MINI_ORK_PROVIDER_POLICY\": \"/private/var/folders/kc/1h62xjm128gb_x1n09c4v90m0000gn/T/mini-ork-ts-from-scratch-zq3u4jlw/.mini-ork/config/agents.yaml\"\n    },\n    \"lanes\": {\n      \"codex_lens\": \"codex\",\n      \"glm_lens\": \"glm\",\n      \"implementer\": \"codex\",\n      \"kimi_lens\": \"kimi\",\n      \"minimax_lens\": \"minimax\",\n      \"planner\": \"glm\",\n      \"publisher\": \"codex\",\n      \"reflector\": \"glm\",\n      \"researcher\": \"kimi\",\n      \"reviewer\": \"minimax\",\n      \"rollback\": \"glm\",\n      \"verifier\": \"glm\",\n      \"worker\": \"codex\"\n    },\n    \"source\": \"/private/var/folders/kc/1h62xjm128gb_x1n09c4v90m0000gn/T/mini-ork-ts-from-scratch-zq3u4jlw/.mini-ork/config/agents.yaml\"\n  },\n  \"recipe\": \"code-fix\",\n  \"risk_tolerance\": \"standard\",\n  \"schema_version\": \"1.0\",\n  \"scope_allow\": [\n    \"Only create or modify files in the generated blank project. Do not edit the\",\n    \"mini-ork repository itself from inside the generated project run.\"\n  ],\n  \"scope_deny\": [],\n  \"success_criteria\": [\n    \"The TypeScript project is created from this markdown spec alone.\",\n    \"`package.json` and all required source/test files exist.\",\n    \"TypeScript typecheck passes.\",\n    \"Tests pass.\",\n    \"The generated CLI can run an example kickoff and emit final JSON.\",\n    \"Recursive child spawning is tested.\",\n    \"Learning signal extraction is tested.\",\n    \"The parent mini-ork run records execution traces.\",\n    \"A reflection step runs after the build and stores at least one learning\",\n    \"artifact or reports an explicit learning blocker.\"\n  ],\n  \"target_repo\": \"/private/var/folders/kc/1h62xjm128gb_x1n09c4v90m0000gn/T/mini-ork-ts-from-scratch-zq3u4jlw\",\n  \"task_class\": \"code_fix\",\n  \"user_goal\": \"Build a TypeScript Mini-Ork From Scratch\",\n  \"verification_command\": [\n    \"npm test\"\n  ]\n}\n"
+    }
+  ],
+  "blockers": [
+    "parent planner dispatch failed; recursive generation not attempted"
+  ],
+  "markdown_report_path": "/Volumes/docker-ssd/ps/mini-ork-recursive/docs/production-validation/runs/20260608-typescript-mini-ork-from-scratch-live.md"
+}
