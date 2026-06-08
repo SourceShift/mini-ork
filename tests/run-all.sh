@@ -3,8 +3,8 @@
 #
 # Layers (run in order, fast → slow):
 #   1. tests/smoke.sh           — dependency + DB-init + syntax + shellcheck pass
-#   2. tests/unit/test_*.sh     — per-lib primitive coverage (13 libs)
-#   3. tests/integration/*.sh   — per-bin end-to-end with isolated tmp project (9 bins + dispatcher)
+#   2. tests/unit/test_*.sh     — per-lib primitive coverage
+#   3. tests/integration/*.sh   — per-bin end-to-end with isolated tmp project
 #   4. tests/e2e/*.sh           — self-improvement cycle (trace→gradient→pattern→candidate→benchmark→promote→rollback)
 #   5. tests/security/*.sh      — injection / traversal / symlink / oversized-input / perms / supply-chain
 #

@@ -64,6 +64,44 @@ run if the project is not initialized. That can update `.gitignore`, matching
 the CLI `mini-ork init` behavior. Set `auto_init=False` when an embedding
 application wants to manage initialization itself.
 
+## Recursive Delegation API
+
+```python
+from pathlib import Path
+
+from mini_ork import MiniOrk, SpawnRequest
+
+client = MiniOrk()
+
+child = client.spawn(
+    SpawnRequest(
+        parent_run_id="run-root-123",
+        kickoff=Path("child-task.md"),
+        recipe="code-fix",
+        child_run_id="run-child-001",
+        allow_child_spawn=True,
+        mode="dry-run",
+    )
+)
+
+print(child.ok)
+print(child.spawn_id)
+print(child.child_workspace)
+print(child.spawn_status)
+```
+
+`SpawnRequest` is intentionally parent-centric. The caller must name the parent
+run, and mini-ork applies recursive limits before a child is approved:
+
+- `MINI_ORK_RECURSIVE_MAX_DEPTH` default `2`
+- `MINI_ORK_RECURSIVE_MAX_CHILDREN` default `4`
+- `MINI_ORK_RECURSIVE_MAX_DESCENDANTS` default `16`
+- `MINI_ORK_RECURSIVE_MAX_PARALLEL` default `4`
+
+Children run under `.mini-ork/runs/<parent>/children/<child>/worktree/` and
+share the parent's state database for lineage/event records. The parent remains
+responsible for merge and publish decisions.
+
 ## Extension API
 
 ```python
@@ -103,6 +141,8 @@ Python integrations should expose:
 - `RunResult.retained_home`: `.mini-ork` state/evidence directory.
 - `RunResult.init_ran` and `RunResult.init_output`: whether bootstrap happened
   and the exact init transcript.
+- `SpawnResult.spawn_id`, `SpawnResult.child_run_id`, and
+  `SpawnResult.child_workspace`: recursive lineage and workspace evidence.
 - Provider policy files written under `.mini-ork/config/agents.yaml`.
 
 This mirrors mini-ork's operational model: plans, verifier evidence, gates,
