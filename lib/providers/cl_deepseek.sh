@@ -12,7 +12,7 @@
 # See lib/providers/README.md for the secrets.local.sh pattern.
 
 export ANTHROPIC_BASE_URL=https://api.deepseek.com/anthropic
-export ANTHROPIC_AUTH_TOKEN="${DEEPSEEK_API_KEY:?DEEPSEEK_API_KEY is required — set it in \${MINI_ORK_HOME}/config/secrets.local.sh}"
+export ANTHROPIC_AUTH_TOKEN="${DEEPSEEK_API_KEY:?DEEPSEEK_API_KEY is required - set it in MINI_ORK_HOME/config/secrets.local.sh}"
 export ANTHROPIC_MODEL='deepseek-v4-pro[1m]'
 export ANTHROPIC_DEFAULT_OPUS_MODEL='deepseek-v4-pro[1m]'
 export ANTHROPIC_DEFAULT_SONNET_MODEL='deepseek-v4-pro[1m]'

@@ -8,7 +8,7 @@ import subprocess
 from pathlib import Path
 from typing import Iterable
 
-from .types import ProviderPolicy, RunEvent, RunRequest, RunResult
+from .types import ProviderPolicy, RunEvent, RunRequest, RunResult, SpawnRequest, SpawnResult
 
 
 class MiniOrkError(RuntimeError):
@@ -132,6 +132,62 @@ class MiniOrk:
         result = self.run(request)
         yield from result.events
 
+    def spawn(self, request: SpawnRequest) -> SpawnResult:
+        cwd = Path(request.cwd or Path.cwd()).resolve()
+        kickoff = Path(request.kickoff)
+        if not kickoff.is_absolute():
+            kickoff = (cwd / kickoff).resolve()
+        if not kickoff.exists():
+            raise MiniOrkError(f"kickoff not found: {kickoff}")
+
+        command = [
+            str(self.root / "bin" / "mini-ork"),
+            "spawn",
+            "--parent-run",
+            request.parent_run_id,
+            "--kickoff",
+            str(kickoff),
+            "--authority",
+            f"{request.authority_level:.3f}",
+        ]
+        if request.recipe:
+            command.extend(["--recipe", request.recipe])
+        if request.child_run_id:
+            command.extend(["--child-run", request.child_run_id])
+        if request.depth is not None:
+            command.extend(["--depth", str(request.depth)])
+        if request.allow_child_spawn:
+            command.append("--allow-child-spawn")
+        if not request.execute:
+            command.append("--no-execute")
+
+        env = self._base_env(cwd)
+        env["MINI_ORK_DRY_RUN"] = "1" if request.mode == "dry-run" else "0"
+        env.update(request.extra_env)
+
+        if request.auto_init and not self._is_initialized(Path(env["MINI_ORK_HOME"])):
+            init_command = [str(self.root / "bin" / "mini-ork"), "init"]
+            subprocess.run(
+                init_command,
+                cwd=cwd,
+                env=env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                timeout=request.timeout_seconds,
+            )
+
+        completed = subprocess.run(
+            command,
+            cwd=cwd,
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=request.timeout_seconds,
+        )
+        return self._spawn_result(command, cwd, completed.returncode, completed.stdout)
+
     def _env(self, cwd: Path, request: RunRequest) -> dict[str, str]:
         env = self._base_env(cwd)
         env["MINI_ORK_DRY_RUN"] = "1" if request.mode == "dry-run" else "0"
@@ -177,6 +233,30 @@ class MiniOrk:
             retained_home=home,
             init_ran=init_ran,
             init_output=init_output,
+        )
+
+    def _spawn_result(
+        self,
+        command: list[str],
+        cwd: Path,
+        returncode: int,
+        output: str,
+    ) -> SpawnResult:
+        events = tuple(RunEvent(line=line) for line in output.splitlines())
+        workspace_raw = _last_value(output, "child_workspace=")
+        kickoff_raw = _last_value(output, "child_kickoff=")
+        return SpawnResult(
+            returncode=returncode,
+            command=tuple(command),
+            cwd=cwd,
+            output=output,
+            events=events,
+            parent_run_id=_last_value(output, "parent_run_id="),
+            child_run_id=_last_value(output, "child_run_id="),
+            spawn_id=_last_value(output, "spawn_id="),
+            child_workspace=Path(workspace_raw) if workspace_raw else None,
+            child_kickoff=Path(kickoff_raw) if kickoff_raw else None,
+            spawn_status=_last_value(output, "spawn_status="),
         )
 
 
