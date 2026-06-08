@@ -23,6 +23,11 @@ mkdir -p "$DB_DIR"
 
 echo "[mini-ork init] DB: $DB"
 
+if [ -L "$DB" ]; then
+  echo "[mini-ork init] ERROR: state DB path is a symlink; refusing to initialize: $DB" >&2
+  exit 1
+fi
+
 # v0.2-pt7 (closes audit F-10/F-11/R1):
 # Enable WAL journaling at init time. WAL is a PERSISTENT pragma
 # (stored in the DB file header), so all subsequent opens inherit it

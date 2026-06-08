@@ -203,6 +203,7 @@ Recipes are user-land workflow definitions. They compose framework primitives in
 | `docs` | `recipes/docs/` | Single-doc edit verified by grep-pattern assertions + relative-link integrity. No typecheck / test / rollback (docs edits are reversed via `git restore`). |
 | `refactor-audit` | `recipes/refactor-audit/` | 4 lens stances run in parallel (glm/kimi/codex/opus), with Opus preserved as the architectural-shape lens. The framework's own self-audit recipe. |
 | `research-synthesis` | `recipes/research-synthesis/` | 4-lens research synthesis (web/lit/code/narrative on distinct families) → synthesizer → publisher. |
+| `post-mvp-delivery` | `recipes/post-mvp-delivery/` | Discovery-first post-MVP product delivery: parallel product/architecture/integration/validation research → options for user choice → selected-option gate → implementation. |
 | `blog-post` | `recipes/blog-post/` | 5-lens blog drafting (editor / researcher / narrative / audience / counter) in parallel across distinct families. |
 | `db-migration` | `recipes/db-migration/` | 5-lens migration audit + plan: integrity / rollback / perf / compat / edge-data in parallel across distinct families. |
 | `ops-runbook` | `recipes/ops-runbook/` | 5-lens runbook generation: detection / containment / diagnosis / recovery / prevention across distinct families. |
