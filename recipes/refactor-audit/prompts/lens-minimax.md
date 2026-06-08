@@ -43,4 +43,4 @@ A 1500-2500 word architectural-shape document covering:
 - Cite the framework's own docs (`docs/ARCHITECTURE.md`,
   `docs/SAFETY.md`) at every architectural pivot
 
-Save your output to: `${MINI_ORK_RUN_DIR}/lens-opus.md`.
+Save your output to: `${MINI_ORK_RUN_DIR}/lens-minimax.md`.
