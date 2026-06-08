@@ -1,0 +1,43 @@
+# Lane policy override for the recursive-self-improve recipe.
+#
+# Copy or symlink to $MINI_ORK_HOME/config/agents.yaml before running
+# bin/mini-ork-self-improve. The outer runner stages this automatically
+# under $MINI_ORK_RUN_DIR/.mini-ork/config/agents.yaml when MINI_ORK_HOME
+# points at the run-specific home.
+#
+# Diversity rationale: synthesizer is Opus (Anthropic). Researchers run on
+# MiniMax (perf), Moonshot Kimi (correctness), and OpenAI Codex (arch + arxiv).
+# Avoid GLM here because (a) the default `reviewer` lane already maps to opus
+# and (b) GLM as a research voter on patches that may later add Anthropic
+# adapters introduces a subtle conflict-of-interest under the same provider
+# family clustering.
+
+lanes:
+  # Canonical loop-role lanes.
+  planner: codex
+  researcher: codex          # bottleneck-scan fallback if model_lane unset
+  implementer: codex
+  worker: codex
+  reviewer: opus             # opus_synthesizer routes through here when
+                             # workflow.yaml uses model_lane: reviewer; we
+                             # use opus_lens explicitly for clarity instead.
+  verifier: codex
+  reflector: codex
+  publisher: codex
+  rollback: codex
+  brain: opus
+
+  # Heterogeneous-family lens lanes (must match workflow.yaml node.model_lane).
+  minimax_lens: minimax      # perf lens — MiniMax-M3
+  kimi_lens: kimi            # correctness lens — Moonshot Kimi
+  codex_lens: codex          # arch + arxiv lens — OpenAI Codex wrapper
+  opus_lens: opus            # synthesizer + final patch reviewer — Anthropic Opus
+
+budget:
+  # Per-iteration cap. Outer runner enforces wall-clock; this is the dollar
+  # guard. Tuned for one full 6-lens iteration (~30 min, mostly Opus synth).
+  per_run_usd: 6.00
+  # Per-epic / per-outer-loop cap. Set ~5h worth of iterations.
+  per_epic_usd: 50.00
+  # Daily hard cap. Outer runner refuses to start a new iteration once hit.
+  daily_cap_usd: 60.00
