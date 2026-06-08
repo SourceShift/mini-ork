@@ -42,7 +42,10 @@ Emit a single JSON object on stdout. No prose before or after the JSON.
   "risk_notes": [
     "<any cross-doc reference that may rot if the edit moves an anchor>"
   ],
-  "artifact_contract": "ref provided",
+  "artifact_contract": {
+    "outputs": ["<path/to/doc.md>"],
+    "success_verifiers": []
+  },
   "verifier_contract": {
     "checks": [
       {
@@ -71,18 +74,22 @@ Emit a single JSON object on stdout. No prose before or after the JSON.
    doc_editor node (which is `type: implementer` per
    `recipes/docs/workflow.yaml`), so `node_type: "implementer"` is
    correct for every step.
-2. **A plan is not complete until `success_check` is defined** AND the
+2. **`artifact_contract` MUST be an object** with `outputs[]` naming every
+   doc file the plan expects to modify. Use an empty `success_verifiers[]`
+   array when the recipe's verifier nodes are fully described by
+   `verifier_contract.checks`.
+3. **A plan is not complete until `success_check` is defined** AND the
    `verifier_contract.checks` array contains at least one grep assertion
    AND at least one link_integrity assertion (or an explicit
    `link_integrity_skip: <reason>` field if the doc has no relative links).
-3. **Respect `constraints`.** Plan steps that would edit files outside
+4. **Respect `constraints`.** Plan steps that would edit files outside
    the named scope are invalid — remove them and explain in `risk_notes`.
-4. **Cite the grep pattern from the kickoff's success criteria.** If the
+5. **Cite the grep pattern from the kickoff's success criteria.** If the
    kickoff says `grep -c "deterministic oracle" docs/foo.md returns ≥ 1`,
    the plan's verifier_contract should encode that as
    `{kind: "grep", file: "docs/foo.md", pattern: "deterministic oracle",
    min_count: 1}` verbatim — no paraphrasing.
-5. **Plans must be at most 5 steps.** If you need more, the task is not a
+6. **Plans must be at most 5 steps.** If you need more, the task is not a
    `docs` edit — escalate to `mini-ork deliver`.
 
 ## What you are NOT allowed to do
@@ -91,3 +98,7 @@ Emit a single JSON object on stdout. No prose before or after the JSON.
 - Invent file paths not in `task_brief` or `relevant_files`.
 - Skip the `success_check` field.
 - Omit the `verifier_contract.checks` array (planner WILL be rejected).
+
+--- task_brief ---
+
+{{KICKOFF_CONTENT}}
