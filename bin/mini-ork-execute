@@ -7,7 +7,7 @@
 #   researcher   → recipe's researcher prompt via context_assemble
 #   implementer  → recipe's implementer prompt; tracks files_written
 #   reviewer     → recipe's reviewer prompt; parses verdict
-#   verifier     → runs each verifier from artifact_contract.success_verifiers[]
+#   verifier     → runs workflow verifier_ref or artifact_contract success verifiers
 #   reflector    → invokes reflection_pipeline
 #   publisher    → calls lib/auto-merge.sh
 #   rollback     → calls lib/version_registry.sh:version_registry rollback
@@ -134,6 +134,9 @@ if [ -n "${WORKFLOW:-}" ] && [ -f "${WORKFLOW:-}" ]; then
   # marked `dispatch_mode: parallel` concurrently (was: all nodes ran
   # under single global DISPATCH_MODE, so workflow-yaml-marked-parallel
   # nodes ran serially anyway — 4 lens took 15min instead of 5min).
+  # D-053: emit verifier_ref as 6th field so verifier workflow nodes run
+  # their declared deterministic scripts instead of relying on the plan to
+  # duplicate workflow wiring in artifact_contract.success_verifiers[].
   mapfile -t NODE_IDS < <(python3 - "$WORKFLOW" <<'PY'
 import sys, yaml
 with open(sys.argv[1]) as f:
@@ -144,12 +147,14 @@ for n in wf.get("nodes", []) or []:
     desc = n.get("description", "") or name
     pref = n.get("prompt_ref", "") or ""
     dmode = n.get("dispatch_mode", "") or "serial"
+    vref = n.get("verifier_ref", "") or ""
     if not name or not typ:
         continue
     # Strip any tabs from user fields (separator collision)
     desc = desc.replace("\t", " ")
     pref = pref.replace("\t", " ")
-    print(f"{name}\t{typ}\t{desc}\t{pref}\t{dmode}")
+    vref = vref.replace("\t", " ")
+    print(f"{name}\t{typ}\t{desc}\t{pref}\t{dmode}\t{vref}")
 PY
   )
 else
@@ -164,7 +169,7 @@ for step in p.get("decomposition", []):
     if not nid or not ntyp:
         continue
     desc = (step.get('description','') or '').replace("\t"," ")
-    print(f"{nid}\t{ntyp}\t{desc}\t\tserial")
+    print(f"{nid}\t{ntyp}\t{desc}\t\tserial\t")
 PY
   )
 fi
@@ -330,7 +335,7 @@ finally:
 }
 
 _dispatch_node() {
-  local node_id="$1" node_type="$2" node_desc="$3" node_prompt_ref="${4:-}"
+  local node_id="$1" node_type="$2" node_desc="$3" node_prompt_ref="${4:-}" node_verifier_ref="${5:-}"
 
   if [ -n "$FILTER_NODE_TYPE" ] && [ "$node_type" != "$FILTER_NODE_TYPE" ]; then
     return 0
@@ -507,17 +512,52 @@ _dispatch_node() {
 
     verifier)
       # Delegate to mini-ork-verify for the artifact_contract
-      ARTIFACT_PATH=$(python3 -c "
-import sys, json
+      if [ -z "$node_verifier_ref" ] && [ -n "${WORKFLOW:-}" ] && [ -f "$WORKFLOW" ]; then
+        node_verifier_ref=$(python3 - "$WORKFLOW" "$node_id" <<'PY'
+import sys, yaml
+with open(sys.argv[1]) as f:
+    wf = yaml.safe_load(f) or {}
+for n in wf.get("nodes", []) or []:
+    if n.get("name") == sys.argv[2]:
+        print(n.get("verifier_ref", "") or "")
+        break
+PY
+        )
+      fi
+      ARTIFACT_PATH=$(python3 - "$PLAN_PATH" 2>/dev/null <<'PY' || echo ""
+import json, sys
 with open(sys.argv[1]) as f:
     p = json.load(f)
-outputs = p.get('artifact_contract', {}).get('outputs', [])
-print(outputs[0] if outputs else '')
-" "$PLAN_PATH" 2>/dev/null || echo "")
+artifact_contract = p.get("artifact_contract", {})
+if not isinstance(artifact_contract, dict):
+    artifact_contract = {}
+outputs = artifact_contract.get("outputs", []) or []
+print(outputs[0] if outputs else "")
+PY
+      )
       if [ -n "$ARTIFACT_PATH" ]; then
-        "$MINI_ORK_ROOT/bin/mini-ork-verify" "$ARTIFACT_PATH" || {
-          echo "  [fail] verifier node failed for $ARTIFACT_PATH" >&2; return 1
-        }
+        if [ -n "$node_verifier_ref" ] && [ -n "$RECIPE_DIR" ]; then
+          local _verifier_script="$RECIPE_DIR/$node_verifier_ref"
+          if [ ! -f "$_verifier_script" ]; then
+            echo "  [fail] verifier_ref not found: $node_verifier_ref" >&2
+            return 1
+          fi
+          local _evidence_dir="$MINI_ORK_HOME/runs/evidence"
+          mkdir -p "$_evidence_dir"
+          local _vstem="${node_verifier_ref#verifiers/}"
+          _vstem="${_vstem%.sh}"
+          local _evidence_path="$_evidence_dir/${_vstem}-$(date +%s).log"
+          if MINI_ORK_PLAN_PATH="$PLAN_PATH" ARTIFACT_PATH="$ARTIFACT_PATH" bash "$_verifier_script" > "$_evidence_path" 2>&1; then
+            echo "  [ok] verifier_ref $node_verifier_ref passed → $_evidence_path"
+          else
+            echo "  [fail] verifier_ref $node_verifier_ref failed → $_evidence_path" >&2
+            return 1
+          fi
+        else
+          "$MINI_ORK_ROOT/bin/mini-ork-verify" --plan "$PLAN_PATH" --task-class "$TASK_CLASS" "$ARTIFACT_PATH" || {
+            echo "  [fail] verifier node failed for $ARTIFACT_PATH" >&2; return 1
+          }
+        fi
       else
         echo "  [warn] verifier node: no outputs in artifact_contract"
       fi
@@ -770,9 +810,9 @@ case "$DISPATCH_MODE" in
     # Global override → all in parallel (legacy behavior)
     PIDS=()
     for entry in "${NODE_IDS[@]}"; do
-      IFS=$'\t' read -r node_id node_type node_desc node_prompt_ref node_dmode <<< "$entry"
+      IFS=$'\t' read -r node_id node_type node_desc node_prompt_ref node_dmode node_verifier_ref <<< "$entry"
       _maybe_flush_batch_at_cap PIDS
-      ( _dispatch_node "$node_id" "$node_type" "$node_desc" "$node_prompt_ref" ) &
+      ( _dispatch_node "$node_id" "$node_type" "$node_desc" "$node_prompt_ref" "$node_verifier_ref" ) &
       PIDS+=($!)
     done
     _flush_parallel_batch PIDS
@@ -781,7 +821,7 @@ case "$DISPATCH_MODE" in
     # Group by node_type; run groups serially, nodes within group in parallel
     declare -A TYPE_GROUPS
     for entry in "${NODE_IDS[@]}"; do
-      IFS=$'\t' read -r node_id node_type node_desc node_prompt_ref node_dmode <<< "$entry"
+      IFS=$'\t' read -r node_id node_type node_desc node_prompt_ref node_dmode node_verifier_ref <<< "$entry"
       TYPE_GROUPS[$node_type]+="${entry}"$'\n'
     done
     for node_type in planner researcher implementer reviewer verifier reflector publisher rollback; do
@@ -789,8 +829,8 @@ case "$DISPATCH_MODE" in
       PIDS=()
       while IFS= read -r e; do
         [ -z "$e" ] && continue
-        IFS=$'\t' read -r nid nt nd npr ndm <<< "$e"
-        ( _dispatch_node "$nid" "$nt" "$nd" "$npr" ) &
+        IFS=$'\t' read -r nid nt nd npr ndm nvr <<< "$e"
+        ( _dispatch_node "$nid" "$nt" "$nd" "$npr" "$nvr" ) &
         PIDS+=($!)
       done <<< "${TYPE_GROUPS[$node_type]}"
       _flush_parallel_batch PIDS
@@ -799,9 +839,9 @@ case "$DISPATCH_MODE" in
   speculative)
     PIDS=()
     for entry in "${NODE_IDS[@]}"; do
-      IFS=$'\t' read -r node_id node_type node_desc node_prompt_ref node_dmode <<< "$entry"
+      IFS=$'\t' read -r node_id node_type node_desc node_prompt_ref node_dmode node_verifier_ref <<< "$entry"
       _maybe_flush_batch_at_cap PIDS
-      ( _dispatch_node "$node_id" "$node_type" "$node_desc" "$node_prompt_ref" ) &
+      ( _dispatch_node "$node_id" "$node_type" "$node_desc" "$node_prompt_ref" "$node_verifier_ref" ) &
       PIDS+=($!)
     done
     for pid in "${PIDS[@]}"; do
@@ -814,16 +854,16 @@ case "$DISPATCH_MODE" in
     # any `serial` node, then run that serial node alone.
     PIDS=()
     for entry in "${NODE_IDS[@]}"; do
-      IFS=$'\t' read -r node_id node_type node_desc node_prompt_ref node_dmode <<< "$entry"
+      IFS=$'\t' read -r node_id node_type node_desc node_prompt_ref node_dmode node_verifier_ref <<< "$entry"
       case "${node_dmode:-serial}" in
         parallel)
-          ( _dispatch_node "$node_id" "$node_type" "$node_desc" "$node_prompt_ref" ) &
+          ( _dispatch_node "$node_id" "$node_type" "$node_desc" "$node_prompt_ref" "$node_verifier_ref" ) &
           PIDS+=($!)
           ;;
         *)
           # Flush any pending parallel batch first
           [ "${#PIDS[@]}" -gt 0 ] && _flush_parallel_batch PIDS
-          _dispatch_node "$node_id" "$node_type" "$node_desc" "$node_prompt_ref" || FAIL_COUNT=$((FAIL_COUNT+1))
+          _dispatch_node "$node_id" "$node_type" "$node_desc" "$node_prompt_ref" "$node_verifier_ref" || FAIL_COUNT=$((FAIL_COUNT+1))
           ;;
       esac
     done

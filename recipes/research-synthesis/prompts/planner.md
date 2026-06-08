@@ -74,5 +74,8 @@ Respond with **ONLY ONE top-level JSON object**, nothing else:
 
 ## Topic context
 
-The kickoff is in `${KICKOFF_PATH}` (relative to `${MINI_ORK_ROOT}`).
-Read it, then emit your plan.
+The kickoff content is below. Read it, then emit your plan.
+
+--- kickoff brief ---
+
+{{KICKOFF_CONTENT}}

@@ -78,5 +78,21 @@ else
 fi
 
 echo ""
+echo "── d-052: recipe planner prompts receive kickoff content ──"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+MISSING=""
+while IFS= read -r prompt_file; do
+  if ! grep -q '{{KICKOFF_CONTENT}}' "$prompt_file"; then
+    MISSING="${MISSING}${prompt_file#$ROOT/} "
+  fi
+done < <(find "$ROOT/recipes" -path '*/prompts/planner.md' -type f | sort)
+
+if [ -z "$MISSING" ]; then
+  _ok "all recipe planner prompts include {{KICKOFF_CONTENT}}"
+else
+  _fail "planner prompts missing kickoff substitution: $MISSING"
+fi
+
+echo ""
 echo "── Results: ${PASS} OK  ${FAIL} FAIL ──"
 [ "$FAIL" -eq 0 ] || exit 1

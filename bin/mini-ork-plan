@@ -209,7 +209,7 @@ con.commit(); con.close()
   exit 1
 }
 
-# D-011 + D-016: extract the FIRST top-level balanced JSON object.
+# D-011 + D-016 + D-052: extract the first valid non-template plan JSON object.
 #
 # D-011 (markdown fences): planner LLMs wrap output in ```json ... ``` despite
 #   explicit 'no markdown fences' instruction.
@@ -218,46 +218,82 @@ con.commit(); con.close()
 #   the spawned session inherits that instruction and emits z-insight AFTER
 #   the requested JSON — confirmed via D-015 forensics on DF5 run-1780214621.
 #
-# A naive `re.search(r'\{.*\}', flags=re.S)` is GREEDY across BOTH objects →
-# concatenates plan-json + z-insight-json into invalid combined blob.
-# Balanced-brace parser finds the FIRST top-level object only.
+# A naive `re.search(r'\{.*\}', flags=re.S)` is GREEDY across BOTH objects.
+# Older code picked the first balanced object, but Codex CLI transcripts can
+# include the prompt schema before the assistant answer. Select the first object
+# that parses as a plan and does not contain placeholder template strings.
 PLAN_JSON=$(printf '%s' "$PLAN_JSON_RAW" | python3 -c "
-import sys
+import json, sys
 txt = sys.stdin.read()
 
-# Skip ahead to the first { (drop any leading prose / markdown fences)
-i = txt.find('{')
-if i < 0:
-    sys.stdout.write(txt)  # no JSON-like content; let downstream parser fail
-    sys.exit(0)
+def objects(s):
+    i = 0
+    while True:
+        start = s.find('{', i)
+        if start < 0:
+            return
+        depth = 0
+        in_str = False
+        esc = False
+        for j in range(start, len(s)):
+            c = s[j]
+            if in_str:
+                if esc:
+                    esc = False
+                elif c == '\\\\':
+                    esc = True
+                elif c == '\"':
+                    in_str = False
+                continue
+            if c == '\"':
+                in_str = True
+            elif c == '{':
+                depth += 1
+            elif c == '}':
+                depth -= 1
+                if depth == 0:
+                    yield s[start:j+1]
+                    i = j + 1
+                    break
+        else:
+            return
 
-# Walk balanced braces with string-literal awareness (so {} inside strings
-# don't throw the depth count off).
-depth = 0
-in_str = False
-esc = False
-end = -1
-for j in range(i, len(txt)):
-    c = txt[j]
-    if in_str:
-        if esc:
-            esc = False
-        elif c == '\\\\':
-            esc = True
-        elif c == '\"':
-            in_str = False
+def contains_placeholder(v):
+    if isinstance(v, str):
+        stripped = v.strip()
+        return stripped.startswith('<') and stripped.endswith('>')
+    if isinstance(v, list):
+        return any(contains_placeholder(x) for x in v)
+    if isinstance(v, dict):
+        return any(contains_placeholder(x) for x in v.values())
+    return False
+
+def is_plan(obj):
+    if not isinstance(obj, dict):
+        return False
+    if not isinstance(obj.get('verifier_contract'), dict):
+        return False
+    if not obj.get('verifier_contract', {}).get('checks'):
+        return False
+    if contains_placeholder(obj):
+        return False
+    return any(k in obj for k in ('objective', 'decomposition', 'artifact_contract'))
+
+first = None
+for chunk in objects(txt):
+    if first is None:
+        first = chunk
+    try:
+        parsed = json.loads(chunk)
+    except Exception:
         continue
-    if c == '\"':
-        in_str = True
-    elif c == '{':
-        depth += 1
-    elif c == '}':
-        depth -= 1
-        if depth == 0:
-            end = j
-            break
+    if is_plan(parsed):
+        sys.stdout.write(json.dumps(parsed, indent=2))
+        sys.exit(0)
 
-sys.stdout.write(txt[i:end+1] if end > 0 else txt[i:])
+# Preserve legacy failure behavior: pass a JSON-ish object through if one exists,
+# otherwise pass the raw text so the validation block reports parse_error.
+sys.stdout.write(first if first is not None else txt)
 ")
 
 # D-012: charge cost-of-call NOW (after LLM returned, before validation).
@@ -284,6 +320,20 @@ try:
     checks = vc.get('checks', [])
     if not checks:
         print('missing_verifier_contract'); sys.exit(0)
+    def contains_placeholder(v):
+        if isinstance(v, str):
+            s = v.strip()
+            return s.startswith('<') and s.endswith('>')
+        if isinstance(v, list):
+            return any(contains_placeholder(x) for x in v)
+        if isinstance(v, dict):
+            return any(contains_placeholder(x) for x in v.values())
+        return False
+    if contains_placeholder(p):
+        print('placeholder_plan'); sys.exit(0)
+    ac = p.get('artifact_contract', {})
+    if not isinstance(ac, dict):
+        print('bad_artifact_contract'); sys.exit(0)
     # D-008b: every decomposition step must have a non-empty, valid node_type
     bad_steps = []
     for i, step in enumerate(p.get('decomposition', []) or []):
@@ -320,6 +370,21 @@ if [ "$HAS_VERIFIER" = "missing_verifier_contract" ]; then
   echo "A plan is not complete until success-check is defined." >&2
   _d015_preserve_raw "missing_verifier_contract"
   trace_write "{\"trace_id\":\"$TRACE_ID\",\"task_class\":\"${TASK_CLASS}\",\"status\":\"failure\",\"reviewer_verdict\":\"missing_verifier_contract\"}" >/dev/null 2>&1 || true
+  exit 1
+fi
+
+if [ "$HAS_VERIFIER" = "placeholder_plan" ]; then
+  echo "PLAN REJECTED: planner emitted a template plan with placeholder values." >&2
+  echo "The selected plan must name real files, sections, actions, and verifier checks." >&2
+  _d015_preserve_raw "placeholder_plan"
+  trace_write "{\"trace_id\":\"$TRACE_ID\",\"task_class\":\"${TASK_CLASS}\",\"status\":\"failure\",\"reviewer_verdict\":\"placeholder_plan\"}" >/dev/null 2>&1 || true
+  exit 1
+fi
+
+if [ "$HAS_VERIFIER" = "bad_artifact_contract" ]; then
+  echo "PLAN REJECTED: artifact_contract must be an object." >&2
+  _d015_preserve_raw "bad_artifact_contract"
+  trace_write "{\"trace_id\":\"$TRACE_ID\",\"task_class\":\"${TASK_CLASS}\",\"status\":\"failure\",\"reviewer_verdict\":\"bad_artifact_contract\"}" >/dev/null 2>&1 || true
   exit 1
 fi
 

@@ -29,26 +29,26 @@ classification and planning.
 Safe smoke of the production lane:
 
 ```bash
-MO_PROD_SCENARIO_MODE=dry-run scripts/run-production-scenarios.sh
+python3 scripts/run_production_scenarios.py --mode dry-run
 ```
 
 Live production validation, once provider policy allows every lane required by
 the selected recipes:
 
 ```bash
-MO_PROD_SCENARIO_MODE=live scripts/run-production-scenarios.sh
+python3 scripts/run_production_scenarios.py --mode live
 ```
 
 Run one scenario:
 
 ```bash
-MO_PROD_SCENARIO_MODE=dry-run scripts/run-production-scenarios.sh refactor-audit
+python3 scripts/run_production_scenarios.py --mode dry-run refactor-audit
 ```
 
 Validate the `.md`-only dispatcher path:
 
 ```bash
-MO_PROD_SCENARIO_MODE=dry-run scripts/run-production-scenarios.sh --md-only code-fix
+python3 scripts/run_production_scenarios.py --mode dry-run --md-only code-fix
 ```
 
 ## Acceptance Contract

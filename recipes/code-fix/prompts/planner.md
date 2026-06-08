@@ -37,6 +37,7 @@ Emit a single JSON object on stdout. No prose before or after the JSON block.
   "decomposition": [
     {
       "step": 1,
+      "node_type": "implementer",
       "action": "<concrete edit or operation>",
       "target_file": "<path/to/file>",
       "rationale": "<why this step is needed>",
@@ -49,8 +50,19 @@ Emit a single JSON object on stdout. No prose before or after the JSON block.
   "risk_notes": [
     "<load-bearing risk that the implementer should watch for>"
   ],
-  "artifact_contract": "ref provided",
-  "verifier_contract": "ref provided",
+  "artifact_contract": {
+    "outputs": ["<path/to/file>"],
+    "success_verifiers": []
+  },
+  "verifier_contract": {
+    "checks": [
+      {
+        "id": "<check-id>",
+        "description": "<what verifier proves>",
+        "command": "<command from kickoff, if present>"
+      }
+    ]
+  },
   "success_check": "<explicit, replayable description of what makes this DONE — must reference the verifier commands>"
 }
 ```
@@ -87,3 +99,7 @@ Emit a single JSON object on stdout. No prose before or after the JSON block.
 - Produce a plan with more than 10 decomposition steps (if you need more, the task
   is not a `code_fix` — escalate to `mini-ork deliver`).
 - Skip the `success_check` field or leave it as a placeholder string.
+
+--- task_brief ---
+
+{{KICKOFF_CONTENT}}

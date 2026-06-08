@@ -58,3 +58,7 @@ Single JSON object on stdout:
 - Don't run the migration.
 - Don't audit security implications (out of scope — file separate
   security-audit recipe).
+
+--- kickoff brief ---
+
+{{KICKOFF_CONTENT}}
