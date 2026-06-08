@@ -20,9 +20,11 @@ Users do not experience mini-ork as unit tests. They experience:
    plans from all available mini-ork data, executes the workflow, verifies the
    artifact, and persists what happened.
 
-The current CLI already has the `.md -> classify -> plan -> execute -> verify`
-spine. The missing product behavior is the profile-enrichment step between
-classification and planning.
+The current CLI has the `.md -> classify -> profile -> plan -> execute ->
+verify` spine. The profile step writes
+`.mini-ork/runs/<run-id>/run_profile.json`, emits `profile_questions=` when
+the kickoff lacks operational context, and can block high-risk recipes before
+planning when `MINI_ORK_PROFILE_STRICT=1`.
 
 ## Run Commands
 
@@ -81,7 +83,7 @@ For every scenario:
 | P10 | `.md`-only dispatcher | reuse P01 without recipe arg | `mini-ork run kickoff.md` classifies first, resolves recipe, then runs the lifecycle | none in dry-run |
 | P11 | explicit recipe override | reuse P01 with low code keywords | `mini-ork run code-fix ...` honors explicit recipe over classifier ambiguity | none in dry-run |
 | P12 | inferred classifier | each kickoff via `mini-ork classify` | classifier routes natural-language kickoffs to recipe classes without explicit override | none |
-| P13 | profile enrichment | profile questionnaire fixture | dispatcher asks confidence-building questions before planner when kickoff lacks critical fields | none until implemented |
+| P13 | profile enrichment | profile questionnaire fixture | dispatcher asks confidence-building questions before planner when kickoff lacks critical fields | none |
 | P14 | provider policy | same matrix with provider allowlist | temporary no-Claude policy affects execution selection, not durable workflow topology | allowed non-Claude providers |
 | P15 | trace / reflect / improve | live run after P01 or P02 | execution traces become gradients, patterns, candidates, eval/promote inputs | same as source run |
 | P16 | tiny guardrails | oversized kickoff, hook dir, malformed workflow | small security/product promises remain true under CLI usage | none |
@@ -102,6 +104,17 @@ kickoff.md
   -> planner receives kickoff + run_profile + task_class + recipe metadata
   -> execute uses the same run profile for budget, scope, and risk gates
 ```
+
+Current implementation:
+
+- `mini-ork run` builds `run_profile.json` after classification and before
+  planning.
+- `mini-ork run` prints `profile_path=`, `profile_status=`,
+  `profile_confidence=`, and `profile_questions=` when questions exist.
+- `mini-ork-plan` appends the run profile to planner prompt context and records
+  `run_profile_path` in dry-run plans.
+- `MINI_ORK_PROFILE_STRICT=1` exits before planning for high-risk incomplete
+  profiles such as `db_migration`.
 
 Minimum profile fields:
 
@@ -142,10 +155,10 @@ Example questions for `code-fix`:
 
 | Gap | Impact | Suggested change |
 |---|---|---|
-| No run-profile artifact between classify and plan | Planner must infer missing operational context from kickoff prose. | Add `bin/mini-ork-profile` or make `classify` emit `profile_questions=` and persist answers. |
+| No persistent profile-answer storage tables yet | Questions are captured in `run_profile.json`, but answered questionnaires are not queryable across runs. | Add `run_profiles`, `run_profile_questions`, and `run_profile_answers` tables when profile UX graduates beyond the CLI artifact. |
 | Dry-run plan is a placeholder | Dry-run validates topology but not planner quality. | Add `MO_PROD_SCENARIO_MODE=profile-only` and `MO_PROD_SCENARIO_MODE=plan-only-live` lanes. |
 | Full suite can hang in symlink security scenario | Long production runs may be blocked by a known guardrail test. | Add timeout around that security probe or explicit symlink rejection in `db/init.sh`. |
-| Provider policy is not first-class profile data | Temporary constraints get confused with durable recipe topology. | Store `provider_policy` in run profile and let dispatch enforce it. |
+| Provider policy is profile-visible but not DB-queryable | Temporary constraints are visible in `run_profile.json`, but not yet stored as relational state. | Persist provider policy snapshot in future profile tables. |
 
 ## Promotion Rule
 
