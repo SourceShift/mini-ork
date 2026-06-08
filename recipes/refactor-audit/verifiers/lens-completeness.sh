@@ -20,7 +20,7 @@ exec 3>"$EVIDENCE"
 missing=()
 findings_total=0
 
-for lens in glm kimi codex minimax; do
+for lens in glm kimi codex opus; do
   f="$RUN_DIR/lens-$lens.md"
   if [ ! -f "$f" ]; then
     echo "MISSING: $f" >&3
@@ -45,7 +45,7 @@ synth="$RUN_DIR/synthesis.md"
 if [ ! -f "$synth" ]; then
   missing+=("synthesis.md")
 else
-  for lens in glm kimi codex minimax; do
+  for lens in glm kimi codex opus; do
     if ! grep -qE "(lens-)?$lens" "$synth"; then
       missing+=("synthesis.md (no reference to $lens lens)")
     fi
