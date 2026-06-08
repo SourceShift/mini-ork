@@ -185,3 +185,39 @@ class RunResult:
     @property
     def ok(self) -> bool:
         return self.returncode == 0
+
+
+@dataclass(frozen=True)
+class SpawnRequest:
+    parent_run_id: str
+    kickoff: Path
+    recipe: str | None = None
+    child_run_id: str | None = None
+    depth: int | None = None
+    authority_level: float = 0.3
+    allow_child_spawn: bool = False
+    execute: bool = True
+    mode: RunMode = "dry-run"
+    cwd: Path | None = None
+    auto_init: bool = False
+    timeout_seconds: int = 1800
+    extra_env: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class SpawnResult:
+    returncode: int
+    command: tuple[str, ...]
+    cwd: Path
+    output: str
+    events: tuple[RunEvent, ...]
+    parent_run_id: str = ""
+    child_run_id: str = ""
+    spawn_id: str = ""
+    child_workspace: Path | None = None
+    child_kickoff: Path | None = None
+    spawn_status: str = ""
+
+    @property
+    def ok(self) -> bool:
+        return self.returncode == 0
