@@ -174,6 +174,35 @@ cat > "$MINI_ORK_RUN_DIR/options.md" <<'MD'
 # Options
 
 ## Option A
+Ship a focused collaboration dashboard.
+
+## Recommended Default
+Choose Option A.
+
+## Tradeoffs
+Lower breadth, faster delivery.
+
+## Risks
+May miss some admin workflows.
+
+## Validation Plan
+Run user-flow and integration tests.
+
+## User Decision Required
+Pending user choice.
+MD
+
+if bash "$OPTIONS_VERIFIER" >/dev/null 2>&1; then
+  _ok "options verifier accepts recommended-default wording from live runs"
+else
+  _fail "options verifier rejected recommended-default wording"
+fi
+
+rm -f "$MINI_ORK_RUN_DIR/options.md"
+cat > "$MINI_ORK_RUN_DIR/options.md" <<'MD'
+# Options
+
+## Option A
 Incomplete package.
 MD
 
@@ -223,6 +252,37 @@ if bash "$DECISION_VERIFIER" >/dev/null 2>&1; then
 else
   _fail "selected-option gate rejected selected-option.md"
 fi
+
+cat > "$TMPROOT/plan.json" <<'JSON'
+{
+  "task_class": "post_mvp_delivery",
+  "objective": "dry-run lane routing check",
+  "decomposition": [],
+  "artifact_contract": {"outputs": ["options.md"], "success_verifiers": []},
+  "verifier_contract": {"checks": []}
+}
+JSON
+
+DRY_OUT="$(
+  MINI_ORK_WORKFLOW="$WORKFLOW" \
+  MINI_ORK_RECIPE="post-mvp-delivery" \
+  MINI_ORK_PLAN_PATH="$TMPROOT/plan.json" \
+  mini-ork-execute --dry-run 2>&1
+)"
+
+for expected in \
+  "node_id=product_lens node_type=researcher model_lane=glm_lens" \
+  "node_id=architecture_lens node_type=researcher model_lane=codex_lens" \
+  "node_id=integration_lens node_type=researcher model_lane=kimi_lens" \
+  "node_id=validation_lens node_type=researcher model_lane=minimax_lens" \
+  "node_id=options_synthesizer node_type=reviewer model_lane=reviewer"
+do
+  if printf '%s\n' "$DRY_OUT" | grep -q "$expected"; then
+    _ok "execute dry-run preserves $expected"
+  else
+    _fail "execute dry-run missing lane marker: $expected"
+  fi
+done
 
 echo
 echo "-- Results: ${PASS} OK  ${FAIL} FAIL --"
