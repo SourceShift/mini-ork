@@ -94,6 +94,172 @@ except Exception:
     MINI_ORK_TASK_CLASS=$(printf '%s\n' "$classify_out" | grep -E '^task_class=' | head -1 | cut -d= -f2)
     export MINI_ORK_TASK_CLASS
 
+    # ── profile ───────────────────────────────────────────────────────────────
+    # Build the run profile before planning so the planner sees operational
+    # context that is easy to inspect and easy for callers to answer later.
+    MINI_ORK_HOME="${MINI_ORK_HOME:-$(pwd)/.mini-ork}"
+    export MINI_ORK_HOME
+    RUN_DIR="$MINI_ORK_HOME/runs/$MINI_ORK_RUN_ID"
+    mkdir -p "$RUN_DIR"
+    MINI_ORK_PROFILE_PATH="$RUN_DIR/run_profile.json"
+    export MINI_ORK_PROFILE_PATH
+    profile_out=$(python3 - "$kickoff" "$MINI_ORK_ROOT" "$recipe" "$MINI_ORK_TASK_CLASS" "$MINI_ORK_PROFILE_PATH" "${MINI_ORK_HOME}/config/agents.yaml" <<'PY'
+import json
+import re
+import sys
+from pathlib import Path
+
+kickoff_path, root, recipe, task_class, profile_path, agents_path = sys.argv[1:7]
+root = Path(root)
+kickoff = Path(kickoff_path)
+profile = Path(profile_path)
+text = kickoff.read_text(encoding="utf-8", errors="replace")
+
+
+def section_lines(names):
+    wanted = {n.lower() for n in names}
+    current = None
+    lines = []
+    for raw in text.splitlines():
+        m = re.match(r"^\s*#{2,6}\s+(.+?)\s*$", raw)
+        if m:
+            title = m.group(1).strip().lower()
+            current = title if any(w in title for w in wanted) else None
+            continue
+        if current:
+            lines.append(raw.rstrip())
+    return [line for line in lines if line.strip()]
+
+
+def bullets(lines):
+    items = []
+    for line in lines:
+        stripped = re.sub(r"^\s*[-*]\s*", "", line).strip()
+        if stripped:
+            items.append(stripped)
+    return items
+
+
+def first_heading():
+    for line in text.splitlines():
+        m = re.match(r"^\s*#\s+(.+?)\s*$", line)
+        if m:
+            return m.group(1).strip()
+    return kickoff.stem.replace("-", " ").replace("_", " ")
+
+
+def load_yaml(path):
+    try:
+        import yaml
+        with open(path, encoding="utf-8") as f:
+            return yaml.safe_load(f) or {}
+    except Exception:
+        return {}
+
+
+def command_hints():
+    patterns = [
+        r"\bpnpm\s+(?:test|run\s+test|type-check)\b[^\n`]*",
+        r"\bnpm\s+(?:test|run\s+test)\b[^\n`]*",
+        r"\bpytest\b[^\n`]*",
+        r"\bcargo\s+test\b[^\n`]*",
+        r"\bgo\s+test\b[^\n`]*",
+        r"\bbash\s+tests/[^\n`]+",
+        r"\bmake\s+test\b[^\n`]*",
+    ]
+    found = []
+    for pattern in patterns:
+        found.extend(m.group(0).strip().rstrip(".") for m in re.finditer(pattern, text, re.I))
+    return list(dict.fromkeys(found))
+
+
+success = bullets(section_lines(["success", "definition of done", "done when", "acceptance"]))
+scope_allow = bullets(section_lines(["scope allow", "in scope", "scope"]))
+scope_deny = bullets(section_lines(["scope deny", "out of scope", "forbidden"]))
+commands = command_hints()
+
+task_yaml = load_yaml(root / "recipes" / recipe / "task_class.yaml")
+artifact_yaml = load_yaml(root / "recipes" / recipe / "artifact_contract.yaml")
+agents_yaml = load_yaml(agents_path)
+
+outputs = artifact_yaml.get("outputs") or []
+if isinstance(outputs, str):
+    outputs = [outputs]
+
+lanes = {}
+if isinstance(agents_yaml.get("lanes"), dict):
+    lanes = agents_yaml["lanes"]
+
+questions = []
+if not success:
+    questions.append("What exact success criteria should the verifier use?")
+if not scope_allow:
+    questions.append("Which files or directories are explicitly in scope?")
+if not commands:
+    questions.append("What command should prove this run succeeded?")
+if task_class == "db_migration":
+    questions = [
+        "Which database engine and version should this migration target?",
+        "Is downtime allowed, and what is the maximum acceptable window?",
+        "What exact rollback or backup restore path should the planner assume?",
+    ]
+elif task_class == "ui_audit" and len(questions) < 3:
+    questions.append("Which target user profile or viewport should the audit prioritize?")
+
+questions = questions[:3]
+confidence = 0.35
+confidence += 0.15 if success else 0
+confidence += 0.15 if scope_allow else 0
+confidence += 0.15 if commands else 0
+confidence += 0.10 if outputs else 0
+confidence += 0.10 if lanes else 0
+confidence = min(confidence, 0.95)
+
+high_risk = task_class in {"db_migration", "bdd_first_delivery"}
+status = "ready"
+if questions:
+    status = "blocked_profile" if high_risk else "needs_answers"
+
+data = {
+    "schema_version": "1.0",
+    "kickoff_path": str(kickoff.resolve()),
+    "target_repo": str(Path.cwd().resolve()),
+    "recipe": recipe,
+    "task_class": task_class,
+    "user_goal": first_heading(),
+    "success_criteria": success,
+    "scope_allow": scope_allow,
+    "scope_deny": scope_deny,
+    "risk_tolerance": "conservative" if high_risk else "standard",
+    "budget_cap_usd": task_yaml.get("budget_cap_usd"),
+    "provider_policy": {
+        "source": str(Path(agents_path).resolve()),
+        "lanes": lanes,
+        "env": {"MINI_ORK_PROVIDER_POLICY": str(Path(agents_path).resolve()) if lanes else ""},
+    },
+    "artifact_destination": outputs,
+    "verification_command": commands[:3],
+    "human_questions": questions,
+    "confidence": round(confidence, 2),
+    "profile_status": status,
+}
+
+profile.parent.mkdir(parents=True, exist_ok=True)
+profile.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+print(f"profile_path={profile}")
+print(f"profile_status={status}")
+print(f"profile_confidence={data['confidence']:.2f}")
+if questions:
+    print("profile_questions=" + json.dumps(questions, separators=(",", ":")))
+PY
+)
+    printf '%s\n' "$profile_out"
+    profile_status=$(printf '%s\n' "$profile_out" | grep -E '^profile_status=' | head -1 | cut -d= -f2)
+    if [ "${MINI_ORK_PROFILE_STRICT:-0}" = "1" ] && [ "$profile_status" = "blocked_profile" ]; then
+      echo "profile blocked: answer profile_questions before planning" >&2
+      exit 2
+    fi
+
     # ── plan ───────────────────────────────────────────────────────────────────
     plan_out=$("$MINI_ORK_ROOT/bin/mini-ork-plan" "$kickoff") || exit $?
     printf '%s\n' "$plan_out"
