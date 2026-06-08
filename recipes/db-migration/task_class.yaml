@@ -10,7 +10,10 @@ description: >
 matches:
   keywords:
     - migration
+    - db migration
+    - database migration
     - schema migration
+    - run profile migration
     - add column
     - drop column
     - alter table

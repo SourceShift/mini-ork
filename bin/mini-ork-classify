@@ -174,38 +174,63 @@ print(n)
   else
     candidate_class=$(basename "$yaml_file" .yaml)
   fi
+  candidate_class="${candidate_class//-/_}"
 
-  # Python fallback handles BOTH shapes:
-  #   matches: [ "kw1", "kw2" ]                            (flat list)
-  #   matches: { keywords: [...], regex: [...], path_globs: [...] }  (structured)
-  # Also tolerates legacy TOP-LEVEL `keywords:` form (recipes/bdd-first-delivery).
-  mapfile -t patterns < <(python3 - "$yaml_file" <<'PY'
-import sys, yaml
-with open(sys.argv[1]) as f:
+  # Count hits — NOT break-on-first (D-010 fix).
+  #
+  # v0.2-pt??: score keywords as literal terms, not raw regex. Raw grep -E
+  # made short keywords like "ui" match unrelated words and caused .md-only
+  # dispatch to over-route mixed production kickoffs to bdd_first_delivery.
+  # Regex matchers are still honored via matches.regex.
+  hits=$(python3 - "$yaml_file" "$KICKOFF" <<'PY'
+import re, sys, yaml
+yaml_file, kickoff = sys.argv[1:3]
+with open(yaml_file) as f:
     data = yaml.safe_load(f) or {}
-m = data.get('matches', [])
+text = open(kickoff).read()
+
+keywords = []
+regexes = []
+m = data.get("matches", [])
 if isinstance(m, dict):
-    for p in m.get('keywords', []) or []:
-        print(p)
-    for p in m.get('regex', []) or []:
-        print(p)
+    keywords.extend(m.get("keywords", []) or [])
+    regexes.extend(m.get("regex", []) or [])
 elif isinstance(m, list):
-    for p in m:
-        print(p)
-# Legacy top-level keywords (back-compat)
-for p in data.get('keywords', []) or []:
-    print(p)
+    keywords.extend(m)
+keywords.extend(data.get("keywords", []) or [])  # legacy back-compat
+
+score = 0
+seen = set()
+for raw in keywords:
+    kw = str(raw or "").strip()
+    key = kw.lower()
+    if not kw or key in seen:
+        continue
+    seen.add(key)
+    if re.fullmatch(r"[A-Za-z0-9_ -]+", kw):
+        # Word-ish literal phrase. Bound both ends so "ui" does not match
+        # "build" or "quick".
+        pat = r"(?<![A-Za-z0-9_])" + re.escape(kw) + r"(?![A-Za-z0-9_])"
+        matched = re.search(pat, text, flags=re.I) is not None
+    else:
+        matched = key in text.lower()
+    if matched:
+        word_count = max(1, len(re.findall(r"[A-Za-z0-9_]+", kw)))
+        score += 1 + (1 if word_count > 1 else 0)
+
+for raw in regexes:
+    rx = str(raw or "").strip()
+    if not rx:
+        continue
+    try:
+        if re.search(rx, text, flags=re.I):
+            score += 2
+    except re.error:
+        continue
+
+print(score)
 PY
   )
-
-  # Count hits — NOT break-on-first (D-010 fix)
-  hits=0
-  for pattern in "${patterns[@]}"; do
-    [ -z "$pattern" ] && continue
-    if echo "$KICKOFF_TEXT" | grep -qiE "$pattern" 2>/dev/null; then
-      hits=$((hits + 1))
-    fi
-  done
 
   # Strict greater-than means lex-first wins on ties
   if [ "$hits" -gt "$BEST_HITS" ]; then

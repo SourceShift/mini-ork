@@ -9,6 +9,9 @@ description: >
 matches:
   keywords:
     - audit
+    - refactor audit
+    - refactor-audit
+    - provider roster
     - refactor
     - scalability
     - bottleneck
