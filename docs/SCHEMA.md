@@ -109,6 +109,70 @@ Per-iteration record within a run. Each iter = one worker pass + one reviewer ve
 
 ---
 
+## Recursive Orchestration
+
+### `run_spawns`
+Lineage table for bounded parent/child mini-ork delegation. A row is written
+before a child run executes, so failed or blocked children remain auditable.
+
+| Column | Type | Notes |
+|---|---|---|
+| `spawn_id` | TEXT PK | `sp-<ts>-<uuid>` |
+| `parent_run_id` | TEXT | FK -> `task_runs.id` for the delegating parent |
+| `child_run_id` | TEXT UNIQUE | Reserved child `task_runs.id` |
+| `root_run_id` | TEXT | Root ancestor used for descendant-budget checks |
+| `depth` | INTEGER | Depth from root; default policy blocks beyond 2 |
+| `recipe` | TEXT | Optional forced child recipe |
+| `kickoff_path` | TEXT | Copied child kickoff under the parent run directory |
+| `child_workspace` | TEXT | Isolated child workspace path |
+| `authority_level` | REAL | 0.0 report-only through 0.9 propose-merge; 1.0 blocked by default |
+| `allow_child_spawn` | INTEGER | 1 if the child may request descendants |
+| `status` | TEXT | `approved` -> `running` -> `completed`/`failed`/`merged`/`rejected` |
+| `policy_snapshot_json` | TEXT | Recursive limit snapshot used at approval time |
+| `created_at` / `updated_at` | INTEGER | Unix epoch seconds |
+
+### `run_events`
+Shared event log for recursive runs.
+
+| Column | Type | Notes |
+|---|---|---|
+| `event_id` | TEXT PK | `ev-<ts>-<uuid>` |
+| `run_id` | TEXT | Run that emitted the event |
+| `parent_run_id` | TEXT | Parent run when applicable |
+| `event_type` | TEXT | e.g. `spawn.approved`, `child.started`, `child.completed`, `child.failed` |
+| `payload_json` | TEXT | Event details |
+| `created_at` | INTEGER | Unix epoch seconds |
+
+### `run_artifact_edges`
+Producer/consumer edges for child artifacts proposed back to a parent.
+
+| Column | Type | Notes |
+|---|---|---|
+| `edge_id` | TEXT PK | `ae-<ts>-<uuid>` |
+| `producer_run_id` | TEXT | Child or worker run that produced the artifact |
+| `consumer_run_id` | TEXT | Parent or downstream run that consumes it |
+| `artifact_path` | TEXT | Path to artifact |
+| `artifact_hash` | TEXT | Optional digest |
+| `artifact_kind` | TEXT | Default `file` |
+| `verification_state` | TEXT | `proposed` / `verified` / `rejected` / `merged` |
+| `created_at` | INTEGER | Unix epoch seconds |
+
+### `merge_decisions`
+Parent-owned decision log for child outputs.
+
+| Column | Type | Notes |
+|---|---|---|
+| `decision_id` | TEXT PK | `md-<ts>-<uuid>` |
+| `parent_run_id` | TEXT | Parent deciding whether to consume child output |
+| `child_run_id` | TEXT | Child being accepted/rejected/deferred |
+| `decision` | TEXT | `accepted` / `rejected` / `needs_changes` / `deferred` |
+| `reason` | TEXT | Human or verifier-readable rationale |
+| `decided_by` | TEXT | Default `parent` |
+| `evidence_json` | TEXT | Structured supporting evidence |
+| `created_at` | INTEGER | Unix epoch seconds |
+
+---
+
 ### `inbox`
 Human-escalation queue. An open inbox item blocks the epic from being re-claimed.
 
