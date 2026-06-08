@@ -1,0 +1,43 @@
+version: "0.1.0"
+task_class: post_mvp_delivery
+description: >
+  Discovery-first post-MVP delivery: profile the user ask, run parallel
+  product/technical/integration/validation research, synthesize options for
+  user choice, then continue into implementation planning.
+
+nodes:
+  - { name: discovery_planner, type: planner, model_lane: planner, prompt_ref: prompts/discovery-planner.md, dispatch_mode: serial }
+  - { name: product_lens, type: researcher, model_lane: glm_lens, prompt_ref: prompts/lens-product.md, dispatch_mode: parallel, gates: [budget_gate] }
+  - { name: architecture_lens, type: researcher, model_lane: codex_lens, prompt_ref: prompts/lens-architecture.md, dispatch_mode: parallel, gates: [budget_gate] }
+  - { name: integration_lens, type: researcher, model_lane: kimi_lens, prompt_ref: prompts/lens-integration.md, dispatch_mode: parallel, gates: [budget_gate] }
+  - { name: validation_lens, type: researcher, model_lane: minimax_lens, prompt_ref: prompts/lens-validation.md, dispatch_mode: parallel, gates: [budget_gate] }
+  - { name: options_synthesizer, type: reviewer, model_lane: reviewer, prompt_ref: prompts/options-synthesis.md, dispatch_mode: serial, gates: [budget_gate] }
+  - { name: options_completeness, type: verifier, verifier_ref: verifiers/options-completeness.sh, dispatch_mode: serial }
+  - { name: delivery_planner, type: reviewer, model_lane: reviewer, prompt_ref: prompts/delivery-plan.md, dispatch_mode: serial }
+  - { name: selected_option_gate, type: verifier, verifier_ref: verifiers/selected-option-gate.sh, dispatch_mode: serial }
+  - { name: implementer, type: implementer, model_lane: worker, prompt_ref: prompts/implementer.md, dispatch_mode: serial, gates: [scope_gate, budget_gate] }
+  - { name: publisher, type: publisher, prompt_ref: null, dispatch_mode: serial, gates: [scope_gate] }
+  - { name: rollback, type: rollback, prompt_ref: null, dispatch_mode: serial }
+
+edges:
+  - { from: discovery_planner, to: product_lens, edge_type: depends_on }
+  - { from: discovery_planner, to: architecture_lens, edge_type: depends_on }
+  - { from: discovery_planner, to: integration_lens, edge_type: depends_on }
+  - { from: discovery_planner, to: validation_lens, edge_type: depends_on }
+  - { from: product_lens, to: options_synthesizer, edge_type: supplies_context_to }
+  - { from: architecture_lens, to: options_synthesizer, edge_type: supplies_context_to }
+  - { from: integration_lens, to: options_synthesizer, edge_type: supplies_context_to }
+  - { from: validation_lens, to: options_synthesizer, edge_type: supplies_context_to }
+  - { from: options_synthesizer, to: options_completeness, edge_type: verifies }
+  - { from: options_completeness, to: delivery_planner, edge_type: human_decision_gate }
+  - { from: delivery_planner, to: selected_option_gate, edge_type: verifies_user_choice }
+  - { from: selected_option_gate, to: implementer, edge_type: depends_on }
+  - { from: implementer, to: publisher, edge_type: depends_on }
+  - { from: options_completeness, to: rollback, edge_type: escalates_to }
+  - { from: selected_option_gate, to: rollback, edge_type: escalates_to }
+  - { from: implementer, to: rollback, edge_type: escalates_to }
+
+rollback_strategy: keep_discovery_artifacts_discard_delivery_patch
+max_self_correction_iterations: 2
+human_decision_artifact: options.md
+selected_option_artifact: selected-option.md
