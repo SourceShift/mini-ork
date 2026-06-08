@@ -190,6 +190,7 @@ The framework ships the universal loop and its primitives. Nothing in `lib/` or 
 | Version registry | `lib/version_registry.sh` | promote / quarantine / rollback |
 | Group evolver | `lib/group_evolver.sh` | workflow candidate generation |
 | Experience memory | `lib/trace_store.sh` + `lib/gradient_extractor.sh` + `lib/pattern_store.sh` | store, extract, surface |
+| Recursive orchestration | `bin/mini-ork-spawn` + `lib/recursive_orchestration.sh` | bounded parent/child mini-ork delegation with lineage, events, and policy limits |
 
 ### RECIPES — opinions live here
 
@@ -246,10 +247,10 @@ See [docs/SAFETY.md](docs/SAFETY.md) for immutable constraints and the Promotion
 
 The full release log lives in [`ROADMAP.md`](ROADMAP.md) — every section dated and per-commit-attributed. Current shipped totals (regenerable via `mini-ork doctor`):
 
-- 6-stage universal loop (`classify → plan → execute → verify → reflect → improve`) + 4 extension entrypoints (`eval`, `improve`, `promote`, `topology`)
-- 40 framework primitives in `lib/` (incl. 6 oracle-hardening libs + `gate_bootstrap.sh` for the v0.3-rc1 central wire-up, added 2026-06-05)
-- 13 user-facing `bin/mini-ork*` entrypoints
-- 15 schema migrations under `db/migrations/` (memory namespaces, benchmarks, evolution, safety, panel topology telemetry)
+- 6-stage universal loop (`classify → plan → execute → verify → reflect → improve`) + 5 extension entrypoints (`eval`, `improve`, `promote`, `topology`, `spawn`)
+- 41 framework primitives in `lib/` (incl. 6 oracle-hardening libs + `gate_bootstrap.sh` for the v0.3-rc1 central wire-up, added 2026-06-05)
+- 14 user-facing `bin/mini-ork*` entrypoints
+- 16 schema migrations under `db/migrations/` (memory namespaces, benchmarks, evolution, safety, panel topology telemetry, recursive orchestration)
 - 9 recipes shipped — see Recipes table above
 - 7 model-family providers under `lib/providers/`
 
