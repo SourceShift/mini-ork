@@ -157,8 +157,9 @@ export MINI_ORK_RUN_ID="run-dispatcher-test-$$"
 RUN_OUT=$(mini-ork run code-fix "$TMPROOT/kickoff.md" 2>&1) || RUN_EXIT=$?
 RUN_EXIT="${RUN_EXIT:-0}"
 
-# Dry-run should exit 0 (or non-fatal verify exit)
-if [ "$RUN_EXIT" -eq 0 ] || [ "$RUN_EXIT" -eq 1 ]; then
+# Dry-run should exit 0. It may not emit an artifact_path, but the wrapper
+# must still continue into verify and let verify emit verdict=dry-run.
+if [ "$RUN_EXIT" -eq 0 ]; then
   _ok "mini-ork run code-fix dry-run completed (exit $RUN_EXIT)"
 else
   _fail "mini-ork run code-fix dry-run failed unexpectedly (exit $RUN_EXIT)"
@@ -198,8 +199,7 @@ else
   if echo "$RUN_OUT" | grep -qi '"verdict"'; then
     _ok "verify step output contains 'verdict' field"
   else
-    # In pure dry-run the verify verdict is included in the combined output
-    _ok "verify step ran (verdict field not parsed in combined output — acceptable)"
+    _fail "verify step did NOT emit verdict field"
   fi
 fi
 

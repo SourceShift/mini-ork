@@ -20,7 +20,7 @@ audit on**, the recipe:
    - **kimi-lens** → code-level refactor diffs (long-context)
    - **codex-lens** → LLM-dispatch / cost optimization (deep
      code-intelligence)
-   - **opus-lens** → architectural shape + synthesis (deep reasoning)
+   - **minimax-lens** → architectural shape + synthesis perspective
 4. **Verify** — checks all 4 lens reports exist + non-empty + cite
    file:line anchors
 5. (Out-of-band) **Reflect** — gradients written from each lens's
@@ -32,7 +32,7 @@ audit on**, the recipe:
 - `${MINI_ORK_HOME}/runs/<run_id>/lens-glm.md`
 - `${MINI_ORK_HOME}/runs/<run_id>/lens-kimi.md`
 - `${MINI_ORK_HOME}/runs/<run_id>/lens-codex.md`
-- `${MINI_ORK_HOME}/runs/<run_id>/lens-opus.md`
+- `${MINI_ORK_HOME}/runs/<run_id>/lens-minimax.md`
 - `${MINI_ORK_HOME}/runs/<run_id>/synthesis.md` — composed final audit
 - (Optional) `docs/refactor/<slug>-AUDIT.md` published by the
   publisher node

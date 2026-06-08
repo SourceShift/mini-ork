@@ -9,7 +9,7 @@ The 4 lens reports are written to:
 - `${MINI_ORK_RUN_DIR}/lens-glm.md` — tactical bottlenecks
 - `${MINI_ORK_RUN_DIR}/lens-kimi.md` — code-level refactor diffs
 - `${MINI_ORK_RUN_DIR}/lens-codex.md` — LLM-dispatch cost cuts
-- `${MINI_ORK_RUN_DIR}/lens-opus.md` — architectural shape
+- `${MINI_ORK_RUN_DIR}/lens-minimax.md` — architectural shape
 
 Read all 4 fully before composing.
 

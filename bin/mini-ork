@@ -68,7 +68,7 @@ except Exception:
     # ── execute (plan path passed via env, not positional) ─────────────────────
     execute_out=$("$MINI_ORK_ROOT/bin/mini-ork-execute") || exit $?
     printf '%s\n' "$execute_out"
-    MINI_ORK_ARTIFACT_PATH=$(printf '%s\n' "$execute_out" | grep -E '^artifact_path=' | head -1 | cut -d= -f2)
+    MINI_ORK_ARTIFACT_PATH=$(printf '%s\n' "$execute_out" | grep -E '^artifact_path=' | head -1 | cut -d= -f2 || true)
     export MINI_ORK_ARTIFACT_PATH
 
     # ── verify ─────────────────────────────────────────────────────────────────

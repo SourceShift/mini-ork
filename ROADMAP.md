@@ -62,7 +62,7 @@ extraction prompt-tuning is D-048, deferred)
 
 **Phase G — Positioning lock-in** ✓
 - 4-distinct-family lens routing in `recipes/refactor-audit/workflow.yaml`
-  (D-047): glm_lens→glm, kimi_lens→kimi, codex_lens→codex, opus_lens→opus
+  (D-047): glm_lens→glm, kimi_lens→kimi, codex_lens→codex, minimax_lens→minimax
 - `docs/positioning/why-mini-ork.md` captures 6-paper literature grounding
   ([Nasser 2026](https://arxiv.org/abs/2601.05114) + [Rajan 2025](https://arxiv.org/abs/2511.16708) + [Karanam 2025](https://arxiv.org/abs/2512.21352) + [Zietsman 2026](https://arxiv.org/abs/2603.25773) + [Shehata 2026](https://arxiv.org/abs/2604.27274) + [Song 2026](https://arxiv.org/abs/2603.21454))
 - README top-of-fold positioning section + 7-axis comparison vs
