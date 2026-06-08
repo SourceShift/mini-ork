@@ -9,7 +9,10 @@ description: >
 matches:
   keywords:
     - runbook
+    - ops runbook
     - playbook
+    - symlink hang
+    - hung process
     - incident response
     - on-call guide
     - operational guide

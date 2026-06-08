@@ -214,6 +214,45 @@ else
   _ok "task_runs row not created (DRY_RUN=1 — classify skips DB write; by design)"
 fi
 
+# 9. mini-ork run <kickoff.md> infers recipe from classifier, then walks pipeline.
+echo ""
+echo "--- 9. mini-ork run kickoff.md: inferred recipe path ---"
+cat > "$TMPROOT/ui-audit-kickoff.md" <<'EOF'
+# UI audit for CLI quickstart
+
+Audit the first-run CLI and README journey for accessibility, visual scanning,
+interaction clarity, and edge cases.
+
+## Success criteria
+
+- Findings cite README/help text anchors.
+- The workflow should be the ui-audit recipe for a read-only audit.
+EOF
+
+MINI_ORK_RUN_ID="run-dispatcher-md-only-$$"
+export MINI_ORK_RUN_ID
+MD_RUN_EXIT=0
+MD_RUN_OUT=$(mini-ork run "$TMPROOT/ui-audit-kickoff.md" 2>&1) || MD_RUN_EXIT=$?
+
+if [ "$MD_RUN_EXIT" -eq 0 ]; then
+  _ok "mini-ork run kickoff.md dry-run completed"
+else
+  _fail "mini-ork run kickoff.md failed unexpectedly (exit $MD_RUN_EXIT)"
+fi
+
+MD_TC=$(echo "$MD_RUN_OUT" | grep -E '^task_class=' | tail -1 | cut -d= -f2)
+if [ "$MD_TC" = "ui_audit" ]; then
+  _ok "kickoff.md inferred task_class=ui_audit"
+else
+  _fail "kickoff.md inferred wrong task_class=${MD_TC:-missing}"
+fi
+
+if echo "$MD_RUN_OUT" | grep -q '"verdict"'; then
+  _ok "kickoff.md inferred path reached verify"
+else
+  _fail "kickoff.md inferred path did not reach verify"
+fi
+
 # === TESTS END ===
 
 echo ""
