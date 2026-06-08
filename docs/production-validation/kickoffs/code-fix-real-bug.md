@@ -2,7 +2,7 @@
 
 ## Goal
 
-Fix a bug in `scripts/run-production-scenarios.sh` where a scenario can exit
+Fix a bug in `scripts/run_production_scenarios.py` where a scenario can exit
 successfully even when the dispatcher selected the wrong task class.
 
 ## Target repo
@@ -11,7 +11,7 @@ This repository: `mini-ork`.
 
 ## Scope allow
 
-- `scripts/run-production-scenarios.sh`
+- `scripts/run_production_scenarios.py`
 - `bin/mini-ork`
 - `bin/mini-ork-classify`
 
@@ -31,7 +31,7 @@ This repository: `mini-ork`.
 ## Verification command
 
 ```bash
-MO_PROD_SCENARIO_MODE=dry-run scripts/run-production-scenarios.sh --md-only code-fix
+python3 scripts/run_production_scenarios.py --mode dry-run --md-only code-fix
 ```
 
 ## Risk tolerance
