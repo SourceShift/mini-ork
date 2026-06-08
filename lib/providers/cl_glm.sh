@@ -10,7 +10,7 @@
 #
 # See lib/providers/README.md for the secrets.local.sh pattern.
 
-export ANTHROPIC_AUTH_TOKEN="${GLM_API_KEY:?GLM_API_KEY is required — set it in \${MINI_ORK_HOME}/config/secrets.local.sh}"
+export ANTHROPIC_AUTH_TOKEN="${GLM_API_KEY:?GLM_API_KEY is required - set it in MINI_ORK_HOME/config/secrets.local.sh}"
 export ANTHROPIC_BASE_URL=https://api.z.ai/api/anthropic
 export ANTHROPIC_MODEL=GLM-5.1
 export ANTHROPIC_SMALL_FAST_MODEL=GLM-5.1

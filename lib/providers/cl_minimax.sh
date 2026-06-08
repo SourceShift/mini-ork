@@ -9,7 +9,7 @@
 #
 # See lib/providers/README.md for the secrets.local.sh pattern.
 
-export ANTHROPIC_AUTH_TOKEN="${MINIMAX_API_KEY:?MINIMAX_API_KEY is required — set it in \${MINI_ORK_HOME}/config/secrets.local.sh}"
+export ANTHROPIC_AUTH_TOKEN="${MINIMAX_API_KEY:?MINIMAX_API_KEY is required - set it in MINI_ORK_HOME/config/secrets.local.sh}"
 export ANTHROPIC_BASE_URL=https://api.minimax.io/anthropic
 export ANTHROPIC_MODEL=MiniMax-M3
 export ANTHROPIC_SMALL_FAST_MODEL=MiniMax-M3
