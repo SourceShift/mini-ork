@@ -124,9 +124,13 @@ print(p.get('task_class', 'generic'))
 # Extract nodes — D-008 fix: workflow.yaml.nodes[] is the authoritative DAG.
 # Falls back to plan.json.decomposition[] only when no workflow.yaml is set
 # (e.g. ad-hoc runs without a recipe).
-# Emit format: <node_id>\t<node_type>\t<description>\t<prompt_ref>
-# (TAB separator, not '::' — bash IFS treats every char as a separator so
-#  '::' was equivalent to ':' and produced 5+ fields from 3 — D-008 cascade)
+# Emit format with ASCII unit separator fields:
+#   <node_id><US><node_type><US><description><US><prompt_ref><US><dispatch_mode><US><verifier_ref><US><model_lane>
+#
+# Do NOT use tab here. In bash, tab is whitespace IFS, so consecutive tabs
+# collapse and empty fields like verifier_ref shift model_lane into the wrong
+# column. Unit separator is non-whitespace and preserves empty YAML fields.
+NODE_FIELD_SEP=$'\x1f'
 NODE_SOURCE=""
 if [ -n "${WORKFLOW:-}" ] && [ -f "${WORKFLOW:-}" ]; then
   NODE_SOURCE="workflow.yaml"
@@ -137,6 +141,11 @@ if [ -n "${WORKFLOW:-}" ] && [ -f "${WORKFLOW:-}" ]; then
   # D-053: emit verifier_ref as 6th field so verifier workflow nodes run
   # their declared deterministic scripts instead of relying on the plan to
   # duplicate workflow wiring in artifact_contract.success_verifiers[].
+  # D-054: emit model_lane as 7th field. node_type selects the executor
+  # handler (researcher/reviewer/implementer); model_lane selects the provider
+  # family through config/agents.yaml. Without this, every researcher node
+  # collapsed to lanes.researcher even when workflow.yaml declared glm_lens,
+  # kimi_lens, codex_lens, or minimax_lens.
   mapfile -t NODE_IDS < <(python3 - "$WORKFLOW" <<'PY'
 import sys, yaml
 with open(sys.argv[1]) as f:
@@ -148,13 +157,16 @@ for n in wf.get("nodes", []) or []:
     pref = n.get("prompt_ref", "") or ""
     dmode = n.get("dispatch_mode", "") or "serial"
     vref = n.get("verifier_ref", "") or ""
+    mlane = n.get("model_lane", "") or typ
     if not name or not typ:
         continue
-    # Strip any tabs from user fields (separator collision)
-    desc = desc.replace("\t", " ")
-    pref = pref.replace("\t", " ")
-    vref = vref.replace("\t", " ")
-    print(f"{name}\t{typ}\t{desc}\t{pref}\t{dmode}\t{vref}")
+    sep = "\x1f"
+    # Strip separators from user fields (separator collision)
+    desc = desc.replace(sep, " ")
+    pref = pref.replace(sep, " ")
+    vref = vref.replace(sep, " ")
+    mlane = mlane.replace(sep, " ")
+    print(sep.join([name, typ, desc, pref, dmode, vref, mlane]))
 PY
   )
 else
@@ -168,8 +180,9 @@ for step in p.get("decomposition", []):
     ntyp = step.get('node_type') or 'implementer'  # explicit None/empty → implementer
     if not nid or not ntyp:
         continue
-    desc = (step.get('description','') or '').replace("\t"," ")
-    print(f"{nid}\t{ntyp}\t{desc}\t\tserial\t")
+    sep = "\x1f"
+    desc = (step.get('description','') or '').replace(sep, " ")
+    print(sep.join([nid, ntyp, desc, "", "serial", "", ntyp]))
 PY
   )
 fi
@@ -335,7 +348,8 @@ finally:
 }
 
 _dispatch_node() {
-  local node_id="$1" node_type="$2" node_desc="$3" node_prompt_ref="${4:-}" node_verifier_ref="${5:-}"
+  local node_id="$1" node_type="$2" node_desc="$3" node_prompt_ref="${4:-}" node_verifier_ref="${5:-}" node_model_lane="${6:-}"
+  local dispatch_lane="${node_model_lane:-$node_type}"
 
   if [ -n "$FILTER_NODE_TYPE" ] && [ "$node_type" != "$FILTER_NODE_TYPE" ]; then
     return 0
@@ -353,11 +367,11 @@ _dispatch_node() {
   fi
 
   if [ "$DRY_RUN" -eq 1 ]; then
-    echo "[dry-run] would dispatch node_id=${node_id} node_type=${node_type}: ${node_desc}"
+    echo "[dry-run] would dispatch node_id=${node_id} node_type=${node_type} model_lane=${dispatch_lane}: ${node_desc}"
     return 0
   fi
 
-  echo "==> dispatch node_id=${node_id} type=${node_type}"
+  echo "==> dispatch node_id=${node_id} type=${node_type} model_lane=${dispatch_lane}"
 
   # Locate recipe prompt for this node.
   # D-030: prefer per-node `prompt_ref` from workflow.yaml (e.g. recipe's
@@ -413,7 +427,7 @@ _dispatch_node() {
       PROMPT_CONTENT="${_prepend}Task: ${node_desc}\n\nPlan context:\n${PLAN_CONTENT}\n\nWrite your output to: ${CONTEXT_FILE}"
       RESULT=$(llm_dispatch \
         --task-class "$TASK_CLASS" \
-        --node-type "researcher" \
+        --node-type "$dispatch_lane" \
         --prompt-text "$PROMPT_CONTENT" 2>&1) || { echo "researcher dispatch failed" >&2; return 1; }
       # D-033: preserve agent's tool-call Writes — if agent wrote real
       # content via Write/Edit to $CONTEXT_FILE, don't clobber it with
@@ -450,7 +464,7 @@ _dispatch_node() {
       PROMPT_CONTENT="${_prepend}Implement: ${node_desc}\n\nPlan:\n${PLAN_CONTENT}"
       RESULT=$(llm_dispatch \
         --task-class "$TASK_CLASS" \
-        --node-type "implementer" \
+        --node-type "$dispatch_lane" \
         --prompt-text "$PROMPT_CONTENT" 2>&1) || { echo "implementer dispatch failed" >&2; return 1; }
       echo "$RESULT" > "$IMPL_LOG"
       echo "  [ok] implementer output → $IMPL_LOG"
@@ -462,11 +476,25 @@ _dispatch_node() {
     reviewer)
       _require_lib llm-dispatch
       [ -f "${PROMPT_FILE:-}" ] || PROMPT_FILE="$MINI_ORK_ROOT/prompts/reviewer.md"
-      # D-020: synthesizer-style reviewers (node_id contains "synth") write
-      # synthesis.md (the recipe's expected artifact) instead of review-*.json.
+      # D-020/D-054: synthesizer-style reviewers write the recipe's
+      # source_artifact (usually synthesis.md, but recipes can override it to
+      # options.md, report.md, etc.) instead of review-*.json.
       local _is_synth=0
       if [[ "$node_id" == *synth* ]]; then
-        REVIEW_FILE="$RUN_DIR/synthesis.md"
+        local _contract_src="synthesis.md"
+        local _contract="$MINI_ORK_ROOT/recipes/${MINI_ORK_RECIPE:-}/artifact_contract.yaml"
+        if [ -f "$_contract" ]; then
+          _contract_src=$(python3 - "$_contract" <<'PY'
+import sys, yaml
+try:
+    d = yaml.safe_load(open(sys.argv[1], encoding="utf-8")) or {}
+    print(d.get("source_artifact") or "synthesis.md")
+except Exception:
+    print("synthesis.md")
+PY
+)
+        fi
+        REVIEW_FILE="$RUN_DIR/$_contract_src"
         _is_synth=1
       else
         REVIEW_FILE="$RUN_DIR/review-${node_id}.json"
@@ -483,7 +511,8 @@ _dispatch_node() {
         _prepend=$'\n\n--- Recipe prompt (system context) ---\n'"$(cat "$PROMPT_FILE")"$'\n--- /recipe prompt ---\n\n'
       fi
       if [ "$_is_synth" -eq 1 ]; then
-        # Synthesizer: write markdown to synthesis.md; no verdict envelope.
+        # Synthesizer: write markdown to the recipe source artifact; no verdict
+        # envelope.
         PROMPT_CONTENT="${_prepend}Synthesize for: ${node_desc}\n\nPlan:\n${PLAN_CONTENT}\n\nWrite your synthesis to: ${REVIEW_FILE}"
       else
         # Classic reviewer: verdict-JSON envelope expected.
@@ -491,7 +520,7 @@ _dispatch_node() {
       fi
       RESULT=$(llm_dispatch \
         --task-class "$TASK_CLASS" \
-        --node-type "reviewer" \
+        --node-type "$dispatch_lane" \
         --prompt-text "$PROMPT_CONTENT" 2>&1) || { echo "reviewer dispatch failed" >&2; return 1; }
       # D-033: same preserve-agent-Write logic as researcher
       local _result_bytes="${#RESULT}"
@@ -810,9 +839,9 @@ case "$DISPATCH_MODE" in
     # Global override → all in parallel (legacy behavior)
     PIDS=()
     for entry in "${NODE_IDS[@]}"; do
-      IFS=$'\t' read -r node_id node_type node_desc node_prompt_ref node_dmode node_verifier_ref <<< "$entry"
+      IFS="$NODE_FIELD_SEP" read -r node_id node_type node_desc node_prompt_ref node_dmode node_verifier_ref node_model_lane <<< "$entry"
       _maybe_flush_batch_at_cap PIDS
-      ( _dispatch_node "$node_id" "$node_type" "$node_desc" "$node_prompt_ref" "$node_verifier_ref" ) &
+      ( _dispatch_node "$node_id" "$node_type" "$node_desc" "$node_prompt_ref" "$node_verifier_ref" "$node_model_lane" ) &
       PIDS+=($!)
     done
     _flush_parallel_batch PIDS
@@ -821,7 +850,7 @@ case "$DISPATCH_MODE" in
     # Group by node_type; run groups serially, nodes within group in parallel
     declare -A TYPE_GROUPS
     for entry in "${NODE_IDS[@]}"; do
-      IFS=$'\t' read -r node_id node_type node_desc node_prompt_ref node_dmode node_verifier_ref <<< "$entry"
+      IFS="$NODE_FIELD_SEP" read -r node_id node_type node_desc node_prompt_ref node_dmode node_verifier_ref node_model_lane <<< "$entry"
       TYPE_GROUPS[$node_type]+="${entry}"$'\n'
     done
     for node_type in planner researcher implementer reviewer verifier reflector publisher rollback; do
@@ -829,8 +858,8 @@ case "$DISPATCH_MODE" in
       PIDS=()
       while IFS= read -r e; do
         [ -z "$e" ] && continue
-        IFS=$'\t' read -r nid nt nd npr ndm nvr <<< "$e"
-        ( _dispatch_node "$nid" "$nt" "$nd" "$npr" "$nvr" ) &
+        IFS="$NODE_FIELD_SEP" read -r nid nt nd npr ndm nvr nml <<< "$e"
+        ( _dispatch_node "$nid" "$nt" "$nd" "$npr" "$nvr" "$nml" ) &
         PIDS+=($!)
       done <<< "${TYPE_GROUPS[$node_type]}"
       _flush_parallel_batch PIDS
@@ -839,9 +868,9 @@ case "$DISPATCH_MODE" in
   speculative)
     PIDS=()
     for entry in "${NODE_IDS[@]}"; do
-      IFS=$'\t' read -r node_id node_type node_desc node_prompt_ref node_dmode node_verifier_ref <<< "$entry"
+      IFS="$NODE_FIELD_SEP" read -r node_id node_type node_desc node_prompt_ref node_dmode node_verifier_ref node_model_lane <<< "$entry"
       _maybe_flush_batch_at_cap PIDS
-      ( _dispatch_node "$node_id" "$node_type" "$node_desc" "$node_prompt_ref" "$node_verifier_ref" ) &
+      ( _dispatch_node "$node_id" "$node_type" "$node_desc" "$node_prompt_ref" "$node_verifier_ref" "$node_model_lane" ) &
       PIDS+=($!)
     done
     for pid in "${PIDS[@]}"; do
@@ -854,16 +883,16 @@ case "$DISPATCH_MODE" in
     # any `serial` node, then run that serial node alone.
     PIDS=()
     for entry in "${NODE_IDS[@]}"; do
-      IFS=$'\t' read -r node_id node_type node_desc node_prompt_ref node_dmode node_verifier_ref <<< "$entry"
+      IFS="$NODE_FIELD_SEP" read -r node_id node_type node_desc node_prompt_ref node_dmode node_verifier_ref node_model_lane <<< "$entry"
       case "${node_dmode:-serial}" in
         parallel)
-          ( _dispatch_node "$node_id" "$node_type" "$node_desc" "$node_prompt_ref" "$node_verifier_ref" ) &
+          ( _dispatch_node "$node_id" "$node_type" "$node_desc" "$node_prompt_ref" "$node_verifier_ref" "$node_model_lane" ) &
           PIDS+=($!)
           ;;
         *)
           # Flush any pending parallel batch first
           [ "${#PIDS[@]}" -gt 0 ] && _flush_parallel_batch PIDS
-          _dispatch_node "$node_id" "$node_type" "$node_desc" "$node_prompt_ref" "$node_verifier_ref" || FAIL_COUNT=$((FAIL_COUNT+1))
+          _dispatch_node "$node_id" "$node_type" "$node_desc" "$node_prompt_ref" "$node_verifier_ref" "$node_model_lane" || FAIL_COUNT=$((FAIL_COUNT+1))
           ;;
       esac
     done

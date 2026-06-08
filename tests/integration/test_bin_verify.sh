@@ -177,6 +177,52 @@ else
   _fail "--task-class code_fix dry-run exited $EXITCODE"
 fi
 
+# 7. Non-dry-run: descriptive success_verifiers map to verifier_contract commands
+echo ""
+echo "--- 7. Descriptive success_verifiers can run exact verifier_contract commands ---"
+COMMAND_PLAN_PATH="$RUN_DIR/plan-command.json"
+cat > "$COMMAND_PLAN_PATH" <<'JSON'
+{
+  "objective": "Verify command-backed checks",
+  "assumptions": [],
+  "decomposition": [],
+  "dependencies": [],
+  "risk_notes": [],
+  "artifact_contract": {
+    "outputs": ["artifact.txt"],
+    "success_verifiers": [
+      "test -f artifact.txt exits 0",
+      "test -f examples/kickoff.md exits 0 with all assertions passing",
+      "test -f examples/kickoff.md prints valid JSON to stdout"
+    ]
+  },
+  "verifier_contract": {
+    "checks": [
+      {"id": "artifact-exists", "description": "artifact exists", "command": "test -f artifact.txt"},
+      {"id": "slash-label", "description": "slash label command", "command": "test -f examples/kickoff.md"},
+      {"id": "prints-label", "description": "prints label command", "command": "test -f examples/kickoff.md"}
+    ]
+  }
+}
+JSON
+mkdir -p examples
+echo "# kickoff" > examples/kickoff.md
+(
+  export MINI_ORK_DRY_RUN=0
+  OUT=$(mini-ork-verify --plan "$COMMAND_PLAN_PATH" "$TMPROOT/artifact.txt" 2>&1)
+  EXITCODE=$?
+  echo "$OUT"
+  exit "$EXITCODE"
+) >/tmp/mini-ork-verify-command-$$.log 2>&1
+EXITCODE=$?
+OUT=$(cat /tmp/mini-ork-verify-command-$$.log)
+rm -f /tmp/mini-ork-verify-command-$$.log
+if [ "$EXITCODE" -eq 0 ] && echo "$OUT" | grep -q '"verdict": "pass"'; then
+  _ok "descriptive success_verifiers map to verifier_contract command"
+else
+  _fail "descriptive verifier command failed (exit=$EXITCODE output=$OUT)"
+fi
+
 # === TESTS END ===
 
 echo ""
