@@ -1,0 +1,343 @@
+#!/usr/bin/env bash
+# mini-ork-self-improve — wall-clock-budgeted outer loop that drives the
+# recursive-self-improve recipe against the mini-ork checkout itself.
+#
+# Per iteration:
+#   1) Create a git worktree at .mini-ork/worktrees/iter-<N>
+#   2) Stage agents.recursive-self-improve.yaml into the worktree's
+#      MINI_ORK_HOME so the recipe sees minimax/kimi/codex/opus lanes.
+#   3) Run `mini-ork-execute --recipe recursive-self-improve` inside the
+#      worktree.
+#   4) Read the recipe's three verifier results.
+#   5) On full pass: commit changes on a branch named
+#      self-improve/iter-<N>-<ts>, optionally merge into the parent
+#      branch with --auto-merge.
+#   6) On any verifier fail: keep lens reports + arxiv-refs + the failing
+#      diff for next iteration's context, then discard the worktree.
+#   7) Record outcome to learning_record + self_improve_runs.
+#
+# Time budget:
+#   --soft-cap-hours  (default 3) — finish current iter then exit
+#   --hard-cap-hours  (default 5) — kill iter mid-run, mark timed_out
+#
+# Safety:
+#   - Implementer NEVER commits. The runner does.
+#   - Branches are named self-improve/iter-<N>-<ts>. Never force-pushed.
+#   - --dry-run skips dispatch and exits after iter 0 planning.
+
+set -Eeuo pipefail
+
+MINI_ORK_ROOT="${MINI_ORK_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+export MINI_ORK_ROOT
+
+_usage() {
+  cat <<'EOF'
+Usage: mini-ork self-improve [flags]
+
+Flags:
+  --soft-cap-hours <H>   finish current iter when reached (default: 3)
+  --hard-cap-hours <H>   kill mid-iter and exit (default: 5)
+  --max-iters <N>        also bound iteration count (default: unbounded)
+  --auto-merge           merge successful iters into parent branch
+  --parent-branch <ref>  parent branch to merge into (default: current HEAD)
+  --dry-run              plan + scan + exit before any LLM dispatch
+  --resume               continue an interrupted self-improve session
+                         (reads MINI_ORK_DB to pick up the last iter)
+  --help
+
+Env:
+  MINI_ORK_HOME          project home (default: ./.mini-ork)
+  MINI_ORK_DB            SQLite path (default: $MINI_ORK_HOME/state.db)
+EOF
+}
+
+SOFT_HOURS=3
+HARD_HOURS=5
+MAX_ITERS=0
+AUTO_MERGE=0
+PARENT_BRANCH=""
+DRY_RUN=0
+RESUME=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --soft-cap-hours)   SOFT_HOURS="${2:?}"; shift 2 ;;
+    --hard-cap-hours)   HARD_HOURS="${2:?}"; shift 2 ;;
+    --max-iters)        MAX_ITERS="${2:?}"; shift 2 ;;
+    --auto-merge)       AUTO_MERGE=1; shift ;;
+    --parent-branch)    PARENT_BRANCH="${2:?}"; shift 2 ;;
+    --dry-run)          DRY_RUN=1; shift ;;
+    --resume)           RESUME=1; shift ;;
+    --help|-h)          _usage; exit 0 ;;
+    *)                  echo "Unknown flag: $1" >&2; _usage; exit 2 ;;
+  esac
+done
+
+# Sanity: 0 < soft <= hard, hours in (0, 24]
+python3 - "$SOFT_HOURS" "$HARD_HOURS" <<'PY' || { echo "invalid cap hours" >&2; exit 2; }
+import sys
+s = float(sys.argv[1]); h = float(sys.argv[2])
+assert 0 < s <= h <= 24, "expected 0 < soft <= hard <= 24"
+PY
+
+MINI_ORK_HOME="${MINI_ORK_HOME:-$(pwd)/.mini-ork}"
+MINI_ORK_DB="${MINI_ORK_DB:-$MINI_ORK_HOME/state.db}"
+export MINI_ORK_HOME MINI_ORK_DB
+
+mkdir -p "$MINI_ORK_HOME" "$MINI_ORK_HOME/worktrees" "$MINI_ORK_HOME/runs" \
+         "$MINI_ORK_HOME/config"
+
+# Stage the lane-policy override so mini-ork-plan picks it up.
+AGENTS_OVR="$MINI_ORK_ROOT/config/agents.recursive-self-improve.yaml"
+AGENTS_DEST="$MINI_ORK_HOME/config/agents.yaml"
+if [ -f "$AGENTS_OVR" ]; then
+  cp -f "$AGENTS_OVR" "$AGENTS_DEST"
+  echo "[info] staged lane override: $AGENTS_OVR → $AGENTS_DEST"
+else
+  echo "[warn] missing $AGENTS_OVR; relying on $AGENTS_DEST" >&2
+fi
+
+# Apply migrations (idempotent CREATE TABLE IF NOT EXISTS).
+if command -v sqlite3 >/dev/null 2>&1; then
+  if [ -f "$MINI_ORK_ROOT/db/migrations/0017_self_improve_learning.sql" ]; then
+    sqlite3 "$MINI_ORK_DB" < "$MINI_ORK_ROOT/db/migrations/0017_self_improve_learning.sql" \
+      || { echo "[err] migration 0017 failed" >&2; exit 3; }
+    echo "[info] applied migration 0017_self_improve_learning"
+  fi
+else
+  echo "[warn] sqlite3 missing — learning_record table may not exist" >&2
+fi
+
+[ -z "$PARENT_BRANCH" ] && PARENT_BRANCH=$(git -C "$MINI_ORK_ROOT" rev-parse --abbrev-ref HEAD)
+
+START_EPOCH=$(date +%s)
+SOFT_DEADLINE=$(( START_EPOCH + SOFT_HOURS*3600 ))
+HARD_DEADLINE=$(( START_EPOCH + HARD_HOURS*3600 ))
+
+# Resume: pick up from max(iter) in self_improve_runs
+LAST_ITER=0
+if [ "$RESUME" -eq 1 ] && [ -f "$MINI_ORK_DB" ]; then
+  LAST_ITER=$(sqlite3 "$MINI_ORK_DB" \
+    "SELECT COALESCE(MAX(iter),0) FROM self_improve_runs;" 2>/dev/null || echo 0)
+  echo "[info] resume: last iter=$LAST_ITER"
+fi
+ITER=$LAST_ITER
+
+_record_run() {
+  local run_id="$1" status="$2" notes="${3:-}" worktree="${4:-}" branch="${5:-}"
+  python3 - "$MINI_ORK_DB" "$run_id" "$ITER" "$status" "$notes" "$worktree" \
+            "$branch" "$SOFT_DEADLINE" "$HARD_DEADLINE" <<'PY' || true
+import sqlite3, sys, time
+db, run_id, iter_, status, notes, wt, br, soft, hard = sys.argv[1:]
+con = sqlite3.connect(db)
+con.execute("PRAGMA busy_timeout=5000")
+con.execute("""
+    INSERT INTO self_improve_runs (
+        run_id, started_at, finished_at, iter, worktree_path, branch_name,
+        soft_deadline_at, hard_deadline_at, outcome, notes
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(run_id) DO UPDATE SET
+        finished_at=excluded.finished_at,
+        outcome=excluded.outcome,
+        notes=excluded.notes
+""", (run_id, int(time.time()), int(time.time()), int(iter_),
+      wt or None, br or None, int(soft), int(hard),
+      status, notes or None))
+con.commit(); con.close()
+PY
+}
+
+_seconds_to_hms() {
+  local s="$1"
+  printf '%dh%02dm%02ds' $((s/3600)) $(((s/60)%60)) $((s%60))
+}
+
+_iter_run() {
+  ITER=$(( ITER + 1 ))
+  local now ts run_id wt_name wt_path branch
+  now=$(date +%s)
+  ts=$(date -u +%Y%m%d%H%M%S)
+  run_id="self-improve-iter-${ITER}-${ts}"
+  wt_name="iter-${ITER}-${ts}"
+  wt_path="$MINI_ORK_HOME/worktrees/${wt_name}"
+  branch="self-improve/iter-${ITER}-${ts}"
+
+  echo
+  echo "=============================================================="
+  echo "iter=${ITER} run_id=${run_id} budget_remaining=$(_seconds_to_hms $(( HARD_DEADLINE - now )))"
+  echo "=============================================================="
+
+  _record_run "$run_id" "pending" "starting" "$wt_path" "$branch"
+
+  # 1. Create worktree on a fresh branch off the parent
+  if ! git -C "$MINI_ORK_ROOT" worktree add -b "$branch" "$wt_path" "$PARENT_BRANCH" 2>&1 | sed 's/^/  [worktree] /'; then
+    _record_run "$run_id" "failed" "worktree-add-failed" "$wt_path" "$branch"
+    return 1
+  fi
+
+  # 2. Run dir lives under the runner's MINI_ORK_HOME, NOT the worktree's.
+  local RUN_DIR="$MINI_ORK_HOME/runs/${run_id}"
+  mkdir -p "$RUN_DIR" "$RUN_DIR/patches"
+
+  # 3. Compose kickoff for this iteration
+  cat > "$RUN_DIR/kickoff.md" <<EOF
+# Recursive Self-Improvement — iter ${ITER}
+
+Target: mini-ork checkout at \`${wt_path}\`.
+
+Prior iteration learnings live in \`learning_record\` (sqlite at
+\`${MINI_ORK_DB}\`); the bottleneck scanner must dedupe against them.
+
+Provider policy (override): see \`${AGENTS_DEST}\`. Researchers must
+NOT route to Anthropic-family lanes other than the synthesizer.
+
+Time budget: soft cap ${SOFT_HOURS}h, hard cap ${HARD_HOURS}h.
+Iteration ${ITER} budget remaining: $(_seconds_to_hms $(( HARD_DEADLINE - $(date +%s) ))).
+EOF
+
+  if [ "$DRY_RUN" -eq 1 ]; then
+    echo "  [dry-run] would dispatch recipe recursive-self-improve inside $wt_path"
+    _record_run "$run_id" "aborted" "dry-run" "$wt_path" "$branch"
+    git -C "$MINI_ORK_ROOT" worktree remove --force "$wt_path" 2>/dev/null || true
+    git -C "$MINI_ORK_ROOT" branch -D "$branch" 2>/dev/null || true
+    return 0
+  fi
+
+  # 4. Dispatch. The worktree is the cwd; MINI_ORK_RUN_DIR is the runner's.
+  export MINI_ORK_RUN_ID="$run_id"
+  export MINI_ORK_RUN_DIR="$RUN_DIR"
+  export MINI_ORK_RECIPE="recursive-self-improve"
+  export MINI_ORK_SELF_IMPROVE_ITER="$ITER"
+  export MINI_ORK_SELF_IMPROVE_WORKTREE="$wt_path"
+  export MINI_ORK_TIMESTAMP="$ts"
+
+  local time_left=$(( HARD_DEADLINE - $(date +%s) ))
+  local per_iter_budget=$(( time_left > 3600 ? 3600 : time_left ))
+  echo "  [iter] dispatching (budget ${per_iter_budget}s)"
+
+  local exec_log="$RUN_DIR/execute.log"
+  local exec_rc=0
+  ( cd "$wt_path" && \
+    timeout "${per_iter_budget}" "$MINI_ORK_ROOT/bin/mini-ork-execute" \
+        --recipe recursive-self-improve \
+        --kickoff "$RUN_DIR/kickoff.md" \
+        > "$exec_log" 2>&1 ) || exec_rc=$?
+
+  # 5. Read verifier outcomes — each writes JSON to its log.
+  local v_bottle="$RUN_DIR/verifier-bottlenecks-found.log"
+  local v_tests="$RUN_DIR/verifier-self-tests-pass.log"
+  local v_reg="$RUN_DIR/verifier-no-regression.log"
+
+  local pass_bottle=0 pass_tests=0 pass_reg=0 converged=0
+  # The verifiers themselves emit JSON on stdout, which mini-ork-execute
+  # captures into $RUN_DIR/verifier-result-*.json. Fall back to the raw
+  # evidence logs above.
+  for vname in bottlenecks-found self-tests-pass no-regression; do
+    local jpath="$RUN_DIR/verifier-result-${vname}.json"
+    if [ ! -f "$jpath" ]; then
+      # Re-run the verifier directly to populate stdout.
+      bash "$MINI_ORK_ROOT/recipes/recursive-self-improve/verifiers/${vname}.sh" \
+        > "$jpath" 2>/dev/null || true
+    fi
+    if [ -f "$jpath" ]; then
+      local p c
+      p=$(python3 -c "import json,sys; d=json.load(open('$jpath')); print('1' if d.get('pass') else '0')" 2>/dev/null || echo 0)
+      c=$(python3 -c "import json; d=json.load(open('$jpath')); print('1' if d.get('converged') else '0')" 2>/dev/null || echo 0)
+      case "$vname" in
+        bottlenecks-found) pass_bottle="$p"; converged="$c" ;;
+        self-tests-pass)   pass_tests="$p" ;;
+        no-regression)     pass_reg="$p" ;;
+      esac
+    fi
+  done
+
+  echo "  [iter] verifiers: bottle=$pass_bottle tests=$pass_tests regression=$pass_reg converged=$converged exec_rc=$exec_rc"
+
+  # 6. Decide outcome
+  local outcome="rejected" notes=""
+  if [ "$converged" -eq 1 ]; then
+    outcome="converged"
+    notes="scanner-reported-convergence"
+  elif [ "$exec_rc" -eq 124 ]; then
+    outcome="timed_out"
+    notes="per-iter-timeout"
+  elif [ "$pass_bottle" = "1" ] && [ "$pass_tests" = "1" ] && [ "$pass_reg" = "1" ]; then
+    outcome="success"
+    notes="all-verifiers-pass"
+  elif [ "$pass_bottle" = "1" ] && { [ "$pass_tests" = "0" ] || [ "$pass_reg" = "0" ]; }; then
+    outcome="rejected"
+    notes="patch-failed-verifier"
+  else
+    outcome="failed"
+    notes="planner-or-synth-failed"
+  fi
+
+  # 7. Commit + auto-merge on success, otherwise discard worktree
+  if [ "$outcome" = "success" ]; then
+    if ! git -C "$wt_path" diff --quiet 2>/dev/null || ! git -C "$wt_path" diff --cached --quiet 2>/dev/null; then
+      git -C "$wt_path" add -A
+      git -C "$wt_path" commit -m "self-improve: iter ${ITER} — see runs/${run_id}/synthesis.md" \
+        --author="mini-ork-self-improve <self-improve@mini-ork.local>" \
+        | sed 's/^/  [commit] /'
+    else
+      echo "  [info] no diff to commit (verifiers passed but nothing changed)"
+    fi
+    if [ "$AUTO_MERGE" -eq 1 ]; then
+      ( cd "$MINI_ORK_ROOT" && git merge --no-ff -m "merge self-improve iter ${ITER}" "$branch" ) \
+        | sed 's/^/  [merge] /' || {
+          echo "  [warn] merge failed; branch $branch left for human review"
+        }
+    fi
+  else
+    echo "  [iter] discarding worktree (outcome=$outcome)"
+    # Preserve diff for next iter's planner context
+    git -C "$wt_path" diff > "$RUN_DIR/patches/iter-${ITER}.diff" 2>/dev/null || true
+  fi
+
+  # 8. Cleanup worktree (branch stays — never delete failed branches
+  #    automatically; operator chooses)
+  git -C "$MINI_ORK_ROOT" worktree remove --force "$wt_path" 2>/dev/null || true
+
+  _record_run "$run_id" "$outcome" "$notes" "$wt_path" "$branch"
+  return 0
+}
+
+# Outer loop
+while :; do
+  NOW=$(date +%s)
+  if [ "$NOW" -ge "$HARD_DEADLINE" ]; then
+    echo "[hard-cap] reached after $(_seconds_to_hms $(( NOW - START_EPOCH )))"
+    break
+  fi
+  if [ "$MAX_ITERS" -gt 0 ] && [ "$ITER" -ge "$MAX_ITERS" ]; then
+    echo "[max-iters] ITER=$ITER reached --max-iters=$MAX_ITERS"
+    break
+  fi
+
+  _iter_run || true
+
+  NOW=$(date +%s)
+  LAST_OUTCOME=$(sqlite3 "$MINI_ORK_DB" \
+    "SELECT outcome FROM self_improve_runs ORDER BY started_at DESC LIMIT 1;" \
+    2>/dev/null || echo "")
+  if [ "$LAST_OUTCOME" = "converged" ]; then
+    echo "[converged] scanner reported convergence; stopping"
+    break
+  fi
+  if [ "$NOW" -ge "$SOFT_DEADLINE" ]; then
+    echo "[soft-cap] reached after $(_seconds_to_hms $(( NOW - START_EPOCH ))); exiting after this iter"
+    break
+  fi
+done
+
+echo
+echo "=============================================================="
+echo "self-improve session complete"
+echo "  iters_run:   $ITER"
+echo "  wall_clock:  $(_seconds_to_hms $(( $(date +%s) - START_EPOCH )))"
+echo "  db:          $MINI_ORK_DB"
+echo "  summary:"
+sqlite3 -header -column "$MINI_ORK_DB" \
+  "SELECT iter, outcome, notes FROM self_improve_runs ORDER BY iter;" \
+  2>/dev/null || true
+echo "=============================================================="
