@@ -11,7 +11,7 @@ nodes:
   # heterogeneous-family multi-agent review (per Rajan 2025 ρ<0.25 +
   # Nasser 2026 harshness diversity). Was: 3 of 4 lenses collapsed to
   # Sonnet via decomposer/spec_author/worker mapping — coalition by
-  # accident. Now: glm/kimi/codex/opus dispatch to 4 distinct families.
+  # accident. Now: glm/kimi/codex/minimax dispatch to 4 distinct families.
   - { name: glm_lens,       type: researcher,  model_lane: glm_lens,     prompt_ref: prompts/lens-glm.md,    dispatch_mode: parallel, gates: [budget_gate] }
   - { name: kimi_lens,      type: researcher,  model_lane: kimi_lens,    prompt_ref: prompts/lens-kimi.md,   dispatch_mode: parallel, gates: [budget_gate] }
   - { name: codex_lens,     type: researcher,  model_lane: codex_lens,   prompt_ref: prompts/lens-codex.md,  dispatch_mode: parallel, gates: [budget_gate] }
