@@ -9,7 +9,7 @@ The audit is composed of 4 parallel **lens** stances (all map to
 - **glm-lens** (researcher): fast tactical bottleneck scan (breadth > depth, grep-driven)
 - **kimi-lens** (researcher): code-level refactor proposals with concrete before/after diffs
 - **codex-lens** (researcher): LLM-dispatch / cost optimization deep-dive
-- **minimax-lens** (researcher): architectural-shape + final synthesis perspective
+- **opus-lens** (researcher): architectural-shape + final synthesis perspective
 
 Plus 1 synthesizer node (`node_type: "reviewer"` — it reviews + composes
 the 4 lens reports) and 1 completeness-verifier (`node_type: "verifier"`)
