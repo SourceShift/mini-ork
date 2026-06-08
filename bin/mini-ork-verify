@@ -88,6 +88,8 @@ fi
 
 # ── extract verifiers from artifact_contract ──────────────────────────────────
 declare -a VERIFIER_NAMES=()
+EVIDENCE_DIR="$MINI_ORK_HOME/runs/evidence"
+mkdir -p "$EVIDENCE_DIR"
 if [ -n "$PLAN_PATH" ] && [ -f "$PLAN_PATH" ]; then
   [ -z "$TASK_CLASS" ] && TASK_CLASS=$(python3 -c "
 import sys, json
@@ -100,7 +102,10 @@ print(p.get('task_class', 'generic'))
 import sys, json
 with open(sys.argv[1]) as f:
     p = json.load(f)
-for v in p.get("artifact_contract", {}).get("success_verifiers", []):
+artifact_contract = p.get("artifact_contract", {})
+if not isinstance(artifact_contract, dict):
+    artifact_contract = {}
+for v in artifact_contract.get("success_verifiers", []) or []:
     print(v)
 PY
   )
@@ -151,8 +156,6 @@ for verifier_name in "${VERIFIER_NAMES[@]}"; do
   [ -z "$verifier_name" ] && continue
 
   verifier_script=$(_find_verifier_script "$verifier_name")
-  EVIDENCE_DIR="$MINI_ORK_HOME/runs/evidence"
-  mkdir -p "$EVIDENCE_DIR"
   # D-036: normalize raw `verifiers/lens-completeness.sh` → `lens-completeness`
   # for the EVIDENCE_PATH stem too. D-026 fixed the script-LOOKUP path but
   # the EVIDENCE_PATH still used raw name → tried writing
@@ -192,7 +195,19 @@ done
 GATE_VERDICT="pass"
 if [ "$DRY_RUN" -eq 0 ] && [ -f "$MINI_ORK_ROOT/lib/gate_registry.sh" ]; then
   _require_lib gate_registry
-  if ! gate_run_all "$TASK_CLASS" "$ARTIFACT_PATH" >> "$EVIDENCE_DIR/gates-$(date +%s).log" 2>&1; then
+  GATE_CONTEXT=$(python3 - "$TASK_CLASS" "$ARTIFACT_PATH" "${PLAN_PATH:-}" "${MINI_ORK_RUN_ID:-}" <<'PY'
+import json, sys
+task_class, artifact_path, plan_path, run_id = sys.argv[1:5]
+print(json.dumps({
+    "task_class": task_class,
+    "artifact_path": artifact_path,
+    "plan_path": plan_path,
+    "panel_run_id": run_id,
+    "cost_usd": 0.0,
+}))
+PY
+  )
+  if ! gate_run_all "$TASK_CLASS" "$GATE_CONTEXT" >> "$EVIDENCE_DIR/gates-$(date +%s).log" 2>&1; then
     GATE_VERDICT="fail"
     FAIL_COUNT=$((FAIL_COUNT+1))
     RESULTS+=("{\"verifier\":\"__gates__\",\"pass\":false,\"evidence_path\":\"gate_registry\"}")

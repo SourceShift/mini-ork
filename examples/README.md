@@ -1,7 +1,7 @@
 # mini-ork Examples
 
-Three runnable examples, ordered by complexity. Start with `01-hello-world`
-to verify your install, then progress to the multi-agent patterns.
+Start with `01-hello-world` to verify your install. Additional multi-agent
+examples should be added to this index only when their directories exist.
 
 ---
 
@@ -10,8 +10,6 @@ to verify your install, then progress to the multi-agent patterns.
 | # | Name | Description | Expected Cost | Expected Runtime | Features |
 |---|---|---|---|---|---|
 | 01 | [hello-world](./01-hello-world/) | Add a CHANGELOG entry under `[Unreleased]` | ~$0.004 | < 60 s | single epic, minimal kickoff, fast install check |
-| 02 | [bug-hunt](./02-bug-hunt/) | Find + fix all empty `catch {}` blocks in `src/` | ~$0.40–0.55 | ~8–12 min | 3 parallel GLM hunters, NDJSON dedup, regression tests |
-| 03 | [refactor-pipeline](./03-refactor-pipeline/) | Extract shared helpers via ARCH → MODULE → ATOM pipeline | ~$0.15–0.50 | ~14 min | 3-stage pipeline, consensus gate, parallel Sonnet workers |
 
 ---
 
@@ -20,13 +18,9 @@ to verify your install, then progress to the multi-agent patterns.
 **Verify install only** → `01-hello-world`. Needs any git repo with a
 `CHANGELOG.md`. Single LLM call, exits in under a minute.
 
-**Multi-agent fan-out** → `02-bug-hunt`. Shows how mini-ork runs hunters in
-parallel, merges their NDJSON, then chains a fix worker. Any TypeScript
-project with `src/` works.
-
-**Large refactor** → `03-refactor-pipeline`. Shows the ARCH→MODULE→ATOM
-three-stage pipeline with an explicit consensus gate. Best for files with
-100+ lines that mix unrelated concerns.
+**Multi-agent fan-out** examples are not checked into this repository yet.
+Add them as real `examples/NN-<slug>/` directories before linking them from
+the index.
 
 ---
 
