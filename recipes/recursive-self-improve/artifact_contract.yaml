@@ -1,0 +1,18 @@
+task_class: recursive_self_improve
+expected_artifact: composite
+
+success_verifiers:
+  - verifiers/bottlenecks-found.sh
+  - verifiers/self-tests-pass.sh
+  - verifiers/no-regression.sh
+
+failure_policy: discard_patch_keep_learning
+rollback_policy: >
+  Preserve lens-*.md, arxiv-refs.md, synthesis.md, and any patch
+  diff under runs/<id>/patches/ for human review and pattern_store
+  ingestion. Discard implementer-applied source changes only after
+  the runner records the iteration's learning_record row.
+
+source_artifact: synthesis.md
+outputs:
+  - docs/improvements/self-improve-latest.md
