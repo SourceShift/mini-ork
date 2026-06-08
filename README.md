@@ -242,7 +242,7 @@ See [docs/SAFETY.md](docs/SAFETY.md) for immutable constraints and the Promotion
 
 ## Roadmap
 
-**Current: v0.3.0-rc1** (in flight, 2026-06-05) — oracle-hardening primitives shipped: `coalition_gate.sh`, `cw_por.sh`, `mo_promote_synthesis_gate`, `adaptive_stability.sh`, `circuit_breaker.sh`. Self-evolution is now explicitly class-restricted (`docs/positioning/why-mini-ork.md` §"Self-evolution is class-restricted").
+**Current: v0.3.0-rc1** (release candidate, 2026-06-08) — oracle-hardening primitives shipped: `coalition_gate.sh`, `cw_por.sh`, `mo_promote_synthesis_gate`, `adaptive_stability.sh`, `circuit_breaker.sh`. Self-evolution is now explicitly class-restricted (`docs/positioning/why-mini-ork.md` §"Self-evolution is class-restricted").
 
 The full release log lives in [`ROADMAP.md`](ROADMAP.md) — every section dated and per-commit-attributed. Current shipped totals (regenerable via `mini-ork doctor`):
 
