@@ -2,7 +2,7 @@ version: "0.1.0"
 task_class: refactor_audit
 description: >
   Multi-model audit recipe — 4 lens stances run in parallel
-  (glm/kimi/codex/minimax) with opus AS META-REVIEWER (synthesizer),
+  (glm/kimi/codex/opus) with opus AS ARCHITECTURAL LENS,
   1 synthesis pass composes findings, publisher emits final audit doc.
 
 nodes:
@@ -11,11 +11,11 @@ nodes:
   # heterogeneous-family multi-agent review (per Rajan 2025 ρ<0.25 +
   # Nasser 2026 harshness diversity). Was: 3 of 4 lenses collapsed to
   # Sonnet via decomposer/spec_author/worker mapping — coalition by
-  # accident. Now: glm/kimi/codex/minimax dispatch to 4 distinct families.
+  # accident. Now: glm/kimi/codex/opus dispatch to 4 distinct families.
   - { name: glm_lens,       type: researcher,  model_lane: glm_lens,     prompt_ref: prompts/lens-glm.md,    dispatch_mode: parallel, gates: [budget_gate] }
   - { name: kimi_lens,      type: researcher,  model_lane: kimi_lens,    prompt_ref: prompts/lens-kimi.md,   dispatch_mode: parallel, gates: [budget_gate] }
   - { name: codex_lens,     type: researcher,  model_lane: codex_lens,   prompt_ref: prompts/lens-codex.md,  dispatch_mode: parallel, gates: [budget_gate] }
-  - { name: minimax_lens,      type: researcher,  model_lane: minimax_lens,    prompt_ref: prompts/lens-minimax.md,   dispatch_mode: parallel, gates: [budget_gate] }
+  - { name: opus_lens,      type: researcher,  model_lane: opus_lens,    prompt_ref: prompts/lens-opus.md,   dispatch_mode: parallel, gates: [budget_gate] }
   - { name: synthesizer,    type: reviewer,    model_lane: reviewer,     prompt_ref: prompts/synthesis.md,    dispatch_mode: serial,   gates: [budget_gate] }
   - { name: lens_completeness, type: verifier, verifier_ref: verifiers/lens-completeness.sh, dispatch_mode: serial }
   - { name: publisher,      type: publisher,   prompt_ref: null, dispatch_mode: serial, gates: [scope_gate] }
@@ -25,11 +25,11 @@ edges:
   - { from: planner, to: glm_lens,   edge_type: depends_on }
   - { from: planner, to: kimi_lens,  edge_type: depends_on }
   - { from: planner, to: codex_lens, edge_type: depends_on }
-  - { from: planner, to: minimax_lens,  edge_type: depends_on }
+  - { from: planner, to: opus_lens,  edge_type: depends_on }
   - { from: glm_lens,   to: synthesizer, edge_type: supplies_context_to }
   - { from: kimi_lens,  to: synthesizer, edge_type: supplies_context_to }
   - { from: codex_lens, to: synthesizer, edge_type: supplies_context_to }
-  - { from: minimax_lens,  to: synthesizer, edge_type: supplies_context_to }
+  - { from: opus_lens,  to: synthesizer, edge_type: supplies_context_to }
   - { from: synthesizer, to: lens_completeness, edge_type: verifies }
   - { from: lens_completeness, to: publisher, edge_type: depends_on }
   - { from: synthesizer, to: rollback, edge_type: escalates_to }
