@@ -19,6 +19,9 @@ Exit 1 = at least one check failed (see `[FAIL]` lines).
 | `tests/smoke.sh` | Deps, DB init, bash syntax, shellcheck | `sqlite3`, `jq`, `git`, `bash 4+` |
 | `tests/unit/test_memory.sh` | `lib/memory.sh` CRUD assertions | `lib/memory.sh` + `db/init.sh` |
 | `tests/unit/test_dispatch.sh` | `lib/dispatch.sh` error-handling | `lib/dispatch.sh` + `db/init.sh` |
+| `tests/integration/test_bin_spawn.sh` | `mini-ork spawn` CLI lineage, child workspace, and child cap | `sqlite3`, `git`, dry-run mode |
+| `tests/e2e/test_e2e_recursive_orchestration.sh` | root -> child -> grandchild recursive orchestration | `sqlite3`, `git`, dry-run mode |
+| `tests/security/test_sec_recursive_spawn_limits.sh` | depth, authority, and orphan-parent spawn blocking | `sqlite3`, `git` |
 
 ---
 
@@ -27,6 +30,9 @@ Exit 1 = at least one check failed (see `[FAIL]` lines).
 ```bash
 bash tests/unit/test_memory.sh
 bash tests/unit/test_dispatch.sh
+bash tests/integration/test_bin_spawn.sh
+bash tests/e2e/test_e2e_recursive_orchestration.sh
+bash tests/security/test_sec_recursive_spawn_limits.sh
 ```
 
 All test scripts follow the same convention:

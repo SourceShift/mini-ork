@@ -15,6 +15,8 @@ from .types import (
     RunEvent,
     RunRequest,
     RunResult,
+    SpawnRequest,
+    SpawnResult,
     TaskClassSpec,
     WorkflowSpec,
 )
@@ -31,6 +33,8 @@ __all__ = [
     "RunEvent",
     "RunRequest",
     "RunResult",
+    "SpawnRequest",
+    "SpawnResult",
     "TaskClassSpec",
     "WorkflowSpec",
 ]
