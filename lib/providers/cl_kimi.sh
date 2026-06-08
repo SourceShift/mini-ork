@@ -9,7 +9,7 @@
 #
 # See lib/providers/README.md for the secrets.local.sh pattern.
 
-export ANTHROPIC_AUTH_TOKEN="${KIMI_API_KEY:?KIMI_API_KEY is required — set it in \${MINI_ORK_HOME}/config/secrets.local.sh}"
+export ANTHROPIC_AUTH_TOKEN="${KIMI_API_KEY:?KIMI_API_KEY is required - set it in MINI_ORK_HOME/config/secrets.local.sh}"
 export ANTHROPIC_BASE_URL=https://api.kimi.com/coding/
 # Stable model ID per official Kimi Code docs (kimi.com/code/docs/en):
 # "always use the model ID `kimi-for-coding` ... the backend automatically
