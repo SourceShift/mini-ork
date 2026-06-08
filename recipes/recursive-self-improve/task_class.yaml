@@ -1,0 +1,40 @@
+name: recursive_self_improve
+version: "0.1.0"
+description: >
+  Time-budgeted recursive self-improvement of mini-ork. Three
+  heterogeneous-family research lenses (minimax perf, kimi
+  correctness, codex arch) plus an arXiv-grounded research lane
+  feed an Opus synthesizer that emits a ranked patch plan. Codex
+  implements the top patch in a git worktree; deterministic
+  verifiers gate promotion. Outer runner (bin/mini-ork-self-improve)
+  loops for 3-5 hours, persisting cross-iteration learning to
+  pattern_records + learning_record tables.
+
+matches:
+  keywords:
+    - self-improve
+    - recursive self-improvement
+    - bottleneck audit
+    - performance audit
+    - self-optimize
+    - meta-improvement
+  regex: []
+
+artifact_contract_ref: artifact_contract.yaml
+default_workflow: workflow.yaml
+
+default_gates:
+  - budget_gate
+  - scope_gate
+
+risk_class: high   # Self-mutation; runs only inside worktree, gated by verifiers.
+
+cost_model:
+  min_usd: 4
+  max_usd: 35
+  per_lens_usd: 5
+  per_synth_usd: 8   # Opus reviewer
+
+runtime_model:
+  min_minutes: 20    # one iteration
+  max_minutes: 60
