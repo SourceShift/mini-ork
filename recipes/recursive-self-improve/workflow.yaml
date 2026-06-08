@@ -1,0 +1,53 @@
+version: "0.1.0"
+task_class: recursive_self_improve
+description: >
+  Recursive self-improvement loop for mini-ork itself. Per iteration:
+  scan repo + run-DB + benchmark deltas for bottlenecks, dispatch
+  three heterogeneous-family research lenses (minimax perf, kimi
+  correctness, codex architecture), pull arXiv evidence via the
+  research lane, opus synthesizes a ranked patch plan, codex
+  implements the top patch inside a git worktree, deterministic
+  verifiers gate progression. Cross-iteration learning is persisted
+  via lib/pattern_store.sh + learning_record table.
+#
+# Lane diversity rationale: Rajan 2025 + Nasser 2026 — multi-agent
+# review's submodularity gain only holds when pairwise voter
+# correlation stays low. Distinct families: MiniMax (perf), Moonshot
+# Kimi (correctness), OpenAI Codex (arch), Anthropic Opus (synthesis).
+
+nodes:
+  - { name: bottleneck_scanner,  type: planner,     model_lane: planner,         prompt_ref: prompts/bottleneck-scan.md,      dispatch_mode: serial,   gates: [budget_gate] }
+  - { name: perf_lens,           type: researcher,  model_lane: minimax_lens,    prompt_ref: prompts/lens-minimax-perf.md,    dispatch_mode: parallel, gates: [budget_gate] }
+  - { name: correctness_lens,    type: researcher,  model_lane: kimi_lens,       prompt_ref: prompts/lens-kimi-correctness.md,dispatch_mode: parallel, gates: [budget_gate] }
+  - { name: arch_lens,           type: researcher,  model_lane: codex_lens,      prompt_ref: prompts/lens-codex-arch.md,      dispatch_mode: parallel, gates: [budget_gate] }
+  - { name: arxiv_research,      type: researcher,  model_lane: codex_lens,      prompt_ref: prompts/arxiv-researcher.md,     dispatch_mode: parallel, gates: [budget_gate] }
+  - { name: opus_synthesizer,    type: reviewer,    model_lane: opus_lens,       prompt_ref: prompts/opus-synthesis.md,       dispatch_mode: serial,   gates: [budget_gate] }
+  - { name: bottlenecks_found,   type: verifier,    verifier_ref: verifiers/bottlenecks-found.sh, dispatch_mode: serial }
+  - { name: implementer,         type: implementer, model_lane: codex_lens,      prompt_ref: prompts/implementer.md,          dispatch_mode: serial,   gates: [scope_gate, budget_gate] }
+  - { name: self_tests_pass,     type: verifier,    verifier_ref: verifiers/self-tests-pass.sh,   dispatch_mode: serial }
+  - { name: no_regression,       type: verifier,    verifier_ref: verifiers/no-regression.sh,     dispatch_mode: serial }
+  - { name: publisher,           type: publisher,   prompt_ref: null,                            dispatch_mode: serial,   gates: [scope_gate] }
+  - { name: rollback,            type: rollback,    prompt_ref: null,                            dispatch_mode: serial }
+
+edges:
+  - { from: bottleneck_scanner, to: perf_lens,        edge_type: depends_on }
+  - { from: bottleneck_scanner, to: correctness_lens, edge_type: depends_on }
+  - { from: bottleneck_scanner, to: arch_lens,        edge_type: depends_on }
+  - { from: bottleneck_scanner, to: arxiv_research,   edge_type: depends_on }
+  - { from: perf_lens,          to: opus_synthesizer, edge_type: supplies_context_to }
+  - { from: correctness_lens,   to: opus_synthesizer, edge_type: supplies_context_to }
+  - { from: arch_lens,          to: opus_synthesizer, edge_type: supplies_context_to }
+  - { from: arxiv_research,     to: opus_synthesizer, edge_type: supplies_context_to }
+  - { from: opus_synthesizer,   to: bottlenecks_found, edge_type: verifies }
+  - { from: bottlenecks_found,  to: implementer,      edge_type: depends_on }
+  - { from: implementer,        to: self_tests_pass,  edge_type: verifies }
+  - { from: self_tests_pass,    to: no_regression,    edge_type: depends_on }
+  - { from: no_regression,      to: publisher,        edge_type: depends_on }
+  - { from: bottlenecks_found,  to: rollback,         edge_type: escalates_to }
+  - { from: self_tests_pass,    to: rollback,         edge_type: escalates_to }
+  - { from: no_regression,      to: rollback,         edge_type: escalates_to }
+
+rollback_strategy: keep_lens_reports_and_arxiv_refs_discard_patch
+max_self_correction_iterations: 2
+human_decision_artifact: null   # autonomous loop; outer runner gates promotion
+source_artifact: synthesis.md
