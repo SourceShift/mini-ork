@@ -41,13 +41,14 @@ lanes:
   glm_lens:     glm         # Zhipu
   kimi_lens:    kimi        # Moonshot
   codex_lens:   codex       # OpenAI Codex
-  minimax_lens: minimax     # MiniMax (M3, Anthropic-compatible gateway)
-  # cross-family synthesizer (different role from lenses: arbiter)
+  opus_lens:    opus        # Anthropic Opus
+  minimax_lens: minimax     # MiniMax (M3, opt-in 5th lens where budget allows)
+  # cross-family synthesizer / reviewer lane
   reviewer:     opus        # Anthropic
   decomposer:   deepseek    # DeepSeek (different family for planning)
 ```
 
-7 model-family wrappers ship out of the box at [`lib/providers/`](lib/providers/): `cl_{glm,kimi,codex,deepseek,opus,sonnet,minimax}.sh`. The audit recipe at [`recipes/refactor-audit/`](recipes/refactor-audit/) uses all 4 distinct lens families per cycle (glm + kimi + codex + minimax) with opus as the cross-family meta-reviewer, verified end-to-end on 2026-06-04 (see [the upstream self-audit](docs/refactor/synthesis-latest.md)).
+7 model-family wrappers ship out of the box at [`lib/providers/`](lib/providers/): `cl_{glm,kimi,codex,deepseek,opus,sonnet,minimax}.sh`. The audit recipe at [`recipes/refactor-audit/`](recipes/refactor-audit/) uses all 4 distinct lens families per cycle (glm + kimi + codex + opus). MiniMax is available as an opt-in additional family for recipes that can afford a 5th lens.
 
 ### What you trade for what
 
@@ -89,11 +90,14 @@ mini-ork init
 # 3. Write a kickoff (or copy an example)
 cp ~/ps/mini-ork/examples/01-hello-world/kickoff.md ./kickoff.md
 
-# 4. Run a recipe (dry-run first, no API keys needed)
+# 4. Run from a kickoff (dry-run first, no API keys needed)
+MINI_ORK_DRY_RUN=1 mini-ork run ./kickoff.md
+
+# Or force a recipe explicitly
 MINI_ORK_DRY_RUN=1 mini-ork run code-fix ./kickoff.md
 
 # 5. For real LLM calls (needs `claude` CLI authenticated)
-mini-ork run code-fix ./kickoff.md
+mini-ork run ./kickoff.md
 ```
 
 `mini-ork run` exits 0 on verified artifact, 1 on gate failure or escalation. All state is in `${MINI_ORK_DB}` (default: `.mini-ork/state.db`). Inspect with:
@@ -192,7 +196,7 @@ Recipes are user-land workflow definitions. They compose framework primitives in
 | `code-fix` | `recipes/code-fix/` | Single-patch fix with typecheck, test, and reviewer gates. Minimal reference recipe. |
 | `bdd-first-delivery` | `recipes/bdd-first-delivery/` | BDD-first multi-epic delivery: decompose → parallel (spec_author + implementer) → bdd_runner → reviewer → publisher. |
 | `docs` | `recipes/docs/` | Single-doc edit verified by grep-pattern assertions + relative-link integrity. No typecheck / test / rollback (docs edits are reversed via `git restore`). |
-| `refactor-audit` | `recipes/refactor-audit/` | 4 lens stances run in parallel (glm/kimi/codex/minimax) with opus as meta-reviewer (synthesizer). The framework's own self-audit recipe. |
+| `refactor-audit` | `recipes/refactor-audit/` | 4 lens stances run in parallel (glm/kimi/codex/opus), with Opus preserved as the architectural-shape lens. The framework's own self-audit recipe. |
 | `research-synthesis` | `recipes/research-synthesis/` | 4-lens research synthesis (web/lit/code/narrative on distinct families) → synthesizer → publisher. |
 | `blog-post` | `recipes/blog-post/` | 5-lens blog drafting (editor / researcher / narrative / audience / counter) in parallel across distinct families. |
 | `db-migration` | `recipes/db-migration/` | 5-lens migration audit + plan: integrity / rollback / perf / compat / edge-data in parallel across distinct families. |
