@@ -175,9 +175,36 @@ fi
 
 # plan step should have emitted plan_path=
 if echo "$RUN_OUT" | grep -qE '^plan_path='; then
+  PLAN_PATH=$(echo "$RUN_OUT" | grep -E '^plan_path=' | head -1 | cut -d= -f2)
   _ok "plan step emitted plan_path="
 else
   _fail "plan step did NOT emit plan_path= line"
+fi
+
+# profile step should have emitted profile_path= and written run_profile.json
+PROFILE_PATH=$(echo "$RUN_OUT" | grep -E '^profile_path=' | head -1 | cut -d= -f2)
+if [ -n "$PROFILE_PATH" ] && [ -f "$PROFILE_PATH" ]; then
+  _ok "profile step wrote run_profile.json"
+else
+  _fail "profile step did NOT write run_profile.json (output: $(echo "$RUN_OUT" | head -12))"
+fi
+
+if [ -n "$PROFILE_PATH" ]; then
+  PROFILE_STATUS=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('profile_status',''))" "$PROFILE_PATH" 2>/dev/null || true)
+  if [ -n "$PROFILE_STATUS" ]; then
+    _ok "run_profile.json includes profile_status=${PROFILE_STATUS}"
+  else
+    _fail "run_profile.json missing profile_status"
+  fi
+fi
+
+if [ -n "${PLAN_PATH:-}" ] && [ -f "${PLAN_PATH:-}" ]; then
+  PLAN_PROFILE_PATH=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('run_profile_path',''))" "$PLAN_PATH" 2>/dev/null || true)
+  if [ "$PLAN_PROFILE_PATH" = "$PROFILE_PATH" ]; then
+    _ok "plan.json records run_profile_path"
+  else
+    _fail "plan.json did not record run_profile_path"
+  fi
 fi
 
 # verify step should have emitted JSON with verdict
@@ -251,6 +278,48 @@ if echo "$MD_RUN_OUT" | grep -q '"verdict"'; then
   _ok "kickoff.md inferred path reached verify"
 else
   _fail "kickoff.md inferred path did not reach verify"
+fi
+
+MD_PROFILE_PATH=$(echo "$MD_RUN_OUT" | grep -E '^profile_path=' | head -1 | cut -d= -f2)
+if [ -n "$MD_PROFILE_PATH" ] && [ -f "$MD_PROFILE_PATH" ]; then
+  MD_QUESTIONS=$(python3 -c "import json,sys; print(len(json.load(open(sys.argv[1])).get('human_questions', [])))" "$MD_PROFILE_PATH" 2>/dev/null || echo 0)
+  if [ "$MD_QUESTIONS" -ge 1 ]; then
+    _ok "kickoff.md inferred path captured profile questions"
+  else
+    _ok "kickoff.md inferred path profile had enough context and required no questions"
+  fi
+else
+  _fail "kickoff.md inferred path did not write run_profile.json"
+fi
+
+# 10. Strict profile mode blocks high-risk recipes that are missing required
+# operational answers before the planner runs.
+echo ""
+echo "--- 10. strict profile mode blocks incomplete high-risk profile ---"
+cat > "$TMPROOT/db-migration-vague.md" <<'EOF'
+# Add run profile tables
+
+We need storage for run profiles.
+EOF
+
+STRICT_EXIT=0
+STRICT_OUT=$(MINI_ORK_RUN_ID="run-dispatcher-strict-$$" MINI_ORK_PROFILE_STRICT=1 mini-ork run db-migration "$TMPROOT/db-migration-vague.md" 2>&1) || STRICT_EXIT=$?
+if [ "$STRICT_EXIT" -eq 2 ]; then
+  _ok "strict profile mode exits 2 before planning"
+else
+  _fail "strict profile mode expected exit 2, got ${STRICT_EXIT}"
+fi
+
+if echo "$STRICT_OUT" | grep -qE '^profile_questions='; then
+  _ok "strict profile mode emits profile_questions="
+else
+  _fail "strict profile mode did not emit profile_questions= (got: $STRICT_OUT)"
+fi
+
+if ! echo "$STRICT_OUT" | grep -qE '^plan_path='; then
+  _ok "strict profile mode blocked before plan_path="
+else
+  _fail "strict profile mode should block before planning"
 fi
 
 # === TESTS END ===
