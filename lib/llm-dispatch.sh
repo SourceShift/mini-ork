@@ -51,6 +51,59 @@ _mo_llm_write_duration_ms() {
   printf '%s\n' "$duration_ms" > "${MINI_ORK_RUN_DIR}/.last-llm-duration-ms" 2>/dev/null || true
 }
 
+_mo_llm_write_llm_calls_row() {
+  local provider="$1" model_id="$2" tier="$3" feature_name="$4"
+  local actor="$5" status="$6" duration_ms="$7" cost_usd="$8" error_message="$9"
+  [ -n "${MINI_ORK_DB:-}" ] && [ -f "$MINI_ORK_DB" ] || return 0
+
+  local iter="${MO_RECURSIVE_ITER:-}"
+  local run_id="${MINI_ORK_RUN_ID:-}"
+  local traceparent="${MO_TRACEPARENT:-}"
+  local err_dir="${MINI_ORK_RUN_DIR:-/tmp}"
+  mkdir -p "$err_dir" 2>/dev/null || err_dir="/tmp"
+
+  python3 - "$MINI_ORK_DB" "$provider" "$model_id" "$tier" "$feature_name" \
+    "$actor" "$status" "$duration_ms" "$cost_usd" "$error_message" \
+    "$iter" "$run_id" "$traceparent" <<'PY' 2>>"${err_dir}/trace-write-errors.log" || true
+import sqlite3
+import sys
+
+db, *args = sys.argv[1:]
+con = sqlite3.connect(db, timeout=5)
+con.execute("PRAGMA busy_timeout=5000")
+con.execute(
+    "INSERT INTO llm_calls (provider, model_id, tier, feature_name, actor, "
+    "status, duration_ms, cost_usd, error_message, iter, run_id, traceparent) "
+    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+    (
+        args[0],
+        args[1],
+        args[2],
+        args[3],
+        args[4],
+        args[5],
+        int(args[6] or 0),
+        float(args[7] or 0.0),
+        args[8] or None,
+        int(args[9]) if args[9] else None,
+        args[10] or None,
+        args[11] or None,
+    ),
+)
+con.commit()
+con.close()
+PY
+}
+
+_mo_llm_provider_for_model() {
+  case "$1" in
+    codex|gpt-*|o1*|o3*) printf 'openai\n' ;;
+    gemini*|*-gemini-*) printf 'google\n' ;;
+    minimax*|glm*|kimi*|deepseek*) printf 'gateway\n' ;;
+    *) printf 'anthropic\n' ;;
+  esac
+}
+
 # v0.2-pt38 (E-MO-19, 2026-06-02): models that route through non-Anthropic
 # gateway endpoints. These don't stream `stream-json` events properly,
 # so we downgrade their output format to `json` even when MO_TRACE_RICH=1.
@@ -459,6 +512,14 @@ PY
     [ "$_duration_ms" -lt 0 ] && _duration_ms=0
     _mo_llm_write_duration_ms "$_duration_ms"
     cat "$out_file"
+    local _cost_usd="0"
+    if [ -f "${out_file}.cost" ]; then
+      _cost_usd=$(cat "${out_file}.cost" 2>/dev/null || printf '0')
+    fi
+    _mo_llm_write_llm_calls_row \
+      "$(_mo_llm_provider_for_model "$model")" "$model" "${MO_LANE_TIER:-default}" \
+      "mini-ork:${node_type:-unknown}" "${MO_LANE_ACTOR:-${node_type:-${USER:-unknown}}}" \
+      "success" "$_duration_ms" "$_cost_usd" ""
     # v0.2-pt8 (D-04 wiring): expose .cost sidecar to caller via well-known
     # path. mo_llm_dispatch writes ${out_file}.cost when JSON output parses;
     # publish to ${MINI_ORK_RUN_DIR}/.last-llm-cost so execute's
@@ -474,6 +535,12 @@ PY
   else
     local rc=$?
     _mo_llm_write_duration_ms 0
+    local _error_message=""
+    _error_message=$(tail -c 200 "$_err_file" 2>/dev/null || true)
+    _mo_llm_write_llm_calls_row \
+      "$(_mo_llm_provider_for_model "$model")" "$model" "${MO_LANE_TIER:-default}" \
+      "mini-ork:${node_type:-unknown}" "${MO_LANE_ACTOR:-${node_type:-${USER:-unknown}}}" \
+      "failed" "0" "0" "$_error_message"
     # D-014: surface last 20 lines of claude CLI stderr to caller's stderr
     # so the framework's caller can see the actual error, not just rc=1.
     if [ -s "$_err_file" ] || [ -s "${out_file}.err.log" ]; then
