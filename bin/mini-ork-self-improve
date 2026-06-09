@@ -27,8 +27,12 @@
 
 set -Eeuo pipefail
 
-MINI_ORK_ROOT="${MINI_ORK_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+MINI_ORK_ROOT="${MINI_ORK_ROOT:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 export MINI_ORK_ROOT
+
+# shellcheck source=bin/lib/profile-seed.sh
+source "$SCRIPT_DIR/lib/profile-seed.sh"
 
 _usage() {
   cat <<'EOF'
@@ -252,24 +256,15 @@ _seconds_to_hms() {
 }
 
 # Pre-iter cost-cap pre-check. The cost circuit breaker in
-# lib/llm-dispatch.sh:344 returns rc=42 once SUM(task_runs.cost_usd)
-# over 24h crosses MO_DAILY_BUDGET_USD — but it fires per-dispatch and
-# only after the runner has already created a worktree + composed a
-# kickoff. Two earlier spiral events this session burned 5 wasted iter
-# records each because the runner couldn't tell the budget was already
-# exhausted before dispatching.
-#
-# This pre-check reads the same SUM(task_runs.cost_usd) the dispatcher
-# would read and halts the outer loop with a clear cost-cap message
-# BEFORE worktree creation. Pure shell + sqlite — no LLM call.
-#
-# Override: MINI_ORK_PRE_ITER_COST_CHECK=0 disables the pre-check
-# (useful in tests that don't simulate the dispatcher's breaker).
+# lib/llm-dispatch.sh:344 fires per-dispatch and only AFTER the runner
+# has created a worktree + composed a kickoff. This pre-check reads the
+# same SUM(task_runs.cost_usd) the dispatcher would read and halts the
+# outer loop BEFORE worktree creation. Pure shell + sqlite — no LLM call.
+# Override: MINI_ORK_PRE_ITER_COST_CHECK=0
 _pre_iter_cost_check() {
-  # Return semantics: rc=0 means "halt — over budget"; rc!=0 means "OK to proceed".
-  # The IF caller halts when this returns true (0).
-  [ "${MINI_ORK_PRE_ITER_COST_CHECK:-1}" = "1" ] || return 1   # override disabled → proceed
-  [ -f "$MINI_ORK_DB" ] || return 1                            # no DB → can't check → proceed
+  # rc=0 means "halt — over budget"; rc!=0 means "OK to proceed".
+  [ "${MINI_ORK_PRE_ITER_COST_CHECK:-1}" = "1" ] || return 1
+  [ -f "$MINI_ORK_DB" ] || return 1
   local _budget="${MO_DAILY_BUDGET_USD:-50}"
   local _spent
   _spent=$(sqlite3 "$MINI_ORK_DB" \
@@ -279,10 +274,7 @@ _pre_iter_cost_check() {
 }
 
 _iter_run() {
-  # Pre-iter cost-cap pre-check: cheap sqlite read of accumulated 24h
-  # cost vs MO_DAILY_BUDGET_USD. If already over, halt before the
-  # expensive worktree-create + kickoff work that would otherwise be
-  # discarded by the dispatcher's downstream rc=42.
+  # Pre-iter cost-cap pre-check before any worktree work.
   if _pre_iter_cost_check; then
     local _budget="${MO_DAILY_BUDGET_USD:-50}"
     local _spent
@@ -294,7 +286,7 @@ _iter_run() {
     echo "[cost-cap-pre-check] HALTING before iter $((ITER + 1)): \$${_spent} spent >= \$${_budget} cap"
     echo "  Raise MO_DAILY_BUDGET_USD or wait for the 24h window to roll."
     echo "=============================================================="
-    return 2  # outer-loop break signal
+    return 2
   fi
 
   ITER=$(( ITER + 1 ))
@@ -374,6 +366,15 @@ NOT route to Anthropic-family lanes other than the synthesizer.
 Time budget: soft cap ${SOFT_HOURS}h, hard cap ${HARD_HOURS}h.
 Iteration ${ITER} budget remaining: $(_seconds_to_hms $(( HARD_DEADLINE - $(date +%s) ))).
 EOF
+  local recipe_example="$MINI_ORK_ROOT/recipes/recursive-self-improve/example-kickoff.md"
+  local profile_seed_source="$RUN_DIR/kickoff.md"
+  local profile_seed_status=""
+  profile_seed_status="$(mo_profile_seed_from_kickoff "$profile_seed_source" "$RUN_DIR/run_profile.json" 2>/dev/null || true)"
+  if [ "$profile_seed_status" = "needs_answers" ] && [ -f "$recipe_example" ]; then
+    profile_seed_source="$recipe_example"
+    profile_seed_status="$(mo_profile_seed_from_kickoff "$profile_seed_source" "$RUN_DIR/run_profile.json" 2>/dev/null || true)"
+  fi
+  echo "  [profile] seed_source=$profile_seed_source status=${profile_seed_status:-unknown}"
 
   if [ "$DRY_RUN" -eq 1 ]; then
     echo "  [dry-run] would dispatch recipe recursive-self-improve inside $wt_path"
