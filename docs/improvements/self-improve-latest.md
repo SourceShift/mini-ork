@@ -1,177 +1,142 @@
-# Synthesis — Recursive Self-Improvement, iter 34
-
-Run ID: `self-improve-iter-34-20260609115529`
-Worktree: `/Users/admin/ps/mini-ork/.mini-ork/worktrees/iter-34-20260609115529`
-HEAD at start: `8f11814`
+# Synthesis — Recursive Self-Improvement, iter 36
 
 ## Ranked patch plan
 
 | Rank | Bottleneck | Category | Patch summary | Evidence | Confidence |
 |---|---|---|---|---|---|
-| 1 | iter-34 verifier `v8_provider_policy_respected` queries a non-existent table `llm_dispatch`; the gate is silently vacuous AND `llm_calls` has no producer | correctness | Wire `_mo_llm_write_llm_calls_row` in `lib/llm-dispatch.sh` to persist provider/model/tier/cost/duration/actor per call, then rewrite the planner template's `v8` check to query `llm_calls` (`actor`, `ts`) instead of `llm_dispatch` (`role`, `created_at`) | bottleneck #1 (`plan.json:179`), correctness #1, arch Cand 1, perf F2; `db/migrations/0002_mini_orch_sessions.sql:220-242`; `lib/llm-dispatch.sh:48-51,348-468`; arXiv 2604.17092 (Bhati, 0.82), 2604.21083 (Lin, 0.76) | 0.88 |
-| 2 | 87/87 `recursive_self_improve` rows today have `duration_ms=0` and `cost_usd=0` — plan/classify wrappers build inline JSON instead of reading the dispatch sidecars | perf | Add `trace_write_node` helper to `lib/trace_store.sh` that reads `${MINI_ORK_RUN_DIR}/.last-llm-{cost,duration-ms}` with a freshness window, then swap the 11 inline `trace_write "{...}"` call-sites in `bin/mini-ork-plan` (9) and `bin/mini-ork-classify` (2) | bottleneck #3, perf F1; `bin/mini-ork-plan:108,302,316,492,500,507,515,522,572`; `bin/mini-ork-classify:113,304`; `bin/mini-ork-execute:301-365` (existing rich writer to share); no new arXiv required (refactor of existing infra) | 0.84 |
-| 3 | `trace_write … 2>/dev/null \|\| true` is the project-wide idiom; the D-039 postmortem at `lib/trace_store.sh:35-50` records a 10+-DF-cycle silent outage caused by exactly this pattern | correctness | Add `trace_write_or_log` wrapper in `lib/trace_store.sh` that routes stderr to `${MINI_ORK_RUN_DIR}/trace-write-errors.log` while preserving caller exit code; mechanically sweep 26 call sites in `bin/mini-ork-{plan,classify,execute,verify,promote}` and `lib/circuit_breaker.sh:441,465` | bottleneck #5, correctness #5, arch Cand 2, perf F3; `lib/trace_store.sh:35-50` postmortem; no directly relevant arXiv (lens marked `no-relevant-papers-found`) but repo-local evidence is sufficient (idiom refactor only, no new infra) | 0.80 |
-| 4 | Synthesis→`learning_record` promotion gap: iters 21–31 produced ranked synthesis but no DB rows; iter-34's dedup scan had to text-scrape prior markdown | arch | Add `_promote_synthesis_findings` to `bin/mini-ork-self-improve` that parses the synthesis ranked table into `learning_record` candidates keyed by `(run_id, iter, rank, title)`; idempotent; called from `_self_improve_record_success` | bottleneck #7, arch Cand 3; `bin/mini-ork-self-improve:178-217,481-484`; `db/migrations/0017_self_improve_learning.sql:30-52`; arXiv 2605.05724 (Ning, 0.84), 2503.20576 (Guo, 0.70) | 0.74 |
-| 5 | `pattern_records` table has 0 rows; promotion pipeline starves because no path mines `execution_traces` clusters into patterns | arch | Add `pattern_miner` step that groups `execution_traces` by `(task_class, reviewer_verdict)` and upserts via `lib/pattern_store.sh` when cluster size ≥ N over a rolling window; gated behind `MO_PATTERN_MINER=1` for safety | bottleneck #6, arch Cand 3; `lib/pattern_store.sh:52-145`; `db/migrations/0011_evolution.sql:45-52`; arXiv 2603.10600 (Fang, 0.86), 2604.10513 (Ben-Gigi, 0.80) | 0.70 |
+| 1 | `dedupe_check` verifier hallucinates `learning_record.signature` (3rd recurrence of planner-LLM-column-hallucination pattern) | correctness | Add a multi-table schema-truth block to the planner prompt covering every table any verifier command may reference (`learning_record`, `llm_calls`, `pattern_records`, `execution_traces`), and replace the `signature` pseudocolumn dedupe with a real `(title, category, iter)` composite key. | `lens-bottleneck.md:30`; `lens-correctness.md:15-35`; `lens-arch.md:21`; `db/migrations/0017_self_improve_learning.sql:30-52`; `bin/mini-ork-plan:144-148`; live probe `Error: no such column: signature`; arXiv `2512.22250`, `2603.23050`, `2605.00628` from `lens-arxiv.md:7-27` | 0.86 |
+| 2 | Plan/classify outer-span `trace_write` rows still emit `duration_ms=0`/`cost_usd=0` (91/91 = 100% of `recursive_self_improve` rows in 24h). | perf | Extract `_trace_write_node_rich` from `bin/mini-ork-execute:301-365` into `lib/trace_rich.sh` as `trace_write_node_rich`; replace 11 outer-span call sites in `bin/mini-ork-plan` + `bin/mini-ork-classify` so sidecars (`.last-llm-cost`, `.last-llm-duration-ms`) propagate. | `lens-bottleneck.md:32`; `lens-perf.md:22-46`; `bin/mini-ork-plan:108,307,321,497,505,512,520,527,577`; `bin/mini-ork-classify:113,308`; arXiv `2604.17092`, `2502.06318` (`lens-arxiv.md:55-68`) | 0.81 |
+| 3 | Synthesizer ranks 4–5 patches per iter; implementer ships 1; deferred patches evaporate (0 `rank≥1` rows in `learning_record` for any iter ≥ 18). | arch | Add `_promote_synthesis_findings` after `_self_improve_record_success` (`bin/mini-ork-self-improve:182-220`) that parses the ranked-patch table from `synthesis.md` and inserts one `learning_record` row per non-rank-1 patch with `outcome='deferred'`, keyed idempotently on `(run_id, iter, rank, title)`. Gate behind `MO_PROMOTE_SYNTHESIS_FINDINGS=1`. | `lens-bottleneck.md:33`; `lens-arch.md:97-112`; `bin/mini-ork-self-improve:182-220,481-484`; arXiv `2603.10600`, `2512.10696`, `2506.05109` (`lens-arxiv.md:78-99`) | 0.74 |
+| 4 | `trace_write … 2>/dev/null \|\| true` idiom at ≥ 31 sites silently swallows schema-drift errors (D-039 recurrence vector). | correctness | Add `trace_write_or_log` wrapper in `lib/trace_store.sh` that captures stderr to `${MINI_ORK_RUN_DIR}/trace-write-errors.log` and propagates the exit code; migrate plan/classify call sites first; leave `\|\| true` only on explicitly-best-effort telemetry paths. | `lens-bottleneck.md:34`; `lens-correctness.md:73-90`; `lib/trace_store.sh:35-50` (D-039 postmortem); arXiv `2604.22028`, `2511.18528` (`lens-arxiv.md:103-116`) | 0.68 |
+| 5 | `llm_calls.actor` taxonomy collapse — workflow role / model lane / run-id overload makes `provider_policy_researcher` structurally vacuous. | correctness | Pass `node_type` as `MO_WORKFLOW_ROLE` from `bin/mini-ork-execute:_dispatch_node` to `mo_llm_dispatch_universal`; in `lib/llm-dispatch.sh:519-522` write `actor = "${MO_LANE_ACTOR:-${MO_WORKFLOW_ROLE:-${node_type:-${USER:-unknown}}}}"` and add `metadata_json.workflow_role` + `metadata_json.model_lane`. Update verifier to query `json_extract(metadata_json,'$.workflow_role')='researcher'` with `actor` fallback for back-compat. | `lens-bottleneck.md:31`; `lens-correctness.md:37-71`; `lens-arch.md:75-94`; `bin/mini-ork-execute:402-404,480-483,517-520,573-576`; `lib/llm-dispatch.sh:519-522`; arXiv `2602.10133`, `2604.05119`, `2601.14567` (`lens-arxiv.md:29-51`) | 0.71 |
 
 ## Top patch — detailed plan
 
-### Patch 1: Wire `llm_calls` producer + align iter-34 `v8` verifier query
+### Patch 1: schema-truth planner prompt + composite-key dedupe
 
-**Problem statement.** Iter-34's own verifier `v8_provider_policy_respected` issues `SELECT COUNT(*) FROM llm_dispatch WHERE role='researcher' AND provider='anthropic' AND created_at > datetime('now','-6 hours')` against a table that does not exist (`db/migrations/0002_mini_orch_sessions.sql:220-242` defines only `llm_calls` with columns `actor`/`ts`). The shell pipe `| grep -q '^0$'` receives the SQLite error on stderr and an empty stdout, so the gate silently mis-fires (the lens disagrees on whether it false-passes or false-fails depending on SQLite version; either way the policy invariant is not actually checked). Even if the table name is corrected, `llm_calls` has 0 producers — the gate is vacuous until a writer ships.
+**Problem statement.** The iter-36 kickoff `plan.json` verifier `dedupe_check` queries `learning_record.signature`, a column that has never existed in the schema (`db/migrations/0017_self_improve_learning.sql:30-52`). `sqlite3` errors out, the `grep -q '^0$'` pipeline produces empty stdout (grep exits 1), and the run-harness `|| true` swallow turns the failure into a vacuous PASS. This is the third recurrence of the same fingerprint in three consecutive iterations: iter-34 invented `llm_dispatch(role)`; iter-35 invented `iteration_id`/`notes`; iter-36 invented `signature`. The planner prompt at `bin/mini-ork-plan:144-148` hard-codes a one-table schema hint for `llm_calls` only.
 
 **Evidence.**
-- `plan.json` line 179: `"command": "sqlite3 ... \"SELECT COUNT(*) FROM llm_dispatch WHERE role='researcher' AND provider='anthropic' AND created_at > datetime('now','-6 hours');\" | grep -q '^0$'"`.
-- Schema truth: `db/migrations/0002_mini_orch_sessions.sql:220-242` (columns: `actor`, `ts`, `provider`, `model_id`, `tier`, `feature_name`, `input_tokens`, `output_tokens`, `cost_usd`, `duration_ms`, `status`, `traceparent`, `metadata_json`, `iter`).
-- `sqlite3 state.db "SELECT COUNT(*) FROM llm_calls;"` → `0`.
-- `grep -rn "INSERT INTO llm_calls\|llm_calls(" --include="*.go" --include="*.sh"` → `0 hits`.
-- Producer-shim site: `lib/llm-dispatch.sh:48-51` (`_mo_llm_write_duration_ms` writes only the sidecar file); `lib/llm-dispatch.sh:453-468` (success path computes `_duration_ms` and copies cost sidecar but never inserts a DB row).
-- arXiv evidence (mandatory because new helper function is new infra): `lens-arxiv.md` cites `2604.17092` "AI Observability for Developer Productivity Tools" (Bhati 2026, conf 0.82) for the provider/model/tier ledger pattern; `2604.21083` "Behavioral Consistency and Transparency Analysis on Large Language Model API Gateways" (Lin 2026, conf 0.76) for the per-call audit row shape.
+- Scan: `lens-bottleneck.md:30` (full row with file/line refs, live `Error: in prepare, no such column: signature` reproduction)
+- Correctness lens: `lens-correctness.md:15-35` (reproduction recipe R1), `lens-correctness.md:174-201` (proposed Fix 1 shape)
+- Arch lens: `lens-arch.md:21` (verifier-surface gap analysis), `lens-arch.md:172` ("avoid verifier surfaces that depend on unverified planner-invented schema")
+- Schema truth: `db/migrations/0017_self_improve_learning.sql:30-52` — columns are `id, run_id, iter, rank, category, title, evidence_paths, arxiv_refs, patch_summary, outcome, severity, confidence, benchmark_delta, created_at, updated_at`
+- Pattern frequency: 3 (iter-34, iter-35, iter-36) — `lens-bottleneck.md:58`
+- arXiv evidence (new infra not added; prompt-only change ≠ new infra, but cited for design grounding):
+  - `2512.22250` — Hallucination Detection for LLM-based Text-to-SQL Generation via Two-Stage Metamorphic Testing (`lens-arxiv.md:8-13`)
+  - `2603.23050` — DBAutoDoc automated schema documentation (`lens-arxiv.md:22-27`)
+  - `2605.00628` — EGREFINE execution-grounded schema refinement (`lens-arxiv.md:15-20`)
 
 **Proposed change.**
 
-1. In `lib/llm-dispatch.sh`, add a new helper after `_mo_llm_write_duration_ms` (around line 60):
+1. **Rewrite the schema-truth block in `bin/mini-ork-plan:144-148`** to cover every table any verifier command may reference. Generate it at plan time from `PRAGMA table_info` against the live DB so it cannot drift from migrations:
 
-   ```sh
-   # _mo_llm_write_llm_calls_row: persist a per-call audit row in llm_calls.
-   # Best-effort: guarded by MINI_ORK_DB writability + busy_timeout.
-   # Args: provider model_id tier feature_name actor status duration_ms cost_usd error_message
-   _mo_llm_write_llm_calls_row() {
-     local provider="$1" model_id="$2" tier="$3" feature_name="$4"
-     local actor="$5" status="$6" duration_ms="$7" cost_usd="$8" error_message="$9"
-     [ -n "${MINI_ORK_DB:-}" ] && [ -f "$MINI_ORK_DB" ] || return 0
-     local iter="${MO_RECURSIVE_ITER:-}"
-     local run_id="${MINI_ORK_RUN_ID:-}"
-     local traceparent="${MO_TRACEPARENT:-}"
-     python3 - "$MINI_ORK_DB" "$provider" "$model_id" "$tier" "$feature_name" \
-                              "$actor" "$status" "$duration_ms" "$cost_usd" \
-                              "$error_message" "$iter" "$run_id" "$traceparent" <<'PY' 2>>"${MINI_ORK_RUN_DIR:-/tmp}/trace-write-errors.log" || true
-   import sqlite3, sys
-   db, *args = sys.argv[1:]
-   con = sqlite3.connect(db, timeout=5)
-   con.execute("PRAGMA busy_timeout=5000")
-   con.execute(
-       "INSERT INTO llm_calls (provider, model_id, tier, feature_name, actor, "
-       "status, duration_ms, cost_usd, error_message, iter, run_id, traceparent) "
-       "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-       (args[0], args[1], args[2], args[3], args[4], args[5],
-        int(args[6] or 0), float(args[7] or 0.0), args[8] or None,
-        int(args[9]) if args[9] else None, args[10] or None, args[11] or None),
-   )
-   con.commit()
-   con.close()
-   PY
-   }
-
-   # Derive provider from model name (consistent with _MO_LLM_EXECUTABLE_MODELS).
-   _mo_llm_provider_for_model() {
-     case "$1" in
-       codex|gpt-*|o1*|o3*) printf 'openai\n' ;;
-       gemini*|*-gemini-*) printf 'google\n' ;;
-       minimax*|glm*|kimi*|deepseek*) printf 'gateway\n' ;;
-       *) printf 'anthropic\n' ;;
-     esac
+   ```bash
+   _mo_plan_schema_truth_block() {
+     local db="${MINI_ORK_DB:-/Users/admin/ps/mini-ork/.mini-ork/state.db}"
+     local tables=(learning_record llm_calls pattern_records execution_traces)
+     printf '\n## Canonical schema (authoritative — every verifier_contract command MUST only reference columns listed here)\n\n'
+     for t in "${tables[@]}"; do
+       printf '### %s\n' "$t"
+       sqlite3 "$db" "PRAGMA table_info(${t});" 2>/dev/null \
+         | awk -F'|' '{printf "  - %s (%s)\n", $2, $3}'
+       printf '\n'
+     done
+     printf '### Dedupe key contract\n'
+     printf '  - learning_record has NO `signature` column. To dedupe a candidate bottleneck, key on (title, category, iter).\n'
+     printf '  - To check whether an iter-N candidate is novel, use: SELECT COUNT(*) FROM learning_record WHERE iter < N AND title = ? AND category = ?;\n'
    }
    ```
 
-2. In `lib/llm-dispatch.sh` `llm_dispatch` success branch (around line 460, after `_mo_llm_write_duration_ms`), call:
+   Splice the function output into the planner prompt where the current static hint lives. If `PRAGMA table_info` returns nothing (DB unreachable), fall back to a hard-coded canonical block kept in `bin/mini-ork-plan` as a literal heredoc — never silently emit an empty block.
 
-   ```sh
-   _mo_llm_write_llm_calls_row \
-     "$(_mo_llm_provider_for_model "$model")" "$model" "${MO_LANE_TIER:-default}" \
-     "mini-ork:${MO_NODE_TYPE:-unknown}" "${MO_LANE_ACTOR:-${USER:-unknown}}" \
-     "success" "$_duration_ms" "$(cat "${out_file}.cost" 2>/dev/null || printf 0)" ""
-   ```
+2. **Replace the `dedupe_check` verifier command at `plan.json` generation time** so future plans use the composite key. The fix lives in the planner prompt (step 1) — the schema-truth block now explicitly prescribes the correct dedupe query — so this is enforced by example. Add one more line to the prompt directives section:
 
-   On the failure branch (rc≠0), call the same helper with `status="failed"`, `cost_usd=0`, and `error_message="$(tail -c 200 "$err_file" 2>/dev/null || true)"`.
+   > When generating any `verifier_contract.checks[].command` that uses `sqlite3`, you MUST reference only columns listed in the Canonical schema block above. Verifier authors who reference an unlisted column will be rejected by the schema preflight (TODO patch 6).
 
-3. Patch the planner template that emits `v8`. The query lives in the planner LLM's structured output, written into `plan.json` by `bin/mini-ork-plan`. Update the planner system prompt (`recipes/recursive-self-improve/prompts/planner.md` or equivalent) to specify the canonical query:
+3. **Add a one-shot validator pass in `bin/mini-ork-plan`** *before* writing `plan.json`: for each `verifier_contract.checks[].command` that contains `sqlite3`, regex-extract referenced column tokens of the form `<table>.<col>` plus bare columns in `SELECT … FROM <t>` clauses, then assert each is present in the canonical schema block. On mismatch, log to `${RUN_DIR}/plan-schema-preflight.log` and reject the plan with a structured error. (This is the metamorphic-testing principle from `2512.22250` adapted to shell.) Keep the regex deliberately narrow — false positives here halt the run, so a permissive matcher with an explicit allowlist for `count(*)`, `iif()`, `datetime()`, etc., is safer than a strict parser.
 
-   ```
-   sqlite3 ${MINI_ORK_DB} "SELECT COUNT(*) FROM llm_calls
-     WHERE actor='researcher' AND provider='anthropic'
-     AND ts > datetime('now','-6 hours');" | grep -q '^0$'
-   ```
+**Regression test.** Add `tests/unit/test_plan_schema_truth.sh` with two assertions:
 
-   For iter-34 only (one-shot), also patch `plan.json:179` in the run directory so the local verifier becomes meaningful immediately.
+- **A1 (negative).** A synthetic `verifier_contract` containing `SELECT signature FROM learning_record` must cause `bin/mini-ork-plan` to exit non-zero with stderr containing `schema-preflight: unknown column 'signature' on table 'learning_record'`.
+- **A2 (positive).** A synthetic `verifier_contract` containing `SELECT COUNT(*) FROM learning_record WHERE iter < 36 AND title = ? AND category = ?` must pass preflight and be written to `plan.json` unchanged.
 
-**Regression test.** Add `tests/unit/test_llm_calls_ledger.sh`:
-
-```sh
-#!/bin/bash
-# Asserts that a successful dispatch writes a row to llm_calls and that the
-# row carries non-empty provider, model_id, status='success', duration_ms>=0.
-set -euo pipefail
-export MINI_ORK_DB="$(mktemp -t mini-ork-XXXXXX.db)"
-sqlite3 "$MINI_ORK_DB" < db/migrations/0002_mini_orch_sessions.sql
-export MINI_ORK_RUN_DIR="$(mktemp -d)"
-source lib/llm-dispatch.sh
-# Simulate the post-dispatch write.
-_mo_llm_write_llm_calls_row "anthropic" "sonnet" "default" \
-  "mini-ork:test" "tester" "success" "1234" "0.0021" ""
-COUNT=$(sqlite3 "$MINI_ORK_DB" "SELECT COUNT(*) FROM llm_calls WHERE status='success' AND duration_ms=1234;")
-[ "$COUNT" = "1" ] || { echo "FAIL: expected 1 row, got $COUNT"; exit 1; }
-echo "PASS: llm_calls ledger writes success row"
-```
-
-Assertion text: `expected exactly 1 row in llm_calls with status='success' AND duration_ms=1234 after successful dispatch`.
+Test assertion text (literal): `assert plan-preflight rejects 'no such column: signature' AND accepts composite (title, category, iter) dedupe`.
 
 **Verification.**
-- `go test ./...` continues to pass (no Go code touched).
-- `tests/unit/test_llm_calls_ledger.sh` PASS.
-- New gate works end-to-end: run iter-34's `v8` after this patch lands — should return `exit=0` with `0` matching rows because `actor='researcher'` writes go to non-anthropic lanes per `agents.yaml` policy.
-- Expected delta: `+24K+ rows/day` on active iter days (per F2 estimate); `llm_calls.cost_usd` rollup becomes computable, unblocking per-provider spend dashboards. Sign: monotone-increasing row count; magnitude: ~100 rows per recursive-self-improve iter.
+
+- `go vet ./...` — must remain green (no Go changes, but verifier requires it).
+- `go test ./...` — must remain green.
+- `bash tests/unit/test_plan_schema_truth.sh` — new test must pass.
+- Live probe: `sqlite3 /Users/admin/ps/mini-ork/.mini-ork/state.db "PRAGMA table_info(learning_record);" | grep -q signature` must return non-zero (negative control — confirms the column still does not exist and the preflight is doing real work, not vacuously passing).
+- Expected benchmark deltas:
+  - Iter-37 `lens-bottleneck.md` row "planner LLM hallucinates a column" → resolved or absent. Sign: downward (frequency 3 → 0).
+  - Iter-37 `plan.json` `verifier_contract.checks` for `dedupe_check` → references `title`+`category`+`iter`, not `signature`. Sign: structural change, magnitude binary.
+  - No expected change to `recursive_self_improve` zero-duration rate (that is Patch 2).
 
 **Rollback criteria.**
-- Any `tests/unit/test_*.sh` that touched `lib/llm-dispatch.sh` regresses.
-- `SQLITE_BUSY` errors observed in `trace-write-errors.log` exceed 1% of successful dispatches over 1h (writer hot-path contention).
-- Provider derivation misclassifies a gateway model as anthropic, which would cause `v8` to false-flag a legitimate non-anthropic researcher dispatch. Detect by sampling `llm_calls.provider` distribution against `agents.yaml` lane truth after first 100 rows; if mismatch >5%, revert and re-derive from `agents.yaml.lanes.<node>.provider` directly.
+
+- If `PRAGMA table_info` injection makes the planner prompt exceed the model's context window for any tier, revert to the static heredoc fallback only (keep the preflight validator).
+- If the preflight validator produces false positives on legitimate aggregate expressions (e.g. `COUNT(DISTINCT actor)`, `json_extract(metadata_json, '$.workflow_role')`), narrow the regex and ship; do not revert the schema-truth block.
+- If any of `go vet ./...` or `go test ./...` regresses, revert all changes — no part of Patch 1 should touch Go code, so a regression indicates an unrelated incidental change crept in.
+- Hard rollback: if iter-37 surfaces *any* new column-hallucination row, revert and escalate to Patch 6 (full pattern miner) in iter-38.
 
 ## Lower-ranked patches
 
-### Patch 2: `trace_write_node` helper + plan/classify wrapper swap (perf)
+### Patch 2 (perf): hoist `_trace_write_node_rich` into `lib/trace_rich.sh`
 
-**Problem.** Plan/classify `trace_write` payloads omit `duration_ms` and `cost_usd`; 87/87 `recursive_self_improve` rows today carry `duration_ms=0`.
-**Change.** Hoist `_trace_write_node_rich` from `bin/mini-ork-execute:301-365` into `lib/trace_store.sh:trace_write_node`; replace 11 inline call-sites in `bin/mini-ork-plan` and `bin/mini-ork-classify`; add freshness-window guard (`5 * MO_DISPATCH_TIMEOUT`, default ~7500s).
-**Test.** Benchmark `rt_richness_001` asserts `duration_ms > 1000 AND cost_usd > 0` after a planner dispatch.
-**Rollback.** Stale sidecar reads → wrapper picks up prior-run values; mitigated by freshness window. Revert if `trace_write_node` is called from a subshell without `MINI_ORK_RUN_DIR`.
+**Problem.** 91/91 (100%) of `recursive_self_improve` `execution_traces` rows in the last 24h carry `duration_ms=0`; sidecars `.last-llm-cost` and `.last-llm-duration-ms` are populated but never read by plan/classify outer spans (`lens-perf.md:24-38`).
 
-### Patch 3: `trace_write_or_log` wrapper (correctness)
+**Change.** Lift `_trace_write_node_rich` (`bin/mini-ork-execute:301-365`) into `lib/trace_rich.sh` as `trace_write_node_rich`. Parameterize `TASK_CLASS` as a positional arg, not an env read (mitigates `lens-perf.md:120` env-propagation hazard). Replace 11 outer-span call sites in `bin/mini-ork-plan` (108, 307, 321, 497, 505, 512, 520, 527, 577) and `bin/mini-ork-classify` (113, 308). ~50–80 LOC.
 
-**Problem.** `trace_write … 2>/dev/null || true` masks schema drift (D-039 postmortem).
-**Change.** Add `trace_write_or_log` to `lib/trace_store.sh`; sweep 26 call sites mechanically; route stderr to `${MINI_ORK_RUN_DIR}/trace-write-errors.log` with rotation knob `MO_TRACE_ERR_LOG_MAX_BYTES=1048576`.
-**Test.** `trace_drift_001` benchmark forces an invalid column, asserts log line appears + caller exit code stays 0.
-**Rollback.** Transient `SQLITE_BUSY` spikes flood the log → tighten rotation, do not revert silencing.
+**Test.** New benchmark `bench_outer_span_richness` per `lens-perf.md:82-86`: invoke `bin/mini-ork-plan` against a synthetic kickoff, assert `duration_ms > 0 AND cost_usd > 0` on the resulting trace row.
 
-### Patch 4: Synthesis→`learning_record` promoter (arch)
+**Verification.** `go vet ./... && go test ./...` green; iter-37 zero-dur rate < 10% (sign: down, magnitude: 100% → ≤ 10%).
 
-**Problem.** Iters 21–31 ranked synthesis but never inserted rows; dedup must text-scrape.
-**Change.** Add `_promote_synthesis_findings` to `bin/mini-ork-self-improve` after `_self_improve_record_success` (line 484). Parse the synthesis ranked table by regex (`| Rank | Bottleneck | ... |`), insert with idempotency key `(run_id, iter, rank, title)`.
-**Test.** Parse iter-32 synthesis fixture, assert 5 rows materialize in `learning_record` with stable keys.
-**Rollback.** Markdown shape drift breaks parser → gate behind `MO_PROMOTE_SYNTHESIS=1`; only enable on confirmed synthesizer template.
+### Patch 3 (arch): synthesis → `learning_record` promoter
 
-### Patch 5: `pattern_miner` over `execution_traces` (arch)
+**Problem.** Synthesizer ranks 4–5 patches; only the rank-0 success stub lands. 0 `rank≥1` rows for any iter ≥ 18 (`lens-bottleneck.md:33`).
 
-**Problem.** `pattern_records` = 0 rows; promotion pipeline starves.
-**Change.** Add `bin/mini-ork-pattern-miner` that groups `execution_traces` by `(task_class, reviewer_verdict)` over a rolling 7-day window; upsert via `lib/pattern_store.sh` when cluster size ≥ 5; output_type derived from verdict taxonomy.
-**Test.** Seed 5 failure rows with `reviewer_verdict='llm_dispatch_failed'`, run miner, assert one `pattern_records` row with `output_type='verifier_addition'`.
-**Rollback.** Noisy clusters promote spam → gate behind `MO_PATTERN_MINER=1`, require operator review for `prompt_change` output_type.
+**Change.** Add `_promote_synthesis_findings` after `_self_improve_record_success` (`bin/mini-ork-self-improve:182-220`). Parse the `## Ranked patch plan` markdown table from `synthesis.md`, insert one row per rank-≥-2 patch with `outcome='deferred'`. Idempotent on `(run_id, iter, rank, title)`. Gate `MO_PROMOTE_SYNTHESIS_FINDINGS=1`.
+
+**arXiv grounding.** `2603.10600` (trajectory-informed memory), `2512.10696` (procedural memory lifecycle), `2506.05109` (metacognitive learning) — `lens-arxiv.md:78-99`.
+
+**Test.** After a successful iter-36 publish with the flag set, `SELECT COUNT(*) FROM learning_record WHERE iter=36 AND rank>=2` returns ≥ 4.
+
+### Patch 4 (correctness): `trace_write_or_log` wrapper
+
+**Problem.** D-039 recurrence vector: ≥ 31 `2>/dev/null || true` call sites silently swallow `INSERT` failures (`lens-correctness.md:73-90`).
+
+**Change.** Add `trace_write_or_log` in `lib/trace_store.sh` that redirects stderr to `${MINI_ORK_RUN_DIR}/trace-write-errors.log` and propagates the exit code. Migrate `bin/mini-ork-plan` and `bin/mini-ork-classify` call sites first; leave true best-effort callers explicitly `|| true`. Allow `SQLITE_BUSY` (exit 5) under a narrow `|| true` shim.
+
+**Test.** `tests/unit/test_trace_write_failure.sh` per `lens-correctness.md:240-251`: a drifted schema must cause `trace_write_or_log` to exit non-zero.
+
+### Patch 5 (correctness): normalize `llm_calls.actor` to workflow role
+
+**Problem.** `provider_policy_researcher` is structurally vacuous because `actor` collapses workflow role / model lane / run-id (`lens-correctness.md:37-71`, `lens-arch.md:75-94`).
+
+**Change.** Export `MO_WORKFLOW_ROLE="$node_type"` around dispatch in `bin/mini-ork-execute:_dispatch_node`. In `lib/llm-dispatch.sh:519-522`, prefer it for `actor`. Carry `workflow_role` and `model_lane` in `metadata_json` for back-compat. Rewrite the verifier to query `json_extract(metadata_json,'$.workflow_role')='researcher'` with `actor` fallback.
+
+**Test.** After fix, any researcher-lane dispatch must leave at least one row where `json_extract(metadata_json,'$.workflow_role')='researcher'`.
+
+**Note.** Patch 5 is the smallest correctness fix that unblocks the kickoff's own `provider_policy_researcher` check, but the schema-shim approach (metadata_json) is interim. The arch lens (`lens-arch.md:178`) flags first-class `workflow_role`/`model_lane` columns as the longer-term answer; this is left for iter-37+.
 
 ## Convergence assessment
 
-**Not yet at diminishing returns.** Iter-34 surfaced a self-referential bug (the iter's own verifier is broken) that prior iters did not catch, plus two empty-schema clusters (`llm_calls`, `pattern_records`) that have been visible-but-unranked since iter-32. Iter-33's #2 (plan/classify `duration_ms=0`) re-ranked here as Patch 2 because no feat commit landed between `b9b6d18` and `8f11814`. The outer loop should continue: iter-35 will likely surface the synthesis→`learning_record` promotion gap (Patch 4) once iter-34's Patch 1 lands and dedup can shift from markdown-scrape to structured queries.
+**Not yet at diminishing returns.** Three signals say keep going:
 
-Signals that suggest convergence is approaching but not here yet:
-- 4 of 5 ranked patches now target the same "empty schema, no producer" anti-pattern (`llm_calls`, `pattern_records`, `learning_record` 21-31 gap, trace-write idiom).
-- arXiv refs are converging on the trajectory-memory / closed-loop self-improvement cluster (2603.10600, 2604.10513, 2605.05724) — same paradigm cited 3 times.
-- Cross-family lens agreement is high (3/3 lenses ranked the `v8` bug; 3/3 cited the trace-write idiom).
+1. **Pattern frequency rising, not falling.** The "planner-LLM-hallucinates-a-column" fingerprint is now at frequency 3 across consecutive iters. If Patch 1 lands cleanly, iter-37 should show frequency 0 — a sharp drop that the next-iter bottleneck scanner will register, validating that the loop *can* close a class of bugs.
+2. **Structural memory deficit.** 0 `rank≥1` rows for any iter ≥ 18 means the loop has been operating without durable backlog. Patch 3 closes that gap; until it lands, every iter's deduplication is approximate (text-scrape over markdown).
+3. **Verifier-surface unverifiability.** Two of the iter-36 kickoff's own verifier checks (`dedupe_check`, `provider_policy_researcher`) are demonstrably vacuous. Until the schema-preflight (Patch 1) and actor normalization (Patch 5) land, the outer loop cannot trust its own success signal.
 
-Continue iterating for ≥2 more cycles; reassess at iter-36.
+The outer loop should continue for at least iters 37–39 and re-evaluate convergence after Patches 1, 2, and 3 have shipped. Iter-36 will only ship Patch 1.
 
 ## Provenance footer
 
-- Lenses consumed: minimax (perf), kimi (correctness), codex (arch), arxiv research lane
-- Synthesizer family: opus (Anthropic)
-- arXiv papers cited: 8 (2604.17092, 2604.21083, 2509.25370, 2602.02475, 2603.10600, 2604.10513, 2605.05724, 2503.20576)
-- Cross-iteration learnings applied: 15 rows scanned from `learning_record` (iter ∈ {0,1,18,19,20,32,33}); deduped against iter-33 ranked synthesis carry-forwards (#2 → Patch 2, #5 → Patch 4)
-- Dedup table: bottleneck #1 (verifier `llm_dispatch` drift) is novel to iter-34 — no prior `learning_record` row matches this fingerprint; sibling iter-33 `learning_record.fingerprint` drift was a different column on a different table
+- Lenses consumed: minimax (perf), kimi (correctness), codex (arch), arXiv research lane
+- Synthesizer family: opus (Anthropic) — sole permitted Anthropic-family lane per provider policy
+- arXiv papers cited: 14 (`2512.22250`, `2605.00628`, `2603.23050`, `2602.10133`, `2604.05119`, `2601.14567`, `2502.06318`, `2604.17092`, `2604.14531`, `2603.10600`, `2512.10696`, `2506.05109`, `2604.22028`, `2511.18528`) — all sourced from `lens-arxiv.md`
+- Cross-iteration learnings applied: 8 rows from `learning_record` (live census in `lens-bottleneck.md:39-57`) plus iter-33/34/35 synthesis markdown text-scrape
+- Lens-availability notes:
+  - `lens-arch.md` content was emitted to the worktree mirror; orchestrator should promote `.mini-ork/runs/self-improve-iter-36-20260609122707/lens-arch.md` from the worktree if absent at the canonical run path
+  - `lens-arxiv.md` same — full content in worktree at `lens-arxiv.md`
