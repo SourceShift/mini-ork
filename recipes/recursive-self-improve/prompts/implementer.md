@@ -25,7 +25,7 @@ modify any other worktree.
 
 - **No new infrastructure without arXiv evidence.** If Patch 1 calls
   for new infra (graph DB, new table, new MCP tool), confirm
-  `${RUN_DIR}/arxiv-refs.md` contains a paper supporting it. If
+  `${RUN_DIR}/lens-arxiv.md` contains a paper supporting it. If
   missing, refuse and write `infra-unjustified` to
   `${RUN_DIR}/implementer-report.md`.
 - **Do not implement patches 2-N.** They are queued for future

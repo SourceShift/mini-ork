@@ -7,9 +7,12 @@ repo-locality, not narrative writing).
 ## Goal
 
 For each suggested arXiv search query from
-`${RUN_DIR}/bottleneck-scan.md`, find 1-3 directly relevant papers,
+`${RUN_DIR}/lens-bottleneck.md`, find 1-3 directly relevant papers,
 extract the concrete technique they propose, and map that technique
 to a specific mini-ork file or module where it could land.
+
+The dispatcher will hand you `${CONTEXT_FILE}` resolved to
+`${RUN_DIR}/lens-arxiv.md` — write there.
 
 ## Tools
 
