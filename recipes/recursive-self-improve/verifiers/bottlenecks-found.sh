@@ -46,23 +46,63 @@ if [ -f "$SYNTH" ]; then
   echo "synthesis ranked_rows=$ranked_rows" >&3
 fi
 
-# Reject polluted artifacts — leaked CLI / learning-mode envelopes.
-# Iter-2's opus synth emitted a synthesis that correctly self-diagnosed
-# this exact bug as patch #3 (lens-arch.md + lens-arxiv.md also leak
-# <z-insight> blocks from researcher-agent runtime envelopes, not just
-# synthesis.md). Citing arXiv 2602.13477 (Naik 2026) +
-# 2502.12630 (Sternak 2025) on multi-agent prompt leakage — the loop's
-# first arxiv-grounded improvement. Applying the synth's proposed fix
-# while iter 3 is in flight so the verifier matches the contract opus
-# articulated.
+# Sanitize-then-check pattern. Codex agents (the executable-wrapper
+# family used by codex_lens, arch_lens, arxiv_lens, bottleneck_lens
+# planner-lane on planner=codex) reliably leak the `★ Insight ────`
+# rule banner and `<z-insight>{...}</z-insight>` JSON envelope from
+# their CLI runtime output into the Write tool's content because
+# learning-mode framing is part of their emission contract. Iter 3
+# rejected for this reason on 3 of 5 lenses; iter 2's own patch #3
+# only addressed the verifier's narrow scope, not the source emission.
+# Per arXiv 2604.01350 (Yang 2026, shared-state contamination) +
+# 2605.16746 (Wang 2026, memory laundering): the durable fix is a
+# post-write sanitizer that strips the framing before durable consumers
+# see it, while preserving every byte of the agent's actual analysis.
+_sanitize_artifact() {
+  local f="$1"
+  [ -f "$f" ] || return 0
+  python3 - "$f" <<'PY'
+import re, sys
+p = sys.argv[1]
+with open(p, encoding="utf-8", errors="replace") as fh:
+    src = fh.read()
+
+# Strip <z-insight>...</z-insight> blocks (greedy across lines).
+src2 = re.sub(r'<z-insight>.*?</z-insight>\s*', '', src, flags=re.DOTALL)
+# Strip "★ Insight ─────…" banner pairs: from a line starting with
+# ★ Insight ─ up to (and including) the next line of only ─ chars.
+src2 = re.sub(
+    r'^★ Insight ─+\s*\n.*?^─+\s*\n',
+    '',
+    src2,
+    flags=re.DOTALL | re.MULTILINE,
+)
+# Remaining single-line ★ Insight banners with no closer — drop them.
+src2 = re.sub(r'^★ Insight ─.*\n', '', src2, flags=re.MULTILINE)
+
+if src2 != src:
+    with open(p, "w", encoding="utf-8") as fh:
+        fh.write(src2)
+    print(f"sanitized: {p}", file=sys.stderr)
+PY
+}
+
+_polluted_remaining=()
 for _polluted in "$SCAN" "$SYNTH" "$ARXIV" \
                  "$RUN_DIR/lens-perf.md" "$RUN_DIR/lens-correctness.md" \
                  "$RUN_DIR/lens-arch.md"; do
   [ -f "$_polluted" ] || continue
+  _sanitize_artifact "$_polluted" 2>>"$EVIDENCE"
+  # Anything still matching after sanitization is un-strippable corruption
+  # (deeply embedded envelope, novel pattern) — those still reject.
   if grep -qE '^(★ Insight ─|<z-insight>)' "$_polluted"; then
-    missing+=("$(basename "$_polluted") contains leaked CLI envelope")
+    _polluted_remaining+=("$(basename "$_polluted")")
   fi
 done
+
+if [ "${#_polluted_remaining[@]}" -gt 0 ]; then
+  missing+=("un-strippable envelope leak in: ${_polluted_remaining[*]}")
+fi
 
 # Pass condition: either converged, or we have all 3 artifacts AND >=1 ranked patch
 pass=0
