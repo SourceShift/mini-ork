@@ -10,6 +10,20 @@ is an isolated copy of the mini-ork checkout. The branch is named
 commit and merge — you do NOT run `git commit`, `git push`, or
 modify any other worktree.
 
+**Filesystem boundary:** the run directory `${RUN_DIR}` is OUTSIDE
+the worktree. Many sandboxes will block writes there. Always write
+your report and any auxiliary scratch files INSIDE the worktree at
+`${WORKTREE_PATH}/.mini-ork-iter-report.md` (or another path under
+`${WORKTREE_PATH}/`). The runner reads both locations.
+
+**Critical:** do NOT write `lens-*.md`, `synthesis.md`,
+`context-*.json`, or `arxiv-*.md` anywhere inside `${WORKTREE_PATH}`.
+Those are workflow-internal artifacts written by upstream nodes to
+`${RUN_DIR}/`. If they appear in `${WORKTREE_PATH}/` they get swept
+into the iter commit as noise on top of your actual patch. The
+runner's staging filter will reject the iter if any are detected at
+worktree root.
+
 ## Your job
 
 1. Read `${RUN_DIR}/synthesis.md`.
@@ -40,7 +54,13 @@ modify any other worktree.
 
 ## Write the report
 
-When finished (success or refusal) write `${RUN_DIR}/implementer-report.md`:
+When finished (success or refusal) write your report to
+`${WORKTREE_PATH}/.mini-ork-iter-report.md` (preferred, always
+writable). If you can also write to `${RUN_DIR}/implementer-report.md`
+the runner will read it, but the worktree-local path is the
+authoritative source for the verifier chain.
+
+Report shape:
 
 ```
 # Implementer Report — iter <N>
