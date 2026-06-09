@@ -14,7 +14,13 @@
 
 lanes:
   # Canonical loop-role lanes.
-  planner: codex
+  # 2026-06-09: planner switched codex → opus after Codex gpt-5.5 hit
+  # 'Selected model is at capacity' mid-iter-4 and the cascade killed
+  # iters 5-17. Opus is more capacity-stable but ~3x cost; the budget
+  # already accounts for opus on synthesizer so the marginal increase
+  # is one extra opus call per iter. Switch back to codex once OpenAI
+  # capacity stabilizes if cost matters more than throughput.
+  planner: opus
   researcher: codex          # bottleneck-scan fallback if model_lane unset
   implementer: codex
   worker: codex
