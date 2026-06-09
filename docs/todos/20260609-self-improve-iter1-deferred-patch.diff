@@ -1,0 +1,54 @@
+diff --git a/bin/mini-ork-execute b/bin/mini-ork-execute
+index d4b86bc..1b4c3a6 100755
+--- a/bin/mini-ork-execute
++++ b/bin/mini-ork-execute
+@@ -40,6 +40,37 @@ _require_lib() {
+   source "$lib"
+ }
+ 
++_run_verifier_ref() {
++  local script="$1"
++  shift || true
++  local stdout_file
++  stdout_file="$(mktemp -t mo-verifier-XXXXXX)"
++  local exit_code=0
++
++  bash "$script" "$@" >"$stdout_file" 2>&1 || exit_code=$?
++
++  if jq -e 'type == "object" and has("pass")' "$stdout_file" >/dev/null 2>&1; then
++    local pass
++    pass="$(jq -r '.pass' "$stdout_file")"
++    if [[ "$pass" != "true" ]]; then
++      cat "$stdout_file" >&2
++      rm -f "$stdout_file"
++      return 1
++    fi
++    cat "$stdout_file"
++    rm -f "$stdout_file"
++    return 0
++  fi
++
++  cat "$stdout_file"
++  rm -f "$stdout_file"
++  return "$exit_code"
++}
++
++if [[ "${MINI_ORK_EXECUTE_SOURCE_ONLY:-0}" = "1" ]]; then
++  return 0 2>/dev/null || exit 0
++fi
++
+ # ── arg parsing ───────────────────────────────────────────────────────────────
+ PLAN_PATH="${MINI_ORK_PLAN_PATH:-}"
+ FILTER_NODE_TYPE=""
+@@ -576,7 +607,7 @@ PY
+           local _vstem="${node_verifier_ref#verifiers/}"
+           _vstem="${_vstem%.sh}"
+           local _evidence_path="$_evidence_dir/${_vstem}-$(date +%s).log"
+-          if MINI_ORK_PLAN_PATH="$PLAN_PATH" ARTIFACT_PATH="$ARTIFACT_PATH" bash "$_verifier_script" > "$_evidence_path" 2>&1; then
++          if MINI_ORK_PLAN_PATH="$PLAN_PATH" ARTIFACT_PATH="$ARTIFACT_PATH" _run_verifier_ref "$_verifier_script" > "$_evidence_path" 2>&1; then
+             echo "  [ok] verifier_ref $node_verifier_ref passed → $_evidence_path"
+           else
+             echo "  [fail] verifier_ref $node_verifier_ref failed → $_evidence_path" >&2
+diff --git a/tests/unit/test_provider_wrappers.sh b/tests/unit/test_provider_wrappers.sh
+old mode 100644
+new mode 100755

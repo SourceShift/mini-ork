@@ -8,12 +8,18 @@ patch plan** the implementer will execute.
 
 ## Inputs at `${RUN_DIR}/`
 
-- `bottleneck-scan.md` — planner's ranked list.
-- `lens-minimax-perf.md` — perf lens.
-- `lens-kimi-correctness.md` — correctness lens.
-- `lens-codex-arch.md` — arch lens.
-- `arxiv-refs.md` — arXiv evidence (or
-  `arxiv-research.md` depending on writer; check both).
+The mini-ork dispatcher writes researcher-node outputs as
+`lens-<short>.md` where `<short>` is the node name with the `_lens`
+suffix stripped:
+
+- `lens-bottleneck.md` — bottleneck lens (replaces what an earlier
+  iteration called `bottleneck-scan.md`).
+- `lens-perf.md` — perf lens (minimax).
+- `lens-correctness.md` — correctness lens (kimi). May be absent if
+  the kimi lane errored — fall back to perf + arch + arxiv inputs.
+- `lens-arch.md` — arch lens (codex).
+- `lens-arxiv.md` — arXiv evidence (replaces what an earlier iteration
+  called `arxiv-refs.md` / `arxiv-research.md`).
 - `learning_record` rows from prior iterations (query via `MINI_ORK_DB`).
 
 ## Output

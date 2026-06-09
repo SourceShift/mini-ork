@@ -16,11 +16,17 @@ description: >
 # Kimi (correctness), OpenAI Codex (arch), Anthropic Opus (synthesis).
 
 nodes:
-  - { name: bottleneck_scanner,  type: planner,     model_lane: planner,         prompt_ref: prompts/bottleneck-scan.md,      dispatch_mode: serial,   gates: [budget_gate] }
+  # bottleneck_lens is dispatched as a researcher (not planner) so the
+  # dispatcher writes its output to lens-bottleneck.md per the
+  # `_lens` naming heuristic. Planner-type nodes write plan.json which
+  # the downstream verifier cannot grep for ranked bottleneck rows.
+  - { name: bottleneck_lens,     type: researcher,  model_lane: planner,         prompt_ref: prompts/bottleneck-scan.md,      dispatch_mode: serial,   gates: [budget_gate] }
   - { name: perf_lens,           type: researcher,  model_lane: minimax_lens,    prompt_ref: prompts/lens-minimax-perf.md,    dispatch_mode: parallel, gates: [budget_gate] }
   - { name: correctness_lens,    type: researcher,  model_lane: kimi_lens,       prompt_ref: prompts/lens-kimi-correctness.md,dispatch_mode: parallel, gates: [budget_gate] }
   - { name: arch_lens,           type: researcher,  model_lane: codex_lens,      prompt_ref: prompts/lens-codex-arch.md,      dispatch_mode: parallel, gates: [budget_gate] }
-  - { name: arxiv_research,      type: researcher,  model_lane: codex_lens,      prompt_ref: prompts/arxiv-researcher.md,     dispatch_mode: parallel, gates: [budget_gate] }
+  # arxiv_lens (not arxiv_lens) so dispatcher writes lens-arxiv.md
+  # via the _lens heuristic; the verifier reads markdown not JSON context.
+  - { name: arxiv_lens,          type: researcher,  model_lane: codex_lens,      prompt_ref: prompts/arxiv-researcher.md,     dispatch_mode: parallel, gates: [budget_gate] }
   - { name: opus_synthesizer,    type: reviewer,    model_lane: opus_lens,       prompt_ref: prompts/opus-synthesis.md,       dispatch_mode: serial,   gates: [budget_gate] }
   - { name: bottlenecks_found,   type: verifier,    verifier_ref: verifiers/bottlenecks-found.sh, dispatch_mode: serial }
   - { name: implementer,         type: implementer, model_lane: codex_lens,      prompt_ref: prompts/implementer.md,          dispatch_mode: serial,   gates: [scope_gate, budget_gate] }
@@ -30,14 +36,14 @@ nodes:
   - { name: rollback,            type: rollback,    prompt_ref: null,                            dispatch_mode: serial }
 
 edges:
-  - { from: bottleneck_scanner, to: perf_lens,        edge_type: depends_on }
-  - { from: bottleneck_scanner, to: correctness_lens, edge_type: depends_on }
-  - { from: bottleneck_scanner, to: arch_lens,        edge_type: depends_on }
-  - { from: bottleneck_scanner, to: arxiv_research,   edge_type: depends_on }
+  - { from: bottleneck_lens, to: perf_lens,        edge_type: depends_on }
+  - { from: bottleneck_lens, to: correctness_lens, edge_type: depends_on }
+  - { from: bottleneck_lens, to: arch_lens,        edge_type: depends_on }
+  - { from: bottleneck_lens, to: arxiv_lens,   edge_type: depends_on }
   - { from: perf_lens,          to: opus_synthesizer, edge_type: supplies_context_to }
   - { from: correctness_lens,   to: opus_synthesizer, edge_type: supplies_context_to }
   - { from: arch_lens,          to: opus_synthesizer, edge_type: supplies_context_to }
-  - { from: arxiv_research,     to: opus_synthesizer, edge_type: supplies_context_to }
+  - { from: arxiv_lens,     to: opus_synthesizer, edge_type: supplies_context_to }
   - { from: opus_synthesizer,   to: bottlenecks_found, edge_type: verifies }
   - { from: bottlenecks_found,  to: implementer,      edge_type: depends_on }
   - { from: implementer,        to: self_tests_pass,  edge_type: verifies }
