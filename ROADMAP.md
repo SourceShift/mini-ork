@@ -15,7 +15,7 @@ node types, 6 edge types, 6 gates, 8 memory namespaces); pipeline shapes
 live in `recipes/`. Two reference recipes ship: `code-fix` (minimal) and
 `bdd-first-delivery` (multi-stage migration target for the literal port).
 
-### v0.2.0 — 2026-06-01 (current)
+### v0.2.0 — 2026-06-01
 
 Dogfood-converged + self-publishing + positioning-grounded. The framework
 now audits itself, publishes its own synthesis to a canonical path under a
@@ -78,12 +78,13 @@ extraction prompt-tuning is D-048, deferred)
   expected promotion-gate behavior; the validated contract is the live
   improve → benchmark → eval → promote chain and its DB writes.
 
-### v0.3.0-rc1 — 2026-06-05 (in flight)
+### v0.3.0-rc1 — 2026-06-08 (current release candidate)
 
-**Oracle Hardening, Wave 1 + Wave 2 partial.** Shipped as 5 self-contained
-primitives in `lib/` plus a positioning honesty patch. Wire-up into
-`bin/mini-ork-execute` is deferred; recipes can opt-in at their own pace
-by sourcing the libraries from a verifier node.
+**Oracle Hardening, Wave 1 + Wave 2 partial.** Shipped as self-contained
+primitives in `lib/` plus a positioning honesty patch. The central publisher
+wire-up now lives behind `lib/gate_bootstrap.sh` and the publisher branch in
+`bin/mini-ork-execute`; recipe-level shims remain available for explicit
+opt-in and testing.
 
 Grounded in 9-paper research brief synthesizing the self-evolution oracle
 question:
@@ -126,7 +127,7 @@ Two new framework phases added by this work:
 
 Tracking epic: `kickoffs/oracle-hardening-v03.md`.
 
-Dispatch path findings filed at `docs/fixes/20260604-dispatch-classifier-overrides-explicit-recipe.md` — the `bin/mini-ork run <recipe>` path needs to honor the explicit recipe arg + a new `recipes/docs/` task class needs to ship before pure-docs kickoffs can dispatch through the canonical dogfood loop.
+Dispatch path findings filed at `docs/fixes/20260604-dispatch-classifier-overrides-explicit-recipe.md` are now mostly closed: `bin/mini-ork run <recipe>` honors explicit recipe args and `recipes/docs/` exists. Remaining release cleanup is documentation parity: the docs recipe still needs recipe-local README/example coverage, and the schema/docs examples need to be aligned with the live workflow dialect.
 
 ## Next (v0.3 final + v0.4 — Q3-Q4 2026 target)
 

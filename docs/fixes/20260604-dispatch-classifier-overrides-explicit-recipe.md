@@ -74,7 +74,7 @@ recipes/docs/
                             #   the kickoff and runs each as
                             #   `grep -c <pattern> <file>` with rc=0
                             #   when count >= expected_min.
-  verifiers/link-verifier.sh # walks all `[...](...)` links and
+  verifiers/link-verifier.sh # walks all markdown links and
                             #   confirms relative paths resolve.
 ```
 

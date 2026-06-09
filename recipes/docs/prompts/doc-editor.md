@@ -33,7 +33,7 @@ After ALL steps complete:
    `kind == "grep"`: confirm the pattern is now present in the file by
    re-reading and searching. If absent, the step that should have
    introduced it failed — go back and re-edit until it's present.
-2. Verify that every relative markdown link `[label](path)` introduced by
+2. Verify that every relative markdown link introduced by
    your edits resolves: the link target should exist on disk relative
    to the editing doc, OR be an external URL (http/https) the
    link_verifier will skip.
