@@ -251,7 +251,52 @@ _seconds_to_hms() {
   printf '%dh%02dm%02ds' $((s/3600)) $(((s/60)%60)) $((s%60))
 }
 
+# Pre-iter cost-cap pre-check. The cost circuit breaker in
+# lib/llm-dispatch.sh:344 returns rc=42 once SUM(task_runs.cost_usd)
+# over 24h crosses MO_DAILY_BUDGET_USD — but it fires per-dispatch and
+# only after the runner has already created a worktree + composed a
+# kickoff. Two earlier spiral events this session burned 5 wasted iter
+# records each because the runner couldn't tell the budget was already
+# exhausted before dispatching.
+#
+# This pre-check reads the same SUM(task_runs.cost_usd) the dispatcher
+# would read and halts the outer loop with a clear cost-cap message
+# BEFORE worktree creation. Pure shell + sqlite — no LLM call.
+#
+# Override: MINI_ORK_PRE_ITER_COST_CHECK=0 disables the pre-check
+# (useful in tests that don't simulate the dispatcher's breaker).
+_pre_iter_cost_check() {
+  # Return semantics: rc=0 means "halt — over budget"; rc!=0 means "OK to proceed".
+  # The IF caller halts when this returns true (0).
+  [ "${MINI_ORK_PRE_ITER_COST_CHECK:-1}" = "1" ] || return 1   # override disabled → proceed
+  [ -f "$MINI_ORK_DB" ] || return 1                            # no DB → can't check → proceed
+  local _budget="${MO_DAILY_BUDGET_USD:-50}"
+  local _spent
+  _spent=$(sqlite3 "$MINI_ORK_DB" \
+    "SELECT printf('%.4f', COALESCE(SUM(cost_usd),0)) FROM task_runs WHERE created_at >= strftime('%s','now','-1 day');" \
+    2>/dev/null) || _spent="0"
+  python3 -c "import sys; sys.exit(0 if float('$_spent') >= float('$_budget') else 1)" 2>/dev/null
+}
+
 _iter_run() {
+  # Pre-iter cost-cap pre-check: cheap sqlite read of accumulated 24h
+  # cost vs MO_DAILY_BUDGET_USD. If already over, halt before the
+  # expensive worktree-create + kickoff work that would otherwise be
+  # discarded by the dispatcher's downstream rc=42.
+  if _pre_iter_cost_check; then
+    local _budget="${MO_DAILY_BUDGET_USD:-50}"
+    local _spent
+    _spent=$(sqlite3 "$MINI_ORK_DB" \
+      "SELECT printf('%.2f', COALESCE(SUM(cost_usd),0)) FROM task_runs WHERE created_at >= strftime('%s','now','-1 day');" \
+      2>/dev/null || echo "?")
+    echo
+    echo "=============================================================="
+    echo "[cost-cap-pre-check] HALTING before iter $((ITER + 1)): \$${_spent} spent >= \$${_budget} cap"
+    echo "  Raise MO_DAILY_BUDGET_USD or wait for the 24h window to roll."
+    echo "=============================================================="
+    return 2  # outer-loop break signal
+  fi
+
   ITER=$(( ITER + 1 ))
   local now ts run_id wt_name wt_path branch
   now=$(date +%s)
