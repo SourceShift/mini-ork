@@ -126,6 +126,24 @@ echo "── verifier behavior ──"
 mkdir -p "$TMPROOT/run"
 export MINI_ORK_RUN_DIR="$TMPROOT/run"
 
+# Regression for the staging-filter bug (iter-1 of run #4 leaked
+# lens-*.md files into commit 5f2d96b at worktree root):
+# runner must filter workflow-internal artifacts out of the iter
+# commit via explicit `git add` pathspec exclusions.
+RUNNER="$MINI_ORK_ROOT/bin/mini-ork-self-improve"
+if grep -qE "':!lens-\*\.md'" "$RUNNER" \
+   && grep -qE "':!synthesis\.md\*'" "$RUNNER" \
+   && grep -qE "':!context-\*\.json'" "$RUNNER"; then
+  _ok "runner staging filter excludes lens-*.md + synthesis.md + context-*.json"
+else
+  _fail "runner staging filter missing workflow-artifact exclusions"
+fi
+if grep -q '_self_improve_record_success' "$RUNNER"; then
+  _ok "runner records success row in learning_record on successful iter"
+else
+  _fail "runner missing learning_record success bookkeeping"
+fi
+
 # Regression for iter-1 file-name mismatch: verifier must look for
 # lens-bottleneck.md + lens-arxiv.md (matches dispatcher's _lens
 # naming heuristic), not the old bottleneck-scan.md / arxiv-refs.md

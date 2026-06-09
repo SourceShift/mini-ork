@@ -65,6 +65,47 @@ Options:
 EOF
 }
 
+_run_verifier_ref() {
+  local _script="$1" _evidence="$2"
+  local _exit _json_rc _errexit_set=0
+
+  case "$-" in
+    *e*) _errexit_set=1; set +e ;;
+  esac
+  MINI_ORK_PLAN_PATH="$PLAN_PATH" ARTIFACT_PATH="$ARTIFACT_PATH" \
+    bash "$_script" > "$_evidence" 2>&1
+  _exit=$?
+
+  python3 - "$_evidence" <<'PY' 2>/dev/null
+import json
+import sys
+
+try:
+    with open(sys.argv[1]) as f:
+        payload = json.load(f)
+except Exception:
+    sys.exit(2)
+
+if not isinstance(payload, dict) or "pass" not in payload:
+    sys.exit(2)
+
+sys.exit(0 if payload.get("pass") is True else 1)
+PY
+  _json_rc=$?
+  if [ "$_errexit_set" -eq 1 ]; then
+    set -e
+  fi
+
+  if [ "$_json_rc" -eq 0 ]; then
+    return 0
+  fi
+
+  if [ "$_json_rc" -eq 2 ]; then
+    return "$_exit"
+  fi
+  return 1
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --help|-h)          _usage; exit 0 ;;
@@ -79,6 +120,10 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+if [ "${MINI_ORK_EXECUTE_SOURCE_ONLY:-0}" = "1" ]; then
+  return 0 2>/dev/null || exit 0
+fi
 
 # ── resolve plan path ─────────────────────────────────────────────────────────
 MINI_ORK_HOME="${MINI_ORK_HOME:-$(pwd)/.mini-ork}"
@@ -576,7 +621,7 @@ PY
           local _vstem="${node_verifier_ref#verifiers/}"
           _vstem="${_vstem%.sh}"
           local _evidence_path="$_evidence_dir/${_vstem}-$(date +%s).log"
-          if MINI_ORK_PLAN_PATH="$PLAN_PATH" ARTIFACT_PATH="$ARTIFACT_PATH" bash "$_verifier_script" > "$_evidence_path" 2>&1; then
+          if _run_verifier_ref "$_verifier_script" "$_evidence_path"; then
             echo "  [ok] verifier_ref $node_verifier_ref passed → $_evidence_path"
           else
             echo "  [fail] verifier_ref $node_verifier_ref failed → $_evidence_path" >&2
