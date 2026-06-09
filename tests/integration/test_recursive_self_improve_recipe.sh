@@ -378,6 +378,79 @@ else
 fi
 
 echo
+echo "── UI kill plumbing (A: per-iter .pid, B: session .pid, C: kill-flag) ──"
+
+RUNNER="$MINI_ORK_ROOT/bin/mini-ork-self-improve"
+
+# Fix B: runner writes its session PID to $MINI_ORK_HOME/state/.self-improve-session.pid
+# at startup with EXIT/INT/TERM trap cleanup
+if grep -q 'self-improve-session.pid' "$RUNNER" \
+   && grep -qE "^trap .*SESSION_PID_FILE.*EXIT INT TERM" "$RUNNER"; then
+  _ok "runner writes session PID at startup with cleanup trap"
+else
+  _fail "runner missing session PID write + cleanup trap"
+fi
+
+# Fix A: runner writes per-iter .pid before timeout dispatch + removes after
+if grep -q '_iter_pid_file="\$RUN_DIR/.pid"' "$RUNNER" \
+   && grep -q 'rm -f "\$_iter_pid_file"' "$RUNNER"; then
+  _ok "runner writes per-iter .pid file + cleans up"
+else
+  _fail "runner missing per-iter .pid write"
+fi
+
+# Fix C: runner polls $SESSION_KILL_FLAG at top of _iter_run and returns 2 if present
+if grep -q 'SESSION_KILL_FLAG' "$RUNNER" \
+   && grep -q '\[kill-flag\]' "$RUNNER"; then
+  _ok "runner polls kill-flag at iter boundary"
+else
+  _fail "runner missing kill-flag poll"
+fi
+
+# Live exercise of B + C: dry-run launches the runner, session PID file should
+# appear during the run and be cleaned up by the EXIT trap.
+PRE_SESSION_FILE="$MINI_ORK_HOME/state/.self-improve-session.pid"
+rm -f "$PRE_SESSION_FILE"
+"$RUNNER" --dry-run --max-iters 1 --soft-cap-hours 1 --hard-cap-hours 1 >/dev/null 2>&1 || true
+if [ ! -f "$PRE_SESSION_FILE" ]; then
+  _ok "session PID file removed after runner exits (EXIT trap fired)"
+else
+  _fail "session PID file leaked: $PRE_SESSION_FILE"
+fi
+
+# Live exercise of C: pre-create the kill-flag → runner halts before iter
+mkdir -p "$MINI_ORK_HOME/state"
+touch "$MINI_ORK_HOME/state/.self-improve-kill"
+out=$("$RUNNER" --dry-run --max-iters 1 --soft-cap-hours 1 --hard-cap-hours 1 2>&1 || true)
+if echo "$out" | grep -q 'kill-flag'; then
+  _ok "runner honors pre-existing kill-flag and halts outer loop"
+else
+  _fail "runner ignored kill-flag at iter boundary"
+  echo "$out" | tail -15
+fi
+# Kill-flag should be consumed (removed) when honored
+if [ ! -f "$MINI_ORK_HOME/state/.self-improve-kill" ]; then
+  _ok "kill-flag consumed (removed) after triggering halt"
+else
+  _fail "kill-flag still present after halt"
+  rm -f "$MINI_ORK_HOME/state/.self-improve-kill"
+fi
+
+# Python control plane: kill_run() touches the kill-flag for self-improve-iter-* IDs
+if python3 -c "
+import pathlib, sys
+src = pathlib.Path('$MINI_ORK_ROOT/mini_ork/web/control.py').read_text()
+assert 'self-improve-iter-' in src
+assert '.self-improve-kill' in src
+assert 'session_halted' in src
+sys.exit(0)
+" 2>/dev/null; then
+  _ok "kill_run() (mini_ork/web/control.py) touches kill-flag for self-improve-iter-* IDs"
+else
+  _fail "kill_run() missing session-halt wiring"
+fi
+
+echo
 echo "── pre-iter cost-cap pre-check ──"
 # Regression for 2-spiral-events-this-session: runner must halt BEFORE
 # worktree creation when SUM(task_runs.cost_usd) over 24h >= cap, not
