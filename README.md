@@ -19,18 +19,18 @@ mini-ork is a **task operating system for agents**. It receives a goal, classifi
 
 **Most agent frameworks ship multi-agent review where every agent is the same model family.** That's the [evaluative coalition](https://blog.sourceshift.io/p/we-ran-a-3-source-bug-hunt-then-we-realised-our-validators-were-all-claude) failure mode the literature has now named, measured, and assigned harshness coefficients to. A panel of four Sonnets isn't four independent judges — it's one disposition amplified four times.
 
-mini-ork is built around the opposite prior: **dispatch lenses to distinct model families by configuration.** Every recipe-level decision (audit, review, synthesis, verification) routes through agents from different vendor families so that **pairwise correlation between voters stays low** — the precondition multi-agent review actually needs to outperform a single agent.
+mini-ork is built around the opposite prior: **dispatch lenses to distinct model families by configuration.** The literature below does not prove that vendor diversity alone is sufficient; it supports a narrower, more useful design rule: multi-agent review needs low-correlation evidence channels, executable checks, and information boundaries. mini-ork uses model-family diversity as an enforceable proxy for that independence, then adds deterministic verifiers where possible.
 
-### The literature this rests on
+### Research signals behind the design
 
-| Paper | What it proves |
+| Paper | What it supports |
 |---|---|
-| [Nasser 2026](https://arxiv.org/abs/2601.05114) — *Evaluative Fingerprints* | 9-judge eval, 3240 ratings: Krippendorff α = **0.042** across same-family panels. Claude-Opus harshness −0.429, Gemini-3-Pro +0.262. Same family ≠ neutral. |
-| [Rajan 2025](https://arxiv.org/abs/2511.16708) — *CodeX-Verify* | Submodularity proof: multi-agent review catches strictly more bugs **iff** pairwise ρ < 0.25. **Heterogeneity isn't an optimisation — it's the precondition for the proof.** |
-| [Karanam 2025](https://arxiv.org/abs/2512.21352) | GPT-4o + Gemini 2.5 + Grok 2 panel: each persona catches a different ~88% of bugs, only ~12% overlap. |
-| [Zietsman 2026](https://arxiv.org/abs/2603.25773) — *Specification as Quality Gate* | AI-reviewing-AI without an executable specification is **structurally** circular. |
-| [Shehata 2026](https://arxiv.org/abs/2604.27274) — *Inverse-Wisdom Law* | "Consensus Paradox": homogeneous agents prioritise internal agreement over external truth. |
-| [Song 2026](https://arxiv.org/abs/2603.21454) — *Cross-Context Verification* | Repeating verification within one session **degrades** accuracy. False positives accrete faster than true ones get found. |
+| [Nasser 2026](https://arxiv.org/abs/2601.05114) — *Evaluative Fingerprints* | 9-judge eval, 3240 ratings: Krippendorff α = **0.042**. Claude-Opus harshness −0.429, Gemini-3-Pro +0.262. LLM judges are stable measurement instruments with different dispositions, not interchangeable graders. |
+| [Rajan 2025](https://arxiv.org/abs/2511.16708) — *Multi-Agent Code Verification via Information Theory* | CodeX-Verify argues that specialized detectors help when detection patterns are conditionally independent. It reports agent correlations ρ = 0.05-0.25 and diminishing gains across 1-4 agents. mini-ork treats low ρ as the target and model-family diversity as an operational proxy. |
+| [Karanam 2025](https://arxiv.org/abs/2512.21352) — *Multi-Agent LLM Committees for Autonomous Software Beta Testing* | A GPT-4o + Gemini 2.5 Pro + Grok 2 Vision committee improves beta-testing task success and bug-detection F1 over single-agent baselines. Persona-diversity analysis reports that only roughly 12% of bugs are found by more than one persona. |
+| [Zietsman 2026](https://arxiv.org/abs/2603.25773) — *Specification as Quality Gate* | Argues that AI-reviewing-AI is structurally circular without executable specifications. This supports mini-ork's verifier-first design: model review is residual judgment, not the oracle. |
+| [Shehata 2026](https://arxiv.org/abs/2604.27274) — *Inverse-Wisdom Law* | Reports a "Consensus Paradox" where kinship-dominant swarms can converge on internal agreement instead of external truth. Treat as a warning signal for same-family panels, not a settled universal law. |
+| [Song 2026](https://arxiv.org/abs/2603.21454) — *Cross-Context Verification* | Supports session isolation and information restriction. The paper's own pilot and cited related work show repeated/shared-context verification can create sycophantic confirmation and false-positive pressure. |
 
 ### The detection-fingerprint test
 
@@ -59,7 +59,7 @@ lanes:
 | You give up | You get |
 |---|---|
 | The convenience of one vendor's billing | Cross-family bias diversity (Nasser 2026) |
-| Same-vendor caching tricks | Submodularity-valid multi-agent review (Rajan 2025) |
+| Same-vendor caching tricks | Lower-correlation review lanes inspired by Rajan 2025 |
 | Single-vendor SLA | Independence of failure modes — one vendor outage doesn't kill the cycle |
 | Uniform model behavior | Persona-differentiated bug catches (Karanam 2025) |
 
@@ -109,6 +109,27 @@ mini-ork run ./kickoff.md
 ```bash
 sqlite3 .mini-ork/state.db "SELECT id, task_class, recipe, status, verdict FROM task_runs ORDER BY created_at DESC LIMIT 5;"
 ```
+
+### Observability UI (optional)
+
+A read-only React SPA backed by FastAPI exposes the same `state.db` + run
+artifacts as a browseable surface — fleet view, per-run DAG forensics,
+trajectory metrics, and the **detection-fingerprint** panel that audits
+which model families ran which lens per recipe.
+
+```bash
+# 1. Install backend deps (one-time)
+pip install fastapi uvicorn pyyaml
+
+# 2. Boot the local UI (binds 127.0.0.1:7090, read-only)
+mini-ork serve
+
+# 3. Browse to http://127.0.0.1:7090
+```
+
+The SPA bundle ships under `mini_ork/web/static/` after `pnpm --dir web build`.
+For dev with hot reload, run `pnpm --dir web dev` (Vite on :5173 proxies to :7090).
+Routes: `/` fleet, `/runs/:id` forensics, `/trajectory` convergence, `/fingerprint` coalition audit.
 
 ---
 
@@ -194,7 +215,7 @@ The framework ships the universal loop and its primitives. Nothing in `lib/` or 
 
 ### RECIPES — opinions live here
 
-Recipes are user-land workflow definitions. They compose framework primitives into pipeline shapes. 11 recipes ship today; 7 of them dispatch a 4–5 lens panel across DISTINCT model families per cycle (Rajan 2025 ρ-precondition by construction).
+Recipes are user-land workflow definitions. They compose framework primitives into pipeline shapes. 11 recipes ship today; 7 of them dispatch a 4–5 lens panel across distinct model families per cycle, using family diversity as a practical proxy for the low-correlation detector patterns highlighted by Rajan 2025.
 
 | Recipe | Location | Shape |
 |---|---|---|
@@ -250,7 +271,8 @@ See [docs/SAFETY.md](docs/SAFETY.md) for immutable constraints and the Promotion
 The full release log lives in [`ROADMAP.md`](ROADMAP.md) — every section dated and per-commit-attributed. Current shipped totals (regenerable via `bash scripts/readme-claim-check.sh` and filesystem counts):
 
 - 6-stage universal loop (`classify → plan → execute → verify → reflect → improve`) + 7 companion entrypoints (`eval`, `improve`, `promote`, `metrics`, `spawn`, direct `bin/mini-ork-topology`, direct `bin/mini-ork-self-improve`)
-- 42 framework primitives in `lib/` (incl. oracle-hardening libs + `gate_bootstrap.sh` for the v0.3-rc1 central wire-up, added 2026-06-05)
+- 43 framework primitives in `lib/` (incl. oracle-hardening libs + `gate_bootstrap.sh` for the v0.3-rc1 central wire-up + `lib/throttle-guard.sh` for provider-throttle classification with per-lane exponential backoff, added 2026-06-09)
+- 1 runner-shared helper in `bin/lib/` (`profile-seed.sh` — deterministic `run_profile.json` seeding from structured kickoff markdown, added 2026-06-09)
 - 15 user-facing `bin/mini-ork*` entrypoints
 - 17 schema migrations under `db/migrations/` (memory namespaces, benchmarks, evolution, safety, panel topology telemetry, recursive orchestration, self-improvement learning)
 - 11 recipes shipped — see Recipes table above
@@ -262,6 +284,32 @@ Next-up work tracks (see [`ROADMAP.md`](ROADMAP.md) for detail):
 - Wave 2-A held-out anchor corpus per synthesis recipe (Wang 2026)
 - Wave 3 mechanical citation+coverage verifier (Sistla 2025 + Ficek 2025)
 - Krippendorff α calibration gate + adversarial fabricated-bug injection (the v0.2 honest-gaps list)
+
+---
+
+## Recursive self-improvement evidence (2026-06-09 session)
+
+The `recursive-self-improve` recipe ran against mini-ork itself for ~5 wall-clock hours, producing **10 commits to `main` autonomously** — each grounded in cited arXiv evidence per the recipe's "new infra requires arXiv evidence" hard rule. Audit trail lives in `self_improve_runs`, `learning_record`, and `self_improve_arxiv_refs` tables; per-iter synthesis files are preserved under `.mini-ork/runs/`.
+
+| Iter | Commit | Technique | arXiv citation(s) |
+|---|---|---|---|
+| 1  | `c5b819c` | Verifier verdict JSON adapter (`_run_verifier_ref`) | — (in-place adapter, no infra) |
+| 2  | `e95e641` | Broader pollution check across all `lens-*.md` artifacts | 2602.13477 Naik 2026; 2502.12630 Sternak 2025 |
+| 3  | `6a66e28` | Post-write envelope sanitizer at consumer boundary | 2604.01350 Yang 2026; 2605.16746 Wang 2026 |
+| 4  | `94b48c8` | Optional `lens-arxiv.md` when provider capacity errors | — (operational) |
+| 18 | `f8967b1` | Utility-delta tri-state gate in `no-regression.sh` | 2604.10547 Chen 2026; 2604.00072 Scrivens 2026 |
+| 19 | `0a3bf1c` | Pre-dispatch profile gate in `bin/mini-ork-plan` | 2605.07062 Barnes 2026 |
+| 20 | `300fe48` | Canonical worktree base-ref resolution | 2603.25697; 2604.07877; 2511.06179 |
+| 32 | `b9b6d18` | Portable `duration_ms` capture at `llm_dispatch` sites | 2604.05119 Pathak 2026; 2601.08815 Ye 2026; 2604.23853 Yuan 2026; 2602.10133; 2602.19065; 2605.27328 |
+| 33 | `77f965f` | Deterministic profile-seed from structured kickoff markdown | 2601.04620; 2604.08633 |
+
+Cumulative DB state at session end: **23 arXiv references cited across the session; 19 marked `used_in_patch=1`** (i.e. landed in main via cherry-pick). The recipe's safety rule was respected in both directions — every patch proposing new infrastructure cited a paper; every in-place adapter explicitly stated no citation required.
+
+The first three patches (`c5b819c`, `e95e641`, `6a66e28`) were emergent — the loop found these bugs by reading its own prior run logs. Iter 18 (utility-delta) and iter 32 (duration_ms) targeted operator-seeded `learning_record` rows. Iter 33 is the most interesting: it healed a symptom of its own iter-19 patch (the profile-gate caused a spiral under a meta-kickoff; iter 33 fixed the root cause by deterministically populating the profile from structured kickoff sections, making the gate's "needs_answers" verdict honest rather than blocking).
+
+Supporting fixes that landed alongside the loop's autonomous output: `lib/throttle-guard.sh` (provider-error classification + per-lane backoff + systemic-halt at 3 simultaneous providers), `bin/mini-ork-self-improve` pre-iter cost-cap pre-check (halt before worktree creation when `SUM(task_runs.cost_usd)` over 24h exceeds `MO_DAILY_BUDGET_USD`), Anthropic-native wrapper policy clarification (`cl_opus.sh` / `cl_sonnet.sh` only unset env vars, deferring to Claude Code ambient auth — gateway wrappers `cl_glm.sh` / `cl_kimi.sh` / `cl_minimax.sh` / `cl_deepseek.sh` keep setting `ANTHROPIC_AUTH_TOKEN` because they route to non-Anthropic endpoints).
+
+Operational env vars added during this session: `MO_DAILY_BUDGET_USD` (cost circuit cap), `MINI_ORK_PROFILE_GATE` (planner profile gate; off by default for the recursive loop), `MINI_ORK_PLAN_CONFIDENCE_FLOOR` (gate threshold), `MINI_ORK_SELF_IMPROVE_BASE_REF` (worktree base ref, defaults to `main`), `MINI_ORK_BENCH_UTILITY_THRESHOLD` + `MINI_ORK_BENCH_MIN_N` (utility-delta gate parameters), `MINI_ORK_THROTTLE_EMPTY_ITER_THRESHOLD` (spiral halt), `MINI_ORK_PRE_ITER_COST_CHECK` (pre-iter cost-cap pre-check override). See `docs/RECURSIVE-SELF-IMPROVE.md` for the operator guide.
 
 ---
 
