@@ -61,11 +61,11 @@ nodes = wf.get("nodes") or []
 by_name = {n["name"]: n for n in nodes}
 
 expected = {
-    "bottleneck_scanner": ("planner",      "planner"),
+    "bottleneck_lens":    ("researcher",   "planner"),
     "perf_lens":          ("researcher",   "minimax_lens"),
     "correctness_lens":   ("researcher",   "kimi_lens"),
     "arch_lens":          ("researcher",   "codex_lens"),
-    "arxiv_research":     ("researcher",   "codex_lens"),
+    "arxiv_lens":         ("researcher",   "codex_lens"),
     "opus_synthesizer":   ("reviewer",     "opus_lens"),
     "implementer":        ("implementer",  "codex_lens"),
 }
@@ -126,6 +126,17 @@ echo "── verifier behavior ──"
 mkdir -p "$TMPROOT/run"
 export MINI_ORK_RUN_DIR="$TMPROOT/run"
 
+# Regression for iter-1 file-name mismatch: verifier must look for
+# lens-bottleneck.md + lens-arxiv.md (matches dispatcher's _lens
+# naming heuristic), not the old bottleneck-scan.md / arxiv-refs.md
+# names. Inline assertion against the verifier source.
+if grep -q 'lens-bottleneck.md' "$RECIPE_DIR/verifiers/bottlenecks-found.sh" \
+   && grep -q 'lens-arxiv.md' "$RECIPE_DIR/verifiers/bottlenecks-found.sh"; then
+  _ok "bottlenecks-found verifier references lens-bottleneck.md + lens-arxiv.md"
+else
+  _fail "bottlenecks-found verifier missing lens-*.md file names — will fail vs dispatcher output"
+fi
+
 # Empty run dir → bottlenecks-found should fail
 out=$(bash "$RECIPE_DIR/verifiers/bottlenecks-found.sh" 2>/dev/null)
 if echo "$out" | python3 -c "import sys,json; d=json.load(sys.stdin); sys.exit(0 if d['pass'] is False else 1)"; then
@@ -135,11 +146,11 @@ else
 fi
 
 # Polluted synthesis → still fails
-cat > "$MINI_ORK_RUN_DIR/bottleneck-scan.md" <<'MD'
+cat > "$MINI_ORK_RUN_DIR/lens-bottleneck.md" <<'MD'
 # Scan
 | 1 | perf | x | high | a:1 | minimax_lens |
 MD
-cat > "$MINI_ORK_RUN_DIR/arxiv-refs.md" <<'MD'
+cat > "$MINI_ORK_RUN_DIR/lens-arxiv.md" <<'MD'
 # Arxiv refs
 MD
 cat > "$MINI_ORK_RUN_DIR/synthesis.md" <<'MD'
@@ -170,7 +181,7 @@ else
 fi
 
 # Converged shortcut
-cat > "$MINI_ORK_RUN_DIR/bottleneck-scan.md" <<'MD'
+cat > "$MINI_ORK_RUN_DIR/lens-bottleneck.md" <<'MD'
 # Scan
 ## Status: converged
 MD
