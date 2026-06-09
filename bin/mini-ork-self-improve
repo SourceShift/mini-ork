@@ -110,6 +110,24 @@ fi
 
 [ -z "$PARENT_BRANCH" ] && PARENT_BRANCH=$(git -C "$MINI_ORK_ROOT" rev-parse --abbrev-ref HEAD)
 
+# Throttle-aware guard. Detects provider capacity / rate-limit /
+# overload errors, sleeps per-provider until cool-down expires,
+# halts the loop if too many providers throttle simultaneously OR
+# too many consecutive iters produce empty run dirs.
+# shellcheck source=lib/throttle-guard.sh
+if [ -f "$MINI_ORK_ROOT/lib/throttle-guard.sh" ]; then
+  source "$MINI_ORK_ROOT/lib/throttle-guard.sh"
+  echo "[info] throttle-guard active (state: $MINI_ORK_HOME/state/)"
+else
+  echo "[warn] lib/throttle-guard.sh missing — running without throttle awareness"
+fi
+
+# Empty-iter spiral guard. iter 4 of this session's run hit Codex
+# capacity and the loop spun through 13 empty iters in 73s before
+# I noticed. Cap the consecutive-empty count and halt when crossed.
+EMPTY_ITER_STREAK=0
+EMPTY_ITER_HALT=${MINI_ORK_THROTTLE_EMPTY_ITER_THRESHOLD:-5}
+
 START_EPOCH=$(date +%s)
 SOFT_DEADLINE=$(( START_EPOCH + SOFT_HOURS*3600 ))
 HARD_DEADLINE=$(( START_EPOCH + HARD_HOURS*3600 ))
@@ -210,6 +228,25 @@ _iter_run() {
 
   _record_run "$run_id" "pending" "starting" "$wt_path" "$branch"
 
+  # 0. Throttle pre-flight. If any provider lane required by this iter
+  #    is mid-cool-down, sleep until it expires (or until the hard
+  #    deadline). Lanes: codex (planner + arxiv + arch + implementer),
+  #    minimax (perf), kimi (correctness), opus (synth/reviewer).
+  if declare -f _throttle_wait_for_cooldowns >/dev/null 2>&1; then
+    if _throttle_systemic_halt_check 2>/dev/null; then
+      echo "  [throttle] SYSTEMIC HALT: 3+ providers throttled simultaneously"
+      _record_run "$run_id" "aborted" "throttle-systemic-halt" "$wt_path" "$branch"
+      git -C "$MINI_ORK_ROOT" worktree remove --force "$wt_path" 2>/dev/null || true
+      return 2  # signal outer loop to break
+    fi
+    _throttle_wait_for_cooldowns "$HARD_DEADLINE" codex opus minimax kimi sonnet || {
+      echo "  [throttle] cool-down would exceed hard deadline; aborting iter"
+      _record_run "$run_id" "aborted" "throttle-cooldown-overflow" "$wt_path" "$branch"
+      git -C "$MINI_ORK_ROOT" worktree remove --force "$wt_path" 2>/dev/null || true
+      return 2
+    }
+  fi
+
   # 1. Create worktree on a fresh branch off the parent
   if ! git -C "$MINI_ORK_ROOT" worktree add -b "$branch" "$wt_path" "$PARENT_BRANCH" 2>&1 | sed 's/^/  [worktree] /'; then
     _record_run "$run_id" "failed" "worktree-add-failed" "$wt_path" "$branch"
@@ -266,6 +303,33 @@ EOF
     timeout "${per_iter_budget}" "$MINI_ORK_ROOT/bin/mini-ork" \
         run recursive-self-improve "$RUN_DIR/kickoff.md" \
         > "$exec_log" 2>&1 ) || exec_rc=$?
+
+  # 4a. Post-dispatch throttle classification. Scan llm-failures/ for
+  #     provider error signatures and update per-provider cool-down
+  #     flags so the NEXT iter's pre-flight check can sleep instead
+  #     of repeating the same dispatch into the same throttle.
+  if declare -f _throttle_classify_run_failures >/dev/null 2>&1; then
+    _throttle_classify_run_failures "$RUN_DIR" 2>&1 | sed 's/^/  /'
+  fi
+
+  # 4b. Empty-iter spiral detector. iter 4 of this session hit Codex
+  #     capacity and the loop spun 13 empty iters in 73s before I
+  #     noticed. If this iter produced zero lens-*.md output, increment
+  #     the streak; halt when the streak crosses the threshold.
+  local lens_count
+  lens_count=$(ls "$RUN_DIR"/lens-*.md 2>/dev/null | wc -l | tr -d ' ')
+  if [ "$lens_count" -eq 0 ]; then
+    EMPTY_ITER_STREAK=$((EMPTY_ITER_STREAK + 1))
+    echo "  [spiral] iter $ITER produced 0 lens-*.md (streak=$EMPTY_ITER_STREAK/$EMPTY_ITER_HALT)"
+    if [ "$EMPTY_ITER_STREAK" -ge "$EMPTY_ITER_HALT" ]; then
+      echo "  [spiral] HALTING: $EMPTY_ITER_STREAK consecutive empty iters — upstream provider likely down"
+      _record_run "$run_id" "aborted" "empty-iter-spiral" "$wt_path" "$branch"
+      git -C "$MINI_ORK_ROOT" worktree remove --force "$wt_path" 2>/dev/null || true
+      return 2  # signal outer loop to break
+    fi
+  else
+    EMPTY_ITER_STREAK=0   # reset on any lens output
+  fi
 
   # 5. Read verifier outcomes — each writes JSON to its log.
   local v_bottle="$RUN_DIR/verifier-bottlenecks-found.log"
@@ -361,6 +425,13 @@ EOF
       local _commit_sha
       _commit_sha=$(git -C "$wt_path" rev-parse HEAD 2>/dev/null || echo "")
       _self_improve_record_success "$run_id" "$branch" "$_commit_sha"
+      # Success clears throttle state on all paid lanes — capacity
+      # signals are stale once a full lens fan-out completes cleanly.
+      if declare -f _throttle_clear_on_success >/dev/null 2>&1; then
+        for _p in codex opus minimax kimi sonnet; do
+          _throttle_clear_on_success "$_p"
+        done
+      fi
     else
       echo "  [info] no diff to commit (verifiers passed but nothing changed)"
     fi
@@ -396,7 +467,17 @@ while :; do
     break
   fi
 
-  _iter_run || true
+  # Capture rc via || so set -e doesn't kill the script on non-zero
+  # function returns. Exit 2 from _iter_run is the "break the outer
+  # loop" signal — systemic throttle, empty-iter spiral, or cool-down
+  # would exceed the hard deadline. Don't keep looping into a
+  # known-bad upstream.
+  _iter_rc=0
+  _iter_run || _iter_rc=$?
+  if [ "$_iter_rc" -eq 2 ]; then
+    echo "[abort] outer loop break signal received from iter (rc=2)"
+    break
+  fi
 
   NOW=$(date +%s)
   LAST_OUTCOME=$(sqlite3 "$MINI_ORK_DB" \

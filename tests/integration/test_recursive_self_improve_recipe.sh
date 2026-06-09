@@ -291,7 +291,84 @@ else
 fi
 
 echo
+echo "── throttle-guard classification ──"
+THROTTLE_LIB="$MINI_ORK_ROOT/lib/throttle-guard.sh"
+_assert "throttle-guard lib exists" test -f "$THROTTLE_LIB"
+if [ -f "$THROTTLE_LIB" ]; then
+  ERR_LOG="$TMPROOT/sample.err.log"
+  echo "ERROR: Selected model is at capacity. Please try a different model." > "$ERR_LOG"
+  cls=$(MINI_ORK_HOME="$MINI_ORK_HOME" bash -c "source '$THROTTLE_LIB'; _throttle_classify_error '$ERR_LOG'")
+  [ "$cls" = "capacity" ] && _ok "classifies 'Selected model is at capacity' as 'capacity'" \
+                          || _fail "classification expected 'capacity' got '$cls'"
+
+  echo "429 Too Many Requests rate_limit_exceeded" > "$ERR_LOG"
+  cls=$(MINI_ORK_HOME="$MINI_ORK_HOME" bash -c "source '$THROTTLE_LIB'; _throttle_classify_error '$ERR_LOG'")
+  [ "$cls" = "throttled" ] && _ok "classifies 429 as 'throttled'" \
+                           || _fail "429 classification expected 'throttled' got '$cls'"
+
+  echo "529 Service Unavailable overloaded_error" > "$ERR_LOG"
+  cls=$(MINI_ORK_HOME="$MINI_ORK_HOME" bash -c "source '$THROTTLE_LIB'; _throttle_classify_error '$ERR_LOG'")
+  [ "$cls" = "overloaded" ] && _ok "classifies 529 as 'overloaded'" \
+                            || _fail "529 classification expected 'overloaded' got '$cls'"
+
+  echo "401 Unauthorized authentication_error" > "$ERR_LOG"
+  cls=$(MINI_ORK_HOME="$MINI_ORK_HOME" bash -c "source '$THROTTLE_LIB'; _throttle_classify_error '$ERR_LOG'")
+  [ "$cls" = "auth_failed" ] && _ok "classifies 401 as 'auth_failed' (not retryable)" \
+                             || _fail "401 classification expected 'auth_failed' got '$cls'"
+
+  echo "random garbage no known pattern" > "$ERR_LOG"
+  cls=$(MINI_ORK_HOME="$MINI_ORK_HOME" bash -c "source '$THROTTLE_LIB'; _throttle_classify_error '$ERR_LOG'")
+  [ "$cls" = "unknown" ] && _ok "classifies unmatched text as 'unknown'" \
+                         || _fail "unknown classification expected got '$cls'"
+
+  # Backoff ladder writes a flag with a cool-down > 0 for capacity errors
+  rm -rf "$MINI_ORK_HOME/state"
+  MINI_ORK_HOME="$MINI_ORK_HOME" bash -c "source '$THROTTLE_LIB'; _throttle_record_failure codex capacity" 2>/dev/null
+  FLAG="$MINI_ORK_HOME/state/throttle-codex.flag"
+  if [ -f "$FLAG" ] && grep -q '^cool_down_until=[0-9]' "$FLAG"; then
+    cool_secs=$(MINI_ORK_HOME="$MINI_ORK_HOME" bash -c "source '$THROTTLE_LIB'; _throttle_check_cooldown codex")
+    if [ "$cool_secs" -gt 0 ]; then
+      _ok "capacity error writes cool-down flag (${cool_secs}s)"
+    else
+      _fail "cool-down flag written but reports 0 seconds"
+    fi
+  else
+    _fail "throttle flag not written for capacity error"
+  fi
+
+  # Success clears the flag
+  MINI_ORK_HOME="$MINI_ORK_HOME" bash -c "source '$THROTTLE_LIB'; _throttle_clear_on_success codex" 2>/dev/null
+  if [ ! -f "$FLAG" ]; then
+    _ok "_throttle_clear_on_success removes the flag"
+  else
+    _fail "success clear left flag in place"
+  fi
+
+  # Systemic-halt check fires when 3+ providers are throttled at once
+  rm -rf "$MINI_ORK_HOME/state"
+  for p in codex opus minimax; do
+    MINI_ORK_HOME="$MINI_ORK_HOME" bash -c "source '$THROTTLE_LIB'; _throttle_record_failure $p capacity" 2>/dev/null
+  done
+  if MINI_ORK_HOME="$MINI_ORK_HOME" bash -c "source '$THROTTLE_LIB'; _throttle_systemic_halt_check"; then
+    _ok "systemic halt fires when 3 providers throttle simultaneously"
+  else
+    _fail "systemic halt failed to fire with 3 throttled providers"
+  fi
+
+  # Runner integration: spiral-halt env var threads through
+  if grep -q "EMPTY_ITER_STREAK" "$MINI_ORK_ROOT/bin/mini-ork-self-improve" \
+     && grep -q "_throttle_systemic_halt_check" "$MINI_ORK_ROOT/bin/mini-ork-self-improve"; then
+    _ok "runner integrates throttle guard + empty-iter spiral halt"
+  else
+    _fail "runner missing throttle/spiral guards"
+  fi
+fi
+
+echo
 echo "── outer runner --dry-run ──"
+# Clear any throttle-flag state the previous smoke block left behind
+# so dry-run doesn't trip the systemic-halt guard.
+rm -rf "$MINI_ORK_HOME/state"
 out=$("$MINI_ORK_ROOT/bin/mini-ork-self-improve" --dry-run --max-iters 1 --soft-cap-hours 1 --hard-cap-hours 1 2>&1 || true)
 if echo "$out" | grep -q "dry-run"; then
   _ok "outer runner --dry-run smoke ran"
