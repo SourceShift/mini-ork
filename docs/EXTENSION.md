@@ -29,56 +29,72 @@ Add new nodes, edges, and workflow topologies by writing a `workflow.yaml` insid
 
 **Where:** `recipes/<your-recipe>/workflow.yaml`
 
-**Validated against:** `schemas/workflow.schema.json`
+**Current contract:** follow the shipped recipes in `recipes/*/workflow.yaml`. `schemas/workflow.schema.json` documents the target validation shape, but the live recipes currently include newer fields such as `verifier_ref` and human-decision edge types that the schema has not fully caught up with yet.
 
 **Example — add a `researcher` node before `implementer`:**
 
 ```yaml
 # recipes/my-recipe/workflow.yaml
-version: "1.0"
+version: "0.1.0"
 task_class: code_fix
+description: "Code fix with explicit research before implementation"
 
 nodes:
-  - id: plan
+  - name: planner
     type: planner
-    model_lane: architect
+    model_lane: planner
+    prompt_ref: prompts/planner.md
+    dispatch_mode: serial
 
-  - id: research
+  - name: research
     type: researcher
-    model_lane: worker
-    depends_on: [plan]
+    model_lane: researcher
+    prompt_ref: prompts/research.md
+    dispatch_mode: serial
 
-  - id: impl
+  - name: implementer
     type: implementer
     model_lane: worker
-    depends_on: [plan, research]
+    prompt_ref: prompts/implementer.md
+    dispatch_mode: serial
+    gates:
+      - scope_gate
+      - budget_gate
 
-  - id: verify
+  - name: verify
     type: verifier
-    scripts: [typecheck.sh, targeted_test.sh]
-    verifies: impl
-    retries: impl          # fires the retries edge on fail
-    max_retries: 2
+    prompt_ref: null
+    verifier_ref: verifiers/targeted_test.sh
+    dispatch_mode: serial
 
-  - id: review
+  - name: reviewer
     type: reviewer
-    model_lane: architect
-    depends_on: [verify]
+    model_lane: reviewer
+    prompt_ref: prompts/reviewer.md
+    dispatch_mode: serial
 
-  - id: publish
+  - name: publisher
     type: publisher
-    depends_on: [review]
+    prompt_ref: null
+    dispatch_mode: serial
 
-  - id: rollback
-    type: rollback
-    escalates_to: rollback  # verify escalates to this after max_retries
+edges:
+  - { from: planner,     to: research,     edge_type: depends_on }
+  - { from: research,    to: implementer, edge_type: supplies_context_to }
+  - { from: implementer, to: verify,      edge_type: verifies }
+  - { from: verify,      to: reviewer,    edge_type: depends_on }
+  - { from: reviewer,    to: publisher,   edge_type: depends_on }
 ```
 
 **Allowed node types:** `planner` `researcher` `implementer` `reviewer` `verifier` `reflector` `publisher` `rollback`
 
-**Allowed edge fields per node:** `depends_on` `supplies_context_to` `verifies` `blocks` `retries` `escalates_to`
+**Common edge types:** `depends_on` `supplies_context_to` `verifies` `blocks` `retries` `escalates_to`. Some shipped recipes also use product-flow edges such as `human_decision_gate` and `verifies_user_choice`; treat those as live recipe dialect extensions until the schema is aligned.
 
-Run `mini-ork validate recipes/my-recipe/workflow.yaml` to check against the schema before running.
+There is no top-level `mini-ork validate` command yet. Until recipe validation is wired, use an existing recipe as the reference, then dry-run the recipe:
+
+```bash
+MINI_ORK_DRY_RUN=1 bin/mini-ork run my-recipe kickoff.md
+```
 
 ---
 
@@ -86,33 +102,31 @@ Run `mini-ork validate recipes/my-recipe/workflow.yaml` to check against the sch
 
 Register new agent roles or model bindings without touching any `lib/` code.
 
-**Where:** `${MINI_ORK_HOME}/config/agents/<role>.yaml`
+**Where:** `${MINI_ORK_HOME}/config/agents.yaml` for lane-to-provider bindings, or provider-specific files under the framework `config/agents/` directory when a recipe ships an override.
 
 **Runtime API:** `lib/agent_registry.sh:agent_register`
 
-**Example — register a custom reviewer using a local Ollama model:**
+**Example — bind a custom reviewer lane to a local provider key:**
 
 ```yaml
-# ${MINI_ORK_HOME}/config/agents/my-reviewer.yaml
-role: reviewer
-version: "1.0"
-model: ollama/qwen2.5-72b
-provider: ollama
-tools: []
-context_window: 32768
-cost_per_1m_input: 0.0
-cost_per_1m_output: 0.0
-task_classes: [code_fix, blog_post]
-notes: "Local reviewer — no external API call"
+# ${MINI_ORK_HOME}/config/agents.yaml
+lanes:
+  planner: opus
+  worker: codex
+  reviewer: kimi
+  verifier: glm
+  publisher: codex
 ```
 
 Then reference it in your `workflow.yaml`:
 
 ```yaml
 nodes:
-  - id: review
+  - name: review
     type: reviewer
-    agent: my-reviewer   # matches the role + version key
+    model_lane: reviewer
+    prompt_ref: prompts/reviewer.md
+    dispatch_mode: serial
 ```
 
 **Shell registration at runtime:**
@@ -159,14 +173,15 @@ echo "SCHEMA_DIFF_PASS"
 exit 0
 ```
 
-Reference it in `workflow.yaml`:
+Reference it in `workflow.yaml` with `verifier_ref`:
 
 ```yaml
 nodes:
-  - id: verify
+  - name: verify
     type: verifier
-    scripts: [schema_diff.sh, targeted_test.sh]
-    verifies: impl
+    prompt_ref: null
+    verifier_ref: verifiers/schema_diff.sh
+    dispatch_mode: serial
 ```
 
 **Shell registration at runtime:**

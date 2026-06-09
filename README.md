@@ -194,7 +194,7 @@ The framework ships the universal loop and its primitives. Nothing in `lib/` or 
 
 ### RECIPES — opinions live here
 
-Recipes are user-land workflow definitions. They compose framework primitives into pipeline shapes. 9 recipes ship today; 7 of them dispatch a 4–5 lens panel across DISTINCT model families per cycle (Rajan 2025 ρ-precondition by construction).
+Recipes are user-land workflow definitions. They compose framework primitives into pipeline shapes. 11 recipes ship today; 7 of them dispatch a 4–5 lens panel across DISTINCT model families per cycle (Rajan 2025 ρ-precondition by construction).
 
 | Recipe | Location | Shape |
 |---|---|---|
@@ -204,6 +204,7 @@ Recipes are user-land workflow definitions. They compose framework primitives in
 | `refactor-audit` | `recipes/refactor-audit/` | 4 lens stances run in parallel (glm/kimi/codex/opus), with Opus preserved as the architectural-shape lens. The framework's own self-audit recipe. |
 | `research-synthesis` | `recipes/research-synthesis/` | 4-lens research synthesis (web/lit/code/narrative on distinct families) → synthesizer → publisher. |
 | `post-mvp-delivery` | `recipes/post-mvp-delivery/` | Discovery-first post-MVP product delivery: parallel product/architecture/integration/validation research → options for user choice → selected-option gate → implementation. |
+| `recursive-self-improve` | `recipes/recursive-self-improve/` | Wall-clock-budgeted self-improvement loop for mini-ork itself: bottleneck scan + heterogeneous lenses + arXiv evidence lane + synthesis + gated patch. Outer driver: `bin/mini-ork-self-improve`. |
 | `blog-post` | `recipes/blog-post/` | 5-lens blog drafting (editor / researcher / narrative / audience / counter) in parallel across distinct families. |
 | `db-migration` | `recipes/db-migration/` | 5-lens migration audit + plan: integrity / rollback / perf / compat / edge-data in parallel across distinct families. |
 | `ops-runbook` | `recipes/ops-runbook/` | 5-lens runbook generation: detection / containment / diagnosis / recovery / prevention across distinct families. |
@@ -217,7 +218,7 @@ Add your own under `recipes/<name>/` — see [docs/EXTENSION.md](docs/EXTENSION.
 
 Extensions do not require forking the framework. See [docs/EXTENSION.md](docs/EXTENSION.md) for full examples.
 
-1. **WorkflowGraph** — add nodes and edges by writing a `workflow.yaml` in your recipe. Validated against `schemas/workflow.schema.json`.
+1. **WorkflowGraph** — add nodes and edges by writing a `workflow.yaml` in your recipe. The live recipes are the executable contract today; `schemas/workflow.schema.json` is the target validation contract and is being aligned with the newer recipe fields such as verifier refs and human decision edges.
 2. **AgentRegistry** — register new roles or model bindings via `lib/agent_registry.sh:agent_register`. No code change.
 3. **VerifierRegistry** — drop a `<name>.sh` script under `${MINI_ORK_HOME}/verifiers/` or `recipes/<recipe>/verifiers/` and reference it in `workflow.yaml`.
 4. **ExperienceMemory** — add new namespaces via DB migrations or override `lib/context_assembler.sh` per task class.
@@ -244,20 +245,20 @@ See [docs/SAFETY.md](docs/SAFETY.md) for immutable constraints and the Promotion
 
 ## Roadmap
 
-**Current: v0.3.0-rc1** (release candidate, 2026-06-08) — oracle-hardening primitives shipped: `coalition_gate.sh`, `cw_por.sh`, `mo_promote_synthesis_gate`, `adaptive_stability.sh`, `circuit_breaker.sh`. Self-evolution is now explicitly class-restricted (`docs/positioning/why-mini-ork.md` §"Self-evolution is class-restricted").
+**Current: v0.3.0-rc1** (release candidate, 2026-06-08) — oracle-hardening primitives shipped: `coalition_gate.sh`, `cw_por.sh`, `mo_promote_synthesis_gate`, `adaptive_stability.sh`, `circuit_breaker.sh`, plus the central `gate_bootstrap.sh` wiring used by execute. Self-evolution is now explicitly class-restricted (`docs/positioning/why-mini-ork.md` §"Self-evolution is class-restricted").
 
-The full release log lives in [`ROADMAP.md`](ROADMAP.md) — every section dated and per-commit-attributed. Current shipped totals (regenerable via `mini-ork doctor`):
+The full release log lives in [`ROADMAP.md`](ROADMAP.md) — every section dated and per-commit-attributed. Current shipped totals (regenerable via `bash scripts/readme-claim-check.sh` and filesystem counts):
 
-- 6-stage universal loop (`classify → plan → execute → verify → reflect → improve`) + 5 extension entrypoints (`eval`, `improve`, `promote`, `topology`, `spawn`)
-- 41 framework primitives in `lib/` (incl. 6 oracle-hardening libs + `gate_bootstrap.sh` for the v0.3-rc1 central wire-up, added 2026-06-05)
-- 14 user-facing `bin/mini-ork*` entrypoints
-- 16 schema migrations under `db/migrations/` (memory namespaces, benchmarks, evolution, safety, panel topology telemetry, recursive orchestration)
-- 9 recipes shipped — see Recipes table above
+- 6-stage universal loop (`classify → plan → execute → verify → reflect → improve`) + 7 companion entrypoints (`eval`, `improve`, `promote`, `metrics`, `spawn`, direct `bin/mini-ork-topology`, direct `bin/mini-ork-self-improve`)
+- 42 framework primitives in `lib/` (incl. oracle-hardening libs + `gate_bootstrap.sh` for the v0.3-rc1 central wire-up, added 2026-06-05)
+- 15 user-facing `bin/mini-ork*` entrypoints
+- 17 schema migrations under `db/migrations/` (memory namespaces, benchmarks, evolution, safety, panel topology telemetry, recursive orchestration, self-improvement learning)
+- 11 recipes shipped — see Recipes table above
 - 7 model-family providers under `lib/providers/`
 
 Next-up work tracks (see [`ROADMAP.md`](ROADMAP.md) for detail):
 
-- Wire the 6 oracle-hardening primitives into `bin/mini-ork-execute` as enforced gates (currently opt-in libraries)
+- Align JSON schemas, documentation examples, and the live recipe YAML dialect so extension authors get one authoritative contract
 - Wave 2-A held-out anchor corpus per synthesis recipe (Wang 2026)
 - Wave 3 mechanical citation+coverage verifier (Sistla 2025 + Ficek 2025)
 - Krippendorff α calibration gate + adversarial fabricated-bug injection (the v0.2 honest-gaps list)

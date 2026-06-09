@@ -8,8 +8,8 @@ The `code-fix` recipe executes the universal task loop — **Classify → Plan �
 |---|---|
 | Single-file bug fix | Feature spanning 5+ files needing parallel workers |
 | Small function refactor | Database migrations (use `db-migration` recipe) |
-| Doc update in a code file | Multi-epic breakdown needed (`mini-ork deliver`) |
-| Adding / adjusting a test | New module requiring scaffold (use `scaffold-module` recipe) |
+| Doc update in a code file | Multi-epic breakdown needed (`mini-ork run bdd-first-delivery <kickoff.md>` or `mini-ork run post-mvp-delivery <kickoff.md>`) |
+| Adding / adjusting a test | New module requiring scaffold or discovery-first delivery (use `post-mvp-delivery`) |
 | Dependency version bump | Cross-service contract change |
 
 ## How to use

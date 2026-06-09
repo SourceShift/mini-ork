@@ -97,7 +97,8 @@ Emit a single JSON object on stdout. No prose before or after the JSON block.
 - Produce a plan that edits files outside the scope defined in `task_brief`.
 - Invent file paths not confirmed in `relevant_files` or `task_brief`.
 - Produce a plan with more than 10 decomposition steps (if you need more, the task
-  is not a `code_fix` — escalate to `mini-ork deliver`).
+  is not a `code_fix` — recommend `mini-ork run bdd-first-delivery <kickoff.md>`
+  or `mini-ork run post-mvp-delivery <kickoff.md>`).
 - Skip the `success_check` field or leave it as a placeholder string.
 
 --- task_brief ---
