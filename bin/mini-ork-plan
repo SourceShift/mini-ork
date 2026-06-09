@@ -143,6 +143,11 @@ The JSON MUST have these top-level keys:
 IMPORTANT: verifier_contract.checks must contain at least one item.
 A plan without a verifier_contract is INVALID.
 
+When checking provider policy for researcher lanes, use the canonical
+llm_calls ledger shape:
+  sqlite3 ${MINI_ORK_DB} "SELECT COUNT(*) FROM llm_calls WHERE actor='researcher' AND provider='anthropic' AND ts > datetime('now','-6 hours');" | grep -q '^0$'
+Do not query legacy/non-existent llm_dispatch(role, created_at).
+
 Respond with ONLY valid JSON. No markdown fences, no prose.
 
 --- KICKOFF ---
