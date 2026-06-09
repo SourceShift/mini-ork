@@ -39,7 +39,7 @@ Flags:
   --hard-cap-hours <H>   kill mid-iter and exit (default: 5)
   --max-iters <N>        also bound iteration count (default: unbounded)
   --auto-merge           merge successful iters into parent branch
-  --parent-branch <ref>  parent branch to merge into (default: current HEAD)
+  --parent-branch <ref>  parent branch to merge into (default: resolved base ref)
   --dry-run              plan + scan + exit before any LLM dispatch
   --resume               continue an interrupted self-improve session
                          (reads MINI_ORK_DB to pick up the last iter)
@@ -48,6 +48,8 @@ Flags:
 Env:
   MINI_ORK_HOME          project home (default: ./.mini-ork)
   MINI_ORK_DB            SQLite path (default: $MINI_ORK_HOME/state.db)
+  MINI_ORK_SELF_IMPROVE_BASE_REF
+	                        base ref for new iter worktrees (default: main)
 EOF
 }
 
@@ -108,7 +110,24 @@ else
   echo "[warn] sqlite3 missing — learning_record table may not exist" >&2
 fi
 
-[ -z "$PARENT_BRANCH" ] && PARENT_BRANCH=$(git -C "$MINI_ORK_ROOT" rev-parse --abbrev-ref HEAD)
+: "${MINI_ORK_SELF_IMPROVE_BASE_REF:=main}"
+BASE_REF_FALLBACK=0
+if [ -z "$PARENT_BRANCH" ]; then
+  if git -C "$MINI_ORK_ROOT" remote get-url origin >/dev/null 2>&1; then
+    git -C "$MINI_ORK_ROOT" fetch --quiet origin "$MINI_ORK_SELF_IMPROVE_BASE_REF" 2>/dev/null || true
+  fi
+  if git -C "$MINI_ORK_ROOT" rev-parse --verify --quiet "$MINI_ORK_SELF_IMPROVE_BASE_REF" >/dev/null; then
+    PARENT_BRANCH="$MINI_ORK_SELF_IMPROVE_BASE_REF"
+  else
+    PARENT_BRANCH=$(git -C "$MINI_ORK_ROOT" rev-parse --abbrev-ref HEAD)
+    BASE_REF_FALLBACK=1
+    printf '[mini-ork-self-improve] WARN: base ref "%s" unavailable; falling back to ambient branch "%s" (drift risk)\n' \
+      "$MINI_ORK_SELF_IMPROVE_BASE_REF" "$PARENT_BRANCH" >&2
+  fi
+fi
+RESOLVED_BASE_SHA=$(git -C "$MINI_ORK_ROOT" rev-parse --verify "$PARENT_BRANCH" 2>/dev/null || echo unknown)
+MINI_ORK_SELF_IMPROVE_RESOLVED_BASE_SHA="$RESOLVED_BASE_SHA"
+export MINI_ORK_SELF_IMPROVE_BASE_REF RESOLVED_BASE_SHA MINI_ORK_SELF_IMPROVE_RESOLVED_BASE_SHA
 
 # Throttle-aware guard. Detects provider capacity / rate-limit /
 # overload errors, sleeps per-provider until cool-down expires,
@@ -184,6 +203,12 @@ PY
 
 _record_run() {
   local run_id="$1" status="$2" notes="${3:-}" worktree="${4:-}" branch="${5:-}"
+  local base_notes="base_ref=${PARENT_BRANCH}@${RESOLVED_BASE_SHA};configured_base_ref=${MINI_ORK_SELF_IMPROVE_BASE_REF};base_ref_fallback=${BASE_REF_FALLBACK}"
+  if [ -n "$notes" ]; then
+    notes="${notes};${base_notes}"
+  else
+    notes="$base_notes"
+  fi
   python3 - "$MINI_ORK_DB" "$run_id" "$ITER" "$status" "$notes" "$worktree" \
             "$branch" "$SOFT_DEADLINE" "$HARD_DEADLINE" <<'PY' || true
 import sqlite3, sys, time
@@ -256,6 +281,23 @@ _iter_run() {
   # 2. Run dir lives under the runner's MINI_ORK_HOME, NOT the worktree's.
   local RUN_DIR="$MINI_ORK_HOME/runs/${run_id}"
   mkdir -p "$RUN_DIR" "$RUN_DIR/patches"
+  python3 - "$RUN_DIR/run_profile.json" "$MINI_ORK_SELF_IMPROVE_BASE_REF" \
+            "$PARENT_BRANCH" "$RESOLVED_BASE_SHA" "$BASE_REF_FALLBACK" <<'PY' || true
+import json, pathlib, sys
+path, configured_ref, resolved_ref, resolved_sha, fallback = sys.argv[1:]
+p = pathlib.Path(path)
+try:
+    data = json.loads(p.read_text(encoding="utf-8")) if p.exists() else {}
+except json.JSONDecodeError:
+    data = {}
+data.update({
+    "self_improve_base_ref": configured_ref,
+    "self_improve_resolved_base_ref": resolved_ref,
+    "self_improve_resolved_base_sha": resolved_sha,
+    "self_improve_base_ref_fallback": fallback == "1",
+})
+p.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+PY
 
   # 3. Compose kickoff for this iteration
   cat > "$RUN_DIR/kickoff.md" <<EOF
