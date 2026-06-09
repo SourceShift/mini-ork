@@ -123,6 +123,47 @@ if [ "$RESUME" -eq 1 ] && [ -f "$MINI_ORK_DB" ]; then
 fi
 ITER=$LAST_ITER
 
+_self_improve_record_success() {
+  local run_id="$1" branch="$2" commit_sha="$3"
+  local iter_="$ITER"
+  # 1. Insert a 'resolved' row tagged with the commit SHA so future
+  #    iterations can dedupe against it via the bottleneck_lens.
+  # 2. Flip the most-recent 'deferred' learning_record row to 'superseded'
+  #    on the heuristic that this successful commit likely covers it
+  #    (the iter would have re-proposed the same patch otherwise). The
+  #    bottleneck_lens prompt then sees the dedup signal cleanly.
+  python3 - "$MINI_ORK_DB" "$run_id" "$iter_" "$branch" "$commit_sha" <<'PY' || true
+import sqlite3, sys, time
+db, run_id, iter_, branch, sha = sys.argv[1:]
+ts = int(time.time())
+con = sqlite3.connect(db)
+con.execute("PRAGMA busy_timeout=5000")
+con.execute("""
+    INSERT INTO learning_record (
+        run_id, iter, rank, category, title, evidence_paths, arxiv_refs,
+        patch_summary, outcome, severity, confidence, created_at, updated_at
+    ) VALUES (?, ?, 0, 'meta', ?, json_array(?), json_array(),
+              ?, 'resolved', 'medium', 1.0, ?, ?)
+""", (run_id, int(iter_),
+      f"iter {iter_} success — commit {sha[:8] if sha else 'unknown'}",
+      branch,
+      f"All 3 verifiers (bottlenecks-found, self-tests-pass, no-regression) passed; "
+      f"runner committed {sha} to {branch}.",
+      ts, ts))
+# Move any still-open 'deferred' rows to 'superseded' so the next
+# bottleneck_lens dedupes against them. This is a best-effort heuristic;
+# operators can manually flip them back if a deferred patch is genuinely
+# distinct from what just landed.
+con.execute("""
+    UPDATE learning_record
+       SET outcome = 'superseded', updated_at = ?
+     WHERE outcome = 'deferred'
+""", (ts,))
+con.commit(); con.close()
+PY
+  echo "  [learning] recorded success row + superseded prior deferred rows"
+}
+
 _record_run() {
   local run_id="$1" status="$2" notes="${3:-}" worktree="${4:-}" branch="${5:-}"
   python3 - "$MINI_ORK_DB" "$run_id" "$ITER" "$status" "$notes" "$worktree" \
@@ -283,11 +324,43 @@ EOF
 
   # 7. Commit + auto-merge on success, otherwise discard worktree
   if [ "$outcome" = "success" ]; then
-    if ! git -C "$wt_path" diff --quiet 2>/dev/null || ! git -C "$wt_path" diff --cached --quiet 2>/dev/null; then
-      git -C "$wt_path" add -A
+    # Staging filter: workflow-internal artifacts (lens-*.md, synthesis.md,
+    # context-*.json, *-research.json, arxiv-*.md) belong under RUN_DIR,
+    # NOT in the iter commit. The implementer agent's sandbox sometimes
+    # confuses ${RUN_DIR} (outside the worktree) with the worktree root
+    # and writes lens-*.md / synthesis.md at $wt_path/. Iter 1 of run #4
+    # leaked 3 such files into commit 5f2d96b; this filter prevents it.
+    local _pollutants=()
+    while IFS= read -r f; do
+      [ -n "$f" ] && _pollutants+=("$f")
+    done < <(cd "$wt_path" && find . -maxdepth 2 \
+        \( -name 'lens-*.md' -o -name 'synthesis.md' -o -name 'synthesis.md.stdout.md' \
+           -o -name 'context-*.json' -o -name 'arxiv-*.md' -o -name 'arxiv-*.json' \
+           -o -name '*-research.json' \) \
+        -not -path './.mini-ork/*' 2>/dev/null | sed 's|^\./||')
+
+    if [ "${#_pollutants[@]}" -gt 0 ]; then
+      echo "  [filter] removing workflow-artifact pollutants from worktree:"
+      for p in "${_pollutants[@]}"; do
+        echo "    - $p"
+        rm -f "$wt_path/$p"
+      done
+    fi
+
+    if ! git -C "$wt_path" diff --quiet 2>/dev/null \
+       || ! git -C "$wt_path" diff --cached --quiet 2>/dev/null \
+       || [ -n "$(git -C "$wt_path" ls-files --others --exclude-standard 2>/dev/null)" ]; then
+      # Stage everything except .mini-ork/ runtime + any remaining pollutants.
+      git -C "$wt_path" add -A -- ':!.mini-ork/' ':!lens-*.md' ':!synthesis.md*' \
+                                  ':!context-*.json' ':!arxiv-*.md' ':!*-research.json'
       git -C "$wt_path" commit -m "self-improve: iter ${ITER} — see runs/${run_id}/synthesis.md" \
         --author="mini-ork-self-improve <self-improve@mini-ork.local>" \
         | sed 's/^/  [commit] /'
+
+      # Capture the SHA for learning_record bookkeeping.
+      local _commit_sha
+      _commit_sha=$(git -C "$wt_path" rev-parse HEAD 2>/dev/null || echo "")
+      _self_improve_record_success "$run_id" "$branch" "$_commit_sha"
     else
       echo "  [info] no diff to commit (verifiers passed but nothing changed)"
     fi
