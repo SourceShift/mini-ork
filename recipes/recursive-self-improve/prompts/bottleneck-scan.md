@@ -11,8 +11,11 @@ The mini-ork dispatcher will hand you `${CONTEXT_FILE}` resolved to
 
 - `$MINI_ORK_ROOT` — the mini-ork checkout under audit.
 - `$MINI_ORK_HOME/state.db` — SQLite trace + benchmark + pattern store.
-  Key tables: `traces`, `benchmark_results`, `pattern_records`,
+  Key tables: `execution_traces`, `benchmark_results`, `pattern_records`,
   `learning_record` (created by `db/migrations/0017_self_improve_learning.sql`).
+  (Per iter-3 patch #2 finding: there is no bare `traces` table; the
+  schema uses `execution_traces`. Earlier prompt versions referenced the
+  wrong name — confirmed via `db/migrations/0010_benchmarks.sql:12`.)
 - `$MINI_ORK_HOME/runs/` — prior run dirs with `*.log` and artifact files.
 - `$MINI_ORK_ROOT/{bin,lib,recipes}` — source surface.
 - Prior iterations' synthesis output at
