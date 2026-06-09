@@ -1,33 +1,34 @@
-# cl_opus.sh — pin claude --print invocations to native Opus 4.7.
+# cl_opus.sh — route claude --print invocations through Anthropic Opus 4.7
+# using the operator's ambient Claude Code login.
 #
-# Source'd by dispatchers that need Opus as the arbiter / strongest-reasoning
-# role. Uses the user's existing Anthropic auth — only pins the model.
+# 2026-06-09 policy change: Anthropic-native wrappers (cl_opus, cl_sonnet)
+# must NOT export ANTHROPIC_* env vars. The operator is already logged in
+# via Claude Code; claude --print inherits that session's auth + selected
+# model when NO Anthropic-related env vars are set. Setting them OVERRIDES
+# the Claude Code session and tends to break in subtle ways (e.g. session
+# is Opus but ANTHROPIC_MODEL pins claude-opus-4-7 → fine; session is
+# Sonnet but ANTHROPIC_MODEL=claude-opus-4-7 → silent auth mismatch).
 #
-# Cost note: Opus 4.7 is ~5-10× the per-token cost of Sonnet 4.6 and ~25-90×
-# Haiku. Reserve Opus for arbitration / conflict-resolution roles where the
-# reasoning quality is load-bearing.
+# This wrapper's only legitimate job: clear gateway pollution. When a
+# previous wrapper in the same shell (cl_glm / cl_kimi / cl_minimax /
+# cl_deepseek) exported ANTHROPIC_AUTH_TOKEN + ANTHROPIC_BASE_URL pointing
+# at a non-Anthropic gateway, sourcing cl_opus.sh WITHOUT undoing those
+# exports means claude --print sends an Anthropic-model-name to the
+# gateway URL and gets back 400/401. Iters 1-5 of session-9's v4 launch
+# spun for exactly this reason after secrets.local.sh's `set -a; . kimi.env`
+# globally exported ANTHROPIC_AUTH_TOKEN.
 #
-# v0.2-pt18 (W3 from DF12 audit synthesis, refactor-audit/synthesis-latest.md
-# Section 2.3): split the model-slot env vars so SUB-AGENTS that an Opus
-# session spawns (TodoWrite, Agent, file reads, etc) run on Sonnet/Haiku
-# instead of the main Opus tier. Previous behavior pinned EVERY slot to
-# Opus, inflating sub-agent cost ~25-90×. At 100K runs/day with frequent
-# reviewer fan-out, audit estimated ~$8K/day saved by this split.
-#
-# Override: set MO_OPUS_PIN_ALL=1 in the parent shell BEFORE sourcing this
-# script to restore the legacy all-Opus behavior (rare — only for brain
-# sessions where sub-agent reasoning quality is genuinely load-bearing).
-export ANTHROPIC_MODEL=claude-opus-4-7
-export ANTHROPIC_DEFAULT_OPUS_MODEL=claude-opus-4-7
+# Result: this wrapper UNSETS gateway-leakage vars, then exits without
+# setting anything new. claude --print falls back to ambient Claude Code
+# auth and model selection.
 
-if [ "${MO_OPUS_PIN_ALL:-0}" = "1" ]; then
-  # Legacy override: every slot on Opus (5-10× cost on sub-agents)
-  export ANTHROPIC_DEFAULT_SONNET_MODEL=claude-opus-4-7
-  export ANTHROPIC_DEFAULT_HAIKU_MODEL=claude-opus-4-7
-  export CLAUDE_CODE_SUBAGENT_MODEL=claude-opus-4-7
-else
-  # v0.2-pt18 default: main Opus, sub-agents on cheaper tiers
-  export ANTHROPIC_DEFAULT_SONNET_MODEL=claude-sonnet-4-6
-  export ANTHROPIC_DEFAULT_HAIKU_MODEL=claude-haiku-4-5-20251001
-  export CLAUDE_CODE_SUBAGENT_MODEL=claude-sonnet-4-6
-fi
+unset ANTHROPIC_AUTH_TOKEN
+unset ANTHROPIC_API_KEY
+unset ANTHROPIC_BASE_URL
+unset ANTHROPIC_MODEL
+unset ANTHROPIC_DEFAULT_OPUS_MODEL
+unset ANTHROPIC_DEFAULT_SONNET_MODEL
+unset ANTHROPIC_DEFAULT_HAIKU_MODEL
+unset ANTHROPIC_SMALL_FAST_MODEL
+unset CLAUDE_CODE_SUBAGENT_MODEL
+unset CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC
