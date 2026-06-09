@@ -6,8 +6,8 @@
 #   1) Create a git worktree at .mini-ork/worktrees/iter-<N>
 #   2) Stage agents.recursive-self-improve.yaml into the worktree's
 #      MINI_ORK_HOME so the recipe sees minimax/kimi/codex/opus lanes.
-#   3) Run `mini-ork-execute --recipe recursive-self-improve` inside the
-#      worktree.
+#   3) Run `mini-ork run recursive-self-improve <kickoff>` inside the
+#      worktree (walks classify -> plan -> execute -> verify).
 #   4) Read the recipe's three verifier results.
 #   5) On full pass: commit changes on a branch named
 #      self-improve/iter-<N>-<ts>, optionally merge into the parent
@@ -217,10 +217,13 @@ EOF
 
   local exec_log="$RUN_DIR/execute.log"
   local exec_rc=0
+  # The lifecycle entrypoint `mini-ork run <recipe> <kickoff>` walks
+  # classify → plan → execute → verify. Driving mini-ork-execute
+  # directly skips plan generation and immediately errors on
+  # "Unknown flag: --recipe" (seen live on iter 1, rc=2).
   ( cd "$wt_path" && \
-    timeout "${per_iter_budget}" "$MINI_ORK_ROOT/bin/mini-ork-execute" \
-        --recipe recursive-self-improve \
-        --kickoff "$RUN_DIR/kickoff.md" \
+    timeout "${per_iter_budget}" "$MINI_ORK_ROOT/bin/mini-ork" \
+        run recursive-self-improve "$RUN_DIR/kickoff.md" \
         > "$exec_log" 2>&1 ) || exec_rc=$?
 
   # 5. Read verifier outcomes — each writes JSON to its log.
@@ -229,27 +232,33 @@ EOF
   local v_reg="$RUN_DIR/verifier-no-regression.log"
 
   local pass_bottle=0 pass_tests=0 pass_reg=0 converged=0
-  # The verifiers themselves emit JSON on stdout, which mini-ork-execute
-  # captures into $RUN_DIR/verifier-result-*.json. Fall back to the raw
-  # evidence logs above.
-  for vname in bottlenecks-found self-tests-pass no-regression; do
+  # Verifier sequence is gated: if bottlenecks-found fails, the patch
+  # never materialized (planner or synth failed) so running the
+  # expensive self-tests-pass + no-regression verifiers is pure waste
+  # of wall-clock budget. Iter 1 burned ~20 min on the full test suite
+  # against an un-patched worktree — exactly the case this gate
+  # prevents.
+  _read_verifier_inner() {
+    local vname="$1"
     local jpath="$RUN_DIR/verifier-result-${vname}.json"
     if [ ! -f "$jpath" ]; then
-      # Re-run the verifier directly to populate stdout.
-      bash "$MINI_ORK_ROOT/recipes/recursive-self-improve/verifiers/${vname}.sh" \
+      MINI_ORK_DRY_RUN=1 bash "$MINI_ORK_ROOT/recipes/recursive-self-improve/verifiers/${vname}.sh" \
         > "$jpath" 2>/dev/null || true
     fi
-    if [ -f "$jpath" ]; then
-      local p c
-      p=$(python3 -c "import json,sys; d=json.load(open('$jpath')); print('1' if d.get('pass') else '0')" 2>/dev/null || echo 0)
-      c=$(python3 -c "import json; d=json.load(open('$jpath')); print('1' if d.get('converged') else '0')" 2>/dev/null || echo 0)
-      case "$vname" in
-        bottlenecks-found) pass_bottle="$p"; converged="$c" ;;
-        self-tests-pass)   pass_tests="$p" ;;
-        no-regression)     pass_reg="$p" ;;
-      esac
+    [ -f "$jpath" ] && python3 -c "import json,sys; d=json.load(open('$jpath')); print('1' if d.get('pass') else '0',('1' if d.get('converged') else '0'))" 2>/dev/null
+  }
+
+  read pass_bottle converged < <(_read_verifier_inner bottlenecks-found)
+  pass_bottle="${pass_bottle:-0}"; converged="${converged:-0}"
+
+  if [ "$pass_bottle" = "1" ] && [ "$converged" != "1" ]; then
+    read pass_tests _ < <(_read_verifier_inner self-tests-pass)
+    pass_tests="${pass_tests:-0}"
+    if [ "$pass_tests" = "1" ]; then
+      read pass_reg _ < <(_read_verifier_inner no-regression)
+      pass_reg="${pass_reg:-0}"
     fi
-  done
+  fi
 
   echo "  [iter] verifiers: bottle=$pass_bottle tests=$pass_tests regression=$pass_reg converged=$converged exec_rc=$exec_rc"
 
