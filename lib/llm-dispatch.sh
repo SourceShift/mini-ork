@@ -34,6 +34,23 @@ _mo_llm_is_executable() {
   return 1
 }
 
+_mo_llm_now_ms() {
+  if command -v gdate >/dev/null 2>&1; then
+    gdate +%s%3N
+  elif command -v python3 >/dev/null 2>&1; then
+    python3 -c 'import time; print(int(time.time() * 1000))'
+  else
+    echo "MISSING_TIME_SHIM: install coreutils gdate or python3" >&2
+    return 127
+  fi
+}
+
+_mo_llm_write_duration_ms() {
+  local duration_ms="${1:-0}"
+  [ -n "${MINI_ORK_RUN_DIR:-}" ] || return 0
+  printf '%s\n' "$duration_ms" > "${MINI_ORK_RUN_DIR}/.last-llm-duration-ms" 2>/dev/null || true
+}
+
 # v0.2-pt38 (E-MO-19, 2026-06-02): models that route through non-Anthropic
 # gateway endpoints. These don't stream `stream-json` events properly,
 # so we downgrade their output format to `json` even when MO_TRACE_RICH=1.
@@ -428,7 +445,19 @@ PY
   local _err_file="${out_file}.shim.err"
 
   # Dispatch via legacy positional API; capture stderr; emit captured stdout.
+  local _duration_start_ms _duration_end_ms _duration_ms
+  _duration_start_ms=$(_mo_llm_now_ms) || {
+    _mo_llm_write_duration_ms 0
+    return 127
+  }
   if mo_llm_dispatch "$model" "$prompt_text" "$out_file" >/dev/null 2>"$_err_file"; then
+    _duration_end_ms=$(_mo_llm_now_ms) || {
+      _mo_llm_write_duration_ms 0
+      return 127
+    }
+    _duration_ms=$((_duration_end_ms - _duration_start_ms))
+    [ "$_duration_ms" -lt 0 ] && _duration_ms=0
+    _mo_llm_write_duration_ms "$_duration_ms"
     cat "$out_file"
     # v0.2-pt8 (D-04 wiring): expose .cost sidecar to caller via well-known
     # path. mo_llm_dispatch writes ${out_file}.cost when JSON output parses;
@@ -444,6 +473,7 @@ PY
     return 0
   else
     local rc=$?
+    _mo_llm_write_duration_ms 0
     # D-014: surface last 20 lines of claude CLI stderr to caller's stderr
     # so the framework's caller can see the actual error, not just rc=1.
     if [ -s "$_err_file" ] || [ -s "${out_file}.err.log" ]; then
