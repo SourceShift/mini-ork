@@ -287,6 +287,7 @@ finally:
 # D-042 (v0.2-pt12): build a rich trace_write payload for a node.
 # Args: trace_id status node_type output_file [reviewer_verdict] [tool_summary_path]
 # Reads cost from ${MINI_ORK_RUN_DIR}/.last-llm-cost when present.
+# Reads duration from ${MINI_ORK_RUN_DIR}/.last-llm-duration-ms when present.
 # Populates files_written + cost_usd + final_artifact_ref so reflect's
 # gradient_extract has real signal (vs. empty traces that the LLM
 # correctly evaluated as "nothing to learn from" — D-042 root cause).
@@ -304,6 +305,11 @@ _trace_write_node_rich() {
     _cost=$(cat "${MINI_ORK_RUN_DIR}/.last-llm-cost" 2>/dev/null | tr -d '[:space:]' || echo "0")
     [ -z "$_cost" ] && _cost="0"
   fi
+  local _duration_ms="0"
+  if [ -n "${MINI_ORK_RUN_DIR:-}" ] && [ -s "${MINI_ORK_RUN_DIR}/.last-llm-duration-ms" ]; then
+    _duration_ms=$(cat "${MINI_ORK_RUN_DIR}/.last-llm-duration-ms" 2>/dev/null | tr -d '[:space:]' || echo "0")
+    [ -z "$_duration_ms" ] && _duration_ms="0"
+  fi
   # v0.2-pt23: tool-summary sidecar — emitted by lib/llm-dispatch.sh stream-json
   # post-process when MO_TRACE_RICH=1. Located next to output_file as a sibling.
   local _tool_summary=""
@@ -314,7 +320,7 @@ _trace_write_node_rich() {
   local _payload
   _payload=$(python3 -c "
 import json, sys, os
-trace_id, status, node_type, output_file, verdict, cost, task_class, tool_summary_path = sys.argv[1:9]
+trace_id, status, node_type, output_file, verdict, cost, task_class, tool_summary_path, duration_ms = sys.argv[1:10]
 
 tool_calls = []
 files_read = []
@@ -341,6 +347,7 @@ obj = {
     'task_class': task_class,
     'status': status,
     'cost_usd': float(cost) if cost else 0.0,
+    'duration_ms': int(duration_ms) if duration_ms else 0,
     'tool_calls': json.dumps(tool_calls),
     'files_read': json.dumps(files_read),
     'files_written': json.dumps(files_written) if files_written else '[]',
@@ -351,7 +358,7 @@ if verdict:
     obj['reviewer_verdict'] = verdict
 obj['verifier_output'] = json.dumps({'node_type': node_type})
 print(json.dumps(obj))
-" "$_trace_id" "$_status" "$_node_type" "$_output_file" "$_verdict" "$_cost" "${TASK_CLASS:-generic}" "$_tool_summary" 2>/dev/null)
+" "$_trace_id" "$_status" "$_node_type" "$_output_file" "$_verdict" "$_cost" "${TASK_CLASS:-generic}" "$_tool_summary" "$_duration_ms" 2>/dev/null)
   if [ -n "$_payload" ]; then
     trace_write "$_payload" >/dev/null 2>&1 || true
   fi
