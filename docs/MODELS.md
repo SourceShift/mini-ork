@@ -1,171 +1,141 @@
 # Model Routing Reference
 
-mini-ork selects models per role based on the task's reasoning requirements, context length, and cost sensitivity. All selections are overridable via env vars or `agents.yaml`.
+mini-ork routes work through **lanes**. A workflow node declares a
+`model_lane`, and `.mini-ork/config/agents.yaml` maps that lane to a provider
+family. The provider wrapper then invokes the external CLI or API adapter.
 
-## Routing Matrix
-
-| Role | Default Model | Cost Tier | Context Needed | Why This Model |
-|---|---|---|---|---|
-| **decomposer** | `claude-opus-4` | high | full kickoff.md | Needs deep reasoning to decompose ambiguous specs into coherent, non-overlapping epics with correct complexity tags |
-| **worker** | `claude-sonnet-4-5` | medium | epic context + codebase snippets | Best cost/quality for implementation. Handles multi-file diffs cleanly |
-| **reviewer** | `claude-opus-4` | high | diff + kickoff constraints | Adversarial lens; must catch constraint violations the worker missed. Kimi-k2 acceptable for diffs > 64K tokens |
-| **reviewer (long diff)** | `kimi-k2` | medium | 128K diff window | More cost-efficient than Opus for reviewing large diffs where breadth > depth |
-| **spec-author** | `claude-sonnet-4-5` | medium | diff + acceptance criteria | BDD Gherkin generation is structured output; Sonnet produces clean feature files |
-| **healer** | `claude-sonnet-4-5` | medium | epic context + correction | Same as worker; healer re-attempts with additional reviewer + BDD failure context |
-| **hunter** | `glm-4` | low | file list + grep output | Fast, cheap. Used for structured analysis (bug scanning, perf hotspots) — not generation |
-| **budget worker** | `deepseek-v3` | very low | epic context | ~10× cheaper than Sonnet; good for boilerplate-heavy epics (migrations, stubs, CRUD) |
-| **escalation summary** | `claude-opus-4` | high | full iter trace | Escalation summaries need to be actionable; Opus produces higher-quality triage notes |
-
-## Cost Estimates
-
-All estimates assume average epic complexity (300–800 line diff, 3 iters max). Actual cost depends on kickoff size, codebase context injected, and iter count.
-
-| Model | Input (per 1M tokens) | Output (per 1M tokens) | Typical cost / epic |
-|---|---|---|---|
-| `claude-opus-4` | $15.00 | $75.00 | $0.15 – $0.60 |
-| `claude-sonnet-4-5` | $3.00 | $15.00 | $0.03 – $0.12 |
-| `kimi-k2` | $0.60 | $2.50 | $0.02 – $0.08 |
-| `glm-4` | $0.14 | $0.14 | $0.01 – $0.04 |
-| `deepseek-v3` | $0.27 | $1.10 | $0.005 – $0.02 |
-
-Costs from provider pricing pages as of 2026-05. Subject to change — verify before budgeting large runs.
-
-## Switching Models
-
-**Per-run (env):**
-```bash
-MINI_ORK_WORKER_MODEL=deepseek-v3 mini-ork deliver kickoff.md
-```
-
-**Per-repo (agents.yaml):**
-```yaml
-worker_model: claude-sonnet-4-5
-reviewer_model: kimi-k2
-decomposer_model: claude-opus-4
-```
-
-**Per-epic (agents.yaml):**
-```yaml
-epics:
-  - name: boilerplate-crud
-    model: deepseek-v3
-  - name: security-audit
-    model: claude-opus-4
-```
-
-Per-epic overrides take precedence over repo defaults and env vars.
-
-## Adding a New Provider
-
-1. Add a provider block to `lib/llm-dispatch.sh`:
-
-```bash
-dispatch_my_provider() {
-  local model="$1" prompt_file="$2"
-  # must write response to stdout, exit 0 on success, non-zero on error
-  curl -s -X POST "https://api.myprovider.com/v1/chat" \
-    -H "Authorization: Bearer ${MY_PROVIDER_API_KEY}" \
-    -H "Content-Type: application/json" \
-    -d "$(jq -n --arg m "$model" --rawfile p "$prompt_file" \
-         '{model:$m, messages:[{role:"user",content:$p}]}')" \
-  | jq -r '.choices[0].message.content'
-}
-```
-
-2. Map the model prefix in `dispatch_model()`:
-```bash
-case "$model" in
-  my-provider-*) dispatch_my_provider "$model" "$prompt_file" ;;
-  ...
-esac
-```
-
-3. Add the API key env var to `docs/CONFIG.md` and `.gitignore`.
-
-No other changes needed. The orchestrator calls `dispatch_model` uniformly.
+This keeps recipes portable: a recipe can say `reviewer` or `glm_lens` without
+hard-coding a vendor model in every node.
 
 ---
 
-## Per-Node Model Lanes in workflow.yaml
+## Shipped Provider Families
 
-In v0.1, nodes declare a `model_lane` rather than a hard-coded model name. The lane resolves to a model via `${MINI_ORK_HOME}/config/agents/<lane>.yaml`.
+Provider wrappers live in `lib/providers/`:
+
+| Provider key | Wrapper | Typical use |
+|---|---|---|
+| `glm` | `lib/providers/cl_glm.sh` | cheap tactical checks and structured analysis |
+| `kimi` | `lib/providers/cl_kimi.sh` | long-context review and synthesis |
+| `codex` | `lib/providers/cl_codex.sh` | executable coding and repository-grounded work |
+| `deepseek` | `lib/providers/cl_deepseek.sh` | budget planning or implementation lanes |
+| `opus` | `lib/providers/cl_opus.sh` | high-reasoning review, synthesis, architecture lens |
+| `sonnet` | `lib/providers/cl_sonnet.sh` | general Anthropic worker lane |
+| `minimax` | `lib/providers/cl_minimax.sh` | additional heterogeneous lens family |
+
+Exact model names and prices belong in the provider wrapper or deployment
+environment, not in recipe docs. Verify live provider pricing before large
+runs.
+
+---
+
+## Lane Binding
+
+Project-local lane policy is normally stored at `.mini-ork/config/agents.yaml`:
 
 ```yaml
-# recipes/code-fix/workflow.yaml (excerpt)
+lanes:
+  planner: opus
+  researcher: codex
+  implementer: codex
+  worker: codex
+  reviewer: opus
+  verifier: glm
+  reflector: codex
+  publisher: codex
+  rollback: codex
+
+  glm_lens: glm
+  kimi_lens: kimi
+  codex_lens: codex
+  opus_lens: opus
+  minimax_lens: minimax
+```
+
+Recipe nodes then reference the lane:
+
+```yaml
 nodes:
-  - id: plan
-    type: planner
-    model_lane: architect      # → config/agents/architect.yaml → claude-opus-4
-
-  - id: impl
-    type: implementer
-    model_lane: worker         # → config/agents/worker.yaml → claude-sonnet-4-5
-
-  - id: verify
-    type: verifier
-    model_lane: cheapfast      # → config/agents/cheapfast.yaml → glm-4
-
-  - id: review
+  - name: reviewer
     type: reviewer
-    model_lane: architect      # same lane, same model
+    model_lane: reviewer
+    prompt_ref: prompts/reviewer.md
+    dispatch_mode: serial
 ```
 
-Lane → model resolution:
+Resolution path:
 
-```
-workflow.yaml  →  model_lane: architect
-                     ↓
-config/agents/architect.yaml  →  model: claude-opus-4
-                                  provider: anthropic
-                     ↓
-lib/agent_registry.sh:agent_resolve()
-                     ↓
-lib/llm-dispatch.sh:dispatch_model("claude-opus-4", prompt_file)
-```
-
-To change the model for all `architect`-lane nodes across all recipes, edit `config/agents/architect.yaml`. No `workflow.yaml` changes needed.
-
-**Per-run override (env):**
-
-```bash
-MINI_ORK_LANE_ARCHITECT_MODEL=claude-opus-4 mini-ork run code-fix kickoff.md
-```
-
-**Per-recipe override (workflow.yaml):**
-
-```yaml
-nodes:
-  - id: plan
-    type: planner
-    model_lane: architect
-    model_override: deepseek-v3   # overrides the lane binding for this node only
+```text
+workflow.yaml node.model_lane
+  -> .mini-ork/config/agents.yaml lane binding
+  -> lib/providers/cl_<provider>.sh
+  -> external CLI/API configured on the host
 ```
 
 ---
 
-## Bounded Autonomy Note — Promotion Gate Model
+## Heterogeneous Panels
 
-The `promotion_gate` and `human_gate` decisions must use a high-quality model. Do not assign `cheapfast` or `budget` lanes to nodes that make promotion decisions.
+The audit, research, migration, runbook, UI, blog, post-MVP, and recursive
+self-improvement recipes use lens lanes such as `glm_lens`, `kimi_lens`,
+`codex_lens`, `opus_lens`, and sometimes `minimax_lens`.
+
+That is the load-bearing design choice: the recipe gets independent model
+families by configuration rather than by prompt persona alone.
+
+Example from a panel recipe:
 
 ```yaml
-# recipes/code-fix/workflow.yaml — correct
 nodes:
-  - id: promote
-    type: reviewer              # reviewer type is the closest match for promotion reasoning
-    model_lane: architect       # opus-class — required for rung 6-7 decisions
-    gates: [promotion_gate]
+  - name: lens_glm
+    type: researcher
+    model_lane: glm_lens
+    prompt_ref: prompts/lens-glm.md
+    dispatch_mode: parallel
+
+  - name: lens_opus
+    type: researcher
+    model_lane: opus_lens
+    prompt_ref: prompts/lens-opus.md
+    dispatch_mode: parallel
 ```
 
-The `promotion_gate` in `lib/promotion_gate.sh` enforces this at runtime:
+---
 
-```bash
-# lib/promotion_gate.sh (excerpt)
-local lane
-lane=$(agent_registry_get_lane "$node_id")
-if [[ "$lane" == "cheapfast" || "$lane" == "budget" ]]; then
-  echo "PROMOTION_GATE_ERROR: promotion decisions require architect or worker lane"
-  exit 1
-fi
+## Changing Providers
+
+To change all nodes on a lane, edit `.mini-ork/config/agents.yaml`:
+
+```yaml
+lanes:
+  reviewer: kimi
 ```
 
-If the lane check fails, the promotion is blocked and written to `audit_log` with `result=rejected` and `reason=insufficient_model_lane`.
+To change one recipe without changing global policy, add a recipe-specific lane
+policy and stage it before running. `bin/mini-ork-self-improve` does this for
+`config/agents.recursive-self-improve.yaml`.
+
+---
+
+## Adding a Provider
+
+1. Add a wrapper at `lib/providers/cl_<provider>.sh`.
+2. Make it read prompt input, call the external model, write the response to
+   stdout, and return non-zero on failure.
+3. Add a lane binding in `.mini-ork/config/agents.yaml`.
+4. Add a smoke probe to the relevant provider-doctor or integration script.
+
+The top-level recipes should not need to change when a provider is added; they
+should keep referring to lanes.
+
+---
+
+## Safety Notes
+
+- Do not silently remap failed providers to another family. A fallback can turn
+  a heterogeneous panel into same-family consensus without the user noticing.
+- Keep Opus available for recipes that explicitly depend on the Opus
+  architectural-shape lens.
+- For temporary provider freezes, change lane policy explicitly and record the
+  run context. Do not delete recipe lanes just because one provider is disabled
+  for a validation window.

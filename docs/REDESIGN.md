@@ -40,7 +40,7 @@ no promotion gate               lib/promotion_gate.sh + version_registry.sh
 | Memory | None | 8 namespaces: task / workflow / agent_performance / failure / recovery / user_preference / artifact / benchmark |
 | Evaluation | None | `lib/benchmark_suite.sh` + `lib/utility_function.sh` |
 | Governance | None | `lib/promotion_gate.sh` + `lib/version_registry.sh` + `audit_log` |
-| Schema | 14 tables | ~45 tables across 7 migrations |
+| Schema | 14 tables | 17 migrations covering core runs, memory, benchmarks, evolution, safety, panel telemetry, recursive orchestration, and self-improvement learning |
 
 ---
 
@@ -55,7 +55,7 @@ no promotion gate               lib/promotion_gate.sh + version_registry.sh
 | `lib/self-correction.sh` | `recipes/bdd-first-delivery/lib/self-correction.sh` | BDD re-prompt loop belongs to recipe |
 | `lib/auto-merge.sh` | `recipes/bdd-first-delivery/lib/auto-merge.sh` | Merge behavior is recipe policy |
 | `lib/memory.sh` | `lib/trace_store.sh` + framework tables | Generalized; 8 namespaces instead of 14-table bespoke |
-| `lib/llm-dispatch.sh` | `lib/agent_registry.sh` + `config/agents/*.yaml` | Model bindings now declarative |
+| `lib/llm-dispatch.sh` | `.mini-ork/config/agents.yaml` + `lib/providers/cl_*.sh` | Lane bindings now declarative; provider wrappers remain external-process adapters |
 | `lib/contract.sh` | `lib/artifact_contract.sh` | Generalized artifact contract shape |
 | `lib/healer.sh` | `lib/healer.sh` (kept) + `retries` edge type | Still in framework; now edge-typed |
 | `lib/cache.sh` | `lib/cache.sh` (kept) | Unchanged |
