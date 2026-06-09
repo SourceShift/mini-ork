@@ -1,118 +1,173 @@
-# Synthesis — Recursive Self-Improvement, iter 18
+# Synthesis — Recursive Self-Improvement, iter 19
 
 ## Ranked patch plan
 
 | Rank | Bottleneck | Category | Patch summary | Evidence | Confidence |
 |---|---|---|---|---|---|
-| 1 | `bench_delta_ok` dead in `no-regression.sh` — verifier passes on benchmark regressions | correctness | Wire `bench_delta_ok` into the `pass` computation; gate on `avg(utility_score) >= ${MINI_ORK_BENCH_UTILITY_THRESHOLD:-0.5}` with an INCONCLUSIVE tier when `n < 3` | `recipes/recursive-self-improve/verifiers/no-regression.sh:39` (single hit, write-only), `:72-76` (pass logic ignores it); arXiv 2603.02601, 2604.00222, 2501.12878 | 0.92 |
-| 2 | `_self_improve_record_success` indiscriminately supersedes all `deferred` rows | correctness | Filter the UPDATE by `evidence_paths` overlap with `git diff --name-only` (or, fallback, `category` match); cap with a 7-day temporal decay clause as escape valve | `bin/mini-ork-self-improve:175-179`; current state.db shows `id=2` (meta) + `id=3` (perf) would be wiped by any unrelated success | 0.88 |
-| 3 | `mini-ork-plan` dispatches planner LLM even when `profile_status=needs_answers` / confidence < threshold | arch | Add a pre-dispatch gate in `bin/mini-ork-plan`; emit `plan_status: needs_answers` artifact and skip `llm_dispatch` when profile is under-specified | `bin/mini-ork-plan:189-211` reads profile metadata, `:218` dispatches unconditionally; runtime cascade in iter-15/16/17 execute.log (3 failed planner calls in 14s); arXiv 2601.15703, 2605.23414, 2604.16753 | 0.85 |
-| 4 | Empty-iter halt threshold = 5 burns ≈$0.25 of planner LLM cost on fast-failure cascades | perf | Lower `MINI_ORK_THROTTLE_EMPTY_ITER_THRESHOLD` default 5→3 AND classify `planner-failure` as immediate-halt (orthogonal to 5153739's provider-throttle class) | `bin/mini-ork-self-improve:129`; iter-15/16/17 cascade (3 planner calls before iter-18 intervened); arXiv 2605.08563 (context-contaminated retries) | 0.78 |
-| 5 | `docs/improvements/self-improve-latest.md` is a single moving pointer — every publisher run clobbers prior synthesis | arch | Extend `artifact_contract.yaml.outputs` with a second template `docs/improvements/self-improve-iter-${ITER}-${RUN_TS}.md`; teach publisher to expand the minimal allowlist before copying | `recipes/recursive-self-improve/artifact_contract.yaml:14-15` (single output), `bin/mini-ork-execute:644-790` (copy loop has no templating); arXiv 2601.20727, 2603.16208 | 0.74 |
+| 1 | Planner LLM dispatches unconditionally when `run_profile.profile_status=needs_answers` | correctness | Add pre-dispatch profile gate in `bin/mini-ork-plan` that emits a deterministic `plan_status=needs_answers` artifact and skips `llm_dispatch` when profile is unready | lens-bottleneck.md #3; lens-correctness.md Bug 3; lens-arch.md candidate 2; arXiv 2605.07062 (control-plane authority boundaries) | 0.89 |
+| 2 | Worktree base-branch drift: iter-N forks from prior-iter audit tip, not `main` HEAD; landed fixes invisible to next iter | arch | In `bin/mini-ork-self-improve`, resolve base to `main` (override via `MINI_ORK_SELF_IMPROVE_BASE_REF`) before `git worktree add`; preflight `git fetch --quiet` when remote exists | lens-bottleneck.md #1; lens-correctness.md Bug N2; lens-arch.md candidate 1; arXiv 2605.07062, 2601.11647 | 0.86 |
+| 3 | `_self_improve_record_success` indiscriminately flips every `deferred` row to `superseded` on any successful commit | correctness | Filter the UPDATE by `category` match OR `evidence_paths` overlap with `git diff --name-only`; add `updated_at < ts - 7*86400` decay fallback | lens-bottleneck.md #2; lens-correctness.md Bug 2; lens-arch.md candidate 4; arXiv 2605.07242 (barrier-first cascade repair) | 0.82 |
+| 4 | Synthesis → `learning_record` promotion gap: iter-18 produced 5 ranked patches; only 1 (success-meta) reached the table | arch | Add a synthesis-patch parser to `bin/mini-ork-self-improve` `_self_improve_record_success` that inserts `outcome='open'` rows for lower-ranked patches keyed by stable title hash | lens-bottleneck.md #6; lens-arch.md candidate 4; arXiv 2511.06179 (MemoriesDB structured promotion), 2605.15815 (BootstrapAgent verifiable knowledge contracts) | 0.78 |
+| 5 | `llm_dispatch` call sites do not capture `duration_ms`; no per-node latency signal exists in trace path | perf | In `lib/llm-dispatch.sh`, emit a `.last-llm-duration` sidecar on the success path; thread it into `_trace_write_node_rich` and `node_runs.duration_ms` column | lens-perf.md C2; learning_record.id=3 (open, 18 iters stale); arXiv 2605.08563 (CCRM context-contamination retries) | 0.72 |
 
 ## Top patch — detailed plan
 
-### Patch 1: Wire `bench_delta_ok` into the no-regression pass gate
+### Patch 1: Pre-dispatch profile gate in `mini-ork-plan`
 
-**Problem statement.** `recipes/recursive-self-improve/verifiers/no-regression.sh:39` initializes `bench_delta_ok=1` and never reassigns or reads it again — the variable is single-assignment write-only. The `pass` calculation at `:72-76` only checks `syntax_failures` and `report_outcome`, so a patch that degrades benchmark utility scores passes the no-regression gate silently. The outer self-improve loop has no forcing function against benchmark regressions, which means convergence cannot be asserted.
+**Problem statement.** `bin/mini-ork-plan` reads `profile_status` and `confidence` into plan metadata but dispatches the planner LLM unconditionally. When the profile is `needs_answers` (as in this very iteration's run_profile), the planner burns ~$0.05/call producing a plan against missing success criteria. iter-15/16/17 execute.logs show 3 identical cascade failures in 14 seconds (timestamps 081624 / 081629 / 081633) — each a separate $0.05 charge against an under-specified profile.
 
 **Evidence.**
-- `recipes/recursive-self-improve/verifiers/no-regression.sh:39` — sole occurrence of `bench_delta_ok` per `grep -n bench_delta_ok` (correctness lens reproduction step 1).
-- `recipes/recursive-self-improve/verifiers/no-regression.sh:42-58` — `bench_summary` query executes but the result only flows to `$EVIDENCE` log at `:60` and to JSON output at `:92`.
-- `recipes/recursive-self-improve/verifiers/no-regression.sh:72-76` — `pass=` computation references `syntax_failures` and `report_outcome` only; `bench_delta_ok` is absent.
-- Supersedes `learning_record.id=4` (open, correctness, "Utility-delta threshold in no-regression verifier") with stronger dead-variable evidence; new row in iter-18 should set `outcome='superseded-by'` link to this patch.
-- arXiv 2603.02601 (AgentAssay, Bhardwaj 2026) — three-valued PASS/FAIL/INCONCLUSIVE verdict pattern, confidence 0.88 (lens-arxiv.md query #1, rank 1).
-- arXiv 2501.12878 (μOpTime, Japke 2025) — variance-aware stability gate when sample is too small, confidence 0.67 (lens-arxiv.md query #1, rank 3).
+- `bin/mini-ork-plan:200-211` — `profile_status` and `confidence` read into plan metadata only.
+- `bin/mini-ork-plan:218` — single, unconditional `llm_dispatch` call. `grep -n llm_dispatch bin/mini-ork-plan` returns exactly one hit.
+- This run's `plan.json:risk_notes[5]` explicitly notes `success_criteria empty in profile (profile_status=needs_answers)`.
+- iter-15/16/17 cascade evidence: `runs/self-improve-iter-1{5,6,7}-*/execute.log` timestamps 081624 / 081629 / 081633.
+- learning_record state: not yet promoted (carry-forward of iter-18 Patch 3, rank #3, conf 0.85, NOT landed on `main` — see lens-bottleneck.md table rows 107-112).
+- arXiv 2605.07062 (Barnes, 2026) — control-plane authority boundaries: profile completeness must sit before provider dispatch, not after.
 
-**Proposed change.** Edit `recipes/recursive-self-improve/verifiers/no-regression.sh`:
+**Proposed change.** In `bin/mini-ork-plan`, immediately before line 218 (`PLAN_JSON_RAW=$(llm_dispatch ...)`), insert a gate block:
 
-1. After the existing `bench_summary` SELECT (around `:42-58`), compute `bench_n` (row count) and `bench_avg` (avg utility_score) from `benchmark_results` for the current `run_id`. Reuse the existing sqlite invocation pattern.
-2. Read threshold from env: `BENCH_UTILITY_THRESHOLD="${MINI_ORK_BENCH_UTILITY_THRESHOLD:-0.5}"`. Read inconclusive floor: `BENCH_MIN_N="${MINI_ORK_BENCH_MIN_N:-3}"`.
-3. Replace the dead `bench_delta_ok=1` line with a three-state assignment:
-   - `bench_delta_ok=1` when `bench_n >= BENCH_MIN_N AND bench_avg >= BENCH_UTILITY_THRESHOLD`.
-   - `bench_delta_ok=0` when `bench_n >= BENCH_MIN_N AND bench_avg < BENCH_UTILITY_THRESHOLD` (regression).
-   - `bench_delta_ok=2` when `bench_n < BENCH_MIN_N` (inconclusive — treat as pass for back-compat, but emit `benchmark_inconclusive: true`).
-4. Extend the `pass=` computation at `:72-76` to require `[ "$bench_delta_ok" != "0" ]`. Inconclusive (`=2`) passes; regression (`=0`) fails.
-5. Emit a new JSON key `benchmark_regression` (boolean: `bench_delta_ok == 0`) and `benchmark_inconclusive` (boolean: `bench_delta_ok == 2`) alongside the existing `bench_summary` block.
+```bash
+# Profile gate (Patch 1, iter 19): block planner dispatch when run_profile is under-specified.
+# Override with MINI_ORK_PROFILE_GATE=0 for back-compat / exploratory use.
+PROFILE_GATE="${MINI_ORK_PROFILE_GATE:-1}"
+CONFIDENCE_FLOOR="${MINI_ORK_PLAN_CONFIDENCE_FLOOR:-0.7}"
+if [ "$PROFILE_GATE" = "1" ]; then
+  _gate_block=0
+  if [ "$profile_status" = "needs_answers" ]; then _gate_block=1; fi
+  if awk "BEGIN{exit !($confidence < $CONFIDENCE_FLOOR)}"; then _gate_block=1; fi
+  if [ "$_gate_block" = "1" ]; then
+    python3 - "$PLAN_OUT_PATH" "$profile_status" "$confidence" "$human_questions_json" <<'PY'
+import json, sys
+out, status, conf, hq = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+plan = {
+  "plan_status": "needs_answers",
+  "blocked_by": "run_profile",
+  "profile_status": status,
+  "confidence": float(conf),
+  "human_questions": json.loads(hq) if hq else [],
+  "decomposition": [],
+  "dependencies": [],
+  "objective": "blocked: profile incomplete",
+}
+with open(out, "w") as f: json.dump(plan, f, indent=2)
+PY
+    echo "{\"plan_status\":\"needs_answers\",\"blocked_by\":\"run_profile\"}"
+    exit 0
+  fi
+fi
+```
 
-Estimated diff: ~35-50 LoC in a single file. Comfortably under the 200-LoC cap.
+Files touched: `bin/mini-ork-plan` only (~30 LOC inserted before `:218`). No schema change. No new tables. Reuses the existing `plan.json` shape with one optional `plan_status` key.
 
-**Regression test.** Add `recipes/recursive-self-improve/verifiers/tests/test_no_regression_bench.sh` (new file, ≤80 LoC) that:
+**Regression test.** Add `recipes/recursive-self-improve/verifiers/profile-gate.sh` plus a fixture run_profile at `tests/fixtures/run_profile-needs-answers.json`. The verifier asserts:
 
-1. Creates a tempdir state.db with the `benchmark_results` schema, inserts 5 rows with `utility_score=0.1` (clearly below 0.5).
-2. Invokes `no-regression.sh` with env vars pointing at the temp DB.
-3. Parses JSON stdout and asserts `pass == false` AND `benchmark_regression == true`. Assertion text: `"benchmark regression must be caught: expected pass=false benchmark_regression=true, got pass=$pass benchmark_regression=$regression"`.
-4. Repeats with 2 rows (below the n=3 inconclusive floor) and asserts `pass == true` AND `benchmark_inconclusive == true`. Assertion text: `"low-n benchmark must be inconclusive not failing: expected pass=true benchmark_inconclusive=true"`.
-5. Repeats with 5 rows at `utility_score=0.9` and asserts `pass == true` AND both new flags false. Assertion text: `"healthy benchmark must pass cleanly: expected pass=true benchmark_regression=false benchmark_inconclusive=false"`.
+1. `MINI_ORK_PROFILE_GATE=1 MINI_ORK_PROFILE_PATH=<fixture> bin/mini-ork-plan` exits 0.
+2. The resulting `plan.json` contains `"plan_status": "needs_answers"` AND `"blocked_by": "run_profile"`.
+3. `node_runs` table contains NO row for the planner node with `lane LIKE '%opus%' OR '%codex%'` for this run_id (no LLM dispatch occurred).
+4. Inverse fixture (`profile_status=ready`, `confidence=0.9`) DOES produce an `llm_dispatch` row in `node_runs` — guarding against the gate over-firing.
 
-Hook the test into whatever runner the recipe uses (the verifier dir already has the convention).
+Assertion text for primary check: `assert plan["plan_status"] == "needs_answers" and plan["blocked_by"] == "run_profile" and not any(r["lane"] in ("opus","sonnet","codex") for r in node_runs)`.
 
-**Verification.** Existing tests that must continue to pass:
-- Any existing `no-regression.sh` invocation in prior iter run dirs that did NOT populate `benchmark_results` — these will now report `benchmark_inconclusive=true` AND `pass=true`, preserving the legacy behavior for empty-benchmark runs.
-- `bin/mini-ork-self-improve:356-366` and `_read_verifier_inner` consume `pass` only (per correctness lens blast-radius analysis); the new JSON keys are additive and consumers are unaffected.
-- The recipe-level success verifier `v6_lint_or_tests` (Go vet + tests, optional pytest) is unaffected — the change is shell-only.
+**Verification.** Pre-existing tests that must keep passing: `recipes/recursive-self-improve/verifiers/no-regression.sh` (utility-delta gate from `f8967b1`), `recipes/recursive-self-improve/verifiers/bottlenecks-found.sh`, the full `tests/test_mini_ork_plan_*.py` suite if present (`grep -rn test_mini_ork_plan tests/ || true`). Expected benchmark delta: per-spiral planner cost drops from ≈$0.25 (5 × $0.05) to ≈$0.00 on the under-specified path; expected magnitude ≈$0.20 saved per spiral. Wall-clock saving: ~14s per cascade (the iter-15/16/17 burn time).
 
-Expected benchmark deltas:
-- `mini-ork.bench.no_regression_runtime`: +5-15 ms per verifier invocation (one extra sqlite SELECT). Negligible.
-- `mini-ork.bench.self_improve_iter_throughput`: 0 or slight positive — iterations that previously passed on a degraded benchmark will now correctly halt, saving downstream LLM spend, but adding 1 extra rollback per N iterations where N is the prior false-pass rate.
+**Rollback criteria.** Discard this patch if:
 
-**Rollback criteria.** Discard this patch if any of:
-- The default threshold `0.5` rejects more than 30% of patches across 3 consecutive iterations on a stable codebase baseline (signal: noisy single-run benchmarks). Recovery: raise the inconclusive floor to `n=5` OR switch to a per-iter relative delta instead of absolute threshold.
-- The new `benchmark_inconclusive` key breaks a downstream consumer the audit missed. Recovery: drop the new keys but keep the `pass` gate change.
-- Any test in `bin/mini-ork-self-improve`'s existing suite regresses. Recovery: revert the whole patch and reopen `learning_record.id=4` for a follow-up iteration.
+- Any pre-existing recipe verifier flips from `pass` to `fail` after the gate lands.
+- `MINI_ORK_PROFILE_GATE=1` causes ≥1 legitimate (`profile_status=ready` AND `confidence >= 0.7`) plan to be blocked across a 5-iter shakeout.
+- The gate produces a `plan.json` shape that breaks `bin/mini-ork-execute` parsing (manifested as `node_runs` rows missing `plan_id` or as decomposition deserialization errors).
+- A planner-confidence floor of 0.7 is shown to gate >10% of historical valid plans in `node_runs` replay.
 
 ## Lower-ranked patches
 
-### Patch 2: Filter the deferred→superseded UPDATE
+### Patch 2: Resolve worktree base to `main` (with explicit override)
 
-**Problem.** `bin/mini-ork-self-improve:175-179` flips every `deferred` row to `superseded` on any successful commit, with no filter on `evidence_paths`, `category`, or commit-touched files. This silently corrupts the dedupe table the next iteration reads.
+**Problem.** `bin/mini-ork-self-improve:111` reads `PARENT_BRANCH=$(git rev-parse --abbrev-ref HEAD)`; `:251` calls `git worktree add -b "$branch" "$wt_path" "$PARENT_BRANCH"`. Result: iter-19 worktree HEAD = `a5b29b4` (iter-18 audit tip), but `main` HEAD = `f8967b1` (utility-delta gate landed AFTER iter-18 published). Iter-19 sees the dead `bench_delta_ok=1` line and re-discovers a closed issue. Manifests as lens-correctness.md Bug N2 (worktree stale verifier).
 
-**Change.** Modify the SQL to `WHERE outcome='deferred' AND (category=:fixed_category OR EXISTS(SELECT 1 FROM json_each(evidence_paths) WHERE value IN (<git diff --name-only>)))`. Implement the path-overlap check as a Python snippet inside the bash function (per correctness lens open question #2). Add a 7-day `updated_at` decay fallback so unmatched rows age out instead of accumulating forever.
+**Evidence.** lens-bottleneck.md #1; lens-arch.md candidate 1; reproduction: `diff <(git show main:recipes/recursive-self-improve/verifiers/no-regression.sh) recipes/.../no-regression.sh` — non-empty in current worktree. arXiv 2605.07062 (control-plane authority for base selection), 2601.11647 (workflow-base scoring).
 
-**Test.** Synthetic DB with 2 deferred rows (one with overlapping `evidence_paths`, one without); assert only the overlapping row is superseded after the success-commit call.
+**Change.** Replace `PARENT_BRANCH` resolution at `:111` with:
 
-**Evidence.** arXiv 2512.10696 (ReMe, Cao 2025, conf 0.82) — utility-based memory refinement vs append-only; arXiv 2601.11974 (MARS, Hou 2026, conf 0.69) — procedural reflection tied to commit evidence.
+```bash
+MINI_ORK_BASE_REF="${MINI_ORK_SELF_IMPROVE_BASE_REF:-main}"
+if git rev-parse --verify --quiet "refs/remotes/origin/$MINI_ORK_BASE_REF" >/dev/null 2>&1; then
+  git fetch --quiet origin "$MINI_ORK_BASE_REF" || true
+fi
+PARENT_BRANCH="$MINI_ORK_BASE_REF"
+if ! git rev-parse --verify --quiet "$PARENT_BRANCH" >/dev/null; then
+  PARENT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
+  echo "warn: base ref '$MINI_ORK_BASE_REF' not found; falling back to current branch '$PARENT_BRANCH'" >&2
+fi
+```
 
-### Patch 3: Pre-dispatch profile gate in `mini-ork-plan`
+**Test.** Verifier creates an empty branch ahead of `main`, calls `bin/mini-ork-self-improve --dry-run`, and asserts the resulting worktree's `git rev-parse HEAD` equals `git rev-parse main`. Inverse: with `MINI_ORK_SELF_IMPROVE_BASE_REF=feature/x`, verify the override wins.
 
-**Problem.** `bin/mini-ork-plan:189-211` reads `profile_status` and `confidence` into plan metadata but dispatches the LLM unconditionally at `:218`. iter-15/16/17 execute.log shows 3 identical cascade failures in 14s on `profile_status=needs_answers profile_confidence=0.55`.
+**Rollback.** Discard if any quarantined experimental branch needs the old current-branch-tip behavior and the env override is insufficient.
 
-**Change.** Before the `PLAN_JSON_RAW=$(llm_dispatch ...)` call, check `profile_status != ready` OR `confidence < ${MINI_ORK_PLAN_CONFIDENCE_FLOOR:-0.7}`. If gated, emit a deterministic plan artifact with `plan_status: needs_answers`, `blocked_by: run_profile`, and `human_questions`, then exit 0 (preserving artifact-write semantics; outer runner already handles the blocked state through throttle logic). Skip the LLM dispatch entirely.
+### Patch 3: Filter `deferred → superseded` UPDATE by category + evidence-path overlap
 
-**Test.** Drive `bin/mini-ork-plan` with a synthetic `run_profile.json` containing `profile_status=needs_answers`; assert no `llm_dispatch` invocation AND that `plan.json` contains `plan_status: needs_answers`.
+**Problem.** `bin/mini-ork-self-improve:175-179` unconditionally flips every `outcome='deferred'` row to `superseded` on any successful commit. Today the bug is dormant (0 deferred rows), but the next loop-produced deferral will be silently superseded by any unrelated success. lens-bottleneck.md #2; lens-correctness.md Bug 2; arXiv 2605.07242 (barrier-first cascade repair).
 
-**Evidence.** arXiv 2601.15703 (AUQ, Zhang 2026, conf 0.84) — uncertainty as active control signal; arXiv 2605.23414 (EPC-AW, Wang 2026, conf 0.79) — refuse when inputs under-specified.
+**Change.** Replace the unfiltered SQL with a Python helper that:
 
-### Patch 4: Tighten empty-iter halt threshold + planner-failure immediate halt
+1. Reads `git diff --name-only HEAD~1 HEAD` for the success commit.
+2. For each `outcome='deferred'` row, computes intersection of `evidence_paths` (JSON array) with the diff set.
+3. Marks `superseded` only when intersection is non-empty OR the row's `category` matches the new commit's category (passed in by `_self_improve_record_success`).
+4. Adds a 7-day decay fallback: rows with `updated_at < ts - 7*86400` AND zero overlap age to `superseded` with reason `decay`.
 
-**Problem.** `bin/mini-ork-self-improve:129` defaults `EMPTY_ITER_HALT=5`. Three failed planner iters cost ≈$0.15 in LLM spend before the halt fires; iter-18 only intervened because it was a fresh attempt.
+**Test.** Synthetic reproduction from lens-correctness.md (lines 88-121): seed 2 deferred rows, commit touching only `a.sh`, assert row pointing to `b.sh` stays `deferred`.
 
-**Change.** Lower default to 3. Add a separate fast-path: if the last N failures are all classified as `planner-failure` (distinct from provider-throttle landed in 5153739), halt immediately regardless of `EMPTY_ITER_HALT`. Wire through the existing `lib/throttle-guard.sh` classification path.
+**Rollback.** Discard if backlog of deferred rows grows unbounded (>50 rows) after 5 iterations.
 
-**Test.** Simulate 3 consecutive `planner-failure` outcomes; assert the loop halts before the 4th iter starts AND a `learning_record` row is written with `category=meta outcome=halted`.
+### Patch 4: Synthesis → `learning_record` promotion hook
 
-**Evidence.** arXiv 2605.08563 (CCRM, Yang 2026, conf 0.83) — context-contaminated retries make subsequent attempts strictly worse than clean ones.
+**Problem.** lens-bottleneck.md #6: iter-18 published 5 ranked patches; only the success-meta row reached `learning_record`. Patches 2-5 exist only in `synthesis.md` text. Every future SQL-based dedupe scan silently re-emits them as novel. lens-arch.md candidate 4; arXiv 2511.06179 (MemoriesDB), 2605.15815 (BootstrapAgent contracts).
 
-### Patch 5: Immutable archive sibling for synthesis artifact
+**Change.** Add `_self_improve_promote_synthesis_patches` to `bin/mini-ork-self-improve`. Called from `_self_improve_record_success` after the success-meta row insert. Logic:
 
-**Problem.** `recipes/recursive-self-improve/artifact_contract.yaml:14-15` declares one output. Every publisher run overwrites `docs/improvements/self-improve-latest.md`. The audit trail collapses at the publisher boundary; future scanners reading only the latest pointer lose path-stable iteration comparison.
+1. Parse `${RUN_DIR}/synthesis.md` for the `## Ranked patch plan` table (regex on `| <rank> | <bottleneck> | <category> | <summary> | <evidence> | <conf> |`).
+2. For each row ranked ≥ 2, compute `title_hash = sha1(category + bottleneck_title)`.
+3. `INSERT OR IGNORE INTO learning_record(run_id, iter, rank, category, title, evidence_paths, arxiv_refs, patch_summary, outcome, severity, confidence, ..., title_hash)` with `outcome='open'`. Title_hash is a uniqueness key — preserve as an indexed column.
+4. On parse failure, log to `${RUN_DIR}/promotion.err` and fall through to current success-meta-only behavior.
 
-**Change.** Add a second `outputs[]` entry with template `docs/improvements/self-improve-iter-${ITER}-${RUN_TS}.md`. Teach `bin/mini-ork-execute:644-790` publisher copy loop to expand a minimal allowlist (`ITER`, `RUN_TS`, `RUN_ID`) before copying. Behind feature flag `MO_ARTIFACT_OUTPUT_TEMPLATES=1` until the contract stabilizes.
+**Schema.** Add `title_hash TEXT` column to `learning_record` via a new migration `db/migrations/0019_learning_record_title_hash.sql`. New infra is justified by arXiv 2511.06179 (structured promotion) — paper present in `lens-arxiv.md`.
 
-**Test.** Run publisher with two distinct `ITER` values; assert both archive paths exist post-run AND `self-improve-latest.md` content matches the most recent.
+**Test.** Run `bin/mini-ork-self-improve` against a fixture run dir whose `synthesis.md` has 3 ranked patches. Assert `SELECT COUNT(*) FROM learning_record WHERE run_id = <run> AND outcome = 'open'` returns 2 (ranks 2 and 3, not the top patch which is being landed). Re-run; assert count stays 2 (idempotence via `title_hash`).
 
-**Evidence.** arXiv 2601.20727 (Audit Trails, Ojewale 2026, conf 0.86) — chronological tamper-evident ledger linked to governance; arXiv 2603.16208 (SoK Traceability, Chen 2026, conf 0.72) — preserve both consumer pointer and role-specific artifact path.
+**Rollback.** Discard if the parser produces false-positive promotions (rows that don't match a real ranked patch) that pollute the dedupe table.
+
+### Patch 5: `duration_ms` capture for `llm_dispatch`
+
+**Problem.** `lib/llm-dispatch.sh` has zero success-path latency capture. learning_record.id=3 has tracked this 18 iterations open. lens-perf.md C2; arXiv 2605.08563 (CCRM, cited in iter-18 synthesis).
+
+**Change.** First, probe: `sqlite3 state.db ".schema node_runs"` — if `duration_ms` column already exists, scope collapses to ~15 LOC (just wire it). If not, add via migration plus emit in `lib/llm-dispatch.sh` success branch:
+
+```bash
+_t0_ms=$(python3 -c 'import time; print(int(time.time()*1000))')
+# ... existing dispatch ...
+_t1_ms=$(python3 -c 'import time; print(int(time.time()*1000))')
+echo "$((_t1_ms - _t0_ms))" > "$RUN_DIR/.last-llm-duration"
+```
+
+Then in `bin/mini-ork-execute:_trace_write_node_rich` (`:300-340`), read `.last-llm-duration` next to `.last-llm-cost`. Wrap 3 call sites at `:473`, `:510`, `:566`.
+
+**Test.** `recipes/recursive-self-improve/benchmark_tasks/latency-trace-completeness.json` — run a 3-node research → implement → review flow; assert every `node_runs` row has `duration_ms IS NOT NULL`, `>= 100`, `<= 300000`.
+
+**Rollback.** Discard if measurement overhead exceeds 2% of dispatch time (unlikely; bash `python3 -c` is ~30-40ms).
 
 ## Convergence assessment
 
-**Not converging yet.** As long as Bottleneck #1 holds — the no-regression verifier silently passes on benchmark regressions — the outer loop has no forcing function against utility decay. The convergence assertion in `lens-bottleneck.md:64` makes the same point: convergence cannot be claimed until `bench_delta_ok` is wired into the pass gate. The outer loop should NOT terminate after this iteration; instead, the next iteration should pick up Patch 2 (memory-laundering) since it has the largest blast radius on dedupe integrity, and Patches 3-5 should queue via `learning_record` for iters 20-22.
+**Not converging.** Two structural defects compound across every iteration until closed:
 
-Additionally: open `learning_record` rows id=2 (auto-promote hook) and id=3 (duration_ms capture) remain unaddressed from iter-4 and are now nearly six iterations stale. They should be considered higher-priority than Patches 4-5 once the correctness gates close.
+1. **Worktree base-branch drift (Patch 2)** — landed patches are invisible to the next iter, so the loop re-discovers closed issues. iter-19 demonstrates this concretely: the worktree's stale `no-regression.sh` carries the dead `bench_delta_ok=1` while `main` already has the fix from `f8967b1`.
+2. **Synthesis → `learning_record` promotion gap (Patch 4)** — every future bottleneck-scan that dedupes via SQL silently re-emits all non-top iter-N patches as novel. iter-18 produced 5 ranked patches, 1 reached the table; the other 4 reappeared in this iter's scan.
+
+Until both close, every loop iteration partially re-discovers prior work AND has an incomplete dedupe surface. The outer loop should NOT terminate. Recommend prioritizing Patch 1 (active cost burn, simplest fix, highest correctness leverage) for this iteration, then Patch 2 (drift) for iter-20, then Patch 4 (promotion) for iter-21. After all three land, re-assess convergence — at that point the loop's memory will actually drive its behavior.
 
 ## Provenance footer
 
-- Lenses consumed: minimax (perf, via lens-bottleneck #4/#6), kimi (correctness, lens-correctness.md), codex (arch, lens-arch.md; arxiv, lens-arxiv.md)
-- Synthesizer family: opus (Anthropic; only synthesizer node permitted on Anthropic per provider policy)
-- arXiv papers cited: 11 (2603.02601, 2604.00222, 2501.12878, 2512.10696, 2601.11974, 2601.15703, 2605.23414, 2604.16753, 2605.08563, 2601.20727, 2603.16208) — all sourced from `lens-arxiv.md`
-- Cross-iteration learnings applied: 4 rows from `learning_record` (id=1 resolved/excluded; id=2, id=3 open/deferred and respected; id=4 superseded-with-evidence by Patch 1)
-- Excluded as already-merged: 4 commits (2bc9a88, bba5b01, 5153739, b1fc54b)
+- Lenses consumed: minimax (perf), kimi (correctness), codex (arch + arxiv + bottleneck).
+- Synthesizer family: opus.
+- arXiv papers cited: 6 directly in patch evidence (2605.07062, 2601.11647, 2605.07242, 2511.06179, 2605.15815, 2605.08563). 6 additional papers available in `lens-arxiv.md` for lower-ranked / future work (2605.03675, 2605.06527, 2604.15877, 2604.13102, 2604.00917, 2605.08017).
+- Cross-iteration learnings applied: 5 rows from `learning_record` (3 resolved excluded: id=1, id=4 via `f8967b1`, id=5; 2 open consulted: id=2 surfaced via Patch 4 framing, id=3 surfaced as Patch 5).
+- Source bottleneck-scan: `lens-bottleneck.md` (8 ranked rows, 5 novel + 4 carry-forward of un-landed iter-18 patches).
+- Arch + arXiv lens artifacts were written to the iter-19 worktree at `/Volumes/docker-ssd/ps/mini-ork/.mini-ork/worktrees/iter-19-20260609095403/lens-{arch,arxiv}.md` due to a run-dir write sandbox denial; synthesis consumed them at those paths.
