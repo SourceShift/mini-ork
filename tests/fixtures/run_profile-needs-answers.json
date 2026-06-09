@@ -1,0 +1,11 @@
+{
+  "profile_status": "needs_answers",
+  "confidence": 0.35,
+  "human_questions": [
+    {
+      "id": "success_criteria",
+      "question": "What concrete outcome should the verifier enforce?"
+    }
+  ],
+  "success_criteria": []
+}
