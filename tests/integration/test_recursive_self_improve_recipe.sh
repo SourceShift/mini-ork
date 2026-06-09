@@ -178,10 +178,30 @@ cat > "$MINI_ORK_RUN_DIR/synthesis.md" <<'MD'
 MD
 out=$(bash "$RECIPE_DIR/verifiers/bottlenecks-found.sh" 2>/dev/null)
 if echo "$out" | python3 -c "import sys,json; d=json.load(sys.stdin); sys.exit(0 if d['pass'] is False else 1)"; then
-  _ok "bottlenecks-found rejects ★ Insight envelope leak"
+  _ok "bottlenecks-found rejects ★ Insight envelope leak in synthesis.md"
 else
   _fail "bottlenecks-found should reject polluted synthesis"
 fi
+
+# Regression for iter-2 finding (synth's own patch #3 citing arXiv
+# 2602.13477 Naik 2026): pollution check must extend to ALL lens-*.md
+# files, not just synthesis.md. Clean synth + polluted lens-perf.md
+# should still reject the iter.
+cat > "$MINI_ORK_RUN_DIR/synthesis.md" <<'MD'
+# Synthesis
+| 1 | foo | perf | bar | x | 0.9 |
+MD
+cat > "$MINI_ORK_RUN_DIR/lens-perf.md" <<'MD'
+# perf lens
+★ Insight ─── pollution in a lens artifact, not synthesis
+MD
+out=$(bash "$RECIPE_DIR/verifiers/bottlenecks-found.sh" 2>/dev/null)
+if echo "$out" | python3 -c "import sys,json; d=json.load(sys.stdin); sys.exit(0 if d['pass'] is False else 1)"; then
+  _ok "bottlenecks-found rejects ★ Insight leak in lens-perf.md (not just synthesis.md)"
+else
+  _fail "bottlenecks-found should reject lens-*.md envelope leak per arXiv 2602.13477"
+fi
+rm -f "$MINI_ORK_RUN_DIR/lens-perf.md"
 
 # Clean synthesis → passes
 cat > "$MINI_ORK_RUN_DIR/synthesis.md" <<'MD'
