@@ -378,6 +378,44 @@ else
 fi
 
 echo
+echo "── pre-iter cost-cap pre-check ──"
+# Regression for 2-spiral-events-this-session: runner must halt BEFORE
+# worktree creation when SUM(task_runs.cost_usd) over 24h >= cap, not
+# wait for the dispatcher's rc=42 mid-iter.
+sqlite3 "$MINI_ORK_DB" "CREATE TABLE IF NOT EXISTS task_runs (run_id TEXT PRIMARY KEY, created_at INTEGER NOT NULL, cost_usd REAL NOT NULL DEFAULT 0.0);" 2>/dev/null
+sqlite3 "$MINI_ORK_DB" "DELETE FROM task_runs;" 2>/dev/null
+
+# 1. Below cap → pre-check returns false → no halt
+sqlite3 "$MINI_ORK_DB" "INSERT INTO task_runs (id, task_class, kickoff_path, status, cost_usd, created_at, updated_at) VALUES ('under-cap', 'recursive_self_improve', '/tmp/x', 'published', 5.00, strftime('%s','now'), strftime('%s','now'));" 2>/dev/null
+out=$(MO_DAILY_BUDGET_USD=100 "$MINI_ORK_ROOT/bin/mini-ork-self-improve" --dry-run --max-iters 1 --soft-cap-hours 1 --hard-cap-hours 1 2>&1 || true)
+if ! echo "$out" | grep -q "cost-cap-pre-check"; then
+  _ok "pre-iter cost-cap pre-check stays silent when spent < cap (\$5 < \$100)"
+else
+  _fail "pre-iter cost-cap pre-check fired incorrectly when under budget"
+fi
+
+# 2. Over cap → pre-check returns true → outer loop halts before iter
+sqlite3 "$MINI_ORK_DB" "INSERT INTO task_runs (id, task_class, kickoff_path, status, cost_usd, created_at, updated_at) VALUES ('over-cap', 'recursive_self_improve', '/tmp/x', 'published', 60.00, strftime('%s','now'), strftime('%s','now'));" 2>/dev/null
+out=$(MO_DAILY_BUDGET_USD=50 "$MINI_ORK_ROOT/bin/mini-ork-self-improve" --dry-run --max-iters 1 --soft-cap-hours 1 --hard-cap-hours 1 2>&1 || true)
+if echo "$out" | grep -q "\[cost-cap-pre-check\] HALTING"; then
+  _ok "pre-iter cost-cap pre-check halts BEFORE worktree create when spent >= cap"
+else
+  _fail "pre-iter cost-cap pre-check should halt outer loop when over budget"
+  echo "$out" | head -10
+fi
+
+# 3. Override disables the check
+out=$(MO_DAILY_BUDGET_USD=50 MINI_ORK_PRE_ITER_COST_CHECK=0 "$MINI_ORK_ROOT/bin/mini-ork-self-improve" --dry-run --max-iters 1 --soft-cap-hours 1 --hard-cap-hours 1 2>&1 || true)
+if ! echo "$out" | grep -q "cost-cap-pre-check"; then
+  _ok "MINI_ORK_PRE_ITER_COST_CHECK=0 disables the pre-check"
+else
+  _fail "pre-check fired despite MINI_ORK_PRE_ITER_COST_CHECK=0"
+fi
+
+# Cleanup so subsequent assertions see clean DB
+sqlite3 "$MINI_ORK_DB" "DELETE FROM task_runs;" 2>/dev/null
+
+echo
 echo "── invalid caps rejected ──"
 out=$("$MINI_ORK_ROOT/bin/mini-ork-self-improve" --soft-cap-hours 5 --hard-cap-hours 3 --dry-run 2>&1 || true)
 if echo "$out" | grep -q "invalid cap hours"; then
