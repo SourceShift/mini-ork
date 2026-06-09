@@ -123,7 +123,7 @@ if [ ! -f "${PLANNER_PROMPT_FILE:-}" ]; then
 fi
 if [ ! -f "${PLANNER_PROMPT_FILE:-}" ]; then
   # Inline fallback prompt — covers cold-start before prompts/ are populated
-  PLANNER_PROMPT_FILE="$(mktemp /tmp/mini-ork-planner-XXXXXX.md)"
+  PLANNER_PROMPT_FILE="$(mktemp /tmp/mini-ork-planner-XXXXXX)"
   _PLANNER_TMPFILE="$PLANNER_PROMPT_FILE"
   cat > "$PLANNER_PROMPT_FILE" <<'PROMPT'
 You are a meticulous task planner. Given the kickoff document below, produce a
@@ -164,6 +164,39 @@ PY
 )
 if [ -n "${MINI_ORK_PROFILE_PATH:-}" ] && [ -f "${MINI_ORK_PROFILE_PATH:-}" ]; then
   PROMPT_TEXT="${PROMPT_TEXT}"$'\n\n--- RUN PROFILE ---\n'"$(cat "$MINI_ORK_PROFILE_PATH")"$'\n--- /RUN PROFILE ---\n'
+fi
+
+profile_status=""
+confidence="1"
+human_questions_json="[]"
+if [ -n "${MINI_ORK_PROFILE_PATH:-}" ] && [ -f "${MINI_ORK_PROFILE_PATH:-}" ]; then
+  _profile_meta=$(python3 - "$MINI_ORK_PROFILE_PATH" <<'PY'
+import json
+import sys
+
+try:
+    with open(sys.argv[1], encoding="utf-8") as f:
+        profile = json.load(f)
+except Exception:
+    profile = {}
+
+status = str(profile.get("profile_status") or "")
+confidence = profile.get("confidence")
+try:
+    confidence = float(confidence)
+except (TypeError, ValueError):
+    confidence = 0.0
+questions = profile.get("human_questions") or []
+print(json.dumps({
+    "profile_status": status,
+    "confidence": confidence,
+    "human_questions": questions,
+}))
+PY
+  )
+  profile_status=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("profile_status",""))' "$_profile_meta")
+  confidence=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("confidence",0))' "$_profile_meta")
+  human_questions_json=$(python3 -c 'import json,sys; print(json.dumps(json.loads(sys.argv[1]).get("human_questions",[])))' "$_profile_meta")
 fi
 # Clean up inline tmpfile if we created it
 [ -n "${_PLANNER_TMPFILE:-}" ] && rm -f "$_PLANNER_TMPFILE"
@@ -213,6 +246,65 @@ PY
   echo "plan_path=${OUT_FILE}"
   echo "task_class=${TASK_CLASS}"
   exit 0
+fi
+
+PROFILE_GATE="${MINI_ORK_PROFILE_GATE:-1}"
+CONFIDENCE_FLOOR="${MINI_ORK_PLAN_CONFIDENCE_FLOOR:-0.7}"
+if [ "$PROFILE_GATE" = "1" ]; then
+  _gate_block=0
+  [ "$profile_status" = "needs_answers" ] && _gate_block=1
+  if awk "BEGIN{exit !($confidence < $CONFIDENCE_FLOOR)}"; then
+    _gate_block=1
+  fi
+  if [ "$_gate_block" = "1" ]; then
+    mkdir -p "$(dirname "$OUT_FILE")"
+    python3 - "$OUT_FILE" "${MINI_ORK_PROFILE_PATH:-}" "$profile_status" "$confidence" "$human_questions_json" <<'PY'
+import json
+import sys
+
+out, profile_path, status, confidence, questions_json = sys.argv[1:6]
+try:
+    confidence_value = float(confidence)
+except ValueError:
+    confidence_value = 0.0
+try:
+    questions = json.loads(questions_json) if questions_json else []
+except json.JSONDecodeError:
+    questions = []
+
+plan = {
+    "plan_status": "needs_answers",
+    "blocked_by": "run_profile",
+    "profile_status": status,
+    "confidence": confidence_value,
+    "human_questions": questions,
+    "objective": "blocked: profile incomplete",
+    "assumptions": [],
+    "decomposition": [],
+    "dependencies": [],
+    "risk_notes": ["run_profile is incomplete; planner dispatch skipped"],
+    "run_profile_path": profile_path,
+    "artifact_contract": {"outputs": [], "success_verifiers": []},
+    "verifier_contract": {
+        "checks": [
+            {
+                "id": "profile-needs-answers",
+                "description": "Planner dispatch is blocked until run_profile is ready.",
+            }
+        ]
+    },
+}
+
+with open(out, "w", encoding="utf-8") as f:
+    json.dump(plan, f, indent=2)
+    f.write("\n")
+PY
+    trace_write "{\"trace_id\":\"$TRACE_ID\",\"task_class\":\"${TASK_CLASS}\",\"status\":\"blocked\",\"reviewer_verdict\":\"run_profile_needs_answers\"}" >/dev/null 2>&1 || true
+    echo "plan_path=${OUT_FILE}"
+    echo "task_class=${TASK_CLASS}"
+    echo "{\"plan_status\":\"needs_answers\",\"blocked_by\":\"run_profile\"}"
+    exit 0
+  fi
 fi
 
 PLAN_JSON_RAW=$(llm_dispatch \
