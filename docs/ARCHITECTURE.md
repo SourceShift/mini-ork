@@ -33,14 +33,14 @@ Nodes are the roles that agents play inside the `Execute` stage. Each role maps 
 
 | Node type | Responsibility | Typical model lane |
 |---|---|---|
-| `planner` | Decompose task into subtasks; emit objective, assumptions, artifact contract, verifier contract. A plan is not complete until it names how success is checked. | `architect` (opus-class) |
-| `researcher` | Gather relevant source material, prior runs, known failure modes. Output is a bounded context pack — not raw dumps. | `worker` (sonnet-class) |
-| `implementer` | Produce the artifact (patch, doc, config, report). Reads planner output + researcher context. | `worker` (sonnet-class) |
-| `reviewer` | Challenge the artifact against requirements. Write structured feedback. Cannot approve its own work. | `architect` (opus-class) or `long-context` (kimi-class) |
-| `verifier` | Run deterministic probes (typecheck, tests, schema diff, health probe, coverage). Binary pass/fail. | `cheapfast` (glm-class) |
-| `reflector` | Extract textual gradients from this execution trace. Link failures to workflow steps. Suggest improvements. | `worker` (sonnet-class) |
-| `publisher` | Commit, merge, push, or otherwise finalize the artifact. Runs only after all gates pass. | `cheapfast` (glm-class) |
-| `rollback` | Revert artifact to last known-good state. Preserve worktree for post-mortem inspection. Never destroy. | `cheapfast` (glm-class) |
+| `planner` | Decompose task into subtasks; emit objective, assumptions, artifact contract, verifier contract. A plan is not complete until it names how success is checked. | `planner` |
+| `researcher` | Gather relevant source material, prior runs, known failure modes. Output is a bounded context pack — not raw dumps. | `researcher`, `glm_lens`, `kimi_lens`, `codex_lens`, `opus_lens`, `minimax_lens` |
+| `implementer` | Produce the artifact (patch, doc, config, report). Reads planner output + researcher context. | `implementer` or `worker` |
+| `reviewer` | Challenge the artifact against requirements. Write structured feedback. Cannot approve its own work. | `reviewer` |
+| `verifier` | Run deterministic probes (typecheck, tests, schema diff, health probe, coverage). Binary pass/fail. | `verifier` |
+| `reflector` | Extract textual gradients from this execution trace. Link failures to workflow steps. Suggest improvements. | `reflector` |
+| `publisher` | Commit, merge, push, or otherwise finalize the artifact. Runs only after all gates pass. | `publisher` |
+| `rollback` | Revert artifact to last known-good state. Preserve worktree for post-mortem inspection. Never destroy. | `rollback` |
 
 ---
 
@@ -59,7 +59,7 @@ Edges in `workflow.yaml` carry typed semantics. The executor enforces them.
 
 ---
 
-## 6 Gate Types
+## Gate Types
 
 Gates are the checkpoints inside `Verify`. They fire in order; first failure aborts (unless the gate config specifies `continue_on_fail`).
 
@@ -71,8 +71,9 @@ Gates are the checkpoints inside `Verify`. They fire in order; first failure abo
 | `budget_gate` | Cumulative cost tracker | `model_costs` total < configured `budget_usd` |
 | `scope_gate` | File-path ownership registry | No two nodes claim the same file path |
 | `deployment_gate` | Deployment-specific checks (schema diff, rollback proof, health probe) | All deployment probes pass |
+| `liveness_gate` | Runtime health and availability probes | Required services/providers respond inside timeout |
 
-Gates are registered at boot via `lib/gate_registry.sh:gate_register`. Custom gates are supported — see [docs/EXTENSION.md](docs/EXTENSION.md).
+Gates are registered at boot via `lib/gate_registry.sh:gate_register`. Custom gates are supported — see [EXTENSION.md](EXTENSION.md).
 
 ---
 
@@ -100,20 +101,25 @@ All writes carry provenance: `run_id`, `task_id`, `agent_version_id`, `ts`. A le
 Task classes are YAML definitions under `${MINI_ORK_HOME}/config/task_classes/`. Each file names a class, its artifact type, required verifiers, and gate policy.
 
 ```yaml
-# ${MINI_ORK_HOME}/config/task_classes/code_fix.yaml
-task_class: code_fix
-artifact_type: patch
+# recipes/code-fix/task_class.yaml
+name: code_fix
+description: "Single-patch code change: bug fix, small feature, refactor of a single function"
+artifact_contract_ref: artifact_contract.yaml
+default_workflow: workflow.yaml
 risk_class: medium
-required_verifiers:
-  - typecheck
-  - targeted_test
-  - reviewer_gate
-failure_policy: request_changes_or_escalate
-rollback_policy: git_branch_quarantine
-human_review_level: none   # none | optional | required
+
+matches:
+  keywords: [fix, bug, patch, update, refactor]
+  path_globs: ["**/*"]
+  regex: []
+
+default_gates:
+  - scope_gate
+  - budget_gate
+  - deployment_gate
 ```
 
-Validated against `schemas/task_class.schema.json`. Built-in classes: `code_fix`, `research_synthesis`, `blog_post`, `ui_audit`, `db_migration`, `ops_runbook`.
+Validated against `schemas/task_class.schema.json` as the target contract. Built-in classes include `code_fix`, `bdd_first_delivery`, `docs`, `research_synthesis`, `blog_post`, `ui_audit`, `db_migration`, `ops_runbook`, `post_mvp_delivery`, and `recursive_self_improve`.
 
 ---
 
@@ -123,46 +129,66 @@ Workflows are versioned DAGs per recipe. Each recipe ships a `workflow.yaml` tha
 
 ```yaml
 # recipes/code-fix/workflow.yaml
-version: "1.0"
+version: "0.1.0"
 task_class: code_fix
+description: "Single-patch code fix with typecheck, test, and reviewer gates"
+
 nodes:
-  - id: plan
+  - name: planner
     type: planner
-    model_lane: architect
-  - id: impl
+    model_lane: planner
+    prompt_ref: prompts/planner.md
+    dispatch_mode: serial
+
+  - name: implementer
     type: implementer
     model_lane: worker
-    depends_on: [plan]
-  - id: verify
+    prompt_ref: prompts/implementer.md
+    dispatch_mode: serial
+
+  - name: typecheck
     type: verifier
-    scripts: [typecheck.sh, targeted_test.sh]
-    verifies: impl
-  - id: review
+    prompt_ref: null
+    verifier_ref: verifiers/typecheck.sh
+    dispatch_mode: serial
+
+  - name: reviewer
     type: reviewer
-    model_lane: architect
-    depends_on: [verify]
-  - id: publish
+    model_lane: reviewer
+    prompt_ref: prompts/reviewer.md
+    dispatch_mode: serial
+
+  - name: publisher
     type: publisher
-    depends_on: [review]
+    prompt_ref: null
+    dispatch_mode: serial
+
+edges:
+  - { from: planner,     to: implementer, edge_type: depends_on }
+  - { from: implementer, to: typecheck,   edge_type: verifies }
+  - { from: typecheck,   to: reviewer,    edge_type: depends_on }
+  - { from: reviewer,    to: publisher,   edge_type: depends_on }
 ```
 
-Validated against `schemas/workflow.schema.json`.
+The live recipes are the executable contract today. `schemas/workflow.schema.json` is the target validation contract and needs alignment with current fields such as `verifier_ref` and recipe-specific human-decision edges.
 
 ---
 
 ## State.db Schema Overview
 
-12 migrations, ~45 tables. Full DDL in [docs/SCHEMA.md](docs/SCHEMA.md).
+17 migrations. Full DDL in [SCHEMA.md](SCHEMA.md).
 
 | Migration | Tables added | Purpose |
 |---|---|---|
-| `001_core.sql` | `runs`, `tasks`, `events`, `model_costs` | Core run lifecycle |
-| `002_epics.sql` | `epics`, `epic_claims`, `epic_reviews`, `iters` | Epic/lane tracking (bdd-first-delivery recipe) |
-| `003_bdd.sql` | `bdd_runs`, `bdd_steps`, `scope_claims`, `merge_log`, `escalations`, `prompt_cache`, `corrections` | BDD pipeline (bdd-first-delivery recipe) |
-| `004_memory.sql` | `task_contexts`, `workflow_versions`, `workflow_candidates`, `agent_versions`, `agent_run_stats`, `failure_records`, `recovery_records`, `user_preferences`, `artifact_records` | 8 memory namespaces |
-| `005_benchmarks.sql` | `benchmark_tasks`, `benchmark_results` | Benchmark memory namespace |
-| `006_evolution.sql` | `textual_gradients`, `pattern_records`, `workflow_candidates`, `evolution_runs` | Reflection + evolution pipeline |
-| `007_safety.sql` | `audit_log`, `quarantine_registry`, `version_registry` | Governance layer |
+| `0001_core.sql` | `runs`, `tasks`, `events`, `model_costs` | Core run lifecycle |
+| `0002`-`0008` | sessions, tickets, expected features, research, validation, reflection basins | Early orchestration and validation layers |
+| `0009_memory_namespaces.sql` | task/workflow/agent/failure/recovery/user/artifact memory tables | Memory namespaces |
+| `0010_benchmarks.sql` | benchmark tables | Benchmark memory namespace |
+| `0011_evolution.sql` | gradients, patterns, candidates, evolution runs | Reflection + evolution pipeline |
+| `0012_safety.sql` | audit, quarantine, version registry | Governance layer |
+| `0013`-`0015` | task runs, execution traces, panel topology telemetry | Run and panel measurement |
+| `0016_recursive_orchestration.sql` | spawn lineage and recursive run tracking | Parent/child mini-ork delegation |
+| `0017_self_improve_learning.sql` | self-improvement learning records | Recursive self-improvement memory |
 
 ---
 
@@ -279,4 +305,4 @@ flowchart TD
   VR -->|next run| T
 ```
 
-Self-evolution is evidence-gated: a candidate must beat the current version on the benchmark suite before promotion. Quarantined versions cannot be re-promoted without `version_clear_quarantine`. Every promote/quarantine/rollback writes to `audit_log` (append-only, enforced by sqlite trigger). See [docs/SAFETY.md](docs/SAFETY.md).
+Self-evolution is evidence-gated: a candidate must beat the current version on the benchmark suite before promotion. Quarantined versions cannot be re-promoted without `version_clear_quarantine`. Every promote/quarantine/rollback writes to `audit_log` (append-only, enforced by sqlite trigger). See [SAFETY.md](SAFETY.md).

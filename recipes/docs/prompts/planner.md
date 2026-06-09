@@ -90,7 +90,8 @@ Emit a single JSON object on stdout. No prose before or after the JSON.
    `{kind: "grep", file: "docs/foo.md", pattern: "deterministic oracle",
    min_count: 1}` verbatim — no paraphrasing.
 6. **Plans must be at most 5 steps.** If you need more, the task is not a
-   `docs` edit — escalate to `mini-ork deliver`.
+   `docs` edit — recommend `post-mvp-delivery`, `bdd-first-delivery`, or
+   another explicit recipe with `mini-ork run <recipe> <kickoff.md>`.
 
 ## What you are NOT allowed to do
 

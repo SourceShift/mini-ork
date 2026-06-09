@@ -67,7 +67,7 @@ U = 0.45 * task_success_rate
   - 0.05 * risk_penalty
 ```
 
-Override per task class via `${MINI_ORK_HOME}/config/utility_functions/<task_class>.sh` — see [docs/EXTENSION.md](docs/EXTENSION.md).
+Override per task class via `${MINI_ORK_HOME}/config/utility_functions/<task_class>.sh` — see [EXTENSION.md](EXTENSION.md).
 
 ---
 
