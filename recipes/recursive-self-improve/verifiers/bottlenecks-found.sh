@@ -16,14 +16,21 @@ exec 3>"$EVIDENCE"
 
 missing=()
 
-SCAN="$RUN_DIR/bottleneck-scan.md"
+# Dispatcher names: researcher node `bottleneck_lens` → lens-bottleneck.md;
+# `arxiv_lens` → lens-arxiv.md (per the _lens-suffix heuristic in
+# bin/mini-ork-execute:410-415).
+SCAN="$RUN_DIR/lens-bottleneck.md"
 SYNTH="$RUN_DIR/synthesis.md"
-ARXIV="$RUN_DIR/arxiv-refs.md"
-[ -f "$RUN_DIR/arxiv-research.md" ] && ARXIV="$RUN_DIR/arxiv-research.md"
+ARXIV="$RUN_DIR/lens-arxiv.md"
+# Back-compat: also accept the older names so an in-flight loop pinned
+# to a prior workflow.yaml does not have its verifier-result inverted.
+[ ! -f "$SCAN" ]  && [ -f "$RUN_DIR/bottleneck-scan.md" ]  && SCAN="$RUN_DIR/bottleneck-scan.md"
+[ ! -f "$ARXIV" ] && [ -f "$RUN_DIR/arxiv-refs.md" ]       && ARXIV="$RUN_DIR/arxiv-refs.md"
+[ ! -f "$ARXIV" ] && [ -f "$RUN_DIR/arxiv-research.md" ]   && ARXIV="$RUN_DIR/arxiv-research.md"
 
-[ -f "$SCAN" ]  || missing+=("bottleneck-scan.md")
+[ -f "$SCAN" ]  || missing+=("lens-bottleneck.md")
 [ -f "$SYNTH" ] || missing+=("synthesis.md")
-[ -f "$ARXIV" ] || missing+=("arxiv-refs.md (or arxiv-research.md)")
+[ -f "$ARXIV" ] || missing+=("lens-arxiv.md")
 
 # Converged → pass with a soft signal so the outer runner terminates.
 converged=0
