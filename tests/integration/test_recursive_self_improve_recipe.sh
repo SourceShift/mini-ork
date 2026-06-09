@@ -194,6 +194,21 @@ fi
 unset MINI_ORK_SELF_IMPROVE_WORKTREE
 
 echo
+echo "── outer runner dispatches via mini-ork run (not mini-ork-execute --recipe) ──"
+# Regression for iter-1 bug: mini-ork-execute has no --recipe / --kickoff flags.
+# The runner must call `mini-ork run recursive-self-improve <kickoff.md>`.
+if grep -q 'run recursive-self-improve' "$MINI_ORK_ROOT/bin/mini-ork-self-improve"; then
+  _ok "runner dispatches via 'mini-ork run recursive-self-improve' (lifecycle walks classify→plan→execute→verify)"
+else
+  _fail "runner missing 'mini-ork run recursive-self-improve' invocation"
+fi
+if grep -q -- '--recipe recursive-self-improve' "$MINI_ORK_ROOT/bin/mini-ork-self-improve"; then
+  _fail "runner still uses 'mini-ork-execute --recipe' — will hit 'Unknown flag' rc=2"
+else
+  _ok "runner does not pass --recipe to mini-ork-execute (which has no such flag)"
+fi
+
+echo
 echo "── outer runner --dry-run ──"
 out=$("$MINI_ORK_ROOT/bin/mini-ork-self-improve" --dry-run --max-iters 1 --soft-cap-hours 1 --hard-cap-hours 1 2>&1 || true)
 if echo "$out" | grep -q "dry-run"; then
