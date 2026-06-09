@@ -1,142 +1,150 @@
-# Synthesis — Recursive Self-Improvement, iter 2
+# Synthesis — Recursive Self-Improvement, iter 3
 
 ## Ranked patch plan
 
 | Rank | Bottleneck | Category | Patch summary | Evidence | Confidence |
 |---|---|---|---|---|---|
-| 1 | JSON verifier verdicts not authoritative in generic executor (carried from iter 1, still deferred) | correctness | Add `_run_verifier_ref <script> <evidence_path>` helper in `bin/mini-ork-execute`; run verifier, parse evidence-file JSON, honor `.pass` (true ⇒ 0, false ⇒ 1, non-JSON ⇒ fall through to exit code) | `lens-bottleneck.md:7` (Row 1); `lens-correctness.md:18-22,44-64,124-131`; `bin/mini-ork-execute:579`; `recipes/recursive-self-improve/verifiers/bottlenecks-found.sh:9`, `self-tests-pass.sh:10`, `no-regression.sh:11`; `bin/mini-ork-self-improve:229-260` (workaround still in place); `learning_record.id=1` `outcome=deferred`; arXiv 2603.18096 (Paduraru 2026, trace-based assurance contracts), 2602.22302 (Bhardwaj 2026, agent behavioral contracts) — both in `lens-arxiv.md:8-20` | 0.88 |
-| 2 | Bottleneck-scan prompt still names non-existent `traces` table (carried from iter 1, not landed) | correctness | Edit `recipes/recursive-self-improve/prompts/bottleneck-scan.md:14` to read `Key tables: execution_traces, benchmark_results, pattern_records, learning_record`; audit the rest of the file for bare `traces` references | `lens-bottleneck.md:9` (Row 3); `lens-correctness.md:24-28,66-77,133-137`; live `.tables` grep — no `traces`, only `execution_traces`; `lib/trace_store.sh:52`, `lib/context_assembler.sh:91` | 0.95 |
-| 3 | Wrapper-pollution check ignores non-synthesis lens artifacts | correctness | In `recipes/recursive-self-improve/verifiers/bottlenecks-found.sh:48-50`, replace the single-file grep with a loop over every required durable artifact (`lens-bottleneck.md`, `lens-perf.md`, `lens-correctness.md`, `lens-arch.md`, `lens-arxiv.md`, `synthesis.md`); anchor regex at line-start | `lens-bottleneck.md:10` (Row 4); `lens-correctness.md:30-34,80-106,139-143`; current run's `lens-arch.md` and `lens-arxiv.md` (run-dir copies) contain `<z-insight>` blocks; `tests/integration/test_recursive_self_improve_recipe.sh:148-166`; arXiv 2602.13477 (Naik 2026, orchestrator multi-agent leakage), 2502.12630 (Sternak 2025, prompt-leakage agentic probes) — `lens-arxiv.md:54-69` | 0.85 |
-| 4 | `execution_traces.duration_ms` unusable — 10/12 cost-bearing rows are 0 (carried, blocks runtime gating) | correctness/perf | Capture per-node wall-clock at the 3 dispatch call sites (`bin/mini-ork-execute:451,472,538`) and add `duration_ms` to the JSON payload at `bin/mini-ork-execute:294-308`; `lib/trace_store.sh:77` already accepts the key | `lens-bottleneck.md:8` (Row 2); `lens-perf.md:20-52,88-123`; `lens-correctness.md:158-159` open question; recipe gate `recipes/recursive-self-improve/task_class.yaml:38`; arXiv 2604.23853 (Yuan 2026, ClawTrace cost-aware tracing), 2602.10133 (AlSayyad 2026, AgentTrace structured logging) — `lens-arxiv.md:30-44` | 0.82 |
-| 5 | Cost-circuit budget check forks Python twice per dispatch with no caching | perf | Mirror the `_MO_LANE_<UPPER>` env-cache pattern (`lib/llm-dispatch.sh:373-414`) for the cost circuit at `:348-368`; cache `_MO_SPENT_TODAY` + `_MO_SPENT_CUTOFF` with 30-60s TTL keyed on `MINI_ORK_DB` | `lens-bottleneck.md:12` (Row 6); `lens-perf.md:54-84,125-167`; arXiv 2601.06007 (Lumer 2026, prompt caching for long-horizon agents), 2510.16276 (Bian 2025, agentic system efficiency) — `lens-arxiv.md:79-91` | 0.74 |
+| 1 | `learning_record.id=1` stays `deferred` even though `_run_verifier_ref` landed in iter 2; every subsequent scan re-ranks resolved work | correctness (meta) | Close the row (`outcome=resolved`), correct `docs/improvements/self-improve-latest.md:7,17-22`, and add a minimal promotion hook in `bin/mini-ork-self-improve` that flips matching `learning_record` rows to `resolved` when the row's associated regression test passes; ship with a unit test that asserts a deferred row transitions on a green run | `lens-bottleneck.md:10` (Row 4); `lens-correctness.md:7,15,25-34,99-102,134`; `lens-arch.md:15`; `bin/mini-ork-execute:68-107` (adapter exists); `bin/mini-ork-execute:624` (dispatched); `tests/unit/test_verifier_ref_json.sh:61-64` (already green); `learning_record` SQLite row 1; iter 2 ranking placed adapter at Rank 1 (`self-improve-iter-2-20260609064419/synthesis.md:7`); arXiv 2605.17998 (Nguyen 2026, verify-gated completion → admission close) and 2605.20312 (Kadaboina 2026, replayable verification artifacts) — `lens-arxiv.md:32-44` | 0.90 |
+| 2 | Bottleneck-scan prompt names non-existent `traces` table; scanners that follow the prompt query a missing table | correctness | One-line edit at `recipes/recursive-self-improve/prompts/bottleneck-scan.md:14` to read `Key tables: execution_traces, benchmark_results, pattern_records, learning_record`; audit file for residual bare `traces` references | `lens-bottleneck.md:8` (Row 2); `lens-correctness.md:9,52-62,111-116`; live schema `db/migrations/0010_benchmarks.sql:12`; consumer `lib/context_assembler.sh:91-95`; carried from iter 1 and iter 2 (`self-improve-iter-2-20260609064419/synthesis.md:9`); no arXiv required (prose-rename) | 0.96 |
+| 3 | Wrapper-pollution check only greps `synthesis.md` while every other durable lens artifact can leak CLI envelope blocks (the z-insight JSON tag and the Insight-rule banner) | correctness | Expand `recipes/recursive-self-improve/verifiers/bottlenecks-found.sh:48-50` to loop over every durable artifact declared in `artifact_contract.yaml` (or hard-coded list: `lens-bottleneck.md`, `lens-perf.md`, `lens-correctness.md`, `lens-arch.md`, `lens-arxiv.md`, `synthesis.md`); anchor the regex at line-start | `lens-bottleneck.md:9` (Row 3); `lens-correctness.md:8,36-50,104-109`; live evidence — current iter-3 run-dir `lens-bottleneck.md:7-52`, `lens-arch.md:9-54`, `lens-arxiv.md:12-57` all carry the CLI envelope block at line start; carried from iter 2 (`self-improve-iter-2-20260609064419/synthesis.md:9`); arXiv 2604.01350 (Yang 2026, shared-state contamination) and 2605.16746 (Wang 2026, memory laundering) — `lens-arxiv.md:55-68` | 0.86 |
+| 4 | `execution_traces.duration_ms` always 0 for cost-bearing rows; recipe `task_class.yaml:38-40 max_minutes:60` gate is unenforceable | correctness/perf | At each of the 3 dispatch call sites in `bin/mini-ork-execute` capture `_t0` before `llm_dispatch` and pass elapsed millis as a positional arg to `_trace_write_node_rich`; extend the Python payload dict at `:315-354` with `'duration_ms': int(sys.argv[N])`; schema already accepts the column | `lens-bottleneck.md:7` (Row 1); `lens-perf.md:7-15,32-58,86-123`; `lens-correctness.md:10,64-77,118-123`; live DB: 13/15 cost-bearing rows have `duration_ms=0`; carried from iter 1 and iter 2 (`self-improve-iter-2-20260609064419/synthesis.md:10`); arXiv 2604.05119 (Pathak 2026, governance-aware telemetry), 2601.08815 (Ye 2026, resource-bounded contracts), 2604.23853 (Yuan 2026, ClawTrace) — `lens-arxiv.md:7-28` | 0.84 |
+| 5 | `no-regression.sh` emits benchmark summary but pass/fail is decided only by shell-syntax and implementer report — a 50% utility drop still passes | correctness | After `bench_summary` is computed in `recipes/recursive-self-improve/verifiers/no-regression.sh:38-60`, look up the prior baseline `utility_score` for the same `task_class` and set `bench_delta_ok=0` if `utility_delta < -0.05` (configurable); thread it into the existing pass condition at `:72-76` | `lens-bottleneck.md:11` (Row 5); `lens-correctness.md:11,79-93,125-130`; live baseline data: stale synthetic `br-wc-3a202-refactor-*` from 2026-06-02; arXiv 2604.10547 (Chen 2026, Agent² RL-Bench) and 2604.00072 (Scrivens 2026, classification vs verification gates) — `lens-arxiv.md:79-92` | 0.72 |
 
 ## Top patch — detailed plan
 
-### Patch 1: JSON-aware verifier adapter in `bin/mini-ork-execute`
+### Patch 1: close `learning_record.id=1` and add a state-closure promotion hook
 
-**Problem statement.** Every recursive-self-improve verifier emits `{"pass": ...}` JSON to its evidence file with `exit 0`, but `bin/mini-ork-execute:579` gates `verifier_ref` only on shell exit. A verifier that detects a real failure and writes `{"pass": false}` still passes. The outer runner `bin/mini-ork-self-improve:229-260` reparses `verifier-result-*.json` with `jq` as a workaround, but the generic executor remains the source of truth for any future recipe.
+**Problem statement.** Iter 2's Rank-1 patch — the `_run_verifier_ref` JSON adapter — actually landed in code (`bin/mini-ork-execute:68-107`, dispatched at `:624`, with a green regression test at `tests/unit/test_verifier_ref_json.sh:61-64`), but the `learning_record.id=1` row that tracked it still reads `outcome=deferred`. Every subsequent bottleneck scan therefore re-ranks the same already-resolved work, the synthesizer's cross-iteration memory drifts, and convergence is structurally impossible. Iter 2 (`self-improve-iter-2-20260609064419/synthesis.md:7`) explicitly flagged this exact scenario as an escalation event. Root cause: there is no automated promotion path from "regression test passes + code present" to "row resolved". Fixing the row by hand without a hook only papers over the same drift next iteration.
 
 **Evidence.**
-- Internal: `bin/mini-ork-execute:579` (exit-only gate); `recipes/recursive-self-improve/verifiers/bottlenecks-found.sh:9`, `self-tests-pass.sh:10`, `no-regression.sh:11` (all `exit 0` by contract; emit `.pass` in JSON at `bottlenecks-found.sh:62-73`, `self-tests-pass.sh:79-90`, `no-regression.sh:78-93`); `bin/mini-ork-self-improve:229-260` (workaround).
-- Reproduction recipe R1 from `lens-correctness.md:45-64` (fake verifier with `pass=false; exit 0` is accepted by the executor).
-- Cross-iter: `learning_record.id=1`, category `arch`, `outcome=deferred`, `confidence=0.75`. Iter 1's synthesis ranked this Patch 1 (`self-improve-iter-1-20260609061529/synthesis.md:15`); commit `ec748c0` preserved the deferred row but did not land the adapter.
-- arXiv:
-  - **2603.18096** (Paduraru 2026, "A Trace-Based Assurance Framework for Agentic AI Orchestration") — explicitly argues verifier observations are structured contract records, not transport exit codes. Confidence 0.78 in `lens-arxiv.md:8-13`.
-  - **2602.22302** (Bhardwaj 2026, "Agent Behavioral Contracts") — runtime-enforceable contract pass/fail object consumed before the workflow advances. Confidence 0.70 in `lens-arxiv.md:15-20`.
+- mini-ork internal:
+  - Adapter exists: `bin/mini-ork-execute:68-107` (function `_run_verifier_ref`).
+  - Adapter is dispatched on the verifier path: `bin/mini-ork-execute:624`.
+  - Regression test green: `tests/unit/test_verifier_ref_json.sh:61-64`.
+  - Stale record: `learning_record.id=1` → `outcome=deferred`, `category=arch`, `title="Verifier verdict JSON adapter (_run_verifier_ref)"`.
+  - Stale docs: `docs/improvements/self-improve-latest.md:7,17-22` still describe the adapter as absent/deferred.
+  - Iter-2 synthesizer flagged this as the convergence-blocking signal: `self-improve-iter-2-20260609064419/synthesis.md:115-127` (convergence assessment).
+- Cross-lens:
+  - `lens-bottleneck.md:10` (Row 4 — "Learning/state closure is stale").
+  - `lens-correctness.md:7,15` (B1 silent corruption taxonomy) + reproduction `lens-correctness.md:25-34`.
+  - `lens-arch.md:15` (architecture-adjacent state-management gap; deliberately not promoted to primary arch refactor candidate).
+- arXiv (mandatory because the patch adds a new `bin/mini-ork-promote` style hook — minor new infra):
+  - **2605.17998** (Nguyen 2026, verify-gated completion as admission control) — `lens-arxiv.md:32-37`, confidence 0.82. Direct support for separating completion-proposal from completion-admission: once the verifier verdict exists, the learning state must transition out of "proposed/deferred" — admission is not optional bookkeeping.
+  - **2605.20312** (Kadaboina 2026, replayable claim-verification artifacts) — `lens-arxiv.md:39-44`, confidence 0.71. Supports recording the closure with stable evidence paths (`bin/mini-ork-execute:68-107`, `tests/unit/test_verifier_ref_json.sh:61-64`) so future scans can verify the closure rather than re-derive it.
 
-**Proposed change.**
+**Proposed change.** Three small, ordered edits in one patch:
 
-1. Add `_run_verifier_ref` near `bin/mini-ork-execute:575` (before the existing dispatch site). Sketch:
+1. **One-shot row closure.** Execute, idempotently, the SQL:
+   ```sql
+   UPDATE learning_record
+     SET outcome='resolved',
+         updated_at=strftime('%s','now'),
+         evidence=json_set(COALESCE(evidence,'[]'),
+           '$[#]', 'tests/unit/test_verifier_ref_json.sh:61-64')
+     WHERE id=1 AND outcome='deferred';
+   ```
+   Wrap in `bin/mini-ork-self-improve` (or a tiny new `bin/mini-ork-promote`) so the next outer-loop run executes it automatically on startup. Keep the wrapper guarded by `id=1` so it only runs the first time.
+
+2. **Docs correction.** Edit `docs/improvements/self-improve-latest.md:7` to remove the "still deferred" framing and replace `:17-22` with one paragraph stating the adapter landed in iter 2, citing `bin/mini-ork-execute:68-107`, `:624`, and `tests/unit/test_verifier_ref_json.sh:61-64`. Add a one-sentence note that the iter-3 self-improve report supersedes this section; the iter-3 report will be written by the publisher node referencing this synthesis.
+
+3. **Promotion hook (the real durable fix).** Add `bin/mini-ork-promote` (or extend `bin/mini-ork-self-improve` startup) with a single function `_promote_resolved_learnings`:
+
    ```bash
-   _run_verifier_ref() {
-     local _script="$1" _evidence="$2" _exit _verdict
-     MINI_ORK_PLAN_PATH="$PLAN_PATH" ARTIFACT_PATH="$ARTIFACT_PATH" \
-       bash "$_script" > "$_evidence" 2>&1
-     _exit=$?
-     _verdict="$(python3 - "$_evidence" <<'PY' 2>/dev/null
-   import json,sys
-   try:
-     d=json.load(open(sys.argv[1]))
-   except Exception:
-     print("nonjson"); sys.exit(0)
-   print("pass" if d.get("pass") is True else "fail")
-   PY
-   )"
-     case "$_verdict" in
-       pass)    return 0 ;;
-       fail)    return 1 ;;
-       nonjson|"") return "$_exit" ;;
-     esac
+   _promote_resolved_learnings() {
+     # For every learning_record row with outcome='deferred' that names a
+     # regression test path in its evidence array, run the test; if it
+     # exits 0, flip outcome to 'resolved' and append the run timestamp.
+     local _db="${MINI_ORK_DB:-.mini-ork/state.db}"
+     [[ -f "$_db" ]] || return 0
+     local _rows; _rows=$(sqlite3 "$_db" \
+       "SELECT id, evidence FROM learning_record WHERE outcome='deferred';")
+     while IFS='|' read -r _id _ev; do
+       [[ -z "$_id" ]] && continue
+       local _test
+       _test=$(printf '%s' "$_ev" | python3 -c \
+         'import sys,json; print(next((p for p in json.load(sys.stdin) if p.endswith(".sh") and "/test_" in p), ""))')
+       [[ -z "$_test" || ! -x "$_test" ]] && continue
+       if "$_test" >/dev/null 2>&1; then
+         sqlite3 "$_db" \
+           "UPDATE learning_record SET outcome='resolved',
+              updated_at=strftime('%s','now') WHERE id=$_id;"
+       fi
+     done <<< "$_rows"
    }
    ```
-2. Replace the inline `if bash "$_verifier_script" > "$_evidence_path" 2>&1; then` block at `bin/mini-ork-execute:579` with `if _run_verifier_ref "$_verifier_script" "$_evidence_path"; then`.
-3. Keep `bin/mini-ork-self-improve:229-260` workaround in place — schedule its removal as a follow-up after one green outer-loop run.
 
-**Regression test.** New `tests/unit/test_verifier_ref_json.sh` with four bats-style assertions (matches `lens-correctness.md:125-129`):
-- `echo '{"pass": false}'; exit 0` ⇒ `_run_verifier_ref` returns non-zero.
-- `echo '{"pass": true}'; exit 0` ⇒ returns 0.
-- `echo 'not json'; exit 1` ⇒ returns non-zero (legacy exit-code gate).
-- `echo 'not json'; exit 0` ⇒ returns 0 (legacy exit-code gate).
+   Call `_promote_resolved_learnings` from `bin/mini-ork-self-improve` near `:90-95` (right after the policy override is staged, before the recipe is dispatched). This makes every future outer-loop iteration self-healing.
+
+**Regression test.** `tests/unit/test_promote_resolved_learnings.sh`. Assertions:
+- Given a fresh test sqlite db with one `learning_record` row whose `outcome='deferred'` and whose `evidence` array contains a path to a known-passing stub test script, calling `_promote_resolved_learnings` flips the row to `outcome='resolved'` and stamps a non-null `updated_at`.
+- Given the same setup but the stub test exits 1, the row remains `outcome='deferred'` and `updated_at` is unchanged.
+- Given a row whose evidence array has no `test_*.sh` entry, the function leaves the row untouched (no-op safety).
+
+Assertion text the test must contain verbatim:
+- `assert_equal "resolved" "$outcome" "deferred row must promote on green test"`
+- `assert_equal "deferred" "$outcome" "deferred row must stay on failed test"`
+- `assert_equal "deferred" "$outcome" "row without test path must be left alone"`
 
 **Verification.**
-- Existing must pass: outer-loop happy path (`bin/mini-ork-self-improve` smoke); `tests/unit/test_circuit_breaker.sh`; existing `tests/e2e/*` relying on exit-0 legacy verifiers.
-- Benchmark delta: no expected wall-time change (the python3 fork already happens in the outer runner; this patch shifts it earlier). Treat any p95 regression > 50 ms/node as a rollback trigger.
+- Existing tests that must continue to pass: `tests/unit/test_verifier_ref_json.sh`, the full `tests/unit/` suite (run `make test-unit` or the project equivalent), and `tests/integration/test_recursive_self_improve_recipe.sh`.
+- Bottleneck-scan smoke: re-running `bash recipes/recursive-self-improve/prompts/bottleneck-scan.md` (via the next outer iteration) must no longer surface the verifier adapter row as a top-ranked bottleneck. Expected delta: the iter-4 `lens-bottleneck.md` top-ranked table shrinks by one row (`learning_record.id=1` no longer shows as Row 4 / Row 1 in correctness lens).
+- DB-side: after one outer-loop run, `sqlite3 "$MINI_ORK_DB" "SELECT outcome FROM learning_record WHERE id=1"` must return `resolved`.
+- Sign on convergence indicator: `learning_record` should now contain ≥1 `resolved` row (currently 0). The synthesizer should treat this as the first observable convergence signal.
 
-**Rollback criteria.**
-- If a legacy verifier emits non-JSON stdout that nonetheless `json.load`-s (extremely unlikely — would require valid JSON without `.pass`), `_verdict` will be `fail` and the dispatch will reject. Mitigation already in code: only `True` literal honors pass; absent key falls to `fail`. If observed in CI, revert the dispatch-site swap and re-open `learning_record.id=1` with the failure mode.
-- If `tests/unit/test_verifier_ref_json.sh` fails on CI, the dispatcher change must be reverted in the same commit — do not ship a partial.
+**Rollback criteria.** Discard this patch and revert all three edits if any of:
+- The promotion hook flips a row to `resolved` on a regression test that is itself stale or skipped (e.g. the test exits 0 because it is empty). Mitigation before rollback: gate `_promote_resolved_learnings` on the test producing at least one assertion (e.g. require `grep -q assert_ "$_test"`).
+- `_run_verifier_ref` is removed or substantively refactored away in a future iter — re-open `learning_record.id=1` to `outcome=deferred` manually and disable the auto-promotion for that row id.
+- The hook materially slows `bin/mini-ork-self-improve` startup (>2 s). If observed, move the promotion check behind an opt-in `MINI_ORK_PROMOTE_LEARNINGS=1` env var.
 
 ## Lower-ranked patches
 
 ### Patch 2: rename `traces` → `execution_traces` in bottleneck-scan prompt
 
-**Problem.** `recipes/recursive-self-improve/prompts/bottleneck-scan.md:14` reads `Key tables: traces, ...`. Live schema has no `traces`; every consumer uses `execution_traces` (`lib/trace_store.sh:52`, `lib/context_assembler.sh:91`, `db/migrations/0010_benchmarks.sql:12`).
+- **Problem.** `recipes/recursive-self-improve/prompts/bottleneck-scan.md:14` says `Key tables: traces`; the live schema has only `execution_traces` (`db/migrations/0010_benchmarks.sql:12`). A scanner that obeys the prompt queries a missing table and concludes "no perf signals". Carried unfixed from iter 1 and iter 2.
+- **Change.** Single-line edit: replace `Key tables: traces, …` with `Key tables: execution_traces, benchmark_results, pattern_records, learning_record`. Audit the rest of the prompt for residual bare `traces` references.
+- **Regression test.** `grep -w "execution_traces" recipes/recursive-self-improve/prompts/bottleneck-scan.md` must exit 0 AND `grep -wE "^[[:space:]]*Key tables:.*[^_]traces($|[^_])" recipes/recursive-self-improve/prompts/bottleneck-scan.md` must exit non-zero. Assertion text: `assert_grep "execution_traces" recipes/recursive-self-improve/prompts/bottleneck-scan.md "prompt must name execution_traces"`.
+- **Verification.** No code paths read this prompt at runtime in a way that requires migration. Diff < 5 LoC.
+- **Rollback.** Revert only if a future migration renames the table back to `traces`.
 
-**Change.** Edit `bottleneck-scan.md:14` to `Key tables: execution_traces, benchmark_results, pattern_records, learning_record`. Audit `bottleneck-scan.md:25-27` and adjacent paragraphs for residual bare `traces`.
+### Patch 3: extend wrapper-pollution verifier to every durable artifact
 
-**Regression test.** Bats assertion: `grep -w "execution_traces" recipes/recursive-self-improve/prompts/bottleneck-scan.md` exits 0 AND `grep -wE "^[[:space:]]*Key tables:.*[^_]traces($|[^_])" recipes/recursive-self-improve/prompts/bottleneck-scan.md` exits non-zero.
+- **Problem.** `recipes/recursive-self-improve/verifiers/bottlenecks-found.sh:48-50` greps only `$SYNTH` (synthesis.md) for the z-insight JSON envelope tag and the Insight-rule banner. Current iter-3 run dir already carries those envelope blocks at line start in `lens-bottleneck.md:7`, `lens-arch.md:9`, and `lens-arxiv.md:12`; the verifier passes anyway. Carried from iter 2.
+- **Change.** Replace the single-file grep with a loop over an explicit array of durable artifacts (`lens-bottleneck.md lens-perf.md lens-correctness.md lens-arch.md lens-arxiv.md synthesis.md`). Anchor both alternation branches at line-start (`^` applied to both the z-insight tag pattern and the Insight-rule banner pattern — the current regex only anchors the left branch) to avoid false positives where the envelope tokens are legitimately quoted inside prose. Emit each polluted file path into the verifier's existing `missing[]` array so the JSON failure shape stays stable.
+- **Regression test.** Extend `tests/integration/test_recursive_self_improve_recipe.sh:166-184` with a fixture polluted `lens-arch.md` (carries the z-insight envelope at line start) and assert verifier emits `pass=false` with `lens-arch.md` in `missing[]`. Assertion text: `assert_equal "false" "$pass" "verifier must reject envelope in any durable artifact"`.
+- **Verification.** Diff < 20 LoC. Existing single-file synthesis check continues to fire as a subset of the new loop. arXiv 2604.01350 (Yang 2026), 2605.16746 (Wang 2026) — `lens-arxiv.md:55-68` — support the broader scope.
+- **Rollback.** If a legitimate lens intentionally quotes the envelope tag at line-start in a fenced block (no current evidence), narrow the regex to require start-of-file or restrict to a specific section header.
 
-**Verification.** Single-line prompt edit. No code paths affected. Next iter's scanner sees the live table name.
+### Patch 4: populate `duration_ms` at the three dispatch call sites
 
-**Rollback criteria.** None expected; revert only if a future migration renames the table back to `traces`.
+- **Problem.** `_trace_write_node_rich` at `bin/mini-ork-execute:300-358` composes the JSON payload without a `duration_ms` key; `lib/trace_store.sh:77` defaults missing keys to `0`; live data shows 13/15 cost-bearing rows have `duration_ms=0`. Recipe gate `recipes/recursive-self-improve/task_class.yaml:38-40` (`runtime_model.max_minutes: 60`) cannot be enforced. Carried from iter 1 and iter 2.
+- **Change.** At each of the 3 dispatch call sites in `bin/mini-ork-execute` (researcher / implementer / reviewer dispatch — see `lens-correctness.md:120`), capture `_t0=$(_now_ms)` before `llm_dispatch` and pass `$(( $(_now_ms) - _t0 ))` as a new positional arg to `_trace_write_node_rich`. Add `'duration_ms': int(sys.argv[N])` to the Python heredoc at `:315-354`. Implement `_now_ms` as `python3 -c 'import time; print(int(time.time()*1000))'` for macOS portability (one fork is acceptable here — perf-sensitive forking is the cost circuit handled by Patch 5, not this trace path).
+- **Regression test.** `tests/unit/test_trace_duration.sh`: stub a no-op node that sleeps ~200 ms; assert `SELECT duration_ms FROM execution_traces WHERE trace_id=?` returns a value in `[150, 600]`. Negative assertion after patch: `SELECT COUNT(*) FROM execution_traces WHERE cost_usd > 0 AND duration_ms = 0` returns 0 on a fresh run. Assertion text: `assert_within 150 600 "$dur" "duration_ms must reflect wall-clock"`.
+- **Verification.** Schema already accepts the column. Diff ~25-40 LoC. arXiv 2604.05119 (Pathak 2026), 2601.08815 (Ye 2026), 2604.23853 (Yuan 2026) — `lens-arxiv.md:7-28` — support telemetry-as-enforcement.
+- **Rollback.** If a `duration_ms` exceeds 24 h (clock skew), clamp to 0 and emit a stderr warning rather than block dispatch.
 
-### Patch 3: extend wrapper-pollution check to all durable lens artifacts
+### Patch 5: teach `no-regression` to actually gate on benchmark regression
 
-**Problem.** `recipes/recursive-self-improve/verifiers/bottlenecks-found.sh:48-50` rejects `<z-insight>` / `★ Insight` only in `$SYNTH`. This iteration's `lens-arch.md` and `lens-arxiv.md` (run-dir copies, written via stdout of the executor) contain full `<z-insight>` envelopes — the verifier passes them. Prior `self-improve-iter-1-20260609054721/lens-arch.md:10-55` shipped the same pollution. Integration test `tests/integration/test_recursive_self_improve_recipe.sh:148-166` only covers polluted `synthesis.md`.
-
-**Change.** In `bottlenecks-found.sh:48-50`, replace the single grep with a loop:
-```bash
-for _f in lens-bottleneck.md lens-perf.md lens-correctness.md lens-arch.md lens-arxiv.md synthesis.md; do
-  [ -f "$RUN_DIR/$_f" ] || continue
-  if grep -qE '^(<z-insight>|★ Insight)' "$RUN_DIR/$_f"; then
-    missing+=("$_f: leaked envelope")
-    pass=false
-  fi
-done
-```
-Anchor regex at line-start (`^`) to avoid false positives on quoted examples inside fenced code blocks.
-
-**Regression test.** Extend `tests/integration/test_recursive_self_improve_recipe.sh:148-166` with a fixture `lens-bottleneck.md` containing `<z-insight>` at line-start; assert verifier emits `{"pass": false, ...}` with the polluted file in `missing[]`. Reproduction R3 in `lens-correctness.md:82-106`.
-
-**Verification.** Verifier diff < 20 LoC. No external dependencies. Existing integration test continues to pass.
-
-**Rollback criteria.** If a legitimate lens intentionally quotes the envelope tag inside a fenced block (no current evidence), narrow regex to require the tag at start-of-file or constrain to a specific section header.
-
-### Patch 4: populate `duration_ms` for every node trace
-
-**Problem.** `_trace_write_node_rich` at `bin/mini-ork-execute:294-308` composes a JSON payload without a `duration_ms` field. `lib/trace_store.sh:76-77` defaults the missing key to 0. Live DB: 10 of 12 cost-bearing rows have `duration_ms=0` (e.g. `tr-implementer-1780986658-59964 cost_usd=1.43 duration_ms=0`). Recipe gate `recipes/recursive-self-improve/task_class.yaml:38` (`runtime_model.max_minutes: 60`) cannot be enforced.
-
-**Change.** Two equivalent options — pick (a) for the smaller diff:
-- (a) At each of the three dispatch call sites (`bin/mini-ork-execute:451,472,538`) capture `_t0` before `llm_dispatch` and pass `$(( $(_now_ms) - _t0 ))` as a new positional arg to `_trace_write_node_rich`. Add `'duration_ms': int(sys.argv[N])` to the python heredoc at `:294-308`. Implement `_now_ms` as `python3 -c 'import time; print(int(time.time()*1000))'` for macOS portability (one Python fork is acceptable here; the perf-sensitive path is the cost circuit, addressed by Patch 5).
-- (b) Stash `_started_at` in env at `_d021_set_status` (`bin/mini-ork-execute:321-339`) when the terminal status is set and read it back in `_trace_write_node_rich`. Cleaner separation but more env coupling.
-
-**Regression test.** New `tests/unit/test_trace_duration.sh`: stub a no-op node that sleeps ~200 ms, assert `SELECT duration_ms FROM execution_traces WHERE trace_id=?` returns a value in `[150, 600]`. Negative assertion: after the patch, `SELECT COUNT(*) FROM execution_traces WHERE cost_usd > 0 AND duration_ms = 0` returns 0 on a fresh run.
-
-**Verification.** Schema already accepts the column. Cost: ~10–15 LoC. Risk class low (additive). Enables future perf measurement (Patch 5's gain becomes observable) and the `task_class.yaml` runtime gate.
-
-**Rollback criteria.** If a `duration_ms` exceeds 24 h (clock skew / env contamination), clamp to 0 and emit a stderr warning rather than block dispatch.
-
-### Patch 5: TTL-bounded env cache for cost-circuit check
-
-**Problem.** `lib/llm-dispatch.sh:348-368` forks `python3` twice on every dispatch — one heredoc for `sqlite3` SUM, one for the float compare. The same file already implements the same anti-pattern fix for lane resolution at `:373-414`. At 100 dispatches/iter × ~25–50 ms/fork: ~3–5 s wasted per iteration.
-
-**Change.** Mirror `_MO_LANE_<UPPER>`: introduce `_MO_SPENT_TODAY` and `_MO_SPENT_CUTOFF` env vars keyed on `MINI_ORK_DB`, TTL 30–60 s, refreshed on miss. Fold the float compare into the same heredoc (Patch F3 from `lens-perf.md:169-191` is a strict subset of this).
-
-**Regression test.** `tests/perf/test_cost_circuit_cache.sh`: 10 `llm_dispatch` calls under `MO_DAILY_BUDGET_USD=50`, count `python3` invocations via `strace -e trace=execve -f` (or shell trace). Cold: 1. Cached: 0 for the read until TTL.
-
-**Verification.** Requires Patch 4 (`duration_ms`) to land first so the wall-time win is actually observable in `execution_traces`. Defer if not landed; keep on the rank list.
-
-**Rollback criteria.** Daily-budget overshoot above 1.5× (existing safety margin). If observed, drop TTL to 0 (effective disable) before reverting.
+- **Problem.** `recipes/recursive-self-improve/verifiers/no-regression.sh:38-60` computes `bench_summary` but the pass/fail decision at `:72-76` only checks shell-syntax failures and the implementer report outcome. A patch that drops `utility_score` by 50% still passes the verifier. Live `benchmark_results` data is stale synthetic (`br-wc-3a202-refactor-*` from 2026-06-02), so this is also a data-freshness sub-issue.
+- **Change.** After `bench_summary` is computed, look up the prior baseline `utility_score` for the same `task_class` from `benchmark_results`. If `utility_delta < -0.05` (configurable via `MO_BENCH_REGRESSION_TOL`), set `bench_delta_ok=0`. Fold it into the existing pass condition at `:72-76` as an additional AND term. Document the env knob in `recipes/recursive-self-improve/README.md` (or equivalent).
+- **Regression test.** Insert a synthetic benchmark row with `utility_score=0.5` against a baseline of `0.8`; assert verifier returns `pass=false` with `benchmark_regression=true` in the JSON. Assertion text: `assert_equal "true" "$benchmark_regression" "must fail on > 5% utility drop"`.
+- **Verification.** arXiv 2604.10547 (Chen 2026, Agent² RL-Bench) and 2604.00072 (Scrivens 2026, gates-vs-classifiers) — `lens-arxiv.md:79-92` — support converting observed deltas into hard gates.
+- **Rollback.** If benchmark noise causes >20% false-positive regressions on otherwise-clean runs, widen the tolerance to 0.10 or disable the gate behind `MO_BENCH_REGRESSION_TOL=999`.
 
 ## Convergence assessment
 
-**Not yet converged.** Iter 2 reproduces every iter-1 finding plus surfaces two architecture rows (substring synth routing, provider-policy split-brain) that the arch lens explicitly defers as "no new infra required this iteration." The most telling signal: `learning_record` has 1 deferred row and 0 resolved rows, and `pattern_records.frequency >= 2` is empty — the outer loop is not yet recording resolutions. Patches 1 and 2 from iter 1 did not land (grep confirms `_run_verifier_ref` absent from `bin/mini-ork-execute`; `bottleneck-scan.md:14` still says `traces`). The architecture lens's two candidates (`artifact_role` workflow field, `MINI_ORK_PROVIDER_POLICY` first-class env) are queued for a future iteration but are unranked here because Patch 1 is the binding constraint — until verifier verdicts are authoritative, no other patch can be reliably gated.
+**Not yet converged, but the binding signal has shifted.** Iter 2's Rank-1 patch (`_run_verifier_ref` JSON adapter) did land in code — `bin/mini-ork-execute:68-107` confirms it, and `tests/unit/test_verifier_ref_json.sh:61-64` is green. That is real progress: the outer loop produced a functioning patch for the first observable time across iters 1-2. However, the corresponding `learning_record.id=1` row is still `outcome=deferred`, and `docs/improvements/self-improve-latest.md:7,17-22` still describes the adapter as absent. Without state closure, every future scan re-ranks resolved work as if it were open, so the synthesizer cannot tell progress from drift — exactly what iter 2's convergence note warned about ("a second consecutive iteration where `learning_record.id=1` remains `deferred` as a hard escalation event").
 
-**Recommendation:** continue past iter 2. Re-evaluate convergence after Patches 1–3 have actually landed (one resolved `learning_record` row + one populated `pattern_records` row at frequency ≥ 2 would be the signal). The outer runner should treat a second consecutive iteration where `learning_record.id=1` remains `deferred` as a hard escalation event and refuse to advance until the JSON adapter lands.
+The remaining bottlenecks are also clustered into two persistent buckets that iter 1 and iter 2 already named:
+- **Bookkeeping / state-closure** (Patches 1, 2): trivially small, repeatedly missed because no one is enforcing closure.
+- **Telemetry / verifier scope** (Patches 3, 4, 5): each is < 50 LoC, each carries arXiv support, and the longer they stay open, the more they corrupt the very signal the outer loop depends on.
+
+`pattern_records.frequency >= 2` remains empty, so the loop has still never promoted a recurring pattern. Patch 1 should also restore the substrate for that promotion path (once one `learning_record` row reaches `resolved`, a second deferred-then-resolved row in a future iteration is the minimum needed to promote a pattern).
+
+**Recommendation:** continue past iter 3. The convergence trigger the outer loop should watch for is: `(a)` `learning_record.id=1.outcome='resolved'`, `(b)` iter-4 `lens-bottleneck.md` no longer ranks any of Patches 2-5 in its top 5, `(c)` at least one `pattern_records` row with `frequency >= 2`. Hitting all three is the earliest honest convergence signal; until then, more iterations are warranted.
 
 ## Provenance footer
 
 - Lenses consumed: minimax (`lens-perf.md`), kimi (`lens-correctness.md`), codex (`lens-arch.md`), arXiv (`lens-arxiv.md`), bottleneck scan (`lens-bottleneck.md`)
 - Synthesizer family: opus
-- arXiv papers cited: 7 (2603.18096, 2602.22302, 2604.23853, 2602.10133, 2602.13477, 2502.12630, 2601.06007); 2510.16276 cited as secondary
-- Cross-iteration learnings applied: 1 row from `learning_record` (id=1, deferred); 5 carried items from `self-improve-iter-1-20260609061529/synthesis.md` (verifier adapter, traces rename, duration_ms, wrapper pollution, cost-circuit cache)
+- arXiv papers cited: 10 unique IDs — 2604.05119, 2601.08815, 2604.23853 (Patch 4); 2605.17998, 2605.20312 (Patch 1); 2604.01350, 2605.16746 (Patch 3); 2604.10547, 2604.00072 (Patch 5); 2503.13577 (referenced for cross-cutting routing caution). All resolved in `lens-arxiv.md`; none invented.
+- Cross-iteration learnings applied: 1 row from `learning_record` (id=1, deferred — feeds Patch 1 directly). 0 rows from `pattern_records` (table currently has no `frequency >= 2` rows). Prior synthesis context consumed: `self-improve-iter-2-20260609064419/synthesis.md:7-15,100-140` (carried-patch identity and convergence framing) and `self-improve-iter-1-20260609061529/synthesis.md` for original framing of the verifier adapter.
