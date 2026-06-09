@@ -44,12 +44,25 @@ if [ -f "$SYNTH" ]; then
   # Count rows in the ranked patch table (lines starting with `| 1 ` … `| 5 `)
   ranked_rows=$(grep -cE '^\| *[1-5] +\|' "$SYNTH" 2>/dev/null || echo 0)
   echo "synthesis ranked_rows=$ranked_rows" >&3
-
-  # Reject polluted synthesis — leaked CLI / learning-mode envelopes
-  if grep -qE '^★ Insight ─|<z-insight>' "$SYNTH"; then
-    missing+=("synthesis.md contains leaked CLI envelope (★ Insight or <z-insight>)")
-  fi
 fi
+
+# Reject polluted artifacts — leaked CLI / learning-mode envelopes.
+# Iter-2's opus synth emitted a synthesis that correctly self-diagnosed
+# this exact bug as patch #3 (lens-arch.md + lens-arxiv.md also leak
+# <z-insight> blocks from researcher-agent runtime envelopes, not just
+# synthesis.md). Citing arXiv 2602.13477 (Naik 2026) +
+# 2502.12630 (Sternak 2025) on multi-agent prompt leakage — the loop's
+# first arxiv-grounded improvement. Applying the synth's proposed fix
+# while iter 3 is in flight so the verifier matches the contract opus
+# articulated.
+for _polluted in "$SCAN" "$SYNTH" "$ARXIV" \
+                 "$RUN_DIR/lens-perf.md" "$RUN_DIR/lens-correctness.md" \
+                 "$RUN_DIR/lens-arch.md"; do
+  [ -f "$_polluted" ] || continue
+  if grep -qE '^(★ Insight ─|<z-insight>)' "$_polluted"; then
+    missing+=("$(basename "$_polluted") contains leaked CLI envelope")
+  fi
+done
 
 # Pass condition: either converged, or we have all 3 artifacts AND >=1 ranked patch
 pass=0
