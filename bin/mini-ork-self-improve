@@ -91,7 +91,28 @@ MINI_ORK_DB="${MINI_ORK_DB:-$MINI_ORK_HOME/state.db}"
 export MINI_ORK_HOME MINI_ORK_DB
 
 mkdir -p "$MINI_ORK_HOME" "$MINI_ORK_HOME/worktrees" "$MINI_ORK_HOME/runs" \
-         "$MINI_ORK_HOME/config"
+         "$MINI_ORK_HOME/config" "$MINI_ORK_HOME/state"
+
+# Fix B (UI control plane): write session PID so the UI / operator can
+# target the outer loop directly without pgrep'ing per-iter task_run_ids.
+# The OUTER process (this script) isn't bound to any single iter, so
+# pgrep -f <task_run_id> never matches it. The trap removes the file on
+# normal exit, SIGINT (Ctrl-C), or SIGTERM (kill from UI / pkill).
+SESSION_PID_FILE="$MINI_ORK_HOME/state/.self-improve-session.pid"
+echo $$ > "$SESSION_PID_FILE"
+trap 'rm -f "$SESSION_PID_FILE" "$MINI_ORK_HOME/state/.self-improve-kill"' EXIT INT TERM
+echo "[info] session PID $$ → $SESSION_PID_FILE (kill -TERM \$(cat <path>) to stop the outer loop)"
+
+# Fix C (kill-flag poll path): the runner watches for this flag at each
+# iter boundary. The UI's kill endpoint (mini_ork/web/control.py:kill_run)
+# touches it when the user kills any self-improve-iter-* run, so a single
+# UI click halts the outer loop cleanly after current iter completes.
+#
+# Do NOT clear the flag at startup — a pre-existing flag means the
+# operator has explicitly asked for halt. Honour it as the very first
+# thing _iter_run does (the flag is consumed when honoured).
+SESSION_KILL_FLAG="$MINI_ORK_HOME/state/.self-improve-kill"
+export SESSION_KILL_FLAG
 
 # The recursive-self-improve recipe's success criteria live in the verifier
 # triple (bottlenecks-found / self-tests-pass / no-regression), NOT in the
@@ -274,6 +295,17 @@ _pre_iter_cost_check() {
 }
 
 _iter_run() {
+  # Fix C: kill-flag poll. UI's kill endpoint touches this when the user
+  # kills any self-improve-iter-*; honour it before any expensive work.
+  if [ -f "$SESSION_KILL_FLAG" ]; then
+    echo
+    echo "=============================================================="
+    echo "[kill-flag] $SESSION_KILL_FLAG present — UI requested outer-loop halt"
+    echo "=============================================================="
+    rm -f "$SESSION_KILL_FLAG"
+    return 2
+  fi
+
   # Pre-iter cost-cap pre-check before any worktree work.
   if _pre_iter_cost_check; then
     local _budget="${MO_DAILY_BUDGET_USD:-50}"
@@ -402,10 +434,28 @@ EOF
   # classify → plan → execute → verify. Driving mini-ork-execute
   # directly skips plan generation and immediately errors on
   # "Unknown flag: --recipe" (seen live on iter 1, rc=2).
-  ( cd "$wt_path" && \
+  #
+  # Fix A: write per-iter .pid file so the UI kill endpoint
+  # (mini_ork/web/control.py:kill_run → reads $RUN_DIR/.pid first) can
+  # SIGTERM the dispatch processes directly. Without this, the endpoint
+  # falls back to pgrep -f <task_run_id> which has stale-process-table
+  # failure modes.
+  local _iter_pid_file="$RUN_DIR/.pid"
+  (
+    cd "$wt_path" || exit 1
     timeout "${per_iter_budget}" "$MINI_ORK_ROOT/bin/mini-ork" \
         run recursive-self-improve "$RUN_DIR/kickoff.md" \
-        > "$exec_log" 2>&1 ) || exec_rc=$?
+        > "$exec_log" 2>&1 &
+    _timeout_pid=$!
+    # Persist BOTH the timeout wrapper PID and our own subshell PID so
+    # the kill endpoint signals the full local chain. Children of the
+    # `mini-ork run` invocation are discovered by mini_ork/web/control.py
+    # via pgrep -f <run_id> already, so this file just needs to anchor
+    # the timeout + subshell parents.
+    printf '%s %s\n' "$_timeout_pid" "$BASHPID" > "$_iter_pid_file"
+    wait "$_timeout_pid"
+  ) || exec_rc=$?
+  rm -f "$_iter_pid_file"
 
   # 4a. Post-dispatch throttle classification. Scan llm-failures/ for
   #     provider error signatures and update per-provider cool-down
@@ -449,11 +499,16 @@ EOF
   _read_verifier_inner() {
     local vname="$1"
     local jpath="$RUN_DIR/verifier-result-${vname}.json"
+    # If the verifier-result JSON is missing, the verifier did not complete —
+    # almost always because execute.log marked the node failed. Treat as
+    # pass=0, converged=0. Do NOT regenerate via dry-run: dry-run verifiers
+    # always emit pass=1, which would silently launder a real failure into
+    # outcome=success (caused the iter-33 bookkeeping inconsistency).
     if [ ! -f "$jpath" ]; then
-      MINI_ORK_DRY_RUN=1 bash "$MINI_ORK_ROOT/recipes/recursive-self-improve/verifiers/${vname}.sh" \
-        > "$jpath" 2>/dev/null || true
+      echo "0 0"
+      return
     fi
-    [ -f "$jpath" ] && python3 -c "import json,sys; d=json.load(open('$jpath')); print('1' if d.get('pass') else '0',('1' if d.get('converged') else '0'))" 2>/dev/null
+    python3 -c "import json,sys; d=json.load(open('$jpath')); print('1' if d.get('pass') else '0',('1' if d.get('converged') else '0'))" 2>/dev/null
   }
 
   read pass_bottle converged < <(_read_verifier_inner bottlenecks-found)
@@ -471,6 +526,13 @@ EOF
   echo "  [iter] verifiers: bottle=$pass_bottle tests=$pass_tests regression=$pass_reg converged=$converged exec_rc=$exec_rc"
 
   # 6. Decide outcome
+  # Hard precedence: a non-zero exit from `mini-ork run` (other than 124 =
+  # timeout) means execute had a node failure. Trust that signal over the
+  # verifier-result JSONs because failed-at-execute verifiers may never
+  # write their JSON, leaving stale or missing files that could fool the
+  # outcome decision. Without this, an execute-time verifier failure can
+  # be silently overridden when JSONs report pass (iter-33's bookkeeping
+  # bug — see ui WhyCard mismatch warning).
   local outcome="rejected" notes=""
   if [ "$converged" -eq 1 ]; then
     outcome="converged"
@@ -478,6 +540,9 @@ EOF
   elif [ "$exec_rc" -eq 124 ]; then
     outcome="timed_out"
     notes="per-iter-timeout"
+  elif [ "$exec_rc" -ne 0 ]; then
+    outcome="rejected"
+    notes="execute-rc=${exec_rc};verifier-bottle=${pass_bottle};verifier-tests=${pass_tests};verifier-reg=${pass_reg}"
   elif [ "$pass_bottle" = "1" ] && [ "$pass_tests" = "1" ] && [ "$pass_reg" = "1" ]; then
     outcome="success"
     notes="all-verifiers-pass"
