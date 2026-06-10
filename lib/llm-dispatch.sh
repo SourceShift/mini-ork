@@ -58,6 +58,28 @@ _mo_llm_write_duration_ms() {
   printf '%s\n' "$duration_ms" > "${MINI_ORK_RUN_DIR}/.last-llm-duration-ms" 2>/dev/null || true
 }
 
+# Redact API-key-shaped tokens from provider error strings before they hit
+# the llm_calls.error_message column or the operator's stderr. The column is
+# exposed via the read-only web API (mini_ork/web/agents.py:565), so an
+# unredacted 401 echo like "Invalid x-api-key: sk-ant-abc123…" would expose
+# partial credentials to any caller of /api/runs/<id>/llm-calls.
+#
+# Patterns cover the prefixes mini-ork providers actually use today:
+#   sk-ant-…, sk-or-…, sk-lf-…, sk-…  (Anthropic / OpenRouter / Langfuse / generic)
+#   Bearer <token>                     (HTTP header echoes from verbose curl)
+#   ANTHROPIC_AUTH_TOKEN=…/etc         (env dumps)
+#   32+ hex chars                      (GLM-style raw keys, cl_glm.sh:9)
+_mo_llm_redact_secrets() {
+  local s="${1:-}"
+  [ -z "$s" ] && { printf '%s' ""; return; }
+  printf '%s' "$s" | sed -E \
+    -e 's/sk-[a-zA-Z]{1,6}-[A-Za-z0-9_-]{8,}/[REDACTED_KEY]/g' \
+    -e 's/sk-[A-Za-z0-9_-]{20,}/[REDACTED_KEY]/g' \
+    -e 's/[Bb]earer[[:space:]]+[A-Za-z0-9_.+\/=-]{8,}/Bearer [REDACTED]/g' \
+    -e 's/(ANTHROPIC_(AUTH_TOKEN|API_KEY)|[A-Z_]+_API_KEY)=[^[:space:]"'"'"']+/\1=[REDACTED]/g' \
+    -e 's/[a-fA-F0-9]{32,}/[REDACTED_HEX]/g'
+}
+
 _mo_llm_write_llm_calls_row() {
   # Args (positional):
   #   1=provider 2=model_id 3=tier 4=feature_name 5=actor
@@ -1205,6 +1227,7 @@ PY
     _mo_llm_write_duration_ms 0
     local _error_message=""
     _error_message=$(tail -c 200 "$_err_file" 2>/dev/null || true)
+    _error_message=$(_mo_llm_redact_secrets "$_error_message")
     _mo_llm_write_llm_calls_row \
       "$(_mo_llm_provider_for_model "$model")" "$model" "${MO_LANE_TIER:-default}" \
       "mini-ork:${node_type:-unknown}" "${MO_LANE_ACTOR:-${node_type:-${USER:-unknown}}}" \
