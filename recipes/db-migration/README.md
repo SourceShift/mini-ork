@@ -97,6 +97,6 @@ into one stance:
 - Edge-case data is adversarial — what weird rows exist that nobody
   remembered → MiniMax at corner-case generation.
 
-These axes are nearly orthogonal — pairwise ρ across them is low by
-construction. That's exactly the Rajan 2025 precondition for multi-agent
-panels to actually catch what single-vendor misses.
+These axes are intended to be low-redundancy: each lens looks for a different
+class of migration risk. That follows the Rajan 2025 design lesson that
+multi-agent review helps when detector patterns are low-correlation.

@@ -1,24 +1,26 @@
 # Why mini-ork — heterogeneous-family multi-agent, by construction
 
 Most agentic frameworks ship multi-agent review and call it a day. mini-ork is
-designed around a different prior: **multi-agent review only works if the
-agents come from different model families.** Same-family coalitions don't
-average bias away — they amplify it.
+designed around a narrower prior: **multi-agent review needs low-correlation
+evidence channels, executable checks, and information boundaries.** Same-family
+coalitions are a common way to lose that independence. mini-ork therefore uses
+model-family diversity as an enforceable proxy, then relies on deterministic
+verifiers where the task allows it.
 
 This document captures the competitive position and the specific shapes
 that make mini-ork compose, not compete, with Claude Code, OpenAI Agents
 SDK, LangGraph, and the new dynamic-workflow agents.
 
-## The literature this rests on
+## Research signals behind the design
 
-| Paper | Finding |
+| Paper | Finding and design implication |
 |---|---|
-| Nasser 2026 ([arxiv:2601.05114](https://arxiv.org/abs/2601.05114)) | 9-judge eval, 3240 ratings, Krippendorff α = 0.042. Claude-Opus harshness −0.429, Gemini-3-Pro +0.262. Same-family validators amplify disposition rather than average it. |
-| Rajan 2025 ([arxiv:2511.16708](https://arxiv.org/abs/2511.16708)) | CodeX-Verify: multi-agent works submodularly **iff** pairwise ρ between voters is low (0.05–0.25). Heterogeneity isn't an optimization — it's the precondition for the proof. |
-| Karanam 2025 ([arxiv:2512.21352](https://arxiv.org/abs/2512.21352)) | GPT-4o + Gemini 2.5 Pro + Grok 2 three-round vote: each persona catches a different ~88% of bugs, ~12% overlap. |
-| Zietsman 2026 ([arxiv:2603.25773](https://arxiv.org/abs/2603.25773)) | AI-reviewing-AI without an executable specification is structurally circular. |
-| Shehata 2026 ([arxiv:2604.27274](https://arxiv.org/abs/2604.27274)) | Consensus Paradox: homogeneous agents prioritise internal agreement over external truth. |
-| Song 2026 ([arxiv:2603.21454](https://arxiv.org/abs/2603.21454)) | Repeating verification within one session **degrades** accuracy. Multi-turn review creates false positives faster than it catches errors. |
+| Nasser 2026 ([arxiv:2601.05114](https://arxiv.org/abs/2601.05114)) | 9-judge eval, 3240 ratings, Krippendorff α = 0.042. Claude-Opus harshness −0.429, Gemini-3-Pro +0.262. LLM judges are stable instruments with distinct evaluative dispositions, so judge choice is a methodological decision. |
+| Rajan 2025 ([arxiv:2511.16708](https://arxiv.org/abs/2511.16708)) | CodeX-Verify argues for specialized detectors with low redundancy: measured ρ = 0.05-0.25 and diminishing returns across 1-4 agents. mini-ork treats low correlation as the target; family diversity is the practical proxy it can enforce. |
+| Karanam 2025 ([arxiv:2512.21352](https://arxiv.org/abs/2512.21352)) | GPT-4o + Gemini 2.5 Pro + Grok 2 Vision committees improve beta-testing task success and bug-detection F1 over single-agent baselines. Persona-diversity analysis reports only roughly 12% of bugs found by more than one persona. |
+| Zietsman 2026 ([arxiv:2603.25773](https://arxiv.org/abs/2603.25773)) | Argues that AI-reviewing-AI without executable specifications is structurally circular. This supports verifier-first architecture and bounded model review. |
+| Shehata 2026 ([arxiv:2604.27274](https://arxiv.org/abs/2604.27274)) | Reports the Consensus Paradox: kinship-dominant swarms can prioritize internal agreement over external truth. Useful warning signal for same-family panels, not a universal theorem. |
+| Song 2026 ([arxiv:2603.21454](https://arxiv.org/abs/2603.21454)) | Supports session isolation and information restriction. Shared-context verifier chains can produce sycophantic confirmation; independent analytical contexts are the useful mechanism. |
 
 If you read one, read Nasser. The harshness table is the receipts.
 
