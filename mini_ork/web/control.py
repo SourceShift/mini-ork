@@ -13,6 +13,7 @@ browsers will let malicious pages issue POSTs to localhost otherwise.
 
 from __future__ import annotations
 
+import json
 import os
 import signal
 import time
@@ -170,6 +171,106 @@ def kill_run(home: Path, db: StateDB, task_run_id: str) -> dict[str, Any]:
             "; self-improve session kill-flag touched — outer loop will halt after current iter"
             if session_halted
             else ""
+        ),
+    }
+
+
+def get_profile(home: Path, task_run_id: str) -> dict[str, Any]:
+    """Read run_profile.json for a task_run — returns the planner's human_questions,
+    confidence score, and any existing answers (from profile-answers.json).
+
+    The UI uses this to drive the interactive Q&A panel: when a kickoff is
+    vague, the planner emits clarifying questions; the user answers; mini-ork
+    re-runs with answers injected into the kickoff context.
+    """
+    run_dir = _resolve_run_dir(home, task_run_id)
+    profile_path = run_dir / "run_profile.json"
+    answers_path = run_dir / "profile-answers.json"
+
+    profile: dict[str, Any] = {}
+    if profile_path.exists():
+        try:
+            profile = json.loads(profile_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            profile = {}
+
+    answers: dict[str, str] = {}
+    if answers_path.exists():
+        try:
+            answers = json.loads(answers_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            answers = {}
+
+    questions = profile.get("human_questions") or []
+    status = profile.get("profile_status", "")
+    return {
+        "task_run_id": task_run_id,
+        "profile_path": str(profile_path) if profile_path.exists() else None,
+        "answers_path": str(answers_path) if answers_path.exists() else None,
+        "profile_status": status,
+        "confidence": profile.get("confidence", 0.0),
+        "questions": questions,
+        "answers": answers,
+        "needs_answers": status == "needs_answers" and len(questions) > len(answers),
+    }
+
+
+def save_answers(
+    home: Path,
+    task_run_id: str,
+    answers: dict[str, str],
+) -> dict[str, Any]:
+    """Persist user answers + augment run_profile.json so a re-dispatch picks them up.
+
+    Writes two files:
+      - <run_dir>/profile-answers.json (the user-supplied map)
+      - <run_dir>/run_profile.json (merged: answers folded into profile,
+        profile_status flipped to 'ready' so the gate stops blocking)
+
+    Returns a dict with the recommended next-step CLI to continue the run.
+    """
+    run_dir = _resolve_run_dir(home, task_run_id)
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    # Persist raw answers
+    answers_path = run_dir / "profile-answers.json"
+    answers_path.write_text(json.dumps(answers, indent=2), encoding="utf-8")
+
+    # Merge into run_profile.json so the next planner invocation sees them
+    profile_path = run_dir / "run_profile.json"
+    profile: dict[str, Any] = {}
+    if profile_path.exists():
+        try:
+            profile = json.loads(profile_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            profile = {}
+
+    profile.setdefault("answers", {}).update(answers)
+    # Mark ready so MINI_ORK_PROFILE_GATE no longer blocks
+    profile["profile_status"] = "ready"
+    profile["confidence"] = max(float(profile.get("confidence", 0.0)), 0.9)
+    profile["human_questions"] = []  # Cleared — user has answered them
+    profile_path.write_text(json.dumps(profile, indent=2), encoding="utf-8")
+
+    # Find the kickoff so the suggested re-run command is exact
+    kickoff = run_dir / "kickoff.md"
+    suggest_cli = (
+        f"mini-ork run {profile.get('recipe', '<recipe>')} {kickoff}"
+        if kickoff.exists()
+        else f"mini-ork run <recipe> <kickoff.md>  # answers saved at {answers_path}"
+    )
+
+    return {
+        "ok": True,
+        "task_run_id": task_run_id,
+        "answers_saved": list(answers.keys()),
+        "answers_path": str(answers_path),
+        "profile_path": str(profile_path),
+        "profile_status": "ready",
+        "next_step_cli": suggest_cli,
+        "note": (
+            "answers persisted + run_profile.json updated; re-run the CLI to continue. "
+            "Future versions will auto-resume."
         ),
     }
 
