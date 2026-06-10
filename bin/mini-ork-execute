@@ -4,7 +4,8 @@
 #
 # Node types dispatched:
 #   planner      → already done (plan step) — skip
-#   researcher   → recipe's researcher prompt via context_assemble
+#   researcher   → recipe's researcher prompt + learned failure modes
+#                  (context_failure_modes_md from lib/context_assembler.sh)
 #   implementer  → recipe's implementer prompt; tracks files_written
 #   reviewer     → recipe's reviewer prompt; parses verdict
 #   verifier     → runs workflow verifier_ref or artifact_contract success verifiers
@@ -147,6 +148,24 @@ fi
 # ── parse plan ────────────────────────────────────────────────────────────────
 RUN_DIR="$(dirname "$PLAN_PATH")"
 
+# Derive + export MINI_ORK_TASK_RUN_ID so downstream subshells (the
+# llm-dispatch shim's per-turn emit + _mo_llm_write_llm_calls_row's
+# auto-derive fallback) can resolve task_runs.trace_id and embed it in
+# llm_calls.traceparent. Without this export the env var stayed empty
+# everywhere — the entire MO_TRACEPARENT chain silently no-op'd and
+# every llm_calls row landed with traceparent=NULL.
+export MINI_ORK_TASK_RUN_ID="${MINI_ORK_TASK_RUN_ID:-$(basename "$RUN_DIR")}"
+
+# Stop/kill control plane:
+#   .pid             — written here so the UI's /kill endpoint knows what to signal
+#   .stop-requested  — touched by the UI's /stop endpoint; checked in _dispatch_node
+# Both are best-effort artifacts; the dispatcher's behavior is unaffected if
+# the dir doesn't exist yet (we create it below).
+mkdir -p "$RUN_DIR" 2>/dev/null || true
+printf '%s\n' "$$" > "$RUN_DIR/.pid" 2>/dev/null || true
+# Clean .pid on graceful exit so a finished run isn't kill-target.
+trap 'rm -f "$RUN_DIR/.pid" 2>/dev/null || true' EXIT
+
 # D-031: propagate run dir to subagent subshells so claude `--print` calls
 # can find $MINI_ORK_RUN_DIR when writing lens-*.md / synthesis.md via Write
 # tool. Without this, subagents pick their own (often stale) run dir based
@@ -159,12 +178,17 @@ export MINI_ORK_RUN_DIR="$RUN_DIR"
 # _trace_write_node_rich below — populates execution_traces.tool_calls /
 # files_read (previously hardcoded []). Opt-out via MO_TRACE_RICH=0.
 export MO_TRACE_RICH="${MO_TRACE_RICH:-1}"
+# task_class resolution order: plan.json (stamped by mini-ork-plan) →
+# MINI_ORK_TASK_CLASS env (set by the run lifecycle) → generic. Older
+# plans lack the stamp, so the env fallback matters: without it the
+# learned-failure-mode injection queries the wrong class and finds nothing.
 TASK_CLASS=$(python3 -c "
 import sys, json
 with open(sys.argv[1]) as f:
     p = json.load(f)
-print(p.get('task_class', 'generic'))
-" "$PLAN_PATH" 2>/dev/null || echo "generic")
+print(p.get('task_class') or '')
+" "$PLAN_PATH" 2>/dev/null || echo "")
+TASK_CLASS="${TASK_CLASS:-${MINI_ORK_TASK_CLASS:-generic}}"
 
 # Extract nodes — D-008 fix: workflow.yaml.nodes[] is the authoritative DAG.
 # Falls back to plan.json.decomposition[] only when no workflow.yaml is set
@@ -238,6 +262,40 @@ TRACE_ID="tr-execute-$(date +%s)-$$"
 if [ "$DRY_RUN" -eq 0 ]; then
   _require_lib trace_store
   trace_write "{\"trace_id\":\"$TRACE_ID\",\"task_class\":\"${TASK_CLASS}\",\"status\":\"running\"}" >/dev/null 2>&1 || true
+
+  # Persist trace_id to task_runs so the observability UI can correlate
+  # mo_events / llm_calls / run_events back to this task_run. Without
+  # this update, the UI's "no trace_id" warning fires and the events +
+  # llm_calls tabs show nothing even when emitters fired.
+  # COALESCE preserves a trace_id classify already wrote (which it does —
+  # so the canonical trace_id is the classify one; we read it back below
+  # to build MO_TRACEPARENT so llm_calls.traceparent matches).
+  if [ -n "${MINI_ORK_TASK_RUN_ID:-}" ] && [ -f "${MINI_ORK_DB:-}" ]; then
+    python3 - "$MINI_ORK_DB" "$MINI_ORK_TASK_RUN_ID" "$TRACE_ID" <<'PY' 2>/dev/null || true
+import sqlite3, sys, time
+db, run_id, trace_id = sys.argv[1:4]
+con = sqlite3.connect(db, timeout=2.0)
+con.execute("PRAGMA busy_timeout = 2000")
+try:
+    con.execute(
+        "UPDATE task_runs SET trace_id = COALESCE(trace_id, ?), updated_at = ? WHERE id = ?",
+        (trace_id, int(time.time()), run_id),
+    )
+    con.commit()
+finally:
+    con.close()
+PY
+    # Read back the canonical task_runs.trace_id (may differ from our
+    # local $TRACE_ID if classify won the COALESCE) and export
+    # MO_TRACEPARENT so every llm_calls row written downstream embeds it.
+    # Without this, the UI's strict trace_id bridge misses all calls and
+    # falls back to time-window (which can leak neighbor-run rows).
+    _canonical_trace=$(sqlite3 "$MINI_ORK_DB" "SELECT COALESCE(trace_id,'') FROM task_runs WHERE id='${MINI_ORK_TASK_RUN_ID}' LIMIT 1;" 2>/dev/null)
+    if [ -n "$_canonical_trace" ]; then
+      export MO_TRACEPARENT="00-${_canonical_trace}-$(printf '%016x' $((RANDOM * RANDOM + $$)))-01"
+      echo "    trace:    $MO_TRACEPARENT"
+    fi
+  fi
 fi
 
 # ── dispatch mode resolution ──────────────────────────────────────────────────
@@ -403,6 +461,16 @@ _dispatch_node() {
   local node_id="$1" node_type="$2" node_desc="$3" node_prompt_ref="${4:-}" node_verifier_ref="${5:-}" node_model_lane="${6:-}"
   local dispatch_lane="${node_model_lane:-$node_type}"
 
+  # Cooperative stop check: UI's POST /api/v1/task-runs/{id}/stop touches
+  # this file. We bail BEFORE dispatching the next node so the current
+  # in-flight node (if any) finishes naturally — that's the difference
+  # between Stop (soft) and Kill (hard SIGKILL).
+  if [ -f "${MINI_ORK_RUN_DIR:-$RUN_DIR}/.stop-requested" ]; then
+    echo "  [stop] .stop-requested present — skipping node_id=${node_id}" >&2
+    FAIL_COUNT=$((${FAIL_COUNT:-0} + 1))
+    return 0
+  fi
+
   if [ -n "$FILTER_NODE_TYPE" ] && [ "$node_type" != "$FILTER_NODE_TYPE" ]; then
     return 0
   fi
@@ -425,6 +493,23 @@ _dispatch_node() {
 
   echo "==> dispatch node_id=${node_id} type=${node_type} model_lane=${dispatch_lane}"
 
+  # Observability: emit node_start event so the UI can color DAG nodes
+  # by running/done status. Best-effort — see lib/mo_node_events.sh.
+  # MINI_ORK_TASK_RUN_ID is preferred (real task_runs.id); fall back to
+  # the run-dir basename which encodes the same id for legacy entries.
+  local _mo_run_id="${MINI_ORK_TASK_RUN_ID:-$(basename "${MINI_ORK_RUN_DIR:-$RUN_DIR}")}"
+  local _mo_node_start_ms=0
+  if [ -f "$MINI_ORK_ROOT/lib/mo_node_events.sh" ]; then
+    # shellcheck disable=SC1091
+    source "$MINI_ORK_ROOT/lib/mo_node_events.sh"
+    _mo_node_start_ms=$(_mo_now_ms)
+    mo_node_start "$_mo_run_id" "$node_id" "$node_type" "$dispatch_lane" || true
+    # Trap RETURN catches every exit path — early `return 1` from a failed
+    # researcher/implementer/reviewer/verifier branch AND clean fall-through
+    # to esac. Without this, ~10 early-return paths silently drop node_end.
+    trap 'mo_node_emit_end_trap' RETURN
+  fi
+
   # Locate recipe prompt for this node.
   # D-030: prefer per-node `prompt_ref` from workflow.yaml (e.g. recipe's
   # `prompts/synthesis.md` for the synthesizer node), fall back to type-
@@ -446,6 +531,26 @@ _dispatch_node() {
   fi
 
   NODE_TRACE_ID="tr-${node_type}-$(date +%s)-$$"
+
+  # Learned-failure-mode injection: pull high-confidence gradients for this
+  # task_class (written by `mini-ork reflect`) into every LLM node prompt.
+  # Empty string when no learnings exist or lib is absent — append is safe.
+  # Opt-out: MO_INJECT_LEARNINGS=0.
+  local _learned_block=""
+  if [ "${MO_INJECT_LEARNINGS:-1}" = "1" ]; then
+    case "$node_type" in
+      researcher|implementer|reviewer)
+        if [ -f "$MINI_ORK_ROOT/lib/context_assembler.sh" ]; then
+          # shellcheck source=lib/context_assembler.sh
+          source "$MINI_ORK_ROOT/lib/context_assembler.sh"
+          if declare -f context_failure_modes_md >/dev/null 2>&1; then
+            _learned_block="$(context_failure_modes_md "${TASK_CLASS:-generic}" 5 || true)"
+            [ -n "$_learned_block" ] && _learned_block=$'\n\n'"${_learned_block}"$'\n'
+          fi
+        fi
+        ;;
+    esac
+  fi
 
   case "$node_type" in
     planner)
@@ -476,7 +581,11 @@ _dispatch_node() {
         _prepend=$'\n\n--- Recipe prompt (system context) ---\n'"$(cat "$PROMPT_FILE")"$'\n--- /recipe prompt ---\n\n'
       fi
       PLAN_CONTENT=$(cat "$PLAN_PATH")
-      PROMPT_CONTENT="${_prepend}Task: ${node_desc}\n\nPlan context:\n${PLAN_CONTENT}\n\nWrite your output to: ${CONTEXT_FILE}"
+      PROMPT_CONTENT="${_prepend}Task: ${node_desc}${_learned_block}\n\nPlan context:\n${PLAN_CONTENT}\n\nWrite your output to: ${CONTEXT_FILE}"
+      # MO_NODE_ID is the canonical recipe node name for UI attribution.
+      # llm_dispatch's --node-type maps to lane/family (not unique across
+      # nodes that share a lane); MO_NODE_ID disambiguates.
+      export MO_NODE_ID="$node_id"
       RESULT=$(llm_dispatch \
         --task-class "$TASK_CLASS" \
         --node-type "$dispatch_lane" \
@@ -513,7 +622,8 @@ _dispatch_node() {
       if [ -f "${PROMPT_FILE:-}" ]; then
         _prepend=$'\n\n--- Recipe prompt (system context) ---\n'"$(cat "$PROMPT_FILE")"$'\n--- /recipe prompt ---\n\n'
       fi
-      PROMPT_CONTENT="${_prepend}Implement: ${node_desc}\n\nPlan:\n${PLAN_CONTENT}"
+      PROMPT_CONTENT="${_prepend}Implement: ${node_desc}${_learned_block}\n\nPlan:\n${PLAN_CONTENT}"
+      export MO_NODE_ID="$node_id"
       RESULT=$(llm_dispatch \
         --task-class "$TASK_CLASS" \
         --node-type "$dispatch_lane" \
@@ -565,11 +675,12 @@ PY
       if [ "$_is_synth" -eq 1 ]; then
         # Synthesizer: write markdown to the recipe source artifact; no verdict
         # envelope.
-        PROMPT_CONTENT="${_prepend}Synthesize for: ${node_desc}\n\nPlan:\n${PLAN_CONTENT}\n\nWrite your synthesis to: ${REVIEW_FILE}"
+        PROMPT_CONTENT="${_prepend}Synthesize for: ${node_desc}${_learned_block}\n\nPlan:\n${PLAN_CONTENT}\n\nWrite your synthesis to: ${REVIEW_FILE}"
       else
         # Classic reviewer: verdict-JSON envelope expected.
-        PROMPT_CONTENT="${_prepend}Review the implementation for: ${node_desc}\n\nPlan:\n${PLAN_CONTENT}\n\nRespond with JSON: {\"verdict\": \"pass|fail|needs_revision\", \"notes\": []}"
+        PROMPT_CONTENT="${_prepend}Review the implementation for: ${node_desc}${_learned_block}\n\nPlan:\n${PLAN_CONTENT}\n\nRespond with JSON: {\"verdict\": \"pass|fail|needs_revision\", \"notes\": []}"
       fi
+      export MO_NODE_ID="$node_id"
       RESULT=$(llm_dispatch \
         --task-class "$TASK_CLASS" \
         --node-type "$dispatch_lane" \
@@ -842,6 +953,8 @@ Dispatched by mini-ork-execute publisher node (D-037 v0.2-pt9).
       echo "  [warn] unknown node_type=${node_type} for node_id=${node_id} — skipping"
       ;;
   esac
+  # node_end is emitted by the RETURN trap installed above — handles both
+  # clean fall-through and early-return paths uniformly.
 }
 
 # ── dispatch loop ─────────────────────────────────────────────────────────────
