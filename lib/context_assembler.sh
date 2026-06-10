@@ -85,14 +85,19 @@ con = sqlite3.connect(db)
 con.row_factory = sqlite3.Row
 
 # --- Prior similar runs from execution_traces ---------------------------
+# Exclude the CURRENT run's own traces (same guard as context_prior_runs_md)
+# — the plan trace written moments earlier is not "prior" memory.
+import os as _os
+cur_run = _os.environ.get("MINI_ORK_RUN_ID", "")
 prior_runs = []
 try:
     rows = con.execute("""
         SELECT trace_id, task_class, status, cost_usd, duration_ms, created_at
         FROM execution_traces
         WHERE task_class = ?
+          AND (? = '' OR run_id IS NULL OR run_id != ?)
         ORDER BY created_at DESC LIMIT 10
-    """, (task_class,)).fetchall()
+    """, (task_class, cur_run, cur_run)).fetchall()
     for r in rows:
         prior_runs.append({
             "cite": f"execution_traces/{r['trace_id']}",
