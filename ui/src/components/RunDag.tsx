@@ -1,9 +1,11 @@
 import { useEffect, useMemo, useState } from "react";
 import { useNavigate } from "@tanstack/react-router";
+import { Terminal } from "lucide-react";
 import {
   Background,
   Controls,
   Handle,
+  MarkerType,
   type Node,
   type Edge,
   Panel,
@@ -17,6 +19,7 @@ import { familyColor } from "@/lib/format";
 
 const NODE_W = 150;
 const NODE_H = 82;
+const LOBE_ICON_BASE = "https://unpkg.com/@lobehub/icons-static-svg@latest/icons";
 
 function layout(
   nodes: DagNode[],
@@ -70,8 +73,8 @@ function layout(
         y: d * (NODE_H + 54),
       },
       type: "ork",
-      sourcePosition: Position.Right,
-      targetPosition: Position.Left,
+      sourcePosition: Position.Bottom,
+      targetPosition: Position.Top,
       width: NODE_W,
       height: NODE_H,
     };
@@ -90,6 +93,12 @@ function layout(
         stroke: live ? STATUS_STYLE.running!.ring : "#242e35",
         strokeWidth: live ? 1.6 : 1.2,
         opacity: live ? 0.9 : 1,
+      },
+      markerEnd: {
+        type: MarkerType.ArrowClosed,
+        color: live ? STATUS_STYLE.running!.ring : "#242e35",
+        width: 16,
+        height: 16,
       },
       animated: live,
     };
@@ -150,11 +159,96 @@ function StatusBadge({ status, ring }: { status: string; ring: string }) {
   return null;
 }
 
+type RuntimeBadge =
+  | { kind: "llm"; label: string; provider: string; color: string }
+  | { kind: "bash"; label: string; color: string };
+
+function runtimeBadgeFor(node: DagNode, familyColorValue: string): RuntimeBadge {
+  if (isBashNode(node)) {
+    return { kind: "bash", label: "bash", color: "#38bdf8" };
+  }
+
+  const provider = lobeProviderFor(node.family, node.lane);
+  if (provider) {
+    return {
+      kind: "llm",
+      label: node.family ?? node.lane ?? provider,
+      provider,
+      color: familyColorValue,
+    };
+  }
+
+  return { kind: "bash", label: node.type || "system", color: "#64748b" };
+}
+
+function isBashNode(node: DagNode): boolean {
+  return Boolean(
+    node.verifier_ref ||
+      node.type === "verifier" ||
+      (!node.lane && ["publisher", "rollback"].includes(node.type)),
+  );
+}
+
+function lobeProviderFor(family?: string | null, lane?: string | null): string | null {
+  const raw = `${family ?? ""} ${lane ?? ""}`.toLowerCase();
+  if (["opus", "sonnet", "claude", "anthropic"].some((key) => raw.includes(key))) return "claude";
+  if (["codex", "openai", "gpt"].some((key) => raw.includes(key))) return "openai";
+  if (["glm", "zhipu", "zhi pu"].some((key) => raw.includes(key))) return "zhipu";
+  if (["kimi", "moonshot"].some((key) => raw.includes(key))) return "moonshot";
+  if (["minimax", "mini max"].some((key) => raw.includes(key))) return "minimax";
+  if (raw.includes("deepseek")) return "deepseek";
+  if (["gemini", "google"].some((key) => raw.includes(key))) return "gemini";
+  if (raw.includes("mistral")) return "mistral";
+  if (raw.includes("qwen")) return "qwen";
+  if (raw.includes("perplexity")) return "perplexity";
+  if (raw.includes("human")) return null;
+  return family ? family.toLowerCase().replace(/[^a-z0-9]+/g, "") : null;
+}
+
+function lobeIconUrl(provider: string): string {
+  return `${LOBE_ICON_BASE}/${provider}.svg`;
+}
+
+function RuntimeIconBadge({ badge, status }: { badge: RuntimeBadge; status: string }) {
+  const done = status === "done";
+  const style = { borderColor: badge.color, color: badge.color };
+  return (
+    <span
+      className={
+        done
+          ? "absolute right-1 top-[-2px] z-10 grid h-5 w-5 place-items-center text-[10px] font-bold"
+          : "absolute right-1 top-[-2px] z-10 grid h-5 w-5 place-items-center rounded-full border bg-[var(--bg)] text-[10px] font-bold shadow-[0_0_0_2px_var(--panel)]"
+      }
+      style={style}
+      title={badge.kind === "llm" ? `LLM provider: ${badge.label}` : "Bash / deterministic runner"}
+      aria-label={badge.kind === "llm" ? `LLM provider: ${badge.label}` : "Bash runner"}
+      data-testid="dag-node-runtime-icon"
+      data-runtime={badge.kind}
+      data-provider={badge.kind === "llm" ? badge.provider : "bash"}
+    >
+      {badge.kind === "llm" ? (
+        <span
+          className="h-3.5 w-3.5"
+          style={{
+            backgroundColor: badge.color,
+            WebkitMask: `url(${lobeIconUrl(badge.provider)}) center / contain no-repeat`,
+            mask: `url(${lobeIconUrl(badge.provider)}) center / contain no-repeat`,
+          }}
+          aria-hidden="true"
+        />
+      ) : (
+        <Terminal size={12} strokeWidth={2.4} aria-hidden="true" />
+      )}
+    </span>
+  );
+}
+
 function OrkNode({ data }: { data: { node: DagNode } }) {
   const n = data.node;
   const status = visualStatus(n);
   const s = STATUS_STYLE[status] ?? STATUS_STYLE.never_seen!;
   const family = n.family ? familyColor(n.family) : "#64748b";
+  const runtimeBadge = runtimeBadgeFor(n, family);
   const running = status === "running" || status === "startup";
   return (
     <div
@@ -169,7 +263,7 @@ function OrkNode({ data }: { data: { node: DagNode } }) {
         opacity: s.opacity,
       }}
     >
-      <Handle type="target" position={Position.Left} className="!bg-ink-500" />
+      <Handle type="target" position={Position.Top} className="!bg-ink-500" />
       <div className="relative flex flex-col items-center">
         {running && (
           <span
@@ -200,6 +294,7 @@ function OrkNode({ data }: { data: { node: DagNode } }) {
           <path d="M24.5 33.5 Q27 36 29.5 33.5" stroke={family} strokeWidth="1.4" fill="none" strokeLinecap="round" opacity="0.75" />
         </svg>
         <StatusBadge status={status} ring={s.ring} />
+        <RuntimeIconBadge badge={runtimeBadge} status={status} />
         <div className="mt-1 max-w-[140px] truncate text-center font-mono text-[10.5px] font-bold text-ink-200">
           {n.name}
         </div>
@@ -213,7 +308,7 @@ function OrkNode({ data }: { data: { node: DagNode } }) {
           ) : null}
         </div>
       </div>
-      <Handle type="source" position={Position.Right} className="!bg-ink-500" />
+      <Handle type="source" position={Position.Bottom} className="!bg-ink-500" />
     </div>
   );
 }
@@ -252,6 +347,9 @@ function Legend() {
       })}
       <span className="border-l border-[var(--hair)] pl-3 font-mono text-[9.5px] text-ink-500">
         glyph colour = model family
+      </span>
+      <span className="border-l border-[var(--hair)] pl-3 font-mono text-[9.5px] text-ink-500">
+        badge = LLM / bash
       </span>
     </div>
   );
