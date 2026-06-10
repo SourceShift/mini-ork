@@ -3,7 +3,9 @@
 # Classify → Plan → Execute → Verify → Reflect → Improve
 set -Eeuo pipefail
 
-MINI_ORK_ROOT="${MINI_ORK_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+# readlink -f: install.sh symlinks this script into ~/.local/bin — without
+# resolving the link, ROOT would become ~/.local and every subcommand exec fails.
+MINI_ORK_ROOT="${MINI_ORK_ROOT:-$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)}"
 export MINI_ORK_ROOT
 
 sub="${1:-help}"; shift || true
@@ -335,6 +337,14 @@ PY
     fi
 
     # ── verify ─────────────────────────────────────────────────────────────────
+    # MINI_ORK_RUN_DIR was set inside the mini-ork-execute subshell and never
+    # reached this process, so run-dir-relative verifiers (RUN_DIR defaults to
+    # '.') reported "lens-tiny.md missing at ./lens-tiny.md" against artifacts
+    # that exist — and evidence landed in the global runs/evidence/ instead of
+    # the run's own dir. Export the _run_dir already resolved above.
+    if [ -n "$_run_dir" ] && [ "$_run_dir" != "." ] && [ -d "$_run_dir" ]; then
+      export MINI_ORK_RUN_DIR="$_run_dir"
+    fi
     _verify_rc=0
     if [ -n "${MINI_ORK_ARTIFACT_PATH:-}" ]; then
       "$MINI_ORK_ROOT/bin/mini-ork-verify" "$MINI_ORK_ARTIFACT_PATH" || _verify_rc=$?
