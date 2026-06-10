@@ -438,12 +438,25 @@ PY
   fi
 fi
 
+# Capture dispatcher stderr to a per-run debug file so failures aren't opaque.
+# The previous shape (2>&1 merged into $PLAN_JSON_RAW + swallowed on failure)
+# left operators with no signal beyond "LLM dispatch failed" — a 9-min debug
+# loop in 2026-06-10 chasing why deepseek planner died at recipe-creator
+# maiden run motivated this. Honors MO_PLAN_DEBUG_LOG=0 to opt out.
+_plan_dispatch_err=""
+if [ "${MO_PLAN_DEBUG_LOG:-1}" != "0" ] && [ -n "${RUN_DIR:-}" ] && [ -d "$RUN_DIR" ]; then
+  _plan_dispatch_err="$RUN_DIR/plan-dispatch.err.log"
+fi
 PLAN_JSON_RAW=$(llm_dispatch \
   --task-class "$TASK_CLASS" \
   --node-type "planner" \
   --prompt-text "$PROMPT_TEXT" \
-  2>&1) || {
+  2> >([ -n "$_plan_dispatch_err" ] && tee "$_plan_dispatch_err" >&2 || cat >&2)) || {
   echo "LLM dispatch failed for planner node" >&2
+  if [ -n "$_plan_dispatch_err" ] && [ -s "$_plan_dispatch_err" ]; then
+    echo "  dispatch stderr (last 20 lines from $_plan_dispatch_err):" >&2
+    tail -20 "$_plan_dispatch_err" | sed 's/^/    /' >&2
+  fi
   trace_write "{\"trace_id\":\"$TRACE_ID\",\"task_class\":\"${TASK_CLASS}\",\"status\":\"failure\"}" >/dev/null 2>&1 || true
   # D-012: charge cost even on failure (LLM was called, money was spent).
   # Note: this counts as a billable attempt; the success-path increment in
