@@ -599,27 +599,52 @@ _d021_set_status() {
   [ -z "${MINI_ORK_DB:-}" ] && return 0
   [ -z "${MINI_ORK_RUN_ID:-}" ] && return 0
   [ ! -f "$MINI_ORK_DB" ] && return 0
+  # Status writes used to run with the default 5s lock timeout and a silent
+  # `2>/dev/null` swallow. Under concurrent runs the publisher's 'published'
+  # write could hit SQLITE_BUSY, vanish without trace, and the later
+  # post-loop 'reviewing' write would win — leaving successful runs stuck
+  # non-terminal forever. busy_timeout + retry + visible stderr fix that.
   python3 -c "
 import sqlite3, sys, time
-con = sqlite3.connect(sys.argv[1])
-con.execute('PRAGMA journal_mode=WAL')
 new_status = sys.argv[3]
 # Match the actual CHECK constraint in migration 0010_runs.sql:
 # status IN ('classified','planned','executing','verifying','reviewing',
 #            'published','rolled_back','failed')
 TERMINAL = {'published', 'rolled_back', 'failed'}
-try:
-    if new_status in TERMINAL:
-        con.execute(
-            'UPDATE task_runs SET status = ?, updated_at = ?, ended_at = COALESCE(ended_at, ?) WHERE id = ?',
-            (new_status, int(time.time()), int(time.time()), sys.argv[2])
-        )
-    else:
-        con.execute('UPDATE task_runs SET status = ?, updated_at = ? WHERE id = ?', (new_status, int(time.time()), sys.argv[2]))
-    con.commit()
-finally:
-    con.close()
-" "$MINI_ORK_DB" "$MINI_ORK_RUN_ID" "$_new_status" 2>/dev/null || true
+last_err = None
+for attempt in range(3):
+    try:
+        con = sqlite3.connect(sys.argv[1], timeout=15.0)
+        con.execute('PRAGMA busy_timeout = 15000')
+        con.execute('PRAGMA journal_mode=WAL')
+        try:
+            if new_status in TERMINAL:
+                now = int(time.time())
+                # Stamp duration_ms alongside ended_at — without it task_runs
+                # carried 0 forever and every wall-time metric read empty.
+                con.execute(
+                    'UPDATE task_runs SET status = ?, updated_at = ?, ended_at = COALESCE(ended_at, ?), '
+                    'duration_ms = CASE WHEN COALESCE(duration_ms, 0) = 0 '
+                    'THEN MAX(COALESCE(ended_at, ?) - created_at, 0) * 1000 '
+                    'ELSE duration_ms END '
+                    'WHERE id = ?',
+                    (new_status, now, now, now, sys.argv[2])
+                )
+            else:
+                con.execute('UPDATE task_runs SET status = ?, updated_at = ? WHERE id = ?', (new_status, int(time.time()), sys.argv[2]))
+            con.commit()
+            last_err = None
+            break
+        finally:
+            con.close()
+    except sqlite3.OperationalError as e:
+        last_err = e
+        time.sleep(0.5 * (attempt + 1))
+if last_err is not None:
+    print(f'[warn] _d021_set_status({new_status}) failed after retries: {last_err}', file=sys.stderr)
+    sys.exit(1)
+" "$MINI_ORK_DB" "$MINI_ORK_RUN_ID" "$_new_status" || \
+    echo "  [warn] status transition to '$_new_status' did not persist for ${MINI_ORK_RUN_ID}" >&2
 }
 
 # Source a lib without firing _dispatch_node's RETURN trap (bash runs RETURN
@@ -1370,7 +1395,8 @@ if [ "$DRY_RUN" -eq 0 ] && [ -f "$MINI_ORK_DB" ] && [ -n "${MINI_ORK_RUN_ID:-}" 
   python3 - "$MINI_ORK_DB" "$MINI_ORK_RUN_ID" <<'PY'
 import sqlite3, sys, time
 db, run_id = sys.argv[1], sys.argv[2]
-con = sqlite3.connect(db)
+con = sqlite3.connect(db, timeout=15.0)
+con.execute("PRAGMA busy_timeout = 15000")
 con.execute("PRAGMA journal_mode=WAL")
 try:
     con.execute("""
