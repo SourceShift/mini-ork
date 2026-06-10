@@ -1,11 +1,11 @@
-import { Link, Outlet, useRouterState } from "@tanstack/react-router";
-import { useQuery } from "@tanstack/react-query";
+import { Link, Outlet, useRouter, useRouterState } from "@tanstack/react-router";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import clsx from "clsx";
 import type React from "react";
-import { useState } from "react";
-import { Activity, BrainCircuit, ChevronDown, GitBranch, Network, Radio, Search, Telescope } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
+import { Activity, BrainCircuit, ChevronDown, FolderOpen, GitBranch, Network, Radio, Search, Telescope, X } from "lucide-react";
 
-import { api, type TaskRun } from "@/lib/api";
+import { api, getWorkspaceHome, setWorkspaceHome, type TaskRun } from "@/lib/api";
 import { formatCost } from "@/lib/format";
 
 const NAV = [
@@ -16,6 +16,27 @@ const NAV = [
 
 export function Shell() {
   const { location } = useRouterState();
+  const router = useRouter();
+
+  // Keep ?ws= pinned in the URL so reloads/deep links resolve to the right
+  // workspace. Router navigations strip unknown search params; re-append via
+  // replaceState (doesn't re-trigger the router). Subscribe to onResolved
+  // because the router commits the URL asynchronously — an effect keyed on
+  // location.href can run before window.location reflects the navigation.
+  useEffect(() => {
+    const sync = () => {
+      const ws = getWorkspaceHome();
+      const url = new URL(window.location.href);
+      const current = url.searchParams.get("ws");
+      if (ws === current || (!ws && current === null)) return;
+      if (ws) url.searchParams.set("ws", ws);
+      else url.searchParams.delete("ws");
+      window.history.replaceState(window.history.state, "", url);
+    };
+    sync();
+    return router.subscribe("onResolved", sync);
+  }, [router]);
+
   const { data: health } = useQuery({
     queryKey: ["health"],
     queryFn: api.health,
@@ -52,6 +73,7 @@ export function Shell() {
           </span>
           <span className="text-[9px] text-ink-500 -mt-3">v0.1</span>
         </div>
+        <ProjectSwitcher />
         <div className="ork-telemetry">
           <Tele label="in flight" value={executing} tone={executing ? "ok" : "default"} live={executing > 0} />
           <Tele label="spend total" value={formatCost(summary?.total_cost_usd)} tone="warn" />
@@ -135,6 +157,313 @@ export function Shell() {
         <span className="kbd">⌘K</span>
       </footer>
     </div>
+  );
+}
+
+function ProjectSwitcher() {
+  const qc = useQueryClient();
+  const router = useRouter();
+  const [open, setOpen] = useState(false);
+  const boxRef = useRef<HTMLDivElement>(null);
+
+  const { data } = useQuery({
+    queryKey: ["projects"],
+    queryFn: api.projects,
+    refetchInterval: 30_000,
+  });
+
+  const sw = useMutation({
+    mutationFn: (home: string) => api.switchProject(home),
+    onSuccess: (res) => {
+      setOpen(false);
+      // Pin the workspace client-side (header + ?ws= + localStorage), drop
+      // every cached query from the old project, and land on the fleet —
+      // run/agent pages from the previous workspace would 404 here.
+      setWorkspaceHome(res.active);
+      qc.clear();
+      // Stamp ?ws= here too: navigating "/"→"/" is a location no-op, so the
+      // Shell URL-keeper effect wouldn't fire.
+      const url = new URL(window.location.href);
+      url.searchParams.set("ws", res.active);
+      window.history.replaceState(window.history.state, "", url);
+      void router.navigate({ to: "/" });
+    },
+  });
+
+  const rm = useMutation({
+    mutationFn: (home: string) => api.removeProject(home),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["projects"] }),
+  });
+
+  useEffect(() => {
+    if (!open) return;
+    const onDown = (e: MouseEvent) => {
+      const t = e.target as Node;
+      // A polling re-render can swap the clicked row's DOM node before this
+      // document-level handler runs; a detached target is NOT an outside
+      // click — without this guard the dropdown closes on inner clicks.
+      if (!document.contains(t)) return;
+      if (boxRef.current && !boxRef.current.contains(t)) setOpen(false);
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setOpen(false);
+    };
+    document.addEventListener("mousedown", onDown);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onDown);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [open]);
+
+  const active = data?.projects.find((p) => p.active);
+
+  return (
+    <div ref={boxRef} className="relative" data-testid="project-switcher">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        className="flex items-center gap-1.5 rounded-[3px] border border-[var(--hair-2)] bg-[var(--bg)] px-2 py-1 text-[10.5px] font-mono text-ink-300 hover:border-[var(--cyan)]"
+        title={active?.home}
+        data-testid="project-switcher-toggle"
+      >
+        <FolderOpen size={12} />
+        <span className="max-w-[140px] truncate">{active?.name ?? "project"}</span>
+        <ChevronDown size={11} className={clsx("transition-transform", open && "rotate-180")} />
+      </button>
+      {open && (
+        <div className="absolute left-0 top-full z-50 mt-1 w-[340px] rounded-[3px] border border-[var(--hair-2)] bg-[var(--bg)] shadow-lg">
+          <div className="px-3 pt-2 pb-1 text-[9.5px] uppercase tracking-[0.18em] text-ink-500">Projects</div>
+          {(data?.projects ?? []).map((p) => (
+            <div
+              key={p.home}
+              className={clsx(
+                "group flex w-full items-center gap-2 px-3 py-1.5 text-[11px] hover:bg-white/[0.035]",
+                p.active ? "text-[var(--grn)]" : p.exists ? "text-ink-300" : "text-ink-600",
+              )}
+            >
+              <button
+                type="button"
+                disabled={p.active || !p.exists || sw.isPending}
+                onClick={() => sw.mutate(p.home)}
+                className="flex min-w-0 flex-1 items-center gap-2 text-left disabled:cursor-default"
+                title={p.active ? p.home : `open ${p.home}`}
+                data-testid={`project-row-${p.name}`}
+              >
+                <span
+                  className="h-1.5 w-1.5 shrink-0 rounded-full"
+                  style={{ background: p.active ? "var(--grn)" : p.exists ? "var(--tx-4)" : "var(--red)" }}
+                />
+                <span className="font-mono truncate">{p.name}</span>
+                <span className="ml-auto max-w-[150px] truncate text-[9.5px] text-ink-500">
+                  {p.exists ? p.home.replace(/\/\.mini-ork$/, "") : "missing state.db"}
+                </span>
+              </button>
+              {!p.active && (
+                <button
+                  type="button"
+                  onClick={() => rm.mutate(p.home)}
+                  className="invisible shrink-0 text-ink-600 hover:text-[var(--red)] group-hover:visible"
+                  title="remove from list (folder is untouched)"
+                >
+                  <X size={11} />
+                </button>
+              )}
+            </div>
+          ))}
+          <AddProjectForm
+            onAdd={() => qc.invalidateQueries({ queryKey: ["projects"] })}
+            onOpen={(home) => sw.mutate(home)}
+            switching={sw.isPending}
+            switchError={sw.isError ? (sw.error as Error).message : null}
+          />
+        </div>
+      )}
+    </div>
+  );
+}
+
+function AddProjectForm({
+  onAdd,
+  onOpen,
+  switching,
+  switchError,
+}: {
+  onAdd: () => void;
+  onOpen: (home: string) => void;
+  switching: boolean;
+  switchError: string | null;
+}) {
+  const qc = useQueryClient();
+  const [path, setPath] = useState("");
+  const [debounced, setDebounced] = useState("");
+  const [added, setAdded] = useState<string | null>(null);
+  const [browsing, setBrowsing] = useState(false);
+  const [browsePath, setBrowsePath] = useState<string | undefined>(undefined);
+
+  useEffect(() => {
+    const t = setTimeout(() => setDebounced(path.trim()), 350);
+    return () => clearTimeout(t);
+  }, [path]);
+
+  const { data: check, isFetching: checking } = useQuery({
+    queryKey: ["project-validate", debounced],
+    queryFn: () => api.validateProject(debounced),
+    enabled: debounced.length > 0,
+    staleTime: 5_000,
+  });
+
+  const { data: tree } = useQuery({
+    queryKey: ["project-browse", browsePath ?? "~"],
+    queryFn: () => api.browseDirs(browsePath),
+    enabled: browsing,
+    staleTime: 10_000,
+  });
+
+  const add = useMutation({
+    mutationFn: (home: string) => api.addProject(home),
+    onSuccess: (res) => {
+      setAdded(res.project.name);
+      qc.invalidateQueries({ queryKey: ["project-validate"] });
+      onAdd();
+    },
+  });
+
+  const pick = (p: string) => {
+    setPath(p);
+    setDebounced(p);
+    setAdded(null);
+    setBrowsing(false);
+  };
+
+  const valid = !!check?.ok && debounced.length > 0;
+  const showCheck = debounced.length > 0 && !checking;
+
+  return (
+    <form
+      className="border-t border-[var(--hair)] p-2 space-y-1.5"
+      data-testid="add-project-form"
+      onSubmit={(e) => {
+        e.preventDefault();
+        if (valid && check?.home) onOpen(check.home);
+      }}
+    >
+      <div className="text-[9.5px] uppercase tracking-[0.18em] text-ink-500">Add project</div>
+      <div className="flex gap-1.5">
+        <input
+          value={path}
+          onChange={(e) => {
+            setPath(e.target.value);
+            setAdded(null);
+          }}
+          placeholder="~/ps/researcher  — or browse →"
+          className={clsx(
+            "h-7 min-w-0 flex-1 rounded-[3px] border bg-[var(--bg)] px-2 text-[10.5px] font-mono text-ink-200 outline-none placeholder:text-ink-600",
+            showCheck && valid && "border-[var(--grn)]",
+            showCheck && !valid && "border-[var(--red)]",
+            (!showCheck || checking) && "border-[var(--hair-2)] focus:border-[var(--cyan)]",
+          )}
+          data-testid="add-project-input"
+        />
+        <button
+          type="button"
+          onClick={() => setBrowsing((v) => !v)}
+          className={clsx(
+            "flex h-7 w-7 shrink-0 items-center justify-center rounded-[3px] border text-ink-400 hover:border-[var(--cyan)]",
+            browsing ? "border-[var(--cyan)] text-[var(--cyan)]" : "border-[var(--hair-2)]",
+          )}
+          title="browse folders"
+          data-testid="browse-folders"
+        >
+          <FolderOpen size={13} />
+        </button>
+      </div>
+      {browsing && tree && (
+        <div className="rounded-[3px] border border-[var(--hair-2)]" data-testid="folder-browser">
+          <div className="flex items-center gap-1 border-b border-[var(--hair)] px-2 py-1">
+            <button
+              type="button"
+              disabled={!tree.parent}
+              onClick={() => setBrowsePath(tree.parent ?? undefined)}
+              className="kbd disabled:opacity-30"
+              title="up one level"
+            >
+              ..
+            </button>
+            <span className="min-w-0 flex-1 truncate font-mono text-[9.5px] text-ink-500" title={tree.path}>
+              {tree.path}
+            </span>
+            {tree.is_project && (
+              <button
+                type="button"
+                onClick={() => pick(tree.path)}
+                className="shrink-0 rounded-[3px] border border-[var(--grn)] px-1.5 text-[9.5px] uppercase text-[var(--grn)]"
+              >
+                use this
+              </button>
+            )}
+          </div>
+          <div className="max-h-[180px] overflow-auto thin">
+            {tree.dirs.map((d) => (
+              <div key={d.path} className="group flex items-center">
+                <button
+                  type="button"
+                  onClick={() => setBrowsePath(d.path)}
+                  className="flex min-w-0 flex-1 items-center gap-2 px-2 py-1 text-left text-[10.5px] hover:bg-white/[0.035]"
+                >
+                  <FolderOpen size={11} className={d.is_project ? "text-[var(--grn)]" : "text-ink-600"} />
+                  <span className={clsx("font-mono truncate", d.is_project ? "text-[var(--grn)]" : "text-ink-300")}>
+                    {d.name}
+                  </span>
+                </button>
+                {d.is_project && (
+                  <button
+                    type="button"
+                    onClick={() => pick(d.path)}
+                    className="invisible mr-2 shrink-0 rounded-[3px] border border-[var(--grn)] px-1.5 text-[9.5px] uppercase text-[var(--grn)] group-hover:visible"
+                    data-testid={`pick-${d.name}`}
+                  >
+                    select
+                  </button>
+                )}
+              </div>
+            ))}
+            {!tree.dirs.length && <div className="px-3 py-2 text-[10px] text-ink-600">no subfolders</div>}
+          </div>
+        </div>
+      )}
+      <div className="min-h-[14px] text-[10px]" data-testid="add-project-feedback">
+        {checking && <span className="text-ink-500">checking…</span>}
+        {showCheck && valid && (
+          <span className="text-[var(--grn)]">
+            ✓ {check?.name} — {check?.home}
+            {check?.registered ? " (already in list)" : ""}
+          </span>
+        )}
+        {showCheck && !valid && <span className="text-[var(--red)]">✗ {check?.error ?? "not a mini-ork folder"}</span>}
+        {!debounced && added && <span className="text-[var(--grn)]">✓ added {added}</span>}
+        {switchError && <span className="text-[var(--red)]"> {switchError}</span>}
+      </div>
+      <div className="flex gap-1.5">
+        <button
+          type="submit"
+          disabled={!valid || switching}
+          className="h-6 flex-1 rounded-[3px] border border-[var(--hair-2)] bg-white/[0.04] text-[10.5px] font-bold uppercase tracking-[0.08em] text-ink-200 hover:border-[var(--cyan)] disabled:opacity-40 disabled:hover:border-[var(--hair-2)]"
+          data-testid="add-open-project"
+        >
+          {switching ? "opening…" : "Add + open"}
+        </button>
+        <button
+          type="button"
+          disabled={!valid || !!check?.registered || add.isPending}
+          onClick={() => check?.home && add.mutate(check.home)}
+          className="h-6 flex-1 rounded-[3px] border border-[var(--hair-2)] text-[10.5px] uppercase tracking-[0.08em] text-ink-400 hover:border-[var(--cyan)] disabled:opacity-40 disabled:hover:border-[var(--hair-2)]"
+          data-testid="add-project"
+        >
+          Add to list
+        </button>
+      </div>
+    </form>
   );
 }
 
