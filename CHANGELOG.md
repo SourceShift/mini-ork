@@ -9,6 +9,12 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+No unreleased changes yet.
+
+---
+
+## [0.3.0-rc2] - 2026-06-10
+
 ### Added
 
 - Bounded recursive orchestration primitive: `mini-ork spawn` can approve and
@@ -19,9 +25,28 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Recursive validation coverage: integration, security, e2e, and live Python
   validation scenarios for parent -> child -> grandchild delegation without
   Anthropic-family provider calls.
+- CI release gates for README mechanical claim checks, ShellCheck, bash test
+  layers, Python web tests, UI typecheck/build, CodeQL, GitGuardian, and
+  dependency review.
+- Observability web smoke CI stage that exercises `make web-test`.
+
+### Fixed
+
+- UI typecheck in clean GitHub runners by adding explicit Node 20 type
+  declarations for `vite.config.ts`.
+- ShellCheck parsing of the optional-check comment in `tests/smoke.sh`.
+- Linux/GNU portability for empty plan discovery in `mini-ork-execute` and
+  `mini-ork-verify`.
+- Linux/macOS `stat` portability in the symlink-attack security test.
+- Dependency Review no longer keeps every PR red when GitHub Dependency graph is
+  unavailable; the workflow still runs the strict gate when the graph is
+  enabled.
 
 ### Verified
 
+- GitHub CI for PR #8: README claim check, ShellCheck, bash smoke/unit/
+  integration/e2e/security, Python 3.11/3.12, UI typecheck/build, web smoke,
+  CodeQL, GitGuardian, and Dependency Review all passed.
 - Full test pyramid: 60 files, 543 assertions, 0 failures.
 - Recursive focused tests: `test_bin_spawn.sh` 9 OK, recursive spawn security 3
   OK, recursive e2e 6 OK.
