@@ -344,6 +344,9 @@ JSON
 # ── trace end ─────────────────────────────────────────────────────────────────
 STATUS="success"
 [ "$VERDICT" = "fail" ] && STATUS="failure"
+# Migration 0019 widened the status CHECK so "nothing was checked" no
+# longer launders into success on the trace row.
+[ "$VERDICT" = "vacuous" ] && STATUS="vacuous"
 if [ "$DRY_RUN" -eq 0 ]; then
   trace_write "{\"trace_id\":\"$TRACE_ID\",\"task_class\":\"${TASK_CLASS}\",\"status\":\"${STATUS}\",\"verifier_output\":\"{\\\"verdict\\\":\\\"${VERDICT}\\\"}\"}" >/dev/null 2>&1 || true
 fi
