@@ -127,8 +127,8 @@ mini-ork serve
 # 3. Browse to http://127.0.0.1:7090
 ```
 
-The SPA bundle ships under `mini_ork/web/static/` after `pnpm --dir web build`.
-For dev with hot reload, run `pnpm --dir web dev` (Vite on :5173 proxies to :7090).
+The SPA bundle ships under `mini_ork/web/static/` after `pnpm --dir ui build`.
+For dev with hot reload, run `pnpm --dir ui dev` (Vite on :5173 proxies to :7090).
 Routes: `/` fleet, `/runs/:id` forensics, `/trajectory` convergence, `/fingerprint` coalition audit.
 
 ---
