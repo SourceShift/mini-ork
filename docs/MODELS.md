@@ -119,11 +119,25 @@ policy and stage it before running. `bin/mini-ork-self-improve` does this for
 
 ## Adding a Provider
 
+### Option 1: providers.yaml registry (no code, BYO keys)
+
+For any Anthropic or OpenAI-compatible endpoint, add an entry to
+`config/providers.yaml` with `kind`, `model`, `base_url`, and `api_key_env`
+(the NAME of an env var you export in
+`$MINI_ORK_HOME/config/secrets.local.sh` — template at
+`config/secrets.example.sh`). Then bind a lane to it in
+`.mini-ork/config/agents.yaml`. A `cl_<name>.sh` wrapper always takes
+precedence over a registry entry of the same name. See `docs/CONFIG.md` →
+"Bring-your-own providers" and `tests/test_provider_registry.sh`.
+
+### Option 2: cl_*.sh wrapper (custom CLI or env logic)
+
 1. Add a wrapper at `lib/providers/cl_<provider>.sh`.
 2. Make it read prompt input, call the external model, write the response to
    stdout, and return non-zero on failure.
 3. Add a lane binding in `.mini-ork/config/agents.yaml`.
-4. Add a smoke probe to the relevant provider-doctor or integration script.
+4. Add a smoke probe to the relevant provider-doctor or integration script
+   (`tests/test_providers_live.sh` covers the shipped lanes).
 
 The top-level recipes should not need to change when a provider is added; they
 should keep referring to lanes.

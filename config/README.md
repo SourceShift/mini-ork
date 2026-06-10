@@ -13,6 +13,8 @@ config/
     kimi.yaml
     minimax.yaml
     human.yaml
+  providers.yaml               # BYO provider registry (use your own API keys/endpoints)
+  secrets.example.sh           # Template → copy to .mini-ork/config/secrets.local.sh
   scope-patterns.yaml.example  # Template for per-project scope guards
   README.md                    # This file
 ```
@@ -136,9 +138,47 @@ The `model_arg` field (e.g., `--model claude-sonnet-4-6`) is passed verbatim to
 
 ---
 
+## BYO providers (`providers.yaml`)
+
+The fastest way to use your own API keys — no wrapper script required.
+Declare the endpoint in `config/providers.yaml`, put the key in
+`$MINI_ORK_HOME/config/secrets.local.sh` (copy `config/secrets.example.sh`),
+and point a lane at the entry:
+
+```yaml
+# config/providers.yaml
+providers:
+  openai_api:
+    kind: openai-compat        # routed through the codex CLI
+    family: openai
+    model: gpt-5.2-codex
+    base_url: https://api.openai.com/v1
+    api_key_env: OPENAI_API_KEY   # NAME of the env var, never the key itself
+```
+
+```yaml
+# config/agents.yaml
+lanes:
+  implementer: openai_api
+```
+
+Kinds: `anthropic-native` (claude CLI + your `ANTHROPIC_API_KEY` or ambient
+login), `anthropic-compat` (claude CLI → gateway via `base_url`),
+`openai-compat` (codex CLI → any /v1 endpoint), `executable` (your own
+script). Precedence: a `lib/providers/cl_<name>.sh` wrapper always wins over
+a registry entry of the same name. Full schema + examples in
+`config/providers.yaml`; regression suite: `tests/test_provider_registry.sh`.
+
+---
+
 ## Adding a new provider
 
-1. Create `agents/<model-id>.yaml` following the schema above.
-2. Add an `env_script` at `$HOME/ps/scripts/cl_<model-id>.sh`.
+For most cases, add a `providers.yaml` entry (above) — done. Write a wrapper
+only when the provider needs custom CLI invocation or env logic:
+
+1. Add a wrapper at `lib/providers/cl_<model-id>.sh` (sourceable env-export
+   for Anthropic-compatible endpoints, or executable honoring
+   `<script> --print --output-format text "<prompt>"`).
+2. Create `agents/<model-id>.yaml` following the schema above.
 3. Add the model to `agents.yaml` lanes if you want it as a default.
 4. Add any new capability tags to this README.
