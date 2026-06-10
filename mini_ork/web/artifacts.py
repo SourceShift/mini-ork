@@ -76,13 +76,25 @@ def read_artifact(home: Path, run_id: str, relpath: str) -> dict[str, Any]:
         raise FileNotFoundError(relpath)
     size = target.stat().st_size
     if size > MAX_BYTES:
+        kind = _classify(target.name)
+        if kind == "log":
+            # Logs fail at the end (test summaries, tracebacks) — serve the
+            # tail instead of refusing the whole file.
+            with target.open("rb") as f:
+                f.seek(size - MAX_BYTES)
+                tail = f.read().decode("utf-8", errors="replace")
+            # Drop the partial first line left by the byte-offset seek.
+            tail = tail.split("\n", 1)[-1]
+            content = f"[showing last {MAX_BYTES} of {size} bytes]\n{tail}"
+        else:
+            content = f"[file too large: {size} bytes; max {MAX_BYTES}]"
         return {
             "name": target.name,
             "relpath": relpath,
             "size": size,
             "truncated": True,
-            "content": f"[file too large: {size} bytes; max {MAX_BYTES}]",
-            "kind": _classify(target.name),
+            "content": content,
+            "kind": kind,
         }
     try:
         content = target.read_text(encoding="utf-8")
