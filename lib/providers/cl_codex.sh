@@ -66,6 +66,31 @@ if ! command -v codex >/dev/null 2>&1; then
   exit 3
 fi
 
+# BYO OpenAI-compatible endpoint (providers.yaml registry contract).
+# When lib/llm-dispatch.sh routes an `openai-compat` registry entry through
+# this wrapper it exports:
+#   MO_OAI_MODEL    → model id to request (`-m`)
+#   MO_OAI_BASE_URL → OpenAI-compatible /v1 endpoint
+#   MO_OAI_ENV_KEY  → NAME of the env var holding the API key (codex reads
+#                     it itself via model_providers.<id>.env_key — the key
+#                     value never appears on the command line)
+# Without these vars the wrapper keeps its default behavior: ambient
+# `codex login` auth + the operator's ~/.codex/config.toml model.
+_CODEX_BYO_FLAGS=()
+if [ -n "${MO_OAI_BASE_URL:-}" ] && [ -n "${MO_OAI_ENV_KEY:-}" ]; then
+  if [ -z "${!MO_OAI_ENV_KEY:-}" ]; then
+    echo "[cl_codex] \$$MO_OAI_ENV_KEY is empty — set it in secrets.local.sh or the environment" >&2
+    exit 5
+  fi
+  _CODEX_BYO_FLAGS+=(
+    -c "model_providers.mini_ork={ name = \"mini-ork BYO\", base_url = \"$MO_OAI_BASE_URL\", env_key = \"$MO_OAI_ENV_KEY\", wire_api = \"chat\" }"
+    -c "model_provider=mini_ork"
+  )
+fi
+if [ -n "${MO_OAI_MODEL:-}" ]; then
+  _CODEX_BYO_FLAGS+=(-m "$MO_OAI_MODEL")
+fi
+
 # Invoke codex exec. The `--skip-git-repo-check` flag avoids the prompt
 # that codex emits when not in a git repo; we may run from /tmp / .mini-ork/runs/.
 # `--output-last-message` gives mini-ork the assistant body instead of the
@@ -78,6 +103,7 @@ RAW_OUT=$(codex exec \
   --skip-git-repo-check \
   --sandbox "$_CODEX_SANDBOX" \
   --output-last-message "$_CODEX_LAST_MESSAGE" \
+  ${_CODEX_BYO_FLAGS[@]+"${_CODEX_BYO_FLAGS[@]}"} \
   "$PROMPT" 2>&1) || {
   echo "[cl_codex] codex exec failed with rc=$? — see stderr for cause" >&2
   echo "$RAW_OUT" >&2
