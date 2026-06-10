@@ -169,6 +169,110 @@ _mo_llm_provider_for_model() {
   esac
 }
 
+# Strip session-protocol blocks that dispatched CLIs inherit from the
+# OPERATOR's global agent config (~/.claude/CLAUDE.md and similar) and emit
+# into their deliverable output. Observed (D-016 family, run-1781095892-69202):
+# codex implementer appended a <z-insight>{...}</z-insight> block after its
+# JSON envelope — downstream parsers and the UI transcript both showed it.
+# The plan-side balanced-brace extractor tolerates it; everything else
+# shouldn't have to. Sanitize at the dispatch boundary so every consumer
+# (envelope parsers, transcripts, run artifacts) sees the assistant body only.
+_mo_llm_strip_protocol_blocks() {
+  local out_file="${1:?out_file required}"
+  [ -f "$out_file" ] || return 0
+  grep -q '<z-insight>' "$out_file" 2>/dev/null || return 0
+  python3 - "$out_file" <<'PY' 2>/dev/null || true
+import re, sys
+path = sys.argv[1]
+with open(path, encoding="utf-8", errors="replace") as f:
+    text = f.read()
+cleaned = re.sub(r"<z-insight>.*?</z-insight>", "", text, flags=re.S)
+# Unterminated block (output truncated mid-emission): drop the tail.
+cleaned = re.sub(r"<z-insight>.*\Z", "", cleaned, flags=re.S)
+if cleaned != text:
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(cleaned.rstrip() + "\n")
+PY
+}
+
+# Transcript writer for executable lanes (cl_codex.sh / cl_gemini.sh).
+# Merges the wrapper's MO_TURNS_FILE sidecar (real per-turn token usage from
+# codex --json turn.completed events) with the final output text, so the UI
+# shows real tokens instead of the zero-token "text-output fallback" card.
+# Falls back to _mo_llm_write_text_transcript when no sidecar was produced.
+# (Bug observed run-1781095892-69202: llm_calls had 77020 in / 1143 out from
+# the sidecar, but the transcript carried zeros — two consumers, one wired.)
+_mo_llm_write_exec_transcript() {
+  local out_file="${1:?out_file required}"
+  local model="${2:-unknown}"
+  [ -f "$out_file" ] || return 0
+  [ -f "${out_file}.transcript.json" ] && return 0
+  if [ ! -s "${out_file}.turns.jsonl" ]; then
+    _mo_llm_write_text_transcript "$out_file" "$model"
+    return 0
+  fi
+
+  python3 - "$out_file" "$model" <<'PY' 2>/dev/null || _mo_llm_write_text_transcript "$out_file" "$model"
+import json
+import os
+import sys
+
+out_path, model = sys.argv[1:3]
+max_bytes = int(os.environ.get("MO_MAX_TRANSCRIPT_BYTES", "1048576"))
+turns = []
+total_in = total_out = 0
+with open(out_path + ".turns.jsonl", encoding="utf-8") as f:
+    for line in f:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            t = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        t_in = int(t.get("input_tokens") or 0)
+        t_out = int(t.get("output_tokens") or 0)
+        total_in += t_in
+        total_out += t_out
+        turns.append({
+            "turn_index": len(turns),
+            "model": t.get("model") or model,
+            "input_tokens": t_in,
+            "output_tokens": t_out,
+            "text": t.get("text") or "",
+            "tool_uses": t.get("tool_uses") or [],
+            "cache_read_input_tokens": int(t.get("cache_read_input_tokens") or 0),
+            "cache_creation_input_tokens": int(t.get("cache_creation_input_tokens") or 0),
+            "stop_reason": t.get("stop_reason"),
+            "session_id": t.get("session_id"),
+        })
+if not turns:
+    sys.exit(1)  # caller falls back to the plain-text writer
+
+# Wrappers emit usage-only turn lines; the assistant body lives in out_file.
+# Attach it to the LAST turn (codex exec surfaces the final agent_message).
+try:
+    with open(out_path, encoding="utf-8", errors="replace") as f:
+        text = f.read(max_bytes + 1)
+except OSError:
+    text = ""
+truncated = len(text.encode("utf-8", errors="replace")) > max_bytes
+if truncated:
+    text = text[: max(200, max_bytes // 4)] + "\n...[truncated]"
+if text and not turns[-1]["text"]:
+    turns[-1]["text"] = text
+
+payload = {
+    "turns": turns,
+    "totals": {"input_tokens": total_in, "output_tokens": total_out},
+}
+if truncated:
+    payload["truncated"] = True
+with open(out_path + ".transcript.json", "w", encoding="utf-8") as f:
+    json.dump(payload, f)
+PY
+}
+
 _mo_llm_write_text_transcript() {
   local out_file="${1:?out_file required}"
   local model="${2:-unknown}"
@@ -448,11 +552,17 @@ mo_llm_dispatch() {
           ;;
       esac
     fi
+    # Sidecar contract: wrappers that can harvest token usage (cl_codex.sh
+    # parses codex --json turn.completed events) write the same sidecar
+    # shapes the claude stream-json path produces, so the envelope/per-turn
+    # ledger emission below works identically for executable lanes.
     if [[ -n "$TIMEOUT_CMD" ]]; then
       (
         set +u
         [[ -f "$secrets" ]] && source "$secrets" 2>/dev/null || true
         for _kv in "${_exec_env[@]}"; do export "$_kv"; done
+        export MO_USAGE_FILE="${out_file}.tokens" MO_TURNS_FILE="${out_file}.turns.jsonl" \
+               MO_COST_FILE="${out_file}.cost"
         "$TIMEOUT_CMD" --kill-after=60 "$timeout_s" \
           "$_exec_bin" --print --output-format text "$prompt"
       ) > "$out_file" 2>"$err_log" || return $?
@@ -461,10 +571,13 @@ mo_llm_dispatch() {
         set +u
         [[ -f "$secrets" ]] && source "$secrets" 2>/dev/null || true
         for _kv in "${_exec_env[@]}"; do export "$_kv"; done
+        export MO_USAGE_FILE="${out_file}.tokens" MO_TURNS_FILE="${out_file}.turns.jsonl" \
+               MO_COST_FILE="${out_file}.cost"
         "$_exec_bin" --print --output-format text "$prompt"
       ) > "$out_file" 2>"$err_log" || return $?
     fi
-    _mo_llm_write_text_transcript "$out_file" "$model"
+    _mo_llm_strip_protocol_blocks "$out_file"
+    _mo_llm_write_exec_transcript "$out_file" "$model"
   else
     # Sourceable env-export: must run claude in subshell with cl_*.sh sourced
 
@@ -660,6 +773,22 @@ if is_error_flag:
         ef.write(f"result: {result_text or 'no error message'}\n")
     sys.exit(3)
 
+# Strip operator-session protocol blocks (z-insight) that the spawned CLI
+# inherited from the operator's global agent config — same sanitizer as
+# _mo_llm_strip_protocol_blocks, applied before any consumer sees the text.
+import re as _re
+def _strip_protocol(s):
+    if not s or '<z-insight>' not in s:
+        return s
+    s = _re.sub(r'<z-insight>.*?</z-insight>', '', s, flags=_re.S)
+    s = _re.sub(r'<z-insight>.*\Z', '', s, flags=_re.S)
+    return s.rstrip()
+
+result_text = _strip_protocol(result_text)
+for _t in turns:
+    if _t.get('text'):
+        _t['text'] = _strip_protocol(_t['text'])
+
 with open(out_path, 'w') as f:
     f.write((result_text or '') + ('\n' if result_text and not result_text.endswith('\n') else ''))
 with open(out_path + '.cost', 'w') as f:
@@ -781,9 +910,11 @@ PY
       jq -r '"\(.usage.input_tokens // 0)\t\(.usage.output_tokens // 0)"' \
         "$_raw_out" > "${out_file}.tokens" 2>/dev/null || true
       rm -f "$_raw_out"
+      _mo_llm_strip_protocol_blocks "$out_file"
       _mo_llm_write_text_transcript "$out_file" "$model"
     else
       mv "$_raw_out" "$out_file"
+      _mo_llm_strip_protocol_blocks "$out_file"
       _mo_llm_write_text_transcript "$out_file" "$model"
     fi
   fi
