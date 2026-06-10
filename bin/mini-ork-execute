@@ -288,6 +288,73 @@ print(p.get('task_class') or '')
 " "$PLAN_PATH" 2>/dev/null || echo "")
 TASK_CLASS="${TASK_CLASS:-${MINI_ORK_TASK_CLASS:-generic}}"
 
+# ── pre-dispatch plan gate ────────────────────────────────────────────────────
+# Refuse to dispatch a plan the planner already declared blocked. Observed
+# run-1781095892-69202: plan_status=needs_answers + empty decomposition, yet
+# the workflow DAG dispatched anyway — a 34s codex implementer call burned to
+# re-discover what plan.json already said. The plan-side gate
+# (bin/mini-ork-plan MINI_ORK_PROFILE_GATE) stops interactive flows; this is
+# the execute-side defense for callers that chain plan→execute unconditionally.
+# Opt out via MINI_ORK_EXECUTE_GATE=0 (mirrors the plan-side env contract).
+if [ "${MINI_ORK_EXECUTE_GATE:-1}" = "1" ] && [ "$DRY_RUN" -eq 0 ]; then
+  _gate_info=$(python3 - "$PLAN_PATH" <<'PY' 2>/dev/null || true
+import json, sys
+with open(sys.argv[1]) as f:
+    p = json.load(f)
+status = p.get("plan_status") or ""
+if status == "needs_answers":
+    print(json.dumps({
+        "plan_status": status,
+        "blocked_by": p.get("blocked_by") or "unknown",
+        "human_questions": p.get("human_questions") or [],
+    }))
+PY
+)
+  if [ -n "$_gate_info" ]; then
+    echo "[blocked] plan_status=needs_answers — refusing to dispatch (MINI_ORK_EXECUTE_GATE=0 to override)"
+    printf '%s\n' "$_gate_info" | python3 -c "
+import json, sys
+g = json.load(sys.stdin)
+print(f\"  blocked_by: {g['blocked_by']}\")
+for q in g.get('human_questions') or []:
+    print(f'  question: {q}')
+" 2>/dev/null || true
+    printf '%s\n' "$_gate_info" > "$RUN_DIR/blocked.json" 2>/dev/null || true
+    # Terminal status BEFORE exit so _mo_crash_finalize doesn't stamp
+    # verdict=CRASH over an orderly refusal.
+    if [ -n "${MINI_ORK_DB:-}" ] && [ -f "$MINI_ORK_DB" ] && [ -n "${MINI_ORK_RUN_ID:-${MINI_ORK_TASK_RUN_ID:-}}" ]; then
+      GATE_INFO="$_gate_info" python3 - "$MINI_ORK_DB" "${MINI_ORK_RUN_ID:-$MINI_ORK_TASK_RUN_ID}" <<'PY' 2>/dev/null || true
+import json, os, sqlite3, sys, time
+db, run_id = sys.argv[1:3]
+now = int(time.time())
+con = sqlite3.connect(db, timeout=5.0)
+con.execute("PRAGMA busy_timeout = 5000")
+try:
+    con.execute(
+        """
+        UPDATE task_runs
+           SET status = 'failed',
+               verdict = COALESCE(verdict, 'BLOCKED'),
+               updated_at = ?, ended_at = COALESCE(ended_at, ?),
+               notes = COALESCE(notes || '; ', '') || 'execute gate: plan_status=needs_answers — nothing dispatched'
+         WHERE id = ? AND status NOT IN ('published', 'rolled_back', 'failed')
+        """,
+        (now, now, run_id),
+    )
+    con.execute(
+        "INSERT INTO run_events(event_id, run_id, event_type, payload_json, created_at) VALUES (?, ?, ?, ?, ?)",
+        (f"evt-execute_blocked-{now}", run_id, "execute_blocked",
+         os.environ.get("GATE_INFO", "{}"), now),
+    )
+    con.commit()
+finally:
+    con.close()
+PY
+    fi
+    exit 6
+  fi
+fi
+
 # Extract nodes — D-008 fix: workflow.yaml.nodes[] is the authoritative DAG.
 # Falls back to plan.json.decomposition[] only when no workflow.yaml is set
 # (e.g. ad-hoc runs without a recipe).
