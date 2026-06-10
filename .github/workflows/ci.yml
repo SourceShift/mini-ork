@@ -11,6 +11,16 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  readme-claim-check:
+    name: readme claim check
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run README mechanical claim check
+        run: bash scripts/readme-claim-check.sh
+
   shellcheck:
     name: shellcheck
     runs-on: ubuntu-latest
@@ -142,3 +152,31 @@ jobs:
       - name: Build SPA
         working-directory: ui
         run: pnpm build
+
+  web-smoke:
+    name: web smoke tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install runtime deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y sqlite3 jq
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install package + web test deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[yaml]"
+          pip install pytest fastapi uvicorn
+
+      - name: Bootstrap state.db
+        run: ./bin/mini-ork init
+
+      - name: Run observability web smoke suite
+        run: make web-test
