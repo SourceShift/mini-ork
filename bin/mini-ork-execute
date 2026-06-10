@@ -586,27 +586,28 @@ _dispatch_node() {
       # llm_dispatch's --node-type maps to lane/family (not unique across
       # nodes that share a lane); MO_NODE_ID disambiguates.
       export MO_NODE_ID="$node_id"
+      local _dispatch_marker="$RUN_DIR/.dispatch-marker-${node_id}"
+      touch "$_dispatch_marker"
       RESULT=$(llm_dispatch \
         --task-class "$TASK_CLASS" \
         --node-type "$dispatch_lane" \
-        --prompt-text "$PROMPT_CONTENT" 2>&1) || { echo "researcher dispatch failed" >&2; return 1; }
-      # D-033: preserve agent's tool-call Writes — if agent wrote real
-      # content via Write/Edit to $CONTEXT_FILE, don't clobber it with
-      # the orchestrator's STDOUT capture (which is just the handoff
-      # summary). Heuristic: agent-Write file is typically 5-50x larger
-      # than the STDOUT summary. Compare sizes; if file already bigger,
-      # skip the echo + dump STDOUT to {CONTEXT_FILE}.stdout.md as
-      # forensics.
-      local _result_bytes="${#RESULT}"
-      local _existing_bytes=0
-      [ -f "$CONTEXT_FILE" ] && _existing_bytes=$(wc -c < "$CONTEXT_FILE" | tr -d ' ')
-      if [ "$_existing_bytes" -gt "$_result_bytes" ] && [ "$_existing_bytes" -gt 512 ]; then
-        echo "  [ok] preserving agent Write at $CONTEXT_FILE ($_existing_bytes bytes; STDOUT $_result_bytes → ${CONTEXT_FILE}.stdout.md)"
+        --prompt-text "$PROMPT_CONTENT" 2>&1) || { rm -f "$_dispatch_marker"; echo "researcher dispatch failed" >&2; return 1; }
+      # D-033v2: preserve agent's tool-call Writes. The old size heuristic
+      # ("existing file bigger than stdout wins") clobbered intentionally
+      # small artifacts whenever the closing chat message was larger
+      # (rubric caught lens-tiny.md replaced by chat residue 3 runs in a
+      # row). Authoritative signal instead: the agent modified
+      # $CONTEXT_FILE during this dispatch (mtime newer than the
+      # pre-dispatch marker) → the file IS the artifact; stdout goes to
+      # .stdout.md as forensics.
+      if [ -f "$CONTEXT_FILE" ] && [ "$CONTEXT_FILE" -nt "$_dispatch_marker" ]; then
+        echo "  [ok] preserving agent Write at $CONTEXT_FILE (STDOUT ${#RESULT} bytes → ${CONTEXT_FILE}.stdout.md)"
         echo "$RESULT" > "${CONTEXT_FILE}.stdout.md"
       else
         echo "$RESULT" > "$CONTEXT_FILE"
         echo "  [ok] researcher output → $CONTEXT_FILE"
       fi
+      rm -f "$_dispatch_marker"
       # D-042: rich trace payload — files_written + cost_usd + final_artifact_ref
       # gives reflect's gradient_extract real signal to learn from.
       _trace_write_node_rich "$NODE_TRACE_ID" "success" "researcher" "$CONTEXT_FILE" ""
@@ -681,21 +682,25 @@ PY
         PROMPT_CONTENT="${_prepend}Review the implementation for: ${node_desc}${_learned_block}\n\nPlan:\n${PLAN_CONTENT}\n\nRespond with JSON: {\"verdict\": \"pass|fail|needs_revision\", \"notes\": []}"
       fi
       export MO_NODE_ID="$node_id"
+      local _dispatch_marker="$RUN_DIR/.dispatch-marker-${node_id}"
+      touch "$_dispatch_marker"
       RESULT=$(llm_dispatch \
         --task-class "$TASK_CLASS" \
         --node-type "$dispatch_lane" \
-        --prompt-text "$PROMPT_CONTENT" 2>&1) || { echo "reviewer dispatch failed" >&2; return 1; }
-      # D-033: same preserve-agent-Write logic as researcher
-      local _result_bytes="${#RESULT}"
-      local _existing_bytes=0
-      [ -f "$REVIEW_FILE" ] && _existing_bytes=$(wc -c < "$REVIEW_FILE" | tr -d ' ')
-      if [ "$_existing_bytes" -gt "$_result_bytes" ] && [ "$_existing_bytes" -gt 512 ]; then
-        echo "  [ok] preserving agent Write at $REVIEW_FILE ($_existing_bytes bytes; STDOUT $_result_bytes → ${REVIEW_FILE}.stdout.md)"
+        --prompt-text "$PROMPT_CONTENT" 2>&1) || { rm -f "$_dispatch_marker"; echo "reviewer dispatch failed" >&2; return 1; }
+      # D-033v2: same mtime-marker preserve-agent-Write logic as researcher
+      # (size heuristic clobbered small artifacts — see researcher branch).
+      if [ -f "$REVIEW_FILE" ] && [ "$REVIEW_FILE" -nt "$_dispatch_marker" ]; then
+        echo "  [ok] preserving agent Write at $REVIEW_FILE (STDOUT ${#RESULT} bytes → ${REVIEW_FILE}.stdout.md)"
         echo "$RESULT" > "${REVIEW_FILE}.stdout.md"
       else
         echo "$RESULT" > "$REVIEW_FILE"
       fi
-      VERDICT=$(echo "$RESULT" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('verdict','unknown'))" 2>/dev/null || echo "unknown")
+      rm -f "$_dispatch_marker"
+      # Parse verdict from the authoritative artifact file, not stdout —
+      # when the agent Writes the review JSON itself, stdout is just the
+      # closing chat message.
+      VERDICT=$(python3 -c "import sys,json; d=json.load(open(sys.argv[1])); print(d.get('verdict','unknown'))" "$REVIEW_FILE" 2>/dev/null || echo "unknown")
       echo "  [ok] reviewer verdict=${VERDICT} → $REVIEW_FILE"
       # D-042 rich trace payload — reviewer/synthesizer node
       _trace_write_node_rich "$NODE_TRACE_ID" "success" "reviewer" "$REVIEW_FILE" "$VERDICT"
