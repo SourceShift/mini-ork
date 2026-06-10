@@ -88,7 +88,14 @@ fi
 
 # ── extract verifiers from artifact_contract ──────────────────────────────────
 declare -a VERIFIER_NAMES=()
-EVIDENCE_DIR="$MINI_ORK_HOME/runs/evidence"
+# Evidence lives WITH the run it verified (gradient: evidence in the global
+# pool is orphaned from its run). Global pool only as fallback when no run
+# dir is in scope (ad-hoc `mini-ork verify <artifact>` invocations).
+if [ -n "${MINI_ORK_RUN_DIR:-}" ] && [ -d "${MINI_ORK_RUN_DIR:-}" ]; then
+  EVIDENCE_DIR="$MINI_ORK_RUN_DIR/evidence"
+else
+  EVIDENCE_DIR="$MINI_ORK_HOME/runs/evidence"
+fi
 mkdir -p "$EVIDENCE_DIR"
 if [ -n "$PLAN_PATH" ] && [ -f "$PLAN_PATH" ]; then
   [ -z "$TASK_CLASS" ] && TASK_CLASS=$(python3 -c "

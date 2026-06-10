@@ -286,8 +286,18 @@ PY
     # mini-ork-self-improve streams the WHOLE lifecycle into the same
     # $RUN_DIR/execute.log via redirect, and truncating it mid-stream
     # from in here would corrupt that capture.
-    _run_dir=$(dirname "${MINI_ORK_PLAN_PATH:-}")
-    if [ -d "$_run_dir" ] && [ ! -f "$_run_dir/execute.log" ]; then
+    #
+    # Resolution order for _run_dir:
+    #   1. MINI_ORK_RUN_DIR if set (authoritative — what mini-ork-execute uses)
+    #   2. dirname of MINI_ORK_PLAN_PATH (back-compat for older callers)
+    # Then refuse to write if the resolved dir is empty or '.' — that's the
+    # silent-skip bug that left execute.log missing on path-confused dispatches.
+    _run_dir="${MINI_ORK_RUN_DIR:-}"
+    if [ -z "$_run_dir" ] && [ -n "${MINI_ORK_PLAN_PATH:-}" ]; then
+      _run_dir=$(dirname "$MINI_ORK_PLAN_PATH")
+    fi
+    if [ -n "$_run_dir" ] && [ "$_run_dir" != "." ] \
+       && [ -d "$_run_dir" ] && [ ! -f "$_run_dir/execute.log" ]; then
       printf '%s\n' "$execute_out" > "$_run_dir/execute.log" 2>/dev/null || true
     fi
 
