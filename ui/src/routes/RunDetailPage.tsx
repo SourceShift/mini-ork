@@ -1,5 +1,5 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { Link, useParams } from "@tanstack/react-router";
+import { Link, useNavigate, useParams, useSearch } from "@tanstack/react-router";
 import type React from "react";
 import { useState } from "react";
 import {
@@ -29,9 +29,15 @@ import { useEventStream } from "@/lib/sse";
 
 export function RunDetailPage() {
   const { taskRunId } = useParams({ from: "/runs/$taskRunId" });
+  const navigate = useNavigate({ from: "/runs/$taskRunId" });
+  const search = useSearch({ from: "/runs/$taskRunId" });
   const qc = useQueryClient();
   const [selectedInput, setSelectedInput] = useState<RunInput | null>(null);
-  const [activeTab, setActiveTab] = useState<RunTab>("agents");
+  // URL is the source of truth for the active tab — deep links and the
+  // back button both work without a state-sync effect.
+  const activeTab: RunTab = isRunTab(search.tab) ? search.tab : "agents";
+  const changeTab = (tab: RunTab) =>
+    navigate({ search: (prev) => ({ ...prev, tab }), replace: true });
 
   const tr = useQuery({ queryKey: ["task-run", taskRunId], queryFn: () => api.taskRun(taskRunId) });
   const events = useQuery({
@@ -135,7 +141,7 @@ export function RunDetailPage() {
         </header>
       )}
 
-      <RunTabs active={activeTab} onChange={setActiveTab} agentCount={agentRows.length} learningCount={learningCount(learning.data ?? null)} />
+      <RunTabs active={activeTab} onChange={changeTab} agentCount={agentRows.length} learningCount={learningCount(learning.data ?? null)} />
 
       {activeTab === "overview" && (
         <>
@@ -280,7 +286,12 @@ function CoalitionPanel({
   );
 }
 
-type RunTab = "overview" | "dag" | "agents" | "learnings" | "artifacts" | "diagnostics";
+const RUN_TABS = ["overview", "dag", "agents", "learnings", "artifacts", "diagnostics"] as const;
+type RunTab = (typeof RUN_TABS)[number];
+
+function isRunTab(v: unknown): v is RunTab {
+  return typeof v === "string" && (RUN_TABS as readonly string[]).includes(v);
+}
 
 function RunTabs({
   active,
