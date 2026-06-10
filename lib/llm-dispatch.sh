@@ -653,6 +653,7 @@ fi
 # ─────────────────────────────────────────────────────────────────────────────
 llm_dispatch() {
   local task_class="" node_type="" prompt_text="" out_file="" model_override=""
+  local _timeout_s=1500 _max_turns=60
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --task-class)  task_class="$2";     shift 2 ;;
@@ -660,6 +661,8 @@ llm_dispatch() {
       --prompt-text) prompt_text="$2";    shift 2 ;;
       --out)         out_file="$2";       shift 2 ;;
       --model)       model_override="$2"; shift 2 ;;
+      --timeout)     _timeout_s="$2";     shift 2 ;;
+      --max-turns)   _max_turns="$2";     shift 2 ;;
       *)             shift ;;
     esac
   done
@@ -756,7 +759,7 @@ PY
     _mo_llm_write_duration_ms 0
     return 127
   }
-  if mo_llm_dispatch "$model" "$prompt_text" "$out_file" >/dev/null 2>"$_err_file"; then
+  if mo_llm_dispatch "$model" "$prompt_text" "$out_file" "$_timeout_s" "$_max_turns" >/dev/null 2>"$_err_file"; then
     _duration_end_ms=$(_mo_llm_now_ms) || {
       _mo_llm_write_duration_ms 0
       return 127
