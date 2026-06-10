@@ -28,7 +28,7 @@ export function FleetPage() {
   });
 
   const totalRuns = summary.data?.by_status.reduce((acc, s) => acc + s.count, 0) ?? 0;
-  const activeRuns = summary.data?.by_status.find((s) => s.status === "executing")?.count ?? 0;
+  const activeRuns = active.data?.length ?? summary.data?.by_status.find((s) => s.status === "executing")?.count ?? 0;
   const failedRuns = summary.data?.by_status.find((s) => s.status === "failed")?.count ?? 0;
 
   return (
@@ -53,7 +53,7 @@ export function FleetPage() {
         <Stat icon={<Boxes size={16} />} label="task_runs" value={totalRuns} testid="stat-task-runs" />
         <Stat
           icon={<Activity size={16} />}
-          label="executing"
+          label="in flight"
           value={activeRuns}
           tone={activeRuns ? "warn" : "muted"}
           testid="stat-executing"
@@ -85,37 +85,53 @@ export function FleetPage() {
             <table className="tbl" data-testid="active-runs-table">
               <thead>
                 <tr>
-                  <Th>Epic</Th>
+                  <Th>Epic / Run</Th>
                   <Th>Agent</Th>
-                  <Th>Branch</Th>
+                  <Th>Source</Th>
                   <Th>Started</Th>
-                  <Th>Heartbeat</Th>
-                  <Th>Test</Th>
+                  <Th>Updated</Th>
+                  <Th>State</Th>
                   <Th>Cost</Th>
                 </tr>
               </thead>
               <tbody>
-                {active.data.map((r) => (
-                  <tr
-                    key={r.id}
-                    className="cursor-pointer"
-                    data-testid={`active-run-${r.id}`}
-                  >
-                    <Td className="font-mono text-xs">{r.epic_title ?? r.epic_id}</Td>
-                    <Td>{r.agent}</Td>
-                    <Td className="font-mono text-xs text-ink-300">{r.branch}</Td>
-                    <Td>{formatRelative(r.started_at)}</Td>
-                    <Td>{formatRelative(r.last_heartbeat_at)}</Td>
-                    <Td><StatusPill status={r.test_status} /></Td>
-                    <Td>{formatCost(r.cost_usd)}</Td>
-                  </tr>
-                ))}
+                {active.data.map((r) => {
+                  const taskRunId = r.task_run_id ?? (r.source === "task_runs" ? String(r.id) : null);
+                  const label = r.epic_title ?? r.epic_id ?? String(r.id);
+                  return (
+                    <tr
+                      key={`${r.source}-${r.id}`}
+                      className="cursor-pointer"
+                      data-testid={`active-run-${r.id}`}
+                    >
+                      <Td className="font-mono text-xs">
+                        {taskRunId ? (
+                          <Link
+                            to="/runs/$taskRunId"
+                            params={{ taskRunId }}
+                            className="text-ink-100 hover:text-[var(--amb)]"
+                          >
+                            {label}
+                          </Link>
+                        ) : (
+                          label
+                        )}
+                      </Td>
+                      <Td>{r.agent}</Td>
+                      <Td className="font-mono text-xs text-ink-300">{r.source === "task_runs" ? "task_runs" : r.branch}</Td>
+                      <Td>{formatRelative(r.started_at)}</Td>
+                      <Td>{formatRelative(r.last_heartbeat_at)}</Td>
+                      <Td><StatusPill status={r.status ?? r.test_status} /></Td>
+                      <Td>{formatCost(r.cost_usd)}</Td>
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           </div>
         ) : (
           <p className="text-[12px] text-ink-400" data-testid="active-runs-empty">
-            No active runs (heartbeat-tracked).
+            No active runs from task_runs or heartbeat-tracked runs.
           </p>
         )}
       </section>
