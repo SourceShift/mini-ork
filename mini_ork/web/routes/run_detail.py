@@ -730,7 +730,11 @@ def read_artifact(
 
 
 @router.get("/{task_run_id}/dag")
-def get_dag(task_run_id: str = PathParam(...), db: StateDB = Depends(get_db)) -> dict[str, Any]:
+def get_dag(
+    task_run_id: str = PathParam(...),
+    db: StateDB = Depends(get_db),
+    home=Depends(get_home),
+) -> dict[str, Any]:
     """Return the recipe DAG with node statuses derived from run_events.
 
     Status rules (derived from node_start/node_end events emitted by
@@ -743,7 +747,7 @@ def get_dag(task_run_id: str = PathParam(...), db: StateDB = Depends(get_db)) ->
     tr = db.row("SELECT recipe FROM task_runs WHERE id = ?", (task_run_id,))
     if not tr or not tr.get("recipe"):
         raise HTTPException(status_code=404, detail="task_run or recipe not found")
-    fp = recipes.fingerprint(tr["recipe"])
+    fp = recipes.fingerprint(tr["recipe"], home)
 
     node_status = _node_status_map(db, task_run_id)
     # Merge status into each node, preserving family attribution
