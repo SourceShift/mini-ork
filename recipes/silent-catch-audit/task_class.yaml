@@ -1,0 +1,42 @@
+name: silent_catch_audit
+version: "0.1.0"
+description: >
+  Read-only audit for JavaScript and TypeScript codebases that detects
+  silent catch anti-patterns, ranks swallowed failures by operational risk,
+  and emits markdown plus machine-readable JSON findings.
+
+matches:
+  keywords:
+    - silent catch
+    - catch anti-pattern
+    - error swallowing
+    - TypeScript audit
+    - JavaScript audit
+    - code review
+    - static analysis
+    - try catch
+    - fire and forget
+    - non-blocking comment
+    - advisory lock
+    - catch pattern
+  regex:
+    - "\\.catch\\(\\s*\\(?.*\\)?\\s*=>\\s*(\\{\\s*\\}|null|undefined)\\s*\\)"
+    - "catch\\s*\\([^)]*\\)\\s*\\{\\s*\\}"
+
+artifact_contract_ref: artifact_contract.yaml
+default_workflow: workflow.yaml
+
+default_gates:
+  - budget_gate
+  - scope_gate
+
+risk_class: low
+
+cost_model:
+  min_usd: 2
+  max_usd: 30
+  per_lens_usd: 4
+
+runtime_model:
+  min_minutes: 5
+  max_minutes: 45
