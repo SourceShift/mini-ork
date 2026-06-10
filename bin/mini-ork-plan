@@ -186,6 +186,26 @@ if [ "${MO_INJECT_LEARNINGS:-1}" = "1" ] && [ -f "$MINI_ORK_ROOT/lib/context_ass
     _prior_block="$(context_prior_runs_md "${TASK_CLASS:-generic}" 5 || true)"
     [ -n "$_prior_block" ] && PROMPT_TEXT="${PROMPT_TEXT}"$'\n\n'"${_prior_block}"$'\n'
   fi
+  # ContextPack artifact: the full bounded bundle (prior runs, failure
+  # modes, prefs, constraints — each item cite-tagged) persisted next to
+  # plan.json. The md blocks above are what the prompt gets; this is the
+  # auditable record of what memory was AVAILABLE at plan time, consumed
+  # by the obs UI's injection_points panel.
+  if [ "$DRY_RUN" -eq 0 ] && declare -f context_assemble >/dev/null 2>&1; then
+    _brief_tmp=$(mktemp /tmp/mini-ork-brief-XXXXXX)
+    python3 - "$KICKOFF" "${TASK_CLASS:-generic}" > "$_brief_tmp" <<'PY'
+import json, pathlib, sys
+print(json.dumps({
+    "task_class": sys.argv[2],
+    "kickoff": pathlib.Path(sys.argv[1]).read_text()[:20000],
+}))
+PY
+    _pack_dir="$(dirname "$OUT_FILE")"
+    mkdir -p "$_pack_dir" 2>/dev/null || true
+    context_assemble "$_brief_tmp" "planner" > "$_pack_dir/context-pack.json" 2>/dev/null \
+      || rm -f "$_pack_dir/context-pack.json"
+    rm -f "$_brief_tmp"
+  fi
 fi
 
 profile_status=""
