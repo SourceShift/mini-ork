@@ -5,6 +5,8 @@ from __future__ import annotations
 from typing import Any
 
 import json
+import os
+import time
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Path as PathParam
@@ -16,6 +18,12 @@ from ..recipes import mini_ork_root
 
 router = APIRouter(prefix="/api/v1/task-runs", tags=["run-detail"])
 
+TERMINAL_STATUSES = {"published", "rolled_back", "failed"}
+# A non-terminal run with no status update AND no run_events for this long is
+# presumed abandoned (engine died without finalizing). The UI renders it as
+# stale instead of a live ticking run with active Stop/Kill controls.
+RUN_STALE_SECONDS = int(os.environ.get("MINI_ORK_RUN_STALE_SECONDS", "1800"))
+
 
 @router.get("/{task_run_id}")
 def get_task_run(
@@ -25,6 +33,20 @@ def get_task_run(
     tr = db.row("SELECT * FROM task_runs WHERE id = ?", (task_run_id,))
     if not tr:
         raise HTTPException(status_code=404, detail=f"task_run {task_run_id} not found")
+    if not tr.get("duration_ms") and tr.get("ended_at") and tr.get("created_at"):
+        tr["duration_ms"] = max(int(tr["ended_at"]) - int(tr["created_at"]), 0) * 1000
+    tr["stale"] = False
+    if tr.get("status") not in TERMINAL_STATUSES:
+        last_ts = int(tr.get("updated_at") or tr.get("created_at") or 0)
+        if db.has_table("run_events"):
+            ev = db.row(
+                "SELECT MAX(created_at) AS ts FROM run_events WHERE run_id = ?",
+                (task_run_id,),
+            )
+            if ev and ev.get("ts"):
+                last_ts = max(last_ts, int(ev["ts"]))
+        tr["last_activity_at"] = last_ts
+        tr["stale"] = (time.time() - last_ts) > RUN_STALE_SECONDS
     return tr
 
 
