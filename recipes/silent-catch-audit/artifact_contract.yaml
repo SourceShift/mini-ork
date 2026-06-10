@@ -1,0 +1,33 @@
+task_class: silent_catch_audit
+expected_artifact: composite
+description: >
+  Produces a read-only audit package: a tiered markdown report, a
+  machine-readable JSON findings file, and a pass/fail verdict. The recipe
+  does not mutate target source code and does not emit ESLint configuration.
+
+success_verifiers:
+  - verifiers/audit-shape.sh
+
+failure_policy: request_changes
+rollback_policy: >
+  Keep structural, semantic, and adversarial lens reports in the run
+  directory for diagnosis; discard the reviewed report and do not publish
+  canonical outputs when shape verification fails.
+
+source_artifact: silent-catch-audit.md
+
+# Smoke-shape runs intentionally use outputs: [] so publisher takes the
+# no-commit path while verifiers still check run-local artifacts.
+# Real-publish runs use outputs with a canonical repository path.
+outputs:
+  - docs/audits/silent-catch-audit.md
+  - docs/audits/silent-catch-audit.findings.json
+
+artifact_path_template: ".mini-ork/artifacts/{run_id}/silent_catch_audit"
+max_size_bytes: 1048576
+retention_days: 90
+tags:
+  - audit
+  - typescript
+  - javascript
+  - reliability
