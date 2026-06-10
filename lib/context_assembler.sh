@@ -228,6 +228,48 @@ if rows:
 PY
 }
 
+# desc: Emit prior same-task_class run outcomes as a compact markdown block
+#       suitable for direct prompt injection (the prior_similar_runs slice of
+#       the ContextPack, without the full context_assemble JSON envelope).
+#       Excludes the CURRENT run's own traces via $MINI_ORK_RUN_ID — without
+#       that, the classify trace written moments earlier shows up as its own
+#       "prior" memory. Prints NOTHING when no prior runs exist.
+context_prior_runs_md() {
+  local task_class="${1:?task_class required}"
+  local limit="${2:-5}"
+  [ -n "${MINI_ORK_DB:-}" ] && [ -f "${MINI_ORK_DB:-}" ] || return 0
+  python3 - "$MINI_ORK_DB" "$task_class" "$limit" "${MINI_ORK_RUN_ID:-}" <<'PY'
+import sqlite3, sys
+
+db, task_class, limit, cur_run = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
+con = sqlite3.connect(db)
+con.execute("PRAGMA busy_timeout=5000")
+try:
+    rows = con.execute("""
+        SELECT trace_id, status, cost_usd, duration_ms, created_at
+        FROM execution_traces
+        WHERE task_class = ?
+          AND (? = '' OR run_id IS NULL OR run_id != ?)
+        ORDER BY created_at DESC LIMIT ?
+    """, (task_class, cur_run, cur_run, limit)).fetchall()
+except sqlite3.OperationalError:
+    rows = []
+finally:
+    con.close()
+
+if rows:
+    n_ok = sum(1 for r in rows if (r[1] or "") == "success")
+    print("--- Prior runs of this task class (memory) ---")
+    print(f"{len(rows)} most recent: {n_ok} success / {len(rows) - n_ok} other. "
+          "Calibrate plan scope and verifier strictness against these outcomes:")
+    for trace_id, status, cost, dur_ms, created in rows:
+        cost_s = f"${cost:.2f}" if isinstance(cost, (int, float)) else "?"
+        dur_s = f"{dur_ms // 1000}s" if isinstance(dur_ms, int) else "?"
+        print(f"- {trace_id}: {status or 'unknown'} (cost {cost_s}, {dur_s})")
+    print("--- /prior runs ---")
+PY
+}
+
 if [[ "${BASH_SOURCE[0]:-}" == "${0:-}" ]]; then
   echo "context_assembler.sh — source me and call context_assemble <task_brief_path> <node_name>"
 fi
