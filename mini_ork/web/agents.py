@@ -46,12 +46,15 @@ def _expected_artifacts(node_id: str, node_type: str) -> list[str]:
             candidates.append("synthesis.md.stdout.md")
         candidates.append(f"review-{node_id}.json")
     if node_type == "verifier":
-        candidates.append(f"verifier-{node_id}.log")
-        candidates.append(f"verifier-result-{node_id}.json")
-        # Some recipes write under aliased verifier names
-        candidates.append(f"verifier-{base}.log")
-        candidates.append(f"verifier-result-{base}.json")
-    return candidates
+        # Both spellings exist in the wild: this repo's executor writes
+        # verifier-<id>.log, other projects' runs write verifier_<id>.log.
+        for sep in ("-", "_"):
+            candidates.append(f"verifier{sep}{node_id}.log")
+            candidates.append(f"verifier{sep}result{sep}{node_id}.json")
+            # Some recipes write under aliased verifier names
+            candidates.append(f"verifier{sep}{base}.log")
+            candidates.append(f"verifier{sep}result{sep}{base}.json")
+    return list(dict.fromkeys(candidates))
 
 
 def list_agents(
