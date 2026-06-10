@@ -152,6 +152,13 @@ WORKFLOW="${MINI_ORK_WORKFLOW:-}"
 if [ -z "$WORKFLOW" ] && [ -n "${MINI_ORK_RECIPE:-}" ]; then
   WORKFLOW="$MINI_ORK_ROOT/recipes/${MINI_ORK_RECIPE}/workflow.yaml"
 fi
+# Lineage: workflow_version_id = content hash of the workflow definition.
+# Exported so trace_write (and any subshell caller) stamps it on every
+# trace of this run — previously always NULL, defeating lineage queries.
+if [ -z "${MINI_ORK_WORKFLOW_VERSION_ID:-}" ] && [ -n "$WORKFLOW" ] && [ -f "$WORKFLOW" ]; then
+  MINI_ORK_WORKFLOW_VERSION_ID="wf-$(shasum -a 256 "$WORKFLOW" 2>/dev/null | cut -c1-12)"
+  export MINI_ORK_WORKFLOW_VERSION_ID
+fi
 
 # ── parse plan ────────────────────────────────────────────────────────────────
 RUN_DIR="$(dirname "$PLAN_PATH")"
@@ -538,6 +545,14 @@ _dispatch_node() {
     [ -f "$_default" ] && PROMPT_FILE="$_default"
   fi
 
+  # Lineage: prompt-template version for this node's trace. trace_write
+  # picks it up from env — hash of the TEMPLATE, not the rendered prompt,
+  # so identical recipe versions compare equal across runs.
+  MO_NODE_PROMPT_SHA=""
+  [ -n "$PROMPT_FILE" ] && \
+    MO_NODE_PROMPT_SHA=$(shasum -a 256 "$PROMPT_FILE" 2>/dev/null | cut -c1-12)
+  export MO_NODE_PROMPT_SHA
+
   NODE_TRACE_ID="tr-${node_type}-$(date +%s)-$$"
 
   # Learned-failure-mode injection: pull high-confidence gradients for this
@@ -747,7 +762,8 @@ PY
             echo "  [fail] verifier_ref not found: $node_verifier_ref" >&2
             return 1
           fi
-          local _evidence_dir="$MINI_ORK_HOME/runs/evidence"
+          # Evidence lives WITH the run it verified (see bin/mini-ork-verify).
+          local _evidence_dir="${MINI_ORK_RUN_DIR:-$MINI_ORK_HOME/runs}/evidence"
           mkdir -p "$_evidence_dir"
           local _vstem="${node_verifier_ref#verifiers/}"
           _vstem="${_vstem%.sh}"
@@ -1112,8 +1128,12 @@ fi
 # documented behavior for executable-wrapper lanes (cl_codex.sh) and
 # acceptable for non-dispatching nodes.
 #
-# This block now ONLY sets the status='reviewing' transition that
-# downstream logic depends on. No cost mutation.
+# This block sets status='reviewing' as the post-node-loop transition
+# that downstream logic depends on. CRITICAL: it must NOT clobber any
+# terminal state the publisher (line 878 / 930) or rollback already set.
+# Without the WHERE-status-guard, every successful run ended up displayed
+# as 'reviewing' in the UI even though publisher wrote 'published'
+# moments earlier — turning task_runs.status into an unreliable metric.
 if [ "$DRY_RUN" -eq 0 ] && [ -f "$MINI_ORK_DB" ] && [ -n "${MINI_ORK_RUN_ID:-}" ]; then
   python3 - "$MINI_ORK_DB" "$MINI_ORK_RUN_ID" <<'PY'
 import sqlite3, sys, time
@@ -1126,6 +1146,7 @@ try:
         SET status     = 'reviewing',
             updated_at = ?
         WHERE id = ?
+          AND status NOT IN ('published', 'rolled_back', 'failed')
     """, (int(time.time()), run_id))
     con.commit()
 except sqlite3.OperationalError as e:

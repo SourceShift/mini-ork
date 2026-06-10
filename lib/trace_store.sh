@@ -45,6 +45,14 @@ now = int(time.time())
 run_id = (p.get("run_id")
           or os.environ.get("MINI_ORK_TASK_RUN_ID")
           or os.environ.get("MINI_ORK_RUN_ID"))
+# Lineage env fallbacks (same pattern as run_id): execute exports the
+# workflow content hash for the whole run and the prompt-template hash
+# per node, so every trace_write caller inherits them for free.
+workflow_version_id = (p.get("workflow_version_id")
+                       or os.environ.get("MINI_ORK_WORKFLOW_VERSION_ID"))
+prompt_version = (p.get("prompt_version")
+                  or os.environ.get("MO_NODE_PROMPT_SHA")
+                  or "")
 
 con = sqlite3.connect(db)
 # v0.2-pt7 (F-11/R1): per-connection busy_timeout — handle SQLITE_BUSY
@@ -77,7 +85,7 @@ con.execute("""
     trace_id,
     run_id,
     p.get("task_class", ""),
-    p.get("prompt_version", "") or "",
+    prompt_version,
     p.get("context_bundle_hash", "") or "",
     json.dumps(p.get("tool_calls", [])),
     json.dumps(p.get("files_read", [])),
@@ -88,7 +96,7 @@ con.execute("""
     int(p.get("duration_ms", 0)),
     p.get("final_artifact_ref"),
     p.get("status", "success"),
-    p.get("workflow_version_id"),
+    workflow_version_id,
     p.get("agent_version_id", "") or "",
 ))
 con.commit()
