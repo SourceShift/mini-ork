@@ -171,6 +171,17 @@ if [ -n "${MINI_ORK_PROFILE_PATH:-}" ] && [ -f "${MINI_ORK_PROFILE_PATH:-}" ]; t
   PROMPT_TEXT="${PROMPT_TEXT}"$'\n\n--- RUN PROFILE ---\n'"$(cat "$MINI_ORK_PROFILE_PATH")"$'\n--- /RUN PROFILE ---\n'
 fi
 
+# Learned-failure-mode injection (same source as execute's node prompts):
+# high-confidence gradients for this task_class from `mini-ork reflect`.
+if [ "${MO_INJECT_LEARNINGS:-1}" = "1" ] && [ -f "$MINI_ORK_ROOT/lib/context_assembler.sh" ]; then
+  # shellcheck source=lib/context_assembler.sh
+  source "$MINI_ORK_ROOT/lib/context_assembler.sh"
+  if declare -f context_failure_modes_md >/dev/null 2>&1; then
+    _learned_block="$(context_failure_modes_md "${TASK_CLASS:-generic}" 5 || true)"
+    [ -n "$_learned_block" ] && PROMPT_TEXT="${PROMPT_TEXT}"$'\n\n'"${_learned_block}"$'\n'
+  fi
+fi
+
 profile_status=""
 confidence="1"
 human_questions_json="[]"
@@ -255,6 +266,95 @@ fi
 
 PROFILE_GATE="${MINI_ORK_PROFILE_GATE:-1}"
 CONFIDENCE_FLOOR="${MINI_ORK_PLAN_CONFIDENCE_FLOOR:-0.7}"
+
+# Interactive Q&A: when profile_status=needs_answers AND we can open the
+# user's terminal, prompt directly. We DELIBERATELY don't gate on `[ -t 1 ]`
+# (stdout) because the test harness + many script wrappers pipe stdout
+# through `tee`, leaving stdout as a pipe — but the user's controlling
+# terminal is still reachable via /dev/tty. That's the right gate: "can we
+# talk to the user?" not "is stdout pristine?".
+#
+# Disable explicitly via MINI_ORK_NONINTERACTIVE=1 (CI / scripted / piped-in).
+_can_prompt=0
+if [ "${MINI_ORK_NONINTERACTIVE:-0}" != "1" ] && [ -e /dev/tty ] && \
+   { exec 9</dev/tty; } 2>/dev/null; then
+  _can_prompt=1
+  exec 9<&-  # close probe FD
+fi
+if [ "$profile_status" = "needs_answers" ] && [ "$_can_prompt" = "1" ]; then
+  echo "" >&2
+  echo "──────────────────────────────────────────────────────────────────────" >&2
+  echo "  mini-ork planner needs your input before dispatching agents." >&2
+  echo "  Profile confidence: $confidence (floor: $CONFIDENCE_FLOOR)" >&2
+  echo "  Run: ${MINI_ORK_RUN_ID:-<unknown>}" >&2
+  echo "──────────────────────────────────────────────────────────────────────" >&2
+  _answers_json=$(python3 - "$human_questions_json" "${MINI_ORK_PROFILE_PATH:-}" <<'PY'
+import json, os, sys
+questions = json.loads(sys.argv[1] or "[]")
+profile_path = sys.argv[2]
+if not questions:
+    print("{}"); sys.exit(0)
+
+# Route prompt writes to /dev/tty directly so they bypass any tee/sed
+# pipeline buffering on stdout/stderr. Read answers from the same tty.
+try:
+    tty_w = open("/dev/tty", "w")
+    tty_r = open("/dev/tty", "r")
+except OSError:
+    # Shouldn't happen — the bash probe already verified /dev/tty is open
+    sys.stderr.write("\n  [warn] could not open /dev/tty for prompting\n")
+    print("{}"); sys.exit(0)
+
+answers = {}
+for i, q in enumerate(questions, 1):
+    text = q if isinstance(q, str) else (q.get("text") or q.get("question") or str(q))
+    tty_w.write(f"\n  Q{i}: {text}\n")
+    tty_w.write("  > ")
+    tty_w.flush()
+    try:
+        ans = tty_r.readline().strip()
+    except (OSError, KeyboardInterrupt):
+        ans = ""
+    if ans:
+        answers[text] = ans
+    elif ans == "":
+        tty_w.write("  [skipped]\n"); tty_w.flush()
+
+tty_w.write("\n")
+tty_w.flush()
+tty_r.close(); tty_w.close()
+print(json.dumps(answers))
+PY
+  )
+  if [ -n "$_answers_json" ] && [ "$_answers_json" != "{}" ]; then
+    # Persist answers + merge into run_profile.json (matches what the
+    # UI's /api/v1/task-runs/{id}/answers does — same shape end-to-end).
+    _answers_path="$(dirname "${MINI_ORK_PROFILE_PATH:-./run_profile.json}")/profile-answers.json"
+    printf '%s\n' "$_answers_json" > "$_answers_path"
+    python3 - "${MINI_ORK_PROFILE_PATH:-}" "$_answers_json" <<'PY' 2>/dev/null
+import json, sys
+path, answers_json = sys.argv[1], sys.argv[2]
+if not path: sys.exit(0)
+try:
+    with open(path) as f: p = json.load(f)
+except Exception:
+    p = {}
+p.setdefault("answers", {}).update(json.loads(answers_json))
+p["profile_status"] = "ready"
+p["confidence"] = max(float(p.get("confidence", 0) or 0), 0.9)
+p["human_questions"] = []
+with open(path, "w") as f: json.dump(p, f, indent=2)
+PY
+    profile_status="ready"
+    confidence="0.9"
+    human_questions_json="[]"
+    echo "  [ok] answers captured ($_answers_path) — continuing planner dispatch" >&2
+    echo "" >&2
+  else
+    echo "  [skip] no answers provided — falling through to gate-block" >&2
+  fi
+fi
+
 if [ "$PROFILE_GATE" = "1" ]; then
   _gate_block=0
   [ "$profile_status" = "needs_answers" ] && _gate_block=1
@@ -347,9 +447,9 @@ con.commit(); con.close()
 # Older code picked the first balanced object, but Codex CLI transcripts can
 # include the prompt schema before the assistant answer. Select the first object
 # that parses as a plan and does not contain placeholder template strings.
-PLAN_JSON=$(printf '%s' "$PLAN_JSON_RAW" | python3 -c "
-import json, sys
-txt = sys.stdin.read()
+PLAN_JSON=$(PLAN_JSON_RAW="$PLAN_JSON_RAW" python3 <<'PY'
+import json, os, sys
+txt = os.environ.get("PLAN_JSON_RAW", "")
 
 def objects(s):
     i = 0
@@ -419,7 +519,8 @@ for chunk in objects(txt):
 # Preserve legacy failure behavior: pass a JSON-ish object through if one exists,
 # otherwise pass the raw text so the validation block reports parse_error.
 sys.stdout.write(first if first is not None else txt)
-")
+PY
+)
 
 # D-012: charge cost-of-call NOW (after LLM returned, before validation).
 # Failed validation still owes the LLM call's cost. The success-path block
@@ -490,10 +591,114 @@ _d015_preserve_raw() {
   fi
 }
 
+_d015_mark_plan_failed() {
+  local verdict="$1"
+  [ -f "${MINI_ORK_DB:-}" ] || return 0
+  [ -n "${RUN_ID:-}" ] || return 0
+  python3 - "$MINI_ORK_DB" "$RUN_ID" "$verdict" <<'PY' 2>/dev/null || true
+import sqlite3
+import sys
+import time
+
+db, run_id, verdict = sys.argv[1:4]
+con = sqlite3.connect(db, timeout=5)
+con.execute("PRAGMA busy_timeout=5000")
+now = int(time.time())
+con.execute(
+    """
+    UPDATE task_runs
+    SET status='failed',
+        verdict=COALESCE(verdict, ?),
+        updated_at=?,
+        ended_at=COALESCE(ended_at, ?)
+    WHERE id=?
+    """,
+    (verdict, now, now, run_id),
+)
+con.commit()
+con.close()
+PY
+}
+
+_d015_recipe_fallback_plan() {
+  [ -n "${MINI_ORK_RECIPE:-}" ] || return 1
+  [ -n "${MINI_ORK_WORKFLOW:-}" ] || return 1
+  [ -f "${MINI_ORK_WORKFLOW:-}" ] || return 1
+  python3 - "$MINI_ORK_RECIPE" "$MINI_ORK_WORKFLOW" "$MINI_ORK_ROOT" "$KICKOFF" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+import yaml
+
+recipe, workflow_path, root, kickoff = sys.argv[1:5]
+workflow = yaml.safe_load(Path(workflow_path).read_text(encoding="utf-8")) or {}
+nodes = workflow.get("nodes") or []
+edges = workflow.get("edges") or []
+
+contract_path = Path(root) / "recipes" / recipe / "artifact_contract.yaml"
+contract = {}
+if contract_path.exists():
+    contract = yaml.safe_load(contract_path.read_text(encoding="utf-8")) or {}
+
+outputs = contract.get("outputs") or workflow.get("outputs") or []
+success_verifiers = contract.get("success_verifiers") or workflow.get("success_verifiers") or []
+
+plan = {
+    "objective": f"Execute recipe {recipe} for {kickoff}",
+    "assumptions": [
+        "Recipe workflow.yaml is the source of truth for dispatch order.",
+        "Planner LLM output was invalid JSON, so mini-ork generated this deterministic recipe plan.",
+    ],
+    "decomposition": [
+        {
+            "id": n.get("name"),
+            "description": n.get("description") or f"{n.get('type', 'unknown')} node {n.get('name')}",
+            "node_type": n.get("type"),
+            "depends_on": [
+                e.get("from")
+                for e in edges
+                if e.get("to") == n.get("name") and e.get("from")
+            ],
+        }
+        for n in nodes
+        if isinstance(n, dict) and n.get("name")
+    ],
+    "dependencies": [
+        {"from": e.get("from"), "to": e.get("to")}
+        for e in edges
+        if isinstance(e, dict) and e.get("from") and e.get("to")
+    ],
+    "risk_notes": [
+        "Fallback plan does not include model-authored verifier shell commands.",
+        "Execution still uses the recipe workflow nodes and recipe verifier_ref scripts.",
+    ],
+    "artifact_contract": {
+        "outputs": outputs,
+        "success_verifiers": success_verifiers,
+    },
+    "verifier_contract": {
+        "checks": [
+            {
+                "id": "recipe-workflow-dispatch",
+                "description": f"Dispatch every node declared in recipes/{recipe}/workflow.yaml.",
+            },
+            {
+                "id": "recipe-artifacts",
+                "description": "Recipe artifact contract is satisfied by execute/verify.",
+            },
+        ]
+    },
+}
+print(json.dumps(plan, indent=2))
+PY
+}
+
 if [ "$HAS_VERIFIER" = "missing_verifier_contract" ]; then
   echo "PLAN REJECTED: verifier_contract.checks is missing or empty." >&2
   echo "A plan is not complete until success-check is defined." >&2
   _d015_preserve_raw "missing_verifier_contract"
+  _d015_mark_plan_failed "missing_verifier_contract"
   trace_write "{\"trace_id\":\"$TRACE_ID\",\"task_class\":\"${TASK_CLASS}\",\"status\":\"failure\",\"reviewer_verdict\":\"missing_verifier_contract\"}" >/dev/null 2>&1 || true
   exit 1
 fi
@@ -502,6 +707,7 @@ if [ "$HAS_VERIFIER" = "placeholder_plan" ]; then
   echo "PLAN REJECTED: planner emitted a template plan with placeholder values." >&2
   echo "The selected plan must name real files, sections, actions, and verifier checks." >&2
   _d015_preserve_raw "placeholder_plan"
+  _d015_mark_plan_failed "placeholder_plan"
   trace_write "{\"trace_id\":\"$TRACE_ID\",\"task_class\":\"${TASK_CLASS}\",\"status\":\"failure\",\"reviewer_verdict\":\"placeholder_plan\"}" >/dev/null 2>&1 || true
   exit 1
 fi
@@ -509,6 +715,7 @@ fi
 if [ "$HAS_VERIFIER" = "bad_artifact_contract" ]; then
   echo "PLAN REJECTED: artifact_contract must be an object." >&2
   _d015_preserve_raw "bad_artifact_contract"
+  _d015_mark_plan_failed "bad_artifact_contract"
   trace_write "{\"trace_id\":\"$TRACE_ID\",\"task_class\":\"${TASK_CLASS}\",\"status\":\"failure\",\"reviewer_verdict\":\"bad_artifact_contract\"}" >/dev/null 2>&1 || true
   exit 1
 fi
@@ -517,18 +724,74 @@ if [ "$HAS_VERIFIER" = "bad_node_types" ]; then
   echo "PLAN REJECTED: one or more decomposition[].node_type values are empty or invalid (D-008b)." >&2
   echo "Each step must declare node_type as one of: planner|researcher|implementer|reviewer|verifier|reflector|publisher|rollback" >&2
   _d015_preserve_raw "bad_node_types"
+  _d015_mark_plan_failed "bad_node_types"
   trace_write "{\"trace_id\":\"$TRACE_ID\",\"task_class\":\"${TASK_CLASS}\",\"status\":\"failure\",\"reviewer_verdict\":\"bad_node_types\"}" >/dev/null 2>&1 || true
   exit 1
 fi
 
 if [ "$HAS_VERIFIER" = "parse_error" ]; then
-  echo "PLAN REJECTED: planner emitted non-JSON output." >&2
   _d015_preserve_raw "parse_error"
-  trace_write "{\"trace_id\":\"$TRACE_ID\",\"task_class\":\"${TASK_CLASS}\",\"status\":\"failure\",\"reviewer_verdict\":\"parse_error\"}" >/dev/null 2>&1 || true
-  exit 1
+  if PLAN_JSON=$(_d015_recipe_fallback_plan); then
+    echo "PLAN WARNING: planner emitted invalid JSON; using deterministic recipe fallback plan." >&2
+    HAS_VERIFIER="ok"
+  else
+    echo "PLAN REJECTED: planner emitted non-JSON output." >&2
+    _d015_mark_plan_failed "parse_error"
+    trace_write "{\"trace_id\":\"$TRACE_ID\",\"task_class\":\"${TASK_CLASS}\",\"status\":\"failure\",\"reviewer_verdict\":\"parse_error\"}" >/dev/null 2>&1 || true
+    exit 1
+  fi
 fi
 
 # ── write plan ────────────────────────────────────────────────────────────────
+# Stamp task_class so plan.json is self-describing: execute and any
+# standalone replay read it from the file instead of relying on the
+# MINI_ORK_TASK_CLASS env var surviving across process boundaries.
+#
+# Also overlay the recipe's artifact_contract.yaml when a recipe is in
+# play: success_verifiers must be runnable script refs, but the planner
+# LLM tends to write prose acceptance criteria there, which mini-ork-verify
+# treats as script names (→ guaranteed script_not_found failures). The
+# recipe contract is authoritative (same principle as D-008 for the DAG);
+# the planner's prose is preserved under acceptance_criteria.
+PLAN_JSON=$(python3 - "$PLAN_JSON" "$TASK_CLASS" "${MINI_ORK_PROFILE_PATH:-}" "$MINI_ORK_ROOT" <<'PY' || echo "$PLAN_JSON"
+import json, sys, os
+
+plan_raw, task_class, profile_path, root = sys.argv[1:5]
+p = json.loads(plan_raw)
+p.setdefault('task_class', task_class)
+
+recipe = ""
+if profile_path and os.path.isfile(profile_path):
+    try:
+        with open(profile_path) as f:
+            recipe = (json.load(f).get("recipe") or "").strip()
+    except Exception:
+        recipe = ""
+
+contract_yaml = os.path.join(root, "recipes", recipe, "artifact_contract.yaml") if recipe else ""
+if contract_yaml and os.path.isfile(contract_yaml):
+    try:
+        import yaml
+        with open(contract_yaml) as f:
+            recipe_contract = yaml.safe_load(f) or {}
+        recipe_verifiers = recipe_contract.get("success_verifiers") or []
+        if recipe_verifiers:
+            ac = p.get("artifact_contract")
+            if not isinstance(ac, dict):
+                ac = {}
+            prose = ac.get("success_verifiers") or []
+            if prose and prose != recipe_verifiers:
+                ac.setdefault("acceptance_criteria", prose)
+            ac["success_verifiers"] = recipe_verifiers
+            if recipe_contract.get("outputs"):
+                ac.setdefault("outputs", recipe_contract["outputs"])
+            p["artifact_contract"] = ac
+    except Exception:
+        pass
+
+print(json.dumps(p, indent=2))
+PY
+)
 mkdir -p "$(dirname "$OUT_FILE")"
 echo "$PLAN_JSON" > "$OUT_FILE"
 

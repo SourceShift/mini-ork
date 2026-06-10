@@ -37,9 +37,17 @@ con.execute("""
         evidence      TEXT NOT NULL,
         confidence    REAL NOT NULL DEFAULT 0.0
                           CHECK(confidence BETWEEN 0.0 AND 1.0),
-        created_at    INTEGER NOT NULL
+        created_at    INTEGER NOT NULL,
+        task_class    TEXT
     )
 """)
+# Idempotent upgrade for DBs created before task_class existed. The old
+# `target LIKE %task_class%` join in context_assembler almost never
+# matched (targets are "workflow.node.plan" etc.) — learnings were
+# unreachable at injection time without a real task_class column.
+cols = [r[1] for r in con.execute("PRAGMA table_info(gradient_records)").fetchall()]
+if "task_class" not in cols:
+    con.execute("ALTER TABLE gradient_records ADD COLUMN task_class TEXT")
 con.commit()
 con.close()
 PY
@@ -266,14 +274,30 @@ for f in required:
         sys.exit(1)
 
 con = sqlite3.connect(db)
+con.execute("PRAGMA busy_timeout=5000")
+
+# evidence is a trace_id — resolve task_class from the source trace so
+# context_assembler can join learnings back to runs of the same class.
+task_class = p.get("task_class") or ""
+if not task_class:
+    try:
+        row = con.execute(
+            "SELECT task_class FROM execution_traces WHERE trace_id = ?",
+            (p["evidence"],),
+        ).fetchone()
+        task_class = row[0] if row and row[0] else ""
+    except sqlite3.OperationalError:
+        task_class = ""
+
 con.execute("""
     INSERT INTO gradient_records (
-        gradient_id, target, signal, suggested_change, evidence, confidence, created_at
-    ) VALUES (?,?,?,?,?,?,?)
+        gradient_id, target, signal, suggested_change, evidence, confidence, created_at, task_class
+    ) VALUES (?,?,?,?,?,?,?,?)
     ON CONFLICT(gradient_id) DO UPDATE SET
         signal=excluded.signal,
         suggested_change=excluded.suggested_change,
-        confidence=excluded.confidence
+        confidence=excluded.confidence,
+        task_class=COALESCE(NULLIF(excluded.task_class,''), gradient_records.task_class)
 """, (
     gid,
     p["target"],
@@ -282,6 +306,7 @@ con.execute("""
     p["evidence"],
     float(p.get("confidence", 0.5)),
     now,
+    task_class,
 ))
 con.commit()
 con.close()

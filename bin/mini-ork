@@ -17,11 +17,16 @@ case "$sub" in
   metrics)
     exec "$MINI_ORK_ROOT/bin/mini-ork-metrics" "$@" ;;
 
+  # Read-only observability UI (React SPA + FastAPI + SSE)
+  serve)
+    exec "$MINI_ORK_ROOT/bin/mini-ork-serve" "$@" ;;
+
   # Convenience: run is a recipe-level entry
   # Walks classify → plan → execute → verify. Each step's output (key=value
   # lines on stdout) is parsed to thread state into the next step's env.
   run)
     first="${1:?recipe name or kickoff.md path required}"; shift
+    _RUN_T0=$(date +%s)   # auto-reflect window start (see reflect step below)
     recipe=""
     kickoff=""
     if [ -f "$first" ]; then
@@ -267,17 +272,46 @@ PY
     export MINI_ORK_PLAN_PATH
 
     # ── execute (plan path passed via env, not positional) ─────────────────────
-    execute_out=$("$MINI_ORK_ROOT/bin/mini-ork-execute") || exit $?
+    # Failures do NOT exit here: failed runs are the strongest learning
+    # signal, so verify + reflect must still fire. _run_rc carries the
+    # worst exit code to the final `exit` after reflect.
+    _run_rc=0
+    execute_out=$("$MINI_ORK_ROOT/bin/mini-ork-execute") || _run_rc=$?
     printf '%s\n' "$execute_out"
     MINI_ORK_ARTIFACT_PATH=$(printf '%s\n' "$execute_out" | grep -E '^artifact_path=' | head -1 | cut -d= -f2 || true)
     export MINI_ORK_ARTIFACT_PATH
 
-    # ── verify ─────────────────────────────────────────────────────────────────
-    if [ -n "${MINI_ORK_ARTIFACT_PATH:-}" ]; then
-      "$MINI_ORK_ROOT/bin/mini-ork-verify" "$MINI_ORK_ARTIFACT_PATH"
-    else
-      "$MINI_ORK_ROOT/bin/mini-ork-verify"
+    # Persist execute output in the run dir (obs contract — asserted by
+    # tests/test_obs_surface.sh). Skip when the file already exists:
+    # mini-ork-self-improve streams the WHOLE lifecycle into the same
+    # $RUN_DIR/execute.log via redirect, and truncating it mid-stream
+    # from in here would corrupt that capture.
+    _run_dir=$(dirname "${MINI_ORK_PLAN_PATH:-}")
+    if [ -d "$_run_dir" ] && [ ! -f "$_run_dir/execute.log" ]; then
+      printf '%s\n' "$execute_out" > "$_run_dir/execute.log" 2>/dev/null || true
     fi
+
+    # ── verify ─────────────────────────────────────────────────────────────────
+    _verify_rc=0
+    if [ -n "${MINI_ORK_ARTIFACT_PATH:-}" ]; then
+      "$MINI_ORK_ROOT/bin/mini-ork-verify" "$MINI_ORK_ARTIFACT_PATH" || _verify_rc=$?
+    else
+      "$MINI_ORK_ROOT/bin/mini-ork-verify" || _verify_rc=$?
+    fi
+    [ "$_run_rc" -eq 0 ] && _run_rc=$_verify_rc
+
+    # ── reflect (learning extraction) ──────────────────────────────────────────
+    # Close the learning loop: extract gradients from THIS run's traces so the
+    # next run of the same task_class gets them injected into node prompts
+    # (context_failure_modes_md). Best-effort — a reflect failure must never
+    # fail an otherwise green run. Opt-out: MO_AUTO_REFLECT=0.
+    if [ "${MO_AUTO_REFLECT:-1}" = "1" ]; then
+      echo "── reflect (auto, since run start) ──"
+      MO_REFLECTION_BATCH="${MO_REFLECTION_BATCH:-25}" \
+        "$MINI_ORK_ROOT/bin/mini-ork-reflect" --since "$_RUN_T0" \
+        || echo "  [warn] auto-reflect failed (run itself unaffected)" >&2
+    fi
+    exit "$_run_rc"
     ;;
 
   doctor)
