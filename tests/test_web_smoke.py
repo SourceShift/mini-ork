@@ -309,3 +309,127 @@ def test_dag_carries_node_status(db) -> None:
     assert any(s in ("running", "done", "failed") for s in statuses.values()), (
         f"expected at least one observed node, got: {statuses}"
     )
+
+
+# ── project switcher (GET /projects, POST /projects/switch) ─────────────────
+
+
+def test_projects_list_includes_active(db, home, monkeypatch, tmp_path) -> None:
+    from mini_ork.web.deps import get_home
+    from mini_ork.web.routes.projects import list_projects
+
+    monkeypatch.setenv("MINI_ORK_PROJECTS_FILE", str(tmp_path / "projects.json"))
+    out = list_projects(get_home())
+    assert out["active"] == str(home)
+    actives = [p for p in out["projects"] if p["active"]]
+    assert len(actives) == 1
+    assert actives[0]["home"] == str(home)
+    assert actives[0]["exists"] is True
+
+
+def test_projects_switch_rejects_bogus_path(db, monkeypatch, tmp_path) -> None:
+    from fastapi import HTTPException
+
+    from mini_ork.web.routes.projects import switch_project
+
+    monkeypatch.setenv("MINI_ORK_PROJECTS_FILE", str(tmp_path / "projects.json"))
+    with pytest.raises(HTTPException) as e:
+        switch_project({"home": str(tmp_path / "nope")})
+    assert e.value.status_code == 400
+    with pytest.raises(HTTPException) as e:
+        switch_project({"home": "  "})
+    assert e.value.status_code == 422
+
+
+def test_projects_switch_swaps_db_and_registers(db, home, monkeypatch, tmp_path) -> None:
+    """Switch to a second home, verify get_db points at it, switch back."""
+    import sqlite3
+
+    from mini_ork.web.deps import get_db, get_home, set_home_override
+    from mini_ork.web.routes.projects import list_projects, switch_project
+
+    monkeypatch.setenv("MINI_ORK_PROJECTS_FILE", str(tmp_path / "projects.json"))
+
+    other = tmp_path / "researcher" / ".mini-ork"
+    other.mkdir(parents=True)
+    con = sqlite3.connect(other / "state.db")
+    con.execute("CREATE TABLE task_runs (id TEXT PRIMARY KEY, status TEXT)")
+    con.commit()
+    con.close()
+
+    try:
+        # convenience: project folder (parent of .mini-ork) is accepted too
+        out = switch_project({"home": str(other.parent)})
+        assert out["ok"] is True
+        assert out["active"] == str(other)
+        assert out["name"] == "researcher"
+        assert get_home() == other
+        assert get_db().db_path == other / "state.db"
+
+        listed = list_projects(get_home())
+        assert str(other) in [p["home"] for p in listed["projects"]]
+    finally:
+        set_home_override(home)
+    assert get_db().db_path == home / "state.db"
+
+
+def test_projects_validate_and_add(db, home, monkeypatch, tmp_path) -> None:
+    import sqlite3
+
+    from mini_ork.web.deps import get_home
+    from mini_ork.web.routes.projects import add_project, list_projects, validate_project
+
+    monkeypatch.setenv("MINI_ORK_PROJECTS_FILE", str(tmp_path / "projects.json"))
+    active = get_home()
+
+    bad = validate_project(str(tmp_path / "nowhere"), active)
+    assert bad["ok"] is False and "error" in bad
+
+    other = tmp_path / "researcher" / ".mini-ork"
+    other.mkdir(parents=True)
+    sqlite3.connect(other / "state.db").close()
+
+    good = validate_project(str(other.parent), active)  # project folder accepted
+    assert good["ok"] is True
+    assert good["home"] == str(other)
+    assert good["name"] == "researcher"
+    assert good["registered"] is False
+
+    out = add_project({"home": str(other.parent)}, active)
+    assert out["ok"] is True and out["project"]["home"] == str(other)
+    # add registers without switching
+    assert validate_project(str(other), active)["registered"] is True
+    listed = list_projects(active)
+    assert str(other) in [p["home"] for p in listed["projects"]]
+    assert listed["active"] == str(home)
+
+
+def test_workspace_scoped_home_resolution(db, home, tmp_path) -> None:
+    """Per-request workspace: the X-Mini-Ork-Home header (or `home` query
+    param for SSE) resolves to its own home + DB without touching the
+    server-wide default."""
+    import sqlite3
+
+    from fastapi import HTTPException
+
+    from mini_ork.web.deps import db_for, get_db, get_default_home, get_home, get_home_lenient
+
+    other = tmp_path / "researcher" / ".mini-ork"
+    other.mkdir(parents=True)
+    sqlite3.connect(other / "state.db").close()
+
+    assert get_home(str(other.parent), None) == other  # project folder accepted
+    assert get_home(None, str(other)) == other  # query param (SSE) works
+    assert get_home(str(other), str(home)) == other  # header beats query param
+    assert get_home(None, None) == get_default_home()  # no workspace → default
+
+    # request-scoped DB resolution leaves the server default untouched
+    assert get_db(get_home(str(other), None)).db_path == other / "state.db"
+    assert get_db().db_path == home / "state.db"
+    assert db_for(other) is db_for(other)  # per-home handle cache
+
+    with pytest.raises(HTTPException) as e:
+        get_home(str(tmp_path / "nope"), None)
+    assert e.value.status_code == 404
+    # lenient variant (projects routes) falls back instead of locking out
+    assert get_home_lenient(str(tmp_path / "nope"), None) == get_default_home()

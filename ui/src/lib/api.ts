@@ -7,10 +7,58 @@
 
 const BASE = "";
 
+// --- workspace (multi-project) --------------------------------------------
+// The server resolves each request's .mini-ork home from the X-Mini-Ork-Home
+// header (or `home` query param for SSE). The chosen workspace lives in the
+// URL (?ws=) so deep links and reloads land in the right project, plus
+// localStorage as a fallback for ws-less URLs.
+
+const WS_KEY = "mini-ork.workspace";
+let workspaceHome: string | null = null;
+
+export function getWorkspaceHome(): string | null {
+  return workspaceHome;
+}
+
+export function setWorkspaceHome(home: string | null): void {
+  workspaceHome = home;
+  try {
+    if (home) localStorage.setItem(WS_KEY, home);
+    else localStorage.removeItem(WS_KEY);
+  } catch {
+    // private browsing — header still works for this session
+  }
+}
+
+/** Call once before first render: URL ?ws= wins, then localStorage. */
+export function initWorkspaceFromUrl(): void {
+  const ws = new URLSearchParams(window.location.search).get("ws");
+  if (ws) {
+    setWorkspaceHome(ws);
+    return;
+  }
+  try {
+    workspaceHome = localStorage.getItem(WS_KEY);
+  } catch {
+    workspaceHome = null;
+  }
+}
+
+/** Append `home=` query param (EventSource can't send headers). */
+export function withWorkspaceParam(path: string): string {
+  if (!workspaceHome) return path;
+  const sep = path.includes("?") ? "&" : "?";
+  return `${path}${sep}home=${encodeURIComponent(workspaceHome)}`;
+}
+
+function wsHeaders(): Record<string, string> {
+  return workspaceHome ? { "X-Mini-Ork-Home": workspaceHome } : {};
+}
+
 async function get<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(`${BASE}${path}`, {
     ...init,
-    headers: { Accept: "application/json", ...(init?.headers ?? {}) },
+    headers: { Accept: "application/json", ...wsHeaders(), ...(init?.headers ?? {}) },
   });
   if (!res.ok) {
     const body = await res.text().catch(() => "");
@@ -19,10 +67,15 @@ async function get<T>(path: string, init?: RequestInit): Promise<T> {
   return (await res.json()) as T;
 }
 
-async function post<T>(path: string): Promise<T> {
+async function post<T>(path: string, body?: unknown): Promise<T> {
   const res = await fetch(`${BASE}${path}`, {
     method: "POST",
-    headers: { Accept: "application/json" },
+    headers: {
+      Accept: "application/json",
+      ...wsHeaders(),
+      ...(body !== undefined ? { "Content-Type": "application/json" } : {}),
+    },
+    ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
   });
   if (!res.ok) {
     const body = await res.text().catch(() => "");
@@ -438,8 +491,31 @@ export type WallTimeRow = { day: string; recipe: string; avg_ms: number; max_ms:
 
 // --- endpoints -----------------------------------------------------------
 
+export type Project = {
+  home: string;
+  name: string;
+  exists: boolean;
+  active: boolean;
+};
+
 export const api = {
   health: () => get<Health>("/api/v1/health"),
+  projects: () => get<{ active: string; projects: Project[] }>("/api/v1/projects"),
+  validateProject: (path: string) =>
+    get<{ ok: boolean; error?: string; home?: string; name?: string; registered?: boolean }>(
+      `/api/v1/projects/validate?path=${encodeURIComponent(path)}`,
+    ),
+  addProject: (home: string) => post<{ ok: boolean; project: Project }>("/api/v1/projects/add", { home }),
+  browseDirs: (path?: string) =>
+    get<{
+      path: string;
+      parent: string | null;
+      is_project: boolean;
+      dirs: { name: string; path: string; is_project: boolean }[];
+    }>(`/api/v1/projects/browse${path ? `?path=${encodeURIComponent(path)}` : ""}`),
+  removeProject: (home: string) => post<{ ok: boolean; removed: string }>("/api/v1/projects/remove", { home }),
+  switchProject: (home: string) =>
+    post<{ ok: boolean; active: string; name: string }>("/api/v1/projects/switch", { home }),
   activeRuns: () => get<ActiveRun[]>("/api/v1/runs/active"),
   taskRuns: (opts: { limit?: number; recipe?: string; status?: string; verdict?: string } = {}) => {
     const q = new URLSearchParams();
@@ -482,7 +558,7 @@ export const api = {
   saveAnswers: async (id: string, answers: Record<string, string>) => {
     const res = await fetch(`/api/v1/task-runs/${encodeURIComponent(id)}/answers`, {
       method: "POST",
-      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      headers: { "Content-Type": "application/json", Accept: "application/json", ...wsHeaders() },
       body: JSON.stringify(answers),
     });
     if (!res.ok) {
