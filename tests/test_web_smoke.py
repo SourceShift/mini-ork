@@ -134,7 +134,7 @@ def test_cost_by_day(db) -> None:
 def test_fingerprint_recursive_self_improve() -> None:
     from mini_ork.web.routes.fingerprint import fingerprint
 
-    out = fingerprint(recipe="recursive-self-improve")
+    out = fingerprint(recipe="recursive-self-improve", home=None)
     assert out["recipe"] == "recursive-self-improve"
     assert out["nodes"], "recipe should have nodes"
     # The framework's load-bearing claim: this recipe must be heterogeneous.
@@ -338,7 +338,7 @@ def test_events_carry_bridge_attribution(db) -> None:
             assert e["bridge"] in ("trace_id", "run_id", "time-window")
 
 
-def test_dag_carries_node_status(db) -> None:
+def test_dag_carries_node_status(db, home) -> None:
     """DAG endpoint must merge node_start/node_end events into per-node status.
 
     Looks for any task_run with node events; skips when none exist (typical
@@ -358,7 +358,7 @@ def test_dag_carries_node_status(db) -> None:
     if not rows:
         pytest.skip("no task_runs with node events yet — re-run after a real dispatch")
     task_run_id = rows[0]["id"]
-    out = get_dag(task_run_id=task_run_id, db=db)
+    out = get_dag(task_run_id=task_run_id, db=db, home=home)
     statuses = {n["name"]: n["status"] for n in out["nodes"]}
     assert any(s in ("running", "done", "failed") for s in statuses.values()), (
         f"expected at least one observed node, got: {statuses}"

@@ -43,11 +43,20 @@ def load_recipe(name: str) -> dict[str, Any]:
     return {"name": name, "workflow": wf, "task_class": tc}
 
 
-@lru_cache(maxsize=1)
-def load_lanes() -> dict[str, str]:
-    """lane_name → family (e.g. opus_lens → opus, planner → deepseek)."""
-    root = mini_ork_root()
-    cfg = _safe_load(root / "config" / "agents.yaml")
+@lru_cache(maxsize=16)
+def load_lanes(home: Path | None = None) -> dict[str, str]:
+    """lane_name → family (e.g. opus_lens → opus, planner → deepseek).
+
+    Mirrors lib/llm-dispatch.sh resolution: the workspace's own
+    $MINI_ORK_HOME/config/agents.yaml wins wholesale when present
+    (per-project lane overrides), else the repo's config/agents.yaml.
+    """
+    cfg_path = mini_ork_root() / "config" / "agents.yaml"
+    if home is not None:
+        override = Path(home) / "config" / "agents.yaml"
+        if override.exists():
+            cfg_path = override
+    cfg = _safe_load(cfg_path)
     lanes = (cfg.get("lanes") or {}) if isinstance(cfg, dict) else {}
     return {str(k): str(v) for k, v in lanes.items()}
 
@@ -59,7 +68,7 @@ def list_recipes() -> list[str]:
     return sorted(p.name for p in root.iterdir() if (p / "workflow.yaml").exists())
 
 
-def fingerprint(recipe_name: str) -> dict[str, Any]:
+def fingerprint(recipe_name: str, home: Path | None = None) -> dict[str, Any]:
     """Per-node family attribution + coalition risk score for a recipe.
 
     Returns:
@@ -68,7 +77,7 @@ def fingerprint(recipe_name: str) -> dict[str, Any]:
     """
     rec = load_recipe(recipe_name)
     wf = rec["workflow"] or {}
-    lanes = load_lanes()
+    lanes = load_lanes(home)
     nodes_raw = wf.get("nodes") or []
     nodes: list[dict[str, Any]] = []
     for n in nodes_raw:
