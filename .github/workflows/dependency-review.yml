@@ -1,0 +1,22 @@
+name: Dependency Review
+
+on:
+  pull_request:
+    branches: ["main"]
+
+permissions:
+  contents: read
+
+jobs:
+  dependency-review:
+    name: dependency review
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      # Fails the PR when a changed dependency introduces a known
+      # vulnerability or an incompatible license.
+      - uses: actions/dependency-review-action@v4
+        with:
+          fail-on-severity: high
