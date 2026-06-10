@@ -64,6 +64,7 @@ export function statusPillClass(status: string | null | undefined): string {
     case "success":
     case "converged":
     case "APPROVE":
+    case "pass":
       return "pill-ok";
     case "executing":
     case "verifying":
@@ -71,8 +72,15 @@ export function statusPillClass(status: string | null | undefined): string {
     case "planned":
     case "in_progress":
     case "pending":
+    case "running":
+    case "partial":
+    // vacuous = zero verifiers executed: not a pass, not a failure — amber
+    // so it reads as "needs attention" rather than laundering into green.
+    case "vacuous":
       return "pill-warn";
     case "failed":
+    case "failure":
+    case "fail":
     case "rolled_back":
     case "aborted":
     case "timed_out":
