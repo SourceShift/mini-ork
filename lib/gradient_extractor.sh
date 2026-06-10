@@ -260,7 +260,7 @@ gradient_store() {
   local payload="${1:?json_payload required}"
   _gradient_ensure_table
   python3 - "${MINI_ORK_DB:?MINI_ORK_DB unset}" "$payload" <<'PY'
-import sqlite3, json, sys, uuid, time
+import sqlite3, json, sys, uuid, time, os, re
 
 db = sys.argv[1]
 try:
@@ -293,6 +293,59 @@ if not task_class:
         task_class = row[0] if row and row[0] else ""
     except sqlite3.OperationalError:
         task_class = ""
+
+# --- Cross-target dedup ---------------------------------------------------
+# The LLM extractor often mints the SAME underlying issue under several
+# targets (e.g. workflow.node.X and workflow.node.Y both flagging missing
+# run_id stamps). Each copy passes the confidence floor and gets injected
+# into prompts — redundant tokens, no extra signal. Before inserting,
+# compare against same-task_class records by stopword-filtered token
+# CONTAINMENT (overlap / smaller set — robust to length asymmetry, unlike
+# plain Jaccard which saturates low on multi-sentence text); on a hit,
+# absorb into the existing record (keep max confidence) instead of
+# inserting. Measured on live data: true dups score >=0.69, the ambiguous
+# plateau sits at ~0.58, so the 0.65 default only merges unambiguous
+# copies — a false merge permanently loses a learning, a miss just costs
+# tokens. MO_GRADIENT_DEDUP_SIM tunes the threshold; 0 disables.
+_STOP = set(
+    "the a an of to in on for and or is are was were be been it its this"
+    " that with not no when even though so as by from at into our we you"
+    " their".split()
+)
+
+def _tokens(s):
+    return set(re.findall(r"[a-z0-9_]+", s.lower())) - _STOP
+
+_thresh = float(os.environ.get("MO_GRADIENT_DEDUP_SIM", "0.65"))
+if _thresh > 0 and not p.get("gradient_id"):
+    new_tok = _tokens(f"{p['signal']} {p['suggested_change']}")
+    try:
+        rows = con.execute(
+            "SELECT gradient_id, target, signal, suggested_change, confidence"
+            " FROM gradient_records WHERE task_class = ?",
+            (task_class,),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        rows = []
+    for gid_e, target_e, sig_e, chg_e, conf_e in rows:
+        old_tok = _tokens(f"{sig_e} {chg_e}")
+        if not new_tok or not old_tok:
+            continue
+        sim = len(new_tok & old_tok) / min(len(new_tok), len(old_tok))
+        if sim >= _thresh:
+            con.execute(
+                "UPDATE gradient_records SET confidence = ? WHERE gradient_id = ?",
+                (max(float(conf_e or 0), float(p.get("confidence", 0.5))), gid_e),
+            )
+            con.commit()
+            con.close()
+            print(
+                f"gradient_store: dedup sim={sim:.2f} target={p['target']}"
+                f" absorbed into {target_e} [{gid_e}]",
+                file=sys.stderr,
+            )
+            print(gid_e)
+            sys.exit(0)
 
 con.execute("""
     INSERT INTO gradient_records (
