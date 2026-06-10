@@ -21,6 +21,12 @@ node_modules/
 **/secrets.local.sh
 **/secrets.local.*
 *.local.secrets
+# Local provider registry may name private endpoints/models — never commit.
+# (It SHADOWS config/providers.yaml entirely: first-hit resolution, no merge.)
+.mini-ork/config/providers.yaml
+
+# Runtime locks
+.claude/scheduled_tasks.lock
 
 # Build artifacts
 dist/
