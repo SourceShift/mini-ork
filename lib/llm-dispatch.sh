@@ -527,6 +527,11 @@ session_id = None
 turns = []  # per-assistant-message usage; one row per real API turn
 total_input_tokens = 0
 total_output_tokens = 0
+# Set True when totals get sourced from the result envelope's usage block
+# (the only field the CLI populates accurately). Default False = totals
+# are summed from possibly-stub per-turn values and should be treated as
+# advisory until the result event lands.
+usage_authoritative = False
 transcript_fallback = None
 try:
     with open(raw_path) as f:
@@ -545,11 +550,19 @@ try:
                 is_error_flag = bool(obj.get('is_error', False))
                 api_error_status = obj.get('api_error_status')
                 session_id = obj.get('session_id', session_id)
-                # Some SDK versions surface usage on the result envelope too
+                # The CLI's per-turn assistant events emit STUB usage values
+                # (often input_tokens=2 / output_tokens=41 repeated across every
+                # turn with stop_reason=null). The 'result' envelope's usage is
+                # the only authoritative count — it's what the API actually
+                # billed. ALWAYS take it as ground truth, not only when turns is
+                # empty. Per-turn stub values stay in the transcript as advisory
+                # (with usage_authoritative flagged below), but the run-level
+                # total_input_tokens / total_output_tokens reflect the truth.
                 u = obj.get('usage') or {}
-                if u and not turns:
+                if u:
                     total_input_tokens = int(u.get('input_tokens') or 0)
                     total_output_tokens = int(u.get('output_tokens') or 0)
+                    usage_authoritative = True
             elif et == 'system' and obj.get('subtype') == 'init':
                 session_id = obj.get('session_id', session_id)
             elif et == 'assistant':
@@ -688,7 +701,15 @@ if not turns and result_text:
         'session_id': session_id,
     })
     transcript_fallback = 'text-output'
-_payload_obj = {'turns': turns}
+_payload_obj = {
+    'turns': turns,
+    'totals': {
+        'input_tokens': total_input_tokens,
+        'output_tokens': total_output_tokens,
+        'cost_usd': total_cost_usd,
+    },
+    'usage_authoritative': usage_authoritative,
+}
 if transcript_fallback:
     _payload_obj['fallback'] = transcript_fallback
 _payload = json.dumps(_payload_obj)
@@ -697,7 +718,16 @@ if len(_payload) > MAX_TRANSCRIPT_BYTES:
     for t in turns:
         if 'text' in t and t['text']:
             t['text'] = t['text'][: max(200, len(t['text']) // 4)] + '\n…[truncated]'
-    _payload_obj = {'turns': turns, 'truncated': True}
+    _payload_obj = {
+        'turns': turns,
+        'truncated': True,
+        'totals': {
+            'input_tokens': total_input_tokens,
+            'output_tokens': total_output_tokens,
+            'cost_usd': total_cost_usd,
+        },
+        'usage_authoritative': usage_authoritative,
+    }
     if transcript_fallback:
         _payload_obj['fallback'] = transcript_fallback
     _payload = json.dumps(_payload_obj)

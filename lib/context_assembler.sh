@@ -245,12 +245,21 @@ db, task_class, limit, cur_run = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys
 con = sqlite3.connect(db)
 con.execute("PRAGMA busy_timeout=5000")
 try:
+    # One line per RUN, not per node trace — 5 node traces of one run are
+    # noise, 5 runs are memory. Legacy rows with run_id NULL degrade to one
+    # group per trace. Run status: failure if ANY node failed.
     rows = con.execute("""
-        SELECT trace_id, status, cost_usd, duration_ms, created_at
+        SELECT COALESCE(run_id, trace_id) AS run_key,
+               COUNT(*) AS nodes,
+               SUM(CASE WHEN status NOT IN ('success','running') THEN 1 ELSE 0 END) AS failed_nodes,
+               SUM(COALESCE(cost_usd, 0)) AS total_cost,
+               SUM(COALESCE(duration_ms, 0)) AS total_dur_ms,
+               MAX(created_at) AS last_at
         FROM execution_traces
         WHERE task_class = ?
           AND (? = '' OR run_id IS NULL OR run_id != ?)
-        ORDER BY created_at DESC LIMIT ?
+        GROUP BY run_key
+        ORDER BY last_at DESC LIMIT ?
     """, (task_class, cur_run, cur_run, limit)).fetchall()
 except sqlite3.OperationalError:
     rows = []
@@ -258,14 +267,15 @@ finally:
     con.close()
 
 if rows:
-    n_ok = sum(1 for r in rows if (r[1] or "") == "success")
+    n_ok = sum(1 for r in rows if (r[2] or 0) == 0)
     print("--- Prior runs of this task class (memory) ---")
-    print(f"{len(rows)} most recent: {n_ok} success / {len(rows) - n_ok} other. "
+    print(f"{len(rows)} most recent: {n_ok} clean / {len(rows) - n_ok} with failures. "
           "Calibrate plan scope and verifier strictness against these outcomes:")
-    for trace_id, status, cost, dur_ms, created in rows:
+    for run_key, nodes, failed, cost, dur_ms, last_at in rows:
+        outcome = "success" if (failed or 0) == 0 else f"{failed}/{nodes} nodes failed"
         cost_s = f"${cost:.2f}" if isinstance(cost, (int, float)) else "?"
-        dur_s = f"{dur_ms // 1000}s" if isinstance(dur_ms, int) else "?"
-        print(f"- {trace_id}: {status or 'unknown'} (cost {cost_s}, {dur_s})")
+        dur_s = f"{int(dur_ms) // 1000}s" if isinstance(dur_ms, (int, float)) else "?"
+        print(f"- {run_key}: {outcome} ({nodes} nodes, cost {cost_s}, {dur_s})")
     print("--- /prior runs ---")
 PY
 }
