@@ -20,14 +20,18 @@ const fleetRoute = createRoute({
 const runDetailRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/runs/$taskRunId",
-  validateSearch: (search: Record<string, unknown>): { tab?: string } =>
-    typeof search.tab === "string" ? { tab: search.tab } : {},
+  validateSearch: (search: Record<string, unknown>): { tab?: string; artifact?: string } => ({
+    ...(typeof search.tab === "string" ? { tab: search.tab } : {}),
+    ...(typeof search.artifact === "string" ? { artifact: search.artifact } : {}),
+  }),
   component: RunDetailPage,
 });
 
 const agentDetailRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/runs/$taskRunId/agents/$nodeId",
+  validateSearch: (search: Record<string, unknown>): { tab?: string } =>
+    typeof search.tab === "string" ? { tab: search.tab } : {},
   component: AgentDetailPage,
 });
 

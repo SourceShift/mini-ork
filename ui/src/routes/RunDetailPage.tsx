@@ -16,11 +16,11 @@ import {
   ScrollText,
 } from "lucide-react";
 
-import { api, type AgentSummary, type DagNode, type LearningAttribution, type LlmCall, type RunEvent, type RunInput, type RunLearning } from "@/lib/api";
+import { api, type AgentSummary, type ArtifactEntry, type DagNode, type Diagnostic, type LearningAttribution, type LlmCall, type RunEvent, type RunInput, type RunLearning, type TaskRun } from "@/lib/api";
 import { formatCost, formatDuration, formatRelative, formatTokens } from "@/lib/format";
 import { FamilyPill, StatusPill, VerdictPill } from "@/components/Pill";
 import { RunDag } from "@/components/RunDag";
-import { ArtifactViewer } from "@/components/ArtifactViewer";
+import { ArtifactViewer, artifactLabel, isDeliverableArtifact } from "@/components/ArtifactViewer";
 import { WhyCard } from "@/components/WhyCard";
 import { RunControls } from "@/components/RunControls";
 import { NeedsAnswersPanel } from "@/components/NeedsAnswersPanel";
@@ -65,6 +65,12 @@ export function RunDetailPage() {
     queryFn: () => api.inputs(taskRunId),
     refetchInterval: 5_000,
   });
+  // Same queryKey as ArtifactViewer — react-query dedupes the request.
+  const artifacts = useQuery({
+    queryKey: ["artifacts", taskRunId],
+    queryFn: () => api.artifacts(taskRunId),
+    refetchInterval: 5_000,
+  });
   const learning = useQuery({
     queryKey: ["learning", taskRunId],
     queryFn: () => api.learning(taskRunId),
@@ -73,6 +79,12 @@ export function RunDetailPage() {
   const correlation = useQuery({
     queryKey: ["correlation", taskRunId],
     queryFn: () => api.correlation(taskRunId),
+  });
+  // Shares queryKey with WhyCard — react-query dedupes, no extra request.
+  const why = useQuery({
+    queryKey: ["why", taskRunId],
+    queryFn: () => api.why(taskRunId),
+    refetchInterval: 10_000,
   });
 
   useEventStream(`/api/v1/stream?task_run=${encodeURIComponent(taskRunId)}`, (name) => {
@@ -95,6 +107,12 @@ export function RunDetailPage() {
   const run = tr.data;
   const dagNodes = dag.data?.nodes ?? [];
   const agentRows = agents.data?.agents ?? [];
+  const agentByFile: Record<string, string> = Object.fromEntries(
+    agentRows.flatMap((a) => a.artifact_files.map((f) => [f, a.node_id])),
+  );
+  const selectedArtifact = typeof search.artifact === "string" ? search.artifact : null;
+  const openArtifact = (relpath: string) =>
+    navigate({ search: (prev) => ({ ...prev, tab: "artifacts", artifact: relpath }) });
 
   return (
     <div className="p-3 space-y-3 max-w-[1500px] mx-auto" data-testid="run-detail-page" data-run-id={taskRunId}>
@@ -110,33 +128,21 @@ export function RunDetailPage() {
       </div>
 
       {run && (
-        <header className="card grid grid-cols-1 lg:grid-cols-[1.4fr_1fr] gap-5" data-testid="run-overview">
-          <div className="min-w-0">
-            <div className="panel-title">Run Forensics</div>
-            <div className="flex items-center gap-2 flex-wrap">
-              <span className="h-8 w-1 rounded-sm" style={{ background: run.status === "failed" ? "var(--red)" : "var(--grn)" }} />
-              <h1 className="text-[21px] font-black uppercase tracking-[0.06em] text-ink-100">{run.recipe ?? run.task_class}</h1>
-              <StatusPill status={run.status} />
-              <VerdictPill verdict={run.verdict} />
-            </div>
-            <p className="mt-2 text-[12px] text-ink-400 leading-relaxed">
-              Mini-ork run <code>{taskRunId}</code> for task class <code>{run.task_class}</code>.
-              Inputs, DAG state, agents, and output artifacts are separated below so telemetry files do
-              not get mixed into deliverables.
-            </p>
-            <div className="mt-4 grid grid-cols-2 md:grid-cols-4 gap-3">
-              <Metric icon={<Clock size={14} />} label="created" value={formatRelative(run.created_at)} />
-              <Metric icon={<Clock size={14} />} label="ended" value={run.ended_at ? formatRelative(run.ended_at) : "running"} />
-              <Metric icon={<ScrollText size={14} />} label="cost" value={formatCost(run.cost_usd)} />
-              <Metric icon={<Bot size={14} />} label="llm calls" value={String(llm.data?.length ?? 0)} />
-            </div>
+        <header className="card" data-testid="run-overview">
+          <div className="panel-title">Run Forensics</div>
+          <div className="flex items-center gap-2 flex-wrap">
+            <span className="h-8 w-1 rounded-sm" style={{ background: run.status === "failed" ? "var(--red)" : "var(--grn)" }} />
+            <h1 className="text-[21px] font-black uppercase tracking-[0.06em] text-ink-100">{run.recipe ?? run.task_class}</h1>
+            <StatusPill status={run.status} />
+            <VerdictPill verdict={run.verdict} />
+            <code className="text-[10.5px] text-ink-500">{run.task_class}</code>
           </div>
-          <div className="grid grid-cols-2 gap-3 content-start">
-            <StatusCount label="startup" value={countNodes(dagNodes, "startup")} tone="startup" />
-            <StatusCount label="running" value={countNodes(dagNodes, "running")} tone="running" />
-            <StatusCount label="succeeded" value={countNodes(dagNodes, "succeeded")} tone="succeeded" />
-            <StatusCount label="failed" value={countNodes(dagNodes, "failed")} tone="failed" />
-            <StatusCount label="queued" value={countNodes(dagNodes, "queued")} tone="queued" wide />
+          <div className="mt-3 grid grid-cols-2 md:grid-cols-5 gap-3">
+            <Metric icon={<Clock size={14} />} label="created" value={formatRelative(run.created_at)} />
+            <Metric icon={<Clock size={14} />} label="ended" value={run.ended_at ? formatRelative(run.ended_at) : "running"} />
+            <Metric icon={<Clock size={14} />} label="duration" value={runDuration(run)} />
+            <Metric icon={<ScrollText size={14} />} label="cost" value={formatCost(run.cost_usd)} />
+            <Metric icon={<Bot size={14} />} label="llm calls" value={String(llm.data?.length ?? 0)} />
           </div>
         </header>
       )}
@@ -146,44 +152,50 @@ export function RunDetailPage() {
       {activeTab === "overview" && (
         <>
           <NeedsAnswersPanel taskRunId={taskRunId} />
-          <section className="grid grid-cols-1 xl:grid-cols-[360px_1fr] gap-3">
-            <RunInputsCard inputs={inputs.data ?? []} onSelect={setSelectedInput} />
-            <CorrelationStrip
-              traceId={run?.trace_id ?? null}
-              events={events.data ?? []}
-              llmCalls={llm.data ?? []}
-              methods={correlation.data?.bridge_methods ?? []}
-            />
-          </section>
-          <section className="grid grid-cols-1 xl:grid-cols-[1fr_380px] gap-3">
-            <WhyCard taskRunId={taskRunId} />
-            <DiagnosticsCard events={events.data ?? []} llmCalls={llm.data ?? []} />
-          </section>
+          <PipelineCard
+            nodes={dagNodes}
+            taskRunId={taskRunId}
+            run={run ?? null}
+            events={events.data ?? []}
+            why={why.data}
+          />
+          <RunInputChips inputs={inputs.data ?? []} onSelect={setSelectedInput} />
+          <RunArtifactChips artifacts={artifacts.data ?? []} agentByFile={agentByFile} onOpen={openArtifact} />
+          {hasFailureSignal(why.data, run?.status) && <WhyCard taskRunId={taskRunId} />}
         </>
-      )}
-
-      {activeTab === "dag" && dag.data && (
-        <DagTabView dag={dag.data} taskRunId={taskRunId} />
       )}
 
       {activeTab === "learnings" && <RunLearningPanel taskRunId={taskRunId} learning={learning.data ?? null} />}
 
       {activeTab === "agents" && (
-        <AgentsTabView dag={dag.data ?? null} taskRunId={taskRunId} agents={agentRows} />
+        <AgentsTabView
+          dag={dag.data ?? null}
+          taskRunId={taskRunId}
+          agents={agentRows}
+          onOpenArtifact={openArtifact}
+        />
       )}
 
       {activeTab === "artifacts" && (
         <section className="space-y-2" data-testid="run-output-section">
           <SectionTitle icon={<ScrollText size={16} />} title="Output artifacts" subtitle="Telemetry sidecars are hidden from this deliverable view." />
-          <ArtifactViewer taskRunId={taskRunId} />
+          <ArtifactViewer taskRunId={taskRunId} initialSelection={selectedArtifact} agentByFile={agentByFile} />
         </section>
       )}
 
       {activeTab === "diagnostics" && (
-        <section className="grid grid-cols-1 xl:grid-cols-[1fr_380px] gap-3">
-          <WhyCard taskRunId={taskRunId} />
-          <DiagnosticsCard events={events.data ?? []} llmCalls={llm.data ?? []} />
-        </section>
+        <>
+          <CorrelationStrip
+            traceId={run?.trace_id ?? null}
+            events={events.data ?? []}
+            llmCalls={llm.data ?? []}
+            methods={correlation.data?.bridge_methods ?? []}
+          />
+          <section className="grid grid-cols-1 xl:grid-cols-[1fr_380px] gap-3">
+            <WhyCard taskRunId={taskRunId} />
+            <DiagnosticsCard events={events.data ?? []} llmCalls={llm.data ?? []} />
+          </section>
+        </>
       )}
       <RunInputModal taskRunId={taskRunId} input={selectedInput} onClose={() => setSelectedInput(null)} />
     </div>
@@ -194,57 +206,34 @@ function AgentsTabView({
   dag,
   taskRunId,
   agents,
+  onOpenArtifact,
 }: {
   dag: ({ nodes: DagNode[]; edges: any[]; families_used?: Record<string, number> } & Record<string, any>) | null;
   taskRunId: string;
   agents: AgentSummary[];
+  onOpenArtifact: (relpath: string) => void;
 }) {
-  const families = Array.from(new Set(agents.map((agent) => agent.family).filter(Boolean))) as string[];
   const totalCost = agents.reduce((sum, agent) => sum + (agent.llm_cost_usd || 0), 0);
   const totalTokens = agents.reduce((sum, agent) => sum + (agent.llm_total_tokens || 0), 0);
   return (
     <section className="space-y-2" data-testid="run-agents-section">
-      <div className="flex flex-wrap items-center justify-between gap-2 border border-[var(--hair)] bg-[var(--panel)] px-2 py-1">
-        <div className="flex flex-wrap items-center gap-1">
-          {["all", "failed", "running"].map((item) => (
-            <span key={item} className={item === "all" ? "pill-ok" : "pill-muted"}>{item}</span>
-          ))}
-          <span className="pill-warn">approx attr</span>
-          {families.map((family) => <FamilyPill key={family} family={family} />)}
-        </div>
-        <div className="font-mono text-[10px] uppercase tracking-[0.08em] text-ink-500">
-          Σ {formatCost(totalCost)} · {formatTokens(totalTokens)} tok · {agents.length} agents
-        </div>
-      </div>
+      {dag && (
+        <CoalitionPanel
+          dag={dag}
+          stats={`Σ ${formatCost(totalCost)} · ${formatTokens(totalTokens)} tok · ${agents.length} agents`}
+        />
+      )}
 
       {dag && (
         <div className="card !p-0 overflow-hidden">
-          <div className="panel-title !m-0">Dispatch tree</div>
-          <RunDag nodes={dag.nodes} edges={dag.edges} taskRunId={taskRunId} compact />
+          <div className="panel-title !m-0">Recipe DAG</div>
+          <RunDag nodes={dag.nodes} edges={dag.edges} taskRunId={taskRunId} />
         </div>
       )}
 
       <div>
         <SectionTitle icon={<GitBranch size={16} />} title="Agent roster" subtitle="Sorted by recipe node with run/cost/timing attribution." />
-        <AgentRunGrid taskRunId={taskRunId} agents={agents} />
-      </div>
-    </section>
-  );
-}
-
-function DagTabView({
-  dag,
-  taskRunId,
-}: {
-  dag: { nodes: DagNode[]; edges: any[]; recipe?: string; coalition?: string; families_used?: Record<string, number>; dominant_family?: string | null; dominant_share?: number };
-  taskRunId: string;
-}) {
-  return (
-    <section className="space-y-2" data-testid="run-dag-section">
-      <CoalitionPanel dag={dag} />
-      <div className="card !p-0 overflow-hidden">
-        <div className="panel-title !m-0">Recipe DAG</div>
-        <RunDag nodes={dag.nodes} edges={dag.edges} taskRunId={taskRunId} />
+        <AgentRunGrid taskRunId={taskRunId} agents={agents} onOpenArtifact={onOpenArtifact} />
       </div>
     </section>
   );
@@ -252,8 +241,10 @@ function DagTabView({
 
 function CoalitionPanel({
   dag,
+  stats,
 }: {
   dag: { nodes: DagNode[]; recipe?: string; coalition?: string; families_used?: Record<string, number>; dominant_family?: string | null; dominant_share?: number };
+  stats?: string;
 }) {
   const families = dag.families_used ?? {};
   const familyCount = Object.keys(families).length;
@@ -269,7 +260,7 @@ function CoalitionPanel({
             {coalition}
           </span>
           <span className="font-mono text-[10.5px] text-ink-500">
-            {familyCount} families · {dag.nodes.length} nodes · structural view
+            {familyCount} families · {dag.nodes.length} nodes{stats ? ` · ${stats}` : ""}
           </span>
         </div>
         <div className="flex flex-wrap items-center gap-1">
@@ -286,7 +277,7 @@ function CoalitionPanel({
   );
 }
 
-const RUN_TABS = ["overview", "dag", "agents", "learnings", "artifacts", "diagnostics"] as const;
+const RUN_TABS = ["overview", "agents", "learnings", "artifacts", "diagnostics"] as const;
 type RunTab = (typeof RUN_TABS)[number];
 
 function isRunTab(v: unknown): v is RunTab {
@@ -306,7 +297,6 @@ function RunTabs({
 }) {
   const tabs: Array<{ id: RunTab; label: string; badge?: number }> = [
     { id: "overview", label: "overview" },
-    { id: "dag", label: "dag" },
     { id: "agents", label: "agents", badge: agentCount },
     { id: "learnings", label: "learnings", badge: learningCount },
     { id: "artifacts", label: "artifacts" },
@@ -547,7 +537,7 @@ function AgentAttributionBadge({ taskRunId, attribution }: { taskRunId: string; 
   );
 }
 
-function RunInputsCard({
+function RunInputChips({
   inputs,
   onSelect,
 }: {
@@ -556,32 +546,202 @@ function RunInputsCard({
 }) {
   const ordered = [...inputs].sort((a, b) => inputRank(a.key) - inputRank(b.key));
   return (
-    <section className="card" data-testid="run-inputs-card">
-      <SectionTitle icon={<FileInput size={16} />} title="Run inputs" subtitle="Open source context in rendered form." compact />
-      <div className="mt-3 space-y-2">
-        {ordered.length ? ordered.map((input) => (
-          <button
-            key={input.key}
-            type="button"
-            onClick={() => onSelect(input)}
-            className="block w-full rounded-md border border-ink-700 bg-ink-900/35 px-3 py-2 text-left hover:border-ork-amber/60 hover:bg-ink-900"
-            data-testid={`run-input-link-${input.key}`}
-          >
-            <div className="flex items-center justify-between gap-2">
-              <span className="font-medium text-ink-100">{input.label}</span>
-              <span className="text-[10px] uppercase text-ink-500">{input.kind}</span>
-            </div>
-            <div className="mt-1 text-xs text-ink-500 truncate">{input.path}</div>
-          </button>
-        )) : (
-          <p className="text-sm text-ink-500">No input documents found yet.</p>
+    <section className="card flex flex-wrap items-center gap-2" data-testid="run-inputs-card">
+      <span className="flex items-center gap-1.5 text-[9.5px] font-black uppercase tracking-[0.13em] text-ink-500">
+        <FileInput size={13} className="text-[var(--grn)]" /> inputs
+      </span>
+      {ordered.length ? ordered.map((input) => (
+        <button
+          key={input.key}
+          type="button"
+          onClick={() => onSelect(input)}
+          title={input.path}
+          className="flex items-center gap-1.5 rounded-[3px] border border-[var(--hair)] bg-[var(--panel-2)] px-2 py-1 hover:border-ork-amber/60"
+          data-testid={`run-input-link-${input.key}`}
+        >
+          <span className="text-[11px] text-ink-100">{input.label}</span>
+          <span className="text-[9px] uppercase text-ink-500">{input.kind}</span>
+        </button>
+      )) : (
+        <span className="text-sm text-ink-500">No input documents found yet.</span>
+      )}
+    </section>
+  );
+}
+
+function RunArtifactChips({
+  artifacts,
+  agentByFile,
+  onOpen,
+}: {
+  artifacts: ArtifactEntry[];
+  agentByFile: Record<string, string>;
+  onOpen: (relpath: string) => void;
+}) {
+  // Run-level deliverables only — agent-claimed files live in the roster table.
+  const runLevel = artifacts.filter((a) => isDeliverableArtifact(a) && !agentByFile[a.relpath]);
+  if (!runLevel.length) return null;
+  return (
+    <section className="card flex flex-wrap items-center gap-2" data-testid="run-artifact-chips">
+      <span className="flex items-center gap-1.5 text-[9.5px] font-black uppercase tracking-[0.13em] text-ink-500">
+        <ScrollText size={13} className="text-[var(--grn)]" /> artifacts
+      </span>
+      {runLevel.map((a) => (
+        <button
+          key={a.relpath}
+          type="button"
+          onClick={() => onOpen(a.relpath)}
+          title={a.relpath}
+          className="flex items-center gap-1.5 rounded-[3px] border border-[var(--hair)] bg-[var(--panel-2)] px-2 py-1 hover:border-ork-amber/60"
+          data-testid={`run-artifact-chip-${a.relpath.replace(/[^a-z0-9]/gi, "-")}`}
+        >
+          <span className="text-[11px] text-ink-100">{artifactLabel(a.relpath)}</span>
+          <span className="text-[9px] uppercase text-ink-500">{a.kind}</span>
+        </button>
+      ))}
+    </section>
+  );
+}
+
+function PipelineCard({
+  nodes,
+  taskRunId,
+  run,
+  events,
+  why,
+}: {
+  nodes: DagNode[];
+  taskRunId: string;
+  run: TaskRun | null;
+  events: RunEvent[];
+  why: Diagnostic | undefined;
+}) {
+  const running = nodes.filter((n) => nodeTone(n) === "running" || nodeTone(n) === "startup");
+  const lastEvent = events.length ? events[events.length - 1] : null;
+  const tail = why?.execute_log?.tail ?? [];
+  const isLive = run != null && run.ended_at == null && run.status !== "failed" && run.status !== "rolled_back";
+  return (
+    <section className="card" data-testid="run-pipeline-card">
+      <SectionTitle
+        icon={<Route size={16} />}
+        title="Pipeline"
+        subtitle="Recipe nodes in dispatch order — click a node for its forensics."
+        compact
+      />
+      <div className="mt-3 flex flex-wrap items-center gap-y-2">
+        {nodes.map((node, i) => (
+          <span key={node.name} className="flex items-center">
+            {i > 0 && <span className="mx-1.5 text-ink-600">→</span>}
+            <PipelineNode node={node} taskRunId={taskRunId} />
+          </span>
+        ))}
+        {!nodes.length && <p className="text-sm text-ink-500">No recipe DAG available for this run.</p>}
+      </div>
+
+      <div className="mt-4 grid grid-cols-1 xl:grid-cols-2 gap-3 border-t border-[var(--hair)] pt-3">
+        <div className="min-w-0" data-testid="run-now-panel">
+          <div className="text-[9.5px] font-black uppercase tracking-[0.13em] text-ink-500">now</div>
+          <div className="mt-1.5 space-y-1">
+            {running.length ? (
+              running.map((n) => (
+                <div key={n.name} className="flex items-center gap-2 text-[12px] text-ink-100">
+                  <span className="h-2 w-2 rounded-full bg-ork-green animate-pulse shrink-0" />
+                  <Link
+                    to="/runs/$taskRunId/agents/$nodeId"
+                    params={{ taskRunId, nodeId: n.name }}
+                    className="font-mono hover:text-[var(--amb)]"
+                  >
+                    {n.name}
+                  </Link>
+                  <span className="text-ink-500">
+                    {n.type}{n.lane ? ` · ${n.lane}` : ""}
+                    {n.started_at != null ? ` · started ${formatRelative(n.started_at)}` : ""}
+                  </span>
+                </div>
+              ))
+            ) : (
+              <div className="text-[12px] text-ink-300">
+                {run?.ended_at
+                  ? `run ${run.status}${run.verdict ? ` — verdict ${run.verdict}` : ""}`
+                  : "no node is dispatching right now"}
+              </div>
+            )}
+            {lastEvent && (
+              <div className="text-[11px] text-ink-500">
+                last event: <code className="text-ink-300">{lastEvent.event_type}</code> · {formatRelative(lastEvent.ts)}
+              </div>
+            )}
+          </div>
+        </div>
+        {isLive && tail.length > 0 && (
+          <div className="min-w-0" data-testid="run-log-tail">
+            <div className="text-[9.5px] font-black uppercase tracking-[0.13em] text-ink-500">execute.log tail</div>
+            <pre className="mt-1.5 text-[10px] text-ink-300 bg-ink-900/60 p-2 rounded overflow-hidden whitespace-pre-wrap">
+              {tail.slice(-3).join("\n")}
+            </pre>
+          </div>
         )}
       </div>
     </section>
   );
 }
 
-function AgentRunGrid({ taskRunId, agents }: { taskRunId: string; agents: AgentSummary[] }) {
+function PipelineNode({ node, taskRunId }: { node: DagNode; taskRunId: string }) {
+  const tone = nodeTone(node);
+  const glyph = tone === "succeeded" ? "✓" : tone === "failed" ? "✗" : tone === "queued" ? "○" : "●";
+  const detail =
+    tone === "running" || tone === "startup"
+      ? node.started_at != null
+        ? formatRelative(node.started_at)
+        : null
+      : node.duration_ms
+        ? formatDuration(node.duration_ms)
+        : null;
+  return (
+    <Link
+      to="/runs/$taskRunId/agents/$nodeId"
+      params={{ taskRunId, nodeId: node.name }}
+      className="flex items-center gap-1.5 rounded-[3px] border border-[var(--hair)] bg-[var(--panel-2)] px-2 py-1 hover:border-ork-amber/60"
+      data-testid={`pipeline-node-${node.name}`}
+      data-status={tone}
+      title={`${node.type}${node.lane ? ` · lane ${node.lane}` : ""}${node.verdict ? ` · ${node.verdict}` : ""}`}
+    >
+      <span
+        className={tone === "running" ? "animate-pulse" : undefined}
+        style={{ color: toneColor(tone, node.family) }}
+      >
+        {glyph}
+      </span>
+      <span className="font-mono text-[11px] text-ink-100">{node.name}</span>
+      {detail && <span className="text-[9.5px] text-ink-500">{detail}</span>}
+    </Link>
+  );
+}
+
+function hasFailureSignal(d: Diagnostic | undefined, status?: string): boolean {
+  if (status === "failed" || status === "rolled_back") return true;
+  if (!d) return false;
+  return (
+    d.verifier_results.some((v) => !v.pass) ||
+    d.evidence_refs.length > 0 ||
+    (d.execute_log?.failure_lines?.length ?? 0) > 0
+  );
+}
+
+function runDuration(run: TaskRun): string {
+  if (run.ended_at) return formatDuration(run.duration_ms);
+  return formatDuration(Math.max(0, Date.now() - run.created_at * 1000));
+}
+
+function AgentRunGrid({
+  taskRunId,
+  agents,
+  onOpenArtifact,
+}: {
+  taskRunId: string;
+  agents: AgentSummary[];
+  onOpenArtifact: (relpath: string) => void;
+}) {
   if (!agents.length) {
     return <p className="card text-sm text-ink-500">No recipe agents found for this run.</p>;
   }
@@ -601,6 +761,7 @@ function AgentRunGrid({ taskRunId, agents }: { taskRunId: string; agents: AgentS
             <th className="text-right">dur</th>
             <th className="text-right">calls</th>
             <th>gates</th>
+            <th>artifacts</th>
           </tr>
         </thead>
         <tbody>
@@ -629,6 +790,24 @@ function AgentRunGrid({ taskRunId, agents }: { taskRunId: string; agents: AgentS
                 <td className="text-right font-mono text-[10.5px]">{formatDuration(agent.duration_ms)}</td>
                 <td className="text-right font-mono text-[10.5px]">{agent.llm_call_count}</td>
                 <td className="font-mono text-[10px] text-ink-500">{agent.gates.length ? agent.gates.join(", ") : "—"}</td>
+                <td className="font-mono text-[10px]">
+                  {agent.artifact_files.length ? (
+                    agent.artifact_files.map((f) => (
+                      <button
+                        key={f}
+                        type="button"
+                        onClick={() => onOpenArtifact(f)}
+                        title={f}
+                        className="block max-w-[180px] truncate text-left text-[var(--amb)] hover:underline"
+                        data-testid={`agent-artifact-link-${agent.node_id}-${f.replace(/[^a-z0-9]/gi, "-")}`}
+                      >
+                        {f}
+                      </button>
+                    ))
+                  ) : (
+                    <span className="text-ink-500">—</span>
+                  )}
+                </td>
               </tr>
             );
           })}
@@ -755,28 +934,6 @@ function MiniStat({ label, value }: { label: string; value: string }) {
   );
 }
 
-function StatusCount({
-  label,
-  value,
-  tone,
-  wide = false,
-}: {
-  label: string;
-  value: number;
-  tone: NodeTone;
-  wide?: boolean;
-}) {
-  return (
-    <div className={`rounded-[3px] border border-[var(--hair)] bg-[var(--panel-2)] p-3 ${wide ? "col-span-2" : ""}`}>
-      <div className="flex items-center justify-between">
-        <span className="text-xs text-ink-400">{label}</span>
-        <span className={`h-2 w-2 rounded-full ${toneClass(tone)}`} />
-      </div>
-      <div className="text-2xl font-semibold text-ink-100 mt-1">{value}</div>
-    </div>
-  );
-}
-
 function NodeStateBadge({ node }: { node: DagNode }) {
   const tone = nodeTone(node);
   return <span className={`h-3 w-3 rounded-full ${toneClass(tone)}`} title={tone} />;
@@ -789,10 +946,6 @@ function nodeTone(node: DagNode): NodeTone {
   if (node.status === "done") return "succeeded";
   if (node.status === "running") return node.started_at ? "running" : "startup";
   return "queued";
-}
-
-function countNodes(nodes: DagNode[], tone: NodeTone): number {
-  return nodes.filter((node) => nodeTone(node) === tone).length;
 }
 
 function toneClass(tone: NodeTone): string {
@@ -830,5 +983,5 @@ function familyColorForCss(family: string): string {
 }
 
 function inputRank(key: string): number {
-  return { kickoff: 0, plan: 1, run_profile: 2, profile_answers: 3 }[key] ?? 10;
+  return { kickoff: 0, plan: 1, workflow: 2, run_profile: 3, profile_answers: 4 }[key] ?? 10;
 }
