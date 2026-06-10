@@ -912,8 +912,11 @@ PY
       rm -f "$_dispatch_marker"
       # Parse verdict from the authoritative artifact file, not stdout —
       # when the agent Writes the review JSON itself, stdout is just the
-      # closing chat message.
-      VERDICT=$(python3 -c "import sys,json; d=json.load(open(sys.argv[1])); print(d.get('verdict','unknown'))" "$REVIEW_FILE" 2>/dev/null || echo "unknown")
+      # closing chat message. Tolerant extraction (lib/extract_verdict.py):
+      # reviewers emit preamble prose around the JSON despite instructions
+      # (D-011/D-016 class) — strict json.load gave verdict=unknown and
+      # cascaded a passing run into rollback (run-1781105320-64712).
+      VERDICT=$(python3 "$MINI_ORK_ROOT/lib/extract_verdict.py" "$REVIEW_FILE" 2>/dev/null || echo "unknown")
       echo "  [ok] reviewer verdict=${VERDICT} → $REVIEW_FILE"
       # D-042 rich trace payload — reviewer/synthesizer node
       _trace_write_node_rich "$NODE_TRACE_ID" "success" "reviewer" "$REVIEW_FILE" "$VERDICT"
