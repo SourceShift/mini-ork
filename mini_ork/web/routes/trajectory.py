@@ -136,15 +136,24 @@ def wall_time(db: StateDB = Depends(get_db)) -> list[dict[str, Any]]:
     """Median wall-time per recipe over time."""
     if not db.has_table("task_runs"):
         return []
+    # duration_ms was historically never written by the engine (always 0),
+    # so derive wall time from ended_at - created_at when the column is empty.
     return db.rows(
         """
-        SELECT date(datetime(created_at, 'unixepoch')) AS day,
-               COALESCE(recipe, 'unspecified') AS recipe,
-               AVG(duration_ms) AS avg_ms,
-               MAX(duration_ms) AS max_ms,
+        SELECT day, recipe,
+               AVG(eff_ms) AS avg_ms,
+               MAX(eff_ms) AS max_ms,
                COUNT(*) AS run_count
-        FROM task_runs
-        WHERE duration_ms > 0
+        FROM (
+            SELECT date(datetime(created_at, 'unixepoch')) AS day,
+                   COALESCE(recipe, 'unspecified') AS recipe,
+                   COALESCE(NULLIF(duration_ms, 0),
+                            CASE WHEN ended_at IS NOT NULL
+                                 THEN MAX(ended_at - created_at, 0) * 1000 END,
+                            0) AS eff_ms
+            FROM task_runs
+        )
+        WHERE eff_ms > 0
         GROUP BY day, recipe
         ORDER BY day ASC
         """
