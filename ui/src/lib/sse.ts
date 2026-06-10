@@ -5,6 +5,8 @@
 
 import { useEffect } from "react";
 
+import { withWorkspaceParam } from "./api";
+
 export function useEventStream(
   path: string,
   onEvent: (name: string, data: unknown) => void,
@@ -12,7 +14,8 @@ export function useEventStream(
 ) {
   useEffect(() => {
     if (!enabled) return;
-    const es = new EventSource(path);
+    // EventSource can't send headers, so workspace rides a query param.
+    const es = new EventSource(withWorkspaceParam(path));
     const handle = (name: string) => (ev: MessageEvent) => {
       try {
         onEvent(name, JSON.parse(ev.data));
