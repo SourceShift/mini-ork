@@ -134,12 +134,22 @@ export function RunDetailPage() {
             <span className="h-8 w-1 rounded-sm" style={{ background: run.status === "failed" ? "var(--red)" : "var(--grn)" }} />
             <h1 className="text-[21px] font-black uppercase tracking-[0.06em] text-ink-100">{run.recipe ?? run.task_class}</h1>
             <StatusPill status={run.status} />
+            {run.stale && (
+              <span
+                className="px-1.5 py-0.5 rounded-sm text-[10px] font-bold uppercase tracking-[0.08em]"
+                style={{ background: "rgba(255,170,0,0.12)", color: "var(--amber, #d6a000)" }}
+                title="No status updates or run events past the staleness cutoff — the engine likely exited without finalizing this run."
+                data-testid="run-stale-pill"
+              >
+                stale
+              </span>
+            )}
             <VerdictPill verdict={run.verdict} />
             <code className="text-[10.5px] text-ink-500">{run.task_class}</code>
           </div>
           <div className="mt-3 grid grid-cols-2 md:grid-cols-5 gap-3">
             <Metric icon={<Clock size={14} />} label="created" value={formatRelative(run.created_at)} />
-            <Metric icon={<Clock size={14} />} label="ended" value={run.ended_at ? formatRelative(run.ended_at) : "running"} />
+            <Metric icon={<Clock size={14} />} label="ended" value={run.ended_at ? formatRelative(run.ended_at) : run.stale ? "stale" : "running"} />
             <Metric icon={<Clock size={14} />} label="duration" value={runDuration(run)} />
             <Metric icon={<ScrollText size={14} />} label="cost" value={formatCost(run.cost_usd)} />
             <Metric icon={<Bot size={14} />} label="llm calls" value={String(llm.data?.length ?? 0)} />
@@ -730,6 +740,10 @@ function hasFailureSignal(d: Diagnostic | undefined, status?: string): boolean {
 
 function runDuration(run: TaskRun): string {
   if (run.ended_at) return formatDuration(run.duration_ms);
+  if (run.stale) {
+    const last = run.last_activity_at ?? run.updated_at ?? run.created_at;
+    return formatDuration(Math.max(0, (last - run.created_at) * 1000));
+  }
   return formatDuration(Math.max(0, Date.now() - run.created_at * 1000));
 }
 
