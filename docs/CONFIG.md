@@ -194,28 +194,45 @@ human_gate:
 
 ### Provider API keys
 
-Store in `.mini-ork/config.env` — sourced by `lib/agent_registry.sh` before any model call. Never committed (gitignored).
+Store in `$MINI_ORK_HOME/config/secrets.local.sh` (default:
+`.mini-ork/config/secrets.local.sh`) — a plain bash file of `export KEY=...`
+lines, sourced by `lib/llm-dispatch.sh` inside each dispatch subshell so keys
+never leak into the parent orchestrator process. Never committed
+(`.gitignore` covers `**/secrets.local.*`). Start from the template:
 
 ```bash
-# .mini-ork/config.env — gitignored, never commit
-ANTHROPIC_API_KEY=sk-ant-...
-DEEPSEEK_API_KEY=...
-GLM_API_KEY=...
-KIMI_API_KEY=...
+cp config/secrets.example.sh .mini-ork/config/secrets.local.sh
 ```
-
-For multi-key setups, place named env files in `.mini-ork/secrets/`:
-
-```
-.mini-ork/secrets/
-  anthropic.env    # ANTHROPIC_API_KEY=...
-  deepseek.env     # DEEPSEEK_API_KEY=...
-```
-
-Select at run time:
 
 ```bash
-MINI_ORK_SECRETS_FILE=.mini-ork/secrets/anthropic.env mini-ork run code-fix kickoff.md
+# .mini-ork/config/secrets.local.sh — gitignored, never commit
+export ANTHROPIC_API_KEY="sk-ant-..."
+export OPENAI_API_KEY="sk-..."
+export GLM_API_KEY="..."
+export KIMI_API_KEY="..."
 ```
 
-`secrets/` is gitignored. Environment variable precedence: shell env > `config.env` > `agents/*.yaml` defaults > built-in defaults.
+Override the file location with `MINI_ORK_SECRETS=/abs/path/to/secrets.sh`.
+
+### Bring-your-own providers (providers.yaml)
+
+To use your own Anthropic or OpenAI-compatible API endpoints without writing
+a `lib/providers/cl_*.sh` wrapper, declare them in `config/providers.yaml`
+(or `$MINI_ORK_HOME/config/providers.yaml`, or a file pointed to by
+`MINI_ORK_PROVIDERS`). Each entry names a provider with `kind`
+(`anthropic-native` | `anthropic-compat` | `openai-compat` | `executable`),
+an optional `model` pin, `base_url`, and `api_key_env` — the NAME of the
+env var holding the key, which you export in `secrets.local.sh`.
+
+A `cl_<name>.sh` wrapper always wins over a registry entry of the same
+name, so registry entries cannot change builtin provider behavior. Wire a
+lane to your entry in `config/agents.yaml`:
+
+```yaml
+lanes:
+  implementer: openai_api    # codex CLI → api.openai.com with your key
+  reviewer: anthropic_api    # claude CLI → your ANTHROPIC_API_KEY
+```
+
+See `config/providers.yaml` for the full schema and commented examples
+(OpenRouter, custom gateways, executable scripts).
