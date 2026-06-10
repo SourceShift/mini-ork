@@ -98,10 +98,12 @@ from difflib import SequenceMatcher
 db, tbl, batch, fuzzy = sys.argv[1], sys.argv[2], int(sys.argv[3]), float(sys.argv[4])
 con = sqlite3.connect(db)
 con.execute("PRAGMA busy_timeout=5000")  # v0.2-pt7 F-11
+cols = {r[1] for r in con.execute(f"PRAGMA table_info({tbl})").fetchall()}
+task_class_expr = "task_class" if "task_class" in cols else "''"
 # LIMIT prevents O(table) memory bomb; repeated runs process all rows.
 rows = con.execute(f"""
     SELECT gradient_id, target, signal, suggested_change, confidence,
-           COALESCE(task_class,'')
+           COALESCE({task_class_expr},'')
     FROM {tbl}
     ORDER BY confidence DESC, created_at ASC
     LIMIT ?

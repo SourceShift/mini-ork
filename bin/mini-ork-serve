@@ -36,7 +36,7 @@ Options:
   --help        This message
 
 Requirements:
-  pip install fastapi uvicorn pyyaml
+  Run make web-deps from the repo root.
 
 The UI bundle (web/dist) is auto-served when built. Without it, the API
 remains usable at /api/v1/... and a JSON hint is returned at /.
@@ -70,7 +70,7 @@ fi
 # Ensure deps are importable; fail fast with a usable hint.
 if ! python3 -c "import fastapi, uvicorn" 2>/dev/null; then
   echo "mini-ork serve: missing 'fastapi' or 'uvicorn'" >&2
-  echo "  pip install fastapi uvicorn pyyaml" >&2
+  echo "  Run 'make web-deps' from the repo root, or follow docs/UI.md." >&2
   exit 1
 fi
 
