@@ -1,668 +1,544 @@
 # Feature inventory (synthesis)
 
+> Note: recipe expected 4 lenses (codex+glm+minimax+kimi); only 3 fired (kimi absent — no `lens-kimi.md` in run dir). CONSENSUS markers therefore use N/3 not N/4. A 3/3 mark means all available lenses agreed; 1/3 means only one lens surfaced it.
+
 ## Summary
-- Total unique features: 312
-- Consensus 4/4: 5
-- Consensus 3/4: 22
-- Consensus 2/4: 38
-- Single-lens finds: 247
-
----
-
-## Routes / endpoints (66 features)
-
-### GEPA prompt evolution (13)
-- `GET /prompt-evolution/test` — `server/routes/promptEvolution.ts:54` — health probe. [CONSENSUS: 1/4] [STATUS: shipped]
-- `GET /prompt-evolution/fleet-overview` — `server/routes/promptEvolution.ts:69` — fleet evolution status. Consumed by GepaDashboardPage. [CONSENSUS: 1/4] [STATUS: shipped]
-- `GET /prompt-evolution/judge-rubrics` — `server/routes/promptEvolution.ts:93` — list judge rubrics. [CONSENSUS: 1/4] [STATUS: shipped]
-- `PATCH /prompt-evolution/judge-rubrics/:prompt_key` — `server/routes/promptEvolution.ts:116` — update rubric weights. [CONSENSUS: 1/4] [STATUS: shipped]
-- `GET /prompt-evolution/eligible` — `server/routes/promptEvolution.ts:173` — list evolution-eligible prompts. [CONSENSUS: 1/4] [STATUS: shipped]
-- `GET /prompt-evolution/:slug/streak` — `server/routes/promptEvolution.ts:191` — mutation streak status. [CONSENSUS: 1/4]
-- `GET /prompt-evolution/:slug/fitness` — `server/routes/promptEvolution.ts:208` — fitness history. [CONSENSUS: 1/4]
-- `GET /prompt-evolution/:slug/mutations` — `server/routes/promptEvolution.ts:228` — mutation history. [CONSENSUS: 1/4]
-- `POST /prompt-evolution/:slug/pause` — `server/routes/promptEvolution.ts:265` — pause evolution. [CONSENSUS: 1/4]
-- `POST /prompt-evolution/:slug/resume` — `server/routes/promptEvolution.ts:289` — resume evolution. [CONSENSUS: 1/4]
-- `POST /prompt-evolution/runs/:runId/rollback` — `server/routes/promptEvolution.ts:318` — rollback evolution run. [CONSENSUS: 1/4]
-- `POST /prompt-evolution/mutations/:mutationUuid/approve` — `server/routes/promptEvolution.ts:350` — HITL approve. [CONSENSUS: 1/4]
-- `POST /prompt-evolution/mutations/:mutationUuid/reject` — `server/routes/promptEvolution.ts:382` — HITL reject. [CONSENSUS: 1/4]
-
-### Prompt feedback (4) [CONSENSUS: 3/4]
-- `POST /prompt-feedback/feedback` — `server/routes/promptFeedback.ts:32` — unified accept/reject feedback router by `source`. Wraps `withFeature({name:'prompt-feedback'})`. [CONSENSUS: 3/4] [STATUS: shipped]
-- `POST /api/prompts/feedback` (chat client) — `src/services/chatSessionService.ts:388` — posts `source:'chat_message'`. [CONSENSUS: 1/4]
-- `POST /api/prompts/feedback` (explanation client) — `src/services/explanationFeedbackService.ts:46` — posts `source:'explanation'`. [CONSENSUS: 1/4]
-- `POST /api/prompts/feedback` (block rewrite client) — `src/hooks/useBlockRewrite.ts:868` — posts `source:'block_rewrite'`. [CONSENSUS: 1/4]
-
-### Sample chapter harvest (5) [CONSENSUS: 3/4]
-- `POST /sample-chapter-harvest/:sessionId/generate-variants` — `server/routes/sampleChapterHarvest.ts:223` — variant dispatch. [CONSENSUS: 2/4] [STATUS: shipped] [OBS: missing — no withFeature]
-- `POST /sample-chapter-harvest/:sessionId/refine` — `server/routes/sampleChapterHarvest.ts:266` — rubric distillation + next iteration. [CONSENSUS: 2/4] [STATUS: shipped] [OBS: missing]
-- `PATCH /sample-chapter-harvest/:sessionId/section-feedback` — `server/routes/sampleChapterHarvest.ts:386` — section verdict persist. [CONSENSUS: 2/4] [OBS: missing]
-- `GET /sample-chapter-harvest/:sessionId/...` — `server/routes/sampleChapterHarvest.ts:447` — harvest status poll. [CONSENSUS: 1/4]
-- `POST /sample-chapter-harvest/*` (compose-surface dispatch+feedback+rubric) — `server/routes/sampleChapterHarvest.ts:223-447` — top-level route group. [CONSENSUS: 1/4]
-
-### Onboarding sample chapter (5) [CONSENSUS: 3/4]
-- `POST /onboarding-sample-chapter/` — `server/routes/onboardingSampleChapter.ts:215` — anon+auth dispatch. Wraps `withFeature({name:'onboarding_sample_chapter'})`. [CONSENSUS: 3/4] [STATUS: shipped]
-- `GET /onboarding-sample-chapter/status/:jobId` — `server/routes/onboardingSampleChapter.ts:266` — poll generation. [CONSENSUS: 3/4]
-- `POST /onboarding-sample-chapter/save` — `server/routes/onboardingSampleChapter.ts:303` — persist variant + section feedback to user profile. [CONSENSUS: 3/4]
-- `POST /onboarding-sample-chapter/refresh` — `server/routes/onboardingSampleChapter.ts:400` — drift-aware refresh. Wraps `withFeature({name:'onboarding_sample_chapter_refresh'})`. [CONSENSUS: 2/4]
-- Full-book acceptance dispatch — `server/routes/onboardingSampleChapter.ts:360` — `accepted_full_book` branch. [CONSENSUS: 1/4]
-
-### Book generation (4) [CONSENSUS: 4/4]
-- `POST /api/book-generation/generate-plan` — `server/routes/bookGeneration.ts:817` — plan-only job creation, async via lifecycle service. Wraps `withFeature({name:'book-generation'})`. [CONSENSUS: 4/4] [STATUS: shipped]
-- `POST /api/book-generation/confirm` — `server/routes/bookGeneration.ts` — confirm + enqueue chapter gen. [CONSENSUS: 3/4]
-- `POST /api/book-generation/cancel|retry` — `server/routes/bookGeneration.ts` — job lifecycle controls. [CONSENSUS: 1/4]
-- `server/routes/bookTreeGeneration.ts` — outline tree gen. Triggered by StepPlan. [CONSENSUS: 2/4]
-
-### Chapter Zoom (3) [CONSENSUS: 2/4]
-- `GET /api/chapter-zoom/:chapterUuid/active-task` — `server/routes/chapterZoom.ts:91` — task rehydration. [CONSENSUS: 1/4] [OBS: missing withFeature]
-- `POST /api/chapter-zoom/:chapterUuid/regenerate` — `server/routes/chapterZoom.ts:158` — summary (re)generate. [CONSENSUS: 2/4]
-- `POST /api/chapter-zoom/:chapterUuid/regenerate/cancel` — `server/routes/chapterZoom.ts:215` — cancel pending/running. [CONSENSUS: 1/4] [OBS: missing]
-
-### Reader / blocks / highlights (14)
-- `server/routes/reader/arxivRef.ts` — arXiv reference resolution. [CONSENSUS: 1/4]
-- `server/routes/chatSessions.ts` — RAG chat sessions CRUD + list/search/facets/shared/save-to-library. [CONSENSUS: 4/4] [STATUS: shipped]
-- `server/routes/highlights.ts` — text highlights CRUD. [CONSENSUS: 1/4]
-- `server/routes/textHighlights.ts` — highlight management. [CONSENSUS: 1/4]
-- `server/routes/knowledgeNodes.ts` — KG node CRUD. [CONSENSUS: 1/4]
-- `server/routes/knowledgeGraph.ts` — KG edge queries. [CONSENSUS: 1/4]
-- `server/routes/citations.ts` — citation CRUD. [CONSENSUS: 1/4]
-- `server/routes/blockRewrite.ts` — AI block text/image rewrite preview+commit. [CONSENSUS: 3/4] [STATUS: shipped]
-- `server/routes/blocks.ts` — block CRUD + mutations. [CONSENSUS: 2/4]
-- `server/routes/blockRevisions.ts` — block revision history. [CONSENSUS: 1/4]
-- `server/routes/contentNodes.ts` — content node KG bridge. [CONSENSUS: 1/4]
-- `server/routes/content*.ts` (anchors / manifest / render-hints / signals) — block-rewrite substrate. [CONSENSUS: 1/4]
-- `server/routes/contextEngine.ts` — RAG context builder + sub-question analysis. [CONSENSUS: 1/4]
-- `server/routes/conversationTree.ts` — threaded chat tree. [CONSENSUS: 1/4]
-
-### Book ops + ancillary (12)
-- `server/routes/bookTranslation.ts` — book clone + translate + RTL/LTR language. [CONSENSUS: 2/4] [STATUS: shipped]
-- `server/routes/bookExport.ts` — book HTML/JSON-LD export. [CONSENSUS: 2/4]
-- `server/routes/bookSearch.ts` — full-text book search. [CONSENSUS: 2/4]
-- `server/routes/bookmarks.ts` — per-block bookmarks. [CONSENSUS: 2/4]
-- `server/routes/books.ts` — books CRUD + `POST /:bookUUID/chapters/:n/regenerate` + `re-render`. [CONSENSUS: 1/4]
-- `server/routes/bookCovers.ts` — book cover assets. [CONSENSUS: 1/4]
-- `server/routes/bookInvariants.ts` — health-check invariants. [CONSENSUS: 1/4]
-- `server/routes/bookReadingProgress.ts` — book-level progress. [CONSENSUS: 1/4]
-- `server/routes/bookMetrics.ts` — book metrics. [CONSENSUS: 1/4]
-- `server/routes/readingProgress.ts` — generic reading progress. [CONSENSUS: 1/4]
-- `server/routes/publisherStyles.ts` — style CRUD. [CONSENSUS: 1/4]
-- `server/routes/publisherStyleSynthesis.ts` + `publisherStyleSynthesisJob.ts` — synthesis dispatch + status. [CONSENSUS: 1/4]
-
-### Document / research / learning (15)
-- `server/routes/documentSummarization.ts` — AI document summary. [CONSENSUS: 1/4]
-- `server/routes/deepResearch.ts` — DeerFlow-style deep research dispatcher. [CONSENSUS: 2/4]
-- `server/routes/documentResearch.ts` — per-document research queue. [CONSENSUS: 1/4]
-- `server/routes/learningQuiz.ts` — quiz generation. [CONSENSUS: 1/4]
-- `server/routes/flashcards.ts` — flashcard CRUD. [CONSENSUS: 2/4]
-- `server/routes/examQuestions.ts` — exam question generation. [CONSENSUS: 1/4]
-- `server/routes/mindmap.ts` — mind map generation. [CONSENSUS: 1/4]
-- `server/routes/mindMapReasoning.ts` — KG-backed reasoning mind map. [CONSENSUS: 1/4]
-- `server/routes/documentMindMaps.ts` — per-doc mind map. [CONSENSUS: 1/4]
-- `server/routes/documentUpload.ts` + `documents.ts` — PDF/MD/CSV upload. [CONSENSUS: 1/4]
-- `server/routes/documentsFilter.ts` — full-text + facets across library. [CONSENSUS: 1/4]
-- `server/routes/documentExport.ts` — PDF/EPUB/MD export. [CONSENSUS: 1/4]
-- `server/routes/documentGCS.ts` + `documentThumbnails.ts` — storage. [CONSENSUS: 1/4]
-- `server/routes/documentPromptSettings.ts` + `documentTranslationSettings.ts` — per-doc overrides. [CONSENSUS: 1/4]
-- `server/routes/embeddings.ts` — RAG substrate. [CONSENSUS: 1/4]
-
-### Admin / observability (6)
-- `GET /api/prompt-executions` (list) — `server/routes/promptExecutions.ts:48` — wraps `withFeature({name:'admin-prompt-executions'})`. [CONSENSUS: 1/4]
-- `GET /api/prompt-executions/stats` — `server/routes/promptExecutions.ts:103` — per-prompt-key health. [CONSENSUS: 1/4]
-- `GET /api/prompt-executions/observability/summary` — `server/routes/promptExecutions.ts:193` — cross-ledger dashboard. [CONSENSUS: 1/4]
-- `POST /api/prompt-executions/compare` — `server/routes/promptExecutions.ts:346` — diff prompt versions. [CONSENSUS: 1/4]
-- `server/routes/adminOverview.ts` (`GET /health`) — admin health snapshot. [CONSENSUS: 1/4]
-- `server/routes/adminSystem.ts` — canary-stats / trace-quality / failure-genes / circuit-breakers / GEPA trigger / evolution sweep+conclude+stability+eligible / failures stats. [CONSENSUS: 1/4]
-
-### Other operator / API (10)
-- `server/routes/auth.ts` — login + magic-link. [CONSENSUS: 1/4]
-- `server/routes/workspaces.ts` — workspace members/invitations/billing. [CONSENSUS: 1/4]
-- `server/routes/billing.ts` — Stripe + plan surface. [CONSENSUS: 1/4]
-- `server/routes/audiobooks.ts` — audiobook gen. [CONSENSUS: 1/4]
-- `server/routes/dailyBriefing.ts` — daily email/summary. [CONSENSUS: 1/4]
-- `server/routes/backgroundTasks.ts` — operator queue inspection. [CONSENSUS: 1/4]
-- `server/routes/debug.ts` + `debugMemoryHealth.ts` — operator-only diag. [CONSENSUS: 1/4]
-- `server/routes/agentRuns.ts` — agent run + trajectory inspector. [CONSENSUS: 1/4]
-- `server/routes/blog/*` — public blog funnel. [CONSENSUS: 1/4]
-- `server/routes/aiAnnotations.ts` — background annotation surface. [CONSENSUS: 1/4]
-
-### Misc routes from MiniMax (15)
-- `server/routes/files.ts` — file metadata. [CONSENSUS: 1/4]
-- `server/routes/conversations.ts` — chat history. [CONSENSUS: 1/4]
-- `server/routes/contextualQuestions.ts` — reader question gen. [CONSENSUS: 1/4]
-- `server/routes/crossReferences.ts` — cross-doc refs. [CONSENSUS: 1/4]
-- `server/routes/citationExport.ts` — BibTeX/JSON export. [CONSENSUS: 1/4]
-- `server/routes/claimBindings.ts` + `claims.ts` — citation provenance. [CONSENSUS: 1/4]
-- `server/routes/enhancedNotes.ts` — enhanced notes. [CONSENSUS: 1/4]
-- `server/routes/blockExplainProfile.ts` — explain profile per block. [CONSENSUS: 1/4]
-- `server/routes/blockActionRefinements.ts` — block action refinement layer. [CONSENSUS: 1/4]
-- `server/routes/explainProfile.ts` — explain profile service. [CONSENSUS: 1/4]
-- `server/routes/chatGateway.ts` — chat tier-based gateway. [CONSENSUS: 1/4]
-- `server/routes/admin/*` (overview / system / debug / debugMemoryHealth) — scoped operational sub-routes. [CONSENSUS: 1/4]
-- Public proof page route (`/proofs/:token` consumer) — `src/pages/proofs/PublicProofPage.tsx`. [CONSENSUS: 1/4]
-- `server/routes/chatSessions.ts` shared-link `GET /shared/:token` — public chat surface. [CONSENSUS: 1/4]
-- Save-chat-to-library `POST /:uuid/messages/:msgUuid/save-to-library` — `server/routes/chatSessions.ts`. [CONSENSUS: 1/4]
-
----
-
-## React components / pages (118 features)
-
-### Onboarding wizard (15) [CONSENSUS: 3/4 on flow]
-- `DashboardWizardSurface` — `src/components/host-app/onboarding/DashboardWizardSurface.tsx:1` — top-level wizard shell. [CONSENSUS: 2/4]
-- `OnboardingSurvey` + `OnboardingSurveyLegacy` — `src/components/host-app/onboarding/OnboardingSurvey.tsx:1` — intent survey, secondary path. [CONSENSUS: 2/4]
-- `WizardStepper` — `src/components/host-app/onboarding/WizardStepper.tsx:1` — step nav bar. [CONSENSUS: 1/4]
-- `TopicPickerStep` — `src/components/host-app/onboarding/TopicPickerStep.tsx:1`. [CONSENSUS: 1/4]
-- `SampleChapterVariantCard` — `src/components/host-app/onboarding/SampleChapterVariantCard.tsx:1`. [CONSENSUS: 1/4]
-- `EvidenceMeter` — `src/components/host-app/onboarding/EvidenceMeter.tsx:1` — evidence gate indicator. [CONSENSUS: 1/4]
-- `SteerSectionPopover` — `src/components/host-app/onboarding/SteerSectionPopover.tsx:1`. [CONSENSUS: 1/4]
-- `SaveAndLandingStep` — `src/components/host-app/onboarding/SaveAndLandingStep.tsx:1`. [CONSENSUS: 1/4]
-- `VariantGenerationStep` / `VariantReviewStep` — same dir. [CONSENSUS: 1/4]
-- `RegisterModal` — `src/components/host-app/onboarding/RegisterModal.tsx:1` + Turnstile verify backend. [CONSENSUS: 2/4]
-- `SampleChapterWizard` — `src/components/host-app/onboarding/SampleChapterWizard.tsx:1` — sample co-write. [CONSENSUS: 1/4]
-- Step files: `StepIntent`/`StepProfile`/`StepPlan`/`StepSample`/`StepSteer`/`StepClarify`/`StepLanding`/`StepRefreshConfirm`/`StepFullBook` — `src/components/host-app/onboarding/steps/*.tsx:1`. [CONSENSUS: 1/4]
-- `wizardMachine` — `src/components/host-app/onboarding/wizardMachine.ts:128` — XState/reducer FSM, 14 actions, pure. [CONSENSUS: 2/4]
-- `evidenceGate.dwEvidenceMet` — `src/components/host-app/onboarding/evidenceGate.ts:22` — boolean gate. Partial unit tests. [CONSENSUS: 1/4]
-- `OnboardingPage` (anon intent planner) — `src/pages/onboarding/OnboardingPage.tsx:1`. [CONSENSUS: 1/4]
-
-### Compose surface (16) [CONSENSUS: 3/4]
-- `ComposePage` — `src/pages/compose/ComposePage.tsx:1` — root wizard. [CONSENSUS: 3/4]
-- `useComposeMachine` + `jobStateMachine` + `skipLogic` — `src/pages/compose/`. [CONSENSUS: 1/4]
-- `StepTopic` — `src/pages/compose/steps/StepTopic.tsx:1`. [CONSENSUS: 2/4]
-- `StepIntent` (compose) — `src/pages/compose/steps/StepIntent.tsx:1`. [CONSENSUS: 1/4]
-- `StepConfigure` — `src/pages/compose/steps/StepConfigure.tsx:1`. [CONSENSUS: 2/4]
-- `StepPlan` (compose) — `src/pages/compose/steps/StepPlan.tsx:1`. [CONSENSUS: 2/4]
-- `StepPlanSketch` — `src/pages/compose/steps/StepPlanSketch.tsx:1`. [CONSENSUS: 2/4]
-- `StepVoice` — `src/pages/compose/steps/StepVoice.tsx:1`. [CONSENSUS: 2/4]
-- `StepPublisherStyle` — `src/pages/compose/steps/StepPublisherStyle.tsx:1`. [CONSENSUS: 2/4]
-- `StepStyleSynthesis` — `src/pages/compose/steps/StepStyleSynthesis.tsx:1`. [CONSENSUS: 2/4]
-- `StepStyleBlueprint` — `src/pages/compose/steps/StepStyleBlueprint.tsx:1`. [CONSENSUS: 2/4]
-- `StepChapterStyleTuning` — `src/pages/compose/steps/StepChapterStyleTuning.tsx:1`. [CONSENSUS: 2/4]
-- `StepRefineCitations` — `src/pages/compose/steps/StepRefineCitations.tsx:1`. [CONSENSUS: 2/4]
-- `StepWrite` — `src/pages/compose/steps/StepWrite.tsx:1`. [CONSENSUS: 2/4]
-- `ProgressStrip` — `src/pages/compose/ProgressStrip.tsx:1` — chapter FSM. [CONSENSUS: 1/4]
-- `ComposePageMobile` — `src/pages/compose/ComposePageMobile.tsx:1`. [CONSENSUS: 1/4]
-
-### Compose sub-components (6)
-- `ClaimRefinementPanel` — `src/components/compose/ClaimRefinementPanel.tsx:1`. [CONSENSUS: 1/4]
-- `EvidenceBankRail` — `src/components/compose/EvidenceBankRail.tsx:1`. [CONSENSUS: 1/4]
-- `BlueprintReaderPreview` — `src/components/compose/blueprint/BlueprintReaderPreview.tsx:116` — markdown render + section overlay. [CONSENSUS: 2/4]
-- `BlueprintSectionStrip` — `src/components/compose/blueprint/BlueprintSectionStrip.tsx:1`. [CONSENSUS: 1/4]
-- `BlueprintSectionFeedbackPopover` — `src/components/compose/blueprint/BlueprintSectionFeedbackPopover.tsx:1`. [CONSENSUS: 1/4]
-- `BlueprintRubricPanel` — `src/components/compose/blueprint/BlueprintRubricPanel.tsx:1`. [CONSENSUS: 1/4]
-
-### Reader chrome (24) [CONSENSUS: 3/4 on reader]
-- `ReaderShell` — `src/components/host-app/reader/shell/ReaderShell.tsx:1` — orchestrator. [CONSENSUS: 2/4]
-- `ReaderShellAskBar` / `ReaderShellComposer` — inline ask. [CONSENSUS: 1/4]
-- `ReaderShellSpine` + `ChapterSpine` — chapter spine rail. [CONSENSUS: 2/4]
-- `ReaderShellSessions` + `SessionsPanel` + `FullSessionsBrowser` + `SessionRow` + `SessionsBulkOrchestrator` + `SessionsSearchOrchestrator` — session UI. [CONSENSUS: 1/4]
-- `ReaderShellOutlineFromHeadings` — auto outline. [CONSENSUS: 1/4]
-- `ReaderShellSummaryPanel` — `src/components/host-app/reader/shell/ReaderShellSummaryPanel.tsx:92` — AI summary panel, polls active-task at mount, dispatches regenerate+cancel. [CONSENSUS: 2/4]
-- `ReaderShellViewModePopover` — view mode. [CONSENSUS: 1/4]
-- `MarkdownChrome` — `src/components/host-app/reader/MarkdownChrome.tsx:1` — md adapter chrome. [CONSENSUS: 2/4]
-- `PdfChrome` — `src/components/host-app/reader/PdfChrome.tsx:1` — pdf chrome. [CONSENSUS: 2/4]
-- `MarkdownAdapter` — `src/components/host-app/reader/shell/adapters/MarkdownAdapter.tsx:16` — tracks progress/heartbeat/manifest, handles empty-state + RTL fallback. [CONSENSUS: 2/4]
-- `BookToc` — `src/components/host-app/reader/BookToc.tsx:1`. [CONSENSUS: 2/4]
-- `ChapterZoomControl` + `ChapterZoomTreeRail` + `ChapterZoomSummaryList` — zoom rail. [CONSENSUS: 2/4]
-- `ReaderChatRail` + `ReaderFloatingChat` + `ChatThreadBody` — chat sidebar. [CONSENSUS: 2/4]
-- `ReaderHighlightPalette` — highlight color picker. [CONSENSUS: 1/4]
-- `ReaderProgressStrip` — `src/components/host-app/reader/ReaderProgressStrip.tsx:1`. [CONSENSUS: 2/4]
-- `ReaderTranslationOverlay` — in-place translation. [CONSENSUS: 2/4]
-- `CompareMode` + `PdfCompareMode` — side-by-side compare. [CONSENSUS: 2/4]
-- `ShareProofButton` — `src/components/host-app/reader/ShareProofButton.tsx:1` — public snippet share. [CONSENSUS: 2/4]
-- `ReaderHeader` — top bar. [CONSENSUS: 1/4]
-- `ReaderSettingsPopover` — font/theme/layout. [CONSENSUS: 1/4]
-- `TimeToMasteryCounter` — reading-stats counter. [CONSENSUS: 1/4]
-- `VerifiedLearningCard` — quiz-validated learning card. [CONSENSUS: 1/4]
-- `PdfMarginSidebar` + `PdfPageThumbnail` — pdf per-page preview. [CONSENSUS: 1/4]
-
-### Reader mobile (5)
-- `MobileReaderChrome` — `src/components/host-app/reader/mobile/MobileReaderChrome.tsx:1`. [CONSENSUS: 1/4]
-- `BottomChatSheet` — bottom chat sheet. [CONSENSUS: 1/4]
-- `MobileQuizSheet` — mobile quiz. [CONSENSUS: 1/4]
-- `MobileCitationCard` / `MobileReaderAskSelectionSheet` / `MobileReaderCiteSheet` / `MobileReaderFindSheet` / `MobileReaderHighlightsSheet` — mobile sheets. [CONSENSUS: 1/4]
-- `PageScrubber` — page scrubber control. [CONSENSUS: 1/4]
-
-### PDF search (3)
-- `PdfSearchOverlay` — `src/components/host-app/reader/search/PdfSearchOverlay.tsx:1`. [CONSENSUS: 1/4]
-- `PdfSearchMinimap` — minimap. [CONSENSUS: 1/4]
-- `usePdfSearch` — search hook. [CONSENSUS: 1/4]
-
-### Highlighter / annotation (8) [CONSENSUS: 3/4 on toolbar]
-- `HighlighterToolbar` + `HighlighterHoverToolbar` — 7 canonical actions visualize/explain/extend/arxiv/code/rewrite/prompt. [CONSENSUS: 1/4]
-- `InlineToolsRow` + `BlockSelectionToolbar` — block-mode toolbar. [CONSENSUS: 1/4]
-- `ColorPalette` — category color. [CONSENSUS: 1/4]
-- `HighlighterToast` — AI-action status toast. [CONSENSUS: 1/4]
-- `useTextHighlights` — CRUD hook with dedup cache. Partial tests. [CONSENSUS: 2/4]
-- `useCrossBlockHighlight` — `src/hooks/useCrossBlockHighlight.ts:1` — DOM mouseup, batch INSERT, pipeline dispatch. Has tests in `tests/frontend/hooks/`. [CONSENSUS: 3/4]
-- `FeedbackRating` + `FeedbackThumbs` — per-action rating widgets. [CONSENSUS: 1/4]
-- `ExplanationFeedbackButtons` — `src/components/blocks/ExplanationFeedbackButtons.tsx:58`. [CONSENSUS: 1/4]
-
-### Chat surface (10)
-- `ChatPage` + `PageChat` (notebook per page) + `ChatPageMobile`. [CONSENSUS: 2/4]
-- `Composer` (citation-aware) — `src/components/host-app/chat/Composer.tsx:1`. [CONSENSUS: 1/4]
-- `AssistantMarkdownContent` — markdown render with citations. [CONSENSUS: 1/4]
-- `SourcesRail` + `CitationCard` — source-anchored answers UI. [CONSENSUS: 1/4]
-- `FollowupChips` + `ScopeChips` — quick continue / scope narrow. [CONSENSUS: 1/4]
-- `RagChatMessage` — `src/features/chat/components/RagChatMessage.tsx:57` — renders `FeedbackThumbs` for non-streaming assistant msgs. [CONSENSUS: 1/4]
-- `useChatSession` + `useChatStream` — session + SSE. [CONSENSUS: 1/4]
-- `useImplicitSignals` — implicit feedback. [CONSENSUS: 1/4]
-- `useDocumentPromptSettings` — per-doc prompt overrides. [CONSENSUS: 1/4]
-- `useChapterZoomSummaries` / `useChapterIllustrations` — reader data. [CONSENSUS: 1/4]
-
-### Pages (top-level) (12)
-- `TodayPage` — `src/pages/TodayPage.tsx:42` — wizard/dashboard switch via `?wizard=` param. [CONSENSUS: 3/4]
-- `TodayPageMobile` — mobile variant. [CONSENSUS: 1/4]
-- `LibraryPage` + `LibraryPageMobile` + `Shelf` + `FacetRail` + `SortPopover` + `ContinueHero` + `CoverCard` + `ListRow` — library shelf. [CONSENSUS: 2/4]
-- `ReaderPage` + `ReaderPageMobile` + `BookReader` + `BookChapterArticle` — reader entry. [CONSENSUS: 2/4]
-- `SearchPage` + `SearchPageMobile` — universal search. [CONSENSUS: 2/4]
-- `CitationsPage` + `CitationsPageMobile` — cross-doc citations. [CONSENSUS: 2/4]
-- `GraphPage` — KG mindmap. [CONSENSUS: 2/4]
-- `ProjectsPage` + `ProjectDetailPage` + `ProjectsPageMobile` — workspace projects. [CONSENSUS: 1/4]
-- `WorkspacePage` + `WorkspaceInvitationAcceptPage` — workspace settings. [CONSENSUS: 1/4]
-- `MemoryPage` + `MemorySettingsPage` — user memory browser. [CONSENSUS: 1/4]
-- `LwSettings/` — per-user prefs. [CONSENSUS: 1/4]
-- `LoginPage` + `MagicLinkConsumePage` — auth surface. [CONSENSUS: 1/4]
-
-### Landing / marketing (3)
-- `PapersLandingPage` + `FilingsLandingPage` + `PriorArtLandingPage` + `landingConfigs.ts` + `PapersLandingPageMobile`. [CONSENSUS: 1/4]
-- `FoundingCheckoutPage` + `FoundingLandingTemplate` — Stripe founder flow. [CONSENSUS: 1/4]
-- `PublicProofPage` — public proof token surface. [CONSENSUS: 1/4]
-
-### Admin pages (16) [CONSENSUS: 2/4]
-- `GepaDashboardPage` — `src/pages/admin/GepaDashboardPage.tsx:1` + `src/pages/admin/gepa/*` (Btn/FleetTable/FleetRow/VistaDecisionDrawer/PauseModal/ResumeModal/Funnel/Sparkline/SummaryCards/FilterBar/KbdHints/Toast/Pill/StatusGlyph/Head/EmptyFirstRun/EmptyFilter/Error/glossary/fmt/types/gepa.css). [CONSENSUS: 2/4]
-- `PromptEvolutionPage` — prompt evolution detail. [CONSENSUS: 2/4]
-- `PromptsAdminPage` — CRUD over `prompt_templates`. [CONSENSUS: 1/4]
-- `ExecutionLedgerPage` — execution ledger. [CONSENSUS: 2/4]
-- `MemoryCalibrationPage` — memory model tuning. [CONSENSUS: 2/4]
-- `AgentRunsPage` + `AgentTrajectoryPage` — agent run inspector. [CONSENSUS: 2/4]
-- `StyleInspectorPage` — style debug inspector. [CONSENSUS: 2/4]
-- `AdminOverviewPage` — health snapshot. [CONSENSUS: 1/4]
-- `AdminSystemPage` — system controls. [CONSENSUS: 1/4]
-- `FailureAnalyticsPage` + `VerificationHeatmapPage` — failure analytics + heatmap. [CONSENSUS: 1/4]
-- `UnattendedRatePage` + `SkillsAnalyticsPage` + `SupportInboxPage` + `WhitelistAdminPage` — operator controls. [CONSENSUS: 1/4]
-- `ThemeSettingsPage` — FE theming. [CONSENSUS: 1/4]
-- `CompliancePage` — compliance view. [CONSENSUS: 1/4]
-- `BookEditorToolsPage` — operator book editor. [CONSENSUS: 1/4]
-- `src/pages/dev/SampleChapterHarvestPage.tsx:653` — renders `BlueprintSectionFeedbackPopover`. [CONSENSUS: 1/4]
-- `src/pages/dev/*` — internal dev pages. [CONSENSUS: 1/4]
-
-### Dashboard chrome (4)
-- `DashboardNavRail` — `src/components/host-app/dashboard/DashboardNavRail.tsx:1` + `Compact.tsx` + `navConfig.ts`. [CONSENSUS: 1/4]
-- `GuestSectionPreview` — anon preview. [CONSENSUS: 1/4]
-- `WhatsNewDialog` — release notes. [CONSENSUS: 1/4]
-- `KeyboardShortcutsDialog` — shortcuts dialog. [CONSENSUS: 1/4]
-
-### Citations / KG components (4)
-- `CitationFilterPopover` + `CitationRow` + `BibliographyCard` — citations UI. [CONSENSUS: 1/4]
-- `TopConceptsCard` — top concepts. [CONSENSUS: 1/4]
-- `NowReadingCard` — Today dashboard tile. [CONSENSUS: 1/4]
-- `kgEdgeIndexer` + `kgService.intelligentTopic` — `server/services/kg/*`. [CONSENSUS: 1/4]
-
----
-
-## Background jobs / workers / cron (49 features)
-
-### BullMQ processors [CONSENSUS: 4/4 on bookGeneration]
-- `bookGenerationProcessor` — `server/workers/unified/processors/bookGenerationProcessor.ts:1` — orchestrates full book gen. Queue `book_generation`. [CONSENSUS: 4/4]
-- `chapterGenerationProcessor` — `server/workers/unified/processors/chapterGenerationProcessor.ts:45` — Daytona sandbox chapter gen. Idempotency check on existing md children, `withFeature({name:'chapter-generation'})`. Queue `chapter-generation`. [CONSENSUS: 3/4]
-- `planGenerationProcessor` — `server/workers/unified/processors/planGenerationProcessor.ts:1`. [CONSENSUS: 1/4]
-- `chapterPlanFillProcessor` — orphan chapter plans. [CONSENSUS: 1/4]
-- `bookTranslationProcessor` — book translation. [CONSENSUS: 1/4]
-- `bookFinalizeProcessor` — book completion + email. [CONSENSUS: 1/4]
-- `documentIndexingProcessor` — document embedding + indexing. [CONSENSUS: 1/4]
-- `aiAnnotationProcessor` — AI annotation generation. [CONSENSUS: 1/4]
-- `hierarchyBuildProcessor` — block hierarchy build. [CONSENSUS: 1/4]
-- `examQuestionsProcessor` — exam question gen. [CONSENSUS: 1/4]
-- `podcastGenerationProcessor` — podcast TTS gen. [CONSENSUS: 1/4]
-- `ttsPreparationProcessor` — TTS chapter extraction. [CONSENSUS: 1/4]
-- `artifactGenerationProcessor` — content artifact gen. [CONSENSUS: 1/4]
-- `cascadeInvalidationProcessor` — cascade invalidation. [CONSENSUS: 1/4]
-- `claimRefinementRegenProcessor` — claim refinement regen. [CONSENSUS: 1/4]
-- `chromeLockedProcessor` — chrome-locked processing. [CONSENSUS: 1/4]
-- `implicitAcceptanceProcessor` — implicit acceptance. [CONSENSUS: 1/4]
-- `preferenceLearningProcessor` — preference learning. [CONSENSUS: 1/4]
-- `qualityDriftProcessor` — quality drift detection. [CONSENSUS: 1/4]
-- `chapterAbstractProcessor` — chapter abstract generation. [CONSENSUS: 1/4]
-- `promptEvolutionCronDispatch` — `server/workers/unified/processors/promptEvolutionCronDispatch.ts:43` — `cronFeatureName='cron:prompt-evolution-dispatch'`; supports `gepa_quarterly`, `conclude_shadow_tests`, `prompt_execution_pending_reaper`. [CONSENSUS: 2/4]
-- `arxivHarvestProcessor` — arXiv paper harvesting. [CONSENSUS: 1/4]
-- `contextReconcile` — `server/workers/unified/processors/contextReconcile.ts:44` — `cronFeatureName='cron:context_reconcile'`, per-scope reconcile. [CONSENSUS: 2/4]
-- `hypeEnrich` — hype enrichment queue. [CONSENSUS: 1/4]
-- `chapterZoomRegenerateProcessor` — `server/workers/unified/processors/chapterZoomRegenerateProcessor.ts:35` — summary regen with cancellation sentinel. [CONSENSUS: 1/4]
-- `contextFsrsDecay` — `server/workers/unified/processors/contextFsrsDecay.ts:46` — `cronFeatureName='cron:context_fsrs_decay'`, cursor-paginated decay. [CONSENSUS: 1/4]
-- `contextCacheReap` — `server/workers/unified/processors/contextCacheReap.ts:35` — `cronFeatureName='cron:context_cache_reap'`; deletes expired `block_context_compose_cache`. [CONSENSUS: 1/4]
-- `stuckJobHealthChecker` — `server/workers/unified/processors/stuckJobHealthChecker.ts:51` — `cronFeatureName='cron:stuck-job-health-check'`; finds stale `book_generation_runs`. [CONSENSUS: 1/4]
-- `scheduled-pipelines` worker — `server/workers/unified/workers/index.ts:1204` — extracts `pipelineType`, routes prompt-evolution vs BCE. [CONSENSUS: 1/4]
-- `addJob` / `addJobToQueue` — `server/workers/unified/queues/index.ts:119` / `:140` / `:248` — OTel carrier injection. [CONSENSUS: 2/4]
-
-### GEPA cron jobs (5)
-- `gepaCron` — `server/services/promptEvolution/gepaCron.ts:1`. [CONSENSUS: 1/4]
-- `llmJudgeCron` — `server/services/promptEvolution/llmJudgeCron.ts:414` — budget gate; scheduled at `0 2 * * *` via `server/cron/index.ts:35`. [CONSENSUS: 2/4]
-- `redTeamCron` — adversarial drill. [CONSENSUS: 1/4]
-- `pendingReaperCron` — stale mutation reaper. [CONSENSUS: 1/4]
-- `concludeShadowCron` — conclude shadow tests. [CONSENSUS: 1/4]
-
-### Feedback / context cron (3)
-- `preferenceDriftCron` — `server/services/feedback/preferenceDriftCron.ts:1`. [CONSENSUS: 1/4]
-- `contextReconcileScheduler` — `server/cron/contextReconcileScheduler.ts:43` — adds `context-reconcile-tick`. [CONSENSUS: 1/4]
-- `contextFsrsDecayScheduler` + `contextCacheReapScheduler` — `server/cron/contextFsrsDecayScheduler.ts:25` + `server/cron/contextCacheReapScheduler.ts:26`. [CONSENSUS: 1/4]
-
-### Background service jobs (10)
-- `backgroundIndexingService` — re-index after edit. [CONSENSUS: 1/4]
-- `backgroundTasks/memoryExtractionProcessor` — distill chats → memory. [CONSENSUS: 1/4]
-- `backgroundTaskProgress` + `backgroundTaskService` — progress state. [CONSENSUS: 1/4]
-- `bookCoverService` — book cover gen. [CONSENSUS: 1/4]
-- `bookChapterEmbeddingService` — RAG fuel embeddings. [CONSENSUS: 1/4]
-- `bookCompleteEmailer` — user-notification on done. [CONSENSUS: 2/4]
-- `chapterAutorubric` + `bookRubric` + `bookFactualReviewer` — quality gate. [CONSENSUS: 1/4]
-- `arxivGrowService` + `arxivGemmaService` + `arxivLibwit/` — corpus growth. [CONSENSUS: 1/4]
-- `blockClassifier/` + `blockHintsMatcher` — AI hint routing. [CONSENSUS: 1/4]
-- `blockMigrationService` — block DB schema migrations. [CONSENSUS: 1/4]
-- `spacedRepetitionScheduler` — flashcard timing. [CONSENSUS: 2/4]
-- `aiAnnotationWorker` — async annotation pass. [CONSENSUS: 1/4]
-- `audiobookService` — audiobook backend. [CONSENSUS: 1/4]
-- `anonymousArxivFunnelService` — marketing funnel. [CONSENSUS: 1/4]
-- `userChapterProgressService` — user chapter progress. [CONSENSUS: 1/4]
-- `bibliographyService` — bibliography. [CONSENSUS: 1/4]
-- `agentTraceLogger` + `agentEvents/` + `agentRunStateReader` + `agentRunLinks` — agent observability. [CONSENSUS: 1/4]
-- `approval/` — book plan approval flow. [CONSENSUS: 1/4]
-- `dailyBriefingService` — daily email/summary. [CONSENSUS: 1/4]
-
----
-
-## Database tables / migrations (15 features)
-
-- `gepa_mutations` — `server/database/migrations/20260910000000_gepa_mutations_evolution_run_id.sql`. [CONSENSUS: 1/4]
-- `evolution_runs` — `server/database/migrations/20260910000001_evolution_run_rollback_support.sql`. [CONSENSUS: 1/4]
-- `gepa_mutations_by_vertical` — `server/database/migrations/20260910000002_gepa_mutations_by_vertical.sql`. [CONSENSUS: 1/4]
-- `gepa_mutations_hitl` — `server/database/migrations/20260910000003_gepa_mutations_hitl.sql`. [CONSENSUS: 1/4]
-- `content_action_anchors` — `server/database/migrations/20260824000000_content_action_anchors.sql`. [CONSENSUS: 1/4]
-- `book_steer_events` — `server/database/migrations/20260903000001_world_model_v2_awm_2_simulation_result.sql`. [CONSENSUS: 1/4]
-- `book_generation_runs.book_id` (FK) — `server/database/migrations/20260901000000_book_generation_runs_book_id_backfill.sql`. [CONSENSUS: 1/4]
-- `verification_results_quiz_item_target` — `server/database/migrations/20260826000000_v4_verification_results_quiz_item_target.sql`. [CONSENSUS: 1/4]
-- `explanation_feedback` — written by `unifiedPromptFeedbackService` + `explanationFeedbackService.ts:47`. [CONSENSUS: 2/4]
-- `prompt_executions` — pending + outcome rows via `promptExecutionService.createExecution/recordOutcome` (`promptExecutionService.ts:36/97/275`). [CONSENSUS: 2/4]
-- `prompt_templates` — registry surface synced from `registerPrompt`. [CONSENSUS: 2/4]
-- `block_rewrite_drafts` — written by `blockRewriteService.previewRewrite/commitRewrite/previewImageGen`. [CONSENSUS: 1/4]
-- `style_blueprint_samples` + `blueprint_section_feedback` + `blueprint_rubrics` — sample-chapter harvest persistence (`samplePersistence.ts:43/91/147` + `rubricDistiller.ts:190`). [CONSENSUS: 2/4]
-- `user_personality` + `personality_pamu_signals` + `personality_atoms` — onboarding profile save (`sampleChapterService.ts:396/417/441/511`). [CONSENSUS: 1/4]
-- `rubric_regeneration_log` — `adaRubricService.ts:56` rate-limit check + write. [CONSENSUS: 1/4]
-- `block_subtree_summaries` — `chapterZoomService.ts:804` summary insert. [CONSENSUS: 1/4]
-- `background_tasks` — `chapterZoomQueueService.ts:76` + various queue facades. [CONSENSUS: 1/4]
-- `block_memory_open_set` — context reconcile scope. [CONSENSUS: 1/4]
-- `block_context_compose_cache` — context cache reap target. [CONSENSUS: 1/4]
-- `llm_api_calls` — LLM cost ledger read by observability summary. [CONSENSUS: 1/4]
-- `publisher_styles` — `chapterPlanCalibration.resolvePublisherStyleKeyAsync` queries; `persistJobPublisherStyle` writes `book_generation_runs.publisher_style` + JSONB legacy artifacts. [CONSENSUS: 1/4]
-
----
-
-## Prompt registry keys (33 features)
-
-### GEPA evolution registry
-- Per-book dynamic registration — `server/services/promptEvolution/bookPromptRegistry.ts:1`. [CONSENSUS: 1/4]
-
-### Classification (6)
-- `prompt_category_phase1_broad` — `server/services/blockCategoryClassifier.ts:36`. [CONSENSUS: 1/4]
-- `prompt_category_phase2_refine` — `:38`. [CONSENSUS: 1/4]
-- `prompt_category_phase3_evidence` — `:40`. [CONSENSUS: 1/4]
-- `prompt_category_phase4_verify` — `:42`. [CONSENSUS: 1/4]
-- `prompt_category_phase4b_escalation` — `:44`. [CONSENSUS: 1/4]
-- `prompt_category_batch` — `:46`. [CONSENSUS: 1/4]
-
-### Book generation (8)
-- `prompt_plan_fill` — `server/services/book-generation/planFillService.ts:21`. [CONSENSUS: 1/4]
-- `prompt_book_chapter_depth` — `server/services/bookGapAnalyzer.ts:16`. [CONSENSUS: 1/4]
-- `prompt_book_completeness` — `server/services/bookGapAnalyzer.ts:18`. [CONSENSUS: 1/4]
-- `prompt_book_factual_review` — `server/services/bookFactualReviewer.ts:20`. [CONSENSUS: 1/4]
-- `prompt_book_structure_validation` — `server/services/bookChapterValidator.ts:26`. [CONSENSUS: 1/4]
-- `prompt_book_integrity_validation` — `server/services/bookChapterValidator.ts:27`. [CONSENSUS: 1/4]
-- `prompt_illustration_spot` — `server/services/chapterIllustration/spotDetector.ts:15`. [CONSENSUS: 1/4]
-- `prompt_narrative_arc` — `server/services/narrativeArcService.ts:34`. [CONSENSUS: 1/4]
-
-### Translation / TTS (3)
-- `prompt_book_title_translation` — `server/services/bookTranslation/bookCloneService.ts:25`. [CONSENSUS: 1/4]
-- `prompt_tts_chapter_structure` — `server/services/ttsPreparationService.ts:24`. [CONSENSUS: 1/4]
-- `prompt_tts_page_convert` — `server/services/ttsPreparationService.ts:26`. [CONSENSUS: 1/4]
-
-### Knowledge graph / content (8)
-- `prompt_content_anchor_find` — `server/services/contentNodeService.ts:60`. [CONSENSUS: 1/4]
-- `prompt_content_child_relevance` — `server/services/contentNodeService.ts:62`. [CONSENSUS: 1/4]
-- `prompt_chapter_suggestions` — `server/services/contentNodeService.ts:64`. [CONSENSUS: 1/4]
-- `prompt_content_explain` — `server/services/contentNodeGenerationMixin.ts:27`. [CONSENSUS: 1/4]
-- `prompt_content_extend` — `server/services/contentNodeGenerationMixin.ts:29`. [CONSENSUS: 1/4]
-- `prompt_content_question` — `server/services/contentNodeGenerationMixin.ts:31`. [CONSENSUS: 1/4]
-- `prompt_content_suggest_explorations` — `server/services/contentNodeSuggestionMixin.ts:24`. [CONSENSUS: 1/4]
-- `prompt_kg_htc_classify` — `server/services/kgHtc/kgHtcClassifier.ts:31`. [CONSENSUS: 1/4]
-
-### Mind map (3)
-- `prompt_mindmap_concept_extract` — `server/services/mindMapReasoningService.ts:22`. [CONSENSUS: 1/4]
-- `prompt_mindmap_evidence_analyze` — `:24`. [CONSENSUS: 1/4]
-- `prompt_mindmap_answer` — `:26`. [CONSENSUS: 1/4]
-
-### Summarization (3)
-- `prompt_annotation_extract` — `server/services/aiAnnotationService.ts:44`. [CONSENSUS: 1/4]
-- `prompt_annotation_page_summary` — `:46`. [CONSENSUS: 1/4]
-- `prompt_web_article_enhance` — `server/services/webArticleService.ts:27`. [CONSENSUS: 1/4]
-
-### Misc surfaces (4)
-- `prompt_rag_chat_response` — chat surface; used by `chatSessionService.sendMessage/streamResponse`. [CONSENSUS: 1/4]
-- `prompt_rag_chat_system` — chat system prompt. [CONSENSUS: 1/4]
-- `prompt_blueprint_rubric_distiller` — `server/services/sampleChapterHarvest/rubricDistiller.ts:126`. [CONSENSUS: 1/4]
-- `prompt_onboarding_full_book_directive` — `server/services/onboarding/fullBookDispatch.ts:50`. [CONSENSUS: 1/4]
-- `MARKDOWN_RENDERING_CONTRACT` placeholder — `server/services/promptFragments/outputDirective.ts` — mandatory `outputDirective` for markdown-producing prompts. [CONSENSUS: 1/4]
-
----
-
-## CLI scripts (3 features)
-
-- `server/routes/admin/*` (adminOverview / adminSystem / debug / debugMemoryHealth) — scoped admin sub-routes serve as operational entry points. [CONSENSUS: 1/4]
-- (No first-class CLI one-shots surfaced beyond admin routes.) [CONSENSUS: 1/4]
-- `mcp-servers/pg19-host-app/` — local MCP server for PG19 stylistic exemplars (FEATURE_PG19_EXEMPLARS gated). [CONSENSUS: 1/4]
-
----
-
-## Service-layer features (28 features) [CONSENSUS: 3-4/4 on harness]
-
-### Prompt harness + execution ledger (3)
-- `promptIntegrationService.resolvePromptForDocument` — `server/services/promptIntegrationService.ts:508` — 3-tier resolver (document → user → registered default). Reads `prompt_templates`/`user_prompt_settings`/`document_prompt_settings`/`block_action_refinements`; writes `prompt_executions` pending row at `:1059`. Inputs `(userUuid, promptKey, fallbackTemplate, placeholders?, options?)`; output `ResolvedPrompt`. Consumed by every LLM call. [CONSENSUS: 3/4] [STATUS: shipped, partially tested]
-- `promptExecutionService.createExecution` / `recordOutcome` — `server/services/promptExecutionService.ts:36/97` — INSERT pending + UPDATE outcome rows. Fire-and-forget from resolver. [CONSENSUS: 2/4]
-- `unifiedPromptFeedbackService.recordPromptFeedback` — `server/services/feedback/unifiedPromptFeedbackService.ts:81` — discriminated-union dispatch by `source`; writes `explanation_feedback` + updates `prompt_executions.accepted/user_rating`. Throws `Message not found` / `Draft not found` → 404. [CONSENSUS: 3/4]
-
-### Feedback subsystem (8)
-- `explanationFeedbackService.storeFeedback` — `server/services/feedback/explanationFeedbackService.ts:47` — INSERT `explanation_feedback`, implicit-signal normalization, EM/Langfuse/canary side-effects (all caught). [CONSENSUS: 2/4]
-- `translationFeedbackService` — translation-specific feedback. [CONSENSUS: 1/4]
-- `pairSelector` — feedback pair selection. [CONSENSUS: 1/4]
-- `implicitSignals` — implicit signal collection. [CONSENSUS: 1/4]
-- `userQualityFactor` — user quality factor. [CONSENSUS: 1/4]
-- `translationQualityFactor` — translation QF. [CONSENSUS: 1/4]
-- `preferenceDriftService` — drift detection. [CONSENSUS: 1/4]
-- `preferenceDriftCron` — drift cron. [CONSENSUS: 1/4]
-
-### Book generation core (15) [CONSENSUS: 4/4]
-- `chapterPlannerService.planChapter` — `server/services/bookGeneration/chapterPlannerService.ts` (~line 180+) — Kimi Code Plan API; BAML-typed `ChapterPlan`; zero-fallback (throws on Zod failure or sum-target drift >15%). [CONSENSUS: 3/4]
-- `chapterWriterCapsule.executeChapter` — `server/services/bookGeneration/chapterWriterCapsule.ts` (~line 150+) — state machine: draft→critique→revise compound or merged single-agent; rubric eval; mode rollback when quality drops > `ROLLBACK_THRESHOLD=0.15`. [CONSENSUS: 2/4]
-- `chapterGenMixin.generateStructuredChapterContent` — `server/services/bookGeneration/chapterGen.ts:110` — Sonnet via `getBookOrchestrator`; `writeChapterFileWithVerification` retries up to `MAX_FILE_WRITE_RETRIES`. [CONSENSUS: 1/4]
-- `chapterGenerator` (+ `generateChapterWithRetry`) — `server/services/book-generation/chapterGenerator.ts:665` — wraps in `withFeature({name:'chapter-generation'})`. [CONSENSUS: 1/4]
-- `chapterPlanCalibration` constants + `resolvePublisherStyleKeyAsync` — `server/services/bookGeneration/chapterPlanCalibration.ts` — throws `Unknown publisher_style_slug` (zero-fallback). [CONSENSUS: 1/4]
-- `canonicalPlanService` + `canonicalChapterSpine` — plan + spine management. [CONSENSUS: 1/4]
-- `evidenceBankService` + `evidenceBankMutations` + `evidenceBankReadService` — evidence substrate. [CONSENSUS: 1/4]
-- `bookOrchestratorContextFirst` — context-first orchestrator. [CONSENSUS: 1/4]
-- `assurancePipeline` — quality assurance pipeline. [CONSENSUS: 1/4]
-- `clawGuard` (behavioralAnalyzer + constraintCatalog) — behavioral guard. [CONSENSUS: 1/4]
-- `bookMemoryService` — book-scoped memory. [CONSENSUS: 1/4]
-- `blindPeerReview` — blind review. [CONSENSUS: 1/4]
-- `globalReviewAgent` — global review. [CONSENSUS: 1/4]
-- `iMadSelectiveCritic` — selective critic. [CONSENSUS: 1/4]
-- `structuralSynthesis` cluster (`citationGraphBuilder` + `leidenClustering` + `multiAspectTaxonomy`). [CONSENSUS: 1/4]
-- `learningQuizItemService` — quiz item gen. [CONSENSUS: 1/4]
-
-### GEPA evolution services (28)
-- `evolutionOrchestrator` — main GEPA loop. [CONSENSUS: 1/4]
-- `gepaRunner` — single run executor. [CONSENSUS: 1/4]
-- `gepaReflector` — reflection stage. [CONSENSUS: 1/4]
-- `constructStage` — mutation construction. [CONSENSUS: 1/4]
-- `validationPipeline` (`stageA_FreeformReasoning` / `stageB_ZodValidation` / `stageC_SaverAudit` / `stageD_CoherenceCheck`). [CONSENSUS: 1/4]
-- `calibrationGate` — calibration. [CONSENSUS: 1/4]
-- `fixtureRegressionGate` — regression gate. [CONSENSUS: 1/4]
-- `rollbackGuard` — rollback guard. [CONSENSUS: 1/4]
-- `clawGuardL5` / `clawGuardL6` — constraint guards. [CONSENSUS: 1/4]
-- `hitlMutationDecision` — HITL approval flow. [CONSENSUS: 1/4]
-- `jointMutationRunner` — joint mutation. [CONSENSUS: 1/4]
-- `inputSecurityScanner` — input safety. [CONSENSUS: 1/4]
-- `adversarialDrill` + `adaptiveAttackDrill` — adversarial drills. [CONSENSUS: 1/4]
-- `metaJudge` + `shadowJudge` — judge meta-eval. [CONSENSUS: 1/4]
-- `pineDebias` — position/inversion debias. [CONSENSUS: 1/4]
-- `judgeRubricService` — rubric mgmt. [CONSENSUS: 1/4]
-- `balancedEvaluation` — balanced eval. [CONSENSUS: 1/4]
-- `executionFitness` — fitness scoring. [CONSENSUS: 1/4]
-- `renderValidityScorer` — render validity scoring. [CONSENSUS: 1/4]
-- `kappaDiscount` — Cohen's kappa discount. [CONSENSUS: 1/4]
-- `fleetOverviewService` — fleet overview aggregation. [CONSENSUS: 1/4]
-- `semanticPromptCache` — semantic dedup. [CONSENSUS: 1/4]
-- `polymorphicPromptAssembly` — polymorphic assembly. [CONSENSUS: 1/4]
-- `historyCurriculum` — history-based curriculum. [CONSENSUS: 1/4]
-- `lrfAdapter` + `lrgaAttributor` — LRF/LRGa attribution. [CONSENSUS: 1/4]
-- `molTsAllocator` — TS allocator. [CONSENSUS: 1/4]
-- `vistaGate` — vista gate. [CONSENSUS: 1/4]
-- `unattendedRateProbe` + `pipelineProxySignals` + `promotionChecklist` — probes/checklist. [CONSENSUS: 1/4]
-- `adaRubricService.triggerRegenerationIfNeeded` — `server/services/promptEvolution/adaRubricService.ts:56` — rate-limited Gemini Flash criterion clarifier; silent-skip on rate limit / missing rubric. [CONSENSUS: 1/4]
-
-### Sample-chapter harvest (3)
-- `variantDispatch.dispatchSampleVariants` — `server/services/sampleChapterHarvest/variantDispatch.ts:460` — persistence + classification. [CONSENSUS: 1/4]
-- `sectionClassifier.classifySampleSections` — `server/services/sampleChapterHarvest/sectionClassifier.ts:115` — harness-resolved prompt + structured LLM. [CONSENSUS: 1/4]
-- `samplePersistence` + `rubricDistiller.refineRubricAndDispatchNext` — `:43/91/145/147` + `rubricDistiller.ts:123/126/139/162/190`. [CONSENSUS: 1/4]
-
-### Onboarding services (3)
-- `sampleChapterService.start/save/refresh` — `server/services/onboarding/sampleChapterService.ts:236/247/307/396/417/441/511/660/1023/1041/1070/1085/1095` — anon-job allocation, profile build, traced Gemini enrichment envelope (currently empty), drift score, confirm-or-commit. [CONSENSUS: 1/4]
-- `fullBookDispatch` — `server/services/onboarding/fullBookDispatch.ts:46/50/57/66/67` — directive prompt resolve, `StartJobRequest` build, provenance stamp on book run. [CONSENSUS: 1/4]
-- `turnstifyVerify` (turnstileVerify.ts) — anon captcha. [CONSENSUS: 1/4]
-
-### Chat / Block rewrite (3)
-- `chatSessionService.sendMessage / streamResponse` — `server/services/chatSessionService.ts` (~500+) — RAG `retrieveUserBlocks`, surface-depth cap `SURFACE_DEPTH_CAP=3`, harness `prompt_rag_chat_response`, auto-title on first msg, context compression. [CONSENSUS: 2/4]
-- `blockRewriteService.previewRewrite / commitRewrite / previewImageGen` — `server/services/blockRewriteService.ts` (~200+ / 400+ / 600+) — `block_rewrite_drafts`, idempotency hash, `BRIEF_TIMEOUT_MS=60s`, transactional commit + cascade invalidation, optional rate limit via `BLOCK_REWRITE_RATE_LIMIT_ENABLED`. [CONSENSUS: 2/4]
-- `persistJobPublisherStyle` — `server/services/publisherStyle/persistJobPublisherStyle.ts:37` — dual-write `book_generation_runs.publisher_style` + `provenance->legacy_job_artifacts->book_plan->publisherStyle` JSONB. [CONSENSUS: 1/4]
-
-### Reader / context (4)
-- `chapterZoomService` — `server/services/reader/chapterZoomService.ts:860/1597/804` — wraps in `withFeature`; resolves prompts via harness; writes `block_subtree_summaries`. [CONSENSUS: 1/4]
-- `chapterZoomQueueService` — `:76/94/109/124/130/146` — `background_tasks` row + BullMQ enqueue + cancel sentinel. [CONSENSUS: 1/4]
-- `reconcileScopeMemory` (called by contextReconcile processor). [CONSENSUS: 1/4]
-- `webArticleService` — web article enhance + import. [CONSENSUS: 1/4]
-
----
-
-## Shared types / hooks (28 features)
-
-### Shared types (4)
-- `shared/types/promptSettings.ts:1` — `PromptKey` + `PROMPT_KEYS` + `PromptFeatureArea` + `FEATURE_AREA_DISPLAY_CONFIG`. [CONSENSUS: 1/4]
-- `shared/types/sampleChapterHarvest.ts:1` — harvest types. [CONSENSUS: 1/4]
-- `shared/types/onboardingSampleChapter.ts:1` — onboarding types. [CONSENSUS: 1/4]
-- `shared/types/observability.ts:1` — `FeatureName` union. [CONSENSUS: 1/4]
-
-### Reader hooks (10)
-- `useTextHighlights` — `src/hooks/useTextHighlights.ts:1` — CRUD + dedup cache. Partial tests. [CONSENSUS: 2/4]
-- `useCrossBlockHighlight` — `src/hooks/useCrossBlockHighlight.ts:1` — batch INSERT + pipeline dispatch. Has tests. [CONSENSUS: 3/4]
-- `useTextSelection` — selection state. [CONSENSUS: 1/4]
-- `useSelectionActionDispatch` — selection action dispatch (explain/visualize/arxiv/etc). [CONSENSUS: 1/4]
-- `useChatSession` + `useChatStream` — chat. [CONSENSUS: 1/4]
-- `useCitations` — citations data. [CONSENSUS: 1/4]
-- `useReadingProgress` — progress. [CONSENSUS: 1/4]
-- `useBookmarks` — bookmarks. [CONSENSUS: 1/4]
-- `useKnowledgeNodes` — KG nodes. [CONSENSUS: 1/4]
-- `useBlockRewrite` — AI rewrite hook. [CONSENSUS: 1/4]
-- `useEvidenceBank` — evidence bank. [CONSENSUS: 1/4]
-- `useHighlightPipeline` — highlight AI pipeline. [CONSENSUS: 1/4]
-- `useTranslationScrollSync` — translation scroll sync. [CONSENSUS: 1/4]
-
-### Book gen hooks (3)
-- `useBookGenerationJob` — job state. [CONSENSUS: 1/4]
-- `useBookGenerationSocket` — WS. [CONSENSUS: 1/4]
-- `useHatchetBookEvents` — Hatchet stream. [CONSENSUS: 1/4]
-
-### GEPA hooks (8)
-- `usePromptEvolution` / `useFleetOverview` / `usePromptExecutions` / `usePromptVersions` / `useJudgeRubrics` / `useExecutionLedger` / `useFailureAnalytics` / `useUnattendedRate`. [CONSENSUS: 1/4]
-
-### Sample chapter hooks (3)
-- `useSampleChapterHarvest` — `src/hooks/useSampleChapterHarvest.ts:138/146/151/160/163` — dispatch + poll + variant store. [CONSENSUS: 2/4]
-- `usePublisherStyles` — style CRUD. [CONSENSUS: 1/4]
-- `usePublisherStyleSynthesis` — synthesis. [CONSENSUS: 1/4]
-
-### Misc hooks (3)
-- `useImplicitSignals` / `useMemoryCalibration` / `useMemoryReview` / `useChapterZoomSummaries` / `useChapterIllustrations` / `useDocumentPromptSettings`. [CONSENSUS: 1/4]
-
-### Evidence providers (book gen) (13)
-- `arxivProvider` — `server/services/bookGeneration/evidenceProviders/arxivProvider.ts:1`. [CONSENSUS: 1/4]
-- `wikipediaProvider`, `wikidataProvider`, `pubmedProvider`, `pg19Provider`, `openalexProvider`, `internetArchiveProvider`, `hathitrustProvider`, `biorxivProvider`, `dplaProvider`, `europeanaProvider`, `wikisourceProvider`, `chroniclingAmericaProvider` — each at corresponding file. [CONSENSUS: 1/4]
-
----
+- Total unique features: 448
+- Consensus 3/3: 0 (with kimi absent, 3/3 would require all three remaining lenses to surface the same item with shared evidence — none did at the file:line granularity used here; high-overlap items max out at 2/3)
+- Consensus 2/3: 89
+- Single-lens finds: 359
+- Coverage gaps surfaced: 14 (10 from MiniMax + 3 from Codex `[OBS: missing]` / broken-dispatch flows + 1 from GLM `[STATUS: flagged]`)
+- Disputed entries: 2
+
+## Routes / endpoints — book-generation (43 features)
+- `POST /draft` — `server/routes/bookGeneration.ts:389` — create book-gen draft (compose wizard). [CONSENSUS: 1/3] [STATUS: shipped]
+- `PATCH /job/:jobId/draft` — `server/routes/bookGeneration.ts:429` — update draft config. [CONSENSUS: 1/3] [STATUS: shipped]
+- `GET /job/:jobId/draft` — `server/routes/bookGeneration.ts:468` — retrieve draft. [CONSENSUS: 1/3] [STATUS: shipped]
+- `POST /confirm-intent/:jobId` — `server/routes/bookGeneration.ts:499` — lock intent before plan gen. [CONSENSUS: 1/3] [STATUS: shipped]
+- `POST /generate-style-guide` — `server/routes/bookGeneration.ts:577` — synthesize style guide. [CONSENSUS: 1/3] [STATUS: shipped]
+- `GET /writing-styles` — `server/routes/bookGeneration.ts:640` — list saved styles. [CONSENSUS: 1/3] [STATUS: shipped]
+- `POST /writing-styles` — `server/routes/bookGeneration.ts:680` — create custom style. [CONSENSUS: 1/3] [STATUS: shipped]
+- `DELETE /writing-styles/:styleUuid` — `server/routes/bookGeneration.ts:724` — delete custom style. [CONSENSUS: 1/3] [STATUS: shipped]
+- `POST /plan-sketch` — `server/routes/bookGeneration.ts:763` — quick outline sketch. [CONSENSUS: 1/3] [STATUS: shipped]
+- `POST /generate-plan` — `server/routes/bookGeneration.ts:817` — full plan gen; full chain in Codex flow 12 (route→`bookGenerationJobService.createPlanOnlyJob`→`lifecycle.ts:659` `withFeature({name:'book-generation'})`→`enqueuePlanGeneration`→Hatchet/BullMQ). [CONSENSUS: 2/3] [STATUS: shipped]
+- `POST /job/:jobId/confirm` — `server/routes/bookGeneration.ts:955` — confirm plan + dispatch chapter fanout; chain in Codex flow 14 (route:955→973→988→`lifecycle.ts:1161` `withFeature`→`1349` enqueue→Hatchet `bookGenerationQueueService.ts:273` or BullMQ:335). [CONSENSUS: 2/3] [STATUS: shipped]
+- `POST /start-job` — `server/routes/bookGeneration.ts:1014` — legacy book-gen start. [CONSENSUS: 1/3] [STATUS: shipped]
+- `POST /job/:jobId/retry` — `server/routes/bookGeneration.ts:1111` — retry failed job. [CONSENSUS: 1/3] [STATUS: shipped]
+- `POST /job/:jobId/resume` — `server/routes/bookGeneration.ts:1196` — resume paused job. [CONSENSUS: 1/3] [STATUS: shipped]
+- `GET /job/:jobId/write-cockpit` — `server/routes/bookGeneration.ts:1428` — SSE stream for live chapter writing. [CONSENSUS: 2/3] [STATUS: shipped] (MiniMax names consumer: WatchTheater)
+- `GET /job/:jobId` — `server/routes/bookGeneration.ts:1466` — job status + metadata. [CONSENSUS: 1/3] [STATUS: shipped]
+- `GET /by-document/:documentUUID` — `server/routes/bookGeneration.ts:1645` — jobs for a document. [CONSENSUS: 1/3] [STATUS: shipped]
+- `POST /job/:jobId/plan/steer` — `server/routes/bookGeneration.ts:2147` — inject plan-gen steering; full chain in Codex flow 16 (`2147`→enqueue:2157→interrupt:2165→durable persist `book_steer_events`:2173→sandbox drains `/plan/steer-queue`:2202/2217). [CONSENSUS: 2/3] [STATUS: shipped]
+- `POST /job/:jobId/chapter/:chapterNumber/steer` — `server/routes/bookGeneration.ts:2235` — chapter-level steering (mirror of plan steer); Codex flow 16:2248. [CONSENSUS: 2/3] [STATUS: shipped]
+- `POST /job/:jobId/force-resume` — `server/routes/bookGeneration.ts:2321` — admin force-resume. [CONSENSUS: 1/3] [STATUS: shipped]
+- `POST /job/:jobId/hatchet-cancel` — `server/routes/bookGeneration.ts:2346` — cancel Hatchet workflow. [CONSENSUS: 1/3] [STATUS: shipped]
+- `POST /job/:jobId/hatchet-replay` — `server/routes/bookGeneration.ts:2368` — replay Hatchet from checkpoint. [CONSENSUS: 1/3] [STATUS: shipped]
+- `POST /chapters/:chapterUUID/retry` — `server/routes/bookGeneration.ts:2450` — retry single chapter. [CONSENSUS: 1/3] [STATUS: shipped]
+- `POST /job/:jobId/replan-orphans` — `server/routes/bookGeneration.ts:2560` — replan orphaned chapters. [CONSENSUS: 1/3] [STATUS: shipped]
+- `POST /job/:jobId/repair-import` — `server/routes/bookGeneration.ts:2697` — repair imported book. [CONSENSUS: 1/3] [STATUS: shipped]
+- `POST /job/:jobId/build-appendixes` — `server/routes/bookGeneration.ts:2725` — build appendices. [CONSENSUS: 1/3] [STATUS: shipped]
+- `DELETE /job/:jobId` — `server/routes/bookGeneration.ts:2791` — delete job. [CONSENSUS: 1/3] [STATUS: shipped]
+- `POST /job/:jobId/regenerate-chapter` — `server/routes/bookGeneration.ts:2856` — regenerate single chapter. [CONSENSUS: 1/3] [STATUS: shipped]
+- `GET /progress/:bookId` — `server/routes/bookGeneration.ts:2919` — SSE progress stream. [CONSENSUS: 1/3] [STATUS: shipped]
+- `POST /plan-from-sandbox` — `server/routes/bookGeneration.ts:3094` — sandbox plan callback; Codex flow 13: validates sandbox secret (3108)→normalizes plan (3125)→script-purity check (3132)→contaminated holds for refinement (3141)→clean→`plan_ready_if_pending` (3149). [CONSENSUS: 2/3] [STATUS: shipped] [OBS: missing — no `withFeature` on callback route]
+- `POST /upload-from-sandbox` — `server/routes/bookGeneration.ts:3177` — sandbox chapter upload; Codex flow 15: validates secret (3192)→looks up chapter by book+chapter# (3197)→updates sidecar content/hash/length/status (3204)→marks anchor completed (3214)→missing-chapter fallback creates new block (3219). [CONSENSUS: 2/3] [STATUS: shipped] [OBS: missing — no `withFeature` or explicit span]
+- `GET /search-chapters/:bookUUID` — `server/routes/bookGeneration.ts:3386` — full-text chapter search. [CONSENSUS: 1/3] [STATUS: shipped]
+- `GET /:jobId/coverage` — `server/routes/bookGeneration.ts:3455` — coverage audit report. [CONSENSUS: 1/3] [STATUS: shipped]
+- `GET /:jobId/jsonld` — `server/routes/bookGeneration.ts:3540` — JSON-LD export. [CONSENSUS: 1/3] [STATUS: shipped]
+- `POST /estimate-cost` — `server/routes/bookGeneration.ts:3580` — gen cost preview. [CONSENSUS: 1/3] [STATUS: shipped]
+- `GET /:jobId/export/html` — `server/routes/bookGeneration.ts:3619` — HTML export. [CONSENSUS: 1/3] [STATUS: shipped]
+- `GET /:jobId/claims` — `server/routes/bookGeneration.ts:3656` — list extracted claims. [CONSENSUS: 1/3] [STATUS: shipped]
+- `POST /:jobId/claims/regenerate-all-with-refinements` — `server/routes/bookGeneration.ts:3697` — regenerate all claims w/ refinements. [CONSENSUS: 1/3] [STATUS: shipped]
+- `POST /:jobId/claims/extract-prose` — `server/routes/bookGeneration.ts:3815` — extract claims from prose. [CONSENSUS: 1/3] [STATUS: shipped]
+- `PATCH /:jobId/claims/:claimId` — `server/routes/bookGeneration.ts:3853` — edit single claim. [CONSENSUS: 1/3] [STATUS: shipped]
+- `POST /:jobId/claims/:claimId/refine` — `server/routes/bookGeneration.ts:3896` — LLM-refine claim. [CONSENSUS: 1/3] [STATUS: shipped]
+- `POST /:jobId/chapters/:chapterNumber/regenerate-with-refinements` — `server/routes/bookGeneration.ts:3979` — regenerate chapter w/ claim refinements. [CONSENSUS: 1/3] [STATUS: shipped]
+
+## Routes / endpoints — prompt feedback + harness + LLM (8 features)
+- `POST /api/prompts/feedback` — `server/routes/promptFeedback.ts:32` — unified prompt thumbs feedback inside `withFeature({name:'prompt-feedback'})`; full chain in Codex flow 1 (FE callers `chatSessionService.ts:382` / `useBlockRewrite.ts:853` / `explanationFeedbackService.ts:44` → `app.ts:520` mount → route → `unifiedPromptFeedbackService.ts:81` dispatch by source → 125 chat / 174 block-rewrite / 199 explanation all write `explanation_feedback` → 232 prompt_executions accepted/rating). [CONSENSUS: 1/3] [STATUS: shipped]
+- Feedback persistence side-effects — Codex flow 2: `explanationFeedbackService.ts:47` `storeFeedback`→58 insert→80 quality-factor recalc→100 `updateUserQualityFactor`→109 canary record→126 async failure-gene extraction→154 Langfuse `user_feedback` score via trace_id. [CONSENSUS: 1/3] [STATUS: shipped]
+- `GET /api/blocks/feedback-stats` — `server/routes/blockExplainProfile.ts:41` — feedback stats + pending regen suggestions; Codex flow 3:47 concurrent load → `explanationFeedbackService.ts:214` aggregate → 216 SQL totals/avg/up/down/neutral → 230 recent ratings for trend. [CONSENSUS: 1/3] [STATUS: shipped] [OBS: missing — no route-level `withFeature`]
+- `POST /api/llm/generate` — `server/routes/llm.ts:29` — raw prompt → `geminiService.generateContent` (48) → returns text+model (67). Codex flow 5. [CONSENSUS: 1/3] [STATUS: shipped] [OBS: missing — bypasses prompt harness; no `withFeature`/`traceGemini`/registry resolution]
+- `POST /api/llm/generate-gemini` — `server/routes/llm.ts:88` — alias of `/generate`; same raw-prompt pattern (107). [CONSENSUS: 1/3] [STATUS: shipped] [OBS: missing]
+- Prompt harness resolution + execution ledger — Codex flow 4: `promptIntegrationService.ts:21` pending `prompt_executions` row → 38 keys from shared settings → 67 feature areas map to profile-maker surfaces → 192 doc/block/refinement/surface context → callers: `synthesizeStyle.ts:460` (`prompt_publisher_style_synthesis`), `escalateGenreLlm.ts:169` (`prompt_chapter_genre_escalation`), `citationAuditService.ts:336` (`prompt_citation_class`). [CONSENSUS: 1/3] [STATUS: shipped]
+- `POST /api/blocks/:uuid/rewrite` — `server/routes/blockRewrite.ts` (line not given) — LLM-driven block rewrite; consumer `SelectionActionRow` rewrite chip. [CONSENSUS: 2/3] [STATUS: shipped]
+- `POST /api/ai-annotations/generate` — `server/routes/aiAnnotations.ts:50` — AI annotation gen. [CONSENSUS: 2/3] [STATUS: shipped]
+
+## Routes / endpoints — onboarding + sample-chapter (5 features)
+- `POST /api/onboarding/sample-chapter/plan` — `server/routes/onboardingSampleChapter.ts:177` — onboarding plan creation; Codex flow 6 wraps in `withFeature({name:'onboarding_intent_plan'})` (192); prompts registered at module load (57 system, 95 intent-classifier, 137 plan-draft). [CONSENSUS: 1/3] [STATUS: shipped]
+- `POST /api/onboarding/sample-chapter` — `server/routes/onboardingSampleChapter.ts:215` — variant dispatch; Codex flow 7: validates anon/auth (215) → `withFeature({name:'onboarding_sample_chapter'})` (239) → `sampleChapterService.ts:236` creates jobId+variant seeds → 268 dispatches via `sampleVariantEnqueue.ts:38/50/74` (Hatchet `sample-chapter-generation` task with `traceCarrier`). FE polls via `useSampleChapterHarvest.ts:151`. [CONSENSUS: 2/3] [STATUS: shipped]
+- `POST /api/onboarding/sample-chapter/save` — `server/routes/onboardingSampleChapter.ts:303` — profile save; Codex flow 8: `withFeature` (345) → `sampleChapterService.ts:307` durable save → 397 upsert `user_personality` → 418 PAMU signals → 489 personality atoms → 608 upsert seed content artifact → 660 best-effort `traceGemini` enrichment. [CONSENSUS: 1/3] [STATUS: shipped]
+- `POST /api/sample-chapter/harvest` — `server/routes/sampleChapterHarvest.ts` — harvest sample for profile/style extraction (compose StepSample + onboarding wizard). [CONSENSUS: 1/3] [STATUS: shipped]
+- `PATCH /api/sample-chapter-harvest/:sessionId/section-feedback` — `server/routes/sampleChapterHarvest.ts:386` — Codex flow 9: validates sample UUID/section/verdict (393) → imports persist (418) → `persistSectionFeedback` (419) → log (428). [CONSENSUS: 1/3] [STATUS: shipped] [OBS: missing — no `withFeature`, no span, only logger]
+- `GET /api/sample-chapter/:uuid/status` — `server/routes/sampleChapterHarvest.ts` — poll harvest progress. [CONSENSUS: 1/3] [STATUS: shipped]
+
+## Routes / endpoints — chat sessions + reader Ask + RAG (8 features)
+- `POST /api/chat-sessions/:uuid/stream` — `server/routes/chatSessions.ts:887` — reader Ask SSE; Codex flow 10: route delegates to `langgraphSseAdapter.streamToResponse` (917) with session+user UUIDs (920) and RAG context option (922). FE wraps in `withFeature({name:'reader-chat:ask'})` at `ReaderChatRail.tsx:333`/349. [CONSENSUS: 2/3] [STATUS: shipped]
+- `PATCH /api/chat-sessions/:uuid/context` — `server/routes/chatSessions.ts:657` — pinned-block context update; Codex flow 11: validates UUID strings (670) → ownership check (680) → `chatSessionService.updateSessionContextBlockUuids` (696) → `chatSessionService.ts:4208` persistence. [CONSENSUS: 1/3] [STATUS: shipped] [OBS: missing — no route-level `withFeature`]
+- `POST /api/chat-sessions/:uuid/save-to-margin` — `server/routes/chatSessions.ts:1347` — save assistant turn as margin note; Codex flow 12: `withFeature({name:'chat-sessions:save-to-margin'})` (1348) → `chatSessionService.saveToMarginNote` (1365) → service `5267`/5294 verify turn belongs to session → 5310 idempotency check → 5333 insert note block. FE caller `chatSessionService.ts:363` `saveTurnToLibrary`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `POST /api/chat/sessions` — `server/routes/chatSessions.ts` — create session (ReaderFloatingChat). [CONSENSUS: 2/3] [STATUS: shipped]
+- `POST /api/chat/gateway` — `server/routes/chatGateway.ts` — SSE chat w/ RAG. [CONSENSUS: 2/3] [STATUS: shipped]
+- `/api/chat-routing-prefs` — `server/routes/chatRoutingPrefs.ts` — routing prefs surface. [CONSENSUS: 1/3] [STATUS: shipped]
+- `GET /api/rag/search` — `server/routes/rag.ts` — RAG vector search. [CONSENSUS: 2/3] [STATUS: shipped]
+- `GET /api/query` — `server/routes/query.ts` — backing query for deep research + chat context. [CONSENSUS: 1/3] [STATUS: shipped]
+
+## Routes / endpoints — blocks + highlights + annotations (9 features)
+- `GET /api/blocks/:uuid` — `server/routes/blocks.ts` — retrieve block + children. [CONSENSUS: 1/3] [STATUS: shipped]
+- `PATCH /api/blocks/:uuid` — `server/routes/blocks.ts` — update block content. [CONSENSUS: 1/3] [STATUS: shipped]
+- `GET /api/text-highlights` — `server/routes/textHighlights.ts` — fetch user highlights. [CONSENSUS: 2/3] [STATUS: shipped]
+- `POST /api/text-highlights` — `server/routes/textHighlights.ts` — create/update highlights. [CONSENSUS: 2/3] [STATUS: shipped]
+- `/api/text-highlights-ukgm-shim` — `server/routes/textHighlights.ukgmShim.ts:1` — UKGM compatibility shim. [CONSENSUS: 1/3] [STATUS: shipped]
+- `/api/block-revisions` — `server/routes/blockRevisions.ts` — block revision history. [CONSENSUS: 1/3] [STATUS: shipped]
+- `/api/block-action-refinements` — `server/routes/blockActionRefinements.ts` — block-level refinement requests. [CONSENSUS: 1/3] [STATUS: shipped]
+- `/api/block-explain-profile` — `server/routes/blockExplainProfile.ts:1` — also hosts `/feedback-stats` (see prompt feedback). [CONSENSUS: 2/3] [STATUS: shipped]
+- `/api/user-explain-profile` — `server/routes/userExplainProfile.ts:1` — explain-profile aggregate. [CONSENSUS: 1/3] [STATUS: shipped]
+
+## Routes / endpoints — auth + user (10 features)
+- `POST /api/auth/register` — `server/routes/auth.ts:65` — registration. [CONSENSUS: 1/3] [STATUS: shipped]
+- `POST /api/auth/login` — `server/routes/auth.ts:155` — login. [CONSENSUS: 1/3] [STATUS: shipped]
+- `POST /api/auth/refresh` — `server/routes/auth.ts:201` — token refresh. [CONSENSUS: 1/3] [STATUS: shipped]
+- `GET /api/auth/me` — `server/routes/auth.ts:309` — current user. [CONSENSUS: 1/3] [STATUS: shipped]
+- `/api/passwordless-auth` — `server/routes/passwordlessAuth.ts:1` — passkey + magic-link auth. Flags `FEATURE_PASSKEY_AUTH` (server/.env:423) + `FEATURE_MAGIC_LINK_AUTH` (:424). [CONSENSUS: 1/3] [STATUS: shipped, flag-gated]
+- `/api/user-settings` — `server/routes/userSettings.ts:1` — user settings. [CONSENSUS: 1/3] [STATUS: shipped]
+- `/api/user-progress` — `server/routes/userProgress.ts:1` — user progress. [CONSENSUS: 1/3] [STATUS: shipped]
+- `/api/user-reading` — `server/routes/userReading.ts:1` — user-reading aggregate. [CONSENSUS: 1/3] [STATUS: shipped]
+- `/api/user-reading-stats` — `server/routes/userReadingStats.ts:1` — reading stats backing. [CONSENSUS: 1/3] [STATUS: shipped]
+- `/api/user-security` — `server/routes/userSecurity.ts:1` — security surface. [CONSENSUS: 1/3] [STATUS: shipped]
+
+## Routes / endpoints — admin / GEPA / evolution (24 features)
+- `POST /api/admin/gepa/run` — `server/routes/adminSystem.ts:263` — trigger GEPA evolution. [CONSENSUS: 1/3] [STATUS: shipped]
+- `POST /api/admin/evolution/trigger` — `server/routes/adminSystem.ts:289` — manual evolution trigger. [CONSENSUS: 1/3] [STATUS: shipped]
+- `POST /api/admin/evolution/sweep` — `server/routes/adminSystem.ts:323` — sweep eligible prompts. [CONSENSUS: 1/3] [STATUS: shipped]
+- `POST /api/admin/evolution/conclude-shadow` — `server/routes/adminSystem.ts:346` — conclude shadow test. [CONSENSUS: 1/3] [STATUS: shipped]
+- `GET /api/admin/evolution/runs` — `server/routes/adminSystem.ts:409` — list evolution runs. [CONSENSUS: 1/3] [STATUS: shipped]
+- `GET /api/admin/evolution/fitness` — `server/routes/adminSystem.ts:434` — fitness landscape. [CONSENSUS: 1/3] [STATUS: shipped]
+- `GET /api/admin/circuit-breakers` — `server/routes/adminSystem.ts:209` — CB status. [CONSENSUS: 1/3] [STATUS: shipped]
+- `POST /api/admin/invalidate-prompt-cache` — `server/routes/adminSystem.ts:230` — flush prompt cache. [CONSENSUS: 1/3] [STATUS: shipped]
+- `GET /api/admin/failures/stats` — `server/routes/adminSystem.ts:483` — failure analytics. [CONSENSUS: 1/3] [STATUS: shipped]
+- `GET /api/admin/failures/recent` — `server/routes/adminSystem.ts:507` — recent failure log. [CONSENSUS: 1/3] [STATUS: shipped]
+- `/api/prompt-evolution` — `server/routes/promptEvolution.ts` — evolution run tracking. [CONSENSUS: 1/3] [STATUS: shipped]
+- `/api/prompt-versions` — `server/routes/promptVersions.ts` — prompt version history. [CONSENSUS: 1/3] [STATUS: shipped]
+- `/api/prompt-experiments` — `server/routes/promptExperiments.ts` — experiment registry. [CONSENSUS: 1/3] [STATUS: shipped]
+- `/api/prompt-settings` — `server/routes/promptSettings.ts` — per-doc / per-user override. [CONSENSUS: 1/3] [STATUS: shipped]
+- `/api/prompt-executions` — `server/routes/promptExecutions.ts` — execution history. [CONSENSUS: 1/3] [STATUS: shipped]
+- `/api/admin-agent-runs` — `server/routes/adminAgentRuns.ts:1` — agent runs + trajectory. [CONSENSUS: 1/3] [STATUS: shipped]
+- `/api/admin-unattended-rate` — `server/routes/adminUnattendedRate.ts:1` — unattended-rate metrics. [CONSENSUS: 1/3] [STATUS: shipped]
+- `/api/admin-verification-heatmap` — `server/routes/adminVerificationHeatmap.ts:1` — verification heatmap. [CONSENSUS: 1/3] [STATUS: shipped]
+- `/api/admin-whitelist` — `server/routes/adminWhitelist.ts:1` — whitelist admin. [CONSENSUS: 1/3] [STATUS: shipped]
+- `/api/admin-ai-annotation-worker` — `server/routes/aiAnnotationWorker.ts:1` — annotation worker controls. [CONSENSUS: 1/3] [STATUS: shipped]
+- `/api/admin-blog-funnel` — `server/routes/adminBlogFunnel.ts:1` — blog funnel admin. [CONSENSUS: 1/3] [STATUS: shipped]
+- `/api/admin-overview` — `server/routes/adminOverview.ts` — admin overview backing. [CONSENSUS: 1/3] [STATUS: shipped]
+- `/api/llm-cost` — `server/routes/llmCost.ts:1` — LLM cost surfacing. [CONSENSUS: 1/3] [STATUS: shipped]
+- `/api/logs` + `/api/logs-otlp-proxy` + `/api/traces-otlp-proxy` — `server/routes/logs.ts`, `logsOtlpProxy.ts`, `tracesOtlpProxy.ts` — OTLP proxy + logs surface. [CONSENSUS: 1/3] [STATUS: shipped]
+
+## Routes / endpoints — content / claims / signals (12 features)
+- `/api/claims` — `server/routes/claims.ts` — claims surface (separate from book-gen job-claims). [CONSENSUS: 1/3] [STATUS: shipped]
+- `/api/claim-bindings` — `server/routes/claimBindings.ts` — claim bindings. [CONSENSUS: 1/3] [STATUS: shipped]
+- `/api/content-signals` — `server/routes/contentSignals.ts` — content signal surface. [CONSENSUS: 1/3] [STATUS: shipped]
+- `/api/content-manifest` — `server/routes/contentManifest.ts` — content manifest. [CONSENSUS: 1/3] [STATUS: shipped]
+- `/api/content-nodes` — `server/routes/contentNodes.ts` — content nodes. [CONSENSUS: 1/3] [STATUS: shipped]
+- `/api/content-artifacts` — `server/routes/contentArtifacts.ts` — content artifacts. [CONSENSUS: 1/3] [STATUS: shipped]
+- `/api/content-action-anchors` — `server/routes/contentActionAnchors.ts` — backed by `20260824000000_content_action_anchors.sql` migration. [CONSENSUS: 2/3] [STATUS: shipped]
+- `/api/content-render-hints` — `server/routes/contentRenderHints.ts` — render hints surface. [CONSENSUS: 1/3] [STATUS: shipped]
+- `/api/citations` — `server/routes/citations.ts` — citations fetch for doc. [CONSENSUS: 2/3] [STATUS: shipped]
+- `/api/citation-export` — `server/routes/citationExport.ts` — .bib/.ris/.json export per project. [CONSENSUS: 2/3] [STATUS: shipped]
+- `/api/taxonomy` — `server/routes/taxonomy.ts:1` — taxonomy surface. [CONSENSUS: 1/3] [STATUS: shipped]
+- `/api/notebook-artifacts` — `server/routes/notebookArtifacts.ts:1` — notebook artifacts. [CONSENSUS: 1/3] [STATUS: shipped]
+
+## Routes / endpoints — reader-adjacent + chapter-zoom + viz (14 features)
+- `/api/chapter-zoom` — `server/routes/chapterZoom.ts:1` — chapter zoom CRUD. [CONSENSUS: 1/3] [STATUS: shipped]
+- `/api/per-chapter-state` — `server/routes/perChapterState.ts:1` — per-chapter state. [CONSENSUS: 1/3] [STATUS: shipped]
+- `/api/visual-queries` — `server/routes/visualQueries.ts:1` — per-reader viz. [CONSENSUS: 1/3] [STATUS: shipped]
+- `/api/kn` (ukgmNodes) — `server/routes/ukgmNodes.ts:1` — UKGM nodes mount. [CONSENSUS: 1/3] [STATUS: shipped]
+- `/api/mermaid-concept` — `server/routes/mermaidConcept.ts:1` — mermaid-based concept reasoning. [CONSENSUS: 1/3] [STATUS: shipped]
+- `/api/mindmap` + mindmap reasoning — `server/routes/mindmap.ts` + `mindMapReasoning.ts` — mindmap surfaces. [CONSENSUS: 1/3] [STATUS: shipped]
+- `/api/python-execution` — `server/routes/pythonExecution.ts:1` — Python sandbox for data-quest viz. [CONSENSUS: 1/3] [STATUS: shipped]
+- `/api/sandbox-callback` — `server/routes/sandboxCallback.ts:1` — in-process Map<id,Waiter> bridge (replaces long-poll for Daytona viz). [CONSENSUS: 1/3] [STATUS: shipped]
+- `/api/sandbox-evidence` — `server/routes/sandboxEvidence.ts:1` — sandbox evidence. [CONSENSUS: 1/3] [STATUS: shipped]
+- `/api/sandbox-results` — `server/routes/sandboxResults.ts:1` — sandbox results ingestion surface (paired w/ worker). [CONSENSUS: 1/3] [STATUS: shipped]
+- `/api/storage` — `server/routes/storage.ts:1` — storage + storage state. [CONSENSUS: 1/3] [STATUS: shipped]
+- `/api/synthesis-report` — `server/routes/synthesisReport.ts:1` — synthesis report surface. [CONSENSUS: 1/3] [STATUS: shipped]
+- `/api/themes` — `server/routes/themes.ts:1` — themes (admin + user). [CONSENSUS: 1/3] [STATUS: shipped]
+- `/api/page-translation-backfill`, `/api/translation-validation`, `/api/translation-restructure`, `/api/translation-profile` — page-level translation infra. [CONSENSUS: 1/3] [STATUS: shipped]
+
+## Routes / endpoints — books / library / search / discovery (16 features)
+- `GET /api/books` — `server/routes/books.ts` — list user books. [CONSENSUS: 2/3] [STATUS: shipped]
+- `GET /api/bookmarks` — `server/routes/bookmarks.ts` — user bookmarks. [CONSENSUS: 2/3] [STATUS: shipped]
+- `POST /api/book-reading-progress` — `server/routes/readingProgress.ts` / `bookReadingProgress.ts` — progress writes. Flag `FEATURE_READING_PROGRESS` (server/.env:264). [CONSENSUS: 2/3] [STATUS: shipped, flag-gated]
+- `/api/book-tree-generation` — `server/routes/bookTreeGeneration.ts` — book tree gen. [CONSENSUS: 1/3] [STATUS: shipped]
+- `/api/book-search` — `server/routes/bookSearch.ts` — book search backing. [CONSENSUS: 1/3] [STATUS: shipped]
+- `/api/book-export` — `server/routes/bookExport.ts` — export surface. [CONSENSUS: 1/3] [STATUS: shipped]
+- `/api/book-invariants` + `/api/book-metrics` — `bookInvariants.ts` + `bookMetrics.ts` — editor tooling backing. [CONSENSUS: 1/3] [STATUS: shipped]
+- `POST /api/books/:uuid/translate` — `server/routes/bookTranslation.ts:243` — clone+translate (translation UI). [CONSENSUS: 2/3] [STATUS: shipped]
+- `GET /api/books/:uuid/language` — `server/routes/bookTranslation.ts` — RTL/LTR detection. [CONSENSUS: 2/3] [STATUS: shipped]
+- `GET /api/search` — `server/routes/search.ts` — universal search. [CONSENSUS: 2/3] [STATUS: shipped]
+- `GET /api/search-summary` — `server/routes/searchSummary.ts` — AI search summary. [CONSENSUS: 1/3] [STATUS: shipped]
+- `POST /api/research-engine` — `server/routes/researchEngine.ts` — multi-source deep research. [CONSENSUS: 2/3] [STATUS: shipped]
+- `GET /api/arxiv/search` — `server/routes/arxiv.ts:156` — arXiv corpus search. [CONSENSUS: 1/3] [STATUS: shipped]
+- `POST /api/arxiv/harvest` — `server/routes/arxiv.ts:105` — admin harvest trigger. [CONSENSUS: 1/3] [STATUS: shipped]
+- `GET /api/arxiv/paper/:arxivId` — `server/routes/arxiv.ts:201` — paper metadata. [CONSENSUS: 1/3] [STATUS: shipped]
+- `/api/arxiv-grow` — `server/routes/arxivGrow.ts:1` — arXiv niche-funnel backing. [CONSENSUS: 1/3] [STATUS: shipped]
+
+## Routes / endpoints — workspace / billing / support / audio (10 features)
+- `GET /api/workspaces` — `server/routes/workspaces.ts` — list workspaces. [CONSENSUS: 2/3] [STATUS: shipped]
+- `POST /api/workspace-invitation-tokens` — `server/routes/workspaceInvitationTokens.ts` — invitation flow. [CONSENSUS: 2/3] [STATUS: shipped]
+- `POST /api/billing/checkout` — `server/routes/billing.ts` — Stripe checkout. [CONSENSUS: 1/3] [STATUS: shipped]
+- `POST /api/support` — `server/routes/support.ts` — submit ticket. [CONSENSUS: 2/3] [STATUS: shipped]
+- `POST /api/audiobooks/prepare` — `server/routes/audiobooks.ts:44` — TTS prepare. [CONSENSUS: 2/3] [STATUS: shipped]
+- `GET /api/audiobooks/:documentUUID/status` — `server/routes/audiobooks.ts:143` — audiobook status. [CONSENSUS: 1/3] [STATUS: shipped]
+- `/api/podcasts` — `server/routes/podcasts.ts:1` — podcast surface. [CONSENSUS: 1/3] [STATUS: shipped]
+- `/api/web-articles` — `server/routes/webArticles.ts:1` — web-article import. [CONSENSUS: 1/3] [STATUS: shipped]
+- `/api/public-funnel` + `/api/blogs` — `publicFunnel.ts` + `blog/` — public blog funnel. [CONSENSUS: 1/3] [STATUS: shipped]
+- `/api/learning-analytics` — `server/routes/learningAnalytics.ts:1` — learning analytics backing. [CONSENSUS: 1/3] [STATUS: shipped]
+
+## Routes / endpoints — background tasks / skills / personality / memory (10 features)
+- `GET /api/background-tasks/stream` — `server/routes/backgroundTasks.ts:69` — SSE task stream. [CONSENSUS: 1/3] [STATUS: shipped]
+- `GET /api/background-tasks/:taskId/result` — `server/routes/backgroundTasks.ts:156` — task result. [CONSENSUS: 1/3] [STATUS: shipped]
+- `GET /api/skills` — `server/routes/skills.ts` — skill list. [CONSENSUS: 2/3] [STATUS: shipped]
+- `/api/skills-crud` — `server/routes/skillsCrud.ts` — skills CRUD. [CONSENSUS: 1/3] [STATUS: shipped]
+- `GET /api/skills-analytics` — `server/routes/skillsAnalytics.ts` — mastery analytics. [CONSENSUS: 2/3] [STATUS: shipped]
+- `/api/personality` — `server/routes/personalityRoutes.ts` — personality routes. [CONSENSUS: 1/3] [STATUS: shipped]
+- `/api/memory-calibration` — `server/routes/memoryCalibration.ts` — memory calibration. [CONSENSUS: 1/3] [STATUS: shipped]
+- `/api/memory-review` — `server/routes/memoryReview.ts` — memory review. [CONSENSUS: 1/3] [STATUS: shipped]
+- `/api/pipeline-orchestrator` — `server/routes/pipelineOrchestrator.ts:1` — orchestrator surface (all templates resolve via harness). [CONSENSUS: 1/3] [STATUS: shipped]
+- `/api/llm` — `server/routes/llm.ts:1` — provider-agnostic LLM wrapper (the raw `/generate` + `/generate-gemini` flagged above hang off this file). [CONSENSUS: 2/3] [STATUS: shipped] [OBS: missing on raw routes]
+
+## React components / pages — top-level pages (24 features)
+- `TodayPage` — `src/pages/today/TodayPage.tsx:1` — daily landing (continue-reading + recent annotations + weekly chart + day-detail drawer). Route `/today` (`src/App.tsx:291`). [CONSENSUS: 1/3] [STATUS: shipped]
+- `LibraryPage` — `src/pages/LibraryPage.tsx:1` — books list w/ filter chips (`all|reading|queue|done|draft`) + facet rail + sort popover + continue-hero + cover-grid/list views. Route `App.tsx:292`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `ReaderPage` — `src/pages/reader/ReaderPage.tsx:1` — main reader; route `/reader/:docUuid` (`App.tsx:294`). [CONSENSUS: 2/3] [STATUS: shipped]
+- `BookReader` — `src/pages/reader/BookReader.tsx` — book reader orchestrator (consumes `ReaderShell`). [CONSENSUS: 1/3] [STATUS: shipped]
+- `BookChapterArticle` — `src/pages/reader/BookChapterArticle.tsx` — single-chapter article renderer. [CONSENSUS: 1/3] [STATUS: shipped]
+- `ReaderPageMobile` — `src/pages/reader/ReaderPageMobile.tsx:1` — mobile reader. [CONSENSUS: 1/3] [STATUS: shipped]
+- `ComposePage` — `src/pages/compose/ComposePage.tsx:1` — 12-step compose wizard host; XState `useComposeMachine.ts:1` + `jobStateMachine.ts:1`. Flags `FEATURE_STYLE_SYNTHESIS` (server/.env:391), `FEATURE_PG19_EXEMPLARS` (:392). [CONSENSUS: 2/3] [STATUS: shipped]
+- `ChatPage` — `src/pages/ChatPage.tsx:1` + `ChatPageMobile.tsx` — standalone chat, gated by `<PaidUserGate>` (`App.tsx:298`); free-tier flag `VITE_FEATURE_CHAT_NON_PREMIUM` (featureFlags.ts:39). [CONSENSUS: 1/3] [STATUS: shipped]
+- `ProjectsPage` + `ProjectDetailPage` — `src/pages/ProjectsPage.tsx:1` + `ProjectDetailPage.tsx:1` — workspace w/ tabs (chat/citations/documents/notes/members/settings/artifacts). Route `App.tsx:295-296`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `GraphPage` — `src/pages/GraphPage.tsx:1` + `graph/GraphHeader.tsx`, `GraphLegend.tsx`, `GraphNodeRail.tsx`, `graph/v2/`. Route `App.tsx:297`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `CitationsPage` + `CitationsPageMobile` — `src/pages/CitationsPage.tsx:1` — citations w/ export. [CONSENSUS: 1/3] [STATUS: shipped]
+- `SearchPage` + `SearchPageMobile` — `src/pages/SearchPage.tsx:1` — universal search. [CONSENSUS: 1/3] [STATUS: shipped]
+- `ImportPage` — `src/pages/import/ImportPage.tsx:1` — wizard w/ `SourcePanel`, `StylePanel`, `ImportPreview`, `SectionEditor`, `ImportJobCard`, FSM `useImportMachine.ts:1`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `DeepResearchPage` + `ResearchResourcesPage` — `src/pages/research/`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `ArxivFunnelPage` — `src/pages/research/ArxivFunnelPage.tsx:1` — niche landing for arXiv funnel. [CONSENSUS: 1/3] [STATUS: shipped]
+- `OnboardingPage` (legacy survey) — `src/pages/onboarding/OnboardingPage.tsx:1` — V8 E-4-F legacy. [CONSENSUS: 1/3] [STATUS: deprecated, scheduled rip] [DISPUTED: see Disputed entries]
+- `SampleChapterWizard` (canonical onboarding) — `src/pages/onboarding/SampleChapterWizard.tsx:1` — 4-step FSM: intent planner → 5 BCF SAMPLE_MODE variants → split-pane review → save+landing. Hook `useSampleChapterHarvest({scope:'onboarding'})`. Route `/onboarding/sample-chapter` (`App.tsx:224`). [CONSENSUS: 2/3] [STATUS: shipped]
+- `MemoryPage` + `MemorySettingsPage` — `src/pages/memory/`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `SettingsShell` — `src/pages/settings/SettingsShell.tsx:1` — tabs: preferences/billing/members/notifications/security/theme/workspace/export. [CONSENSUS: 1/3] [STATUS: shipped]
+- `MagicLinkConsumePage` — `src/pages/MagicLinkConsumePage.tsx:1` — route `/auth/magic-link` (App.tsx:197). Flag `FEATURE_MAGIC_LINK_AUTH`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `LoginPage` — `src/pages/LoginPage.tsx:1` — App.tsx:195. Flags `FEATURE_PASSKEY_AUTH` + `FEATURE_TURNSTILE` (server/config/featureFlags.ts:3). [CONSENSUS: 1/3] [STATUS: shipped]
+- `WorkspaceInvitationAcceptPage` — `src/pages/WorkspaceInvitationAcceptPage.tsx:1` — route `/i/ws/:token` (App.tsx:199). [CONSENSUS: 1/3] [STATUS: shipped]
+- `PublicProofPage` — `src/pages/proofs/PublicProofPage.tsx:1` — route `/proof/:token` (App.tsx:200). [CONSENSUS: 1/3] [STATUS: shipped]
+- `NotFoundPage` + index redirect (`/` → `/:lang/today`) — App.tsx:262. [CONSENSUS: 1/3] [STATUS: shipped]
+
+## React components / pages — landing funnels (4 features)
+- `PriorArtLandingPage` — `/landing/ip-attorney` — App.tsx:231. [CONSENSUS: 1/3] [STATUS: shipped]
+- `FilingsLandingPage` — `/landing/equity-analyst` — App.tsx:233. [CONSENSUS: 1/3] [STATUS: shipped]
+- `FoundingCheckoutPage` — `/papers-founding-placeholder` — App.tsx:238. [CONSENSUS: 1/3] [STATUS: shipped]
+- Dev preview pages — `src/pages/dev/LibwitThemesPreviewPage.tsx` (route `/dev/themes`, App.tsx:204) + `SampleChapterHarvestPage.tsx` (route `/dev/sample-chapter-harvest`, App.tsx:212). [CONSENSUS: 1/3] [STATUS: shipped, internal-only]
+
+## React components / pages — admin (17 features)
+- `AdminShell` — `src/components/admin/AdminShell.tsx` (lazy, App.tsx:54) — mount `:lang/backoffice/*`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `AdminOverviewPage` — `src/pages/admin/AdminOverviewPage.tsx:1` (lazy, App.tsx:59). [CONSENSUS: 1/3] [STATUS: shipped]
+- `AdminSystemPage` — `src/pages/admin/AdminSystemPage.tsx:1`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `AgentRunsPage` + `AgentTrajectoryPage` — `src/pages/admin/` (route `/backoffice/agent-runs/trajectory/:id`). [CONSENSUS: 1/3] [STATUS: shipped]
+- `GepaDashboardPage` — `src/pages/admin/GepaDashboardPage.tsx:1` — one row per `prompt_templates` entry; LwModal pause/resume (replaces `window.prompt/alert`). Flag `FEATURE_LEGACY_GEPA_REFLECTOR` (server/.env:388). [CONSENSUS: 1/3] [STATUS: shipped]
+- `PromptEvolutionPage` — `src/pages/admin/PromptEvolutionPage.tsx:1` — VistaDecisionDrawer for rubric+canary decisions. [CONSENSUS: 1/3] [STATUS: shipped]
+- `PromptsAdminPage` — `src/pages/admin/PromptsAdminPage.tsx:1` — CRUD + 3-tier override (document → user → registered default). [CONSENSUS: 1/3] [STATUS: shipped]
+- `MemoryCalibrationPage` — `src/pages/admin/MemoryCalibrationPage.tsx:1`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `SkillsAnalyticsPage` — `src/pages/admin/SkillsAnalyticsPage.tsx:1`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `StyleInspectorPage` — `src/pages/admin/StyleInspectorPage.tsx:1` — style state + derivation traces. [CONSENSUS: 1/3] [STATUS: shipped]
+- `BookEditorToolsPage` — `src/pages/admin/BookEditorToolsPage.tsx:1`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `CompliancePage` — `src/pages/admin/CompliancePage.tsx:1`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `ExecutionLedgerPage` — `src/pages/admin/ExecutionLedgerPage.tsx:1`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `FailureAnalyticsPage` — `src/pages/admin/FailureAnalyticsPage.tsx:1`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `UnattendedRatePage` — `src/pages/admin/UnattendedRatePage.tsx:1`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `VerificationHeatmapPage` — `src/pages/admin/VerificationHeatmapPage.tsx:1`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `WhitelistAdminPage` + `SupportInboxPage` + `ThemeSettingsPage` — `src/pages/admin/`. [CONSENSUS: 1/3] [STATUS: shipped]
+
+## React components / pages — onboarding wizard (24 features)
+- `WizardLoader` — `src/components/host-app/onboarding/WizardLoader.tsx` — loads state + machine. [CONSENSUS: 1/3] [STATUS: shipped]
+- `DashboardWizardSurface` — `src/components/host-app/onboarding/DashboardWizardSurface.tsx` — wizard host (build save payload at `:345`). [CONSENSUS: 2/3] [STATUS: shipped]
+- `wizardMachine` — `src/components/host-app/onboarding/wizardMachine.ts` — XState. [CONSENSUS: 1/3] [STATUS: shipped]
+- `wizardSteps` — `src/components/host-app/onboarding/wizardSteps.ts` — step registry. [CONSENSUS: 1/3] [STATUS: shipped]
+- `StepLanding` — `src/components/host-app/onboarding/steps/StepLanding.tsx`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `StepIntent` (onboarding) — `src/components/host-app/onboarding/steps/StepIntent.tsx`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `StepClarify` — `src/components/host-app/onboarding/steps/StepClarify.tsx`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `StepSample` — `src/components/host-app/onboarding/steps/StepSample.tsx` — sample variant display. [CONSENSUS: 1/3] [STATUS: shipped]
+- `StepSteer` — `src/components/host-app/onboarding/steps/StepSteer.tsx` — evidence-based steering. [CONSENSUS: 1/3] [STATUS: shipped]
+- `StepProfile` — `src/components/host-app/onboarding/steps/StepProfile.tsx`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `StepPlan` (onboarding) — `src/components/host-app/onboarding/steps/StepPlan.tsx`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `StepFullBook` — `src/components/host-app/onboarding/steps/StepFullBook.tsx`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `StepRefreshConfirm` — `src/components/host-app/onboarding/steps/StepRefreshConfirm.tsx`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `SampleChapterVariantCard` — `src/components/host-app/onboarding/SampleChapterVariantCard.tsx`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `EvidenceMeter` — `src/components/host-app/onboarding/EvidenceMeter.tsx`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `IntentModeChip` — `src/components/host-app/onboarding/IntentModeChip.tsx`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `SteerSectionPopover` — `src/components/host-app/onboarding/SteerSectionPopover.tsx`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `WizardErrorModal` — `src/components/host-app/onboarding/WizardErrorModal.tsx`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `WizardTopBar` — `src/components/host-app/onboarding/WizardTopBar.tsx`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `WizardStepper` — `src/components/host-app/onboarding/WizardStepper.tsx`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `RegisterModal` — `src/components/host-app/onboarding/RegisterModal.tsx`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `VariantGenerationStep` + `VariantReviewStep` — `src/components/host-app/onboarding/`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `OnboardingSurvey` — `src/components/host-app/onboarding/OnboardingSurvey.tsx`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `SaveAndLandingStep` — `src/components/host-app/onboarding/SaveAndLandingStep.tsx`. [CONSENSUS: 1/3] [STATUS: shipped]
+
+## React components / pages — compose wizard (24 features)
+- `StepIntent` (compose) — `src/pages/compose/steps/StepIntent.tsx`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `StepTopic` — `src/pages/compose/steps/StepTopic.tsx`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `StepVoice` — `src/pages/compose/steps/StepVoice.tsx`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `StepPublisherStyle` — `src/pages/compose/steps/StepPublisherStyle.tsx`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `StepStyleSynthesis` — `src/pages/compose/steps/StepStyleSynthesis.tsx`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `StepStyleBlueprint` — `src/pages/compose/steps/StepStyleBlueprint.tsx`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `StepChapterStyleTuning` — `src/pages/compose/steps/StepChapterStyleTuning.tsx`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `StepConfigure` — `src/pages/compose/steps/StepConfigure.tsx`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `StepPlanSketch` — `src/pages/compose/steps/StepPlanSketch.tsx`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `StepPlan` (compose) — `src/pages/compose/steps/StepPlan.tsx`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `StepRefineCitations` — `src/pages/compose/steps/StepRefineCitations.tsx`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `StepWrite` — `src/pages/compose/steps/StepWrite.tsx` — live writing + WatchTheater. [CONSENSUS: 1/3] [STATUS: shipped]
+- `WatchTheater` — `src/pages/compose/components/WatchTheater.tsx` — live SSE viewer. [CONSENSUS: 1/3] [STATUS: shipped]
+- `AgentStreamRail` — `src/pages/compose/components/watch/AgentStreamRail.tsx`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `SteeringComposer` — `src/pages/compose/components/watch/SteeringComposer.tsx`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `PublisherStyleCard` + `PublisherStyleSummary` + `VoicePresetCard`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `ClaimSidebar` + `ClaimEditModal` — `src/pages/compose/components/`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `ThesisClusterEditor` — `src/pages/compose/components/ThesisClusterEditor.tsx`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `DependencyGraphSvg` — `src/pages/compose/components/DependencyGraphSvg.tsx`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `WaveChapterTable` — `src/pages/compose/components/WaveChapterTable.tsx`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `LivePreview` + `LiveHero` — `src/pages/compose/components/`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `GenerationModeSelector` — `src/pages/compose/components/`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `SourceFramingTable` — `src/pages/compose/components/`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `ProgressStrip` (compose) — `src/pages/compose/ProgressStrip.tsx`. [CONSENSUS: 1/3] [STATUS: shipped]
+
+## React components / pages — blueprint surface (4 features)
+- `BlueprintReaderPreview` — `src/components/compose/blueprint/BlueprintReaderPreview.tsx` — reader-style section preview. [CONSENSUS: 1/3] [STATUS: shipped]
+- `BlueprintSectionStrip` — `src/components/compose/blueprint/BlueprintSectionStrip.tsx`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `BlueprintRubricPanel` — `src/components/compose/blueprint/BlueprintRubricPanel.tsx`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `BlueprintSectionFeedbackPopover` — `src/components/compose/blueprint/BlueprintSectionFeedbackPopover.tsx:135` (feedback kind radio) + `:212` (save button submits verdict). [CONSENSUS: 2/3] [STATUS: shipped]
+
+## React components / pages — reader chrome + reader extras (28 features)
+- `MarkdownChrome` — `src/components/host-app/reader/MarkdownChrome.tsx:1` — Markdown-book reader chrome (sidebar TOC, progress strip, settings, header). [CONSENSUS: 1/3] [STATUS: shipped]
+- `PdfChrome` — `src/components/host-app/reader/PdfChrome.tsx:1` + `PdfSidebar.tsx`, `PdfPageThumbnail.tsx`, `PdfMarginSidebar.tsx`. Auto-route when document kind = pdf. [CONSENSUS: 1/3] [STATUS: shipped]
+- `CompareMode` — `src/components/host-app/reader/CompareMode.tsx:1` (Markdown) + `PdfCompareMode.tsx:1` (PDF). [CONSENSUS: 1/3] [STATUS: shipped]
+- `HighlighterToolbar` — `src/components/host-app/highlighter/HighlighterToolbar.tsx:1` (row 128 = unified `SelectionActionRowAdapter`). 7 canonical actions (visualize/explain/extend/arxiv/code/rewrite/prompt). Flags `FEATURE_HIGHLIGHTER_UNIFIED_DISPATCH` (server/.env:472), `FEATURE_HIGHLIGHTER_DISPATCH_CODE` (:473), `FEATURE_HIGHLIGHTER_DERIVATIVE_GEMINI` (:480). [CONSENSUS: 1/3] [STATUS: shipped]
+- `ReaderChatRail` — `src/components/host-app/reader/ReaderChatRail.tsx:1` — in-reader Q&A. Ask flow wraps `withFeature({name:'reader-chat:ask'})` at `:333`, calls `send` at `:349`. Social-proof variant flag `VITE_FEATURE_READER_CHAT_SOCIAL_PROOF` (`:1012`). [CONSENSUS: 2/3] [STATUS: shipped]
+- `ReaderFloatingChat` — `src/components/host-app/reader/ReaderFloatingChat.tsx:1` + `MobileReaderAskSelectionSheet.tsx`. Flag `FEATURE_MOBILE_CHAT_SHEET` (src/utils/featureFlags.ts:24). [CONSENSUS: 2/3] [STATUS: shipped]
+- `ReaderTranslationOverlay` — `src/components/host-app/reader/ReaderTranslationOverlay.tsx:1` — paragraph inline translation. [CONSENSUS: 1/3] [STATUS: shipped]
+- `ChapterZoomControl` + `ChapterZoomTreeRail` + `ChapterZoomSummaryList` — `src/components/host-app/reader/`. [CONSENSUS: 2/3] [STATUS: shipped]
+- `VerifiedLearningCard` — `src/components/host-app/reader/VerifiedLearningCard.tsx:1` — FSRS-style retention badge. [CONSENSUS: 1/3] [STATUS: shipped]
+- `ShareProofButton` — `src/components/host-app/reader/ShareProofButton.tsx:1`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `ReaderShell` — `src/components/host-app/reader/shell/ReaderShell.tsx`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `ReaderShellTopBar` — `src/components/host-app/reader/shell/ReaderShellTopBar.tsx`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `ReaderShellScrubber` — `src/components/host-app/reader/shell/ReaderShellScrubber.tsx`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `ReaderShellComposer` — `src/components/host-app/reader/shell/ReaderShellComposer.tsx`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `ReaderShellAskRail` — `src/components/host-app/reader/shell/ReaderShellAskRail.tsx`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `ReaderShellSummaryPanel` — `src/components/host-app/reader/shell/ReaderShellSummaryPanel.tsx`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `ReaderShellViewModePopover` — `src/components/host-app/reader/shell/ReaderShellViewModePopover.tsx`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `ReaderShellOverflowMenu` — `src/components/host-app/reader/shell/ReaderShellOverflowMenu.tsx`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `ReaderShellThumbGrid` — `src/components/host-app/reader/shell/ReaderShellThumbGrid.tsx`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `BookToc` — `src/components/host-app/reader/BookToc.tsx`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `ChapterZoomTreeRail` — see chapter-zoom group. [CONSENSUS: 1/3] [STATUS: shipped]
+- `ReaderProgressStrip` — `src/components/host-app/reader/ReaderProgressStrip.tsx`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `TimeToMasteryCounter` — `src/components/host-app/reader/TimeToMasteryCounter.tsx`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `PdfMarginSidebar` — `src/components/host-app/reader/PdfMarginSidebar.tsx`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `MobileReaderCiteSheet` — `src/components/host-app/reader/MobileReaderCiteSheet.tsx`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `MobileReaderAskSelectionSheet` — `src/components/host-app/reader/MobileReaderAskSelectionSheet.tsx`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `MobileReaderHighlightsSheet` + `MobileReaderTOCSheet` + `MobileReaderFindSheet` — `src/components/host-app/reader/`. [CONSENSUS: 1/3] [STATUS: shipped]
+
+## Frontend hooks (32 features)
+- `useSampleChapterHarvest` — `src/hooks/useSampleChapterHarvest.ts:138` `dispatchPlan` + `:151` poll + `:196` save selected variants/feedback. Consumed by StepSample + SampleChapterWizard. [CONSENSUS: 2/3] [STATUS: shipped]
+- `usePublisherStyleSynthesis` — `src/hooks/usePublisherStyleSynthesis.ts`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `usePublisherStyles` — `src/hooks/usePublisherStyles.ts`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `usePromptSettings` — `src/hooks/usePromptSettings.ts`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `usePromptEvolution` — `src/hooks/usePromptEvolution.ts`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `usePromptExecutions` — `src/hooks/usePromptExecutions.ts`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `usePromptVersions` — `src/hooks/usePromptVersions.ts`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `useBookGenerationJob` — `src/hooks/useBookGenerationJob.ts`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `useBookGenerationSocket` — `src/hooks/useBookGenerationSocket.ts` — SSE live events for WatchTheater. [CONSENSUS: 1/3] [STATUS: shipped]
+- `useCrossBlockHighlight` — `src/hooks/useCrossBlockHighlight.ts`. [CONSENSUS: 2/3] [STATUS: shipped]
+- `useTextHighlights` — `src/hooks/useTextHighlights.ts`. [CONSENSUS: 2/3] [STATUS: shipped]
+- `useHighlightManagement` — `src/hooks/useHighlightManagement.ts`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `useChatSession` — `src/hooks/useChatSession.ts`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `useChatStream` — `src/hooks/useChatStream.ts` — SSE chat. [CONSENSUS: 1/3] [STATUS: shipped]
+- `useCitations` — `src/hooks/useCitations.ts`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `useChapterCitations` — `src/hooks/useChapterCitations.ts`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `useEvidenceBank` — `src/hooks/useEvidenceBank.ts`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `useBlockRewrite` — `src/hooks/useBlockRewrite.ts:853` records preview thumbs feedback optimistically. [CONSENSUS: 2/3] [STATUS: shipped]
+- `useReadingProgress` — `src/hooks/useReadingProgress.ts`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `useBackgroundTask` — `src/hooks/useBackgroundTask.ts`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `useBackgroundTasksSyncWS` — `src/hooks/useBackgroundTasksSyncWS.ts`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `useBookLanguage` — `src/hooks/useBookLanguage.ts`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `useBookTOC` — `src/hooks/useBookTOC.ts`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `useBookLearning` — `src/hooks/useBookLearning.ts`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `useJudgeRubrics` — `src/hooks/useJudgeRubrics.ts`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `useMemoryCalibration` — `src/hooks/useMemoryCalibration.ts`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `useMemoryReview` — `src/hooks/useMemoryReview.ts`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `useStyleGateGuard` — `src/hooks/useStyleGateGuard.ts`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `useStyleInspect` — `src/hooks/useStyleInspect.ts`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `useSkillInvoker` — `src/hooks/useSkillInvoker.ts`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `useSkillMatching` — `src/hooks/useSkillMatching.ts`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `useStrongApproval` + `useUnattendedRate` — `src/hooks/`. [CONSENSUS: 1/3] [STATUS: shipped]
+
+## Frontend services (5 features)
+- `chatSessionService` (FE) — `src/services/chatSessionService.ts:363` `saveTurnToLibrary` calls /save-to-margin; `:382` chat-message thumbs caller for `/api/prompts/feedback`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `onboardingSampleChapterApi` (FE) — `src/services/onboardingSampleChapterApi.ts:131` POST /plan, `:144` POST /sample-chapter. [CONSENSUS: 1/3] [STATUS: shipped]
+- `explanationFeedbackService` (FE) — `src/services/explanationFeedbackService.ts:44` posts block-level feedback w/ optional prompt/trace; `:80` GET /api/blocks/feedback-stats. [CONSENSUS: 1/3] [STATUS: shipped]
+- `useComposeMachine` — `src/pages/compose/useComposeMachine.ts:1` — XState for compose flow + `jobStateMachine.ts:1`. [CONSENSUS: 1/3] [STATUS: shipped]
+
+## Background jobs / workers / cron — book-gen pipeline (12 features)
+- `bookGenerationProcessor` — `server/workers/unified/processors/bookGenerationProcessor.ts` — orchestrates full lifecycle. Queue `book-generation`. [CONSENSUS: 2/3] [STATUS: shipped]
+- `planGenerationProcessor` — `server/workers/unified/processors/planGenerationProcessor.ts` — plan gen + iterative refinement. Queue `plan-generation`. [CONSENSUS: 2/3] [STATUS: shipped]
+- `bookSetupProcessor` — `server/workers/unified/processors/bookSetupProcessor.ts` — metadata + structure. Queue `book-setup`. [CONSENSUS: 2/3] [STATUS: shipped]
+- `chapterGenerationProcessor` — `server/workers/unified/processors/chapterGenerationProcessor.ts` — single chapter gen. Queue `chapter-generation`. [CONSENSUS: 2/3] [STATUS: shipped]
+- `chapterPlanFillProcessor` — `server/workers/unified/processors/chapterPlanFillProcessor.ts`. Queue `chapter-plan-fill`. [CONSENSUS: 2/3] [STATUS: shipped]
+- `bookFinalizeProcessor` — `server/workers/unified/processors/bookFinalizeProcessor.ts`. Queue `book-finalize`. [CONSENSUS: 2/3] [STATUS: shipped]
+- `bookTranslationProcessor` — `server/workers/unified/processors/bookTranslationProcessor.ts`. Queue `book-translation`. [CONSENSUS: 2/3] [STATUS: shipped]
+- `chapterAbstractProcessor` — `server/workers/unified/processors/chapterAbstractProcessor.ts`. Queue `chapter-abstract`. [CONSENSUS: 2/3] [STATUS: shipped]
+- `chapterIllustrationProcessor` — `server/workers/unified/processors/chapterIllustrationProcessor.ts`. Queue `chapter-illustration`. [CONSENSUS: 2/3] [STATUS: shipped]
+- `chapterZoomRegenerateProcessor` — `server/workers/unified/processors/chapterZoomRegenerateProcessor.ts`. Queue `chapter-zoom-regenerate`. [CONSENSUS: 2/3] [STATUS: shipped]
+- `bookCoverGenerationProcessor` — `server/workers/unified/processors/bookCoverGenerationProcessor.ts`. Queue `book-cover-generation`. [CONSENSUS: 2/3] [STATUS: shipped]
+- `translationProcessor` — `server/workers/unified/processors/translationProcessor.ts`. Queue `translation`. Page-level pairs: `pageTranslationBackfill`, `translationValidation`, `translationRestructure`, `translationProfile`. [CONSENSUS: 2/3] [STATUS: shipped]
+
+## Background jobs / workers / cron — content + memory + skills (16 features)
+- `aiAnnotationProcessor` — `server/workers/unified/processors/aiAnnotationProcessor.ts`. Queue `ai-annotation`. [CONSENSUS: 2/3] [STATUS: shipped]
+- `artifactGenerationProcessor` — Queue `artifact-generation`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `pipelineProcessor` — Queue `pipeline-execution`. [CONSENSUS: 2/3] [STATUS: shipped]
+- `documentIndexingProcessor` — Queue `document-indexing`. [CONSENSUS: 2/3] [STATUS: shipped]
+- `hierarchyBuildProcessor` + `chapterHierarchyIndexingProcessor` + `textCacheExtractionProcessor` + `pageSummarizationProcessor` — indexing infra. [CONSENSUS: 1/3] [STATUS: shipped]
+- `arxivHarvestProcessor` — Queue `arxiv-harvest` (cron 6h cadence; ~147K papers). [CONSENSUS: 2/3] [STATUS: shipped]
+- `sandboxResults` — Queue `sandbox-results` — Daytona result ingestion. [CONSENSUS: 1/3] [STATUS: shipped]
+- `sandboxResultReconciler` — periodic; reconciles lost sandbox results. [CONSENSUS: 2/3] [STATUS: shipped]
+- `stuckJobHealthChecker` — periodic; auto-reaps dead jobs (NB: no operator kill-switch — see coverage gap 1). [CONSENSUS: 2/3] [STATUS: shipped]
+- `implicitAcceptanceProcessor` — periodic. [CONSENSUS: 2/3] [STATUS: shipped]
+- `qualityDriftProcessor` — periodic. [CONSENSUS: 2/3] [STATUS: shipped]
+- `personalityDriftProcessor` — periodic; paired w/ `personalityRoutes.ts`. [CONSENSUS: 2/3] [STATUS: shipped]
+- `preferenceLearningProcessor` — daily. [CONSENSUS: 2/3] [STATUS: shipped]
+- `skillPromotionProcessor` — every 15 min; paired w/ `skills.ts` + `skillsCrud.ts`. [CONSENSUS: 2/3] [STATUS: shipped]
+- `memoryDriftCron` + `memoryCollectionProcessor` + `memoryWorker.ts` + `contextDistill.ts` + `contextReconcile.ts` + `contextCacheReap.ts` + `contextFsrsDecay.ts` + `contextEngineEval.ts` + `forgottenMemoryPrune.ts` — memory pipeline (mix of cron + processors). [CONSENSUS: 2/3] [STATUS: shipped]
+- `backgroundTaskPruneProcessor` — pruning. [CONSENSUS: 1/3] [STATUS: shipped]
+
+## Background jobs / workers / cron — co-evolution + GEPA + red team + drift (8 features)
+- GEPA quarterly cron `gepa-quarterly` — Codex flow 17: `app.ts:875` imports → `gepaCron.ts:61` `registerGepaCron` → `:72` BullMQ upsert cron `0 2 1-7 1,4,7,10 *` → scheduled-pipelines worker `:1204`/`:1209` routes to `promptEvolutionCronDispatch.ts:64` (declares `cron:prompt-evolution-dispatch` feature span) → `:101` dispatches `_runGepaQuarterly` → `:113` imports `handleGepaOptimizationJob` → `gepaCron.ts:805` first-Sunday guard → `:957` ledger-driven sweep finds eligible prompt keys. [CONSENSUS: 2/3] [STATUS: shipped]
+- GEPA feedback sample aggregation — Codex flow 18: `gepaCron.ts:247` `loadSamplesForPrompt` → `:269` SQL reads recent rated rows from `explanation_feedback` → `:280` filters by `prompt_name = ANY($2)` → `:292` feedback text or block content becomes sample → `:315` `composeCandidateMutation` consumes → `:765` joint mutation loads union of samples for group slugs. [CONSENSUS: 1/3] [STATUS: shipped]
+- Red-team quarterly cron `redteam-quarterly` — Codex flow 19: `app.ts:895` registers → `redTeamCron.ts:269/280` BullMQ upsert pipelineType `redteam_quarterly` cron `0 3 1-7 1,4,7,10 *` → scheduled worker `:1208` reads pipelineType → `:1209` only prompt-evolution types routed → `promptEvolutionCronDispatch.ts:43` excludes `redteam_quarterly` → falls through (`:1212`) to BCE dispatch → `bceCronDispatch.ts:92` treats unrecognized as benign skip → `redTeamCron.ts:309` `handleRedTeamDrill` never reached. [CONSENSUS: 1/3] [STATUS: broken — dispatch chain severed] [OBS: missing — no red-team feature span; skipped under BCE debug path]
+- BCE co-evolution crons — Codex flow 20: `app.ts:917` → `cronRegistry.ts:39` start → `:61` trajectory extractor every 15min when enabled → `:74` profile updater daily 03:00 UTC → `:87` skill distiller quarterly → `:100` memory decay Sunday 02:00 UTC → scheduled worker `:1204` consumes → `bceCronDispatch.ts:87/140/164/185/206` execute trajectory/profile/skill-distill/memory-decay. [CONSENSUS: 2/3] [STATUS: shipped] [OBS: weak — BCE dispatcher lacks `cronFeatureName`]
+- Preference-drift monthly cron `preference-drift-monthly` — Codex flow 21: `app.ts:936` → `preferenceDriftCron.ts:19/30` BullMQ upsert pipelineType `preference_drift_monthly` cron `0 5 1 * *` → scheduled worker `:1208` → prompt-evolution dispatcher `:43` does NOT include it → BCE dispatcher `:48` also does NOT include it → `:92` unrecognized → skipped. Intended `preferenceDriftService.ts:218` `runMonthlyDriftDetection` (`:222` scan active users → `:184` insert `preference_drift_events`) never reached. [CONSENSUS: 1/3] [STATUS: broken — dispatch chain severed] [OBS: missing — no drift-specific span]
+- `promptEvolutionCronDispatch` — `server/workers/unified/processors/promptEvolutionCronDispatch.ts` — Queue `scheduled-pipelines`. [CONSENSUS: 2/3] [STATUS: shipped]
+- `bceCronDispatch` — `server/workers/unified/processors/bceCronDispatch.ts` — Queue `scheduled-pipelines`. [CONSENSUS: 2/3] [STATUS: shipped]
+- `redTeamProcessor` — `server/workers/unified/processors/redTeamProcessor.ts` — Queue `scheduled-pipelines` (separate from the broken cron dispatch chain). [CONSENSUS: 2/3] [STATUS: shipped]
+
+## Background jobs / workers / cron — media + import + swarm + content-integrity (12 features)
+- `examQuestionsProcessor` — Queue `exam-questions`. [CONSENSUS: 2/3] [STATUS: shipped]
+- `podcastGenerationProcessor` — Queue `podcast-generation`. [CONSENSUS: 2/3] [STATUS: shipped]
+- `ttsPreparationProcessor` — TTS prep (paired w/ audiobooks). [CONSENSUS: 1/3] [STATUS: shipped]
+- `webArticleEnhancementProcessor` — Queue `web-article-enhancement`. [CONSENSUS: 2/3] [STATUS: shipped]
+- `importTransformProcessor` — paired w/ webArticles + arxiv. [CONSENSUS: 1/3] [STATUS: shipped]
+- `swarmCoordinatorProcessor` — Queue `swarm-coordinator`. [CONSENSUS: 2/3] [STATUS: shipped]
+- `swarmMergeProcessor` — Queue `swarm-merge`. [CONSENSUS: 2/3] [STATUS: shipped]
+- `claimRefinementRegenProcessor` — Queue `claim-refinement-regen`. [CONSENSUS: 2/3] [STATUS: shipped]
+- `blockClassifierRepairProcessor` — block-classifier repair. [CONSENSUS: 1/3] [STATUS: shipped]
+- `cascadeInvalidationProcessor` — cascade invalidation. [CONSENSUS: 1/3] [STATUS: shipped]
+- `suggestionNodesProcessor` + `orphanConnectionProcessor` + `hypeEnrich` + `chromeLockedProcessor` — content-integrity processors. [CONSENSUS: 1/3] [STATUS: shipped]
+- Sample-chapter Hatchet task `sample-chapter-generation` — Codex flow 7: `sampleChapterService.ts:268` → `sampleVariantEnqueue.ts:74` dispatches via bridge. [CONSENSUS: 1/3] [STATUS: shipped]
+
+## Database tables / migrations (12 features)
+- `book_generation_runs` — `server/database/migrations/20260901000000_book_generation_runs_book_id_backfill.sql` — book gen run tracking; `lifecycle.ts:854` UPSERTs pending/planning rows. [CONSENSUS: 2/3] [STATUS: shipped]
+- `books` — canonical book metadata; repaired by `20260902000000_repair_books_canonical_title.sql`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `blocks` — core content blocks with `node_type` / `source_type` / `properties->>'markdown_content'` (chapter body lives here, NOT in `b.content`; anchor row has `source_type='book_chapter_anchor'` + `node_type='chapter'`). [CONSENSUS: 1/3] [STATUS: shipped]
+- `prompt_templates` — harness-managed prompt registry; UPSERTed on boot via `syncPromptRegistryToDatabase`; 1 row per `PromptKey`; GepaDashboardPage renders 1 row per entry. [CONSENSUS: 2/3] [STATUS: shipped]
+- `prompt_executions` — execution ledger; receives `accepted` + `user_rating` from `unifiedPromptFeedbackService.ts:232`; created pending at `promptIntegrationService.ts:21`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `explanation_feedback` — common feedback ledger written by all 3 sources (chat/block-rewrite/explanation); inserted at `explanationFeedbackService.ts:58`; aggregated by `:216`; read by `gepaCron.ts:269`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `gepa_mutations` — `20260910000000_gepa_mutations_evolution_run_id.sql` — GEPA mutation tracking. [CONSENSUS: 1/3] [STATUS: shipped]
+- `evolution_runs` — `20260910000001_evolution_run_rollback_support.sql` — evolution run state. [CONSENSUS: 1/3] [STATUS: shipped]
+- `style_blueprint_samples` — sample chapter harvest data. [CONSENSUS: 2/3] [STATUS: shipped]
+- `blueprint_section_feedback` — section-level feedback (current verdict upserted by `persistSectionFeedback` at `sampleChapterHarvest.ts:419`). [CONSENSUS: 2/3] [STATUS: shipped]
+- `blueprint_rubrics` — distilled rubrics from feedback. [CONSENSUS: 2/3] [STATUS: shipped]
+- `content_action_anchors` — `20260824000000_content_action_anchors.sql` — content action anchor points. [CONSENSUS: 2/3] [STATUS: shipped]
+- `book_steer_events` — durable steer event rows feeding BCE trajectory extraction; written at `bookGeneration.ts:2173`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `user_personality` + PAMU signals + personality atoms — written transactionally by `sampleChapterService.ts:397/418/489` during onboarding save. [CONSENSUS: 1/3] [STATUS: shipped]
+- `preference_drift_events` (intended) — would be inserted by `preferenceDriftService.ts:184` IF the cron dispatch chain reached it. [CONSENSUS: 1/3] [STATUS: broken — see workers]
+- `prompt_injection_events` (intended) — would be persisted by red-team handler IF reached. [CONSENSUS: 1/3] [STATUS: broken — see workers]
+- Total migration count: 619 SQL files in `server/database/migrations/`. [CONSENSUS: 1/3] [STATUS: shipped]
+
+## Prompt registry keys (38 features)
+- `prompt_book_plan_gen` — `server/services/bookGeneration/planGen.ts:45` — plan generation. [CONSENSUS: 1/3] [STATUS: shipped]
+- `prompt_plan_judge` — `server/services/bookGeneration/planGen.ts:71` — plan quality judging. [CONSENSUS: 1/3] [STATUS: shipped]
+- `prompt_plan_refinement` — `server/services/bookGeneration/planGen.ts:98`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `prompt_writing_style_guide` — `server/services/bookGeneration/planGen.ts:131` — StepStyleSynthesis. [CONSENSUS: 1/3] [STATUS: shipped]
+- `prompt_chapter_planner` — `server/services/bookGeneration/chapterPlannerService.ts:149` — chapter fanout. [CONSENSUS: 1/3] [STATUS: shipped]
+- `prompt_capsule_merged_draft` — `server/services/bookGeneration/chapterWriterCapsule.ts:118` — chapter writing. [CONSENSUS: 1/3] [STATUS: shipped]
+- `prompt_plan_sketch` — `server/services/bookGeneration/planSketchService.ts:49`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `prompt_iterative_outline_planner` — `server/services/bookGeneration/iterativeOutlinePlanner.ts:134`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `prompt_plan_critique` — `server/services/bookGeneration/iterativeOutlinePlanner.ts:126`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `prompt_prose_claim_extract` — `server/services/bookGeneration/proseAssertionExtractor.ts:36`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `prompt_chapter_abstract_extraction` — `server/services/bookGeneration/postGen.ts:41`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `prompt_glossary_extraction` — `server/services/bookGeneration/postGen.ts:73`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `prompt_crossref_generation` — `server/services/bookGeneration/postGen.ts:98`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `prompt_book_introduction` — `server/services/bookGeneration/postGen.ts:124`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `prompt_chapter_comprehension_quiz` — `server/services/bookGeneration/quizAutoGen.ts:61`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `prompt_chapter_genre_escalation` — `server/services/bookGeneration/chapterWritingContract/escalateGenreLlm.ts:78` (registered); resolved at `:169` (Codex flow 4). [CONSENSUS: 2/3] [STATUS: shipped]
+- `prompt_chapter_contract_repair` — `server/services/bookGeneration/chapterWritingContract/repairChapterStructure.ts:23`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `prompt_citation_class` — resolved at `server/services/bookGeneration/assurance/citationAuditService.ts:336` (Codex flow 4). [CONSENSUS: 1/3] [STATUS: shipped]
+- `prompt_skill_distiller` — `server/services/bookGeneration/coEvolution/promptRegistry.ts:77`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `prompt_trajectory_event_extractor` — `server/services/bookGeneration/coEvolution/promptRegistry.ts:100`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `prompt_memory_ingestion` — `server/services/bookGeneration/coEvolution/promptRegistry.ts:114`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `prompt_memory_calibrator` — `server/services/bookGeneration/coEvolution/promptRegistry.ts:132`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `prompt_profile_updater` — `server/services/bookGeneration/coEvolution/promptRegistry.ts:154`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `prompt_vertical_classifier` — `server/services/bookGeneration/coEvolution/verticalClassifierLLM.ts:45`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `prompt_book_synthesis_extract` — `server/services/bookGeneration/sourceIngestion/userSynthesisExtractor.ts:49`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `prompt_book_reference_extract` — `server/services/bookGeneration/sourceIngestion/referenceExtractor.ts:41`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `prompt_source_claim_extract` — `server/services/bookGeneration/evidenceBank/sourceClaimExtractor.ts:53`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `prompt_chapter_evidence_pack` — `server/services/bookGeneration/chapterEvidencePackAssembler.ts:53`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `prompt_evidence_cluster_summary` — `server/services/bookGeneration/structuralSynthesis/evidenceClusterSummary.ts:44`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `prompt_oracle_outline` — `server/services/bookGeneration/structuralSynthesis/oracleOutlineExtractor.ts:56`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `prompt_source_multi_aspect` — `server/services/bookGeneration/structuralSynthesis/multiAspectTaxonomy.ts:71`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `prompt_nli_claim_entailment` — `server/services/bookGeneration/assurance/coverageAuditService.ts:63`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `prompt_chapter_quiz_gen` + `_answer` + `_judge` + `prompt_book_cross_quiz` + `_answer` — `server/services/bookGeneration/assurance/readerQuizGate.ts:204/217/256/230/243`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `prompt_adversarial_drill` — `server/services/promptEvolution/adversarialDrill.ts:63` — red team. [CONSENSUS: 1/3] [STATUS: shipped]
+- `prompt_claw_behavioral` — `server/services/bookGeneration/clawGuard/behavioralAnalyzer.ts:25` — ClawGuard L5. [CONSENSUS: 1/3] [STATUS: shipped]
+- `prompt_synthesize_publisher_style` — `server/services/publisherStyle/synthesizeStyle.ts:89`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `prompt_publisher_style_synthesis` — resolved at `server/services/publisherStyle/synthesizeStyle.ts:460` (Codex flow 4 injected-generator path). [CONSENSUS: 1/3] [STATUS: shipped]
+- `prompt_create_publisher_style_spec` — `server/services/publisherStyle/synthesizePublisherStylePrompt.ts:41`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `prompt_skill_distiller_memory` — `server/services/bookGeneration/memory/skillDistiller.ts:77`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `prompt_trajectory_event_extractor_memory` — `server/services/bookGeneration/memory/trajectoryExtractor.ts:66`. [CONSENSUS: 1/3] [STATUS: shipped]
+- Onboarding-registered prompts at module load — `onboardingSampleChapter.ts:57` (system) + `:95` (intent-classifier) + `:137` (plan-draft). [CONSENSUS: 1/3] [STATUS: shipped]
+
+## CLI scripts (4 features)
+- `scripts/docs-manifest.ts` — regenerate `docs/MANIFEST.md`. [CONSENSUS: 1/3] [STATUS: shipped]
+- `scripts/docs-frontmatter-check.ts` — pre-commit frontmatter validator. [CONSENSUS: 1/3] [STATUS: shipped]
+- `server/scripts/backfillArxivMath.ts` — backfill arXiv math extraction. [CONSENSUS: 2/3] [STATUS: flagged]
+- `server/scripts/test-arxiv-extractor.ts` — standalone DOM-walker test. [CONSENSUS: 1/3] [STATUS: shipped]
+
+## Shared types (6 features)
+- `PromptKey` — `shared/types/promptSettings.ts:520` — union type of all registered prompt keys. [CONSENSUS: 1/3] [STATUS: shipped]
+- `PROMPT_KEYS` — `shared/types/promptSettings.ts:901` — runtime array. [CONSENSUS: 1/3] [STATUS: shipped]
+- `PromptFeatureArea` — `shared/types/promptSettings.ts` — feature area enum. [CONSENSUS: 1/3] [STATUS: shipped]
+- `FEATURE_AREA_DISPLAY_CONFIG` — `shared/types/promptSettings.ts` — display config per area. [CONSENSUS: 1/3] [STATUS: shipped]
+- `sampleChapterHarvest.ts` — `shared/types/` — types for the consolidated primitive. [CONSENSUS: 1/3] [STATUS: shipped]
+- `onboardingSampleChapter.ts` — `shared/types/` — onboarding-caller types. [CONSENSUS: 1/3] [STATUS: shipped]
+
+## Cross-cutting observability primitives (3 features)
+- `withFeature({name:'X'})` — `server/observability/feature.ts:1` (server) + `src/utils/feature.ts` (FE). Wraps every new path so FeatureName union surfaces in OTel baggage. [CONSENSUS: 1/3] [STATUS: shipped]
+- `featureContext` middleware — `server/middleware/featureContext.ts:1` — Express-side baggage propagation. [CONSENSUS: 1/3] [STATUS: shipped]
+- Sandbox callback bridge (in-process Map<id,Waiter>) — `server/routes/sandboxCallback.ts:1` — replaces long-poll as source-of-truth for Daytona viz callback delivery. [CONSENSUS: 1/3] [STATUS: shipped]
 
 ## Disputed entries
 
-1. **`llm_judge_nightly` scheduled-pipelines routing**
-   - Codex: `[OBS: missing] / likely broken dispatch` — registered with `pipelineType:'llm_judge_nightly'` at `server/cron/index.ts:56`, but `server/workers/unified/workers/index.ts:1208-1212` does not route this `pipelineType` to `promptEvolutionCronDispatchProcessor` (only `gepa_quarterly`/`conclude_shadow_tests`/`prompt_execution_pending_reaper`); falls through to BCE.
-   - GLM: lists `llmJudgeCron` as a "GEPA cron job, post-mutation" — implies functional.
-   - **Verdict** — Codex has the deeper flow trace; suspected broken dispatch path needs verification before any user-visible nightly LLM judge claim. [DISPUTED: Codex vs GLM]
+1. **Legacy onboarding lifecycle** [DISPUTED: minimax vs glm]. MiniMax explicitly tags `OnboardingPage.tsx:1` as "deprecated, scheduled rip" citing `:4` comment + `App.tsx:223-226` redirect logic that still mounts both paths past the 2-week sunset window. GLM lists the onboarding surface without a deprecation tag and leaves `OnboardingPage` out of its enumeration entirely (only `SampleChapterWizard`-adjacent components are listed). Codex doesn't touch the deprecation question. Effective verdict: deprecated per project pre-prod posture rule "rip + delete, don't parallel-run", but the dispute is unresolved at the inventory level.
 
-2. **Chapter Zoom active-task + cancel observability**
-   - Codex: `[OBS: missing]` on `GET /active-task` route and `POST /cancel` route — no `withFeature` wrapper despite the regenerate path having one.
-   - GLM/MiniMax: list as shipped without flagging the gap.
-   - **Verdict** — Codex evidence specific (line refs); gap is real but feature surface still ships. [DISPUTED: Codex vs GLM/MiniMax — observability gap]
-
-3. **Sample-chapter harvest route observability**
-   - Codex: `[OBS: missing]` on all three sub-routes (`/generate-variants`, `/section-feedback`, `/refine`) — none wrap in `withFeature`; LLM cost tracking is the only observability surface.
-   - GLM: lists as shipped.
-   - **Verdict** — observability gap is real per Codex line refs at `server/routes/sampleChapterHarvest.ts:223/266/386`. [DISPUTED: Codex vs GLM — observability gap]
-
-4. **Onboarding profile enrichment LLM call**
-   - Codex: `sampleChapterService.ts:660` "emits a traced Gemini enrichment envelope, currently with no LLM call" — envelope exists, but call body is unimplemented.
-   - Kimi/MiniMax: imply onboarding profile save is fully shipped.
-   - **Verdict** — surface shipped, enrichment side-effect is no-op. [DISPUTED: Codex vs others — partial feature]
-
-5. **Wizard step count**
-   - GLM: 9 onboarding step files (`StepIntent`/`StepProfile`/`StepPlan`/`StepSample`/`StepSteer`/`StepClarify`/`StepLanding`/`StepRefreshConfirm`/`StepFullBook`).
-   - MiniMax: 12-step compose wizard (lists 12 separately for compose; mentions onboarding wizard generally).
-   - **Verdict** — different wizards. Onboarding ≠ compose; both are real surfaces. [DISPUTED: GLM vs MiniMax — same name "wizard", different surfaces]
-
----
+2. **Red-team and preference-drift cron status** [DISPUTED: codex vs glm]. Codex flow 19 (`redteam-quarterly`) and flow 21 (`preference-drift-monthly`) trace explicit broken dispatch chains: BullMQ correctly upserts the cron, the scheduled worker reads it, but neither the prompt-evolution dispatcher (only handles `gepa_quarterly`-family) nor the BCE dispatcher (only handles `bce_*`) recognize the pipeline type, so they fall through and the intended handlers (`handleRedTeamDrill` at `redTeamCron.ts:309`, `runMonthlyDriftDetection` at `preferenceDriftService.ts:218`) are never invoked. GLM lists both as shipped processors with no broken-status tag. MiniMax also lists `redTeamProcessor.ts` and the drift areas as shipped. Effective verdict: the **processors exist and are shipped**, but the **scheduled-cron path to them is severed** — Codex's trace is correct evidence; GLM's status tag is correct about file existence but misses the dispatch gap.
 
 ## Coverage gap report
 
-### Observability gaps (Codex `[OBS: missing]`)
-- `server/routes/sampleChapterHarvest.ts:223` — `POST /:sessionId/generate-variants` lacks `withFeature`.
-- `server/routes/sampleChapterHarvest.ts:266` — `POST /:sessionId/refine` lacks `withFeature`.
-- `server/routes/sampleChapterHarvest.ts:386` — `PATCH /:sessionId/section-feedback` lacks `withFeature`, span, or `traceGemini`.
-- `server/routes/chapterZoom.ts:91` — `GET /active-task` lacks `withFeature`.
-- `server/routes/chapterZoom.ts:215` — `POST /regenerate/cancel` lacks `withFeature`.
-- `server/workers/unified/workers/index.ts:1208-1212` — `llm_judge_nightly` not routed to `runLlmJudgeCron`; falls through to BCE.
+Merged from MiniMax (10 explicit FE/UX gaps) + Codex (3 missing-observability flows + 2 broken cron chains) + GLM ([STATUS: flagged] callouts).
 
-### Test gaps (Kimi `Tested?: no` / `partial`)
-- `unifiedPromptFeedbackService.recordPromptFeedback` — no tests.
-- `promptExecutionService.createExecution/recordOutcome` — no tests.
-- `chapterPlannerService.planChapter` — integration-only.
-- `chapterGenMixin.generateStructuredChapterContent` — no tests.
-- `persistJobPublisherStyle` — no tests.
-- `blockRewriteService.previewRewrite/commitRewrite/previewImageGen` — partial (markdown-to-blocks only).
-- `chatSessionService.sendMessage/streamResponse` — partial (mappers only).
-- `chapterWriterCapsule.executeChapter` — partial (clawGuardCapsuleBridge extracted; capsule FSM untested).
-- `addJob`/`addJobToQueue` — no tests.
-- `adaRubricService.triggerRegenerationIfNeeded` — no tests.
-- `explanationFeedbackService.storeFeedback` — no tests.
-- `wizardMachine.reducer` — partial (only `dwEvidenceMet` truth-table).
-- `BlueprintReaderPreview` — no tests.
-- `MarkdownAdapter` — no tests.
-- `TodayPage` — no tests.
-- `chapterPlanCalibration` — no tests.
-
-### Product-surface gaps (MiniMax)
-1. **No user-facing chapter/job control panel** — no `POST /:bookUUID/cancel` or `POST /:bookUUID/chapters/:n/cancel` in `server/routes/books.ts`; users who start a 12-chapter book can't kill chapter 7. Closest is admin-only `bookGenerationJobService`.
-2. **No user-triggered resume-from-checkpoint** — `chapterResume.ts:1` + `bookResume` infra exists, no UI button. Reader → chapter list has no "Resume from here" CTA.
-3. **No public "discuss this passage" surface beyond `ShareProofButton`** — `server/routes/highlights.ts` has no public `/highlights/:id` route.
-4. **GEPA evolution invisible to end users** — operator-only `src/pages/admin/GepaDashboardPage.tsx`; no user `/settings/prompt-history` or `RecentPromptChanges` digest.
-5. **Audio surface invisible despite backend** — `server/services/audiobookService.ts:1` + `server/routes/audiobooks.ts:1` ship; no `AudioPlayer.tsx` in `src/components/host-app/reader/`, no Play CTA in `ReaderHeader.tsx`/`ChapterSpine.tsx`.
-6. **No operator view for cross-block highlight graph health** — FE-only `useCrossBlockHighlight` + `useTextHighlights`; no admin diagnostic in `server/routes/adminSystem.ts`.
-7. **Compose re-entry from sidebar restarts at Step 1** — `useComposeMachine.ts` FSM exists; `src/pages/compose/ComposePage.tsx` has no resume-on-mount logic.
-
-### Zero-fallback contracts (Kimi)
-- `chapterPlannerService.planChapter` — throws on Zod parse failure / target-char drift > 15%.
-- `chapterWriterCapsule.executeChapter` — throws on rubric parse failure / sandbox failure.
-- `chapterGenMixin.generateStructuredChapterContent` — throws on LLM or file-write failure.
-- `chapterPlanCalibration.resolvePublisherStyleKeyAsync` — throws `Unknown publisher_style_slug`.
-
-### `[STATUS: flag-gated]`
-- `PG19 stylistic exemplars` — `FEATURE_PG19_EXEMPLARS=true` off by default. Discoverability invisible (feeds style synthesis only).
+1. **No `/api/admin/jobs/cancel` surface for in-flight book/chapter/podcast/translation jobs** (MiniMax). `stuckJobHealthChecker.ts` auto-reaps dead jobs but no operator kill switch / force-complete; stuck gen burns Daytona budget. Fix: `POST /api/admin/jobs/:id/cancel` + `Cancelled` status in `jobStateMachine.ts`.
+2. **No mobile variant of compose wizard** (MiniMax). `ComposePageMobile.tsx:1` exists at page level but `StepStyleSynthesis` / `StepPlan` / `StepConfigure` assume desktop. Gap is component responsiveness, not state machine.
+3. **No user-facing "regenerate single chapter" or "replay from checkpoint" UX** (MiniMax). `chapterZoomRegenerateProcessor.ts` exists but admin-only; no mid-job checkpoint resume UI.
+4. **Audiobook + podcast surfaces lack a discoverable FE page** (MiniMax). `audiobooks.ts:1` + `podcastGenerationProcessor.ts` exist; no `src/pages/audiobooks/` or `src/pages/podcasts/` index.
+5. **Onboarding has dual parallel paths past 2-week sunset window** (MiniMax + DISPUTED). See Disputed entry 1.
+6. **Public sharing limited to proof tokens only** (MiniMax). `ShareProofButton` + `PublicProofPage` exist; no share-an-entire-book / share-a-citation / share-a-chat.
+7. **No batch operations in Library** (MiniMax). `library/utils.ts:1` only read-only filter/sort — no bulk-tag, bulk-move-to-project, bulk-archive, bulk-delete.
+8. **No `/api/v1/inbox` surface at the FE layer** (MiniMax). ContextNest substrate exposes it per CLAUDE.md but no `src/pages/inbox/` or dashboard widget.
+9. **No user-facing "kill a running sandbox" surface** (MiniMax). Zero-Fallback rule keeps sandboxes alive on failure but no UI to inspect/stop a runaway.
+10. **Whitelist admin has no in-product activation surface** (MiniMax). `WhitelistAdminPage` + `adminWhitelist.ts` exist but new-user flow has no progress indicator.
+11. **`POST /api/llm/generate` + `POST /api/llm/generate-gemini` bypass prompt harness** (Codex). `server/routes/llm.ts:29/48/67/88/107`. No prompt registry resolution, no `prompt_executions` linkage, no `withFeature`, no `traceGemini`. Violates project LLM harness rule.
+12. **Multiple routes ship without `withFeature` observability** (Codex). Confirmed missing: `GET /api/blocks/feedback-stats` (blockExplainProfile.ts:41); `PATCH /api/sample-chapter-harvest/:sessionId/section-feedback` (sampleChapterHarvest.ts:386); `PATCH /api/chat-sessions/:uuid/context` (chatSessions.ts:657); `POST /api/book-generation/plan-from-sandbox` (bookGeneration.ts:3094); `POST /api/book-generation/upload-from-sandbox` (bookGeneration.ts:3177); plan/chapter steering endpoints (bookGeneration.ts:2147/2235); BCE cron dispatcher (`bceCronDispatch.ts` — no `cronFeatureName`).
+13. **Scheduled cron dispatch chains severed for `redteam-quarterly` and `preference-drift-monthly`** (Codex flows 19+21). BullMQ correctly registers the crons; worker `:1208` reads pipelineType; neither prompt-evolution dispatcher (`promptEvolutionCronDispatch.ts:43`) nor BCE dispatcher (`bceCronDispatch.ts:48`) recognize the pipelineType; both fall through `:92` as benign skip; intended handlers (`redTeamCron.ts:309`, `preferenceDriftService.ts:218`) are never reached. As-shipped: scheduled jobs appear successful while doing nothing.
+14. **`server/scripts/backfillArxivMath.ts` flagged** (GLM `[STATUS: flagged]`). One-shot CLI for math re-extraction; flagged but no follow-up tag explaining the flag — likely operator-only / pre-prod cleanup script.
