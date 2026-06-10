@@ -1,0 +1,89 @@
+# providers.yaml — BYO (bring-your-own) provider registry for mini-ork.
+#
+# Lets developers use their own Anthropic / OpenAI-compatible API keys
+# without writing a lib/providers/cl_*.sh wrapper. Parsed by
+# lib/providers/registry.sh; consumed by lib/llm-dispatch.sh.
+#
+# PRECEDENCE: a lib/providers/cl_<name>.sh wrapper ALWAYS wins. The
+# registry is only consulted when no wrapper file exists for the model
+# name, so entries here can never change the behavior of the committed
+# providers (opus, sonnet, codex, glm, kimi, minimax, deepseek, gemini).
+# Give your entries new names and point config/agents.yaml lanes at them.
+#
+# Resolution order for this file (first hit wins):
+#   1. $MINI_ORK_PROVIDERS                       (explicit override)
+#   2. $MINI_ORK_HOME/config/providers.yaml      (per-project, gitignored dir)
+#   3. <repo>/config/providers.yaml              (this file)
+#
+# Secrets NEVER go in this file — only the NAME of the env var that holds
+# the key (api_key_env). Put the actual key in
+# $MINI_ORK_HOME/config/secrets.local.sh (see config/secrets.example.sh)
+# or export it in your shell.
+#
+# Schema per entry:
+#   kind: anthropic-native    claude CLI with your raw ANTHROPIC_API_KEY
+#                             (or ambient Claude Code login when unset)
+#         anthropic-compat    claude CLI pointed at an Anthropic-compatible
+#                             gateway (base_url + api_key_env required)
+#         openai-compat       codex CLI pointed at an OpenAI-compatible
+#                             /v1 endpoint (base_url + api_key_env required)
+#         executable          your own script honoring the dispatcher
+#                             contract: <script> --print --output-format text "<prompt>"
+#   family:      provider family recorded in llm_calls telemetry
+#   model:       model id pin (optional for anthropic-native)
+#   base_url:    endpoint for anthropic-compat / openai-compat
+#   api_key_env: NAME of the env var holding the API key
+#   script:      path for kind=executable (absolute or repo-relative)
+#   gateway:     anthropic-compat defaults to true (json output, no
+#                stream-json); set false only for endpoints that stream
+#                native Anthropic stream-json correctly
+#   extra_env:   optional map of extra env vars to export at dispatch
+#
+# Wire-up: point a lane at your entry in config/agents.yaml, e.g.
+#   lanes:
+#     implementer: my_openai
+#     reviewer: anthropic_api
+
+providers:
+  # Claude CLI with your own raw Anthropic API key. Export
+  # ANTHROPIC_API_KEY in secrets.local.sh; without it this falls back to
+  # the ambient `claude` login (same behavior as the builtin `opus` lane).
+  anthropic_api:
+    kind: anthropic-native
+    family: anthropic
+    model: claude-opus-4-7
+
+  # Codex CLI against the official OpenAI API with your own key.
+  # Requires `codex` on PATH; OPENAI_API_KEY in secrets.local.sh.
+  openai_api:
+    kind: openai-compat
+    family: openai
+    model: gpt-5.2-codex
+    base_url: https://api.openai.com/v1
+    api_key_env: OPENAI_API_KEY
+
+  # --- More examples (uncomment + adapt) ---------------------------------
+  #
+  # OpenRouter (OpenAI-compatible aggregator):
+  # openrouter:
+  #   kind: openai-compat
+  #   family: openrouter
+  #   model: anthropic/claude-sonnet-4.6
+  #   base_url: https://openrouter.ai/api/v1
+  #   api_key_env: OPENROUTER_API_KEY
+  #
+  # An Anthropic-compatible gateway (claude CLI + auth token):
+  # my_gateway:
+  #   kind: anthropic-compat
+  #   family: my-gateway
+  #   model: some-model-id
+  #   base_url: https://gateway.example.com/anthropic
+  #   api_key_env: MY_GATEWAY_API_KEY
+  #   extra_env:
+  #     ENABLE_TOOL_SEARCH: "false"
+  #
+  # Your own wrapper script (dispatcher contract on argv):
+  # my_local_llm:
+  #   kind: executable
+  #   family: local
+  #   script: scripts/my_llm_wrapper.sh
