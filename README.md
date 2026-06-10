@@ -366,6 +366,7 @@ Next-up work tracks (see [`ROADMAP.md`](ROADMAP.md) for detail):
 - Wave 2-A held-out anchor corpus per synthesis recipe (Wang 2026)
 - Wave 3 mechanical citation+coverage verifier (Sistla 2025 + Ficek 2025)
 - Krippendorff α calibration gate + adversarial fabricated-bug injection (the v0.2 honest-gaps list)
+- Agent-ops hardening track (LobeHub-informed, 2026-06-10): dispatch-time config snapshots, llm_calls error taxonomy + finish reasons, node heartbeat watchdog, cache-aware cost accounting, verifier rubrics with ground-truth feedback, checkpoint/resume — 14 items in 4 dependency-ordered phases
 
 ---
 
