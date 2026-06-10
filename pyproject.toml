@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mini-ork"
-version = "0.3.0rc1"
+version = "0.3.0rc2"
 description = "Python framework facade for the mini-ork agent workflow runtime"
 readme = "README.md"
 requires-python = ">=3.11"

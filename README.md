@@ -348,7 +348,7 @@ Auto-promotion is **class-restricted**: task classes with an external oracle (te
 
 ## Roadmap
 
-**Current: v0.3.0-rc1** (release candidate, 2026-06-08) — oracle-hardening primitives shipped: `coalition_gate.sh`, `cw_por.sh`, `mo_promote_synthesis_gate`, `adaptive_stability.sh`, `circuit_breaker.sh`, plus the central `gate_bootstrap.sh` wiring used by execute. Self-evolution is now explicitly class-restricted (`docs/positioning/why-mini-ork.md` §"Self-evolution is class-restricted").
+**Current: v0.3.0-rc2** (release candidate, 2026-06-10) — CI-gated observability, security, and reliability hardening on top of the v0.3 oracle-hardening primitives: `coalition_gate.sh`, `cw_por.sh`, `mo_promote_synthesis_gate`, `adaptive_stability.sh`, `circuit_breaker.sh`, plus the central `gate_bootstrap.sh` wiring used by execute. Self-evolution is now explicitly class-restricted (`docs/positioning/why-mini-ork.md` §"Self-evolution is class-restricted").
 
 The full release log lives in [`ROADMAP.md`](ROADMAP.md) — every section dated and per-commit-attributed. Current shipped totals (regenerable via `bash scripts/readme-claim-check.sh` and filesystem counts):
 
