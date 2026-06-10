@@ -47,4 +47,5 @@ __pycache__/
 .claude/settings.local.json
 
 .mini-ork/state.db
+.mini-ork/state.db.*
 docs/blog/
