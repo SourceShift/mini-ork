@@ -268,10 +268,13 @@ if [ -f "$MINI_ORK_DB" ]; then
   RUN_ID="${MINI_ORK_RUN_ID:-run-$(date +%s)-$$}"
   export MINI_ORK_RUN_ID="$RUN_ID"
   RECIPE="${MINI_ORK_RECIPE:-}"
-  python3 - "$MINI_ORK_DB" "$RUN_ID" "$TASK_CLASS" "$RESOLVED_WF_VERSION" "$KICKOFF" "$RECIPE" <<'PY'
+  # Promote TRACE_ID to task_runs.trace_id so the observability UI can
+  # bridge mo_events / llm_calls back to this task_run. Without this,
+  # task_runs.trace_id is NULL → events panel shows "no trace_id" warning.
+  python3 - "$MINI_ORK_DB" "$RUN_ID" "$TASK_CLASS" "$RESOLVED_WF_VERSION" "$KICKOFF" "$RECIPE" "$TRACE_ID" <<'PY'
 import sqlite3, sys, time
 
-db, run_id, task_class, wf_version, kickoff, recipe = sys.argv[1:]
+db, run_id, task_class, wf_version, kickoff, recipe, trace_id = sys.argv[1:]
 con = sqlite3.connect(db)
 con.execute("PRAGMA journal_mode=WAL")
 now = int(time.time())
@@ -280,16 +283,17 @@ now = int(time.time())
 try:
     con.execute("""
         INSERT INTO task_runs
-            (id, task_class, recipe, workflow_version, kickoff_path, status, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, 'classified', ?, ?)
+            (id, task_class, recipe, workflow_version, kickoff_path, status, trace_id, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, 'classified', ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
             task_class=excluded.task_class,
             recipe=excluded.recipe,
             workflow_version=excluded.workflow_version,
             kickoff_path=excluded.kickoff_path,
             status='classified',
+            trace_id=COALESCE(task_runs.trace_id, excluded.trace_id),
             updated_at=excluded.updated_at
-    """, (run_id, task_class, recipe or None, wf_version, kickoff, now, now))
+    """, (run_id, task_class, recipe or None, wf_version, kickoff, trace_id, now, now))
     con.commit()
     print(f"run_id={run_id}")
 except sqlite3.OperationalError as e:
