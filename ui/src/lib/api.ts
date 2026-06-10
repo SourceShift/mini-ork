@@ -1,0 +1,525 @@
+/**
+ * Thin API client over the FastAPI observability surface.
+ *
+ * All endpoints are read-only. In dev the Vite proxy forwards /api → :7090;
+ * in prod the FastAPI app serves the SPA + the same /api routes off one origin.
+ */
+
+const BASE = "";
+
+async function get<T>(path: string, init?: RequestInit): Promise<T> {
+  const res = await fetch(`${BASE}${path}`, {
+    ...init,
+    headers: { Accept: "application/json", ...(init?.headers ?? {}) },
+  });
+  if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    throw new Error(`${res.status} ${res.statusText} — ${body || path}`);
+  }
+  return (await res.json()) as T;
+}
+
+async function post<T>(path: string): Promise<T> {
+  const res = await fetch(`${BASE}${path}`, {
+    method: "POST",
+    headers: { Accept: "application/json" },
+  });
+  if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    throw new Error(`${res.status} ${res.statusText} — ${body || path}`);
+  }
+  return (await res.json()) as T;
+}
+
+// --- types ---------------------------------------------------------------
+
+export type Health = {
+  ok: boolean;
+  db_path: string;
+  has_task_runs: boolean;
+  has_mo_events: boolean;
+  has_self_improve_runs: boolean;
+};
+
+export type TaskRun = {
+  id: string;
+  task_class: string;
+  recipe: string | null;
+  workflow_version: string;
+  status: "classified" | "planned" | "executing" | "verifying" | "reviewing" | "published" | "rolled_back" | "failed";
+  verdict: "APPROVE" | "REQUEST_CHANGES" | "ESCALATE" | "CRASH" | null;
+  cost_usd: number;
+  duration_ms: number;
+  created_at: number;
+  updated_at: number;
+  ended_at: number | null;
+  trace_id: string | null;
+  kickoff_path: string;
+  plan_path: string | null;
+  artifact_path: string | null;
+};
+
+export type ActiveRun = {
+  id: number;
+  epic_id: string;
+  run_dir: string;
+  branch: string;
+  agent: string;
+  started_at: string;
+  last_heartbeat_at: string | null;
+  pid: number | null;
+  host: string | null;
+  test_status: string | null;
+  trace_status: string | null;
+  cost_usd: number;
+  epic_title: string | null;
+  epic_status: string | null;
+  lane: string | null;
+};
+
+export type TaskRunsSummary = {
+  by_recipe: { recipe: string; count: number; cost: number }[];
+  by_status: { status: string; count: number }[];
+  total_cost_usd: number;
+};
+
+export type BridgeMethod = "trace_id" | "run_id" | "time-window";
+
+export type RunEvent = {
+  id: number | string;
+  ts: string | number;
+  event_type: string;
+  actor: string | null;
+  status: string | null;
+  duration_ms: number | null;
+  cost_usd: number | null;
+  artifact_path: string | null;
+  payload_json: string | null;
+  source: "mo_events" | "run_events";
+  bridge: BridgeMethod;
+};
+
+export type LlmCall = {
+  id: number;
+  provider: string;
+  model_id: string;
+  tier: string;
+  feature_name: string;
+  actor: string | null;
+  input_tokens: number;
+  output_tokens: number;
+  total_tokens: number;
+  cost_usd: number;
+  duration_ms: number;
+  status: "success" | "failed";
+  finish_reason: string | null;
+  ts: string;
+  bridge: BridgeMethod;
+};
+
+export type Correlation = {
+  task_run_id: string;
+  trace_id: string | null;
+  bridge_methods: string[];
+  issues: string[];
+  remediation: string | null;
+};
+
+export type VerifierResult = {
+  verifier: string;
+  pass: boolean;
+  result_file: string;
+  log_file: string | null;
+  evidence_path: string | null;
+  payload: Record<string, unknown>;
+};
+
+export type EvidenceRef = { verifier: string; evidence_path: string };
+
+export type Diagnostic = {
+  task_run_id: string;
+  run_dir: string;
+  run_dir_exists: boolean;
+  summary: string;
+  execute_log: {
+    size: number;
+    tail: string[];
+    failure_lines: { line_no: number; text: string }[];
+    total_lines: number;
+  } | null;
+  verifier_results: VerifierResult[];
+  evidence_refs: EvidenceRef[];
+  self_improve_notes: { raw: string | null; outcome: string } | null;
+  trace_verdicts: Array<{
+    trace_id: string;
+    task_class: string;
+    status: string;
+    reviewer_verdict: string | null;
+    verifier_excerpt: string | null;
+    final_artifact_ref: string | null;
+    created_at: string;
+  }>;
+};
+
+export type EvidenceContent = {
+  path: string;
+  relpath: string;
+  size: number;
+  truncated: boolean;
+  content: string;
+};
+
+export type AgentSummary = {
+  node_id: string;
+  node_type: string;
+  model_lane: string | null;
+  family: string | null;
+  prompt_ref: string | null;
+  verifier_ref: string | null;
+  dispatch_mode: string | null;
+  gates: string[];
+  status: NodeStatus;
+  duration_ms: number | null;
+  verdict: string | null;
+  started_at: number | null;
+  ended_at: number | null;
+  artifact_files: string[];
+  llm_call_count: number;
+  llm_cost_usd: number;
+  llm_total_tokens: number;
+  llm_attribution_fallback: boolean;
+};
+
+export type AgentChild = {
+  spawn_id: string;
+  child_run_id: string;
+  depth: number;
+  recipe: string | null;
+  kickoff_path?: string;
+  authority_level?: number;
+  allow_child_spawn?: number;
+  status: string;
+  created_at: number;
+};
+
+export type AgentListResponse = {
+  task_run: TaskRun;
+  recipe: string | null;
+  edges: DagEdge[];
+  agents: AgentSummary[];
+  children: AgentChild[];
+};
+
+export type AgentTurn = {
+  turn_index: number;
+  model: string | null;
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_input_tokens?: number;
+  cache_creation_input_tokens?: number;
+  stop_reason: string | null;
+  session_id: string | null;
+  text: string;
+  tool_uses: Array<{ id: string; name: string; input: Record<string, unknown> }>;
+};
+
+export type AgentTranscript = {
+  turns: AgentTurn[];
+  available: boolean;
+  reason?: string;
+  transcript_path?: string;
+  truncated?: boolean;
+  fallback?: "text-output";
+};
+
+export type AgentDetail = {
+  task_run_id: string;
+  node: DagNode;
+  status: NodeStatus;
+  duration_ms: number | null;
+  verdict: string | null;
+  started_at: number | null;
+  ended_at: number | null;
+  prompt: { path: string | null; content: string | null };
+  artifacts: ArtifactContent[];
+  llm_calls: (LlmCall & { traceparent?: string; error_message?: string | null; metadata_json?: string })[];
+  transcript: AgentTranscript;
+  children: AgentChild[];
+};
+
+export type RunInput = {
+  key: "kickoff" | "plan" | "run_profile" | "profile_answers" | string;
+  label: string;
+  path: string;
+  name: string;
+  kind: "markdown" | "plan" | "json" | string;
+  size: number;
+  mtime: number;
+};
+
+export type RunInputContent = RunInput & {
+  content: string;
+};
+
+export type LearningAttribution = {
+  node_id: string | null;
+  source: string;
+  confidence: "high" | "medium" | "low" | "mixed" | "none" | string;
+  agent_version_id?: string;
+  candidate_node_ids?: string[];
+};
+
+export type LearningGradient = {
+  gradient_id: string;
+  target: string;
+  signal: string;
+  suggested_change: string;
+  evidence: string;
+  confidence: number;
+  created_at: number;
+  agent_attribution: LearningAttribution;
+};
+
+export type LearningPattern = {
+  pattern_id: string;
+  description: string;
+  evidence_trace_ids: string[];
+  frequency: number;
+  first_seen: string;
+  last_seen: string;
+  output_type: string;
+  promoted_to: string | null;
+  status: string;
+  agent_attribution: LearningAttribution;
+};
+
+export type LearningRecord = {
+  id: number;
+  run_id: string;
+  iter: number;
+  rank: number;
+  category: string;
+  title: string;
+  evidence_paths: string[];
+  arxiv_refs: string[];
+  patch_summary: string | null;
+  outcome: string;
+  severity: string;
+  confidence: number;
+  benchmark_delta: number | null;
+  created_at: number;
+  updated_at: number;
+  agent_attribution: LearningAttribution;
+};
+
+export type PriorSimilarRun = {
+  trace_id: string;
+  task_class: string;
+  status: string;
+  cost_usd: number;
+  duration_ms: number;
+  reviewer_verdict: string | null;
+  final_artifact_ref: string | null;
+  created_at: string;
+};
+
+export type LearningInjectionPoint = {
+  name: string;
+  where: string;
+  how: string;
+  wired?: boolean;
+};
+
+export type RunLearning = {
+  task_run_id: string;
+  task_class: string;
+  trace_id: string | null;
+  summary: {
+    gradients_produced: number;
+    patterns_evidenced: number;
+    learning_records: number;
+    prior_similar_runs_available: number;
+    known_failure_modes_available: number;
+  };
+  produced: {
+    gradients: LearningGradient[];
+    patterns: LearningPattern[];
+  };
+  self_improve: {
+    records: LearningRecord[];
+  };
+  injected_candidates: {
+    prior_similar_runs: PriorSimilarRun[];
+    known_failure_modes: LearningGradient[];
+    source: string;
+    injection_points: LearningInjectionPoint[];
+  };
+};
+
+export type GlobalGradient = {
+  gradient_id: string;
+  target: string;
+  signal: string;
+  suggested_change: string;
+  confidence: number;
+  created_at: number;
+};
+
+export type ArtifactEntry = {
+  name: string;
+  relpath: string;
+  size: number;
+  mtime: number;
+  kind: "markdown" | "json" | "log" | "yaml" | "shell" | "other";
+};
+
+export type ArtifactContent = ArtifactEntry & {
+  content: string;
+  truncated: boolean;
+  binary?: boolean;
+};
+
+export type NodeStatus = "never_seen" | "running" | "done" | "failed";
+
+export type DagNode = {
+  name: string;
+  type: string;
+  lane: string | null;
+  family: string | null;
+  prompt_ref: string | null;
+  verifier_ref: string | null;
+  dispatch_mode: string | null;
+  gates: string[];
+  status?: NodeStatus;
+  started_at?: number | string | null;
+  ended_at?: number | string | null;
+  duration_ms?: number | null;
+  verdict?: string | null;
+  artifact_path?: string | null;
+};
+
+export type DagEdge = { from: string; to: string; edge_type: string };
+
+export type Fingerprint = {
+  recipe: string;
+  nodes: DagNode[];
+  edges: DagEdge[];
+  families_used: Record<string, number>;
+  dominant_family: string | null;
+  dominant_share: number;
+  coalition: "heterogeneous" | "low" | "medium" | "high";
+};
+
+export type SelfImproveRun = {
+  run_id: string;
+  iter: number;
+  outcome: "pending" | "success" | "partial" | "rejected" | "failed" | "converged" | "timed_out" | "aborted";
+  started_at: number;
+  finished_at: number | null;
+  soft_deadline_at: number;
+  hard_deadline_at: number;
+  parent_run_id: string | null;
+  branch_name: string | null;
+  worktree_path: string | null;
+  notes: string | null;
+};
+
+export type ParsedNote = { key: string; value: string; kind: "flag" | "kv" | "sha" };
+
+export type SelfImproveDetail = SelfImproveRun & {
+  parsed_notes: ParsedNote[];
+  children: Array<Pick<SelfImproveRun, "run_id" | "iter" | "outcome" | "started_at" | "finished_at">>;
+  siblings: Array<Pick<SelfImproveRun, "run_id" | "iter" | "outcome">>;
+  linked_task_run: TaskRun | null;
+};
+
+export type CostByDayRow = { day: string; recipe: string; cost: number; run_count: number };
+export type WallTimeRow = { day: string; recipe: string; avg_ms: number; max_ms: number; run_count: number };
+
+// --- endpoints -----------------------------------------------------------
+
+export const api = {
+  health: () => get<Health>("/api/v1/health"),
+  activeRuns: () => get<ActiveRun[]>("/api/v1/runs/active"),
+  taskRuns: (opts: { limit?: number; recipe?: string; status?: string; verdict?: string } = {}) => {
+    const q = new URLSearchParams();
+    if (opts.limit) q.set("limit", String(opts.limit));
+    if (opts.recipe) q.set("recipe", opts.recipe);
+    if (opts.status) q.set("status", opts.status);
+    if (opts.verdict) q.set("verdict", opts.verdict);
+    const qs = q.toString();
+    return get<TaskRun[]>(`/api/v1/task-runs${qs ? `?${qs}` : ""}`);
+  },
+  taskRunsSummary: () => get<TaskRunsSummary>("/api/v1/task-runs/summary"),
+  taskRun: (id: string) => get<TaskRun>(`/api/v1/task-runs/${encodeURIComponent(id)}`),
+  events: (id: string) => get<RunEvent[]>(`/api/v1/task-runs/${encodeURIComponent(id)}/events`),
+  llmCalls: (id: string) => get<LlmCall[]>(`/api/v1/task-runs/${encodeURIComponent(id)}/llm-calls`),
+  artifacts: (id: string) => get<ArtifactEntry[]>(`/api/v1/task-runs/${encodeURIComponent(id)}/artifacts`),
+  artifact: (id: string, relpath: string) =>
+    get<ArtifactContent>(`/api/v1/task-runs/${encodeURIComponent(id)}/artifacts/${relpath.split("/").map(encodeURIComponent).join("/")}`),
+  dag: (id: string) => get<Fingerprint & { task_run_id: string }>(`/api/v1/task-runs/${encodeURIComponent(id)}/dag`),
+  correlation: (id: string) => get<Correlation>(`/api/v1/task-runs/${encodeURIComponent(id)}/correlation`),
+  why: (id: string) => get<Diagnostic>(`/api/v1/task-runs/${encodeURIComponent(id)}/why`),
+  agents: (id: string) => get<AgentListResponse>(`/api/v1/task-runs/${encodeURIComponent(id)}/agents`),
+  agent: (id: string, nodeId: string) =>
+    get<AgentDetail>(`/api/v1/task-runs/${encodeURIComponent(id)}/agents/${encodeURIComponent(nodeId)}`),
+  inputs: (id: string) => get<RunInput[]>(`/api/v1/task-runs/${encodeURIComponent(id)}/inputs`),
+  input: (id: string, key: string) =>
+    get<RunInputContent>(`/api/v1/task-runs/${encodeURIComponent(id)}/inputs/${encodeURIComponent(key)}`),
+  learning: (id: string) => get<RunLearning>(`/api/v1/task-runs/${encodeURIComponent(id)}/learning`),
+  // ── interactive Q&A ──
+  profile: (id: string) =>
+    get<{
+      task_run_id: string;
+      profile_status: string;
+      confidence: number;
+      questions: (string | { text?: string; question?: string })[];
+      answers: Record<string, string>;
+      needs_answers: boolean;
+      profile_path: string | null;
+      answers_path: string | null;
+    }>(`/api/v1/task-runs/${encodeURIComponent(id)}/profile`),
+  saveAnswers: async (id: string, answers: Record<string, string>) => {
+    const res = await fetch(`/api/v1/task-runs/${encodeURIComponent(id)}/answers`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      body: JSON.stringify(answers),
+    });
+    if (!res.ok) {
+      const body = await res.text().catch(() => "");
+      throw new Error(`${res.status} ${res.statusText} — ${body}`);
+    }
+    return (await res.json()) as {
+      ok: boolean;
+      task_run_id: string;
+      answers_saved: string[];
+      next_step_cli: string;
+      note: string;
+    };
+  },
+  // ── control plane (POST) ──
+  stop: (id: string) =>
+    post<{ ok: boolean; task_run_id: string; action: string; flag_path: string; note: string }>(
+      `/api/v1/task-runs/${encodeURIComponent(id)}/stop`,
+    ),
+  kill: (id: string) =>
+    post<{
+      ok: boolean;
+      task_run_id: string;
+      action: string;
+      pids_targeted: number[];
+      pids_signaled: number[];
+      pids_survived_permission_denied: number[];
+      note: string;
+    }>(`/api/v1/task-runs/${encodeURIComponent(id)}/kill`),
+  evidence: (id: string, path: string) =>
+    get<EvidenceContent>(`/api/v1/task-runs/${encodeURIComponent(id)}/evidence?path=${encodeURIComponent(path)}`),
+  selfImprove: (limit = 100) => get<SelfImproveRun[]>(`/api/v1/trajectory/self-improve?limit=${limit}`),
+  gradients: (limit = 25) => get<GlobalGradient[]>(`/api/v1/trajectory/gradients?limit=${limit}`),
+  selfImproveDetail: (runId: string) =>
+    get<SelfImproveDetail>(`/api/v1/trajectory/self-improve/${encodeURIComponent(runId)}`),
+  costByDay: () => get<CostByDayRow[]>("/api/v1/trajectory/cost-by-day"),
+  wallTime: () => get<WallTimeRow[]>("/api/v1/trajectory/wall-time"),
+  recipes: () => get<string[]>("/api/v1/fingerprint/recipes"),
+  fingerprint: (recipe: string) => get<Fingerprint>(`/api/v1/fingerprint?recipe=${encodeURIComponent(recipe)}`),
+};
