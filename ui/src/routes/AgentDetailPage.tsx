@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { Link, useParams } from "@tanstack/react-router";
+import { Link, useNavigate, useParams, useSearch } from "@tanstack/react-router";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
@@ -12,26 +12,23 @@ import {
   FileInput,
   FileText,
   GitBranch,
-  Lightbulb,
 } from "lucide-react";
 
-import { api, type ArtifactContent, type LearningAttribution, type RunInput, type RunLearning } from "@/lib/api";
-import { formatDuration, formatRelative } from "@/lib/format";
+import { api, type ArtifactContent, type DagNode, type LearningAttribution, type RunLearning } from "@/lib/api";
+import { formatCost, formatDuration, formatRelative, formatTokens } from "@/lib/format";
 import { FamilyPill, StatusPill, VerdictPill } from "@/components/Pill";
 import { AgentTranscriptPanel } from "@/components/AgentTranscript";
-import { RunInputModal } from "@/components/RunInputModal";
 
 export function AgentDetailPage() {
   const { taskRunId, nodeId } = useParams({ from: "/runs/$taskRunId/agents/$nodeId" });
-  const [selectedInput, setSelectedInput] = useState<RunInput | null>(null);
+  const navigate = useNavigate({ from: "/runs/$taskRunId/agents/$nodeId" });
+  const search = useSearch({ from: "/runs/$taskRunId/agents/$nodeId" });
+  const activeTab: AgentTab = isAgentTab(search.tab) ? search.tab : "overview";
+  const changeTab = (tab: AgentTab) =>
+    navigate({ search: (prev) => ({ ...prev, tab }), replace: true });
   const q = useQuery({
     queryKey: ["agent", taskRunId, nodeId],
     queryFn: () => api.agent(taskRunId, nodeId),
-    refetchInterval: 5_000,
-  });
-  const inputs = useQuery({
-    queryKey: ["inputs", taskRunId],
-    queryFn: () => api.inputs(taskRunId),
     refetchInterval: 5_000,
   });
   const learning = useQuery({
@@ -54,6 +51,10 @@ export function AgentDetailPage() {
 
   const d = q.data;
   const n = d.node;
+  const llmCost = d.llm_calls.reduce((sum, c) => sum + (c.cost_usd ?? 0), 0);
+  const llmTokens = d.llm_calls.reduce((sum, c) => sum + (c.total_tokens ?? 0), 0);
+  const turnCount = d.transcript.available ? d.transcript.turns.length : d.llm_calls.length;
+  const learningBadge = agentLearningCount(learning.data ?? null, nodeId);
 
   return (
     <div
@@ -93,84 +94,117 @@ export function AgentDetailPage() {
               <span className="pill-muted" data-testid="agent-dispatch-mode">{n.dispatch_mode}</span>
             )}
           </div>
-          <div className="text-xs text-ink-400 grid grid-cols-2 md:grid-cols-4 gap-2">
+          <div className="text-xs text-ink-400 grid grid-cols-2 md:grid-cols-4 lg:grid-cols-7 gap-2">
             <Cell label="lane">{n.lane ?? "—"}</Cell>
             <Cell label="duration">{formatDuration(d.duration_ms)}</Cell>
             <Cell label="started">{d.started_at ? formatRelative(d.started_at) : "—"}</Cell>
             <Cell label="ended">{d.ended_at ? formatRelative(d.ended_at) : "—"}</Cell>
-            {n.gates?.length ? (
-              <Cell label="gates">
-                <code className="text-xs">{n.gates.join(", ")}</code>
-              </Cell>
-            ) : null}
-            {n.verifier_ref ? (
-              <Cell label="verifier">
-                <code className="text-xs truncate block">{n.verifier_ref}</code>
-              </Cell>
-            ) : null}
+            <Cell label="llm calls">{String(d.llm_calls.length)}</Cell>
+            <Cell label="cost">{formatCost(llmCost)}</Cell>
+            <Cell label="tokens">{formatTokens(llmTokens)}</Cell>
           </div>
         </div>
       </header>
 
-      <AgentInputContext inputs={inputs.data ?? []} prompt={d.prompt} node={n} onSelect={setSelectedInput} />
-      <AgentLearningPanel nodeId={nodeId} learning={learning.data ?? null} />
-      <AgentTranscriptPanel transcript={d.transcript} calls={d.llm_calls} />
-      <ChildSpawnsPanel children={d.children} />
-      <ArtifactsPanel artifacts={d.artifacts} />
-      <RunInputModal taskRunId={taskRunId} input={selectedInput} onClose={() => setSelectedInput(null)} />
+      <AgentTabs
+        active={activeTab}
+        onChange={changeTab}
+        turnCount={turnCount}
+        artifactCount={d.artifacts.length}
+        learningCount={learningBadge}
+        childCount={d.children.length}
+      />
+
+      {activeTab === "overview" && <AgentInputPanel prompt={d.prompt} node={n} />}
+      {activeTab === "turns" && <AgentTranscriptPanel transcript={d.transcript} calls={d.llm_calls} />}
+      {activeTab === "artifacts" && <ArtifactsPanel artifacts={d.artifacts} />}
+      {activeTab === "learnings" && <AgentLearningPanel nodeId={nodeId} learning={learning.data ?? null} />}
+      {activeTab === "children" && <ChildSpawnsPanel children={d.children} />}
     </div>
   );
 }
 
-function AgentInputContext({
-  inputs,
+const AGENT_TABS = ["overview", "turns", "artifacts", "learnings", "children"] as const;
+type AgentTab = (typeof AGENT_TABS)[number];
+
+function isAgentTab(v: unknown): v is AgentTab {
+  return typeof v === "string" && (AGENT_TABS as readonly string[]).includes(v);
+}
+
+function AgentTabs({
+  active,
+  onChange,
+  turnCount,
+  artifactCount,
+  learningCount,
+  childCount,
+}: {
+  active: AgentTab;
+  onChange: (tab: AgentTab) => void;
+  turnCount: number;
+  artifactCount: number;
+  learningCount: number;
+  childCount: number;
+}) {
+  const tabs: Array<{ id: AgentTab; label: string; badge?: number }> = [
+    { id: "overview", label: "overview" },
+    { id: "turns", label: "turns", badge: turnCount },
+    { id: "artifacts", label: "artifacts", badge: artifactCount },
+    { id: "learnings", label: "learnings", badge: learningCount },
+    { id: "children", label: "children", badge: childCount },
+  ];
+  return (
+    <div className="card !p-0 overflow-hidden" data-testid="agent-tabs">
+      <div className="flex flex-wrap items-center gap-0 border-b border-[var(--hair)] bg-[var(--panel)]">
+        {tabs.map((tab) => (
+          <button
+            key={tab.id}
+            type="button"
+            onClick={() => onChange(tab.id)}
+            data-active={active === tab.id}
+            className="border-b-2 px-3 py-2 text-[10.5px] font-black uppercase tracking-[0.1em] text-ink-500 hover:text-ink-100 data-[active=true]:border-[var(--red)] data-[active=true]:text-ink-100 data-[active=false]:border-transparent"
+          >
+            {tab.label}
+            {tab.badge != null && <span className="ml-1 text-[var(--amb)]">{tab.badge}</span>}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function agentLearningCount(learning: RunLearning | null, nodeId: string): number {
+  if (!learning) return 0;
+  const extracted = [
+    ...learning.produced.gradients,
+    ...learning.produced.patterns,
+    ...learning.self_improve.records,
+  ].filter((item) => attributionMatches(item.agent_attribution, nodeId)).length;
+  const injected = learning.injected_candidates.known_failure_modes.filter(
+    (item) => attributionMatches(item.agent_attribution, nodeId) || (item.target ?? "").includes(nodeId),
+  ).length;
+  return extracted + injected;
+}
+
+function AgentInputPanel({
   prompt,
   node,
-  onSelect,
 }: {
-  inputs: RunInput[];
   prompt: { path: string | null; content: string | null };
-  node: { name: string; type: string; lane: string | null; family: string | null; prompt_ref: string | null; verifier_ref: string | null; dispatch_mode: string | null; gates: string[] };
-  onSelect: (input: RunInput) => void;
+  node: DagNode;
 }) {
   return (
-    <section className="card" data-testid="agent-input-context-section">
+    <section className="card" data-testid="agent-input-section">
       <h3 className="text-sm font-semibold text-ink-200 mb-3 flex items-center gap-1.5">
-        <FileInput size={14} /> Input context
+        <FileInput size={14} /> Agent input
       </h3>
-      <div className="grid grid-cols-1 lg:grid-cols-[320px_1fr] gap-4">
-        <div className="space-y-2">
-          <div className="rounded-md border border-ink-700 bg-ink-900/30 p-3" data-testid="agent-own-context">
-            <div className="text-xs uppercase tracking-wide text-ink-500 mb-2">this agent</div>
-            <div className="grid grid-cols-2 gap-2 text-xs">
-              <Cell label="node">{node.name}</Cell>
-              <Cell label="type">{node.type}</Cell>
-              <Cell label="lane">{node.lane ?? "—"}</Cell>
-              <Cell label="family">{node.family ?? "—"}</Cell>
-              <Cell label="prompt">{node.prompt_ref ?? "—"}</Cell>
-              <Cell label="verifier">{node.verifier_ref ?? "—"}</Cell>
-            </div>
-          </div>
-          {inputs.length ? inputs.map((input) => (
-            <button
-              key={input.key}
-              type="button"
-              onClick={() => onSelect(input)}
-              className="block w-full rounded-md border border-ink-700 bg-ink-900/30 px-3 py-2 text-left hover:border-ork-amber/60"
-              data-testid={`agent-input-link-${input.key}`}
-            >
-              <div className="flex items-center justify-between gap-2">
-                <span className="text-sm text-ink-100">{input.label}</span>
-                <span className="text-[10px] uppercase text-ink-500">{input.kind}</span>
-              </div>
-              <div className="mt-1 truncate text-xs text-ink-500">{input.path}</div>
-            </button>
-          )) : (
-            <p className="text-sm text-ink-500">No run inputs found yet.</p>
-          )}
-        </div>
-        <PromptPanel prompt={prompt} />
+      <div className="mb-3 grid grid-cols-2 md:grid-cols-4 gap-2 text-xs text-ink-400" data-testid="agent-own-context">
+        <Cell label="prompt ref"><code className="text-xs truncate block">{node.prompt_ref ?? "built-in handler"}</code></Cell>
+        <Cell label="verifier"><code className="text-xs truncate block">{node.verifier_ref ?? "—"}</code></Cell>
+        <Cell label="gates"><code className="text-xs">{node.gates?.length ? node.gates.join(", ") : "—"}</code></Cell>
+        <Cell label="dispatch">{node.dispatch_mode ?? "—"}</Cell>
       </div>
+      <PromptPanel prompt={prompt} />
     </section>
   );
 }
@@ -182,21 +216,18 @@ function AgentLearningPanel({ nodeId, learning }: { nodeId: string; learning: Ru
   const injected = (learning?.injected_candidates.known_failure_modes ?? []).filter((item) =>
     attributionMatches(item.agent_attribution, nodeId) || (item.target ?? "").includes(nodeId),
   );
-  const injectionPoints = learning?.injected_candidates.injection_points ?? [];
   const createdCount = gradients.length + patterns.length + records.length;
 
   return (
     <section className="card" data-testid="agent-learning-section">
       <div className="panel-title">Agent learnings</div>
-      <div className="grid grid-cols-1 xl:grid-cols-[minmax(0,1fr)_360px] gap-3">
-        <div className="space-y-3 min-w-0">
-          <div className="grid grid-cols-3 gap-2">
-            <LearningMetric label="created" value={createdCount} />
+      <div className="space-y-3 min-w-0">
+          <div className="grid grid-cols-2 gap-2">
+            <LearningMetric label="extracted" value={createdCount} />
             <LearningMetric label="injected" value={injected.length} />
-            <LearningMetric label="points" value={injectionPoints.length} />
           </div>
           <AgentLearningList
-            title="Created by this agent"
+            title="Extracted by this agent"
             empty="No persisted gradients, patterns, or learning_record rows are attributed to this agent yet."
             rows={[
               ...gradients.map((g) => ({
@@ -223,7 +254,7 @@ function AgentLearningPanel({ nodeId, learning }: { nodeId: string; learning: Ru
             ]}
           />
           <AgentLearningList
-            title="Injected / available memory"
+            title="Injected into this agent (known failure modes)"
             empty="No known failure modes matched this agent. Run-level prior similar runs may still be injected at planner/context level."
             rows={injected.map((g) => ({
               id: g.gradient_id,
@@ -233,22 +264,6 @@ function AgentLearningPanel({ nodeId, learning }: { nodeId: string; learning: Ru
               meta: `${g.target} · ${Math.round((g.confidence ?? 0) * 100)}%`,
             }))}
           />
-        </div>
-        <div className="rounded-[3px] border border-[var(--hair)] bg-[var(--panel-2)] p-3">
-          <h3 className="mb-2 flex items-center gap-1.5 text-[10.5px] font-black uppercase tracking-[0.13em] text-ink-200">
-            <Lightbulb size={13} /> Injection details
-          </h3>
-          <div className="space-y-2">
-            {injectionPoints.map((point) => (
-              <div key={point.name} className="border-l-2 border-[var(--grn)] pl-2">
-                <div className="font-mono text-[10.5px] text-ink-100">{point.name}</div>
-                <div className="font-mono text-[9.5px] text-[var(--amb)]">{point.where}</div>
-                <p className="mt-1 text-[10.5px] leading-relaxed text-ink-500">{point.how}</p>
-              </div>
-            ))}
-            {!injectionPoints.length && <p className="text-[11px] text-ink-500">No injection metadata available.</p>}
-          </div>
-        </div>
       </div>
     </section>
   );
@@ -300,7 +315,7 @@ function AgentLearningList({
 }
 
 function PromptPanel({ prompt }: { prompt: { path: string | null; content: string | null } }) {
-  const [open, setOpen] = useState(false);
+  const [open, setOpen] = useState(true);
   if (!prompt.path) {
     return (
       <div className="rounded-md border border-ink-700 bg-ink-900/30 p-3" data-testid="agent-prompt-section">
