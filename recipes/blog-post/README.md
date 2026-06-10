@@ -76,9 +76,10 @@ Runtime: 3-12 min wall-clock depending on lens dispatch parallelism.
 ## Heterogeneity rationale
 
 Per Rajan 2025 (arxiv:2511.16708) + Nasser 2026 (arxiv:2601.05114):
-multi-agent panels achieve submodular utility gain only when pairwise
-correlation ρ between voters stays low (≤ 0.25). Same-family panels show
-Krippendorff α=0.042 (Nasser) — they collapse to coalition.
+multi-agent panels are most defensible when their detectors are low
+redundancy and their judges do not share the same evaluative disposition.
+Rajan reports low detector correlation in CodeX-Verify; Nasser reports
+near-zero agreement across LLM judges under the same rubric.
 
 This recipe assigns each of the 5 perspective stances to a DISTINCT
 model family by construction. The names of the lens roles

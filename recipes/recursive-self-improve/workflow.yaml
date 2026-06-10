@@ -11,8 +11,9 @@ description: >
   via lib/pattern_store.sh + learning_record table.
 #
 # Lane diversity rationale: Rajan 2025 + Nasser 2026 — multi-agent
-# review's submodularity gain only holds when pairwise voter
-# correlation stays low. Distinct families: MiniMax (perf), Moonshot
+# review is more defensible when detector patterns are low-correlation
+# and judge dispositions are not interchangeable. Distinct families:
+# MiniMax (perf), Moonshot
 # Kimi (correctness), OpenAI Codex (arch), Anthropic Opus (synthesis).
 
 nodes:
