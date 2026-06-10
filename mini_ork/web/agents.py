@@ -75,7 +75,7 @@ def list_agents(
         return {"agents": [], "task_run": None, "children": []}
 
     recipe_name = tr.get("recipe")
-    fp = recipes.fingerprint(recipe_name) if recipe_name else {"nodes": [], "edges": []}
+    fp = recipes.fingerprint(recipe_name, home) if recipe_name else {"nodes": [], "edges": []}
 
     # Per-node lifecycle events (node_start / node_end) keyed by node_id.
     node_events = _collect_node_events(db, task_run_id)
@@ -246,7 +246,7 @@ def agent_detail(
     if not tr:
         return {"error": f"task_run {task_run_id} not found"}
     recipe_name = tr.get("recipe")
-    fp = recipes.fingerprint(recipe_name) if recipe_name else {"nodes": []}
+    fp = recipes.fingerprint(recipe_name, home) if recipe_name else {"nodes": []}
     node = next((n for n in fp["nodes"] if n["name"] == node_id), None)
     if not node:
         return {"error": f"node {node_id} not in recipe {recipe_name}"}
