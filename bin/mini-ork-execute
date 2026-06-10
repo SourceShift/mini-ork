@@ -555,6 +555,14 @@ finally:
 " "$MINI_ORK_DB" "$MINI_ORK_RUN_ID" "$_new_status" 2>/dev/null || true
 }
 
+# Source a lib without firing _dispatch_node's RETURN trap (bash runs RETURN
+# traps when a `source` directly in the trapping function completes; a nested
+# function call does not inherit the trap).
+_mo_source() {
+  # shellcheck disable=SC1090
+  source "$1"
+}
+
 _dispatch_node() {
   local node_id="$1" node_type="$2" node_desc="$3" node_prompt_ref="${4:-}" node_verifier_ref="${5:-}" node_model_lane="${6:-}"
   local dispatch_lane="${node_model_lane:-$node_type}"
@@ -605,8 +613,15 @@ _dispatch_node() {
     # Trap RETURN catches every exit path — early `return 1` from a failed
     # researcher/implementer/reviewer/verifier branch AND clean fall-through
     # to esac. Without this, ~10 early-return paths silently drop node_end.
+    # CAUTION: bash also runs RETURN traps when a `source` directly inside
+    # this function completes — every later source below goes through
+    # _mo_source (a nested function call) so the trap stays quiet until the
+    # real return. Direct `source` here would emit a spurious early node_end.
     trap 'mo_node_emit_end_trap' RETURN
   fi
+  # Clear per-node globals so the trap never reports a previous node's
+  # verdict/artifact when this node's branch exits before setting them.
+  VERDICT=""; CONTEXT_FILE=""; IMPL_LOG=""; REVIEW_FILE=""
 
   # Locate recipe prompt for this node.
   # D-030: prefer per-node `prompt_ref` from workflow.yaml (e.g. recipe's
@@ -648,7 +663,7 @@ _dispatch_node() {
       researcher|implementer|reviewer)
         if [ -f "$MINI_ORK_ROOT/lib/context_assembler.sh" ]; then
           # shellcheck source=lib/context_assembler.sh
-          source "$MINI_ORK_ROOT/lib/context_assembler.sh"
+          _mo_source "$MINI_ORK_ROOT/lib/context_assembler.sh"
           if declare -f context_failure_modes_md >/dev/null 2>&1; then
             _learned_block="$(context_failure_modes_md "${TASK_CLASS:-generic}" 5 || true)"
             [ -n "$_learned_block" ] && _learned_block=$'\n\n'"${_learned_block}"$'\n'
@@ -904,12 +919,12 @@ PY
          && [ -n "${MINI_ORK_DB:-}" ] \
          && [ -f "$MINI_ORK_ROOT/lib/gate_bootstrap.sh" ]; then
         # shellcheck source=lib/gate_bootstrap.sh
-        source "$MINI_ORK_ROOT/lib/gate_bootstrap.sh" 2>/dev/null || true
+        _mo_source "$MINI_ORK_ROOT/lib/gate_bootstrap.sh" 2>/dev/null || true
         if declare -f mo_bootstrap_oracle_gates > /dev/null 2>&1; then
           mo_bootstrap_oracle_gates 2>/dev/null || true
         fi
         # shellcheck source=lib/gate_registry.sh
-        source "$MINI_ORK_ROOT/lib/gate_registry.sh" 2>/dev/null || true
+        _mo_source "$MINI_ORK_ROOT/lib/gate_registry.sh" 2>/dev/null || true
         if declare -f gate_run_all > /dev/null 2>&1; then
           local _gate_ctx
           _gate_ctx=$(python3 -c "
@@ -977,8 +992,43 @@ except Exception:
         _d021_set_status "published"
         return 0
       fi
-      local _src="$RUN_DIR/$_src_name"
-      if [ ! -f "$_src" ]; then
+      # Meta-recipes write ${RUN_DIR}/chosen/recipe_name with the derived
+      # kebab-case slug. Export it BEFORE substituting source_artifact +
+      # outputs[] so YAML entries that reference ${MINI_ORK_DERIVED_RECIPE_NAME}
+      # (recipe-creator convention) resolve to the actual recipe name.
+      if [ -z "${MINI_ORK_DERIVED_RECIPE_NAME:-}" ] \
+         && [ -f "$RUN_DIR/chosen/recipe_name" ]; then
+        MINI_ORK_DERIVED_RECIPE_NAME=$(tr -d '[:space:]' < "$RUN_DIR/chosen/recipe_name")
+        export MINI_ORK_DERIVED_RECIPE_NAME
+      fi
+      # Helper: resolve ${VAR}-style substitutions in a path string. Uses
+      # envsubst when available (safer — only ${VAR} / $VAR), falls back to
+      # bash eval'd printf when not (works but more fragile on quoting).
+      _mo_resolve_path() {
+        local _raw="$1"
+        if command -v envsubst >/dev/null 2>&1; then
+          printf '%s' "$_raw" | envsubst
+        else
+          eval "printf '%s' \"$_raw\"" 2>/dev/null || printf '%s' "$_raw"
+        fi
+      }
+      # Resolve template vars in source_artifact (e.g. recipe-creator uses
+      # `chosen/${MINI_ORK_DERIVED_RECIPE_NAME}/` to address the chosen draft
+      # subdir without hard-coding the derived name into the contract).
+      local _src_name_resolved
+      _src_name_resolved=$(_mo_resolve_path "$_src_name")
+      if [ "$_src_name_resolved" != "$_src_name" ]; then
+        echo "  [resolve] publisher: source_artifact $_src_name → $_src_name_resolved" >&2
+      fi
+      local _src="$RUN_DIR/$_src_name_resolved"
+      # Source may be a single file OR a directory. The recipe-creator
+      # meta-recipe stages `chosen/<derived_name>/` as its source_artifact;
+      # legacy recipes (refactor-audit, etc.) ship a single synthesis.md.
+      # Detect and dispatch the right copy semantics.
+      local _src_is_dir=0
+      if [ -d "$_src" ]; then
+        _src_is_dir=1
+      elif [ ! -f "$_src" ]; then
         echo "  [warn] publisher: expected source artifact missing: $_src" >&2
         return 1
       fi
@@ -986,10 +1036,42 @@ except Exception:
       local _failed_count=0
       while IFS= read -r _out; do
         [ -z "$_out" ] && continue
+        # Resolve ${VAR}-style substitutions in the output path via the
+        # shared helper defined above (envsubst or eval-printf fallback).
+        local _out_expanded
+        _out_expanded=$(_mo_resolve_path "$_out")
+        if [ "$_out_expanded" != "$_out" ]; then
+          echo "  [resolve] publisher: $_out → $_out_expanded" >&2
+        fi
+        _out="$_out_expanded"
         local _dst="$MINI_ORK_ROOT/$_out"
-        mkdir -p "$(dirname "$_dst")"
-        if cp "$_src" "$_dst"; then
+        local _copied=0
+        if [ "$_src_is_dir" = "1" ]; then
+          # Directory-source: rsync-equivalent copy. Strip trailing slash
+          # off destination so cp -R writes contents into a fresh dir
+          # rather than nesting.
+          local _dst_norm="${_dst%/}"
+          mkdir -p "$_dst_norm"
+          # `cp -R "$_src"/. "$_dst_norm"/` copies directory contents,
+          # preserving subdirs, without re-nesting under $_src's basename.
+          if cp -R "$_src"/. "$_dst_norm"/ 2>/dev/null; then
+            _copied=1
+          fi
+        else
+          mkdir -p "$(dirname "$_dst")"
+          if cp "$_src" "$_dst" 2>/dev/null; then
+            _copied=1
+          fi
+        fi
+        if [ "$_copied" = "1" ]; then
           # Stage + commit. mini-ork acts as its own committer identity.
+          # `git add` on a directory recursively stages all files under it.
+          local _commit_summary
+          if [ "$_src_is_dir" = "1" ]; then
+            _commit_summary="Source: $_src/ (directory)"
+          else
+            _commit_summary="Source: $_src ($(wc -c < "$_src" | tr -d ' ') bytes)"
+          fi
           if (cd "$MINI_ORK_ROOT" && \
               git add "$_out" 2>/dev/null && \
               git -c user.email=mini-ork@local -c user.name=mini-ork \
@@ -997,7 +1079,7 @@ except Exception:
 
 Run: $MINI_ORK_RUN_ID
 Recipe: ${MINI_ORK_RECIPE:-unknown}
-Source: $_src ($(wc -c < "$_src" | tr -d ' ') bytes)
+$_commit_summary
 Output: $_out
 Dispatched by mini-ork-execute publisher node (D-037 v0.2-pt9).
 " 2>&1 | tail -3); then
@@ -1033,7 +1115,7 @@ Dispatched by mini-ork-execute publisher node (D-037 v0.2-pt9).
       if [ -n "${MINI_ORK_RUN_ID:-}" ]; then
         if [ -f "$MINI_ORK_ROOT/lib/topology_metrics.sh" ]; then
           # shellcheck source=lib/topology_metrics.sh
-          source "$MINI_ORK_ROOT/lib/topology_metrics.sh" 2>/dev/null || true
+          _mo_source "$MINI_ORK_ROOT/lib/topology_metrics.sh" 2>/dev/null || true
           if declare -f measure_topology > /dev/null 2>&1; then
             local _ttid
             _ttid=$(measure_topology "$MINI_ORK_RUN_ID" "${TASK_CLASS:-generic}" 2>/dev/null || echo "")
