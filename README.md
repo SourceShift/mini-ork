@@ -232,6 +232,7 @@ Recipes are user-land workflow definitions. They compose framework primitives in
 | `db-migration` | `recipes/db-migration/` | 5-lens migration audit + plan: integrity / rollback / perf / compat / edge-data in parallel across distinct families. |
 | `ops-runbook` | `recipes/ops-runbook/` | 5-lens runbook generation: detection / containment / diagnosis / recovery / prevention across distinct families. |
 | `ui-audit` | `recipes/ui-audit/` | 5-lens UI audit: a11y / perf / visual / interaction / edge-cases across distinct families. |
+| `obs-smoke` | `recipes/obs-smoke/` | Cheap 2-node observability smoke (researcher + reviewer + deterministic verifier + publisher) that touches every emit surface: `llm_calls`, `run_events`, `task_runs` transitions. Driven by `tests/test_obs_surface.sh`. |
 
 Add your own under `recipes/<name>/` — see [docs/EXTENSION.md](docs/EXTENSION.md).
 
@@ -275,9 +276,9 @@ The full release log lives in [`ROADMAP.md`](ROADMAP.md) — every section dated
 - 6-stage universal loop (`classify → plan → execute → verify → reflect → improve`) + 7 companion entrypoints (`eval`, `improve`, `promote`, `metrics`, `spawn`, direct `bin/mini-ork-topology`, direct `bin/mini-ork-self-improve`)
 - 43 framework primitives in `lib/` (incl. oracle-hardening libs + `gate_bootstrap.sh` for the v0.3-rc1 central wire-up + `lib/throttle-guard.sh` for provider-throttle classification with per-lane exponential backoff, added 2026-06-09)
 - 1 runner-shared helper in `bin/lib/` (`profile-seed.sh` — deterministic `run_profile.json` seeding from structured kickoff markdown, added 2026-06-09)
-- 15 user-facing `bin/mini-ork*` entrypoints
-- 17 schema migrations under `db/migrations/` (memory namespaces, benchmarks, evolution, safety, panel topology telemetry, recursive orchestration, self-improvement learning)
-- 11 recipes shipped — see Recipes table above
+- 16 user-facing `bin/mini-ork*` entrypoints
+- 18 schema migrations under `db/migrations/` (memory namespaces, benchmarks, evolution, safety, panel topology telemetry, recursive orchestration, self-improvement learning, llm_calls session indexing)
+- 12 recipes shipped — see Recipes table above
 - 7 model-family providers under `lib/providers/` + BYO-key registry (`config/providers.yaml` via `lib/providers/registry.sh`) for custom Anthropic/OpenAI-compatible endpoints
 
 Next-up work tracks (see [`ROADMAP.md`](ROADMAP.md) for detail):
