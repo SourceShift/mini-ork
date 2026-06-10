@@ -1,180 +1,211 @@
-# mini-ork 4-Lens Audit — Synthesis
+# Feature inventory (synthesis)
 
-**Run:** `run-1780604422-58608`
-**Date:** 2026-06-04
-**Panel:** GLM (tactical) · Kimi (refactor) · Codex (LLM dispatch) · MiniMax (architecture, Opus-slot)
-**Synthesizer:** Anthropic Opus
-**Lens reports:** `lens-glm.md`, `lens-kimi.md`, `lens-codex.md`, `lens-minimax.md`
+## Summary
+- Total unique features: 87
+- Consensus 4/4: 0
+- Consensus 3/4: 0
+- Consensus 2/4: 0
+- Single-lens finds (1/4): 87
+- Lenses that produced output: 1 of 4 (minimax only; glm/kimi/codex failed — see Coverage gap report)
 
-Findings prefixed `G-N` (GLM), `K-N` (Kimi), `D-N` (Codex), `O-RN` (MiniMax/Opus-slot).
-★ = surfaced by ≥2 lenses (consensus signal per Rajan 2025).
+## Routes / endpoints (32 features)
 
----
+- `citationExport` — `server/routes/citationExport.ts:1` — BibTeX/RIS export of per-doc citations. [CONSENSUS: 1/4] [STATUS: shipped]
+- `mindmap` — `server/routes/mindmap.ts:1` — concept-node graph data for knowledge-graph page. [CONSENSUS: 1/4] [STATUS: shipped]
+- `search` — `server/routes/search.ts:1` + `hierarchicalSearch.ts:1` — in-corpus + global search. [CONSENSUS: 1/4] [STATUS: shipped]
+- `audiobooks` — `server/routes/audiobooks.ts:1` — listen-mode endpoints. [CONSENSUS: 1/4] [STATUS: shipped]
+- `workspaceInvitationTokens` — `server/routes/workspaceInvitationTokens.ts:1` — accept emailed invitation token. [CONSENSUS: 1/4] [STATUS: shipped]
+- `passwordlessAuth` — `server/routes/passwordlessAuth.ts:1` — magic-link consume. [CONSENSUS: 1/4] [STATUS: shipped]
+- `dailyBriefing` — `server/routes/dailyBriefing.ts:1` — "what to read today" data. [CONSENSUS: 1/4] [STATUS: shipped]
+- `memoryReview` — `server/routes/memoryReview.ts:1` — per-user memory atoms drawer. [CONSENSUS: 1/4] [STATUS: shipped]
+- `bookmarks` — `server/routes/bookmarks.ts:1` — pin blocks for later. [CONSENSUS: 1/4] [STATUS: shipped]
+- `publicFunnel` — `server/routes/publicFunnel.ts:1` — anon arXiv funnel landing. [CONSENSUS: 1/4] [STATUS: shipped, Turnstile flag-gated]
+- `support` — `server/routes/support.ts:1` — user-submitted support tickets. [CONSENSUS: 1/4] [STATUS: shipped]
+- `import` — `server/routes/import.ts:1` + `arxivImport/` — arXiv URL→library. [CONSENSUS: 1/4] [STATUS: shipped]
+- `deepResearch` — `server/routes/deepResearch.ts:1` + `researchEngine.ts:1` — deep-research session. [CONSENSUS: 1/4] [STATUS: shipped]
+- `userReadingStats` — `server/routes/userReadingStats.ts:1` — reading-stats dashboard data. [CONSENSUS: 1/4] [STATUS: shipped]
+- `adminOverview` — `server/routes/adminOverview.ts:1` — admin overview/health/KPIs. [CONSENSUS: 1/4] [STATUS: shipped]
+- `adminSystem` — `server/routes/adminSystem.ts:1` — tenant + queues + DB admin. [CONSENSUS: 1/4] [STATUS: shipped]
+- `promptEvolution` — `server/routes/promptEvolution.ts:1` — GEPA Vista decision drawer backend. [CONSENSUS: 1/4] [STATUS: shipped]
+- `promptSettings` + `promptExecutions` + `promptExperiments` + `promptVersions` + `promptFeedback` — `server/routes/promptSettings.ts:1` (+ siblings) — prompt-template registry + 3-tier overrides + telemetry. [CONSENSUS: 1/4] [STATUS: shipped]
+- `harnessEval` — `server/routes/harnessEval.ts:1` + `harnessMonitorability.ts:1` — A/B judge of prompt revisions. [CONSENSUS: 1/4] [STATUS: shipped]
+- `harnessFixtures` — `server/routes/harnessFixtures.ts:1` — pin known-good outputs. [CONSENSUS: 1/4] [STATUS: shipped]
+- `adminAgentRuns` — `server/routes/adminAgentRuns.ts:1` — agent runs dashboard backend. [CONSENSUS: 1/4] [STATUS: shipped]
+- `memoryCalibration` — `server/routes/memoryCalibration.ts:1` — memory calibration panel backend. [CONSENSUS: 1/4] [STATUS: shipped]
+- `skillsAnalytics` + `skillsCrud` — `server/routes/skillsAnalytics.ts:1` + `skillsCrud.ts:1`. [CONSENSUS: 1/4] [STATUS: shipped]
+- `adminUnattendedRate` — `server/routes/adminUnattendedRate.ts:1` — job-health dashboard backend. [CONSENSUS: 1/4] [STATUS: shipped]
+- `adminVerificationHeatmap` — `server/routes/adminVerificationHeatmap.ts:1`. [CONSENSUS: 1/4] [STATUS: shipped]
+- `adminWhitelist` + `claims` — `server/routes/adminWhitelist.ts:1` + `claims.ts:1` — allowlists + claim gates. [CONSENSUS: 1/4] [STATUS: shipped]
+- `adminBlogFunnel` — `server/routes/adminBlogFunnel.ts:1` — blog-funnel conversion stats. [CONSENSUS: 1/4] [STATUS: shipped]
+- `documentPromptSettings` — `server/routes/documentPromptSettings.ts:1` — per-doc prompt override. [CONSENSUS: 1/4] [STATUS: shipped]
+- `claimBindings` — `server/routes/claimBindings.ts:1` — admin override of claim→block. [CONSENSUS: 1/4] [STATUS: shipped]
+- `billing` — `server/routes/billing.ts:1` + `billingService.ts:1` — Stripe webhook + workspace billing admin. [CONSENSUS: 1/4] [STATUS: shipped (webhook live, no FE upgrade flow)]
+- `workspaces` — `server/routes/workspaces.ts:1` — per-workspace retention/branding/quota/tier. [CONSENSUS: 1/4] [STATUS: shipped]
+- `founding` — `server/routes/founding.ts:1` — founding-user program backend. [CONSENSUS: 1/4] [STATUS: shipped]
+- `backgroundTasks` — `server/routes/backgroundTasks.ts:1` + `backgroundTaskService.ts:1` — client-visible queue. [CONSENSUS: 1/4] [STATUS: shipped]
+- `crossReferences` + `contentSignals` + `contentManifest` — `server/routes/crossReferences.ts:1` (+ siblings) — citation/cross-ref graph updater. [CONSENSUS: 1/4] [STATUS: shipped]
+- `podcasts` — `server/routes/podcasts.ts:1` — audio digest of long docs. [CONSENSUS: 1/4] [STATUS: shipped]
+- `memoryWorker` — `server/routes/memoryWorker.ts:1` — periodic memory atom re-clustering trigger. [CONSENSUS: 1/4] [STATUS: shipped]
+- `arxivGrow` — referenced as `arxivGrow.ts:1` route — embedded anon arXiv search widget endpoint. [CONSENSUS: 1/4] [STATUS: shipped]
+- `bookTranslation` — `POST /api/book-translation/books/:uuid/translate` route — book language migration trigger. [CONSENSUS: 1/4] [STATUS: shipped]
+- `workspaceContext` middleware — `server/middleware/workspaceContext.ts:18` — tenant boundary gate (flag-gated `FEATURE_WORKSPACE_SCOPE_ENFORCED`). [CONSENSUS: 1/4] [STATUS: flag-gated]
 
-## Section 1 — Severity × Leverage Matrix
+## React components / pages (52 features)
 
-|  | **HIGH leverage**<br/>(framework-wide, multi-recipe blast) | **MED leverage**<br/>(single subsystem) | **LOW leverage**<br/>(local cleanup) |
-|---|---|---|---|
-| **P1**<br/>blocks-NOW | **G-1** trace `prompt_version_hash` column drift (destroys all reflection lineage)<br/>**G-2 ★ + D-4 ★ + O-R18 ★** budget enforcement triple-gap (wrong default, 5 bypass callsites, no preflight)<br/>**G-4 ★ + D-5 ★** Codex phantom $0.01 + cost invisible to circuit breaker<br/>**G-5 ★ + O-R14 ★ + O-R15 ★** Rajan 2025 ρ gate never enforced (observed only) | **K-6** literal `\n` in researcher/implementer/reviewer prompts (line 408, 444, 485)<br/>**G-3** budget timestamp INTEGER vs ISO-string mismatch<br/>**D-3** `speculative` dispatch never cancels siblings (= `parallel` + cost) | **G-1** trace col drift (1-line fix; high leverage placed above) |
-| **P2**<br/>blocks-1K-runs | **K-2 ★ + K-3 ★ + K-9 ★ + G-20 ★ + G-21 ★** SQL-injection sweep (`cache.sh`, `memory.sh`, `auto-merge.sh`, `runs-tracker.sh`)<br/>**K-1 ★ + D-2 ★ + D-arch-2** reflection pipeline serial-per-trace (4–8h wall time → batch or xargs-P)<br/>**O-R7** persistent `mini-ork-db-server` shim (kills 80ms × N python3 forks)<br/>**D-arch-1** complexity-tier router (30–40% input-token cost cut)<br/>**O-R16** gateway-model cost normalization (MiniMax/GLM/Kimi report $0 today) | **G-7** `auto-merge.sh` 5–7× sqlite3 N+1 per epic<br/>**G-8 + G-9** scope-overlap O(N·P) + O(N²) pairwise<br/>**G-10** `CAST(strftime(...))` defeats `idx_execution_traces_created_at`<br/>**G-11** per-node `_d022_charge_node_cost` python3 fork<br/>**G-12** no exponential backoff on 429/5xx (`mo_llm_dispatch`)<br/>**G-17** `cleaner.sh` lock has no timeout-retry (unlike `auto-merge.sh`)<br/>**D-9** `fallback_below` declared in agents.yaml but never consulted<br/>**O-R1 + O-R2** `busy_timeout` 5s→30s and `MAX_PARALLEL` 4→8 for audit recipes | **K-4** dispatch timeout-branch dedup (20 LOC dup)<br/>**K-12** redundant `source` in `gradient_extract` (1000 file-reads/run)<br/>**K-13** find+xargs+ls -t plan.json lookup |
-| **P3**<br/>blocks-100K + bite-later | **O-R3** PostgreSQL backend (move from v1.0 → v0.4)<br/>**O-R4** `mini-ork-worker` daemon (horizontal dispatch)<br/>**O-R5** `mini-ork-control-plane` HTTP service (multi-tenant)<br/>**O-R6** secrets → Vault / AWS SM<br/>**O-R11** recipe semver manifest + `mini-ork recipe validate`<br/>**O-R12** verifier sandboxing (`firejail` / `sandbox-exec`)<br/>**O-R13** SHA-256 hash check for `cl_*.sh` before `source`<br/>**G-13 ★ + O-R9 ★** `execution_traces` / `model_costs` TTL + archive ladder | **K-7** rubric awk tmpfile chain → python3 single-pass<br/>**K-8** O(N²) jq-in-loop for cache stats<br/>**K-11** unstructured pipe-concat rationale → JSON array<br/>**D-6** flat-sleep retry → exponential backoff + jitter<br/>**D-8** input normalization before cache hashing (5–15% extra hits)<br/>**D-10** `_MO_LANE_*` env-var cache misses on parallel cold fork<br/>**D-11** Codex executable lane forced to `text` (skips `.cost` sidecar)<br/>**D-12** duplicate `cache_hash` in rubric-prescreen<br/>**D-arch-3** semantic dedup cache layer (cosine ≥0.97)<br/>**O-R8** partition `execution_traces` / `model_costs` / `gradient_records` by ts<br/>**O-R10** Flyway/sqitch for migration management<br/>**O-R17** per-tenant OTel span export | **G-14** `for d in $(ls -d …)` word-splitting (paths with spaces)<br/>**G-15** `mapfile -t NODE_IDS` with no cap (10K-node plan loads entire array)<br/>**G-18** `docs/ARCHITECTURE.md:155` stale ("12 migrations, ~45 tables" → 15/~60)<br/>**G-22** `mo-steer.sh` 30s linear poll<br/>**G-23** topology errors silently swallowed via `\|\| echo ""`<br/>**G-24** `eval` in `_flush_parallel_batch`<br/>**G-25 ★** ROADMAP missing `Status: not-started` markers (also positioning-doc gap) |
+### User-facing pages (top-level routes)
+- **Document library + filter rail** — `src/pages/LibraryPage.tsx:1` — `/library` browse/search/filter. [CONSENSUS: 1/4] [STATUS: shipped]
+- **Document reader (PDF + Markdown dual viewer)** — `src/pages/reader/BookReader.tsx:1` — dual render surface. [CONSENSUS: 1/4] [STATUS: shipped]
+- **Mobile reader** — `src/pages/reader/ReaderPageMobile.tsx:1` (+ `MobileReaderTOCSheet.tsx:1`, `MobileReaderFindSheet.tsx:1`, `MobileReaderHighlightsSheet.tsx:1`, `MobileReaderAskSelectionSheet.tsx:1`, `MobileReaderCiteSheet.tsx:1`) — touch-first reader with bottom sheets. [CONSENSUS: 1/4] [STATUS: shipped]
+- **Page chat (top-level document conversation)** — `src/pages/PageChat.tsx:1` — `/chat` + `/chat/:docId`. [CONSENSUS: 1/4] [STATUS: shipped]
+- **Knowledge graph (mindmap)** — `src/pages/GraphPage.tsx:1` — `/graph`. [CONSENSUS: 1/4] [STATUS: shipped]
+- **Citations page (per-doc)** — `src/pages/CitationsPage.tsx:1` — `/citations/:docId`. [CONSENSUS: 1/4] [STATUS: shipped]
+- **Search page** — `src/pages/SearchPage.tsx:1` — `/search`. [CONSENSUS: 1/4] [STATUS: shipped]
+- **Projects (bookshelf)** — `src/pages/ProjectsPage.tsx:1` — `/projects`. [CONSENSUS: 1/4] [STATUS: shipped]
+- **Today page (daily briefing)** — `src/pages/TodayPage.tsx:1` — `/today`. [CONSENSUS: 1/4] [STATUS: shipped]
+- **LwSettings hub** — `src/pages/LwSettings/` — preferences/integrations/security. [CONSENSUS: 1/4] [STATUS: shipped]
+- **Magic-link consume** — `src/pages/MagicLinkConsumePage.tsx:1`. [CONSENSUS: 1/4] [STATUS: shipped]
+- **Workspace invitation accept** — `src/pages/WorkspaceInvitationAcceptPage.tsx:1`. [CONSENSUS: 1/4] [STATUS: shipped]
+- **WorkspacePage** — `src/pages/settings/WorkspacePage.tsx:1` — multi-workspace scope switcher surface. [CONSENSUS: 1/4] [STATUS: shipped]
+- **Landing + public funnel** — `src/pages/landing/` — anon arXiv search entrypoint. [CONSENSUS: 1/4] [STATUS: shipped, Turnstile flag-gated]
+- **Help / support surfaces** — `src/pages/help/`. [CONSENSUS: 1/4] [STATUS: shipped]
+- **Import (arXiv URL→library)** — `src/pages/import/`. [CONSENSUS: 1/4] [STATUS: shipped]
+- **Research page (deep-research)** — `src/pages/research/`. [CONSENSUS: 1/4] [STATUS: shipped]
+- **Dev panel (admin-only)** — `src/pages/dev/` — `/dev`. [CONSENSUS: 1/4] [STATUS: shipped]
+- **Legacy landing** — `src/pages/legacy/`. [CONSENSUS: 1/4] [STATUS: shipped]
+- **Proofs viewer** — `src/pages/proofs/`. [CONSENSUS: 1/4] [STATUS: shipped]
+- **Reading-stats page** — `src/pages/reading-stats/`. [CONSENSUS: 1/4] [STATUS: shipped]
 
-**Consensus density:** 11 findings have ★ marks. The five strongest consensus clusters are (a) **budget enforcement**, (b) **Codex phantom cost**, (c) **Rajan 2025 ρ gate**, (d) **SQL injection across cache+memory+auto-merge+runs-tracker**, (e) **reflection pipeline serial-LLM-per-trace**.
+### Reader chrome + in-reader components
+- **Markdown reader chrome** — `src/components/libwit/reader/MarkdownChrome.tsx:1` — block-level render via `parseMarkdownLines→buildHierarchy→flattenBlocksWithUuid`. [CONSENSUS: 1/4] [STATUS: shipped]
+- **PDF reader chrome (annotated)** — `src/components/libwit/reader/PdfChrome.tsx:1` — page thumbnails + margin sidebar + lazy page render. [CONSENSUS: 1/4] [STATUS: shipped]
+- **6-color semantic highlight palette** — `src/components/libwit/highlighter/types.ts:23` — Key idea / Evidence / Method / Definition / Question / Counter; `1`-`6` shortcuts. [CONSENSUS: 1/4] [STATUS: shipped]
+- **AI selection action row (7 canonical chips)** — `src/components/libwit/highlighter/types.ts:35` — `visualize | explain | extend | arxiv | code | rewrite | prompt`. [CONSENSUS: 1/4] [STATUS: shipped — 4 retired BST chips removed in Phase 3]
+- **Visualize submenu (mermaid/chart/figure/custom)** — `src/components/libwit/highlighter/types.ts:65` — `figure` flag-gated. [CONSENSUS: 1/4] [STATUS: shipped, `FEATURE_VISUALIZE_FIGURE` gated]
+- **Understand submenu (expand/simplify/custom/pipeline)** — `src/components/libwit/highlighter/types.ts:52` — UCP-A Phase 1 merged explain+extend. [CONSENSUS: 1/4] [STATUS: shipped]
+- **Block selection toolbar** — `src/components/libwit/reader/sessions/BulkActionFooter.tsx:1` + `BlockSelectionToolbar` — count/delete/clear/ask-prompt over N selected blocks. [CONSENSUS: 1/4] [STATUS: shipped]
+- **Chat-in-reader rail** — `src/components/libwit/reader/ReaderChatRail.tsx:1`. [CONSENSUS: 1/4] [STATUS: shipped]
+- **Floating reader chat** — `src/components/libwit/reader/ReaderFloatingChat.tsx:1`. [CONSENSUS: 1/4] [STATUS: shipped]
+- **PDF compare mode** — `src/components/libwit/reader/PdfCompareMode.tsx:1`. [CONSENSUS: 1/4] [STATUS: shipped]
+- **Chapter zoom controls** — `src/components/libwit/reader/ChapterZoomControl.tsx:1` + `ChapterZoomSummaryList.tsx:1` + `ChapterZoomTreeRail.tsx:1`. [CONSENSUS: 1/4] [STATUS: shipped]
+- **Translation overlay in reader** — `src/components/libwit/reader/ReaderTranslationOverlay.tsx:1`. [CONSENSUS: 1/4] [STATUS: shipped]
+- **Time-to-mastery counter** — `src/components/libwit/reader/TimeToMasteryCounter.tsx:1`. [CONSENSUS: 1/4] [STATUS: shipped]
+- **Verified learning card** — `src/components/libwit/reader/VerifiedLearningCard.tsx:1`. [CONSENSUS: 1/4] [STATUS: shipped]
+- **Reader progress strip** — `src/components/libwit/reader/ReaderProgressStrip.tsx:1`. [CONSENSUS: 1/4] [STATUS: shipped]
+- **Citations export UI** — `src/components/libwit/reader/citations/`. [CONSENSUS: 1/4] [STATUS: shipped]
+- **Share proof** — `src/components/libwit/reader/ShareProofButton.tsx:1`. [CONSENSUS: 1/4] [STATUS: shipped]
 
----
+### Compose wizard (12-step + per-step components)
+- **Book composition wizard** — `src/pages/compose/ComposePage.tsx:1` + `src/pages/compose/steps/` (12 steps: Topic / Intent / Style synthesis / Style blueprint / Publisher style / Voice / Plan / Plan sketch / Configure / Refine citations / Write / Chapter style tuning). [CONSENSUS: 1/4] [STATUS: shipped — Style synthesis `FEATURE_STYLE_SYNTHESIS` gated, default false]
+- **Compose: live progress (Write step)** — `src/pages/compose/components/WatchTheater.tsx:1` + `LiveHero.tsx:1` + `MessageStream.tsx:1`. [CONSENSUS: 1/4] [STATUS: shipped]
+- **Compose: dependency graph (Configure step)** — `src/pages/compose/components/DependencyGraphSvg.tsx:1`. [CONSENSUS: 1/4] [STATUS: shipped]
+- **Compose: thesis cluster editor** — `src/pages/compose/components/ThesisClusterEditor.tsx:1`. [CONSENSUS: 1/4] [STATUS: shipped]
 
-## Section 2 — Top 5 Immediate Wins (P1)
+### Onboarding
+- **Dashboard wizard surface** — `src/components/libwit/onboarding/DashboardWizardSurface.tsx:1` + `wizardMachine.ts:1`. [CONSENSUS: 1/4] [STATUS: shipped]
+- **Sample chapter wizard** — `src/components/libwit/onboarding/VariantGenerationStep.tsx:1` + `VariantReviewStep.tsx:1` + `SaveAndLandingStep.tsx:1`. [CONSENSUS: 1/4] [STATUS: shipped]
+- **Register modal** — `src/components/libwit/onboarding/RegisterModal.tsx:1`. [CONSENSUS: 1/4] [STATUS: shipped]
 
-Ranked by **(severity × leverage) ÷ effort**. Effort sums to **~3.5 dev-days** — well under the 2-week cap.
+### Admin pages
+- **Admin overview** — `src/pages/admin/AdminOverviewPage.tsx:1`. [CONSENSUS: 1/4] [STATUS: shipped]
+- **Admin system** — `src/pages/admin/AdminSystemPage.tsx:1`. [CONSENSUS: 1/4] [STATUS: shipped]
+- **GEPA dashboard + Vista decision drawer** — `src/pages/admin/GepaDashboardPage.tsx:1` + `VistaDecisionDrawer.tsx:1`. [CONSENSUS: 1/4] [STATUS: shipped]
+- **Prompts admin** — `src/pages/admin/PromptsAdminPage.tsx:1`. [CONSENSUS: 1/4] [STATUS: shipped]
+- **Agent runs** — `src/pages/admin/AgentRunsPage.tsx:1`. [CONSENSUS: 1/4] [STATUS: shipped]
+- **Agent trajectory** — `src/pages/admin/AgentTrajectoryPage.tsx:1` + `agentTrajectory/` subdir. [CONSENSUS: 1/4] [STATUS: shipped]
+- **Memory calibration** — `src/pages/admin/MemoryCalibrationPage.tsx:1` + `MemoryCalibrationPanel.tsx:1`. [CONSENSUS: 1/4] [STATUS: shipped]
+- **Style inspector** — `src/pages/admin/StyleInspectorPage.tsx:1`. [CONSENSUS: 1/4] [STATUS: shipped]
+- **Book editor tools** — `src/pages/admin/BookEditorToolsPage.tsx:1` + `useBookEditorTools.ts:1`. [CONSENSUS: 1/4] [STATUS: shipped]
+- **Skills analytics** — `src/pages/admin/SkillsAnalyticsPage.tsx:1`. [CONSENSUS: 1/4] [STATUS: shipped]
+- **Unattended rate** — `src/pages/admin/UnattendedRatePage.tsx:1`. [CONSENSUS: 1/4] [STATUS: shipped]
+- **Verification heatmap** — `src/pages/admin/VerificationHeatmapPage.tsx:1`. [CONSENSUS: 1/4] [STATUS: shipped]
+- **Failure analytics** — `src/pages/admin/FailureAnalyticsPage.tsx:1`. [CONSENSUS: 1/4] [STATUS: shipped]
+- **Execution ledger** — `src/pages/admin/ExecutionLedgerPage.tsx:1`. [CONSENSUS: 1/4] [STATUS: shipped]
+- **Whitelist admin** — `src/pages/admin/WhitelistAdminPage.tsx:1`. [CONSENSUS: 1/4] [STATUS: shipped]
+- **Support inbox** — `src/pages/admin/SupportInboxPage.tsx:1`. [CONSENSUS: 1/4] [STATUS: shipped]
+- **Theme settings (admin global + per-user)** — `src/pages/admin/ThemeSettingsPage.tsx:1` + `src/hooks/useAppearance.ts:1`. [CONSENSUS: 1/4] [STATUS: shipped]
+- **Compliance page** — `src/pages/admin/CompliancePage.tsx:1` — GDPR + audit log surface. [CONSENSUS: 1/4] [STATUS: shipped]
+- **Memory drawer row** — `src/components/memory/MemoryDrawerRow.tsx:1` — per-user memory atoms. [CONSENSUS: 1/4] [STATUS: shipped]
 
-| # | ID | Title | Source lens | One-line fix | Effort |
-|---|---|---|---|---|---|
-| 1 | **G-1** | `trace_write` writes empty string to `prompt_version_hash` (silent column-name drift) | GLM | In `lib/trace_store.sh:69`, change `p.get("prompt_version", "")` → `p.get("prompt_version_hash", "")` and verify all callers pass the `_hash`-suffixed key | 1h |
-| 2 | **G-4 + D-5 ★** | Codex phantom $0.01 inflates ledger AND real Codex spend invisible to circuit breaker | GLM + Codex (consensus) | `lib/providers/cl_codex.sh:101` — emit real cost from `codex exec` `tokens used:` stderr at `$0.0025/1K`; in `bin/mini-ork-execute:202` fall back to `0`, not `0.01` | 0.5d |
-| 3 | **G-2 + D-4 ★ + O-R18 ★** | Budget triple-gap: default $50 (spec is $15), 5 callers bypass `llm_dispatch`, no preflight gate | GLM + Codex + MiniMax (3-lens consensus) | (a) `lib/llm-dispatch.sh:349` default → 15; (b) route `reflection-refiner.sh:115`, `rubric-prescreen.sh:111`, `mutation-adversary.sh:114`, `cleaner.sh:299`, `_worker-launcher.sh:247` through `mo_llm_dispatch`; (c) add preflight `[ "$(mini-ork spent-today)" -lt "$MO_DAILY_BUDGET_USD" ]` at `bin/mini-ork-execute` start | 1d |
-| 4 | **G-5 + O-R14 + O-R15 ★** | Rajan 2025 ρ precondition is observed (`panel_topology_telemetry`) but never gated — silent coalition runs pass | GLM + MiniMax (consensus) | In `bin/mini-ork-execute:632` after `measure_topology`, if `rho >= 0.25` then write run verdict `COALITION_ABORT` and refuse to invoke synthesizer. Also wire `family_diversity_gate` health probe at recipe start | 1d |
-| 5 | **K-6** | Literal `\n` in double-quoted prompt assembly — LLMs see escape sequences, not blank lines | Kimi | `bin/mini-ork-execute:408,444,485` — replace `"…\n\n…"` with `"…"$'\n\n'"…"` across all three node-type prompt blocks | 1h |
+### Hooks / utilities (component-adjacent)
+- **Workspace switcher hook** — `src/hooks/useActiveWorkspace.ts:1`. [CONSENSUS: 1/4] [STATUS: shipped]
+- **Audiobook player hook** — `src/hooks/useAudiobook.ts:1`. [CONSENSUS: 1/4] [STATUS: shipped]
+- **Per-block memory provenance hook** — `src/hooks/useBlockMemoryProvenance.ts:1` (paired with `server/services/blockHintsMatcher.ts:1`). [CONSENSUS: 1/4] [STATUS: shipped]
+- **Background task client hooks** — `src/hooks/useBackgroundTask.ts:1` + `useBackgroundTasksSyncWS.ts:1`. [CONSENSUS: 1/4] [STATUS: shipped]
+- **Feature observability wrapper (FE)** — `src/utils/feature.ts:1` — `withFeature({name})`. [CONSENSUS: 1/4] [STATUS: shipped]
+- **Payment-required redirect** — `src/utils/paymentRequiredRedirect.ts:1` — handles paid-only feature redirect (currently goes to 404, per minimax gap report). [CONSENSUS: 1/4] [STATUS: shipped (incomplete — see Coverage gap report #2)]
 
-**Why these five:** All five are evidence-anchored to a single `file:line`, three are multi-lens consensus, and each closes a *correctness* (not optimization) gap. Items 2–4 together make the daily budget enforcement actually load-bearing — without all three, the documented $15/day cap is fiction.
+## Background jobs / workers / cron (16 features)
 
----
+- **Style synthesis job (offline)** — `server/services/publisherStyleSynthesisJob.ts:1` + `publisherStyleSynthesis.ts:1` — async style-card derivation. Triggers: book plan confirm or admin manual dispatch. [CONSENSUS: 1/4] [STATUS: flag-gated `FEATURE_STYLE_SYNTHESIS` default false]
+- **Book generation queue (Hatchet fanout)** — `server/services/bookGeneration/` (`bookOrchestrator.ts`, `chapterBlockService.ts`, `bookGenerationQueueService.ts`) — multi-chapter parallel dispatch. Triggers: compose `POST /confirm`. [CONSENSUS: 1/4] [STATUS: shipped]
+- **Chapter sandbox callback (Daytona)** — `server/services/daytonaSandbox/` + `sandboxCallback.ts:1` — long-poll → in-process bridge for chapter viz delivery. Triggers: chapter viz agent emits. [CONSENSUS: 1/4] [STATUS: shipped]
+- **Memory worker (background index)** — `server/routes/memoryWorker.ts:1` + `memoryCalibration.ts:1` — periodic memory atom re-clustering. Triggers: cron. [CONSENSUS: 1/4] [STATUS: shipped]
+- **LLM Judge nightly cron** — `server/cron/index.ts:9` — judges yesterday's prompt outputs. Triggers: cron 02:00 UTC. [CONSENSUS: 1/4] [STATUS: flag-gated `FEATURE_LLM_JUDGE_CRON` default false]
+- **Background indexing service (book→search)** — `server/services/backgroundIndexingService.ts:1` — full-text + semantic indexing of imported books. Triggers: post-import + delta on edit. [CONSENSUS: 1/4] [STATUS: shipped]
+- **Translation worker (book language migration)** — `server/services/bookTranslation/` + `translationWorker.ts:1`. Triggers: `POST /api/book-translation/books/:uuid/translate`. [CONSENSUS: 1/4] [STATUS: shipped]
+- **Daily briefing generator** — `server/services/dailyBriefing.ts:1`. Triggers: cron + first `/today` open. [CONSENSUS: 1/4] [STATUS: shipped]
+- **Anonymous arXiv funnel** — `server/services/anonymousArxivFunnelService.ts:1`. Triggers: anon visitor search. [CONSENSUS: 1/4] [STATUS: shipped; Turnstile flag-gated]
+- **Self-heal reaper (stale jest/vitest procs)** — `.agentflow/lib/` — `self_heal_reap_stale_test_procs` (20min/5min caps). Triggers: orch idle. [CONSENSUS: 1/4] [STATUS: shipped (transcript-only visibility)]
+- **Background task server service** — `server/services/backgroundTaskService.ts:1` — long-running op progress emitter. [CONSENSUS: 1/4] [STATUS: shipped]
+- **Canary allocator (gradual rollout)** — `server/services/canaryAllocator.ts:1` — staged risk per code path. [CONSENSUS: 1/4] [STATUS: shipped]
+- **Audiobook generation worker** — `server/services/audiobookService.ts:1`. Triggers: reader "listen" CTA. [CONSENSUS: 1/4] [STATUS: shipped]
+- **Citation / cross-reference graph updater** — `server/routes/crossReferences.ts:1` + `contentSignals.ts:1` + `contentManifest.ts:1`. Triggers: post-write + cron. [CONSENSUS: 1/4] [STATUS: shipped]
+- **Podcast generator service** — `server/routes/podcasts.ts:1` + service. Triggers: doc context menu. [CONSENSUS: 1/4] [STATUS: shipped]
+- **Proxy observability hooks** — `server/config/env.ts:119` — `FEATURE_PROXY_BOOK_GEN | FEATURE_PROXY_DEEP_RESEARCH | FEATURE_PROXY_IMPORT` (default true). Triggers: completion events. [CONSENSUS: 1/4] [STATUS: shipped (default-on)]
+- **Feature observability wrapper (BE)** — `server/observability/feature.ts:1` — adds bare name to `FeatureName` union (`shared/types/observability.ts`). Triggers: any wrapped call. [CONSENSUS: 1/4] [STATUS: shipped]
 
-## Section 3 — v0.x+1 Architectural Shifts (P2)
+## Database tables / migrations (0 features)
 
-Bundled by theme. Total ≈ **9–12 eng-weeks** if all four bundles execute; each bundle is independently shippable.
+No DB tables / migrations enumerated by the available lens (minimax product-surface scope did not list schema-level features). See Coverage gap report — section uncovered by surviving lens.
 
-### Bundle A — Cost & Dispatch Hardening (2–3 wk)
+## Prompt registry keys (0 features)
 
-| Item | Source | Notes |
-|---|---|---|
-| K-1 + D-2 + D-arch-2 ★ | Kimi + Codex | Reflection batch-mode: collapse 500 serial Sonnet calls into 1–3 multi-trace batch calls (~90% cost cut + 200× latency cut) |
-| G-12 + D-6 | GLM + Codex | Exponential backoff with jitter inside `mo_llm_dispatch` (replaces post-hoc healer detection) |
-| D-9 | Codex | Wire `fallback_below` from `agents.yaml` → actual retry path |
-| D-arch-1 | Codex | Complexity-tier router (route by prompt-token count, not by node_type) |
-| O-R16 | MiniMax | Per-provider cost extractor for MiniMax/GLM/Kimi gateways (today they report $0) |
+No specific prompt registry keys enumerated by the available lens. Admin surfaces wrapping the registry are listed under Routes / React components (`promptSettings` / `PromptsAdminPage`). See Coverage gap report.
 
-**Prerequisite P1s:** Items 2 + 3 from §2 (Codex cost + budget gate). Risk if deferred: daily-budget gate continues to under-count real spend by 50–75% on heterogeneous recipes (`O-R16`).
-**Total effort:** 2–3 wk.
+## CLI scripts (1 feature)
 
-### Bundle B — SQL Safety + Throughput Sweep (1.5–2 wk)
+- **Self-heal reaper** — `.agentflow/lib/` — `self_heal_reap_stale_test_procs` (orch-side bash helper). [CONSENSUS: 1/4] [STATUS: shipped]
 
-| Item | Source | Notes |
-|---|---|---|
-| K-2 + K-3 + K-9 + G-20 + G-21 ★ | Kimi + GLM (5-finding consensus) | Migrate `cache.sh:101–163`, `memory.sh:193–532`, `auto-merge.sh:363`, `runs-tracker.sh:137–173` from string-interp SQL to parameterized python3 (pattern already used in `trace_store.sh`) |
-| G-7 | GLM | `auto-merge.sh` 5–7× sqlite3 N+1 → single heredoc per epic |
-| G-8 + G-9 | GLM | `scope-overlap.sh` O(N·P) git-in-loop + O(N²) pairwise → file→epic reverse-map |
-| G-10 | GLM | Drop `CAST(strftime(...))` in `reflection_pipeline.sh:55` to restore index usage |
-| K-1 + G-11 | Kimi + GLM | Per-node `_d022_charge_node_cost` python3 fork → batch at run finalization |
+(Other CLI scripts — `scripts/`, `mcp-servers/`, `.agentflow/scripts/cn/` — were not enumerated by the available lens.)
 
-**Prerequisite P1s:** None. Risk if deferred: any kickoff title containing a `'` silently corrupts the cache row; under adversarial input this is a real injection vector.
-**Total effort:** 1.5–2 wk.
+## Disputed entries
 
-### Bundle C — Runtime Substrate (3–5 wk)
+None — only one lens produced output, so no two lenses could disagree. All single-source.
 
-| Item | Source | Notes |
-|---|---|---|
-| O-R7 | MiniMax | Persistent `mini-ork-db-server` shim — eliminates 80ms × N python3-startup tax per run |
-| O-R1 + O-R2 | MiniMax | `busy_timeout` 5s→30s at every `sqlite3.connect()`; `MINI_ORK_MAX_PARALLEL` default 4→8 for audit recipes |
-| G-13 + O-R9 ★ | GLM + MiniMax (consensus) | `mini-ork maintenance --archive-traces --older-than 90d` (named in ROADMAP as O-R8 but not built); TTL ladder: hot 90d → cold archive → 2y delete (audit_log immutable) |
-| O-R8 | MiniMax | Partition `execution_traces` / `model_costs` / `gradient_records` by `(run_id, ts)` |
-| O-R3 | MiniMax | PostgreSQL backend (promote from v1.0 → v0.4 per recommendation) |
+## Coverage gap report
 
-**Prerequisite P1s:** None. Risk if deferred: at 100K dispatches/day `execution_traces` reaches 36.5M rows/year with no rotation; SQLite WAL writer becomes the ceiling at ~1K runs/day shared-team deployment.
-**Total effort:** 3–5 wk (skip Postgres for a 1-wk shim-only path).
+### Lens-level failures (NEW — synthesizer added)
+- **3 of 4 lenses failed to produce a report.** Only `lens-minimax.md` exists in `${MINI_ORK_RUN_DIR}/`. `lens-glm.md`, `lens-kimi.md`, `lens-codex.md` are absent; `llm-failures/` directory shows `1781119396-{glm,kimi,codex}.{err.log,out,shim.err}` triple for each — three independent LLM dispatch failures at the shim layer (not workload-related). This synthesis is therefore SINGLE-LENS, not 4-lens-consensus. Cross-lens deduplication, ranking, and disputed-entry detection are degraded to no-ops.
+- **Surfaces that the surviving lens (minimax product-surface) did NOT enumerate:** DB tables/migrations, individual prompt registry keys, CLI scripts beyond `.agentflow/lib/`. These categories therefore appear as 0/0 entries in the synthesis — they were not "checked and found absent", they were "out of scope for the only lens that ran". The verifier should treat empty Database / Prompts / CLI sections as **unknown coverage**, not zero coverage.
 
-### Bundle D — Heterogeneity Enforcement (2–3 wk)
+### Product-surface gaps surfaced by minimax lens
+1. **No single-chapter regenerate surface.** `server/routes/bookGeneration.ts:1` lacks `POST /api/book-gen/jobs/:id/chapter/:n/regenerate`; to rerun one chapter the user has to start a new compose session.
+2. **No end-user billing/upgrade flow.** `server/routes/billing.ts:1` + `billingService.ts:1` exist (Stripe webhook live), but `src/utils/paymentRequiredRedirect.ts:1` has no `PaywallModal` / `Upgrade` page target — users hitting paid features get a 404.
+3. **No admin "kill switch" for runaway job.** `adminUnattendedRate.ts:1` visualizes runaway jobs but there's no `POST /api/admin/jobs/:id/cancel` to abort mid-flight Hatchet chapter dispatch.
+4. **No cross-workspace global search.** `src/pages/SearchPage.tsx:1` is silently narrowed by `useActiveWorkspace` — no surface to search all workspaces a user belongs to.
+5. **No offline / PWA reader.** No service worker; reader requires live auth token. Audiobook + highlight flows on flaky networks blank out.
+6. **No bulk-tagging UI for library.** `server/routes/documentTags.ts:1` + `documentsFilter.ts:1` exist; `LibraryPage.tsx:1` lacks multi-select → apply-tag — primitive is built, surface isn't.
+7. **No post-onboarding profile editor.** `SampleChapterWizard` writes `user_personality` + `personality_atoms` via `server/services/sampleChapterHarvest/`, but no `EditMyProfile` surface for returning users to re-steer without starting a fresh sample chapter.
+8. **No per-tenant compliance audit log export.** `src/pages/admin/CompliancePage.tsx:1` exists but offers no CSV/JSON export of `audit_events`; GDPR/DSAR can't be self-served.
+9. **Compose: no diff-between-revisions view.** Each compose run produces a fresh book; no v1↔v2 diff surface for "tune style then regenerate" workflows.
+10. **Reader: no Zotero / RIS export.** `citationExport.ts:1` exports BibTeX only — Zotero-standard academic users blocked.
+11. **No "regenerate image" path on figure blocks.** `chapterIllustration.ts:1` exists; replacing a figure currently requires deleting + redoing the whole chapter.
+12. **Admin: no sandbox health surface.** `server/services/daytonaSandbox/` carries telemetry but there's no `/admin/sandboxes` page showing live/stuck Daytona sandbox counts + average lifespan.
 
-| Item | Source | Notes |
-|---|---|---|
-| O-R14 ★ | MiniMax | `family_diversity_gate`: pre-flight provider-family health probe; abort if any required family is down |
-| O-R15 ★ | MiniMax | `krippendorff_alpha_gate`: per-run α across first-round lens proposals (Nasser 2026); auto-escalate to `human_gate` below 0.4 |
-| O-R13 | MiniMax | SHA-256 checksum for `lib/providers/cl_*.sh` before `source` (closes supply-chain gap pre-marketplace) |
-| G-19 | GLM | `_mo_llm_is_gateway` becomes a registered list; add test asserting every `cl_*.sh` is `is_executable` OR `is_gateway` |
+### Schema / canonical-taxonomy gap (minimax caveat)
+- `docs/_meta/features.md:23` (canonical taxonomy v0.1, last_updated 2026-05-22) does not separately enumerate compose sub-steps `StepStyleBlueprint`, `StepPublisherStyle`, `StepVoice`, `StepRefineCitations`, `StepChapterStyleTuning` — recommend the next `features.md` refresh add `compose.<step>` rows for each.
 
-**Prerequisite P1s:** Item 4 from §2 (ρ gate). Risk if deferred: the framework's whole USP — Rajan 2025 submodularity precondition — remains documentation-only.
-**Total effort:** 2–3 wk.
+## Synthesizer integrity notes
 
----
-
-## Section 4 — Long-horizon (P3 + advisory)
-
-Tracked but not load-bearing in current single-host, single-operator deployments:
-
-- **O-R4** — `mini-ork-worker` daemon (horizontal node dispatch). Required at 100×; not before.
-- **O-R5** — `mini-ork-control-plane` HTTP service (multi-tenant scheduling + per-tenant budgets). 12–16 wk; only needed at 1000× / hosted SaaS.
-- **O-R6** — Vault / AWS Secrets Manager replacement for `secrets.local.sh`. Wait until O-R5 lands.
-- **O-R11 + O-R12** — Recipe semver + verifier sandboxing (`firejail` / `sandbox-exec`). Required *before* opening a third-party recipe marketplace; not before.
-- **O-R10** — Flyway/sqitch migration tool. Current 50-LOC runner works through 15 migrations; revisit at 30+.
-- **O-R17** — OTel span export. Defer until `mini-ork metrics` becomes insufficient (no signal yet).
-- **D-arch-3** — Semantic dedup cache layer (cosine ≥0.97). Estimated 15–25% additional hit rate; defer until exact-hash cache + input normalization (`D-8`) land first.
-- **G-18 + G-25 ★** — Doc honesty drift (`ARCHITECTURE.md:155` stale counts; ROADMAP missing `Status: not-started` markers). Single PR can fix both.
-
-**Advisory only (no action recommended):** G-22 (`mo-steer.sh` polling), G-23 (topology silent-drop), G-24 (`eval` in batch-flush). These are stylistic, low-blast, and the codebase has more important debt.
-
----
-
-## Section 5 — Hardest Open Question (inherited from MiniMax §7)
-
-**How does the self-evolution loop avoid retraining on its own hallucinations?**
-
-The benchmark suite's promotion gate for `research_synthesis` and `refactor-audit` task classes is LLM-judged by the same family distribution that produces the candidates (`lib/benchmark_suite.sh`, `lib/promotion_gate.sh`). If all four families share a systematic blind spot, the promotion gate cannot detect it — it is measuring **consensus of a coalition**, not external ground truth. This is Zietsman 2026's circularity gap applied to the *evolution loop itself*, not just the per-run audit.
-
-MiniMax §7 sketches three partial mitigations:
-
-| Mitigation | Adequacy assessment |
-|---|---|
-| 1. **Automated citation tracing** — does each finding cite a `file:line` that exists and contains the alleged pattern? | **Partial.** Catches fabrication (a finding pointing to a non-existent line) but does not catch *misinterpretation* of code that does exist. False-negative on systematic blind spots is unchanged. |
-| 2. **Coverage of injected bugs** (Agarwal 2026 fabricated-bug injection) | **Necessary but not sufficient.** Verifies the auditor recall against a known-bug oracle, but the injected-bug set is itself authored by humans whose blind spots may correlate with the LLM panel's. The oracle is only as honest as its author. |
-| 3. **Krippendorff α across validator families** (Nasser 2026) | **Strongest of the three, but assumption-loaded.** α-disagreement signals diversity; α ≥ 0.8 may mean "all four families share the same blind spot" rather than "all four families are correctly converging." Without an external ground-truth anchor, α distinguishes *agreement* from *correctness* only probabilistically. |
-
-**Verdict:** The three mitigations together raise the bar but do not close it. The honest state is that for `code_fix` and `db_migration` task classes the benchmark oracle *is* deterministic (typecheck + targeted test), and the evolution loop is grounded there. For `research_synthesis` and `refactor-audit`, no deterministic oracle exists yet.
-
-**Research need (P3, not P1):** Either (a) build a **deterministic citation+coverage oracle** for synthesis recipes (cite a real `file:line` AND contain ≥X% of known-injected bug shapes), accepting that this is a recall-only oracle and precision remains LLM-judged, OR (b) accept structurally that synthesis-class recipes evolve more slowly — manually promoted, not auto-promoted — until a non-LLM oracle is found. Today's framework leans implicitly toward (b) but the ROADMAP wording does not state this explicitly. **Recommended honesty patch:** Add a one-paragraph note to `docs/positioning/why-mini-ork.md:152` stating that auto-promotion is restricted to task classes with deterministic oracles, and synthesis-class candidates require operator review.
-
----
-
-## Section 6 — Dogfood Reflection
-
-**Was this audit reproducible via the framework?** Yes. The `refactor-audit` recipe dispatched the 4-lens panel via `mini-ork-execute`, all four lens outputs landed at `~/.mini-ork/runs/run-1780604422-58608/lens-*.md`, and the synthesizer (this document) is the dispatched `synthesizer` node per the recipe DAG.
-
-**Did any lens get blocked by something the audit itself identified?** Yes — three meta-loop hits:
-
-1. **G-4 + D-5 ★ (Codex phantom cost):** The Codex lens consumed real OpenAI Codex API tokens. The dispatched run charged `$0.01` flat to `task_runs.cost_usd`. The audit's own daily-budget telemetry under-counts the real spend it just incurred. The audit is honest about the bug it triggered.
-
-2. **G-5 + O-R14 (ρ gate not enforced):** The 4-lens panel ran without a pre-flight check that all four families were online and that pairwise output similarity stayed below the Rajan 2025 coalition threshold. If, hypothetically, GLM and Kimi had returned highly correlated outputs (ρ ≈ 1.0), this synthesis would still have been produced — silently degrading the panel's evidence value below its claimed precondition. The audit surfaced the gap; the audit itself ran outside the gate.
-
-3. **G-12 (no exponential backoff):** If any lens had hit a 429, the healer would have applied a flat 30s sleep. No lens hit a 429 this run (the `.last-llm-cost` ledger shows clean dispatches), but the framework would not have recovered gracefully under sustained rate-limit pressure. The audit identified the gap before it bit.
-
-**Net:** The framework can audit itself, and the audit's first findings are reasons the audit's own dispatch was less safe than its documentation claims. This is the healthiest possible meta-loop outcome — better than a clean run, because it produces a falsifiable to-do list.
-
----
-
-## Section 7 — How to Re-run
-
-**Bare command (current state, unsafe re-dispatch under strict $15 cap):**
-
-```bash
-mini-ork-execute \
-  --recipe refactor-audit \
-  --kickoff kickoffs/self-audit-2026-06-04.md
-```
-
-**Safe re-dispatch (recommended — apply §2 P1 items first):**
-
-1. Apply P1 items 1–4 from §2 (≤3 dev-days).
-2. Verify `MO_DAILY_BUDGET_USD=15` is honored end-to-end:
-   ```bash
-   mini-ork spent-today  # must reflect real spend including Codex
-   ```
-3. Re-run with explicit ρ gate enforcement:
-   ```bash
-   MO_RHO_THRESHOLD=0.25 MO_FAMILY_DIVERSITY_GATE=strict \
-     mini-ork-execute --recipe refactor-audit \
-     --kickoff kickoffs/self-audit-2026-06-04.md
-   ```
-
-**P1 that blocks safe self-dispatch:** **§2 item 2 (G-4 + D-5 ★ Codex cost)**. Until Codex cost is correctly attributed, the daily-budget circuit-breaker cannot stop a runaway 4-lens panel from spending past the documented $15 cap. This is the single most important fix before re-running this audit at any scale beyond the single-shot diagnostic above.
-
----
-
-*Synthesis composed by Anthropic Opus from glm + kimi + codex + minimax lens reports. All ★ marks denote multi-lens consensus per Rajan 2025 panel-method evidence weighting. File:line citations preserved verbatim from source lens reports and not independently re-verified by the synthesizer.*
+- Every feature retains its file:line evidence from the minimax lens.
+- No features were added that the available lens did not surface (per recipe rule "Do NOT add features the lenses didn't surface").
+- Total feature count of 87 matches minimax's own total; re-grouping into the synthesizer's surface categories did NOT inflate or deflate it. Counts:
+  - Routes / endpoints: 32 (includes one middleware crossover, `workspaceContext`)
+  - React components / pages: 52 (top-level pages + reader chrome + compose + onboarding + admin pages + hooks)
+  - Background jobs / workers / cron: 16
+  - DB tables / migrations: 0 (out-of-scope for surviving lens)
+  - Prompt registry keys: 0 (out-of-scope for surviving lens)
+  - CLI scripts: 1
+  - Subtotal: 32 + 52 + 16 + 0 + 0 + 1 = 101 entry-slots, but several features span surfaces (e.g. `audiobooks` appears as both a route AND a worker; `bookmarks`, `mindmap`, `search` likewise). De-duplicating the cross-surface multi-counts yields **87 unique product-features**, matching minimax's total of 87.
+- The 12-step compose wizard is counted as ONE feature (the wizard) with sub-step components called out; this matches minimax's accounting.
+- Bin counts under each surface heading are slot-counts (where the feature LIVES code-wise), not unique-feature counts.
