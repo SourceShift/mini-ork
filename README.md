@@ -9,9 +9,81 @@
 
 > **Motto:** Stop drawing agent graphs that let one model family grade its own homework. mini-ork turns goals into verifier-gated, stateful, cross-family agent runs, so teams get durable artifacts instead of same-vendor consensus theater.
 
-mini-ork is a **task operating system for agents**. It receives a goal, classifies the work, chooses a workflow, dispatches specialized agents, verifies artifacts, and stores execution experience for self-improvement. It does NOT ship opinions on what your pipeline should look like — pipeline shapes live in [`recipes/`](./recipes/) as composable user-land examples.
+mini-ork is a **task operating system for agents**. It receives a goal, classifies the work, chooses a workflow, dispatches specialized agents across *distinct model families*, verifies artifacts deterministically, and stores execution experience so every run starts smarter — and cheaper — than the last. It does NOT ship opinions on what your pipeline should look like: pipeline shapes live in [`recipes/`](./recipes/) as composable user-land examples.
 
-> ⚡ **10-second demo (no API keys):** `bash examples/00-demo.sh` — bootstraps a throwaway project, walks the classify → plan → execute → verify loop in dry-run mode (no LLM calls), prints the dispatched node sequence + the plan path that *would* be written. Set `MINI_ORK_DRY_RUN=0` to fire real LLM calls and populate the `task_runs` row.
+> ⚡ **30-second demo (no API keys):** `bash examples/00-demo.sh` — bootstraps a throwaway project, walks the classify → plan → execute → verify loop in dry-run mode (no LLM calls), prints the dispatched node sequence + the plan path that *would* be written. Set `MINI_ORK_DRY_RUN=0` to fire real LLM calls and populate the `task_runs` row.
+
+📖 **Full feature catalog:** [docs/FEATURES.md](docs/FEATURES.md) — every capability, pinned to the code that implements it.
+
+---
+
+## Why not just a single-agent coder?
+
+Single-agent coding assistants are remarkable engines. They are also, structurally, three bad deals at once:
+
+| The single-agent deal | What it costs you | What mini-ork does instead |
+|---|---|---|
+| **Amnesia.** Every session starts from zero. | You re-pay the model to re-learn your codebase, your conventions, and the failure it hit yesterday — every single session. | `state.db` persists execution traces, failure gradients, and outcomes. The planner prompt receives the last 5 same-class runs (cost, failures, duration). Yesterday's lesson is today's context. |
+| **Self-grading.** The same model family writes the code *and* approves it. | Review theater: a panel of four Sonnets is one disposition amplified four times (measured: Krippendorff α = 0.042 across judge families). Bugs that family is blind to stay invisible. | Review lenses dispatch to **distinct vendors** (Zhipu, Moonshot, OpenAI, DeepSeek, Anthropic, MiniMax) by configuration, then deterministic `verifiers/*.sh` decide pass/fail mechanically. |
+| **Unmetered spend.** One frontier-priced model for every token, no ledger, no breaker. | Routine grep-level checks billed at architecture-review prices; runaway loops discovered on the invoice. | Per-call `llm_calls` ledger, a dispatch-enforced daily cost cap ($50 default) plus per-lane dispatch budgets, cost + behavioral circuit breakers, and cheap-lane routing — frontier models only where judgment is actually needed. |
+
+The rest of this README is those three rows, with receipts.
+
+---
+
+## The economics: route by price, verify for free, cap the rest
+
+**Cheap-lane routing.** A workflow node declares a *role*; config maps roles to model families. Tactical checks run on budget families, frontier models are reserved for synthesis:
+
+```yaml
+# config/agents.yaml — the shipped defaults, post cost audit (v0.2-pt8)
+lanes:
+  planner:  sonnet   # was opus — audit downgrade: ~$12-18K/day saved at 100K-run scale
+  worker:   sonnet
+  verifier: sonnet
+  reviewer: opus     # kept frontier — final verdict quality
+```
+
+**Deterministic verification costs zero tokens.** Every recipe ships `verifiers/*.sh` — pass/fail is an exit code, not an LLM opinion. You don't pay a model to decide what a test suite can decide. When zero verifiers execute, the verdict is `vacuous`, never success — "nothing was checked" is not laundered into a pass.
+
+**Every call lands in a ledger.** The `llm_calls` table records model, tokens, cost, duration, and session per dispatch — token totals taken from the billed result envelope, not client-side guesses:
+
+```bash
+sqlite3 .mini-ork/state.db \
+  "SELECT model_id, COUNT(*), ROUND(SUM(cost_usd),2) FROM llm_calls GROUP BY model_id;"
+```
+
+**Caps and breakers, not hope.** A daily cost cap is enforced inside the dispatcher itself (`MO_DAILY_BUDGET_USD`, $50 default) — over-budget calls are refused, and the self-improve runner re-checks the same cap *before* each iteration spins up. Per-epic / per-run budget defaults ($5 / $0.50) are declared in `config/agents.yaml` and surfaced to every dispatch as per-lane budget flags. A behavioral circuit breaker ([`lib/circuit_breaker.sh`](lib/circuit_breaker.sh)) detects cost-burn-without-write, artifact stagnation, and stuck verdicts — spinning runs get killed, not billed. [`lib/throttle-guard.sh`](lib/throttle-guard.sh) backs off throttled providers per-lane instead of retry-storming.
+
+**Start cheap, escalate only on failure.** Escalation is modeled, not improvised: `escalates_to` edges in the workflow DAG fire only when a gate actually fails, and every agent definition declares a `fallback_above` precision ladder that terminates at opus ([`config/README.md`](config/README.md)) — the expensive model is the exception path, not the default. Stage-level memoization ([`lib/cache.sh`](lib/cache.sh)) and a cheap 8-item rubric pre-screen ([`lib/rubric-prescreen.sh`](lib/rubric-prescreen.sh)) cut repeat and pre-test spend further.
+
+---
+
+## The learning loop: runs that compound
+
+A single-agent session is a goldfish. mini-ork closes the loop:
+
+```
+run → trace (cost, files, tools, lineage)
+    → reflect (LLM extracts "textual gradients": what to do differently)
+    → inject (planner + node prompts receive prior outcomes & failure modes)
+    → improve (workflow candidates → benchmark → gated promotion, with rollback)
+```
+
+Concretely:
+
+- **Prior-run memory injection** — the planner sees the last 5 same-class runs: which nodes failed, what they cost, how long they took. Plans calibrate against history instead of repeating it.
+- **Learned-failure-mode injection** — high-confidence gradients are injected into node prompts at dispatch time. The mistake from run 12 is a warning label in run 13.
+- **Auditable context packs** — the exact memory bundle available at plan time is persisted next to the plan (`context-pack.json`). You can audit what the planner knew.
+- **Agent performance history** — success rate, cost, latency accumulate per agent version in `agent_performance_memory`. Dispatch gets data, not vibes.
+
+**Receipts:** the [self-improvement session below](#recursive-self-improvement-evidence-2026-06-09-session) ran this loop against mini-ork itself — 10 autonomous, evidence-cited commits to `main` in ~5 wall-clock hours, including the loop finding and fixing bugs by reading its own prior run logs.
+
+Measure your own trajectory any time:
+
+```bash
+mini-ork metrics --recipe refactor-audit   # cost trend, wall-time trend, gradient yield
+```
 
 ---
 
@@ -56,6 +128,8 @@ lanes:
 
 **Bring your own keys:** no wrapper needed to add a provider. Declare Anthropic or OpenAI-compatible endpoints in [`config/providers.yaml`](config/providers.yaml) (`kind: anthropic-native | anthropic-compat | openai-compat | executable`), put the key in `.mini-ork/config/secrets.local.sh` (template: [`config/secrets.example.sh`](config/secrets.example.sh)), and point an `agents.yaml` lane at the entry. A `cl_<name>.sh` wrapper always wins over a registry entry of the same name, so registry entries can't change builtin behavior. Details: [docs/CONFIG.md](docs/CONFIG.md) → "Bring-your-own providers".
 
+And the panel quality is *instrumented*, not assumed: a pre-synthesis coalition gate ([`lib/coalition_gate.sh`](lib/coalition_gate.sh)) hard-blocks same-family degeneration, panel topology telemetry ([`lib/topology_metrics.sh`](lib/topology_metrics.sh)) measures realised correlation per run, and the observability UI's `/fingerprint` route shows exactly which family ran which lens.
+
 ### What you trade for what
 
 | You give up | You get |
@@ -71,6 +145,7 @@ lanes:
 |---|---|---|
 | Agent diversity | All same family (Sonnet/Opus, or GPT-4/o1, etc) | 7 families configurable per lane |
 | State persistence | Per-session, ephemeral | `state.db` (SQLite) across runs |
+| Cost governance | Invoice surprise | Per-call ledger + caps + circuit breakers |
 | Trajectory measurement | None | `mini-ork metrics` cross-cycle |
 | Executable specification | Model decides what's good | `verifiers/*.sh` deterministic gates |
 | Self-publishing | Output stays in session log | Publisher node `git commit` under `mini-ork@local` |
@@ -94,7 +169,7 @@ cd ~/my-project
 mini-ork init
 
 # 3. Write a kickoff (or copy an example)
-cp ~/ps/mini-ork/examples/01-hello-world/kickoff.md ./kickoff.md
+cp <path-to-mini-ork-checkout>/examples/01-hello-world/kickoff.md ./kickoff.md
 
 # 4. Run from a kickoff (dry-run first, no API keys needed)
 MINI_ORK_DRY_RUN=1 mini-ork run ./kickoff.md
@@ -217,7 +292,7 @@ The framework ships the universal loop and its primitives. Nothing in `lib/` or 
 
 ### RECIPES — opinions live here
 
-Recipes are user-land workflow definitions. They compose framework primitives into pipeline shapes. 11 recipes ship today; 7 of them dispatch a 4–5 lens panel across distinct model families per cycle, using family diversity as a practical proxy for the low-correlation detector patterns highlighted by Rajan 2025.
+Recipes are user-land workflow definitions. They compose framework primitives into pipeline shapes. 12 recipes ship today; 8 of them dispatch a 4–5 lens panel across distinct model families per cycle, using family diversity as a practical proxy for the low-correlation detector patterns highlighted by Rajan 2025.
 
 | Recipe | Location | Shape |
 |---|---|---|
@@ -247,6 +322,8 @@ Extensions do not require forking the framework. See [docs/EXTENSION.md](docs/EX
 3. **VerifierRegistry** — drop a `<name>.sh` script under `${MINI_ORK_HOME}/verifiers/` or `recipes/<recipe>/verifiers/` and reference it in `workflow.yaml`.
 4. **ExperienceMemory** — add new namespaces via DB migrations or override `lib/context_assembler.sh` per task class.
 
+Embedding from Python is first-class too — `MiniOrk().run(RunRequest(...))` with typed specs: [docs/PYTHON_FRAMEWORK.md](docs/PYTHON_FRAMEWORK.md).
+
 ---
 
 ## Bounded Autonomy
@@ -263,7 +340,7 @@ Self-improvement is evidence-gated, not free-running. Changes are ranked by risk
 | 6 | Propose code changes to mini-ork itself | Benchmark pass + human review |
 | 7 | Promote runtime changes | Benchmark pass + human gate + `version_clear_quarantine` if previously quarantined |
 
-See [docs/SAFETY.md](docs/SAFETY.md) for immutable constraints and the PromotionGate contract.
+Auto-promotion is **class-restricted**: task classes with an external oracle (test suites, schema validators) can auto-promote on green; LLM-judged classes (synthesis, audits) are manual-promote-only — the framework refuses to fabricate an oracle it doesn't have. See [docs/SAFETY.md](docs/SAFETY.md) for immutable constraints and the PromotionGate contract.
 
 ---
 
@@ -274,7 +351,7 @@ See [docs/SAFETY.md](docs/SAFETY.md) for immutable constraints and the Promotion
 The full release log lives in [`ROADMAP.md`](ROADMAP.md) — every section dated and per-commit-attributed. Current shipped totals (regenerable via `bash scripts/readme-claim-check.sh` and filesystem counts):
 
 - 6-stage universal loop (`classify → plan → execute → verify → reflect → improve`) + 7 companion entrypoints (`eval`, `improve`, `promote`, `metrics`, `spawn`, direct `bin/mini-ork-topology`, direct `bin/mini-ork-self-improve`)
-- 43 framework primitives in `lib/` (incl. oracle-hardening libs + `gate_bootstrap.sh` for the v0.3-rc1 central wire-up + `lib/throttle-guard.sh` for provider-throttle classification with per-lane exponential backoff, added 2026-06-09)
+- 44 framework primitives in `lib/` (incl. oracle-hardening libs + `gate_bootstrap.sh` for the v0.3-rc1 central wire-up + `lib/throttle-guard.sh` for provider-throttle classification + `lib/mo_otel.sh` for env-gated OTel span emission, added 2026-06-09/10)
 - 1 runner-shared helper in `bin/lib/` (`profile-seed.sh` — deterministic `run_profile.json` seeding from structured kickoff markdown, added 2026-06-09)
 - 16 user-facing `bin/mini-ork*` entrypoints
 - 19 schema migrations under `db/migrations/` (memory namespaces, benchmarks, evolution, safety, panel topology telemetry, recursive orchestration, self-improvement learning, llm_calls session indexing, trace status widening)

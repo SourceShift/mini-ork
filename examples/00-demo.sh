@@ -4,7 +4,7 @@
 #
 # What this proves:
 #   1. `mini-ork init` bootstraps a clean .mini-ork/ directory with state.db
-#      seeded across 13 migrations (72 tables).
+#      seeded by the full migration chain (19 migrations today).
 #   2. `mini-ork run code-fix <kickoff>` walks classify → plan → execute → verify.
 #   3. The task_runs row records: task_class=code-fix, recipe=code-fix, status
 #      transitions across the loop.
