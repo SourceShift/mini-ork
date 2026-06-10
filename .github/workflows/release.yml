@@ -1,0 +1,56 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: build + publish GitHub release
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build python sdist + wheel
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+          cache-dependency-path: ui/pnpm-lock.yaml
+
+      # `pnpm build` emits the SPA into mini_ork/web/static/ (vite outDir);
+      # ship it as a standalone tarball so `mini-ork serve` works without a
+      # node toolchain on the consuming machine.
+      - name: Build observability SPA
+        working-directory: ui
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm build
+
+      - name: Pack SPA tarball
+        run: tar -czf mini-ork-ui-${{ github.ref_name }}.tar.gz -C mini_ork/web static
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" \
+            --generate-notes \
+            dist/*.tar.gz dist/*.whl \
+            "mini-ork-ui-${{ github.ref_name }}.tar.gz"
