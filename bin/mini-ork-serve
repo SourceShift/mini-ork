@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+# mini-ork-serve — boot the local observability UI.
+#
+# Reads .mini-ork/state.db in read-only mode and serves a React SPA + REST/SSE
+# at http://127.0.0.1:7090 by default. Binds loopback only — explicit
+# --host 0.0.0.0 to expose.
+#
+# Usage:
+#   mini-ork serve                          # 127.0.0.1:7090, cwd/.mini-ork
+#   mini-ork serve --port 7100
+#   mini-ork serve --home /path/to/.mini-ork
+#   mini-ork serve --reload                 # dev mode (auto-reload on .py change)
+#   mini-ork serve --help
+
+set -Eeuo pipefail
+
+MINI_ORK_ROOT="${MINI_ORK_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+export MINI_ORK_ROOT
+
+PORT=7090
+HOST=127.0.0.1
+HOME_DIR=""
+RELOAD=""
+
+_usage() {
+  cat <<'EOF'
+Usage: mini-ork serve [--port N] [--host ADDR] [--home DIR] [--reload]
+
+Boot the local read-only observability UI. Binds 127.0.0.1:7090 by default.
+
+Options:
+  --port N      HTTP port (default 7090)
+  --host ADDR   Bind address (default 127.0.0.1 — use 0.0.0.0 to expose)
+  --home DIR    Override .mini-ork home (default: $MINI_ORK_HOME or ./.mini-ork)
+  --reload      Enable uvicorn auto-reload (dev only)
+  --help        This message
+
+Requirements:
+  pip install fastapi uvicorn pyyaml
+
+The UI bundle (web/dist) is auto-served when built. Without it, the API
+remains usable at /api/v1/... and a JSON hint is returned at /.
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --help|-h)   _usage; exit 0 ;;
+    --port)      PORT="$2"; shift 2 ;;
+    --host)      HOST="$2"; shift 2 ;;
+    --home)      HOME_DIR="$2"; shift 2 ;;
+    --reload)    RELOAD="--reload"; shift ;;
+    *)           echo "Unknown flag: $1" >&2; _usage; exit 2 ;;
+  esac
+done
+
+if [ -n "$HOME_DIR" ]; then
+  export MINI_ORK_HOME="$HOME_DIR"
+fi
+
+# Resolve home for the preflight check
+RESOLVED_HOME="${MINI_ORK_HOME:-$(pwd)/.mini-ork}"
+DB_PATH="$RESOLVED_HOME/state.db"
+if [ ! -f "$DB_PATH" ]; then
+  echo "mini-ork serve: no state.db at $DB_PATH" >&2
+  echo "  Run 'mini-ork init' first, or pass --home to point elsewhere." >&2
+  exit 1
+fi
+
+# Ensure deps are importable; fail fast with a usable hint.
+if ! python3 -c "import fastapi, uvicorn" 2>/dev/null; then
+  echo "mini-ork serve: missing 'fastapi' or 'uvicorn'" >&2
+  echo "  pip install fastapi uvicorn pyyaml" >&2
+  exit 1
+fi
+
+cd "$MINI_ORK_ROOT"
+
+echo "→ mini-ork serve"
+echo "  host : $HOST:$PORT"
+echo "  home : $RESOLVED_HOME"
+echo "  db   : $DB_PATH"
+echo "  ui   : http://$HOST:$PORT/  (api: /api)"
+echo ""
+
+exec python3 -m uvicorn mini_ork.web.app:app \
+  --host "$HOST" \
+  --port "$PORT" \
+  --log-level info \
+  $RELOAD
