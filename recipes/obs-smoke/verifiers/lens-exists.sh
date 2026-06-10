@@ -60,18 +60,35 @@ if not os.path.isfile(review_path):
     checks["review_exists"] = False
 else:
     checks["review_exists"] = True
+    with open(review_path, encoding="utf-8", errors="replace") as f:
+        review_text = f.read()
     try:
-        with open(review_path, encoding="utf-8", errors="replace") as f:
-            review = json.load(f)
+        review = json.loads(review_text)
+        checks["review_json_strict"] = True
+    except (json.JSONDecodeError, ValueError):
+        # Reviewers emit preamble prose around the JSON (D-011/D-016 class).
+        # Tolerant fallback via lib/extract_verdict.py — strict failure here
+        # cascaded a passing run into rollback (run-1781105320-64712).
+        checks["review_json_strict"] = False
+        review = None
+        lib_dir = os.path.join(os.environ.get("MINI_ORK_ROOT", ""), "lib")
+        if os.path.isdir(lib_dir):
+            sys.path.insert(0, lib_dir)
+            try:
+                from extract_verdict import extract_review
+                review = extract_review(review_text)
+            except ImportError:
+                pass
+    if not isinstance(review, dict):
+        reasons.append("review-tiny_reviewer.json contains no JSON object with a verdict")
+        checks["review_verdict"] = False
+    else:
         verdict = review.get("verdict")
         if verdict not in ("pass", "fail"):
             reasons.append(f"review verdict {verdict!r} not in {{pass,fail}}")
             checks["review_verdict"] = False
         else:
             checks["review_verdict"] = True
-    except (json.JSONDecodeError, ValueError) as e:
-        reasons.append(f"review-tiny_reviewer.json is not valid JSON: {e}")
-        checks["review_verdict"] = False
 
 # --- telemetry: this run's LLM-node traces -------------------------------
 db = os.environ.get("MINI_ORK_DB", "")
