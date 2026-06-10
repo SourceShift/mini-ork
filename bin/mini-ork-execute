@@ -140,9 +140,15 @@ MINI_ORK_DB="${MINI_ORK_DB:-$MINI_ORK_HOME/state.db}"
 export MINI_ORK_HOME MINI_ORK_DB
 
 if [ -z "$PLAN_PATH" ]; then
-  # Find most recent plan.json in runs/
-  PLAN_PATH=$(find "$MINI_ORK_HOME/runs" -name "plan.json" -print0 2>/dev/null \
-    | xargs -0 ls -1t 2>/dev/null | head -1 || true)
+  # Find most recent plan.json in runs/. Keep this in Bash instead of
+  # `find | xargs ls`: GNU xargs runs ls once on empty input, which can
+  # accidentally select an unrelated file and hide the "no plan" error.
+  PLAN_PATH=""
+  while IFS= read -r -d '' candidate; do
+    if [ -z "$PLAN_PATH" ] || [ "$candidate" -nt "$PLAN_PATH" ]; then
+      PLAN_PATH="$candidate"
+    fi
+  done < <(find "$MINI_ORK_HOME/runs" -name "plan.json" -print0 2>/dev/null || true)
 fi
 [ -z "$PLAN_PATH" ] && { echo "No plan.json found. Run: mini-ork plan <kickoff.md>" >&2; exit 2; }
 [ -f "$PLAN_PATH" ]  || { echo "plan not found: $PLAN_PATH" >&2; exit 2; }
