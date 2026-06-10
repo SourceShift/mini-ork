@@ -328,6 +328,8 @@ if _thresh > 0 and not p.get("gradient_id"):
     except sqlite3.OperationalError:
         rows = []
     for gid_e, target_e, sig_e, chg_e, conf_e in rows:
+        if target_e == p["target"]:
+            continue
         old_tok = _tokens(f"{sig_e} {chg_e}")
         if not new_tok or not old_tok:
             continue
