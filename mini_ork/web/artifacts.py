@@ -7,6 +7,7 @@ be exposed.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +15,19 @@ from typing import Any
 # the runs root. Any path that resolves outside is rejected.
 
 MAX_BYTES = 2 * 1024 * 1024  # 2 MiB per file; UI shouldn't load larger blobs
+
+# run_id flows from path params straight to the filesystem. Reject anything
+# that could escape runs_root: `..`, slashes, leading dot, control chars.
+# Real run ids are `run-<unix>-<rand>` or `self-improve-iter-N-<ts>`, so the
+# allowed alphabet is intentionally tight.
+_RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+def _validate_run_id(run_id: str) -> None:
+    if not run_id or ".." in run_id or "/" in run_id or "\\" in run_id:
+        raise PermissionError(f"invalid run_id: {run_id!r}")
+    if not _RUN_ID_RE.match(run_id):
+        raise PermissionError(f"invalid run_id: {run_id!r}")
 
 
 def runs_root(home: Path) -> Path:
@@ -44,6 +58,7 @@ def list_run_dirs(home: Path) -> list[dict[str, Any]]:
 
 
 def list_artifacts(home: Path, run_id: str) -> list[dict[str, Any]]:
+    _validate_run_id(run_id)
     root = runs_root(home) / run_id
     if not root.exists() or not root.is_dir():
         return []
@@ -68,7 +83,13 @@ def list_artifacts(home: Path, run_id: str) -> list[dict[str, Any]]:
 
 
 def read_artifact(home: Path, run_id: str, relpath: str) -> dict[str, Any]:
-    base = (runs_root(home) / run_id).resolve()
+    _validate_run_id(run_id)
+    runs = runs_root(home).resolve()
+    base = (runs / run_id).resolve()
+    # Belt + braces: even after id validation, refuse if the resolved base
+    # is not a direct child of runs_root (catches future allow-list bugs).
+    if base.parent != runs:
+        raise PermissionError(f"invalid run_id: {run_id!r}")
     target = (base / relpath).resolve()
     if base not in target.parents and target != base:
         raise PermissionError(f"path escape: {relpath}")
