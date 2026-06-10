@@ -117,7 +117,38 @@ if [ -n "$TASK_CLASS_FILTER" ]; then
   echo "  [warn] --task-class filter not yet implemented in reflection_run; ignoring" >&2
 fi
 
+_REFLECT_START_TS=$(date +%s)
+
 reflection_run "$SINCE"
 
 # ── trace end ─────────────────────────────────────────────────────────────────
-trace_write "{\"trace_id\":\"$TRACE_ID\",\"task_class\":\"__reflect__\",\"status\":\"success\"}" >/dev/null 2>&1 || true
+# The closing trace carries WHAT reflect did (traces analyzed, gradients
+# written) — a bare status:"success" row gave gradient_extract nothing to
+# learn from and the obs UI nothing to show (gradient: reflect traces
+# must carry payload).
+_REFLECT_END_TS=$(date +%s)
+TRACES_ANALYZED=$(sqlite3 "$MINI_ORK_DB" \
+  "SELECT COUNT(*) FROM execution_traces WHERE CAST(strftime('%s', created_at) AS INTEGER) >= ${SINCE} AND task_class != '__reflect__';" 2>/dev/null || echo 0)
+GRADIENTS_WRITTEN=$(sqlite3 "$MINI_ORK_DB" \
+  "SELECT COUNT(*) FROM gradient_records WHERE created_at >= ${_REFLECT_START_TS};" 2>/dev/null || echo 0)
+_REFLECT_PAYLOAD=$(python3 -c "
+import json, sys
+print(json.dumps({
+    'trace_id': sys.argv[1],
+    'task_class': '__reflect__',
+    'status': 'success',
+    'duration_ms': int(sys.argv[4]) * 1000,
+    # dict, not pre-dumped string — trace_write json.dumps's this field
+    'verifier_output': {
+        'traces_analyzed': int(sys.argv[2]),
+        'gradients_written': int(sys.argv[3]),
+        'since': int(sys.argv[5]),
+    },
+}))" "$TRACE_ID" "${TRACES_ANALYZED:-0}" "${GRADIENTS_WRITTEN:-0}" \
+     "$(( _REFLECT_END_TS - _REFLECT_START_TS ))" "$SINCE" 2>/dev/null)
+if [ -n "$_REFLECT_PAYLOAD" ]; then
+  trace_write "$_REFLECT_PAYLOAD" >/dev/null 2>&1 || true
+else
+  trace_write "{\"trace_id\":\"$TRACE_ID\",\"task_class\":\"__reflect__\",\"status\":\"success\"}" >/dev/null 2>&1 || true
+fi
+echo "reflect: analyzed ${TRACES_ANALYZED:-0} traces, wrote ${GRADIENTS_WRITTEN:-0} gradients (trace ${TRACE_ID})"
