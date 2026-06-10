@@ -86,6 +86,7 @@ quality axis has a different cognitive shape:
 - Edge cases is adversarial (what breaks?) → MiniMax at corner-case
   generation.
 
-Routing each axis to a different family minimizes cross-lens correlation
-ρ — exactly the Rajan 2025 / Nasser 2026 preconditions for multi-agent
-audit panels to actually catch more bugs than single-vendor coalitions.
+Routing each axis to a different family is a practical proxy for reducing
+cross-lens correlation. Rajan 2025 supports the low-correlation detector
+pattern; Nasser 2026 supports treating model/judge choice as a substantive
+source of evaluative disposition rather than an interchangeable detail.
