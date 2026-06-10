@@ -24,6 +24,12 @@ For each finding, report:
 - **Fix sketch**: 1-2 line proposal (concrete, not "consider
   optimizing")
 
+**Citation rule (hard requirement):** every finding MUST cite a
+`file:line` anchor drawn from a file you actually read. If you cannot
+point at a concrete line, DROP the finding rather than emit an
+unanchored claim. Unanchored findings fail verification and get the
+whole report re-flagged.
+
 ## Patterns to look for
 
 1. Unbounded loops (no depth caps, no `--maxdepth`)
