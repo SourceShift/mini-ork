@@ -1,0 +1,45 @@
+name: recipe_authoring
+version: "0.1.0"
+description: >
+  Meta-recipe authoring: given a natural-language epic, produce a complete
+  recipes/<derived_name>/ directory (workflow.yaml + prompts/ + verifiers/ +
+  artifact_contract.yaml + example-kickoff.md + README.md) via a heterogeneous
+  3-drafter panel + opus arbiter + verifier_smith + hard heterogeneity-floor
+  verifier. The framework eating its own dog food.
+
+matches:
+  keywords:
+    - recipe creator
+    - create recipe
+    - new recipe
+    - author recipe
+    - draft recipe
+    - recipe authoring
+    - meta recipe
+    - propose recipe
+    - generate recipe
+    - workflow yaml
+    - new workflow
+  regex: []
+
+artifact_contract_ref: artifact_contract.yaml
+default_workflow: workflow.yaml
+
+default_gates:
+  - budget_gate
+  - scope_gate
+
+risk_class: medium
+# Recipe authoring writes executable bash verifiers + commits a new
+# recipes/<name>/ dir. Higher review bar than read-only audits but
+# lower than code mutation in target codebases (rollback recoverable
+# by git revert of the publisher commit).
+
+cost_model:
+  min_usd: 2
+  max_usd: 25
+  per_drafter_usd: 4
+
+runtime_model:
+  min_minutes: 5
+  max_minutes: 45
