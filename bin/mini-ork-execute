@@ -178,10 +178,86 @@ export MINI_ORK_TASK_RUN_ID="${MINI_ORK_TASK_RUN_ID:-$(basename "$RUN_DIR")}"
 # the dir doesn't exist yet (we create it below).
 mkdir -p "$RUN_DIR" 2>/dev/null || true
 printf '%s\n' "$$" > "$RUN_DIR/.pid" 2>/dev/null || true
+# Crash/kill finalizer (defect #4 from run-1781081895-31571, 2026-06-10):
+# the dispatcher is the ONLY writer of task_runs.status, so dying between
+# node_start and node_end left status='executing' + a "running" DAG node
+# forever. On any non-zero exit with a non-terminal status: mark the run
+# failed/CRASH and emit synthetic node_end(CRASH) for dangling node_starts.
+# Guarded so it never clobbers a terminal status the publisher already set.
+# SIGKILL still bypasses this — covered by control.py kill_run writeback
+# and the read-time reconciliation in mini_ork/web/agents.py.
+_mo_crash_finalize() {
+  local _rc="$1"
+  [ "$_rc" -eq 0 ] && return 0
+  [ "${DRY_RUN:-0}" -eq 1 ] && return 0
+  [ -n "${MINI_ORK_DB:-}" ] && [ -f "$MINI_ORK_DB" ] || return 0
+  [ -n "${MINI_ORK_RUN_ID:-${MINI_ORK_TASK_RUN_ID:-}}" ] || return 0
+  python3 - "$MINI_ORK_DB" "${MINI_ORK_RUN_ID:-$MINI_ORK_TASK_RUN_ID}" "$_rc" <<'PY' 2>/dev/null || true
+import json, sqlite3, sys, time
+db, run_id, rc = sys.argv[1], sys.argv[2], sys.argv[3]
+now = int(time.time())
+TERMINAL = ("published", "rolled_back", "failed")
+con = sqlite3.connect(db, timeout=5.0)
+con.execute("PRAGMA busy_timeout = 5000")
+try:
+    cur = con.execute(
+        """
+        UPDATE task_runs
+           SET status = 'failed',
+               verdict = COALESCE(verdict, 'CRASH'),
+               updated_at = ?,
+               ended_at = COALESCE(ended_at, ?),
+               notes = COALESCE(notes || '; ', '') || 'dispatcher exited rc=' || ? || ' before terminal status — crash-finalized'
+         WHERE id = ? AND status NOT IN (?, ?, ?)
+        """,
+        (now, now, rc, run_id, *TERMINAL),
+    )
+    if cur.rowcount > 0:
+        # Close dangling node_starts so the UI DAG stops showing "running".
+        rows = con.execute(
+            """
+            SELECT event_type, payload_json FROM run_events
+             WHERE run_id = ? AND event_type IN ('node_start', 'node_end')
+            """,
+            (run_id,),
+        ).fetchall()
+        started, ended = {}, set()
+        for ev_type, pj in rows:
+            try:
+                p = json.loads(pj) if pj else {}
+            except json.JSONDecodeError:
+                p = {}
+            nid = p.get("node_id")
+            if not nid:
+                continue
+            if ev_type == "node_start":
+                started[nid] = p.get("node_type", "")
+            else:
+                ended.add(nid)
+        for nid, ntype in started.items():
+            if nid in ended:
+                continue
+            payload = {"node_id": nid, "node_type": ntype, "verdict": "CRASH",
+                       "interrupted": True, "duration_ms": 0}
+            con.execute(
+                "INSERT INTO run_events(event_id, run_id, event_type, payload_json, created_at) VALUES (?, ?, ?, ?, ?)",
+                (f"evt-node_end-{nid}-crashfinalize-{now}", run_id, "node_end", json.dumps(payload), now),
+            )
+    con.commit()
+finally:
+    con.close()
+PY
+}
+
 # Clean .pid on graceful exit so a finished run isn't kill-target.
-# The trap also closes the OTel root span and flushes the JSONL buffer
-# (both no-ops unless MO_OTEL=1; see lib/mo_otel.sh).
-trap '_rc=$?; rm -f "$RUN_DIR/.pid" 2>/dev/null || true; mo_otel_root_end "$_rc" 2>/dev/null || true; mo_otel_flush 2>/dev/null || true' EXIT
+# The trap also crash-finalizes status (no-op on rc=0), closes the OTel
+# root span and flushes the JSONL buffer (no-ops unless MO_OTEL=1).
+trap '_rc=$?; _mo_crash_finalize "$_rc" 2>/dev/null || true; rm -f "$RUN_DIR/.pid" 2>/dev/null || true; mo_otel_root_end "$_rc" 2>/dev/null || true; mo_otel_flush 2>/dev/null || true' EXIT
+# Convert SIGTERM/SIGINT (gtimeout cap, kill_run phase 1, Ctrl-C) into a
+# clean exit so the EXIT trap above actually runs. Without this, an
+# untrapped SIGTERM kills bash WITHOUT running the EXIT trap.
+trap 'exit 143' TERM
+trap 'exit 130' INT
 
 # D-031: propagate run dir to subagent subshells so claude `--print` calls
 # can find $MINI_ORK_RUN_DIR when writing lens-*.md / synthesis.md via Write
