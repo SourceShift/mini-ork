@@ -72,7 +72,7 @@ else
   _ok "claude $(claude --version 2>/dev/null | head -1 || echo '(version unknown)')"
 fi
 
-# shellcheck — optional
+# ShellCheck is optional.
 SHELLCHECK_PRESENT=1
 if ! command -v shellcheck >/dev/null 2>&1; then
   _skip "shellcheck not installed — static analysis skipped  (install: brew install shellcheck)"
