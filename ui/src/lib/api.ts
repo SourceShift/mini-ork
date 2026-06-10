@@ -110,6 +110,9 @@ export type TaskRun = {
   kickoff_path: string;
   plan_path: string | null;
   artifact_path: string | null;
+  /** Detail endpoint only: non-terminal run with no activity past the cutoff. */
+  stale?: boolean;
+  last_activity_at?: number;
 };
 
 export type ActiveRun = {
