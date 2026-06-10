@@ -79,42 +79,90 @@ PY
   echo "reflection_extract_gradients: extracted ${extracted} gradients since ${since_ts}" >&2
 }
 
-# desc: Deduplicate gradient_records table (merge identical target+signal pairs,
-#       keeping highest confidence). gradients_table defaults to "gradient_records".
+# desc: Deduplicate gradient_records table. Pass 1 merges identical
+#       target+signal pairs; pass 2 fuzzy-merges semantically-similar signals
+#       within (task_class, target) groups (difflib ratio on signal >=
+#       MO_DEDUP_FUZZY, default 0.55). Highest confidence wins in both passes.
+#       gradients_table defaults to "gradient_records".
 reflection_deduplicate() {
   local gradients_table="${1:-gradient_records}"
   # v0.2-pt7 (R6/F-18): bounded fetchall to prevent OOM at 10M+ rows.
   # Default cap MO_DEDUP_BATCH=10000; oldest-first ordering ensures
   # repeated runs eventually process the whole table without OOM.
   local _batch="${MO_DEDUP_BATCH:-10000}"
-  python3 - "${MINI_ORK_DB:?MINI_ORK_DB unset}" "$gradients_table" "$_batch" <<'PY'
-import sqlite3, json, sys
-db, tbl, batch = sys.argv[1], sys.argv[2], int(sys.argv[3])
+  local _fuzzy="${MO_DEDUP_FUZZY:-0.55}"
+  python3 - "${MINI_ORK_DB:?MINI_ORK_DB unset}" "$gradients_table" "$_batch" "$_fuzzy" <<'PY'
+import sqlite3, sys
+from difflib import SequenceMatcher
+
+db, tbl, batch, fuzzy = sys.argv[1], sys.argv[2], int(sys.argv[3]), float(sys.argv[4])
 con = sqlite3.connect(db)
 con.execute("PRAGMA busy_timeout=5000")  # v0.2-pt7 F-11
-# Find duplicate (target, signal) groups — keep highest confidence row.
 # LIMIT prevents O(table) memory bomb; repeated runs process all rows.
 rows = con.execute(f"""
-    SELECT gradient_id, target, signal, suggested_change, confidence, evidence
+    SELECT gradient_id, target, signal, suggested_change, confidence,
+           COALESCE(task_class,'')
     FROM {tbl}
-    ORDER BY target, signal, confidence DESC
+    ORDER BY confidence DESC, created_at ASC
     LIMIT ?
 """, (batch,)).fetchall()
 
-seen = {}
 to_delete = []
-for gid, tgt, sig, _, conf, _ in rows:
+
+# Pass 1 — exact (target, signal) merge, global across task_classes.
+# Rows arrive confidence-desc so the first seen per key is the keeper.
+seen = {}
+survivors = []
+for row in rows:
+    gid, tgt, sig = row[0], row[1], row[2]
     key = (tgt, sig)
     if key in seen:
-        to_delete.append(gid)   # lower-confidence duplicate
+        to_delete.append(gid)
     else:
         seen[key] = gid
+        survivors.append(row)
+
+# Pass 2 — fuzzy merge within (task_class, target) groups. Gradients from
+# repeated reflect runs phrase the same lesson slightly differently
+# ("verifier_output is an empty object '{}'" vs "verifier_output is an
+# empty object, meaning..."); exact-match dedup never catches these so the
+# table grows by ~5 near-identical rows per lifecycle. Greedy
+# confidence-desc scan: a row whose SIGNAL is similar to an already-kept
+# representative is deleted. Calibrated on live data 2026-06-10:
+# signal-only char ratio separates cleanly (cross-lesson pairs max 0.48,
+# same-lesson rephrases >= 0.55); including suggested_change in the
+# comparison muddied it (same-lesson pairs dropped to ~0.60 because
+# prescription phrasing diverges more than diagnosis phrasing).
+groups = {}
+for row in survivors:
+    groups.setdefault((row[5], row[1]), []).append(row)
+
+fuzzy_deleted = 0
+for grp in groups.values():
+    kept_texts = []
+    for gid, _tgt, sig, _change, _conf, _tc in grp:
+        text = sig
+        sm = SequenceMatcher(b=text, autojunk=False)
+        dup = False
+        for kt in kept_texts:
+            sm.set_seq1(kt)
+            if sm.real_quick_ratio() >= fuzzy and sm.quick_ratio() >= fuzzy \
+               and sm.ratio() >= fuzzy:
+                dup = True
+                break
+        if dup:
+            to_delete.append(gid)
+            fuzzy_deleted += 1
+        else:
+            kept_texts.append(text)
 
 if to_delete:
     placeholders = ",".join("?" * len(to_delete))
     con.execute(f"DELETE FROM {tbl} WHERE gradient_id IN ({placeholders})", to_delete)
     con.commit()
-    print(f"reflection_deduplicate: removed {len(to_delete)} duplicates", file=sys.stderr)
+    exact = len(to_delete) - fuzzy_deleted
+    print(f"reflection_deduplicate: removed {len(to_delete)} duplicates "
+          f"({exact} exact, {fuzzy_deleted} fuzzy@{fuzzy})", file=sys.stderr)
 else:
     print("reflection_deduplicate: no duplicates found", file=sys.stderr)
 con.close()
