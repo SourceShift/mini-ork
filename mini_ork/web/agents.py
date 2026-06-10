@@ -541,7 +541,9 @@ def _llm_rows_for_run(
                    duration_ms, status, finish_reason, ts, traceparent,
                    error_message, metadata_json
             FROM llm_calls
-            WHERE strftime('%s', ts) BETWEEN ? AND ?
+            -- CAST is load-bearing: strftime returns TEXT, and TEXT BETWEEN
+            -- INTEGER params is always false in SQLite (ints sort before text)
+            WHERE CAST(strftime('%s', ts) AS INTEGER) BETWEEN ? AND ?
             """,
             (int(created_at), int(upper)),
         ):
