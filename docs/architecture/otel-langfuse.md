@@ -1,11 +1,17 @@
 # OpenTelemetry + Langfuse integration
 
-> Status: **partially implemented**. `mini_ork/otel_export.py` builds the
+> Status: **implemented**. `mini_ork/otel_export.py` builds the
 > task_run → agent → llm_call span tree from state.db and exports it as
 > OTLP/JSON (env-gated on `LANGFUSE_PUBLIC_KEY`/`LANGFUSE_SECRET_KEY`,
 > `--dry-run` prints the payload; tests in `tests/test_otel_export.py`).
-> Live in-process span emission (`lib/mo_otel.sh` wiring points below)
-> remains design-only.
+> Live in-process span emission is wired: `MO_OTEL=1` makes
+> `bin/mini-ork-execute` buffer lifecycle events to
+> `$MINI_ORK_RUN_DIR/.otel-spans.jsonl` via `lib/mo_otel.sh` (root span at
+> startup/EXIT trap, agent spans piggybacked on the node-end trap in
+> `lib/mo_node_events.sh`) and flush at run end through
+> `python3 -m mini_ork.otel_export --from-jsonl` — which joins the
+> llm_call layer from state.db, POSTs, and renames the buffer to `*.sent`
+> on success (it survives otherwise, for resync).
 
 ## Why
 
@@ -82,14 +88,23 @@ export LANGFUSE_SECRET_KEY="sk-lf-..."
 - `traceparent` LIKE matching in obs UI ← **done** (string trace_id today)
 - W3C traceparent shape `00-{traceid}-{spanid}-01` ← **done** (hex TBD)
 
-## What needs building (~1 day)
+## What's built
 
-1. **0019 migration**: add `task_runs.otel_trace_id TEXT` (32-hex)
-2. **`lib/mo_otel.sh`** helper (~150 LOC bash + small python module)
-3. **`mini_ork/otel.py`** OTLP exporter (~100 LOC using
-   `opentelemetry-sdk` + `opentelemetry-exporter-otlp-proto-http`)
-4. **Wire** into `bin/mini-ork-execute` at 3 points
-5. **UI**: Langfuse deep-link from task_run header
+1. **`mini_ork/otel_export.py`** — stdlib-only OTLP/JSON exporter; offline
+   mode (`<task_run_id>`, reads state.db) and live mode (`--from-jsonl`,
+   reads the run buffer + joins llm_calls). 32-hex trace_ids derived
+   deterministically from task_run_id (`sha256` prefix) — no migration
+   needed; live and offline exports of the same run collide on
+   traceId/spanId so the backend dedupes.
+2. **`lib/mo_otel.sh`** — bash span buffer (root_begin/root_end/agent
+   events as JSONL; `MO_OTEL=1` gated; every entry point returns 0).
+3. **Wired** into `bin/mini-ork-execute` (source + root_begin after
+   `MINI_ORK_RUN_DIR` export; root_end + flush in the EXIT trap) and
+   `lib/mo_node_events.sh` (`mo_node_emit_end_trap` emits the agent span).
+
+## What's left
+
+- **UI**: Langfuse deep-link from task_run header
 
 ## Failure modes & guards
 

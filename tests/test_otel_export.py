@@ -11,7 +11,12 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from mini_ork.otel_export import build_payload, export
+from mini_ork.otel_export import (
+    build_payload,
+    build_payload_from_jsonl,
+    export,
+    export_jsonl,
+)
 
 RUN_ID = "run-1700000000-12345"
 
@@ -127,3 +132,87 @@ def test_cli_dry_run_emits_valid_otlp_json(db):
     payload = json.loads(out.stdout)
     assert payload["resourceSpans"][0]["resource"]["attributes"][0]["key"] == "service.name"
     assert len(_spans(payload)) == 5
+
+
+# ── live JSONL buffer mode (lib/mo_otel.sh flush path) ───────────────────────
+
+@pytest.fixture()
+def jsonl(tmp_path):
+    path = tmp_path / ".otel-spans.jsonl"
+    events = [
+        {"type": "root_begin", "task_run_id": RUN_ID, "start_ms": 1700000000000},
+        {"type": "agent", "node_id": "researcher", "node_type": "researcher",
+         "start_ms": 1700000010000, "end_ms": 1700000035000, "verdict": ""},
+        {"type": "agent", "node_id": "reviewer", "node_type": "reviewer",
+         "start_ms": 1700000040000, "end_ms": 1700000049000, "verdict": "REQUEST_CHANGES"},
+        {"type": "root_end", "end_ms": 1700000100000, "status": "success"},
+    ]
+    path.write_text("".join(json.dumps(e) + "\n" for e in events))
+    return str(path)
+
+
+def test_jsonl_span_tree_shape(jsonl):
+    spans = _spans(build_payload_from_jsonl(jsonl))
+    assert len(spans) == 3  # root + 2 agents (no db join)
+
+    root = spans[0]
+    assert root["name"] == f"task_run {RUN_ID}"
+    assert "parentSpanId" not in root
+    assert root["startTimeUnixNano"] == str(1700000000000 * 1_000_000)
+    assert root["endTimeUnixNano"] == str(1700000100000 * 1_000_000)
+    assert root["status"]["code"] == 1
+
+    agents = {s["name"]: s for s in spans[1:]}
+    assert set(agents) == {"agent researcher", "agent reviewer"}
+    for a in agents.values():
+        assert a["parentSpanId"] == root["spanId"]
+        assert a["traceId"] == root["traceId"]
+    assert agents["agent reviewer"]["status"]["code"] == 2  # REQUEST_CHANGES -> ERROR
+
+
+def test_jsonl_ids_match_offline_exporter(db, jsonl):
+    """Live + offline exports of the same run must collide on trace/root IDs
+    so the backend dedupes instead of double-counting."""
+    live = _spans(build_payload_from_jsonl(jsonl))
+    offline = _spans(build_payload(db, RUN_ID))
+    assert live[0]["traceId"] == offline[0]["traceId"]
+    assert live[0]["spanId"] == offline[0]["spanId"]
+
+
+def test_jsonl_joins_llm_calls_from_db(db, jsonl):
+    spans = _spans(build_payload_from_jsonl(jsonl, db_path=db))
+    assert len(spans) == 5  # root + 2 agents + 2 llm_calls
+    agents = {s["name"]: s for s in spans if s["name"].startswith("agent ")}
+    llm = {s["name"]: s for s in spans if s["name"].startswith("llm_call ")}
+    assert llm["llm_call researcher"]["parentSpanId"] == agents["agent researcher"]["spanId"]
+    assert llm["llm_call reviewer"]["parentSpanId"] == agents["agent reviewer"]["spanId"]
+
+
+def test_jsonl_missing_root_begin_exits(tmp_path):
+    path = tmp_path / "bad.jsonl"
+    path.write_text(json.dumps({"type": "agent", "node_id": "x"}) + "\n")
+    with pytest.raises(SystemExit):
+        build_payload_from_jsonl(str(path))
+
+
+def test_jsonl_root_end_fallback_to_max_agent_end(jsonl):
+    lines = [l for l in Path(jsonl).read_text().splitlines() if '"root_end"' not in l]
+    Path(jsonl).write_text("\n".join(lines) + "\n")
+    spans = _spans(build_payload_from_jsonl(jsonl))
+    assert spans[0]["endTimeUnixNano"] == str(1700000049000 * 1_000_000)
+
+
+def test_export_jsonl_renames_buffer_on_post(jsonl, monkeypatch):
+    import mini_ork.otel_export as mod
+    monkeypatch.setattr(mod, "_deliver", lambda payload, dry_run: True)
+    assert export_jsonl(jsonl, None, dry_run=False) == 0
+    assert not Path(jsonl).exists()
+    assert Path(jsonl + ".sent").exists()
+
+
+def test_export_jsonl_keeps_buffer_without_creds(jsonl, monkeypatch, capsys):
+    monkeypatch.delenv("LANGFUSE_PUBLIC_KEY", raising=False)
+    monkeypatch.delenv("LANGFUSE_SECRET_KEY", raising=False)
+    assert export_jsonl(jsonl, None, dry_run=False) == 0
+    assert Path(jsonl).exists()  # survives for resync
+    assert "no-op" in capsys.readouterr().err

@@ -179,13 +179,20 @@ export MINI_ORK_TASK_RUN_ID="${MINI_ORK_TASK_RUN_ID:-$(basename "$RUN_DIR")}"
 mkdir -p "$RUN_DIR" 2>/dev/null || true
 printf '%s\n' "$$" > "$RUN_DIR/.pid" 2>/dev/null || true
 # Clean .pid on graceful exit so a finished run isn't kill-target.
-trap 'rm -f "$RUN_DIR/.pid" 2>/dev/null || true' EXIT
+# The trap also closes the OTel root span and flushes the JSONL buffer
+# (both no-ops unless MO_OTEL=1; see lib/mo_otel.sh).
+trap '_rc=$?; rm -f "$RUN_DIR/.pid" 2>/dev/null || true; mo_otel_root_end "$_rc" 2>/dev/null || true; mo_otel_flush 2>/dev/null || true' EXIT
 
 # D-031: propagate run dir to subagent subshells so claude `--print` calls
 # can find $MINI_ORK_RUN_DIR when writing lens-*.md / synthesis.md via Write
 # tool. Without this, subagents pick their own (often stale) run dir based
 # on filesystem scan, breaking the recipe's expected artifact layout.
 export MINI_ORK_RUN_DIR="$RUN_DIR"
+
+# Live OTel span buffering (MO_OTEL=1 gated; best-effort, never breaks runs).
+# shellcheck source=/dev/null
+source "$MINI_ORK_ROOT/lib/mo_otel.sh" 2>/dev/null || true
+declare -f mo_otel_root_begin >/dev/null 2>&1 && mo_otel_root_begin "$MINI_ORK_TASK_RUN_ID"
 
 # v0.2-pt23 (D-048 fix): enable rich-trace capture in lib/llm-dispatch.sh
 # so every dispatch emits a `.tool-summary` sidecar with tool_calls +
