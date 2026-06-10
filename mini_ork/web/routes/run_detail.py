@@ -395,7 +395,7 @@ def get_learning(
                 {
                     "name": "prior_similar_runs",
                     "where": "bin/mini-ork-plan (context_prior_runs_md)",
-                    "how": "outcomes of the 5 most recent same-task_class execution_traces (excluding this run's own) are appended as a 'Prior runs' block to the planner prompt.",
+                    "how": "per-run outcomes (nodes, failures, cost, duration) of the 5 most recent same-task_class runs — grouped by run_id, excluding this run's own traces — are appended as a 'Prior runs' block to the planner prompt.",
                     "wired": True,
                 },
             ],

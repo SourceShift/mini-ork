@@ -2,6 +2,17 @@
 # Verifier for obs-smoke: checks the researcher wrote lens-tiny.md and the
 # reviewer's JSON verdict exists. Deterministic — no LLM cost.
 #
+# Beyond existence, asserts:
+#   - lens-tiny.md content SHAPE: first non-blank line is a markdown header,
+#     >=4 non-blank lines, and no chat-transcript markers (<z-insight>) —
+#     catches the harness overwriting the agent-written artifact with the
+#     agent's reply text (gradient 0.95).
+#   - review-tiny_reviewer.json is valid JSON with verdict in {pass,fail}.
+#   - telemetry: this run's researcher/reviewer traces exist in
+#     execution_traces with non-null run_id and evidence of work
+#     (tool_calls or files_written non-empty). Skipped (not failed) when
+#     MINI_ORK_DB / run id are not in scope (ad-hoc invocation).
+#
 # Emits JSON to stdout (consumed by bin/mini-ork-execute) + writes the
 # canonical verifier-result-lens-exists.json sidecar to the run dir.
 
@@ -11,40 +22,116 @@ RUN_DIR="${MINI_ORK_RUN_DIR:-.}"
 LENS="$RUN_DIR/lens-tiny.md"
 REVIEW="$RUN_DIR/review-tiny_reviewer.json"
 
-pass=true
-reasons=()
+result=$(python3 - "$LENS" "$REVIEW" <<'PY'
+import json, os, re, sqlite3, sys
 
-if [ ! -f "$LENS" ]; then
-  pass=false
-  reasons+=("lens-tiny.md missing at $LENS")
-elif [ "$(wc -c < "$LENS" | tr -d ' ')" -lt 30 ]; then
-  pass=false
-  reasons+=("lens-tiny.md too small (<30 bytes — researcher likely no-op'd)")
-fi
+lens_path, review_path = sys.argv[1], sys.argv[2]
+reasons = []
+checks = {}
 
-if [ ! -f "$REVIEW" ]; then
-  pass=false
-  reasons+=("review-tiny_reviewer.json missing at $REVIEW")
-fi
+# --- lens-tiny.md: existence + content shape ----------------------------
+if not os.path.isfile(lens_path):
+    reasons.append(f"lens-tiny.md missing at {lens_path}")
+    checks["lens_exists"] = False
+else:
+    checks["lens_exists"] = True
+    with open(lens_path, encoding="utf-8", errors="replace") as f:
+        content = f.read()
+    if len(content) < 30:
+        reasons.append("lens-tiny.md too small (<30 bytes — researcher likely no-op'd)")
+    lines = [l for l in content.splitlines() if l.strip()]
+    shape_ok = True
+    if not lines or not lines[0].lstrip().startswith("#"):
+        shape_ok = False
+        reasons.append("lens-tiny.md first non-blank line is not a markdown header — "
+                       "content is not the lens the researcher was asked to write")
+    if len(lines) < 4:
+        shape_ok = False
+        reasons.append(f"lens-tiny.md has {len(lines)} non-blank lines (<4) — incomplete lens")
+    if "<z-insight>" in content:
+        shape_ok = False
+        reasons.append("lens-tiny.md contains <z-insight> chat-transcript marker — "
+                       "harness overwrote the agent-written artifact with reply text")
+    checks["lens_shape"] = shape_ok
 
-# Emit JSON to stdout (consumed by the executor) + write sidecar.
-# Pass bash state via env vars to keep the python clean.
-export MO_PASS="$pass" MO_LENS="$LENS" MO_REVIEW="$REVIEW"
-MO_REASONS=$(printf '%s\n' "${reasons[@]}")
-export MO_REASONS
+# --- review-tiny_reviewer.json: existence + valid verdict ---------------
+if not os.path.isfile(review_path):
+    reasons.append(f"review-tiny_reviewer.json missing at {review_path}")
+    checks["review_exists"] = False
+else:
+    checks["review_exists"] = True
+    try:
+        with open(review_path, encoding="utf-8", errors="replace") as f:
+            review = json.load(f)
+        verdict = review.get("verdict")
+        if verdict not in ("pass", "fail"):
+            reasons.append(f"review verdict {verdict!r} not in {{pass,fail}}")
+            checks["review_verdict"] = False
+        else:
+            checks["review_verdict"] = True
+    except (json.JSONDecodeError, ValueError) as e:
+        reasons.append(f"review-tiny_reviewer.json is not valid JSON: {e}")
+        checks["review_verdict"] = False
 
-result=$(python3 - <<'PY'
-import json, os
-reasons = [l.strip() for l in os.environ.get('MO_REASONS','').split('\n') if l.strip()]
+# --- telemetry: this run's LLM-node traces -------------------------------
+db = os.environ.get("MINI_ORK_DB", "")
+run_id = (os.environ.get("MINI_ORK_TASK_RUN_ID")
+          or os.environ.get("MINI_ORK_RUN_ID") or "")
+if db and os.path.isfile(db) and run_id:
+    try:
+        con = sqlite3.connect(db)
+        con.execute("PRAGMA busy_timeout=5000")
+        rows = con.execute(
+            "SELECT trace_id, run_id, tool_calls, files_written "
+            "FROM execution_traces WHERE run_id = ? AND "
+            "(trace_id LIKE 'tr-researcher-%' OR trace_id LIKE 'tr-reviewer-%')",
+            (run_id,)).fetchall()
+        con.close()
+        if not rows:
+            reasons.append(f"telemetry: no researcher/reviewer traces for run {run_id} "
+                           "in execution_traces")
+            checks["telemetry_traces"] = False
+        else:
+            checks["telemetry_traces"] = True
+            for trace_id, trow_run, tool_calls, files_written in rows:
+                if not trow_run:
+                    reasons.append(f"telemetry: {trace_id} has NULL run_id")
+                    checks["telemetry_run_id"] = False
+
+                def nonempty(v):
+                    try:
+                        x = json.loads(v) if isinstance(v, str) else v
+                        if isinstance(x, str):  # double-encoded
+                            x = json.loads(x)
+                        return bool(x)
+                    except (json.JSONDecodeError, TypeError, ValueError):
+                        return bool(v and v not in ("[]", '"[]"'))
+                if not (nonempty(tool_calls) or nonempty(files_written)):
+                    reasons.append(f"telemetry: {trace_id} has empty tool_calls AND "
+                                   "files_written — no evidence of work recorded")
+                    checks["telemetry_work_evidence"] = False
+            checks.setdefault("telemetry_run_id", True)
+            checks.setdefault("telemetry_work_evidence", True)
+    except sqlite3.Error as e:
+        reasons.append(f"telemetry: db query failed: {e}")
+        checks["telemetry_traces"] = False
+else:
+    checks["telemetry"] = "skipped (no MINI_ORK_DB or run id in scope)"
+
+passed = not reasons
 print(json.dumps({
-    'verifier': 'lens-exists',
-    'pass': os.environ.get('MO_PASS') == 'true',
-    'reasons': reasons,
-    'lens_path': os.environ.get('MO_LENS', ''),
-    'review_path': os.environ.get('MO_REVIEW', ''),
+    "verifier": "lens-exists",
+    "pass": passed,
+    "reasons": reasons,
+    "checks": checks,
+    "lens_path": lens_path,
+    "review_path": review_path,
 }))
+sys.exit(0)
 PY
 )
 echo "$result"
 # Persist the sidecar for the obs UI's Why? panel to consume
 echo "$result" > "${RUN_DIR}/verifier-result-lens-exists.json" 2>/dev/null || true
+# Exit reflects the verdict so the executor's verifier gate sees failures.
+python3 -c "import json,sys; sys.exit(0 if json.loads(sys.argv[1]).get('pass') else 1)" "$result"
