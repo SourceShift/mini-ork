@@ -154,7 +154,7 @@ gradient_extract() {
   # Default: call LLM via llm-dispatch.sh
   # shellcheck source=lib/llm-dispatch.sh
   source "${MINI_ORK_ROOT}/lib/llm-dispatch.sh" 2>/dev/null || true
-  if ! declare -f mo_llm_dispatch > /dev/null 2>&1; then
+  if ! declare -f llm_dispatch > /dev/null 2>&1; then
     echo "gradient_extract: llm-dispatch.sh not loaded" >&2
     return 1
   fi
@@ -164,9 +164,14 @@ gradient_extract() {
   tmp_out="$(mktemp -t gradient_extract.XXXXXX)"
   local model="${MINI_ORK_GRADIENT_MODEL:-sonnet}"
 
-  if ! mo_llm_dispatch "$model" "$prompt" "$tmp_out" 120 5; then
+  # Route via the llm_dispatch shim (not mo_llm_dispatch directly) so this
+  # path emits llm_calls ledger rows + respects the cost circuit breaker.
+  # Shim cats the out-file to stdout; silence it — we parse $tmp_out below.
+  if ! llm_dispatch --model "$model" --node-type gradient-extract \
+         --prompt-text "$prompt" --out "$tmp_out" \
+         --timeout 120 --max-turns 5 >/dev/null; then
     echo "gradient_extract: LLM dispatch failed" >&2
-    rm -f "$tmp_out" "${tmp_out}.err.log"
+    rm -f "$tmp_out" "${tmp_out}.err.log" "${tmp_out}.shim.err"
     return 1
   fi
 
