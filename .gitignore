@@ -3,12 +3,16 @@ node_modules/
 
 # State + secrets
 *.db
+*.db-shm
+*.db-wal
 .env
 .env.local
 .mini-ork/runs/
 .mini-ork/INBOX/
 .mini-ork/locks/
 .mini-ork/secrets/
+.mini-ork/state/
+.mini-ork/worktrees/
 # v0.2-pt16 (SAFETY): cl_*.sh wrappers source secrets.local.sh per-dispatch
 # (see lib/providers/cl_glm.sh comment block). The documented path is
 # ${MINI_ORK_HOME}/config/secrets.local.sh — must be ignored everywhere
@@ -20,10 +24,15 @@ node_modules/
 
 # Build artifacts
 dist/
+design/
 
 # Temp + logs
 /tmp/
 *.log
+__pycache__/
+*.pyc
+# verify step writes verifier-result-*.json to cwd on direct runs
+/verifier-result-*.json
 
 # OS
 .DS_Store
@@ -32,3 +41,4 @@ dist/
 .claude/settings.local.json
 
 .mini-ork/state.db
+docs/blog/
