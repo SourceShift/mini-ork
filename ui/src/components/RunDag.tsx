@@ -1,4 +1,4 @@
-import { useMemo } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useNavigate } from "@tanstack/react-router";
 import {
   Background,
@@ -6,6 +6,7 @@ import {
   Handle,
   type Node,
   type Edge,
+  Panel,
   Position,
   ReactFlow,
 } from "@xyflow/react";
@@ -17,7 +18,11 @@ import { familyColor } from "@/lib/format";
 const NODE_W = 150;
 const NODE_H = 82;
 
-function layout(nodes: DagNode[], edges: DagEdge[]): { nodes: Node[]; edges: Edge[] } {
+function layout(
+  nodes: DagNode[],
+  edges: DagEdge[],
+  statusOf: (name: string) => string,
+): { nodes: Node[]; edges: Edge[] } {
   // Simple longest-path layering (Sugiyama-light): topological depth → x,
   // ordinal within layer → y. Good enough for ≤20-node recipe DAGs without
   // pulling in dagre.
@@ -72,39 +77,85 @@ function layout(nodes: DagNode[], edges: DagEdge[]): { nodes: Node[]; edges: Edg
     };
   });
 
-  const flowEdges: Edge[] = edges.map((e, i) => ({
-    id: `e${i}`,
-    source: e.from,
-    target: e.to,
-    label: e.edge_type === "depends_on" ? undefined : e.edge_type,
-    labelStyle: { fontSize: 9, fill: "var(--tx-4)", fontFamily: "var(--mono)" },
-    style: { stroke: "#242e35", strokeWidth: 1.2 },
-    animated: false,
-  }));
+  const flowEdges: Edge[] = edges.map((e, i) => {
+    const targetStatus = statusOf(e.to);
+    const live = targetStatus === "running" || targetStatus === "startup";
+    return {
+      id: `e${i}`,
+      source: e.from,
+      target: e.to,
+      label: e.edge_type === "depends_on" ? undefined : e.edge_type,
+      labelStyle: { fontSize: 9, fill: "var(--tx-4)", fontFamily: "var(--mono)" },
+      style: {
+        stroke: live ? STATUS_STYLE.running!.ring : "#242e35",
+        strokeWidth: live ? 1.6 : 1.2,
+        opacity: live ? 0.9 : 1,
+      },
+      animated: live,
+    };
+  });
 
   return { nodes: flowNodes, edges: flowEdges };
 }
 
-const STATUS_STYLE: Record<string, { ring: string; dot: string; opacity: number; label: string }> = {
-  never_seen: { ring: "#64748b", dot: "#64748b", opacity: 0.62, label: "queued" },
-  startup:    { ring: "#f59e0b", dot: "#f59e0b", opacity: 1.0,  label: "startup" },
-  running:    { ring: "#22c55e", dot: "#22c55e", opacity: 1.0,  label: "running" },
-  done:       { ring: "#c084fc", dot: "#c084fc", opacity: 1.0,  label: "succeeded" },
-  failed:     { ring: "#ef4444", dot: "#ef4444", opacity: 1.0,  label: "failed" },
+const STATUS_STYLE: Record<
+  string,
+  { ring: string; opacity: number; label: string; dashed?: boolean }
+> = {
+  never_seen: { ring: "#64748b", opacity: 0.55, label: "queued", dashed: true },
+  startup:    { ring: "#f59e0b", opacity: 1.0,  label: "startup" },
+  running:    { ring: "#38bdf8", opacity: 1.0,  label: "running" },
+  done:       { ring: "#22c55e", opacity: 1.0,  label: "done" },
+  failed:     { ring: "#ef4444", opacity: 1.0,  label: "failed" },
 };
+
+const LEGEND_ORDER = ["never_seen", "running", "done", "failed"] as const;
 
 function visualStatus(n: DagNode): string {
   if (n.status === "running" && !n.started_at) return "startup";
   return n.status ?? "never_seen";
 }
 
+function StatusBadge({ status, ring }: { status: string; ring: string }) {
+  if (status === "done")
+    return (
+      <span
+        className="absolute right-9 top-0 grid h-4 w-4 place-items-center rounded-full border bg-[var(--bg)] text-[10px] font-bold"
+        style={{ borderColor: ring, color: ring }}
+      >
+        ✓
+      </span>
+    );
+  if (status === "failed")
+    return (
+      <span
+        className="absolute right-9 top-0 grid h-4 w-4 place-items-center rounded-full border bg-[var(--bg)] text-[10px] font-bold"
+        style={{ borderColor: ring, color: ring }}
+      >
+        !
+      </span>
+    );
+  if (status === "running" || status === "startup")
+    return (
+      <span
+        className="absolute right-9 top-0 grid h-4 w-4 place-items-center rounded-full border bg-[var(--bg)]"
+        style={{ borderColor: ring }}
+      >
+        <span
+          className="h-1.5 w-1.5 rounded-full"
+          style={{ background: ring, animation: "ork-ping 1.2s ease-out infinite" }}
+        />
+      </span>
+    );
+  return null;
+}
+
 function OrkNode({ data }: { data: { node: DagNode } }) {
   const n = data.node;
   const status = visualStatus(n);
-  const s = STATUS_STYLE[status]!;
-  const color = n.family ? familyColor(n.family) : s.ring;
-  const failed = status === "failed";
-  const running = status === "running";
+  const s = STATUS_STYLE[status] ?? STATUS_STYLE.never_seen!;
+  const family = n.family ? familyColor(n.family) : "#64748b";
+  const running = status === "running" || status === "startup";
   return (
     <div
       className="relative grid place-items-center text-xs"
@@ -123,33 +174,43 @@ function OrkNode({ data }: { data: { node: DagNode } }) {
         {running && (
           <span
             className="absolute top-0 h-12 w-12 rounded-full border opacity-50"
-            style={{ borderColor: "var(--grn)", animation: "ork-ping 1.8s ease-out infinite" }}
+            style={{ borderColor: s.ring, animation: "ork-ping 1.8s ease-out infinite" }}
           />
         )}
         <svg width="54" height="54" viewBox="0 0 54 54" aria-hidden="true">
+          {/* Outer ring = lifecycle status; inner glyph = model family. */}
           <polygon
-            points={hexPoints(27, 27, 22)}
-            fill={failed ? "var(--w-red)" : color}
-            fillOpacity={failed ? 0.75 : 0.16}
-            stroke={failed ? "var(--red)" : color}
-            strokeWidth={failed ? 2.1 : 1.6}
+            points={hexPoints(27, 27, 25)}
+            fill="none"
+            stroke={s.ring}
+            strokeWidth={status === "failed" ? 2.4 : 1.9}
+            strokeDasharray={s.dashed ? "4 3" : undefined}
           />
-          <path d="M18 23 L23 25 M36 23 L31 25" stroke={failed ? "var(--red)" : color} strokeWidth="2" strokeLinecap="round" />
-          <circle cx="21" cy="27" r="1.8" fill={failed ? "var(--red)" : color} />
-          <circle cx="33" cy="27" r="1.8" fill={failed ? "var(--red)" : color} />
-          <path d="M23 37 L21.8 31 M31 37 L32.2 31" stroke={failed ? "var(--red)" : color} strokeWidth="2" strokeLinecap="round" />
-          <path d="M24 34 Q27 37 30 34" stroke={failed ? "var(--red)" : color} strokeWidth="1.5" fill="none" strokeLinecap="round" opacity="0.75" />
+          <polygon
+            points={hexPoints(27, 27, 20)}
+            fill={status === "failed" ? "var(--w-red)" : family}
+            fillOpacity={status === "failed" ? 0.6 : 0.16}
+            stroke={family}
+            strokeWidth={1.3}
+          />
+          <path d="M19 24 L23.5 25.8 M35 24 L30.5 25.8" stroke={family} strokeWidth="2" strokeLinecap="round" />
+          <circle cx="21.5" cy="27.5" r="1.7" fill={family} />
+          <circle cx="32.5" cy="27.5" r="1.7" fill={family} />
+          <path d="M23.5 36 L22.4 31 M30.5 36 L31.6 31" stroke={family} strokeWidth="2" strokeLinecap="round" />
+          <path d="M24.5 33.5 Q27 36 29.5 33.5" stroke={family} strokeWidth="1.4" fill="none" strokeLinecap="round" opacity="0.75" />
         </svg>
-        {failed && (
-          <span className="absolute right-10 top-1 grid h-4 w-4 place-items-center rounded-full border border-[var(--red)] bg-[var(--bg)] text-[10px] text-[var(--red)]">
-            !
-          </span>
-        )}
+        <StatusBadge status={status} ring={s.ring} />
         <div className="mt-1 max-w-[140px] truncate text-center font-mono text-[10.5px] font-bold text-ink-200">
           {n.name}
         </div>
-        <div className="max-w-[140px] truncate text-center font-mono text-[9px] text-ink-500">
-          {s.label}{n.duration_ms ? ` · ${Math.round(n.duration_ms / 1000)}s` : ""}
+        <div
+          className="max-w-[140px] truncate text-center font-mono text-[9px] font-semibold"
+          style={{ color: s.ring }}
+        >
+          {s.label}
+          {n.duration_ms ? (
+            <span className="font-normal text-ink-500"> · {Math.round(n.duration_ms / 1000)}s</span>
+          ) : null}
         </div>
       </div>
       <Handle type="source" position={Position.Right} className="!bg-ink-500" />
@@ -166,6 +227,36 @@ function hexPoints(x: number, y: number, r: number): string {
   return points.join(" ");
 }
 
+function Legend() {
+  return (
+    <div
+      className="flex items-center gap-3 rounded-[3px] border border-[var(--hair)] bg-[var(--panel-2)] px-2.5 py-1.5"
+      data-testid="dag-legend"
+    >
+      {LEGEND_ORDER.map((key) => {
+        const s = STATUS_STYLE[key]!;
+        return (
+          <span key={key} className="flex items-center gap-1.5 font-mono text-[9.5px] text-ink-400">
+            <svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true">
+              <polygon
+                points={hexPoints(6, 6, 5)}
+                fill="none"
+                stroke={s.ring}
+                strokeWidth={1.5}
+                strokeDasharray={s.dashed ? "2.5 2" : undefined}
+              />
+            </svg>
+            {s.label}
+          </span>
+        );
+      })}
+      <span className="border-l border-[var(--hair)] pl-3 font-mono text-[9.5px] text-ink-500">
+        glyph colour = model family
+      </span>
+    </div>
+  );
+}
+
 export function RunDag({
   nodes,
   edges,
@@ -177,8 +268,21 @@ export function RunDag({
   taskRunId?: string;
   compact?: boolean;
 }) {
-  const { nodes: fNodes, edges: fEdges } = useMemo(() => layout(nodes, edges), [nodes, edges]);
+  const [fullscreen, setFullscreen] = useState(false);
+  const { nodes: fNodes, edges: fEdges } = useMemo(() => {
+    const byName = new Map(nodes.map((n) => [n.name, visualStatus(n)]));
+    return layout(nodes, edges, (name) => byName.get(name) ?? "never_seen");
+  }, [nodes, edges]);
   const navigate = useNavigate();
+
+  useEffect(() => {
+    if (!fullscreen) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setFullscreen(false);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [fullscreen]);
 
   if (!nodes.length)
     return (
@@ -189,10 +293,16 @@ export function RunDag({
 
   return (
     <div
-      className={`${compact ? "h-[330px]" : "h-[420px]"} rounded-[3px] border border-[var(--hair)] bg-[var(--panel)]`}
+      className={
+        fullscreen
+          ? "fixed inset-0 z-50 bg-[var(--bg)]"
+          : `${compact ? "h-[330px]" : "h-[420px]"} rounded-[3px] border border-[var(--hair)] bg-[var(--panel)]`
+      }
       data-testid="dag-canvas"
+      data-fullscreen={fullscreen}
     >
       <ReactFlow
+        key={fullscreen ? "dag-fs" : "dag-inline"}
         nodes={fNodes}
         edges={fEdges}
         nodeTypes={{ ork: OrkNode }}
@@ -212,6 +322,20 @@ export function RunDag({
       >
         <Background color="#1a2228" gap={22} />
         <Controls className="!border-[var(--hair-2)] !bg-[var(--panel-2)] !text-ink-400" />
+        <Panel position="top-left">
+          <Legend />
+        </Panel>
+        <Panel position="top-right">
+          <button
+            type="button"
+            className="rounded-[3px] border border-[var(--hair)] bg-[var(--panel-2)] px-2 py-1 font-mono text-[10px] text-ink-300 hover:border-[var(--hair-2)] hover:text-ink-100"
+            data-testid="dag-fullscreen-toggle"
+            onClick={() => setFullscreen((v) => !v)}
+            title={fullscreen ? "Exit fullscreen (Esc)" : "Fullscreen"}
+          >
+            {fullscreen ? "✕ exit fullscreen" : "⛶ fullscreen"}
+          </button>
+        </Panel>
       </ReactFlow>
     </div>
   );
