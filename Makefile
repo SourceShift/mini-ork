@@ -122,7 +122,7 @@ web-up:
 dev-all: web-up
 
 web-test:
-	@python3 -m pytest tests/test_web_smoke.py -v
+	@python3 -m pytest tests/test_web_smoke.py tests/test_otel_export.py -v
 	@bash tests/test_self_improve_outcome.sh
 	@MINI_ORK_OBS_SMOKE_DRY=1 bash tests/test_obs_surface.sh
 	@echo ""

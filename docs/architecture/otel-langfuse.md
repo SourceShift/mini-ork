@@ -1,7 +1,11 @@
 # OpenTelemetry + Langfuse integration
 
-> Status: **design** (not yet implemented). Sketches the path from current
-> sqlite-only telemetry to full OTel spans exported to Langfuse.
+> Status: **partially implemented**. `mini_ork/otel_export.py` builds the
+> task_run → agent → llm_call span tree from state.db and exports it as
+> OTLP/JSON (env-gated on `LANGFUSE_PUBLIC_KEY`/`LANGFUSE_SECRET_KEY`,
+> `--dry-run` prints the payload; tests in `tests/test_otel_export.py`).
+> Live in-process span emission (`lib/mo_otel.sh` wiring points below)
+> remains design-only.
 
 ## Why
 
