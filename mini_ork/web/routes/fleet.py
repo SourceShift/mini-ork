@@ -142,7 +142,12 @@ def list_task_runs(
     return db.rows(
         f"""
         SELECT id, task_class, recipe, workflow_version, status, verdict,
-               cost_usd, duration_ms, created_at, updated_at, ended_at, trace_id,
+               cost_usd,
+               COALESCE(NULLIF(duration_ms, 0),
+                        CASE WHEN ended_at IS NOT NULL
+                             THEN MAX(ended_at - created_at, 0) * 1000 END,
+                        0) AS duration_ms,
+               created_at, updated_at, ended_at, trace_id,
                kickoff_path, plan_path, artifact_path
         FROM task_runs
         {where}
