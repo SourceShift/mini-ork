@@ -64,15 +64,21 @@ def list_inputs(
     inputs the UI should show before the DAG.
     """
     tr = db.row(
-        "SELECT kickoff_path, plan_path FROM task_runs WHERE id = ?",
+        "SELECT kickoff_path, plan_path, recipe FROM task_runs WHERE id = ?",
         (task_run_id,),
     )
     if not tr:
         raise HTTPException(status_code=404, detail="task_run not found")
 
+    workflow_path = (
+        str(mini_ork_root() / "recipes" / tr["recipe"] / "workflow.yaml")
+        if tr.get("recipe")
+        else None
+    )
     candidates = [
         ("kickoff", "Kickoff", tr.get("kickoff_path"), "markdown"),
         ("plan", "Plan", tr.get("plan_path"), "plan"),
+        ("workflow", f"Recipe workflow ({tr.get('recipe')})", workflow_path, "yaml"),
         ("run_profile", "Run profile", str(home / "runs" / task_run_id / "run_profile.json"), "json"),
         (
             "profile_answers",
