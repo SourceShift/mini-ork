@@ -237,6 +237,28 @@ def test_load_transcript_prefers_stable_agent_sidecar(tmp_path: Path) -> None:
     assert out["fallback"] == "text-output"
 
 
+def test_load_transcript_strips_z_insight_blocks(tmp_path: Path) -> None:
+    """Spawned CLIs inherit the operator's global CLAUDE.md and emit
+    <z-insight> protocol blocks into deliverables (run-1781095892-69202).
+    Render-time strip covers transcripts persisted before the engine fix."""
+    import json as _json
+
+    from mini_ork.web.agents import load_transcript
+
+    home = tmp_path / ".mini-ork"
+    run_dir = home / "runs" / "run-polluted"
+    run_dir.mkdir(parents=True)
+    polluted = '{"ok":true}\n<z-insight>\n{"leak":1}\n</z-insight>'
+    (run_dir / "agent-implementer.transcript.json").write_text(
+        _json.dumps({"turns": [{"turn_index": 0, "text": polluted}]}),
+        encoding="utf-8",
+    )
+
+    out = load_transcript(home, "run-polluted", "implementer")
+    assert "<z-insight>" not in out["turns"][0]["text"]
+    assert out["turns"][0]["text"] == '{"ok":true}'
+
+
 def test_load_transcript_falls_back_to_output_artifact(tmp_path: Path) -> None:
     """Legacy runs without sidecars should still show the agent's visible output."""
     from mini_ork.web.agents import load_transcript

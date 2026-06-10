@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path
 from typing import Any
 
@@ -196,6 +197,19 @@ def list_agents(
     }
 
 
+def _strip_protocol_blocks(text: str | None) -> str | None:
+    """Drop <z-insight> blocks that dispatched CLIs inherit from the
+    operator's global agent config and emit into deliverable output.
+    The dispatch boundary sanitizes new runs (lib/llm-dispatch.sh
+    _mo_llm_strip_protocol_blocks); this render-time strip covers
+    transcripts persisted before that fix."""
+    if not text or "<z-insight>" not in text:
+        return text
+    text = re.sub(r"<z-insight>.*?</z-insight>", "", text, flags=re.S)
+    text = re.sub(r"<z-insight>.*\Z", "", text, flags=re.S)
+    return text.rstrip()
+
+
 def load_transcript(home: Path, task_run_id: str, node_id: str) -> dict[str, Any]:
     """Read the per-turn transcript file for a given agent dispatch.
 
@@ -231,6 +245,9 @@ def load_transcript(home: Path, task_run_id: str, node_id: str) -> dict[str, Any
                 payload["transcript_path"] = str(path.relative_to(home))
                 payload["available"] = True
                 payload.setdefault("turns", [])
+                for turn in payload["turns"]:
+                    if isinstance(turn, dict) and turn.get("text"):
+                        turn["text"] = _strip_protocol_blocks(turn["text"])
                 return payload
             except (OSError, json.JSONDecodeError) as e:
                 return {"turns": [], "available": False, "reason": f"parse error: {e}"}
@@ -257,7 +274,7 @@ def load_transcript(home: Path, task_run_id: str, node_id: str) -> dict[str, Any
                     "model": None,
                     "input_tokens": 0,
                     "output_tokens": 0,
-                    "text": text,
+                    "text": _strip_protocol_blocks(text),
                     "tool_uses": [],
                     "cache_read_input_tokens": 0,
                     "cache_creation_input_tokens": 0,
@@ -346,6 +363,30 @@ def agent_detail(
             (task_run_id, f"%{node_id}%", node_id),
         )
 
+    transcript = load_transcript(home, task_run_id, node_id)
+    # Historical-run backfill: executable lanes (codex) wrote zero-token
+    # fallback transcripts before _mo_llm_write_exec_transcript existed,
+    # while the llm_calls ledger got real sidecar usage. When every turn
+    # carries zeros but the ledger has tokens, surface the ledger truth.
+    turns = transcript.get("turns") or []
+    if (
+        turns
+        and llm_rows
+        and all(
+            not (t.get("input_tokens") or 0) and not (t.get("output_tokens") or 0)
+            for t in turns
+            if isinstance(t, dict)
+        )
+    ):
+        tot_in = sum(r.get("input_tokens") or 0 for r in llm_rows)
+        tot_out = sum(r.get("output_tokens") or 0 for r in llm_rows)
+        if tot_in or tot_out:
+            transcript["totals"] = {"input_tokens": tot_in, "output_tokens": tot_out}
+            transcript["tokens_source"] = "llm_calls"
+            if len(turns) == 1 and isinstance(turns[0], dict):
+                turns[0]["input_tokens"] = tot_in
+                turns[0]["output_tokens"] = tot_out
+
     return {
         "task_run_id": task_run_id,
         "node": node,
@@ -357,7 +398,7 @@ def agent_detail(
         "prompt": {"path": prompt_path, "content": prompt_text},
         "artifacts": artifact_payloads,
         "llm_calls": llm_rows,
-        "transcript": load_transcript(home, task_run_id, node_id),
+        "transcript": transcript,
         "children": children,
     }
 
