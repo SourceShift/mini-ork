@@ -627,7 +627,9 @@ def get_events(
             SELECT id, ts, event_type, actor, status, duration_ms, cost_usd,
                    artifact_path, payload_json
             FROM mo_events
-            WHERE strftime('%s', ts) BETWEEN ? AND ?
+            -- CAST is load-bearing: strftime returns TEXT, and TEXT BETWEEN
+            -- INTEGER params is always false in SQLite (ints sort before text)
+            WHERE CAST(strftime('%s', ts) AS INTEGER) BETWEEN ? AND ?
             ORDER BY ts ASC LIMIT ?
             """,
             (int(tr["created_at"]), int(upper), limit),
@@ -700,7 +702,9 @@ def get_llm_calls(
                    input_tokens, output_tokens, total_tokens, cost_usd,
                    duration_ms, status, finish_reason, ts
             FROM llm_calls
-            WHERE strftime('%s', ts) BETWEEN ? AND ?
+            -- CAST is load-bearing: strftime returns TEXT, and TEXT BETWEEN
+            -- INTEGER params is always false in SQLite (ints sort before text)
+            WHERE CAST(strftime('%s', ts) AS INTEGER) BETWEEN ? AND ?
             ORDER BY ts ASC
             """,
             (int(tr["created_at"]), int(upper)),
