@@ -292,7 +292,7 @@ The framework ships the universal loop and its primitives. Nothing in `lib/` or 
 
 ### RECIPES — opinions live here
 
-Recipes are user-land workflow definitions. They compose framework primitives into pipeline shapes. 12 recipes ship today; 8 of them dispatch a 4–5 lens panel across distinct model families per cycle, using family diversity as a practical proxy for the low-correlation detector patterns highlighted by Rajan 2025.
+Recipes are user-land workflow definitions. They compose framework primitives into pipeline shapes. 14 recipes ship today; 8 of them dispatch a 4–5 lens panel across distinct model families per cycle, using family diversity as a practical proxy for the low-correlation detector patterns highlighted by Rajan 2025.
 
 | Recipe | Location | Shape |
 |---|---|---|
@@ -357,7 +357,7 @@ The full release log lives in [`ROADMAP.md`](ROADMAP.md) — every section dated
 - 1 runner-shared helper in `bin/lib/` (`profile-seed.sh` — deterministic `run_profile.json` seeding from structured kickoff markdown, added 2026-06-09)
 - 16 user-facing `bin/mini-ork*` entrypoints
 - 19 schema migrations under `db/migrations/` (memory namespaces, benchmarks, evolution, safety, panel topology telemetry, recursive orchestration, self-improvement learning, llm_calls session indexing, trace status widening)
-- 12 recipes shipped — see Recipes table above
+- 14 recipes shipped — see Recipes table above
 - 7 model-family providers under `lib/providers/` + BYO-key registry (`config/providers.yaml` via `lib/providers/registry.sh`) for custom Anthropic/OpenAI-compatible endpoints
 
 Next-up work tracks (see [`ROADMAP.md`](ROADMAP.md) for detail):
