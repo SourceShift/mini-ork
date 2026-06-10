@@ -54,6 +54,8 @@ lanes:
 
 7 model-family wrappers ship out of the box at [`lib/providers/`](lib/providers/): `cl_{glm,kimi,codex,deepseek,opus,sonnet,minimax}.sh`. The audit recipe at [`recipes/refactor-audit/`](recipes/refactor-audit/) uses all 4 distinct lens families per cycle (glm + kimi + codex + opus). MiniMax is available as an opt-in additional family for recipes that can afford a 5th lens.
 
+**Bring your own keys:** no wrapper needed to add a provider. Declare Anthropic or OpenAI-compatible endpoints in [`config/providers.yaml`](config/providers.yaml) (`kind: anthropic-native | anthropic-compat | openai-compat | executable`), put the key in `.mini-ork/config/secrets.local.sh` (template: [`config/secrets.example.sh`](config/secrets.example.sh)), and point an `agents.yaml` lane at the entry. A `cl_<name>.sh` wrapper always wins over a registry entry of the same name, so registry entries can't change builtin behavior. Details: [docs/CONFIG.md](docs/CONFIG.md) → "Bring-your-own providers".
+
 ### What you trade for what
 
 | You give up | You get |
@@ -276,7 +278,7 @@ The full release log lives in [`ROADMAP.md`](ROADMAP.md) — every section dated
 - 15 user-facing `bin/mini-ork*` entrypoints
 - 17 schema migrations under `db/migrations/` (memory namespaces, benchmarks, evolution, safety, panel topology telemetry, recursive orchestration, self-improvement learning)
 - 11 recipes shipped — see Recipes table above
-- 7 model-family providers under `lib/providers/`
+- 7 model-family providers under `lib/providers/` + BYO-key registry (`config/providers.yaml` via `lib/providers/registry.sh`) for custom Anthropic/OpenAI-compatible endpoints
 
 Next-up work tracks (see [`ROADMAP.md`](ROADMAP.md) for detail):
 

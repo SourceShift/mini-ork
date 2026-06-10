@@ -129,6 +129,11 @@ nodes:
     dispatch_mode: serial
 ```
 
+Lane values resolve to `lib/providers/cl_<name>.sh` wrappers first, then to
+BYO entries in `config/providers.yaml` (your own Anthropic / OpenAI-compatible
+keys — see `docs/CONFIG.md` → "Bring-your-own providers"). Custom names like
+`openai_api` or `openrouter` work anywhere a builtin lane value does.
+
 **Shell registration at runtime:**
 
 ```bash
