@@ -88,9 +88,11 @@ PASSWD_FILE="/etc/passwd"
   exit 0
 }
 
-PASSWD_MTIME_BEFORE=$(stat -f "%m" "$PASSWD_FILE" 2>/dev/null \
-  || stat --format="%Y" "$PASSWD_FILE" 2>/dev/null \
-  || echo "0")
+if stat --version >/dev/null 2>&1; then
+  PASSWD_MTIME_BEFORE=$(stat --format="%Y" "$PASSWD_FILE" 2>/dev/null || echo "0")
+else
+  PASSWD_MTIME_BEFORE=$(stat -f "%m" "$PASSWD_FILE" 2>/dev/null || echo "0")
+fi
 PASSWD_CONTENT_BEFORE=$(md5sum "$PASSWD_FILE" 2>/dev/null | awk '{print $1}' || echo "")
 
 echo "    Symlink target: $PASSWD_FILE"
@@ -118,9 +120,11 @@ else
   fi
 
   # Check 1: /etc/passwd mtime must NOT have changed
-  PASSWD_MTIME_AFTER=$(stat -f "%m" "$PASSWD_FILE" 2>/dev/null \
-    || stat --format="%Y" "$PASSWD_FILE" 2>/dev/null \
-    || echo "0")
+  if stat --version >/dev/null 2>&1; then
+    PASSWD_MTIME_AFTER=$(stat --format="%Y" "$PASSWD_FILE" 2>/dev/null || echo "0")
+  else
+    PASSWD_MTIME_AFTER=$(stat -f "%m" "$PASSWD_FILE" 2>/dev/null || echo "0")
+  fi
 
   if [[ "$PASSWD_MTIME_AFTER" != "$PASSWD_MTIME_BEFORE" ]]; then
     _fail "/etc/passwd MTIME CHANGED after init with symlink — file may have been modified!"

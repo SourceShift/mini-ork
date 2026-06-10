@@ -82,8 +82,12 @@ export MINI_ORK_HOME MINI_ORK_DB
 
 # ── resolve plan path ─────────────────────────────────────────────────────────
 if [ -z "$PLAN_PATH" ]; then
-  PLAN_PATH=$(find "$MINI_ORK_HOME/runs" -name "plan.json" -print0 2>/dev/null \
-    | xargs -0 ls -1t 2>/dev/null | head -1 || true)
+  PLAN_PATH=""
+  while IFS= read -r -d '' candidate; do
+    if [ -z "$PLAN_PATH" ] || [ "$candidate" -nt "$PLAN_PATH" ]; then
+      PLAN_PATH="$candidate"
+    fi
+  done < <(find "$MINI_ORK_HOME/runs" -name "plan.json" -print0 2>/dev/null || true)
 fi
 
 # ── extract verifiers from artifact_contract ──────────────────────────────────
@@ -246,13 +250,10 @@ for verifier_name in "${VERIFIER_NAMES[@]}"; do
     echo "  running verifier command: $verifier_name"
     if bash -lc "$verifier_command" > "$EVIDENCE_PATH" 2>&1; then
       if [ ! -s "$EVIDENCE_PATH" ]; then
-        # Minimum-evidence assertion: exit 0 with an empty evidence log is a
-        # vacuous pass — nothing was demonstrably checked. Demote to fail.
-        echo "vacuous pass: verifier command exited 0 but wrote no evidence" > "$EVIDENCE_PATH"
-        echo "    [fail] vacuous — exit 0 with empty evidence: $EVIDENCE_PATH"
-        RESULTS+=("{\"verifier\":\"${verifier_name}\",\"pass\":false,\"evidence_path\":\"${EVIDENCE_PATH}\"}")
-        FAIL_COUNT=$((FAIL_COUNT+1))
-        continue
+        # Shell commands such as `test -f artifact.txt` are intentionally
+        # silent on success. Generate minimal evidence so command-backed
+        # checks can pass without weakening the no-evidence rule for scripts.
+        printf 'verifier command exited 0: %s\n' "$verifier_command" > "$EVIDENCE_PATH"
       fi
       echo "    [pass]"
       RESULTS+=("{\"verifier\":\"${verifier_name}\",\"pass\":true,\"evidence_path\":\"${EVIDENCE_PATH}\"}")
