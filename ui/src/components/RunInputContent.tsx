@@ -4,6 +4,9 @@ import remarkGfm from "remark-gfm";
 
 export function RunInputContent({ kind, content }: { kind: string; content: string }) {
   if (kind === "plan") return <PlanView content={content} />;
+  if (kind === "yaml") {
+    return <pre className="text-xs text-ink-200 overflow-auto whitespace-pre-wrap">{content}</pre>;
+  }
   if (kind === "markdown") {
     return (
       <div className="prose prose-invert prose-sm max-w-none prose-headings:text-ink-100 prose-p:text-ink-200 prose-a:text-ork-amber">
@@ -76,14 +79,14 @@ function PlanView({ content }: { content: string }) {
 
 function PlanList({ title, items, empty = "None." }: { title: string; items: string[]; empty?: string }) {
   return (
-    <section className="rounded-md border border-ink-700 bg-ink-900/30 p-4">
+    <section className="rounded-md border border-ink-700 bg-ink-900/30 p-4 min-w-0">
       <h2 className="text-sm font-semibold text-ink-200 mb-3">{title}</h2>
       {items.length ? (
         <ul className="space-y-2 text-sm text-ink-300">
           {items.map((item, i) => (
             <li key={`${item}-${i}`} className="flex gap-2">
               <span className="text-ork-amber">•</span>
-              <span>{item}</span>
+              <span className="min-w-0 break-all">{item}</span>
             </li>
           ))}
         </ul>
