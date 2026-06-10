@@ -52,13 +52,18 @@ export function Shell() {
     queryFn: () => api.taskRuns({ limit: 24 }),
     refetchInterval: 10_000,
   });
+  const { data: activeRuns } = useQuery({
+    queryKey: ["shell-active-runs"],
+    queryFn: api.activeRuns,
+    refetchInterval: 5_000,
+  });
   const { data: gradients } = useQuery({
     queryKey: ["shell-gradients"],
     queryFn: () => api.gradients(10),
     refetchInterval: 30_000,
   });
 
-  const executing = summary?.by_status.find((s) => s.status === "executing")?.count ?? 0;
+  const executing = activeRuns?.length ?? 0;
   const failed = summary?.by_status.find((s) => s.status === "failed")?.count ?? 0;
   const total = summary?.by_status.reduce((sum, row) => sum + row.count, 0) ?? 0;
   const pathLabel = location.pathname === "/" ? "/fleet" : location.pathname;
@@ -111,7 +116,7 @@ export function Shell() {
               );
             })}
           </nav>
-          <RailFleet runs={runs ?? []} activePath={location.pathname} />
+          <RailFleet runs={runs ?? []} activePath={location.pathname} activeCount={executing} />
           <div className="border-t border-[var(--hair)] p-3 space-y-2 ork-rail-meta">
             <div className="text-[9.5px] uppercase tracking-[0.18em] text-ink-500">Substrate</div>
             <div className="flex items-center gap-2 text-[10px] text-ink-400">
@@ -467,7 +472,7 @@ function AddProjectForm({
   );
 }
 
-function RailFleet({ runs, activePath }: { runs: TaskRun[]; activePath: string }) {
+function RailFleet({ runs, activePath, activeCount }: { runs: TaskRun[]; activePath: string; activeCount: number }) {
   const [open, setOpen] = useState(true);
   const [q, setQ] = useState("");
   const filtered = runs.filter((run) => {
@@ -485,7 +490,7 @@ function RailFleet({ runs, activePath }: { runs: TaskRun[]; activePath: string }
       >
         <ChevronDown size={12} className={clsx("transition-transform", !open && "-rotate-90")} />
         Fleet
-        <span className="ml-auto pill-ok">{runs.filter((r) => r.status === "executing").length}</span>
+        <span className="ml-auto pill-ok">{activeCount}</span>
       </button>
       {open && (
         <div className="pb-2">

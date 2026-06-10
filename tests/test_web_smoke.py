@@ -66,11 +66,13 @@ def test_active_runs(db) -> None:
 def test_active_runs_includes_unfinished_task_runs(tmp_path: Path) -> None:
     """Universal task-loop runs are active even without legacy heartbeat rows."""
     import sqlite3
+    import time
 
     from mini_ork.web.db import StateDB
     from mini_ork.web.routes.fleet import active_runs
 
     db_path = tmp_path / "state.db"
+    now = int(time.time())
     con = sqlite3.connect(db_path)
     con.execute(
         """
@@ -94,7 +96,27 @@ def test_active_runs_includes_unfinished_task_runs(tmp_path: Path) -> None:
           id, parent_epic_id, task_class, recipe, status, verdict,
           cost_usd, created_at, updated_at, ended_at
         )
-        VALUES ('run-live', NULL, 'code_fix', 'code-fix', 'executing', NULL, 0.25, 10, 20, NULL)
+        VALUES ('run-live', NULL, 'code_fix', 'code-fix', 'executing', NULL, 0.25, ?, ?, NULL)
+        """,
+        (now - 5, now),
+    )
+    con.execute(
+        """
+        INSERT INTO task_runs (
+          id, parent_epic_id, task_class, recipe, status, verdict,
+          cost_usd, created_at, updated_at, ended_at
+        )
+        VALUES ('run-classified', NULL, 'code_fix', 'code-fix', 'classified', NULL, 0.25, ?, ?, NULL)
+        """,
+        (now - 5, now),
+    )
+    con.execute(
+        """
+        INSERT INTO task_runs (
+          id, parent_epic_id, task_class, recipe, status, verdict,
+          cost_usd, created_at, updated_at, ended_at
+        )
+        VALUES ('run-stale', NULL, 'code_fix', 'code-fix', 'executing', NULL, 0.25, 10, 20, NULL)
         """
     )
     con.execute(

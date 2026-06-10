@@ -53,8 +53,29 @@ for migration_file in $(ls "$MIGRATIONS_DIR"/*.sql | sort); do
     echo "  [skip] $filename — already applied"
   else
     echo "  [apply] $filename"
-    sqlite3 "$DB" < "$migration_file"
-    echo "  [ok]   $filename"
+    if sqlite3 "$DB" < "$migration_file"; then
+      sqlite3 "$DB" \
+        "INSERT OR IGNORE INTO schema_migrations(filename, applied_at, checksum) VALUES ('$filename', strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'runner-applied');"
+      echo "  [ok]   $filename"
+    elif [ "$filename" = "0018_llm_calls_session_id.sql" ] && \
+         sqlite3 "$DB" "PRAGMA table_info(llm_calls);" 2>/dev/null | awk -F'|' '$2=="session_id"{found=1} END{exit found?0:1}'; then
+      # Older DBs may already have the column from a partial/manual apply but
+      # lack the schema_migrations marker. Finish the idempotent parts and
+      # mark the migration so `mini-ork init` remains safe to re-run.
+      sqlite3 "$DB" "
+        CREATE INDEX IF NOT EXISTS idx_llm_calls_session
+          ON llm_calls(session_id) WHERE session_id IS NOT NULL;
+        UPDATE llm_calls
+           SET session_id = json_extract(metadata_json, '$.session_id')
+         WHERE session_id IS NULL
+           AND metadata_json IS NOT NULL;
+        INSERT OR IGNORE INTO schema_migrations(filename, applied_at, checksum)
+        VALUES ('$filename', strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'recovered-existing-session-id');
+      "
+      echo "  [ok]   $filename — recovered existing session_id column"
+    else
+      exit 1
+    fi
   fi
 done
 
