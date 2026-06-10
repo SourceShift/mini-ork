@@ -113,13 +113,13 @@ export type TaskRun = {
 };
 
 export type ActiveRun = {
-  id: number;
-  epic_id: string;
+  id: number | string;
+  epic_id: string | null;
   run_dir: string;
-  branch: string;
+  branch: string | null;
   agent: string;
-  started_at: string;
-  last_heartbeat_at: string | null;
+  started_at: string | number | null;
+  last_heartbeat_at: string | number | null;
   pid: number | null;
   host: string | null;
   test_status: string | null;
@@ -128,6 +128,12 @@ export type ActiveRun = {
   epic_title: string | null;
   epic_status: string | null;
   lane: string | null;
+  source: "runs" | "task_runs";
+  task_run_id: string | null;
+  task_class?: string | null;
+  recipe?: string | null;
+  status?: string | null;
+  verdict?: string | null;
 };
 
 export type TaskRunsSummary = {
