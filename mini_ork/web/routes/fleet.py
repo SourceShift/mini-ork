@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any
 
 from fastapi import APIRouter, Depends, Query
@@ -25,20 +26,80 @@ def health(db: StateDB = Depends(get_db)) -> dict[str, Any]:
 
 @router.get("/runs/active")
 def active_runs(db: StateDB = Depends(get_db)) -> list[dict[str, Any]]:
-    if not db.has_table("runs"):
-        return []
-    return db.rows(
-        """
-        SELECT r.id, r.epic_id, r.run_dir, r.branch, r.agent, r.started_at,
-               r.last_heartbeat_at, r.pid, r.host, r.test_status, r.trace_status,
-               r.cost_usd, e.title AS epic_title, e.status AS epic_status, e.lane
-        FROM runs r
-        LEFT JOIN epics e ON e.id = r.epic_id
-        WHERE r.ended_at IS NULL
-        ORDER BY r.started_at DESC
-        LIMIT 100
-        """
+    rows: list[dict[str, Any]] = []
+
+    if db.has_table("runs"):
+        for row in db.rows(
+            """
+            SELECT r.id, r.epic_id, r.run_dir, r.branch, r.agent, r.started_at,
+                   r.last_heartbeat_at, r.pid, r.host, r.test_status, r.trace_status,
+                   r.cost_usd, e.title AS epic_title, e.status AS epic_status, e.lane
+            FROM runs r
+            LEFT JOIN epics e ON e.id = r.epic_id
+            WHERE r.ended_at IS NULL
+            ORDER BY r.started_at DESC
+            LIMIT 100
+            """
+        ):
+            rows.append({**row, "source": "runs", "task_run_id": None, "status": None})
+
+    if db.has_table("task_runs"):
+        task_rows = db.rows(
+            """
+            SELECT id, parent_epic_id, task_class, recipe, status, verdict,
+                   cost_usd, created_at, updated_at, ended_at
+            FROM task_runs
+            WHERE ended_at IS NULL
+              AND status NOT IN ('published', 'rolled_back', 'failed')
+            ORDER BY updated_at DESC
+            LIMIT 100
+            """
+        )
+        for row in task_rows:
+            label = row.get("recipe") or row.get("task_class") or "task_run"
+            rows.append(
+                {
+                    "id": row["id"],
+                    "epic_id": row.get("parent_epic_id"),
+                    "run_dir": f"runs/{row['id']}",
+                    "branch": None,
+                    "agent": label,
+                    "started_at": row.get("created_at"),
+                    "last_heartbeat_at": row.get("updated_at"),
+                    "pid": None,
+                    "host": None,
+                    "test_status": row.get("status"),
+                    "trace_status": row.get("verdict"),
+                    "cost_usd": row.get("cost_usd"),
+                    "epic_title": None,
+                    "epic_status": None,
+                    "lane": None,
+                    "source": "task_runs",
+                    "task_run_id": row["id"],
+                    "task_class": row.get("task_class"),
+                    "recipe": row.get("recipe"),
+                    "status": row.get("status"),
+                    "verdict": row.get("verdict"),
+                }
+            )
+
+    rows.sort(
+        key=lambda r: _active_sort_ts(r.get("last_heartbeat_at") or r.get("started_at")),
+        reverse=True,
     )
+    return rows[:100]
+
+
+def _active_sort_ts(value: Any) -> float:
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            normalized = value.replace("Z", "+00:00")
+            return datetime.fromisoformat(normalized).timestamp()
+        except ValueError:
+            return 0.0
+    return 0.0
 
 
 @router.get("/task-runs")

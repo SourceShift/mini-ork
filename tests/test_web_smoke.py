@@ -63,6 +63,60 @@ def test_active_runs(db) -> None:
     assert isinstance(rows, list)
 
 
+def test_active_runs_includes_unfinished_task_runs(tmp_path: Path) -> None:
+    """Universal task-loop runs are active even without legacy heartbeat rows."""
+    import sqlite3
+
+    from mini_ork.web.db import StateDB
+    from mini_ork.web.routes.fleet import active_runs
+
+    db_path = tmp_path / "state.db"
+    con = sqlite3.connect(db_path)
+    con.execute(
+        """
+        CREATE TABLE task_runs (
+          id TEXT PRIMARY KEY,
+          parent_epic_id TEXT,
+          task_class TEXT NOT NULL,
+          recipe TEXT,
+          status TEXT NOT NULL,
+          verdict TEXT,
+          cost_usd REAL NOT NULL DEFAULT 0,
+          created_at INTEGER NOT NULL,
+          updated_at INTEGER NOT NULL,
+          ended_at INTEGER
+        )
+        """
+    )
+    con.execute(
+        """
+        INSERT INTO task_runs (
+          id, parent_epic_id, task_class, recipe, status, verdict,
+          cost_usd, created_at, updated_at, ended_at
+        )
+        VALUES ('run-live', NULL, 'code_fix', 'code-fix', 'executing', NULL, 0.25, 10, 20, NULL)
+        """
+    )
+    con.execute(
+        """
+        INSERT INTO task_runs (
+          id, parent_epic_id, task_class, recipe, status, verdict,
+          cost_usd, created_at, updated_at, ended_at
+        )
+        VALUES ('run-done', NULL, 'code_fix', 'code-fix', 'published', 'APPROVE', 0.50, 1, 2, 3)
+        """
+    )
+    con.commit()
+    con.close()
+
+    rows = active_runs(StateDB(db_path))
+
+    assert [r["id"] for r in rows] == ["run-live"]
+    assert rows[0]["source"] == "task_runs"
+    assert rows[0]["task_run_id"] == "run-live"
+    assert rows[0]["test_status"] == "executing"
+
+
 def test_self_improve(db) -> None:
     from mini_ork.web.routes.trajectory import self_improve_runs
 
