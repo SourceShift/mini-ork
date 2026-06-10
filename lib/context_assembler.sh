@@ -106,14 +106,17 @@ except Exception:
     pass
 
 # --- Known failure modes from gradient_records -------------------------
+# task_class column is the primary join (populated by gradient_store);
+# the legacy target-substring match stays as fallback for rows stored
+# before the column existed.
 failure_modes = []
 try:
     rows = con.execute("""
         SELECT target, signal, suggested_change, confidence
         FROM gradient_records
-        WHERE target LIKE ? AND confidence >= 0.6
+        WHERE (task_class = ? OR target LIKE ?) AND confidence >= 0.6
         ORDER BY confidence DESC LIMIT 10
-    """, (f"%{task_class}%",)).fetchall()
+    """, (task_class, f"%{task_class}%")).fetchall()
     for r in rows:
         failure_modes.append({
             "cite": f"gradient_records/{r['target']}",
@@ -187,6 +190,41 @@ if tokens_used > budget:
 
 pack["tokens_estimated"] = approx_tokens(json.dumps(pack))
 print(json.dumps(pack))
+PY
+}
+
+# desc: Emit learned failure modes for task_class as a compact markdown block
+#       suitable for direct prompt injection. Prints NOTHING when no learnings
+#       exist (callers can append output unconditionally). Confidence floor 0.6.
+context_failure_modes_md() {
+  local task_class="${1:?task_class required}"
+  local limit="${2:-5}"
+  [ -n "${MINI_ORK_DB:-}" ] && [ -f "${MINI_ORK_DB:-}" ] || return 0
+  python3 - "$MINI_ORK_DB" "$task_class" "$limit" <<'PY'
+import sqlite3, sys
+
+db, task_class, limit = sys.argv[1], sys.argv[2], int(sys.argv[3])
+con = sqlite3.connect(db)
+con.execute("PRAGMA busy_timeout=5000")
+try:
+    rows = con.execute("""
+        SELECT target, signal, suggested_change
+        FROM gradient_records
+        WHERE (task_class = ? OR target LIKE ?) AND confidence >= 0.6
+        ORDER BY confidence DESC, created_at DESC LIMIT ?
+    """, (task_class, f"%{task_class}%", limit)).fetchall()
+except sqlite3.OperationalError:
+    rows = []
+finally:
+    con.close()
+
+if rows:
+    print("--- Learned failure modes (from prior runs of this task class) ---")
+    print("Avoid repeating these known issues:")
+    for target, signal, change in rows:
+        print(f"- [{target}] {signal.strip()}")
+        print(f"  Fix applied going forward: {change.strip()}")
+    print("--- /learned failure modes ---")
 PY
 }
 
