@@ -171,6 +171,15 @@ def command_hints():
         r"\bgo\s+test\b[^\n`]*",
         r"\bbash\s+tests/[^\n`]+",
         r"\bmake\s+test\b[^\n`]*",
+        # Recipe-shipped verifiers (recipes/<name>/verifiers/*.sh) — bash
+        # invocations of these count as the "verification command" for
+        # meta-recipes whose proof of success IS their own verifier suite.
+        # Closes the recipe_authoring needs_answers gate when the kickoff
+        # names its own validator.
+        r"\bbash\s+recipes/[^\s`]+\.sh\b[^\n`]*",
+        r"\bbash\s+verifiers/[^\s`]+\.sh\b[^\n`]*",
+        r"\b\./verifiers/[^\s`]+\.sh\b[^\n`]*",
+        r"\bbin/mini-ork(?:-[a-z]+)?\s+(?:verify|run|classify|plan)\b[^\n`]*",
     ]
     found = []
     for pattern in patterns:
