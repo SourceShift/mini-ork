@@ -376,9 +376,9 @@ def get_learning(
             "known_failure_modes": known_failure_modes,
             "source": "lib/context_assembler.sh",
             # "wired" = the injection actually happens in the live run
-            # pipeline today. context_assemble() (which would inject
-            # prior_similar_runs) exists but nothing in bin/ calls it —
-            # claiming injection for it was misleading.
+            # pipeline today. The full context_assemble() ContextPack JSON
+            # still has no caller, but its prior_similar_runs slice is
+            # injected via context_prior_runs_md (bin/mini-ork-plan).
             "injection_points": [
                 {
                     "name": "known_failure_modes",
@@ -394,9 +394,9 @@ def get_learning(
                 },
                 {
                     "name": "prior_similar_runs",
-                    "where": "lib/context_assembler.sh (context_assemble)",
-                    "how": "would insert same-task_class execution_traces into a ContextPack — implemented but NOT yet called by the run pipeline.",
-                    "wired": False,
+                    "where": "bin/mini-ork-plan (context_prior_runs_md)",
+                    "how": "outcomes of the 5 most recent same-task_class execution_traces (excluding this run's own) are appended as a 'Prior runs' block to the planner prompt.",
+                    "wired": True,
                 },
             ],
         },

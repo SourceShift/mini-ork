@@ -180,6 +180,12 @@ if [ "${MO_INJECT_LEARNINGS:-1}" = "1" ] && [ -f "$MINI_ORK_ROOT/lib/context_ass
     _learned_block="$(context_failure_modes_md "${TASK_CLASS:-generic}" 5 || true)"
     [ -n "$_learned_block" ] && PROMPT_TEXT="${PROMPT_TEXT}"$'\n\n'"${_learned_block}"$'\n'
   fi
+  # Prior-run memory: outcomes of recent same-task_class runs so the planner
+  # calibrates scope/verifiers against history instead of planning blind.
+  if declare -f context_prior_runs_md >/dev/null 2>&1; then
+    _prior_block="$(context_prior_runs_md "${TASK_CLASS:-generic}" 5 || true)"
+    [ -n "$_prior_block" ] && PROMPT_TEXT="${PROMPT_TEXT}"$'\n\n'"${_prior_block}"$'\n'
+  fi
 fi
 
 profile_status=""
