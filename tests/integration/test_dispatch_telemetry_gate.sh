@@ -114,7 +114,10 @@ CREATE TABLE task_runs(id TEXT PRIMARY KEY, status TEXT, verdict TEXT, updated_a
 CREATE TABLE run_events(event_id TEXT, run_id TEXT, event_type TEXT, payload_json TEXT, created_at INTEGER);
 INSERT INTO task_runs(id,status,created_at) VALUES('run-gate','planned',strftime('%s','now'));
 "
-MINI_ORK_HOME="$HOME_DIR" MINI_ORK_RUN_ID="run-gate" \
+# Pin MINI_ORK_DRY_RUN=0: the gate deliberately skips under dry-run
+# (execute:299), and CI exports MINI_ORK_DRY_RUN=1 globally — without the
+# pin this test asserts different behavior depending on ambient env.
+MINI_ORK_HOME="$HOME_DIR" MINI_ORK_RUN_ID="run-gate" MINI_ORK_DRY_RUN=0 \
   "$ROOT/bin/mini-ork-execute" "$HOME_DIR/runs/run-gate/plan.json" >/dev/null 2>&1
 rc=$?
 [ "$rc" -eq 6 ] && _ok "gate exits 6" || _fail "gate rc=$rc (want 6)"
