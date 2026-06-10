@@ -133,7 +133,11 @@ def kill_run(home: Path, db: StateDB, task_run_id: str) -> dict[str, Any]:
 
     # Writeback to task_runs — mark failed regardless of whether pids were
     # found. The user clicked Kill; the row should reflect that intent.
-    _writeback_terminal(db, task_run_id, status="failed", notes="killed-by-user")
+    _writeback_terminal(db, task_run_id, status="failed", notes="killed-by-user", verdict="CRASH")
+
+    # SIGKILL bypasses the dispatcher's EXIT-trap finalizer, so dangling
+    # node_start events (UI DAG "running" forever) must be closed here too.
+    _close_dangling_node_events(db, task_run_id)
 
     # Clean up .pid + .stop-requested artifacts so the row doesn't look
     # like a still-active run.
@@ -275,7 +279,9 @@ def save_answers(
     }
 
 
-def _writeback_terminal(db: StateDB, task_run_id: str, status: str, notes: str) -> None:
+def _writeback_terminal(
+    db: StateDB, task_run_id: str, status: str, notes: str, verdict: str | None = None
+) -> None:
     """Write a terminal status + notes to task_runs. Uses raw sqlite write
     (db is read-only). We open our own connection here — the read-only
     connection from get_db() will refuse writes."""
@@ -290,13 +296,71 @@ def _writeback_terminal(db: StateDB, task_run_id: str, status: str, notes: str) 
             """
             UPDATE task_runs
                SET status = ?,
+                   verdict = COALESCE(verdict, ?),
                    notes = COALESCE(notes || '; ', '') || ?,
                    updated_at = ?,
                    ended_at = COALESCE(ended_at, ?)
              WHERE id = ?
             """,
-            (status, notes, now, now, task_run_id),
+            (status, verdict, notes, now, now, task_run_id),
         )
         con.commit()
+    finally:
+        con.close()
+
+
+def _close_dangling_node_events(db: StateDB, task_run_id: str) -> None:
+    """Insert synthetic node_end(CRASH) for every node_start lacking a
+    node_end. Without this, the UI DAG derives 'running' from the dangling
+    node_start forever (observed run-1781081895-31571, 2026-06-10)."""
+    import sqlite3
+
+    db_path = str(db.db_path)
+    now = int(time.time())
+    con = sqlite3.connect(db_path, timeout=5.0)
+    try:
+        con.execute("PRAGMA busy_timeout = 5000")
+        rows = con.execute(
+            """
+            SELECT event_type, payload_json FROM run_events
+             WHERE run_id = ? AND event_type IN ('node_start', 'node_end')
+            """,
+            (task_run_id,),
+        ).fetchall()
+        started: dict[str, str] = {}
+        ended: set[str] = set()
+        for ev_type, pj in rows:
+            try:
+                p = json.loads(pj) if pj else {}
+            except json.JSONDecodeError:
+                p = {}
+            nid = p.get("node_id")
+            if not nid:
+                continue
+            if ev_type == "node_start":
+                started[nid] = p.get("node_type", "")
+            else:
+                ended.add(nid)
+        for nid, ntype in started.items():
+            if nid in ended:
+                continue
+            payload = {
+                "node_id": nid,
+                "node_type": ntype,
+                "verdict": "CRASH",
+                "interrupted": True,
+                "duration_ms": 0,
+            }
+            con.execute(
+                """
+                INSERT INTO run_events(event_id, run_id, event_type, payload_json, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (f"evt-node_end-{nid}-killclose-{now}", task_run_id, "node_end", json.dumps(payload), now),
+            )
+        con.commit()
+    except sqlite3.OperationalError:
+        # run_events may not exist on very old state.dbs — best-effort.
+        pass
     finally:
         con.close()
