@@ -218,6 +218,90 @@ Wire-up + remaining oracle-hardening gaps:
   "kimi/glm/minimax/codex all silent-failing" environment-side issues
   surfaced during the 2026-06-05 live-smoke session.
 
+### Agent-ops hardening — LobeHub-informed (2026-06-10 deep review)
+
+Source: deep review of [lobehub/lobehub](https://github.com/lobehub/lobehub)
+(local checkout `~/ps/lobehub`), an agent-operations platform whose
+mechanisms map closely onto mini-ork's loop. Ordered by dependency: each
+phase consumes the previous one's outputs. LobeHub file references point
+at the mechanism to port, not code to copy.
+
+**Phase 1 — truthful run telemetry** (fixes observed lies; everything
+downstream depends on it)
+
+1. **Dispatch-time config snapshot.** Freeze resolved lane→family/model
+   onto the run record at dispatch (new column or `run_events` payload)
+   instead of re-resolving from `config/agents.yaml` at view time. Root
+   cause of the 2026-06-10 sonnet-vs-codex badge bug; LobeHub pattern:
+   denormalized `appContext` / `verifyPlan` snapshots
+   (`packages/database/src/schemas/agentOperations.ts`).
+2. **Error taxonomy on `llm_calls`.** Add `error_category`
+   (auth/quota/capacity/request/safety/network/stream/provider/config) +
+   retryable-vs-fatal classification in `lib/llm-dispatch.sh`, extending
+   `lib/throttle-guard.sh`'s provider-throttle classification to the full
+   taxonomy (`packages/model-runtime/src/errors/taxonomy.ts`,
+   `utils/isNonRetryableRequestError.ts`).
+3. **Finish reasons on node lifecycle.** `node_end` events carry *why*
+   (`done | error | interrupted | max_steps | cost_limit | timeout`)
+   distinct from status, fed by item 2. Kills the "node done, dispatch
+   failed with zero output" class observed on run-1781081895-31571
+   (`agentOperations.ts:11-29` lifecycle + completion reasons).
+4. **Heartbeat watchdog + failure fuse for nodes.** Extend the legacy
+   `runs.last_heartbeat_at` pattern to task-loop nodes: `heartbeatTimeout`
+   kills silent hangs (the 25-min dead codex dispatch); fuse = halt the
+   lane after 3 consecutive failures and surface a briefing instead of
+   retrying forever (`packages/database/src/schemas/task.ts:70-79`,
+   `agentCronJob.ts`).
+
+**Phase 2 — cost + capability accuracy** (consumes Phase 1's per-call
+truth)
+
+5. **Cache-aware cost accounting.** Track `cached_input_tokens` /
+   cache-write tokens in `llm_calls`; bill cache reads at cache rate,
+   subtract from input. Largest current cost error on Anthropic-heavy
+   lanes (`packages/model-runtime/src/core/usageConverters/utils/computeChatCost.ts:35-209`).
+6. **Pricing strategy table.** Config-driven (provider, model) →
+   {input, output, cache_read, cache_write} rates with fixed/tiered
+   strategies, replacing inline cost math; pairs with `docs/MODELS.md`
+   (`model-bank` pricing schema).
+7. **Capability flags in `agents.yaml`.** Per-family
+   `capabilities: {vision, tools, reasoning, search}` so gates reject
+   impossible lane assignments *before* dispatch
+   (`packages/model-bank/src/types/aiModel.ts:28-61`).
+
+**Phase 3 — feedback loops** (consumes Phases 1-2 telemetry)
+
+8. **Langfuse score mapping.** Extend the planned exporter
+   (docs/architecture/otel-langfuse.md): verdicts/rollbacks/promotions
+   become trace scores (APPROVE +, REQUEST_CHANGES −, rollback −1.0) so
+   traces self-rank (`src/libs/traces/event.ts:16-20`).
+9. **Verifier rubrics with ground-truth feedback.** Criteria/rubric/result
+   tables; results carry verdict + confidence + `is_false_positive` /
+   `is_false_negative` operator flags + optional `repair_run_id` chaining
+   an auto-repair run. Feeds the existing self-improve `learning_record`
+   loop (`packages/database/src/schemas/verify.ts`).
+10. **Checkpoint/resume for recipes.** On verifier failure resume from the
+    last completed node instead of replaying the recipe — direct token
+    saver for the recursive loop (`packages/types/src/task/index.ts:24-34`,
+    `canResume`/`resumedFromStep` events).
+
+**Phase 4 — operator control + UX polish**
+
+11. **Intervention policies as a gate.** `never | required | always`
+    per tool + parameter-pattern rules + always-wins security blacklist +
+    confirmed-call memo (no duplicate prompts). The mature form of
+    scope_gate; UI already has the kill path
+    (`packages/agent-runtime/src/core/InterventionChecker.ts`).
+12. **Throttled streaming UI updates.** Batch SSE transcript/log chunks,
+    flush ≤1×/300ms to stop re-render storms on chatty agents
+    (`src/store/chat/agents/StreamingHandler.ts:74-88`).
+13. **Processing-state card.** Glanceable elapsed/steps/tool-calls/cost
+    badges + progress shimmer beside the dispatch-tree DAG
+    (`src/features/Conversation/Messages/Tasks/shared/ProcessingState.tsx`).
+14. **Operation trees with cascading cancel.** Parent/child op hierarchy
+    so killing a node aborts its children — completes the UI-kill work
+    (`src/store/chat/slices/operation/types.ts`).
+
 ### Recipe portfolio
 
 - `recipes/research-synthesis/` — multi-source paper synthesis
@@ -266,4 +350,5 @@ These have been considered and intentionally excluded:
 
 ## Last updated
 
-2026-06-01 — v0.2.0 ship + Phase G positioning lock-in
+2026-06-10 — Agent-ops hardening track added (LobeHub deep-review, 14 items
+across 4 dependency-ordered phases)
