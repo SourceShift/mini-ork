@@ -1,0 +1,73 @@
+version: "0.1.0"
+task_class: silent_catch_audit
+description: >
+  Read-only TypeScript/JavaScript audit for silent catch sites. Three
+  heterogeneous researcher lanes collect candidate sites, classify runtime
+  criticality, and challenge false positives; one reviewer emits the final
+  tiered report, JSON findings, and verdict.
+
+nodes:
+  - name: planner
+    type: planner
+    model_lane: planner
+    prompt_ref: prompts/planner.md
+    dispatch_mode: serial
+
+  - name: structural_lens
+    type: researcher
+    model_lane: codex_lens
+    prompt_ref: prompts/structural-lens.md
+    dispatch_mode: parallel
+    gates: [budget_gate]
+
+  - name: semantic_lens
+    type: researcher
+    model_lane: glm_lens
+    prompt_ref: prompts/semantic-lens.md
+    dispatch_mode: parallel
+    gates: [budget_gate]
+
+  - name: adversarial_lens
+    type: researcher
+    model_lane: kimi_lens
+    prompt_ref: prompts/adversarial-lens.md
+    dispatch_mode: parallel
+    gates: [budget_gate]
+
+  - name: findings_reviewer
+    type: reviewer
+    model_lane: reviewer
+    prompt_ref: prompts/findings-reviewer.md
+    dispatch_mode: serial
+    gates: [budget_gate]
+
+  - name: audit_shape
+    type: verifier
+    prompt_ref: null
+    verifier_ref: verifiers/audit-shape.sh
+    dispatch_mode: serial
+
+  - name: publisher
+    type: publisher
+    prompt_ref: null
+    dispatch_mode: serial
+    gates: [scope_gate]
+
+  - name: rollback
+    type: rollback
+    prompt_ref: null
+    dispatch_mode: serial
+
+edges:
+  - { from: planner, to: structural_lens, edge_type: depends_on }
+  - { from: planner, to: semantic_lens, edge_type: depends_on }
+  - { from: planner, to: adversarial_lens, edge_type: depends_on }
+  - { from: structural_lens, to: findings_reviewer, edge_type: supplies_context_to }
+  - { from: semantic_lens, to: findings_reviewer, edge_type: supplies_context_to }
+  - { from: adversarial_lens, to: findings_reviewer, edge_type: supplies_context_to }
+  - { from: findings_reviewer, to: audit_shape, edge_type: verifies }
+  - { from: audit_shape, to: publisher, edge_type: depends_on }
+  - { from: findings_reviewer, to: rollback, edge_type: escalates_to }
+  - { from: audit_shape, to: rollback, edge_type: escalates_to }
+
+rollback_strategy: keep_lens_reports_discard_publish
