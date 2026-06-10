@@ -238,6 +238,15 @@ for verifier_name in "${VERIFIER_NAMES[@]}"; do
     fi
     echo "  running verifier command: $verifier_name"
     if bash -lc "$verifier_command" > "$EVIDENCE_PATH" 2>&1; then
+      if [ ! -s "$EVIDENCE_PATH" ]; then
+        # Minimum-evidence assertion: exit 0 with an empty evidence log is a
+        # vacuous pass — nothing was demonstrably checked. Demote to fail.
+        echo "vacuous pass: verifier command exited 0 but wrote no evidence" > "$EVIDENCE_PATH"
+        echo "    [fail] vacuous — exit 0 with empty evidence: $EVIDENCE_PATH"
+        RESULTS+=("{\"verifier\":\"${verifier_name}\",\"pass\":false,\"evidence_path\":\"${EVIDENCE_PATH}\"}")
+        FAIL_COUNT=$((FAIL_COUNT+1))
+        continue
+      fi
       echo "    [pass]"
       RESULTS+=("{\"verifier\":\"${verifier_name}\",\"pass\":true,\"evidence_path\":\"${EVIDENCE_PATH}\"}")
       PASS_COUNT=$((PASS_COUNT+1))
@@ -251,6 +260,14 @@ for verifier_name in "${VERIFIER_NAMES[@]}"; do
 
   echo "  running verifier: $verifier_name"
   if ARTIFACT_PATH="$ARTIFACT_PATH" bash "$verifier_script" > "$EVIDENCE_PATH" 2>&1; then
+    if [ ! -s "$EVIDENCE_PATH" ]; then
+      # Minimum-evidence assertion (see command branch above).
+      echo "vacuous pass: verifier exited 0 but wrote no evidence" > "$EVIDENCE_PATH"
+      echo "    [fail] vacuous — exit 0 with empty evidence: $EVIDENCE_PATH"
+      RESULTS+=("{\"verifier\":\"${verifier_name}\",\"pass\":false,\"evidence_path\":\"${EVIDENCE_PATH}\"}")
+      FAIL_COUNT=$((FAIL_COUNT+1))
+      continue
+    fi
     echo "    [pass]"
     RESULTS+=("{\"verifier\":\"${verifier_name}\",\"pass\":true,\"evidence_path\":\"${EVIDENCE_PATH}\"}")
     PASS_COUNT=$((PASS_COUNT+1))
@@ -289,6 +306,13 @@ fi
 # ── compute final verdict ─────────────────────────────────────────────────────
 if [ "$DRY_RUN" -eq 1 ]; then
   VERDICT="dry-run"
+elif [ "$PASS_COUNT" -eq 0 ] && [ "$FAIL_COUNT" -eq 0 ]; then
+  # Minimum-evidence assertion at the verdict level: zero verifiers executed
+  # means nothing was checked — that is not a "pass". Exit stays 0 so
+  # contract-less recipes keep working, but the verdict (and the trace's
+  # verifier_output) say "vacuous" instead of laundering it into success.
+  VERDICT="vacuous"
+  echo "  [warn] no verifiers executed — verdict=vacuous (pass requires evidence)" >&2
 elif [ "$FAIL_COUNT" -eq 0 ] && [ "$GATE_VERDICT" = "pass" ]; then
   VERDICT="pass"
 elif [ "$PASS_COUNT" -eq 0 ]; then

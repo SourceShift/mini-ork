@@ -77,6 +77,14 @@ _run_verifier_ref() {
     bash "$_script" > "$_evidence" 2>&1
   _exit=$?
 
+  # Minimum-evidence assertion: exit 0 with an empty evidence file is a
+  # vacuous pass — fail it. (Mirrors bin/mini-ork-verify's per-verifier check.)
+  if [ ! -s "$_evidence" ]; then
+    echo "vacuous pass: verifier exited $_exit but wrote no evidence" > "$_evidence"
+    [ "$_errexit_set" -eq 1 ] && set -e
+    return 1
+  fi
+
   python3 - "$_evidence" <<'PY' 2>/dev/null
 import json
 import sys
