@@ -7,9 +7,9 @@ description: >
   dissent into a ranked research doc.
 
 # Each lens routes to its NAMED family lane (mirrors refactor-audit
-# v0.2-pt14 D-047 fix). Per Rajan 2025 + Nasser 2026: low pairwise
-# correlation between voters is the precondition for multi-agent
-# review's submodularity gain.
+# v0.2-pt14 D-047 fix). Rajan 2025 supports low-correlation detector
+# patterns; Nasser 2026 supports treating judge/model choice as a real
+# evaluative disposition. Family diversity is the enforceable proxy here.
 nodes:
   - { name: planner,        type: planner,     model_lane: planner,       prompt_ref: prompts/planner.md,         dispatch_mode: serial }
   - { name: glm_lens,       type: researcher,  model_lane: glm_lens,      prompt_ref: prompts/lens-glm-web.md,    dispatch_mode: parallel, gates: [budget_gate] }
