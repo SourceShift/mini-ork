@@ -25,7 +25,7 @@ _trace_now() { date +%s; }
 trace_write() {
   local payload="${1:?json_payload required}"
   python3 - "${MINI_ORK_DB:?MINI_ORK_DB unset}" "$payload" <<'PY'
-import sqlite3, json, sys, uuid, time
+import sqlite3, json, sys, uuid, time, os
 
 db = sys.argv[1]
 try:
@@ -36,6 +36,15 @@ except json.JSONDecodeError as e:
 
 trace_id = p.get("trace_id") or f"tr-{uuid.uuid4().hex[:16]}"
 now = int(time.time())
+# run_id stamps the trace with its parent task_runs.id so the obs UI can
+# attribute node traces (and the gradients they evidence) to a run.
+# Payload wins; env fallback covers every lifecycle caller for free —
+# bin/mini-ork exports MINI_ORK_RUN_ID for the whole run, execute exports
+# MINI_ORK_TASK_RUN_ID. Was always NULL before — 3 separate auto-minted
+# gradients flagged it.
+run_id = (p.get("run_id")
+          or os.environ.get("MINI_ORK_TASK_RUN_ID")
+          or os.environ.get("MINI_ORK_RUN_ID"))
 
 con = sqlite3.connect(db)
 # v0.2-pt7 (F-11/R1): per-connection busy_timeout — handle SQLITE_BUSY
@@ -51,13 +60,14 @@ con.execute("PRAGMA busy_timeout=5000")
 # Migration 0010 + 0014 own the schema authoritatively now.
 con.execute("""
     INSERT INTO execution_traces (
-        trace_id, task_class, prompt_version_hash, context_bundle_hash,
+        trace_id, run_id, task_class, prompt_version_hash, context_bundle_hash,
         tool_calls, files_read, files_written, verifier_output,
         reviewer_verdict, cost_usd, duration_ms, final_artifact_ref,
         status, workflow_version_id, agent_version_id
-    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     ON CONFLICT(trace_id) DO UPDATE SET
         status=excluded.status,
+        run_id=COALESCE(excluded.run_id, run_id),
         verifier_output=excluded.verifier_output,
         reviewer_verdict=excluded.reviewer_verdict,
         cost_usd=excluded.cost_usd,
@@ -65,6 +75,7 @@ con.execute("""
         final_artifact_ref=excluded.final_artifact_ref
 """, (
     trace_id,
+    run_id,
     p.get("task_class", ""),
     p.get("prompt_version", "") or "",
     p.get("context_bundle_hash", "") or "",
