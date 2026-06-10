@@ -22,6 +22,13 @@ set -euo pipefail
 
 MINI_ORK_ROOT="${MINI_ORK_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 
+# providers.yaml registry — BYO-key providers without a cl_*.sh wrapper.
+# Precedence: an existing cl_<model>.sh ALWAYS wins; the registry is only
+# consulted for model names with no wrapper file. See lib/providers/registry.sh.
+# shellcheck source=lib/providers/registry.sh
+[ -f "$MINI_ORK_ROOT/lib/providers/registry.sh" ] && \
+  source "$MINI_ORK_ROOT/lib/providers/registry.sh"
+
 # Models that ship as proper executables (call their CLI directly)
 _MO_LLM_EXECUTABLE_MODELS=(codex gemini)
 
@@ -144,6 +151,16 @@ PY
 }
 
 _mo_llm_provider_for_model() {
+  # Registry family wins for registry-defined providers (telemetry accuracy
+  # for BYO endpoints); falls back to the historical name-pattern heuristic.
+  if declare -f mo_provider_field >/dev/null 2>&1; then
+    local _fam
+    _fam=$(mo_provider_field "$1" family 2>/dev/null) || _fam=""
+    if [ -n "$_fam" ]; then
+      printf '%s\n' "$_fam"
+      return 0
+    fi
+  fi
   case "$1" in
     codex|gpt-*|o1*|o3*) printf 'openai\n' ;;
     gemini*|*-gemini-*) printf 'google\n' ;;
@@ -232,7 +249,80 @@ _mo_llm_is_gateway() {
   for _m in "${_MO_LLM_GATEWAY_MODELS[@]}"; do
     [[ "$_m" == "$model" ]] && return 0
   done
+  # Registry anthropic-compat providers are gateways by default (third-party
+  # Anthropic-compatible endpoints don't stream `stream-json` reliably —
+  # same hang class as E-MO-19). Opt out with `gateway: false`.
+  if declare -f mo_provider_kind >/dev/null 2>&1; then
+    local _kind _gw
+    _kind=$(mo_provider_kind "$model" 2>/dev/null) || _kind=""
+    if [ "$_kind" = "anthropic-compat" ]; then
+      _gw=$(mo_provider_field "$model" gateway 2>/dev/null) || _gw=""
+      [ "$_gw" != "false" ] && return 0
+    fi
+  fi
   return 1
+}
+
+# Apply a registry provider's env contract inside the dispatch subshell.
+# Mirrors what the sourceable cl_*.sh wrappers do, driven by providers.yaml.
+_mo_registry_apply_env() {
+  local model="$1"
+  local kind model_id base_url key_env
+  kind=$(mo_provider_kind "$model") || return 1
+  model_id=$(mo_provider_field "$model" model 2>/dev/null) || model_id=""
+  case "$kind" in
+    anthropic-native)
+      # Same policy as cl_opus.sh (2026-06-09 incident fix): clear gateway
+      # pollution so claude --print falls back to ambient Claude Code login.
+      # BYO addition: when the operator exported ANTHROPIC_API_KEY (raw
+      # Anthropic API key, no Claude Code login), preserve it and pin the
+      # registry model id if one is declared.
+      local _byo_key="${ANTHROPIC_API_KEY:-}"
+      unset ANTHROPIC_AUTH_TOKEN ANTHROPIC_API_KEY ANTHROPIC_BASE_URL \
+            ANTHROPIC_MODEL ANTHROPIC_DEFAULT_OPUS_MODEL \
+            ANTHROPIC_DEFAULT_SONNET_MODEL ANTHROPIC_DEFAULT_HAIKU_MODEL \
+            ANTHROPIC_SMALL_FAST_MODEL CLAUDE_CODE_SUBAGENT_MODEL \
+            CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC
+      if [ -n "$_byo_key" ]; then
+        export ANTHROPIC_API_KEY="$_byo_key"
+        [ -n "$model_id" ] && export ANTHROPIC_MODEL="$model_id"
+      fi
+      ;;
+    anthropic-compat)
+      base_url=$(mo_provider_field "$model" base_url 2>/dev/null) || base_url=""
+      key_env=$(mo_provider_field "$model" api_key_env 2>/dev/null) || key_env=""
+      if [ -z "$base_url" ] || [ -z "$key_env" ]; then
+        echo "[registry] provider '$model': anthropic-compat requires base_url + api_key_env" >&2
+        return 1
+      fi
+      if [ -z "${!key_env:-}" ]; then
+        echo "[registry] provider '$model': \$$key_env is empty — set it in secrets.local.sh or the environment" >&2
+        return 1
+      fi
+      export ANTHROPIC_AUTH_TOKEN="${!key_env}"
+      export ANTHROPIC_BASE_URL="$base_url"
+      if [ -n "$model_id" ]; then
+        export ANTHROPIC_MODEL="$model_id"
+        export ANTHROPIC_SMALL_FAST_MODEL="$model_id"
+        export ANTHROPIC_DEFAULT_OPUS_MODEL="$model_id"
+        export ANTHROPIC_DEFAULT_SONNET_MODEL="$model_id"
+        export ANTHROPIC_DEFAULT_HAIKU_MODEL="$model_id"
+        export CLAUDE_CODE_SUBAGENT_MODEL="$model_id"
+      fi
+      export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+  local _extra _line
+  _extra=$(mo_provider_field "$model" extra_env 2>/dev/null) || _extra=""
+  if [ -n "$_extra" ]; then
+    while IFS= read -r _line; do
+      [ -n "$_line" ] && export "$_line"
+    done <<< "$_extra"
+  fi
+  return 0
 }
 
 # mo_llm_dispatch <model> <prompt> <out_file> [timeout_s] [max_turns]
@@ -247,9 +337,18 @@ mo_llm_dispatch() {
   local cl_script="$scripts_dir/cl_${model}.sh"
   local err_log="${out_file}.err.log"
 
+  # Wrapper-wins precedence: a cl_<model>.sh file always takes priority.
+  # The providers.yaml registry only handles model names with no wrapper,
+  # so BYO entries can never regress the committed providers.
+  local _registry_kind=""
   if [[ ! -f "$cl_script" ]]; then
-    echo "mo_llm_dispatch: cl_${model}.sh missing at $cl_script" >> "$err_log"
-    return 2
+    if declare -f mo_provider_kind >/dev/null 2>&1; then
+      _registry_kind=$(mo_provider_kind "$model" 2>/dev/null) || _registry_kind=""
+    fi
+    if [[ -z "$_registry_kind" ]]; then
+      echo "mo_llm_dispatch: cl_${model}.sh missing at $cl_script and no providers.yaml entry" >> "$err_log"
+      return 2
+    fi
   fi
 
   # Pick timeout binary (macOS may need gtimeout from coreutils)
@@ -311,21 +410,63 @@ mo_llm_dispatch() {
   fi
   local _raw_out="${out_file}.raw"
 
-  if _mo_llm_is_executable "$model"; then
+  # Secrets are sourced inside each dispatch subshell so api_key_env vars
+  # declared in providers.yaml resolve for both branch kinds.
+  local secrets="${MINI_ORK_SECRETS:-${MINI_ORK_HOME:-.mini-ork}/config/secrets.local.sh}"
+
+  if _mo_llm_is_executable "$model" || [[ "$_registry_kind" == "openai-compat" || "$_registry_kind" == "executable" ]]; then
     # Executable wrapper: cl_codex.sh / cl_gemini.sh handle their own CLI
     # (these don't support --output-format json universally → keep text)
+    local _exec_bin="$cl_script"
+    local _exec_env=()
+    if [[ ! -f "$cl_script" ]]; then
+      case "$_registry_kind" in
+        openai-compat)
+          # Route through cl_codex.sh with the BYO endpoint contract
+          _exec_bin="$scripts_dir/cl_codex.sh"
+          local _oai_model _oai_base _oai_key_env
+          _oai_model=$(mo_provider_field "$model" model 2>/dev/null) || _oai_model=""
+          _oai_base=$(mo_provider_field "$model" base_url 2>/dev/null) || _oai_base=""
+          _oai_key_env=$(mo_provider_field "$model" api_key_env 2>/dev/null) || _oai_key_env=""
+          [[ -n "$_oai_model" ]] && _exec_env+=("MO_OAI_MODEL=$_oai_model")
+          [[ -n "$_oai_base" ]] && _exec_env+=("MO_OAI_BASE_URL=$_oai_base")
+          [[ -n "$_oai_key_env" ]] && _exec_env+=("MO_OAI_ENV_KEY=$_oai_key_env")
+          ;;
+        executable)
+          local _reg_script
+          _reg_script=$(mo_provider_field "$model" script 2>/dev/null) || _reg_script=""
+          if [[ -z "$_reg_script" ]]; then
+            echo "mo_llm_dispatch: provider '$model' kind=executable needs a script field" >> "$err_log"
+            return 2
+          fi
+          [[ "$_reg_script" != /* ]] && _reg_script="$MINI_ORK_ROOT/$_reg_script"
+          if [[ ! -x "$_reg_script" ]]; then
+            echo "mo_llm_dispatch: provider '$model' script not executable: $_reg_script" >> "$err_log"
+            return 2
+          fi
+          _exec_bin="$_reg_script"
+          ;;
+      esac
+    fi
     if [[ -n "$TIMEOUT_CMD" ]]; then
-      "$TIMEOUT_CMD" --kill-after=60 "$timeout_s" \
-        "$cl_script" --print --output-format text "$prompt" \
-        > "$out_file" 2>"$err_log" || return $?
+      (
+        set +u
+        [[ -f "$secrets" ]] && source "$secrets" 2>/dev/null || true
+        for _kv in "${_exec_env[@]}"; do export "$_kv"; done
+        "$TIMEOUT_CMD" --kill-after=60 "$timeout_s" \
+          "$_exec_bin" --print --output-format text "$prompt"
+      ) > "$out_file" 2>"$err_log" || return $?
     else
-      "$cl_script" --print --output-format text "$prompt" \
-        > "$out_file" 2>"$err_log" || return $?
+      (
+        set +u
+        [[ -f "$secrets" ]] && source "$secrets" 2>/dev/null || true
+        for _kv in "${_exec_env[@]}"; do export "$_kv"; done
+        "$_exec_bin" --print --output-format text "$prompt"
+      ) > "$out_file" 2>"$err_log" || return $?
     fi
     _mo_llm_write_text_transcript "$out_file" "$model"
   else
     # Sourceable env-export: must run claude in subshell with cl_*.sh sourced
-    local secrets="${MINI_ORK_SECRETS:-${MINI_ORK_HOME:-.mini-ork}/config/secrets.local.sh}"
 
     # v0.2-pt23: stream-json mode requires --verbose per claude CLI contract.
     local _verbose_flag=()
@@ -335,7 +476,11 @@ mo_llm_dispatch() {
       (
         set +u  # secrets file may reference unset vars
         [[ -f "$secrets" ]] && source "$secrets" 2>/dev/null || true
-        source "$cl_script"
+        if [[ -n "$_registry_kind" ]]; then
+          _mo_registry_apply_env "$model" || exit 9
+        else
+          source "$cl_script"
+        fi
         "$TIMEOUT_CMD" --kill-after=60 "$timeout_s" claude \
           --print \
           --permission-mode bypassPermissions \
@@ -349,7 +494,11 @@ mo_llm_dispatch() {
       (
         set +u
         [[ -f "$secrets" ]] && source "$secrets" 2>/dev/null || true
-        source "$cl_script"
+        if [[ -n "$_registry_kind" ]]; then
+          _mo_registry_apply_env "$model" || exit 9
+        else
+          source "$cl_script"
+        fi
         claude \
           --print \
           --permission-mode bypassPermissions \
