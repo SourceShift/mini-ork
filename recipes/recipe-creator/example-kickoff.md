@@ -37,6 +37,17 @@ heterogeneous coverage:
 
 Pick 3+ distinct model families across these stances.
 
+## Verification command (HOW success is proved)
+
+```bash
+bash recipes/db-migration-audit/verifiers/recipe-validator.sh
+```
+
+The generated recipe's own `verifier_smith` populates this verifier with
+structural + heterogeneity-floor checks. The recipe-creator's own
+`recipe-validator.sh` is the meta-validator that fires before publish.
+No external test suite required.
+
 ## Out of scope
 
 - Executing the migration (read-only audit)
