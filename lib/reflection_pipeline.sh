@@ -66,10 +66,14 @@ PY
     [[ -z "$tid" ]] && continue
     while IFS= read -r gradient; do
       [[ -z "$gradient" ]] && continue
-      gradient_store "$gradient" >/dev/null 2>&1 || true
+      gradient_store "$gradient" >/dev/null || true
       echo "$gradient"
       (( extracted++ )) || true
-    done < <(gradient_extract "$tid" 2>/dev/null || true)
+    # </dev/null: the claude CLI inside gradient_extract slurps inherited
+    # stdin (the herestring feeding the outer loop) — without this the
+    # first LLM call eats all remaining trace ids and the loop stops
+    # after one trace.
+    done < <(gradient_extract "$tid" </dev/null || true)
   done <<< "$trace_ids"
 
   echo "reflection_extract_gradients: extracted ${extracted} gradients since ${since_ts}" >&2
