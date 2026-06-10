@@ -17,11 +17,46 @@ state.db + filesystem, so the UI can answer:
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any
 
 from . import artifacts, recipes
 from .db import StateDB
+
+# task_runs.status values after which no node can possibly still be running.
+_TERMINAL_RUN_STATUSES = {"published", "rolled_back", "failed"}
+
+
+def _dispatcher_alive(home: Path, task_run_id: str) -> bool:
+    """Probe the dispatcher .pid written by bin/mini-ork-execute. Missing
+    file or dead pid → not alive. PermissionError on the signal-0 probe
+    means the process exists under another uid → treat as alive."""
+    pid_file = home / "runs" / task_run_id / ".pid"
+    try:
+        pids = [int(p) for p in pid_file.read_text().split() if p.strip().isdigit()]
+    except (OSError, ValueError):
+        return False
+    for pid in pids:
+        try:
+            os.kill(pid, 0)
+            return True
+        except ProcessLookupError:
+            continue
+        except PermissionError:
+            return True
+    return False
+
+
+def _reconcile_stale_running(ev: dict[str, Any], run_is_dead: bool) -> dict[str, Any]:
+    """A node is only truly 'running' while the dispatcher is alive. A
+    dangling node_start on a dead run (SIGKILL'd dispatcher, crash before
+    the EXIT-trap finalizer landed, historical rows) must render as
+    failed/CRASH — observed run-1781081895-31571 showing the test node
+    'running' days after the orchestrator tree was killed."""
+    if ev.get("status") != "running" or not run_is_dead:
+        return ev
+    return {**ev, "status": "failed", "verdict": ev.get("verdict") or "CRASH", "interrupted": True}
 
 
 # Heuristic mapping: recipe node → output artifact filename emitted by
@@ -80,6 +115,12 @@ def list_agents(
     # Per-node lifecycle events (node_start / node_end) keyed by node_id.
     node_events = _collect_node_events(db, task_run_id)
 
+    # Liveness gate for 'running' nodes: terminal run status OR a dead
+    # dispatcher means any dangling node_start is a crash artifact.
+    run_is_dead = tr.get("status") in _TERMINAL_RUN_STATUSES or not _dispatcher_alive(
+        home, task_run_id
+    )
+
     # Per-node LLM call rollup (cost, count, tokens) — joined via traceparent
     # LIKE trace_id AND metadata_json -> node_id when available, with
     # lane→node_id fallback derived from the recipe DAG.
@@ -101,7 +142,7 @@ def list_agents(
     for node in fp["nodes"]:
         node_id = node["name"]
         node_type = node["type"]
-        ev = node_events.get(node_id, {})
+        ev = _reconcile_stale_running(node_events.get(node_id, {}), run_is_dead)
         llm_summary = llm_per_node.get(node_id, {"count": 0, "cost": 0.0, "tokens": 0, "fallback": False})
         # All-node llm aggregate if metadata didn't carry node_id (older runs)
         if llm_summary["count"] == 0 and llm_per_node.get("__unattributed__"):
@@ -121,6 +162,7 @@ def list_agents(
                 "dispatch_mode": node.get("dispatch_mode"),
                 "gates": node.get("gates") or [],
                 "status": ev.get("status", "never_seen"),
+                "interrupted": ev.get("interrupted", False),
                 "duration_ms": ev.get("duration_ms"),
                 "verdict": ev.get("verdict"),
                 "started_at": ev.get("started_at"),
@@ -242,7 +284,7 @@ def agent_detail(
     node_id: str,
 ) -> dict[str, Any]:
     """Full per-agent detail: prompt, output, LLM calls, child spawns, transcript."""
-    tr = db.row("SELECT recipe, trace_id, created_at, ended_at FROM task_runs WHERE id = ?", (task_run_id,))
+    tr = db.row("SELECT recipe, trace_id, created_at, ended_at, status FROM task_runs WHERE id = ?", (task_run_id,))
     if not tr:
         return {"error": f"task_run {task_run_id} not found"}
     recipe_name = tr.get("recipe")
@@ -251,7 +293,10 @@ def agent_detail(
     if not node:
         return {"error": f"node {node_id} not in recipe {recipe_name}"}
 
-    ev = _collect_node_events(db, task_run_id).get(node_id, {})
+    ev = _reconcile_stale_running(
+        _collect_node_events(db, task_run_id).get(node_id, {}),
+        tr.get("status") in _TERMINAL_RUN_STATUSES or not _dispatcher_alive(home, task_run_id),
+    )
 
     # Prompt source — recipe-relative path under recipes/<name>/<prompt_ref>
     prompt_text = None
