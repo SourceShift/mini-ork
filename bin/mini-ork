@@ -291,6 +291,30 @@ PY
       printf '%s\n' "$execute_out" > "$_run_dir/execute.log" 2>/dev/null || true
     fi
 
+    # ── rubric pre-screen (advisory scoring) ──────────────────────────────────
+    # Scores the run's artifacts against the kickoff via an 8-item rubric
+    # (lib/rubric-prescreen.sh). Advisory — never changes _run_rc — but the
+    # outcome is written as an execution trace, so the reflect step below
+    # converts rubric FAIL items into gradients that future runs of this
+    # task_class get injected into their prompts. Also writes
+    # panel-verdict.json, making lib/promotion_gate.sh's panel-score gate
+    # evaluate real data instead of fail-opening. Opt-out: MO_RUBRIC=0.
+    if [ "${MO_RUBRIC:-1}" = "1" ] && [ -d "$_run_dir" ]; then
+      echo "── rubric (advisory pre-screen) ──"
+      # shellcheck source=lib/llm-dispatch.sh
+      source "$MINI_ORK_ROOT/lib/llm-dispatch.sh" 2>/dev/null || true
+      # shellcheck source=lib/trace_store.sh
+      source "$MINI_ORK_ROOT/lib/trace_store.sh" 2>/dev/null || true
+      # shellcheck source=lib/rubric-prescreen.sh
+      source "$MINI_ORK_ROOT/lib/rubric-prescreen.sh" 2>/dev/null || true
+      if declare -f mo_rubric_run_score >/dev/null 2>&1; then
+        mo_rubric_run_score "$kickoff" "$_run_dir" "${MINI_ORK_TASK_CLASS:-generic}" \
+          || echo "  [warn] rubric pre-screen failed (advisory — run unaffected)" >&2
+      else
+        echo "  [warn] mo_rubric_run_score unavailable — skipping rubric" >&2
+      fi
+    fi
+
     # ── verify ─────────────────────────────────────────────────────────────────
     _verify_rc=0
     if [ -n "${MINI_ORK_ARTIFACT_PATH:-}" ]; then
