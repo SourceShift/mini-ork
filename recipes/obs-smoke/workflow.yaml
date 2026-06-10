@@ -1,0 +1,53 @@
+task_class: obs_smoke
+description: >
+  Two-node LLM smoke (researcher + reviewer) + a deterministic verifier
+  + a publisher. Designed to be cheap, deterministic, and to touch every
+  observability emit:
+    - llm_calls (per-turn metadata.node_id, traceparent, session_id, tokens)
+    - run_events (node_start, node_end per node)
+    - task_runs status transitions: classified → planned → executing → published
+    - filesystem artifacts: lens-tiny.md, review-tiny_reviewer.json,
+      verifier-result-lens-exists.json
+    - cost_usd accumulation
+
+nodes:
+  # Named *_lens on purpose: the executor's lens heuristic maps node ids
+  # ending in _lens to lens-<stem>.md output (here lens-tiny.md), which is
+  # what verifiers/lens-exists.sh and artifact_contract.yaml expect. A
+  # generic name like tiny_researcher would produce context-<id>.json and
+  # fail the lens_exists verifier.
+  - name: tiny_lens
+    type: researcher
+    model_lane: opus_lens
+    prompt_ref: prompts/tiny-researcher.md
+    dispatch_mode: serial
+
+  - name: tiny_reviewer
+    type: reviewer
+    model_lane: opus_lens
+    prompt_ref: prompts/tiny-reviewer.md
+    dispatch_mode: serial
+
+  - name: lens_exists
+    type: verifier
+    prompt_ref: null
+    verifier_ref: verifiers/lens-exists.sh
+    dispatch_mode: serial
+
+  - name: publisher
+    type: publisher
+    prompt_ref: null
+    dispatch_mode: serial
+
+  - name: rollback
+    type: rollback
+    prompt_ref: null
+    dispatch_mode: serial
+
+edges:
+  - { from: tiny_lens,       to: tiny_reviewer, edge_type: depends_on }
+  - { from: tiny_reviewer,   to: lens_exists,   edge_type: verifies   }
+  - { from: lens_exists,     to: publisher,     edge_type: depends_on }
+  - { from: lens_exists,     to: rollback,      edge_type: escalates_to }
+
+rollback_strategy: keep_artifacts_discard_publish
