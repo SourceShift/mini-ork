@@ -16,16 +16,13 @@ rollback_policy: >
   if all three drafts failed the heterogeneity floor or structural
   check.
 
-# Publisher path (D-037). source_artifact is the chosen draft staged
-# under ${MINI_ORK_RUN_DIR}/chosen/, and outputs[] are derived
-# dynamically because the recipe name comes from the planner. The
-# publisher accepts an explicit ${MINI_ORK_RECIPE_DEST}-style env var
-# that the planner writes into run_profile.json as artifact_destination
-# (see bin/mini-ork-execute publisher branch).
-source_artifact: chosen
+# Publisher path (D-037). The recipe-creator's arbiter writes the chosen
+# draft to ${RUN_DIR}/chosen/<derived_recipe_name>/ AND records the slug
+# in ${RUN_DIR}/chosen/recipe_name (single line). The publisher branch
+# in bin/mini-ork-execute reads recipe_name and exports
+# MINI_ORK_DERIVED_RECIPE_NAME before resolving the ${VAR} substitutions
+# in source_artifact + outputs[] below. envsubst (or bash eval fallback)
+# does the actual expansion. See bin/mini-ork-execute publisher node.
+source_artifact: chosen/${MINI_ORK_DERIVED_RECIPE_NAME}/
 outputs:
-  # The publisher copies the entire chosen/ subtree to:
-  #   ${MINI_ORK_RECIPE_DEST:-recipes/<derived_name>/}
-  # The derived name comes from chosen/recipe_name file written by the
-  # arbiter (kebab-case slug ≤ 32 chars, validated by recipe-validator.sh).
   - recipes/${MINI_ORK_DERIVED_RECIPE_NAME}/
