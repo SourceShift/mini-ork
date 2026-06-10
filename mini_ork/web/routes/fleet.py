@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import time
 from datetime import datetime
 from typing import Any
 
@@ -11,6 +13,9 @@ from ..deps import get_db
 from ..db import StateDB
 
 router = APIRouter(prefix="/api/v1", tags=["fleet"])
+
+ACTIVE_TASK_RUN_STATUSES = ("executing", "verifying", "reviewing")
+ACTIVE_TASK_RUN_STALE_SECONDS = int(os.environ.get("MINI_ORK_ACTIVE_STALE_SECONDS", str(6 * 60 * 60)))
 
 
 @router.get("/health")
@@ -27,6 +32,7 @@ def health(db: StateDB = Depends(get_db)) -> dict[str, Any]:
 @router.get("/runs/active")
 def active_runs(db: StateDB = Depends(get_db)) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
+    cutoff = int(time.time()) - ACTIVE_TASK_RUN_STALE_SECONDS
 
     if db.has_table("runs"):
         for row in db.rows(
@@ -41,6 +47,8 @@ def active_runs(db: StateDB = Depends(get_db)) -> list[dict[str, Any]]:
             LIMIT 100
             """
         ):
+            if not _is_recent_active_ts(row.get("last_heartbeat_at"), cutoff):
+                continue
             rows.append({**row, "source": "runs", "task_run_id": None, "status": None})
 
     if db.has_table("task_runs"):
@@ -50,10 +58,12 @@ def active_runs(db: StateDB = Depends(get_db)) -> list[dict[str, Any]]:
                    cost_usd, created_at, updated_at, ended_at
             FROM task_runs
             WHERE ended_at IS NULL
-              AND status NOT IN ('published', 'rolled_back', 'failed')
+              AND status IN (?, ?, ?)
+              AND updated_at >= ?
             ORDER BY updated_at DESC
             LIMIT 100
-            """
+            """,
+            (*ACTIVE_TASK_RUN_STATUSES, cutoff),
         )
         for row in task_rows:
             label = row.get("recipe") or row.get("task_class") or "task_run"
@@ -88,6 +98,10 @@ def active_runs(db: StateDB = Depends(get_db)) -> list[dict[str, Any]]:
         reverse=True,
     )
     return rows[:100]
+
+
+def _is_recent_active_ts(value: Any, cutoff: int) -> bool:
+    return _active_sort_ts(value) >= cutoff
 
 
 def _active_sort_ts(value: Any) -> float:
