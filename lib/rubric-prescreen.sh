@@ -206,6 +206,161 @@ PY
   fi
 }
 
+# ── mini-ork run-lifecycle entry point ───────────────────────────────────────
+# mo_rubric_run_score <kickoff_path> <run_dir> <task_class>
+#
+# Run-shaped sibling of mo_run_rubric_prescreen (which is epic/iter-shaped
+# for the mini-orch deliver flow and needs the epics table + worktrees).
+# Dispatches through llm_dispatch so cost/telemetry land in llm_calls.
+#
+# Writes:
+#   <run_dir>/rubric.json          {pass, score 0-8, items[]}
+#   <run_dir>/panel-verdict.json   {panel_score 0-100, ...} — consumed by
+#                                  lib/promotion_gate.sh (was fail-open
+#                                  forever because nothing wrote this file)
+#   execution_traces row           status=success|failure with the rubric
+#                                  JSON in verifier_output, so auto-reflect
+#                                  (gradient_extract) turns FAIL items into
+#                                  gradient_records → injected into future
+#                                  prompts of the same task_class.
+#
+# Advisory: always returns 0 unless inputs are missing. A bad rubric run
+# must never fail the lifecycle.
+mo_rubric_run_score() {
+  local kickoff_path="${1:?kickoff_path required}"
+  local run_dir="${2:?run_dir required}"
+  local task_class="${3:-generic}"
+
+  [ -f "$kickoff_path" ] || { echo "rubric: kickoff not found: $kickoff_path" >&2; return 1; }
+  [ -d "$run_dir" ]      || { echo "rubric: run_dir not found: $run_dir" >&2; return 1; }
+  declare -f llm_dispatch >/dev/null 2>&1 || { echo "rubric: llm_dispatch not loaded" >&2; return 1; }
+
+  local template="$MINI_ORK_ROOT/prompts/rubric-prescreen.md"
+  [ -f "$template" ] || { echo "rubric: template missing: $template" >&2; return 1; }
+
+  local rubric_path="$run_dir/rubric.json"
+  local verdict_path="$run_dir/panel-verdict.json"
+
+  # Bounded work-product summary: artifact list + head of each text file.
+  # Plays the role {{DIFF_SUMMARY}} plays in the epic flow.
+  local artifact_summary
+  artifact_summary=$(python3 - "$run_dir" <<'PY'
+import os, sys
+run_dir = sys.argv[1]
+lines = []
+for name in sorted(os.listdir(run_dir)):
+    path = os.path.join(run_dir, name)
+    if not os.path.isfile(path) or name.startswith("."):
+        continue
+    size = os.path.getsize(path)
+    lines.append(f"### {name} ({size} bytes)")
+    if name.endswith((".md", ".json", ".txt", ".yaml", ".log")) and size > 0:
+        try:
+            with open(path, errors="replace") as f:
+                head = "".join(f.readlines()[:25])
+            lines.append(head[:2000].rstrip())
+        except Exception:
+            pass
+    lines.append("")
+print("\n".join(lines)[:12000])
+PY
+)
+  [ -n "$artifact_summary" ] || artifact_summary="(run dir contains no readable artifacts)"
+
+  local prompt_text
+  prompt_text=$(python3 - "$template" "$kickoff_path" <<'PY' "$artifact_summary"
+import sys
+template, kickoff = sys.argv[1], sys.argv[2]
+artifacts = sys.argv[3]
+body = open(template, errors="replace").read()
+body = body.replace("{{KICKOFF_BODY}}", open(kickoff, errors="replace").read())
+body = body.replace("{{DIFF_SUMMARY}}", artifacts)
+print(body)
+PY
+)
+
+  echo "  rubric: scoring run artifacts (task_class=$task_class)" >&2
+  local raw rc=0
+  raw=$(llm_dispatch \
+    --task-class "$task_class" \
+    --node-type rubric \
+    --prompt-text "$prompt_text" 2>&1) || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    echo "  rubric: dispatch failed (rc=$rc): $(printf '%s' "$raw" | tail -c 300)" >&2
+    jq -n '{pass: false, score: -1, parse_error: true, items: []}' > "$rubric_path"
+    return 0
+  fi
+
+  # Extract the {"pass":...} object (model may wrap it in prose/fences).
+  local extracted
+  extracted=$(RESULT_TEXT="$raw" python3 - <<'PY' 2>/dev/null
+import re, sys, json, os
+text = os.environ.get("RESULT_TEXT", "")
+starts = [m.start() for m in re.finditer(r'\{[^{]*?"pass"\s*:', text)]
+for start in reversed(starts):
+    depth, in_str, esc = 0, False, False
+    for i in range(start, len(text)):
+        c = text[i]
+        if esc: esc = False; continue
+        if c == '\\': esc = True; continue
+        if c == '"': in_str = not in_str; continue
+        if in_str: continue
+        if c == '{': depth += 1
+        elif c == '}':
+            depth -= 1
+            if depth == 0:
+                cand = text[start:i+1]
+                try:
+                    json.loads(cand); print(cand); sys.exit(0)
+                except Exception:
+                    break
+PY
+)
+
+  if [ -n "$extracted" ] && echo "$extracted" | jq -e '.pass != null and .score != null' >/dev/null 2>&1; then
+    echo "$extracted" | jq -c '.' > "$rubric_path"
+  else
+    jq -n --arg diag "$(printf '%s' "$raw" | tail -c 800)" \
+      '{pass: false, score: -1, parse_error: true, items: [], parse_error_diagnostic: $diag}' \
+      > "$rubric_path"
+  fi
+
+  local score pass
+  score=$(jq -r '.score' "$rubric_path")
+  pass=$(jq -r '.pass' "$rubric_path")
+  echo "  rubric: pass=$pass score=$score/8 → $rubric_path" >&2
+
+  # Panel verdict for the promotion gate: 0-8 → 0-100.
+  if [ "$score" != "-1" ]; then
+    jq -n --argjson score "$score" --argjson pass "$pass" \
+          --arg src "rubric-prescreen" --arg tc "$task_class" \
+      '{panel_score: ($score * 12.5), pass: $pass, source: $src,
+        task_class: $tc, scale: "rubric 0-8 mapped to 0-100"}' \
+      > "$verdict_path"
+  fi
+
+  # Learning hook: persist as an execution trace so reflection_extract_
+  # gradients (auto-reflect at end of run) sees the rubric outcome and
+  # mints gradients from FAIL items. gradient_store joins task_class from
+  # this row via evidence=trace_id.
+  if declare -f trace_write >/dev/null 2>&1; then
+    # trace_write's ${MINI_ORK_DB:?} expansion kills the whole shell when
+    # unset — even under `|| true` — so resolve the default here.
+    export MINI_ORK_DB="${MINI_ORK_DB:-${MINI_ORK_HOME:-$MINI_ORK_ROOT/.mini-ork}/state.db}"
+    local _trace_id="tr-rubric-$(date +%s)-$$"
+    local _status="failure"
+    [ "$pass" = "true" ] && _status="success"
+    local _payload
+    _payload=$(jq -n --arg tid "$_trace_id" --arg tc "$task_class" \
+                     --arg st "$_status" --arg ref "$rubric_path" \
+                     --slurpfile rub "$rubric_path" \
+      '{trace_id: $tid, task_class: $tc, status: $st,
+        final_artifact_ref: $ref, verifier_output: $rub[0]}')
+    trace_write "$_payload" >/dev/null 2>&1 || true
+  fi
+  return 0
+}
+
 # Append rubric findings to feedback (advisory only).
 mo_append_rubric_to_feedback() {
   local epic="$1" iter="$2" feedback_path="$3"
