@@ -52,29 +52,72 @@ _mo_llm_write_duration_ms() {
 }
 
 _mo_llm_write_llm_calls_row() {
+  # Args (positional):
+  #   1=provider 2=model_id 3=tier 4=feature_name 5=actor
+  #   6=status   7=duration_ms 8=cost_usd 9=error_message
+  #   10=input_tokens (optional) 11=output_tokens (optional)
+  #   12=metadata_json (optional) — per-turn extras like turn_index, session_id
   local provider="$1" model_id="$2" tier="$3" feature_name="$4"
   local actor="$5" status="$6" duration_ms="$7" cost_usd="$8" error_message="$9"
+  local input_tokens="${10:-0}" output_tokens="${11:-0}" metadata_json="${12:-{\}}"
+  # Always include MO_NODE_ID in metadata for UI attribution — the
+  # recipe's actual node name (e.g. perf_lens, opus_synthesizer), distinct
+  # from lane/family (e.g. minimax_lens, opus_lens) which appears in
+  # feature_name. Lens nodes share lanes so feature_name alone is
+  # ambiguous; node_id is the unique key.
+  if [ -n "${MO_NODE_ID:-}" ]; then
+    metadata_json=$(MO_NODE_ID="$MO_NODE_ID" python3 -c '
+import json, os, sys
+md = sys.argv[1] or "{}"
+try: d = json.loads(md)
+except Exception: d = {}
+if not isinstance(d, dict): d = {}
+d["node_id"] = os.environ.get("MO_NODE_ID", "")
+print(json.dumps(d))' "$metadata_json")
+  fi
   [ -n "${MINI_ORK_DB:-}" ] && [ -f "$MINI_ORK_DB" ] || return 0
 
   local iter="${MO_RECURSIVE_ITER:-}"
   local run_id="${MINI_ORK_RUN_ID:-}"
   local traceparent="${MO_TRACEPARENT:-}"
+  # Auto-derive traceparent from the task_runs row if env wasn't set —
+  # covers bin/mini-ork-plan + bin/mini-ork-classify (and anywhere else)
+  # that doesn't explicitly export MO_TRACEPARENT. The dispatcher does
+  # export it after reading task_runs.trace_id, but earlier stages
+  # (classify writes the row, plan runs before execute) need this fallback.
+  if [ -z "$traceparent" ] && [ -n "${MINI_ORK_TASK_RUN_ID:-}" ] && [ -f "${MINI_ORK_DB:-}" ]; then
+    local _tid
+    _tid=$(sqlite3 "$MINI_ORK_DB" "SELECT COALESCE(trace_id,'') FROM task_runs WHERE id='${MINI_ORK_TASK_RUN_ID}' LIMIT 1;" 2>/dev/null)
+    if [ -n "$_tid" ]; then
+      traceparent="00-${_tid}-$(printf '%016x' $((RANDOM * RANDOM + $$)))-01"
+    fi
+  fi
   local err_dir="${MINI_ORK_RUN_DIR:-/tmp}"
   mkdir -p "$err_dir" 2>/dev/null || err_dir="/tmp"
 
   python3 - "$MINI_ORK_DB" "$provider" "$model_id" "$tier" "$feature_name" \
     "$actor" "$status" "$duration_ms" "$cost_usd" "$error_message" \
-    "$iter" "$run_id" "$traceparent" <<'PY' 2>>"${err_dir}/trace-write-errors.log" || true
+    "$iter" "$run_id" "$traceparent" "$input_tokens" "$output_tokens" "$metadata_json" \
+    <<'PY' 2>>"${err_dir}/trace-write-errors.log" || true
 import sqlite3
 import sys
 
 db, *args = sys.argv[1:]
 con = sqlite3.connect(db, timeout=5)
 con.execute("PRAGMA busy_timeout=5000")
+in_tok = int(args[12] or 0)
+out_tok = int(args[13] or 0)
+import json as _json
+try:
+    _md = _json.loads(args[14] or "{}")
+    _sess = _md.get("session_id") if isinstance(_md, dict) else None
+except Exception:
+    _sess = None
 con.execute(
     "INSERT INTO llm_calls (provider, model_id, tier, feature_name, actor, "
-    "status, duration_ms, cost_usd, error_message, iter, run_id, traceparent) "
-    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+    "status, duration_ms, cost_usd, error_message, iter, run_id, traceparent, "
+    "input_tokens, output_tokens, total_tokens, metadata_json, session_id) "
+    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
     (
         args[0],
         args[1],
@@ -88,6 +131,11 @@ con.execute(
         int(args[9]) if args[9] else None,
         args[10] or None,
         args[11] or None,
+        in_tok,
+        out_tok,
+        in_tok + out_tok,
+        args[14] or "{}",
+        _sess,
     ),
 )
 con.commit()
@@ -102,6 +150,75 @@ _mo_llm_provider_for_model() {
     minimax*|glm*|kimi*|deepseek*) printf 'gateway\n' ;;
     *) printf 'anthropic\n' ;;
   esac
+}
+
+_mo_llm_write_text_transcript() {
+  local out_file="${1:?out_file required}"
+  local model="${2:-unknown}"
+  [ -f "$out_file" ] || return 0
+  [ -f "${out_file}.transcript.json" ] && return 0
+
+  python3 - "$out_file" "$model" <<'PY' 2>/dev/null || true
+import json
+import os
+import sys
+
+out_path, model = sys.argv[1:3]
+max_bytes = int(os.environ.get("MO_MAX_TRANSCRIPT_BYTES", "1048576"))
+try:
+    with open(out_path, "r", encoding="utf-8", errors="replace") as f:
+        text = f.read(max_bytes + 1)
+except OSError:
+    sys.exit(0)
+
+truncated = len(text.encode("utf-8", errors="replace")) > max_bytes
+if truncated:
+    text = text[:max(200, max_bytes // 4)] + "\n...[truncated]"
+
+payload = {
+    "turns": [
+        {
+            "turn_index": 0,
+            "model": model,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "text": text,
+            "tool_uses": [],
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "stop_reason": None,
+            "session_id": None,
+        }
+    ],
+    "fallback": "text-output",
+}
+if truncated:
+    payload["truncated"] = True
+with open(out_path + ".transcript.json", "w", encoding="utf-8") as f:
+    json.dump(payload, f)
+PY
+}
+
+_mo_llm_persist_agent_transcript() {
+  local out_file="${1:?out_file required}"
+  local model="${2:-unknown}"
+  [ -n "${MINI_ORK_RUN_DIR:-}" ] || return 0
+  [ -n "${MO_NODE_ID:-}" ] || return 0
+  [ -d "$MINI_ORK_RUN_DIR" ] || return 0
+
+  if [ ! -f "${out_file}.transcript.json" ]; then
+    _mo_llm_write_text_transcript "$out_file" "$model"
+  fi
+  [ -f "${out_file}.transcript.json" ] || return 0
+
+  local safe_node
+  safe_node=$(printf '%s' "$MO_NODE_ID" | tr -c 'A-Za-z0-9_.-' '_')
+  cp "${out_file}.transcript.json" \
+    "${MINI_ORK_RUN_DIR}/agent-${safe_node}.transcript.json" 2>/dev/null || true
+  if [ -f "${out_file}.stream.jsonl" ]; then
+    cp "${out_file}.stream.jsonl" \
+      "${MINI_ORK_RUN_DIR}/agent-${safe_node}.stream.jsonl" 2>/dev/null || true
+  fi
 }
 
 # v0.2-pt38 (E-MO-19, 2026-06-02): models that route through non-Anthropic
@@ -205,6 +322,7 @@ mo_llm_dispatch() {
       "$cl_script" --print --output-format text "$prompt" \
         > "$out_file" 2>"$err_log" || return $?
     fi
+    _mo_llm_write_text_transcript "$out_file" "$model"
   else
     # Sourceable env-export: must run claude in subshell with cl_*.sh sourced
     local secrets="${MINI_ORK_SECRETS:-${MINI_ORK_HOME:-.mini-ork}/config/secrets.local.sh}"
@@ -257,6 +375,10 @@ tool_calls = []
 files_read = []
 files_written = []
 session_id = None
+turns = []  # per-assistant-message usage; one row per real API turn
+total_input_tokens = 0
+total_output_tokens = 0
+transcript_fallback = None
 try:
     with open(raw_path) as f:
         for line in f:
@@ -274,10 +396,80 @@ try:
                 is_error_flag = bool(obj.get('is_error', False))
                 api_error_status = obj.get('api_error_status')
                 session_id = obj.get('session_id', session_id)
+                # Some SDK versions surface usage on the result envelope too
+                u = obj.get('usage') or {}
+                if u and not turns:
+                    total_input_tokens = int(u.get('input_tokens') or 0)
+                    total_output_tokens = int(u.get('output_tokens') or 0)
             elif et == 'system' and obj.get('subtype') == 'init':
                 session_id = obj.get('session_id', session_id)
             elif et == 'assistant':
                 msg = obj.get('message', {}) or {}
+                # Per-turn usage — one llm_calls row will be written per turn
+                u = msg.get('usage') or {}
+                turn_in = int(u.get('input_tokens') or 0)
+                turn_out = int(u.get('output_tokens') or 0)
+                cache_in = int(u.get('cache_read_input_tokens') or 0)
+                cache_create = int(u.get('cache_creation_input_tokens') or 0)
+                model_id_turn = msg.get('model')
+                stop_reason = msg.get('stop_reason')
+                # Extract full per-turn text + tool_use blocks for the UI's
+                # "agent transcript" view. Without these, the UI shows only
+                # tokens/cost metadata — users can't see what the agent
+                # actually said or did.
+                turn_text_blocks = []
+                turn_tool_uses = []
+                for block in msg.get('content', []) or []:
+                    if not isinstance(block, dict):
+                        continue
+                    btype = block.get('type')
+                    if btype == 'text':
+                        turn_text_blocks.append(block.get('text', ''))
+                    elif btype == 'tool_use':
+                        turn_tool_uses.append({
+                            'id': block.get('id'),
+                            'name': block.get('name'),
+                            'input': block.get('input', {}),
+                        })
+                if turn_in or turn_out:
+                    # The CLI emits one assistant event PER CONTENT BLOCK
+                    # (thinking / text / tool_use), each repeating the same
+                    # message id and cumulative usage. Merge events sharing a
+                    # message id into one turn, replacing (not summing) usage.
+                    msg_id = msg.get('id')
+                    prev = turns[-1] if turns else None
+                    if prev is not None and msg_id and prev.get('message_id') == msg_id:
+                        total_input_tokens += turn_in - prev['input_tokens']
+                        total_output_tokens += turn_out - prev['output_tokens']
+                        prev['input_tokens'] = turn_in
+                        prev['output_tokens'] = turn_out
+                        prev['cache_read_input_tokens'] = cache_in
+                        prev['cache_creation_input_tokens'] = cache_create
+                        if turn_text_blocks:
+                            joined = '\n'.join(turn_text_blocks)
+                            prev['text'] = (prev['text'] + '\n' + joined) if prev['text'] else joined
+                        prev['tool_uses'].extend(turn_tool_uses)
+                        if model_id_turn:
+                            prev['model'] = model_id_turn
+                        if stop_reason:
+                            prev['stop_reason'] = stop_reason
+                    else:
+                        turns.append({
+                            'turn_index': len(turns),
+                            'model': model_id_turn,
+                            'message_id': msg_id,
+                            'input_tokens': turn_in,
+                            'output_tokens': turn_out,
+                            'text': '\n'.join(turn_text_blocks),
+                            'tool_uses': turn_tool_uses,
+                            'cache_read_input_tokens': cache_in,
+                            'cache_creation_input_tokens': cache_create,
+                            'stop_reason': stop_reason,
+                            'session_id': session_id,
+                        })
+                        total_input_tokens += turn_in
+                        total_output_tokens += turn_out
+                # Tool calls (separate concern from token counting)
                 for block in msg.get('content', []) or []:
                     if not isinstance(block, dict):
                         continue
@@ -310,6 +502,15 @@ with open(out_path, 'w') as f:
     f.write((result_text or '') + ('\n' if result_text and not result_text.endswith('\n') else ''))
 with open(out_path + '.cost', 'w') as f:
     f.write(f"{total_cost_usd}\n")
+# Token totals sidecar (TAB-separated: input\toutput)
+with open(out_path + '.tokens', 'w') as f:
+    f.write(f"{total_input_tokens}\t{total_output_tokens}\n")
+# Per-turn telemetry — one JSONL line per assistant message with usage.
+# Consumed by lib/llm-dispatch.sh:llm_dispatch shim to emit one llm_calls row
+# per real API turn instead of one summary per agent envelope.
+with open(out_path + '.turns.jsonl', 'w') as f:
+    for t in turns:
+        f.write(json.dumps(t) + '\n')
 with open(out_path + '.tool-summary', 'w') as f:
     json.dump({
         'session_id': session_id,
@@ -317,13 +518,58 @@ with open(out_path + '.tool-summary', 'w') as f:
         'files_read': files_read,
         'files_written': files_written,
     }, f)
+# Per-turn transcript with FULL content (text + tool_use blocks). The UI's
+# AgentDetailPage reads this to render expandable turn cards showing what
+# the agent actually said and which tools it called — the user-facing
+# "agent transcript" surface. Capped to MAX_TRANSCRIPT_BYTES (1 MiB total
+# for the whole turns array) to avoid runaway disk usage on very long runs.
+import os as _os
+MAX_TRANSCRIPT_BYTES = int(_os.environ.get('MO_MAX_TRANSCRIPT_BYTES', '1048576'))
+if not turns and result_text:
+    turns.append({
+        'turn_index': 0,
+        'model': None,
+        'input_tokens': total_input_tokens,
+        'output_tokens': total_output_tokens,
+        'text': result_text,
+        'tool_uses': [],
+        'cache_read_input_tokens': 0,
+        'cache_creation_input_tokens': 0,
+        'stop_reason': None,
+        'session_id': session_id,
+    })
+    transcript_fallback = 'text-output'
+_payload_obj = {'turns': turns}
+if transcript_fallback:
+    _payload_obj['fallback'] = transcript_fallback
+_payload = json.dumps(_payload_obj)
+if len(_payload) > MAX_TRANSCRIPT_BYTES:
+    # Trim each turn's text from the END until under cap. Preserve metadata.
+    for t in turns:
+        if 'text' in t and t['text']:
+            t['text'] = t['text'][: max(200, len(t['text']) // 4)] + '\n…[truncated]'
+    _payload_obj = {'turns': turns, 'truncated': True}
+    if transcript_fallback:
+        _payload_obj['fallback'] = transcript_fallback
+    _payload = json.dumps(_payload_obj)
+with open(out_path + '.transcript.json', 'w') as f:
+    f.write(_payload)
 PY
       local _post_rc=$?
       if [ $_post_rc -ne 0 ]; then
         rm -f "$_raw_out"
         return $_post_rc
       fi
-      rm -f "$_raw_out"
+      # Preserve the stream-json log as .stream.jsonl so the UI can offer a
+      # "raw stream" download for deep forensics. Per-turn structured content
+      # is in .transcript.json (smaller, parsed). The .stream.jsonl is the
+      # full unprocessed record. Capped via MO_KEEP_STREAM_JSONL=0 to disable.
+      if [ "${MO_KEEP_STREAM_JSONL:-1}" = "1" ]; then
+        mv "$_raw_out" "${out_file}.stream.jsonl" 2>/dev/null || rm -f "$_raw_out"
+      else
+        rm -f "$_raw_out"
+      fi
+      _mo_llm_persist_agent_transcript "$out_file" "$model"
       return 0
     fi
 
@@ -351,11 +597,18 @@ PY
       fi
       jq -r '.result // .' "$_raw_out" > "$out_file"
       jq -r '.total_cost_usd // 0' "$_raw_out" > "${out_file}.cost" 2>/dev/null || true
+      # Token totals from the JSON envelope's usage block (Anthropic CLI emits
+      # them on the top-level result object in non-streaming mode).
+      jq -r '"\(.usage.input_tokens // 0)\t\(.usage.output_tokens // 0)"' \
+        "$_raw_out" > "${out_file}.tokens" 2>/dev/null || true
       rm -f "$_raw_out"
+      _mo_llm_write_text_transcript "$out_file" "$model"
     else
       mv "$_raw_out" "$out_file"
+      _mo_llm_write_text_transcript "$out_file" "$model"
     fi
   fi
+  _mo_llm_persist_agent_transcript "$out_file" "$model"
   return 0
 }
 
@@ -511,15 +764,117 @@ PY
     _duration_ms=$((_duration_end_ms - _duration_start_ms))
     [ "$_duration_ms" -lt 0 ] && _duration_ms=0
     _mo_llm_write_duration_ms "$_duration_ms"
+    _mo_llm_persist_agent_transcript "$out_file" "$model"
     cat "$out_file"
     local _cost_usd="0"
     if [ -f "${out_file}.cost" ]; then
       _cost_usd=$(cat "${out_file}.cost" 2>/dev/null || printf '0')
     fi
-    _mo_llm_write_llm_calls_row \
-      "$(_mo_llm_provider_for_model "$model")" "$model" "${MO_LANE_TIER:-default}" \
-      "mini-ork:${node_type:-unknown}" "${MO_LANE_ACTOR:-${node_type:-${USER:-unknown}}}" \
-      "success" "$_duration_ms" "$_cost_usd" ""
+    # Token totals from sidecar (claude --output-format json emits .usage)
+    local _in_tok=0 _out_tok=0
+    if [ -f "${out_file}.tokens" ]; then
+      IFS=$'\t' read -r _in_tok _out_tok < "${out_file}.tokens" 2>/dev/null || true
+      _in_tok="${_in_tok:-0}"; _out_tok="${_out_tok:-0}"
+    fi
+
+    # Per-turn emission: when stream-json captured per-assistant-message usage,
+    # write ONE llm_calls row per real API turn. This is the "full transparency
+    # on agent runs" surface — instead of a single envelope row per agent
+    # invocation, each underlying claude API call is visible. Falls back to a
+    # single summary row when turns sidecar is absent (text/json modes,
+    # codex/gemini executable lanes).
+    local _provider; _provider=$(_mo_llm_provider_for_model "$model")
+    local _feature="mini-ork:${node_type:-unknown}"
+    local _actor="${MO_LANE_ACTOR:-${node_type:-${USER:-unknown}}}"
+    if [ -f "${out_file}.turns.jsonl" ] && [ -s "${out_file}.turns.jsonl" ]; then
+      # Read each turn → emit one row. Cost is split proportionally across turns.
+      # Per-turn emit path: pass MINI_ORK_TASK_RUN_ID too so the python block
+      # can auto-derive traceparent when MO_TRACEPARENT is empty. Without
+      # this fallback every per-turn row landed with traceparent=NULL and
+      # the UI's strict-bridge filter dropped them.
+      MO_NODE_ID="${MO_NODE_ID:-}" \
+      python3 - "${out_file}.turns.jsonl" "$_cost_usd" "$_provider" "$_feature" \
+                "$_actor" "$model" "$_duration_ms" \
+                "${MO_LANE_TIER:-default}" "${MINI_ORK_DB:-}" \
+                "${MO_RECURSIVE_ITER:-}" "${MINI_ORK_RUN_ID:-}" \
+                "${MO_TRACEPARENT:-}" "${MINI_ORK_TASK_RUN_ID:-}" <<'PY' 2>/dev/null || true
+import json, os, secrets, sqlite3, sys
+turns_path, cost_total, provider, feature, actor, model, duration_ms, \
+  tier, db, iter_, run_id, traceparent, task_run_id = sys.argv[1:14]
+
+# Auto-derive traceparent if env was empty — matches _mo_llm_write_llm_calls_row's
+# fallback so both emit paths produce identical traceparent shape.
+if not traceparent and task_run_id and db:
+    try:
+        _con = sqlite3.connect(db, timeout=2.0)
+        _row = _con.execute(
+            "SELECT COALESCE(trace_id,'') FROM task_runs WHERE id=? LIMIT 1",
+            (task_run_id,),
+        ).fetchone()
+        _con.close()
+        _tid = _row[0] if _row else ""
+        if _tid:
+            traceparent = f"00-{_tid}-{secrets.token_hex(8)}-01"
+    except Exception:
+        pass
+if not db: sys.exit(0)
+try:
+    turns = [json.loads(line) for line in open(turns_path) if line.strip()]
+except Exception:
+    sys.exit(0)
+if not turns: sys.exit(0)
+total_out = sum(int(t.get('output_tokens') or 0) for t in turns) or 1
+cost_total_f = float(cost_total or 0.0)
+con = sqlite3.connect(db, timeout=5)
+con.execute("PRAGMA busy_timeout=5000")
+for t in turns:
+    # Cost split proportionally by output_tokens (output dominates cost)
+    out_tok = int(t.get('output_tokens') or 0)
+    in_tok = int(t.get('input_tokens') or 0)
+    share = (out_tok / total_out) if total_out else 0
+    cost_share = cost_total_f * share
+    meta = json.dumps({
+        'turn_index': t.get('turn_index'),
+        'session_id': t.get('session_id'),
+        'stop_reason': t.get('stop_reason'),
+        'cache_read_input_tokens': t.get('cache_read_input_tokens', 0),
+        'cache_creation_input_tokens': t.get('cache_creation_input_tokens', 0),
+        # MO_NODE_ID is the canonical recipe node name (e.g. perf_lens).
+        # Falls back to feature_name suffix (lane/family) only when env
+        # var isn't set — that path is ambiguous when multiple nodes
+        # share a lane (the 4 lens nodes all use lens lanes).
+        'node_id': os.environ.get('MO_NODE_ID') or (feature.split(':',1)[1] if ':' in feature else None),
+    })
+    con.execute(
+        "INSERT INTO llm_calls (provider, model_id, tier, feature_name, actor, "
+        "status, duration_ms, cost_usd, error_message, iter, run_id, traceparent, "
+        "input_tokens, output_tokens, total_tokens, metadata_json, session_id) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            provider, t.get('model') or model, tier, feature, actor or None,
+            'success',
+            # Per-turn duration unknown from claude stream-json; spread evenly.
+            int(int(duration_ms or 0) / max(len(turns), 1)),
+            cost_share, None,
+            int(iter_) if iter_ else None,
+            run_id or None,
+            traceparent or None,
+            in_tok, out_tok, in_tok + out_tok,
+            meta,
+            t.get('session_id'),
+        ),
+    )
+con.commit()
+con.close()
+PY
+    else
+      _mo_llm_write_llm_calls_row \
+        "$_provider" "$model" "${MO_LANE_TIER:-default}" \
+        "$_feature" "$_actor" \
+        "success" "$_duration_ms" "$_cost_usd" "" \
+        "$_in_tok" "$_out_tok" "{}"
+    fi
+    rm -f "${out_file}.tokens" "${out_file}.turns.jsonl" 2>/dev/null || true
     # v0.2-pt8 (D-04 wiring): expose .cost sidecar to caller via well-known
     # path. mo_llm_dispatch writes ${out_file}.cost when JSON output parses;
     # publish to ${MINI_ORK_RUN_DIR}/.last-llm-cost so execute's
@@ -540,7 +895,7 @@ PY
     _mo_llm_write_llm_calls_row \
       "$(_mo_llm_provider_for_model "$model")" "$model" "${MO_LANE_TIER:-default}" \
       "mini-ork:${node_type:-unknown}" "${MO_LANE_ACTOR:-${node_type:-${USER:-unknown}}}" \
-      "failed" "0" "0" "$_error_message"
+      "failed" "0" "0" "$_error_message" "0" "0" "{}"
     # D-014: surface last 20 lines of claude CLI stderr to caller's stderr
     # so the framework's caller can see the actual error, not just rc=1.
     if [ -s "$_err_file" ] || [ -s "${out_file}.err.log" ]; then
