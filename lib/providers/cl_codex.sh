@@ -93,6 +93,9 @@ fi
 
 # Invoke codex exec. The `--skip-git-repo-check` flag avoids the prompt
 # that codex emits when not in a git repo; we may run from /tmp / .mini-ork/runs/.
+# `--json` makes codex emit JSONL events on stdout — turn.completed events
+# carry the real token usage (input/cached/output) that the plain transcript
+# only shows as a strippable "tokens used:" status line.
 # `--output-last-message` gives mini-ork the assistant body instead of the
 # terminal transcript (prompt + status + hooks), which would confuse downstream
 # JSON extraction. Default to workspace-write because implementer nodes must be
@@ -102,6 +105,7 @@ _CODEX_SANDBOX="${CODEX_SANDBOX:-workspace-write}"
 RAW_OUT=$(codex exec \
   --skip-git-repo-check \
   --sandbox "$_CODEX_SANDBOX" \
+  --json \
   --output-last-message "$_CODEX_LAST_MESSAGE" \
   ${_CODEX_BYO_FLAGS[@]+"${_CODEX_BYO_FLAGS[@]}"} \
   "$PROMPT" 2>&1) || {
@@ -110,8 +114,92 @@ RAW_OUT=$(codex exec \
   rm -f "$_CODEX_LAST_MESSAGE"
   exit 4
 }
+
+# Harvest usage + per-turn sidecars from the JSONL event stream BEFORE
+# RAW_OUT gets replaced by the last-message body. The dispatcher exports:
+#   MO_USAGE_FILE → TSV "input_tokens<TAB>output_tokens" (envelope row totals)
+#   MO_TURNS_FILE → turns.jsonl lines matching the stream-json per-turn shape
+# Both optional — absent env vars skip the sidecar (standalone CLI use).
+if [ -n "${MO_USAGE_FILE:-}" ] || [ -n "${MO_TURNS_FILE:-}" ] || [ -n "${MO_COST_FILE:-}" ]; then
+  RAW_OUT="$RAW_OUT" python3 - "${MO_USAGE_FILE:-}" "${MO_TURNS_FILE:-}" "${MO_COST_FILE:-}" <<'PY' || true
+import json, os, sys
+usage_path, turns_path, cost_path = sys.argv[1:4]
+in_tok = out_tok = cached_tok = 0
+turns = []
+thread_id = None
+for line in os.environ.get("RAW_OUT", "").splitlines():
+    line = line.strip()
+    if not line.startswith("{"):
+        continue
+    try:
+        ev = json.loads(line)
+    except Exception:
+        continue
+    if ev.get("type") == "thread.started":
+        thread_id = ev.get("thread_id")
+    if ev.get("type") == "turn.completed":
+        u = ev.get("usage") or {}
+        t_in = int(u.get("input_tokens") or 0)
+        t_out = int(u.get("output_tokens") or 0)
+        t_cached = int(u.get("cached_input_tokens") or 0)
+        in_tok += t_in
+        out_tok += t_out
+        cached_tok += t_cached
+        turns.append({
+            "turn_index": len(turns),
+            "input_tokens": t_in,
+            "output_tokens": t_out,
+            "cache_read_input_tokens": t_cached,
+            "model": "codex",
+            "session_id": thread_id,
+        })
+if usage_path and (in_tok or out_tok):
+    with open(usage_path, "w") as f:
+        f.write(f"{in_tok}\t{out_tok}\n")
+if turns_path and turns:
+    with open(turns_path, "w") as f:
+        for t in turns:
+            f.write(json.dumps(t) + "\n")
+# Estimated cost: codex CLI exposes no billing figure on this surface, so
+# derive one from token usage at list price. Defaults are OpenAI's published
+# gpt-5/codex rates (USD per 1M tokens); override per deployment via env.
+# Note: usage.input_tokens INCLUDES cached_input_tokens, which bill at the
+# discounted rate — subtract before applying the full input rate.
+if cost_path and (in_tok or out_tok):
+    p_in = float(os.environ.get("MO_CODEX_USD_PER_MTOK_IN", "1.25"))
+    p_cached = float(os.environ.get("MO_CODEX_USD_PER_MTOK_CACHED", "0.125"))
+    p_out = float(os.environ.get("MO_CODEX_USD_PER_MTOK_OUT", "10.0"))
+    fresh_in = max(in_tok - cached_tok, 0)
+    cost = (fresh_in * p_in + cached_tok * p_cached + out_tok * p_out) / 1e6
+    with open(cost_path, "w") as f:
+        f.write(f"{cost:.6f}\n")
+PY
+fi
+
 if [ -s "$_CODEX_LAST_MESSAGE" ]; then
   RAW_OUT="$(cat "$_CODEX_LAST_MESSAGE")"
+else
+  # --json mode: stdout is JSONL, not a transcript. Reconstruct the assistant
+  # body from agent_message events so the marker-strip fallback below still
+  # has plain text to work with.
+  _CODEX_MSG=$(RAW_OUT="$RAW_OUT" python3 - <<'PY' || true
+import json, os
+msgs = []
+for line in os.environ.get("RAW_OUT", "").splitlines():
+    line = line.strip()
+    if not line.startswith("{"):
+        continue
+    try:
+        ev = json.loads(line)
+    except Exception:
+        continue
+    item = ev.get("item") or {}
+    if ev.get("type") == "item.completed" and item.get("type") == "agent_message":
+        msgs.append(item.get("text") or "")
+print("\n\n".join(m for m in msgs if m))
+PY
+)
+  [ -n "$_CODEX_MSG" ] && RAW_OUT="$_CODEX_MSG"
 fi
 rm -f "$_CODEX_LAST_MESSAGE"
 
