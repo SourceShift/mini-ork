@@ -120,6 +120,10 @@ mo_node_emit_end_trap() {
   _dur=$(( _end - ${_mo_node_start_ms:-0} ))
   _artifact="${CONTEXT_FILE:-${IMPL_LOG:-${REVIEW_FILE:-}}}"
   mo_node_end "$_mo_run_id" "$node_id" "$node_type" "$_dur" "${VERDICT:-}" "$_artifact" || true
+  # Piggyback an OTel agent span when lib/mo_otel.sh is loaded (MO_OTEL=1).
+  if declare -f mo_otel_agent >/dev/null 2>&1; then
+    mo_otel_agent "$node_id" "$node_type" "${_mo_node_start_ms:-0}" "$_end" "${VERDICT:-}" || true
+  fi
 }
 
 # Convenience: emit node_end with duration + verdict payload.
