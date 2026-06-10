@@ -2,6 +2,10 @@
 
 You are planning a read-only silent-catch audit for a TypeScript/JavaScript codebase.
 
+Kickoff content:
+
+{{KICKOFF_CONTENT}}
+
 Use the kickoff objective and any available run context to define:
 
 - target repository or path
