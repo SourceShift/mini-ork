@@ -32,17 +32,17 @@ def test_recipe_builder() -> None:
     assert_true(recipe.workflow.to_dict()["edges"][0]["edge_type"] == "verifies", "edge materializes")
 
 
-def test_codex_policy_writer(tmp: Path) -> None:
-    client = MiniOrk(root=ROOT, home=tmp / ".mini-ork")
-    path = client.write_provider_policy(ProviderPolicy.codex_only(), tmp / ".mini-ork")
+def test_codex_policy_writer(tmp_path: Path) -> None:
+    client = MiniOrk(root=ROOT, home=tmp_path / ".mini-ork")
+    path = client.write_provider_policy(ProviderPolicy.codex_only(), tmp_path / ".mini-ork")
     text = path.read_text(encoding="utf-8")
     assert_true("planner: codex" in text, "planner lane written")
     assert_true("opus_lens: codex" in text, "opus lens can be remapped by policy")
 
 
-def test_dry_run_client(tmp: Path) -> None:
-    subprocess.run(["git", "init", "-q"], cwd=tmp, check=True)
-    kickoff = tmp / "kickoff.md"
+def test_dry_run_client(tmp_path: Path) -> None:
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    kickoff = tmp_path / "kickoff.md"
     kickoff.write_text(
         "# Docs update\n\n"
         "## Goal\nUpdate docs.\n\n"
@@ -51,7 +51,7 @@ def test_dry_run_client(tmp: Path) -> None:
         encoding="utf-8",
     )
 
-    result = MiniOrk(root=ROOT, home=tmp / ".mini-ork").run(
+    result = MiniOrk(root=ROOT, home=tmp_path / ".mini-ork").run(
         RunRequest(kickoff=kickoff, recipe="docs", mode="dry-run")
     )
     assert_true(result.ok, f"dry-run failed:\n{result.output}")
