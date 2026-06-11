@@ -74,7 +74,19 @@ mo_emit_cache_flags() {
   if [ "${MO_PROMPT_CACHE_DISABLED:-0}" = "1" ]; then
     return 0
   fi
-  out=(--exclude-dynamic-system-prompt-sections)
+  # Feature-detect: claude CLIs older than ~2.1.5x reject unknown options,
+  # so emitting the flag unconditionally breaks EVERY dispatch on that
+  # machine (observed on a fresh install with claude 2.1.47). Probe --help
+  # once per process and degrade to cache-miss instead of hard failure.
+  if [ -z "${_MO_CACHE_FLAG_SUPPORTED:-}" ]; then
+    if claude --help 2>/dev/null | grep -q -- '--exclude-dynamic-system-prompt-sections'; then
+      _MO_CACHE_FLAG_SUPPORTED=1
+    else
+      _MO_CACHE_FLAG_SUPPORTED=0
+    fi
+  fi
+  [ "$_MO_CACHE_FLAG_SUPPORTED" = "1" ] && out=(--exclude-dynamic-system-prompt-sections)
+  return 0
 }
 
 # Aggregate prompt-cache usage across all *.log files in an iter-N dir.
