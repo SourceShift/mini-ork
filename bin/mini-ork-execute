@@ -661,9 +661,56 @@ _mo_source() {
   source "$1"
 }
 
+_mo_policy_route_lane() {
+  local node_type="$1" current_lane="$2"
+  local policy="${MO_ROUTING_POLICY:-}"
+  local frontier="${MO_FRONTIER_LANE:-opus_lens}"
+  local cheap="${MO_CHEAP_LANE:-kimi_lens}"
+
+  case "$policy" in
+    ""|workflow_default)
+      printf '%s\n' "$current_lane" ;;
+    frontier_only)
+      case "$node_type" in
+        researcher|implementer|reviewer) printf '%s\n' "$frontier" ;;
+        *) printf '%s\n' "$current_lane" ;;
+      esac ;;
+    cheap_only)
+      case "$node_type" in
+        researcher|implementer|reviewer) printf '%s\n' "$cheap" ;;
+        *) printf '%s\n' "$current_lane" ;;
+      esac ;;
+    static_hybrid)
+      case "$node_type" in
+        reviewer) printf '%s\n' "$frontier" ;;
+        researcher|implementer) printf '%s\n' "$cheap" ;;
+        *) printf '%s\n' "$current_lane" ;;
+      esac ;;
+    trace_governed)
+      # Cheap-first execution with expensive review/recovery. FAIL_COUNT is
+      # the executor's prefix-trace signal: verifier/reviewer failures before
+      # this node increase it, so later LLM nodes escalate automatically.
+      case "$node_type" in
+        reviewer) printf '%s\n' "$frontier" ;;
+        researcher|implementer)
+          if [ "${FAIL_COUNT:-0}" -gt 0 ]; then
+            printf '%s\n' "$frontier"
+          else
+            printf '%s\n' "$cheap"
+          fi ;;
+        *) printf '%s\n' "$current_lane" ;;
+      esac ;;
+    *)
+      echo "  [warn] unknown MO_ROUTING_POLICY=$policy — using workflow lane $current_lane" >&2
+      printf '%s\n' "$current_lane" ;;
+  esac
+}
+
 _dispatch_node() {
   local node_id="$1" node_type="$2" node_desc="$3" node_prompt_ref="${4:-}" node_verifier_ref="${5:-}" node_model_lane="${6:-}"
   local dispatch_lane="${node_model_lane:-$node_type}"
+  local workflow_lane="$dispatch_lane"
+  dispatch_lane="$(_mo_policy_route_lane "$node_type" "$dispatch_lane")"
 
   # Cooperative stop check: UI's POST /api/v1/task-runs/{id}/stop touches
   # this file. We bail BEFORE dispatching the next node so the current
@@ -695,7 +742,11 @@ _dispatch_node() {
     return 0
   fi
 
-  echo "==> dispatch node_id=${node_id} type=${node_type} model_lane=${dispatch_lane}"
+  if [ "$workflow_lane" != "$dispatch_lane" ]; then
+    echo "==> dispatch node_id=${node_id} type=${node_type} model_lane=${dispatch_lane} (policy ${MO_ROUTING_POLICY}: ${workflow_lane} → ${dispatch_lane})"
+  else
+    echo "==> dispatch node_id=${node_id} type=${node_type} model_lane=${dispatch_lane}"
+  fi
 
   # Observability: emit node_start event so the UI can color DAG nodes
   # by running/done status. Best-effort — see lib/mo_node_events.sh.
