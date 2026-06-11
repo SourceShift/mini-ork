@@ -1,0 +1,25 @@
+Generate the image with a 16:9 aspect ratio. The canvas must be 16:9.
+
+            A clean academic technical diagram on a pure white background (#ffffff).
+No cream paper, no beige tint, no paper grain, no texture, no shadows, no
+photorealism. Use crisp black and charcoal strokes, geometric shapes, arrows,
+and minimal English labels. Use restrained desaturated accents: sage, soft blue,
+muted violet, and one red emphasis. Do not add a figure number, title, caption,
+watermark, author name, logo, or explanatory paragraph inside the image. The
+LaTeX paper will provide the caption separately. Keep every label short,
+spelled correctly, and horizontally readable.
+
+
+            SUBJECT:
+            Create a clean two-panel benchmark summary chart with exact policy labels:
+"frontier-only", "cheap-only", "static role mapping", "trace-governed".
+
+Left panel label: "cost per success". Right panel label: "expensive calls".
+Left panel relative bar heights: frontier-only highest, cheap-only second,
+static role mapping third, trace-governed lowest. Right panel relative bar
+heights: frontier-only highest, static role mapping second, trace-governed
+third, cheap-only lowest.
+
+Add one compact callout: "26.63% lower cost vs frontier-only".
+Do not claim trace-governed has the fewest calls. Do not include a title,
+figure number, caption, or extra explanatory paragraph inside the image.

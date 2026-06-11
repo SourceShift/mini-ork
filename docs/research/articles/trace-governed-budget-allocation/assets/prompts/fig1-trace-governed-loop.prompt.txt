@@ -1,0 +1,26 @@
+Generate the image with a 16:9 aspect ratio. The canvas must be 16:9.
+
+            A clean academic technical diagram on a pure white background (#ffffff).
+No cream paper, no beige tint, no paper grain, no texture, no shadows, no
+photorealism. Use crisp black and charcoal strokes, geometric shapes, arrows,
+and minimal English labels. Use restrained desaturated accents: sage, soft blue,
+muted violet, and one red emphasis. Do not add a figure number, title, caption,
+watermark, author name, logo, or explanatory paragraph inside the image. The
+LaTeX paper will provide the caption separately. Keep every label short,
+spelled correctly, and horizontally readable.
+
+
+            SUBJECT:
+            Create a mini-ork control-loop diagram with exactly these main boxes:
+"Recipe DAG", "Durable trace", "Routing policy", "Budget gate",
+"Deterministic verifier".
+
+Inside "Recipe DAG", show four small nodes labeled "planner", "implementer",
+"reviewer", "verifier". Inside "Durable trace", show four compact event cards
+labeled "lane", "cost", "verifier", "retry". Inside "Routing policy", show two
+choices labeled "frontier lane" and "cheap lane".
+
+Use arrows to show:
+Recipe DAG -> Durable trace -> Routing policy -> agent attempt -> Durable trace.
+Budget gate and Deterministic verifier feed back into Routing policy.
+Do not include any title, figure number, or caption inside the image.
