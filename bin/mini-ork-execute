@@ -428,6 +428,173 @@ PY
 fi
 echo "    nodes:    ${#NODE_IDS[@]} (from ${NODE_SOURCE})"
 
+_snapshot_dispatch_config() {
+  [ "$DRY_RUN" -eq 0 ] || return 0
+  [ -n "${MINI_ORK_TASK_RUN_ID:-}" ] || return 0
+  [ -f "${MINI_ORK_DB:-}" ] || return 0
+
+  local _nodes_blob
+  _nodes_blob=$(printf '%s\n' "${NODE_IDS[@]}")
+  MO_NODE_IDS_SNAPSHOT="$_nodes_blob" python3 - \
+    "$MINI_ORK_DB" "$MINI_ORK_TASK_RUN_ID" "${MINI_ORK_HOME:-}" "${MINI_ORK_ROOT:-.}" "$NODE_FIELD_SEP" <<'PY' 2>/dev/null || true
+import hashlib
+import json
+import os
+import re
+import sqlite3
+import sys
+import time
+from pathlib import Path
+
+try:
+    import yaml
+except ImportError:
+    yaml = None
+
+db_path, run_id, home_raw, root_raw, sep = sys.argv[1:6]
+home = Path(home_raw) if home_raw else None
+root = Path(root_raw)
+
+
+def load_yaml(path: Path | None) -> dict:
+    if path is None or yaml is None or not path.exists():
+        return {}
+    try:
+        with path.open() as f:
+            data = yaml.safe_load(f) or {}
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def agents_path() -> Path | None:
+    if home is not None:
+        override = home / "config" / "agents.yaml"
+        if override.exists():
+            return override
+    fallback = root / "config" / "agents.yaml"
+    return fallback if fallback.exists() else None
+
+
+def providers_path() -> Path | None:
+    explicit = os.environ.get("MINI_ORK_PROVIDERS")
+    if explicit and Path(explicit).exists():
+        return Path(explicit)
+    if home is not None:
+        override = home / "config" / "providers.yaml"
+        if override.exists():
+            return override
+    fallback = root / "config" / "providers.yaml"
+    return fallback if fallback.exists() else None
+
+
+def env_expand(value):
+    if value is None:
+        return None
+    return os.path.expandvars(str(value))
+
+
+def env_expand_tree(value):
+    if isinstance(value, dict):
+        return {str(k): env_expand_tree(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [env_expand_tree(v) for v in value]
+    if isinstance(value, str):
+        return env_expand(value)
+    return value
+
+
+def provider_for_model(model: str) -> str:
+    if model == "codex" or model.startswith(("gpt-", "o1", "o3")):
+        return "openai"
+    if model.startswith("gemini") or "-gemini-" in model:
+        return "google"
+    if model.startswith(("minimax", "glm", "kimi", "deepseek")):
+        return "gateway"
+    return "anthropic"
+
+
+def parse_export(text: str, name: str) -> str | None:
+    patterns = (
+        rf"^\s*export\s+{re.escape(name)}=(['\"])(.*?)\1\s*$",
+        rf"^\s*export\s+{re.escape(name)}=([^\s#]+)",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.MULTILINE)
+        if match:
+            value = match.group(2) if len(match.groups()) > 1 else match.group(1)
+            return env_expand(value)
+    return None
+
+
+def wrapper_fields(model: str) -> dict:
+    wrapper = root / "lib" / "providers" / f"cl_{model}.sh"
+    fields = {
+        "family": model,
+        "model_id": model,
+        "provider": provider_for_model(model),
+        "base_url": None,
+    }
+    if not wrapper.exists():
+        return fields
+    try:
+        text = wrapper.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return fields
+    fields["model_id"] = parse_export(text, "ANTHROPIC_MODEL") or model
+    fields["base_url"] = parse_export(text, "ANTHROPIC_BASE_URL")
+    return fields
+
+
+def registry_fields(model: str, providers: dict) -> dict | None:
+    entry = (providers.get("providers") or {}).get(model)
+    if not isinstance(entry, dict):
+        return None
+    return {
+        "family": env_expand(entry.get("family")) or model,
+        "model_id": env_expand(entry.get("model")) or model,
+        "provider": env_expand(entry.get("family")) or provider_for_model(model),
+        "base_url": env_expand(entry.get("base_url")),
+    }
+
+
+nodes_blob = os.environ.get("MO_NODE_IDS_SNAPSHOT", "")
+lanes: list[str] = []
+for line in nodes_blob.splitlines():
+    parts = line.split(sep)
+    if len(parts) >= 7 and parts[6] and parts[6] not in lanes:
+        lanes.append(parts[6])
+
+agents = load_yaml(agents_path())
+providers = load_yaml(providers_path())
+lane_map = agents.get("lanes") or {}
+snapshot: dict[str, dict] = {}
+for lane in lanes:
+    model = str(lane_map.get(lane) or lane_map.get("worker") or lane_map.get("worker_default") or "sonnet")
+    snapshot[lane] = registry_fields(model, providers) or wrapper_fields(model)
+
+payload = json.dumps(snapshot, sort_keys=True, separators=(",", ":"))
+effective_agents = json.dumps(env_expand_tree(agents), sort_keys=True, separators=(",", ":"))
+sha = hashlib.sha256(effective_agents.encode("utf-8")).hexdigest()
+
+con = sqlite3.connect(db_path, timeout=2.0)
+try:
+    cols = {row[1] for row in con.execute("PRAGMA table_info(task_runs)").fetchall()}
+    if {"dispatch_config_json", "agents_yaml_sha"} <= cols:
+        con.execute(
+            """
+            UPDATE task_runs
+            SET dispatch_config_json = ?, agents_yaml_sha = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (payload, sha, int(time.time()), run_id),
+        )
+        con.commit()
+finally:
+    con.close()
+PY
+}
+
 # ── trace start ───────────────────────────────────────────────────────────────
 TRACE_ID="tr-execute-$(date +%s)-$$"
 if [ "$DRY_RUN" -eq 0 ]; then
@@ -1390,6 +1557,7 @@ echo ""
 
 # D-021: status='executing' as we enter the dispatch loop.
 _d021_set_status "executing"
+_snapshot_dispatch_config
 
 FAIL_COUNT=0
 
