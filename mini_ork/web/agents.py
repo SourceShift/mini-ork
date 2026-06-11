@@ -29,6 +29,47 @@ from .db import StateDB
 _TERMINAL_RUN_STATUSES = {"published", "rolled_back", "failed"}
 
 
+def _snapshot_nodes(fp: dict[str, Any], dispatch_config_json: str | None) -> list[dict[str, Any]]:
+    """Overlay historical run lane attribution onto current recipe nodes."""
+    nodes = fp.get("nodes") or []
+    if not dispatch_config_json:
+        return nodes
+    try:
+        snapshot = json.loads(dispatch_config_json)
+    except (TypeError, json.JSONDecodeError):
+        return nodes
+    if not isinstance(snapshot, dict):
+        return nodes
+
+    out: list[dict[str, Any]] = []
+    for node in nodes:
+        if not isinstance(node, dict):
+            out.append(node)
+            continue
+        lane = node.get("lane")
+        lane_snapshot = snapshot.get(lane) if lane else None
+        if not isinstance(lane_snapshot, dict):
+            out.append(node)
+            continue
+        merged = dict(node)
+        for key in ("family", "model_id", "provider", "base_url"):
+            if key in lane_snapshot:
+                merged[key] = lane_snapshot.get(key)
+        out.append(merged)
+    return out
+
+
+def _task_run_snapshot_select(db: StateDB) -> str:
+    """Select snapshot columns when migrated, otherwise synthesize NULLs."""
+    try:
+        cols = {row.get("name") for row in db.rows("PRAGMA table_info(task_runs)")}
+    except Exception:
+        cols = set()
+    if {"dispatch_config_json", "agents_yaml_sha"} <= cols:
+        return "dispatch_config_json, agents_yaml_sha"
+    return "NULL AS dispatch_config_json, NULL AS agents_yaml_sha"
+
+
 def _dispatcher_alive(home: Path, task_run_id: str) -> bool:
     """Probe the dispatcher .pid written by bin/mini-ork-execute. Missing
     file or dead pid → not alive. PermissionError on the signal-0 probe
@@ -100,9 +141,11 @@ def list_agents(
     task_run_id: str,
 ) -> dict[str, Any]:
     """Return all agents dispatched by a task_run with summary metrics."""
+    snapshot_select = _task_run_snapshot_select(db)
     tr = db.row(
-        """
-        SELECT id, recipe, trace_id, created_at, ended_at, status, cost_usd
+        f"""
+        SELECT id, recipe, trace_id, created_at, ended_at, status, cost_usd,
+               {snapshot_select}
         FROM task_runs WHERE id = ?
         """,
         (task_run_id,),
@@ -112,6 +155,7 @@ def list_agents(
 
     recipe_name = tr.get("recipe")
     fp = recipes.fingerprint(recipe_name, home) if recipe_name else {"nodes": [], "edges": []}
+    nodes = _snapshot_nodes(fp, tr.get("dispatch_config_json"))
 
     # Per-node lifecycle events (node_start / node_end) keyed by node_id.
     node_events = _collect_node_events(db, task_run_id)
@@ -140,7 +184,7 @@ def list_agents(
         fs_files = {p.name for p in run_dir.iterdir() if p.is_file()}
 
     agents: list[dict[str, Any]] = []
-    for node in fp["nodes"]:
+    for node in nodes:
         node_id = node["name"]
         node_type = node["type"]
         ev = _reconcile_stale_running(node_events.get(node_id, {}), run_is_dead)
@@ -158,6 +202,9 @@ def list_agents(
                 "node_type": node_type,
                 "model_lane": node.get("lane"),
                 "family": node.get("family"),
+                "model_id": node.get("model_id"),
+                "provider": node.get("provider"),
+                "base_url": node.get("base_url"),
                 "prompt_ref": node.get("prompt_ref"),
                 "verifier_ref": node.get("verifier_ref"),
                 "dispatch_mode": node.get("dispatch_mode"),
@@ -301,12 +348,21 @@ def agent_detail(
     node_id: str,
 ) -> dict[str, Any]:
     """Full per-agent detail: prompt, output, LLM calls, child spawns, transcript."""
-    tr = db.row("SELECT recipe, trace_id, created_at, ended_at, status FROM task_runs WHERE id = ?", (task_run_id,))
+    snapshot_select = _task_run_snapshot_select(db)
+    tr = db.row(
+        f"""
+        SELECT recipe, trace_id, created_at, ended_at, status,
+               {snapshot_select}
+        FROM task_runs WHERE id = ?
+        """,
+        (task_run_id,),
+    )
     if not tr:
         return {"error": f"task_run {task_run_id} not found"}
     recipe_name = tr.get("recipe")
     fp = recipes.fingerprint(recipe_name, home) if recipe_name else {"nodes": []}
-    node = next((n for n in fp["nodes"] if n["name"] == node_id), None)
+    nodes = _snapshot_nodes(fp, tr.get("dispatch_config_json"))
+    node = next((n for n in nodes if n["name"] == node_id), None)
     if not node:
         return {"error": f"node {node_id} not in recipe {recipe_name}"}
 
