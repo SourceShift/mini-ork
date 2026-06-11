@@ -1,0 +1,41 @@
+name: framework_edit
+version: "0.1.0"
+description: >
+  Verifier-gated multi-file edit proposal for the mini-ork framework itself.
+  Produces a unified diff and verdict.json without applying changes.
+
+artifact_contract_ref: artifact_contract.yaml
+default_workflow: workflow.yaml
+
+matches:
+  keywords:
+    - framework-edit
+    - mini-ork self-modification
+    - self-modify mini-ork
+    - 2+ file mini-ork change
+    - mini-ork repo edit
+    - framework edit recipe
+    - propose diff mini-ork
+    - mini-ork feature add
+    - mini-ork bug fix dispatch
+    - verifier-gated mini-ork edit
+  path_globs:
+    - "**/*"
+  regex: []
+
+default_gates:
+  - scope_gate
+  - budget_gate
+  - deployment_gate
+
+risk_class: high
+
+cost_model:
+  min_usd: 5.0
+  max_usd: 10.0
+  per_lens_usd: 1.0
+  per_drafter_usd: 2.0
+
+runtime_model:
+  min_minutes: 5
+  max_minutes: 15
