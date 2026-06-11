@@ -495,6 +495,54 @@ export type SelfImproveDetail = SelfImproveRun & {
   linked_task_run: TaskRun | null;
 };
 
+export type IdeaTreeStatus = "harvested" | "pruned" | "pending" | "running" | "rejected" | string;
+
+export type IdeaTreeRoot = {
+  node_id: string;
+  recipe: string | null;
+  hypothesis: string | null;
+  status: IdeaTreeStatus;
+  created_at: string | null;
+  updated_at: string | null;
+  node_count: number;
+  harvested_count: number;
+  pruned_count: number;
+};
+
+export type IdeaTreeNode = {
+  node_id: string;
+  parent_node_id: string | null;
+  recipe: string | null;
+  task_run_id: string | null;
+  self_improve_run_id: string | null;
+  hypothesis: string | null;
+  status: IdeaTreeStatus;
+  score_dev: number | null;
+  score_test: number | null;
+  insights: unknown[];
+  depth: number;
+  created_at: string | null;
+  updated_at: string | null;
+};
+
+export type IdeaTreeEdge = { from: string; to: string };
+
+export type IdeaTreeResponse = {
+  root_node_id: string;
+  nodes: IdeaTreeNode[];
+  edges: IdeaTreeEdge[];
+  stats: {
+    total?: number;
+    by_status?: Record<string, number>;
+    max_depth?: number;
+  };
+};
+
+export type IdeaTreeNodeDetail = Omit<IdeaTreeNode, "depth"> & {
+  root_node_id: string;
+  children: Array<Pick<IdeaTreeNode, "node_id" | "hypothesis" | "status" | "score_dev" | "score_test">>;
+};
+
 export type CostByDayRow = { day: string; recipe: string; cost: number; run_count: number };
 export type WallTimeRow = { day: string; recipe: string; avg_ms: number; max_ms: number; run_count: number };
 
@@ -603,6 +651,11 @@ export const api = {
   gradients: (limit = 25) => get<GlobalGradient[]>(`/api/v1/trajectory/gradients?limit=${limit}`),
   selfImproveDetail: (runId: string) =>
     get<SelfImproveDetail>(`/api/v1/trajectory/self-improve/${encodeURIComponent(runId)}`),
+  ideaTree: {
+    roots: () => get<IdeaTreeRoot[]>("/api/v1/idea-tree/roots"),
+    read: (rootId: string) => get<IdeaTreeResponse>(`/api/v1/idea-tree/${encodeURIComponent(rootId)}`),
+    node: (nodeId: string) => get<IdeaTreeNodeDetail>(`/api/v1/idea-tree/node/${encodeURIComponent(nodeId)}`),
+  },
   costByDay: () => get<CostByDayRow[]>("/api/v1/trajectory/cost-by-day"),
   wallTime: () => get<WallTimeRow[]>("/api/v1/trajectory/wall-time"),
   recipes: () => get<string[]>("/api/v1/fingerprint/recipes"),
