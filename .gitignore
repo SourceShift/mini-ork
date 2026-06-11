@@ -49,3 +49,7 @@ __pycache__/
 .mini-ork/state.db
 .mini-ork/state.db.*
 docs/blog/
+
+# Local research notes/instructions that are useful on this machine but should
+# not ship as project documentation.
+docs/research/local/
