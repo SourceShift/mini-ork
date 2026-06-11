@@ -14,6 +14,7 @@ from .routes import (
     control as control_routes,
     fingerprint,
     fleet,
+    idea_tree as idea_tree_routes,
     projects,
     run_detail,
     stream,
@@ -62,6 +63,7 @@ def create_app(home: Path | None = None, dev_cors: bool = True) -> FastAPI:
     app.include_router(stream.router)
     app.include_router(control_routes.router)
     app.include_router(projects.router)
+    app.include_router(idea_tree_routes.router)
 
     @app.get("/api")
     def api_index() -> JSONResponse:
