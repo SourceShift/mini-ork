@@ -45,7 +45,8 @@ headroom.
 Required run-local artifacts:
 
 - `${MINI_ORK_RUN_DIR}/qdrant-contract-remediation-plan.md`
-- `${MINI_ORK_RUN_DIR}/qdrant-contract-findings.json`
+- `${MINI_ORK_RUN_DIR}/qdrant-contract-findings.json` — JSON object envelope
+  with top-level `findings[]` and `metadata`, not a raw top-level array.
 - `${MINI_ORK_RUN_DIR}/qdrant-contract-patch-summary.md`
 - `${MINI_ORK_RUN_DIR}/qdrant-contract-verification.md`
 

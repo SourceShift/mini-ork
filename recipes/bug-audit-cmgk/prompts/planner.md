@@ -4,6 +4,11 @@ You are the planner for a bug-only audit. Read the kickoff (which
 embeds the validated feature inventory from Phase 1) and produce a
 5-7 step plan covering:
 
+Kickoff content:
+```text
+{{KICKOFF_CONTENT}}
+```
+
 1. Bug classes in scope (correctness, race, security, observability,
    contract drift, fail-open hazards, dead-code-after-cutover)
 2. What the panel definition of a "bug" is — must be a CONCRETE
