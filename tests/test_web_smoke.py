@@ -6,6 +6,8 @@ returns sensible shapes when pointed at the repo's own .mini-ork/state.db.
 
 from __future__ import annotations
 
+import sqlite3
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -482,6 +484,189 @@ def test_dag_carries_node_status(db, home) -> None:
     assert any(s in ("running", "done", "failed") for s in statuses.values()), (
         f"expected at least one observed node, got: {statuses}"
     )
+
+
+def test_error_category_column_exists(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.db"
+    con = sqlite3.connect(db_path)
+    con.executescript(
+        """
+        CREATE TABLE schema_migrations(filename TEXT PRIMARY KEY, applied_at TEXT, checksum TEXT);
+        CREATE TABLE llm_calls (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          provider TEXT NOT NULL,
+          model_id TEXT NOT NULL,
+          tier TEXT NOT NULL,
+          feature_name TEXT NOT NULL,
+          actor TEXT,
+          status TEXT NOT NULL CHECK (status IN ('success','failed')),
+          duration_ms INTEGER NOT NULL DEFAULT 0,
+          cost_usd REAL NOT NULL DEFAULT 0,
+          error_message TEXT,
+          iter INTEGER,
+          run_id TEXT,
+          traceparent TEXT,
+          input_tokens INTEGER NOT NULL DEFAULT 0,
+          output_tokens INTEGER NOT NULL DEFAULT 0,
+          total_tokens INTEGER NOT NULL DEFAULT 0,
+          metadata_json TEXT NOT NULL DEFAULT '{}',
+          session_id TEXT,
+          ts TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+        );
+        CREATE TABLE run_events (
+          event_id TEXT PRIMARY KEY,
+          run_id TEXT NOT NULL,
+          event_type TEXT NOT NULL,
+          payload_json TEXT NOT NULL DEFAULT '{}',
+          created_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+        );
+        """
+    )
+    con.executescript((ROOT / "db/migrations/0021_error_taxonomy_finish_reasons.sql").read_text())
+
+    cols = {r[1] for r in con.execute("PRAGMA table_info(llm_calls)").fetchall()}
+    assert {"error_category", "retryable"} <= cols
+    con.execute(
+        """
+        INSERT INTO llm_calls (
+          provider, model_id, tier, feature_name, status,
+          error_category, retryable
+        ) VALUES ('gateway', 'glm', 'default', 'mini-ork:test', 'failed', 'auth', 0)
+        """
+    )
+    with pytest.raises(sqlite3.IntegrityError):
+        con.execute(
+            """
+            INSERT INTO llm_calls (
+              provider, model_id, tier, feature_name, status,
+              error_category, retryable
+            ) VALUES ('gateway', 'glm', 'default', 'mini-ork:test', 'failed', 'auth_failed', 0)
+            """
+        )
+    con.close()
+
+
+def test_finish_reason_column_exists(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.db"
+    con = sqlite3.connect(db_path)
+    con.executescript(
+        """
+        CREATE TABLE schema_migrations(filename TEXT PRIMARY KEY, applied_at TEXT, checksum TEXT);
+        CREATE TABLE llm_calls (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          provider TEXT NOT NULL,
+          model_id TEXT NOT NULL,
+          tier TEXT NOT NULL,
+          feature_name TEXT NOT NULL,
+          status TEXT NOT NULL CHECK (status IN ('success','failed'))
+        );
+        CREATE TABLE run_events (
+          event_id TEXT PRIMARY KEY,
+          run_id TEXT NOT NULL,
+          event_type TEXT NOT NULL,
+          payload_json TEXT NOT NULL DEFAULT '{}',
+          created_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+        );
+        """
+    )
+    con.executescript((ROOT / "db/migrations/0021_error_taxonomy_finish_reasons.sql").read_text())
+
+    cols = {r[1] for r in con.execute("PRAGMA table_info(run_events)").fetchall()}
+    assert "finish_reason" in cols
+    con.execute(
+        """
+        INSERT INTO run_events(event_id, run_id, event_type, payload_json, finish_reason)
+        VALUES ('evt-ok', 'run-1', 'node_end', '{}', 'verdict_revise')
+        """
+    )
+    with pytest.raises(sqlite3.IntegrityError):
+        con.execute(
+            """
+            INSERT INTO run_events(event_id, run_id, event_type, payload_json, finish_reason)
+            VALUES ('evt-bad', 'run-1', 'node_end', '{}', 'needs_revision')
+            """
+        )
+    con.close()
+
+
+def test_llm_dispatch_classifies_invalid_api_key_as_auth() -> None:
+    script = (
+        "set -euo pipefail; "
+        "MINI_ORK_ROOT=$PWD; "
+        "source lib/llm-dispatch.sh; "
+        "_mo_llm_classify_error 'HTTP 401 invalid api key' 1"
+    )
+    out = subprocess.run(
+        ["bash", "--noprofile", "--norc", "-c", script],
+        cwd=ROOT,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=True,
+    )
+    assert out.stdout.strip() == "auth"
+
+
+def test_llm_calls_route_tolerates_null_taxonomy_columns(tmp_path: Path) -> None:
+    from mini_ork.web.db import StateDB
+    from mini_ork.web.routes.run_detail import get_llm_calls
+
+    db_path = tmp_path / "state.db"
+    now = 1_800_000_000
+    con = sqlite3.connect(db_path)
+    con.executescript(
+        """
+        CREATE TABLE task_runs (
+          id TEXT PRIMARY KEY,
+          trace_id TEXT,
+          created_at INTEGER NOT NULL,
+          ended_at INTEGER
+        );
+        CREATE TABLE llm_calls (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          provider TEXT NOT NULL,
+          model_id TEXT NOT NULL,
+          tier TEXT NOT NULL,
+          feature_name TEXT NOT NULL,
+          actor TEXT,
+          input_tokens INTEGER NOT NULL DEFAULT 0,
+          output_tokens INTEGER NOT NULL DEFAULT 0,
+          total_tokens INTEGER NOT NULL DEFAULT 0,
+          cost_usd REAL NOT NULL DEFAULT 0,
+          duration_ms INTEGER NOT NULL DEFAULT 0,
+          status TEXT NOT NULL CHECK (status IN ('success','failed')),
+          finish_reason TEXT,
+          error_message TEXT,
+          traceparent TEXT,
+          metadata_json TEXT NOT NULL DEFAULT '{}',
+          session_id TEXT,
+          error_category TEXT,
+          retryable INTEGER,
+          ts TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+        );
+        """
+    )
+    con.execute(
+        "INSERT INTO task_runs(id, trace_id, created_at, ended_at) VALUES ('run-1', 'trace-1', ?, ?)",
+        (now - 10, now + 10),
+    )
+    con.execute(
+        """
+        INSERT INTO llm_calls (
+          provider, model_id, tier, feature_name, status, finish_reason,
+          error_category, retryable, traceparent, ts
+        ) VALUES (
+          'gateway', 'glm', 'default', 'mini-ork:reviewer', 'success', NULL,
+          NULL, NULL, '00-trace-1-span-01', '2027-01-15T08:00:00.000Z'
+        )
+        """
+    )
+    con.commit()
+    con.close()
+
+    rows = get_llm_calls(task_run_id="run-1", db=StateDB(db_path))
+    assert len(rows) == 1
+    assert rows[0]["feature_name"] == "mini-ork:reviewer"
 
 
 # ── project switcher (GET /projects, POST /projects/switch) ─────────────────

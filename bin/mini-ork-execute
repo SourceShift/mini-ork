@@ -528,7 +528,7 @@ finally:
 # D-048 root cause per opus cross-family validation of MiniMax-M3
 # gradient_extract output on synthetic rich-shape trace (2026-06-01).
 _trace_write_node_rich() {
-  local _trace_id="$1" _status="$2" _node_type="$3" _output_file="${4:-}" _verdict="${5:-}"
+  local _trace_id="$1" _status="$2" _node_type="$3" _output_file="${4:-}" _verdict="${5:-}" _finish_reason="${6:-}"
   local _cost="0"
   if [ -n "${MINI_ORK_RUN_DIR:-}" ] && [ -f "${MINI_ORK_RUN_DIR}/.last-llm-cost" ]; then
     _cost=$(cat "${MINI_ORK_RUN_DIR}/.last-llm-cost" 2>/dev/null | tr -d '[:space:]' || echo "0")
@@ -549,7 +549,7 @@ _trace_write_node_rich() {
   local _payload
   _payload=$(python3 -c "
 import json, sys, os
-trace_id, status, node_type, output_file, verdict, cost, task_class, tool_summary_path, duration_ms = sys.argv[1:10]
+trace_id, status, node_type, output_file, verdict, cost, task_class, tool_summary_path, duration_ms, finish_reason = sys.argv[1:11]
 
 tool_calls = []
 files_read = []
@@ -585,9 +585,11 @@ if output_file:
     obj['final_artifact_ref'] = output_file
 if verdict:
     obj['reviewer_verdict'] = verdict
-obj['verifier_output'] = json.dumps({'node_type': node_type})
+if finish_reason:
+    obj['finish_reason'] = finish_reason
+obj['verifier_output'] = json.dumps({'node_type': node_type, 'finish_reason': finish_reason or None})
 print(json.dumps(obj))
-" "$_trace_id" "$_status" "$_node_type" "$_output_file" "$_verdict" "$_cost" "${TASK_CLASS:-generic}" "$_tool_summary" "$_duration_ms" 2>/dev/null)
+" "$_trace_id" "$_status" "$_node_type" "$_output_file" "$_verdict" "$_cost" "${TASK_CLASS:-generic}" "$_tool_summary" "$_duration_ms" "$_finish_reason" 2>/dev/null)
   if [ -n "$_payload" ]; then
     trace_write "$_payload" >/dev/null 2>&1 || true
   fi
@@ -706,6 +708,17 @@ _mo_policy_route_lane() {
   esac
 }
 
+_mo_finish_reason_for_failure() {
+  local _rc="${1:-1}" _text="${2:-}"
+  if [ "$_rc" -eq 124 ]; then
+    printf 'timeout\n'
+  elif printf '%s' "$_text" | grep -q 'cost_circuit_open'; then
+    printf 'cost_limit\n'
+  else
+    printf 'error\n'
+  fi
+}
+
 _dispatch_node() {
   local node_id="$1" node_type="$2" node_desc="$3" node_prompt_ref="${4:-}" node_verifier_ref="${5:-}" node_model_lane="${6:-}"
   local dispatch_lane="${node_model_lane:-$node_type}"
@@ -718,6 +731,7 @@ _dispatch_node() {
   # between Stop (soft) and Kill (hard SIGKILL).
   if [ -f "${MINI_ORK_RUN_DIR:-$RUN_DIR}/.stop-requested" ]; then
     echo "  [stop] .stop-requested present — skipping node_id=${node_id}" >&2
+    MO_NODE_FINISH_REASON="interrupted"
     FAIL_COUNT=$((${FAIL_COUNT:-0} + 1))
     return 0
   fi
@@ -770,7 +784,7 @@ _dispatch_node() {
   fi
   # Clear per-node globals so the trap never reports a previous node's
   # verdict/artifact when this node's branch exits before setting them.
-  VERDICT=""; CONTEXT_FILE=""; IMPL_LOG=""; REVIEW_FILE=""
+  VERDICT=""; CONTEXT_FILE=""; IMPL_LOG=""; REVIEW_FILE=""; MO_NODE_FINISH_REASON=""
 
   # Locate recipe prompt for this node.
   # D-030: prefer per-node `prompt_ref` from workflow.yaml (e.g. recipe's
@@ -858,10 +872,18 @@ _dispatch_node() {
       export MO_NODE_ID="$node_id"
       local _dispatch_marker="$RUN_DIR/.dispatch-marker-${node_id}"
       touch "$_dispatch_marker"
+      local _dispatch_rc=0
       RESULT=$(llm_dispatch \
         --task-class "$TASK_CLASS" \
         --node-type "$dispatch_lane" \
-        --prompt-text "$PROMPT_CONTENT" 2>&1) || { rm -f "$_dispatch_marker"; echo "researcher dispatch failed" >&2; return 1; }
+        --prompt-text "$PROMPT_CONTENT" 2>&1) || {
+          _dispatch_rc=$?
+          MO_NODE_FINISH_REASON=$(_mo_finish_reason_for_failure "$_dispatch_rc" "$RESULT")
+          rm -f "$_dispatch_marker"
+          echo "researcher dispatch failed" >&2
+          _trace_write_node_rich "$NODE_TRACE_ID" "failure" "researcher" "$CONTEXT_FILE" "" "$MO_NODE_FINISH_REASON"
+          return 1
+        }
       # D-033v2: preserve agent's tool-call Writes. The old size heuristic
       # ("existing file bigger than stdout wins") clobbered intentionally
       # small artifacts whenever the closing chat message was larger
@@ -880,7 +902,8 @@ _dispatch_node() {
       rm -f "$_dispatch_marker"
       # D-042: rich trace payload — files_written + cost_usd + final_artifact_ref
       # gives reflect's gradient_extract real signal to learn from.
-      _trace_write_node_rich "$NODE_TRACE_ID" "success" "researcher" "$CONTEXT_FILE" ""
+      MO_NODE_FINISH_REASON="done"
+      _trace_write_node_rich "$NODE_TRACE_ID" "success" "researcher" "$CONTEXT_FILE" "" "$MO_NODE_FINISH_REASON"
       _d022_charge_node_cost "${MINI_ORK_RUN_DIR}/.last-llm-cost"
       ;;
 
@@ -895,14 +918,22 @@ _dispatch_node() {
       fi
       PROMPT_CONTENT="${_prepend}Implement: ${node_desc}${_learned_block}\n\nPlan:\n${PLAN_CONTENT}"
       export MO_NODE_ID="$node_id"
+      local _dispatch_rc=0
       RESULT=$(llm_dispatch \
         --task-class "$TASK_CLASS" \
         --node-type "$dispatch_lane" \
-        --prompt-text "$PROMPT_CONTENT" 2>&1) || { echo "implementer dispatch failed" >&2; return 1; }
+        --prompt-text "$PROMPT_CONTENT" 2>&1) || {
+          _dispatch_rc=$?
+          MO_NODE_FINISH_REASON=$(_mo_finish_reason_for_failure "$_dispatch_rc" "$RESULT")
+          echo "implementer dispatch failed" >&2
+          _trace_write_node_rich "$NODE_TRACE_ID" "failure" "implementer" "$IMPL_LOG" "" "$MO_NODE_FINISH_REASON"
+          return 1
+        }
       echo "$RESULT" > "$IMPL_LOG"
       echo "  [ok] implementer output → $IMPL_LOG"
       # D-042 rich trace payload
-      _trace_write_node_rich "$NODE_TRACE_ID" "success" "implementer" "$IMPL_LOG" ""
+      MO_NODE_FINISH_REASON="done"
+      _trace_write_node_rich "$NODE_TRACE_ID" "success" "implementer" "$IMPL_LOG" "" "$MO_NODE_FINISH_REASON"
       _d022_charge_node_cost "${MINI_ORK_RUN_DIR}/.last-llm-cost"
       ;;
 
@@ -954,10 +985,18 @@ PY
       export MO_NODE_ID="$node_id"
       local _dispatch_marker="$RUN_DIR/.dispatch-marker-${node_id}"
       touch "$_dispatch_marker"
+      local _dispatch_rc=0
       RESULT=$(llm_dispatch \
         --task-class "$TASK_CLASS" \
         --node-type "$dispatch_lane" \
-        --prompt-text "$PROMPT_CONTENT" 2>&1) || { rm -f "$_dispatch_marker"; echo "reviewer dispatch failed" >&2; return 1; }
+        --prompt-text "$PROMPT_CONTENT" 2>&1) || {
+          _dispatch_rc=$?
+          MO_NODE_FINISH_REASON=$(_mo_finish_reason_for_failure "$_dispatch_rc" "$RESULT")
+          rm -f "$_dispatch_marker"
+          echo "reviewer dispatch failed" >&2
+          _trace_write_node_rich "$NODE_TRACE_ID" "failure" "reviewer" "$REVIEW_FILE" "" "$MO_NODE_FINISH_REASON"
+          return 1
+        }
       # D-033v2: same mtime-marker preserve-agent-Write logic as researcher
       # (size heuristic clobbered small artifacts — see researcher branch).
       if [ -f "$REVIEW_FILE" ] && [ "$REVIEW_FILE" -nt "$_dispatch_marker" ]; then
@@ -976,7 +1015,37 @@ PY
       VERDICT=$(python3 "$MINI_ORK_ROOT/lib/extract_verdict.py" "$REVIEW_FILE" 2>/dev/null || echo "unknown")
       echo "  [ok] reviewer verdict=${VERDICT} → $REVIEW_FILE"
       # D-042 rich trace payload — reviewer/synthesizer node
-      _trace_write_node_rich "$NODE_TRACE_ID" "success" "reviewer" "$REVIEW_FILE" "$VERDICT"
+      local _verdict_norm
+      _verdict_norm=$(printf '%s' "$VERDICT" | tr '[:upper:]' '[:lower:]')
+      if [ "$_is_synth" -eq 0 ]; then
+        case "$_verdict_norm" in
+          pass|approve|approved)
+            MO_NODE_FINISH_REASON="done"
+            _trace_write_node_rich "$NODE_TRACE_ID" "success" "reviewer" "$REVIEW_FILE" "$VERDICT" "$MO_NODE_FINISH_REASON"
+            ;;
+          revise|needs_revision|request_changes)
+            MO_NODE_FINISH_REASON="verdict_revise"
+            _trace_write_node_rich "$NODE_TRACE_ID" "failure" "reviewer" "$REVIEW_FILE" "$VERDICT" "$MO_NODE_FINISH_REASON"
+            _d022_charge_node_cost "${MINI_ORK_RUN_DIR}/.last-llm-cost"
+            return 1
+            ;;
+          fail|failed|escalate)
+            MO_NODE_FINISH_REASON="verdict_fail"
+            _trace_write_node_rich "$NODE_TRACE_ID" "failure" "reviewer" "$REVIEW_FILE" "$VERDICT" "$MO_NODE_FINISH_REASON"
+            _d022_charge_node_cost "${MINI_ORK_RUN_DIR}/.last-llm-cost"
+            return 1
+            ;;
+          *)
+            MO_NODE_FINISH_REASON="verdict_fail"
+            _trace_write_node_rich "$NODE_TRACE_ID" "failure" "reviewer" "$REVIEW_FILE" "$VERDICT" "$MO_NODE_FINISH_REASON"
+            _d022_charge_node_cost "${MINI_ORK_RUN_DIR}/.last-llm-cost"
+            return 1
+            ;;
+        esac
+      else
+        MO_NODE_FINISH_REASON="done"
+        _trace_write_node_rich "$NODE_TRACE_ID" "success" "reviewer" "$REVIEW_FILE" "$VERDICT" "$MO_NODE_FINISH_REASON"
+      fi
       _d022_charge_node_cost "${MINI_ORK_RUN_DIR}/.last-llm-cost"
       ;;
 
@@ -1020,17 +1089,22 @@ PY
           local _evidence_path="$_evidence_dir/${_vstem}-$(date +%s).log"
           if _run_verifier_ref "$_verifier_script" "$_evidence_path"; then
             echo "  [ok] verifier_ref $node_verifier_ref passed → $_evidence_path"
+            MO_NODE_FINISH_REASON="done"
           else
             echo "  [fail] verifier_ref $node_verifier_ref failed → $_evidence_path" >&2
+            MO_NODE_FINISH_REASON="error"
             return 1
           fi
         else
           "$MINI_ORK_ROOT/bin/mini-ork-verify" --plan "$PLAN_PATH" --task-class "$TASK_CLASS" "$ARTIFACT_PATH" || {
+            MO_NODE_FINISH_REASON="error"
             echo "  [fail] verifier node failed for $ARTIFACT_PATH" >&2; return 1
           }
+          MO_NODE_FINISH_REASON="done"
         fi
       else
         echo "  [warn] verifier node: no outputs in artifact_contract"
+        MO_NODE_FINISH_REASON="error"
       fi
       ;;
 
@@ -1261,6 +1335,7 @@ Dispatched by mini-ork-execute publisher node (D-037 v0.2-pt9).
       echo "  [ok] publisher: $_published_count artifact(s) published"
       # D-021: transition to 'published' on successful publisher dispatch.
       _d021_set_status "published"
+      MO_NODE_FINISH_REASON="done"
 
       # E-MO-01 (epic catalogue 2026-06-02-2100): measure realised panel
       # topology (ρ, C, I) post-cycle. Best-effort — never fails the run.
@@ -1289,8 +1364,10 @@ Dispatched by mini-ork-execute publisher node (D-037 v0.2-pt9).
           || version_rollback agent default 2>/dev/null \
           || echo "  [ok] rollback: nothing to revert (no prior promoted version)" >&2
         echo "  [ok] rollback complete"
+        MO_NODE_FINISH_REASON="done"
       else
         echo "rollback: version_rollback function not found in lib/version_registry.sh" >&2
+        MO_NODE_FINISH_REASON="error"
         return 1
       fi
       ;;
@@ -1299,6 +1376,7 @@ Dispatched by mini-ork-execute publisher node (D-037 v0.2-pt9).
       echo "  [warn] unknown node_type=${node_type} for node_id=${node_id} — skipping"
       ;;
   esac
+  [ -n "$MO_NODE_FINISH_REASON" ] || MO_NODE_FINISH_REASON="done"
   # node_end is emitted by the RETURN trap installed above — handles both
   # clean fall-through and early-return paths uniformly.
 }
