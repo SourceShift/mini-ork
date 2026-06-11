@@ -7,6 +7,11 @@ Inputs:
 - Optional file-glob hint that narrows the affected subtree.
 - Any explicit `scope_allow` override for high-blast-radius files.
 
+Kickoff content:
+```text
+{{KICKOFF_CONTENT}}
+```
+
 Produce a concise plan with:
 1. Requested outcome in one sentence.
 2. Candidate files or globs to inspect.
