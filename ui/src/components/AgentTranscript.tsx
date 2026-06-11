@@ -12,9 +12,11 @@ type LlmCallRow = AgentDetail["llm_calls"][number];
 export function AgentTranscriptPanel({
   transcript,
   calls,
+  running = false,
 }: {
   transcript: AgentTranscript;
   calls: LlmCallRow[];
+  running?: boolean;
 }) {
   const callsByTurn = new Map<number, LlmCallRow>();
   for (const c of calls) {
@@ -57,7 +59,20 @@ export function AgentTranscriptPanel({
         </div>
       </div>
 
-      {!transcript.available && (
+      {running && (
+        <div
+          className="mb-3 flex items-center gap-2 rounded-md border border-ork-amber/30 bg-ork-amber/5 px-3 py-2"
+          data-testid="agent-inflight-banner"
+        >
+          <span className="h-2 w-2 rounded-full bg-ork-amber animate-pulse" />
+          <p className="text-xs text-ink-300">
+            Agent in flight — LLM calls are ledgered when each call completes, so turns
+            appear here as they finish (auto-refreshes every 5s).
+          </p>
+        </div>
+      )}
+
+      {!transcript.available && !running && (
         <p className="text-sm text-ink-500 mb-3">
           {transcript.reason ?? "no transcript captured"}.
           Rich turn transcripts require <code className="text-ink-300">MO_TRACE_RICH=1</code>{" "}
@@ -73,7 +88,7 @@ export function AgentTranscriptPanel({
         </p>
       )}
 
-      {!transcript.available && calls.length === 0 && (
+      {!transcript.available && calls.length === 0 && !running && (
         <p className="text-sm text-ink-500">
           No LLM calls attributed to this agent. Either (a) this is a non-LLM node (verifier /
           publisher / rollback), (b) the run predates <code>lib/llm-dispatch.sh</code>'s llm_calls
