@@ -58,6 +58,91 @@ _mo_llm_write_duration_ms() {
   printf '%s\n' "$duration_ms" > "${MINI_ORK_RUN_DIR}/.last-llm-duration-ms" 2>/dev/null || true
 }
 
+# _mo_check_lane_fuse <lane> <error_category>
+#
+# Returns 1 when MO_FUSE_ENABLED=1 and the last three completed calls for the
+# lane all failed with the same retryable error_category. Returns 0 otherwise
+# so callers can proceed. The lane is stored in llm_calls.feature_name by the
+# flag-based shim as "<task_class>:<lane>".
+_mo_check_lane_fuse() {
+  local lane="${1:-}" error_category="${2:-}"
+  [ "${MO_FUSE_ENABLED:-0}" = "1" ] || return 0
+  [ -n "$lane" ] || return 0
+  [ -n "$error_category" ] || return 0
+  [ -n "${MINI_ORK_DB:-}" ] && [ -f "${MINI_ORK_DB:-}" ] || return 0
+
+  python3 - "$MINI_ORK_DB" "$lane" "$error_category" <<'PY'
+import json
+import sqlite3
+import sys
+
+db, lane, category = sys.argv[1:4]
+feature_suffix = ":" + lane
+con = sqlite3.connect(db, timeout=5.0)
+con.execute("PRAGMA busy_timeout = 5000")
+try:
+    cols = {r[1] for r in con.execute("PRAGMA table_info(llm_calls)").fetchall()}
+    if not {"status", "feature_name", "error_category", "retryable"} <= cols:
+        sys.exit(0)
+    rows = con.execute(
+        """
+        SELECT status, error_category, retryable
+          FROM llm_calls
+         WHERE feature_name LIKE ?
+         ORDER BY id DESC
+         LIMIT 3
+        """,
+        (f"%{feature_suffix}",),
+    ).fetchall()
+finally:
+    con.close()
+
+if len(rows) != 3:
+    sys.exit(0)
+trip = all(
+    status == "failed" and err == category and int(retryable or 0) == 1
+    for status, err, retryable in rows
+)
+if trip:
+    print(json.dumps({"lane": lane, "error_category": category, "consecutive_failures": 3}))
+    sys.exit(1)
+sys.exit(0)
+PY
+}
+
+_mo_record_lane_fuse_trip() {
+  local lane="${1:-}" category="${2:-}"
+  [ -n "$lane" ] || return 0
+  [ -n "${MINI_ORK_DB:-}" ] && [ -f "${MINI_ORK_DB:-}" ] || return 0
+  [ -n "${MINI_ORK_TASK_RUN_ID:-${MINI_ORK_RUN_ID:-}}" ] || return 0
+
+  python3 - "$MINI_ORK_DB" "${MINI_ORK_TASK_RUN_ID:-$MINI_ORK_RUN_ID}" "$lane" "$category" <<'PY' 2>/dev/null || true
+import sqlite3
+import sys
+import time
+
+db, run_id, lane, category = sys.argv[1:5]
+con = sqlite3.connect(db, timeout=5.0)
+con.execute("PRAGMA busy_timeout = 5000")
+try:
+    cols = {r[1] for r in con.execute("PRAGMA table_info(task_runs)").fetchall()}
+    if {"fuse_blown_lane", "fuse_consecutive_failures"} <= cols:
+        con.execute(
+            """
+            UPDATE task_runs
+               SET fuse_blown_lane = ?,
+                   fuse_consecutive_failures = 3,
+                   updated_at = COALESCE(?, updated_at)
+             WHERE id = ?
+            """,
+            (lane, int(time.time()), run_id),
+        )
+        con.commit()
+finally:
+    con.close()
+PY
+}
+
 # Redact API-key-shaped tokens from provider error strings before they hit
 # the llm_calls.error_message column or the operator's stderr. The column is
 # exposed via the read-only web API (mini_ork/web/agents.py:565), so an
@@ -1072,8 +1157,8 @@ finally:
     fi
   fi
 
-  # Resolve model: explicit override > agents.yaml lane lookup > env default > sonnet
-  local model="${model_override:-${MINI_ORK_DEFAULT_MODEL:-sonnet}}"
+	  # Resolve model: explicit override > agents.yaml lane lookup > env default > sonnet
+	  local model="${model_override:-${MINI_ORK_DEFAULT_MODEL:-sonnet}}"
   if [ -z "$model_override" ] && [ -n "$node_type" ]; then
     # v0.2-pt8 (G-002+K-07+D-06 ★★★ triple-consensus): cache agents.yaml
     # lane resolution per-session. Was: every llm_dispatch call forked a
@@ -1115,9 +1200,20 @@ PY
       fi
       # Cache the resolution via export — subshells inherit. Cover both keyed-
       # by-original-name (legacy callers) and keyed-by-safe-name (new path).
-      export "$_safe_key=$model"
-    fi
-  fi
+	      export "$_safe_key=$model"
+	    fi
+	  fi
+
+	  if [ "${MO_FUSE_ENABLED:-0}" = "1" ] && [ -n "${MINI_ORK_DB:-}" ] && [ -f "${MINI_ORK_DB:-}" ]; then
+	    local _category
+	    for _category in capacity network stream provider; do
+	      if ! _mo_check_lane_fuse "$node_type" "$_category" >/dev/null; then
+	        _mo_record_lane_fuse_trip "$node_type" "$_category"
+	        echo "[lane_fuse_open] lane=$node_type error_category=$_category consecutive_failures=3 — halting dispatch" >&2
+	        return 43
+	      fi
+	    done
+	  fi
 
   # Allocate tmp out-file when caller wants stdout (default for universal-loop)
   local _tmp_out=""
