@@ -1,0 +1,52 @@
+name: researcher_qdrant_contract
+version: "0.1.0"
+description: >
+  PG/Qdrant indexing and retrieval contract remediation for the researcher
+  repo. Maps every content creation path to its canonical sync point, fixes
+  retrieval allowlists, defines degraded-preview fallback semantics, and ships
+  scoped reconciliation/backfill scripts with mandatory --dry-run. Does NOT
+  perform blind full reindexing.
+
+matches:
+  keywords:
+    - qdrant
+    - knowledge_nodes_unified
+    - contract
+    - payload
+    - retrieval
+    - hydration
+    - reconciliation
+    - embedding
+    - backfill
+    - split-brain
+    - indexing
+    - researcher
+    - pg-sync
+    - vector-index
+    - bookChapterEmbeddingService
+    - <canonical_sync_module>
+  regex:
+    - "qdrant.*contract"
+    - "knowledge_nodes_unified"
+    - "bookChapterEmbeddingService"
+    - "pg.*qdrant.*sync"
+
+artifact_contract_ref: artifact_contract.yaml
+default_workflow: workflow.yaml
+
+default_gates:
+  - budget_gate
+  - scope_gate
+
+risk_class: high
+# Touches researcher repo DB/Qdrant sync paths. High review bar because
+# bad patches can corrupt vector index state or introduce split-brain writers.
+
+cost_model:
+  min_usd: 4
+  max_usd: 30
+  per_lens_usd: 3
+
+runtime_model:
+  min_minutes: 10
+  max_minutes: 60
