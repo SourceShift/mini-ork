@@ -1,0 +1,48 @@
+name: chapter_review
+version: "0.1.0"
+description: >
+  Multi-axis panel review of a book chapter by 4 heterogeneous LLM lenses.
+  Produces a structured chapter-review.json with 9 axis scores,
+  fragment-level suggestions, overall verdict, summary, and a
+  panel-disagreement metric. Designed for editorial pipelines,
+  pedagogical QA, and pre-publication chapter critique.
+
+# Canonical matcher shape (matches schemas/task_class.schema.json).
+matches:
+  keywords:
+    - chapter review
+    - chapter critique
+    - book chapter
+    - multi-axis review
+    - fragment suggestions
+    - panel disagreement
+    - lens panel
+    - style coherence
+    - audience fit
+    - factuality
+    - citations
+    - editorial review
+    - manuscript critique
+    - writing quality
+    - peer review
+    - pedagogical review
+  regex: []
+
+artifact_contract_ref: artifact_contract.yaml
+default_workflow: workflow.yaml
+
+default_gates:
+  - budget_gate
+  - scope_gate
+
+risk_class: low   # Review is read-only analysis; no source mutation.
+
+# Cost model (informational; budget_gate enforces).
+cost_model:
+  min_usd: 1
+  max_usd: 5
+  per_lens_usd: 1
+
+runtime_model:
+  min_minutes: 3
+  max_minutes: 15
