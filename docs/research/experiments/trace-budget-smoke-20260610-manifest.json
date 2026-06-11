@@ -1,0 +1,49 @@
+{
+  "experiment_id": "trace-budget-smoke-20260610",
+  "description": "Controlled obs-smoke routing-policy pilot: one task, one replicate, four routing policies.",
+  "expensive_model_patterns": ["opus", "sonnet", "fable", "mythos", "claude"],
+  "policies": [
+    {
+      "policy": "frontier_only",
+      "description": "All LLM nodes route to opus_lens."
+    },
+    {
+      "policy": "cheap_only",
+      "description": "All LLM nodes route to kimi_lens."
+    },
+    {
+      "policy": "static_hybrid",
+      "description": "Researcher/implementer nodes route to kimi_lens; reviewer nodes route to opus_lens."
+    },
+    {
+      "policy": "trace_governed",
+      "description": "Researcher/implementer nodes route cheap-first, with frontier review and failure-state escalation."
+    }
+  ],
+  "runs": [
+    {
+      "policy": "frontier_only",
+      "task_id": "obs-smoke-001",
+      "replicate": 1,
+      "run_id": "trace-budget-smoke-20260610-frontier_only-obs-smoke-001-r1"
+    },
+    {
+      "policy": "cheap_only",
+      "task_id": "obs-smoke-001",
+      "replicate": 1,
+      "run_id": "trace-budget-smoke-20260610-cheap_only-obs-smoke-001-r1"
+    },
+    {
+      "policy": "static_hybrid",
+      "task_id": "obs-smoke-001",
+      "replicate": 1,
+      "run_id": "trace-budget-smoke-20260610-static_hybrid-obs-smoke-001-r1"
+    },
+    {
+      "policy": "trace_governed",
+      "task_id": "obs-smoke-001",
+      "replicate": 1,
+      "run_id": "trace-budget-smoke-20260610-trace_governed-obs-smoke-001-r1"
+    }
+  ]
+}

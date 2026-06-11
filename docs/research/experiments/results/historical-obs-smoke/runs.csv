@@ -1,0 +1,25 @@
+policy,task_id,replicate,run_id,recipe,task_class,status,success,verifier_pass,verifier_passes,verifier_total,verifier_reasons,task_cost_usd,llm_cost_usd,duration_s,llm_call_count,failed_llm_call_count,input_tokens,output_tokens,expensive_call_count,distinct_provider_count,providers,retry_event_count
+historical_obs_smoke,obs-smoke-001,1,run-1781015034-9925,obs-smoke,obs_smoke,failed,0,0,0,0,,0.05,0,350.0,0,0,0,0,0,0,,0
+historical_obs_smoke,obs-smoke-002,1,run-1781015300-29102,obs-smoke,obs_smoke,failed,0,0,0,0,,0.0,0.24664,87.0,1,0,5,1,1,1,anthropic,0
+historical_obs_smoke,obs-smoke-003,1,run-1781015438-38459,obs-smoke,obs_smoke,failed,0,0,0,1,verifier-result-lens-exists.json: pass=False,0.534316,0.743081,105.0,5,0,24,22,5,1,anthropic,0
+historical_obs_smoke,obs-smoke-004,1,run-1781015698-55547,obs-smoke,obs_smoke,failed,0,0,0,1,verifier-result-lens-exists.json: pass=False,0.536798,0.757863,104.0,5,0,24,21,5,1,anthropic,0
+historical_obs_smoke,obs-smoke-005,1,run-1781016198-84027,obs-smoke,obs_smoke,failed,0,0,0,0,,0.05,0.262465,96.0,1,0,5,1,1,1,anthropic,0
+historical_obs_smoke,obs-smoke-006,1,run-1781016416-96341,obs-smoke,obs_smoke,failed,0,0,0,0,,0.05,0.525025,100.0,3,0,12,8,3,1,anthropic,0
+historical_obs_smoke,obs-smoke-007,1,run-1781031690-74197,obs-smoke,obs_smoke,failed,0,0,0,0,,0.0,0,11.0,0,0,0,0,0,0,,0
+historical_obs_smoke,obs-smoke-008,1,run-1781031742-78513,obs-smoke,obs_smoke,failed,0,0,0,0,,0.0,0,10.0,0,0,0,0,0,0,,0
+historical_obs_smoke,obs-smoke-009,1,run-1781031767-81437,obs-smoke,obs_smoke,classified,0,0,0,0,,0.05,0,0.0,0,0,0,0,0,0,,0
+historical_obs_smoke,obs-smoke-010,1,run-1781031854-85467,obs-smoke,obs_smoke,failed,0,0,0,1,verifier-result-lens-exists.json: pass=False,0.400261,0.551099,89.0,7,0,13,2950,7,1,anthropic,0
+historical_obs_smoke,obs-smoke-011,1,run-1781032390-13149,obs-smoke,obs_smoke,failed,0,0,0,1,verifier-result-lens-exists.json: pass=False,0.407633,0.592722,103.0,8,0,15,4244,8,1,anthropic,0
+historical_obs_smoke,obs-smoke-012,1,run-1781032903-48633,obs-smoke,obs_smoke,failed,0,0,0,1,verifier-result-lens-exists.json: pass=False,0.420374,0.595662,108.0,7,0,13,3739,7,1,anthropic,0
+historical_obs_smoke,obs-smoke-013,1,run-1781038813-58423,obs-smoke,obs_smoke,failed,0,1,1,1,,0.421135,0.813746,113.0,8,0,15,4531,8,1,anthropic,0
+historical_obs_smoke,obs-smoke-014,1,run-1781039046-84883,obs-smoke,obs_smoke,reviewing,0,1,1,1,,0.421618,0.608062,106.0,7,0,13,4026,7,1,anthropic,0
+historical_obs_smoke,obs-smoke-015,1,run-1781039200-2684,obs-smoke,obs_smoke,reviewing,0,1,1,1,,0.435406,0.650882,120.0,8,0,14,234,8,1,anthropic,0
+historical_obs_smoke,obs-smoke-016,1,run-1781039455-30154,obs-smoke,obs_smoke,reviewing,0,1,1,1,,0.41606,0.616005,105.0,8,0,14,253,8,1,anthropic,0
+historical_obs_smoke,obs-smoke-017,1,run-1781070408-23684,obs-smoke,obs_smoke,reviewing,0,1,1,1,,0.415721,0.604628,108.0,7,0,13,4101,7,1,anthropic,0
+historical_obs_smoke,obs-smoke-018,1,run-1781070892-81354,obs-smoke,obs_smoke,reviewing,0,1,1,1,,0.425597,0.629829,117.0,8,0,15,4811,8,1,anthropic,0
+historical_obs_smoke,obs-smoke-019,1,run-1781071699-60187,obs-smoke,obs_smoke,reviewing,0,1,1,1,,0.422854,0.623323,122.0,8,0,15,4608,8,1,anthropic,0
+historical_obs_smoke,obs-smoke-020,1,run-1781082049-43701,obs-smoke,obs_smoke,published,1,1,1,1,,0.435835,2.370404,130.0,13,0,25,467,13,1,anthropic,0
+historical_obs_smoke,obs-smoke-021,1,run-1781104706-3045,obs-smoke,obs_smoke,published,1,1,1,1,,0.423092,1.934083,145.0,12,0,23,16108,12,1,anthropic,0
+historical_obs_smoke,obs-smoke-022,1,run-1781105320-64712,obs-smoke,obs_smoke,failed,0,0,0,1,verifier-result-lens-exists.json: pass=False,0.508578,2.191818,156.0,15,0,29,577,15,1,anthropic,0
+historical_obs_smoke,obs-smoke-023,1,run-1781106591-90667,obs-smoke,obs_smoke,published,1,1,1,1,,0.431676,1.974398,125.0,12,0,23,17542,12,1,anthropic,0
+historical_obs_smoke,obs-smoke-024,1,run-1781107148-33710,obs-smoke,obs_smoke,published,1,1,1,1,,0.401485,2.080837,102.0,13,0,25,626,13,1,anthropic,0
