@@ -80,6 +80,45 @@ _mo_llm_redact_secrets() {
     -e 's/[a-fA-F0-9]{32,}/[REDACTED_HEX]/g'
 }
 
+_mo_llm_classify_error() {
+  local message="${1:-}" rc="${2:-}"
+  local text
+  text=$(printf '%s' "$message" | tr '[:upper:]' '[:lower:]')
+
+  case "$rc" in
+    6|7|28) printf 'network\n'; return 0 ;;
+  esac
+
+  if printf '%s' "$text" | grep -Eq 'missing (api key|wrapper)|api key.*missing|malformed config|config.*missing|cl_[a-z0-9_-]+\.sh missing|no providers\.yaml entry|\$[A-Z0-9_]+ is empty'; then
+    printf 'config\n'
+  elif printf '%s' "$text" | grep -Eq '(^|[^0-9])(401|403)([^0-9]|$)|invalid api key|authentication failed|not logged in|unauthorized|forbidden'; then
+    printf 'auth\n'
+  elif printf '%s' "$text" | grep -Eq '429' && printf '%s' "$text" | grep -Eq 'monthly|tokens-per-day|billing|quota|insufficient credits|credit limit'; then
+    printf 'quota\n'
+  elif printf '%s' "$text" | grep -Eq '(^|[^0-9])(429|503)([^0-9]|$)' && printf '%s' "$text" | grep -Eq 'capacity|concurrent|rate|overload|temporarily unavailable'; then
+    printf 'capacity\n'
+  elif printf '%s' "$text" | grep -Eq '(^|[^0-9])400([^0-9]|$)|invalid request|context too long|maximum context|prompt too long'; then
+    printf 'request\n'
+  elif printf '%s' "$text" | grep -Eq '(^|[^0-9])422([^0-9]|$)|content filter|safety|moderation'; then
+    printf 'safety\n'
+  elif printf '%s' "$text" | grep -Eq 'connection refused|could not resolve|dns|timed out|timeout was reached|network is unreachable'; then
+    printf 'network\n'
+  elif printf '%s' "$text" | grep -Eq 'partial stream|unexpected eof|stream.*(closed|ended|error)|incomplete chunk|chunked encoding'; then
+    printf 'stream\n'
+  elif printf '%s' "$text" | grep -Eq '(^|[^0-9])(500|502|504)([^0-9]|$)|internal server error|bad gateway|gateway timeout|provider error'; then
+    printf 'provider\n'
+  else
+    printf 'unknown\n'
+  fi
+}
+
+_mo_llm_error_retryable() {
+  case "${1:-unknown}" in
+    capacity|network|stream|provider) printf '1\n' ;;
+    *) printf '0\n' ;;
+  esac
+}
+
 _mo_llm_write_llm_calls_row() {
   # Args (positional):
   #   1=provider 2=model_id 3=tier 4=feature_name 5=actor
@@ -89,6 +128,11 @@ _mo_llm_write_llm_calls_row() {
   local provider="$1" model_id="$2" tier="$3" feature_name="$4"
   local actor="$5" status="$6" duration_ms="$7" cost_usd="$8" error_message="$9"
   local input_tokens="${10:-0}" output_tokens="${11:-0}" metadata_json="${12:-{\}}"
+  local error_category="" retryable=""
+  if [ "$status" = "failed" ]; then
+    error_category=$(_mo_llm_classify_error "$error_message" "${MO_LLM_LAST_RC:-}")
+    retryable=$(_mo_llm_error_retryable "$error_category")
+  fi
   # Always include MO_NODE_ID in metadata for UI attribution — the
   # recipe's actual node name (e.g. perf_lens, opus_synthesizer), distinct
   # from lane/family (e.g. minimax_lens, opus_lens) which appears in
@@ -127,6 +171,7 @@ print(json.dumps(d))' "$metadata_json")
   python3 - "$MINI_ORK_DB" "$provider" "$model_id" "$tier" "$feature_name" \
     "$actor" "$status" "$duration_ms" "$cost_usd" "$error_message" \
     "$iter" "$run_id" "$traceparent" "$input_tokens" "$output_tokens" "$metadata_json" \
+    "$error_category" "$retryable" \
     <<'PY' 2>>"${err_dir}/trace-write-errors.log" || true
 import sqlite3
 import sys
@@ -136,36 +181,38 @@ con = sqlite3.connect(db, timeout=5)
 con.execute("PRAGMA busy_timeout=5000")
 in_tok = int(args[12] or 0)
 out_tok = int(args[13] or 0)
+error_category = args[15] or None
+retryable = int(args[16]) if args[16] != "" else None
 import json as _json
 try:
     _md = _json.loads(args[14] or "{}")
     _sess = _md.get("session_id") if isinstance(_md, dict) else None
 except Exception:
     _sess = None
+cols = {r[1] for r in con.execute("PRAGMA table_info(llm_calls)").fetchall()}
+insert_cols = [
+    "provider", "model_id", "tier", "feature_name", "actor",
+    "status", "duration_ms", "cost_usd", "error_message", "iter",
+    "run_id", "traceparent", "input_tokens", "output_tokens",
+    "total_tokens", "metadata_json", "session_id",
+]
+values = [
+    args[0], args[1], args[2], args[3], args[4], args[5],
+    int(args[6] or 0), float(args[7] or 0.0), args[8] or None,
+    int(args[9]) if args[9] else None, args[10] or None,
+    args[11] or None, in_tok, out_tok, in_tok + out_tok,
+    args[14] or "{}", _sess,
+]
+if "error_category" in cols:
+    insert_cols.append("error_category")
+    values.append(error_category)
+if "retryable" in cols:
+    insert_cols.append("retryable")
+    values.append(retryable)
+placeholders = ",".join("?" for _ in insert_cols)
 con.execute(
-    "INSERT INTO llm_calls (provider, model_id, tier, feature_name, actor, "
-    "status, duration_ms, cost_usd, error_message, iter, run_id, traceparent, "
-    "input_tokens, output_tokens, total_tokens, metadata_json, session_id) "
-    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-    (
-        args[0],
-        args[1],
-        args[2],
-        args[3],
-        args[4],
-        args[5],
-        int(args[6] or 0),
-        float(args[7] or 0.0),
-        args[8] or None,
-        int(args[9]) if args[9] else None,
-        args[10] or None,
-        args[11] or None,
-        in_tok,
-        out_tok,
-        in_tok + out_tok,
-        args[14] or "{}",
-        _sess,
-    ),
+    f"INSERT INTO llm_calls ({', '.join(insert_cols)}) VALUES ({placeholders})",
+    values,
 )
 con.commit()
 con.close()
@@ -1162,6 +1209,7 @@ total_out = sum(int(t.get('output_tokens') or 0) for t in turns) or 1
 cost_total_f = float(cost_total or 0.0)
 con = sqlite3.connect(db, timeout=5)
 con.execute("PRAGMA busy_timeout=5000")
+cols = {r[1] for r in con.execute("PRAGMA table_info(llm_calls)").fetchall()}
 for t in turns:
     # Cost split proportionally by output_tokens (output dominates cost)
     out_tok = int(t.get('output_tokens') or 0)
@@ -1180,24 +1228,35 @@ for t in turns:
         # share a lane (the 4 lens nodes all use lens lanes).
         'node_id': os.environ.get('MO_NODE_ID') or (feature.split(':',1)[1] if ':' in feature else None),
     })
+    insert_cols = [
+        "provider", "model_id", "tier", "feature_name", "actor",
+        "status", "duration_ms", "cost_usd", "error_message", "iter",
+        "run_id", "traceparent", "input_tokens", "output_tokens",
+        "total_tokens", "metadata_json", "session_id",
+    ]
+    values = [
+        provider, t.get('model') or model, tier, feature, actor or None,
+        'success',
+        # Per-turn duration unknown from claude stream-json; spread evenly.
+        int(int(duration_ms or 0) / max(len(turns), 1)),
+        cost_share, None,
+        int(iter_) if iter_ else None,
+        run_id or None,
+        traceparent or None,
+        in_tok, out_tok, in_tok + out_tok,
+        meta,
+        t.get('session_id'),
+    ]
+    if "error_category" in cols:
+        insert_cols.append("error_category")
+        values.append(None)
+    if "retryable" in cols:
+        insert_cols.append("retryable")
+        values.append(None)
+    placeholders = ",".join("?" for _ in insert_cols)
     con.execute(
-        "INSERT INTO llm_calls (provider, model_id, tier, feature_name, actor, "
-        "status, duration_ms, cost_usd, error_message, iter, run_id, traceparent, "
-        "input_tokens, output_tokens, total_tokens, metadata_json, session_id) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        (
-            provider, t.get('model') or model, tier, feature, actor or None,
-            'success',
-            # Per-turn duration unknown from claude stream-json; spread evenly.
-            int(int(duration_ms or 0) / max(len(turns), 1)),
-            cost_share, None,
-            int(iter_) if iter_ else None,
-            run_id or None,
-            traceparent or None,
-            in_tok, out_tok, in_tok + out_tok,
-            meta,
-            t.get('session_id'),
-        ),
+        f"INSERT INTO llm_calls ({', '.join(insert_cols)}) VALUES ({placeholders})",
+        values,
     )
 con.commit()
 con.close()
@@ -1224,9 +1283,15 @@ PY
     return 0
   else
     local rc=$?
+    export MO_LLM_LAST_RC="$rc"
     _mo_llm_write_duration_ms 0
     local _error_message=""
-    _error_message=$(tail -c 200 "$_err_file" 2>/dev/null || true)
+    _error_message=$(
+      {
+        tail -c 200 "$_err_file" 2>/dev/null || true
+        tail -c 200 "${out_file}.err.log" 2>/dev/null || true
+      } | tail -c 400
+    )
     _error_message=$(_mo_llm_redact_secrets "$_error_message")
     _mo_llm_write_llm_calls_row \
       "$(_mo_llm_provider_for_model "$model")" "$model" "${MO_LANE_TIER:-default}" \
