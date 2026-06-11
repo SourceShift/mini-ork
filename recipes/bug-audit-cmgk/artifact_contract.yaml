@@ -1,0 +1,18 @@
+task_class: refactor_audit
+expected_artifact: composite     # 4 lens reports + 1 synthesis markdown
+success_verifiers:
+  - verifiers/lens-completeness.sh
+failure_policy: request_changes
+rollback_policy: >
+  Keep the 4 lens reports under runs/<id>/lens-*.md for inspection;
+  discard the synthesis if it failed verification. Lens reports remain
+  individually consumable.
+
+# v0.2-pt9 (D-037): publisher path. `source_artifact` names the file
+# produced in $MINI_ORK_RUN_DIR; `outputs[]` lists canonical repo paths
+# the publisher should write to + git-commit. Each cycle's synthesis is
+# preserved in git history; the curated SCALABILITY-AUDIT.md remains
+# separate (manually maintained narrative across cycles).
+source_artifact: synthesis.md
+outputs:
+  - docs/refactor/synthesis-latest.md
