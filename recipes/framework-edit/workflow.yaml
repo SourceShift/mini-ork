@@ -1,0 +1,107 @@
+version: "0.1.0"
+task_class: framework_edit
+description: >
+  Propose verifier-gated 2+ file edits to the mini-ork repo itself.
+  Emits a unified diff plus verdict.json without applying the change.
+  Cheap enough (~$5–10) for routine daily dispatch while enforcing
+  ≥3 model families across lens+implementer+reviewer assignments.
+
+nodes:
+  - name: planner
+    type: planner
+    model_lane: decomposer
+    prompt_ref: prompts/planner.md
+    dispatch_mode: serial
+
+  - name: code_impact_lens
+    type: researcher
+    model_lane: kimi_lens
+    prompt_ref: prompts/code-impact-lens.md
+    dispatch_mode: parallel
+    gates:
+      - budget_gate
+
+  - name: prior_art_lens
+    type: researcher
+    model_lane: codex_lens
+    prompt_ref: prompts/prior-art-lens.md
+    dispatch_mode: parallel
+    gates:
+      - budget_gate
+
+  - name: codex_implementer
+    type: implementer
+    model_lane: codex_lens
+    prompt_ref: prompts/implementer.md
+    dispatch_mode: serial
+    gates:
+      - scope_gate
+      - budget_gate
+
+  - name: static_check_verifier
+    type: verifier
+    prompt_ref: null
+    verifier_ref: verifiers/static-check.sh
+    dispatch_mode: serial
+
+  - name: test_verifier
+    type: verifier
+    prompt_ref: null
+    verifier_ref: verifiers/test.sh
+    dispatch_mode: serial
+
+  - name: opus_arbiter
+    type: reviewer
+    model_lane: opus_lens
+    prompt_ref: prompts/reviewer.md
+    dispatch_mode: serial
+    gates:
+      - budget_gate
+
+  - name: verifier_smith
+    type: implementer
+    model_lane: glm_lens
+    prompt_ref: prompts/verifier-smith.md
+    dispatch_mode: serial
+    gates:
+      - budget_gate
+
+  - name: recipe_validator
+    type: verifier
+    prompt_ref: null
+    verifier_ref: verifiers/recipe-validator.sh
+    dispatch_mode: serial
+
+  - name: publisher
+    type: publisher
+    model_lane: publisher
+    prompt_ref: null
+    dispatch_mode: serial
+    gates:
+      - deployment_gate
+
+  - name: rollback
+    type: rollback
+    model_lane: rollback
+    prompt_ref: null
+    dispatch_mode: serial
+
+edges:
+  - { from: planner,             to: code_impact_lens,      edge_type: depends_on }
+  - { from: planner,             to: prior_art_lens,        edge_type: depends_on }
+  - { from: planner,             to: codex_implementer,     edge_type: depends_on }
+  - { from: code_impact_lens,    to: codex_implementer,     edge_type: supplies_context_to }
+  - { from: prior_art_lens,      to: codex_implementer,     edge_type: supplies_context_to }
+  - { from: codex_implementer,   to: static_check_verifier, edge_type: verifies }
+  - { from: codex_implementer,   to: test_verifier,         edge_type: verifies }
+  - { from: static_check_verifier, to: opus_arbiter,        edge_type: depends_on }
+  - { from: test_verifier,       to: opus_arbiter,          edge_type: depends_on }
+  - { from: opus_arbiter,        to: verifier_smith,        edge_type: depends_on }
+  - { from: verifier_smith,      to: recipe_validator,      edge_type: verifies }
+  - { from: recipe_validator,    to: publisher,             edge_type: depends_on }
+  - { from: recipe_validator,    to: rollback,              edge_type: escalates_to }
+  - { from: opus_arbiter,        to: rollback,              edge_type: escalates_to }
+  - { from: publisher,           to: rollback,              edge_type: depends_on }
+
+rollback_strategy: revert_branch
+max_self_correction_iterations: 1
