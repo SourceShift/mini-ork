@@ -1,0 +1,20 @@
+task_class: blog_cohesion
+expected_artifact: composite   # 5 lens JSONs + applied_post.md + apply_log.md
+
+success_verifiers:
+  - verifiers/cohesion-completeness.sh
+
+failure_policy: request_changes
+rollback_policy: >
+  Keep the 5 lens JSON reports under runs/<id>/context-*.json for
+  inspection; discard applied_post.md if it failed verification. The
+  user can re-run with adjusted lens prompts or apply lens findings
+  manually.
+
+# Publisher path: the user applies applied_post.md back over the
+# original draft as a separate step (this recipe does NOT auto-commit
+# the post — too high a blast radius for a single-shot polish pass).
+source_artifact: applied_post.md
+outputs:
+  - applied_post.md
+  - apply_log.md
