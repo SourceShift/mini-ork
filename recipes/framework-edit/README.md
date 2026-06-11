@@ -1,34 +1,91 @@
 # framework-edit
 
-Proposes verifier-gated 2+ file edits to the mini-ork repo itself.
-Produces a unified diff plus `verdict.json` without applying the change.
+Routine recipe for verifier-gated edits to mini-ork itself.
+
+It proposes a unified diff and verdict for human review. It does not apply the
+diff, commit it, or run a meta-recipe selection panel.
 
 ## Topology
 
-```
-planner → [code_impact_lens, prior_art_lens] → codex_implementer
-                                                ↓
-                              [static_check_verifier, test_verifier]
-                                                ↓
-                                        opus_arbiter
-                                                ↓
-                                     verifier_smith
-                                                ↓
-                                     recipe_validator
-                                                ↓
-                              [publisher, rollback]
+```text
+planner -> [code_impact_lens, prior_art_lens] -> implementer
+                                                -> [static_check_verifier, test_verifier]
+                                                -> reviewer
+                                                -> publisher
+
+reviewer/static_check_verifier/test_verifier -> rollback on failure
 ```
 
-## Failure-Mode Coverage
+The recipe has exactly 9 nodes:
 
-| Failure mode | Verifier / mitigation |
-|---|---|
-| Drafter collapses to identical DAG | Recipe-validator enforces ≥3 distinct model families |
-| Verifier rubber-stamps (empty checks) | Verifier output contract: empty `checks[]` = hard failure |
-| Reviewer verdict parse regression | Arbiter node hard-fails if `verdict` missing or ∉ {approve,revise,reject} |
-| Artifact naming drift | Binding artifact manifest in planner; copied verbatim downstream |
-| Typecheck silently skipped | Static-check verifier records skip as explicit check entry |
-| Web smoke tests need network | Test verifier scrubs env and asserts hermetic execution |
-| High-blast-radius edit without approval | Static-check verifier blocks exact-match path list unless kickoff token present |
-| Schema-touching without migration file | Static-check verifier flags missing `0NNN_*.sql` pair |
-| Recipe-validator NameError on booleans | Self-test against known-good recipe (`recipes/code-fix/`) |
+1. `planner`
+2. `code_impact_lens`
+3. `prior_art_lens`
+4. `implementer`
+5. `static_check_verifier`
+6. `test_verifier`
+7. `reviewer`
+8. `publisher`
+9. `rollback`
+
+## Model Lanes
+
+The LLM-dispatching lanes intentionally span four model families:
+
+- `code_impact_lens`: `kimi_lens`
+- `prior_art_lens`: `codex_lens`
+- `implementer`: `glm_lens`
+- `reviewer`: `opus_lens`
+
+Verifier, publisher, rollback, and decomposer lanes are operational lanes and
+are not counted as research-family diversity.
+
+## Artifacts
+
+Required run-local artifacts:
+
+- `${MINI_ORK_RUN_DIR}/framework-edit.diff`
+- `${MINI_ORK_RUN_DIR}/verdict.json`
+
+`verdict.json` must use:
+
+```json
+{ "files_changed": 0, "tests_pass": false, "static_pass": false, "pass": false }
+```
+
+## Smoke Shape vs Real Publish
+
+For smoke-shape validation, `artifact_contract.yaml` defines
+`publish_modes.smoke_shape.outputs: []`. This prevents a structural recipe test
+from promoting or committing anything.
+
+For a real framework-edit run, `publish_modes.real_publish.outputs` lists the
+two run-local review artifacts. These are still not source-code destinations;
+the operator reviews the diff and applies it manually if desired.
+
+## Rollback Strategy
+
+`rollback_strategy: keep_run_artifacts_discard_worktree`.
+
+On verifier or reviewer failure, the recipe keeps diff, verdict, lens, and log
+artifacts under the run directory, then abandons the isolated worktree. This is
+aligned to the artifact contract: evidence is preserved, but no patch is
+applied to main.
+
+## Diverges From
+
+- `recipes/code-fix`: same routine patch pattern, but this recipe adds two
+  research lenses and framework-specific blast-radius policy.
+- `recipes/recursive-self-improve`: not the same DAG. This draft omits
+  recursive iteration, arXiv research, synthesis, learning persistence, and
+  autonomous patch promotion.
+- Current `recipes/framework-edit`: intentionally diverges. The existing
+  canonical recipe has an 11-node shape with `opus_arbiter`, `verifier_smith`,
+  `recipe_validator`, and a `codex_implementer`; this draft follows the v2
+  binding 9-node routine code-edit shape and uses `implementer` on `glm_lens`.
+
+## Verifiers
+
+This drafter candidate ships stub verifier scripts only. They are executable
+and define structured JSON output shape, but the downstream selected recipe
+should replace them with full checks before publication.

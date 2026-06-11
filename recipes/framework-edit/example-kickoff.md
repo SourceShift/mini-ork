@@ -1,19 +1,32 @@
-# Example Kickoff — Framework-Edit Recipe
+# Framework Edit: Cost Saved Badge
 
-**Task:** Add a "Cost-saved-vs-Opus" badge to the Trajectory UI page header.
+## Goal
 
-**Change description:**
-In `ui/src/routes/AgentDetailPage.tsx`, add a small badge component next to
-the page title that displays the estimated cost savings of the current run
-compared to an Opus-only baseline. The badge should read "Saved $X.XX vs Opus"
-and derive the value from `run.metadata.estimated_savings_usd`.
+Add a compact "Cost saved vs Opus" badge to the Trajectory UI page header.
 
-Also update `ui/src/components/AgentTranscript.tsx` to pass the
-`estimated_savings_usd` field through the transcript prop so the badge can
-access it.
+## Scope Hint
 
-**Glob hint:** `ui/src/{routes,components}/**`
+- `ui/src/routes/trajectory/**`
+- `ui/src/components/trajectory/**`
 
-**Expected outputs:**
-- `framework-edit.diff` (unified diff, 2 files)
-- `verdict.json`
+## Expected Edit
+
+Touch two files:
+1. The Trajectory page header component.
+2. The nearby cost or run-summary formatter used by that page.
+
+## Requirements
+
+- Reuse existing cost data already shown on the page.
+- Do not add a new backend endpoint.
+- Do not modify `.mini-ork/config/**`.
+- Keep the badge small enough not to wrap the header on desktop.
+
+## Done When
+
+- `${MINI_ORK_RUN_DIR}/framework-edit.diff` contains the proposed two-file UI
+  patch.
+- `${MINI_ORK_RUN_DIR}/verdict.json` contains:
+  `{ "files_changed": 2, "tests_pass": true, "static_pass": true, "pass": true }`
+- Static checks and `pytest tests/test_web_smoke.py` pass in the isolated
+  worktree.

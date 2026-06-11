@@ -1,11 +1,23 @@
 task_class: framework_edit
 expected_artifact: diff
+description: >
+  Produces a proposed unified diff and verdict for mini-ork self-edits.
+  The publisher emits run-local artifacts for operator review; it must not
+  apply the diff to main.
 
 source_artifact: "${MINI_ORK_RUN_DIR}/framework-edit.diff"
-outputs:
+
+required_artifacts:
   - "${MINI_ORK_RUN_DIR}/framework-edit.diff"
   - "${MINI_ORK_RUN_DIR}/verdict.json"
-  - "${MINI_ORK_RUN_DIR}/review-opus_arbiter.json"
+
+verdict_schema:
+  required_keys:
+    files_changed: integer
+    tests_pass: boolean
+    static_pass: boolean
+    pass: boolean
+  rule: "pass == (tests_pass && static_pass)"
 
 success_verifiers:
   - verifiers/static-check.sh
@@ -13,9 +25,34 @@ success_verifiers:
   - verifiers/framework-edit-shape.sh
 
 failure_policy: request_changes
-
 rollback_policy: >
-  Revert the proposed diff from the throwaway worktree and delete
-  ${MINI_ORK_RUN_DIR}/framework-edit.diff. Triggered when reviewer
-  verdict is reject/revise, any verifier fails, or the recipe_validator
-  reports a structural defect.
+  Preserve framework-edit.diff, verdict.json, verifier logs, and lens reports
+  in ${MINI_ORK_RUN_DIR}; remove or abandon the isolated worktree so no target
+  source changes leak into the checkout.
+
+publish_modes:
+  smoke_shape:
+    description: >
+      Structural recipe checks only. Use outputs: [] so the publisher takes
+      the no-commit path while verifiers still confirm recipe shape.
+    outputs: []
+  real_publish:
+    description: >
+      A live framework-edit run. Outputs are run-local review artifacts, not
+      canonical source files and not an auto-applied patch.
+    outputs:
+      - "${MINI_ORK_RUN_DIR}/framework-edit.diff"
+      - "${MINI_ORK_RUN_DIR}/verdict.json"
+
+outputs:
+  - "${MINI_ORK_RUN_DIR}/framework-edit.diff"
+  - "${MINI_ORK_RUN_DIR}/verdict.json"
+
+artifact_path_template: ".mini-ork/runs/{run_id}/framework-edit"
+max_size_bytes: 1048576
+retention_days: 30
+tags:
+  - framework
+  - self-edit
+  - diff
+  - verifier-gated
