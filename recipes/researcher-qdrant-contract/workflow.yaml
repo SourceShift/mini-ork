@@ -1,0 +1,100 @@
+version: "0.1.0"
+task_class: researcher_qdrant_contract
+description: >
+  PG/Qdrant contract remediation recipe for the researcher repo.
+  Four independent lenses (contract-architect, creation-flow-auditor,
+  retrieval-hydration, migration-backfill) ground a single implementer that
+  produces a patch plan. A deterministic verifier enforces the payload
+  contract, guards against new direct Qdrant writers, validates retrieval
+  allowlists, and checks reconciliation --dry-run gating. Reviewer gates
+  split-brain and data-loss risk before publisher commits artifacts.
+
+nodes:
+  - name: planner
+    type: planner
+    model_lane: planner
+    prompt_ref: prompts/planner.md
+    dispatch_mode: serial
+
+  - name: contract_architect
+    type: researcher
+    model_lane: opus_lens
+    prompt_ref: prompts/contract-architect.md
+    dispatch_mode: parallel
+    gates: [budget_gate]
+
+  - name: creation_flow_auditor
+    type: researcher
+    model_lane: kimi_lens
+    prompt_ref: prompts/creation-flow-auditor.md
+    dispatch_mode: parallel
+    gates: [budget_gate]
+
+  - name: retrieval_hydration_lens
+    type: researcher
+    model_lane: codex_lens
+    prompt_ref: prompts/retrieval-hydration-lens.md
+    dispatch_mode: parallel
+    gates: [budget_gate]
+
+  - name: migration_backfill_lens
+    type: researcher
+    model_lane: minimax_lens
+    prompt_ref: prompts/migration-backfill-lens.md
+    dispatch_mode: parallel
+    gates: [budget_gate]
+
+  - name: implementer
+    type: implementer
+    model_lane: implementer
+    prompt_ref: prompts/implementer.md
+    dispatch_mode: serial
+    gates: [scope_gate, budget_gate]
+
+  - name: deterministic_verifier
+    type: verifier
+    model_lane: verifier
+    prompt_ref: null
+    verifier_ref: verifiers/deterministic-checks.sh
+    dispatch_mode: serial
+
+  - name: reviewer
+    type: reviewer
+    model_lane: reviewer
+    prompt_ref: prompts/reviewer.md
+    dispatch_mode: serial
+    gates: [budget_gate]
+
+  - name: publisher
+    type: publisher
+    model_lane: publisher
+    prompt_ref: null
+    dispatch_mode: serial
+    gates: [scope_gate]
+
+  - name: rollback
+    type: rollback
+    model_lane: rollback
+    prompt_ref: null
+    dispatch_mode: serial
+
+edges:
+  - { from: planner,                to: contract_architect,      edge_type: depends_on }
+  - { from: planner,                to: creation_flow_auditor,   edge_type: depends_on }
+  - { from: planner,                to: retrieval_hydration_lens, edge_type: depends_on }
+  - { from: planner,                to: migration_backfill_lens, edge_type: depends_on }
+
+  - { from: contract_architect,     to: implementer,             edge_type: supplies_context_to }
+  - { from: creation_flow_auditor,  to: implementer,             edge_type: supplies_context_to }
+  - { from: retrieval_hydration_lens, to: implementer,           edge_type: supplies_context_to }
+  - { from: migration_backfill_lens,  to: implementer,           edge_type: supplies_context_to }
+
+  - { from: implementer,            to: deterministic_verifier,  edge_type: verifies }
+  - { from: deterministic_verifier, to: reviewer,                edge_type: depends_on }
+
+  - { from: reviewer,               to: publisher,               edge_type: depends_on }
+  - { from: reviewer,               to: rollback,                edge_type: escalates_to }
+  - { from: deterministic_verifier, to: rollback,                edge_type: escalates_to }
+
+rollback_strategy: keep_run_artifacts_discard_partial_outputs
+max_self_correction_iterations: 1
