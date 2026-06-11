@@ -1,0 +1,46 @@
+version: "0.1.0"
+task_class: blog_cohesion
+description: >
+  Polish an existing blog-post draft via 5 parallel cohesion lenses
+  routed to DISTINCT model families (thesis=GLM / bridge=Codex /
+  topic=Opus / entity=MiniMax / rhythm=Kimi), reconciled by an Opus
+  arbiter that emits applied_post.md + apply_log.md.
+
+# Each lens routes to a NAMED family lane (mirrors blog-post recipe's
+# v0.2-pt26 D-047 fix). Per Rajan 2025 + Nasser 2026, family diversity
+# is the precondition for multi-lens findings to be additive rather
+# than coalitional.
+nodes:
+  - { name: planner,      type: planner,    model_lane: planner,      prompt_ref: prompts/planner.md,    dispatch_mode: serial }
+  - { name: thesis,       type: researcher, model_lane: glm_lens,     prompt_ref: prompts/thesis.md,     dispatch_mode: parallel, gates: [budget_gate] }
+  - { name: bridge,       type: researcher, model_lane: codex_lens,   prompt_ref: prompts/bridge.md,     dispatch_mode: parallel, gates: [budget_gate] }
+  - { name: topic,        type: researcher, model_lane: opus_lens,    prompt_ref: prompts/topic.md,      dispatch_mode: parallel, gates: [budget_gate] }
+  - { name: entity,       type: researcher, model_lane: minimax_lens, prompt_ref: prompts/entity.md,     dispatch_mode: parallel, gates: [budget_gate] }
+  - { name: rhythm,       type: researcher, model_lane: kimi_lens,    prompt_ref: prompts/rhythm.md,     dispatch_mode: parallel, gates: [budget_gate] }
+  # Node name MUST contain "synth" — mini-ork's reviewer dispatch treats
+  # *synth* node ids as synthesizers (write source_artifact directly) vs
+  # classic reviewers (write review-<id>.json verdict envelope only). The
+  # arbiter role conceptually IS a synthesizer of 5 lens findings.
+  - { name: synth_arbiter, type: reviewer, model_lane: reviewer, prompt_ref: prompts/arbiter.md, dispatch_mode: serial, gates: [budget_gate] }
+  - { name: cohesion_completeness, type: verifier, verifier_ref: verifiers/cohesion-completeness.sh, dispatch_mode: serial }
+  - { name: publisher,    type: publisher,  prompt_ref: null, dispatch_mode: serial, gates: [scope_gate] }
+  - { name: rollback,     type: rollback,   prompt_ref: null, dispatch_mode: serial }
+
+edges:
+  - { from: planner, to: thesis, edge_type: depends_on }
+  - { from: planner, to: bridge, edge_type: depends_on }
+  - { from: planner, to: topic,  edge_type: depends_on }
+  - { from: planner, to: entity, edge_type: depends_on }
+  - { from: planner, to: rhythm, edge_type: depends_on }
+  - { from: thesis, to: synth_arbiter, edge_type: supplies_context_to }
+  - { from: bridge, to: synth_arbiter, edge_type: supplies_context_to }
+  - { from: topic,  to: synth_arbiter, edge_type: supplies_context_to }
+  - { from: entity, to: synth_arbiter, edge_type: supplies_context_to }
+  - { from: rhythm, to: synth_arbiter, edge_type: supplies_context_to }
+  - { from: synth_arbiter, to: cohesion_completeness, edge_type: verifies }
+  - { from: cohesion_completeness, to: publisher, edge_type: depends_on }
+  - { from: synth_arbiter, to: rollback, edge_type: escalates_to }
+  - { from: cohesion_completeness, to: rollback, edge_type: escalates_to }
+
+rollback_strategy: keep_lens_reports_discard_applied
+max_self_correction_iterations: 2
