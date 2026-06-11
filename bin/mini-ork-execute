@@ -879,11 +879,92 @@ _mo_finish_reason_for_failure() {
   local _rc="${1:-1}" _text="${2:-}"
   if [ "$_rc" -eq 124 ]; then
     printf 'timeout\n'
+  elif [ "$_rc" -eq 43 ] || printf '%s' "$_text" | grep -q 'lane_fuse_open'; then
+    printf 'error\n'
   elif printf '%s' "$_text" | grep -q 'cost_circuit_open'; then
     printf 'cost_limit\n'
   else
     printf 'error\n'
   fi
+}
+
+_mo_watchdog_check_stale_heartbeats() {
+  local run_id="${1:-}" timeout_s="${MO_HEARTBEAT_TIMEOUT_S:-300}"
+  [ -n "$run_id" ] || return 0
+  [ -n "${MINI_ORK_DB:-}" ] && [ -f "${MINI_ORK_DB:-}" ] || return 0
+
+  python3 - "$MINI_ORK_DB" "$run_id" "$timeout_s" <<'PY' 2>/dev/null || return 0
+import json
+import sqlite3
+import sys
+import time
+
+db, run_id, timeout_s = sys.argv[1:4]
+try:
+    timeout_ms = int(float(timeout_s) * 1000)
+except ValueError:
+    timeout_ms = 300000
+now_ms = int(time.time() * 1000)
+cutoff = now_ms - timeout_ms
+con = sqlite3.connect(db, timeout=2.0)
+con.execute("PRAGMA busy_timeout = 2000")
+try:
+    cols = {r[1] for r in con.execute("PRAGMA table_info(run_events)").fetchall()}
+    if "last_heartbeat_at" not in cols:
+        sys.exit(0)
+    rows = con.execute(
+        """
+        SELECT event_id, event_type, payload_json, last_heartbeat_at, created_at
+          FROM run_events
+         WHERE run_id = ?
+           AND event_type IN ('node_start', 'node_heartbeat', 'node_end')
+         ORDER BY created_at ASC
+        """,
+        (run_id,),
+    ).fetchall()
+finally:
+    con.close()
+latest = {}
+ended_at = {}
+for event_id, event_type, payload_raw, last_heartbeat_at, created_at in rows:
+    try:
+        payload = json.loads(payload_raw or "{}")
+    except json.JSONDecodeError:
+        payload = {}
+    node = payload.get("node_id") or event_id
+    if event_type in ("node_start", "node_heartbeat") and last_heartbeat_at is not None:
+        prev = latest.get(node)
+        if prev is None or int(last_heartbeat_at) > prev:
+            latest[node] = int(last_heartbeat_at)
+    elif event_type == "node_end":
+        ended_at[node] = max(int(created_at or 0) * 1000, ended_at.get(node, 0))
+for node, last_heartbeat_at in latest.items():
+    if last_heartbeat_at < cutoff and ended_at.get(node, 0) < last_heartbeat_at:
+        print(f"{node}\t{last_heartbeat_at}")
+        sys.exit(1)
+sys.exit(0)
+PY
+}
+
+_mo_start_node_heartbeat_loop() {
+  local run_id="${1:-}" node_id_arg="${2:-}" interval_s="${MO_HEARTBEAT_INTERVAL_S:-30}"
+  [ -n "$run_id" ] || return 0
+  [ -n "$node_id_arg" ] || return 0
+  declare -f mo_emit_node_heartbeat >/dev/null 2>&1 || return 0
+  (
+    while :; do
+      sleep "$interval_s" || exit 0
+      mo_emit_node_heartbeat "$node_id_arg" "$run_id" || true
+    done
+  ) &
+  printf '%s\n' "$!"
+}
+
+_mo_stop_node_heartbeat_loop() {
+  local pid="${1:-}"
+  [ -n "$pid" ] || return 0
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
 }
 
 _dispatch_node() {
@@ -952,6 +1033,20 @@ _dispatch_node() {
   # Clear per-node globals so the trap never reports a previous node's
   # verdict/artifact when this node's branch exits before setting them.
   VERDICT=""; CONTEXT_FILE=""; IMPL_LOG=""; REVIEW_FILE=""; MO_NODE_FINISH_REASON=""
+  local _heartbeat_pid=""
+  local _watchdog_hit=""
+
+  if [[ "$node_type" == "researcher" || "$node_type" == "implementer" || "$node_type" == "reviewer" ]]; then
+    _watchdog_hit="$(_mo_watchdog_check_stale_heartbeats "$_mo_run_id" 2>/dev/null || true)"
+    if [ -n "$_watchdog_hit" ]; then
+      MO_NODE_FINISH_REASON="timeout"
+      FAIL_COUNT=$((${FAIL_COUNT:-0} + 1))
+      echo "  [timeout] stale heartbeat detected before node_id=${node_id}: ${_watchdog_hit}" >&2
+      return 1
+    fi
+    export MO_NODE_TYPE="$node_type"
+    _heartbeat_pid="$(_mo_start_node_heartbeat_loop "$_mo_run_id" "$node_id" || true)"
+  fi
 
   # Locate recipe prompt for this node.
   # D-030: prefer per-node `prompt_ref` from workflow.yaml (e.g. recipe's
@@ -1040,18 +1135,20 @@ _dispatch_node() {
       local _dispatch_marker="$RUN_DIR/.dispatch-marker-${node_id}"
       touch "$_dispatch_marker"
       local _dispatch_rc=0
-      RESULT=$(llm_dispatch \
-        --task-class "$TASK_CLASS" \
-        --node-type "$dispatch_lane" \
-        --prompt-text "$PROMPT_CONTENT" 2>&1) || {
-          _dispatch_rc=$?
-          MO_NODE_FINISH_REASON=$(_mo_finish_reason_for_failure "$_dispatch_rc" "$RESULT")
-          rm -f "$_dispatch_marker"
-          echo "researcher dispatch failed" >&2
+	      RESULT=$(llm_dispatch \
+	        --task-class "$TASK_CLASS" \
+	        --node-type "$dispatch_lane" \
+	        --prompt-text "$PROMPT_CONTENT" 2>&1) || {
+	          _dispatch_rc=$?
+	          _mo_stop_node_heartbeat_loop "$_heartbeat_pid"
+	          MO_NODE_FINISH_REASON=$(_mo_finish_reason_for_failure "$_dispatch_rc" "$RESULT")
+	          rm -f "$_dispatch_marker"
+	          echo "researcher dispatch failed" >&2
           _trace_write_node_rich "$NODE_TRACE_ID" "failure" "researcher" "$CONTEXT_FILE" "" "$MO_NODE_FINISH_REASON"
-          return 1
-        }
-      # D-033v2: preserve agent's tool-call Writes. The old size heuristic
+	          return 1
+	        }
+	      _mo_stop_node_heartbeat_loop "$_heartbeat_pid"
+	      # D-033v2: preserve agent's tool-call Writes. The old size heuristic
       # ("existing file bigger than stdout wins") clobbered intentionally
       # small artifacts whenever the closing chat message was larger
       # (rubric caught lens-tiny.md replaced by chat residue 3 runs in a
@@ -1086,17 +1183,19 @@ _dispatch_node() {
       PROMPT_CONTENT="${_prepend}Implement: ${node_desc}${_learned_block}\n\nPlan:\n${PLAN_CONTENT}"
       export MO_NODE_ID="$node_id"
       local _dispatch_rc=0
-      RESULT=$(llm_dispatch \
-        --task-class "$TASK_CLASS" \
-        --node-type "$dispatch_lane" \
-        --prompt-text "$PROMPT_CONTENT" 2>&1) || {
-          _dispatch_rc=$?
-          MO_NODE_FINISH_REASON=$(_mo_finish_reason_for_failure "$_dispatch_rc" "$RESULT")
-          echo "implementer dispatch failed" >&2
+	      RESULT=$(llm_dispatch \
+	        --task-class "$TASK_CLASS" \
+	        --node-type "$dispatch_lane" \
+	        --prompt-text "$PROMPT_CONTENT" 2>&1) || {
+	          _dispatch_rc=$?
+	          _mo_stop_node_heartbeat_loop "$_heartbeat_pid"
+	          MO_NODE_FINISH_REASON=$(_mo_finish_reason_for_failure "$_dispatch_rc" "$RESULT")
+	          echo "implementer dispatch failed" >&2
           _trace_write_node_rich "$NODE_TRACE_ID" "failure" "implementer" "$IMPL_LOG" "" "$MO_NODE_FINISH_REASON"
-          return 1
-        }
-      echo "$RESULT" > "$IMPL_LOG"
+	          return 1
+	        }
+	      _mo_stop_node_heartbeat_loop "$_heartbeat_pid"
+	      echo "$RESULT" > "$IMPL_LOG"
       echo "  [ok] implementer output → $IMPL_LOG"
       # D-042 rich trace payload
       MO_NODE_FINISH_REASON="done"
@@ -1153,18 +1252,20 @@ PY
       local _dispatch_marker="$RUN_DIR/.dispatch-marker-${node_id}"
       touch "$_dispatch_marker"
       local _dispatch_rc=0
-      RESULT=$(llm_dispatch \
-        --task-class "$TASK_CLASS" \
-        --node-type "$dispatch_lane" \
-        --prompt-text "$PROMPT_CONTENT" 2>&1) || {
-          _dispatch_rc=$?
-          MO_NODE_FINISH_REASON=$(_mo_finish_reason_for_failure "$_dispatch_rc" "$RESULT")
-          rm -f "$_dispatch_marker"
-          echo "reviewer dispatch failed" >&2
+	      RESULT=$(llm_dispatch \
+	        --task-class "$TASK_CLASS" \
+	        --node-type "$dispatch_lane" \
+	        --prompt-text "$PROMPT_CONTENT" 2>&1) || {
+	          _dispatch_rc=$?
+	          _mo_stop_node_heartbeat_loop "$_heartbeat_pid"
+	          MO_NODE_FINISH_REASON=$(_mo_finish_reason_for_failure "$_dispatch_rc" "$RESULT")
+	          rm -f "$_dispatch_marker"
+	          echo "reviewer dispatch failed" >&2
           _trace_write_node_rich "$NODE_TRACE_ID" "failure" "reviewer" "$REVIEW_FILE" "" "$MO_NODE_FINISH_REASON"
-          return 1
-        }
-      # D-033v2: same mtime-marker preserve-agent-Write logic as researcher
+	          return 1
+	        }
+	      _mo_stop_node_heartbeat_loop "$_heartbeat_pid"
+	      # D-033v2: same mtime-marker preserve-agent-Write logic as researcher
       # (size heuristic clobbered small artifacts — see researcher branch).
       if [ -f "$REVIEW_FILE" ] && [ "$REVIEW_FILE" -nt "$_dispatch_marker" ]; then
         echo "  [ok] preserving agent Write at $REVIEW_FILE (STDOUT ${#RESULT} bytes → ${REVIEW_FILE}.stdout.md)"
