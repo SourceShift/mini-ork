@@ -47,7 +47,7 @@ else
 fi
 
 HELP_OUT=$(mini-ork help 2>&1 || true)
-for kw in "classify" "plan" "execute" "verify" "reflect" "improve" "eval" "promote" "run" "init" "doctor" "version"; do
+for kw in "classify" "plan" "execute" "verify" "reflect" "improve" "eval" "promote" "run" "init" "update" "doctor" "version"; do
   if echo "$HELP_OUT" | grep -qi "$kw"; then
     _ok "help mentions subcommand: $kw"
   else

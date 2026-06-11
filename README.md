@@ -187,6 +187,9 @@ bash install.sh
 cd ~/my-project
 mini-ork init
 
+# Later, refresh schema and inspect local config drift after framework updates
+mini-ork update
+
 # 3. Write a kickoff (or copy an example)
 cp <path-to-mini-ork-checkout>/examples/01-hello-world/kickoff.md ./kickoff.md
 
