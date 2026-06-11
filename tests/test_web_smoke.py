@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import sqlite3
 import subprocess
+import json
 from pathlib import Path
 
 import pytest
@@ -587,6 +588,130 @@ def test_finish_reason_column_exists(tmp_path: Path) -> None:
             """
         )
     con.close()
+
+
+def test_dispatch_config_snapshot_columns_exist(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.db"
+    con = sqlite3.connect(db_path)
+    con.executescript(
+        """
+        CREATE TABLE schema_migrations(filename TEXT PRIMARY KEY, applied_at TEXT, checksum TEXT);
+        CREATE TABLE task_runs (
+          id TEXT PRIMARY KEY,
+          updated_at INTEGER NOT NULL
+        );
+        """
+    )
+    con.executescript((ROOT / "db/migrations/0022_dispatch_config_snapshot.sql").read_text())
+
+    cols = {r[1] for r in con.execute("PRAGMA table_info(task_runs)").fetchall()}
+    assert {"dispatch_config_json", "agents_yaml_sha"} <= cols
+    indexes = {r[1] for r in con.execute("PRAGMA index_list(task_runs)").fetchall()}
+    assert "idx_task_runs_agents_yaml_sha" in indexes
+    con.close()
+
+
+def test_agents_endpoint_legacy_null_snapshot_uses_fallback(tmp_path: Path, monkeypatch) -> None:
+    from mini_ork.web.db import StateDB
+    from mini_ork.web.routes.run_detail import list_agents
+
+    home = tmp_path / ".mini-ork"
+    home.mkdir()
+    db_path = home / "state.db"
+    con = sqlite3.connect(db_path)
+    con.execute(
+        """
+        CREATE TABLE task_runs (
+          id TEXT PRIMARY KEY,
+          recipe TEXT,
+          trace_id TEXT,
+          created_at INTEGER,
+          ended_at INTEGER,
+          status TEXT,
+          cost_usd REAL,
+          dispatch_config_json TEXT,
+          agents_yaml_sha TEXT
+        )
+        """
+    )
+    con.execute(
+        """
+        INSERT INTO task_runs (
+          id, recipe, created_at, ended_at, status, cost_usd,
+          dispatch_config_json, agents_yaml_sha
+        ) VALUES ('run-legacy', 'framework-edit', 1, 2, 'published', 0, NULL, NULL)
+        """
+    )
+    con.commit()
+    con.close()
+
+    monkeypatch.setenv("MINI_ORK_ROOT", str(ROOT))
+    out = list_agents(task_run_id="run-legacy", db=StateDB(db_path), home=home)
+    code_lens = next(a for a in out["agents"] if a["node_id"] == "code_impact_lens")
+    assert code_lens["model_lane"] == "kimi_lens"
+    assert code_lens["family"] == "kimi"
+    assert code_lens["model_id"] is None
+
+
+def test_agents_endpoint_prefers_dispatch_config_snapshot(tmp_path: Path, monkeypatch) -> None:
+    from mini_ork.web.db import StateDB
+    from mini_ork.web.routes.run_detail import agent_detail, list_agents
+
+    home = tmp_path / ".mini-ork"
+    home.mkdir()
+    db_path = home / "state.db"
+    snapshot = {
+        "kimi_lens": {
+            "family": "historical-family",
+            "model_id": "historical-model",
+            "provider": "historical-provider",
+            "base_url": "https://historical.example/v1",
+        }
+    }
+    con = sqlite3.connect(db_path)
+    con.execute(
+        """
+        CREATE TABLE task_runs (
+          id TEXT PRIMARY KEY,
+          recipe TEXT,
+          trace_id TEXT,
+          created_at INTEGER,
+          ended_at INTEGER,
+          status TEXT,
+          cost_usd REAL,
+          dispatch_config_json TEXT,
+          agents_yaml_sha TEXT
+        )
+        """
+    )
+    con.execute(
+        """
+        INSERT INTO task_runs (
+          id, recipe, created_at, ended_at, status, cost_usd,
+          dispatch_config_json, agents_yaml_sha
+        ) VALUES ('run-snapshot', 'framework-edit', 1, 2, 'published', 0, ?, 'sha')
+        """,
+        (json.dumps(snapshot),),
+    )
+    con.commit()
+    con.close()
+
+    monkeypatch.setenv("MINI_ORK_ROOT", str(ROOT))
+    out = list_agents(task_run_id="run-snapshot", db=StateDB(db_path), home=home)
+    code_lens = next(a for a in out["agents"] if a["node_id"] == "code_impact_lens")
+    assert code_lens["family"] == "historical-family"
+    assert code_lens["model_id"] == "historical-model"
+    assert code_lens["provider"] == "historical-provider"
+    assert code_lens["base_url"] == "https://historical.example/v1"
+
+    detail = agent_detail(
+        task_run_id="run-snapshot",
+        node_id="code_impact_lens",
+        db=StateDB(db_path),
+        home=home,
+    )
+    assert detail["node"]["family"] == "historical-family"
+    assert detail["node"]["model_id"] == "historical-model"
 
 
 def test_llm_dispatch_classifies_invalid_api_key_as_auth() -> None:
