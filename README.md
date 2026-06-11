@@ -160,6 +160,25 @@ And the panel quality is *instrumented*, not assumed: a pre-synthesis coalition 
 
 ## Quickstart
 
+### Prerequisites — provider CLIs
+
+mini-ork dispatches agents through vendor CLIs, not raw API keys. Install and
+authenticate the CLIs for the model families your lanes use:
+
+| CLI | Model families it unlocks | Install | Authenticate |
+|---|---|---|---|
+| [`claude`](https://docs.anthropic.com/en/docs/claude-code) | Anthropic (sonnet/opus lanes) **and** Anthropic-compatible gateways (GLM, Kimi, DeepSeek, MiniMax via `lib/providers/cl_*.sh` env pinning) | `curl -fsSL https://claude.ai/install.sh \| bash` or `npm i -g @anthropic-ai/claude-code` | `claude` (interactive login) |
+| [`codex`](https://github.com/openai/codex) | OpenAI (codex lane, `codex_lens` reviews, BYO OpenAI-compatible endpoints) | `npm i -g @openai/codex` | `codex login` |
+
+`claude` is required for any real run with the default lane config (planner /
+worker / verifier / reviewer all route through it). `codex` is only needed when
+a recipe assigns the `codex` lane or `codex_lens` — without it those nodes fail
+at dispatch. Dry-run mode (`MINI_ORK_DRY_RUN=1`) needs neither.
+
+> Keep the CLIs current (`claude update`, `npm i -g @openai/codex@latest`) —
+> the dispatcher uses newer CLI flags (e.g. prompt-cache control), and old
+> binaries shadowed earlier in `$PATH` are a classic source of dispatch failures.
+
 ```bash
 # 1. Install (creates symlink in $HOME/.local/bin or /usr/local/bin)
 bash install.sh
@@ -195,8 +214,8 @@ trajectory metrics, and the **detection-fingerprint** panel that audits
 which model families ran which lens per recipe.
 
 ```bash
-# 1. Install backend deps (one-time)
-pip install fastapi uvicorn pyyaml
+# 1. Install backend + UI deps (one-time)
+make web-deps
 
 # 2. Boot the local UI (binds 127.0.0.1:7090, read-only)
 mini-ork serve
@@ -204,8 +223,8 @@ mini-ork serve
 # 3. Browse to http://127.0.0.1:7090
 ```
 
-The SPA bundle ships under `mini_ork/web/static/` after `pnpm --dir ui build`.
-For dev with hot reload, run `pnpm --dir ui dev` (Vite on :5173 proxies to :7090).
+The SPA bundle ships under `mini_ork/web/static/` after `make web-build`.
+For dev with hot reload, run `make web-up` (FastAPI on :7090 + Vite on :7070), then open `http://localhost:7070`.
 Routes: `/` fleet, `/runs/:id` forensics, `/trajectory` convergence, `/fingerprint` coalition audit.
 
 ---
@@ -356,7 +375,7 @@ The full release log lives in [`ROADMAP.md`](ROADMAP.md) — every section dated
 - 44 framework primitives in `lib/` (incl. oracle-hardening libs + `gate_bootstrap.sh` for the v0.3-rc1 central wire-up + `lib/throttle-guard.sh` for provider-throttle classification + `lib/mo_otel.sh` for env-gated OTel span emission, added 2026-06-09/10)
 - 1 runner-shared helper in `bin/lib/` (`profile-seed.sh` — deterministic `run_profile.json` seeding from structured kickoff markdown, added 2026-06-09)
 - 16 user-facing `bin/mini-ork*` entrypoints
-- 19 schema migrations under `db/migrations/` (memory namespaces, benchmarks, evolution, safety, panel topology telemetry, recursive orchestration, self-improvement learning, llm_calls session indexing, trace status widening)
+- 20 schema migrations under `db/migrations/` (memory namespaces, benchmarks, evolution, safety, panel topology telemetry, recursive orchestration, self-improvement learning, llm_calls session indexing, trace status widening, Arbor-style idea_tree primitive)
 - 14 recipes shipped — see Recipes table above
 - 7 model-family providers under `lib/providers/` + BYO-key registry (`config/providers.yaml` via `lib/providers/registry.sh`) for custom Anthropic/OpenAI-compatible endpoints
 
