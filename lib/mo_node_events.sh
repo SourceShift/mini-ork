@@ -19,7 +19,7 @@
 #   run_id      e.g. "self-improve-iter-32-20260609110333" (matches task_runs.id)
 #   node_id     workflow node name (e.g. "opus_synthesizer")
 #   node_type   "researcher" | "reviewer" | "implementer" | "verifier" | ...
-#   event_type  "node_start" | "node_end"
+#   event_type  "node_start" | "node_end" | "node_heartbeat"
 #   extra_json  optional JSON object merged into payload (e.g. model_lane, duration_ms)
 #
 # Failure mode: best-effort. Any DB error is logged to stderr but does
@@ -81,29 +81,21 @@ con = sqlite3.connect(db, timeout=2.0)
 con.execute("PRAGMA busy_timeout = 2000")
 try:
     cols = {r[1] for r in con.execute("PRAGMA table_info(run_events)").fetchall()}
+    now_s = int(time.time())
+    heartbeat_ms = int(time.time() * 1000)
+    insert_cols = ["event_id", "run_id", "event_type", "payload_json", "created_at"]
+    values = [event_id, run_id, event_type, json.dumps(payload), now_s]
     if "finish_reason" in cols:
-        con.execute(
-            """
-            INSERT INTO run_events(event_id, run_id, event_type, payload_json, finish_reason, created_at)
-            VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (
-                event_id,
-                run_id,
-                event_type,
-                json.dumps(payload),
-                payload.get("finish_reason"),
-                int(time.time()),
-            ),
-        )
-    else:
-        con.execute(
-            """
-            INSERT INTO run_events(event_id, run_id, event_type, payload_json, created_at)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            (event_id, run_id, event_type, json.dumps(payload), int(time.time())),
-        )
+        insert_cols.append("finish_reason")
+        values.append(payload.get("finish_reason"))
+    if "last_heartbeat_at" in cols and event_type in ("node_start", "node_heartbeat"):
+        insert_cols.append("last_heartbeat_at")
+        values.append(heartbeat_ms)
+    placeholders = ",".join("?" for _ in insert_cols)
+    con.execute(
+        f"INSERT INTO run_events({', '.join(insert_cols)}) VALUES ({placeholders})",
+        values,
+    )
     con.commit()
 finally:
     con.close()
@@ -119,6 +111,14 @@ mo_node_start() {
     extra="{\"model_lane\":\"$model_lane\"}"
   fi
   mo_node_emit "$run_id" "$node_id" "$node_type" "node_start" "$extra"
+}
+
+# Convenience: emit node_heartbeat for the currently running node.
+# Usage: mo_emit_node_heartbeat <node_id> <run_id>
+mo_emit_node_heartbeat() {
+  local node_id="${1:?}" run_id="${2:?}"
+  local node_type="${MO_NODE_TYPE:-heartbeat}"
+  mo_node_emit "$run_id" "$node_id" "$node_type" "node_heartbeat" "{}"
 }
 
 # RETURN-trap callback. Reads variables from the caller's scope so it can
