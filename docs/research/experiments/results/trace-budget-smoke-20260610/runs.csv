@@ -1,0 +1,5 @@
+policy,task_id,replicate,run_id,recipe,task_class,status,success,verifier_pass,verifier_passes,verifier_total,verifier_reasons,task_cost_usd,llm_cost_usd,duration_s,llm_call_count,failed_llm_call_count,input_tokens,output_tokens,expensive_call_count,distinct_provider_count,providers,retry_event_count,plan_fallback,zero_stdout_artifact_count
+frontier_only,obs-smoke-001,1,trace-budget-smoke-20260610-frontier_only-obs-smoke-001-r1,obs-smoke,obs_smoke,published,1,1,1,1,,0.51963,0.94458,87.0,4,0,18,3169,4,1,anthropic,0,0,0
+cheap_only,obs-smoke-001,1,trace-budget-smoke-20260610-cheap_only-obs-smoke-001-r1,obs-smoke,obs_smoke,published,1,1,1,1,,0.473604,0.715907,129.0,3,0,66027,5217,1,2,"anthropic,gateway",0,1,0
+static_hybrid,obs-smoke-001,1,trace-budget-smoke-20260610-static_hybrid-obs-smoke-001-r1,obs-smoke,obs_smoke,published,1,1,1,1,,0.606211,0.849226,120.0,3,0,58692,4226,2,2,"anthropic,gateway",0,0,0
+trace_governed,obs-smoke-001,1,trace-budget-smoke-20260610-trace_governed-obs-smoke-001-r1,obs-smoke,obs_smoke,published,1,1,1,1,,0.389639,0.624498,110.0,3,0,9923,4366,2,2,"anthropic,gateway",0,0,0

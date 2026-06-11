@@ -1,0 +1,2 @@
+policy,runs,successful_runs,success_rate,verifier_pass_rate,total_cost_usd,cost_per_success_usd,median_duration_s,llm_call_count,failed_llm_call_count,input_tokens,output_tokens,expensive_call_count,retry_event_count,distinct_provider_count_max
+historical_obs_smoke,24,4,0.1667,0.4583,7.658439,1.91461,106.0,156,0,335,68870,156,0,1

@@ -1,0 +1,5 @@
+policy,runs,successful_runs,success_rate,verifier_pass_rate,reviewer_accept_rate,total_cost_usd,cost_per_success_usd,median_duration_s,llm_call_count,failed_llm_call_count,input_tokens,output_tokens,expensive_call_count,retry_event_count,reviewer_verdict_count,reviewer_accept_count,plan_fallback_count,zero_stdout_artifact_count,distinct_provider_count_max,success_rate_ci95,verifier_pass_rate_ci95
+cheap_only,12,12,1.0,1.0,1.0,5.229859,0.435822,132.0,33,0,267172,65025,12,0,9,9,3,0,2,"[0.7575, 1.0]","[0.7575, 1.0]"
+frontier_only,12,12,1.0,1.0,0.8889,6.437018,0.536418,87.0,67,0,223,31880,67,0,9,8,4,0,1,"[0.7575, 1.0]","[0.7575, 1.0]"
+static_hybrid,12,12,1.0,1.0,0.8889,4.999689,0.416641,93.0,43,0,159214,39329,31,0,9,8,3,0,2,"[0.7575, 1.0]","[0.7575, 1.0]"
+trace_governed,12,12,1.0,1.0,0.8889,4.723043,0.393587,99.0,39,0,112420,42533,27,0,9,8,2,0,2,"[0.7575, 1.0]","[0.7575, 1.0]"

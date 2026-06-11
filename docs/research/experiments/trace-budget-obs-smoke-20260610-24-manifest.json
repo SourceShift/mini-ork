@@ -1,0 +1,157 @@
+{
+  "experiment_id": "trace-budget-obs-smoke-20260610-24",
+  "description": "Controlled replicated obs-smoke routing-policy batch. Safe smoke benchmark: writes only under .mini-ork/runs.",
+  "expensive_model_patterns": [
+    "opus",
+    "sonnet",
+    "fable",
+    "mythos",
+    "claude"
+  ],
+  "runs": [
+    {
+      "policy": "frontier_only",
+      "task_id": "obs-smoke-001",
+      "replicate": 1,
+      "run_id": "trace-budget-obs-smoke-20260610-24-frontier_only-obs-smoke-001-r1"
+    },
+    {
+      "policy": "cheap_only",
+      "task_id": "obs-smoke-001",
+      "replicate": 1,
+      "run_id": "trace-budget-obs-smoke-20260610-24-cheap_only-obs-smoke-001-r1"
+    },
+    {
+      "policy": "static_hybrid",
+      "task_id": "obs-smoke-001",
+      "replicate": 1,
+      "run_id": "trace-budget-obs-smoke-20260610-24-static_hybrid-obs-smoke-001-r1"
+    },
+    {
+      "policy": "trace_governed",
+      "task_id": "obs-smoke-001",
+      "replicate": 1,
+      "run_id": "trace-budget-obs-smoke-20260610-24-trace_governed-obs-smoke-001-r1"
+    },
+    {
+      "policy": "frontier_only",
+      "task_id": "obs-smoke-001",
+      "replicate": 2,
+      "run_id": "trace-budget-obs-smoke-20260610-24-frontier_only-obs-smoke-001-r2"
+    },
+    {
+      "policy": "cheap_only",
+      "task_id": "obs-smoke-001",
+      "replicate": 2,
+      "run_id": "trace-budget-obs-smoke-20260610-24-cheap_only-obs-smoke-001-r2"
+    },
+    {
+      "policy": "static_hybrid",
+      "task_id": "obs-smoke-001",
+      "replicate": 2,
+      "run_id": "trace-budget-obs-smoke-20260610-24-static_hybrid-obs-smoke-001-r2"
+    },
+    {
+      "policy": "trace_governed",
+      "task_id": "obs-smoke-001",
+      "replicate": 2,
+      "run_id": "trace-budget-obs-smoke-20260610-24-trace_governed-obs-smoke-001-r2"
+    },
+    {
+      "policy": "frontier_only",
+      "task_id": "obs-smoke-002",
+      "replicate": 1,
+      "run_id": "trace-budget-obs-smoke-20260610-24-frontier_only-obs-smoke-002-r1"
+    },
+    {
+      "policy": "cheap_only",
+      "task_id": "obs-smoke-002",
+      "replicate": 1,
+      "run_id": "trace-budget-obs-smoke-20260610-24-cheap_only-obs-smoke-002-r1"
+    },
+    {
+      "policy": "static_hybrid",
+      "task_id": "obs-smoke-002",
+      "replicate": 1,
+      "run_id": "trace-budget-obs-smoke-20260610-24-static_hybrid-obs-smoke-002-r1"
+    },
+    {
+      "policy": "trace_governed",
+      "task_id": "obs-smoke-002",
+      "replicate": 1,
+      "run_id": "trace-budget-obs-smoke-20260610-24-trace_governed-obs-smoke-002-r1"
+    },
+    {
+      "policy": "frontier_only",
+      "task_id": "obs-smoke-002",
+      "replicate": 2,
+      "run_id": "trace-budget-obs-smoke-20260610-24-frontier_only-obs-smoke-002-r2"
+    },
+    {
+      "policy": "cheap_only",
+      "task_id": "obs-smoke-002",
+      "replicate": 2,
+      "run_id": "trace-budget-obs-smoke-20260610-24-cheap_only-obs-smoke-002-r2"
+    },
+    {
+      "policy": "static_hybrid",
+      "task_id": "obs-smoke-002",
+      "replicate": 2,
+      "run_id": "trace-budget-obs-smoke-20260610-24-static_hybrid-obs-smoke-002-r2"
+    },
+    {
+      "policy": "trace_governed",
+      "task_id": "obs-smoke-002",
+      "replicate": 2,
+      "run_id": "trace-budget-obs-smoke-20260610-24-trace_governed-obs-smoke-002-r2"
+    },
+    {
+      "policy": "frontier_only",
+      "task_id": "obs-smoke-003",
+      "replicate": 1,
+      "run_id": "trace-budget-obs-smoke-20260610-24-frontier_only-obs-smoke-003-r1"
+    },
+    {
+      "policy": "cheap_only",
+      "task_id": "obs-smoke-003",
+      "replicate": 1,
+      "run_id": "trace-budget-obs-smoke-20260610-24-cheap_only-obs-smoke-003-r1"
+    },
+    {
+      "policy": "static_hybrid",
+      "task_id": "obs-smoke-003",
+      "replicate": 1,
+      "run_id": "trace-budget-obs-smoke-20260610-24-static_hybrid-obs-smoke-003-r1"
+    },
+    {
+      "policy": "trace_governed",
+      "task_id": "obs-smoke-003",
+      "replicate": 1,
+      "run_id": "trace-budget-obs-smoke-20260610-24-trace_governed-obs-smoke-003-r1"
+    },
+    {
+      "policy": "frontier_only",
+      "task_id": "obs-smoke-003",
+      "replicate": 2,
+      "run_id": "trace-budget-obs-smoke-20260610-24-frontier_only-obs-smoke-003-r2"
+    },
+    {
+      "policy": "cheap_only",
+      "task_id": "obs-smoke-003",
+      "replicate": 2,
+      "run_id": "trace-budget-obs-smoke-20260610-24-cheap_only-obs-smoke-003-r2"
+    },
+    {
+      "policy": "static_hybrid",
+      "task_id": "obs-smoke-003",
+      "replicate": 2,
+      "run_id": "trace-budget-obs-smoke-20260610-24-static_hybrid-obs-smoke-003-r2"
+    },
+    {
+      "policy": "trace_governed",
+      "task_id": "obs-smoke-003",
+      "replicate": 2,
+      "run_id": "trace-budget-obs-smoke-20260610-24-trace_governed-obs-smoke-003-r2"
+    }
+  ]
+}
