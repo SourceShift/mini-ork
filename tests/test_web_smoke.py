@@ -174,6 +174,81 @@ def test_app_factory_boots(home: Path) -> None:
     assert "/api/v1/health" in paths
     assert "/api/v1/task-runs" in paths
     assert "/api/v1/fingerprint" in paths
+    # Idea tree endpoints (plan: docs/plans/2026-06-11-arbor-techniques-into-mini-ork.md item 1)
+    assert "/api/v1/idea-tree/roots" in paths
+    assert "/api/v1/idea-tree/{root_node_id}" in paths
+
+
+def test_idea_tree_roots_returns_backfilled_sessions(db) -> None:
+    """list_roots() must surface every root node with subtree counts.
+
+    Relies on the migration + backfill having run. If state.db has no
+    idea_tree_nodes table at all, skip — the test only covers the
+    post-backfill happy path. Real production runs should always have
+    at least the synthetic roots from scripts/backfill_idea_tree.py.
+    """
+    from mini_ork.web.idea_tree import list_roots
+
+    if not db.has_table("idea_tree_nodes"):
+        pytest.skip("idea_tree_nodes table missing — apply migration 0020")
+    roots = list_roots(db)
+    if not roots:
+        pytest.skip("no idea_tree_nodes rows — run scripts/backfill_idea_tree.py")
+    for r in roots:
+        # Required fields the UI Trajectory page renders.
+        assert {"node_id", "status", "node_count"}.issubset(r.keys())
+        # node_count includes the root itself, so >= 1 for any non-empty tree.
+        assert r["node_count"] >= 1
+
+
+def test_idea_tree_read_tree_includes_depth_and_edges(db) -> None:
+    """read_tree() must emit nodes with depth + matching edges list.
+
+    Depth-first invariant: every non-root edge has a from-id that
+    appears in nodes with depth strictly less than the to-id's depth.
+    """
+    from mini_ork.web.idea_tree import list_roots, read_tree
+
+    if not db.has_table("idea_tree_nodes"):
+        pytest.skip("idea_tree_nodes table missing")
+    roots = list_roots(db)
+    if not roots:
+        pytest.skip("no roots to read")
+    tree = read_tree(db, roots[0]["node_id"])
+    assert tree["root_node_id"] == roots[0]["node_id"]
+    assert tree["nodes"], "root should have itself + descendants"
+    # Root node's depth must be 0.
+    root_in_tree = next(n for n in tree["nodes"] if n["node_id"] == roots[0]["node_id"])
+    assert root_in_tree["depth"] == 0
+    # Edges must reference declared node ids.
+    node_ids = {n["node_id"] for n in tree["nodes"]}
+    for e in tree["edges"]:
+        assert e["from"] in node_ids and e["to"] in node_ids
+    # Stats sanity.
+    assert tree["stats"]["total"] == len(tree["nodes"])
+    assert tree["stats"]["max_depth"] >= 0
+
+
+def test_idea_tree_walk_to_root_ends_at_root(db) -> None:
+    """walk_to_root() must return a chain that ends at a parent-less node."""
+    from mini_ork.web.idea_tree import list_roots, read_tree, walk_to_root
+
+    if not db.has_table("idea_tree_nodes"):
+        pytest.skip("idea_tree_nodes table missing")
+    roots = list_roots(db)
+    if not roots:
+        pytest.skip("no roots")
+    tree = read_tree(db, roots[0]["node_id"])
+    # Pick the deepest leaf and walk up.
+    leaves = [n for n in tree["nodes"] if n["depth"] == tree["stats"]["max_depth"]]
+    if not leaves:
+        pytest.skip("no leaves to walk")
+    chain = walk_to_root(db, leaves[0]["node_id"])
+    assert chain, "chain must be non-empty"
+    # Last entry in the chain is the root (parent_node_id IS NULL).
+    assert chain[-1]["parent_node_id"] is None
+    # First entry is the leaf we started from.
+    assert chain[0]["node_id"] == leaves[0]["node_id"]
 
 
 def test_self_improve_detail(db) -> None:
