@@ -311,7 +311,7 @@ The framework ships the universal loop and its primitives. Nothing in `lib/` or 
 
 ### RECIPES — opinions live here
 
-Recipes are user-land workflow definitions. They compose framework primitives into pipeline shapes. 14 recipes ship today; 8 of them dispatch a 4–5 lens panel across distinct model families per cycle, using family diversity as a practical proxy for the low-correlation detector patterns highlighted by Rajan 2025.
+Recipes are user-land workflow definitions. They compose framework primitives into pipeline shapes. 15 recipes ship today; 8 of them dispatch a 4–5 lens panel across distinct model families per cycle, using family diversity as a practical proxy for the low-correlation detector patterns highlighted by Rajan 2025.
 
 | Recipe | Location | Shape |
 |---|---|---|
@@ -329,6 +329,7 @@ Recipes are user-land workflow definitions. They compose framework primitives in
 | `obs-smoke` | `recipes/obs-smoke/` | Cheap 2-node observability smoke (researcher + reviewer + deterministic verifier + publisher) that touches every emit surface: `llm_calls`, `run_events`, `task_runs` transitions. Driven by `tests/test_obs_surface.sh`. |
 | `recipe-creator` | `recipes/recipe-creator/` | Meta-recipe: takes a natural-language epic and produces a complete `recipes/<derived>/` directory via a 3-family drafter panel (glm/kimi/codex) + opus arbiter + verifier-smith + HARD heterogeneity-floor validator. The framework dogfooding itself on small-N recipe authoring. |
 | `silent-catch-audit` | `recipes/silent-catch-audit/` | **First recipe authored by `recipe-creator`** (run 1781087711, 2026-06-10). 3-lens audit of TS/JS codebases for silent `.catch(() => {})` anti-patterns — structural (codex) + semantic (glm) + adversarial (kimi) lenses → tiered findings reviewer with critical/high/allowed verdict. |
+| `framework-edit` | `recipes/framework-edit/` | **Recipe-creator-authored, 2026-06-11.** Routine mini-ork self-modification: planner → code-impact + prior-art lenses → glm implementer → static-check + test verifiers → opus reviewer → publisher / rollback. 4 distinct LLM families. Emits a unified diff for operator review; does NOT auto-apply. Mandatory dispatch path for every 2+ file change in this repo. |
 
 Add your own under `recipes/<name>/` — see [docs/EXTENSION.md](docs/EXTENSION.md).
 
@@ -376,7 +377,7 @@ The full release log lives in [`ROADMAP.md`](ROADMAP.md) — every section dated
 - 1 runner-shared helper in `bin/lib/` (`profile-seed.sh` — deterministic `run_profile.json` seeding from structured kickoff markdown, added 2026-06-09)
 - 16 user-facing `bin/mini-ork*` entrypoints
 - 20 schema migrations under `db/migrations/` (memory namespaces, benchmarks, evolution, safety, panel topology telemetry, recursive orchestration, self-improvement learning, llm_calls session indexing, trace status widening, Arbor-style idea_tree primitive)
-- 14 recipes shipped — see Recipes table above
+- 15 recipes shipped — see Recipes table above
 - 7 model-family providers under `lib/providers/` + BYO-key registry (`config/providers.yaml` via `lib/providers/registry.sh`) for custom Anthropic/OpenAI-compatible endpoints
 
 Next-up work tracks (see [`ROADMAP.md`](ROADMAP.md) for detail):
