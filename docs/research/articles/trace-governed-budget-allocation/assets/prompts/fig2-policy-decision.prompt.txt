@@ -1,0 +1,25 @@
+Generate the image with a 16:9 aspect ratio. The canvas must be 16:9.
+
+            A clean academic technical diagram on a pure white background (#ffffff).
+No cream paper, no beige tint, no paper grain, no texture, no shadows, no
+photorealism. Use crisp black and charcoal strokes, geometric shapes, arrows,
+and minimal English labels. Use restrained desaturated accents: sage, soft blue,
+muted violet, and one red emphasis. Do not add a figure number, title, caption,
+watermark, author name, logo, or explanatory paragraph inside the image. The
+LaTeX paper will provide the caption separately. Keep every label short,
+spelled correctly, and horizontally readable.
+
+
+            SUBJECT:
+            Create a compact routing decision diagram with exactly these labels:
+"next node", "trace context", "escalation score", "failure / retry / risk?",
+"frontier lane", "cheap worker lane", "budget check", "stop / rollback /
+human gate", "proceed".
+
+Flow: next node + trace context -> escalation score -> decision diamond. The
+"yes" branch goes to frontier lane. The "no" branch goes to cheap worker lane.
+Both lanes go to budget check. Budget exceeded goes to stop / rollback / human
+gate. Budget ok goes to proceed.
+
+Do not include any title, figure number, caption, duplicate words, or long
+sentences inside the image.
