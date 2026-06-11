@@ -3,6 +3,11 @@
 You are the planner for a feature-inventory audit. Read the kickoff
 and produce a 5-7 step plan covering:
 
+Kickoff content:
+```text
+{{KICKOFF_CONTENT}}
+```
+
 1. What directories each lens covers (already specified in kickoff)
 2. What the panel definition of a "feature" is for this audit
 3. Synthesis rules — how the synthesizer should deduplicate overlapping

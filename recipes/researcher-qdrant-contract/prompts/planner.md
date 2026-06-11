@@ -23,7 +23,7 @@ Produce a concise JSON plan with this strict schema:
   "verifier_commands": ["string[] — expected deterministic verifier invocations"],
   "artifact_manifest": {
     "qdrant-contract-remediation-plan.md": "phased implementation plan, owned file/module list, risk table, rollback/backfill strategy",
-    "qdrant-contract-findings.json": "machine-readable list of contract gaps by flow",
+    "qdrant-contract-findings.json": "machine-readable JSON object envelope: { \"findings\": [{ \"id\": string, \"flow\": string, \"severity\": \"critical|high|medium|low\", \"description\": string, \"affected_files\": string[], \"remediation_phase\": integer }], \"metadata\": { \"generated_at\": ISO8601 string, \"recipe_version\": string } }",
     "qdrant-contract-patch-summary.md": "what was changed or exact patch queue in plan-only mode",
     "qdrant-contract-verification.md": "commands run, DB/Qdrant dry-run evidence, remaining blockers"
   },
@@ -39,6 +39,11 @@ Produce a concise JSON plan with this strict schema:
         "id": "artifacts_exist",
         "description": "all four qdrant-contract artifacts exist and are non-empty",
         "command": "bash recipes/researcher-qdrant-contract/verifiers/deterministic-checks.sh"
+      },
+      {
+        "id": "findings_json_schema",
+        "description": "findings JSON uses the object envelope {findings, metadata}; findings is an array of typed contract gaps",
+        "command": "python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert isinstance(d.get(\"findings\"), list); assert isinstance(d.get(\"metadata\"), dict)' \"$MINI_ORK_RUN_DIR/qdrant-contract-findings.json\""
       },
       {
         "id": "payload_contract_keys",
@@ -74,6 +79,8 @@ Constraints:
 - Do NOT include blind full Qdrant reindexing in the plan.
 - Do NOT touch the mini-ork framework core.
 - Do NOT run the researcher frontend or backend servers.
+- Do NOT describe `qdrant-contract-findings.json` as a top-level JSON array.
+- Do NOT emit verifier commands that iterate `qdrant-contract-findings.json` with `.[]`; commands MUST read `.findings[]` or delegate to `deterministic-checks.sh`.
 - Preserve the invariant: PostgreSQL `blocks` is canonical; Qdrant `knowledge_nodes_unified` is derived.
 - The JSON plan MUST include `verifier_contract.checks[]` with at least the
   checks shown above. Do not omit or rename this key; mini-ork rejects plans

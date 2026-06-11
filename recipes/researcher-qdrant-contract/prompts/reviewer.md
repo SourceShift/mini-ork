@@ -26,6 +26,8 @@ Inputs:
 4. **Payload contract completeness**
    - Does the canonical schema require `text_preview` and `source_kind`?
    - Are all required keys documented with types and semantics?
+   - Does `qdrant-contract-findings.json` use the recipe's envelope shape
+     `{ "findings": [...], "metadata": {...} }` rather than a top-level array?
 
 5. **Retrieval allowlist coverage**
    - Does the allowlist include every canonical retrievable node type?
@@ -50,6 +52,9 @@ Emit a JSON envelope with this strict schema:
 
 Rules:
 - `verdict` MUST be one of `approve`, `revise`, `reject`.
+- Treat `{ "findings": [...], "metadata": {...} }` as the valid findings
+  artifact shape. Do not require a top-level findings array.
+- If checking findings with jq, use `.findings[]`, not `.[]`.
 - If any split-brain writer is introduced, verdict MUST be `reject`.
 - If `--dry-run` is not actually gating writes, verdict MUST be `reject`.
 - Do NOT emit `<z-insight>` blocks.
