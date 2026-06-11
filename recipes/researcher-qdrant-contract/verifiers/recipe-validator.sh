@@ -85,6 +85,12 @@ _check "task-class-keywords-min" "task_class.yaml declares at least three keywor
   'python3 -c "import sys,yaml; d=yaml.safe_load(open(sys.argv[1])) or {}; kw=d.get(\"matches\",{}).get(\"keywords\",[]); assert len(kw) >= 3, kw" "$RECIPE_DIR/task_class.yaml"'
 _check "required-output-artifacts-named" "artifact_contract names the four required outputs" \
   'python3 -c "import sys,yaml; blob=str(yaml.safe_load(open(sys.argv[1])) or {}); req=[\"qdrant-contract-remediation-plan.md\", \"qdrant-contract-findings.json\", \"qdrant-contract-patch-summary.md\", \"qdrant-contract-verification.md\"]; missing=[x for x in req if x not in blob]; assert not missing, missing" "$RECIPE_DIR/artifact_contract.yaml"'
+_check "findings-envelope-contract-documented" "planner, implementer, and reviewer agree on findings envelope shape" \
+  'grep -q "findings" "$RECIPE_DIR/prompts/planner.md" && grep -q "metadata" "$RECIPE_DIR/prompts/planner.md" && grep -q "findings" "$RECIPE_DIR/prompts/implementer.md" && grep -q "metadata" "$RECIPE_DIR/prompts/implementer.md" && grep -q "findings" "$RECIPE_DIR/prompts/reviewer.md" && grep -q "metadata" "$RECIPE_DIR/prompts/reviewer.md"'
+_check "no-raw-array-findings-verifier" "recipe prompts do not validate findings with raw .[] iteration" \
+  '! grep -R "all(\\.\\[\\]" "$RECIPE_DIR/prompts"'
+_check "planner-does-not-call-findings-raw-array" "planner artifact manifest does not call findings a raw JSON array" \
+  '! grep -q "Machine-readable JSON array" "$RECIPE_DIR/prompts/planner.md"'
 _check "payload-contract-keys-documented" "prompts document text_preview and source_kind" \
   'grep -q "text_preview" "$RECIPE_DIR"/prompts/*.md && grep -q "source_kind" "$RECIPE_DIR"/prompts/*.md'
 _check "reconciliation-dry-run-flag" "prompts require --dry-run support" \
