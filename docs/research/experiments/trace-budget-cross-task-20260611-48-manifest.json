@@ -1,0 +1,325 @@
+{
+  "experiment_id": "trace-budget-cross-task-20260611-48",
+  "description": "Combined controlled benchmark: 24 obs_smoke runs from 2026-06-10 plus 24 docs/code_fix fixture runs from 2026-06-11.",
+  "expensive_model_patterns": [
+    "opus",
+    "sonnet",
+    "fable",
+    "mythos",
+    "claude"
+  ],
+  "runs": [
+    {
+      "policy": "frontier_only",
+      "task_id": "obs-smoke-001",
+      "replicate": 1,
+      "run_id": "trace-budget-obs-smoke-20260610-24-frontier_only-obs-smoke-001-r1"
+    },
+    {
+      "policy": "cheap_only",
+      "task_id": "obs-smoke-001",
+      "replicate": 1,
+      "run_id": "trace-budget-obs-smoke-20260610-24-cheap_only-obs-smoke-001-r1"
+    },
+    {
+      "policy": "static_hybrid",
+      "task_id": "obs-smoke-001",
+      "replicate": 1,
+      "run_id": "trace-budget-obs-smoke-20260610-24-static_hybrid-obs-smoke-001-r1"
+    },
+    {
+      "policy": "trace_governed",
+      "task_id": "obs-smoke-001",
+      "replicate": 1,
+      "run_id": "trace-budget-obs-smoke-20260610-24-trace_governed-obs-smoke-001-r1"
+    },
+    {
+      "policy": "frontier_only",
+      "task_id": "obs-smoke-001",
+      "replicate": 2,
+      "run_id": "trace-budget-obs-smoke-20260610-24-frontier_only-obs-smoke-001-r2"
+    },
+    {
+      "policy": "cheap_only",
+      "task_id": "obs-smoke-001",
+      "replicate": 2,
+      "run_id": "trace-budget-obs-smoke-20260610-24-cheap_only-obs-smoke-001-r2"
+    },
+    {
+      "policy": "static_hybrid",
+      "task_id": "obs-smoke-001",
+      "replicate": 2,
+      "run_id": "trace-budget-obs-smoke-20260610-24-static_hybrid-obs-smoke-001-r2"
+    },
+    {
+      "policy": "trace_governed",
+      "task_id": "obs-smoke-001",
+      "replicate": 2,
+      "run_id": "trace-budget-obs-smoke-20260610-24-trace_governed-obs-smoke-001-r2"
+    },
+    {
+      "policy": "frontier_only",
+      "task_id": "obs-smoke-002",
+      "replicate": 1,
+      "run_id": "trace-budget-obs-smoke-20260610-24-frontier_only-obs-smoke-002-r1"
+    },
+    {
+      "policy": "cheap_only",
+      "task_id": "obs-smoke-002",
+      "replicate": 1,
+      "run_id": "trace-budget-obs-smoke-20260610-24-cheap_only-obs-smoke-002-r1"
+    },
+    {
+      "policy": "static_hybrid",
+      "task_id": "obs-smoke-002",
+      "replicate": 1,
+      "run_id": "trace-budget-obs-smoke-20260610-24-static_hybrid-obs-smoke-002-r1"
+    },
+    {
+      "policy": "trace_governed",
+      "task_id": "obs-smoke-002",
+      "replicate": 1,
+      "run_id": "trace-budget-obs-smoke-20260610-24-trace_governed-obs-smoke-002-r1"
+    },
+    {
+      "policy": "frontier_only",
+      "task_id": "obs-smoke-002",
+      "replicate": 2,
+      "run_id": "trace-budget-obs-smoke-20260610-24-frontier_only-obs-smoke-002-r2"
+    },
+    {
+      "policy": "cheap_only",
+      "task_id": "obs-smoke-002",
+      "replicate": 2,
+      "run_id": "trace-budget-obs-smoke-20260610-24-cheap_only-obs-smoke-002-r2"
+    },
+    {
+      "policy": "static_hybrid",
+      "task_id": "obs-smoke-002",
+      "replicate": 2,
+      "run_id": "trace-budget-obs-smoke-20260610-24-static_hybrid-obs-smoke-002-r2"
+    },
+    {
+      "policy": "trace_governed",
+      "task_id": "obs-smoke-002",
+      "replicate": 2,
+      "run_id": "trace-budget-obs-smoke-20260610-24-trace_governed-obs-smoke-002-r2"
+    },
+    {
+      "policy": "frontier_only",
+      "task_id": "obs-smoke-003",
+      "replicate": 1,
+      "run_id": "trace-budget-obs-smoke-20260610-24-frontier_only-obs-smoke-003-r1"
+    },
+    {
+      "policy": "cheap_only",
+      "task_id": "obs-smoke-003",
+      "replicate": 1,
+      "run_id": "trace-budget-obs-smoke-20260610-24-cheap_only-obs-smoke-003-r1"
+    },
+    {
+      "policy": "static_hybrid",
+      "task_id": "obs-smoke-003",
+      "replicate": 1,
+      "run_id": "trace-budget-obs-smoke-20260610-24-static_hybrid-obs-smoke-003-r1"
+    },
+    {
+      "policy": "trace_governed",
+      "task_id": "obs-smoke-003",
+      "replicate": 1,
+      "run_id": "trace-budget-obs-smoke-20260610-24-trace_governed-obs-smoke-003-r1"
+    },
+    {
+      "policy": "frontier_only",
+      "task_id": "obs-smoke-003",
+      "replicate": 2,
+      "run_id": "trace-budget-obs-smoke-20260610-24-frontier_only-obs-smoke-003-r2"
+    },
+    {
+      "policy": "cheap_only",
+      "task_id": "obs-smoke-003",
+      "replicate": 2,
+      "run_id": "trace-budget-obs-smoke-20260610-24-cheap_only-obs-smoke-003-r2"
+    },
+    {
+      "policy": "static_hybrid",
+      "task_id": "obs-smoke-003",
+      "replicate": 2,
+      "run_id": "trace-budget-obs-smoke-20260610-24-static_hybrid-obs-smoke-003-r2"
+    },
+    {
+      "policy": "trace_governed",
+      "task_id": "obs-smoke-003",
+      "replicate": 2,
+      "run_id": "trace-budget-obs-smoke-20260610-24-trace_governed-obs-smoke-003-r2"
+    },
+    {
+      "policy": "frontier_only",
+      "task_id": "docs-001",
+      "replicate": 1,
+      "run_id": "trace-budget-fixtures-20260611-24c-frontier_only-docs-001-r1",
+      "task_class": "docs"
+    },
+    {
+      "policy": "cheap_only",
+      "task_id": "docs-001",
+      "replicate": 1,
+      "run_id": "trace-budget-fixtures-20260611-24c-cheap_only-docs-001-r1",
+      "task_class": "docs"
+    },
+    {
+      "policy": "static_hybrid",
+      "task_id": "docs-001",
+      "replicate": 1,
+      "run_id": "trace-budget-fixtures-20260611-24c-static_hybrid-docs-001-r1",
+      "task_class": "docs"
+    },
+    {
+      "policy": "trace_governed",
+      "task_id": "docs-001",
+      "replicate": 1,
+      "run_id": "trace-budget-fixtures-20260611-24c-trace_governed-docs-001-r1",
+      "task_class": "docs"
+    },
+    {
+      "policy": "frontier_only",
+      "task_id": "docs-002",
+      "replicate": 1,
+      "run_id": "trace-budget-fixtures-20260611-24c-frontier_only-docs-002-r1",
+      "task_class": "docs"
+    },
+    {
+      "policy": "cheap_only",
+      "task_id": "docs-002",
+      "replicate": 1,
+      "run_id": "trace-budget-fixtures-20260611-24c-cheap_only-docs-002-r1",
+      "task_class": "docs"
+    },
+    {
+      "policy": "static_hybrid",
+      "task_id": "docs-002",
+      "replicate": 1,
+      "run_id": "trace-budget-fixtures-20260611-24c-static_hybrid-docs-002-r1",
+      "task_class": "docs"
+    },
+    {
+      "policy": "trace_governed",
+      "task_id": "docs-002",
+      "replicate": 1,
+      "run_id": "trace-budget-fixtures-20260611-24c-trace_governed-docs-002-r1",
+      "task_class": "docs"
+    },
+    {
+      "policy": "frontier_only",
+      "task_id": "docs-003",
+      "replicate": 1,
+      "run_id": "trace-budget-fixtures-20260611-24c-frontier_only-docs-003-r1",
+      "task_class": "docs"
+    },
+    {
+      "policy": "cheap_only",
+      "task_id": "docs-003",
+      "replicate": 1,
+      "run_id": "trace-budget-fixtures-20260611-24c-cheap_only-docs-003-r1",
+      "task_class": "docs"
+    },
+    {
+      "policy": "static_hybrid",
+      "task_id": "docs-003",
+      "replicate": 1,
+      "run_id": "trace-budget-fixtures-20260611-24c-static_hybrid-docs-003-r1",
+      "task_class": "docs"
+    },
+    {
+      "policy": "trace_governed",
+      "task_id": "docs-003",
+      "replicate": 1,
+      "run_id": "trace-budget-fixtures-20260611-24c-trace_governed-docs-003-r1",
+      "task_class": "docs"
+    },
+    {
+      "policy": "frontier_only",
+      "task_id": "code-fix-001",
+      "replicate": 1,
+      "run_id": "trace-budget-fixtures-20260611-24c-frontier_only-code-fix-001-r1",
+      "task_class": "code_fix"
+    },
+    {
+      "policy": "cheap_only",
+      "task_id": "code-fix-001",
+      "replicate": 1,
+      "run_id": "trace-budget-fixtures-20260611-24c-cheap_only-code-fix-001-r1",
+      "task_class": "code_fix"
+    },
+    {
+      "policy": "static_hybrid",
+      "task_id": "code-fix-001",
+      "replicate": 1,
+      "run_id": "trace-budget-fixtures-20260611-24c-static_hybrid-code-fix-001-r1",
+      "task_class": "code_fix"
+    },
+    {
+      "policy": "trace_governed",
+      "task_id": "code-fix-001",
+      "replicate": 1,
+      "run_id": "trace-budget-fixtures-20260611-24c-trace_governed-code-fix-001-r1",
+      "task_class": "code_fix"
+    },
+    {
+      "policy": "frontier_only",
+      "task_id": "code-fix-002",
+      "replicate": 1,
+      "run_id": "trace-budget-fixtures-20260611-24c-frontier_only-code-fix-002-r1",
+      "task_class": "code_fix"
+    },
+    {
+      "policy": "cheap_only",
+      "task_id": "code-fix-002",
+      "replicate": 1,
+      "run_id": "trace-budget-fixtures-20260611-24c-cheap_only-code-fix-002-r1",
+      "task_class": "code_fix"
+    },
+    {
+      "policy": "static_hybrid",
+      "task_id": "code-fix-002",
+      "replicate": 1,
+      "run_id": "trace-budget-fixtures-20260611-24c-static_hybrid-code-fix-002-r1",
+      "task_class": "code_fix"
+    },
+    {
+      "policy": "trace_governed",
+      "task_id": "code-fix-002",
+      "replicate": 1,
+      "run_id": "trace-budget-fixtures-20260611-24c-trace_governed-code-fix-002-r1",
+      "task_class": "code_fix"
+    },
+    {
+      "policy": "frontier_only",
+      "task_id": "code-fix-003",
+      "replicate": 1,
+      "run_id": "trace-budget-fixtures-20260611-24c-frontier_only-code-fix-003-r1",
+      "task_class": "code_fix"
+    },
+    {
+      "policy": "cheap_only",
+      "task_id": "code-fix-003",
+      "replicate": 1,
+      "run_id": "trace-budget-fixtures-20260611-24c-cheap_only-code-fix-003-r1",
+      "task_class": "code_fix"
+    },
+    {
+      "policy": "static_hybrid",
+      "task_id": "code-fix-003",
+      "replicate": 1,
+      "run_id": "trace-budget-fixtures-20260611-24c-static_hybrid-code-fix-003-r1",
+      "task_class": "code_fix"
+    },
+    {
+      "policy": "trace_governed",
+      "task_id": "code-fix-003",
+      "replicate": 1,
+      "run_id": "trace-budget-fixtures-20260611-24c-trace_governed-code-fix-003-r1",
+      "task_class": "code_fix"
+    }
+  ]
+}
