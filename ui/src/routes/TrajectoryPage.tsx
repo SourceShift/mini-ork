@@ -1,3 +1,4 @@
+import { useEffect, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { Link } from "@tanstack/react-router";
 import { ChevronRight } from "lucide-react";
@@ -5,12 +6,30 @@ import { ChevronRight } from "lucide-react";
 import { api, type SelfImproveRun } from "@/lib/api";
 import { formatCost, formatDuration, formatRelative } from "@/lib/format";
 import { StatusPill } from "@/components/Pill";
+import { IdeaTreePanel } from "@/components/IdeaTreePanel";
 
 export function TrajectoryPage() {
   const selfImprove = useQuery({
     queryKey: ["self-improve"],
     queryFn: () => api.selfImprove(50),
     refetchInterval: 10_000,
+  });
+  const roots = useQuery({
+    queryKey: ["idea-tree-roots"],
+    queryFn: () => api.ideaTree.roots(),
+    refetchInterval: 30_000,
+  });
+  const [selectedRootId, setSelectedRootId] = useState<string>("");
+  useEffect(() => {
+    if (!selectedRootId && roots.data?.[0]?.node_id) {
+      setSelectedRootId(roots.data[0].node_id);
+    }
+  }, [roots.data, selectedRootId]);
+  const tree = useQuery({
+    queryKey: ["idea-tree", selectedRootId],
+    queryFn: () => api.ideaTree.read(selectedRootId),
+    enabled: Boolean(selectedRootId),
+    refetchInterval: 30_000,
   });
   const cost = useQuery({ queryKey: ["cost-by-day"], queryFn: api.costByDay });
   const wall = useQuery({ queryKey: ["wall-time"], queryFn: api.wallTime });
@@ -46,6 +65,33 @@ export function TrajectoryPage() {
         />
       </section>
 
+      <section className="card !p-0 overflow-hidden" data-testid="hypothesis-tree-section">
+        <div className="panel-title !m-0 flex items-center justify-between gap-3">
+          <span>Hypothesis tree</span>
+          <select
+            className="max-w-[520px] rounded-[3px] border border-[var(--hair)] bg-[var(--panel-2)] px-2 py-1 font-mono text-[10px] text-ink-300 outline-none hover:border-[var(--hair-2)] focus:border-ork-amber"
+            value={selectedRootId}
+            onChange={(event) => setSelectedRootId(event.target.value)}
+            disabled={!roots.data?.length}
+            aria-label="Select hypothesis tree root"
+            data-testid="idea-tree-root-select"
+          >
+            {(roots.data ?? []).map((root) => (
+              <option key={root.node_id} value={root.node_id}>
+                {rootLabel(root)}
+              </option>
+            ))}
+          </select>
+        </div>
+        {roots.isLoading || tree.isLoading ? (
+          <p className="p-4 text-sm text-ink-400">Loading hypothesis tree.</p>
+        ) : roots.isError || tree.isError ? (
+          <p className="p-4 text-sm text-red-300">Could not load the hypothesis tree.</p>
+        ) : (
+          <IdeaTreePanel tree={tree.data} />
+        )}
+      </section>
+
       <section className="card" data-testid="self-improve-section">
         <div className="panel-title">self-improve ledger</div>
         {selfImprove.data?.length ? (
@@ -75,6 +121,18 @@ export function TrajectoryPage() {
       </section>
     </div>
   );
+}
+
+function rootLabel(root: {
+  node_id: string;
+  hypothesis: string | null;
+  node_count: number;
+  harvested_count: number;
+  pruned_count: number;
+}): string {
+  const hypothesis = root.hypothesis?.trim() || root.node_id;
+  const short = hypothesis.length > 84 ? `${hypothesis.slice(0, 81)}...` : hypothesis;
+  return `${short} (${root.node_count} nodes, ${root.harvested_count} harvested, ${root.pruned_count} pruned)`;
 }
 
 function SelfImproveRow({ row }: { row: SelfImproveRun }) {
