@@ -102,18 +102,55 @@ fi
 # able to edit the scenario project; operators can override with CODEX_SANDBOX.
 _CODEX_LAST_MESSAGE="$(mktemp -t mini-ork-codex-last.XXXXXX)"
 _CODEX_SANDBOX="${CODEX_SANDBOX:-workspace-write}"
+
+# Real-time progress sidecar (2026-06-11 fix).
+# Problem: `RAW_OUT=$(codex exec ... 2>&1)` buffers ALL stdout until codex
+# exits, so a 15-20 min implementer turn writes ZERO lines to mini-ork-execute's
+# log until the very end. Observers (Monitor tail / UI / operator) cannot
+# distinguish a live codex run from a deadlock — diagnosed 2026-06-11
+# run-1781188025-72603 spent 17+ min looking like a hang to a tail-based
+# monitor while codex was actually progressing through tool calls.
+# Fix: tee codex's JSONL stream to a sidecar so turn.completed / tool_call
+# events are visible AS THEY HAPPEN. The sidecar path is derived from
+# MO_USAGE_FILE when set (same dir as out-file), else /tmp.
+if [ -n "${MO_USAGE_FILE:-}" ]; then
+  _CODEX_STREAM_FILE="${MO_USAGE_FILE%.tokens}.stream.jsonl"
+else
+  _CODEX_STREAM_FILE="$(mktemp -t mini-ork-codex-stream.XXXXXX)"
+fi
+export MO_CODEX_STREAM_FILE="$_CODEX_STREAM_FILE"
+
+# Tee through a FIFO so RAW_OUT still captures everything (used by both the
+# error path and the post-process python block below) AND the sidecar file
+# fills in real time. macOS bash 5 `tee` flushes per-line in the absence of
+# block buffering on a FIFO sink.
+_CODEX_FIFO="$(mktemp -u -t mini-ork-codex-fifo.XXXXXX)"
+mkfifo "$_CODEX_FIFO" || { echo "[cl_codex] mkfifo failed for $_CODEX_FIFO" >&2; exit 6; }
+( tee -a "$_CODEX_STREAM_FILE" < "$_CODEX_FIFO" ) &
+_CODEX_TEE_PID=$!
+
+# Run codex with stdout streamed through the FIFO; capture combined output
+# (FIFO contents + stderr) so the error path and the post-process block still
+# work unchanged. `set +e` around the read so we get rc without -e killing us.
+set +e
 RAW_OUT=$(codex exec \
   --skip-git-repo-check \
   --sandbox "$_CODEX_SANDBOX" \
   --json \
   --output-last-message "$_CODEX_LAST_MESSAGE" \
   ${_CODEX_BYO_FLAGS[@]+"${_CODEX_BYO_FLAGS[@]}"} \
-  "$PROMPT" 2>&1) || {
-  echo "[cl_codex] codex exec failed with rc=$? — see stderr for cause" >&2
+  "$PROMPT" 2> >(tee -a "$_CODEX_STREAM_FILE" >&2) | tee "$_CODEX_FIFO")
+_CODEX_RC=${PIPESTATUS[0]}
+set -uo pipefail
+wait "$_CODEX_TEE_PID" 2>/dev/null || true
+rm -f "$_CODEX_FIFO"
+
+if [ "$_CODEX_RC" -ne 0 ]; then
+  echo "[cl_codex] codex exec failed with rc=$_CODEX_RC — see stderr for cause" >&2
   echo "$RAW_OUT" >&2
   rm -f "$_CODEX_LAST_MESSAGE"
   exit 4
-}
+fi
 
 # Harvest usage + per-turn sidecars from the JSONL event stream BEFORE
 # RAW_OUT gets replaced by the last-message body. The dispatcher exports:
