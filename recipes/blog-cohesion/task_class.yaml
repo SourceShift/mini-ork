@@ -1,0 +1,58 @@
+name: blog_cohesion
+version: "0.1.0"
+description: >
+  5-lens cohesion audit of an EXISTING blog-post draft. Each lens examines
+  the post from a distinct structural angle (thesis / bridges / topic
+  sentences / entity continuity / rhythm) and emits structured JSON
+  findings. An Opus arbiter reconciles overlapping suggestions and
+  applies them to produce a diffable applied_post.md. Companion to
+  blog_post (which DRAFTS from a kickoff); this recipe POLISHES an
+  existing draft.
+
+# Cross-family panel — per Rajan 2025 (arxiv:2511.16708) submodularity
+# proof and Nasser 2026 (arxiv:2601.05114) evaluative-fingerprints
+# finding, multi-lens reviews only catch additive gaps when pairwise
+# correlation is low. Each lens routes to a distinct model family via
+# config/agents.yaml.
+
+matches:
+  keywords:
+    - cohesion pass
+    - polish this post
+    - polish this draft
+    - tighten this post
+    - tighten this draft
+    - cohesion check
+    - cohesion-check
+    - cohesion swarm
+    - blog cohesion
+    - run cohesion
+    - smooth this post
+    - smooth this draft
+    - restyle this post
+    - mini-orch this post
+    - mini-orch this draft
+  regex:
+    - "blog-cohesion"
+  path_globs:
+    - "src/content/blog/*.md"
+    - "content/blog/*.md"
+    - "posts/*.md"
+
+artifact_contract_ref: artifact_contract.yaml
+default_workflow: workflow.yaml
+
+default_gates:
+  - budget_gate
+  - scope_gate
+
+risk_class: low
+
+cost_model:
+  min_usd: 1.50
+  max_usd: 4.50
+  per_lens_usd: 0.50
+
+runtime_model:
+  min_minutes: 8
+  max_minutes: 25
