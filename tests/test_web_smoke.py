@@ -611,6 +611,99 @@ def test_dispatch_config_snapshot_columns_exist(tmp_path: Path) -> None:
     con.close()
 
 
+def test_node_heartbeat_fuse_columns_exist(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.db"
+    con = sqlite3.connect(db_path)
+    con.executescript(
+        """
+        CREATE TABLE schema_migrations(filename TEXT PRIMARY KEY, applied_at TEXT, checksum TEXT);
+        CREATE TABLE run_events (
+          event_id TEXT PRIMARY KEY,
+          run_id TEXT NOT NULL,
+          event_type TEXT NOT NULL,
+          payload_json TEXT NOT NULL DEFAULT '{}',
+          created_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+        );
+        CREATE TABLE task_runs (
+          id TEXT PRIMARY KEY,
+          updated_at INTEGER NOT NULL
+        );
+        """
+    )
+    con.executescript((ROOT / "db/migrations/0023_node_heartbeat_fuse.sql").read_text())
+
+    run_event_cols = {r[1]: r for r in con.execute("PRAGMA table_info(run_events)").fetchall()}
+    task_run_cols = {r[1]: r for r in con.execute("PRAGMA table_info(task_runs)").fetchall()}
+    assert "last_heartbeat_at" in run_event_cols
+    assert run_event_cols["last_heartbeat_at"][3] == 0
+    assert {"fuse_blown_lane", "fuse_consecutive_failures"} <= set(task_run_cols)
+    assert task_run_cols["fuse_blown_lane"][3] == 0
+    assert task_run_cols["fuse_consecutive_failures"][4] == "0"
+    indexes = {r[1] for r in con.execute("PRAGMA index_list(run_events)").fetchall()}
+    assert "idx_run_events_last_heartbeat_at" in indexes
+    con.close()
+
+
+def test_lane_fuse_trips_after_three_retryable_failures(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.db"
+    con = sqlite3.connect(db_path)
+    con.executescript(
+        """
+        CREATE TABLE llm_calls (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          feature_name TEXT NOT NULL,
+          status TEXT NOT NULL,
+          error_category TEXT,
+          retryable INTEGER
+        );
+        INSERT INTO llm_calls(feature_name, status, error_category, retryable)
+        VALUES
+          ('framework_edit:glm_lens', 'failed', 'network', 1),
+          ('framework_edit:glm_lens', 'failed', 'network', 1),
+          ('framework_edit:glm_lens', 'failed', 'network', 1);
+        """
+    )
+    con.close()
+
+    script = (
+        "source lib/llm-dispatch.sh; "
+        f"MINI_ORK_DB={db_path} MO_FUSE_ENABLED=1 "
+        "_mo_check_lane_fuse glm_lens network >/dev/null"
+    )
+    result = subprocess.run(["bash", "-lc", script], cwd=ROOT)
+    assert result.returncode == 1
+
+
+def test_lane_fuse_ignores_nonretryable_failures(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.db"
+    con = sqlite3.connect(db_path)
+    con.executescript(
+        """
+        CREATE TABLE llm_calls (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          feature_name TEXT NOT NULL,
+          status TEXT NOT NULL,
+          error_category TEXT,
+          retryable INTEGER
+        );
+        INSERT INTO llm_calls(feature_name, status, error_category, retryable)
+        VALUES
+          ('framework_edit:glm_lens', 'failed', 'auth', 0),
+          ('framework_edit:glm_lens', 'failed', 'auth', 0),
+          ('framework_edit:glm_lens', 'failed', 'auth', 0);
+        """
+    )
+    con.close()
+
+    script = (
+        "source lib/llm-dispatch.sh; "
+        f"MINI_ORK_DB={db_path} MO_FUSE_ENABLED=1 "
+        "_mo_check_lane_fuse glm_lens auth >/dev/null"
+    )
+    result = subprocess.run(["bash", "-lc", script], cwd=ROOT)
+    assert result.returncode == 0
+
+
 def test_agents_endpoint_legacy_null_snapshot_uses_fallback(tmp_path: Path, monkeypatch) -> None:
     from mini_ork.web.db import StateDB
     from mini_ork.web.routes.run_detail import list_agents
