@@ -1,0 +1,4 @@
+target_policy,baseline_policy,target_runs,baseline_runs,success_rate_delta,verifier_pass_rate_delta,cost_per_success_delta_usd,cost_reduction_vs_baseline
+trace_governed,frontier_only,6,6,0.0,0.0,-0.127523,0.2532
+trace_governed,static_hybrid,6,6,0.0,0.0,0.009372,-0.0256
+trace_governed,cheap_only,6,6,0.0,0.0,0.035142,-0.103
