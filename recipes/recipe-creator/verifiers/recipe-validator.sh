@@ -226,10 +226,14 @@ _check "heterogeneity-3-families" "≥ 3 distinct model_lane families (HARD floo
        '[ -f "$HETERO_JSON" ] && python3 -c "import json; assert json.load(open(\"$HETERO_JSON\"))[\"distinct_count\"] >= 3"'
 
 # ── Compose verdict ──────────────────────────────────────────────────
+# Translate bash truthiness to Python identifiers BEFORE the heredoc so
+# the `$pass` expansion inside the Python block becomes a valid literal
+# (True/False), not the bash bareword (true/false) that triggers
+# NameError: name 'true' is not defined.
 if [ "${#failed_checks[@]}" -eq 0 ]; then
-  pass=true
+  pass=True
 else
-  pass=false
+  pass=False
 fi
 
 python3 - <<PY
