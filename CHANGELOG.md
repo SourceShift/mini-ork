@@ -13,6 +13,72 @@ No unreleased changes yet.
 
 ---
 
+## [0.3.0] - 2026-06-11
+
+### Added
+
+- **Arbor-style Idea Tree primitive** (`db/migrations/0020_idea_tree.sql`):
+  generic `idea_tree_nodes` table for hypothesis-tree exploration patterns,
+  status enum (`pending` / `running` / `harvested` / `pruned` / `rejected`),
+  insights JSON column for future upward propagation. Idempotent backfill
+  script (`scripts/backfill_idea_tree.py`) materializes existing
+  `self_improve_runs` history as tree nodes chronologically per day-cluster.
+- **Idea Tree read API** under `/api/v1/idea-tree/*` — `roots`, `{root_node_id}`
+  subtree, single-node, ancestor-chain endpoints. Loopback-only.
+- **Idea Tree visualization** on the Trajectory UI page — `@xyflow/react`
+  panel with status-color-coded nodes, click-through to per-run forensics or
+  self-improve iter detail.
+- **`recipe-creator` meta-recipe** (`recipes/recipe-creator/`) — authors new
+  recipes from natural-language epics via a 3-family drafter panel
+  (glm/kimi/codex) → opus arbiter → verifier_smith → HARD heterogeneity-floor
+  validator. The framework dogfooding itself on small-N recipe authoring.
+- **`silent-catch-audit` recipe** (`recipes/silent-catch-audit/`) — first
+  recipe authored end-to-end by `recipe-creator`. 3-lens audit of TS/JS
+  codebases for silent `.catch(() => {})` anti-patterns.
+- **`framework-edit` recipe** (`recipes/framework-edit/`) — recipe-creator-
+  authored. Routine mini-ork self-modification with verifier-gated discipline
+  (`bash -n`, `py_compile`, `tsc --noEmit`, `pytest tests/test_web_smoke.py`
+  against a throwaway patched copy). Emits a unified diff for operator review;
+  does NOT auto-apply.
+- **Three locally-authored recipes**: `blog-cohesion`, `bug-audit-cmgk`,
+  `feature-inventory-cmgk`.
+- **Routing policy primitive** (`MO_ROUTING_POLICY` env): five policies
+  (`workflow_default`, `frontier_only`, `cheap_only`, `static_hybrid`,
+  `trace_governed`) swap workflow-declared lanes at dispatch time without
+  recipe edits.
+- **Agent in-flight banner** on the Run Detail Agent transcript: pulsing
+  amber indicator + explanatory copy when an agent dispatch is still running.
+
+### Fixed
+
+- **`recipes/recipe-creator/verifiers/recipe-validator.sh`** — Python
+  `NameError: name 'true' is not defined` when bash `pass=true` was
+  interpolated into a Python heredoc. Translate at the bash→Python boundary
+  with `True`/`False` literals.
+- **`lib/lane-helpers.sh`** — feature-detect
+  `--exclude-dynamic-system-prompt-sections` on the `claude` CLI before
+  emitting it. Older CLIs (≤2.1.47 observed) hard-fail every dispatch on
+  unknown options; probe once per process and degrade to cache-miss instead.
+- **`bin/mini-ork-execute` publisher branch** (shipped 2026-06-10 in
+  `f11f380`, included here for v0.3.0 finalization): resolves `${VAR}`
+  substitutions in `artifact_contract.yaml` `source_artifact` + `outputs[]`
+  via envsubst, and copies directory sources via `cp -R src/. dst/`. Required
+  for the meta-recipe pattern to auto-publish derivative recipes.
+- **`bin/mini-ork-plan`** (shipped 2026-06-10 in `ad2ea05`): dispatcher
+  stderr now persisted to `$RUN_DIR/plan-dispatch.err.log` and echoed on
+  dispatch failure. Closes the opaque "LLM dispatch failed for planner node"
+  failure mode.
+
+### Notes
+
+- Backward-compatible with v0.3.0-rc2. All additions are opt-in.
+- `framework-edit` recipe's `verdict.json` has a known write-ordering bug
+  (implementer writes `pass=false` defensively before verifiers run). The
+  authoritative source is each verifier's `verifier-<name>.checks.tsv` file,
+  not `verdict.json`. Fix tracked for v0.3.1.
+
+---
+
 ## [0.3.0-rc2] - 2026-06-10
 
 ### Added
