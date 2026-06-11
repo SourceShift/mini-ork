@@ -1,0 +1,59 @@
+version: "0.1.0"
+task_class: chapter_review
+description: >
+  Heterogeneous-LLM panel review of a book chapter.
+  4 lens stances (glm/kimi/codex/opus) run in parallel, each scoring
+  assigned axes. Opus synthesizer composes a single chapter-review.json
+  with authoritative axis scores, fragment suggestions, overall verdict,
+  summary, and a panel_disagreement_score computed from lens variance.
+  Two verifier nodes (schema + panel-completeness) prove JSON shape and
+  lens coverage before publisher commits.
+
+nodes:
+  # 4 parallel lenses — each routes to its named family lane for
+  # heterogeneous review. Rajan 2025 / Nasser 2026 motivate
+  # low-correlation detectors and judge-disposition realism.
+  - { name: glm_lens,       type: researcher,  model_lane: glm_lens,     prompt_ref: prompts/lens-glm.md,    dispatch_mode: parallel, gates: [budget_gate] }
+  - { name: kimi_lens,      type: researcher,  model_lane: kimi_lens,    prompt_ref: prompts/lens-kimi.md,   dispatch_mode: parallel, gates: [budget_gate] }
+  - { name: codex_lens,     type: researcher,  model_lane: codex_lens,   prompt_ref: prompts/lens-codex.md,  dispatch_mode: parallel, gates: [budget_gate] }
+  - { name: opus_lens,      type: researcher,  model_lane: opus_lens,    prompt_ref: prompts/lens-opus.md,   dispatch_mode: parallel, gates: [budget_gate] }
+
+  # Synthesizer: authoritative composer. Runs serial after all lenses.
+  - { name: synthesizer,    type: reviewer,    model_lane: reviewer,     prompt_ref: prompts/synthesis.md,   dispatch_mode: serial,   gates: [budget_gate] }
+
+  # Verifier 1: JSON schema — asserts every required top-level key
+  # and every C1..C9 sub-key by name, plus valid JSON syntax.
+  - { name: schema_verifier,       type: verifier, verifier_ref: verifiers/schema.sh,              dispatch_mode: serial }
+
+  # Verifier 2: Panel completeness — asserts all 4 lens artifacts
+  # exist pre-synthesis and that panel_disagreement_score is
+  # derivable from the 4 lens score sets.
+  - { name: panel_completeness,    type: verifier, verifier_ref: verifiers/panel-completeness.sh,  dispatch_mode: serial }
+
+  # Publisher commits chapter-review.json; rollback recovers on failure.
+  - { name: publisher,      type: publisher,   prompt_ref: null, dispatch_mode: serial, gates: [scope_gate] }
+  - { name: rollback,       type: rollback,    prompt_ref: null, dispatch_mode: serial }
+
+edges:
+  # Lenses run in parallel from kickoff (no explicit planner node
+  # in this topology; kickoff is the plan input).
+  - { from: glm_lens,   to: synthesizer, edge_type: supplies_context_to }
+  - { from: kimi_lens,  to: synthesizer, edge_type: supplies_context_to }
+  - { from: codex_lens, to: synthesizer, edge_type: supplies_context_to }
+  - { from: opus_lens,  to: synthesizer, edge_type: supplies_context_to }
+
+  # Synthesis must complete before either verifier runs.
+  - { from: synthesizer,        to: schema_verifier,       edge_type: verifies }
+  - { from: synthesizer,        to: panel_completeness,    edge_type: verifies }
+
+  # Publisher gates on BOTH verifiers passing.
+  - { from: schema_verifier,    to: publisher, edge_type: depends_on }
+  - { from: panel_completeness, to: publisher, edge_type: depends_on }
+
+  # Rollback catches any downstream failure.
+  - { from: publisher,          to: rollback, edge_type: escalates_to }
+  - { from: schema_verifier,    to: rollback, edge_type: escalates_to }
+  - { from: panel_completeness, to: rollback, edge_type: escalates_to }
+
+rollback_strategy: keep_lens_reports_discard_synthesis
+max_self_correction_iterations: 2
