@@ -12,7 +12,7 @@ sub="${1:-help}"; shift || true
 
 case "$sub" in
   # Universal loop subcommands
-  classify|plan|execute|verify|reflect|improve|eval|promote|init|spawn)
+  classify|plan|execute|verify|reflect|improve|eval|promote|init|update|spawn)
     exec "$MINI_ORK_ROOT/bin/mini-ork-$sub" "$@" ;;
 
   # Phase C: trajectory metrics across DF cycles (v0.2-pt13)
@@ -416,6 +416,7 @@ Recipe runner:
 
 Lifecycle:
   init                           Bootstrap project (creates .mini-ork/)
+  update                         Apply migrations + report config drift
   doctor                         Check deps + env vars + lib presence
   version
 
