@@ -116,7 +116,9 @@ export function AgentDetailPage() {
       />
 
       {activeTab === "overview" && <AgentInputPanel prompt={d.prompt} node={n} />}
-      {activeTab === "turns" && <AgentTranscriptPanel transcript={d.transcript} calls={d.llm_calls} />}
+      {activeTab === "turns" && (
+        <AgentTranscriptPanel transcript={d.transcript} calls={d.llm_calls} running={d.status === "running"} />
+      )}
       {activeTab === "artifacts" && <ArtifactsPanel artifacts={d.artifacts} />}
       {activeTab === "learnings" && <AgentLearningPanel nodeId={nodeId} learning={learning.data ?? null} />}
       {activeTab === "children" && <ChildSpawnsPanel children={d.children} />}
