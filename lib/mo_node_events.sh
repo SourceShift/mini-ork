@@ -80,13 +80,30 @@ payload = {
 con = sqlite3.connect(db, timeout=2.0)
 con.execute("PRAGMA busy_timeout = 2000")
 try:
-    con.execute(
-        """
-        INSERT INTO run_events(event_id, run_id, event_type, payload_json, created_at)
-        VALUES (?, ?, ?, ?, ?)
-        """,
-        (event_id, run_id, event_type, json.dumps(payload), int(time.time())),
-    )
+    cols = {r[1] for r in con.execute("PRAGMA table_info(run_events)").fetchall()}
+    if "finish_reason" in cols:
+        con.execute(
+            """
+            INSERT INTO run_events(event_id, run_id, event_type, payload_json, finish_reason, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                event_id,
+                run_id,
+                event_type,
+                json.dumps(payload),
+                payload.get("finish_reason"),
+                int(time.time()),
+            ),
+        )
+    else:
+        con.execute(
+            """
+            INSERT INTO run_events(event_id, run_id, event_type, payload_json, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (event_id, run_id, event_type, json.dumps(payload), int(time.time())),
+        )
     con.commit()
 finally:
     con.close()
@@ -112,14 +129,23 @@ mo_node_start() {
 # Caller must set: _mo_run_id, _mo_node_start_ms, node_id, node_type
 # Optional: VERDICT, CONTEXT_FILE, IMPL_LOG, REVIEW_FILE
 mo_node_emit_end_trap() {
-  local _end _dur _artifact
+  local _rc=$?
+  local _end _dur _artifact _finish_reason
   [ -n "${_mo_run_id:-}" ] || return 0
   [ -n "${node_id:-}" ]    || return 0
   [ -n "${node_type:-}" ]  || return 0
   _end=$(_mo_now_ms)
   _dur=$(( _end - ${_mo_node_start_ms:-0} ))
   _artifact="${CONTEXT_FILE:-${IMPL_LOG:-${REVIEW_FILE:-}}}"
-  mo_node_end "$_mo_run_id" "$node_id" "$node_type" "$_dur" "${VERDICT:-}" "$_artifact" || true
+  _finish_reason="${MO_NODE_FINISH_REASON:-}"
+  if [ -z "$_finish_reason" ]; then
+    if [ "$_rc" -eq 0 ]; then
+      _finish_reason="done"
+    else
+      _finish_reason="error"
+    fi
+  fi
+  mo_node_end "$_mo_run_id" "$node_id" "$node_type" "$_dur" "${VERDICT:-}" "$_artifact" "$_finish_reason" || true
   # Piggyback an OTel agent span when lib/mo_otel.sh is loaded (MO_OTEL=1).
   if declare -f mo_otel_agent >/dev/null 2>&1; then
     mo_otel_agent "$node_id" "$node_type" "${_mo_node_start_ms:-0}" "$_end" "${VERDICT:-}" || true
@@ -127,17 +153,18 @@ mo_node_emit_end_trap() {
 }
 
 # Convenience: emit node_end with duration + verdict payload.
-# Usage: mo_node_end <run_id> <node_id> <node_type> <duration_ms> [<verdict>] [<artifact_path>]
+# Usage: mo_node_end <run_id> <node_id> <node_type> <duration_ms> [<verdict>] [<artifact_path>] [<finish_reason>]
 mo_node_end() {
   local run_id="${1:?}" node_id="${2:?}" node_type="${3:?}" duration_ms="${4:-0}"
-  local verdict="${5:-}" artifact_path="${6:-}"
+  local verdict="${5:-}" artifact_path="${6:-}" finish_reason="${7:-}"
   local extra
-  extra=$(python3 - "$duration_ms" "$verdict" "$artifact_path" <<'PY'
+  extra=$(python3 - "$duration_ms" "$verdict" "$artifact_path" "$finish_reason" <<'PY'
 import json, sys
-duration_ms, verdict, artifact_path = sys.argv[1:4]
+duration_ms, verdict, artifact_path, finish_reason = sys.argv[1:5]
 out = {"duration_ms": int(duration_ms or 0)}
 if verdict:       out["verdict"] = verdict
 if artifact_path: out["artifact_path"] = artifact_path
+if finish_reason: out["finish_reason"] = finish_reason
 print(json.dumps(out))
 PY
   )
