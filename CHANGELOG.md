@@ -13,6 +13,87 @@ No unreleased changes yet.
 
 ---
 
+## [0.3.0.1] - 2026-06-12
+
+**Phase 1 of Agent-ops hardening complete.** Substrate-only patch release
+ships the truthful-run-telemetry layer the v0.3 roadmap names as blocking
+everything downstream (LobeHub-informed deep review, 2026-06-10). All four
+items shipped as small, verifier-gated framework-edit dispatches in a
+single session (~$10 LLM spend total, ~3 hours wall clock).
+
+### Added
+
+- **A2 + A3 — error taxonomy on `llm_calls` + finish reasons on `node_end`**
+  (`db/migrations/0021_error_taxonomy_finish_reasons.sql`, commit
+  `ca4a165`). New `llm_calls.error_category` (9-category enum: auth /
+  quota / capacity / request / safety / network / stream / provider /
+  config / unknown) + `retryable` (0/1) classified inside `lib/llm-
+  dispatch.sh`. New `run_events.finish_reason` (8-value enum: done /
+  error / interrupted / max_steps / cost_limit / timeout /
+  verdict_revise / verdict_fail) emitted by `bin/mini-ork-execute`.
+  Reviewer node now reads VERDICT and returns non-zero on revise / fail
+  / REQUEST_CHANGES / ESCALATE so `escalates_to → rollback` edges fire
+  as recipe authors expect. Closes the framework-edit v1 (2026-06-11)
+  failure mode where a recipe published despite arbiter `needs_revision`.
+
+- **A1 — dispatch-time config snapshot**
+  (`db/migrations/0022_dispatch_config_snapshot.sql`, commit `fbb59f5`).
+  New `task_runs.dispatch_config_json` (full resolved lane → {family,
+  model_id, provider, base_url} map frozen at dispatch start) +
+  `task_runs.agents_yaml_sha`. The UI's `mini_ork/web/agents.py` now
+  prefers the snapshot over re-resolving from current `config/agents.yaml`,
+  closing the 2026-06-10 sonnet-vs-codex badge bug.
+
+- **A4 — heartbeat watchdog + failure fuse for nodes**
+  (`db/migrations/0023_node_heartbeat_fuse.sql`, commit `d8d2417`).
+  Background per-node heartbeat loop emits `node_heartbeat` events
+  every `MO_HEARTBEAT_INTERVAL_S` (default 30s). Inline watchdog
+  SIGTERMs nodes whose last heartbeat is older than
+  `MO_HEARTBEAT_TIMEOUT_S` (default 300s = 5 min), marking
+  `finish_reason=timeout`. Failure fuse halts a lane after 3
+  consecutive same-category retryable failures — depends on A2's
+  classifier. Closes the 25-min dead codex dispatch class observed
+  2026-06-10.
+
+### Fixed
+
+- **Heartbeat loop noise** (`bin/mini-ork-execute`): silence stderr from
+  the background heartbeat subshell to keep `execute.log` clean.
+
+### Notes
+
+- Backward-compatible with v0.3.0. All new columns NULL-able for legacy
+  rows; legacy code paths read NULL as "snapshot not available, fall
+  back".
+- Four follow-up items deferred to v0.3.1, blocked by intermittent
+  planner-output parser intolerance (D-011/D-016 class) and the
+  framework-edit verifier-methodology bug discovered by A4's reviewer
+  on 2026-06-11:
+  1. `recipes/framework-edit/verifiers/{static-check,test}.sh` —
+     throwaway copy is not its own git root; verifiers measure HEAD
+     instead of the patched diff. Discovered by opus reviewer; local
+     re-verify after `git apply` has been the operator-side gate.
+  2. `recipes/framework-edit` — implementer writes `verdict.json` with
+     `pass=false` defensively before verifiers run; reviewer reads
+     stale verdict and emits `needs_revision`. Verifier-checks.tsv is
+     the source of truth.
+  3. `bin/mini-ork-plan` parser — opus markdown-wrap + codex streaming
+     envelope both produce parse_error / missing-field rejections on
+     long kickoffs. Tolerant extraction works for short kickoffs.
+  4. Phase 2 (cache-aware cost accounting, capability flags, pricing
+     strategy table), Phase 3 (checkpoint/resume), Phase 4 (UX polish),
+     Track B (calibration gates), Arbor plan days 3-5 — all blocked
+     on a working framework-edit dispatch.
+
+### Dispatch artifacts (audit trail)
+
+- A2+A3: run-1781192890-33995 ($4.60, 18 min, 23/23 verifier-checks pass)
+- A1: run-1781194771-50446 ($2.64, 16 min, 23/23 verifier-checks pass)
+- A4: run-1781195887-21821 ($2.79, 18 min, 23/23 verifier-checks pass; first
+  reviewer to surface the framework-edit verifier-methodology bug)
+
+---
+
 ## [0.3.0] - 2026-06-11
 
 ### Added
