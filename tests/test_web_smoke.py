@@ -644,6 +644,153 @@ def test_node_heartbeat_fuse_columns_exist(tmp_path: Path) -> None:
     con.close()
 
 
+def test_llm_calls_cache_columns_exist(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.db"
+    con = sqlite3.connect(db_path)
+    con.executescript(
+        """
+        CREATE TABLE schema_migrations(filename TEXT PRIMARY KEY, applied_at TEXT, checksum TEXT);
+        CREATE TABLE llm_calls (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          provider TEXT NOT NULL,
+          model_id TEXT NOT NULL,
+          tier TEXT NOT NULL,
+          feature_name TEXT NOT NULL,
+          status TEXT NOT NULL CHECK (status IN ('success','failed'))
+        );
+        """
+    )
+    con.executescript((ROOT / "db/migrations/0024_cache_aware_cost.sql").read_text())
+
+    cols = {r[1]: r for r in con.execute("PRAGMA table_info(llm_calls)").fetchall()}
+    assert {
+        "cached_input_tokens",
+        "cache_creation_input_tokens",
+        "cost_input_uncached_usd",
+        "cost_input_cached_usd",
+        "cost_cache_write_usd",
+    } <= set(cols)
+    assert cols["cached_input_tokens"][4] == "0"
+    assert cols["cache_creation_input_tokens"][4] == "0"
+    con.close()
+
+
+def test_cache_cost_components_sum_to_cost_usd(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.db"
+    con = sqlite3.connect(db_path)
+    con.executescript(
+        """
+        CREATE TABLE schema_migrations(filename TEXT PRIMARY KEY, applied_at TEXT, checksum TEXT);
+        CREATE TABLE llm_calls (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          provider TEXT NOT NULL,
+          model_id TEXT NOT NULL,
+          tier TEXT NOT NULL,
+          feature_name TEXT NOT NULL,
+          actor TEXT,
+          status TEXT NOT NULL CHECK (status IN ('success','failed')),
+          duration_ms INTEGER NOT NULL DEFAULT 0,
+          cost_usd REAL NOT NULL DEFAULT 0,
+          error_message TEXT,
+          iter INTEGER,
+          run_id TEXT,
+          traceparent TEXT,
+          input_tokens INTEGER NOT NULL DEFAULT 0,
+          output_tokens INTEGER NOT NULL DEFAULT 0,
+          total_tokens INTEGER NOT NULL DEFAULT 0,
+          metadata_json TEXT NOT NULL DEFAULT '{}',
+          session_id TEXT,
+          ts TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+        );
+        """
+    )
+    con.executescript((ROOT / "db/migrations/0024_cache_aware_cost.sql").read_text())
+    con.close()
+
+    script = (
+        "source lib/llm-dispatch.sh; "
+        f"MINI_ORK_DB={db_path} _mo_llm_write_llm_calls_row "
+        "anthropic claude-opus-4 default mini-ork:test tester success 100 0.009 '' "
+        "1000 25 '{}' 200 300"
+    )
+    result = subprocess.run(["bash", "-lc", script], cwd=ROOT)
+    assert result.returncode == 0
+
+    con = sqlite3.connect(db_path)
+    row = con.execute(
+        """
+        SELECT cost_input_uncached_usd, cost_input_cached_usd, cost_cache_write_usd,
+               cost_usd, cached_input_tokens, cache_creation_input_tokens
+        FROM llm_calls
+        """
+    ).fetchone()
+    con.close()
+
+    assert row[4] == 200
+    assert row[5] == 300
+    expected_input_cost = (500 * 15.0 + 200 * 1.5 + 300 * 18.75) / 1_000_000
+    component_sum = row[0] + row[1] + row[2]
+    assert component_sum == pytest.approx(expected_input_cost)
+    assert row[3] == pytest.approx(0.009)
+
+
+def test_legacy_rows_with_zero_cache_still_query(tmp_path: Path) -> None:
+    from mini_ork.web.db import StateDB
+    from mini_ork.web.routes.run_detail import get_llm_calls
+
+    db_path = tmp_path / "state.db"
+    now = 1_800_000_000
+    con = sqlite3.connect(db_path)
+    con.executescript(
+        """
+        CREATE TABLE task_runs (
+          id TEXT PRIMARY KEY,
+          trace_id TEXT,
+          created_at INTEGER NOT NULL,
+          ended_at INTEGER
+        );
+        CREATE TABLE llm_calls (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          provider TEXT NOT NULL,
+          model_id TEXT NOT NULL,
+          tier TEXT NOT NULL,
+          feature_name TEXT NOT NULL,
+          actor TEXT,
+          input_tokens INTEGER NOT NULL DEFAULT 0,
+          output_tokens INTEGER NOT NULL DEFAULT 0,
+          total_tokens INTEGER NOT NULL DEFAULT 0,
+          cost_usd REAL NOT NULL DEFAULT 0,
+          duration_ms INTEGER NOT NULL DEFAULT 0,
+          status TEXT NOT NULL CHECK (status IN ('success','failed')),
+          finish_reason TEXT,
+          traceparent TEXT,
+          ts TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+        );
+        """
+    )
+    con.execute(
+        "INSERT INTO task_runs(id, trace_id, created_at, ended_at) VALUES ('run-legacy', 'trace-legacy', ?, ?)",
+        (now - 10, now + 10),
+    )
+    con.execute(
+        """
+        INSERT INTO llm_calls (
+          provider, model_id, tier, feature_name, status,
+          input_tokens, output_tokens, total_tokens, cost_usd, traceparent, ts
+        ) VALUES (
+          'anthropic', 'claude-opus-4', 'default', 'mini-ork:planner', 'success',
+          100, 20, 120, 0.01, '00-trace-legacy-span-01', '2027-01-15T08:00:00.000Z'
+        )
+        """
+    )
+    con.commit()
+    con.close()
+
+    rows = get_llm_calls(task_run_id="run-legacy", db=StateDB(db_path))
+    assert len(rows) == 1
+    assert rows[0]["cached_input_tokens"] == 0
+
+
 def test_lane_fuse_trips_after_three_retryable_failures(tmp_path: Path) -> None:
     db_path = tmp_path / "state.db"
     con = sqlite3.connect(db_path)
