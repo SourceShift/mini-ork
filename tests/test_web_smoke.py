@@ -1084,6 +1084,24 @@ def test_llm_calls_route_tolerates_null_taxonomy_columns(tmp_path: Path) -> None
     assert rows[0]["feature_name"] == "mini-ork:reviewer"
 
 
+def test_profile_answerer_helper_exists() -> None:
+    helper = ROOT / "lib" / "profile_answerer.sh"
+    text = helper.read_text()
+
+    assert "mo_answer_profile_questions" in text
+    assert "llm_dispatch" in text
+    assert "--node-type \"profile_answerer\"" in text
+    assert "\"auto_answered\": True" in text
+
+
+def test_mini_ork_plan_references_auto_answer_env() -> None:
+    plan = (ROOT / "bin" / "mini-ork-plan").read_text()
+
+    assert "MO_AUTO_ANSWER_PROFILE" in plan
+    assert "profile_answerer.sh" in plan
+    assert "mo_answer_profile_questions" in plan
+
+
 # ── project switcher (GET /projects, POST /projects/switch) ─────────────────
 
 
