@@ -691,6 +691,12 @@ def get_llm_calls(
 
     out: list[dict[str, Any]] = []
     seen: set[int] = set()
+    llm_cols = {r["name"] for r in db.rows("PRAGMA table_info(llm_calls)")}
+    cached_input_expr = (
+        "cached_input_tokens"
+        if "cached_input_tokens" in llm_cols
+        else "0 AS cached_input_tokens"
+    )
 
     def _add(row: dict[str, Any], bridge: str) -> None:
         if row["id"] in seen:
@@ -703,9 +709,10 @@ def get_llm_calls(
     trace_id = tr.get("trace_id")
     if trace_id:
         for r in db.rows(
-            """
+            f"""
             SELECT id, provider, model_id, tier, feature_name, actor,
                    input_tokens, output_tokens, total_tokens, cost_usd,
+                   {cached_input_expr},
                    duration_ms, status, finish_reason, ts
             FROM llm_calls
             WHERE traceparent LIKE ?
@@ -719,9 +726,10 @@ def get_llm_calls(
     if tr.get("created_at"):
         upper = tr.get("ended_at") or int(__import__("time").time())
         for r in db.rows(
-            """
+            f"""
             SELECT id, provider, model_id, tier, feature_name, actor,
                    input_tokens, output_tokens, total_tokens, cost_usd,
+                   {cached_input_expr},
                    duration_ms, status, finish_reason, ts
             FROM llm_calls
             -- CAST is load-bearing: strftime returns TEXT, and TEXT BETWEEN
