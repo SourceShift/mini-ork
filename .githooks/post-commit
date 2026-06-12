@@ -1,0 +1,101 @@
+#!/usr/bin/env bash
+# .githooks/post-commit — file-reversion watchdog.
+#
+# Problem this solves: when a framework-edit (or other mini-ork) dispatch
+# is running concurrently with a user `git commit`, the dispatch's
+# implementer / verifier / publisher / rollback chain (or a subagent like
+# codex CLI doing its own sandbox cleanup) sometimes reverts the
+# just-committed files in the working tree back to a pre-commit state.
+# HEAD is intact, but the working tree files are deleted or reverted.
+#
+# Root-cause is still under investigation across at least 4 layers
+# (publisher cp logic, codex CLI sandbox cleanup, git-worktree-add side
+# effects from .mini-ork/worktrees/*, rollback node's keep_*_discard_*
+# semantics). Rather than gate on identifying the culprit, this hook
+# implements a defensive auto-recovery loop that:
+#
+# 1. Records the SHA + file list of the new commit at commit time.
+# 2. Spawns a detached watchdog that, for the next N seconds, polls the
+#    working tree.
+# 3. If any file from the commit is missing OR has content matching its
+#    HEAD~1 state (i.e. been "reverted" by a racing process), restores it
+#    from HEAD via `git checkout HEAD -- <file>` and logs the recovery.
+#
+# Escape hatches:
+#   MO_REVERSION_GUARD_DISABLED=1 git commit ...   → skip the hook
+#   MO_REVERSION_GUARD_WATCH_S=N                   → tune watch window (default 60s)
+#   MO_REVERSION_GUARD_POLL_S=N                    → tune poll interval (default 5s)
+#
+# The recovery log lives at .mini-ork/file-reversion-guard.log.
+# Each recovery is a tab-separated row:
+#   <iso-timestamp>\t<sha>\t<file>\t<recovered-from-sha>
+
+set -uo pipefail
+
+if [ "${MO_REVERSION_GUARD_DISABLED:-0}" = "1" ]; then
+  exit 0
+fi
+
+REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)"
+[ -z "$REPO_ROOT" ] && exit 0
+cd "$REPO_ROOT" || exit 0
+
+SHA="$(git rev-parse HEAD)"
+WATCH_S="${MO_REVERSION_GUARD_WATCH_S:-60}"
+POLL_S="${MO_REVERSION_GUARD_POLL_S:-5}"
+LOG="$REPO_ROOT/.mini-ork/file-reversion-guard.log"
+mkdir -p "$REPO_ROOT/.mini-ork"
+
+# Files this commit added or modified. Deletions in this commit are
+# intentional — don't re-add them.
+FILES="$(git diff-tree --no-commit-id --name-only --diff-filter=AM -r "$SHA" 2>/dev/null)"
+[ -z "$FILES" ] && exit 0
+
+# Spawn a detached watchdog. We use setsid + nohup to fully detach so the
+# commit shell can return immediately. The watchdog runs ENTIRELY in
+# this shell — no external scripts to install.
+(
+  # Detach from parent process group so the commit completes immediately.
+  trap '' HUP INT TERM
+  exec </dev/null >>"$LOG" 2>&1
+  END=$(( $(date +%s) + WATCH_S ))
+  while [ "$(date +%s)" -lt "$END" ]; do
+    sleep "$POLL_S"
+    while IFS= read -r f; do
+      [ -z "$f" ] && continue
+      if [ ! -f "$REPO_ROOT/$f" ]; then
+        # File deleted — restore from HEAD.
+        if git -C "$REPO_ROOT" checkout HEAD -- "$f" 2>/dev/null; then
+          printf '%s\t%s\t%s\trestored-deleted-from-%s\n' \
+            "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$SHA" "$f" "$SHA"
+        fi
+        continue
+      fi
+      # File present — check if content matches HEAD's blob.
+      head_blob="$(git -C "$REPO_ROOT" rev-parse "$SHA:$f" 2>/dev/null)"
+      [ -z "$head_blob" ] && continue
+      file_blob="$(git -C "$REPO_ROOT" hash-object "$REPO_ROOT/$f" 2>/dev/null)"
+      if [ -n "$file_blob" ] && [ "$file_blob" != "$head_blob" ]; then
+        # Working-tree content drifted from HEAD. Only restore if the
+        # drifted content matches a PARENT commit (i.e. someone reverted
+        # to an earlier state); otherwise it's a legitimate user edit
+        # and we leave it alone.
+        for parent_ref in "$SHA^" "$SHA^^" "$SHA^^^"; do
+          parent_blob="$(git -C "$REPO_ROOT" rev-parse "$parent_ref:$f" 2>/dev/null)" || continue
+          if [ "$file_blob" = "$parent_blob" ]; then
+            if git -C "$REPO_ROOT" checkout HEAD -- "$f" 2>/dev/null; then
+              parent_sha="$(git -C "$REPO_ROOT" rev-parse "$parent_ref" 2>/dev/null)"
+              printf '%s\t%s\t%s\trestored-reverted-to-%s\n' \
+                "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$SHA" "$f" "$parent_sha"
+            fi
+            break
+          fi
+        done
+      fi
+    done <<< "$FILES"
+  done
+) &
+
+# Disown so the watchdog survives shell exit.
+disown $! 2>/dev/null || true
+exit 0
