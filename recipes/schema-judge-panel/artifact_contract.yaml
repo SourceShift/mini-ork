@@ -1,0 +1,12 @@
+task_class: schema_judge_panel
+expected_artifact: composite
+success_verifiers:
+  - verifiers/panel-completeness.sh
+failure_policy: request_changes
+rollback_policy: >
+  Keep all five judge reports under runs/<id>/judge-*.md for human inspection.
+  Discard synthesis if verification fails.
+
+source_artifact: synthesis.md
+outputs:
+  - docs/_meta/handoffs/schema-judge-panel-synthesis-latest.md

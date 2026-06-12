@@ -1111,8 +1111,29 @@ _dispatch_node() {
       # lens-*.md files, write markdown not JSON. Heuristic: node_id ending
       # in `_lens` or `-lens` → output as lens-<short>.md (matching the
       # recipe's verifier glob). Otherwise default JSON context shape.
+      #
+      # schema-judge-panel is intentionally judge-report shaped rather than
+      # generic lens shaped: its prompts, synthesizer, verifier, and artifact
+      # contract all require judge-*.md files. Keep this recipe-specific map
+      # ahead of the generic _lens fallback so reruns do not strand valid
+      # reports under lens-*.md where the verifier cannot find them.
       local _norm_id="${node_id%_lens}"; _norm_id="${_norm_id%-lens}"
-      if [[ "$node_id" == *_lens || "$node_id" == *-lens ]]; then
+      if [ "${MINI_ORK_RECIPE:-}" = "schema-judge-panel" ]; then
+        case "$node_id" in
+          opus_scalability_lens) CONTEXT_FILE="$RUN_DIR/judge-opus-scalability.md" ;;
+          opus_llm_safety_lens) CONTEXT_FILE="$RUN_DIR/judge-opus-llm-safety.md" ;;
+          kimi_correctness_lens) CONTEXT_FILE="$RUN_DIR/judge-kimi-correctness.md" ;;
+          codex_codebase_lens) CONTEXT_FILE="$RUN_DIR/judge-codex-codebase.md" ;;
+          minimax_perf_lens) CONTEXT_FILE="$RUN_DIR/judge-minimax-performance.md" ;;
+          *)
+            if [[ "$node_id" == *_lens || "$node_id" == *-lens ]]; then
+              CONTEXT_FILE="$RUN_DIR/lens-${_norm_id}.md"
+            else
+              CONTEXT_FILE="$RUN_DIR/context-${node_id}.json"
+            fi
+            ;;
+        esac
+      elif [[ "$node_id" == *_lens || "$node_id" == *-lens ]]; then
         CONTEXT_FILE="$RUN_DIR/lens-${_norm_id}.md"
       else
         CONTEXT_FILE="$RUN_DIR/context-${node_id}.json"
