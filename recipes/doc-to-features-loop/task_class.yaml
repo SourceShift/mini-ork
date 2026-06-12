@@ -1,0 +1,47 @@
+name: doc_to_features_loop
+task_class: doc_to_features_loop
+version: "0.2.0"
+description: >
+  Extract all surface and deep features from a markdown doc, rank them, dispatch
+  each P0 feature through recursive-validate-impl, and use reflector/replanner
+  feedback to converge on a verified implementation queue.
+
+artifact_contract_ref: artifact_contract.yaml
+default_workflow: workflow.yaml
+
+matches:
+  keywords:
+    - doc to features
+    - feature extraction loop
+    - business doc implementation
+    - recursive feature dispatch
+    - markdown product spec
+    - arxiv-libwit
+    - modern techniques
+  regex:
+    - "Source doc:"
+    - "feature index"
+    - "recursive-validate-impl"
+  path_globs:
+    - "recipes/doc-to-features-loop/**"
+
+default_gates:
+  - budget_gate
+  - scope_gate
+
+risk_class: high
+max_parallel_runs: 1
+budget_cap_usd: 100
+tags:
+  - recursive
+  - feature-extraction
+  - implementation
+  - arxiv-libwit
+
+heterogeneity:
+  feature_extractors:
+    lanes:
+      - codex_lens
+      - kimi_lens
+      - glm_lens
+      - minimax_lens

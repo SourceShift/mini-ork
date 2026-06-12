@@ -1,0 +1,28 @@
+task_class: doc_to_features_loop
+expected_artifact: composite
+
+success_verifiers:
+  - verifiers/extraction-completeness.sh
+  - verifiers/arxiv-compliance-check.sh
+  - verifiers/per-feature-dispatch-results.sh
+
+failure_policy: keep_failure_evidence_replan_or_escalate
+rollback_policy: >
+  Keep the feature index, child dispatch records, aggregate verdict,
+  reflector output, and replan artifact for operator review. Discard only
+  unsafe child patches produced by failed recursive-validate-impl runs.
+
+source_artifact: feature-index.json
+outputs:
+  - path: "${MINI_ORK_RUN_DIR}/feature-index.json"
+    mime: application/json
+    description: "Ranked feature list with dependencies, priority, effort, value, and modern_techniques_refs."
+  - path: "${MINI_ORK_RUN_DIR}/aggregate-verdict.json"
+    mime: application/json
+    description: "Aggregate child verdicts with shape {total, passed, failed, pending, pass_rate, features[]}."
+  - path: "${MINI_ORK_RUN_DIR}/reflector.json"
+    mime: application/json
+    description: "Strict JSON failure pattern and plan mutation for the next loop iteration."
+  - path: "${MINI_ORK_RUN_DIR}/replan.json"
+    mime: application/json
+    description: "Mutated backlog after reflector feedback."

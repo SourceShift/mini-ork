@@ -1,0 +1,57 @@
+version: "0.2.0"
+task_class: doc_to_features_loop
+description: >
+  Outer self-improving loop. Takes a markdown doc, extracts surface and deep
+  features, ranks P0/P1/P2 work, dispatches P0 features through
+  recursive-validate-impl, then reflects and replans on failed child verdicts.
+  Hard-caps at convergence, max iterations, or total budget.
+
+nodes:
+  - { name: planner, type: planner, model_lane: planner, prompt_ref: null, dispatch_mode: serial, gates: [budget_gate] }
+  - { name: feature_extractor_codex, type: researcher, model_lane: codex_lens, prompt_ref: prompts/feature-extractor-surface.md, dispatch_mode: parallel, gates: [budget_gate] }
+  - { name: feature_extractor_kimi, type: researcher, model_lane: kimi_lens, prompt_ref: prompts/feature-extractor-deep.md, dispatch_mode: parallel, gates: [budget_gate] }
+  - { name: feature_extractor_glm, type: researcher, model_lane: glm_lens, prompt_ref: prompts/feature-extractor-deep.md, dispatch_mode: parallel, gates: [budget_gate] }
+  - { name: feature_extractor_minimax, type: researcher, model_lane: minimax_lens, prompt_ref: prompts/feature-extractor-surface.md, dispatch_mode: parallel, gates: [budget_gate] }
+  - { name: feature_synthesizer, type: reviewer, model_lane: codex_lens, prompt_ref: prompts/feature-synthesizer.md, dispatch_mode: serial, gates: [budget_gate] }
+  - { name: feature_prioritizer, type: planner, model_lane: planner, prompt_ref: prompts/feature-prioritizer.md, dispatch_mode: serial, gates: [budget_gate] }
+  - { name: extraction_completeness, type: verifier, verifier_ref: verifiers/extraction-completeness.sh, dispatch_mode: serial }
+  - { name: arxiv_compliance, type: verifier, verifier_ref: verifiers/arxiv-compliance-check.sh, dispatch_mode: serial }
+  - { name: per_feature_dispatcher, type: implementer, model_lane: codex_lens, prompt_ref: prompts/per-feature-dispatcher.md, dispatch_mode: serial, gates: [budget_gate, scope_gate] }
+  - { name: dispatch_aggregator, type: verifier, verifier_ref: verifiers/per-feature-dispatch-results.sh, dispatch_mode: serial }
+  - { name: reflector, type: reflector, model_lane: reflector, prompt_ref: prompts/reflector.md, dispatch_mode: serial, gates: [budget_gate] }
+  - { name: replanner, type: planner, model_lane: planner, prompt_ref: prompts/replanner.md, dispatch_mode: serial, gates: [budget_gate] }
+  - { name: publisher, type: publisher, prompt_ref: null, dispatch_mode: serial, gates: [scope_gate] }
+  - { name: rollback, type: rollback, prompt_ref: null, dispatch_mode: serial }
+
+edges:
+  - { from: planner, to: feature_extractor_codex, edge_type: depends_on }
+  - { from: planner, to: feature_extractor_kimi, edge_type: depends_on }
+  - { from: planner, to: feature_extractor_glm, edge_type: depends_on }
+  - { from: planner, to: feature_extractor_minimax, edge_type: depends_on }
+  - { from: feature_extractor_codex, to: feature_synthesizer, edge_type: supplies_context_to }
+  - { from: feature_extractor_kimi, to: feature_synthesizer, edge_type: supplies_context_to }
+  - { from: feature_extractor_glm, to: feature_synthesizer, edge_type: supplies_context_to }
+  - { from: feature_extractor_minimax, to: feature_synthesizer, edge_type: supplies_context_to }
+  - { from: feature_synthesizer, to: feature_prioritizer, edge_type: depends_on }
+  - { from: feature_prioritizer, to: extraction_completeness, edge_type: verifies }
+  - { from: extraction_completeness, to: arxiv_compliance, edge_type: depends_on, condition: pass }
+  - { from: extraction_completeness, to: reflector, edge_type: escalates_to, condition: fail }
+  - { from: arxiv_compliance, to: per_feature_dispatcher, edge_type: depends_on, condition: pass }
+  - { from: arxiv_compliance, to: reflector, edge_type: escalates_to, condition: fail }
+  - { from: per_feature_dispatcher, to: dispatch_aggregator, edge_type: verifies }
+  - { from: dispatch_aggregator, to: publisher, edge_type: depends_on, condition: pass }
+  - { from: dispatch_aggregator, to: reflector, edge_type: escalates_to, condition: fail }
+  - { from: reflector, to: replanner, edge_type: depends_on }
+  - { from: replanner, to: feature_extractor_codex, edge_type: depends_on, recursive: true }
+
+recursion:
+  max_iterations: 8
+  convergence_check: all_p0_features_passed
+  budget_cap_per_iter_usd: 15.00
+  budget_cap_total_usd: 100.00
+  divergence_kill: |
+    If iteration N's failed-features set is a superset of iteration N-1's set,
+    escalate to an operator. Detect by hashing sorted failed feature IDs and
+    stopping when the hash repeats for two consecutive iterations.
+
+rollback_strategy: keep_partial_pass_discard_failed_iter
