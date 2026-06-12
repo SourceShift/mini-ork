@@ -1,0 +1,33 @@
+name: schema_judge_panel
+version: "0.1.0"
+description: >
+  Five-lens read-only judge panel for database/codebase architecture plans.
+  The panel runs two Opus lenses plus Kimi, Codex, and MiniMax.
+  Each judge must discover first, then critique, then propose a migration plan.
+
+matches:
+  keywords:
+    - schema judge panel
+    - database judge panel
+    - migration judges
+    - architecture judges
+    - schema migration review
+    - scalability migration review
+  regex: []
+
+artifact_contract_ref: artifact_contract.yaml
+default_workflow: workflow.yaml
+
+default_gates:
+  - budget_gate
+
+risk_class: low
+
+cost_model:
+  min_usd: 5
+  max_usd: 80
+  per_lens_usd: 8
+
+runtime_model:
+  min_minutes: 15
+  max_minutes: 90
