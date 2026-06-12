@@ -1,0 +1,40 @@
+task_class: recursive_validate_impl
+expected_artifact: composite
+
+success_verifiers:
+  - verifiers/tier1-compile-typecheck.sh
+  - verifiers/tier2-scoped-unit.sh
+  - verifiers/tier3-property-mutation.sh
+
+failure_policy: keep_failure_evidence_replan_or_escalate
+rollback_policy: >
+  Keep implementer summaries, tier evidence, panel reports, reflector output,
+  and replan artifacts for operator review. Discard only the failed iteration's
+  unsafe patch when rollback fires.
+
+source_artifact: implementer-summary.json
+outputs:
+  - path: "${MINI_ORK_RUN_DIR}/implementer-summary.json"
+    mime: application/json
+    description: "Implementation summary with mandatory touched_files[] consumed by verifiers."
+  - path: "${MINI_ORK_RUN_DIR}/tier1-evidence.log"
+    mime: text/plain
+    description: "Compile, typecheck, and lint evidence for touched files."
+  - path: "${MINI_ORK_RUN_DIR}/tier2-evidence.log"
+    mime: text/plain
+    description: "Scoped unit-test evidence discovered near touched files."
+  - path: "${MINI_ORK_RUN_DIR}/tier3-evidence.log"
+    mime: text/plain
+    description: "Property-based and mutation-testing evidence when tooling exists."
+  - path: "${MINI_ORK_RUN_DIR}/tier4-{family}.md"
+    mime: text/markdown
+    description: "One heterogeneous panel report per family: codex, kimi, minimax, and glm."
+  - path: "${MINI_ORK_RUN_DIR}/reflector.json"
+    mime: application/json
+    description: "Strict JSON failure pattern, general lesson, and plan mutation."
+  - path: "${MINI_ORK_RUN_DIR}/replan.json"
+    mime: application/json
+    description: "Mutated plan generated from reflector.json and the previous plan."
+  - path: "${MINI_ORK_RUN_DIR}/panel-verdict.json"
+    mime: application/json
+    description: "Merged tier-4 approval, request-changes, or escalation decision."
