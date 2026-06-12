@@ -1,0 +1,75 @@
+version: "0.1.0"
+task_class: epic_runner_delivery
+description: >
+  Multi-epic delivery orchestrator. Ingests a single markdown doc describing an
+  acyclic graph of epics, walks the graph in topological waves, dispatches each
+  epic as a child framework-edit run, aggregates per-epic verdicts, and emits
+  one gated delivery report. The dispatcher↔aggregator loop is emulated inside
+  the dispatcher node via internal polling so the workflow DAG stays acyclic.
+
+nodes:
+  - name: planner
+    type: planner
+    model_lane: planner
+    prompt_ref: prompts/planner.md
+    dispatch_mode: serial
+
+  - name: epic_dispatcher
+    type: implementer
+    model_lane: codex_lens
+    prompt_ref: prompts/epic-dispatcher.md
+    dispatch_mode: serial
+    gates: [budget_gate, scope_gate]
+
+  - name: wave_aggregator
+    type: implementer
+    model_lane: glm_lens
+    prompt_ref: prompts/wave-aggregator.md
+    dispatch_mode: serial
+    gates: [budget_gate]
+
+  - name: epic_verifier
+    type: verifier
+    model_lane: verifier
+    prompt_ref: prompts/epic-verifier.md
+    verifier_ref: verifiers/epic-graph-complete.sh
+    dispatch_mode: serial
+
+  - name: final_reviewer
+    type: reviewer
+    model_lane: opus_lens
+    prompt_ref: prompts/final-reviewer.md
+    dispatch_mode: serial
+    gates: [budget_gate]
+
+  - name: publisher
+    type: publisher
+    model_lane: publisher
+    prompt_ref: null
+    dispatch_mode: serial
+
+  - name: rollback
+    type: rollback
+    model_lane: rollback
+    prompt_ref: null
+    dispatch_mode: serial
+
+  - name: reflector
+    type: reflector
+    model_lane: reflector
+    prompt_ref: prompts/reflector.md
+    dispatch_mode: serial
+
+edges:
+  - { from: planner,          to: epic_dispatcher,   edge_type: depends_on }
+  - { from: planner,          to: wave_aggregator,   edge_type: depends_on }
+  - { from: epic_dispatcher,  to: wave_aggregator,   edge_type: supplies_context_to }
+  - { from: wave_aggregator,  to: epic_verifier,     edge_type: verifies }
+  - { from: epic_verifier,    to: final_reviewer,    edge_type: depends_on }
+  - { from: final_reviewer,   to: publisher,         edge_type: depends_on }
+  - { from: final_reviewer,   to: rollback,          edge_type: escalates_to }
+  - { from: epic_verifier,    to: rollback,          edge_type: escalates_to }
+
+rollback_strategy: keep_run_artifacts_discard_partial_publish
+max_self_correction_iterations: 0
+source_artifact: epic-runner-delivery.json

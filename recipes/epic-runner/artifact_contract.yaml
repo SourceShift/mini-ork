@@ -1,0 +1,61 @@
+task_class: epic_runner_delivery
+expected_artifact: composite
+description: >
+  Composite delivery artifact for the epic-runner recipe. The recipe consumes a
+  single multi-epic markdown document and emits a structured delivery report.
+  Because the recipe is meta-level, the canonical outputs[] list is deliberately
+  empty in smoke-shape mode; real runs populate outputs with the delivery report.
+
+source_artifact: "${MINI_ORK_RUN_DIR}/epic-runner-delivery.json"
+
+required_artifacts:
+  - "${MINI_ORK_RUN_DIR}/epic-runner-delivery.json"
+  - "${MINI_ORK_RUN_DIR}/epic-runner-plan.json"
+
+verdict_schema:
+  required_keys:
+    pass: boolean
+    epics_total: integer
+    epics_passed: integer
+    waves_total: integer
+    final_artifact_ref: string
+  rule: "pass == (epics_total > 0 && epics_passed == epics_total)"
+
+success_verifiers:
+  - verifiers/epic-graph-complete.sh
+
+failure_policy: request_changes
+rollback_policy: >
+  Keep run-local artifacts (delivery.json, plan.json, per-epic child run traces,
+  verifier logs) in ${MINI_ORK_RUN_DIR}. If any partial publish occurred in the
+  target repo, revert the recipes/epic-runner/ tree to its pre-run state. Do not
+  touch child epic target repositories beyond the requested publish scope.
+
+publish_modes:
+  smoke_shape:
+    description: >
+      Structural recipe checks only. outputs: [] so the publisher takes the
+      no-commit path while verifiers still confirm recipe shape.
+    outputs: []
+  real_publish:
+    description: >
+      A live epic-runner delivery. Outputs the aggregate delivery report and
+      plan JSON to the run directory. Child framework-edit runs may modify their
+      own target repos according to their own contracts.
+    outputs:
+      - "${MINI_ORK_RUN_DIR}/epic-runner-delivery.json"
+      - "${MINI_ORK_RUN_DIR}/epic-runner-plan.json"
+
+# Meta-level recipe: canonical outputs are deliberately empty unless the kickoff
+# explicitly opts into real_publish.
+outputs: []
+
+artifact_path_template: ".mini-ork/runs/{run_id}/epic-runner"
+max_size_bytes: 1048576
+retention_days: 30
+tags:
+  - epic
+  - multi-epic
+  - orchestration
+  - framework-edit
+  - dependency-graph
