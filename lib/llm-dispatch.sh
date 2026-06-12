@@ -210,9 +210,11 @@ _mo_llm_write_llm_calls_row() {
   #   6=status   7=duration_ms 8=cost_usd 9=error_message
   #   10=input_tokens (optional) 11=output_tokens (optional)
   #   12=metadata_json (optional) — per-turn extras like turn_index, session_id
+  #   13=cached_input_tokens (optional) 14=cache_creation_input_tokens (optional)
   local provider="$1" model_id="$2" tier="$3" feature_name="$4"
   local actor="$5" status="$6" duration_ms="$7" cost_usd="$8" error_message="$9"
   local input_tokens="${10:-0}" output_tokens="${11:-0}" metadata_json="${12:-{\}}"
+  local cached_input_tokens="${13:-0}" cache_creation_input_tokens="${14:-0}"
   local error_category="" retryable=""
   if [ "$status" = "failed" ]; then
     error_category=$(_mo_llm_classify_error "$error_message" "${MO_LLM_LAST_RC:-}")
@@ -256,7 +258,7 @@ print(json.dumps(d))' "$metadata_json")
   python3 - "$MINI_ORK_DB" "$provider" "$model_id" "$tier" "$feature_name" \
     "$actor" "$status" "$duration_ms" "$cost_usd" "$error_message" \
     "$iter" "$run_id" "$traceparent" "$input_tokens" "$output_tokens" "$metadata_json" \
-    "$error_category" "$retryable" \
+    "$cached_input_tokens" "$cache_creation_input_tokens" "$error_category" "$retryable" \
     <<'PY' 2>>"${err_dir}/trace-write-errors.log" || true
 import sqlite3
 import sys
@@ -266,8 +268,14 @@ con = sqlite3.connect(db, timeout=5)
 con.execute("PRAGMA busy_timeout=5000")
 in_tok = int(args[12] or 0)
 out_tok = int(args[13] or 0)
-error_category = args[15] or None
-retryable = int(args[16]) if args[16] != "" else None
+cached_in = int(args[15] or 0)
+cache_create = int(args[16] or 0)
+uncached_in = max(in_tok - cached_in - cache_create, 0)
+cost_input_uncached = uncached_in * 15.0 / 1_000_000
+cost_input_cached = cached_in * 1.5 / 1_000_000
+cost_cache_write = cache_create * 18.75 / 1_000_000
+error_category = args[17] or None
+retryable = int(args[18]) if args[18] != "" else None
 import json as _json
 try:
     _md = _json.loads(args[14] or "{}")
@@ -294,6 +302,21 @@ if "error_category" in cols:
 if "retryable" in cols:
     insert_cols.append("retryable")
     values.append(retryable)
+if "cached_input_tokens" in cols:
+    insert_cols.append("cached_input_tokens")
+    values.append(cached_in)
+if "cache_creation_input_tokens" in cols:
+    insert_cols.append("cache_creation_input_tokens")
+    values.append(cache_create)
+if "cost_input_uncached_usd" in cols:
+    insert_cols.append("cost_input_uncached_usd")
+    values.append(cost_input_uncached)
+if "cost_input_cached_usd" in cols:
+    insert_cols.append("cost_input_cached_usd")
+    values.append(cost_input_cached)
+if "cost_cache_write_usd" in cols:
+    insert_cols.append("cost_cache_write_usd")
+    values.append(cost_cache_write)
 placeholders = ",".join("?" for _ in insert_cols)
 con.execute(
     f"INSERT INTO llm_calls ({', '.join(insert_cols)}) VALUES ({placeholders})",
@@ -794,6 +817,8 @@ session_id = None
 turns = []  # per-assistant-message usage; one row per real API turn
 total_input_tokens = 0
 total_output_tokens = 0
+total_cache_read_input_tokens = 0
+total_cache_creation_input_tokens = 0
 # Set True when totals get sourced from the result envelope's usage block
 # (the only field the CLI populates accurately). Default False = totals
 # are summed from possibly-stub per-turn values and should be treated as
@@ -829,6 +854,8 @@ try:
                 if u:
                     total_input_tokens = int(u.get('input_tokens') or 0)
                     total_output_tokens = int(u.get('output_tokens') or 0)
+                    total_cache_read_input_tokens = int(u.get('cache_read_input_tokens') or 0)
+                    total_cache_creation_input_tokens = int(u.get('cache_creation_input_tokens') or 0)
                     usage_authoritative = True
             elif et == 'system' and obj.get('subtype') == 'init':
                 session_id = obj.get('session_id', session_id)
@@ -949,7 +976,7 @@ with open(out_path + '.cost', 'w') as f:
     f.write(f"{total_cost_usd}\n")
 # Token totals sidecar (TAB-separated: input\toutput)
 with open(out_path + '.tokens', 'w') as f:
-    f.write(f"{total_input_tokens}\t{total_output_tokens}\n")
+    f.write(f"{total_input_tokens}\t{total_output_tokens}\t{total_cache_read_input_tokens}\t{total_cache_creation_input_tokens}\n")
 # Per-turn telemetry — one JSONL line per assistant message with usage.
 # Consumed by lib/llm-dispatch.sh:llm_dispatch shim to emit one llm_calls row
 # per real API turn instead of one summary per agent envelope.
@@ -978,8 +1005,8 @@ if not turns and result_text:
         'output_tokens': total_output_tokens,
         'text': result_text,
         'tool_uses': [],
-        'cache_read_input_tokens': 0,
-        'cache_creation_input_tokens': 0,
+        'cache_read_input_tokens': total_cache_read_input_tokens,
+        'cache_creation_input_tokens': total_cache_creation_input_tokens,
         'stop_reason': None,
         'session_id': session_id,
     })
@@ -1061,7 +1088,7 @@ PY
       jq -r '.total_cost_usd // 0' "$_raw_out" > "${out_file}.cost" 2>/dev/null || true
       # Token totals from the JSON envelope's usage block (Anthropic CLI emits
       # them on the top-level result object in non-streaming mode).
-      jq -r '"\(.usage.input_tokens // 0)\t\(.usage.output_tokens // 0)"' \
+      jq -r '"\(.usage.input_tokens // 0)\t\(.usage.output_tokens // 0)\t\(.usage.cache_read_input_tokens // 0)\t\(.usage.cache_creation_input_tokens // 0)"' \
         "$_raw_out" > "${out_file}.tokens" 2>/dev/null || true
       rm -f "$_raw_out"
       _mo_llm_strip_protocol_blocks "$out_file"
@@ -1249,10 +1276,11 @@ PY
       _cost_usd=$(cat "${out_file}.cost" 2>/dev/null || printf '0')
     fi
     # Token totals from sidecar (claude --output-format json emits .usage)
-    local _in_tok=0 _out_tok=0
+    local _in_tok=0 _out_tok=0 _cached_in_tok=0 _cache_create_tok=0
     if [ -f "${out_file}.tokens" ]; then
-      IFS=$'\t' read -r _in_tok _out_tok < "${out_file}.tokens" 2>/dev/null || true
+      IFS=$'\t' read -r _in_tok _out_tok _cached_in_tok _cache_create_tok < "${out_file}.tokens" 2>/dev/null || true
       _in_tok="${_in_tok:-0}"; _out_tok="${_out_tok:-0}"
+      _cached_in_tok="${_cached_in_tok:-0}"; _cache_create_tok="${_cache_create_tok:-0}"
     fi
 
     # Per-turn emission: when stream-json captured per-assistant-message usage,
@@ -1310,6 +1338,12 @@ for t in turns:
     # Cost split proportionally by output_tokens (output dominates cost)
     out_tok = int(t.get('output_tokens') or 0)
     in_tok = int(t.get('input_tokens') or 0)
+    cached_in = int(t.get('cache_read_input_tokens') or 0)
+    cache_create = int(t.get('cache_creation_input_tokens') or 0)
+    uncached_in = max(in_tok - cached_in - cache_create, 0)
+    cost_input_uncached = uncached_in * 15.0 / 1_000_000
+    cost_input_cached = cached_in * 1.5 / 1_000_000
+    cost_cache_write = cache_create * 18.75 / 1_000_000
     share = (out_tok / total_out) if total_out else 0
     cost_share = cost_total_f * share
     meta = json.dumps({
@@ -1349,6 +1383,21 @@ for t in turns:
     if "retryable" in cols:
         insert_cols.append("retryable")
         values.append(None)
+    if "cached_input_tokens" in cols:
+        insert_cols.append("cached_input_tokens")
+        values.append(cached_in)
+    if "cache_creation_input_tokens" in cols:
+        insert_cols.append("cache_creation_input_tokens")
+        values.append(cache_create)
+    if "cost_input_uncached_usd" in cols:
+        insert_cols.append("cost_input_uncached_usd")
+        values.append(cost_input_uncached)
+    if "cost_input_cached_usd" in cols:
+        insert_cols.append("cost_input_cached_usd")
+        values.append(cost_input_cached)
+    if "cost_cache_write_usd" in cols:
+        insert_cols.append("cost_cache_write_usd")
+        values.append(cost_cache_write)
     placeholders = ",".join("?" for _ in insert_cols)
     con.execute(
         f"INSERT INTO llm_calls ({', '.join(insert_cols)}) VALUES ({placeholders})",
@@ -1362,7 +1411,7 @@ PY
         "$_provider" "$model" "${MO_LANE_TIER:-default}" \
         "$_feature" "$_actor" \
         "success" "$_duration_ms" "$_cost_usd" "" \
-        "$_in_tok" "$_out_tok" "{}"
+        "$_in_tok" "$_out_tok" "{}" "$_cached_in_tok" "$_cache_create_tok"
     fi
     rm -f "${out_file}.tokens" "${out_file}.turns.jsonl" 2>/dev/null || true
     # v0.2-pt8 (D-04 wiring): expose .cost sidecar to caller via well-known
