@@ -1,0 +1,41 @@
+name: epic_runner_delivery
+version: "0.1.0"
+description: >
+  Orchestrates delivery of a multi-epic plan. Reads an epic dependency graph,
+  schedules waves, dispatches child framework-edit runs, and aggregates their
+  verdicts into a single delivery report.
+
+matches:
+  keywords:
+    - deliver epic
+    - multi-epic
+    - epic runner
+    - epic doc
+    - epic graph
+    - schema migration
+    - wave dispatch
+    - epic dependency graph
+    - epic-runner
+    - multi-epic delivery
+  regex:
+    - "deliver\\s+(multiple|multi)\\s+epics"
+    - "epic\\s+(runner|orchestrat|dispatch|graph|wave)"
+    - "multi-epic\\s+(delivery|run|doc)"
+
+artifact_contract_ref: artifact_contract.yaml
+default_workflow: workflow.yaml
+
+default_gates:
+  - budget_gate
+  - scope_gate
+
+risk_class: high
+
+cost_model:
+  min_usd: 5
+  max_usd: 50
+  per_epic_usd: 3
+
+runtime_model:
+  min_minutes: 10
+  max_minutes: 90
