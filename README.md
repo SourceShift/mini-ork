@@ -314,7 +314,7 @@ The framework ships the universal loop and its primitives. Nothing in `lib/` or 
 
 ### RECIPES — opinions live here
 
-Recipes are user-land workflow definitions. They compose framework primitives into pipeline shapes. 20 recipes ship today; 8 of them dispatch a 4–5 lens panel across distinct model families per cycle, using family diversity as a practical proxy for the low-correlation detector patterns highlighted by Rajan 2025.
+Recipes are user-land workflow definitions. They compose framework primitives into pipeline shapes. 21 recipes ship today; 8 of them dispatch a 4–5 lens panel across distinct model families per cycle, using family diversity as a practical proxy for the low-correlation detector patterns highlighted by Rajan 2025.
 
 | Recipe | Location | Shape |
 |---|---|---|
@@ -338,6 +338,7 @@ Recipes are user-land workflow definitions. They compose framework primitives in
 | `bug-audit-cmgk` | `recipes/bug-audit-cmgk/` | Refactor-audit variant tuned for bug enumeration with file:line anchors and severity tiers. 4 distinct family lenses → synthesis. |
 | `chapter-review` | `recipes/chapter-review/` | Multi-axis panel review of a book chapter by 4 heterogeneous LLM lenses. Produces a structured `chapter-review.json` with 9 axis scores. |
 | `researcher-qdrant-contract` | `recipes/researcher-qdrant-contract/` | PG/Qdrant indexing and retrieval contract remediation. Maps every content creation path to its canonical sync point. |
+| `schema-judge-panel` | `recipes/schema-judge-panel/` | Five-lens read-only judge panel for database/codebase architecture plans. Two Opus lenses plus Kimi, Codex, MiniMax. Each judge discovers, critiques, then proposes a migration plan. |
 
 Add your own under `recipes/<name>/` — see [docs/EXTENSION.md](docs/EXTENSION.md).
 
@@ -385,7 +386,7 @@ The full release log lives in [`ROADMAP.md`](ROADMAP.md) — every section dated
 - 1 runner-shared helper in `bin/lib/` (`profile-seed.sh` — deterministic `run_profile.json` seeding from structured kickoff markdown, added 2026-06-09)
 - 17 user-facing `bin/mini-ork*` entrypoints
 - 23 schema migrations under `db/migrations/` (memory namespaces, benchmarks, evolution, safety, panel topology telemetry, recursive orchestration, self-improvement learning, llm_calls session indexing, trace status widening, Arbor-style idea_tree primitive, error taxonomy + finish reasons, dispatch config snapshot, heartbeat + fuse)
-- 20 recipes shipped — see Recipes table above
+- 21 recipes shipped — see Recipes table above
 - 7 model-family providers under `lib/providers/` + BYO-key registry (`config/providers.yaml` via `lib/providers/registry.sh`) for custom Anthropic/OpenAI-compatible endpoints
 
 Next-up work tracks (see [`ROADMAP.md`](ROADMAP.md) for detail):
