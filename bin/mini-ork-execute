@@ -365,7 +365,7 @@ fi
 # Falls back to plan.json.decomposition[] only when no workflow.yaml is set
 # (e.g. ad-hoc runs without a recipe).
 # Emit format with ASCII unit separator fields:
-#   <node_id><US><node_type><US><description><US><prompt_ref><US><dispatch_mode><US><verifier_ref><US><model_lane>
+#   <node_id><US><node_type><US><description><US><prompt_ref><US><dispatch_mode><US><verifier_ref><US><model_lane><US><requires_capabilities_csv>
 #
 # Do NOT use tab here. In bash, tab is whitespace IFS, so consecutive tabs
 # collapse and empty fields like verifier_ref shift model_lane into the wrong
@@ -386,6 +386,8 @@ if [ -n "${WORKFLOW:-}" ] && [ -f "${WORKFLOW:-}" ]; then
   # family through config/agents.yaml. Without this, every researcher node
   # collapsed to lanes.researcher even when workflow.yaml declared glm_lens,
   # kimi_lens, codex_lens, or minimax_lens.
+  # Phase 2.7: emit requires_capabilities as 8th field so dispatch can reject
+  # impossible lane assignments before spending tokens.
   mapfile -t NODE_IDS < <(python3 - "$WORKFLOW" <<'PY'
 import sys, yaml
 with open(sys.argv[1]) as f:
@@ -398,6 +400,11 @@ for n in wf.get("nodes", []) or []:
     dmode = n.get("dispatch_mode", "") or "serial"
     vref = n.get("verifier_ref", "") or ""
     mlane = n.get("model_lane", "") or typ
+    requires = n.get("requires_capabilities", []) or []
+    if isinstance(requires, str):
+        requires_csv = requires
+    else:
+        requires_csv = ",".join(str(x) for x in requires)
     if not name or not typ:
         continue
     sep = "\x1f"
@@ -406,7 +413,8 @@ for n in wf.get("nodes", []) or []:
     pref = pref.replace(sep, " ")
     vref = vref.replace(sep, " ")
     mlane = mlane.replace(sep, " ")
-    print(sep.join([name, typ, desc, pref, dmode, vref, mlane]))
+    requires_csv = requires_csv.replace(sep, " ")
+    print(sep.join([name, typ, desc, pref, dmode, vref, mlane, requires_csv]))
 PY
   )
 else
@@ -422,7 +430,7 @@ for step in p.get("decomposition", []):
         continue
     sep = "\x1f"
     desc = (step.get('description','') or '').replace(sep, " ")
-    print(sep.join([nid, ntyp, desc, "", "serial", "", ntyp]))
+    print(sep.join([nid, ntyp, desc, "", "serial", "", ntyp, ""]))
 PY
   )
 fi
@@ -968,7 +976,7 @@ _mo_stop_node_heartbeat_loop() {
 }
 
 _dispatch_node() {
-  local node_id="$1" node_type="$2" node_desc="$3" node_prompt_ref="${4:-}" node_verifier_ref="${5:-}" node_model_lane="${6:-}"
+  local node_id="$1" node_type="$2" node_desc="$3" node_prompt_ref="${4:-}" node_verifier_ref="${5:-}" node_model_lane="${6:-}" node_requires_capabilities="${7:-}"
   local dispatch_lane="${node_model_lane:-$node_type}"
   local workflow_lane="$dispatch_lane"
   dispatch_lane="$(_mo_policy_route_lane "$node_type" "$dispatch_lane")"
@@ -1035,6 +1043,18 @@ _dispatch_node() {
   VERDICT=""; CONTEXT_FILE=""; IMPL_LOG=""; REVIEW_FILE=""; MO_NODE_FINISH_REASON=""
   local _heartbeat_pid=""
   local _watchdog_hit=""
+
+  if [ -n "$node_requires_capabilities" ]; then
+    _mo_source "$MINI_ORK_ROOT/lib/lane-helpers.sh"
+    export MO_LANE_REQUIRES_CAPABILITY="$node_requires_capabilities"
+    if ! mo_assert_lane_capability "$dispatch_lane"; then
+      MO_NODE_FINISH_REASON="config"
+      FAIL_COUNT=$((${FAIL_COUNT:-0} + 1))
+      echo "  [config] lane=${dispatch_lane} missing required capability for node_id=${node_id}: ${node_requires_capabilities}" >&2
+      return 1
+    fi
+    unset MO_LANE_REQUIRES_CAPABILITY
+  fi
 
   if [[ "$node_type" == "researcher" || "$node_type" == "implementer" || "$node_type" == "reviewer" ]]; then
     _watchdog_hit="$(_mo_watchdog_check_stale_heartbeats "$_mo_run_id" 2>/dev/null || true)"
@@ -1718,9 +1738,9 @@ case "$DISPATCH_MODE" in
     # Global override → all in parallel (legacy behavior)
     PIDS=()
     for entry in "${NODE_IDS[@]}"; do
-      IFS="$NODE_FIELD_SEP" read -r node_id node_type node_desc node_prompt_ref node_dmode node_verifier_ref node_model_lane <<< "$entry"
+      IFS="$NODE_FIELD_SEP" read -r node_id node_type node_desc node_prompt_ref node_dmode node_verifier_ref node_model_lane node_requires_capabilities <<< "$entry"
       _maybe_flush_batch_at_cap PIDS
-      ( _dispatch_node "$node_id" "$node_type" "$node_desc" "$node_prompt_ref" "$node_verifier_ref" "$node_model_lane" ) &
+      ( _dispatch_node "$node_id" "$node_type" "$node_desc" "$node_prompt_ref" "$node_verifier_ref" "$node_model_lane" "$node_requires_capabilities" ) &
       PIDS+=($!)
     done
     _flush_parallel_batch PIDS
@@ -1729,7 +1749,7 @@ case "$DISPATCH_MODE" in
     # Group by node_type; run groups serially, nodes within group in parallel
     declare -A TYPE_GROUPS
     for entry in "${NODE_IDS[@]}"; do
-      IFS="$NODE_FIELD_SEP" read -r node_id node_type node_desc node_prompt_ref node_dmode node_verifier_ref node_model_lane <<< "$entry"
+      IFS="$NODE_FIELD_SEP" read -r node_id node_type node_desc node_prompt_ref node_dmode node_verifier_ref node_model_lane node_requires_capabilities <<< "$entry"
       TYPE_GROUPS[$node_type]+="${entry}"$'\n'
     done
     for node_type in planner researcher implementer reviewer verifier reflector publisher rollback; do
@@ -1737,8 +1757,8 @@ case "$DISPATCH_MODE" in
       PIDS=()
       while IFS= read -r e; do
         [ -z "$e" ] && continue
-        IFS="$NODE_FIELD_SEP" read -r nid nt nd npr ndm nvr nml <<< "$e"
-        ( _dispatch_node "$nid" "$nt" "$nd" "$npr" "$nvr" "$nml" ) &
+        IFS="$NODE_FIELD_SEP" read -r nid nt nd npr ndm nvr nml nreq <<< "$e"
+        ( _dispatch_node "$nid" "$nt" "$nd" "$npr" "$nvr" "$nml" "$nreq" ) &
         PIDS+=($!)
       done <<< "${TYPE_GROUPS[$node_type]}"
       _flush_parallel_batch PIDS
@@ -1747,9 +1767,9 @@ case "$DISPATCH_MODE" in
   speculative)
     PIDS=()
     for entry in "${NODE_IDS[@]}"; do
-      IFS="$NODE_FIELD_SEP" read -r node_id node_type node_desc node_prompt_ref node_dmode node_verifier_ref node_model_lane <<< "$entry"
+      IFS="$NODE_FIELD_SEP" read -r node_id node_type node_desc node_prompt_ref node_dmode node_verifier_ref node_model_lane node_requires_capabilities <<< "$entry"
       _maybe_flush_batch_at_cap PIDS
-      ( _dispatch_node "$node_id" "$node_type" "$node_desc" "$node_prompt_ref" "$node_verifier_ref" "$node_model_lane" ) &
+      ( _dispatch_node "$node_id" "$node_type" "$node_desc" "$node_prompt_ref" "$node_verifier_ref" "$node_model_lane" "$node_requires_capabilities" ) &
       PIDS+=($!)
     done
     for pid in "${PIDS[@]}"; do
@@ -1762,16 +1782,16 @@ case "$DISPATCH_MODE" in
     # any `serial` node, then run that serial node alone.
     PIDS=()
     for entry in "${NODE_IDS[@]}"; do
-      IFS="$NODE_FIELD_SEP" read -r node_id node_type node_desc node_prompt_ref node_dmode node_verifier_ref node_model_lane <<< "$entry"
+      IFS="$NODE_FIELD_SEP" read -r node_id node_type node_desc node_prompt_ref node_dmode node_verifier_ref node_model_lane node_requires_capabilities <<< "$entry"
       case "${node_dmode:-serial}" in
         parallel)
-          ( _dispatch_node "$node_id" "$node_type" "$node_desc" "$node_prompt_ref" "$node_verifier_ref" "$node_model_lane" ) &
+          ( _dispatch_node "$node_id" "$node_type" "$node_desc" "$node_prompt_ref" "$node_verifier_ref" "$node_model_lane" "$node_requires_capabilities" ) &
           PIDS+=($!)
           ;;
         *)
           # Flush any pending parallel batch first
           [ "${#PIDS[@]}" -gt 0 ] && _flush_parallel_batch PIDS
-          _dispatch_node "$node_id" "$node_type" "$node_desc" "$node_prompt_ref" "$node_verifier_ref" "$node_model_lane" || FAIL_COUNT=$((FAIL_COUNT+1))
+          _dispatch_node "$node_id" "$node_type" "$node_desc" "$node_prompt_ref" "$node_verifier_ref" "$node_model_lane" "$node_requires_capabilities" || FAIL_COUNT=$((FAIL_COUNT+1))
           ;;
       esac
     done
