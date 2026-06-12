@@ -1,0 +1,45 @@
+name: recursive_validate_impl
+task_class: recursive_validate_impl
+version: "0.2.0"
+description: >
+  Recursive implementation recipe for one or more technical features with
+  machine-checkable Definition of Done probes, multi-tier deterministic
+  verification, heterogeneous panel review, and reflection-driven replanning.
+
+artifact_contract_ref: artifact_contract.yaml
+default_workflow: workflow.yaml
+
+matches:
+  keywords:
+    - recursive validate implementation
+    - recursive validation
+    - multi-tier validate
+    - implementation quality
+    - dod probes
+    - modern techniques compliance
+    - reflect replan
+    - re-implement
+  regex:
+    - "Definition of Done"
+    - "DoD probes"
+    - "multi-tier"
+  path_globs:
+    - "recipes/recursive-validate-impl/**"
+
+default_gates:
+  - budget_gate
+  - scope_gate
+
+risk_class: high
+max_parallel_runs: 1
+budget_cap_usd: 25
+tags:
+  - recursive
+  - verifier
+  - implementation
+  - arxiv-libwit
+
+heterogeneity:
+  tier4_panel:
+    model_lane: panel
+    standing_directive: "No opus in panel; resolve panel to codex, kimi, minimax, and glm."

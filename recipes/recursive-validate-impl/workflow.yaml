@@ -1,0 +1,45 @@
+version: "0.2.0"
+task_class: recursive_validate_impl
+description: >
+  Recursive implement to multi-tier-validate to reflect to replan loop.
+  Targets task classes where DoD probes are concrete and machine-checkable.
+  Hard-converges at DoD-pass, max_recursion, budget_exhaustion, or repeated
+  failure signatures.
+
+nodes:
+  - { name: planner, type: planner, model_lane: planner, prompt_ref: prompts/planner.md, dispatch_mode: serial, gates: [budget_gate] }
+  - { name: implementer, type: implementer, model_lane: worker, prompt_ref: prompts/implementer.md, dispatch_mode: serial, gates: [budget_gate, scope_gate] }
+  - { name: tier1_compile, type: verifier, verifier_ref: verifiers/tier1-compile-typecheck.sh, dispatch_mode: serial }
+  - { name: tier2_unit, type: verifier, verifier_ref: verifiers/tier2-scoped-unit.sh, dispatch_mode: serial }
+  - { name: tier3_property, type: verifier, verifier_ref: verifiers/tier3-property-mutation.sh, dispatch_mode: serial }
+  - { name: tier4_panel, type: reviewer, model_lane: panel, prompt_ref: prompts/tier4-panel-review.md, dispatch_mode: parallel, gates: [budget_gate] }
+  - { name: reflector, type: reflector, model_lane: reflector, prompt_ref: prompts/reflector.md, dispatch_mode: serial, gates: [budget_gate] }
+  - { name: replanner, type: planner, model_lane: planner, prompt_ref: prompts/replanner.md, dispatch_mode: serial, gates: [budget_gate] }
+  - { name: publisher, type: publisher, prompt_ref: null, dispatch_mode: serial, gates: [scope_gate] }
+  - { name: rollback, type: rollback, prompt_ref: null, dispatch_mode: serial }
+
+edges:
+  - { from: planner, to: implementer, edge_type: depends_on }
+  - { from: implementer, to: tier1_compile, edge_type: verifies }
+  - { from: tier1_compile, to: tier2_unit, edge_type: depends_on, condition: pass }
+  - { from: tier1_compile, to: reflector, edge_type: escalates_to, condition: fail }
+  - { from: tier2_unit, to: tier3_property, edge_type: depends_on, condition: pass }
+  - { from: tier2_unit, to: reflector, edge_type: escalates_to, condition: fail }
+  - { from: tier3_property, to: tier4_panel, edge_type: depends_on, condition: pass }
+  - { from: tier3_property, to: reflector, edge_type: escalates_to, condition: fail }
+  - { from: tier4_panel, to: publisher, edge_type: depends_on, condition: pass }
+  - { from: tier4_panel, to: reflector, edge_type: escalates_to, condition: fail }
+  - { from: reflector, to: replanner, edge_type: depends_on }
+  - { from: replanner, to: implementer, edge_type: depends_on, recursive: true }
+
+recursion:
+  max_iterations: 5
+  convergence_check: all_dod_probes_pass
+  budget_cap_per_iter_usd: 5.00
+  budget_cap_total_usd: 25.00
+  divergence_kill: |
+    Iteration N+1 produces same verifier-fail signature as iteration N.
+    Detected by hashing the failure-log sorted by stage. Two identical
+    hashes in a row -> escalate to operator instead of looping forever.
+
+rollback_strategy: keep_partial_drain_discard_failed_iter
