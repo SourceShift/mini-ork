@@ -38,11 +38,35 @@ _changed_files() {
   git -C "$REPO_ROOT" apply --numstat "$DIFF" 2>/dev/null | awk '{print $3}' | sed '/^$/d' | sort -u >"$CHANGED"
 }
 
+_diff_sentinel_path() {
+  awk '/^\+\+\+ b\// { sub(/^\+\+\+ b\//, ""); print; exit }' "$DIFF"
+}
+
+_assert_copy_is_own_git_root() {
+  git -C "$WORKTREE" init
+  local top
+  top="$(cd "$WORKTREE" && pwd -P)"
+  [ "$(git -C "$WORKTREE" rev-parse --show-toplevel)" = "$top" ]
+}
+
+_write_apply_sentinels() {
+  sha256sum "$DIFF" >"$WORK_PARENT/diff-applied.sha256" &&
+    (cd "$WORKTREE" && { git diff --no-index /dev/null . || true; } | sha256sum) >"$WORK_PARENT/diff-applied.post.sha256" &&
+    [ -s "$WORK_PARENT/diff-applied.sha256" ] &&
+    [ -s "$WORK_PARENT/diff-applied.post.sha256" ]
+}
+
 _make_patched_copy() {
   rm -rf "$WORK_PARENT"
   mkdir -p "$WORKTREE"
   git -C "$REPO_ROOT" archive HEAD | tar -x -C "$WORKTREE"
-  git -C "$WORKTREE" apply "$DIFF"
+  _assert_copy_is_own_git_root || return 1
+  local sentinel
+  sentinel="$(_diff_sentinel_path)"
+  [ -n "$sentinel" ] || return 1
+  git -C "$WORKTREE" apply "$DIFF" || return 1
+  [ -e "$WORKTREE/$sentinel" ] || return 1
+  _write_apply_sentinels
 }
 
 # Template tier: declared artifacts exist and have basic shape.
@@ -62,6 +86,12 @@ _check "changed-files-extracted" "changed file list can be extracted" \
   '_changed_files && [ -s "$CHANGED" ]'
 _check "patched-copy-created" "diff applies to throwaway copy for static checks" \
   '_make_patched_copy'
+_check "copy-is-own-git-root" "throwaway copy is an independent git root" \
+  'top="$(cd "$WORKTREE" && pwd -P)"; [ "$(git -C "$WORKTREE" rev-parse --show-toplevel)" = "$top" ] || { echo "copy-not-its-own-git-root" >&3; false; }'
+_check "diff-introduces-sentinel" "first diff-introduced path exists after apply" \
+  'sentinel="$(_diff_sentinel_path)"; [ -n "$sentinel" ] && [ -e "$WORKTREE/$sentinel" ] || { echo "sentinel-file-absent-post-apply" >&3; false; }'
+_check "apply-sentinel-has-content" "diff and patched-tree sentinels are non-empty" \
+  '[ -s "$WORK_PARENT/diff-applied.sha256" ] && [ -s "$WORK_PARENT/diff-applied.post.sha256" ]'
 _check "shell-syntax-clean" "changed shell files pass bash -n" \
   'ok=1; while IFS= read -r f; do case "$f" in *.sh) [ -f "$WORKTREE/$f" ] && bash -n "$WORKTREE/$f" || ok=0;; esac; done <"$CHANGED"; [ "$ok" = 1 ]'
 _check "python-compile-clean" "changed Python files compile" \
