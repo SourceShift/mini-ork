@@ -956,7 +956,7 @@ _mo_start_node_heartbeat_loop() {
       sleep "$interval_s" || exit 0
       mo_emit_node_heartbeat "$node_id_arg" "$run_id" || true
     done
-  ) &
+  ) >/dev/null 2>&1 &
   printf '%s\n' "$!"
 }
 
