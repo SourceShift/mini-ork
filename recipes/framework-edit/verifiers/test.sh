@@ -38,6 +38,39 @@ _make_throwaway_copy() {
   git -C "$REPO_ROOT" archive HEAD | tar -x -C "$WORKTREE"
 }
 
+_diff_sentinel_path() {
+  awk '/^\+\+\+ b\// { sub(/^\+\+\+ b\//, ""); print; exit }' "$DIFF"
+}
+
+_assert_copy_is_own_git_root() {
+  git -C "$WORKTREE" init
+  local top
+  top="$(cd "$WORKTREE" && pwd -P)"
+  [ "$(git -C "$WORKTREE" rev-parse --show-toplevel)" = "$top" ]
+}
+
+_apply_diff_to_copy() {
+  _assert_copy_is_own_git_root || {
+    echo "copy-not-its-own-git-root" >&3
+    return 1
+  }
+  local sentinel
+  sentinel="$(_diff_sentinel_path)"
+  [ -n "$sentinel" ] || {
+    echo "sentinel-file-absent-post-apply" >&3
+    return 1
+  }
+  git -C "$WORKTREE" apply "$DIFF" || return 1
+  [ -e "$WORKTREE/$sentinel" ] || {
+    echo "sentinel-file-absent-post-apply" >&3
+    return 1
+  }
+  sha256sum "$DIFF" >"$WORK_PARENT/diff-applied.sha256" &&
+    (cd "$WORKTREE" && { git diff --no-index /dev/null . || true; } | sha256sum) >"$WORK_PARENT/diff-applied.post.sha256" &&
+    [ -s "$WORK_PARENT/diff-applied.sha256" ] &&
+    [ -s "$WORK_PARENT/diff-applied.post.sha256" ]
+}
+
 # Template tier: declared artifacts exist and have basic shape.
 _check "artifact-diff-exists" "framework-edit.diff exists" '[ -f "$DIFF" ]'
 _check "artifact-diff-non-empty" "framework-edit.diff is non-empty" '[ -s "$DIFF" ]'
@@ -51,12 +84,18 @@ _check "evidence-log-written" "evidence log is writable" '[ -w "$EVIDENCE" ]'
 # Task-specific tier.
 _check "throwaway-copy-created" "repo HEAD copied under MINI_ORK_RUN_DIR" \
   '_make_throwaway_copy && [ -d "$WORKTREE/tests" ]'
+_check "copy-is-own-git-root" "throwaway copy is an independent git root" \
+  '_assert_copy_is_own_git_root || { echo "copy-not-its-own-git-root" >&3; false; }'
 _check "diff-applies-to-copy" "framework-edit.diff applies to throwaway copy" \
-  'git -C "$WORKTREE" apply "$DIFF" && touch "$WORK_PARENT/diff-applied.ok"'
+  '_apply_diff_to_copy'
+_check "diff-introduces-sentinel" "first diff-introduced path exists after apply" \
+  'sentinel="$(_diff_sentinel_path)"; [ -n "$sentinel" ] && [ -e "$WORKTREE/$sentinel" ] || { echo "sentinel-file-absent-post-apply" >&3; false; }'
+_check "apply-sentinel-has-content" "diff and patched-tree sentinels are non-empty" \
+  '[ -s "$WORK_PARENT/diff-applied.sha256" ] && [ -s "$WORK_PARENT/diff-applied.post.sha256" ]'
 _check "web-smoke-test-exists" "tests/test_web_smoke.py exists after patch" \
   '[ -f "$WORKTREE/tests/test_web_smoke.py" ]'
 _check "web-smoke-tests-pass" "pytest tests/test_web_smoke.py passes without network keys" \
-  '[ -f "$WORK_PARENT/diff-applied.ok" ] && cd "$WORKTREE" && env -u OPENAI_API_KEY -u ANTHROPIC_API_KEY -u OPENROUTER_API_KEY -u GEMINI_API_KEY PYTHONPATH=. python3 -m pytest tests/test_web_smoke.py -q'
+  '[ -s "$WORK_PARENT/diff-applied.sha256" ] && [ -s "$WORK_PARENT/diff-applied.post.sha256" ] && cd "$WORKTREE" && env -u OPENAI_API_KEY -u ANTHROPIC_API_KEY -u OPENROUTER_API_KEY -u GEMINI_API_KEY PYTHONPATH=. python3 -m pytest tests/test_web_smoke.py -q'
 
 python3 - "$NAME" "$EVIDENCE" "$CHECKS_TSV" <<'PY'
 import json, sys
