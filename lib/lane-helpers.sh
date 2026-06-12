@@ -89,6 +89,58 @@ mo_emit_cache_flags() {
   return 0
 }
 
+# Assert that a resolved dispatch lane's family supports every capability in
+# MO_LANE_REQUIRES_CAPABILITY. Empty requirements are a no-op.
+#
+# Args:
+#   1: resolved lane name, e.g. "opus_lens" or "implementer"
+#
+# The lane is resolved through the same agents.yaml precedence as dispatch:
+# $MINI_ORK_HOME/config/agents.yaml first, then repo config/agents.yaml.
+mo_assert_lane_capability() {
+  local lane="${1:-}"
+  local required="${MO_LANE_REQUIRES_CAPABILITY:-}"
+  [ -n "$required" ] || return 0
+  [ -n "$lane" ] || {
+    echo "lane" >&2
+    return 1
+  }
+
+  local agents_yaml="${MINI_ORK_HOME:-.mini-ork}/config/agents.yaml"
+  [ -f "$agents_yaml" ] || agents_yaml="$MINI_ORK_ROOT/config/agents.yaml"
+  [ -f "$agents_yaml" ] || {
+    echo "capabilities" >&2
+    return 1
+  }
+  local fallback_agents_yaml="$MINI_ORK_ROOT/config/agents.yaml"
+  [ -f "$fallback_agents_yaml" ] || fallback_agents_yaml="$agents_yaml"
+
+  python3 - "$agents_yaml" "$fallback_agents_yaml" "$lane" "$required" <<'PY'
+import sys
+import yaml
+
+path, fallback_path, lane, required_csv = sys.argv[1:5]
+cfg = yaml.safe_load(open(path, encoding="utf-8")) or {}
+fallback_cfg = yaml.safe_load(open(fallback_path, encoding="utf-8")) or {}
+lanes = cfg.get("lanes") or {}
+capabilities = cfg.get("capabilities") or fallback_cfg.get("capabilities") or {}
+family = str(lanes.get(lane) or lane).strip()
+family_caps = capabilities.get(family) or {}
+
+missing = []
+for raw in required_csv.split(","):
+    name = raw.strip()
+    if not name:
+        continue
+    if family_caps.get(name) is not True:
+        missing.append(name)
+
+if missing:
+    print(missing[0], file=sys.stderr)
+    sys.exit(1)
+PY
+}
+
 # Aggregate prompt-cache usage across all *.log files in an iter-N dir.
 # Sums cache_creation_input_tokens (writes) + cache_read_input_tokens (reads)
 # + input_tokens (uncached) across every claude stream-json log in the dir.
