@@ -972,6 +972,56 @@ def test_llm_dispatch_classifies_invalid_api_key_as_auth() -> None:
     assert out.stdout.strip() == "auth"
 
 
+def test_agents_yaml_has_capabilities_section() -> None:
+    import yaml
+
+    cfg = yaml.safe_load((ROOT / "config/agents.yaml").read_text()) or {}
+    capabilities = cfg.get("capabilities") or {}
+    expected = {"opus", "sonnet", "codex", "glm", "kimi", "deepseek", "minimax"}
+    assert expected <= set(capabilities)
+    for family in expected:
+        assert {"vision", "tools", "reasoning", "search"} <= set(capabilities[family])
+
+
+def test_capability_check_passes_when_family_supports_all() -> None:
+    script = (
+        "set -euo pipefail; "
+        "MINI_ORK_ROOT=$PWD; "
+        "MINI_ORK_HOME=$PWD/.mini-ork; "
+        "MO_LANE_REQUIRES_CAPABILITY='vision,tools'; "
+        "source lib/lane-helpers.sh; "
+        "mo_assert_lane_capability opus_lens"
+    )
+    subprocess.run(
+        ["bash", "--noprofile", "--norc", "-c", script],
+        cwd=ROOT,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=True,
+    )
+
+
+def test_capability_check_fails_when_family_missing_one() -> None:
+    script = (
+        "set -euo pipefail; "
+        "MINI_ORK_ROOT=$PWD; "
+        "MINI_ORK_HOME=$PWD/.mini-ork; "
+        "MO_LANE_REQUIRES_CAPABILITY='vision,tools'; "
+        "source lib/lane-helpers.sh; "
+        "mo_assert_lane_capability codex_lens"
+    )
+    result = subprocess.run(
+        ["bash", "--noprofile", "--norc", "-c", script],
+        cwd=ROOT,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    assert result.returncode == 1
+    assert result.stderr.strip() == "vision"
+
+
 def test_llm_calls_route_tolerates_null_taxonomy_columns(tmp_path: Path) -> None:
     from mini_ork.web.db import StateDB
     from mini_ork.web.routes.run_detail import get_llm_calls

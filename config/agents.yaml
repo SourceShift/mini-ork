@@ -55,3 +55,40 @@ budget:
   per_epic_usd: 5.00
   per_run_usd: 0.50
   daily_cap_usd: 50.00
+
+capabilities:
+  opus:
+    vision: true
+    tools: true
+    reasoning: true
+    search: true
+  sonnet:
+    vision: true
+    tools: true
+    reasoning: false
+    search: false
+  codex:
+    vision: false
+    tools: true
+    reasoning: true
+    search: false
+  glm:
+    vision: false
+    tools: true
+    reasoning: false
+    search: false
+  kimi:
+    vision: true
+    tools: true
+    reasoning: false
+    search: false
+  deepseek:
+    vision: false
+    tools: true
+    reasoning: true
+    search: false
+  minimax:
+    vision: false
+    tools: true
+    reasoning: false
+    search: false
