@@ -220,14 +220,33 @@ if turns_path and turns:
         for t in turns:
             f.write(json.dumps(t) + "\n")
 # Estimated cost: codex CLI exposes no billing figure on this surface, so
-# derive one from token usage at list price. Defaults are OpenAI's published
-# gpt-5/codex rates (USD per 1M tokens); override per deployment via env.
+# derive one from token usage at list price. As of 2026-06-13 this lookup
+# reads through lib/pricing_strategy.sh::pricing_lookup, which sources
+# .mini-ork/config/pricing.yaml. Env vars remain as the last-resort
+# fallback for deployments without the YAML.
 # Note: usage.input_tokens INCLUDES cached_input_tokens, which bill at the
 # discounted rate — subtract before applying the full input rate.
 if cost_path and (in_tok or out_tok):
-    p_in = float(os.environ.get("MO_CODEX_USD_PER_MTOK_IN", "1.25"))
-    p_cached = float(os.environ.get("MO_CODEX_USD_PER_MTOK_CACHED", "0.125"))
-    p_out = float(os.environ.get("MO_CODEX_USD_PER_MTOK_OUT", "10.0"))
+    import subprocess
+
+    def _ymlrate(model, kind, fallback):
+        try:
+            rc = subprocess.run(
+                ["bash", "-c",
+                 "source ${MINI_ORK_ROOT:-.}/lib/pricing_strategy.sh; "
+                 f"pricing_lookup openai {model} {kind}"],
+                capture_output=True, text=True, timeout=5,
+            )
+            v = (rc.stdout or "").strip()
+            if v and v != "0":
+                return float(v)
+        except Exception:
+            pass
+        return float(os.environ.get(fallback["env"], fallback["default"]))
+
+    p_in = _ymlrate("gpt-5", "input",      {"env": "MO_CODEX_USD_PER_MTOK_IN",     "default": "1.25"})
+    p_cached = _ymlrate("gpt-5", "cache_read", {"env": "MO_CODEX_USD_PER_MTOK_CACHED", "default": "0.125"})
+    p_out = _ymlrate("gpt-5", "output",     {"env": "MO_CODEX_USD_PER_MTOK_OUT",    "default": "10.0"})
     fresh_in = max(in_tok - cached_tok, 0)
     cost = (fresh_in * p_in + cached_tok * p_cached + out_tok * p_out) / 1e6
     with open(cost_path, "w") as f:
