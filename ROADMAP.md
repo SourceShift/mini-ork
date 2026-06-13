@@ -159,7 +159,7 @@ Wire-up + remaining oracle-hardening gaps:
     `tests/integration/test_oracle_gates_auto_wire.sh` pins the
     contract (2 fixtures green, 2 deferred placeholders for follow-up
     coverage).
-- **Wave 2-A** — per-recipe held-out anchor corpus (Wang 2026). Hand-author per synthesis recipe; corpus selection is judgment-heavy.
+- **Wave 2-A** ✅ substrate landed 2026-06-13 in [`lib/anchor_corpus.sh`](lib/anchor_corpus.sh) (commit `f1a9032`): `anchor_corpus_load` + `anchor_corpus_recall` for held-out corpus recall scoring. Corpus content (the must-find anchor list per recipe) remains operator-authored — judgment-heavy per Wang 2026 — and ships in `recipes/<name>/anchor-corpus.json` as recipes mature.
 - **Wave 3** ✅ landed 2026-06-13 in [`lib/citation_verifier_mechanical.sh`](lib/citation_verifier_mechanical.sh): recall-floor oracle for synthesis-style findings (Sistla 2025 + Ficek 2025). Mechanical citation coverage + wireheading check in one gate (commit `31f7808`).
 
 ### Calibration + adversarial gates (the positioning-doc honest-gaps list)
@@ -262,10 +262,7 @@ truth)
 
 **Phase 3 — feedback loops** (consumes Phases 1-2 telemetry)
 
-8. **Langfuse score mapping.** Extend the planned exporter
-   (docs/architecture/otel-langfuse.md): verdicts/rollbacks/promotions
-   become trace scores (APPROVE +, REQUEST_CHANGES −, rollback −1.0) so
-   traces self-rank (`src/libs/traces/event.ts:16-20`).
+8. ✅ **Langfuse score mapping** landed 2026-06-13 in [`lib/langfuse_score_mapper.sh`](lib/langfuse_score_mapper.sh) (commit `c0e6ad8`). `langfuse_score_for_verdict` maps reviewer / verifier / oracle-gate / rollback / promotion events to numeric trace scores (-1.0 ..= +1.0) standardized across organizations. 15 score conventions defined; pairs with the planned OTel-Langfuse exporter.
 9. ✅ **Verifier rubrics with ground-truth feedback** landed 2026-06-13 in [`db/migrations/0025_verifier_rubrics.sql`](db/migrations/0025_verifier_rubrics.sql) + [`lib/verifier_rubric.sh`](lib/verifier_rubric.sh) (commit `53d6ad0`). Three correlated tables (`verifier_rubrics`, `verifier_criteria`, `verifier_results`) with operator-set `is_false_positive` / `is_false_negative` flags + `repair_run_id` chaining. CRUD primitives: `rubric_register`, `verifier_result_record`, `verifier_result_annotate`, `verifier_chain_repair`, `verifier_fp_rate`.
 10. ✅ **Checkpoint/resume primitive** landed 2026-06-13 in [`lib/checkpoint.sh`](lib/checkpoint.sh) (commit `843eca2`). Four primitives (`checkpoint_write`, `checkpoint_can_resume`, `checkpoint_clear`, `checkpoint_summary`) backed by `${MINI_ORK_RUN_DIR}/.checkpoint.json`. Wiring into `bin/mini-ork-execute` is a deliberate follow-up.
 
@@ -334,7 +331,7 @@ These have been considered and intentionally excluded:
 
 ## Last updated
 
-2026-06-13 — Calibration-list closed (Krippendorff α + citation coverage + Refute-or-Promote + honest CIs gates shipped); Wave 3 mechanical citation verifier landed; Phase 2 item 6 (pricing strategy table) + Phase 3 items 9 (verifier rubrics + ground-truth) + 10 (checkpoint/resume primitive) shipped; mini-ork rollback CLI verb wired; 3 session bugs closed (publisher dict-shape, child-implementer artifact path, defensive verdict-write); OSS hygiene pass
+2026-06-13 — Calibration-list closed (Krippendorff α + citation coverage + Refute-or-Promote + honest CIs gates shipped); Wave 3 mechanical citation verifier landed; Wave 2-A substrate (anchor corpus loader + recall scorer) landed; Phase 2 item 6 (pricing strategy table) + Phase 3 items 8 (Langfuse score mapping) + 9 (verifier rubrics + ground-truth) + 10 (checkpoint/resume primitive) shipped; mini-ork rollback CLI verb wired; 4 session bugs closed (publisher dict-shape, child-implementer artifact path, defensive verdict-write, cleaner.sh stash-pop race causing working-tree file-reversion); OSS hygiene pass
 
 2026-06-10 — Agent-ops hardening track added (LobeHub deep-review, 14 items
 across 4 dependency-ordered phases)
