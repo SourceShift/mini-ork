@@ -19,6 +19,11 @@ nodes:
   - { name: tier4_kimi,    type: researcher, model_lane: kimi_lens,    prompt_ref: prompts/tier4-panel-review.md, dispatch_mode: parallel, gates: [budget_gate] }
   - { name: tier4_codex,   type: researcher, model_lane: codex_lens,   prompt_ref: prompts/tier4-panel-review.md, dispatch_mode: parallel, gates: [budget_gate] }
   - { name: tier4_minimax, type: researcher, model_lane: minimax_lens, prompt_ref: prompts/tier4-panel-review.md, dispatch_mode: parallel, gates: [budget_gate] }
+  # tier4_quorum is a fail-fast gate added 2026-06-14. Without it, missing
+  # 2+ tier-4 lens reports caused tier4_synth to hang indefinitely (observed
+  # in run-1781333552-17796-identity-and-rbac + run-1781377882-65036-
+  # intervention-policies-gate). Default MO_TIER4_QUORUM=3 of 4 lenses.
+  - { name: tier4_quorum,  type: verifier,   verifier_ref: verifiers/tier4-panel-quorum.sh, dispatch_mode: serial }
   - { name: tier4_synth,   type: reviewer,   model_lane: reviewer,     prompt_ref: prompts/tier4-panel-synthesizer.md, dispatch_mode: serial, gates: [budget_gate] }
   - { name: reflector, type: reflector, model_lane: reflector, prompt_ref: prompts/reflector.md, dispatch_mode: serial, gates: [budget_gate] }
   - { name: replanner, type: planner, model_lane: planner, prompt_ref: prompts/replanner.md, dispatch_mode: serial, gates: [budget_gate] }
@@ -37,10 +42,12 @@ edges:
   - { from: tier3_property, to: tier4_codex,   edge_type: depends_on, condition: pass }
   - { from: tier3_property, to: tier4_minimax, edge_type: depends_on, condition: pass }
   - { from: tier3_property, to: reflector, edge_type: escalates_to, condition: fail }
-  - { from: tier4_glm,     to: tier4_synth, edge_type: supplies_context_to }
-  - { from: tier4_kimi,    to: tier4_synth, edge_type: supplies_context_to }
-  - { from: tier4_codex,   to: tier4_synth, edge_type: supplies_context_to }
-  - { from: tier4_minimax, to: tier4_synth, edge_type: supplies_context_to }
+  - { from: tier4_glm,     to: tier4_quorum, edge_type: supplies_context_to }
+  - { from: tier4_kimi,    to: tier4_quorum, edge_type: supplies_context_to }
+  - { from: tier4_codex,   to: tier4_quorum, edge_type: supplies_context_to }
+  - { from: tier4_minimax, to: tier4_quorum, edge_type: supplies_context_to }
+  - { from: tier4_quorum,  to: tier4_synth, edge_type: depends_on, condition: pass }
+  - { from: tier4_quorum,  to: reflector,   edge_type: escalates_to, condition: fail }
   - { from: tier4_synth, to: publisher, edge_type: depends_on, condition: pass }
   - { from: tier4_synth, to: reflector, edge_type: escalates_to, condition: fail }
   - { from: reflector, to: replanner, edge_type: depends_on }
