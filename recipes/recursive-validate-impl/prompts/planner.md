@@ -3,6 +3,14 @@
 You are the planner for `recursive-validate-impl`. Build a concrete plan for
 the kickoff's technical feature work and its recursive validation loop.
 
+The full kickoff content is interpolated below.
+
+## Kickoff
+
+{{KICKOFF_CONTENT}}
+
+## Planner instructions
+
 Read the kickoff carefully. Extract the complete `## Definition of Done
 (probes)` section into `dod_probes[]`. Each probe must preserve enough command
 text for a reviewer to rerun it. If `dod_probes[]` would be empty, reject the
