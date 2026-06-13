@@ -89,10 +89,22 @@ fi
 # making it look like edits were being reverted by a linter). Now: pop the
 # stash back via EXIT trap on every code path.
 CLEANER_STASH_CREATED=0
+CLEANER_STASH_HEAD=""
 if ! git diff --quiet || ! git diff --staged --quiet; then
   echo "[cleaner] working tree dirty — stashing first (will pop on exit)" >&2
   if git stash push -u -m "cleaner pre-stash $TS" >&2; then
     CLEANER_STASH_CREATED=1
+    # Record HEAD AT STASH TIME so the restore step can detect a race:
+    # if another agent commits while the cleaner is running, popping
+    # the stash against the new HEAD silently REVERTS the new commit
+    # (the stash diff is "old working - old HEAD"; applied against
+    # new HEAD it reverses the intervening commit). This was the
+    # root cause of the 2026-06-13 file-reversion race seen in
+    # multiple framework-edit / recursive-validate-impl dispatches
+    # — operator commits made it to git history (HEAD intact) but
+    # working tree files reverted to pre-commit state because the
+    # cleaner's exit-trap popped a stash whose baseline had moved.
+    CLEANER_STASH_HEAD=$(git rev-parse HEAD 2>/dev/null || true)
   fi
 fi
 
@@ -100,15 +112,30 @@ restore_user_stash() {
   [ "$CLEANER_STASH_CREATED" = "1" ] || return 0
   local ref
   ref=$(git stash list | grep -F "cleaner pre-stash $TS" | head -1 | sed 's/:.*$//')
-  if [ -n "$ref" ]; then
-    # Switch back to main first if cleaner left us on its branch — pop only
-    # makes sense on the same branch the user was on (which was main).
-    git checkout main >/dev/null 2>&1 || true
-    if git stash pop "$ref" >/dev/null 2>&1; then
-      echo "[cleaner] restored user's pre-stash ($ref)" >&2
-    else
-      echo "[cleaner] WARNING: could not auto-pop $ref (conflict?). Run \`git stash pop $ref\` manually." >&2
-    fi
+  if [ -z "$ref" ]; then
+    return 0
+  fi
+  # Switch back to main first if cleaner left us on its branch — pop only
+  # makes sense on the same branch the user was on (which was main).
+  git checkout main >/dev/null 2>&1 || true
+  local _now_head
+  _now_head=$(git rev-parse HEAD 2>/dev/null || true)
+  if [ -n "$CLEANER_STASH_HEAD" ] && [ -n "$_now_head" ] && \
+     [ "$CLEANER_STASH_HEAD" != "$_now_head" ]; then
+    # HEAD moved between stash and pop. Popping the stash now would
+    # revert the intervening commit(s). Refuse — leave the stash
+    # for the operator to inspect with `git stash list`.
+    echo "[cleaner] WARNING: HEAD moved during cleaner run" >&2
+    echo "[cleaner]   stash-time HEAD: $CLEANER_STASH_HEAD" >&2
+    echo "[cleaner]   restore-time HEAD: $_now_head" >&2
+    echo "[cleaner]   stash $ref preserved; pop manually after reviewing" >&2
+    echo "[cleaner]   (auto-pop would revert the intervening commit)" >&2
+    return 0
+  fi
+  if git stash pop "$ref" >/dev/null 2>&1; then
+    echo "[cleaner] restored user's pre-stash ($ref)" >&2
+  else
+    echo "[cleaner] WARNING: could not auto-pop $ref (conflict?). Run \`git stash pop $ref\` manually." >&2
   fi
 }
 trap 'restore_user_stash; rm -rf "$LOCK_DIR"' EXIT
