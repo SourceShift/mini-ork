@@ -254,10 +254,7 @@ truth)
    cache-write tokens in `llm_calls`; bill cache reads at cache rate,
    subtract from input. Largest current cost error on Anthropic-heavy
    lanes (`packages/model-runtime/src/core/usageConverters/utils/computeChatCost.ts:35-209`).
-6. **Pricing strategy table.** Config-driven (provider, model) →
-   {input, output, cache_read, cache_write} rates with fixed/tiered
-   strategies, replacing inline cost math; pairs with `docs/MODELS.md`
-   (`model-bank` pricing schema).
+6. ✅ **Pricing strategy table** landed 2026-06-13 in [`lib/pricing_strategy.sh`](lib/pricing_strategy.sh) + [`.mini-ork/config/pricing.yaml`](.mini-ork/config/pricing.yaml) (commit `13ea509`). `pricing_lookup <provider> <model> <token_kind>` reads YAML rates; six default lanes covered (anthropic, openai, moonshot, deepseek, zhipu, minimax). Wiring into `lib/llm-dispatch.sh` is a deliberate follow-up.
 7. **Capability flags in `agents.yaml`.** Per-family
    `capabilities: {vision, tools, reasoning, search}` so gates reject
    impossible lane assignments *before* dispatch
@@ -269,15 +266,8 @@ truth)
    (docs/architecture/otel-langfuse.md): verdicts/rollbacks/promotions
    become trace scores (APPROVE +, REQUEST_CHANGES −, rollback −1.0) so
    traces self-rank (`src/libs/traces/event.ts:16-20`).
-9. **Verifier rubrics with ground-truth feedback.** Criteria/rubric/result
-   tables; results carry verdict + confidence + `is_false_positive` /
-   `is_false_negative` operator flags + optional `repair_run_id` chaining
-   an auto-repair run. Feeds the existing self-improve `learning_record`
-   loop (`packages/database/src/schemas/verify.ts`).
-10. **Checkpoint/resume for recipes.** On verifier failure resume from the
-    last completed node instead of replaying the recipe — direct token
-    saver for the recursive loop (`packages/types/src/task/index.ts:24-34`,
-    `canResume`/`resumedFromStep` events).
+9. ✅ **Verifier rubrics with ground-truth feedback** landed 2026-06-13 in [`db/migrations/0025_verifier_rubrics.sql`](db/migrations/0025_verifier_rubrics.sql) + [`lib/verifier_rubric.sh`](lib/verifier_rubric.sh) (commit `53d6ad0`). Three correlated tables (`verifier_rubrics`, `verifier_criteria`, `verifier_results`) with operator-set `is_false_positive` / `is_false_negative` flags + `repair_run_id` chaining. CRUD primitives: `rubric_register`, `verifier_result_record`, `verifier_result_annotate`, `verifier_chain_repair`, `verifier_fp_rate`.
+10. ✅ **Checkpoint/resume primitive** landed 2026-06-13 in [`lib/checkpoint.sh`](lib/checkpoint.sh) (commit `843eca2`). Four primitives (`checkpoint_write`, `checkpoint_can_resume`, `checkpoint_clear`, `checkpoint_summary`) backed by `${MINI_ORK_RUN_DIR}/.checkpoint.json`. Wiring into `bin/mini-ork-execute` is a deliberate follow-up.
 
 **Phase 4 — operator control + UX polish**
 
@@ -344,7 +334,7 @@ These have been considered and intentionally excluded:
 
 ## Last updated
 
-2026-06-13 — Calibration-list closed (Krippendorff α + citation coverage + Refute-or-Promote + honest CIs gates shipped); Wave 3 mechanical citation verifier landed; 3 session bugs closed (publisher dict-shape, child-implementer artifact path, defensive verdict-write); OSS hygiene pass
+2026-06-13 — Calibration-list closed (Krippendorff α + citation coverage + Refute-or-Promote + honest CIs gates shipped); Wave 3 mechanical citation verifier landed; Phase 2 item 6 (pricing strategy table) + Phase 3 items 9 (verifier rubrics + ground-truth) + 10 (checkpoint/resume primitive) shipped; mini-ork rollback CLI verb wired; 3 session bugs closed (publisher dict-shape, child-implementer artifact path, defensive verdict-write); OSS hygiene pass
 
 2026-06-10 — Agent-ops hardening track added (LobeHub deep-review, 14 items
 across 4 dependency-ordered phases)
