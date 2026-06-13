@@ -1,0 +1,59 @@
+# Pricing strategy table — config-driven (provider, model) rates.
+#
+# USD per million tokens. Cache columns optional; absent rate is
+# interpreted as 0 (the negotiated default when a contract does not
+# specify a cache rate). Operators tune per contract — the framework
+# only LOOKS UP, never calls home, never refreshes from a remote.
+#
+# Wiring: lib/pricing_strategy.sh::pricing_lookup is the single
+# consumer entry point. Downstream cache-aware cost accounting
+# (P2.5, migration 0024) reads through it.
+#
+# Schema:
+#   pricing:
+#     <provider>:
+#       <model>:
+#         input:       <usd_per_million_tokens>
+#         output:      <usd_per_million_tokens>
+#         cache_read:  <usd_per_million_tokens>   # optional
+#         cache_write: <usd_per_million_tokens>   # optional
+#
+# Sample rates shipped here are illustrative defaults from the
+# 2026-06 public price lists; treat them as a starting point, not
+# binding. Replace per contract.
+
+pricing:
+  anthropic:
+    claude-sonnet-4-6:
+      input:       3.00
+      output:     15.00
+      cache_read:  0.30
+      cache_write: 3.75
+    claude-opus-4-7:
+      input:      15.00
+      output:     75.00
+      cache_read:  1.50
+      cache_write: 18.75
+  openai:
+    gpt-5:
+      input:       2.50
+      output:     10.00
+    o4-mini:
+      input:       1.10
+      output:      4.40
+  moonshot:
+    kimi-k2-instruct:
+      input:       0.15
+      output:      2.50
+  deepseek:
+    deepseek-chat:
+      input:       0.27
+      output:      1.10
+  zhipu:
+    glm-4-plus:
+      input:       0.50
+      output:      1.50
+  minimax:
+    abab-7-chat:
+      input:       0.20
+      output:      0.80
