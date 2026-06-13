@@ -205,10 +205,30 @@ context_failure_modes_md() {
   local task_class="${1:?task_class required}"
   local limit="${2:-5}"
   [ -n "${MINI_ORK_DB:-}" ] && [ -f "${MINI_ORK_DB:-}" ] || return 0
-  python3 - "$MINI_ORK_DB" "$task_class" "$limit" <<'PY'
+  # Project-scope filter (2026-06-13 fix). gradient_records collects lessons
+  # from ALL prior runs across ALL projects in this mini-ork install. Without
+  # filtering, mini-ork-self-referential lessons (target prefixes like
+  # `workflow.`, `verifier.`, `gate.`, `recipe.`) leak into every project's
+  # implementer prompt — diagnosed during CWT-A dispatch where codex went off
+  # to fix mini-ork's own workflow components instead of the researcher
+  # target. Skip framework-internal targets when MO_TARGET_CWD is set and
+  # does NOT match MINI_ORK_ROOT (i.e. we're working on a non-mini-ork
+  # project). When MO_TARGET_CWD is unset OR matches MINI_ORK_ROOT, fall
+  # through to the legacy behavior so mini-ork's own self-improvement runs
+  # still see their lessons.
+  local _strip_framework_internal=0
+  if [ -n "${MO_TARGET_CWD:-}" ] && [ -n "${MINI_ORK_ROOT:-}" ] && \
+     [ "$(cd "${MO_TARGET_CWD}" 2>/dev/null && pwd -P)" != "$(cd "${MINI_ORK_ROOT}" && pwd -P)" ]; then
+    _strip_framework_internal=1
+  fi
+  python3 - "$MINI_ORK_DB" "$task_class" "$limit" "$_strip_framework_internal" <<'PY'
 import sqlite3, sys
 
-db, task_class, limit = sys.argv[1], sys.argv[2], int(sys.argv[3])
+db, task_class, limit, strip_framework = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
+FRAMEWORK_INTERNAL_PREFIXES = (
+    "workflow.", "verifier.", "gate.", "recipe.",
+    "provenance.", "provider.", "cache.", "dispatcher.",
+)
 con = sqlite3.connect(db)
 con.execute("PRAGMA busy_timeout=5000")
 try:
@@ -217,11 +237,16 @@ try:
         FROM gradient_records
         WHERE (task_class = ? OR target LIKE ?) AND confidence >= 0.6
         ORDER BY confidence DESC, created_at DESC LIMIT ?
-    """, (task_class, f"%{task_class}%", limit)).fetchall()
+    """, (task_class, f"%{task_class}%", limit * 4 if strip_framework else limit)).fetchall()
 except sqlite3.OperationalError:
     rows = []
 finally:
     con.close()
+
+if strip_framework:
+    rows = [r for r in rows if not r[0].startswith(FRAMEWORK_INTERNAL_PREFIXES)][:limit]
+else:
+    rows = rows[:limit]
 
 if rows:
     print("--- Learned failure modes (from prior runs of this task class) ---")
