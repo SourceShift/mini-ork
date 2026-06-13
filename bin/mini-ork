@@ -197,6 +197,33 @@ success = bullets(section_lines(["success", "definition of done", "done when", "
 scope_allow = bullets(section_lines(["scope allow", "in scope", "scope"]))
 scope_deny = bullets(section_lines(["scope deny", "out of scope", "forbidden"]))
 commands = command_hints()
+# 2026-06-13: kickoff bullets under "## Verification commands" / "## Verification
+# command" sections are taken verbatim as commands. command_hints() only matches
+# a fixed regex catalog (pnpm test, pytest, cargo test, etc.) and skips real-
+# world verifiers like `npx tsc --noEmit -p tsconfig.json` or `pnpm vitest run
+# <path>` — diagnosed during CWT-A dispatch where the kickoff had an explicit
+# `## Verification commands` section but the planner still raised
+# "What command should prove this run succeeded?" because none of the bullets
+# matched the regex catalog. Only accept lines starting with `-` or `*` so the
+# section's preamble prose doesn't become a "command". Strip outer backticks so
+# the bullet's `cmd` form yields `cmd`. Place after command_hints() so explicit
+# bullets win over heuristic regex matches.
+def _bullet_only(lines):
+    out = []
+    for line in lines:
+        m = re.match(r"^\s*[-*]\s+(.+?)\s*$", line)
+        if m:
+            out.append(m.group(1).strip())
+    return out
+_explicit_verify = _bullet_only(section_lines([
+    "verification command", "verification commands", "proof of success",
+]))
+for _c in _explicit_verify:
+    _c = _c.strip()
+    if _c.startswith("`") and _c.endswith("`") and len(_c) >= 2:
+        _c = _c[1:-1].strip()
+    if _c and _c not in commands:
+        commands.append(_c)
 
 task_yaml = load_yaml(root / "recipes" / recipe / "task_class.yaml")
 artifact_yaml = load_yaml(root / "recipes" / recipe / "artifact_contract.yaml")
