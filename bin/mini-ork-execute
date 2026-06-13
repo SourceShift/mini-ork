@@ -1350,6 +1350,23 @@ _dispatch_node() {
       fi
       PROMPT_CONTENT="${_prepend}Implement: ${node_desc}${_learned_block}\n\nPlan:\n${PLAN_CONTENT}"
       export MO_NODE_ID="$node_id"
+      # Pin codex/gemini cwd to the target repo. Derived from kickoff_path's
+      # git toplevel — that's the repo containing the kickoff doc (and thus
+      # the worker's edit surface). Falls back to $PWD when git toplevel
+      # can't be resolved (e.g. kickoff outside a git repo). cl_codex.sh
+      # reads MO_TARGET_CWD and passes -C/--cd to codex. Diagnosed 2026-06-13
+      # CWT-A dispatch: codex landed at MINI_ORK_ROOT instead of researcher
+      # repo because no explicit cwd pin reached the codex CLI.
+      local _kickoff_for_cwd=""
+      if [ -n "${MINI_ORK_RUN_DIR:-}" ] && [ -f "$MINI_ORK_RUN_DIR/run_profile.json" ]; then
+        _kickoff_for_cwd=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('kickoff_path',''))" "$MINI_ORK_RUN_DIR/run_profile.json" 2>/dev/null || true)
+      fi
+      if [ -n "$_kickoff_for_cwd" ] && [ -f "$_kickoff_for_cwd" ]; then
+        export MO_TARGET_CWD="$(cd "$(dirname "$_kickoff_for_cwd")" && git rev-parse --show-toplevel 2>/dev/null || pwd)"
+      else
+        export MO_TARGET_CWD="${MO_TARGET_CWD:-$PWD}"
+      fi
+      echo "  [cwd] codex target: $MO_TARGET_CWD" >&2
       local _dispatch_rc=0
 	      RESULT=$(llm_dispatch \
 	        --task-class "$TASK_CLASS" \

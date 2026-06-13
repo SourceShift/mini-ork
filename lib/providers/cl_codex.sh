@@ -103,6 +103,27 @@ fi
 _CODEX_LAST_MESSAGE="$(mktemp -t mini-ork-codex-last.XXXXXX)"
 _CODEX_SANDBOX="${CODEX_SANDBOX:-workspace-write}"
 
+# Pin codex's working root explicitly via -C/--cd so it cannot drift to
+# MINI_ORK_ROOT (or any other ambient cwd) when the dispatcher subshell
+# inherits a path-confused cwd. Diagnosed 2026-06-13: an implementer dispatch
+# from /Volumes/docker-ssd/Migration/Development/researcher landed codex with
+# cwd=/Volumes/docker-ssd/ps/mini-ork (codex session_meta confirmed). The
+# implementer then grep'd mini-ork's own README/ROADMAP/recipes instead of
+# the target repo's CWT-A kickoff files. Zero target-repo edits, $0.48 burned.
+#
+# Resolution order:
+#   1. MO_TARGET_CWD env (dispatcher sets this when it knows the target repo —
+#      e.g. derived from the kickoff_path's git toplevel).
+#   2. $PWD as recovered from the subshell — usually correct when the
+#      dispatcher's parent shell ran in the target repo.
+# Both fall back to "" if neither is set, in which case we skip --cd and
+# preserve codex's prior behavior (inherits whatever cwd the process has).
+_CODEX_TARGET_CWD="${MO_TARGET_CWD:-${PWD:-}}"
+_CODEX_CD_FLAGS=()
+if [ -n "$_CODEX_TARGET_CWD" ] && [ -d "$_CODEX_TARGET_CWD" ]; then
+  _CODEX_CD_FLAGS+=(-C "$_CODEX_TARGET_CWD")
+fi
+
 # Real-time progress sidecar (2026-06-11 fix).
 # Problem: `RAW_OUT=$(codex exec ... 2>&1)` buffers ALL stdout until codex
 # exits, so a 15-20 min implementer turn writes ZERO lines to mini-ork-execute's
@@ -138,6 +159,7 @@ RAW_OUT=$(codex exec \
   --sandbox "$_CODEX_SANDBOX" \
   --json \
   --output-last-message "$_CODEX_LAST_MESSAGE" \
+  ${_CODEX_CD_FLAGS[@]+"${_CODEX_CD_FLAGS[@]}"} \
   ${_CODEX_BYO_FLAGS[@]+"${_CODEX_BYO_FLAGS[@]}"} \
   "$PROMPT" 2> >(tee -a "$_CODEX_STREAM_FILE" >&2) | tee "$_CODEX_FIFO")
 _CODEX_RC=${PIPESTATUS[0]}
