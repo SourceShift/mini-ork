@@ -13,10 +13,10 @@ export ANTHROPIC_AUTH_TOKEN="${KIMI_API_KEY:?KIMI_API_KEY is required - set it i
 export ANTHROPIC_BASE_URL=https://api.kimi.com/coding/
 # Live gateway validation on 2026-06-08: the Kimi Anthropic-compatible
 # endpoint used by this environment returns HTTP 400 for kimi-for-coding via
-# Claude Code, while the local working wrapper succeeds with kimi-k2.6.
-export ANTHROPIC_MODEL=kimi-k2.6
-export ANTHROPIC_DEFAULT_OPUS_MODEL=kimi-k2.6
-export ANTHROPIC_DEFAULT_SONNET_MODEL=kimi-k2.6
-export ANTHROPIC_DEFAULT_HAIKU_MODEL=kimi-k2.6
-export CLAUDE_CODE_SUBAGENT_MODEL=kimi-k2.6
+# Claude Code, while the local working wrapper succeeds with kimi-k2.7-code.
+export ANTHROPIC_MODEL=kimi-k2.7-code
+export ANTHROPIC_DEFAULT_OPUS_MODEL=kimi-k2.7-code
+export ANTHROPIC_DEFAULT_SONNET_MODEL=kimi-k2.7-code
+export ANTHROPIC_DEFAULT_HAIKU_MODEL=kimi-k2.7-code
+export CLAUDE_CODE_SUBAGENT_MODEL=kimi-k2.7-code
 export ENABLE_TOOL_SEARCH=false
