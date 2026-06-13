@@ -160,22 +160,16 @@ Wire-up + remaining oracle-hardening gaps:
     contract (2 fixtures green, 2 deferred placeholders for follow-up
     coverage).
 - **Wave 2-A** — per-recipe held-out anchor corpus (Wang 2026). Hand-author per synthesis recipe; corpus selection is judgment-heavy.
-- **Wave 3** — `lib/citation-verifier-mechanical.sh` recall-floor oracle for `refactor_audit` findings (Sistla 2025 + Ficek 2025). 2-3 week sub-decomposition.
+- **Wave 3** ✅ landed 2026-06-13 in [`lib/citation_verifier_mechanical.sh`](lib/citation_verifier_mechanical.sh): recall-floor oracle for synthesis-style findings (Sistla 2025 + Ficek 2025). Mechanical citation coverage + wireheading check in one gate (commit `31f7808`).
 
 ### Calibration + adversarial gates (the positioning-doc honest-gaps list)
 
-- **Krippendorff α calibration gate** per Nasser 2026: compute α across
-  deliberators' first-round proposals; below 0.4 → escalate to human review
-  rather than vote on it
-- **Adversarial fabricated-bug injection** per [Agarwal 2026 *Refute-or-Promote*](https://arxiv.org/abs/2604.19049):
-  plant N known-fake bugs in the audit input; measure validator
-  false-positive survival rate as the quality signal
-- **Wireheading check on validators**: verify the validator actually read
-  the cited file (Read/Grep tool calls in trace) before upholding severity.
-  Already partly there via D-042 rich `files_read` capture — the gate isn't
-  enforced yet
-- **Honest confidence intervals on every claim** per [Dai 2025 *Semantic Triangulation*](https://arxiv.org/abs/2511.12288):
-  not "P1" but "P1 ± 1 (95% CI: [P0, P2]) per N=4 validators with κ=0.3"
+All four calibration-list items shipped 2026-06-13. The list is closed.
+
+- ✅ **Krippendorff α calibration gate** ([`lib/krippendorff_alpha_gate.sh`](lib/krippendorff_alpha_gate.sh), commit `3d1e815`) — α<0.4 across panel lens scores escalates to human review per Nasser 2026.
+- ✅ **Adversarial fabricated-bug injection** ([`lib/refute_or_promote_gate.sh`](lib/refute_or_promote_gate.sh), commit `ad48ef3`) — two leaf primitives (generate N fabrications + check FP-survival) per [Agarwal 2026 *Refute-or-Promote*](https://arxiv.org/abs/2604.19049). FP-survival > 10% triggers REFUTE_FAILED.
+- ✅ **Wireheading check on validators** ([`lib/citation_verifier_mechanical.sh`](lib/citation_verifier_mechanical.sh), commit `31f7808`) — same gate as Wave 3. Mechanically resolves each citation against repo root; coverage < 80% triggers CITATION_UNDERCOVERED.
+- ✅ **Honest confidence intervals on every claim** ([`lib/honest_ci_gate.sh`](lib/honest_ci_gate.sh), commit `91eba3d`) — per-finding CI from lens votes via t-dist with df=n-1 per [Dai 2025 *Semantic Triangulation*](https://arxiv.org/abs/2511.12288). wide_ratio > 30% triggers CI_TOO_WIDE.
 
 ### Evolution + promotion layer (deferred from v0.2)
 
@@ -349,6 +343,8 @@ These have been considered and intentionally excluded:
    abstraction
 
 ## Last updated
+
+2026-06-13 — Calibration-list closed (Krippendorff α + citation coverage + Refute-or-Promote + honest CIs gates shipped); Wave 3 mechanical citation verifier landed; 3 session bugs closed (publisher dict-shape, child-implementer artifact path, defensive verdict-write); OSS hygiene pass
 
 2026-06-10 — Agent-ops hardening track added (LobeHub deep-review, 14 items
 across 4 dependency-ordered phases)
