@@ -53,30 +53,80 @@ PY
   )
 
   local raw=""
+  # Treat both non-zero exit AND empty stdout as failure → fall over to kimi.
+  # Several providers (esp. deepseek under transient throttling) exit 0 with
+  # empty/whitespace output instead of raising; without the empty-check we'd
+  # silently lose the answer and downstream JSON parsing would die at char 0.
   if ! raw=$(llm_dispatch \
     --task-class "profile_answerer" \
     --node-type "profile_answerer" \
     --model "deepseek" \
-    --prompt-text "$prompt"); then
+    --prompt-text "$prompt") || [ -z "${raw// /}" ]; then
     raw=$(llm_dispatch \
       --task-class "profile_answerer" \
       --node-type "profile_answerer" \
       --model "kimi" \
-      --prompt-text "$prompt")
+      --prompt-text "$prompt") || raw=""
   fi
 
   mkdir -p "$(dirname "$profile_answers_out_path")"
   MO_PROFILE_ANSWER_RAW="$raw" python3 - "$questions_json" "$profile_answers_out_path" <<'PY'
 import json
 import os
+import re
 import sys
 
 questions_json, out_path = sys.argv[1:3]
 raw = os.environ.get("MO_PROFILE_ANSWER_RAW", "").strip()
+
+# Strip optional markdown code fences (```json … ``` or ``` … ```). Most
+# instruction-tuned LLMs add fences for any structured payload even when
+# the prompt forbids them. Also strip a leading "json" word on its own line.
+fence_pattern = re.compile(r"^```(?:json|JSON)?\s*\n?|\n?```\s*$", re.MULTILINE)
+raw = fence_pattern.sub("", raw).strip()
+
+# Some providers prepend a brief acknowledgement before the JSON object.
+# Fall back to extracting the FIRST balanced {...} substring.
+def extract_json_object(text: str) -> str:
+    start = text.find("{")
+    if start == -1:
+        return text
+    depth = 0
+    in_str = False
+    esc = False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if esc:
+            esc = False
+            continue
+        if ch == "\\" and in_str:
+            esc = True
+            continue
+        if ch == '"':
+            in_str = not in_str
+            continue
+        if in_str:
+            continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start:i + 1]
+    return text
+
 try:
     parsed = json.loads(raw)
-except json.JSONDecodeError as exc:
-    raise SystemExit(f"profile answerer returned non-json output: {exc}")
+except json.JSONDecodeError:
+    salvaged = extract_json_object(raw)
+    try:
+        parsed = json.loads(salvaged)
+    except json.JSONDecodeError as exc:
+        snippet = raw[:200].replace("\n", "\\n")
+        raise SystemExit(
+            f"profile answerer returned non-json output: {exc} | "
+            f"raw_first_200={snippet!r}"
+        )
 
 try:
     questions = json.loads(questions_json or "[]")
