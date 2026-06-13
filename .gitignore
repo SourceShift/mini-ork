@@ -25,6 +25,24 @@ node_modules/
 # (It SHADOWS config/providers.yaml entirely: first-hit resolution, no merge.)
 .mini-ork/config/providers.yaml
 
+# Per-developer Claude Code workspace — never ship to OSS.
+# Covers session memory, handoffs, scheduled task state, settings overrides.
+.claude/
+
+# Local kickoffs are user-authored, session-specific, and may name internal
+# projects or customers. Keep them out of the OSS tree.
+.mini-ork/kickoffs/
+
+# Local build / cache artifacts
+.pnpm-store/
+.runtime/
+mini_ork/web/static/
+ui/tsconfig.tsbuildinfo
+
+# Commercial / private deliverables (e.g. customer-specific business plans).
+# Open-source repo carries the recipe, not the customer-named output.
+docs/business-plans/
+
 # Runtime locks
 .claude/scheduled_tasks.lock
 
@@ -36,6 +54,7 @@ design/
 /tmp/
 *.log
 __pycache__/
+**/__pycache__/
 *.pyc
 # verify step writes verifier-result-*.json to cwd on direct runs
 /verifier-result-*.json
