@@ -314,7 +314,7 @@ The framework ships the universal loop and its primitives. Nothing in `lib/` or 
 
 ### RECIPES — opinions live here
 
-Recipes are user-land workflow definitions. They compose framework primitives into pipeline shapes. 22 recipes ship today; 8 of them dispatch a 4–5 lens panel across distinct model families per cycle, using family diversity as a practical proxy for the low-correlation detector patterns highlighted by Rajan 2025.
+Recipes are user-land workflow definitions. They compose framework primitives into pipeline shapes. 24 recipes ship today; 8 of them dispatch a 4–5 lens panel across distinct model families per cycle, using family diversity as a practical proxy for the low-correlation detector patterns highlighted by Rajan 2025.
 
 | Recipe | Location | Shape |
 |---|---|---|
@@ -340,6 +340,8 @@ Recipes are user-land workflow definitions. They compose framework primitives in
 | `researcher-qdrant-contract` | `recipes/researcher-qdrant-contract/` | PG/Qdrant indexing and retrieval contract remediation. Maps every content creation path to its canonical sync point. |
 | `schema-judge-panel` | `recipes/schema-judge-panel/` | Five-lens read-only judge panel for database/codebase architecture plans. Two Opus lenses plus Kimi, Codex, MiniMax. Each judge discovers, critiques, then proposes a migration plan. |
 | `epic-runner` | `recipes/epic-runner/` | **Recipe-creator-authored, 2026-06-12.** Multi-epic delivery orchestrator. Ingests a markdown epic doc with a dependency graph, walks it in topological waves, dispatches each epic as a child framework-edit run, aggregates verdicts, emits one gated delivery report. Dispatcher↔aggregator loop emulated inside the dispatcher node so the workflow DAG stays acyclic. |
+| `doc-to-features-loop` | `recipes/doc-to-features-loop/` | Document-driven feature extraction loop. Parses a long-form spec into discrete technical features, then iterates implementation + verification per feature with cross-feature dependency tracking. |
+| `recursive-validate-impl` | `recipes/recursive-validate-impl/` | **Recipe-creator-authored, 2026-06-12.** Recursive implement → multi-tier-validate → reflect → replan loop for any technical-feature kickoff. 5-tier verification (compile/typecheck → scoped unit → property + mutation → heterogeneous LLM panel) gated left-to-right; tier-4 panel cross-references implementation against arxiv-search-tool "modern techniques" compliance, not just done-state. Reflector extracts failure gradients; recursion hard-caps at 5 iterations or $25 with a divergence-kill safety net. |
 
 Add your own under `recipes/<name>/` — see [docs/EXTENSION.md](docs/EXTENSION.md).
 
@@ -383,11 +385,11 @@ Auto-promotion is **class-restricted**: task classes with an external oracle (te
 The full release log lives in [`ROADMAP.md`](ROADMAP.md) — every section dated and per-commit-attributed. Current shipped totals (regenerable via `bash scripts/readme-claim-check.sh` and filesystem counts):
 
 - 6-stage universal loop (`classify → plan → execute → verify → reflect → improve`) + 7 companion entrypoints (`eval`, `improve`, `promote`, `metrics`, `spawn`, direct `bin/mini-ork-topology`, direct `bin/mini-ork-self-improve`)
-- 44 framework primitives in `lib/` (incl. oracle-hardening libs + `gate_bootstrap.sh` for the v0.3-rc1 central wire-up + `lib/throttle-guard.sh` for provider-throttle classification + `lib/mo_otel.sh` for env-gated OTel span emission, added 2026-06-09/10)
+- 45 framework primitives in `lib/` (incl. oracle-hardening libs + `gate_bootstrap.sh` for the v0.3-rc1 central wire-up + `lib/throttle-guard.sh` for provider-throttle classification + `lib/mo_otel.sh` for env-gated OTel span emission, added 2026-06-09/10 + `lib/profile_answerer.sh` for MO_AUTO_ANSWER_PROFILE autonomous-dispatch mode, added 2026-06-12)
 - 1 runner-shared helper in `bin/lib/` (`profile-seed.sh` — deterministic `run_profile.json` seeding from structured kickoff markdown, added 2026-06-09)
 - 17 user-facing `bin/mini-ork*` entrypoints
 - 24 schema migrations under `db/migrations/` (memory namespaces, benchmarks, evolution, safety, panel topology telemetry, recursive orchestration, self-improvement learning, llm_calls session indexing, trace status widening, Arbor-style idea_tree primitive, error taxonomy + finish reasons, dispatch config snapshot, heartbeat + fuse, cache-aware cost accounting)
-- 22 recipes shipped — see Recipes table above
+- 24 recipes shipped — see Recipes table above
 - 7 model-family providers under `lib/providers/` + BYO-key registry (`config/providers.yaml` via `lib/providers/registry.sh`) for custom Anthropic/OpenAI-compatible endpoints
 
 Next-up work tracks (see [`ROADMAP.md`](ROADMAP.md) for detail):
