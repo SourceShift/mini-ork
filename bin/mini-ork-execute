@@ -419,10 +419,59 @@ PY
   )
 else
   NODE_SOURCE="plan.json.decomposition"
-  mapfile -t NODE_IDS < <(python3 - "$PLAN_PATH" <<'PY'
-import sys, json
+  # D-056 (2026-06-13): when plan.json.decomposition is the node source AND a
+  # workflow.yaml is also configured for the same task_class, lift the
+  # per-node model_lane / prompt_ref / verifier_ref / dispatch_mode from
+  # workflow.yaml. Without this, the planner's decomposition (which doesn't
+  # know about lane bindings) silently collapses every researcher node onto
+  # the generic 'researcher' lane (= kimi per default agents.yaml). That
+  # killed heterogeneous-lens panels: 4 distinct families (glm/kimi/codex/
+  # minimax) all routed to kimi, defeating the ρ-diversity contract. Match
+  # plan-decomp node-id to workflow node name, allowing both `glm_lens` and
+  # `glm-lens` (planner LLMs sometimes rewrite underscores to dashes).
+  mapfile -t NODE_IDS < <(WORKFLOW_PATH="${WORKFLOW:-}" python3 - "$PLAN_PATH" <<'PY'
+import os, re, sys, json
+
+try:
+    import yaml
+except ImportError:
+    yaml = None
+
 with open(sys.argv[1]) as f:
     p = json.load(f)
+
+# Optional workflow.yaml lookup for lane / prompt-ref / verifier-ref / dispatch-mode.
+workflow_path = os.environ.get("WORKFLOW_PATH", "")
+wf_by_name = {}
+if workflow_path and yaml is not None and os.path.isfile(workflow_path):
+    try:
+        with open(workflow_path) as wf:
+            wf_data = yaml.safe_load(wf) or {}
+        for node in (wf_data.get("nodes") or []):
+            name = str(node.get("name") or "")
+            if not name:
+                continue
+            wf_by_name[name] = {
+                "model_lane":   str(node.get("model_lane") or "") or None,
+                "prompt_ref":   str(node.get("prompt_ref") or "") or None,
+                "verifier_ref": str(node.get("verifier_ref") or "") or None,
+                "dispatch_mode": str(node.get("dispatch_mode") or "serial"),
+            }
+    except Exception:
+        wf_by_name = {}
+
+def _wf_lookup(nid: str):
+    """Match by exact name, then underscore-variant, then dash-variant."""
+    if nid in wf_by_name:
+        return wf_by_name[nid]
+    underscored = nid.replace("-", "_")
+    if underscored in wf_by_name:
+        return wf_by_name[underscored]
+    dashed = nid.replace("_", "-")
+    if dashed in wf_by_name:
+        return wf_by_name[dashed]
+    return None
+
 for step in p.get("decomposition", []):
     nid = step.get('id', '')
     ntyp = step.get('node_type') or 'implementer'  # explicit None/empty → implementer
@@ -430,7 +479,14 @@ for step in p.get("decomposition", []):
         continue
     sep = "\x1f"
     desc = (step.get('description','') or '').replace(sep, " ")
-    print(sep.join([nid, ntyp, desc, "", "serial", "", ntyp, ""]))
+    wf = _wf_lookup(nid) or {}
+    # Plan-decomp wins for the fields the planner explicitly sets; workflow.yaml
+    # fills in the lane/prompt/verifier/mode that planners can't infer.
+    model_lane = step.get("model_lane") or (wf.get("model_lane") or ntyp)
+    prompt_ref = step.get("prompt_ref") or wf.get("prompt_ref") or ""
+    verifier_ref = step.get("verifier_ref") or wf.get("verifier_ref") or ""
+    dispatch_mode = step.get("dispatch_mode") or wf.get("dispatch_mode") or "serial"
+    print(sep.join([nid, ntyp, desc, prompt_ref, dispatch_mode, verifier_ref, model_lane, ""]))
 PY
   )
 fi
@@ -636,7 +692,15 @@ PY
     # MO_TRACEPARENT so every llm_calls row written downstream embeds it.
     # Without this, the UI's strict trace_id bridge misses all calls and
     # falls back to time-window (which can leak neighbor-run rows).
-    _canonical_trace=$(sqlite3 "$MINI_ORK_DB" "SELECT COALESCE(trace_id,'') FROM task_runs WHERE id='${MINI_ORK_TASK_RUN_ID}' LIMIT 1;" 2>/dev/null)
+    # `|| true` swallows sqlite3 exit≠0 — e.g. when state.db has no task_runs
+    # table because the MINI_ORK_HOME was bootstrapped without `mini-ork init`
+    # (or initialized at a different schema version). Without the swallow,
+    # bash `set -e` + command-substitution under `inherit_errexit` causes the
+    # whole script to crash before the dispatch loop fires, leaving execute.log
+    # truncated at the "nodes: N" header and downstream verifier reporting
+    # vacuous pass on missing artifacts. Bridge stays best-effort; UI just
+    # falls back to time-window trace correlation when this skips.
+    _canonical_trace=$(sqlite3 "$MINI_ORK_DB" "SELECT COALESCE(trace_id,'') FROM task_runs WHERE id='${MINI_ORK_TASK_RUN_ID}' LIMIT 1;" 2>/dev/null || true)
     if [ -n "$_canonical_trace" ]; then
       export MO_TRACEPARENT="00-${_canonical_trace}-$(printf '%016x' $((RANDOM * RANDOM + $$)))-01"
       echo "    trace:    $MO_TRACEPARENT"
@@ -1213,6 +1277,69 @@ _dispatch_node() {
       ;;
 
     implementer)
+      if [ "${MINI_ORK_RECIPE:-}" = "doc-to-features-loop" ] && [ "$node_id" = "per_feature_dispatcher" ]; then
+        IMPL_LOG="$RUN_DIR/child-runs/_summary.json"
+        local _dispatcher="$MINI_ORK_ROOT/recipes/doc-to-features-loop/lib/per_feature_dispatcher.py"
+        if [ ! -f "$_dispatcher" ]; then
+          MO_NODE_FINISH_REASON="error"
+          echo "per-feature dispatcher script missing: $_dispatcher" >&2
+          _trace_write_node_rich "$NODE_TRACE_ID" "failure" "implementer" "$IMPL_LOG" "" "$MO_NODE_FINISH_REASON"
+          return 1
+        fi
+        if python3 "$_dispatcher"; then
+          MO_NODE_FINISH_REASON="done"
+          echo "  [ok] per-feature dispatcher results → $IMPL_LOG"
+          _trace_write_node_rich "$NODE_TRACE_ID" "success" "implementer" "$IMPL_LOG" "" "$MO_NODE_FINISH_REASON"
+        else
+          MO_NODE_FINISH_REASON="error"
+          echo "per-feature dispatcher failed" >&2
+          _trace_write_node_rich "$NODE_TRACE_ID" "failure" "implementer" "$IMPL_LOG" "" "$MO_NODE_FINISH_REASON"
+          return 1
+        fi
+        return 0
+      fi
+      if [ "${MINI_ORK_RECIPE:-}" = "epic-runner" ] && [ "$node_id" = "epic_dispatcher" ]; then
+        IMPL_LOG="$RUN_DIR/epic-results.json"
+        local _dispatcher="$MINI_ORK_ROOT/recipes/epic-runner/lib/epic_dispatcher.py"
+        if [ ! -f "$_dispatcher" ]; then
+          MO_NODE_FINISH_REASON="error"
+          echo "epic dispatcher script missing: $_dispatcher" >&2
+          _trace_write_node_rich "$NODE_TRACE_ID" "failure" "implementer" "$IMPL_LOG" "" "$MO_NODE_FINISH_REASON"
+          return 1
+        fi
+        if python3 "$_dispatcher"; then
+          MO_NODE_FINISH_REASON="done"
+          echo "  [ok] epic dispatcher results → $IMPL_LOG"
+          _trace_write_node_rich "$NODE_TRACE_ID" "success" "implementer" "$IMPL_LOG" "" "$MO_NODE_FINISH_REASON"
+        else
+          MO_NODE_FINISH_REASON="error"
+          echo "epic dispatcher failed" >&2
+          _trace_write_node_rich "$NODE_TRACE_ID" "failure" "implementer" "$IMPL_LOG" "" "$MO_NODE_FINISH_REASON"
+          return 1
+        fi
+        return 0
+      fi
+      if [ "${MINI_ORK_RECIPE:-}" = "epic-runner" ] && [ "$node_id" = "wave_aggregator" ]; then
+        IMPL_LOG="$RUN_DIR/wave-aggregate.json"
+        local _aggregator="$MINI_ORK_ROOT/recipes/epic-runner/lib/wave_aggregator.py"
+        if [ ! -f "$_aggregator" ]; then
+          MO_NODE_FINISH_REASON="error"
+          echo "wave aggregator script missing: $_aggregator" >&2
+          _trace_write_node_rich "$NODE_TRACE_ID" "failure" "implementer" "$IMPL_LOG" "" "$MO_NODE_FINISH_REASON"
+          return 1
+        fi
+        if python3 "$_aggregator"; then
+          MO_NODE_FINISH_REASON="done"
+          echo "  [ok] wave aggregate → $IMPL_LOG"
+          _trace_write_node_rich "$NODE_TRACE_ID" "success" "implementer" "$IMPL_LOG" "" "$MO_NODE_FINISH_REASON"
+        else
+          MO_NODE_FINISH_REASON="error"
+          echo "wave aggregator failed" >&2
+          _trace_write_node_rich "$NODE_TRACE_ID" "failure" "implementer" "$IMPL_LOG" "" "$MO_NODE_FINISH_REASON"
+          return 1
+        fi
+        return 0
+      fi
       _require_lib llm-dispatch
       [ -f "${PROMPT_FILE:-}" ] || PROMPT_FILE="$MINI_ORK_ROOT/prompts/implementer.md"
       IMPL_LOG="$RUN_DIR/impl-${node_id}.log"
@@ -1518,7 +1645,17 @@ try:
     d = yaml.safe_load(open('$_contract')) or {}
     outs = d.get('outputs') or []
     for o in outs:
-        print(o)
+        # Outputs entries are either plain path strings or dict-shaped
+        # records with at least a 'path' key (recipe-creator + recursive-
+        # validate-impl convention). Without this guard, dict entries get
+        # str()'d into 'repr(dict)' filenames, which is how the
+        # 2026-06-13 OSS-leak garbage commits happened.
+        if isinstance(o, dict):
+            path = o.get('path')
+            if path:
+                print(path)
+        elif isinstance(o, str):
+            print(o)
 except Exception:
     pass
 " 2>/dev/null)
