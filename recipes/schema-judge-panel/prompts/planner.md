@@ -2,6 +2,14 @@
 
 You are planning a five-judge database/codebase architecture review.
 
+The full kickoff content is interpolated below.
+
+## Kickoff
+
+{{KICKOFF_CONTENT}}
+
+## Planner instructions
+
 The kickoff names the target repository, the proposed architecture document,
 and the user's priority order:
 
