@@ -17,6 +17,23 @@ mini-ork is a **task operating system for agents**. It receives a goal, classifi
 
 ---
 
+## Competitive advantage: compounding agent work, not one-off prompting
+
+mini-ork's edge is that it treats agent work as an operating system problem, not a chat-session problem. The framework records what happened, routes the next attempt through better lanes, verifies outputs with executable gates, and can improve its own workflows under budget and safety constraints.
+
+| Advantage | Why it matters | How mini-ork implements it |
+|---|---|---|
+| **Recursive self-improvement** | The system can learn from its own failed or expensive runs instead of waiting for a human to manually redesign the workflow. | `recursive-self-improve` scans bottlenecks, gathers heterogeneous evidence, proposes workflow/code changes, benchmarks them, and promotes only through gated checks. The 2026-06-09 run produced 10 autonomous, evidence-cited commits to `main`. |
+| **Cross-family review independence** | A panel of same-family agents often shares the same blind spots; diversity only counts when the evaluators are meaningfully different. | Recipes can dispatch lenses across Zhipu, Moonshot, OpenAI, DeepSeek, Anthropic, and MiniMax lanes, while `coalition_gate.sh` blocks same-family degeneration. |
+| **Executable verification before opinion** | LLM review is useful, but it should not be the final oracle when tests, schemas, or shell checks can decide. | Recipe-local `verifiers/*.sh` return mechanical pass/fail results; empty verification is marked `vacuous`, not silently treated as success. |
+| **Persistent memory and trajectory data** | Each run becomes training signal for the next run without fine-tuning a model or depending on hidden vendor memory. | `state.db` stores task runs, failure gradients, context packs, agent performance, cost, duration, and lineage. Planner/node prompts receive relevant prior outcomes. |
+| **Cost-aware orchestration** | Agent systems fail in production when every step uses the most expensive model or runaway loops keep billing. | Lane routing, per-call `llm_calls`, `MO_DAILY_BUDGET_USD`, per-run budgets, cache reuse, escalation edges, and circuit breakers make spend visible and bounded. |
+| **Recipes instead of framework lock-in** | Teams need different workflows without forking the orchestrator. | Domain logic lives in `recipes/`; the framework supplies the reusable classify → plan → execute → verify → reflect → improve loop and the shared safety rails. |
+
+The practical result: mini-ork can start cheap, escalate only when gates fail, preserve what it learned, and recursively improve the workflow that produced the result. That is the difference between a capable agent session and a compounding agent system.
+
+---
+
 ## Why not just a single-agent coder?
 
 Single-agent coding assistants are remarkable engines. They are also, structurally, three bad deals at once:
