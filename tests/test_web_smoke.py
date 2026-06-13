@@ -984,13 +984,19 @@ def test_agents_yaml_has_capabilities_section() -> None:
 
 
 def test_capability_check_passes_when_family_supports_all() -> None:
+    # kimi_lens is the canonical "supports vision + tools" lane after the
+    # 2026-06-13 no-opus standing directive removed opus_lens from
+    # .mini-ork/config/agents.yaml. Kimi exposes vision=true + tools=true
+    # in config/agents.yaml's capabilities map, which is what the gate
+    # asserts against. opus_lens used to play this role but no longer
+    # resolves under the override; codex / glm / minimax all lack vision.
     script = (
         "set -euo pipefail; "
         "MINI_ORK_ROOT=$PWD; "
         "MINI_ORK_HOME=$PWD/.mini-ork; "
         "MO_LANE_REQUIRES_CAPABILITY='vision,tools'; "
         "source lib/lane-helpers.sh; "
-        "mo_assert_lane_capability opus_lens"
+        "mo_assert_lane_capability kimi_lens"
     )
     subprocess.run(
         ["bash", "--noprofile", "--norc", "-c", script],
