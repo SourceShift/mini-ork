@@ -19,6 +19,10 @@ case "$sub" in
   metrics)
     exec "$MINI_ORK_ROOT/bin/mini-ork-metrics" "$@" ;;
 
+  # Evolution + promotion: rollback a workflow or agent to its previous stable version
+  rollback)
+    exec "$MINI_ORK_ROOT/bin/mini-ork-rollback" "$@" ;;
+
   # Read-only observability UI (React SPA + FastAPI + SSE)
   serve)
     exec "$MINI_ORK_ROOT/bin/mini-ork-serve" "$@" ;;

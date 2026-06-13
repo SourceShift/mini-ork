@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# mini-ork-rollback - Roll back a workflow or agent to its previous stable version.
+
+set -Eeuo pipefail
+
+MINI_ORK_ROOT="${MINI_ORK_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+export MINI_ORK_ROOT
+
+_usage() {
+  cat <<'EOF'
+Usage: mini-ork rollback <workflow|agent> <name>
+
+Roll back a workflow or agent to its previous stable version.
+
+Arguments:
+  workflow|agent   Registry kind to roll back
+  name             Workflow or agent name
+
+Options:
+  --help, -h       Show this help
+EOF
+}
+
+if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+  _usage
+  exit 0
+fi
+
+kind="${1:-}"
+name="${2:-}"
+
+if [[ "$kind" != "workflow" && "$kind" != "agent" ]]; then
+  _usage >&2
+  exit 2
+fi
+
+if [[ -z "$name" || $# -ne 2 ]]; then
+  _usage >&2
+  exit 2
+fi
+
+MINI_ORK_HOME="${MINI_ORK_HOME:-$(pwd)/.mini-ork}"
+MINI_ORK_DB="${MINI_ORK_DB:-$MINI_ORK_HOME/state.db}"
+export MINI_ORK_HOME MINI_ORK_DB
+
+# shellcheck source=lib/version_registry.sh
+source "$MINI_ORK_ROOT/lib/version_registry.sh"
+
+version_rollback "$kind" "$name"
