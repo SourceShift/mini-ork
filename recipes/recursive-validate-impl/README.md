@@ -19,3 +19,22 @@ probes, checks hard-rule compliance, searches arxiv-libwit for current
 techniques, and judges compliance with modern techniques for the feature class.
 That keeps verification focused on both "does it work?" and "is this a modern,
 defensible implementation?"
+
+## Fail-fast quorum (added 2026-06-14)
+
+Between the 4 parallel tier-4 lens reports and the tier-4 synthesizer sits
+a `tier4_quorum` verifier node. It counts how many of `tier4-{glm,kimi,
+codex,minimax}.md` exist and are non-empty (size > 100 bytes). If the
+count is less than `MO_TIER4_QUORUM` (default **3 of 4**), the gate
+emits `pass=false` and the recipe edge escalates straight to `reflector`
+instead of letting `tier4_synth` hang waiting for missing data.
+
+This closes a stall pattern observed in two earlier runs where 2 of 4
+lens reports were silently absent and the synthesizer either looped on
+partial input or waited indefinitely. The quorum allows 1 lens failure
+(rate-limit, network blip, single-provider outage) without blocking the
+loop; 2+ failures escalate to reflector for replan or operator review.
+
+Tune via env:
+- `MO_TIER4_QUORUM` — minimum non-empty lens reports required (default 3)
+- `MO_TIER4_LENS_MIN_BYTES` — size threshold for "non-empty" (default 100)
