@@ -750,6 +750,21 @@ try:
 finally:
     con.close()
 " "$MINI_ORK_DB" "$MINI_ORK_RUN_ID" "$_cost" 2>/dev/null || true
+
+  # Epic E4: reactive cost-pause. After charging the node, check
+  # whether we've crossed the next MO_PAUSE_EVERY_USD window. If so,
+  # mo_cost_pause_check writes the sentinel + returns rc=2. The
+  # finish_reason 'paused_for_approval' lets downstream nodes detect
+  # the pause without inspecting the sentinel themselves. Resume via
+  # `bin/mini-ork-resume <run_id>`.
+  if [ -f "$MINI_ORK_ROOT/lib/cost_pause.sh" ]; then
+    # shellcheck source=/dev/null
+    source "$MINI_ORK_ROOT/lib/cost_pause.sh"
+    if ! mo_cost_pause_check "$MINI_ORK_RUN_ID" "$_cost"; then
+      MO_NODE_FINISH_REASON="paused_for_approval"
+      export MO_NODE_FINISH_REASON
+    fi
+  fi
 }
 
 # D-042 (v0.2-pt12): build a rich trace_write payload for a node.
@@ -1039,6 +1054,14 @@ _mo_stop_node_heartbeat_loop() {
   wait "$pid" 2>/dev/null || true
 }
 
+_mo_intervention_gate_check() {
+  local node_id="$1" node_type="$2" dispatch_lane="$3" node_desc="$4"
+  local gate_lib="$MINI_ORK_ROOT/lib/intervention_gate.sh"
+  [ -f "$gate_lib" ] || return 0
+  _mo_source "$gate_lib"
+  intervention_gate_check "$node_id" "$node_type" "$dispatch_lane" "$node_desc"
+}
+
 _dispatch_node() {
   local node_id="$1" node_type="$2" node_desc="$3" node_prompt_ref="${4:-}" node_verifier_ref="${5:-}" node_model_lane="${6:-}" node_requires_capabilities="${7:-}"
   local dispatch_lane="${node_model_lane:-$node_type}"
@@ -1074,6 +1097,12 @@ _dispatch_node() {
   if [ "$DRY_RUN" -eq 1 ]; then
     echo "[dry-run] would dispatch node_id=${node_id} node_type=${node_type} model_lane=${dispatch_lane}: ${node_desc}"
     return 0
+  fi
+
+  if ! _mo_intervention_gate_check "$node_id" "$node_type" "$dispatch_lane" "$node_desc"; then
+    MO_NODE_FINISH_REASON="blocked"
+    FAIL_COUNT=$((${FAIL_COUNT:-0} + 1))
+    return 1
   fi
 
   if [ "$workflow_lane" != "$dispatch_lane" ]; then
