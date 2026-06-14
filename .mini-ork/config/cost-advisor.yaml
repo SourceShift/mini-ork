@@ -1,0 +1,46 @@
+# Per-turn cost advisor configuration.
+#
+# The advisor picks ONE model per turn sized to the turn's difficulty
+# (trivial → cheap, medium → medium, hard → expensive). This file
+# defines the tier → model mapping AND the budget thresholds that
+# trigger tier downgrades when the run is running short on budget.
+#
+# Operators tune per deployment. The framework only LOOKS UP, never
+# calls home, never refreshes from a remote.
+#
+# Wiring: mini_ork.cost_advisor.advise_model() reads this YAML before
+# dispatching. The advisor itself classifies turn difficulty using
+# the cheap classifier lane below.
+
+tiers:
+  cheap:
+    # Smallest model still capable of structured JSON + tool use.
+    # Default: kimi (no-opus directive applies).
+    model: kimi
+    max_input_tokens: 64000
+    price_ceiling_usd_per_million: 1.0
+  medium:
+    model: glm
+    max_input_tokens: 128000
+    price_ceiling_usd_per_million: 3.0
+  expensive:
+    # Reserved for hard turns where cheap models would loop.
+    # No opus, no sonnet, no gemini per standing directive.
+    model: codex
+    max_input_tokens: 200000
+    price_ceiling_usd_per_million: 15.0
+
+budget_thresholds:
+  # When the run's remaining budget drops below these, the advisor
+  # downgrades the tier regardless of the classifier's verdict.
+  # Reactive defence against late-run cost overruns.
+  force_cheap_below_usd: 5.0
+  force_medium_below_usd: 25.0
+
+classifier:
+  # The classifier itself is a CHEAP LLM call. It must never be the
+  # expensive tier — that would defeat the purpose. Recursion guard:
+  # the classifier never invokes the advisor itself.
+  lane: deepseek_lens
+  max_input_tokens: 300
+  max_output_tokens: 100
