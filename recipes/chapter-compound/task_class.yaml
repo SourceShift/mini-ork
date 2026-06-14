@@ -1,0 +1,54 @@
+name: chapter_compound
+version: "0.1.0"
+description: >
+  Multi-pass chapter writer: 4 heterogeneous LLM lenses (glm/kimi/codex/opus)
+  each draft the SAME chapter in parallel from a shared contract+evidence+outline,
+  then the 4-lens panel critique scores every draft, an Opus-meta synthesizer
+  selects the best via deterministic weighting, and a focused revise loop
+  (Opus-only, N iterations, default N=2) tightens the selected draft to
+  passing. Publishes chapter-compound.json carrying the final markdown,
+  selection rationale, and full audit-bundle of every pass.
+
+  Composes the existing chapter-review recipe (consumed via critique-fanout
+  per-draft) with a writer-fanout + selection + revise overlay. The output
+  artifact's per-cell critiques reuse chapter-review.json shape verbatim,
+  so any consumer already on chapter-review can recurse into compound's
+  critique_cells without schema work.
+
+# Canonical matcher shape (matches schemas/task_class.schema.json).
+matches:
+  keywords:
+    - chapter compound
+    - multi-pass writer
+    - compound writer
+    - 4-lens writer
+    - writer fanout
+    - parallel chapter drafts
+    - audit-bundle chapter
+    - book chapter compound
+    - chapter compound writer
+    - select best draft
+    - lens-diverse writer
+  regex: []
+
+artifact_contract_ref: artifact_contract.yaml
+default_workflow: workflow.yaml
+
+default_gates:
+  - budget_gate
+  - scope_gate
+
+risk_class: medium   # Writer fanout produces NEW content — not read-only.
+
+# Cost model (informational; budget_gate enforces).
+# 4 writers × $0.10-0.20 + 16 critique cells (4 chapter-review runs × 4 lenses
+# internal) × $0.05-0.10 + 1 selection ($0.01) + 2-3 revise × $0.05-0.20.
+cost_model:
+  min_usd: 1
+  max_usd: 5
+  per_writer_usd: 1
+  per_critique_run_usd: 1
+
+runtime_model:
+  min_minutes: 5
+  max_minutes: 25

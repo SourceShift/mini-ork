@@ -1,0 +1,86 @@
+version: "0.1.0"
+task_class: chapter_compound
+description: >
+  Multi-pass writer: 4 parallel writer lenses produce 4 drafts of the SAME
+  chapter from a shared contract, the chapter-review panel scores every
+  draft (4 critique cells), an Opus-meta synthesizer selects the best via
+  deterministic weighting, and a focused revise loop tightens it.
+  Publishes chapter-compound.json (libwit/shared/types/chapterCompound.ts
+  schema-guard contract).
+
+nodes:
+  # ── Writer fanout (4 parallel) ──────────────────────────────────────
+  # Each lens drafts the SAME chapter from the shared contract+evidence+outline.
+  # Same lens family as chapter-review so the per-cell critiques can reuse
+  # chapter-review's scoring matrix directly.
+  - { name: writer_glm,    type: researcher, model_lane: glm_lens,    prompt_ref: prompts/writer-glm.md,    dispatch_mode: parallel, gates: [budget_gate] }
+  - { name: writer_kimi,   type: researcher, model_lane: kimi_lens,   prompt_ref: prompts/writer-kimi.md,   dispatch_mode: parallel, gates: [budget_gate] }
+  - { name: writer_codex,  type: researcher, model_lane: codex_lens,  prompt_ref: prompts/writer-codex.md,  dispatch_mode: parallel, gates: [budget_gate] }
+  - { name: writer_opus,   type: researcher, model_lane: opus_lens,   prompt_ref: prompts/writer-opus.md,   dispatch_mode: parallel, gates: [budget_gate] }
+
+  # ── Critique fanout (4 parallel) ────────────────────────────────────
+  # One critique pass per draft. Each critique_fanout node invokes the
+  # 4-lens chapter-review panel internally — yielding 4 critique cells
+  # (one per writer-lens) where each cell carries the full
+  # chapter-review.json shape. Output: critique-<writer>.json.
+  - { name: critique_glm,    type: reviewer, model_lane: reviewer, prompt_ref: prompts/critique-fanout-glm.md,    dispatch_mode: parallel, gates: [budget_gate] }
+  - { name: critique_kimi,   type: reviewer, model_lane: reviewer, prompt_ref: prompts/critique-fanout-kimi.md,   dispatch_mode: parallel, gates: [budget_gate] }
+  - { name: critique_codex,  type: reviewer, model_lane: reviewer, prompt_ref: prompts/critique-fanout-codex.md,  dispatch_mode: parallel, gates: [budget_gate] }
+  - { name: critique_opus,   type: reviewer, model_lane: reviewer, prompt_ref: prompts/critique-fanout-opus.md,   dispatch_mode: parallel, gates: [budget_gate] }
+
+  # ── Selection (deterministic + Opus-meta rationale) ─────────────────
+  # Reads all 4 critique cells, computes:
+  #   composite_score(draft) = mean(axes.score)
+  #                          × (1 - panel_disagreement_score)
+  #                          × (1 + log(accepted_for_review_count))
+  # Picks winning draft, writes selection.json + winning-draft.md.
+  - { name: selector,    type: reviewer, model_lane: reviewer, prompt_ref: prompts/select-best.md,   dispatch_mode: serial, gates: [budget_gate] }
+
+  # ── Revise loop (Opus-only, iteration-bounded) ──────────────────────
+  # Applies fragment_suggestions from the selected draft's critique to the
+  # selected markdown. Re-critiques (single Opus) after each iteration;
+  # exit when post-critique.passed === true OR max_revise_iterations
+  # reached (from context.json, default 2). Writes revisions/iter-<N>.json
+  # per iteration + cumulative revisions.json.
+  - { name: revise_loop, type: reviewer, model_lane: reviewer, prompt_ref: prompts/revise-loop.md,   dispatch_mode: serial, gates: [budget_gate] }
+
+  # ── Verifiers ───────────────────────────────────────────────────────
+  - { name: schema_verifier,        type: verifier, verifier_ref: verifiers/schema.sh,              dispatch_mode: serial }
+  - { name: writer_completeness,    type: verifier, verifier_ref: verifiers/writer-completeness.sh, dispatch_mode: serial }
+
+  # ── Publisher commits chapter-compound.json; rollback on failure ───
+  - { name: publisher,   type: publisher, prompt_ref: null, dispatch_mode: serial, gates: [scope_gate] }
+  - { name: rollback,    type: rollback,  prompt_ref: null, dispatch_mode: serial }
+
+edges:
+  # Writers run in parallel from kickoff. Each critique consumes its
+  # corresponding writer's draft.
+  - { from: writer_glm,    to: critique_glm,   edge_type: supplies_context_to }
+  - { from: writer_kimi,   to: critique_kimi,  edge_type: supplies_context_to }
+  - { from: writer_codex,  to: critique_codex, edge_type: supplies_context_to }
+  - { from: writer_opus,   to: critique_opus,  edge_type: supplies_context_to }
+
+  # Selector waits for ALL critiques.
+  - { from: critique_glm,   to: selector, edge_type: supplies_context_to }
+  - { from: critique_kimi,  to: selector, edge_type: supplies_context_to }
+  - { from: critique_codex, to: selector, edge_type: supplies_context_to }
+  - { from: critique_opus,  to: selector, edge_type: supplies_context_to }
+
+  # Revise loop reads selector output.
+  - { from: selector, to: revise_loop, edge_type: supplies_context_to }
+
+  # Verifiers gate on revise_loop completion.
+  - { from: revise_loop, to: schema_verifier,     edge_type: verifies }
+  - { from: revise_loop, to: writer_completeness, edge_type: verifies }
+
+  # Publisher requires BOTH verifiers passing.
+  - { from: schema_verifier,     to: publisher, edge_type: depends_on }
+  - { from: writer_completeness, to: publisher, edge_type: depends_on }
+
+  # Rollback catches any failure.
+  - { from: publisher,            to: rollback, edge_type: escalates_to }
+  - { from: schema_verifier,      to: rollback, edge_type: escalates_to }
+  - { from: writer_completeness,  to: rollback, edge_type: escalates_to }
+
+rollback_strategy: keep_drafts_and_critiques_discard_synthesis
+max_self_correction_iterations: 2

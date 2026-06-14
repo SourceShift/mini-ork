@@ -1,0 +1,28 @@
+task_class: chapter_compound
+expected_artifact: composite     # 4 drafts + 4 critique-fanout JSONs + 1 selection + N revisions + 1 compound JSON
+success_verifiers:
+  - verifiers/schema.sh
+  - verifiers/writer-completeness.sh
+failure_policy: request_changes
+rollback_policy: >
+  Keep every draft + critique cell under runs/<id>/drafts/draft-*.md and
+  runs/<id>/critiques/critique-*.json for inspection. Discard the
+  compound artifact if it failed verification; the per-lens drafts and
+  critiques remain individually consumable so a second-pass synthesis
+  can be re-attempted without re-running writers.
+
+# source_artifact names the input files staged into $MINI_ORK_RUN_DIR
+# by the dispatcher (per the libwit BE's stageChapterCompoundInputs
+# at server/resources/daytona/run-miniork-agent.cjs). outputs[] lists
+# the canonical artifact the publisher writes + git-commits.
+source_artifact:
+  - chapter_contract.json   # ChapterWritingContract (JSON)
+  - evidence_pack.md        # Pre-fetched evidence bundle (markdown)
+  - chapter_outline.md      # chapterPlan.summary + keyTopics
+  - context.json            # chapter_title, chapter_number, book_topic,
+                            #   audience, language, style_blueprint_summary,
+                            #   prior_chapters_outline, max_revise_iterations
+  - style_blueprint.md      # Optional; stubbed if absent
+  - seed.md                 # Optional warm-start markdown
+outputs:
+  - chapter-compound.json
