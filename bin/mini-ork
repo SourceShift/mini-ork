@@ -23,6 +23,10 @@ case "$sub" in
   rollback)
     exec "$MINI_ORK_ROOT/bin/mini-ork-rollback" "$@" ;;
 
+  # Epic E4: clear a cost-pause sentinel so the next dispatch step can proceed
+  resume)
+    exec "$MINI_ORK_ROOT/bin/mini-ork-resume" "$@" ;;
+
   # Read-only observability UI (React SPA + FastAPI + SSE)
   serve)
     exec "$MINI_ORK_ROOT/bin/mini-ork-serve" "$@" ;;
