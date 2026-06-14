@@ -1,0 +1,58 @@
+version: "0.1.0"
+task_class: harness_bridge
+description: >
+  Wraps a full coding-agent harness (claude-code, codex-cli, or
+  gemini-cli) as a workflow node. Inspired by the Harvey pattern
+  Databricks describes in their Omnigent announcement: an open
+  worker model + a frontier advisor caller. Mini-ork's harness
+  bridge lets you compose either model as a node alongside
+  mini-ork's verifier-gated artifact pipeline.
+#
+# Loaded by Epic E6 of the Omnigent-improvement plan
+# (.mini-ork/kickoffs/omnigent-phase-e6-http-api-and-harness-wrappers.md).
+# Planner picks the harness based on the kickoff's `## Harness`
+# declaration; the harness_node calls lib/harness_wrapper.sh::
+# mo_harness_wrap; the verifier checks the emitted diff applies
+# cleanly + the verdict shape is well-formed.
+
+nodes:
+  - name: planner
+    type: planner
+    model_lane: planner
+    prompt_ref: prompts/planner.md
+    dispatch_mode: serial
+
+  - name: harness_node
+    type: implementer
+    model_lane: worker
+    prompt_ref: null
+    dispatch_mode: serial
+    gates:
+      - scope_gate
+      - budget_gate
+
+  - name: harness_verifier
+    type: verifier
+    verifier_ref: verifiers/harness-shape.sh
+    prompt_ref: null
+    dispatch_mode: serial
+
+  - name: publisher
+    type: publisher
+    prompt_ref: null
+    dispatch_mode: serial
+    gates:
+      - scope_gate
+
+  - name: rollback
+    type: rollback
+    prompt_ref: null
+    dispatch_mode: serial
+
+edges:
+  - { from: planner,          to: harness_node,     edge_type: depends_on }
+  - { from: harness_node,     to: harness_verifier, edge_type: verifies }
+  - { from: harness_verifier, to: publisher,        edge_type: depends_on, condition: pass }
+  - { from: harness_verifier, to: rollback,         edge_type: escalates_to, condition: fail }
+
+rollback_strategy: keep_harness_stdout_discard_diff
