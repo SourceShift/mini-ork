@@ -1,0 +1,76 @@
+# Egress policies — config-driven secret-injection allowlist.
+#
+# Declares which upstream hosts may receive which named secrets when
+# the agent's outbound traffic is routed through the Omnigent egress
+# proxy. The proxy reads this allowlist + injects secrets from the
+# operator's vault on approved requests. Secrets NEVER appear in
+# the agent's environment, command line, or trace store.
+#
+# Wiring (NOT shipped in this epic — see Epic E2/E5 follow-ups):
+#   - lib/llm-dispatch.sh calls mo_egress_proxy_start before each
+#     provider dispatch; the proxy reads this YAML.
+#   - The vault (separate epic) stores the actual secret values.
+#   - The agent process sees only HTTPS_PROXY=localhost:<port>;
+#     it never sees a raw API key.
+#
+# Schema:
+#   policies:
+#     <policy_name>:
+#       allowed_hosts: [list]      # exact host matches; no wildcards in v1
+#       inject_secret: <NAME>      # the vault key
+#       inject_header: <header>    # which HTTP header to set
+#       prefix: "<optional>"       # e.g. "Bearer " or "token "
+#
+# Operators edit this file directly. Adding a new provider means
+# adding a new policy block; nothing rebuilt.
+
+policies:
+  anthropic-api:
+    allowed_hosts:
+      - api.anthropic.com
+    inject_secret: ANTHROPIC_API_KEY
+    inject_header: x-api-key
+
+  openai-api:
+    allowed_hosts:
+      - api.openai.com
+    inject_secret: OPENAI_API_KEY
+    inject_header: authorization
+    prefix: "Bearer "
+
+  moonshot-api:
+    allowed_hosts:
+      - api.moonshot.cn
+      - api.moonshot.ai
+    inject_secret: MOONSHOT_API_KEY
+    inject_header: authorization
+    prefix: "Bearer "
+
+  zhipu-api:
+    allowed_hosts:
+      - open.bigmodel.cn
+    inject_secret: GLM_API_KEY
+    inject_header: authorization
+    prefix: "Bearer "
+
+  minimax-api:
+    allowed_hosts:
+      - api.minimax.io
+      - api.minimax.chat
+    inject_secret: MINIMAX_API_KEY
+    inject_header: authorization
+    prefix: "Bearer "
+
+  deepseek-api:
+    allowed_hosts:
+      - api.deepseek.com
+    inject_secret: DEEPSEEK_API_KEY
+    inject_header: authorization
+    prefix: "Bearer "
+
+  github-api:
+    allowed_hosts:
+      - api.github.com
+    inject_secret: GITHUB_TOKEN
+    inject_header: authorization
+    prefix: "token "
