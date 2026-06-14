@@ -331,7 +331,7 @@ The framework ships the universal loop and its primitives. Nothing in `lib/` or 
 
 ### RECIPES — opinions live here
 
-Recipes are user-land workflow definitions. They compose framework primitives into pipeline shapes. 25 recipes ship today; 8 of them dispatch a 4–5 lens panel across distinct model families per cycle, using family diversity as a practical proxy for the low-correlation detector patterns highlighted by Rajan 2025.
+Recipes are user-land workflow definitions. They compose framework primitives into pipeline shapes. 26 recipes ship today; 8 of them dispatch a 4–5 lens panel across distinct model families per cycle, using family diversity as a practical proxy for the low-correlation detector patterns highlighted by Rajan 2025.
 
 | Recipe | Location | Shape |
 |---|---|---|
@@ -361,6 +361,7 @@ Recipes are user-land workflow definitions. They compose framework primitives in
 | `recursive-validate-impl` | `recipes/recursive-validate-impl/` | **Recipe-creator-authored, 2026-06-12.** Recursive implement → multi-tier-validate → reflect → replan loop for any technical-feature kickoff. 5-tier verification (compile/typecheck → scoped unit → property + mutation → heterogeneous LLM panel) gated left-to-right; tier-4 panel cross-references implementation against arxiv-libwit "modern techniques" compliance, not just done-state. Reflector extracts failure gradients; recursion hard-caps at 5 iterations or $25 with a divergence-kill safety net. |
 
 | `harness-bridge` | `recipes/harness-bridge/` | **2026-06-14.** Wraps a full coding-agent harness (claude-code / codex-cli / gemini-cli) as a workflow node. Harvey-pattern composition. Planner picks the harness from a kickoff declaration; harness-shape verifier checks the emitted diff applies. |
+| `chapter-compound` | `recipes/chapter-compound/` | **2026-06-15.** Multi-pass book-chapter writer: 4 lens writers draft same chapter in parallel from shared contract, chapter-review recipe scores every draft (4×4 critique matrix), deterministic selector picks best, Opus-only revise loop tightens it. Audit-bundle output (`chapter-compound.json`) carries every draft + critique + selection rationale + revision trace. Consumed by libwit/server when `FEATURE_CHAPTER_COMPOUND_WRITER=true`. |
 
 Add your own under `recipes/<name>/` — see [docs/EXTENSION.md](docs/EXTENSION.md).
 
@@ -404,7 +405,7 @@ Auto-promotion is **class-restricted**: task classes with an external oracle (te
 The full release log lives in [`ROADMAP.md`](ROADMAP.md) — every section dated and per-commit-attributed. Current shipped totals (regenerable via `bash scripts/readme-claim-check.sh` and filesystem counts):
 
 - 6-stage universal loop (`classify → plan → execute → verify → reflect → improve`) + 7 companion entrypoints (`eval`, `improve`, `promote`, `metrics`, `spawn`, direct `bin/mini-ork-topology`, direct `bin/mini-ork-self-improve`)
-- 55 framework primitives in `lib/` (incl. oracle-hardening libs + `gate_bootstrap.sh` for the v0.3-rc1 central wire-up + `lib/throttle-guard.sh` for provider-throttle classification + `lib/mo_otel.sh` for env-gated OTel span emission, added 2026-06-09/10 + `lib/profile_answerer.sh` for MO_AUTO_ANSWER_PROFILE autonomous-dispatch mode, added 2026-06-12 + 4 calibration-list gates landed 2026-06-13: `lib/krippendorff_alpha_gate.sh` Nasser 2026 α<0.4 panel-divergence escalation, `lib/citation_verifier_mechanical.sh` Sistla 2025 mechanical citation coverage + wireheading check, `lib/refute_or_promote_gate.sh` Agarwal 2026 adversarial fabrication survival, `lib/honest_ci_gate.sh` Dai 2025 per-finding confidence intervals)
+- 56 framework primitives in `lib/` (incl. oracle-hardening libs + `gate_bootstrap.sh` for the v0.3-rc1 central wire-up + `lib/throttle-guard.sh` for provider-throttle classification + `lib/mo_otel.sh` for env-gated OTel span emission, added 2026-06-09/10 + `lib/profile_answerer.sh` for MO_AUTO_ANSWER_PROFILE autonomous-dispatch mode, added 2026-06-12 + 4 calibration-list gates landed 2026-06-13: `lib/krippendorff_alpha_gate.sh` Nasser 2026 α<0.4 panel-divergence escalation, `lib/citation_verifier_mechanical.sh` Sistla 2025 mechanical citation coverage + wireheading check, `lib/refute_or_promote_gate.sh` Agarwal 2026 adversarial fabrication survival, `lib/honest_ci_gate.sh` Dai 2025 per-finding confidence intervals)
 - 1 runner-shared helper in `bin/lib/` (`profile-seed.sh` — deterministic `run_profile.json` seeding from structured kickoff markdown, added 2026-06-09)
 - 19 user-facing `bin/mini-ork*` entrypoints (incl. `mini-ork rollback <workflow|agent> <name> + mini-ork resume <run_id> for cost-pause clearance, added 2026-06-14` added 2026-06-13 — first-class CLI verb for the evolution+promotion layer's version_registry)
 - 26 schema migrations under `db/migrations/` (memory namespaces, benchmarks, evolution, safety, panel topology telemetry, recursive orchestration, self-improvement learning, llm_calls session indexing, trace status widening, Arbor-style idea_tree primitive, error taxonomy + finish reasons, dispatch config snapshot, heartbeat + fuse, cache-aware cost accounting, policy state + audit trail)
