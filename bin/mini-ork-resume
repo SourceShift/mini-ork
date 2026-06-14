@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+# mini-ork-resume — operator entrypoint to clear a cost-pause sentinel.
+#
+# Companion to lib/cost_pause.sh (Epic E4). The dispatcher writes
+# .cost-pause sentinel files when cumulative run cost crosses
+# MO_PAUSE_EVERY_USD. This entrypoint removes the sentinel + records
+# the approval to <run_dir>/.cost-pause-approvals.jsonl so the
+# resume action is auditable.
+
+set -Eeuo pipefail
+
+MINI_ORK_ROOT="${MINI_ORK_ROOT:-$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)}"
+export MINI_ORK_ROOT
+
+_usage() {
+  cat <<EOF
+Usage: mini-ork resume <run_id>
+
+Clear the cost-pause sentinel for <run_id> + record an audit row.
+
+Arguments:
+  run_id           Run identifier (e.g. run-1781000000-12345)
+
+Options:
+  --help, -h       Show this help
+
+After resume, the next dispatch step against this run will be
+allowed to proceed. The cumulative spend counter is preserved -
+the NEXT pause fires when cost crosses the NEXT multiple of
+\$MO_PAUSE_EVERY_USD (default \$25), not immediately.
+EOF
+}
+
+case "${1:-}" in
+  ""|--help|-h)
+    _usage
+    [ -z "${1:-}" ] && exit 2 || exit 0
+    ;;
+esac
+
+RUN_ID="$1"
+
+MINI_ORK_HOME="${MINI_ORK_HOME:-$(pwd)/.mini-ork}"
+RUN_DIR="$MINI_ORK_HOME/runs/$RUN_ID"
+
+if [ ! -d "$RUN_DIR" ]; then
+  echo "[mini-ork-resume] run dir not found: $RUN_DIR" >&2
+  exit 1
+fi
+
+SENTINEL="$RUN_DIR/.cost-pause"
+if [ ! -f "$SENTINEL" ]; then
+  echo "[mini-ork-resume] no cost-pause sentinel for $RUN_ID (already running?)" >&2
+  exit 0
+fi
+
+# Audit row: append the approval to a jsonl file. Operators can grep
+# it to see who resumed which run when.
+APPROVALS="$RUN_DIR/.cost-pause-approvals.jsonl"
+APPROVER="${USER:-unknown}"
+TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+printf '{"resumed_at":"%s","approver":"%s","run_id":"%s","sentinel_payload":%s}\n' \
+  "$TS" "$APPROVER" "$RUN_ID" "$(cat "$SENTINEL")" \
+  >> "$APPROVALS"
+
+rm -f "$SENTINEL"
+
+echo "[mini-ork-resume] resumed $RUN_ID (approver=$APPROVER, audit=$APPROVALS)"
