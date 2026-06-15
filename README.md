@@ -361,6 +361,7 @@ Recipes are user-land workflow definitions. They compose framework primitives in
 | `recursive-validate-impl` | `recipes/recursive-validate-impl/` | **Recipe-creator-authored, 2026-06-12.** Recursive implement → multi-tier-validate → reflect → replan loop for any technical-feature kickoff. 5-tier verification (compile/typecheck → scoped unit → property + mutation → heterogeneous LLM panel) gated left-to-right; tier-4 panel cross-references implementation against arxiv-search-tool "modern techniques" compliance, not just done-state. Reflector extracts failure gradients; recursion hard-caps at 5 iterations or $25 with a divergence-kill safety net. |
 
 | `harness-bridge` | `recipes/harness-bridge/` | **2026-06-14.** Wraps a full coding-agent harness (claude-code / codex-cli / gemini-cli) as a workflow node. Harvey-pattern composition. Planner picks the harness from a kickoff declaration; harness-shape verifier checks the emitted diff applies. |
+| `chapter-validation-10lens` | `recipes/chapter-validation-10lens/` | **2026-06-15.** 10 parallel lens agents each judge ONE slice of chapter validation (structure, factuality, voice, length, forbidden constructs, format, etc.); a synthesizer rolls the 10 verdicts into one pass/revise/block call; a publisher emits a human-readable report. |
 
 Add your own under `recipes/<name>/` — see [docs/EXTENSION.md](docs/EXTENSION.md).
 
