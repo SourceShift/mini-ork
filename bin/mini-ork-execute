@@ -847,6 +847,20 @@ print(json.dumps(obj))
   if [ -n "$_payload" ]; then
     trace_write "$_payload" >/dev/null 2>&1 || true
   fi
+  # Auto-dispatch bug-collector after the per-node trace lands. Opt-in via
+  # MO_BUG_COLLECTOR=1 (default off — initial heuristic scan is free but
+  # produces noticeable per-run noise during burn-in). The collector reads
+  # the agent's output and emits noticed_bugs.jsonl rows the reflect-stage
+  # sweep picks up. Never fails the caller's run.
+  if [ "${MO_BUG_COLLECTOR:-0}" = "1" ] && [ -x "$MINI_ORK_ROOT/bin/mini-ork-bug-collector" ]; then
+    "$MINI_ORK_ROOT/bin/mini-ork-bug-collector" \
+      --node-id "$_trace_id" \
+      --node-type "$_node_type" \
+      --output-file "$_output_file" \
+      --status "$_status" \
+      --task-class "${TASK_CLASS:-generic}" \
+      2>/dev/null || true
+  fi
 }
 
 # D-021: status transition helper. Updates task_runs.status at phase boundaries.
