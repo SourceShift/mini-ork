@@ -173,7 +173,23 @@ def test_app_factory_boots(home: Path) -> None:
     from mini_ork.web.app import create_app
 
     app = create_app(home=home, dev_cors=False)
-    paths = [r.path for r in app.routes]
+
+    # FastAPI >= 0.111 wraps app.include_router() results as
+    # _IncludedRouter wrappers that don't expose .path directly;
+    # older versions flatten the routes inline. Walk both shapes:
+    # if a node has .path use it; otherwise recurse into .routes.
+    def _flatten_paths(routes):
+        out = []
+        for r in routes:
+            p = getattr(r, "path", None)
+            if p is not None:
+                out.append(p)
+            child = getattr(r, "routes", None)
+            if child:
+                out.extend(_flatten_paths(child))
+        return out
+
+    paths = _flatten_paths(app.routes)
     assert "/api/v1/health" in paths
     assert "/api/v1/task-runs" in paths
     assert "/api/v1/fingerprint" in paths
