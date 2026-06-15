@@ -26,7 +26,8 @@ STUB_LOG=$(mktemp /tmp/cn-stub-XXXXXX.log)
 STUB_PIDFILE=$(mktemp /tmp/cn-stub-pid-XXXXXX)
 
 # Isolated state dir so the reachability cache doesn't bleed across runs.
-export MINI_ORK_HOME=$(mktemp -d /tmp/mo-test-XXXXXX)
+MINI_ORK_HOME=$(mktemp -d /tmp/mo-test-XXXXXX)
+export MINI_ORK_HOME
 
 cleanup() {
   if [ -f "$STUB_PIDFILE" ]; then
@@ -158,7 +159,7 @@ else _fail "stub did NOT receive session_start — log: $(cat "$STUB_LOG")"; fi
 
 echo ""
 echo "--- MO_DISABLE_CN=1 short-circuits everything ---"
-MO_DISABLE_CN=1
+export MO_DISABLE_CN=1
 out_disabled=$(cn_retrieve "anything" 3)
 if [ "$out_disabled" = "{}" ]; then _ok "cn_retrieve returns {} when disabled"
 else _fail "expected {}, got '$out_disabled'"; fi

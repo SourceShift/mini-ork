@@ -93,9 +93,9 @@ sqlite3 "$DB" "
 # We don't have the child session id yet (Task tool hasn't run) — fall back
 # to a synthetic id so CN can still index the spawn intent. The real child
 # session id arrives on subagent_stop and supersedes this entry.
-if [ -f "$MINI_ORK_ROOT/lib/cn_client.sh" ]; then
+if [ -f "${MINI_ORK_ROOT}/lib/cn_client.sh" ]; then
   # shellcheck source=../lib/cn_client.sh
-  source "$MINI_ORK_ROOT/lib/cn_client.sh" 2>/dev/null || true
+  source "${MINI_ORK_ROOT}/lib/cn_client.sh" 2>/dev/null || true
   if declare -f cn_hook_post >/dev/null 2>&1; then
     cn_hook_post "session_start" "miniork-spawn-${parent_session}-$(date +%s)" "$cwd" "" || true
   fi

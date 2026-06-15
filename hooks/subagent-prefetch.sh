@@ -38,9 +38,9 @@ fi
 
 # Disable opt-out + cn_client guard.
 [ "${MO_DISABLE_CN:-0}" = "1" ] && { emit_continue; exit 0; }
-[ -f "$MINI_ORK_ROOT/lib/cn_client.sh" ] || { emit_continue; exit 0; }
+[ -f "${MINI_ORK_ROOT}/lib/cn_client.sh" ] || { emit_continue; exit 0; }
 # shellcheck source=../lib/cn_client.sh
-source "$MINI_ORK_ROOT/lib/cn_client.sh" 2>/dev/null || { emit_continue; exit 0; }
+source "${MINI_ORK_ROOT}/lib/cn_client.sh" 2>/dev/null || { emit_continue; exit 0; }
 declare -f cn_retrieve >/dev/null 2>&1 || { emit_continue; exit 0; }
 
 extract_field() {
