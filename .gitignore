@@ -21,6 +21,12 @@ node_modules/
 **/secrets.local.sh
 **/secrets.local.*
 *.local.secrets
+# Per-developer local env preferences (non-secret). Same gitignored
+# pattern as secrets.local.sh; holds prefs like MO_REVIEW_LLM_LENSES=1
+# that an individual machine wants on by default. Sourced from
+# .githooks/pre-push right after MINI_ORK_HOME is established.
+.mini-ork/config/local.sh
+**/.mini-ork/config/local.sh
 # Local provider registry may name private endpoints/models — never commit.
 # (It SHADOWS config/providers.yaml entirely: first-hit resolution, no merge.)
 .mini-ork/config/providers.yaml
