@@ -1,0 +1,104 @@
+version: "0.1.0"
+task_class: chapter_validation_10lens
+description: >
+  10 parallel lens agents each judge ONE slice of chapter validation
+  (structure, factuality, voice, length, forbidden constructs, format,
+  coverage, coherence, reader-contract, synthesis). A synthesizer
+  agent reads all 10 lens-verdict.json files + emits one final
+  artifact with pass/revise/block + per-lens scores + the union of
+  cited issues. A publisher writes the final report. A verifier
+  checks all 10 lens outputs were produced.
+
+nodes:
+  - name: planner
+    type: planner
+    model_lane: planner
+    prompt_ref: prompts/planner.md
+    dispatch_mode: serial
+
+  - name: lens_01_structure
+    type: reviewer
+    model_lane: lens_01
+    prompt_ref: prompts/lens_01_structure.md
+    dispatch_mode: partitioned
+    partition_key: lens_id
+
+  - name: lens_02_factuality
+    type: reviewer
+    model_lane: lens_02
+    prompt_ref: prompts/lens_02_factuality.md
+    dispatch_mode: partitioned
+    partition_key: lens_id
+
+  - name: lens_03_voice_tone
+    type: reviewer
+    model_lane: lens_03
+    prompt_ref: prompts/lens_03_voice_tone.md
+    dispatch_mode: partitioned
+    partition_key: lens_id
+
+  - name: lens_04_length_density
+    type: reviewer
+    model_lane: lens_04
+    prompt_ref: prompts/lens_04_length_density.md
+    dispatch_mode: partitioned
+    partition_key: lens_id
+
+  - name: lens_05_forbidden_constructs
+    type: reviewer
+    model_lane: lens_05
+    prompt_ref: prompts/lens_05_forbidden_constructs.md
+    dispatch_mode: partitioned
+    partition_key: lens_id
+
+  - name: lens_06_markdown_format
+    type: reviewer
+    model_lane: lens_06
+    prompt_ref: prompts/lens_06_markdown_format.md
+    dispatch_mode: partitioned
+    partition_key: lens_id
+
+  - name: lens_07_coverage
+    type: reviewer
+    model_lane: lens_07
+    prompt_ref: prompts/lens_07_coverage.md
+    dispatch_mode: partitioned
+    partition_key: lens_id
+
+  - name: lens_08_coherence
+    type: reviewer
+    model_lane: lens_08
+    prompt_ref: prompts/lens_08_coherence.md
+    dispatch_mode: partitioned
+    partition_key: lens_id
+
+  - name: lens_09_reader_contract
+    type: reviewer
+    model_lane: lens_09
+    prompt_ref: prompts/lens_09_reader_contract.md
+    dispatch_mode: partitioned
+    partition_key: lens_id
+
+  - name: lens_10_synthesis_originality
+    type: reviewer
+    model_lane: lens_10
+    prompt_ref: prompts/lens_10_synthesis_originality.md
+    dispatch_mode: partitioned
+    partition_key: lens_id
+
+  - name: synthesizer
+    type: reviewer
+    model_lane: opus_lens
+    prompt_ref: prompts/synthesizer.md
+    dispatch_mode: serial
+
+  - name: lens_outputs_complete
+    type: verifier
+    prompt_ref: null
+    verifier_ref: verifiers/lens_outputs_complete.sh
+    dispatch_mode: serial
+
+  - name: publisher
+    type: publisher
+    prompt_ref: prompts/publisher.md
+    dispatch_mode: serial
