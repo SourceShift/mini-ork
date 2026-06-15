@@ -128,20 +128,28 @@ _dispatch_epic() {
     rc=$?
   fi
 
-  # Verdict resolution: look at the verdict.json produced by the dispatched run.
-  # We rely on the run id printed in the log (e.g. `run_id=run-...`) to find it.
+  # Verdict resolution: the recipe writes its final aggregated verdict to one
+  # of {panel-verdict.json, verdict.json}. bin/mini-ork-execute emits
+  # panel-verdict.json; some older recipes emit verdict.json. Try both
+  # canonical locations in order.
   local run_id verdict
   run_id=$(grep -E '^run_id=' "$log_path" | head -1 | cut -d= -f2)
   verdict=""
-  if [ -n "$run_id" ] && [ -f "$MINI_ORK_HOME/runs/$run_id/verdict.json" ]; then
-    verdict=$(python3 -c "
+  if [ -n "$run_id" ]; then
+    local _vfile
+    for _vfile in panel-verdict.json verdict.json; do
+      if [ -f "$MINI_ORK_HOME/runs/$run_id/$_vfile" ]; then
+        verdict=$(python3 -c "
 import json, sys
 try:
     d = json.load(open(sys.argv[1]))
     print(d.get('verdict','unknown'))
 except Exception:
     pass
-" "$MINI_ORK_HOME/runs/$run_id/verdict.json" 2>/dev/null)
+" "$MINI_ORK_HOME/runs/$run_id/$_vfile" 2>/dev/null)
+        [ -n "$verdict" ] && break
+      fi
+    done
   fi
   [ -z "$verdict" ] && verdict="unknown"
 
