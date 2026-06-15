@@ -1,15 +1,15 @@
-# Kickoff — runbook: BullMQ queue backlog (libwit dev_book-generation)
+# Kickoff — runbook: BullMQ queue backlog (the host application dev_book-generation)
 
 ## Incident class
 
 `bullmq-book-gen-queue-backlog` — the BullMQ `dev_book-generation` queue
-on libwit's Redis instance accumulates > 100 waiting jobs and chapter
+on the host application's Redis instance accumulates > 100 waiting jobs and chapter
 throughput drops to < 1 chapter/minute, blocking user-visible book
 generation.
 
 ## Affected services
 
-- libwit BE pods (consume the queue)
+- the host application BE pods (consume the queue)
 - Redis at `100.74.239.22:6380` (queue substrate)
 - Hatchet (alternative dispatcher for the same workflow)
 - Downstream Daytona sandboxes (per-chapter agent execution)

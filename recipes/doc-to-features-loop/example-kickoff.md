@@ -10,7 +10,7 @@
 - Extract implicit platform, compliance, observability, data, and operations
   work even when the source doc only hints at it.
 - Every P0 feature must include non-empty `modern_techniques_refs` gathered via
-  arxiv-libwit before dispatch.
+  arxiv-search-tool before dispatch.
 - Dispatch each P0 feature through `recursive-validate-impl`; do not implement
   broad document features directly in this outer loop.
 - Keep child patches scoped to each generated child kickoff.

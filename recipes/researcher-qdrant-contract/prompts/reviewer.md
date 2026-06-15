@@ -12,7 +12,7 @@ Inputs:
 ## Review checklist
 
 1. **Split-brain writer guard**
-   - Is `bookChapterEmbeddingService` retired or normalized behind `knowledgeNodeQdrantSync`?
+   - Is `bookChapterEmbeddingService` retired or normalized behind `<canonical_sync_module>`?
    - Is there any NEW direct Qdrant writer (client.upsert, upload_points) outside the canonical sync path?
 
 2. **Data-loss risk**

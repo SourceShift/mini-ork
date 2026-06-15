@@ -15,7 +15,7 @@ are green. The reflector and replanner convert failures into the next plan
 mutation, while `divergence_kill` prevents repeating the same failed iteration.
 
 Tier 4 is quality-aware, not just completion-aware. Each panel lens reruns DoD
-probes, checks hard-rule compliance, searches arxiv-libwit for current
+probes, checks hard-rule compliance, searches arxiv-search-tool for current
 techniques, and judges compliance with modern techniques for the feature class.
 That keeps verification focused on both "does it work?" and "is this a modern,
 defensible implementation?"

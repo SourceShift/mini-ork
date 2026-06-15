@@ -13,7 +13,7 @@ If you previously used an internal `deliver.sh`-based pipeline (often found unde
 | `.agentflow/lib/spec-reviewer.sh` | Framework invokes `prompts/spec_reviewer.md` via `model_lane: spec_reviewer` | Same — shell glue removed |
 | `.agentflow/lib/self-correction.sh` | Framework invokes `prompts/self_correction.md` via `model_lane: worker` | Shell glue removed |
 | `.agentflow/lib/contract.sh` | Framework `scope_gate` (see `workflow.yaml` `gates: [scope_gate]`) | Scope enforcement is now a named gate |
-| `.agentflow/prompts/decomposer.md` | `recipes/bdd-first-delivery/prompts/decomposer.md` | Rewritten; libwit references removed |
+| `.agentflow/prompts/decomposer.md` | `recipes/bdd-first-delivery/prompts/decomposer.md` | Rewritten; the host application references removed |
 | `.agentflow/prompts/spec-author.md` | `recipes/bdd-first-delivery/prompts/spec_author.md` | Rewritten generically |
 | `.agentflow/prompts/spec-reviewer.md` | `recipes/bdd-first-delivery/prompts/spec_reviewer.md` | Rewritten generically |
 | `.agentflow/prompts/self-correction.md` | `recipes/bdd-first-delivery/prompts/self_correction.md` | Rewritten generically |

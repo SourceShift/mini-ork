@@ -87,7 +87,7 @@ failure modes — they require citations be flagged as `[lookup: <query>]`
 when not findable.
 
 External human-in-the-loop verification (WebFetch in this case, but could
-be arxiv-libwit MCP or any tool the lenses don't have) is then the closing
+be arxiv-search-tool MCP or any tool the lenses don't have) is then the closing
 step. The pipeline is: panel says "I can't verify"; human verifies; doc
 updates with the trail.
 
@@ -101,7 +101,7 @@ in the positioning doc's "Where mini-ork is honest about what it isn't
 
 ## Follow-up
 
-- v0.3: integrate arxiv-libwit MCP into the research-synthesis recipe's
+- v0.3: integrate arxiv-search-tool MCP into the research-synthesis recipe's
   lens prompts so they can resolve post-cutoff papers without external
   WebFetch.
 - v0.3: add an "external-verification" verifier-script that flags any

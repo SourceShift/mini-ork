@@ -242,7 +242,7 @@ single session (~$10 LLM spend total, ~3 hours wall clock).
 ### Fixed — universal-loop integration bugs surfaced by end-to-end smoke
 
 - (schema) Added migration `0013_task_runs.sql` — universal-loop runtime needs a
-  table distinct from the libwit-shape `runs` table (which requires `epic_id` FK)
+  table distinct from the the host application-shape `runs` table (which requires `epic_id` FK)
 - (classify) Now writes to `task_runs` (was: `runs`, which failed FK + column mismatch)
 - (classify) Matchers tolerate BOTH flat `matches: [kw...]` AND structured
   `matches: { keywords, regex }` shapes — recipes had inconsistent schemas
@@ -279,7 +279,7 @@ single session (~$10 LLM spend total, ~3 hours wall clock).
 - `tests/smoke.sh`: 97/97 OK
 - `bash examples/00-demo.sh` runs end-to-end in dry-run; produces a `task_runs`
   row with `task_class=code-fix`, `recipe=code-fix`, `status=classified`
-- 0 domain leaks (`libwit`, `jisawru`, `100.74.239.22`, etc.)
+- 0 domain leaks (`the host application`, `jisawru`, `100.74.239.22`, etc.)
 - 0 legacy env-var refs (`AGENTFLOW_*`, `MO_AGENTFLOW_*`)
 
 ---
@@ -359,7 +359,7 @@ bin/mini-ork-promote
 
 - `recipes/code-fix/` — minimal reference recipe (classify → plan → implement → verify)
 - `recipes/bdd-first-delivery/` — full BDD pipeline ported as a user-land recipe
-- `recipes/_legacy_libwit_prompts/` — archived v0.0 prompts (read-only reference)
+- `recipes/_legacy_host_app_prompts/` — archived v0.0 prompts (read-only reference)
 
 ### Migration path
 
