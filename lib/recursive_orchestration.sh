@@ -82,6 +82,13 @@ con.commit()
 con.close()
 print(event_id)
 PY
+
+  # Outbound event-callback hook. Best-effort; cannot block dispatch.
+  if ! declare -F _mo_emit_hook >/dev/null 2>&1; then
+    # shellcheck disable=SC1091
+    . "$(dirname "${BASH_SOURCE[0]}")/mo_emit_hook.sh" 2>/dev/null || return 0
+  fi
+  _mo_emit_hook "$event_type" "$run_id" "$payload_json"
 }
 
 mo_recursive_approve_spawn() {
