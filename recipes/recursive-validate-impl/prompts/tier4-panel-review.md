@@ -11,7 +11,7 @@ rules, and quality expectations. Save your output to
    probe, with command output and file:line evidence where applicable.
 2. Check hard-rule compliance. Grep the diff and touched files for violations,
    and list each violation under `### Violated by:`.
-3. Search arxiv-libwit, or an equivalent arxiv search tool if arxiv-libwit is
+3. Search arxiv-search-tool, or an equivalent arxiv search tool if arxiv-search-tool is
    unavailable, for `"<feature topic> latest techniques 2024-2026"`.
 4. Judge compliance with modern techniques for the feature class. Explain where
    the implementation matches current practice and where it falls behind.
@@ -35,7 +35,7 @@ rules, and quality expectations. Save your output to
 
 ## Modern-technique compliance
 
-- arxiv-libwit query:
+- arxiv-search-tool query:
 - Papers or sources consulted:
 - Compliance with modern techniques:
 - Gaps:

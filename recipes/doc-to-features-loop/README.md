@@ -4,7 +4,7 @@
 product, or technical specification into a ranked queue of implementable
 features. It reads the source document through separate surface and deep
 extraction lenses, merges those findings into `feature-index.json`, checks
-that important implementation ideas cite modern techniques from arxiv-libwit,
+that important implementation ideas cite modern techniques from arxiv-search-tool,
 and then dispatches P0 features one by one.
 
 The inner implementation loop is `recursive-validate-impl`. This recipe does

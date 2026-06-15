@@ -62,8 +62,8 @@ no promotion gate               lib/promotion_gate.sh + version_registry.sh
 | `lib/scope-overlap.sh` | `lib/gate_registry.sh` (`scope_gate` type) | Gate, not a lib script |
 | `lib/rebase-guard.sh` | `recipes/bdd-first-delivery/lib/rebase-guard.sh` | Merge guard belongs to recipe |
 | `lib/finalize.sh` | `publisher` node type in `workflow.yaml` | Node, not a lib script |
-| `prompts/refactor-arch-struct.md` | `recipes/_legacy_libwit_prompts/` | Archived; read-only reference |
-| `prompts/bdd-spec-author.md` | `recipes/_legacy_libwit_prompts/` | Archived |
+| `prompts/refactor-arch-struct.md` | `recipes/_legacy_host_app_prompts/` | Archived; read-only reference |
+| `prompts/bdd-spec-author.md` | `recipes/_legacy_host_app_prompts/` | Archived |
 | `skills/` | `recipes/<recipe>/verifiers/` | Domain-specific verifiers live in recipe |
 
 ---

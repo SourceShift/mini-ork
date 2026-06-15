@@ -47,7 +47,7 @@ Single JSON object on stdout:
   flag. senior → terse + assume tools. mixed → terse + footnote on
   non-obvious flags.
 - `runtime_environment` MUST be filled — if kickoff doesn't specify,
-  default to libwit's stack: platform=k3s, log=Loki, metrics=Prometheus
+  default to the host application's stack: platform=k3s, log=Loki, metrics=Prometheus
   via Grafana, tracing=Tempo.
 - `scope_boundaries` MUST list ≥ 2 things excluded (e.g. "doesn't cover
   AWS-side IAM rotation", "doesn't cover external CDN cache flush").

@@ -7,7 +7,7 @@
 ## Target schema
 
 - RDBMS: PostgreSQL 16.2
-- Table: `chapter_blocks` (libwit production)
+- Table: `chapter_blocks`
 - Current row count: ~12.5M
 - Current size: ~3.2 GB
 - Existing FKs: `(book_uuid) REFERENCES books(uuid)`, `(parent_block_id) REFERENCES blocks(uuid)`

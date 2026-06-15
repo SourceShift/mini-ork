@@ -102,7 +102,7 @@ with the auditing models explicitly heterogeneous (satisfying its own
 positioning-doc precondition).
 
 This is dispatch #5 in the LIVE panel-mode lineage. Prior 4 were
-libwit-side panels via `.agentflow/mini-orch/`; this one is
+the host application-side panels via `.agentflow/mini-orch/`; this one is
 upstream-side via `~/ps/mini-ork/bin/mini-ork run`.
 
 ---

@@ -52,8 +52,8 @@ Produce a concise JSON plan with this strict schema:
       },
       {
         "id": "canonical_sync_writer",
-        "description": "plan and patch summary route Qdrant writes through knowledgeNodeQdrantSync and reject new direct upsert/upload_points writers",
-        "command": "grep -qi knowledgeNodeQdrantSync \"$MINI_ORK_RUN_DIR/qdrant-contract-remediation-plan.md\" \"$MINI_ORK_RUN_DIR/qdrant-contract-patch-summary.md\""
+        "description": "plan and patch summary route Qdrant writes through <canonical_sync_module> and reject new direct upsert/upload_points writers",
+        "command": "grep -qi <canonical_sync_module> \"$MINI_ORK_RUN_DIR/qdrant-contract-remediation-plan.md\" \"$MINI_ORK_RUN_DIR/qdrant-contract-patch-summary.md\""
       },
       {
         "id": "book_chapter_service_normalized",

@@ -32,7 +32,7 @@ ARXIV="$RUN_DIR/lens-arxiv.md"
 [ -f "$SYNTH" ] || missing+=("synthesis.md")
 # lens-arxiv.md is OPTIONAL. Iter 4 demonstrated the failure mode:
 # Codex returned "Selected model is at capacity" for the arxiv lane after
-# successfully running 6 arxiv-libwit/search_papers MCP calls, so
+# successfully running 6 arxiv-search-tool/search_papers MCP calls, so
 # lens-arxiv.md was never written. The opus synth ran anyway (degraded-
 # inputs branch) and produced a 5-patch ranking. Forcing arxiv to be
 # mandatory blocks the loop on transient provider issues. The
