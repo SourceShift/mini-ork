@@ -1,0 +1,25 @@
+name: chapter_validation_10lens
+description: >
+  Multi-lens parallel chapter validation. Splits the validation surface
+  into 10 independent slices, each judged by a small focused lens
+  agent, then synthesizes the 10 verdicts into a single pass/revise/
+  block recommendation. Designed for any markdown chapter or
+  long-form prose artifact — book, RFC, research note, post-mortem.
+
+artifact_contract_ref: artifact_contract.yaml
+default_workflow: workflow.yaml
+
+matches:
+  keywords:
+    - chapter-validation
+    - chapter-review
+    - 10-lens
+    - multi-lens
+    - lens-panel
+    - validate chapter
+    - chapter rubric
+    - book validation
+    - long-form review
+  regex:
+    - "validate.*(chapter|section|book)"
+    - "(chapter|section).*(lens|rubric|panel)"
