@@ -17,6 +17,7 @@ import json
 import os
 import signal
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -36,6 +37,92 @@ CONTROLLABLE_STATUSES = {
 
 def _resolve_run_dir(home: Path, task_run_id: str) -> Path:
     return home / "runs" / task_run_id
+
+
+def pause_cost_run(
+    home: Path, task_run_id: str, threshold_usd: float = 25.0
+) -> dict[str, Any]:
+    """Write the cost-pause sentinel manually.
+
+    Companion to lib/cost_pause.sh (Epic E4). The HTTP layer lets
+    operators trigger a pause without waiting for the cost-threshold
+    crossing. The dispatcher (bin/mini-ork-execute) checks the
+    sentinel before each LLM call and bails with
+    finish_reason=paused_for_approval. Resume via the /resume-cost
+    POST or via `bin/mini-ork-resume <run_id>`.
+    """
+    run_dir = _resolve_run_dir(home, task_run_id)
+    if not run_dir.is_dir():
+        return {"ok": False, "error": "run_dir not found", "task_run_id": task_run_id}
+
+    sentinel = run_dir / ".cost-pause"
+    payload = {
+        "threshold_usd": threshold_usd,
+        "spent_usd": 0.0,  # operator-triggered; cost counter untouched
+        "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "run_id": task_run_id,
+        "source": "http-api",
+    }
+    sentinel.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+
+    return {
+        "ok": True,
+        "task_run_id": task_run_id,
+        "action": "pause-cost",
+        "sentinel_path": str(sentinel),
+        "threshold_usd": threshold_usd,
+        "note": (
+            "dispatcher will hold further LLM calls; resume via "
+            "POST /api/v1/task-runs/{id}/resume-cost or "
+            "bin/mini-ork-resume"
+        ),
+    }
+
+
+def resume_cost_run(
+    home: Path, task_run_id: str, approver: str
+) -> dict[str, Any]:
+    """Clear the cost-pause sentinel + record the approval.
+
+    Mirrors bin/mini-ork-resume's audit shape: appends
+    {resumed_at, approver, source, run_id} to
+    .cost-pause-approvals.jsonl so the resume is traceable. Returns
+    ok=False when no sentinel was present (treat as a successful
+    no-op on the client side).
+    """
+    run_dir = _resolve_run_dir(home, task_run_id)
+    if not run_dir.is_dir():
+        return {"ok": False, "error": "run_dir not found", "task_run_id": task_run_id}
+
+    sentinel = run_dir / ".cost-pause"
+    if not sentinel.is_file():
+        return {
+            "ok": False,
+            "error": "no cost-pause sentinel present",
+            "task_run_id": task_run_id,
+        }
+
+    sentinel_payload = sentinel.read_text(encoding="utf-8").strip()
+    approvals = run_dir / ".cost-pause-approvals.jsonl"
+    audit = {
+        "resumed_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "approver": approver,
+        "source": "http-api",
+        "run_id": task_run_id,
+        "sentinel_payload": sentinel_payload,
+    }
+    with approvals.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(audit) + "\n")
+
+    sentinel.unlink()
+
+    return {
+        "ok": True,
+        "task_run_id": task_run_id,
+        "action": "resume-cost",
+        "approver": approver,
+        "audit_path": str(approvals),
+    }
 
 
 def stop_run(home: Path, db: StateDB, task_run_id: str) -> dict[str, Any]:
