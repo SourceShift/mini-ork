@@ -65,10 +65,10 @@ _check "payload-source-kind" "remediation plan includes source_kind payload key"
   'grep -qi "source_kind" "$PLAN"'
 _check "source-of-truth-invariant" "plan preserves PG as truth and Qdrant as derived index" \
   'grep -qiE "postgres|postgresql|pg" "$PLAN" && grep -qi "qdrant" "$PLAN" && grep -qiE "canonical|source of truth|source-of-truth|derived" "$PLAN"'
-_check "canonical-sync-writer" "plan routes Qdrant writes through knowledgeNodeQdrantSync" \
-  'grep -qi "knowledgeNodeQdrantSync" "$PLAN" "$PATCH_SUMMARY"'
+_check "canonical-sync-writer" "plan routes Qdrant writes through <canonical_sync_module>" \
+  'grep -qi "<canonical_sync_module>" "$PLAN" "$PATCH_SUMMARY"'
 _check "book-chapter-service-normalized" "bookChapterEmbeddingService is retired or normalized" \
-  'grep -qi "bookChapterEmbeddingService" "$PLAN" "$PATCH_SUMMARY" && grep -qiE "retir|normaliz|canonical sync|knowledgeNodeQdrantSync" "$PLAN" "$PATCH_SUMMARY"'
+  'grep -qi "bookChapterEmbeddingService" "$PLAN" "$PATCH_SUMMARY" && grep -qiE "retir|normaliz|canonical sync|<canonical_sync_module>" "$PLAN" "$PATCH_SUMMARY"'
 _check "retrieval-allowlist-coverage" "plan or verification covers retrieval allowlists" \
   'grep -qi "allowlist" "$PLAN" "$VERIFY" && grep -qiE "text_chunk|highlight|ai_annotation|generated_content|book_chapter_content" "$PLAN" "$VERIFY"'
 _check "reconciliation-dry-run-flag" "reconciliation/backfill requires --dry-run" \
@@ -80,7 +80,7 @@ _check "verification-records-commands" "verification report records commands or 
 _check "no-blind-full-reindex" "artifacts reject blind full reindexing" \
   'grep -qiE "no blind|without blind|forbid.*blind|not.*blind|blind_full_reindex" "$PLAN" "$PATCH_SUMMARY" "$VERIFY"'
 _check "no-new-direct-qdrant-writer" "patch summary rejects new direct upsert/upload_points writers" \
-  'grep -qiE "upsert|upload_points|direct qdrant writer" "$PATCH_SUMMARY" && grep -qiE "deny|forbid|reject|no new|outside.*knowledgeNodeQdrantSync|canonical sync" "$PATCH_SUMMARY"'
+  'grep -qiE "upsert|upload_points|direct qdrant writer" "$PATCH_SUMMARY" && grep -qiE "deny|forbid|reject|no new|outside.*<canonical_sync_module>|canonical sync" "$PATCH_SUMMARY"'
 
 python3 - "$NAME" "$EVIDENCE" "$CHECKS_TSV" "$PLAN" "$FINDINGS" "$PATCH_SUMMARY" "$VERIFY" <<'PY'
 import json

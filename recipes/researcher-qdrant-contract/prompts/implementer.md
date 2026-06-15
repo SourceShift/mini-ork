@@ -48,7 +48,7 @@ Inputs:
 ## Rules
 
 - Preserve the invariant: PostgreSQL `blocks` is canonical; Qdrant `knowledge_nodes_unified` is derived.
-- Route all new Qdrant writes through `knowledgeNodeQdrantSync`.
+- Route all new Qdrant writes through `<canonical_sync_module>`.
 - Normalize or retire `bookChapterEmbeddingService` behind the canonical sync path.
 - Ensure retrieval allowlists cover all canonical retrievable node types.
 - Ensure payload contract includes `text_preview` and `source_kind`.

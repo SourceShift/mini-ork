@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Verify P0 features carry arxiv-libwit modern techniques references.
+# Verify P0 features carry arxiv-search-tool modern techniques references.
 
 set -uo pipefail
 
@@ -37,7 +37,7 @@ for feature in p0:
         missing.append(feature.get("id", "<missing-id>"))
 assert not missing, f"P0 features missing modern_techniques_refs: {missing}"
 PY'
-check "p0-arxiv-libwit-source-present" "each P0 reference names arxiv-libwit or an arxiv source" \
+check "p0-arxiv-search-tool-source-present" "each P0 reference names arxiv-search-tool or an arxiv source" \
   'python3 - "$FEATURE_INDEX" <<'"'"'PY'"'"'
 import json, sys
 data = json.load(open(sys.argv[1], encoding="utf-8"))
@@ -48,7 +48,7 @@ for feature in features:
         continue
     refs = feature.get("modern_techniques_refs") or []
     text = json.dumps(refs).lower()
-    if "arxiv-libwit" not in text and "arxiv" not in text:
+    if "arxiv-search-tool" not in text and "arxiv" not in text:
         bad.append(feature.get("id", "<missing-id>"))
 assert not bad, f"P0 features missing arxiv source evidence: {bad}"
 PY'

@@ -51,7 +51,7 @@ Emit a JSON envelope with this strict schema:
     "degraded_preview_fields": ["title", "text_preview", "source_kind", "node_type", "document_uuid"],
     "pg_hydration_failure_behavior": "return degraded preview with stale warning, never silently drop"
   },
-  "canonical_writer_module": "knowledgeNodeQdrantSync",
+  "canonical_writer_module": "<canonical_sync_module>",
   "forbidden_patterns": [
     "new direct Qdrant client.upsert outside canonical writer",
     "new direct upload_points call outside canonical writer"

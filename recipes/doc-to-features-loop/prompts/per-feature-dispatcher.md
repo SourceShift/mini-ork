@@ -12,7 +12,7 @@ Each child kickoff must include:
 - The feature ID, title, source evidence, and dependencies.
 - A scoped implementation request for only that feature.
 - Concrete Definition of Done probes derived from the feature index.
-- The arxiv-libwit modern techniques references that justify the approach.
+- The arxiv-search-tool modern techniques references that justify the approach.
 - A reminder that the child run must preserve unrelated user changes and keep
   its patch scoped.
 
