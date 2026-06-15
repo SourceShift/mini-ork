@@ -6,6 +6,14 @@ the repository using the Edit and Write tools, then emit a JSON summary on stdou
 
 ---
 
+## Step 0 — ContextNest prefetch (read first if present)
+
+Run `ls {{MO_CN_PREFETCH_DIR}}` — if any `*.md` files exist there, cat each one and incorporate the semantic-retrieve atoms, recent features, and inbox items into your understanding of the task. These are populated by the `subagent-prefetch.sh` UserPromptSubmit hook from the ContextNest substrate (gated on `MINI_ORK_RUN_ID`). They are short (<2KB typically) and high-signal; skim them BEFORE reading the plan so you can cross-reference prior work.
+
+If the directory is empty or doesn't exist, skip this step silently — ContextNest is optional infra.
+
+---
+
 ## Inputs
 
 | Input | Source |
