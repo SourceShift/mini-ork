@@ -24,7 +24,7 @@ matches:
     - pg-sync
     - vector-index
     - bookChapterEmbeddingService
-    - knowledgeNodeQdrantSync
+    - <canonical_sync_module>
   regex:
     - "qdrant.*contract"
     - "knowledge_nodes_unified"

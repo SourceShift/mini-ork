@@ -8,7 +8,7 @@ generated content nodes in the `researcher` repo.
 
 ## Scope
 
-- `researcher` repo PG/Qdrant sync modules (especially `knowledgeNodeQdrantSync`,
+- `researcher` repo PG/Qdrant sync modules (especially `<canonical_sync_module>`,
   `knowledgeNodeEmbeddingBuilder`, `bookChapterEmbeddingService`).
 - Retrieval and hydration code paths.
 - Reconciliation/backfill script design.
@@ -23,7 +23,7 @@ generated content nodes in the `researcher` repo.
 ## Constraints
 
 - PostgreSQL `blocks` is canonical; Qdrant `knowledge_nodes_unified` is derived.
-- All Qdrant writes must route through `knowledgeNodeQdrantSync`.
+- All Qdrant writes must route through `<canonical_sync_module>`.
 - `bookChapterEmbeddingService` must be retired or normalized behind the canonical writer.
 - Reconciliation/backfill must support `--dry-run`.
 - No blind full Qdrant reindexing.

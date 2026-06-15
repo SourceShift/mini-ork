@@ -1,7 +1,7 @@
 # Mini-Orch Hardening — Preflight Gate + Secrets/Syntax Robustness
 
 **Date:** 2026-06-02
-**Origin:** Downstream observation in `SourceShift/libwit` (`.agentflow/mini-orch/`)
+**Origin:** Downstream observation in `SourceShift/the host application` (`.agentflow/mini-orch/`)
 **Author:** claude-autopilot
 **Status:** Spec — to be applied by mini-ork's own agents
 
@@ -13,7 +13,7 @@
 
 ## Why this exists
 
-A 2026-06-02 downstream session (libwit-autopilot) lost ~3-4 hours and
+A 2026-06-02 downstream session (the host application-autopilot) lost ~3-4 hours and
 ~$15-20 of LLM budget to 11 distinct dispatch failures — none catastrophic
 individually, but cumulatively eating most of a productive day. Bucket
 analysis: **9 design / 2 spec**. The pattern is design fragility, not

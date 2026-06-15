@@ -2,7 +2,7 @@
 
 > ## ⚠️ CORRECTION (2026-06-02 22:05 UTC)
 >
-> **Root cause re-attributed.** Forensic inspection of libwit's
+> **Root cause re-attributed.** Forensic inspection of the host application's
 > `.agentflow/mini-orch/runs/.../W3B-C/iter-1/` showed `review.log` and
 > `verdict.json` were ABSENT — but `rubric.json` was present with
 > `{"pass": false, "score": -1, "parse_error": true, "items": []}`.
@@ -40,7 +40,7 @@
 
 
 **Date observed:** 2026-06-02 across ~3 hours of dispatch (WAVE 3a 5/5 + WAVE 3b 3/3 sub-epics, every iteration)
-**Downstream incident:** libwit `researcher` repo — SELF-EVOLVING-WAVE-3A-MEMORY-CLUSTER + SELF-EVOLVING-WAVE-3B-CAPSULE-EVIDENCE
+**Downstream incident:** the host application `researcher` repo — SELF-EVOLVING-WAVE-3A-MEMORY-CLUSTER + SELF-EVOLVING-WAVE-3B-CAPSULE-EVIDENCE
 **Affected runtime:** `.agentflow/lib/review.sh` reviewer phase (after worker emits commits, before auto-merge)
 
 ## Symptom
@@ -79,7 +79,7 @@ This is the same shape as the `spec-author silent-die` failure (`./20260602-spec
 - Stderr redirect path swallowing errors before they hit the err file
 - Empty stdout interpreted as "review skipped" instead of "review FAILED"
 
-And matches the broader `phase5-prose-claims` codex silent-exit class — libwit commit `e12422e1b` (2026-06-01) fixed `cl_codex.sh:135`'s `2>/dev/null` trailing redirect.
+And matches the broader `phase5-prose-claims` codex silent-exit class — the host application commit `e12422e1b` (2026-06-01) fixed `cl_codex.sh:135`'s `2>/dev/null` trailing redirect.
 
 ## Suspected root cause
 
@@ -179,7 +179,7 @@ Cost: ~$0.001 per dispatch. Saves ~$0.30-1.00 of wasted main-dispatch + 5-15 min
 
 ## Downstream patches needed
 
-After upstream lands, libwit `researcher` repo must:
+After upstream lands, the host application `researcher` repo must:
 - Pull updated `lib/review.sh`
 - Re-run any in-flight wave that hit silent-die — the new behavior will mark them ESCALATE explicitly so the resumer knows where to look
 - Confirm the health-probe (Fix E) catches a deliberately-broken lane
@@ -188,8 +188,8 @@ After upstream lands, libwit `researcher` repo must:
 
 - `./20260602-spec-author-silent-die.md` — sister failure mode (same shape, different LLM call site)
 - `./20260602-preflight-gate-hardening.md` — preflight gate catches many upfront failures but cannot catch mid-dispatch silent-die
-- libwit commit `e12422e1b` — analogous fix for codex worker silent-exit class
-- libwit Insforge memory `wave_1_6of6_and_wave_3b_3of3_shipped_self_evolving_2026_06_02` (id=1252) — downstream session log documenting the 8-time occurrence pattern
+- the host application commit `e12422e1b` — analogous fix for codex worker silent-exit class
+- the host application Insforge memory `wave_1_6of6_and_wave_3b_3of3_shipped_self_evolving_2026_06_02` (id=1252) — downstream session log documenting the 8-time occurrence pattern
 
 ## Cost of NOT fixing
 

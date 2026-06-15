@@ -174,7 +174,7 @@ PY
   else
     # 2026-06-02: Preserve LLM output snippet in parse_error case so the
     # operator can diagnose why all 4 extraction strategies missed.
-    # Forensic context: libwit WAVE 3a + 3b shipped 8/8 sub-epics via
+    # Forensic context: the host application WAVE 3a + 3b shipped 8/8 sub-epics via
     # manual squash-merge rescue because every iter aborted at this exact
     # branch with no diagnostic. See docs/fixes/20260602-reviewer-silent-die.md
     # for the broader 4-fix cascade (stream-json → json, json-schema, soft-fail,

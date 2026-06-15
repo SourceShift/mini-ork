@@ -3,14 +3,14 @@
 ## Surfaces to audit
 
 1. **BookReader page** (desktop + mobile)
-   - Desktop entry: `https://libwit.com/library/<book-uuid>/read`
+   - Desktop entry: `https://host-app.example.com/library/<book-uuid>/read`
    - Mobile entry: same URL, viewport 390×844
    - Files: `src/pages/reader/BookReader.tsx`, `src/pages/reader/BookChapterArticle.tsx`,
-     `src/components/libwit/reader/mobile/MobileReaderChrome.tsx`
+     `src/components/host-app/reader/mobile/MobileReaderChrome.tsx`
 
 2. **Highlighter toolbar** (selection-triggered, both viewports)
-   - Files: `src/components/libwit/highlighter/HighlighterToolbar.tsx`,
-     `src/components/libwit/reader/mobile/MobileReaderSelectionPopover.tsx`
+   - Files: `src/components/host-app/highlighter/HighlighterToolbar.tsx`,
+     `src/components/host-app/reader/mobile/MobileReaderSelectionPopover.tsx`
 
 ## Target users
 
