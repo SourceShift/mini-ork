@@ -271,6 +271,15 @@ trap 'exit 130' INT
 # on filesystem scan, breaking the recipe's expected artifact layout.
 export MINI_ORK_RUN_DIR="$RUN_DIR"
 
+# ContextNest prefetch dir — populated by hooks/subagent-prefetch.sh on
+# every worker's first UserPromptSubmit when MINI_ORK_RUN_ID is set. The
+# hook writes <session_id>.md per spawned subagent. Prompt templates can
+# reference {{MO_CN_PREFETCH_DIR}} to instruct workers to `ls` + cat the
+# files before their first turn (semantic-retrieve atoms + recent
+# features + inbox items relevant to the cwd + prompt).
+export MO_CN_PREFETCH_DIR="$RUN_DIR/cn_prefetch"
+mkdir -p "$MO_CN_PREFETCH_DIR" 2>/dev/null || true
+
 # Live OTel span buffering (MO_OTEL=1 gated; best-effort, never breaks runs).
 # shellcheck source=/dev/null
 source "$MINI_ORK_ROOT/lib/mo_otel.sh" 2>/dev/null || true

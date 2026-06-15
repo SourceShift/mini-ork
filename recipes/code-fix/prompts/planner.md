@@ -6,6 +6,12 @@ You do NOT suggest UI copy or wording. You produce structured JSON.
 
 ---
 
+## Step 0 — ContextNest prefetch (read first if present)
+
+Run `ls {{MO_CN_PREFETCH_DIR}}` — if any `*.md` files exist there, cat each one before drafting the plan. They contain semantic-retrieve atoms about prior work, recent features (last 48h), and inbox items. Use them to: (a) avoid duplicating work a sibling session shipped, (b) cite prior decisions/learnings in your reasoning_notes, (c) tighten step scopes when a recent feature already touched the same surface. Skip silently when the dir is empty.
+
+---
+
 ## Inputs (provided via context_assemble)
 
 The following context sections will be injected before this prompt when the node runs.
