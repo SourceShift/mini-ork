@@ -100,6 +100,16 @@ try:
 finally:
     con.close()
 PY
+
+  # Outbound event-callback hook. Best-effort fire-and-forget; cannot
+  # block or fail the dispatch. Source guard avoids re-sourcing on every
+  # call when the caller already pulled the hook lib.
+  if ! declare -F _mo_emit_hook >/dev/null 2>&1; then
+    # shellcheck disable=SC1091
+    . "$(dirname "${BASH_SOURCE[0]}")/mo_emit_hook.sh" 2>/dev/null || return 0
+  fi
+  _mo_emit_hook "$event_type" "$run_id" \
+    "{\"node_id\":\"$node_id\",\"node_type\":\"$node_type\"}"
 }
 
 # Convenience: emit node_start with model_lane payload.
