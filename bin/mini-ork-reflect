@@ -121,6 +121,28 @@ _REFLECT_START_TS=$(date +%s)
 
 reflection_run "$SINCE"
 
+# Patch #5: pattern_miner — group execution_traces clusters → pattern_records.
+# Gated by MO_PATTERN_MINER=1 so adoption is opt-in until burn-in proves it.
+if [ "${MO_PATTERN_MINER:-0}" = "1" ]; then
+  _require_lib pattern_store
+  _PATTERNS_WRITTEN=$(pattern_store_mine_from_traces \
+      --window "${MO_PATTERN_MINER_WINDOW:-7d}" \
+      --min-cluster "${MO_PATTERN_MINER_MIN_CLUSTER:-3}" 2>/dev/null || echo 0)
+  echo "  [pattern_miner] wrote ${_PATTERNS_WRITTEN:-0} pattern_records rows"
+fi
+
+# E7: cross-epic gradient transfer — promote recurring targets across
+# task_classes into __cross_class__ gradients the planner reads everywhere.
+# Default ON; opt-out via MO_CROSS_EPIC_GRADIENTS=0.
+if [ "${MO_CROSS_EPIC_GRADIENTS:-1}" != "0" ]; then
+  _require_lib cross_epic_gradient
+  _CROSS_WRITTEN=$(cross_epic_gradient_promote \
+      --min-classes "${MO_CROSS_EPIC_MIN_CLASSES:-2}" \
+      --min-confidence "${MO_CROSS_EPIC_MIN_CONF:-0.7}" \
+      --window "${MO_CROSS_EPIC_WINDOW:-14d}" 2>/dev/null || echo 0)
+  echo "  [cross_epic_gradient] promoted ${_CROSS_WRITTEN:-0} cross-class gradients"
+fi
+
 # ── trace end ─────────────────────────────────────────────────────────────────
 # The closing trace carries WHAT reflect did (traces analyzed, gradients
 # written) — a bare status:"success" row gave gradient_extract nothing to

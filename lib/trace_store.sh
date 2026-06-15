@@ -105,6 +105,100 @@ print(trace_id)
 PY
 }
 
+# Patch #2: trace_write_node — write a node trace and enrich it with cost +
+#       duration from the dispatch sidecar files at
+#       ${MINI_ORK_RUN_DIR}/.last-llm-cost and .last-llm-duration-ms.
+#       Sidecar freshness window guards against stale prior-run values:
+#       default 5 * MO_DISPATCH_TIMEOUT (= 7500s when timeout unset).
+#       Args: <task_class> <status> <extra_json>
+#         extra_json is merged on top of {trace_id, task_class, status,
+#         cost_usd, duration_ms}.
+trace_write_node() {
+  local task_class="${1:?task_class required}"
+  local status="${2:-success}"
+  local extra_json="${3:-{}}"
+  python3 - "${MINI_ORK_DB:?MINI_ORK_DB unset}" "$task_class" "$status" "$extra_json" <<'PY'
+import json, os, sys, time, uuid
+
+db, task_class, status, extra_json = sys.argv[1:5]
+try:
+    extra = json.loads(extra_json) if extra_json.strip() else {}
+except json.JSONDecodeError:
+    extra = {}
+
+run_dir = os.environ.get("MINI_ORK_RUN_DIR", "")
+cost = 0.0
+duration_ms = 0
+try:
+    timeout = int(os.environ.get("MO_DISPATCH_TIMEOUT", "1500"))
+except ValueError:
+    timeout = 1500
+freshness_s = 5 * timeout
+now = time.time()
+
+def _read_sidecar(name):
+    if not run_dir:
+        return None
+    p = os.path.join(run_dir, name)
+    try:
+        st = os.stat(p)
+    except OSError:
+        return None
+    if now - st.st_mtime > freshness_s:
+        return None
+    try:
+        return open(p).read().strip()
+    except OSError:
+        return None
+
+c = _read_sidecar(".last-llm-cost")
+if c:
+    try:
+        cost = float(c)
+    except ValueError:
+        cost = 0.0
+d = _read_sidecar(".last-llm-duration-ms")
+if d:
+    try:
+        duration_ms = int(float(d))
+    except ValueError:
+        duration_ms = 0
+
+payload = {
+    "trace_id": extra.get("trace_id") or f"tr-{uuid.uuid4().hex[:16]}",
+    "task_class": task_class,
+    "status": status,
+    "cost_usd": cost,
+    "duration_ms": duration_ms,
+}
+payload.update({k: v for k, v in extra.items() if k not in payload or payload[k] in (None, "", 0, 0.0)})
+print(json.dumps(payload, separators=(",", ":")))
+PY
+}
+
+# Patch #3: trace_write_or_log — wrapper that routes stderr to
+#       ${MINI_ORK_RUN_DIR}/trace-write-errors.log instead of /dev/null,
+#       preserving caller's exit code 0. Replaces the
+#       `trace_write … 2>/dev/null || true` idiom at 26 call-sites.
+#       Optional rotation knob: MO_TRACE_ERR_LOG_MAX_BYTES (default 1MB);
+#       when log exceeds this it's truncated to 0 bytes on next write.
+trace_write_or_log() {
+  local payload="${1:?json_payload required}"
+  local run_dir="${MINI_ORK_RUN_DIR:-${RUN_DIR:-/tmp/mini-ork-noop}}"
+  local errlog="${run_dir}/trace-write-errors.log"
+  mkdir -p "$run_dir" 2>/dev/null || true
+  local max_bytes="${MO_TRACE_ERR_LOG_MAX_BYTES:-1048576}"
+  if [ -f "$errlog" ]; then
+    local sz
+    sz=$(wc -c <"$errlog" 2>/dev/null | tr -d ' ')
+    if [ -n "$sz" ] && [ "$sz" -gt "$max_bytes" ]; then
+      : > "$errlog"
+    fi
+  fi
+  trace_write "$payload" >/dev/null 2>>"$errlog" || true
+  return 0
+}
+
 # desc: Retrieve a single execution trace by trace_id. Emits JSON on stdout or
 #       "null" when not found.
 trace_get() {
