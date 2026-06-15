@@ -72,6 +72,13 @@ PY
       # Explicit path: `mini-ork run <recipe> kickoff.md`.
       recipe="$first"
       kickoff="${1:?kickoff.md path required}"; shift || true
+      # Underscore→dash normalization — matches the user-first path's fallback
+      # (line ~65). Without this, `mini-ork run bdd_first_delivery <kickoff>`
+      # fails because recipes are dir-named with dashes (`bdd-first-delivery/`)
+      # while task_class names use underscores (`bdd_first_delivery`). 2026-06-15.
+      if [ ! -d "$MINI_ORK_ROOT/recipes/$recipe" ] && [ -d "$MINI_ORK_ROOT/recipes/${recipe//_/-}" ]; then
+        recipe="${recipe//_/-}"
+      fi
     fi
     [ -d "$MINI_ORK_ROOT/recipes/$recipe" ] || {
       echo "no recipe: $recipe (ls $MINI_ORK_ROOT/recipes/)" >&2; exit 2
