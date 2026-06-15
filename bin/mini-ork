@@ -12,7 +12,7 @@ sub="${1:-help}"; shift || true
 
 case "$sub" in
   # Universal loop subcommands
-  classify|plan|execute|verify|reflect|improve|eval|promote|init|update|spawn|scheduler|epics|bugs)
+  classify|plan|execute|verify|reflect|improve|eval|promote|init|update|spawn|scheduler|epics|bugs|inject)
     exec "$MINI_ORK_ROOT/bin/mini-ork-$sub" "$@" ;;
 
   # Phase C: trajectory metrics across DF cycles (v0.2-pt13)

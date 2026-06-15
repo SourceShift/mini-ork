@@ -266,6 +266,45 @@ if rows:
 PY
 }
 
+# desc: Emit operator-injected steering messages as a markdown block.
+#       Reads unconsumed, unexpired rows from operator_steering targeted at
+#       this run + role (or "any") and marks them consumed so the agent does
+#       not see the same steering twice in a single dispatch. Prints
+#       NOTHING when no steering is queued.
+#
+#       Args:
+#         $1  role  e.g. "planner" | "implementer" | "reviewer" — agent role
+#                   the calling node represents
+context_operator_steering_md() {
+  local role="${1:?role required}"
+  [ -n "${MINI_ORK_DB:-}" ] && [ -f "${MINI_ORK_DB:-}" ] || return 0
+  [ -f "$(dirname "${BASH_SOURCE[0]}")/operator_steering.sh" ] || return 0
+  # shellcheck source=lib/operator_steering.sh
+  . "$(dirname "${BASH_SOURCE[0]}")/operator_steering.sh"
+
+  local jsonl
+  jsonl="$(operator_steering_fetch_for "${MINI_ORK_RUN_ID:-}" "$role" 2>/dev/null)"
+  [ -n "$jsonl" ] || return 0
+
+  python3 - "$jsonl" <<'PY'
+import json, sys
+lines = [l for l in sys.argv[1].splitlines() if l.strip()]
+if not lines:
+    sys.exit(0)
+print("--- Operator steering (injected supervisor guidance) ---")
+print(f"{len(lines)} message(s) targeted at this node. Treat as load-bearing:")
+for line in lines:
+    try:
+        r = json.loads(line)
+        sev = r.get("severity","info").upper()
+        src = r.get("source","unknown")
+        print(f"- [{sev}] (from {src}) {r.get('message','')}")
+    except Exception:
+        continue
+print("--- /operator steering ---")
+PY
+}
+
 # desc: Emit prior same-task_class run outcomes as a compact markdown block
 #       suitable for direct prompt injection (the prior_similar_runs slice of
 #       the ContextPack, without the full context_assemble JSON envelope).

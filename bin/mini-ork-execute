@@ -1220,6 +1220,13 @@ _dispatch_node() {
             _learned_block="$(context_failure_modes_md "${TASK_CLASS:-generic}" 5 || true)"
             [ -n "$_learned_block" ] && _learned_block=$'\n\n'"${_learned_block}"$'\n'
           fi
+          # Operator steering: inject unconsumed supervisor messages targeted
+          # at this run + role. Each consumed row is marked so the agent
+          # sees it once per dispatch.
+          if declare -f context_operator_steering_md >/dev/null 2>&1; then
+            _steering_block="$(context_operator_steering_md "$node_type" || true)"
+            [ -n "$_steering_block" ] && _learned_block="${_learned_block}"$'\n'"${_steering_block}"$'\n'
+          fi
         fi
         ;;
     esac
