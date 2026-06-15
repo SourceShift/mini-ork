@@ -35,6 +35,16 @@ HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$HOOK_DIR/.." && pwd)"
 cd "$REPO_ROOT" || exit 0
 
+# Per-developer local env preferences (non-secret). Same pattern as
+# secrets.local.sh — gitignored, sourced into the hook env. Use it to
+# turn on per-machine defaults like MO_REVIEW_LLM_LENSES=1 without
+# touching the shipped hook code.
+_mo_local_env="${MINI_ORK_HOME:-$REPO_ROOT/.mini-ork}/config/local.sh"
+if [ -f "$_mo_local_env" ]; then
+  # shellcheck source=/dev/null
+  . "$_mo_local_env"
+fi
+
 # Master bypass — silently exit clean.
 if [ "${MO_README_DRIFT_SKIP:-0}" = "1" ]; then
   echo "pre-push: MO_README_DRIFT_SKIP=1 — bypassing all drift checks"
