@@ -40,7 +40,7 @@ Emit a JSON envelope with this strict schema:
   "split_brain_findings": [
     {
       "service": "bookChapterEmbeddingService",
-      "violation": "direct Qdrant writer bypassing knowledgeNodeQdrantSync",
+      "violation": "direct Qdrant writer bypassing <canonical_sync_module>",
       "remediation": "retire or normalize behind canonical sync path"
     }
   ],

@@ -4,7 +4,7 @@ Merge the four extractor reports into one ranked `feature-index.json`. Deduplica
 features by user-visible capability and implementation dependency, preserving all
 source evidence.
 
-Before assigning P0 priority, consult arxiv-libwit for modern techniques that
+Before assigning P0 priority, consult arxiv-search-tool for modern techniques that
 could materially improve implementation quality, evaluation, safety, retrieval,
 agent orchestration, UI generation, testing, or observability. Each P0 feature
 must include a non-empty `modern_techniques_refs` array.
@@ -26,7 +26,7 @@ Return strict JSON:
       "dependencies": [],
       "modern_techniques_refs": [
         {
-          "source": "arxiv-libwit",
+          "source": "arxiv-search-tool",
           "title": "paper or technique title",
           "why_relevant": "one sentence"
         }

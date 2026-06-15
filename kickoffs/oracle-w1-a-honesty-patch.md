@@ -28,5 +28,5 @@ Only `docs/positioning/why-mini-ork.md` may be edited. No other file may be touc
 
 Source paragraph that drives this kickoff lives in the epic
 `kickoffs/oracle-hardening-v03.md` § Wave 1 — W1-A. The downstream research brief
-documenting per-paper rationale is at libwit's
+documenting per-paper rationale is at the host application's
 `docs/_meta/research/20260605-self-evolution-oracle-arxiv-summaries.md`.
