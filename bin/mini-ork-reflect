@@ -143,6 +143,20 @@ if [ "${MO_CROSS_EPIC_GRADIENTS:-1}" != "0" ]; then
   echo "  [cross_epic_gradient] promoted ${_CROSS_WRITTEN:-0} cross-class gradients"
 fi
 
+# Per-agent bug-report sweep — pick up noticed_bugs.jsonl from each run dir
+# and upsert into bug_reports table. Auto-promote top-N to epics when
+# MO_BUG_REPORT_AUTO_PROMOTE=N (default 0, manual only).
+if [ "${MO_BUG_REPORT_SWEEP:-1}" != "0" ]; then
+  _require_lib bug_report
+  _BUGS_SWEPT=$(bug_report_sweep --since "$SINCE" 2>/dev/null || echo 0)
+  echo "  [bug_report_sweep] swept ${_BUGS_SWEPT:-0} new noticed bug(s)"
+  _AUTO_PROMOTE="${MO_BUG_REPORT_AUTO_PROMOTE:-0}"
+  if [ "$_AUTO_PROMOTE" != "0" ]; then
+    _PROMOTED=$(bug_report_promote --top "$_AUTO_PROMOTE" 2>/dev/null || echo 0)
+    echo "  [bug_report_promote] promoted ${_PROMOTED:-0} bug(s) to epics"
+  fi
+fi
+
 # ── trace end ─────────────────────────────────────────────────────────────────
 # The closing trace carries WHAT reflect did (traces analyzed, gradients
 # written) — a bare status:"success" row gave gradient_extract nothing to
