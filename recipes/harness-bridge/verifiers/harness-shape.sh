@@ -58,16 +58,20 @@ else
   pass=false
 fi
 
+# Translate bash booleans (true/false) to Python booleans (True/False)
+# at the heredoc boundary so json.dumps receives valid identifiers.
+_py_bool() { [ "$1" = "true" ] && printf 'True' || printf 'False'; }
+
 python3 -c "
 import json
 print(json.dumps({
   'verifier': 'harness-shape',
-  'pass': $pass,
+  'pass': $(_py_bool "$pass"),
   'evidence_path': '$EVIDENCE',
-  'artifact_verdict_exists': $artifact_verdict_exists,
-  'verdict_parses': $verdict_parses,
-  'harness_known': $harness_known,
-  'diff_shape_ok': $diff_shape_ok,
+  'artifact_verdict_exists': $(_py_bool "$artifact_verdict_exists"),
+  'verdict_parses': $(_py_bool "$verdict_parses"),
+  'harness_known': $(_py_bool "$harness_known"),
+  'diff_shape_ok': $(_py_bool "$diff_shape_ok"),
 }))
 "
 exit 0
