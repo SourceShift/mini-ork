@@ -186,6 +186,18 @@ if [ "${MO_INJECT_LEARNINGS:-1}" = "1" ] && [ -f "$MINI_ORK_ROOT/lib/context_ass
     _prior_block="$(context_prior_runs_md "${TASK_CLASS:-generic}" 5 || true)"
     [ -n "$_prior_block" ] && PROMPT_TEXT="${PROMPT_TEXT}"$'\n\n'"${_prior_block}"$'\n'
   fi
+  # ContextNest cross-session substrate. Surfaces atoms (decisions, learnings,
+  # risk_flags, prompt_directives) from prior Claude Code sessions — fresh
+  # data the local sqlite memory doesn't have. Gated by MO_DISABLE_CN=1 and
+  # silent when CN is unreachable so the planner never blocks on it.
+  if declare -f context_contextnest_atoms_md >/dev/null 2>&1; then
+    _cn_atoms_block="$(context_contextnest_atoms_md "$KICKOFF" 6 || true)"
+    [ -n "$_cn_atoms_block" ] && PROMPT_TEXT="${PROMPT_TEXT}"$'\n\n'"${_cn_atoms_block}"$'\n'
+  fi
+  if declare -f context_contextnest_recent_sessions_md >/dev/null 2>&1; then
+    _cn_sess_block="$(context_contextnest_recent_sessions_md "$KICKOFF" 4 || true)"
+    [ -n "$_cn_sess_block" ] && PROMPT_TEXT="${PROMPT_TEXT}"$'\n\n'"${_cn_sess_block}"$'\n'
+  fi
   # ContextPack artifact: the full bounded bundle (prior runs, failure
   # modes, prefs, constraints — each item cite-tagged) persisted next to
   # plan.json. The md blocks above are what the prompt gets; this is the
