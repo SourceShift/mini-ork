@@ -114,21 +114,29 @@ except Exception:
 # task_class column is the primary join (populated by gradient_store);
 # the legacy target-substring match stays as fallback for rows stored
 # before the column existed.
+# E7: also merge __cross_class__ gradients — universal lessons fanned out
+# from recurring targets across multiple task_classes. These get a higher
+# weight in the assembler since they generalize.
 failure_modes = []
 try:
     rows = con.execute("""
-        SELECT target, signal, suggested_change, confidence
+        SELECT target, signal, suggested_change, confidence,
+               (task_class = '__cross_class__') AS is_cross_class
         FROM gradient_records
-        WHERE (task_class = ? OR target LIKE ?) AND confidence >= 0.6
-        ORDER BY confidence DESC LIMIT 10
+        WHERE ((task_class = ? OR target LIKE ?)
+               OR task_class = '__cross_class__')
+          AND confidence >= 0.6
+        ORDER BY is_cross_class DESC, confidence DESC LIMIT 10
     """, (task_class, f"%{task_class}%")).fetchall()
     for r in rows:
+        scope = "cross_class" if r["is_cross_class"] else task_class
         failure_modes.append({
             "cite": f"gradient_records/{r['target']}",
             "target": r["target"],
             "signal": r["signal"],
             "suggested_change": r["suggested_change"],
             "confidence": r["confidence"],
+            "scope": scope,
         })
 except Exception:
     pass

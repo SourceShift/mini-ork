@@ -1,0 +1,200 @@
+#!/usr/bin/env bash
+# mini-ork scheduler — autonomous multi-epic delivery loop.
+#
+# Pulls the next-ready epic from `epics` (status='not started' AND all hard
+# deps resolved) and dispatches it via `mini-ork run epic-runner <kickoff>`.
+# On verdict=success, marks epic 'done' and cascades dep resolution. On
+# failure, marks epic 'escalated' (visible in `mini-ork-epics list`).
+#
+# Flags:
+#   --once               Run a single pick→dispatch→verdict cycle then exit
+#   --idle-secs N        Sleep N seconds between empty-queue polls (default 60)
+#   --max-iters N        Hard stop after N dispatches (default unlimited)
+#   --budget-cap-usd X   Daily cost cap; refuses to dispatch when exceeded
+#                        (defaults to MO_DAILY_BUDGET_USD or 50.0)
+#   --dry-run            Print what would be dispatched, do not invoke runner
+#   --help
+#
+# Exit codes:
+#   0   queue drained (no ready epics) OR --once cycle finished cleanly
+#   1   fatal: missing deps (no DB, no epic-runner recipe)
+#   2   cost-pause sentinel encountered
+#   3   max-iters reached
+
+set -Eeuo pipefail
+
+MINI_ORK_ROOT="${MINI_ORK_ROOT:-$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)}"
+export MINI_ORK_ROOT
+MINI_ORK_HOME="${MINI_ORK_HOME:-$MINI_ORK_ROOT/.mini-ork}"
+export MINI_ORK_HOME
+STATE_DB="${MINI_ORK_DB:-$MINI_ORK_HOME/state.db}"
+export STATE_DB
+RECIPE="${MO_SCHED_RECIPE:-epic-runner}"
+
+ONCE=0
+IDLE_SECS=60
+MAX_ITERS=0
+BUDGET_CAP="${MO_DAILY_BUDGET_USD:-50.0}"
+DRY_RUN=0
+
+_usage() {
+  sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --once)             ONCE=1; shift ;;
+    --idle-secs)        IDLE_SECS="$2"; shift 2 ;;
+    --max-iters)        MAX_ITERS="$2"; shift 2 ;;
+    --budget-cap-usd)   BUDGET_CAP="$2"; shift 2 ;;
+    --dry-run)          DRY_RUN=1; shift ;;
+    --help|-h)          _usage; exit 0 ;;
+    *) echo "scheduler: unknown flag $1" >&2; exit 2 ;;
+  esac
+done
+
+[ -f "$STATE_DB" ] || { echo "scheduler: state.db not found at $STATE_DB" >&2; exit 1; }
+[ -d "$MINI_ORK_ROOT/recipes/$RECIPE" ] || {
+  echo "scheduler: recipe not found: recipes/$RECIPE" >&2; exit 1;
+}
+
+# shellcheck source=lib/epic_graph.sh
+source "$MINI_ORK_ROOT/lib/epic_graph.sh"
+
+# Today's spend so far. We sum task_runs.cost_usd over the rolling 24h window
+# rather than reading a daily-cap sentinel — simpler + always-fresh.
+_today_cost_usd() {
+  sqlite3 "$STATE_DB" \
+    "SELECT COALESCE(SUM(cost_usd), 0) FROM task_runs
+       WHERE created_at >= strftime('%s','now','-24 hours');" 2>/dev/null \
+  || echo 0
+}
+
+_cost_pause_active() {
+  # Check for the same sentinel files the rest of mini-ork uses.
+  [ -f "$MINI_ORK_HOME/cost-pause.sentinel" ] || \
+  [ -f "$MINI_ORK_HOME/control/cost-pause" ]
+}
+
+# Resolve an epic's kickoff path. Order: kickoff_path column → kickoffs/<id>.md
+# → recipes/<recipe>/example-kickoff.md (last-resort smoke).
+_resolve_kickoff() {
+  local epic_id="$1"
+  local kp
+  kp=$(sqlite3 "$STATE_DB" "SELECT kickoff_path FROM epics WHERE id='$epic_id';" 2>/dev/null)
+  if [ -n "$kp" ] && [ -f "$MINI_ORK_ROOT/$kp" ]; then
+    printf '%s\n' "$MINI_ORK_ROOT/$kp"
+    return 0
+  fi
+  if [ -f "$MINI_ORK_ROOT/kickoffs/$epic_id.md" ]; then
+    printf '%s\n' "$MINI_ORK_ROOT/kickoffs/$epic_id.md"
+    return 0
+  fi
+  if [ -f "$MINI_ORK_ROOT/recipes/$RECIPE/example-kickoff.md" ]; then
+    echo "scheduler: epic $epic_id has no kickoff; falling back to example" >&2
+    printf '%s\n' "$MINI_ORK_ROOT/recipes/$RECIPE/example-kickoff.md"
+    return 0
+  fi
+  return 1
+}
+
+# Mark an epic 'in progress' then dispatch the recipe. Capture verdict.
+_dispatch_epic() {
+  local epic_id="$1"
+  local kickoff
+  kickoff=$(_resolve_kickoff "$epic_id") || {
+    echo "  [skip] epic $epic_id has no resolvable kickoff" >&2
+    sqlite3 "$STATE_DB" "UPDATE epics SET status='escalated', notes=COALESCE(notes,'') || ' [scheduler: no kickoff]' WHERE id='$epic_id';"
+    return 1
+  }
+
+  sqlite3 "$STATE_DB" "UPDATE epics SET status='in progress' WHERE id='$epic_id';"
+
+  local log_dir="$MINI_ORK_HOME/runs/scheduler"
+  mkdir -p "$log_dir"
+  local log_path="$log_dir/dispatch-$(date +%s)-$epic_id.log"
+
+  if [ "$DRY_RUN" = "1" ]; then
+    echo "  [dry-run] would dispatch: $MINI_ORK_ROOT/bin/mini-ork run $RECIPE $kickoff"
+    sqlite3 "$STATE_DB" "UPDATE epics SET status='not started' WHERE id='$epic_id';"
+    return 0
+  fi
+
+  echo "  [dispatch] epic=$epic_id recipe=$RECIPE kickoff=$kickoff → $log_path"
+  local rc=0
+  if "$MINI_ORK_ROOT/bin/mini-ork" run "$RECIPE" "$kickoff" > "$log_path" 2>&1; then
+    rc=0
+  else
+    rc=$?
+  fi
+
+  # Verdict resolution: look at the verdict.json produced by the dispatched run.
+  # We rely on the run id printed in the log (e.g. `run_id=run-...`) to find it.
+  local run_id verdict
+  run_id=$(grep -E '^run_id=' "$log_path" | head -1 | cut -d= -f2)
+  verdict=""
+  if [ -n "$run_id" ] && [ -f "$MINI_ORK_HOME/runs/$run_id/verdict.json" ]; then
+    verdict=$(python3 -c "
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+    print(d.get('verdict','unknown'))
+except Exception:
+    pass
+" "$MINI_ORK_HOME/runs/$run_id/verdict.json" 2>/dev/null)
+  fi
+  [ -z "$verdict" ] && verdict="unknown"
+
+  case "$verdict" in
+    pass|success)
+      echo "  [done] epic=$epic_id verdict=$verdict"
+      sqlite3 "$STATE_DB" "UPDATE epics SET status='done' WHERE id='$epic_id';"
+      epic_graph_on_done "$epic_id"
+      ;;
+    *)
+      echo "  [fail] epic=$epic_id verdict=$verdict rc=$rc → escalated"
+      sqlite3 "$STATE_DB" "UPDATE epics SET status='escalated' WHERE id='$epic_id';"
+      ;;
+  esac
+  return $rc
+}
+
+# Main loop.
+iter=0
+while :; do
+  if _cost_pause_active; then
+    echo "scheduler: cost-pause active — exiting" >&2
+    exit 2
+  fi
+
+  spent=$(_today_cost_usd)
+  if awk "BEGIN{exit !($spent >= $BUDGET_CAP)}"; then
+    echo "scheduler: 24h spend \$$spent ≥ cap \$$BUDGET_CAP — refusing dispatch" >&2
+    exit 2
+  fi
+
+  # Pick first ready epic. epic_graph_ready_now is sorted oldest-first.
+  next_epic=$(epic_graph_ready_now | head -1)
+
+  if [ -z "$next_epic" ]; then
+    if [ "$ONCE" = "1" ]; then
+      echo "scheduler: queue empty (--once) → exit 0"
+      exit 0
+    fi
+    echo "scheduler: queue empty; idle ${IDLE_SECS}s"
+    sleep "$IDLE_SECS"
+    continue
+  fi
+
+  echo "scheduler: iter $((iter+1)) — next=$next_epic spent=\$$spent / cap=\$$BUDGET_CAP"
+  _dispatch_epic "$next_epic" || true
+  iter=$((iter+1))
+
+  if [ "$ONCE" = "1" ]; then
+    exit 0
+  fi
+  if [ "$MAX_ITERS" -gt 0 ] && [ "$iter" -ge "$MAX_ITERS" ]; then
+    echo "scheduler: max-iters $MAX_ITERS reached → exit 3" >&2
+    exit 3
+  fi
+done
