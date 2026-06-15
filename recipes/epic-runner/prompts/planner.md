@@ -60,4 +60,36 @@ Rules:
    meta-recipe machinery. The generated recipe has exactly 8 nodes:
    planner, epic_dispatcher, wave_aggregator, epic_verifier, final_reviewer,
    publisher, rollback, reflector.
-5. Write the plan file and nothing else.
+5. Write the `epic-runner-plan.json` file above.
+6. **ALSO emit a SECOND file `${MINI_ORK_RUN_DIR}/plan.json`** to satisfy
+   the framework's universal D-015 plan-gate (`bin/mini-ork-plan` requires
+   `verifier_contract.checks` to be non-empty on every plan, including
+   multi-epic recipes). Use this minimal shape — it composes with
+   `epic-runner-plan.json` rather than duplicating it:
+
+   ```json
+   {
+     "recipe_name": "epic-runner",
+     "task_class": "epic_runner_delivery",
+     "objective": "<copy from epic-runner-plan.json>",
+     "decomposition": [
+       { "step_number": 1, "description": "Dispatch each wave's epics as child framework-edit runs, wait for all to terminate before advancing.", "files": [] }
+     ],
+     "verifier_contract": {
+       "checks": [
+         {
+           "id": "epic-graph-complete",
+           "description": "Deterministic schema gate — every declared epic appears in epic-results.json with passed/failed/skipped status and dependency order is respected.",
+           "command": "bash recipes/epic-runner/verifiers/epic-graph-complete.sh"
+         },
+         {
+           "id": "epic-runner-delivery-pass",
+           "description": "epic-runner-delivery.json reports pass=true after final_reviewer.",
+           "command": "jq -e '.pass == true' \"$MINI_ORK_RUN_DIR/epic-runner-delivery.json\""
+         }
+       ]
+     }
+   }
+   ```
+
+7. Write BOTH `epic-runner-plan.json` and `plan.json`. No other files.
