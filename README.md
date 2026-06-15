@@ -366,7 +366,7 @@ Add your own under `recipes/<name>/` — see [docs/EXTENSION.md](docs/EXTENSION.
 
 ---
 
-## 4 Extension Points
+## 5 Extension Points
 
 Extensions do not require forking the framework. See [docs/EXTENSION.md](docs/EXTENSION.md) for full examples.
 
@@ -374,6 +374,7 @@ Extensions do not require forking the framework. See [docs/EXTENSION.md](docs/EX
 2. **AgentRegistry** — register new roles or model bindings via `lib/agent_registry.sh:agent_register`. No code change.
 3. **VerifierRegistry** — drop a `<name>.sh` script under `${MINI_ORK_HOME}/verifiers/` or `recipes/<recipe>/verifiers/` and reference it in `workflow.yaml`.
 4. **ExperienceMemory** — add new namespaces via DB migrations or override `lib/context_assembler.sh` per task class.
+5. **EventHooks** — point `MINI_ORK_ON_EVENT` at any executable to receive push notifications on every node lifecycle / recursive child-run event. Reference handlers under `examples/event-hooks/` (FIFO, HTTP webhook, JSONL log). See [docs/EVENT-HOOKS.md](docs/EVENT-HOOKS.md).
 
 Embedding from Python is first-class too — `MiniOrk().run(RunRequest(...))` with typed specs: [docs/PYTHON_FRAMEWORK.md](docs/PYTHON_FRAMEWORK.md).
 
