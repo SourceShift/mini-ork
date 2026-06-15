@@ -2,7 +2,7 @@
 
 Per the 3-axis topology framework
 (docs/_meta/research/20260602-2030-context-formation-diversity-framework-multi-agent-panels.md
-in libwit + upstream's positioning doc), the C axis — context formation
+in the host application + upstream's positioning doc), the C axis — context formation
 distance — measures HOW DIFFERENTLY each lens constructed its working
 evidence from the same input.
 

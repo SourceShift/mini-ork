@@ -48,7 +48,7 @@
 ## P1 — Visible breakage
 
 - [BUG-005] [CONSENSUS: 4/4] [DISPUTED-SEVERITY: P0 (minimax) vs P1 (kimi, codex, glm)] Block Visualize hardcodes `mode: 'fast'` and never renders `AiGenerationControls`
-  - File: `src/components/blocks/BlockSelectionToolbar.tsx:373` (hardcode) + `src/components/libwit/highlighter/AiGenerationControls.tsx` (control component) — compare with `src/components/markdown/UnifiedMarkdownRenderer.tsx:836`, `src/components/pdf/PDFPageViewViewer.tsx:2942`, `src/components/blocks/BlockTreeRenderer.tsx:1167`.
+  - File: `src/components/blocks/BlockSelectionToolbar.tsx:373` (hardcode) + `src/components/host-app/highlighter/AiGenerationControls.tsx` (control component) — compare with `src/components/markdown/UnifiedMarkdownRenderer.tsx:836`, `src/components/pdf/PDFPageViewViewer.tsx:2942`, `src/components/blocks/BlockTreeRenderer.tsx:1167`.
   - Feature: Shared AiGenerationControls parity (F1)
   - Symptom: Block toolbar has no Fast/Deep, no Quick/Sources; `startAnnotationPipeline` always sends `mode: 'fast'` with `bypassConfirmation: false`.
   - Root cause: Block surface never mounts `AiGenerationControls`; no `modelMode`/`retrievalMode` state.
@@ -66,7 +66,7 @@
   - Fix shape: Pass the full selected range into a placement adapter; persist generated visual after the range.
 
 - [BUG-007] [CONSENSUS: 2/4 kimi+minimax] [DISPUTED-SEVERITY: P2 (kimi) vs P1 (minimax)] Figure / illustration is gated off everywhere — `figureEnabled={false}` is a literal in 5 call sites
-  - File: `src/components/libwit/highlighter/MarkdownHighlighterProvider.tsx:979` + `src/components/blocks/BlockSelectionToolbar.tsx:826` + `src/components/blocks/BlockTreeRenderer.tsx:1198` + `src/components/markdown/UnifiedMarkdownRenderer.tsx:996` + `src/components/pdf/PDFPageViewViewer.tsx:2973`. BE path lives at `server/services/pipelineTemplates/highlightActions.ts:556`.
+  - File: `src/components/host-app/highlighter/MarkdownHighlighterProvider.tsx:979` + `src/components/blocks/BlockSelectionToolbar.tsx:826` + `src/components/blocks/BlockTreeRenderer.tsx:1198` + `src/components/markdown/UnifiedMarkdownRenderer.tsx:996` + `src/components/pdf/PDFPageViewViewer.tsx:2973`. BE path lives at `server/services/pipelineTemplates/highlightActions.ts:556`.
   - Feature: Visualize submenu across surfaces (F2)
   - Symptom: `VisualizeChipMenu` accepts `figureEnabled`, but every host passes `false`. BE prompt + handler exist; UI never reaches them.
   - Root cause: No flag wiring (env, remote config, or BE feature flag).
@@ -93,7 +93,7 @@
   - Fix shape: Either create a wrapper typed for block-selection seeds OR change block-selection to a sibling insertion that explicitly skips wrapper.
 
 - [BUG-010] [CONSENSUS: 1/4 kimi] `VisualizeVizType` union shrinks between shared, service, and call-site layers
-  - File: `src/services/derivativeDispatchService.ts:23` (local re-decl drops `'plot'`) + `shared/types/contentArtifacts.ts:55` (canonical) + `src/components/libwit/highlighter/MarkdownHighlighterProvider.tsx:598` (mapping omits `'plot'`).
+  - File: `src/services/derivativeDispatchService.ts:23` (local re-decl drops `'plot'`) + `shared/types/contentArtifacts.ts:55` (canonical) + `src/components/host-app/highlighter/MarkdownHighlighterProvider.tsx:598` (mapping omits `'plot'`).
   - Feature: Visualize sub-action dispatch (F2)
   - Symptom: Shared type defines `'mermaid' | 'chart' | 'figure' | 'plot'`; service + mapper handle only three.
   - Root cause: Local type re-declaration that lies about mirroring the shared type.
@@ -157,7 +157,7 @@
 ## P2 — Degraded behaviour
 
 - [BUG-017] [CONSENSUS: 2/4 kimi+glm] `PDFMobileSelectionSheet` ignores `disabledActions` API, only forwards legacy `arxivDisabled`
-  - File: `src/components/pdf/PDFMobileSelectionSheet.tsx:28-33,52` + `src/components/libwit/highlighter/MobileSheet.tsx:61-66` (canonical `disabledActions?: Partial<Record<HighlighterAction, string>>`).
+  - File: `src/components/pdf/PDFMobileSelectionSheet.tsx:28-33,52` + `src/components/host-app/highlighter/MobileSheet.tsx:61-66` (canonical `disabledActions?: Partial<Record<HighlighterAction, string>>`).
   - Feature: Mobile parity (F4)
   - Symptom: PDF mobile cannot disable `code` on non-code selections or any future gated action.
   - Reproduction: PDF mobile non-code selection → tap `code` → pipeline fires.
@@ -177,7 +177,7 @@
   - Fix shape: Expand callback signature to accept `PipelineRunStatus`; emit from `stopPipeline`.
 
 - [BUG-020] [CONSENSUS: 1/4 kimi] `MarkdownHighlighterProvider` callbacks omit `showToast` from dep arrays
-  - File: `src/components/libwit/highlighter/MarkdownHighlighterProvider.tsx:447` + `:146-151`.
+  - File: `src/components/host-app/highlighter/MarkdownHighlighterProvider.tsx:447` + `:146-151`.
   - Symptom: `runAction`, `handleUnderstandSub`, `handleVisualizeSub` miss `showToast` in deps.
   - Impact: Closure correctness risk under Strict Mode / future React compiler.
   - Fix shape: Add to dep arrays.
@@ -211,7 +211,7 @@
   - Fix shape: Normalize both keys in `triggerRun()` before wrapper creation.
 
 - [BUG-026] [CONSENSUS: 1/4 glm] `MarkdownHighlighterProvider` toolbar lacks shared `AiGenerationControls`
-  - File: `src/components/libwit/highlighter/MarkdownHighlighterProvider.tsx:881` — renders `HighlighterToolbar` without `contextModeControl`, unlike `UnifiedMarkdownRenderer`.
+  - File: `src/components/host-app/highlighter/MarkdownHighlighterProvider.tsx:881` — renders `HighlighterToolbar` without `contextModeControl`, unlike `UnifiedMarkdownRenderer`.
   - Symptom: Markdown surfaces routed through this provider behave differently from `UnifiedMarkdownRenderer`.
   - Fix shape: Inject the same model/retrieval state + controls, or retire the provider for selection generation.
 

@@ -1,7 +1,7 @@
 # Fix-Spec — spec-author silent-die failure mode
 
 **Date observed:** 2026-06-02 ~15:53 UTC
-**Downstream incident:** libwit `researcher` repo, WAVE 1 `SELF-EVOLVING-P0-P1-F-STATE` sub-epic
+**Downstream incident:** the host application `researcher` repo, WAVE 1 `SELF-EVOLVING-P0-P1-F-STATE` sub-epic
 **Affected runtime:** `.agentflow/mini-orch/run.sh` orchestrator spec-author phase (Phase 11 BDD spec synth)
 
 ## Symptom
@@ -36,7 +36,7 @@ The fact that `spec-author.log` and `spec-author.err` are BOTH missing (not zero
 This pattern matches the broader `phase5-prose-claims` silent-exit class:
 - TRACK-A codex worker SIGTERM rc=143 with 0-byte log + 0-byte err
 - Root cause: `cl_codex.sh:135` exec line ended with `2>/dev/null` swallowing all stderr
-- Fixed in libwit commit `e12422e1b` (2026-06-01)
+- Fixed in the host application commit `e12422e1b` (2026-06-01)
 
 The spec-author dispatcher needs the same audit: scan all spawn paths (`cl_<lane>.sh` invocations from spec-synth steps) for `2>/dev/null` or unredirected error swallowing.
 
@@ -94,7 +94,7 @@ But for F-STATE (which has a `BookJobProgressContent.tsx` FE file in scope) the 
 
 ## Downstream patches needed
 
-After upstream lands, libwit `researcher` repo must:
+After upstream lands, the host application `researcher` repo must:
 - Pull updated `lib/spec-synth.sh`
 - Re-run F-STATE via the dispatch plan at `docs/_meta/todos/20260602-2015-f-state-re-dispatch-plan.md`
 - Verify the new error-emission path by deliberately killing the spec-author LLM mid-flight and observing the FATAL log
@@ -102,5 +102,5 @@ After upstream lands, libwit `researcher` repo must:
 ## Composes with
 
 - `~/ps/mini-ork/docs/fixes/20260602-preflight-gate-hardening.md` (prior upstream fix-spec)
-- Downstream: libwit `researcher` Insforge memory `wave_1_self_evolving_5_of_6_shipped_e_assign_manual_rescue_2026_06_02` (id=1250)
-- libwit commit `e12422e1b` — analogous fix for codex worker silent-exit class
+- Downstream: the host application `researcher` Insforge memory `wave_1_self_evolving_5_of_6_shipped_e_assign_manual_rescue_2026_06_02` (id=1250)
+- the host application commit `e12422e1b` — analogous fix for codex worker silent-exit class

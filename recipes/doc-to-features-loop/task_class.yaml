@@ -16,7 +16,7 @@ matches:
     - business doc implementation
     - recursive feature dispatch
     - markdown product spec
-    - arxiv-libwit
+    - arxiv-search-tool
     - modern techniques
   regex:
     - "Source doc:"
@@ -36,7 +36,7 @@ tags:
   - recursive
   - feature-extraction
   - implementation
-  - arxiv-libwit
+  - arxiv-search-tool
 
 heterogeneity:
   feature_extractors:
