@@ -1238,3 +1238,92 @@ def test_workspace_scoped_home_resolution(db, home, tmp_path) -> None:
     assert e.value.status_code == 404
     # lenient variant (projects routes) falls back instead of locking out
     assert get_home_lenient(str(tmp_path / "nope"), None) == get_default_home()
+
+
+# ── E4 cost-pause + E6 auth HTTP integration ──────────────────────────────
+
+
+def test_pause_cost_writes_sentinel(tmp_path: Path) -> None:
+    from mini_ork.web.control import pause_cost_run
+
+    run_id = "run-test-pause"
+    run_dir = tmp_path / "runs" / run_id
+    run_dir.mkdir(parents=True)
+
+    result = pause_cost_run(tmp_path, run_id, threshold_usd=42.0)
+    assert result["ok"] is True
+    assert result["threshold_usd"] == 42.0
+    sentinel = run_dir / ".cost-pause"
+    assert sentinel.is_file()
+    payload = json.loads(sentinel.read_text())
+    assert payload["threshold_usd"] == 42.0
+    assert payload["source"] == "http-api"
+    assert payload["run_id"] == run_id
+
+
+def test_pause_cost_rejects_missing_run(tmp_path: Path) -> None:
+    from mini_ork.web.control import pause_cost_run
+
+    result = pause_cost_run(tmp_path, "run-nope")
+    assert result["ok"] is False
+    assert "not found" in result["error"]
+
+
+def test_resume_cost_clears_sentinel_and_audits(tmp_path: Path) -> None:
+    from mini_ork.web.control import pause_cost_run, resume_cost_run
+
+    run_id = "run-test-resume"
+    run_dir = tmp_path / "runs" / run_id
+    run_dir.mkdir(parents=True)
+    pause_cost_run(tmp_path, run_id, threshold_usd=10.0)
+
+    result = resume_cost_run(tmp_path, run_id, approver="amir")
+    assert result["ok"] is True
+    assert result["approver"] == "amir"
+    assert not (run_dir / ".cost-pause").exists()
+
+    approvals = run_dir / ".cost-pause-approvals.jsonl"
+    assert approvals.is_file()
+    audit_line = json.loads(approvals.read_text().splitlines()[0])
+    assert audit_line["approver"] == "amir"
+    assert audit_line["run_id"] == run_id
+    assert audit_line["source"] == "http-api"
+
+
+def test_resume_cost_without_sentinel_returns_error(tmp_path: Path) -> None:
+    from mini_ork.web.control import resume_cost_run
+
+    run_id = "run-test-no-sentinel"
+    run_dir = tmp_path / "runs" / run_id
+    run_dir.mkdir(parents=True)
+
+    result = resume_cost_run(tmp_path, run_id, approver="amir")
+    assert result["ok"] is False
+    assert "no cost-pause sentinel" in result["error"]
+
+
+def test_auth_require_token_rejects_missing_header() -> None:
+    from fastapi import HTTPException
+
+    from mini_ork.web.auth import require_token
+
+    # FastAPI Request stub: only headers is consulted.
+    class _StubReq:
+        headers = {}  # type: ignore[assignment]
+
+    with pytest.raises(HTTPException) as exc:
+        require_token(_StubReq())  # type: ignore[arg-type]
+    assert exc.value.status_code == 401
+
+
+def test_auth_require_token_accepts_valid_token(tmp_path: Path, monkeypatch) -> None:
+    from mini_ork.web.auth import require_token
+
+    tokens_file = tmp_path / "auth-tokens.txt"
+    tokens_file.write_text("abc123 amir\n# comment\ndef456 ops-bot\n")
+    monkeypatch.setenv("MINI_ORK_HOME", str(tmp_path))
+
+    class _StubReq:
+        headers = {"authorization": "Bearer abc123"}
+
+    assert require_token(_StubReq()) == "amir"  # type: ignore[arg-type]
