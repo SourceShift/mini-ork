@@ -44,6 +44,16 @@ for m in re.finditer(r"^\+\+\+ b/(.+)$", diff, re.M):
 for f in sorted(files):
     if not os.path.isfile(f):
         continue
+    # bin/ holds polyglot CLIs (Python, Node); only bash-shebang files
+    # get the bash -n check. Otherwise we'd flag every Python script as
+    # a "bash syntax error" critical issue.
+    try:
+        with open(f) as fh:
+            first = fh.readline()
+    except Exception:
+        continue
+    if "bash" not in first and not first.endswith("sh\n"):
+        continue
     r = subprocess.run(["bash", "-n", f], capture_output=True, text=True)
     if r.returncode != 0:
         print(json.dumps({
