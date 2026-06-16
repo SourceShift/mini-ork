@@ -71,6 +71,80 @@ if [ $L1_RC -ne 0 ]; then
 fi
 echo "✓ Layer 1 clean."
 
+# Layer 3 runs on every push (it scales severity policy by target_branch
+# internally — block on main, warn on feature). The Layer 3 function lives
+# at the bottom of this file and exits when verdict=block.
+_layer3_run() {
+  [ "${MO_REVIEW_SKIP:-0}" = "1" ] && {
+    echo "pre-push: Layer 3 skipped (MO_REVIEW_SKIP=1)."; return 0; }
+  [ -f "$REPO_ROOT/lib/pre_push_review.sh" ] || {
+    echo "pre-push: Layer 3 not installed (lib/pre_push_review.sh missing) — skipping."
+    return 0; }
+
+  local _l3_push_sha _l3_push_base _l3_target _l3_review_id _l3_verdict _l3_mode
+  _l3_push_sha=$(git rev-parse HEAD)
+  _l3_push_base=$(git merge-base "$_l3_push_sha" "origin/main" 2>/dev/null || echo "")
+  [ -z "$_l3_push_base" ] && _l3_push_base=$(git rev-parse "$_l3_push_sha^" 2>/dev/null || echo "")
+  _l3_target="feature"; [ "$target_main" = 1 ] && _l3_target="main"
+  _l3_mode="heuristic"
+  [ "${MO_REVIEW_LLM_LENSES:-0}" = "1" ] && _l3_mode="hybrid"
+
+  echo "pre-push: running Layer 3 (code reviewer) — target=$_l3_target base=${_l3_push_base:0:12} sha=${_l3_push_sha:0:12}"
+
+  _l3_review_id=$(MINI_ORK_ROOT="$REPO_ROOT" \
+                  MINI_ORK_DB="${MINI_ORK_DB:-$REPO_ROOT/.mini-ork/state.db}" \
+    bash -c "source '$REPO_ROOT/lib/pre_push_review.sh'; \
+             review_run '$_l3_push_sha' '$_l3_target' --mode '$_l3_mode' \
+             ${_l3_push_base:+--base '$_l3_push_base'}" 2>&1 | tail -1)
+
+  if ! printf '%s' "$_l3_review_id" | grep -qE '^[0-9]+$'; then
+    echo "⚠ pre-push: Layer 3 reviewer error (review_id=$_l3_review_id) — fail-open."
+    return 0
+  fi
+
+  _l3_verdict=$(MINI_ORK_ROOT="$REPO_ROOT" \
+                MINI_ORK_DB="${MINI_ORK_DB:-$REPO_ROOT/.mini-ork/state.db}" \
+    bash -c "source '$REPO_ROOT/lib/pre_push_review.sh'; review_verdict_for $_l3_review_id")
+
+  echo "  review_id=$_l3_review_id verdict=$_l3_verdict"
+
+  case "$_l3_verdict" in
+    approve)
+      echo "✓ pre-push: Layer 3 clean."
+      return 0 ;;
+    warn)
+      "$REPO_ROOT/bin/mini-ork-review" show "$_l3_review_id"
+      echo
+      echo "⚠ pre-push: Layer 3 raised warnings but target is '$_l3_target' — push proceeds."
+      return 0 ;;
+    block)
+      "$REPO_ROOT/bin/mini-ork-review" show "$_l3_review_id"
+      if [ "${MO_REVIEW_AUTO_FIX:-0}" = "1" ]; then
+        echo
+        echo "pre-push: MO_REVIEW_AUTO_FIX=1 — forwarding issues to bug_reports."
+        local _l3_n
+        _l3_n=$(MINI_ORK_ROOT="$REPO_ROOT" \
+                MINI_ORK_DB="${MINI_ORK_DB:-$REPO_ROOT/.mini-ork/state.db}" \
+          bash -c "source '$REPO_ROOT/lib/pre_push_review.sh'; \
+                   review_forward_to_bug_reports $_l3_review_id")
+        echo "pre-push: forwarded $_l3_n issue(s)."
+        echo "         operator next:"
+        echo "           bin/mini-ork bugs promote --top $_l3_n"
+        echo "           bin/mini-ork scheduler --once"
+      fi
+      echo
+      echo "✗ pre-push: Layer 3 blocked push (verdict=block, review_id=$_l3_review_id)."
+      echo "  Fix the issues above, OR:"
+      echo "    MO_REVIEW_SKIP=1 git push       # bypass Layer 3 only"
+      echo "    MO_REVIEW_AUTO_FIX=1 git push   # dispatch a fix epic instead of blocking"
+      echo "    git push --no-verify            # bypass all hooks"
+      return 1 ;;
+  esac
+  return 0
+}
+
+_layer3_run || exit 1
+
 # Layers 2a + 2b only fire on push to main, and only if structural diff exists.
 if [ "$target_main" -ne 1 ]; then
   echo "pre-push: not pushing to main → skipping L2 panel."

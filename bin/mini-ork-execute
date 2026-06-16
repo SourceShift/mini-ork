@@ -271,15 +271,6 @@ trap 'exit 130' INT
 # on filesystem scan, breaking the recipe's expected artifact layout.
 export MINI_ORK_RUN_DIR="$RUN_DIR"
 
-# ContextNest prefetch dir — populated by hooks/subagent-prefetch.sh on
-# every worker's first UserPromptSubmit when MINI_ORK_RUN_ID is set. The
-# hook writes <session_id>.md per spawned subagent. Prompt templates can
-# reference {{MO_CN_PREFETCH_DIR}} to instruct workers to `ls` + cat the
-# files before their first turn (semantic-retrieve atoms + recent
-# features + inbox items relevant to the cwd + prompt).
-export MO_CN_PREFETCH_DIR="$RUN_DIR/cn_prefetch"
-mkdir -p "$MO_CN_PREFETCH_DIR" 2>/dev/null || true
-
 # Live OTel span buffering (MO_OTEL=1 gated; best-effort, never breaks runs).
 # shellcheck source=/dev/null
 source "$MINI_ORK_ROOT/lib/mo_otel.sh" 2>/dev/null || true
@@ -856,6 +847,35 @@ print(json.dumps(obj))
   if [ -n "$_payload" ]; then
     trace_write "$_payload" >/dev/null 2>&1 || true
   fi
+  # Auto-dispatch bug-collector after the per-node trace lands. Opt-in via
+  # MO_BUG_COLLECTOR=1 (default off — initial heuristic scan is free but
+  # produces noticeable per-run noise during burn-in). The collector reads
+  # the agent's output and emits noticed_bugs.jsonl rows the reflect-stage
+  # sweep picks up. Never fails the caller's run.
+  if [ "${MO_BUG_COLLECTOR:-0}" = "1" ] && [ -x "$MINI_ORK_ROOT/bin/mini-ork-bug-collector" ]; then
+    "$MINI_ORK_ROOT/bin/mini-ork-bug-collector" \
+      --node-id "$_trace_id" \
+      --node-type "$_node_type" \
+      --output-file "$_output_file" \
+      --status "$_status" \
+      --task-class "${TASK_CLASS:-generic}" \
+      2>/dev/null || true
+  fi
+  # Track B item 3: per-node Process Reward Model (PRM) scoring.
+  # arXiv:2510.08049 + 2602.09305. Heuristic 0.0-1.0 reward derived from
+  # the just-written trace's observable signals (status, tool_calls,
+  # files, reviewer_verdict, duration, cost). Best-effort; gated on
+  # MO_PRM_SCORE=1 (default off; opt in once smoke confirms).
+  if [ "${MO_PRM_SCORE:-0}" = "1" ] \
+     && [ -f "$MINI_ORK_ROOT/lib/process_reward.sh" ]; then
+    if ! declare -f prm_score_trace >/dev/null 2>&1; then
+      # shellcheck source=lib/process_reward.sh
+      source "$MINI_ORK_ROOT/lib/process_reward.sh" 2>/dev/null || true
+    fi
+    if declare -f prm_score_trace >/dev/null 2>&1; then
+      prm_score_trace "$_trace_id" >/dev/null 2>&1 || true
+    fi
+  fi
 }
 
 # D-021: status transition helper. Updates task_runs.status at phase boundaries.
@@ -1214,6 +1234,13 @@ _dispatch_node() {
           if declare -f context_failure_modes_md >/dev/null 2>&1; then
             _learned_block="$(context_failure_modes_md "${TASK_CLASS:-generic}" 5 || true)"
             [ -n "$_learned_block" ] && _learned_block=$'\n\n'"${_learned_block}"$'\n'
+          fi
+          # Operator steering: inject unconsumed supervisor messages targeted
+          # at this run + role. Each consumed row is marked so the agent
+          # sees it once per dispatch.
+          if declare -f context_operator_steering_md >/dev/null 2>&1; then
+            _steering_block="$(context_operator_steering_md "$node_type" || true)"
+            [ -n "$_steering_block" ] && _learned_block="${_learned_block}"$'\n'"${_steering_block}"$'\n'
           fi
         fi
         ;;
@@ -2024,6 +2051,27 @@ if [ "$DRY_RUN" -eq 0 ]; then
   STATUS="success"
   [ "$FAIL_COUNT" -gt 0 ] && STATUS="failure"
   trace_write "{\"trace_id\":\"$TRACE_ID\",\"task_class\":\"${TASK_CLASS}\",\"status\":\"${STATUS}\"}" >/dev/null 2>&1 || true
+
+  # D3: populate task_memory + failure_memory per-task-class so the planner
+  # injection of "prior 5 runs by task_class" has data to read.
+  if _require_lib memory 2>/dev/null; then
+    _mo_run_cost=$(sqlite3 "$MINI_ORK_DB" \
+      "SELECT COALESCE(cost_usd, 0) FROM task_runs WHERE id='${MINI_ORK_RUN_ID:-}';" \
+      2>/dev/null | head -1)
+    _mo_run_dur_ms=$(sqlite3 "$MINI_ORK_DB" \
+      "SELECT (strftime('%s','now') - CAST(strftime('%s', created_at) AS INTEGER)) * 1000
+         FROM task_runs WHERE id='${MINI_ORK_RUN_ID:-}';" 2>/dev/null | head -1)
+    memory_write_task "${TASK_CLASS:-generic}" \
+                      "$STATUS" \
+                      "${_mo_run_dur_ms:-0}" \
+                      "${_mo_run_cost:-0}" \
+                      "[]" || true
+    if [ "$FAIL_COUNT" -gt 0 ]; then
+      memory_write_failure "execute" \
+                           "dispatch_error" \
+                           "${FAIL_COUNT} node(s) failed" || true
+    fi
+  fi
 fi
 
 if [ "$FAIL_COUNT" -gt 0 ]; then
