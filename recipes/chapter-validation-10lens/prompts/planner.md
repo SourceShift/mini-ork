@@ -39,3 +39,7 @@ Emit `${MINI_ORK_RUN_DIR}/plan.json` with this exact shape:
 Parse the kickoff to fill `chapter_context`. If a field is unknown,
 emit explicit `null` rather than guessing. The `lens_partitions` array
 is fixed — emit verbatim. Write the file and nothing else.
+
+## Kickoff content
+
+{{KICKOFF_CONTENT}}
