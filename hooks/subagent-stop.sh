@@ -83,18 +83,4 @@ sqlite3 "$DB" "
   );
 " 2>/dev/null || true
 
-# Mirror to ContextNest so the child subagent's transcript is ingested into
-# the substrate. CN's /api/v1/cc/hook/subagent_stop tails the JSONL from the
-# last-known offset and extracts memories/features. Fire-and-forget.
-if [ -f "${MINI_ORK_ROOT}/lib/cn_client.sh" ]; then
-  # shellcheck source=../lib/cn_client.sh
-  source "${MINI_ORK_ROOT}/lib/cn_client.sh" 2>/dev/null || true
-  if declare -f cn_hook_post >/dev/null 2>&1; then
-    transcript_path=$(extract_field "transcript_path")
-    [ -z "$transcript_path" ] && transcript_path=$(extract_field "transcript")
-    target_session="${child_session:-$parent_session}"
-    cn_hook_post "subagent_stop" "$target_session" "$PWD" "$transcript_path" || true
-  fi
-fi
-
 emit_continue

@@ -361,12 +361,13 @@ Recipes are user-land workflow definitions. They compose framework primitives in
 | `recursive-validate-impl` | `recipes/recursive-validate-impl/` | **Recipe-creator-authored, 2026-06-12.** Recursive implement → multi-tier-validate → reflect → replan loop for any technical-feature kickoff. 5-tier verification (compile/typecheck → scoped unit → property + mutation → heterogeneous LLM panel) gated left-to-right; tier-4 panel cross-references implementation against arxiv-search-tool "modern techniques" compliance, not just done-state. Reflector extracts failure gradients; recursion hard-caps at 5 iterations or $25 with a divergence-kill safety net. |
 
 | `harness-bridge` | `recipes/harness-bridge/` | **2026-06-14.** Wraps a full coding-agent harness (claude-code / codex-cli / gemini-cli) as a workflow node. Harvey-pattern composition. Planner picks the harness from a kickoff declaration; harness-shape verifier checks the emitted diff applies. |
+| `chapter-validation-10lens` | `recipes/chapter-validation-10lens/` | **2026-06-15.** 10 parallel lens agents each judge ONE slice of chapter validation (structure, factuality, voice, length, forbidden constructs, format, coverage, coherence, reader contract, synthesis originality); a synthesizer rolls the 10 verdicts into one pass/revise/block call; a publisher emits a human-readable report. |
 
 Add your own under `recipes/<name>/` — see [docs/EXTENSION.md](docs/EXTENSION.md).
 
 ---
 
-## 5 Extension Points
+## 4 Extension Points
 
 Extensions do not require forking the framework. See [docs/EXTENSION.md](docs/EXTENSION.md) for full examples.
 
@@ -374,7 +375,6 @@ Extensions do not require forking the framework. See [docs/EXTENSION.md](docs/EX
 2. **AgentRegistry** — register new roles or model bindings via `lib/agent_registry.sh:agent_register`. No code change.
 3. **VerifierRegistry** — drop a `<name>.sh` script under `${MINI_ORK_HOME}/verifiers/` or `recipes/<recipe>/verifiers/` and reference it in `workflow.yaml`.
 4. **ExperienceMemory** — add new namespaces via DB migrations or override `lib/context_assembler.sh` per task class.
-5. **EventHooks** — point `MINI_ORK_ON_EVENT` at any executable to receive push notifications on every node lifecycle / recursive child-run event. Reference handlers under `examples/event-hooks/` (FIFO, HTTP webhook, JSONL log). See [docs/EVENT-HOOKS.md](docs/EVENT-HOOKS.md).
 
 Embedding from Python is first-class too — `MiniOrk().run(RunRequest(...))` with typed specs: [docs/PYTHON_FRAMEWORK.md](docs/PYTHON_FRAMEWORK.md).
 
@@ -405,10 +405,10 @@ Auto-promotion is **class-restricted**: task classes with an external oracle (te
 The full release log lives in [`ROADMAP.md`](ROADMAP.md) — every section dated and per-commit-attributed. Current shipped totals (regenerable via `bash scripts/readme-claim-check.sh` and filesystem counts):
 
 - 6-stage universal loop (`classify → plan → execute → verify → reflect → improve`) + 7 companion entrypoints (`eval`, `improve`, `promote`, `metrics`, `spawn`, direct `bin/mini-ork-topology`, direct `bin/mini-ork-self-improve`)
-- 58 framework primitives in `lib/` (incl. oracle-hardening libs + `gate_bootstrap.sh` for the v0.3-rc1 central wire-up + `lib/throttle-guard.sh` for provider-throttle classification + `lib/mo_otel.sh` for env-gated OTel span emission, added 2026-06-09/10 + `lib/profile_answerer.sh` for MO_AUTO_ANSWER_PROFILE autonomous-dispatch mode, added 2026-06-12 + 4 calibration-list gates landed 2026-06-13: `lib/krippendorff_alpha_gate.sh` Nasser 2026 α<0.4 panel-divergence escalation, `lib/citation_verifier_mechanical.sh` Sistla 2025 mechanical citation coverage + wireheading check, `lib/refute_or_promote_gate.sh` Agarwal 2026 adversarial fabrication survival, `lib/honest_ci_gate.sh` Dai 2025 per-finding confidence intervals + `lib/cn_client.sh` ContextNest read+ingest bridge added 2026-06-15)
+- 73 framework primitives in `lib/` (incl. oracle-hardening libs + `gate_bootstrap.sh` for the v0.3-rc1 central wire-up + `lib/throttle-guard.sh` for provider-throttle classification + `lib/mo_otel.sh` for env-gated OTel span emission, added 2026-06-09/10 + `lib/profile_answerer.sh` for MO_AUTO_ANSWER_PROFILE autonomous-dispatch mode, added 2026-06-12 + 4 calibration-list gates landed 2026-06-13: `lib/krippendorff_alpha_gate.sh` Nasser 2026 α<0.4 panel-divergence escalation, `lib/citation_verifier_mechanical.sh` Sistla 2025 mechanical citation coverage + wireheading check, `lib/refute_or_promote_gate.sh` Agarwal 2026 adversarial fabrication survival, `lib/honest_ci_gate.sh` Dai 2025 per-finding confidence intervals)
 - 1 runner-shared helper in `bin/lib/` (`profile-seed.sh` — deterministic `run_profile.json` seeding from structured kickoff markdown, added 2026-06-09)
-- 19 user-facing `bin/mini-ork*` entrypoints (incl. `mini-ork rollback <workflow|agent> <name> + mini-ork resume <run_id> for cost-pause clearance, added 2026-06-14` added 2026-06-13 — first-class CLI verb for the evolution+promotion layer's version_registry)
-- 26 schema migrations under `db/migrations/` (memory namespaces, benchmarks, evolution, safety, panel topology telemetry, recursive orchestration, self-improvement learning, llm_calls session indexing, trace status widening, Arbor-style idea_tree primitive, error taxonomy + finish reasons, dispatch config snapshot, heartbeat + fuse, cache-aware cost accounting, policy state + audit trail)
+- 29 user-facing `bin/mini-ork*` entrypoints (incl. `mini-ork rollback <workflow|agent> <name> + mini-ork resume <run_id> for cost-pause clearance, added 2026-06-14` added 2026-06-13 — first-class CLI verb for the evolution+promotion layer's version_registry; plus the 2026-06-15 meta-orchestrator stack: `mini-ork epics` for roadmap ingest/split, `mini-ork scheduler` for autonomous multi-epic dispatch, `mini-ork bugs` for the per-agent observation channel, `mini-ork-bug-collector` heuristic scanner, `mini-ork-watchdog` early-failure prediction, `mini-ork-conductor` meta-orchestrator picking topology + lane hints per epic, `mini-ork lifetime` operator leaderboard, and `mini-ork review` pre-push code reviewer with optional fix-loop)
+- 38 schema migrations under `db/migrations/` (memory namespaces, benchmarks, evolution, safety, panel topology telemetry, recursive orchestration, self-improvement learning, llm_calls session indexing, trace status widening, Arbor-style idea_tree primitive, error taxonomy + finish reasons, dispatch config snapshot, heartbeat + fuse, cache-aware cost accounting, policy state + audit trail, plus the 2026-06-15 stack: epic_dependencies, epics.pr_url + branch, bug_reports, prompt_win_rates for RHO retrospective harness optimization, execution_traces.process_reward for PRM scoring, agent_performance_memory.relative_advantage for GRPO routing, watchdog_aborts for early-failure prediction, topology_role_evolution with topology_win_rates + role_evolver_log + conductor_decisions for the meta-orchestrator, and pre_push_reviews + pre_push_review_issues for the Layer 3 code reviewer with fix-loop)
 - 24 recipes shipped — see Recipes table above
 - 7 model-family providers under `lib/providers/` + BYO-key registry (`config/providers.yaml` via `lib/providers/registry.sh`) for custom Anthropic/OpenAI-compatible endpoints
 

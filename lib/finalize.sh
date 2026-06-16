@@ -10,6 +10,9 @@ MINI_ORK_ROOT="${MINI_ORK_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 # Auto-merge wiring. Source-time only; the actual call happens inside mo_finalize.
 # shellcheck disable=SC1091
 . "$MINI_ORK_ROOT/lib/auto-merge.sh"
+# PR-create wiring (E3). Disabled by default; opt-in via MO_OPEN_PR=1.
+# shellcheck disable=SC1091
+. "$MINI_ORK_ROOT/lib/pr-create.sh"
 
 mo_finalize() {
   : "${REPO_ROOT:?}"
@@ -203,7 +206,19 @@ mo_finalize() {
       kickoff_path=$(sqlite3 "$state_db" "SELECT kickoff_path FROM epics WHERE id='$epic';" 2>/dev/null)
       local branch
       branch=$(grep -E '^>?[[:space:]]*\*\*Branch:\*\*' "$REPO_ROOT/$kickoff_path" 2>/dev/null | head -1 | sed -E 's/^[^`]*`([^`]+)`.*/\1/')
-      echo "  gh pr create --base main --head $branch --title \"...\""
+      # E3: actually open the PR when MO_OPEN_PR=1, capturing URL into epics.pr_url.
+      # Falls back to printing the manual command when disabled / no gh / no token.
+      if [ "${MO_OPEN_PR:-0}" = "1" ]; then
+        local _pr_url
+        _pr_url=$(mo_open_pr "$epic" "$branch" "$REPO_ROOT/$kickoff_path" 2>/dev/null || true)
+        if [ -n "$_pr_url" ]; then
+          echo "  $epic → $_pr_url"
+        else
+          echo "  $epic → (PR open skipped; see mini-ork logs)"
+        fi
+      else
+        echo "  gh pr create --base main --head $branch --title \"...\""
+      fi
     done
     echo "  \`\`\`"
   } > "$report"

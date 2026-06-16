@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# mini-ork bugs — operator UI for the per-agent bug reporting channel.
+#
+# Subcommands:
+#   sweep [--since EPOCH] [--all]
+#       Pick up noticed_bugs.jsonl files from every run dir, upsert into
+#       the bug_reports table. Called by `mini-ork reflect` automatically;
+#       run manually to force a fresh sweep.
+#
+#   list                                 50 most-recent bug_reports rows
+#   show <id>                            full detail of one row
+#   prioritize [--top N]                 ranked view
+#   promote --top N                      take top-N open bugs, create epics
+#                                        + per-epic kickoffs, flip status to
+#                                        'queued_as_epic'.
+
+set -Eeuo pipefail
+
+MINI_ORK_ROOT="${MINI_ORK_ROOT:-$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)}"
+export MINI_ORK_ROOT
+MINI_ORK_HOME="${MINI_ORK_HOME:-$MINI_ORK_ROOT/.mini-ork}"
+export MINI_ORK_HOME
+STATE_DB="${MINI_ORK_DB:-$MINI_ORK_HOME/state.db}"
+export STATE_DB
+
+# shellcheck source=lib/bug_report.sh
+source "$MINI_ORK_ROOT/lib/bug_report.sh"
+
+_usage() {
+  sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+sub="${1:-help}"; shift || true
+case "$sub" in
+  sweep)      bug_report_sweep "$@" ;;
+  list)       bug_report_list ;;
+  show)       bug_report_show "${1:?id required}" ;;
+  prioritize) bug_report_prioritize "$@" ;;
+  promote)    bug_report_promote "$@" ;;
+  help|--help|-h) _usage ;;
+  *) echo "Unknown subcommand: $sub" >&2; _usage; exit 2 ;;
+esac

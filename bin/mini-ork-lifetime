@@ -1,0 +1,169 @@
+#!/usr/bin/env bash
+# mini-ork lifetime — operator CLI for the lifetime leaderboard.
+#
+# Phase 3 of the meta-orchestrator design. Rolls up cross-channel signal
+# into per-(recipe, task_class, lane, topology) leaderboards an operator
+# can scan to understand "what mini-ork has actually learned across its
+# whole lifetime, and where the wins compound."
+#
+# Subcommands:
+#   show <recipe> [--task-class X]
+#       Print the four leaderboards for the recipe:
+#         - prompt_win_rates (per prompt_version_hash)
+#         - lane relative_advantage (per agent_version_id)
+#         - topology win_rates (per workflow.yaml hash)
+#         - bug accumulation (top open bug_reports tagged at this recipe)
+#   conductor-history [N]
+#       Last N conductor_decisions with outcome + realized_score.
+#   summary
+#       Cross-recipe top-level leaderboard.
+
+set -Eeuo pipefail
+
+MINI_ORK_ROOT="${MINI_ORK_ROOT:-$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)}"
+export MINI_ORK_ROOT
+MINI_ORK_HOME="${MINI_ORK_HOME:-$MINI_ORK_ROOT/.mini-ork}"
+export MINI_ORK_HOME
+STATE_DB="${MINI_ORK_DB:-$MINI_ORK_HOME/state.db}"
+export STATE_DB
+
+_show() {
+  local recipe="${1:?recipe required}"
+  shift
+  local task_class=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --task-class) task_class="$2"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+  local tc_filter=""
+  [ -n "$task_class" ] && tc_filter=" AND task_class='$task_class'"
+
+  echo "=== lifetime: recipe=$recipe ${task_class:+ class=$task_class} ==="
+  echo
+  echo "## Top prompts by win_rate (sample_size >= 3)"
+  sqlite3 -separator ' | ' "$STATE_DB" \
+    "SELECT printf('%.3f', win_rate), printf('%4d', sample_size),
+            substr(prompt_version_hash,1,16), task_class
+       FROM prompt_win_rates
+      WHERE sample_size >= 3 ${tc_filter}
+      ORDER BY win_rate DESC LIMIT 8;"
+  echo
+
+  echo "## Lanes by relative_advantage (runs_count >= 3)"
+  sqlite3 -separator ' | ' "$STATE_DB" \
+    "SELECT printf('%+.3f', relative_advantage),
+            printf('%4d', runs_count),
+            printf('%-15s', agent_version_id),
+            task_class
+       FROM agent_performance_memory
+      WHERE runs_count >= 3 ${tc_filter}
+      ORDER BY relative_advantage DESC LIMIT 8;"
+  echo
+
+  echo "## Topologies for this recipe (workflow_name LIKE '%${recipe}%')"
+  sqlite3 -separator ' | ' "$STATE_DB" \
+    "SELECT printf('%.3f', win_rate), printf('%4d', sample_size),
+            printf('%.4f', avg_cost_usd),
+            substr(topology_id,1,14), workflow_name, task_class
+       FROM topology_win_rates
+      WHERE workflow_name LIKE '%${recipe}%' ${tc_filter}
+      ORDER BY win_rate DESC LIMIT 5;"
+  echo
+
+  echo "## Top open bug_reports tagged at this recipe's agents"
+  sqlite3 -separator ' | ' "$STATE_DB" \
+    "SELECT printf('%-9s', severity), printf('%4d', frequency),
+            printf('%-15s', agent_role),
+            substr(title,1,70)
+       FROM bug_reports
+      WHERE status='open'
+        AND (observed_in LIKE '%${recipe}%' OR
+             agent_role IN ('planner','reviewer','implementer','verifier','researcher','publisher'))
+      ORDER BY
+        CASE severity WHEN 'critical' THEN 8 WHEN 'high' THEN 4
+                      WHEN 'medium' THEN 2 ELSE 1 END * frequency DESC
+      LIMIT 5;"
+  echo
+
+  echo "## Pending role-evolver proposals for this recipe"
+  sqlite3 -separator ' | ' "$STATE_DB" \
+    "SELECT printf('%-4d', id), printf('%-7s', proposal_kind),
+            printf('%-15s', target_node_id),
+            substr(rationale,1,80)
+       FROM role_evolver_log
+      WHERE status='open' AND (target_recipe='$recipe' OR target_recipe='*')
+      ORDER BY id DESC LIMIT 5;"
+}
+
+_conductor_history() {
+  local n="${1:-10}"
+  echo "=== last $n conductor_decisions ==="
+  sqlite3 -separator ' | ' "$STATE_DB" \
+    "SELECT datetime(decided_at,'unixepoch','localtime') AS at,
+            printf('%-22s', substr(epic_id,1,22)),
+            printf('%-18s', substr(chosen_recipe,1,18)),
+            printf('%.3f', predicted_score),
+            printf('%.2f', budget_pct_used),
+            COALESCE(outcome, '?'),
+            COALESCE(printf('%.3f', realized_score), '-')
+       FROM conductor_decisions
+      ORDER BY decided_at DESC LIMIT $n;"
+}
+
+_summary() {
+  echo "=== mini-ork lifetime summary ==="
+  echo
+  echo "## Run volume (24h / 7d / lifetime)"
+  sqlite3 -column -header "$STATE_DB" \
+    "SELECT
+        SUM(CASE WHEN created_at >= strftime('%s','now','-24 hours') THEN 1 ELSE 0 END) AS h24,
+        SUM(CASE WHEN created_at >= strftime('%s','now','-7 days')   THEN 1 ELSE 0 END) AS d7,
+        COUNT(*)                                                                         AS lifetime
+       FROM task_runs;"
+  echo
+  echo "## Top 5 prompts by win_rate (all classes, sample_size >= 5)"
+  sqlite3 -separator ' | ' "$STATE_DB" \
+    "SELECT printf('%.3f', win_rate), printf('%4d', sample_size),
+            substr(prompt_version_hash,1,16), task_class
+       FROM prompt_win_rates WHERE sample_size >= 5
+       ORDER BY win_rate DESC LIMIT 5;"
+  echo
+  echo "## Top 5 lanes by relative_advantage (all classes)"
+  sqlite3 -separator ' | ' "$STATE_DB" \
+    "SELECT printf('%+.3f', relative_advantage), printf('%4d', runs_count),
+            printf('%-15s', agent_version_id), task_class
+       FROM agent_performance_memory WHERE runs_count >= 3
+       ORDER BY relative_advantage DESC LIMIT 5;"
+  echo
+  echo "## Top 5 topologies by win_rate (all classes)"
+  sqlite3 -separator ' | ' "$STATE_DB" \
+    "SELECT printf('%.3f', win_rate), printf('%4d', sample_size),
+            substr(workflow_name,1,18), task_class
+       FROM topology_win_rates WHERE sample_size >= 3
+       ORDER BY win_rate DESC LIMIT 5;"
+  echo
+  echo "## Open bug_reports priority"
+  sqlite3 -separator ' | ' "$STATE_DB" \
+    "SELECT severity, COUNT(*) FROM bug_reports WHERE status='open'
+       GROUP BY severity ORDER BY
+         CASE severity WHEN 'critical' THEN 4 WHEN 'high' THEN 3
+                       WHEN 'medium' THEN 2 ELSE 1 END DESC;"
+}
+
+sub="${1:-summary}"; shift || true
+case "$sub" in
+  show)              _show "$@" ;;
+  conductor-history) _conductor_history "$@" ;;
+  summary)           _summary ;;
+  help|--help|-h)
+    cat <<EOF
+Usage: mini-ork lifetime <subcommand>
+  show <recipe> [--task-class X]   leaderboards filtered to a recipe
+  conductor-history [N]            last N conductor_decisions rows
+  summary                          cross-recipe top-level snapshot
+EOF
+    ;;
+  *) echo "lifetime: unknown subcommand $sub" >&2; exit 2 ;;
+esac

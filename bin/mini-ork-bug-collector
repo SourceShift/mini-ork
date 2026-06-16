@@ -1,0 +1,173 @@
+#!/usr/bin/env bash
+# mini-ork bug-collector — auto-dispatched after each node completes by
+# bin/mini-ork-execute. Scans the just-finished agent's output for
+# side-issues the agent noticed but did NOT fix, and emits one
+# noticed_bugs.jsonl row per finding so bin/mini-ork-reflect's sweep can
+# pick them up.
+#
+# Modes:
+#   --mode heuristic   (default) — regex-scan output for known markers.
+#                      Free; emits low-medium confidence.
+#   --mode llm         — dispatch a kimi_lens (or MO_BUG_COLLECTOR_LANE)
+#                      reviewer to read the output and synthesize bugs.
+#                      Higher confidence, costs ~$0.02-0.05/node.
+#   --mode off         — no-op (used by harness env to disable inline).
+#
+# Args:
+#   --node-id        trace_id or node identifier (for provenance)
+#   --node-type      planner|implementer|reviewer|researcher|verifier|... agent role
+#   --output-file    path to the agent's primary output (md/json/log)
+#   --status         success|failure
+#   --task-class     classification for the originating run
+#
+# Returns 0 always (best-effort; never fails the caller's run).
+
+set -uo pipefail
+
+MINI_ORK_ROOT="${MINI_ORK_ROOT:-$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)}"
+export MINI_ORK_ROOT
+MINI_ORK_HOME="${MINI_ORK_HOME:-$MINI_ORK_ROOT/.mini-ork}"
+export MINI_ORK_HOME
+STATE_DB="${MINI_ORK_DB:-$MINI_ORK_HOME/state.db}"
+export STATE_DB
+
+mode="${MO_BUG_COLLECTOR_MODE:-heuristic}"
+node_id="" node_type="" output_file="" status="success" task_class=""
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --mode)        mode="$2"; shift 2 ;;
+    --node-id)     node_id="$2"; shift 2 ;;
+    --node-type)   node_type="$2"; shift 2 ;;
+    --output-file) output_file="$2"; shift 2 ;;
+    --status)      status="$2"; shift 2 ;;
+    --task-class)  task_class="$2"; shift 2 ;;
+    --help|-h)     sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) shift ;;
+  esac
+done
+
+[ "$mode" = "off" ] && exit 0
+
+# shellcheck source=lib/bug_report.sh
+source "$MINI_ORK_ROOT/lib/bug_report.sh"
+
+# Find candidate scan targets. The dispatcher may pass an output_file that
+# doesn't exist (e.g. on early failure); fall back to the run dir's recent
+# files in that case.
+_resolve_scan_targets() {
+  local targets=()
+  if [ -n "$output_file" ] && [ -f "$output_file" ]; then
+    targets+=("$output_file")
+  fi
+  # Tool-summary sidecar may contain tool call commentary worth scanning.
+  if [ -n "$output_file" ] && [ -f "${output_file}.tool-summary" ]; then
+    targets+=("${output_file}.tool-summary")
+  fi
+  # Recent stdout-md sidecar from the dispatcher.
+  if [ -n "$output_file" ] && [ -f "${output_file}.stdout.md" ]; then
+    targets+=("${output_file}.stdout.md")
+  fi
+  printf '%s\n' "${targets[@]}"
+}
+
+case "$mode" in
+  heuristic)
+    targets=$(_resolve_scan_targets)
+    [ -z "$targets" ] && exit 0
+    # Pass targets via a tempfile rather than stdin — heredoc-as-script for
+    # python3 - hijacks stdin from any pipe (`printf | python3 - <<EOF`
+    # silently drops the pipe content since the heredoc IS python's stdin).
+    _targets_file=$(mktemp /tmp/mo-bc-targets-XXXXXX)
+    printf '%s\n' "$targets" > "$_targets_file"
+    python3 - "$node_id" "$node_type" "$status" "$task_class" "${MINI_ORK_RUN_DIR:-/tmp}" "$_targets_file" <<'PY'
+import json, os, re, sys, time
+
+node_id, node_type, status, task_class, run_dir, targets_file = sys.argv[1:7]
+sink = os.path.join(run_dir, "noticed_bugs.jsonl")
+os.makedirs(run_dir, exist_ok=True)
+
+# Each entry: (regex, severity, confidence, scope_extractor).
+# Patterns are anchored to LINE START (re.M) and bounded by newline to avoid
+# matching across sentences. They allow periods inside the captured span so
+# that file extensions like 'lib/foo.sh' don't break the match.
+PATTERNS = [
+    # Explicit agent-noticed markers — highest confidence.
+    (re.compile(r"^[^\n]*\b(?:noticed|observed|saw)\b[^\n]{0,200}?\bbut\b[^\n]{0,200}", re.I | re.M),
+     "medium", 0.70, "agent-noticed"),
+    (re.compile(r"^[^\n]*\bout of scope but[^\n]{0,200}", re.I | re.M),
+     "medium", 0.75, "out-of-scope-but"),
+    (re.compile(r"^[^\n]*\b(?:should fix|needs to be fixed|known(?: to be)? broken|bug in|defect in)[^\n]{0,200}", re.I | re.M),
+     "high", 0.80, "explicit-bug-mention"),
+    (re.compile(r"^[^\n]*\b(?:deferred|deferring|postponing|leaving for later)\b[^\n]{0,200}", re.I | re.M),
+     "medium", 0.65, "deferred-fix"),
+    # Code-style markers — middle confidence.
+    (re.compile(r"^[^\n]*\b(?:TODO|FIXME|HACK|XXX|KLUDGE)\s*:?[^\n]{0,200}", re.I | re.M),
+     "low", 0.55, "todo-marker"),
+    # Failure-correlated phrasings (only fire on failure to avoid false positives).
+    (re.compile(r"^[^\n]*\b(?:assertion|invariant) (?:fails|violated|broken)[^\n]{0,200}", re.I | re.M),
+     "high", 0.78, "broken-invariant"),
+]
+ONLY_ON_FAILURE = {"broken-invariant"}
+
+try:
+    paths = [p.strip() for p in open(targets_file).read().splitlines() if p.strip()]
+except OSError:
+    paths = []
+emitted = 0
+seen = set()
+with open(sink, "a", encoding="utf-8") as out:
+    for p in paths:
+        try:
+            text = open(p, encoding="utf-8", errors="replace").read()
+        except OSError:
+            continue
+        for rgx, severity, conf, scope in PATTERNS:
+            if scope in ONLY_ON_FAILURE and status != "failure":
+                continue
+            for m in rgx.finditer(text):
+                title = m.group(0).strip()[:300]
+                # Cheap dedupe within a single scan pass.
+                key = (scope, title.lower())
+                if key in seen:
+                    continue
+                seen.add(key)
+                row = {
+                    "agent_role": node_type or "unknown",
+                    "task_class": task_class,
+                    "severity": severity,
+                    "title": title,
+                    "description": f"Heuristic match ({scope}) in {os.path.basename(p)} produced by node {node_id} (status={status}).",
+                    "suggested_fix": "",
+                    "observed_in": p,
+                    "confidence": conf,
+                }
+                out.write(json.dumps(row, separators=(",", ":")) + "\n")
+                emitted += 1
+                # Cap emissions per node so a single chatty agent can't flood.
+                if emitted >= 5:
+                    break
+            if emitted >= 5:
+                break
+        if emitted >= 5:
+            break
+print(emitted, file=sys.stderr)
+PY
+    rm -f "$_targets_file"
+    ;;
+
+  llm)
+    # Stub for future: dispatch a kimi_lens (or MO_BUG_COLLECTOR_LANE) review of
+    # the output_file with a structured-output prompt. Out-of-scope for v1; the
+    # heuristic mode handles the immediate use case and is free.
+    echo "  [bug-collector] llm mode not yet implemented; use --mode heuristic" >&2
+    exit 0
+    ;;
+
+  *)
+    echo "bug-collector: unknown mode '$mode'" >&2
+    exit 0  # never fail caller
+    ;;
+esac
+
+exit 0
