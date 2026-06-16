@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# mini-ork review — operator CLI for the pre-push code reviewer.
+#
+# Subcommands:
+#   run <source_sha> <target_branch> [--mode heuristic|llm_panel]
+#       Run a review of source_sha vs origin/target_branch, persist
+#       findings, print verdict + review_id.
+#   show <review_id>           Print review summary + open issues
+#   verdict <review_id>        Print just the verdict word
+#   forward <review_id>        Forward open issues to bug_reports + sweep
+#                              (the fix loop picks them up via promote +
+#                              the scheduler)
+#   list [N]                   List the last N reviews
+
+set -Eeuo pipefail
+
+MINI_ORK_ROOT="${MINI_ORK_ROOT:-$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd -P)}"
+export MINI_ORK_ROOT
+MINI_ORK_HOME="${MINI_ORK_HOME:-$MINI_ORK_ROOT/.mini-ork}"
+export MINI_ORK_HOME
+STATE_DB="${MINI_ORK_DB:-$MINI_ORK_HOME/state.db}"
+export STATE_DB
+
+source "$MINI_ORK_ROOT/lib/pre_push_review.sh"
+
+_usage() {
+  cat <<EOF
+Usage: mini-ork review <subcommand> [args]
+
+  run <source_sha> <target_branch> [--mode heuristic|llm_panel]
+  show <review_id>
+  verdict <review_id>
+  forward <review_id>
+  list [N]
+EOF
+}
+
+sub="${1:-help}"; shift || true
+case "$sub" in
+  run)     review_run "$@" ;;
+  show)    review_show "$@" ;;
+  verdict) review_verdict_for "$@" ;;
+  forward) review_forward_to_bug_reports "$@" ;;
+  list)
+    N="${1:-10}"
+    sqlite3 -separator ' | ' "$STATE_DB" \
+      "SELECT printf('%-4d', id),
+              datetime(reviewed_at,'unixepoch','localtime'),
+              printf('%-8s', verdict),
+              printf('%-25s', substr(target_branch,1,25)),
+              printf('%4d issues / %d critical', issues_open, issues_critical)
+         FROM pre_push_reviews
+        ORDER BY reviewed_at DESC LIMIT $N;"
+    ;;
+  help|--help|-h) _usage ;;
+  *) echo "review: unknown subcommand $sub" >&2; _usage; exit 2 ;;
+esac

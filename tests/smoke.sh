@@ -141,9 +141,12 @@ echo ""
 echo "--- Syntax check (bash -n) ---"
 
 SYNTAX_FILES=()
-# bin/* — skip files with no shebang (likely not shell scripts)
+# bin/ holds polyglot CLIs (Python, Node, bash) — all named mini-ork-*. Only
+# bash files get bash -n / shellcheck. Sniff the shebang to filter.
 for f in "$MINI_ORK_REPO"/bin/*; do
-  [[ -f "$f" ]] && SYNTAX_FILES+=("$f")
+  [[ -f "$f" ]] || continue
+  head -1 "$f" 2>/dev/null | grep -qE 'bash|sh$' || continue
+  SYNTAX_FILES+=("$f")
 done
 # lib/*.sh
 for f in "$MINI_ORK_REPO"/lib/*.sh; do

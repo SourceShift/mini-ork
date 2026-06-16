@@ -121,6 +121,63 @@ _REFLECT_START_TS=$(date +%s)
 
 reflection_run "$SINCE"
 
+# Patch #5: pattern_miner — group execution_traces clusters → pattern_records.
+# Gated by MO_PATTERN_MINER=1 so adoption is opt-in until burn-in proves it.
+if [ "${MO_PATTERN_MINER:-0}" = "1" ]; then
+  _require_lib pattern_store
+  _PATTERNS_WRITTEN=$(pattern_store_mine_from_traces \
+      --window "${MO_PATTERN_MINER_WINDOW:-7d}" \
+      --min-cluster "${MO_PATTERN_MINER_MIN_CLUSTER:-3}" 2>/dev/null || echo 0)
+  echo "  [pattern_miner] wrote ${_PATTERNS_WRITTEN:-0} pattern_records rows"
+fi
+
+# E7: cross-epic gradient transfer — promote recurring targets across
+# task_classes into __cross_class__ gradients the planner reads everywhere.
+# Default ON; opt-out via MO_CROSS_EPIC_GRADIENTS=0.
+if [ "${MO_CROSS_EPIC_GRADIENTS:-1}" != "0" ]; then
+  _require_lib cross_epic_gradient
+  _CROSS_WRITTEN=$(cross_epic_gradient_promote \
+      --min-classes "${MO_CROSS_EPIC_MIN_CLASSES:-2}" \
+      --min-confidence "${MO_CROSS_EPIC_MIN_CONF:-0.7}" \
+      --window "${MO_CROSS_EPIC_WINDOW:-14d}" 2>/dev/null || echo 0)
+  echo "  [cross_epic_gradient] promoted ${_CROSS_WRITTEN:-0} cross-class gradients"
+fi
+
+# Per-agent bug-report sweep — pick up noticed_bugs.jsonl from each run dir
+# and upsert into bug_reports table. Auto-promote top-N to epics when
+# MO_BUG_REPORT_AUTO_PROMOTE=N (default 0, manual only).
+if [ "${MO_BUG_REPORT_SWEEP:-1}" != "0" ]; then
+  _require_lib bug_report
+  _BUGS_SWEPT=$(bug_report_sweep --since "$SINCE" 2>/dev/null || echo 0)
+  echo "  [bug_report_sweep] swept ${_BUGS_SWEPT:-0} new noticed bug(s)"
+  _AUTO_PROMOTE="${MO_BUG_REPORT_AUTO_PROMOTE:-0}"
+  if [ "$_AUTO_PROMOTE" != "0" ]; then
+    _PROMOTED=$(bug_report_promote --top "$_AUTO_PROMOTE" 2>/dev/null || echo 0)
+    echo "  [bug_report_promote] promoted ${_PROMOTED:-0} bug(s) to epics"
+  fi
+fi
+
+# Track B item 2: RHO win-rate aggregation. Walks execution_traces, groups
+# by (prompt_version_hash, task_class), upserts wins/losses into
+# prompt_win_rates. Pure SQL, no LLM dispatch. Default on, opt out via
+# MO_RHO_AGGREGATE=0. See lib/rho_aggregator.sh (arXiv:2606.05922).
+if [ "${MO_RHO_AGGREGATE:-1}" != "0" ] \
+   && [ -f "$MINI_ORK_ROOT/lib/rho_aggregator.sh" ]; then
+  _require_lib rho_aggregator
+  _RHO_UPDATED=$(rho_aggregate_win_rates --since "$SINCE" 2>/dev/null || echo 0)
+  echo "  [rho_aggregate] upserted ${_RHO_UPDATED:-0} prompt_win_rates row(s)"
+fi
+
+# Track B item 4: GRPO-style lane routing — recompute relative_advantage
+# per (lane, task_class) from group-relative trace comparisons. Default on,
+# opt out via MO_LANE_ROUTER=0. arXiv:2601.22607 + 2603.02701.
+if [ "${MO_LANE_ROUTER:-1}" != "0" ] \
+   && [ -f "$MINI_ORK_ROOT/lib/lane_router.sh" ]; then
+  _require_lib lane_router
+  _LANES_UPDATED=$(lane_router_recompute_advantages --since "$SINCE" 2>/dev/null || echo 0)
+  echo "  [lane_router] recomputed advantage for ${_LANES_UPDATED:-0} (lane, task_class) pair(s)"
+fi
+
 # ── trace end ─────────────────────────────────────────────────────────────────
 # The closing trace carries WHAT reflect did (traces analyzed, gradients
 # written) — a bare status:"success" row gave gradient_extract nothing to

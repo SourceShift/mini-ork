@@ -1,0 +1,203 @@
+#!/usr/bin/env bash
+# mini-ork watchdog — periodic early-failure prediction for active runs.
+#
+# Track B item 5 (arXiv:2605.08715, Online Auditing for Early Failure
+# Prediction in Multi-Agent Systems). Polls every active task_run, looks
+# at the per-node traces emitted so far, computes a similarity match
+# against known-failing pattern_records clusters, and when the match score
+# exceeds MO_WATCHDOG_ABORT_THRESHOLD (default 0.65) writes
+# .stop-requested into the run dir. bin/mini-ork-execute checks that file
+# at the next node boundary and bails before more cost is sunk.
+#
+# Flags:
+#   --once                Single pass over active runs, then exit
+#   --poll-secs N         Idle seconds between passes (default 30)
+#   --dry-run             Print decisions, do not write .stop-requested
+#   --threshold T         Match score >= T triggers abort (default 0.65)
+#   --warn-only           Log to watchdog_aborts but never write the file
+#   --help
+#
+# The watchdog logs every decision (abort, warn, no-match) to
+# watchdog_aborts so the false-positive rate can be measured.
+
+set -Eeuo pipefail
+
+MINI_ORK_ROOT="${MINI_ORK_ROOT:-$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)}"
+export MINI_ORK_ROOT
+MINI_ORK_HOME="${MINI_ORK_HOME:-$MINI_ORK_ROOT/.mini-ork}"
+export MINI_ORK_HOME
+STATE_DB="${MINI_ORK_DB:-$MINI_ORK_HOME/state.db}"
+export STATE_DB
+
+ONCE=0
+POLL_SECS=30
+DRY_RUN=0
+THRESHOLD="${MO_WATCHDOG_ABORT_THRESHOLD:-0.65}"
+WARN_ONLY=0
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --once)       ONCE=1; shift ;;
+    --poll-secs)  POLL_SECS="$2"; shift 2 ;;
+    --dry-run)    DRY_RUN=1; shift ;;
+    --threshold)  THRESHOLD="$2"; shift 2 ;;
+    --warn-only)  WARN_ONLY=1; shift ;;
+    --help|-h)
+      sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'
+      exit 0 ;;
+    *) echo "watchdog: unknown flag $1" >&2; exit 2 ;;
+  esac
+done
+
+[ -f "$STATE_DB" ] || { echo "watchdog: $STATE_DB missing" >&2; exit 1; }
+
+_watchdog_pass() {
+  python3 - "$STATE_DB" "$THRESHOLD" "$DRY_RUN" "$WARN_ONLY" \
+           "$MINI_ORK_HOME" <<'PY'
+import json, math, os, re, sqlite3, sys, time
+from collections import Counter
+
+db, threshold_s, dry_run_s, warn_only_s, home = sys.argv[1:6]
+threshold = float(threshold_s); dry_run = dry_run_s == "1"; warn_only = warn_only_s == "1"
+
+con = sqlite3.connect(db); con.execute("PRAGMA busy_timeout=5000")
+con.row_factory = sqlite3.Row
+
+# Active task_runs: status not in terminal set + recent.
+# task_runs schema varies; gracefully handle missing columns.
+try:
+    active = con.execute("""
+        SELECT id, status
+          FROM task_runs
+         WHERE (status IS NULL
+                OR status NOT IN ('published','failed','rolled_back','approved','completed'))
+           AND created_at >= strftime('%s','now','-24 hours')
+    """).fetchall()
+except sqlite3.OperationalError:
+    active = []
+
+# Known-failing pattern clusters.
+try:
+    failing_patterns = con.execute("""
+        SELECT pattern_id, description, frequency
+          FROM pattern_records
+         WHERE description LIKE '%status=failure%'
+            OR description LIKE '%status=vacuous%'
+    """).fetchall()
+except sqlite3.OperationalError:
+    failing_patterns = []
+
+def _tok(s):
+    s = (s or "").lower()
+    s = re.sub(r"[^\w./_-]+", " ", s)
+    return [t for t in s.split() if len(t) >= 3]
+
+def _tf(toks):
+    c = Counter(toks); n = sum(c.values()) or 1
+    return {t: cnt/n for t, cnt in c.items()}
+
+def _cos(a, b):
+    keys = set(a) | set(b)
+    dot = sum(a.get(k,0)*b.get(k,0) for k in keys)
+    na = math.sqrt(sum(v*v for v in a.values()))
+    nb = math.sqrt(sum(v*v for v in b.values()))
+    return dot/(na*nb) if na and nb else 0.0
+
+pattern_vecs = [(p, _tf(_tok(p["description"]))) for p in failing_patterns]
+
+decisions = []
+for run in active:
+    run_id = str(run["id"])
+    traces = con.execute("""
+        SELECT task_class, status, reviewer_verdict, agent_version_id
+          FROM execution_traces
+         WHERE run_id = ?
+           AND status IS NOT NULL
+    """, (run_id,)).fetchall()
+    if len(traces) < 2:
+        continue
+    tc = traces[-1]["task_class"]
+    bag_parts, fail_count = [], 0
+    for t in traces:
+        st = (t["status"] or "")
+        bag_parts.append(f"status={st}")
+        bag_parts.append(f"task_class={t['task_class'] or ''}")
+        rv = t["reviewer_verdict"] or ""
+        if rv: bag_parts.append(f"verdict={rv}")
+        if st in ("failure", "vacuous"):
+            fail_count += 1
+    bag_vec = _tf(_tok(" ".join(bag_parts)))
+    if not bag_vec:
+        continue
+    best_score, best_p = 0.0, None
+    for p, pv in pattern_vecs:
+        s = _cos(bag_vec, pv)
+        if s > best_score:
+            best_score, best_p = s, p
+    fail_boost = min(0.20, 0.05 * fail_count)
+    score = round(min(1.0, best_score + fail_boost), 4)
+    if best_p is None:
+        continue
+    action = "no-match"
+    if score >= threshold:
+        if warn_only:    action = "warned_only"
+        elif dry_run:    action = "would_abort"
+        else:            action = "abort"
+
+    decisions.append({
+        "run_id": run_id, "task_class": tc,
+        "matched_pattern": best_p["pattern_id"],
+        "match_score": score,
+        "fail_count": fail_count,
+        "action": action,
+    })
+
+    if action == "abort":
+        run_dir = os.path.join(home, "runs", f"run-{run_id}")
+        if not os.path.isdir(run_dir):
+            import glob
+            matches = glob.glob(os.path.join(home, "runs", f"*{run_id}*"))
+            run_dir = matches[0] if matches else run_dir
+        try:
+            os.makedirs(run_dir, exist_ok=True)
+            with open(os.path.join(run_dir, ".stop-requested"), "w") as f:
+                f.write(f"watchdog abort: matched={best_p['pattern_id']} score={score}\n")
+        except OSError:
+            pass
+
+    if action in ("abort", "warned_only"):
+        try:
+            con.execute("""
+                INSERT INTO watchdog_aborts
+                    (run_id, task_class, matched_pattern, match_score,
+                     evidence, outcome, aborted_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (run_id, tc, best_p["pattern_id"], score,
+                  json.dumps({"fail_count": fail_count, "traces": len(traces)}),
+                  "aborted" if action == "abort" else "warned_only",
+                  int(time.time())))
+        except sqlite3.OperationalError:
+            pass
+
+con.commit()
+con.close()
+print(json.dumps({
+    "active_runs": len(active),
+    "decisions":   decisions,
+    "aborted":     sum(1 for d in decisions if d["action"] == "abort"),
+    "warned":      sum(1 for d in decisions if d["action"] == "warned_only"),
+    "no_match":    sum(1 for d in decisions if d["action"] == "no-match"),
+}))
+PY
+}
+
+if [ "$ONCE" = "1" ]; then
+  _watchdog_pass
+  exit 0
+fi
+
+echo "watchdog: polling every ${POLL_SECS}s (threshold=$THRESHOLD)"
+while :; do
+  _watchdog_pass
+  sleep "$POLL_SECS"
+done

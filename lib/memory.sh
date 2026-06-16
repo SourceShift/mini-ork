@@ -552,6 +552,113 @@ mo_mem_smoke() {
   fi
 }
 
+# ─── Per-task-class memory namespace writers (D3) ────────────────────
+#
+# Populates task_memory + failure_memory at trace-write time so the
+# planner's "prior 5 runs by task_class" injection has data to read.
+# Both writers are best-effort: if FK lookup fails or schema drifts,
+# they log to trace-write-errors.log (via trace_write_or_log style)
+# and return 0 so the caller's run is not affected.
+
+# Lookup integer runs.id matching MINI_ORK_RUN_ID via run_dir suffix.
+# Returns "0" when no orchestrator row exists (common for ad-hoc CLI runs).
+_mo_resolve_runs_id() {
+  local uid="${1:-${MINI_ORK_RUN_ID:-}}"
+  [ -n "$uid" ] || { printf '0\n'; return 0; }
+  local rid
+  rid=$(sqlite3 "$STATE_DB" \
+    "SELECT id FROM runs WHERE run_dir LIKE '%${uid}%' ORDER BY id DESC LIMIT 1;" \
+    2>/dev/null || true)
+  printf '%s\n' "${rid:-0}"
+}
+
+# memory_write_task <task_class> <outcome> <duration_ms> <cost_usd> <artifacts_json>
+# Idempotent at the run-dir level via .task_memory_written sentinel.
+memory_write_task() {
+  local task_class="${1:?task_class required}"
+  local outcome="${2:-success}"
+  local duration_ms="${3:-0}"
+  local cost_usd="${4:-0}"
+  local artifacts_json="${5:-[]}"
+  local run_dir="${MINI_ORK_RUN_DIR:-}"
+  local sentinel="${run_dir:-/tmp}/.task_memory_written"
+  # Idempotence: one row per run.
+  if [ -n "$run_dir" ] && [ -f "$sentinel" ]; then
+    return 0
+  fi
+  case "$outcome" in
+    success|failure|partial) : ;;
+    *) outcome="partial" ;;
+  esac
+  local kickoff_hash=""
+  if [ -n "${MINI_ORK_KICKOFF_PATH:-}" ] && [ -f "${MINI_ORK_KICKOFF_PATH}" ]; then
+    kickoff_hash=$(shasum -a 256 "${MINI_ORK_KICKOFF_PATH}" 2>/dev/null \
+                   | awk '{print $1}')
+  fi
+  local rid
+  rid=$(_mo_resolve_runs_id "${MINI_ORK_RUN_ID:-}")
+  python3 - "$STATE_DB" "$rid" "$task_class" "$kickoff_hash" "$outcome" \
+                       "$artifacts_json" "$duration_ms" "$cost_usd" \
+    2>>"${run_dir:-/tmp}/trace-write-errors.log" <<'PY' || return 0
+import json, sqlite3, sys
+db, rid, task_class, kickoff_hash, outcome, artifacts_json, dur_ms, cost = sys.argv[1:9]
+try:
+    artifacts = json.loads(artifacts_json) if artifacts_json.strip() else []
+    if not isinstance(artifacts, list):
+        artifacts = []
+except json.JSONDecodeError:
+    artifacts = []
+con = sqlite3.connect(db)
+con.execute("PRAGMA busy_timeout=5000")
+con.execute("""
+    INSERT INTO task_memory
+        (run_id, task_class, kickoff_hash, outcome,
+         artifacts_produced, duration_ms, cost_usd)
+    VALUES (?,?,?,?,?,?,?)
+""", (int(rid or 0), task_class, kickoff_hash or "", outcome,
+      json.dumps(artifacts), int(float(dur_ms or 0)), float(cost or 0)))
+con.commit()
+con.close()
+PY
+  if [ -n "$run_dir" ]; then
+    mkdir -p "$run_dir" 2>/dev/null || true
+    : > "$sentinel" 2>/dev/null || true
+  fi
+}
+
+# memory_write_failure <workflow_stage> <failure_category> <error_message>
+# failure_category ∈ {verifier_fail, timeout, cost_overrun, dispatch_error}
+memory_write_failure() {
+  local stage="${1:?workflow_stage required}"
+  local category="${2:-dispatch_error}"
+  local error_msg="${3:-}"
+  local run_dir="${MINI_ORK_RUN_DIR:-/tmp}"
+  case "$category" in
+    verifier_fail|timeout|cost_overrun|dispatch_error) : ;;
+    *) category="dispatch_error" ;;
+  esac
+  local rid
+  rid=$(_mo_resolve_runs_id "${MINI_ORK_RUN_ID:-}")
+  local fid
+  fid=$(python3 -c 'import uuid; print(uuid.uuid4())' 2>/dev/null || echo "")
+  [ -n "$fid" ] || return 0
+  python3 - "$STATE_DB" "$fid" "$rid" "$stage" "$category" "$error_msg" \
+    2>>"${run_dir}/trace-write-errors.log" <<'PY' || return 0
+import sqlite3, sys
+db, fid, rid, stage, category, err_msg = sys.argv[1:7]
+con = sqlite3.connect(db)
+con.execute("PRAGMA busy_timeout=5000")
+con.execute("""
+    INSERT INTO failure_memory
+        (failure_id, run_id, workflow_stage, failure_category,
+         error_message, stack_trace)
+    VALUES (?,?,?,?,?,?)
+""", (fid, int(rid or 0), stage, category, err_msg[:8000], ""))
+con.commit()
+con.close()
+PY
+}
+
 # When invoked directly, run the smoke check.
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
   mo_mem_smoke
