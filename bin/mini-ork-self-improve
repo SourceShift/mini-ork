@@ -200,6 +200,100 @@ if [ "$RESUME" -eq 1 ] && [ -f "$MINI_ORK_DB" ]; then
 fi
 ITER=$LAST_ITER
 
+_promote_synthesis_findings() {
+  # Patch #4 (iter-34 synthesis-ranked): parse $RUN_DIR/synthesis.md's ranked
+  # patch table and upsert one learning_record row per row, keyed by
+  # (run_id, iter, rank, title). Idempotent. Best-effort: a missing or
+  # malformed synthesis.md is a no-op.
+  local run_id="$1"
+  local iter_="${2:-$ITER}"
+  local synth_path="${MINI_ORK_HOME}/runs/${run_id}/synthesis.md"
+  [ -f "$synth_path" ] || return 0
+  python3 - "$MINI_ORK_DB" "$run_id" "$iter_" "$synth_path" <<'PY' || true
+import re, json, sqlite3, sys, time, os
+
+db, run_id, iter_str, synth_path = sys.argv[1:5]
+iter_ = int(iter_str)
+try:
+    text = open(synth_path).read()
+except OSError:
+    sys.exit(0)
+
+# Locate the "Ranked patch plan" table. Accept any markdown table whose
+# header contains all of Rank / Bottleneck / Category / Confidence.
+lines = text.splitlines()
+table_rows = []
+header_idx = None
+for i, line in enumerate(lines):
+    if line.lstrip().startswith("|") and "rank" in line.lower() and "bottleneck" in line.lower() and "category" in line.lower() and "confidence" in line.lower():
+        header_idx = i
+        break
+if header_idx is None:
+    sys.exit(0)
+# Skip header + separator row, then collect data rows until first blank/non-pipe.
+for line in lines[header_idx + 2:]:
+    if not line.strip() or not line.lstrip().startswith("|"):
+        break
+    table_rows.append(line)
+
+if not table_rows:
+    sys.exit(0)
+
+VALID_CATEGORY = {"perf", "correctness", "arch", "meta"}
+ARXIV_RE = re.compile(r"\b(\d{4}\.\d{4,6})\b")
+PATH_RE = re.compile(r"\b([a-z_][\w./-]*\.(?:sh|py|sql|md|yaml|yml|json|toml|tsx?|jsx?))\b", re.I)
+
+con = sqlite3.connect(db)
+con.execute("PRAGMA busy_timeout=5000")
+
+inserted = 0
+for row in table_rows:
+    cells = [c.strip() for c in row.strip().strip("|").split("|")]
+    if len(cells) < 6:
+        continue
+    rank_raw, bottleneck, category, patch_summary, evidence, confidence = cells[:6]
+    try:
+        rank = int(re.sub(r"\D", "", rank_raw) or "0")
+    except ValueError:
+        rank = 0
+    category = (category or "meta").strip().lower()
+    if category not in VALID_CATEGORY:
+        category = "meta"
+    title = (bottleneck or "").strip()[:200]
+    if not title:
+        continue
+    try:
+        conf = float(confidence)
+    except (ValueError, TypeError):
+        conf = 0.0
+    severity = "high" if conf >= 0.85 else "medium" if conf >= 0.7 else "low"
+    arxiv = sorted(set(ARXIV_RE.findall(evidence)))
+    paths = sorted(set(PATH_RE.findall(evidence)))
+    ts = int(time.time())
+    # Idempotence: skip if a row already exists for (run_id, iter, rank, title).
+    exists = con.execute(
+        "SELECT 1 FROM learning_record WHERE run_id=? AND iter=? AND rank=? AND title=? LIMIT 1",
+        (run_id, iter_, rank, title),
+    ).fetchone()
+    if exists:
+        continue
+    con.execute("""
+        INSERT INTO learning_record (
+            run_id, iter, rank, category, title, evidence_paths, arxiv_refs,
+            patch_summary, outcome, severity, confidence, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?)
+    """, (run_id, iter_, rank, category, title,
+          json.dumps(paths), json.dumps(arxiv),
+          patch_summary[:1000], severity, conf, ts, ts))
+    inserted += 1
+
+con.commit()
+con.close()
+if inserted:
+    print(f"promoted {inserted} synthesis rows into learning_record", file=sys.stderr)
+PY
+}
+
 _self_improve_record_success() {
   local run_id="$1" branch="$2" commit_sha="$3"
   local iter_="$ITER"
@@ -239,6 +333,8 @@ con.execute("""
 con.commit(); con.close()
 PY
   echo "  [learning] recorded success row + superseded prior deferred rows"
+  # Patch #4: parse synthesis.md's ranked patch table → learning_record.
+  _promote_synthesis_findings "$run_id" "$iter_"
 }
 
 _record_run() {

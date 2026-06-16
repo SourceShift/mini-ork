@@ -14,13 +14,17 @@
 
 lanes:
   # Canonical loop-role lanes.
-  # 2026-06-13: STANDING DIRECTIVE — no opus, no sonnet, no gemini anywhere.
-  # All role-lanes (planner / reviewer / brain / reflector / publisher /
-  # rollback / verifier / rubric) MUST map to one of glm / kimi / codex /
-  # minimax. This closes the lane-name aliasing bypass discovered in
-  # live-test stall run-1781333552-17796-identity-and-rbac where
-  # model_lane:reviewer routed to opus and burned $38 + 1h41m in
-  # post-run auto-reflect via mini-ork-reflect.
+  # 2026-06-15: STANDING DIRECTIVE — gemini is banned everywhere.
+  # opus and sonnet ARE allowed; pick the strongest reasoner for hard-
+  # judgment nodes (planner / reviewer / synthesizer / cross-epic
+  # prioritizer). The 2026-06-13 incident that motivated the original
+  # broad ban (run-1781333552-17796-identity-and-rbac burned $38 + 1h41m
+  # routing model_lane:reviewer to opus in auto-reflect) was about
+  # ACCIDENTAL opus routing via lane-name aliasing, not about opus
+  # itself being wrong. The fix is to keep explicit opus assignments
+  # (cost-conscious, judgment-binding) and continue to deny gemini.
+  # All role-lanes MUST map to one of glm / kimi / codex / minimax /
+  # opus / sonnet.
   planner: codex             # was opus 2026-06-09..13; back to codex
   researcher: codex          # bottleneck-scan fallback if model_lane unset
   implementer: codex

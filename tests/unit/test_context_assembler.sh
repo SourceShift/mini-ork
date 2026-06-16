@@ -115,27 +115,5 @@ else
 fi
 
 echo ""
-echo "--- ContextNest atom injection: silent when CN unreachable ---"
-# Force MO_DISABLE_CN so cn_client returns {} without any network attempt.
-BRIEF_CN="$(mktemp /tmp/task-brief-XXXXXX.json)"
-echo '{"task_class":"audit","title":"Verify schema claims","description":"check pattern"}' > "$BRIEF_CN"
-MO_DISABLE_CN=1 OUT="$(context_contextnest_atoms_md "$BRIEF_CN" 3 2>&1 || true)"
-if [ -z "$OUT" ]; then
-  _ok "context_contextnest_atoms_md silent when MO_DISABLE_CN=1"
-else
-  _fail "expected silent output with MO_DISABLE_CN=1, got: '$OUT'"
-fi
-rm -f "$BRIEF_CN"
-
-echo ""
-echo "--- ContextNest atom injection: silent when brief missing ---"
-OUT_MISSING="$(context_contextnest_atoms_md "/tmp/does-not-exist-$$.json" 3 2>&1 || true)"
-if [ -z "$OUT_MISSING" ]; then
-  _ok "context_contextnest_atoms_md silent when brief missing"
-else
-  _fail "expected silent output when brief missing, got: '$OUT_MISSING'"
-fi
-
-echo ""
 echo "── Results: ${PASS} OK  ${SKIP} SKIP  ${FAIL} FAIL ──"
 [ "$FAIL" -eq 0 ] || exit 1

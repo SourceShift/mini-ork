@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "mini-ork-steering": {
+      "command": "mini-ork-mcp-steering",
+      "args": [],
+      "description": "Returns operator-supervisor guidance queued for the current run + agent role. Workers call get_operator_steering(run_id, role) between major decisions to receive supervisor steering injected via the `mini-ork inject` CLI."
+    }
+  }
+}
