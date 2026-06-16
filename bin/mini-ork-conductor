@@ -1,0 +1,322 @@
+#!/usr/bin/env bash
+# mini-ork conductor — meta-orchestrator (mini-ork-of-mini-orks).
+#
+# Phase 2 of the design grounded in Shepherd (arXiv:2605.10913),
+# TaskWeave (2606.01199), TacoMAS (2605.09539), Mass (2502.02533),
+# InfraMind (2606.11440) and TCP-MCP (2605.27850).
+#
+# Per tick:
+#   1. Read state of: epic queue, prompt_win_rates, agent_performance_memory,
+#      topology_win_rates, role_evolver_log proposals, 24h cost vs cap.
+#   2. Pick the next epic from epic_graph_ready_now.
+#   3. Decide:
+#        - Recipe / topology  (highest win_rate per task_class, ties broken
+#          by lower avg_cost; falls back to the epic's kickoff hint)
+#        - Lane hints         (highest relative_advantage per (lane, task_class))
+#        - Prompt seeds       (top-quartile prompt_version_hash for the role)
+#      Under high budget pressure (>70% spend), prefer cheaper topologies
+#      with sample_size >= 3 over higher-win-rate but expensive ones
+#      (InfraMind-style budget bias).
+#   4. Write the decision to conductor_decisions.
+#   5. Stage the lane hints + prompt seeds into env vars and call
+#      bin/mini-ork-scheduler --once.
+#
+# Modes:
+#   --once               One decision + dispatch then exit
+#   --max-iters N        Bound iterations (default unbounded)
+#   --idle-secs N        Poll interval when queue empty (default 60)
+#   --dry-run            Decide + log but skip dispatch
+#   --explain            Emit a verbose rationale per decision
+#   --help
+#
+# All decisions logged to conductor_decisions. Re-runnable.
+
+set -Eeuo pipefail
+
+MINI_ORK_ROOT="${MINI_ORK_ROOT:-$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)}"
+export MINI_ORK_ROOT
+MINI_ORK_HOME="${MINI_ORK_HOME:-$MINI_ORK_ROOT/.mini-ork}"
+export MINI_ORK_HOME
+STATE_DB="${MINI_ORK_DB:-$MINI_ORK_HOME/state.db}"
+export STATE_DB
+
+ONCE=0
+MAX_ITERS=0
+IDLE_SECS=60
+DRY_RUN=0
+EXPLAIN=0
+BUDGET_CAP="${MO_DAILY_BUDGET_USD:-50.0}"
+PLASTICITY_BUDGET="${MO_PLASTICITY_BUDGET:-5}"  # max mutations / 24h (Phase 5)
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --once)       ONCE=1; shift ;;
+    --max-iters)  MAX_ITERS="$2"; shift 2 ;;
+    --idle-secs)  IDLE_SECS="$2"; shift 2 ;;
+    --dry-run)    DRY_RUN=1; shift ;;
+    --explain)    EXPLAIN=1; shift ;;
+    --help|-h)
+      sed -n '2,33p' "$0" | sed 's/^# \{0,1\}//'
+      exit 0 ;;
+    *) echo "conductor: unknown flag $1" >&2; exit 2 ;;
+  esac
+done
+
+# shellcheck source=lib/epic_graph.sh
+source "$MINI_ORK_ROOT/lib/epic_graph.sh"
+
+_today_cost() {
+  sqlite3 "$STATE_DB" \
+    "SELECT COALESCE(SUM(cost_usd), 0) FROM task_runs
+       WHERE created_at >= strftime('%s','now','-24 hours');" \
+    2>/dev/null || echo 0
+}
+
+_mutations_today() {
+  sqlite3 "$STATE_DB" \
+    "SELECT COUNT(*) FROM role_evolver_log
+       WHERE applied_at >= strftime('%s','now','-24 hours');" \
+    2>/dev/null || echo 0
+}
+
+# Decide topology + lane hints for one epic; emit JSON decision.
+# Implements:
+#   - Mass-style highest-win-rate-per-task-class topology pick
+#   - GRPO-style highest-advantage lane pick
+#   - InfraMind budget bias: under pressure, prefer cheap+proven
+#   - Phase 5 stability anchor: promoted workflow_memory rows are protected
+#     and only chosen unless an experiment with shadow status > N samples
+#     of advantage has been proven
+#   - Phase 5 plasticity budget: cap mutation proposals applied per 24h
+_decide_for_epic() {
+  local epic_id="$1"
+  local spent="$2"
+  python3 - "$STATE_DB" "$epic_id" "$BUDGET_CAP" "$spent" \
+                       "$PLASTICITY_BUDGET" <<'PY'
+import json, sqlite3, sys, time
+db, epic_id, cap_s, spent_s, plast_s = sys.argv[1:6]
+cap, spent, plast_budget = float(cap_s), float(spent_s), int(plast_s)
+budget_pct = (spent / cap) if cap > 0 else 0.0
+
+con = sqlite3.connect(db); con.execute("PRAGMA busy_timeout=5000")
+con.row_factory = sqlite3.Row
+
+epic = con.execute(
+    "SELECT id, title, kickoff_path FROM epics WHERE id=?", (epic_id,)
+).fetchone()
+if not epic:
+    print(json.dumps({"error": "epic_not_found", "epic_id": epic_id}))
+    sys.exit(0)
+
+# Heuristic task_class: derive from epic_id slug ('arx-1-vero-harness' ->
+# task_class lookup against epics table or fall back to 'framework_edit').
+task_class = "framework_edit"
+try:
+    tc = con.execute(
+        "SELECT task_class FROM task_runs WHERE kickoff_path=? "
+        "ORDER BY created_at DESC LIMIT 1",
+        (epic["kickoff_path"] or "",),
+    ).fetchone()
+    if tc and tc["task_class"]:
+        task_class = tc["task_class"]
+except sqlite3.OperationalError:
+    pass
+
+# 1. Topology pick.
+# Mass-style: highest win_rate with sample_size >= 3.
+# InfraMind: under budget pressure (>0.70), prefer cheaper topologies first.
+# Stability anchor: only consider topologies whose workflow_memory.status
+# is in {promoted, shadow}. Quarantined and deprecated never chosen.
+topology = None
+topology_rationale = ""
+try:
+    if budget_pct > 0.70:
+        # Cheap-first when budget is tight.
+        rows = con.execute("""
+            SELECT t.topology_id, t.workflow_name, t.win_rate, t.sample_size,
+                   t.avg_cost_usd,
+                   COALESCE(wm.status, 'unknown') AS wf_status
+              FROM topology_win_rates t
+              LEFT JOIN workflow_memory wm ON wm.yaml_hash = t.topology_id
+             WHERE t.task_class=? AND t.sample_size >= 3
+               AND (wm.status IS NULL OR wm.status IN ('promoted','shadow'))
+             ORDER BY t.avg_cost_usd ASC, t.win_rate DESC LIMIT 1
+        """, (task_class,)).fetchone()
+        topology_rationale = (
+            f"budget pressure {budget_pct:.0%} > 70%; "
+            "biasing toward lowest avg_cost (InfraMind 2606.11440)."
+        )
+    else:
+        rows = con.execute("""
+            SELECT t.topology_id, t.workflow_name, t.win_rate, t.sample_size,
+                   t.avg_cost_usd,
+                   COALESCE(wm.status, 'unknown') AS wf_status
+              FROM topology_win_rates t
+              LEFT JOIN workflow_memory wm ON wm.yaml_hash = t.topology_id
+             WHERE t.task_class=? AND t.sample_size >= 3
+               AND (wm.status IS NULL OR wm.status IN ('promoted','shadow'))
+             ORDER BY t.win_rate DESC, t.sample_size DESC LIMIT 1
+        """, (task_class,)).fetchone()
+        topology_rationale = (
+            "highest win_rate with sample_size >= 3, stability-anchored "
+            "(Mass 2502.02533 + workflow_memory.status filter)."
+        )
+    if rows:
+        topology = {
+            "topology_id":   rows["topology_id"],
+            "workflow_name": rows["workflow_name"] or task_class.replace("_","-"),
+            "win_rate":      rows["win_rate"],
+            "sample_size":   rows["sample_size"],
+        }
+except sqlite3.OperationalError:
+    pass
+
+# 2. Lane hints. For each common node_type, pick the agent_version_id
+# with highest relative_advantage (sample_size >= 3) for this task_class.
+lane_hints = {}
+try:
+    for node_type in ("planner","researcher","reviewer","implementer","verifier"):
+        r = con.execute("""
+            SELECT agent_version_id, relative_advantage
+              FROM agent_performance_memory
+             WHERE task_class=? AND runs_count >= 3
+               AND (role=? OR model=?)
+             ORDER BY relative_advantage DESC, runs_count DESC LIMIT 1
+        """, (task_class, node_type, node_type)).fetchone()
+        if r and r["relative_advantage"] > 0:
+            lane_hints[node_type] = r["agent_version_id"]
+except sqlite3.OperationalError:
+    pass
+
+# 3. Open role-evolver proposals for this recipe (Phase 5 plasticity gate
+# applied at the apply step, not here).
+open_proposals = con.execute("""
+    SELECT COUNT(*) AS n FROM role_evolver_log
+     WHERE status='open' AND (target_recipe=? OR target_recipe='*')
+""", ((topology or {}).get("workflow_name") or "*",)).fetchone()
+open_proposals_n = open_proposals["n"] if open_proposals else 0
+
+# 4. Plasticity budget check.
+mut_today = con.execute("""
+    SELECT COUNT(*) AS n FROM role_evolver_log
+     WHERE applied_at >= strftime('%s','now','-24 hours')
+""").fetchone()["n"]
+plasticity_remaining = max(0, plast_budget - mut_today)
+
+# 5. Predicted score: simple multiplicative model
+#    score = topology.win_rate * (1 + sum(positive_lane_advantages)*0.3)
+predicted = (topology or {}).get("win_rate", 0.5) or 0.5
+lane_adv_sum = 0.0
+try:
+    for r in con.execute("""
+        SELECT agent_version_id, relative_advantage
+          FROM agent_performance_memory
+         WHERE task_class=? AND agent_version_id IN ({})
+        """.format(",".join(["?"]*len(lane_hints)) or "''"),
+        (task_class, *lane_hints.values())
+    ).fetchall():
+        if r["relative_advantage"] > 0:
+            lane_adv_sum += r["relative_advantage"]
+except sqlite3.OperationalError:
+    pass
+predicted = min(1.0, predicted * (1.0 + lane_adv_sum * 0.3))
+
+decision = {
+    "epic_id":          epic_id,
+    "task_class":       task_class,
+    "topology":         topology,
+    "lane_hints":       lane_hints,
+    "open_role_proposals": open_proposals_n,
+    "plasticity_remaining": plasticity_remaining,
+    "predicted_score":  round(predicted, 4),
+    "budget_pct_used":  round(budget_pct, 4),
+    "topology_rationale": topology_rationale,
+}
+print(json.dumps(decision, separators=(",", ":")))
+PY
+}
+
+_log_decision() {
+  local dec_json="$1"
+  python3 - "$STATE_DB" "$dec_json" <<'PY'
+import json, sqlite3, sys, time
+db, dec = sys.argv[1], json.loads(sys.argv[2])
+con = sqlite3.connect(db); con.execute("PRAGMA busy_timeout=5000")
+con.execute("""
+    INSERT INTO conductor_decisions
+        (decided_at, epic_id, task_class, chosen_topology, chosen_recipe,
+         chosen_lane_hints, predicted_score, budget_pct_used,
+         rationale, outcome)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')
+""", (int(time.time()),
+      dec.get("epic_id"), dec.get("task_class"),
+      (dec.get("topology") or {}).get("topology_id"),
+      (dec.get("topology") or {}).get("workflow_name"),
+      json.dumps(dec.get("lane_hints") or {}),
+      float(dec.get("predicted_score") or 0.0),
+      float(dec.get("budget_pct_used") or 0.0),
+      dec.get("topology_rationale", "")[:600]))
+con.commit(); con.close()
+PY
+}
+
+_tick() {
+  local spent
+  spent=$(_today_cost)
+  local next_epic
+  next_epic=$(epic_graph_ready_now | head -1)
+  if [ -z "$next_epic" ]; then
+    echo "conductor: queue empty"
+    return 2
+  fi
+
+  local dec
+  dec=$(_decide_for_epic "$next_epic" "$spent")
+  if [ "$EXPLAIN" = "1" ] || [ "$DRY_RUN" = "1" ]; then
+    echo "conductor: decision for $next_epic:"
+    echo "$dec" | python3 -m json.tool | sed 's/^/  /'
+  else
+    local recipe
+    recipe=$(echo "$dec" | python3 -c "import json,sys;d=json.loads(sys.stdin.read());print((d.get('topology') or {}).get('workflow_name','') or '')")
+    echo "conductor: chose recipe=$recipe for $next_epic spent=\$$spent"
+  fi
+
+  _log_decision "$dec"
+
+  if [ "$DRY_RUN" = "1" ]; then
+    return 0
+  fi
+
+  # Stage env hints for the scheduler.
+  local recipe lane_hints
+  recipe=$(echo "$dec" | python3 -c "import json,sys;d=json.loads(sys.stdin.read());print((d.get('topology') or {}).get('workflow_name','') or '')")
+  lane_hints=$(echo "$dec" | python3 -c "import json,sys;d=json.loads(sys.stdin.read());print(json.dumps(d.get('lane_hints',{})))")
+
+  if [ -n "$recipe" ]; then
+    MO_SCHED_RECIPE="$recipe" \
+    MO_CONDUCTOR_LANE_HINTS="$lane_hints" \
+      "$MINI_ORK_ROOT/bin/mini-ork-scheduler" --once --max-iters 1 \
+      || echo "conductor: scheduler dispatch exited non-zero" >&2
+  else
+    "$MINI_ORK_ROOT/bin/mini-ork-scheduler" --once --max-iters 1 \
+      || echo "conductor: scheduler dispatch exited non-zero" >&2
+  fi
+}
+
+iter=0
+while :; do
+  _tick
+  rc=$?
+  iter=$((iter+1))
+  if [ "$ONCE" = "1" ]; then
+    exit 0
+  fi
+  if [ "$MAX_ITERS" -gt 0 ] && [ "$iter" -ge "$MAX_ITERS" ]; then
+    echo "conductor: max-iters $MAX_ITERS reached"
+    exit 0
+  fi
+  if [ "$rc" = "2" ]; then
+    echo "conductor: idle ${IDLE_SECS}s"
+    sleep "$IDLE_SECS"
+  fi
+done

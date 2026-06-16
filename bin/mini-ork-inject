@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# mini-ork-inject — emit an operator steering message into state.db so the
+# next context_assemble call surfaces it to the targeted agent role.
+#
+# Usage:
+#   mini-ork inject \
+#     --run-id <run-id> \
+#     --role planner|implementer|reviewer|verifier|any \
+#     --message "<text>" \
+#     [--severity info|warn|critical]    # default: info
+#     [--source <free-form>]             # default: "operator-cli"
+#     [--confidence 0.0-1.0]             # default: 0.8
+#     [--ttl-secs <int>]                 # default: 3600 (1h)
+#
+# When --run-id is omitted the message lands in the global queue and
+# reaches the next planner dispatch of any run.
+#
+# Exit codes:
+#   0  message accepted; row id printed on stdout
+#   1  DB unreachable / write failed
+#   2  bad arguments
+#
+# Example — between an implementer node_end event and the reviewer's
+# node_start event, tell the reviewer to weight integration tests above
+# unit tests:
+#
+#   mini-ork inject \
+#     --run-id run-1781511519-53872 \
+#     --role reviewer \
+#     --severity warn \
+#     --message "Integration tests are the load-bearing gate for this fix; do not approve on unit-test pass alone."
+
+set -Eeuo pipefail
+
+MINI_ORK_ROOT="${MINI_ORK_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+export MINI_ORK_ROOT
+
+# shellcheck source=lib/operator_steering.sh
+. "$MINI_ORK_ROOT/lib/operator_steering.sh"
+
+if [[ $# -eq 0 || "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+  sed -n '2,/^set -Eeuo/p' "${BASH_SOURCE[0]}" | sed -n '/^#/p' | sed 's/^# \{0,1\}//'
+  exit 0
+fi
+
+# Translate the ergonomic --role flag to the lib's --role-target.
+NEW_ARGS=()
+HAS_SOURCE=0
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --role)        NEW_ARGS+=("--role-target" "$2"); shift 2 ;;
+    --source)      HAS_SOURCE=1; NEW_ARGS+=("$1" "$2"); shift 2 ;;
+    *)             NEW_ARGS+=("$1"); shift ;;
+  esac
+done
+
+if [[ "$HAS_SOURCE" == 0 ]]; then
+  NEW_ARGS+=(--source "operator-cli")
+fi
+
+operator_steering_emit "${NEW_ARGS[@]}"
