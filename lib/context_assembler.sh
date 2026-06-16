@@ -423,6 +423,148 @@ if rows:
 PY
 }
 
+# desc: Emit ContextNest atoms as a compact markdown block suitable for
+#       direct prompt injection. Queries CN's /api/v1/tools/retrieve with
+#       text derived from the task brief; degrades silently when CN is
+#       down or MO_DISABLE_CN=1 (caller can append unconditionally).
+#
+#       Args:
+#         $1  task_brief_path  Path to brief JSON (read for title/description).
+#         $2  limit            Max atoms to surface (default 5).
+#
+#       Why this exists: mini-ork's planner has only ever seen
+#       local sqlite memory (task_memory + failure_memory). ContextNest
+#       carries the cross-session substrate fed by ALL Claude Code
+#       sessions in this install — fresh schema knowledge, recent
+#       feature deliveries, attention-inbox items. Without this fetch,
+#       the planner bakes outdated assumptions into plans (see chapter-
+#       anchor drift audit, 2026-06-15).
+#
+#       Restored 2026-06-16 after PR #18 silently dropped these functions
+#       while landing an unrelated feature stack (regression caught by
+#       scripts/smoke-cn-bridge.sh — see Smoke Test Standard in
+#       ContextNest's docs/roadmap/epics/agent-context-pack.md).
+context_contextnest_atoms_md() {
+  local task_brief_path="${1:?task_brief_path required}"
+  local limit="${2:-5}"
+  [ "${MO_DISABLE_CN:-0}" = "1" ] && return 0
+  [ -f "$task_brief_path" ] || return 0
+  [ -f "${MINI_ORK_ROOT}/lib/cn_client.sh" ] || return 0
+  # shellcheck source=cn_client.sh
+  source "${MINI_ORK_ROOT}/lib/cn_client.sh"
+  declare -f cn_retrieve >/dev/null 2>&1 || return 0
+  cn_available || return 0
+
+  # Build query from brief: prefer 'title' + first 200 chars of 'description'
+  # or 'objective'. Fall back to whole file content. The query is what
+  # CN's embedder sees, so more semantic context = better retrieval.
+  local query
+  query=$(python3 - "$task_brief_path" <<'PY'
+import json, sys
+try:
+    with open(sys.argv[1]) as f:
+        raw = f.read()
+    try:
+        d = json.loads(raw)
+    except Exception:
+        print(raw[:512].strip())
+        sys.exit(0)
+    parts = []
+    for k in ("title", "objective", "description", "task_class"):
+        v = d.get(k)
+        if isinstance(v, str) and v.strip():
+            parts.append(v.strip())
+    if not parts:
+        parts.append(raw[:512].strip())
+    print(" ".join(parts)[:600])
+except Exception:
+    pass
+PY
+)
+  [ -z "$query" ] && return 0
+  local hits_json
+  hits_json=$(cn_retrieve "$query" "$limit" 2>/dev/null) || return 0
+  cn_render_atoms_md "$hits_json" "$limit"
+}
+
+# desc: Emit a compact markdown block listing CN sessions that recently
+#       touched files relevant to the brief. Helps planner notice "this
+#       module was last edited 3 sessions ago for reason X" without
+#       reading git log. Args: $1 = brief path, $2 = max files to probe.
+context_contextnest_recent_sessions_md() {
+  local task_brief_path="${1:?task_brief_path required}"
+  local max_files="${2:-3}"
+  [ "${MO_DISABLE_CN:-0}" = "1" ] && return 0
+  [ -f "$task_brief_path" ] || return 0
+  [ -f "${MINI_ORK_ROOT}/lib/cn_client.sh" ] || return 0
+  # shellcheck source=cn_client.sh
+  source "${MINI_ORK_ROOT}/lib/cn_client.sh"
+  declare -f cn_sessions_by_file >/dev/null 2>&1 || return 0
+  cn_available || return 0
+
+  # Pull file hints from brief's 'files' or 'paths' array.
+  local files_csv
+  files_csv=$(python3 - "$task_brief_path" "$max_files" <<'PY'
+import json, sys
+try:
+    with open(sys.argv[1]) as f:
+        d = json.load(f)
+    max_files = int(sys.argv[2])
+    candidates = []
+    for k in ("files", "paths", "relevant_files", "targets"):
+        v = d.get(k)
+        if isinstance(v, list):
+            for item in v:
+                if isinstance(item, str):
+                    candidates.append(item)
+                elif isinstance(item, dict):
+                    p = item.get("path") or item.get("file") or item.get("name")
+                    if isinstance(p, str):
+                        candidates.append(p)
+    if candidates:
+        print(",".join(candidates[:max_files]))
+except Exception:
+    pass
+PY
+)
+  [ -z "$files_csv" ] && return 0
+  local any_output=0
+  local IFS=','
+  local f
+  for f in $files_csv; do
+    [ -z "$f" ] && continue
+    local resp
+    resp=$(cn_sessions_by_file "$f" 2>/dev/null) || continue
+    local rendered
+    rendered=$(python3 - "$resp" "$f" <<'PY' 2>/dev/null
+import json, sys
+try:
+    d = json.loads(sys.argv[1])
+except Exception:
+    sys.exit(0)
+sessions = d.get("sessions") or d.get("hits") or []
+if not sessions:
+    sys.exit(0)
+print(f"- File `{sys.argv[2]}` recently touched in:")
+for s in sessions[:3]:
+    sid = s.get("session_id") or s.get("id", "")
+    ts = (s.get("last_seen") or s.get("ts") or "")[:10]
+    title = (s.get("title") or s.get("intent") or "").strip()[:80]
+    print(f"  - {sid[:8]} ({ts}) {title}")
+PY
+)
+    if [ -n "$rendered" ]; then
+      if [ "$any_output" -eq 0 ]; then
+        printf '%s\n' "--- ContextNest: recent sessions for relevant files ---"
+        any_output=1
+      fi
+      printf '%s\n' "$rendered"
+    fi
+  done
+  [ "$any_output" -eq 1 ] && printf '%s\n' "--- /ContextNest: recent sessions ---"
+  return 0
+}
+
 if [[ "${BASH_SOURCE[0]:-}" == "${0:-}" ]]; then
   echo "context_assembler.sh — source me and call context_assemble <task_brief_path> <node_name>"
 fi

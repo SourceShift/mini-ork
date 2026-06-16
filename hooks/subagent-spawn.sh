@@ -88,4 +88,16 @@ sqlite3 "$DB" "
      '$(esc_sql "$prompt_excerpt")', 'spawned', '$(esc_sql "$cwd")');
 " 2>/dev/null || true
 
+# Mirror to ContextNest so substrate sees mini-ork subagent spawns alongside
+# direct Claude Code sessions. Fire-and-forget; CN being down never blocks.
+# Restored 2026-06-16 after PR #18 silently dropped this hook augmentation
+# (regression caught by scripts/smoke-cn-bridge.sh).
+if [ -f "${MINI_ORK_ROOT}/lib/cn_client.sh" ]; then
+  # shellcheck source=../lib/cn_client.sh
+  source "${MINI_ORK_ROOT}/lib/cn_client.sh" 2>/dev/null || true
+  if declare -f cn_hook_post >/dev/null 2>&1; then
+    cn_hook_post "session_start" "miniork-spawn-${parent_session}-$(date +%s)" "$cwd" "" || true
+  fi
+fi
+
 emit_continue
