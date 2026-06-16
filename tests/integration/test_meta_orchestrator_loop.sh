@@ -24,6 +24,15 @@ STATE_DB="${MINI_ORK_DB:-$MINI_ORK_HOME/state.db}"
 MINI_ORK_DB="$STATE_DB"
 export STATE_DB MINI_ORK_DB
 
+# CI bootstrap: state.db may not exist on a fresh checkout. Apply migrations
+# idempotently before any test that queries the schema.
+if [ ! -f "$STATE_DB" ]; then
+  mkdir -p "$(dirname "$STATE_DB")"
+  : > "$STATE_DB"
+fi
+MINI_ORK_DB="$STATE_DB" bash "$MINI_ORK_ROOT/db/init.sh" >/dev/null 2>&1 || true
+
+
 PASS=0; FAIL=0
 _t() { printf '\n=== %s ===\n' "$1"; }
 _check() {
