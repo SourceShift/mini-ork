@@ -33,6 +33,22 @@ if [ ! -f "$STATE_DB" ]; then
 fi
 MINI_ORK_DB="$STATE_DB" bash "$MINI_ORK_ROOT/db/init.sh" >/dev/null 2>&1 || true
 
+# Step 7 asserts the context assembler surfaces __cross_class__ gradients.
+# Seed one high-confidence cross-class row so the assertion has data to
+# verify against on a clean DB. INSERT OR IGNORE keeps reruns idempotent.
+sqlite3 "$STATE_DB" "
+INSERT OR IGNORE INTO gradient_records
+  (gradient_id, target, signal, suggested_change, evidence,
+   confidence, created_at, task_class)
+VALUES
+  ('e1-test-cross-class-seed',
+   'workflow.cross_class.example',
+   'Recurring lesson across multiple task_classes (seeded for E1 test).',
+   'Test stub — verifies assembler surfaces __cross_class__ rows.',
+   'tests/integration/test_autonomous_epic_pipeline.sh',
+   0.9, strftime('%s','now'), '__cross_class__');
+" 2>/dev/null || true
+
 PASS=0; FAIL=0
 _t() { printf '\n=== %s ===\n' "$1"; }
 _check() {
