@@ -114,22 +114,95 @@ except Exception:
 # task_class column is the primary join (populated by gradient_store);
 # the legacy target-substring match stays as fallback for rows stored
 # before the column existed.
+# E7: also merge __cross_class__ gradients — universal lessons fanned out
+# from recurring targets across multiple task_classes. These get a higher
+# weight in the assembler since they generalize.
 failure_modes = []
 try:
     rows = con.execute("""
-        SELECT target, signal, suggested_change, confidence
+        SELECT target, signal, suggested_change, confidence,
+               (task_class = '__cross_class__') AS is_cross_class
         FROM gradient_records
-        WHERE (task_class = ? OR target LIKE ?) AND confidence >= 0.6
-        ORDER BY confidence DESC LIMIT 10
+        WHERE ((task_class = ? OR target LIKE ?)
+               OR task_class = '__cross_class__')
+          AND confidence >= 0.6
+        ORDER BY is_cross_class DESC, confidence DESC LIMIT 10
     """, (task_class, f"%{task_class}%")).fetchall()
     for r in rows:
+        scope = "cross_class" if r["is_cross_class"] else task_class
         failure_modes.append({
             "cite": f"gradient_records/{r['target']}",
             "target": r["target"],
             "signal": r["signal"],
             "suggested_change": r["suggested_change"],
             "confidence": r["confidence"],
+            "scope": scope,
         })
+except Exception:
+    pass
+
+# --- Similarity-retrieved prior observations (Track A item 1) -----------
+# TF-IDF cosine over bug_reports + gradient_records + learning_record text
+# columns, scored against the incoming task_brief. Pulls in lessons that
+# don't match by exact task_class — exactly what "agent encounters a
+# similar problem next time -> already knows the fix" needs.
+similar_lessons = []
+try:
+    import math as _math, re as _re
+    from collections import Counter as _Counter
+    try:
+        query_text = " ".join(filter(None, [
+            brief.get("goal", "") if isinstance(brief, dict) else "",
+            brief.get("title", "") if isinstance(brief, dict) else "",
+            brief.get("description", "") if isinstance(brief, dict) else "",
+            task_class,
+        ]))
+    except Exception:
+        query_text = task_class
+    def _stok(s):
+        s = (s or "").lower()
+        s = _re.sub(r"[^\w./_-]+", " ", s)
+        return [t for t in s.split() if len(t) >= 3]
+    def _stf(toks):
+        c = _Counter(toks); total = sum(c.values()) or 1
+        return {t: cnt/total for t, cnt in c.items()}
+    def _scos(a, b):
+        keys = set(a) | set(b)
+        dot = sum(a.get(k,0)*b.get(k,0) for k in keys)
+        na = _math.sqrt(sum(v*v for v in a.values()))
+        nb = _math.sqrt(sum(v*v for v in b.values()))
+        return dot/(na*nb) if na and nb else 0.0
+    for tbl, col, kind in (
+        ("bug_reports",      "title",  "bug"),
+        ("gradient_records", "signal", "gradient"),
+        ("learning_record",  "title",  "learning"),
+    ):
+        try:
+            rows = con.execute(f"SELECT rowid AS rid, * FROM {tbl} LIMIT 2000").fetchall()
+        except sqlite3.OperationalError:
+            continue
+        docs = [_stok((r[col] or "")) for r in rows]
+        df = _Counter()
+        for d in docs:
+            for t in set(d): df[t] += 1
+        N = max(len(docs), 1)
+        idf = {t: _math.log(1.0 + N/(1+c)) for t,c in df.items()}
+        def _svec(toks): return {t: w*idf.get(t,0.0) for t,w in _stf(toks).items()}
+        q_vec = _svec(_stok(query_text))
+        scored = []
+        for r, d in zip(rows, docs):
+            s = _scos(q_vec, _svec(d))
+            if s >= 0.15: scored.append((s, r))
+        scored.sort(reverse=True, key=lambda p: p[0])
+        for s, r in scored[:3]:
+            similar_lessons.append({
+                "cite": f"{tbl}/{r['rid']}",
+                "kind": kind,
+                "score": round(s, 4),
+                "title": (r[col] or "")[:200],
+                "suggested_fix": (r["suggested_fix"]    if "suggested_fix"    in r.keys() else
+                                  r["suggested_change"] if "suggested_change" in r.keys() else "") or "",
+            })
 except Exception:
     pass
 
@@ -166,6 +239,7 @@ pack = {
     "verifier_contract": {"content": verifier_contract, "cite": "artifact_contract"},
     "prior_similar_runs": prior_runs,
     "known_failure_modes": failure_modes,
+    "similar_lessons": similar_lessons,
     "user_preferences": user_prefs,
     "constraints": constraints,
     "forbidden_fallbacks": forbidden_fallbacks,
@@ -258,6 +332,45 @@ if rows:
 PY
 }
 
+# desc: Emit operator-injected steering messages as a markdown block.
+#       Reads unconsumed, unexpired rows from operator_steering targeted at
+#       this run + role (or "any") and marks them consumed so the agent does
+#       not see the same steering twice in a single dispatch. Prints
+#       NOTHING when no steering is queued.
+#
+#       Args:
+#         $1  role  e.g. "planner" | "implementer" | "reviewer" — agent role
+#                   the calling node represents
+context_operator_steering_md() {
+  local role="${1:?role required}"
+  [ -n "${MINI_ORK_DB:-}" ] && [ -f "${MINI_ORK_DB:-}" ] || return 0
+  [ -f "$(dirname "${BASH_SOURCE[0]}")/operator_steering.sh" ] || return 0
+  # shellcheck source=lib/operator_steering.sh
+  . "$(dirname "${BASH_SOURCE[0]}")/operator_steering.sh"
+
+  local jsonl
+  jsonl="$(operator_steering_fetch_for "${MINI_ORK_RUN_ID:-}" "$role" 2>/dev/null)"
+  [ -n "$jsonl" ] || return 0
+
+  python3 - "$jsonl" <<'PY'
+import json, sys
+lines = [l for l in sys.argv[1].splitlines() if l.strip()]
+if not lines:
+    sys.exit(0)
+print("--- Operator steering (injected supervisor guidance) ---")
+print(f"{len(lines)} message(s) targeted at this node. Treat as load-bearing:")
+for line in lines:
+    try:
+        r = json.loads(line)
+        sev = r.get("severity","info").upper()
+        src = r.get("source","unknown")
+        print(f"- [{sev}] (from {src}) {r.get('message','')}")
+    except Exception:
+        continue
+print("--- /operator steering ---")
+PY
+}
+
 # desc: Emit prior same-task_class run outcomes as a compact markdown block
 #       suitable for direct prompt injection (the prior_similar_runs slice of
 #       the ContextPack, without the full context_assemble JSON envelope).
@@ -308,143 +421,6 @@ if rows:
         print(f"- {run_key}: {outcome} ({nodes} nodes, cost {cost_s}, {dur_s})")
     print("--- /prior runs ---")
 PY
-}
-
-# desc: Emit ContextNest atoms as a compact markdown block suitable for
-#       direct prompt injection. Queries CN's /api/v1/tools/retrieve with
-#       text derived from the task brief; degrades silently when CN is
-#       down or MO_DISABLE_CN=1 (caller can append unconditionally).
-#
-#       Args:
-#         $1  task_brief_path  Path to brief JSON (read for title/description).
-#         $2  limit            Max atoms to surface (default 5).
-#
-#       Why this exists: mini-ork's planner has only ever seen
-#       local sqlite memory (task_memory + failure_memory). ContextNest
-#       carries the cross-session substrate fed by ALL Claude Code
-#       sessions in this install — fresh schema knowledge, recent
-#       feature deliveries, attention-inbox items. Without this fetch,
-#       the planner bakes outdated assumptions into plans (see chapter-
-#       anchor drift audit, 2026-06-15).
-context_contextnest_atoms_md() {
-  local task_brief_path="${1:?task_brief_path required}"
-  local limit="${2:-5}"
-  [ "${MO_DISABLE_CN:-0}" = "1" ] && return 0
-  [ -f "$task_brief_path" ] || return 0
-  [ -f "$MINI_ORK_ROOT/lib/cn_client.sh" ] || return 0
-  # shellcheck source=cn_client.sh
-  source "$MINI_ORK_ROOT/lib/cn_client.sh"
-  declare -f cn_retrieve >/dev/null 2>&1 || return 0
-  cn_available || return 0
-
-  # Build query from brief: prefer 'title' + first 200 chars of 'description'
-  # or 'objective'. Fall back to whole file content. The query is what
-  # CN's embedder sees, so more semantic context = better retrieval.
-  local query
-  query=$(python3 - "$task_brief_path" <<'PY'
-import json, sys
-try:
-    with open(sys.argv[1]) as f:
-        raw = f.read()
-    try:
-        d = json.loads(raw)
-    except Exception:
-        print(raw[:512].strip())
-        sys.exit(0)
-    parts = []
-    for k in ("title", "objective", "description", "task_class"):
-        v = d.get(k)
-        if isinstance(v, str) and v.strip():
-            parts.append(v.strip())
-    if not parts:
-        parts.append(raw[:512].strip())
-    print(" ".join(parts)[:600])
-except Exception:
-    pass
-PY
-)
-  [ -z "$query" ] && return 0
-  local hits_json
-  hits_json=$(cn_retrieve "$query" "$limit" 2>/dev/null) || return 0
-  cn_render_atoms_md "$hits_json" "$limit"
-}
-
-# desc: Emit a compact markdown block listing CN sessions that recently
-#       touched files relevant to the brief. Helps planner notice "this
-#       module was last edited 3 sessions ago for reason X" without
-#       reading git log. Args: $1 = brief path, $2 = max files to probe.
-context_contextnest_recent_sessions_md() {
-  local task_brief_path="${1:?task_brief_path required}"
-  local max_files="${2:-3}"
-  [ "${MO_DISABLE_CN:-0}" = "1" ] && return 0
-  [ -f "$task_brief_path" ] || return 0
-  [ -f "$MINI_ORK_ROOT/lib/cn_client.sh" ] || return 0
-  # shellcheck source=cn_client.sh
-  source "$MINI_ORK_ROOT/lib/cn_client.sh"
-  declare -f cn_sessions_by_file >/dev/null 2>&1 || return 0
-  cn_available || return 0
-
-  # Pull file hints from brief's 'files' or 'paths' array.
-  local files_csv
-  files_csv=$(python3 - "$task_brief_path" "$max_files" <<'PY'
-import json, sys
-try:
-    with open(sys.argv[1]) as f:
-        d = json.load(f)
-    max_files = int(sys.argv[2])
-    candidates = []
-    for k in ("files", "paths", "relevant_files", "targets"):
-        v = d.get(k)
-        if isinstance(v, list):
-            for item in v:
-                if isinstance(item, str):
-                    candidates.append(item)
-                elif isinstance(item, dict):
-                    p = item.get("path") or item.get("file") or item.get("name")
-                    if isinstance(p, str):
-                        candidates.append(p)
-    if candidates:
-        print(",".join(candidates[:max_files]))
-except Exception:
-    pass
-PY
-)
-  [ -z "$files_csv" ] && return 0
-  local any_output=0
-  local IFS=','
-  local f
-  for f in $files_csv; do
-    [ -z "$f" ] && continue
-    local resp
-    resp=$(cn_sessions_by_file "$f" 2>/dev/null) || continue
-    local rendered
-    rendered=$(python3 - "$resp" "$f" <<'PY' 2>/dev/null
-import json, sys
-try:
-    d = json.loads(sys.argv[1])
-except Exception:
-    sys.exit(0)
-sessions = d.get("sessions") or d.get("hits") or []
-if not sessions:
-    sys.exit(0)
-print(f"- File `{sys.argv[2]}` recently touched in:")
-for s in sessions[:3]:
-    sid = s.get("session_id") or s.get("id", "")
-    ts = (s.get("last_seen") or s.get("ts") or "")[:10]
-    title = (s.get("title") or s.get("intent") or "").strip()[:80]
-    print(f"  - {sid[:8]} ({ts}) {title}")
-PY
-)
-    if [ -n "$rendered" ]; then
-      if [ "$any_output" -eq 0 ]; then
-        printf '%s\n' "--- ContextNest: recent sessions for relevant files ---"
-        any_output=1
-      fi
-      printf '%s\n' "$rendered"
-    fi
-  done
-  [ "$any_output" -eq 1 ] && printf '%s\n' "--- /ContextNest: recent sessions ---"
-  return 0
 }
 
 if [[ "${BASH_SOURCE[0]:-}" == "${0:-}" ]]; then

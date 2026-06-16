@@ -174,6 +174,94 @@ print(json.dumps([dict(r) for r in rows]))
 PY
 }
 
+# desc: Mine execution_traces for cross-run clusters and upsert one
+#       pattern_records row per cluster whose size ≥ min_cluster within the
+#       window. Cluster key is (task_class, status). Returns count on stdout.
+#       Args:  --window <duration>   (e.g. 7d, 24h; default 7d)
+#              --min-cluster <int>   (default 3)
+pattern_store_mine_from_traces() {
+  local window="7d" min_cluster="3"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --window)      window="$2";      shift 2 ;;
+      --min-cluster) min_cluster="$2"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+  _pattern_ensure_table
+  python3 - "${MINI_ORK_DB:?MINI_ORK_DB unset}" "$window" "$min_cluster" <<'PY'
+import sqlite3, json, sys, re, time, hashlib, uuid
+
+db, window, min_cluster_str = sys.argv[1:4]
+min_cluster = int(min_cluster_str)
+
+m = re.match(r"^(\d+)([dh])$", window.strip())
+if not m:
+    secs = 7 * 86400
+else:
+    n, unit = int(m.group(1)), m.group(2)
+    secs = n * (86400 if unit == "d" else 3600)
+since_epoch = int(time.time()) - secs
+
+con = sqlite3.connect(db)
+con.execute("PRAGMA busy_timeout=5000")
+con.row_factory = sqlite3.Row
+# execution_traces.created_at is TEXT ISO. Compare against ISO-formatted since.
+import datetime
+since_iso = datetime.datetime.utcfromtimestamp(since_epoch).strftime('%Y-%m-%dT%H:%M:%S.000Z')
+clusters = con.execute("""
+    SELECT task_class, status, COUNT(*) AS freq,
+           GROUP_CONCAT(trace_id, ',') AS trace_ids
+      FROM execution_traces
+     WHERE created_at >= ?
+       AND task_class IS NOT NULL AND task_class <> ''
+       AND status IS NOT NULL AND status <> ''
+     GROUP BY task_class, status
+    HAVING COUNT(*) >= ?
+""", (since_iso, min_cluster)).fetchall()
+
+written = 0
+for c in clusters:
+    task_class, status, freq, trace_csv = c["task_class"], c["status"], c["freq"], c["trace_ids"] or ""
+    trace_ids = [t for t in trace_csv.split(",") if t]
+    # Deterministic pattern_id so re-mining upserts instead of duplicating.
+    key = f"{task_class}|{status}".encode()
+    pid = "pat-" + hashlib.sha256(key).hexdigest()[:12]
+    desc = f"cluster: task_class={task_class} status={status} (freq={freq} in window)"
+    # output_type heuristic: failure clusters → verifier_addition candidates;
+    # success clusters → best_practice_rule candidates.
+    output_type = "verifier_addition" if status in ("failure", "vacuous") else "best_practice_rule"
+    existing = con.execute(
+        "SELECT frequency, evidence_trace_ids FROM pattern_records WHERE pattern_id=?",
+        (pid,),
+    ).fetchone()
+    if existing:
+        old_ev = json.loads(existing["evidence_trace_ids"] or "[]")
+        merged = list(dict.fromkeys(old_ev + trace_ids))[:200]  # cap evidence list
+        con.execute("""
+            UPDATE pattern_records
+               SET frequency=?, evidence_trace_ids=?,
+                   last_seen=strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+                   description=?, output_type=?
+             WHERE pattern_id=?
+        """, (freq, json.dumps(merged), desc, output_type, pid))
+    else:
+        con.execute("""
+            INSERT INTO pattern_records
+                (pattern_id, description, evidence_trace_ids, frequency,
+                 first_seen, last_seen, output_type)
+            VALUES (?,?,?,?,
+                    strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+                    strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+                    ?)
+        """, (pid, desc, json.dumps(trace_ids[:200]), freq, output_type))
+    written += 1
+con.commit()
+con.close()
+print(written)
+PY
+}
+
 # desc: Register a callback function name to be invoked when a NEW pattern is
 #       stored. The function receives (pattern_id, original_payload_json).
 pattern_on_new() {

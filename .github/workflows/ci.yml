@@ -41,14 +41,20 @@ jobs:
       # bin/mini-ork* explicitly.
       - name: Run shellcheck (errors block CI)
         run: |
-          { find bin -type f -name 'mini-ork*';
+          # bin/ holds polyglot CLIs (Python, Node) named mini-ork-*; filter
+          # to bash-shebang files only so shellcheck doesn't crash on them.
+          { find bin -type f -name 'mini-ork*' \
+              -exec sh -c 'head -1 "$1" | grep -qE "bash|sh\$"' _ {} \; -print;
             find lib tests recipes -type f -name '*.sh'; } \
             | xargs shellcheck --shell=bash --severity=error
 
       - name: Run shellcheck (warnings advisory)
         continue-on-error: true
         run: |
-          { find bin -type f -name 'mini-ork*';
+          # bin/ holds polyglot CLIs (Python, Node) named mini-ork-*; filter
+          # to bash-shebang files only so shellcheck doesn't crash on them.
+          { find bin -type f -name 'mini-ork*' \
+              -exec sh -c 'head -1 "$1" | grep -qE "bash|sh\$"' _ {} \; -print;
             find lib tests recipes -type f -name '*.sh'; } \
             | xargs shellcheck --shell=bash --severity=warning \
             | tee shellcheck-warnings.log || true

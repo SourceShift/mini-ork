@@ -1,0 +1,342 @@
+#!/usr/bin/env bash
+# mini-ork epics — ingest, list, inspect epics + dependencies.
+#
+# Subcommands:
+#   ingest <roadmap.md>    Parse a roadmap doc → epics + epic_dependencies rows
+#   list [--status STATUS] List epics, optionally filtered
+#   ready                  List epics whose hard deps are all met
+#   show <epic_id>         Inspect one epic + its deps
+#
+# Heuristic for ingest:
+#   Every `## <title>` heading becomes an epic. The epic id is the heading
+#   slug, with any explicit `(id: foo-1)` overriding. A line within the epic
+#   body matching one of:
+#       - depends on: <id>[, <id>...]
+#       - blocked by: <id>[, <id>...]
+#       - after: <id>[, <id>...]
+#   creates a hard `from → this` dependency. Soft deps use `should follow:`.
+#   Headings not in any roadmap section are silently skipped.
+
+set -Eeuo pipefail
+
+MINI_ORK_ROOT="${MINI_ORK_ROOT:-$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)}"
+export MINI_ORK_ROOT
+MINI_ORK_HOME="${MINI_ORK_HOME:-$MINI_ORK_ROOT/.mini-ork}"
+export MINI_ORK_HOME
+STATE_DB="${MINI_ORK_DB:-$MINI_ORK_HOME/state.db}"
+export STATE_DB
+
+# shellcheck source=lib/epic_graph.sh
+source "$MINI_ORK_ROOT/lib/epic_graph.sh"
+
+_usage() {
+  cat <<EOF
+Usage: mini-ork epics <subcommand> [args]
+
+  ingest <roadmap.md>          Parse roadmap markdown -> epics + deps
+  split <roadmap.md>           Emit per-epic kickoff files under kickoffs/auto/
+                               and set epics.kickoff_path for each.
+  list [--status STATUS]       List epics (default: active, non-archived)
+  ready                        List ready-to-dispatch epics
+  show <epic_id>               Show one epic + its deps
+EOF
+}
+
+# Split a roadmap markdown into per-epic kickoff files.
+# Each ## heading -> kickoffs/auto/<epic_id>.md with this shape:
+#   # <title>
+#   ## Goal
+#   <body extracted from roadmap section>
+#   ## Verification commands
+#   - shellcheck <touched files inferred from body backticks>
+#   (or a fallback bash -n / shellcheck on the recipe's own files)
+#
+# Then UPDATE epics.kickoff_path = kickoffs/auto/<epic_id>.md.
+_split() {
+  local roadmap="${1:?roadmap.md path required}"
+  [ -f "$roadmap" ] || { echo "no such file: $roadmap" >&2; exit 2; }
+  python3 - "$STATE_DB" "$roadmap" "$MINI_ORK_ROOT" <<'PY'
+import re, sqlite3, sys
+from pathlib import Path
+
+db, roadmap, repo_root = sys.argv[1:4]
+repo_root = Path(repo_root)
+text = Path(roadmap).read_text(encoding="utf-8", errors="replace")
+
+EPIC_RE = re.compile(r"^##\s+(.+?)\s*(?:\(id:\s*([\w.-]+)\))?\s*$")
+DEP_PATTERNS = (
+    r"^\s*-\s+(?:depends on|blocked by|after|requires|should follow|prefer after|related to|see also|context)\s*:.*$"
+)
+DEP_RE = re.compile(DEP_PATTERNS, re.I)
+
+def slugify(title: str) -> str:
+    s = re.sub(r"[^a-z0-9-]+", "-", title.lower().strip()).strip("-")
+    return s or "epic"
+
+def extract_path_hints(body):
+    """Find backtick'd file paths in the body; treat as scope hints."""
+    paths = re.findall(r"`([a-z_][\w./-]*\.(?:sh|py|sql|md|yaml|yml|json|ts|tsx|js|jsx))`", body, re.I)
+    paths += re.findall(r"`(bin/[\w-]+)`", body)
+    paths += re.findall(r"`(lib/[\w_-]+\.sh)`", body)
+    paths += re.findall(r"`(recipes/[\w-]+/?[\w./-]*)`", body)
+    return list(dict.fromkeys(paths))
+
+def synthesize_verification(paths):
+    """Pick a verification command set from path hints."""
+    shells = [p for p in paths if p.endswith(".sh") or p.startswith("bin/")]
+    pys = [p for p in paths if p.endswith(".py")]
+    sqls = [p for p in paths if p.endswith(".sql")]
+    cmds = []
+    if shells:
+        cmds.append("shellcheck " + " ".join(shells[:5]))
+    if pys:
+        cmds.append("python3 -m py_compile " + " ".join(pys[:5]))
+    if sqls:
+        cmds.append("# Apply: sqlite3 .mini-ork/state.db < " + sqls[0])
+    if not cmds:
+        cmds = [
+            "bash -n bin/mini-ork-epics bin/mini-ork-scheduler",
+            "bash tests/integration/test_autonomous_epic_pipeline.sh",
+        ]
+    return cmds
+
+# Parse roadmap into (id, title, body)
+epics = []
+cur = None
+for raw in text.splitlines():
+    m = EPIC_RE.match(raw)
+    if m:
+        title, explicit_id = m.group(1).strip(), (m.group(2) or "").strip()
+        eid = explicit_id or slugify(title)
+        cur = {"id": eid, "title": title, "body": []}
+        epics.append(cur)
+    elif cur is not None:
+        cur["body"].append(raw)
+
+if not epics:
+    print("split: no '## <title>' headings found", file=sys.stderr)
+    sys.exit(1)
+
+# Dedupe ids (same as ingest does).
+seen, deduped = set(), []
+for e in epics:
+    if e["id"] in seen:
+        e["id"] = f"{e['id']}-{len(deduped)}"
+    seen.add(e["id"])
+    deduped.append(e)
+epics = deduped
+
+out_dir = repo_root / "kickoffs" / "auto"
+out_dir.mkdir(parents=True, exist_ok=True)
+
+con = sqlite3.connect(db)
+con.execute("PRAGMA busy_timeout=5000")
+
+written = 0
+for e in epics:
+    # Strip dep markers from the body so they don't appear in the kickoff body.
+    body_lines = [ln for ln in e["body"] if not DEP_RE.match(ln)]
+    # Strip leading/trailing blank lines.
+    while body_lines and not body_lines[0].strip():
+        body_lines.pop(0)
+    while body_lines and not body_lines[-1].strip():
+        body_lines.pop()
+    body = "\n".join(body_lines).strip()
+    path_hints = extract_path_hints(body)
+    verify_cmds = synthesize_verification(path_hints)
+
+    kickoff_rel = f"kickoffs/auto/{e['id']}.md"
+    kickoff_abs = repo_root / kickoff_rel
+
+    parts = [
+        f"# {e['title']}",
+        "",
+        "## Goal",
+        "",
+        body or "(no body extracted from roadmap)",
+        "",
+    ]
+    if path_hints:
+        parts.extend([
+            "## Scope Hint",
+            "",
+            *[f"- `{p}`" for p in path_hints[:10]],
+            "",
+        ])
+    parts.extend([
+        "## Verification commands",
+        "",
+        *[f"- `{c}`" for c in verify_cmds],
+        "",
+        "## Done When",
+        "",
+        "- `${MINI_ORK_RUN_DIR}/panel-verdict.json` contains `\"verdict\": \"pass\"` with all verifiers passing.",
+        "- All verification commands pass in the isolated worktree.",
+        "",
+        "_Auto-generated by `mini-ork epics split` from "
+        f"{Path(roadmap).name}._",
+        "",
+    ])
+    kickoff_abs.write_text("\n".join(parts), encoding="utf-8")
+
+    # Update kickoff_path so the scheduler's _resolve_kickoff finds it first.
+    con.execute(
+        "UPDATE epics SET kickoff_path=? WHERE id=?",
+        (kickoff_rel, e["id"]),
+    )
+    written += 1
+
+con.commit()
+con.close()
+print(f"split: wrote {written} kickoff(s) under kickoffs/auto/ + updated kickoff_path")
+PY
+}
+
+
+_ingest() {
+  local roadmap="${1:?roadmap.md path required}"
+  [ -f "$roadmap" ] || { echo "no such file: $roadmap" >&2; exit 2; }
+  python3 - "$STATE_DB" "$roadmap" <<'PY'
+import re, sqlite3, sys
+from pathlib import Path
+
+db, roadmap = sys.argv[1:3]
+text = Path(roadmap).read_text(encoding="utf-8", errors="replace")
+
+# Parse: split by `## ` headings. Body = lines until next ## heading.
+EPIC_RE = re.compile(r"^##\s+(.+?)\s*(?:\(id:\s*([\w.-]+)\))?\s*$")
+DEP_RES = {
+    "hard": re.compile(r"^\s*-\s+(?:depends on|blocked by|after|requires)\s*:\s*(.+)$", re.I),
+    "soft": re.compile(r"^\s*-\s+(?:should follow|prefer after)\s*:\s*(.+)$", re.I),
+    "informational": re.compile(r"^\s*-\s+(?:related to|see also|context)\s*:\s*(.+)$", re.I),
+}
+
+def slugify(title: str) -> str:
+    s = re.sub(r"[^a-z0-9-]+", "-", title.lower().strip()).strip("-")
+    return s or "epic"
+
+epics = []  # (id, title, body_lines)
+cur = None
+for raw in text.splitlines():
+    m = EPIC_RE.match(raw)
+    if m:
+        title, explicit_id = m.group(1).strip(), (m.group(2) or "").strip()
+        eid = explicit_id or slugify(title)
+        cur = {"id": eid, "title": title, "body": []}
+        epics.append(cur)
+    elif cur is not None:
+        cur["body"].append(raw)
+
+if not epics:
+    print("ingest: no '## <title>' headings found", file=sys.stderr)
+    sys.exit(1)
+
+# Dedupe ids — preserve first.
+seen, deduped = set(), []
+for e in epics:
+    if e["id"] in seen:
+        e["id"] = f"{e['id']}-{len(deduped)}"
+    seen.add(e["id"])
+    deduped.append(e)
+epics = deduped
+
+con = sqlite3.connect(db)
+con.execute("PRAGMA busy_timeout=5000")
+
+inserted, dep_count = 0, 0
+for e in epics:
+    # 1. Upsert the epic row. New epics default to 'not started'; existing
+    #    rows are left alone (so re-ingest doesn't clobber in-flight state).
+    exists = con.execute("SELECT id FROM epics WHERE id=?", (e["id"],)).fetchone()
+    if not exists:
+        con.execute(
+            "INSERT INTO epics(id, title, status) VALUES(?,?,'not started')",
+            (e["id"], e["title"][:200]),
+        )
+        inserted += 1
+    # 2. Scan body for dep markers; insert as edges.
+    for line in e["body"]:
+        for kind, rgx in DEP_RES.items():
+            m = rgx.match(line)
+            if not m:
+                continue
+            for raw_dep in re.split(r"[,\s]+", m.group(1)):
+                dep = raw_dep.strip().strip("`")
+                if not dep or dep == e["id"]:
+                    continue
+                try:
+                    con.execute(
+                        """INSERT OR IGNORE INTO epic_dependencies
+                            (from_epic_id, to_epic_id, kind)
+                            VALUES(?,?,?)""",
+                        (dep, e["id"], kind),
+                    )
+                    dep_count += 1
+                except sqlite3.Error as err:
+                    print(f"ingest: dep insert failed ({dep}->{e['id']}): {err}", file=sys.stderr)
+
+# 3. Auto-block any epic that has at least one unresolved hard dep AND is
+#    currently 'not started' — the scheduler skips 'blocked' epics until
+#    epic_graph_on_done flips them.
+con.execute("""
+    UPDATE epics
+       SET status='blocked'
+     WHERE status='not started'
+       AND id IN (
+           SELECT DISTINCT to_epic_id FROM epic_dependencies
+            WHERE kind='hard' AND resolved_at IS NULL
+       )
+""")
+con.commit()
+print(f"ingest: {inserted} new epic(s), {dep_count} dep edge(s) processed")
+PY
+}
+
+_list() {
+  local status_filter=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --status) status_filter="$2"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+  local clause=""
+  [ -n "$status_filter" ] && clause="WHERE status='$status_filter' AND archived_at IS NULL"
+  [ -z "$status_filter" ] && clause="WHERE archived_at IS NULL"
+  sqlite3 -separator ' | ' "$STATE_DB" \
+    "SELECT printf('%-22s', id), printf('%-15s', status), substr(title,1,60) FROM epics $clause ORDER BY created_at;"
+}
+
+_ready() {
+  epic_graph_ready_now
+}
+
+_show() {
+  local epic_id="${1:?epic_id required}"
+  echo "=== epic ==="
+  sqlite3 -line "$STATE_DB" \
+    "SELECT id, title, status, created_at, updated_at FROM epics WHERE id='$epic_id';"
+  echo
+  echo "=== deps (incoming — must be 'done' for this epic to run) ==="
+  sqlite3 -separator ' | ' "$STATE_DB" \
+    "SELECT printf('%-22s', from_epic_id), printf('%-15s', kind),
+            CASE WHEN resolved_at IS NULL THEN 'UNRESOLVED' ELSE 'resolved' END
+       FROM epic_dependencies WHERE to_epic_id='$epic_id' ORDER BY kind;"
+  echo
+  echo "=== deps (outgoing — this epic blocks these) ==="
+  sqlite3 -separator ' | ' "$STATE_DB" \
+    "SELECT printf('%-22s', to_epic_id), printf('%-15s', kind),
+            CASE WHEN resolved_at IS NULL THEN 'UNRESOLVED' ELSE 'resolved' END
+       FROM epic_dependencies WHERE from_epic_id='$epic_id' ORDER BY kind;"
+}
+
+sub="${1:-help}"; shift || true
+case "$sub" in
+  ingest) _ingest "$@" ;;
+  split)  _split  "$@" ;;
+  list)   _list   "$@" ;;
+  ready)  _ready  "$@" ;;
+  show)   _show   "$@" ;;
+  help|--help|-h) _usage ;;
+  *) echo "Unknown subcommand: $sub" >&2; _usage; exit 2 ;;
+esac

@@ -1,0 +1,239 @@
+#!/usr/bin/env python3
+"""mini-ork-mcp-steering — MCP server exposing operator_steering as a tool.
+
+Standalone stdio MCP server (JSON-RPC 2.0 over stdin/stdout per the
+Model Context Protocol spec). Exposes ONE tool:
+
+    get_operator_steering(run_id: str, role: str) -> list[dict]
+
+Returns unconsumed, unexpired operator-steering rows targeted at the
+given run_id + role. Each call marks rows consumed so a worker never
+sees the same guidance twice.
+
+This is the Phase 3 surface from
+docs/research/2026-06-15-mid-node-injection.md — a pull-based mid-call
+injection channel that both codex (codex mcp add ...) and claude
+(claude --mcp-config ...) consume natively. Workers are told to call
+the tool between major decisions; they receive any queued supervisor
+guidance + incorporate it before continuing.
+
+Registration:
+
+    # codex
+    codex mcp add mini-ork-steering -- mini-ork-mcp-steering
+
+    # claude (per-invocation)
+    claude --mcp-config '{"mcpServers":{"mini-ork-steering":\\
+      {"command":"mini-ork-mcp-steering","args":[]}}}' ...
+
+Recipe prompt addition (one line):
+
+    Before any non-trivial decision, call
+    get_operator_steering(run_id="$MINI_ORK_RUN_ID", role="implementer")
+    and incorporate any returned guidance into your next step.
+
+Wire protocol: stdio, line-delimited JSON-RPC 2.0. Handles initialize,
+tools/list, tools/call. Logging goes to stderr (stdout is the
+protocol channel — never write to it directly).
+
+State source: ${MINI_ORK_DB:-${MINI_ORK_HOME:-$PWD/.mini-ork}/state.db}
+"""
+
+import json
+import os
+import sqlite3
+import sys
+import time
+
+VERSION = "0.1.0"
+
+
+def _log(msg: str) -> None:
+    """Stderr-only logging; stdout is the MCP protocol channel."""
+    print(f"[mini-ork-mcp-steering] {msg}", file=sys.stderr, flush=True)
+
+
+def _db_path() -> str:
+    explicit = os.environ.get("MINI_ORK_DB")
+    if explicit:
+        return explicit
+    home = os.environ.get("MINI_ORK_HOME") or os.path.join(os.getcwd(), ".mini-ork")
+    return os.path.join(home, "state.db")
+
+
+def _now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def get_operator_steering(run_id: str, role: str) -> list[dict]:
+    """Fetch + consume unconsumed steering rows for (run_id, role).
+
+    Returns up to 10 rows ordered by severity DESC, confidence DESC,
+    created_at DESC. Same ordering as lib/operator_steering.sh.
+    """
+    db = _db_path()
+    if not os.path.exists(db):
+        _log(f"db not found: {db}")
+        return []
+    now_ms = _now_ms()
+    con = sqlite3.connect(db, timeout=5.0)
+    con.execute("PRAGMA busy_timeout = 5000")
+    try:
+        cur = con.execute(
+            """SELECT id, run_id, role_target, severity, message, source,
+                      confidence, created_at, expires_at
+                 FROM operator_steering
+                WHERE consumed_at IS NULL
+                  AND expires_at > ?
+                  AND (run_id = ? OR run_id IS NULL)
+                  AND (role_target = ? OR role_target = 'any')
+                ORDER BY
+                  CASE severity WHEN 'critical' THEN 3 WHEN 'warn' THEN 2 ELSE 1 END DESC,
+                  confidence DESC,
+                  created_at DESC
+                LIMIT 10""",
+            (now_ms, run_id or "", role),
+        )
+        rows = cur.fetchall()
+        out = []
+        ids = []
+        for r in rows:
+            ids.append(r[0])
+            out.append({
+                "id": r[0],
+                "run_id": r[1],
+                "role_target": r[2],
+                "severity": r[3],
+                "message": r[4],
+                "source": r[5],
+                "confidence": r[6],
+                "created_at": r[7],
+                "expires_at": r[8],
+            })
+        if ids:
+            placeholders = ",".join("?" for _ in ids)
+            con.execute(
+                f"UPDATE operator_steering SET consumed_at = ? WHERE id IN ({placeholders})",
+                [now_ms, *ids],
+            )
+            con.commit()
+        return out
+    finally:
+        con.close()
+
+
+# ── MCP JSON-RPC 2.0 protocol surface ─────────────────────────────────────
+
+TOOL_DEFS = [{
+    "name": "get_operator_steering",
+    "description": (
+        "Returns operator-supervisor guidance queued for the current run + agent role. "
+        "Call this between major decisions — before file edits, before committing, when "
+        "you're unsure how to proceed, or when finishing a logical step. Returns an empty "
+        "list when no guidance is queued. Each row is consumed exactly once per call, so "
+        "calling repeatedly is safe."
+    ),
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "run_id": {
+                "type": "string",
+                "description": "The mini-ork run id (from MINI_ORK_RUN_ID env var)",
+            },
+            "role": {
+                "type": "string",
+                "enum": ["planner", "implementer", "reviewer", "verifier", "any"],
+                "description": "Your agent role for this dispatch",
+            },
+        },
+        "required": ["run_id", "role"],
+    },
+}]
+
+
+def _send(obj: dict) -> None:
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+
+
+def _handle(req: dict) -> dict | None:
+    method = req.get("method")
+    req_id = req.get("id")
+    params = req.get("params") or {}
+
+    if method == "initialize":
+        return {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "mini-ork-steering", "version": VERSION},
+            },
+        }
+
+    if method == "notifications/initialized":
+        # Per spec, no response for notifications
+        return None
+
+    if method == "tools/list":
+        return {"jsonrpc": "2.0", "id": req_id, "result": {"tools": TOOL_DEFS}}
+
+    if method == "tools/call":
+        tool = params.get("name")
+        args = params.get("arguments") or {}
+        if tool == "get_operator_steering":
+            run_id = str(args.get("run_id") or "")
+            role = str(args.get("role") or "any")
+            rows = get_operator_steering(run_id, role)
+            return {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "result": {
+                    "content": [{
+                        "type": "text",
+                        "text": json.dumps(rows, indent=2),
+                    }],
+                    "isError": False,
+                },
+            }
+        return {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "error": {"code": -32601, "message": f"unknown tool: {tool}"},
+        }
+
+    return {
+        "jsonrpc": "2.0",
+        "id": req_id,
+        "error": {"code": -32601, "message": f"unknown method: {method}"},
+    }
+
+
+def main() -> int:
+    _log(f"started v{VERSION} db={_db_path()}")
+    for raw in sys.stdin:
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            req = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            _log(f"bad json: {exc}")
+            continue
+        try:
+            resp = _handle(req)
+        except Exception as exc:
+            _log(f"handler error: {exc}")
+            resp = {
+                "jsonrpc": "2.0",
+                "id": req.get("id"),
+                "error": {"code": -32603, "message": str(exc)},
+            }
+        if resp is not None:
+            _send(resp)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
