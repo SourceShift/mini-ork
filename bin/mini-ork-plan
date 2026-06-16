@@ -200,6 +200,15 @@ if [ "${MO_INJECT_LEARNINGS:-1}" = "1" ] && [ -f "$MINI_ORK_ROOT/lib/context_ass
     _cn_sess_block="$(context_contextnest_recent_sessions_md "$KICKOFF" 4 || true)"
     [ -n "$_cn_sess_block" ] && PROMPT_TEXT="${PROMPT_TEXT}"$'\n\n'"${_cn_sess_block}"$'\n'
   fi
+  # HarnessBridge Technique 1: Active-State Index block — surfaces
+  # unresolved_errors + open_constraints + established_facts +
+  # pending_goals from live state.db so the planner doesn't reconstruct
+  # what state it's in from chronological history. Gated by
+  # MO_DISABLE_ACTIVE_STATE=1; silent when no live state.
+  if declare -f context_active_state_md >/dev/null 2>&1; then
+    _asi_block="$(context_active_state_md "${TASK_CLASS:-__any__}" 30 || true)"
+    [ -n "$_asi_block" ] && PROMPT_TEXT="${PROMPT_TEXT}"$'\n\n'"${_asi_block}"$'\n'
+  fi
   # ContextPack artifact: the full bounded bundle (prior runs, failure
   # modes, prefs, constraints — each item cite-tagged) persisted next to
   # plan.json. The md blocks above are what the prompt gets; this is the
