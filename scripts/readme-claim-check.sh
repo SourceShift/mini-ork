@@ -119,7 +119,7 @@ fi
 # Probe 4 — recipes table row count vs actual recipes/ dirs
 recipes_actual=$(count_subdirs recipes)
 recipes_table_rows=$(awk '/^### RECIPES/,/^Add your own/' "$MO_README" \
-                     | grep -cE '^\| `[a-z-]+` \|')
+                     | grep -cE '^\| `[a-z0-9-]+` \|')
 add_probe "recipes table rows" "$recipes_actual" "$recipes_table_rows"
 
 # Probe 5 — providers count claim
