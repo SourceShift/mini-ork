@@ -12,7 +12,7 @@
   },
   "dependencies": {
     "@tanstack/react-query": "^5.51.0",
-    "@tanstack/react-router": "^1.46.0",
+    "@tanstack/react-router": "^1.170.16",
     "@xyflow/react": "^12.3.0",
     "clsx": "^2.1.1",
     "lucide-react": "^0.439.0",
