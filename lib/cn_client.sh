@@ -30,8 +30,8 @@
 [ "${0:-}" = "${BASH_SOURCE[0]:-}" ] && set -Eeuo pipefail
 
 CN_BASE_URL="${CN_BASE_URL:-http://127.0.0.1:28080}"
-CN_TIMEOUT_SEC="${CN_TIMEOUT_SEC:-2}"
-CN_HOOK_TIMEOUT_SEC="${CN_HOOK_TIMEOUT_SEC:-1}"
+CN_TIMEOUT_SEC="${CN_TIMEOUT_SEC:-8}"  # bumped from 2 → 8 in PR-1: 2s silently empties retrieve on ~500-char planner briefs (cn_retrieve curl times out → fallback `echo "{}"` → planner gets no atoms with no error). 8s comfortably covers embedder fan-out for typical brief sizes against a populated substrate. Override lower (e.g. CN_TIMEOUT_SEC=2) only in tests.
+CN_HOOK_TIMEOUT_SEC="${CN_HOOK_TIMEOUT_SEC:-3}"  # bumped from 1 → 3 in PR-1: 1s silently flips cn_available to "down" intermittently when CN's health endpoint takes 0.8-1s under load (consolidation worker active on a populated substrate). 3s comfortably covers the steady-state health-check latency without making the fire-and-forget hook posts feel slow. The hook curls themselves still set --max-time CN_HOOK_TIMEOUT_SEC so a truly dead CN doesn't block Claude's hook loop.
 CN_PING_TTL="${CN_PING_TTL:-30}"
 
 _cn_disabled() { [ "${MO_DISABLE_CN:-0}" = "1" ]; }
@@ -55,7 +55,14 @@ cn_available() {
     fi
   fi
   local code
-  code=$(curl -s -o /dev/null -w '%{http_code}' --max-time "$CN_HOOK_TIMEOUT_SEC" \
+  # Reachability probe uses CN_TIMEOUT_SEC (read budget) not CN_HOOK_TIMEOUT_SEC
+  # (fire-and-forget budget). PR-1 evidence: under populated substrate +
+  # consolidation worker contention, /health latency varies 0.5-3s and a 3s
+  # cap times out 30% of the time. Read-call budget (8s) is the right shape
+  # for "is the substrate reachable enough to trust a read?" — hook posts
+  # remain on the tighter CN_HOOK_TIMEOUT_SEC budget because losing a hook
+  # post is cheaper than blocking the planner.
+  code=$(curl -s -o /dev/null -w '%{http_code}' --max-time "$CN_TIMEOUT_SEC" \
     "$CN_BASE_URL/api/v1/substrate/health" 2>/dev/null || echo "000")
   if [ "$code" = "200" ]; then
     printf '%s up\n' "$now" > "$cache" 2>/dev/null
@@ -76,6 +83,51 @@ _cn_post_json() {
 _cn_get() {
   local path="$1"
   curl -s --max-time "$CN_TIMEOUT_SEC" "$CN_BASE_URL$path" 2>/dev/null || echo "{}"
+}
+
+# desc: GET raw text response (no JSON-shape fallback). Used for the
+#       capsule endpoint which returns text/markdown. Empty string on
+#       failure so callers can distinguish "no content" from JSON {} hits.
+_cn_get_text() {
+  local path="$1"
+  curl -s --max-time "$CN_TIMEOUT_SEC" "$CN_BASE_URL$path" 2>/dev/null || echo ""
+}
+
+# desc: Fetch the deterministic kind-ordered prompt-context capsule.
+#       CN clusters atoms by kind, orders by what an agent most needs
+#       to know first (risks → decisions → failures → directives →
+#       verifications → evidence → reads → artifacts → assumptions),
+#       and renders ready-to-paste markdown. Strictly better signal than
+#       flat retrieve for planner consumption.
+#
+#       Args:
+#         $1  query     Optional substring filter (case-insensitive over
+#                       cluster normalized text). Empty = no filter.
+#         $2  since     Duration like "14d", "48h", "30m". Default "14d".
+#         $3  project   Optional cwd substring to scope clusters to.
+#
+#       Returns: markdown text (multi-line) or empty string. Empty when
+#       CN is down/disabled OR substrate has no atoms matching filters
+#       OR capsule renderer dropped all clusters (caller's responsibility
+#       to fall back to cn_retrieve if needed).
+cn_capsule() {
+  local query="${1:-}"
+  local since="${2:-14d}"
+  local project="${3:-}"
+  _cn_disabled && { echo ""; return 0; }
+  cn_available || { echo ""; return 0; }
+  local qs="since=$since"
+  if [ -n "$query" ]; then
+    local encoded_q
+    encoded_q=$(python3 -c 'import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=""))' "$query")
+    qs="$qs&query=$encoded_q"
+  fi
+  if [ -n "$project" ]; then
+    local encoded_p
+    encoded_p=$(python3 -c 'import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=""))' "$project")
+    qs="$qs&project=$encoded_p"
+  fi
+  _cn_get_text "/api/v1/prompt-context/capsule?$qs"
 }
 
 # desc: Semantic retrieve. Returns CN's raw JSON ({"hits":[...]} or {}).
