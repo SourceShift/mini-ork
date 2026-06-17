@@ -191,6 +191,181 @@ cn_features_recent() {
   _cn_get "/api/v1/features?$q"
 }
 
+# desc: Topic-cluster basins via /api/v1/field/basins. Returns
+#       attractor-formed clusters with member counts + representative
+#       fragment id. Filterable by project_cwd substring.
+#
+#       Args:
+#         $1  project (optional substring filter)
+#         $2  limit (default 20 — capped server-side anyway)
+#
+#       PR-3 use: planner pack surfaces top basins so the LLM sees
+#       "here are the 3 dominant topics in this project's recent work"
+#       before deciding scope. Concrete example: planner kicking off a
+#       chapter-anchor schema task sees the basin titled "book-chapter
+#       schema migration" with 12 fragments → knows there's recent
+#       coherent work in this area without re-reading git log.
+cn_basins() {
+  local project="${1:-}"
+  local limit="${2:-20}"
+  _cn_disabled && { echo "{}"; return 0; }
+  cn_available || { echo "{}"; return 0; }
+  local q="limit=$limit"
+  if [ -n "$project" ]; then
+    local encoded
+    encoded=$(python3 -c 'import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=""))' "$project")
+    q="$q&project=$encoded"
+  fi
+  _cn_get "/api/v1/field/basins?$q"
+}
+
+# desc: Graph neighbours of a fragment via /api/v1/connections. Returns
+#       similarity-driven edges built by the consolidation worker.
+#
+#       Args:
+#         $1  node_id (fragment id; required)
+#         $2  limit (default 8)
+#
+#       PR-3 use: implementer pack expands the top retrieved hit by
+#       graph-neighbouring it — surfaces atoms semantically adjacent
+#       to the primary match without requiring the planner to know
+#       the exact query.
+cn_connections_for() {
+  local node_id="${1:?node_id required}"
+  local limit="${2:-8}"
+  _cn_disabled && { echo "{}"; return 0; }
+  cn_available || { echo "{}"; return 0; }
+  local encoded
+  encoded=$(python3 -c 'import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=""))' "$node_id")
+  _cn_get "/api/v1/connections?node_id=$encoded&limit=$limit"
+}
+
+# desc: Inbox filtered by urgency. CN's /api/v1/inbox returns all
+#       attention items; this wrapper pre-filters to a single urgency
+#       tier (now / soon / later). Defaults to no filter (alias to
+#       cn_inbox).
+#
+#       Args:
+#         $1  urgency (now|soon|later; empty = no filter)
+#         $2  limit (default 10)
+#
+#       PR-3 use: planner pack surfaces only urgency=now items so the
+#       LLM knows what's blocking the user RIGHT NOW. Reviewer pack
+#       can pull urgency=later for backlog awareness.
+cn_inbox_filtered() {
+  local urgency="${1:-}"
+  local limit="${2:-10}"
+  _cn_disabled && { echo "{}"; return 0; }
+  cn_available || { echo "{}"; return 0; }
+  local q="limit=$limit"
+  [ -n "$urgency" ] && q="$q&urgency=$urgency"
+  _cn_get "/api/v1/inbox?$q"
+}
+
+# desc: Render a markdown block summarising recent ContextNest features
+#       relevant to a given layer (frontend / backend / infra / docs /
+#       tests / other). Used by the implementer pack to surface "what
+#       shipped nearby in the last 48h" so workers don't duplicate
+#       recently-merged work.
+#
+#       Args:
+#         $1  features_json (from cn_features_recent)
+#         $2  cwd (current project cwd, for "this project" tagging)
+#         $3  limit (default 6)
+#
+#       Returns empty when no features. Caller appends unconditionally.
+cn_render_features_md() {
+  local json="${1:?features json required}"
+  local cwd="${2:-}"
+  local limit="${3:-6}"
+  python3 - "$json" "$cwd" "$limit" <<'PY' 2>/dev/null || true
+import json, sys
+try:
+    data = json.loads(sys.argv[1])
+except Exception:
+    sys.exit(0)
+features = data.get("features") or data.get("items") or []
+if not features:
+    sys.exit(0)
+cwd = sys.argv[2]
+limit = int(sys.argv[3])
+print("--- ContextNest features delivered recently ---")
+for f in features[:limit]:
+    name = (f.get("feature") or f.get("name") or "").strip()
+    layer = f.get("layer", "?")
+    htt = (f.get("how_to_test") or "").strip()
+    pcwd = (f.get("project_cwd") or "")
+    here = " [this project]" if cwd and pcwd and (cwd in pcwd or pcwd in cwd) else ""
+    print(f"- ({layer}){here} {name}")
+    if htt:
+        print(f"  test: {htt[:160]}")
+print("--- /ContextNest features ---")
+PY
+}
+
+# desc: Render a markdown block surfacing inbox items (filtered by
+#       urgency upstream via cn_inbox_filtered). Empty when no items.
+#
+#       Args:
+#         $1  inbox_json (from cn_inbox or cn_inbox_filtered)
+#         $2  limit (default 5)
+cn_render_inbox_md() {
+  local json="${1:?inbox json required}"
+  local limit="${2:-5}"
+  python3 - "$json" "$limit" <<'PY' 2>/dev/null || true
+import json, sys
+try:
+    d = json.loads(sys.argv[1])
+except Exception:
+    sys.exit(0)
+items = d.get("items") or d.get("inbox") or []
+if not items:
+    sys.exit(0)
+limit = int(sys.argv[2])
+print("--- ContextNest attention inbox ---")
+for it in items[:limit]:
+    kind = it.get("kind", "?")
+    sid = (it.get("session_id") or it.get("id", ""))[:8]
+    text = (it.get("content") or it.get("subject") or it.get("action") or "").strip().replace("\n", " ")
+    if len(text) > 160:
+        text = text[:157] + "..."
+    print(f"- [{kind} {sid}] {text}")
+print("--- /ContextNest attention inbox ---")
+PY
+}
+
+# desc: Render a markdown block summarising basin topic clusters.
+#       Helps planner see "what topics dominate recent work" before
+#       deciding the plan's scope.
+#
+#       Args:
+#         $1  basins_json (from cn_basins)
+#         $2  limit (default 5)
+cn_render_basins_md() {
+  local json="${1:?basins json required}"
+  local limit="${2:-5}"
+  python3 - "$json" "$limit" <<'PY' 2>/dev/null || true
+import json, sys
+try:
+    d = json.loads(sys.argv[1])
+except Exception:
+    sys.exit(0)
+basins = d.get("basins") or d.get("items") or []
+if not basins:
+    sys.exit(0)
+limit = int(sys.argv[2])
+print("--- ContextNest topic clusters (basins) ---")
+for b in basins[:limit]:
+    bid = (b.get("basin_id") or b.get("id", ""))[:8]
+    mass = b.get("active_mass") or b.get("mass") or b.get("size") or 0
+    rep = (b.get("representative") or b.get("centroid_text") or "").strip().replace("\n", " ")
+    if len(rep) > 160:
+        rep = rep[:157] + "..."
+    print(f"- [{bid} mass={mass}] {rep}")
+print("--- /ContextNest topic clusters ---")
+PY
+}
+
 # desc: Fire-and-forget hook POST to CN. event is one of session_start,
 #       user_prompt_submit, stop, subagent_stop, task_completed.
 #       Never blocks; never fails the caller.
