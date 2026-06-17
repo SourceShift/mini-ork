@@ -186,16 +186,29 @@ if [ "${MO_INJECT_LEARNINGS:-1}" = "1" ] && [ -f "$MINI_ORK_ROOT/lib/context_ass
     _prior_block="$(context_prior_runs_md "${TASK_CLASS:-generic}" 5 || true)"
     [ -n "$_prior_block" ] && PROMPT_TEXT="${PROMPT_TEXT}"$'\n\n'"${_prior_block}"$'\n'
   fi
-  # ContextNest cross-session substrate. Surfaces atoms (decisions, learnings,
-  # risk_flags, prompt_directives) from prior Claude Code sessions — fresh
-  # data the local sqlite memory doesn't have. Gated by MO_DISABLE_CN=1 and
-  # silent when CN is unreachable so the planner never blocks on it.
-  # Restored 2026-06-16 after PR #18 silently dropped this wire-up
-  # (regression caught by scripts/smoke-cn-bridge.sh).
-  if declare -f context_contextnest_atoms_md >/dev/null 2>&1; then
+  # ContextNest cross-session substrate. PR-3 (2026-06-17): try the
+  # role-tailored planner pack first (capsule + by-intent + inbox +
+  # basins), fall back to the generic capsule-or-retrieve block from
+  # context_contextnest_atoms_md when role packs are disabled or empty.
+  # Gated by MO_DISABLE_CN=1 and silent when CN unreachable.
+  _cn_planner_pack=""
+  if [ "${MO_USE_ROLE_PACKS:-1}" = "1" ] && [ -f "$MINI_ORK_ROOT/lib/context_role_packs.sh" ]; then
+    # shellcheck source=../lib/context_role_packs.sh
+    source "$MINI_ORK_ROOT/lib/context_role_packs.sh"
+    if declare -f context_role_pack_md >/dev/null 2>&1; then
+      _cn_planner_pack="$(context_role_pack_md planner "$KICKOFF" "" || true)"
+      [ -n "$_cn_planner_pack" ] && PROMPT_TEXT="${PROMPT_TEXT}"$'\n\n'"${_cn_planner_pack}"$'\n'
+    fi
+  fi
+  # Fallback: when role pack returned nothing (CN down, capsule empty,
+  # MO_USE_ROLE_PACKS=0), still try the generic atoms_md block so the
+  # planner gets SOMETHING when possible.
+  if [ -z "$_cn_planner_pack" ] && declare -f context_contextnest_atoms_md >/dev/null 2>&1; then
     _cn_atoms_block="$(context_contextnest_atoms_md "$KICKOFF" 6 || true)"
     [ -n "$_cn_atoms_block" ] && PROMPT_TEXT="${PROMPT_TEXT}"$'\n\n'"${_cn_atoms_block}"$'\n'
   fi
+  # Recent-sessions block runs regardless — adds file-touch history
+  # when the brief includes files[]/paths[]/relevant_files[]/targets[].
   if declare -f context_contextnest_recent_sessions_md >/dev/null 2>&1; then
     _cn_sess_block="$(context_contextnest_recent_sessions_md "$KICKOFF" 4 || true)"
     [ -n "$_cn_sess_block" ] && PROMPT_TEXT="${PROMPT_TEXT}"$'\n\n'"${_cn_sess_block}"$'\n'
