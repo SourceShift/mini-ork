@@ -74,6 +74,17 @@ class H(BaseHTTPRequestHandler):
             self._send_json(200, {"features": [
                 {"feature": "stub feature", "layer": "backend", "how_to_test": "curl localhost"}
             ]}); return
+        if self.path.startswith("/api/v1/prompt-context/capsule"):
+            md = ("# Prompt Context\n\n"
+                  "## Risks\n- [risk_flag x3] stub capsule risk\n\n"
+                  "## Decisions\n- [decision_made x2] stub capsule decision\n")
+            body = md.encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/markdown; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         self._send_json(404, {"error": "not found"})
 
     def do_POST(self):
@@ -156,6 +167,14 @@ cn_hook_post "session_start" "test-session-XYZ" "/tmp" ""
 sleep 0.3
 if grep -q "hook session_start" "$STUB_LOG"; then _ok "stub received session_start"
 else _fail "stub did NOT receive session_start — log: $(cat "$STUB_LOG")"; fi
+
+echo ""
+echo "--- cn_capsule returns markdown body (PR-1) ---"
+capsule_out=$(cn_capsule "stub" "14d")
+if echo "$capsule_out" | grep -q "## Risks"; then _ok "cn_capsule returns kind-ordered markdown"
+else _fail "cn_capsule missing ## Risks section — got: '$capsule_out'"; fi
+if echo "$capsule_out" | grep -q "## Decisions"; then _ok "cn_capsule includes Decisions section"
+else _fail "cn_capsule missing ## Decisions section"; fi
 
 echo ""
 echo "--- MO_DISABLE_CN=1 short-circuits everything ---"

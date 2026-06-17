@@ -424,26 +424,36 @@ PY
 }
 
 # desc: Emit ContextNest atoms as a compact markdown block suitable for
-#       direct prompt injection. Queries CN's /api/v1/tools/retrieve with
-#       text derived from the task brief; degrades silently when CN is
-#       down or MO_DISABLE_CN=1 (caller can append unconditionally).
+#       direct prompt injection. PR-1 swap (2026-06-17): prefers CN's
+#       /api/v1/prompt-context/capsule (kind-ordered clusters, ready
+#       markdown) over the flat /tools/retrieve hit list. Falls back to
+#       retrieve when capsule returns empty (substrate too fresh for
+#       cluster aggregation, or filters drop all candidates). Degrades
+#       silently when CN is down or MO_DISABLE_CN=1 (caller can append
+#       unconditionally).
 #
 #       Args:
-#         $1  task_brief_path  Path to brief JSON (read for title/description).
-#         $2  limit            Max atoms to surface (default 5).
+#         $1  task_brief_path  Path to brief JSON or markdown.
+#         $2  limit            Max atoms to surface in retrieve fallback
+#                              (default 5). Capsule has its own server-side
+#                              cap controlled via /capsule?max_per_kind=.
 #
-#       Why this exists: mini-ork's planner has only ever seen
-#       local sqlite memory (task_memory + failure_memory). ContextNest
-#       carries the cross-session substrate fed by ALL Claude Code
-#       sessions in this install — fresh schema knowledge, recent
-#       feature deliveries, attention-inbox items. Without this fetch,
-#       the planner bakes outdated assumptions into plans (see chapter-
-#       anchor drift audit, 2026-06-15).
+#       Why capsule first: capsule deduplicates atoms into clusters and
+#       orders them by what a planning agent most needs to know first
+#       (risks → decisions → failures → directives → verifications →
+#       evidence → reads → artifacts → assumptions). Same substrate,
+#       strictly better signal for prompt injection.
 #
-#       Restored 2026-06-16 after PR #18 silently dropped these functions
-#       while landing an unrelated feature stack (regression caught by
-#       scripts/smoke-cn-bridge.sh — see Smoke Test Standard in
-#       ContextNest's docs/roadmap/epics/agent-context-pack.md).
+#       Why retrieve fallback: capsule depends on atoms having `kind`
+#       metadata; some legacy atoms don't. On a freshly-ingested or
+#       under-populated substrate the capsule may return nothing where
+#       retrieve still finds nearest-neighbour hits.
+#
+#       Why exists at all: mini-ork's planner has only ever seen local
+#       sqlite memory (task_memory + failure_memory). ContextNest carries
+#       the cross-session substrate fed by all Claude Code sessions in
+#       this install. Without this fetch, the planner bakes outdated
+#       assumptions into plans (see chapter-anchor drift audit, 2026-06-15).
 context_contextnest_atoms_md() {
   local task_brief_path="${1:?task_brief_path required}"
   local limit="${2:-5}"
@@ -457,7 +467,8 @@ context_contextnest_atoms_md() {
 
   # Build query from brief: prefer 'title' + first 200 chars of 'description'
   # or 'objective'. Fall back to whole file content. The query is what
-  # CN's embedder sees, so more semantic context = better retrieval.
+  # CN sees as the substring filter (capsule) AND as the embedder input
+  # (retrieve fallback), so more semantic context = better filtering.
   local query
   query=$(python3 - "$task_brief_path" <<'PY'
 import json, sys
@@ -482,6 +493,45 @@ except Exception:
 PY
 )
   [ -z "$query" ] && return 0
+
+  # Try capsule first (kind-ordered markdown, strictly better signal).
+  # Capsule's substring filter is case-insensitive over cluster normalized
+  # text; passing the full multi-sentence brief query usually under-matches,
+  # so feed it the first concept-shaped token for a more permissive filter.
+  # Empty query also valid — returns the full deterministic capsule.
+  #
+  # Concept-shaped means: alphanumeric + dash/underscore, length >=4.
+  # This skips markdown headers (`#`, `##`), bullets (`-`, `*`), code fences,
+  # and short stopword-like tokens. Falls back to empty filter (full capsule)
+  # when no qualifying token exists in the first 5 words of the brief.
+  local capsule_query
+  capsule_query=$(printf '%s' "$query" | awk '
+    {
+      for (i=1; i<=NF && i<=5; i++) {
+        tok = $i
+        # Strip leading + trailing non-alphanum
+        gsub(/^[^A-Za-z0-9]+|[^A-Za-z0-9_-]+$/, "", tok)
+        if (length(tok) >= 4) { print tok; exit }
+      }
+    }')
+  local capsule_md
+  if declare -f cn_capsule >/dev/null 2>&1; then
+    capsule_md=$(cn_capsule "$capsule_query" "14d" 2>/dev/null)
+    # Capsule renderer always emits at least the "# Prompt Context\n" header
+    # line even when no clusters match. Treat <100 chars as "effectively empty"
+    # and fall through to retrieve.
+    if [ "${#capsule_md}" -gt 100 ]; then
+      printf '%s\n%s\n%s\n' \
+        "--- ContextNest capsule (kind-ordered substrate digest) ---" \
+        "$capsule_md" \
+        "--- /ContextNest capsule ---"
+      return 0
+    fi
+  fi
+
+  # Fallback: flat retrieve hits (pre-PR-1 behaviour). Kept so capsule-empty
+  # cases (legacy atoms without kind metadata, freshly-ingested substrate)
+  # still surface something.
   local hits_json
   hits_json=$(cn_retrieve "$query" "$limit" 2>/dev/null) || return 0
   cn_render_atoms_md "$hits_json" "$limit"
