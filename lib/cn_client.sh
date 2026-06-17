@@ -391,6 +391,47 @@ print(json.dumps(p))
   return 0
 }
 
+# desc: Fire-and-forget POST to CN's PR-6 outcome endpoint
+#       (/api/v1/agent/outcome). Reports the set of atom ids a worker
+#       consumed via its prefetch + the run outcome string so CN can
+#       bump last_accessed (always) and adjust _cn_confidence_signal
+#       (±0.05 on success/failure, 0 on neutral).
+#
+#       Args:
+#         $1  outcome              "success" | "failure" | <anything-neutral>
+#         $2  atom_ids_csv         comma-separated CN atom ids (cn-...)
+#         $3  evidence (optional)  ≤480 chars, free-text snippet
+#         $4  session_id (optional) consumer session id for traceability
+#
+#       Returns: 0 always (fire-and-forget, never blocks caller).
+#       No-op when CN is down, MO_DISABLE_CN=1, or atom_ids_csv is empty.
+cn_outcome_post() {
+  local outcome="${1:?outcome required}"
+  local atom_ids_csv="${2:-}"
+  local evidence="${3:-}"
+  local session_id="${4:-}"
+  _cn_disabled && return 0
+  [ -z "$atom_ids_csv" ] && return 0
+  cn_available || return 0
+  local body
+  body=$(python3 -c '
+import json, sys
+csv = sys.argv[2]
+ids = [s.strip() for s in csv.split(",") if s.strip()]
+if not ids:
+    sys.exit(1)
+p = {"atom_ids": ids, "outcome": sys.argv[1]}
+if sys.argv[3]: p["evidence"] = sys.argv[3]
+if sys.argv[4]: p["session_id"] = sys.argv[4]
+print(json.dumps(p))
+' "$outcome" "$atom_ids_csv" "$evidence" "$session_id" 2>/dev/null) || return 0
+  curl -s -o /dev/null --max-time "$CN_HOOK_TIMEOUT_SEC" \
+    -X POST "$CN_BASE_URL/api/v1/agent/outcome" \
+    -H 'Content-Type: application/json' \
+    -d "$body" >/dev/null 2>&1 &
+  return 0
+}
+
 # desc: Render a compact markdown block from a cn_retrieve JSON payload.
 #       Returns nothing when no hits — callers can append unconditionally.
 cn_render_atoms_md() {
