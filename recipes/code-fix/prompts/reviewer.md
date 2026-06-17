@@ -13,6 +13,12 @@ no "looks good but…" answers. One of three outcomes, nothing in between.
 
 ---
 
+## Step 0 — ContextNest prefetch (read first if present)
+
+Run `ls {{MO_CN_PREFETCH_DIR}}` — if any `*.md` files exist there, cat each one. They contain semantic-retrieve atoms about prior work in this area + recent features + inbox items. Use them to spot regressions (a feature recently shipped that this PR might break) or duplicated work (a sibling session shipped the same fix). Skip silently when empty.
+
+---
+
 ## Inputs
 
 | Input | Source |
