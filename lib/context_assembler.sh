@@ -517,10 +517,25 @@ PY
   local capsule_md
   if declare -f cn_capsule >/dev/null 2>&1; then
     capsule_md=$(cn_capsule "$capsule_query" "14d" 2>/dev/null)
-    # Capsule renderer always emits at least the "# Prompt Context\n" header
-    # line even when no clusters match. Treat <100 chars as "effectively empty"
-    # and fall through to retrieve.
-    if [ "${#capsule_md}" -gt 100 ]; then
+    # Two-gate "is this capsule worth surfacing" check, then fall through
+    # to retrieve if it fails either gate:
+    #
+    #   1. char floor (CN_CAPSULE_MIN_CHARS, default 100). The renderer
+    #      always emits the "# Prompt Context" header even with zero
+    #      clusters, so a near-header-only response is effectively empty.
+    #   2. cluster presence. Each kind cluster renders a "## <heading>"
+    #      line (prompt_context.rs). A capsule padded past the char floor
+    #      by a long header/preamble but carrying NO "## " section is still
+    #      contentless for a planner — retrieve's nearest-neighbour hits
+    #      beat it. Without this gate such capsules were emitted as if
+    #      substantive, starving the planner of the retrieve fallback.
+    local min_chars="${CN_CAPSULE_MIN_CHARS:-100}"
+    local section_count
+    # grep -c already prints 0 on no match but exits 1; `|| true` swallows
+    # that exit without the `|| echo 0` antipattern (which would append a
+    # second "0" and corrupt the integer compare).
+    section_count=$(printf '%s' "$capsule_md" | grep -c '^## ' || true)
+    if [ "${#capsule_md}" -gt "$min_chars" ] && [ "${section_count:-0}" -ge 1 ]; then
       printf '%s\n%s\n%s\n' \
         "--- ContextNest capsule (kind-ordered substrate digest) ---" \
         "$capsule_md" \
