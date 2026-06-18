@@ -59,6 +59,27 @@ _assert() {
   } >> "$EVIDENCE"
 }
 
+_assert_either() {
+  # Passes when EITHER expected substring is present. Needed because
+  # context_contextnest_atoms_md emits two valid shapes since the PR-1
+  # capsule swap: the kind-ordered capsule (preferred) or the legacy
+  # flat retrieve hit list (fallback on thin/legacy substrates).
+  local name="$1" exp_a="$2" exp_b="$3" actual="$4" verdict
+  if [[ "$actual" == *"$exp_a"* || "$actual" == *"$exp_b"* ]]; then
+    verdict="PASS"
+    PASS=$((PASS+1))
+  else
+    verdict="FAIL - neither expected substring found"
+    FAIL=$((FAIL+1))
+  fi
+  {
+    printf '\n## Assertion: %s\n' "$name"
+    printf '**Expected substring (either):** `%s` OR `%s`\n' "$exp_a" "$exp_b"
+    printf '**Actual (first 240 chars):** `%s`\n' "${actual:0:240}"
+    printf '**Verdict:** %s\n' "$verdict"
+  } >> "$EVIDENCE"
+}
+
 _assert_eq_int() {
   local name="$1" expected="$2" actual="$3" verdict
   if [[ "$actual" -eq "$expected" ]]; then
@@ -122,8 +143,12 @@ if [[ "$cn_code" == "200" ]]; then
       context_contextnest_atoms_md "'"$KICKOFF"'" 6
     ' 2>&1
   )
-  _assert "atoms block has header" "--- ContextNest atoms" "$T1_OUT"
-  _assert "atoms block lists at least one atom" "sim=" "$T1_OUT"
+  # Accept either output shape: capsule (kind-ordered digest) or the
+  # legacy flat retrieve hit list. PR-1 made capsule the default path.
+  _assert_either "CN block has header (capsule or atoms)" \
+    "--- ContextNest capsule" "--- ContextNest atoms" "$T1_OUT"
+  _assert_either "CN block carries substrate content" \
+    "# Prompt Context" "sim=" "$T1_OUT"
   { printf '\n### Captured planner CN block (1000 chars):\n```\n%s\n```\n' "${T1_OUT:0:1000}"; } >> "$EVIDENCE"
 else
   echo "  [skip] Test 1 - CN unreachable" >&2
