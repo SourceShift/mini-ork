@@ -615,6 +615,21 @@ PY
   return 0
 }
 
+# Active-State Index helper — HarnessBridge Technique 1 (arxiv:2606.12882).
+# Wraps lib/active_state_index.sh:1 mo_active_state_block so the planner
+# block at bin/mini-ork-plan:176 can call it through the same
+# convention as the other context_*_md helpers.
+context_active_state_md() {
+  local task_class="${1:-__any__}"
+  local days="${2:-30}"
+  [ "${MO_DISABLE_ACTIVE_STATE:-0}" = "1" ] && return 0
+  [ -f "${MINI_ORK_ROOT}/lib/active_state_index.sh" ] || return 0
+  # shellcheck source=active_state_index.sh
+  source "${MINI_ORK_ROOT}/lib/active_state_index.sh"
+  declare -f mo_active_state_block >/dev/null 2>&1 || return 0
+  mo_active_state_block "$task_class" "$days"
+}
+
 if [[ "${BASH_SOURCE[0]:-}" == "${0:-}" ]]; then
   echo "context_assembler.sh — source me and call context_assemble <task_brief_path> <node_name>"
 fi
