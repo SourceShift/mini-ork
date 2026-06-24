@@ -66,6 +66,39 @@ con.execute("PRAGMA busy_timeout=5000")
 # but every INSERT silently failed (caller uses 2>/dev/null || true).
 # Result: execution_traces stayed EMPTY across 10+ DF cycles.
 # Migration 0010 + 0014 own the schema authoritatively now.
+# FE-1 (2026-06-23): verifier_output historically double-encoded — execute
+# pre-serialised the dict to a JSON string, then trace_store wrapped it again,
+# so the column stored an escaped-string-of-JSON. Downstream GRPO readers
+# json.loads'd once and got a string, so dict access failed and the writer
+# silently fell back to agent_version_id as the role key. Normalise once
+# here: if the payload hands us a string, decode it (handles both the new
+# dict-from-execute AND the legacy double-encoded rows); if it's a dict,
+# use it as-is; otherwise coerce to {}. One json.dumps at the end.
+def _normalise_verifier_output(v):
+    if isinstance(v, dict):
+        return v
+    if isinstance(v, str):
+        s = v.strip()
+        if not s or s in ("null", "None"):
+            return {}
+        # Single decode: covers dict JSON like {"node_type": "researcher"}.
+        try:
+            decoded = json.loads(s)
+        except (ValueError, TypeError):
+            return {}
+        if isinstance(decoded, dict):
+            return decoded
+        # Legacy double-encoded rows: a stringified dict wrapping a dict.
+        if isinstance(decoded, str):
+            try:
+                redecoded = json.loads(decoded)
+            except (ValueError, TypeError):
+                return {}
+            return redecoded if isinstance(redecoded, dict) else {}
+        return {}
+    return {}
+
+verifier_output_obj = _normalise_verifier_output(p.get("verifier_output", {}))
 con.execute("""
     INSERT INTO execution_traces (
         trace_id, run_id, task_class, prompt_version_hash, context_bundle_hash,
@@ -90,7 +123,7 @@ con.execute("""
     json.dumps(p.get("tool_calls", [])),
     json.dumps(p.get("files_read", [])),
     json.dumps(p.get("files_written", [])),
-    json.dumps(p.get("verifier_output", {})),
+    json.dumps(verifier_output_obj),
     p.get("reviewer_verdict"),
     float(p.get("cost_usd", 0.0)),
     int(p.get("duration_ms", 0)),
