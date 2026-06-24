@@ -113,9 +113,8 @@ if [ "${MO_VALIDATE_DO_RUNS:-0}" = "1" ]; then
   done
 else
   echo "  [inspect-only] MO_VALIDATE_DO_RUNS!=1 — skipping real dispatch."
-  echo "  Re-running the aggregators on existing traces to refresh GRPO/RHO:"
-  fire_writers
-  snapshot "AFTER aggregator refresh (no new run)"
+  echo "  router probe is read-only — no DB writers fire in inspect mode."
+  snapshot "AFTER snapshot only (no new run, no writers)"
 fi
 
 ROUTE_AFTER="$(probe_router)"
