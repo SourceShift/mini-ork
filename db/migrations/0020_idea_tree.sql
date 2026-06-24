@@ -29,7 +29,7 @@
 
 PRAGMA foreign_keys = OFF;
 
-CREATE TABLE idea_tree_nodes (
+CREATE TABLE IF NOT EXISTS idea_tree_nodes (
   node_id              TEXT PRIMARY KEY,
   parent_node_id       TEXT REFERENCES idea_tree_nodes(node_id) ON DELETE SET NULL,
   root_node_id         TEXT NOT NULL,                  -- denormalized root for fast subtree queries
@@ -53,21 +53,21 @@ CREATE TABLE idea_tree_nodes (
 );
 
 -- Index on parent so subtree walks are O(children) per level.
-CREATE INDEX idx_idea_tree_parent ON idea_tree_nodes(parent_node_id);
+CREATE INDEX IF NOT EXISTS idx_idea_tree_parent ON idea_tree_nodes(parent_node_id);
 
 -- Index on root so "give me the whole tree" is one indexed scan.
-CREATE INDEX idx_idea_tree_root ON idea_tree_nodes(root_node_id);
+CREATE INDEX IF NOT EXISTS idx_idea_tree_root ON idea_tree_nodes(root_node_id);
 
 -- Partial indexes for the common back-pointer joins.
-CREATE INDEX idx_idea_tree_task_run
+CREATE INDEX IF NOT EXISTS idx_idea_tree_task_run
     ON idea_tree_nodes(task_run_id)
     WHERE task_run_id IS NOT NULL;
 
-CREATE INDEX idx_idea_tree_self_improve
+CREATE INDEX IF NOT EXISTS idx_idea_tree_self_improve
     ON idea_tree_nodes(self_improve_run_id)
     WHERE self_improve_run_id IS NOT NULL;
 
 -- Status filter for "what's pending right now" UI queries.
-CREATE INDEX idx_idea_tree_status ON idea_tree_nodes(status);
+CREATE INDEX IF NOT EXISTS idx_idea_tree_status ON idea_tree_nodes(status);
 
 PRAGMA foreign_keys = ON;

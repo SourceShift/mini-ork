@@ -305,8 +305,20 @@ reflection_run() {
   local since_ts="${1:-$(( $(_rfl_now) - 86400 ))}"
   echo "reflection_run: starting pipeline since=${since_ts}" >&2
 
-  echo "  [1/6] extract_gradients" >&2
-  reflection_extract_gradients "$since_ts" >/dev/null
+  # Always-on by project policy: the learning system extracts gradients every
+  # reflect cycle (set MO_REFLECTION_EXTRACT_GRADIENTS=0 to opt out for cost).
+  if [ "${MO_REFLECTION_EXTRACT_GRADIENTS:-1}" = "1" ]; then
+    echo "  [1/6] extract_gradients" >&2
+    reflection_extract_gradients "$since_ts" >/dev/null
+  else
+    echo "  [1/6] extract_gradients skipped (MO_REFLECTION_EXTRACT_GRADIENTS=0)" >&2
+    # Ensure downstream SQL steps have the table even when extraction is
+    # skipped for foreground delivery runs.
+    source "${MINI_ORK_ROOT}/lib/gradient_extractor.sh" 2>/dev/null || true
+    if declare -f _gradient_ensure_table >/dev/null 2>&1; then
+      _gradient_ensure_table 2>/dev/null || true
+    fi
+  fi
 
   echo "  [2/6] deduplicate" >&2
   reflection_deduplicate "gradient_records"
