@@ -162,7 +162,7 @@ gradient_extract() {
   local prompt="${_GRADIENT_EXTRACTOR_PROMPT_TEMPLATE/<<<TRACE_JSON>>>/${trace_json}}"
   local tmp_out
   tmp_out="$(mktemp -t gradient_extract.XXXXXX)"
-  local model="${MINI_ORK_GRADIENT_MODEL:-sonnet}"
+  local model="${MINI_ORK_GRADIENT_MODEL:-codex}"
 
   # Route via the llm_dispatch shim (not mo_llm_dispatch directly) so this
   # path emits llm_calls ledger rows + respects the cost circuit breaker.
