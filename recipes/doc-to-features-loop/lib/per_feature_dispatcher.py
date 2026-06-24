@@ -18,6 +18,19 @@ STATUS_PASSED = "passed"
 STATUS_FAILED = "failed"
 STATUS_PENDING = "pending"
 
+# Feature id is the kernel of every filesystem path built by the dispatcher
+# (child_run_id, kickoff path, run dir, log path). A malicious or garbled id
+# would let "/" / ".." / shell metacharacters escape the run dir. The regex
+# is intentionally restrictive: alphanumerics, dot, underscore, hyphen, 1-128
+# chars. Validation runs BEFORE any path is built.
+_SAFE_FEATURE_ID = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
+
+
+def _safe_feature_id(fid: str) -> str:
+    if not isinstance(fid, str) or not _SAFE_FEATURE_ID.match(fid):
+        raise ValueError(f"unsafe feature id: {fid!r}")
+    return fid
+
 
 def _load_json(path: Path) -> dict[str, Any]:
     with path.open(encoding="utf-8") as f:
@@ -276,6 +289,13 @@ def _write_deterministic_panel_fallback(child_dir: Path, log_path: Path) -> Path
     if panel_path.exists() and panel_path.stat().st_size > 0:
         return panel_path
 
+    # Deterministic fallback is opt-in: a missing tier4_synth verdict is
+    # reported as such (return None), not silently masked as APPROVE. Set
+    # MO_TIER4_DETERMINISTIC_FALLBACK=1 to reproduce the prior behavior
+    # for A/B comparison or for runs that explicitly opt into the heuristic.
+    if os.environ.get("MO_TIER4_DETERMINISTIC_FALLBACK", "0") != "1":
+        return None
+
     tier1 = _latest_evidence_json(child_dir, "tier1-compile-typecheck")
     tier2 = _latest_evidence_json(child_dir, "tier2-scoped-unit")
     tier3 = _latest_evidence_json(child_dir, "tier3-property-mutation")
@@ -375,7 +395,7 @@ def _dispatch_feature(
     parent_run_id: str,
     source_kickoff: str,
 ) -> dict[str, Any]:
-    fid = str(feature["id"]).strip()
+    fid = _safe_feature_id(str(feature["id"]).strip())
     child_run_id = f"{parent_run_id}-{fid}"
     kickoff_path = run_dir / "child-kickoffs" / f"{fid}.md"
     _write_kickoff(kickoff_path, feature, source_kickoff)
@@ -435,13 +455,7 @@ def _dispatch_feature(
             result["source_verdict_path"] = str(source_verdict_path) if source_verdict_path else None
             result["files_written"] = _files_written(child_dir, verdict)
             result["final_artifact_ref"] = _final_artifact_ref(child_dir) or None
-            source_verdict = verdict.get("source_verdict")
-            fallback_pass = (
-                isinstance(source_verdict, dict)
-                and source_verdict.get("pass") is True
-                and str(source_verdict.get("source") or "").endswith("tier4-fallback")
-            )
-            result["status"] = STATUS_PASSED if verdict.get("pass") is True and (proc.returncode == 0 or fallback_pass) else STATUS_FAILED
+            result["status"] = STATUS_PASSED if verdict.get("pass") is True and proc.returncode == 0 else STATUS_FAILED
             if result["status"] == STATUS_FAILED:
                 result["error"] = f"child exited {proc.returncode}; pass={verdict.get('pass')}"
             elif proc.returncode != 0:

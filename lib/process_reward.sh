@@ -21,14 +21,16 @@
 #
 # Verifiable-first (FE): the +0.15 reviewer_verdict term is gated behind
 # status == success so an adversarial / noisy LLM judge cannot lift a
-# failed trace above 0.5. Same-family traces (agent_version_id contains
-# opus / minimax / glm / kimi) get the verdict term zeroed to neutralize
-# judge self-preference — the execution_traces schema has no reviewer_model
-# column, so the doer's lane is the conservative proxy. PRM copies in
-# prm_score_trace and prm_backfill MUST stay behaviorally identical: the
-# weight table below is mirrored verbatim in prm_backfill. Drift between
-# the two causes process_reward to diverge between single-trace writes and
-# bulk backfills, silently breaking the router.
+# failed trace above 0.5. Same-family decontamination (zeroing the verdict
+# term when agent_version_id contains opus/minimax/glm/kimi) has been
+# REMOVED: the doer's lane is not a valid proxy for the reviewer's lane
+# without a real reviewer_model column in execution_traces, and the
+# asymmetric stripping of +0.15 from opus/minimax/glm/kimi runs biased
+# GRPO group ranking. Same-family neutralization awaits a schema change.
+# PRM copies in prm_score_trace and prm_backfill MUST stay behaviorally
+# identical: the weight table below is mirrored verbatim in prm_backfill.
+# Drift between the two causes process_reward to diverge between
+# single-trace writes and bulk backfills, silently breaking the router.
 #
 # Public API:
 #   prm_score_trace   <trace_id>        compute + UPDATE process_reward
@@ -59,19 +61,8 @@ if not r:
     con.close()
     sys.exit(0)
 
-# Verifiable-first: same-family detection uses agent_version_id family token
-# as the conservative proxy for "reviewer and doer share a family". The
-# execution_traces schema has no reviewer_model column, so any agent_version_id
-# that encodes a known single-family lane (opus/minimax/glm/kimi) triggers
-# neutralization of the +0.15 verdict term. Missing or non-matching ids keep
-# the verdict credit on — better to risk false-positive judge influence than
-# to over-neutralize cross-family lanes.
-_FAMILY_TOKENS = ("opus", "minimax", "glm", "kimi")
-def _same_family(agent_version_id):
-    if not agent_version_id:
-        return False
-    av = str(agent_version_id).lower()
-    return any(tok in av for tok in _FAMILY_TOKENS)
+# Same-family decontamination removed: see FE note in the file header.
+# Awaiting a real reviewer_model column in execution_traces.
 
 def _len_json(s):
     try:
@@ -114,11 +105,10 @@ if _activity_cap_enabled:
     activity = min(activity, ACTIVITY_CAP)
 score += activity
 v = (r["reviewer_verdict"] or "").lower()
-# Verdict term GATED on status==success AND NOT same-family. A failed trace
-# cannot be lifted by an approving judge; same-family judges contribute
-# nothing so they cannot self-prefer.
-if status_success and v in {"approve", "approved", "pass", "success", "ok"} \
-        and not _same_family(r["agent_version_id"]):
+# Verdict term GATED on status==success. A failed trace cannot be lifted
+# by an approving judge. Same-family decontamination has been removed
+# pending a real reviewer_model column.
+if status_success and v in {"approve", "approved", "pass", "success", "ok"}:
     score += W_VERDICT
 dur = int(r["duration_ms"] or 0)
 if 1000 <= dur <= 600000:
@@ -132,6 +122,7 @@ con.execute("UPDATE execution_traces SET process_reward=? WHERE trace_id=?",
 con.commit()
 con.close()
 print(score)
+sys.stderr.write(f"[prm] activity_cap={'on' if _activity_cap_enabled else 'off'}\n")
 PY
 }
 
@@ -156,14 +147,8 @@ rows = con.execute(
     "SELECT * FROM execution_traces WHERE created_at >= ?", (since_iso,)
 ).fetchall()
 
-# Verifiable-first: same-family detection — must match prm_score_trace byte
-# for byte to keep the two PRM heuristic copies behaviorally identical.
-_FAMILY_TOKENS = ("opus", "minimax", "glm", "kimi")
-def _same_family(agent_version_id):
-    if not agent_version_id:
-        return False
-    av = str(agent_version_id).lower()
-    return any(tok in av for tok in _FAMILY_TOKENS)
+# Same-family decontamination removed: see FE note in the file header.
+# Awaiting a real reviewer_model column in execution_traces.
 
 def _len_json(s):
     try:
@@ -208,11 +193,11 @@ for r in rows:
         activity = min(activity, ACTIVITY_CAP)
     score += activity
     v = (r["reviewer_verdict"] or "").lower()
-    # Verdict term GATED on status==success AND NOT same-family. Identical to
-    # prm_score_trace; do not drift these two copies or process_reward will
-    # diverge between single-trace and bulk paths.
-    if status_success and v in {"approve", "approved", "pass", "success", "ok"} \
-            and not _same_family(r["agent_version_id"]):
+    # Verdict term GATED on status==success. Identical to prm_score_trace;
+    # do not drift these two copies or process_reward will diverge between
+    # single-trace and bulk paths. Same-family decontamination has been
+    # removed pending a real reviewer_model column.
+    if status_success and v in {"approve", "approved", "pass", "success", "ok"}:
         score += W_VERDICT
     dur = int(r["duration_ms"] or 0)
     if 1000 <= dur <= 600000:
@@ -226,6 +211,7 @@ for r in rows:
 con.commit()
 con.close()
 print(scored)
+sys.stderr.write(f"[prm] activity_cap={'on' if _activity_cap_enabled else 'off'}\n")
 PY
 }
 
