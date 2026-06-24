@@ -34,7 +34,7 @@ lanes:
   reflector: codex
   publisher: codex
   rollback: codex
-  brain: codex               # was opus; no-opus directive applies here too
+  brain: opus                # restored 2026-06-17 per user directive: opus+glm OK, only codex banned
   rubric: kimi               # was sonnet; cheap + reliable structured JSON
 
   # Heterogeneous-family lens lanes (must match workflow.yaml node.model_lane).
@@ -42,9 +42,9 @@ lanes:
   kimi_lens: kimi            # correctness lens — Moonshot Kimi
   codex_lens: codex          # arch + arxiv lens — OpenAI Codex wrapper
   glm_lens: glm              # structural extraction lens — Zhipu GLM
-  # opus_lens REMOVED 2026-06-13 per standing no-opus directive. Legacy
-  # recipes that still reference opus_lens will fail provider lookup —
-  # that's the desired loud failure so they get migrated to codex_lens.
+  opus_lens: opus            # restored 2026-06-17 per user directive: opus+glm OK, only codex banned
+
+
 
 budget:
   # Per-iteration cap. Outer runner enforces wall-clock; this is the dollar

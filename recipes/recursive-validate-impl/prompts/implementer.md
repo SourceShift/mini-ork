@@ -24,6 +24,13 @@ Required JSON shape:
       "evidence": "command output path or reason"
     }
   ],
+  "verification_evidence": [
+    {
+      "command": "reproducible command from repo root",
+      "status": "pass | fail | not_run",
+      "evidence": "path to log or concise reason"
+    }
+  ],
   "risk_notes": [],
   "ready_for_tier1": true
 }
@@ -31,6 +38,13 @@ Required JSON shape:
 
 Rules:
 - Do not mark `ready_for_tier1` true when `touched_files[]` is empty.
+- `touched_files[]` must include every file this child created or modified,
+  including migrations, tests, documentation/blame records, fixtures, scripts,
+  config, and generated support files. Do not list only TypeScript/source
+  files.
+- Record every verification command you ran in `verification_evidence[]`; when
+  a command cannot run, include the exact reason and the narrower equivalent
+  verifier, if any.
 - Do not edit files outside the kickoff scope unless the plan explicitly names
   them.
 - Do not claim verifier success. Verifier nodes own pass/fail.

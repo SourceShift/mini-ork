@@ -351,7 +351,7 @@ it.
   the mini-ork GitHub repository.
 - **RSP amendment proposals:** open a PR against this document with
   the `rsp-amendment` label.
-- **Maintainer:** Amir Khakshour (`khakshour.amir@gmail.com`).
+- **Maintainer:** Amir Khakshour (`security@ork-ai.dev`).
 - **Public commit log:** every change to this document is in git
   history.
 

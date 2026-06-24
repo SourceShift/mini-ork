@@ -10,7 +10,7 @@ generation.
 ## Affected services
 
 - the host application BE pods (consume the queue)
-- Redis at `100.74.239.22:6380` (queue substrate)
+- Redis at `<prod-host>:6380` (queue substrate)
 - Hatchet (alternative dispatcher for the same workflow)
 - Downstream Daytona sandboxes (per-chapter agent execution)
 
@@ -36,11 +36,11 @@ queue commands.
 
 ## Runtime environment
 
-- platform: k3s on jisawru (100.74.239.22)
-- log: Loki at `http://100.74.239.22:13101`
-- metrics: Prometheus via Grafana at `http://100.74.239.22:13000`
-- tracing: Tempo at `http://100.74.239.22:3200`
-- Redis: `100.74.239.22:6380` password `redis_password_123` queue prefix `dev_`
+- platform: k3s on <prod-host> (<prod-host>)
+- log: Loki at `http://<prod-host>:13101`
+- metrics: Prometheus via Grafana at `http://<prod-host>:13000`
+- tracing: Tempo at `http://<prod-host>:3200`
+- Redis: `<prod-host>:6380` password `<redis-password>` queue prefix `dev_`
 
 ## External dependencies
 

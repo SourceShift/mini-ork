@@ -130,6 +130,560 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+_mo_reward_from_status() {
+  local _status="${1:-}" _verdict="${2:-}"
+  case "$(printf '%s' "$_verdict" | tr '[:upper:]' '[:lower:]')" in
+    approve|approved|pass|passed|success|ok) printf '1.0\n'; return 0 ;;
+    reject|rejected|fail|failed|request_changes|needs_revision|escalate) printf '0.0\n'; return 0 ;;
+  esac
+  case "$(printf '%s' "$_status" | tr '[:upper:]' '[:lower:]')" in
+    success|published|done|approve|approved|pass|passed) printf '1.0\n' ;;
+    failure|failed|rolled_back|blocked|crash|escalated|reject|rejected) printf '0.0\n' ;;
+    *) printf '0.5\n' ;;
+  esac
+}
+
+_mo_learning_static_lane() {
+  local _node_type="$1" _current_lane="$2"
+  local _frontier="${MO_FRONTIER_LANE:-opus_lens}"
+  local _cheap="${MO_CHEAP_LANE:-kimi_lens}"
+  # A recipe-pinned lane (current_lane != node_type) is both explicit author
+  # intent and the learning loop's exploration arm: research-synthesis fans
+  # out across glm/kimi/codex/opus on purpose so GRPO has competing lanes to
+  # rank. Collapsing those onto the cheap default ran all 4 researcher lenses
+  # on kimi_lens, stamping one agent_version_id, starving GRPO of competitors
+  # so relative_advantage stayed 0 and the governed router could never flip.
+  # Only synthesize a default for generic, unpinned nodes — where the planner
+  # emitted a node_type with no model_lane, so current_lane == node_type.
+  if [ "$_current_lane" != "$_node_type" ]; then
+    printf '%s\n' "$_current_lane"
+    return 0
+  fi
+  case "$_node_type" in
+    reviewer) printf '%s\n' "$_frontier" ;;
+    researcher|implementer) printf '%s\n' "$_cheap" ;;
+    *) printf '%s\n' "$_current_lane" ;;
+  esac
+}
+
+_mo_learning_governed_lane() {
+  local _node_type="$1" _current_lane="$2"
+  local _task_class="${TASK_CLASS:-${MINI_ORK_TASK_CLASS:-generic}}"
+  local _min_samples="${MO_LEARNING_MIN_SAMPLES:-3}"
+  # Exploration floor: with probability epsilon, route to a non-greedy
+  # eligible lane instead of argmaxing relative_advantage. Epsilon=0 is the
+  # legacy greedy path — keeps backward compat for opt-in. MO_LEARNING_SEED
+  # makes exploration deterministic for proof harnesses.
+  local _epsilon="${MO_LEARNING_EPSILON:-0.10}"
+  local _seed="${MO_LEARNING_SEED:-}"
+  [ -n "${MINI_ORK_DB:-}" ] && [ -f "${MINI_ORK_DB:-}" ] || {
+    _mo_learning_static_lane "$_node_type" "$_current_lane"
+    return 0
+  }
+  python3 - "$MINI_ORK_DB" "$_task_class" "$_node_type" "$_current_lane" "$_min_samples" "$_epsilon" "$_seed" <<'PY'
+import os
+import random
+import sqlite3
+import sys
+
+db, task_class, node_type, current_lane, min_samples_s, epsilon_s, seed_s = sys.argv[1:8]
+try:
+    min_samples = max(1, int(min_samples_s))
+except ValueError:
+    min_samples = 3
+try:
+    epsilon = float(epsilon_s)
+except ValueError:
+    epsilon = 0.10
+if epsilon < 0.0:
+    epsilon = 0.0
+if epsilon > 1.0:
+    epsilon = 1.0
+
+# Seeded RNG for deterministic exploration; falls back to system RNG when
+# unset so live runs remain non-deterministic by default.
+if seed_s:
+    try:
+        rng = random.Random(int(seed_s))
+    except ValueError:
+        rng = random.Random(seed_s)
+else:
+    rng = random.SystemRandom()
+
+fallback = current_lane
+
+
+def _prompt_present(con):
+    row = con.execute(
+        """
+        SELECT 1
+          FROM prompt_win_rates
+         WHERE task_class = ?
+           AND sample_size >= ?
+           AND (node_type = ? OR node_type IS NULL)
+         ORDER BY win_rate DESC, sample_size DESC
+         LIMIT 1
+        """,
+        (task_class, min_samples, node_type),
+    ).fetchone()
+    return row is not None
+
+
+def _argmax_top(con):
+    row = con.execute(
+        """
+        SELECT agent_version_id, relative_advantage
+          FROM agent_performance_memory
+         WHERE task_class = ?
+           AND runs_count >= ?
+           AND relative_advantage > 0
+           AND (role = ? OR model = ? OR agent_version_id = ?)
+         ORDER BY relative_advantage DESC, runs_count DESC
+         LIMIT 1
+        """,
+        (task_class, min_samples, node_type, node_type, current_lane),
+    ).fetchone()
+    return row["agent_version_id"] if row else fallback
+
+
+def _eligible_lanes(con):
+    # Exploration pool: learned lanes with runs_count >= 1 for the same
+    # task_class and node_type. Static fallback is appended below if absent.
+    rows = con.execute(
+        """
+        SELECT agent_version_id, relative_advantage
+          FROM agent_performance_memory
+         WHERE task_class = ?
+           AND runs_count >= 1
+           AND relative_advantage > 0
+           AND (role = ? OR model = ? OR agent_version_id = ?)
+         ORDER BY relative_advantage DESC, runs_count DESC
+        """,
+        (task_class, node_type, node_type, current_lane),
+    ).fetchall()
+    pool = [(r["agent_version_id"], float(r["relative_advantage"])) for r in rows]
+    if fallback and all(lane != fallback for lane, _ in pool):
+        pool.append((fallback, 0.5))
+    return pool
+
+
+con = None
+try:
+    con = sqlite3.connect(db, timeout=2.0)
+    con.execute("PRAGMA busy_timeout=2000")
+    con.row_factory = sqlite3.Row
+    if not _prompt_present(con):
+        print(fallback)
+        raise SystemExit(0)
+    if epsilon == 0.0:
+        # Backward-compat: legacy greedy argmax.
+        print(_argmax_top(con))
+        raise SystemExit(0)
+    pool = _eligible_lanes(con)
+    if not pool:
+        print(fallback)
+        raise SystemExit(0)
+    pool.sort(key=lambda kv: kv[1], reverse=True)
+    top_lane = pool[0][0]
+    if rng.random() < epsilon:
+        rest = [lane for lane, _ in pool[1:]]
+        if not rest:
+            print(top_lane)
+        else:
+            print(rng.choice(rest))
+    else:
+        print(top_lane)
+except sqlite3.OperationalError:
+    print(fallback)
+finally:
+    if con is not None:
+        con.close()
+PY
+}
+
+mo_learning_update_conductor_outcomes() {
+  local _db="${MINI_ORK_DB:-${MINI_ORK_HOME:-.mini-ork}/state.db}"
+  [ -f "$_db" ] || return 0
+  python3 - "$_db" <<'PY'
+import sqlite3
+import sys
+
+db = sys.argv[1]
+con = sqlite3.connect(db, timeout=5.0)
+con.execute("PRAGMA busy_timeout=5000")
+con.row_factory = sqlite3.Row
+try:
+    rows = con.execute(
+        """
+        SELECT cd.id, e.status
+          FROM conductor_decisions cd
+          JOIN epics e ON e.id = cd.epic_id
+         WHERE COALESCE(cd.outcome, 'pending') = 'pending'
+           AND e.status IN ('done', 'escalated')
+        """
+    ).fetchall()
+    for row in rows:
+        success = row["status"] == "done"
+        con.execute(
+            "UPDATE conductor_decisions SET outcome=?, realized_score=? WHERE id=?",
+            ("success" if success else "failure", 1.0 if success else 0.0, row["id"]),
+        )
+    con.commit()
+    print(len(rows))
+finally:
+    con.close()
+PY
+}
+
+mo_learning_write_grpo_advantages() {
+  local _db="${MINI_ORK_DB:-${MINI_ORK_HOME:-.mini-ork}/state.db}"
+  [ -f "$_db" ] || return 0
+  python3 - "$_db" <<'PY'
+import datetime
+import json
+import math
+import os
+import sqlite3
+import sys
+
+db = sys.argv[1]
+con = sqlite3.connect(db, timeout=5.0)
+con.execute("PRAGMA busy_timeout=5000")
+con.row_factory = sqlite3.Row
+cols = {r[1] for r in con.execute("PRAGMA table_info(agent_performance_memory)").fetchall()}
+if "relative_advantage" not in cols:
+    raise SystemExit("agent_performance_memory.relative_advantage is missing")
+
+# ── GRPO write-half decay knobs ─────────────────────────────────────────────
+# MO_LEARNING_DECAY_ALPHA blends the new batch's relative_advantage with the
+# previously stored estimate: new = α·batch + (1-α)·stored. α=1.0 reproduces
+# the pre-FE2 overwrite path bit-for-bit (backward-compat escape hatch);
+# α<1.0 lets a stable historical signal resist a single noisy batch. Default
+# 0.30 — 30% new evidence per write — matches the policy used by the cost
+# advisor and keeps the router from flipping on transient variance.
+try:
+    decay_alpha = float(os.environ.get("MO_LEARNING_DECAY_ALPHA", "0.30"))
+except ValueError:
+    decay_alpha = 0.30
+if decay_alpha < 0.0:
+    decay_alpha = 0.0
+elif decay_alpha > 1.0:
+    decay_alpha = 1.0
+
+# MO_LEARNING_HALFLIFE_DAYS controls per-trace recency weighting inside the
+# current batch: weight = exp(-ln(2)·age_days/halflife). Set to 0 to disable
+# (constant weight 1.0). Default 14 days. Missing or malformed created_at
+# silently degrades to weight 1.0 — no exception, no skewed group.
+try:
+    halflife_days = float(os.environ.get("MO_LEARNING_HALFLIFE_DAYS", "14"))
+except ValueError:
+    halflife_days = 14.0
+if halflife_days < 0.0:
+    halflife_days = 0.0
+
+def _parse_iso(ts):
+    if not ts:
+        return None
+    s = ts.strip()
+    if not s:
+        return None
+    if s.endswith("Z"):
+        s = s[:-1]
+    try:
+        return datetime.datetime.fromisoformat(s)
+    except ValueError:
+        return None
+
+_now = datetime.datetime.now(datetime.timezone.utc)
+_ln2 = math.log(2.0)
+
+def recency_weight(created_at):
+    """Half-life decay weight. Fresh or unparseable timestamps return 1.0;
+    older timestamps decay toward 0. halflife_days<=0 disables entirely."""
+    if halflife_days <= 0.0:
+        return 1.0
+    dt = _parse_iso(created_at)
+    if dt is None:
+        return 1.0
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=datetime.timezone.utc)
+    age_days = (_now - dt).total_seconds() / 86400.0
+    if age_days <= 0.0:
+        return 1.0
+    return math.exp(-_ln2 * age_days / halflife_days)
+
+rows = con.execute(
+    """
+    SELECT trace_id, task_class, agent_version_id, verifier_output, status,
+           reviewer_verdict, cost_usd, duration_ms, process_reward, created_at
+      FROM execution_traces
+     WHERE task_class IS NOT NULL
+       AND task_class <> ''
+       AND agent_version_id IS NOT NULL
+       AND agent_version_id <> ''
+    """
+).fetchall()
+
+def _decode_verifier_output(raw):
+    """Decode verifier_output cell robustly.
+
+    Accepts: dict, single-encoded JSON string ({"..."}), legacy double-encoded
+    string ("{\"node_type\":...}"), None, or garbage. Returns a dict or {}.
+    """
+    if isinstance(raw, dict):
+        return raw
+    if not isinstance(raw, str):
+        return {}
+    s = raw.strip()
+    if not s or s in ("null", "None", "{}"):
+        return {}
+    try:
+        decoded = json.loads(s)
+    except (ValueError, TypeError):
+        return {}
+    if isinstance(decoded, dict):
+        return decoded
+    # Legacy rows from before FE-1: string of a stringified dict.
+    if isinstance(decoded, str):
+        try:
+            redecoded = json.loads(decoded)
+        except (ValueError, TypeError):
+            return {}
+        return redecoded if isinstance(redecoded, dict) else {}
+    return {}
+
+def node_type(row):
+    """Stable role key for GRPO grouping.
+
+    FE-1: never fall back to agent_version_id. agent_version_id is per-lane,
+    so using it as a group key creates singleton groups with std=0 and
+    zero advantage — defeating the whole GRPO signal. When node_type is
+    missing, fall back to the row's task_class so competing lanes in the
+    same task still land in the same group.
+    """
+    payload = _decode_verifier_output(row["verifier_output"])
+    value = payload.get("node_type") if isinstance(payload, dict) else None
+    if value:
+        return str(value)
+    tc = row["task_class"] or ""
+    return str(tc) if tc else "_unknown"
+
+# Verifiable-first reward shaping (FE: reward shaping verifiable-first).
+#
+# Precedence:
+#   1. process_reward — top-priority. Preserve legacy clamp exactly; this is
+#      the deterministic, externally-validated signal when it exists.
+#   2. status — primary deterministic signal on the row itself. Anchors the
+#      score at 0.85 (success) or 0.15 (failed) so an adversarial reviewer
+#      verdict cannot flip a known-good or known-bad trace across the 0.5
+#      threshold.
+#   3. reviewer_verdict — small tiebreaker in [-0.10, +0.10] (well within the
+#      +/- 0.15 band documented in the FE kickoff). Disabled entirely when
+#      status is unknown so the legacy verdict-only fallback remains.
+#   4. Same-family neutralization — when the row's agent_version_id encodes
+#      a known single-family lane (opus/minimax/glm/kimi), the reviewer is
+#      presumed same-family and the verdict tiebreaker is zeroed out. The
+#      execution_traces schema has no reviewer_model column, so this is the
+#      conservative proxy: a missed cross-family benefit is cheaper than a
+#      bias-vulnerable self-preferring judge signal.
+#
+# Unparseable agent_version_id / missing review → same-family = False (we do
+# not over-neutralize when we cannot prove the family match).
+_FAMILY_TOKENS = ("opus", "minimax", "glm", "kimi")
+_APPROVE = {"approve", "approved", "pass", "success", "ok"}
+_REJECT = {"reject", "rejected", "fail", "failed", "request_changes", "needs_revision", "escalate"}
+_VERDICT_BAND = 0.10  # FE: +/- 0.15 band; use 0.10 to leave headroom for clamp
+
+def _lane_family(agent_version_id):
+    """Return the known family token from agent_version_id, or None."""
+    if not agent_version_id:
+        return None
+    av = str(agent_version_id).lower()
+    for tok in _FAMILY_TOKENS:
+        if tok in av:
+            return tok
+    return None
+
+def reward(row):
+    # 1. process_reward is the top-priority deterministic signal — preserve
+    #    the legacy clamped behavior bit-for-bit when present.
+    if row["process_reward"] is not None:
+        return max(0.0, min(1.0, float(row["process_reward"])))
+
+    verdict = (row["reviewer_verdict"] or "").lower()
+    status = (row["status"] or "").lower()
+    same_family = _lane_family(row["agent_version_id"]) is not None
+
+    # 2. Unknown status — fall back to verdict-only legacy behavior. Without a
+    #    deterministic status anchor we cannot outrank the verdict, so we
+    #    reproduce the prior shape exactly (1.0 / 0.0 / status-derived).
+    if status not in {"success", "failed"}:
+        if verdict in _APPROVE:
+            return 1.0
+        if verdict in _REJECT:
+            return 0.0
+        return 1.0 if row["status"] == "success" else 0.0
+
+    # 3. Known status — anchor at 0.85 (success) or 0.15 (failed). The 0.5
+    #    gap between anchors is wide enough that the verdict tiebreaker
+    #    (+/- 0.10, neutralized on same-family) cannot flip the result across
+    #    the 0.5 threshold.
+    base = 0.85 if status == "success" else 0.15
+    if same_family:
+        delta = 0.0
+    elif verdict in _APPROVE:
+        delta = _VERDICT_BAND
+    elif verdict in _REJECT:
+        delta = -_VERDICT_BAND
+    else:
+        delta = 0.0
+    return max(0.0, min(1.0, base + delta))
+
+# Pre-compute (row, score, recency_weight) once so group stats and per-agent
+# z-scores share the same weighting. Unparseable created_at yields weight 1.0
+# — the unweighted fallback is intentionally conservative: rather than drop
+# the trace, we let it contribute at full strength.
+weight_rows = [(row, reward(row), recency_weight(row["created_at"])) for row in rows]
+
+groups = {}
+for row, score, w in weight_rows:
+    groups.setdefault((node_type(row), row["task_class"]), []).append((row, score, w))
+
+# Pre-fetch stored relative_advantage per (agent_version_id, task_class) so
+# the UPSERT can blend with the prior estimate instead of clobbering it.
+# The map is intentionally local: any non-numeric cell is skipped rather than
+# raising, matching the lenient decode pattern used for verifier_output.
+existing_adv = {}
+for er in con.execute(
+    "SELECT agent_version_id, task_class, relative_advantage "
+    "FROM agent_performance_memory"
+).fetchall():
+    try:
+        existing_adv[(er["agent_version_id"], er["task_class"])] = float(er["relative_advantage"])
+    except (TypeError, ValueError):
+        pass
+
+written = 0
+for (role, task_class), items in groups.items():
+    # Weighted mean & std over the group's (score, weight) pairs. The
+    # weighted-std denominator is Σw, not Σw-1, matching the unweighted path
+    # so a uniform weight distribution reproduces the legacy numbers exactly.
+    total_w = sum(w for _, _, w in items)
+    if total_w > 0.0:
+        mean = sum(w * s for _, s, w in items) / total_w
+        variance = sum(w * (s - mean) ** 2 for _, s, w in items) / total_w
+    else:
+        scores = [s for _, s, _ in items]
+        mean = sum(scores) / len(scores)
+        variance = sum((s - mean) ** 2 for s in scores) / len(scores)
+    std = math.sqrt(variance)
+    # Sigma-zero cost tie-break (MO_LEARNING_TIEBREAK env-gated).
+    # When std==0 every per-trace z-score is exactly 0.0 — no variance signal
+    # to rank lanes — so a tied group's GRPO advantages collapse to 0 and the
+    # router argmax cannot choose. We break the tie with a bounded cost
+    # ranking: cheaper lanes get a small positive bump, costlier lanes get a
+    # small negative bump, both clamped to [-0.1, +0.1] so the tie-break
+    # cannot dominate real correctness signals. Default ON; set
+    # MO_LEARNING_TIEBREAK=0 to reproduce the legacy behavior where sigma-zero
+    # advantages are exactly 0.0 (no bump, no signal).
+    try:
+        tiebreak_enabled = int(os.environ.get("MO_LEARNING_TIEBREAK", "1")) != 0
+    except ValueError:
+        tiebreak_enabled = True
+    if std == 0 and tiebreak_enabled:
+        costs = sorted({round(float(r["cost_usd"] or 0.0), 6) for r, _, _ in items})
+        cost_min, cost_max = (costs[0], costs[-1]) if costs else (0.0, 0.0)
+        cost_span = cost_max - cost_min
+    else:
+        cost_min = cost_max = cost_span = 0.0
+        if std == 0:
+            tiebreak_enabled = False  # forces legacy zero path
+    by_agent = {}
+    for row, score, w in items:
+        bucket = by_agent.setdefault(row["agent_version_id"], {
+            "runs": 0, "success": 0, "cost": 0.0, "duration": 0.0,
+            "adv": [], "w": [],
+        })
+        bucket["runs"] += 1
+        bucket["success"] += 1 if row["status"] == "success" else 0
+        bucket["cost"] += float(row["cost_usd"] or 0.0)
+        bucket["duration"] += float(row["duration_ms"] or 0.0)
+        if std == 0:
+            # Sigma-zero: pure tie-break (or 0.0 under legacy). Apply BEFORE
+            # shrinkage and EMA decay so the bounded bump propagates through
+            # both composition stages without being re-clamped.
+            if tiebreak_enabled and cost_span > 0:
+                c = float(row["cost_usd"] or 0.0)
+                adv_tb = round(0.1 * (cost_max - c) / cost_span * 2.0 - 0.1, 6)
+                # Defensive clamp in case rounding or future changes nudge
+                # outside [-0.1, +0.1].
+                adv_tb = max(-0.1, min(0.1, adv_tb))
+                bucket["adv"].append(adv_tb)
+            else:
+                bucket["adv"].append(0.0)
+        else:
+            bucket["adv"].append((score - mean) / std)
+        bucket["w"].append(w)
+    # n-aware shrinkage: pulled-in means raw z-scores from tiny groups dominate
+    # the router argmax and starve exploration of any competitor lane. The
+    # k/(k+n) factor (here n/(n+k) applied to the raw z-score) keeps a single
+    # noisy z=1.0 at n=1 well below 1.0 and lets it asymptote toward the raw
+    # value as n grows. k defaults to 5 — override with MO_LEARNING_SHRINKAGE_K.
+    try:
+        shrink_k = max(0, int(os.environ.get("MO_LEARNING_SHRINKAGE_K", "5")))
+    except ValueError:
+        shrink_k = 5
+    for agent_id, bucket in by_agent.items():
+        runs = bucket["runs"]
+        # Weighted mean of the agent's per-trace z-scores. Falls back to
+        # arithmetic mean when all weights collapsed to zero.
+        bw_total = sum(bucket["w"])
+        if bw_total > 0.0:
+            raw_rel_adv = sum(w * a for w, a in zip(bucket["w"], bucket["adv"])) / bw_total
+        else:
+            raw_rel_adv = sum(bucket["adv"]) / len(bucket["adv"])
+        shrink_factor = runs / (runs + shrink_k) if (runs + shrink_k) > 0 else 0.0
+        batch_adv = raw_rel_adv * shrink_factor
+        # EMA blend with the prior stored estimate. α=1.0 reproduces the old
+        # overwrite path bit-for-bit. When no prior row exists we accept the
+        # batch value as-is — blending with a phantom 0.0 would systematically
+        # under-weight first writes and starve cold-start lanes.
+        prior = existing_adv.get((agent_id, task_class))
+        if prior is not None and decay_alpha < 1.0:
+            rel_adv = decay_alpha * batch_adv + (1.0 - decay_alpha) * prior
+        else:
+            rel_adv = batch_adv
+        con.execute(
+            """
+            INSERT INTO agent_performance_memory
+                (agent_version_id, role, model, task_class, runs_count,
+                 success_count, avg_cost_usd, avg_duration_ms,
+                 top_failure_modes, relative_advantage, last_updated)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, '[]', ?,
+                    strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+            ON CONFLICT(agent_version_id, task_class) DO UPDATE SET
+                role=excluded.role,
+                model=excluded.model,
+                runs_count=excluded.runs_count,
+                success_count=excluded.success_count,
+                avg_cost_usd=excluded.avg_cost_usd,
+                avg_duration_ms=excluded.avg_duration_ms,
+                relative_advantage=excluded.relative_advantage,
+                last_updated=excluded.last_updated
+            """,
+            (
+                agent_id, role, agent_id, task_class, runs, bucket["success"],
+                bucket["cost"] / runs, bucket["duration"] / runs,
+                round(rel_adv, 6),
+            ),
+        )
+        written += 1
+con.commit()
+con.close()
+print(written)
+PY
+}
+
 if [ "${MINI_ORK_EXECUTE_SOURCE_ONLY:-0}" = "1" ]; then
   return 0 2>/dev/null || exit 0
 fi
@@ -814,7 +1368,7 @@ _trace_write_node_rich() {
   local _payload
   _payload=$(python3 -c "
 import json, sys, os
-trace_id, status, node_type, output_file, verdict, cost, task_class, tool_summary_path, duration_ms, finish_reason = sys.argv[1:11]
+trace_id, status, node_type, output_file, verdict, cost, task_class, tool_summary_path, duration_ms, finish_reason, agent_version_id = sys.argv[1:12]
 
 tool_calls = []
 files_read = []
@@ -846,15 +1400,17 @@ obj = {
     'files_read': json.dumps(files_read),
     'files_written': json.dumps(files_written) if files_written else '[]',
 }
+if agent_version_id:
+    obj['agent_version_id'] = agent_version_id
 if output_file:
     obj['final_artifact_ref'] = output_file
 if verdict:
     obj['reviewer_verdict'] = verdict
 if finish_reason:
     obj['finish_reason'] = finish_reason
-obj['verifier_output'] = json.dumps({'node_type': node_type, 'finish_reason': finish_reason or None})
+obj['verifier_output'] = {'node_type': node_type, 'finish_reason': finish_reason or None}
 print(json.dumps(obj))
-" "$_trace_id" "$_status" "$_node_type" "$_output_file" "$_verdict" "$_cost" "${TASK_CLASS:-generic}" "$_tool_summary" "$_duration_ms" "$_finish_reason" 2>/dev/null)
+" "$_trace_id" "$_status" "$_node_type" "$_output_file" "$_verdict" "$_cost" "${TASK_CLASS:-generic}" "$_tool_summary" "$_duration_ms" "$_finish_reason" "${dispatch_lane:-}" 2>/dev/null)
   if [ -n "$_payload" ]; then
     trace_write "$_payload" >/dev/null 2>&1 || true
   fi
@@ -876,8 +1432,9 @@ print(json.dumps(obj))
   # arXiv:2510.08049 + 2602.09305. Heuristic 0.0-1.0 reward derived from
   # the just-written trace's observable signals (status, tool_calls,
   # files, reviewer_verdict, duration, cost). Best-effort; gated on
-  # MO_PRM_SCORE=1 (default off; opt in once smoke confirms).
-  if [ "${MO_PRM_SCORE:-0}" = "1" ] \
+  # MO_PRM_SCORE (default ON since smoke-learning-loops.sh passes 10/10).
+  # Set MO_PRM_SCORE=0 to opt out. Feeds GRPO advantages downstream.
+  if [ "${MO_PRM_SCORE:-1}" = "1" ] \
      && [ -f "$MINI_ORK_ROOT/lib/process_reward.sh" ]; then
     if ! declare -f prm_score_trace >/dev/null 2>&1; then
       # shellcheck source=lib/process_reward.sh
@@ -959,7 +1516,10 @@ _mo_source() {
 
 _mo_policy_route_lane() {
   local node_type="$1" current_lane="$2"
-  local policy="${MO_ROUTING_POLICY:-}"
+  # Default ON: real runs act on learnings. Safe — learning_governed degrades
+  # to the static default when learning tables are cold/vacuous. Opt out with
+  # MO_ROUTING_POLICY=workflow_default.
+  local policy="${MO_ROUTING_POLICY:-learning_governed}"
   local frontier="${MO_FRONTIER_LANE:-opus_lens}"
   local cheap="${MO_CHEAP_LANE:-kimi_lens}"
 
@@ -977,11 +1537,9 @@ _mo_policy_route_lane() {
         *) printf '%s\n' "$current_lane" ;;
       esac ;;
     static_hybrid)
-      case "$node_type" in
-        reviewer) printf '%s\n' "$frontier" ;;
-        researcher|implementer) printf '%s\n' "$cheap" ;;
-        *) printf '%s\n' "$current_lane" ;;
-      esac ;;
+      _mo_learning_static_lane "$node_type" "$current_lane" ;;
+    learning_governed)
+      _mo_learning_governed_lane "$node_type" "$(_mo_learning_static_lane "$node_type" "$current_lane")" ;;
     trace_governed)
       # Cheap-first execution with expensive review/recovery. FAIL_COUNT is
       # the executor's prefix-trace signal: verifier/reviewer failures before
@@ -1064,7 +1622,11 @@ for event_id, event_type, payload_raw, last_heartbeat_at, created_at in rows:
         if prev is None or int(last_heartbeat_at) > prev:
             latest[node] = int(last_heartbeat_at)
     elif event_type == "node_end":
-        ended_at[node] = max(int(created_at or 0) * 1000, ended_at.get(node, 0))
+        # run_events.created_at is second precision while last_heartbeat_at is
+        # millisecond precision. Treat an end event as covering its whole
+        # second, otherwise fast nodes can falsely look stale by a few ms.
+        ended_ms = (int(created_at or 0) * 1000) + 999
+        ended_at[node] = max(ended_ms, ended_at.get(node, 0))
 for node, last_heartbeat_at in latest.items():
     if last_heartbeat_at < cutoff and ended_at.get(node, 0) < last_heartbeat_at:
         print(f"{node}\t{last_heartbeat_at}")
@@ -1146,7 +1708,7 @@ _dispatch_node() {
   fi
 
   if [ "$workflow_lane" != "$dispatch_lane" ]; then
-    echo "==> dispatch node_id=${node_id} type=${node_type} model_lane=${dispatch_lane} (policy ${MO_ROUTING_POLICY}: ${workflow_lane} → ${dispatch_lane})"
+    echo "==> dispatch node_id=${node_id} type=${node_type} model_lane=${dispatch_lane} (policy ${MO_ROUTING_POLICY:-learning_governed}: ${workflow_lane} → ${dispatch_lane})"
   else
     echo "==> dispatch node_id=${node_id} type=${node_type} model_lane=${dispatch_lane}"
   fi
@@ -1229,7 +1791,14 @@ _dispatch_node() {
     MO_NODE_PROMPT_SHA=$(shasum -a 256 "$PROMPT_FILE" 2>/dev/null | cut -c1-12)
   export MO_NODE_PROMPT_SHA
 
-  NODE_TRACE_ID="tr-${node_type}-$(date +%s)-$$"
+  # Uniqueness across a parallel batch: $$ is the parent shell PID and is
+  # IDENTICAL inside every `( _dispatch_node ... ) &` subshell, and date is
+  # second-granular, so same-type lenses dispatched together (e.g. the 4
+  # research_synthesis researcher lanes) collided on one trace_id — only one
+  # row survived the PK insert, silently dropping 3 of 4 lane traces and
+  # starving GRPO of competitors. node_id is unique per node in the batch;
+  # BASHPID disambiguates subshells as defense-in-depth.
+  NODE_TRACE_ID="tr-${node_type}-$(date +%s)-${BASHPID}-${node_id}"
 
   # Learned-failure-mode injection: pull high-confidence gradients for this
   # task_class (written by `mini-ork reflect`) into every LLM node prompt.
@@ -1285,6 +1854,20 @@ _dispatch_node() {
           kimi_correctness_lens) CONTEXT_FILE="$RUN_DIR/judge-kimi-correctness.md" ;;
           codex_codebase_lens) CONTEXT_FILE="$RUN_DIR/judge-codex-codebase.md" ;;
           minimax_perf_lens) CONTEXT_FILE="$RUN_DIR/judge-minimax-performance.md" ;;
+          *)
+            if [[ "$node_id" == *_lens || "$node_id" == *-lens ]]; then
+              CONTEXT_FILE="$RUN_DIR/lens-${_norm_id}.md"
+            else
+              CONTEXT_FILE="$RUN_DIR/context-${node_id}.json"
+            fi
+            ;;
+        esac
+      elif [ "${MINI_ORK_RECIPE:-}" = "recursive-validate-impl" ]; then
+        case "$node_id" in
+          tier4_glm) CONTEXT_FILE="$RUN_DIR/tier4-glm.md" ;;
+          tier4_kimi) CONTEXT_FILE="$RUN_DIR/tier4-kimi.md" ;;
+          tier4_codex) CONTEXT_FILE="$RUN_DIR/tier4-codex.md" ;;
+          tier4_minimax) CONTEXT_FILE="$RUN_DIR/tier4-minimax.md" ;;
           *)
             if [[ "$node_id" == *_lens || "$node_id" == *-lens ]]; then
               CONTEXT_FILE="$RUN_DIR/lens-${_norm_id}.md"
@@ -1497,8 +2080,16 @@ PY
       # D-020/D-054: synthesizer-style reviewers write the recipe's
       # source_artifact (usually synthesis.md, but recipes can override it to
       # options.md, report.md, etc.) instead of review-*.json.
+      #
+      # recursive-validate-impl is the exception: tier4_synth is not an
+      # informational synthesis artifact. It is the approval gate for publish,
+      # and its prompt requires strict JSON at panel-verdict.json.
       local _is_synth=0
-      if [[ "$node_id" == *synth* ]]; then
+      local _is_panel_gate=0
+      if [ "${MINI_ORK_RECIPE:-}" = "recursive-validate-impl" ] && [ "$node_id" = "tier4_synth" ]; then
+        REVIEW_FILE="$RUN_DIR/panel-verdict.json"
+        _is_panel_gate=1
+      elif [[ "$node_id" == *synth* ]]; then
         local _contract_src="synthesis.md"
         local _contract="$MINI_ORK_ROOT/recipes/${MINI_ORK_RECIPE:-}/artifact_contract.yaml"
         if [ -f "$_contract" ]; then
@@ -1528,7 +2119,10 @@ PY
       if [ -f "${PROMPT_FILE:-}" ]; then
         _prepend=$'\n\n--- Recipe prompt (system context) ---\n'"$(cat "$PROMPT_FILE")"$'\n--- /recipe prompt ---\n\n'
       fi
-      if [ "$_is_synth" -eq 1 ]; then
+      if [ "$_is_panel_gate" -eq 1 ]; then
+        # Verdict-bearing synthesizer: the recipe prompt owns the JSON schema.
+        PROMPT_CONTENT="${_prepend}Synthesize panel verdict for: ${node_desc}${_learned_block}\n\nPlan:\n${PLAN_CONTENT}\n\nWrite strict JSON to: ${REVIEW_FILE}"
+      elif [ "$_is_synth" -eq 1 ]; then
         # Synthesizer: write markdown to the recipe source artifact; no verdict
         # envelope.
         PROMPT_CONTENT="${_prepend}Synthesize for: ${node_desc}${_learned_block}\n\nPlan:\n${PLAN_CONTENT}\n\nWrite your synthesis to: ${REVIEW_FILE}"
@@ -1744,6 +2338,36 @@ except Exception:
         fi
       fi
       # ─────────────────────────────────────────────────────────────────
+
+      if [ "${MINI_ORK_RECIPE:-}" = "recursive-validate-impl" ]; then
+        local _panel_verdict_file="${MINI_ORK_RUN_DIR:-${MINI_ORK_HOME}/runs/${MINI_ORK_RUN_ID}}/panel-verdict.json"
+        if [ ! -s "$_panel_verdict_file" ]; then
+          echo "  [BLOCK] publisher: missing panel verdict at $_panel_verdict_file" >&2
+          return 1
+        fi
+        local _panel_publish_ok
+        _panel_publish_ok=$(python3 - "$_panel_verdict_file" 2>/dev/null <<'PY'
+import json, sys
+try:
+    data = json.load(open(sys.argv[1], encoding="utf-8"))
+except Exception:
+    print("false")
+    raise SystemExit(0)
+verdict = str(data.get("verdict", "")).strip().lower()
+pass_value = data.get("pass")
+if pass_value is True or verdict in {"approve", "approved", "pass"}:
+    print("true")
+else:
+    print("false")
+PY
+)
+        if [ "$_panel_publish_ok" != "true" ]; then
+          echo "  [BLOCK] publisher: panel verdict is not approved — publish refused" >&2
+          head -c 1200 "$_panel_verdict_file" >&2 || true
+          echo >&2
+          return 1
+        fi
+      fi
 
       local _contract="$MINI_ORK_ROOT/recipes/${MINI_ORK_RECIPE:-}/artifact_contract.yaml"
       if [ ! -f "$_contract" ]; then
@@ -2042,6 +2666,12 @@ case "$DISPATCH_MODE" in
       IFS="$NODE_FIELD_SEP" read -r node_id node_type node_desc node_prompt_ref node_dmode node_verifier_ref node_model_lane node_requires_capabilities <<< "$entry"
       case "${node_dmode:-serial}" in
         parallel)
+          # v0.2-pt7 (R3/F-28) cap was missing on this serial-walk branch:
+          # consecutive per-node `parallel` dmode nodes spawned uncapped,
+          # saturating the process table + signalling claude startup lstat()
+          # with EINTR on slow/external volumes. Honor MINI_ORK_MAX_PARALLEL
+          # here too (block-then-continue), matching the global parallel mode.
+          _maybe_flush_batch_at_cap PIDS
           ( _dispatch_node "$node_id" "$node_type" "$node_desc" "$node_prompt_ref" "$node_verifier_ref" "$node_model_lane" "$node_requires_capabilities" ) &
           PIDS+=($!)
           ;;
@@ -2082,6 +2712,11 @@ if [ "$DRY_RUN" -eq 0 ]; then
                            "dispatch_error" \
                            "${FAIL_COUNT} node(s) failed" || true
     fi
+  fi
+
+  if [ "${MO_LEARNING_WRITEBACK:-1}" = "1" ]; then
+    mo_learning_update_conductor_outcomes >/dev/null
+    mo_learning_write_grpo_advantages >/dev/null
   fi
 fi
 
