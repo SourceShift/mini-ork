@@ -1,304 +1,178 @@
-# Synthesis — GEPA / Memory / Context-Engine Integration Audit
+---
+title: GEPA ↔ Memory ↔ Context-Engine Integration & Correctness Audit — Synthesis
+feature: prompt_evolution
+doc_type: research
+status: active
+version: 1.0
+last_updated: 2026-06-25
+last_verified: 2026-06-25
+owner: "@mini-ork-synthesizer"
+audience: agent+human
+supersedes: null
+replaced_by: null
+canonical_path: docs/_meta/research/20260625-gepa-memory-contextengine-integration-audit.md
+tags: [gepa, memory, context-engine, integration-audit, zero-fallback, chart-drift, prompt-harness]
+---
 
-**Run:** `run-1782378483-66819` · **Date:** 2026-06-25 · **Stance:** read-only, integration-completeness first.
+# GEPA ↔ Memory ↔ Context-Engine — 4-Lens Integration Audit (Synthesis)
 
-> **Lens coverage: 2 of 4 landed.** `lens-codex.md` (LLM-dispatch/cost) and
-> `lens-opus.md` (architectural shape) completed. **`lens-glm` and `lens-kimi`
-> never ran** — both died at launch on missing API keys
-> (`KIMI_API_KEY`, `MINIMAX_API_KEY` unset in
-> `MINI_ORK_HOME/config/secrets.local.sh`, see
-> `.mini-ork/runs/run-1782378483-66819/llm-failures/1782378577-{kimi,minimax}.err.log`).
-> minimax was the glm-substitute (per the standing skip-GLM rule). **This is a
-> meta-loop hit** — the audit was itself blocked by the exact config-drift /
-> unmirrored-secret class it set out to find. Consensus signal below is
-> therefore weaker than a 4-lens design: where Codex and Opus *independently*
-> converge, that is strong; single-lens findings are NOT down-weighted but ARE
-> un-triangulated. See §6.
+**Run:** `run-1782379484-31281` · **Lenses:** GLM/MiniMax (tactical breadth), Kimi (code-level correctness), Codex (LLM-dispatch/cost + wiring), Opus (architectural shape) · **Mode:** read-only.
 
-Finding IDs: `D-N` = Codex lens, `O-RN` = Opus lens. Consensus (2+ lenses) = ★.
+**Finding IDs:** `G-N` = GLM, `K-N` = Kimi (refactor-N), `D-N` = Codex (finding-N), `O-RN` = Opus recommendation N. **★** = consensus (surfaced by 2+ lenses).
+
+**The one-paragraph verdict.** Of the three subsystems only **GEPA→Harness (Seam A) is wired end-to-end**. Memory↔Context-Engine (Seam B) and Compose→Chapter-Writing (Seam C) are *dark* — built, imported, but no data flows through them (Opus §1-4). On top of that structural gap sits a dense cluster of **fail-open Zero-Fallback violations** (Kimi K-3..K-7, K-15) and **chart-drift** that silently no-ops memory hardening and two crons in prod (G-3, G-4, O-R8, O-R10). The cheapest, highest-consequence wins are config-surface + fail-closed flips; the substrate work is closing Seam B by making memory a budgeted compose layer.
 
 ---
 
-## Section 1 — Severity × leverage matrix
+## Section 1 — Severity × Leverage Matrix
 
-Severity: **P1** = load-bearing now (correctness / prod-starvation), **P2** =
-v0.x+1 architectural, **P3** = tracked, not load-bearing. Leverage = blast radius
-÷ how much it unblocks. (Opus's "P0" R1 sits at top-of-P1 here.)
+Cells list finding IDs. **★** marks consensus (2+ lenses on the same defect).
 
-| | HIGH leverage | MED leverage | LOW leverage |
+| | **HIGH leverage** | **MED leverage** | **LOW leverage** |
 |---|---|---|---|
-| **P1** | **O-R1 ★** (un-starve GEPA, 1 chart line) · **O-R7** (SM-2→compose bridge) · **O-R5** · **O-R6** | **O-R3** (SM-2 kernel) · **O-R2** (boot flag-assert) | — |
-| **P2** | **D-9** ($700/d citation batch) · **D-8** ($600/d judge cascade) · **D-4 ★** ($450/d judge batch) | **D-1/D-2/D-3** (distill batch+policy) · **D-13 ★** (guard facade) · **O-R8 ★** (fail-loud catches) · **O-R4** (typed import) | **D-11/D-12** (tier:'tag' routing) · **D-10** (calibrator cap) |
-| **P3** | — | **D-5/D-6/D-7** (deep GEPA batch chain) · **D-14** (HYPE cost visibility) | store-collapse decision (§5) |
+| **P1** (ship ≤2 wk) | **G-3★/O-R8★** (HARD_FAIL fail-open), **K-1★** (Mem0 app read-after-write break), **G-12** (compose cache cross-user leak), **K-4** (ACL single-row fail-open), **K-7** (write-gate wrong user_uuid), **K-5** (calibrator Redis fail-open), **G-1/G-10** (redteam_quarterly silent no-op) | **K-2** (skill provenance `'system'`), **K-6** (bucket-perm fail-open), **K-13** (cache TTL NaN → write 500), **K-3★/D-9** (compose layer silent-empty), **K-15** (hebbian silent swallow) | **K-14** (kalman clamp), **K-8** (driftProbe deleted-block filter), **G-4** (LLM_JUDGE_CRON missing), **G-8** (adaptive-attack cron outside gate) |
+| **P2** (v0.x+1) | **G-5★/G-6★/K-9★/K-10★/D-6★/O-Seam-B** (GEPA harness bypass), **O-R2★/O-R3★/G-11** (Mem0→compose layer + score_metadata), **K-11** (shadow experiment never scheduled) | **D-arch2** (batch structured API), **D-arch1** (budget envelope), **O-R5** (wire one chapter-compose, delete dup), **O-R6** (contract hot read-path), **D-1/D-2/D-8/D-10/D-12/D-15** (serial dispatch) | **D-arch3** (gateway cache policy), **D-13** (compose-hint before deterministic route), **D-5** (judge tier escalation always) |
+| **P3** (tracked) | **O-R4** (system-of-record decision), **G-7★/O-R11★** (consolidate memory flags off SealedSecret) | **G-9** (dead barrel), **G-18/G-19/G-22** (dead exports), **D-14** (multimodal overlap) | **G-14/G-21** (naming collisions), **G-20** (file placement), **G-2** (dual red-team path), **O-R9★** (BCE_M3 dual home) |
 
-**Consensus cells:**
-- **★ `llmJudgeCron.ts` is a load-bearing weak point** — surfaced by *both*
-  lenses via *different* failure modes: Opus O-R1 (flag-starved →
-  `llmJudgeCron.ts:341` never scores) + Codex D-4 (when it *does* run, it's a
-  serial per-execution loop, `llmJudgeCron.ts:341`/`:498`). Same component, two
-  orthogonal defects → highest-confidence target in the audit.
-- **★ Silent-degradation in the LLM dispatch path** — Codex D-13 (GEPA/CE hot
-  paths bypass `withGuards`, `server/llm/middleware/index.ts:4`) + Opus O-R8
-  (resolver `catch { return null }`, `promptIntegrationService.ts:1266`). Both
-  name the same Zero-Fallback-violating shape from opposite ends (missing guard
-  vs. swallowing catch).
-- **★ Chart flag-mirroring** — both lenses independently ran the same
-  flag-vs-chart diff and corroborate on the *present* flags at identical
-  anchors (`infra/charts/libwit/values.yaml:299` `BCE_M3_CALIBRATOR`, `:307`
-  `FEATURE_PROMPT_EVOLUTION`; Codex "what's already right" #7 = Opus §6 table).
-  Opus extends it to the *missing* flags. Convergent methodology, complementary
-  coverage.
+**Consensus signal map** (the defects ≥2 lenses independently flagged — fix these first, the cross-validation is your confidence):
+
+- **`FEATURE_MEMORY_HARD_FAIL` fail-open** — G-3, Kimi chart table (`lens-kimi.md:538`), O-R8. **3 lenses.**
+- **GEPA bypasses the prompt harness** — G-5/G-6, K-9/K-10, D-6, Opus Seam B. **4 lenses.**
+- **Memory flags absent from `values.yaml` (chart-drift)** — G-7, Kimi chart table, Codex "what's already right" (`lens-codex.md:112`), O-R11. **4 lenses.**
+- **Compose layer fail-open / Zero-Fallback** — K-3, D-9 (different sites, same anti-pattern). **2 lenses.**
+- **Mem0 read-after-write / Seam-B silo** — K-1 (the `app` mismatch), Opus §3. **2 lenses.**
+- **`BCE_M3_CALIBRATOR` dual config home** — GLM flag matrix (`lens-glm.md:56`), O-R9. **2 lenses.**
 
 ---
 
-## Section 2 — Top 5 immediate wins (P1 / highest-ROI) — total < 1 week
+## Section 2 — Top 5 Immediate Wins (P1)
 
-Ranked by ROI (severity × leverage ÷ effort), not lens order.
+Ranked by ROI = (severity × leverage) ÷ effort. Total effort < 2 weeks.
 
-| # | ID | Title | Lens | One-line fix | Effort |
+| Rank | ID | Title | Lens | One-line fix | Effort |
 |---|---|---|---|---|---|
-| 1 | **O-R1 ★** | `FEATURE_LLM_JUDGE_CRON` absent → GEPA promotion starves | Opus (+ Codex D-4 corroborates the component) | Add the flag (+ confirm `concludeShadowCron` gate) to `infra/charts/libwit/values.yaml` beside `:307`, with a loud `logger.info` on flag-OFF | 0.5 d |
-| 2 | **O-R5** | `FEATURE_MEMORY_HARD_FAIL` unmirrored → Mem0 writes fail silent | Opus | Mirror to chart, default `'true'` (pre-prod fail-loud), read at `memoryHealthProbe.ts:35` | 0.5 d |
-| 3 | **O-R6** | 3× `CONTEXT_*` crons unmirrored → FSRS decay never runs in prod | Opus | Mirror `CONTEXT_FSRS_DECAY_CRON` / `CONTEXT_RECONCILE_CRON` / `CONTEXT_ENGINE_EVAL_INTERVAL_MS`; decay is the load-bearing one (else `block_memory_open_set` grows monotonically) | 0.5 d |
-| 4 | **D-8** | Balanced eval pays Flash+OpenRouter+Claude up-front | Codex | Cascade: Flash first → add OpenRouter only on low-confidence → Claude only on disagreement, `balancedEvaluation.ts:127`/`:150`/`:165` | 1–2 d |
-| 5 | **D-11 + D-12** | Pure classifiers dispatch `tier:'fast'`, not `tier:'tag'` | Codex | Flip `verticalClassifierLLM.ts:256` + `autoAssignChapterSkills.ts:158` to `tier:'tag'` (64% input-cost cut, `tiers.ts:62`) | 0.5 d |
+| 1 | **K-1★** | Mem0 `app` mismatch makes every trajectory write invisible to read | kimi | Write `app: BOOK_GEN_MEMORY_APP` + move `trajectory_kind` into `metadata` (`bookMemoryService.ts:294`/`:373`); dual-read window before dropping legacy filter | 0.5d |
+| 2 | **G-12** | Compose cache leaks progressive-delivery `delivered_uuids` across users | glm | Add `user_uuid` + `session_uuid` to `hashQuery` key composition in `contextEngine/cache.ts` | 0.5d |
+| 3 | **G-3★ / O-R8★** | `FEATURE_MEMORY_HARD_FAIL` absent in all 5 config surfaces → CAM silently OFF in prod | glm+opus | Mirror flag to `values.yaml` backend.env + `server/.env.example` (explicit `'false'`); add `logger.info` on flag-OFF at `memoryHealthProbe.ts:35`; **decide** book-gen posture (flip on or document best-effort) | 0.5d |
+| 4 | **K-4 / K-7** | ACL single-row fail-open + write-gate fed a block UUID as `user_uuid` | kimi | `acl.ts:122` return `{allowed:false}` on zero rows; `operations.ts:329` resolve real owner `user_uuid` via `blocks` lookup (reuse the K-6 lookup) | 1d |
+| 5 | **G-1 / G-10** | `redteam_quarterly` enqueued but not in `PROMPT_EVOLUTION_PIPELINE_TYPES` → fires into a silent `{success:true, itemsProcessed:0}` no-op every quarter | glm | Add `'redteam_quarterly'` to the type list (`promptEvolutionCronDispatch.ts:33`) + a `case` in `_dispatch` (`:96`) calling `handleRedTeamDrill` (`redTeamCron.ts:309`) | 1d |
 
-Sum ≈ **3.5–4.5 engineer-days**. #1–#3 are one-line chart edits behind a
-verified consumer; ship them in a single PR + a smoke that greps the prod pod
-env for each flag. #4–#5 are pure cost cuts (~$750/day combined at 100K-turn
-scale per Codex's own estimates) with zero behavior change.
+**Runner-up P1s** (same sprint, lower individual ROI but trivial): K-5 (calibrator `return POSITIVE_INFINITY` on Redis-down, `calibrationGate.ts:141`), K-13 (validate `CONTEXT_CACHE_TTL_SECONDS`, `cache.ts:223` — currently `NaN` 500s every cache write), K-2 (skill provenance real `user_uuid`, `skillBank.ts:339`), K-14 (clamp Kalman `U` to [0,1], `kalman.ts:47`), K-8 (driftProbe `AND` not `OR` on deleted/tombstoned, `driftProbe.ts:242`).
 
-Bonus same-PR add: **O-R2** (boot-time assertion that the GEPA flag dependency
-set is co-present) — fails loud at startup so a half-registered subsystem can
-never silently recur. ~0.5 d.
+> **Sequencing note:** K-4 and K-7 share the `blocks` owner-lookup that K-6 also needs — land all three ACL/owner fixes in one commit and cache the lookup once. K-3 (compose layer fail-fast) should land **after** the manifest gains an explicit `optional: true` marker per layer, or it will hard-fail composes that legitimately tolerate a missing enrichment layer.
 
 ---
 
-## Section 3 — v0.x+1 architectural shifts (P2)
+## Section 3 — v0.x+1 Architectural Shifts (P2)
 
-Bundled by substrate theme.
+Bundled by theme. Each bundle names total eng-weeks, prerequisite P1s, and risk-if-deferred.
 
-### Bundle A — data-layer: one write→store→read spine per memory class · ~3 eng-wks
-- **O-R3** extract SM-2/FSRS recurrence into a single pure kernel
-  (`server/services/memory/sm2Kernel.ts`); both `spacedRepetitionService.ts:430`
-  and `spacedRepetitionScheduler.ts:62` call it. Today they are two disjoint
-  re-implementations over `memory_items` vs. `user_chapter_progress`.
-- **O-R7** (highest single-leverage item in the audit) add `layers/dueReview.ts`
-  reading the unified store, injecting "overdue concepts" as an open-set fact
-  class into `compose()`. This is the *only* change that makes the two memory
-  subsystems actually one.
-- **O-R4** replace the widened-module runtime reflection in
-  `memoryExtractionProcessor.ts:74-217` with a typed
-  `import { writeMemory }`; let `tsc` be the contract.
-- **Prereq P1s:** O-R3 must land before O-R7 (R7 reads the kernel's store).
-- **Risk if deferred:** the next off-by-one SM-2 fix lands in one engine and
-  silently leaves the other wrong (Opus); "spaced-repetition-aware context"
-  stays structurally impossible.
+### Bundle A — LLM-dispatch: route GEPA prompts through the harness ★ (4-lens consensus)
+**Findings:** G-5, G-6, K-9, K-10, D-6, Opus Seam B. **Eng-wks:** 1.5. **Prereq P1s:** none. **Risk if deferred:** the entire prompt-evolution arc (GEPA mutation/reflection, VISTA gates, judge rubric, balanced-eval) emits inline `prompt: \`...\`` literals — only **1 of 44** `promptEvolution/*` files calls `registerPrompt` (`adversarialDrill.ts:63`; G-5). The 3-tier override chain (document→user→registered default) is **inert** for prompt-evolution, and quarterly reruns bypass the semantic/idempotency caches (D-6). This is also a direct violation of the project's mandatory harness rule. Migrate `gepaCron.ts:206/:367`, `gepaReflector.ts`, `judgeRubricService` through `registerPrompt` + `resolvePromptForDocument`; key candidate JSON by `{promptSlug, parentVersion, sampleSetHash, baselineHash}` (D-6) to claw back 80-100% on replayed cycles.
 
-### Bundle B — LLM-dispatch: batch-first pipelines · ~2.5 eng-wks
-- **Context distill** D-1 (STITCH per-fact, `distill.ts:202`→`stitch.ts:65`) +
-  D-2 (op-classify per-fact, `distill.ts:227`→`operations.ts:224`) + D-3
-  (`shouldDistillNow` always returns `true`, `distill.ts:284`) → fold into one
-  batch job per turn/chapter. Codex est. **70–90% fewer CE LLM calls**.
-- **GEPA** D-4 (judge batch ★) + D-5 (reflection patch batch,
-  `gepaReflector.ts:326`) + D-6 (validation chain fuse,
-  `validationPipeline.ts:103`) + D-7 (fixture batch, `fixtureRunner.ts:97`).
-- **Citation** D-9 classify-per-chapter (`citationAuditService.ts:556`) with a
-  content-hash read-through cache. Single biggest line item ($700/day).
-- **Prereq P1s:** none — independent of Bundle A.
-- **Risk if deferred:** linear/quadratic LLM spend scales with traffic; today's
-  cost is invisible until volume arrives.
+### Bundle B — Data-layer: close Seam B, make memory a budgeted compose layer ★
+**Findings:** O-R2, O-R3, G-11, K-1. **Eng-wks:** 2-3. **Prereq P1s:** K-1 (fix the read-after-write break first, or you fold a broken store into compose). **Risk if deferred:** memory reaches the model as an *opaque prose splice* (`{{relevant_memory}}` at `promptIntegrationService.ts:1409`), outside the compose token budget and untraced (Opus §8). The FSRS/Kalman scoring machinery is **built but dormant** — `semantic.ts:149` ranks by score *if* `score_metadata` is supplied, but `compose.ts:495` never supplies it, so it always falls through to flat cosine (Opus §3). Thread `score_metadata` into `loadSemantic` (O-R2), promote the splice to a `loadMem0()` compose layer (O-R3). This is also the **scale fix**: Opus §6 shows the remote OpenMemory REST hop is the first thing to break under 10× load — folding it into a Postgres-local layer solves wiring + latency together.
 
-### Bundle C — runtime: central guarded facade + fail-loud · ~1.5 eng-wks
-- **D-13 ★** move idempotency/throttle/circuit-breaker into `llm.generate*`
-  defaults for named hot paths (`server/llm/middleware/index.ts:4`) instead of
-  "helper exists, caller must remember." GEPA + CE currently bypass it.
-- **O-R8 ★** replace bare `catch { return null }` at
-  `promptIntegrationService.ts:1266` + `:1284` with a logged, metric-incremented
-  catch that distinguishes "not found" (null) from "lookup failed" (alert).
-- **D-3** enforce the distill policy knobs (gate before dispatch).
-- **Risk if deferred:** a transient DB blip silently downgrades *every* prompt
-  to its hard-coded default with no telemetry — degradation that looks like
-  normal operation (Opus).
+### Bundle C — Runtime: batch structured-output + budget envelope
+**Findings:** D-arch1, D-arch2, D-1, D-2, D-8, D-10, D-12, D-15. **Eng-wks:** 2. **Prereq P1s:** none. **Risk if deferred:** GEPA VISTA scoring (`vistaGate.ts:322`), LLM-judge (`llmJudgeCron.ts:341`), balanced-eval (`balancedEvaluation.ts:114`), memory calibration (`memoryExtractionProcessor.ts:318`), and multimodal indexing (`pdfLayoutIndex.ts:102`) all loop serially over records that share a rubric/system prompt. A single `llm.generateStructuredBatch({items, sharedPrompt, itemSchema, maxConcurrency})` helper (D-arch2) is the largest cross-cutting save — 50-80% input-token reduction on repeated framing — and a gateway-level budget contract (D-arch1) caps surprise spend before dispatch, not in nightly cron.
 
-### Bundle D — observability: chart-drift + cost visibility · ~1 eng-wk
-- **O-R2** boot-time flag-dependency assertion (also in §2 bonus).
-- Loud `logger.info` on every gated flag-OFF (chart-drift class, per
-  `FEATURE_PG19_EXEMPLARS` incident) so "starved" ≠ "no work."
-- **D-14** include generation cost in HYPE's returned `totalCost`
-  (`hype.ts:142` returns embedding-only) so budgets can actually stop dispatch.
-- **D-10** add pre-dispatch cost estimate + `(memory_kind, normalized_tags,
-  text_hash)` cache to the calibrator (`bookMemoryService.ts:817` warns *after*
-  the call already happened at `:797`).
+### Bundle D — Wire the end-to-end evolution + chapter paths
+**Findings:** K-11, O-R5, O-R6, D-9. **Eng-wks:** 1.5. **Prereq P1s:** Bundle A (harness) for K-11's prompt path. **Risk if deferred:** `runEvolutionPipeline` logs "shadow testing" but **never creates the experiment or schedules `concludeAfter`** (K-11, `evolutionOrchestrator.ts:254`) — accepted candidates are never promoted, so the loop GEPA *looks* like it closes is open. Two dead chapter-compose implementations sit next to the live triad path (O-R5: `bookOrchestratorContextFirst.ts:76` + `chapterGenerate.ts:49`) — pick one, wire it, delete the other in the same commit (Pre-Prod posture). Balanced-eval emits a synthetic `score:0.5` verdict when all judges fail (D-9, `balancedEvaluation.ts:175`) — treat zero/under-quorum as a hard failed eval, never a promotable verdict.
 
 ---
 
-## Section 4 — Long-horizon (P3 + advisory)
+## Section 4 — Long-Horizon (P3 + advisory)
 
-- **D-5 / D-6 / D-7** deep GEPA batch chain — tracked behind Bundle B's
-  higher-ROI distill+citation work; GEPA volume is quarterly-cron-bounded today.
-- **D-14 / D-10** cost-visibility items — advisory until HYPE/calibrator paths
-  carry real traffic.
-- **Store-collapse decision** (§5) — the one multi-week call; explicitly *not*
-  forced now. R7's read-only bridge defers it cleanly.
-- Codex architectural #3 (operation-shape router with **enforcement tests** so
-  `vertical_classifier` / `book-skill-assignment` / citation-class / memory-op
-  default to `tag` unless justified) — lint/test scaffolding, low urgency but
-  prevents D-11/D-12 regressions.
+- **System-of-record decision (O-R4)** — `CLAUDE.md` says "Postgres is the SoR," yet trajectory memory lives only in remote OpenMemory. This is the *parent* of Bundle B and Section 5's hardest question — defer the decision, but track it as load-bearing for any 1000× plan.
+- **Config-surface consolidation (G-7★, O-R11★, O-R9★)** — move memory toggles (`BCE_M1_MEM0`, `OPENMEMORY_HOST`, `BCE_M1_PERSIST`) out of the SealedSecret into `values.yaml backend.env`, reserving the secret for genuine secrets (`MEM0_API_KEY`). De-dup `BCE_M3_CALIBRATOR` to one home (lives in *both* `values.yaml:299` and the secret — a drift trap where patching the secret silently does nothing because explicit `env:` wins).
+- **Dead-surface cleanup (G-9, G-18, G-19, G-22)** — the `promptEvolution/index.ts` barrel is imported by zero production code (3 test files only); 8 contextEngine sub-modules (`kalman/fsrs/hebbian/score/jit/dualRoute/sessionDelta/composeHint`) have zero cross-folder callers. Internalize behind `__internal__/` or accept as library-style surface — but they inflate the jest module-graph load today.
+- **Naming collisions (G-14, G-21)** — two `calibrationGate.ts` (GEPA canary vs compose read-gate) and `concludeShadowTest.ts` (production code matching the `*.test.ts` jest glob). Rename to disambiguate before a deep-import lands on the wrong one.
+- **Dual red-team path (G-2)** — chart cron runs `redTeamDrill.js` weekly while `redTeamCron` registers a BullMQ quarterly scheduler for the same work; two paths drift and one is already broken (G-1). Pick one.
 
 ---
 
-## Section 5 — Hardest open question
+## Section 5 — Hardest Open Question
 
-**Inherited from Opus §7: should the two SM-2 engines + the Mem0 layer collapse
-into one store, or stay three?**
+**Inherited from Opus §9:** *Should memory be a Context-Engine compose layer (Postgres-local) or stay a separate remote forgetting-curve service (OpenMemory)?*
 
-Opus sketches three mitigations: **(a) collapse** → one `memory_store`, R7
-trivial; **(b) keep three** → respects the latency/ownership boundary, R7 via a
-read-only cross-layer join; **(c) bridge via R7** regardless. Opus leans
-*keep-three + unify-the-math + bridge*, held loosely.
+Opus sketches the dependency: the answer **hinges on what `OPENMEMORY_HOST` actually points at** — a rich managed Mem0 (vector recall, entity resolution, cross-session consolidation) or a localhost stub. If managed → thin-sync that mirrors recalls into a CE layer for ranking, leaving consolidation remote. If stub → fold in wholesale.
 
-**My assessment: the three mitigations are sufficient to defer the decision, not
-to resolve it.** Unifying the *math* (O-R3) is unambiguously correct and
-unblocks everything downstream — do it now, no further research needed. The
-*store* decision should NOT be made on this audit's evidence, because the one
-input that decides it was never gathered: **the compose latency budget.** R7's
-read-only join (mitigation c) is cheap *only if* compose can afford one extra PG
-read per turn within its existing budget — and `compose.ts` already does cache +
-budget-paring + parallel fanout (`compose.ts:366`/`:447`, Codex), so the
-headroom is measurable but unmeasured here. The genuinely open sub-question is
-**product, not architectural**: must SM-2 mastery influence agent context in
-*real-time* (forces collapse) or is *batch* acceptable (keep-three + R7 read
-layer wins)? That is a one-experiment question — instrument compose's p95 with a
-shadow `dueReview` join behind a flag, measure the delta, *then* decide. **More
-research needed, but it is bounded and cheap** (one flagged read-only layer + a
-latency probe), not a speculative multi-week migration. Recommendation: ship
-O-R3 now, prototype O-R7 as read-only behind a flag, and let the latency number
-make the collapse call.
+**My assessment: the three sketched mitigations are necessary but NOT sufficient — more research is required, and it is cheap research.** Opus correctly notes the SealedSecret value is unreadable from a read-only repo audit, but the resolution is one authorized command away and does **not** need the secret plaintext:
+
+1. `kubectl exec deploy/libwit-backend -n researcher -- printenv OPENMEMORY_HOST` (read-only, pre-authorized jisawru scope) reveals host shape — managed DNS vs `127.0.0.1`.
+2. `kubectl get pods -n researcher | grep -i openmemory` + a `curl` to `$OPENMEMORY_HOST/health` from inside the pod tells you if it's a real service with real row counts.
+3. A `SELECT count(*) FROM block_memory_open_set` vs the OpenMemory row count quantifies how much consolidation would have to be re-implemented.
+
+Until those three probes run, **any commitment to Bundle B's R3/R4 is premature** — you'd be choosing a substrate shape blind. This is the single highest-leverage unknown in the tri-subsystem design, and it's resolvable in ~20 minutes of pod introspection. **Recommendation: run the three probes before scheduling Bundle B; the probe result selects thin-sync vs wholesale-fold.**
 
 ---
 
-## Section 6 — Dogfood reflection (meta-loop check)
+## Section 6 — Dogfood Reflection (meta-loop check)
 
-**Was this audit reproducible via the framework? Partially — and it was blocked
-by a defect of the exact class it audits.**
+**Was this audit reproducible via the framework?** Yes — 4 heterogeneous lenses dispatched in parallel, each produced a non-empty grep-anchored report, and synthesis cross-validated 6 consensus defects. The framework's value showed precisely where lenses *disagreed in emphasis but agreed on fact*: Codex called chart-drift "mixed, not uniformly broken" (`lens-codex.md:112`) and was right to caution that SealedSecret may carry `BCE_M1_MEM0` — GLM and Kimi flagged the same flags as "missing from values.yaml" without that nuance. The synthesis preserves Codex's caveat: **chart-absence is necessary but not sufficient proof of empty prod pods.** That tension is the audit working as designed.
 
-1. **2 of 4 lenses never ran.** `lens-kimi` and `lens-minimax` (the glm-slot
-   substitute) both died at launch:
-   `KIMI_API_KEY`/`MINIMAX_API_KEY` "is required - set it in
-   `MINI_ORK_HOME/config/secrets.local.sh`"
-   (`llm-failures/1782378577-{kimi,minimax}.err.log`). **This is the
-   unmirrored-secret / config-drift class — the same failure mode the audit's
-   own flag-mirroring section (O-R1/R5/R6) is built to catch.** The audit
-   tripped on its own primary finding theme. Meta-loop: confirmed.
-2. **Telemetry sink missing.** `trace-write-errors.log` shows three
-   `sqlite3.OperationalError: no such table: llm_calls` — the run's own
-   cost-ledger write-path has no table behind it. That is a write-path-with-
-   no-read-target — *also* a finding class this audit hunts (cf. O-R7's SM-2
-   write with no compose read). The framework instrumenting the audit exhibits
-   the defect category under audit.
-3. **Consensus is half-strength.** The recipe's value proposition is 4-stance
-   triangulation; we got 2. Where Codex and Opus converge (the 3 ★ cells in
-   §1) the signal is real and load-bearing. But Kimi (correctness deep-read:
-   SM-2 off-by-one math, ACL fail-open, cache-key collisions, SQL param-typing)
-   and GLM (tactical breadth grep-sweep) covered dimensions **neither surviving
-   lens fully owns** — Codex is cost-shaped, Opus is shape-shaped. **The
-   correctness-bug surface (Kimi's mandate) is the single biggest blind spot in
-   this synthesis.** No SM-2 arithmetic was verified; O-R3's "they will drift on
-   the next off-by-one" is asserted, not proven, precisely because the lens that
-   would have proven it never ran.
+**Did any lens get blocked by something the audit itself identified?** Yes — a genuine meta-loop hit. Opus's hardest question (§9) is blocked by the **same config-surface fragmentation the audit flags as a P3 finding** (O-R11): because memory toggles live in the SealedSecret rather than `values.yaml`, the architectural lens *cannot read from the repo whether OpenMemory is real or a stub*. The audit's own finding (move flags off the SealedSecret for reviewability) is exactly what would have let the audit answer its hardest question without a live probe. The reviewability regression O-R11 names is not hypothetical — it blocked this very audit.
 
-**Verdict:** the *framework* is reproducible; *this run* was not clean. The
-findings that survived are trustworthy (anchored, cross-checked where possible),
-but the audit is **incomplete on correctness** and must be re-run at full lens
-capacity before any P1 SM-2 math claim (O-R3 drift) is treated as verified.
+**One honest gap:** every anchor is grep-derived against the working tree but **not** runtime-verified. G-15 (the documented-but-maybe-absent `MemoryUnavailableError` throw at `bookMemoryService.ts:772`) and the exact line drift in Opus's sub-agent-sourced anchors carry a "verify line still current" caveat. No lens ran the DB or an LLM — by design (read-only), but it means SM-2/FSRS math claims (K-14 clamp) are reasoned, not measured.
 
 ---
 
-## Section 7 — How to re-run
-
-**Blocker (P1 for re-run):** populate the two missing keys, else you get the
-same 2/4 degraded run:
+## Section 7 — How to Re-Run
 
 ```bash
-# In $MINI_ORK_HOME/config/secrets.local.sh (NOT committed):
-export KIMI_API_KEY=...        # unblocks lens-kimi (correctness deep-read)
-export MINIMAX_API_KEY=...     # unblocks lens-minimax (glm-slot substitute)
-```
-
-Then re-dispatch the audit recipe:
-
-```bash
+# From the audit worktree root:
 cd /Volumes/docker-ssd/Migration/Development/researcher-gepa-mem-ce-audit
-/Volumes/docker-ssd/ps/mini-ork/bin/mini-ork run research-synthesis \
-  .mini-ork/runs/run-1782378483-66819/plan.json
-# (recipe = 4 parallel lenses → synthesizer → verify-completeness → publish)
+
+# Re-dispatch the 4-lens refactor-audit recipe (mini-ork):
+bin/mini-ork run refactor-audit \
+  .mini-ork/kickoffs/gepa-mem-ce-integration-audit.md \
+  --lenses glm,kimi,codex,opus \
+  --budget-usd 40
+
+# Verifier (confirms all 4 lens reports + synthesis anchors/consensus/missing-integration):
+MINI_ORK_RUN_DIR=.mini-ork/runs/run-1782379484-31281 \
+  bash verifiers/lens-completeness.sh
 ```
 
-**Self-verification (verifier script `verifiers/lens-completeness.sh` was never
-authored — planned in the plan, absent on disk).** Inline checks from the
-`verifier_contract`, runnable now:
-
-```bash
-RUN=.mini-ork/runs/run-1782378483-66819
-for l in codex opus; do test -s "$RUN/lens-$l.md" && \
-  grep -qE '[A-Za-z0-9_/.-]+\.(ts|tsx|sql|sh):[0-9]+' "$RUN/lens-$l.md"; done
-test -s "$RUN/synthesis.md" && \
-  grep -qE '[A-Za-z0-9_/.-]+\.(ts|tsx|sql|sh):[0-9]+' "$RUN/synthesis.md"
-```
-
-The `lenses-exist-nonempty` and `each-lens-has-anchor` checks **pass for
-codex+opus and FAIL for glm+kimi** (absent) — an honest red, not a papered-over
-green. Author `verifiers/lens-completeness.sh` to encode this matrix and treat
-a <4 lens count as a hard fail on the next run.
+**P1 that blocks clean self-dispatch:** none in this run — all 4 lenses completed and the synthesizer dispatched normally. **Caveat for re-run:** per standing directives, **drop GLM and codex from mini-ork lane assignment** (GLM 429s on Fair Usage within 2-3 dispatches/hour; codex is banned in mini-ork lanes) — the lens *names* here are historical labels; the GLM lane already ran as MiniMax. Substitute `minimax,kimi,opus,sonnet` for a clean re-run.
 
 ---
 
-## Appendix A — Missing Integration (built-but-unwired, ≥5 with grep evidence)
+## Appendix — Missing-Integration Ledger (built-but-unwired)
 
-Every entry: a component that exists in source with low/zero downstream wiring.
+Every component below is implemented and type-checked but has **no live data path**. Grep call-site evidence inline.
 
-| # | Component | Built at | Wired? | Evidence | Lens |
-|---|---|---|---|---|---|
-| 1 | `FEATURE_LLM_JUDGE_CRON` (scores GEPA shadow runs) | consumer `llmJudgeCron.ts` processor | ❌ absent from chart | `grep -r FEATURE_LLM_JUDGE_CRON infra/charts/` → nothing | O-R1 (P0) |
-| 2 | `FEATURE_MEMORY_HARD_FAIL` (enforces Zero-Fallback on Mem0) | read `memoryHealthProbe.ts:35` | ❌ absent from chart | flag-diff §6 | O-R5 (P1) |
-| 3 | `CONTEXT_FSRS_DECAY_CRON` + reconcile + eval crons | `workers/unified/processors/contextFsrsDecay.ts` etc. | ❌ absent from chart | grep `infra/charts/` → nothing | O-R6 (P1) |
-| 4 | SM-2 store → compose read path | `memory_items` / `user_chapter_progress` writers exist | ❌ never read by compose | `grep memory_items compose.ts layers/` → 0 hits | O-R7 (P1) |
-| 5 | Second SM-2 engine sharing state | `spacedRepetitionScheduler.ts:93` | ❌ disjoint from `spacedRepetitionService.ts:177` | different table/columns, zero shared state | O-R3 (P1) |
-| 6 | `writeMemory` typed import | exported `bookMemoryService.ts:510` | ⚠ reached only by runtime reflection guard | `memoryExtractionProcessor.ts:74-217` widened-type `typeof` | O-R4 (P2) |
-| 7 | LLM guard middleware (`withGuards`) | `server/llm/middleware/index.ts:4` | ⚠ bypassed by GEPA/CE hot paths | grep: used by block-rewrite/book-validation, NOT `stitch.ts:65` / `llmJudgeCron.ts:259` | D-13 (P2) |
-| 8 | `shouldDistillNow` policy knobs | `distill.ts:279` (`every_n_turns`, `on_token_pressure`) | ⚠ declared, all branches `return true` | `distill.ts:284` | D-3 (P2) |
+| # | Component | File:line | Evidence of no wiring | Lens |
+|---|---|---|---|---|
+| 1 | `redteam_quarterly` handler | `promptEvolutionCronDispatch.ts:33` / `:96` | Enqueued to `scheduled-pipelines` but absent from `PROMPT_EVOLUTION_PIPELINE_TYPES` **and** `BCE_PIPELINE_TYPES` → `isPromptEvolutionPipelineType` false → silent `{success:true, itemsProcessed:0}` (`:76-82`) | G-1, G-10 |
+| 2 | Shadow experiment scheduling | `evolutionOrchestrator.ts:254` | Logs "shadow testing" but never calls `experimentService.createShadowExperiment` / sets `concludeAfter` → accepted candidates never promoted (loop is open) | K-11 |
+| 3 | Chapter-level compose | `bookOrchestratorContextFirst.ts:76-115` + `chapterGenerate.ts:49-84` | `getChapterContextFromEngine` / `composeChapterContext` exported, called **only by a test**; live path uses `loadChapterTriadContext` (`:2113`) | O-R5 |
+| 4 | Prompt harness in GEPA | `promptEvolution/*.ts` (43/44 files) | Only `adversarialDrill.ts:63` calls `registerPrompt`; `resolvePromptForDocument` has 0 real calls (2 JSDoc-only hits in `pipelineProxySignals.ts:160,193`) | G-5, G-6, K-9, K-10, D-6 |
+| 5 | FSRS/Kalman compose ranking | `semantic.ts:149` ← `compose.ts:495` | `loadSemantic` ranks by `score_metadata` **if supplied**; compose never supplies it → always flat cosine. Forgetting-curve writes have zero read leverage | O-R2, G-11 |
+| 6 | Mem0 ↔ Context Engine bridge | `compose.ts` (whole file) | **Zero references** to `bookMemoryService`; only bridge is the `{{relevant_memory}}` string splice at `promptIntegrationService.ts:1409` | O-R3 (Seam B) |
+| 7 | `ChapterWritingContract` read-path | `bookOrchestratorContextFirst.ts` | `loadLatestContract` called only by the repair loop; live path rebuilds fresh every run → write-path with no hot read-path | O-R6 |
+| 8 | `FEATURE_MEMORY_HARD_FAIL` throw | `bookMemoryService.ts:104,118` (doc) vs `:772` | Comments promise `MemoryUnavailableError` throw under hard-fail; no grep-confirmed `throw` site | G-15 |
+| 9 | `handleRedTeamDrill` | `redTeamCron.ts:309` | Called only from the dead queue path (#1) and a manual endpoint — no live worker invocation | G coverage table |
 
-8 candidates ≥ the 5-minimum. Items 1–5 are true zero-wire; 6–8 are
-wired-but-defeated (reflection / bypass / no-op).
+### FEATURE_* / BCE_* chart-mirroring table
 
-## Appendix B — Flag-mirroring table (chart source vs. `server/.env`)
+Canonical source: `infra/charts/libwit/values.yaml` backend.env vs the SealedSecret (`templates/sealed/libwit-server-env.yaml`). **"present-in-chart"** = explicit in `values.yaml backend.env`. *Caveat (Codex `lens-codex.md:112`): chart-absence is necessary, not sufficient, proof of empty prod — SealedSecret or `kubectl set env` may carry the value.*
 
-Every named `FEATURE_*` / `BCE_*` / `OPENMEMORY_*` / `CONTEXT_*` flag, with a
-present-in-chart verdict. Both lenses cross-checked; Codex confirms the ✅ rows
-at the same anchors Opus uses.
+| Flag | In `values.yaml`? | In SealedSecret? | In `.env.example`? | Prod reality | Action |
+|---|:---:|:---:|:---:|---|---|
+| `FEATURE_PROMPT_EVOLUTION` | ✅ `:307` | ❌ | ❌ | Crons register (Seam A producer ON) | OK |
+| `BCE_M3_CALIBRATOR` | ✅ `:299` | ✅ | ❌ | **Dual home** — `env:` wins, secret patch is a no-op trap | De-dup (O-R9) |
+| `BCE_M1_MEM0` | ❌ | ✅ `:42` | ✅ | Set via secret (encrypted, unreviewable) | Move to chart (G-7, O-R11) |
+| `OPENMEMORY_HOST` | ❌ | ✅ `:145` | ✅ | Sealed → cannot assert real host | Move to chart (O-R11) |
+| `BCE_M1_PERSIST` | ❌ | ✅ | — | Set via secret | Move to chart |
+| `BOOK_CONTEXT_FIRST` | ❌ | ✅ | — | Chapter path ON via secret | Move to chart |
+| `FEATURE_MEMORY_HARD_FAIL` | ❌ | ❌ | ❌ | **Absent everywhere → fail-open no-op in prod** | Mirror + decide posture (G-3★, O-R8★) |
+| `FEATURE_LLM_JUDGE_CRON` | ❌ | ❌ | ❌ | **Absent everywhere → nightly judge OFF in prod** | Mirror (G-4) |
+| `FEATURE_BOOK_EVENT_DRIVEN_DISPATCH` | ❌ | ❌ | ❌ | **Absent → newest feature (commit `0bfc4df7e`) dark in prod** | Mirror in shipping PR (O-R10) |
+| `BCE_M2_CALIBRATION_AUDIT_CRON` | ✅ `:325` (`'false'`) | ❌ | ❌ | Manual flip only; no auto-trigger despite "flip once enough rows" comment | Startup probe or runbook (G-13) |
+| `CE_T2_ENFORCE` | ❌ | — | ✅ | T2 agent/distiller writes log-allowed only | Mirror (K-table) |
+| `CE_T3_ENABLED` | ❌ | — | ✅ | Cross-scope agent writes always denied | Mirror (K-table) |
+| `HEBBIAN_TOPK` / `CONTEXT_CACHE_TTL_SECONDS` / `FSRS_STABILITY_FLOOR_DAYS` | ❌ | — | ✅ | Hardcoded defaults; chart cannot tune | Mirror (K-table) |
+| `FEATURE_HARNESS_PLANNER_WEIGHTS` | ✅ (`'false'`) | ❌ | ❌ | Chart only | OK |
 
-| Flag | In chart? | Anchor | Risk |
-|---|---|---|---|
-| `FEATURE_PROMPT_EVOLUTION` | ✅ | `infra/charts/libwit/values.yaml:307` | OK |
-| `BCE_M3_CALIBRATOR` | ✅ | `values.yaml:299` | OK |
-| `BCE_M1_MEM0` | ✅ | sealed `infra/charts/libwit/templates/sealed/libwit-server-env.yaml:42` | OK |
-| `OPENMEMORY_HOST` | ✅ | sealed `:145` | OK |
-| `FEATURE_MEMORY_HARD_FAIL` | ❌ MISSING | read `memoryHealthProbe.ts:35` | **P1 — silent Mem0 failure (O-R5)** |
-| `FEATURE_LLM_JUDGE_CRON` | ❌ MISSING | consumer `llmJudgeCron.ts:341` | **P0 — starves GEPA promotion (O-R1 ★ D-4)** |
-| `CONTEXT_RECONCILE_CRON` | ❌ MISSING | `contextReconcile.ts` | P1 — no reconcile in prod (O-R6) |
-| `CONTEXT_FSRS_DECAY_CRON` | ❌ MISSING | `contextFsrsDecay.ts` | P1 — memory monotonic growth (O-R6) |
-| `CONTEXT_ENGINE_EVAL_INTERVAL_MS` | ❌ MISSING | `contextEngineEval.ts` | P2 — no eval loop (O-R6) |
-| `FEATURE_LEGACY_GEPA_REFLECTOR` | ❌ MISSING | `gepaCron.ts:865` | P3 — default-OFF anyway |
-
-**Caveat (read-only, both lenses):** "missing from chart" ≠ "empty in prod pod"
-— flags can be injected via SealedSecret or `kubectl set env`; live pod env was
-**not** inspected. The P0/P1 verdicts are chart-*source* verdicts. The fix
-(mirror to chart) is correct regardless: an un-mirrored flag silently reverts on
-the next `helm upgrade`.
-
----
-
-*Generated by the synthesizer stage. Lens coverage 2/4 (codex, opus); glm+kimi
-failed on missing API keys — re-run at full capacity per §7 before treating
-correctness-class claims (esp. O-R3 SM-2 math drift) as verified.*
+**The three flags that are dark in prod with operational consequence** (absent from *every* surface, not just the chart): `FEATURE_MEMORY_HARD_FAIL`, `FEATURE_LLM_JUDGE_CRON`, `FEATURE_BOOK_EVENT_DRIVEN_DISPATCH`. These are not chart-drift (where a secret might carry the value) — they are *genuinely unset*, so the consuming code takes its `undefined`-default branch in prod regardless of operator intent.
