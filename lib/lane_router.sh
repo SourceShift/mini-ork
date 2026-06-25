@@ -38,7 +38,13 @@
 [ "${0:-}" = "${BASH_SOURCE[0]:-}" ] && set -Eeuo pipefail
 
 MINI_ORK_ROOT="${MINI_ORK_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
-STATE_DB="${MINI_ORK_DB:-${MINI_ORK_HOME:-.mini-ork}/state.db}"
+# v0.2-pt36 RLM-3: DB access now flows through the policy_store seam over
+# lib/db_open.sh. STATE_DB is resolved per-call via $(mo_store_db_path) so
+# MO_STORE_DB / MO_STORE_BACKEND=postgres can route without forking this lib.
+# SQLite default (no env override) resolves to the same path as the old
+# ${MINI_ORK_DB:-${MINI_ORK_HOME:-.mini-ork}/state.db} convention.
+# shellcheck disable=SC1091
+. "${MINI_ORK_ROOT}/lib/policy_store.sh"
 
 lane_router_recompute_advantages() {
   local since=0
@@ -48,6 +54,9 @@ lane_router_recompute_advantages() {
       *) shift ;;
     esac
   done
+  mo_store_assert_sqlite
+  local STATE_DB
+  STATE_DB="$(mo_store_db_path)"
   python3 - "$STATE_DB" "$since" <<'PY'
 import json, sqlite3, sys, datetime
 from collections import defaultdict
@@ -165,6 +174,9 @@ PY
 lane_router_preferred_lane() {
   local task_class="${1:?task_class required}"
   local node_type="${2:-}"
+  mo_store_assert_sqlite
+  local STATE_DB
+  STATE_DB="$(mo_store_db_path)"
   local where="task_class='$task_class' AND runs_count >= 3"
   [ -n "$node_type" ] && where="$where AND (role='$node_type' OR model='$node_type')"
   sqlite3 -separator '|' "$STATE_DB" \
