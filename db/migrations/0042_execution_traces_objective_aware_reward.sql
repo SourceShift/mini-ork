@@ -25,16 +25,13 @@
 
 PRAGMA foreign_keys = OFF;
 
-ALTER TABLE execution_traces ADD COLUMN objective_domain      TEXT    NOT NULL DEFAULT 'code-delivery';
-ALTER TABLE execution_traces ADD COLUMN segment               TEXT    DEFAULT NULL;
-ALTER TABLE execution_traces ADD COLUMN reward_primary_metric TEXT    DEFAULT NULL;
-ALTER TABLE execution_traces ADD COLUMN reward_direction      TEXT    NOT NULL DEFAULT 'higher_is_better';
-ALTER TABLE execution_traces ADD COLUMN reward_value          REAL    DEFAULT NULL;
-ALTER TABLE execution_traces ADD COLUMN reward_anchor         REAL    DEFAULT NULL;
-ALTER TABLE execution_traces ADD COLUMN reward_g              REAL    DEFAULT NULL;
-ALTER TABLE execution_traces ADD COLUMN reward_vector_json    TEXT    DEFAULT NULL;
-ALTER TABLE execution_traces ADD COLUMN reward_source         TEXT    NOT NULL DEFAULT 'verifier@v1';
-ALTER TABLE execution_traces ADD COLUMN validity              TEXT    NOT NULL DEFAULT 'valid';
+-- review-37/38 HIGH #194: bare ADD COLUMN fails on reapply ("duplicate column
+-- name"). Guard all ten ALTERs behind a single existence check on the first
+-- column — if objective_domain is present the migration already ran, so the
+-- whole block is skipped. Indexes below stay CREATE … IF NOT EXISTS (already
+-- idempotent). Partial-apply safe: objective_domain is added first, so a row
+-- that has it has all ten.
+.read "|sh -c 'db=\"${MINI_ORK_DB:?}\"; have=$(sqlite3 \"$db\" \"SELECT COUNT(*) FROM pragma_table_info(\\\"execution_traces\\\") WHERE name = \\\"objective_domain\\\";\"); if [ \"${have:-0}\" = \"0\" ]; then printf \"%s\n\" \"ALTER TABLE execution_traces ADD COLUMN objective_domain      TEXT    NOT NULL DEFAULT '\"'\"'code-delivery'\"'\"';\" \"ALTER TABLE execution_traces ADD COLUMN segment               TEXT    DEFAULT NULL;\" \"ALTER TABLE execution_traces ADD COLUMN reward_primary_metric TEXT    DEFAULT NULL;\" \"ALTER TABLE execution_traces ADD COLUMN reward_direction      TEXT    NOT NULL DEFAULT '\"'\"'higher_is_better'\"'\"';\" \"ALTER TABLE execution_traces ADD COLUMN reward_value          REAL    DEFAULT NULL;\" \"ALTER TABLE execution_traces ADD COLUMN reward_anchor         REAL    DEFAULT NULL;\" \"ALTER TABLE execution_traces ADD COLUMN reward_g              REAL    DEFAULT NULL;\" \"ALTER TABLE execution_traces ADD COLUMN reward_vector_json    TEXT    DEFAULT NULL;\" \"ALTER TABLE execution_traces ADD COLUMN reward_source         TEXT    NOT NULL DEFAULT '\"'\"'verifier@v1'\"'\"';\" \"ALTER TABLE execution_traces ADD COLUMN validity              TEXT    NOT NULL DEFAULT '\"'\"'valid'\"'\"';\"; fi'"
 
 CREATE INDEX IF NOT EXISTS idx_et_objective_domain
   ON execution_traces(objective_domain);
