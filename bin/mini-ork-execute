@@ -70,11 +70,33 @@ _run_verifier_ref() {
   local _script="$1" _evidence="$2"
   local _exit _json_rc _errexit_set=0
 
+  # Run the verifier in the tree where the implementer actually wrote + committed
+  # its files — NOT the executor's $PWD (the kickoff repo's MAIN checkout). The
+  # implementer applies the plan in an isolated worktree (prompts/implementer.md)
+  # and records its absolute path as `worktree_path` in implementer-summary.json.
+  # tier1/tier2/tier3 read RELATIVE touched_files and run tsc/eslint/jest from
+  # $PWD; without this cd they fail-closed ("No files matching the pattern …" /
+  # empty test_files) on any worktree-isolated change → false ESCALATE of clean
+  # code (recurring researcher-repo gotcha, 2026-06-25). Fallback order:
+  # worktree_path (if a real dir) → MO_TARGET_CWD → current $PWD.
+  local _verify_cwd="" _summary="${MINI_ORK_RUN_DIR:-$RUN_DIR}/implementer-summary.json"
+  if [ -f "$_summary" ]; then
+    _verify_cwd="$(python3 -c 'import json,sys
+try:
+    print(json.load(open(sys.argv[1])).get("worktree_path") or "")
+except Exception:
+    print("")' "$_summary" 2>/dev/null)"
+  fi
+  if [ -z "$_verify_cwd" ] || [ ! -d "$_verify_cwd" ]; then
+    _verify_cwd="${MO_TARGET_CWD:-$PWD}"
+  fi
+
   case "$-" in
     *e*) _errexit_set=1; set +e ;;
   esac
-  MINI_ORK_PLAN_PATH="$PLAN_PATH" ARTIFACT_PATH="$ARTIFACT_PATH" \
-    bash "$_script" > "$_evidence" 2>&1
+  echo "[verifier-cwd] $(basename "$_script") → $_verify_cwd" >&2
+  ( cd "$_verify_cwd" && MINI_ORK_PLAN_PATH="$PLAN_PATH" ARTIFACT_PATH="$ARTIFACT_PATH" \
+    bash "$_script" ) > "$_evidence" 2>&1
   _exit=$?
 
   # Minimum-evidence assertion: exit 0 with an empty evidence file is a
