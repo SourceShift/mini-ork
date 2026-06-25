@@ -11,7 +11,18 @@
 #   tool_calls (json), files_read (json), files_written (json),
 #   verifier_output (json), reviewer_verdict, cost_usd, duration_ms,
 #   final_artifact_ref, status (success|failure), workflow_version_id,
-#   agent_version_id, task_class, created_at
+#   agent_version_id, task_class, created_at,
+#   objective_domain, segment, reward_primary_metric, reward_direction,
+#   reward_value, reward_anchor, reward_g, reward_vector_json,
+#   reward_source, validity
+#
+# v0.2-ptN (objective-aware reward): the reward_* columns let learning loops
+# reason about gain across objectives that aren't naturally 0.0-1.0.
+# reward_g is direction-normalized: dir*(value-anchor)/abs(anchor) so that
+# 'higher_is_better' and 'lower_is_better' metrics pool into a single
+# comparable axis. Legacy scalar callers default objective_domain to
+# 'code-delivery' and reward_source to 'verifier@v1', preserving the
+# process_reward (0031) behavior unchanged.
 
 [ "${0:-}" = "${BASH_SOURCE[0]:-}" ] && set -Eeuo pipefail
 
@@ -99,13 +110,54 @@ def _normalise_verifier_output(v):
     return {}
 
 verifier_output_obj = _normalise_verifier_output(p.get("verifier_output", {}))
+# v0.2-ptN (objective-aware reward): read the new reward_* columns from the
+# payload. Defaults preserve legacy scalar callers — objective_domain falls
+# back to 'code-delivery', reward_source to 'verifier@v1', reward_direction
+# to 'higher_is_better'. segment defaults to task_class so per-task-class
+# slicing works without an explicit override.
+def _compute_reward_g(value, anchor, direction):
+    """Direction-normalized, scale-free gain. Safe zero-anchor behaviour:
+    when anchor is exactly 0 we cannot scale, so we return 0.0 — this is a
+    deliberate signal that 'the baseline is unanchored, no learning signal'.
+    """
+    if value is None or anchor is None or anchor == 0:
+        return None
+    try:
+        v = float(value)
+        a = float(anchor)
+    except (TypeError, ValueError):
+        return None
+    sign = 1.0 if direction == "higher_is_better" else -1.0
+    return sign * (v - a) / abs(a)
+
+reward_primary_metric = p.get("reward_primary_metric")
+reward_value = p.get("reward_value")
+reward_anchor = p.get("reward_anchor")
+reward_direction = p.get("reward_direction") or "higher_is_better"
+reward_g_explicit = p.get("reward_g")
+reward_g = (
+    reward_g_explicit
+    if reward_g_explicit is not None
+    else _compute_reward_g(reward_value, reward_anchor, reward_direction)
+)
+reward_vector = p.get("reward_vector")
+if isinstance(reward_vector, dict):
+    reward_vector_json = json.dumps(reward_vector)
+elif isinstance(reward_vector, str):
+    reward_vector_json = reward_vector
+else:
+    reward_vector_json = None
+
 con.execute("""
     INSERT INTO execution_traces (
         trace_id, run_id, task_class, prompt_version_hash, context_bundle_hash,
         tool_calls, files_read, files_written, verifier_output,
         reviewer_verdict, cost_usd, duration_ms, final_artifact_ref,
-        status, workflow_version_id, agent_version_id
-    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        status, workflow_version_id, agent_version_id,
+        objective_domain, segment, reward_primary_metric, reward_direction,
+        reward_value, reward_anchor, reward_g, reward_vector_json,
+        reward_source, validity
+    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     ON CONFLICT(trace_id) DO UPDATE SET
         status=excluded.status,
         run_id=COALESCE(excluded.run_id, run_id),
@@ -113,7 +165,17 @@ con.execute("""
         reviewer_verdict=excluded.reviewer_verdict,
         cost_usd=excluded.cost_usd,
         duration_ms=excluded.duration_ms,
-        final_artifact_ref=excluded.final_artifact_ref
+        final_artifact_ref=excluded.final_artifact_ref,
+        objective_domain=excluded.objective_domain,
+        segment=excluded.segment,
+        reward_primary_metric=excluded.reward_primary_metric,
+        reward_direction=excluded.reward_direction,
+        reward_value=excluded.reward_value,
+        reward_anchor=excluded.reward_anchor,
+        reward_g=excluded.reward_g,
+        reward_vector_json=excluded.reward_vector_json,
+        reward_source=excluded.reward_source,
+        validity=excluded.validity
 """, (
     trace_id,
     run_id,
@@ -131,6 +193,16 @@ con.execute("""
     p.get("status", "success"),
     workflow_version_id,
     p.get("agent_version_id", "") or "",
+    p.get("objective_domain") or "code-delivery",
+    p.get("segment") or p.get("task_class") or None,
+    reward_primary_metric,
+    reward_direction,
+    float(reward_value) if reward_value is not None else None,
+    float(reward_anchor) if reward_anchor is not None else None,
+    float(reward_g) if reward_g is not None else None,
+    reward_vector_json,
+    p.get("reward_source") or "verifier@v1",
+    p.get("validity") or "valid",
 ))
 con.commit()
 con.close()
