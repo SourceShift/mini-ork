@@ -87,11 +87,86 @@ decide() {
   #    (runs_count >= 3). When the floor yields no row, fall back to the
   #    lane the agents.yaml file maps node_type to. Cold-start safe: we
   #    never invent a lane.
-  local route
-  route=$(lane_router_preferred_lane "$task_class" "$node_type" 2>/dev/null \
+  local learned_route route
+  learned_route=$(lane_router_preferred_lane "$task_class" "$node_type" 2>/dev/null \
     | awk -F'|' '{print $1; exit}')
-  if [ -z "$route" ]; then
+  if [ -n "$learned_route" ]; then
+    route="$learned_route"
+  else
     route=$(decision_service_default_lane "$node_type")
+  fi
+
+  # 1a) Epsilon-greedy exploration — rlm-4b-pre-b. With probability EPSILON
+  #     (default 0.10, recovered from the prior bin/mini-ork-execute argmax
+  #     so decide callers get the same explore/exploit semantics decide will
+  #     replace), replace route with a deterministic exploration lane
+  #     picked from config/agents.yaml (excluding the current exploit
+  #     route). SEED makes exploration reproducible for proof harnesses;
+  #     unset ⇒ SystemRandom so live runs stay non-deterministic by default.
+  #     Cold-start guard: only fires when a learned route exists
+  #     (learned_route non-empty). When the GRPO floor yields no row,
+  #     decide returns the configured default lane unchanged — exploration
+  #     must NOT pull a cold-start run off its default lane (this is the
+  #     rlm-4b regression's invariant).
+  local _epsilon _seed
+  _epsilon="${EPSILON:-${MO_LEARNING_EPSILON:-0.10}}"
+  _seed="${SEED:-${MO_LEARNING_SEED:-}}"
+  if [ -n "$learned_route" ]; then
+    local _agents_yaml="${MINI_ORK_HOME:-.mini-ork}/config/agents.yaml"
+    [ -f "$_agents_yaml" ] || _agents_yaml="$MINI_ORK_ROOT/config/agents.yaml"
+    route=$(MO_DECISION_EPSILON_AGENTS_YAML="$_agents_yaml" \
+      python3 - "$route" "$_epsilon" "$_seed" <<'PY'
+import os, random, sys, yaml
+
+exploit_route, epsilon_s, seed = sys.argv[1:4]
+try:
+    epsilon = float(epsilon_s)
+except (TypeError, ValueError):
+    epsilon = 0.10
+if epsilon < 0.0:
+    epsilon = 0.0
+if epsilon > 1.0:
+    epsilon = 1.0
+
+# Seeded RNG for deterministic exploration; SystemRandom when unset so live
+# runs remain non-deterministic by default. Matches bin/mini-ork-execute's
+# _mo_learning_governed_lane discipline.
+if seed:
+    try:
+        rng = random.Random(int(seed))
+    except ValueError:
+        rng = random.Random(seed)
+else:
+    rng = random.SystemRandom()
+
+if rng.random() >= epsilon:
+    # No exploration this round — exploit unchanged.
+    print(exploit_route)
+    sys.exit(0)
+
+# Explore — pick a lane from agents.yaml that's not the current exploit
+# route. Sorted + set so the seeded RNG produces stable selections across
+# runs with the same seed (avoids hash-ordering drift on Py3 dicts).
+agents_yaml = os.environ.get("MO_DECISION_EPSILON_AGENTS_YAML", "")
+candidates = []
+if agents_yaml and os.path.isfile(agents_yaml):
+    try:
+        with open(agents_yaml, encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+        seen = set()
+        for v in (cfg.get("lanes") or {}).values():
+            if not v or v == exploit_route or v in seen:
+                continue
+            seen.add(v)
+            candidates.append(v)
+    except Exception:
+        # agents.yaml malformed/unreadable — no exploration candidates;
+        # fall back to exploit rather than crashing the caller.
+        pass
+
+print(rng.choice(sorted(candidates)) if candidates else exploit_route)
+PY
+    )
   fi
 
   # 2) Coalition — slice-aware family-diversity check.
