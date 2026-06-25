@@ -37,7 +37,13 @@
 #   MO_DEADLINE_START     When the budget was armed; lets mo_deadline_check
 #                         compute elapsed without re-reading the sidecar.
 
-set -uo pipefail
+# review-37/38 #195: this file is SOURCED by bin/mini-ork and decide()'s
+# callers. A top-level `set -uo pipefail` would leak strict mode into the
+# caller's shell and change unrelated behavior. Apply strict mode only when
+# this file is executed directly, never when sourced.
+if [[ "${BASH_SOURCE[0]:-}" == "${0:-}" ]]; then
+  set -uo pipefail
+fi
 
 _mo_deadline_log() {
   local _level="$1"; shift

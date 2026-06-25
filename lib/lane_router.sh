@@ -175,7 +175,21 @@ for (lane, tc), stats in acc.items():
 
 # Per-domain slice → lane_domain_advantage (migration 0043). Keyed by
 # (agent_version_id, task_class, node_type, objective_domain) so objective
-# domains no longer collide on a single row.
+# domains no longer collide on a single row. Defensive CREATE keeps recompute
+# from crashing on a DB where migration 0043 has not yet applied (review-38).
+con.execute("""
+    CREATE TABLE IF NOT EXISTS lane_domain_advantage (
+      agent_version_id   TEXT    NOT NULL,
+      task_class         TEXT    NOT NULL,
+      node_type          TEXT    NOT NULL DEFAULT '',
+      objective_domain   TEXT    NOT NULL DEFAULT '',
+      relative_advantage REAL    NOT NULL DEFAULT 0.0,
+      runs_count         INTEGER NOT NULL DEFAULT 0,
+      success_count      INTEGER NOT NULL DEFAULT 0,
+      last_updated       TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      PRIMARY KEY (agent_version_id, task_class, node_type, objective_domain)
+    )
+""")
 for (lane, tc, nt, od), stats in acc_domain.items():
     avg_adv = stats["adv_sum"] / max(stats["n"], 1)
     con.execute("""
@@ -208,20 +222,26 @@ lane_router_preferred_lane() {
   STATE_DB="$(mo_store_db_path)"
   local _min_samples="${MO_LEARNING_MIN_SAMPLES:-3}"
 
+  # review-37/38: single-quote-escape every interpolated value (SQLite CLI
+  # has no bind params here) so quotes/inputs can't break or inject SQL.
+  local _tc_e=${task_class//\'/\'\'}
+  local _nt_e=${node_type//\'/\'\'}
+  local _od_e=${objective_domain//\'/\'\'}
+
   # review-36 #193: prefer the durable per-objective_domain slice
   # (lane_domain_advantage, migration 0043) when a domain is supplied and it
   # clears the sample floor. This is what makes per-domain learning real at
   # the storage layer rather than slice-mean only.
   if [ -n "$objective_domain" ]; then
-    local dwhere="task_class='$task_class' AND objective_domain='$objective_domain' AND runs_count >= ${_min_samples}"
-    [ -n "$node_type" ] && dwhere="$dwhere AND node_type='$node_type'"
+    local dwhere="task_class='$_tc_e' AND objective_domain='$_od_e' AND runs_count >= ${_min_samples}"
+    [ -n "$node_type" ] && dwhere="$dwhere AND node_type='$_nt_e'"
     local _hit
     _hit=$(sqlite3 -separator '|' "$STATE_DB" \
       "SELECT agent_version_id, printf('%.3f', relative_advantage), runs_count
          FROM lane_domain_advantage
         WHERE $dwhere
         ORDER BY relative_advantage DESC, runs_count DESC
-        LIMIT 1;")
+        LIMIT 1;" 2>/dev/null)
     if [ -n "$_hit" ]; then
       echo "$_hit"
       return 0
@@ -230,8 +250,8 @@ lane_router_preferred_lane() {
 
   # Fallback: cross-domain global slice (no domain given, or the domain has
   # not yet reached the sample floor — cold-start safe).
-  local where="task_class='$task_class' AND runs_count >= ${_min_samples}"
-  [ -n "$node_type" ] && where="$where AND (role='$node_type' OR model='$node_type')"
+  local where="task_class='$_tc_e' AND runs_count >= ${_min_samples}"
+  [ -n "$node_type" ] && where="$where AND (role='$_nt_e' OR model='$_nt_e')"
   sqlite3 -separator '|' "$STATE_DB" \
     "SELECT agent_version_id, printf('%.3f', relative_advantage), runs_count
        FROM agent_performance_memory
