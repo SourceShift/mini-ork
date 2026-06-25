@@ -160,14 +160,14 @@ And the panel quality is *instrumented*, not assumed: a pre-synthesis coalition 
 
 | Axis | Single-vendor agent SDKs | mini-ork |
 |---|---|---|
-| Agent diversity | All same family (Sonnet/Opus, or GPT-4/o1, etc) | 7 families configurable per lane |
-| State persistence | Per-session, ephemeral | `state.db` (SQLite) across runs |
-| Cost governance | Invoice surprise | Per-call ledger + caps + circuit breakers |
-| Trajectory measurement | None | `mini-ork metrics` cross-cycle |
+| Agent diversity | Within-vendor configurability (Claude subagent model selection, LangGraph model-agnostic nodes) but no framework-enforced cross-family separation | 7 families configurable per lane + `lib/coalition_gate.sh` hard-blocks same-family degeneration |
+| State persistence | Per-session by default; project-scoped memory is opt-in and shallow (Claude Code CLAUDE.md, OpenAI Sessions, LangGraph checkpointer) | `state.db` (SQLite) across runs — task_runs, gradients, lineage, agent_performance_memory, run_events, llm_calls |
+| Cost governance | Vendor-side observability (LangSmith usage, OpenAI usage API, Claude cost dashboards) — visible but not dispatch-enforced | Per-call ledger + dispatch-enforced caps (`MO_DAILY_BUDGET_USD`) + per-lane budgets + circuit breakers — over-budget calls refused, not billed |
+| Trajectory measurement | Vendor-scoped traces (LangSmith, OpenAI Traces, Claude Code session telemetry) — span-level but not cross-cycle aggregate | `mini-ork metrics` cross-cycle — gradient yield, relative-advantage per agent, cost+dur trends, lane utilization |
 | Executable specification | Model decides what's good | `verifiers/*.sh` deterministic gates |
 | Self-publishing | Output stays in session log | Publisher node `git commit` under `mini-ork@local` |
-| Cross-cycle improvement | Each session starts from zero | reflect → improve → eval → promote chain |
-| Reproducibility | Run-to-run drift | Deterministic given same kickoff |
+| Cross-cycle improvement | Memory persists across sessions (Claude memories, LangGraph memory modules, OpenAI memory) but added monotonically — no gating, rollback, or versioned promotion | reflect → improve → eval → promote chain — gated by utility-delta + benchmark, with quarantine + rollback via `version_registry` |
+| Reproducibility | Same kickoff can be replayed (LangGraph checkpointer, Claude Code session resume, OpenAI Sessions) but the framework does not instrument run-to-run variance | Deterministic given same kickoff; where variance exists (epsilon-greedy routing, LLM sampling) the trajectory is captured in `state.db` |
 
 **Composition, not competition:** mini-ork dispatches Claude Code, codex, gemini-cli, GLM, Kimi etc as worker agents. The framework is the operating system; the vendor SDKs are the engines.
 
