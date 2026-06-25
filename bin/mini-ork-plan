@@ -343,8 +343,10 @@ if [ "${MINI_ORK_NONINTERACTIVE:-0}" != "1" ] && [ -e /dev/tty ] && \
   _can_prompt=1
   exec 9<&-  # close probe FD
 fi
+# Always-on by project policy: non-interactive runs auto-answer profile
+# questions from the kickoff (set MO_AUTO_ANSWER_PROFILE=0 to opt out).
 if [ "$profile_status" = "needs_answers" ] && [ "$_can_prompt" != "1" ] && \
-   [ "${MO_AUTO_ANSWER_PROFILE:-0}" = "1" ]; then
+   [ "${MO_AUTO_ANSWER_PROFILE:-1}" = "1" ]; then
   # shellcheck source=/dev/null
   source "$MINI_ORK_ROOT/lib/profile_answerer.sh"
   _answers_path="$(dirname "${MINI_ORK_PROFILE_PATH:-./run_profile.json}")/profile-answers.json"
@@ -519,6 +521,89 @@ PY
   fi
 fi
 
+if [ "${MO_FORCE_RECIPE_FALLBACK_PLAN:-0}" = "1" ] && [ "${TASK_CLASS:-}" = "doc_to_features_loop" ]; then
+  mkdir -p "$(dirname "$OUT_FILE")"
+  python3 - "$OUT_FILE" "${MINI_ORK_RECIPE:-}" "${MINI_ORK_WORKFLOW:-}" "$MINI_ORK_ROOT" "$KICKOFF" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+import yaml
+
+out, recipe, workflow_path, root, kickoff = sys.argv[1:6]
+if not recipe:
+    recipe = "generic"
+if not workflow_path:
+    workflow_path = str(Path(root) / "recipes" / recipe / "workflow.yaml")
+
+workflow = yaml.safe_load(Path(workflow_path).read_text(encoding="utf-8")) or {}
+nodes = workflow.get("nodes") or []
+edges = workflow.get("edges") or []
+
+contract_path = Path(root) / "recipes" / recipe / "artifact_contract.yaml"
+contract = {}
+if contract_path.exists():
+    contract = yaml.safe_load(contract_path.read_text(encoding="utf-8")) or {}
+
+outputs = contract.get("outputs") or workflow.get("outputs") or []
+success_verifiers = contract.get("success_verifiers") or workflow.get("success_verifiers") or []
+
+plan = {
+    "objective": f"Execute recipe {recipe} for {kickoff}",
+    "assumptions": [
+        "MO_FORCE_RECIPE_FALLBACK_PLAN=1 skipped planner LLM dispatch.",
+        "Recipe workflow.yaml is the source of truth for dispatch order.",
+    ],
+    "decomposition": [
+        {
+            "id": n.get("name"),
+            "description": n.get("description") or f"{n.get('type', 'unknown')} node {n.get('name')}",
+            "node_type": n.get("type"),
+            "depends_on": [
+                e.get("from")
+                for e in edges
+                if e.get("to") == n.get("name") and e.get("from")
+            ],
+        }
+        for n in nodes
+        if isinstance(n, dict) and n.get("name")
+    ],
+    "dependencies": [
+        {"from": e.get("from"), "to": e.get("to")}
+        for e in edges
+        if isinstance(e, dict) and e.get("from") and e.get("to")
+    ],
+    "risk_notes": [
+        "Fallback plan does not include model-authored verifier shell commands.",
+        "Execution still uses the recipe workflow nodes and recipe verifier_ref scripts.",
+    ],
+    "artifact_contract": {
+        "outputs": outputs,
+        "success_verifiers": success_verifiers,
+    },
+    "verifier_contract": {
+        "checks": [
+            {
+                "id": "recipe-workflow-dispatch",
+                "description": f"Dispatch every node declared in recipes/{recipe}/workflow.yaml.",
+            },
+            {
+                "id": "recipe-artifacts",
+                "description": "Recipe artifact contract is satisfied by execute/verify.",
+            },
+        ]
+    },
+}
+
+Path(out).write_text(json.dumps(plan, indent=2) + "\n", encoding="utf-8")
+print(json.dumps(plan, indent=2))
+PY
+  trace_write "{\"trace_id\":\"$TRACE_ID\",\"task_class\":\"${TASK_CLASS}\",\"status\":\"success\",\"final_artifact_ref\":\"${OUT_FILE}\",\"reviewer_verdict\":\"recipe_fallback\"}" >/dev/null 2>&1 || true
+  echo "plan_path=${OUT_FILE}"
+  echo "task_class=${TASK_CLASS}"
+  exit 0
+fi
+
 # Capture dispatcher stderr to a per-run debug file so failures aren't opaque.
 # The previous shape (2>&1 merged into $PLAN_JSON_RAW + swallowed on failure)
 # left operators with no signal beyond "LLM dispatch failed" — a 9-min debug
@@ -528,11 +613,23 @@ _plan_dispatch_err=""
 if [ "${MO_PLAN_DEBUG_LOG:-1}" != "0" ] && [ -n "${RUN_DIR:-}" ] && [ -d "$RUN_DIR" ]; then
   _plan_dispatch_err="$RUN_DIR/plan-dispatch.err.log"
 fi
-PLAN_JSON_RAW=$(llm_dispatch \
-  --task-class "$TASK_CLASS" \
-  --node-type "planner" \
-  --prompt-text "$PROMPT_TEXT" \
-  2> >([ -n "$_plan_dispatch_err" ] && tee "$_plan_dispatch_err" >&2 || cat >&2)) || {
+if [ -n "$_plan_dispatch_err" ]; then
+  PLAN_JSON_RAW=$(llm_dispatch \
+    --task-class "$TASK_CLASS" \
+    --node-type "planner" \
+    --prompt-text "$PROMPT_TEXT" \
+    2>"$_plan_dispatch_err") || {
+    _plan_dispatch_failed=1
+  }
+else
+  PLAN_JSON_RAW=$(llm_dispatch \
+    --task-class "$TASK_CLASS" \
+    --node-type "planner" \
+    --prompt-text "$PROMPT_TEXT") || {
+    _plan_dispatch_failed=1
+  }
+fi
+if [ "${_plan_dispatch_failed:-0}" = "1" ]; then
   echo "LLM dispatch failed for planner node" >&2
   if [ -n "$_plan_dispatch_err" ] && [ -s "$_plan_dispatch_err" ]; then
     echo "  dispatch stderr (last 20 lines from $_plan_dispatch_err):" >&2
@@ -552,7 +649,7 @@ con.commit(); con.close()
 " "$MINI_ORK_DB" "$RUN_ID" 2>/dev/null || true
   fi
   exit 1
-}
+fi
 
 # D-011 + D-016 + D-052: extract the first valid non-template plan JSON object.
 #
@@ -815,12 +912,17 @@ PY
 }
 
 if [ "$HAS_VERIFIER" = "missing_verifier_contract" ]; then
-  echo "PLAN REJECTED: verifier_contract.checks is missing or empty." >&2
-  echo "A plan is not complete until success-check is defined." >&2
   _d015_preserve_raw "missing_verifier_contract"
-  _d015_mark_plan_failed "missing_verifier_contract"
-  trace_write "{\"trace_id\":\"$TRACE_ID\",\"task_class\":\"${TASK_CLASS}\",\"status\":\"failure\",\"reviewer_verdict\":\"missing_verifier_contract\"}" >/dev/null 2>&1 || true
-  exit 1
+  if PLAN_JSON=$(_d015_recipe_fallback_plan); then
+    echo "PLAN WARNING: planner output did not expose verifier_contract.checks; using deterministic recipe fallback plan." >&2
+    HAS_VERIFIER="ok"
+  else
+    echo "PLAN REJECTED: verifier_contract.checks is missing or empty." >&2
+    echo "A plan is not complete until success-check is defined." >&2
+    _d015_mark_plan_failed "missing_verifier_contract"
+    trace_write "{\"trace_id\":\"$TRACE_ID\",\"task_class\":\"${TASK_CLASS}\",\"status\":\"failure\",\"reviewer_verdict\":\"missing_verifier_contract\"}" >/dev/null 2>&1 || true
+    exit 1
+  fi
 fi
 
 if [ "$HAS_VERIFIER" = "placeholder_plan" ]; then

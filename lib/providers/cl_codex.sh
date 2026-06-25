@@ -124,6 +124,15 @@ if [ -n "$_CODEX_TARGET_CWD" ] && [ -d "$_CODEX_TARGET_CWD" ]; then
   _CODEX_CD_FLAGS+=(-C "$_CODEX_TARGET_CWD")
 fi
 
+# Codex may refresh plugins/skills with `git ls-remote` before starting a
+# turn. Some developer machines rewrite GitHub HTTPS remotes to SSH, which can
+# prompt for an encrypted key passphrase and wedge non-interactive mini-ork
+# runs. Keep git network checks fail-fast and non-interactive.
+export GIT_TERMINAL_PROMPT="${GIT_TERMINAL_PROMPT:-0}"
+export GIT_ASKPASS="${GIT_ASKPASS:-/bin/false}"
+export SSH_ASKPASS="${SSH_ASKPASS:-/bin/false}"
+export GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh -o BatchMode=yes -o NumberOfPasswordPrompts=0}"
+
 # Real-time progress sidecar (2026-06-11 fix).
 # Problem: `RAW_OUT=$(codex exec ... 2>&1)` buffers ALL stdout until codex
 # exits, so a 15-20 min implementer turn writes ZERO lines to mini-ork-execute's
@@ -141,31 +150,26 @@ else
 fi
 export MO_CODEX_STREAM_FILE="$_CODEX_STREAM_FILE"
 
-# Tee through a FIFO so RAW_OUT still captures everything (used by both the
-# error path and the post-process python block below) AND the sidecar file
-# fills in real time. macOS bash 5 `tee` flushes per-line in the absence of
-# block buffering on a FIFO sink.
-_CODEX_FIFO="$(mktemp -u -t mini-ork-codex-fifo.XXXXXX)"
-mkfifo "$_CODEX_FIFO" || { echo "[cl_codex] mkfifo failed for $_CODEX_FIFO" >&2; exit 6; }
-( tee -a "$_CODEX_STREAM_FILE" < "$_CODEX_FIFO" ) &
-_CODEX_TEE_PID=$!
-
-# Run codex with stdout streamed through the FIFO; capture combined output
-# (FIFO contents + stderr) so the error path and the post-process block still
-# work unchanged. `set +e` around the read so we get rc without -e killing us.
+# Run codex with plain file redirects. Avoid FIFO/tee/process-substitution
+# chains: on macOS job control can stop or wedge the wrapper before a real
+# Codex process appears, leaving mini-ork heartbeats but no agent output.
 set +e
-RAW_OUT=$(codex exec \
+{
+  printf '[cl_codex] launching codex exec cwd=%s sandbox=%s\n' "$_CODEX_TARGET_CWD" "$_CODEX_SANDBOX"
+  printf '[cl_codex] prompt_bytes=%s\n' "$(printf '%s' "$PROMPT" | wc -c | tr -d ' ')"
+} >> "$_CODEX_STREAM_FILE" 2>/dev/null || true
+codex exec \
   --skip-git-repo-check \
   --sandbox "$_CODEX_SANDBOX" \
   --json \
   --output-last-message "$_CODEX_LAST_MESSAGE" \
   ${_CODEX_CD_FLAGS[@]+"${_CODEX_CD_FLAGS[@]}"} \
   ${_CODEX_BYO_FLAGS[@]+"${_CODEX_BYO_FLAGS[@]}"} \
-  "$PROMPT" 2> >(tee -a "$_CODEX_STREAM_FILE" >&2) | tee "$_CODEX_FIFO")
-_CODEX_RC=${PIPESTATUS[0]}
+  -- "$PROMPT" \
+  </dev/null >> "$_CODEX_STREAM_FILE" 2>&1
+_CODEX_RC=$?
+RAW_OUT="$(cat "$_CODEX_STREAM_FILE" 2>/dev/null || true)"
 set -uo pipefail
-wait "$_CODEX_TEE_PID" 2>/dev/null || true
-rm -f "$_CODEX_FIFO"
 
 if [ "$_CODEX_RC" -ne 0 ]; then
   echo "[cl_codex] codex exec failed with rc=$_CODEX_RC — see stderr for cause" >&2
