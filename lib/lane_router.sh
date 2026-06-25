@@ -177,7 +177,8 @@ lane_router_preferred_lane() {
   mo_store_assert_sqlite
   local STATE_DB
   STATE_DB="$(mo_store_db_path)"
-  local where="task_class='$task_class' AND runs_count >= 3"
+  local _min_samples="${MO_LEARNING_MIN_SAMPLES:-3}"
+  local where="task_class='$task_class' AND runs_count >= ${_min_samples}"
   [ -n "$node_type" ] && where="$where AND (role='$node_type' OR model='$node_type')"
   sqlite3 -separator '|' "$STATE_DB" \
     "SELECT agent_version_id, printf('%.3f', relative_advantage), runs_count
