@@ -38,7 +38,7 @@ lanes:
   # pairwise ρ stays low. Each lens lane maps to a DISTINCT model family
   # so 4 named lenses (glm/kimi/codex/opus) actually run on 4 families,
   # not 3-of-4 collapsed to Sonnet via decomposer/spec_author/worker mapping.
-  glm_lens: glm          # Zhipu
+  glm_lens: minimax      # remapped glm->minimax (standing skip-GLM directive: GLM 429s on Fair Usage within 2-3 dispatches/hr; broad-scan stance now runs on MiniMax-M3)
   kimi_lens: kimi        # Moonshot
   codex_lens: codex      # OpenAI Codex (executable wrapper)
   opus_lens: opus        # Anthropic (kept — different role: deep arch)
