@@ -88,7 +88,7 @@ decide() {
   #    lane the agents.yaml file maps node_type to. Cold-start safe: we
   #    never invent a lane.
   local learned_route route
-  learned_route=$(lane_router_preferred_lane "$task_class" "$node_type" 2>/dev/null \
+  learned_route=$(lane_router_preferred_lane "$task_class" "$node_type" "$objective_domain" 2>/dev/null \
     | awk -F'|' '{print $1; exit}')
   if [ -n "$learned_route" ]; then
     route="$learned_route"
