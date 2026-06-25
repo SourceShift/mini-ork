@@ -1,0 +1,15 @@
+task_class: mo_vs_omnigent
+expected_artifact: composite   # 4 lens reports + 1 synthesis markdown
+
+success_verifiers:
+  - verifiers/source-completeness.sh
+
+failure_policy: request_changes
+rollback_policy: >
+  Keep the 4 lens reports under runs/<id>/lens-*.md for inspection;
+  discard the synthesis if it failed verification. Lens reports remain
+  individually consumable as comparison notes.
+
+source_artifact: synthesis.md
+outputs:
+  - docs/research/mo-vs-omnigent-latest.md

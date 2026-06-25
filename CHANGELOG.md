@@ -279,7 +279,7 @@ single session (~$10 LLM spend total, ~3 hours wall clock).
 - `tests/smoke.sh`: 97/97 OK
 - `bash examples/00-demo.sh` runs end-to-end in dry-run; produces a `task_runs`
   row with `task_class=code-fix`, `recipe=code-fix`, `status=classified`
-- 0 domain leaks (`the host application`, `jisawru`, `100.74.239.22`, etc.)
+- 0 domain leaks (private hostnames, internal IPs, host-application refs, etc.)
 - 0 legacy env-var refs (`AGENTFLOW_*`, `MO_AGENTFLOW_*`)
 
 ---

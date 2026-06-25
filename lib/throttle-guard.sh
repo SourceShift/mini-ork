@@ -46,8 +46,11 @@ _throttle_classify_error() {
   if grep -qE "Selected model is at capacity|model_overloaded|engine is overloaded" "$err_log" 2>/dev/null; then
     echo "capacity"; return 0
   fi
-  # OpenAI / generic 429 rate limit
-  if grep -qE "429 Too Many Requests|rate_limit_exceeded|rate limit reached|insufficient_quota" "$err_log" 2>/dev/null; then
+  # OpenAI / generic 429 rate limit. Also GLM (Zhipu) "Fair Usage Policy /
+  # Request rejected (429)" wording, which lands as api_error_status:429 in the
+  # provider .out JSON body rather than .err.log — callers that fold the body
+  # into the classified text will now match it instead of falling to "unknown".
+  if grep -qE "429 Too Many Requests|rate_limit_exceeded|rate limit reached|insufficient_quota|Fair Usage Policy|Request rejected \(429\)|api_error_status\"?:\s*\"?429" "$err_log" 2>/dev/null; then
     echo "throttled"; return 0
   fi
   # Anthropic overload (Opus / Sonnet)
