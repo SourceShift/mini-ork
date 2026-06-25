@@ -158,14 +158,6 @@ except Exception:
     MINI_ORK_TASK_CLASS=$(printf '%s\n' "$classify_out" | grep -E '^task_class=' | head -1 | cut -d= -f2)
     export MINI_ORK_TASK_CLASS
 
-    # ── deadline gate (between classify and profile) ────────────────────────
-    # Soft-stop model: check is between stages, never mid-stage. A long
-    # stage can overshoot; that's recorded in the deadline_hit payload.
-    if [ -n "$DEADLINE_SECS" ] && ! mo_deadline_check "$MINI_ORK_RUN_ID"; then
-      echo "deadline_hit after classify; no best-so-far artifact yet; exiting cleanly" >&2
-      exit 0
-    fi
-
     # ── profile ───────────────────────────────────────────────────────────────
     # Build the run profile before planning so the planner sees operational
     # context that is easy to inspect and easy for callers to answer later.
@@ -191,6 +183,17 @@ except Exception:
         exit 2
       }
     fi
+
+    # ── deadline gate (between classify and profile) ────────────────────────
+    # Soft-stop model: check is between stages, never mid-stage. A long
+    # stage can overshoot; that's recorded in the deadline_hit payload.
+    # MUST run after deadline_budget.sh is sourced + armed above, otherwise
+    # mo_deadline_check is undefined and the gate misfires on every run.
+    if [ -n "$DEADLINE_SECS" ] && ! mo_deadline_check "$MINI_ORK_RUN_ID"; then
+      echo "deadline_hit after classify; no best-so-far artifact yet; exiting cleanly" >&2
+      exit 0
+    fi
+
     profile_out=$(python3 - "$kickoff" "$MINI_ORK_ROOT" "$recipe" "$MINI_ORK_TASK_CLASS" "$MINI_ORK_PROFILE_PATH" "${MINI_ORK_HOME}/config/agents.yaml" <<'PY'
 import json
 import re
