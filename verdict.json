@@ -1,0 +1,35 @@
+{
+  "pass": true,
+  "review_id": 33,
+  "summary": "Resolved the three pre-push defects with scoped edits: learning writeback helpers now no-op cleanly on cold schemas, migration 0039 now guards repair-index creation for direct sqlite3 application, and source-completeness preserves missing entries with spaces and unicode as single JSON array items.",
+  "fixes": [
+    {
+      "id": "fix-1",
+      "file": "bin/mini-ork-execute",
+      "description": "mo_learning_update_conductor_outcomes now catches sqlite3.OperationalError from missing learning tables, prints 0, and exits successfully while leaving the normal update/commit/count path unchanged."
+    },
+    {
+      "id": "fix-2",
+      "file": "bin/mini-ork-execute",
+      "description": "mo_learning_write_grpo_advantages now treats an absent relative_advantage column or missing execution_traces table as optional cold-schema writeback, printing 0 and exiting successfully without masking non-OperationalError failures."
+    },
+    {
+      "id": "fix-3",
+      "file": "db/migrations/0039_learning_column_repairs.sql",
+      "description": "The migration header now documents the self-guarded direct-application contract, and the two repair index statements are generated only when their backing columns exist."
+    },
+    {
+      "id": "fix-4",
+      "file": "recipes/mo-vs-omnigent/verifiers/source-completeness.sh",
+      "description": "The failing-path missing array is passed to Python as argv elements and serialized with json.dumps(sys.argv[1:]), preserving entries containing spaces and unicode."
+    }
+  ],
+  "verification": [
+    "bash -n bin/mini-ork-execute recipes/mo-vs-omnigent/verifiers/source-completeness.sh",
+    "Cold scratch DB helper probe: mo_learning_update_conductor_outcomes and mo_learning_write_grpo_advantages each printed 0 and exited 0.",
+    "Direct sqlite3 migration probe with absent target columns exited 0 and created no repair indexes.",
+    "Direct sqlite3 migration probe with present target columns exited 0 and created idx_execution_traces_process_reward_repair and idx_agent_perf_advantage_repair.",
+    "source-completeness failing-path probe parsed valid JSON and preserved 'lens-glm.md (only 0 sources, need \u22655)' as one missing array element.",
+    "git diff --check -- bin/mini-ork-execute db/migrations/0039_learning_column_repairs.sql recipes/mo-vs-omnigent/verifiers/source-completeness.sh"
+  ]
+}
