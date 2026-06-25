@@ -6,8 +6,10 @@
 to the trace/state schema so every decision→outcome row carries enough to train
 a multi-consumer policy without one consumer's signal dominating.
 
-Schema migration adds to the execution-trace row in `db/` (new migration under
-`db/migrations/`) and the writer helper in `lib/trace_store.sh`:
+Schema migration adds to the execution-trace row in `db/` via new migration
+`db/migrations/0042_execution_traces_objective_aware_reward.sql` (use `0042` —
+do NOT reuse `0041`, which is taken by `0041_grounded_rejections_reconcile.sql`)
+plus the writer helper in `lib/trace_store.sh`:
 - `objective_domain` TEXT NOT NULL (mandatory partition, e.g. `code-delivery` |
   `book-gen`) — nothing is ever pooled across this.
 - `segment` TEXT (sub-key: recipe/repo for code, genre/audience for book-gen).
@@ -33,6 +35,8 @@ Done when (smoke):
 ## Scope Hint
 
 - `lib/trace_store.sh`
+- `db/migrations/0042_execution_traces_objective_aware_reward.sql` (new; `0042`,
+  not `0041`). Fresh `mini-ork init` now exits 0, so the migration smoke can run.
 
 ## Verification commands
 
