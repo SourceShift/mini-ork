@@ -41,11 +41,12 @@ Two deliverables, tightly coupled (one table, one reward term):
 
 ## Migration slot — IMPORTANT
 
-A concurrent framework-edit (run-1782386506-37416, "objective-aware normalized
-trace rewards", panel PASS=75) has ALREADY claimed
-`db/migrations/0041_execution_traces_objective_aware_reward.sql` on its branch
-(not yet merged to main). **This epic MUST use `0042`**, not 0041, to avoid a
-migration-number collision. F3's migration adds a *different* column
+Migration numbering is contended by concurrent sessions. As of this writing the
+taken slots are: `0041_grounded_rejections_reconcile.sql` (committed,
+`9340a0d`) and `0042` (rlm-1 objective-aware reward, renumbered there in
+`c36ebb3`). **This epic MUST use the lowest free slot at dispatch time — `0043`
+unless something lands first.** Do NOT hardcode a number from this doc; re-check
+`ls db/migrations/ | sort | tail` immediately before creating the migration. F3's migration adds a *different* column
 (`reviewer_model`), so it composes cleanly with 0041's columns — but the number
 must not clash. Make it idempotent: gate the `ALTER TABLE ... ADD COLUMN` behind
 a `pragma_table_info` existence check (init.sh applies via `sqlite3 DB < file`,
@@ -53,7 +54,7 @@ so dot-commands / guarded SQL are valid — mirror the 0039 self-guard pattern).
 
 ## Scope (in / out)
 
-- IN: `db/migrations/0042_execution_traces_reviewer_model.sql` (idempotent),
+- IN: `db/migrations/00NN_execution_traces_reviewer_model.sql (NN = lowest free slot, ~0043)` (idempotent),
   `lib/trace_store.sh` (bind `reviewer_model` on insert/upsert),
   `bin/mini-ork-execute` (write the reviewer's lane into `reviewer_model` when a
   review node resolves), `lib/process_reward.sh` (move the verdict term onto the
@@ -77,7 +78,7 @@ schema work on a COPY. Re-running `db/init.sh` on the copy must be idempotent
 
 ## Definition of Done
 
-- `0042_execution_traces_reviewer_model.sql` applies cleanly via `db/init.sh` on
+- `00NN_execution_traces_reviewer_model.sql (NN = lowest free slot, ~0043)` applies cleanly via `db/init.sh` on
   a copy of the live DB; `execution_traces.reviewer_model` exists; re-run is a
   no-op.
 - `lib/trace_store.sh` binds `reviewer_model`; a review trace written through
