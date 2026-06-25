@@ -4,21 +4,31 @@
 # Track B item 4 (arXiv:2601.22607 verifiable-reward GRPO + 2603.02701
 # Graph-GRPO for multi-agent topologies). When a recipe dispatches a
 # lens panel (codex + kimi + glm + minimax in parallel), each lens
-# produces a comparable trajectory. We score each by downstream
-# verifier outcome and compute:
+# produces a comparable trajectory. We score each by the normalized
+# cross-objective reward_g (set by trace_store.sh from
+# reward_value/anchor/direction) and compute:
 #
 #   relative_advantage[i] = score[i] - mean(scores in group)
 #
-# Positive advantage = "this lens outperformed peers on this task class".
-# Negative = "this lens underperformed". Aggregated into
-# agent_performance_memory.relative_advantage and used by the lane
-# router to bias future picks toward consistently-winning lanes.
+# The group key is (objective_domain, task_class, node_type) so each
+# objective domain learns an isolated policy signal. score is sourced
+# only from reward_g; rows with reward_g IS NULL are skipped — falling
+# back to process_reward or status would reintroduce raw cross-objective
+# reward contamination the normalized reward_g column exists to remove.
+#
+# Positive advantage = "this lens outperformed peers on this
+# objective_domain + task_class + node_type". Negative = "this lens
+# underperformed". Aggregated into agent_performance_memory.
+# relative_advantage and used by the lane router to bias future picks
+# toward consistently-winning lanes.
 #
 # Public API:
 #   lane_router_recompute_advantages [--since EPOCH]
-#       Walk recent execution_traces grouped by (run_id, task_class,
-#       node_type). For each group, compute per-lane scores + group mean,
-#       then UPSERT agent_performance_memory rows with relative_advantage.
+#       Walk recent execution_traces grouped by (objective_domain,
+#       task_class, node_type). For each group, compute per-lane scores
+#       from normalized reward_g plus the group mean, then UPSERT
+#       agent_performance_memory rows with relative_advantage. Rows
+#       with reward_g IS NULL are skipped.
 #
 #   lane_router_preferred_lane <task_class> <node_type>
 #       Print the lane (model lane name) with highest relative_advantage
@@ -51,28 +61,29 @@ con = sqlite3.connect(db)
 con.execute("PRAGMA busy_timeout=5000")
 con.row_factory = sqlite3.Row
 
-# Group traces by (run_id, task_class) and compute per-lane score within
-# group. We derive "lane" from agent_version_id (mini-ork stores it as the
-# model_lane string, e.g. "codex_lens"). Score per trace = process_reward
-# when present, else a status-derived fallback (success=0.7, failure=0.0,
-# other=0.4).
+# Group traces by (objective_domain, task_class, node_type) so each
+# objective domain learns an isolated policy signal. "lane" derives from
+# agent_version_id (mini-ork stores it as the model_lane string, e.g.
+# "codex_lens"). score is sourced only from the normalized reward_g column
+# (set by trace_store.sh from reward_value/anchor/direction); rows with
+# reward_g IS NULL are skipped so unnormalized raw signals never enter
+# the relative-advantage calculation.
 rows = con.execute("""
-    SELECT run_id, task_class, agent_version_id,
-           verifier_output, status, process_reward
+    SELECT objective_domain, task_class, agent_version_id,
+           verifier_output, reward_g
       FROM execution_traces
      WHERE created_at >= ?
        AND task_class IS NOT NULL AND task_class <> ''
        AND agent_version_id IS NOT NULL AND agent_version_id <> ''
-       AND run_id IS NOT NULL
+       AND objective_domain IS NOT NULL AND objective_domain <> ''
+       AND reward_g IS NOT NULL
 """, (since_iso,)).fetchall()
 
 def _score(row):
-    pr = row["process_reward"]
-    if pr is not None:
-        return float(pr)
-    st = (row["status"] or "").lower()
-    return {"success": 0.70, "failure": 0.0, "vacuous": 0.20,
-            "running": 0.40, "blocked": 0.30}.get(st, 0.40)
+    # score is the normalized cross-objective reward_g only. No fallback to
+    # process_reward or status — that would reintroduce raw cross-objective
+    # reward contamination the reward_g column exists to remove.
+    return float(row["reward_g"])
 
 def _node_type(row):
     # node_type is stored in verifier_output JSON as {"node_type": "..."}
@@ -82,20 +93,25 @@ def _node_type(row):
     except Exception:
         return "unknown"
 
-# Build groups keyed by (run_id, task_class).
+# Build groups keyed by (objective_domain, task_class, node_type).
 groups = defaultdict(list)
 for r in rows:
-    groups[(r["run_id"], r["task_class"])].append({
+    groups[(r["objective_domain"], r["task_class"], _node_type(r))].append({
         "lane":      r["agent_version_id"],
         "score":     _score(r),
         "task_class": r["task_class"],
-        "node_type": _node_type(r),
     })
 
-# Accumulate per (lane, task_class) advantage samples.
+# Accumulate per (lane, task_class) advantage samples. The slice group
+# key (objective_domain, task_class, node_type) provides domain-isolated
+# computation here; the storage row key collapses to (lane, task_class)
+# because agent_performance_memory.PRIMARY KEY is (agent_version_id,
+# task_class) — per-domain UPSERTs collide on storage. Domain isolation
+# therefore lives at the slice-mean level, not the storage row.
 acc = defaultdict(lambda: {"adv_sum": 0.0, "n": 0, "wins": 0,
-                          "node_types": defaultdict(int)})
-for (_run, _tc), members in groups.items():
+                          "node_types": defaultdict(int),
+                          "objective_domains": defaultdict(int)})
+for (_od, _tc, _nt), members in groups.items():
     if len(members) < 2:
         continue  # need at least 2 lenses for group-relative comparison
     mean = sum(m["score"] for m in members) / len(members)
@@ -106,7 +122,12 @@ for (_run, _tc), members in groups.items():
         acc[key]["n"] += 1
         if adv > 0:
             acc[key]["wins"] += 1
-        acc[key]["node_types"][m["node_type"]] += 1
+        # node_type + objective_domain are folded for traceability even
+        # though storage PK doesn't separate them; once a future migration
+        # adds objective_domain to agent_performance_memory this folding
+        # can be promoted to a real column.
+        acc[key]["node_types"][_nt] += 1
+        acc[key]["objective_domains"][_od] += 1
 
 # Upsert agent_performance_memory.
 # PRIMARY KEY is (agent_version_id, task_class) so we collapse node_types
