@@ -107,11 +107,12 @@ VALUES
    strftime('%s','now'), '$TC');
 
 INSERT INTO grounded_rejections
-  (run_id, trace_id, task_class, node_type, claim, refutation, evidence_json, source_artifact)
+  (id, gate_name, verdict, concern, evidence_trace_ids, evidence_summary, suggestion)
 VALUES
-  ('$TS', 'tr-bad-1-$TS', '$TC', 'implementer',
-   'draft has proof artifacts', 'implementer_summary.json was missing',
-   '["artifact-presence"]', 'impl.log');
+  ('gr-$TS', 'implementer', 'fail',
+   'draft has proof artifacts but implementer_summary.json was missing',
+   '["tr-bad-1-$TS"]', 'artifact-presence: impl.log',
+   'require implementer_summary and diff before verifier');
 SQL
 
 mo_learning_update_conductor_outcomes >/tmp/mini-ork-learning-conductor.out
@@ -120,6 +121,7 @@ mo_learning_write_grpo_advantages >/tmp/mini-ork-learning-grpo.out
 TASK_CLASS="$TC"
 MO_ROUTING_POLICY=learning_governed
 MO_LEARNING_MIN_SAMPLES=2
+MO_LEARNING_EPSILON=0
 ROUTED="$(_mo_learning_governed_lane implementer cheap_lens)"
 
 assert_sql "process_reward column exists" \
@@ -141,7 +143,7 @@ assert_sql "conductor_decisions writeback marks success" \
 assert_ge "gradient_records table accepts learning signal" \
   "SELECT COUNT(*) FROM gradient_records WHERE task_class='$TC';" "1"
 assert_ge "grounded_rejections records refuted draft" \
-  "SELECT COUNT(*) FROM grounded_rejections WHERE task_class='$TC';" "1"
+  "SELECT COUNT(*) FROM grounded_rejections WHERE id='gr-$TS' AND gate_name='implementer' AND verdict='fail' AND suggestion='require implementer_summary and diff before verifier';" "1"
 
 if [ "$PASS" -eq 0 ]; then
   echo "FAIL zero assertions ran" >&2
