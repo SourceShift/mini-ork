@@ -61,6 +61,19 @@ ensure_column() {
 }
 ensure_column "execution_traces" "process_reward" "REAL DEFAULT NULL"
 ensure_column "agent_performance_memory" "relative_advantage" "REAL NOT NULL DEFAULT 0.0"
+# 0042 objective-aware reward columns — created here (idempotent, env-independent)
+# before migrations run, so migration 0042 only owns the indexes. Resolves the
+# review-38/39 'not idempotent' + 'depends on MINI_ORK_DB env var' findings.
+ensure_column "execution_traces" "objective_domain"      "TEXT NOT NULL DEFAULT 'code-delivery'"
+ensure_column "execution_traces" "segment"               "TEXT DEFAULT NULL"
+ensure_column "execution_traces" "reward_primary_metric" "TEXT DEFAULT NULL"
+ensure_column "execution_traces" "reward_direction"      "TEXT NOT NULL DEFAULT 'higher_is_better'"
+ensure_column "execution_traces" "reward_value"          "REAL DEFAULT NULL"
+ensure_column "execution_traces" "reward_anchor"         "REAL DEFAULT NULL"
+ensure_column "execution_traces" "reward_g"              "REAL DEFAULT NULL"
+ensure_column "execution_traces" "reward_vector_json"    "TEXT DEFAULT NULL"
+ensure_column "execution_traces" "reward_source"         "TEXT NOT NULL DEFAULT 'verifier@v1'"
+ensure_column "execution_traces" "validity"              "TEXT NOT NULL DEFAULT 'valid'"
 
 # Apply each migration in lex order
 for migration_file in $(ls "$MIGRATIONS_DIR"/*.sql | sort); do
