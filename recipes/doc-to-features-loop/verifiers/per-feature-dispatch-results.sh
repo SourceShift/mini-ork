@@ -14,7 +14,14 @@ CHECKS_TSV="$RUN_DIR/verifier-$NAME.checks.tsv"
 : >"$CHECKS_TSV"
 exec 3>"$EVIDENCE"
 
-python3 - "$FEATURE_INDEX" "$CHILD_DIR" "$AGGREGATE" >&3 <<'PY'
+if [ -x "scripts/miniork/aggregate-child-verdicts.sh" ]; then
+  if bash scripts/miniork/aggregate-child-verdicts.sh "$RUN_DIR" >&3 2>&1; then
+    :
+  else
+    echo "repo aggregate-child-verdicts.sh failed; continuing to shape checks" >&3
+  fi
+else
+  python3 - "$FEATURE_INDEX" "$CHILD_DIR" "$AGGREGATE" >&3 <<'PY'
 import glob, json, os, sys
 feature_index, child_dir, aggregate_path = sys.argv[1:4]
 
@@ -74,6 +81,7 @@ with open(aggregate_path, "w", encoding="utf-8") as f:
     json.dump(aggregate, f, indent=2, sort_keys=True)
 print(json.dumps(aggregate, sort_keys=True))
 PY
+fi
 
 check() {
   local id="$1" desc="$2" cond="$3"

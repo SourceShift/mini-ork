@@ -740,7 +740,7 @@ mo_llm_dispatch() {
         for _kv in "${_exec_env[@]}"; do export "$_kv"; done
         export MO_USAGE_FILE="${out_file}.tokens" MO_TURNS_FILE="${out_file}.turns.jsonl" \
                MO_COST_FILE="${out_file}.cost"
-        "$TIMEOUT_CMD" --kill-after=60 "$timeout_s" \
+        "$TIMEOUT_CMD" --foreground --kill-after=60 "$timeout_s" \
           "$_exec_bin" --print --output-format text "$prompt"
       ) > "$out_file" 2>"$err_log" || return $?
     else
@@ -1144,7 +1144,11 @@ fi
 # ─────────────────────────────────────────────────────────────────────────────
 llm_dispatch() {
   local task_class="" node_type="" prompt_text="" out_file="" model_override=""
-  local _timeout_s=1500 _max_turns=60
+  # Node wall-clock + turn caps are env-overridable. Slow lanes (e.g. kimi at
+  # ~30s/turn) doing many grep/read tool calls can exceed the 1500s default and
+  # get SIGKILLed mid-work — claude --print buffers stdout until exit, so the
+  # kill produces a 0-byte artifact, which then cascade-skips dependents.
+  local _timeout_s="${MO_NODE_TIMEOUT_S:-1500}" _max_turns="${MO_NODE_MAX_TURNS:-60}"
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --task-class)  task_class="$2";     shift 2 ;;

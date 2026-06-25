@@ -18,7 +18,7 @@ nodes:
   # Family-diverse drafters — each emits a candidate recipe directory under
   # ${MINI_ORK_RUN_DIR}/drafts/<family>/. 3 distinct families satisfy the
   # heterogeneity floor BEFORE the arbiter even picks.
-  - { name: glm_drafter,      type: implementer, model_lane: glm_lens,       prompt_ref: prompts/drafter-glm.md,       dispatch_mode: parallel, gates: [budget_gate] }
+  - { name: minimax_drafter,      type: implementer, model_lane: minimax_lens,   prompt_ref: prompts/drafter-glm.md,       dispatch_mode: parallel, gates: [budget_gate] }
   - { name: kimi_drafter,     type: implementer, model_lane: kimi_lens,      prompt_ref: prompts/drafter-kimi.md,      dispatch_mode: parallel, gates: [budget_gate] }
   - { name: codex_drafter,    type: implementer, model_lane: codex_lens,     prompt_ref: prompts/drafter-codex.md,     dispatch_mode: parallel, gates: [budget_gate] }
 
@@ -41,18 +41,18 @@ nodes:
 edges:
   - { from: planner,         to: arxiv_lens,      edge_type: depends_on }
   - { from: planner,         to: prior_art_lens,  edge_type: depends_on }
-  - { from: planner,         to: glm_drafter,     edge_type: depends_on }
+  - { from: planner,         to: minimax_drafter,     edge_type: depends_on }
   - { from: planner,         to: kimi_drafter,    edge_type: depends_on }
   - { from: planner,         to: codex_drafter,   edge_type: depends_on }
 
-  - { from: arxiv_lens,      to: glm_drafter,     edge_type: supplies_context_to }
+  - { from: arxiv_lens,      to: minimax_drafter,     edge_type: supplies_context_to }
   - { from: arxiv_lens,      to: kimi_drafter,    edge_type: supplies_context_to }
   - { from: arxiv_lens,      to: codex_drafter,   edge_type: supplies_context_to }
-  - { from: prior_art_lens,  to: glm_drafter,     edge_type: supplies_context_to }
+  - { from: prior_art_lens,  to: minimax_drafter,     edge_type: supplies_context_to }
   - { from: prior_art_lens,  to: kimi_drafter,    edge_type: supplies_context_to }
   - { from: prior_art_lens,  to: codex_drafter,   edge_type: supplies_context_to }
 
-  - { from: glm_drafter,     to: opus_arbiter,    edge_type: supplies_context_to }
+  - { from: minimax_drafter,     to: opus_arbiter,    edge_type: supplies_context_to }
   - { from: kimi_drafter,    to: opus_arbiter,    edge_type: supplies_context_to }
   - { from: codex_drafter,   to: opus_arbiter,    edge_type: supplies_context_to }
 

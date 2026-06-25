@@ -65,7 +65,7 @@ text = Path(roadmap).read_text(encoding="utf-8", errors="replace")
 
 EPIC_RE = re.compile(r"^##\s+(.+?)\s*(?:\(id:\s*([\w.-]+)\))?\s*$")
 DEP_PATTERNS = (
-    r"^\s*-\s+(?:depends on|blocked by|after|requires|should follow|prefer after|related to|see also|context)\s*:.*$"
+    r"^\s*(?:-\s+)?(?:depends on|blocked by|after|requires|should follow|prefer after|related to|see also|context)\s*:.*$"
 )
 DEP_RE = re.compile(DEP_PATTERNS, re.I)
 
@@ -206,9 +206,9 @@ text = Path(roadmap).read_text(encoding="utf-8", errors="replace")
 # Parse: split by `## ` headings. Body = lines until next ## heading.
 EPIC_RE = re.compile(r"^##\s+(.+?)\s*(?:\(id:\s*([\w.-]+)\))?\s*$")
 DEP_RES = {
-    "hard": re.compile(r"^\s*-\s+(?:depends on|blocked by|after|requires)\s*:\s*(.+)$", re.I),
-    "soft": re.compile(r"^\s*-\s+(?:should follow|prefer after)\s*:\s*(.+)$", re.I),
-    "informational": re.compile(r"^\s*-\s+(?:related to|see also|context)\s*:\s*(.+)$", re.I),
+    "hard": re.compile(r"^\s*(?:-\s+)?(?:depends on|blocked by|after|requires)\s*:\s*(.+)$", re.I),
+    "soft": re.compile(r"^\s*(?:-\s+)?(?:should follow|prefer after)\s*:\s*(.+)$", re.I),
+    "informational": re.compile(r"^\s*(?:-\s+)?(?:related to|see also|context)\s*:\s*(.+)$", re.I),
 }
 
 def slugify(title: str) -> str:

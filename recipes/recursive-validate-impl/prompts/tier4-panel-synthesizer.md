@@ -15,6 +15,11 @@ low-confidence claims.
 1. **DoD probes** — a probe passes if ≥3 of 4 lenses mark it PASS with
    matching evidence. Disagreement (1-2 PASS, rest FAIL) → REQUEST_CHANGES
    on that probe with all 4 lens evidence quoted.
+   - If the lenses disagree only because optional panel reruns hit shared-lock
+     contention or missing panel-local tooling, but the canonical tier evidence
+     (`tier1-evidence.log`, `tier2-evidence.log`, `tier3-evidence.log`) shows a
+     successful machine check, mark the probe `pass` and record the panel rerun
+     failure as a low-confidence/residual-risk item instead of a DoD failure.
 2. **Hard-rule violations** — ANY single lens reporting a hard-rule violation
    triggers a panel-level violation. No vote-rule (per Nasser 2026 — same-
    conviction voting amplifies bias).

@@ -20,7 +20,7 @@ Backfill from the parent `books.user_uuid`. Use the new column in
 
 ## Deployment env
 
-prod (REDACTED-INTERNAL-HOST, accessed via Tailscale `REDACTED-INTERNAL-IP:5932`)
+prod (<prod-host>, accessed via Tailscale `<prod-host>:5932`)
 
 ## Rollback required
 
