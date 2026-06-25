@@ -111,15 +111,19 @@ for r in rows:
         "task_class": r["task_class"],
     })
 
-# Accumulate per (lane, task_class) advantage samples. The slice group
-# key (objective_domain, task_class, node_type) provides domain-isolated
-# computation here; the storage row key collapses to (lane, task_class)
-# because agent_performance_memory.PRIMARY KEY is (agent_version_id,
-# task_class) — per-domain UPSERTs collide on storage. Domain isolation
-# therefore lives at the slice-mean level, not the storage row.
+# Accumulate two slices in one pass (review-36 #193):
+#   acc        — (lane, task_class) GLOBAL slice → agent_performance_memory
+#                (cross-domain, backward-compatible — unchanged readers keep
+#                working).
+#   acc_domain — (lane, task_class, node_type, objective_domain) PER-DOMAIN
+#                slice → lane_domain_advantage (migration 0043). This is the
+#                durable per-objective_domain storage the router prefers; it
+#                no longer collides across domains the way a single
+#                agent_performance_memory row did.
 acc = defaultdict(lambda: {"adv_sum": 0.0, "n": 0, "wins": 0,
                           "node_types": defaultdict(int),
                           "objective_domains": defaultdict(int)})
+acc_domain = defaultdict(lambda: {"adv_sum": 0.0, "n": 0, "wins": 0})
 for (_od, _tc, _nt), members in groups.items():
     if len(members) < 2:
         continue  # need at least 2 lenses for group-relative comparison
@@ -131,12 +135,15 @@ for (_od, _tc, _nt), members in groups.items():
         acc[key]["n"] += 1
         if adv > 0:
             acc[key]["wins"] += 1
-        # node_type + objective_domain are folded for traceability even
-        # though storage PK doesn't separate them; once a future migration
-        # adds objective_domain to agent_performance_memory this folding
-        # can be promoted to a real column.
         acc[key]["node_types"][_nt] += 1
         acc[key]["objective_domains"][_od] += 1
+        # Per-domain slice: keep node_type + objective_domain in the key so
+        # domains and node types are isolated at the storage row, not folded.
+        dkey = (m["lane"], m["task_class"], _nt, _od)
+        acc_domain[dkey]["adv_sum"] += adv
+        acc_domain[dkey]["n"] += 1
+        if adv > 0:
+            acc_domain[dkey]["wins"] += 1
 
 # Upsert agent_performance_memory.
 # PRIMARY KEY is (agent_version_id, task_class) so we collapse node_types
@@ -165,6 +172,27 @@ for (lane, tc), stats in acc.items():
     """, (lane, top_node or lane, lane, tc,
           stats["n"], stats["wins"], round(avg_adv, 4)))
     upserted += 1
+
+# Per-domain slice → lane_domain_advantage (migration 0043). Keyed by
+# (agent_version_id, task_class, node_type, objective_domain) so objective
+# domains no longer collide on a single row.
+for (lane, tc, nt, od), stats in acc_domain.items():
+    avg_adv = stats["adv_sum"] / max(stats["n"], 1)
+    con.execute("""
+        INSERT INTO lane_domain_advantage
+            (agent_version_id, task_class, node_type, objective_domain,
+             relative_advantage, runs_count, success_count, last_updated)
+        VALUES (?, ?, ?, ?, ?, ?, ?,
+                strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+        ON CONFLICT(agent_version_id, task_class, node_type, objective_domain)
+        DO UPDATE SET
+            relative_advantage = excluded.relative_advantage,
+            runs_count         = excluded.runs_count,
+            success_count      = excluded.success_count,
+            last_updated       = excluded.last_updated
+    """, (lane, tc, nt or '', od or '', round(avg_adv, 4),
+          stats["n"], stats["wins"]))
+
 con.commit()
 con.close()
 print(upserted)
@@ -174,10 +202,34 @@ PY
 lane_router_preferred_lane() {
   local task_class="${1:?task_class required}"
   local node_type="${2:-}"
+  local objective_domain="${3:-}"
   mo_store_assert_sqlite
   local STATE_DB
   STATE_DB="$(mo_store_db_path)"
   local _min_samples="${MO_LEARNING_MIN_SAMPLES:-3}"
+
+  # review-36 #193: prefer the durable per-objective_domain slice
+  # (lane_domain_advantage, migration 0043) when a domain is supplied and it
+  # clears the sample floor. This is what makes per-domain learning real at
+  # the storage layer rather than slice-mean only.
+  if [ -n "$objective_domain" ]; then
+    local dwhere="task_class='$task_class' AND objective_domain='$objective_domain' AND runs_count >= ${_min_samples}"
+    [ -n "$node_type" ] && dwhere="$dwhere AND node_type='$node_type'"
+    local _hit
+    _hit=$(sqlite3 -separator '|' "$STATE_DB" \
+      "SELECT agent_version_id, printf('%.3f', relative_advantage), runs_count
+         FROM lane_domain_advantage
+        WHERE $dwhere
+        ORDER BY relative_advantage DESC, runs_count DESC
+        LIMIT 1;")
+    if [ -n "$_hit" ]; then
+      echo "$_hit"
+      return 0
+    fi
+  fi
+
+  # Fallback: cross-domain global slice (no domain given, or the domain has
+  # not yet reached the sample floor — cold-start safe).
   local where="task_class='$task_class' AND runs_count >= ${_min_samples}"
   [ -n "$node_type" ] && where="$where AND (role='$node_type' OR model='$node_type')"
   sqlite3 -separator '|' "$STATE_DB" \
