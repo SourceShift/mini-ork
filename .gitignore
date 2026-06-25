@@ -64,6 +64,12 @@ __pycache__/
 *.pyc
 # verify step writes verifier-result-*.json to cwd on direct runs
 /verifier-result-*.json
+# framework-edit implementer writes implementer_summary.json to cwd on direct runs
+/implementer_summary.json
+
+# Unrelated local scratch projects that share this working tree but are not
+# part of mini-ork. Keep them out of the OSS repo.
+/peltier-thermal/
 
 # OS
 .DS_Store
@@ -78,3 +84,14 @@ docs/blog/
 # Local research notes/instructions that are useful on this machine but should
 # not ship as project documentation.
 docs/research/local/
+
+# External-IP guard: these artifact classes carry private external-project
+# IP and must never enter this public repo.
+Volumes/
+.mo-run-home/
+/doc-part_*.md
+/lens-minimax.md
+# Whole research-notes dir holds local arxiv/conductor scaffolding (incl. PDFs),
+# not shippable project docs.
+.mini-ork/research-notes/
+kickoffs/*autonomy-pluggability*

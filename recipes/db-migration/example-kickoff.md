@@ -20,7 +20,7 @@ Backfill from the parent `books.user_uuid`. Use the new column in
 
 ## Deployment env
 
-prod (jisawru, accessed via Tailscale `100.74.239.22:5932`)
+prod (<prod-host>, accessed via Tailscale `<prod-host>:5932`)
 
 ## Rollback required
 

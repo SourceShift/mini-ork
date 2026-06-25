@@ -23,7 +23,7 @@ nodes:
 
   - name: wave_aggregator
     type: implementer
-    model_lane: glm_lens
+    model_lane: minimax_lens
     prompt_ref: prompts/wave-aggregator.md
     dispatch_mode: serial
     gates: [budget_gate]

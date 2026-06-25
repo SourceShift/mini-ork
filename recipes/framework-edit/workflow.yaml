@@ -29,7 +29,7 @@ nodes:
 
   - name: implementer
     type: implementer
-    model_lane: glm_lens
+    model_lane: minimax_lens
     prompt_ref: prompts/implementer.md
     dispatch_mode: serial
     gates: [scope_gate, budget_gate]
