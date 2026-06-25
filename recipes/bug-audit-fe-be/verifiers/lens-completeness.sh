@@ -63,14 +63,22 @@ if [ "${#missing[@]}" -eq 0 ]; then
     'missing': []
   }))"
 else
-  python3 - <<PY
-import json
-missing = """${missing[@]}""".split()
+  # review-39 HIGH: pass each missing entry newline-joined via an env var and
+  # split ONLY on newline, so multi-word entries keep their internal spaces.
+  # Data goes through the environment, never interpolated into the Python
+  # source (no quote/whitespace/injection hazard).
+  MO_MISSING="$(printf '%s\n' "${missing[@]}")" \
+  MO_EVIDENCE="$EVIDENCE" \
+  MO_FINDINGS_TOTAL="$findings_total" \
+  python3 <<'PY'
+import json, os
+missing = [l for l in os.environ.get("MO_MISSING", "").split("\n") if l.strip() != ""]
+ft = os.environ.get("MO_FINDINGS_TOTAL", "0")
 print(json.dumps({
   'verifier': 'lens-completeness',
   'pass': False,
-  'evidence_path': '$EVIDENCE',
-  'findings_count': $findings_total,
+  'evidence_path': os.environ.get("MO_EVIDENCE", ""),
+  'findings_count': int(ft) if ft.strip().lstrip("-").isdigit() else ft,
   'missing': missing
 }))
 PY
