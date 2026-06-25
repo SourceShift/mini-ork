@@ -36,28 +36,42 @@ collision.
 
 ## Expected Edit
 
-Reconcile the two migrations so a fresh init applies both cleanly and ends with
-ONE canonical `grounded_rejections` schema. Decide the canonical column set by
-reading every consumer of `grounded_rejections` under `lib/` and `bin/` (grep
-the table name) and preserving the columns those readers actually query — do
-NOT guess. Then make the migrations converge: e.g. one migration owns the
-`CREATE TABLE` and the other becomes idempotent `ALTER TABLE … ADD COLUMN`
-guards plus indexes that only reference columns guaranteed to exist at that
-point. Both fresh-init order (0037→0040) and already-initialized DBs must end
-in the same final schema. Keep `PRAGMA foreign_keys` handling intact.
+The two migrations are NOT two versions of one table — they are semantically
+distinct tables that collided on the name `grounded_rejections`, with
+INCOMPATIBLE primary keys that cannot be reconciled by additive ALTER:
+- `0037` = gate-failure tuples (`id TEXT PRIMARY KEY`, `gate_name/verdict/
+  concern/evidence_trace_ids`, plus immutability triggers
+  `grounded_rejections_no_immutable_update` / `grounded_rejections_no_delete`).
+  Its ONLY consumer is `lib/gates_common.sh`, which writes this shape.
+- `0040` = refuted-draft events (`id INTEGER PRIMARY KEY AUTOINCREMENT`,
+  `trace_id/task_class/node_type/claim/refutation/evidence_json`). It has
+  ZERO consumers in `lib/` or `bin/`.
+
+Fix by KEEPING `0037` as the canonical `grounded_rejections` (unchanged,
+triggers intact) and RENAMING `0040`'s table + its three indexes to a distinct,
+non-colliding name (e.g. `grounded_draft_rejections`) so the index creation no
+longer targets 0037's columns. The implementer may instead drop-and-recreate
+`0040`'s table under the new name. Do NOT merge the two. First grep
+`grounded_rejections` across `lib/`/`bin/` to confirm the consumer inventory
+before choosing; if any consumer of 0040's columns turns up, repoint it to the
+renamed table.
 
 ## Requirements
 
 - Fresh `MINI_ORK_HOME=$(mktemp -d)/.mini-ork ./bin/mini-ork init` exits 0.
-- Already-initialized DBs are not broken (migrations remain idempotent/additive;
-  no destructive DROP of a populated table).
-- Every `lib/`/`bin/` reader of `grounded_rejections` still resolves its columns
-  against the final schema.
+- Already-initialized DBs are not broken (idempotent; no destructive DROP of a
+  populated table — guard any rename so it is safe on a DB that already has
+  0040's table).
+- `0037` stays canonical: its columns, indexes, AND immutability triggers are
+  preserved unchanged.
+- `0040`'s columns and indexes SURVIVE under the renamed table — they must not
+  be silently dropped (the rename target must exist with those columns/indexes).
+- `lib/gates_common.sh` still resolves its `grounded_rejections` columns.
 
 ## Done When
 
-- A fresh init in a temp home exits 0 and `grounded_rejections` exists with the
-  canonical columns.
+- A fresh init in a temp home exits 0; `grounded_rejections` exists with the
+  0037 schema and the renamed table exists with 0040's columns/indexes.
 - `./bin/mini-ork doctor` exits 0.
-- `grep -rn grounded_rejections lib/ bin/` consumers all reference columns that
-  exist in the reconciled schema.
+- Any `verdict.json` example the change documents uses keys in exactly this
+  order: `files_changed, tests_pass, static_pass, pass`.
