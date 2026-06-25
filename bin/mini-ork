@@ -35,10 +35,52 @@ case "$sub" in
   # Walks classify → plan → execute → verify. Each step's output (key=value
   # lines on stdout) is parsed to thread state into the next step's env.
   run)
-    first="${1:?recipe name or kickoff.md path required}"; shift
     _RUN_T0=$(date +%s)   # auto-reflect window start (see reflect step below)
     recipe=""
     kickoff=""
+    first=""
+
+    # ── pre-parse flags ─────────────────────────────────────────────────────
+    # Pull --deadline <seconds> out of "$@" before positional handling so the
+    # user-first probe-classify path doesn't accidentally treat it as the
+    # kickoff path. Forward-compatible: unknown flags pass through untouched
+    # so positional `mini-ork run <recipe> <kickoff>` callers stay green.
+    DEADLINE_SECS=""
+    _mo_args=()
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --deadline)
+          if [ "$#" -lt 2 ]; then
+            echo "--deadline requires <seconds>" >&2
+            exit 2
+          fi
+          case "$2" in
+            ''|*[!0-9]*)
+              echo "--deadline: seconds must be a positive integer (got '$2')" >&2
+              exit 2 ;;
+          esac
+          DEADLINE_SECS="$2"
+          shift 2 ;;
+        --deadline=*)
+          _v="${1#*=}"
+          case "$_v" in
+            ''|*[!0-9]*)
+              echo "--deadline: seconds must be a positive integer (got '$_v')" >&2
+              exit 2 ;;
+          esac
+          DEADLINE_SECS="$_v"
+          shift ;;
+        *) _mo_args+=("$1"); shift ;;
+      esac
+    done
+    if [ "${#_mo_args[@]}" -gt 0 ]; then
+      set -- "${_mo_args[@]}"
+    else
+      set --
+    fi
+    unset _mo_args _v
+
+    first="${1:?recipe name or kickoff.md path required}"; shift
     if [ -f "$first" ]; then
       # User-first path: `mini-ork run kickoff.md`.
       # Probe classify in dry-run mode, resolve the matching recipe, then run
@@ -116,6 +158,14 @@ except Exception:
     MINI_ORK_TASK_CLASS=$(printf '%s\n' "$classify_out" | grep -E '^task_class=' | head -1 | cut -d= -f2)
     export MINI_ORK_TASK_CLASS
 
+    # ── deadline gate (between classify and profile) ────────────────────────
+    # Soft-stop model: check is between stages, never mid-stage. A long
+    # stage can overshoot; that's recorded in the deadline_hit payload.
+    if [ -n "$DEADLINE_SECS" ] && ! mo_deadline_check "$MINI_ORK_RUN_ID"; then
+      echo "deadline_hit after classify; no best-so-far artifact yet; exiting cleanly" >&2
+      exit 0
+    fi
+
     # ── profile ───────────────────────────────────────────────────────────────
     # Build the run profile before planning so the planner sees operational
     # context that is easy to inspect and easy for callers to answer later.
@@ -125,6 +175,22 @@ except Exception:
     mkdir -p "$RUN_DIR"
     MINI_ORK_PROFILE_PATH="$RUN_DIR/run_profile.json"
     export MINI_ORK_PROFILE_PATH
+
+    # ── deadline arming ────────────────────────────────────────────────────
+    # Source the deadline helper and arm the budget when --deadline was
+    # passed. Must run after RUN_DIR exists so the sidecar lives next to
+    # other run artifacts. --deadline 0 / unset = no budget (open).
+    # shellcheck source=lib/deadline_budget.sh
+    source "$MINI_ORK_ROOT/lib/deadline_budget.sh" 2>/dev/null || {
+      echo "failed to source lib/deadline_budget.sh" >&2
+      exit 2
+    }
+    if [ -n "$DEADLINE_SECS" ] && [ "$DEADLINE_SECS" -gt 0 ] 2>/dev/null; then
+      mo_deadline_init "$MINI_ORK_RUN_ID" "$DEADLINE_SECS" "$RUN_DIR" || {
+        echo "deadline init failed" >&2
+        exit 2
+      }
+    fi
     profile_out=$(python3 - "$kickoff" "$MINI_ORK_ROOT" "$recipe" "$MINI_ORK_TASK_CLASS" "$MINI_ORK_PROFILE_PATH" "${MINI_ORK_HOME}/config/agents.yaml" <<'PY'
 import json
 import re
@@ -318,11 +384,23 @@ PY
       exit 2
     fi
 
+    # ── deadline gate (between profile and plan) ─────────────────────────────
+    if [ -n "$DEADLINE_SECS" ] && ! mo_deadline_check "$MINI_ORK_RUN_ID"; then
+      echo "deadline_hit after profile; no best-so-far artifact yet; exiting cleanly" >&2
+      exit 0
+    fi
+
     # ── plan ───────────────────────────────────────────────────────────────────
     plan_out=$("$MINI_ORK_ROOT/bin/mini-ork-plan" "$kickoff") || exit $?
     printf '%s\n' "$plan_out"
     MINI_ORK_PLAN_PATH=$(printf '%s\n' "$plan_out" | grep -E '^plan_path=' | head -1 | cut -d= -f2)
     export MINI_ORK_PLAN_PATH
+
+    # ── deadline gate (between plan and execute) ─────────────────────────────
+    if [ -n "$DEADLINE_SECS" ] && ! mo_deadline_check "$MINI_ORK_RUN_ID"; then
+      echo "deadline_hit after plan; best-so-far artifact: ${MINI_ORK_PLAN_PATH:-<none>}" >&2
+      exit 0
+    fi
 
     # ── execute (plan path passed via env, not positional) ─────────────────────
     # Failures do NOT exit here: failed runs are the strongest learning
@@ -333,6 +411,14 @@ PY
     printf '%s\n' "$execute_out"
     MINI_ORK_ARTIFACT_PATH=$(printf '%s\n' "$execute_out" | grep -E '^artifact_path=' | head -1 | cut -d= -f2 || true)
     export MINI_ORK_ARTIFACT_PATH
+
+    # ── deadline gate (between execute and rubric/verify) ────────────────────
+    # mo_deadline_check records MINI_ORK_ARTIFACT_PATH in the .deadline-hit
+    # sentinel payload so downstream tools can find the best-so-far output.
+    if [ -n "$DEADLINE_SECS" ] && ! mo_deadline_check "$MINI_ORK_RUN_ID"; then
+      echo "deadline_hit after execute; best-so-far artifact: ${MINI_ORK_ARTIFACT_PATH:-<none>}" >&2
+      exit "$_run_rc"
+    fi
 
     # Persist execute output in the run dir (obs contract — asserted by
     # tests/test_obs_surface.sh). Skip when the file already exists:
@@ -394,6 +480,12 @@ PY
       "$MINI_ORK_ROOT/bin/mini-ork-verify" || _verify_rc=$?
     fi
     [ "$_run_rc" -eq 0 ] && _run_rc=$_verify_rc
+
+    # ── deadline gate (between verify and reflect) ──────────────────────────
+    if [ -n "$DEADLINE_SECS" ] && ! mo_deadline_check "$MINI_ORK_RUN_ID"; then
+      echo "deadline_hit after verify; best-so-far artifact: ${MINI_ORK_ARTIFACT_PATH:-<none>}" >&2
+      exit "$_run_rc"
+    fi
 
     # ── reflect (learning extraction) ──────────────────────────────────────────
     # Close the learning loop: extract gradients from THIS run's traces so the
