@@ -470,17 +470,43 @@ total = con.execute(
     "SELECT COUNT(*) FROM pre_push_review_issues WHERE review_id=? AND status='open'",
     (rid,)).fetchone()[0]
 
+# Heuristic HIGHs are DETERMINISTIC checks (bash syntax, migration safety,
+# secret leak, …). They are reliable, so they block on their own.
+heuristic_high = con.execute(
+    "SELECT COUNT(*) FROM pre_push_review_issues "
+    "WHERE review_id=? AND severity='high' AND status='open' "
+    "AND lens LIKE 'heuristic.%'",
+    (rid,)).fetchone()[0]
+
+# LLM-panel HIGHs are STOCHASTIC: a single lens flags inconsistently across
+# byte-identical commits (observed: review 41 approve/high=0 vs review 43
+# block/high=4 on the SAME sha). A single non-deterministic lens must not gate
+# main. Require CONSENSUS — >=2 DISTINCT llm lenses flagging a HIGH on the same
+# file — before a panel HIGH counts toward blocking. Single-lens panel HIGHs
+# are still recorded and surfaced, but demoted to warn (they do not block).
+consensus_high = con.execute(
+    "SELECT COUNT(*) FROM ("
+    "  SELECT file_path FROM pre_push_review_issues "
+    "  WHERE review_id=? AND severity='high' AND status='open' "
+    "    AND lens LIKE 'llm.%' AND file_path IS NOT NULL "
+    "  GROUP BY file_path HAVING COUNT(DISTINCT lens) >= 2"
+    ")",
+    (rid,)).fetchone()[0]
+
+blocking_high = heuristic_high + consensus_high
+
 # Verdict policy:
-#   any critical              -> block always
-#   any high + target=main    -> block
-#   any high + target=feature -> warn
-#   medium/low                -> warn if >5 else approve
+#   any critical                         -> block always
+#   blocking HIGH (heuristic or >=2-lens   -> block on main, warn on feature
+#     consensus) + target=main
+#   single-lens panel HIGH               -> warn (recorded, non-blocking)
+#   medium/low                           -> warn if >5 else approve
 to_main = target in ("main","master")
 if critical > 0:
     verdict = "block"
-elif high > 0:
+elif blocking_high > 0:
     verdict = "block" if to_main else "warn"
-elif total > 5:
+elif high > 0 or total > 5:
     verdict = "warn"
 else:
     verdict = "approve"
@@ -491,7 +517,7 @@ con.execute("""
            rationale=?
      WHERE id=?
 """, (verdict, total, critical,
-      f"target={target} crit={critical} high={high} total={total}", rid))
+      f"target={target} crit={critical} high={high} blocking={blocking_high} (heuristic={heuristic_high}, consensus={consensus_high}) total={total}", rid))
 con.commit(); con.close()
 PY
 

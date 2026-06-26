@@ -197,10 +197,15 @@ def _spawn_command(
             "--child-run",
             child_run_id,
         ]
+        # NOTE: `mini-ork spawn` does NOT accept --smoke-shape (only the `run`
+        # path below does). Appending it here made every epic-runner child
+        # spawn fail with "Unknown flag: --smoke-shape". Publish gating for the
+        # spawn path is handled via MINI_ORK_EPIC_PUBLISH env, so the flag is
+        # unnecessary here.
     else:
         cmd = [str(root / "bin" / "mini-ork"), "run", "framework-edit", str(kickoff_path)]
-    if not publish_enabled:
-        cmd.append("--smoke-shape")
+        if not publish_enabled:
+            cmd.append("--smoke-shape")
     return cmd
 
 

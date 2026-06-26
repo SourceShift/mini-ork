@@ -1,0 +1,29 @@
+version: "0.1.0"
+task_class: fe_be_bug_audit
+description: >
+  FE+BE bug-audit recipe — 2 heterogeneous lens stances run in parallel
+  (kimi contract-violation + minimax user-impact), opus synthesis composes
+  + ranks findings. Drops glm/codex lanes per standing directives
+  (glm 429s on Fair Usage; codex banned in mini-ork).
+
+nodes:
+  - { name: planner,        type: planner,     model_lane: planner,      prompt_ref: prompts/planner.md,  dispatch_mode: serial }
+  - { name: kimi_lens,      type: researcher,  model_lane: kimi_lens,    prompt_ref: prompts/lens-kimi.md,    dispatch_mode: parallel, gates: [budget_gate] }
+  - { name: minimax_lens,   type: researcher,  model_lane: minimax_lens, prompt_ref: prompts/lens-minimax.md,  dispatch_mode: parallel, gates: [budget_gate] }
+  - { name: synthesizer,    type: reviewer,    model_lane: reviewer,     prompt_ref: prompts/synthesis.md,    dispatch_mode: serial,   gates: [budget_gate] }
+  - { name: lens_completeness, type: verifier, verifier_ref: verifiers/lens-completeness.sh, dispatch_mode: serial }
+  - { name: publisher,      type: publisher,   prompt_ref: null, dispatch_mode: serial, gates: [scope_gate] }
+  - { name: rollback,       type: rollback,    prompt_ref: null, dispatch_mode: serial }
+
+edges:
+  - { from: planner, to: kimi_lens,     edge_type: depends_on }
+  - { from: planner, to: minimax_lens,  edge_type: depends_on }
+  - { from: kimi_lens,    to: synthesizer, edge_type: supplies_context_to }
+  - { from: minimax_lens, to: synthesizer, edge_type: supplies_context_to }
+  - { from: synthesizer, to: lens_completeness, edge_type: verifies }
+  - { from: lens_completeness, to: publisher, edge_type: depends_on }
+  - { from: synthesizer, to: rollback, edge_type: escalates_to }
+  - { from: lens_completeness, to: rollback, edge_type: escalates_to }
+
+rollback_strategy: keep_lens_reports_discard_synthesis
+max_self_correction_iterations: 3
