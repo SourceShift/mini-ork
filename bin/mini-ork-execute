@@ -1475,6 +1475,13 @@ _mo_source() {
 
 _mo_policy_route_lane() {
   local node_type="$1" current_lane="$2"
+  # Dry-run is a workflow-shape preview, not a learning-policy preview. It
+  # must preserve the recipe's explicit model_lane assignments so tests and
+  # operators can verify lane wiring without a warm GRPO table.
+  if [ "${DRY_RUN:-0}" -eq 1 ]; then
+    printf '%s\n' "$current_lane"
+    return 0
+  fi
   # Default ON: real runs act on learnings. Safe — learning_governed degrades
   # to the static default when learning tables are cold/vacuous. Opt out with
   # MO_ROUTING_POLICY=workflow_default.
