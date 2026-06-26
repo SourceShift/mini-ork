@@ -38,9 +38,9 @@ lanes:
   # pairwise ρ stays low. Each lens lane maps to a DISTINCT model family
   # so 4 named lenses (glm/kimi/codex/opus) actually run on 4 families,
   # not 3-of-4 collapsed to Sonnet via decomposer/spec_author/worker mapping.
-  glm_lens: minimax      # remapped glm->minimax (standing skip-GLM directive: GLM 429s on Fair Usage within 2-3 dispatches/hr; broad-scan stance now runs on MiniMax-M3)
+  glm_lens: glm          # Zhipu GLM-5.1 (restored 2026-06-25 for the 5-family AWM audit; user explicitly wants GLM in the panel)
   kimi_lens: kimi        # Moonshot
-  codex_lens: sonnet     # remapped codex->sonnet (standing no-codex directive: never run codex in mini-ork lanes; keeps 4 distinct families minimax/kimi/sonnet/opus; lens file stays lens-codex.md)
+  codex_lens: codex      # OpenAI Codex (restored 2026-06-25; codex NOT banned per 2026-06-24 correction; user wants codex in the panel)
   opus_lens: opus        # Anthropic (kept — different role: deep arch)
   # v0.2-pt26 (2026-06-01): MiniMax-M3 lens. Verified end-to-end this
   # session — produced 4 faithful/actionable/calibrated gradients on
