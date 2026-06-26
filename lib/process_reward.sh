@@ -44,10 +44,22 @@
 [ "${0:-}" = "${BASH_SOURCE[0]:-}" ] && set -Eeuo pipefail
 
 MINI_ORK_ROOT="${MINI_ORK_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
-STATE_DB="${MINI_ORK_DB:-${MINI_ORK_HOME:-.mini-ork}/state.db}"
+# v0.2-pt36 RLM-3: DB access now flows through the policy_store seam over
+# lib/db_open.sh. STATE_DB is resolved per-call via $(mo_store_db_path) so
+# MO_STORE_DB / MO_STORE_BACKEND=postgres can route without forking this lib.
+# SQLite default (no env override) resolves to the same path as the old
+# ${MINI_ORK_DB:-${MINI_ORK_HOME:-.mini-ork}/state.db} convention. PRM weight
+# table (W_STATUS..W_COST, ACTIVITY_CAP) is mirrored verbatim between
+# prm_score_trace and prm_backfill; this refactor only changes the connect
+# path, not the scoring math.
+# shellcheck disable=SC1091
+. "${MINI_ORK_ROOT}/lib/policy_store.sh"
 
 prm_score_trace() {
   local trace_id="${1:?trace_id required}"
+  mo_store_assert_sqlite
+  local STATE_DB
+  STATE_DB="$(mo_store_db_path)"
   python3 - "$STATE_DB" "$trace_id" <<'PY'
 import json, os, sqlite3, sys
 db, trace_id = sys.argv[1:3]
@@ -134,6 +146,9 @@ prm_backfill() {
       *) shift ;;
     esac
   done
+  mo_store_assert_sqlite
+  local STATE_DB
+  STATE_DB="$(mo_store_db_path)"
   python3 - "$STATE_DB" "$since" <<'PY'
 import json, os, sqlite3, sys, datetime
 db, since_str = sys.argv[1:3]
@@ -218,6 +233,9 @@ PY
 prm_low_scoring() {
   local task_class="${1:?task_class required}"
   local n="${2:-10}"
+  mo_store_assert_sqlite
+  local STATE_DB
+  STATE_DB="$(mo_store_db_path)"
   sqlite3 -separator ' | ' "$STATE_DB" \
     "SELECT printf('%.2f', process_reward),
             printf('%-15s', status),

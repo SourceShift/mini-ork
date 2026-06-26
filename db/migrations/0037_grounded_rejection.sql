@@ -22,28 +22,6 @@ CREATE TABLE IF NOT EXISTS grounded_rejections (
   consumed_by_reflector_ts INTEGER      -- set when reflector reads the row; null otherwise
 );
 
-CREATE INDEX IF NOT EXISTS idx_grounded_rejections_ts
-  ON grounded_rejections(ts DESC);
-
-CREATE INDEX IF NOT EXISTS idx_grounded_rejections_run
-  ON grounded_rejections(run_id, ts DESC) WHERE run_id IS NOT NULL;
-
-CREATE INDEX IF NOT EXISTS idx_grounded_rejections_unconsumed
-  ON grounded_rejections(consumed_by_reflector_ts) WHERE consumed_by_reflector_ts IS NULL;
-
--- Provenance fields are immutable after insert; only consumed_by_reflector_ts
--- may be updated to mark reflector consumption.
-CREATE TRIGGER IF NOT EXISTS grounded_rejections_no_immutable_update
-  BEFORE UPDATE OF id, ts, run_id, gate_name, verdict, concern, evidence_trace_ids, evidence_summary, suggestion
-  ON grounded_rejections
-  BEGIN
-    SELECT RAISE(ABORT, 'grounded_rejections: provenance fields are immutable; only consumed_by_reflector_ts may be set');
-  END;
-
-CREATE TRIGGER IF NOT EXISTS grounded_rejections_no_delete
-  BEFORE DELETE ON grounded_rejections
-  BEGIN
-    SELECT RAISE(ABORT, 'grounded_rejections is append-only');
-  END;
+.read "|sh -c 'db=\"${MINI_ORK_DB:?}\"; if sqlite3 \"$db\" \"SELECT COUNT(*) FROM pragma_table_info(\\\"grounded_rejections\\\") WHERE name = \\\"ts\\\";\" | grep -q \"^1$\"; then printf \"%s\n\" \"CREATE INDEX IF NOT EXISTS idx_grounded_rejections_ts\" \"  ON grounded_rejections(ts DESC);\" \"\" \"CREATE INDEX IF NOT EXISTS idx_grounded_rejections_run\" \"  ON grounded_rejections(run_id, ts DESC) WHERE run_id IS NOT NULL;\" \"\" \"CREATE INDEX IF NOT EXISTS idx_grounded_rejections_unconsumed\" \"  ON grounded_rejections(consumed_by_reflector_ts) WHERE consumed_by_reflector_ts IS NULL;\" \"\" \"CREATE TRIGGER IF NOT EXISTS grounded_rejections_no_immutable_update\" \"  BEFORE UPDATE OF id, ts, run_id, gate_name, verdict, concern, evidence_trace_ids, evidence_summary, suggestion\" \"  ON grounded_rejections\" \"  BEGIN\" \"    SELECT RAISE(ABORT, '\"'\"'grounded_rejections: provenance fields are immutable; only consumed_by_reflector_ts may be set'\"'\"');\" \"  END;\" \"\" \"CREATE TRIGGER IF NOT EXISTS grounded_rejections_no_delete\" \"  BEFORE DELETE ON grounded_rejections\" \"  BEGIN\" \"    SELECT RAISE(ABORT, '\"'\"'grounded_rejections is append-only'\"'\"');\" \"  END;\"; fi'"
 
 PRAGMA foreign_keys = ON;

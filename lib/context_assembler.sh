@@ -13,6 +13,16 @@
 # Token budget: MINI_ORK_CTX_BUDGET_TOKENS (default 64000). Prefers
 # recent/high-confidence items; truncates with summary marker.
 # Every included item carries a cite: <source> field.
+#
+# Slice-provider seam (rlm-6 context-paging):
+#   MINI_ORK_SLICE_PROVIDER selects which truncation policy runs.
+#     default (unset) — legacy 64K-truncate, byte-for-byte compatible.
+#     paged           — emits the first slice and tags the pack with
+#                       _slice_provider / _next_slice_hint so the
+#                       book-gen Body can fetch the next slice. Future
+#                       work; this seam is the only thing rlm-6 ships.
+#   Unknown provider names fall back to "default" so a misconfigured
+#   caller cannot regress the eng-team consumer.
 
 [ "${0:-}" = "${BASH_SOURCE[0]:-}" ] && set -Eeuo pipefail
 
@@ -51,12 +61,20 @@ except Exception:
     fi
   fi
 
+  # Slice-provider seam (rlm-6 context-paging).
+  # Default provider reproduces the legacy 64K-truncate behavior
+  # byte-for-byte; paged provider is a stub for the book-gen Body to bind
+  # groundChapterQuery's "next slice" fetch against. Selected via the
+  # MINI_ORK_SLICE_PROVIDER env var; unknown names fall through to the
+  # default so a misconfigured caller never regresses the eng-team consumer.
+  local slice_provider="${MINI_ORK_SLICE_PROVIDER:-default}"
   python3 - \
     "${MINI_ORK_DB:?MINI_ORK_DB unset}" \
     "$brief_content" \
     "$workflow_node" \
     "$budget" \
     "$verifier_contract" \
+    "$slice_provider" \
     <<'PY'
 import sqlite3, json, sys, re, time
 
@@ -233,6 +251,70 @@ except Exception:
 con.close()
 
 # --- Token budget enforcement ------------------------------------------
+# Slice-provider seam (rlm-6 context-paging). The default provider is the
+# legacy 64K-truncate behavior extracted verbatim; the paged provider is a
+# stub for the book-gen Body to bind groundChapterQuery's "next slice"
+# fetch against. Both mutate `pack` in place and return it so callers can
+# extend (e.g. tag metadata) without re-implementing the trim loops.
+def slice_provider_default(pack, budget):
+    """Trim pack to fit budget — legacy 64K-truncate behavior.
+
+    Stable contract: when MINI_ORK_SLICE_PROVIDER is unset or "default"
+    this function's output is byte-for-byte identical to the pre-rlm-6
+    inline truncation. Dict insertion order is preserved so json.dumps
+    produces the same key sequence. Do not reorder the keys below
+    without rerunning tests/fixtures/slice_provider_smoke.sh.
+    """
+    serialized = json.dumps(pack)
+    tokens_used = approx_tokens(serialized)
+
+    if tokens_used > budget:
+        # Trim prior_runs first, then failure_modes
+        while tokens_used > budget and pack["prior_similar_runs"]:
+            pack["prior_similar_runs"].pop()
+            pack["_truncated"] = True
+            tokens_used = approx_tokens(json.dumps(pack))
+
+        while tokens_used > budget and pack["known_failure_modes"]:
+            pack["known_failure_modes"].pop()
+            pack["_truncated"] = True
+            tokens_used = approx_tokens(json.dumps(pack))
+
+        pack["_truncation_summary"] = (
+            f"Context truncated to fit {budget} token budget; "
+            f"oldest prior_runs and low-confidence failure_modes removed."
+        )
+    return pack
+
+def slice_provider_paged(pack, budget):
+    """On-demand slice provider stub.
+
+    Falls through to the default trim, then tags the pack so a downstream
+    caller (book-gen Body's groundChapterQuery) can fetch the next slice
+    without re-running the assembler. The next-slice fetching itself is
+    deliberately out of scope for rlm-6 — this task only exposes the
+    seam. The marker keys (_slice_provider, _next_slice_hint) make the
+    paged path observable so callers and tests can detect it.
+    """
+    pack = slice_provider_default(pack, budget)
+    pack["_slice_provider"] = "paged"
+    pack["_next_slice_hint"] = (
+        "Fetch additional slices via context_assemble with the same "
+        "MINI_ORK_SLICE_PROVIDER=paged and a follow-on cursor; this "
+        "stub only emits the first slice."
+    )
+    return pack
+
+# Dispatch: unknown provider names fall through to default so a
+# misconfigured caller never regresses the eng-team consumer (plan risk
+# note: "fail closed to existing behavior").
+slice_provider_name = sys.argv[6] if len(sys.argv) > 6 else "default"
+slice_providers = {
+    "default": slice_provider_default,
+    "paged":   slice_provider_paged,
+}
+slice_provider_fn = slice_providers.get(slice_provider_name, slice_provider_default)
+
 pack = {
     "task_brief": {"content": brief, "cite": "task_brief_path"},
     "workflow_node": node_name,
@@ -247,26 +329,7 @@ pack = {
     "budget_tokens": budget,
 }
 
-serialized = json.dumps(pack)
-tokens_used = approx_tokens(serialized)
-
-if tokens_used > budget:
-    # Trim prior_runs first, then failure_modes
-    while tokens_used > budget and pack["prior_similar_runs"]:
-        pack["prior_similar_runs"].pop()
-        pack["_truncated"] = True
-        tokens_used = approx_tokens(json.dumps(pack))
-
-    while tokens_used > budget and pack["known_failure_modes"]:
-        pack["known_failure_modes"].pop()
-        pack["_truncated"] = True
-        tokens_used = approx_tokens(json.dumps(pack))
-
-    pack["_truncation_summary"] = (
-        f"Context truncated to fit {budget} token budget; "
-        f"oldest prior_runs and low-confidence failure_modes removed."
-    )
-
+pack = slice_provider_fn(pack, budget)
 pack["tokens_estimated"] = approx_tokens(json.dumps(pack))
 print(json.dumps(pack))
 PY
