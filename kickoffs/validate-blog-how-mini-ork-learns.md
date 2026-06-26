@@ -3,7 +3,7 @@
 ## Goal
 
 Run the chapter-validation-10lens recipe against the technical blog post at
-`/Volumes/docker-ssd/ps/mini-ork/docs/research/articles/how-mini-ork-learns.md`.
+`docs/research/articles/how-mini-ork-learns.md`.
 Each lens scores one slice; the synthesizer rolls them into a single
 pass/revise/block verdict; the publisher emits a report.
 
@@ -21,7 +21,7 @@ the actual source files in this repo (the assigned sources), not external papers
 
 ## Chapter artifact
 
-`/Volumes/docker-ssd/ps/mini-ork/docs/research/articles/how-mini-ork-learns.md`
+`docs/research/articles/how-mini-ork-learns.md`
 
 ## Verification commands
 

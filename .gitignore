@@ -85,19 +85,13 @@ docs/blog/
 # not ship as project documentation.
 docs/research/local/
 
-# libwit / external-IP guard: these artifact classes carry private libwit
-# (book-gen / researcher repo) IP and must never enter this public repo.
+# External-IP guard: these artifact classes carry private external-project
+# IP and must never enter this public repo.
 Volumes/
 .mo-run-home/
 /doc-part_*.md
 /lens-minimax.md
 # Whole research-notes dir holds local arxiv/conductor scaffolding (incl. PDFs),
-# not shippable project docs — broadened from the earlier phasec-only rule.
+# not shippable project docs.
 .mini-ork/research-notes/
-kickoffs/*researcher*
 kickoffs/*autonomy-pluggability*
-recipes/research-synthesis-mktcore/
-# Overlay/symlinked book-gen (researcher) recipes that point outside this repo
-# or carry private book-gen IP — never commit the symlink or the audit dir.
-recipes/book-gen-flow-audit
-recipes/researcher-book-chapter-persistence-audit/

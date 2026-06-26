@@ -54,7 +54,7 @@ closure IS the training-data pipeline.
   (`bin/mini-ork-execute`) that reads `prompt_win_rates`/`relative_advantage` and
   falls back to static when sample_size is low.
 - OUT: no GPU training, no trained model, no WorkflowSpec unification (that is
-  Phase 2). No libwit source edits in this epic.
+  Phase 2). No external-product source edits in this epic.
 - DB SAFETY: never mutate the live `.mini-ork/state.db` directly in the implementer
   nodes; all schema work is validated on a COPY. A backup already exists at
   `.mini-ork/state.db.bak-20260623-phase0`.
