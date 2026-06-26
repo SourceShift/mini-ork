@@ -50,7 +50,7 @@ Keep the router **pure-read** so it can never corrupt the learning substrate.
 ## Out of scope
 
 - No generative conductor, no GRPO-in-prompt, no model training (later epics).
-- No libwit / book-gen integration (that is `plug-2-bookgen-adapter`).
+- No external-product integration (that is handled by a separate adapter recipe).
 - Do not modify the governance `policy_decisions` schema or semantics.
 
 ## Definition of Done

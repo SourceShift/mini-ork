@@ -16,6 +16,12 @@ VIEWS_DIR="${SCRIPT_DIR}/views"
 # Resolve DB path
 MINI_ORK_HOME="${MINI_ORK_HOME:-${PWD}}"
 DB="${MINI_ORK_DB:-${MINI_ORK_HOME}/.mini-ork/state.db}"
+# Export so migrations that shell out via `.read "|sh -c '… ${MINI_ORK_DB:?} …'"`
+# (e.g. 0037/0041 grounded_rejections guards) always resolve to the DB being
+# initialized — even when init.sh was invoked on the default path with no
+# MINI_ORK_DB env set. Without this, those migrations abort with
+# "MINI_ORK_DB: parameter null or not set" (review-40 HIGH).
+export MINI_ORK_DB="$DB"
 
 # Ensure parent directory exists
 DB_DIR="$(dirname "$DB")"

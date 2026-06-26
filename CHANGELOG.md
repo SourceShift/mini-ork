@@ -13,6 +13,58 @@ No unreleased changes yet.
 
 ---
 
+## [0.4.0] - 2026-06-25
+
+**Shared-brain RLM milestone.** A consumer-agnostic mini-ork "brain" now learns
+per `objective_domain` and exposes a stateless inference-time `decide()` surface,
+so multiple consumers (eng-team, book-gen, external researcher repos) share one
+learning substrate while keeping their mechanics native. Ships alongside the
+closed GRPO learning loop and a backend-pluggable store-port seam that lets the
+brain run on Postgres as well as SQLite.
+
+### Added
+
+- **Stateless decision service** (`lib/decision_service.sh`, `feat(rlm-4a)`).
+  `decide()` is a pure inference-time surface — given an objective domain and
+  candidate lanes it returns a routing decision without mutating learner state.
+  `bin/mini-ork-execute` now routes through it (`feat(rlm-4b)`).
+- **Epsilon-greedy exploration** in `decide()` (`feat(rlm-4b-pre-b)`) —
+  brain-side exploration honoring `MO_LEARNING_MIN_SAMPLES`.
+- **Objective-aware reward contract** on `execution_traces` (`feat(rlm-1)`,
+  migration `0042`) — normalized reward partitioned by `objective_domain`.
+- **Relative-advantage lane routing grouped by `objective_domain`**
+  (`feat(rlm-2)`, `lib/lane_router.sh`), with the sample floor honoring
+  `MO_LEARNING_MIN_SAMPLES` (`fix(rlm-4b-pre)`).
+- **Backend-pluggable store-port seam** for the brain libs (`feat(rlm-3)`) —
+  lets the policy/trace stores target Postgres or SQLite behind one interface.
+- **Per-request `--deadline` wall-clock budget** (`feat(rlm-5)`,
+  `lib/deadline_budget.sh` + `bin/mini-ork`) — returns best-so-far between
+  stages when the deadline hits.
+- **Paged-context slice-provider seam** (`feat(rlm-6)`,
+  `lib/context_assembler.sh`) — default reproduces the 64K-bounded output; a
+  paged provider serves large manuscripts.
+- **Shared-brain integration smoke** (`feat(rlm-7)`) — proves two
+  `objective_domain` slices learn independent policies from one brain.
+
+### Changed
+
+- **Closed the GRPO learning loop** (`feat(learning)`, `0bc6ae6`) — outcome
+  feedback + cold-DB-safe writeback so reward signal completes the
+  classify→…→reflect cycle.
+- Verifier tiers now run in the implementer's worktree rather than the main
+  checkout (`fix(execute)`), preventing cross-run contamination.
+
+### Fixed
+
+- **`grounded_rejections` migration collision** between `0037` and `0040`
+  (`fix(db)`, `9340a0d`) — `0040` neutralized, reconcile migration `0041`
+  added, smoke harness moved to the canonical columns
+  (`evidence_trace_ids` / `consumed_by_reflector_ts`).
+- Untracked a stale root `verdict.json` that was leaking the review-33 artifact
+  into verifier clones.
+
+---
+
 ## [0.3.0.1] - 2026-06-12
 
 **Phase 1 of Agent-ops hardening complete.** Substrate-only patch release
