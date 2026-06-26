@@ -484,6 +484,16 @@ PY
     fi
     [ "$_run_rc" -eq 0 ] && _run_rc=$_verify_rc
 
+    # ── usage report (telemetry) ─────────────────────────────────────────────
+    # Emit per-actor/lens token usage into $RUN_DIR/usage.json so external
+    # consumers (researcher compose ledger, CI cost attribution) can attribute
+    # cost without parsing state.db. Best-effort: a usage-report failure must
+    # never fail an otherwise green run.
+    if [ -n "${_run_dir:-}" ] && [ -d "$_run_dir" ]; then
+      "$MINI_ORK_ROOT/bin/mini-ork-usage-report" "$_run_dir" \
+        || echo "  [warn] usage report failed (run itself unaffected)" >&2
+    fi
+
     # ── deadline gate (between verify and reflect) ──────────────────────────
     if [ -n "$DEADLINE_SECS" ] && ! mo_deadline_check "$MINI_ORK_RUN_ID"; then
       echo "deadline_hit after verify; best-so-far artifact: ${MINI_ORK_ARTIFACT_PATH:-<none>}" >&2
