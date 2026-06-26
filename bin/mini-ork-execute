@@ -79,7 +79,18 @@ _run_verifier_ref() {
   # empty test_files) on any worktree-isolated change → false ESCALATE of clean
   # code (recurring researcher-repo gotcha, 2026-06-25). Fallback order:
   # worktree_path (if a real dir) → MO_TARGET_CWD → current $PWD.
-  local _verify_cwd="" _summary="${MINI_ORK_RUN_DIR:-$RUN_DIR}/implementer-summary.json"
+  # When sourced with MINI_ORK_EXECUTE_SOURCE_ONLY=1, RUN_DIR may be unbound
+  # (the script returns early before line 672). Use MINI_ORK_RUN_DIR alone in
+  # that case — test harnesses set it as the run directory, or fall back to a
+  # default if still unset.
+  local _verify_cwd=""
+  if [ -n "${MINI_ORK_RUN_DIR:-}" ]; then
+    _summary="${MINI_ORK_RUN_DIR}/implementer-summary.json"
+  elif [ -n "${RUN_DIR:-}" ]; then
+    _summary="${RUN_DIR}/implementer-summary.json"
+  else
+    _summary="${PWD}/implementer-summary.json"
+  fi
   if [ -f "$_summary" ]; then
     _verify_cwd="$(python3 -c 'import json,sys
 try:
