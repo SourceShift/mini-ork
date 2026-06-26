@@ -79,15 +79,15 @@ if [ "${#missing[@]}" -eq 0 ]; then
     'missing': []
   }))"
 else
-  python3 - <<PY
+  python3 - "${missing[@]}" <<PY
 import json
-missing = """${missing[@]}""".split()
+import sys
 print(json.dumps({
   'verifier': 'source-completeness',
   'pass': False,
   'evidence_path': '$EVIDENCE',
   'source_count': $total_sources,
-  'missing': missing
+  'missing': sys.argv[1:]
 }))
 PY
 fi

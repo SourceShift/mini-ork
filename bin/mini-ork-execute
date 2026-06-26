@@ -70,11 +70,44 @@ _run_verifier_ref() {
   local _script="$1" _evidence="$2"
   local _exit _json_rc _errexit_set=0
 
+  # Run the verifier in the tree where the implementer actually wrote + committed
+  # its files — NOT the executor's $PWD (the kickoff repo's MAIN checkout). The
+  # implementer applies the plan in an isolated worktree (prompts/implementer.md)
+  # and records its absolute path as `worktree_path` in implementer-summary.json.
+  # tier1/tier2/tier3 read RELATIVE touched_files and run tsc/eslint/jest from
+  # $PWD; without this cd they fail-closed ("No files matching the pattern …" /
+  # empty test_files) on any worktree-isolated change → false ESCALATE of clean
+  # code (recurring researcher-repo gotcha, 2026-06-25). Fallback order:
+  # worktree_path (if a real dir) → MO_TARGET_CWD → current $PWD.
+  # When sourced with MINI_ORK_EXECUTE_SOURCE_ONLY=1, RUN_DIR may be unbound
+  # (the script returns early before line 672). Use MINI_ORK_RUN_DIR alone in
+  # that case — test harnesses set it as the run directory, or fall back to a
+  # default if still unset.
+  local _verify_cwd=""
+  if [ -n "${MINI_ORK_RUN_DIR:-}" ]; then
+    _summary="${MINI_ORK_RUN_DIR}/implementer-summary.json"
+  elif [ -n "${RUN_DIR:-}" ]; then
+    _summary="${RUN_DIR}/implementer-summary.json"
+  else
+    _summary="${PWD}/implementer-summary.json"
+  fi
+  if [ -f "$_summary" ]; then
+    _verify_cwd="$(python3 -c 'import json,sys
+try:
+    print(json.load(open(sys.argv[1])).get("worktree_path") or "")
+except Exception:
+    print("")' "$_summary" 2>/dev/null)"
+  fi
+  if [ -z "$_verify_cwd" ] || [ ! -d "$_verify_cwd" ]; then
+    _verify_cwd="${MO_TARGET_CWD:-$PWD}"
+  fi
+
   case "$-" in
     *e*) _errexit_set=1; set +e ;;
   esac
-  MINI_ORK_PLAN_PATH="$PLAN_PATH" ARTIFACT_PATH="$ARTIFACT_PATH" \
-    bash "$_script" > "$_evidence" 2>&1
+  echo "[verifier-cwd] $(basename "$_script") → $_verify_cwd" >&2
+  ( cd "$_verify_cwd" && MINI_ORK_PLAN_PATH="$PLAN_PATH" ARTIFACT_PATH="$ARTIFACT_PATH" \
+    bash "$_script" ) > "$_evidence" 2>&1
   _exit=$?
 
   # Minimum-evidence assertion: exit 0 with an empty evidence file is a
@@ -169,136 +202,53 @@ _mo_learning_static_lane() {
 _mo_learning_governed_lane() {
   local _node_type="$1" _current_lane="$2"
   local _task_class="${TASK_CLASS:-${MINI_ORK_TASK_CLASS:-generic}}"
-  local _min_samples="${MO_LEARNING_MIN_SAMPLES:-3}"
-  # Exploration floor: with probability epsilon, route to a non-greedy
-  # eligible lane instead of argmaxing relative_advantage. Epsilon=0 is the
-  # legacy greedy path — keeps backward compat for opt-in. MO_LEARNING_SEED
-  # makes exploration deterministic for proof harnesses.
-  local _epsilon="${MO_LEARNING_EPSILON:-0.10}"
-  local _seed="${MO_LEARNING_SEED:-}"
+  # objective_domain is the GRPO slice key in lib/lane_router.sh / lib/decision_service.sh.
+  # Default to "code-delivery" — matches the legacy fallback in lib/trace_store.sh so
+  # callers that have not yet been taught to stamp objective_domain get the same slice
+  # the historical traces were recorded against. MINI_ORK_OBJECTIVE_DOMAIN overrides for
+  # book-gen / future-domain runs; MO_OBJECTIVE_DOMAIN is the older alias kept for parity.
+  local _objective_domain="${MINI_ORK_OBJECTIVE_DOMAIN:-${MO_OBJECTIVE_DOMAIN:-code-delivery}}"
+
+  # No state DB → keep the static fallback. Mirrors the historical "no DB" branch:
+  # decide() can't consult the GRPO tables without one, so we don't pretend otherwise.
+  # This is the load-bearing piece for "preserving existing default-lane behavior":
+  # when MINI_ORK_DB is absent, the lane stays whatever the static synthesizer picked.
   [ -n "${MINI_ORK_DB:-}" ] && [ -f "${MINI_ORK_DB:-}" ] || {
     _mo_learning_static_lane "$_node_type" "$_current_lane"
     return 0
   }
-  python3 - "$MINI_ORK_DB" "$_task_class" "$_node_type" "$_current_lane" "$_min_samples" "$_epsilon" "$_seed" <<'PY'
-import os
-import random
-import sqlite3
-import sys
 
-db, task_class, node_type, current_lane, min_samples_s, epsilon_s, seed_s = sys.argv[1:8]
-try:
-    min_samples = max(1, int(min_samples_s))
-except ValueError:
-    min_samples = 3
-try:
-    epsilon = float(epsilon_s)
-except ValueError:
-    epsilon = 0.10
-if epsilon < 0.0:
-    epsilon = 0.0
-if epsilon > 1.0:
-    epsilon = 1.0
+  # Source decision_service.sh lazily so this function stays the only caller path
+  # that pulls the brain lib in. Mirrors the inline-source pattern used for
+  # lib/process_reward.sh a few hundred lines below. The strict-mode guard inside
+  # decision_service.sh means sourcing it here does NOT leak set -u/pipefail onto
+  # execute's caller shell.
+  if ! declare -f decide >/dev/null 2>&1; then
+    # shellcheck source=lib/decision_service.sh
+    source "${MINI_ORK_ROOT}/lib/decision_service.sh"
+  fi
 
-# Seeded RNG for deterministic exploration; falls back to system RNG when
-# unset so live runs remain non-deterministic by default.
-if seed_s:
-    try:
-        rng = random.Random(int(seed_s))
-    except ValueError:
-        rng = random.Random(seed_s)
-else:
-    rng = random.SystemRandom()
-
-fallback = current_lane
-
-
-def _prompt_present(con):
-    row = con.execute(
-        """
-        SELECT 1
-          FROM prompt_win_rates
-         WHERE task_class = ?
-           AND sample_size >= ?
-           AND (node_type = ? OR node_type IS NULL)
-         ORDER BY win_rate DESC, sample_size DESC
-         LIMIT 1
-        """,
-        (task_class, min_samples, node_type),
-    ).fetchone()
-    return row is not None
-
-
-def _argmax_top(con):
-    row = con.execute(
-        """
-        SELECT agent_version_id, relative_advantage
-          FROM agent_performance_memory
-         WHERE task_class = ?
-           AND runs_count >= ?
-           AND relative_advantage > 0
-           AND (role = ? OR model = ? OR agent_version_id = ?)
-         ORDER BY relative_advantage DESC, runs_count DESC
-         LIMIT 1
-        """,
-        (task_class, min_samples, node_type, node_type, current_lane),
-    ).fetchone()
-    return row["agent_version_id"] if row else fallback
-
-
-def _eligible_lanes(con):
-    # Exploration pool: learned lanes with runs_count >= 1 for the same
-    # task_class and node_type. Static fallback is appended below if absent.
-    rows = con.execute(
-        """
-        SELECT agent_version_id, relative_advantage
-          FROM agent_performance_memory
-         WHERE task_class = ?
-           AND runs_count >= 1
-           AND relative_advantage > 0
-           AND (role = ? OR model = ? OR agent_version_id = ?)
-         ORDER BY relative_advantage DESC, runs_count DESC
-        """,
-        (task_class, node_type, node_type, current_lane),
-    ).fetchall()
-    pool = [(r["agent_version_id"], float(r["relative_advantage"])) for r in rows]
-    if fallback and all(lane != fallback for lane, _ in pool):
-        pool.append((fallback, 0.5))
-    return pool
-
-
-con = None
-try:
-    con = sqlite3.connect(db, timeout=2.0)
-    con.execute("PRAGMA busy_timeout=2000")
-    con.row_factory = sqlite3.Row
-    if not _prompt_present(con):
-        print(fallback)
-        raise SystemExit(0)
-    if epsilon == 0.0:
-        # Backward-compat: legacy greedy argmax.
-        print(_argmax_top(con))
-        raise SystemExit(0)
-    pool = _eligible_lanes(con)
-    if not pool:
-        print(fallback)
-        raise SystemExit(0)
-    pool.sort(key=lambda kv: kv[1], reverse=True)
-    top_lane = pool[0][0]
-    if rng.random() < epsilon:
-        rest = [lane for lane, _ in pool[1:]]
-        if not rest:
-            print(top_lane)
-        else:
-            print(rng.choice(rest))
-    else:
-        print(top_lane)
-except sqlite3.OperationalError:
-    print(fallback)
-finally:
-    if con is not None:
-        con.close()
-PY
+  # Delegate the routing read to the canonical decision surface used by every
+  # other brain consumer (book-gen, future domains). The .route field carries
+  # the lane name — when the GRPO sample floor is unmet, decide() falls back
+  # to the agents.yaml default (decision_service_default_lane), which matches
+  # the canonical cold-start lane and avoids re-implementing the lane_router
+  # query here. Epsilon exploration is intentionally NOT re-applied: deciding
+  # exploration policy belongs on the brain side (decision_service / lane_router),
+  # not duplicated at this lane-selection point.
+  local _decision_json=""
+  _decision_json="$(decide "$_node_type" "$_task_class" "$_objective_domain" 2>/dev/null || true)"
+  local _route=""
+  if [ -n "$_decision_json" ]; then
+    _route="$(printf '%s' "$_decision_json" \
+      | python3 -c 'import json,sys;d=json.loads(sys.stdin.read() or "{}");print(d.get("route",""))' \
+        2>/dev/null || true)"
+  fi
+  if [ -n "$_route" ]; then
+    printf '%s\n' "$_route"
+  else
+    printf '%s\n' "$_current_lane"
+  fi
 }
 
 mo_learning_update_conductor_outcomes() {
@@ -330,6 +280,8 @@ try:
         )
     con.commit()
     print(len(rows))
+except sqlite3.OperationalError:
+    print(0)
 finally:
     con.close()
 PY
@@ -352,7 +304,9 @@ con.execute("PRAGMA busy_timeout=5000")
 con.row_factory = sqlite3.Row
 cols = {r[1] for r in con.execute("PRAGMA table_info(agent_performance_memory)").fetchall()}
 if "relative_advantage" not in cols:
-    raise SystemExit("agent_performance_memory.relative_advantage is missing")
+    print(0)
+    con.close()
+    sys.exit(0)
 
 # ── GRPO write-half decay knobs ─────────────────────────────────────────────
 # MO_LEARNING_DECAY_ALPHA blends the new batch's relative_advantage with the
@@ -412,17 +366,22 @@ def recency_weight(created_at):
         return 1.0
     return math.exp(-_ln2 * age_days / halflife_days)
 
-rows = con.execute(
-    """
-    SELECT trace_id, task_class, agent_version_id, verifier_output, status,
-           reviewer_verdict, cost_usd, duration_ms, process_reward, created_at
-      FROM execution_traces
-     WHERE task_class IS NOT NULL
-       AND task_class <> ''
-       AND agent_version_id IS NOT NULL
-       AND agent_version_id <> ''
-    """
-).fetchall()
+try:
+    rows = con.execute(
+        """
+        SELECT trace_id, task_class, agent_version_id, verifier_output, status,
+               reviewer_verdict, cost_usd, duration_ms, process_reward, created_at
+          FROM execution_traces
+         WHERE task_class IS NOT NULL
+           AND task_class <> ''
+           AND agent_version_id IS NOT NULL
+           AND agent_version_id <> ''
+        """
+    ).fetchall()
+except sqlite3.OperationalError:
+    print(0)
+    con.close()
+    sys.exit(0)
 
 def _decode_verifier_output(raw):
     """Decode verifier_output cell robustly.
@@ -1516,6 +1475,13 @@ _mo_source() {
 
 _mo_policy_route_lane() {
   local node_type="$1" current_lane="$2"
+  # Dry-run is a workflow-shape preview, not a learning-policy preview. It
+  # must preserve the recipe's explicit model_lane assignments so tests and
+  # operators can verify lane wiring without a warm GRPO table.
+  if [ "${DRY_RUN:-0}" -eq 1 ]; then
+    printf '%s\n' "$current_lane"
+    return 0
+  fi
   # Default ON: real runs act on learnings. Safe — learning_governed degrades
   # to the static default when learning tables are cold/vacuous. Opt out with
   # MO_ROUTING_POLICY=workflow_default.
