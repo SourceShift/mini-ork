@@ -33,6 +33,13 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
+# The dispatcher gates publish via MINI_ORK_EPIC_PUBLISH env instead of a
+# --smoke-shape flag on the spawn binary. Reflect that in the fake spawn log
+# so the integration test still verifies smoke-shape child invocations.
+if [ "${MINI_ORK_EPIC_PUBLISH:-false}" != "true" ]; then
+  smoke=1
+fi
+
 echo "$child smoke=$smoke kickoff=$kickoff" >> "$MINI_ORK_HOME/fake-spawn.log"
 child_dir="$MINI_ORK_HOME/runs/$child"
 mkdir -p "$child_dir"
