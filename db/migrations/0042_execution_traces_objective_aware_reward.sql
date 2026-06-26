@@ -25,12 +25,14 @@
 
 PRAGMA foreign_keys = OFF;
 
--- review-38/39 HIGH (#194 + env-var-dependent shell-out): the ten reward
--- columns are now created idempotently and env-independently by db/init.sh's
--- ensure_column helper (which runs BEFORE migrations, the same pattern 0039
--- documents). This migration therefore contains NO ALTER and NO shell-out —
--- it owns only the indexes below (pure SQL, CREATE … IF NOT EXISTS, safe to
--- reapply). Column DDL of record lives in db/init.sh.
+-- review-38 HIGH #194: bare ADD COLUMN fails on reapply ("duplicate column").
+-- Guard all ten ALTERs behind a single existence check on the first column —
+-- if objective_domain is present the migration already ran, so the whole block
+-- is skipped (idempotent). Same guarded `.read|sh` idiom as 0037/0041;
+-- db/init.sh exports MINI_ORK_DB before applying migrations, so ${MINI_ORK_DB}
+-- always resolves to the DB being initialized. Partial-apply safe: the first
+-- column added is objective_domain, so a row that has it has all ten.
+.read "|sh -c 'db=\"${MINI_ORK_DB:?}\"; have=$(sqlite3 \"$db\" \"SELECT COUNT(*) FROM pragma_table_info(\\\"execution_traces\\\") WHERE name = \\\"objective_domain\\\";\"); if [ \"${have:-0}\" = \"0\" ]; then printf \"%s\n\" \"ALTER TABLE execution_traces ADD COLUMN objective_domain      TEXT    NOT NULL DEFAULT '\"'\"'code-delivery'\"'\"';\" \"ALTER TABLE execution_traces ADD COLUMN segment               TEXT    DEFAULT NULL;\" \"ALTER TABLE execution_traces ADD COLUMN reward_primary_metric TEXT    DEFAULT NULL;\" \"ALTER TABLE execution_traces ADD COLUMN reward_direction      TEXT    NOT NULL DEFAULT '\"'\"'higher_is_better'\"'\"';\" \"ALTER TABLE execution_traces ADD COLUMN reward_value          REAL    DEFAULT NULL;\" \"ALTER TABLE execution_traces ADD COLUMN reward_anchor         REAL    DEFAULT NULL;\" \"ALTER TABLE execution_traces ADD COLUMN reward_g              REAL    DEFAULT NULL;\" \"ALTER TABLE execution_traces ADD COLUMN reward_vector_json    TEXT    DEFAULT NULL;\" \"ALTER TABLE execution_traces ADD COLUMN reward_source         TEXT    NOT NULL DEFAULT '\"'\"'verifier@v1'\"'\"';\" \"ALTER TABLE execution_traces ADD COLUMN validity              TEXT    NOT NULL DEFAULT '\"'\"'valid'\"'\"';\"; fi'"
 
 CREATE INDEX IF NOT EXISTS idx_et_objective_domain
   ON execution_traces(objective_domain);
