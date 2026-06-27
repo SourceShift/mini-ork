@@ -106,8 +106,8 @@ _CODEX_SANDBOX="${CODEX_SANDBOX:-workspace-write}"
 # Pin codex's working root explicitly via -C/--cd so it cannot drift to
 # MINI_ORK_ROOT (or any other ambient cwd) when the dispatcher subshell
 # inherits a path-confused cwd. Diagnosed 2026-06-13: an implementer dispatch
-# from /Volumes/docker-ssd/Migration/Development/researcher landed codex with
-# cwd=/Volumes/docker-ssd/ps/mini-ork (codex session_meta confirmed). The
+# from a sibling research workspace landed codex with cwd=<mini-ork root>
+# (codex session_meta confirmed). The
 # implementer then grep'd mini-ork's own README/ROADMAP/recipes instead of
 # the target repo's CWT-A kickoff files. Zero target-repo edits, $0.48 burned.
 #
