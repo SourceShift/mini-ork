@@ -13,6 +13,33 @@ No unreleased changes yet.
 
 ---
 
+## [0.4.1] - 2026-06-26
+
+**Verifier infra hardening patch.** Fixes infrastructure false-negatives in
+epic-runner child framework-edit verifiers and hardens dispatcher spawn-bin
+resolution.
+
+### Fixed
+
+- `bin/mini-ork-execute` now honors `MO_TARGET_CWD` as the verifier cwd,
+  preventing `git archive HEAD` from running in an untracked child workspace
+  and producing an empty throwaway copy.
+- `recipes/framework-edit/verifiers/test.sh` no longer requires a `tests/`
+  directory for the throwaway-copy check and skips the web-smoke verifier
+  gracefully when `tests/test_web_smoke.py` is absent.
+- `recipes/epic-runner/lib/epic_dispatcher.py` rejects non-regular or
+  non-executable `MINI_ORK_EPIC_SPAWN_BIN` paths (e.g. `/dev/null`), falling
+  back to the default spawn behavior instead of raising `PermissionError`.
+
+### Changed
+
+- `lib/providers/cl_codex.sh` comment redacted local absolute paths
+  (`/Volumes/docker-ssd/...`) to keep the source tree machine-agnostic.
+- Added `docs/fixes/20260627-epic-runner-framework-edit-verifier-failures.md`
+  documenting the failure modes, fixes, and remaining hardening notes.
+
+---
+
 ## [0.4.0] - 2026-06-25
 
 **Shared-brain RLM milestone.** A consumer-agnostic mini-ork "brain" now learns
