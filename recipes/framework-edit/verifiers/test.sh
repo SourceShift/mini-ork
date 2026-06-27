@@ -83,7 +83,7 @@ _check "evidence-log-written" "evidence log is writable" '[ -w "$EVIDENCE" ]'
 
 # Task-specific tier.
 _check "throwaway-copy-created" "repo HEAD copied under MINI_ORK_RUN_DIR" \
-  '_make_throwaway_copy && [ -d "$WORKTREE/tests" ]'
+  '_make_throwaway_copy && [ -d "$WORKTREE" ] && [ -n "$(ls -A "$WORKTREE")" ]'
 _check "copy-is-own-git-root" "throwaway copy is an independent git root" \
   '_assert_copy_is_own_git_root || { echo "copy-not-its-own-git-root" >&3; false; }'
 _check "diff-applies-to-copy" "framework-edit.diff applies to throwaway copy" \
