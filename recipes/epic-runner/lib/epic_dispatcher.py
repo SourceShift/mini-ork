@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -177,6 +178,17 @@ def _run_verifier(script: str, child_dir: Path, record: dict[str, Any]) -> tuple
     return bool(verdict.get("pass")) and proc.returncode == 0, verdict, output
 
 
+def _is_usable_spawn_bin(path: Path) -> bool:
+    """Reject non-regular or non-executable paths (e.g. /dev/null)."""
+    if not path.is_file():
+        return False
+    try:
+        mode = path.stat().st_mode
+        return stat.S_ISREG(mode) and os.access(path, os.X_OK)
+    except OSError:
+        return False
+
+
 def _spawn_command(
     spawn_bin: Path,
     root: Path,
@@ -185,7 +197,7 @@ def _spawn_command(
     kickoff_path: Path,
     publish_enabled: bool,
 ) -> list[str]:
-    if spawn_bin.exists():
+    if _is_usable_spawn_bin(spawn_bin):
         cmd = [
             str(spawn_bin),
             "--parent-run",
