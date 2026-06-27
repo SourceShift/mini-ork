@@ -83,23 +83,28 @@ _run_verifier_ref() {
   # (the script returns early before line 672). Use MINI_ORK_RUN_DIR alone in
   # that case — test harnesses set it as the run directory, or fall back to a
   # default if still unset.
-  local _verify_cwd=""
-  if [ -n "${MINI_ORK_RUN_DIR:-}" ]; then
-    _summary="${MINI_ORK_RUN_DIR}/implementer-summary.json"
-  elif [ -n "${RUN_DIR:-}" ]; then
-    _summary="${RUN_DIR}/implementer-summary.json"
-  else
-    _summary="${PWD}/implementer-summary.json"
-  fi
-  if [ -f "$_summary" ]; then
-    _verify_cwd="$(python3 -c 'import json,sys
+  # Operator/env override wins first. This prevents false ESCALATEs when the
+  # implementer-summary worktree_path points at an untracked child workspace
+  # (e.g. epic-runner child runs) where git archive HEAD fails.
+  local _verify_cwd="${MO_TARGET_CWD:-}"
+  if [ -z "$_verify_cwd" ] || [ ! -d "$_verify_cwd" ]; then
+    if [ -n "${MINI_ORK_RUN_DIR:-}" ]; then
+      _summary="${MINI_ORK_RUN_DIR}/implementer-summary.json"
+    elif [ -n "${RUN_DIR:-}" ]; then
+      _summary="${RUN_DIR}/implementer-summary.json"
+    else
+      _summary="${PWD}/implementer-summary.json"
+    fi
+    if [ -f "$_summary" ]; then
+      _verify_cwd="$(python3 -c 'import json,sys
 try:
     print(json.load(open(sys.argv[1])).get("worktree_path") or "")
 except Exception:
     print("")' "$_summary" 2>/dev/null)"
+    fi
   fi
   if [ -z "$_verify_cwd" ] || [ ! -d "$_verify_cwd" ]; then
-    _verify_cwd="${MO_TARGET_CWD:-$PWD}"
+    _verify_cwd="$PWD"
   fi
 
   case "$-" in
