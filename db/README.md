@@ -41,6 +41,7 @@ MINI_ORK_DB=/path/to/state.db ./db/init.sh
 | `ticket_attempts` | Per-attempt records for ticket fix runs |
 | `detective_classifications` | Root-cause classifications of failing epics |
 | `detective_blocker_files` | Files implicated in a detective classification |
+| `defect_attributions` | Append-only log of (found→blamed) run pairs with decaying penalty used by the lane router |
 | `missed_by_gauntlet` | Bugs that reached prod despite passing gauntlet |
 | `gauntlet_failures` | Per-fingerprint gauntlet failure history |
 | `lessons_bank` | LLM-inferred failure→recovery rules |
