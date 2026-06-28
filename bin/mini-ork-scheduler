@@ -61,6 +61,97 @@ done
 # shellcheck source=lib/epic_graph.sh
 source "$MINI_ORK_ROOT/lib/epic_graph.sh"
 
+# Idempotent schema migration: epics.priority (Track B5 — priority inheritance).
+# Without this column, base/effective priority is always 0 and a medium-priority
+# requester can outrun a high-priority waiter blocked on a low-priority holder.
+[ -f "$STATE_DB" ] && sqlite3 "$STATE_DB" \
+  "SELECT 1 FROM pragma_table_info('epics') WHERE name='priority';" 2>/dev/null \
+  | grep -q 1 || sqlite3 "$STATE_DB" \
+  "ALTER TABLE epics ADD COLUMN priority INTEGER NOT NULL DEFAULT 0;" 2>/dev/null || true
+
+# Effective priority for a single epic (Track B5 inheritance):
+#   eff(E) = max( base(E), max(base(W) for W in transitive waiters of E) )
+# where waiters are nodes reachable by following unresolved hard edges from E.
+# A "holder" in flight therefore inherits the highest base priority of any
+# blocked waiter; once the holder releases, its effective priority falls back
+# to its own base. This is the standard priority-inheritance fix for inversion.
+_epic_effective_priority() {
+  local epic_id="${1:?epic_id required}"
+  python3 - "$STATE_DB" "$epic_id" <<'PY' 2>/dev/null || echo 0
+import sqlite3, sys
+con = sqlite3.connect(sys.argv[1])
+con.execute("PRAGMA busy_timeout=5000")
+epic_id = sys.argv[2]
+row = con.execute("""
+    WITH RECURSIVE inheritors(node) AS (
+        SELECT id FROM epics WHERE id = ?
+        UNION
+        SELECT d.to_epic_id
+          FROM inheritors i
+          JOIN epic_dependencies d ON d.from_epic_id = i.node
+         WHERE d.kind = 'hard' AND d.resolved_at IS NULL
+    )
+    SELECT COALESCE(MAX(e.priority), 0) AS eff
+      FROM inheritors i JOIN epics e ON e.id = i.node
+""", (epic_id,)).fetchone()
+con.close()
+print(int(row[0]) if row and row[0] is not None else 0)
+PY
+}
+
+# Priority-aware pick: among all ready epics, pick the one with the highest
+# effective priority (inheritance applied). Ties broken by created_at ASC so
+# the order is deterministic across re-runs. A medium-priority requester with
+# no blocked ancestors therefore cannot outrun a high-priority waiter blocked
+# on a low-priority holder — the holder's effective priority is the waiter's
+# priority for the duration of the block.
+_pick_next_epic() {
+  python3 - "$STATE_DB" <<'PY' 2>/dev/null
+import sqlite3, sys
+con = sqlite3.connect(sys.argv[1])
+con.execute("PRAGMA busy_timeout=5000")
+rows = con.execute("""
+    WITH RECURSIVE inheritors(root, node) AS (
+        SELECT e.id, e.id FROM epics e
+         WHERE e.status = 'not started'
+           AND e.archived_at IS NULL
+           AND NOT EXISTS (
+               SELECT 1 FROM epic_dependencies d
+                WHERE d.to_epic_id = e.id
+                  AND d.kind = 'hard'
+                  AND d.resolved_at IS NULL
+           )
+        UNION
+        SELECT i.root, d.to_epic_id
+          FROM inheritors i
+          JOIN epic_dependencies d ON d.from_epic_id = i.node
+         WHERE d.kind = 'hard' AND d.resolved_at IS NULL
+    ),
+    effective(root, eff) AS (
+        SELECT root, COALESCE(MAX(e.priority), 0)
+          FROM inheritors i JOIN epics e ON e.id = i.node
+         GROUP BY root
+    )
+    SELECT e.id
+      FROM epics e
+      JOIN effective ef ON ef.root = e.id
+     WHERE e.status = 'not started'
+       AND e.archived_at IS NULL
+       AND NOT EXISTS (
+           SELECT 1 FROM epic_dependencies d
+            WHERE d.to_epic_id = e.id
+              AND d.kind = 'hard'
+              AND d.resolved_at IS NULL
+       )
+     ORDER BY ef.eff DESC, e.created_at ASC
+     LIMIT 1
+""").fetchall()
+con.close()
+for r in rows:
+    print(r[0])
+PY
+}
+
 # Today's spend so far. We sum task_runs.cost_usd over the rolling 24h window
 # rather than reading a daily-cap sentinel — simpler + always-fresh.
 _today_cost_usd() {
@@ -181,8 +272,9 @@ while :; do
     exit 2
   fi
 
-  # Pick first ready epic. epic_graph_ready_now is sorted oldest-first.
-  next_epic=$(epic_graph_ready_now | head -1)
+  # Pick first ready epic. _pick_next_epic orders by effective priority
+  # (Track B5 inheritance), ties broken oldest-first via created_at.
+  next_epic=$(_pick_next_epic | head -1)
 
   if [ -z "$next_epic" ]; then
     if [ "$ONCE" = "1" ]; then

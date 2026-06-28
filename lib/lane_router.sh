@@ -10,11 +10,12 @@
 #
 #   relative_advantage[i] = score[i] - mean(scores in group)
 #
-# The group key is (objective_domain, task_class, node_type) so each
-# objective domain learns an isolated policy signal. score is sourced
-# only from reward_g; rows with reward_g IS NULL are skipped — falling
-# back to process_reward or status would reintroduce raw cross-objective
-# reward contamination the normalized reward_g column exists to remove.
+# The group key is (objective_domain, task_class, node_type, code_region) when
+# code_region is present, and the legacy (objective_domain, task_class,
+# node_type) key when code_region is NULL/absent. score is sourced only from
+# reward_g; rows with reward_g IS NULL are skipped — falling back to
+# process_reward or status would reintroduce raw cross-objective reward
+# contamination the normalized reward_g column exists to remove.
 #
 # Positive advantage = "this lens outperformed peers on this
 # objective_domain + task_class + node_type". Negative = "this lens
@@ -30,9 +31,20 @@
 #       agent_performance_memory rows with relative_advantage. Rows
 #       with reward_g IS NULL are skipped.
 #
-#   lane_router_preferred_lane <task_class> <node_type>
+#       frc-a5: when migration-0045's `defect_attributions` table is
+#       present, the per-region (acc_region) slice also folds each
+#       row's exponentially decayed `penalty` into the blamed lane's
+#       `lane_region_advantage.relative_advantage`. The decay formula is
+#       `decay = 0.5 ** (age_days / decay_halflife_days)` and `penalty`
+#       is signed negative (range [-1, 0]), so blamed lanes drop and
+#       unblamed lanes (no matching attribution) are unchanged. Global
+#       (agent_performance_memory) and per-domain (lane_domain_advantage)
+#       slices are intentionally untouched — penalties are region-scoped
+#       by design.
+#
+#   lane_router_preferred_lane <task_class> <node_type> [objective_domain] [code_region]
 #       Print the lane (model lane name) with highest relative_advantage
-#       for the given pair, with sample_size >= 3 to avoid noise.
+#       for the given slice, with sample_size >= 3 to avoid noise.
 #       Falls back to the lane configured in agents.yaml when no data.
 
 [ "${0:-}" = "${BASH_SOURCE[0]:-}" ] && set -Eeuo pipefail
@@ -70,16 +82,17 @@ con = sqlite3.connect(db)
 con.execute("PRAGMA busy_timeout=5000")
 con.row_factory = sqlite3.Row
 
-# Group traces by (objective_domain, task_class, node_type) so each
-# objective domain learns an isolated policy signal. "lane" derives from
-# agent_version_id (mini-ork stores it as the model_lane string, e.g.
-# "codex_lens"). score is sourced only from the normalized reward_g column
-# (set by trace_store.sh from reward_value/anchor/direction); rows with
-# reward_g IS NULL are skipped so unnormalized raw signals never enter
-# the relative-advantage calculation.
-rows = con.execute("""
+cols = {row[1] for row in con.execute("PRAGMA table_info(execution_traces)").fetchall()}
+code_region_expr = "code_region" if "code_region" in cols else "NULL AS code_region"
+
+# Group traces by (objective_domain, task_class, node_type, code_region) when
+# code_region is present. NULL/absent code_region is kept on the exact legacy
+# (objective_domain, task_class, node_type) path for backward compatibility.
+# "lane" derives from agent_version_id (mini-ork stores it as the model_lane
+# string, e.g. "codex_lens"). score is sourced only from normalized reward_g.
+rows = con.execute(f"""
     SELECT objective_domain, task_class, agent_version_id,
-           verifier_output, reward_g
+           verifier_output, reward_g, {code_region_expr}
       FROM execution_traces
      WHERE created_at >= ?
        AND task_class IS NOT NULL AND task_class <> ''
@@ -102,10 +115,11 @@ def _node_type(row):
     except Exception:
         return "unknown"
 
-# Build groups keyed by (objective_domain, task_class, node_type).
+# Build groups keyed by (objective_domain, task_class, node_type, code_region).
 groups = defaultdict(list)
 for r in rows:
-    groups[(r["objective_domain"], r["task_class"], _node_type(r))].append({
+    code_region = (r["code_region"] or "").strip() if "code_region" in r.keys() else ""
+    groups[(r["objective_domain"], r["task_class"], _node_type(r), code_region)].append({
         "lane":      r["agent_version_id"],
         "score":     _score(r),
         "task_class": r["task_class"],
@@ -120,11 +134,16 @@ for r in rows:
 #                durable per-objective_domain storage the router prefers; it
 #                no longer collides across domains the way a single
 #                agent_performance_memory row did.
+#   acc_region — (lane, task_class, node_type, objective_domain, code_region)
+#                REGION slice → lane_region_advantage. Populated only for
+#                non-empty code_region so NULL-region behavior stays exactly
+#                on the existing global/domain paths.
 acc = defaultdict(lambda: {"adv_sum": 0.0, "n": 0, "wins": 0,
                           "node_types": defaultdict(int),
                           "objective_domains": defaultdict(int)})
 acc_domain = defaultdict(lambda: {"adv_sum": 0.0, "n": 0, "wins": 0})
-for (_od, _tc, _nt), members in groups.items():
+acc_region = defaultdict(lambda: {"adv_sum": 0.0, "n": 0, "wins": 0})
+for (_od, _tc, _nt, _cr), members in groups.items():
     if len(members) < 2:
         continue  # need at least 2 lenses for group-relative comparison
     mean = sum(m["score"] for m in members) / len(members)
@@ -144,6 +163,69 @@ for (_od, _tc, _nt), members in groups.items():
         acc_domain[dkey]["n"] += 1
         if adv > 0:
             acc_domain[dkey]["wins"] += 1
+        if _cr:
+            rkey = (m["lane"], m["task_class"], _nt, _od, _cr)
+            acc_region[rkey]["adv_sum"] += adv
+            acc_region[rkey]["n"] += 1
+            if adv > 0:
+                acc_region[rkey]["wins"] += 1
+
+# frc-a5: fold decayed defect_attributions into region-scoped advantage.
+# Aggregation is per (lane, code_region, task_class) — apply the summed
+# effective penalty (penalty * decay) to every acc_region key whose
+# (lane, task_class, code_region) matches. acc and acc_domain stay
+# untouched so no-region routing behavior is preserved.
+_penalty_by_key = defaultdict(float)  # (lane, code_region, task_class) -> summed effective penalty
+try:
+    _has_defect_attributions = con.execute(
+        "SELECT 1 FROM sqlite_master "
+        "WHERE type='table' AND name='defect_attributions' LIMIT 1"
+    ).fetchone()
+except Exception:
+    _has_defect_attributions = None
+
+if _has_defect_attributions:
+    _penalty_rows = con.execute("""
+        SELECT lane, code_region, task_class,
+               penalty, decay_halflife_days, ts
+          FROM defect_attributions
+         WHERE penalty IS NOT NULL AND penalty <> 0
+    """).fetchall()
+    _now_utc = datetime.datetime.utcnow()
+    _penalty_by_key = defaultdict(float)
+    for _pr in _penalty_rows:
+        _pen = float(_pr["penalty"])
+        _hlf_raw = _pr["decay_halflife_days"]
+        try:
+            _hlf = float(_hlf_raw) if _hlf_raw is not None else 30.0
+        except (TypeError, ValueError):
+            continue  # non-numeric halflife → skip; do not silently invent
+        if _hlf <= 0:
+            continue  # invalid halflife → skip; do not silently invent
+        _ts_raw = _pr["ts"]
+        # SQLite emits 'YYYY-MM-DDTHH:MM:SS.mmmZ'. Parse tolerantly (with or
+        # without fractional seconds); a missing %S previously made EVERY row
+        # fail and silently skip, killing the whole fold (frc-a5 critic fix).
+        _tsv = str(_ts_raw).strip().rstrip('Z').replace('T', ' ')
+        _ts = None
+        for _fmt in ('%Y-%m-%d %H:%M:%S.%f', '%Y-%m-%d %H:%M:%S'):
+            try:
+                _ts = datetime.datetime.strptime(_tsv, _fmt)
+                break
+            except ValueError:
+                _ts = None
+        if _ts is None:
+            continue  # unparseable ts → skip
+        _age_days = max((_now_utc - _ts).total_seconds() / 86400.0, 0.0)
+        _decay = 0.5 ** (_age_days / _hlf)
+        _effective = _pen * _decay  # signed negative penalty (severity-scaled, decayed)
+        _penalty_by_key[
+            (_pr["lane"], _pr["code_region"], _pr["task_class"])
+        ] += _effective
+    # NOTE: penalty is applied AFTER the adv_sum/n average at the region upsert
+    # below — NOT added to adv_sum here. Folding into adv_sum diluted the penalty
+    # by run count (a -0.5 penalty became -0.5/n), so magnitude wrongly depended
+    # on sample size (frc-a5 critic fix).
 
 # Upsert agent_performance_memory.
 # PRIMARY KEY is (agent_version_id, task_class) so we collapse node_types
@@ -207,6 +289,49 @@ for (lane, tc, nt, od), stats in acc_domain.items():
     """, (lane, tc, nt or '', od or '', round(avg_adv, 4),
           stats["n"], stats["wins"]))
 
+# Region slice → lane_region_advantage. This additive table keeps the existing
+# lane_domain_advantage key untouched while making non-NULL code_region a real
+# routing dimension.
+con.execute("""
+    CREATE TABLE IF NOT EXISTS lane_region_advantage (
+      agent_version_id   TEXT    NOT NULL,
+      task_class         TEXT    NOT NULL,
+      node_type          TEXT    NOT NULL DEFAULT '',
+      objective_domain   TEXT    NOT NULL DEFAULT '',
+      code_region        TEXT    NOT NULL DEFAULT '',
+      relative_advantage REAL    NOT NULL DEFAULT 0.0,
+      runs_count         INTEGER NOT NULL DEFAULT 0,
+      success_count      INTEGER NOT NULL DEFAULT 0,
+      last_updated       TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      PRIMARY KEY (agent_version_id, task_class, node_type, objective_domain, code_region)
+    )
+""")
+con.execute("""
+    CREATE INDEX IF NOT EXISTS idx_lane_region_adv
+      ON lane_region_advantage(task_class, node_type, objective_domain, code_region, relative_advantage DESC)
+""")
+for (lane, tc, nt, od, cr), stats in acc_region.items():
+    avg_adv = stats["adv_sum"] / max(stats["n"], 1)
+    # Apply decayed defect penalty AFTER averaging so its magnitude does not
+    # depend on run count (frc-a5 critic fix). Region-scoped only.
+    if cr:
+        avg_adv += _penalty_by_key.get((lane, cr, tc), 0.0)
+    con.execute("""
+        INSERT INTO lane_region_advantage
+            (agent_version_id, task_class, node_type, objective_domain,
+             code_region, relative_advantage, runs_count, success_count,
+             last_updated)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?,
+                strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+        ON CONFLICT(agent_version_id, task_class, node_type, objective_domain, code_region)
+        DO UPDATE SET
+            relative_advantage = excluded.relative_advantage,
+            runs_count         = excluded.runs_count,
+            success_count      = excluded.success_count,
+            last_updated       = excluded.last_updated
+    """, (lane, tc, nt or '', od or '', cr or '', round(avg_adv, 4),
+          stats["n"], stats["wins"]))
+
 con.commit()
 con.close()
 print(upserted)
@@ -217,6 +342,7 @@ lane_router_preferred_lane() {
   local task_class="${1:?task_class required}"
   local node_type="${2:-}"
   local objective_domain="${3:-}"
+  local code_region="${4:-}"
   mo_store_assert_sqlite
   local STATE_DB
   STATE_DB="$(mo_store_db_path)"
@@ -227,6 +353,25 @@ lane_router_preferred_lane() {
   local _tc_e=${task_class//\'/\'\'}
   local _nt_e=${node_type//\'/\'\'}
   local _od_e=${objective_domain//\'/\'\'}
+  local _cr_e=${code_region//\'/\'\'}
+
+  # Region slice: only active for non-empty code_region. When code_region is
+  # absent, do not change the legacy/domain routing path at all.
+  if [ -n "$objective_domain" ] && [ -n "$code_region" ]; then
+    local rwhere="task_class='$_tc_e' AND objective_domain='$_od_e' AND code_region='$_cr_e' AND runs_count >= ${_min_samples}"
+    [ -n "$node_type" ] && rwhere="$rwhere AND node_type='$_nt_e'"
+    local _rhit
+    _rhit=$(sqlite3 -separator '|' "$STATE_DB" \
+      "SELECT agent_version_id, printf('%.3f', relative_advantage), runs_count
+         FROM lane_region_advantage
+        WHERE $rwhere
+        ORDER BY relative_advantage DESC, runs_count DESC
+        LIMIT 1;" 2>/dev/null)
+    if [ -n "$_rhit" ]; then
+      echo "$_rhit"
+      return 0
+    fi
+  fi
 
   # review-36 #193: prefer the durable per-objective_domain slice
   # (lane_domain_advantage, migration 0043) when a domain is supplied and it

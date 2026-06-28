@@ -15,11 +15,13 @@
 #           "reward_estimate": <float 0.0-1.0>,
 #           "recursion_hint":  { ... },
 #           "sample_size":     <int>,
-#           "segment":         "<segment name>"
+#           "segment":         "<segment name>",
+#           "code_region":     "<region name or null>"
 #         }
 #
 # Composition (pure read + compute, no per-request state):
-#   - routing        : lane_router_preferred_lane <task_class> <node_type>;
+#   - routing        : lane_router_preferred_lane <task_class> <node_type>
+#                      <objective_domain> <code_region>;
 #                      falls back to the agents.yaml lane for that node_type
 #                      when the GRPO sample-size floor (>=3) yields no row.
 #                      Cold-start safe: decide never invents a lane.
@@ -72,11 +74,16 @@ MINI_ORK_ROOT="${MINI_ORK_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 #   task_class       — e.g. "code-fix", "spec-author"
 #   objective_domain — e.g. "eng-team", "book-gen"
 #   segment          — optional free-form label echoed back in the JSON
+#                      and treated as code_region when non-empty/non-default
 decide() {
   local node_type="${1:?node_type required}"
   local task_class="${2:?task_class required}"
   local objective_domain="${3:-}"
   local segment="${4:-default}"
+  local code_region=""
+  if [ -n "$segment" ] && [ "$segment" != "default" ]; then
+    code_region="$segment"
+  fi
 
   # Gate every SQLite-direct helper behind the backend seam.
   mo_store_assert_sqlite
@@ -88,7 +95,7 @@ decide() {
   #    lane the agents.yaml file maps node_type to. Cold-start safe: we
   #    never invent a lane.
   local learned_route route
-  learned_route=$(lane_router_preferred_lane "$task_class" "$node_type" "$objective_domain" 2>/dev/null \
+  learned_route=$(lane_router_preferred_lane "$task_class" "$node_type" "$objective_domain" "$code_region" 2>/dev/null \
     | awk -F'|' '{print $1; exit}')
   if [ -n "$learned_route" ]; then
     route="$learned_route"
@@ -190,10 +197,10 @@ PY
   recursion_hint=$(decision_service_recursion_hint)
 
   python3 - "$route" "$coalition_ok" "$reward_mean" "$reward_sample" \
-                "$recursion_hint" "$segment" <<'PY'
+                "$recursion_hint" "$segment" "$code_region" <<'PY'
 import json, sys
-route, coalition_ok, reward_mean, reward_sample, recursion_hint, segment = (
-    sys.argv[1:7]
+route, coalition_ok, reward_mean, reward_sample, recursion_hint, segment, code_region = (
+    sys.argv[1:8]
 )
 out = {
     "route":           route,
@@ -202,6 +209,7 @@ out = {
     "recursion_hint":  json.loads(recursion_hint),
     "sample_size":     int(reward_sample),
     "segment":         segment,
+    "code_region":     code_region or None,
 }
 print(json.dumps(out, sort_keys=True))
 PY
