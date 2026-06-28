@@ -1296,6 +1296,110 @@ finally:
   fi
 }
 
+_mo_infer_trace_code_region() {
+  local _payload="${1:-}"
+  python3 -c "
+import json
+import os
+import sys
+
+try:
+    payload = json.loads(sys.argv[1] or '{}')
+except json.JSONDecodeError:
+    sys.exit(0)
+
+run_dir = os.environ.get('MINI_ORK_RUN_DIR') or os.environ.get('RUN_DIR') or ''
+roots = [
+    os.environ.get('MO_TARGET_CWD') or '',
+    os.environ.get('MINI_ORK_ROOT') or '',
+    os.getcwd(),
+]
+roots = [os.path.abspath(r) for r in roots if r]
+
+def _decode_files(value):
+    if isinstance(value, list):
+        return value
+    if isinstance(value, str):
+        s = value.strip()
+        if not s:
+            return []
+        try:
+            decoded = json.loads(s)
+        except json.JSONDecodeError:
+            return [s]
+        return decoded if isinstance(decoded, list) else []
+    return []
+
+def _relativize(path):
+    if not isinstance(path, str):
+        return None
+    p = path.strip()
+    if not p or '://' in p:
+        return None
+    if run_dir:
+        run_abs = os.path.abspath(run_dir)
+        p_abs = os.path.abspath(p) if os.path.isabs(p) else os.path.abspath(os.path.join(os.getcwd(), p))
+        try:
+            if os.path.commonpath([run_abs, p_abs]) == run_abs:
+                return None
+        except ValueError:
+            pass
+    if os.path.isabs(p):
+        p_abs = os.path.abspath(p)
+        for root in roots:
+            try:
+                if os.path.commonpath([root, p_abs]) == root:
+                    return os.path.relpath(p_abs, root)
+            except ValueError:
+                continue
+        return None
+    return p
+
+for raw in _decode_files(payload.get('files_written')):
+    rel = _relativize(raw)
+    if not rel:
+        continue
+    rel = rel.replace('\\\\', '/')
+    while rel.startswith('./'):
+        rel = rel[2:]
+    if not rel or rel.startswith('../'):
+        continue
+    # Root-level files (no '/') map to an explicit '(root)' sentinel rather than
+    # '.', which read as "directoryless" and polluted the region table (frc-a1 fix).
+    print(rel.split('/', 1)[0] if '/' in rel else '(root)')
+    break
+" "$_payload" 2>/dev/null || true
+}
+
+_mo_update_trace_code_region() {
+  local _trace_id="$1" _payload="${2:-}"
+  [ -n "$_trace_id" ] || return 0
+  [ -n "${MINI_ORK_DB:-}" ] && [ -f "${MINI_ORK_DB:-}" ] || return 0
+
+  local _code_region
+  _code_region="$(_mo_infer_trace_code_region "$_payload")"
+  [ -n "$_code_region" ] || return 0
+
+  python3 - "$MINI_ORK_DB" "$_trace_id" "$_code_region" <<'PY' 2>/dev/null || true
+import sqlite3
+import sys
+
+db, trace_id, code_region = sys.argv[1:4]
+con = sqlite3.connect(db, timeout=5.0)
+con.execute("PRAGMA busy_timeout=5000")
+try:
+    cols = {row[1] for row in con.execute("PRAGMA table_info(execution_traces)").fetchall()}
+    if "code_region" in cols:
+        con.execute(
+            "UPDATE execution_traces SET code_region=? WHERE trace_id=?",
+            (code_region, trace_id),
+        )
+        con.commit()
+finally:
+    con.close()
+PY
+}
+
 # D-042 (v0.2-pt12): build a rich trace_write payload for a node.
 # Args: trace_id status node_type output_file [reviewer_verdict] [tool_summary_path]
 # Reads cost from ${MINI_ORK_RUN_DIR}/.last-llm-cost when present.
@@ -1377,6 +1481,7 @@ print(json.dumps(obj))
 " "$_trace_id" "$_status" "$_node_type" "$_output_file" "$_verdict" "$_cost" "${TASK_CLASS:-generic}" "$_tool_summary" "$_duration_ms" "$_finish_reason" "${dispatch_lane:-}" 2>/dev/null)
   if [ -n "$_payload" ]; then
     trace_write "$_payload" >/dev/null 2>&1 || true
+    _mo_update_trace_code_region "$_trace_id" "$_payload"
   fi
   # Auto-dispatch bug-collector after the per-node trace lands. Opt-in via
   # MO_BUG_COLLECTOR=1 (default off — initial heuristic scan is free but

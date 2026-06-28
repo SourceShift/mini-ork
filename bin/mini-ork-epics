@@ -29,6 +29,16 @@ export STATE_DB
 # shellcheck source=lib/epic_graph.sh
 source "$MINI_ORK_ROOT/lib/epic_graph.sh"
 
+# Idempotent schema migration: epics.priority (Track B5).
+# `priority` is an integer; higher = more important. The scheduler raises a
+# holder's effective priority to the max of any blocked-waiter's priority so
+# the highest-priority waiter is dispatched first after a cascade (classic
+# priority inheritance — only persists while the waiter is blocked).
+[ -f "$STATE_DB" ] && sqlite3 "$STATE_DB" \
+  "SELECT 1 FROM pragma_table_info('epics') WHERE name='priority';" 2>/dev/null \
+  | grep -q 1 || sqlite3 "$STATE_DB" \
+  "ALTER TABLE epics ADD COLUMN priority INTEGER NOT NULL DEFAULT 0;" 2>/dev/null || true
+
 _usage() {
   cat <<EOF
 Usage: mini-ork epics <subcommand> [args]
@@ -39,6 +49,11 @@ Usage: mini-ork epics <subcommand> [args]
   list [--status STATUS]       List epics (default: active, non-archived)
   ready                        List ready-to-dispatch epics
   show <epic_id>               Show one epic + its deps
+  priority <epic_id> [VALUE]   Show or set an epic's base priority (integer,
+                               higher = more important; default 0). The
+                               scheduler computes effective priority at
+                               dispatch time as the max of self + blocked
+                               waiters (priority inheritance, Track B5).
 EOF
 }
 
@@ -304,7 +319,7 @@ _list() {
   [ -n "$status_filter" ] && clause="WHERE status='$status_filter' AND archived_at IS NULL"
   [ -z "$status_filter" ] && clause="WHERE archived_at IS NULL"
   sqlite3 -separator ' | ' "$STATE_DB" \
-    "SELECT printf('%-22s', id), printf('%-15s', status), substr(title,1,60) FROM epics $clause ORDER BY created_at;"
+    "SELECT printf('%-22s', id), printf('%-15s', status), printf('priority=%-5d', priority), substr(title,1,60) FROM epics $clause ORDER BY created_at;"
 }
 
 _ready() {
@@ -315,7 +330,7 @@ _show() {
   local epic_id="${1:?epic_id required}"
   echo "=== epic ==="
   sqlite3 -line "$STATE_DB" \
-    "SELECT id, title, status, created_at, updated_at FROM epics WHERE id='$epic_id';"
+    "SELECT id, title, status, priority, created_at, updated_at FROM epics WHERE id='$epic_id';"
   echo
   echo "=== deps (incoming — must be 'done' for this epic to run) ==="
   sqlite3 -separator ' | ' "$STATE_DB" \
@@ -330,13 +345,33 @@ _show() {
        FROM epic_dependencies WHERE from_epic_id='$epic_id' ORDER BY kind;"
 }
 
+# priority <epic_id> [VALUE] — show or set an epic's base priority.
+# Higher integer = more important. Effective priority at dispatch time is
+# max(base, max_waiter_blocked_on_us) (Track B5 inheritance).
+_priority() {
+  local epic_id="${1:?epic_id required}"
+  local value="${2:-}"
+  if [ -z "$value" ]; then
+    sqlite3 -separator ' | ' "$STATE_DB" \
+      "SELECT id, printf('priority=%d', priority) FROM epics WHERE id='$epic_id';"
+  else
+    case "$value" in
+      ''|*[!0-9-]*) echo "priority: VALUE must be an integer (got: $value)" >&2; exit 2 ;;
+    esac
+    sqlite3 "$STATE_DB" \
+      "UPDATE epics SET priority=$value WHERE id='$epic_id';"
+    _priority "$epic_id"
+  fi
+}
+
 sub="${1:-help}"; shift || true
 case "$sub" in
-  ingest) _ingest "$@" ;;
-  split)  _split  "$@" ;;
-  list)   _list   "$@" ;;
-  ready)  _ready  "$@" ;;
-  show)   _show   "$@" ;;
+  ingest)   _ingest   "$@" ;;
+  split)    _split    "$@" ;;
+  list)     _list     "$@" ;;
+  ready)    _ready    "$@" ;;
+  show)     _show     "$@" ;;
+  priority) _priority "$@" ;;
   help|--help|-h) _usage ;;
   *) echo "Unknown subcommand: $sub" >&2; _usage; exit 2 ;;
 esac
