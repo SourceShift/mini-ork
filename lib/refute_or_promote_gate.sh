@@ -61,6 +61,11 @@
 
 set -uo pipefail
 
+MINI_ORK_ROOT="${MINI_ORK_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+# shellcheck source=lib/gates_common.sh
+[ -f "${MINI_ORK_ROOT}/lib/gates_common.sh" ] && \
+  source "${MINI_ORK_ROOT}/lib/gates_common.sh" 2>/dev/null || true
+
 mo_generate_fabrications() {
   local _count="${1:-}"
   local _out="${2:-}"
@@ -147,7 +152,8 @@ mo_check_fabrication_survival() {
 
   mkdir -p "$_report_dir" 2>/dev/null || true
 
-  MO_REF_FINDINGS="$_findings" \
+  local _out _rc
+  _out=$(MO_REF_FINDINGS="$_findings" \
   MO_REF_FAB="$_fabrications" \
   MO_REF_CEILING_PY="$_ceiling" \
   MO_REF_REPORT="$_report_path" \
@@ -230,6 +236,21 @@ emit("validator_grounded", "ok", fp_count, fp_total, round(fp_rate, 4),
      f"validator refuted {fp_total - fp_count} of {fp_total} fabrications ({fp_rate:.1%} <= ceiling {ceiling:.0%})",
      0)
 PY
+)
+  _rc=$?
+  printf '%s\n' "$_out"
+
+  local _verdict
+  _verdict=$(printf '%s' "$_out" | jq -r '.verdict // ""' 2>/dev/null)
+  if [ "$_verdict" = "REFUTE_FAILED" ] && declare -f mo_grounded_rejection >/dev/null 2>&1; then
+    local _reason _rationale
+    _reason=$(printf '%s' "$_out" | jq -r '.reason // ""' 2>/dev/null)
+    _rationale=$(printf '%s' "$_out" | jq -r '.rationale // ""' 2>/dev/null)
+    mo_grounded_rejection "refute_or_promote" "fail" "$_reason" "$_rationale" \
+      "strengthen the validator: the surviving fabrications are false positives that must be refuted before promotion" \
+      '[]' "${MINI_ORK_RUN_ID:-}" >/dev/null 2>&1 || true
+  fi
+  return $_rc
 }
 
 # Self-test: 3 fixtures (clean validator / hallucinating validator /
