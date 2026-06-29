@@ -211,6 +211,49 @@ PROMPT_FILE="$ITER_DIR/prompt.md"
   echo "$KICKOFF_BODY"
 } > "$PROMPT_FILE"
 
+# ─── ContextNest worker context (PR-3 + prefetch wiring; best-effort) ────
+# Two complementary, bounded, never-blocking augmentations appended to the
+# worker prompt so EVERY recipe's workers get CN context — not just the 3
+# code-fix prompts that hard-code MO_CN_PREFETCH_DIR.
+#
+#   (1) Implementer role pack — synchronous, inlined now. This is the missing
+#       implementer call site (previously context_role_pack_md was only ever
+#       called for the planner).
+#   (2) Generic "ContextNest prefetch" read instruction — points the worker at
+#       MO_CN_PREFETCH_DIR (written async by hooks/subagent-prefetch.sh) so the
+#       per-session prefetch file is consumed by all recipes, not only code-fix.
+if [ "${MO_USE_ROLE_PACKS:-1}" = "1" ] && [ "${MO_DISABLE_CN:-0}" != "1" ] \
+   && [ -f "$MINI_ORK_ROOT/lib/context_role_packs.sh" ]; then
+  # shellcheck source=../lib/context_role_packs.sh
+  source "$MINI_ORK_ROOT/lib/context_role_packs.sh" 2>/dev/null || true
+  if declare -f context_role_pack_md >/dev/null 2>&1; then
+    _cn_impl_pack="$(context_role_pack_md implementer "$KICKOFF_ABS" "" 2>/dev/null || true)"
+    if [ -n "$_cn_impl_pack" ]; then
+      {
+        echo
+        echo "## ContextNest implementer pack (cross-session substrate — advisory)"
+        echo
+        echo "Prior editors of these files, adjacent deliveries, and graph"
+        echo "neighbours. Verify against live code before acting on any atom."
+        echo
+        printf '%s\n' "$_cn_impl_pack"
+      } >> "$PROMPT_FILE"
+    fi
+  fi
+fi
+if [ -n "${MO_CN_PREFETCH_DIR:-}" ]; then
+  {
+    echo
+    echo "## Step 0 — ContextNest prefetch (read if present)"
+    echo
+    echo "Before planning your edits, check for a prefetched cross-session"
+    echo "context file. If \`$MO_CN_PREFETCH_DIR\` exists and contains any"
+    echo "\`*.md\` file, read it first — it holds semantic atoms, inbox items,"
+    echo "and recent feature deliveries relevant to this task. Treat it as"
+    echo "advisory memory: verify against live code before acting."
+  } >> "$PROMPT_FILE"
+fi
+
 PROMPT_BYTES=$(wc -c < "$PROMPT_FILE" | xargs)
 echo "    prompt: $PROMPT_FILE ($PROMPT_BYTES bytes)"
 

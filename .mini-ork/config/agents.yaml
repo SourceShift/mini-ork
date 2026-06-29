@@ -25,24 +25,24 @@ lanes:
   # (cost-conscious, judgment-binding) and continue to deny gemini.
   # All role-lanes MUST map to one of glm / kimi / codex / minimax /
   # opus / sonnet.
-  planner: codex             # was opus 2026-06-09..13; back to codex
-  researcher: codex          # bottleneck-scan fallback if model_lane unset
-  implementer: codex
-  worker: codex
-  reviewer: codex            # was opus; tier4_synth + general reviewers now codex
-  verifier: codex
-  reflector: codex
-  publisher: codex
-  rollback: codex
-  brain: opus                # restored 2026-06-17 per user directive: opus+glm OK, only codex banned
+  planner: minimax  # codex flaky in this env -> minimax workhorse
+  researcher: minimax  # codex flaky in this env -> minimax workhorse
+  implementer: minimax  # codex flaky in this env -> minimax workhorse
+  worker: minimax  # codex flaky in this env -> minimax workhorse
+  reviewer: minimax  # codex flaky in this env -> minimax workhorse
+  verifier: minimax  # codex flaky in this env -> minimax workhorse
+  reflector: minimax  # codex flaky in this env -> minimax workhorse
+  publisher: minimax  # codex flaky in this env -> minimax workhorse
+  rollback: minimax  # codex flaky in this env -> minimax workhorse
+  brain: minimax  # codex flaky in this env -> minimax workhorse
   rubric: kimi               # was sonnet; cheap + reliable structured JSON
 
   # Heterogeneous-family lens lanes (must match workflow.yaml node.model_lane).
-  minimax_lens: minimax      # perf lens — MiniMax-M3
-  kimi_lens: kimi            # correctness lens — Moonshot Kimi
-  codex_lens: codex          # arch + arxiv lens — OpenAI Codex wrapper
-  glm_lens: glm              # structural extraction lens — Zhipu GLM
-  opus_lens: opus            # restored 2026-06-17 per user directive: opus+glm OK, only codex banned
+  minimax_lens: minimax      # perf lens
+  kimi_lens: kimi            # correctness lens
+  codex_lens: codex          # codex review lens (non-critical; panel tolerates failure)
+  glm_lens: kimi             # no-glm -> kimi
+  opus_lens: kimi            # no-claude; panel family-diversity via kimi
 
 
 

@@ -53,6 +53,11 @@
 
 set -uo pipefail
 
+MINI_ORK_ROOT="${MINI_ORK_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+# shellcheck source=lib/gates_common.sh
+[ -f "${MINI_ORK_ROOT}/lib/gates_common.sh" ] && \
+  source "${MINI_ORK_ROOT}/lib/gates_common.sh" 2>/dev/null || true
+
 mo_check_panel_alpha() {
   local _run_dir="${1:-}"
   if [ -z "$_run_dir" ] || [ ! -d "$_run_dir" ]; then
@@ -72,7 +77,8 @@ mo_check_panel_alpha() {
     return 0
   fi
 
-  MO_ALPHA_INPUT="$_input_path" \
+  local _out _rc
+  _out=$(MO_ALPHA_INPUT="$_input_path" \
   MO_ALPHA_THRESHOLD_PY="$_threshold" \
   MO_ALPHA_MIN_LENSES_PY="$_min_lenses" \
   MO_ALPHA_SCORES_TSV="$_scores_tsv" \
@@ -218,6 +224,21 @@ emit("panel_calibrated", "ok", alpha, lens_count, item_count,
      f"alpha {alpha:.3f} >= threshold {threshold} across {lens_count} lenses x {item_count} items",
      0)
 PY
+)
+  _rc=$?
+  printf '%s\n' "$_out"
+
+  local _verdict
+  _verdict=$(printf '%s' "$_out" | jq -r '.verdict // ""' 2>/dev/null)
+  if [ "$_verdict" = "ALPHA_ESCALATE" ] && declare -f mo_grounded_rejection >/dev/null 2>&1; then
+    local _reason _rationale
+    _reason=$(printf '%s' "$_out" | jq -r '.reason // ""' 2>/dev/null)
+    _rationale=$(printf '%s' "$_out" | jq -r '.rationale // ""' 2>/dev/null)
+    mo_grounded_rejection "krippendorff_alpha" "needs_revision" "$_reason" "$_rationale" \
+      "re-run lenses or widen the panel; α below floor means the panel cannot defend a single point-verdict" \
+      '[]' "${MINI_ORK_RUN_ID:-}" >/dev/null 2>&1 || true
+  fi
+  return $_rc
 }
 
 # Self-test fixtures: run directly to see verdicts. Pattern mirrors
