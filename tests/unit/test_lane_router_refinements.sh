@@ -13,8 +13,10 @@ bad(){ echo "  [FAIL] $1"; FAIL=$((FAIL+1)); }
 
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 DB="$TMP/state.db"
-# Base schema from the project DB (has execution_traces + agent_performance_memory).
-cp "${MINI_ORK_HOME:-$ROOT/.mini-ork}/state.db" "$DB"
+# Build a fresh schema in-test — CI has no populated state.db fixture to copy.
+# db/init.sh applies all migrations idempotently and gives us execution_traces,
+# agent_performance_memory, lane_domain_advantage + lane_region_advantage.
+MINI_ORK_DB="$DB" MINI_ORK_HOME="$TMP" bash "$ROOT/db/init.sh" >/dev/null 2>&1
 export MINI_ORK_DB="$DB"
 
 # Insert one trace. args: lane reward_g cost created_at [region]
