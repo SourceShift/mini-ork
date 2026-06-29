@@ -145,3 +145,87 @@ All harnesses produce evidence files with per-assertion verdicts + captured outp
 
 - **PR-5 composed CN endpoint** (`POST /api/v1/agent/context-pack?role=<role>`): collapses each role pack's 3-4 sequential CN calls into one server-side composition. Gated on PR-3 latency measurement — only ship if the composed approach measurably beats per-endpoint composition (≥30% latency reduction).
 - **PR-6 outcome feedback loop** (EvoMem pattern): after `subagent_stop`, POST `{atom_ids_used[], outcome, evidence}` to CN; CN bumps atom confidence on success, decays on contradiction. Needs new CN endpoint + sidecar table.
+
+## Verification in practice (2026-06-18)
+
+Question asked: *is mini-ork actually consuming the ContextNest ContextPack at
+runtime, or just defining the plumbing?* Verified against the live daemon (CN
+healthy, substrate populated at ~28k atoms / ~3.9k clusters) and against two
+real run artifacts plus a direct live-test of the planner role pack.
+
+### What works (confirmed firing)
+
+- **Planner role-pack injection is live.** `bin/mini-ork-plan:198-199` guards on
+  `declare -f context_role_pack_md` and calls
+  `context_role_pack_md planner "$KICKOFF" ""`, appending the result to the
+  planner prompt (gated by `MO_USE_ROLE_PACKS=1`, the default). A direct
+  live-test produced a **6738-char** capsule block (Risks / Decisions /
+  Failures / Directives headings present), proving CN was reached and the
+  ContextPack reached the planner's prompt — not just the audit artifact.
+- **`context-pack.json` is written** as an audit artifact via
+  `context_assemble … planner`. Note: its *local-state* fields
+  (`prior_similar_runs`, `known_failure_modes`, `similar_lessons`) read from the
+  run's local `state.db`, **not** from CN. In a fresh worktree those were `0`
+  while the CN-sourced capsule was simultaneously non-empty — so a zero there
+  is a local-state artifact, not evidence that CN delivered nothing.
+
+### Gaps (wired for delivery, not yet consumed)
+
+1. **Worker prefetch dir is delivered but only consumed by `code-fix`.**
+   `bin/mini-ork-execute` exports `MO_CN_PREFETCH_DIR` and
+   `hooks/subagent-prefetch.sh` writes the per-session prefetch file, but only
+   **3 of 160** prompt templates reference `MO_CN_PREFETCH_DIR`
+   (`recipes/code-fix/prompts/{planner,implementer,reviewer}.md`). Every other
+   recipe's workers — including `framework-edit` — never read the prefetched
+   atoms. In both inspected `framework-edit` runs the `cn_prefetch/` dir was
+   **empty**: delivery wired, consumption absent.
+2. **Only the planner role pack is called.** `context_role_pack_md` has exactly
+   **one** call site (`bin/mini-ork-plan:199`, planner). The
+   implementer / researcher / reviewer / reflector / publisher sub-packs in
+   `lib/context_role_packs.sh` are defined and unit-smoke-tested but never
+   invoked by any node. Five of six role packs are dead-on-arrival at runtime.
+3. **Capsule is unfiltered for markdown kickoffs.**
+   `_role_pack_extract_query` picks the first ≥4-char token from the first 8
+   words of the brief; for a markdown kickoff (which opens with `#`, headings,
+   prose) it returns **empty**, so the planner capsule runs unscoped — a
+   whole-substrate digest that pulls in unrelated atoms rather than a
+   task-scoped slice.
+
+### Bottom line
+
+The headline path (CN → planner role-pack ContextPack → planner prompt) is real
+and fires on every plan. The remaining value is locked behind wiring, not
+capability: extend prefetch consumption past `code-fix`, add the five missing
+role-pack call sites, and give `_role_pack_extract_query` a markdown-aware
+fallback so the capsule is task-scoped.
+
+### Resolution (2026-06-18, same day)
+
+All three gaps fixed in-repo:
+
+- **Gap 3 — markdown-aware query scoping.** `_role_pack_extract_query`
+  (`lib/context_role_packs.sh`) now strips heading markers + code fences and
+  filters structural stopwords (`kickoff`/`phase`/`goal`/`wire`/…) before
+  picking a token. A markdown kickoff opening `# Kickoff: Wire grounded-rejection
+  …` now scopes to **`grounded-rejection`** instead of `Kickoff`. JSON-brief and
+  generic-brief behaviour unchanged (the `oracle-hardening` smoke brief still
+  resolves to `Epic`, keeping the PR-3 smoke green).
+- **Gap 2 — missing role-pack call sites.** Two chokepoints now invoke
+  `context_role_pack_md`:
+  - `bin/mini-ork-invoke-prompt` injects a role pack keyed on
+    `MINI_ORK_NODE_TYPE` for every recipe-internal node (reviewer / reflector /
+    publisher / researcher …) — one edit covers all of them, with the
+    *substituted* prompt text used as the brief.
+  - `bin/_worker-launcher.sh` inlines the **implementer** pack into every
+    spawned worker's prompt (previously the implementer pack was defined but
+    never called).
+- **Gap 1 — prefetch consumed only by `code-fix`.** `bin/_worker-launcher.sh`
+  now appends a generic **Step 0 — ContextNest prefetch** instruction pointing
+  at `MO_CN_PREFETCH_DIR` for *all* recipes, so the per-session prefetch file is
+  no longer ignored outside the three `code-fix` prompts.
+
+All injections are best-effort + bounded (guarded by `MO_USE_ROLE_PACKS=1` /
+`MO_DISABLE_CN`, `declare -f`, and silent failure) — they can never block or
+fail a plan/worker/node. Verified: PR-3 role-pack smoke 9/9, `test_cn_client`
+10/10, `test_context_assembler` 7/7, `bash -n` clean on all three files, no new
+shellcheck findings.

@@ -58,6 +58,11 @@
 
 set -uo pipefail
 
+MINI_ORK_ROOT="${MINI_ORK_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+# shellcheck source=lib/gates_common.sh
+[ -f "${MINI_ORK_ROOT}/lib/gates_common.sh" ] && \
+  source "${MINI_ORK_ROOT}/lib/gates_common.sh" 2>/dev/null || true
+
 mo_check_citations() {
   local _doc="${1:-}"
   local _report_dir="${2:-${MINI_ORK_RUN_DIR:-.}}"
@@ -87,7 +92,8 @@ mo_check_citations() {
 
   mkdir -p "$_report_dir" 2>/dev/null || true
 
-  MO_CIT_DOC="$_doc" \
+  local _out _rc
+  _out=$(MO_CIT_DOC="$_doc" \
   MO_CIT_ROOT="$_root" \
   MO_CIT_FLOOR="$_floor" \
   MO_CIT_MIN_COUNT="$_min_count" \
@@ -220,6 +226,21 @@ emit("citations_covered", "ok", round(coverage, 4),
      f"citation coverage {coverage:.1%} >= floor {floor:.0%} across {total} citations spanning {len(unique_files)} unique files",
      0)
 PY
+)
+  _rc=$?
+  printf '%s\n' "$_out"
+
+  local _verdict
+  _verdict=$(printf '%s' "$_out" | jq -r '.verdict // ""' 2>/dev/null)
+  if [ "$_verdict" = "CITATION_UNDERCOVERED" ] && declare -f mo_grounded_rejection >/dev/null 2>&1; then
+    local _reason _rationale
+    _reason=$(printf '%s' "$_out" | jq -r '.reason // ""' 2>/dev/null)
+    _rationale=$(printf '%s' "$_out" | jq -r '.rationale // ""' 2>/dev/null)
+    mo_grounded_rejection "citation_verifier" "fail" "$_reason" "$_rationale" \
+      "add path/file.ext:LINE anchors for the uncited claims, or remove the unsupported claims" \
+      '[]' "${MINI_ORK_RUN_ID:-}" >/dev/null 2>&1 || true
+  fi
+  return $_rc
 }
 
 # Self-test: 4 fixtures (full coverage / partial coverage / no citations /

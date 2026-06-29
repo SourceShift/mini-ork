@@ -63,6 +63,11 @@
 
 set -uo pipefail
 
+MINI_ORK_ROOT="${MINI_ORK_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+# shellcheck source=lib/gates_common.sh
+[ -f "${MINI_ORK_ROOT}/lib/gates_common.sh" ] && \
+  source "${MINI_ORK_ROOT}/lib/gates_common.sh" 2>/dev/null || true
+
 mo_compute_finding_cis() {
   local _in="${1:-}"
   local _out="${2:-}"
@@ -205,7 +210,8 @@ mo_check_ci_widths() {
     return 0
   fi
 
-  MO_CI_AUGMENTED="$_augmented" \
+  local _out _rc
+  _out=$(MO_CI_AUGMENTED="$_augmented" \
   MO_CI_CEILING_PY="$_ceiling" \
   MO_CI_WIDE_RATIO_PY="$_wide_ratio_ceiling" \
   python3 - <<'PY'
@@ -270,6 +276,21 @@ emit("ci_within_band", "ok", wide, total, round(ratio, 4),
      f"{wide}/{total} findings have wide CIs ({ratio:.1%} <= ceiling {wide_ratio_ceiling:.0%})",
      0)
 PY
+)
+  _rc=$?
+  printf '%s\n' "$_out"
+
+  local _verdict
+  _verdict=$(printf '%s' "$_out" | jq -r '.verdict // ""' 2>/dev/null)
+  if [ "$_verdict" = "CI_TOO_WIDE" ] && declare -f mo_grounded_rejection >/dev/null 2>&1; then
+    local _reason _rationale
+    _reason=$(printf '%s' "$_out" | jq -r '.reason // ""' 2>/dev/null)
+    _rationale=$(printf '%s' "$_out" | jq -r '.rationale // ""' 2>/dev/null)
+    mo_grounded_rejection "honest_ci" "needs_revision" "$_reason" "$_rationale" \
+      "gather more samples or widen the band consciously; the current CIs are too wide to act on" \
+      '[]' "${MINI_ORK_RUN_ID:-}" >/dev/null 2>&1 || true
+  fi
+  return $_rc
 }
 
 # Self-test fixtures: tight panel (narrow CIs) / split panel (wide CIs)
