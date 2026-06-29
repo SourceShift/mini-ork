@@ -13,6 +13,7 @@
 # Flags:
 #   --since <timestamp>   Start of analysis window (default: 24h ago)
 #   --task-class <name>   Limit reflection to a specific task class
+#   --lane <lane>         Resolve reflection through agents.yaml lane mapping
 #   --dry-run             Print what would be analyzed; do not invoke LLM
 #   --help
 
@@ -34,6 +35,7 @@ _require_lib() {
 # ── arg parsing ───────────────────────────────────────────────────────────────
 SINCE=""
 TASK_CLASS_FILTER=""
+REFLECT_LANE="${MINI_ORK_REFLECT_LANE:-}"
 DRY_RUN="${MINI_ORK_DRY_RUN:-0}"
 
 _usage() {
@@ -46,6 +48,7 @@ signals, recurring patterns, and suggested workflow promotions.
 Options:
   --since <timestamp>   Start of analysis window (ISO-8601 or unix ts, default: 24h ago)
   --task-class <name>   Limit reflection to traces of this task class
+  --lane <lane>          Resolve reflection model from agents.yaml (default: reflector)
   --dry-run             Show trace count that would be analyzed; skip LLM
   --help                Show this help
 EOF
@@ -57,6 +60,7 @@ while [[ $# -gt 0 ]]; do
     --dry-run)     DRY_RUN=1; shift ;;
     --since)       SINCE="${2:?--since requires a value}"; shift 2 ;;
     --task-class)  TASK_CLASS_FILTER="${2:?--task-class requires a value}"; shift 2 ;;
+    --lane)        REFLECT_LANE="${2:?--lane requires a value}"; shift 2 ;;
     -*)            echo "Unknown flag: $1. Try --help" >&2; exit 2 ;;
     *)             echo "Unexpected argument: $1. Try --help" >&2; exit 2 ;;
   esac
@@ -66,6 +70,36 @@ done
 MINI_ORK_HOME="${MINI_ORK_HOME:-$(pwd)/.mini-ork}"
 MINI_ORK_DB="${MINI_ORK_DB:-$MINI_ORK_HOME/state.db}"
 export MINI_ORK_HOME MINI_ORK_DB
+
+_resolve_reflect_model() {
+  local lane="${1:-reflector}"
+  local agents_yaml="${MINI_ORK_HOME}/config/agents.yaml"
+  [ ! -f "$agents_yaml" ] && agents_yaml="$MINI_ORK_ROOT/config/agents.yaml"
+  if [ ! -f "$agents_yaml" ]; then
+    printf '%s\n' "$lane"
+    return 0
+  fi
+  python3 - "$agents_yaml" "$lane" <<'PY' 2>/dev/null || printf '%s\n' "$lane"
+import sys, yaml
+path, lane = sys.argv[1:3]
+try:
+    data = yaml.safe_load(open(path)) or {}
+    lanes = data.get("lanes") or {}
+    print(lanes.get(lane) or lanes.get("reflector") or lane)
+except Exception:
+    print(lane)
+PY
+}
+
+if [ -n "$REFLECT_LANE" ]; then
+  export MINI_ORK_REFLECT_LANE="$REFLECT_LANE"
+else
+  REFLECT_LANE="reflector"
+fi
+if [ -z "${MINI_ORK_GRADIENT_MODEL:-}" ]; then
+  MINI_ORK_GRADIENT_MODEL="$(_resolve_reflect_model "$REFLECT_LANE")"
+  export MINI_ORK_GRADIENT_MODEL
+fi
 
 # Default since = 24h ago
 if [ -z "$SINCE" ]; then
@@ -95,6 +129,7 @@ if [ "$DRY_RUN" -eq 1 ]; then
       "SELECT COUNT(*) FROM execution_traces WHERE created_at >= ${SINCE}${FILTER_SQL};" 2>/dev/null || echo 0)
   fi
   echo "[dry-run] would analyze ${COUNT} trace(s) since ${SINCE}"
+  echo "[dry-run] lane: ${REFLECT_LANE} -> ${MINI_ORK_GRADIENT_MODEL}"
   [ -n "$TASK_CLASS_FILTER" ] && echo "[dry-run] filter: task_class=${TASK_CLASS_FILTER}"
   exit 0
 fi
@@ -105,6 +140,7 @@ _require_lib reflection_pipeline
 echo "=== mini-ork reflect ==="
 echo "    since:   $SINCE"
 echo "    filter:  ${TASK_CLASS_FILTER:-all}"
+echo "    lane:    ${REFLECT_LANE} -> ${MINI_ORK_GRADIENT_MODEL}"
 echo ""
 
 # v0.2-pt11 (D-040): reflection_run takes ONE positional arg `since_ts`,
