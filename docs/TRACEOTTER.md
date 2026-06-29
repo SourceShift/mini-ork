@@ -40,8 +40,8 @@ Normalize local traces:
 
 ```bash
 traceotter --json ingest \
-  --codex /Users/admin/.codex/sessions \
-  --claude /Users/admin/.claude/projects \
+  --codex ~/.codex/sessions \
+  --claude ~/.claude/projects \
   --mini-ork .mini-ork/runs \
   --out .traceotter/local \
   --limit-files 200
@@ -68,8 +68,8 @@ Run the full local preparation pipeline:
 
 ```bash
 traceotter --json pipeline \
-  --codex /Users/admin/.codex/sessions \
-  --claude /Users/admin/.claude/projects \
+  --codex ~/.codex/sessions \
+  --claude ~/.claude/projects \
   --mini-ork .mini-ork/runs \
   --out .traceotter/local \
   --limit-files 500
