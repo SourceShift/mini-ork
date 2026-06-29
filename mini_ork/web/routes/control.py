@@ -115,3 +115,38 @@ def resume_cost(
         # is a different error class than "run doesn't exist".
         raise HTTPException(status_code=409, detail=result.get("error", "resume failed"))
     return result
+
+
+# ── HITL steering injection (U2, Bearer-token auth required) ──────────────
+
+
+@router.post("/{task_run_id}/steer")
+def steer(
+    task_run_id: str = PathParam(...),
+    message: str = Body(..., embed=True, description="Steering text the agent sees next"),
+    role_target: str = Body("any", embed=True, description="planner/implementer/reviewer/verifier/any"),
+    severity: str = Body("info", embed=True, description="info/warn/critical"),
+    confidence: float = Body(0.8, embed=True, description="0.0–1.0; context_assembler ranks by this"),
+    ttl_secs: int = Body(3600, embed=True, description="message TTL in seconds"),
+    db: StateDB = Depends(get_db),
+    operator: str = Depends(auth.require_token),
+) -> dict[str, Any]:
+    """Inject an operator-steering message into an in-flight run. The targeted
+    agent role picks it up on its next context_assemble pack (the HTTP-write
+    counterpart to lib/operator_steering.sh + the read-side MCP tool)."""
+    result = control.steer_run(
+        db,
+        task_run_id,
+        message,
+        role_target=role_target,
+        severity=severity,
+        source=f"http:{operator}",
+        confidence=confidence,
+        ttl_secs=ttl_secs,
+    )
+    if not result.get("ok"):
+        err = result.get("error", "steer failed")
+        status = 404 if "not found" in err else 400
+        raise HTTPException(status_code=status, detail=err)
+    result["operator"] = operator
+    return result
