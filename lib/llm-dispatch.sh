@@ -1294,11 +1294,15 @@ PY
   while :; do
     : > "$_err_file" 2>/dev/null || true
     rm -f "${out_file}.err.log" 2>/dev/null || true
-    if mo_llm_dispatch "$model" "$prompt_text" "$out_file" "$_timeout_s" "$_max_turns" >/dev/null 2>"$_err_file"; then
+    # Capture rc into a var IMMEDIATELY — `if cmd; then…; fi` with no else
+    # returns 0 when cmd fails, so reading $? after `fi` would mask the real
+    # dispatch rc (D-013/D-014 regression: shim reported rc=0 on a hard fail).
+    mo_llm_dispatch "$model" "$prompt_text" "$out_file" "$_timeout_s" "$_max_turns" >/dev/null 2>"$_err_file"
+    _dispatch_rc=$?
+    if [ "$_dispatch_rc" -eq 0 ]; then
       _dispatch_ok=1
       break
     fi
-    _dispatch_rc=$?
     local _retry_probe=""
     _retry_probe=$(
       {

@@ -17,6 +17,7 @@ from .routes import (
     idea_tree as idea_tree_routes,
     projects,
     run_detail,
+    runs as runs_routes,
     stream,
     trajectory,
 )
@@ -62,6 +63,7 @@ def create_app(home: Path | None = None, dev_cors: bool = True) -> FastAPI:
     app.include_router(fingerprint.router)
     app.include_router(stream.router)
     app.include_router(control_routes.router)
+    app.include_router(runs_routes.router)
     app.include_router(projects.router)
     app.include_router(idea_tree_routes.router)
 

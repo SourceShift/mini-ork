@@ -451,3 +451,184 @@ def _close_dangling_node_events(db: StateDB, task_run_id: str) -> None:
         pass
     finally:
         con.close()
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# U2 — operator-steering HTTP write surface
+# ════════════════════════════════════════════════════════════════════════════
+# HTTP-write counterpart to lib/operator_steering.sh's `operator_steering_emit`
+# (bash, same-host only) and the read-side MCP `get_operator_steering` tool.
+# Lets an external driver (dashboard, product backend, SDK client) inject a
+# mid-run steering message that the targeted agent role sees on its NEXT
+# context_assemble pack — without shelling into the run host. The workspace is
+# resolved by the request's home (X-Mini-Ork-Home), so a remote driver can
+# point this at the run's own state.db.
+
+_STEER_ROLES = {"planner", "implementer", "reviewer", "verifier", "any"}
+_STEER_SEVERITIES = {"info", "warn", "critical"}
+
+
+def steer_run(
+    db: StateDB,
+    task_run_id: str | None,
+    message: str,
+    role_target: str = "any",
+    severity: str = "info",
+    source: str = "http-api",
+    confidence: float = 0.8,
+    ttl_secs: int = 3600,
+) -> dict[str, Any]:
+    """Insert an operator_steering row (HITL steering injection).
+
+    task_run_id=None targets the global queue (next planner dispatch). A named
+    run that no longer exists returns not-found; a named terminal run is still
+    rejected upstream by the caller if desired. Validates role_target/severity/
+    confidence against the operator_steering CHECK constraints before writing.
+    Returns {ok, steering_id, run_id, ...}.
+    """
+    import sqlite3
+
+    msg = (message or "").strip()
+    if not msg:
+        return {"ok": False, "error": "message required"}
+    if role_target not in _STEER_ROLES:
+        return {"ok": False, "error": f"invalid role_target: {role_target!r}"}
+    if severity not in _STEER_SEVERITIES:
+        return {"ok": False, "error": f"invalid severity: {severity!r}"}
+    try:
+        conf = float(confidence)
+    except (TypeError, ValueError):
+        return {"ok": False, "error": "confidence must be a number"}
+    if not (0.0 <= conf <= 1.0):
+        return {"ok": False, "error": "confidence must be in [0,1]"}
+
+    if task_run_id:
+        tr = db.row("SELECT id FROM task_runs WHERE id = ?", (task_run_id,))
+        if tr is None:
+            return {"ok": False, "error": "task_run not found", "task_run_id": task_run_id}
+
+    now_ms = int(time.time() * 1000)
+    expires_ms = now_ms + max(1, int(ttl_secs)) * 1000
+    con = sqlite3.connect(str(db.db_path), timeout=5.0)
+    try:
+        con.execute("PRAGMA busy_timeout = 5000")
+        cur = con.execute(
+            """INSERT INTO operator_steering
+                 (run_id, role_target, severity, message, source, confidence, created_at, expires_at)
+               VALUES (NULLIF(?, ''), ?, ?, ?, NULLIF(?, ''), ?, ?, ?)""",
+            (task_run_id or "", role_target, severity, msg, source or "", conf, now_ms, expires_ms),
+        )
+        con.commit()
+        steering_id = cur.lastrowid
+    finally:
+        con.close()
+    return {
+        "ok": True,
+        "steering_id": steering_id,
+        "run_id": task_run_id,
+        "role_target": role_target,
+        "severity": severity,
+        "expires_at": expires_ms,
+    }
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# U1 — detached run launch
+# ════════════════════════════════════════════════════════════════════════════
+# Non-blocking counterpart to mini_ork.client.MiniOrk.run (which blocks up to
+# 1800s). Returns a run_id immediately; the caller observes progress via the
+# SSE /api/v1/stream endpoint and drives the run via /steer + /stop. run_id is
+# pre-minted here (matching bin/mini-ork's `run-$(date+%s)-$$` shape) and passed
+# through MINI_ORK_RUN_ID so the returned id IS the id the run uses.
+
+# Slug charset for recipe names + run ids. Deliberately excludes '/' and any
+# '..' so a caller-supplied recipe/run_id can never traverse out of the
+# runs-inbox when used as a filename, nor inject a path argument.
+_SAFE_TOKEN_CHARS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-"
+)
+
+
+def _is_safe_token(s: str) -> bool:
+    return bool(s) and ".." not in s and all(c in _SAFE_TOKEN_CHARS for c in s)
+
+
+def _mini_ork_root() -> Path:
+    env = os.environ.get("MINI_ORK_ROOT")
+    if env:
+        return Path(env).resolve()
+    # mini_ork/web/control.py → parents[2] == repo root (bin/ lives there).
+    return Path(__file__).resolve().parents[2]
+
+
+def launch_run(
+    home: Path,
+    recipe: str,
+    kickoff_markdown: str,
+    run_id: str | None = None,
+    extra_env: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """Spawn `bin/mini-ork run <recipe> <kickoff>` DETACHED; return run_id now.
+
+    The kickoff markdown is written to <home>/runs-inbox/<run_id>.md. The spawn
+    uses an argv list (no shell), so recipe/kickoff cannot inject commands;
+    recipe + run_id are additionally validated against a safe token charset.
+    Returns {ok, run_id, recipe, pid, kickoff_path, log_path}.
+    """
+    import secrets
+    import subprocess
+
+    rcp = (recipe or "").strip()
+    if not _is_safe_token(rcp):
+        return {"ok": False, "error": f"invalid recipe: {recipe!r}"}
+    if not (kickoff_markdown or "").strip():
+        return {"ok": False, "error": "kickoff_markdown required"}
+
+    rid = (run_id or "").strip() or f"run-{int(time.time())}-{secrets.token_hex(3)}"
+    if not _is_safe_token(rid):
+        return {"ok": False, "error": f"invalid run_id: {rid!r}"}
+
+    root = _mini_ork_root()
+    bin_path = root / "bin" / "mini-ork"
+    if not bin_path.is_file():
+        return {"ok": False, "error": f"bin/mini-ork not found under {root}"}
+
+    inbox = Path(home) / "runs-inbox"
+    try:
+        inbox.mkdir(parents=True, exist_ok=True)
+        kickoff_path = inbox / f"{rid}.md"
+        kickoff_path.write_text(kickoff_markdown, encoding="utf-8")
+        log_path = inbox / f"{rid}.launch.log"
+    except OSError as exc:
+        return {"ok": False, "error": f"could not stage kickoff: {exc}"}
+
+    env = dict(os.environ)
+    env["MINI_ORK_RUN_ID"] = rid
+    env["MINI_ORK_HOME"] = str(home)
+    env["MINI_ORK_ROOT"] = str(root)
+    if extra_env:
+        env.update({str(k): str(v) for k, v in extra_env.items()})
+
+    try:
+        log_fh = open(log_path, "ab")  # noqa: SIM115 — handed to the child; closed in parent below
+        proc = subprocess.Popen(
+            [str(bin_path), "run", rcp, str(kickoff_path)],
+            cwd=str(root),
+            env=env,
+            stdout=log_fh,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,  # detach from the server's process group
+        )
+        log_fh.close()
+    except OSError as exc:
+        return {"ok": False, "error": f"spawn failed: {exc}"}
+
+    return {
+        "ok": True,
+        "run_id": rid,
+        "recipe": rcp,
+        "pid": proc.pid,
+        "kickoff_path": str(kickoff_path),
+        "log_path": str(log_path),
+    }
