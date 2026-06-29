@@ -890,6 +890,63 @@ PY
   fi
 fi
 
+# ── pre-dispatch steering checkpoint (U3) ────────────────────────────────────
+# A recipe expresses a HITL steering checkpoint by emitting
+# plan_status=needs_steering. Unlike needs_answers (a hard block), this is a
+# RESUMABLE pause: if a steering message has already arrived for this run (via
+# the operator_steering channel / POST /api/v1/task-runs/<id>/steer), proceed and
+# let the next node consume it; otherwise write the awaiting-steering marker and
+# exit so the driver can collect human steering and resume (re-run execute).
+# Additive — no existing recipe emits needs_steering, so existing runs are
+# unaffected. Opt out via MINI_ORK_EXECUTE_GATE=0 (same contract as needs_answers).
+if [ "${MINI_ORK_EXECUTE_GATE:-1}" = "1" ] && [ "$DRY_RUN" -eq 0 ] \
+   && [ -f "$MINI_ORK_ROOT/lib/steering_checkpoint.sh" ]; then
+  _steer_status=$(python3 - "$PLAN_PATH" <<'PY' 2>/dev/null || true
+import json, sys
+try:
+    with open(sys.argv[1]) as f:
+        print(json.load(f).get("plan_status") or "")
+except Exception:
+    print("")
+PY
+)
+  if [ "$_steer_status" = "needs_steering" ]; then
+    # shellcheck source=/dev/null
+    . "$MINI_ORK_ROOT/lib/steering_checkpoint.sh"
+    _ckpt_run="${MINI_ORK_RUN_ID:-${MINI_ORK_TASK_RUN_ID:-}}"
+    if mo_steering_checkpoint_gate "$_ckpt_run" "checkpoint" "any"; then
+      echo "[steering] checkpoint satisfied — steering present, proceeding"
+    else
+      echo "[steering] checkpoint awaiting human steering — pausing run $_ckpt_run"
+      echo "[steering]   resume: POST /api/v1/task-runs/$_ckpt_run/steer, then re-run execute"
+      if [ -n "${MINI_ORK_DB:-}" ] && [ -f "${MINI_ORK_DB:-}" ] && [ -n "$_ckpt_run" ]; then
+        python3 - "$MINI_ORK_DB" "$_ckpt_run" <<'PY' 2>/dev/null || true
+import sqlite3, sys, time
+db, run_id = sys.argv[1:3]
+now = int(time.time())
+con = sqlite3.connect(db, timeout=5.0)
+con.execute("PRAGMA busy_timeout = 5000")
+try:
+    con.execute(
+        "INSERT INTO run_events(event_id, run_id, event_type, payload_json, created_at) VALUES (?, ?, ?, ?, ?)",
+        (f"evt-steering_await-{now}", run_id, "steering_checkpoint_awaiting", "{}", now),
+    )
+    con.commit()
+finally:
+    con.close()
+PY
+      fi
+      # Disarm the crash-finalize EXIT trap: this is an orderly RESUMABLE pause,
+      # not a crash. task_runs.status has no 'paused' value (CHECK constraint),
+      # so we deliberately leave status untouched — the .steering-checkpoint
+      # marker is the pause signal the driver reads. exit 7 = paused_for_steering.
+      trap - EXIT
+      rm -f "$RUN_DIR/.pid" 2>/dev/null || true
+      exit 7
+    fi
+  fi
+fi
+
 # Extract nodes — D-008 fix: workflow.yaml.nodes[] is the authoritative DAG.
 # Falls back to plan.json.decomposition[] only when no workflow.yaml is set
 # (e.g. ad-hoc runs without a recipe).
