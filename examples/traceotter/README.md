@@ -4,8 +4,8 @@ Create a tiny local dataset from your agent sessions:
 
 ```bash
 traceotter --json pipeline \
-  --codex /Users/admin/.codex/sessions \
-  --claude /Users/admin/.claude/projects \
+  --codex ~/.codex/sessions \
+  --claude ~/.claude/projects \
   --mini-ork ../../.mini-ork/runs \
   --out /tmp/traceotter-demo \
   --limit-files 20 \
