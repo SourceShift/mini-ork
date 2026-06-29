@@ -44,14 +44,43 @@ if ! declare -f cn_available >/dev/null 2>&1; then
 fi
 
 # desc: Extract a short concept token from a task brief — used as the
-#       capsule substring filter. Mirrors the logic from
-#       context_contextnest_atoms_md: skip markdown headers + stopwords,
-#       pick first alphanumeric token of length ≥4 in the first 5 words.
+#       capsule substring filter. For JSON briefs reads title/objective.
+#       For markdown briefs (kickoffs) strips heading markers, code
+#       fences and structural boilerplate (Kickoff/Phase/Goal/Wire...)
+#       before picking a concept token, and prefers domain-shaped
+#       hyphenated/underscored tokens (e.g. "grounded-rejection") which
+#       are almost always the real subject — so the capsule is
+#       task-scoped instead of matching kickoff boilerplate substrate-wide.
 _role_pack_extract_query() {
   local task_brief_path="$1"
   [ -f "$task_brief_path" ] || { echo ""; return 0; }
   python3 - "$task_brief_path" <<'PY' 2>/dev/null
 import json, sys, re
+
+# Structural / filler words that must never become the scoping token —
+# they match unrelated atoms across the whole substrate.
+STOP = {
+    "kickoff", "phase", "goal", "task", "wire", "into", "from", "with",
+    "this", "that", "then", "plain", "english", "objective", "summary",
+    "step", "steps", "title", "intro", "overview", "context", "change",
+    "changes", "implement", "implementation", "ship", "shipped", "fix",
+    "fixes", "make", "adds", "added", "using", "when", "where", "what",
+    "which", "should", "would", "will", "must", "each", "their", "they",
+    "have", "been", "does", "doing", "done", "onto", "over", "under",
+}
+
+def pick(text):
+    # First concept token (len>=4) that isn't structural boilerplate. The
+    # stopword filter is the whole point: a kickoff starts with
+    # "Kickoff: Wire grounded-rejection ..." — skipping kickoff/wire lands
+    # on "grounded-rejection" (the real subject) instead of "Kickoff",
+    # which would match kickoff atoms substrate-wide.
+    for raw_tok in text.split()[:60]:
+        tok = re.sub(r"^[^A-Za-z0-9]+|[^A-Za-z0-9_-]+$", "", raw_tok)
+        if len(tok) >= 4 and tok.lower() not in STOP:
+            return tok
+    return ""
+
 try:
     with open(sys.argv[1]) as f:
         raw = f.read()
@@ -64,13 +93,18 @@ try:
                 parts.append(v.strip())
         text = " ".join(parts)[:600] if parts else raw[:512].strip()
     except Exception:
-        text = raw[:512].strip()
-    # First concept-shaped token (len>=4, alphanumeric/dash/underscore).
-    for tok in text.split()[:8]:
-        tok = re.sub(r"^[^A-Za-z0-9]+|[^A-Za-z0-9_-]+$", "", tok)
-        if len(tok) >= 4:
-            print(tok)
-            return
+        # Markdown brief: drop heading markers, code fences and inline
+        # backticks before tokenising so '#'/'```'/'`x`' don't pollute.
+        lines = []
+        for ln in raw.splitlines():
+            s = re.sub(r"^\s*#+\s*", "", ln)   # heading markers
+            if s.strip().startswith("```"):     # fenced code start/end
+                continue
+            lines.append(s)
+        text = re.sub(r"`+", " ", "\n".join(lines))[:512].strip()
+    out = pick(text)
+    if out:
+        print(out)
 except Exception:
     pass
 PY

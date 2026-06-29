@@ -56,6 +56,29 @@ sys.stdout.write(out)
 PY
 )
 
+# ── ContextNest role pack (PR-3 wiring; best-effort) ──────────────────────────
+# Every recipe-internal node (reviewer / reflector / publisher / researcher …)
+# routes through here, so this is the single chokepoint that gives each node
+# its role-tailored substrate slice. Keyed on NODE_TYPE; context_role_pack_md
+# maps the role and falls back to a generic pack for unknown roles. The
+# substituted PROMPT_TEXT (not the raw template) is used as the brief so query
+# extraction sees the real task subject, not {{PLACEHOLDERS}}. Silent + bounded:
+# never blocks or fails the invocation.
+if [ "${MO_USE_ROLE_PACKS:-1}" = "1" ] && [ "${MO_DISABLE_CN:-0}" != "1" ] \
+   && [ -f "$MINI_ORK_ROOT/lib/context_role_packs.sh" ]; then
+  # shellcheck source=/dev/null
+  source "$MINI_ORK_ROOT/lib/context_role_packs.sh" 2>/dev/null || true
+  if declare -f context_role_pack_md >/dev/null 2>&1; then
+    _cn_brief_tmp=$(mktemp 2>/dev/null) || _cn_brief_tmp=""
+    if [ -n "$_cn_brief_tmp" ]; then
+      printf '%s' "$PROMPT_TEXT" > "$_cn_brief_tmp"
+      _cn_node_pack="$(context_role_pack_md "$NODE_TYPE" "$_cn_brief_tmp" "" 2>/dev/null || true)"
+      [ -n "$_cn_node_pack" ] && PROMPT_TEXT="${PROMPT_TEXT}"$'\n\n'"${_cn_node_pack}"$'\n'
+      rm -f "$_cn_brief_tmp"
+    fi
+  fi
+fi
+
 # ── trace start ───────────────────────────────────────────────────────────────
 TRACE_ID="tr-invoke-$(date +%s)-$$"
 if [ -f "$MINI_ORK_ROOT/lib/trace_store.sh" ] && [ -n "${MINI_ORK_DB:-}" ]; then

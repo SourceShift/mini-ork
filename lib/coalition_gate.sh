@@ -46,6 +46,10 @@
 
 MINI_ORK_ROOT="${MINI_ORK_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 
+# shellcheck source=lib/gates_common.sh
+[ -f "${MINI_ORK_ROOT}/lib/gates_common.sh" ] && \
+  source "${MINI_ORK_ROOT}/lib/gates_common.sh" 2>/dev/null || true
+
 mo_check_panel_coalition() {
   local panel_run_id="${1:?panel_run_id required}"
   local recipe="${2:?recipe required}"
@@ -151,7 +155,8 @@ PY
   lens_count=$(echo "$family_json"   | jq -r '.lens_count   // 0')
   family_count=$(echo "$family_json" | jq -r '.family_count // 0')
 
-  python3 - "$rho" "$rho_threshold" "$lens_count" "$family_count" "$gate_mode" "$family_json" <<'PY'
+  local _out _rc
+  _out=$(python3 - "$rho" "$rho_threshold" "$lens_count" "$family_count" "$gate_mode" "$family_json" <<'PY'
 import json, sys
 
 rho_s, rho_thr_s, lc_s, fc_s, mode, fam_json = sys.argv[1:7]
@@ -234,6 +239,22 @@ print(json.dumps({
 }))
 sys.exit(1)
 PY
+)
+  _rc=$?
+  printf '%s\n' "$_out"
+
+  local _verdict
+  _verdict=$(printf '%s' "$_out" | jq -r '.verdict // ""' 2>/dev/null)
+  if [ "$_verdict" = "COALITION_ABORT" ] && declare -f mo_grounded_rejection >/dev/null 2>&1; then
+    local _reason _rationale _remediation
+    _reason=$(printf '%s' "$_out" | jq -r '.reason // ""' 2>/dev/null)
+    _rationale=$(printf '%s' "$_out" | jq -r '.rationale // ""' 2>/dev/null)
+    _remediation=$(printf '%s' "$_out" | jq -r '.remediation // ""' 2>/dev/null)
+    [ -z "$_remediation" ] && _remediation="widen family diversity in config/agents.yaml, or accept lens reports without synthesis"
+    mo_grounded_rejection "coalition" "fail" "$_reason" "$_rationale" \
+      "$_remediation" '[]' "${panel_run_id:-}" >/dev/null 2>&1 || true
+  fi
+  return $_rc
 }
 
 # Self-test entry point. Constructs a fake state.db with two execution_traces
