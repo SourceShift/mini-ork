@@ -121,9 +121,25 @@ else
   _ok "--task-class code_fix flag processed without crash"
 fi
 
-# 7. --dry-run with empty DB: reports 0 traces, exits 0
+# 7. --lane resolves through agents.yaml and exports the gradient model in dry-run output
 echo ""
-echo "--- 7. Empty DB: 0 traces reported ---"
+echo "--- 7. --lane resolves through agents.yaml ---"
+mkdir -p "$MINI_ORK_HOME/config"
+cat > "$MINI_ORK_HOME/config/agents.yaml" <<'YAML'
+lanes:
+  reflector: sonnet
+  cheap_reflect: kimi
+YAML
+OUT=$(mini-ork-reflect --dry-run --lane cheap_reflect 2>&1 || true)
+if echo "$OUT" | grep -q "lane: cheap_reflect -> kimi"; then
+  _ok "--lane cheap_reflect resolves to kimi"
+else
+  _fail "--lane cheap_reflect did not resolve via agents.yaml (got: $OUT)"
+fi
+
+# 8. --dry-run with empty DB: reports 0 traces, exits 0
+echo ""
+echo "--- 8. Empty DB: 0 traces reported ---"
 OUT=$(mini-ork-reflect --dry-run 2>&1 || true)
 if echo "$OUT" | grep -qiE "0 trace|0 trace|dry.run.*0|analyz.*0"; then
   _ok "empty DB → 0 traces reported"

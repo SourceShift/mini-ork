@@ -153,6 +153,21 @@ else
   _fail "unknown flag → expected exit 2, got exit $EXITCODE"
 fi
 
+# 8. Per-node parallel batching must enforce the same cap as global parallel.
+echo ""
+echo "--- 8. Per-node parallel path uses max-parallel cap ---"
+if awk '
+  /case "\$\{node_dmode:-serial\}" in/ { in_serial=1 }
+  in_serial && /parallel\)/ { in_parallel=1 }
+  in_parallel && /_maybe_flush_batch_at_cap PIDS/ { found=1 }
+  in_parallel && /\( _dispatch_node/ { saw_spawn=1; exit }
+  END { exit !(found && saw_spawn) }
+' "$MINI_ORK_ROOT/bin/mini-ork-execute"; then
+  _ok "per-node parallel spawn is guarded by _maybe_flush_batch_at_cap"
+else
+  _fail "per-node parallel spawn is missing _maybe_flush_batch_at_cap"
+fi
+
 # === TESTS END ===
 
 echo ""
