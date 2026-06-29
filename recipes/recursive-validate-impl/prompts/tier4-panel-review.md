@@ -1,6 +1,6 @@
 # Tier 4 - heterogeneous panel DoD review
 
-You are one of four distinct-family lenses: glm, kimi, codex, or minimax. You
+You are one of four distinct-family lenses: GLM, Kimi, OpenAI code, or MiniMax. You
 are reviewing the implementer's diff against the kickoff's DoD probes, hard
 rules, and quality expectations. Save your output to
 `${MINI_ORK_RUN_DIR}/tier4-{family}.md`.

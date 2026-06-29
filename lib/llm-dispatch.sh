@@ -1123,6 +1123,26 @@ mo_llm_smoke() {
   return 1
 }
 
+_mo_llm_glm_fair_usage_retryable() {
+  local model="${1:-}" message="${2:-}" attempt="${3:-1}" max_attempts="${4:-1}"
+  [ "$model" = "glm" ] || return 1
+  [ "$attempt" -lt "$max_attempts" ] || return 1
+  printf '%s' "$message" | grep -Eiq '(^|[^0-9])(429|1313)([^0-9]|$)|fair usage policy|usage pattern does not comply' || return 1
+  return 0
+}
+
+_mo_llm_glm_backoff_seconds() {
+  local attempt="${1:-1}" max_sleep="${MO_GLM_RETRY_MAX_SLEEP_S:-45}" base_s="${MO_GLM_RETRY_BASE_S:-5}"
+  case "$max_sleep" in ''|*[!0-9]*) max_sleep=45 ;; esac
+  case "$base_s" in ''|*[!0-9]*) base_s=5 ;; esac
+  local base=$((2 ** (attempt - 1) * base_s))
+  local jitter=$((RANDOM % 4))
+  local delay=$((base + jitter))
+  [ "$delay" -gt "$max_sleep" ] && delay="$max_sleep"
+  [ "$delay" -lt 1 ] && delay=1
+  printf '%s\n' "$delay"
+}
+
 # When invoked directly: smoke-test all inspectors
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
   for m in opus sonnet kimi glm codex; do
@@ -1265,7 +1285,39 @@ PY
     _mo_llm_write_duration_ms 0
     return 127
   }
-  if mo_llm_dispatch "$model" "$prompt_text" "$out_file" "$_timeout_s" "$_max_turns" >/dev/null 2>"$_err_file"; then
+  local _dispatch_ok=0 _dispatch_rc=0 _attempt=1 _max_attempts=1
+  if [ "$model" = "glm" ]; then
+    _max_attempts="${MO_GLM_MAX_ATTEMPTS:-3}"
+    case "$_max_attempts" in ''|*[!0-9]*) _max_attempts=3 ;; esac
+    [ "$_max_attempts" -lt 1 ] && _max_attempts=1
+  fi
+  while :; do
+    : > "$_err_file" 2>/dev/null || true
+    rm -f "${out_file}.err.log" 2>/dev/null || true
+    if mo_llm_dispatch "$model" "$prompt_text" "$out_file" "$_timeout_s" "$_max_turns" >/dev/null 2>"$_err_file"; then
+      _dispatch_ok=1
+      break
+    fi
+    _dispatch_rc=$?
+    local _retry_probe=""
+    _retry_probe=$(
+      {
+        tail -c 1000 "$_err_file" 2>/dev/null || true
+        tail -c 1000 "${out_file}.err.log" 2>/dev/null || true
+        tail -c 1000 "$out_file" 2>/dev/null || true
+      } | tail -c 2000
+    )
+    if _mo_llm_glm_fair_usage_retryable "$model" "$_retry_probe" "$_attempt" "$_max_attempts"; then
+      local _sleep_s
+      _sleep_s=$(_mo_llm_glm_backoff_seconds "$_attempt")
+      echo "[llm_dispatch RETRY model=glm reason=fair_usage attempt=${_attempt}/${_max_attempts} sleep=${_sleep_s}s]" >&2
+      sleep "$_sleep_s"
+      _attempt=$((_attempt + 1))
+      continue
+    fi
+    break
+  done
+  if [ "$_dispatch_ok" -eq 1 ]; then
     _duration_end_ms=$(_mo_llm_now_ms) || {
       _mo_llm_write_duration_ms 0
       return 127
@@ -1431,7 +1483,7 @@ PY
     rm -f "$_err_file"
     return 0
   else
-    local rc=$?
+    local rc="$_dispatch_rc"
     export MO_LLM_LAST_RC="$rc"
     _mo_llm_write_duration_ms 0
     local _error_message=""
