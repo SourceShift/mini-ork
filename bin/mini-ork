@@ -165,6 +165,12 @@ except Exception:
     export MINI_ORK_HOME
     RUN_DIR="$MINI_ORK_HOME/runs/$MINI_ORK_RUN_ID"
     mkdir -p "$RUN_DIR"
+    # T1.0 per-run config isolation: freeze the effective lane policy into the
+    # run-dir at launch so a concurrent edit to the global agents.yaml (another
+    # run, or an operator) can't perturb this run's routing mid-flight.
+    # shellcheck source=lib/config_resolve.sh
+    source "$MINI_ORK_ROOT/lib/config_resolve.sh" 2>/dev/null \
+      && mo_snapshot_run_config "$RUN_DIR" || true
     MINI_ORK_PROFILE_PATH="$RUN_DIR/run_profile.json"
     export MINI_ORK_PROFILE_PATH
 
