@@ -2149,6 +2149,66 @@ _dispatch_node() {
         fi
         return 0
       fi
+      # R5b: opt-in minimal scaffold tier (MO_SCAFFOLD_TIER=minimal /
+      # MO_NODE_SCAFFOLD=minimal). Resolver defaults to harness when env is
+      # unset or unknown, so this branch is unreachable on the default path —
+      # the harness code below runs byte-identical to pre-R5b.
+      _mo_source "$MINI_ORK_ROOT/lib/scaffold_tier.sh"
+      local _scaffold_tier
+      _scaffold_tier="$(mo_scaffold_tier "$node_type" "${TASK_CLASS:-}")"
+      if [ "$_scaffold_tier" = "minimal" ]; then
+        IMPL_LOG="$RUN_DIR/impl-${node_id}.log"
+        [ -f "${PROMPT_FILE:-}" ] || PROMPT_FILE="$MINI_ORK_ROOT/prompts/implementer.md"
+        PLAN_CONTENT=$(cat "$PLAN_PATH")
+        local _prepend=""
+        if [ -f "${PROMPT_FILE:-}" ]; then
+          _prepend=$'\n\n--- Recipe prompt (system context) ---\n'"$(cat "$PROMPT_FILE")"$'\n--- /recipe prompt ---\n\n'
+        fi
+        PROMPT_CONTENT="${_prepend}Implement: ${node_desc}${_learned_block}\n\nPlan:\n${PLAN_CONTENT}"
+        export MO_NODE_ID="$node_id"
+        # Mirror the harness branch's MO_TARGET_CWD pin (kickoff_path's git
+        # toplevel → PWD fallback) so the minimal agent lands in the same
+        # edit surface the harness would.
+        local _kickoff_for_cwd=""
+        if [ -n "${MINI_ORK_RUN_DIR:-}" ] && [ -f "$MINI_ORK_RUN_DIR/run_profile.json" ]; then
+          _kickoff_for_cwd=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('kickoff_path',''))" "$MINI_ORK_RUN_DIR/run_profile.json" 2>/dev/null || true)
+        fi
+        if [ -n "$_kickoff_for_cwd" ] && [ -f "$_kickoff_for_cwd" ]; then
+          export MO_TARGET_CWD="$(cd "$(dirname "$_kickoff_for_cwd")" && git rev-parse --show-toplevel 2>/dev/null || pwd)"
+        else
+          export MO_TARGET_CWD="${MO_TARGET_CWD:-$PWD}"
+        fi
+        # Defensive: minimal.py reads MO_RUNTIME_BACKEND transitively via
+        # mo_runtime_exec. Subprocess already inherits env; the explicit
+        # export makes the contract obvious in the dispatch site.
+        export MO_RUNTIME_BACKEND="${MO_RUNTIME_BACKEND:-}"
+        export PYTHONPATH="$MINI_ORK_ROOT${PYTHONPATH:+:$PYTHONPATH}"
+        local _impl_rc=0
+        MINI_ORK_ROOT_VAL="$MINI_ORK_ROOT" PROMPT_VAL="$PROMPT_CONTENT" IMPL_LOG_VAL="$IMPL_LOG" CWD_VAL="$MO_TARGET_CWD" \
+          python3 - <<'PY' || _impl_rc=$?
+import os, sys
+sys.path.insert(0, os.environ["MINI_ORK_ROOT_VAL"])
+from mini_ork.agent.minimal import run_minimal
+task = os.environ["PROMPT_VAL"]
+impl_log = os.environ["IMPL_LOG_VAL"]
+cwd = os.environ["CWD_VAL"]
+result = run_minimal(task, cwd=cwd)
+with open(impl_log, "w", encoding="utf-8") as fh:
+    fh.write(result.final_output or "")
+print(f"minimal_agent status={result.exit_status} output_len={len(result.final_output or '')}")
+PY
+        _mo_stop_node_heartbeat_loop "$_heartbeat_pid"
+        if [ "$_impl_rc" -eq 0 ] && [ -s "$IMPL_LOG" ]; then
+          echo "  [ok] minimal scaffold implementer output → $IMPL_LOG"
+          MO_NODE_FINISH_REASON="done"
+          _trace_write_node_rich "$NODE_TRACE_ID" "success" "implementer" "$IMPL_LOG" "" "$MO_NODE_FINISH_REASON"
+          return 0
+        fi
+        MO_NODE_FINISH_REASON="error"
+        echo "  [err] minimal scaffold implementer failed (rc=$_impl_rc)" >&2
+        _trace_write_node_rich "$NODE_TRACE_ID" "failure" "implementer" "$IMPL_LOG" "" "$MO_NODE_FINISH_REASON"
+        return 1
+      fi
       _require_lib llm-dispatch
       [ -f "${PROMPT_FILE:-}" ] || PROMPT_FILE="$MINI_ORK_ROOT/prompts/implementer.md"
       IMPL_LOG="$RUN_DIR/impl-${node_id}.log"
