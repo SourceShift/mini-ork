@@ -22,6 +22,9 @@ WORKTREE="$WORK_PARENT/repo"
 : >"$CHANGED"
 exec 3>"$EVIDENCE"
 
+# shellcheck source=_verdict_merge.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_verdict_merge.sh"
+
 _check() {
   local id="$1" desc="$2" cond="$3"
   echo "[$id] $desc" >&3
@@ -74,9 +77,6 @@ _check "artifact-diff-exists" "framework-edit.diff exists" '[ -f "$DIFF" ]'
 _check "artifact-diff-non-empty" "framework-edit.diff is non-empty" '[ -s "$DIFF" ]'
 _check "artifact-diff-shape" "framework-edit.diff has unified-diff anchors" \
   'grep -qE "^(diff --git|--- |\+\+\+ |@@ )" "$DIFF"'
-_check "artifact-verdict-json-exists" "verdict.json exists" '[ -f "$RUN_DIR/verdict.json" ]'
-_check "artifact-verdict-json-parses" "verdict.json parses as JSON" \
-  'python3 -m json.tool "$RUN_DIR/verdict.json" >/dev/null'
 _check "evidence-log-written" "evidence log is writable" '[ -w "$EVIDENCE" ]'
 
 # Task-specific tier.
@@ -101,7 +101,11 @@ _check "typescript-typecheck-or-explicit-skip" "run typecheck when TS/TSX files 
 _check "high-blast-radius-guard" "high-blast-radius paths require explicit ALLOW_HIGH_BLAST_RADIUS token" \
   'if grep -qE "^(lib/circuit_breaker\.sh|lib/throttle-guard\.sh|\.mini-ork/config/)" "$CHANGED"; then grep -R -q -E "(^|[^A-Z0-9_])ALLOW_HIGH_BLAST_RADIUS([^A-Z0-9_]|$)" "$RUN_DIR/context-pack.json" "$RUN_DIR/kickoff.md" 2>/dev/null; else true; fi'
 
-python3 - "$NAME" "$EVIDENCE" "$CHECKS_TSV" "$CHANGED" <<'PY'
+# Build the changed-files list (static-check owns files_changed) and capture count.
+_changed_files
+files_changed_count="$(wc -l < "$CHANGED" | tr -d ' ')"
+
+VERIFIER_JSON="$(python3 - "$NAME" "$EVIDENCE" "$CHECKS_TSV" "$CHANGED" <<'PY'
 import json, sys
 name, evidence, tsv, changed_path = sys.argv[1:5]
 checks = []
@@ -125,5 +129,14 @@ print(json.dumps({
     "changed_files": changed,
 }))
 PY
+)"
 
+static_pass="$(printf '%s' "$VERIFIER_JSON" | python3 -c 'import json,sys; print("true" if json.load(sys.stdin)["pass"] else "false")')"
+write_verdict "$static_pass" "$files_changed_count"
+
+# Parse-check runs AFTER the write so the file we parse is the file we wrote.
+_check "artifact-verdict-json-parses" "verdict.json parses as JSON" \
+  'python3 -m json.tool "$RUN_DIR/verdict.json" >/dev/null'
+
+printf '%s' "$VERIFIER_JSON"
 exit 0

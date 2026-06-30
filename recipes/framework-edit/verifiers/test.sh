@@ -20,6 +20,9 @@ WORKTREE="$WORK_PARENT/repo"
 : >"$CHECKS_TSV"
 exec 3>"$EVIDENCE"
 
+# shellcheck source=_verdict_merge.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_verdict_merge.sh"
+
 _check() {
   local id="$1" desc="$2" cond="$3"
   echo "[$id] $desc" >&3
@@ -76,9 +79,6 @@ _check "artifact-diff-exists" "framework-edit.diff exists" '[ -f "$DIFF" ]'
 _check "artifact-diff-non-empty" "framework-edit.diff is non-empty" '[ -s "$DIFF" ]'
 _check "artifact-diff-shape" "framework-edit.diff has unified-diff anchors" \
   'grep -qE "^(diff --git|--- |\+\+\+ |@@ )" "$DIFF"'
-_check "artifact-verdict-json-exists" "verdict.json exists" '[ -f "$RUN_DIR/verdict.json" ]'
-_check "artifact-verdict-json-parses" "verdict.json parses as JSON" \
-  'python3 -m json.tool "$RUN_DIR/verdict.json" >/dev/null'
 _check "evidence-log-written" "evidence log is writable" '[ -w "$EVIDENCE" ]'
 
 # Task-specific tier.
@@ -102,7 +102,7 @@ else
   _check "web-smoke-tests-skipped" "tests/test_web_smoke.py absent in target repo; skipping web-smoke" 'true'
 fi
 
-python3 - "$NAME" "$EVIDENCE" "$CHECKS_TSV" <<'PY'
+VERIFIER_JSON="$(python3 - "$NAME" "$EVIDENCE" "$CHECKS_TSV" <<'PY'
 import json, sys
 name, evidence, tsv = sys.argv[1:4]
 checks = []
@@ -124,5 +124,17 @@ print(json.dumps({
     "artifact_ref": "$MINI_ORK_RUN_DIR/framework-edit.diff tests/test_web_smoke.py",
 }))
 PY
+)"
 
+tests_pass="$(printf '%s' "$VERIFIER_JSON" | python3 -c 'import json,sys; print("true" if json.load(sys.stdin)["pass"] else "false")')"
+# test.sh owns tests_pass only; static-check owns files_changed/static_pass.
+# Pass empty string for files_changed so the helper does not overwrite the
+# value static-check already wrote.
+write_verdict "" "" "$tests_pass"
+
+# Parse-check runs AFTER the write so the file we parse is the file we wrote.
+_check "artifact-verdict-json-parses" "verdict.json parses as JSON" \
+  'python3 -m json.tool "$RUN_DIR/verdict.json" >/dev/null'
+
+printf '%s' "$VERIFIER_JSON"
 exit 0
