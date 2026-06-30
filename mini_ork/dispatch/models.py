@@ -33,6 +33,11 @@ class DispatchRequest:
     max_turns: int = 60
     # Extra environment for the provider process. The prompt is NEVER put here.
     env: dict[str, str] = field(default_factory=dict)
+    # Working directory for the provider process. None = inherit the caller's
+    # cwd. The cwd guard (providers.cwd_guard) refuses a dispatch whose cwd lands
+    # inside the mini-ork framework tree — that is the cwd-confusion that lets a
+    # target-repo lane's git ops corrupt the framework repo.
+    cwd: str | None = None
 
 
 @dataclass
