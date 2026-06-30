@@ -13,6 +13,54 @@ No unreleased changes yet.
 
 ---
 
+## [0.6.0] - 2026-06-30
+
+**Live control plane, parallel-run safety, and the start of the Python
+migration.** Adds an HTTP control plane for detached/steerable runs, makes
+concurrent runs safe by isolating per-run config, and lands the first coexisting
+slices of the Bash→Python dispatch migration (ADR-001). All additive — no
+breaking changes.
+
+### Added
+
+- **Live control plane** — detached run-launch (`POST /api/v1/runs`), HTTP
+  operator-steering (`POST /api/v1/task-runs/{id}/steer`), and a HITL steering
+  checkpoint (`plan_status=needs_steering`, pause/resume).
+- **Per-run config isolation (T1.0)** — a run snapshots its effective lane
+  policy (`config/agents.yaml`) into its run-dir at launch via
+  `lib/config_resolve.sh`, and the dispatch resolvers read run-dir-first. Editing
+  the global `agents.yaml` no longer perturbs an in-flight run; concurrent runs
+  hold independent frozen policies. **Parallel runs are now safe.**
+- **`mini_ork.dispatch`** — Phase-0 Python dispatch layer (coexists with the
+  bash path; nothing wired live yet): a typed dispatch core (prompt delivered
+  over stdin → no `ARG_MAX`/E2BIG, faithful exit codes), an all-lane provider
+  registry (codex via wrapper sidecars; claude-family via wrapper env reuse),
+  `llm_calls` telemetry persistence, and a `python3 -m mini_ork.dispatch <model>`
+  CLI entrypoint.
+- **`lib/providers/cl_codex.sh` stdin prompt mode** — reads the prompt from stdin
+  when none is on argv (E2BIG-proof caller-to-codex); argv still wins.
+- **Docs** — Rivet-parity roadmap and ADR-001 (Bash→Python migration) under
+  `docs/_meta/`.
+
+### Fixed
+
+- **codex lane E2BIG** — `cl_codex.sh` passed the codex output stream through the
+  environment, exceeding `ARG_MAX` and killing every codex dispatch; the stream
+  is now passed by file path.
+- **Post-commit watchdog** now restores the branch ref when a racing process
+  clobbers `HEAD` onto an unrelated commit, not just reverted working-tree files.
+- **Planner no longer dead-ends** on `profile_status=needs_answers` with zero
+  questions (`lib/profile_gate.sh`) — a self-sufficient planner dispatches
+  instead of blocking on answers that cannot exist. The confidence-floor gate is
+  unchanged.
+- **bug-audit planner** emits structured JSON rather than markdown.
+
+### Changed
+
+- UI dev-dependencies: `vite` 5 → 8, `@types/node` 20 → 25.
+
+---
+
 ## [0.4.1] - 2026-06-26
 
 **Verifier infra hardening patch.** Fixes infrastructure false-negatives in
