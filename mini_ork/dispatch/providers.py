@@ -153,6 +153,24 @@ class ProviderSpec:
     env: Mapping[str, str] = field(default_factory=dict)
 
 
+# Provider family recorded in llm_calls.provider, per built-in lane.
+_PROVIDER_FAMILY = {
+    "opus": "anthropic",
+    "sonnet": "anthropic",
+    "codex": "openai",
+    "gemini": "google",
+    "glm": "zai",
+    "kimi": "moonshot",
+    "minimax": "minimax",
+    "deepseek": "deepseek",
+}
+
+
+def provider_for_model(model: str) -> str:
+    """Telemetry provider family for a lane (falls back to the lane name)."""
+    return _PROVIDER_FAMILY.get(model, model)
+
+
 def mini_ork_root(root: str | os.PathLike[str] | None = None) -> Path:
     """Repo root: explicit arg → $MINI_ORK_ROOT → package parent."""
     if root is not None:
@@ -179,9 +197,10 @@ def resolve_provider(
 
     if model in EXECUTABLE_MODELS:
         # Run the wrapper as a command; prompt arrives over stdin (core.dispatch).
+        # stdout is the CLEANED assistant text — cl_codex.sh redirects the codex
+        # JSONL to a stream file and writes usage/cost to MO_*_FILE sidecars, so
+        # there are no stdout parsers here; dispatch_model reads the sidecars.
         command: tuple[str, ...] = (str(wrapper), "--print", "--output-format", "text")
-        if model == "codex":
-            return ProviderSpec(model, command, parse_codex_usage, codex_cost)
         return ProviderSpec(model, command)
 
     # Claude family: env-pin from the wrapper, then run claude with JSON output.
@@ -217,6 +236,8 @@ def dispatch_model(
             env=merged_env,
         )
     )
+    if request.model == "codex":
+        return _dispatch_codex_via_wrapper(effective, spec)
     return dispatch(
         effective,
         spec.command,
@@ -224,6 +245,62 @@ def dispatch_model(
         parse_cost=spec.parse_cost,  # type: ignore[arg-type]
         parse_text=spec.parse_text,  # type: ignore[arg-type]
     )
+
+
+def _read_codex_sidecars(usage_path: str, cost_path: str) -> tuple[TokenUsage, float]:
+    """Read cl_codex.sh's sidecars: MO_USAGE_FILE is a TSV ``in<TAB>out`` line;
+    MO_COST_FILE is a single float. Missing/garbled → zeros."""
+    in_tok = out_tok = 0
+    cost = 0.0
+    try:
+        with open(usage_path, encoding="utf-8") as fh:
+            parts = fh.read().strip().split("\t")
+            if len(parts) >= 2:
+                in_tok, out_tok = int(parts[0] or 0), int(parts[1] or 0)
+    except (OSError, ValueError):
+        pass
+    try:
+        with open(cost_path, encoding="utf-8") as fh:
+            cost = float(fh.read().strip() or 0.0)
+    except (OSError, ValueError):
+        pass
+    return TokenUsage(input_tokens=in_tok, output_tokens=out_tok), cost
+
+
+def _dispatch_codex_via_wrapper(
+    request: DispatchRequest, spec: ProviderSpec
+) -> DispatchResult:
+    """codex telemetry lives in sidecar files the wrapper writes (stdout is the
+    cleaned text). Point MO_USAGE_FILE/MO_COST_FILE at temp files, dispatch, then
+    fold the sidecar usage/cost into the result. MO_USAGE_FILE MUST end in
+    ``.tokens`` — cl_codex.sh derives its stream-file path from it."""
+    import tempfile
+
+    fd_u, usage_path = tempfile.mkstemp(suffix=".tokens")
+    os.close(fd_u)
+    fd_c, cost_path = tempfile.mkstemp(suffix=".cost")
+    os.close(fd_c)
+    try:
+        env = {**request.env, "MO_USAGE_FILE": usage_path, "MO_COST_FILE": cost_path}
+        req = DispatchRequest(
+            model=request.model,
+            prompt=request.prompt,
+            timeout_s=request.timeout_s,
+            max_turns=request.max_turns,
+            env=env,
+        )
+        result = dispatch(req, spec.command)
+        if result.ok:
+            usage, cost = _read_codex_sidecars(usage_path, cost_path)
+            result.usage = usage
+            result.cost_usd = cost
+        return result
+    finally:
+        for path in (usage_path, cost_path, f"{usage_path[:-7]}.stream.jsonl"):
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
 
 
 def dispatch_with_command(
