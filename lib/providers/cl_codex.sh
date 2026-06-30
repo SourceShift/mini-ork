@@ -55,8 +55,17 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+# Stdin prompt mode (Phase-0 wiring): when no positional prompt was given and
+# stdin is a pipe/file (not a tty), read the prompt from stdin. This lets the
+# Python dispatch layer (mini_ork.dispatch) drive the wrapper without ever
+# putting the prompt on argv — E2BIG-proof from the caller all the way in.
+# Backward-compatible: existing argv callers are unaffected.
+if [ -z "$PROMPT" ] && [ ! -t 0 ]; then
+  PROMPT="$(cat)"
+fi
+
 if [ -z "$PROMPT" ]; then
-  echo "[cl_codex] no prompt provided" >&2
+  echo "[cl_codex] no prompt provided (positional arg or stdin)" >&2
   exit 2
 fi
 
