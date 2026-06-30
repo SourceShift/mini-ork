@@ -29,6 +29,7 @@ from .models import DispatchRequest, DispatchResult, TokenUsage
 # with a stub provider.
 UsageParser = Callable[[str], TokenUsage]
 CostParser = Callable[[str, TokenUsage], float]
+TextParser = Callable[[str], str]
 
 
 def dispatch(
@@ -37,6 +38,7 @@ def dispatch(
     *,
     parse_usage: UsageParser | None = None,
     parse_cost: CostParser | None = None,
+    parse_text: TextParser | None = None,
 ) -> DispatchResult:
     """Run ``command`` (an argv list — no shell), feeding ``request.prompt`` on
     stdin, and return a :class:`DispatchResult`.
@@ -92,10 +94,13 @@ def dispatch(
 
     usage = parse_usage(stdout) if parse_usage else TokenUsage()
     cost = parse_cost(stdout, usage) if parse_cost else 0.0
+    # parse_text extracts the assistant body from a structured envelope (e.g.
+    # claude --output-format json puts it in .result); default is raw stdout.
+    text = parse_text(stdout) if parse_text else stdout
     return DispatchResult(
         ok=True,
         rc=0,
-        text=stdout,
+        text=text,
         model=request.model,
         usage=usage,
         cost_usd=cost,

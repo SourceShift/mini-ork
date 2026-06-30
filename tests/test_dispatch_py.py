@@ -7,6 +7,7 @@ faithful port of cl_codex.sh.
 
 from __future__ import annotations
 
+import json
 import sys
 
 import pytest
@@ -14,9 +15,13 @@ import pytest
 from mini_ork.dispatch import (
     DispatchRequest,
     TokenUsage,
+    claude_cost,
+    claude_env_for,
+    claude_result_text,
     codex_cost,
     dispatch_model,
     dispatch_with_command,
+    parse_claude_usage,
     parse_codex_usage,
     resolve_provider,
 )
@@ -122,3 +127,72 @@ def test_resolve_known_lane_points_at_wrapper():
     spec = resolve_provider("codex")
     assert spec.command[0].endswith("lib/providers/cl_codex.sh")
     assert spec.parse_usage is parse_codex_usage
+
+
+# ── claude-family lanes ─────────────────────────────────────────────────────
+
+_CLAUDE_ENVELOPE = json.dumps(
+    {
+        "result": "the answer is 42",
+        "total_cost_usd": 0.0123,
+        "usage": {
+            "input_tokens": 800,
+            "output_tokens": 120,
+            "cache_read_input_tokens": 200,
+            "cache_creation_input_tokens": 50,
+        },
+    }
+)
+
+
+def test_claude_result_text_extracts_result_field():
+    assert claude_result_text(_CLAUDE_ENVELOPE) == "the answer is 42"
+
+
+def test_claude_usage_and_cost_from_envelope():
+    u = parse_claude_usage(_CLAUDE_ENVELOPE)
+    assert u.input_tokens == 800
+    assert u.output_tokens == 120
+    assert u.cached_input_tokens == 200
+    assert u.cache_creation_tokens == 50
+    # claude reports real billed cost — trust the envelope, don't estimate
+    assert claude_cost(_CLAUDE_ENVELOPE, u) == pytest.approx(0.0123)
+
+
+def test_dispatch_through_a_claude_style_stub():
+    emit = "import sys; sys.stdout.write(sys.stdin.read())"  # echo the envelope
+    cmd = [PY, "-c", emit]
+    res = dispatch_with_command(
+        _req(_CLAUDE_ENVELOPE),
+        cmd,
+        parse_text=claude_result_text,
+        parse_usage=parse_claude_usage,
+        parse_cost=claude_cost,
+    )
+    assert res.ok is True
+    assert res.text == "the answer is 42"  # body is .result, not the raw JSON
+    assert res.usage.output_tokens == 120
+    assert res.cost_usd == pytest.approx(0.0123)
+
+
+def test_claude_env_for_reuses_wrapper_as_source_of_truth(monkeypatch):
+    # With the lane's API key present, sourcing cl_glm.sh yields the z.ai pins.
+    monkeypatch.setenv("GLM_API_KEY", "dummy-key-for-test")
+    env = claude_env_for("glm")
+    assert env.get("ANTHROPIC_BASE_URL") == "https://api.z.ai/api/anthropic"
+    assert env.get("ANTHROPIC_MODEL") == "GLM-5.1"
+
+
+def test_claude_env_for_empty_without_key(monkeypatch):
+    # Missing key → the wrapper's `${GLM_API_KEY:?}` guard aborts the source
+    # before any export, so we get nothing rather than a half-pinned env.
+    monkeypatch.delenv("GLM_API_KEY", raising=False)
+    env = claude_env_for("glm")
+    assert "ANTHROPIC_AUTH_TOKEN" not in env
+
+
+def test_resolve_claude_lane_uses_claude_command():
+    spec = resolve_provider("glm")
+    assert spec.command[0] == "claude"
+    assert spec.parse_text is claude_result_text
+    assert spec.parse_usage is parse_claude_usage
