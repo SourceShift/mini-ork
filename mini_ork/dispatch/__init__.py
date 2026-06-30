@@ -13,6 +13,7 @@ from .models import DispatchRequest, DispatchResult, TokenUsage
 from .providers import (
     EXECUTABLE_MODELS,
     KNOWN_MODELS,
+    LaneHealth,
     ProviderSpec,
     claude_cost,
     claude_env_for,
@@ -20,8 +21,11 @@ from .providers import (
     codex_cost,
     dispatch_model,
     dispatch_with_command,
+    lane_health,
     parse_claude_usage,
     parse_codex_usage,
+    preflight,
+    provider_for_model,
     resolve_provider,
 )
 from .telemetry import cache_aware_cost, persist_call
@@ -45,4 +49,8 @@ __all__ = [
     "EXECUTABLE_MODELS",
     "persist_call",
     "cache_aware_cost",
+    "lane_health",
+    "preflight",
+    "LaneHealth",
+    "provider_for_model",
 ]
