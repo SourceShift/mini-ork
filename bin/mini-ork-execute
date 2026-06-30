@@ -31,6 +31,11 @@ set -Eeuo pipefail
 MINI_ORK_ROOT="${MINI_ORK_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 export MINI_ORK_ROOT
 
+# R0a runtime seam (mo_runtime_exec and forwarders). Sourced defensively so a
+# fresh checkout without lib/runtime/ still runs; the factory defaults to the
+# 'local' backend when MO_RUNTIME_BACKEND is unset (preserves pre-R0a behavior).
+[ -f "$MINI_ORK_ROOT/lib/runtime/contract.sh" ] && . "$MINI_ORK_ROOT/lib/runtime/contract.sh" || true
+
 # ── lib guards ────────────────────────────────────────────────────────────────
 _require_lib() {
   local lib="$MINI_ORK_ROOT/lib/${1}.sh"
@@ -111,8 +116,9 @@ except Exception:
     *e*) _errexit_set=1; set +e ;;
   esac
   echo "[verifier-cwd] $(basename "$_script") → $_verify_cwd" >&2
-  ( cd "$_verify_cwd" && MINI_ORK_PLAN_PATH="$PLAN_PATH" ARTIFACT_PATH="$ARTIFACT_PATH" \
-    bash "$_script" ) > "$_evidence" 2>&1
+  mo_runtime_exec "bash '$_script'" "$_verify_cwd" 0 \
+    MINI_ORK_PLAN_PATH="$PLAN_PATH" ARTIFACT_PATH="$ARTIFACT_PATH" \
+    > "$_evidence" 2>&1
   _exit=$?
 
   # Minimum-evidence assertion: exit 0 with an empty evidence file is a
