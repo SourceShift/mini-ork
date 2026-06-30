@@ -789,6 +789,13 @@ trap 'exit 130' INT
 # on filesystem scan, breaking the recipe's expected artifact layout.
 export MINI_ORK_RUN_DIR="$RUN_DIR"
 
+# T1.0 per-run config isolation: ensure the effective lane policy is frozen into
+# the run-dir (idempotent — `bin/mini-ork run` already did this for orchestrated
+# runs; this covers direct-execute entry, e.g. the HTTP control-plane launch).
+# shellcheck source=lib/config_resolve.sh
+source "$MINI_ORK_ROOT/lib/config_resolve.sh" 2>/dev/null \
+  && mo_snapshot_run_config "$RUN_DIR" || true
+
 # ContextNest prefetch dir — populated by hooks/subagent-prefetch.sh on
 # every worker's first UserPromptSubmit when MINI_ORK_RUN_ID is set. The
 # hook writes <session_id>.md per spawned subagent. Prompt templates can
