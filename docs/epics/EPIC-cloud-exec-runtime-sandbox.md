@@ -20,6 +20,41 @@ makes the seam real.
 
 ---
 
+## Delivery-safety constraints (MUST NOT slow/block researcher or any consumer)
+
+Derived from real usage in the **researcher** consumer (`…/researcher/.mini-ork/state.db`):
+264 runs / 20 days, **~29 concurrent**, dominated by code-fix (80), framework-edit (44),
+epic-runner (33); runs up to 137 min; host is **macOS**; runs span many git worktrees under
+`…/Development/worktrees/dsp-*`. Researcher's delivery velocity depends on these. Therefore:
+
+1. **Default is `local`, zero added overhead.** `MO_RUNTIME_BACKEND` unset ⇒ byte-for-byte
+   current behavior. No container/microVM boot, no extra fork, no new latency on the hot path.
+   The 264-run cadence must be unaffected until a consumer explicitly opts in.
+2. **No new hard dependency; degrade, never fail.** bubblewrap is Linux-only and the researcher
+   host is macOS — a missing `bwrap`/`docker` must **auto-fall-back to `local` with a WARN**, never
+   abort a run. (Mirror the existing `lib/sandbox/{modal,daytona}.sh` fall-back-to-local pattern.)
+3. **Opt-in per run/recipe, not a global flip.** Trusted in-repo delivery (researcher's bread and
+   butter) stays `local`; isolation is requested only for untrusted/cloud work. Never change the
+   repo-wide default as part of this epic.
+4. **Concurrency-safe, no new global lock.** ~29 parallel runs must not serialize. The seam uses
+   per-run workspace dirs only (respect v0.6.0 per-run config isolation `lib/config_resolve.sh`);
+   no shared mutable state, no global semaphore introduced by the runtime layer.
+5. **Behavior-preserving refactor (R0b).** Routing the executor through the seam must not change
+   verifier/reviewer/publisher semantics — existing recipe smoke + `pytest` stay green. Land R0b
+   only behind the default-`local` path so a sync into researcher is a no-op until opted in.
+6. **Safe to sync.** Everything additive + default-off so updating researcher's vendored
+   `.mini-ork/` (its `mini-ork update` path) carries the runtime layer with **no behavior change**.
+7. **Bonus velocity win, ship first:** the I-5 (verdict.json) + I-7 (test-gate) fixes already on
+   source main directly cut researcher's current failure rate (last 24h: framework-edit 10 +
+   code-fix 8 + epic-runner 5 failed). Syncing those into researcher's `.mini-ork/` is the
+   fastest delivery-speed improvement and is independent of this epic.
+
+**Net:** the runtime/sandbox layer is an *opt-in capability*, not a *mandatory gate*. It can only
+make researcher faster (isolation prevents the cross-repo clobber that corrupts runs) and never
+slower, because the default path is unchanged.
+
+---
+
 ## Phase R0a — the exec seam + local backend (FIRST PIECE, additive, no behavior change)
 **Deliverables**
 - `lib/runtime/contract.sh` — defines + dispatches the runtime interface:
