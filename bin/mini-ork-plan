@@ -276,6 +276,21 @@ PY
   confidence=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("confidence",0))' "$_profile_meta")
   human_questions_json=$(python3 -c 'import json,sys; print(json.dumps(json.loads(sys.argv[1]).get("human_questions",[])))' "$_profile_meta")
 fi
+# Normalize the "needs_answers with ZERO questions" contradiction: the planner
+# asked nothing (it had everything), so there is nothing to answer and blocking
+# on missing answers is unsatisfiable. Treat as ready (the confidence-floor gate
+# below still applies independently). See lib/profile_gate.sh.
+if [ "$profile_status" = "needs_answers" ] && [ -n "${MINI_ORK_PROFILE_PATH:-}" ]; then
+  # shellcheck source=lib/profile_gate.sh
+  if source "$MINI_ORK_ROOT/lib/profile_gate.sh" 2>/dev/null; then
+    _normalized=$(mo_profile_normalize_zero_questions "$MINI_ORK_PROFILE_PATH")
+    if [ "$_normalized" = "ready" ]; then
+      profile_status="ready"
+      human_questions_json="[]"
+      echo "  [ok] profile flagged needs_answers with 0 questions — nothing to answer; treating as ready" >&2
+    fi
+  fi
+fi
 # Clean up inline tmpfile if we created it
 [ -n "${_PLANNER_TMPFILE:-}" ] && rm -f "$_PLANNER_TMPFILE"
 
