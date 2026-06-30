@@ -53,9 +53,11 @@ fi
 
 # Read git's stdin to find out which refs are being pushed.
 target_main=0
+target_tag=0
 while read -r local_ref local_sha remote_ref remote_sha; do
   case "$remote_ref" in
     refs/heads/main|refs/heads/master) target_main=1 ;;
+    refs/tags/*) target_tag=1 ;;
   esac
 done
 
@@ -64,10 +66,22 @@ echo "pre-push: running Layer 1 (mechanical claim-check)…"
 bash "$REPO_ROOT/scripts/readme-claim-check.sh"
 L1_RC=$?
 if [ $L1_RC -ne 0 ]; then
-  echo
-  echo "✗ pre-push: Layer 1 found mechanical drift — push BLOCKED."
-  echo "  Fix README or pass MO_README_DRIFT_SKIP=1 (or --no-verify) to bypass."
-  exit 1
+  # Release tags are immutable snapshots — README drift must never block a
+  # tag push. Downgrade to advisory on tag pushes; hard-block on every other
+  # ref (including refs/heads/main). Escape hatches (MO_README_DRIFT_SKIP /
+  # --no-verify) remain the user's path when a hard-block is undesired on
+  # feature branches.
+  if [ "$target_tag" -eq 1 ]; then
+    echo
+    echo "⚠ pre-push: Layer 1 found mechanical drift on tag push — advisory — tag push proceeds."
+    echo "  Fix README or pass MO_README_DRIFT_SKIP=1 (or --no-verify) to bypass in the future."
+    echo "  Falling through to Layer 3 / Layer 2 (whichever applies)."
+  else
+    echo
+    echo "✗ pre-push: Layer 1 found mechanical drift — push BLOCKED."
+    echo "  Fix README or pass MO_README_DRIFT_SKIP=1 (or --no-verify) to bypass."
+    exit 1
+  fi
 fi
 echo "✓ Layer 1 clean."
 
