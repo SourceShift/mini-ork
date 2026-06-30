@@ -23,6 +23,13 @@
 #   mo_runtime_alive
 #     Print "1" if the session is up, "0" otherwise. Exit code is the same.
 #
+# Available backends (auto-discovered by filename in mo_runtime_load_backend):
+#   local       — default; same-host execution with pgid-kill timeout semantics
+#   bubblewrap  — opt-in (R2); filesystem-isolates writes to $WORKSPACE; falls
+#                 back to local with a WARN when bwrap is missing or the host
+#                 is not Linux. See lib/runtime/bubblewrap.sh for the isolation
+#                 contract.
+#
 # Activation: the factory below runs at source-time. There is no opt-out.
 
 # Locate this lib's directory even when sourced through a symlink/path munging.
