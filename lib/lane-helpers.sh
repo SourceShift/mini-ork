@@ -7,6 +7,10 @@ set -uo pipefail
 
 MINI_ORK_ROOT="${MINI_ORK_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 
+# Per-run config isolation: run-dir-first agents.yaml resolution (T1.0).
+# shellcheck disable=SC1091
+. "${MINI_ORK_ROOT}/lib/config_resolve.sh"
+
 # Returns 0 (true) if the lane is a "free" gateway lane the operator has a
 # coding plan for — these lanes ignore the --max-budget-usd cap because there
 # is no marginal cost. Returns 1 (false) otherwise.
@@ -106,8 +110,7 @@ mo_assert_lane_capability() {
     return 1
   }
 
-  local agents_yaml="${MINI_ORK_HOME:-.mini-ork}/config/agents.yaml"
-  [ -f "$agents_yaml" ] || agents_yaml="$MINI_ORK_ROOT/config/agents.yaml"
+  local agents_yaml; agents_yaml="$(mo_resolve_agents_yaml)"  # run-dir-first (T1.0)
   [ -f "$agents_yaml" ] || {
     echo "capabilities" >&2
     return 1
