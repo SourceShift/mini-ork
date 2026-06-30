@@ -11,11 +11,16 @@ from __future__ import annotations
 from .core import dispatch
 from .models import DispatchRequest, DispatchResult, TokenUsage
 from .providers import (
+    EXECUTABLE_MODELS,
     KNOWN_MODELS,
     ProviderSpec,
+    claude_cost,
+    claude_env_for,
+    claude_result_text,
     codex_cost,
     dispatch_model,
     dispatch_with_command,
+    parse_claude_usage,
     parse_codex_usage,
     resolve_provider,
 )
@@ -31,5 +36,10 @@ __all__ = [
     "resolve_provider",
     "parse_codex_usage",
     "codex_cost",
+    "parse_claude_usage",
+    "claude_cost",
+    "claude_result_text",
+    "claude_env_for",
     "KNOWN_MODELS",
+    "EXECUTABLE_MODELS",
 ]

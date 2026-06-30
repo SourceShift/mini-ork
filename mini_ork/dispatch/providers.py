@@ -12,15 +12,19 @@ from __future__ import annotations
 
 import json
 import os
-from collections.abc import Sequence
-from dataclasses import dataclass
+import shlex
+import subprocess
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from .core import dispatch
 from .models import DispatchRequest, DispatchResult, TokenUsage
 
-# Lanes mini-ork knows about. codex/gemini are executable wrappers; the rest are
-# Anthropic-compatible (claude CLI behind an env-pinned gateway).
+# Lanes mini-ork knows about. codex/gemini are EXECUTABLE wrappers (run the
+# cl_*.sh as a command); the rest are the CLAUDE family (source the cl_*.sh to
+# pin ANTHROPIC_* env, then run `claude --print --output-format json`).
+EXECUTABLE_MODELS = frozenset({"codex", "gemini"})
 KNOWN_MODELS = frozenset(
     {"opus", "sonnet", "kimi", "glm", "minimax", "codex", "gemini", "deepseek"}
 )
@@ -68,6 +72,75 @@ def codex_cost(_stdout: str, usage: TokenUsage) -> float:
     ) / 1e6
 
 
+# ── claude family (anthropic-compatible lanes) ──────────────────────────────
+# `claude --print --output-format json` emits {"result", "total_cost_usd",
+# "usage": {...}}. The body is .result (NOT raw stdout), cost is reported
+# directly, and usage carries the cache-aware token split.
+
+
+def _claude_envelope(stdout: str) -> dict:
+    try:
+        obj = json.loads(stdout)
+        return obj if isinstance(obj, dict) else {}
+    except (ValueError, TypeError):
+        return {}
+
+
+def claude_result_text(stdout: str) -> str:
+    """Extract the assistant body from claude's JSON envelope (.result)."""
+    env = _claude_envelope(stdout)
+    return str(env.get("result") or "") if env else stdout
+
+
+def parse_claude_usage(stdout: str) -> TokenUsage:
+    u = (_claude_envelope(stdout).get("usage")) or {}
+    return TokenUsage(
+        input_tokens=int(u.get("input_tokens") or 0),
+        output_tokens=int(u.get("output_tokens") or 0),
+        cached_input_tokens=int(u.get("cache_read_input_tokens") or 0),
+        cache_creation_tokens=int(u.get("cache_creation_input_tokens") or 0),
+    )
+
+
+def claude_cost(stdout: str, _usage: TokenUsage) -> float:
+    """Claude reports real billed cost in the envelope — trust it over an
+    estimate."""
+    try:
+        return float(_claude_envelope(stdout).get("total_cost_usd") or 0.0)
+    except (ValueError, TypeError):
+        return 0.0
+
+
+def claude_env_for(
+    model: str, root: str | os.PathLike[str] | None = None
+) -> dict[str, str]:
+    """Capture the ANTHROPIC_*/CLAUDE_* env a claude-family wrapper exports, by
+    sourcing it in a subshell. This reuses the committed cl_*.sh as the single
+    source of truth for each lane's base_url/model/key-env — no duplication in
+    Python. Returns {} if the wrapper's required API key env var is unset (its
+    `${KEY:?}` guard aborts the source before any export runs)."""
+    wrapper = mini_ork_root(root) / "lib" / "providers" / f"cl_{model}.sh"
+    if not wrapper.is_file():
+        raise FileNotFoundError(f"provider wrapper not found: {wrapper}")
+    proc = subprocess.run(
+        [
+            "bash",
+            "-c",
+            f"source {shlex.quote(str(wrapper))} >/dev/null 2>&1; "
+            'env | grep -E "^(ANTHROPIC_|CLAUDE_CODE_)" || true',
+        ],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    env: dict[str, str] = {}
+    for line in proc.stdout.splitlines():
+        if "=" in line:
+            key, _, value = line.partition("=")
+            env[key] = value
+    return env
+
+
 @dataclass(frozen=True)
 class ProviderSpec:
     """How to run one model lane and read its telemetry."""
@@ -76,6 +149,8 @@ class ProviderSpec:
     command: tuple[str, ...]
     parse_usage: object | None = None  # UsageParser | None
     parse_cost: object | None = None  # CostParser | None
+    parse_text: object | None = None  # TextParser | None
+    env: Mapping[str, str] = field(default_factory=dict)
 
 
 def mini_ork_root(root: str | os.PathLike[str] | None = None) -> Path:
@@ -101,10 +176,23 @@ def resolve_provider(
     wrapper = mini_ork_root(root) / "lib" / "providers" / f"cl_{model}.sh"
     if not wrapper.is_file():
         raise FileNotFoundError(f"provider wrapper not found: {wrapper}")
-    command: tuple[str, ...] = (str(wrapper), "--print", "--output-format", "text")
-    if model == "codex":
-        return ProviderSpec(model, command, parse_codex_usage, codex_cost)
-    return ProviderSpec(model, command)
+
+    if model in EXECUTABLE_MODELS:
+        # Run the wrapper as a command; prompt arrives over stdin (core.dispatch).
+        command: tuple[str, ...] = (str(wrapper), "--print", "--output-format", "text")
+        if model == "codex":
+            return ProviderSpec(model, command, parse_codex_usage, codex_cost)
+        return ProviderSpec(model, command)
+
+    # Claude family: env-pin from the wrapper, then run claude with JSON output.
+    return ProviderSpec(
+        model=model,
+        command=("claude", "--print", "--output-format", "json"),
+        parse_usage=parse_claude_usage,
+        parse_cost=claude_cost,
+        parse_text=claude_result_text,
+        env=claude_env_for(model, root),
+    )
 
 
 def dispatch_model(
@@ -116,11 +204,25 @@ def dispatch_model(
         spec = resolve_provider(request.model, root)
     except (ValueError, FileNotFoundError) as exc:
         return DispatchResult(ok=False, rc=2, error=str(exc), model=request.model)
+    # Merge the lane's pinned env UNDER any per-request overrides.
+    merged_env = {**dict(spec.env), **request.env}
+    effective = (
+        request
+        if merged_env == request.env
+        else DispatchRequest(
+            model=request.model,
+            prompt=request.prompt,
+            timeout_s=request.timeout_s,
+            max_turns=request.max_turns,
+            env=merged_env,
+        )
+    )
     return dispatch(
-        request,
+        effective,
         spec.command,
         parse_usage=spec.parse_usage,  # type: ignore[arg-type]
         parse_cost=spec.parse_cost,  # type: ignore[arg-type]
+        parse_text=spec.parse_text,  # type: ignore[arg-type]
     )
 
 
@@ -130,6 +232,13 @@ def dispatch_with_command(
     *,
     parse_usage: object | None = None,
     parse_cost: object | None = None,
+    parse_text: object | None = None,
 ) -> DispatchResult:
     """Escape hatch for tests / custom commands: dispatch an explicit argv."""
-    return dispatch(request, command, parse_usage=parse_usage, parse_cost=parse_cost)  # type: ignore[arg-type]
+    return dispatch(
+        request,
+        command,
+        parse_usage=parse_usage,  # type: ignore[arg-type]
+        parse_cost=parse_cost,  # type: ignore[arg-type]
+        parse_text=parse_text,  # type: ignore[arg-type]
+    )
