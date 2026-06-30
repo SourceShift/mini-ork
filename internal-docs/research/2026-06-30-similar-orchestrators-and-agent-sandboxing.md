@@ -127,6 +127,44 @@ single change that unlocks cloud execution *and* fixes A1.
 
 ---
 
+## B.1 mini-SWE-agent — the minimalist sibling, and the cheapest path to A1
+
+`SWE-agent/mini-swe-agent` (Princeton/Stanford SWE-bench team; used by Meta, NVIDIA,
+IBM, Anyscale; **>74% SWE-bench verified in ~100 lines, bash-only**) is the most
+directly relevant repo to mini-ork — and it has already solved A1 by *design*, not by
+adding infrastructure. Three properties make sandboxing/cloud trivial:
+
+1. **Every action is an independent, stateless `subprocess.run`** — NOT a persistent
+   shell session. Their own words: *"this is a big deal for stability… it makes it
+   trivial to execute actions in sandboxes — literally just switch out `subprocess.run`
+   with `docker exec` — and to scale up effortlessly."*
+   → **This is the crux of A1.** mini-ork's executor keeps stateful shell context and
+   `cd`s the host, so it can't be swapped to a sandbox backend. If actions were
+   stateless + routed through a single exec function, swapping local→`docker exec`→
+   microVM would be a one-line backend change (== R1, the runtime interface).
+2. **Bash-only, no custom tools, no tool-calling interface** — works with *any* model;
+   "want a PR? just tell the LM to figure it out." mini-ork is already bash-centric, so
+   this validates the direction and argues against over-building tools.
+3. **Completely linear history** — messages == trajectory (great for debugging + FT).
+   Relevant to mini-ork's I-14 observability mess (multiple status sources): a linear
+   append model is easier to render faithfully.
+
+**Deployable backends it ships out of the box:** local, **docker/podman**,
+**singularity/apptainer**, **bubblewrap**, contree. Note **bubblewrap** — an
+unprivileged, lightweight FS/namespace sandbox (no VM, no daemon). That's the ideal
+*cheap middle tier* for mini-ork between "local worktree" and "microVM/E2B": real
+path/namespace isolation that would have *prevented the cross-repo HEAD clobber*, with
+near-zero overhead. Models are pluggable via **litellm/openrouter/portkey** (vs
+mini-ork's hand-rolled `lib/providers/cl_*.sh`).
+
+**Borrow, concretely:**
+- Refactor the executor so a recipe action is a **stateless exec call** through one
+  function (`runtime_exec`), the way mini-SWE-agent uses `subprocess.run`. This is the
+  prerequisite that makes R1/R2 cheap rather than a rewrite.
+- Add a **bubblewrap backend** as the first real sandbox tier (cheap, no daemon) before
+  reaching for Docker/microVM.
+- Steal its trajectory-browser + linear-history model for I-14.
+
 ## C. Orchestration topology — what mini-ork already does well vs. what to borrow
 
 The augmentcode roundup of **9 OSS coding-agent orchestrators** (Composio, Emdash,
@@ -200,8 +238,9 @@ mini-ork's heterogeneous "lens panel + arbiter" is a recognized pattern:
 
 | # | Recommendation | Closes | Effort |
 |---|---|---|---|
+| R0 | **Make recipe actions stateless** (mini-SWE-agent's `subprocess.run`-per-action model) routed through ONE exec function — the prerequisite that turns R1/R2 from a rewrite into a backend swap | A1 enabler | med |
 | R1 | **Runtime-abstraction interface** (`runtime_exec/put/get`), `local`+`container` impls; executor/recipes stop `cd`+`bash`-ing the host | A1, enables cloud, M4 corruption | high |
-| R2 | **Per-agent sandbox with a hard workspace boundary** via Docker/gVisor first, then microVM/E2B/Daytona; `MO_SANDBOX_BACKEND` knob | A1, M4 | high |
+| R2 | **Per-agent sandbox with a hard workspace boundary** — start with **bubblewrap** (cheap, no daemon, would've stopped our clobber), then Docker/gVisor, then microVM/E2B/Daytona; `MO_SANDBOX_BACKEND` knob | A1, M4 | high (bwrap tier: low) |
 | R3 | **Wrap a managed sandbox** (E2B or Daytona or self-hosted microsandbox/libkrun) rather than building VM mgmt | A1 cloud | med |
 | R4 | **GEPA-style reflective prompt evolution** alongside GRPO (35× fewer rollouts) | I-4 cost, learning | med |
 | R5 | **Kanban/board UI + explicit merge node** for the epics/scheduler (borrow Vibe Kanban / OpenHands EventStream) | I-14, I-15 | med |
@@ -216,7 +255,8 @@ mini-ork's heterogeneous "lens panel + arbiter" is a recognized pattern:
 
 ## Repo reference
 - Sandboxes: `restyler/awesome-sandbox` · `e2b-dev/E2B` · `daytonaio/daytona` · `containers/libkrun` · microsandbox · `firecracker-microvm/firecracker` · `google/gvisor` · `kata-containers`
-- Runtime: `SWE-agent/swe-rex` · OpenHands runtime (`OpenHands/openhands`, arXiv 2511.03690)
+- Runtime: `SWE-agent/swe-rex` · **`SWE-agent/mini-swe-agent`** (100-line, stateless-`subprocess.run`, bash-only, local/docker/podman/singularity/bubblewrap backends, >74% SWE-bench) · OpenHands runtime (`OpenHands/openhands`, arXiv 2511.03690)
+- Cheap sandbox primitive: **bubblewrap** (`containers/bubblewrap`) — unprivileged namespace/FS sandbox, no daemon
 - Orchestrators: CrewAI `crewaiinc/crewai` · `langchain` (Open SWE) · Conductor/Claude Squad/Vibe Kanban/Emdash/Baton · `vivy-yi/awesome-agent-orchestration`
 - Self-improve: `zou-group/textgrad` · `gepa-ai/gepa` · DSPy `dspy.ai` · `bobxwu/learning-from-rewards-llm-papers`
 - Panels/judges: `lechmazur/debate` · `karpathy/llm-council` · `junchenzhi/Awesome-LLM-Ensemble` · `CSHaitao/Awesome-LLMs-as-Judges` · `North-Shore-AI/crucible_ensemble`
