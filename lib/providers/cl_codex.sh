@@ -184,13 +184,25 @@ fi
 #   MO_TURNS_FILE → turns.jsonl lines matching the stream-json per-turn shape
 # Both optional — absent env vars skip the sidecar (standalone CLI use).
 if [ -n "${MO_USAGE_FILE:-}" ] || [ -n "${MO_TURNS_FILE:-}" ] || [ -n "${MO_COST_FILE:-}" ]; then
-  RAW_OUT="$RAW_OUT" python3 - "${MO_USAGE_FILE:-}" "${MO_TURNS_FILE:-}" "${MO_COST_FILE:-}" <<'PY' || true
+  # Pass the stream file PATH (short), not its content — exec() counts env
+  # + argv toward ARG_MAX, so a multi-KB RAW_OUT in the environment is E2BIG
+  # ("Argument list too long"). RAW_OUT here is a verbatim cat of this file.
+  MO_RAW_FILE="$_CODEX_STREAM_FILE" python3 - "${MO_USAGE_FILE:-}" "${MO_TURNS_FILE:-}" "${MO_COST_FILE:-}" <<'PY' || true
 import json, os, sys
 usage_path, turns_path, cost_path = sys.argv[1:4]
 in_tok = out_tok = cached_tok = 0
 turns = []
 thread_id = None
-for line in os.environ.get("RAW_OUT", "").splitlines():
+def _read_raw():
+    p = os.environ.get("MO_RAW_FILE", "")
+    if not p:
+        return ""
+    try:
+        with open(p, "r", errors="replace") as _f:
+            return _f.read()
+    except OSError:
+        return ""
+for line in _read_raw().splitlines():
     line = line.strip()
     if not line.startswith("{"):
         continue
@@ -276,10 +288,21 @@ else
   # --json mode: stdout is JSONL, not a transcript. Reconstruct the assistant
   # body from agent_message events so the marker-strip fallback below still
   # has plain text to work with.
-  _CODEX_MSG=$(RAW_OUT="$RAW_OUT" python3 - <<'PY' || true
+  # Pass the stream file path, not its content (ARG_MAX / E2BIG — see above).
+  # In this branch RAW_OUT is still the verbatim stream-file cat.
+  _CODEX_MSG=$(MO_RAW_FILE="$_CODEX_STREAM_FILE" python3 - <<'PY' || true
 import json, os
+def _read_raw():
+    p = os.environ.get("MO_RAW_FILE", "")
+    if not p:
+        return ""
+    try:
+        with open(p, "r", errors="replace") as _f:
+            return _f.read()
+    except OSError:
+        return ""
 msgs = []
-for line in os.environ.get("RAW_OUT", "").splitlines():
+for line in _read_raw().splitlines():
     line = line.strip()
     if not line.startswith("{"):
         continue
@@ -308,10 +331,24 @@ rm -f "$_CODEX_LAST_MESSAGE"
 # If we pass that whole transcript through, mini-ork-plan's balanced JSON
 # extractor sees the prompt's example JSON before the actual answer. Keep text
 # after the final bare `codex` marker when present, then remove status lines.
-CLEAN=$(RAW_OUT="$RAW_OUT" python3 - <<'PY'
+# RAW_OUT is transformed by now (last-message body / agent text), so it can't
+# reuse $_CODEX_STREAM_FILE — stage it to a fresh tempfile and pass the path
+# (ARG_MAX / E2BIG: never put a large value in env or argv for exec).
+_CODEX_CLEAN_IN="$(mktemp -t mini-ork-codex-clean.XXXXXX)"
+printf '%s' "$RAW_OUT" > "$_CODEX_CLEAN_IN"
+CLEAN=$(MO_RAW_FILE="$_CODEX_CLEAN_IN" python3 - <<'PY'
 import re, sys
 import os
-txt = os.environ.get("RAW_OUT", "")
+def _read_raw():
+    p = os.environ.get("MO_RAW_FILE", "")
+    if not p:
+        return ""
+    try:
+        with open(p, "r", errors="replace") as _f:
+            return _f.read()
+    except OSError:
+        return ""
+txt = _read_raw()
 lines = txt.splitlines()
 last_codex = -1
 for i, line in enumerate(lines):
@@ -337,6 +374,7 @@ for line in lines:
 print("\n".join(kept).strip())
 PY
 )
+rm -f "$_CODEX_CLEAN_IN"
 [ -z "$CLEAN" ] && CLEAN="$RAW_OUT"
 
 if [ "$FORMAT" = "json" ]; then
@@ -346,14 +384,16 @@ if [ "$FORMAT" = "json" ]; then
   # to us via this CLI surface, so total_cost_usd is 0; caller's
   # _d022_charge_node_cost falls back to $0.01 placeholder which is
   # the documented behavior for executable-wrapper lanes.
-  python3 -c "
+  # Feed CLEAN via stdin, not argv — a large assistant body as a command-line
+  # argument would hit ARG_MAX / E2BIG just like the env-var sites above.
+  printf '%s' "$CLEAN" | python3 -c "
 import json, sys
 print(json.dumps({
-    'result': sys.argv[1],
+    'result': sys.stdin.read(),
     'total_cost_usd': 0.0,
     'model': 'codex',
 }))
-" "$CLEAN"
+"
 else
   printf '%s\n' "$CLEAN"
 fi
