@@ -41,6 +41,12 @@ REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)"
 cd "$REPO_ROOT" || exit 0
 
 SHA="$(git rev-parse HEAD)"
+# Branch we committed onto (empty if detached) — used by the HEAD-clobber guard
+# below. A racing process (e.g. a confused cross-repo `codex` session) has been
+# observed `git reset`ing HEAD onto an UNRELATED/foreign commit seconds after a
+# commit, orphaning it. The original watchdog assumed "HEAD is intact"; it isn't
+# always, so we now guard the branch ref too.
+BRANCH="$(git symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
 WATCH_S="${MO_REVERSION_GUARD_WATCH_S:-60}"
 POLL_S="${MO_REVERSION_GUARD_POLL_S:-5}"
 LOG="$REPO_ROOT/.mini-ork/file-reversion-guard.log"
@@ -61,6 +67,32 @@ FILES="$(git diff-tree --no-commit-id --name-only --diff-filter=AM -r "$SHA" 2>/
   END=$(( $(date +%s) + WATCH_S ))
   while [ "$(date +%s)" -lt "$END" ]; do
     sleep "$POLL_S"
+
+    # ── HEAD-clobber guard ────────────────────────────────────────────────
+    # If we're still on the same branch but its tip was moved OFF our commit
+    # to an OLDER commit that does not contain our commit (a sideways/foreign
+    # reset, not a legitimate follow-up commit/amend/rebase), restore the
+    # branch ref to our SHA. Two conditions keep this from fighting normal
+    # git use:
+    #   1. our SHA is no longer an ancestor of the tip (commit was orphaned)
+    #   2. the new tip is OLDER than our commit (a fresh amend/rebase would be
+    #      NEWER, so this only fires on a reset to a pre-existing/stale commit)
+    if [ -n "$BRANCH" ]; then
+      cur_branch="$(git -C "$REPO_ROOT" symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
+      cur_tip="$(git -C "$REPO_ROOT" rev-parse --verify -q HEAD 2>/dev/null || true)"
+      if [ "$cur_branch" = "$BRANCH" ] && [ -n "$cur_tip" ] && [ "$cur_tip" != "$SHA" ] \
+         && ! git -C "$REPO_ROOT" merge-base --is-ancestor "$SHA" "$cur_tip" 2>/dev/null; then
+        tip_ct="$(git -C "$REPO_ROOT" show -s --format=%ct "$cur_tip" 2>/dev/null || echo 0)"
+        our_ct="$(git -C "$REPO_ROOT" show -s --format=%ct "$SHA" 2>/dev/null || echo 0)"
+        if [ "${tip_ct:-0}" -lt "${our_ct:-0}" ]; then
+          if git -C "$REPO_ROOT" update-ref "refs/heads/$BRANCH" "$SHA" "$cur_tip" 2>/dev/null; then
+            printf '%s\t%s\t%s\trestored-HEAD-clobbered-from-%s\n' \
+              "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$SHA" "(branch:$BRANCH)" "$cur_tip"
+          fi
+        fi
+      fi
+    fi
+
     while IFS= read -r f; do
       [ -z "$f" ] && continue
       if [ ! -f "$REPO_ROOT/$f" ]; then
