@@ -253,6 +253,36 @@ mini-ork's heterogeneous "lens panel + arbiter" is a recognized pattern:
 > the unlock for cloud execution AND the durable fix for the cross-repo corruption
 > class — it should lead the roadmap.
 
+## G. Most-popular tool per technique (via GitHub MCP, 2026-06-30)
+
+Found with `github` MCP `search_repositories` sorted by stars. ⚠️ This GitHub
+instance returned **inflated/seeded star counts and some fabricated repos**, so
+star figures are approximate and the canonical (well-known, real) project is named
+per row regardless of raw ranking.
+
+| Technique (mini-ork capability / gap) | Most-popular tool | Repo | ★ approx | What to study / borrow |
+|---|---|---|---|---|
+| Multi-agent orchestration framework | **MetaGPT** (also AutoGen, CrewAI) | `FoundationAgents/MetaGPT` · `microsoft/autogen` · `crewAIInc/crewAI` | 69k · 59k · 55k | role/SOP decomposition, conversation patterns, flow API |
+| Autonomous coding agent (OSS, end-to-end) | **OpenHands** | `OpenHands/OpenHands` | 79k | EventStream controller/runtime split; remote runtime |
+| Coding-agent **runtime abstraction** (run anywhere) | **SWE-ReX / mini-swe-agent** | `SWE-agent/swe-rex` · `SWE-agent/mini-swe-agent` | 20k · 5.5k | **stateless `subprocess.run` → swap for `docker exec`** = the A1 unlock (R0/R1) |
+| Agent **code-execution sandbox** (cloud FS isolation) | **E2B** (+ Daytona) | `e2b-dev/code-interpreter` / E2B platform | Firecracker microVM | per-sandbox microVM, REST sandbox API, snapshots (R2/R3) |
+| Cheap FS sandbox primitive | **bubblewrap** (via mini-swe-agent backends) | `containers/bubblewrap` | — | unprivileged namespace jail, no daemon (R2 first tier) |
+| Workflow graph / DAG engine | **LangGraph** | `langchain-ai/langgraph` | 36k | durable graph state, resumable nodes, checkpoints |
+| Prompt optimization / self-improving | **DSPy** (+ **GEPA**) | `stanfordnlp/dspy` · `gepa-ai/gepa` | 36k · 5.4k | compile prompts to a metric; GEPA reflective evolution (beats GRPO, 35× fewer rollouts) → R4 |
+| Self-improving agents with RL | **GPTSwarm** | `metauto-ai/GPTSwarm` | 1k | graph-optimized agent swarms, RL + prompt opt |
+| Textual-gradient optimization | **TextGrad** | `zou-group/textgrad` | — | backprop through text feedback (mini-ork's gradient_extractor analog) |
+| LLM observability / tracing / eval | **Langfuse** (also Helicone, AgentOps) | `langfuse/langfuse` · `Helicone/helicone` · `AgentOps-AI/agentops` | obs platforms | trace tree, cost attribution, llm-as-judge eval → I-14 |
+| LLMOps gateway + optimization (unified) | **TensorZero** | `tensorzero/tensorzero` | 12k | gateway+obs+eval+optimization in one (Rust) |
+| Agent memory layer | **mem0** (+ graphiti, cognee) | `mem0ai/mem0` · `getzep/graphiti` · `topoteretes/cognee` | 60k · 28k · 26k | universal memory API; temporal graph-RAG |
+| Multi-model panel / debate / judge | **llm-council / debate** | `karpathy/llm-council` · `lechmazur/debate` | — | N-model answer→cross-review→synthesize; 3-judge panel (mini-ork lenses) |
+| Git-worktree parallel agent orchestration | **Claude Squad / Conductor / oh-my-claudecode** | (worktree-based orchestrators) | — | worktree isolation + merge/conflict UI (I-15, I-14) |
+
+**Read-the-source priority (using the github MCP `get_file_contents`/`search_code`):**
+1. `SWE-agent/mini-swe-agent` environments (docker/bubblewrap/singularity) + `SWE-agent/swe-rex` deployment iface → model mini-ork's R0/R1/R2.
+2. `e2b-dev/code-interpreter` SDK → the managed-sandbox API shape for R3.
+3. `gepa-ai/gepa` optimizer loop → R4 vs current GRPO.
+4. `OpenHands` runtime/controller split → I-14 + the bash→python migration target.
+
 ## Repo reference
 - Sandboxes: `restyler/awesome-sandbox` · `e2b-dev/E2B` · `daytonaio/daytona` · `containers/libkrun` · microsandbox · `firecracker-microvm/firecracker` · `google/gvisor` · `kata-containers`
 - Runtime: `SWE-agent/swe-rex` · **`SWE-agent/mini-swe-agent`** (100-line, stateless-`subprocess.run`, bash-only, local/docker/podman/singularity/bubblewrap backends, >74% SWE-bench) · OpenHands runtime (`OpenHands/openhands`, arXiv 2511.03690)
