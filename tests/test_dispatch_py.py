@@ -120,7 +120,7 @@ def test_unknown_lane_is_structured_not_raised():
     res = dispatch_model(DispatchRequest(model="not-a-real-lane", prompt="q"))
     assert res.ok is False
     assert res.rc == 2
-    assert "unknown model lane" in res.error
+    assert "unknown lane" in res.error  # caught by the preflight gate, fail-fast
 
 
 def test_resolve_known_lane_points_at_wrapper():
