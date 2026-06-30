@@ -60,6 +60,7 @@ def dispatch(
             capture_output=True,
             text=True,
             env=proc_env,
+            cwd=request.cwd,  # None = inherit; pinned by the caller's cwd guard
             timeout=request.timeout_s,
         )
     except subprocess.TimeoutExpired:

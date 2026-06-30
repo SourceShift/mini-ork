@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# .githooks/reference-transaction — protect THIS mini-ork repo from cross-repo
+# corruption by a consuming repo's vendored install.
+#
+# The problem (by design, until now): another repo that uses mini-ork (a
+# vendored .mini-ork/) runs a provider lane — e.g. codex — whose cwd drifts, by
+# mistake, into THIS framework tree. The provider then does its own git
+# operations here: it creates `refs/codex/curated-sync` pointing at a FOREIGN
+# commit (observed: 3fdeeb4 "Fix DigitalOcean dark mode logo") and
+# `git reset --hard` HEAD onto it, replacing the framework working tree with an
+# unrelated repo's tree (the "8432 deletions" corruption).
+#
+# This hook makes the framework repo immune regardless of what the consuming
+# repo does — it does not depend on the consumer being updated. It fires on
+# every ref update; in the `prepared` phase it ABORTS the transaction if any
+# update moves HEAD / a branch, or creates a ref, to a commit that shares NO
+# history with this repo. That is the unmistakable signature of a foreign reset.
+# Legitimate work (new commits, merges, fast-forwards, branch switches) all share
+# mini-ork history and pass untouched.
+#
+# Escape hatch: MO_ALLOW_FOREIGN_REF=1 (for a deliberate cross-graft).
+set -uo pipefail
+
+state="${1:-}"
+[ "$state" = "prepared" ] || exit 0
+[ "${MO_ALLOW_FOREIGN_REF:-0}" = "1" ] && exit 0
+
+# Anchor: a commit KNOWN to belong to this repo's history. Prefer the remote
+# tracking ref (a rogue reset doesn't touch refs/remotes/*), so recovery to a
+# real mini-ork commit is still permitted even while HEAD is already corrupted.
+anchor=""
+for ref in refs/remotes/origin/main refs/remotes/origin/HEAD HEAD; do
+  anchor=$(git rev-parse --verify --quiet "$ref^{commit}" 2>/dev/null) && [ -n "$anchor" ] && break
+done
+if [ -z "$anchor" ]; then
+  anchor=$(git for-each-ref --count=1 --format='%(objectname)' refs/heads/ 2>/dev/null)
+fi
+[ -n "$anchor" ] || exit 0  # bare/empty repo with no anchor — nothing to defend
+
+zero="0000000000000000000000000000000000000000"
+reject=0
+while read -r _old new ref; do
+  case "$ref" in
+    HEAD | refs/heads/* | refs/codex/*) ;;
+    *) continue ;;  # remotes, tags, notes, stash, etc. are not the vector
+  esac
+  [ "$new" = "$zero" ] && continue              # deletions are fine
+  git cat-file -e "${new}^{commit}" 2>/dev/null || continue  # non-commit → skip
+  # FOREIGN iff it shares no merge-base with our anchor.
+  if [ -z "$(git merge-base "$new" "$anchor" 2>/dev/null)" ]; then
+    echo "[mini-ork ref-guard] REJECT $ref -> ${new:0:12}: commit is FOREIGN to this repo (no shared history)." >&2
+    echo "  This is the cross-repo corruption vector — a consuming repo's lane writing into the framework tree." >&2
+    echo "  If this is intentional, re-run with MO_ALLOW_FOREIGN_REF=1." >&2
+    reject=1
+  fi
+done
+
+exit "$reject"

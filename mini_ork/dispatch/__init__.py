@@ -19,6 +19,7 @@ from .providers import (
     claude_env_for,
     claude_result_text,
     codex_cost,
+    cwd_guard,
     dispatch_model,
     dispatch_with_command,
     lane_health,
@@ -27,6 +28,7 @@ from .providers import (
     preflight,
     provider_for_model,
     resolve_provider,
+    resolve_target_cwd,
 )
 from .telemetry import cache_aware_cost, persist_call
 
@@ -53,4 +55,6 @@ __all__ = [
     "preflight",
     "LaneHealth",
     "provider_for_model",
+    "cwd_guard",
+    "resolve_target_cwd",
 ]
