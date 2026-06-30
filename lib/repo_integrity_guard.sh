@@ -53,7 +53,11 @@ repo_integrity_check_and_heal() {
   [ -n "$CUR_TIP" ] || return 0
 
   mkdir -p "$REPO_ROOT/.mini-ork" 2>/dev/null || true
-  LKG_FILE="$REPO_ROOT/.mini-ork/last-known-good-ref.$BRANCH"
+  # Branch names contain '/' (e.g. fix/foo) → sanitize so the LKG filename never
+  # resolves into a non-existent subdir (which silently disabled the guard's
+  # baseline tracking on every real feature branch).
+  _BRANCH_SAFE="${BRANCH//\//__}"
+  LKG_FILE="$REPO_ROOT/.mini-ork/last-known-good-ref.$_BRANCH_SAFE"
   LOG_FILE="$REPO_ROOT/.mini-ork/repo-integrity-guard.log"
 
   # ── baseline resolution (priority: file → origin/main → reflog) ─────────

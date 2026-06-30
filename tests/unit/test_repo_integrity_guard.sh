@@ -268,6 +268,26 @@ echo "$main_out" | grep -q "BLOCKED" \
   && _ok "main push output mentions BLOCKED" \
   || _fail "main push output missing BLOCKED; got:\n$main_out"
 
+# ── (g) slash-named branch — LKG filename must be sanitized ─────────────────
+echo ""
+echo "--- (g) slash branch (feat/x): LKG filename sanitized, no subdir error ---"
+G_DIR="$TMP_ROOT/g"
+_setup_repo "$G_DIR"
+echo "g" > "$G_DIR/f.txt"
+git -C "$G_DIR" add f.txt
+git -C "$G_DIR" commit -q -m "initial"
+git -C "$G_DIR" switch -q -c feat/slash-case
+G_ERR="$( cd "$G_DIR" && repo_integrity_check_and_heal 2>&1 1>/dev/null )"
+[ -z "$G_ERR" ] \
+  && _ok "guard runs clean on slash branch (no stderr)" \
+  || _fail "guard emitted error on slash branch: $G_ERR"
+[ -s "$G_DIR/.mini-ork/last-known-good-ref.feat__slash-case" ] \
+  && _ok "LKG written with sanitized name (feat__slash-case)" \
+  || _fail "sanitized LKG file missing: $(ls "$G_DIR"/.mini-ork/last-known-good-ref.* 2>/dev/null)"
+[ ! -d "$G_DIR/.mini-ork/last-known-good-ref.feat" ] \
+  && _ok "no stray last-known-good-ref.feat/ subdir created" \
+  || _fail "slash leaked into a subdir path"
+
 # ── summary ────────────────────────────────────────────────────────────────
 echo ""
 echo "── Results: ${PASS} OK  ${SKIP} SKIP  ${FAIL} FAIL ──"
