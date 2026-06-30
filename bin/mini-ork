@@ -152,6 +152,14 @@ except Exception:
     fi
     [ -z "${derived_class:-}" ] && derived_class="${recipe//-/_}"
 
+    # ── repo-integrity guard ─────────────────────────────────────────────────
+    # Standing check on every `mini-ork run` startup: detects a cross-repo
+    # `git reset --hard` clobber of the current branch ref and self-heals.
+    # Source is guarded so a missing/older mini-ork host still runs cleanly;
+    # `|| true` ensures a guard failure NEVER aborts the caller's run (we
+    # are healing, not gating). Defensive `|| true` is load-bearing.
+    [ -f "$MINI_ORK_ROOT/lib/repo_integrity_guard.sh" ] && source "$MINI_ORK_ROOT/lib/repo_integrity_guard.sh" && repo_integrity_check_and_heal || true
+
     # ── classify ───────────────────────────────────────────────────────────────
     classify_out=$("$MINI_ORK_ROOT/bin/mini-ork-classify" --task-class "$derived_class" "$kickoff") || exit $?
     printf '%s\n' "$classify_out"
