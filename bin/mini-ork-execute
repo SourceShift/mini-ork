@@ -844,11 +844,15 @@ import json, sys
 with open(sys.argv[1]) as f:
     p = json.load(f)
 status = p.get("plan_status") or ""
-if status == "needs_answers":
+_questions = p.get("human_questions") or []
+# Defense-in-depth (mirrors bin/mini-ork-plan's normalization): a needs_answers
+# plan with ZERO questions is a contradiction — there is nothing to answer, so
+# do NOT block. Only block when there are real unanswered questions.
+if status == "needs_answers" and _questions:
     print(json.dumps({
         "plan_status": status,
         "blocked_by": p.get("blocked_by") or "unknown",
-        "human_questions": p.get("human_questions") or [],
+        "human_questions": _questions,
     }))
 PY
 )
