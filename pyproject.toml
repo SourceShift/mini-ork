@@ -30,3 +30,13 @@ mini-ork-python = "mini_ork.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["mini_ork*"]
+
+[tool.pytest.ini_options]
+# Make `pytest` (run bare by recipes/code-fix/verifiers/test.sh) behave:
+#   - pythonpath=["."] so `import mini_ork` resolves without an editable install
+#     (the test gate runs in a fresh env; without this every dispatch false-fails
+#     on ModuleNotFoundError → rollback).
+#   - testpaths=["tests"] so collection ignores code-fix experiment fixtures
+#     under docs/research/experiments/fixtures/** (sample tasks, not real tests).
+pythonpath = ["."]
+testpaths = ["tests"]
