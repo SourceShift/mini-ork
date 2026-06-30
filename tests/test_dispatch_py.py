@@ -126,7 +126,8 @@ def test_unknown_lane_is_structured_not_raised():
 def test_resolve_known_lane_points_at_wrapper():
     spec = resolve_provider("codex")
     assert spec.command[0].endswith("lib/providers/cl_codex.sh")
-    assert spec.parse_usage is parse_codex_usage
+    # codex telemetry comes from sidecars (dispatch_model), not stdout parsers.
+    assert spec.parse_usage is None
 
 
 # ── claude-family lanes ─────────────────────────────────────────────────────
