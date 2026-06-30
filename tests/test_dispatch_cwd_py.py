@@ -1,0 +1,76 @@
+"""Tests for the cwd guard (mini_ork.dispatch) — the dispatch-side half of the
+isolation fix. A target-repo lane must never run with its cwd inside the
+mini-ork framework tree; that confusion is how a consuming repo's provider git
+ops (codex's refs/codex resets) corrupt the framework repo.
+"""
+
+from __future__ import annotations
+
+import os
+import stat
+
+from mini_ork.dispatch import (
+    DispatchRequest,
+    cwd_guard,
+    dispatch_model,
+    resolve_target_cwd,
+)
+
+KEYED = '#!/usr/bin/env bash\nexport ANTHROPIC_AUTH_TOKEN="${GLM_API_KEY:?}"\n'
+
+
+def _wrapper(root, model, body):
+    prov = root / "lib" / "providers"
+    prov.mkdir(parents=True, exist_ok=True)
+    w = prov / f"cl_{model}.sh"
+    w.write_text(body)
+    w.chmod(w.stat().st_mode | stat.S_IXUSR)
+
+
+def test_resolve_target_cwd_precedence(tmp_path, monkeypatch):
+    # explicit request.cwd wins
+    r = DispatchRequest(model="glm", prompt="x", cwd=str(tmp_path / "a"))
+    assert resolve_target_cwd(r) == os.path.abspath(str(tmp_path / "a"))
+    # then MO_TARGET_CWD
+    monkeypatch.setenv("MO_TARGET_CWD", str(tmp_path / "b"))
+    assert resolve_target_cwd(DispatchRequest(model="glm", prompt="x")) == os.path.abspath(
+        str(tmp_path / "b")
+    )
+
+
+def test_cwd_inside_framework_is_rejected(tmp_path):
+    framework = tmp_path / "mini-ork"
+    (framework / "sub").mkdir(parents=True)
+    g = cwd_guard(str(framework / "sub"), root=framework)
+    assert g.ok is False
+    assert "framework tree" in g.reason and "cwd-confusion" in g.reason
+
+
+def test_cwd_outside_framework_is_allowed(tmp_path):
+    framework = tmp_path / "mini-ork"
+    framework.mkdir()
+    target = tmp_path / "researcher"
+    target.mkdir()
+    assert cwd_guard(str(target), root=framework).ok is True
+
+
+def test_framework_cwd_allowed_with_optin(tmp_path, monkeypatch):
+    framework = tmp_path / "mini-ork"
+    framework.mkdir()
+    monkeypatch.setenv("MO_ALLOW_FRAMEWORK_CWD", "1")
+    assert cwd_guard(str(framework), root=framework).ok is True  # self-edit opt-in
+
+
+def test_dispatch_model_fails_fast_on_framework_cwd(tmp_path, monkeypatch):
+    # Healthy lane (key set) but the requested cwd is inside the framework tree
+    # → dispatch_model must refuse BEFORE running the provider.
+    _wrapper(tmp_path, "glm", KEYED)
+    monkeypatch.setenv("MINI_ORK_ROOT", str(tmp_path))
+    monkeypatch.setenv("GLM_API_KEY", "set")
+    monkeypatch.delenv("MO_ALLOW_FRAMEWORK_CWD", raising=False)
+    res = dispatch_model(
+        DispatchRequest(model="glm", prompt="hi", cwd=str(tmp_path / "lib"))
+    )
+    assert res.ok is False
+    assert res.rc == 2
+    assert "cwd guard failed" in res.error
