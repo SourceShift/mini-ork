@@ -259,6 +259,46 @@ def preflight(
     return {m: lane_health(m, root) for m in dict.fromkeys(models)}
 
 
+def resolve_target_cwd(
+    request: DispatchRequest, *, env: Mapping[str, str] | None = None
+) -> str:
+    """The directory the provider runs in. Precedence: request.cwd →
+    $MO_TARGET_CWD → the current process cwd. Returns an absolute path so the
+    dispatch is never at the mercy of an inherited, drifted cwd."""
+    e = os.environ if env is None else env
+    cwd = request.cwd or e.get("MO_TARGET_CWD") or os.getcwd()
+    return os.path.abspath(cwd)
+
+
+def cwd_guard(
+    cwd: str,
+    root: str | os.PathLike[str] | None = None,
+    *,
+    env: Mapping[str, str] | None = None,
+) -> LaneHealth:
+    """Refuse a dispatch whose working directory is INSIDE the mini-ork framework
+    tree. That is the cwd-confusion (a target-repo lane landing in mini-ork
+    itself) under which the provider's own git operations — e.g. codex's
+    `refs/codex/*` resets — corrupt the framework repo. A genuine mini-ork
+    self-edit opts in with MO_ALLOW_FRAMEWORK_CWD=1."""
+    e = os.environ if env is None else env
+    if e.get("MO_ALLOW_FRAMEWORK_CWD") == "1":
+        return LaneHealth(True, "ok")
+    framework = mini_ork_root(root)
+    target = Path(cwd).resolve()
+    try:
+        target.relative_to(framework)
+    except ValueError:
+        return LaneHealth(True, "ok")  # outside the framework tree — fine
+    return LaneHealth(
+        False,
+        f"dispatch cwd {target} is inside the mini-ork framework tree {framework} "
+        "— likely cwd-confusion (a target-repo lane landing in mini-ork). Set "
+        "MO_TARGET_CWD to the target repo, or MO_ALLOW_FRAMEWORK_CWD=1 for a "
+        "genuine mini-ork self-edit.",
+    )
+
+
 def dispatch_model(
     request: DispatchRequest,
     root: str | os.PathLike[str] | None = None,
@@ -266,8 +306,12 @@ def dispatch_model(
     preflight_check: bool = True,
 ) -> DispatchResult:
     """Resolve ``request.model`` to a provider and dispatch it. Unknown lane /
-    missing wrapper / a lane whose required API key is unset come back as a
-    structured ``ok=False`` result (fail-fast), not a raise or a silent stall."""
+    missing wrapper / unset API key / a framework-tree cwd come back as a
+    structured ``ok=False`` result (fail-fast), not a raise, stall, or repo
+    corruption."""
+    # Always pin an explicit, absolute cwd so the provider can't inherit a
+    # drifted one. The guard (below) is what refuses the dangerous case.
+    target_cwd = resolve_target_cwd(request)
     if preflight_check:
         health = lane_health(request.model, root)
         if not health.ok:
@@ -275,22 +319,25 @@ def dispatch_model(
                 ok=False, rc=2, error=f"lane preflight failed: {health.reason}",
                 model=request.model,
             )
+        guard = cwd_guard(target_cwd, root)
+        if not guard.ok:
+            return DispatchResult(
+                ok=False, rc=2, error=f"cwd guard failed: {guard.reason}",
+                model=request.model,
+            )
     try:
         spec = resolve_provider(request.model, root)
     except (ValueError, FileNotFoundError) as exc:
         return DispatchResult(ok=False, rc=2, error=str(exc), model=request.model)
-    # Merge the lane's pinned env UNDER any per-request overrides.
+    # Merge the lane's pinned env UNDER any per-request overrides; pin the cwd.
     merged_env = {**dict(spec.env), **request.env}
-    effective = (
-        request
-        if merged_env == request.env
-        else DispatchRequest(
-            model=request.model,
-            prompt=request.prompt,
-            timeout_s=request.timeout_s,
-            max_turns=request.max_turns,
-            env=merged_env,
-        )
+    effective = DispatchRequest(
+        model=request.model,
+        prompt=request.prompt,
+        timeout_s=request.timeout_s,
+        max_turns=request.max_turns,
+        env=merged_env,
+        cwd=target_cwd,
     )
     if request.model == "codex":
         return _dispatch_codex_via_wrapper(effective, spec)
@@ -344,6 +391,7 @@ def _dispatch_codex_via_wrapper(
             timeout_s=request.timeout_s,
             max_turns=request.max_turns,
             env=env,
+            cwd=request.cwd,  # preserve the guarded target cwd through the codex path
         )
         result = dispatch(req, spec.command)
         if result.ok:
