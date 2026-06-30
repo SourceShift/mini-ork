@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import subprocess
 from collections.abc import Mapping, Sequence
@@ -214,11 +215,66 @@ def resolve_provider(
     )
 
 
+# A wrapper's `${SOME_API_KEY:?}` guard declares the key it requires. If that
+# var is unset the bash wrapper aborts and the lane produces nothing — the exact
+# "minimax died silently, 19-min stall" failure from prod sessions. We read that
+# declaration to fail FAST with a clear reason instead of stalling.
+_REQUIRED_KEY_RE = re.compile(r"\$\{([A-Z][A-Z0-9_]*_API_KEY)\s*:[?]")
+
+
+@dataclass(frozen=True)
+class LaneHealth:
+    ok: bool
+    reason: str
+
+
+def lane_health(model: str, root: str | os.PathLike[str] | None = None) -> LaneHealth:
+    """Cheap pre-dispatch check: is this lane runnable right now? Catches the
+    common silent-death cause — a wrapper that requires an API key env var which
+    isn't set. Does NOT make a network call. Lanes with no declared key (ambient
+    auth, e.g. opus) are healthy as long as the wrapper exists."""
+    if model not in KNOWN_MODELS:
+        return LaneHealth(False, f"unknown lane: {model!r}")
+    wrapper = mini_ork_root(root) / "lib" / "providers" / f"cl_{model}.sh"
+    if not wrapper.is_file():
+        return LaneHealth(False, f"wrapper missing: {wrapper}")
+    try:
+        text = wrapper.read_text(encoding="utf-8")
+    except OSError as exc:
+        return LaneHealth(False, f"wrapper unreadable: {exc}")
+    for match in _REQUIRED_KEY_RE.finditer(text):
+        key = match.group(1)
+        if not os.environ.get(key):
+            return LaneHealth(
+                False, f"{model}: ${key} is not set — lane would die silently"
+            )
+    return LaneHealth(True, "ok")
+
+
+def preflight(
+    models: Sequence[str], root: str | os.PathLike[str] | None = None
+) -> dict[str, LaneHealth]:
+    """Health-check several lanes at once (e.g. every lane a recipe will use).
+    Returns {model: LaneHealth}; callers abort the run if any are unhealthy."""
+    return {m: lane_health(m, root) for m in dict.fromkeys(models)}
+
+
 def dispatch_model(
-    request: DispatchRequest, root: str | os.PathLike[str] | None = None
+    request: DispatchRequest,
+    root: str | os.PathLike[str] | None = None,
+    *,
+    preflight_check: bool = True,
 ) -> DispatchResult:
     """Resolve ``request.model`` to a provider and dispatch it. Unknown lane /
-    missing wrapper come back as a structured ``ok=False`` result, not a raise."""
+    missing wrapper / a lane whose required API key is unset come back as a
+    structured ``ok=False`` result (fail-fast), not a raise or a silent stall."""
+    if preflight_check:
+        health = lane_health(request.model, root)
+        if not health.ok:
+            return DispatchResult(
+                ok=False, rc=2, error=f"lane preflight failed: {health.reason}",
+                model=request.model,
+            )
     try:
         spec = resolve_provider(request.model, root)
     except (ValueError, FileNotFoundError) as exc:
