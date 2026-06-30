@@ -68,6 +68,8 @@ MINI_ORK_ROOT="${MINI_ORK_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 . "${MINI_ORK_ROOT}/lib/coalition_gate.sh"
 # shellcheck disable=SC1091
 . "${MINI_ORK_ROOT}/lib/process_reward.sh"
+# shellcheck disable=SC1091
+. "${MINI_ORK_ROOT}/lib/config_resolve.sh"  # run-dir-first agents.yaml (T1.0)
 
 # decide <node_type> <task_class> <objective_domain> [segment]
 #   node_type        — e.g. "implementer", "reviewer", "planner"
@@ -119,8 +121,7 @@ decide() {
   _epsilon="${EPSILON:-${MO_LEARNING_EPSILON:-0.10}}"
   _seed="${SEED:-${MO_LEARNING_SEED:-}}"
   if [ -n "$learned_route" ]; then
-    local _agents_yaml="${MINI_ORK_HOME:-.mini-ork}/config/agents.yaml"
-    [ -f "$_agents_yaml" ] || _agents_yaml="$MINI_ORK_ROOT/config/agents.yaml"
+    local _agents_yaml; _agents_yaml="$(mo_resolve_agents_yaml)"  # run-dir-first (T1.0)
     route=$(MO_DECISION_EPSILON_AGENTS_YAML="$_agents_yaml" \
       python3 - "$route" "$_epsilon" "$_seed" <<'PY'
 import os, random, sys, yaml
@@ -223,8 +224,7 @@ PY
 #   empty route and the caller decides what to do — we never invent a lane).
 decision_service_default_lane() {
   local node_type="${1:?node_type required}"
-  local agents_yaml="${MINI_ORK_HOME:-.mini-ork}/config/agents.yaml"
-  [ -f "$agents_yaml" ] || agents_yaml="$MINI_ORK_ROOT/config/agents.yaml"
+  local agents_yaml; agents_yaml="$(mo_resolve_agents_yaml)"  # run-dir-first (T1.0)
   [ -f "$agents_yaml" ] || { printf ''; return 0; }
 
   python3 - "$agents_yaml" "$node_type" <<'PY'
