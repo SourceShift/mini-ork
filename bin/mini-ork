@@ -534,7 +534,7 @@ PY
     done
     ;;
 
-  version) echo "mini-ork 0.5.0 (universal task loop runtime)" ;;
+  version) echo "mini-ork 0.6.0 (universal task loop runtime)" ;;
 
   help|--help|-h)
     cat <<'EOF'
