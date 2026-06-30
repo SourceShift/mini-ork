@@ -50,6 +50,32 @@ where the surface has already been ported, rather than extending Bash.
 
 ## Tier 1 — Quick wins (autonomous-safe, low architectural risk)
 
+### T1.0 — Parallel-run safety via per-run config isolation ⭐⭐ (active blocker)
+- **Rivet:** each actor owns co-located, per-instance state; instances never
+  contend on shared mutable config.
+- **mini-ork today:** **cannot run two dispatches in parallel safely.**
+  `agents.yaml` (the lane policy) is read *live, per-dispatch* by
+  `lib/decision_service.sh` + `lib/lane-helpers.sh` — there is **no per-run config
+  snapshot**. Editing the global `agents.yaml` while a run is in flight mutates
+  that run's lane routing on its next node. The scheduler is serial by design; the
+  `config/` dir and `state.db` are single-tenant globals.
+- **Target (interim, Bash-implementable, forward-compatible):** snapshot the
+  *effective* config at launch into the run-dir
+  (`runs/<run_id>/config/agents.yaml` + a resolved lane/knob manifest); make the
+  dispatch resolvers read **run-dir-first** (run-dir → `MINI_ORK_HOME` →
+  `MINI_ORK_ROOT`). Result: editing global `agents.yaml` never touches in-flight
+  runs; concurrent runs hold independent frozen policies; runs become reproducible
+  (config captured with the run).
+- **Acceptance:** two concurrent `mini-ork run`s with different launch-time lane
+  policies each keep their own lanes; mutating global `agents.yaml` mid-run does
+  not change a live run's resolved lane (asserted by a test that snapshots, mutates
+  the global, dispatches, and checks the lane); a broader shared-state audit
+  (config dir, `state.db` run-keying, `version_registry`, `coord_gate` locks)
+  documents anything else that needs run-scoping.
+- **Effort:** M. **Autonomous-safe:** ⚠️ touches the dispatch resolver — gate on
+  review. **This is the first concrete slice of T3.1 (actor-per-run) and survives
+  the Phase-0 Python migration unchanged (it's a design pattern, not a band-aid).**
+
 ### T1.1 — Declarative git hooks (lefthook) ⭐
 - **Rivet:** `lefthook.yml` declaratively wires git hooks.
 - **mini-ork today:** hand-written `.githooks/pre-push` + `post-commit`. The
