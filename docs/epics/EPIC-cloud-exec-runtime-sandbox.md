@@ -90,6 +90,41 @@ in this phase.
 - `MO_RUNTIME_BACKEND=bubblewrap`; auto-skip on non-Linux (macOS dev stays `local`).
 - DoD: a test proving a write outside `$WORKSPACE` fails under bubblewrap but succeeds under local.
 
+## Phase R5 — minimal-agent scaffold tier (native Python; runs AFTER R2)
+**Why:** most nodes fire a full Claude/Codex CLI harness (60-turn cap, MCP, big startup) even for
+bounded jobs (one-file mechanical fix, doc tweak, "run X and read output"). mini-SWE-agent's
+insight: for bounded work a stateless bash-command loop with any model is cheaper, faster, more
+deterministic. We **reimplement the pattern natively in Python** (NOT vendoring `mini-swe-agent` /
+litellm) so it reuses mini-ork's own `mini_ork.dispatch` provider layer and the runtime seam.
+Sequenced after R2 so every command the minimal agent runs goes through `mo_runtime_exec` →
+sandboxed for free.
+
+**Deliverables**
+- `mini_ork/agent/minimal.py` — a ~linear-history agent: loop {prompt model for ONE next bash
+  command → run it via the runtime seam → append output to messages → repeat} with a hard
+  turn-cap + a `COMPLETE`/submit sentinel. Stateless actions (subprocess-per-action), no tool-
+  calling API (works with any model), messages == trajectory (easy to trace/replay). Calls go
+  through `mini_ork.dispatch` (the existing Phase-0 dispatch), and command execution shells out to
+  the runtime seam (`mo_runtime_exec`) so it inherits local/bubblewrap/docker isolation.
+- **Scaffold-tier router:** extend the classifier / `lib/lane_router.sh` with a `scaffold` axis
+  alongside the model lane: `minimal` vs `harness`. Route by task complexity (start CONSERVATIVE —
+  only clearly-bounded node types go `minimal`; default `harness`). Expose `MO_SCAFFOLD_TIER`
+  override; the GRPO loop can learn the routing over time.
+- A node-executor path that, when a node resolves to `scaffold=minimal`, runs `mini_ork.agent.minimal`
+  instead of the full CLI harness.
+
+**DoD / smoke**
+- `python -m pytest tests/test_minimal_agent_py.py` — the loop solves a trivial bounded task
+  (e.g. "create file X with content Y") in ≤N turns, against a stub/dummy model; asserts stateless
+  actions + turn-cap + sentinel completion.
+- Misroute safety: with `MO_SCAFFOLD_TIER` unset, behavior is unchanged (default `harness`).
+- A bounded `code-fix`-style node completes via the minimal tier at materially lower cost/turns
+  than the harness (record the delta).
+
+**Constraints:** native Python under `mini_ork/`; no `mini-swe-agent`/litellm dependency; default
+tier stays `harness` (opt-in/router-gated) so researcher + all consumers are unaffected until the
+router promotes a node type. Minimal-agent command exec MUST go through the runtime seam.
+
 ## Phase R3 — docker, then managed (cloud)
 - `lib/runtime/docker.sh` (`docker exec` into a per-run container; workspace mounted) +
   `mo_runtime_put/get` real impls.
@@ -101,5 +136,12 @@ in this phase.
 
 ## Dispatch plan
 Each phase is one scoped `code-fix` kickoff (single deliverable, per the 2+-file dispatch rule).
-**Start with R0a** — additive, low-risk, validates the now-fixed dispatch vehicle (I-5 verdict.json
-+ I-7 test-gate). Verify each phase before the next; keep `local` the default until R2 lands.
+**Order: R0a → R0b → R2 → R5 (minimal-agent tier) → R3.** R5 runs after R2 so the minimal agent's
+command execution inherits the sandbox. Start with R0a — additive, low-risk, validates the
+now-fixed dispatch vehicle (I-5 verdict.json + I-7 test-gate). Verify each phase before the next;
+keep `local` the default backend and `harness` the default scaffold tier until explicitly opted in.
+
+**Self-improve flywheel:** as each phase lands it is turned on for the loop's OWN next iterations —
+R2 sandbox makes the self-builder run isolated; R5 routes the loop's bounded sub-tasks to the cheap
+minimal tier; later GEPA/memory/panel sharpen the loop's optimize/recall/verify. Consumers
+(researcher) only get a phase via opt-in / `mini-ork update`, never a forced default flip.
