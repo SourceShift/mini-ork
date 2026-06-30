@@ -24,6 +24,7 @@ from .providers import (
     parse_codex_usage,
     resolve_provider,
 )
+from .telemetry import cache_aware_cost, persist_call
 
 __all__ = [
     "dispatch",
@@ -42,4 +43,6 @@ __all__ = [
     "claude_env_for",
     "KNOWN_MODELS",
     "EXECUTABLE_MODELS",
+    "persist_call",
+    "cache_aware_cost",
 ]
