@@ -29,6 +29,10 @@
 #                 back to local with a WARN when bwrap is missing or the host
 #                 is not Linux. See lib/runtime/bubblewrap.sh for the isolation
 #                 contract.
+#   docker      — opt-in (R3); runs each command in a per-run container with
+#                 real put/get via `docker cp`; falls back to local with a WARN
+#                 when docker is missing or the daemon is unreachable. See
+#                 lib/runtime/docker.sh for the cid-file convention.
 #
 # Activation: the factory below runs at source-time. There is no opt-out.
 
