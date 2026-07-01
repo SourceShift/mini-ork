@@ -520,6 +520,25 @@ EOF
   export MINI_ORK_SELF_IMPROVE_WORKTREE="$wt_path"
   export MINI_ORK_TIMESTAMP="$ts"
 
+  # ── Loop-scoped default-on for the capabilities the loop itself built ──────
+  # These exports live in THIS iteration's process env only. They are NOT the
+  # repo-wide default and are NOT vendored into consumers — researcher and
+  # every other .mini-ork install stay default-off (local backend / harness
+  # tier) until each feature is proven and opted in. Operator env always wins.
+  #
+  # ON now — sandbox: run the self-builder isolated so a confused agent can't
+  # clobber a sibling repo (the exact corruption this project hit). Uses the R2
+  # bubblewrap backend on Linux; falls back to local with a WARN off-Linux or
+  # when bwrap is absent (macOS dev) — never blocks an iteration.
+  export MO_RUNTIME_BACKEND="${MO_RUNTIME_BACKEND:-bubblewrap}"
+  #
+  # STAGED (kept opt-in until safe to auto-use, so the loop doesn't degrade its
+  # own output): the minimal-agent tier (MO_SCAFFOLD_TIER=minimal) needs the
+  # complexity router to mature — self-improve nodes are open-ended code edits,
+  # the wrong fit for the bounded minimal agent today; and GEPA (MO_OPTIMIZER=
+  # gepa) needs its R4b reflect-loop wiring + integration tests before it evolves
+  # real prompts unattended. Enable per-run with those env vars meanwhile.
+
   local time_left=$(( HARD_DEADLINE - $(date +%s) ))
   local per_iter_budget=$(( time_left > 3600 ? 3600 : time_left ))
   echo "  [iter] dispatching (budget ${per_iter_budget}s)"
