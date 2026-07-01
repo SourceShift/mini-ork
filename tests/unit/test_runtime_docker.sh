@@ -53,9 +53,20 @@ else
 
   unset MO_RUNTIME_BACKEND
 
+  # DOCKER_AVAIL means docker can ACTUALLY RUN A CONTAINER — not merely that
+  # `docker info` answers. Sandboxed CI runners (docker-in-docker without
+  # privileges, blocked image pulls) pass `docker info` but fail `docker run`,
+  # which makes mo_runtime_start fall back to local → the container-cycle
+  # assertions (b)/(c) would test local, not docker (false pass) or fail on
+  # alive=0. Probe a real run so those tests SKIP honestly where docker can't
+  # run containers, and only exercise the container path where it truly works.
   DOCKER_AVAIL=0
-  command -v docker >/dev/null 2>&1 && timeout 5 docker info >/dev/null 2>&1 \
-    && DOCKER_AVAIL=1
+  if command -v docker >/dev/null 2>&1 && timeout 5 docker info >/dev/null 2>&1; then
+    _probe_img="${MO_RUNTIME_DOCKER_IMAGE:-debian:stable-slim}"
+    if timeout 120 docker run --rm "$_probe_img" true >/dev/null 2>&1; then
+      DOCKER_AVAIL=1
+    fi
+  fi
 
   # ── (a) docker unavailable: command still runs AND WARN surfaces ────────────
   # Load-bearing "degrade never fail" assertion — must execute on EVERY
