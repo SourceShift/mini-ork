@@ -214,6 +214,49 @@ if [ "${MO_LANE_ROUTER:-1}" != "0" ] \
   echo "  [lane_router] recomputed advantage for ${_LANES_UPDATED:-0} (lane, task_class) pair(s)"
 fi
 
+# R4b: GEPA-style reflective prompt optimizer — opt-in via MO_OPTIMIZER=gepa.
+# Wires mini_ork.optimize.gepa (Protocol + optimize()) plus
+# mini_ork.optimize.miniork_adapter.MiniOrkGepaAdapter into the reflect
+# hook. Suggests — does not auto-apply — a prompt change grounded in the
+# cached execution_traces + process_reward rows. DEFAULT PATH
+# (MO_OPTIMIZER unset) leaves this block fully skipped: no python
+# invocation, no DB write, output byte-identical to the pre-R4b reflect.
+if [ "${MO_OPTIMIZER:-}" = "gepa" ]; then
+  _GEPA_TASK_CLASS="${MO_OPTIMIZER_TASK_CLASS:-${TASK_CLASS_FILTER:-}}"
+  _GEPA_RECIPE="${MINI_ORK_RECIPE:-${_GEPA_TASK_CLASS:-default}}"
+  if [ -z "$_GEPA_TASK_CLASS" ] && [ "${MO_OPTIMIZER_ALLOW_DEFAULT:-0}" != "1" ]; then
+    echo "  [optimizer] MO_OPTIMIZER=gepa requires --task-class or MO_OPTIMIZER_TASK_CLASS; skipping" >&2
+  else
+    _GEPA_SUGGESTION_JSON="$(MO_OPTIMIZER_BUDGET="${MO_OPTIMIZER_BUDGET:-4}" \
+      python3 - "$_GEPA_TASK_CLASS" "$_GEPA_RECIPE" "$MINI_ORK_DB" <<'PY' 2>/dev/null || true
+import json, os, sys
+tc, recipe, db = sys.argv[1], sys.argv[2], sys.argv[3]
+from mini_ork.optimize import run_suggestion
+try:
+    print(json.dumps(run_suggestion(db_path=db, task_class=tc or "default", recipe=recipe or tc or "default")))
+except Exception as e:
+    print(json.dumps({"validity": "error", "description": f"gepa error: {e}", "output_type": "other"}))
+PY
+)"
+    if [ -n "$_GEPA_SUGGESTION_JSON" ]; then
+      _GEPA_VALIDITY=$(printf '%s' "$_GEPA_SUGGESTION_JSON" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("validity",""))' 2>/dev/null || echo "")
+      _GEPA_PATTERN_ID=$(printf '%s' "$_GEPA_SUGGESTION_JSON" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("pattern_id",""))' 2>/dev/null || echo "")
+      _GEPA_FULL_EVAL=$(printf '%s' "$_GEPA_SUGGESTION_JSON" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("full_eval_count",0))' 2>/dev/null || echo 0)
+      _GEPA_ART_DIR="${MINI_ORK_HOME}/optimizer"
+      mkdir -p "$_GEPA_ART_DIR" 2>/dev/null || true
+      if [ "$_GEPA_VALIDITY" = "valid" ] && [ -n "$_GEPA_PATTERN_ID" ] \
+         && [ -f "$MINI_ORK_ROOT/lib/pattern_store.sh" ]; then
+        _require_lib pattern_store
+        pattern_store "$_GEPA_SUGGESTION_JSON" >/dev/null 2>&1 || true
+      fi
+      if [ -n "$_GEPA_PATTERN_ID" ]; then
+        printf '%s\n' "$_GEPA_SUGGESTION_JSON" > "${_GEPA_ART_DIR}/${_GEPA_PATTERN_ID}.json" 2>/dev/null || true
+      fi
+      echo "  [optimizer] gepa suggestion: ${_GEPA_PATTERN_ID:-<none>} full_eval_count=${_GEPA_FULL_EVAL:-0}"
+    fi
+  fi
+fi
+
 # ── trace end ─────────────────────────────────────────────────────────────────
 # The closing trace carries WHAT reflect did (traces analyzed, gradients
 # written) — a bare status:"success" row gave gradient_extract nothing to
