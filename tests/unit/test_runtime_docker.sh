@@ -150,8 +150,8 @@ else
       fi
 
       echo "OK"
-    ) && _ok "(b) docker exec + put + get round-trip + alive + stop pass" \
-      || _fail "(b) docker container cycle failed"
+    ) 2>"${WORKSPACE}/b.err" && _ok "(b) docker exec + put + get round-trip + alive + stop pass" \
+      || _fail "(b) docker container cycle failed: $(tr '\n' ' ' < "${WORKSPACE}/b.err" 2>/dev/null | tail -c 300)"
   fi
 
   # ── (c) timeout mapping: rc=124 from `timeout --foreground` survives ───────
