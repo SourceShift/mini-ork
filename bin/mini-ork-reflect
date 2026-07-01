@@ -158,14 +158,23 @@ _REFLECT_START_TS=$(date +%s)
 reflection_run "$SINCE"
 
 # Patch #5: pattern_miner — group execution_traces clusters → pattern_records.
-# Gated by MO_PATTERN_MINER=1 so adoption is opt-in until burn-in proves it.
-if [ "${MO_PATTERN_MINER:-0}" = "1" ]; then
+# Default ON; opt-out via MO_PATTERN_MINER=0. Safe (read-as-context telemetry
+# only — no dispatch/exec change). See kickoffs/issue-fixes/close-learning-loop-writeback.md.
+if [ "${MO_PATTERN_MINER:-1}" != "0" ]; then
   _require_lib pattern_store
   _PATTERNS_WRITTEN=$(pattern_store_mine_from_traces \
       --window "${MO_PATTERN_MINER_WINDOW:-7d}" \
       --min-cluster "${MO_PATTERN_MINER_MIN_CLUSTER:-3}" 2>/dev/null || echo 0)
   echo "  [pattern_miner] wrote ${_PATTERNS_WRITTEN:-0} pattern_records rows"
 fi
+
+# Learning-loop write-back: count promotion suggestions persisted DURING this
+# run (status='proposed', detected_at >= _REFLECT_START_TS). reflection_run
+# internally invokes reflection_persist_suggestions (idempotent upsert keyed
+# by pattern_id) before this query runs.
+_SUGGESTIONS_WRITTEN=$(sqlite3 "$MINI_ORK_DB" \
+  "SELECT COUNT(*) FROM emergent_patterns WHERE status='proposed' AND detected_at >= ${_REFLECT_START_TS};" 2>/dev/null || echo 0)
+echo "[learning] persisted ${_PATTERNS_WRITTEN:-0} patterns, ${_SUGGESTIONS_WRITTEN:-0} suggestions"
 
 # E7: cross-epic gradient transfer — promote recurring targets across
 # task_classes into __cross_class__ gradients the planner reads everywhere.
