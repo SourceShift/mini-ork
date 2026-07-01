@@ -299,6 +299,95 @@ print(json.dumps(suggestions))
 PY
 }
 
+# desc: Persist promotion suggestions as durable, queryable, evidence-linked
+#       rows. Reuses the existing emergent_patterns table (status='proposed')
+#       rather than promotion_records (which is the heavy benchmark-gated
+#       APPLY path). Idempotent upsert keyed by pattern_id (PK), so repeated
+#       reflect runs do not duplicate rows. Args:
+#         $1 = JSON array of suggestions (output of reflection_suggest_promotions)
+#       Emits count of suggestions persisted on stdout.
+reflection_persist_suggestions() {
+  local suggestions_json="${1:?suggestions_json required}"
+  python3 - "${MINI_ORK_DB:?MINI_ORK_DB unset}" "$suggestions_json" <<'PY'
+import sqlite3, json, sys, time
+
+db, suggestions_json = sys.argv[1], sys.argv[2]
+try:
+    suggestions = json.loads(suggestions_json)
+except (json.JSONDecodeError, TypeError):
+    print(0)
+    sys.exit(0)
+if not isinstance(suggestions, list):
+    print(0)
+    sys.exit(0)
+
+con = sqlite3.connect(db)
+con.execute("PRAGMA busy_timeout=5000")
+# Schema mirror of db/migrations/0008_reflection_basins.sql (idempotent CREATE).
+con.execute("""
+    CREATE TABLE IF NOT EXISTS emergent_patterns (
+        pattern_id           TEXT PRIMARY KEY,
+        cluster_label        TEXT NOT NULL,
+        member_item_ids_json TEXT NOT NULL,
+        feature_set_json     TEXT NOT NULL,
+        strength_score       REAL NOT NULL,
+        suggested_meta_adr   TEXT,
+        status               TEXT NOT NULL DEFAULT 'proposed'
+                             CHECK(status IN ('proposed','approved','rejected','superseded')),
+        detected_at          INTEGER NOT NULL,
+        resolved_at          INTEGER
+    )
+""")
+now = int(time.time())
+persisted = 0
+for s in suggestions:
+    pid = s.get("pattern_id") or ""
+    if not pid:
+        continue
+    desc = (s.get("description") or "")[:500]
+    freq = s.get("frequency", 1)
+    try:
+        freq_f = float(freq)
+    except (TypeError, ValueError):
+        freq_f = 1.0
+    output_type = s.get("suggested_promotion_type") or "other"
+    ev = s.get("evidence_trace_ids", [])
+    if isinstance(ev, str):
+        try:
+            ev = json.loads(ev)
+        except Exception:
+            ev = []
+    if not isinstance(ev, list):
+        ev = []
+    members = [{"item_table": "execution_traces", "item_id": tid} for tid in ev if tid]
+    features = [output_type] if output_type else []
+    rationale = s.get("rationale") or None
+    # Idempotent upsert keyed by pattern_id (PK). INSERT OR REPLACE resets
+    # resolved_at to NULL and status to 'proposed' on each reflect run, which
+    # matches the kickoff's "no duplicates on re-run" requirement.
+    con.execute("""
+        INSERT OR REPLACE INTO emergent_patterns
+            (pattern_id, cluster_label, member_item_ids_json,
+             feature_set_json, strength_score, suggested_meta_adr,
+             status, detected_at, resolved_at)
+        VALUES (?,?,?,?,?,?,?,?,NULL)
+    """, (
+        pid,
+        desc,
+        json.dumps(members),
+        json.dumps(features),
+        freq_f,
+        rationale,
+        "proposed",
+        now,
+    ))
+    persisted += 1
+con.commit()
+con.close()
+print(persisted)
+PY
+}
+
 # desc: Orchestrate all 6 reflection steps sequentially. since_ts is unix epoch;
 #       defaults to 24 hours ago.
 reflection_run() {
@@ -344,12 +433,14 @@ PY
     reflection_summarize_patterns "$cid" >/dev/null
   done || true
 
-  echo "  [6/6] suggest_promotions" >&2
+  echo "  [6/6] suggest_promotions + persist" >&2
   local suggestions
   suggestions="$(reflection_suggest_promotions "pattern_records" 2>/dev/null || echo '[]')"
   local count
   count="$(python3 -c "import json,sys; print(len(json.loads(sys.argv[1])))" "$suggestions" 2>/dev/null || echo 0)"
-  echo "reflection_run: ${count} promotion suggestions generated" >&2
+  local persisted
+  persisted="$(reflection_persist_suggestions "$suggestions" 2>/dev/null || echo 0)"
+  echo "reflection_run: ${count} promotion suggestions generated, ${persisted:-0} persisted" >&2
   echo "$suggestions"
 }
 
