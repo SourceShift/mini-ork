@@ -28,7 +28,11 @@ exit 0
 STUB
 chmod +x "$TMP/codex"
 
-run_codex(){ PATH="$TMP:$PATH" CODEX_PROMPT_CAPTURE="$TMP/cap" bash "$ROOT/lib/providers/cl_codex.sh" "$@"; }
+# MO_TARGET_CWD pinned to $TMP (not $ROOT): without it the cwd-guard's PWD
+# fallback resolves to this repo's own checkout (which has bin/mini-ork) and
+# refuses the dispatch — this test isn't exercising the guard, just stdin
+# prompt handling, so it needs a non-framework target cwd.
+run_codex(){ MO_TARGET_CWD="$TMP" PATH="$TMP:$PATH" CODEX_PROMPT_CAPTURE="$TMP/cap" bash "$ROOT/lib/providers/cl_codex.sh" "$@"; }
 
 # 1. prompt via stdin, NO positional prompt → wrapper reads stdin
 : > "$TMP/cap"
