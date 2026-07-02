@@ -68,65 +68,29 @@ ensure_column() {
 ensure_column "execution_traces" "process_reward" "REAL DEFAULT NULL"
 ensure_column "agent_performance_memory" "relative_advantage" "REAL NOT NULL DEFAULT 0.0"
 
-# Apply each migration in lex order
-for migration_file in $(ls "$MIGRATIONS_DIR"/*.sql | sort); do
-  filename="$(basename "$migration_file")"
+# Apply migrations + views via the checksummed, transactional runner
+# (lib/migrate.sh): real sha256 checksums, one transaction per migration, and
+# in-place rehash of the old placeholder checksums. See
+# docs/_meta/migration-and-update-design.md.
+# shellcheck source=../lib/migrate.sh
+. "$SCRIPT_DIR/../lib/migrate.sh"
+export MINI_ORK_DB="$DB"
+export MINI_ORK_ROOT="${MINI_ORK_ROOT:-$(cd "$SCRIPT_DIR/.." && pwd)}"
+mo_migrate_ensure_table "$DB"
 
-  # Check if already applied (schema_migrations table may not exist yet on first run)
-  already_applied=$(sqlite3 "$DB" \
-    "SELECT COUNT(*) FROM schema_migrations WHERE filename='${filename}';" 2>/dev/null || echo "0")
+# Legacy recovery (preserved from the old inline runner): a partial/manual apply
+# can leave llm_calls.session_id present without 0018 marked. Mark it so the
+# runner won't try to re-ADD the column (which would fail). Only fires when the
+# column already exists; a fresh DB has no llm_calls table yet, so 0018 applies
+# normally.
+if sqlite3 "$DB" "PRAGMA table_info(llm_calls);" 2>/dev/null | awk -F'|' '$2=="session_id"{f=1} END{exit f?0:1}'; then
+  sqlite3 "$DB" "CREATE INDEX IF NOT EXISTS idx_llm_calls_session ON llm_calls(session_id) WHERE session_id IS NOT NULL;" 2>/dev/null || true
+  sqlite3 "$DB" "INSERT OR IGNORE INTO schema_migrations(filename, applied_at, checksum) VALUES ('0018_llm_calls_session_id.sql', strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'recovered-existing-session-id');" 2>/dev/null || true
+fi
 
-  if [ "$already_applied" = "1" ]; then
-    echo "  [skip] $filename — already applied"
-  else
-    echo "  [apply] $filename"
-    if sqlite3 "$DB" < "$migration_file"; then
-      sqlite3 "$DB" \
-        "INSERT OR IGNORE INTO schema_migrations(filename, applied_at, checksum) VALUES ('$filename', strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'runner-applied');"
-      echo "  [ok]   $filename"
-    elif [ "$filename" = "0018_llm_calls_session_id.sql" ] && \
-         sqlite3 "$DB" "PRAGMA table_info(llm_calls);" 2>/dev/null | awk -F'|' '$2=="session_id"{found=1} END{exit found?0:1}'; then
-      # Older DBs may already have the column from a partial/manual apply but
-      # lack the schema_migrations marker. Finish the idempotent parts and
-      # mark the migration so `mini-ork init` remains safe to re-run.
-      sqlite3 "$DB" "
-        CREATE INDEX IF NOT EXISTS idx_llm_calls_session
-          ON llm_calls(session_id) WHERE session_id IS NOT NULL;
-        UPDATE llm_calls
-           SET session_id = json_extract(metadata_json, '$.session_id')
-         WHERE session_id IS NULL
-           AND metadata_json IS NOT NULL;
-        INSERT OR IGNORE INTO schema_migrations(filename, applied_at, checksum)
-        VALUES ('$filename', strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'recovered-existing-session-id');
-      "
-      echo "  [ok]   $filename — recovered existing session_id column"
-    else
-      exit 1
-    fi
-  fi
-done
-
-# Apply views in lex order, idempotently.
-# Views use CREATE VIEW IF NOT EXISTS so re-applying is safe.
-# We also track them in schema_migrations so `mini-ork doctor` can
-# report which view files have been applied.
+mo_migrate_apply "$MIGRATIONS_DIR" || exit 1
 if [ -d "$VIEWS_DIR" ]; then
-  for view_file in $(ls "$VIEWS_DIR"/*.sql 2>/dev/null | sort); do
-    viewfilename="$(basename "$view_file")"
-
-    already_applied=$(sqlite3 "$DB" \
-      "SELECT COUNT(*) FROM schema_migrations WHERE filename='${viewfilename}';" 2>/dev/null || echo "0")
-
-    if [ "$already_applied" = "1" ]; then
-      echo "  [skip] $viewfilename — already applied"
-    else
-      echo "  [apply view] $viewfilename"
-      sqlite3 "$DB" < "$view_file"
-      sqlite3 "$DB" \
-        "INSERT OR IGNORE INTO schema_migrations(filename, applied_at, checksum) VALUES ('${viewfilename}', strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'view-v1');"
-      echo "  [ok]   $viewfilename"
-    fi
-  done
+  mo_migrate_apply "$VIEWS_DIR" || exit 1
 else
   echo "  [info] No views dir found at $VIEWS_DIR — skipping"
 fi
