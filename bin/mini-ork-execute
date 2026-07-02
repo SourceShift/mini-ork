@@ -2373,7 +2373,11 @@ PY
       # (D-011/D-016 class) — strict json.load gave verdict=unknown and
       # cascaded a passing run into rollback (run-1781105320-64712).
       VERDICT=$(python3 "$MINI_ORK_ROOT/lib/extract_verdict.py" "$REVIEW_FILE" 2>/dev/null || echo "unknown")
-      echo "  [ok] reviewer verdict=${VERDICT} → $REVIEW_FILE"
+      # [info], not [ok] — extraction succeeding says nothing about whether the
+      # verdict itself will pass the gate below. A prior "[ok] verdict=fail"
+      # log line read as a benign status update immediately ahead of a hard
+      # node failure, which is confusing to debug from logs alone.
+      echo "  [info] reviewer verdict=${VERDICT} → $REVIEW_FILE"
       # D-042 rich trace payload — reviewer/synthesizer node
       local _verdict_norm
       _verdict_norm=$(printf '%s' "$VERDICT" | tr '[:upper:]' '[:lower:]')
@@ -2396,6 +2400,9 @@ PY
             return 1
             ;;
           *)
+            echo "  [fail] reviewer node '${node_id}' verdict='${VERDICT}' is not one of pass|approve|approved|revise|needs_revision|request_changes|fail|failed|escalate — treating as a failed node." >&2
+            echo "         extract_verdict.py could not find a recognized 'verdict' key in $REVIEW_FILE." >&2
+            echo "         If this reviewer's output is informational only (no recipe edge/loop branches on its verdict), use type: researcher instead — it captures the same response without the pass/fail gate. See docs/EXTENSION.md § Node type dispatch semantics." >&2
             MO_NODE_FINISH_REASON="verdict_fail"
             _trace_write_node_rich "$NODE_TRACE_ID" "failure" "reviewer" "$REVIEW_FILE" "$VERDICT" "$MO_NODE_FINISH_REASON"
             _d022_charge_node_cost "${MINI_ORK_RUN_DIR}/.last-llm-cost"
