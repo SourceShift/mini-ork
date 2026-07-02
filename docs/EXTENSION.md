@@ -96,6 +96,50 @@ There is no top-level `mini-ork validate` command yet. Until recipe validation i
 MINI_ORK_DRY_RUN=1 bin/mini-ork run my-recipe kickoff.md
 ```
 
+### Node type dispatch semantics
+
+The `workflow.yaml` fields above describe the *shape* of a node. They don't
+describe what `bin/mini-ork-execute` actually *does* with each `type` at
+dispatch time — and the difference matters: two node types that look
+interchangeable have very different guarantees about whether your LLM
+call's output actually becomes a usable artifact.
+
+| Type | Write-target injected into prompt? | Response captured if the model doesn't write a file itself? | Gated on a `verdict`? |
+|---|---|---|---|
+| `researcher` | Yes — `"Write your output to: $RUN_DIR/context-<node_id>.json"` (a real resolved path, not a variable the model has to expand) | Yes — raw response text is saved to that path as a fallback | No |
+| `reviewer` | Yes — same as `researcher`, saved to `$RUN_DIR/review-<node_id>.json` | Yes — same fallback | **Yes**, see below |
+| `implementer` | No | **No.** `IMPL_LOG` only stores raw stdout for forensics; it is never treated as a data artifact | No |
+| `verifier` | N/A (runs `verifier_ref` script, no LLM call) | N/A | N/A (exit code is the verdict) |
+| `publisher` / `rollback` | N/A (`prompt_ref: null`, deterministic) | N/A | N/A |
+
+**Use `researcher` for any stage whose job is "generate content and hand it
+to the next node."** This is the default choice — it's what every shipped
+lens/synthesis-style recipe (`chapter-review`, `dsp-planning-burst`) uses.
+The model doesn't need a file-write tool at all: tell it in the prompt to
+emit exactly one JSON value as its final response, and mini-ork saves it.
+
+**Use `implementer` only for actual code-editing tasks against a git
+checkout.** It's the only node type where `MO_TARGET_CWD` gets pinned to a
+worktree, matching `code-fix` / `recursive-validate-impl`'s pattern of
+having the model edit real files in a real repo. If you route a
+"generate JSON, write it to the run dir" task through `implementer`, the
+LLM call will report `[ok] implementer output` — success! — while
+producing zero usable artifact, because nothing captures its response.
+This failure mode is silent: the dispatch itself doesn't error.
+
+**The `reviewer` verdict gate.** After capturing the response,
+`lib/extract_verdict.py` looks for a `verdict` key and requires its value
+to be one of `pass`/`approve`/`approved` to succeed. `revise`/
+`needs_revision`/`request_changes`/`fail`/`failed`/`escalate` — and
+critically, *anything else, including a missing `verdict` key entirely* —
+fails the node (`return 1`) and is counted toward `FAIL_COUNT`. This gate
+exists for recipes whose edges/loop genuinely branch on the verdict
+(escalate-to-reflector patterns). If your reviewer node is informational
+only — its prompt's real output contract has no `verdict` field, e.g.
+`{"passed": bool, "notes": "..."}`  — this gate will unconditionally fail
+that node regardless of how valid the content is. Use `type: researcher`
+instead; it captures identical content without the gate.
+
 ---
 
 ## 2. AgentRegistry
