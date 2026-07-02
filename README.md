@@ -125,6 +125,28 @@ mini-ork is a worker, not a replacement. Compose it under whatever agentic CLI y
 
 For **multi-recipe roadmaps**, use `mini-ork epics` (ingest + split) + `mini-ork scheduler` (autonomous dispatch) + `mini-ork review` (pre-push code reviewer with fix-loop). See [docs/EXTENSION.md](docs/EXTENSION.md) for adding your own recipes, lanes, or verifiers.
 
+### Install the Claude Code skill (recommended)
+
+mini-ork ships an **Agent Skill** at [skills/mini-ork/SKILL.md](skills/mini-ork/SKILL.md) so a
+skill-aware CLI (Claude Code, and other agents that read `SKILL.md`) drives the orchestrator
+*correctly* instead of improvising flags, paths, or recipes. It encodes the SAFE-USAGE CONTRACT
+(cwd/target isolation, `MINI_ORK_ROOT`, kickoff sizing) that prevents the top failure modes —
+cross-repo corruption, hollow/truncated plans, silent lane stalls.
+
+Install it once (user-level, available in every project):
+
+```bash
+# user scope — all repos
+mkdir -p ~/.claude/skills && cp -r skills/mini-ork ~/.claude/skills/
+
+# or project scope — this repo only
+mkdir -p .claude/skills && cp -r skills/mini-ork .claude/skills/
+```
+
+Then it auto-triggers on prompts like *"run this kickoff"*, *"dispatch a framework-edit / code-fix"*,
+*"ingest this roadmap / run the scheduler"*, or *"what recipe should I use"* — the agent loads the
+skill and drives `bin/mini-ork` with the right cwd, lanes, and recipe.
+
 ---
 
 ## Recipes
