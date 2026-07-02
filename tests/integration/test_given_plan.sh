@@ -16,6 +16,11 @@ set -uo pipefail
 MINI_ORK_ROOT="${MINI_ORK_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 export MINI_ORK_ROOT
 export PATH="$MINI_ORK_ROOT/bin:$PATH"
+# The CI integration harness exports MINI_ORK_DRY_RUN=1 globally (to keep tests
+# LLM-free). The given-plan branch lives AFTER the --dry-run short-circuit, so
+# these invocations MUST run non-dry to reach it — and they still make no LLM
+# call (MO_GIVEN_PLAN skips the planner dispatch), so this stays credential-free.
+export MINI_ORK_DRY_RUN=0
 
 TMPROOT=$(mktemp -d /tmp/ork-givenplan-XXXXXX)
 trap 'cd /; rm -rf "$TMPROOT"' EXIT
