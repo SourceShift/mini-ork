@@ -24,10 +24,17 @@ Run `ls {{MO_CN_PREFETCH_DIR}}` — if any `*.md` files exist there, cat each on
 | Input | Source |
 |---|---|
 | `plan.json` | Planner output |
-| `implementer_summary.json` | Implementer output |
+| `implementer-summary.json` | Implementer output (`files_changed`, `rationale`, `confidence`, `scope_violations`, `skipped_steps`, `notes`) |
 | `verifier_typecheck.json` | typecheck.sh output (`{ verifier, pass, evidence_path, error_summary }`) |
 | `verifier_test.json` | test.sh output (same shape) |
-| `diff` | Full unified diff of all changed files |
+| `review-diff.patch` | Unified diff of the files listed in `implementer-summary.files_changed`, scoped to the implementer's worktree |
+
+> **Inputs are pre-assembled for you.** `bin/mini-ork-execute` writes these four
+> files into `$RUN_DIR` (under `implementer-summary.json`, `verifier_typecheck.json`,
+> `verifier_test.json`, `review-diff.patch`) and embeds their contents inline in
+> the prompt below as a "Reviewer inputs" block. Read THAT block — do not try
+> to `cat` paths of your own. If any input is missing, it is shown as
+> `(not available)`.
 
 ---
 
@@ -39,12 +46,12 @@ Issue APPROVE **only** when ALL of the following hold:
 
 1. `verifier_typecheck.json` → `pass: true`
 2. `verifier_test.json` → `pass: true`
-3. Every file in `implementer_summary.files_changed` is within the plan's
+3. Every file in `implementer-summary.files_changed` is within the plan's
    expected edit surface (no scope surprise).
 4. The diff matches the plan's `decomposition` — no unexplained hunks.
 5. No forbidden pattern is introduced (silent catch, default fallback, debug output,
    new global side effect, deleted file not in plan, reformatted unrelated lines).
-6. `implementer_summary.confidence` is ≥ 0.6 (below this, flag in `evidence`).
+6. `implementer-summary.confidence` is ≥ 0.6 (below this, flag in `evidence`).
 
 If any single condition fails: do NOT APPROVE.
 
