@@ -628,7 +628,23 @@ _plan_dispatch_err=""
 if [ "${MO_PLAN_DEBUG_LOG:-1}" != "0" ] && [ -n "${RUN_DIR:-}" ] && [ -d "$RUN_DIR" ]; then
   _plan_dispatch_err="$RUN_DIR/plan-dispatch.err.log"
 fi
-if [ -n "$_plan_dispatch_err" ]; then
+# Given-plan mode (MO_GIVEN_PLAN=<path>): the caller supplies a complete plan
+# JSON, so the planner LLM dispatch is skipped entirely. The supplied plan
+# flows through the SAME extraction + schema/validation gates below as an
+# LLM-produced plan — quality gates are preserved; only the redundant
+# derivation call is removed. Intended for forced/static recipes whose plan
+# is fully determined by their workflow.yaml (re-deriving it per run buys
+# nothing and costs a planner-lane LLM call each time). Fail-loud contract:
+# an unreadable path is an error, never a silent fallback to the LLM.
+if [ -n "${MO_GIVEN_PLAN:-}" ]; then
+  if [ ! -r "$MO_GIVEN_PLAN" ]; then
+    echo "MO_GIVEN_PLAN is set but not readable: $MO_GIVEN_PLAN" >&2
+    trace_write "{\"trace_id\":\"$TRACE_ID\",\"task_class\":\"${TASK_CLASS}\",\"status\":\"failure\",\"reason\":\"given_plan_unreadable\"}" >/dev/null 2>&1 || true
+    exit 1
+  fi
+  PLAN_JSON_RAW=$(cat "$MO_GIVEN_PLAN")
+  echo "plan: using given plan from MO_GIVEN_PLAN=$MO_GIVEN_PLAN (planner LLM skipped)" >&2
+elif [ -n "$_plan_dispatch_err" ]; then
   PLAN_JSON_RAW=$(llm_dispatch \
     --task-class "$TASK_CLASS" \
     --node-type "planner" \
