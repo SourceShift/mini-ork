@@ -86,7 +86,11 @@ echo '{"type":"turn.completed","usage":{"input_tokens":1000000,"cached_input_tok
 [ -n "$LAST" ] && printf 'body\n' > "$LAST"
 EOF
 chmod +x "$TMP/stubbin/codex"
+# MO_TARGET_CWD pinned to $TMP: without it the cwd-guard's PWD fallback
+# resolves to this repo's own checkout (which has bin/mini-ork) and refuses
+# the dispatch — this test exercises telemetry sidecars, not the guard.
 PATH="$TMP/stubbin:$PATH" \
+  MO_TARGET_CWD="$TMP" \
   MO_USAGE_FILE="$TMP/u.tokens" MO_TURNS_FILE="$TMP/t.jsonl" MO_COST_FILE="$TMP/c.cost" \
   MO_CODEX_USD_PER_MTOK_IN=1.0 MO_CODEX_USD_PER_MTOK_OUT=10.0 \
   "$ROOT/lib/providers/cl_codex.sh" --print --output-format text "p" >/dev/null 2>&1
