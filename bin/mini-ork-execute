@@ -159,6 +159,118 @@ PY
   return 1
 }
 
+# _mo_assemble_reviewer_inputs — write review-diff.patch and build the reviewer
+# prompt context block (D-RIA, 2026-07-02).
+#
+# Reads from $RUN_DIR (preferred) or $1 if passed:
+#   - implementer-summary.json (the implementer's JSON summary, including
+#     files_changed and worktree_path)
+#   - verifier_typecheck.json + verifier_test.json (verifier verdicts,
+#     persisted by the verifier node handler)
+# Writes $RUN_DIR/review-diff.patch (unified diff of files_changed scoped to
+# the implementer's worktree, or a `(no diff available)` marker) and prints a
+# reviewer-context block to stdout, ready to append to the reviewer's
+# PROMPT_CONTENT.
+#
+# Missing inputs degrade to "(not available)" — the function never aborts on
+# missing files. The "hard-abstain" instruction in the block tells the LLM to
+# review whatever IS present and only refuse a verdict when BOTH the diff
+# AND the summary are absent.
+_mo_assemble_reviewer_inputs() {
+  local _run_dir="${1:-${MINI_ORK_RUN_DIR:-${RUN_DIR:-}}}"
+  if [ -z "$_run_dir" ]; then
+    return 0
+  fi
+  mkdir -p "$_run_dir" 2>/dev/null || true
+
+  # Resolve the worktree the implementer wrote to (prefer worktree_path from
+  # the summary; fall back to MO_TARGET_CWD, then $PWD).
+  local _worktree=""
+  if [ -f "$_run_dir/implementer-summary.json" ]; then
+    _worktree=$(python3 - "$_run_dir/implementer-summary.json" <<'PY' 2>/dev/null
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+    print(d.get("worktree_path") or "")
+except Exception:
+    pass
+PY
+    )
+  fi
+  if [ -z "$_worktree" ] || [ ! -d "$_worktree" ]; then
+    _worktree="${MO_TARGET_CWD:-$PWD}"
+  fi
+
+  # Generate review-diff.patch (D-RIA deliverable #2)
+  local _diff_path="$_run_dir/review-diff.patch"
+  local _files=""
+  if [ -f "$_run_dir/implementer-summary.json" ]; then
+    _files=$(python3 - "$_run_dir/implementer-summary.json" <<'PY' 2>/dev/null
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+    fc = d.get("files_changed") or []
+    if isinstance(fc, list):
+        print(" ".join(str(x) for x in fc))
+except Exception:
+    pass
+PY
+    )
+  fi
+  if [ -d "$_worktree" ] \
+      && git -C "$_worktree" rev-parse --git-dir >/dev/null 2>&1; then
+    if [ -n "$_files" ]; then
+      git -C "$_worktree" diff --no-color -- "${_files}" \
+        > "$_diff_path" 2>/dev/null || true
+    else
+      git -C "$_worktree" diff --no-color \
+        > "$_diff_path" 2>/dev/null || true
+    fi
+  fi
+  if [ ! -s "$_diff_path" ]; then
+    # Either no diff at all, no worktree, or git error — write an empty
+    # marker so the reviewer LLM can see we tried. Not fatal.
+    : > "$_diff_path"
+  fi
+
+  # Build the context block (D-RIA deliverable #3)
+  local _block=""
+  _block="${_block}--- Reviewer inputs (assembled by mini-ork-execute) ---"$'\n'
+
+  if [ -s "$_run_dir/implementer-summary.json" ]; then
+    _block="${_block}"$'\n'"# implementer-summary.json"$'\n'
+    _block="${_block}$(cat "$_run_dir/implementer-summary.json")"$'\n'
+  else
+    _block="${_block}"$'\n'"# implementer-summary.json"$'\n'
+    _block="${_block}(not available)"$'\n'
+  fi
+
+  for _vstem in typecheck test; do
+    local _vfile="$_run_dir/verifier_${_vstem}.json"
+    if [ -s "$_vfile" ]; then
+      _block="${_block}"$'\n'"# verifier_${_vstem}.json"$'\n'
+      _block="${_block}$(cat "$_vfile")"$'\n'
+    else
+      _block="${_block}"$'\n'"# verifier_${_vstem}.json"$'\n'
+      _block="${_block}(not available)"$'\n'
+    fi
+  done
+
+  _block="${_block}"$'\n'"# review-diff.patch"$'\n'
+  if [ -s "$_diff_path" ]; then
+    _block="${_block}$(cat "$_diff_path")"$'\n'
+  else
+    _block="${_block}(no diff)"$'\n'
+  fi
+
+  _block="${_block}"$'\n'\
+"--- End reviewer inputs ---"$'\n'$'\n'
+  _block="${_block}"\
+"REVIEWER NOTE: The four inputs above are required for a real verdict. If any input is marked '(not available)' or '(no diff)', review what IS present. Only hard-abstain (verdict=needs_revision with reason 'inputs missing') when BOTH the diff and the summary are absent — that is the only genuine no-op case. A missing verifier verdict is a real failure signal, not an abstention excuse."$'\n'
+
+  printf '%s' "$_block"
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --help|-h)          _usage; exit 0 ;;
@@ -2499,7 +2611,15 @@ PY
         PROMPT_CONTENT="${_prepend}Synthesize for: ${node_desc}${_learned_block}\n\nPlan:\n${PLAN_CONTENT}\n\nWrite your synthesis to: ${REVIEW_FILE}"
       else
         # Classic reviewer: verdict-JSON envelope expected.
-        PROMPT_CONTENT="${_prepend}Review the implementation for: ${node_desc}${_learned_block}\n\nPlan:\n${PLAN_CONTENT}\n\nRespond with JSON: {\"verdict\": \"pass|fail|needs_revision\", \"notes\": []}"
+        # D-RIA (2026-07-02): assemble + inject the four required reviewer
+        # inputs (implementer-summary.json, verifier_{typecheck,test}.json,
+        # review-diff.patch) into the prompt BEFORE the JSON envelope so the
+        # reviewer LLM actually receives them — previous behavior emitted the
+        # envelope with no inputs, so reviewers hard-abstained with "missing
+        # inputs" every time (a real verdict never happened → gate was theater).
+        local _reviewer_inputs
+        _reviewer_inputs="$(_mo_assemble_reviewer_inputs 2>/dev/null || true)"
+        PROMPT_CONTENT="${_prepend}Review the implementation for: ${node_desc}${_learned_block}\n\nPlan:\n${PLAN_CONTENT}\n\n${_reviewer_inputs}\nRespond with JSON: {\"verdict\": \"pass|fail|needs_revision\", \"notes\": []}"
       fi
       export MO_NODE_ID="$node_id"
       local _dispatch_marker="$RUN_DIR/.dispatch-marker-${node_id}"
@@ -2621,6 +2741,18 @@ PY
           else
             echo "  [fail] verifier_ref $node_verifier_ref failed → $_evidence_path" >&2
             MO_NODE_FINISH_REASON="error"
+          fi
+          # D-RIA (2026-07-02): persist verifier JSON to a stable path the
+          # reviewer reads. The reviewer prompt's "Inputs" table references
+          # `verifier_<name>.json` — without this persist, only the timestamped
+          # evidence log exists and the reviewer hard-abstains ("missing
+          # inputs"). Copy BEFORE the failure return so failures are visible
+          # too (a missing-verifier is a real signal, not an abstention excuse).
+          local _vpersist_dir="${MINI_ORK_RUN_DIR:-${RUN_DIR:-}}"
+          if [ -n "$_vpersist_dir" ] && [ -s "$_evidence_path" ]; then
+            cp "$_evidence_path" "$_vpersist_dir/verifier_${_vstem}.json" 2>/dev/null || true
+          fi
+          if [ "$MO_NODE_FINISH_REASON" = "error" ]; then
             return 1
           fi
         else
