@@ -43,7 +43,11 @@ STUB
 chmod +x "$TMP/codex"
 
 run_wrapper(){ # $1=format ; rest via env already set by caller
-  PATH="$TMP:$PATH" bash "$ROOT/lib/providers/cl_codex.sh" --print --output-format "$1" "do the thing"
+  # MO_TARGET_CWD pinned to $TMP (not $ROOT): without it the cwd-guard's PWD
+  # fallback resolves to this repo's own checkout (which has bin/mini-ork)
+  # and refuses the dispatch — this test isn't exercising the guard, just
+  # the wrapper's E2BIG handling, so it needs a non-framework target cwd.
+  MO_TARGET_CWD="$TMP" PATH="$TMP:$PATH" bash "$ROOT/lib/providers/cl_codex.sh" --print --output-format "$1" "do the thing"
 }
 
 # ── Scenario A: last-message present (sites 187 harvest + 311 clean + 356) ──
