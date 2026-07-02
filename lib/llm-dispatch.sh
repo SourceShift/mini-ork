@@ -1123,6 +1123,23 @@ mo_llm_smoke() {
   return 1
 }
 
+# Generic lane-agnostic retry predicate. Composes the existing classifier
+# (capacity|network|stream|provider → retryable; quota|auth|config|request|safety → terminal)
+# with an attempt-bound guard. Returns 0 only when retryable category AND
+# attempt < max_attempts. Lane-specific overrides (GLM fair-usage) live in their
+# own predicates and must be evaluated first in the retry loop.
+_mo_llm_throttle_retryable() {
+  local model="${1:-}" message="${2:-}" rc="${3:-}" attempt="${4:-1}" max_attempts="${5:-1}"
+  [ -n "$model" ] || return 1
+  case "$attempt" in ''|*[!0-9]*) attempt=1 ;; esac
+  case "$max_attempts" in ''|*[!0-9]*) max_attempts=1 ;; esac
+  [ "$attempt" -lt "$max_attempts" ] || return 1
+  local _category
+  _category=$(_mo_llm_classify_error "$message" "$rc")
+  [ "$(_mo_llm_error_retryable "$_category")" = "1" ] || return 1
+  return 0
+}
+
 _mo_llm_glm_fair_usage_retryable() {
   local model="${1:-}" message="${2:-}" attempt="${3:-1}" max_attempts="${4:-1}"
   [ "$model" = "glm" ] || return 1
@@ -1132,9 +1149,27 @@ _mo_llm_glm_fair_usage_retryable() {
 }
 
 _mo_llm_glm_backoff_seconds() {
-  local attempt="${1:-1}" max_sleep="${MO_GLM_RETRY_MAX_SLEEP_S:-45}" base_s="${MO_GLM_RETRY_BASE_S:-5}"
+  local attempt="${1:-1}"
+  local max_sleep="${MO_GLM_RETRY_MAX_SLEEP_S:-${MO_DISPATCH_RETRY_MAX_SLEEP_S:-45}}"
+  local base_s="${MO_GLM_RETRY_BASE_S:-${MO_DISPATCH_RETRY_BASE_S:-5}}"
+  _mo_llm_backoff_seconds_raw "$attempt" "$max_sleep" "$base_s"
+}
+
+# Generic lane-agnostic backoff: exponential + jitter, capped at max_sleep,
+# floored at 1s. attempt clamped to [1,12] to avoid bash integer overflow
+# (`2**(attempt-1)` exceeds 64-bit past attempt≈31).
+_mo_llm_backoff_seconds() {
+  local attempt="${1:-1}" max_sleep="${MO_DISPATCH_RETRY_MAX_SLEEP_S:-45}" base_s="${MO_DISPATCH_RETRY_BASE_S:-5}"
+  _mo_llm_backoff_seconds_raw "$attempt" "$max_sleep" "$base_s"
+}
+
+_mo_llm_backoff_seconds_raw() {
+  local attempt="$1" max_sleep="$2" base_s="$3"
   case "$max_sleep" in ''|*[!0-9]*) max_sleep=45 ;; esac
   case "$base_s" in ''|*[!0-9]*) base_s=5 ;; esac
+  case "$attempt" in ''|*[!0-9]*) attempt=1 ;; esac
+  [ "$attempt" -lt 1 ] && attempt=1
+  [ "$attempt" -gt 12 ] && attempt=12
   local base=$((2 ** (attempt - 1) * base_s))
   local jitter=$((RANDOM % 4))
   local delay=$((base + jitter))
@@ -1285,11 +1320,11 @@ PY
     _mo_llm_write_duration_ms 0
     return 127
   }
-  local _dispatch_ok=0 _dispatch_rc=0 _attempt=1 _max_attempts=1
-  if [ "$model" = "glm" ]; then
-    _max_attempts="${MO_GLM_MAX_ATTEMPTS:-3}"
-    case "$_max_attempts" in ''|*[!0-9]*) _max_attempts=3 ;; esac
-    [ "$_max_attempts" -lt 1 ] && _max_attempts=1
+  local _dispatch_ok=0 _dispatch_rc=0 _attempt=1 _max_attempts="${MO_DISPATCH_MAX_ATTEMPTS:-3}"
+  case "$_max_attempts" in ''|*[!0-9]*) _max_attempts=3 ;; esac
+  [ "$_max_attempts" -lt 1 ] && _max_attempts=1
+  if [ "$model" = "glm" ] && [ -n "${MO_GLM_MAX_ATTEMPTS:-}" ]; then
+    case "$MO_GLM_MAX_ATTEMPTS" in ''|*[!0-9]*) ;; *) [ "$MO_GLM_MAX_ATTEMPTS" -gt "$_max_attempts" ] && _max_attempts="$MO_GLM_MAX_ATTEMPTS" ;; esac
   fi
   while :; do
     : > "$_err_file" 2>/dev/null || true
@@ -1311,10 +1346,22 @@ PY
         tail -c 1000 "$out_file" 2>/dev/null || true
       } | tail -c 2000
     )
-    if _mo_llm_glm_fair_usage_retryable "$model" "$_retry_probe" "$_attempt" "$_max_attempts"; then
-      local _sleep_s
-      _sleep_s=$(_mo_llm_glm_backoff_seconds "$_attempt")
-      echo "[llm_dispatch RETRY model=glm reason=fair_usage attempt=${_attempt}/${_max_attempts} sleep=${_sleep_s}s]" >&2
+    local _category
+    _category=$(_mo_llm_classify_error "$_retry_probe" "$_dispatch_rc")
+    # GLM fair-usage must be evaluated FIRST: its raw 429/1313 regex catches
+    # 'fair usage' messages that the generic classifier routes to 'quota'
+    # (= non-retryable). Falling through to the generic predicate would lose
+    # GLM retries and silently sink runs (the original failure mode).
+    if _mo_llm_glm_fair_usage_retryable "$model" "$_retry_probe" "$_attempt" "$_max_attempts" \
+       || _mo_llm_throttle_retryable "$model" "$_retry_probe" "$_dispatch_rc" "$_attempt" "$_max_attempts"; then
+      local _sleep_s _reason
+      if _mo_llm_glm_fair_usage_retryable "$model" "$_retry_probe" "$_attempt" "$_max_attempts"; then
+        _reason="fair_usage"
+      else
+        _reason="${_category:-unknown}"
+      fi
+      _sleep_s=$(_mo_llm_backoff_seconds "$_attempt")
+      echo "[llm_dispatch RETRY model=$model reason=${_reason} attempt=${_attempt}/${_max_attempts} sleep=${_sleep_s}s]" >&2
       sleep "$_sleep_s"
       _attempt=$((_attempt + 1))
       continue
