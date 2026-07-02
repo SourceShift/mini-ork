@@ -654,6 +654,167 @@ print(written)
 PY
 }
 
+# _publisher_try_commit_files — M1 publisher-commit seam.
+#
+# When the recipe's artifact_contract.yaml has no outputs[] (code-fix
+# convention), the publisher traditionally no-ops because there is no
+# artifact to ship. M1 semantics: instead of silently dropping the
+# implementer's in-place edits, commit them on reviewer APPROVE.
+#
+# Resolves verdict defensively across recipes:
+#   1) $RUN_DIR/panel-verdict.json   (recursive-validate-impl convention)
+#   2) $RUN_DIR/review-verdict.json  (code-fix / mini-ork-publisher)
+#   3) $REVIEW_FILE via lib/extract_verdict.py
+#   4) $VERDICT shell var (set by the reviewer node at line ~2375)
+# Then loads ${RUN_DIR}/implementer-summary.json and validates each
+# files_changed[] entry via python3 realpath (portable; rejects paths
+# missing OR escaping target_repo toplevel). On APPROVE + valid paths,
+# `git add --` ONLY those files (no `-A` — OSS-leak guard, 2026-06-13)
+# and commits with an attribution footer.
+#
+# rc=0 → committed (logs `[publish] <N> file(s): <sha>`). Caller can
+#         `_d021_set_status "published"` + return 0 to skip the rest of
+#         the empty-outputs branch.
+# rc=1 → skipped with reason logged to stderr. Caller falls through to
+#         the existing log+published behavior at line ~2618.
+_publisher_try_commit_files() {
+  local target_repo="${1:-}"
+  RUN_DIR="${MINI_ORK_RUN_DIR:-${RUN_DIR:-}}" \
+  MO_TARGET_CWD="$target_repo" \
+  REVIEW_FILE="${REVIEW_FILE:-}" \
+  VERDICT="${VERDICT:-}" \
+  MINI_ORK_ROOT="${MINI_ORK_ROOT:-}" \
+  MINI_ORK_RECIPE="${MINI_ORK_RECIPE:-code-fix}" \
+  MINI_ORK_NODE_DESC="${MINI_ORK_NODE_DESC:-implementer}" \
+  MINI_ORK_RUN_ID="${MINI_ORK_RUN_ID:-local}" \
+  python3 - <<'PY'
+import os, json, subprocess, sys
+
+run_dir = os.environ.get("RUN_DIR", "")
+recipe_root = os.environ.get("MINI_ORK_ROOT", "")
+summary_path = os.path.join(run_dir, "implementer-summary.json") if run_dir else ""
+target_repo = os.environ.get("MO_TARGET_CWD", "")
+review_file = os.environ.get("REVIEW_FILE", "")
+recipe = os.environ.get("MINI_ORK_RECIPE", "code-fix")
+desc = os.environ.get("MINI_ORK_NODE_DESC", "implementer")
+run_id = os.environ.get("MINI_ORK_RUN_ID", "local")
+
+def log(msg):
+    print(msg, file=sys.stderr, flush=True)
+
+verdict = ""
+candidates = []
+if run_dir:
+    for name in ("panel-verdict.json", "review-verdict.json"):
+        p = os.path.join(run_dir, name)
+        if os.path.isfile(p):
+            candidates.append(p)
+if review_file and os.path.isfile(review_file):
+    candidates.append(review_file)
+for p in candidates:
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        continue
+    if not isinstance(data, dict):
+        continue
+    v = str(data.get("verdict", "")).strip().lower()
+    pv = data.get("pass")
+    if pv is True or v in {"approve", "approved", "pass"}:
+        verdict = "approve"
+        break
+
+if verdict != "approve" and review_file and recipe_root:
+    try:
+        out = subprocess.check_output(
+            ["python3", os.path.join(recipe_root, "lib", "extract_verdict.py"), review_file],
+            stderr=subprocess.DEVNULL,
+        ).decode("utf-8", "replace").strip().lower()
+        if out in {"approve", "approved", "pass"}:
+            verdict = "approve"
+    except Exception:
+        pass
+
+if verdict != "approve":
+    shell_v = os.environ.get("VERDICT", "").strip().lower()
+    if shell_v in {"approve", "approved", "pass"}:
+        verdict = "approve"
+
+disp = verdict or os.environ.get("VERDICT", "").strip() or "<none>"
+if verdict != "approve":
+    log("  [skip-publish] reviewer verdict (resolved: '" + disp + "') is not APPROVE — no commit")
+    sys.exit(1)
+
+files = []
+if summary_path and os.path.isfile(summary_path):
+    try:
+        with open(summary_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            raw = data.get("files_changed")
+            if isinstance(raw, list):
+                for entry in raw:
+                    if isinstance(entry, str) and entry:
+                        files.append(entry)
+    except Exception:
+        pass
+
+if not files:
+    log("  [skip-publish] no files_changed in " + (summary_path or "<unset>") + " — no commit")
+    sys.exit(1)
+
+if not target_repo:
+    log("  [skip-publish] no target_repo resolved (MO_TARGET_CWD empty and git toplevel failed)")
+    sys.exit(1)
+
+try:
+    real_root = os.path.realpath(target_repo)
+except Exception:
+    real_root = target_repo
+
+valid = []
+for raw_path in files:
+    abs_path = raw_path if os.path.isabs(raw_path) else os.path.abspath(raw_path)
+    if not os.path.exists(abs_path):
+        log("  [reject-publish] file does not exist: " + raw_path)
+        continue
+    real = os.path.realpath(abs_path)
+    # Strict-child: real == real_root OR real.startswith(real_root + os.sep).
+    if real != real_root and not real.startswith(real_root + os.sep):
+        log("  [reject-publish] file escapes target repo toplevel: " + raw_path + " -> " + real + " not under " + real_root)
+        continue
+    valid.append(real)
+
+if not valid:
+    log("  [skip-publish] no valid files inside target_repo=" + real_root + " — no commit")
+    sys.exit(1)
+
+try:
+    subprocess.run(
+        ["git", "add", "--", *valid],
+        cwd=target_repo, check=True,
+        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+    )
+    msg = "mini-ork(" + recipe + "): " + desc + " [run " + run_id + "]"
+    subprocess.run(
+        ["git", "-c", "user.email=mini-ork@local",
+         "-c", "user.name=mini-ork",
+         "commit", "-q", "-m", msg],
+        cwd=target_repo, check=True,
+        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+    )
+    sha = subprocess.check_output(
+        ["git", "-C", target_repo, "rev-parse", "HEAD"]
+    ).decode("utf-8", "replace").strip()
+    log("  [publish] committed " + str(len(valid)) + " file(s): " + sha)
+    sys.exit(0)
+except subprocess.CalledProcessError as e:
+    log("  [skip-publish] git add/commit failed in " + target_repo + ": rc=" + str(e.returncode))
+    sys.exit(1)
+PY
+}
+
 if [ "${MINI_ORK_EXECUTE_SOURCE_ONLY:-0}" = "1" ]; then
   return 0 2>/dev/null || exit 0
 fi
@@ -2622,6 +2783,22 @@ except Exception:
 " 2>/dev/null)
       if [ -z "$_outputs" ]; then
         echo "  [warn] publisher: artifact_contract.yaml has no outputs[] — skipping publish" >&2
+        # [M1 publisher-commit] code-fix recipes have empty outputs[] because
+        # their intent is "commit the implementer's in-place edits on reviewer
+        # APPROVE" instead of shipping an artifact file. Resolve verdict +
+        # files_changed defensively, validate paths via realpath strict-child,
+        # and `git add --` ONLY those files (no `-A` — OSS-leak guard).
+        # Helper logs the skip/complete reason; rc=0 promotes, rc=1 falls
+        # through to the existing log+published behavior.
+        local _pub_target_repo="${MO_TARGET_CWD:-}"
+        if [ -z "$_pub_target_repo" ]; then
+          _pub_target_repo=$(git -C "${MINI_ORK_ROOT:-.}" rev-parse --show-toplevel 2>/dev/null \
+            || printf '%s' "${MINI_ORK_ROOT:-.}")
+        fi
+        if _publisher_try_commit_files "$_pub_target_repo"; then
+          _d021_set_status "published"
+          return 0
+        fi
         _d021_set_status "published"
         return 0
       fi
