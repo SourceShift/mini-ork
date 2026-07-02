@@ -128,6 +128,37 @@ _CODEX_SANDBOX="${CODEX_SANDBOX:-workspace-write}"
 # Both fall back to "" if neither is set, in which case we skip --cd and
 # preserve codex's prior behavior (inherits whatever cwd the process has).
 _CODEX_TARGET_CWD="${MO_TARGET_CWD:-${PWD:-}}"
+
+# ── cwd guard (cross-repo corruption prevention) ──────────────────────────────
+# A codex turn runs `git reset --hard refs/codex/curated-sync` inside its cwd.
+# If that cwd resolves to a mini-ork FRAMEWORK tree (this install, or a sibling
+# framework source clone such as a dev checkout used to vendor updates) rather
+# than the intended TARGET repo, codex clobbers the framework repo's working
+# tree instead of the consumer's project. This is silent and easy to miss: the
+# dispatcher reports a normal run, and the damage only surfaces when the
+# framework repo's own history looks corrupted.
+#
+# Concretely this happens when MO_TARGET_CWD isn't propagated all the way to
+# the subshell that actually invokes codex (e.g. a nested pipeline stage), so
+# the fallback `${PWD:-}` resolves to wherever THAT subshell happens to be —
+# which can drift to a framework tree if the dispatcher or one of its child
+# processes was launched from there.
+#
+# Fail fast rather than corrupt. Override for a genuine framework self-edit
+# (e.g. dogfooding mini-ork on its own source) via MO_ALLOW_FRAMEWORK_CWD=1.
+if [ "${MO_ALLOW_FRAMEWORK_CWD:-0}" != "1" ] && [ -n "$_CODEX_TARGET_CWD" ]; then
+  _cg="$(cd "$_CODEX_TARGET_CWD" 2>/dev/null && pwd -P || echo "$_CODEX_TARGET_CWD")"
+  _is_framework_tree=0
+  [ -f "$_cg/bin/mini-ork" ] && _is_framework_tree=1   # cwd IS a mini-ork install root
+  case "$_cg" in
+    */.mini-ork|*/.mini-ork/*|*/mini-ork|*/mini-ork/*) _is_framework_tree=1 ;;
+  esac
+  if [ "$_is_framework_tree" = "1" ]; then
+    echo "[cl_codex] cwd guard FAILED: '$_cg' looks like a mini-ork framework tree — refusing codex dispatch (it would corrupt that repo instead of your target project). Set MO_TARGET_CWD to your TARGET repo; MO_ALLOW_FRAMEWORK_CWD=1 only for a genuine framework self-edit." >&2
+    exit 2
+  fi
+fi
+
 _CODEX_CD_FLAGS=()
 if [ -n "$_CODEX_TARGET_CWD" ] && [ -d "$_CODEX_TARGET_CWD" ]; then
   _CODEX_CD_FLAGS+=(-C "$_CODEX_TARGET_CWD")
