@@ -21,7 +21,7 @@ import sys
 
 from .models import DispatchRequest
 from .providers import dispatch_model, provider_for_model
-from .telemetry import persist_call
+from .telemetry import persist_artifact, persist_call
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -89,9 +89,10 @@ def main(argv: list[str] | None = None) -> int:
 
     # Persist telemetry (best-effort; never changes the exit code).
     db = os.environ.get("MINI_ORK_DB", "")
+    call_id: int | None = None
     if db:
         try:
-            persist_call(
+            call_id = persist_call(
                 db,
                 result,
                 provider=provider_for_model(args.model),
@@ -103,6 +104,42 @@ def main(argv: list[str] | None = None) -> int:
             )
         except Exception as exc:  # telemetry must never break dispatch
             sys.stderr.write(f"[mini_ork.dispatch] telemetry write failed: {exc}\n")
+
+    # Register run_artifacts rows for any agent-* file the bash layer already
+    # wrote into MINI_ORK_RUN_DIR (agent-<node>.transcript.json +
+    # agent-<node>.stream.jsonl). The Python path is the future
+    # MO_DISPATCH_BACKEND=python switch; today the bash mirror at
+    # _mo_llm_persist_agent_transcript also registers the same files, so the
+    # UNIQUE(run_id, node_id, kind, rel_path) constraint keeps the row count
+    # at 1 even if both paths fire.
+    if db and run_dir and call_id is not None:
+        run_id = os.environ.get("MINI_ORK_RUN_ID") or ""
+        node_id = os.environ.get("MO_NODE_ID") or ""
+        if run_id and node_id:
+            safe_node = "".join(
+                c if c.isalnum() or c in "._-" else "_" for c in node_id
+            )
+            for kind, filename in (
+                ("turn_jsonl", f"agent-{safe_node}.stream.jsonl"),
+                ("transcript", f"agent-{safe_node}.transcript.json"),
+            ):
+                abs_path = os.path.join(run_dir, filename)
+                if os.path.isfile(abs_path):
+                    try:
+                        persist_artifact(
+                            db,
+                            run_id=run_id,
+                            node_id=node_id,
+                            call_id=call_id,
+                            kind=kind,
+                            rel_path=filename,
+                            abs_path=abs_path,
+                        )
+                    except Exception as exc:  # telemetry must never break dispatch
+                        sys.stderr.write(
+                            f"[mini_ork.dispatch] run_artifacts write failed "
+                            f"for {kind}: {exc}\n"
+                        )
 
     status = "ok" if result.ok else f"FAIL rc={result.rc}"
     sys.stderr.write(
