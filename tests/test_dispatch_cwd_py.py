@@ -38,7 +38,12 @@ def test_resolve_target_cwd_precedence(tmp_path, monkeypatch):
     )
 
 
-def test_cwd_inside_framework_is_rejected(tmp_path):
+def test_cwd_inside_framework_is_rejected(tmp_path, monkeypatch):
+    # Clear the opt-in if it leaked in from the CALLER's environment — a
+    # framework-edit run (MO_ALLOW_FRAMEWORK_CWD=1) invoking the whole test
+    # suite via verifiers/test.sh would otherwise flip this guard to ok=True
+    # and poison the suite gate for every run (2026-07-03 migration batch).
+    monkeypatch.delenv("MO_ALLOW_FRAMEWORK_CWD", raising=False)
     framework = tmp_path / "mini-ork"
     (framework / "sub").mkdir(parents=True)
     g = cwd_guard(str(framework / "sub"), root=framework)
