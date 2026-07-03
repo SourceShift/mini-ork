@@ -35,8 +35,19 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     prompt = sys.stdin.read()
-    request = DispatchRequest(model=args.model, prompt=prompt, timeout_s=args.timeout)
-    result = dispatch_model(request)
+    # `model` may be a comma-separated fallback chain, e.g. "minimax,codex,sonnet":
+    # a hung/flaky primary lane is abandoned and the next is tried, so one bad
+    # lane can't stall the run (MO_DISPATCH_ATTEMPT_TIMEOUT_S bounds each try).
+    lanes = [m.strip() for m in args.model.split(",") if m.strip()]
+    request = DispatchRequest(model=lanes[0], prompt=prompt, timeout_s=args.timeout)
+    if len(lanes) > 1:
+        from .providers import dispatch_with_fallback
+        _att = os.environ.get("MO_DISPATCH_ATTEMPT_TIMEOUT_S")
+        result = dispatch_with_fallback(
+            request, lanes,
+            per_attempt_timeout_s=float(_att) if _att else None)
+    else:
+        result = dispatch_model(request)
 
     # Emit the assistant body to the caller (out-file or stdout).
     if args.out:
@@ -48,6 +59,33 @@ def main(argv: list[str] | None = None) -> int:
             return 127
     else:
         sys.stdout.write(result.text)
+
+    # Sidecar contract the bash executor + reward path depend on (parity with
+    # lib/llm-dispatch.sh mo_llm_dispatch): <out>.cost per-call cost, <out>.err.log
+    # on failure, and $MINI_ORK_RUN_DIR/.last-llm-cost + .last-llm-duration-ms
+    # (read by bin/mini-ork-execute:_trace_write_node_rich and the D-022 cost
+    # charger). Best-effort — never changes the exit code.
+    if args.out:
+        try:
+            with open(args.out + ".cost", "w", encoding="utf-8") as fh:
+                fh.write(f"{result.cost_usd:.6f}")
+        except OSError:
+            pass
+        if not result.ok and result.error:
+            try:
+                with open(args.out + ".err.log", "w", encoding="utf-8") as fh:
+                    fh.write(result.error.rstrip() + "\n")
+            except OSError:
+                pass
+    run_dir = os.environ.get("MINI_ORK_RUN_DIR", "")
+    if run_dir and os.path.isdir(run_dir):
+        try:
+            with open(os.path.join(run_dir, ".last-llm-cost"), "w", encoding="utf-8") as fh:
+                fh.write(f"{result.cost_usd:.6f}")
+            with open(os.path.join(run_dir, ".last-llm-duration-ms"), "w", encoding="utf-8") as fh:
+                fh.write(str(result.duration_ms))
+        except OSError:
+            pass
 
     # Persist telemetry (best-effort; never changes the exit code).
     db = os.environ.get("MINI_ORK_DB", "")
