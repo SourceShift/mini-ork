@@ -614,6 +614,25 @@ mo_llm_dispatch() {
   local timeout_s="${4:-1500}"
   local max_turns="${5:-60}"
 
+  # ADR-001 Phase 1: delegate to the Python dispatch layer when opted in
+  # (MO_DISPATCH_BACKEND=python). The Python path reads the prompt over stdin
+  # (E2BIG-proof), fails fast on a missing API key / framework-tree cwd, and
+  # writes the same sidecar contract this bash path does (.last-llm-cost,
+  # .last-llm-duration-ms, <out>.cost). PYTHONPATH pins the package without
+  # changing cwd, so the provider still runs in the (guarded) target cwd.
+  if [ "${MO_DISPATCH_BACKEND:-bash}" = "python" ]; then
+    # Use the executor's role-aware fallback chain when it's for THIS model
+    # (chain leads with $model), so a hung/flaky lead lane routes to the next
+    # lane instead of stalling the run. Otherwise dispatch the single model.
+    local _model_arg="$model"
+    if [ -n "${MO_DISPATCH_CHAIN:-}" ] && [ "${MO_DISPATCH_CHAIN%%,*}" = "$model" ]; then
+      _model_arg="$MO_DISPATCH_CHAIN"
+    fi
+    printf '%s' "$prompt" | PYTHONPATH="${MINI_ORK_ROOT}${PYTHONPATH:+:$PYTHONPATH}" \
+      python3 -m mini_ork.dispatch "$_model_arg" --out "$out_file" --timeout "$timeout_s"
+    return $?
+  fi
+
   local scripts_dir="$MINI_ORK_ROOT/lib/providers"
   local cl_script="$scripts_dir/cl_${model}.sh"
   local err_log="${out_file}.err.log"
