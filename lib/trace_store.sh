@@ -393,7 +393,51 @@ print(f"artifact attached to {trace_id}", file=sys.stderr)
 PY
 }
 
+# mo_grade_run_reward <run_dir> <run_id>
+#   Close the eval loop (win #3): feed the rubric's GRADED 0-8 run score into the
+#   learning reward instead of letting it be flattened to pass/fail before the
+#   loop sees it. Reads <run_dir>/rubric.json {score 0-8}, normalizes to [0,1],
+#   and stamps it as reward_value on every execution_trace of THIS run with a
+#   fixed neutral anchor 0.5 → reward_g in [-1,+1]. lane_router then learns from
+#   graded run quality (score 8→+1, 4→0, 0→-1), not a binary verdict. This is the
+#   per-run graded score the two-disjoint-eval-worlds gap was missing.
+#   Best-effort; never fails the run. Opt-out: MO_GRADE_RUN_REWARD=0.
+mo_grade_run_reward() {
+  local run_dir="${1:?run_dir required}" run_id="${2:-}"
+  [ "${MO_GRADE_RUN_REWARD:-1}" = "1" ] || return 0
+  [ -n "$run_id" ] || return 0
+  local rubric_path="$run_dir/rubric.json"
+  [ -f "$rubric_path" ] || return 0
+  local _db="${MINI_ORK_DB:-${MINI_ORK_HOME:-.mini-ork}/state.db}"
+  python3 - "$_db" "$run_id" "$rubric_path" <<'PY'
+import json, sqlite3, sys
+db, run_id, rubric_path = sys.argv[1:4]
+try:
+    score = float(json.load(open(rubric_path)).get("score"))
+except (ValueError, TypeError, KeyError, OSError):
+    sys.exit(0)
+val = max(0.0, min(1.0, score / 8.0))        # rubric 0-8 → [0,1]
+anchor = 0.5
+reward_g = (val - anchor) / abs(anchor)      # graded, [-1,+1]
+con = sqlite3.connect(db)
+con.execute("PRAGMA busy_timeout=5000")
+con.execute(
+    "UPDATE execution_traces SET reward_value=?, reward_anchor=?, reward_g=?, "
+    "reward_direction='higher_is_better', reward_primary_metric='rubric_score', "
+    "reward_source='rubric@v1' WHERE run_id=?",
+    (val, anchor, reward_g, run_id),
+)
+n = con.total_changes
+con.commit()
+con.close()
+sys.stderr.write(
+    f"[eval] graded run reward: rubric {score:g}/8 → reward_g {reward_g:+.2f} "
+    f"on {n} trace(s)\n"
+)
+PY
+}
+
 # When invoked directly, emit usage.
 if [[ "${BASH_SOURCE[0]:-}" == "${0:-}" ]]; then
-  echo "trace_store.sh — source me and call trace_write / trace_get / trace_query / trace_attach_artifact"
+  echo "trace_store.sh — source me and call trace_write / trace_get / trace_query / trace_attach_artifact / mo_grade_run_reward"
 fi
