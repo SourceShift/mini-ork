@@ -299,6 +299,25 @@ _mo_reward_from_status() {
   esac
 }
 
+# Role-aware lane fallback chain: the resolved lane LEADS, then the category
+# fallback lanes, deduped. Consumed by the Python dispatch backend so a
+# hung/flaky lead lane is abandoned and the next lane serves the node — one bad
+# lane can no longer stall a run (the recurring cross_epic_gradient-style stall).
+# Coding roles fall back through MO_FALLBACK_CODING, review roles through
+# MO_FALLBACK_REVIEW. Empty tail (unknown role) → lead only (no behavior change).
+_mo_dispatch_chain() {
+  local _nt="$1" _lead="$2" _tail=""
+  case "$_nt" in
+    implementer|worker|spec_author|healer|planner|researcher|reflector|replanner|synthesizer|bdd_runner)
+      _tail="${MO_FALLBACK_CODING:-minimax,codex,sonnet}" ;;
+    reviewer|spec_reviewer|verifier|brain)
+      _tail="${MO_FALLBACK_REVIEW:-opus,kimi,sonnet}" ;;
+  esac
+  [ -z "$_tail" ] && { printf '%s' "$_lead"; return; }
+  printf '%s,%s' "$_lead" "$_tail" \
+    | awk -F, '{o="";for(i=1;i<=NF;i++)if($i!=""&&!s[$i]++){printf "%s%s",(o?",":""),$i;o=1}}'
+}
+
 _mo_learning_static_lane() {
   local _node_type="$1" _current_lane="$2"
   local _frontier="${MO_FRONTIER_LANE:-opus_lens}"
@@ -1779,11 +1798,23 @@ _trace_write_node_rich() {
   if [ -n "$_output_file" ] && [ -f "${_output_file}.tool-summary" ]; then
     _tool_summary="${_output_file}.tool-summary"
   fi
+  # v0.6: activate the GRPO shared-brain loop — stamp a real reward_g on every
+  # node trace. Previously _trace_write_node_rich never set reward_value/anchor,
+  # so reward_g stayed NULL and lane_router_recompute_advantages processed zero
+  # code-delivery rows — the learning loop was inert in the default runtime.
+  # value = node outcome in [0,1] from status/verdict; a fixed neutral anchor
+  # (MO_REWARD_ANCHOR, default 0.5) makes reward_g = dir*(value-anchor)/|anchor|
+  # land in [-1,+1]; lane_router then derives the group-relative advantage per
+  # (objective_domain, task_class, node_type, code_region). Opt-out: MO_REWARD_STAMP=0.
+  local _reward_value="" _reward_anchor="${MO_REWARD_ANCHOR:-0.5}" _reward_direction="higher_is_better"
+  if [ "${MO_REWARD_STAMP:-1}" = "1" ]; then
+    _reward_value=$(_mo_reward_from_status "$_status" "$_verdict")
+  fi
   # Compose JSON payload via python3 for proper escaping.
   local _payload
   _payload=$(python3 -c "
 import json, sys, os
-trace_id, status, node_type, output_file, verdict, cost, task_class, tool_summary_path, duration_ms, finish_reason, agent_version_id = sys.argv[1:12]
+trace_id, status, node_type, output_file, verdict, cost, task_class, tool_summary_path, duration_ms, finish_reason, agent_version_id, reward_value, reward_anchor, reward_direction = sys.argv[1:15]
 
 tool_calls = []
 files_read = []
@@ -1823,9 +1854,16 @@ if verdict:
     obj['reviewer_verdict'] = verdict
 if finish_reason:
     obj['finish_reason'] = finish_reason
+if reward_value:
+    try:
+        obj['reward_value'] = float(reward_value)
+        obj['reward_anchor'] = float(reward_anchor)
+        obj['reward_direction'] = reward_direction
+    except ValueError:
+        pass
 obj['verifier_output'] = {'node_type': node_type, 'finish_reason': finish_reason or None}
 print(json.dumps(obj))
-" "$_trace_id" "$_status" "$_node_type" "$_output_file" "$_verdict" "$_cost" "${TASK_CLASS:-generic}" "$_tool_summary" "$_duration_ms" "$_finish_reason" "${dispatch_lane:-}" 2>/dev/null)
+" "$_trace_id" "$_status" "$_node_type" "$_output_file" "$_verdict" "$_cost" "${TASK_CLASS:-generic}" "$_tool_summary" "$_duration_ms" "$_finish_reason" "${dispatch_lane:-}" "$_reward_value" "$_reward_anchor" "$_reward_direction" 2>/dev/null)
   if [ -n "$_payload" ]; then
     trace_write "$_payload" >/dev/null 2>&1 || true
     _mo_update_trace_code_region "$_trace_id" "$_payload"
@@ -2092,6 +2130,12 @@ _dispatch_node() {
   local dispatch_lane="${node_model_lane:-$node_type}"
   local workflow_lane="$dispatch_lane"
   dispatch_lane="$(_mo_policy_route_lane "$node_type" "$dispatch_lane")"
+
+  # Export the role-aware fallback chain (lead = resolved lane) so the Python
+  # dispatch backend routes around a hung/flaky lead lane instead of stalling.
+  # Only takes effect under MO_DISPATCH_BACKEND=python; inert otherwise.
+  MO_DISPATCH_CHAIN="$(_mo_dispatch_chain "$node_type" "$dispatch_lane")"
+  export MO_DISPATCH_CHAIN
 
   # Cooperative stop check: UI's POST /api/v1/task-runs/{id}/stop touches
   # this file. We bail BEFORE dispatching the next node so the current
