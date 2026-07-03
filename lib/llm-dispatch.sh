@@ -517,6 +517,139 @@ _mo_llm_persist_agent_transcript() {
     cp "${out_file}.stream.jsonl" \
       "${MINI_ORK_RUN_DIR}/agent-${safe_node}.stream.jsonl" 2>/dev/null || true
   fi
+
+  # MIGRATION: remove when this node moves to mini_ork.dispatch
+  # Minimal bash mirror for nodes not yet on the Python dispatch backend.
+  # Registers run_artifacts rows (kind='turn_jsonl' + 'transcript') so the
+  # schema lives in both worlds. Inline-python heredoc is PRAGMA-gated, so
+  # it no-ops on DBs without the run_artifacts table (pre-0047 migrations).
+  # call_id is intentionally NULL on the bash side: bash cannot cheaply
+  # recover llm_calls.lastrowid across an inline-python boundary.
+  if [ -n "${MINI_ORK_DB:-}" ] && [ -f "${MINI_ORK_DB}" ]; then
+    MINI_ORK_DB="$MINI_ORK_DB" \
+    MINI_ORK_RUN_DIR="$MINI_ORK_RUN_DIR" \
+    MINI_ORK_RUN_ID="${MINI_ORK_RUN_ID:-}" \
+    MO_NODE_ID="$MO_NODE_ID" \
+    _safe_node="$safe_node" \
+    python3 <<'PY' 2>/dev/null || true
+import hashlib, os, sqlite3, time
+db_path = os.environ["MINI_ORK_DB"]
+run_dir = os.environ["MINI_ORK_RUN_DIR"]
+run_id = os.environ.get("MINI_ORK_RUN_ID", "") or ""
+node_id = os.environ.get("MO_NODE_ID", "") or ""
+safe_node = os.environ.get("_safe_node", "")
+if not (db_path and run_dir and run_id and node_id and safe_node):
+    raise SystemExit(0)
+try:
+    con = sqlite3.connect(db_path, timeout=5)
+except Exception:
+    raise SystemExit(0)
+try:
+    tables = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    if "run_artifacts" not in tables:
+        raise SystemExit(0)
+    existing = {r[1] for r in con.execute("PRAGMA table_info(run_artifacts)")}
+    cols = [c for c in ("run_id", "node_id", "call_id", "kind", "rel_path",
+                        "bytes", "sha256", "created_at") if c in existing]
+    ph = ",".join("?" for _ in cols)
+    col_sql = ",".join(f'"{c}"' for c in cols)
+    insert = f"INSERT OR IGNORE INTO run_artifacts ({col_sql}) VALUES ({ph})"
+    now = int(time.time())
+    for kind, fname in (
+        ("turn_jsonl", f"agent-{safe_node}.stream.jsonl"),
+        ("transcript", f"agent-{safe_node}.transcript.json"),
+    ):
+        p = os.path.join(run_dir, fname)
+        if not os.path.isfile(p):
+            continue
+        try:
+            size = os.path.getsize(p)
+            h = hashlib.sha256()
+            with open(p, "rb") as fh:
+                for chunk in iter(lambda: fh.read(65536), b""):
+                    h.update(chunk)
+            digest = h.hexdigest()
+        except OSError:
+            continue
+        values = {
+            "run_id": run_id, "node_id": node_id, "call_id": None,
+            "kind": kind, "rel_path": fname, "bytes": size,
+            "sha256": digest, "created_at": now,
+        }
+        try:
+            con.execute(insert, [values[c] for c in cols])
+        except sqlite3.IntegrityError:
+            pass
+    con.commit()
+finally:
+    con.close()
+PY
+  fi
+
+  # MIGRATION: remove when this node moves to mini_ork.dispatch
+  # Gzip on completion: turn every agent-<node>.stream.jsonl under the run
+  # dir into a .stream.jsonl.gz sibling and rewrite the matching
+  # run_artifacts row's rel_path/sha256/bytes. Self-contained inline python
+  # (no mini_ork import — this mirror must survive a bare bash exec that
+  # hasn't installed the package). PRAGMA-gated on run_artifacts; no-op on
+  # old DBs.
+  if [ -n "${MINI_ORK_DB:-}" ] && [ -f "${MINI_ORK_DB}" ] \
+     && [ -d "${MINI_ORK_RUN_DIR:-}" ]; then
+    MINI_ORK_DB="$MINI_ORK_DB" \
+    MINI_ORK_RUN_DIR="$MINI_ORK_RUN_DIR" \
+    MINI_ORK_RUN_ID="${MINI_ORK_RUN_ID:-}" \
+    python3 <<'PY' 2>/dev/null || true
+import glob, gzip, hashlib, os, sqlite3, time
+db_path = os.environ["MINI_ORK_DB"]
+run_dir = os.environ["MINI_ORK_RUN_DIR"]
+run_id = os.environ.get("MINI_ORK_RUN_ID", "") or ""
+if not run_id:
+    # rel_path is a bare basename shared across runs; without a run_id to scope
+    # the UPDATE we'd clobber other runs' rows. Skip rather than corrupt.
+    raise SystemExit(0)
+try:
+    con = sqlite3.connect(db_path, timeout=5)
+except Exception:
+    raise SystemExit(0)
+try:
+    tables = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    if "run_artifacts" not in tables:
+        raise SystemExit(0)
+    now = int(time.time())
+    gzipped = 0
+    for src_path in sorted(glob.glob(os.path.join(run_dir, "agent-*.stream.jsonl"))):
+        gz_path = src_path + ".gz"
+        try:
+            if os.path.exists(gz_path) and os.path.getmtime(gz_path) >= os.path.getmtime(src_path):
+                continue
+            with open(src_path, "rb") as fin, gzip.open(gz_path, "wb", compresslevel=6) as fout:
+                while True:
+                    chunk = fin.read(65536)
+                    if not chunk:
+                        break
+                    fout.write(chunk)
+            size = os.path.getsize(gz_path)
+            h = hashlib.sha256()
+            with open(gz_path, "rb") as fh:
+                for chunk in iter(lambda: fh.read(65536), b""):
+                    h.update(chunk)
+            digest = h.hexdigest()
+            rel_gz = os.path.basename(gz_path)
+            rel_src = os.path.basename(src_path)
+            con.execute(
+                "UPDATE run_artifacts SET rel_path=?, bytes=?, sha256=?, created_at=? "
+                "WHERE rel_path=? AND run_id=?",
+                (rel_gz, size, digest, now, rel_src, run_id),
+            )
+            gzipped += 1
+        except (OSError, sqlite3.Error):
+            continue
+    if gzipped:
+        con.commit()
+finally:
+    con.close()
+PY
+  fi
 }
 
 # v0.2-pt38 (E-MO-19, 2026-06-02): models that route through non-Anthropic

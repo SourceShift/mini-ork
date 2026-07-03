@@ -4,8 +4,11 @@ served by the next lane, instead of blocking for the full 25-min timeout.
 """
 from __future__ import annotations
 
+import shutil
 import sys
 from pathlib import Path
+
+import pytest
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
@@ -13,6 +16,11 @@ from mini_ork.dispatch.models import DispatchRequest  # noqa: E402
 from mini_ork.dispatch.providers import dispatch_with_fallback  # noqa: E402
 
 
+@pytest.mark.skipif(
+    shutil.which("codex") is None,
+    reason="fallback target 'codex' CLI not installed in this env (e.g. CI) — "
+    "the test asserts a *successful* fallback dispatch, which needs a real working lane",
+)
 def test_dead_primary_falls_back_to_working_lane(monkeypatch):
     # Force glm 'dead' (unset key → preflight fails instantly, standing in for a
     # hang). The chain must fall back to codex (works in this env) and succeed.
