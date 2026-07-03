@@ -16,8 +16,12 @@ a crash — telemetry must never break a dispatch.
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import sqlite3
+import sys
+import time
 from collections.abc import Mapping
 from pathlib import Path
 
@@ -117,3 +121,138 @@ def persist_call(
         return cur.lastrowid
     finally:
         con.close()
+
+
+def _validate_rel_path(rel_path: str) -> str | None:
+    """Reject rel_paths that aren't portable across vendor / foreign-home /
+    cloud-exec run dirs. Returns the cleaned rel_path on success, or None on
+    rejection (we don't raise — telemetry must never break a dispatch)."""
+    if not rel_path:
+        return None
+    if rel_path.startswith("/"):
+        return None
+    parts = rel_path.split("/")
+    if any(p == ".." for p in parts):
+        return None
+    return rel_path
+
+
+def persist_artifact(
+    db_path: str | Path,
+    *,
+    run_id: str,
+    node_id: str | None,
+    call_id: int | None,
+    kind: str,
+    rel_path: str,
+    abs_path: str | Path,
+) -> int | None:
+    """Register one run_artifacts row for ``abs_path``. PRAGMA-table_info-gated:
+    no-op (returns None) if the table is absent (old DBs). rel_path MUST be a
+    portable relative path — absolute paths and ``..`` components are rejected
+    with a soft stderr warning instead of crashing. Returns the inserted rowid
+    on success."""
+    db = Path(db_path)
+    if not db.is_file():
+        return None
+    cleaned = _validate_rel_path(rel_path)
+    if cleaned is None:
+        sys.stderr.write(
+            f"[telemetry] reject run_artifacts rel_path={rel_path!r}: "
+            "must be relative, no leading '/', no '..' component\n"
+        )
+        return None
+    abs_p = Path(abs_path)
+    if not abs_p.is_file():
+        return None
+    try:
+        size = abs_p.stat().st_size
+        h = hashlib.sha256()
+        with open(abs_p, "rb") as fh:
+            for chunk in iter(lambda: fh.read(65536), b""):
+                h.update(chunk)
+        digest = h.hexdigest()
+    except OSError as exc:
+        sys.stderr.write(f"[telemetry] hash failed for {abs_p}: {exc}\n")
+        return None
+
+    con = sqlite3.connect(str(db), timeout=5)
+    try:
+        con.execute("PRAGMA busy_timeout=5000")
+        tables = {row[0] for row in con.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        )}
+        if "run_artifacts" not in tables:
+            return None
+        existing = {row[1] for row in con.execute("PRAGMA table_info(run_artifacts)")}
+        cols = [c for c in (
+            "run_id", "node_id", "call_id", "kind", "rel_path",
+            "bytes", "sha256", "created_at",
+        ) if c in existing]
+        placeholders = ",".join("?" for _ in cols)
+        col_sql = ",".join(f'"{c}"' for c in cols)
+        values = {
+            "run_id": run_id,
+            "node_id": node_id,
+            "call_id": call_id,
+            "kind": kind,
+            "rel_path": cleaned,
+            "bytes": size,
+            "sha256": digest,
+            "created_at": int(time.time()),
+        }
+        cur = con.execute(
+            f"INSERT INTO run_artifacts ({col_sql}) VALUES ({placeholders})",
+            [values[c] for c in cols],
+        )
+        con.commit()
+        return cur.lastrowid
+    except sqlite3.IntegrityError:
+        # UNIQUE(run_id, node_id, kind, rel_path) — already registered; no-op.
+        return None
+    finally:
+        con.close()
+
+
+def resolve_artifact_abs(
+    run_dir_or_db: str | Path,
+    run_id: str,
+    node_id: str | None,
+    kind: str,
+    *,
+    run_dir: str | Path | None = None,
+) -> Path | None:
+    """Return the absolute path for the most recent run_artifacts row matching
+    ``(run_id, node_id, kind)``. First positional arg accepts either a DB path
+    OR a run dir; if a run dir is passed, ``$MINI_ORK_DB`` is used as the DB.
+    Returns ``None`` if no row exists or the joined path doesn't resolve to a
+    real file."""
+    if run_dir is not None:
+        anchor = Path(run_dir)
+        db_path = Path(run_dir_or_db)
+    else:
+        anchor = Path(run_dir_or_db)
+        candidate_db = Path(run_dir_or_db)
+        db_path = candidate_db if candidate_db.suffix == ".db" else Path(
+            os.environ.get("MINI_ORK_DB", str(candidate_db / "state.db"))
+        )
+    if not db_path.is_file():
+        return None
+    con = sqlite3.connect(str(db_path), timeout=5)
+    try:
+        existing = {row[1] for row in con.execute("PRAGMA table_info(run_artifacts)")}
+        if not existing:
+            return None
+        row = con.execute(
+            "SELECT rel_path FROM run_artifacts "
+            "WHERE run_id=? AND kind=? "
+            "  AND (node_id IS ? OR node_id=?) "
+            "ORDER BY created_at DESC, id DESC LIMIT 1",
+            (run_id, kind, node_id, node_id),
+        ).fetchone()
+    finally:
+        con.close()
+    if not row:
+        return None
+    joined = (anchor / row[0]).resolve()
+    return joined if joined.is_file() else None
