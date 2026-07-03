@@ -407,6 +407,60 @@ def _dispatch_codex_via_wrapper(
                 pass
 
 
+def dispatch_with_fallback(
+    request: DispatchRequest,
+    lanes: Sequence[str],
+    root: str | os.PathLike[str] | None = None,
+    *,
+    per_attempt_timeout_s: float | None = None,
+) -> DispatchResult:
+    """Dispatch ``request`` trying each lane in ``lanes`` in order, returning the
+    first result that succeeds with non-empty output. A lane that fails preflight
+    (dead/unset key), times out (a HUNG lane — the recurring stall), returns a
+    non-zero rc, or emits empty text is abandoned and the next lane is tried.
+
+    This is the fix for the single biggest reliability failure: one flaky/hung
+    lane (codex flaky in some envs, glm/kimi/minimax gateways hang in others)
+    blocking a whole run for the full 25-min timeout with no recovery. With a
+    fallback chain, a hung lane costs one attempt-timeout and the run continues
+    on a healthy lane instead of stalling delivery.
+
+    Returns the last failed result if every lane fails (so the caller still sees
+    a faithful rc/error, never a silent hang).
+    """
+    import sys
+
+    last: DispatchResult | None = None
+    tried: list[str] = []
+    for i, lane in enumerate(lanes):
+        req = DispatchRequest(
+            model=lane,
+            prompt=request.prompt,
+            timeout_s=per_attempt_timeout_s or request.timeout_s,
+            max_turns=request.max_turns,
+            env=dict(request.env),
+            cwd=request.cwd,
+        )
+        result = dispatch_model(req, root)
+        tried.append(lane)
+        if result.ok and (result.text or "").strip():
+            if i > 0:
+                sys.stderr.write(
+                    f"[dispatch] lane fallback: {'/'.join(tried[:-1])} failed → "
+                    f"served by {lane}\n"
+                )
+            return result
+        sys.stderr.write(
+            f"[dispatch] lane {lane} failed (rc={result.rc} "
+            f"{(result.error or 'empty output')[:80]}); trying next\n"
+        )
+        last = result
+    if last is None:
+        return DispatchResult(ok=False, rc=2, error="no lanes provided",
+                              model=request.model)
+    return last
+
+
 def dispatch_with_command(
     request: DispatchRequest,
     command: Sequence[str],

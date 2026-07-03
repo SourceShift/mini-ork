@@ -476,6 +476,13 @@ PY
       if declare -f mo_rubric_run_score >/dev/null 2>&1; then
         mo_rubric_run_score "$kickoff" "$_run_dir" "${MINI_ORK_TASK_CLASS:-generic}" \
           || echo "  [warn] rubric pre-screen failed (advisory — run unaffected)" >&2
+        # Close the eval loop (win #3): feed the rubric's GRADED 0-8 score into
+        # the learning reward so lane_router learns from run quality, not a
+        # flattened pass/fail. Best-effort — never affects the run outcome.
+        if declare -f mo_grade_run_reward >/dev/null 2>&1; then
+          mo_grade_run_reward "$_run_dir" "${MINI_ORK_RUN_ID:-${MINI_ORK_TASK_RUN_ID:-}}" \
+            || echo "  [warn] grade-run-reward failed (advisory)" >&2
+        fi
       else
         echo "  [warn] mo_rubric_run_score unavailable — skipping rubric" >&2
       fi
