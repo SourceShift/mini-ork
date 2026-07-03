@@ -3,7 +3,7 @@
 Strangler-fig: bash stays until each Python port is parity-verified against the
 LIVE bash. Every ported module has a test that invokes the real bash function.
 
-## DONE + verified (10 modules)
+## DONE + verified (15 modules)
 
 ### Trunk / Tier A — the learning brain (main repo, bash-parity tests)
 | module | python | test | notes |
@@ -32,3 +32,25 @@ config_resolve · rho_aggregator — 7 modules, ~700 LOC. Resumable loop:
 ## Test all ported trunk modules
     cd <repo> && python3 -m pytest tests/unit/test_cache_py.py \
       tests/unit/test_trace_store_py.py tests/unit/test_lane_router_py.py -q
+
+## Session 2 additions (Fable, committed on feat/python-migration)
+| module | python | test | notes |
+|---|---|---|---|
+| coalition_gate.sh | mini_ork/ported/coalition_gate.py | test_coalition_gate_py.py (3) | rho taken as input; measure_rho port deferred |
+| decision_service.sh | mini_ork/ported/decision_service.py | test_decision_service_py.py (3) | full decide() surface; composes ported lane_router |
+| epic_graph.sh | mini_ork/ported/epic_graph.py | test_epic_graph_py.py (4) | dep DAG + cascade |
+| mini-ork-scheduler | mini_ork/scheduler.py | test_scheduler_py.py (4) | **win #1 landed**: run_pool() concurrent epic pool (MO_SCHED_MAX_PARALLEL) |
+| cost_pause.sh | mini_ork/ported/cost_pause.py | test_cost_pause_py.py (2) | window-crossing pause + sentinel |
+
+Also landed earlier on this branch: win #3 (mo_grade_run_reward: rubric 0-8 ->
+graded reward_g, bash+python), lane-fallback hang-proofing (dispatch_with_fallback
++ role-aware chains in executor).
+
+## REMAINING (trunk)
+- context_assembler.sh (713) — 7 independent context_*_md functions; portable one-by-one
+- reflection_pipeline.sh (358) + gradient_extractor.sh (379) + bin/mini-ork-reflect (247)
+- bin/mini-ork-execute (2942) + bin/mini-ork-plan (1077) — the big loop, last
+- llm-dispatch.sh remainder (tool-summary sidecar; then flip MO_DISPATCH_BACKEND default)
+- assorted leaves: workflow_lifecycle, operator_steering, steering_checkpoint,
+  mid_node_injector, role_evolver, runs-tracker, spec-split, artifact_contract,
+  reflection-refiner, cross_epic_gradient
