@@ -47,7 +47,7 @@ graded reward_g, bash+python), lane-fallback hang-proofing (dispatch_with_fallba
 + role-aware chains in executor).
 
 ## REMAINING (trunk)
-- context_assembler.sh (713) — 7 independent context_*_md functions; portable one-by-one
+- context_assembler.sh — CORE PORTED (mini_ork/context_assembler.py: context_assemble + failure_modes_md + prior_runs_md, test_context_assembler_py.py, 5 tests). Remaining: contextnest_atoms_md / recent_sessions_md (CN HTTP) + operator_steering_md (needs operator_steering port) + active_state_md
 - reflection_pipeline.sh (358) + gradient_extractor.sh (379) + bin/mini-ork-reflect (247)
 - bin/mini-ork-execute (2942) + bin/mini-ork-plan (1077) — the big loop, last
 - llm-dispatch.sh remainder (tool-summary sidecar; then flip MO_DISPATCH_BACKEND default)
