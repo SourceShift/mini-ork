@@ -205,9 +205,16 @@ def resolve_provider(
         return ProviderSpec(model, command)
 
     # Claude family: env-pin from the wrapper, then run claude with JSON output.
+    # `--permission-mode bypassPermissions` is LOAD-BEARING: without it, `claude
+    # --print` runs in the default permission mode and auto-denies every Write/
+    # Edit/Bash-redirect in non-interactive mode, so an implementer/worker lane
+    # can read but never write files — the port silently produces nothing. The
+    # bash path (lib/llm-dispatch.sh:938, lib/lane-helpers.sh:244) always passes
+    # it; the Python port dropped it (2026-07-04 migration batch, 3rd killer).
     return ProviderSpec(
         model=model,
-        command=("claude", "--print", "--output-format", "json"),
+        command=("claude", "--print", "--permission-mode", "bypassPermissions",
+                 "--output-format", "json"),
         parse_usage=parse_claude_usage,
         parse_cost=claude_cost,
         parse_text=claude_result_text,
