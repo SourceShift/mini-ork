@@ -204,7 +204,7 @@ for line in diff.split("\n"):
                 "description": "Matched pattern: " + pat,
                 "suggested_fix": "Remove the secret + rotate the credential immediately.",
             }, separators=(",", ":")))
-            return
+            sys.exit(0)  # stop after first match (top-level script: `return` is a SyntaxError — was silently disabling this scanner)
 PY
 }
 
