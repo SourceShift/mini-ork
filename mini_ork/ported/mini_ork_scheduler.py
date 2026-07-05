@@ -127,7 +127,7 @@ def dispatch_epic(db, epic_id, root, home, recipe, dry_run) -> int:
                     pass
     if verdict in ("pass", "success"):
         c.execute("UPDATE epics SET status='done' WHERE id=?", (epic_id,)); c.commit(); c.close()
-        epic_graph.epic_graph_on_done(epic_id, db=db) if hasattr(epic_graph, "epic_graph_on_done") else None
+        epic_graph.on_done(epic_id, db=db)   # cascade dep resolution (bash: epic_graph_on_done)
     else:
         c.execute("UPDATE epics SET status='escalated' WHERE id=?", (epic_id,)); c.commit(); c.close()
     return rc
