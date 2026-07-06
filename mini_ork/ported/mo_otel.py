@@ -112,10 +112,14 @@ def _now_ms() -> int:
     to match Python idioms; the bash function name `_mo_otel_now_ms` is
     preserved in the docstring for grep parity.
     """
-    gdate = subprocess.run(
-        ["gdate", "+%s%3N"], capture_output=True, text=True
-    )
-    if gdate.returncode == 0 and gdate.stdout.strip():
+    try:
+        gdate = subprocess.run(
+            ["gdate", "+%s%3N"], capture_output=True, text=True
+        )
+    except (FileNotFoundError, OSError):
+        # gdate absent on Linux CI — the spawn raises; fall through to time_ns().
+        gdate = None
+    if gdate is not None and gdate.returncode == 0 and gdate.stdout.strip():
         try:
             return int(gdate.stdout.strip())
         except ValueError:
