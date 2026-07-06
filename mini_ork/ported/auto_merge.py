@@ -22,9 +22,27 @@ import subprocess
 from pathlib import Path
 
 
-def _git(cwd, *args) -> tuple[str, int]:
-    r = subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, text=True)
+def _git(cwd, *args, env=None) -> tuple[str, int]:
+    r = subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, text=True, env=env)
     return r.stdout.strip(), r.returncode
+
+
+def _identity_env(cwd) -> dict:
+    """Ambient env + a fallback git identity when the repo/global config (and
+    GIT_*_EMAIL env) provide none — so the squash `git commit` never dies with
+    'Author identity unknown' in identity-less environments (CI runners, fresh
+    repos). Configured identity is preserved (setdefault + only-when-unconfigured)."""
+    e = dict(os.environ)
+    if e.get("GIT_AUTHOR_EMAIL") and e.get("GIT_COMMITTER_EMAIL"):
+        return e
+    cfg = subprocess.run(["git", "-C", str(cwd), "config", "user.email"],
+                         capture_output=True, text=True).stdout.strip()
+    if not cfg:
+        e.setdefault("GIT_AUTHOR_NAME", "mini-ork")
+        e.setdefault("GIT_AUTHOR_EMAIL", "mini-ork@localhost")
+        e.setdefault("GIT_COMMITTER_NAME", "mini-ork")
+        e.setdefault("GIT_COMMITTER_EMAIL", "mini-ork@localhost")
+    return e
 
 
 def _sql(db, stmt) -> str:
@@ -221,7 +239,8 @@ def auto_merge(repo_root, mini_orch_dir, job_id, *, mini_ork_home, state_db,
                 _git(repo_root, "checkout", "--", ".")
                 failed += 1
                 continue
-            _, rc = _git(repo_root, "commit", "--no-verify", "-m", squash_msg)
+            _, rc = _git(repo_root, "commit", "--no-verify", "-m", squash_msg,
+                         env=_identity_env(repo_root))
             if rc != 0:
                 _git(repo_root, "checkout", "--", ".")
                 failed += 1
