@@ -22,9 +22,27 @@ import subprocess
 from pathlib import Path
 
 
-def _git(cwd, *args) -> tuple[str, int]:
-    r = subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, text=True)
+def _git(cwd, *args, env=None) -> tuple[str, int]:
+    r = subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, text=True, env=env)
     return r.stdout.strip(), r.returncode
+
+
+def _identity_env(cwd) -> dict:
+    """Ambient env + a fallback git identity when none is configured. `git rebase`
+    replays commits (new committer), so without an identity it dies with
+    'Committer identity unknown' in identity-less environments (CI, fresh repos).
+    Configured/env identity is preserved."""
+    e = dict(os.environ)
+    if e.get("GIT_AUTHOR_EMAIL") and e.get("GIT_COMMITTER_EMAIL"):
+        return e
+    cfg = subprocess.run(["git", "-C", str(cwd), "config", "user.email"],
+                         capture_output=True, text=True).stdout.strip()
+    if not cfg:
+        e.setdefault("GIT_AUTHOR_NAME", "mini-ork")
+        e.setdefault("GIT_AUTHOR_EMAIL", "mini-ork@localhost")
+        e.setdefault("GIT_COMMITTER_NAME", "mini-ork")
+        e.setdefault("GIT_COMMITTER_EMAIL", "mini-ork@localhost")
+    return e
 
 
 def _name_list(cwd, *diff_args) -> list[str]:
@@ -74,12 +92,12 @@ def rebase_branch_onto_main(epic: str, worktree: str, phase: str = "dispatch", *
     decision_path = os.path.join(run_dir, "rebase-decision.json")
 
     if not overlap_files:
-        _git(worktree, "rebase", "main")
+        _git(worktree, "rebase", "main", env=_identity_env(worktree))
         _write_rebase_decision(decision_path, branch_files, main_files, overlap_files,
                                "no_overlap_auto")
         return 0
 
-    _, rc = _git(worktree, "rebase", "main")
+    _, rc = _git(worktree, "rebase", "main", env=_identity_env(worktree))
     if rc == 0:
         decision = "overlap_attempted"
     else:
