@@ -352,15 +352,12 @@ def test_check_secret_patterns_vs_bash_parity(secret_line: str, kind: str, tmp_p
     """For each of the 5 secret patterns, both ports must emit exactly
     one critical issue with the same JSONL shape.
 
-    KNOWN BASH BUG (do NOT edit lib/pre_push_review.sh per the kickoff's
-    strangler-fig rule): the bash ``_check_secret_patterns`` heredoc ends
-    with a top-level Python ``return``, which is a SyntaxError. The bash
-    subprocess therefore aborts with rc=1 and emits NO JSONL output. The
-    Python port fixes this — it correctly emits one critical issue per
-    matched pattern and returns on the first match. This test documents
-    both behaviors (bash broken, py fixed) and asserts the Python port's
-    correct output shape so a regression in either direction is
-    observable.
+    The bash ``_check_secret_patterns`` heredoc previously ended with a
+    top-level Python ``return`` (a SyntaxError → silent no-op → dead secret
+    scanner). That was FIXED in PR #131 (``return`` → ``sys.exit(0)``). This
+    test now enforces true bash+py parity: both must succeed, emit exactly one
+    critical finding per matched pattern (returning on the first match), and
+    produce the identical finding field-for-field.
     """
     diff_text = (
         "diff --git a/lib/example.sh b/lib/example.sh\n"
@@ -379,21 +376,18 @@ def test_check_secret_patterns_vs_bash_parity(secret_line: str, kind: str, tmp_p
         "_check_secret_patterns", [str(diff_path)],
         db=str(tmp_path / "unused.db"),
     )
-    # The bash subprocess must fail with the known SyntaxError. If it
-    # ever starts succeeding, the bash bug is fixed upstream and the
-    # parity test should be tightened.
-    assert bash_r.returncode != 0, (
-        f"{kind}: bash unexpectedly succeeded — bash source bug is fixed; "
-        f"tighten this test to enforce bash+py parity."
+    # The bash secret scanner bug (top-level `return` → SyntaxError → silent
+    # no-op) was FIXED (lib/pre_push_review.sh: `return` → `sys.exit(0)`, PR #131).
+    # It must now succeed and emit the SAME single finding as the Python port.
+    assert bash_r.returncode == 0, (
+        f"{kind}: bash secret check failed: {bash_r.stderr!r}"
     )
-    assert "SyntaxError" in bash_r.stderr, (
-        f"{kind}: bash failed but not with the expected SyntaxError: "
-        f"{bash_r.stderr!r}"
-    )
+    import json as _json
     bash_lines = [ln for ln in bash_r.stdout.splitlines() if ln.strip()]
-    assert bash_lines == [], (
-        f"{kind}: bash emitted JSONL despite the SyntaxError: {bash_lines!r}"
+    assert len(bash_lines) == 1, (
+        f"{kind}: bash expected exactly 1 JSONL finding, got {bash_lines!r}"
     )
+    bash_issue = _json.loads(bash_lines[0])
 
     # Python port — must emit exactly one critical issue per match with
     # the bash-INTENDED shape.
@@ -412,6 +406,12 @@ def test_check_secret_patterns_vs_bash_parity(secret_line: str, kind: str, tmp_p
         f"{kind}: title prefix mismatch: {issue['title']!r}"
     )
     assert issue["suggested_fix"].startswith("Remove the secret")
+    # bash+py parity on the fixed behavior: identical finding, field for field.
+    # The bash JSONL omits the `line` key entirely; the port emits an explicit
+    # `line: None` — semantically identical, so normalize before comparing.
+    assert {**bash_issue, "line": bash_issue.get("line")} == issue, (
+        f"{kind}: bash/py secret finding mismatch:\n bash={bash_issue!r}\n py  ={issue!r}"
+    )
 
 
 def test_check_secret_patterns_returns_on_first_match():
