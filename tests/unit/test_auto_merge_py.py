@@ -123,12 +123,18 @@ def test_auto_merge_approve_and_skip_parity(tmp_path):
         bl = (rp / "home" / ".mini-ork").parent / "merge.log"
         print("DBG bash merge.log:", (rb / "orch" / "runs" / JOB / "merge.log").read_text()[:800]
               if (rb / "orch" / "runs" / JOB / "merge.log").exists() else "<none>")
-        for lbl, r in (("bash", rb / "repo"), ("port", rp / "repo")):
-            for br in _d.run(["git", "-C", str(r), "branch", "--format=%(refname:short)"],
-                             capture_output=True, text=True).stdout.split():
-                mt = _d.run(["git", "-C", str(r), "merge-tree", "--write-tree", "main", br],
-                            capture_output=True, text=True)
-                print(f"DBG merge-tree {lbl} {br}: rc={mt.returncode} err={mt.stderr.strip()[:150]!r}")
+        # manual replay of the port's merge steps on a fresh copy → find the failing git cmd
+        rx = tmp_path / "x"; shutil.copytree(tmp_path / "src", rx); rxr = str(rx / "repo")
+
+        def _gg(*a):
+            r = _d.run(["git", "-C", rxr, *a], capture_output=True, text=True)
+            print(f"DBG replay git {' '.join(a)}: rc={r.returncode} out={r.stdout.strip()[:120]!r} "
+                  f"err={r.stderr.strip()[:200]!r}")
+            return r
+        _gg("checkout", "main")
+        _gg("merge", "--squash", "feat/ok")
+        _gg("status", "--short")
+        _gg("commit", "--no-verify", "-m", "test squash")
     assert counts_b == counts_p == (1, 1, 0)
     snap_b, snap_p = _snapshot(rb), _snapshot(rp)
     assert snap_b == snap_p
