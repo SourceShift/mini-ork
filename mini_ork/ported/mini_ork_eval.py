@@ -275,12 +275,19 @@ def main(argv: list[str] | None = None) -> int:
         # JSON it prints via the embedded python heredoc lands directly on
         # our stdout. The port mirrors that side-effect: print the summary
         # dict bash would have printed.
-        summary = benchmark_suite.run(
-            args.candidate,
-            runner_fn=None,
-            root=str(Path(__file__).resolve().parents[2]),
-            db=db,
-        )
+        # A read-only DB makes benchmark_suite's FK-bootstrap writes raise; bash
+        # tolerates that (writes are best-effort) and still exits 0. Mirror it:
+        # skip the writes with the same warn instead of crashing the run.
+        try:
+            summary = benchmark_suite.run(
+                args.candidate,
+                runner_fn=None,
+                root=str(Path(__file__).resolve().parents[2]),
+                db=db,
+            )
+        except sqlite3.OperationalError as e:
+            sys.stderr.write(f"[warn] DB update skipped: {e}\n")
+            summary = {}
         sys.stdout.write(json.dumps(summary) + "\n")
 
         total_utility = 0

@@ -110,7 +110,12 @@ mkdir -p "$(dirname "$STEER_FILE")"
 # Liveness check via heartbeat.
 if [ "$FORCE" -ne 1 ] && [ -f "$HEARTBEAT" ]; then
   # Heartbeat file's mtime — refuse if older than 15s.
-  HB_MTIME=$(stat -f %m "$HEARTBEAT" 2>/dev/null || stat -c %Y "$HEARTBEAT" 2>/dev/null || echo 0)
+  # GNU stat (`-c %Y`, Linux/CI) FIRST, then BSD stat (`-f %m`, macOS). The old
+  # BSD-first order broke on Linux: GNU `stat -f %m` means *filesystem* status,
+  # not mtime, and "succeeds" with non-numeric output that poisoned the
+  # arithmetic below (`File: unbound variable` under set -u). Sanitize to 0.
+  HB_MTIME=$(stat -c %Y "$HEARTBEAT" 2>/dev/null || stat -f %m "$HEARTBEAT" 2>/dev/null || echo 0)
+  case "$HB_MTIME" in ''|*[!0-9]*) HB_MTIME=0 ;; esac
   NOW=$(date +%s)
   AGE=$((NOW - HB_MTIME))
   if [ "$AGE" -gt 15 ]; then

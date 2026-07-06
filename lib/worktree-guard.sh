@@ -55,7 +55,8 @@ mo_wait_for_worker_quiescence() {
       return 0  # worker exited mid-wait
     fi
     if [ -f "$worker_log" ]; then
-      cur_mtime=$(stat -f %m "$worker_log" 2>/dev/null || stat -c %Y "$worker_log" 2>/dev/null || echo 0)
+      cur_mtime=$(stat -c %Y "$worker_log" 2>/dev/null || stat -f %m "$worker_log" 2>/dev/null || echo 0)
+      case "$cur_mtime" in ''|*[!0-9]*) cur_mtime=0 ;; esac
     else
       cur_mtime=0
     fi
