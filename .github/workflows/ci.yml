@@ -119,7 +119,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -e ".[yaml]"
-          pip install pytest fastapi uvicorn
+          pip install pytest fastapi uvicorn pytest-forked
 
       # The web smoke suite points the FastAPI route handlers at a real
       # state.db; init bootstraps the full schema so those tests run
@@ -127,8 +127,14 @@ jobs:
       - name: Bootstrap state.db
         run: ./bin/mini-ork init
 
+      # --forked runs each test in its own subprocess, so the parity suite's
+      # process-global state (leaked threads, sqlite WAL handles, accumulated
+      # FDs/temp state across 1200+ subprocess-spawning parity tests) can't bleed
+      # across tests. Every residual failure reproduced ONLY under full-suite
+      # accumulation, never in isolation; tests/conftest.py already restores
+      # env+cwd per test — --forked covers the rest at the process boundary.
       - name: Run pytest
-        run: python -m pytest tests/ -v
+        run: python -m pytest tests/ -q -p no:cacheprovider --forked
 
   ui:
     name: ui typecheck + build
