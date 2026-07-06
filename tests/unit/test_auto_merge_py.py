@@ -113,6 +113,22 @@ def test_auto_merge_approve_and_skip_parity(tmp_path):
                              mini_ork_home=str(rp / "home" / ".mini-ork"),
                              state_db=str(rp / "home" / ".mini-ork" / "state.db"),
                              now_iso="2026-07-05T00:00:00.000Z")
+    if (counts_b, counts_p) != ((1, 1, 0), (1, 1, 0)):  # TEMP CI diagnostic
+        import subprocess as _d
+        print("DBG git:", _d.run(["git", "--version"], capture_output=True, text=True).stdout.strip())
+        _gc = _d.run(["git", "config", "--list", "--show-origin"], capture_output=True, text=True).stdout
+        print("DBG cfg:", " | ".join(l for l in _gc.splitlines()
+              if any(k in l.lower() for k in ("merge", "diff", "rebase", "feature", "gpg", "commit", "sign"))))
+        print("DBG counts bash=%r port=%r" % (counts_b, counts_p))
+        bl = (rp / "home" / ".mini-ork").parent / "merge.log"
+        print("DBG bash merge.log:", (rb / "orch" / "runs" / JOB / "merge.log").read_text()[:800]
+              if (rb / "orch" / "runs" / JOB / "merge.log").exists() else "<none>")
+        for lbl, r in (("bash", rb / "repo"), ("port", rp / "repo")):
+            for br in _d.run(["git", "-C", str(r), "branch", "--format=%(refname:short)"],
+                             capture_output=True, text=True).stdout.split():
+                mt = _d.run(["git", "-C", str(r), "merge-tree", "--write-tree", "main", br],
+                            capture_output=True, text=True)
+                print(f"DBG merge-tree {lbl} {br}: rc={mt.returncode} err={mt.stderr.strip()[:150]!r}")
     assert counts_b == counts_p == (1, 1, 0)
     snap_b, snap_p = _snapshot(rb), _snapshot(rp)
     assert snap_b == snap_p
