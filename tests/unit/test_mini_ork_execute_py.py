@@ -8,6 +8,7 @@ harsh-critic-gated increment.
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 import subprocess
@@ -205,3 +206,130 @@ def test_conductor_outcomes_parity(tmp_path):
     assert nb == str(np_) == "2"
     q = "SELECT epic_id,outcome,realized_score FROM conductor_decisions ORDER BY epic_id;"
     assert _sql(db_b, q).stdout == _sql(db_p, q).stdout
+
+
+# ── orchestration backbone parity (NODE_IDS + --dry-run) ──
+
+def _py_blocks():
+    lines = BIN.read_text().splitlines()
+    blocks, cur = [], None
+    for ln in lines:
+        if cur is None and re.search(r"<<'PY'", ln):
+            cur = []
+        elif cur is not None and ln.strip() == "PY":
+            blocks.append("\n".join(cur)); cur = None
+        elif cur is not None:
+            cur.append(ln)
+    wf = next(b for b in blocks if "requires_capabilities" in b and 'wf.get("nodes"' in b)
+    plan = next(b for b in blocks if "decomposition" in b and "wf_by_name" in b)
+    return wf, plan
+
+
+_WF = """dispatch_mode: serial
+nodes:
+  - name: plan1
+    type: planner
+    description: make a plan
+    model_lane: opus_lens
+  - name: res1
+    type: researcher
+    description: research it
+    model_lane: kimi_lens
+    dispatch_mode: parallel
+  - name: impl1
+    type: implementer
+    description: build it
+  - name: rev1
+    type: reviewer
+    description: review it
+    verifier_ref: verifiers/check.sh
+  - name: rb1
+    type: rollback
+    description: undo
+"""
+
+_PLAN = json.dumps({"decomposition": [
+    {"id": "res1", "node_type": "researcher", "description": "research"},
+    {"id": "impl1", "node_type": "implementer", "description": "build"},
+    {"id": "bad", "description": "no type defaults to implementer"},
+]})
+
+
+def _write(tmp, name, content):
+    p = tmp / name; p.write_text(content); return str(p)
+
+
+def test_nodes_from_workflow_parity(tmp_path):
+    wf = _write(tmp_path, "wf.yaml", _WF)
+    blk = tmp_path / "wfblk.py"; blk.write_text(_py_blocks()[0])
+    rb = subprocess.run(["python3", str(blk), wf], capture_output=True, text=True).stdout
+    rp = "\n".join(ex.nodes_from_workflow(wf)) + ("\n" if ex.nodes_from_workflow(wf) else "")
+    assert rb == rp, f"BASH:{rb!r}\nPY:{rp!r}"
+
+
+def test_nodes_from_plan_parity(tmp_path):
+    wf = _write(tmp_path, "wf.yaml", _WF)
+    plan = _write(tmp_path, "plan.json", _PLAN)
+    blk = tmp_path / "planblk.py"; blk.write_text(_py_blocks()[1])
+    rb = subprocess.run(["python3", str(blk), plan], capture_output=True, text=True,
+                        env={**os.environ, "WORKFLOW_PATH": wf}).stdout
+    rp = "\n".join(ex.nodes_from_plan(plan, wf)) + ("\n" if ex.nodes_from_plan(plan, wf) else "")
+    assert rb == rp, f"BASH:{rb!r}\nPY:{rp!r}"
+
+
+def _dispatch_lines(text):
+    return [ln for ln in text.splitlines()
+            if ln.startswith("[dry-run] would dispatch") or "[skip] rollback" in ln]
+
+
+def test_dry_run_end_to_end_parity(tmp_path):
+    wf = _write(tmp_path, "wf.yaml", _WF)
+    home = tmp_path / ".mini-ork"; home.mkdir()
+    db = str(home / "state.db")
+    subprocess.run(["bash", str(REPO / "db" / "init.sh")],
+                   env={**os.environ, "MINI_ORK_HOME": str(home), "MINI_ORK_DB": db},
+                   capture_output=True, text=True, check=True)
+    run_dir = home / "runs" / "run-x"; run_dir.mkdir(parents=True)
+    plan = _write(tmp_path, str(run_dir / "plan.json").replace(str(tmp_path) + "/", ""), _PLAN) \
+        if False else str(run_dir / "plan.json")
+    Path(plan).write_text(_PLAN)
+    env = {**os.environ, "MINI_ORK_ROOT": str(REPO), "MINI_ORK_WORKFLOW": wf,
+           "MINI_ORK_HOME": str(home), "MINI_ORK_DB": db, "MINI_ORK_PLAN_PATH": plan,
+           "MINI_ORK_TASK_CLASS": "code_fix", "MINI_ORK_DRY_RUN": "1"}
+    cb = subprocess.run(["bash", str(BIN), "--dry-run"], capture_output=True, text=True, env=env)
+    old = dict(os.environ); os.environ.clear(); os.environ.update(env)
+    import io
+    from contextlib import redirect_stdout
+    buf = io.StringIO()
+    try:
+        with redirect_stdout(buf):
+            rc = ex.main(["--dry-run"], root=str(REPO))
+    finally:
+        os.environ.clear(); os.environ.update(old)
+    assert cb.returncode == rc == 0, cb.stderr
+    assert _dispatch_lines(cb.stdout) == _dispatch_lines(buf.getvalue()), \
+        f"BASH:{_dispatch_lines(cb.stdout)}\nPY:{_dispatch_lines(buf.getvalue())}"
+    # workflow source has 5 nodes; 4 dispatch + 1 rollback skip
+    assert len(_dispatch_lines(buf.getvalue())) == 5
+    assert any("rollback" in ln for ln in _dispatch_lines(buf.getvalue()))
+
+
+def test_dry_run_node_type_filter(tmp_path):
+    wf = _write(tmp_path, "wf.yaml", _WF)
+    home = tmp_path / ".mini-ork"; home.mkdir()
+    plan = str(home / "plan.json"); Path(plan).write_text(_PLAN)
+    env = {**os.environ, "MINI_ORK_ROOT": str(REPO), "MINI_ORK_WORKFLOW": wf,
+           "MINI_ORK_HOME": str(home), "MINI_ORK_PLAN_PATH": plan, "MINI_ORK_DRY_RUN": "1"}
+    cb = subprocess.run(["bash", str(BIN), "--dry-run", "--node-type", "researcher"],
+                        capture_output=True, text=True, env=env)
+    old = dict(os.environ); os.environ.clear(); os.environ.update(env)
+    import io
+    from contextlib import redirect_stdout
+    buf = io.StringIO()
+    try:
+        with redirect_stdout(buf):
+            ex.main(["--dry-run", "--node-type", "researcher"], root=str(REPO))
+    finally:
+        os.environ.clear(); os.environ.update(old)
+    assert _dispatch_lines(cb.stdout) == _dispatch_lines(buf.getvalue())
+    assert len(_dispatch_lines(buf.getvalue())) == 1   # only res1
