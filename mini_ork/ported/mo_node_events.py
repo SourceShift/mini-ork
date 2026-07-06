@@ -92,10 +92,16 @@ def _now_ms() -> int:
     as a last-resort 1s-resolution fallback. Same pattern as
     lib/llm-dispatch.sh::_mo_llm_now_ms.
     """
-    gdate = subprocess.run(
-        ["gdate", "+%s%3N"], capture_output=True, text=True
-    )
-    if gdate.returncode == 0 and gdate.stdout.strip():
+    try:
+        gdate = subprocess.run(
+            ["gdate", "+%s%3N"], capture_output=True, text=True
+        )
+    except (FileNotFoundError, OSError):
+        # gdate (GNU coreutils) is absent on Linux CI / stock installs — the
+        # spawn itself raises, so guard it and fall through to time.time_ns()
+        # (the docstring's intended fallback) instead of crashing every caller.
+        gdate = None
+    if gdate is not None and gdate.returncode == 0 and gdate.stdout.strip():
         try:
             return int(gdate.stdout.strip())
         except ValueError:
