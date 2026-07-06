@@ -108,3 +108,100 @@ def test_infer_code_region_parity(tmp_path):
         finally:
             os.chdir(cwd); os.environ.clear(); os.environ.update(old)
         assert rb == rp, f"{p!r}: bash={rb!r} py={rp!r}"
+
+
+# ── GRPO writeback parity (DB-deterministic) ──
+
+def _seed_db(tmp, name):
+    home = tmp / name / ".mini-ork"; home.mkdir(parents=True)
+    db = str(home / "state.db")
+    subprocess.run(["bash", str(REPO / "db" / "init.sh")],
+                   env={**os.environ, "MINI_ORK_HOME": str(home), "MINI_ORK_DB": db},
+                   capture_output=True, text=True, check=True)
+    return db
+
+
+def _sql(db, s):
+    return subprocess.run(["sqlite3", db, s], capture_output=True, text=True)
+
+
+def _seed_traces(db):
+    traces = [
+        ("t1", "opus_lens", "success", 1.0, 1000), ("t2", "minimax_lens", "failed", 0.5, 800),
+        ("t3", "kimi_lens", "success", 0.2, 500), ("t4", "opus_lens", "failed", 1.1, 900),
+    ]
+    for tid, av, status, cost, dur in traces:
+        _sql(db, "INSERT INTO execution_traces (trace_id,run_id,workflow_version_id,agent_version_id,"
+                 "task_class,prompt_version_hash,context_bundle_hash,tool_calls,files_read,"
+                 "files_written,verifier_output,reviewer_verdict,cost_usd,duration_ms,"
+                 "final_artifact_ref,status,created_at) VALUES "
+                 f"('{tid}','r1','wf1','{av}','code_fix','ph','ch','[]','[]','[]',"
+                 f"'{{\"node_type\":\"researcher\"}}','',{cost},{dur},'','{status}','2026-07-01T00:00:00Z');")
+
+
+def _apm_rows(db):
+    return _sql(db, "SELECT agent_version_id,role,task_class,runs_count,success_count,"
+                    "printf('%.6f',avg_cost_usd),printf('%.6f',avg_duration_ms),"
+                    "printf('%.6f',relative_advantage) FROM agent_performance_memory "
+                    "ORDER BY agent_version_id;").stdout.strip()
+
+
+def test_grpo_advantages_parity(tmp_path):
+    db_b = _seed_db(tmp_path, "gb"); db_p = _seed_db(tmp_path, "gp")
+    _seed_traces(db_b); _seed_traces(db_p)
+    # halflife=0 disables recency drift so bash/py compute identical weights
+    env = {"MO_LEARNING_HALFLIFE_DAYS": "0", "MINI_ORK_DB": db_b}
+    nb = subprocess.run(["bash", "-c", f'{_extract("mo_learning_write_grpo_advantages")}\n'
+                         'mo_learning_write_grpo_advantages', "_"],
+                        capture_output=True, text=True, env={**os.environ, **env}).stdout.strip()
+    old = dict(os.environ)
+    os.environ.update({"MO_LEARNING_HALFLIFE_DAYS": "0"})
+    try:
+        np_ = ex.write_grpo_advantages(db_p)
+    finally:
+        os.environ.clear(); os.environ.update(old)
+    assert nb == str(np_), f"count bash={nb} py={np_}"
+    assert _apm_rows(db_b) == _apm_rows(db_p) and _apm_rows(db_p), "agent_performance_memory differs"
+
+
+def test_grpo_sigma_zero_tiebreak_parity(tmp_path):
+    # all-success same-reward group → std==0 → cost tiebreak path
+    db_b = _seed_db(tmp_path, "sb"); db_p = _seed_db(tmp_path, "sp")
+    for db in (db_b, db_p):
+        for tid, av, cost in [("a", "opus_lens", 2.0), ("b", "kimi_lens", 0.1)]:
+            _sql(db, "INSERT INTO execution_traces (trace_id,run_id,workflow_version_id,"
+                     "agent_version_id,task_class,prompt_version_hash,context_bundle_hash,tool_calls,"
+                     "files_read,files_written,verifier_output,reviewer_verdict,cost_usd,duration_ms,"
+                     "final_artifact_ref,status,created_at) VALUES "
+                     f"('{tid}','r','w','{av}','code_fix','p','c','[]','[]','[]',"
+                     f"'{{\"node_type\":\"impl\"}}','',{cost},100,'','success','2026-07-01T00:00:00Z');")
+    env = {"MO_LEARNING_HALFLIFE_DAYS": "0", "MINI_ORK_DB": db_b}
+    subprocess.run(["bash", "-c", f'{_extract("mo_learning_write_grpo_advantages")}\n'
+                    'mo_learning_write_grpo_advantages', "_"],
+                   capture_output=True, text=True, env={**os.environ, **env})
+    old = dict(os.environ); os.environ.update({"MO_LEARNING_HALFLIFE_DAYS": "0"})
+    try:
+        ex.write_grpo_advantages(db_p)
+    finally:
+        os.environ.clear(); os.environ.update(old)
+    assert _apm_rows(db_b) == _apm_rows(db_p)
+    # cheaper lane (kimi) got the positive bump
+    kimi = _sql(db_p, "SELECT relative_advantage FROM agent_performance_memory "
+                      "WHERE agent_version_id='kimi_lens';").stdout.strip()
+    assert float(kimi) > 0
+
+
+def test_conductor_outcomes_parity(tmp_path):
+    db_b = _seed_db(tmp_path, "cb"); db_p = _seed_db(tmp_path, "cp")
+    for db in (db_b, db_p):
+        _sql(db, "INSERT INTO epics (id,title,status) VALUES ('e1','E1','done'),('e2','E2','escalated');")
+        _sql(db, "INSERT INTO conductor_decisions (decided_at,epic_id,task_class,outcome) VALUES "
+                 "(1,'e1','x','pending'),(1,'e2','x','pending');")
+    nb = subprocess.run(["bash", "-c", f'{_extract("mo_learning_update_conductor_outcomes")}\n'
+                         'mo_learning_update_conductor_outcomes', "_"],
+                        capture_output=True, text=True,
+                        env={**os.environ, "MINI_ORK_DB": db_b}).stdout.strip()
+    np_ = ex.learning_update_conductor_outcomes(db_p)
+    assert nb == str(np_) == "2"
+    q = "SELECT epic_id,outcome,realized_score FROM conductor_decisions ORDER BY epic_id;"
+    assert _sql(db_b, q).stdout == _sql(db_p, q).stdout
