@@ -22,6 +22,11 @@ import json
 import math
 import os
 import sqlite3
+import sys
+
+_SEP = "\x1f"
+_NODE_TYPE_ORDER = ("planner", "researcher", "implementer", "reviewer", "verifier",
+                    "reflector", "publisher", "rollback")
 
 
 def reward_from_status(status: str = "", verdict: str = "") -> str:
@@ -397,3 +402,219 @@ def write_grpo_advantages(db) -> int:
     con.commit()
     con.close()
     return written
+
+
+# ── orchestration backbone (NODE_IDS assembly + DAG loop + dry-run) ──
+#
+# The live per-node LLM execution (_dispatch_node's non-dry-run branches) is the
+# remaining integration-gated increment; main() below fully ports the
+# deterministic orchestration — node assembly, dispatch-mode routing, the
+# dry-run dispatch plan, verdict.json + status — all parity-gated against the
+# live bash --dry-run. A live dispatch raises NotImplementedError unless a
+# dispatch_fn seam is supplied.
+
+def nodes_from_workflow(wf_path: str) -> list[str]:
+    """workflow.yaml → NODE_IDS tuples (8 SEP-joined fields). Verbatim."""
+    import yaml
+    with open(wf_path) as f:
+        wf = yaml.safe_load(f) or {}
+    out = []
+    for n in wf.get("nodes", []) or []:
+        name = n.get("name", "")
+        typ = n.get("type", "")
+        desc = n.get("description", "") or name
+        pref = n.get("prompt_ref", "") or ""
+        dmode = n.get("dispatch_mode", "") or "serial"
+        vref = n.get("verifier_ref", "") or ""
+        mlane = n.get("model_lane", "") or typ
+        requires = n.get("requires_capabilities", []) or []
+        requires_csv = requires if isinstance(requires, str) else ",".join(str(x) for x in requires)
+        if not name or not typ:
+            continue
+        desc = desc.replace(_SEP, " ")
+        pref = pref.replace(_SEP, " ")
+        vref = vref.replace(_SEP, " ")
+        mlane = mlane.replace(_SEP, " ")
+        requires_csv = requires_csv.replace(_SEP, " ")
+        out.append(_SEP.join([name, typ, desc, pref, dmode, vref, mlane, requires_csv]))
+    return out
+
+
+def nodes_from_plan(plan_path: str, wf_path: str = "") -> list[str]:
+    """plan.json.decomposition (+ optional workflow.yaml lane/prompt lift) → NODE_IDS. Verbatim."""
+    try:
+        import yaml
+    except ImportError:
+        yaml = None
+    with open(plan_path) as f:
+        p = json.load(f)
+    wf_by_name = {}
+    if wf_path and yaml is not None and os.path.isfile(wf_path):
+        try:
+            with open(wf_path) as wf:
+                wf_data = yaml.safe_load(wf) or {}
+            for node in (wf_data.get("nodes") or []):
+                name = str(node.get("name") or "")
+                if not name:
+                    continue
+                wf_by_name[name] = {
+                    "model_lane": str(node.get("model_lane") or "") or None,
+                    "prompt_ref": str(node.get("prompt_ref") or "") or None,
+                    "verifier_ref": str(node.get("verifier_ref") or "") or None,
+                    "dispatch_mode": str(node.get("dispatch_mode") or "serial")}
+        except Exception:
+            wf_by_name = {}
+
+    def _wf_lookup(nid):
+        if nid in wf_by_name:
+            return wf_by_name[nid]
+        u = nid.replace("-", "_")
+        if u in wf_by_name:
+            return wf_by_name[u]
+        d = nid.replace("_", "-")
+        if d in wf_by_name:
+            return wf_by_name[d]
+        return None
+
+    out = []
+    for step in p.get("decomposition", []):
+        nid = step.get("id", "")
+        ntyp = step.get("node_type") or "implementer"
+        if not nid or not ntyp:
+            continue
+        desc = (step.get("description", "") or "").replace(_SEP, " ")
+        wf = _wf_lookup(nid) or {}
+        model_lane = step.get("model_lane") or (wf.get("model_lane") or ntyp)
+        prompt_ref = step.get("prompt_ref") or wf.get("prompt_ref") or ""
+        verifier_ref = step.get("verifier_ref") or wf.get("verifier_ref") or ""
+        dispatch_mode = step.get("dispatch_mode") or wf.get("dispatch_mode") or "serial"
+        out.append(_SEP.join([nid, ntyp, desc, prompt_ref, dispatch_mode, verifier_ref, model_lane, ""]))
+    return out
+
+
+def _dry_dispatch_node(fields, filter_node_type, fail_count, out):
+    """The dry-run branch of _dispatch_node: gates + the plan line. Appends to
+    `out`. Returns whether it counted as dispatched (for the plan line count)."""
+    node_id, node_type, node_desc, model_lane = fields[0], fields[1], fields[2], fields[6]
+    if filter_node_type and node_type != filter_node_type:
+        return
+    if node_type == "rollback" and fail_count == 0:
+        out.append("  [skip] rollback — no failures (escalates_to edge not triggered)")
+        return
+    # dry-run: _mo_policy_route_lane returns current_lane unchanged
+    out.append(f"[dry-run] would dispatch node_id={node_id} node_type={node_type} "
+               f"model_lane={model_lane}: {node_desc}")
+
+
+def _resolve_dispatch_mode(override, wf_path) -> str:
+    if override:
+        return override
+    if wf_path and os.path.isfile(wf_path):
+        try:
+            import yaml
+            return (yaml.safe_load(open(wf_path)) or {}).get("dispatch_mode") or "serial"
+        except Exception:
+            return "serial"
+    return "serial"
+
+
+def _emit_run_verdict(run_dir, fail_count, dispatched):
+    if not (run_dir and os.path.isdir(run_dir)):
+        return
+    if os.path.isfile(os.path.join(run_dir, "verdict.json")) or \
+            os.path.isfile(os.path.join(run_dir, "panel-verdict.json")):
+        return
+    verdict = "fail" if fail_count > 0 else "pass"
+    try:
+        open(os.path.join(run_dir, "verdict.json"), "w").write(
+            '{"verdict":"%s","failed_nodes":%d,"dispatched":%d,"source":"execute@run-level"}\n'
+            % (verdict, fail_count, dispatched))
+    except OSError:
+        return
+    print(f"  [verdict] run-level verdict.json: {verdict} (failed_nodes={fail_count})")
+
+
+def main(argv=None, *, root=None, dispatch_fn=None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    root = root or os.environ.get("MINI_ORK_ROOT") or os.getcwd()
+    os.environ["MINI_ORK_ROOT"] = root
+
+    dry_run = os.environ.get("MINI_ORK_DRY_RUN", "0") == "1"
+    filter_node_type = ""
+    dispatch_mode_override = ""
+    plan_path = os.environ.get("MINI_ORK_PLAN_PATH", "")
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a in ("--help", "-h"):
+            sys.stdout.write("Usage: mini-ork execute [<plan.json>] [--node-type <type>] "
+                             "[--dispatch-mode <mode>] [--dry-run]\n")
+            return 0
+        elif a == "--dry-run":
+            dry_run = True; i += 1
+        elif a == "--node-type":
+            filter_node_type = argv[i + 1]; i += 2
+        elif a == "--dispatch-mode":
+            dispatch_mode_override = argv[i + 1]; i += 2
+        elif a.startswith("-"):
+            sys.stderr.write(f"Unknown flag: {a}. Try --help\n"); return 2
+        else:
+            if not plan_path:
+                plan_path = a; i += 1
+            else:
+                sys.stderr.write(f"Unexpected argument: {a}\n"); return 2
+
+    workflow = os.environ.get("MINI_ORK_WORKFLOW", "")
+    if not workflow and os.environ.get("MINI_ORK_RECIPE"):
+        workflow = os.path.join(root, "recipes", os.environ["MINI_ORK_RECIPE"], "workflow.yaml")
+    run_dir = os.path.dirname(plan_path) if plan_path else "."
+
+    # NODE_IDS: workflow.yaml source wins; else plan.json.decomposition.
+    if workflow and os.path.isfile(workflow):
+        node_source = "workflow.yaml"
+        node_ids = nodes_from_workflow(workflow)
+    else:
+        node_source = "plan.json.decomposition"
+        node_ids = nodes_from_plan(plan_path, workflow)
+    print(f"    nodes:    {len(node_ids)} (from {node_source})")
+
+    dispatch_mode = _resolve_dispatch_mode(dispatch_mode_override, workflow)
+    fields_list = [tuple((e.split(_SEP) + [""] * 8)[:8]) for e in node_ids]
+
+    fail_count = 0
+    out: list[str] = []
+    if dry_run:
+        # partitioned reorders by node_type group; others keep NODE_IDS order.
+        if dispatch_mode == "partitioned":
+            ordered = [f for nt in _NODE_TYPE_ORDER for f in fields_list if f[1] == nt]
+        else:
+            ordered = fields_list
+        for f in ordered:
+            _dry_dispatch_node(f, filter_node_type, fail_count, out)
+        for line in out:
+            print(line)
+        dispatched = sum(1 for line in out if line.startswith("[dry-run] would dispatch"))
+        _emit_run_verdict(run_dir, fail_count, dispatched)
+        print("")
+        print("execute: all nodes complete")
+        return 0
+
+    # Live per-node execution — the integration-gated increment.
+    if dispatch_fn is None:
+        raise NotImplementedError(
+            "mini_ork_execute live dispatch not yet ported — the per-node LLM "
+            "execution (_dispatch_node non-dry-run branches) is the next "
+            "increment. Use --dry-run, or pass dispatch_fn=.")
+    for f in fields_list:
+        if dispatch_fn(f) != 0:
+            fail_count += 1
+    _emit_run_verdict(run_dir, fail_count, len(fields_list))
+    if fail_count > 0:
+        sys.stderr.write(f"execute: {fail_count} node(s) failed\n")
+        return 1
+    print("\nexecute: all nodes complete")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
