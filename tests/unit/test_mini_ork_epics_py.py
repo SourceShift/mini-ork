@@ -34,7 +34,7 @@ def _env(root, home, db):
     return {**os.environ, "MINI_ORK_ROOT": str(root), "MINI_ORK_HOME": str(home), "MINI_ORK_DB": db}
 
 
-def _side(tmp_path, name):
+def _side(tmp_path, name, roadmap=ROADMAP):
     """A repo copy (so split writes into an isolated kickoffs/auto) + fresh db."""
     root = tmp_path / name
     root.mkdir()
@@ -49,7 +49,7 @@ def _side(tmp_path, name):
     subprocess.run(["bash", str(REPO / "db" / "init.sh")],
                    env={**os.environ, "MINI_ORK_HOME": str(home), "MINI_ORK_DB": db},
                    capture_output=True, text=True, check=True)
-    (root / "roadmap.md").write_text(ROADMAP)
+    (root / "roadmap.md").write_text(roadmap)
     return root, home, db
 
 
@@ -112,3 +112,76 @@ def test_priority_parity(tmp_path):
     rb_rc = subprocess.run(["bash", str(rb / "bin" / "mini-ork-epics"), "priority", "base-1", "x"],
                            env=_env(rb, hb, db_b), capture_output=True, text=True).returncode
     assert rb_rc == ep.main(["priority", "base-1", "x"], db=db_p, root=str(rp)) == 2
+
+
+def test_skip_marker_parity(tmp_path):
+    roadmap = """# Roadmap
+
+## Symptom (no-epic)
+This context must not become an epic or kickoff.
+
+## Epic A
+Do A.
+
+## Epic B
+Do B.
+"""
+    rb, hb, db_b = _side(tmp_path, "b", roadmap)
+    rp, hp, db_p = _side(tmp_path, "p", roadmap)
+    subprocess.run(["bash", str(rb / "bin" / "mini-ork-epics"), "ingest", str(rb / "roadmap.md")],
+                   env=_env(rb, hb, db_b), capture_output=True, text=True)
+    ep.main(["ingest", str(rp / "roadmap.md")], db=db_p, root=str(rp))
+    subprocess.run(["bash", str(rb / "bin" / "mini-ork-epics"), "split", str(rb / "roadmap.md")],
+                   env=_env(rb, hb, db_b), capture_output=True, text=True)
+    ep.main(["split", str(rp / "roadmap.md")], db=db_p, root=str(rp))
+    q_e = "SELECT id, title, status FROM epics ORDER BY id"
+    assert _rows(db_b, q_e) == _rows(db_p, q_e)
+    assert not _rows(db_p, "SELECT id FROM epics WHERE id='symptom'")
+    assert not (rb / "kickoffs" / "auto" / "symptom.md").exists()
+    assert not (rp / "kickoffs" / "auto" / "symptom.md").exists()
+
+
+def test_prose_dep_resolution_parity(tmp_path):
+    roadmap = """# Roadmap
+
+## Epic 0 - verify the diagnosis
+Verify the diagnosis.
+
+## Epic 1
+Implement the fix.
+depends on: Epic 0
+"""
+    rb, hb, db_b = _side(tmp_path, "b", roadmap)
+    rp, hp, db_p = _side(tmp_path, "p", roadmap)
+    subprocess.run(["bash", str(rb / "bin" / "mini-ork-epics"), "ingest", str(rb / "roadmap.md")],
+                   env=_env(rb, hb, db_b), capture_output=True, text=True)
+    ep.main(["ingest", str(rp / "roadmap.md")], db=db_p, root=str(rp))
+    q_d = "SELECT from_epic_id, to_epic_id, kind FROM epic_dependencies ORDER BY from_epic_id, to_epic_id"
+    assert _rows(db_b, q_d) == _rows(db_p, q_d)
+    assert ("epic-0-verify-the-diagnosis", "epic-1", "hard") in _rows(db_p, q_d)
+
+
+def test_unresolved_dep_warns_and_skips_parity(tmp_path):
+    roadmap = """# Roadmap
+
+## Epic 1
+Implement the fix.
+depends on: NonexistentEpic
+"""
+    rb, hb, db_b = _side(tmp_path, "b", roadmap)
+    rp, hp, db_p = _side(tmp_path, "p", roadmap)
+    ob = subprocess.run(["bash", str(rb / "bin" / "mini-ork-epics"), "ingest", str(rb / "roadmap.md")],
+                        env=_env(rb, hb, db_b), capture_output=True, text=True)
+    import io
+    from contextlib import redirect_stderr, redirect_stdout
+    stdout, stderr = io.StringIO(), io.StringIO()
+    with redirect_stdout(stdout), redirect_stderr(stderr):
+        ep.main(["ingest", str(rp / "roadmap.md")], db=db_p, root=str(rp))
+    q_d = "SELECT from_epic_id, to_epic_id, kind FROM epic_dependencies ORDER BY from_epic_id, to_epic_id"
+    assert _rows(db_b, q_d) == _rows(db_p, q_d) == []
+    assert "WARNING" in ob.stderr
+    assert "NonexistentEpic" in ob.stderr
+    assert "WARNING" in stderr.getvalue()
+    assert "NonexistentEpic" in stderr.getvalue()
+    assert "1 dep(s) skipped" in ob.stdout
+    assert "1 dep(s) skipped" in stdout.getvalue()
