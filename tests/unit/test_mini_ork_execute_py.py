@@ -208,6 +208,124 @@ def test_conductor_outcomes_parity(tmp_path):
     assert _sql(db_b, q).stdout == _sql(db_p, q).stdout
 
 
+# ── live-path support helpers (increment 4) ──
+
+def _seed_task_run(db, rid="r1", status="planned", cost=0.0):
+    _sql(db, f"INSERT INTO task_runs (id,task_class,workflow_version,kickoff_path,status,"
+             f"cost_usd,created_at,updated_at) VALUES ('{rid}','x','v1','k.md','{status}',"
+             f"{cost},strftime('%s','now','-60 seconds'),strftime('%s','now'));")
+
+
+def test_set_status_parity(tmp_path):
+    db_b, db_p = _seed_db(tmp_path, "ssb"), _seed_db(tmp_path, "ssp")
+    for db in (db_b, db_p):
+        _seed_task_run(db)
+    fn = _extract("_d021_set_status")
+    subprocess.run(["bash", "-c", f'DRY_RUN=0\nMINI_ORK_DB="{db_b}"\nMINI_ORK_RUN_ID="r1"\n{fn}\n'
+                    '_d021_set_status "published"'], capture_output=True, text=True)
+    ex.set_status(db_p, "r1", "published")
+    q = "SELECT status, ended_at IS NOT NULL AND ended_at>0, duration_ms>0 FROM task_runs WHERE id='r1';"
+    assert _sql(db_b, q).stdout.strip() == _sql(db_p, q).stdout.strip()
+    assert _sql(db_p, q).stdout.strip() == "published|1|1"   # terminal stamps ended_at + duration
+    # non-terminal transition: no ended_at
+    for db in (db_b, db_p):
+        _seed_task_run(db, rid="r2")
+    subprocess.run(["bash", "-c", f'DRY_RUN=0\nMINI_ORK_DB="{db_b}"\nMINI_ORK_RUN_ID="r2"\n{fn}\n'
+                    '_d021_set_status "reviewing"'], capture_output=True, text=True)
+    ex.set_status(db_p, "r2", "reviewing")
+    q2 = "SELECT status, ended_at FROM task_runs WHERE id='r2';"
+    assert _sql(db_b, q2).stdout == _sql(db_p, q2).stdout
+    assert _sql(db_p, q2).stdout.strip() == "reviewing|"
+
+
+def test_charge_node_cost_parity(tmp_path):
+    db_b, db_p = _seed_db(tmp_path, "ccb"), _seed_db(tmp_path, "ccp")
+    for db in (db_b, db_p):
+        _seed_task_run(db, cost=0.10)
+    cost_file = tmp_path / "cost"; cost_file.write_text("0.037")
+    fn = _extract("_d022_charge_node_cost")
+    subprocess.run(["bash", "-c", f'DRY_RUN=0\nMINI_ORK_DB="{db_b}"\nMINI_ORK_RUN_ID="r1"\n'
+                    f'MINI_ORK_ROOT="{tmp_path}"\n{fn}\n_d022_charge_node_cost "{cost_file}"'],
+                   capture_output=True, text=True)
+    ex.charge_node_cost(db_p, "r1", str(cost_file), root=str(tmp_path))
+    q = "SELECT printf('%.4f', cost_usd) FROM task_runs WHERE id='r1';"
+    assert _sql(db_b, q).stdout == _sql(db_p, q).stdout
+    assert _sql(db_p, q).stdout.strip() == "0.1370"   # 0.10 + 0.037
+    # invalid cost file → $0.01 placeholder on both
+    for db in (db_b, db_p):
+        _seed_task_run(db, rid="r3", cost=0)
+    bad = tmp_path / "bad"; bad.write_text("not-a-number")
+    subprocess.run(["bash", "-c", f'DRY_RUN=0\nMINI_ORK_DB="{db_b}"\nMINI_ORK_RUN_ID="r3"\n'
+                    f'{fn}\n_d022_charge_node_cost "{bad}"'], capture_output=True, text=True)
+    ex.charge_node_cost(db_p, "r3", str(bad))
+    q3 = "SELECT printf('%.4f', cost_usd) FROM task_runs WHERE id='r3';"
+    assert _sql(db_b, q3).stdout == _sql(db_p, q3).stdout == "0.0100\n"
+
+
+def _git_repo(d):
+    d.mkdir(parents=True)
+    for a in (["init", "-q", "-b", "main"], ["config", "user.email", "t@e"],
+              ["config", "user.name", "t"]):
+        subprocess.run(["git", "-C", str(d), *a], capture_output=True)
+    (d / "app.py").write_text("x = 1\n")
+    subprocess.run(["git", "-C", str(d), "add", "-A"], capture_output=True)
+    subprocess.run(["git", "-C", str(d), "commit", "-qm", "base"], capture_output=True)
+    return d
+
+
+_DIFF_LOG = """The implementer emitted a diff instead of applying it:
+
+--- a/app.py
++++ b/app.py
+@@ -1 +1,2 @@
+ x = 1
++y = 2
+"""
+
+_FENCED_LOG = """I created the file:
+
+### FILE: `newmod.py`
+```python
+def hello():
+    return "hi"
+```
+done.
+"""
+
+
+def _run_bash_apply(impl_log, target):
+    fn = _extract("mo_apply_impl_output")
+    subprocess.run(["bash", "-c", f'MO_APPLY_IMPL_OUTPUT=1\n{fn}\n'
+                    f'mo_apply_impl_output "{impl_log}" "{target}"'], capture_output=True, text=True)
+
+
+def test_apply_impl_output_diff_parity(tmp_path):
+    logf = tmp_path / "impl.log"; logf.write_text(_DIFF_LOG)
+    rb = _git_repo(tmp_path / "rb"); rp = _git_repo(tmp_path / "rp")
+    _run_bash_apply(str(logf), str(rb))
+    ex.apply_impl_output(str(logf), str(rp))
+    assert (rb / "app.py").read_text() == (rp / "app.py").read_text() == "x = 1\ny = 2\n"
+
+
+def test_apply_impl_output_fenced_parity(tmp_path):
+    logf = tmp_path / "impl.log"; logf.write_text(_FENCED_LOG)
+    rb = _git_repo(tmp_path / "rb"); rp = _git_repo(tmp_path / "rp")
+    _run_bash_apply(str(logf), str(rb))
+    ex.apply_impl_output(str(logf), str(rp))
+    assert (rb / "newmod.py").exists() and (rp / "newmod.py").exists()
+    assert (rb / "newmod.py").read_text() == (rp / "newmod.py").read_text()
+    assert 'def hello():' in (rp / "newmod.py").read_text()
+
+
+def test_apply_impl_output_skips_dirty_tree(tmp_path):
+    # implementer already changed the tree → applier must NO-OP (both)
+    logf = tmp_path / "impl.log"; logf.write_text(_DIFF_LOG)
+    rp = _git_repo(tmp_path / "rp")
+    (rp / "app.py").write_text("x = 999\n")   # dirty
+    ex.apply_impl_output(str(logf), str(rp))
+    assert (rp / "app.py").read_text() == "x = 999\n"   # untouched
+
+
 # ── orchestration backbone parity (NODE_IDS + --dry-run) ──
 
 def _py_blocks():
