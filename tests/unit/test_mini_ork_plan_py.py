@@ -47,7 +47,9 @@ def _kick(tmp):
 def _env(home, db, given=None, extra=None):
     e = {**os.environ, "MINI_ORK_ROOT": str(REPO), "MINI_ORK_HOME": home, "MINI_ORK_DB": db,
          "MINI_ORK_TASK_CLASS": "code_fix", "MO_INJECT_LEARNINGS": "0",
-         "MINI_ORK_PROFILE_GATE": "0", "MINI_ORK_RUN_ID": "run-fixed-1"}
+         "MINI_ORK_PROFILE_GATE": "0", "MINI_ORK_PROFILE_PATH": "",
+         "MINI_ORK_NONINTERACTIVE": "1", "MO_AUTO_ANSWER_PROFILE": "0",
+         "MINI_ORK_RUN_ID": "run-fixed-1"}
     if given:
         e["MO_GIVEN_PLAN"] = given
     if extra:
@@ -68,6 +70,28 @@ def _run_py(home, db, kickoff, out, given=None, extra=None):
     finally:
         os.environ.clear(); os.environ.update(old)
     return rc
+
+
+def _run_py_dispatch(home, db, kickoff, out, dispatch, extra=None):
+    old = dict(os.environ)
+    os.environ.clear(); os.environ.update(_env(home, db, extra=extra))
+    try:
+        rc = plan.main([kickoff, "--out", out], root=str(REPO), dispatch=dispatch)
+    finally:
+        os.environ.clear(); os.environ.update(old)
+    return rc
+
+
+def _fake_dispatch(*responses):
+    calls = {"n": 0}
+
+    def dispatch(_task_class, _node_type, _prompt):
+        i = min(calls["n"], len(responses) - 1)
+        calls["n"] += 1
+        return 0, responses[i]
+
+    dispatch.calls = calls
+    return dispatch
 
 
 def _taskrow(db):
@@ -180,3 +204,60 @@ def test_flag_errors_parity(tmp_path):
         plan.main(["--bogus"], root=str(REPO)) == 2
     assert subprocess.run(["bash", str(BIN), "/no/such.md"], capture_output=True, env=e).returncode == \
         plan.main(["/no/such.md"], root=str(REPO)) == 2
+
+
+def test_repair_recovers_parse_error(tmp_path):
+    home, db = _home(tmp_path, "repair-ok")
+    k = _kick(tmp_path)
+    out = str(tmp_path / "repair-ok.json")
+    dispatch = _fake_dispatch("not json", json.dumps(_VALID))
+
+    rc = _run_py_dispatch(home, db, k, out, dispatch)
+
+    assert rc == 0
+    assert dispatch.calls["n"] == 2
+    assert json.loads(Path(out).read_text())["objective"] == _VALID["objective"]
+
+
+def test_repair_exhausted_hard_fail(tmp_path, capsys):
+    home, db = _home(tmp_path, "repair-fail")
+    k = _kick(tmp_path)
+    out = str(tmp_path / "repair-fail.json")
+    dispatch = _fake_dispatch("not json")
+
+    rc = _run_py_dispatch(home, db, k, out, dispatch)
+
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert dispatch.calls["n"] == 3
+    assert "PLAN REJECTED" in captured.err
+
+
+def test_mo_plan_deterministic_fallback_opt_in(tmp_path):
+    home, db = _home(tmp_path, "repair-fallback")
+    k = _kick(tmp_path)
+    out = str(tmp_path / "repair-fallback.json")
+    recipe = tmp_path / "recipes" / "demo"
+    recipe.mkdir(parents=True)
+    workflow = recipe / "workflow.yaml"
+    workflow.write_text(
+        "nodes:\n"
+        "  - name: implement\n"
+        "    type: implementer\n"
+        "edges: []\n"
+        "outputs:\n"
+        "  - plan.json\n"
+        "success_verifiers:\n"
+        "  - verifiers/test.sh\n"
+    )
+    dispatch = _fake_dispatch("not json")
+
+    rc = _run_py_dispatch(home, db, k, out, dispatch, extra={
+        "MO_PLAN_DETERMINISTIC_FALLBACK": "1",
+        "MINI_ORK_RECIPE": "demo",
+        "MINI_ORK_WORKFLOW": str(workflow),
+    })
+
+    assert rc == 0
+    assert dispatch.calls["n"] == 1
+    assert json.loads(Path(out).read_text())["objective"].startswith("Execute recipe ")
