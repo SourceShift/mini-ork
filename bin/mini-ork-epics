@@ -8,13 +8,18 @@
 #   show <epic_id>         Inspect one epic + its deps
 #
 # Heuristic for ingest:
-#   Every `## <title>` heading becomes an epic. The epic id is the heading
-#   slug, with any explicit `(id: foo-1)` overriding. A line within the epic
-#   body matching one of:
+#   Every `## <title>` heading becomes an epic unless the heading ends with
+#   `(no-epic)`, `(context)`, or `(ignore)`. The epic id is the heading slug,
+#   with any explicit `(id: foo-1)` overriding. A line within the epic body
+#   matching one of:
 #       - depends on: <id>[, <id>...]
 #       - blocked by: <id>[, <id>...]
 #       - after: <id>[, <id>...]
 #   creates a hard `from → this` dependency. Soft deps use `should follow:`.
+#   Dependency lists split on commas only. Each token resolves by exact id,
+#   slugified exact id, unique slug prefix, then unique slug substring against
+#   parsed epics plus existing DB epics. Unresolved or ambiguous tokens emit a
+#   WARNING and are counted as skipped in the ingest summary.
 #   Headings not in any roadmap section are silently skipped.
 
 set -Eeuo pipefail
@@ -78,7 +83,7 @@ db, roadmap, repo_root = sys.argv[1:4]
 repo_root = Path(repo_root)
 text = Path(roadmap).read_text(encoding="utf-8", errors="replace")
 
-EPIC_RE = re.compile(r"^##\s+(.+?)\s*(?:\(id:\s*([\w.-]+)\))?\s*$")
+EPIC_RE = re.compile(r"^##\s+(.+?)\s*(?:\(id:\s*([\w.-]+)\))?\s*(?:\((no-epic|context|ignore)\))?\s*$", re.I)
 DEP_PATTERNS = (
     r"^\s*(?:-\s+)?(?:depends on|blocked by|after|requires|should follow|prefer after|related to|see also|context)\s*:.*$"
 )
@@ -86,6 +91,7 @@ DEP_RE = re.compile(DEP_PATTERNS, re.I)
 
 def slugify(title: str) -> str:
     s = re.sub(r"[^a-z0-9-]+", "-", title.lower().strip()).strip("-")
+    s = re.sub(r"-+", "-", s)
     return s or "epic"
 
 def extract_path_hints(body):
@@ -121,6 +127,9 @@ cur = None
 for raw in text.splitlines():
     m = EPIC_RE.match(raw)
     if m:
+        if m.group(3):
+            cur = None
+            continue
         title, explicit_id = m.group(1).strip(), (m.group(2) or "").strip()
         eid = explicit_id or slugify(title)
         cur = {"id": eid, "title": title, "body": []}
@@ -219,7 +228,7 @@ db, roadmap = sys.argv[1:3]
 text = Path(roadmap).read_text(encoding="utf-8", errors="replace")
 
 # Parse: split by `## ` headings. Body = lines until next ## heading.
-EPIC_RE = re.compile(r"^##\s+(.+?)\s*(?:\(id:\s*([\w.-]+)\))?\s*$")
+EPIC_RE = re.compile(r"^##\s+(.+?)\s*(?:\(id:\s*([\w.-]+)\))?\s*(?:\((no-epic|context|ignore)\))?\s*$", re.I)
 DEP_RES = {
     "hard": re.compile(r"^\s*(?:-\s+)?(?:depends on|blocked by|after|requires)\s*:\s*(.+)$", re.I),
     "soft": re.compile(r"^\s*(?:-\s+)?(?:should follow|prefer after)\s*:\s*(.+)$", re.I),
@@ -228,6 +237,7 @@ DEP_RES = {
 
 def slugify(title: str) -> str:
     s = re.sub(r"[^a-z0-9-]+", "-", title.lower().strip()).strip("-")
+    s = re.sub(r"-+", "-", s)
     return s or "epic"
 
 epics = []  # (id, title, body_lines)
@@ -235,6 +245,9 @@ cur = None
 for raw in text.splitlines():
     m = EPIC_RE.match(raw)
     if m:
+        if m.group(3):
+            cur = None
+            continue
         title, explicit_id = m.group(1).strip(), (m.group(2) or "").strip()
         eid = explicit_id or slugify(title)
         cur = {"id": eid, "title": title, "body": []}
@@ -258,7 +271,25 @@ epics = deduped
 con = sqlite3.connect(db)
 con.execute("PRAGMA busy_timeout=5000")
 
-inserted, dep_count = 0, 0
+parsed_epic_ids = {e["id"] for e in epics}
+existing_epic_ids = {row[0] for row in con.execute("SELECT id FROM epics").fetchall()}
+resolvable_epic_ids = parsed_epic_ids | existing_epic_ids
+
+def resolve_dep(token):
+    slug = slugify(token)
+    if token in resolvable_epic_ids:
+        return token
+    if slug in resolvable_epic_ids:
+        return slug
+    matches = [eid for eid in resolvable_epic_ids if eid.startswith(slug)]
+    if len(matches) == 1:
+        return matches[0]
+    matches = [eid for eid in resolvable_epic_ids if slug in eid]
+    if len(matches) == 1:
+        return matches[0]
+    return None
+
+inserted, dep_count, skipped = 0, 0, 0
 for e in epics:
     # 1. Upsert the epic row. New epics default to 'not started'; existing
     #    rows are left alone (so re-ingest doesn't clobber in-flight state).
@@ -275,9 +306,18 @@ for e in epics:
             m = rgx.match(line)
             if not m:
                 continue
-            for raw_dep in re.split(r"[,\s]+", m.group(1)):
-                dep = raw_dep.strip().strip("`")
+            for raw_dep in re.split(r"\s*,\s*", m.group(1)):
+                token = raw_dep.strip().strip("`")
+                if not token:
+                    continue
+                dep = resolve_dep(token)
                 if not dep or dep == e["id"]:
+                    if token and not dep:
+                        print(
+                            f"WARNING: ingest: dep \"{token}\" from \"{e['id']}\" did not resolve; skipped",
+                            file=sys.stderr,
+                        )
+                        skipped += 1
                     continue
                 try:
                     con.execute(
@@ -303,7 +343,7 @@ con.execute("""
        )
 """)
 con.commit()
-print(f"ingest: {inserted} new epic(s), {dep_count} dep edge(s) processed")
+print(f"ingest: {inserted} new epic(s), {dep_count} dep edge(s) processed, {skipped} dep(s) skipped (unresolved)")
 PY
 }
 

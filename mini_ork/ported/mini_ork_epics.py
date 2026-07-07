@@ -2,8 +2,12 @@
 
 Strangler-fig parity port of the subcommand CLI: ingest (roadmap md → epics +
 epic_dependencies + auto-block), split (per-epic kickoff files + kickoff_path),
-list, ready (via ported epic_graph), show, priority. Verbatim markdown/dep
-regexes and slug/dedupe/auto-block logic.
+list, ready (via ported epic_graph), show, priority. Every `## <title>`
+heading becomes an epic unless it ends with `(no-epic)`, `(context)`, or
+`(ignore)`. Dependency lists split on commas only; each token resolves by exact
+id, slugified exact id, unique slug prefix, then unique slug substring against
+parsed epics plus existing DB epics. Unresolved or ambiguous tokens emit a
+WARNING and are counted as skipped in the ingest summary.
 
     main(argv=None, *, db=None, root=None) -> int
 """
@@ -32,7 +36,7 @@ _USAGE = """Usage: mini-ork epics <subcommand> [args]
                                waiters (priority inheritance, Track B5).
 """
 
-_EPIC_RE = re.compile(r"^##\s+(.+?)\s*(?:\(id:\s*([\w.-]+)\))?\s*$")
+_EPIC_RE = re.compile(r"^##\s+(.+?)\s*(?:\(id:\s*([\w.-]+)\))?\s*(?:\((no-epic|context|ignore)\))?\s*$", re.I)
 _DEP_RES = {
     "hard": re.compile(r"^\s*(?:-\s+)?(?:depends on|blocked by|after|requires)\s*:\s*(.+)$", re.I),
     "soft": re.compile(r"^\s*(?:-\s+)?(?:should follow|prefer after)\s*:\s*(.+)$", re.I),
@@ -50,6 +54,7 @@ def _resolve_db(db):
 
 def _slugify(title: str) -> str:
     s = re.sub(r"[^a-z0-9-]+", "-", title.lower().strip()).strip("-")
+    s = re.sub(r"-+", "-", s)
     return s or "epic"
 
 
@@ -58,6 +63,9 @@ def _parse_epics(text: str):
     for raw in text.splitlines():
         m = _EPIC_RE.match(raw)
         if m:
+            if m.group(3):
+                cur = None
+                continue
             title = m.group(1).strip()
             eid = (m.group(2) or "").strip() or _slugify(title)
             cur = {"id": eid, "title": title, "body": []}
@@ -80,7 +88,25 @@ def ingest(roadmap: str, db: str) -> int:
     if not epics:
         sys.stderr.write("ingest: no '## <title>' headings found\n"); return 1
     con = sqlite3.connect(db); con.execute("PRAGMA busy_timeout=5000")
-    inserted = dep_count = 0
+    parsed_epic_ids = {e["id"] for e in epics}
+    existing_epic_ids = {row[0] for row in con.execute("SELECT id FROM epics").fetchall()}
+    resolvable_epic_ids = parsed_epic_ids | existing_epic_ids
+
+    def resolve_dep(token: str):
+        slug = _slugify(token)
+        if token in resolvable_epic_ids:
+            return token
+        if slug in resolvable_epic_ids:
+            return slug
+        matches = [eid for eid in resolvable_epic_ids if eid.startswith(slug)]
+        if len(matches) == 1:
+            return matches[0]
+        matches = [eid for eid in resolvable_epic_ids if slug in eid]
+        if len(matches) == 1:
+            return matches[0]
+        return None
+
+    inserted = dep_count = skipped = 0
     for e in epics:
         if not con.execute("SELECT id FROM epics WHERE id=?", (e["id"],)).fetchone():
             con.execute("INSERT INTO epics(id, title, status) VALUES(?,?,'not started')",
@@ -91,23 +117,31 @@ def ingest(roadmap: str, db: str) -> int:
                 m = rgx.match(line)
                 if not m:
                     continue
-                for raw_dep in re.split(r"[,\s]+", m.group(1)):
-                    dep = raw_dep.strip().strip("`")
+                for raw_dep in re.split(r"\s*,\s*", m.group(1)):
+                    token = raw_dep.strip().strip("`")
+                    if not token:
+                        continue
+                    dep = resolve_dep(token)
                     if not dep or dep == e["id"]:
+                        if not dep:
+                            sys.stderr.write(
+                                f"WARNING: ingest: dep \"{token}\" from \"{e['id']}\" did not resolve; skipped\n")
+                            skipped += 1
                         continue
                     try:
                         con.execute("INSERT OR IGNORE INTO epic_dependencies "
                                     "(from_epic_id, to_epic_id, kind) VALUES(?,?,?)",
                                     (dep, e["id"], kind))
                         dep_count += 1
-                    except sqlite3.Error:
-                        pass
+                    except sqlite3.Error as err:
+                        sys.stderr.write(f"ingest: dep insert failed ({dep}->{e['id']}): {err}\n")
     con.execute("""UPDATE epics SET status='blocked'
         WHERE status='not started' AND id IN (
             SELECT DISTINCT to_epic_id FROM epic_dependencies
              WHERE kind='hard' AND resolved_at IS NULL)""")
     con.commit(); con.close()
-    sys.stdout.write(f"ingest: {inserted} new epic(s), {dep_count} dep edge(s) processed\n")
+    sys.stdout.write(
+        f"ingest: {inserted} new epic(s), {dep_count} dep edge(s) processed, {skipped} dep(s) skipped (unresolved)\n")
     return 0
 
 
