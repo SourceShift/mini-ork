@@ -17,6 +17,11 @@
 #   MINI_ORK_TASK_CLASS     Set by mini-ork-classify (or pass --task-class)
 #   MINI_ORK_WORKFLOW       Path to active workflow.yaml
 #   MINI_ORK_RECIPE         Active recipe name
+#   MO_PLAN_MAX_REPAIRS     Recoverable planner-output repair retries (default: 2)
+#   MO_PLAN_DETERMINISTIC_FALLBACK
+#                           Use deterministic recipe fallback after recoverable
+#                           planner-output rejection (default: 0; otherwise
+#                           repair retries are exhausted, then planning fails)
 #
 # Flags:
 #   --task-class <name>     Override task class
@@ -942,18 +947,262 @@ print(json.dumps(plan, indent=2))
 PY
 }
 
-if [ "$HAS_VERIFIER" = "missing_verifier_contract" ]; then
-  _d015_preserve_raw "missing_verifier_contract"
-  if PLAN_JSON=$(_d015_recipe_fallback_plan); then
-    echo "PLAN WARNING: planner output did not expose verifier_contract.checks; using deterministic recipe fallback plan." >&2
-    HAS_VERIFIER="ok"
-  else
-    echo "PLAN REJECTED: verifier_contract.checks is missing or empty." >&2
-    echo "A plan is not complete until success-check is defined." >&2
-    _d015_mark_plan_failed "missing_verifier_contract"
-    trace_write "{\"trace_id\":\"$TRACE_ID\",\"task_class\":\"${TASK_CLASS}\",\"status\":\"failure\",\"reviewer_verdict\":\"missing_verifier_contract\"}" >/dev/null 2>&1 || true
-    exit 1
+_d015_charge_cost() {
+  if [ -f "${MINI_ORK_DB:-}" ] && [ -n "${RUN_ID:-}" ]; then
+    python3 -c "
+import sqlite3, sys, time
+con = sqlite3.connect(sys.argv[1])
+con.execute('PRAGMA journal_mode=WAL')
+con.execute(\"UPDATE task_runs SET cost_usd=COALESCE(cost_usd,0)+0.05, updated_at=? WHERE id=?\", (int(time.time()), sys.argv[2]))
+con.commit(); con.close()
+" "$MINI_ORK_DB" "$RUN_ID" 2>/dev/null || true
   fi
+}
+
+_d015_detect_truncation() {
+  PLAN_JSON_RAW="$PLAN_JSON_RAW" python3 <<'PY'
+import os
+raw = (os.environ.get("PLAN_JSON_RAW", "") or "").rstrip()[-200:]
+depth = 0
+in_str = False
+esc = False
+for c in raw:
+    if in_str:
+        if esc:
+            esc = False
+        elif c == "\\":
+            esc = True
+        elif c == '"':
+            in_str = False
+        continue
+    if c == '"':
+        in_str = True
+    elif c == "{":
+        depth += 1
+    elif c == "}":
+        depth -= 1
+print("1" if depth > 0 else "0")
+PY
+}
+
+_d015_repair_retry() {
+  local original_prompt="$1"
+  local raw_invalid="$2"
+  local verdict="$3"
+  local truncated="$4"
+  local repair_prompt
+  repair_prompt=$(python3 - "$original_prompt" "$raw_invalid" "$verdict" "$truncated" <<'PY'
+import sys
+
+original_prompt, raw_invalid, verdict, truncated = sys.argv[1:5]
+flag = "yes" if truncated == "1" else "no"
+print(f"""{original_prompt}
+
+--- INVALID PLANNER OUTPUT ---
+{raw_invalid}
+--- /INVALID PLANNER OUTPUT ---
+
+The previous planner output was rejected with verdict: {verdict}
+Trailing-window truncation suspected: {flag}
+
+Return a corrected planner plan using this required JSON schema:
+  objective: string
+  decomposition: array of steps, each with node_type set to one of planner, researcher, implementer, reviewer, verifier, reflector, publisher, rollback
+  verifier_contract.checks: non-empty array
+  artifact_contract: object
+
+No prose, no markdown fences, return ONLY valid JSON.
+""", end="")
+PY
+)
+  if [ -n "$_plan_dispatch_err" ]; then
+    llm_dispatch \
+      --task-class "$TASK_CLASS" \
+      --node-type "planner" \
+      --prompt-text "$repair_prompt" \
+      2>"$_plan_dispatch_err"
+  else
+    llm_dispatch \
+      --task-class "$TASK_CLASS" \
+      --node-type "planner" \
+      --prompt-text "$repair_prompt"
+  fi
+}
+
+_d015_extract_plan_json() {
+  PLAN_JSON_RAW="$PLAN_JSON_RAW" python3 <<'PY'
+import json, os, sys
+txt = os.environ.get("PLAN_JSON_RAW", "")
+
+def objects(s):
+    i = 0
+    while True:
+        start = s.find('{', i)
+        if start < 0:
+            return
+        depth = 0
+        in_str = False
+        esc = False
+        for j in range(start, len(s)):
+            c = s[j]
+            if in_str:
+                if esc:
+                    esc = False
+                elif c == '\\':
+                    esc = True
+                elif c == '"':
+                    in_str = False
+                continue
+            if c == '"':
+                in_str = True
+            elif c == '{':
+                depth += 1
+            elif c == '}':
+                depth -= 1
+                if depth == 0:
+                    yield s[start:j+1]
+                    i = j + 1
+                    break
+        else:
+            return
+
+def contains_placeholder(v):
+    if isinstance(v, str):
+        stripped = v.strip()
+        return stripped.startswith('<') and stripped.endswith('>')
+    if isinstance(v, list):
+        return any(contains_placeholder(x) for x in v)
+    if isinstance(v, dict):
+        return any(contains_placeholder(x) for x in v.values())
+    return False
+
+def is_plan(obj):
+    if not isinstance(obj, dict):
+        return False
+    if not isinstance(obj.get('verifier_contract'), dict):
+        return False
+    if not obj.get('verifier_contract', {}).get('checks'):
+        return False
+    if contains_placeholder(obj):
+        return False
+    return any(k in obj for k in ('objective', 'decomposition', 'artifact_contract'))
+
+first = None
+for chunk in objects(txt):
+    if first is None:
+        first = chunk
+    try:
+        parsed = json.loads(chunk)
+    except Exception:
+        continue
+    if is_plan(parsed):
+        sys.stdout.write(json.dumps(parsed, indent=2))
+        sys.exit(0)
+
+sys.stdout.write(first if first is not None else txt)
+PY
+}
+
+_d015_validate_plan() {
+  echo "$PLAN_JSON" | python3 -c "
+import sys, json
+NODE_TYPES = {'planner','researcher','implementer','reviewer','verifier','reflector','publisher','rollback'}
+try:
+    p = json.load(sys.stdin)
+    vc = p.get('verifier_contract', {})
+    checks = vc.get('checks', [])
+    if not checks:
+        print('missing_verifier_contract'); sys.exit(0)
+    def contains_placeholder(v):
+        if isinstance(v, str):
+            s = v.strip()
+            return s.startswith('<') and s.endswith('>')
+        if isinstance(v, list):
+            return any(contains_placeholder(x) for x in v)
+        if isinstance(v, dict):
+            return any(contains_placeholder(x) for x in v.values())
+        return False
+    if contains_placeholder(p):
+        print('placeholder_plan'); sys.exit(0)
+    ac = p.get('artifact_contract', {})
+    if not isinstance(ac, dict):
+        print('bad_artifact_contract'); sys.exit(0)
+    bad_steps = []
+    for i, step in enumerate(p.get('decomposition', []) or []):
+        nt = (step.get('node_type') or '').strip()
+        if not nt:
+            bad_steps.append(f'step[{i}] {step.get(\"id\",\"?\")}: empty node_type')
+        elif nt not in NODE_TYPES:
+            bad_steps.append(f'step[{i}] {step.get(\"id\",\"?\")}: node_type={nt!r} not in {sorted(NODE_TYPES)}')
+    if bad_steps:
+        print('bad_node_types:' + '|'.join(bad_steps), file=sys.stderr)
+        print('bad_node_types'); sys.exit(0)
+    print('ok')
+except Exception as e:
+    print(f'parse_error:{e}', file=sys.stderr)
+    print('parse_error')
+" 2>&1 | tail -1
+}
+
+if [ "$HAS_VERIFIER" = "placeholder_plan" ]; then
+  echo "PLAN REJECTED: planner emitted a template plan with placeholder values." >&2
+  echo "The selected plan must name real files, sections, actions, and verifier checks." >&2
+  _d015_preserve_raw "placeholder_plan"
+  _d015_mark_plan_failed "placeholder_plan"
+  trace_write "{\"trace_id\":\"$TRACE_ID\",\"task_class\":\"${TASK_CLASS}\",\"status\":\"failure\",\"reviewer_verdict\":\"placeholder_plan\"}" >/dev/null 2>&1 || true
+  exit 1
+fi
+
+if [ -z "${MO_GIVEN_PLAN:-}" ]; then
+  case "$HAS_VERIFIER" in
+    parse_error|missing_verifier_contract|bad_artifact_contract|bad_node_types)
+      _d015_first_verdict="$HAS_VERIFIER"
+      _d015_preserve_raw "$_d015_first_verdict"
+      if [ "${MO_PLAN_DETERMINISTIC_FALLBACK:-0}" = "1" ]; then
+        if PLAN_JSON=$(_d015_recipe_fallback_plan); then
+          echo "PLAN WARNING: planner output was invalid; using deterministic recipe fallback plan because MO_PLAN_DETERMINISTIC_FALLBACK=1." >&2
+          HAS_VERIFIER="ok"
+        fi
+      else
+        _d015_max_repairs="${MO_PLAN_MAX_REPAIRS:-2}"
+        case "$_d015_max_repairs" in
+          ''|*[!0-9]*) _d015_max_repairs=2 ;;
+        esac
+        _d015_attempt=1
+        while [ "$_d015_attempt" -le "$_d015_max_repairs" ]; do
+          echo "PLAN REPAIR: retrying planner output repair (${_d015_attempt}/${_d015_max_repairs}) after ${HAS_VERIFIER}." >&2
+          _d015_truncated="$(_d015_detect_truncation)"
+          if PLAN_JSON_RAW=$(_d015_repair_retry "$PROMPT_TEXT" "$PLAN_JSON_RAW" "$HAS_VERIFIER" "$_d015_truncated"); then
+            _d015_charge_cost
+          else
+            _d015_charge_cost
+            echo "LLM dispatch failed for planner repair" >&2
+            if [ -n "$_plan_dispatch_err" ] && [ -s "$_plan_dispatch_err" ]; then
+              echo "  dispatch stderr (last 20 lines from $_plan_dispatch_err):" >&2
+              tail -20 "$_plan_dispatch_err" | sed 's/^/    /' >&2
+            fi
+            _d015_mark_plan_failed "$_d015_first_verdict"
+            trace_write "{\"trace_id\":\"$TRACE_ID\",\"task_class\":\"${TASK_CLASS}\",\"status\":\"failure\",\"reviewer_verdict\":\"${_d015_first_verdict}\"}" >/dev/null 2>&1 || true
+            exit 1
+          fi
+          PLAN_JSON=$(_d015_extract_plan_json)
+          HAS_VERIFIER=$(_d015_validate_plan)
+          _d015_preserve_raw "$_d015_first_verdict"
+          [ "$HAS_VERIFIER" = "ok" ] && break
+          [ "$HAS_VERIFIER" = "placeholder_plan" ] && break
+          _d015_attempt=$((_d015_attempt + 1))
+        done
+      fi
+      ;;
+  esac
+fi
+
+if [ "$HAS_VERIFIER" = "missing_verifier_contract" ]; then
+  echo "PLAN REJECTED: verifier_contract.checks is missing or empty." >&2
+  echo "A plan is not complete until success-check is defined." >&2
+  _d015_mark_plan_failed "missing_verifier_contract"
+  trace_write "{\"trace_id\":\"$TRACE_ID\",\"task_class\":\"${TASK_CLASS}\",\"status\":\"failure\",\"reviewer_verdict\":\"missing_verifier_contract\"}" >/dev/null 2>&1 || true
+  exit 1
 fi
 
 if [ "$HAS_VERIFIER" = "placeholder_plan" ]; then
@@ -967,7 +1216,6 @@ fi
 
 if [ "$HAS_VERIFIER" = "bad_artifact_contract" ]; then
   echo "PLAN REJECTED: artifact_contract must be an object." >&2
-  _d015_preserve_raw "bad_artifact_contract"
   _d015_mark_plan_failed "bad_artifact_contract"
   trace_write "{\"trace_id\":\"$TRACE_ID\",\"task_class\":\"${TASK_CLASS}\",\"status\":\"failure\",\"reviewer_verdict\":\"bad_artifact_contract\"}" >/dev/null 2>&1 || true
   exit 1
@@ -976,23 +1224,16 @@ fi
 if [ "$HAS_VERIFIER" = "bad_node_types" ]; then
   echo "PLAN REJECTED: one or more decomposition[].node_type values are empty or invalid (D-008b)." >&2
   echo "Each step must declare node_type as one of: planner|researcher|implementer|reviewer|verifier|reflector|publisher|rollback" >&2
-  _d015_preserve_raw "bad_node_types"
   _d015_mark_plan_failed "bad_node_types"
   trace_write "{\"trace_id\":\"$TRACE_ID\",\"task_class\":\"${TASK_CLASS}\",\"status\":\"failure\",\"reviewer_verdict\":\"bad_node_types\"}" >/dev/null 2>&1 || true
   exit 1
 fi
 
 if [ "$HAS_VERIFIER" = "parse_error" ]; then
-  _d015_preserve_raw "parse_error"
-  if PLAN_JSON=$(_d015_recipe_fallback_plan); then
-    echo "PLAN WARNING: planner emitted invalid JSON; using deterministic recipe fallback plan." >&2
-    HAS_VERIFIER="ok"
-  else
-    echo "PLAN REJECTED: planner emitted non-JSON output." >&2
-    _d015_mark_plan_failed "parse_error"
-    trace_write "{\"trace_id\":\"$TRACE_ID\",\"task_class\":\"${TASK_CLASS}\",\"status\":\"failure\",\"reviewer_verdict\":\"parse_error\"}" >/dev/null 2>&1 || true
-    exit 1
-  fi
+  echo "PLAN REJECTED: planner emitted non-JSON output." >&2
+  _d015_mark_plan_failed "parse_error"
+  trace_write "{\"trace_id\":\"$TRACE_ID\",\"task_class\":\"${TASK_CLASS}\",\"status\":\"failure\",\"reviewer_verdict\":\"parse_error\"}" >/dev/null 2>&1 || true
+  exit 1
 fi
 
 # ── write plan ────────────────────────────────────────────────────────────────
