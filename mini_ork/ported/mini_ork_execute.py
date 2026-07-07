@@ -14,6 +14,8 @@ Ported here (all pure / transcribed verbatim):
     infer_trace_code_region(payload)        — files_written → top-level code region
     learning_update_conductor_outcomes(db)  — resolve pending conductor decisions
     write_grpo_advantages(db)               — GRPO group-relative advantage writeback
+    set_status / charge_node_cost           — per-node DB status + cost writes
+    apply_impl_output                       — 'capture coin-flip' diff/fenced-block applier
 """
 from __future__ import annotations
 
@@ -21,8 +23,11 @@ import datetime
 import json
 import math
 import os
+import re
 import sqlite3
+import subprocess
 import sys
+import time
 
 _SEP = "\x1f"
 _NODE_TYPE_ORDER = ("planner", "researcher", "implementer", "reviewer", "verifier",
@@ -614,6 +619,155 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
         return 1
     print("\nexecute: all nodes complete")
     return 0
+
+
+# ── per-node live-path support helpers (deterministic; increment 4) ──
+#
+# These are the deterministic operations _dispatch_node's live (non-dry-run)
+# branches wire around the LLM call: DB status/cost writes and the "capture
+# coin-flip" output applier. Ported + parity-gated ahead of the live routing
+# (whose LLM dispatch is integration territory).
+
+def set_status(db, run_id, new_status, *, dry_run=False):
+    """Verbatim port of _d021_set_status: retrying task_runs status write;
+    terminal states stamp ended_at + duration_ms."""
+    if dry_run or not db or not run_id or not os.path.isfile(db):
+        return
+    terminal = {"published", "rolled_back", "failed"}
+    last_err = None
+    for attempt in range(3):
+        try:
+            con = sqlite3.connect(db, timeout=15.0)
+            con.execute("PRAGMA busy_timeout = 15000")
+            con.execute("PRAGMA journal_mode=WAL")
+            try:
+                if new_status in terminal:
+                    now = int(time.time())
+                    con.execute(
+                        "UPDATE task_runs SET status = ?, updated_at = ?, ended_at = COALESCE(ended_at, ?), "
+                        "duration_ms = CASE WHEN COALESCE(duration_ms, 0) = 0 "
+                        "THEN MAX(COALESCE(ended_at, ?) - created_at, 0) * 1000 "
+                        "ELSE duration_ms END WHERE id = ?",
+                        (new_status, now, now, now, run_id))
+                else:
+                    con.execute("UPDATE task_runs SET status = ?, updated_at = ? WHERE id = ?",
+                                (new_status, int(time.time()), run_id))
+                con.commit()
+                last_err = None
+                break
+            finally:
+                con.close()
+        except sqlite3.OperationalError as e:
+            last_err = e
+            time.sleep(0.5 * (attempt + 1))
+    if last_err is not None:
+        sys.stderr.write(f"[warn] set_status({new_status}) failed after retries: {last_err}\n")
+
+
+def charge_node_cost(db, run_id, cost_file="", *, dry_run=False, root=None):
+    """Verbatim port of _d022_charge_node_cost: charge the node's real LLM cost
+    (from the .last-llm-cost sidecar; $0.01 placeholder otherwise), then the
+    reactive cost-pause check (bash lib seam — sets MO_NODE_FINISH_REASON)."""
+    if dry_run or not db or not run_id or not os.path.isfile(db):
+        return
+    cost = "0.01"
+    if cost_file and os.path.isfile(cost_file):
+        raw = open(cost_file).read().strip()
+        try:
+            v = float(raw)
+            if 0 < v < 10:
+                cost = raw
+        except ValueError:
+            pass
+    try:
+        con = sqlite3.connect(db)
+        con.execute("PRAGMA journal_mode=WAL")
+        con.execute("PRAGMA busy_timeout=5000")
+        con.execute("UPDATE task_runs SET cost_usd = COALESCE(cost_usd,0) + ?, updated_at = ? WHERE id = ?",
+                    (float(cost), int(time.time()), run_id))
+        con.commit(); con.close()
+    except Exception:
+        pass
+    root = root or os.environ.get("MINI_ORK_ROOT", "")
+    pause = os.path.join(root, "lib", "cost_pause.sh") if root else ""
+    if pause and os.path.isfile(pause):
+        r = subprocess.run(["bash", "-c", f'source "{pause}"; mo_cost_pause_check "$1" "$2"',
+                            "_", run_id, cost], capture_output=True)
+        if r.returncode != 0:
+            os.environ["MO_NODE_FINISH_REASON"] = "paused_for_approval"
+
+
+def apply_impl_output(impl_log, target):
+    """Verbatim port of mo_apply_impl_output (the 'capture coin-flip' fix): when
+    the implementer applied NOTHING to the tree, parse its text output for a
+    unified diff (git apply) or fenced file blocks with a path marker (write the
+    files). Path-safe: rejects absolute / .. / out-of-target paths."""
+    if os.environ.get("MO_APPLY_IMPL_OUTPUT", "1") != "1":
+        return
+    if not (impl_log and os.path.isfile(impl_log) and os.path.getsize(impl_log) > 0
+            and os.path.isdir(target)):
+        return
+    porc = subprocess.run(["git", "-C", target, "status", "--porcelain"],
+                          capture_output=True, text=True).stdout
+    if porc.splitlines()[:1]:
+        return
+    text = open(impl_log, encoding="utf-8", errors="replace").read()
+    target_real = os.path.realpath(target)
+
+    def safe_path(p):
+        p = p.strip().strip('`"\'')
+        if not p or os.path.isabs(p) or ".." in p.split("/"):
+            return None
+        full = os.path.realpath(os.path.join(target_real, p))
+        if not full.startswith(target_real + os.sep):
+            return None
+        return p
+
+    applied = []
+    if re.search(r"^--- (a/|/dev/null)", text, re.M) and re.search(r"^\+\+\+ b/", text, re.M):
+        m = re.search(r"(^--- .*?)(?=\n```|\Z)", text, re.S | re.M)
+        if m:
+            try:
+                subprocess.run(["git", "-C", target, "apply", "--whitespace=nowarn", "-"],
+                               input=m.group(1), text=True, capture_output=True, check=True)
+                applied.append("<unified-diff>")
+            except subprocess.CalledProcessError:
+                pass
+    if not applied:
+        lines = text.splitlines()
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            fm = re.match(r"^```[\w+-]*\s+(?:file=|path=)?([\w./_-]+\.[\w]+)\s*$", line)
+            path = safe_path(fm.group(1)) if fm else None
+            if not path and line.startswith("```") and line.strip() != "```":
+                path = None
+            if not path and line.startswith("```"):
+                for back in range(1, 4):
+                    if i - back < 0:
+                        break
+                    pm = re.match(
+                        r"^\s*(?:#{2,4}\s*)?(?:\*\*)?(?:FILE:|File:|file:)?\s*`?"
+                        r"([\w./_-]+\.(?:py|sh|md|yaml|yml|json|toml|txt|cfg|ini))`?:?(?:\*\*)?\s*$",
+                        lines[i - back])
+                    if pm:
+                        path = safe_path(pm.group(1))
+                        break
+            if line.startswith("```") and path:
+                body = []
+                i += 1
+                while i < len(lines) and not lines[i].startswith("```"):
+                    body.append(lines[i])
+                    i += 1
+                if body:
+                    full = os.path.join(target_real, path)
+                    os.makedirs(os.path.dirname(full) or ".", exist_ok=True)
+                    with open(full, "w", encoding="utf-8") as fh:
+                        fh.write("\n".join(body) + "\n")
+                    applied.append(path)
+            i += 1
+    if applied:
+        print("  [apply-impl-output] applied from implementer text: " + ", ".join(applied))
 
 
 if __name__ == "__main__":
