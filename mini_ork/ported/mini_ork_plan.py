@@ -4,8 +4,13 @@ Strangler-fig parity port. Reads task_class + kickoff, builds the planner prompt
 (recipe > workflow > built-in), injects learnings/CN context (best-effort),
 dispatches the planner LLM, then extracts + validates the plan JSON through a
 chain of quality gates (D-011/016/052 extraction, D-008b node-type check,
-placeholder/parse rejection with recipe-fallback), overlays the recipe
-artifact_contract, and writes plan.json + the task_runs row.
+placeholder/parse rejection), retries recoverable invalid planner output with a
+repair prompt, overlays the recipe artifact_contract, and writes plan.json + the
+task_runs row.
+
+Recoverable planner verdicts default to repair-then-fail: the port retries up
+to MO_PLAN_MAX_REPAIRS times (default: 2), then rejects the plan. The old
+deterministic recipe fallback is only used when MO_PLAN_DETERMINISTIC_FALLBACK=1.
 
 The one non-deterministic seam is the LLM dispatch (``dispatch=``); MO_GIVEN_PLAN
 and --dry-run skip it. Every embedded-python block (extraction, validation,
@@ -24,6 +29,8 @@ from pathlib import Path
 
 _NODE_TYPES = {"planner", "researcher", "implementer", "reviewer", "verifier",
                "reflector", "publisher", "rollback"}
+_RECOVERABLE_VERDICTS = {"parse_error", "missing_verifier_contract",
+                         "bad_artifact_contract", "bad_node_types"}
 
 # Verbatim heredoc from bin/mini-ork-plan (dry-run placeholder, inline objects).
 _DRY_RUN_PLACEHOLDER = """{
@@ -167,6 +174,50 @@ def validate_plan(plan_json: str) -> str:
     except Exception as e:
         sys.stderr.write(f"parse_error:{e}\n")
         return "parse_error"
+
+
+def _detect_truncation(raw: str) -> bool:
+    depth = 0
+    in_str = False
+    esc = False
+    for c in (raw or "").rstrip()[-200:]:
+        if in_str:
+            if esc:
+                esc = False
+            elif c == "\\":
+                esc = True
+            elif c == '"':
+                in_str = False
+            continue
+        if c == '"':
+            in_str = True
+        elif c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+    return depth > 0
+
+
+def _build_repair_prompt(root, kickoff, workflow, profile_path, raw_invalid, verdict, truncated) -> str:
+    original = _build_prompt(root, kickoff, workflow, profile_path)
+    truncation_note = "yes" if truncated else "no"
+    return f"""{original}
+
+--- INVALID PLANNER OUTPUT ---
+{raw_invalid or ""}
+--- /INVALID PLANNER OUTPUT ---
+
+The previous planner output was rejected with verdict: {verdict}
+Trailing-window truncation suspected: {truncation_note}
+
+Return a corrected planner plan using this required JSON schema:
+  objective: string
+  decomposition: array of steps, each with node_type set to one of planner, researcher, implementer, reviewer, verifier, reflector, publisher, rollback
+  verifier_contract.checks: non-empty array
+  artifact_contract: object
+
+No prose, no markdown fences, return ONLY valid JSON.
+"""
 
 
 def recipe_fallback_plan(recipe, workflow_path, root, kickoff) -> str | None:
@@ -448,33 +499,54 @@ def main(argv=None, *, root=None, dispatch=None) -> int:
     _charge_cost(db, run_id)
     verdict = validate_plan(plan_json)
 
-    if verdict == "missing_verifier_contract":
-        _preserve_raw(home, run_id, verdict, raw, plan_json)
-        fb = recipe_fallback_plan(recipe, workflow, root, kickoff)
-        if fb:
-            plan_json, verdict = fb, "ok"
-            sys.stderr.write("PLAN WARNING: planner output did not expose verifier_contract.checks; using deterministic recipe fallback plan.\n")
+    if not given and verdict in _RECOVERABLE_VERDICTS:
+        first_verdict = verdict
+        _preserve_raw(home, run_id, first_verdict, raw, plan_json)
+        if os.environ.get("MO_PLAN_DETERMINISTIC_FALLBACK", "0") == "1":
+            fb = recipe_fallback_plan(recipe, workflow, root, kickoff)
+            if fb:
+                plan_json, verdict = fb, "ok"
+                sys.stderr.write("PLAN WARNING: planner output was invalid; using deterministic recipe fallback plan because MO_PLAN_DETERMINISTIC_FALLBACK=1.\n")
         else:
-            sys.stderr.write("PLAN REJECTED: verifier_contract.checks is missing or empty.\n")
-            _mark_failed(db, run_id, verdict); return 1
+            try:
+                max_repairs = int(os.environ.get("MO_PLAN_MAX_REPAIRS", "2"))
+            except ValueError:
+                max_repairs = 2
+            for attempt in range(1, max(0, max_repairs) + 1):
+                sys.stderr.write(f"PLAN REPAIR: retrying planner output repair ({attempt}/{max_repairs}) after {verdict}.\n")
+                truncated = _detect_truncation(raw)
+                repair_prompt = _build_repair_prompt(root, kickoff, workflow, profile_path,
+                                                     raw, verdict, truncated)
+                rc, repaired = dispatch(task_class, "planner", repair_prompt)
+                _charge_cost(db, run_id)
+                if rc != 0:
+                    sys.stderr.write("LLM dispatch failed for planner repair\n")
+                    _mark_failed(db, run_id, first_verdict)
+                    return 1
+                raw = repaired
+                plan_json = extract_plan_json(raw)
+                verdict = validate_plan(plan_json)
+                _preserve_raw(home, run_id, first_verdict, raw, plan_json)
+                if verdict == "ok":
+                    break
+                if verdict == "placeholder_plan":
+                    break
+
+    if verdict == "missing_verifier_contract":
+        sys.stderr.write("PLAN REJECTED: verifier_contract.checks is missing or empty.\n")
+        _mark_failed(db, run_id, verdict); return 1
     if verdict == "placeholder_plan":
         sys.stderr.write("PLAN REJECTED: planner emitted a template plan with placeholder values.\n")
         _preserve_raw(home, run_id, verdict, raw, plan_json); _mark_failed(db, run_id, verdict); return 1
     if verdict == "bad_artifact_contract":
         sys.stderr.write("PLAN REJECTED: artifact_contract must be an object.\n")
-        _preserve_raw(home, run_id, verdict, raw, plan_json); _mark_failed(db, run_id, verdict); return 1
+        _mark_failed(db, run_id, verdict); return 1
     if verdict == "bad_node_types":
         sys.stderr.write("PLAN REJECTED: one or more decomposition[].node_type values are empty or invalid (D-008b).\n")
-        _preserve_raw(home, run_id, verdict, raw, plan_json); _mark_failed(db, run_id, verdict); return 1
+        _mark_failed(db, run_id, verdict); return 1
     if verdict == "parse_error":
-        _preserve_raw(home, run_id, verdict, raw, plan_json)
-        fb = recipe_fallback_plan(recipe, workflow, root, kickoff)
-        if fb:
-            plan_json, verdict = fb, "ok"
-            sys.stderr.write("PLAN WARNING: planner emitted invalid JSON; using deterministic recipe fallback plan.\n")
-        else:
-            sys.stderr.write("PLAN REJECTED: planner emitted non-JSON output.\n")
-            _mark_failed(db, run_id, verdict); return 1
+        sys.stderr.write("PLAN REJECTED: planner emitted non-JSON output.\n")
+        _mark_failed(db, run_id, verdict); return 1
 
     plan_json = overlay_plan(plan_json, task_class, profile_path, root)
     os.makedirs(os.path.dirname(out_file), exist_ok=True)
