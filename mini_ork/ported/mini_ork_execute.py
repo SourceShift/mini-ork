@@ -28,6 +28,7 @@ import json
 import math
 import os
 import re
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -86,6 +87,67 @@ def learning_static_lane(node_type: str, current_lane: str) -> str:
         return frontier
     if node_type in ("researcher", "implementer"):
         return cheap
+    return current_lane
+
+
+def learning_governed_lane(node_type: str, current_lane: str, *, root=None) -> str:
+    """Port of bash `_mo_learning_governed_lane`: delegate the routing read to the
+    canonical `decide()` surface in lib/decision_service.sh — the same brain every
+    consumer uses. No state DB → static fallback (decide can't consult GRPO tables).
+    Shells to the bash `decide` (not re-implemented) so routing stays byte-identical
+    to bash; the .route field carries the lane, empty falls back to current_lane."""
+    db = os.environ.get("MINI_ORK_DB", "")
+    if not db or not os.path.isfile(db):
+        return learning_static_lane(node_type, current_lane)
+    root = root or os.environ.get("MINI_ORK_ROOT") or \
+        os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    ds = os.path.join(root, "lib", "decision_service.sh")
+    if not os.path.isfile(ds):
+        return current_lane
+    task_class = os.environ.get("TASK_CLASS") or os.environ.get("MINI_ORK_TASK_CLASS") or "generic"
+    objective_domain = (os.environ.get("MINI_ORK_OBJECTIVE_DOMAIN")
+                        or os.environ.get("MO_OBJECTIVE_DOMAIN") or "code-delivery")
+    try:
+        r = subprocess.run(
+            ["bash", "-c", f'source "{ds}"; decide "$1" "$2" "$3"',
+             "_", node_type, task_class, objective_domain],
+            capture_output=True, text=True, timeout=30)
+        route = ""
+        if r.returncode == 0 and r.stdout.strip():
+            route = (json.loads(r.stdout).get("route", "") if r.stdout.strip().startswith("{") else "")
+        return route or current_lane
+    except Exception:
+        return current_lane
+
+
+def policy_route_lane(node_type: str, current_lane: str, *, dry_run=False, root=None) -> str:
+    """Port of bash `_mo_policy_route_lane`. Applied to every live node BEFORE dispatch
+    so the routed lane (not the raw node_type/workflow lane) reaches --node-type. Dry-run
+    preserves the recipe's explicit lane (workflow-shape preview, not a policy preview)."""
+    if dry_run:
+        return current_lane
+    policy = os.environ.get("MO_ROUTING_POLICY") or "learning_governed"
+    frontier = os.environ.get("MO_FRONTIER_LANE", "opus_lens")
+    cheap = os.environ.get("MO_CHEAP_LANE", "kimi_lens")
+    llm_types = ("researcher", "implementer", "reviewer")
+    if policy in ("", "workflow_default"):
+        return current_lane
+    if policy == "frontier_only":
+        return frontier if node_type in llm_types else current_lane
+    if policy == "cheap_only":
+        return cheap if node_type in llm_types else current_lane
+    if policy == "static_hybrid":
+        return learning_static_lane(node_type, current_lane)
+    if policy == "learning_governed":
+        return learning_governed_lane(node_type, learning_static_lane(node_type, current_lane), root=root)
+    if policy == "trace_governed":
+        fail_count = int(os.environ.get("FAIL_COUNT", "0") or "0")
+        if node_type == "reviewer":
+            return frontier
+        if node_type in ("researcher", "implementer"):
+            return frontier if fail_count > 0 else cheap
+        return current_lane
+    sys.stderr.write(f"  [warn] unknown MO_ROUTING_POLICY={policy} — using workflow lane {current_lane}\n")
     return current_lane
 
 
@@ -856,6 +918,327 @@ def _default_llm_dispatch(root):
     return d
 
 
+def _watchdog_stale_heartbeat(root, db, run_id):
+    """Port of bash `_mo_watchdog_check_stale_heartbeats` (embedded python). Returns
+    '<node>\\t<ts>' for the first node whose last heartbeat is older than the timeout
+    and not covered by a node_end, else '' (also '' on any error — best-effort)."""
+    db = os.environ.get("MINI_ORK_DB", db)
+    if not run_id or not db or not os.path.isfile(db):
+        return ""
+    try:
+        timeout_ms = int(float(os.environ.get("MO_HEARTBEAT_TIMEOUT_S", "300")) * 1000)
+    except ValueError:
+        timeout_ms = 300000
+    now_ms = int(time.time() * 1000)
+    cutoff = now_ms - timeout_ms
+    try:
+        con = sqlite3.connect(db, timeout=2.0)
+        con.execute("PRAGMA busy_timeout = 2000")
+        try:
+            cols = {r[1] for r in con.execute("PRAGMA table_info(run_events)").fetchall()}
+            if "last_heartbeat_at" not in cols:
+                return ""
+            rows = con.execute(
+                "SELECT event_id, event_type, payload_json, last_heartbeat_at, created_at "
+                "FROM run_events WHERE run_id = ? AND event_type IN "
+                "('node_start','node_heartbeat','node_end') ORDER BY created_at ASC",
+                (run_id,)).fetchall()
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return ""
+    latest, ended_at = {}, {}
+    for event_id, event_type, payload_raw, last_hb, created_at in rows:
+        try:
+            payload = json.loads(payload_raw or "{}")
+        except json.JSONDecodeError:
+            payload = {}
+        node = payload.get("node_id") or event_id
+        if event_type in ("node_start", "node_heartbeat") and last_hb is not None:
+            if latest.get(node) is None or int(last_hb) > latest[node]:
+                latest[node] = int(last_hb)
+        elif event_type == "node_end":
+            ended_ms = (int(created_at or 0) * 1000) + 999
+            ended_at[node] = max(ended_ms, ended_at.get(node, 0))
+    for node, last_hb in latest.items():
+        if last_hb < cutoff and ended_at.get(node, 0) < last_hb:
+            return f"{node}\t{last_hb}"
+    return ""
+
+
+def _synth_artifact_name(root, recipe):
+    """Bash _dispatch_node:2710-2723 — the synth output file is the recipe's
+    artifact_contract.yaml `source_artifact` (default synthesis.md)."""
+    default = "synthesis.md"
+    contract = os.path.join(root, "recipes", recipe, "artifact_contract.yaml") if recipe else ""
+    if not contract or not os.path.isfile(contract):
+        return default
+    try:
+        import yaml  # noqa: PLC0415 — lazy, matches bash's inline python
+        d = yaml.safe_load(open(contract, encoding="utf-8")) or {}
+        return (d.get("source_artifact") or default) if isinstance(d, dict) else default
+    except Exception:
+        return default
+
+
+def _resolve_target_cwd(run_dir_eff):
+    """Port of bash _dispatch_node:2633-2641. Derive the implementer edit-surface cwd
+    from the run's kickoff git-toplevel; fall back to $MO_TARGET_CWD or cwd. This is
+    the CWT-A corruption fix — pins codex to the TARGET repo, not MINI_ORK_ROOT."""
+    kickoff = ""
+    prof = os.path.join(run_dir_eff, "run_profile.json") if run_dir_eff else ""
+    if prof and os.path.isfile(prof):
+        try:
+            kickoff = json.load(open(prof)).get("kickoff_path", "") or ""
+        except Exception:
+            kickoff = ""
+    if kickoff and os.path.isfile(kickoff):
+        try:
+            r = subprocess.run(["git", "rev-parse", "--show-toplevel"],
+                               cwd=os.path.dirname(kickoff), capture_output=True, text=True)
+            if r.returncode == 0 and r.stdout.strip():
+                return r.stdout.strip()
+        except Exception:
+            pass
+        return os.getcwd()
+    return os.environ.get("MO_TARGET_CWD") or os.getcwd()
+
+
+def _assert_lane_capability(root, lane, required):
+    """Shell to lib/lane-helpers.sh mo_assert_lane_capability (rc 0 = satisfiable).
+    Not re-implemented — the capability taxonomy lives in the bash lib."""
+    lib = os.path.join(root, "lib", "lane-helpers.sh")
+    if not os.path.isfile(lib) or not required:
+        return True
+    try:
+        r = subprocess.run(
+            ["bash", "-c", f'source "{lib}"; MO_LANE_REQUIRES_CAPABILITY="$2" '
+             'mo_assert_lane_capability "$1"', "_", lane, required],
+            capture_output=True, text=True, timeout=15)
+        return r.returncode == 0
+    except Exception:
+        return True
+
+
+def _intervention_gate_check(root, node_id, node_type, lane, node_desc):
+    """Shell to lib/intervention_gate.sh intervention_gate_check (rc 0 = proceed).
+    Absent lib → proceed (matches bash `[ -f "$gate_lib" ] || return 0`)."""
+    lib = os.path.join(root, "lib", "intervention_gate.sh")
+    if not os.path.isfile(lib):
+        return True
+    try:
+        r = subprocess.run(
+            ["bash", "-c", f'source "{lib}"; intervention_gate_check "$1" "$2" "$3" "$4"',
+             "_", node_id, node_type, lane, node_desc],
+            capture_output=True, text=True, timeout=15)
+        return r.returncode == 0
+    except Exception:
+        return True
+
+
+def _publisher_try_commit_files(root, target_repo, run_dir, review_file, verdict_env,
+                                recipe, node_desc, run_id):
+    """Port of bash `_publisher_try_commit_files` (embedded python, :824-949). Commit
+    the implementer's in-place edits on reviewer APPROVE. Strict-child path validation
+    (the OSS-leak guard — only `git add --` files proven inside the target repo, never
+    `-A`). Returns True on commit, False on skip."""
+    def log(msg):
+        print(msg, file=sys.stderr, flush=True)
+    summary_path = os.path.join(run_dir, "implementer-summary.json") if run_dir else ""
+    verdict = ""
+    candidates = []
+    if run_dir:
+        for name in ("panel-verdict.json", "review-verdict.json"):
+            p = os.path.join(run_dir, name)
+            if os.path.isfile(p):
+                candidates.append(p)
+    if review_file and os.path.isfile(review_file):
+        candidates.append(review_file)
+    for p in candidates:
+        try:
+            data = json.load(open(p, encoding="utf-8"))
+        except Exception:
+            continue
+        if not isinstance(data, dict):
+            continue
+        if data.get("pass") is True or str(data.get("verdict", "")).strip().lower() in {"approve", "approved", "pass"}:
+            verdict = "approve"
+            break
+    if verdict != "approve" and review_file and root:
+        try:
+            out = subprocess.check_output(
+                ["python3", os.path.join(root, "lib", "extract_verdict.py"), review_file],
+                stderr=subprocess.DEVNULL).decode("utf-8", "replace").strip().lower()
+            if out in {"approve", "approved", "pass"}:
+                verdict = "approve"
+        except Exception:
+            pass
+    if verdict != "approve" and (verdict_env or "").strip().lower() in {"approve", "approved", "pass"}:
+        verdict = "approve"
+    if verdict != "approve":
+        disp = verdict or (verdict_env or "").strip() or "<none>"
+        log(f"  [skip-publish] reviewer verdict (resolved: '{disp}') is not APPROVE — no commit")
+        return False
+    files = []
+    if summary_path and os.path.isfile(summary_path):
+        try:
+            data = json.load(open(summary_path, encoding="utf-8"))
+            if isinstance(data, dict) and isinstance(data.get("files_changed"), list):
+                files = [e for e in data["files_changed"] if isinstance(e, str) and e]
+        except Exception:
+            pass
+    if not files:
+        log(f"  [skip-publish] no files_changed in {summary_path or '<unset>'} — no commit")
+        return False
+    if not target_repo:
+        log("  [skip-publish] no target_repo resolved (MO_TARGET_CWD empty and git toplevel failed)")
+        return False
+    real_root = os.path.realpath(target_repo)
+    valid = []
+    for raw in files:
+        ap = raw if os.path.isabs(raw) else os.path.abspath(raw)
+        if not os.path.exists(ap):
+            log(f"  [reject-publish] file does not exist: {raw}")
+            continue
+        real = os.path.realpath(ap)
+        if real != real_root and not real.startswith(real_root + os.sep):
+            log(f"  [reject-publish] file escapes target repo toplevel: {raw} -> {real} not under {real_root}")
+            continue
+        valid.append(real)
+    if not valid:
+        log(f"  [skip-publish] no valid files inside target_repo={real_root} — no commit")
+        return False
+    try:
+        subprocess.run(["git", "add", "--", *valid], cwd=target_repo, check=True,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        msg = f"mini-ork({recipe}): {node_desc} [run {run_id}]"
+        subprocess.run(["git", "-c", "user.email=mini-ork@local", "-c", "user.name=mini-ork",
+                        "commit", "-q", "-m", msg], cwd=target_repo, check=True,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        sha = subprocess.check_output(["git", "-C", target_repo, "rev-parse", "HEAD"]).decode("utf-8", "replace").strip()
+        log(f"  [publish] committed {len(valid)} file(s): {sha}")
+        return True
+    except subprocess.CalledProcessError as e:
+        log(f"  [skip-publish] git add/commit failed in {target_repo}: rc={e.returncode}")
+        return False
+
+
+def publisher_node(root, run_dir, db, run_id, recipe, task_class, review_file="", verdict_env=""):
+    """Port of bash publisher branch (:2909-3200). The panel found the port stubbed
+    this to `set_status('published')` — this restores the two BLOCKING gates + delivery:
+      1. oracle gates (block on safety_violation);
+      2. recursive-validate-impl panel-verdict approval gate;
+      3. artifact-contract copy source_artifact→outputs + git commit, OR the M1
+         empty-outputs in-place implementer commit.
+    Returns (rc, finish_reason). Template ${VAR} paths resolved via expandvars
+    (envsubst-equivalent)."""
+    # ── oracle gates: fire once pre-publish; only a definitive safety_violation blocks
+    if (os.environ.get("MO_ORACLE_GATES_AUTO", "1") == "1" and run_id and db
+            and os.path.isfile(os.path.join(root, "lib", "gate_bootstrap.sh"))):
+        verdict_file = os.path.join(run_dir, "panel-verdict.json")
+        ctx = json.dumps({"panel_run_id": run_id, "recipe": recipe or "unknown",
+                          "task_class": task_class or "generic",
+                          "verdict_file": verdict_file, "current_round": 1})
+        try:
+            r = subprocess.run(
+                ["bash", "-c",
+                 'source "$1/lib/gate_bootstrap.sh" 2>/dev/null || true; '
+                 'declare -f mo_bootstrap_oracle_gates >/dev/null 2>&1 && mo_bootstrap_oracle_gates 2>/dev/null || true; '
+                 'source "$1/lib/gate_registry.sh" 2>/dev/null || true; '
+                 'declare -f gate_run_all >/dev/null 2>&1 && gate_run_all "$2" "$3" 2>/dev/null || echo "{}"',
+                 "_", root, task_class or "generic", ctx],
+                capture_output=True, text=True, timeout=120)
+            try:
+                sv = json.loads(r.stdout.strip() or "{}").get("safety_violation", False)
+            except Exception:
+                sv = False
+            if sv is True or str(sv) == "True":
+                print("  [BLOCK] oracle-gates: safety_violation — publish refused (COALITION_ABORT or equivalent)")
+                return 1, "safety_violation"
+            print("  [ok] oracle-gates: pre-publish pass")
+        except Exception:
+            pass
+    # ── recursive-validate-impl requires an approved panel verdict
+    if recipe == "recursive-validate-impl":
+        pvf = os.path.join(run_dir, "panel-verdict.json")
+        if not (os.path.isfile(pvf) and os.path.getsize(pvf) > 0):
+            print(f"  [BLOCK] publisher: missing panel verdict at {pvf}", file=sys.stderr)
+            return 1, "verdict_fail"
+        try:
+            data = json.load(open(pvf, encoding="utf-8"))
+            ok = data.get("pass") is True or str(data.get("verdict", "")).strip().lower() in {"approve", "approved", "pass"}
+        except Exception:
+            ok = False
+        if not ok:
+            print("  [BLOCK] publisher: panel verdict is not approved — publish refused", file=sys.stderr)
+            return 1, "verdict_fail"
+    # ── artifact contract
+    contract = os.path.join(root, "recipes", recipe, "artifact_contract.yaml") if recipe else ""
+    if not contract or not os.path.isfile(contract):
+        print(f"  [warn] publisher: no artifact_contract.yaml at {contract} — skipping", file=sys.stderr)
+        return 0, "done"
+    src_name, outputs = "synthesis.md", []
+    try:
+        import yaml  # noqa: PLC0415
+        d = yaml.safe_load(open(contract, encoding="utf-8")) or {}
+        if isinstance(d, dict):
+            src_name = d.get("source_artifact") or "synthesis.md"
+            for o in (d.get("outputs") or []):
+                if isinstance(o, dict) and o.get("path"):
+                    outputs.append(o["path"])
+                elif isinstance(o, str):
+                    outputs.append(o)
+    except Exception:
+        pass
+    if not outputs:
+        # M1 empty-outputs: commit the implementer's in-place edits (code-fix recipes)
+        target_repo = os.environ.get("MO_TARGET_CWD", "")
+        if not target_repo:
+            try:
+                target_repo = subprocess.check_output(
+                    ["git", "-C", root or ".", "rev-parse", "--show-toplevel"],
+                    stderr=subprocess.DEVNULL).decode().strip()
+            except Exception:
+                target_repo = root or "."
+        print("  [warn] publisher: artifact_contract.yaml has no outputs[] — skipping publish", file=sys.stderr)
+        _publisher_try_commit_files(root, target_repo, run_dir, review_file, verdict_env,
+                                    recipe or "code-fix", os.environ.get("MINI_ORK_NODE_DESC", "implementer"),
+                                    run_id or "local")
+        set_status(db, run_id, "published")
+        return 0, "done"
+    # ── copy source_artifact → outputs[] + git-commit each (envsubst via expandvars)
+    src = os.path.join(run_dir, os.path.expandvars(src_name))
+    src_is_dir = os.path.isdir(src)
+    if not src_is_dir and not os.path.isfile(src):
+        print(f"  [warn] publisher: expected source artifact missing: {src}", file=sys.stderr)
+        return 1, "error"
+    for out in outputs:
+        out = os.path.expandvars(out)
+        dst = os.path.join(root, out)
+        try:
+            if src_is_dir:
+                dst_norm = dst.rstrip("/")
+                os.makedirs(dst_norm, exist_ok=True)
+                subprocess.run(["cp", "-R", src + "/.", dst_norm + "/"], check=False)
+            else:
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                shutil.copy(src, dst)
+            subprocess.run(["git", "add", out], cwd=root, check=False,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(
+                ["git", "-c", "user.email=mini-ork@local", "-c", "user.name=mini-ork",
+                 "commit", "-q", "-m",
+                 f"audit({recipe or 'unknown'}): publish synthesis from {run_id}\n\n"
+                 f"Run: {run_id}\nRecipe: {recipe or 'unknown'}\nOutput: {out}\n"
+                 "Dispatched by mini-ork-execute publisher node (D-037 v0.2-pt9)."],
+                cwd=root, capture_output=True)
+            print(f"  [ok] publisher: published {out} (committed)")
+        except Exception as e:
+            print(f"  [warn] publisher: failed {out}: {e}", file=sys.stderr)
+    set_status(db, run_id, "published")
+    return 0, "done"
+
+
 _REVIEW_PASS = {"pass", "approve", "approved"}
 _REVIEW_REVISE = {"revise", "needs_revision", "request_changes"}
 # unknown/other verdicts fall through to verdict_fail (matches bash catch-all)
@@ -865,14 +1248,27 @@ def dispatch_node(fields, *, root, run_dir, plan_path, task_class, db, run_id,
                   dispatch_fn, recipe="", workflow="", trace_fn=None):
     """Live dispatch of one node. Returns (rc, finish_reason). rc!=0 → FAIL_COUNT++.
     dispatch_fn(task_class, node_type, prompt) -> (rc, text)."""
-    node_id, node_type, node_desc, prompt_ref, _dmode, verifier_ref, model_lane, _req = \
+    node_id, node_type, node_desc, prompt_ref, _dmode, verifier_ref, model_lane, node_requires_capabilities = \
         (list(fields) + [""] * 8)[:8]
-    lane = model_lane or node_type
+    # F1: apply the learning policy router BEFORE dispatch (bash _dispatch_node:2219)
+    # so the routed lane — not the raw workflow/node_type lane — reaches --node-type.
+    # Without this the whole GRPO/learning-governed router is inert (panel finding 1).
+    workflow_lane = model_lane or node_type
+    lane = policy_route_lane(node_type, workflow_lane, dry_run=False, root=root)
     trace = trace_fn or (lambda *a, **k: None)
-    cost_sidecar = os.path.join(os.environ.get("MINI_ORK_RUN_DIR", run_dir), ".last-llm-cost")
+    run_dir_eff = os.environ.get("MINI_ORK_RUN_DIR", run_dir)
+    cost_sidecar = os.path.join(run_dir_eff, ".last-llm-cost")
 
     def _charge():
         charge_node_cost(db, run_id, cost_sidecar, root=root)
+
+    # ── Pre-dispatch gates (bash _dispatch_node:2231-2318). These run for every
+    # real dispatch; the dry-run preview path is _dry_dispatch_node, not here. ──
+    # Cooperative soft-stop: UI POST /stop touches .stop-requested; bail BEFORE the
+    # next node so an in-flight node finishes naturally (Stop=soft vs Kill=hard).
+    if os.path.isfile(os.path.join(run_dir_eff, ".stop-requested")):
+        print(f"  [stop] .stop-requested present — skipping node_id={node_id}", file=sys.stderr)
+        return 1, "interrupted"
 
     # rollback only fires on an upstream failure (escalates_to edge) — the caller
     # gates that; here a reached rollback sets the terminal status.
@@ -882,6 +1278,24 @@ def dispatch_node(fields, *, root, run_dir, plan_path, task_class, db, run_id,
     if node_type == "reflector":
         subprocess.run([os.path.join(root, "bin", "mini-ork-reflect")], capture_output=True)
         return 0, "done"
+
+    # Capability assert (bash:2296-2306): a node's requires_capabilities must be
+    # satisfiable by the resolved lane, else fail 'config' rather than dispatch to
+    # an incapable lane.
+    if node_requires_capabilities and not _assert_lane_capability(root, lane, node_requires_capabilities):
+        print(f"  [config] lane={lane} missing required capability for node_id={node_id}: "
+              f"{node_requires_capabilities}", file=sys.stderr)
+        return 1, "config"
+    # Stale-heartbeat watchdog (bash:2308-2315) for the LLM node types.
+    if node_type in ("researcher", "implementer", "reviewer"):
+        stale = _watchdog_stale_heartbeat(root, db, run_id)
+        if stale:
+            print(f"  [timeout] stale heartbeat detected before node_id={node_id}: {stale}",
+                  file=sys.stderr)
+            return 1, "timeout"
+    # Intervention gate (bash:2258-2262): human-in-the-loop hold.
+    if not _intervention_gate_check(root, node_id, node_type, lane, node_desc):
+        return 1, "blocked"
 
     recipe_dir = os.path.join(root, "recipes", recipe) if recipe else ""
     prompt_file = ""
@@ -929,7 +1343,13 @@ def dispatch_node(fields, *, root, run_dir, plan_path, task_class, db, run_id,
     if node_type == "implementer":
         impl_log = os.path.join(run_dir, f"impl-{node_id}.log")
         prompt = f"{_prepend()}Implement: {node_desc}\n\nPlan:\n{plan_content}"
-        target = os.environ.get("MO_TARGET_CWD") or os.getcwd()
+        # F4: pin the codex/gemini edit surface to the TARGET repo (kickoff's git
+        # toplevel), not os.getcwd(). Without this the implementer diff/writes land
+        # in mini-ork's own tree when cwd != target — the CWT-A corruption hazard
+        # (bash _dispatch_node:2626-2642). Export so cl_codex.sh reads it.
+        target = _resolve_target_cwd(run_dir_eff)
+        os.environ["MO_TARGET_CWD"] = target
+        print(f"  [cwd] codex target: {target}", file=sys.stderr)
         rc, result = dispatch_fn(task_class, lane, prompt)
         if rc != 0:
             fr = finish_reason_for_failure(rc, result)
@@ -942,9 +1362,23 @@ def dispatch_node(fields, *, root, run_dir, plan_path, task_class, db, run_id,
         return 0, "done"
 
     if node_type == "reviewer":
-        is_synth = "synth" in node_id
-        review_file = (os.path.join(run_dir, f"review-{node_id}.json") if not is_synth
-                       else os.path.join(run_dir, "synthesis.md"))
+        # F3/F6: three-way classification matching bash _dispatch_node:2704-2727.
+        #  - recursive-validate-impl/tier4_synth is a PANEL GATE, not a synth: it
+        #    writes panel-verdict.json and MUST run the verdict gate (approval gate).
+        #  - other *synth* nodes are informational: write the artifact_contract
+        #    source_artifact (default synthesis.md) and never gate.
+        #  - everything else is a classic reviewer → review-<id>.json + gate.
+        recipe_eff = recipe or os.environ.get("MINI_ORK_RECIPE", "")
+        is_panel_gate = (recipe_eff == "recursive-validate-impl" and node_id == "tier4_synth")
+        if is_panel_gate:
+            review_file = os.path.join(run_dir, "panel-verdict.json")
+            is_synth = False
+        elif "synth" in node_id:
+            review_file = os.path.join(run_dir, _synth_artifact_name(root, recipe_eff))
+            is_synth = True
+        else:
+            review_file = os.path.join(run_dir, f"review-{node_id}.json")
+            is_synth = False
         prompt = f"{_prepend()}Review: {node_desc}\n\nPlan:\n{plan_content}"
         marker = os.path.join(run_dir, f".dispatch-marker-{node_id}"); open(marker, "w").write("")
         rc, result = dispatch_fn(task_class, lane, prompt)
@@ -960,7 +1394,7 @@ def dispatch_node(fields, *, root, run_dir, plan_path, task_class, db, run_id,
         verdict = _extract_verdict(root, review_file)
         print(f"  [info] reviewer verdict={verdict} → {review_file}")
         vn = verdict.lower()
-        if is_synth:
+        if is_synth:  # true synth only — panel gate falls through to the verdict gate
             trace(node_id, "success", "reviewer", review_file, verdict, "done")
             _charge()
             return 0, "done"
@@ -998,8 +1432,10 @@ def dispatch_node(fields, *, root, run_dir, plan_path, task_class, db, run_id,
         return (0, "done") if rc == 0 else (1, "error")
 
     if node_type == "publisher":
-        set_status(db, run_id, "published")
-        return 0, "done"
+        recipe_eff = recipe or os.environ.get("MINI_ORK_RECIPE", "")
+        return publisher_node(root, run_dir_eff, db, run_id, recipe_eff, task_class,
+                              review_file=os.environ.get("REVIEW_FILE", ""),
+                              verdict_env=os.environ.get("VERDICT", ""))
 
     if node_type == "rollback":
         set_status(db, run_id, "rolled_back")

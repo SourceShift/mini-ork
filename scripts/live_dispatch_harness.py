@@ -57,6 +57,11 @@ def main() -> int:
                 "strftime('%s','now'),strftime('%s','now'))")
     con.commit(); con.close()
 
+    # Export the full run env the dispatch subprocess needs — mirrors what a real
+    # `mini-ork run` exports. Missing MINI_ORK_HOME sends llm-dispatch to a stale
+    # cwd-relative .mini-ork with no lane config → the dispatch silently errors.
+    os.environ["MINI_ORK_HOME"] = str(home)
+    os.environ["MINI_ORK_ROOT"] = str(ROOT)
     os.environ["MINI_ORK_RUN_DIR"] = str(run_dir)
     os.environ["MINI_ORK_DB"] = db
     fields = ("h1_lens", "researcher", "Return the single word OK and nothing else.",
