@@ -1,163 +1,196 @@
-# Research Synthesis — GEPA `promptEvolution/` → Prompt-Harness Migration
+# Research Synthesis: SIA vs mini-ork / TraceOtter / ContextNest / Coevolve
 
-**Research question:** Should the `server/services/promptEvolution/` arc (GEPA mutation, reflection, VISTA gates, judge rubric, balanced-eval) migrate onto the mandatory project prompt harness (`registerPrompt` + `resolvePromptForDocument`, 3-tier `document → user → default` override chain)? If so, by what strategy, with what call-site→PromptKey mapping, what cache-key invariant, and what machine-checkable Definition-of-Done?
+## Section 1: TL;DR (≤ 5 bullets)
 
-**Lenses composed:** `lens-glm` (web/practice breadth), `lens-kimi` (academic rigor), `lens-codex` (in-repo + OSS code patterns), `lens-opus` (deep theory/tension). All four read in full.
-
-**Headline:** All four lenses converge that the migration is correct *and* that the naive reading of the kickoff premise is wrong. The kickoff says "43/44 files emit inline prompt literals"; the codex lens, reading live at HEAD, found that **only 10 of 50 non-test files actually call an LLM, 9 of those carry inline literals, and exactly 1 (`adversarialDrill.ts`) already registers** (Codex-A6). The migration backlog is **9 call-sites, not 43 files.** The single most important design finding — agreed by codex and opus, anticipated by glm and kimi as a gap — is that **GEPA mutation *candidates* are data and must NOT get a PromptKey; only the *meta-prompts that drive evolution* (reflector, judge, repair, rubric) are config and migrate.**
-
----
-
-## Section 1 — TL;DR
-
-- **Migrate — but only the 9 meta-prompt call-sites, never the mutation candidates.** The candidate prompt body flowing through `vistaGate.ts:333` (`scorePrompt(promptBody, …)`) is GEPA *data*; registering it is a category error. *(Codex-A6 + Opus-§3/§7; high.)*
-- **Use branch-by-abstraction gated per-file by existing fixtures, not big-bang.** All four refactoring sources reject big-bang; opus prefers strangler-fig but concedes the repo's own per-file fixture gates + pre-prod posture make the call closer than dogma. *(GLM-Fowler + Opus-§4.3/§6 + Kimi-10; high on "not big-bang", medium on strangler-vs-BBA — see §3.)*
-- **The cache key for replayed eval/judge prompts must be a full prompt-content hash + version, never owner-keyed or position-truncated.** This is a live defect: `idempotency.ts:44` hashes only the first 200 chars, and GEPA edits are deliberately small/targeted — a mutation past char 200 collides to a stale result. *(Codex-A5 + GLM-PromptLayer-repro + Kimi-8/Kimi-9 + Opus-§4.1; high.)*
-- **Treat each eval/judge prompt as a measurement instrument, not a feature.** Judge wording alone shifts outcomes up to 24.2pp; semantically equivalent rewordings flip 25% of verdicts — a drifting un-versioned ruler inside a self-improving loop is a metrology failure. *(Kimi-3/Kimi-4/Kimi-5 + Opus-§1/§4.2; high.)*
-- **Definition-of-Done is a machine-checkable invariant cloned from the repo's existing `no-restricted-syntax` gate.** `eslint.config.mjs:333` already bans raw `fetch()` to provider URLs via an AST selector; clone it to flag a literal/template passed as `prompt:` to `llm.generate*` inside `promptEvolution/**`, plus a grep gate in `scripts/lint-critical-gates.sh`. *(Codex-A "invariant" + Opus-§6.4; high.)*
-
----
-
-## Section 2 — Consensus findings (≥2 lenses converge)
-
-**★★★ (all 4) — A prompt that scores/judges is a versioned measurement instrument, and inline literals are pure liability for it.**
-glm frames it as the field's WHY ("prompt versioning must account for non-deterministic LLM outputs", GLM-MLflow; reproducibility needs the exact prompt pinned, GLM-PromptLayer-repro: "69 papers audited, only 5 runnable, 0 fully reproduced"). kimi supplies the effect sizes (Kimi-4/Zhang 2026: judge wording shifts harmful-rate up to **24.2pp**, surface rewording up to **20.1pp**; Kimi-3/Yagubyan 2026: pairwise prefs flip **13.6%** avg, semantically equivalent prompts change majority outcome in **25%** of cases). codex shows the repo *already accepted* a reflective meta-prompt as a harness key (Codex-A3, the `prompt_deep_research_reflect` "P2-10 harness-bypass closure"). opus supplies the theory (Opus-§1: the 2023 LLM-as-judge arrival turned the eval prompt from documentation into an instrument). **This is the load-bearing justification for the entire migration.**
-
-**★★★ (all 4) — GEPA mutation candidates are DATA, not config; only the meta-prompts are config.**
-codex makes it concrete and falsifiable: `vistaGate.ts:333` passes the candidate-being-scored as `systemPrompt`; "any ADR recommendation that tries to register `promptBody` is unsound" (Codex-A6). opus elevates it to the central tension and names the carve-out verbatim (Opus-§3/§7: "the candidates flow through placeholders, the instruments flow through the registry"). glm flagged it as a literature gap ("no canonical treatment of self-evolving prompts vs static-config", GLM-gap-1/gap-6). kimi flagged the same as caveat #6 ("GEPA prompts are data, not static config… the harness may need an extension"). **Convergent across breadth, rigor, practice, and theory — the strongest signal in the synthesis.**
-
-**★★★ (all 4) — Cache key for replayed eval prompts must be content-hash + version, not owner-keyed / not truncated.**
-codex localizes the bug (Codex-A5: `idempotency.ts:44` = `sha256(...:promptSnippet.slice(0,200))`, 5-min TTL; GEPA edits are "small and targeted" per `gepaReflector.ts:239` → post-char-200 mutation = identical key = stale replay). opus supplies the defense already in-repo (Opus-§4.1/§6.3: `semanticPromptCache.ts:92-93` already does SHA-256 `content_hash` discriminated by `embedding_model_version`) and the CACE framing (Sculley 2015). glm supplies the external recipe (GLM-PromptLayer-repro + GLM-FutureAGI: cache must include prompt content + version + model + temp + seed; GLM-2601.23088 key-collision attack → need ≥SHA-256 collision resistance). kimi supplies the determinism science (Kimi-8/Messina-Scotta 2026: `T_bg ≈ 0.075` even at nominal T=0 → key must include model+provider+version; Kimi-9/Li 2026: 480k calls, temp↔agreement Pearson −0.82 to −0.93 → freeze + record judge temperature).
-
-> **Note — two distinct cache mechanisms, not a contradiction.** codex's `idempotency.ts` (a 5-min request-dedup middleware, truncated/owner-keyed = the *defect*) and opus's `semanticPromptCache.ts` (content-hash eval cache = the *correct* model). The ADR fix is: route eval/judge calls through the content-hash cache (or mark them idempotency-exempt), never let the 200-char middleware key a GEPA eval. See §3 for why this is reconciliation, not dispute.
-
-**★★ (codex + glm) — The universal registry schema is "name + version + label", and the gateway sits downstream of prompt resolution.**
-codex: researcher's `PromptKey` + A/B variant + doc/user override mirrors Langfuse `getPrompt(name, version, {label})` (Codex-B1), promptflow filename (Codex-B3), Helicone/PromptLayer (Codex-B6); the `llm.generateStructured` facade takes a raw string, so migration swaps the literal *upstream* of the facade, never touches the facade (Codex-A4/convergent-pattern-2). glm: same triad across Langfuse/LangSmith/Helicone/MLflow (GLM-bucket-1), and prompt-as-flag-payload is a documented rollout pattern (GLM-GrowthBook/FeatBit). **Implication: the researcher harness already IS the convergent shape; the migration just enrolls 9 keys.**
-
-**★★ (opus + kimi) — Provenance must be recorded as a tuple per mutation cycle to defend against judge drift.**
-opus: record `(promptKey, source, content_hash, embedding_model_version)` so "by what standard was mutation X promoted?" is one query (Opus-§6.5). kimi: Preference Leakage (Kimi-7/Li 2025: PLS up to **37.9%**, p<0.001) + the alt-annotator test (Kimi-6/Calderon 2025) demand provenance separating judge lineage from generator lineage. RULERS (Kimi-5/Hong 2026) = "locked, versioned, immutable rubric bundles" with QWK 0.7276 vs 0.4319 — the academic blueprint for the registry's judge-rubric keys.
-
-**★★ (glm + kimi) — Co-version the eval set with the prompt; validate each variant before deleting the legacy literal.**
-glm: GLM-2601.22025 ("eval harness version-controlled alongside the prompt templates… small enough to run on every change"). kimi: same paper as Kimi-10/Commey 2026 — generic "improved" prompts dropped Llama-3 extraction **100%→90%**, RAG compliance **93.3%→80%**. **Direct support for per-file fixture-gated migration: each harness-registered replacement must pass the existing GEPA fixture before the inline literal is removed.**
-
-**★★ (codex + opus) — A fallback literal survives even in a "no-inline" system; the invariant forbids the *live* literal, not all strings.**
-codex-convergent-pattern-3 (researcher `fallbackPrompt`, Langfuse `fallback=`) + Opus-§6.4 carve-out ("forbid literal *templates* while allowing placeholder-injected mutation content"). **The lint gate must be written to this precision or it false-positives on GEPA's raison d'être.**
+- **SIA closes a narrow, evaluator-gated self-improvement loop (harness edits + optional weight updates) and the code is shipped, but its headline benchmark gains are vendor-reported and not independently replicated.**
+  - Lenses: lens-glm source-01, lens-kimi P1, lens-codex impl-1/2, lens-opus §2.
+  - Confidence: high.
+- **SIA's weights mode is not a built-in trainer; it delegates to a generated `train.py` that depends on Tinker / Modal / SandboxFusion credentials, making it the highest-risk claim-vs-code surface.**
+  - Lenses: lens-kimi P1, lens-codex impl-2/3, lens-opus §3.
+  - Confidence: high.
+- **Our stack is stronger on cross-run memory, provenance, multi-lane routing, and productized orchestration, but still lacks a real graded per-run eval node and has a fragile research-synthesis verifier.**
+  - Lenses: lens-codex impl-4/5/6/9/12/13/14, lens-kimi P2/P5/P11, lens-opus §3/§4.
+  - Confidence: high.
+- **For continual, multi-task learning, memory-based RL (JitRL / Memento / SKILL-DISCO) is a methodologically credible alternative to SIA's per-task fine-tuning, but the two are not directly benchmarked against each other.**
+  - Lenses: lens-kimi P2/P5/P9/P10, lens-glm source-07, lens-opus §3.
+  - Confidence: medium-high.
+- **The highest-leverage steal from SIA is its `evaluate.py → results.json → feedback-agent` contract, ported into mini-ork as a `type: eval` recipe node that feeds the already-shipped `reward_g` / lane-router / TraceOtter pipeline.**
+  - Lenses: lens-codex impl-1/4/5, lens-kimi P11, lens-opus §6 rec-1/8.
+  - Confidence: high.
 
 ---
 
-## Section 3 — Disputed findings (sources disagree)
+## Section 2: Consensus Findings
 
-**Dispute 1 — Strangler-fig vs branch-by-abstraction as the chosen strategy.**
-- **opus argues strangler-fig** (Opus-§6.1): wrap each call-site behind `resolvePromptForDocument` one file at a time, gated by its fixture, highest-stakes (judge rubric) first. Cites Fowler 2004 + Feathers 2004.
-- **opus simultaneously concedes branch-by-abstraction** may win "if the 43 files share so much state that no single file can be migrated without its neighbors" (Opus-§6.1) and that **pre-prod posture makes big-bang itself more tenable than dogma suggests** (Opus-§6.6).
-- **glm leans branch-by-abstraction** on structural grounds: "the GEPA migration has no HTTP façade — it's an internal service-layer refactor — so branch-by-abstraction may fit better than strangler-fig" (GLM-bucket-3, citing Fowler's *Patterns of Legacy Displacement* + *LegacySeam*: `resolvePromptForDocument` IS the seam).
-- **codex implicitly favors a precedent-extension** (not a named refactor school): replicate the P2-10 closure that already added a reflective key (Codex-A3) — i.e. the pattern is proven in-repo, lowering the risk of any sequencing choice.
-- **My judgment:** This is a *scale* disagreement, not a contradiction. Strangler-fig is for replacing a *system* at its edges via a façade; there is no façade here — `resolvePromptForDocument` is an internal **seam** (GLM-LegacySeam), which is the textbook trigger for **branch-by-abstraction**. But the migration is only **9 call-sites**, not 43 files (Codex-A6) — small enough that the strangler/BBA distinction nearly collapses. **Resolution: branch-by-abstraction is the technically precise label (seam, no façade, in-place swap), executed per-file gated by existing fixtures (the strangler discipline opus wants).** The ADR should pick **branch-by-abstraction**, name strangler-fig and big-bang as alternatives-rejected, and note the choice is low-stakes given the 9-site backlog. *Additional evidence that would resolve it fully: the call-site shared-state graph (does any of the 9 sites share mutable module state with another?) — codex's census suggests they don't, but the impl run should confirm before committing to per-file ordering.*
+### SIA strengths vs us
 
-**Dispute 2 — Is the kickoff's "43/44 inline literals" premise accurate?**
-- **Planner/kickoff premise:** 43/44 files emit inline literals (audit Bundle A: G-5/G-6/K-9/K-10/D-6/Opus-Seam-A).
-- **codex, reading live at HEAD (Codex-A6):** 50 non-test files; **10 call an LLM; 9 carry inline literals; 1 already registers.** "True compliant count is 1 of 50."
-- **My judgment:** Not a real contradiction — different denominators. The audit counted *files containing literal strings*; codex counted *files that actually invoke an LLM with a literal as the live prompt*. The migration-relevant number is codex's: **9 call-sites**. The ADR must use 9 (the actionable backlog) and footnote the 43 (the broader literal-sprawl the audit flagged, most of which are non-LLM strings or comments). *Resolving evidence: codex already cites file:line for all 9 (census table) — verifier should confirm each anchor resolves.*
+- ★★★ **SIA has a concrete, generation-level evaluator contract.** The orchestrator runs the target artifact, then a task-local `evaluate.py` writes `results.json`, and the feedback prompt consumes that scalar evidence to mutate the next generation. This is a falsifiable, file-system-level improvement signal that our stack has not yet made first-class.
+  - Evidence: lens-codex impl-1 (`/Volumes/docker-ssd/ps/sia/sia/orchestrator.py:185`, `/Volumes/docker-ssd/ps/sia/EVALUATION_GUIDE.md:5`); lens-kimi P1 (`/Volumes/docker-ssd/ps/sia/sia/orchestrator.py:185-270`); lens-opus §2 (`/Volumes/docker-ssd/ps/sia/sia/orchestrator.py:185`).
 
-**Dispute 3 — Does the harness override chain *fit* self-evolving prompts at all, or does it need an extension?**
-- **kimi (caveat #6) + opus (§3) say the 3-tier chain is INERT for GEPA:** a system-authored prompt has no "user override of default"; forcing `userUuid:"system"` collapses four tiers to default-only ("theater", Opus-§3).
-- **opus's conclusion (§6.2) — add a `system`/`evolved` source tier** that bypasses `document→user` resolution; cites that the `source` enum already carries a non-user value (`label`, `promptIntegrationService.ts:181`) proving the tier set is extensible.
-- **codex implicitly says no extension needed for the meta-prompts:** they ARE human-authored config (the reflector/judge/repair templates), so the existing default tier fits; only candidates are data, and candidates don't migrate (Codex-A6).
-- **My judgment:** Both are right about different objects. **Meta-prompts (the 9 sites) = human-authored config → existing default tier fits, no extension required.** The `system` tier opus proposes is only needed *if* the team ever wants to persist an *evolved* prompt as a reusable canonical default (glm-gap-6's (a)+(b): persist/share mutation output). That is **out of scope for this migration** (which governs instruments, not candidates). **Resolution: the ADR migrates the 9 meta-prompts using the existing 3-tier default; it explicitly defers the `system`/`evolved` tier as a documented future extension, with opus's Kendall-τ experiment (§ below) as the gate for whether it's ever needed.** This is the cleanest reconciliation of the dissent: opus is right the chain is inert for *candidates*, wrong that this blocks *instrument* migration.
+- ★★★ **SIA is narrower and more benchmark-shaped, which makes its loop easier to report and replicate (in principle).** It accepts one task, one public/private data split, one generated artifact, and one metric. This matches the eval-driven-development culture better than our broad orchestration graph.
+  - Evidence: lens-codex impl-1/2 (`/Volumes/docker-ssd/ps/sia/sia/cli.py:84`, `/Volumes/docker-ssd/ps/sia/sia/config.py:30`); lens-kimi P1; lens-opus §2.
 
-> **Per recipe discipline (Nasser 2026): disputes above are reported, not vote-ruled.** Where I render a "resolution" it is a *reconciliation* (the lenses describe different objects/scales), not a majority vote between same-conviction agents.
+- ★★ **SIA treats harness edits and weight updates as complementary levers.** The CLI exposes `--focus harness` and `--focus weights`; weights mode switches the generated artifact to `train.py`. The literature cluster around SIA (Self-Rewarding LMs, Voyager, STaR) supports combining improvement levers rather than choosing one.
+  - Evidence: lens-glm source-01/source-19; lens-codex impl-2 (`/Volumes/docker-ssd/ps/sia/sia/orchestrator.py:661`, `/Volumes/docker-ssd/ps/sia/sia/prompts.py:432`); lens-opus §2.
 
----
+### Our strengths vs SIA
 
-## Section 4 — Cross-lens gaps (in no source)
+- ★★★ **Our stack has shipped cross-run operational learning substrate that SIA lacks.** mini-ork records `reward_value` / `reward_g` on every node trace, computes relative lane advantage, and stamps execution-time rewards; TraceOtter distills histories into training datasets; ContextNest stores provenance-graded memory; Coevolve exposes the operator shell.
+  - Evidence: lens-codex impl-4/5/6/10/11/12/13/14 (`/Volumes/docker-ssd/ps/mini-ork/mini_ork/trace_store.py:28`, `/Volumes/docker-ssd/ps/mini-ork/mini_ork/lane_router.py:31`, `/Volumes/docker-ssd/ps/TraceOtter/traceotter/pipeline.py:15`, `/Volumes/docker-ssd/ps/ContextNest/src/ingest/claude_code/extractor.rs:20`, `/Volumes/docker-ssd/ps/coevolve/internal/core/integration.go:9`); lens-kimi P2/P5/P11; lens-opus §3/§4.
 
-1. **No canonical "self-evolving prompt vs static-config prompt" treatment.** Every registry vendor (Langfuse/LangSmith/Helicone/MLflow) and academic source assumes human-authored prompts. The GEPA data-vs-config carve-out is constructed from first principles here (GLM-gap-1, Kimi-caveat-6, Opus-§3). *Candidate for: an in-repo ADR contribution + possible upstream note to GEPA authors.*
+- ★★★ **Our stack is methodologically stronger for continual learning and avoids catastrophic forgetting by design.** JitRL proves a memory-only additive logit update is sufficient and 30× cheaper; Memento and SKILL-DISCO corroborate memory-based adaptation; SIA overwrites `target_agent.py` per generation with no non-erasing archive.
+  - Evidence: lens-kimi P2/P5/P9 (`/Volumes/docker-ssd/ps/TraceOtter/docs/roadmap/m9-continual-jit-learning.md`); lens-glm source-07/source-08; lens-opus §3; lens-codex convergent pattern 1.
 
-2. **No published cache-key composition spec for LLM eval replay.** All sources gesture "pin everything"; nobody publishes the canonical recipe. The ADR must *invent* the composite: `sha256(canonical_json{prompt_content, prompt_version, model_id, provider, temperature, seed, parser_schema})` — flagged as an ADR contribution, not established practice (GLM-gap-2, corroborated by Kimi-8/Kimi-9 on which fields are load-bearing).
+- ★★ **Our stack records process telemetry and provenance, not just final benchmark scores.** ContextNest grades verification/read-context/feature claims against raw tool events; mini-ork traces include cost, duration, tool calls, and rubric scores. This reduces the risk of climbing the wrong hill.
+  - Evidence: lens-codex impl-12/13 (`/Volumes/docker-ssd/ps/ContextNest/src/ingest/claude_code/extractor.rs:1129`, `/Volumes/docker-ssd/ps/ContextNest/src/ingest/claude_code/extractor.rs:1308`); lens-kimi P4/P6; lens-opus §4.
 
-3. **No strangler-vs-BBA case study for an internal prompt-registry call-pattern migration.** Fowler's canon is application rewrites, not internal registry enrollment (GLM-gap-3). The ADR's branch-by-abstraction choice needs original justification (the seam argument), not just a citation.
-
-4. **No public OSS "no-inline-prompt-literal" lint rule.** The seam canon says "wrap then enforce" but no project publishes the regex/AST rule (GLM-gap-4). The repo's `no-restricted-syntax` clone (Codex-invariant) is novel practice worth documenting.
-
-5. **No third-party empirical data on prompt-regression incidents caused by implicit vs explicit prompt-source.** Vendors *sell* "you need a registry"; the closest evidence (GLM-PromptLayer 69-paper audit) is about academic eval reproducibility, not prompt-source hygiene (GLM-gap-5). **Verifier must not over-claim external validation for the lint-invariant recommendation** — it rests on in-repo reasoning + analogy, not measured incident data.
-
-6. **No accuracy anchor in the judge-reliability literature.** Kimi-caveat-2: Zhang/Yagubyan show prompts *disagree* but rarely establish which is *correct*. **So the migration's honest claim is improved *reproducibility + auditability*, NOT improved accuracy.** The ADR must state this scope limit explicitly.
-
-7. **Open question opus would measure (the OOD experiment):** *Does routing GEPA eval/judge prompts through the harness change the fitness ranking of mutations, holding content byte-identical?* Measurable = Kendall's τ between pre/post-migration mutation orderings. τ≈1.0 → harness is free auditability, migrate. τ<1.0 → harness leaks into the fitness signal (stray placeholder default, Tier-0 A/B firing on a system key, cache-key mismatch) → seal leaks first (Opus-§5). **This is the single best validation experiment for the impl run.**
+- ★★ **Our stack has a productized control plane (Coevolve) that SIA does not.** Coevolve registers orchestrator / memory / learning / worker integrations and renders real run/cost/router/context panels rather than benchmark dashboards.
+  - Evidence: lens-codex impl-14/15 (`/Volumes/docker-ssd/ps/coevolve/internal/core/integration.go:133`, `/Volumes/docker-ssd/ps/coevolve/internal/run/controller.go:82`); lens-opus §3.
 
 ---
 
-## Section 5 — Numbered recommendations (falsifiable)
+## Section 3: Disputed Findings
 
-1. **Migrate exactly the 9 meta-prompt call-sites** (Codex-A6 census table) into a new `prompt_evolution` feature area, one `PromptKey` each: `prompt_gepa_reflect_root_cause` (`gepaReflector.ts:239`), `prompt_gepa_apply_edit` (`:350`), `prompt_gepa_cron_reflect` (`gepaCron.ts:367`), `prompt_gepa_adversarial_attack` (`adaptiveAttackDrill.ts:149`), `prompt_gepa_rubric_redesign` (`adaRubricService.ts:134`), `prompt_gepa_json_repair` (`stageB_ZodValidation.ts:81`), `prompt_gepa_llm_judge` (`llmJudgeCron.ts`), `prompt_gepa_stage_{a,c,d}` (`evolutionOrchestrator.ts`), `prompt_gepa_meta_judge` (`metaJudge.ts`/`balancedEvaluation.ts:88`). *Support: codex (live anchors).* **Wrong if:** the impl run finds a callsite where the mutation candidate and its measuring instrument are fused in one literal (Opus-§7) — that site must be split before migration.
+### Dispute 1: Is SIA's narrow benchmark loop more "scientific" or just more limited?
 
-2. **Do NOT register the mutation candidate at `vistaGate.ts:333`** or any `scorePrompt(promptBody, …)` path — it is GEPA data flowing through a placeholder. *Support: Codex-A6 + Opus-§7 (all-4 consensus).* **Wrong if:** product ever wants per-user GEPA personalization (then candidates become owner-scoped — not the case today).
+- **Claim A (SIA is more scientific):** The SIA loop is short, falsifiable, and centered on a crisp evaluator; our broad orchestration stack optimizes many things but not one benchmark. (lens-glm source-01/source-09, lens-opus §2 conventional wisdom)
+- **Claim B (SIA is limited, outer-system is more complete):** Real software delivery requires memory, routing, provenance, rollback, cost control, and operator surfaces; a benchmark score can miss all of them. (lens-kimi P4/P11, lens-opus §3 dissent, lens-codex impl-12/13/14)
+- **Why they disagree:** Different definitions of "improvement." SIA optimizes a task-local scalar; our stack optimizes repeated heterogeneous work. The disagreement is a scope dispute, not a factual one.
+- **Evidence that would resolve it:** A controlled cross-task transfer experiment: ten learning tasks + ten held-out transfer tasks, same budget, measuring next-task performance, cost, failure recovery, and provenance accuracy. (lens-opus §5)
 
-3. **Choose branch-by-abstraction, executed per-file gated by existing fixtures** (`fixtureRegressionGate.ts`), highest-stakes instrument (judge rubric) first. Name strangler-fig + big-bang as alternatives-rejected. *Support: GLM-LegacySeam (seam, no façade) + Opus-§6.1/§6.6 (fixture discipline) + Kimi-10/GLM-2601.22025 (validate-before-delete).* **Wrong if:** the 9 sites share mutable module state (then a single atomic `PromptSource` seam swap beats per-file) — confirm via call-site graph in the impl run.
+### Dispute 2: Are per-task weight updates necessary, or is memory-based RL sufficient?
 
-4. **Make the eval/judge cache key a full content-hash + version, never owner-keyed or 200-char-truncated.** Route GEPA eval/judge through `semanticPromptCache.ts` (content-hash, already correct) and mark those calls exempt from `idempotency.ts`'s 200-char middleware. *Support: Codex-A5 (the bug) + Opus-§4.1/§6.3 (the in-repo defense) + GLM-2601.23088 (≥SHA-256) + Kimi-8/Kimi-9 (include model+temp).* **Wrong if:** GEPA eval results were ever legitimately user-specific — they measure the prompt, not the user.
+- **Claim A (weight updates are complementary and sometimes required):** Some domains (GPU kernels, legal charge classification, scRNA denoising) need latent skill acquisition that prompting/memory cannot provide. (lens-glm source-01, lens-opus §2 conventional wisdom)
+- **Claim B (memory-based RL is the right default for continual systems):** JitRL proves a frozen base plus additive logit memory is sufficient, 30× cheaper, and avoids catastrophic forgetting; SIA's per-task fine-tuning assumes a closed task. (lens-kimi P2/P5, lens-glm source-07)
+- **Why they disagree:** Different time horizon and task distribution. SIA assumes a fixed task with a clear eval endpoint; JitRL assumes a continuous stream of tasks.
+- **Evidence that would resolve it:** Head-to-head ablation on the same task sequence: SIA `--focus weights` vs JitRL-style memory router, measuring final performance, forgetting, and cost.
 
-5. **Ship the machine-checkable DoD invariant** = clone `eslint.config.mjs:333` (`no-restricted-syntax`) to flag a `Literal`/`TemplateLiteral` passed as the `prompt:` property of an `llm.generate*` CallExpression inside `server/services/promptEvolution/**`, **plus** a grep gate in `scripts/lint-critical-gates.sh`: `! grep -REn 'prompt:\s*` + backtick `|const \w*[Pp]rompt\w* = ` + backtick + `You are' server/services/promptEvolution --include='*.ts' | grep -v '\.test\.'`. Green = zero inline literals remain. *Support: Codex-invariant + Opus-§6.4.* **Wrong if:** written too coarsely — it must forbid literal *templates* while allowing placeholder-injected candidate content (the §2 carve-out), or it false-positives on GEPA's own data path.
+### Dispute 3: Does SIA's stationary evaluator fatally cap its loop?
 
-6. **Record `(promptKey, source, content_hash, embedding_model_version)` as a provenance tuple per mutation cycle.** *Support: Opus-§6.5 + Kimi-5/Kimi-7 (judge drift/leakage).* **Wrong if:** per-cycle storage cost exceeds audit value — implausible at 5 mutations/cycle (`gepaReflector.ts:24`).
-
-7. **Validate each migrated prompt against its existing fixture before deleting the inline literal; claim reproducibility+auditability, not accuracy.** *Support: Kimi-10/GLM-2601.22025 (validate-before-delete) + Kimi-caveat-2 (no accuracy anchor).* **Wrong if:** a fixture is itself stale/wrong — re-baseline it in the same commit (pre-prod posture permits this).
-
-8. **Run opus's Kendall-τ pass-through experiment in the impl run** as the migration's correctness gate, and **defer the `system`/`evolved` source tier** unless τ<1.0 forces it. *Support: Opus-§5/§6.2 + Kimi-caveat-6.* **Wrong if:** no historical mutation cycles with recorded fitness exist to replay (then fall back to byte-identical-render assertion per call-site).
+- **Claim A (evaluator is a strength):** SIA's `evaluate.py → results.json` contract turns improvement into an objective, legible signal. (lens-opus §2, lens-codex impl-1)
+- **Claim B (stationary evaluator is a liability):** Red Queen Gödel Machine argues evaluators must co-evolve with the agent; a fixed evaluator can be gamed and caps attainable competence. (lens-kimi P4, lens-opus §4)
+- **Why they disagree:** One side treats the evaluator as ground truth; the other treats it as another mutable artifact under adversarial pressure.
+- **Evidence that would resolve it:** Measure SIA's gaming-resistance: introduce a held-out human or oracle judge and report divergence between `results.json` and the oracle.
 
 ---
 
-## Section 6 — Source manifest
+## Section 4: Cross-Lens Gaps
 
-### lens-glm (web/practice — 22 distinct URLs)
-- Langfuse prompt version control — https://langfuse.com/docs/prompt-management/features/prompt-version-control
-- LangSmith manage prompts — https://docs.langchain.com/langsmith/manage-prompts
-- Helicone prompt mgmt overview/assembly — https://docs.helicone.ai/features/advanced-usage/prompts/overview
-- MLflow Prompt Registry — https://mlflow.org/prompt-registry
-- PromptLayer "Why LLM Eval Isn't Reproducible" (Feb 2026) — https://blog.promptlayer.com/why-llm-evaluation-results-arent-reproducible-and-what-to-do-about-it
-- PromptLayer "LLM Eval Fundamentals" (Jan 2026) — https://blog.promptlayer.com/llm-evaluation-fundamentals-our-guide-for-engineering-teams
-- Braintrust "What is prompt versioning" — https://www.braintrust.dev/articles/what-is-prompt-versioning
-- Maxim AI "Top 5 Prompt Versioning Tools" — https://www.getmaxim.ai/articles/top-5-prompt-versioning-tools-for-reliable-ai-workflows
-- EleutherAI lm-evaluation-harness — https://github.com/EleutherAI/lm-evaluation-harness
-- arXiv 2601.22025 "When 'Better' Prompts Hurt" — https://arxiv.org/html/2601.22025v1
-- Future AGI "Non-Deterministic LLM Prompts 2026" — https://futureagi.com/blog/non-deterministic-llm-prompts-2025
-- DeepEval "Deterministic LLM Eval Metrics" — https://www.confident-ai.com/blog/how-i-built-deterministic-llm-evaluation-metrics-for-deepeval
-- Langfuse LLM-as-a-Judge — https://langfuse.com/docs/evaluation/evaluation-methods/llm-as-a-judge
-- arXiv 2601.23088 "Key Collision Attack on LLM Semantic Caching" — https://arxiv.org/html/2601.23088v1
-- Fowler StranglerFigApplication — https://martinfowler.com/bliki/StranglerFigApplication.html
-- Fowler "Rewriting Strangler Fig" (2024) — https://martinfowler.com/articles/2024-strangler-fig-rewrite.html
-- Fowler "Patterns of Legacy Displacement" — https://martinfowler.com/articles/patterns-legacy-displacement
-- Fowler LegacySeam — https://martinfowler.com/bliki/LegacySeam.html
-- Hashbyt "Strangler Fig vs Big Bang" — https://medium.com/@hashbyt/strangler-fig-vs-big-bang-which-migration-wins-47d95ab9da60
-- Chris Richardson "STOP big bang modernizations" — https://microservices.io/post/architecture/2024/06/27/stop-hurting-yourself-by-doing-big-bang-modernizations.html
-- GEPA paper — https://arxiv.org/abs/2507.19457
-- gepa-ai/gepa reference impl — https://github.com/gepa-ai/gepa
-- LLM Feature Flags in Backends — https://medium.com/@2nick2patel2/llm-feature-flags-in-backends-policy-driven-prompts-and-safe-rollouts-9b8361ca4479
-- GrowthBook "Feature flagging AI models" — https://www.growthbook.io/insights/feature-flagging-ai-models-safely-roll-out-changes
-- FeatBit "AI Feature Flag Code References" — https://www.featbit.co/blogs/ai-feature-flag-code-references
+1. **No controlled ablation of all three persistence modes.** No source compares weight updates, memory writes, and harness edits within one system on one task sequence. SIA compares harness-only / weights-only / combined, but does not include a memory-only arm. (lens-glm §"What's NOT", lens-kimi P2/P5)
+2. **No independent replication of SIA's headline numbers.** LawBench 45% → 70.1%, 14× TriMul speedup, and scRNA gains are vendor-reported; no third-party lab reproduction was found. (lens-kimi P1 caveats, lens-opus §4)
+3. **No cross-project transfer evidence.** Neither SIA nor our stack reports whether improvement on one task/package improves performance on unrelated real-repo delivery tasks. (lens-glm §"What's NOT", lens-opus §5)
+4. **No operational-cost accounting.** Sandbox runs, evaluator calls, fine-tuning retries, trace storage, and human review gates are not priced in SIA's public claims; our stack also lacks a unified cost-of-learning ledger. (lens-glm §"What's NOT", lens-codex impl-8)
+5. **No safety / gaming-resistance case.** The literature lacks a standard "agent self-improvement safety case" comparable to benchmark leaderboards. SIA does not measure evaluator gaming. (lens-kimi P4, lens-glm source-08/source-09, lens-opus §4)
+6. **SIA Chinese-language internals not reviewed.** Design rationale, issues, or discussions in Chinese docs are a coverage gap. (lens-kimi caveats, lens-opus §4)
+7. **ContextNest audit is incomplete.** The available checkout in this environment is `/Volumes/docker-ssd/ps/ML/ContextNest`; the Rust substrate service described in the plan lives at `/Volumes/docker-ssd/ps/ContextNest` and was only partially audited. (lens-opus §4 evidence gap)
+8. **mini-ork research-synthesis verifier is fragile.** The workflow references a root `verifiers/source-completeness.sh` that is missing, and a similar older verifier exits 0 on failure. (lens-codex impl-9)
 
-### lens-kimi (academic — arXiv IDs)
-- 2507.19457 GEPA (Agrawal 2025, ICLR 2026 Oral)
-- 2508.18870 ReflectivePrompt (Zhuravlev 2025)
-- 2606.13685 Coin Flip Judge (Yagubyan 2026)
-- 2604.24074 Safety-Benchmark Judge Sensitivity (Zhang 2026, ICIC 2026)
-- 2601.08654 RULERS (Hong 2026)
-- 2501.10970 Alternative Annotator Test (Calderon 2025, ACL 2025)
-- 2502.01534 Preference Leakage (Li 2025, ICLR 2026)
-- 2604.22411 Background Temperature (Messina & Scotta 2026, TMLR)
-- 2603.28304 Necessity of Setting Temperature in LLM-as-a-Judge (Li 2026)
-- 2601.22025 When "Better" Prompts Hurt (Commey 2026)
-- 2509.12421 Understanding Prompt Management in GitHub Repos (Li 2025, IEEE Software)
-- 2603.15044 Prompt Readiness Levels (Guinard 2026)
-- Citation-chain ancestry: 2005.14165, 2107.13586, 2309.08532, 2201.11903, 2310.03714, 2306.05685, 2303.16634, 2305.17926, 2405.01724, 2501.00274, 2404.04475, 2406.11939
+---
 
-### lens-codex (in-repo file:line + OSS repos)
-- In-repo: `server/config/promptDecorators.ts:233,50,201`; `server/services/promptIntegrationService.ts:534,560`; `shared/types/promptSettings.ts:552,969,18,113,845,2916`; `server/llm/index.ts:39`; `server/llm/middleware/idempotency.ts:40-44`; `server/services/promptEvolution/gepaReflector.ts:239,350`; `gepaCron.ts:367`; `adaptiveAttackDrill.ts:149`; `adaRubricService.ts:134`; `stageB_ZodValidation.ts:81`; `vistaGate.ts:333`; `adversarialDrill.ts:63`; `eslint.config.mjs:333`
-- OSS: github.com/langfuse/langfuse, github.com/promptfoo/promptfoo, github.com/microsoft/promptflow, github.com/BerriAI/litellm, github.com/guidance-ai/guidance, github.com/Helicone/helicone, github.com/eslint/eslint
+## Section 5: Numbered Recommendations
 
-### lens-opus (theory + in-repo)
-- arXiv 2507.19457 (GEPA), 2310.03714 (DSPy), 2306.05685 (Zheng LLM-as-Judge); Sculley 2015 (Hidden Technical Debt / CACE, NeurIPS); Pineau 2021 (Reproducibility checklist); Fowler 2004 (StranglerFig); Feathers 2004 (Working Effectively with Legacy Code)
-- In-repo: `server/config/promptDecorators.ts:233`; `server/services/promptIntegrationService.ts:181,507,535`; `server/services/promptEvolution/gepaReflector.ts:2-25`; `server/services/promptEvolution/semanticPromptCache.ts:43,74,92-93`
+### Steal-from-SIA shortlist
 
-### synthesis-added
-- None beyond the union above. The composite cache-key spec (§4.2) and the branch-by-abstraction seam argument (§3 Dispute 1) are synthesis contributions, not new citations.
+This is the steal-from-SIA shortlist.
+
+1. **Steal SIA's generation-level evaluator contract as a first-class `type: eval` recipe node.** After a mini-ork node produces an artifact, run a task-local `evaluate.py` that writes a structured `results.json`, then stamp the scalar(s) into `reward_value` / `reward_g` so the lane router can learn from it.
+   - Supported by: lens-codex impl-1/4/5, lens-kimi P11, lens-opus §6 rec-1/8.
+   - Anchor: `/Volumes/docker-ssd/ps/sia/sia/orchestrator.py:185`, `/Volumes/docker-ssd/ps/sia/EVALUATION_GUIDE.md:5`, `/Volumes/docker-ssd/ps/mini-ork/internal-docs/research/2026-07-03-adding-eval-to-miniork-run-flow.md`.
+   - **Wrong if:** our dominant tasks cannot define any meaningful held-out evaluator (lens-opus §6 rec-1).
+
+2. **Add a held-out eval gate before recursive self-improvement promotion.** Reuse SIA's evaluator pressure, but require a dev/test split and a co-evolving rubric so the loop cannot overfit a single frozen metric.
+   - Supported by: lens-kimi P4/P11, lens-opus §6 rec-4, lens-codex impl-7.
+   - Anchor: `/Volumes/docker-ssd/ps/mini-ork/docs/RECURSIVE-SELF-IMPROVE.md`, `/Volumes/docker-ssd/ps/TraceOtter/docs/ENGINEER_WORKFLOW.md:77`.
+   - **Wrong if:** the evaluation signal is too noisy to distinguish real improvement from variance (lens-opus §6 rec-4).
+
+3. **Offer SIA-style harness mutation as an optional narrow-task recipe, separate from the general orchestration path.** Use it for benchmark-style tasks with clean evaluators; keep mini-ork's broad multi-lane scheduler as the default for messy product work.
+   - Supported by: lens-codex impl-1/2, lens-opus §6 rec-1/8.
+   - Anchor: `/Volumes/docker-ssd/ps/sia/sia/cli.py:84`, `/Volumes/docker-ssd/ps/sia/sia/orchestrator.py:661`.
+   - **Wrong if:** the project has no crisp benchmark tasks and all work is open-ended repo delivery (lens-opus §6 rec-8).
+
+4. **Route SIA/TraceOtter weight updates to a late-stage reward consumer, not the first learning surface.** Build eval + quality gates first (TraceOtter curation, ContextNest provenance), then use SIA's prompt-embedded RL cookbook only after the harness is stable and reward data is clean.
+   - Supported by: lens-kimi P2/P7/P8, lens-codex impl-3/10/11, lens-opus §6 rec-2/8.
+   - Anchor: `/Volumes/docker-ssd/ps/sia/sia/prompts.py:432`, `/Volumes/docker-ssd/ps/TraceOtter/traceotter/curation.py:65`, `/Volumes/docker-ssd/ps/TraceOtter/docs/roadmap/m9-continual-jit-learning.md`.
+   - **Wrong if:** the target domain has abundant clean reward data and the harness is already stable (lens-opus §6 rec-2).
+
+5. **Co-evolve the evaluator/rubric with the agent to avoid stationary-evaluator caps.** Adopt the Red Queen Gödel Machine critique as a design requirement: every eval metric gets a shadow oracle or periodic adversarial audit.
+   - Supported by: lens-kimi P4, lens-glm source-09/source-10, lens-opus §6 rec-4.
+   - Anchor: `/Volumes/docker-ssd/ps/sia/sia/prompts.py:186` (warning about missing ground truth), `/Volumes/docker-ssd/ps/mini-ork/internal-docs/research/2026-07-05-arxiv-driven-rnd-loop.md`.
+   - **Wrong if:** the evaluation task has a true, immutable ground truth and no gaming surface.
+
+---
+
+## Section 6: Source Manifest
+
+### lens-glm
+
+- [source-01] arxiv:2605.27276 — SIA: Self Improving AI with Harness & Weight Updates (Hebbar et al., 2026) — https://arxiv.org/abs/2605.27276
+- [source-02] arxiv:2505.22954 — Darwin Gödel Machine (Zhang, Hu, Lu, Lange, Clune, 2025) — https://arxiv.org/abs/2505.22954
+- [source-03] arxiv:2606.07412 — Socratic-SWE (Chuan Xiao et al., 2026) — https://arxiv.org/abs/2606.07412
+- [source-04] arxiv:2511.13646 — Live-SWE-agent (Chunqiu Steven Xia et al., 2025) — https://arxiv.org/abs/2511.13646
+- [source-05] arxiv:2512.18552 — Self-Play SWE-RL (Yuxiang Wei et al., 2025) — https://arxiv.org/abs/2512.18552
+- [source-06] arxiv:2508.03680 — Agent Lightning (Xufang Luo et al., 2025) — https://arxiv.org/abs/2508.03680
+- [source-07] arxiv:2506.10943 — Self-Adapting Language Models / SEAL (Adam Zweiger et al., 2025) — https://arxiv.org/abs/2506.10943
+- [source-08] arxiv:2512.24873 — ALE / ROME (Weixun Wang et al., 2025) — https://arxiv.org/abs/2512.24873
+- [source-09] arxiv:2410.10934 — Agent-as-a-Judge (Mingchen Zhuge et al., 2024) — https://arxiv.org/abs/2410.10934
+- [source-10] arxiv:2604.18240 — AJ-Bench (Wentao Shi et al., 2026) — https://arxiv.org/abs/2604.18240
+- [source-11] arxiv:2507.22844 — RLVMR (Zijing Zhang et al., 2025) — https://arxiv.org/abs/2507.22844
+- [source-12] arxiv:2507.03112 — RLVER (Peisong Wang et al., 2025) — https://arxiv.org/abs/2507.03112
+- [source-13] AlphaEvolve PDF — https://storage.googleapis.com/deepmind-media/DeepMind.com/Blog/alphaevolve-a-gemini-powered-coding-agent-for-designing-advanced-algorithms/AlphaEvolve.pdf
+- [source-14] OpenEvolve — https://github.com/codelion/openevolve
+- [source-15] arxiv:2407.01476 — Tree Search for Language Model Agents (Jing Yu Koh et al., 2024) — https://arxiv.org/abs/2407.01476
+- [source-16] arxiv:2310.04406 — LATS (Andy Zhou et al., 2023) — https://arxiv.org/abs/2310.04406
+- [source-17] arxiv:2310.02304 — STOP (Eric Zelikman et al., 2023) — https://arxiv.org/abs/2310.02304
+- [source-18] arxiv:2305.16291 — Voyager (Guanzhi Wang et al., 2023) — https://arxiv.org/abs/2305.16291
+- [source-19] arxiv:2401.10020 — Self-Rewarding Language Models (Weizhe Yuan et al., 2024) — https://arxiv.org/abs/2401.10020
+- [source-20] arxiv:2308.00352 — MetaGPT (Sirui Hong et al., 2023) — https://arxiv.org/abs/2308.00352
+
+### lens-kimi
+
+- [P1] arxiv:2605.27276 — SIA (Hebbar et al., 2026)
+- [P2] arxiv:2601.18510 — Just-In-Time Reinforcement Learning (JitRL)
+- [P3] arxiv:2505.22954 — Darwin Gödel Machine
+- [P4] arxiv:2606.26294 — Red Queen Gödel Machine
+- [P5] arxiv:2508.16153 — Memento
+- [P6] arxiv:2509.21154 — GRPO is Secretly a Process Reward Model (referenced, not re-verified)
+- [P7] arxiv:2401.10020 — Self-Rewarding Language Models
+- [P8] arxiv:2603.08660 — Unsupervised RLVR
+- [P9] arxiv:2606.26669 — SKILL-DISCO (referenced via TraceOtter, not re-verified)
+- [P10] arxiv:2606.06893 — Workflow-to-Skill (referenced via TraceOtter, not re-verified)
+- [P11] arxiv:2411.13768 — Eval-Driven Development for LLM agents (referenced via mini-ork eval doc, not re-verified)
+- [P12] arxiv:2305.16291 — Voyager
+- File anchors: `/Volumes/docker-ssd/ps/sia/sia/orchestrator.py:577`, `/Volumes/docker-ssd/ps/sia/sia/orchestrator.py:822-835`, `/Volumes/docker-ssd/ps/sia/sia/config.py:74-79`, `/Volumes/docker-ssd/ps/sia/EVALUATION_GUIDE.md`, `/Volumes/docker-ssd/ps/sia/sia/orchestrator.py:496-518`, `/Volumes/docker-ssd/ps/sia/sia/config.py:30`, `/Volumes/docker-ssd/ps/sia/sia/orchestrator.py:312-352`, `/Volumes/docker-ssd/ps/TraceOtter/docs/roadmap/m9-continual-jit-learning.md`, `/Volumes/docker-ssd/ps/mini-ork/internal-docs/research/2026-07-03-adding-eval-to-miniork-run-flow.md`
+
+### lens-codex
+
+- Repository: github:hexo-ai/sia (local v0.5.1)
+- Repository: github:SourceShift/mini-ork (commit f3c260be4fa069d3331eddb3ac4e676582a89e63)
+- Repository: github:SourceShift/TraceOtter (commit 0ebb27d5420f8d34bb5617ee5f8b0db2a31ffb63)
+- Repository: github:SourceShift/ContextNest (commit 1f1b2a245d68df3727b9e3f5fa848e9794d2000d)
+- Repository: github:SourceShift/coevolve (commit 47a2aaead5f8956522187b1add8594180cc284fe)
+- File anchors (SIA): `/Volumes/docker-ssd/ps/sia/sia/orchestrator.py:661`, `/Volumes/docker-ssd/ps/sia/sia/orchestrator.py:679`, `/Volumes/docker-ssd/ps/sia/sia/orchestrator.py:692`, `/Volumes/docker-ssd/ps/sia/EVALUATION_GUIDE.md:5`, `/Volumes/docker-ssd/ps/sia/sia/cli.py:84`, `/Volumes/docker-ssd/ps/sia/sia/config.py:68`, `/Volumes/docker-ssd/ps/sia/sia/config.py:74-79`, `/Volumes/docker-ssd/ps/sia/sia/orchestrator.py:821`, `/Volumes/docker-ssd/ps/sia/sia/prompts.py:39`, `/Volumes/docker-ssd/ps/sia/sia/prompts.py:51`, `/Volumes/docker-ssd/ps/sia/sia/prompts.py:186`, `/Volumes/docker-ssd/ps/sia/sia/prompts.py:236`, `/Volumes/docker-ssd/ps/sia/sia/prompts.py:433`
+- File anchors (our stack): `/Volumes/docker-ssd/ps/mini-ork/mini_ork/trace_store.py:28`, `/Volumes/docker-ssd/ps/mini-ork/mini_ork/trace_store.py:67`, `/Volumes/docker-ssd/ps/mini-ork/mini_ork/trace_store.py:195`, `/Volumes/docker-ssd/ps/mini-ork/tests/unit/test_trace_store_py.py:72`, `/Volumes/docker-ssd/ps/mini-ork/mini_ork/lane_router.py:31`, `/Volumes/docker-ssd/ps/mini-ork/mini_ork/lane_router.py:90`, `/Volumes/docker-ssd/ps/mini-ork/lib/decision_service.sh:95`, `/Volumes/docker-ssd/ps/mini-ork/tests/unit/test_lane_router_py.py:60`, `/Volumes/docker-ssd/ps/mini-ork/bin/mini-ork-execute:1783`, `/Volumes/docker-ssd/ps/mini-ork/bin/mini-ork-execute:1801`, `/Volumes/docker-ssd/ps/mini-ork/bin/mini-ork:479`, `/Volumes/docker-ssd/ps/mini-ork/mini_ork/optimize/gepa.py:1`, `/Volumes/docker-ssd/ps/mini-ork/mini_ork/optimize/gepa.py:142`, `/Volumes/docker-ssd/ps/mini-ork/mini_ork/optimize/miniork_adapter.py:1`, `/Volumes/docker-ssd/ps/mini-ork/mini_ork/optimize/miniork_adapter.py:237`, `/Volumes/docker-ssd/ps/mini-ork/mini_ork/scheduler.py:79`, `/Volumes/docker-ssd/ps/mini-ork/mini_ork/scheduler.py:198`, `/Volumes/docker-ssd/ps/mini-ork/mini_ork/scheduler.py:232`, `/Volumes/docker-ssd/ps/mini-ork/recipes/research-synthesis/workflow.yaml:14`, `/Volumes/docker-ssd/ps/mini-ork/recipes/research-synthesis/workflow.yaml:20`, `/Volumes/docker-ssd/ps/mini-ork/recipes/research-synthesis/artifact_contract.yaml:4`, `/Volumes/docker-ssd/ps/mini-ork/recipes/mo-vs-omnigent/verifiers/source-completeness.sh:12`, `/Volumes/docker-ssd/ps/TraceOtter/traceotter/pipeline.py:15`, `/Volumes/docker-ssd/ps/TraceOtter/traceotter/pipeline.py:51`, `/Volumes/docker-ssd/ps/TraceOtter/traceotter/cli.py:91`, `/Volumes/docker-ssd/ps/TraceOtter/traceotter/cli.py:121`, `/Volumes/docker-ssd/ps/TraceOtter/traceotter/targets.py:13`, `/Volumes/docker-ssd/ps/TraceOtter/traceotter/targets.py:23`, `/Volumes/docker-ssd/ps/TraceOtter/traceotter/targets.py:75`, `/Volumes/docker-ssd/ps/TraceOtter/traceotter/targets.py:136`, `/Volumes/docker-ssd/ps/TraceOtter/traceotter/curation.py:65`, `/Volumes/docker-ssd/ps/ContextNest/src/ingest/claude_code/extractor.rs:20`, `/Volumes/docker-ssd/ps/ContextNest/src/ingest/claude_code/extractor.rs:1129`, `/Volumes/docker-ssd/ps/ContextNest/src/ingest/claude_code/extractor.rs:1246`, `/Volumes/docker-ssd/ps/ContextNest/src/ingest/claude_code/extractor.rs:1308`, `/Volumes/docker-ssd/ps/ContextNest/src/ingest/claude_code/extractor.rs:1338`, `/Volumes/docker-ssd/ps/ContextNest/src/api/prompt_context.rs:1`, `/Volumes/docker-ssd/ps/ContextNest/src/api/prompt_context.rs:84`, `/Volumes/docker-ssd/ps/ContextNest/src/api/substrate.rs:68`, `/Volumes/docker-ssd/ps/ContextNest/src/api/substrate.rs:176`, `/Volumes/docker-ssd/ps/ContextNest/src/api/sessions.rs:713`, `/Volumes/docker-ssd/ps/coevolve/internal/core/integration.go:9`, `/Volumes/docker-ssd/ps/coevolve/internal/core/integration.go:133`, `/Volumes/docker-ssd/ps/coevolve/internal/seams/db.go:30`, `/Volumes/docker-ssd/ps/coevolve/internal/seams/contextnest.go:81`, `/Volumes/docker-ssd/ps/coevolve/internal/run/controller.go:82`, `/Volumes/docker-ssd/ps/coevolve/internal/run/controller.go:161`, `/Volumes/docker-ssd/ps/coevolve/internal/run/controller.go:244`, `/Volumes/docker-ssd/ps/coevolve/internal/run/opencode_serve.go:83`, `/Volumes/docker-ssd/ps/coevolve/internal/run/opencode_serve.go:194`
+
+### lens-opus
+
+- arxiv:2605.27276 — SIA
+- `/Volumes/docker-ssd/ps/sia/README.md:12`
+- `/Volumes/docker-ssd/ps/sia/sia/orchestrator.py:185`
+- `/Volumes/docker-ssd/ps/sia/sia/orchestrator.py:635`
+- `/Volumes/docker-ssd/ps/sia/sia/orchestrator.py:821`
+- `/Volumes/docker-ssd/ps/sia/sia/prompts.py:432`
+- `/Volumes/docker-ssd/ps/mini-ork/mini_ork/trace_store.py:1`
+- `/Volumes/docker-ssd/ps/mini-ork/mini_ork/lane_router.py:1`
+- `/Volumes/docker-ssd/ps/mini-ork/docs/RECURSIVE-SELF-IMPROVE.md:3`
+- `/Volumes/docker-ssd/ps/TraceOtter/docs/ENGINEER_WORKFLOW.md:3`
+- `/Volumes/docker-ssd/ps/TraceOtter/docs/ENGINEER_WORKFLOW.md:77`
+- `/Volumes/docker-ssd/ps/coevolve/README.md:18`
+- `/Volumes/docker-ssd/ps/coevolve/README.md:55`
+- `/Volumes/docker-ssd/ps/ML/ContextNest/memory/sessions/README.md:3`
+- `/Volumes/docker-ssd/ps/ML/ContextNest/memory/agents/README.md:3`
+
+### This synthesis additionally cites
+
+- `/Volumes/docker-ssd/ps/mini-ork/internal-docs/research/2026-07-03-adding-eval-to-miniork-run-flow.md`
+- `/Volumes/docker-ssd/ps/mini-ork/internal-docs/research/2026-07-05-arxiv-driven-rnd-loop.md`
+- `/Volumes/docker-ssd/ps/TraceOtter/docs/roadmap/m9-continual-jit-learning.md`
