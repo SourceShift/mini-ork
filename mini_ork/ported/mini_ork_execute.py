@@ -700,6 +700,10 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
         if f[1] == "rollback" and fail_count == 0:
             print("  [skip] rollback — no failures (escalates_to edge not triggered)")
             continue
+        # D1: bash keeps FAIL_COUNT as a shell var visible to _mo_policy_route_lane's
+        # trace_governed branch (:2014). Export it so the port's policy_route_lane sees
+        # the live prefix-failure count (else trace_governed never escalates).
+        os.environ["FAIL_COUNT"] = str(fail_count)
         rc, _fr = dispatch_node(f, root=root, run_dir=live_run_dir, plan_path=plan_path,
                                 task_class=task_class, db=db, run_id=run_id,
                                 dispatch_fn=llm, recipe=recipe, workflow=workflow)
@@ -1216,29 +1220,59 @@ def publisher_node(root, run_dir, db, run_id, recipe, task_class, review_file=""
     if not src_is_dir and not os.path.isfile(src):
         print(f"  [warn] publisher: expected source artifact missing: {src}", file=sys.stderr)
         return 1, "error"
+    # B1: track copy/commit failures like bash (:3111-3184). A failed copy, or a
+    # copy-OK-but-commit-failed with a dirty tree, is a real failure — return 1 and
+    # do NOT mark 'published'. A commit that fails with nothing-to-commit (dst already
+    # matches) is an OK no-op. Was: swallowed failures + unconditional 'published'.
+    published_count = 0
+    failed_count = 0
     for out in outputs:
         out = os.path.expandvars(out)
         dst = os.path.join(root, out)
+        copied = False
         try:
             if src_is_dir:
                 dst_norm = dst.rstrip("/")
                 os.makedirs(dst_norm, exist_ok=True)
-                subprocess.run(["cp", "-R", src + "/.", dst_norm + "/"], check=False)
+                copied = subprocess.run(["cp", "-R", src + "/.", dst_norm + "/"],
+                                        capture_output=True).returncode == 0
             else:
                 os.makedirs(os.path.dirname(dst), exist_ok=True)
                 shutil.copy(src, dst)
-            subprocess.run(["git", "add", out], cwd=root, check=False,
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            subprocess.run(
-                ["git", "-c", "user.email=mini-ork@local", "-c", "user.name=mini-ork",
-                 "commit", "-q", "-m",
-                 f"audit({recipe or 'unknown'}): publish synthesis from {run_id}\n\n"
-                 f"Run: {run_id}\nRecipe: {recipe or 'unknown'}\nOutput: {out}\n"
-                 "Dispatched by mini-ork-execute publisher node (D-037 v0.2-pt9)."],
-                cwd=root, capture_output=True)
-            print(f"  [ok] publisher: published {out} (committed)")
+                copied = True
         except Exception as e:
-            print(f"  [warn] publisher: failed {out}: {e}", file=sys.stderr)
+            print(f"  [fail] publisher: cp failed for {out}: {e}", file=sys.stderr)
+        if not copied:
+            print(f"  [fail] publisher: cp failed for {out}", file=sys.stderr)
+            failed_count += 1
+            continue
+        subprocess.run(["git", "add", out], cwd=root, check=False,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        commit = subprocess.run(
+            ["git", "-c", "user.email=mini-ork@local", "-c", "user.name=mini-ork",
+             "commit", "-q", "-m",
+             f"audit({recipe or 'unknown'}): publish synthesis from {run_id}\n\n"
+             f"Run: {run_id}\nRecipe: {recipe or 'unknown'}\nOutput: {out}\n"
+             "Dispatched by mini-ork-execute publisher node (D-037 v0.2-pt9)."],
+            cwd=root, capture_output=True)
+        if commit.returncode == 0:
+            print(f"  [ok] publisher: published {out} (committed)")
+            published_count += 1
+        else:
+            # nothing-to-commit (dst unchanged) is an OK no-op, not a failure.
+            status = subprocess.run(["git", "status", "--porcelain", out], cwd=root,
+                                    capture_output=True, text=True)
+            if not status.stdout.strip():
+                print(f"  [ok] publisher: {out} unchanged from prior cycle (no-op commit)")
+                published_count += 1
+            else:
+                print(f"  [warn] publisher: copy OK but commit failed for {out}", file=sys.stderr)
+                failed_count += 1
+    if failed_count > 0:
+        print(f"  [fail] publisher: {failed_count} of {published_count + failed_count} outputs failed",
+              file=sys.stderr)
+        return 1, "error"
+    print(f"  [ok] publisher: {published_count} artifact(s) published")
     set_status(db, run_id, "published")
     return 0, "done"
 
@@ -1457,8 +1491,25 @@ def dispatch_node(fields, *, root, run_dir, plan_path, task_class, db, run_id,
                               verdict_env=os.environ.get("VERDICT", ""))
 
     if node_type == "rollback":
-        set_status(db, run_id, "rolled_back")
-        return 1, "rolled_back"
+        # F4: bash (:3205-3223) does a best-effort version_rollback (workflow then
+        # agent), succeeds regardless of whether a prior version exists, sets
+        # finish_reason=done and returns 0 — it does NOT set task_runs.status. Was:
+        # set_status('rolled_back') + return 1 (a no-op that also mis-set status and
+        # double-counted the failure). The upstream failure already failed the run.
+        from mini_ork.ported import version_registry as _vr  # noqa: PLC0415
+        reverted = False
+        for kind, name in (("workflow", recipe or "default"), ("agent", "default")):
+            try:
+                _vr.rollback(kind, name, db=db)
+                reverted = True
+                break
+            except Exception:
+                continue
+        if not reverted:
+            print("  [ok] rollback: nothing to revert (no prior promoted version)", file=sys.stderr)
+        print("  [ok] rollback complete")
+        trace(node_id, "success", "rollback", "", "", "done")
+        return 0, "done"
 
     return 0, "done"
 

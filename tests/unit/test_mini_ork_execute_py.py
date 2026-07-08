@@ -415,8 +415,12 @@ def test_live_publisher_and_rollback_status(tmp_path, monkeypatch):
     # 'published' (panel finding 2); the faithful port leaves status unchanged.
     rc, _ = ex.dispatch_node(_fields("pub", "publisher"), **common)
     assert rc == 0 and _sql(db, "SELECT status FROM task_runs WHERE id='r1';").stdout.strip() != "published"
+    # F4: rollback is best-effort (bash :3205-3223) — returns 0/done regardless of
+    # whether a prior version exists, and does NOT set task_runs.status. The upstream
+    # failure already fails the run. Was wrongly (1,'rolled_back') + status mutation.
     rc_rb, fr_rb = ex.dispatch_node(_fields("rb", "rollback"), **common)
-    assert rc_rb == 1 and fr_rb == "rolled_back"
+    assert rc_rb == 0 and fr_rb == "done"
+    assert _sql(db, "SELECT status FROM task_runs WHERE id='r1';").stdout.strip() != "rolled_back"
 
 
 def test_verifier_no_artifact_does_not_fail_run(tmp_path):
