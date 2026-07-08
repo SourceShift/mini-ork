@@ -326,6 +326,121 @@ def test_apply_impl_output_skips_dirty_tree(tmp_path):
     assert (rp / "app.py").read_text() == "x = 999\n"   # untouched
 
 
+# ── live per-node routing (increment 5) ──
+# The LLM is an injectable seam, so these are FUNCTIONAL tests (fake dispatch →
+# correct wiring of the ported helpers), not bash-parity (LLM output can't be
+# parity-tested). They verify dispatch_node writes the right files, applies
+# output, gates on the verdict, runs verifiers, and sets status/cost.
+
+def _fake(response, rc=0):
+    def d(_task_class, _node_type, _prompt):
+        return rc, response
+    return d
+
+
+def _fields(node_id, node_type, lane="", vref=""):
+    return (node_id, node_type, f"do {node_id}", "", "serial", vref, lane or node_type, "")
+
+
+def _plan(tmp, outputs=("out.md",)):
+    p = tmp / "plan.json"
+    p.write_text(json.dumps({"objective": "o", "artifact_contract": {"outputs": list(outputs)}}))
+    return str(p)
+
+
+def test_live_researcher_writes_context(tmp_path):
+    db = _seed_db(tmp_path, "r"); _seed_task_run(db)
+    rd = tmp_path / "run"; rd.mkdir()
+    rc, fr = ex.dispatch_node(_fields("res1_lens", "researcher", "kimi_lens"),
+                              root=str(REPO), run_dir=str(rd), plan_path=_plan(tmp_path),
+                              task_class="code_fix", db=db, run_id="r1",
+                              dispatch_fn=_fake("finding: X is slow"))
+    assert rc == 0 and fr == "done"
+    assert (rd / "lens-res1.md").read_text() == "finding: X is slow"
+    # cost charged
+    assert float(_sql(db, "SELECT cost_usd FROM task_runs WHERE id='r1';").stdout) > 0
+
+
+def test_live_implementer_applies_diff(tmp_path, monkeypatch):
+    db = _seed_db(tmp_path, "i"); _seed_task_run(db)
+    rd = tmp_path / "run"; rd.mkdir()
+    repo = _git_repo(tmp_path / "repo")
+    monkeypatch.setenv("MO_TARGET_CWD", str(repo))
+    rc, fr = ex.dispatch_node(_fields("impl1", "implementer", "codex"),
+                              root=str(REPO), run_dir=str(rd), plan_path=_plan(tmp_path),
+                              task_class="code_fix", db=db, run_id="r1",
+                              dispatch_fn=_fake(_DIFF_LOG))
+    assert rc == 0 and fr == "done"
+    assert (rd / "impl-impl1.log").read_text() == _DIFF_LOG
+    assert (repo / "app.py").read_text() == "x = 1\ny = 2\n"   # diff applied to clean tree
+
+
+def test_live_reviewer_verdict_gate(tmp_path):
+    db = _seed_db(tmp_path, "rev"); _seed_task_run(db)
+    rd = tmp_path / "run"; rd.mkdir()
+    common = dict(root=str(REPO), run_dir=str(rd), plan_path=_plan(tmp_path),
+                  task_class="code_fix", db=db, run_id="r1")
+    rc_pass, _ = ex.dispatch_node(_fields("rev1", "reviewer", "opus"),
+                                  dispatch_fn=_fake('{"verdict": "pass"}'), **common)
+    assert rc_pass == 0
+    rc_fail, fr_fail = ex.dispatch_node(_fields("rev2", "reviewer", "opus"),
+                                        dispatch_fn=_fake('{"verdict": "fail"}'), **common)
+    assert rc_fail == 1 and fr_fail == "verdict_fail"
+    rc_rev, fr_rev = ex.dispatch_node(_fields("rev3", "reviewer", "opus"),
+                                      dispatch_fn=_fake('{"verdict": "needs_revision"}'), **common)
+    assert rc_rev == 1 and fr_rev == "verdict_revise"
+    # a synth reviewer never gates → always success
+    rc_synth, _ = ex.dispatch_node(_fields("synth_node", "reviewer", "opus"),
+                                   dispatch_fn=_fake("# Synthesis\ntop findings..."), **common)
+    assert rc_synth == 0
+
+
+def test_run_verifier_ref(tmp_path):
+    ok = tmp_path / "ok.sh"; ok.write_text('#!/usr/bin/env bash\necho \'{"pass": true}\'\n')
+    bad = tmp_path / "bad.sh"; bad.write_text('#!/usr/bin/env bash\necho \'{"pass": false}\'\n')
+    empty = tmp_path / "empty.sh"; empty.write_text('#!/usr/bin/env bash\nexit 0\n')
+    assert ex._run_verifier_ref(str(ok), str(tmp_path / "e1"), cwd=str(tmp_path)) == 0
+    assert ex._run_verifier_ref(str(bad), str(tmp_path / "e2"), cwd=str(tmp_path)) == 1
+    assert ex._run_verifier_ref(str(empty), str(tmp_path / "e3"), cwd=str(tmp_path)) == 1  # vacuous
+
+
+def test_live_publisher_and_rollback_status(tmp_path):
+    db = _seed_db(tmp_path, "pub"); _seed_task_run(db)
+    rd = tmp_path / "run"; rd.mkdir()
+    common = dict(root=str(REPO), run_dir=str(rd), plan_path=_plan(tmp_path),
+                  task_class="code_fix", db=db, run_id="r1", dispatch_fn=_fake(""))
+    rc, _ = ex.dispatch_node(_fields("pub", "publisher"), **common)
+    assert rc == 0 and _sql(db, "SELECT status FROM task_runs WHERE id='r1';").stdout.strip() == "published"
+    rc_rb, fr_rb = ex.dispatch_node(_fields("rb", "rollback"), **common)
+    assert rc_rb == 1 and fr_rb == "rolled_back"
+
+
+def test_main_live_run_wired(tmp_path, monkeypatch):
+    # a small workflow-sourced run driven by a fake LLM end-to-end through main()
+    wf = tmp_path / "wf.yaml"
+    wf.write_text("dispatch_mode: serial\nnodes:\n"
+                  "  - {name: res1, type: researcher, description: research}\n"
+                  "  - {name: rev1, type: reviewer, description: review}\n")
+    home = tmp_path / ".mini-ork"; home.mkdir()
+    db = str(home / "state.db")
+    subprocess.run(["bash", str(REPO / "db" / "init.sh")],
+                   env={**os.environ, "MINI_ORK_HOME": str(home), "MINI_ORK_DB": db},
+                   capture_output=True, text=True, check=True)
+    rd = home / "runs" / "run-x"; rd.mkdir(parents=True)
+    plan = rd / "plan.json"; plan.write_text(json.dumps({"objective": "o", "decomposition": []}))
+    _seed_task_run(db, rid="run-x")
+    for k, v in {"MINI_ORK_ROOT": str(REPO), "MINI_ORK_WORKFLOW": str(wf), "MINI_ORK_HOME": str(home),
+                 "MINI_ORK_DB": db, "MINI_ORK_PLAN_PATH": str(plan), "MINI_ORK_RUN_DIR": str(rd),
+                 "MINI_ORK_RUN_ID": "run-x", "MINI_ORK_TASK_CLASS": "code_fix"}.items():
+        monkeypatch.setenv(k, v)
+    rc = ex.main([], root=str(REPO), dispatch_fn=_fake('{"verdict": "pass"}'))  # plan via env
+    assert rc == 0
+    assert (rd / "context-res1.json").exists()          # researcher wrote its output
+    assert (rd / "review-rev1.json").exists()            # reviewer wrote its output
+    assert (rd / "verdict.json").exists()                # run-level verdict emitted
+    assert _sql(db, "SELECT status FROM task_runs WHERE id='run-x';").stdout.strip() in ("executing", "reviewing", "published")
+
+
 # ── orchestration backbone parity (NODE_IDS + --dry-run) ──
 
 def _py_blocks():
