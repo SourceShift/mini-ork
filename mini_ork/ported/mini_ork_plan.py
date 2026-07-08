@@ -50,6 +50,16 @@ _USAGE = """Usage: mini-ork plan <kickoff.md> [--task-class <name>] [--out <plan
 Generate a structured plan JSON from a kickoff file.
 
 The plan MUST include a verifier_contract (checks[]) — planning fails if missing.
+
+Outputs:
+  <out-file>   JSON plan written to .mini-ork/runs/<run>/plan.json (or --out path)
+  stdout       plan path on success
+
+Options:
+  --task-class <name>   Override task_class (default: $MINI_ORK_TASK_CLASS)
+  --out <path>          Write plan to this path instead of default
+  --dry-run             Print plan JSON to stdout; do not write files or DB
+  --help                Show this help
 """
 
 _BUILTIN_PROMPT = """You are a meticulous task planner. Given the kickoff document below, produce a
