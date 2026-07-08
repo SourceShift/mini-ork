@@ -1755,7 +1755,10 @@ def dispatch_node(fields, *, root, run_dir, plan_path, task_class, db, run_id,
         if not reverted:
             print("  [ok] rollback: nothing to revert (no prior promoted version)", file=sys.stderr)
         print("  [ok] rollback complete")
-        trace(node_id, "success", "rollback", "", "", "done")
+        # NOTE: bash traces NO rollback node (:3205-3223 has no _trace_write_node_rich).
+        # Tracing it with status=success would write a spurious +1-reward execution_traces
+        # row — semantically inverted (rollback fires because the run FAILED) — that
+        # poisons GRPO/reflect. Deliberately no trace() here to stay faithful.
         return 0, "done"
 
     return 0, "done"
