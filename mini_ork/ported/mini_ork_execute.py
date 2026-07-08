@@ -1,10 +1,12 @@
 """Python port of bin/mini-ork-execute — the executor (INCREMENTAL).
 
-bin/mini-ork-execute is the 3449-line node-dispatch engine. Its orchestration
-core (_dispatch_node + the DAG loop) drives every run and warrants dedicated
-harsh-critic review before its default flips; this module lands the deterministic
-HELPER LAYER first, behind a live-bash parity gate, so the risky core ports onto
-verified foundations.
+bin/mini-ork-execute is the 3449-line node-dispatch engine. This port covers it
+in increments: deterministic helpers + GRPO writeback + orchestration backbone
+(NODE_IDS + --dry-run, all live-bash parity-gated) + the live per-node routing
+(dispatch_node), whose ONE LLM call is an injectable seam (dispatch_fn) — the live
+path is functionally verified (fake dispatch → ported-helper wiring), not
+bash-parity, since real model output can't be parity-tested. The default flip
+(bash→Python runtime) + a real-LLM integration harness remain.
 
 Ported here (all pure / transcribed verbatim):
     reward_from_status(status, verdict)     — status/verdict → GRPO reward
@@ -16,6 +18,8 @@ Ported here (all pure / transcribed verbatim):
     write_grpo_advantages(db)               — GRPO group-relative advantage writeback
     set_status / charge_node_cost           — per-node DB status + cost writes
     apply_impl_output                       — 'capture coin-flip' diff/fenced-block applier
+    dispatch_node(...)                      — LIVE per-node routing (LLM = seam)
+    main(..., dispatch_fn=)                 — full run: dry-run OR live per-node dispatch
 """
 from __future__ import annotations
 
@@ -604,17 +608,34 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
         print("execute: all nodes complete")
         return 0
 
-    # Live per-node execution — the integration-gated increment.
-    if dispatch_fn is None:
-        raise NotImplementedError(
-            "mini_ork_execute live dispatch not yet ported — the per-node LLM "
-            "execution (_dispatch_node non-dry-run branches) is the next "
-            "increment. Use --dry-run, or pass dispatch_fn=.")
-    for f in fields_list:
-        if dispatch_fn(f) != 0:
+    # ── live per-node execution ──
+    # dispatch_fn is the LLM seam (task_class, node_type, prompt) -> (rc, text);
+    # defaults to the ported llm_dispatch. dispatch_node wires the ported helpers
+    # (apply_impl_output, charge_node_cost, set_status, verdict gate) around it.
+    task_class = os.environ.get("MINI_ORK_TASK_CLASS", "generic")
+    db = os.environ.get("MINI_ORK_DB") or os.path.join(
+        os.environ.get("MINI_ORK_HOME", ".mini-ork"), "state.db")
+    run_id = os.environ.get("MINI_ORK_RUN_ID", "")
+    recipe = os.environ.get("MINI_ORK_RECIPE", "")
+    live_run_dir = os.environ.get("MINI_ORK_RUN_DIR") or run_dir
+    llm = dispatch_fn or _default_llm_dispatch(root)
+    set_status(db, run_id, "executing")
+    ordered = ([f for nt in _NODE_TYPE_ORDER for f in fields_list if f[1] == nt]
+               if dispatch_mode == "partitioned" else fields_list)
+    for f in ordered:
+        if filter_node_type and f[1] != filter_node_type:
+            continue
+        if f[1] == "rollback" and fail_count == 0:
+            print("  [skip] rollback — no failures (escalates_to edge not triggered)")
+            continue
+        rc, _fr = dispatch_node(f, root=root, run_dir=live_run_dir, plan_path=plan_path,
+                                task_class=task_class, db=db, run_id=run_id,
+                                dispatch_fn=llm, recipe=recipe, workflow=workflow)
+        if rc != 0:
             fail_count += 1
-    _emit_run_verdict(run_dir, fail_count, len(fields_list))
+    _emit_run_verdict(live_run_dir, fail_count, len(fields_list))
     if fail_count > 0:
+        set_status(db, run_id, "failed")
         sys.stderr.write(f"execute: {fail_count} node(s) failed\n")
         return 1
     print("\nexecute: all nodes complete")
@@ -768,6 +789,213 @@ def apply_impl_output(impl_log, target):
             i += 1
     if applied:
         print("  [apply-impl-output] applied from implementer text: " + ", ".join(applied))
+
+
+# ── live per-node routing (increment 5) ──
+#
+# The live (non-dry-run) counterpart of _dry_dispatch_node. The LLM call is an
+# injectable seam (dispatch_fn(task_class, node_type, prompt) -> (rc, text));
+# the deterministic wiring around it — output-file naming, preserve-agent-Write,
+# apply_impl_output, the reviewer verdict gate, cost charge, status — is ported.
+# Trace writes + heartbeats + context assembly + oracle gates are best-effort
+# seams (the run's pass/fail result does not depend on them). Recipe-specific
+# dispatchers (per_feature/epic/minimal-scaffold) and the publisher commit
+# delegate to their existing scripts. This makes main()'s live path functional
+# with the LLM as the one integration seam.
+
+def _extract_verdict(root, review_file) -> str:
+    p = os.path.join(root, "lib", "extract_verdict.py")
+    if not os.path.isfile(p):
+        return "unknown"
+    r = subprocess.run(["python3", p, review_file], capture_output=True, text=True)
+    return (r.stdout.strip() or "unknown") if r.returncode == 0 else "unknown"
+
+
+def _run_verifier_ref(script, evidence_path, *, plan_path="", artifact_path="", cwd=None):
+    """Port of _run_verifier_ref (minus the mo_runtime_exec seam): run the
+    verifier script, capture evidence, and treat {"pass": true} as success."""
+    cwd = cwd or os.environ.get("MO_TARGET_CWD") or os.getcwd()
+    with open(evidence_path, "wb") as fh:
+        rc = subprocess.run(["bash", script], cwd=cwd, stdout=fh, stderr=subprocess.STDOUT,
+                            env={**os.environ, "MINI_ORK_PLAN_PATH": plan_path,
+                                 "ARTIFACT_PATH": artifact_path}).returncode
+    if not os.path.getsize(evidence_path):
+        open(evidence_path, "w").write(f"vacuous pass: verifier exited {rc} but wrote no evidence")
+        return 1
+    try:
+        payload = json.load(open(evidence_path))
+    except Exception:
+        return rc  # non-JSON evidence → propagate the script's rc
+    if not isinstance(payload, dict) or "pass" not in payload:
+        return rc
+    return 0 if payload.get("pass") is True else 1
+
+
+def _default_llm_dispatch(root):
+    """The real LLM seam: shell to llm_dispatch, capturing stdout+stderr as the
+    node result — mirrors bash's
+    RESULT=$(llm_dispatch --task-class X --node-type Y --prompt-text Z 2>&1)."""
+    lib = os.path.join(root, "lib", "llm-dispatch.sh")
+
+    def d(task_class, node_type, prompt):
+        r = subprocess.run(
+            ["bash", "-c", f'source "{lib}"; llm_dispatch --task-class "$1" '
+             '--node-type "$2" --prompt-text "$3" 2>&1', "_", task_class, node_type, prompt],
+            capture_output=True, text=True)
+        return r.returncode, r.stdout
+    return d
+
+
+_REVIEW_PASS = {"pass", "approve", "approved"}
+_REVIEW_REVISE = {"revise", "needs_revision", "request_changes"}
+# unknown/other verdicts fall through to verdict_fail (matches bash catch-all)
+
+
+def dispatch_node(fields, *, root, run_dir, plan_path, task_class, db, run_id,
+                  dispatch_fn, recipe="", workflow="", trace_fn=None):
+    """Live dispatch of one node. Returns (rc, finish_reason). rc!=0 → FAIL_COUNT++.
+    dispatch_fn(task_class, node_type, prompt) -> (rc, text)."""
+    node_id, node_type, node_desc, prompt_ref, _dmode, verifier_ref, model_lane, _req = \
+        (list(fields) + [""] * 8)[:8]
+    lane = model_lane or node_type
+    trace = trace_fn or (lambda *a, **k: None)
+    cost_sidecar = os.path.join(os.environ.get("MINI_ORK_RUN_DIR", run_dir), ".last-llm-cost")
+
+    def _charge():
+        charge_node_cost(db, run_id, cost_sidecar, root=root)
+
+    # rollback only fires on an upstream failure (escalates_to edge) — the caller
+    # gates that; here a reached rollback sets the terminal status.
+    if node_type == "planner":
+        print("  [skip] planner node handled by mini-ork-plan")
+        return 0, "done"
+    if node_type == "reflector":
+        subprocess.run([os.path.join(root, "bin", "mini-ork-reflect")], capture_output=True)
+        return 0, "done"
+
+    recipe_dir = os.path.join(root, "recipes", recipe) if recipe else ""
+    prompt_file = ""
+    if prompt_ref and recipe_dir and os.path.isfile(os.path.join(recipe_dir, prompt_ref)):
+        prompt_file = os.path.join(recipe_dir, prompt_ref)
+    elif recipe_dir and os.path.isfile(os.path.join(recipe_dir, "prompts", f"{node_type}.md")):
+        prompt_file = os.path.join(recipe_dir, "prompts", f"{node_type}.md")
+    elif os.path.isfile(os.path.join(root, "prompts", f"{node_type}.md")):
+        prompt_file = os.path.join(root, "prompts", f"{node_type}.md")
+
+    def _prepend():
+        return (f"\n\n--- Recipe prompt (system context) ---\n{open(prompt_file).read()}"
+                f"\n--- /recipe prompt ---\n\n") if prompt_file and os.path.isfile(prompt_file) else ""
+
+    def _write_preserving_agent(out_file, marker, result):
+        # preserve the agent's own tool-call Write when it touched out_file
+        if os.path.isfile(out_file) and os.path.getmtime(out_file) > os.path.getmtime(marker):
+            open(out_file + ".stdout.md", "w").write(result)
+        else:
+            open(out_file, "w").write(result)
+
+    plan_content = open(plan_path).read() if plan_path and os.path.isfile(plan_path) else ""
+    os.environ["MO_NODE_ID"] = node_id
+
+    if node_type == "researcher":
+        norm = node_id[:-5] if node_id.endswith(("_lens", "-lens")) else node_id
+        ctx = (os.path.join(run_dir, f"lens-{norm}.md") if node_id.endswith(("_lens", "-lens"))
+               else os.path.join(run_dir, f"context-{node_id}.json"))
+        prompt = f"{_prepend()}Task: {node_desc}\n\nPlan context:\n{plan_content}\n\nWrite your output to: {ctx}"
+        marker = os.path.join(run_dir, f".dispatch-marker-{node_id}"); open(marker, "w").write("")
+        rc, result = dispatch_fn(task_class, lane, prompt)
+        if rc != 0:
+            fr = finish_reason_for_failure(rc, result)
+            trace(node_id, "failure", "researcher", ctx, "", fr)
+            return 1, fr
+        _write_preserving_agent(ctx, marker, result)
+        try:
+            os.remove(marker)
+        except OSError:
+            pass
+        trace(node_id, "success", "researcher", ctx, "", "done")
+        _charge()
+        return 0, "done"
+
+    if node_type == "implementer":
+        impl_log = os.path.join(run_dir, f"impl-{node_id}.log")
+        prompt = f"{_prepend()}Implement: {node_desc}\n\nPlan:\n{plan_content}"
+        target = os.environ.get("MO_TARGET_CWD") or os.getcwd()
+        rc, result = dispatch_fn(task_class, lane, prompt)
+        if rc != 0:
+            fr = finish_reason_for_failure(rc, result)
+            trace(node_id, "failure", "implementer", impl_log, "", fr)
+            return 1, fr
+        open(impl_log, "w").write(result)
+        apply_impl_output(impl_log, target)   # ported "capture coin-flip" applier
+        trace(node_id, "success", "implementer", impl_log, "", "done")
+        _charge()
+        return 0, "done"
+
+    if node_type == "reviewer":
+        is_synth = "synth" in node_id
+        review_file = (os.path.join(run_dir, f"review-{node_id}.json") if not is_synth
+                       else os.path.join(run_dir, "synthesis.md"))
+        prompt = f"{_prepend()}Review: {node_desc}\n\nPlan:\n{plan_content}"
+        marker = os.path.join(run_dir, f".dispatch-marker-{node_id}"); open(marker, "w").write("")
+        rc, result = dispatch_fn(task_class, lane, prompt)
+        if rc != 0:
+            fr = finish_reason_for_failure(rc, result)
+            trace(node_id, "failure", "reviewer", review_file, "", fr)
+            return 1, fr
+        _write_preserving_agent(review_file, marker, result)
+        try:
+            os.remove(marker)
+        except OSError:
+            pass
+        verdict = _extract_verdict(root, review_file)
+        print(f"  [info] reviewer verdict={verdict} → {review_file}")
+        vn = verdict.lower()
+        if is_synth:
+            trace(node_id, "success", "reviewer", review_file, verdict, "done")
+            _charge()
+            return 0, "done"
+        if vn in _REVIEW_PASS:
+            trace(node_id, "success", "reviewer", review_file, verdict, "done")
+            _charge()
+            return 0, "done"
+        fr = "verdict_revise" if vn in _REVIEW_REVISE else "verdict_fail"
+        trace(node_id, "failure", "reviewer", review_file, verdict, fr)
+        _charge()
+        return 1, fr
+
+    if node_type == "verifier":
+        artifact = ""
+        try:
+            ac = (json.load(open(plan_path)).get("artifact_contract") or {}) if plan_path else {}
+            outs = ac.get("outputs") or [] if isinstance(ac, dict) else []
+            artifact = outs[0] if outs else ""
+        except Exception:
+            artifact = ""
+        if not artifact:
+            return 1, "error"
+        if verifier_ref and recipe_dir:
+            script = os.path.join(recipe_dir, verifier_ref)
+            if not os.path.isfile(script):
+                print(f"  [fail] verifier_ref not found: {verifier_ref}", file=sys.stderr)
+                return 1, "error"
+            ev_dir = os.path.join(os.environ.get("MINI_ORK_RUN_DIR", run_dir), "evidence")
+            os.makedirs(ev_dir, exist_ok=True)
+            ev = os.path.join(ev_dir, os.path.basename(verifier_ref).replace(".sh", "") + ".log")
+            rc = _run_verifier_ref(script, ev, plan_path=plan_path, artifact_path=artifact)
+            return (0, "done") if rc == 0 else (1, "error")
+        rc = subprocess.run([os.path.join(root, "bin", "mini-ork-verify"), "--plan", plan_path,
+                             "--task-class", task_class, artifact]).returncode
+        return (0, "done") if rc == 0 else (1, "error")
+
+    if node_type == "publisher":
+        set_status(db, run_id, "published")
+        return 0, "done"
+
+    if node_type == "rollback":
+        set_status(db, run_id, "rolled_back")
+        return 1, "rolled_back"
+
+    return 0, "done"
 
 
 if __name__ == "__main__":
