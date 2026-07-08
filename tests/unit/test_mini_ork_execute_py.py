@@ -423,6 +423,15 @@ def test_live_publisher_and_rollback_status(tmp_path, monkeypatch):
     assert _sql(db, "SELECT status FROM task_runs WHERE id='r1';").stdout.strip() != "rolled_back"
 
 
+def test_envsubst_blanks_unset_vars(monkeypatch):
+    # B2-C: envsubst-equivalent blanks unset vars (not literal like os.path.expandvars),
+    # else the publisher commits garbage ${VAR}-in-path files.
+    monkeypatch.setenv("MINI_ORK_DERIVED_RECIPE_NAME", "my-recipe")
+    monkeypatch.delenv("NOPE", raising=False)
+    assert ex._envsubst("docs/${MINI_ORK_DERIVED_RECIPE_NAME}/out.md") == "docs/my-recipe/out.md"
+    assert ex._envsubst("a/${NOPE}/b") == "a//b"  # blanked, not left literal
+
+
 def test_classic_reviewer_prompt_has_inputs_and_json_envelope(tmp_path):
     # F2-B: the classic reviewer prompt must carry the assembled inputs block AND the
     # JSON verdict envelope — without the envelope the LLM emits prose → unknown verdict

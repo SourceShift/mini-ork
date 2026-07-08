@@ -1165,6 +1165,14 @@ def _intervention_gate_check(root, node_id, node_type, lane, node_desc):
         return True
 
 
+def _envsubst(s):
+    """B2-C: envsubst-equivalent — expand $VAR / ${VAR} from the environment, BLANKING
+    unset vars (os.path.expandvars leaves them literal, which commits garbage
+    ${VAR}-in-path files, the OSS-leak-garbage class the bash guard prevents)."""
+    return re.sub(r'\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)',
+                  lambda m: os.environ.get(m.group(1) or m.group(2), ''), s)
+
+
 def _make_trace_fn(task_class, db, run_id):
     """F3: build the trace_fn that reproduces bash `_trace_write_node_rich` (:1786) —
     without it the live path writes ZERO execution_traces rows and the whole GRPO /
@@ -1391,8 +1399,17 @@ def publisher_node(root, run_dir, db, run_id, recipe, task_class, review_file=""
                                     run_id or "local")
         set_status(db, run_id, "published")
         return 0, "done"
-    # ── copy source_artifact → outputs[] + git-commit each (envsubst via expandvars)
-    src = os.path.join(run_dir, os.path.expandvars(src_name))
+    # ── copy source_artifact → outputs[] + git-commit each.
+    # B2-C: recipe-creator meta-recipe references ${MINI_ORK_DERIVED_RECIPE_NAME}; read
+    # it from chosen/recipe_name and export BEFORE resolving templates (bash :3075-3079).
+    if not os.environ.get("MINI_ORK_DERIVED_RECIPE_NAME"):
+        chosen = os.path.join(run_dir, "chosen", "recipe_name")
+        if os.path.isfile(chosen):
+            try:
+                os.environ["MINI_ORK_DERIVED_RECIPE_NAME"] = "".join(open(chosen).read().split())
+            except OSError:
+                pass
+    src = os.path.join(run_dir, _envsubst(src_name))
     src_is_dir = os.path.isdir(src)
     if not src_is_dir and not os.path.isfile(src):
         print(f"  [warn] publisher: expected source artifact missing: {src}", file=sys.stderr)
@@ -1404,7 +1421,7 @@ def publisher_node(root, run_dir, db, run_id, recipe, task_class, review_file=""
     published_count = 0
     failed_count = 0
     for out in outputs:
-        out = os.path.expandvars(out)
+        out = _envsubst(out)
         dst = os.path.join(root, out)
         copied = False
         try:
@@ -1568,6 +1585,34 @@ def dispatch_node(fields, *, root, run_dir, plan_path, task_class, db, run_id,
         return 0, "done"
 
     if node_type == "implementer":
+        # F6-B: implementer sub-mode dispatchers (bash :2493-2555). Orchestration
+        # recipes replace the single-LLM implementer with a python fan-out dispatcher.
+        recipe_eff = recipe or os.environ.get("MINI_ORK_RECIPE", "")
+        _submode = {
+            ("doc-to-features-loop", "per_feature_dispatcher"):
+                ("child-runs/_summary.json", "doc-to-features-loop/lib/per_feature_dispatcher.py"),
+            ("epic-runner", "epic_dispatcher"):
+                ("epic-results.json", "epic-runner/lib/epic_dispatcher.py"),
+            ("epic-runner", "wave_aggregator"):
+                ("wave-aggregate.json", "epic-runner/lib/wave_aggregator.py"),
+        }.get((recipe_eff, node_id))
+        if _submode:
+            impl_rel, script_rel = _submode
+            sub_log = os.path.join(run_dir, impl_rel)
+            script = os.path.join(root, "recipes", script_rel)
+            if not os.path.isfile(script):
+                print(f"dispatcher script missing: {script}", file=sys.stderr)
+                trace(node_id, "failure", "implementer", sub_log, "", "error")
+                return 1, "error"
+            os.makedirs(os.path.dirname(sub_log), exist_ok=True)
+            rc = subprocess.run(["python3", script]).returncode
+            if rc == 0:
+                print(f"  [ok] dispatcher results → {sub_log}")
+                trace(node_id, "success", "implementer", sub_log, "", "done")
+                return 0, "done"
+            print("dispatcher failed", file=sys.stderr)
+            trace(node_id, "failure", "implementer", sub_log, "", "error")
+            return 1, "error"
         impl_log = os.path.join(run_dir, f"impl-{node_id}.log")
         prompt = f"{_prepend()}Implement: {node_desc}{learned}\n\nPlan:\n{plan_content}"
         # F4: pin the codex/gemini edit surface to the TARGET repo (kickoff's git
