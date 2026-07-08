@@ -993,14 +993,18 @@ def _resolve_target_cwd(run_dir_eff):
         except Exception:
             kickoff = ""
     if kickoff and os.path.isfile(kickoff):
+        kdir = os.path.dirname(kickoff)
         try:
             r = subprocess.run(["git", "rev-parse", "--show-toplevel"],
-                               cwd=os.path.dirname(kickoff), capture_output=True, text=True)
+                               cwd=kdir, capture_output=True, text=True)
             if r.returncode == 0 and r.stdout.strip():
                 return r.stdout.strip()
         except Exception:
             pass
-        return os.getcwd()
+        # NEW-2: bash's `$(cd dirname && git … || pwd)` returns dirname(kickoff) on
+        # git failure (the subshell already cd'd) — NOT the executor cwd. Returning
+        # os.getcwd() would re-open the CWT-A corruption path this fix exists to close.
+        return kdir
     return os.environ.get("MO_TARGET_CWD") or os.getcwd()
 
 
@@ -1262,21 +1266,35 @@ def dispatch_node(fields, *, root, run_dir, plan_path, task_class, db, run_id,
     def _charge():
         charge_node_cost(db, run_id, cost_sidecar, root=root)
 
-    # ── Pre-dispatch gates (bash _dispatch_node:2231-2318). These run for every
-    # real dispatch; the dry-run preview path is _dry_dispatch_node, not here. ──
+    # Export the role-aware fallback chain (lead = resolved lane) so a python
+    # dispatch backend routes around a hung/flaky lead lane (bash:2224-2225, NEW-5).
+    os.environ["MO_DISPATCH_CHAIN"] = dispatch_chain(node_type, lane)
+
+    # ── Pre-dispatch gates, in bash _dispatch_node order (:2231-2318). These run
+    # for every real dispatch; the dry-run preview path is _dry_dispatch_node. ──
     # Cooperative soft-stop: UI POST /stop touches .stop-requested; bail BEFORE the
     # next node so an in-flight node finishes naturally (Stop=soft vs Kill=hard).
     if os.path.isfile(os.path.join(run_dir_eff, ".stop-requested")):
         print(f"  [stop] .stop-requested present — skipping node_id={node_id}", file=sys.stderr)
         return 1, "interrupted"
 
-    # rollback only fires on an upstream failure (escalates_to edge) — the caller
-    # gates that; here a reached rollback sets the terminal status.
+    # Intervention gate (bash:2258-2262): runs FIRST, for every node type (including
+    # planner/reflector), before the type-specific handling.
+    if not _intervention_gate_check(root, node_id, node_type, lane, node_desc):
+        return 1, "blocked"
+
+    # planner/reflector don't dispatch an LLM — handled after the intervention gate
+    # (bash routes them through the same gate then falls to their case).
     if node_type == "planner":
         print("  [skip] planner node handled by mini-ork-plan")
         return 0, "done"
     if node_type == "reflector":
-        subprocess.run([os.path.join(root, "bin", "mini-ork-reflect")], capture_output=True)
+        # NEW-3: guard like bash's `… || true` (:2906) — a missing/non-exec binary
+        # must degrade gracefully, not crash the whole live run with FileNotFoundError.
+        try:
+            subprocess.run([os.path.join(root, "bin", "mini-ork-reflect")], capture_output=True)
+        except OSError:
+            pass
         return 0, "done"
 
     # Capability assert (bash:2296-2306): a node's requires_capabilities must be
@@ -1293,9 +1311,6 @@ def dispatch_node(fields, *, root, run_dir, plan_path, task_class, db, run_id,
             print(f"  [timeout] stale heartbeat detected before node_id={node_id}: {stale}",
                   file=sys.stderr)
             return 1, "timeout"
-    # Intervention gate (bash:2258-2262): human-in-the-loop hold.
-    if not _intervention_gate_check(root, node_id, node_type, lane, node_desc):
-        return 1, "blocked"
 
     recipe_dir = os.path.join(root, "recipes", recipe) if recipe else ""
     prompt_file = ""
@@ -1416,7 +1431,11 @@ def dispatch_node(fields, *, root, run_dir, plan_path, task_class, db, run_id,
         except Exception:
             artifact = ""
         if not artifact:
-            return 1, "error"
+            # NEW-1: bash (:2899-2902) warns + sets error finish_reason but does NOT
+            # return 1 — a verifier node with no artifact_contract outputs does not
+            # fail the run. Return rc 0 to match (finish_reason error is informational).
+            print("  [warn] verifier node: no outputs in artifact_contract")
+            return 0, "error"
         if verifier_ref and recipe_dir:
             script = os.path.join(recipe_dir, verifier_ref)
             if not os.path.isfile(script):

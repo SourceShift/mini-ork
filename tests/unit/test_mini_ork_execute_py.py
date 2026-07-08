@@ -419,6 +419,18 @@ def test_live_publisher_and_rollback_status(tmp_path, monkeypatch):
     assert rc_rb == 1 and fr_rb == "rolled_back"
 
 
+def test_verifier_no_artifact_does_not_fail_run(tmp_path):
+    # NEW-1: bash (:2899-2902) warns + does NOT return 1 when artifact_contract has
+    # no outputs — the run passes. The port previously returned (1,'error').
+    db = _seed_db(tmp_path, "vf"); _seed_task_run(db)
+    rd = tmp_path / "run"; rd.mkdir()
+    plan = tmp_path / "noout.json"; plan.write_text('{"artifact_contract": {"outputs": []}}')
+    rc, _ = ex.dispatch_node(_fields("v1", "verifier"), root=str(REPO), run_dir=str(rd),
+                             plan_path=str(plan), task_class="code_fix", db=db, run_id="r1",
+                             dispatch_fn=_fake(""))
+    assert rc == 0
+
+
 def test_publisher_panel_gate_blocks_without_approval(tmp_path, monkeypatch):
     # F2/F3: the recursive-validate-impl publisher MUST block when panel-verdict.json
     # is missing or not approved (bash :2986-3013). The old stub shipped regardless.
