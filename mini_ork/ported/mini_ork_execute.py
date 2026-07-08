@@ -556,8 +556,18 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
     while i < len(argv):
         a = argv[i]
         if a in ("--help", "-h"):
-            sys.stdout.write("Usage: mini-ork execute [<plan.json>] [--node-type <type>] "
-                             "[--dispatch-mode <mode>] [--dry-run]\n")
+            sys.stdout.write(
+                "Usage: mini-ork execute [<plan.json>] [--node-type <type>] "
+                "[--dispatch-mode <mode>] [--dry-run]\n\n"
+                "Dispatch plan steps to node-type handlers.\n\n"
+                "Node types: planner | researcher | implementer | reviewer | verifier |\n"
+                "            reflector | publisher | rollback\n\n"
+                "Dispatch modes: serial | parallel | partitioned | speculative\n\n"
+                "Options:\n"
+                "  --node-type <type>        Execute only nodes of this type (filter)\n"
+                "  --dispatch-mode <mode>    Override workflow dispatch mode\n"
+                "  --dry-run                 Print what would be dispatched; no LLM calls\n"
+                "  --help                    Show this help\n")
             return 0
         elif a == "--dry-run":
             dry_run = True; i += 1
