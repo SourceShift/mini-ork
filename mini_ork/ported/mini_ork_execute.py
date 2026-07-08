@@ -1033,6 +1033,91 @@ def _assert_lane_capability(root, lane, required):
         return True
 
 
+_JUDGE_LENS_FILES = {
+    "opus_scalability_lens": "judge-opus-scalability.md",
+    "opus_llm_safety_lens": "judge-opus-llm-safety.md",
+    "kimi_correctness_lens": "judge-kimi-correctness.md",
+    "codex_codebase_lens": "judge-codex-codebase.md",
+    "minimax_perf_lens": "judge-minimax-performance.md",
+}
+_TIER4_LENS_FILES = {
+    "tier4_glm": "tier4-glm.md", "tier4_kimi": "tier4-kimi.md",
+    "tier4_codex": "tier4-codex.md", "tier4_minimax": "tier4-minimax.md",
+}
+
+
+def _researcher_output_file(run_dir, recipe, node_id):
+    """F1-B (bash _dispatch_node:2403-2437): recipe-specific researcher output names.
+    schema-judge-panel + recursive-validate-impl map non-_lens node_ids to the exact
+    judge-*.md / tier4-*.md files their synthesizer + verifier glob for. Without these
+    the panel gate reads context-<id>.json → zero lens inputs → theater verdict."""
+    if recipe == "schema-judge-panel" and node_id in _JUDGE_LENS_FILES:
+        return os.path.join(run_dir, _JUDGE_LENS_FILES[node_id])
+    if recipe == "recursive-validate-impl" and node_id in _TIER4_LENS_FILES:
+        return os.path.join(run_dir, _TIER4_LENS_FILES[node_id])
+    if node_id.endswith(("_lens", "-lens")):
+        return os.path.join(run_dir, f"lens-{node_id[:-5]}.md")
+    return os.path.join(run_dir, f"context-{node_id}.json")
+
+
+def _assemble_reviewer_inputs(run_dir):
+    """F2-B (bash _mo_assemble_reviewer_inputs:182-275). Build the reviewer input block:
+    implementer-summary.json + verifier_{typecheck,test}.json + a generated
+    review-diff.patch, with the REVIEWER NOTE. Without this the classic reviewer reviews
+    blind and hard-abstains ('inputs missing') — the gate becomes theater."""
+    if not run_dir:
+        return ""
+    try:
+        os.makedirs(run_dir, exist_ok=True)
+    except OSError:
+        pass
+    summary = os.path.join(run_dir, "implementer-summary.json")
+    worktree, files = "", []
+    if os.path.isfile(summary):
+        try:
+            d = json.load(open(summary))
+            worktree = d.get("worktree_path") or ""
+            fc = d.get("files_changed") or []
+            files = [str(x) for x in fc] if isinstance(fc, list) else []
+        except Exception:
+            pass
+    if not worktree or not os.path.isdir(worktree):
+        worktree = os.environ.get("MO_TARGET_CWD") or os.getcwd()
+    diff_path = os.path.join(run_dir, "review-diff.patch")
+    try:
+        if os.path.isdir(worktree) and subprocess.run(
+                ["git", "-C", worktree, "rev-parse", "--git-dir"],
+                capture_output=True).returncode == 0:
+            args = ["git", "-C", worktree, "diff", "--no-color"] + (["--", *files] if files else [])
+            with open(diff_path, "w") as fh:
+                subprocess.run(args, stdout=fh, stderr=subprocess.DEVNULL)
+        if not (os.path.isfile(diff_path) and os.path.getsize(diff_path) > 0):
+            open(diff_path, "w").close()
+    except Exception:
+        open(diff_path, "w").close()
+
+    def _sec(title, path):
+        if os.path.isfile(path) and os.path.getsize(path) > 0:
+            return f"\n# {title}\n{open(path).read()}\n"
+        return f"\n# {title}\n(not available)\n"
+
+    block = "--- Reviewer inputs (assembled by mini-ork-execute) ---\n"
+    block += _sec("implementer-summary.json", summary)
+    block += _sec("verifier_typecheck.json", os.path.join(run_dir, "verifier_typecheck.json"))
+    block += _sec("verifier_test.json", os.path.join(run_dir, "verifier_test.json"))
+    if os.path.isfile(diff_path) and os.path.getsize(diff_path) > 0:
+        block += f"\n# review-diff.patch\n{open(diff_path).read()}\n"
+    else:
+        block += "\n# review-diff.patch\n(no diff)\n"
+    block += ("\n--- End reviewer inputs ---\n\n"
+              "REVIEWER NOTE: The four inputs above are required for a real verdict. If any "
+              "input is marked '(not available)' or '(no diff)', review what IS present. Only "
+              "hard-abstain (verdict=needs_revision with reason 'inputs missing') when BOTH the "
+              "diff and the summary are absent — that is the only genuine no-op case. A missing "
+              "verifier verdict is a real failure signal, not an abstention excuse.\n")
+    return block
+
+
 def _learned_block(root, task_class, node_type):
     """F5-B (bash _dispatch_node:2357-2382): inject reflect-learned failure modes +
     unconsumed operator-steering messages into LLM node prompts — the READ side of
@@ -1465,9 +1550,7 @@ def dispatch_node(fields, *, root, run_dir, plan_path, task_class, db, run_id,
     os.environ["MO_NODE_ID"] = node_id
 
     if node_type == "researcher":
-        norm = node_id[:-5] if node_id.endswith(("_lens", "-lens")) else node_id
-        ctx = (os.path.join(run_dir, f"lens-{norm}.md") if node_id.endswith(("_lens", "-lens"))
-               else os.path.join(run_dir, f"context-{node_id}.json"))
+        ctx = _researcher_output_file(run_dir, recipe or os.environ.get("MINI_ORK_RECIPE", ""), node_id)
         prompt = f"{_prepend()}Task: {node_desc}{learned}\n\nPlan context:\n{plan_content}\n\nWrite your output to: {ctx}"
         marker = os.path.join(run_dir, f".dispatch-marker-{node_id}"); open(marker, "w").write("")
         rc, result = dispatch_fn(task_class, lane, prompt)
@@ -1523,7 +1606,20 @@ def dispatch_node(fields, *, root, run_dir, plan_path, task_class, db, run_id,
         else:
             review_file = os.path.join(run_dir, f"review-{node_id}.json")
             is_synth = False
-        prompt = f"{_prepend()}Review: {node_desc}{learned}\n\nPlan:\n{plan_content}"
+        # F2-B: per-case prompt matching bash :2739-2756. The classic reviewer gets the
+        # assembled inputs (summary + verifier verdicts + diff) AND the JSON envelope —
+        # without the envelope the LLM emits prose → verdict=unknown → false rollback.
+        if is_panel_gate:
+            prompt = (f"{_prepend()}Synthesize panel verdict for: {node_desc}{learned}\n\n"
+                      f"Plan:\n{plan_content}\n\nWrite strict JSON to: {review_file}")
+        elif is_synth:
+            prompt = (f"{_prepend()}Synthesize for: {node_desc}{learned}\n\n"
+                      f"Plan:\n{plan_content}\n\nWrite your synthesis to: {review_file}")
+        else:
+            reviewer_inputs = _assemble_reviewer_inputs(run_dir_eff)
+            prompt = (f"{_prepend()}Review the implementation for: {node_desc}{learned}\n\n"
+                      f"Plan:\n{plan_content}\n\n{reviewer_inputs}\n"
+                      'Respond with JSON: {"verdict": "pass|fail|needs_revision", "notes": []}')
         marker = os.path.join(run_dir, f".dispatch-marker-{node_id}"); open(marker, "w").write("")
         rc, result = dispatch_fn(task_class, lane, prompt)
         if rc != 0:
@@ -1574,6 +1670,17 @@ def dispatch_node(fields, *, root, run_dir, plan_path, task_class, db, run_id,
             os.makedirs(ev_dir, exist_ok=True)
             ev = os.path.join(ev_dir, os.path.basename(verifier_ref).replace(".sh", "") + ".log")
             rc = _run_verifier_ref(script, ev, plan_path=plan_path, artifact_path=artifact)
+            # F2-B: persist evidence to verifier_<stem>.json (bash :2886-2888) so the
+            # reviewer input assembly can read the typecheck/test verdicts. Before the
+            # rc return so failures are visible too (a missing verifier is real signal).
+            vstem = verifier_ref[len("verifiers/"):] if verifier_ref.startswith("verifiers/") else verifier_ref
+            vstem = vstem[:-3] if vstem.endswith(".sh") else vstem
+            persist_dir = os.environ.get("MINI_ORK_RUN_DIR", run_dir)
+            if persist_dir and os.path.isfile(ev) and os.path.getsize(ev) > 0:
+                try:
+                    shutil.copy(ev, os.path.join(persist_dir, f"verifier_{vstem}.json"))
+                except OSError:
+                    pass
             return (0, "done") if rc == 0 else (1, "error")
         rc = subprocess.run([os.path.join(root, "bin", "mini-ork-verify"), "--plan", plan_path,
                              "--task-class", task_class, artifact]).returncode

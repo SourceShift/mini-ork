@@ -423,6 +423,39 @@ def test_live_publisher_and_rollback_status(tmp_path, monkeypatch):
     assert _sql(db, "SELECT status FROM task_runs WHERE id='r1';").stdout.strip() != "rolled_back"
 
 
+def test_classic_reviewer_prompt_has_inputs_and_json_envelope(tmp_path):
+    # F2-B: the classic reviewer prompt must carry the assembled inputs block AND the
+    # JSON verdict envelope — without the envelope the LLM emits prose → unknown verdict
+    # → false rollback of a good run.
+    db = _seed_db(tmp_path, "rv"); _seed_task_run(db)
+    rd = tmp_path / "run"; rd.mkdir()
+    captured = {}
+
+    def cap(tc, nt, prompt):
+        captured["p"] = prompt
+        return 0, '{"verdict":"pass"}'
+
+    ex.dispatch_node(_fields("rev1", "reviewer"), root=str(REPO), run_dir=str(rd),
+                     plan_path=_plan(tmp_path), task_class="code_fix", db=db, run_id="r1",
+                     dispatch_fn=cap)
+    assert "Respond with JSON" in captured["p"]
+    assert "Reviewer inputs" in captured["p"]
+
+
+def test_researcher_recipe_specific_output_files(tmp_path):
+    # F1-B: recursive-validate-impl tier4_* and schema-judge-panel *_lens researcher
+    # nodes must write the exact tier4-*.md / judge-*.md the panel synthesizer globs,
+    # not context-<id>.json. Otherwise the panel gate sees zero lens inputs.
+    db = _seed_db(tmp_path, "rf"); _seed_task_run(db)
+    rd = tmp_path / "run"; rd.mkdir()
+    common = dict(root=str(REPO), run_dir=str(rd), plan_path=_plan(tmp_path),
+                  task_class="code_fix", db=db, run_id="r1", dispatch_fn=_fake("panel body"))
+    ex.dispatch_node(_fields("tier4_glm", "researcher"), recipe="recursive-validate-impl", **common)
+    assert (rd / "tier4-glm.md").is_file()
+    ex.dispatch_node(_fields("kimi_correctness_lens", "researcher"), recipe="schema-judge-panel", **common)
+    assert (rd / "judge-kimi-correctness.md").is_file()
+
+
 def test_verifier_no_artifact_does_not_fail_run(tmp_path):
     # NEW-1: bash (:2899-2902) warns + does NOT return 1 when artifact_contract has
     # no outputs — the run passes. The port previously returned (1,'error').
