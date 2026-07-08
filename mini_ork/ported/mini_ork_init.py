@@ -249,12 +249,18 @@ def mini_ork_init(
     project_root = Path(project_root)
     mini_ork_repo = Path(mini_ork_repo).resolve()
 
+    # Match bash: MINI_ORK_HOME="${MINI_ORK_HOME:-$(pwd)/.mini-ork}" — the default
+    # is derived from the un-resolved cwd and bash never resolve()s it. Resolving
+    # here diverges from bash's stdout on a symlinked cwd (macOS /tmp), same
+    # reason project_root is left un-resolved above. Use abspath to guarantee an
+    # absolute path (bash's default is absolute via $(pwd)) without following
+    # symlinks.
     if mini_ork_home is None:
         mini_ork_home = Path(
-            os.environ.get("MINI_ORK_HOME", str(project_root / ".mini-ork"))
-        ).resolve()
+            os.path.abspath(os.environ.get("MINI_ORK_HOME", str(project_root / ".mini-ork")))
+        )
     else:
-        mini_ork_home = Path(mini_ork_home).resolve()
+        mini_ork_home = Path(os.path.abspath(mini_ork_home))
 
     buf = StringIO()
     env = os.environ.copy()
@@ -341,3 +347,25 @@ def mini_ork_init(
     buf.write("\n")
 
     return buf.getvalue()
+
+
+def main(argv: list[str] | None = None) -> int:
+    """CLI entry mirroring bin/mini-ork-init.
+
+    Bash init takes no meaningful flags (it scaffolds unconditionally and even
+    ignores --help), so argv is accepted but unused. project_root is the cwd
+    (bash uses the invocation directory); mini_ork_repo is MINI_ORK_ROOT
+    (exported by the bin wrapper before delegation), falling back to the repo
+    root inferred from this file's location.
+    """
+    repo = os.environ.get("MINI_ORK_ROOT") or str(Path(__file__).resolve().parents[2])
+    # Bash uses the logical cwd ($PWD, symlinks intact); Path.cwd()/getcwd()
+    # resolve symlinks, which diverges when the project dir is a symlink
+    # (e.g. macOS /tmp → /private/tmp). Prefer $PWD to mirror bash exactly.
+    proj = os.environ.get("PWD") or os.getcwd()
+    sys.stdout.write(mini_ork_init(proj, repo))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -146,7 +146,34 @@ def main(argv: list[str] | None = None, *, db: str | None = None, root: str | No
         elif a == "--dry-run": dry_run = 1; i += 1
         elif a == "--explain": explain = 1; i += 1
         elif a in ("--help", "-h"):
-            sys.stdout.write("mini-ork conductor — meta-orchestrator.\n"); return 0
+            sys.stdout.write(
+                "mini-ork conductor — meta-orchestrator (mini-ork-of-mini-orks).\n\n"
+                "Phase 2 of the design grounded in Shepherd (arXiv:2605.10913),\n"
+                "TaskWeave (2606.01199), TacoMAS (2605.09539), Mass (2502.02533),\n"
+                "InfraMind (2606.11440) and TCP-MCP (2605.27850).\n\n"
+                "Per tick:\n"
+                "  1. Read state of: epic queue, prompt_win_rates, agent_performance_memory,\n"
+                "     topology_win_rates, role_evolver_log proposals, 24h cost vs cap.\n"
+                "  2. Pick the next epic from epic_graph_ready_now.\n"
+                "  3. Decide:\n"
+                "       - Recipe / topology  (highest win_rate per task_class, ties broken\n"
+                "         by lower avg_cost; falls back to the epic's kickoff hint)\n"
+                "       - Lane hints         (highest relative_advantage per (lane, task_class))\n"
+                "       - Prompt seeds       (top-quartile prompt_version_hash for the role)\n"
+                "     Under high budget pressure (>70% spend), prefer cheaper topologies\n"
+                "     with sample_size >= 3 over higher-win-rate but expensive ones\n"
+                "     (InfraMind-style budget bias).\n"
+                "  4. Write the decision to conductor_decisions.\n"
+                "  5. Stage the lane hints + prompt seeds into env vars and call\n"
+                "     bin/mini-ork-scheduler --once.\n\n"
+                "Modes:\n"
+                "  --once               One decision + dispatch then exit\n"
+                "  --max-iters N        Bound iterations (default unbounded)\n"
+                "  --idle-secs N        Poll interval when queue empty (default 60)\n"
+                "  --dry-run            Decide + log but skip dispatch\n"
+                "  --explain            Emit a verbose rationale per decision\n"
+                "  --help\n\n"
+                "All decisions logged to conductor_decisions. Re-runnable.\n"); return 0
         else:
             sys.stderr.write(f"conductor: unknown flag {a}\n"); return 2
 

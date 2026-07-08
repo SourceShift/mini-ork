@@ -69,6 +69,7 @@ import os
 import re
 import sqlite3
 import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -1043,3 +1044,37 @@ def run_cli(argv: Iterable[str] | None = None) -> str:
         n = int(rest[0]) if rest else 10
         return review_list(n)
     raise ValueError(f"review: unknown subcommand {sub}")
+
+
+_USAGE = """Usage: mini-ork review <subcommand> [args]
+
+  run <source_sha> <target_branch> [--mode heuristic|llm_panel]
+  show <review_id>
+  verdict <review_id>
+  forward <review_id>
+  list [N]
+"""
+
+
+def main(argv: list[str] | None = None) -> int:
+    """CLI entry mirroring bin/mini-ork-review's case dispatch.
+
+    empty / help / --help / -h → usage on stdout, rc 0.
+    unknown subcommand         → error on stderr + usage on stdout, rc 2.
+    known subcommand           → run_cli output on stdout, rc 0.
+    """
+    args = list(sys.argv[1:] if argv is None else argv)
+    if not args or args[0] in ("help", "--help", "-h"):
+        sys.stdout.write(_USAGE)
+        return 0
+    try:
+        sys.stdout.write(run_cli(args))
+    except ValueError as e:
+        sys.stderr.write(f"{e}\n")
+        sys.stdout.write(_USAGE)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
