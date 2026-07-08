@@ -151,7 +151,24 @@ def main(argv: list[str] | None = None, *, db: str | None = None, root: str | No
         elif a == "--budget-cap-usd": cap = float(argv[i + 1]); i += 2
         elif a == "--dry-run": dry_run = 1; i += 1
         elif a in ("--help", "-h"):
-            sys.stdout.write("mini-ork scheduler — autonomous multi-epic delivery loop.\n"); return 0
+            sys.stdout.write(
+                "mini-ork scheduler — autonomous multi-epic delivery loop.\n\n"
+                "Pulls the next-ready epic from `epics` (status='not started' AND all hard\n"
+                "deps resolved) and dispatches it via `mini-ork run epic-runner <kickoff>`.\n"
+                "On verdict=success, marks epic 'done' and cascades dep resolution. On\n"
+                "failure, marks epic 'escalated' (visible in `mini-ork-epics list`).\n\n"
+                "Flags:\n"
+                "  --once               Run a single pick→dispatch→verdict cycle then exit\n"
+                "  --idle-secs N        Sleep N seconds between empty-queue polls (default 60)\n"
+                "  --max-iters N        Hard stop after N dispatches (default unlimited)\n"
+                "  --budget-cap-usd X   Daily cost cap; refuses to dispatch when exceeded\n"
+                "                       (defaults to MO_DAILY_BUDGET_USD or 50.0)\n"
+                "  --dry-run            Print what would be dispatched, do not invoke runner\n"
+                "  --help\n\n"
+                "Exit codes:\n"
+                "  0   queue drained (no ready epics) OR --once cycle finished cleanly\n"
+                "  1   fatal: missing deps (no DB, no epic-runner recipe)\n"
+                "  2   cost-pause sentinel encountered\n"); return 0
         else:
             sys.stderr.write(f"scheduler: unknown flag {a}\n"); return 2
 
