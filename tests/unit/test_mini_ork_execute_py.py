@@ -498,6 +498,12 @@ def test_main_live_run_wired(tmp_path, monkeypatch):
     assert (rd / "review-rev1.json").exists()            # reviewer wrote its output
     assert (rd / "verdict.json").exists()                # run-level verdict emitted
     assert _sql(db, "SELECT status FROM task_runs WHERE id='run-x';").stdout.strip() in ("executing", "reviewing", "published")
+    # F3: the live path must now write reward-stamped execution_traces rows — the
+    # GRPO/reflect learning-loop signal that was ZERO under python before the trace_fn
+    # wiring. researcher + reviewer each stamp a row with a non-null reward_value.
+    n = _sql(db, "SELECT COUNT(*) FROM execution_traces "
+                 "WHERE run_id='run-x' AND reward_value IS NOT NULL;").stdout.strip()
+    assert int(n) >= 2
 
 
 # ── orchestration backbone parity (NODE_IDS + --dry-run) ──

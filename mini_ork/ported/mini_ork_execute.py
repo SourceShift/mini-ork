@@ -33,6 +33,7 @@ import sqlite3
 import subprocess
 import sys
 import time
+import uuid
 
 _SEP = "\x1f"
 _NODE_TYPE_ORDER = ("planner", "researcher", "implementer", "reviewer", "verifier",
@@ -691,6 +692,9 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
     recipe = os.environ.get("MINI_ORK_RECIPE", "")
     live_run_dir = os.environ.get("MINI_ORK_RUN_DIR") or run_dir
     llm = dispatch_fn or _default_llm_dispatch(root)
+    # F3: without a trace_fn the live path writes zero execution_traces rows and the
+    # GRPO/reflect learning loop is inert. Wire the real writer (reward-stamped rows).
+    trace_writer = _make_trace_fn(task_class, db, run_id)
     set_status(db, run_id, "executing")
     ordered = ([f for nt in _NODE_TYPE_ORDER for f in fields_list if f[1] == nt]
                if dispatch_mode == "partitioned" else fields_list)
@@ -706,7 +710,8 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
         os.environ["FAIL_COUNT"] = str(fail_count)
         rc, _fr = dispatch_node(f, root=root, run_dir=live_run_dir, plan_path=plan_path,
                                 task_class=task_class, db=db, run_id=run_id,
-                                dispatch_fn=llm, recipe=recipe, workflow=workflow)
+                                dispatch_fn=llm, recipe=recipe, workflow=workflow,
+                                trace_fn=trace_writer)
         if rc != 0:
             fail_count += 1
     _emit_run_verdict(live_run_dir, fail_count, len(fields_list))
@@ -1028,6 +1033,37 @@ def _assert_lane_capability(root, lane, required):
         return True
 
 
+def _learned_block(root, task_class, node_type):
+    """F5-B (bash _dispatch_node:2357-2382): inject reflect-learned failure modes +
+    unconsumed operator-steering messages into LLM node prompts — the READ side of
+    the learning loop. Shells to lib/context_assembler.sh (the same code the bash path
+    runs). Empty when opt-out (MO_INJECT_LEARNINGS=0), non-LLM node, or lib absent."""
+    if os.environ.get("MO_INJECT_LEARNINGS", "1") != "1":
+        return ""
+    if node_type not in ("researcher", "implementer", "reviewer"):
+        return ""
+    lib = os.path.join(root, "lib", "context_assembler.sh")
+    if not os.path.isfile(lib):
+        return ""
+    block = ""
+    try:
+        fm = subprocess.run(
+            ["bash", "-c", 'source "$1"; declare -f context_failure_modes_md >/dev/null 2>&1 '
+             '&& context_failure_modes_md "$2" 5 || true', "_", lib, task_class or "generic"],
+            capture_output=True, text=True, timeout=30).stdout.strip()
+        if fm:
+            block = "\n\n" + fm + "\n"
+        st = subprocess.run(
+            ["bash", "-c", 'source "$1"; declare -f context_operator_steering_md >/dev/null 2>&1 '
+             '&& context_operator_steering_md "$2" || true', "_", lib, node_type],
+            capture_output=True, text=True, timeout=30).stdout.strip()
+        if st:
+            block = block + "\n" + st + "\n"
+    except Exception:
+        pass
+    return block
+
+
 def _intervention_gate_check(root, node_id, node_type, lane, node_desc):
     """Shell to lib/intervention_gate.sh intervention_gate_check (rc 0 = proceed).
     Absent lib → proceed (matches bash `[ -f "$gate_lib" ] || return 0`)."""
@@ -1042,6 +1078,62 @@ def _intervention_gate_check(root, node_id, node_type, lane, node_desc):
         return r.returncode == 0
     except Exception:
         return True
+
+
+def _make_trace_fn(task_class, db, run_id):
+    """F3: build the trace_fn that reproduces bash `_trace_write_node_rich` (:1786) —
+    without it the live path writes ZERO execution_traces rows and the whole GRPO /
+    reflect learning loop is inert under the python runtime. Each node success/failure
+    writes a row with a reward stamp (reward_from_status) + code_region so
+    lane_router_recompute_advantages has real signal to learn from.
+    Signature matches dispatch_node's `trace(node_id, status, node_type, output_file,
+    verdict, finish_reason)`."""
+    from mini_ork import trace_store  # noqa: PLC0415
+
+    def _tf(node_id, status, node_type, output_file="", verdict="", finish_reason=""):
+        extra = {
+            "trace_id": f"tr-{node_type}-{node_id}-{uuid.uuid4().hex[:8]}",
+            "run_id": run_id,
+            "verifier_output": {"node_type": node_type, "finish_reason": finish_reason or None},
+        }
+        if output_file:
+            extra["final_artifact_ref"] = output_file
+            extra["files_written"] = json.dumps([output_file])
+        if verdict:
+            extra["reviewer_verdict"] = verdict
+        if finish_reason:
+            extra["finish_reason"] = finish_reason
+        # Reward stamp (bash:1812-1815): activates the GRPO shared-brain loop.
+        if os.environ.get("MO_REWARD_STAMP", "1") == "1":
+            rv = reward_from_status(status, verdict)
+            if rv:
+                try:
+                    extra["reward_value"] = float(rv)
+                    extra["reward_anchor"] = float(os.environ.get("MO_REWARD_ANCHOR", "0.5"))
+                    extra["reward_direction"] = "higher_is_better"
+                except ValueError:
+                    pass
+        try:
+            payload = trace_store.trace_write_node(task_class, status, extra)
+            trace_id = trace_store.trace_write(payload, db=db)
+            # code_region UPDATE (bash _mo_update_trace_code_region:1744) — the GRPO
+            # grouping key alongside (objective_domain, task_class, node_type).
+            region = infer_trace_code_region(json.dumps(payload))
+            if trace_id and region and db and os.path.isfile(db):
+                con = sqlite3.connect(db, timeout=5.0)
+                con.execute("PRAGMA busy_timeout=5000")
+                try:
+                    cols = {r[1] for r in con.execute("PRAGMA table_info(execution_traces)").fetchall()}
+                    if "code_region" in cols:
+                        con.execute("UPDATE execution_traces SET code_region=? WHERE trace_id=?",
+                                    (region, trace_id))
+                        con.commit()
+                finally:
+                    con.close()
+        except Exception:
+            pass  # trace writes are best-effort (bash uses 2>/dev/null || true)
+
+    return _tf
 
 
 def _publisher_try_commit_files(root, target_repo, run_dir, review_file, verdict_env,
@@ -1367,13 +1459,16 @@ def dispatch_node(fields, *, root, run_dir, plan_path, task_class, db, run_id,
             open(out_file, "w").write(result)
 
     plan_content = open(plan_path).read() if plan_path and os.path.isfile(plan_path) else ""
+    # F5-B: reflect-learned failure modes + operator steering, injected after node_desc
+    # in the LLM prompts (the read side of the learning loop). Empty for non-LLM nodes.
+    learned = _learned_block(root, task_class, node_type)
     os.environ["MO_NODE_ID"] = node_id
 
     if node_type == "researcher":
         norm = node_id[:-5] if node_id.endswith(("_lens", "-lens")) else node_id
         ctx = (os.path.join(run_dir, f"lens-{norm}.md") if node_id.endswith(("_lens", "-lens"))
                else os.path.join(run_dir, f"context-{node_id}.json"))
-        prompt = f"{_prepend()}Task: {node_desc}\n\nPlan context:\n{plan_content}\n\nWrite your output to: {ctx}"
+        prompt = f"{_prepend()}Task: {node_desc}{learned}\n\nPlan context:\n{plan_content}\n\nWrite your output to: {ctx}"
         marker = os.path.join(run_dir, f".dispatch-marker-{node_id}"); open(marker, "w").write("")
         rc, result = dispatch_fn(task_class, lane, prompt)
         if rc != 0:
@@ -1391,7 +1486,7 @@ def dispatch_node(fields, *, root, run_dir, plan_path, task_class, db, run_id,
 
     if node_type == "implementer":
         impl_log = os.path.join(run_dir, f"impl-{node_id}.log")
-        prompt = f"{_prepend()}Implement: {node_desc}\n\nPlan:\n{plan_content}"
+        prompt = f"{_prepend()}Implement: {node_desc}{learned}\n\nPlan:\n{plan_content}"
         # F4: pin the codex/gemini edit surface to the TARGET repo (kickoff's git
         # toplevel), not os.getcwd(). Without this the implementer diff/writes land
         # in mini-ork's own tree when cwd != target — the CWT-A corruption hazard
@@ -1428,7 +1523,7 @@ def dispatch_node(fields, *, root, run_dir, plan_path, task_class, db, run_id,
         else:
             review_file = os.path.join(run_dir, f"review-{node_id}.json")
             is_synth = False
-        prompt = f"{_prepend()}Review: {node_desc}\n\nPlan:\n{plan_content}"
+        prompt = f"{_prepend()}Review: {node_desc}{learned}\n\nPlan:\n{plan_content}"
         marker = os.path.join(run_dir, f".dispatch-marker-{node_id}"); open(marker, "w").write("")
         rc, result = dispatch_fn(task_class, lane, prompt)
         if rc != 0:
