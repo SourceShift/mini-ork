@@ -43,10 +43,7 @@ except ImportError as exc:  # pragma: no cover
 # candidate keys; values are the file names under recipes/<recipe>/prompts/.
 DEFAULT_COMPONENTS = {"planner": "planner.md", "implementer": "implementer.md", "reviewer": "reviewer.md"}
 
-# Score weights (sum of positives ~1.0; penalties subtract).
-W_TESTS = 0.6      # verifier / tests passed
-W_STATUS = 0.4     # run reached a successful terminal state
-COST_PENALTY_PER_USD = 0.05   # soft: -0.05 per $1 spent (keeps it honest on cost)
+COST_PENALTY_PER_USD = 0.05   # soft: -0.05 per $1 spent (keeps GEPA honest on cost)
 
 
 @dataclass
@@ -61,7 +58,7 @@ class MiniOrkTask:
 class MiniOrkTrace:
     run_id: str
     status: str
-    tests_passed: bool | None
+    reward_g: float          # mini-ork's own graded verifier reward (~[-1, 1])
     false_completion: bool
     cost_usd: float
     verifier_output: str
@@ -132,7 +129,7 @@ class MiniOrkGEPAAdapter(GEPAAdapter[MiniOrkTask, MiniOrkTrace, MiniOrkOutput]):
                     "Inputs": {"task_recipe": self.recipe, "run_id": trace.run_id},
                     "Generated Outputs": {
                         "status": trace.status,
-                        "tests_passed": trace.tests_passed,
+                        "reward_g": trace.reward_g,
                         "files_written": trace.files_written[:10],
                         "reviewer_verdict": trace.reviewer_verdict,
                     },
@@ -143,18 +140,19 @@ class MiniOrkGEPAAdapter(GEPAAdapter[MiniOrkTask, MiniOrkTrace, MiniOrkOutput]):
     # ---- scoring + reflection (grounded in real outcomes) ---------------
 
     def _score(self, t: MiniOrkTrace) -> float:
-        base = (W_TESTS if t.tests_passed else 0.0) + (W_STATUS if t.status == "success" else 0.0)
-        if t.false_completion:            # claimed done but human/verifier rejected
+        # mini-ork's own graded reward (reward_g ~[-1,1]) normalized to [0,1].
+        base = max(0.0, min(1.0, (t.reward_g + 1.0) / 2.0))
+        if t.false_completion:            # claimed done but verifier rejected
             base -= self.honesty_penalty
         base -= COST_PENALTY_PER_USD * max(0.0, t.cost_usd)
         return max(0.0, min(1.0, base))
 
     def _feedback_text(self, t: MiniOrkTrace, score: float) -> str:
-        parts = [f"score={score:.2f} status={t.status} tests_passed={t.tests_passed} cost=${t.cost_usd:.3f}"]
+        parts = [f"score={score:.2f} status={t.status} reward_g={t.reward_g:.2f} cost=${t.cost_usd:.3f}"]
         if t.false_completion:
             parts.append("FALSE COMPLETION: the agent claimed the task was done but it was not — "
                          "tighten the prompt to require verification before declaring completion.")
-        if t.tests_passed is False and t.verifier_output:
+        if t.reward_g <= 0 and t.verifier_output:
             parts.append("VERIFIER/TEST FAILURE. Output:\n" + t.verifier_output[:1200])
         if t.reviewer_verdict and t.reviewer_verdict not in ("approve", "pass"):
             parts.append(f"REVIEWER rejected with verdict={t.reviewer_verdict}.")
@@ -192,6 +190,7 @@ class MiniOrkGEPAAdapter(GEPAAdapter[MiniOrkTask, MiniOrkTrace, MiniOrkOutput]):
             [str(self.root / "bin" / "mini-ork"), "run", recipe_dir.name, task.kickoff],
             env=env, cwd=self.root, timeout=self.run_timeout_s,
             check=False, capture_output=True, text=True,
+            stdin=subprocess.DEVNULL,   # headless: mini-ork dispatch expects no TTY stdin
         )
         return self._latest_run_id()
 
@@ -208,32 +207,28 @@ class MiniOrkGEPAAdapter(GEPAAdapter[MiniOrkTask, MiniOrkTrace, MiniOrkOutput]):
         con.row_factory = sqlite3.Row
         try:
             et = con.execute(
-                "SELECT status, tests_passed, verifier_output, reviewer_verdict, "
-                "files_written, cost_usd FROM execution_traces WHERE run_id=? "
+                "SELECT status, reward_g, verifier_output, reviewer_verdict, "
+                "files_written FROM execution_traces WHERE run_id=? "
                 "ORDER BY created_at DESC LIMIT 1", (run_id,)).fetchone()
             cost = con.execute(
                 "SELECT COALESCE(SUM(cost_usd),0) FROM llm_calls WHERE run_id=?", (run_id,)).fetchone()[0]
         finally:
             con.close()
-        tp = None
-        false_completion = False
-        status = "unknown"
-        verifier = ""
-        verdict = None
+        status, reward_g, verifier, verdict = "unknown", 0.0, "", None
         files: list[str] = []
         if et:
             status = et["status"] or "unknown"
-            tp = bool(et["tests_passed"]) if et["tests_passed"] is not None else None
+            reward_g = float(et["reward_g"]) if et["reward_g"] is not None else 0.0
             verifier = str(et["verifier_output"] or "")
             verdict = et["reviewer_verdict"]
             try:
                 files = json.loads(et["files_written"] or "[]")
             except (ValueError, TypeError):
                 files = []
-            # a "success" status with failing tests is a false completion
-            false_completion = status == "success" and tp is False
+        # a "success" status with a non-positive reward = claimed done but not verified
+        false_completion = status == "success" and reward_g <= 0
         return MiniOrkTrace(
-            run_id=run_id, status=status, tests_passed=tp, false_completion=false_completion,
+            run_id=run_id, status=status, reward_g=reward_g, false_completion=false_completion,
             cost_usd=float(cost or 0.0), verifier_output=verifier, reviewer_verdict=verdict,
             files_written=files,
         )

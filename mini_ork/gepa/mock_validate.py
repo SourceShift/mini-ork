@@ -46,7 +46,7 @@ class MockAdapter(MiniOrkGEPAAdapter):
             scores.append(score)
             if traces is not None:
                 traces.append(MiniOrkTrace(
-                    run_id="mock", status="success", tests_passed=good,
+                    run_id="mock", status="success", reward_g=(1.0 if good else -1.0),
                     false_completion=not good, cost_usd=0.5,
                     verifier_output="" if good else "TS2345: Argument of type 'X' not assignable",
                     reviewer_verdict=None if good else "needs-revision", files_written=["src/a.ts"]))
