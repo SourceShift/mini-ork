@@ -404,15 +404,116 @@ def test_run_verifier_ref(tmp_path):
     assert ex._run_verifier_ref(str(empty), str(tmp_path / "e3"), cwd=str(tmp_path)) == 1  # vacuous
 
 
-def test_live_publisher_and_rollback_status(tmp_path):
+def test_live_publisher_and_rollback_status(tmp_path, monkeypatch):
+    monkeypatch.setenv("MO_ORACLE_GATES_AUTO", "0")  # isolate from the oracle-gate shell-out
     db = _seed_db(tmp_path, "pub"); _seed_task_run(db)
     rd = tmp_path / "run"; rd.mkdir()
     common = dict(root=str(REPO), run_dir=str(rd), plan_path=_plan(tmp_path),
                   task_class="code_fix", db=db, run_id="r1", dispatch_fn=_fake(""))
+    # No recipe → no artifact_contract.yaml. Bash returns 0 WITHOUT publishing
+    # (bin/mini-ork-execute:3017-3019). The old port stub wrongly always marked
+    # 'published' (panel finding 2); the faithful port leaves status unchanged.
     rc, _ = ex.dispatch_node(_fields("pub", "publisher"), **common)
-    assert rc == 0 and _sql(db, "SELECT status FROM task_runs WHERE id='r1';").stdout.strip() == "published"
+    assert rc == 0 and _sql(db, "SELECT status FROM task_runs WHERE id='r1';").stdout.strip() != "published"
+    # F4: rollback is best-effort (bash :3205-3223) — returns 0/done regardless of
+    # whether a prior version exists, and does NOT set task_runs.status. The upstream
+    # failure already fails the run. Was wrongly (1,'rolled_back') + status mutation.
     rc_rb, fr_rb = ex.dispatch_node(_fields("rb", "rollback"), **common)
-    assert rc_rb == 1 and fr_rb == "rolled_back"
+    assert rc_rb == 0 and fr_rb == "done"
+    assert _sql(db, "SELECT status FROM task_runs WHERE id='r1';").stdout.strip() != "rolled_back"
+
+
+def test_envsubst_blanks_unset_vars(monkeypatch):
+    # B2-C: envsubst-equivalent blanks unset vars (not literal like os.path.expandvars),
+    # else the publisher commits garbage ${VAR}-in-path files.
+    monkeypatch.setenv("MINI_ORK_DERIVED_RECIPE_NAME", "my-recipe")
+    monkeypatch.delenv("NOPE", raising=False)
+    assert ex._envsubst("docs/${MINI_ORK_DERIVED_RECIPE_NAME}/out.md") == "docs/my-recipe/out.md"
+    assert ex._envsubst("a/${NOPE}/b") == "a//b"  # blanked, not left literal
+
+
+def test_classic_reviewer_prompt_has_inputs_and_json_envelope(tmp_path):
+    # F2-B: the classic reviewer prompt must carry the assembled inputs block AND the
+    # JSON verdict envelope — without the envelope the LLM emits prose → unknown verdict
+    # → false rollback of a good run.
+    db = _seed_db(tmp_path, "rv"); _seed_task_run(db)
+    rd = tmp_path / "run"; rd.mkdir()
+    captured = {}
+
+    def cap(tc, nt, prompt):
+        captured["p"] = prompt
+        return 0, '{"verdict":"pass"}'
+
+    ex.dispatch_node(_fields("rev1", "reviewer"), root=str(REPO), run_dir=str(rd),
+                     plan_path=_plan(tmp_path), task_class="code_fix", db=db, run_id="r1",
+                     dispatch_fn=cap)
+    assert "Respond with JSON" in captured["p"]
+    assert "Reviewer inputs" in captured["p"]
+
+
+def test_researcher_recipe_specific_output_files(tmp_path):
+    # F1-B: recursive-validate-impl tier4_* and schema-judge-panel *_lens researcher
+    # nodes must write the exact tier4-*.md / judge-*.md the panel synthesizer globs,
+    # not context-<id>.json. Otherwise the panel gate sees zero lens inputs.
+    db = _seed_db(tmp_path, "rf"); _seed_task_run(db)
+    rd = tmp_path / "run"; rd.mkdir()
+    common = dict(root=str(REPO), run_dir=str(rd), plan_path=_plan(tmp_path),
+                  task_class="code_fix", db=db, run_id="r1", dispatch_fn=_fake("panel body"))
+    ex.dispatch_node(_fields("tier4_glm", "researcher"), recipe="recursive-validate-impl", **common)
+    assert (rd / "tier4-glm.md").is_file()
+    ex.dispatch_node(_fields("kimi_correctness_lens", "researcher"), recipe="schema-judge-panel", **common)
+    assert (rd / "judge-kimi-correctness.md").is_file()
+
+
+def test_verifier_no_artifact_does_not_fail_run(tmp_path):
+    # NEW-1: bash (:2899-2902) warns + does NOT return 1 when artifact_contract has
+    # no outputs — the run passes. The port previously returned (1,'error').
+    db = _seed_db(tmp_path, "vf"); _seed_task_run(db)
+    rd = tmp_path / "run"; rd.mkdir()
+    plan = tmp_path / "noout.json"; plan.write_text('{"artifact_contract": {"outputs": []}}')
+    rc, _ = ex.dispatch_node(_fields("v1", "verifier"), root=str(REPO), run_dir=str(rd),
+                             plan_path=str(plan), task_class="code_fix", db=db, run_id="r1",
+                             dispatch_fn=_fake(""))
+    assert rc == 0
+
+
+def test_publisher_panel_gate_blocks_without_approval(tmp_path, monkeypatch):
+    # F2/F3: the recursive-validate-impl publisher MUST block when panel-verdict.json
+    # is missing or not approved (bash :2986-3013). The old stub shipped regardless.
+    monkeypatch.setenv("MO_ORACLE_GATES_AUTO", "0")
+    db = _seed_db(tmp_path, "pg"); _seed_task_run(db)
+    rd = tmp_path / "run"; rd.mkdir()
+    common = dict(root=str(REPO), run_dir=str(rd), plan_path=_plan(tmp_path),
+                  task_class="code_fix", db=db, run_id="r1", dispatch_fn=_fake(""),
+                  recipe="recursive-validate-impl")
+    # missing panel verdict → block
+    rc, fr = ex.dispatch_node(_fields("pub", "publisher"), **common)
+    assert rc == 1 and fr == "verdict_fail"
+    # present but rejecting → still block
+    (rd / "panel-verdict.json").write_text('{"verdict":"reject"}')
+    rc2, fr2 = ex.dispatch_node(_fields("pub", "publisher"), **common)
+    assert rc2 == 1 and fr2 == "verdict_fail"
+    # approved → clears the panel gate (the recursive-validate-impl contract then
+    # errors on the absent source artifact in this minimal run dir — that's a
+    # downstream delivery error, NOT a gate block, so fr is not verdict_fail).
+    (rd / "panel-verdict.json").write_text('{"verdict":"approve"}')
+    _, fr3 = ex.dispatch_node(_fields("pub", "publisher"), **common)
+    assert fr3 != "verdict_fail"
+
+
+def test_reviewer_panel_gate_not_treated_as_synth(tmp_path, monkeypatch):
+    # F3: recursive-validate-impl/tier4_synth is a panel GATE, not an ungated synth —
+    # a reject verdict must fail the node (old code: "synth" in node_id → ungated pass).
+    monkeypatch.setenv("MINI_ORK_RUN_DIR", str(tmp_path / "run"))
+    db = _seed_db(tmp_path, "tg"); _seed_task_run(db)
+    rd = tmp_path / "run"; rd.mkdir()
+    common = dict(root=str(REPO), run_dir=str(rd), plan_path=_plan(tmp_path),
+                  task_class="code_fix", db=db, run_id="r1",
+                  recipe="recursive-validate-impl",
+                  dispatch_fn=_fake('{"verdict":"fail"}'))
+    rc, fr = ex.dispatch_node(_fields("tier4_synth", "reviewer"), **common)
+    assert rc == 1 and fr == "verdict_fail"
+    assert (rd / "panel-verdict.json").is_file()  # writes panel-verdict.json, not synthesis.md
 
 
 def test_main_live_run_wired(tmp_path, monkeypatch):
@@ -439,6 +540,12 @@ def test_main_live_run_wired(tmp_path, monkeypatch):
     assert (rd / "review-rev1.json").exists()            # reviewer wrote its output
     assert (rd / "verdict.json").exists()                # run-level verdict emitted
     assert _sql(db, "SELECT status FROM task_runs WHERE id='run-x';").stdout.strip() in ("executing", "reviewing", "published")
+    # F3: the live path must now write reward-stamped execution_traces rows — the
+    # GRPO/reflect learning-loop signal that was ZERO under python before the trace_fn
+    # wiring. researcher + reviewer each stamp a row with a non-null reward_value.
+    n = _sql(db, "SELECT COUNT(*) FROM execution_traces "
+                 "WHERE run_id='run-x' AND reward_value IS NOT NULL;").stdout.strip()
+    assert int(n) >= 2
 
 
 # ── orchestration backbone parity (NODE_IDS + --dry-run) ──

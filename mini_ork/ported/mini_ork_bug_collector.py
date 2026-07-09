@@ -92,15 +92,6 @@ _USAGE_BLOCK = (
     "  --task-class     classification for the originating run\n"
     "\n"
     "Returns 0 always (best-effort; never fails the caller's run).\n"
-    "\n"
-    "set -uo pipefail\n"
-    "\n"
-    'MINI_ORK_ROOT="${MINI_ORK_ROOT:-$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)}"\n'
-    "export MINI_ORK_ROOT\n"
-    'MINI_ORK_HOME="${MINI_ORK_HOME:-$MINI_ORK_ROOT/.mini-ork}"\n'
-    "export MINI_ORK_HOME\n"
-    'STATE_DB="${MINI_ORK_DB:-$MINI_ORK_HOME/state.db}"\n'
-    "export STATE_DB\n"
 )
 
 
