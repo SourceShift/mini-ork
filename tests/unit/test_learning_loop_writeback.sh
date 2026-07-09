@@ -46,6 +46,7 @@ source "$LIB_PIPELINE"
 # miner emits one pattern. 2 traces in (code_fix, success) → does NOT emit.
 python3 - "$TEST_DB" <<'PY'
 import sqlite3, sys, time
+from datetime import datetime, timedelta, timezone
 db = sys.argv[1]
 con = sqlite3.connect(db)
 con.execute("PRAGMA busy_timeout=5000")
@@ -68,7 +69,11 @@ con.execute("""
         created_at INTEGER
     )
 """)
-now_iso = "2026-07-01T12:00:00.000Z"
+# created_at must be RELATIVE to now — the miner filters `created_at >= now-<window>`
+# (pattern_store.sh:216). A hardcoded absolute date silently ages out of the default
+# 7d window and the miner returns 0 rows (the time-bomb that broke this test once real
+# time crossed 7 days past the old literal). Seed 1h ago so it's always in-window.
+now_iso = (datetime.now(timezone.utc) - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
 rows = [
     ("tr-fix-fail-1", "code_fix", "failure", now_iso),
     ("tr-fix-fail-2", "code_fix", "failure", now_iso),
