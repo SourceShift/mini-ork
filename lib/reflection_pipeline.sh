@@ -44,6 +44,10 @@ reflection_extract_gradients() {
   # rows/day. Default cap MO_REFLECTION_BATCH=500 traces/run; rerun
   # reflection_extract_gradients with newer since_ts to process more.
   local _batch="${MO_REFLECTION_BATCH:-500}"
+  # AC2: skip framework-internal traces (task_class starts with `__`,
+  # e.g. `__reflect__`). These carry only "what reflect did" payload,
+  # not a real signal to learn from — and bin/mini-ork-reflect already
+  # counts `task_class != '__reflect__'` itself, so we must agree here.
   trace_ids="$(python3 - "${MINI_ORK_DB:?MINI_ORK_DB unset}" "$since_ts" "$_batch" <<'PY'
 import sqlite3, json, sys
 con = sqlite3.connect(sys.argv[1])
@@ -51,9 +55,16 @@ con.execute("PRAGMA busy_timeout=5000")  # v0.2-pt7 F-11
 # v0.2-pt11 (D-039 follow): execution_traces.created_at is TEXT (ISO-8601
 # per migration 0010 default), caller passes unix-ts INT — compare via
 # strftime('%s', created_at) cast to int.
+# Gr1 fix (kickoff): exclude framework-self traces (task_class LIKE
+# '\_\_%' ESCAPE '\\' — the only `__*` corpus in the repo is `__reflect__`
+# today, but the pattern generalizes if more appear). Lifted out of the
+# LIKE clause inline so future maintainers see the policy.
 rows = con.execute(
-    "SELECT trace_id FROM execution_traces WHERE CAST(strftime('%s', created_at) AS INTEGER) >= ? ORDER BY created_at LIMIT ?",
-    (int(sys.argv[2]), int(sys.argv[3]))
+    "SELECT trace_id, task_class FROM execution_traces"
+    " WHERE CAST(strftime('%s', created_at) AS INTEGER) >= ?"
+    "   AND (task_class IS NULL OR task_class NOT LIKE '\\_%' ESCAPE '\\')"
+    " ORDER BY created_at LIMIT ?",
+    (int(sys.argv[2]), int(sys.argv[3])),
 ).fetchall()
 con.close()
 for r in rows:
@@ -61,9 +72,19 @@ for r in rows:
 PY
 )"
 
-  local extracted=0
+  local extracted=0 skipped_watermark=0
   while IFS= read -r tid; do
     [[ -z "$tid" ]] && continue
+    # AC1: idempotent re-extract. If a gradient_records row already names
+    # this trace_id as evidence, skip — re-running with an overlapping
+    # `--since` window must not double-insert (kickoff: per-trace watermark
+    # against `gradient_records.evidence`, no schema migration).
+    if declare -f _gradient_check_watermark >/dev/null 2>&1; then
+      if _gradient_check_watermark "$tid" 2>/dev/null; then
+        (( skipped_watermark++ )) || true
+        continue
+      fi
+    fi
     while IFS= read -r gradient; do
       [[ -z "$gradient" ]] && continue
       gradient_store "$gradient" >/dev/null || true
@@ -75,6 +96,10 @@ PY
     # after one trace.
     done < <(gradient_extract "$tid" </dev/null || true)
   done <<< "$trace_ids"
+
+  if [ "$skipped_watermark" -gt 0 ]; then
+    echo "reflection_extract_gradients: skipped ${skipped_watermark} already-extracted trace(s) (watermark)" >&2
+  fi
 
   echo "reflection_extract_gradients: extracted ${extracted} gradients since ${since_ts}" >&2
 }
@@ -92,7 +117,7 @@ reflection_deduplicate() {
   local _batch="${MO_DEDUP_BATCH:-10000}"
   local _fuzzy="${MO_DEDUP_FUZZY:-0.55}"
   python3 - "${MINI_ORK_DB:?MINI_ORK_DB unset}" "$gradients_table" "$_batch" "$_fuzzy" <<'PY'
-import sqlite3, sys
+import sqlite3, re, sys
 from difflib import SequenceMatcher
 
 db, tbl, batch, fuzzy = sys.argv[1], sys.argv[2], int(sys.argv[3]), float(sys.argv[4])
@@ -109,32 +134,70 @@ rows = con.execute(f"""
     LIMIT ?
 """, (batch,)).fetchall()
 
+# Gr2 fix: legacy (target, signal) dedup missed same-target reviewers
+# whose only difference was per-trace token noise (durations like
+# "2.7min" vs "8.9min", costs like "$1.62" vs "$5.10", trace ids).
+# SequenceMatcher on raw signal chars scored such pairs at ~0.40 — far
+# below the 0.55 fuzzy floor — so the table grew ~5x per lifecycle.
+# Replace lexical signal with a normalized SEMANTIC SIGNATURE that
+# strips the noisy token classes while leaving prose untouched, then
+# key merge on (target, semantic_signature). Calibration tokens:
+#   - numerals: any run of digits, optionally with decimal point
+#   - currency: $<digits>
+#   - durations: <n>s | <n>min | <n>ms | <n>h
+#   - ISO timestamps: YYYY-MM-DD[ HH:MM:SS]
+#   - UUIDs: 8-4-4-4-12 hex with dashes
+#   - trace ids: trace_<hex> (>=8 hex chars) and tr-<hex>
+#   - bare hex runs >= 8 chars (catches tail snippets from truncated ids)
+# `suggested_change` is concatenated for context — the same prescription
+# phrased against different signals is one lesson, not many.
+_NUM = r"\d+(?:\.\d+)?"
+_CUR = r"\$\d+(?:\.\d+)?"
+_DUR = r"\d+(?:\.\d+)?\s*(?:ms|s|sec|secs|min|mins|h|hr|hrs|hours?)"
+_ISO = r"\d{4}-\d{2}-\d{2}(?:[ T]\d{2}:\d{2}(?::\d{2})?)?"
+_UUID = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+_TRACE = r"(?:trace|tr)_[0-9a-f]{8,}"
+_HEXLONG = r"\b[0-9a-f]{8,}\b"
+_NOISE = re.compile(
+    rf"({_CUR}|{_DUR}|{_ISO}|{_UUID}|{_TRACE}|{_HEXLONG}|{_NUM})",
+    re.IGNORECASE,
+)
+_WS = re.compile(r"\s+")
+
+def _semantic_signature(text):
+    """Lower-cased, noise-stripped text suitable for dedup keying."""
+    if not text:
+        return ""
+    s = _NOISE.sub(" ", text.lower())
+    s = _WS.sub(" ", s).strip()
+    return s
+
 to_delete = []
 
-# Pass 1 — exact (target, signal) merge, global across task_classes.
+# Pass 1 — exact (target, semantic_signature) merge.
 # Rows arrive confidence-desc so the first seen per key is the keeper.
+# The semantic signature folds trace-token noise (durations/costs/ids)
+# so reviewer rows from different traces with the same target collapse
+# to a single representative. Prose (suggested_change intent) is
+# preserved verbatim, so distinct intents still key apart.
 seen = {}
 survivors = []
 for row in rows:
-    gid, tgt, sig = row[0], row[1], row[2]
-    key = (tgt, sig)
+    gid, tgt, sig, chg = row[0], row[1], row[2], row[3]
+    sig_key = _semantic_signature(f"{sig} {chg}")
+    key = (tgt, sig_key)
     if key in seen:
         to_delete.append(gid)
     else:
         seen[key] = gid
         survivors.append(row)
 
-# Pass 2 — fuzzy merge within (task_class, target) groups. Gradients from
-# repeated reflect runs phrase the same lesson slightly differently
-# ("verifier_output is an empty object '{}'" vs "verifier_output is an
-# empty object, meaning..."); exact-match dedup never catches these so the
-# table grows by ~5 near-identical rows per lifecycle. Greedy
-# confidence-desc scan: a row whose SIGNAL is similar to an already-kept
-# representative is deleted. Calibrated on live data 2026-06-10:
-# signal-only char ratio separates cleanly (cross-lesson pairs max 0.48,
-# same-lesson rephrases >= 0.55); including suggested_change in the
-# comparison muddied it (same-lesson pairs dropped to ~0.60 because
-# prescription phrasing diverges more than diagnosis phrasing).
+# Pass 2 — fuzzy merge within (task_class, target) groups. Operates on
+# the SAME semantic_signature so the difflib ratio compares normalized
+# text (no trace-token blow-up). Greedy confidence-desc scan: a row
+# whose signature is similar to an already-kept representative is
+# deleted. Same-target pairs MUST be compared (kickoff: prior pass
+# tokenized only `signal`, missing cross-trace same-target reviewers).
 groups = {}
 for row in survivors:
     groups.setdefault((row[5], row[1]), []).append(row)
@@ -142,11 +205,16 @@ for row in survivors:
 fuzzy_deleted = 0
 for grp in groups.values():
     kept_texts = []
-    for gid, _tgt, sig, _change, _conf, _tc in grp:
-        text = sig
+    for gid, tgt, sig, chg, _conf, _tc in grp:
+        text = _semantic_signature(f"{sig} {chg}")
+        if not text:
+            kept_texts.append(text or "")
+            continue
         sm = SequenceMatcher(b=text, autojunk=False)
         dup = False
         for kt in kept_texts:
+            if not kt:
+                continue
             sm.set_seq1(kt)
             if sm.real_quick_ratio() >= fuzzy and sm.quick_ratio() >= fuzzy \
                and sm.ratio() >= fuzzy:
