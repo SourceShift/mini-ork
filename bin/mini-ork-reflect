@@ -16,6 +16,14 @@
 #   --lane <lane>         Resolve reflection through agents.yaml lane mapping
 #   --dry-run             Print what would be analyzed; do not invoke LLM
 #   --help
+#
+# Idempotency:
+#   Re-running reflect with an overlapping `--since` window is safe.
+#   reflection_extract_gradients carries a per-trace watermark against
+#   gradient_records.evidence — a trace already linked to a gradient is
+#   skipped, so re-extraction never duplicates rows. Framework-self
+#   traces (task_class starting with `__`, e.g. `__reflect__`) are
+#   filtered out before the LLM dispatch and contribute no gradient.
 
 set -Eeuo pipefail
 
