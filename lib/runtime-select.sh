@@ -5,14 +5,15 @@
 # mini_ork/ported/mini_ork_<name>.py (bin/mini-ork → mini_ork_cli) behind live-bash
 # parity gates. This shim lets a single env flag flip the runtime:
 #
-#   MINI_ORK_RUNTIME=bash    (default) — run the bash entrypoint as before.
-#   MINI_ORK_RUNTIME=python            — exec the ported module instead.
+#   MINI_ORK_RUNTIME=python  (default) — exec the ported module (the live runtime).
+#   MINI_ORK_RUNTIME=bash              — run the legacy bash entrypoint (escape hatch).
 #
-# NOTE: default stays bash. Flipping to python-default was attempted (#156) but the
-# whole-framework flip surfaced real divergences in the not-panel-verified ported
-# flows (spawn, recursive orchestration, run lifecycle, execute no-plan exit codes,
-# telemetry gates). Only the execute dispatch ENGINE is deeply verified (4 panels).
-# The flip needs those flows fixed + verified first; until then python is opt-in.
+# The default is python: the first flip attempt (#156) surfaced real divergences in
+# the non-dispatch-engine ported flows (spawn child kickoff, recursive orchestration,
+# execute no-plan exit codes, needs_answers gate) + a shim exec-on-source bug — all
+# fixed here and re-gated by the full CI suite running under python. Fall back to bash
+# per-command with MINI_ORK_RUNTIME=bash. The shim still only delegates when the ported
+# module exists, so any not-yet-ported entrypoint transparently degrades to bash.
 #
 # Each entrypoint sources this and calls, right after MINI_ORK_ROOT is set:
 #   mo_runtime_maybe_delegate "${BASH_SOURCE[0]}" "$@"
@@ -26,7 +27,7 @@
 # classify/plan/execute sub-invocations also delegate to Python.
 
 mo_runtime_maybe_delegate() {
-  [ "${MINI_ORK_RUNTIME:-bash}" = "python" ] || return 0
+  [ "${MINI_ORK_RUNTIME:-python}" = "python" ] || return 0
   # Only delegate when the entrypoint is EXECUTED, not SOURCED. Bash unit tests
   # (and any code) `source bin/mini-ork-*` to reuse its functions; the exec below
   # would hijack that source and run python instead of loading the functions. The
