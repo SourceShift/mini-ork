@@ -110,27 +110,35 @@ def _seed_sqlite(path: Path, rows: list[dict]) -> None:
 
 
 def _patch_dispatch(monkeypatch):
-    """Patch ``mini_ork.optimize.gepa.dispatch_model`` to return a
-    deterministic improving candidate. Mirrors the fixture in
-    ``test_gepa_optimizer_py.py`` so we don't duplicate logic.
+    """Patch ``mini_ork.optimize.gepa.dispatch_model`` to route both
+    reflector and judge calls deterministically.
     """
 
     def _patch(reflect_fn):
         def stub_dispatch(request):
             try:
                 blob = json.loads(request.prompt)
-                candidate = blob.get("candidate", {})
-                component_key = blob.get(
-                    "component_to_rewrite", "instruction"
-                )
-                new_candidate = reflect_fn(
-                    candidate,
-                    blob.get("feedback", []),
-                    component_key,
-                )
-                response_text = (
-                    "```json\n" + json.dumps(new_candidate) + "\n```"
-                )
+                instruction = blob.get("instruction", "")
+                if "mutated prompt candidate" in instruction:
+                    examples = blob.get("held_out_examples", [])
+                    candidate = blob.get("candidate", {})
+                    score = 1.0 if TARGET_TOKEN in json.dumps(candidate) else 0.0
+                    response_text = json.dumps(
+                        {"scores": [score] * len(examples)}
+                    )
+                else:
+                    candidate = blob.get("candidate", {})
+                    component_key = blob.get(
+                        "component_to_rewrite", "instruction"
+                    )
+                    new_candidate = reflect_fn(
+                        candidate,
+                        blob.get("feedback", []),
+                        component_key,
+                    )
+                    response_text = (
+                        "```json\n" + json.dumps(new_candidate) + "\n```"
+                    )
             except Exception:
                 response_text = "```json\n{}\n```"
             return DispatchResult(
@@ -394,7 +402,7 @@ def test_active_path_run_suggestion_emits_pattern_record_or_artifact(
     ):
         assert key in suggestion, f"missing key in suggestion: {key}"
     assert suggestion["output_type"] == "prompt_change"
-    assert suggestion["validity"] in {"valid", "insufficient_evidence"}
+    assert suggestion["validity"] in {"valid", "no_improvement", "insufficient_evidence"}
     assert suggestion["iteration_count"] == 3
     assert suggestion["full_eval_count"] <= 3
     # pattern_id matches gepa- prefix for downstream filtering
