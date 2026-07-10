@@ -423,7 +423,19 @@ def main(argv: list[str] | None = None) -> int:
     sub = argv[0] if argv else "summary"
     rest = argv[1:]
     if sub == "show":
-        out = show(*rest)
+        # Parse `show <recipe> [--task-class X]` — the flag must not be splatted as a
+        # positional arg (bash treats --task-class as a named filter, not a 2nd recipe).
+        recipe = ""
+        task_class = None
+        i = 0
+        while i < len(rest):
+            if rest[i] == "--task-class" and i + 1 < len(rest):
+                task_class = rest[i + 1]; i += 2
+            else:
+                if not recipe:
+                    recipe = rest[i]
+                i += 1
+        out = show(recipe, task_class)
         sys.stdout.write(out)
         return 0
     if sub == "conductor-history":
