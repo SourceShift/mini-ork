@@ -81,10 +81,12 @@ class MiniOrkGEPAAdapter(GEPAAdapter[MiniOrkTask, MiniOrkTrace, MiniOrkOutput]):
         components: dict[str, str] | None = None,
         run_timeout_s: int = 1800,
         honesty_penalty: float = 0.6,
+        target_cwd: str | Path | None = None,
     ):
         self.root = Path(mini_ork_root)
         self.recipe = recipe
         self.state_db = str(state_db)
+        self.target_cwd = str(target_cwd) if target_cwd else None
         self.components = components or DEFAULT_COMPONENTS
         self.run_timeout_s = run_timeout_s
         self.honesty_penalty = honesty_penalty
@@ -186,6 +188,8 @@ class MiniOrkGEPAAdapter(GEPAAdapter[MiniOrkTask, MiniOrkTrace, MiniOrkOutput]):
             "MINI_ORK_ROOT": str(self.root),
             "MINI_ORK_NONINTERACTIVE": "1",
         }
+        if self.target_cwd:
+            env["MO_TARGET_CWD"] = self.target_cwd   # codex refuses to edit the framework tree
         subprocess.run(
             [str(self.root / "bin" / "mini-ork"), "run", recipe_dir.name, task.kickoff],
             env=env, cwd=self.root, timeout=self.run_timeout_s,
