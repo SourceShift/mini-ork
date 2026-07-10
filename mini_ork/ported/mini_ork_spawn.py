@@ -361,9 +361,15 @@ def spawn(
         "MINI_ORK_PARENT_RUN_ID": parent_run,
         "MINI_ORK_ALLOW_CHILD_SPAWN": str(allow_flag),
     }
-    cli_target = recipe if recipe else paths["child_kickoff"]
     cli = os.path.join(resolved_root, "bin", "mini-ork")
-    cli_argv = [cli, "run", cli_target] if recipe else [cli, "run", cli_target]
+    # bash bin/mini-ork-spawn:110-129 — WITH a recipe: `run <recipe> <kickoff>`;
+    # WITHOUT: `run <kickoff>`. The kickoff arg is mandatory in both; dropping it
+    # (the old `run <recipe>` with no kickoff) left the child run with nothing to
+    # plan → it failed and never wrote plan.json.
+    if recipe:
+        cli_argv = [cli, "run", recipe, paths["child_kickoff"]]
+    else:
+        cli_argv = [cli, "run", paths["child_kickoff"]]
     proc = subprocess.run(cli_argv, cwd=paths["child_workspace"], env=child_env,
                           capture_output=True, text=True)
     child_exit = proc.returncode

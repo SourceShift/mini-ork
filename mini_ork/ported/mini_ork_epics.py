@@ -230,10 +230,31 @@ def _priority(epic_id: str, value, db: str) -> int:
     return _priority(epic_id, None, db)
 
 
+def _ensure_priority_column(db):
+    """Idempotent epics.priority migration (bash bin/mini-ork-epics:40-48). bash runs
+    this on EVERY invocation so list/priority/scheduler queries never crash on an older
+    epics schema; the port skipped it and _list's `SELECT ... priority` crashed. Only
+    alters when the table exists but lacks the column. Best-effort."""
+    if not db or not os.path.isfile(db):
+        return
+    try:
+        con = sqlite3.connect(db)
+        try:
+            cols = {r[1] for r in con.execute("PRAGMA table_info(epics)").fetchall()}
+            if cols and "priority" not in cols:
+                con.execute("ALTER TABLE epics ADD COLUMN priority INTEGER NOT NULL DEFAULT 0")
+                con.commit()
+        finally:
+            con.close()
+    except sqlite3.Error:
+        pass
+
+
 def main(argv: list[str] | None = None, *, db: str | None = None, root: str | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     root = root or os.environ.get("MINI_ORK_ROOT") or os.getcwd()
     db = _resolve_db(db)
+    _ensure_priority_column(db)
     sub = argv[0] if argv else "help"
     rest = argv[1:]
     if sub == "ingest":
