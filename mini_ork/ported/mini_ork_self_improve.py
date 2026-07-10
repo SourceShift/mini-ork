@@ -297,7 +297,20 @@ def main(argv=None, *, root=None, dispatch=None) -> int:
             it = 0
 
     # Outer loop
+    kill_flag = os.path.join(home, "state", ".self-improve-kill")
     while True:
+        # Fix C (bash bin/mini-ork-self-improve:397-406): poll the UI kill-flag at each
+        # iteration boundary — the /kill endpoint touches it; halt the outer loop and
+        # CONSUME the flag. The port skipped this, so the runner ran through the kill.
+        if os.path.isfile(kill_flag):
+            print("==============================================================")
+            print(f"[kill-flag] {kill_flag} present — UI requested outer-loop halt")
+            print("==============================================================")
+            try:
+                os.remove(kill_flag)
+            except OSError:
+                pass
+            break
         now = int(time.time())
         if now >= hard_deadline:
             print(f"[hard-cap] reached after {seconds_to_hms(now - start)}")
