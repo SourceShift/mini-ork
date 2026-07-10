@@ -239,6 +239,8 @@ fi
 # (MO_OPTIMIZER unset) leaves this block fully skipped: no python
 # invocation, no DB write, output byte-identical to the pre-R4b reflect.
 if [ "${MO_OPTIMIZER:-}" = "gepa" ]; then
+  MO_OPTIMIZER_MODEL="${MO_OPTIMIZER_MODEL:-minimax}"
+  export MO_OPTIMIZER_MODEL
   _GEPA_TASK_CLASS="${MO_OPTIMIZER_TASK_CLASS:-${TASK_CLASS_FILTER:-}}"
   _GEPA_RECIPE="${MINI_ORK_RECIPE:-${_GEPA_TASK_CLASS:-default}}"
   if [ -z "$_GEPA_TASK_CLASS" ] && [ "${MO_OPTIMIZER_ALLOW_DEFAULT:-0}" != "1" ]; then
@@ -250,7 +252,12 @@ import json, os, sys
 tc, recipe, db = sys.argv[1], sys.argv[2], sys.argv[3]
 from mini_ork.optimize import run_suggestion
 try:
-    print(json.dumps(run_suggestion(db_path=db, task_class=tc or "default", recipe=recipe or tc or "default")))
+    print(json.dumps(run_suggestion(
+        db_path=db,
+        task_class=tc or "default",
+        recipe=recipe or tc or "default",
+        model=os.environ.get("MO_OPTIMIZER_MODEL", "minimax"),
+    )))
 except Exception as e:
     print(json.dumps({"validity": "error", "description": f"gepa error: {e}", "output_type": "other"}))
 PY
@@ -261,7 +268,7 @@ PY
       _GEPA_FULL_EVAL=$(printf '%s' "$_GEPA_SUGGESTION_JSON" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("full_eval_count",0))' 2>/dev/null || echo 0)
       _GEPA_ART_DIR="${MINI_ORK_HOME}/optimizer"
       mkdir -p "$_GEPA_ART_DIR" 2>/dev/null || true
-      if [ "$_GEPA_VALIDITY" = "valid" ] && [ -n "$_GEPA_PATTERN_ID" ] \
+      if [ "$_GEPA_VALIDITY" != "error" ] && [ -n "$_GEPA_PATTERN_ID" ] \
          && [ -f "$MINI_ORK_ROOT/lib/pattern_store.sh" ]; then
         _require_lib pattern_store
         pattern_store "$_GEPA_SUGGESTION_JSON" >/dev/null 2>&1 || true
@@ -269,7 +276,15 @@ PY
       if [ -n "$_GEPA_PATTERN_ID" ]; then
         printf '%s\n' "$_GEPA_SUGGESTION_JSON" > "${_GEPA_ART_DIR}/${_GEPA_PATTERN_ID}.json" 2>/dev/null || true
       fi
-      echo "  [optimizer] gepa suggestion: ${_GEPA_PATTERN_ID:-<none>} full_eval_count=${_GEPA_FULL_EVAL:-0}"
+      case "$_GEPA_VALIDITY" in
+        insufficient_evidence)
+          echo "  [optimizer] gepa insufficient_evidence: ${_GEPA_PATTERN_ID:-<none>} (no execution_traces rows for task_class=${_GEPA_TASK_CLASS:-default}; suggestion not applied)" >&2
+          ;;
+        no_improvement)
+          echo "  [optimizer] gepa no_improvement: ${_GEPA_PATTERN_ID:-<none>} (zero accepted mutations; suggestion not applied)" >&2
+          ;;
+      esac
+      echo "  [optimizer] gepa suggestion: ${_GEPA_PATTERN_ID:-<none>} validity=${_GEPA_VALIDITY:-unknown} model=${MO_OPTIMIZER_MODEL} full_eval_count=${_GEPA_FULL_EVAL:-0}"
     fi
   fi
 fi
