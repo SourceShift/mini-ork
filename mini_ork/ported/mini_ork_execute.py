@@ -646,6 +646,30 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
             else:
                 sys.stderr.write(f"Unexpected argument: {a}\n"); return 2
 
+    # Resolve plan path (bash :957-973): empty → newest plan.json in $MINI_ORK_HOME/runs,
+    # then REQUIRE it. A missing or nonexistent plan must exit 2 with a message, not a
+    # Python traceback (nodes_from_plan would open('') / a bad path). bash requires a
+    # plan even in workflow mode (it's used for run_dir / task_run_id / plan_content).
+    home = os.environ.get("MINI_ORK_HOME") or os.path.join(os.getcwd(), ".mini-ork")
+    if not plan_path:
+        newest, newest_mtime = "", -1.0
+        for dirpath, _dirs, files in os.walk(os.path.join(home, "runs")):
+            if "plan.json" in files:
+                p = os.path.join(dirpath, "plan.json")
+                try:
+                    m = os.path.getmtime(p)
+                except OSError:
+                    continue
+                if m > newest_mtime:
+                    newest, newest_mtime = p, m
+        plan_path = newest
+    if not plan_path:
+        sys.stderr.write("No plan.json found. Run: mini-ork plan <kickoff.md>\n")
+        return 2
+    if not os.path.isfile(plan_path):
+        sys.stderr.write(f"plan not found: {plan_path}\n")
+        return 2
+
     workflow = os.environ.get("MINI_ORK_WORKFLOW", "")
     if not workflow and os.environ.get("MINI_ORK_RECIPE"):
         workflow = os.path.join(root, "recipes", os.environ["MINI_ORK_RECIPE"], "workflow.yaml")
