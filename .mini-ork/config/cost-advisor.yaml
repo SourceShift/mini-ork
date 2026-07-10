@@ -41,6 +41,6 @@ classifier:
   # The classifier itself is a CHEAP LLM call. It must never be the
   # expensive tier — that would defeat the purpose. Recursion guard:
   # the classifier never invokes the advisor itself.
-  lane: deepseek_lens
+  lane: kimi_lens   # was deepseek_lens; deepseek disabled (insufficient balance + not an approved lane)
   max_input_tokens: 300
   max_output_tokens: 100
