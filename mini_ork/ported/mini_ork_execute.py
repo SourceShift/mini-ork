@@ -675,6 +675,11 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
         workflow = os.path.join(root, "recipes", os.environ["MINI_ORK_RECIPE"], "workflow.yaml")
     run_dir = os.path.dirname(plan_path) if plan_path else "."
 
+    # Pre-dispatch execute gate (bash :1136-1203): refuse to dispatch a
+    # needs_answers plan (exit 6, records the block). Before node building.
+    if _execute_gate_check(plan_path, run_dir, dry_run):
+        return 6
+
     # NODE_IDS: workflow.yaml source wins; else plan.json.decomposition.
     if workflow and os.path.isfile(workflow):
         node_source = "workflow.yaml"
@@ -1195,6 +1200,67 @@ def _envsubst(s):
     ${VAR}-in-path files, the OSS-leak-garbage class the bash guard prevents)."""
     return re.sub(r'\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)',
                   lambda m: os.environ.get(m.group(1) or m.group(2), ''), s)
+
+
+def _execute_gate_check(plan_path, run_dir, dry_run):
+    """Port of bash execute pre-dispatch gate (:1142-1203). A plan with
+    plan_status=needs_answers AND real human_questions must NOT dispatch: print the
+    refusal, write blocked.json, mark the run failed/BLOCKED, emit an execute_blocked
+    run_event, and signal exit 6. Returns True when blocked. Opt out via
+    MINI_ORK_EXECUTE_GATE=0; skipped under dry-run."""
+    if os.environ.get("MINI_ORK_EXECUTE_GATE", "1") != "1" or dry_run:
+        return False
+    try:
+        p = json.load(open(plan_path))
+    except Exception:
+        return False
+    status = p.get("plan_status") or ""
+    questions = p.get("human_questions") or []
+    # A needs_answers plan with ZERO questions is a contradiction — do not block.
+    if status != "needs_answers" or not questions:
+        return False
+    gate_info = {"plan_status": status, "blocked_by": p.get("blocked_by") or "unknown",
+                 "human_questions": questions}
+    print("[blocked] plan_status=needs_answers — refusing to dispatch "
+          "(MINI_ORK_EXECUTE_GATE=0 to override)")
+    print(f"  blocked_by: {gate_info['blocked_by']}")
+    for q in questions:
+        print(f"  question: {q}")
+    try:
+        with open(os.path.join(run_dir, "blocked.json"), "w") as f:
+            f.write(json.dumps(gate_info) + "\n")
+    except OSError:
+        pass
+    # Resolve db with the same MINI_ORK_HOME/state.db fallback bash uses (:958) —
+    # callers set MINI_ORK_HOME but not always MINI_ORK_DB.
+    home = os.environ.get("MINI_ORK_HOME") or os.path.join(os.getcwd(), ".mini-ork")
+    db = os.environ.get("MINI_ORK_DB") or os.path.join(home, "state.db")
+    run_id = (os.environ.get("MINI_ORK_RUN_ID") or os.environ.get("MINI_ORK_TASK_RUN_ID")
+              or os.path.basename(run_dir))
+    if db and os.path.isfile(db) and run_id:
+        try:
+            now = int(time.time())
+            con = sqlite3.connect(db, timeout=5.0)
+            con.execute("PRAGMA busy_timeout = 5000")
+            try:
+                con.execute(
+                    "UPDATE task_runs SET status='failed', verdict=COALESCE(verdict,'BLOCKED'), "
+                    "updated_at=?, ended_at=COALESCE(ended_at,?), "
+                    "notes=COALESCE(notes || '; ','') || "
+                    "'execute gate: plan_status=needs_answers — nothing dispatched' "
+                    "WHERE id=? AND status NOT IN ('published','rolled_back','failed')",
+                    (now, now, run_id))
+                con.execute(
+                    "INSERT INTO run_events(event_id, run_id, event_type, payload_json, created_at) "
+                    "VALUES (?,?,?,?,?)",
+                    (f"evt-execute_blocked-{now}", run_id, "execute_blocked",
+                     json.dumps(gate_info), now))
+                con.commit()
+            finally:
+                con.close()
+        except sqlite3.Error:
+            pass
+    return True
 
 
 def _make_trace_fn(task_class, db, run_id):
