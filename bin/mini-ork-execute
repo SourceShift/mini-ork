@@ -2017,7 +2017,16 @@ _mo_policy_route_lane() {
     static_hybrid)
       _mo_learning_static_lane "$node_type" "$current_lane" ;;
     learning_governed)
-      _mo_learning_governed_lane "$node_type" "$(_mo_learning_static_lane "$node_type" "$current_lane")" ;;
+      # Router-monoculture fix: respect a recipe-pinned lane (current_lane != node_type)
+      # — deliberate cross-family panel diversity or a model-strength pin. The governed
+      # router must NOT override it with the single global-slice winner (that collapses 4
+      # same-node-type panel researchers onto one lane). Learning governs only UNPINNED
+      # nodes; pinned nodes keep their lane (matches _mo_learning_static_lane).
+      if [ "$current_lane" != "$node_type" ]; then
+        printf '%s\n' "$current_lane"
+      else
+        _mo_learning_governed_lane "$node_type" "$(_mo_learning_static_lane "$node_type" "$current_lane")"
+      fi ;;
     trace_governed)
       # Cheap-first execution with expensive review/recovery. FAIL_COUNT is
       # the executor's prefix-trace signal: verifier/reviewer failures before
