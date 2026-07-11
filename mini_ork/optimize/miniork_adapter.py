@@ -6,16 +6,15 @@ loop in ``gepa.py``) into a real data source — the ``execution_traces`` and
 reflect hook emits is grounded in observed, scored, prior runs rather than
 fresh LLM evals.
 
-The adapter is offline: ``evaluate()`` reads cached ``reward_value`` rows
-keyed by ``prompt_version_hash``; it never dispatches a model. This is the
-hard constraint from the task brief. For hash mismatches we fall back to
-the parent's cached mean score — i.e. "we have no evidence this candidate
-is different from its parent, so treat it as parity" — instead of silently
-defaulting to a fabricated number.
+The adapter is offline for known prompt hashes: ``evaluate()`` reads cached
+``reward_value`` rows keyed by ``prompt_version_hash`` and never dispatches a
+model on that fast path. Mutated prompt text intentionally drops the hash and
+uses ``held_out_score`` on the same cached rows as held-out examples.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sqlite3
@@ -24,7 +23,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from .gepa import optimize
+from .gepa import held_out_score, optimize
 
 
 class MiniOrkGepaAdapter:
@@ -38,10 +37,9 @@ class MiniOrkGepaAdapter:
     unpopulated). The PRM is the source of truth — ``reward_value`` is the
     offline reward signal.
 
-    ``evaluate(batch, candidate)`` scores the candidate by matching
-    ``candidate.get('prompt_version_hash')`` to cached rows; rows that
-    don't match fall back to the parent's cached mean (so a brand-new
-    prompt_hash is treated as parity rather than inventing a number).
+    ``evaluate(batch, candidate)`` scores cached candidates by matching
+    ``candidate.get('prompt_version_hash')`` to cached rows. Hashless mutated
+    candidates are scored by ``held_out_score`` against the same cached rows.
 
     ``make_reflective_dataset()`` surfaces each example's
     ``verifier_output`` and ``reviewer_verdict`` strings as feedback dicts
@@ -55,12 +53,18 @@ class MiniOrkGepaAdapter:
         task_class: str,
         recipe: str = "",
         n: int = 20,
+        evaluator_model: str | None = None,
     ) -> None:
         self.task_class = task_class
         self.recipe = recipe
         self.n = n
         self.full_eval_count = 0
         self.iteration_count = 0
+        self.online_eval_count = 0
+        self.online_eval_errors: list[str] = []
+        self.evaluator_model = evaluator_model or os.environ.get(
+            "MO_OPTIMIZER_MODEL", "minimax"
+        )
         self._db_path = str(db_path)
         self.full_batch: list[dict[str, Any]] = self._load_full_batch()
 
@@ -71,12 +75,8 @@ class MiniOrkGepaAdapter:
             self._score_cache.setdefault(row["prompt_version_hash"], []).append(
                 row["reward_value"]
             )
-        # Default score to fall back to when a candidate has no cached
-        # rows: the parent's mean across whatever rows ARE cached, so
-        # unknown candidates inherit parent evidence instead of being
-        # scored as 0.0 (which would silently drag the optimizer toward
-        # "ignore new candidates").
         self._default_score = self._compute_default_score()
+        self._online_score_cache: dict[tuple[str, tuple[str, ...]], list[float]] = {}
 
     def _load_full_batch(self) -> list[dict[str, Any]]:
         if not Path(self._db_path).exists():
@@ -123,37 +123,54 @@ class MiniOrkGepaAdapter:
     ) -> tuple[list[float], list[Any]]:
         """Score ``candidate`` against each example in ``batch``.
 
-        Match by ``candidate['prompt_version_hash']`` against the cached
-        ``reward_value`` rows. Examples whose row doesn't match the
-        candidate hash fall back to ``_default_score`` (parent mean) so
-        we never fabricate per-example scores.
-
-        Returns ``(per_example_scores, traces)`` where each trace is the
-        row dict — the same shape ``reflect_on_component`` consumes via
-        ``make_reflective_dataset``.
+        Cached prompt hashes stay fully offline. Uncached mutated candidates
+        are judged against the already-loaded rows and never trigger a fresh
+        task execution.
         """
         cand_hash = candidate.get("prompt_version_hash", "")
+        if cand_hash and cand_hash in self._score_cache:
+            return self._evaluate_cached(batch, cand_hash)
+        return self._evaluate_online(batch, candidate)
+
+    def _evaluate_cached(
+        self, batch: list[Any], cand_hash: str
+    ) -> tuple[list[float], list[Any]]:
         cached = self._score_cache.get(cand_hash, [])
-        # Build a per-row fallback: if the row's own hash doesn't match
-        # the candidate, use parent mean (cached).
         scores: list[float] = []
         traces: list[Any] = []
         for ex in batch:
             row_hash = ex.get("prompt_version_hash", "") if isinstance(ex, dict) else ""
             row_score = ex.get("reward_value") if isinstance(ex, dict) else None
-            if cand_hash and row_hash == cand_hash and row_score is not None:
+            if row_hash == cand_hash and row_score is not None:
                 scores.append(float(row_score))
             else:
                 scores.append(float(self._default_score))
             traces.append(ex)
-        # Rank-based assignment: if we have MORE cached examples than
-        # the batch asks for (rare path; batch slice is normal), use
-        # the first len(batch) cached scores; if we have FEWER, fill the
-        # rest with default.
         if cached and len(cached) >= len(batch):
             for i in range(len(batch)):
                 scores[i] = float(cached[i])
         return scores, traces
+
+    def _evaluate_online(
+        self, batch: list[Any], candidate: dict[str, str]
+    ) -> tuple[list[float], list[Any]]:
+        cache_key = (_candidate_hash(candidate), _batch_key(batch))
+        cached = self._online_score_cache.get(cache_key)
+        if cached is not None:
+            return list(cached), list(batch)
+        self.online_eval_count += 1
+        try:
+            scores = held_out_score(
+                candidate, batch, model=self.evaluator_model
+            )
+        except Exception as e:
+            self.online_eval_errors.append(str(e)[:240])
+            scores = [0.0] * len(batch)
+        if len(scores) < len(batch):
+            scores = scores + [0.0] * (len(batch) - len(scores))
+        scores = [float(s) for s in scores[: len(batch)]]
+        self._online_score_cache[cache_key] = list(scores)
+        return scores, list(batch)
 
     def make_reflective_dataset(
         self,
@@ -177,10 +194,6 @@ class MiniOrkGepaAdapter:
                 row_hash = ex.get("prompt_version_hash", "")
                 verifier = ex.get("verifier_output", "")
                 reviewer = ex.get("reviewer_verdict", "")
-            # Snip large verifier strings so the reflect prompt stays
-            # bounded — the optimizer never needs the full payload, only
-            # signal. 240 chars covers most "verifier: ok / fail / reason"
-            # outputs.
             verifier_snip = verifier[:240] if verifier else ""
             reviewer_snip = reviewer[:240] if reviewer else ""
             out.append(
@@ -195,6 +208,27 @@ class MiniOrkGepaAdapter:
                 }
             )
         return out
+
+
+def _candidate_hash(candidate: dict[str, str]) -> str:
+    blob = json.dumps(candidate, sort_keys=True, default=str)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def _batch_key(batch: list[Any]) -> tuple[str, ...]:
+    out: list[str] = []
+    for i, ex in enumerate(batch):
+        if isinstance(ex, dict):
+            out.append(
+                str(
+                    ex.get("trace_id")
+                    or ex.get("prompt_version_hash")
+                    or f"idx:{i}"
+                )
+            )
+        else:
+            out.append(f"idx:{i}:{type(ex).__name__}")
+    return tuple(out)
 
 
 def _safe_str(v: Any) -> str:
@@ -243,38 +277,19 @@ def run_suggestion(
     minibatch: int = 4,
     prompt_version_hash: str | None = None,
     seed_candidate: dict[str, str] | None = None,
+    model: str | None = None,
 ) -> dict[str, Any]:
-    """Build a suggestion dict the reflect hook can emit.
-
-    Equivalent to ``optimize(seed, adapter, ...)`` but bundled with the
-    ``pattern_records`` row shape so the bash hook can persist it
-    directly. Pure-Python so a bash side can call this via
-    ``python3 -c "import mini_ork.optimize.miniork_adapter as m; ..."``
-    without bringing in another dependency.
-
-    Returns a suggestion JSON dict with the shape used by
-    ``reflection_suggest_promotions`` consumers:
-
-        {
-            "suggested_promotion_type": "prompt_change",
-            "pattern_id": "gepa-<recipe>-<ts>",
-            "description": "...",
-            "evidence_trace_ids": [...],
-            "candidate": <best_candidate>,
-            "parent_seed": <seed_candidate>,
-            "full_eval_count": N,
-            "iteration_count": M,
-            "validity": "valid" | "insufficient_evidence",
-            "task_class": "...",
-            "recipe": "...",
-        }
-    """
+    """Build a suggestion dict the reflect hook can emit."""
     if budget is None:
         budget = int(os.environ.get("MO_OPTIMIZER_BUDGET", "4"))
     budget = max(1, min(int(budget), 8))  # hard cap
+    model = model or os.environ.get("MO_OPTIMIZER_MODEL", "minimax")
 
     adapter = MiniOrkGepaAdapter(
-        db_path=db_path, task_class=task_class, recipe=recipe
+        db_path=db_path,
+        task_class=task_class,
+        recipe=recipe,
+        evaluator_model=model,
     )
 
     if not adapter.full_batch:
@@ -293,6 +308,9 @@ def run_suggestion(
             "parent_seed": seed_candidate or {},
             "full_eval_count": 0,
             "iteration_count": 0,
+            "online_eval_count": 0,
+            "online_eval_errors": [],
+            "model": model,
             "validity": "insufficient_evidence",
             "task_class": task_class,
             "recipe": recipe,
@@ -308,11 +326,13 @@ def run_suggestion(
         seed_candidate = dict(seed_candidate)
         seed_candidate["prompt_version_hash"] = prompt_version_hash
 
-    best, _ = optimize(
-        seed_candidate, adapter, minibatch=minibatch, budget=budget
+    best, accepted = optimize(
+        seed_candidate,
+        adapter,
+        minibatch=minibatch,
+        budget=budget,
+        model=model,
     )
-    # Evidence: the trace_ids in full_batch — what the optimizer actually
-    # scored against. Cap to the most recent 50 to keep the row bounded.
     evidence = [r["trace_id"] for r in adapter.full_batch[-50:]]
     ts = int(time.time())
     return {
@@ -329,7 +349,10 @@ def run_suggestion(
         "parent_seed": seed_candidate,
         "full_eval_count": adapter.full_eval_count,
         "iteration_count": adapter.iteration_count,
-        "validity": "valid",
+        "online_eval_count": adapter.online_eval_count,
+        "online_eval_errors": adapter.online_eval_errors,
+        "model": model,
+        "validity": "valid" if accepted else "no_improvement",
         "task_class": task_class,
         "recipe": recipe,
         # pattern_store-shaped fields (so the bash reflect hook can

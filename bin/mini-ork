@@ -15,7 +15,7 @@ sub="${1:-help}"; shift || true
 
 case "$sub" in
   # Universal loop subcommands
-  classify|plan|execute|verify|reflect|improve|eval|promote|init|update|spawn|scheduler|epics|bugs|inject|review|traceotter)
+  classify|plan|execute|verify|reflect|improve|eval|promote|init|update|spawn|scheduler|epics|bugs|inject|review|apply|traceotter)
     exec "$MINI_ORK_ROOT/bin/mini-ork-$sub" "$@" ;;
 
   # Phase C: trajectory metrics across DF cycles (v0.2-pt13)
@@ -569,6 +569,8 @@ Universal loop subcommands:
   improve                        Propose workflow candidates via group_evolver
   eval --candidate <id>          Run benchmark suite against a workflow candidate
   promote --candidate <id>       Promotion gate decision (promote|quarantine)
+  apply --task-class <name>      Close the apply loop: pick→materialize→score→gate→
+  --target <file>                write|quarantine (IMPL-3, opt-in via MO_APPLY_ENABLED=1)
 
 Recipe runner:
   run <kickoff.md>               Classify kickoff, resolve recipe, then walk

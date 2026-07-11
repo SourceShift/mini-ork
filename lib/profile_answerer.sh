@@ -60,7 +60,7 @@ PY
   if ! raw=$(llm_dispatch \
     --task-class "profile_answerer" \
     --node-type "profile_answerer" \
-    --model "deepseek" \
+    --model "kimi" \
     --prompt-text "$prompt") || [ -z "${raw// /}" ]; then
     raw=$(llm_dispatch \
       --task-class "profile_answerer" \
