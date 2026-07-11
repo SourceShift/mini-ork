@@ -48,7 +48,12 @@ MAX_ITERS=0
 IDLE_SECS=60
 DRY_RUN=0
 EXPLAIN=0
-BUDGET_CAP="${MO_DAILY_BUDGET_USD:-50.0}"
+# Daily cap single-sourced from config/agents.yaml (budget.daily_cap_usd) via
+# mo_daily_budget_cap; MO_DAILY_BUDGET_USD still overrides. Falls back to 50
+# when agents.yaml is absent — identical to the old `${MO_DAILY_BUDGET_USD:-50.0}`.
+# shellcheck source=lib/budget_config.sh
+. "$MINI_ORK_ROOT/lib/budget_config.sh"
+BUDGET_CAP="$(mo_daily_budget_cap)"
 PLASTICITY_BUDGET="${MO_PLASTICITY_BUDGET:-5}"  # max mutations / 24h (Phase 5)
 
 while [ $# -gt 0 ]; do

@@ -177,6 +177,35 @@ def main(argv: list[str] | None = None, *, db: str | None = None, root: str | No
         else:
             results.append(f'{{"verifier":"{name}","pass":false,"evidence_path":"{ev}"}}'); fail_count += 1
 
+    # Required-artifact assertion (parity: bin/mini-ork-verify). A recipe that
+    # declares a concrete, run-local artifact but produces nothing (missing OR
+    # zero-byte) must FAIL — not launder into pass/partial/vacuous. Only ABSOLUTE
+    # env-expanded paths (e.g. `${MINI_ORK_RUN_DIR}/framework-edit.diff`) are
+    # enforced; relative canonical outputs are publish-targets (exempt). A real,
+    # non-empty artifact passes (the 36KB-synthesis false-negative case).
+    artifact_fail = False
+    if dry_run == 0 and plan_path and os.path.isfile(plan_path):
+        try:
+            ac_req = json.load(open(plan_path, encoding="utf-8")).get("artifact_contract", {})
+        except Exception:
+            ac_req = {}
+        if isinstance(ac_req, dict):
+            seen: set[str] = set()
+            for key in ("required_artifacts", "outputs"):
+                for raw in ac_req.get(key, []) or []:
+                    p = os.path.expandvars(str(raw))
+                    if not os.path.isabs(p) or p in seen:
+                        continue
+                    seen.add(p)
+                    if os.path.isfile(p) and os.path.getsize(p) > 0:
+                        results.append(f'{{"verifier":"__artifact__","pass":true,"evidence_path":"{p}"}}')
+                        pass_count += 1
+                    else:
+                        sys.stderr.write(f"  [fail] required artifact missing or empty: {p}\n")
+                        results.append(f'{{"verifier":"__artifact__","pass":false,"evidence_path":"{p}"}}')
+                        fail_count += 1
+                        artifact_fail = True
+
     gate_verdict = "pass"
     if dry_run == 0 and os.path.isfile(os.path.join(root, "lib", "gate_registry.sh")):
         ctx = json.dumps({"task_class": task_class, "artifact_path": artifact_path,
@@ -195,6 +224,10 @@ def main(argv: list[str] | None = None, *, db: str | None = None, root: str | No
 
     if dry_run == 1:
         verdict = "dry-run"
+    elif artifact_fail:
+        # Missing/empty required artifact is a hard fail: outranks an otherwise
+        # passing verifier set so a hollow run cannot resolve to "partial".
+        verdict = "fail"
     elif pass_count == 0 and fail_count == 0:
         verdict = "vacuous"
     elif fail_count == 0 and gate_verdict == "pass":

@@ -45,6 +45,7 @@ __all__ = [
     "reflection_summarize_patterns",
     "reflection_suggest_promotions",
     "reflection_persist_suggestions",
+    "reflection_verify_patterns",
     "reflection_run",
 ]
 
@@ -641,6 +642,58 @@ def reflection_persist_suggestions(suggestions_json: str) -> int:
     return _persist_suggestions_upsert(db_path, suggestions_json)
 
 
+def reflection_verify_patterns() -> int:
+    """Mirror lib/reflection_pipeline.sh::reflection_verify_patterns.
+
+    Judge-gate (extract→distill→verify): transition emergent_patterns rows from
+    status='proposed' → 'approved' when they clear the evidence/strength floor
+    (strength_score >= MO_EMERGENT_VERIFY_MIN_STRENGTH AND member-evidence count
+    >= MO_EMERGENT_VERIFY_MIN_EVIDENCE). Only approved rows are eligible to be
+    read into routing/context — the guard against memory confabulation (Dixit
+    2026). Opt-out MO_EMERGENT_VERIFY=0. Cold-safe: no-op on missing/empty
+    table. Prints and returns the count of newly-approved rows.
+    """
+    if os.environ.get("MO_EMERGENT_VERIFY", "1") != "1":
+        print(0)
+        return 0
+    min_strength = float(os.environ.get("MO_EMERGENT_VERIFY_MIN_STRENGTH", "3"))
+    min_evidence = int(os.environ.get("MO_EMERGENT_VERIFY_MIN_EVIDENCE", "1"))
+    db_path = os.environ["MINI_ORK_DB"]
+    con = _connect(db_path)
+    try:
+        try:
+            rows = con.execute(
+                "SELECT pattern_id, member_item_ids_json, strength_score "
+                "FROM emergent_patterns WHERE status='proposed'"
+            ).fetchall()
+        except sqlite3.OperationalError:
+            print(0)
+            return 0
+        now = int(time.time())
+        approved = 0
+        for pid, members_json, strength in rows:
+            try:
+                n_evidence = len(json.loads(members_json)) if members_json else 0
+            except (json.JSONDecodeError, TypeError):
+                n_evidence = 0
+            try:
+                s = float(strength)
+            except (TypeError, ValueError):
+                s = 0.0
+            if s >= min_strength and n_evidence >= min_evidence:
+                con.execute(
+                    "UPDATE emergent_patterns SET status='approved', resolved_at=? "
+                    "WHERE pattern_id=? AND status='proposed'",
+                    (now, pid),
+                )
+                approved += 1
+        con.commit()
+    finally:
+        con.close()
+    print(approved)
+    return approved
+
+
 def reflection_run(since_ts: int | None = None) -> str:
     """Mirror lib/reflection_pipeline.sh::reflection_run.
 
@@ -733,6 +786,23 @@ def reflection_run(since_ts: int | None = None) -> str:
         f"reflection_run: {count} promotion suggestions generated, {persisted} persisted",
         file=sys.stderr,
     )
+
+    # [judge-gate] extract→distill→verify: promote only evidence-backed
+    # emergent_patterns from 'proposed' → 'approved' so confabulated
+    # self-diagnoses never reach routing/context (Dixit 2026).
+    print("  [verify] judge-gate emergent_patterns", file=sys.stderr)
+    approved = 0
+    try:
+        _approved_buf = io.StringIO()
+        with redirect_stdout(_approved_buf):
+            approved = reflection_verify_patterns()
+    except Exception:
+        approved = 0
+    print(
+        f"reflection_run: {approved} emergent_patterns approved by judge-gate",
+        file=sys.stderr,
+    )
+
     # Final stdout emission: bash's `echo "$suggestions"` — single copy.
     print(suggestions_json)
     return suggestions_json

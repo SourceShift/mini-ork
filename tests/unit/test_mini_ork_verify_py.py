@@ -110,3 +110,75 @@ def test_dry_run_parity(tmp_path):
     sp, _ = _py(home, db, "art.txt", "--plan", plan, "--dry-run")
     assert _norm(sb) == _norm(sp)
     assert json.loads(sp)["verdict"] == "dry-run"
+
+
+def _req_plan(home, artifact_path, verifiers=None):
+    """A plan whose artifact_contract requires a concrete (absolute) run-local
+    artifact — the hollow-run guard target."""
+    plan = home / "plan-req.json"
+    plan.write_text(json.dumps({
+        "task_class": "framework_edit",
+        "artifact_contract": {
+            "required_artifacts": [str(artifact_path)],
+            "success_verifiers": verifiers or [],
+        },
+    }))
+    return str(plan)
+
+
+def test_missing_required_artifact_fails(tmp_path):
+    # (i) a required artifact that does not exist → hard FAIL (exit 1), both impls.
+    home, db, _ = _scenario(tmp_path, [])
+    missing = tmp_path / "artifact.md"          # never created
+    plan = _req_plan(home, missing)
+    sb, rb = _bash(home, db, str(missing), "--plan", plan)
+    sp, rp = _py(home, db, str(missing), "--plan", plan)
+    assert _norm(sb) == _norm(sp)
+    assert json.loads(sb)["verdict"] == json.loads(sp)["verdict"] == "fail"
+    assert rb == rp == 1
+
+
+def test_empty_required_artifact_fails(tmp_path):
+    # (i) a zero-byte required artifact → hard FAIL (exit 1), both impls.
+    home, db, _ = _scenario(tmp_path, [])
+    empty = tmp_path / "artifact.md"; empty.write_text("")   # exists but 0 bytes
+    plan = _req_plan(home, empty)
+    sb, rb = _bash(home, db, str(empty), "--plan", plan)
+    sp, rp = _py(home, db, str(empty), "--plan", plan)
+    assert _norm(sb) == _norm(sp)
+    assert json.loads(sb)["verdict"] == json.loads(sp)["verdict"] == "fail"
+    assert rb == rp == 1
+
+
+def test_real_required_artifact_passes(tmp_path):
+    # (ii) a real, non-empty required artifact → PASS (exit 0), both impls. This
+    # is the 36KB-synthesis false-negative that must NOT be false-failed.
+    home, db, _ = _scenario(tmp_path, [])
+    real = tmp_path / "synthesis.md"
+    real.write_text("# Synthesis\n" + ("evidence line with a real finding\n" * 2000))
+    assert real.stat().st_size > 30_000
+    plan = _req_plan(home, real)
+    sb, rb = _bash(home, db, str(real), "--plan", plan)
+    sp, rp = _py(home, db, str(real), "--plan", plan)
+    assert _norm(sb) == _norm(sp)
+    assert json.loads(sb)["verdict"] == json.loads(sp)["verdict"] == "pass"
+    assert rb == rp == 0
+
+
+def test_relative_output_is_exempt(tmp_path):
+    # A relative canonical output (publish-target) that doesn't exist yet must NOT
+    # trip the guard — only absolute run-local artifacts are enforced.
+    home, db, _ = _scenario(tmp_path, [])
+    plan = home / "plan-rel.json"
+    plan.write_text(json.dumps({
+        "task_class": "research_synthesis",
+        "artifact_contract": {
+            "outputs": ["docs/research/synthesis-latest.md"],  # relative → exempt
+            "success_verifiers": ["goodv"],
+        },
+    }))
+    sb, rb = _bash(home, db, "art.txt", "--plan", str(plan))
+    sp, rp = _py(home, db, "art.txt", "--plan", str(plan))
+    assert _norm(sb) == _norm(sp)
+    assert json.loads(sb)["verdict"] == json.loads(sp)["verdict"] == "pass"
+    assert rb == rp == 0

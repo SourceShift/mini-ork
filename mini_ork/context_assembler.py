@@ -129,6 +129,40 @@ def context_assemble(task_brief_path: str, workflow_node: str,
     except Exception:
         pass
 
+    # Verified emergent patterns (judge-gate approved) — read-back of the
+    # reflection judge-gate. ONLY status='approved' rows (those that cleared the
+    # evidence/strength floor in reflection_verify_patterns); 'proposed' rows are
+    # unverified self-diagnoses and are excluded to avoid memory confabulation
+    # (Dixit 2026). Sibling of known_failure_modes. Opt-out MO_EMERGENT_INJECT=0;
+    # cold-safe (empty/missing table → []).
+    verified_emergent = []
+    if os.environ.get("MO_EMERGENT_INJECT", "1") == "1":
+        try:
+            emg_limit = int(os.environ.get("MO_EMERGENT_INJECT_LIMIT", "3"))
+        except ValueError:
+            emg_limit = 3
+        try:
+            for r in con.execute("""
+                SELECT pattern_id, cluster_label, feature_set_json,
+                       strength_score, suggested_meta_adr
+                FROM emergent_patterns
+                WHERE status='approved'
+                ORDER BY strength_score DESC, detected_at DESC LIMIT ?
+            """, (emg_limit,)).fetchall():
+                try:
+                    feats = json.loads(r["feature_set_json"]) if r["feature_set_json"] else []
+                except Exception:
+                    feats = []
+                verified_emergent.append({
+                    "cite": f"emergent_patterns/{r['pattern_id']}",
+                    "feature": feats[0] if feats else "emergent",
+                    "cluster_label": r["cluster_label"],
+                    "suggested_change": r["suggested_meta_adr"] or "",
+                    "strength_score": r["strength_score"],
+                    "scope": "emergent"})
+        except Exception:
+            pass
+
     similar_lessons = []
     try:
         query_text = " ".join(filter(None, [
@@ -212,6 +246,7 @@ def context_assemble(task_brief_path: str, workflow_node: str,
         "verifier_contract": {"content": verifier_contract, "cite": "artifact_contract"},
         "prior_similar_runs": prior_runs,
         "known_failure_modes": failure_modes,
+        "verified_emergent_patterns": verified_emergent,
         "similar_lessons": similar_lessons,
         "user_preferences": user_prefs,
         "constraints": constraints,
@@ -260,14 +295,49 @@ def failure_modes_md(task_class: str, limit: int = 5, db: str | None = None) -> 
                 if not r[0].startswith(FRAMEWORK_INTERNAL_PREFIXES)][:limit]
     else:
         rows = rows[:limit]
-    if not rows:
-        return ""
-    out = ["--- Learned failure modes (from prior runs of this task class) ---",
-           "Avoid repeating these known issues:"]
-    for target, signal, change in rows:
-        out.append(f"- [{target}] {signal.strip()}")
-        out.append(f"  Fix applied going forward: {change.strip()}")
-    out.append("--- /learned failure modes ---")
+    out = []
+    if rows:
+        out.append("--- Learned failure modes (from prior runs of this task class) ---")
+        out.append("Avoid repeating these known issues:")
+        for target, signal, change in rows:
+            out.append(f"- [{target}] {signal.strip()}")
+            out.append(f"  Fix applied going forward: {change.strip()}")
+        out.append("--- /learned failure modes ---")
+
+    # Verified emergent patterns (judge-gate approved) — read-back into the
+    # prompt. ONLY status='approved' rows (cleared the evidence/strength floor
+    # in reflection_verify_patterns); 'proposed' self-diagnoses excluded
+    # (memory-confabulation guard, Dixit 2026). Opt-out MO_EMERGENT_INJECT=0;
+    # cold-safe (empty/missing table → nothing).
+    if os.environ.get("MO_EMERGENT_INJECT", "1") == "1":
+        try:
+            emg_limit = int(os.environ.get("MO_EMERGENT_INJECT_LIMIT", "3"))
+        except ValueError:
+            emg_limit = 3
+        con2 = sqlite3.connect(dbp)
+        con2.execute("PRAGMA busy_timeout=5000")
+        try:
+            emg = con2.execute("""
+                SELECT cluster_label, feature_set_json, strength_score
+                FROM emergent_patterns
+                WHERE status='approved'
+                ORDER BY strength_score DESC, detected_at DESC LIMIT ?
+            """, (emg_limit,)).fetchall()
+        except sqlite3.OperationalError:
+            emg = []
+        finally:
+            con2.close()
+        if emg:
+            out.append("--- Verified emergent patterns (cross-run, judge-gate approved) ---")
+            for cluster_label, feature_set_json, _strength in emg:
+                try:
+                    feats = json.loads(feature_set_json) if feature_set_json else []
+                except Exception:
+                    feats = []
+                feat = feats[0] if feats else "emergent"
+                out.append(f"- [{feat}] {(cluster_label or '').strip()}")
+            out.append("--- /verified emergent patterns ---")
+
     return "\n".join(out)
 
 

@@ -90,3 +90,47 @@ def test_roundtrip_get(db):
         db=db)
     row = trace_store.trace_get(tid, db=db)
     assert row and row["status"] == "success" and abs(float(row["reward_g"]) - 1.0) < 1e-9
+
+
+def test_objective_domain_passthrough(db):
+    # objective_domain must land from the payload, not silently default to
+    # code-delivery — the scoping-stamp fix (feature-partition column population).
+    tid = trace_store.trace_write(
+        {"trace_id": "od-1", "task_class": "book-gen", "status": "success",
+         "objective_domain": "book-gen"}, db=db)
+    row = trace_store.trace_get(tid, db=db)
+    assert row["objective_domain"] == "book-gen"
+    # unset → legacy code-delivery fallback preserved
+    tid2 = trace_store.trace_write(
+        {"trace_id": "od-2", "task_class": "x", "status": "success"}, db=db)
+    assert trace_store.trace_get(tid2, db=db)["objective_domain"] == "code-delivery"
+
+
+def _bash_grade(db, run_dir, run_id):
+    subprocess.run(
+        ["bash", "-c", f'. "{TS_SH}" && mo_grade_run_reward "$1" "$2"', "_", run_dir, run_id],
+        env={**os.environ, "MINI_ORK_DB": db}, capture_output=True, text=True, check=True,
+    )
+
+
+def test_grade_run_reward_bash_vs_python(db, tmp_path):
+    # Win #3 graded bridge: rubric.json {score 0-8} → reward_g in [-1,+1] stamped on
+    # every trace of the run, overwriting the binary status-map reward. Assert the
+    # bash mo_grade_run_reward and python grade_run_reward agree on the graded value.
+    rd = tmp_path / "grade-run"; rd.mkdir()
+    (rd / "rubric.json").write_text(json.dumps({"score": 6}))
+    # seed one trace per side under distinct run_ids, initial reward_g = -1 (status-map fail)
+    for tid, rid in (("gb-1", "grade-bash"), ("gp-1", "grade-py")):
+        trace_store.trace_write(
+            {"trace_id": tid, "run_id": rid, "task_class": "code-fix", "status": "failure",
+             "reward_value": 0.0, "reward_anchor": 0.5, "reward_direction": "higher_is_better"},
+            db=db)
+    _bash_grade(db, str(rd), "grade-bash")
+    n = trace_store.grade_run_reward(str(rd), "grade-py", db=db)
+    assert n == 1
+    bg, pg = _reward_g(db, "gb-1"), _reward_g(db, "gp-1")
+    graded = (6 / 8 - 0.5) / 0.5   # 0.5
+    assert abs(float(bg) - graded) < 1e-9 and abs(float(pg) - graded) < 1e-9
+    # missing rubric → no-op (0 rows), leaves status-map reward intact
+    empty = tmp_path / "no-rubric"; empty.mkdir()
+    assert trace_store.grade_run_reward(str(empty), "grade-py", db=db) == 0
