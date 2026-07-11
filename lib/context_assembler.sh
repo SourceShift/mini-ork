@@ -159,6 +159,43 @@ try:
 except Exception:
     pass
 
+# --- Verified emergent patterns (judge-gate approved) -------------------
+# Read-back of the reflection judge-gate: ONLY status='approved' rows (those
+# that cleared the evidence/strength floor in reflection_verify_patterns).
+# 'proposed' rows are self-diagnoses that never passed verification, so they
+# are deliberately excluded — the guard against memory confabulation (Dixit
+# 2026). Emitted as a sibling of known_failure_modes ("alongside"). Opt-out
+# MO_EMERGENT_INJECT=0. Cold-safe: empty/missing table → [].
+import os as _os_emg
+verified_emergent = []
+if _os_emg.environ.get("MO_EMERGENT_INJECT", "1") == "1":
+    try:
+        _emg_limit = int(_os_emg.environ.get("MO_EMERGENT_INJECT_LIMIT", "3"))
+    except ValueError:
+        _emg_limit = 3
+    try:
+        for r in con.execute("""
+            SELECT pattern_id, cluster_label, feature_set_json,
+                   strength_score, suggested_meta_adr
+            FROM emergent_patterns
+            WHERE status='approved'
+            ORDER BY strength_score DESC, detected_at DESC LIMIT ?
+        """, (_emg_limit,)).fetchall():
+            try:
+                _feats = json.loads(r["feature_set_json"]) if r["feature_set_json"] else []
+            except Exception:
+                _feats = []
+            verified_emergent.append({
+                "cite": f"emergent_patterns/{r['pattern_id']}",
+                "feature": _feats[0] if _feats else "emergent",
+                "cluster_label": r["cluster_label"],
+                "suggested_change": r["suggested_meta_adr"] or "",
+                "strength_score": r["strength_score"],
+                "scope": "emergent",
+            })
+    except Exception:
+        pass
+
 # --- Similarity-retrieved prior observations (Track A item 1) -----------
 # TF-IDF cosine over bug_reports + gradient_records + learning_record text
 # columns, scored against the incoming task_brief. Pulls in lessons that
@@ -321,6 +358,7 @@ pack = {
     "verifier_contract": {"content": verifier_contract, "cite": "artifact_contract"},
     "prior_similar_runs": prior_runs,
     "known_failure_modes": failure_modes,
+    "verified_emergent_patterns": verified_emergent,
     "similar_lessons": similar_lessons,
     "user_preferences": user_prefs,
     "constraints": constraints,
@@ -392,6 +430,41 @@ if rows:
         print(f"- [{target}] {signal.strip()}")
         print(f"  Fix applied going forward: {change.strip()}")
     print("--- /learned failure modes ---")
+
+# Verified emergent patterns (judge-gate approved) — read-back of the
+# reflection judge-gate into the prompt. ONLY status='approved' rows (cleared
+# the evidence/strength floor in reflection_verify_patterns); 'proposed'
+# self-diagnoses are excluded (memory-confabulation guard, Dixit 2026).
+# Opt-out MO_EMERGENT_INJECT=0. Cold-safe: empty/missing table → nothing.
+import os as _os_emg, json as _json_emg
+if _os_emg.environ.get("MO_EMERGENT_INJECT", "1") == "1":
+    try:
+        _emg_limit = int(_os_emg.environ.get("MO_EMERGENT_INJECT_LIMIT", "3"))
+    except ValueError:
+        _emg_limit = 3
+    con2 = sqlite3.connect(db)
+    con2.execute("PRAGMA busy_timeout=5000")
+    try:
+        emg = con2.execute("""
+            SELECT cluster_label, feature_set_json, strength_score
+            FROM emergent_patterns
+            WHERE status='approved'
+            ORDER BY strength_score DESC, detected_at DESC LIMIT ?
+        """, (_emg_limit,)).fetchall()
+    except sqlite3.OperationalError:
+        emg = []
+    finally:
+        con2.close()
+    if emg:
+        print("--- Verified emergent patterns (cross-run, judge-gate approved) ---")
+        for cluster_label, feature_set_json, strength in emg:
+            try:
+                feats = _json_emg.loads(feature_set_json) if feature_set_json else []
+            except Exception:
+                feats = []
+            feat = feats[0] if feats else "emergent"
+            print(f"- [{feat}] {(cluster_label or '').strip()}")
+        print("--- /verified emergent patterns ---")
 PY
 }
 

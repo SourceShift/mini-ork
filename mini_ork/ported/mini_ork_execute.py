@@ -931,6 +931,35 @@ def _extract_verdict(root, review_file) -> str:
     return (r.stdout.strip() or "unknown") if r.returncode == 0 else "unknown"
 
 
+def _required_artifacts_ok(plan_path) -> bool:
+    """Hollow-run guard for the verifier node (parity: bash _mo_required_artifacts_ok).
+    A recipe that declares a concrete, run-local artifact (an ABSOLUTE, env-expanded
+    artifact_contract path such as ``${MINI_ORK_RUN_DIR}/framework-edit.diff``) but
+    produces nothing — missing OR zero-byte — fails. Relative canonical outputs are
+    publish-targets (exempt), so a genuine artifact is never false-failed. Returns
+    True when all required artifacts exist + are non-empty (or none apply)."""
+    if not plan_path or not os.path.isfile(plan_path):
+        return True
+    try:
+        ac = json.load(open(plan_path, encoding="utf-8")).get("artifact_contract", {})
+    except Exception:
+        return True
+    if not isinstance(ac, dict):
+        return True
+    ok = True
+    seen: set[str] = set()
+    for key in ("required_artifacts", "outputs"):
+        for raw in ac.get(key, []) or []:
+            p = os.path.expandvars(str(raw))
+            if not os.path.isabs(p) or p in seen:
+                continue
+            seen.add(p)
+            if not (os.path.isfile(p) and os.path.getsize(p) > 0):
+                sys.stderr.write(f"  [fail] required artifact missing or empty: {p}\n")
+                ok = False
+    return ok
+
+
 def _run_verifier_ref(script, evidence_path, *, plan_path="", artifact_path="", cwd=None):
     """Port of _run_verifier_ref (minus the mo_runtime_exec seam): run the
     verifier script, capture evidence, and treat {"pass": true} as success."""
@@ -1798,6 +1827,12 @@ def dispatch_node(fields, *, root, run_dir, plan_path, task_class, db, run_id,
         return 1, fr
 
     if node_type == "verifier":
+        # Hollow-run guard: fail before any verifier runs if the recipe declares a
+        # concrete run-local artifact (absolute contract path) that is missing or
+        # zero-byte. Covers the verifier_ref branch (which bypasses mini-ork-verify).
+        if not _required_artifacts_ok(plan_path):
+            print("  [fail] verifier node: required artifact(s) missing or empty", file=sys.stderr)
+            return 1, "error"
         artifact = ""
         try:
             ac = (json.load(open(plan_path)).get("artifact_contract") or {}) if plan_path else {}
