@@ -616,6 +616,52 @@ def test_trace_fn_objective_domain_defaults(tmp_path, monkeypatch):
                     "WHERE run_id='run-d';").stdout.strip() == "code-delivery"
 
 
+def test_trace_fn_merges_tool_summary_sidecar_and_lane(tmp_path, monkeypatch):
+    # MO_TRACE_RICH fidelity: when the "${output_file}.tool-summary" sidecar exists
+    # (emitted by llm-dispatch stream-json post-process), the trace_fn must parse it
+    # and merge tool_calls + files_read (+ extra files_written) into the row — mirroring
+    # bash _trace_write_node_rich. And the resolved lane must land as agent_version_id.
+    db = _seed_db(tmp_path, "sidecar"); _seed_task_run(db, rid="run-x", status="executing")
+    monkeypatch.setenv("MINI_ORK_DB", db)
+    out = tmp_path / "impl.log"; out.write_text("implementer output\n")
+    # Seed the tool-summary sidecar next to the output file, bash-shaped.
+    (tmp_path / "impl.log.tool-summary").write_text(json.dumps({
+        "tool_calls": [{"name": "Edit", "count": 2}, {"name": "Bash", "count": 1}],
+        "files_read": ["src/a.py", "src/b.py"],
+        "files_written": ["src/a.py"],
+    }))
+    tf = ex._make_trace_fn("code_fix", db, "run-x")
+    # lane threaded via kwarg (dispatch_node binds the resolved lane into trace()).
+    tf("impl1", "success", "implementer", output_file=str(out),
+       finish_reason="done", lane="minimax_lens")
+    row = _sql(db, "SELECT tool_calls, files_read, files_written, agent_version_id "
+                   "FROM execution_traces WHERE run_id='run-x';").stdout.strip()
+    tool_calls_json, files_read_json, files_written_json, agent = row.split("|")
+    assert json.loads(tool_calls_json) == [
+        {"name": "Edit", "count": 2}, {"name": "Bash", "count": 1}]
+    assert json.loads(files_read_json) == ["src/a.py", "src/b.py"]
+    # output_file first, then the sidecar's extra files_written (deduped).
+    assert json.loads(files_written_json) == [str(out), "src/a.py"]
+    assert agent == "minimax_lens"
+
+
+def test_trace_fn_no_sidecar_leaves_tool_calls_empty(tmp_path, monkeypatch):
+    # Guard: with no sidecar present, tool_calls/files_read stay empty arrays (the
+    # merge is strictly best-effort and gated on sidecar existence, like bash).
+    db = _seed_db(tmp_path, "nosidecar"); _seed_task_run(db, rid="run-n", status="executing")
+    monkeypatch.setenv("MINI_ORK_DB", db)
+    out = tmp_path / "impl.log"; out.write_text("out\n")
+    tf = ex._make_trace_fn("code_fix", db, "run-n")
+    tf("impl1", "success", "implementer", output_file=str(out), lane="codex_lens")
+    row = _sql(db, "SELECT tool_calls, files_read, files_written, agent_version_id "
+                   "FROM execution_traces WHERE run_id='run-n';").stdout.strip()
+    tc, fr, fw, agent = row.split("|")
+    assert json.loads(tc) == []
+    assert json.loads(fr) == []
+    assert json.loads(fw) == [str(out)]
+    assert agent == "codex_lens"
+
+
 # ── orchestration backbone parity (NODE_IDS + --dry-run) ──
 
 def _py_blocks():

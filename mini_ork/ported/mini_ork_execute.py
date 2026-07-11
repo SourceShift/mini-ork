@@ -1318,10 +1318,10 @@ def _make_trace_fn(task_class, db, run_id):
     writes a row with a reward stamp (reward_from_status) + code_region so
     lane_router_recompute_advantages has real signal to learn from.
     Signature matches dispatch_node's `trace(node_id, status, node_type, output_file,
-    verdict, finish_reason)`."""
+    verdict, finish_reason, lane)`."""
     from mini_ork import trace_store  # noqa: PLC0415
 
-    def _tf(node_id, status, node_type, output_file="", verdict="", finish_reason=""):
+    def _tf(node_id, status, node_type, output_file="", verdict="", finish_reason="", lane=""):
         extra = {
             "trace_id": f"tr-{node_type}-{node_id}-{uuid.uuid4().hex[:8]}",
             "run_id": run_id,
@@ -1332,9 +1332,39 @@ def _make_trace_fn(task_class, db, run_id):
                                  or os.environ.get("MO_OBJECTIVE_DOMAIN") or "code-delivery"),
             "verifier_output": {"node_type": node_type, "finish_reason": finish_reason or None},
         }
+        # agent_version_id = the resolved dispatch lane (bash passes ${dispatch_lane:-}
+        # into the payload, :1878). Without it lane attribution is lost on every trace,
+        # so lane_router_recompute_advantages can't group rows by lane.
+        if lane:
+            extra["agent_version_id"] = lane
+        files_written = []
         if output_file:
             extra["final_artifact_ref"] = output_file
-            extra["files_written"] = json.dumps([output_file])
+            files_written.append(output_file)
+            # tool-summary sidecar (bash _trace_write_node_rich, :1786): llm-dispatch
+            # emits "${output_file}.tool-summary" from its stream-json post-process when
+            # MO_TRACE_RICH=1. When present, merge tool_calls + files_read (+ any extra
+            # files_written) so reflect's gradient_extract sees real tool/file signal
+            # instead of empty arrays — the D-048 fix, mirrored from bash. Best-effort:
+            # a missing/garbled sidecar is a silent no-op (bash reads with `|| true`).
+            sidecar = f"{output_file}.tool-summary"
+            if os.path.isfile(sidecar):
+                try:
+                    with open(sidecar) as fh:
+                        ts = json.load(fh)
+                    tool_calls = ts.get("tool_calls") or []
+                    files_read = ts.get("files_read") or []
+                    if tool_calls:
+                        extra["tool_calls"] = tool_calls
+                    if files_read:
+                        extra["files_read"] = files_read
+                    for fw in (ts.get("files_written") or []):
+                        if fw and fw not in files_written:
+                            files_written.append(fw)
+                except Exception:
+                    pass  # best-effort (bash: python3 … 2>/dev/null)
+        if files_written:
+            extra["files_written"] = files_written
         if verdict:
             extra["reviewer_verdict"] = verdict
         if finish_reason:
@@ -1630,7 +1660,12 @@ def dispatch_node(fields, *, root, run_dir, plan_path, task_class, db, run_id,
     # Without this the whole GRPO/learning-governed router is inert (panel finding 1).
     workflow_lane = model_lane or node_type
     lane = policy_route_lane(node_type, workflow_lane, dry_run=False, root=root)
-    trace = trace_fn or (lambda *a, **k: None)
+    _base_trace = trace_fn or (lambda *a, **k: None)
+
+    # Bind the resolved lane into every trace() call so agent_version_id is stamped
+    # (bash passes the shell var dispatch_lane into _trace_write_node_rich's payload).
+    def trace(node_id, status, node_type, output_file="", verdict="", finish_reason=""):
+        _base_trace(node_id, status, node_type, output_file, verdict, finish_reason, lane=lane)
     run_dir_eff = os.environ.get("MINI_ORK_RUN_DIR", run_dir)
     cost_sidecar = os.path.join(run_dir_eff, ".last-llm-cost")
 
