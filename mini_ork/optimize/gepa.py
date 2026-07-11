@@ -12,6 +12,7 @@ mutation on the full set.
 from __future__ import annotations
 
 import json
+import os
 import random
 from dataclasses import dataclass
 from typing import Any, Callable, Protocol, runtime_checkable
@@ -86,6 +87,10 @@ class _NoProposal(Exception):
     """Reflection call returned no usable mutation. Loop skips the iteration."""
 
 
+def _optimizer_model(model: str | None) -> str:
+    return model or os.environ.get("MO_OPTIMIZER_MODEL", "minimax")
+
+
 def _strip_code_fence(raw: str) -> str:
     if not raw.startswith("```"):
         return raw
@@ -98,18 +103,89 @@ def _strip_code_fence(raw: str) -> str:
     return inner.strip()
 
 
+def _clamp_score(value: Any) -> float:
+    try:
+        score = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if score != score:
+        return 0.0
+    return max(0.0, min(1.0, score))
+
+
+def _coerce_score_list(parsed: Any, count: int) -> list[float]:
+    if count <= 0:
+        return []
+    raw = parsed
+    if isinstance(parsed, dict):
+        raw = parsed.get("scores", parsed.get("score", 0.0))
+    if isinstance(raw, list):
+        scores = [_clamp_score(v) for v in raw[:count]]
+        while len(scores) < count:
+            scores.append(scores[-1] if scores else 0.0)
+        return scores
+    return [_clamp_score(raw)] * count
+
+
+def held_out_score(
+    candidate: dict[str, str],
+    examples: list[Any],
+    *,
+    model: str | None = None,
+    max_chars: int = 800,
+) -> list[float]:
+    """Score an uncached mutated prompt candidate on held-out examples."""
+    model = _optimizer_model(model)
+    held_out_examples: list[dict[str, Any]] = []
+    for ex in examples:
+        if isinstance(ex, dict):
+            held_out_examples.append(
+                {
+                    "trace_id": ex.get("trace_id", ""),
+                    "prompt_version_hash": ex.get("prompt_version_hash", ""),
+                    "reward_value": ex.get("reward_value"),
+                    "verifier_output": str(ex.get("verifier_output", ""))[:max_chars],
+                    "reviewer_verdict": str(ex.get("reviewer_verdict", ""))[:max_chars],
+                }
+            )
+        else:
+            held_out_examples.append({"example": str(ex)[:max_chars]})
+    prompt = json.dumps(
+        {
+            "candidate": candidate,
+            "held_out_examples": held_out_examples,
+            "instruction": (
+                "Score the mutated prompt candidate on each held-out example. "
+                "Return JSON only: {\"scores\": [numbers from 0.0 to 1.0]}."
+            ),
+        },
+        indent=2,
+    )
+    result: DispatchResult = dispatch_model(
+        DispatchRequest(model=model, prompt=prompt)
+    )
+    if not result.ok or not result.text.strip():
+        raise _NoProposal(f"judge dispatch not ok: rc={result.rc} err={result.error!r}")
+    try:
+        parsed = json.loads(_strip_code_fence(result.text.strip()))
+    except json.JSONDecodeError as e:
+        raise _NoProposal(f"judge response not JSON: {e}") from e
+    return _coerce_score_list(parsed, len(examples))
+
+
 def reflect_on_component(
     candidate: dict[str, str],
     reflective_dataset: list[dict[str, Any]],
     component_key: str,
     *,
-    model: str = "stub",
+    model: str | None = None,
 ) -> dict[str, str]:
     """Call ``dispatch_model`` to propose a rewrite of one component.
 
     Returns a NEW candidate dict (input not mutated). Raises ``_NoProposal``
     on unparseable response or missing target key.
     """
+    model = _optimizer_model(model)
     prompt = json.dumps({
         "candidate": candidate,
         "component_to_rewrite": component_key,
@@ -135,7 +211,10 @@ def reflect_on_component(
     if not isinstance(new_value, str):
         new_value = str(new_value)
     mutated = dict(candidate)
+    old_value = mutated.get(component_key)
     mutated[component_key] = new_value
+    if component_key != "prompt_version_hash" and new_value != old_value:
+        mutated.pop("prompt_version_hash", None)
     return mutated
 
 
@@ -145,7 +224,7 @@ def optimize(
     *,
     minibatch: int = 8,
     budget: int = 4,
-    model: str = "stub",
+    model: str | None = None,
     rng: random.Random | None = None,
     component_selector: Callable[[dict[str, str]], str] | None = None,
 ) -> tuple[dict[str, str], list[dict[str, Any]]]:
@@ -155,6 +234,7 @@ def optimize(
     ``<= budget`` at return because only accepted mutations consume a full
     eval. Returns ``(best_candidate, accepted_mutations_trace)``.
     """
+    model = _optimizer_model(model)
     rng = rng or random.Random()
     component_selector = component_selector or (lambda c: next(iter(c)))
 
@@ -219,4 +299,8 @@ def optimize(
         })
 
     best_candidate, _ = front.best()
+    assert adapter.full_eval_count <= budget, (
+        f"full_eval_count={adapter.full_eval_count} leaked past "
+        f"budget={budget} — rollout cap broken"
+    )
     return best_candidate, accepted

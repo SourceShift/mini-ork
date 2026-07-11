@@ -42,7 +42,7 @@ lanes:
   kimi_lens: kimi            # correctness lens
   codex_lens: codex          # codex review lens (non-critical; panel tolerates failure)
   glm_lens: kimi             # no-glm -> kimi
-  opus_lens: kimi            # no-claude; panel family-diversity via kimi
+  opus_lens: opus            # real opus lens (claude CLI available) — 4 distinct lens families
 
 
 

@@ -20,6 +20,50 @@
 
 MINI_ORK_ROOT="${MINI_ORK_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 
+# desc: Decide whether task_class identifies a framework-internal agent
+#       (e.g. `__reflect__`). Framework self-traces add no learning signal
+#       and only bloat the gradient table — callers should skip them before
+#       paying the LLM dispatch cost. Returns 0 (skip) for task_class
+#       beginning with `__`, 1 (extract) otherwise. Pure string match on
+#       the task_class string — no DB hit, no schema dependency.
+#       In scope: any agent whose name is wrapped in double underscores.
+#       Out of scope: regular task_classes (no leading `__`).
+_gradient_is_framework_agent() {
+  local task_class="${1:-}"
+  [[ -z "$task_class" ]] && return 1
+  case "$task_class" in
+    __*) return 0 ;;
+    *)    return 1 ;;
+  esac
+}
+
+# desc: Per-trace watermark check. Returns 0 (skip — already linked) when
+#       at least one gradient_records row exists whose evidence equals the
+#       given trace_id; returns 1 (extract) otherwise. Idempotency contract:
+#       re-running `reflection_extract_gradients` over an overlapping
+#       `--since` window must not duplicate rows for traces that already
+#       produced a gradient in an earlier run. Scoped per-(task_class, trace)
+#       — a trace_id already linked under a different task_class counts as
+#       "seen" (per risk_notes: don't widen across task_class to avoid
+#       silently dropping legitimate same-trace, different-class gradients).
+_gradient_check_watermark() {
+  local trace_id="${1:?trace_id required}"
+  python3 - "${MINI_ORK_DB:?MINI_ORK_DB unset}" "$trace_id" <<'PY' >/dev/null 2>&1
+import sqlite3, sys
+db, tid = sys.argv[1], sys.argv[2]
+con = sqlite3.connect(db)
+try:
+    row = con.execute(
+        "SELECT 1 FROM gradient_records WHERE evidence = ? LIMIT 1",
+        (tid,),
+    ).fetchone()
+except sqlite3.OperationalError:
+    row = None
+con.close()
+sys.exit(0 if row else 1)
+PY
+}
+
 # Ensure gradient_records table exists.
 _gradient_ensure_table() {
   # v0.2-pt10 G-003 DDL session guard
