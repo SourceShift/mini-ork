@@ -761,6 +761,16 @@ mo_llm_dispatch() {
     if [ -n "${MO_DISPATCH_CHAIN:-}" ] && [ "${MO_DISPATCH_CHAIN%%,*}" = "$model" ]; then
       _model_arg="$MO_DISPATCH_CHAIN"
     fi
+    # Source secrets BEFORE delegating — the python layer reads API keys from
+    # os.environ and (unlike the bash path below) never sources
+    # secrets.local.sh itself. Without this every gateway lane fails preflight
+    # with "key not set" whenever the caller relied on MINI_ORK_SECRETS
+    # (2026-07-03 migration batch: 10/10 runs dead on this).
+    local _py_secrets="${MINI_ORK_SECRETS:-${MINI_ORK_HOME:-.mini-ork}/config/secrets.local.sh}"
+    if [ -f "$_py_secrets" ]; then
+      set -a; # shellcheck disable=SC1090
+      source "$_py_secrets" 2>/dev/null || true; set +a
+    fi
     printf '%s' "$prompt" | PYTHONPATH="${MINI_ORK_ROOT}${PYTHONPATH:+:$PYTHONPATH}" \
       python3 -m mini_ork.dispatch "$_model_arg" --out "$out_file" --timeout "$timeout_s"
     return $?
