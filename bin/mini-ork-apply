@@ -1,0 +1,137 @@
+#!/usr/bin/env bash
+# mini-ork-apply — Close the apply loop (IMPL-3).
+#
+# Consumes the highest-confidence pattern_records / emergent_patterns /
+# gradient_records row for a (task_class, target_kind, target_name) tuple,
+# materializes it as a workflow_candidates row, scores it on a held-out set,
+# and ONLY if the non-regression gate clears does it rewrite the target prompt
+# file + write a version_registry entry. On regression it quarantines the
+# candidate and writes a promotion_records row explaining the decision.
+#
+# Usage:
+#   bin/mini-ork apply --task-class <name> --target <file>
+#                       [--target-kind prompt_file|agent_prompt|workflow_node|workflow_edge]
+#                       [--dry-run] [--scorer mock|gepa]
+#
+# Defaults:
+#   --target-kind  prompt_file
+#   --scorer       mock (deterministic, test-friendly)
+#
+# Flags:
+#   --task-class <name>     Required. e.g. reviewer, framework_edit
+#   --target    <file>      Required. Path to the prompt file to potentially rewrite
+#   --target-kind <k>       One of prompt_file (default), agent_prompt, workflow_node, workflow_edge
+#   --dry-run               Force dry-run even with MO_APPLY_ENABLED=1
+#   --scorer <mock|gepa>    Scoring backend (default mock)
+#   --enable                Sets MO_APPLY_ENABLED=1 for this invocation only
+#   --help
+#
+# Env:
+#   MO_APPLY_ENABLED=1      Master gate (off by default).
+#   MO_APPLY_DRY_RUN=1      Skip the file write + version_registry write.
+#   MO_APPLY_NONREGRESSION_DELTA  Default 0.0.
+#   MO_APPLY_MIN_EXAMPLES   Default 1.
+#   MO_APPLY_FORCE_REGRESSION=1   Test seam: forces a regression score.
+#
+# Idempotency:
+#   Calling apply twice on the same (task_class, target) produces two distinct
+#   workflow_candidates rows (one per call) but the same apply_attempts audit
+#   trail. The picker re-selects based on current max-conf source pattern, so
+#   a re-run after the source's confidence changes may pick a different row.
+
+set -Eeuo pipefail
+
+MINI_ORK_ROOT="${MINI_ORK_ROOT:-$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)}"
+export MINI_ORK_ROOT
+
+# ── arg parsing ───────────────────────────────────────────────────────────────
+TASK_CLASS=""
+TARGET=""
+TARGET_KIND="prompt_file"
+DRY_RUN="${MO_APPLY_DRY_RUN:-0}"
+SCORER="${MO_APPLY_SCORER:-mock}"
+ENABLE_NOW=0
+
+_usage() {
+  cat <<'EOF'
+Usage: bin/mini-ork apply --task-class <name> --target <file>
+                          [--target-kind prompt_file|agent_prompt|workflow_node|workflow_edge]
+                          [--dry-run] [--scorer mock|gepa] [--enable]
+
+Close the apply loop: turn the highest-confidence proposed prompt change
+into a scored workflow_candidate, gated by a non-regression rule, and
+either rewrite the prompt file (on promote) or quarantine with reason
+(on regression).
+
+Defaults:
+  --target-kind  prompt_file
+  --scorer       mock
+  --dry-run      off unless MO_APPLY_DRY_RUN=1
+
+Flags:
+  --enable        Set MO_APPLY_ENABLED=1 for this call (master gate; default off)
+
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --help|-h)      _usage; exit 0 ;;
+    --task-class)   TASK_CLASS="${2:?--task-class requires a value}"; shift 2 ;;
+    --target)       TARGET="${2:?--target requires a value}"; shift 2 ;;
+    --target-kind)  TARGET_KIND="${2:?--target-kind requires a value}"; shift 2 ;;
+    --dry-run)      DRY_RUN=1; shift ;;
+    --scorer)       SCORER="${2:?--scorer requires a value}"; shift 2 ;;
+    --enable)       ENABLE_NOW=1; shift ;;
+    -*)             echo "Unknown flag: $1" >&2; _usage >&2; exit 2 ;;
+    *)              echo "Unexpected argument: $1" >&2; exit 2 ;;
+  esac
+done
+
+[ -n "$TASK_CLASS" ] || { echo "--task-class is required" >&2; _usage >&2; exit 2; }
+[ -n "$TARGET" ] || { echo "--target is required" >&2; _usage >&2; exit 2; }
+
+# Honor --enable / --dry-run precedence: --enable lifts the master gate,
+# --dry-run keeps the file write off regardless.
+[ "$ENABLE_NOW" = "1" ] && export MO_APPLY_ENABLED=1
+[ "$DRY_RUN" = "1" ] && export MO_APPLY_DRY_RUN=1
+
+export MO_APPLY_SCORER="$SCORER"
+
+MINI_ORK_HOME="${MINI_ORK_HOME:-$(pwd)/.mini-ork}"
+MINI_ORK_DB="${MINI_ORK_DB:-$MINI_ORK_HOME/state.db}"
+export MINI_ORK_HOME MINI_ORK_DB
+
+# Source the lib. _require_lib keeps the same shape other mini-ork-* use.
+_require_lib() {
+  local lib="$MINI_ORK_ROOT/lib/${1}.sh"
+  if [ ! -f "$lib" ]; then
+    echo "lib/${1}.sh not yet present" >&2; exit 3
+  fi
+  source "$lib"
+}
+_require_lib apply
+
+# Convert a target file path into a target_name that's stable across invocations
+# (so the picker resolves the same row regardless of cwd). For prompt_file
+# targets the canonical name is the path relative to MINI_ORK_ROOT when
+# possible, else the absolute path.
+_resolve_target_name() {
+  local abs="$1"
+  case "$abs" in
+    "${MINI_ORK_ROOT}/"*) printf '%s' "${abs#${MINI_ORK_ROOT}/}" ;;
+    *) printf '%s' "$abs" ;;
+  esac
+}
+TARGET_NAME="$(_resolve_target_name "$TARGET")"
+
+echo "=== mini-ork apply ==="
+echo "    task_class: $TASK_CLASS"
+echo "    target:     $TARGET"
+echo "    target_kind:$TARGET_KIND"
+echo "    scorer:     $SCORER"
+echo "    apply_enabled: ${MO_APPLY_ENABLED:-0}"
+echo "    dry_run:    ${MO_APPLY_DRY_RUN:-0}"
+echo ""
+
+apply_run "$TASK_CLASS" "$TARGET_KIND" "$TARGET_NAME" "$TARGET"
