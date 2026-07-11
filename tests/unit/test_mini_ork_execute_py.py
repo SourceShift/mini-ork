@@ -548,6 +548,37 @@ def test_main_live_run_wired(tmp_path, monkeypatch):
     assert int(n) >= 2
 
 
+def test_trace_fn_stamps_scoping(tmp_path, monkeypatch):
+    # Scoping-stamp fix: the per-node trace_fn must land code_region (from an in-repo
+    # files_written path) and objective_domain (from MINI_ORK_OBJECTIVE_DOMAIN), the
+    # two feature-partition columns that were NULL/monolithic before.
+    db = _seed_db(tmp_path, "scope"); _seed_task_run(db, rid="run-s", status="executing")
+    repo = _git_repo(tmp_path / "repo")
+    (repo / "lib").mkdir()
+    edited = repo / "lib" / "healer.sh"; edited.write_text("echo hi\n")
+    monkeypatch.setenv("MINI_ORK_DB", db)
+    monkeypatch.setenv("MINI_ORK_ROOT", str(repo))
+    monkeypatch.setenv("MO_TARGET_CWD", str(repo))
+    monkeypatch.setenv("MINI_ORK_OBJECTIVE_DOMAIN", "book-gen")
+    tf = ex._make_trace_fn("code_fix", db, "run-s")
+    tf("impl1", "success", "implementer", output_file=str(edited), finish_reason="done")
+    row = _sql(db, "SELECT objective_domain, code_region FROM execution_traces "
+                   "WHERE run_id='run-s';").stdout.strip()
+    assert row == "book-gen|lib"
+
+
+def test_trace_fn_objective_domain_defaults(tmp_path, monkeypatch):
+    # objective_domain defaults to code-delivery ONLY when the env is unset.
+    db = _seed_db(tmp_path, "scopedef"); _seed_task_run(db, rid="run-d", status="executing")
+    monkeypatch.delenv("MINI_ORK_OBJECTIVE_DOMAIN", raising=False)
+    monkeypatch.delenv("MO_OBJECTIVE_DOMAIN", raising=False)
+    monkeypatch.setenv("MINI_ORK_DB", db)
+    tf = ex._make_trace_fn("code_fix", db, "run-d")
+    tf("r1", "success", "researcher")
+    assert _sql(db, "SELECT objective_domain FROM execution_traces "
+                    "WHERE run_id='run-d';").stdout.strip() == "code-delivery"
+
+
 # ── orchestration backbone parity (NODE_IDS + --dry-run) ──
 
 def _py_blocks():
