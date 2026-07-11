@@ -22,11 +22,16 @@ from . import epic_graph
 
 
 def _today_cost(db):
-    c = sqlite3.connect(db)
-    r = c.execute("SELECT COALESCE(SUM(cost_usd),0) FROM task_runs "
-                  "WHERE created_at >= strftime('%s','now','-24 hours')").fetchone()
-    c.close()
-    return float(r[0] or 0)
+    # bash: `sqlite3 … 2>/dev/null || echo 0` — tolerate a missing task_runs table /
+    # empty or absent db (a fresh .mini-ork), returning 0 instead of crashing the loop.
+    try:
+        c = sqlite3.connect(db)
+        r = c.execute("SELECT COALESCE(SUM(cost_usd),0) FROM task_runs "
+                      "WHERE created_at >= strftime('%s','now','-24 hours')").fetchone()
+        c.close()
+        return float(r[0] or 0)
+    except sqlite3.Error:
+        return 0.0
 
 
 def _adaptive_lane_gain(con, base=0.3):
