@@ -67,6 +67,10 @@ def ready_now(db: str | None = None) -> list[str]:
                          AND d.resolved_at IS NULL)
              ORDER BY e.created_at ASC""").fetchall()
         return [r[0] for r in rows]
+    except sqlite3.Error:
+        # Fresh db without the epics/epic_dependencies tables → no ready epics,
+        # matching bash's tolerant `sqlite3 … 2>/dev/null` (crash-free empty result).
+        return []
     finally:
         con.close()
 
