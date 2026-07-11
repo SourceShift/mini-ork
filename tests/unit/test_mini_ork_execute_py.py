@@ -67,6 +67,18 @@ def test_dispatch_chain_parity():
         assert rb == rp, f"({nt},{lead}): bash={rb!r} py={rp!r}"
 
 
+def test_router_respects_pins_no_monoculture():
+    # Router-monoculture fix (bash + py parity): under learning_governed (the default),
+    # recipe-pinned panel lenses keep their DISTINCT lanes instead of the governed router
+    # collapsing all 4 same-node-type researchers onto one global-slice winner.
+    env = {"MO_ROUTING_POLICY": "learning_governed", "DRY_RUN": "0"}
+    for lens in ("glm_lens", "kimi_lens", "codex_lens", "opus_lens"):
+        rb = _call("_mo_policy_route_lane", "researcher", lens, env=env)
+        rp = ex.policy_route_lane("researcher", lens)
+        assert rb == lens and rp == lens, \
+            f"pinned {lens} must be preserved: bash={rb!r} py={rp!r} — monoculture NOT fixed"
+
+
 def test_learning_static_lane_parity():
     env = {"MO_FRONTIER_LANE": "opus_lens", "MO_CHEAP_LANE": "kimi_lens"}
     for nt, lane in [("reviewer", "reviewer"), ("researcher", "researcher"),
