@@ -128,7 +128,7 @@ jobs:
         run: ./bin/mini-ork init
 
       - name: Run pytest
-        run: python -m pytest tests/ -v
+        run: python -m pytest tests/ -q -p no:cacheprovider
 
   ui:
     name: ui typecheck + build
