@@ -97,7 +97,7 @@ def _len_json(s):
 #   ACTIVITY_CAP   = 0.15   # MO_PRM_ACTIVITY_CAP=1 (default): clamp W_TOOL+W_FILE
 #                           # MO_PRM_ACTIVITY_CAP=0 (legacy): no clamp, activity can dominate
 W_STATUS, W_TOOL, W_FILE, W_VERDICT, W_DURATION, W_COST, ACTIVITY_CAP = \
-    0.40, 0.20, 0.10, 0.15, 0.10, 0.05, 0.15
+    0.50, 0.10, 0.05, 0.30, 0.05, 0.00, 0.15
 try:
     _activity_cap_enabled = int(os.environ.get("MO_PRM_ACTIVITY_CAP", "1")) != 0
 except ValueError:
@@ -105,28 +105,23 @@ except ValueError:
 
 score = 0.0
 status_success = (r["status"] or "") == "success"
+# Goodhart fix: activity, timeliness, and verdict credit apply ONLY on success.
+# A busy/timely FAILURE earns nothing (was ~0.25 from activity+duration) — this
+# sharpens the success/failure separation the GRPO advantage learns from.
 if status_success:
     score += W_STATUS
-tool_n = _len_json(r["tool_calls"])
-file_n = _len_json(r["files_written"]) + _len_json(r["files_read"])
-activity = (W_TOOL if tool_n > 0 else 0.0) + (W_FILE if file_n > 0 else 0.0)
-# Goodhart guard: cap combined activity contribution so noisy failed work
-# cannot outscore bare success. Legacy uncapped behavior is opt-in via
-# MO_PRM_ACTIVITY_CAP=0.
-if _activity_cap_enabled:
-    activity = min(activity, ACTIVITY_CAP)
-score += activity
-v = (r["reviewer_verdict"] or "").lower()
-# Verdict term GATED on status==success. A failed trace cannot be lifted
-# by an approving judge. Same-family decontamination has been removed
-# pending a real reviewer_model column.
-if status_success and v in {"approve", "approved", "pass", "success", "ok"}:
-    score += W_VERDICT
-dur = int(r["duration_ms"] or 0)
-if 1000 <= dur <= 600000:
-    score += W_DURATION
-if float(r["cost_usd"] or 0) > 0:
-    score += W_COST
+    tool_n = _len_json(r["tool_calls"])
+    file_n = _len_json(r["files_written"]) + _len_json(r["files_read"])
+    activity = (W_TOOL if tool_n > 0 else 0.0) + (W_FILE if file_n > 0 else 0.0)
+    if _activity_cap_enabled:
+        activity = min(activity, ACTIVITY_CAP)
+    score += activity
+    v = (r["reviewer_verdict"] or "").lower()
+    if v in {"approve", "approved", "pass", "success", "ok"}:
+        score += W_VERDICT
+    dur = int(r["duration_ms"] or 0)
+    if 1000 <= dur <= 600000:
+        score += W_DURATION
 
 score = round(min(1.0, max(0.0, score)), 4)
 con.execute("UPDATE execution_traces SET process_reward=? WHERE trace_id=?",
@@ -186,7 +181,7 @@ def _len_json(s):
 #   ACTIVITY_CAP   = 0.15   # MO_PRM_ACTIVITY_CAP=1 (default): clamp W_TOOL+W_FILE
 #                           # MO_PRM_ACTIVITY_CAP=0 (legacy): no clamp, activity can dominate
 W_STATUS, W_TOOL, W_FILE, W_VERDICT, W_DURATION, W_COST, ACTIVITY_CAP = \
-    0.40, 0.20, 0.10, 0.15, 0.10, 0.05, 0.15
+    0.50, 0.10, 0.05, 0.30, 0.05, 0.00, 0.15
 try:
     _activity_cap_enabled = int(os.environ.get("MO_PRM_ACTIVITY_CAP", "1")) != 0
 except ValueError:
@@ -196,29 +191,23 @@ scored = 0
 for r in rows:
     score = 0.0
     status_success = (r["status"] or "") == "success"
+    # Goodhart fix (mirror of prm_score_trace): activity/timeliness/verdict credit
+    # ONLY on success; a busy FAILURE scores 0. Keep identical to the single-trace
+    # copy or single vs bulk process_reward diverge.
     if status_success:
         score += W_STATUS
-    tool_n = _len_json(r["tool_calls"])
-    file_n = _len_json(r["files_written"]) + _len_json(r["files_read"])
-    activity = (W_TOOL if tool_n > 0 else 0.0) + (W_FILE if file_n > 0 else 0.0)
-    # Goodhart guard: cap combined activity contribution so noisy failed work
-    # cannot outscore bare success. Legacy uncapped behavior is opt-in via
-    # MO_PRM_ACTIVITY_CAP=0.
-    if _activity_cap_enabled:
-        activity = min(activity, ACTIVITY_CAP)
-    score += activity
-    v = (r["reviewer_verdict"] or "").lower()
-    # Verdict term GATED on status==success. Identical to prm_score_trace;
-    # do not drift these two copies or process_reward will diverge between
-    # single-trace and bulk paths. Same-family decontamination has been
-    # removed pending a real reviewer_model column.
-    if status_success and v in {"approve", "approved", "pass", "success", "ok"}:
-        score += W_VERDICT
-    dur = int(r["duration_ms"] or 0)
-    if 1000 <= dur <= 600000:
-        score += W_DURATION
-    if float(r["cost_usd"] or 0) > 0:
-        score += W_COST
+        tool_n = _len_json(r["tool_calls"])
+        file_n = _len_json(r["files_written"]) + _len_json(r["files_read"])
+        activity = (W_TOOL if tool_n > 0 else 0.0) + (W_FILE if file_n > 0 else 0.0)
+        if _activity_cap_enabled:
+            activity = min(activity, ACTIVITY_CAP)
+        score += activity
+        v = (r["reviewer_verdict"] or "").lower()
+        if v in {"approve", "approved", "pass", "success", "ok"}:
+            score += W_VERDICT
+        dur = int(r["duration_ms"] or 0)
+        if 1000 <= dur <= 600000:
+            score += W_DURATION
     score = round(min(1.0, max(0.0, score)), 4)
     con.execute("UPDATE execution_traces SET process_reward=? WHERE trace_id=?",
                 (score, r["trace_id"]))
