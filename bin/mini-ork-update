@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+
+# Runtime cutover (bash→Python): MINI_ORK_RUNTIME=python execs the ported module.
+{ MINI_ORK_ROOT="${MINI_ORK_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"; [ -f "$MINI_ORK_ROOT/lib/runtime-select.sh" ] && . "$MINI_ORK_ROOT/lib/runtime-select.sh" && mo_runtime_maybe_delegate "${BASH_SOURCE[0]}" "$@"; } || true
 # mini-ork-update - update a project's .mini-ork state without overwriting config
 set -Eeuo pipefail
 

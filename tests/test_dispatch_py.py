@@ -197,3 +197,17 @@ def test_resolve_claude_lane_uses_claude_command():
     assert spec.command[0] == "claude"
     assert spec.parse_text is claude_result_text
     assert spec.parse_usage is parse_claude_usage
+
+
+def test_claude_lane_passes_bypass_permissions():
+    """Regression guard for the 3rd migration-batch killer: a claude-family
+    worker MUST run with `--permission-mode bypassPermissions`, or `claude
+    --print` auto-denies file writes in non-interactive mode and the
+    implementer produces nothing. Parity with lib/llm-dispatch.sh:938."""
+    for lane in ("glm", "minimax", "kimi", "sonnet", "opus"):
+        cmd = resolve_provider(lane).command
+        assert "--permission-mode" in cmd and "bypassPermissions" in cmd, lane
+        assert cmd[cmd.index("--permission-mode") + 1] == "bypassPermissions", lane
+    # codex/gemini are wrapper-executables with their own permission handling —
+    # they must NOT be handed claude's --permission-mode flag.
+    assert "--permission-mode" not in resolve_provider("codex").command
