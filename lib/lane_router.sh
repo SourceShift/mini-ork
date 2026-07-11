@@ -42,10 +42,21 @@
 #       slices are intentionally untouched — penalties are region-scoped
 #       by design.
 #
+#       Cost-free contextual-bandit upgrade (D1-D3): when MO_ROUTER_UCB_C > 0
+#       the recompute ALSO computes per-lane variance / standard deviation /
+#       z-score (against the lane_slice_baseline EMA) and writes them into
+#       lane_domain_advantage + lane_region_advantage. Single-sample groups
+#       (when MO_ROUTER_SINGLE_SAMPLE=1) drop their score into
+#       lane_slice_baseline as a persistent EMA. The legacy default path
+#       (MO_ROUTER_UCB_C=0, MO_ROUTER_SINGLE_SAMPLE=0) reproduces the prior
+#       within-group-mean router byte-for-byte — verifier regression gate.
+#
 #   lane_router_preferred_lane <task_class> <node_type> [objective_domain] [code_region]
 #       Print the lane (model lane name) with highest relative_advantage
 #       for the given slice, with sample_size >= 3 to avoid noise.
 #       Falls back to the lane configured in agents.yaml when no data.
+#       When MO_ROUTER_UCB_C > 0 the active slice's z_score_advantage +
+#       UCB bonus replaces relative_advantage DESC for the ordering term.
 
 [ "${0:-}" = "${BASH_SOURCE[0]:-}" ] && set -Eeuo pipefail
 
@@ -88,6 +99,16 @@ SHRINK_K = int(os.environ.get("MO_LEARNING_SHRINKAGE_K", "5"))
 DECAY_ALPHA = float(os.environ.get("MO_LEARNING_DECAY_ALPHA", "0.30"))
 HALFLIFE = float(os.environ.get("MO_LEARNING_HALFLIFE_DAYS", "14"))
 TIEBREAK = int(os.environ.get("MO_LEARNING_TIEBREAK", "1"))
+# Cost-free contextual-bandit env knobs (D1-D3). Defaults per kickoff:
+#   MO_ROUTER_UCB_C        default 0.5 → bandit ordering on by default
+#   MO_ROUTER_SINGLE_SAMPLE default 1   → single-sample baselines on
+#   MO_ROUTER_CONTEXTUAL   default 0   → NeuralUCB off (zero-cost default)
+# Setting all three to 0 reproduces the legacy within-group-mean router
+# byte-for-byte (verifier regression gate; tests/unit/test_lane_router.sh
+# + tests/unit/test_lane_router_py.py both pin UCB_C=0).
+UCB_C = float(os.environ.get("MO_ROUTER_UCB_C", "0.5"))
+SINGLE_SAMPLE = int(os.environ.get("MO_ROUTER_SINGLE_SAMPLE", "1"))
+BANDIT_ON = UCB_C > 0.0
 
 con = sqlite3.connect(db)
 con.execute("PRAGMA busy_timeout=5000")
