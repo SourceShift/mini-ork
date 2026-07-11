@@ -289,6 +289,14 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+# NOTE (verdict vocabulary): this maps a terminal verdict/status to an OUTCOME
+# reward in {1.0, 0.5, 0.0} — a DIFFERENT concept from the PRM verdict-credit
+# gate in lib/process_reward.sh / mini_ork/learning/process_reward.py, whose
+# set is {approve,approved,pass,success,ok}. This set is intentionally broader
+# (adds `passed` and status terms like published/done) because it also
+# classifies raw run STATUS, not just reviewer verdicts. The two sets are NOT
+# unified on purpose: adding `passed` to the PRM gate would grant +W_VERDICT to
+# traces that currently score without it (a reward-value change, out of scope).
 _mo_reward_from_status() {
   local _status="${1:-}" _verdict="${2:-}"
   case "$(printf '%s' "$_verdict" | tr '[:upper:]' '[:lower:]')" in
@@ -1843,6 +1851,12 @@ obj = {
     'trace_id': trace_id,
     'task_class': task_class,
     'status': status,
+    # objective_domain is the GRPO slice key. Stamp it from the run's env so the
+    # feature-partition column is populated per-run (book-gen / future domains),
+    # not silently defaulted to 'code-delivery' inside trace_store for every row.
+    # Default to code-delivery ONLY when unset — matches lib/trace_store.sh's
+    # legacy fallback so historical + untagged runs share one slice.
+    'objective_domain': os.environ.get('MINI_ORK_OBJECTIVE_DOMAIN') or os.environ.get('MO_OBJECTIVE_DOMAIN') or 'code-delivery',
     'cost_usd': float(cost) if cost else 0.0,
     'duration_ms': int(duration_ms) if duration_ms else 0,
     'tool_calls': json.dumps(tool_calls),
@@ -3352,6 +3366,14 @@ if [ "$DRY_RUN" -eq 0 ]; then
   STATUS="success"
   [ "$FAIL_COUNT" -gt 0 ] && STATUS="failure"
   trace_write "{\"trace_id\":\"$TRACE_ID\",\"task_class\":\"${TASK_CLASS}\",\"status\":\"${STATUS}\"}" >/dev/null 2>&1 || true
+
+  # Close the eval loop: feed the rubric's GRADED 0-8 run score into reward_g on
+  # every trace of this run BEFORE the GRPO advantage recompute below reads them.
+  # When ${RUN_DIR}/rubric.json exists, mo_grade_run_reward overwrites the per-node
+  # status-map reward with the graded value (rubric 8→+1, 4→0, 0→-1); when it is
+  # absent it is a no-op, leaving the _mo_reward_from_status status-map fallback
+  # that _trace_write_node_rich already stamped. Best-effort; never fails the run.
+  mo_grade_run_reward "$RUN_DIR" "${MINI_ORK_RUN_ID:-}" >/dev/null 2>&1 || true
 
   # D3: populate task_memory + failure_memory per-task-class so the planner
   # injection of "prior 5 runs by task_class" has data to read.

@@ -456,7 +456,58 @@ print(persisted)
 PY
 }
 
-# desc: Orchestrate all 6 reflection steps sequentially. since_ts is unix epoch;
+# desc: Judge-gate (extract→distill→verify). Transition emergent_patterns rows
+#       from status='proposed' → 'approved' when they clear an evidence/strength
+#       floor already present in the schema:
+#         strength_score >= MO_EMERGENT_VERIFY_MIN_STRENGTH (default 3), AND
+#         evidence member count (member_item_ids_json) >= MO_EMERGENT_VERIFY_MIN_EVIDENCE (default 1).
+#       ONLY rows that clear this gate become eligible to be read into
+#       routing/context (see context_assembler). This is the guard against
+#       memory confabulation (Dixit 2026): raw self-diagnosed patterns stay
+#       'proposed' and never reach the rail; only evidence-backed ones are
+#       promoted to 'approved'. Opt-out MO_EMERGENT_VERIFY=0. Cold-safe: no-op
+#       on missing/empty table. Emits count of newly-approved rows on stdout.
+reflection_verify_patterns() {
+  if [ "${MO_EMERGENT_VERIFY:-1}" != "1" ]; then echo 0; return 0; fi
+  local min_strength="${MO_EMERGENT_VERIFY_MIN_STRENGTH:-3}"
+  local min_evidence="${MO_EMERGENT_VERIFY_MIN_EVIDENCE:-1}"
+  python3 - "${MINI_ORK_DB:?MINI_ORK_DB unset}" "$min_strength" "$min_evidence" <<'PY'
+import sqlite3, json, sys, time
+db, min_strength, min_evidence = sys.argv[1], float(sys.argv[2]), int(sys.argv[3])
+con = sqlite3.connect(db)
+con.execute("PRAGMA busy_timeout=5000")
+try:
+    rows = con.execute(
+        "SELECT pattern_id, member_item_ids_json, strength_score "
+        "FROM emergent_patterns WHERE status='proposed'"
+    ).fetchall()
+except sqlite3.OperationalError:
+    print(0); con.close(); sys.exit(0)
+now = int(time.time())
+approved = 0
+for pid, members_json, strength in rows:
+    try:
+        n_evidence = len(json.loads(members_json)) if members_json else 0
+    except (json.JSONDecodeError, TypeError):
+        n_evidence = 0
+    try:
+        s = float(strength)
+    except (TypeError, ValueError):
+        s = 0.0
+    if s >= min_strength and n_evidence >= min_evidence:
+        con.execute(
+            "UPDATE emergent_patterns SET status='approved', resolved_at=? "
+            "WHERE pattern_id=? AND status='proposed'",
+            (now, pid),
+        )
+        approved += 1
+con.commit()
+con.close()
+print(approved)
+PY
+}
+
+# desc: Orchestrate all reflection steps sequentially. since_ts is unix epoch;
 #       defaults to 24 hours ago.
 reflection_run() {
   local since_ts="${1:-$(( $(_rfl_now) - 86400 ))}"
@@ -509,6 +560,15 @@ PY
   local persisted
   persisted="$(reflection_persist_suggestions "$suggestions" 2>/dev/null || echo 0)"
   echo "reflection_run: ${count} promotion suggestions generated, ${persisted:-0} persisted" >&2
+
+  # [judge-gate] extract→distill→verify: promote only evidence-backed
+  # emergent_patterns from 'proposed' → 'approved' so confabulated
+  # self-diagnoses never reach routing/context (Dixit 2026).
+  echo "  [verify] judge-gate emergent_patterns" >&2
+  local approved
+  approved="$(reflection_verify_patterns 2>/dev/null || echo 0)"
+  echo "reflection_run: ${approved:-0} emergent_patterns approved by judge-gate" >&2
+
   echo "$suggestions"
 }
 

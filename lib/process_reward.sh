@@ -1,14 +1,18 @@
 #!/usr/bin/env bash
 # process_reward.sh — Process Reward Model (PRM) heuristic for mini-ork.
 #
-# Approximates a per-node reward 0.0-1.0 from observable trace signals:
-#   + 0.40  status = success
-#   + 0.20  tool_calls non-empty (agent actually did work)        [capped, see below]
-#   + 0.10  files_written or files_read non-empty (artifacts)      [capped, see below]
-#   + 0.15  reviewer_verdict in {APPROVE, pass, success, ok}, gated on
-#           status == success AND not same-family (see verifiable-first note)
-#   + 0.10  duration_ms in [1000, 600000] (not too fast, not too slow)
-#   + 0.05  cost_usd > 0 (real LLM invocation, not a stub)
+# Approximates a per-node reward 0.0-1.0 from observable trace signals. The
+# weight table + verdict set are the SINGLE SOURCE OF TRUTH in
+# mini_ork/learning/process_reward.py; both prm_score_trace and prm_backfill
+# load them from there by file path (see _load_prm_weights) so the values
+# cannot drift. Current outcome-dominant weights (status + review carry 0.80):
+#   + W_STATUS   status = success                               (outcome)
+#   + W_VERDICT  reviewer_verdict ∈ approve|approved|pass|success|ok,
+#               gated on status == success (see verifiable-first note)
+#   + W_TOOL     tool_calls non-empty (agent did work)           [capped]
+#   + W_FILE     files_written or files_read non-empty (artifacts)[capped]
+#   + W_DURATION duration_ms in [1000, 600000]
+#   (W_COST retired to 0.00 — rewarded cost>0, near-constant/off-thesis)
 # Total maxes at 1.0, floors at 0.0; partial credit is the point.
 #
 # Activity cap (Goodhart guard): by default the combined contribution of
@@ -27,10 +31,10 @@
 # without a real reviewer_model column in execution_traces, and the
 # asymmetric stripping of +0.15 from opus/minimax/glm/kimi runs biased
 # GRPO group ranking. Same-family neutralization awaits a schema change.
-# PRM copies in prm_score_trace and prm_backfill MUST stay behaviorally
-# identical: the weight table below is mirrored verbatim in prm_backfill.
-# Drift between the two causes process_reward to diverge between
-# single-trace writes and bulk backfills, silently breaking the router.
+# prm_score_trace and prm_backfill now load the weight table from the same
+# canonical Python module (mini_ork/learning/process_reward.py) instead of
+# each carrying an inline copy, so single-trace writes and bulk backfills can
+# no longer diverge and silently break the router.
 #
 # Public API:
 #   prm_score_trace   <trace_id>        compute + UPDATE process_reward
@@ -48,10 +52,10 @@ MINI_ORK_ROOT="${MINI_ORK_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 # lib/db_open.sh. STATE_DB is resolved per-call via $(mo_store_db_path) so
 # MO_STORE_DB / MO_STORE_BACKEND=postgres can route without forking this lib.
 # SQLite default (no env override) resolves to the same path as the old
-# ${MINI_ORK_DB:-${MINI_ORK_HOME:-.mini-ork}/state.db} convention. PRM weight
-# table (W_STATUS..W_COST, ACTIVITY_CAP) is mirrored verbatim between
-# prm_score_trace and prm_backfill; this refactor only changes the connect
-# path, not the scoring math.
+# ${MINI_ORK_DB:-${MINI_ORK_HOME:-.mini-ork}/state.db} convention. The PRM
+# weight table is single-sourced from mini_ork/learning/process_reward.py
+# (loaded by both prm_score_trace and prm_backfill); this refactor only
+# changes the connect path, not the scoring math.
 # shellcheck disable=SC1091
 . "${MINI_ORK_ROOT}/lib/policy_store.sh"
 
@@ -60,9 +64,9 @@ prm_score_trace() {
   mo_store_assert_sqlite
   local STATE_DB
   STATE_DB="$(mo_store_db_path)"
-  python3 - "$STATE_DB" "$trace_id" <<'PY'
-import json, os, sqlite3, sys
-db, trace_id = sys.argv[1:3]
+  python3 - "$STATE_DB" "$trace_id" "$MINI_ORK_ROOT" <<'PY'
+import importlib.util, json, os, sqlite3, sys
+db, trace_id, mo_root = sys.argv[1:4]
 con = sqlite3.connect(db)
 con.execute("PRAGMA busy_timeout=5000")
 con.row_factory = sqlite3.Row
@@ -83,21 +87,26 @@ def _len_json(s):
     except Exception:
         return 0
 
-# ── PRM weight table (DO NOT EDIT THIS COPY WITHOUT EDITING prm_backfill) ──
-# This table is mirrored verbatim in prm_backfill below. Both copies MUST
-# stay byte-identical so single-trace writes (prm_score_trace) and bulk
-# backfills (prm_backfill) compute the same process_reward for the same row.
-#   W_STATUS       = 0.40   # status == "success"
-#   W_TOOL         = 0.20   # tool_calls non-empty
-#   W_FILE         = 0.10   # files_read or files_written non-empty
-#   W_VERDICT      = 0.15   # reviewer_verdict ∈ approve|approved|pass|success|ok
-#                           #   AND status==success AND not same-family
-#   W_DURATION     = 0.10   # 1000 <= duration_ms <= 600000
-#   W_COST         = 0.05   # cost_usd > 0
-#   ACTIVITY_CAP   = 0.15   # MO_PRM_ACTIVITY_CAP=1 (default): clamp W_TOOL+W_FILE
-#                           # MO_PRM_ACTIVITY_CAP=0 (legacy): no clamp, activity can dominate
-W_STATUS, W_TOOL, W_FILE, W_VERDICT, W_DURATION, W_COST, ACTIVITY_CAP = \
-    0.50, 0.10, 0.05, 0.30, 0.05, 0.00, 0.15
+def _load_prm_weights(root):
+    """Load the canonical PRM weight table + verdict set from the Python port
+    by file path. Avoids `import mini_ork.*` so the facade in mini_ork/__init__
+    is not executed; the target module is pure stdlib with no import-time IO."""
+    src = os.path.join(root, "mini_ork", "learning", "process_reward.py")
+    spec = importlib.util.spec_from_file_location("mo_prm_weights", src)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return (mod.W_STATUS, mod.W_TOOL, mod.W_FILE, mod.W_VERDICT,
+            mod.W_DURATION, mod.ACTIVITY_CAP, set(mod._VERDICT_SET))
+
+# ── PRM weight table — SINGLE SOURCE OF TRUTH ─────────────────────────────
+# The weights + verdict set are canonically defined ONCE in
+# mini_ork/learning/process_reward.py and loaded here by file path (no package
+# import, so mini_ork/__init__'s facade is NOT triggered). prm_score_trace and
+# prm_backfill BOTH load from the same module, so the two copies can no longer
+# drift from each other or from the Python port. Parity is enforced by
+# tests/unit/test_process_reward_parity.py.
+W_STATUS, W_TOOL, W_FILE, W_VERDICT, W_DURATION, ACTIVITY_CAP, _VERDICT_SET = \
+    _load_prm_weights(mo_root)
 try:
     _activity_cap_enabled = int(os.environ.get("MO_PRM_ACTIVITY_CAP", "1")) != 0
 except ValueError:
@@ -117,7 +126,7 @@ if status_success:
         activity = min(activity, ACTIVITY_CAP)
     score += activity
     v = (r["reviewer_verdict"] or "").lower()
-    if v in {"approve", "approved", "pass", "success", "ok"}:
+    if v in _VERDICT_SET:
         score += W_VERDICT
     dur = int(r["duration_ms"] or 0)
     if 1000 <= dur <= 600000:
@@ -144,9 +153,9 @@ prm_backfill() {
   mo_store_assert_sqlite
   local STATE_DB
   STATE_DB="$(mo_store_db_path)"
-  python3 - "$STATE_DB" "$since" <<'PY'
-import json, os, sqlite3, sys, datetime
-db, since_str = sys.argv[1:3]
+  python3 - "$STATE_DB" "$since" "$MINI_ORK_ROOT" <<'PY'
+import importlib.util, json, os, sqlite3, sys, datetime
+db, since_str, mo_root = sys.argv[1:4]
 since = int(since_str)
 since_iso = datetime.datetime.utcfromtimestamp(since).strftime('%Y-%m-%dT%H:%M:%S.000Z')
 
@@ -167,21 +176,22 @@ def _len_json(s):
     except Exception:
         return 0
 
-# ── PRM weight table (DO NOT EDIT THIS COPY WITHOUT EDITING prm_score_trace) ──
-# Mirror copy of prm_score_trace's weight table. Both copies MUST stay
-# byte-identical so single-trace writes and bulk backfills compute the same
-# process_reward for the same row.
-#   W_STATUS       = 0.40   # status == "success"
-#   W_TOOL         = 0.20   # tool_calls non-empty
-#   W_FILE         = 0.10   # files_read or files_written non-empty
-#   W_VERDICT      = 0.15   # reviewer_verdict ∈ approve|approved|pass|success|ok
-#                           #   AND status==success AND not same-family
-#   W_DURATION     = 0.10   # 1000 <= duration_ms <= 600000
-#   W_COST         = 0.05   # cost_usd > 0
-#   ACTIVITY_CAP   = 0.15   # MO_PRM_ACTIVITY_CAP=1 (default): clamp W_TOOL+W_FILE
-#                           # MO_PRM_ACTIVITY_CAP=0 (legacy): no clamp, activity can dominate
-W_STATUS, W_TOOL, W_FILE, W_VERDICT, W_DURATION, W_COST, ACTIVITY_CAP = \
-    0.50, 0.10, 0.05, 0.30, 0.05, 0.00, 0.15
+def _load_prm_weights(root):
+    """Load the canonical PRM weight table + verdict set from the Python port
+    by file path. Identical loader to prm_score_trace — both read the single
+    source in mini_ork/learning/process_reward.py so they cannot diverge."""
+    src = os.path.join(root, "mini_ork", "learning", "process_reward.py")
+    spec = importlib.util.spec_from_file_location("mo_prm_weights", src)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return (mod.W_STATUS, mod.W_TOOL, mod.W_FILE, mod.W_VERDICT,
+            mod.W_DURATION, mod.ACTIVITY_CAP, set(mod._VERDICT_SET))
+
+# ── PRM weight table — SINGLE SOURCE OF TRUTH (see prm_score_trace) ────────
+# Loaded from the same canonical module as prm_score_trace, so single-trace
+# writes and bulk backfills compute identical process_reward for the same row.
+W_STATUS, W_TOOL, W_FILE, W_VERDICT, W_DURATION, ACTIVITY_CAP, _VERDICT_SET = \
+    _load_prm_weights(mo_root)
 try:
     _activity_cap_enabled = int(os.environ.get("MO_PRM_ACTIVITY_CAP", "1")) != 0
 except ValueError:
@@ -203,7 +213,7 @@ for r in rows:
             activity = min(activity, ACTIVITY_CAP)
         score += activity
         v = (r["reviewer_verdict"] or "").lower()
-        if v in {"approve", "approved", "pass", "success", "ok"}:
+        if v in _VERDICT_SET:
             score += W_VERDICT
         dur = int(r["duration_ms"] or 0)
         if 1000 <= dur <= 600000:

@@ -744,6 +744,16 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
         if rc != 0:
             fail_count += 1
     _emit_run_verdict(live_run_dir, fail_count, len(fields_list))
+    # Close the eval loop (bash mo_grade_run_reward, :3271): feed the rubric's GRADED
+    # 0-8 run score into reward_g on every trace of this run. When rubric.json exists it
+    # overwrites the per-node status-map reward with the graded value; absent → no-op,
+    # leaving the reward_from_status fallback the trace_fn already stamped. Best-effort.
+    if os.environ.get("MO_GRADE_RUN_REWARD", "1") == "1":
+        try:
+            from mini_ork import trace_store  # noqa: PLC0415
+            trace_store.grade_run_reward(live_run_dir, run_id, db=db)
+        except Exception:
+            pass
     if fail_count > 0:
         set_status(db, run_id, "failed")
         sys.stderr.write(f"execute: {fail_count} node(s) failed\n")
@@ -1277,6 +1287,11 @@ def _make_trace_fn(task_class, db, run_id):
         extra = {
             "trace_id": f"tr-{node_type}-{node_id}-{uuid.uuid4().hex[:8]}",
             "run_id": run_id,
+            # objective_domain is the GRPO slice key (bash obj stamp, :1839). Stamp it
+            # from the run's env so the feature-partition column populates per-run;
+            # default code-delivery ONLY when unset, matching trace_store's fallback.
+            "objective_domain": (os.environ.get("MINI_ORK_OBJECTIVE_DOMAIN")
+                                 or os.environ.get("MO_OBJECTIVE_DOMAIN") or "code-delivery"),
             "verifier_output": {"node_type": node_type, "finish_reason": finish_reason or None},
         }
         if output_file:
