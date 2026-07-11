@@ -289,6 +289,39 @@ PY
   fi
 fi
 
+# IMPL-3 close-the-loop: optional apply stage. Picks the highest-confidence
+# proposed prompt change for the current task_class and routes it through the
+# non-regression gate. Off-by-default; opt in via MO_APPLY_ENABLED=1. Best-
+# effort — a failure here never invalidates the reflect run. Smoke gate is
+# MO_APPLY_DRY_RUN=1 to keep unattended runs safe.
+#
+# Apply target selection: prefer `prompts/<task_class>/*.prompt` when such a
+# file exists (canonical reviewer/impl/etc. prompt slots); else skip with a
+# warning. We deliberately do NOT auto-discover every prompt file in the repo
+# — the agent/safety team owns the target allowlist, so we surface the
+# candidates and require a flag.
+if [ "${MO_APPLY_ENABLED:-0}" = "1" ] && [ -f "$MINI_ORK_ROOT/lib/apply.sh" ]; then
+  # shellcheck source=lib/apply.sh
+  source "$MINI_ORK_ROOT/lib/apply.sh" 2>/dev/null || true
+  APPLY_TC="${TASK_CLASS_FILTER:-${MINI_ORK_TASK_CLASS:-generic}}"
+  APPLY_TARGET_FILE="${MO_APPLY_TARGET_FILE:-prompts/${APPLY_TC}.prompt}"
+  if [ -f "$MINI_ORK_ROOT/$APPLY_TARGET_FILE" ]; then
+    echo "── apply (IMPL-3, MO_APPLY_ENABLED=1) ──"
+    APPLY_OUT=$(apply_run "$APPLY_TC" prompt_file "$APPLY_TARGET_FILE" \
+                   "$MINI_ORK_ROOT/$APPLY_TARGET_FILE" 2>&1 || true)
+    echo "$APPLY_OUT"
+    _APPLY_DECISION=$(printf '%s' "$APPLY_OUT" | python3 -c 'import json,sys
+try:
+    d=json.loads(sys.stdin.read().splitlines()[-1])
+    print(d.get("decision","unknown"))
+except Exception:
+    print("unknown")' 2>/dev/null || echo "unknown")
+    echo "  [apply] decision=${_APPLY_DECISION}"
+  else
+    echo "  [apply] MO_APPLY_ENABLED=1 but no target prompt at ${APPLY_TARGET_FILE}; set MO_APPLY_TARGET_FILE to override" >&2
+  fi
+fi
+
 # ── trace end ─────────────────────────────────────────────────────────────────
 # The closing trace carries WHAT reflect did (traces analyzed, gradients
 # written) — a bare status:"success" row gave gradient_extract nothing to
