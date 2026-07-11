@@ -343,6 +343,12 @@ if _has_defect_attributions:
     for _pr in _penalty_rows:
         _pen = float(_pr["penalty"])
         _hlf_raw = _pr["decay_halflife_days"]
+        # NOTE: this 30.0 is the DEFECT-ATTRIBUTION penalty-decay halflife, a
+        # DIFFERENT quantity from the GRPO recency halflife (MO_LEARNING_HALFLIFE_DAYS,
+        # default 14, at line ~89 and bin/mini-ork-execute). It is only a fallback
+        # for a NULL decay_halflife_days column and MUST match that column's write
+        # default in lib/blame_attributor.sh (DECAY=30.0 / DEFAULT 30.0) — not the
+        # learning halflife. The two are intentionally not unified.
         try:
             _hlf = float(_hlf_raw) if _hlf_raw is not None else 30.0
         except (TypeError, ValueError):
