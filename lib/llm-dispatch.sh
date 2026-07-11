@@ -29,6 +29,13 @@ MINI_ORK_ROOT="${MINI_ORK_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 [ -f "$MINI_ORK_ROOT/lib/providers/registry.sh" ] && \
   source "$MINI_ORK_ROOT/lib/providers/registry.sh"
 
+# Daily budget cap single source of truth: config/agents.yaml budget.daily_cap_usd
+# (read via mo_daily_budget_cap). The cost circuit below calls it instead of
+# hardcoding 50 so the cap matches the conductor + agents.yaml.
+# shellcheck source=lib/budget_config.sh
+[ -f "$MINI_ORK_ROOT/lib/budget_config.sh" ] && \
+  source "$MINI_ORK_ROOT/lib/budget_config.sh"
+
 # Models that ship as proper executables (call their CLI directly)
 _MO_LLM_EXECUTABLE_MODELS=(codex gemini)
 
@@ -1380,11 +1387,18 @@ llm_dispatch() {
   done
 
   # v0.2-pt7 (R10): cost circuit breaker. Check accumulated daily spend
-  # against MO_DAILY_BUDGET_USD before dispatching. Default cap: $50/day.
+  # against the daily cap before dispatching. The cap is single-sourced from
+  # config/agents.yaml (budget.daily_cap_usd) via mo_daily_budget_cap, with
+  # MO_DAILY_BUDGET_USD overriding and a 50 fallback when config is absent.
   # Returns non-zero with `[cost_circuit_open]` marker if exceeded so the
   # caller's $? check trips, halting the run gracefully.
   if [ -n "${MINI_ORK_DB:-}" ] && [ -f "${MINI_ORK_DB:-}" ]; then
-    local _budget="${MO_DAILY_BUDGET_USD:-50}"
+    local _budget
+    if declare -F mo_daily_budget_cap >/dev/null 2>&1; then
+      _budget="$(mo_daily_budget_cap)"
+    else
+      _budget="${MO_DAILY_BUDGET_USD:-50}"
+    fi
     local _spent_today
     _spent_today=$(python3 -c "
 import sqlite3, sys, time

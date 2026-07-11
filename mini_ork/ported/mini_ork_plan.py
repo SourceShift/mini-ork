@@ -23,6 +23,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -587,5 +588,24 @@ def _build_prompt(root, kickoff, workflow, profile_path) -> str:
     return prompt
 
 
+def _default_llm_dispatch(root):
+    """Default planner LLM seam for the CLI entry — shells to llm_dispatch, mirroring
+    bash bin/mini-ork-plan:656 (RESULT=$(llm_dispatch --node-type planner …)). Without
+    this, a python-runtime `mini-ork run` hard-fails at plan ('LLM dispatch unavailable')
+    because __main__ passed no dispatch. The seam stays injectable for tests (which pass
+    dispatch= explicitly or use MO_GIVEN_PLAN); only the CLI boundary wires this default."""
+    lib = os.path.join(root, "lib", "llm-dispatch.sh")
+
+    def d(task_class, node_type, prompt):
+        r = subprocess.run(
+            ["bash", "-c", f'source "{lib}"; llm_dispatch --task-class "$1" '
+             '--node-type "$2" --prompt-text "$3" 2>&1', "_", task_class, node_type, prompt],
+            capture_output=True, text=True)
+        return r.returncode, r.stdout
+    return d
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    _root = os.environ.get("MINI_ORK_ROOT") or \
+        os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    raise SystemExit(main(dispatch=_default_llm_dispatch(_root)))

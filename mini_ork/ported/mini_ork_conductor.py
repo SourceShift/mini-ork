@@ -29,6 +29,45 @@ def _today_cost(db):
     return float(r[0] or 0)
 
 
+def _adaptive_lane_gain(con, base=0.3):
+    """Fit the lane-advantage gain from conductor_decisions.realized_score.
+
+    Mirror of the embedded-python helper in bin/mini-ork-conductor. Reads back
+    the realized_score history (written post-run by the learning loop) and
+    calibrates the gain via an EMA of past outcomes: ema==0.5 → gain==base,
+    good track record widens it, poor track record damps it. Cold-safe: fewer
+    than MO_CONDUCTOR_GAIN_MIN_SAMPLES resolved decisions keeps the historical
+    default (0.3). Opt-out MO_CONDUCTOR_ADAPTIVE_GAIN=0. Bounded to [0.1, 0.6].
+    """
+    if os.environ.get("MO_CONDUCTOR_ADAPTIVE_GAIN", "1") != "1":
+        return base
+    try:
+        min_samples = int(os.environ.get("MO_CONDUCTOR_GAIN_MIN_SAMPLES", "3"))
+    except ValueError:
+        min_samples = 3
+    try:
+        rows = con.execute(
+            "SELECT realized_score FROM conductor_decisions "
+            "WHERE realized_score IS NOT NULL ORDER BY decided_at ASC"
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return base
+    scores = []
+    for r in rows:
+        try:
+            scores.append(float(r[0]))
+        except (TypeError, ValueError):
+            continue
+    if len(scores) < min_samples:
+        return base
+    alpha = 0.3
+    ema = scores[0]
+    for s in scores[1:]:
+        ema = alpha * s + (1.0 - alpha) * ema
+    gain = base * (2.0 * ema)
+    return max(0.1, min(0.6, gain))
+
+
 def decide_for_epic(db, epic_id, spent, cap, plast_budget) -> dict:
     budget_pct = (spent / cap) if cap > 0 else 0.0
     con = sqlite3.connect(db); con.execute("PRAGMA busy_timeout=5000"); con.row_factory = sqlite3.Row
@@ -93,6 +132,7 @@ def decide_for_epic(db, epic_id, spent, cap, plast_budget) -> dict:
                             "WHERE applied_at >= strftime('%s','now','-24 hours')").fetchone()["n"]
     plasticity_remaining = max(0, plast_budget - mut_today)
 
+    lane_gain = _adaptive_lane_gain(con, 0.3)
     predicted = (topology or {}).get("win_rate", 0.5) or 0.5
     lane_adv_sum = 0.0
     try:
@@ -105,7 +145,7 @@ def decide_for_epic(db, epic_id, spent, cap, plast_budget) -> dict:
                     lane_adv_sum += r["relative_advantage"]
     except sqlite3.OperationalError:
         pass
-    predicted = min(1.0, predicted * (1.0 + lane_adv_sum * 0.3))
+    predicted = min(1.0, predicted * (1.0 + lane_adv_sum * lane_gain))
     con.close()
     return {"epic_id": epic_id, "task_class": task_class, "topology": topology,
             "lane_hints": lane_hints, "open_role_proposals": open_proposals_n,
