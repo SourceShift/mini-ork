@@ -215,8 +215,8 @@ Cost guard: `MO_DAILY_BUDGET_USD` ($50 default) is enforced inside the dispatche
 
 Shipped totals (regenerable via `scripts/readme-claim-check.sh`):
 
-- **89 framework primitives** in `lib/` (lifecycle + memory + gates + agent registry + runtime + observability + the 4 calibration-list gates + HarnessBridge stack + live control plane + per-run config isolation + `lib/migrate.sh` checksummed transactional DB migrations).
-- **31 user-facing `bin/mini-ork` entrypoints** (the 6-stage loop + `eval` / `improve` / `promote` / `metrics` / `spawn` / `epics` / `scheduler` / `review` / `bugs` / `lifetime` / `coord` / `usage-report` / `watchdog` / `conductor` and friends).
+- **90 framework primitives** in `lib/` (lifecycle + memory + gates + agent registry + runtime + observability + the 4 calibration-list gates + HarnessBridge stack + live control plane + per-run config isolation + `lib/migrate.sh` checksummed transactional DB migrations + `lib/runtime-select.sh` bash→Python runtime cutover switch).
+- **32 user-facing `bin/mini-ork` entrypoints** (the `mini-ork` dispatcher + the 6-stage loop + `eval` / `improve` / `promote` / `metrics` / `spawn` / `epics` / `scheduler` / `review` / `bugs` / `lifetime` / `coord` / `usage-report` / `watchdog` / `conductor` and friends).
 - **48 schema migrations** under `db/migrations/` (memory namespaces, execution traces, gradients, panel topology, recursive orchestration, llm_calls, lifecycle widening, error taxonomy, heartbeat, agent performance, epic + bug + pre-push review tables, HarnessBridge grounded-rejections, run-artifacts trajectory store).
 - **28 recipes** shipped — see [Recipes table](#recipes) above.
 - **7 model-family wrappers** under [lib/providers/](lib/providers/) + BYO-key registry (`config/providers.yaml`) for custom Anthropic/OpenAI-compatible endpoints.

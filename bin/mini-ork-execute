@@ -30,6 +30,9 @@ set -Eeuo pipefail
 
 MINI_ORK_ROOT="${MINI_ORK_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 export MINI_ORK_ROOT
+# Runtime cutover (bash→Python): MINI_ORK_RUNTIME=python execs the ported module.
+{ [ -f "$MINI_ORK_ROOT/lib/runtime-select.sh" ] && . "$MINI_ORK_ROOT/lib/runtime-select.sh" && mo_runtime_maybe_delegate "${BASH_SOURCE[0]}" "$@"; } || true
+
 
 # R0a runtime seam (mo_runtime_exec and forwarders). Sourced defensively so a
 # fresh checkout without lib/runtime/ still runs; the factory defaults to the
@@ -2021,6 +2024,90 @@ _mo_policy_route_lane() {
   esac
 }
 
+# Killer-2 fix (2026-07-03, migration batch autopsy): gateway lanes
+# (minimax/glm/kimi via claude --print) often EMIT file contents in their text
+# output instead of applying them to the tree — the "capture coin-flip". When
+# the implementer dispatch produced no tree changes, parse its output for
+# (a) a unified diff → git apply, or (b) fenced file blocks with a path marker
+# (### FILE: path / ```lang file=path / **path** + fence) → write the files.
+# Path-safe: rejects absolute paths and .. traversal; only writes inside the
+# target repo. Best-effort, logs what it applied. Opt-out: MO_APPLY_IMPL_OUTPUT=0.
+mo_apply_impl_output() {
+  local impl_log="${1:?impl_log required}" target="${2:?target_cwd required}"
+  [ "${MO_APPLY_IMPL_OUTPUT:-1}" = "1" ] || return 0
+  [ -s "$impl_log" ] && [ -d "$target" ] || return 0
+  # only act when the implementer applied NOTHING (tree unchanged)
+  if [ -n "$(git -C "$target" status --porcelain 2>/dev/null | head -1)" ]; then
+    return 0
+  fi
+  python3 - "$impl_log" "$target" <<'PY' 2>/dev/null || true
+import os, re, subprocess, sys
+
+impl_log, target = sys.argv[1], sys.argv[2]
+text = open(impl_log, encoding="utf-8", errors="replace").read()
+target_real = os.path.realpath(target)
+
+def safe_path(p):
+    p = p.strip().strip('`"\'')
+    if not p or os.path.isabs(p) or ".." in p.split("/"):
+        return None
+    full = os.path.realpath(os.path.join(target_real, p))
+    if not full.startswith(target_real + os.sep):
+        return None
+    return p
+
+applied = []
+# (a) unified diff blocks
+if re.search(r"^--- (a/|/dev/null)", text, re.M) and re.search(r"^\+\+\+ b/", text, re.M):
+    m = re.search(r"(^--- .*?)(?=\n```|\Z)", text, re.S | re.M)
+    if m:
+        try:
+            subprocess.run(["git", "-C", target, "apply", "--whitespace=nowarn", "-"],
+                           input=m.group(1), text=True, capture_output=True, check=True)
+            applied.append("<unified-diff>")
+        except subprocess.CalledProcessError:
+            pass
+
+# (b) fenced blocks with a nearby path marker
+if not applied:
+    lines = text.splitlines()
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        fm = re.match(r"^```[\w+-]*\s+(?:file=|path=)?([\w./_-]+\.[\w]+)\s*$", line)
+        path = safe_path(fm.group(1)) if fm else None
+        if not path and line.startswith("```") and line.strip() != "```":
+            path = None
+        if not path and line.startswith("```"):
+            # look back up to 3 lines for a path marker
+            for back in range(1, 4):
+                if i - back < 0:
+                    break
+                pm = re.match(
+                    r"^\s*(?:#{2,4}\s*)?(?:\*\*)?(?:FILE:|File:|file:)?\s*`?([\w./_-]+\.(?:py|sh|md|yaml|yml|json|toml|txt|cfg|ini))`?:?(?:\*\*)?\s*$",
+                    lines[i - back])
+                if pm:
+                    path = safe_path(pm.group(1))
+                    break
+        if line.startswith("```") and path:
+            body = []
+            i += 1
+            while i < len(lines) and not lines[i].startswith("```"):
+                body.append(lines[i])
+                i += 1
+            if body:
+                full = os.path.join(target_real, path)
+                os.makedirs(os.path.dirname(full) or ".", exist_ok=True)
+                with open(full, "w", encoding="utf-8") as fh:
+                    fh.write("\n".join(body) + "\n")
+                applied.append(path)
+        i += 1
+
+if applied:
+    print("  [apply-impl-output] applied from implementer text: " + ", ".join(applied))
+PY
+}
+
 _mo_finish_reason_for_failure() {
   local _rc="${1:-1}" _text="${2:-}"
   if [ "$_rc" -eq 124 ]; then
@@ -2568,6 +2655,9 @@ PY
 	      _mo_stop_node_heartbeat_loop "$_heartbeat_pid"
 	      echo "$RESULT" > "$IMPL_LOG"
       echo "  [ok] implementer output → $IMPL_LOG"
+      # Killer-2 fix: if the lane emitted file contents in text instead of
+      # applying them (gateway-lane capture coin-flip), apply from the output.
+      mo_apply_impl_output "$IMPL_LOG" "${MO_TARGET_CWD:-$PWD}" || true
       # D-057 (2026-06-13): when the implementer is invoked under a sandbox
       # whose writable scope is the cwd (= the worktree under spawned-child
       # runs, or implementer-worktree under framework-edit), the LLM cannot
@@ -3288,6 +3378,19 @@ if [ "$DRY_RUN" -eq 0 ]; then
     mo_learning_update_conductor_outcomes >/dev/null
     mo_learning_write_grpo_advantages >/dev/null
   fi
+fi
+
+# Killer-1 fix (verdict.json gap): every run now emits a run-level verdict.json
+# so downstream gates (scheduler done/escalated, promotion, migration drivers)
+# read real data instead of resolving '<none>' and fail-closing into rollback.
+# Never overwrites a recipe-emitted panel-verdict.json / verdict.json.
+if [ -n "${MINI_ORK_RUN_DIR:-}" ] && [ -d "${MINI_ORK_RUN_DIR:-}" ] && \
+   [ ! -f "$MINI_ORK_RUN_DIR/verdict.json" ] && [ ! -f "$MINI_ORK_RUN_DIR/panel-verdict.json" ]; then
+  _mo_final_verdict="pass"; [ "$FAIL_COUNT" -gt 0 ] && _mo_final_verdict="fail"
+  printf '{"verdict":"%s","failed_nodes":%s,"dispatched":%s,"source":"execute@run-level"}\n' \
+    "$_mo_final_verdict" "${FAIL_COUNT:-0}" "${DISPATCHED_COUNT:-0}" \
+    > "$MINI_ORK_RUN_DIR/verdict.json" 2>/dev/null || true
+  echo "  [verdict] run-level verdict.json: $_mo_final_verdict (failed_nodes=${FAIL_COUNT:-0})"
 fi
 
 if [ "$FAIL_COUNT" -gt 0 ]; then
