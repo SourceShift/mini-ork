@@ -140,6 +140,15 @@ def policy_route_lane(node_type: str, current_lane: str, *, dry_run=False, root=
     if policy == "static_hybrid":
         return learning_static_lane(node_type, current_lane)
     if policy == "learning_governed":
+        # Router-monoculture fix: a recipe-pinned lane (current_lane != node_type) is a
+        # deliberate author choice — cross-family panel diversity (glm/kimi/codex/opus
+        # lenses) or a model-strength pin. The governed router must NOT override it with
+        # the single global-slice winner: that collapses every same-node-type panel node
+        # (4 researchers) onto ONE lane, destroying the diversity the recipe designed.
+        # Learning governs only UNPINNED nodes (current_lane == node_type); pinned nodes
+        # keep their lane — consistent with learning_static_lane's pin-preservation.
+        if current_lane != node_type:
+            return current_lane
         return learning_governed_lane(node_type, learning_static_lane(node_type, current_lane), root=root)
     if policy == "trace_governed":
         fail_count = int(os.environ.get("FAIL_COUNT", "0") or "0")
