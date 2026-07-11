@@ -16,6 +16,14 @@
 #   --lane <lane>         Resolve reflection through agents.yaml lane mapping
 #   --dry-run             Print what would be analyzed; do not invoke LLM
 #   --help
+#
+# Idempotency:
+#   Re-running reflect with an overlapping `--since` window is safe.
+#   reflection_extract_gradients carries a per-trace watermark against
+#   gradient_records.evidence — a trace already linked to a gradient is
+#   skipped, so re-extraction never duplicates rows. Framework-self
+#   traces (task_class starting with `__`, e.g. `__reflect__`) are
+#   filtered out before the LLM dispatch and contribute no gradient.
 
 set -Eeuo pipefail
 
@@ -234,6 +242,8 @@ fi
 # (MO_OPTIMIZER unset) leaves this block fully skipped: no python
 # invocation, no DB write, output byte-identical to the pre-R4b reflect.
 if [ "${MO_OPTIMIZER:-}" = "gepa" ]; then
+  MO_OPTIMIZER_MODEL="${MO_OPTIMIZER_MODEL:-minimax}"
+  export MO_OPTIMIZER_MODEL
   _GEPA_TASK_CLASS="${MO_OPTIMIZER_TASK_CLASS:-${TASK_CLASS_FILTER:-}}"
   _GEPA_RECIPE="${MINI_ORK_RECIPE:-${_GEPA_TASK_CLASS:-default}}"
   if [ -z "$_GEPA_TASK_CLASS" ] && [ "${MO_OPTIMIZER_ALLOW_DEFAULT:-0}" != "1" ]; then
@@ -245,7 +255,12 @@ import json, os, sys
 tc, recipe, db = sys.argv[1], sys.argv[2], sys.argv[3]
 from mini_ork.optimize import run_suggestion
 try:
-    print(json.dumps(run_suggestion(db_path=db, task_class=tc or "default", recipe=recipe or tc or "default")))
+    print(json.dumps(run_suggestion(
+        db_path=db,
+        task_class=tc or "default",
+        recipe=recipe or tc or "default",
+        model=os.environ.get("MO_OPTIMIZER_MODEL", "minimax"),
+    )))
 except Exception as e:
     print(json.dumps({"validity": "error", "description": f"gepa error: {e}", "output_type": "other"}))
 PY
@@ -256,7 +271,7 @@ PY
       _GEPA_FULL_EVAL=$(printf '%s' "$_GEPA_SUGGESTION_JSON" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("full_eval_count",0))' 2>/dev/null || echo 0)
       _GEPA_ART_DIR="${MINI_ORK_HOME}/optimizer"
       mkdir -p "$_GEPA_ART_DIR" 2>/dev/null || true
-      if [ "$_GEPA_VALIDITY" = "valid" ] && [ -n "$_GEPA_PATTERN_ID" ] \
+      if [ "$_GEPA_VALIDITY" != "error" ] && [ -n "$_GEPA_PATTERN_ID" ] \
          && [ -f "$MINI_ORK_ROOT/lib/pattern_store.sh" ]; then
         _require_lib pattern_store
         pattern_store "$_GEPA_SUGGESTION_JSON" >/dev/null 2>&1 || true
@@ -264,8 +279,49 @@ PY
       if [ -n "$_GEPA_PATTERN_ID" ]; then
         printf '%s\n' "$_GEPA_SUGGESTION_JSON" > "${_GEPA_ART_DIR}/${_GEPA_PATTERN_ID}.json" 2>/dev/null || true
       fi
-      echo "  [optimizer] gepa suggestion: ${_GEPA_PATTERN_ID:-<none>} full_eval_count=${_GEPA_FULL_EVAL:-0}"
+      case "$_GEPA_VALIDITY" in
+        insufficient_evidence)
+          echo "  [optimizer] gepa insufficient_evidence: ${_GEPA_PATTERN_ID:-<none>} (no execution_traces rows for task_class=${_GEPA_TASK_CLASS:-default}; suggestion not applied)" >&2
+          ;;
+        no_improvement)
+          echo "  [optimizer] gepa no_improvement: ${_GEPA_PATTERN_ID:-<none>} (zero accepted mutations; suggestion not applied)" >&2
+          ;;
+      esac
+      echo "  [optimizer] gepa suggestion: ${_GEPA_PATTERN_ID:-<none>} validity=${_GEPA_VALIDITY:-unknown} model=${MO_OPTIMIZER_MODEL} full_eval_count=${_GEPA_FULL_EVAL:-0}"
     fi
+  fi
+fi
+
+# IMPL-3 close-the-loop: optional apply stage. Picks the highest-confidence
+# proposed prompt change for the current task_class and routes it through the
+# non-regression gate. Off-by-default; opt in via MO_APPLY_ENABLED=1. Best-
+# effort — a failure here never invalidates the reflect run. Smoke gate is
+# MO_APPLY_DRY_RUN=1 to keep unattended runs safe.
+#
+# Apply target selection: prefer `prompts/<task_class>/*.prompt` when such a
+# file exists (canonical reviewer/impl/etc. prompt slots); else skip with a
+# warning. We deliberately do NOT auto-discover every prompt file in the repo
+# — the agent/safety team owns the target allowlist, so we surface the
+# candidates and require a flag.
+if [ "${MO_APPLY_ENABLED:-0}" = "1" ] && [ -f "$MINI_ORK_ROOT/lib/apply.sh" ]; then
+  # shellcheck source=lib/apply.sh
+  source "$MINI_ORK_ROOT/lib/apply.sh" 2>/dev/null || true
+  APPLY_TC="${TASK_CLASS_FILTER:-${MINI_ORK_TASK_CLASS:-generic}}"
+  APPLY_TARGET_FILE="${MO_APPLY_TARGET_FILE:-prompts/${APPLY_TC}.prompt}"
+  if [ -f "$MINI_ORK_ROOT/$APPLY_TARGET_FILE" ]; then
+    echo "── apply (IMPL-3, MO_APPLY_ENABLED=1) ──"
+    APPLY_OUT=$(apply_run "$APPLY_TC" prompt_file "$APPLY_TARGET_FILE" \
+                   "$MINI_ORK_ROOT/$APPLY_TARGET_FILE" 2>&1 || true)
+    echo "$APPLY_OUT"
+    _APPLY_DECISION=$(printf '%s' "$APPLY_OUT" | python3 -c 'import json,sys
+try:
+    d=json.loads(sys.stdin.read().splitlines()[-1])
+    print(d.get("decision","unknown"))
+except Exception:
+    print("unknown")' 2>/dev/null || echo "unknown")
+    echo "  [apply] decision=${_APPLY_DECISION}"
+  else
+    echo "  [apply] MO_APPLY_ENABLED=1 but no target prompt at ${APPLY_TARGET_FILE}; set MO_APPLY_TARGET_FILE to override" >&2
   fi
 fi
 
