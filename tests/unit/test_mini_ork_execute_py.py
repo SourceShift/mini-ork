@@ -389,10 +389,35 @@ def test_live_reviewer_verdict_gate(tmp_path):
     rc_rev, fr_rev = ex.dispatch_node(_fields("rev3", "reviewer", "opus"),
                                       dispatch_fn=_fake('{"verdict": "needs_revision"}'), **common)
     assert rc_rev == 1 and fr_rev == "verdict_revise"
+    # unknown/unparseable verdict on a gating (non-synth) node → FAIL, not neutral.
+    rc_unk, fr_unk = ex.dispatch_node(_fields("rev4", "reviewer", "opus"),
+                                      dispatch_fn=_fake("I think this looks fine overall."), **common)
+    assert rc_unk == 1 and fr_unk == "verdict_fail"
     # a synth reviewer never gates → always success
     rc_synth, _ = ex.dispatch_node(_fields("synth_node", "reviewer", "opus"),
                                    dispatch_fn=_fake("# Synthesis\ntop findings..."), **common)
     assert rc_synth == 0
+
+
+def test_live_verifier_hollow_artifact_fails(tmp_path):
+    # Hollow-run guard: a plan that requires a concrete absolute run-local artifact
+    # which is missing → the verifier node fails before any verifier runs. A real,
+    # non-empty artifact at that path passes the guard.
+    db = _seed_db(tmp_path, "vh"); _seed_task_run(db)
+    rd = tmp_path / "run"; rd.mkdir()
+    art = rd / "framework-edit.diff"
+    plan = tmp_path / "plan-req.json"
+    plan.write_text(json.dumps({"objective": "o",
+                                "artifact_contract": {"required_artifacts": [str(art)]}}))
+    common = dict(root=str(REPO), run_dir=str(rd), plan_path=str(plan),
+                  task_class="framework_edit", db=db, run_id="r1", dispatch_fn=_fake(""))
+    rc_missing, fr_missing = ex.dispatch_node(_fields("verify1", "verifier"), **common)
+    assert rc_missing == 1 and fr_missing == "error"
+    # Now materialise a real, non-empty artifact → guard passes (no outputs → the
+    # node returns 0 with an informational finish_reason, bash parity).
+    art.write_text("diff --git a/x b/x\n+real change\n")
+    rc_ok, _ = ex.dispatch_node(_fields("verify2", "verifier"), **common)
+    assert rc_ok == 0
 
 
 def test_run_verifier_ref(tmp_path):
