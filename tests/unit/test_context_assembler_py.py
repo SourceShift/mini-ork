@@ -105,6 +105,72 @@ def test_context_assemble_parity(db, tmp_path, monkeypatch):
     assert py_pack == bash_pack
 
 
+def _seed_emergent(db, rows):
+    """rows: (pattern_id, cluster_label, features_list, strength, status)."""
+    con = sqlite3.connect(db)
+    now = int(time.time())
+    for pid, label, feats, strength, status in rows:
+        con.execute(
+            "INSERT INTO emergent_patterns (pattern_id, cluster_label, "
+            "member_item_ids_json, feature_set_json, strength_score, "
+            "suggested_meta_adr, status, detected_at) VALUES (?,?,?,?,?,?,?,?)",
+            (pid, label, "[]", json.dumps(feats), strength,
+             "meta-adr text", status, now))
+    con.commit()
+    con.close()
+
+
+def test_verified_emergent_md_readback(db, monkeypatch):
+    """failure_modes_md surfaces judge-gate 'approved' emergent patterns and
+    hides 'proposed' ones; bash and python md output stay byte-identical."""
+    monkeypatch.setenv("MINI_ORK_DB", db)
+    monkeypatch.delenv("MO_TARGET_CWD", raising=False)
+    _seed_emergent(db, [
+        ("emg-ok",  "empty verifier output means silent failure",
+         ["verifier_addition"], 7.0, "approved"),
+        ("emg-raw", "unverified confabulated self-diagnosis",
+         ["adr"], 9.0, "proposed"),
+    ])
+    py = ca.failure_modes_md("code-fix", 5, db=db)
+    bash = _bash_fn(db, "context_failure_modes_md", "code-fix", "5")
+    assert py == bash
+    assert "Verified emergent patterns" in py
+    assert "empty verifier output means silent failure" in py
+    # The 'proposed' (unverified) pattern must NOT reach the prompt.
+    assert "confabulated" not in py
+
+
+def test_verified_emergent_optout_and_json(db, monkeypatch):
+    """MO_EMERGENT_INJECT=0 suppresses the block; JSON pack carries approved rows
+    under verified_emergent_patterns with bash/python parity."""
+    monkeypatch.setenv("MINI_ORK_DB", db)
+    _seed_emergent(db, [
+        ("emg-ok", "cross-run lesson", ["verifier_addition"], 6.0, "approved"),
+    ])
+    # opt-out hides the md block on both sides
+    monkeypatch.setenv("MO_EMERGENT_INJECT", "0")
+    py_off = ca.failure_modes_md("code-fix", 5, db=db)
+    bash_off = _bash_fn(db, "context_failure_modes_md", "code-fix", "5",
+                        extra_env={"MO_EMERGENT_INJECT": "0"})
+    assert py_off == bash_off
+    assert "Verified emergent patterns" not in py_off
+    monkeypatch.delenv("MO_EMERGENT_INJECT", raising=False)
+
+    # JSON path: verified_emergent_patterns populated + parity.
+    import tempfile
+    brief = os.path.join(tempfile.mkdtemp(), "brief.json")
+    with open(brief, "w") as f:
+        f.write(json.dumps({"task_class": "code-fix", "goal": "x"}))
+    pack = ca.context_assemble(brief, "implementer", db=db)
+    bash_out = _bash_fn(db, "context_assemble", brief, "implementer")
+    bpack = json.loads(bash_out)
+    for v in ("assembled_at", "tokens_estimated"):
+        pack.pop(v, None); bpack.pop(v, None)
+    assert pack == bpack
+    ids = [e["cite"] for e in pack["verified_emergent_patterns"]]
+    assert "emergent_patterns/emg-ok" in ids
+
+
 def test_truncation_budget(db, tmp_path, monkeypatch):
     brief = tmp_path / "brief.json"
     brief.write_text(json.dumps({"task_class": "code-fix"}))

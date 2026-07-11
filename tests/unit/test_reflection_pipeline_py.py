@@ -586,6 +586,105 @@ def shlex_quote(s: str) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# (9) reflection_verify_patterns — judge-gate: proposed → approved on floor
+# ─────────────────────────────────────────────────────────────────────────────
+def _seed_emergent(temp_db, rows):
+    """rows: list of (pattern_id, members_list, strength_score, status)."""
+    now = int(time.time())
+    con = sqlite3.connect(temp_db)
+    con.execute("PRAGMA busy_timeout=5000")
+    con.execute("DELETE FROM emergent_patterns")
+    for pid, members, strength, status in rows:
+        con.execute(
+            "INSERT INTO emergent_patterns (pattern_id, cluster_label, "
+            "member_item_ids_json, feature_set_json, strength_score, status, detected_at) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (pid, f"label-{pid}", json.dumps(members), json.dumps(["verifier_addition"]),
+             strength, status, now),
+        )
+    con.commit()
+    con.close()
+
+
+def test_reflection_verify_patterns_gate(temp_db):
+    """Judge-gate promotes only evidence-backed 'proposed' rows to 'approved'.
+
+    Floor (defaults): strength_score >= 3 AND member-evidence count >= 1.
+    Rows below either bound stay 'proposed'. Byte-parity on the stdout count
+    between the live bash function and the Python port (run bash first, re-seed,
+    then Python — each observes the same input)."""
+    seed = [
+        ("p-strong",   [{"item_table": "execution_traces", "item_id": "t1"}], 5.0, "proposed"),  # pass
+        ("p-weak-str", [{"item_table": "execution_traces", "item_id": "t2"}], 2.0, "proposed"),  # fail: strength
+        ("p-no-ev",    [],                                                     9.0, "proposed"),  # fail: evidence
+        ("p-already",  [{"item_table": "execution_traces", "item_id": "t3"}], 8.0, "approved"),  # not proposed
+    ]
+
+    _seed_emergent(temp_db, seed)
+    r = _run_bash_function(temp_db, "reflection_verify_patterns")
+    assert r.returncode == 0, f"bash verify failed: {r.stderr}"
+    assert r.stdout.strip() == "1", f"bash approved count: {r.stdout!r}"
+
+    _seed_emergent(temp_db, seed)
+    import io
+    from contextlib import redirect_stdout
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        n = rp.reflection_verify_patterns()
+    assert n == 1
+    assert buf.getvalue().strip() == "1"
+
+    # Row-diff after Python ran: only p-strong flipped to approved; p-already
+    # stays approved; the two failing rows stay proposed.
+    con = sqlite3.connect(temp_db)
+    statuses = dict(con.execute(
+        "SELECT pattern_id, status FROM emergent_patterns"
+    ).fetchall())
+    con.close()
+    assert statuses["p-strong"] == "approved"
+    assert statuses["p-weak-str"] == "proposed"
+    assert statuses["p-no-ev"] == "proposed"
+    assert statuses["p-already"] == "approved"
+
+
+def test_reflection_verify_patterns_optout(temp_db, monkeypatch):
+    """MO_EMERGENT_VERIFY=0 is a hard opt-out: nothing is promoted, count 0."""
+    seed = [("p-strong", [{"item_table": "execution_traces", "item_id": "t1"}], 5.0, "proposed")]
+    _seed_emergent(temp_db, seed)
+    r = _run_bash_function(temp_db, "reflection_verify_patterns",
+                           env_extra={"MO_EMERGENT_VERIFY": "0"})
+    assert r.stdout.strip() == "0"
+    monkeypatch.setenv("MO_EMERGENT_VERIFY", "0")
+    import io
+    from contextlib import redirect_stdout
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        n = rp.reflection_verify_patterns()
+    assert n == 0
+    con = sqlite3.connect(temp_db)
+    st = con.execute("SELECT status FROM emergent_patterns WHERE pattern_id='p-strong'").fetchone()[0]
+    con.close()
+    assert st == "proposed"  # untouched
+
+
+def test_reflection_verify_patterns_cold(temp_db):
+    """Cold-safe: no emergent_patterns rows → count 0, no crash (both sides)."""
+    con = sqlite3.connect(temp_db)
+    con.execute("PRAGMA busy_timeout=5000")
+    con.execute("DELETE FROM emergent_patterns")
+    con.commit()
+    con.close()
+    r = _run_bash_function(temp_db, "reflection_verify_patterns")
+    assert r.returncode == 0 and r.stdout.strip() == "0"
+    import io
+    from contextlib import redirect_stdout
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        assert rp.reflection_verify_patterns() == 0
+    assert buf.getvalue().strip() == "0"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # (8) reflection_extract_gradients — SQL trace_id selection + injected stub
 # ─────────────────────────────────────────────────────────────────────────────
 def test_reflection_extract_gradients(temp_db):
