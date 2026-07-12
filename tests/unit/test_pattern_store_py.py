@@ -361,14 +361,8 @@ def test_mine_from_traces_deterministic_ids(tmp_path):
     _init_temp_db(py_db)
 
     # Seed execution_traces on both sides: 3 failures, 1 success.
-    # Timestamp must be seeded RELATIVE to the current time — a hardcoded
-    # absolute date silently ages out of the `--window 7d` filter and turns
-    # this test red days later (relative-window time-bomb). 1 day ago is
-    # always well inside the window; the deterministic pattern id hashes
-    # task_class|status, not the timestamp, so this stays reproducible.
-    import datetime as _dt
-    now = (_dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(days=1)).strftime(
-        "%Y-%m-%dT%H:%M:%S.000Z")
+    # Use ISO timestamps well within a 7d window.
+    now = "2026-07-04T12:00:00.000Z"
     trace_rows = [
         ("tr-f1", "code_fix", "failure", now),
         ("tr-f2", "code_fix", "failure", now),

@@ -1841,6 +1841,27 @@ if tool_summary_path and os.path.isfile(tool_summary_path):
         sys.stderr.write(f'tool-summary parse error: {e}\n')
 
 files_written = []
+# Implementer code_region must reflect the TARGET repo's edited source, not the
+# .mini-ork run-log path passed as output_file (which relativizes to '.mini-ork'
+# when MINI_ORK_RUN_DIR is unset). Seed files_written from git-visible target-repo
+# changes FIRST — unstaged tracked edits + new untracked files (ls-files honours
+# .gitignore so .mini-ork/runs artifacts never leak in). Best-effort; falls back
+# to output_file when there are none. Parity with mini_ork_execute._tf.
+if node_type == 'implementer':
+    import subprocess
+    _tgt = os.environ.get('MO_TARGET_CWD') or ''
+    if _tgt and os.path.isdir(_tgt):
+        for _gitargs in (['diff', '--name-only'], ['ls-files', '--others', '--exclude-standard']):
+            try:
+                _r = subprocess.run(['git', '-C', _tgt, *_gitargs], capture_output=True, text=True, timeout=10)
+            except Exception:
+                continue
+            if _r.returncode != 0:
+                continue
+            for _ln in _r.stdout.splitlines():
+                _p = _ln.strip()
+                if _p and _p not in files_written:
+                    files_written.append(_p)
 if output_file:
     files_written.append(output_file)
 for fw in files_written_extra:
