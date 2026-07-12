@@ -236,6 +236,34 @@ def infer_trace_code_region(payload: str) -> str:
     return ""
 
 
+def _target_repo_changed_files() -> list[str]:
+    """Repo-relative paths git sees as changed in the TARGET repo, so an
+    implementer trace's code_region reflects the edited source — not the
+    .mini-ork run-log path passed as output_file (which relativizes to
+    '.mini-ork' when MINI_ORK_RUN_DIR is unset). Covers unstaged tracked
+    edits (`git diff --name-only`) plus new untracked files (`ls-files
+    --others --exclude-standard`, which honours .gitignore so .mini-ork/runs
+    artifacts never leak in). Best-effort: any git failure yields [] and the
+    caller falls back to the impl.log path (prior behaviour)."""
+    target = os.environ.get("MO_TARGET_CWD") or ""
+    if not target or not os.path.isdir(target):
+        return []
+    files: list[str] = []
+    for args in (["diff", "--name-only"], ["ls-files", "--others", "--exclude-standard"]):
+        try:
+            r = subprocess.run(["git", "-C", target, *args],
+                               capture_output=True, text=True, timeout=10)
+        except Exception:
+            continue
+        if r.returncode != 0:
+            continue
+        for line in r.stdout.splitlines():
+            p = line.strip()
+            if p and p not in files:
+                files.append(p)
+    return files
+
+
 # ── GRPO learning writeback (verbatim transcription of the embedded python) ──
 
 def learning_update_conductor_outcomes(db) -> int:
@@ -1337,7 +1365,12 @@ def _make_trace_fn(task_class, db, run_id):
         # so lane_router_recompute_advantages can't group rows by lane.
         if lane:
             extra["agent_version_id"] = lane
-        files_written = []
+        # Implementer code_region must reflect the TARGET repo's edited source,
+        # not the .mini-ork run-log path. Seed files_written from git-visible
+        # target-repo changes FIRST so infer_trace_code_region resolves the
+        # region from the edited repo; output_file (impl.log) stays as the
+        # fallback consumed only when there are no target-repo changes.
+        files_written = _target_repo_changed_files() if node_type == "implementer" else []
         if output_file:
             extra["final_artifact_ref"] = output_file
             files_written.append(output_file)
