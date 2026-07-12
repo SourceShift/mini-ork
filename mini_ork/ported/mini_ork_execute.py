@@ -40,17 +40,31 @@ _NODE_TYPE_ORDER = ("planner", "researcher", "implementer", "reviewer", "verifie
                     "reflector", "publisher", "rollback")
 
 
+# Anti-Goodhart reward anchor (per arXiv 2601.18533 chain-veto semantics):
+# execution status is the PRIMARY (verified) anchor; the reviewer verdict can
+# only VETO (downgrade), never fabricate a positive. The prior implementation
+# was judge-anchored — verdict checked first, status only as fallback — which
+# let a self-improving loop learn to GAME the reviewer instead of writing
+# correct code. This rewrite makes the loop reward *verified execution*, with
+# the reviewer as a one-way downgrade gate.
+_REWARD_SUCCESS_STATUSES = ("success", "published", "done", "pass")
+_REWARD_FAILURE_STATUSES = ("failure", "failed", "rolled_back", "blocked",
+                            "crash", "escalated", "reject")
+_REWARD_VETO_VERDICTS = ("reject", "needs_revision", "request_changes",
+                         "escalate")
+_REWARD_APPROVE_VERDICTS = ("approve", "approved", "pass", "passed",
+                            "success", "ok")
+
+
 def reward_from_status(status: str = "", verdict: str = "") -> str:
-    v = (verdict or "").lower()
-    if v in ("approve", "approved", "pass", "passed", "success", "ok"):
-        return "1.0"
-    if v in ("reject", "rejected", "fail", "failed", "request_changes", "needs_revision", "escalate"):
-        return "0.0"
     s = (status or "").lower()
-    if s in ("success", "published", "done", "approve", "approved", "pass", "passed"):
-        return "1.0"
-    if s in ("failure", "failed", "rolled_back", "blocked", "crash", "escalated", "reject", "rejected"):
+    v = (verdict or "").lower()
+    if s in _REWARD_FAILURE_STATUSES:
         return "0.0"
+    if s in _REWARD_SUCCESS_STATUSES:
+        return "0.0" if v in _REWARD_VETO_VERDICTS else "1.0"
+    if s == "":
+        return "1.0" if v in _REWARD_APPROVE_VERDICTS else "0.5"
     return "0.5"
 
 
