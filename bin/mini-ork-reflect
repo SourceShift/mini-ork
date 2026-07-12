@@ -227,12 +227,29 @@ fi
 # Track B item 4: GRPO-style lane routing — recompute relative_advantage
 # per (lane, task_class) from group-relative trace comparisons. Default on,
 # opt out via MO_LANE_ROUTER=0. arXiv:2601.22607 + 2603.02701.
+#
+# D5 wiring: when MO_ROUTER_PER_NODE_CREDIT=1, weight reward_g by per-node
+# process_reward BEFORE the lane router reads it, then restore from the
+# backup table so downstream consumers (next reflect cycle, replay eval,
+# obs UI) see the unweighted rubric value. The apply step is gated on the
+# flag; the restore step runs UNCONDITIONALLY so a stale backup from a
+# prior crashed run can never leak — the restore path drops the table
+# even when it is empty.
+_D5_APPLIED=0
 if [ "${MO_LANE_ROUTER:-1}" != "0" ] \
    && [ -f "$MINI_ORK_ROOT/lib/lane_router.sh" ]; then
+  if [ "${MO_ROUTER_PER_NODE_CREDIT:-0}" = "1" ]; then
+    reflection_apply_per_node_credit 2>/dev/null || true
+    _D5_APPLIED=1
+  fi
   _require_lib lane_router
   _LANES_UPDATED=$(lane_router_recompute_advantages --since "$SINCE" 2>/dev/null || echo 0)
   echo "  [lane_router] recomputed advantage for ${_LANES_UPDATED:-0} (lane, task_class) pair(s)"
 fi
+# Always run the restore so a stale backup from a prior crashed run can't
+# leak weighted reward_g values into subsequent reflect cycles or into the
+# obs UI. No-op when the table is absent (MO_ROUTER_PER_NODE_CREDIT=0).
+reflection_restore_per_node_credit 2>/dev/null || true
 
 # R4b: GEPA-style reflective prompt optimizer — opt-in via MO_OPTIMIZER=gepa.
 # Wires mini_ork.optimize.gepa (Protocol + optimize()) plus
