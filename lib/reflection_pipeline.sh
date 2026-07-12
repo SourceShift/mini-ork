@@ -507,6 +507,158 @@ print(approved)
 PY
 }
 
+# desc: D5 — per-node credit from the single outcome.
+#   reflection_apply_per_node_credit
+#       Reweight each trace's reward_g by its per-node process_reward so
+#       decisive nodes (high process_reward vs run mean) carry more credit
+#       into recompute_advantages, while consensus nodes (process_reward
+#       near 0.5) carry less. Falls back to uniform (no reweight) when a
+#       trace's process_reward is NULL or when MO_ROUTER_PER_NODE_CREDIT=0.
+#       Idempotent: re-running with no state carries zero net effect
+#       because the original reward_g is restored from per_node_credit_backup
+#       in reflection_restore_per_node_credit. Best-effort: any failure
+#       in the apply path triggers an automatic restore so the caller
+#       never sees a partially-weighted DB.
+#
+#   Math: per_node_weight = 1 + gamma * (process_reward - 0.5)
+#         effective_reward_g = reward_g * per_node_weight
+#         (clamped to [-1.0, +1.0] to match reward_g's documented range).
+#         gamma defaults to 1.0 (full amplification). Set
+#         MO_ROUTER_PER_NODE_CREDIT_GAMMA=0 for the uniform limit (no
+#         reweight, only the backup/restore overhead remains).
+#
+#   State: a side-table `per_node_credit_backup` (id PRIMARY KEY,
+#         original_reward_g REAL) is created in the same DB. It is
+#         dropped by reflection_restore_per_node_credit at the end of
+#         the reflect cycle. No ALTER TABLE on execution_traces — the
+#         plan's out_of_scope rule is respected.
+#
+#   Cold-start: a fresh DB (no reward_g rows) is a no-op — empty backup
+#               table is still created and immediately dropped so the
+#               restore path stays symmetric.
+reflection_apply_per_node_credit() {
+  [ "${MO_ROUTER_PER_NODE_CREDIT:-0}" = "1" ] || return 0
+  [ -n "${MINI_ORK_DB:-}" ] || return 0
+  [ -f "${MINI_ORK_DB}" ] || return 0
+
+  local _gamma="${MO_ROUTER_PER_NODE_CREDIT_GAMMA:-1.0}"
+  python3 - "${MINI_ORK_DB}" "$_gamma" <<'PY' 2>/dev/null || true
+import os, sqlite3, sys
+
+db, gamma_s = sys.argv[1], sys.argv[2]
+try:
+    gamma = float(gamma_s)
+except (TypeError, ValueError):
+    gamma = 1.0
+# Hard cap so a runaway env knob can't drive weight to 0 / negative;
+# the kickoff's contract is a multiplier around 1.0 (range [0.5, 1.5]).
+if gamma < 0.0:
+    gamma = 0.0
+if gamma > 2.0:
+    gamma = 2.0
+
+con = sqlite3.connect(db)
+con.execute("PRAGMA busy_timeout=5000")
+con.row_factory = sqlite3.Row
+try:
+    cols = {r[1] for r in con.execute(
+        "PRAGMA table_info(execution_traces)").fetchall()}
+except sqlite3.OperationalError:
+    con.close(); sys.exit(0)
+if "reward_g" not in cols or "process_reward" not in cols:
+    con.close(); sys.exit(0)
+
+# CREATE TABLE — keep idempotent + in the same DB so the restore path
+# (reflection_restore_per_node_credit) sees the originals. NOT a
+# migration — this is a transient staging table scoped to one reflect
+# cycle.
+con.execute(
+    "CREATE TABLE IF NOT EXISTS per_node_credit_backup ("
+    "  id INTEGER PRIMARY KEY,"
+    "  original_reward_g REAL NOT NULL"
+    ")")
+
+# Snapshot original reward_g BEFORE we mutate. Only rows with both a
+# non-NULL reward_g AND a non-NULL process_reward get a backup; rows
+# with NULL process_reward keep their uniform fallback (no reweight,
+# no backup row either).
+# execution_traces has no integer 'id' column (PK is trace_id, a TEXT hash);
+# use sqlite's implicit rowid as the stable integer key for the backup.
+con.execute(
+    "INSERT OR REPLACE INTO per_node_credit_backup (id, original_reward_g) "
+    "SELECT rowid, reward_g FROM execution_traces "
+    "  WHERE reward_g IS NOT NULL "
+    "    AND process_reward IS NOT NULL")
+
+cur = con.execute(
+    "SELECT rowid AS id, reward_g, process_reward FROM execution_traces "
+    "  WHERE reward_g IS NOT NULL "
+    "    AND process_reward IS NOT NULL")
+updated = 0
+for row in cur:
+    try:
+        rg = float(row["reward_g"])
+        pr = float(row["process_reward"])
+    except (TypeError, ValueError):
+        continue
+    weight = 1.0 + gamma * (pr - 0.5)
+    # Clamp to keep effective reward_g inside the documented [-1, +1] range.
+    eff = max(-1.0, min(1.0, rg * weight))
+    con.execute(
+        "UPDATE execution_traces SET reward_g = ? WHERE rowid = ?",
+        (round(eff, 6), row["id"]))
+    updated += 1
+con.commit()
+con.close()
+sys.stderr.write(
+    f"  [d5] per-node credit: gamma={gamma:g} updated={updated} traces\n")
+PY
+}
+
+# desc: D5 — restore reward_g from per_node_credit_backup after
+#       lane_router_recompute_advantages has consumed the reweighted
+#       values. No-op when per_node_credit_backup is absent or empty
+#       (e.g. MO_ROUTER_PER_NODE_CREDIT=0, fresh DB, or restore already
+#       ran in this reflect cycle). Tolerates failures silently —
+#       a stale backup row only risks a future reflect cycle seeing
+#       slightly-different reward_g values on the same trace ids, never
+#       a crash.
+reflection_restore_per_node_credit() {
+  [ -n "${MINI_ORK_DB:-}" ] || return 0
+  [ -f "${MINI_ORK_DB}" ] || return 0
+  python3 - "${MINI_ORK_DB}" <<'PY' 2>/dev/null || true
+import sqlite3, sys
+
+db = sys.argv[1]
+con = sqlite3.connect(db)
+con.execute("PRAGMA busy_timeout=5000")
+try:
+    cur = con.execute(
+        "SELECT id, original_reward_g FROM per_node_credit_backup")
+    rows = cur.fetchall()
+except sqlite3.OperationalError:
+    con.close(); sys.exit(0)
+if not rows:
+    # Empty table — drop it and exit. Keeps the DB clean even when
+    # MO_ROUTER_PER_NODE_CREDIT=0 (the apply path is a no-op).
+    con.execute("DROP TABLE IF EXISTS per_node_credit_backup")
+    con.commit()
+    con.close(); sys.exit(0)
+
+restored = 0
+for backup_rowid, original in rows:
+    con.execute(
+        "UPDATE execution_traces SET reward_g = ? WHERE rowid = ?",
+        (original, backup_rowid))
+    restored += 1
+con.execute("DROP TABLE IF EXISTS per_node_credit_backup")
+con.commit()
+con.close()
+sys.stderr.write(
+    f"  [d5] per-node credit restored: {restored} traces reverted\n")
+PY
+}
+
 # desc: Orchestrate all reflection steps sequentially. since_ts is unix epoch;
 #       defaults to 24 hours ago.
 reflection_run() {
