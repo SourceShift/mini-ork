@@ -362,10 +362,13 @@ def test_reflection_detect_stale(temp_db):
     assert sorted(bash_json["stale_ids"]) == sorted(py_json["stale_ids"]) == [
         "g-stale-1", "g-stale-2",
     ]
-    # Bash uses time.time() inside python3 — float; Python uses time.time() —
-    # also float. They may differ by milliseconds. Use the float-tolerance gate.
+    # Bash and Python compute `now` in two separate subprocesses; when the
+    # window base is truncated to integer seconds, the two calls can land on
+    # opposite sides of a second boundary and differ by exactly 1 (observed:
+    # bash=…654 vs py=…655). Tolerate a full-second straddle — a 1e-6 gate was
+    # a CI time-bomb that flaked whenever the calls crossed a second.
     assert math.isclose(bash_json["stale_before_epoch"], py_json["stale_before_epoch"],
-                        rel_tol=0, abs_tol=1e-6), (
+                        rel_tol=0, abs_tol=2), (
         f"stale_before_epoch mismatch: bash={bash_json['stale_before_epoch']} py={py_json['stale_before_epoch']}"
     )
     # Stderr summary must match byte-for-byte.
