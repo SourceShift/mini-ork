@@ -1,0 +1,20 @@
+[
+  {
+    "id": "t1",
+    "dir": "t1",
+    "gold_test_cmd": "pytest evals/heldout/tasks/t1/test_t1.py -q",
+    "note": "word_count: counts only ASCII spaces; off-by-one on empty string"
+  },
+  {
+    "id": "t2",
+    "dir": "t2",
+    "gold_test_cmd": "pytest evals/heldout/tasks/t2/test_t2.py -q",
+    "note": "flatten: only flattens one level; nested lists past depth one survive"
+  },
+  {
+    "id": "t3",
+    "dir": "t3",
+    "gold_test_cmd": "pytest evals/heldout/tasks/t3/test_t3.py -q",
+    "note": "fizzbuzz: returns only Fizz for multiples of 15; should be FizzBuzz"
+  }
+]
