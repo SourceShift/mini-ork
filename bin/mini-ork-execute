@@ -289,24 +289,36 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-# NOTE (verdict vocabulary): this maps a terminal verdict/status to an OUTCOME
-# reward in {1.0, 0.5, 0.0} — a DIFFERENT concept from the PRM verdict-credit
-# gate in lib/process_reward.sh / mini_ork/learning/process_reward.py, whose
-# set is {approve,approved,pass,success,ok}. This set is intentionally broader
-# (adds `passed` and status terms like published/done) because it also
-# classifies raw run STATUS, not just reviewer verdicts. The two sets are NOT
-# unified on purpose: adding `passed` to the PRM gate would grant +W_VERDICT to
-# traces that currently score without it (a reward-value change, out of scope).
+# Anti-Goodhart reward anchor (per arXiv 2601.18533 chain-veto semantics):
+# execution status is the PRIMARY (verified) anchor; the reviewer verdict can
+# only VETO (downgrade), never fabricate a positive. This MUST stay in exact
+# parity with mini_ork/ported/mini_ork_execute.py:reward_from_status — GRPO
+# trains on whichever side the trainer reads, so a divergence is silent skill
+# corruption (see reward_from_status_parity test below).
 _mo_reward_from_status() {
   local _status="${1:-}" _verdict="${2:-}"
-  case "$(printf '%s' "$_verdict" | tr '[:upper:]' '[:lower:]')" in
-    approve|approved|pass|passed|success|ok) printf '1.0\n'; return 0 ;;
-    reject|rejected|fail|failed|request_changes|needs_revision|escalate) printf '0.0\n'; return 0 ;;
-  esac
-  case "$(printf '%s' "$_status" | tr '[:upper:]' '[:lower:]')" in
-    success|published|done|approve|approved|pass|passed) printf '1.0\n' ;;
-    failure|failed|rolled_back|blocked|crash|escalated|reject|rejected) printf '0.0\n' ;;
-    *) printf '0.5\n' ;;
+  local _s _v
+  _s="$(printf '%s' "$_status" | tr '[:upper:]' '[:lower:]')"
+  _v="$(printf '%s' "$_verdict" | tr '[:upper:]' '[:lower:]')"
+  case "$_s" in
+    failure|failed|rolled_back|blocked|crash|escalated|reject)
+      printf '0.0\n'; return 0 ;;
+    success|published|done|pass)
+      case "$_v" in
+        reject|needs_revision|request_changes|escalate)
+          printf '0.0\n'; return 0 ;;
+        *)
+          printf '1.0\n'; return 0 ;;
+      esac ;;
+    "")
+      case "$_v" in
+        approve|approved|pass|passed|success|ok)
+          printf '1.0\n'; return 0 ;;
+        *)
+          printf '0.5\n'; return 0 ;;
+      esac ;;
+    *)
+      printf '0.5\n'; return 0 ;;
   esac
 }
 
