@@ -623,6 +623,7 @@ def test_trace_fn_merges_tool_summary_sidecar_and_lane(tmp_path, monkeypatch):
     # bash _trace_write_node_rich. And the resolved lane must land as agent_version_id.
     db = _seed_db(tmp_path, "sidecar"); _seed_task_run(db, rid="run-x", status="executing")
     monkeypatch.setenv("MINI_ORK_DB", db)
+    monkeypatch.delenv("MO_TARGET_CWD", raising=False)  # keep files_written deterministic (no target-repo seed)
     out = tmp_path / "impl.log"; out.write_text("implementer output\n")
     # Seed the tool-summary sidecar next to the output file, bash-shaped.
     (tmp_path / "impl.log.tool-summary").write_text(json.dumps({
@@ -650,6 +651,7 @@ def test_trace_fn_no_sidecar_leaves_tool_calls_empty(tmp_path, monkeypatch):
     # merge is strictly best-effort and gated on sidecar existence, like bash).
     db = _seed_db(tmp_path, "nosidecar"); _seed_task_run(db, rid="run-n", status="executing")
     monkeypatch.setenv("MINI_ORK_DB", db)
+    monkeypatch.delenv("MO_TARGET_CWD", raising=False)  # keep files_written deterministic (no target-repo seed)
     out = tmp_path / "impl.log"; out.write_text("out\n")
     tf = ex._make_trace_fn("code_fix", db, "run-n")
     tf("impl1", "success", "implementer", output_file=str(out), lane="codex_lens")
@@ -660,6 +662,33 @@ def test_trace_fn_no_sidecar_leaves_tool_calls_empty(tmp_path, monkeypatch):
     assert json.loads(fr) == []
     assert json.loads(fw) == [str(out)]
     assert agent == "codex_lens"
+
+
+def test_implementer_trace_code_region_from_target_repo(tmp_path, monkeypatch):
+    # Regression: an implementer node's code_region must reflect the TARGET repo's
+    # edited source dir, NOT '.mini-ork'. The impl.log passed as output_file lives
+    # under $MO_TARGET_CWD/.mini-ork/runs/<id>/ — with MINI_ORK_RUN_DIR unset it
+    # relativizes to '.mini-ork', poisoning the GRPO code_region slice. files_written
+    # must be seeded from git-visible target-repo changes first (untracked + unstaged),
+    # and .mini-ork/runs artifacts must be excluded via .gitignore.
+    db = _seed_db(tmp_path, "implregion"); _seed_task_run(db, rid="run-i", status="executing")
+    repo = _git_repo(tmp_path / "repo")
+    (repo / ".gitignore").write_text(".mini-ork/runs/\n")   # mirror production: run artifacts ignored
+    subprocess.run(["git", "-C", str(repo), "add", ".gitignore"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "gitignore"], check=True, capture_output=True)
+    (repo / "app").mkdir()
+    (repo / "app" / "service.py").write_text("x = 1\n")     # new untracked source edit (implementer output)
+    run_dir = repo / ".mini-ork" / "runs" / "run-i"; run_dir.mkdir(parents=True)
+    impl_log = run_dir / "impl-impl1.log"; impl_log.write_text("done\n")  # the poisoning output_file
+    monkeypatch.setenv("MINI_ORK_DB", db)
+    monkeypatch.setenv("MO_TARGET_CWD", str(repo))
+    monkeypatch.delenv("MINI_ORK_RUN_DIR", raising=False)   # the env that triggered the bug
+    monkeypatch.delenv("RUN_DIR", raising=False)
+    tf = ex._make_trace_fn("code_fix", db, "run-i")
+    tf("impl1", "success", "implementer", output_file=str(impl_log), finish_reason="done")
+    region = _sql(db, "SELECT code_region FROM execution_traces "
+                      "WHERE run_id='run-i';").stdout.strip()
+    assert region == "app", f"expected 'app' from target-repo edit, got {region!r}"
 
 
 # ── orchestration backbone parity (NODE_IDS + --dry-run) ──
