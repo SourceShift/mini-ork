@@ -57,6 +57,84 @@ def test_reward_from_status_parity():
         assert rb == rp, f"({status!r},{verdict!r}): bash={rb!r} py={rp!r}"
 
 
+# --- Anti-Goodhart reward anchor: status is primary, verdict only vetoes ---
+# These tests encode the truth table from kickoffs/reward-execution-anchor.md.
+# The prior judge-anchored wiring let a self-improving loop learn to GAME the
+# reviewer instead of writing correct code; the fix re-anchors on verified
+# execution status so a happy verdict cannot fabricate a positive on failed exec.
+
+
+def test_failed_execution_beats_happy_judge():
+    # Anti-Goodhart: judge approval cannot fabricate a positive on failed exec.
+    for s in ("failure", "failed", "rolled_back", "blocked", "crash",
+              "escalated", "reject"):
+        assert ex.reward_from_status(s, "approve") == "0.0", \
+            f"status={s!r} verdict='approve' must be 0.0 (exec failed)"
+        assert ex.reward_from_status(s, "") == "0.0", \
+            f"status={s!r} verdict='' must be 0.0 (exec failed)"
+
+
+def test_judge_veto_zeros_pass():
+    # Verifier veto downgrades a passed exec.
+    for s in ("success", "published", "done", "pass"):
+        for v in ("reject", "needs_revision", "request_changes", "escalate"):
+            assert ex.reward_from_status(s, v) == "0.0", \
+                f"status={s!r} verdict={v!r} must be 0.0 (veto)"
+
+
+def test_passed_exec_no_verdict_one():
+    # Verified success without a veto is the canonical positive reward.
+    for s in ("success", "published", "done", "pass"):
+        assert ex.reward_from_status(s, "") == "1.0", \
+            f"status={s!r} verdict='' must be 1.0 (exec passed, no veto)"
+        assert ex.reward_from_status(s, "approve") == "1.0", \
+            f"status={s!r} verdict='approve' must be 1.0 (exec passed, approve)"
+        assert ex.reward_from_status(s, "ok") == "1.0", \
+            f"status={s!r} verdict='ok' must be 1.0 (exec passed, ok)"
+
+
+def test_review_only_falls_back_to_verdict():
+    # Empty status means "no execution signal" (review-only node); the verdict
+    # decides. An approving verdict still yields 1.0 — the anti-Goodhart rule
+    # forbids fabrication of positives, not the legitimate review-only path.
+    for v in ("approve", "approved", "pass", "passed", "success", "ok"):
+        assert ex.reward_from_status("", v) == "1.0", \
+            f"status='' verdict={v!r} must be 1.0 (review-only fallback)"
+
+
+def test_no_signal_half():
+    # Both empty: neither execution nor reviewer verdict — half-credit.
+    assert ex.reward_from_status("", "") == "0.5"
+    # Empty status + veto-only verdict has no exec signal to confirm the
+    # negative — collapse to 0.5, NOT 0.0 (the veto cannot fabricate either).
+    for v in ("reject", "needs_revision", "request_changes", "escalate"):
+        assert ex.reward_from_status("", v) == "0.5", \
+            f"status='' verdict={v!r} must be 0.5 (no exec to confirm veto)"
+
+
+def test_bash_python_parity():
+    # Bash _mo_reward_from_status and python reward_from_status MUST return
+    # identical values on the full (status, verdict) truth table. GRPO trains
+    # on whichever side the trainer reads — a divergence is silent skill
+    # corruption (parity is non-negotiable, not nice-to-have).
+    statuses = ("", "success", "published", "done", "pass",
+                "failure", "failed", "rolled_back", "blocked", "crash",
+                "escalated", "reject", "weird", "approve", "approved",
+                "passed", "rejected", "PUBLISHED", "FAILED", "Approve")
+    verdicts = ("", "approve", "approved", "pass", "passed", "success", "ok",
+                "reject", "rejected", "needs_revision", "request_changes",
+                "escalate", "fail", "failed", "weird")
+    for s in statuses:
+        for v in verdicts:
+            rb = _call("_mo_reward_from_status", s, v)
+            rp = ex.reward_from_status(s, v)
+            assert rb == rp, (
+                f"PARITY FAIL ({s!r},{v!r}): bash={rb!r} py={rp!r} — "
+                "bash and python MUST match byte-for-byte (silent GRPO "
+                "skill corruption if they diverge)"
+            )
+
+
 def test_dispatch_chain_parity():
     env = {"MO_FALLBACK_CODING": "minimax,codex,sonnet", "MO_FALLBACK_REVIEW": "opus,kimi,sonnet"}
     for nt, lead in [("implementer", "minimax"), ("implementer", "glm"), ("reviewer", "opus"),
