@@ -45,17 +45,74 @@ def test_assertion_failure_is_a_real_reproduction():
     assert not o.passed
 
 
+def test_a_test_with_a_nameerror_is_a_defect_not_a_reproduction():
+    """THE false-reject that motivated `test_defect`, verbatim from a real run.
+
+    A generated probe used `exp_polar` without importing it. pytest printed
+    "FAILED ... - NameError", the word "failed" matched, and the oracle concluded
+    "the bug is NOT fixed" — about a patch that fixed it perfectly.
+
+    A test that dies on an undefined name never exercised the code at all.
+    """
+    o = Crucible._classify(
+        "FAILED crucible_probe.py::test_polylog - NameError: name 'exp_polar' is not defined\n"
+        "1 failed in 0.9s\nCRUCIBLE_RC=1"
+    )
+    assert o.status == "test_defect"
+    assert o.test_is_broken
+    assert not o.informative      # says NOTHING about the patch
+    assert not o.ran
+
+
+@pytest.mark.parametrize("exc", [
+    "NameError: name 'foo' is not defined",
+    "ImportError: cannot import name 'bar'",
+    "ModuleNotFoundError: No module named 'baz'",
+    "SyntaxError: invalid syntax",
+    "IndentationError: unexpected indent",
+    "fixture 'tmpdir_factory' not found",
+])
+def test_every_test_defect_is_uninformative(exc):
+    o = Crucible._classify(f"E   {exc}\n1 failed in 0.1s\nCRUCIBLE_RC=1")
+    assert o.status == "test_defect", exc
+    assert not o.informative, exc
+
+
+@pytest.mark.parametrize("exc", ["AttributeError", "TypeError", "ValueError", "KeyError"])
+def test_ambiguous_exceptions_are_NOT_called_test_defects(exc):
+    """Deliberately narrow. A library bug can legitimately raise AttributeError or
+    TypeError, so a probe that catches one may be a TRUE reproduction. We only claim the
+    cases where the test is unambiguously at fault — over-claiming here would silently
+    discard real bug reports."""
+    o = Crucible._classify(f"E   {exc}: something\n1 failed in 0.1s\nCRUCIBLE_RC=1")
+    assert o.status == "failed"
+    assert o.informative
+
+
 def test_broken_environment_is_error_not_failure():
     """THE distinction PR #170 turns on.
 
-    An import/collection error means the test never ran. The patch is not to blame, and a
-    gate that treats this as a failure will reject correct work — the false-reject that made
-    the old absolute-green verifier net-negative.
+    A collection error means the test never ran. The patch is not to blame, and a gate that
+    treats this as a failure will reject correct work — the false-reject that made the old
+    absolute-green verifier net-negative.
+
+    (Import errors are NOT here: they land in `test_defect`, because they are usually the
+    test's own fault and are worth one repair attempt before abstaining. Either way the
+    `informative` guard blocks them — see below.)
     """
-    o = Crucible._classify("ModuleNotFoundError: No module named 'astropy'\nCRUCIBLE_RC=2")
+    o = Crucible._classify("INTERNALERROR> pytest could not collect crucible_probe.py\nCRUCIBLE_RC=3")
     assert o.status == "error"
     assert not o.ran
     assert not o.informative   # we may NOT act on this — it says nothing about the patch
+
+
+def test_no_uninformative_outcome_can_ever_be_read_as_a_verdict():
+    """The whole taxonomy, stated as one invariant: only two of six statuses are evidence
+    about the patch. Everything else is a fact about the harness."""
+    for s in ("test_defect", "error", "apply_fail", "no_run"):
+        assert not ExecOutcome(status=s).informative, s
+    for s in ("passed", "failed"):
+        assert ExecOutcome(status=s).informative, s
 
 
 def test_unapplied_patch_is_apply_fail_not_failure():

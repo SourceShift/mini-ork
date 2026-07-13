@@ -58,11 +58,15 @@ class ExecOutcome:
     """What the code ACTUALLY did. This — not a model's opinion — is the anchor.
 
     `status` is the primary signal (see PR #168, anti-Goodhart reward chain):
-        passed      the test ran and succeeded
-        failed      the test ran and an assertion failed  (a real reproduction)
-        error       the test could not run (import/collection) — UNINFORMATIVE
-        apply_fail  the candidate patch did not apply
-        no_run      the runtime never started
+        passed       the test ran and succeeded
+        failed       the test ran and an ASSERTION failed — a real reproduction
+        test_defect  the TEST is broken (NameError, bad import, syntax) — UNINFORMATIVE
+        error        the test could not be collected at all — UNINFORMATIVE
+        apply_fail   the candidate patch did not apply
+        no_run       the runtime never started
+
+    Only `passed` and `failed` are evidence ABOUT THE PATCH. The rest are facts about the
+    harness, and a patch must never be scored on them.
     """
 
     status: str
@@ -78,12 +82,21 @@ class ExecOutcome:
 
     @property
     def informative(self) -> bool:
-        """False when the runtime could not produce a usable signal.
+        """False when the outcome says nothing about the patch.
 
-        A patch must never be blamed for an uninformative environment — that false-reject
-        is what made the verifier net-negative before PR #170.
+        A patch must never be blamed for an environment it did not break (PR #170), nor for
+        a test that was never valid in the first place.
         """
         return self.status in ("passed", "failed")
+
+    @property
+    def test_is_broken(self) -> bool:
+        """The test itself is defective and must be REPAIRED, not believed.
+
+        This is the difference between "the bug is still there" and "my test has a typo",
+        and collapsing them is how a correct patch gets rejected.
+        """
+        return self.status == "test_defect"
 
 
 def _have_verifiers() -> bool:
@@ -188,7 +201,9 @@ class Crucible:
         if self.backend == "subprocess":
             # runs on the host; takes no image/workdir
             return R.SubprocessConfig(type="subprocess")
-        kw = {"type": self.backend, "image": self.spec.image, "workdir": self.spec.workdir}
+        kw: dict[str, object] = {
+            "type": self.backend, "image": self.spec.image, "workdir": self.spec.workdir,
+        }
         if self.spec.cpu is not None:
             kw["cpu"] = self.spec.cpu
         if self.spec.memory is not None:
@@ -242,6 +257,23 @@ class Crucible:
         return self._classify(out, backend=self.backend)
 
     # ── verdict: execution-anchored, never judge-approved ────────────────────
+
+    # Exceptions that mean THE TEST IS BROKEN, not the code under test.
+    #
+    # A test that dies on an undefined name or a bad import never exercised the code at
+    # all — believing it is how you reject a correct patch. (Measured: a generated probe
+    # used `exp_polar` without importing it; pytest printed "FAILED ... - NameError", the
+    # word "failed" was matched, and the oracle concluded "the bug is NOT fixed" about a
+    # patch that fixed it perfectly.)
+    #
+    # Kept deliberately narrow. AttributeError and TypeError are NOT here: a library bug
+    # can legitimately raise either, and a probe that catches one may be a true
+    # reproduction. We only claim the cases where the test is unambiguously at fault.
+    _TEST_DEFECT = re.compile(
+        r"\b(NameError|ImportError|ModuleNotFoundError|SyntaxError|IndentationError"
+        r"|fixture '[^']+' not found)\b"
+    )
+
     @staticmethod
     def _classify(out: str, backend: str = "") -> ExecOutcome:
         if "CRUCIBLE_APPLY_FAIL" in out:
@@ -250,15 +282,15 @@ class Crucible:
         rc = int(m.group(1)) if m else None
         if rc == 0:
             return ExecOutcome(status="passed", ran=True, returncode=0, output=out[-800:], backend=backend)
+
+        # The test is broken as CODE. Repair it; do not read it as a verdict on the patch.
+        if Crucible._TEST_DEFECT.search(out):
+            return ExecOutcome(status="test_defect", ran=False, returncode=rc,
+                               output=out[-800:], backend=backend)
+
         low = out.lower()
-        # An ERROR (import/collection) is NOT a reproduction and NOT the patch's fault.
-        collection_error = (
-            ("error" in low and "failed" not in low)
-            or "importerror" in low
-            or "modulenotfound" in low
-            or "interrupted" in low
-        )
-        if collection_error:
+        # An ERROR (collection) is not a reproduction and not the patch's fault either.
+        if ("error" in low and "failed" not in low) or "interrupted" in low:
             return ExecOutcome(status="error", ran=False, returncode=rc, output=out[-800:], backend=backend)
         if rc is None:
             return ExecOutcome(status="no_run", ran=False, output=out[-800:], backend=backend)
