@@ -23,6 +23,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -122,15 +123,52 @@ def _objects(s):
             return
 
 
+# A genuine unfilled stub carries a stub word (the dry-run placeholder reads
+# "<dry-run: not generated>"). A bare angle-bracketed identifier does NOT.
+_PLACEHOLDER_HINT = re.compile(
+    r"\b(dry[- ]?run|not[- ]generated|todo|tbd|fixme|fill[- ]?(me|in)?|xxx|placeholder)\b",
+    re.I,
+)
+
+
+def _is_stub_string(v) -> bool:
+    """True only for an UNFILLED template value — not for code that uses angle brackets."""
+    if not isinstance(v, str):
+        return False
+    s = v.strip()
+    if not (s.startswith("<") and s.endswith(">")):
+        return False
+    inner = s[1:-1].strip()
+    if not inner:
+        return True
+    # "<dry-run: not generated>", "<TODO>", "<fill me>" -> a real stub
+    # "<ContentNodeCreationModal>", "<div>", "<Foo />"   -> real code
+    return bool(_PLACEHOLDER_HINT.search(inner))
+
+
 def _contains_placeholder(v):
-    if isinstance(v, str):
-        stripped = v.strip()
-        return stripped.startswith("<") and stripped.endswith(">")
-    if isinstance(v, list):
-        return any(_contains_placeholder(x) for x in v)
+    """True when the PLAN ITSELF was never generated (i.e. it is the dry-run stub).
+
+    Scope matters. The old check recursed into EVERY nested string and flagged anything
+    shaped like `<...>`. That rejected two entirely legitimate things:
+
+      * JSX/HTML tags a plan naturally names — "<ContentNodeCreationModal>" — which made
+        mini-ork unable to plan work on ANY React/JSX codebase; and
+      * the planner's own step annotations — "<shell-only>", "<analysis-only — no edit>"
+        — meaning "this step edits no file".
+
+    A *placeholder plan* means the planner produced nothing: the dry-run stub, whose
+    objective is "<dry-run: not generated>" and whose decomposition is empty. Judge the
+    plan by its objective (and emptiness), not by every string inside it.
+    """
     if isinstance(v, dict):
-        return any(_contains_placeholder(x) for x in v.values())
-    return False
+        if _is_stub_string(v.get("objective")):
+            return True
+        # the dry-run stub is an empty shell: no objective, nothing to do
+        if not str(v.get("objective") or "").strip() and not (v.get("decomposition") or []):
+            return True
+        return False
+    return _is_stub_string(v)
 
 
 def _is_plan(obj):
