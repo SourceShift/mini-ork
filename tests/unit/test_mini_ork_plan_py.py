@@ -261,3 +261,39 @@ def test_mo_plan_deterministic_fallback_opt_in(tmp_path):
     assert rc == 0
     assert dispatch.calls["n"] == 1
     assert json.loads(Path(out).read_text())["objective"].startswith("Execute recipe ")
+
+
+
+def test_jsx_tags_are_not_placeholders():
+    """A plan for a React/JSX codebase names component tags. Those are CODE, not stubs.
+
+    Regression: the old check flagged ANY string shaped like `<...>`, anywhere in the plan.
+    A legitimate plan mentioning "<ContentNodeCreationModal>" was therefore rejected as a
+    dry-run placeholder -- which made mini-ork unable to plan work on any React/JSX repo.
+    """
+    jsx = {
+        **_VALID,
+        "objective": "Remove duplicate ContentNodeCreationModal mounts",
+        "decomposition": [
+            {"id": "s1", "node_type": "implementer", "depends_on": [],
+             "description": "HighlightableText renders <ContentNodeCreationModal /> directly; "
+                            "route it through the provider instead."},
+            # the planner annotates non-editing steps this way -- also angle-bracketed
+            {"id": "s2", "node_type": "verifier", "depends_on": ["s1"],
+             "description": "<shell-only>"},
+        ],
+    }
+    assert plan.validate_plan(json.dumps(jsx)) == "ok"
+
+
+def test_dry_run_stub_still_rejected():
+    """The thing the check actually exists for must still be caught."""
+    assert plan.validate_plan(plan._DRY_RUN_PLACEHOLDER) == "placeholder_plan"
+
+    # an objective that is an unfilled template value, with nothing to do
+    stub = {**_VALID, "objective": "<TODO>", "decomposition": []}
+    assert plan.validate_plan(json.dumps(stub)) == "placeholder_plan"
+
+    # an empty shell: no objective, no steps
+    empty = {**_VALID, "objective": "", "decomposition": []}
+    assert plan.validate_plan(json.dumps(empty)) == "placeholder_plan"
