@@ -9,7 +9,7 @@ description = "Python framework facade for the mini-ork agent workflow runtime"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { file = "LICENSE" }
-authors = [{ name = "SourceShift" }]
+authors = [{ name = "Amir Khakshour", email = "amir.khakshour@gmail.com" }]
 keywords = ["agents", "workflow", "orchestration", "multi-agent", "llm"]
 classifiers = [
   "Development Status :: 3 - Alpha",

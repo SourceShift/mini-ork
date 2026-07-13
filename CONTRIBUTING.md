@@ -4,7 +4,7 @@ Thank you for contributing. This document covers the issue workflow, PR process,
 
 ## Reporting Bugs
 
-Use [GitHub Issues](https://github.com/ork-ai/mini-ork/issues/new?template=bug_report.md). Include:
+Use [GitHub Issues](https://github.com/SourceShift/mini-ork/issues/new?template=bug_report.md). Include:
 
 1. **Version** — `mini-ork --version`
 2. **Reproduction** — exact command + a minimal `kickoff.md` that triggers the bug
@@ -14,7 +14,7 @@ Use [GitHub Issues](https://github.com/ork-ai/mini-ork/issues/new?template=bug_r
 
 ## Requesting Features
 
-Use [GitHub Issues](https://github.com/ork-ai/mini-ork/issues/new?template=feature_request.md). Describe the use case first, then the proposed behavior. If you have a draft implementation, link the branch.
+Use [GitHub Issues](https://github.com/SourceShift/mini-ork/issues/new?template=feature_request.md). Describe the use case first, then the proposed behavior. If you have a draft implementation, link the branch.
 
 ## Pull Request Flow
 
@@ -89,4 +89,45 @@ One subject line ≤ 72 chars. Body optional. No scope for cross-cutting changes
 
 ## License
 
-By contributing, you agree that your contributions will be licensed under the Apache-2.0 License (see [LICENSE](LICENSE)).
+**mini-ork is Apache-2.0, and stays Apache-2.0.** If you use it — in a product, a
+company, a service, closed-source or not — nothing here changes anything for you.
+Use it, fork it, sell what you build with it. That is the point of the license, and
+we are not walking it back. Every version already published under Apache-2.0 is
+irrevocable: it cannot be un-published or retroactively relicensed, by us or anyone.
+
+The rest of this section applies **only if you contribute code.**
+
+### Contributor grant
+
+By submitting a contribution (a pull request, patch, or any work intentionally
+sent for inclusion), you certify that:
+
+1. **You wrote it, or you have the right to submit it.** It is your original work,
+   or it is covered by a compatible open-source license and you are permitted to
+   submit it under Apache-2.0. It is not covered by an employment or client
+   agreement that would give someone else ownership without their permission.
+
+2. **You retain copyright to your contribution.** You are not signing it away.
+
+3. **You grant a license to it.** You grant Amir Khakshour and every recipient of
+   mini-ork a perpetual, worldwide, non-exclusive, royalty-free, irrevocable
+   license to reproduce, modify, publicly display, distribute, **and sublicense**
+   your contribution and derivative works of it. You grant the same terms for any
+   patent claims you own that your contribution necessarily infringes.
+
+4. **You understand your contribution is public** and distributed under Apache-2.0.
+
+Clause 3 is the one that matters, so here is the plain-English version of why it
+exists: the word **"sublicense"** is what lets the project's copyright stay
+consolidated — so it can be assigned to a company, dual-licensed for enterprise
+customers, or offered under different terms to a specific customer, without
+tracking down every past contributor for permission. Projects that skip this end
+up unable to make any licensing decision at all once they have contributors.
+
+**What it is not:** it is not a copyright assignment (you keep yours, clause 2),
+and it is not permission to take the open-source core away from you (see the
+promise above). Contributions are accepted by making them — there is no form to
+sign and no document to email.
+
+If you are contributing on behalf of an employer, make sure they are OK with the
+above before you open the PR.

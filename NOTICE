@@ -1,8 +1,13 @@
 mini-ork
-Copyright 2026 The mini-ork Authors
+Copyright 2026 Amir Khakshour
 
-This product includes software developed by The mini-ork Authors
-(https://github.com/ork-ai/mini-ork).
+Licensed under the Apache License, Version 2.0 (the "License"); you may not
+use this software except in compliance with the License. A copy of the License
+is distributed with this software in the LICENSE file, and is also available at
+http://www.apache.org/licenses/LICENSE-2.0
+
+This product includes software developed by Amir Khakshour and the mini-ork
+contributors (https://github.com/SourceShift/mini-ork).
 
 ---
 

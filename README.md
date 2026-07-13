@@ -239,4 +239,11 @@ Run `./bin/mini-ork doctor` after installation to verify every dep is present + 
 
 ## License
 
-Apache-2.0. See [LICENSE](LICENSE).
+**Apache-2.0** — see [LICENSE](LICENSE). Copyright © 2026 Amir Khakshour.
+
+Use it in anything, including commercial and closed-source products. You owe
+nothing but the attribution the license already asks for. Published versions are
+irrevocable — they cannot be un-published or retroactively relicensed.
+
+Contributing? See the [contributor grant](CONTRIBUTING.md#license) — you keep your
+copyright; there is nothing to sign.
