@@ -9,7 +9,7 @@ description = "Python framework facade for the mini-ork agent workflow runtime"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { file = "LICENSE" }
-authors = [{ name = "Amir Khakshour", email = "amir.khakshour@gmail.com" }]
+authors = [{ name = "SourceShift" }]
 keywords = ["agents", "workflow", "orchestration", "multi-agent", "llm"]
 classifiers = [
   "Development Status :: 3 - Alpha",
@@ -20,6 +20,11 @@ classifiers = [
 
 [project.optional-dependencies]
 yaml = ["PyYAML>=6.0"]
+# Crucible — mini-ork's verified-execution runtime seam (mini_ork/runtime/).
+# Engine is `verifiers` (MIT, Prime Intellect): isolated Docker/sandbox runtimes +
+# trace DAGs. Optional by design: Crucible falls back to the docker CLI when absent,
+# so mini-ork stays zero-dependency by default. Attribution: THIRD_PARTY.md
+runtime = ["verifiers>=0.2.0,<0.3"]
 
 [project.urls]
 Homepage = "https://github.com/SourceShift/mini-ork"
