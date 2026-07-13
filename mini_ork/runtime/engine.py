@@ -74,6 +74,7 @@ class ExecOutcome:
     returncode: int | None = None
     output: str = ""
     backend: str = ""
+    exc: str = ""      # the exception that caused the failure, e.g. "AssertionError"
     meta: dict = field(default_factory=dict)
 
     @property
@@ -274,6 +275,30 @@ class Crucible:
         r"|fixture '[^']+' not found)\b"
     )
 
+    # The exception that actually caused the failure. Callers need this to ask the question
+    # the status alone cannot answer: *did the test fail for the reason it was written for?*
+    # A probe that asserts an expected value should fail with AssertionError. If it dies on
+    # a ValueError raised deep in the library's own setup, it never reached its assertion —
+    # it is red, but it is not a reproduction.
+    _EXC = re.compile(r"\b([A-Z][A-Za-z0-9_]*(?:Error|Exception|Warning))\b(?=\s*:)")
+
+    @staticmethod
+    def _exc_of(out: str) -> str:
+        """The exception pytest attributed the failure to. Prefer its own summary line.
+
+        pytest renders a BARE `assert x == y` as `FAILED t.py::t - assert 3 == 5`, not as
+        `AssertionError` — the word "assert" sits exactly where the exception name goes.
+        Reading that literally makes a genuine assertion failure look like an unknown
+        exception, and a caller that keys on AssertionError will discard a perfectly good
+        reproduction. Normalise it.
+        """
+        m = re.search(r"^FAILED .*? - ([A-Za-z_][\w.]*)", out, re.M)
+        if m:
+            name = m.group(1).rsplit(".", 1)[-1]
+            return "AssertionError" if name == "assert" else name
+        hits = Crucible._EXC.findall(out)
+        return hits[-1] if hits else ""
+
     @staticmethod
     def _classify(out: str, backend: str = "") -> ExecOutcome:
         if "CRUCIBLE_APPLY_FAIL" in out:
@@ -283,18 +308,22 @@ class Crucible:
         if rc == 0:
             return ExecOutcome(status="passed", ran=True, returncode=0, output=out[-800:], backend=backend)
 
+        exc = Crucible._exc_of(out)
+
         # The test is broken as CODE. Repair it; do not read it as a verdict on the patch.
         if Crucible._TEST_DEFECT.search(out):
             return ExecOutcome(status="test_defect", ran=False, returncode=rc,
-                               output=out[-800:], backend=backend)
+                               output=out[-800:], backend=backend, exc=exc)
 
         low = out.lower()
         # An ERROR (collection) is not a reproduction and not the patch's fault either.
         if ("error" in low and "failed" not in low) or "interrupted" in low:
-            return ExecOutcome(status="error", ran=False, returncode=rc, output=out[-800:], backend=backend)
+            return ExecOutcome(status="error", ran=False, returncode=rc,
+                               output=out[-800:], backend=backend, exc=exc)
         if rc is None:
-            return ExecOutcome(status="no_run", ran=False, output=out[-800:], backend=backend)
-        return ExecOutcome(status="failed", ran=True, returncode=rc, output=out[-800:], backend=backend)
+            return ExecOutcome(status="no_run", ran=False, output=out[-800:], backend=backend, exc=exc)
+        return ExecOutcome(status="failed", ran=True, returncode=rc,
+                           output=out[-800:], backend=backend, exc=exc)
 
     # ── plumbing: one _exec, two backends ────────────────────────────────────
     def _exec(self, script: str) -> tuple[int | None, str]:

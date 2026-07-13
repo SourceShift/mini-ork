@@ -89,6 +89,34 @@ def test_ambiguous_exceptions_are_NOT_called_test_defects(exc):
     assert o.informative
 
 
+def test_a_bare_assert_is_reported_as_an_AssertionError():
+    """pytest renders a bare `assert x == y` as `FAILED t.py::t - assert 3 == 5` — the word
+    "assert" sits exactly where the exception name goes.
+
+    Reading that literally makes a genuine assertion failure look like an unknown exception.
+    Measured cost: a caller keying on AssertionError to confirm "this probe really did
+    reproduce the reported bug" discarded a perfectly good reproduction and abstained.
+    """
+    o = Crucible._classify("FAILED probe.py::test_polylog - assert 3 == 5\n1 failed\nCRUCIBLE_RC=1")
+    assert o.status == "failed"
+    assert o.exc == "AssertionError"
+
+
+def test_the_exception_that_caused_the_failure_is_reported():
+    """`status` alone cannot answer the question that matters: did the test fail for the
+    reason it was WRITTEN for? A probe asserting an expected value should fail with an
+    AssertionError. One that dies on a ValueError inside the library's own setup never
+    reached its assertion — it is red, but it is not a reproduction."""
+    assert Crucible._classify(
+        "E   AssertionError: assert 3 == 5\n1 failed\nCRUCIBLE_RC=1").exc == "AssertionError"
+    assert Crucible._classify(
+        "E   ValueError: Could not determine celestial frame\n1 failed\nCRUCIBLE_RC=1").exc == "ValueError"
+    assert Crucible._classify(
+        "E   astropy.utils.iers.iers.IERSWarning: failed to download\n1 failed\nCRUCIBLE_RC=1"
+    ).exc == "IERSWarning"           # dotted paths reduce to the bare name
+    assert Crucible._classify("1 passed\nCRUCIBLE_RC=0").exc == ""
+
+
 def test_broken_environment_is_error_not_failure():
     """THE distinction PR #170 turns on.
 
