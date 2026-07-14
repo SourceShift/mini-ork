@@ -12,6 +12,7 @@ from fastapi.staticfiles import StaticFiles
 from .deps import get_db, get_home, set_home_override
 from .routes import (
     control as control_routes,
+    dispatch as dispatch_routes,
     fingerprint,
     fleet,
     idea_tree as idea_tree_routes,
@@ -20,6 +21,7 @@ from .routes import (
     run_detail,
     runs as runs_routes,
     stream,
+    traceotter,
     trajectory,
 )
 
@@ -79,6 +81,8 @@ def create_app(home: Path | None = None, dev_cors: bool = True) -> FastAPI:
     app.include_router(projects.router)
     app.include_router(idea_tree_routes.router)
     app.include_router(learning.router)
+    app.include_router(traceotter.router)
+    app.include_router(dispatch_routes.router)
 
     @app.get("/api")
     def api_index() -> JSONResponse:
