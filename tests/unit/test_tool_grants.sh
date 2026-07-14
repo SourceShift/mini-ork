@@ -33,10 +33,27 @@ _ok()   { OK=$((OK + 1));   echo "  [OK]   $1"; }
 _fail() { FAIL=$((FAIL + 1)); echo "  [FAIL] $1"; }
 
 TMP=$(mktemp -d -t mo-tool-grants.XXXXXX)
-trap 'rm -rf "$TMP"' EXIT
+trap 'rm -rf "$TMP"; [ -n "${TEST_PROVIDER_WRAPPER:-}" ] && [ -f "$TEST_PROVIDER_WRAPPER" ] && rm -f "$TEST_PROVIDER_WRAPPER"' EXIT
 
 # ── Source lib/llm-dispatch.sh in source-only mode (no auto-execution) ───
 MINI_ORK_LLM_SOURCE_ONLY=1 source "$ROOT/lib/llm-dispatch.sh" 2>/dev/null || true
+
+# Drop a tiny permanent-shape provider wrapper for `model=test`. Both the
+# bash dispatch (claudettes mo_llm_dispatch resolves $MINI_ORK_ROOT/lib/providers
+# directly — no SCRIPTS_DIR override) and the python dispatch (resolve_provider
+# reads the same fixed path) read this file. It has no ${KEY:?} guards so
+# lane_health returns ok without any real API key in the environment. The
+# wrapper is removed on EXIT to keep lib/providers/ clean even if the test is
+# killed mid-flight.
+TEST_PROVIDER_WRAPPER="$ROOT/lib/providers/cl_test.sh"
+if [ ! -f "$TEST_PROVIDER_WRAPPER" ]; then
+  cat > "$TEST_PROVIDER_WRAPPER" <<'WRAP'
+#!/usr/bin/env bash
+# Test-only provider wrapper — sets no API keys so lane_health returns ok.
+unset ANTHROPIC_AUTH_TOKEN ANTHROPIC_API_KEY ANTHROPIC_BASE_URL
+WRAP
+  chmod +x "$TEST_PROVIDER_WRAPPER"
+fi
 
 # ─── Producer tests: parse real workflow.yaml + bespoke fixtures ─────────
 
@@ -181,11 +198,25 @@ STUB_BIN="$TMP/bin"
 mkdir -p "$STUB_BIN"
 cat > "$STUB_BIN/claude" <<'STUB'
 #!/usr/bin/env bash
-# stub claude — prints its argv as a JSON array, exits 0
+# stub claude — two capture modes:
+#  1. STUB_CAPTURE_FILE set → write argv to that file as JSON (used by the
+#     python dispatch path, where parse_text swallows a JSON-array stdout
+#     into {} and would leave out.txt empty).
+#  2. STUB_CAPTURE_FILE unset → print argv as JSON to stdout (used by the
+#     bash dispatch path, where --output-format text passes raw stdout through).
+if [ -n "${STUB_CAPTURE_FILE:-}" ]; then
+  python3 - "$@" <<PY
+import json, sys
+with open("${STUB_CAPTURE_FILE}", "w", encoding="utf-8") as fh:
+    json.dump(sys.argv[1:], fh)
+PY
+  exit 0
+fi
 python3 - "$@" <<'PY'
 import json, sys
 print(json.dumps(sys.argv[1:]))
 PY
+exit 0
 STUB
 chmod +x "$STUB_BIN/claude"
 
@@ -206,14 +237,7 @@ MO_TRACE_RICH=0 \
 MINI_ORK_LLM_SOURCE_ONLY=1 \
 bash -c '
   source "'"$ROOT/lib/llm-dispatch.sh"'"
-  # Source a stub provider so the bash sourceable branch is exercised.
-  mkdir -p "'"$TMP"'/providers"
-  cat > "'"$TMP"'/providers/cl_test.sh" <<EOF
-#!/usr/bin/env bash
-unset ANTHROPIC_AUTH_TOKEN ANTHROPIC_API_KEY ANTHROPIC_BASE_URL
-EOF
-  chmod +x "'"$TMP"'/providers/cl_test.sh"
-  SCRIPTS_DIR="'"$TMP"'/providers" mo_llm_dispatch test "PONG" "'"$FIXTURE_RUN_DIR/out.txt"'" 60 5
+  mo_llm_dispatch test "PONG" "'"$FIXTURE_RUN_DIR/out.txt"'" 60 5
 ' >/dev/null 2>"$FIXTURE_RUN_DIR/err.log" || true
 
 # The stub prints its argv as JSON on stdout — read it back
@@ -270,6 +294,127 @@ if [ -f "$FIXTURE_RUN_DIR/.mcp-config.json" ]; then
   fi
 else
   _fail "node-scoped .mcp-config.json was NOT written"
+fi
+
+# ─── argv injection: Python backend (stub claude binary) ─────────────────
+# Same coverage as the bash path above, but driven through `python3 -m
+# mini_ork.dispatch test` so we exercise providers.apply_tool_grants + the
+# dispatch_model integration. The python __main__ reads the prompt from
+# stdin, calls dispatch_model, which resolves the active node's grant via
+# MO_NODE_ID/MO_NODE_TYPE/MO_WORKFLOW_YAML and folds the same
+# --allowedTools/--strict-mcp-config/--mcp-config flags onto the claude argv.
+echo "── argv injection: Python backend reaches stub claude with --allowedTools ──"
+
+# Real workflow.yaml + implementer node + run dir → dispatch via stub. The
+# python path resolves the wrapper at $MINI_ORK_ROOT/lib/providers/cl_<model>.sh;
+# lay down a tiny stub wrapper for this test only (no ${KEY:?} guards, so
+# lane_health passes + cwd_guard stays out of the way under MO_ALLOW_FRAMEWORK_CWD).
+PY_FIXTURE_RUN_DIR="$TMP/run-py-impl"
+mkdir -p "$PY_FIXTURE_RUN_DIR"
+cp "$ROOT/recipes/code-fix/workflow.yaml" "$PY_FIXTURE_RUN_DIR/workflow.yaml"
+
+# Drive via __main__: stub claude on PATH, MO_ALLOW_FRAMEWORK_CWD so the cwd
+# guard doesn't reject the test cwd (we're already inside the framework tree).
+# STUB_CAPTURE_FILE points the stub at the argv-capture path (the python path's
+# parse_text would otherwise swallow a JSON-array stdout into {}).
+PATH="$STUB_BIN:$PATH" \
+MINI_ORK_ROOT="$ROOT" \
+MINI_ORK_RUN_DIR="$PY_FIXTURE_RUN_DIR" \
+MO_NODE_ID=implementer \
+MO_NODE_TYPE=implementer \
+MO_WORKFLOW_YAML="$ROOT/recipes/code-fix/workflow.yaml" \
+MO_ALLOW_FRAMEWORK_CWD=1 \
+MO_LANE_TIER=default \
+MO_TOOL_GRANTS_DISABLED=0 \
+STUB_CAPTURE_FILE="$PY_FIXTURE_RUN_DIR/.stub_argv.json" \
+PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+  python3 -m mini_ork.dispatch sonnet --out "$PY_FIXTURE_RUN_DIR/out.txt" \
+  >/dev/null 2>"$PY_FIXTURE_RUN_DIR/err.log" || true
+# NB: 'sonnet' (a real anthropic-family lane) not 'test' — the Python backend's
+# lane_health preflight rejects unknown lanes BEFORE building the claude argv, so
+# a fake lane made the stub unreachable and every assertion fail on empty argv.
+# The stub `claude` on PATH intercepts the invocation, so no real API call is made.
+
+if [ -f "$PY_FIXTURE_RUN_DIR/.stub_argv.json" ]; then
+  PY_STUB_ARGV=$(head -c 8192 "$PY_FIXTURE_RUN_DIR/.stub_argv.json")
+else
+  PY_STUB_ARGV=""
+fi
+
+echo "    python stub argv (first 200 chars): ${PY_STUB_ARGV:0:200}"
+
+if echo "$PY_STUB_ARGV" | grep -q '"--allowedTools"'; then
+  _ok "python backend: stub claude invocation received --allowedTools"
+else
+  _fail "python backend: stub claude invocation did NOT receive --allowedTools (argv: $PY_STUB_ARGV)"
+fi
+
+if echo "$PY_STUB_ARGV" | grep -q '"--strict-mcp-config"'; then
+  _ok "python backend: stub claude invocation received --strict-mcp-config"
+else
+  _fail "python backend: stub claude invocation did NOT receive --strict-mcp-config (argv: $PY_STUB_ARGV)"
+fi
+
+if echo "$PY_STUB_ARGV" | grep -q '"--mcp-config"'; then
+  _ok "python backend: stub claude invocation received --mcp-config"
+else
+  _fail "python backend: stub claude invocation did NOT receive --mcp-config (argv: $PY_STUB_ARGV)"
+fi
+
+# Implementer MUST still receive Write + Edit + mcp__codegraph (regression bar
+# the prior consumer-only attempt broke). The --permission-mode bypassPermissions
+# flag must also survive the apply_tool_grants insertion intact.
+if echo "$PY_STUB_ARGV" | grep -qE '"--allowedTools",\s*"[^"]*Write'; then
+  _ok "python backend: implementer --allowedTools contains Write (regression bar)"
+else
+  _fail "python backend: implementer --allowedTools missing Write (argv: $PY_STUB_ARGV)"
+fi
+if echo "$PY_STUB_ARGV" | grep -qE '"--allowedTools",\s*"[^"]*Edit'; then
+  _ok "python backend: implementer --allowedTools contains Edit (regression bar)"
+else
+  _fail "python backend: implementer --allowedTools missing Edit (argv: $PY_STUB_ARGV)"
+fi
+if echo "$PY_STUB_ARGV" | grep -qE '"--allowedTools",\s*"[^"]*mcp__codegraph'; then
+  _ok "python backend: implementer --allowedTools contains mcp__codegraph (MCP grant rendered)"
+else
+  _fail "python backend: implementer --allowedTools missing mcp__codegraph (argv: $PY_STUB_ARGV)"
+fi
+
+# --permission-mode bypassPermissions must be preserved through the tool-grant
+# insertion — without it the dispatch silently produces read-only (the python
+# migration batch's 3rd killer at providers.resolve_provider).
+if echo "$PY_STUB_ARGV" | grep -q '"--permission-mode",\s*"bypassPermissions"'; then
+  _ok "python backend: --permission-mode bypassPermissions preserved"
+else
+  _fail "python backend: --permission-mode bypassPermissions missing (argv: $PY_STUB_ARGV)"
+fi
+
+# Node-scoped .mcp-config.json MUST also be written by the python path
+if [ -f "$PY_FIXTURE_RUN_DIR/.mcp-config.json" ]; then
+  _ok "python backend: node-scoped .mcp-config.json written to run dir"
+  if grep -q '"codegraph"' "$PY_FIXTURE_RUN_DIR/.mcp-config.json"; then
+    _ok "python backend: node-scoped .mcp-config.json contains the granted codegraph server"
+  else
+    _fail "python backend: node-scoped .mcp-config.json missing the granted server (content: $(cat "$PY_FIXTURE_RUN_DIR/.mcp-config.json"))"
+  fi
+else
+  _fail "python backend: node-scoped .mcp-config.json was NOT written"
+fi
+
+# Source-level greps for the python-side flag injection (verifier contract
+# check: providers.py must reference all three flag names so a future reader
+# can't delete the impl by mistake).
+COUNT_ALLOWED_PY=$(grep -c -- '--allowedTools' "$ROOT/mini_ork/dispatch/providers.py" || true)
+if [ "$COUNT_ALLOWED_PY" -ge 3 ]; then
+  _ok "python backend: --allowedTools present in providers.py (count=$COUNT_ALLOWED_PY)"
+else
+  _fail "python backend: --allowedTools count=$COUNT_ALLOWED_PY in providers.py (expected >=3)"
+fi
+COUNT_STRICT_PY=$(grep -c -- '--strict-mcp-config' "$ROOT/mini_ork/dispatch/providers.py" || true)
+if [ "$COUNT_STRICT_PY" -ge 3 ]; then
+  _ok "python backend: --strict-mcp-config present in providers.py (count=$COUNT_STRICT_PY)"
+else
+  _fail "python backend: --strict-mcp-config count=$COUNT_STRICT_PY in providers.py (expected >=3)"
 fi
 
 # ─── Source-level greps (verifier contract) ─────────────────────────────
