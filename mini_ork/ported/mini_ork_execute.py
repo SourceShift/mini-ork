@@ -667,13 +667,17 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
     filter_node_type = ""
     dispatch_mode_override = ""
     plan_path = os.environ.get("MINI_ORK_PLAN_PATH", "")
+    from_node = ""
+    recovery_active = False
+    repair_budget = ""
     i = 0
     while i < len(argv):
         a = argv[i]
         if a in ("--help", "-h"):
             sys.stdout.write(
                 "Usage: mini-ork execute [<plan.json>] [--node-type <type>] "
-                "[--dispatch-mode <mode>] [--dry-run]\n\n"
+                "[--dispatch-mode <mode>] [--dry-run]\n"
+                "                       [--from-node <id>] [--recovery] [--repair-budget <usd>]\n\n"
                 "Dispatch plan steps to node-type handlers.\n\n"
                 "Node types: planner | researcher | implementer | reviewer | verifier |\n"
                 "            reflector | publisher | rollback\n\n"
@@ -682,6 +686,13 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
                 "  --node-type <type>        Execute only nodes of this type (filter)\n"
                 "  --dispatch-mode <mode>    Override workflow dispatch mode\n"
                 "  --dry-run                 Print what would be dispatched; no LLM calls\n"
+                "  --from-node <id>          Enter the loop at this node (recovery)\n"
+                "  --recovery                Same as --from-node + closure filter\n"
+                "                            (set by `mini-ork recover`; honors\n"
+                "                            MINI_ORK_RECOVERY_CLOSURE env var)\n"
+                "  --repair-budget <usd>     Bound the recovery cost ceiling\n"
+                "                            (strategy=repair). Without it, the\n"
+                "                            default is $5.00 (env MO_REPAIR_BUDGET_USD)\n"
                 "  --help                    Show this help\n")
             return 0
         elif a == "--dry-run":
@@ -690,6 +701,20 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
             filter_node_type = argv[i + 1]; i += 2
         elif a == "--dispatch-mode":
             dispatch_mode_override = argv[i + 1]; i += 2
+        elif a == "--from-node":
+            if i + 1 >= len(argv):
+                sys.stderr.write("--from-node requires <id>\n"); return 2
+            from_node = argv[i + 1]; i += 2
+        elif a.startswith("--from-node="):
+            from_node = a.split("=", 1)[1].strip(); i += 1
+        elif a == "--recovery":
+            recovery_active = True; i += 1
+        elif a == "--repair-budget":
+            if i + 1 >= len(argv):
+                sys.stderr.write("--repair-budget requires <usd>\n"); return 2
+            repair_budget = argv[i + 1]; i += 2
+        elif a.startswith("--repair-budget="):
+            repair_budget = a.split("=", 1)[1].strip(); i += 1
         elif a.startswith("-"):
             sys.stderr.write(f"Unknown flag: {a}. Try --help\n"); return 2
         else:
@@ -740,6 +765,73 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
         node_source = "plan.json.decomposition"
         node_ids = nodes_from_plan(plan_path, workflow)
     print(f"    nodes:    {len(node_ids)} (from {node_source})")
+
+    # ── E2 recovery-context filter ──────────────────────────────────────────
+    # If `mini-ork recover` set MINI_ORK_RECOVERY_FROM (the closure root)
+    # and MINI_ORK_RECOVERY_CLOSURE (the closure node_ids), restrict the
+    # dispatch set to ONLY those nodes. Ancestors of the closure root are
+    # SKIPPED entirely — they have valid E1 checkpoints (the planner
+    # verified each one via is_node_reusable before emitting the env),
+    # so dispatching them again would burn LLM calls for no reason.
+    # CLI flags (`--from-node`, `--recovery`) take precedence over the
+    # env vars; both forms produce the same filter shape.
+    closure_env = os.environ.get("MINI_ORK_RECOVERY_CLOSURE", "").strip()
+    closure_from_env = os.environ.get("MINI_ORK_RECOVERY_FROM", "").strip()
+    if recovery_active and not closure_env and not closure_from_env and not from_node:
+        # Operator passed --recovery with no plan context: refuse rather
+        # than silently run the whole DAG. This is the "drop into recovery
+        # mode but the planner hasn't computed a plan" footgun.
+        sys.stderr.write(
+            "execute: --recovery requires MINI_ORK_RECOVERY_FROM or "
+            "--from-node (use `mini-ork recover <run_id>` to compute the plan)\n"
+        )
+        return 2
+    effective_from = from_node or closure_from_env
+    effective_closure = (
+        set(closure_env.split()) if closure_env else set()
+    )
+    if effective_from or effective_closure:
+        # Repair-budget wiring: surface the budget as MO_REPAIR_BUDGET_USD
+        # so the cost_pause seam (or any future cost-aware router) can
+        # honor it without depending on a new env contract.
+        if repair_budget:
+            try:
+                v = float(repair_budget)
+                if v > 0:
+                    os.environ["MO_REPAIR_BUDGET_USD"] = f"{v:.2f}"
+            except ValueError:
+                sys.stderr.write(
+                    f"execute: --repair-budget must be a positive number, got {repair_budget!r}\n"
+                )
+                return 2
+        if not effective_closure and effective_from:
+            # Operator override only (--from-node, no closure set): trust
+            # the operator and include every node downstream of from_node.
+            # Use the planner's DAG loader so the semantics stay identical
+            # to `mini-ork recover` (edges, escalates_to exclusion).
+            from mini_ork.ported.recovery_planner import load_dag
+            dag = load_dag(workflow)
+            effective_closure = dag.descendants(effective_from)
+        # Track the closure set BEFORE mutating node_ids; the original
+        # ``node_ids`` list is SEP-joined strings (the format
+        # ``_resolve_dispatch_mode`` and the dispatch-loop below both
+        # consume). We keep ``node_ids`` as strings and filter by name
+        # here so the downstream ``fields_list = [... e.split(...) ...]``
+        # keeps working unchanged.
+        before_count = len(node_ids)
+        node_ids = [
+            e for e in node_ids
+            if e.split(_SEP, 1)[0] in effective_closure
+        ]
+        # Mark the run as a recovery dispatch so downstream trace / cost
+        # seams can stamp the metadata without re-deriving the closure.
+        os.environ["MINI_ORK_RECOVERY_ACTIVE"] = "1"
+        if effective_from:
+            os.environ["MINI_ORK_RECOVERY_FROM"] = effective_from
+        print(
+            f"    recovery: from_node={effective_from or '<unset>'} "
+            f"closure={len(node_ids)}/{before_count} nodes"
+        )
 
     dispatch_mode = _resolve_dispatch_mode(dispatch_mode_override, workflow)
     fields_list = [tuple((e.split(_SEP) + [""] * 8)[:8]) for e in node_ids]
