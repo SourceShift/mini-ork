@@ -1,0 +1,56 @@
+name: README drift review (advisory)
+
+# Layer 2 of the README-drift stack: a MiniMax-M3 reviewer that posts
+# NON-BLOCKING PR suggestions for SEMANTIC claim drift. The hard, exact gate
+# stays in Layer 1 (the `readme-claim-check` job in ci.yml). This job never
+# fails the PR — it only advises.
+#
+# Setup: add a repo secret MINIMAX_API_KEY. Without it the job self-skips.
+
+on:
+  pull_request:
+    paths:
+      - 'README.md'
+      - 'lib/**'
+      - 'bin/**'
+      - 'db/migrations/**'
+      - 'recipes/**'
+      - 'schemas/**'
+
+# least privilege: read the code, comment on the PR. No write to contents.
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: readme-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  readme-review:
+    name: minimax README drift reviewer (advisory)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # only run when the secret exists, so forks / unconfigured repos don't
+    # show a perpetually-skipped-but-attempted job.
+    if: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0        # need history for the base..head diff
+
+      - name: Fetch PR base for the diff
+        run: git fetch --no-tags origin "${{ github.base_ref }}" >/dev/null 2>&1 || true
+
+      - name: Install claude CLI
+        run: npm install -g @anthropic-ai/claude-code >/dev/null 2>&1 || echo "claude install failed — script will self-skip"
+
+      - name: MiniMax README drift review → PR suggestions (advisory)
+        env:
+          MINIMAX_API_KEY: ${{ secrets.MINIMAX_API_KEY }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          MO_BASE_REF: origin/${{ github.base_ref }}
+        run: bash scripts/readme-review-ci.sh
