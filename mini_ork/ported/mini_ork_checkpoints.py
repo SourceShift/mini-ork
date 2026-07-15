@@ -249,6 +249,21 @@ def write_checkpoint(
     attempt_no = int(attempt) if attempt is not None else 1
     now = int(ended_at) if ended_at else 0
 
+    # (E4) Persist the provider's session transcript into the run dir so a
+    # future recovery can `claude --resume <session_id>` even after the worker
+    # sandbox dies. Best-effort: a failure here leaves session_ref NULL and the
+    # node simply re-runs from scratch on recovery (still correct). This does
+    # NOT affect is_node_reusable — session_ref is never read by the validity
+    # check (design §6).
+    session_ref: str | None = None
+    if provider_session_id and run_dir:
+        try:
+            from mini_ork.ported.session_store import persist_session  # lazy
+            ref = persist_session(run_dir, provider_session_id)
+            session_ref = ref or None
+        except Exception as e:  # noqa: BLE001 — persistence is best-effort
+            _log_err(f"write_checkpoint: session persist skipped ({e})")
+
     # (c) one transaction for both rows.
     con = None
     try:
@@ -265,7 +280,7 @@ def write_checkpoint(
                 """,
                 (run_id, node_id, attempt_no, status, input_hash,
                  recipe_version, config_hash, manifest_json,
-                 None, failure_class, now),
+                 session_ref, failure_class, now),
             )
             con.execute(
                 """

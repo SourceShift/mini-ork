@@ -1668,6 +1668,16 @@ def _make_checkpoint_fn(db, run_id, run_dir, recipe, task_class):
         # subtree.
         input_hash = hashlib.sha256(
             f"{run_id}|{node_id}|{recipe_eff}".encode()).hexdigest()
+        # (E4) recover the node's claude session id from the dispatch sidecar
+        # so write_checkpoint records it + persists the transcript. Empty for
+        # non-claude lanes / when no dispatch happened.
+        provider_session_id = ""
+        _sc = os.path.join(run_dir, ".sessions", f"{node_id}.session")
+        if os.path.isfile(_sc):
+            try:
+                provider_session_id = open(_sc).read().strip()
+            except OSError:
+                provider_session_id = ""
         mc.write_checkpoint(
             db, run_id, node_id,
             status="success", input_hash=input_hash,
@@ -1675,7 +1685,7 @@ def _make_checkpoint_fn(db, run_id, run_dir, recipe, task_class):
             artifact_paths=[output_file], run_dir=run_dir,
             node_type=node_type or "", started_at=started_at,
             ended_at=int(time.time()), initiator="python",
-            owner_token=owner_token,
+            owner_token=owner_token, provider_session_id=provider_session_id,
         )
 
     return _cp
@@ -2037,6 +2047,28 @@ def dispatch_node(fields, *, root, run_dir, plan_path, task_class, db, run_id,
     # in the LLM prompts (the read side of the learning loop). Empty for non-LLM nodes.
     learned = _learned_block(root, task_class, node_type)
     os.environ["MO_NODE_ID"] = node_id
+
+    # (E4 turn-resume) During an active recovery, restore this node's persisted
+    # transcript and export MO_RESUME_SESSION_ID so a claude lane continues the
+    # interrupted conversation (`--resume <id>`, via providers.dispatch_model)
+    # instead of starting the node over. Strictly recovery-scoped and fail-soft:
+    # off recovery, for codex/gemini, or with no session it is a no-op and the
+    # node runs normally.
+    os.environ.pop("MO_RESUME_SESSION_ID", None)
+    if (os.environ.get("MINI_ORK_RECOVERY_CLOSURE", "").strip()
+            or os.environ.get("MINI_ORK_RECOVERY_FROM", "").strip()):
+        try:
+            from mini_ork.ported.resume_prep import prepare_node_resume  # noqa: PLC0415
+            _resume_sid = prepare_node_resume(
+                db, run_id, node_id, run_dir=run_dir, model=lane,
+                cwd=os.environ.get("MO_TARGET_CWD") or None,
+            )
+            if _resume_sid:
+                os.environ["MO_RESUME_SESSION_ID"] = _resume_sid
+                print(f"  [resume] node_id={node_id} continuing session "
+                      f"{_resume_sid[:12]}… via --resume", file=sys.stderr)
+        except Exception as e:  # noqa: BLE001 — resume is best-effort
+            print(f"  [resume] skipped for node_id={node_id}: {e}", file=sys.stderr)
 
     if node_type == "researcher":
         ctx = _researcher_output_file(run_dir, recipe or os.environ.get("MINI_ORK_RECIPE", ""), node_id)
