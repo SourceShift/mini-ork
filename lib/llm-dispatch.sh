@@ -746,6 +746,225 @@ _mo_registry_apply_env() {
   return 0
 }
 
+# ─── Node-scoped tool grants (kickoff/tool-grant-hermetic-dispatch.md) ───────
+# Producer + consumer that wire `tools:` blocks out of workflow.yaml into
+# hermetic --allowedTools / --mcp-config / --strict-mcp-config argv on every
+# claude invocation. The previous attempt shipped the consumer but never the
+# producer, so every node fell through to the conservative default and 12+
+# recipes' implementer nodes silently lost Write/Edit. Producer and consumer
+# live together in this file so they cannot drift apart again.
+
+# _mo_default_tools_for_type <node_type>
+# Type-aware fail-closed defaults. "Fail closed" means "no MCP and no ambient
+# leakage", NOT "no ability to do the job" — an undeclared implementer must
+# still be able to write files or every recipe breaks.
+_mo_default_tools_for_type() {
+  case "${1:-}" in
+    implementer) printf 'Read,Write,Edit,Bash|\n' ;;
+    *)           printf 'Read,Bash|\n' ;;
+  esac
+}
+
+# _mo_resolve_node_tools_from_yaml <yaml_path> <node_id>
+# Producer: parse a workflow.yaml, find the node by name (with -/_ variants),
+# extract its `tools:` block. Prints "native_csv|mcp_csv" to stdout. Prints
+# empty string when the node is not declared (caller applies type-aware
+# default). Reads with yaml.safe_load when available, falls back to a tiny
+# bespoke parser for the two shapes we actually use.
+_mo_resolve_node_tools_from_yaml() {
+  local yaml_path="${1:?yaml required}" node_id="${2:?node_id required}"
+  [ -f "$yaml_path" ] || { printf '\n'; return 0; }
+  python3 - "$yaml_path" "$node_id" <<'PY' 2>/dev/null || printf '\n'
+import re, sys
+yaml_path, node_id = sys.argv[1], sys.argv[2]
+
+# Try PyYAML first (clean parse); fall back to a regex-based extractor for
+# the simple list-of-dicts shape we control in this repo's workflow.yamls.
+def _try_yaml():
+    try:
+        import yaml  # noqa: F401
+        with open(yaml_path) as f:
+            d = yaml.safe_load(f) or {}
+        nodes = d.get("nodes") or []
+        for n in nodes:
+            if not isinstance(n, dict):
+                continue
+            nm = str(n.get("name") or "")
+            if nm == node_id or nm.replace("-", "_") == node_id.replace("-", "_"):
+                tools = n.get("tools") or {}
+                if not isinstance(tools, dict):
+                    return ""
+                native = tools.get("native") or []
+                mcp = tools.get("mcp") or []
+                if not isinstance(native, list):
+                    native = list(native) if native else []
+                if not isinstance(mcp, list):
+                    mcp = list(mcp) if mcp else []
+                return "%s|%s" % (",".join(str(x) for x in native),
+                                 ",".join(str(x) for x in mcp))
+        return ""  # node not in this yaml
+    except ImportError:
+        return None
+    except Exception:
+        return ""
+
+def _regex_fallback():
+    # Robust to either yq or yaml format. We only need the `tools:` block of
+    # the node whose `name: <node_id>` matches. Handles the multi-doc case by
+    # scanning all `name:` lines and resetting the active block.
+    try:
+        with open(yaml_path) as f:
+            text = f.read()
+    except Exception:
+        return ""
+    norm = node_id.replace("-", "_")
+    # Split into top-level node entries — they're preceded by `  - name: ...`.
+    blocks = re.split(r"\n(?=  - name: |\n  - name: )", text)
+    for blk in blocks:
+        m = re.search(r"^\s*-?\s*name:\s*['\"]?([A-Za-z0-9_.-]+)['\"]?", blk, re.M)
+        if not m:
+            continue
+        if m.group(1) != node_id and m.group(1).replace("-", "_") != norm:
+            continue
+        tools_m = re.search(r"^\s*tools:\s*\n((?:\s+\S.*\n)+)", blk, re.M)
+        if not tools_m:
+            return ""
+        body = tools_m.group(1)
+        nat_m = re.search(r"native:\s*\[([^\]]*)\]", body)
+        mcp_m = re.search(r"mcp:\s*\[([^\]]*)\]", body)
+        def _split(s):
+            if not s:
+                return ""
+            return ",".join(t.strip().strip("'\"") for t in s.split(",") if t.strip())
+        return "%s|%s" % (_split(nat_m.group(1) if nat_m else ""),
+                          _split(mcp_m.group(1) if mcp_m else ""))
+    return ""
+
+result = _try_yaml()
+if result is None:
+    result = _regex_fallback()
+sys.stdout.write(result + "\n")
+PY
+}
+
+# _mo_resolve_node_tools (env-aware entry point)
+# Resolves the active node's tool grant. Honors, in order:
+#   1. explicit MO_RESOLVED_NODE_TOOLS override (used by tests)
+#   2. parse from MO_WORKFLOW_YAML or $MINI_ORK_RUN_DIR/workflow.yaml
+#   3. type-aware default from MO_NODE_TYPE
+# Prints "native_csv|mcp_csv" on stdout; emits a one-line warning on stderr
+# when an undeclared node falls through to a default (operator visibility).
+_mo_resolve_node_tools() {
+  if [ -n "${MO_RESOLVED_NODE_TOOLS:-}" ]; then
+    printf '%s\n' "${MO_RESOLVED_NODE_TOOLS}"
+    return 0
+  fi
+  local yaml_path=""
+  if [ -n "${MO_WORKFLOW_YAML:-}" ] && [ -f "${MO_WORKFLOW_YAML}" ]; then
+    yaml_path="${MO_WORKFLOW_YAML}"
+  elif [ -n "${MINI_ORK_RUN_DIR:-}" ] && [ -f "${MINI_ORK_RUN_DIR}/workflow.yaml" ]; then
+    yaml_path="${MINI_ORK_RUN_DIR}/workflow.yaml"
+  fi
+  local node_id="${MO_NODE_ID:-}" node_type="${MO_NODE_TYPE:-}"
+  local resolved=""
+  if [ -n "$yaml_path" ] && [ -n "$node_id" ]; then
+    resolved="$(_mo_resolve_node_tools_from_yaml "$yaml_path" "$node_id")"
+  fi
+  # NB: the yaml resolver prints the bare separator "|" (empty native, empty mcp)
+  # for a node with no `tools:` block. That is a NON-empty string, so `-z` alone
+  # silently skipped the type-aware default and every undeclared node resolved to
+  # no tools at all. Treat "|" as unresolved.
+  if [ -z "$resolved" ] || [ "$resolved" = "|" ]; then
+    resolved="$(_mo_default_tools_for_type "$node_type")"
+    if [ -n "$node_id" ]; then
+      echo "[tool-grants] node=$node_id type=${node_type:-unknown} undeclared; applying type-aware default" >&2
+    fi
+  fi
+  printf '%s\n' "$resolved"
+}
+
+# _mo_build_allowed_tools_arg <native_csv> <mcp_csv>
+# Composes the comma-separated value passed to --allowedTools. Native tools
+# pass through verbatim; MCP grants are rendered as mcp__<server>.
+_mo_build_allowed_tools_arg() {
+  local native_csv="${1:-}" mcp_csv="${2:-}"
+  local out="" p
+  if [ -n "$native_csv" ]; then
+    local IFS=','
+    for p in $native_csv; do
+      p="${p#"${p%%[![:space:]]*}"}"; p="${p%"${p##*[![:space:]]}"}"
+      [ -z "$p" ] && continue
+      [ -n "$out" ] && out+=","
+      out+="$p"
+    done
+  fi
+  if [ -n "$mcp_csv" ]; then
+    local IFS=','
+    for p in $mcp_csv; do
+      p="${p#"${p%%[![:space:]]*}"}"; p="${p%"${p##*[![:space:]]}"}"
+      [ -z "$p" ] && continue
+      [ -n "$out" ] && out+=","
+      out+="mcp__${p}"
+    done
+  fi
+  printf '%s\n' "$out"
+}
+
+# _mo_write_node_mcp_config <mcp_csv> <run_dir>
+# Writes a node-scoped .mcp-config.json containing only the granted MCP
+# servers. Sources the operator's MCP server definitions from
+# ${MINI_ORK_HOME}/config/mcp_servers.json (operator home) or
+# ${MINI_ORK_ROOT}/mcp/steering.json (repo fallback), filters to the granted
+# subset, and writes to ${run_dir}/.mcp-config.json. Granted servers not in
+# the operator config get a no-op stub so the flag is well-formed and the
+# run remains hermetic (--strict-mcp-config forbids ambient leakage).
+_mo_write_node_mcp_config() {
+  local mcp_csv="${1:-}" run_dir="${2:-}"
+  [ -n "$run_dir" ] || return 0
+  mkdir -p "$run_dir" 2>/dev/null || true
+  local out="$run_dir/.mcp-config.json"
+  MINI_ORK_HOME="${MINI_ORK_HOME:-}" \
+  MINI_ORK_ROOT="${MINI_ORK_ROOT:-}" \
+  python3 - "$mcp_csv" "$out" <<'PY' 2>/dev/null || true
+import json, os, sys
+mcp_csv, out_path = sys.argv[1], sys.argv[2]
+granted = [s.strip() for s in (mcp_csv or "").split(",") if s.strip()]
+home = os.environ.get("MINI_ORK_HOME", "") or ""
+root = os.environ.get("MINI_ORK_ROOT", "") or ""
+sources = []
+if home:
+    sources.append(os.path.join(home, "config", "mcp_servers.json"))
+if root:
+    sources.append(os.path.join(root, ".claude", "mcp_servers.json"))
+    sources.append(os.path.join(root, "mcp", "steering.json"))
+operator = {}
+for src in sources:
+    if not src or not os.path.isfile(src):
+        continue
+    try:
+        with open(src) as f:
+            d = json.load(f)
+    except Exception:
+        continue
+    if isinstance(d, dict) and isinstance(d.get("mcpServers"), dict):
+        operator = d["mcpServers"]
+        break
+    if isinstance(d, dict):
+        operator = d
+        break
+scoped = {}
+for g in granted:
+    if g in operator and isinstance(operator[g], dict):
+        scoped[g] = operator[g]
+    else:
+        scoped[g] = {"command": "echo", "args": ["no-op: %s not configured" % g]}
+payload = {"mcpServers": scoped}
+with open(out_path, "w") as f:
+    json.dump(payload, f, indent=2)
+PY
+  printf '%s\n' "$out"
+}
+
 # mo_llm_dispatch <model> <prompt> <out_file> [timeout_s] [max_turns]
 mo_llm_dispatch() {
   local model="${1:?model required}"
@@ -753,6 +972,27 @@ mo_llm_dispatch() {
   local out_file="${3:?out file required}"
   local timeout_s="${4:-1500}"
   local max_turns="${5:-60}"
+
+  # Tool grants (kickoff/tool-grant-hermetic-dispatch.md): resolve the active
+  # node's capability contract from workflow.yaml and emit hermetic argv
+  # flags below. Resolve BEFORE the python-backend early return so the
+  # python path can pick up the same grant when wired.
+  local _mo_tools_resolved=""
+  if [ "${MO_TOOL_GRANTS_DISABLED:-0}" != "1" ]; then
+    _mo_tools_resolved="$(_mo_resolve_node_tools)"
+  else
+    _mo_tools_resolved="$(_mo_default_tools_for_type "${MO_NODE_TYPE:-}")"
+  fi
+  local _mo_native_csv="${_mo_tools_resolved%%|*}"
+  local _mo_mcp_csv="${_mo_tools_resolved#*|}"
+  local _mo_allowed_tools_value
+  _mo_allowed_tools_value="$(_mo_build_allowed_tools_arg "$_mo_native_csv" "$_mo_mcp_csv")"
+  local _mo_tool_args=(--allowedTools "$_mo_allowed_tools_value" --strict-mcp-config)
+  local _mo_mcp_config_path=""
+  if [ -n "${MINI_ORK_RUN_DIR:-}" ]; then
+    _mo_mcp_config_path="$(_mo_write_node_mcp_config "$_mo_mcp_csv" "${MINI_ORK_RUN_DIR}")"
+    [ -n "$_mo_mcp_config_path" ] && _mo_tool_args+=(--mcp-config "$_mo_mcp_config_path")
+  fi
 
   # ADR-001 Phase 1: delegate to the Python dispatch layer when opted in
   # (MO_DISPATCH_BACKEND=python). The Python path reads the prompt over stdin
@@ -943,6 +1183,7 @@ mo_llm_dispatch() {
         "$TIMEOUT_CMD" --kill-after=60 "$timeout_s" claude \
           --print \
           --permission-mode bypassPermissions \
+          "${_mo_tool_args[@]}" \
           --output-format "$_format" \
           "${_verbose_flag[@]}" \
           --max-turns "$max_turns" \
@@ -961,6 +1202,7 @@ mo_llm_dispatch() {
         claude \
           --print \
           --permission-mode bypassPermissions \
+          "${_mo_tool_args[@]}" \
           --output-format "$_format" \
           "${_verbose_flag[@]}" \
           --max-turns "$max_turns" \
