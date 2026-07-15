@@ -1186,7 +1186,10 @@ def test_projects_switch_swaps_db_and_registers(db, home, monkeypatch, tmp_path)
         assert str(other) in [p["home"] for p in listed["projects"]]
     finally:
         set_home_override(home)
-    assert get_db().db_path == home / "state.db"
+    # StateDB.db_path is canonicalised via .resolve(); resolve the expected
+    # side too so the assert holds whether state.db is a real file or a symlink
+    # (e.g. a worktree/vendored install whose state.db links elsewhere).
+    assert get_db().db_path == (home / "state.db").resolve()
 
 
 def test_projects_validate_and_add(db, home, monkeypatch, tmp_path) -> None:
@@ -1241,7 +1244,10 @@ def test_workspace_scoped_home_resolution(db, home, tmp_path) -> None:
 
     # request-scoped DB resolution leaves the server default untouched
     assert get_db(get_home(str(other), None)).db_path == other / "state.db"
-    assert get_db().db_path == home / "state.db"
+    # StateDB.db_path is canonicalised via .resolve(); resolve the expected
+    # side too so the assert holds whether state.db is a real file or a symlink
+    # (e.g. a worktree/vendored install whose state.db links elsewhere).
+    assert get_db().db_path == (home / "state.db").resolve()
     assert db_for(other) is db_for(other)  # per-home handle cache
 
     with pytest.raises(HTTPException) as e:
