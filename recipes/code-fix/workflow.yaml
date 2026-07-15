@@ -3,11 +3,20 @@ task_class: code_fix
 description: "Single-patch code fix with typecheck, test, and reviewer gates"
 
 nodes:
+  # Reference capability profiles — enforced hermetically by
+  # mo_llm_dispatch() (lib/llm-dispatch.sh) via --allowedTools +
+  # --mcp-config + --strict-mcp-config. Structural invariant: no single
+  # node may simultaneously hold repo-write + untrusted-content ingress
+  # + outbound channel. Web / comms MCP grants are deliberately absent
+  # here; a node that needs them must declare them and pass review.
   - name: planner
     type: planner
     model_lane: planner
     prompt_ref: prompts/planner.md
     dispatch_mode: serial
+    tools:
+      native: [Read]
+      mcp: [codegraph]
 
   - name: implementer
     type: implementer
@@ -17,6 +26,9 @@ nodes:
     gates:
       - scope_gate
       - budget_gate
+    tools:
+      native: [Read, Write, Edit, Bash]
+      mcp: [codegraph]
 
   - name: typecheck
     type: verifier
@@ -35,6 +47,8 @@ nodes:
     model_lane: reviewer
     prompt_ref: prompts/reviewer.md
     dispatch_mode: serial
+    tools:
+      native: [Read, Bash]
 
   - name: publisher
     type: publisher
