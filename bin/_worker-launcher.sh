@@ -163,7 +163,7 @@ PROMPT_FILE="$ITER_DIR/prompt.md"
   echo
   echo "- Touch ONLY files in scope patterns above."
   echo "- Idempotent migrations (\`IF NOT EXISTS\`)."
-  echo "- Use Context7 MCP before writing code that uses any library/SDK."
+  echo "- Before writing code that uses any library/SDK, fetch its current docs via the \`ctx7\` CLI: \`npx ctx7@latest docs /org/project '<your question>'\`."
   echo "- No fallback logic for SDK / sandbox failures — fail loudly."
   echo "- Commit per logical unit. Conventional Commits format."
   echo "- Do NOT push. Do NOT create PRs."
