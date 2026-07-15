@@ -24,6 +24,7 @@ Ported here (all pure / transcribed verbatim):
 from __future__ import annotations
 
 import datetime
+import hashlib
 import json
 import math
 import os
@@ -775,6 +776,12 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
     # F3: without a trace_fn the live path writes zero execution_traces rows and the
     # GRPO/reflect learning loop is inert. Wire the real writer (reward-stamped rows).
     trace_writer = _make_trace_fn(task_class, db, run_id)
+    # F4 (durable-dag E1): parallel writer that publishes node_checkpoints
+    # rows at every node success. The runtime seam (trace wrapper inside
+    # dispatch_node) calls BOTH; absence of a node_checkpoints row after
+    # a success means the writer failed best-effort and the runtime will
+    # treat the node as not-reusable on the next attempt (design §4).
+    checkpoint_writer = _make_checkpoint_fn(db, run_id, live_run_dir, recipe, task_class)
     set_status(db, run_id, "executing")
     ordered = ([f for nt in _NODE_TYPE_ORDER for f in fields_list if f[1] == nt]
                if dispatch_mode == "partitioned" else fields_list)
@@ -791,7 +798,7 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
         rc, _fr = dispatch_node(f, root=root, run_dir=live_run_dir, plan_path=plan_path,
                                 task_class=task_class, db=db, run_id=run_id,
                                 dispatch_fn=llm, recipe=recipe, workflow=workflow,
-                                trace_fn=trace_writer)
+                                trace_fn=trace_writer, checkpoint_fn=checkpoint_writer)
         if rc != 0:
             fail_count += 1
     _emit_run_verdict(live_run_dir, fail_count, len(fields_list))
@@ -1508,6 +1515,56 @@ def _make_trace_fn(task_class, db, run_id):
     return _tf
 
 
+def _make_checkpoint_fn(db, run_id, run_dir, recipe, task_class):
+    """F4 (durable-dag E1): closure that publishes a ``node_checkpoints`` row
+    at every node success. Mirrors ``_make_trace_fn``'s role — a single
+    closure the dispatch_node trace wrapper calls. Best-effort: failures
+    are logged to stderr but NEVER raise, so a transient DB hiccup cannot
+    crash a live run. The runtime treats the absence of a row as
+    ``not reusable → rerun`` (the fail-closed contract from design §4).
+
+    E1 placeholder semantics (E2 will tighten these):
+      - ``input_hash`` is a stable per-(run,node) sha256 — E1 has no
+        upstream-input resolution; this keeps the column populated and
+        the validity check wired so the schema, write, and read paths
+        are all exercised. E2 replaces this with a real upstream-hash.
+      - ``recipe_version`` is the resolved recipe name (workflow.yaml
+        is the source of truth in E2; recipe is a stable proxy in E1).
+      - ``config_hash`` is a stable per-(task_class, recipe, run_id)
+        sha256 — the resolved config slice mini-ork already knows.
+    """
+    from mini_ork.ported import mini_ork_checkpoints as mc  # noqa: PLC0415
+    started_at = int(time.time())
+    recipe_eff = recipe or "unknown"
+    # Pre-compute the stable input/config hashes; both depend only on
+    # resolved run-level fields so they are constant for a given (run,
+    # recipe, task_class) and only vary by node_id (input_hash) — which
+    # is exactly the per-node reuse key the validity check compares.
+    config_hash = hashlib.sha256(
+        f"{task_class}|{recipe_eff}|{run_id}".encode()).hexdigest()
+
+    def _cp(node_id: str, status: str, node_type: str = "", output_file: str = ""):
+        if status != "success":
+            return  # only success → reusable checkpoint (design §3 rule 0)
+        if not output_file:
+            return  # nothing on disk to checkpoint; no row = rerun is correct
+        # input_hash is per-(run, node) in E1; E2 will fold in upstream
+        # input sha256s so a config change invalidates exactly the right
+        # subtree.
+        input_hash = hashlib.sha256(
+            f"{run_id}|{node_id}|{recipe_eff}".encode()).hexdigest()
+        mc.write_checkpoint(
+            db, run_id, node_id,
+            status="success", input_hash=input_hash,
+            recipe_version=recipe_eff, config_hash=config_hash,
+            artifact_paths=[output_file], run_dir=run_dir,
+            node_type=node_type or "", started_at=started_at,
+            ended_at=int(time.time()), initiator="python",
+        )
+
+    return _cp
+
+
 def _publisher_try_commit_files(root, target_repo, run_dir, review_file, verdict_env,
                                 recipe, node_desc, run_id):
     """Port of bash `_publisher_try_commit_files` (embedded python, :824-949). Commit
@@ -1756,7 +1813,8 @@ _REVIEW_REVISE = {"revise", "needs_revision", "request_changes"}
 
 
 def dispatch_node(fields, *, root, run_dir, plan_path, task_class, db, run_id,
-                  dispatch_fn, recipe="", workflow="", trace_fn=None):
+                  dispatch_fn, recipe="", workflow="", trace_fn=None,
+                  checkpoint_fn=None):
     """Live dispatch of one node. Returns (rc, finish_reason). rc!=0 → FAIL_COUNT++.
     dispatch_fn(task_class, node_type, prompt) -> (rc, text)."""
     node_id, node_type, node_desc, prompt_ref, _dmode, verifier_ref, model_lane, node_requires_capabilities = \
@@ -1767,11 +1825,21 @@ def dispatch_node(fields, *, root, run_dir, plan_path, task_class, db, run_id,
     workflow_lane = model_lane or node_type
     lane = policy_route_lane(node_type, workflow_lane, dry_run=False, root=root)
     _base_trace = trace_fn or (lambda *a, **k: None)
+    # F4: durable DAG checkpoint writer (E1). Single seam — the trace
+    # wrapper below — so every node completion site publishes a row in
+    # exactly one place. Best-effort: the writer returns non-zero on
+    # failure but never raises; absence of a row means "not reusable",
+    # which the runtime treats as rerun (design §4 fail-closed).
+    _base_checkpoint = checkpoint_fn or (lambda *a, **k: None)
 
     # Bind the resolved lane into every trace() call so agent_version_id is stamped
     # (bash passes the shell var dispatch_lane into _trace_write_node_rich's payload).
     def trace(node_id, status, node_type, output_file="", verdict="", finish_reason=""):
         _base_trace(node_id, status, node_type, output_file, verdict, finish_reason, lane=lane)
+        # F4: publish the durable checkpoint at the SAME single seam as the
+        # trace write. The wrapper unifies node-completion side effects so
+        # E2's recovery code can rely on every success also having a row.
+        _base_checkpoint(node_id, status, node_type, output_file)
     run_dir_eff = os.environ.get("MINI_ORK_RUN_DIR", run_dir)
     # Snapshot the tree BEFORE any implementer node edits it, so the reviewer
     # diff captures only the implementer's delta (not pre-existing dirt from a
