@@ -24,7 +24,8 @@ from pathlib import Path
 
 _EXEC_SUBS = {"classify", "plan", "execute", "verify", "reflect", "improve", "eval",
               "promote", "init", "update", "spawn", "scheduler", "epics", "bugs",
-              "inject", "review", "traceotter", "metrics", "rollback", "resume", "serve"}
+              "inject", "review", "traceotter", "metrics", "rollback", "resume",
+              "recover", "serve"}
 
 _HELP = """mini-ork — task operating system for agents (v0.1)
 
