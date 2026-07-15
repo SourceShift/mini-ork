@@ -1179,6 +1179,49 @@ def _researcher_output_file(run_dir, recipe, node_id):
     return os.path.join(run_dir, f"context-{node_id}.json")
 
 
+def _capture_pre_impl_baseline(run_dir):
+    """Snapshot the working-tree state BEFORE the implementer edits, so the
+    reviewer diff (below) captures ONLY the implementer's delta — never
+    pre-existing dirt from a concurrent session sharing this in-place tree.
+
+    Why this exists: framework-edit's implementer edits MO_TARGET_CWD in place,
+    and the reviewer diff was `git diff` (working tree vs HEAD). With any
+    unrelated uncommitted change already present, that diff swept it into
+    review-diff.patch — so the run could review, and publish, another session's
+    work. (Observed repeatedly; a concurrent session hit the same confound.)
+
+    `git stash create` records the current tracked modifications as a commit
+    object WITHOUT touching the working tree, index, or stash list — a purely
+    non-destructive snapshot. Empty output means a clean tree, so the baseline is
+    HEAD. The ref is persisted to <run_dir>/pre-implementer-ref and read back by
+    _assemble_reviewer_inputs. Idempotent: only the first call (before the first
+    implementer iteration) writes it.
+    """
+    if not run_dir:
+        return
+    ref_path = os.path.join(run_dir, "pre-implementer-ref")
+    if os.path.isfile(ref_path):
+        return
+    cwd = os.environ.get("MO_TARGET_CWD") or os.getcwd()
+    try:
+        if subprocess.run(["git", "-C", cwd, "rev-parse", "--git-dir"],
+                          capture_output=True).returncode != 0:
+            return
+        created = subprocess.run(["git", "-C", cwd, "stash", "create"],
+                                 capture_output=True, text=True)
+        ref = (created.stdout or "").strip()
+        if not ref:
+            head = subprocess.run(["git", "-C", cwd, "rev-parse", "HEAD"],
+                                  capture_output=True, text=True)
+            ref = (head.stdout or "").strip()
+        if ref:
+            os.makedirs(run_dir, exist_ok=True)
+            with open(ref_path, "w") as fh:
+                fh.write(ref + "\n")
+    except Exception:
+        pass
+
+
 def _assemble_reviewer_inputs(run_dir):
     """F2-B (bash _mo_assemble_reviewer_inputs:182-275). Build the reviewer input block:
     implementer-summary.json + verifier_{typecheck,test}.json + a generated
@@ -1203,11 +1246,27 @@ def _assemble_reviewer_inputs(run_dir):
     if not worktree or not os.path.isdir(worktree):
         worktree = os.environ.get("MO_TARGET_CWD") or os.getcwd()
     diff_path = os.path.join(run_dir, "review-diff.patch")
+    # Diff against the pre-implementer baseline (captured at run start by
+    # _capture_pre_impl_baseline) so the reviewer sees ONLY the implementer's
+    # delta, never pre-existing dirt from a concurrent session sharing this
+    # in-place working tree. Falls back to a plain working-tree diff only when no
+    # baseline was recorded (e.g. an isolated worktree that started clean).
+    baseline = ""
+    ref_path = os.path.join(run_dir, "pre-implementer-ref")
+    if os.path.isfile(ref_path):
+        try:
+            baseline = open(ref_path).read().strip()
+        except OSError:
+            baseline = ""
     try:
         if os.path.isdir(worktree) and subprocess.run(
                 ["git", "-C", worktree, "rev-parse", "--git-dir"],
                 capture_output=True).returncode == 0:
-            args = ["git", "-C", worktree, "diff", "--no-color"] + (["--", *files] if files else [])
+            args = ["git", "-C", worktree, "diff", "--no-color"]
+            if baseline:
+                args.append(baseline)
+            if files:
+                args += ["--", *files]
             with open(diff_path, "w") as fh:
                 subprocess.run(args, stdout=fh, stderr=subprocess.DEVNULL)
         if not (os.path.isfile(diff_path) and os.path.getsize(diff_path) > 0):
@@ -1714,6 +1773,10 @@ def dispatch_node(fields, *, root, run_dir, plan_path, task_class, db, run_id,
     def trace(node_id, status, node_type, output_file="", verdict="", finish_reason=""):
         _base_trace(node_id, status, node_type, output_file, verdict, finish_reason, lane=lane)
     run_dir_eff = os.environ.get("MINI_ORK_RUN_DIR", run_dir)
+    # Snapshot the tree BEFORE any implementer node edits it, so the reviewer
+    # diff captures only the implementer's delta (not pre-existing dirt from a
+    # concurrent session sharing this in-place working tree). Non-destructive.
+    _capture_pre_impl_baseline(run_dir_eff)
     cost_sidecar = os.path.join(run_dir_eff, ".last-llm-cost")
 
     def _charge():
