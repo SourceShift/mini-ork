@@ -15,6 +15,7 @@ import os
 import re
 import shlex
 import subprocess
+import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -336,6 +337,30 @@ def dispatch_model(
         spec = resolve_provider(request.model, root)
     except (ValueError, FileNotFoundError) as exc:
         return DispatchResult(ok=False, rc=2, error=str(exc), model=request.model)
+    # Node-scoped tool grants (kickoff/tool-grant-hermetic-dispatch.md):
+    # resolve the active node's capability grant from MO_NODE_ID/MO_NODE_TYPE
+    # + workflow.yaml, then inject --allowedTools + --strict-mcp-config
+    # (+ --mcp-config when MCP grants are present and MINI_ORK_RUN_DIR is set)
+    # into the claude argv. EXECUTABLE_MODELS (codex/gemini) are skipped —
+    # their CLIs don't accept --allowedTools and bash never passes it to them.
+    # MO_TOOL_GRANTS_DISABLED=1 opt-out for local debugging, matching the bash
+    # dispatch's escape hatch at lib/llm-dispatch.sh:981.
+    if request.model not in EXECUTABLE_MODELS:
+        effective_env = {**os.environ, **request.env}
+        if effective_env.get("MO_TOOL_GRANTS_DISABLED", "0") != "1":
+            run_dir = effective_env.get("MINI_ORK_RUN_DIR", "") or None
+            new_command = apply_tool_grants(
+                spec.command, env=effective_env, run_dir=run_dir
+            )
+            if new_command != spec.command:
+                spec = ProviderSpec(
+                    model=spec.model,
+                    command=new_command,
+                    parse_usage=spec.parse_usage,
+                    parse_cost=spec.parse_cost,
+                    parse_text=spec.parse_text,
+                    env=spec.env,
+                )
     # Merge the lane's pinned env UNDER any per-request overrides; pin the cwd.
     merged_env = {**dict(spec.env), **request.env}
     effective = DispatchRequest(
@@ -355,6 +380,255 @@ def dispatch_model(
         parse_cost=spec.parse_cost,  # type: ignore[arg-type]
         parse_text=spec.parse_text,  # type: ignore[arg-type]
     )
+
+
+# ─── Node-scoped tool grants (kickoff/tool-grant-hermetic-dispatch.md) ───────
+# Faithful Python port of the bash resolver in lib/llm-dispatch.sh
+# (_mo_resolve_node_tools / _mo_default_tools_for_type / _mo_build_allowed_tools_arg /
+# _mo_write_node_mcp_config). Resolves a workflow.yaml `tools:` block per active
+# node and injects hermetic --allowedTools + --strict-mcp-config + --mcp-config
+# argv onto the claude invocation. Without this every dispatch silently lost
+# the previous attempt's consumer-only wiring and gave undeclared implementer
+# nodes Read,Bash — no Write/Edit — which broke 12+ recipes' worker lanes.
+
+# Type-aware fail-closed defaults. "Fail closed" means "no MCP and no ambient
+# leakage", NOT "no ability to do the job" — an undeclared implementer must
+# still be able to write files or every recipe breaks.
+def _mo_default_tools_for_type(node_type: str) -> str:
+    if node_type == "implementer":
+        return "Read,Write,Edit,Bash|"
+    return "Read,Bash|"
+
+
+def _resolve_node_tools_from_yaml(yaml_path: str, node_id: str) -> str:
+    """Producer: parse a workflow.yaml, find the node by name (with -/_ variants),
+    extract its `tools:` block. Prints "native_csv|mcp_csv" to stdout. Empty
+    string when the node isn't declared — caller applies the type-aware default."""
+    p = Path(yaml_path)
+    if not p.is_file():
+        return ""
+
+    def _try_yaml() -> str | None:
+        try:
+            import yaml  # noqa: F401
+        except ImportError:
+            return None
+        try:
+            with open(p, encoding="utf-8") as fh:
+                d = yaml.safe_load(fh) or {}
+        except (OSError, ValueError, TypeError):
+            return ""
+        nodes = d.get("nodes") or []
+        for n in nodes:
+            if not isinstance(n, dict):
+                continue
+            nm = str(n.get("name") or "")
+            if nm == node_id or nm.replace("-", "_") == node_id.replace("-", "_"):
+                tools = n.get("tools") or {}
+                if not isinstance(tools, dict):
+                    return ""
+                native = tools.get("native") or []
+                mcp = tools.get("mcp") or []
+                if not isinstance(native, list):
+                    native = list(native) if native else []
+                if not isinstance(mcp, list):
+                    mcp = list(mcp) if mcp else []
+                return "%s|%s" % (
+                    ",".join(str(x) for x in native),
+                    ",".join(str(x) for x in mcp),
+                )
+        return ""
+
+    # Regex fallback: robust to either yq or yaml format. Handles the multi-doc
+    # case by scanning all `name:` lines and resetting the active block.
+    def _regex_fallback() -> str:
+        try:
+            text = p.read_text(encoding="utf-8")
+        except OSError:
+            return ""
+        norm = node_id.replace("-", "_")
+        blocks = re.split(r"\n(?=  - name: |\n  - name: )", text)
+        for blk in blocks:
+            m = re.search(r"^\s*-?\s*name:\s*['\"]?([A-Za-z0-9_.-]+)['\"]?", blk, re.M)
+            if not m:
+                continue
+            if m.group(1) != node_id and m.group(1).replace("-", "_") != norm:
+                continue
+            tools_m = re.search(r"^\s*tools:\s*\n((?:\s+\S.*\n)+)", blk, re.M)
+            if not tools_m:
+                return ""
+            body = tools_m.group(1)
+            nat_m = re.search(r"native:\s*\[([^\]]*)\]", body)
+            mcp_m = re.search(r"mcp:\s*\[([^\]]*)\]", body)
+
+            def _split(s: str | None) -> str:
+                if not s:
+                    return ""
+                return ",".join(
+                    t.strip().strip("'\"") for t in s.split(",") if t.strip()
+                )
+
+            return "%s|%s" % (
+                _split(nat_m.group(1) if nat_m else ""),
+                _split(mcp_m.group(1) if mcp_m else ""),
+            )
+        return ""
+
+    result = _try_yaml()
+    if result is None:
+        result = _regex_fallback()
+    return result
+
+
+def _resolve_node_tools(env: Mapping[str, str]) -> str:
+    """Env-aware entry: MO_RESOLVED_NODE_TOOLS override → workflow.yaml lookup →
+    type-aware default. Mirrors _mo_resolve_node_tools in lib/llm-dispatch.sh."""
+    override = env.get("MO_RESOLVED_NODE_TOOLS", "")
+    if override:
+        return override
+    yaml_path = env.get("MO_WORKFLOW_YAML", "")
+    if not yaml_path or not Path(yaml_path).is_file():
+        run_dir = env.get("MINI_ORK_RUN_DIR", "")
+        if run_dir:
+            candidate = Path(run_dir) / "workflow.yaml"
+            if candidate.is_file():
+                yaml_path = str(candidate)
+    node_id = env.get("MO_NODE_ID", "")
+    node_type = env.get("MO_NODE_TYPE", "")
+    resolved = ""
+    if yaml_path and node_id:
+        resolved = _resolve_node_tools_from_yaml(yaml_path, node_id)
+    # The yaml resolver returns the bare "|" for a node with no tools: block —
+    # that's a non-empty string, so a plain truthiness check would skip the
+    # default and resolve every undeclared node to NO tools. Treat "|" as
+    # unresolved. Same footgun fixed in bash at llm-dispatch.sh:873-877.
+    if not resolved or resolved == "|":
+        resolved = _mo_default_tools_for_type(node_type)
+        if node_id:
+            sys.stderr.write(
+                f"[tool-grants] node={node_id} type={node_type or 'unknown'} "
+                "undeclared; applying type-aware default\n"
+            )
+    return resolved
+
+
+def _build_allowed_tools_arg(native_csv: str, mcp_csv: str) -> str:
+    """Compose the comma-separated value passed to --allowedTools. Native tools
+    pass through verbatim; MCP grants render as mcp__<server>."""
+    parts: list[str] = []
+    for csv in (native_csv or "", mcp_csv or ""):
+        for raw in csv.split(","):
+            tok = raw.strip()
+            if not tok:
+                continue
+            if csv is mcp_csv:
+                if not tok.startswith("mcp__"):
+                    tok = f"mcp__{tok}"
+            parts.append(tok)
+    return ",".join(parts)
+
+
+def _write_node_mcp_config(
+    mcp_csv: str, run_dir: str, *, env: Mapping[str, str] | None = None
+) -> str | None:
+    """Write a node-scoped .mcp-config.json containing only the granted MCP
+    servers. Sources the operator's MCP server definitions from
+    ${MINI_ORK_HOME}/config/mcp_servers.json (operator home) or
+    ${MINI_ORK_ROOT}/.claude/mcp_servers.json (repo fallback), filters to the
+    granted subset, writes to ${run_dir}/.mcp-config.json. Granted servers not
+    in the operator config get a no-op stub so --strict-mcp-config keeps the
+    dispatch hermetic."""
+    if not run_dir:
+        return None
+    granted = [s.strip() for s in (mcp_csv or "").split(",") if s.strip()]
+    if not granted:
+        return None
+    e = env if env is not None else os.environ
+    home = e.get("MINI_ORK_HOME", "") or ""
+    root = e.get("MINI_ORK_ROOT", "") or ""
+    sources: list[str] = []
+    if home:
+        sources.append(os.path.join(home, "config", "mcp_servers.json"))
+    if root:
+        sources.append(os.path.join(root, ".claude", "mcp_servers.json"))
+        sources.append(os.path.join(root, "mcp", "steering.json"))
+    operator: dict[str, object] = {}
+    for src in sources:
+        if not src or not os.path.isfile(src):
+            continue
+        try:
+            with open(src, encoding="utf-8") as fh:
+                d = json.load(fh)
+        except (OSError, ValueError, TypeError):
+            continue
+        if isinstance(d, dict) and isinstance(d.get("mcpServers"), dict):
+            operator = d["mcpServers"]  # type: ignore[assignment]
+            break
+        if isinstance(d, dict):
+            operator = d
+            break
+    scoped: dict[str, object] = {}
+    for g in granted:
+        candidate = operator.get(g) if isinstance(operator, dict) else None
+        if isinstance(candidate, dict):
+            scoped[g] = candidate
+        else:
+            scoped[g] = {"command": "echo", "args": [f"no-op: {g} not configured"]}
+    out_dir = Path(run_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / ".mcp-config.json"
+    try:
+        with open(out_path, "w", encoding="utf-8") as fh:
+            json.dump({"mcpServers": scoped}, fh, indent=2)
+    except OSError:
+        return None
+    return str(out_path)
+
+
+def apply_tool_grants(
+    command: Sequence[str],
+    *,
+    env: Mapping[str, str],
+    run_dir: str | None = None,
+) -> tuple[str, ...]:
+    """Insert --allowedTools, --strict-mcp-config (always), and --mcp-config
+    (when MCP grants present + run_dir given) into a claude argv. Inserts at
+    the position bash uses (after --permission-mode, before --output-format)
+    so the resulting argv is byte-for-byte equivalent to the bash path's.
+    Returns the original command unchanged when the resolver returns an empty
+    grant — an undeclared implementer MUST still default to
+    Read,Write,Edit,Bash so implementer recipes don't silently go read-only."""
+    # Defense-in-depth: --allowedTools/--strict-mcp-config are claude CLI flags.
+    # Today every caller path passes a claude command (kimi/minimax/glm route
+    # through the claude binary; codex/gemini are excluded upstream), but guard
+    # here so a future non-claude lane can never have these injected into its argv.
+    if not command or command[0] != "claude":
+        return tuple(command)
+    resolved = _resolve_node_tools(env)
+    if not resolved or "|" not in resolved:
+        return tuple(command)
+    native_csv, mcp_csv = resolved.split("|", 1)
+    allowed = _build_allowed_tools_arg(native_csv, mcp_csv)
+    if not allowed:
+        return tuple(command)
+    tool_flags = ["--allowedTools", allowed, "--strict-mcp-config"]
+    rd = run_dir or env.get("MINI_ORK_RUN_DIR", "")
+    if rd and mcp_csv.strip():
+        cfg_path = _write_node_mcp_config(mcp_csv, rd, env=env)
+        if cfg_path:
+            tool_flags += ["--mcp-config", cfg_path]
+    # Insertion point: right before --output-format (or end), matching bash's
+    # argv layout (--permission-mode <then tool-flags> --output-format). When
+    # --output-format isn't present, append (safe fallback for command shapes
+    # this codebase hasn't shipped yet).
+    new = list(command)
+    insert_idx = len(new)
+    for i, arg in enumerate(new):
+        if arg == "--output-format":
+            insert_idx = i
+            break
+    new[insert_idx:insert_idx] = tool_flags
+    return tuple(new)
 
 
 def _read_codex_sidecars(usage_path: str, cost_path: str) -> tuple[TokenUsage, float]:
