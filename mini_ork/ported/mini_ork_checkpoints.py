@@ -176,6 +176,7 @@ def write_checkpoint(
     initiator: str = "python",
     failure_class: str | None = None,
     attempt: int | None = None,
+    owner_token: str | None = None,
 ) -> int:
     """Crash-safe per-node checkpoint publication. Returns 0 on success.
 
@@ -211,6 +212,25 @@ def write_checkpoint(
     if not os.path.isfile(db):
         _log_err(f"write_checkpoint: db not found: {db}")
         return 1
+
+    # (E3 fencing) When a caller presents an owner_token it is asserting it
+    # holds the run's single-writer lease. Reject the publish if that token is
+    # NOT the current LIVE holder — this is what stops a stale worker (whose
+    # lease expired and was re-acquired by a newer recovery) from committing a
+    # checkpoint over the top of live work (design §7). When no token is passed
+    # (legacy non-recovery path) fencing is disabled — preserves E1's contract.
+    if owner_token is not None:
+        try:
+            from mini_ork.ported.lease import is_lease_holder  # lazy: avoid load-order coupling
+            if not is_lease_holder(db, run_id, owner_token):
+                _log_err(
+                    f"write_checkpoint: fence rejected — token {owner_token!r} is not the "
+                    f"live lease holder of run {run_id!r}; refusing to publish {node_id!r}"
+                )
+                return 2
+        except Exception as e:  # noqa: BLE001 — fence must fail closed
+            _log_err(f"write_checkpoint: fence check errored ({e}); refusing to publish")
+            return 2
 
     # (a) + (b) build manifest and fsync artifacts BEFORE the row.
     # If we crash between (a) and (c) the next recovery sees no row

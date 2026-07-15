@@ -78,6 +78,14 @@ import sys
 # immediately as ImportError on first call (fail loud).
 from mini_ork.ported import mini_ork_checkpoints as mc  # noqa: E402
 
+# E3 seam — single-writer lease + idempotent recovery request. Guarded
+# (soft) so the planner still imports on a build where E3 is absent; the
+# dispatch path checks ``_lease is not None`` before using it.
+try:
+    from mini_ork.ported import lease as _lease  # noqa: E402
+except Exception:  # noqa: BLE001 — E3 optional at import time
+    _lease = None  # type: ignore[assignment]
+
 __all__ = [
     "DAG",
     "RecoveryPlan",
@@ -850,6 +858,32 @@ def main(argv: list[str] | None = None) -> int:
             f"[mini-ork-recover] every node is reusable; nothing to recover for {run_id}\n"
         )
         return 0
+
+    # ── E3: single-writer lease + idempotent recovery request ──
+    # A recovery must OWN the run before it dispatches. Register the request
+    # (idempotent on run_id+from_node+strategy) then acquire the lease. If the
+    # lease is already held by another live recovery, return a safe descriptive
+    # result and DO NOT dispatch — so two concurrent `recover` calls run the
+    # node once (design §5/§7, scenario 6). The acquired token is exported as
+    # MINI_ORK_LEASE_TOKEN so execute's checkpoint publish is fenced against a
+    # stale worker. Gated on lease_tables_present so a pre-0052 (legacy) DB
+    # recovers fence-free exactly as E2 did.
+    if _lease is not None and _lease.lease_tables_present(db_path):
+        _from = plan.first_node or (from_node or "")
+        _req = _lease.request_recovery(db_path, run_id, _from, strategy)
+        _token = _lease.acquire_lease(db_path, run_id)
+        if _token is None:
+            _rid = _req[0] if _req else "<unknown>"
+            sys.stdout.write(
+                f"[mini-ork-recover] run {run_id} is already being recovered "
+                f"(single-writer lease held by another worker; request_id={_rid}); "
+                f"not dispatching a second time.\n"
+            )
+            return 0
+        if _req is not None:
+            os.environ["MINI_ORK_RECOVERY_REQUEST"] = _req[0]
+            _lease.mark_dispatched(db_path, _req[0], owner_token=_token, cost_usd=0.0)
+        os.environ["MINI_ORK_LEASE_TOKEN"] = _token
 
     # Active strategies: emit the env, print the plan, hand off to
     # mini-ork-execute which honors MINI_ORK_RECOVERY_FROM + CLOSURE.

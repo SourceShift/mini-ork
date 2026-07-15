@@ -1644,6 +1644,13 @@ def _make_checkpoint_fn(db, run_id, run_dir, recipe, task_class):
     from mini_ork.ported import mini_ork_checkpoints as mc  # noqa: PLC0415
     started_at = int(time.time())
     recipe_eff = recipe or "unknown"
+    # E3 fencing: during a recovery dispatch, mini-ork-recover acquires the
+    # run's single-writer lease and exports MINI_ORK_LEASE_TOKEN. Threading it
+    # here makes every checkpoint publish present the token, so a stale worker
+    # whose lease was re-acquired by a newer recovery is rejected at the write
+    # (design §7). On a normal run the env is unset → owner_token=None → no
+    # fencing (preserves E1's contract).
+    owner_token = os.environ.get("MINI_ORK_LEASE_TOKEN") or None
     # Pre-compute the stable input/config hashes; both depend only on
     # resolved run-level fields so they are constant for a given (run,
     # recipe, task_class) and only vary by node_id (input_hash) — which
@@ -1668,6 +1675,7 @@ def _make_checkpoint_fn(db, run_id, run_dir, recipe, task_class):
             artifact_paths=[output_file], run_dir=run_dir,
             node_type=node_type or "", started_at=started_at,
             ended_at=int(time.time()), initiator="python",
+            owner_token=owner_token,
         )
 
     return _cp
