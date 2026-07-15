@@ -740,21 +740,37 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
                 if m > newest_mtime:
                     newest, newest_mtime = p, m
         plan_path = newest
-    if not plan_path:
+    # E2 recovery: a from-workflow recovery derives node_ids from MINI_ORK_WORKFLOW
+    # and its run_dir from MINI_ORK_RUN_DIR, so it does NOT require a plan.json — the
+    # original plan may be gone, or recovery may be driven purely from the workflow +
+    # E1 checkpoints. Only require a plan for a normal, non-recovery run.
+    _wf_env = os.environ.get("MINI_ORK_WORKFLOW", "")
+    _recovery_ctx = bool(
+        from_node
+        or os.environ.get("MINI_ORK_RECOVERY_CLOSURE", "").strip()
+        or os.environ.get("MINI_ORK_RECOVERY_FROM", "").strip()
+        or recovery_active
+    )
+    _recovery_no_plan = (
+        not plan_path and _recovery_ctx and bool(_wf_env) and os.path.isfile(_wf_env)
+    )
+    if not plan_path and not _recovery_no_plan:
         sys.stderr.write("No plan.json found. Run: mini-ork plan <kickoff.md>\n")
         return 2
-    if not os.path.isfile(plan_path):
+    if plan_path and not os.path.isfile(plan_path):
         sys.stderr.write(f"plan not found: {plan_path}\n")
         return 2
 
     workflow = os.environ.get("MINI_ORK_WORKFLOW", "")
     if not workflow and os.environ.get("MINI_ORK_RECIPE"):
         workflow = os.path.join(root, "recipes", os.environ["MINI_ORK_RECIPE"], "workflow.yaml")
-    run_dir = os.path.dirname(plan_path) if plan_path else "."
+    run_dir = (os.path.dirname(plan_path) if plan_path
+               else (os.environ.get("MINI_ORK_RUN_DIR") or "."))
 
     # Pre-dispatch execute gate (bash :1136-1203): refuse to dispatch a
-    # needs_answers plan (exit 6, records the block). Before node building.
-    if _execute_gate_check(plan_path, run_dir, dry_run):
+    # needs_answers plan (exit 6). Needs a plan.json; a from-workflow recovery
+    # has none → nothing to gate on, so skip it.
+    if plan_path and _execute_gate_check(plan_path, run_dir, dry_run):
         return 6
 
     # NODE_IDS: workflow.yaml source wins; else plan.json.decomposition.
