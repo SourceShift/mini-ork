@@ -113,6 +113,35 @@ def claude_cost(stdout: str, _usage: TokenUsage) -> float:
         return 0.0
 
 
+def claude_session_id(stdout: str) -> str:
+    """Extract the conversation id from claude's JSON envelope (.session_id).
+
+    `claude --print --output-format json` emits a stable ``session_id`` that
+    keys the on-disk transcript under ``~/.claude/projects/<hash>/<id>.jsonl``.
+    Capturing it is what makes turn-resume (``--resume <id>``) possible for a
+    node that stopped mid-conversation (durable-dag E4). "" when absent."""
+    return str(_claude_envelope(stdout).get("session_id") or "")
+
+
+def apply_resume(command: Sequence[str], session_id: str) -> tuple[str, ...]:
+    """Insert ``--resume <session_id>`` into a claude argv so a recovery
+    continues the SAME conversation instead of starting fresh (E4, priority-A:
+    "resurrect a failed node at turn 9").
+
+    Only rewrites a ``claude`` invocation (EXECUTABLE_MODELS codex/gemini have
+    their own session model — node-level resume only, handled elsewhere). The
+    flag goes right after ``claude`` so it precedes ``--print``/tool flags,
+    matching how the CLI expects a resume target. Idempotent: a command that
+    already carries ``--resume`` is returned unchanged.
+    """
+    if not session_id or not command or command[0] != "claude":
+        return tuple(command)
+    if "--resume" in command:
+        return tuple(command)
+    out = [command[0], "--resume", session_id, *command[1:]]
+    return tuple(out)
+
+
 def claude_env_for(
     model: str, root: str | os.PathLike[str] | None = None
 ) -> dict[str, str]:
@@ -152,6 +181,7 @@ class ProviderSpec:
     parse_usage: object | None = None  # UsageParser | None
     parse_cost: object | None = None  # CostParser | None
     parse_text: object | None = None  # TextParser | None
+    parse_session: object | None = None  # SessionParser | None (E4)
     env: Mapping[str, str] = field(default_factory=dict)
 
 
@@ -219,6 +249,7 @@ def resolve_provider(
         parse_usage=parse_claude_usage,
         parse_cost=claude_cost,
         parse_text=claude_result_text,
+        parse_session=claude_session_id,
         env=claude_env_for(model, root),
     )
 
@@ -347,20 +378,28 @@ def dispatch_model(
     # dispatch's escape hatch at lib/llm-dispatch.sh:981.
     if request.model not in EXECUTABLE_MODELS:
         effective_env = {**os.environ, **request.env}
+        command = spec.command
         if effective_env.get("MO_TOOL_GRANTS_DISABLED", "0") != "1":
             run_dir = effective_env.get("MINI_ORK_RUN_DIR", "") or None
-            new_command = apply_tool_grants(
-                spec.command, env=effective_env, run_dir=run_dir
+            command = apply_tool_grants(command, env=effective_env, run_dir=run_dir)
+        # E4 turn-resume: the recovery path exports MO_RESUME_SESSION_ID for a
+        # node with a persisted session. Insert `--resume <id>` so the claude
+        # lane continues the interrupted conversation instead of starting over.
+        # Claude-family only — codex/gemini (EXECUTABLE_MODELS) are excluded
+        # above and fall back to node-level resume.
+        resume_id = effective_env.get("MO_RESUME_SESSION_ID", "").strip()
+        if resume_id:
+            command = apply_resume(command, resume_id)
+        if command != spec.command:
+            spec = ProviderSpec(
+                model=spec.model,
+                command=command,
+                parse_usage=spec.parse_usage,
+                parse_cost=spec.parse_cost,
+                parse_text=spec.parse_text,
+                parse_session=spec.parse_session,
+                env=spec.env,
             )
-            if new_command != spec.command:
-                spec = ProviderSpec(
-                    model=spec.model,
-                    command=new_command,
-                    parse_usage=spec.parse_usage,
-                    parse_cost=spec.parse_cost,
-                    parse_text=spec.parse_text,
-                    env=spec.env,
-                )
     # Merge the lane's pinned env UNDER any per-request overrides; pin the cwd.
     merged_env = {**dict(spec.env), **request.env}
     effective = DispatchRequest(
@@ -373,13 +412,36 @@ def dispatch_model(
     )
     if request.model == "codex":
         return _dispatch_codex_via_wrapper(effective, spec)
-    return dispatch(
+    result = dispatch(
         effective,
         spec.command,
         parse_usage=spec.parse_usage,  # type: ignore[arg-type]
         parse_cost=spec.parse_cost,  # type: ignore[arg-type]
         parse_text=spec.parse_text,  # type: ignore[arg-type]
+        parse_session=spec.parse_session,  # type: ignore[arg-type]
     )
+    _stash_session_id(result.session_id, merged_env)
+    return result
+
+
+def _stash_session_id(session_id: str, env: Mapping[str, str]) -> None:
+    """E4: write the captured claude session id to a per-node sidecar
+    (``<run_dir>/.sessions/<node_id>.session``) so the checkpoint writer can
+    record it as ``node_attempts.provider_session_id`` without changing the
+    dispatch_fn return contract. Best-effort; keyed by MINI_ORK_RUN_DIR +
+    MO_NODE_ID which the execute loop sets before every node dispatch."""
+    if not session_id:
+        return
+    run_dir = env.get("MINI_ORK_RUN_DIR") or os.environ.get("MINI_ORK_RUN_DIR") or ""
+    node_id = env.get("MO_NODE_ID") or os.environ.get("MO_NODE_ID") or ""
+    if not run_dir or not node_id:
+        return
+    try:
+        d = Path(run_dir) / ".sessions"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / f"{node_id}.session").write_text(session_id)
+    except OSError:
+        pass
 
 
 # ─── Node-scoped tool grants (kickoff/tool-grant-hermetic-dispatch.md) ───────

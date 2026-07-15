@@ -30,6 +30,13 @@ case "$sub" in
   resume)
     exec "$MINI_ORK_ROOT/bin/mini-ork-resume" "$@" ;;
 
+  # Epic E2: dependency-closure recovery — reuse E1 checkpoints, rerun only
+  # the failed-node subtree. Distinct from `resume` (cost-pause); the two
+  # subcommands are NEVER conflated. The python planner is the load-bearing
+  # seam; bin/mini-ork-recover is a thin runtime-cutover wrapper.
+  recover)
+    exec "$MINI_ORK_ROOT/bin/mini-ork-recover" "$@" ;;
+
   # Read-only observability UI (React SPA + FastAPI + SSE)
   serve)
     exec "$MINI_ORK_ROOT/bin/mini-ork-serve" "$@" ;;

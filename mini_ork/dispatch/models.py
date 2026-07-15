@@ -54,3 +54,8 @@ class DispatchResult:
     usage: TokenUsage = field(default_factory=TokenUsage)
     cost_usd: float = 0.0
     duration_ms: int = 0
+    # Provider conversation id (claude --output-format json emits `session_id`).
+    # Captured so a failed node can be resumed at its interrupted turn via
+    # `claude --resume <session_id>` (durable-dag E4). "" when the provider
+    # does not surface one (codex/gemini use their own session model).
+    session_id: str = ""
