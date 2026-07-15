@@ -693,6 +693,27 @@ def _emit_recovery_env(plan: RecoveryPlan) -> None:
     os.environ["MINI_ORK_RECOVERY_STRATEGY"] = plan.strategy
 
 
+def _task_class_for_recipe(recipe: str) -> str:
+    """Resolve a recipe's task_class so the recovery config_hash matches the
+    one E1 wrote at run time. The original run's config_hash embeds the run's
+    task_class; without MINI_ORK_TASK_CLASS set, recover must reproduce it or
+    every node reads as a hash-mismatch rerun. Source of truth is
+    ``recipes/<recipe>/task_class.yaml`` (`name:`); falls back to the kebab→snake
+    recipe-name convention (e.g. ``framework-edit`` → ``framework_edit``)."""
+    if not recipe:
+        return ""
+    root = os.environ.get("MINI_ORK_ROOT") or os.getcwd()
+    tc_yaml = os.path.join(root, "recipes", recipe, "task_class.yaml")
+    if os.path.isfile(tc_yaml):
+        try:
+            for line in open(tc_yaml):
+                if line.strip().startswith("name:"):
+                    return line.split(":", 1)[1].strip().strip('"\'')
+        except OSError:
+            pass
+    return recipe.replace("-", "_")
+
+
 def main(argv: list[str] | None = None) -> int:
     """CLI entrypoint mirroring ``mini_ork_resume.main``.
 
@@ -785,7 +806,8 @@ def main(argv: list[str] | None = None) -> int:
     run_dir, db_default, workflow_default, recipe = _resolve_default_paths(run_id)
     workflow = workflow_override or workflow_default
     db_path = db_override or db_default
-    task_class = os.environ.get("MINI_ORK_TASK_CLASS") or "generic"
+    task_class = (os.environ.get("MINI_ORK_TASK_CLASS")
+                  or _task_class_for_recipe(recipe) or "generic")
 
     if not os.path.isdir(run_dir):
         sys.stderr.write(
