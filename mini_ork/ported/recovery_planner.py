@@ -748,11 +748,21 @@ def main(argv: list[str] | None = None) -> int:
     status_only = False
     workflow_override = ""
     db_override = ""
+    cancel_request_id = ""
     positional: list[str] = []
     i = 0
     while i < len(argv):
         a = argv[i]
-        if a == "--from-node":
+        if a == "--cancel":
+            if i + 1 >= len(argv):
+                sys.stderr.write("--cancel requires <request_id>\n")
+                return 2
+            cancel_request_id = argv[i + 1]
+            i += 2
+        elif a.startswith("--cancel="):
+            cancel_request_id = a.split("=", 1)[1].strip()
+            i += 1
+        elif a == "--from-node":
             if i + 1 >= len(argv):
                 sys.stderr.write("--from-node requires <id>\n")
                 return 2
@@ -797,6 +807,28 @@ def main(argv: list[str] | None = None) -> int:
         else:
             positional.append(a)
             i += 1
+
+    # ── E5: `recover --cancel <request_id>` — cancel a pending recovery
+    # WITHOUT invalidating prior checkpoints. Targets a request_id (not a
+    # run_id), so it short-circuits before the positional run_id check. Uses
+    # the E5 admin module (no change to E1–E4 logic). ──
+    if cancel_request_id:
+        home = os.environ.get("MINI_ORK_HOME") or os.path.join(os.getcwd(), ".mini-ork")
+        db_path = db_override or os.environ.get("MINI_ORK_DB") or os.path.join(home, "state.db")
+        from mini_ork.ported.recovery_admin import cancel_recovery  # noqa: PLC0415
+        res = cancel_recovery(db_path, cancel_request_id)
+        if not res["ok"]:
+            sys.stderr.write(
+                f"[mini-ork-recover] could not cancel {cancel_request_id}: "
+                f"no such request or DB error\n"
+            )
+            return 1
+        sys.stdout.write(
+            f"[mini-ork-recover] cancelled recovery {cancel_request_id} "
+            f"(was {res['previous_status']}); lease_released={res['lease_released']}; "
+            f"prior checkpoints preserved.\n"
+        )
+        return 0
 
     if len(positional) != 1:
         sys.stderr.write(
