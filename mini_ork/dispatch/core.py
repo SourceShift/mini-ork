@@ -39,6 +39,7 @@ def dispatch(
     parse_usage: UsageParser | None = None,
     parse_cost: CostParser | None = None,
     parse_text: TextParser | None = None,
+    parse_session: "Callable[[str], str] | None" = None,
 ) -> DispatchResult:
     """Run ``command`` (an argv list — no shell), feeding ``request.prompt`` on
     stdin, and return a :class:`DispatchResult`.
@@ -84,6 +85,9 @@ def dispatch(
     rc = proc.returncode
     stdout = proc.stdout or ""
     if rc != 0:
+        # A FAILED node is exactly what E4 resumes — capture its session_id
+        # from whatever envelope made it to stdout so the recovery can
+        # `--resume` the same conversation.
         return DispatchResult(
             ok=False,
             rc=rc,
@@ -91,6 +95,7 @@ def dispatch(
             error=(proc.stderr or "")[-2000:],
             model=request.model,
             duration_ms=duration_ms,
+            session_id=parse_session(stdout) if parse_session else "",
         )
 
     usage = parse_usage(stdout) if parse_usage else TokenUsage()
@@ -98,6 +103,10 @@ def dispatch(
     # parse_text extracts the assistant body from a structured envelope (e.g.
     # claude --output-format json puts it in .result); default is raw stdout.
     text = parse_text(stdout) if parse_text else stdout
+    # parse_session pulls the provider conversation id (claude .session_id) so
+    # a failed node can later be resumed at its interrupted turn (E4). "" for
+    # providers that don't surface one.
+    session_id = parse_session(stdout) if parse_session else ""
     return DispatchResult(
         ok=True,
         rc=0,
@@ -106,4 +115,5 @@ def dispatch(
         usage=usage,
         cost_usd=cost,
         duration_ms=duration_ms,
+        session_id=session_id,
     )

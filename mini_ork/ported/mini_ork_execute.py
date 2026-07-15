@@ -24,6 +24,7 @@ Ported here (all pure / transcribed verbatim):
 from __future__ import annotations
 
 import datetime
+import hashlib
 import json
 import math
 import os
@@ -666,13 +667,17 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
     filter_node_type = ""
     dispatch_mode_override = ""
     plan_path = os.environ.get("MINI_ORK_PLAN_PATH", "")
+    from_node = ""
+    recovery_active = False
+    repair_budget = ""
     i = 0
     while i < len(argv):
         a = argv[i]
         if a in ("--help", "-h"):
             sys.stdout.write(
                 "Usage: mini-ork execute [<plan.json>] [--node-type <type>] "
-                "[--dispatch-mode <mode>] [--dry-run]\n\n"
+                "[--dispatch-mode <mode>] [--dry-run]\n"
+                "                       [--from-node <id>] [--recovery] [--repair-budget <usd>]\n\n"
                 "Dispatch plan steps to node-type handlers.\n\n"
                 "Node types: planner | researcher | implementer | reviewer | verifier |\n"
                 "            reflector | publisher | rollback\n\n"
@@ -681,6 +686,13 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
                 "  --node-type <type>        Execute only nodes of this type (filter)\n"
                 "  --dispatch-mode <mode>    Override workflow dispatch mode\n"
                 "  --dry-run                 Print what would be dispatched; no LLM calls\n"
+                "  --from-node <id>          Enter the loop at this node (recovery)\n"
+                "  --recovery                Same as --from-node + closure filter\n"
+                "                            (set by `mini-ork recover`; honors\n"
+                "                            MINI_ORK_RECOVERY_CLOSURE env var)\n"
+                "  --repair-budget <usd>     Bound the recovery cost ceiling\n"
+                "                            (strategy=repair). Without it, the\n"
+                "                            default is $5.00 (env MO_REPAIR_BUDGET_USD)\n"
                 "  --help                    Show this help\n")
             return 0
         elif a == "--dry-run":
@@ -689,6 +701,20 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
             filter_node_type = argv[i + 1]; i += 2
         elif a == "--dispatch-mode":
             dispatch_mode_override = argv[i + 1]; i += 2
+        elif a == "--from-node":
+            if i + 1 >= len(argv):
+                sys.stderr.write("--from-node requires <id>\n"); return 2
+            from_node = argv[i + 1]; i += 2
+        elif a.startswith("--from-node="):
+            from_node = a.split("=", 1)[1].strip(); i += 1
+        elif a == "--recovery":
+            recovery_active = True; i += 1
+        elif a == "--repair-budget":
+            if i + 1 >= len(argv):
+                sys.stderr.write("--repair-budget requires <usd>\n"); return 2
+            repair_budget = argv[i + 1]; i += 2
+        elif a.startswith("--repair-budget="):
+            repair_budget = a.split("=", 1)[1].strip(); i += 1
         elif a.startswith("-"):
             sys.stderr.write(f"Unknown flag: {a}. Try --help\n"); return 2
         else:
@@ -714,21 +740,37 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
                 if m > newest_mtime:
                     newest, newest_mtime = p, m
         plan_path = newest
-    if not plan_path:
+    # E2 recovery: a from-workflow recovery derives node_ids from MINI_ORK_WORKFLOW
+    # and its run_dir from MINI_ORK_RUN_DIR, so it does NOT require a plan.json — the
+    # original plan may be gone, or recovery may be driven purely from the workflow +
+    # E1 checkpoints. Only require a plan for a normal, non-recovery run.
+    _wf_env = os.environ.get("MINI_ORK_WORKFLOW", "")
+    _recovery_ctx = bool(
+        from_node
+        or os.environ.get("MINI_ORK_RECOVERY_CLOSURE", "").strip()
+        or os.environ.get("MINI_ORK_RECOVERY_FROM", "").strip()
+        or recovery_active
+    )
+    _recovery_no_plan = (
+        not plan_path and _recovery_ctx and bool(_wf_env) and os.path.isfile(_wf_env)
+    )
+    if not plan_path and not _recovery_no_plan:
         sys.stderr.write("No plan.json found. Run: mini-ork plan <kickoff.md>\n")
         return 2
-    if not os.path.isfile(plan_path):
+    if plan_path and not os.path.isfile(plan_path):
         sys.stderr.write(f"plan not found: {plan_path}\n")
         return 2
 
     workflow = os.environ.get("MINI_ORK_WORKFLOW", "")
     if not workflow and os.environ.get("MINI_ORK_RECIPE"):
         workflow = os.path.join(root, "recipes", os.environ["MINI_ORK_RECIPE"], "workflow.yaml")
-    run_dir = os.path.dirname(plan_path) if plan_path else "."
+    run_dir = (os.path.dirname(plan_path) if plan_path
+               else (os.environ.get("MINI_ORK_RUN_DIR") or "."))
 
     # Pre-dispatch execute gate (bash :1136-1203): refuse to dispatch a
-    # needs_answers plan (exit 6, records the block). Before node building.
-    if _execute_gate_check(plan_path, run_dir, dry_run):
+    # needs_answers plan (exit 6). Needs a plan.json; a from-workflow recovery
+    # has none → nothing to gate on, so skip it.
+    if plan_path and _execute_gate_check(plan_path, run_dir, dry_run):
         return 6
 
     # NODE_IDS: workflow.yaml source wins; else plan.json.decomposition.
@@ -739,6 +781,73 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
         node_source = "plan.json.decomposition"
         node_ids = nodes_from_plan(plan_path, workflow)
     print(f"    nodes:    {len(node_ids)} (from {node_source})")
+
+    # ── E2 recovery-context filter ──────────────────────────────────────────
+    # If `mini-ork recover` set MINI_ORK_RECOVERY_FROM (the closure root)
+    # and MINI_ORK_RECOVERY_CLOSURE (the closure node_ids), restrict the
+    # dispatch set to ONLY those nodes. Ancestors of the closure root are
+    # SKIPPED entirely — they have valid E1 checkpoints (the planner
+    # verified each one via is_node_reusable before emitting the env),
+    # so dispatching them again would burn LLM calls for no reason.
+    # CLI flags (`--from-node`, `--recovery`) take precedence over the
+    # env vars; both forms produce the same filter shape.
+    closure_env = os.environ.get("MINI_ORK_RECOVERY_CLOSURE", "").strip()
+    closure_from_env = os.environ.get("MINI_ORK_RECOVERY_FROM", "").strip()
+    if recovery_active and not closure_env and not closure_from_env and not from_node:
+        # Operator passed --recovery with no plan context: refuse rather
+        # than silently run the whole DAG. This is the "drop into recovery
+        # mode but the planner hasn't computed a plan" footgun.
+        sys.stderr.write(
+            "execute: --recovery requires MINI_ORK_RECOVERY_FROM or "
+            "--from-node (use `mini-ork recover <run_id>` to compute the plan)\n"
+        )
+        return 2
+    effective_from = from_node or closure_from_env
+    effective_closure = (
+        set(closure_env.split()) if closure_env else set()
+    )
+    if effective_from or effective_closure:
+        # Repair-budget wiring: surface the budget as MO_REPAIR_BUDGET_USD
+        # so the cost_pause seam (or any future cost-aware router) can
+        # honor it without depending on a new env contract.
+        if repair_budget:
+            try:
+                v = float(repair_budget)
+                if v > 0:
+                    os.environ["MO_REPAIR_BUDGET_USD"] = f"{v:.2f}"
+            except ValueError:
+                sys.stderr.write(
+                    f"execute: --repair-budget must be a positive number, got {repair_budget!r}\n"
+                )
+                return 2
+        if not effective_closure and effective_from:
+            # Operator override only (--from-node, no closure set): trust
+            # the operator and include every node downstream of from_node.
+            # Use the planner's DAG loader so the semantics stay identical
+            # to `mini-ork recover` (edges, escalates_to exclusion).
+            from mini_ork.ported.recovery_planner import load_dag
+            dag = load_dag(workflow)
+            effective_closure = dag.descendants(effective_from)
+        # Track the closure set BEFORE mutating node_ids; the original
+        # ``node_ids`` list is SEP-joined strings (the format
+        # ``_resolve_dispatch_mode`` and the dispatch-loop below both
+        # consume). We keep ``node_ids`` as strings and filter by name
+        # here so the downstream ``fields_list = [... e.split(...) ...]``
+        # keeps working unchanged.
+        before_count = len(node_ids)
+        node_ids = [
+            e for e in node_ids
+            if e.split(_SEP, 1)[0] in effective_closure
+        ]
+        # Mark the run as a recovery dispatch so downstream trace / cost
+        # seams can stamp the metadata without re-deriving the closure.
+        os.environ["MINI_ORK_RECOVERY_ACTIVE"] = "1"
+        if effective_from:
+            os.environ["MINI_ORK_RECOVERY_FROM"] = effective_from
+        print(
+            f"    recovery: from_node={effective_from or '<unset>'} "
+            f"closure={len(node_ids)}/{before_count} nodes"
+        )
 
     dispatch_mode = _resolve_dispatch_mode(dispatch_mode_override, workflow)
     fields_list = [tuple((e.split(_SEP) + [""] * 8)[:8]) for e in node_ids]
@@ -775,6 +884,12 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
     # F3: without a trace_fn the live path writes zero execution_traces rows and the
     # GRPO/reflect learning loop is inert. Wire the real writer (reward-stamped rows).
     trace_writer = _make_trace_fn(task_class, db, run_id)
+    # F4 (durable-dag E1): parallel writer that publishes node_checkpoints
+    # rows at every node success. The runtime seam (trace wrapper inside
+    # dispatch_node) calls BOTH; absence of a node_checkpoints row after
+    # a success means the writer failed best-effort and the runtime will
+    # treat the node as not-reusable on the next attempt (design §4).
+    checkpoint_writer = _make_checkpoint_fn(db, run_id, live_run_dir, recipe, task_class)
     set_status(db, run_id, "executing")
     ordered = ([f for nt in _NODE_TYPE_ORDER for f in fields_list if f[1] == nt]
                if dispatch_mode == "partitioned" else fields_list)
@@ -791,7 +906,7 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
         rc, _fr = dispatch_node(f, root=root, run_dir=live_run_dir, plan_path=plan_path,
                                 task_class=task_class, db=db, run_id=run_id,
                                 dispatch_fn=llm, recipe=recipe, workflow=workflow,
-                                trace_fn=trace_writer)
+                                trace_fn=trace_writer, checkpoint_fn=checkpoint_writer)
         if rc != 0:
             fail_count += 1
     _emit_run_verdict(live_run_dir, fail_count, len(fields_list))
@@ -1508,6 +1623,74 @@ def _make_trace_fn(task_class, db, run_id):
     return _tf
 
 
+def _make_checkpoint_fn(db, run_id, run_dir, recipe, task_class):
+    """F4 (durable-dag E1): closure that publishes a ``node_checkpoints`` row
+    at every node success. Mirrors ``_make_trace_fn``'s role — a single
+    closure the dispatch_node trace wrapper calls. Best-effort: failures
+    are logged to stderr but NEVER raise, so a transient DB hiccup cannot
+    crash a live run. The runtime treats the absence of a row as
+    ``not reusable → rerun`` (the fail-closed contract from design §4).
+
+    E1 placeholder semantics (E2 will tighten these):
+      - ``input_hash`` is a stable per-(run,node) sha256 — E1 has no
+        upstream-input resolution; this keeps the column populated and
+        the validity check wired so the schema, write, and read paths
+        are all exercised. E2 replaces this with a real upstream-hash.
+      - ``recipe_version`` is the resolved recipe name (workflow.yaml
+        is the source of truth in E2; recipe is a stable proxy in E1).
+      - ``config_hash`` is a stable per-(task_class, recipe, run_id)
+        sha256 — the resolved config slice mini-ork already knows.
+    """
+    from mini_ork.ported import mini_ork_checkpoints as mc  # noqa: PLC0415
+    started_at = int(time.time())
+    recipe_eff = recipe or "unknown"
+    # E3 fencing: during a recovery dispatch, mini-ork-recover acquires the
+    # run's single-writer lease and exports MINI_ORK_LEASE_TOKEN. Threading it
+    # here makes every checkpoint publish present the token, so a stale worker
+    # whose lease was re-acquired by a newer recovery is rejected at the write
+    # (design §7). On a normal run the env is unset → owner_token=None → no
+    # fencing (preserves E1's contract).
+    owner_token = os.environ.get("MINI_ORK_LEASE_TOKEN") or None
+    # Pre-compute the stable input/config hashes; both depend only on
+    # resolved run-level fields so they are constant for a given (run,
+    # recipe, task_class) and only vary by node_id (input_hash) — which
+    # is exactly the per-node reuse key the validity check compares.
+    config_hash = hashlib.sha256(
+        f"{task_class}|{recipe_eff}|{run_id}".encode()).hexdigest()
+
+    def _cp(node_id: str, status: str, node_type: str = "", output_file: str = ""):
+        if status != "success":
+            return  # only success → reusable checkpoint (design §3 rule 0)
+        if not output_file:
+            return  # nothing on disk to checkpoint; no row = rerun is correct
+        # input_hash is per-(run, node) in E1; E2 will fold in upstream
+        # input sha256s so a config change invalidates exactly the right
+        # subtree.
+        input_hash = hashlib.sha256(
+            f"{run_id}|{node_id}|{recipe_eff}".encode()).hexdigest()
+        # (E4) recover the node's claude session id from the dispatch sidecar
+        # so write_checkpoint records it + persists the transcript. Empty for
+        # non-claude lanes / when no dispatch happened.
+        provider_session_id = ""
+        _sc = os.path.join(run_dir, ".sessions", f"{node_id}.session")
+        if os.path.isfile(_sc):
+            try:
+                provider_session_id = open(_sc).read().strip()
+            except OSError:
+                provider_session_id = ""
+        mc.write_checkpoint(
+            db, run_id, node_id,
+            status="success", input_hash=input_hash,
+            recipe_version=recipe_eff, config_hash=config_hash,
+            artifact_paths=[output_file], run_dir=run_dir,
+            node_type=node_type or "", started_at=started_at,
+            ended_at=int(time.time()), initiator="python",
+            owner_token=owner_token, provider_session_id=provider_session_id,
+        )
+
+    return _cp
+
+
 def _publisher_try_commit_files(root, target_repo, run_dir, review_file, verdict_env,
                                 recipe, node_desc, run_id):
     """Port of bash `_publisher_try_commit_files` (embedded python, :824-949). Commit
@@ -1756,7 +1939,8 @@ _REVIEW_REVISE = {"revise", "needs_revision", "request_changes"}
 
 
 def dispatch_node(fields, *, root, run_dir, plan_path, task_class, db, run_id,
-                  dispatch_fn, recipe="", workflow="", trace_fn=None):
+                  dispatch_fn, recipe="", workflow="", trace_fn=None,
+                  checkpoint_fn=None):
     """Live dispatch of one node. Returns (rc, finish_reason). rc!=0 → FAIL_COUNT++.
     dispatch_fn(task_class, node_type, prompt) -> (rc, text)."""
     node_id, node_type, node_desc, prompt_ref, _dmode, verifier_ref, model_lane, node_requires_capabilities = \
@@ -1767,11 +1951,21 @@ def dispatch_node(fields, *, root, run_dir, plan_path, task_class, db, run_id,
     workflow_lane = model_lane or node_type
     lane = policy_route_lane(node_type, workflow_lane, dry_run=False, root=root)
     _base_trace = trace_fn or (lambda *a, **k: None)
+    # F4: durable DAG checkpoint writer (E1). Single seam — the trace
+    # wrapper below — so every node completion site publishes a row in
+    # exactly one place. Best-effort: the writer returns non-zero on
+    # failure but never raises; absence of a row means "not reusable",
+    # which the runtime treats as rerun (design §4 fail-closed).
+    _base_checkpoint = checkpoint_fn or (lambda *a, **k: None)
 
     # Bind the resolved lane into every trace() call so agent_version_id is stamped
     # (bash passes the shell var dispatch_lane into _trace_write_node_rich's payload).
     def trace(node_id, status, node_type, output_file="", verdict="", finish_reason=""):
         _base_trace(node_id, status, node_type, output_file, verdict, finish_reason, lane=lane)
+        # F4: publish the durable checkpoint at the SAME single seam as the
+        # trace write. The wrapper unifies node-completion side effects so
+        # E2's recovery code can rely on every success also having a row.
+        _base_checkpoint(node_id, status, node_type, output_file)
     run_dir_eff = os.environ.get("MINI_ORK_RUN_DIR", run_dir)
     # Snapshot the tree BEFORE any implementer node edits it, so the reviewer
     # diff captures only the implementer's delta (not pre-existing dirt from a
@@ -1853,6 +2047,28 @@ def dispatch_node(fields, *, root, run_dir, plan_path, task_class, db, run_id,
     # in the LLM prompts (the read side of the learning loop). Empty for non-LLM nodes.
     learned = _learned_block(root, task_class, node_type)
     os.environ["MO_NODE_ID"] = node_id
+
+    # (E4 turn-resume) During an active recovery, restore this node's persisted
+    # transcript and export MO_RESUME_SESSION_ID so a claude lane continues the
+    # interrupted conversation (`--resume <id>`, via providers.dispatch_model)
+    # instead of starting the node over. Strictly recovery-scoped and fail-soft:
+    # off recovery, for codex/gemini, or with no session it is a no-op and the
+    # node runs normally.
+    os.environ.pop("MO_RESUME_SESSION_ID", None)
+    if (os.environ.get("MINI_ORK_RECOVERY_CLOSURE", "").strip()
+            or os.environ.get("MINI_ORK_RECOVERY_FROM", "").strip()):
+        try:
+            from mini_ork.ported.resume_prep import prepare_node_resume  # noqa: PLC0415
+            _resume_sid = prepare_node_resume(
+                db, run_id, node_id, run_dir=run_dir, model=lane,
+                cwd=os.environ.get("MO_TARGET_CWD") or None,
+            )
+            if _resume_sid:
+                os.environ["MO_RESUME_SESSION_ID"] = _resume_sid
+                print(f"  [resume] node_id={node_id} continuing session "
+                      f"{_resume_sid[:12]}… via --resume", file=sys.stderr)
+        except Exception as e:  # noqa: BLE001 — resume is best-effort
+            print(f"  [resume] skipped for node_id={node_id}: {e}", file=sys.stderr)
 
     if node_type == "researcher":
         ctx = _researcher_output_file(run_dir, recipe or os.environ.get("MINI_ORK_RECIPE", ""), node_id)

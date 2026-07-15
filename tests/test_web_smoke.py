@@ -40,6 +40,17 @@ def test_health(db) -> None:
     assert out["has_task_runs"] is True
 
 
+def test_recovery_ui_route_returns_projection_shape(db) -> None:
+    # E5: the recovery projection endpoint wires + always returns a renderable
+    # dict (empty nodes for an unknown run), reading the E1–E3 tables.
+    from mini_ork.web.routes.recovery import recovery_view
+
+    out = recovery_view("no-such-run-e5", db)
+    assert set(out.keys()) >= {"run_id", "nodes", "active_recovery", "lease", "next_action"}
+    assert out["run_id"] == "no-such-run-e5"
+    assert isinstance(out["nodes"], list)
+
+
 def test_task_runs_summary(db) -> None:
     from mini_ork.web.routes.fleet import task_runs_summary
 
