@@ -123,11 +123,10 @@ _CODEX_SANDBOX="${CODEX_SANDBOX:-workspace-write}"
 # Resolution order:
 #   1. MO_TARGET_CWD env (dispatcher sets this when it knows the target repo —
 #      e.g. derived from the kickoff_path's git toplevel).
-#   2. $PWD as recovered from the subshell — usually correct when the
-#      dispatcher's parent shell ran in the target repo.
-# Both fall back to "" if neither is set, in which case we skip --cd and
-# preserve codex's prior behavior (inherits whatever cwd the process has).
-_CODEX_TARGET_CWD="${MO_TARGET_CWD:-${PWD:-}}"
+#   2. MINI_ORK_TARGET_REPO from lib/paths.sh (the tree being mutated).
+#   3. $PWD as a last resort.
+# A blank result means we skip --cd and preserve codex's prior behavior.
+_CODEX_TARGET_CWD="${MO_TARGET_CWD:-${MINI_ORK_TARGET_REPO:-${PWD:-}}}"
 
 # ── cwd guard (cross-repo corruption prevention) ──────────────────────────────
 # A codex turn runs `git reset --hard refs/codex/curated-sync` inside its cwd.
