@@ -16,7 +16,11 @@ import sqlite3
 from pathlib import Path
 
 import pytest
-from fastapi.testclient import TestClient
+
+try:
+    from fastapi.testclient import TestClient
+except (ImportError, RuntimeError) as exc:
+    pytest.skip(f"fastapi.testclient unavailable: {exc}", allow_module_level=True)
 
 from mini_ork.web.app import create_app
 
