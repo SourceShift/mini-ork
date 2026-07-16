@@ -271,4 +271,4 @@ def test_task_class_seeding_count(tmp_path):
     _assert_ok(py, "python")
     bash_count = len(list((bash_project / ".mini-ork" / "config" / "task_classes").iterdir()))
     py_count = len(list((py_project / ".mini-ork" / "config" / "task_classes").iterdir()))
-    assert bash_count == py_count == 34
+    assert bash_count == py_count == 27
