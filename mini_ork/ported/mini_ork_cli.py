@@ -24,7 +24,8 @@ from pathlib import Path
 
 _EXEC_SUBS = {"classify", "plan", "execute", "verify", "reflect", "improve", "eval",
               "promote", "init", "update", "spawn", "scheduler", "epics", "bugs",
-              "inject", "review", "traceotter", "metrics", "rollback", "resume", "serve"}
+              "inject", "review", "traceotter", "metrics", "rollback", "resume", "serve",
+              "validate", "garden", "recipe-eval"}
 
 _HELP = """mini-ork — task operating system for agents (v0.1)
 
@@ -49,6 +50,9 @@ Lifecycle:
   init                           Bootstrap project (creates .mini-ork/)
   update                         Apply migrations + report config drift
   doctor                         Check deps + env vars + lib presence
+  validate                       Pre-run static checks with Fix: hints
+  garden                         Drift detection (collisions, orphans, stale runs)
+  recipe-eval                    Static evaluation of recipe definitions
   version
 
 Environment:
@@ -448,13 +452,15 @@ def main(argv=None, *, root=None) -> int:
         return _run_lifecycle(rest, root)
     if sub == "doctor":
         import shutil
+        # lib/paths.sh semantics: default PROJECT_HOME is cwd/.mini-ork.
+        home = os.environ.get("MINI_ORK_HOME") or os.path.join(os.getcwd(), ".mini-ork")
         print("=== mini-ork doctor ===")
         for d in ("bash", "sqlite3", "jq", "git", "yq", "curl", "claude", "python3"):
             print(f"  [OK]      {d}" if shutil.which(d) else f"  [MISSING] {d}")
         if os.environ.get("MINI_ORK_HOME"):
             print(f"  [OK]      MINI_ORK_HOME={os.environ['MINI_ORK_HOME']}")
-        else:
-            print("  [WARN]    MINI_ORK_HOME unset (default: <project>/.mini-ork)")
+        elif home:
+            print(f"  [OK]      MINI_ORK_HOME={home}")
         if os.environ.get("MINI_ORK_DB"):
             print(f"  [OK]      MINI_ORK_DB={os.environ['MINI_ORK_DB']}")
         else:
@@ -463,11 +469,24 @@ def main(argv=None, *, root=None) -> int:
         print("Lib presence:")
         for lib in ("trace_store", "llm-dispatch", "gate_registry", "group_evolver",
                     "reflection_pipeline", "benchmark_suite", "utility_function",
-                    "promotion_gate", "version_registry"):
+                    "promotion_gate", "version_registry", "paths"):
             if os.path.isfile(os.path.join(root, "lib", f"{lib}.sh")):
                 print(f"  [OK]      lib/{lib}.sh")
             else:
                 print(f"  [MISSING] lib/{lib}.sh (P1 in flight?)")
+        print("")
+        print("Provider preflight:")
+        for tool, name in (("claude", "anthropic"), ("codex", "codex")):
+            if shutil.which(tool):
+                print(f"  [OK]      {name} ({tool} CLI present)")
+            else:
+                print(f"  [WARN]    {name} ({tool} CLI missing)")
+        for env_var, family in (("GLM_API_KEY", "glm"), ("KIMI_API_KEY", "kimi"),
+                                ("MINIMAX_API_KEY", "minimax"), ("DEEPSEEK_API_KEY", "deepseek")):
+            if os.environ.get(env_var):
+                print(f"  [OK]      {family} (${env_var} set)")
+            else:
+                print(f"  [WARN]    {family} (${env_var} unset)")
         return 0
     if sub == "version":
         print("mini-ork 0.6.0 (universal task loop runtime)")

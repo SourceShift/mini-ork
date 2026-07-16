@@ -10,9 +10,9 @@ rollback_policy: >
 
 # v0.2-pt9 (D-037): publisher path. `source_artifact` names the file
 # produced in $MINI_ORK_RUN_DIR; `outputs[]` lists canonical repo paths
-# the publisher should write to + git-commit. Each cycle's synthesis is
-# preserved in git history; the curated SCALABILITY-AUDIT.md remains
-# separate (manually maintained narrative across cycles).
+# the publisher should write to + git-commit.
+# FIX 2026-07-15: recipe-specific output path to avoid collision with
+# bug-audit-cmgk, bug-audit-fe-be, and feature-inventory-cmgk.
 source_artifact: synthesis.md
 outputs:
-  - docs/refactor/synthesis-latest.md
+  - docs/refactor/synthesis-refactor-audit.md
