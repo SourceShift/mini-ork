@@ -5,8 +5,11 @@ set -Eeuo pipefail
 
 # readlink -f: install.sh symlinks this script into ~/.local/bin — without
 # resolving the link, ROOT would become ~/.local and every subcommand exec fails.
-MINI_ORK_ROOT="${MINI_ORK_ROOT:-$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)}"
-export MINI_ORK_ROOT
+# Source the single path-resolution contract before anything else.
+# This exports MINI_ORK_ENGINE_ROOT, MINI_ORK_PROJECT_HOME, MINI_ORK_TARGET_REPO
+# and legacy aliases MINI_ORK_ROOT / MINI_ORK_HOME.
+# shellcheck source=lib/paths.sh
+. "$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)/lib/paths.sh"
 # Runtime cutover (bash→Python): MINI_ORK_RUNTIME=python execs the ported module.
 { [ -f "$MINI_ORK_ROOT/lib/runtime-select.sh" ] && . "$MINI_ORK_ROOT/lib/runtime-select.sh" && mo_runtime_maybe_delegate "${BASH_SOURCE[0]}" "$@"; } || true
 
@@ -15,7 +18,7 @@ sub="${1:-help}"; shift || true
 
 case "$sub" in
   # Universal loop subcommands
-  classify|plan|execute|verify|reflect|improve|eval|promote|init|update|spawn|scheduler|epics|bugs|inject|review|apply|traceotter)
+  classify|plan|execute|verify|reflect|improve|eval|promote|init|update|spawn|scheduler|epics|bugs|inject|review|apply|traceotter|validate|garden|recipe-eval)
     exec "$MINI_ORK_ROOT/bin/mini-ork-$sub" "$@" ;;
 
   # Phase C: trajectory metrics across DF cycles (v0.2-pt13)
@@ -179,8 +182,7 @@ except Exception:
     # ── profile ───────────────────────────────────────────────────────────────
     # Build the run profile before planning so the planner sees operational
     # context that is easy to inspect and easy for callers to answer later.
-    MINI_ORK_HOME="${MINI_ORK_HOME:-$(pwd)/.mini-ork}"
-    export MINI_ORK_HOME
+    # PROJECT_HOME was resolved by lib/paths.sh; runs live under it.
     RUN_DIR="$MINI_ORK_HOME/runs/$MINI_ORK_RUN_ID"
     mkdir -p "$RUN_DIR"
     # T1.0 per-run config isolation: freeze the effective lane policy into the
@@ -550,11 +552,34 @@ PY
     echo "Lib presence:"
     for lib in trace_store llm-dispatch gate_registry group_evolver \
                 reflection_pipeline benchmark_suite utility_function \
-                promotion_gate version_registry; do
+                promotion_gate version_registry paths; do
       if [ -f "$MINI_ORK_ROOT/lib/${lib}.sh" ]; then
         echo "  [OK]      lib/${lib}.sh"
       else
         echo "  [MISSING] lib/${lib}.sh (P1 in flight?)"
+      fi
+    done
+    echo ""
+    echo "Provider preflight:"
+    _provider_ok() { echo "  [OK]      $1"; }
+    _provider_warn() { echo "  [WARN]    $1"; }
+    # Built-in family checks.
+    if command -v claude >/dev/null 2>&1; then
+      _provider_ok "anthropic (claude CLI present)"
+    else
+      _provider_warn "anthropic (claude CLI missing)"
+    fi
+    if command -v codex >/dev/null 2>&1; then
+      _provider_ok "codex (codex CLI present)"
+    else
+      _provider_warn "codex (codex CLI missing)"
+    fi
+    for _kv in "GLM_API_KEY:glm" "KIMI_API_KEY:kimi" "MINIMAX_API_KEY:minimax" "DEEPSEEK_API_KEY:deepseek"; do
+      _env_var="${_kv%%:*}"; _family="${_kv#*:}"
+      if [ -n "${!_env_var:-}" ]; then
+        _provider_ok "$_family (\$_env_var set)"
+      else
+        _provider_warn "$_family (\$_env_var unset)"
       fi
     done
     ;;
@@ -587,7 +612,10 @@ Recipe runner:
 Lifecycle:
   init                           Bootstrap project (creates .mini-ork/)
   update                         Apply migrations + report config drift
-  doctor                         Check deps + env vars + lib presence
+  doctor                         Check deps + env vars + lib presence + provider preflight
+  validate                       Pre-run static checks with Fix: hints
+  garden                         Drift detection (collisions, orphans, stale runs)
+  recipe-eval                    Static evaluation of recipe definitions
   version
 
 Environment:

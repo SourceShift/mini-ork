@@ -237,6 +237,9 @@ def test_absent_gitignore_created(tmp_path):
     bash_lines = [line for line in (bash_project / ".gitignore").read_text(encoding="utf-8").splitlines() if line]
     py_lines = [line for line in (py_project / ".gitignore").read_text(encoding="utf-8").splitlines() if line]
     assert bash_lines == [
+        "# mini-ork generated state (the engine pointer below is committed)",
+        ".mini-ork/*",
+        "!.mini-ork/engine",
         ".mini-ork/state.db",
         ".mini-ork/runs/",
         ".mini-ork/INBOX/",
@@ -268,4 +271,4 @@ def test_task_class_seeding_count(tmp_path):
     _assert_ok(py, "python")
     bash_count = len(list((bash_project / ".mini-ork" / "config" / "task_classes").iterdir()))
     py_count = len(list((py_project / ".mini-ork" / "config" / "task_classes").iterdir()))
-    assert bash_count == py_count == 27
+    assert bash_count == py_count == 34
