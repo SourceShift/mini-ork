@@ -34,7 +34,7 @@ Have the agent tell me. At the end of every turn, each agent emits a structured 
 
 A hook types each field into a memory kind and ingests it. Zero human labeling. The agent knows what it just did better than any parser could — it has the intent, the reasoning, the discarded options.
 
-That last sentence is the mistake. It took two months to see it.
+That last sentence is the mistake. It took two months to see it, and I only saw it by going back and grading every block against what actually ran.
 
 ## The audit
 
@@ -99,9 +99,7 @@ My first draft said the divergence was in the models: Codex the fabricator, Clau
 - **83% of those no-work turns still emitted a verification claim.**
 - **Every turn that did real work claimed verification correctly — 21 of 21.**
 
-Read those together. When Codex actually runs a command, it reports honestly. The fabrication is concentrated entirely on the turns where it did *nothing* — and it does nothing on those turns because the instruction I gave both agents says *emit this block every turn, including short ones.* A generative model handed a mandatory `verification` field on an empty turn will fill it. That is a model doing exactly what it was told, not a model lying.
-
-The bug is the trigger. I built a form that demands a verification report on turns where the honest answer is "nothing to report," and then I was surprised the form got filled in.
+The bug is the trigger. I built a form that demands a verification report on turns where the honest answer is "nothing to report," and then I was surprised the form got filled in. Read those numbers together and the mechanism is right there: when Codex actually runs a command, it reports honestly (21 of 21); the fabrication is concentrated entirely on the turns where it did *nothing*, because the instruction I gave both agents says *emit this block every turn, including short ones*. A generative model handed a mandatory `verification` field on an empty turn will fill it. That is a model doing exactly what it was told, not a model lying.
 
 ## I'm not the first to hit this
 
