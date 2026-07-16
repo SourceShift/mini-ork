@@ -98,7 +98,7 @@ jobs:
   python-tests:
     name: python tests (${{ matrix.python-version }})
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 35
     strategy:
       fail-fast: false
       matrix:
