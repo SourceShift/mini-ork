@@ -75,6 +75,9 @@ limits:
 """
 
 _GITIGNORE_ENTRIES = (
+    "# mini-ork generated state (the engine pointer below is committed)",
+    ".mini-ork/*",
+    "!.mini-ork/engine",
     ".mini-ork/state.db",
     ".mini-ork/runs/",
     ".mini-ork/INBOX/",
@@ -277,6 +280,11 @@ def mini_ork_init(
     paths = [mini_ork_home] + [mini_ork_home / sub for sub in _HOME_SUBDIRS]
     _make_dirs_idempotent(buf, paths)
     _chmod_700_safe(buf, mini_ork_home / "secrets")
+
+    # ── 1b. Engine pointer ─────────────────────────────────────────────────────
+    # Write a committed pointer from the project back to the engine installation.
+    _write_engine_pointer(buf, mini_ork_home, mini_ork_repo)
+
     buf.write("\n")
 
     # ── 2. Default config files ──────────────────────────────────────────────
@@ -347,6 +355,31 @@ def mini_ork_init(
     buf.write("\n")
 
     return buf.getvalue()
+
+
+def _write_engine_pointer(buf: StringIO, mini_ork_home: Path, mini_ork_repo: Path) -> None:
+    """Mirror bash lines 52-83: write .mini-ork/engine relative pointer."""
+    pointer_file = mini_ork_home / "engine"
+    if pointer_file.is_file():
+        _ok(buf, "engine pointer already present")
+        return
+
+    # Compute a relative path from mini_ork_home to mini_ork_repo.
+    src = mini_ork_home.resolve()
+    dst = mini_ork_repo.resolve()
+    src_parts = src.parts
+    dst_parts = dst.parts
+    common = 0
+    for a, b in zip(src_parts, dst_parts):
+        if a != b:
+            break
+        common += 1
+    up = len(src_parts) - common
+    down = dst_parts[common:]
+    rel = os.sep.join([".."] * up + list(down)) if up or down else "."
+
+    pointer_file.write_text(rel + "\n", encoding="utf-8")
+    _ok(buf, f"engine pointer written: {rel}")
 
 
 def main(argv: list[str] | None = None) -> int:
