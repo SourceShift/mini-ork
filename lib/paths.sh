@@ -52,10 +52,11 @@ else
       echo "mini-ork: empty engine pointer: $_mo_engine_pointer" >&2
       exit 2
     fi
-    if [ -d "$_mo_pointer_target" ]; then
+    # Absolute targets are used as-is; relative targets are resolved
+    # relative to the pointer file's directory (never the caller's CWD).
+    if [[ "$_mo_pointer_target" = /* ]]; then
       MINI_ORK_ENGINE_ROOT="$(_mo_abspath "$_mo_pointer_target")"
     else
-      # Resolve relative to the pointer file's directory.
       _mo_pointer_dir="$(dirname "$_mo_engine_pointer")"
       MINI_ORK_ENGINE_ROOT="$(_mo_abspath "$_mo_pointer_dir/$_mo_pointer_target")"
     fi
