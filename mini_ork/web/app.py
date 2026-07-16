@@ -12,14 +12,17 @@ from fastapi.staticfiles import StaticFiles
 from .deps import get_db, get_home, set_home_override
 from .routes import (
     control as control_routes,
+    dispatch as dispatch_routes,
     fingerprint,
     fleet,
     idea_tree as idea_tree_routes,
+    learning,
     projects,
     recovery as recovery_routes,
     run_detail,
     runs as runs_routes,
     stream,
+    traceotter,
     trajectory,
 )
 
@@ -51,7 +54,18 @@ def create_app(home: Path | None = None, dev_cors: bool = True) -> FastAPI:
                 # Keep old Vite default to ease transition for users who alias
                 "http://localhost:5173",
                 "http://127.0.0.1:5173",
+                # Electron renderers (Orca) load from file:// and therefore send
+                # `Origin: null`. Without this every fetch from an embedded panel is
+                # blocked by CORS — and blocked-by-CORS looks exactly like "no data",
+                # which is the silent-empty-panel failure we refuse elsewhere.
+                "null",
             ],
+            # Any page SERVED FROM localhost may call us, on any port — this is what
+            # lets an Electron dev renderer (whose Vite port is not fixed) work without
+            # hard-coding it. A remote origin like https://evil.com does NOT match, so
+            # this does not open the control endpoints to the web at large. The server
+            # binds 127.0.0.1 regardless.
+            allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$",
             allow_credentials=False,
             # POST is needed for stop/kill control endpoints
             allow_methods=["GET", "POST"],
@@ -68,6 +82,9 @@ def create_app(home: Path | None = None, dev_cors: bool = True) -> FastAPI:
     app.include_router(projects.router)
     app.include_router(recovery_routes.router)
     app.include_router(idea_tree_routes.router)
+    app.include_router(learning.router)
+    app.include_router(traceotter.router)
+    app.include_router(dispatch_routes.router)
 
     @app.get("/api")
     def api_index() -> JSONResponse:
