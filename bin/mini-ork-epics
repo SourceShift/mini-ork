@@ -24,13 +24,13 @@
 
 set -Eeuo pipefail
 
-MINI_ORK_ROOT="${MINI_ORK_ROOT:-$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)}"
-export MINI_ORK_ROOT
+# Source the single path-resolution contract before anything else.
+# shellcheck source=lib/paths.sh
+. "$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)/lib/paths.sh"
 # Runtime cutover (bash→Python): MINI_ORK_RUNTIME=python execs the ported module.
 { [ -f "$MINI_ORK_ROOT/lib/runtime-select.sh" ] && . "$MINI_ORK_ROOT/lib/runtime-select.sh" && mo_runtime_maybe_delegate "${BASH_SOURCE[0]}" "$@"; } || true
 
-MINI_ORK_HOME="${MINI_ORK_HOME:-$MINI_ORK_ROOT/.mini-ork}"
-export MINI_ORK_HOME
+# PROJECT_HOME (MINI_ORK_HOME) and TARGET_REPO are now resolved by lib/paths.sh.
 STATE_DB="${MINI_ORK_DB:-$MINI_ORK_HOME/state.db}"
 export STATE_DB
 

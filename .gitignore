@@ -95,3 +95,9 @@ Volumes/
 # not shippable project docs.
 .mini-ork/research-notes/
 kickoffs/*autonomy-pluggability*
+
+# mini-ork generated state (the engine pointer below is committed)
+
+.mini-ork/*
+
+!.mini-ork/engine

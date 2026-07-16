@@ -39,9 +39,10 @@ def _side(tmp_path, name, roadmap=ROADMAP):
     root = tmp_path / name
     root.mkdir()
     (root / "lib").mkdir()
-    # epic_graph.sh must be sourceable by the bash CLI
+    # libs that bin/mini-ork-epics sources
     import shutil
     shutil.copy(REPO / "lib" / "epic_graph.sh", root / "lib" / "epic_graph.sh")
+    shutil.copy(REPO / "lib" / "paths.sh", root / "lib" / "paths.sh")
     (root / "bin").mkdir()
     shutil.copy(BIN, root / "bin" / "mini-ork-epics")
     home = root / ".mini-ork"; home.mkdir()
