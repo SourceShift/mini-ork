@@ -28,8 +28,9 @@
 
 set -Eeuo pipefail
 
-MINI_ORK_ROOT="${MINI_ORK_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
-export MINI_ORK_ROOT
+# Source the single path-resolution contract before anything else.
+# shellcheck source=lib/paths.sh
+. "$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)/lib/paths.sh"
 # Runtime cutover (bash→Python): MINI_ORK_RUNTIME=python execs the ported module.
 { [ -f "$MINI_ORK_ROOT/lib/runtime-select.sh" ] && . "$MINI_ORK_ROOT/lib/runtime-select.sh" && mo_runtime_maybe_delegate "${BASH_SOURCE[0]}" "$@"; } || true
 
@@ -428,6 +429,47 @@ con = sqlite3.connect(db, timeout=5.0)
 con.execute("PRAGMA busy_timeout=5000")
 con.row_factory = sqlite3.Row
 try:
+    n = 0
+
+    # Path 1 (migration 0050): reconcile against the RUN the decision produced.
+    #
+    # Why this exists: the epic-only join below never fired for run-driven work. A
+    # `mini-ork run` completes a task_run and does not necessarily advance an epic — on a
+    # live db all 10 conductor decisions pointed at an epic still `not started`, so
+    # realized_score was NULL on 10 of 10 rows. The conductor predicted a score every time
+    # and never once learned whether it was right. A prediction nobody scores is not a
+    # prediction, it is a claim.
+    has_run_col = any(
+        r["name"] == "task_run_id"
+        for r in con.execute("PRAGMA table_info(conductor_decisions)").fetchall()
+    )
+    if has_run_col:
+        # GROUND TRUTH (read off the live schema, not assumed): task_runs.status is
+        # CHECKed against ('classified','planned','executing','verifying','reviewing',
+        # 'published','rolled_back','failed'). The terminal SUCCESS state is `published` —
+        # `done` cannot occur. And `verdict` is empty on 242 of 278 completed runs, so it is
+        # only ever a negative override ('CRASH'), never the positive signal. `ended_at IS
+        # NOT NULL` is not a terminal test either: rows sit in `reviewing` with it set.
+        rows = con.execute(
+            """
+            SELECT cd.id, tr.status, tr.verdict
+              FROM conductor_decisions cd
+              JOIN task_runs tr ON tr.id = cd.task_run_id
+             WHERE COALESCE(cd.outcome, 'pending') = 'pending'
+               AND tr.status IN ('published', 'failed', 'rolled_back')
+            """
+        ).fetchall()
+        for row in rows:
+            status = (row["status"] or "").strip().lower()
+            verdict = (row["verdict"] or "").strip().lower()
+            success = status == "published" and verdict != "crash"
+            con.execute(
+                "UPDATE conductor_decisions SET outcome=?, realized_score=? WHERE id=?",
+                ("success" if success else "failure", 1.0 if success else 0.0, row["id"]),
+            )
+            n += 1
+
+    # Path 2: epic-driven work (the original path, kept).
     rows = con.execute(
         """
         SELECT cd.id, e.status
@@ -443,8 +485,10 @@ try:
             "UPDATE conductor_decisions SET outcome=?, realized_score=? WHERE id=?",
             ("success" if success else "failure", 1.0 if success else 0.0, row["id"]),
         )
+        n += 1
+
     con.commit()
-    print(len(rows))
+    print(n)
 except sqlite3.OperationalError:
     print(0)
 finally:
