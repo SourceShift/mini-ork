@@ -35,8 +35,12 @@ _mo_abspath() {
 }
 
 # ── ENGINE_ROOT ───────────────────────────────────────────────────────────────
+# MINI_ORK_ROOT is accepted as a legacy input alias for MINI_ORK_ENGINE_ROOT
+# so existing tests/scripts that export MINI_ORK_ROOT continue to work.
 if [ -n "${MINI_ORK_ENGINE_ROOT:-}" ]; then
   MINI_ORK_ENGINE_ROOT="$(_mo_abspath "$MINI_ORK_ENGINE_ROOT")"
+elif [ -n "${MINI_ORK_ROOT:-}" ]; then
+  MINI_ORK_ENGINE_ROOT="$(_mo_abspath "$MINI_ORK_ROOT")"
 else
   # Look for a project-local pointer to a separately-installed engine.
   _mo_engine_pointer=""
