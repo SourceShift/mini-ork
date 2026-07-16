@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
 
+# Source the single path-resolution contract before anything else.
+# shellcheck source=lib/paths.sh
+. "$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)/lib/paths.sh"
 # Runtime cutover (bash→Python): MINI_ORK_RUNTIME=python execs the ported module.
-{ MINI_ORK_ROOT="${MINI_ORK_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"; [ -f "$MINI_ORK_ROOT/lib/runtime-select.sh" ] && . "$MINI_ORK_ROOT/lib/runtime-select.sh" && mo_runtime_maybe_delegate "${BASH_SOURCE[0]}" "$@"; } || true
+{ [ -f "$MINI_ORK_ROOT/lib/runtime-select.sh" ] && . "$MINI_ORK_ROOT/lib/runtime-select.sh" && mo_runtime_maybe_delegate "${BASH_SOURCE[0]}" "$@"; } || true
 # mini-ork-init — scaffold .mini-ork/ in the current project
 # Run from the project root: mini-ork init  (or: bash path/to/mini-ork-init)
 # Idempotent — safe to re-run.
 set -Eeuo pipefail
 
-MINI_ORK_REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-PROJECT_ROOT="$(pwd)"
-
-# Allow caller to override the home dir (used in tests)
-MINI_ORK_HOME="${MINI_ORK_HOME:-$PROJECT_ROOT/.mini-ork}"
+PROJECT_ROOT="$MINI_ORK_TARGET_REPO"
+# PROJECT_HOME (MINI_ORK_HOME) was resolved by lib/paths.sh.
 export MINI_ORK_HOME
 export MINI_ORK_DB="$MINI_ORK_HOME/state.db"
 
@@ -49,20 +49,55 @@ done
 # Idempotent + safe on re-run.
 chmod 700 "$MINI_ORK_HOME/secrets" 2>/dev/null || _warn "chmod 700 secrets/ failed (filesystem doesn't support unix perms?)"
 
+# ── 1b. Engine pointer ────────────────────────────────────────────────────────
+# Write a committed pointer from the project back to the engine installation.
+# This makes "install mini-ork into any repo" first-class and avoids the
+# symlink hack used on the TraceOtter run.
+_engine_pointer_file="$MINI_ORK_HOME/engine"
+if [ ! -f "$_engine_pointer_file" ]; then
+  # Compute a relative path from PROJECT_HOME/.mini-ork to ENGINE_ROOT.
+  _mo_relpath() {
+    python3 - "$1" "$2" <<'PY'
+import os, sys
+src = os.path.abspath(sys.argv[1])
+dst = os.path.abspath(sys.argv[2])
+# Compute a relative path from src to dst.
+src_parts = src.split(os.sep)
+dst_parts = dst.split(os.sep)
+common = 0
+for a, b in zip(src_parts, dst_parts):
+    if a != b:
+        break
+    common += 1
+up = len(src_parts) - common
+down = dst_parts[common:]
+result = os.sep.join(['..'] * up + down) if up or down else '.'
+print(result)
+PY
+  }
+  _engine_pointer_target="$(_mo_relpath "$MINI_ORK_HOME" "$MINI_ORK_ENGINE_ROOT")"
+  printf '%s\n' "$_engine_pointer_target" > "$_engine_pointer_file"
+  _ok "engine pointer written: $_engine_pointer_target"
+  unset -f _mo_relpath
+else
+  _ok "engine pointer already present"
+fi
+unset _engine_pointer_file _engine_pointer_target
+
 echo ""
 
 # ── 2. Copy default config files ──────────────────────────────────────────────
 
 echo "--- Copying default config ---"
 
-CONFIG_SRC="$MINI_ORK_REPO/config"
+CONFIG_SRC="$MINI_ORK_ENGINE_ROOT/config"
 CONFIG_DEST="$MINI_ORK_HOME/config"
 TASK_CLASSES_DEST="$CONFIG_DEST/task_classes"
 mkdir -p "$TASK_CLASSES_DEST"
 
 # Seed task_classes/ from every recipe's task_class.yaml so the classifier has
 # something to match against on first run.
-for recipe_dir in "$MINI_ORK_REPO"/recipes/*/; do
+for recipe_dir in "$MINI_ORK_ENGINE_ROOT"/recipes/*/; do
   [ -d "$recipe_dir" ] || continue
   recipe_name="$(basename "$recipe_dir")"
   src_yaml="$recipe_dir/task_class.yaml"
@@ -175,6 +210,9 @@ echo "--- Updating .gitignore ---"
 
 GITIGNORE="$PROJECT_ROOT/.gitignore"
 GITIGNORE_ENTRIES=(
+  "# mini-ork generated state (the engine pointer below is committed)"
+  ".mini-ork/*"
+  "!.mini-ork/engine"
   ".mini-ork/state.db"
   ".mini-ork/runs/"
   ".mini-ork/INBOX/"

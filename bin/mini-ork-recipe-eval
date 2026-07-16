@@ -1,0 +1,160 @@
+#!/usr/bin/env bash
+# mini-ork-recipe-eval — static evaluation of recipe definitions.
+#
+# Layer-1 analog of wshobson/agents plugin-eval: deterministic checks with
+# concrete Fix: hints. Scores each recipe 0-100 across static dimensions.
+
+set -Eeuo pipefail
+
+# Source the single path-resolution contract before anything else.
+# shellcheck source=lib/paths.sh
+. "$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)/lib/paths.sh"
+
+_usage() {
+  cat <<'EOF'
+Usage: mini-ork recipe-eval [recipe-name]
+
+Static evaluation of recipe definitions. Every finding includes a Fix: hint.
+
+Options:
+  --json     Emit JSON instead of human-readable table.
+  --help     Show this help.
+EOF
+}
+
+JSON=0
+RECIPE=""
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --help|-h) _usage; exit 0 ;;
+    --json) JSON=1; shift ;;
+    -*)
+      echo "Unknown flag: $1" >&2
+      _usage >&2
+      exit 2
+      ;;
+    *)
+      if [ -z "$RECIPE" ]; then
+        RECIPE="$1"; shift
+      else
+        echo "Unexpected argument: $1" >&2
+        _usage >&2
+        exit 2
+      fi
+      ;;
+  esac
+done
+
+# Determine recipe list.
+if [ -n "$RECIPE" ]; then
+  recipes=("$RECIPE")
+else
+  recipes=()
+  while IFS= read -r -d '' d; do
+    recipes+=("$(basename "$d")")
+  done < <(find "$MINI_ORK_ROOT/recipes" -maxdepth 1 -mindepth 1 -type d -print0 2>/dev/null | sort -z)
+fi
+
+python3 - "$MINI_ORK_ROOT" "$JSON" "${recipes[@]}" <<'PY'
+import json, os, sys, yaml
+from pathlib import Path
+
+root = Path(sys.argv[1])
+json_mode = sys.argv[2] == "1"
+recipes = sys.argv[3:]
+
+MAX_PROMPT_KB = 32
+MAX_WORKFLOW_KB = 16
+
+
+def size_kb(path: Path) -> int:
+    return path.stat().st_size // 1024 if path.is_file() else 0
+
+
+def load_yaml(path: Path):
+    if not path.is_file():
+        return None
+    try:
+        with open(path) as f:
+            return yaml.safe_load(f) or {}
+    except Exception:
+        return None
+
+
+def eval_recipe(name: str) -> dict:
+    rd = root / "recipes" / name
+    findings = []
+    score = 100
+
+    required = {
+        "task_class.yaml": 15,
+        "workflow.yaml": 15,
+        "artifact_contract.yaml": 15,
+    }
+    for fn, weight in required.items():
+        if not (rd / fn).is_file():
+            findings.append({"sev": "error", "msg": f"missing {fn}", "fix": f"create recipes/{name}/{fn}"})
+            score -= weight
+
+    tc = load_yaml(rd / "task_class.yaml") or {}
+    wf = load_yaml(rd / "workflow.yaml") or {}
+    ac = load_yaml(rd / "artifact_contract.yaml") or {}
+
+    if tc and not tc.get("name"):
+        findings.append({"sev": "error", "msg": "task_class.yaml missing name", "fix": f"add 'name:' to recipes/{name}/task_class.yaml"})
+        score -= 10
+
+    if tc and not tc.get("description"):
+        findings.append({"sev": "warn", "msg": "task_class.yaml missing description", "fix": f"add 'description:' to recipes/{name}/task_class.yaml"})
+        score -= 5
+
+    if wf and not wf.get("nodes"):
+        findings.append({"sev": "error", "msg": "workflow.yaml missing nodes", "fix": f"add nodes: to recipes/{name}/workflow.yaml"})
+        score -= 10
+
+    verifiers = (ac or {}).get("success_verifiers") or []
+    if not verifiers:
+        findings.append({"sev": "warn", "msg": "no success_verifiers", "fix": f"add success_verifiers: to recipes/{name}/artifact_contract.yaml"})
+        score -= 10
+
+    # Prompt / workflow size checks
+    for p in rd.glob("prompts/*.md"):
+        kb = size_kb(p)
+        if kb > MAX_PROMPT_KB:
+            findings.append({"sev": "warn", "msg": f"prompt {p.name} is {kb} KiB (cap {MAX_PROMPT_KB})", "fix": "move detail to prompts/references/"})
+            score -= 5
+
+    wf_kb = size_kb(rd / "workflow.yaml")
+    if wf_kb > MAX_WORKFLOW_KB:
+        findings.append({"sev": "warn", "msg": f"workflow.yaml is {wf_kb} KiB (cap {MAX_WORKFLOW_KB})", "fix": "decompose into smaller nodes"})
+        score -= 5
+
+    # Example kickoff presence
+    example_dirs = [d for d in (rd / "examples").iterdir() if d.is_dir()] if (rd / "examples").is_dir() else []
+    example_files = [f for f in (rd / "examples").iterdir() if f.is_file() and f.suffix == ".md"] if (rd / "examples").is_dir() else []
+    if not example_dirs and not example_files:
+        findings.append({"sev": "warn", "msg": "no example kickoff", "fix": f"add recipes/{name}/examples/<name>/kickoff.md"})
+        score -= 5
+
+    score = max(0, score)
+    return {"recipe": name, "score": score, "findings": findings}
+
+
+results = [eval_recipe(name) for name in recipes]
+
+if json_mode:
+    print(json.dumps(results, indent=2))
+else:
+    print("# RecipeEval (static)")
+    print("")
+    for r in results:
+        grade = "A" if r["score"] >= 90 else "B" if r["score"] >= 80 else "C" if r["score"] >= 70 else "D" if r["score"] >= 60 else "F"
+        print(f"## {r['recipe']} — {r['score']}/100 ({grade})")
+        for f in r["findings"]:
+            print(f"- [{f['sev']}] {f['msg']}")
+            print(f"  Fix: {f['fix']}")
+        if not r["findings"]:
+            print("- No static findings.")
+        print("")
+PY

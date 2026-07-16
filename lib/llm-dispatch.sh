@@ -20,7 +20,10 @@
 
 set -euo pipefail
 
-MINI_ORK_ROOT="${MINI_ORK_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+# Source the single path-resolution contract. This exports MINI_ORK_ENGINE_ROOT,
+# MINI_ORK_PROJECT_HOME, MINI_ORK_TARGET_REPO and legacy aliases.
+# shellcheck source=lib/paths.sh
+. "$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)/lib/paths.sh"
 
 # providers.yaml registry — BYO-key providers without a cl_*.sh wrapper.
 # Precedence: an existing cl_<model>.sh ALWAYS wins; the registry is only
@@ -1142,6 +1145,10 @@ mo_llm_dispatch() {
     # parses codex --json turn.completed events) write the same sidecar
     # shapes the claude stream-json path produces, so the envelope/per-turn
     # ledger emission below works identically for executable lanes.
+    # Pin cwd for executable wrappers so codex/gemini cannot drift to the
+    # engine repo. The kickoff-path git toplevel already set MO_TARGET_CWD in
+    # the dispatcher; fall back to the resolved target repo.
+    export MO_TARGET_CWD="${MO_TARGET_CWD:-$MINI_ORK_TARGET_REPO}"
     if [[ -n "$TIMEOUT_CMD" ]]; then
       (
         set +u

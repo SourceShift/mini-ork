@@ -282,13 +282,78 @@ def _target_repo_changed_files() -> list[str]:
 # ── GRPO learning writeback (verbatim transcription of the embedded python) ──
 
 def learning_update_conductor_outcomes(db) -> int:
-    """Resolve pending conductor_decisions against their epic's terminal status."""
+    """Write back what the conductor ACTUALLY got, so its predictions become falsifiable.
+
+    THE BUG THIS FIXES. This function used to reconcile only against an EPIC's terminal
+    status. But `bin/mini-ork run` completes a TASK_RUN and does not necessarily advance any
+    epic — on the live db every conductor decision pointed at an epic still marked
+    `not started`, so the join matched nothing and `realized_score` was NULL on 10 of 10 rows.
+    The conductor predicted a score every single time and never once learned whether it was
+    right. Uncalibrated by construction.
+
+    A prediction nobody scores is not a prediction, it is a claim. This closes that.
+
+    Two reconciliation paths now, in priority order:
+
+      1. task_run_id (migration 0050) — the run the decision actually produced. This is the
+         path that fires for run-driven work, i.e. essentially all of it.
+      2. epic_id — the original path, kept for epic-driven work.
+
+    `verdict` is preferred over `status` because it is the *judged* outcome; `status` merely
+    says the process finished. A run that completes while failing its verifiers is a failure,
+    and scoring it 1.0 because it exited cleanly is precisely the false-completion this whole
+    system exists to prevent.
+    """
     if not (db and os.path.isfile(db)):
         return 0
     con = sqlite3.connect(db, timeout=5.0)
     con.execute("PRAGMA busy_timeout=5000")
     con.row_factory = sqlite3.Row
+    updated = 0
     try:
+        has_run_col = any(
+            r["name"] == "task_run_id"
+            for r in con.execute("PRAGMA table_info(conductor_decisions)").fetchall()
+        )
+
+        # ── path 1: the run the decision produced (migration 0050) ──────────────
+        #
+        # GROUND TRUTH, read off the live schema and data — not assumed:
+        #
+        #   task_runs.status CHECK IN ('classified','planned','executing','verifying',
+        #                              'reviewing','published','rolled_back','failed')
+        #
+        # So the terminal success state is `published`, NOT `done`. An earlier version of this
+        # function checked `status in ('done','success','pass')` — values that CANNOT occur —
+        # and its unit tests passed only because they used the same invented status. Tests that
+        # encode the author's assumption instead of the system's schema prove nothing.
+        #
+        # And `verdict` is NOT a reliable signal: on the live db it is EMPTY on 242 of 278
+        # completed runs; the only value ever observed is 'CRASH'. So verdict is used only as
+        # a negative override, never as the positive one.
+        #
+        # `ended_at IS NOT NULL` is also NOT a terminal test — 8 rows sit in `reviewing` with
+        # ended_at set. Gate on the status set, which is what actually means "finished".
+        if has_run_col:
+            rows = con.execute(
+                "SELECT cd.id, tr.status, tr.verdict "
+                "FROM conductor_decisions cd JOIN task_runs tr ON tr.id = cd.task_run_id "
+                "WHERE COALESCE(cd.outcome, 'pending') = 'pending' "
+                "  AND tr.status IN ('published', 'failed', 'rolled_back')"
+            ).fetchall()
+            for row in rows:
+                status = (row["status"] or "").strip().lower()
+                verdict = (row["verdict"] or "").strip().lower()
+                # Published AND not crashed = the only way to score 1.0. A crash is a failure
+                # no matter what the status column says.
+                success = status == "published" and verdict != "crash"
+                con.execute(
+                    "UPDATE conductor_decisions SET outcome=?, realized_score=? WHERE id=?",
+                    ("success" if success else "failure", 1.0 if success else 0.0, row["id"]),
+                )
+                updated += 1
+
+        # ── path 2: epic-driven work (the original path) ────────────────────────
         rows = con.execute(
             "SELECT cd.id, e.status FROM conductor_decisions cd JOIN epics e ON e.id = cd.epic_id "
             "WHERE COALESCE(cd.outcome, 'pending') = 'pending' AND e.status IN ('done', 'escalated')"
@@ -297,8 +362,10 @@ def learning_update_conductor_outcomes(db) -> int:
             success = row["status"] == "done"
             con.execute("UPDATE conductor_decisions SET outcome=?, realized_score=? WHERE id=?",
                         ("success" if success else "failure", 1.0 if success else 0.0, row["id"]))
+            updated += 1
+
         con.commit()
-        return len(rows)
+        return updated
     except sqlite3.OperationalError:
         return 0
     finally:
