@@ -1,419 +1,293 @@
-"""Parity gate: mini_ork.ported.langfuse_score_mapper vs lib/langfuse_score_mapper.sh.
+"""Standalone unit tests for ``mini_ork.ported.langfuse_score_mapper``.
 
-Each test invokes the LIVE bash functions from ``lib/langfuse_score_mapper.sh``
-via ``bash -c 'source lib/langfuse_score_mapper.sh; <func> <args>'`` on
-identical inputs as the Python port and asserts equivalent outputs
-(stdout lines parsed as one-JSON-per-line, exit codes / raised
-exceptions, byte-equal table text). No mocks, no hardcoded outputs
-beyond what bash itself emits.
-
-Seven cases (above the kickoff's >=6 floor):
-  (a) reviewer APPROVE via stdin           — bash emits 1 line
-                                               {{name:'reviewer_approve',
-                                                 value:1.0, ...}};
-                                             python port returns
-                                             [same dict].
-  (b) verifier fail via stdin              — bash emits 1 line value=-0.5
-                                             comment 'deterministic fail'.
-  (c) oracle CITATION_UNDERCOVERED         — bash emits 1 line value=-0.5
-                                             comment 'citations missing'
-                                             (verdict→ORACLE_MAP).
-  (d) rollback event via stdin             — bash emits 1 line value=-1.0
-                                             comment 'publish reverted'.
-  (e) promotion promoted via stdin        — bash emits 1 line value=1.0
-                                             comment 'candidate promoted'
-                                             (decision→PROMOTION_MAP).
-  (f) combined reviewer+verifier (2 evts)  — bash emits 2 lines in
-                                             reviewer→verifier order;
-                                             python returns the same
-                                             2-element list.
-  (g) langfuse_score_table byte-equal      — bash stdout of the table
-                                             function equals Python
-                                             langfuse_score_table()
-                                             string verbatim.
-
-Bash stdin pipe: bash's ``[ -t 0 ]`` returns False when subprocess
-pipes stdin, so the bash function's usage-error branch is unreachable
-from these tests — it requires a real tty that pytest cannot easily
-provide. Python port raises ``ValueError('usage: ...')`` for the
-equivalent condition (``input_json`` None AND ``stdin_text`` None);
-see test_lsm.usage_error_raises for the in-process equivalent.
-
-Environment isolation: each test points subprocess at a per-test
-stdin payload so bash's ``cat`` and Python's ``stdin_text`` both
-land in the same JSON string with no filesystem pollution.
+Replaces the bash-parity gate (which drove ``bash -c 'source
+lib/langfuse_score_mapper.sh; ...'`` in a subprocess) as part of the
+bash→Python migration: the Python port is now the sole implementation, so
+its coverage no longer shells out to ``lib/langfuse_score_mapper.sh`` — it
+asserts the port's behaviour directly. These pin the deterministic
+contract the mapper must keep (the score table, the four decision/verdict
+maps, the emit order for ``langfuse_score_for_verdict``, and its input
+resolution rules) independent of any bash oracle.
 """
+
 from __future__ import annotations
 
-import json
-import shutil
-import subprocess
-import sys
-from pathlib import Path
+from typing import Dict, Tuple
 
 import pytest
 
-REPO = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(REPO))
-from mini_ork.ported import langfuse_score_mapper as lsm  # noqa: E402
+from mini_ork.ported.langfuse_score_mapper import (
+    ORACLE_MAP,
+    PROMOTION_MAP,
+    REVIEWER_MAP,
+    SCORE_TABLE,
+    VERIFIER_MAP,
+    langfuse_score_for_verdict,
+    langfuse_score_table,
+)
 
-SH = REPO / "lib" / "langfuse_score_mapper.sh"
+# Verbatim copy of the bash ``langfuse_score_table`` heredoc body (lib/
+# langfuse_score_mapper.sh lines 70-88), which the port's docstring
+# states it mirrors exactly. Pinned here as a static literal so the test
+# suite doesn't need to invoke bash to catch drift.
+_EXPECTED_TABLE_TEXT = (
+    "event                          score   rationale\n"
+    "─────                          ─────   ─────────\n"
+    "reviewer APPROVE               +1.0    explicit approval, full credit\n"
+    "reviewer REQUEST_CHANGES       -0.5    review found defects; not a pass\n"
+    "reviewer ESCALATE               0.0    operator decides; do not pre-bias\n"
+    "verifier pass                  +0.5    deterministic pass, half-credit\n"
+    "                                       (full credit reserved for reviewer)\n"
+    "verifier fail                  -0.5    deterministic fail\n"
+    "verifier vacuous               -0.25   nothing checked != pass\n"
+    "panel COALITION_ABORT          -0.75   structural panel failure (ρ + family)\n"
+    "panel ALPHA_ESCALATE           -0.5    α<0.4, panel divergence too high\n"
+    "panel CITATION_UNDERCOVERED    -0.5    citations failed to resolve\n"
+    "panel REFUTE_FAILED            -0.75   validator hallucinated fabrications\n"
+    "panel CI_TOO_WIDE              -0.25   per-finding CIs honest-uncertain\n"
+    "rollback fired                 -1.0    publish was reverted post-hoc\n"
+    "promoted                       +1.0    candidate passed promotion gate\n"
+    "quarantined                    -1.0    candidate failed promotion gate\n"
+    "pending_human_approval          0.0    awaiting decision\n"
+)
 
-# Float tolerance from the kickoff: 'floats 1e-6'. Strict superset of
-# bash's own repr precision (Python's ``json.dumps(0.5)`` → ``0.5``
-# exactly; ``json.dumps(-0.25)`` → ``-0.25`` exactly).
-_FLOAT_TOL = 1e-6
-
-
-def _which_bash() -> None:
-    if not shutil.which("bash"):
-        pytest.skip("bash not on PATH")
-    if not shutil.which("python3"):
-        pytest.skip("python3 not on PATH (lib/langfuse_score_mapper.sh uses a python3 heredoc)")
-    if not SH.exists():
-        pytest.skip(f"missing lib/langfuse_score_mapper.sh at {SH}")
-
-
-def _bash_score_for_verdict(stdin_payload: str) -> subprocess.CompletedProcess:
-    """Invoke ``bash -c 'source lib/langfuse_score_mapper.sh; langfuse_score_for_verdict'``
-    with ``stdin_payload`` piped on stdin (so bash's ``[ -t 0 ]`` is False
-    and the function reads stdin instead of erroring on usage)."""
-    src = (
-        f'source "{SH}"\n'
-        f'langfuse_score_for_verdict\n'
-    )
-    return subprocess.run(
-        ["bash", "-c", src],
-        input=stdin_payload,
-        capture_output=True, text=True,
-    )
-
-
-def _bash_score_table() -> subprocess.CompletedProcess:
-    """Invoke ``bash -c 'source lib/langfuse_score_mapper.sh; langfuse_score_table'``."""
-    src = (
-        f'source "{SH}"\n'
-        f'langfuse_score_table\n'
-    )
-    return subprocess.run(
-        ["bash", "-c", src],
-        capture_output=True, text=True,
-    )
-
-
-def _bash_json_lines(cp: subprocess.CompletedProcess) -> list[dict]:
-    """Parse bash stdout as one JSON object per line.
-
-    bash emits via Python's ``print(json.dumps(...))`` so each non-empty
-    stdout line is a JSON object. Empty / trailing lines are skipped
-    (bash sometimes leaves a final newline).
-    """
-    out: list[dict] = []
-    for line in cp.stdout.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        out.append(json.loads(line))
-    return out
+# Verbatim copy of the bash ``_LANGFUSE_SCORES_*`` constants (lib/
+# langfuse_score_mapper.sh lines 52-66) paired with the JSON-emit
+# rationale strings (lines 136-150) — NOT the longer operator-facing
+# table text above. This is the same shape as the port's SCORE_TABLE.
+_EXPECTED_SCORE_TABLE: Dict[str, Tuple[float, str]] = {
+    "reviewer_approve": (1.0, "explicit approval"),
+    "reviewer_request_changes": (-0.5, "review found defects"),
+    "reviewer_escalate": (0.0, "operator decides"),
+    "verifier_pass": (0.5, "deterministic pass"),
+    "verifier_fail": (-0.5, "deterministic fail"),
+    "verifier_vacuous": (-0.25, "nothing checked"),
+    "coalition_abort": (-0.75, "rho + family failure"),
+    "alpha_escalate": (-0.5, "alpha below threshold"),
+    "citation_undercovered": (-0.5, "citations missing"),
+    "refute_failed": (-0.75, "fabrications survived"),
+    "ci_too_wide": (-0.25, "per-finding CIs too wide"),
+    "rollback_fired": (-1.0, "publish reverted"),
+    "promoted": (1.0, "candidate promoted"),
+    "quarantined": (-1.0, "candidate quarantined"),
+    "pending_human_approval": (0.0, "awaiting decision"),
+}
 
 
-def _assert_score_eq(py_score: dict, bash_score: dict, label: str) -> None:
+def _assert_score(
+    emitted: Dict[str, object], name: str, value: float, comment: str
+) -> None:
     """Field-by-field equality for one emitted score dict."""
-    assert py_score["name"] == bash_score["name"], (
-        f"{label}: name mismatch py={py_score['name']!r} bash={bash_score['name']!r}"
-    )
-    assert py_score["data_type"] == bash_score["data_type"], (
-        f"{label}: data_type mismatch py={py_score['data_type']!r} bash={bash_score['data_type']!r}"
-    )
-    assert py_score["comment"] == bash_score["comment"], (
-        f"{label}: comment mismatch py={py_score['comment']!r} bash={bash_score['comment']!r}"
-    )
-    assert abs(float(py_score["value"]) - float(bash_score["value"])) < _FLOAT_TOL, (
-        f"{label}: value mismatch py={py_score['value']!r} bash={bash_score['value']!r}"
-    )
+    assert emitted["name"] == name
+    assert emitted["data_type"] == "NUMERIC"
+    assert emitted["comment"] == comment
+    assert isinstance(emitted["value"], float)
+    assert emitted["value"] == pytest.approx(value)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# (a) reviewer APPROVE via stdin
-# ─────────────────────────────────────────────────────────────────────────────
-def test_reviewer_approve_via_stdin_parity():
-    """echo '{"decision":"APPROVE"}' | langfuse_score_for_verdict
-    → 1 line: reviewer_approve value=1.0 'explicit approval'."""
-    _which_bash()
-    payload = '{"decision":"APPROVE"}'
+class TestScoreTable:
+    def test_all_fifteen_events_present(self):
+        assert set(SCORE_TABLE) == set(_EXPECTED_SCORE_TABLE)
 
-    r_bash = _bash_score_for_verdict(payload)
-    assert r_bash.returncode == 0, (
-        f"bash rc={r_bash.returncode}\nstderr={r_bash.stderr}"
-    )
-    bash_scores = _bash_json_lines(r_bash)
-    assert len(bash_scores) == 1, (
-        f"bash expected 1 line for reviewer APPROVE, got {len(bash_scores)}: "
-        f"{r_bash.stdout!r}"
-    )
+    def test_values_and_comments_match_bash_source(self):
+        assert SCORE_TABLE == _EXPECTED_SCORE_TABLE
 
-    py_scores = lsm.langfuse_score_for_verdict(payload)
-    assert len(py_scores) == 1
-    _assert_score_eq(py_scores[0], bash_scores[0], "reviewer_approve")
-    assert bash_scores[0]["name"] == "reviewer_approve"
-    assert bash_scores[0]["value"] == 1.0
+    def test_langfuse_score_table_matches_bash_heredoc_verbatim(self):
+        assert langfuse_score_table() == _EXPECTED_TABLE_TEXT
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# (b) verifier fail via stdin
-# ─────────────────────────────────────────────────────────────────────────────
-def test_verifier_fail_via_stdin_parity():
-    """echo '{"verdict":"fail"}' | langfuse_score_for_verdict
-    → 1 line: verifier_fail value=-0.5 'deterministic fail'."""
-    _which_bash()
-    payload = '{"verdict":"fail"}'
+class TestMaps:
+    def test_reviewer_map_entries(self):
+        assert REVIEWER_MAP == {
+            "APPROVE": "reviewer_approve",
+            "REQUEST_CHANGES": "reviewer_request_changes",
+            "ESCALATE": "reviewer_escalate",
+        }
 
-    r_bash = _bash_score_for_verdict(payload)
-    assert r_bash.returncode == 0, (
-        f"bash rc={r_bash.returncode}\nstderr={r_bash.stderr}"
-    )
-    bash_scores = _bash_json_lines(r_bash)
-    assert len(bash_scores) == 1, (
-        f"bash expected 1 line for verifier fail, got {len(bash_scores)}: "
-        f"{r_bash.stdout!r}"
-    )
+    def test_verifier_map_entries(self):
+        assert VERIFIER_MAP == {
+            "pass": "verifier_pass",
+            "fail": "verifier_fail",
+            "vacuous": "verifier_vacuous",
+        }
 
-    py_scores = lsm.langfuse_score_for_verdict(payload)
-    assert len(py_scores) == 1
-    _assert_score_eq(py_scores[0], bash_scores[0], "verifier_fail")
-    assert bash_scores[0]["name"] == "verifier_fail"
-    assert bash_scores[0]["value"] == -0.5
+    def test_oracle_map_entries(self):
+        assert ORACLE_MAP == {
+            "COALITION_ABORT": "coalition_abort",
+            "ALPHA_ESCALATE": "alpha_escalate",
+            "CITATION_UNDERCOVERED": "citation_undercovered",
+            "REFUTE_FAILED": "refute_failed",
+            "CI_TOO_WIDE": "ci_too_wide",
+        }
 
+    def test_promotion_map_entries(self):
+        assert PROMOTION_MAP == {
+            "promoted": "promoted",
+            "quarantined": "quarantined",
+            "pending_human_approval": "pending_human_approval",
+        }
 
-# ─────────────────────────────────────────────────────────────────────────────
-# (c) oracle CITATION_UNDERCOVERED via stdin
-# ─────────────────────────────────────────────────────────────────────────────
-def test_oracle_citation_undercovered_via_stdin_parity():
-    """echo '{"verdict":"CITATION_UNDERCOVERED"}' | langfuse_score_for_verdict
-    → 1 line: citation_undercovered value=-0.5 'citations missing'.
+    def test_all_map_values_exist_in_score_table(self):
+        for mapping in (REVIEWER_MAP, VERIFIER_MAP, ORACLE_MAP, PROMOTION_MAP):
+            for event_name in mapping.values():
+                assert event_name in SCORE_TABLE
 
-    Note: the bash Python heredoc emits the JSON-style rationale
-    'citations missing' (NOT the operator-facing table text 'citations
-    failed to resolve' shown in langfuse_score_table)."""
-    _which_bash()
-    payload = '{"verdict":"CITATION_UNDERCOVERED"}'
+    def test_reviewer_and_promotion_keys_are_disjoint(self):
+        # A single "decision" value must not double-fire both maps.
+        assert set(REVIEWER_MAP) & set(PROMOTION_MAP) == set()
 
-    r_bash = _bash_score_for_verdict(payload)
-    assert r_bash.returncode == 0, (
-        f"bash rc={r_bash.returncode}\nstderr={r_bash.stderr}"
-    )
-    bash_scores = _bash_json_lines(r_bash)
-    assert len(bash_scores) == 1, (
-        f"bash expected 1 line for oracle CITATION_UNDERCOVERED, got "
-        f"{len(bash_scores)}: {r_bash.stdout!r}"
-    )
-
-    py_scores = lsm.langfuse_score_for_verdict(payload)
-    assert len(py_scores) == 1
-    _assert_score_eq(py_scores[0], bash_scores[0], "citation_undercovered")
-    assert bash_scores[0]["name"] == "citation_undercovered"
-    assert bash_scores[0]["value"] == -0.5
+    def test_verifier_and_oracle_keys_are_disjoint(self):
+        # A single "verdict" value must not double-fire both maps.
+        assert set(VERIFIER_MAP) & set(ORACLE_MAP) == set()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# (d) rollback event via stdin
-# ─────────────────────────────────────────────────────────────────────────────
-def test_rollback_event_via_stdin_parity():
-    """echo '{"event":"rollback_fired"}' | langfuse_score_for_verdict
-    → 1 line: rollback_fired value=-1.0 'publish reverted'."""
-    _which_bash()
-    payload = '{"event":"rollback_fired"}'
+class TestLangfuseScoreForVerdictSingleMatch:
+    """One emit per case, mirroring the six bash self-test fixtures."""
 
-    r_bash = _bash_score_for_verdict(payload)
-    assert r_bash.returncode == 0, (
-        f"bash rc={r_bash.returncode}\nstderr={r_bash.stderr}"
-    )
-    bash_scores = _bash_json_lines(r_bash)
-    assert len(bash_scores) == 1, (
-        f"bash expected 1 line for rollback event, got {len(bash_scores)}: "
-        f"{r_bash.stdout!r}"
-    )
+    def test_reviewer_approve_via_stdin_text(self):
+        scores = langfuse_score_for_verdict(stdin_text='{"decision":"APPROVE"}')
+        assert len(scores) == 1
+        _assert_score(scores[0], "reviewer_approve", 1.0, "explicit approval")
 
-    py_scores = lsm.langfuse_score_for_verdict(payload)
-    assert len(py_scores) == 1
-    _assert_score_eq(py_scores[0], bash_scores[0], "rollback_fired")
-    assert bash_scores[0]["name"] == "rollback_fired"
-    assert bash_scores[0]["value"] == -1.0
+    def test_verifier_fail_via_input_json_inline(self):
+        scores = langfuse_score_for_verdict('{"verdict":"fail"}')
+        assert len(scores) == 1
+        _assert_score(scores[0], "verifier_fail", -0.5, "deterministic fail")
 
+    def test_oracle_citation_undercovered(self):
+        scores = langfuse_score_for_verdict('{"verdict":"CITATION_UNDERCOVERED"}')
+        assert len(scores) == 1
+        # Note: the JSON-emit rationale is 'citations missing' (not the
+        # longer operator-facing table text 'citations failed to resolve').
+        _assert_score(scores[0], "citation_undercovered", -0.5, "citations missing")
 
-# ─────────────────────────────────────────────────────────────────────────────
-# (e) promotion promoted via stdin (decision → PROMOTION_MAP)
-# ─────────────────────────────────────────────────────────────────────────────
-def test_promotion_promoted_via_stdin_parity():
-    """echo '{"decision":"promoted"}' | langfuse_score_for_verdict
-    → 1 line: promoted value=1.0 'candidate promoted'.
+    def test_rollback_event(self):
+        scores = langfuse_score_for_verdict('{"event":"rollback_fired"}')
+        assert len(scores) == 1
+        _assert_score(scores[0], "rollback_fired", -1.0, "publish reverted")
 
-    'promoted' is in PROMOTION_MAP but NOT in REVIEWER_MAP, so only the
-    promotion emit fires."""
-    _which_bash()
-    payload = '{"decision":"promoted"}'
+    def test_promotion_promoted(self):
+        # 'promoted' is in PROMOTION_MAP but NOT in REVIEWER_MAP, so only
+        # the promotion emit fires.
+        scores = langfuse_score_for_verdict('{"decision":"promoted"}')
+        assert len(scores) == 1
+        _assert_score(scores[0], "promoted", 1.0, "candidate promoted")
 
-    r_bash = _bash_score_for_verdict(payload)
-    assert r_bash.returncode == 0, (
-        f"bash rc={r_bash.returncode}\nstderr={r_bash.stderr}"
-    )
-    bash_scores = _bash_json_lines(r_bash)
-    assert len(bash_scores) == 1, (
-        f"bash expected 1 line for promotion promoted, got {len(bash_scores)}: "
-        f"{r_bash.stdout!r}"
-    )
+    def test_quarantined(self):
+        scores = langfuse_score_for_verdict('{"decision":"quarantined"}')
+        assert len(scores) == 1
+        _assert_score(scores[0], "quarantined", -1.0, "candidate quarantined")
 
-    py_scores = lsm.langfuse_score_for_verdict(payload)
-    assert len(py_scores) == 1
-    _assert_score_eq(py_scores[0], bash_scores[0], "promoted")
-    assert bash_scores[0]["name"] == "promoted"
-    assert bash_scores[0]["value"] == 1.0
+    def test_pending_human_approval(self):
+        scores = langfuse_score_for_verdict('{"decision":"pending_human_approval"}')
+        assert len(scores) == 1
+        _assert_score(
+            scores[0], "pending_human_approval", 0.0, "awaiting decision"
+        )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# (f) combined reviewer APPROVE + verifier pass (2 events, in emit order)
-# ─────────────────────────────────────────────────────────────────────────────
-def test_combined_reviewer_and_verifier_parity():
-    """echo '{"decision":"APPROVE","verdict":"pass"}' | langfuse_score_for_verdict
-    → 2 lines in bash-emit order: reviewer_approve then verifier_pass.
+class TestLangfuseScoreForVerdictCombined:
+    """Multiple rules can fire from one payload; order must match the
+    bash emit order: reviewer_map(decision), promotion_map(decision),
+    verifier_map(verdict), oracle_map(verdict), rollback event."""
 
-    Bash heredoc emits reviewer_map(decision) FIRST then verifier_map(verdict);
-    the Python port mirrors that order so positionally-indexed comparison
-    holds."""
-    _which_bash()
-    payload = '{"decision":"APPROVE","verdict":"pass"}'
+    def test_reviewer_and_verifier_order(self):
+        scores = langfuse_score_for_verdict(
+            '{"decision":"APPROVE","verdict":"pass"}'
+        )
+        assert [s["name"] for s in scores] == ["reviewer_approve", "verifier_pass"]
 
-    r_bash = _bash_score_for_verdict(payload)
-    assert r_bash.returncode == 0, (
-        f"bash rc={r_bash.returncode}\nstderr={r_bash.stderr}"
-    )
-    bash_scores = _bash_json_lines(r_bash)
-    assert len(bash_scores) == 2, (
-        f"bash expected 2 lines for combined input, got {len(bash_scores)}: "
-        f"{r_bash.stdout!r}"
-    )
+    def test_oracle_and_rollback_order(self):
+        scores = langfuse_score_for_verdict(
+            '{"verdict":"COALITION_ABORT","event":"rollback_fired"}'
+        )
+        assert [s["name"] for s in scores] == ["coalition_abort", "rollback_fired"]
 
-    py_scores = lsm.langfuse_score_for_verdict(payload)
-    assert len(py_scores) == 2
-    # Both sides must agree on order AND content.
-    for i, (py_s, bash_s) in enumerate(zip(py_scores, bash_scores)):
-        _assert_score_eq(py_s, bash_s, f"combined[{i}]")
-    assert py_scores[0]["name"] == "reviewer_approve"
-    assert py_scores[1]["name"] == "verifier_pass"
+    def test_reviewer_verifier_rollback_full_order(self):
+        scores = langfuse_score_for_verdict(
+            '{"decision":"APPROVE","verdict":"fail","event":"rollback_fired"}'
+        )
+        assert [s["name"] for s in scores] == [
+            "reviewer_approve",
+            "verifier_fail",
+            "rollback_fired",
+        ]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# (g) langfuse_score_table byte-equal
-# ─────────────────────────────────────────────────────────────────────────────
-def test_score_table_byte_equal_parity():
-    """langfuse_score_table() returns the same heredoc text bash ``cat
-    <<EOF`` prints. Static literal — no input — so byte-equality holds."""
-    _which_bash()
-    r_bash = _bash_score_table()
-    assert r_bash.returncode == 0, (
-        f"bash rc={r_bash.returncode}\nstderr={r_bash.stderr}"
-    )
-    py_table = lsm.langfuse_score_table()
-    assert py_table == r_bash.stdout, (
-        f"score table text mismatch.\n--- python ---\n{py_table!r}\n"
-        f"--- bash ---\n{r_bash.stdout!r}\n--- diff ---\n"
-        f"{[i for i, (a, b) in enumerate(zip(py_table, r_bash.stdout)) if a != b]}"
-    )
+class TestLangfuseScoreForVerdictNoMatch:
+    def test_empty_match_dict_returns_empty_list(self):
+        assert langfuse_score_for_verdict('{"foo":"bar"}') == []
+
+    def test_unmatched_decision_and_verdict_values_ignored(self):
+        assert (
+            langfuse_score_for_verdict('{"decision":"UNKNOWN","verdict":"whatever"}')
+            == []
+        )
+
+    def test_non_dict_list_input_returns_empty_list(self):
+        assert langfuse_score_for_verdict("[1, 2, 3]") == []
+
+    def test_non_dict_scalar_string_input_returns_empty_list(self):
+        assert langfuse_score_for_verdict('"just a string"') == []
+
+    def test_non_dict_scalar_number_input_returns_empty_list(self):
+        assert langfuse_score_for_verdict("42") == []
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Empty-match input (no rule fires) — bonus case for safety
-# ─────────────────────────────────────────────────────────────────────────────
-def test_empty_match_returns_empty_list_parity():
-    """dict with no decision/verdict/event keys → 0 lines on bash, []
-    on python. Mirrors bash heredoc behavior of 'if isinstance(data,
-    dict): [emit rules]' — when none match, nothing is printed."""
-    _which_bash()
-    payload = '{"foo":"bar"}'
+class TestInputResolution:
+    def test_usage_error_raises_value_error_when_no_input(self):
+        with pytest.raises(ValueError) as exc:
+            langfuse_score_for_verdict()
+        msg = str(exc.value)
+        assert "usage" in msg.lower()
+        assert "langfuse_score_for_verdict" in msg
 
-    r_bash = _bash_score_for_verdict(payload)
-    assert r_bash.returncode == 0, (
-        f"bash rc={r_bash.returncode}\nstderr={r_bash.stderr}"
-    )
-    bash_lines = [ln for ln in r_bash.stdout.splitlines() if ln.strip()]
-    assert bash_lines == [], (
-        f"bash expected 0 stdout lines for unmatched dict, got "
-        f"{bash_lines!r}"
-    )
+    def test_parse_error_raises_value_error_for_input_json(self):
+        with pytest.raises(ValueError) as exc:
+            langfuse_score_for_verdict("{not valid json")
+        assert "parse error" in str(exc.value).lower()
 
-    py_scores = lsm.langfuse_score_for_verdict(payload)
-    assert py_scores == [], f"python expected [] for unmatched dict, got {py_scores}"
+    def test_parse_error_raises_value_error_for_stdin_text(self):
+        with pytest.raises(ValueError) as exc:
+            langfuse_score_for_verdict(stdin_text="{not valid json")
+        assert "parse error" in str(exc.value).lower()
 
+    def test_parse_error_raises_value_error_for_file_path_mode(self, tmp_path):
+        bad_file = tmp_path / "bad.json"
+        bad_file.write_text("{not valid json")
+        with pytest.raises(ValueError) as exc:
+            langfuse_score_for_verdict(str(bad_file))
+        assert "parse error" in str(exc.value).lower()
 
-def test_usage_error_raises_value_error():
-    """Calling langfuse_score_for_verdict with NO input_json and NO
-    stdin_text raises ValueError with the usage message — the Python
-    port equivalent of bash's ``[ -t 0 ]`` usage-error branch (which
-    is unreachable from subprocess because pytest cannot provide a
-    real tty)."""
-    with pytest.raises(ValueError) as exc:
-        lsm.langfuse_score_for_verdict()
-    msg = str(exc.value)
-    assert "usage" in msg.lower(), f"usage message missing 'usage': {msg!r}"
-    assert "langfuse_score_for_verdict" in msg, f"usage message missing function name: {msg!r}"
+    def test_input_json_file_path_is_read(self, tmp_path):
+        payload_file = tmp_path / "verdict.json"
+        payload_file.write_text('{"verdict":"pass"}')
+        scores = langfuse_score_for_verdict(str(payload_file))
+        assert len(scores) == 1
+        _assert_score(scores[0], "verifier_pass", 0.5, "deterministic pass")
 
+    def test_input_json_takes_precedence_over_stdin_text(self):
+        # Mirrors bash lines 109-112 / port's _load_input: when both are
+        # given, input_json wins.
+        scores = langfuse_score_for_verdict(
+            '{"decision":"APPROVE"}', stdin_text='{"verdict":"pass"}'
+        )
+        assert len(scores) == 1
+        assert scores[0]["name"] == "reviewer_approve"
 
-def test_parse_error_raises_value_error(tmp_path):
-    """Malformed JSON → ValueError with 'parse error' prefix; bash
-    returns rc=2 with the same prefix on stderr."""
-    _which_bash()
-    bad = "{not valid json"
+    def test_nonexistent_path_like_string_falls_back_to_inline_and_fails_parse(self):
+        # Looks like a path but doesn't exist on disk -> treated as
+        # literal JSON text -> not valid JSON -> parse error.
+        with pytest.raises(ValueError) as exc:
+            langfuse_score_for_verdict("/nonexistent/path/to/verdict.json")
+        assert "parse error" in str(exc.value).lower()
 
-    r_bash = _bash_score_for_verdict(bad)
-    assert r_bash.returncode == 2, (
-        f"bash expected rc=2 on parse error, got {r_bash.returncode}; "
-        f"stderr={r_bash.stderr!r}"
-    )
-    assert "parse error" in r_bash.stderr.lower(), (
-        f"bash stderr should contain 'parse error': {r_bash.stderr!r}"
-    )
-
-    # Python: stdin_text path with malformed JSON
-    with pytest.raises(ValueError) as exc:
-        lsm.langfuse_score_for_verdict(stdin_text=bad)
-    assert "parse error" in str(exc.value).lower()
-
-    # Python: input_json path with malformed JSON
-    with pytest.raises(ValueError) as exc:
-        lsm.langfuse_score_for_verdict(bad)
-    assert "parse error" in str(exc.value).lower()
-
-    # Python: file-path mode with malformed-JSON file. Bash does NOT
-    # echo the path on parse error (only the JSON exception message),
-    # so we just assert the prefix matches.
-    bad_file = tmp_path / "bad.json"
-    bad_file.write_text(bad)
-    with pytest.raises(ValueError) as exc:
-        lsm.langfuse_score_for_verdict(str(bad_file))
-    assert "parse error" in str(exc.value).lower()
-
-
-def test_input_json_file_path_parity(tmp_path):
-    """input_json pointing at an existing file is read (mirror bash
-    lines 156-161). Otherwise it's treated as inline JSON."""
-    _which_bash()
-    payload_file = tmp_path / "verdict.json"
-    payload_file.write_text('{"verdict":"pass"}')
-
-    # Bash: only stdin path is reachable from subprocess (positional
-    # arg path requires non-empty stdin? — bash lines 92-112: if $1
-    # is non-empty AND stdin is also non-empty, bash takes $1 as the
-    # input. With our test we pipe the same content on stdin for
-    # parity; the file-vs-inline distinction is only testable on the
-    # Python side.)
-    same_payload = '{"verdict":"pass"}'
-    r_bash = _bash_score_for_verdict(same_payload)
-    assert r_bash.returncode == 0
-    bash_scores = _bash_json_lines(r_bash)
-    assert len(bash_scores) == 1
-    assert bash_scores[0]["name"] == "verifier_pass"
-
-    # Python file-path mode
-    py_scores = lsm.langfuse_score_for_verdict(str(payload_file))
-    assert len(py_scores) == 1
-    _assert_score_eq(py_scores[0], bash_scores[0], "file_path_mode")
+    def test_directory_path_falls_back_to_literal_string_and_fails_parse(
+        self, tmp_path
+    ):
+        # os.path.exists() is True for a directory but os.path.isfile()
+        # is False, so _load_input returns the path string itself
+        # (not its contents) -> json.loads on the path text fails.
+        with pytest.raises(ValueError) as exc:
+            langfuse_score_for_verdict(str(tmp_path))
+        assert "parse error" in str(exc.value).lower()
