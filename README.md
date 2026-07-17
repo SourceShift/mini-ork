@@ -229,6 +229,16 @@ The `recursive-self-improve` recipe ran against mini-ork itself for ~5 wall-cloc
 
 ---
 
+## Part of the mini-ork stack
+
+mini-ork is the orchestration brain of a small self-improving stack — each piece stands alone and compounds together:
+
+- **[ContextNest](https://github.com/SourceShift/ContextNest)** — cross-session memory substrate. mini-ork records what each run decided, tried, and verified; the next run starts with that context instead of a blank slate.
+- **[TraceOtter](https://github.com/SourceShift/TraceOtter)** — distills mini-ork run trajectories into a small local model, so routing gets cheaper and smarter over time.
+- **[coevolve](https://github.com/SourceShift/coevolve)** — an extensible CLI/TUI over mini-ork + ContextNest + TraceOtter for driving the whole loop from one surface.
+
+---
+
 ## Dependencies
 
 `bash` 4+ · `sqlite3` 3.35+ (WAL) · `jq` 1.6+ · `yq` 4+ · `git` 2.28+ · `claude` CLI 2.1+ · `codex` CLI (optional, for `codex` lane).
