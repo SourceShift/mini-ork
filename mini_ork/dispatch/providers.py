@@ -20,6 +20,8 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import yaml
+
 from .core import dispatch
 from .models import DispatchRequest, DispatchResult, TokenUsage
 
@@ -213,17 +215,156 @@ def mini_ork_root(root: str | os.PathLike[str] | None = None) -> Path:
     return Path(__file__).resolve().parents[2]
 
 
+def _load_providers_registry(
+    root: str | os.PathLike[str] | None = None,
+) -> Mapping[str, object]:
+    candidates: list[Path] = []
+    if override := os.environ.get("MINI_ORK_PROVIDERS"):
+        candidates.append(Path(override))
+    home = Path(os.environ.get("MINI_ORK_HOME", ".mini-ork"))
+    candidates.append(home / "config" / "providers.yaml")
+    candidates.append(mini_ork_root(root) / "config" / "providers.yaml")
+
+    for path in candidates:
+        if not path.is_file():
+            continue
+        try:
+            document = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        except (OSError, yaml.YAMLError) as exc:
+            raise ValueError(f"invalid providers registry {path}: {exc}") from exc
+        if not isinstance(document, Mapping):
+            raise ValueError(f"invalid providers registry {path}: root must be a mapping")
+        providers = document.get("providers") or {}
+        if not isinstance(providers, Mapping):
+            raise ValueError(
+                f"invalid providers registry {path}: 'providers' must be a mapping"
+            )
+        return providers
+    return {}
+
+
+def _resolve_from_registry(
+    name: str,
+    registry: Mapping[str, object],
+    root: str | os.PathLike[str] | None = None,
+) -> ProviderSpec:
+    entry = registry.get(name)
+    if not isinstance(entry, Mapping):
+        raise ValueError(f"unknown model lane: {name!r}")
+
+    kind = entry.get("kind")
+    supported = {
+        "anthropic-native",
+        "anthropic-compat",
+        "openai-compat",
+        "executable",
+    }
+    if kind not in supported:
+        raise ValueError(f"provider {name!r} has unsupported kind: {kind!r}")
+
+    raw_extra_env = entry.get("extra_env") or {}
+    if not isinstance(raw_extra_env, Mapping):
+        raise ValueError(f"provider {name!r} field 'extra_env' must be a mapping")
+    extra_env = {str(key): str(value) for key, value in raw_extra_env.items()}
+    model_id = str(entry.get("model") or "")
+
+    if kind in {"anthropic-native", "anthropic-compat"}:
+        env: dict[str, str] = {}
+        if kind == "anthropic-native":
+            if api_key := os.environ.get("ANTHROPIC_API_KEY"):
+                env["ANTHROPIC_API_KEY"] = api_key
+                if model_id:
+                    env["ANTHROPIC_MODEL"] = model_id
+        else:
+            base_url = entry.get("base_url")
+            if not isinstance(base_url, str) or not base_url:
+                raise ValueError(f"provider {name!r} missing required field 'base_url'")
+            api_key_env = entry.get("api_key_env")
+            if not isinstance(api_key_env, str) or not api_key_env:
+                raise ValueError(f"provider {name!r} missing required field 'api_key_env'")
+            env.update(
+                {
+                    "ANTHROPIC_AUTH_TOKEN": os.environ.get(api_key_env, ""),
+                    "ANTHROPIC_BASE_URL": base_url,
+                    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+                }
+            )
+            if model_id:
+                env.update(
+                    {
+                        "ANTHROPIC_MODEL": model_id,
+                        "ANTHROPIC_SMALL_FAST_MODEL": model_id,
+                        "ANTHROPIC_DEFAULT_OPUS_MODEL": model_id,
+                        "ANTHROPIC_DEFAULT_SONNET_MODEL": model_id,
+                        "ANTHROPIC_DEFAULT_HAIKU_MODEL": model_id,
+                        "CLAUDE_CODE_SUBAGENT_MODEL": model_id,
+                    }
+                )
+        env.update(extra_env)
+        return ProviderSpec(
+            model=name,
+            command=(
+                "claude",
+                "--print",
+                "--permission-mode",
+                "bypassPermissions",
+                "--output-format",
+                "json",
+            ),
+            parse_usage=parse_claude_usage,
+            parse_cost=claude_cost,
+            parse_text=claude_result_text,
+            parse_session=claude_session_id,
+            env=env,
+        )
+
+    if kind == "openai-compat":
+        base_url = entry.get("base_url")
+        if not isinstance(base_url, str) or not base_url:
+            raise ValueError(f"provider {name!r} missing required field 'base_url'")
+        api_key_env = entry.get("api_key_env")
+        if not isinstance(api_key_env, str) or not api_key_env:
+            raise ValueError(f"provider {name!r} missing required field 'api_key_env'")
+        wrapper = mini_ork_root(root) / "lib" / "providers" / "cl_codex.sh"
+        if not wrapper.is_file():
+            raise FileNotFoundError(f"provider wrapper not found: {wrapper}")
+        env = {
+            "MO_OAI_BASE_URL": base_url,
+            "MO_OAI_ENV_KEY": api_key_env,
+        }
+        if model_id:
+            env["MO_OAI_MODEL"] = model_id
+        env.update(extra_env)
+        return ProviderSpec(
+            model=name,
+            command=(str(wrapper), "--print", "--output-format", "text"),
+            env=env,
+        )
+
+    script_value = entry.get("script")
+    if not isinstance(script_value, str) or not script_value:
+        raise ValueError(f"provider {name!r} missing required field 'script'")
+    script = Path(script_value)
+    if not script.is_absolute():
+        script = mini_ork_root(root) / script
+    if not script.is_file():
+        raise FileNotFoundError(f"provider script not found: {script}")
+    if not os.access(script, os.X_OK):
+        raise ValueError(f"provider {name!r} script is not executable: {script}")
+    return ProviderSpec(
+        model=name,
+        command=(str(script), "--print", "--output-format", "text"),
+        env=extra_env,
+    )
+
+
 def resolve_provider(
     model: str, root: str | os.PathLike[str] | None = None
 ) -> ProviderSpec:
-    """Resolve a model lane to its :class:`ProviderSpec`.
-
-    Raises ``ValueError`` for an unknown lane (we never invent a provider) and
-    ``FileNotFoundError`` if the wrapper script is missing.
-    """
-    if model not in KNOWN_MODELS:
-        raise ValueError(f"unknown model lane: {model!r}")
+    """Resolve a built-in wrapper or registry-defined model lane."""
     wrapper = mini_ork_root(root) / "lib" / "providers" / f"cl_{model}.sh"
+    if model not in KNOWN_MODELS:
+        return _resolve_from_registry(model, _load_providers_registry(root), root)
     if not wrapper.is_file():
         raise FileNotFoundError(f"provider wrapper not found: {wrapper}")
 
@@ -268,24 +409,39 @@ class LaneHealth:
 
 
 def lane_health(model: str, root: str | os.PathLike[str] | None = None) -> LaneHealth:
-    """Cheap pre-dispatch check: is this lane runnable right now? Catches the
-    common silent-death cause — a wrapper that requires an API key env var which
-    isn't set. Does NOT make a network call. Lanes with no declared key (ambient
-    auth, e.g. opus) are healthy as long as the wrapper exists."""
-    if model not in KNOWN_MODELS:
-        return LaneHealth(False, f"unknown lane: {model!r}")
-    wrapper = mini_ork_root(root) / "lib" / "providers" / f"cl_{model}.sh"
-    if not wrapper.is_file():
-        return LaneHealth(False, f"wrapper missing: {wrapper}")
+    """Cheap pre-dispatch check for wrapper and registry-defined lanes."""
+    if model in KNOWN_MODELS:
+        wrapper = mini_ork_root(root) / "lib" / "providers" / f"cl_{model}.sh"
+        if not wrapper.is_file():
+            return LaneHealth(False, f"wrapper missing: {wrapper}")
+        try:
+            text = wrapper.read_text(encoding="utf-8")
+        except OSError as exc:
+            return LaneHealth(False, f"wrapper unreadable: {exc}")
+        for match in _REQUIRED_KEY_RE.finditer(text):
+            key = match.group(1)
+            if not os.environ.get(key):
+                return LaneHealth(
+                    False, f"{model}: ${key} is not set — lane would die silently"
+                )
+        return LaneHealth(True, "ok")
+
     try:
-        text = wrapper.read_text(encoding="utf-8")
-    except OSError as exc:
-        return LaneHealth(False, f"wrapper unreadable: {exc}")
-    for match in _REQUIRED_KEY_RE.finditer(text):
-        key = match.group(1)
-        if not os.environ.get(key):
+        registry = _load_providers_registry(root)
+        _resolve_from_registry(model, registry, root)
+    except (FileNotFoundError, ValueError) as exc:
+        return LaneHealth(False, str(exc))
+
+    entry = registry[model]
+    if isinstance(entry, Mapping) and entry.get("kind") in {
+        "anthropic-compat",
+        "openai-compat",
+    }:
+        api_key_env = entry["api_key_env"]
+        if not os.environ.get(str(api_key_env)):
             return LaneHealth(
-                False, f"{model}: ${key} is not set — lane would die silently"
+                False,
+                f"{model}: ${api_key_env} is not set — lane would die silently",
             )
     return LaneHealth(True, "ok")
 
