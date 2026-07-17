@@ -1,108 +1,35 @@
-"""Parity gate: live bash vs Python port of ``refute_or_promote_gate``.
+"""Standalone unit tests for ``mini_ork.ported.refute_or_promote_gate``.
 
-For each fixture we build a synthetic findings file + fabrications file,
-invoke the LIVE ``mo_check_fabrication_survival`` bash function via
-subprocess (no mocking), then call the Python port and compare the
-resulting dict shape. Floats must match within ``1e-6``; exit codes must
-match; every key/value must match byte-stable after JSON parse.
-
-Strangler-fig invariant: ``lib/refute_or_promote_gate.sh`` is NEVER
-modified by this test (parity is enforced, not the bash itself). The
-bash subprocess sources ONLY ``lib/refute_or_promote_gate.sh`` — never
-``gates_common.sh`` — so the bash-only ``mo_grounded_rejection``
-side-effect stays inert. The harness achieves this by pointing
-``MINI_ORK_ROOT`` at an isolated tmp dir that has no
-``lib/gates_common.sh``.
+Replaces the bash-parity gate as part of the bash→Python migration: the
+Python port is now the sole implementation, so its coverage no longer runs
+``lib/refute_or_promote_gate.sh`` in a subprocess — it asserts the port's
+behaviour directly. These pin the deterministic contract the gate must keep
+(fabrication schema/formula/template, survival detection, ceiling
+comparison, dict-shape asymmetry around ``report_path``, and rc semantics)
+independent of any bash oracle.
 """
+
 from __future__ import annotations
 
 import json
 import os
-import subprocess
-import sys
 from pathlib import Path
+from typing import Any
 
-REPO = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(REPO))
-from mini_ork.ported import refute_or_promote_gate as rp  # noqa: E402
+import pytest
 
-LIB_SH = REPO / "lib" / "refute_or_promote_gate.sh"
-
-
-# --------------------------------------------------------------------------- #
-# Subprocess harness
-# --------------------------------------------------------------------------- #
-
-def _bash_check(findings: str, fabs: str, report_dir: str,
-                env_extra: dict) -> tuple[dict, int]:
-    """Run live bash ``mo_check_fabrication_survival``, return (dict, rc).
-
-    Asserts non-empty JSON stdout — bash always emits exactly one line of
-    JSON in our fixtures (no early-return branch is silent).
-    """
-    env = os.environ.copy()
-    env.update(env_extra)
-    proc = subprocess.run(
-        ["bash", "-c",
-         f'. "{LIB_SH}" && mo_check_fabrication_survival "$1" "$2" "$3"',
-         "_", findings, fabs, report_dir],
-        env=env,
-        capture_output=True,
-        text=True,
-    )
-    raw = (proc.stdout or "").strip()
-    assert raw, f"bash emitted no JSON: stderr={proc.stderr!r}"
-    parsed = json.loads(raw)
-    return parsed, proc.returncode
-
-
-def _py_check(findings: str, fabs: str, report_dir: str,
-              env_extra: dict) -> tuple[dict, int]:
-    """Run Python port with the same env knobs bash sees."""
-    saved: dict[str, str | None] = {}
-    for k, v in env_extra.items():
-        saved[k] = os.environ.get(k)
-        os.environ[k] = v
-    try:
-        d, rc = rp.check_fabrication_survival(findings, fabs, report_dir)
-    finally:
-        for k, v in saved.items():
-            if v is None:
-                os.environ.pop(k, None)
-            else:
-                os.environ[k] = v
-    return d, rc
-
-
-def _assert_parity(bash_dict: dict, py_dict: dict,
-                   bash_rc: int, py_rc: int, label: str) -> None:
-    assert bash_rc == py_rc, f"{label}: rc drift bash={bash_rc} py={py_rc}"
-    assert bash_dict == py_dict, (
-        f"{label}: dict drift\n  bash={bash_dict!r}\n  py={py_dict!r}"
-    )
-    b_rate = bash_dict.get("fp_rate")
-    p_rate = py_dict.get("fp_rate")
-    if b_rate is not None and p_rate is not None:
-        assert abs(b_rate - p_rate) < 1e-6, (
-            f"{label}: fp_rate drift bash={b_rate} py={p_rate}"
-        )
+from mini_ork.ported.refute_or_promote_gate import (
+    check_fabrication_survival,
+    generate_fabrications,
+)
 
 
 # --------------------------------------------------------------------------- #
 # Fixture helpers
 # --------------------------------------------------------------------------- #
 
-def _isolated_env(tmp_path: Path) -> dict:
-    """Harness env: ``MINI_ORK_ROOT`` must NOT have ``lib/gates_common.sh``
-    so the bash-only ``mo_grounded_rejection`` side-effect stays inert."""
-    return {"MINI_ORK_ROOT": str(tmp_path / "no_lib")}
-
-
-def _seed_fabs(path: Path, n: int) -> list[dict]:
-    """Seed fabrications via Python port (single source of truth for ids
-    both engines read). Returns the records so callers can build
-    hallucinating findings."""
-    rp.generate_fabrications(n, str(path))
+def _seed_fabs(path: Path, n: int, prefix: str | None = None) -> list[dict[str, Any]]:
+    generate_fabrications(n, str(path), prefix=prefix)
     return json.loads(path.read_text())
 
 
@@ -115,7 +42,7 @@ def _clean_findings(path: Path) -> None:
     )
 
 
-def _hallucinating_findings(path: Path, cited: list[dict]) -> None:
+def _hallucinating_findings(path: Path, cited: list[dict[str, Any]]) -> None:
     text = "## Findings\n\n"
     for x in cited:
         text += f'- {x["path"]}:{x["line"]} — {x["claim"]}\n'
@@ -124,271 +51,416 @@ def _hallucinating_findings(path: Path, cited: list[dict]) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Fixtures (>=6 per kickoff)
+# generate_fabrications — arg validation
 # --------------------------------------------------------------------------- #
 
-def test_01_clean_validator(tmp_path):
-    """5 fabrications, findings cite 0 of them → validator_grounded/0/0/rc=0."""
-    fabs = tmp_path / "fab.json"
-    findings = tmp_path / "findings.md"
-    report = tmp_path / "report"
-    report.mkdir()
-    _seed_fabs(fabs, 5)
-    _clean_findings(findings)
-    env = _isolated_env(tmp_path)
-    bd, brc = _bash_check(str(findings), str(fabs), str(report), env)
-    pd, prc = _py_check(str(findings), str(fabs), str(report), env)
-    _assert_parity(bd, pd, brc, prc, "01_clean")
-    assert brc == 0
-    assert bd["verdict"] == "validator_grounded"
-    assert bd["reason"] == "ok"
-    assert bd["fp_count"] == 0
-    assert bd["fp_total"] == 5
-    assert bd["fp_rate"] == 0.0
+class TestGenerateFabricationsValidation:
+    def test_count_zero_raises(self, tmp_path: Path):
+        with pytest.raises(ValueError):
+            generate_fabrications(0, str(tmp_path / "fab.json"))
 
+    def test_count_negative_raises(self, tmp_path: Path):
+        with pytest.raises(ValueError):
+            generate_fabrications(-3, str(tmp_path / "fab.json"))
 
-def test_02_hallucinating_3_of_5(tmp_path):
-    """Findings cite first 3 of 5 → REFUTE_FAILED / fp_rate=0.6 / rc=1."""
-    fabs = tmp_path / "fab.json"
-    findings = tmp_path / "findings.md"
-    report = tmp_path / "report"
-    report.mkdir()
-    recs = _seed_fabs(fabs, 5)
-    _hallucinating_findings(findings, recs[:3])
-    env = _isolated_env(tmp_path)
-    bd, brc = _bash_check(str(findings), str(fabs), str(report), env)
-    pd, prc = _py_check(str(findings), str(fabs), str(report), env)
-    _assert_parity(bd, pd, brc, prc, "02_hallucinating")
-    assert brc == 1
-    assert bd["verdict"] == "REFUTE_FAILED"
-    assert bd["reason"] == "high_fp_survival"
-    assert bd["fp_count"] == 3
-    assert bd["fp_total"] == 5
-    assert abs(bd["fp_rate"] - 0.6) < 1e-6
+    def test_count_non_int_raises(self, tmp_path: Path):
+        with pytest.raises(ValueError):
+            generate_fabrications("5", str(tmp_path / "fab.json"))  # type: ignore[arg-type]  # deliberate: exercise bash's non-integer rejection path
 
+    def test_count_bool_true_raises(self, tmp_path: Path):
+        # bool is a subclass of int in Python; the port explicitly rejects
+        # it so `generate_fabrications(True, ...)` cannot masquerade as
+        # count=1 (mirrors bash's `[[ "$_count" =~ ^[0-9]+$ ]]` regex gate,
+        # which only ever sees a string).
+        with pytest.raises(ValueError):
+            generate_fabrications(True, str(tmp_path / "fab.json"))  # type: ignore[arg-type]  # deliberate: exercise the bool-is-int guard
 
-def test_03_missing_findings(tmp_path):
-    """Missing findings file → indeterminate/missing_inputs/no report_path/rc=0."""
-    fabs = tmp_path / "fab.json"
-    report = tmp_path / "report"
-    report.mkdir()
-    _seed_fabs(fabs, 5)
-    missing = tmp_path / "does-not-exist.md"
-    env = _isolated_env(tmp_path)
-    bd, brc = _bash_check(str(missing), str(fabs), str(report), env)
-    pd, prc = _py_check(str(missing), str(fabs), str(report), env)
-    _assert_parity(bd, pd, brc, prc, "03_missing_findings")
-    assert brc == 0
-    assert bd["verdict"] == "indeterminate"
-    assert bd["reason"] == "missing_inputs"
-    assert "report_path" not in bd
-    assert "report_path" not in pd
-    # Rationale must match the bash printf string verbatim.
-    assert bd["rationale"] == (
-        "findings_path or fabrications_json missing; cannot measure"
-    )
-
-
-def test_04_missing_fabrications(tmp_path):
-    """Missing fabrications file → same shape as (3)."""
-    findings = tmp_path / "findings.md"
-    report = tmp_path / "report"
-    report.mkdir()
-    _clean_findings(findings)
-    missing = tmp_path / "no-fabs.json"
-    env = _isolated_env(tmp_path)
-    bd, brc = _bash_check(str(findings), str(missing), str(report), env)
-    pd, prc = _py_check(str(findings), str(missing), str(report), env)
-    _assert_parity(bd, pd, brc, prc, "04_missing_fabs")
-    assert brc == 0
-    assert bd["verdict"] == "indeterminate"
-    assert bd["reason"] == "missing_inputs"
-    assert "report_path" not in bd
-    assert "report_path" not in pd
-
-
-def test_05_empty_fabrications(tmp_path):
-    """Empty fabrications array → indeterminate/missing_inputs WITH report_path/rc=0."""
-    fabs = tmp_path / "fab.json"
-    fabs.write_text("[]")
-    findings = tmp_path / "findings.md"
-    report = tmp_path / "report"
-    report.mkdir()
-    _clean_findings(findings)
-    env = _isolated_env(tmp_path)
-    bd, brc = _bash_check(str(findings), str(fabs), str(report), env)
-    pd, prc = _py_check(str(findings), str(fabs), str(report), env)
-    _assert_parity(bd, pd, brc, prc, "05_empty_fabs")
-    assert brc == 0
-    assert bd["verdict"] == "indeterminate"
-    assert bd["reason"] == "missing_inputs"
-    assert "report_path" in bd
-    assert bd["rationale"] == "fabrications_json must be a non-empty array"
-
-
-def test_06_boundary_one_of_ten_at_default_ceiling(tmp_path):
-    """1 of 10 cited at default ceiling 0.1 — exactly at ceiling, must NOT
-    trigger (rate > ceiling is strict)."""
-    fabs = tmp_path / "fab.json"
-    findings = tmp_path / "findings.md"
-    report = tmp_path / "report"
-    report.mkdir()
-    recs = _seed_fabs(fabs, 10)
-    _hallucinating_findings(findings, recs[:1])
-    env = _isolated_env(tmp_path)
-    # Default ceiling 0.1 — leave env untouched so MO_REFUTE_FP_CEILING
-    # is unset on both engines.
-    env.pop("MO_REFUTE_FP_CEILING", None)
-    bd, brc = _bash_check(str(findings), str(fabs), str(report), env)
-    pd, prc = _py_check(str(findings), str(fabs), str(report), env)
-    _assert_parity(bd, pd, brc, prc, "06_boundary")
-    assert brc == 0
-    assert bd["verdict"] == "validator_grounded"
-    assert bd["fp_count"] == 1
-    assert bd["fp_total"] == 10
-    assert abs(bd["fp_rate"] - 0.1) < 1e-6
-    assert abs(bd["fp_ceiling"] - 0.1) < 1e-6
-
-
-def test_07_custom_ceiling_override(tmp_path):
-    """2 of 5 cited = 0.4 < 0.5 ceiling → validator_grounded."""
-    fabs = tmp_path / "fab.json"
-    findings = tmp_path / "findings.md"
-    report = tmp_path / "report"
-    report.mkdir()
-    recs = _seed_fabs(fabs, 5)
-    _hallucinating_findings(findings, recs[:2])
-    env = _isolated_env(tmp_path)
-    env["MO_REFUTE_FP_CEILING"] = "0.5"
-    bd, brc = _bash_check(str(findings), str(fabs), str(report), env)
-    pd, prc = _py_check(str(findings), str(fabs), str(report), env)
-    _assert_parity(bd, pd, brc, prc, "07_custom_ceiling")
-    assert brc == 0
-    assert bd["verdict"] == "validator_grounded"
-    assert bd["fp_count"] == 2
-    assert bd["fp_total"] == 5
-    assert abs(bd["fp_rate"] - 0.4) < 1e-6
-    assert abs(bd["fp_ceiling"] - 0.5) < 1e-6
+    def test_empty_out_path_raises(self):
+        with pytest.raises(ValueError):
+            generate_fabrications(3, "")
 
 
 # --------------------------------------------------------------------------- #
-# Generation parity — schema/formula/template, NOT exact ids (random)
+# generate_fabrications — schema / formula / template
 # --------------------------------------------------------------------------- #
 
-def test_08_generation_parity(tmp_path):
-    """Both engines generate the same schema, line formula, claim template
-    rotation, path template, and id format. Exact id strings differ
-    because ``secrets.token_hex(4)[:7]`` is per-process."""
-    py_fabs = tmp_path / "py_fabs.json"
-    bash_fabs = tmp_path / "bash_fabs.json"
+class TestGenerateFabricationsSchema:
+    def test_writes_expected_count(self, tmp_path: Path):
+        recs = _seed_fabs(tmp_path / "fab.json", 5)
+        assert len(recs) == 5
 
-    rp.generate_fabrications(5, str(py_fabs))
+    def test_schema_keys(self, tmp_path: Path):
+        recs = _seed_fabs(tmp_path / "fab.json", 3)
+        for rec in recs:
+            assert set(rec.keys()) == {"id", "path", "line", "claim"}
 
-    env = os.environ.copy()
-    env["MINI_ORK_ROOT"] = str(tmp_path / "no_lib")
-    proc = subprocess.run(
-        ["bash", "-c",
-         f'. "{LIB_SH}" && mo_generate_fabrications 5 "$1"',
-         "_", str(bash_fabs)],
-        env=env,
-        capture_output=True,
-        text=True,
-    )
-    assert proc.returncode == 0, (
-        f"bash generation failed rc={proc.returncode} stderr={proc.stderr}"
-    )
+    def test_line_formula(self, tmp_path: Path):
+        recs = _seed_fabs(tmp_path / "fab.json", 5)
+        for i, rec in enumerate(recs):
+            assert rec["line"] == 30 + (i * 11) % 200
 
-    py_records = json.loads(py_fabs.read_text())
-    bash_records = json.loads(bash_fabs.read_text())
+    def test_path_template(self, tmp_path: Path):
+        recs = _seed_fabs(tmp_path / "fab.json", 5)
+        for rec in recs:
+            assert rec["path"] == f"src/{rec['id']}/handler.ts"
 
-    assert len(py_records) == len(bash_records) == 5
+    def test_default_prefix_and_id_format(self, tmp_path: Path):
+        recs = _seed_fabs(tmp_path / "fab.json", 4)
+        for rec in recs:
+            assert rec["id"].startswith("__fabricated_")
+            suffix = rec["id"][len("__fabricated_"):]
+            assert len(suffix) == 7
+            int(suffix, 16)  # valid hex
 
-    # Schema
-    expected_keys = {"id", "path", "line", "claim"}
-    assert set(py_records[0].keys()) == expected_keys
-    assert set(bash_records[0].keys()) == expected_keys
+    def test_custom_prefix(self, tmp_path: Path):
+        recs = _seed_fabs(tmp_path / "fab.json", 2, prefix="__custom_")
+        for rec in recs:
+            assert rec["id"].startswith("__custom_")
+            assert not rec["id"].startswith("__fabricated_")
 
-    # Claim template rotation — strip per-record id, compare templates
-    for i in range(5):
-        py_t = py_records[i]["claim"].replace(py_records[i]["id"], "{id}")
-        bash_t = bash_records[i]["claim"].replace(bash_records[i]["id"], "{id}")
-        assert py_t == bash_t, (
-            f"claim template drift at i={i}: py={py_t!r} bash={bash_t!r}"
+    def test_prefix_from_env(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setenv("MO_REFUTE_PREFIX", "__envprefix_")
+        recs = _seed_fabs(tmp_path / "fab.json", 2)
+        for rec in recs:
+            assert rec["id"].startswith("__envprefix_")
+
+    def test_claim_template_rotation(self, tmp_path: Path):
+        # 10 templates rotate by index; id=6 records covers 6 distinct
+        # templates and confirms each claim fills in its own id.
+        recs = _seed_fabs(tmp_path / "fab.json", 6)
+        for rec in recs:
+            assert rec["id"] in rec["claim"]
+
+    def test_ids_are_unique(self, tmp_path: Path):
+        recs = _seed_fabs(tmp_path / "fab.json", 20)
+        ids = [r["id"] for r in recs]
+        assert len(ids) == len(set(ids))
+
+    def test_creates_parent_dirs(self, tmp_path: Path):
+        out = tmp_path / "nested" / "dir" / "fab.json"
+        generate_fabrications(2, str(out))
+        assert out.is_file()
+        assert len(json.loads(out.read_text())) == 2
+
+    def test_output_ends_with_trailing_newline(self, tmp_path: Path):
+        out = tmp_path / "fab.json"
+        generate_fabrications(1, str(out))
+        assert out.read_text().endswith("\n")
+
+
+# --------------------------------------------------------------------------- #
+# check_fabrication_survival — core verdicts
+# --------------------------------------------------------------------------- #
+
+class TestCheckFabricationSurvival:
+    def test_clean_validator_grounded(self, tmp_path: Path):
+        fabs = tmp_path / "fab.json"
+        findings = tmp_path / "findings.md"
+        report_dir = tmp_path / "report"
+        report_dir.mkdir()
+        _seed_fabs(fabs, 5)
+        _clean_findings(findings)
+
+        d, rc = check_fabrication_survival(str(findings), str(fabs), str(report_dir))
+
+        assert rc == 0
+        assert d["verdict"] == "validator_grounded"
+        assert d["reason"] == "ok"
+        assert d["fp_count"] == 0
+        assert d["fp_total"] == 5
+        assert d["fp_rate"] == 0.0
+        assert d["fp_ceiling"] == pytest.approx(0.1)
+        assert d["report_path"] == str(report_dir / "refute-survival.tsv")
+        assert Path(d["report_path"]).is_file()
+
+    def test_hallucinating_3_of_5_refute_failed(self, tmp_path: Path):
+        fabs = tmp_path / "fab.json"
+        findings = tmp_path / "findings.md"
+        report_dir = tmp_path / "report"
+        report_dir.mkdir()
+        recs = _seed_fabs(fabs, 5)
+        _hallucinating_findings(findings, recs[:3])
+
+        d, rc = check_fabrication_survival(str(findings), str(fabs), str(report_dir))
+
+        assert rc == 1
+        assert d["verdict"] == "REFUTE_FAILED"
+        assert d["reason"] == "high_fp_survival"
+        assert d["fp_count"] == 3
+        assert d["fp_total"] == 5
+        assert d["fp_rate"] == pytest.approx(0.6)
+        assert "validator promoted 3 of 5 fabricated findings" in d["rationale"]
+
+    def test_missing_findings_indeterminate_no_report_path(self, tmp_path: Path):
+        fabs = tmp_path / "fab.json"
+        report_dir = tmp_path / "report"
+        report_dir.mkdir()
+        _seed_fabs(fabs, 5)
+        missing = tmp_path / "does-not-exist.md"
+
+        d, rc = check_fabrication_survival(str(missing), str(fabs), str(report_dir))
+
+        assert rc == 0
+        assert d["verdict"] == "indeterminate"
+        assert d["reason"] == "missing_inputs"
+        assert "report_path" not in d
+        assert d["rationale"] == (
+            "findings_path or fabrications_json missing; cannot measure"
         )
 
-    # Line formula — 30 + (i * 11) % 200
-    for i in range(5):
-        expected = 30 + (i * 11) % 200
-        assert py_records[i]["line"] == expected, (
-            f"py line drift at i={i}: got {py_records[i]['line']}"
-        )
-        assert bash_records[i]["line"] == expected, (
-            f"bash line drift at i={i}: got {bash_records[i]['line']}"
+    def test_missing_fabrications_indeterminate_no_report_path(self, tmp_path: Path):
+        findings = tmp_path / "findings.md"
+        report_dir = tmp_path / "report"
+        report_dir.mkdir()
+        _clean_findings(findings)
+        missing = tmp_path / "no-fabs.json"
+
+        d, rc = check_fabrication_survival(str(findings), str(missing), str(report_dir))
+
+        assert rc == 0
+        assert d["verdict"] == "indeterminate"
+        assert d["reason"] == "missing_inputs"
+        assert "report_path" not in d
+
+    def test_empty_findings_path_indeterminate(self, tmp_path: Path):
+        fabs = tmp_path / "fab.json"
+        report_dir = tmp_path / "report"
+        report_dir.mkdir()
+        _seed_fabs(fabs, 5)
+
+        d, rc = check_fabrication_survival("", str(fabs), str(report_dir))
+
+        assert rc == 0
+        assert d["verdict"] == "indeterminate"
+        assert "report_path" not in d
+
+    def test_empty_fabrications_json_path_indeterminate(self, tmp_path: Path):
+        findings = tmp_path / "findings.md"
+        report_dir = tmp_path / "report"
+        report_dir.mkdir()
+        _clean_findings(findings)
+
+        d, rc = check_fabrication_survival(str(findings), "", str(report_dir))
+
+        assert rc == 0
+        assert d["verdict"] == "indeterminate"
+        assert "report_path" not in d
+
+    def test_empty_fabrications_array_indeterminate_with_report_path(self, tmp_path: Path):
+        fabs = tmp_path / "fab.json"
+        fabs.write_text("[]")
+        findings = tmp_path / "findings.md"
+        report_dir = tmp_path / "report"
+        report_dir.mkdir()
+        _clean_findings(findings)
+
+        d, rc = check_fabrication_survival(str(findings), str(fabs), str(report_dir))
+
+        assert rc == 0
+        assert d["verdict"] == "indeterminate"
+        assert d["reason"] == "missing_inputs"
+        assert "report_path" in d
+        assert d["rationale"] == "fabrications_json must be a non-empty array"
+
+    def test_fabrications_json_not_a_list_indeterminate_with_report_path(self, tmp_path: Path):
+        fabs = tmp_path / "fab.json"
+        fabs.write_text(json.dumps({"not": "a list"}))
+        findings = tmp_path / "findings.md"
+        report_dir = tmp_path / "report"
+        report_dir.mkdir()
+        _clean_findings(findings)
+
+        d, rc = check_fabrication_survival(str(findings), str(fabs), str(report_dir))
+
+        assert rc == 0
+        assert d["verdict"] == "indeterminate"
+        assert "report_path" in d
+        assert d["rationale"] == "fabrications_json must be a non-empty array"
+
+    def test_malformed_fabrications_json_indeterminate_with_report_path(self, tmp_path: Path):
+        fabs = tmp_path / "fab.json"
+        fabs.write_text("{not valid json")
+        findings = tmp_path / "findings.md"
+        report_dir = tmp_path / "report"
+        report_dir.mkdir()
+        _clean_findings(findings)
+
+        d, rc = check_fabrication_survival(str(findings), str(fabs), str(report_dir))
+
+        assert rc == 0
+        assert d["verdict"] == "indeterminate"
+        assert d["reason"] == "missing_inputs"
+        assert "report_path" in d
+        assert "fabrications_json unreadable" in d["rationale"]
+
+    def test_non_dict_and_no_id_fabrication_entries_are_skipped(self, tmp_path: Path):
+        fabs = tmp_path / "fab.json"
+        fabs.write_text(json.dumps([
+            "not-a-dict",
+            {"path": "src/x/handler.ts", "line": 1, "claim": "no id here"},
+            {"id": "", "path": "src/y/handler.ts", "line": 2, "claim": "empty id"},
+            {"id": "__fabricated_real01", "path": "src/z/handler.ts", "line": 3,
+             "claim": "has __fabricated_real01 in it"},
+        ]))
+        findings = tmp_path / "findings.md"
+        findings.write_text("cites __fabricated_real01 as if real")
+        report_dir = tmp_path / "report"
+        report_dir.mkdir()
+
+        d, rc = check_fabrication_survival(str(findings), str(fabs), str(report_dir))
+
+        assert rc == 1
+        assert d["verdict"] == "REFUTE_FAILED"
+        assert d["fp_total"] == 1  # only the entry with a truthy id counts
+        assert d["fp_count"] == 1
+        assert d["fp_rate"] == pytest.approx(1.0)
+
+    def test_boundary_rate_equals_ceiling_does_not_trigger(self, tmp_path: Path):
+        fabs = tmp_path / "fab.json"
+        findings = tmp_path / "findings.md"
+        report_dir = tmp_path / "report"
+        report_dir.mkdir()
+        recs = _seed_fabs(fabs, 10)
+        _hallucinating_findings(findings, recs[:1])  # 1/10 == default ceiling 0.1
+
+        d, rc = check_fabrication_survival(str(findings), str(fabs), str(report_dir))
+
+        assert rc == 0
+        assert d["verdict"] == "validator_grounded"
+        assert d["fp_count"] == 1
+        assert d["fp_total"] == 10
+        assert d["fp_rate"] == pytest.approx(0.1)
+        assert d["fp_ceiling"] == pytest.approx(0.1)
+
+    def test_custom_ceiling_kwarg_override(self, tmp_path: Path):
+        fabs = tmp_path / "fab.json"
+        findings = tmp_path / "findings.md"
+        report_dir = tmp_path / "report"
+        report_dir.mkdir()
+        recs = _seed_fabs(fabs, 5)
+        _hallucinating_findings(findings, recs[:2])  # 2/5 = 0.4
+
+        d, rc = check_fabrication_survival(
+            str(findings), str(fabs), str(report_dir), ceiling=0.5
         )
 
-    # Path template — src/<id>/handler.ts
-    for i in range(5):
-        assert py_records[i]["path"] == f"src/{py_records[i]['id']}/handler.ts"
-        assert bash_records[i]["path"] == f"src/{bash_records[i]['id']}/handler.ts"
+        assert rc == 0
+        assert d["verdict"] == "validator_grounded"
+        assert d["fp_count"] == 2
+        assert d["fp_total"] == 5
+        assert d["fp_rate"] == pytest.approx(0.4)
+        assert d["fp_ceiling"] == pytest.approx(0.5)
 
-    # Id format — prefix + 7 hex chars
-    for rec in py_records + bash_records:
-        assert rec["id"].startswith("__fabricated_")
-        suffix = rec["id"][len("__fabricated_"):]
-        assert len(suffix) == 7, f"id suffix wrong length: {rec['id']!r}"
-        int(suffix, 16)  # valid hex
+    def test_ceiling_from_env_when_kwarg_omitted(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        monkeypatch.setenv("MO_REFUTE_FP_CEILING", "0.5")
+        fabs = tmp_path / "fab.json"
+        findings = tmp_path / "findings.md"
+        report_dir = tmp_path / "report"
+        report_dir.mkdir()
+        recs = _seed_fabs(fabs, 5)
+        _hallucinating_findings(findings, recs[:2])  # 2/5 = 0.4 < 0.5
+
+        d, rc = check_fabrication_survival(str(findings), str(fabs), str(report_dir))
+
+        assert rc == 0
+        assert d["verdict"] == "validator_grounded"
+        assert d["fp_ceiling"] == pytest.approx(0.5)
+
+    def test_report_dir_from_env_when_omitted(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        monkeypatch.chdir(tmp_path)
+        run_dir = tmp_path / "run_dir"
+        monkeypatch.setenv("MINI_ORK_RUN_DIR", str(run_dir))
+        fabs = tmp_path / "fab.json"
+        findings = tmp_path / "findings.md"
+        _seed_fabs(fabs, 3)
+        _clean_findings(findings)
+
+        d, rc = check_fabrication_survival(str(findings), str(fabs))
+
+        assert rc == 0
+        assert d["report_path"] == str(run_dir / "refute-survival.tsv")
+        assert (run_dir / "refute-survival.tsv").is_file()
+
+    def test_report_dir_defaults_to_dot_when_no_env(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.delenv("MINI_ORK_RUN_DIR", raising=False)
+        fabs = tmp_path / "fab.json"
+        findings = tmp_path / "findings.md"
+        _seed_fabs(fabs, 3)
+        _clean_findings(findings)
+
+        d, rc = check_fabrication_survival(str(findings), str(fabs))
+
+        assert rc == 0
+        assert d["report_path"] == os.path.join(".", "refute-survival.tsv")
+        assert (tmp_path / "refute-survival.tsv").is_file()
+
+    def test_report_tsv_content_marks_survived_and_not_survived(self, tmp_path: Path):
+        fabs = tmp_path / "fab.json"
+        findings = tmp_path / "findings.md"
+        report_dir = tmp_path / "report"
+        report_dir.mkdir()
+        recs = _seed_fabs(fabs, 3)
+        _hallucinating_findings(findings, recs[:1])
+
+        d, _rc = check_fabrication_survival(str(findings), str(fabs), str(report_dir))
+
+        report_path = d["report_path"]
+        lines = Path(report_path).read_text().splitlines()
+        assert lines[0] == "id\tpath\tline\tsurvived"
+        assert len(lines) == 1 + len(recs)
+        survived_row = next(ln for ln in lines[1:] if ln.startswith(recs[0]["id"]))
+        assert survived_row.endswith("\tyes")
+        for rec in recs[1:]:
+            row = next(ln for ln in lines[1:] if ln.startswith(rec["id"]))
+            assert row.endswith("\tno")
+
+    def test_fp_rate_is_rounded_to_4_digits(self, tmp_path: Path):
+        fabs = tmp_path / "fab.json"
+        findings = tmp_path / "findings.md"
+        report_dir = tmp_path / "report"
+        report_dir.mkdir()
+        recs = _seed_fabs(fabs, 3)  # 1/3 = 0.333333...
+        _hallucinating_findings(findings, recs[:1])
+
+        d, _rc = check_fabrication_survival(
+            str(findings), str(fabs), str(report_dir), ceiling=0.9
+        )
+
+        assert d["fp_rate"] == round(1 / 3, 4)
 
 
 # --------------------------------------------------------------------------- #
-# Strangler-fig + import smoke
+# Smoke: pure import + arg-validation without any filesystem fixtures
 # --------------------------------------------------------------------------- #
 
-def test_bash_untouched():
-    """Strangler-fig: bash source must remain byte-identical."""
-    proc = subprocess.run(
-        ["git", "diff", "--stat", "lib/refute_or_promote_gate.sh"],
-        cwd=str(REPO),
-        capture_output=True,
-        text=True,
-    )
-    assert proc.stdout.strip() == "", (
-        f"bash was modified:\n{proc.stdout}\n{proc.stderr}"
-    )
+class TestImportAndValidationSmoke:
+    def test_generate_fabrications_count_zero_raises(self):
+        with pytest.raises(ValueError):
+            generate_fabrications(0, "/tmp/foo.json")
 
+    def test_generate_fabrications_negative_count_raises(self):
+        with pytest.raises(ValueError):
+            generate_fabrications(-3, "/tmp/foo.json")
 
-def test_import_and_validation():
-    """Smoke: pure import + arg-validation without subprocess."""
-    # count<1 raises ValueError
-    try:
-        rp.generate_fabrications(0, str("/tmp/foo.json"))
-    except ValueError:
-        pass
-    else:
-        raise AssertionError("expected ValueError for count=0")
+    def test_generate_fabrications_empty_out_path_raises(self):
+        with pytest.raises(ValueError):
+            generate_fabrications(3, "")
 
-    # negative count raises ValueError
-    try:
-        rp.generate_fabrications(-3, str("/tmp/foo.json"))
-    except ValueError:
-        pass
-    else:
-        raise AssertionError("expected ValueError for negative count")
+    def test_check_fabrication_survival_missing_inputs_shape(self):
+        d, rc = check_fabrication_survival("/no/such/file.md", "/no/such/fabs.json")
 
-    # empty out_path raises ValueError
-    try:
-        rp.generate_fabrications(3, "")
-    except ValueError:
-        pass
-    else:
-        raise AssertionError("expected ValueError for empty out_path")
-
-    # check_fabrication_survival smoke on missing inputs
-    d, rc = rp.check_fabrication_survival("/no/such/file.md", "/no/such/fabs.json")
-    assert rc == 0
-    assert d["verdict"] == "indeterminate"
-    assert d["reason"] == "missing_inputs"
-    assert "report_path" not in d
-    assert set(d.keys()) == {
-        "verdict", "reason", "fp_count", "fp_total",
-        "fp_rate", "fp_ceiling", "rationale",
-    }
+        assert rc == 0
+        assert d["verdict"] == "indeterminate"
+        assert d["reason"] == "missing_inputs"
+        assert "report_path" not in d
+        assert set(d.keys()) == {
+            "verdict", "reason", "fp_count", "fp_total",
+            "fp_rate", "fp_ceiling", "rationale",
+        }
