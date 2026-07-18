@@ -1,154 +1,169 @@
-"""Parity gate: mini_ork.ported.profile_gate vs lib/profile_gate.sh.
+"""Standalone unit tests for ``mini_ork.ported.profile_gate``.
 
-Each case invokes the LIVE bash function via subprocess (no mocking) and
-compares stdout + file side-effect against the Python port.
-Bash source at lib/profile_gate.sh is unmodified (strangler-fig coexistence).
+Replaces the bash-parity gate (against ``lib/profile_gate.sh``) as part of
+the bash→Python migration: the Python port is now the sole implementation,
+so its coverage no longer runs ``lib/profile_gate.sh`` in a subprocess — it
+asserts the port's behaviour directly. These pin the same contract exercised
+by the bash unit test (``tests/unit/test_profile_gate_zero_questions.sh``):
+normalizing the "needs_answers with ZERO human_questions" contradiction to
+"ready", while leaving every other case untouched.
+
+File I/O is scoped to pytest's ``tmp_path`` fixture (no production paths, no
+env vars, no sqlite) so each test is fully isolated.
 """
+
 from __future__ import annotations
 
 import json
-import os
-import subprocess
-import sys
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(REPO))
-from mini_ork.ported import profile_gate as pg  # noqa: E402
+from mini_ork.ported.profile_gate import normalize_zero_questions
 
-PG_SH = REPO / "lib" / "profile_gate.sh"
+_MARKER = "needs_answers->ready (0 questions: nothing to answer)"
 
 
-def _bash_echo(profile_path: str) -> str:
-    """Invoke the live bash function on a file; return stripped stdout."""
-    r = subprocess.run(
-        ["bash", "-c",
-         f'. "{PG_SH}" && mo_profile_normalize_zero_questions "$1"',
-         "_", profile_path],
-        env={**os.environ, "MINI_ORK_ROOT": str(REPO)},
-        capture_output=True, text=True, check=True)
-    return r.stdout.strip()
-
-
-def _bytes(path: str) -> bytes:
-    with open(path, "rb") as f:
-        return f.read()
-
-
-def _write(path: Path, body: dict | str) -> str:
+def _write(path: Path, body: dict | str) -> Path:
     if isinstance(body, str):
-        path.write_text(body)
+        path.write_text(body, encoding="utf-8")
     else:
-        path.write_text(json.dumps(body))
-    return str(path)
+        path.write_text(json.dumps(body), encoding="utf-8")
+    return path
 
 
-def _run_pair(input_body: dict | str, py_dest: Path, bash_dest: Path) -> tuple[str, str, bytes, bytes]:
-    """Write the same `input_body` to two fresh paths and run Python on one,
-    bash on the other. Returns (out_py, out_bash, py_bytes, bash_bytes)."""
-    _write(py_dest, input_body)
-    _write(bash_dest, input_body)
-    out_py = pg.normalize_zero_questions(str(py_dest))
-    out_bash = _bash_echo(str(bash_dest))
-    return out_py, out_bash, _bytes(str(py_dest)), _bytes(str(bash_dest))
+class TestNeedsAnswersZeroQuestions:
+    """Case 1 (dedicated bash test) — the core bug fix."""
 
+    def test_normalizes_to_ready_and_rewrites_file(self, tmp_path):
+        p = _write(tmp_path / "p1.json", {
+            "profile_status": "needs_answers", "human_questions": [],
+            "confidence": 0.9, "recipe": "code_fix",
+        })
+        out = normalize_zero_questions(str(p))
 
-# ---------- parity cases ----------
+        assert out == "ready"
+        j = json.loads(p.read_text(encoding="utf-8"))
+        assert j["profile_status"] == "ready"
+        assert j["human_questions"] == []
+        assert j["profile_status_normalized"] == _MARKER
+        assert j["confidence"] == 0.9  # gate stays independent of confidence floor
 
-def test_needs_answers_zero_questions_normalizes_parity(tmp_path):
-    """Case 1: needs_answers + [] → echo 'ready', file rewritten with marker."""
-    body = {"profile_status": "needs_answers", "human_questions": [],
-            "confidence": 0.9, "recipe": "code_fix"}
-    out_py, out_bash, py_b, bash_b = _run_pair(
-        body, tmp_path / "p1_py.json", tmp_path / "p1_bash.json")
-
-    assert out_py == out_bash == "ready"
-    assert py_b == bash_b  # both rewrites byte-identical
-    j = json.loads(py_b)
-    assert j["profile_status"] == "ready"
-    assert j["profile_status_normalized"] == "needs_answers->ready (0 questions: nothing to answer)"
-
-
-def test_needs_answers_real_questions_unchanged_parity(tmp_path):
-    """Case 2: needs_answers + non-empty questions → echo 'needs_answers'; file untouched."""
-    body = {"profile_status": "needs_answers",
-            "human_questions": ["What is the target repo?"], "confidence": 0.4}
-    out_py, out_bash, py_b, bash_b = _run_pair(
-        body, tmp_path / "p2_py.json", tmp_path / "p2_bash.json")
-
-    assert out_py == out_bash == "needs_answers"
-    assert py_b == bash_b == json.dumps(body).encode()  # both sides wrote nothing
-
-
-def test_already_ready_unchanged_parity(tmp_path):
-    """Case 3: already ready → echo 'ready', file untouched."""
-    body = {"profile_status": "ready", "human_questions": [], "confidence": 1.0}
-    out_py, out_bash, py_b, bash_b = _run_pair(
-        body, tmp_path / "p3_py.json", tmp_path / "p3_bash.json")
-
-    assert out_py == out_bash == "ready"
-    assert py_b == bash_b == json.dumps(body).encode()
-
-
-def test_missing_path_empty_echo_parity(tmp_path):
-    """Case 4: missing path → both echo '', no file written."""
-    bogus = str(tmp_path / "does-not-exist.json")
-    assert not os.path.exists(bogus)
-
-    out_py = pg.normalize_zero_questions(bogus)
-    out_bash = _bash_echo(bogus)
-
-    assert out_py == out_bash == ""
-    assert not os.path.exists(bogus)
-
-
-def test_malformed_json_empty_echo_untouched_parity(tmp_path):
-    """Case 5: malformed JSON → both echo '', file untouched."""
-    bad = "{not json"
-
-    py_path = _write(tmp_path / "mal_py.json", bad)
-    py_bytes_before = _bytes(py_path)
-    out_py = pg.normalize_zero_questions(py_path)
-
-    bash_path = _write(tmp_path / "mal_bash.json", bad)
-    out_bash = _bash_echo(bash_path)
-
-    assert out_py == out_bash == ""
-    assert _bytes(py_path) == py_bytes_before == bad.encode()
-    assert _bytes(bash_path) == bad.encode()
-
-
-def test_needs_answers_with_confidence_and_extras_preserved_parity(tmp_path):
-    """Case 6: needs_answers + many keys → echo 'ready'; confidence + extras preserved.
-    Both sides get a fresh input; both rewrite; bytes must be identical."""
-    body = {"profile_status": "needs_answers", "human_questions": [],
+    def test_preserves_confidence_and_extra_keys(self, tmp_path):
+        p = _write(tmp_path / "p6.json", {
+            "profile_status": "needs_answers", "human_questions": [],
             "confidence": 0.42, "recipe": "code_fix", "task_class": "code_fix",
             "target_repo": "mo-wt-profile_gate", "success_criteria": ["parity"],
-            "scope_allow": ["*.py"], "scope_deny": ["lib/profile_gate.sh"]}
-    out_py, out_bash, py_b, bash_b = _run_pair(
-        body, tmp_path / "p6_py.json", tmp_path / "p6_bash.json")
+            "scope_allow": ["*.py"], "scope_deny": ["lib/profile_gate.sh"],
+        })
+        out = normalize_zero_questions(str(p))
 
-    assert out_py == out_bash == "ready"
-    assert py_b == bash_b  # byte-identical rewrite is the strongest key-preservation proof
-    j = json.loads(py_b)
-    assert j["confidence"] == 0.42
-    assert j["recipe"] == "code_fix"
-    assert j["target_repo"] == "mo-wt-profile_gate"
-
-
-def test_ready_with_nonempty_questions_passthrough_parity(tmp_path):
-    """Case 7: ready + non-empty questions → echo 'ready', file untouched (passthrough)."""
-    body = {"profile_status": "ready",
-            "human_questions": ["documentation-only flag remains?"], "confidence": 0.7}
-    out_py, out_bash, py_b, bash_b = _run_pair(
-        body, tmp_path / "p7_py.json", tmp_path / "p7_bash.json")
-
-    assert out_py == out_bash == "ready"
-    assert py_b == bash_b == json.dumps(body).encode()
+        assert out == "ready"
+        j = json.loads(p.read_text(encoding="utf-8"))
+        assert j["confidence"] == 0.42
+        assert j["recipe"] == "code_fix"
+        assert j["task_class"] == "code_fix"
+        assert j["target_repo"] == "mo-wt-profile_gate"
+        assert j["success_criteria"] == ["parity"]
+        assert j["scope_allow"] == ["*.py"]
+        assert j["scope_deny"] == ["lib/profile_gate.sh"]
 
 
-def test_empty_path_string_empty_echo_parity():
-    """Case 8 (edge): empty string path → both echo ''."""
-    out_py = pg.normalize_zero_questions("")
-    out_bash = _bash_echo("")
-    assert out_py == out_bash == ""
+class TestNeedsAnswersRealQuestions:
+    """Case 2 (dedicated bash test) — a legitimate block must stay blocked."""
+
+    def test_unchanged_when_questions_present(self, tmp_path):
+        body = {
+            "profile_status": "needs_answers",
+            "human_questions": ["What is the target repo?"],
+            "confidence": 0.4,
+        }
+        p = _write(tmp_path / "p2.json", body)
+        before = p.read_bytes()
+
+        out = normalize_zero_questions(str(p))
+
+        assert out == "needs_answers"
+        assert p.read_bytes() == before  # file untouched
+
+
+class TestAlreadyReady:
+    """Case 3 (dedicated bash test) — idempotence on an already-ready profile."""
+
+    def test_ready_with_no_questions_unchanged(self, tmp_path):
+        body = {"profile_status": "ready", "human_questions": [], "confidence": 1.0}
+        p = _write(tmp_path / "p3.json", body)
+        before = p.read_bytes()
+
+        out = normalize_zero_questions(str(p))
+
+        assert out == "ready"
+        assert p.read_bytes() == before
+
+    def test_ready_with_nonempty_questions_passthrough(self, tmp_path):
+        body = {
+            "profile_status": "ready",
+            "human_questions": ["documentation-only flag remains?"],
+            "confidence": 0.7,
+        }
+        p = _write(tmp_path / "p7.json", body)
+        before = p.read_bytes()
+
+        out = normalize_zero_questions(str(p))
+
+        assert out == "ready"
+        assert p.read_bytes() == before
+
+
+class TestMissingOrEmptyPath:
+    """Case 4 (dedicated bash test) — missing path is a safe no-op."""
+
+    def test_missing_path_returns_empty_and_creates_nothing(self, tmp_path):
+        bogus = tmp_path / "does-not-exist.json"
+        assert not bogus.exists()
+
+        out = normalize_zero_questions(str(bogus))
+
+        assert out == ""
+        assert not bogus.exists()
+
+    def test_empty_string_path_returns_empty(self):
+        assert normalize_zero_questions("") == ""
+
+
+class TestMalformedJson:
+    def test_malformed_json_returns_empty_and_file_untouched(self, tmp_path):
+        bad = "{not json"
+        p = _write(tmp_path / "mal.json", bad)
+        before = p.read_bytes()
+
+        out = normalize_zero_questions(str(p))
+
+        assert out == ""
+        assert p.read_bytes() == before == bad.encode("utf-8")
+
+
+class TestStatusCoercion:
+    """profile_status is coerced via ``str(x or "")`` — missing/None-valued
+    keys must not be misread as a truthy 'needs_answers' match."""
+
+    def test_missing_profile_status_key_treated_as_empty(self, tmp_path):
+        p = _write(tmp_path / "p8.json", {"human_questions": []})
+        out = normalize_zero_questions(str(p))
+        assert out == ""
+
+    def test_null_profile_status_returns_empty(self, tmp_path):
+        p = _write(tmp_path / "p9.json", {
+            "profile_status": None, "human_questions": [],
+        })
+        out = normalize_zero_questions(str(p))
+        assert out == ""
+
+    def test_missing_human_questions_key_treated_as_empty_list(self, tmp_path):
+        # No `human_questions` key at all -> `.get(...) or []` -> [] -> normalizes.
+        p = _write(tmp_path / "p10.json", {
+            "profile_status": "needs_answers", "confidence": 0.5,
+        })
+        out = normalize_zero_questions(str(p))
+        assert out == "ready"
+        j = json.loads(p.read_text(encoding="utf-8"))
+        assert j["human_questions"] == []
+        assert j["profile_status_normalized"] == _MARKER

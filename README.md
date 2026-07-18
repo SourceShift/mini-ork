@@ -215,7 +215,7 @@ Cost guard: `MO_DAILY_BUDGET_USD` ($50 default) is enforced inside the dispatche
 
 Shipped totals (regenerable via `scripts/readme-claim-check.sh`):
 
-- **92 framework primitives** in `lib/` (lifecycle + memory + gates + agent registry + runtime + observability + the 4 calibration-list gates + HarnessBridge stack + live control plane + per-run config isolation + `lib/migrate.sh` checksummed transactional DB migrations + `lib/runtime-select.sh` bash→Python runtime cutover switch + `lib/apply.sh` learn→apply loop).
+- **77 framework primitives** in `lib/` (shrinking as the bash→Python migration retires libs whose Python ports are the sole impl — see [docs/migration/python-migration-completion-plan.md](docs/migration/python-migration-completion-plan.md)): lifecycle + memory + gates + agent registry + runtime + observability + the 4 calibration-list gates + HarnessBridge stack + live control plane + per-run config isolation + `lib/migrate.sh` checksummed transactional DB migrations + `lib/runtime-select.sh` bash→Python runtime cutover switch + `lib/apply.sh` learn→apply loop.
 - **37 user-facing `bin/mini-ork` entrypoints** (the `mini-ork` dispatcher + the 6-stage loop + `eval` / `improve` / `promote` / `apply` / `metrics` / `spawn` / `epics` / `scheduler` / `review` / `bugs` / `lifetime` / `coord` / `usage-report` / `watchdog` / `conductor` and friends).
 - **55 schema migrations** under `db/migrations/` (memory namespaces, execution traces, gradients, panel topology, recursive orchestration, llm_calls, lifecycle widening, error taxonomy, heartbeat, agent performance, epic + bug + pre-push review tables, HarnessBridge grounded-rejections, run-artifacts trajectory store, apply-attempts audit table, lane-advantage variance + single-sample baseline).
 - **28 recipes** shipped — see [Recipes table](#recipes) above.
@@ -226,6 +226,16 @@ Shipped totals (regenerable via `scripts/readme-claim-check.sh`):
 ## Recursive self-improvement evidence
 
 The `recursive-self-improve` recipe ran against mini-ork itself for ~5 wall-clock hours, producing **10 autonomous commits to `main`** — each grounded in cited arXiv evidence per the recipe's "new infra requires arXiv evidence" hard rule. Audit trail: `self_improve_runs`, `learning_record`, `self_improve_arxiv_refs` tables in `state.db`. The first three patches were emergent — the loop found the bugs by reading its own prior run logs. See [docs/RECURSIVE-SELF-IMPROVE.md](docs/RECURSIVE-SELF-IMPROVE.md) for the operator guide.
+
+---
+
+## Part of the mini-ork stack
+
+mini-ork is the orchestration brain of a small self-improving stack — each piece stands alone and compounds together:
+
+- **[ContextNest](https://github.com/SourceShift/ContextNest)** — cross-session memory substrate. mini-ork records what each run decided, tried, and verified; the next run starts with that context instead of a blank slate.
+- **[TraceOtter](https://github.com/SourceShift/TraceOtter)** — distills mini-ork run trajectories into a small local model, so routing gets cheaper and smarter over time.
+- **[coevolve](https://github.com/SourceShift/coevolve)** — an extensible CLI/TUI over mini-ork + ContextNest + TraceOtter for driving the whole loop from one surface.
 
 ---
 
