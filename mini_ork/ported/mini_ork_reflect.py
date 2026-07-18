@@ -371,22 +371,24 @@ def main(argv: list[str] | None = None) -> int:
         sys.stdout.write(f"  [cross_epic_gradient] promoted {cross_written or 0} cross-class gradients\n")
 
     # ── side-channel: bug_report (MO_BUG_REPORT_SWEEP) ──────────────────────
+    # Native: bug_report_sweep()/bug_report_promote() reimplement the bash lib in-
+    # process (both return-only, no stdout to capture). sweep resolves the db from
+    # MINI_ORK_DB (set above) and the runs dir from `home`; promote's repo_root=None
+    # falls back to $MINI_ORK_ROOT — matching the bash _bash_lib_call env. try/except
+    # mirrors `|| echo 0`.
     if os.environ.get("MO_BUG_REPORT_SWEEP", "1") != "0":
-        bugs_swept = _bash_lib_call(
-            "bug_report",
-            "bug_report_sweep",
-            f"--since {since}",
-            subprocess_env,
-        )
+        from mini_ork.ported import bug_report
+        try:
+            bugs_swept = bug_report.bug_report_sweep(since=int(since or 0), home=mini_ork_home)
+        except Exception:
+            bugs_swept = 0
         sys.stdout.write(f"  [bug_report_sweep] swept {bugs_swept or 0} new noticed bug(s)\n")
         auto_promote = os.environ.get("MO_BUG_REPORT_AUTO_PROMOTE", "0")
         if auto_promote != "0":
-            promoted = _bash_lib_call(
-                "bug_report",
-                "bug_report_promote",
-                f"--top {auto_promote}",
-                subprocess_env,
-            )
+            try:
+                promoted = bug_report.bug_report_promote(top=int(auto_promote))
+            except Exception:
+                promoted = 0
             sys.stdout.write(f"  [bug_report_promote] promoted {promoted or 0} bug(s) to epics\n")
 
     # ── side-channel: rho_aggregator (MO_RHO_AGGREGATE) ────────────────────
