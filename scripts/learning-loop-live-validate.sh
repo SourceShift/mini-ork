@@ -49,7 +49,8 @@ export MINI_ORK_EXECUTE_SOURCE_ONLY=1
 # shellcheck source=../bin/mini-ork-execute
 source "$MINI_ORK_ROOT/bin/mini-ork-execute"
 unset MINI_ORK_EXECUTE_SOURCE_ONLY
-[ -f "$MINI_ORK_ROOT/lib/rho_aggregator.sh" ] && source "$MINI_ORK_ROOT/lib/rho_aggregator.sh" 2>/dev/null || true
+# RHO aggregation is native Python now (lib/rho_aggregator.sh retired); fire_writers
+# calls it directly via PYTHONPATH below.
 
 q() { sqlite3 "$MINI_ORK_DB" "$1" 2>/dev/null; }
 
@@ -85,9 +86,9 @@ fire_writers() {
   # GRPO / conductor / RHO reflect the freshest traces immediately.
   mo_learning_write_grpo_advantages   >/dev/null 2>&1 || true
   mo_learning_update_conductor_outcomes >/dev/null 2>&1 || true
-  if declare -f rho_aggregate_win_rates >/dev/null 2>&1; then
-    rho_aggregate_win_rates --task-class "$TC" >/dev/null 2>&1 || true
-  fi
+  PYTHONPATH="$MINI_ORK_ROOT" python3 -c \
+    "from mini_ork.ported.rho_aggregator import aggregate_win_rates as a; a('$MINI_ORK_DB', task_class='$TC')" \
+    >/dev/null 2>&1 || true
 }
 
 echo "================ LEARNING-LOOP LIVE VALIDATION ================"
