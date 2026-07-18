@@ -341,16 +341,28 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     # ── side-channel: cross_epic_gradient (MO_CROSS_EPIC_GRADIENTS) ────────
+    # Native: promote() reimplements cross_epic_gradient_promote in-process (byte-
+    # parity verified on the real state.db). The try/except mirrors _bash_lib_call's
+    # `|| echo 0` — promote() itself propagates sqlite errors, but a side-channel
+    # must never crash reflect.
     if os.environ.get("MO_CROSS_EPIC_GRADIENTS", "1") != "0":
         min_classes = os.environ.get("MO_CROSS_EPIC_MIN_CLASSES", "2")
         min_conf = os.environ.get("MO_CROSS_EPIC_MIN_CONF", "0.7")
         window = os.environ.get("MO_CROSS_EPIC_WINDOW", "14d")
-        cross_written = _bash_lib_call(
-            "cross_epic_gradient",
-            "cross_epic_gradient_promote",
-            f"--min-classes {min_classes} --min-confidence {min_conf} --window {window}",
-            subprocess_env,
-        )
+        from mini_ork.ported import cross_epic_gradient
+        try:
+            # promote() prints the count (a bash-heredoc parity artifact its own test
+            # asserts) AND returns it; capture the print so it doesn't leak into
+            # reflect's stdout — exactly what _bash_lib_call did with the subprocess's.
+            with contextlib.redirect_stdout(io.StringIO()):
+                cross_written = cross_epic_gradient.promote(
+                    min_classes=int(min_classes),
+                    min_confidence=float(min_conf),
+                    window=window,
+                    db=db_path,
+                )
+        except Exception:
+            cross_written = 0
         sys.stdout.write(f"  [cross_epic_gradient] promoted {cross_written or 0} cross-class gradients\n")
 
     # ── side-channel: bug_report (MO_BUG_REPORT_SWEEP) ──────────────────────
