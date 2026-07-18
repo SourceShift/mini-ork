@@ -1,0 +1,45 @@
+name: self_migrate
+version: "0.1.0"
+description: >
+  Verifier-gated migration of ONE integration fork (a bash↔Python seam — an
+  entrypoint whose Python side runs while the paired bash entrypoint and its
+  refs still exist). Closes the fork as a single unit: makes the Python side
+  sole, repoints every inbound reference, and retires the bash entrypoint —
+  gated on byte-parity vs the bash oracle, the affected feature-acceptance
+  probe, and a static-feature ledger classifying every behavior static vs
+  agentic. Propose-not-commit: emits a reviewable diff + ledger + verdict,
+  never auto-applies to main.
+
+matches:
+  keywords:
+    - self-migrate
+    - close-fork
+    - integration-point
+    - bash-to-python
+    - un-shell
+    - runtime-select
+    - parity-gate
+    - static-feature-ledger
+    - cost-verifiability
+    - entrypoint-retire
+  regex:
+    - "\\bmigrat(e|ion)\\b.*\\b(fork|seam|integration|entrypoint|bash|python)\\b"
+    - "\\b(close|retire)\\b.*\\b(fork|entrypoint|bin/mini-ork-)\\b"
+
+artifact_contract_ref: artifact_contract.yaml
+default_workflow: workflow.yaml
+
+default_gates:
+  - budget_gate
+  - scope_gate
+
+risk_class: medium
+
+cost_model:
+  min_usd: 3
+  max_usd: 15
+  per_lens_usd: 2
+
+runtime_model:
+  min_minutes: 8
+  max_minutes: 40
