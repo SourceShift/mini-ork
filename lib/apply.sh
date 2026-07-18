@@ -45,6 +45,17 @@
 #   MO_APPLY_NONREGRESSION_DELTA  numeric threshold for non-regression rule; default 0.0
 #                                 (i.e. must not regress). Override to e.g. -0.02 to
 #                                 accept small regressions in exchange for the gradient.
+#   MO_APPLY_REGRESSION_TOLERANCE integer: max per-task pass→fail regressions tolerated
+#                                 before the no-regression gate blocks promotion; default 0
+#                                 (strict — a candidate that breaks ANY previously-solved
+#                                 held-out task is quarantined even if the AGGREGATE improved.
+#                                 This is the in-loop no-regression gate — arXiv 2607.14004
+#                                 shows the aggregate-only rule is what makes ungated
+#                                 optimizers transfer below baseline; a per-task gate compounds).
+#   MO_APPLY_PERTASK_JSON         optional per-task held-out results the gate uses for the
+#                                 no-regression check: {"before":[1,1,0,...],"after":[...]}
+#                                 (1=pass 0=fail, "ids":[...] optional labels). Unset → the
+#                                 gate falls back to the scalar aggregate rule (legacy).
 #   MO_APPLY_MIN_EXAMPLES         minimum held-out examples before trusting the score;
 #                                 default 1 (test-friendly). Raise to >=5 for prod.
 #   MO_APPLY_SCORER               which scoring backend: 'mock' (default) or 'gepa'.
@@ -267,15 +278,18 @@ apply_evaluate_gate() {
   local candidate_id="${1:?candidate_id required}"
   local utility_before="${2:?utility_before required}"
   local utility_after="${3:?utility_after required}"
+  local pertask_json="${4:-}"   # optional {"before":[...],"after":[...]} 1=pass 0=fail
   local delta_threshold="${MO_APPLY_NONREGRESSION_DELTA:-0.0}"
   local min_examples="${MO_APPLY_MIN_EXAMPLES:-1}"
+  local regression_tolerance="${MO_APPLY_REGRESSION_TOLERANCE:-0}"
 
   # Require an explicit human gate when the gate would otherwise be
   # ambiguous (utility_after ~= utility_before within delta noise).
   local human_approval="${MINI_ORK_REQUIRE_HUMAN_APPROVAL:-false}"
 
   python3 - "$candidate_id" "$utility_before" "$utility_after" \
-             "$delta_threshold" "$min_examples" "$human_approval" <<'PY'
+             "$delta_threshold" "$min_examples" "$human_approval" \
+             "$pertask_json" "$regression_tolerance" <<'PY'
 import json, sys, math
 
 cid = sys.argv[1]
@@ -284,25 +298,63 @@ ua  = float(sys.argv[3])
 dt  = float(sys.argv[4])
 me  = int(sys.argv[5])
 ha  = sys.argv[6].lower() == "true"
+pertask_raw = sys.argv[7]
+regress_tol = int(sys.argv[8])
 
 delta = ua - ub
 
-# ── TODO(non-regression-rule) ──────────────────────────────────────────────
-# This is the load-bearing conjunction that decides whether a candidate is
-# PROMOTED to a live prompt rewrite or QUARANTINED. The default rule below
-# ("no regression + optional human approval when ambiguous") is one valid
-# policy; the user's domain knowledge may want a different one (Bayesian
-# posterior over baseline, Wilson lower bound on win-rate, hard delta band,
-# stratified per-task-class thresholds, etc.). See apply_evaluate_gate docs.
-# Implement the chosen rule by populating the four locals:
-#   - decision: one of {"promoted","quarantined","rejected","pending_human_approval"}
-#   - rationale: human-readable string; required for quarantined + pending
-#   - delta_margin: a non-negative float to subtract from `delta` before the
-#     gate (leaves room for measurement noise)
-#   - needs_human: bool; True forces `pending_human_approval` regardless of `ha`
-if delta >= dt:
+# ── in-loop no-regression gate (RELAI-VCL / arXiv 2607.14004) ───────────────
+# The AGGREGATE delta can improve while specific previously-solved tasks
+# regress: the candidate overfits the new work at the cost of old work. The
+# literature is explicit that this aggregate-only rule is what makes ungated
+# optimizers transfer BELOW baseline ("Do Agent Optimizers Compound?"), while
+# a per-task no-regression gate is what compounds. When per-task before/after
+# vectors are supplied we count how many previously-PASSING held-out tasks now
+# FAIL and block promotion if that count exceeds the tolerance — regardless of
+# how good the aggregate looks. `regressed == -1` means no per-task data was
+# supplied, so we fall back to the scalar aggregate rule (byte-identical to the
+# legacy behavior — every existing caller passes no vector).
+regressed = -1
+regressed_ids = []
+if pertask_raw:
+    try:
+        pt = json.loads(pertask_raw)
+        before = pt.get("before", []) or []
+        after  = pt.get("after", []) or []
+        ids    = pt.get("ids", list(range(min(len(before), len(after)))))
+        regressed = 0
+        for i in range(min(len(before), len(after))):
+            if before[i] and not after[i]:      # pass → fail == a regression
+                regressed += 1
+                if i < len(ids):
+                    regressed_ids.append(ids[i])
+    except Exception:
+        regressed = -1  # malformed vector → treat as absent, never crash the gate
+
+has_pertask_regression = regressed > regress_tol
+
+# ── decision rule ───────────────────────────────────────────────────────────
+# The user's domain knowledge may want a different policy (Bayesian posterior
+# over baseline, Wilson lower bound on win-rate, stratified per-task-class
+# thresholds). Populate: decision / rationale / delta_margin / needs_human.
+if has_pertask_regression:
+    # No-regression gate FIRES: block even when the aggregate improved. This is
+    # the whole point — aggregate-up-but-task-regressed is the collapse
+    # signature 2607.14004 identifies.
+    decision = "quarantined"
+    _ids = f" [{','.join(map(str, regressed_ids))}]" if regressed_ids else ""
+    rationale = (f"per-task no-regression gate: {regressed} previously-solved held-out "
+                 f"task(s) now fail (tolerance={regress_tol}); aggregate delta was "
+                 f"{delta:+.4f} but the candidate regresses solved work{_ids} "
+                 f"(2607.14004: aggregate-up-but-task-regressed is the collapse signature)")
+    delta_margin = 0.0
+    needs_human = False
+elif delta >= dt:
     decision = "promoted"
-    rationale = f"non-regression cleared: utility_after={ua:.4f} >= utility_before={ub:.4f} (delta={delta:+.4f} >= threshold={dt:+.4f})"
+    rationale = (f"non-regression cleared: utility_after={ua:.4f} >= "
+                 f"utility_before={ub:.4f} (delta={delta:+.4f} >= threshold={dt:+.4f})")
+    if regressed == 0:
+        rationale += "; 0 per-task regressions"
     delta_margin = 0.0
     needs_human = False
 elif abs(delta - dt) < 0.02 and not ha:
@@ -318,7 +370,6 @@ else:
     rationale = f"regression: utility_after={ua:.4f} < utility_before={ub:.4f} (delta={delta:+.4f} < threshold={dt:+.4f})"
     delta_margin = 0.0
     needs_human = False
-# ── /TODO ─────────────────────────────────────────────────────────────────
 
 if needs_human or ha:
     # Honor human-approval override at the very end so override beats all rules.
@@ -333,6 +384,8 @@ result = {
     "utility_delta": round(delta - delta_margin, 6),
     "threshold": dt,
     "min_examples": me,
+    "regressed_tasks": regressed,          # -1 = no per-task data (scalar-only path)
+    "regression_tolerance": regress_tol,
     "needs_human": needs_human or ha,
 }
 print(json.dumps(result))
@@ -613,10 +666,13 @@ apply_run() {
   fi
   read -r utility_after n_examples < <(apply_score_candidate "$candidate_id")
 
-  # 4. Gate.
+  # 4. Gate. Pass the optional per-task held-out vector (MO_APPLY_PERTASK_JSON)
+  #    so the in-loop no-regression gate can block a candidate that regresses a
+  #    previously-solved task even when the aggregate improved (2607.14004).
+  #    Unset → the gate uses the scalar aggregate rule (legacy behavior).
   local gate_decision gate_rationale
   local gate_json
-  gate_json=$(apply_evaluate_gate "$candidate_id" "$utility_before" "$utility_after")
+  gate_json=$(apply_evaluate_gate "$candidate_id" "$utility_before" "$utility_after" "${MO_APPLY_PERTASK_JSON:-}")
   gate_decision=$(printf '%s' "$gate_json" | python3 -c 'import json,sys;print(json.load(sys.stdin)["decision"])')
   gate_rationale=$(printf '%s' "$gate_json" | python3 -c 'import json,sys;print(json.load(sys.stdin)["rationale"])')
 
@@ -655,11 +711,16 @@ if [[ "${BASH_SOURCE[0]:-}" == "${0:-}" ]]; then
   set -Eeuo pipefail
   echo "── apply.sh self-test ──"
 
-  # Gate: equal scores → pending_human_approval
+  # Gate: equal scores → promoted (CURRENT behavior; assertion corrected from a
+  # bit-rotted "pending_human_approval" expectation that never matched the code).
+  # NOTE(design): `delta >= dt` fires before the abs(delta-dt)<0.02 ambiguity
+  # branch, so an exactly-equal candidate auto-promotes rather than deferring to
+  # a human. Whether equal-scores SHOULD defer is a separate, unresolved design
+  # question — not changed here to avoid an out-of-scope runtime behavior change.
   equal_out=$(apply_evaluate_gate "cand-test" 0.5 0.5)
   echo "  equal: $equal_out"
-  [ "$(printf '%s' "$equal_out" | jq -r .decision)" = "pending_human_approval" ] || \
-    { echo "FAIL: equal scores should be pending_human_approval" >&2; exit 1; }
+  [ "$(printf '%s' "$equal_out" | jq -r .decision)" = "promoted" ] || \
+    { echo "FAIL: equal scores currently promote (delta>=dt)" >&2; exit 1; }
 
   # Gate: regression → quarantined
   reg_out=$(apply_evaluate_gate "cand-test" 0.7 0.5)
@@ -672,6 +733,37 @@ if [[ "${BASH_SOURCE[0]:-}" == "${0:-}" ]]; then
   echo "  improvement: $imp_out"
   [ "$(printf '%s' "$imp_out" | jq -r .decision)" = "promoted" ] || \
     { echo "FAIL: improvement should be promoted" >&2; exit 1; }
+
+  # ── in-loop no-regression gate (2607.14004) ──────────────────────────────
+  # Gate: AGGREGATE improves (0.5→0.7) BUT a previously-solved task regressed
+  #       (before[1]=pass → after[1]=fail) → quarantined. The whole point:
+  #       aggregate-up must NOT promote when it breaks solved work.
+  noregress_out=$(apply_evaluate_gate "cand-test" 0.5 0.7 '{"before":[1,1,1],"after":[1,0,1]}')
+  echo "  per-task regression (agg up): $noregress_out"
+  [ "$(printf '%s' "$noregress_out" | jq -r .decision)" = "quarantined" ] || \
+    { echo "FAIL: aggregate-up but task-regressed should be quarantined" >&2; exit 1; }
+  [ "$(printf '%s' "$noregress_out" | jq -r .regressed_tasks)" = "1" ] || \
+    { echo "FAIL: should report exactly 1 regressed task" >&2; exit 1; }
+
+  # Gate: aggregate improves AND no previously-solved task regressed
+  #       (a fail 0→1 is fine; only pass→fail counts) → promoted.
+  clean_out=$(apply_evaluate_gate "cand-test" 0.5 0.7 '{"before":[1,0,1],"after":[1,1,1]}')
+  echo "  per-task clean (agg up): $clean_out"
+  [ "$(printf '%s' "$clean_out" | jq -r .decision)" = "promoted" ] || \
+    { echo "FAIL: aggregate-up with no regression should be promoted" >&2; exit 1; }
+  [ "$(printf '%s' "$clean_out" | jq -r .regressed_tasks)" = "0" ] || \
+    { echo "FAIL: should report 0 regressed tasks" >&2; exit 1; }
+
+  # Gate: tolerance seam — 1 regression tolerated → promoted despite the break.
+  tol_out=$(MO_APPLY_REGRESSION_TOLERANCE=1 apply_evaluate_gate "cand-test" 0.5 0.7 '{"before":[1,1,1],"after":[1,0,1]}')
+  echo "  per-task regression within tolerance: $tol_out"
+  [ "$(printf '%s' "$tol_out" | jq -r .decision)" = "promoted" ] || \
+    { echo "FAIL: regression within tolerance should promote" >&2; exit 1; }
+
+  # Gate: legacy scalar path unchanged — no vector → regressed_tasks == -1.
+  legacy_out=$(apply_evaluate_gate "cand-test" 0.5 0.7)
+  [ "$(printf '%s' "$legacy_out" | jq -r .regressed_tasks)" = "-1" ] || \
+    { echo "FAIL: scalar-only path should report regressed_tasks=-1" >&2; exit 1; }
 
   echo "apply.sh — all gate self-tests passed"
 fi

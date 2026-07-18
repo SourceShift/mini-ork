@@ -271,4 +271,8 @@ def test_task_class_seeding_count(tmp_path):
     _assert_ok(py, "python")
     bash_count = len(list((bash_project / ".mini-ork" / "config" / "task_classes").iterdir()))
     py_count = len(list((py_project / ".mini-ork" / "config" / "task_classes").iterdir()))
-    assert bash_count == py_count == 27
+    # The invariant this test exists to prove is bash↔python PARITY — init seeds the
+    # SAME task_classes either way. The absolute count grows as recipes are added
+    # (was 27; ~34 now), so pinning a literal is brittle and drifts on both branches.
+    assert bash_count == py_count
+    assert bash_count >= 27  # sanity floor: at least the historical baseline seeded
