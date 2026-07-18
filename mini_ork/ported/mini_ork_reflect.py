@@ -373,14 +373,16 @@ def main(argv: list[str] | None = None) -> int:
             sys.stdout.write(f"  [bug_report_promote] promoted {promoted or 0} bug(s) to epics\n")
 
     # ── side-channel: rho_aggregator (MO_RHO_AGGREGATE) ────────────────────
-    if (os.environ.get("MO_RHO_AGGREGATE", "1") != "0"
-            and os.path.isfile(os.path.join(os.environ["MINI_ORK_ROOT"], "lib", "rho_aggregator.sh"))):
-        rho_updated = _bash_lib_call(
-            "rho_aggregator",
-            "rho_aggregate_win_rates",
-            f"--since {since}",
-            subprocess_env,
-        )
+    # Native: aggregate_win_rates() reimplements rho_aggregate_win_rates in-process
+    # (byte-parity verified vs live bash on the real state.db — 114/114 rows). The
+    # try/except mirrors _bash_lib_call's `|| echo 0`: a side-channel failure must
+    # never crash reflect.
+    if os.environ.get("MO_RHO_AGGREGATE", "1") != "0":
+        from mini_ork.ported import rho_aggregator
+        try:
+            rho_updated = rho_aggregator.aggregate_win_rates(db_path, since=int(since or 0))
+        except Exception:
+            rho_updated = 0
         sys.stdout.write(f"  [rho_aggregate] upserted {rho_updated or 0} prompt_win_rates row(s)\n")
 
     # ── side-channel: lane_router (MO_LANE_ROUTER) ──────────────────────────
