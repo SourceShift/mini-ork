@@ -108,29 +108,23 @@ def learning_static_lane(node_type: str, current_lane: str) -> str:
 
 def learning_governed_lane(node_type: str, current_lane: str, *, root=None) -> str:
     """Port of bash `_mo_learning_governed_lane`: delegate the routing read to the
-    canonical `decide()` surface in lib/decision_service.sh — the same brain every
-    consumer uses. No state DB → static fallback (decide can't consult GRPO tables).
-    Shells to the bash `decide` (not re-implemented) so routing stays byte-identical
-    to bash; the .route field carries the lane, empty falls back to current_lane."""
+    canonical NATIVE `decide()` in ``mini_ork.ported.decision_service`` — the same
+    brain every consumer uses. No state DB → static fallback (decide can't consult
+    GRPO tables). Byte-parity with bash `decide` (verified deterministic, EPSILON=0);
+    the .route field carries the lane, empty falls back to current_lane.
+
+    2026-07-18: rewired from `bash -c 'source decision_service.sh; decide'` to the
+    in-process native port — routing no longer shells out per dispatch."""
     db = os.environ.get("MINI_ORK_DB", "")
     if not db or not os.path.isfile(db):
         return learning_static_lane(node_type, current_lane)
-    root = root or os.environ.get("MINI_ORK_ROOT") or \
-        os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    ds = os.path.join(root, "lib", "decision_service.sh")
-    if not os.path.isfile(ds):
-        return current_lane
     task_class = os.environ.get("TASK_CLASS") or os.environ.get("MINI_ORK_TASK_CLASS") or "generic"
     objective_domain = (os.environ.get("MINI_ORK_OBJECTIVE_DOMAIN")
                         or os.environ.get("MO_OBJECTIVE_DOMAIN") or "code-delivery")
     try:
-        r = subprocess.run(
-            ["bash", "-c", f'source "{ds}"; decide "$1" "$2" "$3"',
-             "_", node_type, task_class, objective_domain],
-            capture_output=True, text=True, timeout=30)
-        route = ""
-        if r.returncode == 0 and r.stdout.strip():
-            route = (json.loads(r.stdout).get("route", "") if r.stdout.strip().startswith("{") else "")
+        from mini_ork.ported import decision_service
+        route = decision_service.decide(
+            node_type, task_class, objective_domain, db=db).get("route", "")
         return route or current_lane
     except Exception:
         return current_lane

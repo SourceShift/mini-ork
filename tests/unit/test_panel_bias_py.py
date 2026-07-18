@@ -1,419 +1,420 @@
-"""Parity gate: mini_ork.ported.panel_bias vs lib/panel_bias.sh.
+"""Standalone unit tests for ``mini_ork.ported.panel_bias``.
 
-Each test invokes the LIVE bash functions from ``lib/panel_bias.sh`` via
-``bash -c 'source lib/panel_bias.sh; <func> <args>'`` on identical
-inputs as the Python port and asserts equivalent outputs (file presence,
-byte-content, label_map shape, borda/mean_rank values, sort order,
-exit codes / raised exceptions). No mocks, no hardcoded outputs beyond
-what bash itself emits.
-
-Seven cases (above the kickoff's >=6 floor):
-  (a) panel_anonymize happy-path         — both write resp-{A,B,C}.md,
-                                            byte-match sources via label_map
-                                            round-trip; label_map keys/values
-                                            match the same set.
-  (b) panel_anonymize seed determinism   — same seed → identical mapping
-                                            (bash via awk srand, python via
-                                            random.seed; each is deterministic
-                                            in-process); two seeds produce
-                                            different mappings (collision
-                                            retry, mirrors test_panel_bias.sh).
-  (c) panel_anonymize missing dir        — bash rc=1 + stderr "not found"
-                                            matches python FileNotFoundError
-                                            with the path echoed in the
-                                            message.
-  (d) panel_rank_aggregate hand-computed — 3 reviewers (A C B / B A C / A
-                                            B C), N=3 → borda A=5 B=3 C=1;
-                                            mean_rank 1.3333/2.0000/2.6667;
-                                            sort glm>kimi>opus.
-  (e) panel_rank_aggregate tie-break     — borda+mean_rank tie → family
-                                            alphabetical (alpha<bravo).
-  (f) panel_permute_order determinism    — same seed → identical order;
-                                            different seeds → different
-                                            orders (with high prob).
-  (g) panel_permute_order multiset       — output is a permutation of the
-                                            source basenames (count +
-                                            multiset preserved).
-
-RNG parity: bash uses awk's RNG (linear-congruential, 20-digit
-precision), Python uses ``random.Random(seed)`` (Mersenne Twister). The
-two produce DIFFERENT orderings for the same seed — the test does NOT
-byte-compare raw permutation order. It compares downstream observable
-properties (label_map keys ⊆ A..Z, families ⊆ {glm,kimi,opus};
-borda/mean_rank exact; sort-by tuple; permutation-of-source multiset).
-
-Environment isolation: each test points subprocess env at a per-test
-temp dir so bash's ``mktemp`` + label_map sibling conventions and
-Python's path-based I/O both land in /tmp without polluting the repo.
+Replaces the bash-parity gate as part of the bash→Python migration: the
+Python port is now the sole implementation, so its coverage no longer runs
+``lib/panel_bias.sh`` in a subprocess (via ``bash -c 'source ...'``) — it
+asserts the port's behaviour directly. These pin the deterministic contract
+adversarial panel review depends on: anonymize (lens-*.md → resp-<LABEL>.md
++ sibling label_map.json), rank_aggregate (Borda + mean_rank + tie-break
+sort), and permute_order (seed-deterministic shuffle), independent of any
+bash oracle. All filesystem I/O is isolated to pytest's ``tmp_path``.
 """
+
 from __future__ import annotations
 
 import json
-import shutil
-import subprocess
-import sys
-from pathlib import Path
 
 import pytest
 
-REPO = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(REPO))
-from mini_ork.ported import panel_bias as pb  # noqa: E402
-
-SH = REPO / "lib" / "panel_bias.sh"
-
-# Tolerance for floats parsed from JSON. The bash implementation emits
-# mean_rank via `awk 'BEGIN{printf "%.4f", s/c}'` so the precision is
-# bounded at 1e-4. 1e-6 from the kickoff is a strict superset.
-_FLOAT_TOL = 1e-6
-
-
-def _which_bash() -> None:
-    if not shutil.which("bash"):
-        pytest.skip("bash not on PATH")
-    if not shutil.which("jq"):
-        pytest.skip("jq not on PATH (required by lib/panel_bias.sh)")
-    if not SH.exists():
-        pytest.skip(f"missing lib/panel_bias.sh at {SH}")
+from mini_ork.ported.panel_bias import (
+    _LABELS,
+    _iter_rankings,
+    _list_lens_files,
+    _shuffle_lines,
+    panel_anonymize,
+    panel_permute_order,
+    panel_rank_aggregate,
+)
 
 
-def _bash_panel_anonymize(reports_dir: str, out_dir: str, seed: int) -> subprocess.CompletedProcess:
-    """Invoke ``bash -c 'source lib/panel_bias.sh; panel_anonymize ...'``."""
-    src = (
-        f'source "{SH}"\n'
-        f'panel_anonymize "{reports_dir}" "{out_dir}" {seed}\n'
-    )
-    return subprocess.run(
-        ["bash", "-c", src],
-        capture_output=True, text=True,
-    )
-
-
-def _bash_panel_rank_aggregate(xrank_dir: str, label_map: str) -> subprocess.CompletedProcess:
-    """Invoke ``bash -c 'source lib/panel_bias.sh; panel_rank_aggregate ...'``."""
-    src = (
-        f'source "{SH}"\n'
-        f'panel_rank_aggregate "{xrank_dir}" "{label_map}"\n'
-    )
-    return subprocess.run(
-        ["bash", "-c", src],
-        capture_output=True, text=True,
-    )
-
-
-def _bash_panel_permute_order(reports_dir: str, seed: int) -> subprocess.CompletedProcess:
-    """Invoke ``bash -c 'source lib/panel_bias.sh; panel_permute_order ...'``."""
-    src = (
-        f'source "{SH}"\n'
-        f'panel_permute_order "{reports_dir}" {seed}\n'
-    )
-    return subprocess.run(
-        ["bash", "-c", src],
-        capture_output=True, text=True,
-    )
-
-
-def _write_lens_families(reports_dir: Path, families: list[str]) -> None:
+def _write_lens_families(reports_dir, families: list[str]) -> None:
     reports_dir.mkdir(parents=True, exist_ok=True)
     for f in families:
         (reports_dir / f"lens-{f}.md").write_text(f"LENS OUTPUT for {f}\n")
 
 
-def _read_json(path: Path):
-    return json.loads(path.read_text())
+class TestLabelsConstant:
+    def test_is_26_uppercase_letters_a_to_z(self):
+        # Guards the label alphabet against silent drift (mirrors bash
+        # _PB_LABELS=(A B C ... Z)).
+        assert _LABELS == tuple(chr(ord("A") + i) for i in range(26))
+        assert len(_LABELS) == 26
+        assert _LABELS[0] == "A"
+        assert _LABELS[-1] == "Z"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# (a) panel_anonymize happy-path
-# ─────────────────────────────────────────────────────────────────────────────
-def test_panel_anonymize_happy_path_parity(tmp_path):
-    """3 families (glm/kimi/opus), seed=42 → resp-{A,B,C}.md byte-match
-    sources via label_map round-trip; label_map keys ⊆ A..Z, values ⊆
-    {glm,kimi,opus}. Both sides must produce a label_map whose
-    values are exactly the input families (no orphans)."""
-    _which_bash()
-    r = tmp_path / "reports"
-    o = tmp_path / "out"
-    _write_lens_families(r, ["glm", "kimi", "opus"])
+class TestListLensFiles:
+    def test_globs_lens_prefixed_md_files_sorted(self, tmp_path):
+        r = tmp_path / "reports"
+        _write_lens_families(r, ["opus", "glm", "kimi"])
+        assert _list_lens_files(str(r)) == ["lens-glm.md", "lens-kimi.md", "lens-opus.md"]
 
-    # Bash
-    r_bash = _bash_panel_anonymize(str(r), str(o), 42)
-    assert r_bash.returncode == 0, (
-        f"bash panel_anonymize rc={r_bash.returncode}\nstderr={r_bash.stderr}"
-    )
-    bash_map = _read_json(o.with_name(o.name + ".label_map.json"))
-    assert set(bash_map.keys()) == {"A", "B", "C"}
-    assert set(bash_map.values()) == {"glm", "kimi", "opus"}
-    for label, family in bash_map.items():
-        assert (o / f"resp-{label}.md").read_bytes() == (
-            r / f"lens-{family}.md"
-        ).read_bytes(), f"bash resp-{label}.md not byte-equal to source lens-{family}.md"
+    def test_ignores_non_matching_files(self, tmp_path):
+        r = tmp_path / "reports"
+        r.mkdir()
+        (r / "lens-glm.md").write_text("x")
+        (r / "notlens.md").write_text("x")
+        (r / "lens-glm.txt").write_text("x")
+        (r / "readme.md").write_text("x")
+        assert _list_lens_files(str(r)) == ["lens-glm.md"]
 
-    # Reset out dir for python side
-    shutil.rmtree(o)
-    o.mkdir()
+    def test_ignores_directories_matching_the_pattern(self, tmp_path):
+        r = tmp_path / "reports"
+        r.mkdir()
+        (r / "lens-glm.md").write_text("x")
+        (r / "lens-dir.md").mkdir()  # matches the glob pattern but is a dir
+        assert _list_lens_files(str(r)) == ["lens-glm.md"]
 
-    # Python
-    py_map = pb.panel_anonymize(str(r), str(o), 42)
-    assert set(py_map.keys()) == {"A", "B", "C"}
-    assert set(py_map.values()) == {"glm", "kimi", "opus"}
-    for label, family in py_map.items():
-        assert (o / f"resp-{label}.md").read_bytes() == (
-            r / f"lens-{family}.md"
-        ).read_bytes(), f"python resp-{label}.md not byte-equal to source lens-{family}.md"
+    def test_missing_dir_raises_file_not_found(self, tmp_path):
+        bogus = str(tmp_path / "nope")
+        with pytest.raises(FileNotFoundError) as exc:
+            _list_lens_files(bogus)
+        assert bogus in str(exc.value)
+
+    def test_empty_dir_returns_empty_list(self, tmp_path):
+        r = tmp_path / "reports"
+        r.mkdir()
+        assert _list_lens_files(str(r)) == []
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# (b) panel_anonymize seed determinism
-# ─────────────────────────────────────────────────────────────────────────────
-def test_panel_anonymize_seed_determinism_parity(tmp_path):
-    """Same seed on the SAME implementation must produce the SAME
-    mapping (deterministic). Different seeds on the same implementation
-    must produce different mappings (with high probability — bash test
-    uses 2-re-roll collision retry). Both sides pass this on their own
-    RNG; we don't compare bash-vs-python raw permutations because the
-    RNG algorithms differ (awk vs random.seed)."""
-    _which_bash()
-    r = tmp_path / "reports"
-    _write_lens_families(r, ["glm", "kimi", "opus"])
+class TestShuffleLines:
+    def test_same_seed_is_deterministic(self):
+        lines = ["a", "b", "c", "d", "e"]
+        assert _shuffle_lines(lines, 7) == _shuffle_lines(lines, 7)
 
-    # ── Same seed → same mapping on bash ──
-    o1 = tmp_path / "out_bash_42_a"
-    o2 = tmp_path / "out_bash_42_b"
-    for o in (o1, o2):
-        r_bash = _bash_panel_anonymize(str(r), str(o), 42)
-        assert r_bash.returncode == 0
-    map_a = _read_json(o1.with_name(o1.name + ".label_map.json"))
-    map_b = _read_json(o2.with_name(o2.name + ".label_map.json"))
-    assert map_a == map_b, f"bash seed=42 not deterministic across invocations: {map_a} vs {map_b}"
+    def test_different_seeds_can_differ(self):
+        lines = ["a", "b", "c", "d", "e"]
+        out1 = _shuffle_lines(lines, 1)
+        out2 = _shuffle_lines(lines, 2)
+        assert out1 != out2  # not a hard guarantee in general, true for this input/seed pair
 
-    # ── Same seed → same mapping on python ──
-    py_map_a = pb.panel_anonymize(str(r), str(tmp_path / "out_py_42_a"), 42)
-    py_map_b = pb.panel_anonymize(str(r), str(tmp_path / "out_py_42_b"), 42)
-    assert py_map_a == py_map_b, (
-        f"python seed=42 not deterministic across invocations: {py_map_a} vs {py_map_b}"
-    )
+    def test_output_is_a_permutation_of_input(self):
+        lines = ["alpha", "bravo", "charlie", "delta"]
+        out = _shuffle_lines(lines, 42)
+        assert sorted(out) == sorted(lines)
+        assert len(out) == len(lines)
 
-    # ── Different seeds → different mapping on bash (with retry) ──
-    o_seed99 = tmp_path / "out_bash_99"
-    r_bash99 = _bash_panel_anonymize(str(r), str(o_seed99), 99)
-    assert r_bash99.returncode == 0
-    map_99 = _read_json(o_seed99.with_name(o_seed99.name + ".label_map.json"))
-    tries = 0
-    seed = 99
-    while map_a == map_99 and tries < 2:
-        tries += 1
-        seed = 99 + tries
-        o_retry = tmp_path / f"out_bash_{seed}"
-        r_retry = _bash_panel_anonymize(str(r), str(o_retry), seed)
-        assert r_retry.returncode == 0
-        map_99 = _read_json(o_retry.with_name(o_retry.name + ".label_map.json"))
-    assert map_a != map_99, (
-        f"bash seed=42 vs seed={seed} produced identical mapping "
-        f"(collision after {tries + 1} retries)"
-    )
+    def test_empty_input_is_empty_output(self):
+        assert _shuffle_lines([], 0) == []
 
-    # ── Different seeds → different mapping on python (with retry) ──
-    py_seed = 99
-    py_99 = pb.panel_anonymize(str(r), str(tmp_path / "out_py_99"), py_seed)
-    tries = 0
-    while py_map_a == py_99 and tries < 2:
-        tries += 1
-        py_seed = 99 + tries
-        py_99 = pb.panel_anonymize(str(r), str(tmp_path / f"out_py_{py_seed}"), py_seed)
-    assert py_map_a != py_99, (
-        f"python seed=42 vs seed={py_seed} produced identical mapping"
-    )
+    def test_does_not_mutate_input_list(self):
+        lines = ["a", "b", "c"]
+        original = list(lines)
+        _shuffle_lines(lines, 3)
+        assert lines == original
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# (c) panel_anonymize missing reports_dir
-# ─────────────────────────────────────────────────────────────────────────────
-def test_panel_anonymize_missing_reports_dir_parity(tmp_path):
-    """Missing reports_dir → bash rc=1 + stderr "not found"; python
-    FileNotFoundError with path echoed in message."""
-    _which_bash()
-    bogus = str(tmp_path / "no_such_reports")
-    out = str(tmp_path / "out")
+class TestIterRankings:
+    def test_extracts_final_ranking_tokens(self, tmp_path):
+        x = tmp_path / "xrank"
+        x.mkdir()
+        (x / "r1.md").write_text("# Reviewer 1\npreamble\nFINAL RANKING: A C B\n")
+        out = _iter_rankings(str(x))
+        assert out == [["A", "C", "B"]]
 
-    r_bash = _bash_panel_anonymize(bogus, out, 0)
-    assert r_bash.returncode != 0, (
-        f"bash panel_anonymize rc=0 on missing dir (should fail): {r_bash.stderr}"
-    )
-    assert "not found" in r_bash.stderr.lower(), (
-        f"bash stderr should mention 'not found', got: {r_bash.stderr!r}"
-    )
-    assert bogus in r_bash.stderr, f"bash stderr should echo the path: {r_bash.stderr!r}"
+    def test_takes_first_matching_line_only(self, tmp_path):
+        x = tmp_path / "xrank"
+        x.mkdir()
+        (x / "r1.md").write_text(
+            "FINAL RANKING: A B\nnotes\nFINAL RANKING: B A\n"
+        )
+        out = _iter_rankings(str(x))
+        assert out == [["A", "B"]]
 
-    with pytest.raises(FileNotFoundError) as exc:
-        pb.panel_anonymize(bogus, out, 0)
-    assert "not found" in str(exc.value).lower()
-    assert bogus in str(exc.value), f"python error should echo the path: {exc.value!r}"
+    def test_skips_files_without_the_marker(self, tmp_path):
+        x = tmp_path / "xrank"
+        x.mkdir()
+        (x / "r1.md").write_text("FINAL RANKING: A B\n")
+        (x / "r2.md").write_text("no marker here\n")
+        out = _iter_rankings(str(x))
+        assert out == [["A", "B"]]
 
+    def test_no_matching_files_raises_value_error(self, tmp_path):
+        x = tmp_path / "xrank"
+        x.mkdir()
+        (x / "r1.md").write_text("nothing relevant\n")
+        with pytest.raises(ValueError, match="FINAL RANKING"):
+            _iter_rankings(str(x))
 
-# ─────────────────────────────────────────────────────────────────────────────
-# (d) panel_rank_aggregate hand-computed (3 reviewers)
-# ─────────────────────────────────────────────────────────────────────────────
-def test_panel_rank_aggregate_hand_computed_parity(tmp_path):
-    """3 reviewers with rankings ('A C B', 'B A C', 'A B C'), N=3:
-        borda scale p=0→2, p=1→1, p=2→0
-          A: r1=2 (p=0), r2=1 (p=1), r3=2 (p=0)   → Σ = 5
-          B: r1=0 (p=2), r2=2 (p=0), r3=1 (p=1)   → Σ = 3
-          C: r1=1 (p=1), r2=0 (p=2), r3=0 (p=2)   → Σ = 1
-        mean_rank (1-indexed average position):
-          A: (1+2+1)/3 = 1.3333
-          B: (3+1+2)/3 = 2.0000
-          C: (2+3+3)/3 = 2.6667
-      Sort: borda DESC → glm(5) > kimi(3) > opus(1). Both sides must
-      emit panel-rank-aggregate.json with this exact shape + ordering.
-    """
-    _which_bash()
-    x = tmp_path / "xrank"
-    x.mkdir()
-    (x / "r1.md").write_text("# R1\npreamble\nFINAL RANKING: A C B\n")
-    (x / "r2.md").write_text("# R2\npreamble\nFINAL RANKING: B A C\n")
-    (x / "r3.md").write_text("# R3\npreamble\nFINAL RANKING: A B C\n")
-    lm = tmp_path / "label_map.json"
-    lm.write_text(json.dumps({"A": "glm", "B": "kimi", "C": "opus"}))
+    def test_missing_dir_raises_file_not_found(self, tmp_path):
+        bogus = str(tmp_path / "nope")
+        with pytest.raises(FileNotFoundError):
+            _iter_rankings(bogus)
 
-    # Bash
-    r_bash = _bash_panel_rank_aggregate(str(x), str(lm))
-    assert r_bash.returncode == 0, f"bash rc={r_bash.returncode}\nstderr={r_bash.stderr}"
-    bash_out = _read_json(x / "panel-rank-aggregate.json")
-    assert isinstance(bash_out, list) and len(bash_out) == 3
-    bash_by_label = {e["label"]: e for e in bash_out}
-    assert int(bash_by_label["A"]["borda"]) == 5
-    assert int(bash_by_label["B"]["borda"]) == 3
-    assert int(bash_by_label["C"]["borda"]) == 1
-    assert abs(float(bash_by_label["A"]["mean_rank"]) - 1.3333) < _FLOAT_TOL
-    assert abs(float(bash_by_label["B"]["mean_rank"]) - 2.0000) < _FLOAT_TOL
-    assert abs(float(bash_by_label["C"]["mean_rank"]) - 2.6667) < _FLOAT_TOL
-    bash_order = [e["family"] for e in bash_out]
-    assert bash_order == ["glm", "kimi", "opus"], f"bash order={bash_order}"
-
-    # Reset output and run python on the same input
-    (x / "panel-rank-aggregate.json").unlink()
-    py_out = pb.panel_rank_aggregate(str(x), str(lm))
-    assert isinstance(py_out, list) and len(py_out) == 3
-    py_by_label: dict = {e["label"]: e for e in py_out}
-    assert int(str(py_by_label["A"]["borda"])) == 5
-    assert int(str(py_by_label["B"]["borda"])) == 3
-    assert int(str(py_by_label["C"]["borda"])) == 1
-    assert abs(float(str(py_by_label["A"]["mean_rank"])) - 1.3333) < _FLOAT_TOL
-    assert abs(float(str(py_by_label["B"]["mean_rank"])) - 2.0000) < _FLOAT_TOL
-    assert abs(float(str(py_by_label["C"]["mean_rank"])) - 2.6667) < _FLOAT_TOL
-    py_order = [e["family"] for e in py_out]
-    assert py_order == ["glm", "kimi", "opus"], f"python order={py_order}"
-
-    # The output file written by python must round-trip identically.
-    py_out_file = _read_json(x / "panel-rank-aggregate.json")
-    assert py_out_file == py_out
+    def test_ignores_subdirectories(self, tmp_path):
+        x = tmp_path / "xrank"
+        x.mkdir()
+        (x / "r1.md").write_text("FINAL RANKING: A B\n")
+        (x / "subdir").mkdir()
+        (x / "subdir" / "r2.md").write_text("FINAL RANKING: B A\n")
+        out = _iter_rankings(str(x))
+        assert out == [["A", "B"]]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# (e) panel_rank_aggregate tie-break (borda+mean_rank tie → family ASC)
-# ─────────────────────────────────────────────────────────────────────────────
-def test_panel_rank_aggregate_tiebreak_parity(tmp_path):
-    """N=2, 2 reviewers with anti-symmetric ranking ('A B', 'B A') →
-    borda_tie=1 each, mean_rank=1.5 each. Tie broken by family
-    alphabetical (alpha < bravo)."""
-    _which_bash()
-    x = tmp_path / "xrank_tb"
-    x.mkdir()
-    (x / "r1.md").write_text("FINAL RANKING: A B\n")
-    (x / "r2.md").write_text("FINAL RANKING: B A\n")
-    lm = tmp_path / "label_map_tb.json"
-    lm.write_text(json.dumps({"A": "bravo", "B": "alpha"}))
+class TestPanelAnonymize:
+    def test_happy_path_byte_matches_source_via_label_map(self, tmp_path):
+        r = tmp_path / "reports"
+        o = tmp_path / "out"
+        _write_lens_families(r, ["glm", "kimi", "opus"])
 
-    r_bash = _bash_panel_rank_aggregate(str(x), str(lm))
-    assert r_bash.returncode == 0, f"bash rc={r_bash.returncode}\nstderr={r_bash.stderr}"
-    bash_out = _read_json(x / "panel-rank-aggregate.json")
-    bash_order = [e["family"] for e in bash_out]
-    assert bash_order == ["alpha", "bravo"], f"bash tie-break order={bash_order}"
+        label_map = panel_anonymize(str(r), str(o), 42)
 
-    (x / "panel-rank-aggregate.json").unlink()
-    py_out = pb.panel_rank_aggregate(str(x), str(lm))
-    py_order = [e["family"] for e in py_out]
-    assert py_order == ["alpha", "bravo"], f"python tie-break order={py_order}"
+        assert set(label_map.keys()) == {"A", "B", "C"}
+        assert set(label_map.values()) == {"glm", "kimi", "opus"}
+        for label, family in label_map.items():
+            assert (o / f"resp-{label}.md").read_bytes() == (
+                r / f"lens-{family}.md"
+            ).read_bytes()
+
+    def test_label_map_written_as_sibling_not_inside_out_dir(self, tmp_path):
+        r = tmp_path / "reports"
+        o = tmp_path / "out"
+        _write_lens_families(r, ["glm", "kimi"])
+
+        panel_anonymize(str(r), str(o), 0)
+
+        sibling = o.with_name(o.name + ".label_map.json")
+        assert sibling.is_file()
+        assert not (o / "label_map.json").exists()
+
+    def test_returned_dict_matches_written_file(self, tmp_path):
+        r = tmp_path / "reports"
+        o = tmp_path / "out"
+        _write_lens_families(r, ["glm", "kimi"])
+
+        returned = panel_anonymize(str(r), str(o), 5)
+        on_disk = json.loads(o.with_name(o.name + ".label_map.json").read_text())
+        assert returned == on_disk
+
+    def test_same_seed_is_deterministic_across_invocations(self, tmp_path):
+        r = tmp_path / "reports"
+        _write_lens_families(r, ["glm", "kimi", "opus"])
+
+        map_a = panel_anonymize(str(r), str(tmp_path / "out_a"), 42)
+        map_b = panel_anonymize(str(r), str(tmp_path / "out_b"), 42)
+        assert map_a == map_b
+
+    def test_different_seeds_can_produce_different_mappings(self, tmp_path):
+        r = tmp_path / "reports"
+        _write_lens_families(r, ["glm", "kimi", "opus"])
+
+        map_42 = panel_anonymize(str(r), str(tmp_path / "out_42"), 42)
+        map_99 = panel_anonymize(str(r), str(tmp_path / "out_99"), 99)
+        assert map_42 != map_99
+
+    def test_default_seed_is_zero(self, tmp_path):
+        r = tmp_path / "reports"
+        _write_lens_families(r, ["glm", "kimi"])
+
+        explicit = panel_anonymize(str(r), str(tmp_path / "out_explicit"), 0)
+        default = panel_anonymize(str(r), str(tmp_path / "out_default"))
+        assert explicit == default
+
+    def test_missing_reports_dir_raises_with_path_in_message(self, tmp_path):
+        bogus = str(tmp_path / "no_such_reports")
+        out = str(tmp_path / "out")
+        with pytest.raises(FileNotFoundError) as exc:
+            panel_anonymize(bogus, out, 0)
+        assert "not found" in str(exc.value).lower()
+        assert bogus in str(exc.value)
+
+    def test_no_lens_files_raises_file_not_found(self, tmp_path):
+        r = tmp_path / "reports"
+        r.mkdir()
+        (r / "readme.md").write_text("not a lens file")
+        with pytest.raises(FileNotFoundError, match="no lens-\\*.md"):
+            panel_anonymize(str(r), str(tmp_path / "out"), 0)
+
+    def test_more_than_26_families_raises_value_error(self, tmp_path):
+        r = tmp_path / "reports"
+        families = [f"family{i:02d}" for i in range(27)]
+        _write_lens_families(r, families)
+        with pytest.raises(ValueError, match="more than 26"):
+            panel_anonymize(str(r), str(tmp_path / "out"), 0)
+
+    def test_multi_segment_family_name_preserved_verbatim(self, tmp_path):
+        r = tmp_path / "reports"
+        _write_lens_families(r, ["glm-4.5"])
+        label_map = panel_anonymize(str(r), str(tmp_path / "out"), 0)
+        assert set(label_map.values()) == {"glm-4.5"}
+
+    def test_out_dir_is_created_if_missing_including_parents(self, tmp_path):
+        r = tmp_path / "reports"
+        _write_lens_families(r, ["glm"])
+        o = tmp_path / "nested" / "deeper" / "out"
+        panel_anonymize(str(r), str(o), 0)
+        assert o.is_dir()
+        assert (o / "resp-A.md").is_file()
+
+    def test_out_dir_already_existing_is_not_an_error(self, tmp_path):
+        r = tmp_path / "reports"
+        _write_lens_families(r, ["glm"])
+        o = tmp_path / "out"
+        o.mkdir()
+        panel_anonymize(str(r), str(o), 0)  # should not raise
+        assert (o / "resp-A.md").is_file()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# (f) panel_permute_order determinism (same seed → same order)
-# ─────────────────────────────────────────────────────────────────────────────
-def test_panel_permute_order_determinism_parity(tmp_path):
-    """Same seed on the SAME implementation must yield identical order
-    (deterministic). Different seeds on the same implementation must
-    yield different orders (with high prob). 5 files: alpha/beta/gamma
-    /delta/epsilon."""
-    _which_bash()
-    p = tmp_path / "perm_reports"
-    p.mkdir()
-    for f in ("alpha", "beta", "gamma", "delta", "epsilon"):
-        (p / f"{f}.md").write_text("")
+class TestPanelRankAggregate:
+    def _write_hand_computed_fixture(self, tmp_path):
+        x = tmp_path / "xrank"
+        x.mkdir()
+        (x / "r1.md").write_text("# R1\npreamble\nFINAL RANKING: A C B\n")
+        (x / "r2.md").write_text("# R2\npreamble\nFINAL RANKING: B A C\n")
+        (x / "r3.md").write_text("# R3\npreamble\nFINAL RANKING: A B C\n")
+        lm = tmp_path / "label_map.json"
+        lm.write_text(json.dumps({"A": "glm", "B": "kimi", "C": "opus"}))
+        return x, lm
 
-    # Bash: same seed → same order
-    r1 = _bash_panel_permute_order(str(p), 1)
-    r2 = _bash_panel_permute_order(str(p), 1)
-    assert r1.returncode == 0 and r2.returncode == 0
-    assert r1.stdout == r2.stdout, (
-        f"bash panel_permute_order seed=1 not deterministic:\n{r1.stdout!r}\nvs\n{r2.stdout!r}"
-    )
+    def test_hand_computed_borda_and_mean_rank(self, tmp_path):
+        # 3 reviewers ('A C B', 'B A C', 'A B C'), N=3:
+        #   Borda scale p=0→2, p=1→1, p=2→0.
+        #     A: r1=2, r2=1, r3=2 → Σ=5     mean_rank: (1+2+1)/3 = 1.3333
+        #     B: r1=0, r2=2, r3=1 → Σ=3     mean_rank: (3+1+2)/3 = 2.0000
+        #     C: r1=1, r2=0, r3=0 → Σ=1     mean_rank: (2+3+3)/3 = 2.6667
+        x, lm = self._write_hand_computed_fixture(tmp_path)
 
-    # Bash: different seed → different order (with retry)
-    bash_seed = 2
-    rb = _bash_panel_permute_order(str(p), bash_seed)
-    assert rb.returncode == 0
-    tries = 0
-    while r1.stdout == rb.stdout and tries < 2:
-        tries += 1
-        bash_seed = 2 + tries
-        rb = _bash_panel_permute_order(str(p), bash_seed)
-        assert rb.returncode == 0
-    assert r1.stdout != rb.stdout, (
-        f"bash seed=1 vs seed={bash_seed} produced identical order "
-        f"(collision after {tries + 1} retries)"
-    )
+        out = panel_rank_aggregate(str(x), str(lm))
 
-    # Python: same seed → same order
-    py1 = pb.panel_permute_order(str(p), 1)
-    py2 = pb.panel_permute_order(str(p), 1)
-    assert py1 == py2, f"python seed=1 not deterministic: {py1} vs {py2}"
+        by_label = {e["label"]: e for e in out}
+        assert by_label["A"]["borda"] == 5
+        assert by_label["B"]["borda"] == 3
+        assert by_label["C"]["borda"] == 1
+        assert by_label["A"]["mean_rank"] == pytest.approx(1.3333)
+        assert by_label["B"]["mean_rank"] == pytest.approx(2.0000)
+        assert by_label["C"]["mean_rank"] == pytest.approx(2.6667)
 
-    # Python: different seed → different order (with retry)
-    py_seed = 2
-    pyb = pb.panel_permute_order(str(p), py_seed)
-    tries = 0
-    while py1 == pyb and tries < 2:
-        tries += 1
-        py_seed = 2 + tries
-        pyb = pb.panel_permute_order(str(p), py_seed)
-    assert py1 != pyb, f"python seed=1 vs seed={py_seed} produced identical order"
+    def test_sort_order_is_borda_desc(self, tmp_path):
+        x, lm = self._write_hand_computed_fixture(tmp_path)
+        out = panel_rank_aggregate(str(x), str(lm))
+        assert [e["family"] for e in out] == ["glm", "kimi", "opus"]
+
+    def test_output_file_round_trips_the_return_value(self, tmp_path):
+        x, lm = self._write_hand_computed_fixture(tmp_path)
+        out = panel_rank_aggregate(str(x), str(lm))
+        on_disk = json.loads((x / "panel-rank-aggregate.json").read_text())
+        assert on_disk == out
+
+    def test_tie_break_falls_back_to_family_alphabetical(self, tmp_path):
+        # N=2, anti-symmetric rankings force a Borda AND mean_rank tie;
+        # the sort must then fall back to family name ascending.
+        x = tmp_path / "xrank_tb"
+        x.mkdir()
+        (x / "r1.md").write_text("FINAL RANKING: A B\n")
+        (x / "r2.md").write_text("FINAL RANKING: B A\n")
+        lm = tmp_path / "label_map_tb.json"
+        lm.write_text(json.dumps({"A": "bravo", "B": "alpha"}))
+
+        out = panel_rank_aggregate(str(x), str(lm))
+
+        assert [e["family"] for e in out] == ["alpha", "bravo"]
+        assert out[0]["borda"] == out[1]["borda"]
+        assert out[0]["mean_rank"] == out[1]["mean_rank"]
+
+    def test_label_missing_from_label_map_falls_back_to_unknown(self, tmp_path):
+        x = tmp_path / "xrank"
+        x.mkdir()
+        (x / "r1.md").write_text("FINAL RANKING: A Z\n")
+        lm = tmp_path / "label_map.json"
+        lm.write_text(json.dumps({"A": "glm"}))  # Z is not in the map
+
+        out = panel_rank_aggregate(str(x), str(lm))
+
+        by_label = {e["label"]: e for e in out}
+        assert by_label["Z"]["family"] == "unknown"
+        assert by_label["A"]["family"] == "glm"
+
+    def test_missing_xrank_dir_raises_file_not_found(self, tmp_path):
+        bogus = str(tmp_path / "nope")
+        lm = tmp_path / "label_map.json"
+        lm.write_text("{}")
+        with pytest.raises(FileNotFoundError):
+            panel_rank_aggregate(bogus, str(lm))
+
+    def test_missing_label_map_raises_file_not_found(self, tmp_path):
+        x = tmp_path / "xrank"
+        x.mkdir()
+        (x / "r1.md").write_text("FINAL RANKING: A B\n")
+        bogus_lm = str(tmp_path / "no_such_label_map.json")
+        with pytest.raises(FileNotFoundError):
+            panel_rank_aggregate(str(x), bogus_lm)
+
+    def test_no_reviewer_file_with_marker_raises_value_error(self, tmp_path):
+        x = tmp_path / "xrank"
+        x.mkdir()
+        (x / "r1.md").write_text("nothing relevant here\n")
+        lm = tmp_path / "label_map.json"
+        lm.write_text("{}")
+        with pytest.raises(ValueError, match="FINAL RANKING"):
+            panel_rank_aggregate(str(x), str(lm))
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# (g) panel_permute_order multiset preservation
-# ─────────────────────────────────────────────────────────────────────────────
-def test_panel_permute_order_multiset_parity(tmp_path):
-    """Both sides must emit a permutation of the source basenames —
-    count + multiset preserved. 7 files of varying lengths."""
-    _which_bash()
-    p = tmp_path / "perm_multi"
-    p.mkdir()
-    files = ["alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf"]
-    for f in files:
-        (p / f"{f}.md").write_text("")
-    src_sorted = sorted(f"{f}.md" for f in files)
+class TestPanelPermuteOrder:
+    def _write_md_files(self, dirpath, names: list[str]) -> None:
+        dirpath.mkdir(parents=True, exist_ok=True)
+        for n in names:
+            (dirpath / f"{n}.md").write_text("")
 
-    r_bash = _bash_panel_permute_order(str(p), 7)
-    assert r_bash.returncode == 0, f"bash rc={r_bash.returncode}\nstderr={r_bash.stderr}"
-    bash_lines = sorted(line for line in r_bash.stdout.splitlines() if line)
-    assert bash_lines == src_sorted, (
-        f"bash output not a permutation of source: got {bash_lines}"
-    )
-    assert len(bash_lines) == len(set(bash_lines)), "bash output has duplicates"
+    def test_same_seed_is_deterministic(self, tmp_path):
+        p = tmp_path / "perm_reports"
+        self._write_md_files(p, ["alpha", "beta", "gamma", "delta", "epsilon"])
 
-    py_out = pb.panel_permute_order(str(p), 7)
-    assert sorted(py_out) == src_sorted, (
-        f"python output not a permutation of source: got {sorted(py_out)}"
-    )
-    assert len(py_out) == len(set(py_out)), "python output has duplicates"
+        out1 = panel_permute_order(str(p), 1)
+        out2 = panel_permute_order(str(p), 1)
+        assert out1 == out2
+
+    def test_different_seeds_can_produce_different_orders(self, tmp_path):
+        p = tmp_path / "perm_reports"
+        self._write_md_files(p, ["alpha", "beta", "gamma", "delta", "epsilon"])
+
+        out1 = panel_permute_order(str(p), 1)
+        out2 = panel_permute_order(str(p), 2)
+        assert out1 != out2
+
+    def test_output_is_a_permutation_of_source_basenames(self, tmp_path):
+        p = tmp_path / "perm_multi"
+        files = ["alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf"]
+        self._write_md_files(p, files)
+
+        out = panel_permute_order(str(p), 7)
+
+        assert sorted(out) == sorted(f"{f}.md" for f in files)
+        assert len(out) == len(set(out))
+
+    def test_default_seed_is_zero(self, tmp_path):
+        p = tmp_path / "perm_reports"
+        self._write_md_files(p, ["alpha", "beta", "gamma"])
+
+        explicit = panel_permute_order(str(p), 0)
+        default = panel_permute_order(str(p))
+        assert explicit == default
+
+    def test_ignores_non_md_files(self, tmp_path):
+        p = tmp_path / "perm_reports"
+        p.mkdir()
+        (p / "alpha.md").write_text("")
+        (p / "notes.txt").write_text("")
+        (p / "README").write_text("")
+
+        out = panel_permute_order(str(p), 0)
+        assert out == ["alpha.md"]
+
+    def test_ignores_subdirectories_even_if_named_like_md(self, tmp_path):
+        p = tmp_path / "perm_reports"
+        p.mkdir()
+        (p / "alpha.md").write_text("")
+        (p / "subdir.md").mkdir()
+
+        out = panel_permute_order(str(p), 0)
+        assert out == ["alpha.md"]
+
+    def test_empty_dir_returns_empty_list(self, tmp_path):
+        p = tmp_path / "perm_reports"
+        p.mkdir()
+        assert panel_permute_order(str(p), 0) == []
+
+    def test_missing_dir_raises_file_not_found(self, tmp_path):
+        bogus = str(tmp_path / "nope")
+        with pytest.raises(FileNotFoundError) as exc:
+            panel_permute_order(bogus, 0)
+        assert bogus in str(exc.value)
