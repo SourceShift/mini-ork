@@ -250,7 +250,10 @@ def _resolve_from_registry(
 ) -> ProviderSpec:
     entry = registry.get(name)
     if not isinstance(entry, Mapping):
-        raise ValueError(f"unknown model lane: {name!r}")
+        # "unknown lane" (not "unknown model lane") is the load-bearing substring:
+        # dispatch_model's preflight surfaces this verbatim and test_dispatch_py +
+        # the bash lane_health contract both grep for "unknown lane".
+        raise ValueError(f"unknown lane: {name!r}")
 
     kind = entry.get("kind")
     supported = {
