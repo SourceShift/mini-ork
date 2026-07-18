@@ -311,16 +311,21 @@ def main(argv: list[str] | None = None) -> int:
     sys.stdout.write(f"{suggestions_json.rstrip(chr(10))}\n")
 
     # ── side-channel: pattern_store (MO_PATTERN_MINER) ──────────────────────
+    # Native: mine_from_traces() reimplements pattern_store_mine_from_traces in-
+    # process (byte-parity verified on the real state.db — both return 9). Unlike
+    # cross_epic's promote(), it returns without printing, so no stdout capture is
+    # needed. try/except mirrors _bash_lib_call's `|| echo 0`.
     patterns_written = 0
     if os.environ.get("MO_PATTERN_MINER", "1") != "0":
         window = os.environ.get("MO_PATTERN_MINER_WINDOW", "7d")
         min_cluster = os.environ.get("MO_PATTERN_MINER_MIN_CLUSTER", "3")
-        patterns_written = _bash_lib_call(
-            "pattern_store",
-            "pattern_store_mine_from_traces",
-            f"--window {window} --min-cluster {min_cluster}",
-            subprocess_env,
-        )
+        from mini_ork.ported import pattern_store
+        try:
+            patterns_written = pattern_store.mine_from_traces(
+                db_path=db_path, window=window, min_cluster=int(min_cluster)
+            )
+        except Exception:
+            patterns_written = 0
         sys.stdout.write(f"  [pattern_miner] wrote {patterns_written or 0} pattern_records rows\n")
 
     # ── learning-loop write-back ───────────────────────────────────────────
