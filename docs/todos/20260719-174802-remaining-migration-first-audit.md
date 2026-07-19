@@ -52,7 +52,7 @@ Current status: completed and source-applied from the green isolated proposal pr
 
 Current status: `reflect` preflight prepared; classify → plan → cli → execute not started. The ordering is unchanged.
 
-Remaining parts: with user confirmation, repair the two pre-existing reflect parity tests whose Bash pass mutates the shared fixture database before the Python pass; rerun the green pre-retirement oracle; obtain separate paid-run approval; then run the same five-verifier pipeline, apply only passing diffs, update migration documentation, and repeat the requirements audit after each closure.
+Remaining parts: obtain paid-run approval; then run the same five-verifier pipeline, apply only passing diffs, update migration documentation, and repeat the requirements audit after each closure. The clean isolated target already passes all 8 pre-retirement reflect parity tests, so the two failures seen only in the dirty source checkout do not currently require a test change.
 
 ## Second requirements audit
 
@@ -86,6 +86,6 @@ Completed: 2026-07-19
 - Confirmed generic bookkeeping uses `run-verdict.json` and preserves a recipe-owned detailed `verdict.json`.
 - Confirmed all 50 executor tests pass, including same-run mirror visibility, detailed-verdict preservation, and recipe-specific reviewer evidence.
 - Confirmed 15 verify/CLI unit tests, 8 integration assertions, 18 E2E assertions, Pyright, validate, shell syntax, diff hygiene, and garden (0 errors, 0 warnings) pass.
-- Ran the repository-wide suite directly because `make test` has no target: 1,805 passed, 5 skipped, and 3 pre-existing/out-of-scope failures reproduced in isolation (one user-owned capability-policy mismatch and two reflect shared-database mutation cases). Per repository instructions, those unrelated tests were diagnosed but not changed.
+- Ran the repository-wide suite directly because `make test` has no target: 1,805 passed, 5 skipped, and 3 source-checkout-state failures (one user-owned capability-policy mismatch and two reflect cases). The reflect failures reproduced in the dirty source checkout, were not changed, and do not reproduce in the clean isolated migration target, where all 8 tests pass.
 
-The verify fork and its artifact-handoff prerequisite are done locally. The corrected `reflect` kickoff is prepared, but its pre-retirement oracle has two reproduced baseline failures and must be green before spending on the run. The later five forks remain pending in the required order and need explicit cost approval one run at a time; the next paid run is `reflect`.
+The verify fork and its artifact-handoff prerequisite are done locally. The corrected `reflect` kickoff and isolated worktree are prepared, and the clean target's 8-test pre-retirement oracle is green. The later five forks remain pending in the required order and need explicit cost approval one run at a time; the next paid run is `reflect`.

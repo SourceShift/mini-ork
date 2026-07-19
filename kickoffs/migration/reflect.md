@@ -15,14 +15,14 @@ must operate on the explicit isolated target.
 - **python entrypoint:** `/private/tmp/mini-ork-self-migrate-reflect/mini_ork/ported/mini_ork_reflect.py`
 - **bash entrypoint to retire:** `/private/tmp/mini-ork-self-migrate-reflect/bin/mini-ork-reflect`
 
-## Mandatory preflight blocker
+## Preflight evidence
 
-Do not start the paid self-migrate run until
-`tests/unit/test_mini_ork_reflect_py.py` is green before retirement. On the
-2026-07-19 source baseline, `test_opt_out_pattern_miner` and
-`test_combined_opt_out` fail because the Bash sweep mutates the shared fixture
-database before the Python sweep observes it. The recipe's
-`pre-retirement-parity` node is fail-closed and will reject that baseline.
+The exact isolated target passed all 8 tests in
+`tests/unit/test_mini_ork_reflect_py.py` before retirement. Two reflect tests
+failed in the dirty source checkout during the repository-wide suite, but they
+do not reproduce in this clean worktree; do not modify them unless the isolated
+run produces a new failure. The recipe's `pre-retirement-parity` node remains
+fail-closed and must preserve its own durable green report before migration.
 
 ## Inbound references to resolve
 
