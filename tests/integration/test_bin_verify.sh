@@ -1,11 +1,16 @@
 #!/usr/bin/env bash
-# tests/integration/test_bin_verify.sh — integration tests for bin/mini-ork-verify
+# tests/integration/test_bin_verify.sh — integration tests for the Python verifier module
 set -uo pipefail
 
-MINI_ORK_ROOT="${MINI_ORK_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
+MINI_ORK_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 export MINI_ORK_ROOT
 export PATH="$MINI_ORK_ROOT/bin:$PATH"
 export MINI_ORK_DRY_RUN=1
+
+mini_ork_verify() {
+  env PYTHONPATH="$MINI_ORK_ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+    python3 -m mini_ork.ported.mini_ork_verify "$@"
+}
 
 # Isolated tmp project
 TMPROOT=$(mktemp -d /tmp/ork-int-test-XXXXXX)
@@ -14,6 +19,9 @@ cd "$TMPROOT"
 git init -q
 export MINI_ORK_HOME="$TMPROOT/.mini-ork"
 export MINI_ORK_DB="$MINI_ORK_HOME/state.db"
+export MINI_ORK_ENGINE_ROOT="$MINI_ORK_ROOT"
+export MINI_ORK_PROJECT_HOME="$MINI_ORK_HOME"
+export MINI_ORK_TARGET_REPO="$TMPROOT"
 
 # Bootstrap
 mini-ork init >/dev/null 2>&1
@@ -37,6 +45,7 @@ EOF
 RUN_ID="run-test-verify-$$"
 export MINI_ORK_RUN_ID="$RUN_ID"
 RUN_DIR="$MINI_ORK_HOME/runs/$RUN_ID"
+export MINI_ORK_RUN_DIR="$RUN_DIR"
 mkdir -p "$RUN_DIR"
 PLAN_PATH="$RUN_DIR/plan.json"
 cat > "$PLAN_PATH" <<'JSON'
@@ -60,20 +69,20 @@ export MINI_ORK_PLAN_PATH="$PLAN_PATH"
 # A fake artifact file
 echo "artifact content" > "$TMPROOT/artifact.txt"
 
-echo "── integration: mini-ork-verify ──"
+echo "── integration: Python verify module ──"
 
 # === TESTS START ===
 
 # 1. --help exits 0 and prints usage
 echo ""
 echo "--- 1. --help exits 0 ---"
-if mini-ork-verify --help >/dev/null 2>&1; then
+if mini_ork_verify --help >/dev/null 2>&1; then
   _ok "--help exits 0"
 else
   _fail "--help exited non-zero"
 fi
 
-HELP_OUT=$(mini-ork-verify --help 2>&1 || true)
+HELP_OUT=$(mini_ork_verify --help 2>&1 || true)
 if echo "$HELP_OUT" | grep -qi "verify\|artifact\|verifier\|plan"; then
   _ok "--help output mentions expected keywords"
 else
@@ -84,7 +93,7 @@ fi
 echo ""
 echo "--- 2. Unknown flag exits 2 ---"
 EXITCODE=0
-mini-ork-verify --unknown-flag-xyz 2>/dev/null || EXITCODE=$?
+mini_ork_verify --unknown-flag-xyz 2>/dev/null || EXITCODE=$?
 if [ "$EXITCODE" -eq 2 ]; then
   _ok "unknown flag → exit 2"
 else
@@ -94,16 +103,16 @@ fi
 # 3. --dry-run with plan: lists verifiers, exits 0, emits JSON verdict=dry-run
 echo ""
 echo "--- 3. Dry-run: lists verifiers and emits JSON ---"
-OUT=$(mini-ork-verify --dry-run --plan "$PLAN_PATH" "$TMPROOT/artifact.txt" 2>&1 || true)
+OUT=$(mini_ork_verify --dry-run --plan "$PLAN_PATH" "$TMPROOT/artifact.txt" 2>&1 || true)
 EXITCODE=0
-mini-ork-verify --dry-run --plan "$PLAN_PATH" "$TMPROOT/artifact.txt" >/dev/null 2>&1 || EXITCODE=$?
+mini_ork_verify --dry-run --plan "$PLAN_PATH" "$TMPROOT/artifact.txt" >/dev/null 2>&1 || EXITCODE=$?
 if [ "$EXITCODE" -eq 0 ]; then
   _ok "dry-run exits 0"
 else
   _fail "dry-run exited $EXITCODE"
 fi
 
-JSON_OUT=$(mini-ork-verify --dry-run --plan "$PLAN_PATH" "$TMPROOT/artifact.txt" 2>/dev/null || true)
+JSON_OUT=$(mini_ork_verify --dry-run --plan "$PLAN_PATH" "$TMPROOT/artifact.txt" 2>/dev/null || true)
 # The output contains a prefix line + multi-line JSON block; extract the JSON object
 VERDICT=$(echo "$JSON_OUT" | python3 -c "
 import sys, json
@@ -138,7 +147,7 @@ fi
 # 4. Dry-run with plan: verifier name from artifact_contract appears in output
 echo ""
 echo "--- 4. Dry-run lists verifier names from plan ---"
-OUT=$(mini-ork-verify --dry-run --plan "$PLAN_PATH" "$TMPROOT/artifact.txt" 2>&1 || true)
+OUT=$(mini_ork_verify --dry-run --plan "$PLAN_PATH" "$TMPROOT/artifact.txt" 2>&1 || true)
 if echo "$OUT" | grep -qi "check_tests_pass\|dry.run.*verifier\|verifier.*check"; then
   _ok "dry-run output mentions verifier name from artifact_contract"
 else
@@ -153,7 +162,7 @@ echo "--- 5. No plan: exits 0 with pass verdict ---"
   unset MINI_ORK_PLAN_PATH
   mkdir -p "$MINI_ORK_HOME/runs"
   EXITCODE=0
-  JSON_OUT=$(mini-ork-verify --dry-run "$TMPROOT/artifact.txt" 2>/dev/null) || EXITCODE=$?
+  JSON_OUT=$(mini_ork_verify --dry-run "$TMPROOT/artifact.txt" 2>/dev/null) || EXITCODE=$?
   echo "EXIT:$EXITCODE"
   echo "JSON:$JSON_OUT"
 ) | {
@@ -170,7 +179,7 @@ echo "--- 5. No plan: exits 0 with pass verdict ---"
 echo ""
 echo "--- 6. --task-class flag accepted ---"
 EXITCODE=0
-mini-ork-verify --dry-run --plan "$PLAN_PATH" --task-class "code_fix" "$TMPROOT/artifact.txt" >/dev/null 2>&1 || EXITCODE=$?
+mini_ork_verify --dry-run --plan "$PLAN_PATH" --task-class "code_fix" "$TMPROOT/artifact.txt" >/dev/null 2>&1 || EXITCODE=$?
 if [ "$EXITCODE" -eq 0 ]; then
   _ok "--task-class code_fix dry-run exits 0"
 else
@@ -209,14 +218,14 @@ mkdir -p examples
 echo "# kickoff" > examples/kickoff.md
 (
   export MINI_ORK_DRY_RUN=0
-  OUT=$(mini-ork-verify --plan "$COMMAND_PLAN_PATH" "$TMPROOT/artifact.txt" 2>&1)
+  OUT=$(mini_ork_verify --plan "$COMMAND_PLAN_PATH" "$TMPROOT/artifact.txt" 2>&1)
   EXITCODE=$?
   echo "$OUT"
   exit "$EXITCODE"
-) >/tmp/mini-ork-verify-command-$$.log 2>&1
+) >/tmp/mini-ork-python-verify-command-$$.log 2>&1
 EXITCODE=$?
-OUT=$(cat /tmp/mini-ork-verify-command-$$.log)
-rm -f /tmp/mini-ork-verify-command-$$.log
+OUT=$(cat /tmp/mini-ork-python-verify-command-$$.log)
+rm -f /tmp/mini-ork-python-verify-command-$$.log
 if [ "$EXITCODE" -eq 0 ] && echo "$OUT" | grep -q '"verdict": "pass"'; then
   _ok "descriptive success_verifiers map to verifier_contract command"
 else

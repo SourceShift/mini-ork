@@ -7,20 +7,32 @@
 #
 # Inputs (env): MINI_ORK_RUN_DIR (required), MINI_ORK_ROOT (repo root),
 #               MO_FORK (the fork being migrated, e.g. "verify") — informational.
-# Output: JSON to stdout with .pass. Exit code always 0; caller reads .pass.
+# Output: JSON to stdout with .pass. Exit code mirrors .pass.
 
 set -uo pipefail
 RUN_DIR="${MINI_ORK_RUN_DIR:?MINI_ORK_RUN_DIR required}"
-REPO_ROOT="${MINI_ORK_ROOT:-$(pwd)}"
+REPO_ROOT="${MO_TARGET_CWD:-${MINI_ORK_ROOT:-$(pwd)}}"
 FORK="${MO_FORK:-}"
 HARNESS="$REPO_ROOT/scripts/runtime-parity-harness.sh"
 EVIDENCE="$RUN_DIR/verifier-parity.log"
+FORK_TEST="$REPO_ROOT/tests/unit/test_mini_ork_${FORK}_py.py"
 
 pass=true
 reasons=()
 
-if [ ! -f "$HARNESS" ]; then
-  pass=false; reasons+=("runtime-parity-harness.sh not found at $HARNESS")
+if [ -n "$FORK" ] && [ -f "$FORK_TEST" ]; then
+  if (
+    cd "$REPO_ROOT"
+    env -u MINI_ORK_RUN_DIR -u MINI_ORK_RECIPE -u MINI_ORK_RUN_ID \
+      -u MINI_ORK_PLAN_PATH -u MINI_ORK_TASK_CLASS \
+      python3 -m pytest "$FORK_TEST" -q -p no:cacheprovider
+  ) >"$EVIDENCE" 2>&1; then
+    pass=true
+  else
+    pass=false; reasons+=("fork parity test failed: $FORK_TEST — see verifier-parity.log")
+  fi
+elif [ ! -f "$HARNESS" ]; then
+  pass=false; reasons+=("no fork parity test and runtime-parity-harness.sh not found at $HARNESS")
 else
   if bash "$HARNESS" >"$EVIDENCE" 2>&1; then
     pass=true
@@ -42,3 +54,5 @@ print(json.dumps({
     "reasons": reasons,
 }))
 PY
+
+[ "$pass" = true ]

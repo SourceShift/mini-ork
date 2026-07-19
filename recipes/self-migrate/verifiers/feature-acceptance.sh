@@ -8,11 +8,11 @@
 #
 # Inputs (env): MINI_ORK_RUN_DIR (required), MINI_ORK_ROOT (repo root),
 #               MO_FORK (the fork/feature, e.g. "verify").
-# Output: JSON to stdout with .pass. Exit 0 always.
+# Output: JSON to stdout with .pass. Exit code mirrors .pass.
 
 set -uo pipefail
 RUN_DIR="${MINI_ORK_RUN_DIR:?MINI_ORK_RUN_DIR required}"
-REPO_ROOT="${MINI_ORK_ROOT:-$(pwd)}"
+REPO_ROOT="${MO_TARGET_CWD:-${MINI_ORK_ROOT:-$(pwd)}}"
 FORK="${MO_FORK:-}"
 GATE="$REPO_ROOT/gates/feature_acceptance.sh"
 EVIDENCE="$RUN_DIR/verifier-feature-acceptance.log"
@@ -35,7 +35,12 @@ fi
 # (b) the fork's Python test module + pyright on its port
 TESTF="$REPO_ROOT/tests/unit/test_mini_ork_${FORK}_py.py"
 if [ -n "$FORK" ] && [ -f "$TESTF" ]; then
-  if ( cd "$REPO_ROOT" && python3 -m pytest "$TESTF" -q -p no:cacheprovider ) >>"$EVIDENCE" 2>&1; then
+  if (
+    cd "$REPO_ROOT"
+    env -u MINI_ORK_RUN_DIR -u MINI_ORK_RECIPE -u MINI_ORK_RUN_ID \
+      -u MINI_ORK_PLAN_PATH -u MINI_ORK_TASK_CLASS \
+      python3 -m pytest "$TESTF" -q -p no:cacheprovider
+  ) >>"$EVIDENCE" 2>&1; then
     echo "[pytest] $TESTF PASS" >>"$EVIDENCE"
   else
     pass=false; reasons+=("pytest $TESTF failed")
@@ -43,7 +48,7 @@ if [ -n "$FORK" ] && [ -f "$TESTF" ]; then
 fi
 PORTF="$REPO_ROOT/mini_ork/ported/mini_ork_${FORK}.py"
 if [ -n "$FORK" ] && [ -f "$PORTF" ]; then
-  if ( cd "$REPO_ROOT" && python3 -m pyright "$PORTF" 2>&1 | grep -q '0 errors' ) ; then
+  if ( cd "$REPO_ROOT" && python3 -m pyright "$PORTF" 2>&1 | grep -F '0 errors' >/dev/null ) ; then
     echo "[pyright] $PORTF 0 errors" >>"$EVIDENCE"
   else
     pass=false; reasons+=("pyright on $PORTF not clean")
@@ -62,3 +67,5 @@ print(json.dumps({
     "reasons": reasons,
 }))
 PY
+
+[ "$pass" = true ]

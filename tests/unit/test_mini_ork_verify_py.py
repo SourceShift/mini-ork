@@ -1,10 +1,4 @@
-"""Parity gate: mini_ork.ported.mini_ork_verify vs bin/mini-ork-verify.
-
-A plan with pass/fail verifier scripts is run through the LIVE bash dispatcher
-and the port; the parsed verdict + pass/fail counts + per-verifier pass values
-must match (evidence paths carry timestamps, so those are excluded). Covers
---help, empty→vacuous, dry-run, all-pass, and mixed→partial.
-"""
+"""Golden contract tests for the sole Python verifier implementation."""
 from __future__ import annotations
 
 import json
@@ -17,11 +11,16 @@ REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
 from mini_ork.ported import mini_ork_verify as ver  # noqa: E402
 
-BIN = REPO / "bin" / "mini-ork-verify"
-
-
 def _env(home, db):
-    return {**os.environ, "MINI_ORK_ROOT": str(REPO), "MINI_ORK_HOME": str(home), "MINI_ORK_DB": db}
+    return {
+        **os.environ,
+        "MINI_ORK_ENGINE_ROOT": str(REPO),
+        "MINI_ORK_PROJECT_HOME": str(home),
+        "MINI_ORK_TARGET_REPO": str(home.parent),
+        "MINI_ORK_ROOT": str(REPO),
+        "MINI_ORK_HOME": str(home),
+        "MINI_ORK_DB": db,
+    }
 
 
 def _scenario(tmp_path, verifiers):
@@ -44,14 +43,7 @@ def _norm(js: str):
             [(r["verifier"], r["pass"]) for r in d["results"]])
 
 
-def _bash(home, db, *args):
-    r = subprocess.run(["bash", str(BIN), *args], capture_output=True, text=True, env=_env(home, db))
-    # the JSON is the {...} block on stdout
-    s = r.stdout[r.stdout.index("{"):] if "{" in r.stdout else r.stdout
-    return s, r.returncode
-
-
-def _py(home, db, *args):
+def _verify(home, db, *args):
     import io
     from contextlib import redirect_stdout, redirect_stderr
     o, e = io.StringIO(), io.StringIO()
@@ -67,48 +59,48 @@ def _py(home, db, *args):
     return s, rc
 
 
-def test_help_parity(tmp_path):
+def test_help_golden(tmp_path):
     home, db, _ = _scenario(tmp_path, [])
-    ob = subprocess.run(["bash", str(BIN), "--help"], capture_output=True, text=True, env=_env(home, db))
     import io
     from contextlib import redirect_stdout
     buf = io.StringIO()
     with redirect_stdout(buf):
         rc = ver.main(["--help"], db=db, root=str(REPO))
-    assert ob.returncode == rc == 0 and ob.stdout == buf.getvalue()
+    assert rc == 0
+    assert buf.getvalue() == ver._USAGE
 
 
-def test_all_pass_parity(tmp_path):
+def test_all_pass_golden(tmp_path):
     home, db, plan = _scenario(tmp_path, ["goodv"])
-    sb, rb = _bash(home, db, "art.txt", "--plan", plan)
-    sp, rp = _py(home, db, "art.txt", "--plan", plan)
-    assert rb == rp == 0
-    assert _norm(sb) == _norm(sp)
+    sp, rp = _verify(home, db, "art.txt", "--plan", plan)
+    assert rp == 0
+    assert _norm(sp) == ("pass", 1, 0, [("goodv", True), ("__gates__", True)])
     assert json.loads(sp)["verdict"] == "pass"
 
 
-def test_mixed_partial_parity(tmp_path):
+def test_mixed_partial_golden(tmp_path):
     home, db, plan = _scenario(tmp_path, ["goodv", "badv"])
-    sb, rb = _bash(home, db, "art.txt", "--plan", plan)
-    sp, rp = _py(home, db, "art.txt", "--plan", plan)
-    assert rb == rp == 0                       # partial → exit 0
-    assert _norm(sb) == _norm(sp)
+    sp, rp = _verify(home, db, "art.txt", "--plan", plan)
+    assert rp == 0
+    assert _norm(sp) == (
+        "partial", 1, 1,
+        [("goodv", True), ("badv", False), ("__gates__", True)],
+    )
     assert json.loads(sp)["verdict"] == "partial"
 
 
-def test_vacuous_parity(tmp_path):
+def test_vacuous_golden(tmp_path):
     home, db, plan = _scenario(tmp_path, [])   # no verifiers
-    sb, rb = _bash(home, db, "art.txt", "--plan", plan)
-    sp, rp = _py(home, db, "art.txt", "--plan", plan)
-    assert rb == rp == 0
-    assert json.loads(sb)["verdict"] == json.loads(sp)["verdict"] == "vacuous"
+    sp, rp = _verify(home, db, "art.txt", "--plan", plan)
+    assert rp == 0
+    assert _norm(sp) == ("vacuous", 0, 0, [("__gates__", True)])
 
 
-def test_dry_run_parity(tmp_path):
+def test_dry_run_golden(tmp_path):
     home, db, plan = _scenario(tmp_path, ["goodv", "badv"])
-    sb, _ = _bash(home, db, "art.txt", "--plan", plan, "--dry-run")
-    sp, _ = _py(home, db, "art.txt", "--plan", plan, "--dry-run")
-    assert _norm(sb) == _norm(sp)
+    sp, rp = _verify(home, db, "art.txt", "--plan", plan, "--dry-run")
+    assert rp == 0
+    assert _norm(sp) == ("dry-run", 0, 0, [("goodv", None), ("badv", None)])
     assert json.loads(sp)["verdict"] == "dry-run"
 
 
@@ -127,27 +119,23 @@ def _req_plan(home, artifact_path, verifiers=None):
 
 
 def test_missing_required_artifact_fails(tmp_path):
-    # (i) a required artifact that does not exist → hard FAIL (exit 1), both impls.
+    # A required artifact that does not exist is a hard failure.
     home, db, _ = _scenario(tmp_path, [])
     missing = tmp_path / "artifact.md"          # never created
     plan = _req_plan(home, missing)
-    sb, rb = _bash(home, db, str(missing), "--plan", plan)
-    sp, rp = _py(home, db, str(missing), "--plan", plan)
-    assert _norm(sb) == _norm(sp)
-    assert json.loads(sb)["verdict"] == json.loads(sp)["verdict"] == "fail"
-    assert rb == rp == 1
+    sp, rp = _verify(home, db, str(missing), "--plan", plan)
+    assert json.loads(sp)["verdict"] == "fail"
+    assert rp == 1
 
 
 def test_empty_required_artifact_fails(tmp_path):
-    # (i) a zero-byte required artifact → hard FAIL (exit 1), both impls.
+    # A zero-byte required artifact is also a hard failure.
     home, db, _ = _scenario(tmp_path, [])
     empty = tmp_path / "artifact.md"; empty.write_text("")   # exists but 0 bytes
     plan = _req_plan(home, empty)
-    sb, rb = _bash(home, db, str(empty), "--plan", plan)
-    sp, rp = _py(home, db, str(empty), "--plan", plan)
-    assert _norm(sb) == _norm(sp)
-    assert json.loads(sb)["verdict"] == json.loads(sp)["verdict"] == "fail"
-    assert rb == rp == 1
+    sp, rp = _verify(home, db, str(empty), "--plan", plan)
+    assert json.loads(sp)["verdict"] == "fail"
+    assert rp == 1
 
 
 def test_real_required_artifact_passes(tmp_path):
@@ -158,11 +146,9 @@ def test_real_required_artifact_passes(tmp_path):
     real.write_text("# Synthesis\n" + ("evidence line with a real finding\n" * 2000))
     assert real.stat().st_size > 30_000
     plan = _req_plan(home, real)
-    sb, rb = _bash(home, db, str(real), "--plan", plan)
-    sp, rp = _py(home, db, str(real), "--plan", plan)
-    assert _norm(sb) == _norm(sp)
-    assert json.loads(sb)["verdict"] == json.loads(sp)["verdict"] == "pass"
-    assert rb == rp == 0
+    sp, rp = _verify(home, db, str(real), "--plan", plan)
+    assert json.loads(sp)["verdict"] == "pass"
+    assert rp == 0
 
 
 def test_relative_output_is_exempt(tmp_path):
@@ -177,8 +163,6 @@ def test_relative_output_is_exempt(tmp_path):
             "success_verifiers": ["goodv"],
         },
     }))
-    sb, rb = _bash(home, db, "art.txt", "--plan", str(plan))
-    sp, rp = _py(home, db, "art.txt", "--plan", str(plan))
-    assert _norm(sb) == _norm(sp)
-    assert json.loads(sb)["verdict"] == json.loads(sp)["verdict"] == "pass"
-    assert rb == rp == 0
+    sp, rp = _verify(home, db, "art.txt", "--plan", str(plan))
+    assert json.loads(sp)["verdict"] == "pass"
+    assert rp == 0
