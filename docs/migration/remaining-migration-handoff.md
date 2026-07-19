@@ -333,6 +333,18 @@ Do not start the paid self-migrate run without explicit approval. The next live
 run must also confirm that its same-run reviewer consumes the harvested
 evidence.
 
+### Reflect launch attempt 1: `run-1784502357-9667`
+
+- The run stopped at planner dispatch before seam mapping or implementation.
+- The frozen run policy selected MiniMax for `planner`, but
+  `MINIMAX_API_KEY` is unset; `mini-ork doctor` reports MiniMax unavailable.
+- No proposal or verdict was produced, and the isolated reflect worktree stayed
+  clean at `0fe5071c`.
+- The safe retry uses process-local `_MO_LANE_PLANNER=codex` and
+  `_MO_LANE_GLM_LENS=codex` overrides. It does not edit the user-owned
+  `.mini-ork/config/agents.yaml` and still requires explicit paid-retry
+  approval.
+
 Each fork closure produces:
 - `self-migrate.diff` (reviewable, apply or reject)
 - `static-feature-ledger.json` (cost/verifiability map)
