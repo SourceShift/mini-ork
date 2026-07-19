@@ -1198,6 +1198,28 @@ def _required_artifacts_ok(plan_path) -> bool:
     return ok
 
 
+def _verifier_runs_before_implementer(workflow, node_id) -> bool:
+    """Return whether ``node_id`` is a pre-implementation verifier.
+
+    Baseline/parity capture nodes intentionally run before an implementer can
+    produce the plan's final artifacts. Applying the hollow-run artifact guard
+    to that phase creates a false failed-node count even when the baseline
+    verifier itself passes. Unknown or malformed workflows fail closed by
+    returning ``False``.
+    """
+    if not workflow or not node_id or not os.path.isfile(workflow):
+        return False
+    try:
+        import yaml  # noqa: PLC0415
+        nodes = (yaml.safe_load(open(workflow, encoding="utf-8")) or {}).get("nodes") or []
+        current = next(i for i, node in enumerate(nodes) if node.get("name") == node_id)
+        first_implementer = next(i for i, node in enumerate(nodes)
+                                 if node.get("type") == "implementer")
+    except (OSError, StopIteration, TypeError, AttributeError):
+        return False
+    return current < first_implementer
+
+
 def _run_verifier_ref(script, evidence_path, *, plan_path="", artifact_path="", cwd=None):
     """Port of _run_verifier_ref (minus the mo_runtime_exec seam): run the
     verifier script, capture evidence, and treat {"pass": true} as success."""
@@ -1571,6 +1593,14 @@ def _assemble_reviewer_inputs(run_dir):
     fixed_verifiers = {"verifier_typecheck.json", "verifier_test.json"}
     for name in sorted(fixed_verifiers):
         block += _sec(name, os.path.join(run_dir, name))
+    # The self-migrate pre-retirement report intentionally has a distinct name:
+    # it proves the legacy fork was green before deletion, rather than checking
+    # the post-migration implementation. Surface it whenever the recipe emitted
+    # it so the reviewer receives the complete retirement evidence set.
+    for name in ("pre-retirement-parity.json",):
+        path = os.path.join(run_dir, name)
+        if os.path.isfile(path) and os.path.getsize(path) > 0:
+            block += _sec(name, path)
     try:
         recipe_verifiers = sorted(
             name for name in os.listdir(run_dir)
@@ -1591,7 +1621,7 @@ def _assemble_reviewer_inputs(run_dir):
     else:
         block += "\n# review-diff.patch\n(no diff)\n"
     block += ("\n--- End reviewer inputs ---\n\n"
-              "REVIEWER NOTE: The four inputs above are required for a real verdict. If any "
+              "REVIEWER NOTE: The assembled inputs above are required for a real verdict. If any "
               "input is marked '(not available)' or '(no diff)', review what IS present. Only "
               "hard-abstain (verdict=needs_revision with reason 'inputs missing') when BOTH the "
               "diff and the summary are absent — that is the only genuine no-op case. A missing "
@@ -2214,10 +2244,19 @@ def dispatch_node(fields, *, root, run_dir, plan_path, task_class, db, run_id,
         print("  [skip] planner node handled by mini-ork-plan")
         return 0, "done"
     if node_type == "reflector":
-        # NEW-3: guard like bash's `… || true` (:2906) — a missing/non-exec binary
-        # must degrade gracefully, not crash the whole live run with FileNotFoundError.
+        # Preserve bash's `… || true`: reflection is a side-channel and must
+        # never fail the workflow node. Capturing output also prevents the
+        # reflect report from leaking into execute's stdout contract.
         try:
-            subprocess.run([os.path.join(root, "bin", "mini-ork-reflect")], capture_output=True)
+            subprocess.run(
+                [sys.executable, "-m", "mini_ork.ported.mini_ork_reflect"],
+                capture_output=True,
+                env={
+                    **os.environ,
+                    "MINI_ORK_ROOT": root,
+                    "PYTHONPATH": root + os.pathsep + os.environ.get("PYTHONPATH", ""),
+                },
+            )
         except OSError:
             pass
         return 0, "done"
@@ -2419,8 +2458,11 @@ def dispatch_node(fields, *, root, run_dir, plan_path, task_class, db, run_id,
     if node_type == "verifier":
         # Hollow-run guard: fail before any verifier runs if the recipe declares a
         # concrete run-local artifact (absolute contract path) that is missing or
-        # zero-byte. Covers the verifier_ref branch (which bypasses the canonical verifier).
-        if not _required_artifacts_ok(plan_path):
+        # zero-byte. Covers the verifier_ref branch (which bypasses the canonical
+        # verifier). A verifier ordered before the first implementer is a baseline
+        # oracle and cannot require artifacts that do not exist until implementation.
+        if (not _verifier_runs_before_implementer(workflow, node_id)
+                and not _required_artifacts_ok(plan_path)):
             print("  [fail] verifier node: required artifact(s) missing or empty", file=sys.stderr)
             return 1, "error"
         artifact = ""

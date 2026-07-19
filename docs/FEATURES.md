@@ -61,7 +61,7 @@ experience and feeds it forward:
 | Persistent state substrate | `.mini-ork/state.db` (SQLite, WAL) | `task_runs`, `execution_traces`, `gradient_records`, `pattern_records`, `benchmark_results`, `version_registry` survive across sessions, branches, machines. |
 | 8 memory namespaces | `db/migrations/` (19 migrations) | task / workflow / agent_performance / failure / recovery / user_preference / artifact / benchmark. |
 | Execution traces with lineage | `lib/trace_store.sh` | Every node dispatch records tool calls, files read/written, cost, duration, workflow-version hash, and prompt-template hash — full provenance per artifact. |
-| Textual gradient extraction | `lib/gradient_extractor.sh` + `bin/mini-ork-reflect` | Reflection turns failed/successful traces into natural-language "gradients": what to do differently next time, with confidence scores. |
+| Textual gradient extraction | `mini_ork/ported/mini_ork_reflect.py` + `mini_ork/ported/reflection_pipeline.py` | Reflection turns failed/successful traces into natural-language "gradients": what to do differently next time, with confidence scores. |
 | Prior-run memory injection | `lib/context_assembler.sh` + `bin/mini-ork-plan` | The planner prompt receives outcomes of the 5 most recent same-class runs (per-run: nodes, failures, cost, duration) — plans calibrate against history. |
 | Learned-failure-mode injection | `bin/mini-ork-execute` | High-confidence gradients for the task class are injected into node prompts at dispatch time. |
 | Auditable context packs | `bin/mini-ork-plan` (`context-pack.json`) | The full cite-tagged memory bundle available at plan time is persisted next to the plan — you can audit what the planner knew. |
