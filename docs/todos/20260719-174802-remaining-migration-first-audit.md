@@ -45,14 +45,22 @@ Current status: completed and source-applied from the green isolated proposal pr
    - Remaining parts: none.
 
 9. Make mirrored verifier evidence available before review
-   - Current status: implemented and regression-tested. The executor reconciles the target worktree's run mirror before reviewer dispatch, writes an implementer summary, includes recipe-specific reports in reviewer inputs, and preserves canonical generic and detailed verdicts separately.
-   - Remaining parts: live-confirm same-run reviewer visibility during the paid `reflect` fork.
+   - Current status: completed. The reflect run live-confirmed same-run map,
+     ledger, detailed verdict, diff, and recipe-report visibility; the follow-up
+     repair also surfaces the standalone pre-retirement report explicitly.
+   - Remaining parts: none.
 
 ## Later forks
 
-Current status: `reflect` preflight prepared; its first paid launch stopped at planner dispatch before changing the isolated target. Classify → plan → cli → execute are not started, and the ordering is unchanged.
+Current status: `reflect` is closed and source-applied from the passing isolated
+proposal in `run-1784503045-70610`. Classify → plan → cli → execute are not
+started, and the ordering is unchanged.
 
-Remaining parts: relaunch from the dedicated temporary runtime home whose frozen policy uses only Kimi, Codex, and GLM, with Kimi/GLM credentials loaded process-locally from `/Users/admin/ps/scripts`; then run the same five-verifier pipeline, apply only passing diffs, update migration documentation, and repeat the requirements audit after each closure. The clean isolated target already passes all 8 pre-retirement reflect parity tests, so the two failures seen only in the dirty source checkout do not currently require a test change.
+Remaining parts: prepare the isolated `classify` target and kickoff, then run the
+same five-verifier pipeline with only Kimi, Codex, and GLM. Load Kimi/GLM
+credentials process-locally from `/Users/admin/ps/scripts`, apply only passing
+diffs, update migration documentation, and repeat the requirements audit after
+each closure. Each new paid fork launch requires explicit approval.
 
 ## Second requirements audit
 
@@ -88,4 +96,6 @@ Completed: 2026-07-19
 - Confirmed 15 verify/CLI unit tests, 8 integration assertions, 18 E2E assertions, Pyright, validate, shell syntax, diff hygiene, and garden (0 errors, 0 warnings) pass.
 - Ran the repository-wide suite directly because `make test` has no target: 1,805 passed, 5 skipped, and 3 source-checkout-state failures (one user-owned capability-policy mismatch and two reflect cases). The reflect failures reproduced in the dirty source checkout, were not changed, and do not reproduce in the clean isolated migration target, where all 8 tests pass.
 
-The verify fork and its artifact-handoff prerequisite are done locally. The corrected `reflect` kickoff and isolated worktree are prepared, and the clean target's 8-test pre-retirement oracle is green. The later five forks remain pending in the required order and need explicit cost approval one run at a time; the next paid run is `reflect`.
+The verify and reflect forks and their artifact-handoff prerequisites are done
+locally. The later four forks remain pending in the required order and need
+explicit cost approval one run at a time; the next paid run is `classify`.

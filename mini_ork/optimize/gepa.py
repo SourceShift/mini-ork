@@ -1,6 +1,6 @@
 """GEPA-style reflective prompt optimizer (R4a standalone). Standalone — no
 wiring into the GRPO loop, ``lib/reflection_pipeline.sh``, or
-``bin/mini-ork-reflect``. R4b will integrate.
+``mini_ork.ported.mini_ork_reflect``. R4b will integrate.
 
 Budget semantic: ``budget`` = max OPTIMIZATION ITERATIONS. Each accepted
 mutation costs one full eval; rejected mutations cost only the two minibatch

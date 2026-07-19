@@ -69,13 +69,13 @@ For other forks, create a kickoff modeled after `recipes/self-migrate/example-ki
 
 ### Step 2: The recipe pipeline
 
-1. **seam_mapper (opus)** → `integration-map.json`
+1. **seam_mapper (GLM)** → `integration-map.json`
    - Every outbound seam (Python→bash shell-out)
    - Every inbound reference (bin/, lib/, mini_ork/, tests/, scripts/, web UI)
    - Runtime-select coupling
    - Close blockers
 
-2. **static_feature_ledger (opus)** → `static-feature-ledger.json`
+2. **static_feature_ledger (GLM)** → `static-feature-ledger.json`
    - Classify EVERY behavior in the Python module:
      - **static**: deterministic, ~0 tokens, byte-parity verifiable (the moat)
      - **agentic**: LLM call, expensive, weakly verifiable
@@ -96,7 +96,7 @@ For other forks, create a kickoff modeled after `recipes/self-migrate/example-ki
    - `ledger-shape.sh`: ledger completeness (every feature has a row, agentic rows have opportunity)
    - `fork-closure.sh`: physical entrypoint removal plus literal and dynamic caller scans
 
-5. **reviewer (opus)** → `verdict.json`
+5. **reviewer (GLM)** → `verdict.json`
    - `pass == parity_pass && acceptance_pass && ledger_complete && no_dangling_edge`
 
 ### Step 3: Verdict → apply or rollback
@@ -112,20 +112,28 @@ If `verdict.json` says `"pass": false`:
 - Fix the issue (re-run migrator, or fix the Python port, or fix a verifier)
 - Re-run the recipe
 
-## Lane policy (DO NOT CHANGE)
+## Lane policy for the remaining forks
 
 Set in `$MINI_ORK_HOME/config/agents.yaml`:
 
 | role | lane | backoff |
 |---|---|---|
 | implementer (`migrator`) | **codex** | codex |
-| mapper / ledger / reviewer | **opus** (`opus_lens`) | codex |
-| discovery lens (non-critical) | **GLM** (`glm_lens`) | codex |
+| planner / general research | **Kimi** (`kimi_current`) | codex |
+| mapper / ledger / reviewer | **GLM 5.2** (`glm_current`) | codex |
 
 **WHY this policy:**
 - Codex is the implementer lane (writing code, not analysis)
-- Opus is the strongest reasoner for deep judgment (reviewer, mapper, ledger)
-- GLM is analysis-only and hits 429 "Fair Usage" — use only for non-critical discovery
+- Kimi provides planning and broad discovery through the authenticated coding API
+- GLM 5.2 owns seam analysis, ledger judgment, and review
+- MiniMax and Opus are not provider values for the remaining migration runs
+
+Use a dedicated temporary `MINI_ORK_HOME` rather than editing the user's
+`.mini-ork/config/agents.yaml`. Load Kimi and GLM credentials process-locally
+from `/Users/admin/ps/scripts/cl_kimi.sh` and `cl_glm.sh`; never persist their
+values in repository files or run artifacts. The local Kimi Claude wrapper's
+hard-coded model is stale, so the reflect run used a run-local executable
+adapter against the authenticated Anthropic-compatible messages endpoint.
 
 ## Feature-acceptance probes
 
@@ -259,7 +267,7 @@ This ledger tells us WHERE to optimize mini-ork itself — the migration's real 
 
 Run the self-migrate recipe on each fork in recommended order:
 1. ✅ verify (closed and source-applied from the fully verified isolated Run 3 proposal; see the live evidence below)
-2. reflect
+2. ✅ reflect (closed and source-applied from `run-1784503045-70610`; see the live evidence below)
 3. classify
 4. plan
 5. cli
@@ -323,16 +331,6 @@ reviewer evidence assembly, and verdict preservation.
 - `bin/mini-ork garden` reports 0 errors and 0 warnings (265 informational stale-run notices only).
 - The repository-wide direct pytest run completed with 1,805 passed, 5 skipped, and 3 source-checkout-state failures: one capability-policy expectation affected by the user-owned `.mini-ork/config/agents.yaml`, plus two reflect opt-out tests. The reflect failures reproduced in the dirty source checkout but all 8 reflect tests pass in the clean isolated migration worktree. The documented `make test` command is unavailable because this checkout has no `test` Make target.
 
-### Next safe action
-
-Use `kickoffs/migration/reflect.md` and the isolated reflect worktree prepared
-from the focused verify-closure commit. The exact isolated target passes all 8
-pre-retirement reflect parity tests; the two failures observed in the dirty
-source checkout do not reproduce there, so no test repair is currently needed.
-Do not start the paid self-migrate run without explicit approval. The next live
-run must also confirm that its same-run reviewer consumes the harvested
-evidence.
-
 ### Reflect launch attempt 1: `run-1784502357-9667`
 
 - The run stopped at planner dispatch before seam mapping or implementation.
@@ -345,6 +343,47 @@ evidence.
   process-locally from `/Users/admin/ps/scripts/cl_kimi.sh` and `cl_glm.sh`;
   no secret or persistent user-owned policy is changed.
 
+## Live reflect evidence — 2026-07-20
+
+### Passing proposal: `run-1784503045-70610`
+
+- Isolated target: `/private/tmp/mini-ork-self-migrate-reflect`.
+- Provider policy used only Kimi, Codex, and GLM: Kimi planned, Codex migrated,
+  and GLM 5.2 mapped seams, built the authoritative ledger, and reviewed.
+- The proposal deletes `bin/mini-ork-reflect` and repoints the top-level CLI,
+  legacy executor, Python CLI, Python executor, GEPA wiring, and integration
+  coverage to `python -m mini_ork.ported.mini_ork_reflect`.
+- All five migration reports pass: durable pre-retirement parity,
+  post-retirement parity, feature acceptance, the 27-row static-feature ledger,
+  and deterministic fork closure. The GLM reviewer and detailed
+  `verdict.json` also pass.
+- The preserved proposal and isolated target diff were byte-identical
+  (`sha256: 173793e43fb3d24355b4d0683101c3d9578fa536157ceb7d51ed4efaecfb8f03`)
+  before promotion.
+- Post-apply checks pass: 11 reflect/GEPA tests, 11 integration assertions, 8
+  parity cases, reflect feature acceptance, Pyright, ledger shape, closure,
+  Bash syntax, and diff hygiene.
+
+### Executor repairs discovered by the completion audit
+
+- Reviewer assembly now includes the standalone
+  `pre-retirement-parity.json`, not only `verifier_*.json`, with focused
+  regression coverage.
+- The run's outer `failed_nodes=1` was traced to the generic hollow-artifact
+  guard running on `pre_retirement_parity` before the migrator could create
+  final artifacts. The executor now derives verifier phase from workflow order:
+  baseline verifiers before the first implementer may run, while every later
+  verifier remains fail-closed on missing artifacts.
+- The executor/CLI suite passes all 57 tests after both repairs; Pyright reports
+  zero errors on execute, CLI, and reflect.
+
+### Next safe action
+
+Prepare `kickoffs/migration/classify.md` and a clean isolated classify target
+from the focused reflect-closure commit. Preserve the Kimi/Codex/GLM-only
+runtime policy and the same five-verifier contract. Do not start the next paid
+self-migrate run without separate explicit approval.
+
 Each fork closure produces:
 - `self-migrate.diff` (reviewable, apply or reject)
 - `static-feature-ledger.json` (cost/verifiability map)
@@ -353,7 +392,7 @@ Each fork closure produces:
 
 **Final state:** pure Python runtime, no bash entrypoints, complete static-feature ledger for the entire codebase.
 
-## Current execution status (2026-07-19)
+## Historical verify execution findings (2026-07-19)
 
 The first isolated verify run is preserved at
 `.mini-ork/runs/run-1784474339-7704`. Its three original recipe verifiers
@@ -383,7 +422,8 @@ The run exposed five contract gaps:
    reviewer ran before sandbox-mirrored reports were reconciled. The runtime now
    harvests the allowlisted target-run mirror before reviewer dispatch, keeps
    detailed and generic verdicts separate, and regression-tests reviewer input
-   assembly. The next paid fork must confirm that contract in a live run.
+   assembly. The reflect run subsequently confirmed the artifact-handoff
+   contract and closed the final standalone-report omission.
 
 The detailed first-audit backlog is
 `docs/todos/20260719-174802-remaining-migration-first-audit.md`.

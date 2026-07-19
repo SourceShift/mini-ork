@@ -1,20 +1,18 @@
-"""Strangler-fig Python port of `bin/mini-ork-reflect`.
+"""Sole runtime implementation of the mini-ork reflect command.
 
 Mirrors the bash CLI byte-for-byte: same flags, same stdout/stderr lines,
 same env-var opt-out toggles (MO_PATTERN_MINER, MO_CROSS_EPIC_GRADIENTS,
 MO_BUG_REPORT_SWEEP, MO_RHO_AGGREGATE, MO_LANE_ROUTER), same SQLite writes
 via subprocess to the unported bash libs.
 
-Co-existence model (strangler-fig): bash `bin/mini-ork-reflect` is the
-authoritative source. This module mirrors its CLI surface and dispatches
+This module owns the CLI surface and dispatches
 the load-bearing pipeline call (`reflection_run`) to the ported Python
 implementation in `mini_ork.ported.reflection_pipeline`, while side-channel
 libs (pattern_store, cross_epic_gradient, bug_report, rho_aggregator,
 lane_router) are invoked via `subprocess.run(['bash','-c', ...])` so their
 sqlite writes are byte-identical to the bash CLI. Parity is enforced by
-`tests/unit/test_mini_ork_reflect_py.py` (>=6 cases that invoke the live
-bash subprocess via `subprocess.run(['bash',...])` and diff against the
-Python output byte-for-byte; floats 1e-6 tolerance).
+`tests/unit/test_mini_ork_reflect_py.py` (eight standalone golden and
+behavioral contracts captured after pre-retirement byte parity passed).
 
 GEPA optimizer block (MO_OPTIMIZER=gepa) is intentionally NOT ported: the
 default path (MO_OPTIMIZER unset) leaves the block fully skipped, which
@@ -92,7 +90,7 @@ def _resolve_reflect_model(lane: str, mini_ork_home: str) -> str:
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="mini-ork-reflect",
-        description="Reflection pipeline orchestrator (Python port of bin/mini-ork-reflect).",
+        description="Reflection pipeline orchestrator (Python runtime).",
         add_help=False,  # bash prints its own help text; mirror it
     )
     p.add_argument("--since", type=str, default="")
