@@ -56,11 +56,12 @@ Current status: `reflect` is closed and source-applied from the passing isolated
 proposal in `run-1784503045-70610`. Classify → plan → cli → execute are not
 started, and the ordering is unchanged.
 
-Remaining parts: prepare the isolated `classify` target and kickoff, then run the
-same five-verifier pipeline with only Kimi, Codex, and GLM. Load Kimi/GLM
-credentials process-locally from `/Users/admin/ps/scripts`, apply only passing
-diffs, update migration documentation, and repeat the requirements audit after
-each closure. Each new paid fork launch requires explicit approval.
+Remaining parts: the isolated `classify` target and canonical kickoff are now
+prepared at `86eba5e7`, with 5 unit parity tests, 9 integration assertions,
+feature acceptance, and Pyright green. After explicit approval, run the same
+five-verifier pipeline with only Kimi, Codex, and GLM. Load Kimi/GLM credentials
+process-locally from `/Users/admin/ps/scripts`, apply only passing diffs, update
+migration documentation, and repeat the requirements audit after each closure.
 
 ## Second requirements audit
 

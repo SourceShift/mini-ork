@@ -379,10 +379,13 @@ reviewer evidence assembly, and verdict preservation.
 
 ### Next safe action
 
-Prepare `kickoffs/migration/classify.md` and a clean isolated classify target
-from the focused reflect-closure commit. Preserve the Kimi/Codex/GLM-only
-runtime policy and the same five-verifier contract. Do not start the next paid
-self-migrate run without separate explicit approval.
+The canonical `kickoffs/migration/classify.md` and clean isolated target
+`/private/tmp/mini-ork-self-migrate-classify` are prepared at the focused
+reflect-closure commit `86eba5e7`. Its pre-retirement baseline passes 5 unit
+parity tests, 9 integration assertions, classify feature acceptance, and
+Pyright. The next action is the paid self-migrate launch using only Kimi,
+Codex, and GLM with credentials loaded process-locally from
+`/Users/admin/ps/scripts`. Do not start it without separate explicit approval.
 
 Each fork closure produces:
 - `self-migrate.diff` (reviewable, apply or reject)
