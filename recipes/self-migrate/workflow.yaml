@@ -1,0 +1,104 @@
+version: "0.1.0"
+task_class: self_migrate
+description: >
+  Per-fork migration pipeline. Maps one integration fork's seams (outbound
+  shell-outs + inbound refs), builds a static-vs-agentic feature ledger,
+  makes the Python side sole and repoints every inbound reference, then gates
+  the proposed diff on byte-parity vs the bash oracle, the affected
+  feature-acceptance probe, and ledger completeness. Emits a reviewable diff +
+  ledger + verdict.json without applying to main. The bash entrypoint is
+  retired in the DIFF only — the operator reviews before it lands.
+
+nodes:
+  # ── 1. map the fork's integration surface (opus reasons per seam) ──
+  - name: seam_mapper
+    type: planner
+    model_lane: opus_lens
+    prompt_ref: prompts/seam-mapper.md
+    dispatch_mode: serial
+
+  # ── 2a. cheap first-pass static/agentic scan (GLM, non-critical, codex-backoff) ──
+  - name: cost_verifiability_lens
+    type: researcher
+    model_lane: glm_lens
+    prompt_ref: prompts/cost-verifiability-lens.md
+    dispatch_mode: parallel
+    gates: [budget_gate]
+
+  # ── 2b. the authoritative static-feature ledger (opus judgment) ──
+  - name: static_feature_ledger
+    type: researcher
+    model_lane: opus_lens
+    prompt_ref: prompts/static-feature-ledger.md
+    dispatch_mode: parallel
+    gates: [budget_gate]
+
+  # ── 3. make Python sole + repoint every inbound ref (codex implements) ──
+  - name: migrator
+    type: implementer
+    model_lane: implementer
+    prompt_ref: prompts/migrator.md
+    dispatch_mode: serial
+    gates: [scope_gate, budget_gate]
+
+  # ── 4. the verify stack = the moat, made concrete ──
+  - name: parity_verifier
+    type: verifier
+    model_lane: verifier
+    prompt_ref: null
+    verifier_ref: verifiers/parity.sh
+    dispatch_mode: serial
+
+  - name: acceptance_verifier
+    type: verifier
+    model_lane: verifier
+    prompt_ref: null
+    verifier_ref: verifiers/feature-acceptance.sh
+    dispatch_mode: serial
+
+  - name: ledger_verifier
+    type: verifier
+    model_lane: verifier
+    prompt_ref: null
+    verifier_ref: verifiers/ledger-shape.sh
+    dispatch_mode: serial
+
+  # ── 5. final judgment: fork fully closed, no dangling edge, ledger complete ──
+  - name: reviewer
+    type: reviewer
+    model_lane: opus_lens
+    prompt_ref: prompts/reviewer.md
+    dispatch_mode: serial
+    gates: [budget_gate]
+
+  - name: publisher
+    type: publisher
+    model_lane: publisher
+    prompt_ref: null
+    dispatch_mode: serial
+
+  - name: rollback
+    type: rollback
+    model_lane: rollback
+    prompt_ref: null
+    dispatch_mode: serial
+
+edges:
+  - { from: seam_mapper,            to: cost_verifiability_lens, edge_type: depends_on }
+  - { from: seam_mapper,            to: static_feature_ledger,   edge_type: depends_on }
+  - { from: cost_verifiability_lens, to: migrator,               edge_type: supplies_context_to }
+  - { from: static_feature_ledger,  to: migrator,                edge_type: supplies_context_to }
+  - { from: migrator,               to: parity_verifier,         edge_type: verifies }
+  - { from: migrator,               to: acceptance_verifier,     edge_type: verifies }
+  - { from: migrator,               to: ledger_verifier,         edge_type: verifies }
+  - { from: parity_verifier,        to: reviewer,                edge_type: depends_on }
+  - { from: acceptance_verifier,    to: reviewer,                edge_type: depends_on }
+  - { from: ledger_verifier,        to: reviewer,                edge_type: depends_on }
+  - { from: reviewer,               to: publisher,               edge_type: depends_on }
+  - { from: reviewer,               to: rollback,                edge_type: escalates_to }
+  - { from: parity_verifier,        to: rollback,                edge_type: escalates_to }
+  - { from: acceptance_verifier,    to: rollback,                edge_type: escalates_to }
+
+rollback_strategy: keep_run_artifacts_discard_worktree
+max_self_correction_iterations: 1
+source_artifact: self-migrate.diff
