@@ -52,7 +52,7 @@ Current status: completed and source-applied from the green isolated proposal pr
 
 Current status: `reflect` preflight prepared; its first paid launch stopped at planner dispatch before changing the isolated target. Classify → plan → cli → execute are not started, and the ordering is unchanged.
 
-Remaining parts: obtain paid-retry approval and relaunch with process-local Codex overrides for the unavailable MiniMax-backed `planner` and `glm_lens` lanes; then run the same five-verifier pipeline, apply only passing diffs, update migration documentation, and repeat the requirements audit after each closure. The clean isolated target already passes all 8 pre-retirement reflect parity tests, so the two failures seen only in the dirty source checkout do not currently require a test change.
+Remaining parts: relaunch from the dedicated temporary runtime home whose frozen policy uses only Kimi, Codex, and GLM, with Kimi/GLM credentials loaded process-locally from `/Users/admin/ps/scripts`; then run the same five-verifier pipeline, apply only passing diffs, update migration documentation, and repeat the requirements audit after each closure. The clean isolated target already passes all 8 pre-retirement reflect parity tests, so the two failures seen only in the dirty source checkout do not currently require a test change.
 
 ## Second requirements audit
 

@@ -340,10 +340,10 @@ evidence.
   `MINIMAX_API_KEY` is unset; `mini-ork doctor` reports MiniMax unavailable.
 - No proposal or verdict was produced, and the isolated reflect worktree stayed
   clean at `0fe5071c`.
-- The safe retry uses process-local `_MO_LANE_PLANNER=codex` and
-  `_MO_LANE_GLM_LENS=codex` overrides. It does not edit the user-owned
-  `.mini-ork/config/agents.yaml` and still requires explicit paid-retry
-  approval.
+- The safe retry uses a dedicated temporary runtime home with only Kimi,
+  Codex, and GLM provider values. Kimi and GLM credentials are loaded
+  process-locally from `/Users/admin/ps/scripts/cl_kimi.sh` and `cl_glm.sh`;
+  no secret or persistent user-owned policy is changed.
 
 Each fork closure produces:
 - `self-migrate.diff` (reviewable, apply or reject)
