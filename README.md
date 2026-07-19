@@ -185,6 +185,7 @@ A recipe is `workflow.yaml` + `prompts/` + `verifiers/` + an `artifact_contract`
 | `harness-bridge` | Wraps a full coding-agent harness (claude-code / codex-cli / gemini-cli) as a workflow node. |
 | `chapter-validation-10lens` | 10 parallel lens agents each judge one slice of chapter validation. |
 | `mo-vs-omnigent` | Head-to-head mini-ork vs [omnigent](https://github.com/omnigent-ai/omnigent) across 4 distinct lens families. |
+| `self-migrate` | Verify-gated bash→Python fork migration: close integration forks (outbound seams + every inbound ref → Python sole, bash entrypoint retired) gated on byte-parity, feature-acceptance, and static-feature ledger. |
 
 Add your own under `recipes/<name>/` — see [docs/EXTENSION.md](docs/EXTENSION.md).
 
