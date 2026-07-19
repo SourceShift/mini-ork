@@ -25,8 +25,6 @@ actual tool-call receipts to assign provenance:
 from __future__ import annotations
 
 import json
-import os
-import sqlite3
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -290,6 +288,18 @@ def terminal_commitment_gate(
             "evidence": {...},
         }
     """
+    # Validate run_dir exists (future-proofing for run_dir-dependent checks)
+    run_path = Path(run_dir)
+    if not run_path.exists():
+        return {
+            "provenance": "claimed",
+            "reason": f"Run directory does not exist: {run_dir}",
+            "up3_violation": False,
+            "should_block_merge": True,
+            "delivery_claim": None,
+            "evidence": {},
+        }
+
     # Load z-insight block
     try:
         with open(zinsight_path, "r") as f:
