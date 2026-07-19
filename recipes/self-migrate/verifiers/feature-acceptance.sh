@@ -32,7 +32,7 @@ elif [ -z "$FORK" ]; then
   reasons+=("MO_FORK not set — cannot select a feature probe (shape-only)")
 fi
 
-# (b) the fork's Python test module + pyright on its port
+# (b) the fork's Python unit contracts
 TESTF="$REPO_ROOT/tests/unit/test_mini_ork_${FORK}_py.py"
 if [ -n "$FORK" ] && [ -f "$TESTF" ]; then
   if (
@@ -46,12 +46,35 @@ if [ -n "$FORK" ] && [ -f "$TESTF" ]; then
     pass=false; reasons+=("pytest $TESTF failed")
   fi
 fi
-PORTF="$REPO_ROOT/mini_ork/ported/mini_ork_${FORK}.py"
-if [ -n "$FORK" ] && [ -f "$PORTF" ]; then
-  if ( cd "$REPO_ROOT" && python3 -m pyright "$PORTF" 2>&1 | grep -F '0 errors' >/dev/null ) ; then
-    echo "[pyright] $PORTF 0 errors" >>"$EVIDENCE"
+
+# Reflect has additional inbound contracts beyond its focused unit module:
+# GEPA's default path and the standalone CLI integration suite.
+if [ "$FORK" = "reflect" ]; then
+  if (
+    cd "$REPO_ROOT"
+    python3 -m pytest tests/test_gepa_wiring_py.py -q -p no:cacheprovider
+  ) >>"$EVIDENCE" 2>&1; then
+    echo "[pytest] tests/test_gepa_wiring_py.py PASS" >>"$EVIDENCE"
   else
-    pass=false; reasons+=("pyright on $PORTF not clean")
+    pass=false; reasons+=("pytest tests/test_gepa_wiring_py.py failed")
+  fi
+  if ( cd "$REPO_ROOT" && bash tests/integration/test_bin_reflect.sh ) >>"$EVIDENCE" 2>&1; then
+    echo "[integration] tests/integration/test_bin_reflect.sh PASS" >>"$EVIDENCE"
+  else
+    pass=false; reasons+=("reflect integration suite failed")
+  fi
+fi
+
+# (c) type-check the migrated port and the Python callers changed by the rewire.
+TYPE_TARGETS=("mini_ork/ported/mini_ork_${FORK}.py")
+if [ "$FORK" = "reflect" ]; then
+  TYPE_TARGETS+=("mini_ork/ported/mini_ork_cli.py" "mini_ork/ported/mini_ork_execute.py")
+fi
+if [ -n "$FORK" ] && [ -f "$REPO_ROOT/${TYPE_TARGETS[0]}" ]; then
+  if ( cd "$REPO_ROOT" && python3 -m pyright "${TYPE_TARGETS[@]}" ) >>"$EVIDENCE" 2>&1; then
+    echo "[pyright] ${TYPE_TARGETS[*]} 0 errors" >>"$EVIDENCE"
+  else
+    pass=false; reasons+=("pyright on ${TYPE_TARGETS[*]} not clean")
   fi
 fi
 

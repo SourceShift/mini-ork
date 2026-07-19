@@ -1,11 +1,16 @@
 #!/usr/bin/env bash
-# tests/integration/test_bin_reflect.sh — integration tests for bin/mini-ork-reflect
+# tests/integration/test_bin_reflect.sh — Python-sole reflect CLI integration tests
 set -uo pipefail
 
 MINI_ORK_ROOT="${MINI_ORK_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 export MINI_ORK_ROOT
 export PATH="$MINI_ORK_ROOT/bin:$PATH"
 export MINI_ORK_DRY_RUN=1
+
+reflect_cmd() {
+  PYTHONPATH="${MINI_ORK_ROOT}${PYTHONPATH:+:$PYTHONPATH}" \
+    python3 -m mini_ork.ported.mini_ork_reflect "$@"
+}
 
 # Isolated tmp project
 TMPROOT=$(mktemp -d /tmp/ork-int-test-XXXXXX)
@@ -40,13 +45,13 @@ echo "── integration: mini-ork-reflect ──"
 # 1. --help exits 0 and prints usage
 echo ""
 echo "--- 1. --help exits 0 ---"
-if mini-ork-reflect --help >/dev/null 2>&1; then
+if reflect_cmd --help >/dev/null 2>&1; then
   _ok "--help exits 0"
 else
   _fail "--help exited non-zero"
 fi
 
-HELP_OUT=$(mini-ork-reflect --help 2>&1 || true)
+HELP_OUT=$(reflect_cmd --help 2>&1 || true)
 if echo "$HELP_OUT" | grep -qi "reflect\|since\|pattern\|trace\|gradient"; then
   _ok "--help output mentions expected keywords"
 else
@@ -57,7 +62,7 @@ fi
 echo ""
 echo "--- 2. Unknown flag exits 2 ---"
 EXITCODE=0
-mini-ork-reflect --unknown-flag-xyz 2>/dev/null || EXITCODE=$?
+reflect_cmd --unknown-flag-xyz 2>/dev/null || EXITCODE=$?
 if [ "$EXITCODE" -eq 2 ]; then
   _ok "unknown flag → exit 2"
 else
@@ -68,7 +73,7 @@ fi
 echo ""
 echo "--- 3. Unexpected positional arg exits 2 ---"
 EXITCODE=0
-mini-ork-reflect some-unexpected-arg 2>/dev/null || EXITCODE=$?
+reflect_cmd some-unexpected-arg 2>/dev/null || EXITCODE=$?
 if [ "$EXITCODE" -eq 2 ]; then
   _ok "unexpected positional arg → exit 2"
 else
@@ -79,7 +84,7 @@ fi
 echo ""
 echo "--- 4. --dry-run exits 0 + reports trace count ---"
 EXITCODE=0
-OUT=$(mini-ork-reflect --dry-run 2>&1) || EXITCODE=$?
+OUT=$(reflect_cmd --dry-run 2>&1) || EXITCODE=$?
 if [ "$EXITCODE" -eq 0 ]; then
   _ok "--dry-run exits 0"
 else
@@ -95,7 +100,7 @@ fi
 echo ""
 echo "--- 5. --since timestamp accepted ---"
 EXITCODE=0
-mini-ork-reflect --dry-run --since "0" 2>/dev/null || EXITCODE=$?
+reflect_cmd --dry-run --since "0" 2>/dev/null || EXITCODE=$?
 if [ "$EXITCODE" -eq 0 ]; then
   _ok "--since 0 accepted, exits 0"
 else
@@ -106,14 +111,14 @@ fi
 echo ""
 echo "--- 6. --task-class filter accepted ---"
 EXITCODE=0
-mini-ork-reflect --dry-run --task-class "code_fix" 2>/dev/null || EXITCODE=$?
+reflect_cmd --dry-run --task-class "code_fix" 2>/dev/null || EXITCODE=$?
 if [ "$EXITCODE" -eq 0 ]; then
   _ok "--task-class code_fix dry-run exits 0"
 else
   _fail "--task-class code_fix dry-run exited $EXITCODE"
 fi
 
-OUT=$(mini-ork-reflect --dry-run --task-class "code_fix" 2>&1 || true)
+OUT=$(reflect_cmd --dry-run --task-class "code_fix" 2>&1 || true)
 if echo "$OUT" | grep -qi "code_fix\|filter\|task.class"; then
   _ok "--task-class code_fix reflected in output"
 else
@@ -130,7 +135,7 @@ lanes:
   reflector: sonnet
   cheap_reflect: kimi
 YAML
-OUT=$(mini-ork-reflect --dry-run --lane cheap_reflect 2>&1 || true)
+OUT=$(reflect_cmd --dry-run --lane cheap_reflect 2>&1 || true)
 if echo "$OUT" | grep -q "lane: cheap_reflect -> kimi"; then
   _ok "--lane cheap_reflect resolves to kimi"
 else
@@ -140,7 +145,7 @@ fi
 # 8. --dry-run with empty DB: reports 0 traces, exits 0
 echo ""
 echo "--- 8. Empty DB: 0 traces reported ---"
-OUT=$(mini-ork-reflect --dry-run 2>&1 || true)
+OUT=$(reflect_cmd --dry-run 2>&1 || true)
 if echo "$OUT" | grep -qiE "0 trace|0 trace|dry.run.*0|analyz.*0"; then
   _ok "empty DB → 0 traces reported"
 else

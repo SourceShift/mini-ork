@@ -1,5 +1,7 @@
 # Close the `reflect` integration fork
 
+Status: completed locally from `run-1784503045-70610` on 2026-07-20.
+
 ## Goal
 
 Close the `reflect` fork: make
@@ -44,6 +46,11 @@ Claude-compatible tokens into `KIMI_API_KEY` and `GLM_API_KEY`, then clear the
 temporary Anthropic gateway variables before launching. Never copy secret
 values into this kickoff, the runtime home, or run artifacts.
 
+The successful run used GLM model `glm-5.2`. Kimi's authenticated catalog
+exposed `kimi-for-coding`, while the repository Claude wrapper's hard-coded
+model was rejected; a mode-700 run-local executable adapter called the
+Anthropic-compatible messages endpoint directly. No credentials were persisted.
+
 ## Inbound references to resolve
 
 - `bin/mini-ork` — repoint direct and automatic run-lifecycle reflection.
@@ -69,7 +76,9 @@ the following stale path references without changing their behavior:
 - `mini_ork/optimize/gepa.py`
 - `mini_ork/ported/mini_ork_reflect.py`
 - `recipes/audit-findings-validator/verifiers/missing-impl.sh` — replace its
-  Bash-file implementation check with a Python-port capability check.
+  Bash-file implementation check with a Python-port capability check. The seam
+  map proved this path is a phantom edge in the isolated target, so no file was
+  created or changed.
 
 ## Acceptance criteria
 
@@ -114,9 +123,26 @@ the following stale path references without changing their behavior:
 - `/private/tmp/mini-ork-self-migrate-reflect/tests/test_gepa_wiring_py.py`
 - `/private/tmp/mini-ork-self-migrate-reflect/tests/integration/test_bin_reflect.sh`
 - `/private/tmp/mini-ork-self-migrate-reflect/tests/unit/test_mini_ork_reflect_py.py`
+- `/private/tmp/mini-ork-self-migrate-reflect/tests/unit/test_mini_ork_execute_py.py`
 - `/private/tmp/mini-ork-self-migrate-reflect/scripts/runtime-parity-harness.sh`
 - `/private/tmp/mini-ork-self-migrate-reflect/gates/feature_acceptance.sh`
-- `/private/tmp/mini-ork-self-migrate-reflect/recipes/audit-findings-validator/verifiers/missing-impl.sh`
+- `/private/tmp/mini-ork-self-migrate-reflect/docs/FEATURES.md`
+- `/private/tmp/mini-ork-self-migrate-reflect/docs/LEARNING-LOOP-LIFECYCLE.md`
+- `/private/tmp/mini-ork-self-migrate-reflect/docs/architecture/coevolve-ecosystem.md`
+- `/private/tmp/mini-ork-self-migrate-reflect/docs/architecture/techniques-compendium.md`
+
+## Completion evidence
+
+- Detailed migration verdict: pass.
+- Five reports: pre-retirement parity, post-retirement parity, feature
+  acceptance, 27-row ledger shape, and fork closure all pass.
+- Reviewer: pass; rubric: 7/8.
+- Source verification: 11 reflect/GEPA tests, 11 integration assertions, 8
+  focused parity cases, reflect feature acceptance, 57 executor/CLI tests,
+  Pyright with zero errors, Bash syntax, and `git diff --check` all pass.
+- Completion-audit repair: reviewer inputs now include the standalone
+  pre-retirement report, and workflow-phase-aware artifact guarding prevents a
+  pre-implementation verifier from creating a false run failure.
 
 ## Rollback
 

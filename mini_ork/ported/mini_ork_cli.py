@@ -436,11 +436,17 @@ def _run_lifecycle(argv, root) -> int:
     if not _gate("verify", artifact):
         return run_rc
 
-    # ── reflect (best-effort, bash) ──
+    # ── reflect (best-effort, Python-sole entrypoint) ──
     if os.environ.get("MO_AUTO_REFLECT", "1") == "1":
         sys.stdout.write("── reflect (auto, since run start) ──\n")
-        subprocess.run([_bin(root, "reflect"), "--since", str(t0)],
-                       env={**os.environ, "MO_REFLECTION_BATCH": os.environ.get("MO_REFLECTION_BATCH", "25")})
+        subprocess.run(
+            [sys.executable, "-m", "mini_ork.ported.mini_ork_reflect", "--since", str(t0)],
+            capture_output=True,
+            env={
+                **_module_env(root),
+                "MO_REFLECTION_BATCH": os.environ.get("MO_REFLECTION_BATCH", "25"),
+            },
+        )
     return run_rc
 
 
