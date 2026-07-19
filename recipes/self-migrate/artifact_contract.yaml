@@ -1,0 +1,69 @@
+task_class: self_migrate
+expected_artifact: diff
+description: >
+  Produces a proposed unified diff that closes one integration fork (Python
+  made sole, inbound refs repointed, bash entrypoint retired), plus the
+  static-feature ledger and a verdict. Propose-not-commit: the publisher emits
+  run-local review artifacts and must NOT apply the diff or retire any
+  entrypoint on main.
+
+source_artifact: "${MINI_ORK_RUN_DIR}/self-migrate.diff"
+
+required_artifacts:
+  - "${MINI_ORK_RUN_DIR}/self-migrate.diff"
+  - "${MINI_ORK_RUN_DIR}/static-feature-ledger.json"
+  - "${MINI_ORK_RUN_DIR}/integration-map.json"
+  - "${MINI_ORK_RUN_DIR}/verdict.json"
+
+verdict_schema:
+  required_keys:
+    files_changed: integer
+    parity_pass: boolean
+    acceptance_pass: boolean
+    ledger_complete: boolean
+    no_dangling_edge: boolean
+    pass: boolean
+  rule: "pass == (parity_pass && acceptance_pass && ledger_complete && no_dangling_edge)"
+
+success_verifiers:
+  - verifiers/parity.sh
+  - verifiers/feature-acceptance.sh
+  - verifiers/ledger-shape.sh
+
+failure_policy: request_changes
+rollback_policy: >
+  Preserve self-migrate.diff, static-feature-ledger.json, integration-map.json,
+  verdict.json, and verifier logs in ${MINI_ORK_RUN_DIR}; abandon the isolated
+  worktree so no source change and no entrypoint retirement leaks onto the
+  checkout.
+
+publish_modes:
+  smoke_shape:
+    description: >
+      Structural recipe checks only. Use outputs: [] so the publisher takes the
+      no-commit path while verifiers still confirm recipe shape.
+    outputs: []
+  real_publish:
+    description: >
+      A live fork-close proposal. Outputs are run-local review artifacts — the
+      migration diff (including the bash-entrypoint retirement) and the ledger —
+      not canonical source files and not an auto-applied patch.
+    outputs:
+      - "${MINI_ORK_RUN_DIR}/self-migrate.diff"
+      - "${MINI_ORK_RUN_DIR}/static-feature-ledger.json"
+      - "${MINI_ORK_RUN_DIR}/verdict.json"
+
+outputs:
+  - "${MINI_ORK_RUN_DIR}/self-migrate.diff"
+  - "${MINI_ORK_RUN_DIR}/static-feature-ledger.json"
+  - "${MINI_ORK_RUN_DIR}/verdict.json"
+
+artifact_path_template: ".mini-ork/runs/{run_id}/self-migrate"
+max_size_bytes: 2097152
+retention_days: 30
+tags:
+  - migration
+  - self-edit
+  - fork-close
+  - static-feature-ledger
+  - verifier-gated
