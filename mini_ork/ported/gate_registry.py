@@ -72,6 +72,7 @@ _VALID_GATE_TYPES: tuple[str, ...] = (
     "scope_gate",
     "deployment_gate",
     "liveness_gate",
+    "terminal_commitment_gate",  # M5: Score "I'm done" claims against receipts
     "custom",
 )
 
@@ -313,6 +314,31 @@ def gate_evaluate(db_path: str, gate_id: str, context_json: str) -> str:
         return _evaluate_scope(context_json, condition)
     if gtype == "liveness_gate":
         return _evaluate_liveness(context_json, db_path, None)
+    if gtype == "terminal_commitment_gate":
+        # M5: Terminal commitment scoring
+        # Context JSON should contain: run_dir, transcript_path, zinsight_path
+        try:
+            ctx = json.loads(context_json)
+            run_dir = ctx.get("run_dir", "")
+            transcript_path = ctx.get("transcript_path", "")
+            zinsight_path = ctx.get("zinsight_path", "")
+
+            if not all([run_dir, transcript_path, zinsight_path]):
+                return "defer"
+
+            # Import here to avoid circular dependency
+            from .terminal_commitment import terminal_commitment_gate
+
+            result = terminal_commitment_gate(run_dir, transcript_path, zinsight_path)
+
+            # Map verdict to gate protocol
+            if result.get("up3_violation", False):
+                return "fail"  # UP-3 contradiction is a hard failure
+            if result.get("provenance") == "observed":
+                return "pass"  # Receipt-backed delivery
+            return "defer"  # Unverified claim → defer (don't auto-merge)
+        except Exception:
+            return "defer"
     if gtype in ("deployment_gate", "reviewer_gate", "deterministic_verifier", "custom"):
         return _evaluate_external(condition, context_json, db_path)
     return "defer"
