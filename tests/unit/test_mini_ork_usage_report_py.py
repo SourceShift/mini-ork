@@ -444,13 +444,7 @@ def test_since_filter_excludes_old_rows(temp_db, tmp_path):
     --since=N (current epoch), only the fresh row is visible. The
     ancient row's (region, lane) pair must NOT appear.
     """
-    # 60s buffer: the "fresh" row is stamped at _now_iso_ms() (≈now). A --since
-    # threshold of exactly int(time.time()) sits on the same-second boundary, so
-    # ms rounding + subprocess scheduling skew can push the fresh row just under
-    # the cutoff → entry_count 0 (a CI-timing flake). Backdating the threshold 60s
-    # keeps the fresh row unambiguously in-window and the 2020 row out, preserving
-    # the test's intent. (See memory: relative-window test time-bomb.)
-    now_epoch = int(time.time()) - 60
+    now_epoch = int(time.time())
     _seed_lane_region_advantage(temp_db["db"], [
         ("codex_lens", "code-fix", "implementer", "code-delivery",
          "lib", 0.45, 2, 2, _now_iso_ms()),
