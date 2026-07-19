@@ -15,6 +15,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import yaml
+
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
 from mini_ork.ported import mini_ork_execute as ex  # noqa: E402
@@ -438,17 +440,35 @@ def _plan(tmp, outputs=("out.md",)):
     return str(p)
 
 
-def test_live_researcher_writes_context(tmp_path):
+def test_live_researcher_writes_context(tmp_path, monkeypatch):
     db = _seed_db(tmp_path, "r"); _seed_task_run(db)
     rd = tmp_path / "run"; rd.mkdir()
+    monkeypatch.delenv("MINI_ORK_RUN_DIR", raising=False)
+
+    def dispatch_with_run_dir(_task_class, _lane, _prompt):
+        assert os.environ["MINI_ORK_RUN_DIR"] == str(rd)
+        return 0, "finding: X is slow"
+
     rc, fr = ex.dispatch_node(_fields("res1_lens", "researcher", "kimi_lens"),
                               root=str(REPO), run_dir=str(rd), plan_path=_plan(tmp_path),
                               task_class="code_fix", db=db, run_id="r1",
-                              dispatch_fn=_fake("finding: X is slow"))
+                              dispatch_fn=dispatch_with_run_dir)
     assert rc == 0 and fr == "done"
     assert (rd / "lens-res1.md").read_text() == "finding: X is slow"
     # cost charged
     assert float(_sql(db, "SELECT cost_usd FROM task_runs WHERE id='r1';").stdout) > 0
+
+
+def test_self_migrate_researcher_artifact_names(tmp_path):
+    assert ex._researcher_output_file(str(tmp_path), "self-migrate", "seam_mapper") == str(
+        tmp_path / "integration-map.json"
+    )
+    assert ex._researcher_output_file(
+        str(tmp_path), "self-migrate", "static_feature_ledger"
+    ) == str(tmp_path / "static-feature-ledger.json")
+    assert ex._researcher_output_file(
+        str(tmp_path), "self-migrate", "cost_verifiability_lens"
+    ) == str(tmp_path / "cost-verifiability-lens.md")
 
 
 def test_live_implementer_applies_diff(tmp_path, monkeypatch):
@@ -514,9 +534,16 @@ def test_run_verifier_ref(tmp_path):
     ok = tmp_path / "ok.sh"; ok.write_text('#!/usr/bin/env bash\necho \'{"pass": true}\'\n')
     bad = tmp_path / "bad.sh"; bad.write_text('#!/usr/bin/env bash\necho \'{"pass": false}\'\n')
     empty = tmp_path / "empty.sh"; empty.write_text('#!/usr/bin/env bash\nexit 0\n')
+    env_ok = tmp_path / "env-ok.sh"
+    env_ok.write_text(
+        '#!/usr/bin/env bash\n'
+        '[ "$MINI_ORK_RUN_DIR" = "$PWD" ]\n'
+        'echo \'{"pass": true}\'\n'
+    )
     assert ex._run_verifier_ref(str(ok), str(tmp_path / "e1"), cwd=str(tmp_path)) == 0
     assert ex._run_verifier_ref(str(bad), str(tmp_path / "e2"), cwd=str(tmp_path)) == 1
     assert ex._run_verifier_ref(str(empty), str(tmp_path / "e3"), cwd=str(tmp_path)) == 1  # vacuous
+    assert ex._run_verifier_ref(str(env_ok), str(tmp_path / "e4"), cwd=str(tmp_path)) == 0
 
 
 def test_live_publisher_and_rollback_status(tmp_path, monkeypatch):
@@ -536,6 +563,88 @@ def test_live_publisher_and_rollback_status(tmp_path, monkeypatch):
     rc_rb, fr_rb = ex.dispatch_node(_fields("rb", "rollback"), **common)
     assert rc_rb == 0 and fr_rb == "done"
     assert _sql(db, "SELECT status FROM task_runs WHERE id='r1';").stdout.strip() != "rolled_back"
+
+
+def test_publisher_preserves_heterogeneous_run_local_artifacts(tmp_path, monkeypatch):
+    """A diff source must never overwrite sibling JSON outputs in a composite contract."""
+    root = tmp_path / "engine"
+    recipe_dir = root / "recipes" / "self-migrate"
+    recipe_dir.mkdir(parents=True)
+    run_dir = root / ".mini-ork" / "runs" / "run-publish"
+    run_dir.mkdir(parents=True)
+    diff = run_dir / "self-migrate.diff"
+    ledger = run_dir / "static-feature-ledger.json"
+    verdict = run_dir / "verdict.json"
+    diff.write_text("diff --git a/a b/a\n")
+    ledger.write_text('{"features": []}\n')
+    verdict.write_text('{"pass": false}\n')
+    (recipe_dir / "artifact_contract.yaml").write_text(
+        "source_artifact: ${MINI_ORK_RUN_DIR}/self-migrate.diff\n"
+        "outputs:\n"
+        "  - ${MINI_ORK_RUN_DIR}/self-migrate.diff\n"
+        "  - ${MINI_ORK_RUN_DIR}/static-feature-ledger.json\n"
+        "  - ${MINI_ORK_RUN_DIR}/verdict.json\n"
+    )
+    monkeypatch.setenv("MINI_ORK_RUN_DIR", str(run_dir))
+    statuses = []
+    monkeypatch.setattr(ex, "set_status", lambda _db, _rid, status: statuses.append(status))
+
+    rc, reason = ex.publisher_node(
+        str(root), str(run_dir), "", "run-publish", "self-migrate", "self_migrate"
+    )
+
+    assert (rc, reason) == (0, "done")
+    assert diff.read_text() == "diff --git a/a b/a\n"
+    assert json.loads(ledger.read_text()) == {"features": []}
+    assert json.loads(verdict.read_text()) == {"pass": False}
+    assert statuses == ["published"]
+
+
+def test_resolve_target_cwd_prefers_explicit_worktree_over_external_kickoff(tmp_path, monkeypatch):
+    repo = _git_repo(tmp_path / "target")
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    kickoff = tmp_path / "external-kickoff.md"
+    kickoff.write_text("# kickoff\n")
+    (run_dir / "run_profile.json").write_text(json.dumps({"kickoff_path": str(kickoff)}))
+    monkeypatch.setenv("MO_TARGET_CWD", str(repo))
+
+    assert ex._resolve_target_cwd(str(run_dir)) == str(repo)
+
+
+def test_self_migrate_harvests_target_run_mirror_before_review(tmp_path):
+    target = tmp_path / "target"
+    run_dir = tmp_path / "engine" / ".mini-ork" / "runs" / "run-harvest"
+    mirror = target / ".mini-ork" / "runs" / "run-harvest"
+    run_dir.mkdir(parents=True)
+    mirror.mkdir(parents=True)
+    (mirror / "self-migrate.diff").write_text("diff --git a/a b/a\n")
+    (mirror / "static-feature-ledger.json").write_text('{"features":[{"feature":"f"}]}\n')
+    (mirror / "verdict.json").write_text('{"pass":true}\n')
+    (mirror / "verifier_fork-closure.json").write_text('{"pass":true}\n')
+    (mirror / "agent-migrator.stream.jsonl").write_text("large operational transcript\n")
+
+    copied = ex._harvest_self_migrate_artifacts(str(run_dir), str(target))
+
+    assert copied == ["self-migrate.diff", "static-feature-ledger.json", "verdict.json",
+                      "verifier_fork-closure.json"]
+    assert json.loads((run_dir / "verdict.json").read_text()) == {"pass": True}
+    assert not (run_dir / "agent-migrator.stream.jsonl").exists()
+
+
+def test_run_verdict_preserves_recipe_detailed_verdict(tmp_path):
+    run_dir = tmp_path / "run"; run_dir.mkdir()
+    detailed = {"pass": True, "parity_pass": True}
+    (run_dir / "verdict.json").write_text(json.dumps(detailed))
+
+    ex._emit_run_verdict(str(run_dir), fail_count=2, dispatched=12)
+
+    assert json.loads((run_dir / "verdict.json").read_text()) == detailed
+    run_verdict = json.loads((run_dir / "run-verdict.json").read_text())
+    assert run_verdict == {
+        "verdict": "fail", "failed_nodes": 2, "dispatched": 12,
+        "source": "execute@run-level",
+    }
 
 
 def test_envsubst_blanks_unset_vars(monkeypatch):
@@ -564,6 +673,32 @@ def test_classic_reviewer_prompt_has_inputs_and_json_envelope(tmp_path):
                      dispatch_fn=cap)
     assert "Respond with JSON" in captured["p"]
     assert "Reviewer inputs" in captured["p"]
+
+
+def test_classic_reviewer_prompt_includes_recipe_specific_evidence(tmp_path):
+    db = _seed_db(tmp_path, "rve"); _seed_task_run(db)
+    rd = tmp_path / "run"; rd.mkdir()
+    (rd / "implementer-summary.json").write_text('{"status":"implemented"}\n')
+    (rd / "verifier_parity.json").write_text('{"pass":true}\n')
+    (rd / "verifier_fork-closure.json").write_text('{"pass":true}\n')
+    (rd / "integration-map.json").write_text('{"fork":"verify"}\n')
+    (rd / "static-feature-ledger.json").write_text('{"features":[]}\n')
+    (rd / "verdict.json").write_text('{"pass":true}\n')
+    (rd / "self-migrate.diff").write_text("diff --git a/a b/a\n")
+    captured = {}
+
+    def cap(tc, nt, prompt):
+        captured["p"] = prompt
+        return 0, '{"verdict":"pass"}'
+
+    ex.dispatch_node(_fields("reviewer", "reviewer"), root=str(REPO), run_dir=str(rd),
+                     plan_path=_plan(tmp_path), task_class="self_migrate", db=db,
+                     run_id="r1", recipe="self-migrate", dispatch_fn=cap)
+
+    for name in ("verifier_parity.json", "verifier_fork-closure.json",
+                 "integration-map.json", "static-feature-ledger.json",
+                 "verdict.json", "self-migrate.diff"):
+        assert f"# {name}" in captured["p"]
 
 
 def test_researcher_recipe_specific_output_files(tmp_path):
@@ -826,6 +961,79 @@ def test_nodes_from_workflow_parity(tmp_path):
     rb = subprocess.run(["python3", str(blk), wf], capture_output=True, text=True).stdout
     rp = "\n".join(ex.nodes_from_workflow(wf)) + ("\n" if ex.nodes_from_workflow(wf) else "")
     assert rb == rp, f"BASH:{rb!r}\nPY:{rp!r}"
+
+
+def test_self_migrate_workflow_orders_pre_retirement_parity_before_migrator():
+    workflow = yaml.safe_load((REPO / "recipes" / "self-migrate" / "workflow.yaml").read_text())
+    names = [node["name"] for node in workflow["nodes"]]
+
+    assert workflow["dispatch_mode"] == "serial"
+    assert names.index("pre_retirement_parity") < names.index("migrator")
+
+
+def test_self_migrate_verifier_exit_status_matches_false_json(tmp_path):
+    """A reported migration failure must also fail the process-level gate."""
+    target = tmp_path / "target"
+    (target / "bin").mkdir(parents=True)
+    (target / "gates").mkdir()
+    failing_gate = target / "gates" / "feature_acceptance.sh"
+    failing_gate.write_text("#!/usr/bin/env bash\nexit 1\n")
+    failing_gate.chmod(0o755)
+
+    cases = [
+        "pre-retirement-parity.sh",
+        "parity.sh",
+        "feature-acceptance.sh",
+        "ledger-shape.sh",
+        "fork-closure.sh",
+    ]
+    for name in cases:
+        run_dir = tmp_path / name.removesuffix(".sh")
+        run_dir.mkdir()
+        legacy_entrypoint = target / "bin" / f"mini-ork-{'verify'}"
+        if name == "fork-closure.sh":
+            legacy_entrypoint.write_text("#!/usr/bin/env bash\n")
+        script = REPO / "recipes" / "self-migrate" / "verifiers" / name
+        result = subprocess.run(
+            ["bash", str(script)],
+            cwd=target,
+            env={
+                **os.environ,
+                "MINI_ORK_RUN_DIR": str(run_dir),
+                "MINI_ORK_ROOT": str(target),
+                "MO_TARGET_CWD": str(target),
+                "MO_FORK": "verify",
+            },
+            capture_output=True,
+            text=True,
+        )
+        payload = json.loads(result.stdout)
+        assert payload["pass"] is False, (name, result.stdout, result.stderr)
+        assert result.returncode != 0, (name, result.stdout, result.stderr)
+        legacy_entrypoint.unlink(missing_ok=True)
+
+    ledger_run = tmp_path / "ledger-success"
+    ledger_run.mkdir()
+    (ledger_run / "static-feature-ledger.json").write_text(json.dumps({
+        "features": [{
+            "feature": "function:mini_ork.ported.example.main",
+            "class": "static",
+            "opportunity": "deterministic",
+        }],
+    }))
+    (ledger_run / "self-migrate.diff").write_text(
+        "diff --git a/example.py b/example.py\n"
+        "+def main():\n"
+        "+    return 0\n"
+    )
+    ledger_result = subprocess.run(
+        ["bash", str(REPO / "recipes" / "self-migrate" / "verifiers" / "ledger-shape.sh")],
+        env={**os.environ, "MINI_ORK_RUN_DIR": str(ledger_run)},
+        capture_output=True,
+        text=True,
+    )
+    assert ledger_result.returncode == 0, ledger_result.stdout + ledger_result.stderr
+    assert json.loads(ledger_result.stdout)["pass"] is True
 
 
 def test_nodes_from_plan_parity(tmp_path):
