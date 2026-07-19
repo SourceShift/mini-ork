@@ -54,7 +54,7 @@ existed.
 |---|---|---|---|---|
 | **PRM** (Process Reward) | `execution_traces.process_reward` | `lib/process_reward.sh::prm_score_trace` | inline, per node | heuristic 0–1 quality of one node's work |
 | **GRPO** (Group Relative Policy Opt.) | `agent_performance_memory.relative_advantage` | `mo_learning_write_grpo_advantages` (`bin/mini-ork-execute:252`) | end-of-run | which lane beats its peers on a task class |
-| **RHO** (prompt win rates) | `prompt_win_rates` | `mini_ork/ported/rho_aggregator.py::aggregate_win_rates` (native; bash `lib/rho_aggregator.sh::rho_aggregate_win_rates` backs `bin/mini-ork-reflect`) | reflect / conductor | which prompt version wins per task class |
+| **RHO** (prompt win rates) | `prompt_win_rates` | `mini_ork/ported/rho_aggregator.py::aggregate_win_rates` (native and called by the Python reflect entrypoint) | reflect / conductor | which prompt version wins per task class |
 | **Conductor writeback** | `conductor_decisions.outcome` / `realized_score` | `mo_learning_update_conductor_outcomes` (`bin/mini-ork-execute:218`) | end-of-run | did the chosen topology/recipe pay off |
 | **Grounded rejections** | `grounded_rejections` | _table ready; prod writer = open task #9_ | review/oracle gates | refuted claims + evidence (anti-reward) |
 
@@ -244,7 +244,7 @@ Two honest caveats:
 | PRM scorer | `lib/process_reward.sh` |
 | GRPO writer | `bin/mini-ork-execute:252` (`mo_learning_write_grpo_advantages`) |
 | Conductor writeback | `bin/mini-ork-execute:218` (`mo_learning_update_conductor_outcomes`) |
-| RHO aggregator | `mini_ork/ported/rho_aggregator.py` (native, used by the Python reflect); `lib/rho_aggregator.sh` still backs the legacy `bin/mini-ork-reflect` |
+| RHO aggregator | `mini_ork/ported/rho_aggregator.py` (native, used by the Python-sole reflect entrypoint) |
 | End-of-run writeback callsite | `bin/mini-ork-execute:2376` |
 | Closure proof gate | `scripts/learning-loop-closure-gate.sh` |
 | Machinery smoke harness | `scripts/smoke-learning-loops.sh` |

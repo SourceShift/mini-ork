@@ -46,7 +46,7 @@ reflection_extract_gradients() {
   local _batch="${MO_REFLECTION_BATCH:-500}"
   # AC2: skip framework-internal traces (task_class starts with `__`,
   # e.g. `__reflect__`). These carry only "what reflect did" payload,
-  # not a real signal to learn from — and bin/mini-ork-reflect already
+  # not a real signal to learn from — and the Python reflect entrypoint already
   # counts `task_class != '__reflect__'` itself, so we must agree here.
   trace_ids="$(python3 - "${MINI_ORK_DB:?MINI_ORK_DB unset}" "$since_ts" "$_batch" <<'PY'
 import sqlite3, json, sys
