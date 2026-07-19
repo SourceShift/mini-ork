@@ -24,6 +24,23 @@ do not reproduce in this clean worktree; do not modify them unless the isolated
 run produces a new failure. The recipe's `pre-retirement-parity` node remains
 fail-closed and must preserve its own durable green report before migration.
 
+### Provider preflight
+
+The first paid launch (`run-1784502357-9667`) stopped before planning because
+the frozen operator policy routes `planner` and `glm_lens` to MiniMax while
+`MINIMAX_API_KEY` is unavailable. The isolated target remained clean. For the
+retry, preserve the user-owned policy file and apply process-local lane-cache
+overrides instead:
+
+```bash
+export _MO_LANE_PLANNER=codex
+export _MO_LANE_GLM_LENS=codex
+```
+
+This keeps the authoritative `opus_lens` mapper, ledger, and reviewer lanes and
+the `codex_lens` migrator unchanged. A retry still requires explicit cost
+approval.
+
 ## Inbound references to resolve
 
 - `bin/mini-ork` — repoint direct and automatic run-lifecycle reflection.
