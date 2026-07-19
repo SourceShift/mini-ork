@@ -325,10 +325,14 @@ reviewer evidence assembly, and verdict preservation.
 
 ### Next safe action
 
-Create the `reflect` kickoff and isolated worktree from the focused migration
-commit. The next live run must confirm that the same-run reviewer consumes the
-harvested evidence, but do not start that paid self-migrate run without explicit
-approval.
+Use `kickoffs/migration/reflect.md` and the isolated reflect worktree prepared
+from the focused verify-closure commit. Before any paid run, resolve the known
+pre-retirement parity blocker: `test_opt_out_pattern_miner` and
+`test_combined_opt_out` currently compare the Python sweep against a database
+already mutated by the Bash sweep. Do not change those tests without explicit
+user confirmation, and do not start the paid self-migrate run without separate
+explicit approval. The next live run must also confirm that its same-run
+reviewer consumes the harvested evidence.
 
 Each fork closure produces:
 - `self-migrate.diff` (reviewable, apply or reject)
