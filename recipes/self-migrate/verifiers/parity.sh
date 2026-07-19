@@ -20,16 +20,16 @@ FORK_TEST="$REPO_ROOT/tests/unit/test_mini_ork_${FORK}_py.py"
 pass=true
 reasons=()
 
-if [ -n "$FORK" ] && [ -f "$FORK_TEST" ]; then
+if [ -n "$FORK" ] && [ -f "$FORK_TEST" ] && [ -f "$HARNESS" ]; then
   if (
     cd "$REPO_ROOT"
     env -u MINI_ORK_RUN_DIR -u MINI_ORK_RECIPE -u MINI_ORK_RUN_ID \
       -u MINI_ORK_PLAN_PATH -u MINI_ORK_TASK_CLASS \
-      python3 -m pytest "$FORK_TEST" -q -p no:cacheprovider
+      bash "$HARNESS" "$FORK"
   ) >"$EVIDENCE" 2>&1; then
     pass=true
   else
-    pass=false; reasons+=("fork parity test failed: $FORK_TEST — see verifier-parity.log")
+    pass=false; reasons+=("post-retirement contract failed: $FORK_TEST — see verifier-parity.log")
   fi
 elif [ ! -f "$HARNESS" ]; then
   pass=false; reasons+=("no fork parity test and runtime-parity-harness.sh not found at $HARNESS")
