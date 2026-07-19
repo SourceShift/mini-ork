@@ -2,7 +2,8 @@
 
 You are the final judgment before the proposal is published. You have: the
 `self-migrate.diff`, the `integration-map.json`, the `static-feature-ledger.json`,
-and the three verifier reports (parity, feature-acceptance, ledger-shape). Use
+and the five verifier reports (pre-retirement parity, post-change parity,
+feature-acceptance, ledger-shape, fork-closure). Use
 opus-level scrutiny — this is the moat.
 
 ## Decide `pass` on four questions, each grounded in evidence

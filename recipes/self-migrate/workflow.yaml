@@ -1,5 +1,6 @@
 version: "0.1.0"
 task_class: self_migrate
+dispatch_mode: serial
 description: >
   Per-fork migration pipeline. Maps one integration fork's seams (outbound
   shell-outs + inbound refs), builds a static-vs-agentic feature ledger,
@@ -12,7 +13,7 @@ description: >
 nodes:
   # ── 1. map the fork's integration surface (opus reasons per seam) ──
   - name: seam_mapper
-    type: planner
+    type: researcher
     model_lane: opus_lens
     prompt_ref: prompts/seam-mapper.md
     dispatch_mode: serial
@@ -33,10 +34,18 @@ nodes:
     dispatch_mode: parallel
     gates: [budget_gate]
 
+  # ── 2c. capture the Bash oracle while the legacy entrypoint still exists ──
+  - name: pre_retirement_parity
+    type: verifier
+    model_lane: verifier
+    prompt_ref: null
+    verifier_ref: verifiers/pre-retirement-parity.sh
+    dispatch_mode: serial
+
   # ── 3. make Python sole + repoint every inbound ref (codex implements) ──
   - name: migrator
     type: implementer
-    model_lane: implementer
+    model_lane: codex_lens
     prompt_ref: prompts/migrator.md
     dispatch_mode: serial
     gates: [scope_gate, budget_gate]
@@ -63,6 +72,13 @@ nodes:
     verifier_ref: verifiers/ledger-shape.sh
     dispatch_mode: serial
 
+  - name: closure_verifier
+    type: verifier
+    model_lane: verifier
+    prompt_ref: null
+    verifier_ref: verifiers/fork-closure.sh
+    dispatch_mode: serial
+
   # ── 5. final judgment: fork fully closed, no dangling edge, ledger complete ──
   - name: reviewer
     type: reviewer
@@ -86,18 +102,23 @@ nodes:
 edges:
   - { from: seam_mapper,            to: cost_verifiability_lens, edge_type: depends_on }
   - { from: seam_mapper,            to: static_feature_ledger,   edge_type: depends_on }
-  - { from: cost_verifiability_lens, to: migrator,               edge_type: supplies_context_to }
-  - { from: static_feature_ledger,  to: migrator,                edge_type: supplies_context_to }
+  - { from: cost_verifiability_lens, to: pre_retirement_parity,  edge_type: depends_on }
+  - { from: static_feature_ledger,  to: pre_retirement_parity,   edge_type: depends_on }
+  - { from: pre_retirement_parity,  to: migrator,                edge_type: supplies_context_to }
   - { from: migrator,               to: parity_verifier,         edge_type: verifies }
   - { from: migrator,               to: acceptance_verifier,     edge_type: verifies }
   - { from: migrator,               to: ledger_verifier,         edge_type: verifies }
+  - { from: migrator,               to: closure_verifier,        edge_type: verifies }
   - { from: parity_verifier,        to: reviewer,                edge_type: depends_on }
   - { from: acceptance_verifier,    to: reviewer,                edge_type: depends_on }
   - { from: ledger_verifier,        to: reviewer,                edge_type: depends_on }
+  - { from: closure_verifier,       to: reviewer,                edge_type: depends_on }
   - { from: reviewer,               to: publisher,               edge_type: depends_on }
   - { from: reviewer,               to: rollback,                edge_type: escalates_to }
   - { from: parity_verifier,        to: rollback,                edge_type: escalates_to }
   - { from: acceptance_verifier,    to: rollback,                edge_type: escalates_to }
+  - { from: pre_retirement_parity,  to: rollback,                edge_type: escalates_to }
+  - { from: closure_verifier,       to: rollback,                edge_type: escalates_to }
 
 rollback_strategy: keep_run_artifacts_discard_worktree
 max_self_correction_iterations: 1

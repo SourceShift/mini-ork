@@ -11,7 +11,7 @@
 # Exit 0 = all assertions pass. Exit 1 = any assertion failed.
 set -uo pipefail
 
-MINI_ORK_ROOT="${MINI_ORK_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
+MINI_ORK_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 export MINI_ORK_ROOT
 export MINI_ORK_DRY_RUN=1
 
@@ -37,8 +37,13 @@ fi
 
 # ── isolated project dir ──────────────────────────────────────────────────────
 TEST_DIR="$(mktemp -d /tmp/mini-ork-e2e-code-fix-XXXXXX)"
+TEST_DIR="$(cd "$TEST_DIR" && pwd -P)"
 export MINI_ORK_HOME="$TEST_DIR/.mini-ork"
 export MINI_ORK_DB="$MINI_ORK_HOME/state.db"
+export MINI_ORK_ENGINE_ROOT="$MINI_ORK_ROOT"
+export MINI_ORK_PROJECT_HOME="$MINI_ORK_HOME"
+export MINI_ORK_TARGET_REPO="$TEST_DIR"
+unset MINI_ORK_RUN_DIR MINI_ORK_RUN_ID MINI_ORK_PLAN_PATH MINI_ORK_RECIPE MINI_ORK_TASK_CLASS
 trap 'rm -rf "$TEST_DIR"' EXIT
 
 echo "--- mini-ork init ---"
@@ -160,12 +165,9 @@ fi
 echo ""
 echo "--- mini-ork verify (dry-run) ---"
 
-VERIFY_OUT="$("$MINI_ORK_ROOT/bin/mini-ork-verify" 2>/dev/null || echo '[verify-skipped]')"
-if [[ -x "$MINI_ORK_ROOT/bin/mini-ork-verify" ]]; then
-  _assert "verify script ran" '[[ -n "${VERIFY_OUT:-}" ]]'
-else
-  _skip "mini-ork-verify not found — verify step skipped"
-fi
+VERIFY_OUT="$(env PYTHONPATH="$MINI_ORK_ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+  python3 -m mini_ork.ported.mini_ork_verify 2>/dev/null || echo '[verify-failed]')"
+_assert "Python verify module ran" '[[ -n "${VERIFY_OUT:-}" ]]'
 
 echo ""
 echo "--- task_runs row: classified status (if state.db was initialised) ---"

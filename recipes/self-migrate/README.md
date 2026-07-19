@@ -24,9 +24,11 @@ is repointed and the bash entrypoint retires.
    ledger is the migration's strategic payload.
 3. **migrator** (codex) → `self-migrate.diff` — make Python sole, repoint every
    inbound ref, retire the bash entrypoint in the diff.
-4. **verify** — `parity.sh` (byte-parity vs the bash oracle) · `feature-acceptance.sh`
+4. **verify** — `pre-retirement-parity.sh` captures byte parity while the Bash
+   oracle still exists · `parity.sh` rechecks the migrated behavior · `feature-acceptance.sh`
    (the end-to-end feature probe + pytest + pyright) · `ledger-shape.sh` (the
-   ledger is complete, every agentic row has a cost-down `opportunity`).
+   ledger is complete, every agentic row has a cost-down `opportunity`) ·
+   `fork-closure.sh` (the retired entrypoint and every runtime reference are gone).
 5. **reviewer** (opus) → `verdict.json` — `pass == parity ∧ acceptance ∧
    ledger_complete ∧ no_dangling_edge`.
 
@@ -39,7 +41,7 @@ is repointed and the bash entrypoint retires.
 
 ## Run it
 ```bash
-export MINI_ORK_ROOT="$PWD/.mini-ork" MINI_ORK_HOME="$PWD/.mini-ork" MO_TARGET_CWD="$PWD"
+export MINI_ORK_ROOT="$PWD" MINI_ORK_HOME="$PWD/.mini-ork" MO_TARGET_CWD="$PWD"
 export MO_ALLOW_FRAMEWORK_CWD=1 MO_FORK=verify      # self-edit + name the fork
 "$MINI_ORK_ROOT/bin/mini-ork" run self-migrate recipes/self-migrate/example-kickoff.md
 ```
