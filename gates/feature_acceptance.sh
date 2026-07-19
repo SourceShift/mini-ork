@@ -31,11 +31,18 @@ _run() { # <label> <cmd...>  → prints PASS/FAIL, updates rc_all
 _probe_entrypoint() { # <cmd>
   local cmd="$1"
   local bin="$ROOT/bin/mini-ork-$cmd"
-  [ -f "$bin" ] || { echo "SKIP  $cmd — no bin/mini-ork-$cmd"; return 0; }
-  # (a) --help works under python runtime (exercises the delegation + arg parse)
-  _run "$cmd:help(python)" env MINI_ORK_RUNTIME=python MINI_ORK_ROOT="$ROOT" bash "$bin" --help
+  local module="mini_ork.ported.mini_ork_$cmd"
+  # (a) --help works through the live Python entrypoint. Before retirement this
+  # exercises runtime-select delegation; after retirement it exercises the
+  # canonical module directly instead of turning deletion into a vacuous SKIP.
+  if [ -f "$bin" ]; then
+    _run "$cmd:help(python)" env MINI_ORK_RUNTIME=python MINI_ORK_ROOT="$ROOT" bash "$bin" --help
+  else
+    _run "$cmd:help(python-sole)" env PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+      python3 -m "$module" --help
+  fi
   # (b) the ported module imports + exposes main (the runtime path is real)
-  _run "$cmd:module-imports" python3 -c "import importlib,sys; sys.path.insert(0,'$ROOT'); m=importlib.import_module('mini_ork.ported.mini_ork_$cmd'); assert hasattr(m,'main')"
+  _run "$cmd:module-imports" python3 -c "import importlib,sys; sys.path.insert(0,'$ROOT'); m=importlib.import_module('$module'); assert hasattr(m,'main')"
 }
 
 # ── higher-order feature probes (delegate to existing gates where they exist) ──
