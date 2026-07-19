@@ -68,7 +68,7 @@ Stages recognised by the dispatcher (`bin/mini-ork:15`): `classify → plan → 
 | plan | `bin/mini-ork-plan` | Emits `plan.json` with `artifact_contract.success_verifiers[]` + `verifier_contract.checks[]`. |
 | execute | `bin/mini-ork-execute` | Dispatches workflow nodes; hosts the GRPO write-half (`mo_learning_write_grpo_advantages`, `:432+`) and the lane-routing switch (`_mo_policy_route_lane`, `:1971`). |
 | verify | `bin/mini-ork-verify` | Runs `success_verifiers[]` then `gate_run_all` (`:305`). Empty-evidence exit-0 = `[fail] vacuous` (`:271-278`); zero verifiers run = verdict `vacuous`, not `pass` (`:317-323`). |
-| reflect | `bin/mini-ork-reflect` | Delegates to `reflection_run`, then pattern_miner, cross_epic_gradient, bug_report_sweep, rho_aggregate, lane_router_recompute, optional GEPA (`:158-267`). |
+| reflect | `mini_ork/ported/mini_ork_reflect.py` | Delegates to `reflection_run`, then pattern_miner, cross_epic_gradient, bug_report_sweep, rho_aggregate, lane_router_recompute, optional GEPA. |
 | improve | `bin/mini-ork-improve` | Reads per-task_class perf from `execution_traces`, calls `group_propose`, persists `workflow_candidates`. |
 | eval | `bin/mini-ork-eval` | Benchmarks a candidate, computes `utility_delta` vs baseline, transitions candidate→shadow. |
 | promote | `bin/mini-ork-promote` | `promotion_evaluate`; on pass registers a version + status `promoted`; on fail `quarantined` (permanent block). |

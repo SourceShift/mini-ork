@@ -73,7 +73,7 @@ _USAGE_BLOCK = (
     "mini-ork bug-collector — auto-dispatched after each node completes by\n"
     "bin/mini-ork-execute. Scans the just-finished agent's output for\n"
     "side-issues the agent noticed but did NOT fix, and emits one\n"
-    "noticed_bugs.jsonl row per finding so bin/mini-ork-reflect's sweep can\n"
+    "noticed_bugs.jsonl row per finding so the Python reflect pipeline's sweep can\n"
     "pick them up.\n"
     "\n"
     "Modes:\n"

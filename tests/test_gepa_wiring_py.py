@@ -3,7 +3,7 @@
 
 Two scenarios:
 
-1. Default path (``MO_OPTIMIZER`` unset): ``bin/mini-ork-reflect --dry-run``
+1. Default path (``MO_OPTIMIZER`` unset): the Python reflect module in dry-run
    against a seeded ``state.db`` must produce the same shape of output as
    pre-R4b — no ``[optimizer]`` substring, no ``pattern_records`` row with
    ``pattern_id LIKE 'gepa-%'``.
@@ -25,6 +25,7 @@ import json
 import os
 import sqlite3
 import subprocess
+import sys
 from pathlib import Path
 
 from mini_ork.dispatch import DispatchResult
@@ -32,7 +33,7 @@ from mini_ork.optimize import MiniOrkGepaAdapter, run_suggestion
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-REFLECT_BIN = REPO_ROOT / "bin" / "mini-ork-reflect"
+REFLECT_MODULE = "mini_ork.ported.mini_ork_reflect"
 
 TARGET_TOKEN = "gepa_target_token"
 
@@ -190,10 +191,13 @@ def test_default_path_skips_optimizer_block(tmp_path):
     env["MINI_ORK_DB"] = str(db_path)
 
     result = subprocess.run(
-        [str(REFLECT_BIN), "--dry-run"],
+        [sys.executable, "-m", REFLECT_MODULE, "--dry-run"],
         capture_output=True,
         text=True,
-        env=env,
+        env={
+            **env,
+            "PYTHONPATH": str(REPO_ROOT) + os.pathsep + env.get("PYTHONPATH", ""),
+        },
         cwd=str(tmp_path),
     )
     assert result.returncode == 0, (

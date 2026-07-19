@@ -530,6 +530,36 @@ def test_live_verifier_hollow_artifact_fails(tmp_path):
     assert rc_ok == 0
 
 
+def test_pre_implementer_verifier_does_not_require_final_artifact(tmp_path, monkeypatch):
+    db = _seed_db(tmp_path, "pre-vh"); _seed_task_run(db)
+    rd = tmp_path / "run"; rd.mkdir()
+    missing_final_artifact = rd / "self-migrate.diff"
+    plan = tmp_path / "plan-pre.json"
+    plan.write_text(json.dumps({
+        "objective": "capture the legacy oracle before migration",
+        "artifact_contract": {"outputs": [str(missing_final_artifact)]},
+    }))
+    verifier_called = []
+
+    def passing_baseline_verifier(script, evidence_path, **_kwargs):
+        verifier_called.append(script)
+        Path(evidence_path).write_text('{"pass":true}\n')
+        return 0
+
+    monkeypatch.setattr(ex, "_run_verifier_ref", passing_baseline_verifier)
+    workflow = REPO / "recipes" / "self-migrate" / "workflow.yaml"
+    rc, fr = ex.dispatch_node(
+        _fields("pre_retirement_parity", "verifier", vref="verifiers/pre-retirement-parity.sh"),
+        root=str(REPO), run_dir=str(rd), plan_path=str(plan), task_class="self_migrate",
+        db=db, run_id="r1", dispatch_fn=_fake(""), recipe="self-migrate",
+        workflow=str(workflow),
+    )
+
+    assert rc == 0 and fr == "done"
+    assert verifier_called
+    assert not missing_final_artifact.exists()
+
+
 def test_run_verifier_ref(tmp_path):
     ok = tmp_path / "ok.sh"; ok.write_text('#!/usr/bin/env bash\necho \'{"pass": true}\'\n')
     bad = tmp_path / "bad.sh"; bad.write_text('#!/usr/bin/env bash\necho \'{"pass": false}\'\n')
@@ -679,6 +709,7 @@ def test_classic_reviewer_prompt_includes_recipe_specific_evidence(tmp_path):
     db = _seed_db(tmp_path, "rve"); _seed_task_run(db)
     rd = tmp_path / "run"; rd.mkdir()
     (rd / "implementer-summary.json").write_text('{"status":"implemented"}\n')
+    (rd / "pre-retirement-parity.json").write_text('{"pass":true}\n')
     (rd / "verifier_parity.json").write_text('{"pass":true}\n')
     (rd / "verifier_fork-closure.json").write_text('{"pass":true}\n')
     (rd / "integration-map.json").write_text('{"fork":"verify"}\n')
@@ -695,7 +726,8 @@ def test_classic_reviewer_prompt_includes_recipe_specific_evidence(tmp_path):
                      plan_path=_plan(tmp_path), task_class="self_migrate", db=db,
                      run_id="r1", recipe="self-migrate", dispatch_fn=cap)
 
-    for name in ("verifier_parity.json", "verifier_fork-closure.json",
+    for name in ("pre-retirement-parity.json", "verifier_parity.json",
+                 "verifier_fork-closure.json",
                  "integration-map.json", "static-feature-ledger.json",
                  "verdict.json", "self-migrate.diff"):
         assert f"# {name}" in captured["p"]

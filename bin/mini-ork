@@ -533,7 +533,8 @@ PY
     if [ "${MO_AUTO_REFLECT:-1}" = "1" ]; then
       echo "── reflect (auto, since run start) ──"
       MO_REFLECTION_BATCH="${MO_REFLECTION_BATCH:-25}" \
-        "$MINI_ORK_ROOT/bin/mini-ork-reflect" --since "$_RUN_T0" \
+        env PYTHONPATH="${MINI_ORK_ROOT}${PYTHONPATH:+:$PYTHONPATH}" \
+        python3 -m mini_ork.ported.mini_ork_reflect --since "$_RUN_T0" \
         || echo "  [warn] auto-reflect failed (run itself unaffected)" >&2
     fi
     exit "$_run_rc"
