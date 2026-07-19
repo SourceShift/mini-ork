@@ -28,18 +28,21 @@ fail-closed and must preserve its own durable green report before migration.
 
 The first paid launch (`run-1784502357-9667`) stopped before planning because
 the frozen operator policy routes `planner` and `glm_lens` to MiniMax while
-`MINIMAX_API_KEY` is unavailable. The isolated target remained clean. For the
-retry, preserve the user-owned policy file and apply process-local lane-cache
-overrides instead:
+`MINIMAX_API_KEY` is unavailable. The isolated target remained clean.
 
-```bash
-export _MO_LANE_PLANNER=codex
-export _MO_LANE_GLM_LENS=codex
-```
+The retry uses the dedicated runtime home
+`/private/tmp/mini-ork-self-migrate-reflect-home`. Its frozen policy contains
+only three provider values:
 
-This keeps the authoritative `opus_lens` mapper, ledger, and reviewer lanes and
-the `codex_lens` migrator unchanged. A retry still requires explicit cost
-approval.
+- Kimi: planner and general research
+- Codex: migrator and coding fallback
+- GLM: seam mapper, authoritative ledger, reviewer, and judgment fallback
+
+Load the Kimi and GLM credentials process-locally from
+`/Users/admin/ps/scripts/cl_kimi.sh` and `cl_glm.sh`, translate their
+Claude-compatible tokens into `KIMI_API_KEY` and `GLM_API_KEY`, then clear the
+temporary Anthropic gateway variables before launching. Never copy secret
+values into this kickoff, the runtime home, or run artifacts.
 
 ## Inbound references to resolve
 
