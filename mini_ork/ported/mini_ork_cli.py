@@ -1,4 +1,4 @@
-"""Python port of bin/mini-ork — the entrypoint / universal-loop dispatcher.
+"""Python port of the mini-ork entrypoint / universal-loop dispatcher.
 
 Strangler-fig parity port. Simple subcommands delegate to bin/mini-ork-<sub>
 (still bash until ported); the `run` recipe-runner walks classify → profile →
@@ -22,7 +22,7 @@ import sys
 import time
 from pathlib import Path
 
-_EXEC_SUBS = {"classify", "plan", "execute", "verify", "reflect", "improve", "eval",
+_EXEC_SUBS = {"classify", "plan", "execute", "reflect", "improve", "eval",
               "promote", "init", "update", "spawn", "scheduler", "epics", "bugs",
               "inject", "review", "traceotter", "metrics", "rollback", "resume", "recover",
               "serve", "validate", "garden", "recipe-eval"}
@@ -64,6 +64,12 @@ Environment:
 
 def _bin(root, name):
     return os.path.join(root, "bin", f"mini-ork-{name}")
+
+
+def _module_env(root):
+    env = dict(os.environ)
+    env["PYTHONPATH"] = root + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+    return env
 
 
 def resolve_recipe(root: str, task_class: str) -> str:
@@ -422,8 +428,8 @@ def _run_lifecycle(argv, root) -> int:
     # ── verify ──
     if _run_dir and _run_dir != "." and os.path.isdir(_run_dir):
         os.environ["MINI_ORK_RUN_DIR"] = _run_dir
-    vargs = [_bin(root, "verify")] + ([artifact] if artifact else [])
-    vr = subprocess.run(vargs, capture_output=True, text=True)
+    vargs = [sys.executable, "-m", "mini_ork.ported.mini_ork_verify"] + ([artifact] if artifact else [])
+    vr = subprocess.run(vargs, capture_output=True, text=True, env=_module_env(root))
     sys.stdout.write(vr.stdout); sys.stderr.write(vr.stderr)
     if run_rc == 0:
         run_rc = vr.returncode
@@ -446,6 +452,11 @@ def main(argv=None, *, root=None) -> int:
     sub = argv[0] if argv else "help"
     rest = argv[1:]
 
+    if sub == "verify":
+        return subprocess.run(
+            [sys.executable, "-m", "mini_ork.ported.mini_ork_verify", *rest],
+            env=_module_env(root),
+        ).returncode
     if sub in _EXEC_SUBS:
         return subprocess.run([_bin(root, sub), *rest]).returncode
     if sub == "run":

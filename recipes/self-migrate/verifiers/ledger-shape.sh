@@ -8,7 +8,7 @@
 # ledger row (best-effort — warns if the diff is absent, e.g. smoke shape).
 #
 # Inputs (env): MINI_ORK_RUN_DIR (required).
-# Output: JSON to stdout with .pass. Exit 0 always.
+# Output: JSON to stdout with .pass. Exit code mirrors .pass.
 
 set -uo pipefail
 RUN_DIR="${MINI_ORK_RUN_DIR:?MINI_ORK_RUN_DIR required}"
@@ -24,14 +24,14 @@ ok = True
 if not os.path.isfile(ledger_path):
     print(json.dumps({"name": "ledger-shape", "pass": False,
                       "reasons": [f"ledger missing at {ledger_path}"]}))
-    raise SystemExit(0)
+    raise SystemExit(1)
 
 try:
     led = json.load(open(ledger_path, encoding="utf-8"))
 except Exception as e:
     print(json.dumps({"name": "ledger-shape", "pass": False,
                       "reasons": [f"ledger not valid JSON: {e}"]}))
-    raise SystemExit(0)
+    raise SystemExit(1)
 
 feats = led.get("features")
 if not isinstance(feats, list) or not feats:
@@ -40,9 +40,12 @@ if not isinstance(feats, list) or not feats:
 
 VALID_CLASS = {"static", "agentic", "integration"}
 named = set()
+symbols = set()
 for i, f in enumerate(feats):
     name = f.get("feature")
     named.add(name)
+    if isinstance(name, str):
+        symbols.add(re.split(r"[.:]", name)[-1])
     if not name:
         ok = False; reasons.append(f"feature[{i}] missing name")
     if f.get("class") not in VALID_CLASS:
@@ -55,7 +58,7 @@ for i, f in enumerate(feats):
 if os.path.isfile(diff_path):
     added = open(diff_path, encoding="utf-8", errors="replace").read()
     changed_fns = set(re.findall(r'^\+\s*def\s+([a-zA-Z_]\w*)', added, re.M))
-    missing = [fn for fn in changed_fns if fn not in named and not fn.startswith("_")]
+    missing = [fn for fn in changed_fns if fn not in symbols and not fn.startswith("_")]
     if missing:
         ok = False
         reasons.append("changed functions with no ledger row: " + ", ".join(sorted(missing)))
@@ -64,4 +67,5 @@ else:
 
 print(json.dumps({"name": "ledger-shape", "pass": ok,
                   "features": len(feats), "reasons": reasons}))
+raise SystemExit(0 if ok else 1)
 PY

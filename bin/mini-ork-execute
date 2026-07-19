@@ -126,7 +126,7 @@ except Exception:
   _exit=$?
 
   # Minimum-evidence assertion: exit 0 with an empty evidence file is a
-  # vacuous pass — fail it. (Mirrors bin/mini-ork-verify's per-verifier check.)
+  # vacuous pass — fail it. (Mirrors the canonical Python verifier check.)
   if [ ! -s "$_evidence" ]; then
     echo "vacuous pass: verifier exited $_exit but wrote no evidence" > "$_evidence"
     [ "$_errexit_set" -eq 1 ] && set -e
@@ -2932,7 +2932,7 @@ PY
       ;;
 
     verifier)
-      # Delegate to mini-ork-verify for the artifact_contract
+      # Delegate to the canonical Python verifier for the artifact_contract.
       if [ -z "$node_verifier_ref" ] && [ -n "${WORKFLOW:-}" ] && [ -f "$WORKFLOW" ]; then
         node_verifier_ref=$(python3 - "$WORKFLOW" "$node_id" <<'PY'
 import sys, yaml
@@ -2963,7 +2963,7 @@ PY
             echo "  [fail] verifier_ref not found: $node_verifier_ref" >&2
             return 1
           fi
-          # Evidence lives WITH the run it verified (see bin/mini-ork-verify).
+          # Evidence lives WITH the run it verified (see mini_ork_verify.py).
           local _evidence_dir="${MINI_ORK_RUN_DIR:-$MINI_ORK_HOME/runs}/evidence"
           mkdir -p "$_evidence_dir"
           local _vstem="${node_verifier_ref#verifiers/}"
@@ -2990,7 +2990,9 @@ PY
             return 1
           fi
         else
-          "$MINI_ORK_ROOT/bin/mini-ork-verify" --plan "$PLAN_PATH" --task-class "$TASK_CLASS" "$ARTIFACT_PATH" || {
+          env PYTHONPATH="$MINI_ORK_ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+            python3 -m mini_ork.ported.mini_ork_verify \
+              --plan "$PLAN_PATH" --task-class "$TASK_CLASS" "$ARTIFACT_PATH" || {
             MO_NODE_FINISH_REASON="error"
             echo "  [fail] verifier node failed for $ARTIFACT_PATH" >&2; return 1
           }

@@ -14,6 +14,7 @@ required_artifacts:
   - "${MINI_ORK_RUN_DIR}/static-feature-ledger.json"
   - "${MINI_ORK_RUN_DIR}/integration-map.json"
   - "${MINI_ORK_RUN_DIR}/verdict.json"
+  - "${MINI_ORK_RUN_DIR}/pre-retirement-parity-evidence.log"
 
 verdict_schema:
   required_keys:
@@ -26,9 +27,11 @@ verdict_schema:
   rule: "pass == (parity_pass && acceptance_pass && ledger_complete && no_dangling_edge)"
 
 success_verifiers:
+  - verifiers/pre-retirement-parity.sh
   - verifiers/parity.sh
   - verifiers/feature-acceptance.sh
   - verifiers/ledger-shape.sh
+  - verifiers/fork-closure.sh
 
 failure_policy: request_changes
 rollback_policy: >

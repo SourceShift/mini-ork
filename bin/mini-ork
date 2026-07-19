@@ -511,9 +511,11 @@ PY
     fi
     _verify_rc=0
     if [ -n "${MINI_ORK_ARTIFACT_PATH:-}" ]; then
-      "$MINI_ORK_ROOT/bin/mini-ork-verify" "$MINI_ORK_ARTIFACT_PATH" || _verify_rc=$?
+      env PYTHONPATH="$MINI_ORK_ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+        python3 -m mini_ork.ported.mini_ork_verify "$MINI_ORK_ARTIFACT_PATH" || _verify_rc=$?
     else
-      "$MINI_ORK_ROOT/bin/mini-ork-verify" || _verify_rc=$?
+      env PYTHONPATH="$MINI_ORK_ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+        python3 -m mini_ork.ported.mini_ork_verify || _verify_rc=$?
     fi
     [ "$_run_rc" -eq 0 ] && _run_rc=$_verify_rc
 

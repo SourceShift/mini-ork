@@ -8,12 +8,28 @@
 # integration harness); it validates the deterministic surface end-to-end through
 # the actual bin/ shim, complementing the per-module parity unit tests.
 #
-# Usage: bash scripts/runtime-parity-harness.sh
+# Usage: bash scripts/runtime-parity-harness.sh [fork]
 # Exit 0 = every check identical across runtimes; 1 = a divergence.
 set -uo pipefail
 
 ROOT="${MINI_ORK_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 export MINI_ORK_ROOT="$ROOT"
+FORK="${1:-}"
+
+# A closed fork no longer has a Bash runtime to invoke. Its pre-retirement
+# oracle receipt is durable in the migration run, so the post-retirement
+# harness validates the captured standalone Python contract instead. Keep the
+# no-argument mode as the full cross-runtime matrix for forks still in flight.
+if [ -n "$FORK" ]; then
+  FORK_TEST="$ROOT/tests/unit/test_mini_ork_${FORK}_py.py"
+  if [ ! -f "$FORK_TEST" ]; then
+    echo "FAIL — no focused runtime contract for fork '$FORK': $FORK_TEST" >&2
+    exit 1
+  fi
+  echo "── focused runtime contract: $FORK ──"
+  exec python3 -m pytest "$FORK_TEST" -q -p no:cacheprovider
+fi
+
 BIN="$ROOT/bin"
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 FAILS=0
