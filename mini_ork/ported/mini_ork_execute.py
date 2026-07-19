@@ -706,17 +706,28 @@ def _resolve_dispatch_mode(override, wf_path) -> str:
 def _emit_run_verdict(run_dir, fail_count, dispatched):
     if not (run_dir and os.path.isdir(run_dir)):
         return
-    if os.path.isfile(os.path.join(run_dir, "verdict.json")) or \
-            os.path.isfile(os.path.join(run_dir, "panel-verdict.json")):
+    if os.path.isfile(os.path.join(run_dir, "panel-verdict.json")):
         return
     verdict = "fail" if fail_count > 0 else "pass"
+    verdict_path = os.path.join(run_dir, "verdict.json")
+    if os.path.isfile(verdict_path):
+        try:
+            existing = json.load(open(verdict_path, encoding="utf-8"))
+        except Exception:
+            existing = {}
+        if isinstance(existing, dict) and existing.get("source") == "execute@run-level":
+            return
+        # A recipe may own verdict.json as a detailed deliverable. Keep that
+        # evidence intact and put executor bookkeeping beside it.
+        verdict_path = os.path.join(run_dir, "run-verdict.json")
     try:
-        open(os.path.join(run_dir, "verdict.json"), "w").write(
+        open(verdict_path, "w").write(
             '{"verdict":"%s","failed_nodes":%d,"dispatched":%d,"source":"execute@run-level"}\n'
             % (verdict, fail_count, dispatched))
     except OSError:
         return
-    print(f"  [verdict] run-level verdict.json: {verdict} (failed_nodes={fail_count})")
+    print(f"  [verdict] run-level {os.path.basename(verdict_path)}: {verdict} "
+          f"(failed_nodes={fail_count})")
 
 
 def main(argv=None, *, root=None, dispatch_fn=None) -> int:
@@ -1191,10 +1202,18 @@ def _run_verifier_ref(script, evidence_path, *, plan_path="", artifact_path="", 
     """Port of _run_verifier_ref (minus the mo_runtime_exec seam): run the
     verifier script, capture evidence, and treat {"pass": true} as success."""
     cwd = cwd or os.environ.get("MO_TARGET_CWD") or os.getcwd()
+    verifier_env = {**os.environ,
+                    "MINI_ORK_PLAN_PATH": plan_path,
+                    "ARTIFACT_PATH": artifact_path}
+    # A direct ``mini-ork execute`` invocation may know the run directory only
+    # through ``evidence_path``/``run_dir`` and not export MINI_ORK_RUN_DIR.
+    # Recipe verifiers use that variable as their artifact namespace, so make
+    # the executor-to-verifier boundary explicit instead of relying on an
+    # outer CLI process to have populated it.
+    verifier_env.setdefault("MINI_ORK_RUN_DIR", os.path.dirname(evidence_path))
     with open(evidence_path, "wb") as fh:
         rc = subprocess.run(["bash", script], cwd=cwd, stdout=fh, stderr=subprocess.STDOUT,
-                            env={**os.environ, "MINI_ORK_PLAN_PATH": plan_path,
-                                 "ARTIFACT_PATH": artifact_path}).returncode
+                            env=verifier_env).returncode
     if not os.path.getsize(evidence_path):
         open(evidence_path, "w").write(f"vacuous pass: verifier exited {rc} but wrote no evidence")
         return 1
@@ -1287,8 +1306,18 @@ def _synth_artifact_name(root, recipe):
 
 def _resolve_target_cwd(run_dir_eff):
     """Port of bash _dispatch_node:2633-2641. Derive the implementer edit-surface cwd
-    from the run's kickoff git-toplevel; fall back to $MO_TARGET_CWD or cwd. This is
+    from an explicit valid $MO_TARGET_CWD, otherwise the run kickoff's git-toplevel.
+    This is
     the CWT-A corruption fix — pins codex to the TARGET repo, not MINI_ORK_ROOT."""
+    explicit = os.environ.get("MO_TARGET_CWD") or ""
+    if explicit and os.path.isdir(explicit):
+        try:
+            r = subprocess.run(["git", "-C", explicit, "rev-parse", "--show-toplevel"],
+                               capture_output=True, text=True)
+            if r.returncode == 0 and r.stdout.strip():
+                return r.stdout.strip()
+        except Exception:
+            pass
     kickoff = ""
     prof = os.path.join(run_dir_eff, "run_profile.json") if run_dir_eff else ""
     if prof and os.path.isfile(prof):
@@ -1309,7 +1338,7 @@ def _resolve_target_cwd(run_dir_eff):
         # git failure (the subshell already cd'd) — NOT the executor cwd. Returning
         # os.getcwd() would re-open the CWT-A corruption path this fix exists to close.
         return kdir
-    return os.environ.get("MO_TARGET_CWD") or os.getcwd()
+    return explicit or os.getcwd()
 
 
 def _assert_lane_capability(root, lane, required):
@@ -1350,6 +1379,14 @@ def _researcher_output_file(run_dir, recipe, node_id):
         return os.path.join(run_dir, _JUDGE_LENS_FILES[node_id])
     if recipe == "recursive-validate-impl" and node_id in _TIER4_LENS_FILES:
         return os.path.join(run_dir, _TIER4_LENS_FILES[node_id])
+    if recipe == "self-migrate":
+        self_migrate_outputs = {
+            "seam_mapper": "integration-map.json",
+            "static_feature_ledger": "static-feature-ledger.json",
+            "cost_verifiability_lens": "cost-verifiability-lens.md",
+        }
+        if node_id in self_migrate_outputs:
+            return os.path.join(run_dir, self_migrate_outputs[node_id])
     if node_id.endswith(("_lens", "-lens")):
         return os.path.join(run_dir, f"lens-{node_id[:-5]}.md")
     return os.path.join(run_dir, f"context-{node_id}.json")
@@ -1396,6 +1433,80 @@ def _capture_pre_impl_baseline(run_dir):
                 fh.write(ref + "\n")
     except Exception:
         pass
+
+
+def _harvest_self_migrate_artifacts(run_dir, target):
+    """Copy self-migrate outputs from an isolated target's run mirror.
+
+    Codex providers are intentionally sandboxed to ``MO_TARGET_CWD``. When the
+    engine run directory is outside that target, agents write the requested
+    artifacts to ``<target>/.mini-ork/runs/<run-id>`` instead. Harvest those
+    files immediately after the implementer returns so verifier and reviewer
+    nodes in the same run consume the producer's actual evidence.
+    """
+    if not run_dir or not target:
+        return []
+    mirror = os.path.join(target, ".mini-ork", "runs", os.path.basename(run_dir.rstrip(os.sep)))
+    if not os.path.isdir(mirror) or os.path.realpath(mirror) == os.path.realpath(run_dir):
+        return []
+    exact = {
+        "self-migrate.diff", "static-feature-ledger.json", "integration-map.json",
+        "verdict.json", "reflection.md", "requirements-gap-pass-1.md",
+        "requirements-validation-pass-2.md", "pre-retirement-parity.json",
+        "pre-retirement-parity-evidence.log",
+    }
+    prefixes = ("verifier_", "verifier-")
+    copied = []
+    os.makedirs(run_dir, exist_ok=True)
+    for name in sorted(os.listdir(mirror)):
+        src = os.path.join(mirror, name)
+        if not os.path.isfile(src) or os.path.getsize(src) == 0:
+            continue
+        if name not in exact and not name.startswith(prefixes):
+            continue
+        dst = os.path.join(run_dir, name)
+        if name == "verdict.json" and os.path.isfile(dst):
+            try:
+                current = json.load(open(dst, encoding="utf-8"))
+            except Exception:
+                current = {}
+            if isinstance(current, dict) and current.get("source") == "execute@run-level":
+                shutil.copy2(dst, os.path.join(run_dir, "run-verdict.json"))
+        shutil.copy2(src, dst)
+        copied.append(name)
+    return copied
+
+
+def _write_self_migrate_implementer_summary(run_dir, target, impl_log, harvested):
+    """Materialize the reviewer/publisher summary for a self-migrate proposal."""
+    if not run_dir or not target:
+        return
+    baseline = ""
+    ref_path = os.path.join(run_dir, "pre-implementer-ref")
+    if os.path.isfile(ref_path):
+        try:
+            baseline = open(ref_path, encoding="utf-8").read().strip()
+        except OSError:
+            baseline = ""
+    args = ["git", "-C", target, "diff", "--name-only"]
+    if baseline:
+        args.append(baseline)
+    try:
+        changed = subprocess.run(args, capture_output=True, text=True, timeout=15)
+        files = [os.path.join(target, line.strip()) for line in changed.stdout.splitlines()
+                 if line.strip()] if changed.returncode == 0 else []
+    except Exception:
+        files = []
+    payload = {
+        "status": "implemented",
+        "worktree_path": target,
+        "files_changed": files,
+        "implementation_log": impl_log,
+        "harvested_artifacts": list(harvested),
+    }
+    with open(os.path.join(run_dir, "implementer-summary.json"), "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2)
+        handle.write("\n")
 
 
 def _assemble_reviewer_inputs(run_dir):
@@ -1457,8 +1568,24 @@ def _assemble_reviewer_inputs(run_dir):
 
     block = "--- Reviewer inputs (assembled by mini-ork-execute) ---\n"
     block += _sec("implementer-summary.json", summary)
-    block += _sec("verifier_typecheck.json", os.path.join(run_dir, "verifier_typecheck.json"))
-    block += _sec("verifier_test.json", os.path.join(run_dir, "verifier_test.json"))
+    fixed_verifiers = {"verifier_typecheck.json", "verifier_test.json"}
+    for name in sorted(fixed_verifiers):
+        block += _sec(name, os.path.join(run_dir, name))
+    try:
+        recipe_verifiers = sorted(
+            name for name in os.listdir(run_dir)
+            if name.startswith("verifier_") and name.endswith(".json")
+            and name not in fixed_verifiers
+        )
+    except OSError:
+        recipe_verifiers = []
+    for name in recipe_verifiers:
+        block += _sec(name, os.path.join(run_dir, name))
+    for name in ("integration-map.json", "static-feature-ledger.json", "verdict.json",
+                 "self-migrate.diff"):
+        path = os.path.join(run_dir, name)
+        if os.path.isfile(path) and os.path.getsize(path) > 0:
+            block += _sec(name, path)
     if os.path.isfile(diff_path) and os.path.getsize(diff_path) > 0:
         block += f"\n# review-diff.patch\n{open(diff_path).read()}\n"
     else:
@@ -1943,9 +2070,31 @@ def publisher_node(root, run_dir, db, run_id, recipe, task_class, review_file=""
     # matches) is an OK no-op. Was: swallowed failures + unconditional 'published'.
     published_count = 0
     failed_count = 0
+    run_root = os.path.realpath(run_dir)
     for out in outputs:
         out = _envsubst(out)
         dst = os.path.join(root, out)
+        dst_real = os.path.realpath(dst)
+        run_local = dst_real == run_root or dst_real.startswith(run_root + os.sep)
+
+        # Composite/propose-only recipes publish several heterogeneous files in
+        # MINI_ORK_RUN_DIR (for example a diff plus JSON ledger and verdict).
+        # Those files are already in their canonical destination: copying the
+        # single source_artifact over every output corrupts the artifact set.
+        # Preserve each run-local output byte-for-byte and fail closed when the
+        # producer omitted one.
+        if run_local:
+            if os.path.isfile(dst) and os.path.getsize(dst) > 0:
+                print(f"  [ok] publisher: preserved run-local artifact {out}")
+                published_count += 1
+            elif os.path.isdir(dst) and os.listdir(dst):
+                print(f"  [ok] publisher: preserved run-local artifact {out}")
+                published_count += 1
+            else:
+                print(f"  [fail] publisher: missing run-local artifact {out}",
+                      file=sys.stderr)
+                failed_count += 1
+            continue
         copied = False
         try:
             if src_is_dir:
@@ -2028,6 +2177,11 @@ def dispatch_node(fields, *, root, run_dir, plan_path, task_class, db, run_id,
         # E2's recovery code can rely on every success also having a row.
         _base_checkpoint(node_id, status, node_type, output_file)
     run_dir_eff = os.environ.get("MINI_ORK_RUN_DIR", run_dir)
+    # Node prompts and subprocess verifiers refer to MINI_ORK_RUN_DIR as their
+    # artifact namespace. ``mini-ork run`` can derive the directory from the
+    # plan without exporting it, so publish the resolved value at the node
+    # boundary before any provider or verifier subprocess is invoked.
+    os.environ["MINI_ORK_RUN_DIR"] = run_dir_eff
     # Snapshot the tree BEFORE any implementer node edits it, so the reviewer
     # diff captures only the implementer's delta (not pre-existing dirt from a
     # concurrent session sharing this in-place working tree). Non-destructive.
@@ -2194,6 +2348,11 @@ def dispatch_node(fields, *, root, run_dir, plan_path, task_class, db, run_id,
             return 1, fr
         open(impl_log, "w").write(result)
         apply_impl_output(impl_log, target)   # ported "capture coin-flip" applier
+        if recipe_eff == "self-migrate":
+            harvested = _harvest_self_migrate_artifacts(run_dir_eff, target)
+            _write_self_migrate_implementer_summary(
+                run_dir_eff, target, impl_log, harvested
+            )
         trace(node_id, "success", "implementer", impl_log, "", "done")
         _charge()
         return 0, "done"
@@ -2260,7 +2419,7 @@ def dispatch_node(fields, *, root, run_dir, plan_path, task_class, db, run_id,
     if node_type == "verifier":
         # Hollow-run guard: fail before any verifier runs if the recipe declares a
         # concrete run-local artifact (absolute contract path) that is missing or
-        # zero-byte. Covers the verifier_ref branch (which bypasses mini-ork-verify).
+        # zero-byte. Covers the verifier_ref branch (which bypasses the canonical verifier).
         if not _required_artifacts_ok(plan_path):
             print("  [fail] verifier node: required artifact(s) missing or empty", file=sys.stderr)
             return 1, "error"
@@ -2298,8 +2457,14 @@ def dispatch_node(fields, *, root, run_dir, plan_path, task_class, db, run_id,
                 except OSError:
                     pass
             return (0, "done") if rc == 0 else (1, "error")
-        rc = subprocess.run([os.path.join(root, "bin", "mini-ork-verify"), "--plan", plan_path,
-                             "--task-class", task_class, artifact]).returncode
+        module_env = dict(os.environ)
+        module_env["PYTHONPATH"] = root + (
+            os.pathsep + module_env["PYTHONPATH"] if module_env.get("PYTHONPATH") else ""
+        )
+        rc = subprocess.run([
+            sys.executable, "-m", "mini_ork.ported.mini_ork_verify", "--plan", plan_path,
+            "--task-class", task_class, artifact,
+        ], env=module_env).returncode
         return (0, "done") if rc == 0 else (1, "error")
 
     if node_type == "publisher":

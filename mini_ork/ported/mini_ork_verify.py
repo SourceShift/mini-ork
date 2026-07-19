@@ -1,4 +1,4 @@
-"""Python port of bin/mini-ork-verify — verifier dispatcher.
+"""Canonical Python verifier dispatcher.
 
 Strangler-fig parity port. Reads artifact_contract.success_verifiers[] from the
 plan, runs each verifier script/command, evaluates the ported
@@ -18,6 +18,8 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+
+from mini_ork import trace_store
 
 from . import gate_registry
 
@@ -94,6 +96,14 @@ def _find_verifier_command(raw, plan_path):
     return ""
 
 
+def _safe_trace_write(payload: dict, db: str) -> None:
+    """Persist verifier telemetry without making observability a failure mode."""
+    try:
+        trace_store.trace_write(payload, db=db)
+    except Exception:
+        pass
+
+
 def main(argv: list[str] | None = None, *, db: str | None = None, root: str | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     root = root or os.environ.get("MINI_ORK_ROOT") or os.getcwd()
@@ -143,6 +153,14 @@ def main(argv: list[str] | None = None, *, db: str | None = None, root: str | No
             verifier_names = [v for v in (ac.get("success_verifiers") or []) if v]
     task_class = task_class or "generic"
 
+    trace_id = f"tr-verify-{int(time.time())}-{os.getpid()}"
+    if dry_run == 0:
+        _safe_trace_write({
+            "trace_id": trace_id,
+            "task_class": task_class,
+            "status": "running",
+        }, db)
+
     results: list[str] = []
     pass_count = fail_count = 0
 
@@ -161,13 +179,23 @@ def main(argv: list[str] | None = None, *, db: str | None = None, root: str | No
                 results.append(f'{{"verifier":"{name}","pass":false,"evidence_path":"script_not_found"}}')
                 fail_count += 1
                 continue
-            rc = subprocess.run(["bash", "-lc", command], capture_output=True).returncode
-            with open(ev, "wb") as fh:
-                fh.write(subprocess.run(["bash", "-lc", command], capture_output=True).stdout or b"")
-            ok = rc == 0
+            run = subprocess.run(
+                ["bash", "-lc", command],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+            )
+            evidence = run.stdout or b""
+            if run.returncode == 0 and not evidence:
+                evidence = f"verifier command exited 0: {command}\n".encode()
+            Path(ev).write_bytes(evidence)
+            ok = run.returncode == 0
         else:
-            r = subprocess.run(["bash", script], capture_output=True,
-                               env={**os.environ, "ARTIFACT_PATH": artifact_path})
+            r = subprocess.run(
+                ["bash", script],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                env={**os.environ, "ARTIFACT_PATH": artifact_path},
+            )
             Path(ev).write_bytes(r.stdout or b"")
             ok = r.returncode == 0
             if ok and os.path.getsize(ev) == 0:  # vacuous: exit 0 but no evidence → fail
@@ -177,7 +205,7 @@ def main(argv: list[str] | None = None, *, db: str | None = None, root: str | No
         else:
             results.append(f'{{"verifier":"{name}","pass":false,"evidence_path":"{ev}"}}'); fail_count += 1
 
-    # Required-artifact assertion (parity: bin/mini-ork-verify). A recipe that
+    # Required-artifact assertion retained from the pre-retirement contract. A recipe that
     # declares a concrete, run-local artifact but produces nothing (missing OR
     # zero-byte) must FAIL — not launder into pass/partial/vacuous. Only ABSOLUTE
     # env-expanded paths (e.g. `${MINI_ORK_RUN_DIR}/framework-edit.diff`) are
@@ -237,7 +265,7 @@ def main(argv: list[str] | None = None, *, db: str | None = None, root: str | No
     else:
         verdict = "partial"
 
-    sys.stdout.write(
+    output = (
         "{\n"
         f'  "verdict": "{verdict}",\n'
         f'  "artifact_path": "{artifact_path or ""}",\n'
@@ -246,6 +274,15 @@ def main(argv: list[str] | None = None, *, db: str | None = None, root: str | No
         f'  "fail_count": {fail_count},\n'
         f'  "results": [{",".join(results)}]\n'
         "}\n")
+    sys.stdout.write(output)
+    if dry_run == 0:
+        status = "failure" if verdict == "fail" else ("vacuous" if verdict == "vacuous" else "success")
+        _safe_trace_write({
+            "trace_id": trace_id,
+            "task_class": task_class,
+            "status": status,
+            "verifier_output": {"verdict": verdict},
+        }, db)
     return 1 if verdict == "fail" else 0
 
 
