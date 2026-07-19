@@ -321,18 +321,17 @@ reviewer evidence assembly, and verdict preservation.
 - Verify and CLI unit modules pass all 15 tests; integration and E2E scripts pass 8 and 18 assertions respectively.
 - Pyright reports zero errors across the migrated verifier, CLI, and executor; `bin/mini-ork validate`, shell syntax checks, and `git diff --check` pass.
 - `bin/mini-ork garden` reports 0 errors and 0 warnings (265 informational stale-run notices only).
-- The repository-wide direct pytest run completed with 1,805 passed, 5 skipped, and 3 pre-existing/out-of-scope failures: one capability-policy expectation affected by the user-owned `.mini-ork/config/agents.yaml`, plus two reflect opt-out tests where the Bash sweep mutates the shared test database before the Python sweep. Each failure reproduces in isolation. The documented `make test` command is unavailable because this checkout has no `test` Make target.
+- The repository-wide direct pytest run completed with 1,805 passed, 5 skipped, and 3 source-checkout-state failures: one capability-policy expectation affected by the user-owned `.mini-ork/config/agents.yaml`, plus two reflect opt-out tests. The reflect failures reproduced in the dirty source checkout but all 8 reflect tests pass in the clean isolated migration worktree. The documented `make test` command is unavailable because this checkout has no `test` Make target.
 
 ### Next safe action
 
 Use `kickoffs/migration/reflect.md` and the isolated reflect worktree prepared
-from the focused verify-closure commit. Before any paid run, resolve the known
-pre-retirement parity blocker: `test_opt_out_pattern_miner` and
-`test_combined_opt_out` currently compare the Python sweep against a database
-already mutated by the Bash sweep. Do not change those tests without explicit
-user confirmation, and do not start the paid self-migrate run without separate
-explicit approval. The next live run must also confirm that its same-run
-reviewer consumes the harvested evidence.
+from the focused verify-closure commit. The exact isolated target passes all 8
+pre-retirement reflect parity tests; the two failures observed in the dirty
+source checkout do not reproduce there, so no test repair is currently needed.
+Do not start the paid self-migrate run without explicit approval. The next live
+run must also confirm that its same-run reviewer consumes the harvested
+evidence.
 
 Each fork closure produces:
 - `self-migrate.diff` (reviewable, apply or reject)
