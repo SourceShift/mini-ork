@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # mini-ork bug-collector — auto-dispatched after each node completes by
-# bin/mini-ork-execute. Scans the just-finished agent's output for
+# mini_ork/ported/mini_ork_execute.py. Scans the just-finished agent's output for
 # side-issues the agent noticed but did NOT fix, and emits one
 # noticed_bugs.jsonl row per finding so the Python reflect pipeline's sweep can
 # pick them up.

@@ -188,7 +188,7 @@ def _resolve_capability_yaml_paths() -> tuple[str, str, bool]:
     return primary, fallback, primary_exists
 
 
-def assert_lane_capability(lane: str) -> None:
+def assert_lane_capability(lane: str, required: str | None = None) -> None:
     """Mirror ``mo_assert_lane_capability`` — raise ``RuntimeError`` on missing.
 
     Bash exits 1 and prints the first missing capability token to stderr
@@ -201,7 +201,8 @@ def assert_lane_capability(lane: str) -> None:
     first-missing-cap token bash emits — the parity test asserts on
     ``rc=1`` + stderr phrase, not on the internal call shape.
     """
-    required = os.environ.get("MO_LANE_REQUIRES_CAPABILITY", "")
+    required = (os.environ.get("MO_LANE_REQUIRES_CAPABILITY", "")
+                if required is None else required)
     if not required:
         return
     if not lane:

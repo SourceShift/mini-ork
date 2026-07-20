@@ -71,7 +71,7 @@ __all__ = [
 # the leading `#`. Drift from the bash source breaks `test_help_parity`.
 _USAGE_BLOCK = (
     "mini-ork bug-collector — auto-dispatched after each node completes by\n"
-    "bin/mini-ork-execute. Scans the just-finished agent's output for\n"
+    "mini_ork/ported/mini_ork_execute.py. Scans the just-finished agent's output for\n"
     "side-issues the agent noticed but did NOT fix, and emits one\n"
     "noticed_bugs.jsonl row per finding so the Python reflect pipeline's sweep can\n"
     "pick them up.\n"

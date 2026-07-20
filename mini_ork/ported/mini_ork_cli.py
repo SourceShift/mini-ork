@@ -33,7 +33,7 @@ from mini_ork.ported import (
 
 _NATIVE_SUBS = {"classify", "plan", "verify", "reflect"}
 
-_EXEC_SUBS = {"execute", "improve", "eval",
+_EXEC_SUBS = {"improve", "eval",
               "promote", "init", "update", "spawn", "scheduler", "epics", "bugs",
               "inject", "review", "apply", "traceotter", "metrics", "rollback", "resume", "recover",
               "serve", "validate", "garden", "recipe-eval"}
@@ -426,10 +426,16 @@ def _run_lifecycle(argv, root) -> int:
         return 0
 
     # ── execute ── (failures do not exit; verify+reflect still fire)
-    ex = subprocess.run([_bin(root, "execute")], capture_output=True, text=True)
-    run_rc = ex.returncode
-    sys.stdout.write(ex.stdout)
-    artifact = _grep_kv(ex.stdout, "artifact_path")
+    from mini_ork.ported import mini_ork_execute
+    execute_stdout = io.StringIO()
+    execute_stderr = io.StringIO()
+    with contextlib.redirect_stdout(execute_stdout), contextlib.redirect_stderr(execute_stderr):
+        run_rc = mini_ork_execute.main([], root=root)
+    execute_out = execute_stdout.getvalue()
+    execute_err = execute_stderr.getvalue()
+    sys.stdout.write(execute_out)
+    sys.stderr.write(execute_err)
+    artifact = _grep_kv(execute_out, "artifact_path")
     if artifact:
         os.environ["MINI_ORK_ARTIFACT_PATH"] = artifact
     if deadline and _deadline(root, "mo_deadline_check", run_id) != 0:
@@ -442,7 +448,7 @@ def _run_lifecycle(argv, root) -> int:
     if _run_dir and _run_dir != "." and os.path.isdir(_run_dir) \
             and not os.path.isfile(os.path.join(_run_dir, "execute.log")):
         try:
-            open(os.path.join(_run_dir, "execute.log"), "w").write(ex.stdout)
+            open(os.path.join(_run_dir, "execute.log"), "w").write(execute_out)
         except OSError:
             pass
 
@@ -510,6 +516,9 @@ def main(argv=None, *, root=None) -> int:
             [sys.executable, "-m", f"mini_ork.ported.mini_ork_{sub}", *rest],
             env=_module_env(root),
         ).returncode
+    if sub == "execute":
+        from mini_ork.ported import mini_ork_execute
+        return mini_ork_execute.main(rest, root=root)
     if sub in _EXEC_SUBS:
         return subprocess.run([_bin(root, sub), *rest]).returncode
     if sub == "run":

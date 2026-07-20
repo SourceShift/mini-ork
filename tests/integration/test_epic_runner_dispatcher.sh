@@ -235,13 +235,13 @@ else
   _fail "dependency violation aggregate invalid"
 fi
 
-if bash -n "$MINI_ORK_ROOT/bin/mini-ork-execute" \
-  && bash -n "$MINI_ORK_ROOT/bin/mini-ork-spawn" \
+if bash -n "$MINI_ORK_ROOT/bin/mini-ork-spawn" \
+  && python3 -m py_compile "$MINI_ORK_ROOT/mini_ork/ported/mini_ork_execute.py" \
   && python3 -m py_compile "$MINI_ORK_ROOT/recipes/epic-runner/lib/epic_dispatcher.py" \
     "$MINI_ORK_ROOT/recipes/epic-runner/lib/wave_aggregator.py"; then
-  _ok "modified shell entrypoints pass bash -n"
+  _ok "modified shell/Python entrypoints pass syntax checks"
 else
-  _fail "modified shell entrypoints failed bash -n"
+  _fail "modified shell/Python entrypoints failed syntax checks"
 fi
 
 echo "── Results: ${PASS} OK  ${FAIL} FAIL ──"

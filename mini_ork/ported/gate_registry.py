@@ -1,7 +1,6 @@
-"""Faithful Python port of ``lib/gate_registry.sh``.
+"""Python-owned gate registry.
 
-Strangler-fig co-existence: ``lib/gate_registry.sh`` stays the canonical
-implementation. This module mirrors its 4 public functions
+This module implements the 4 public functions
 (``gate_register``, ``gate_evaluate``, ``gate_list``, ``gate_run_all``)
 and the 7 valid gate types
 (``deterministic_verifier``, ``reviewer_gate``, ``human_gate``,
@@ -19,15 +18,11 @@ Design notes
 * **Gate-id parity.** ``gate-<gtype[:6]>-<uuid4().hex[:8]>`` is
   mirrored exactly so a side-by-side row diff across both
   implementations matches when the random suffix is excluded.
-* **liveness_gate and external-callable types subprocess bash.**
-  ``liveness_gate`` reads verdict from ``mo_check_liveness_breaker``
-  in ``lib/circuit_breaker.sh`` (bash-only state machine). The four
-  external-callable types dispatch ``<condition> <context>`` with rc
-  0=pass, 2=defer, else=fail — a function-name protocol that lives in
-  the caller shell. Reimplementing either in Python would be a
-  behavioral reinvention; the port keeps them as a thin subprocess
-  shim so parity holds at the ``bash`` boundary, not at some
-  Python-imagined equivalent.
+* **Native liveness, explicit executable gates.** ``liveness_gate`` uses the
+  native circuit-breaker port. External-callable gate types may execute an
+  explicit executable contract with rc 0=pass, 2=defer, else=fail. Shell
+  function names are intentionally not resolved through an implicit Bash
+  process; unresolved conditions defer.
 * **Bash ``null`` → Python ``None``** for missing/inactive rows.
 
 Public API (mirrors bash function names exactly)::
@@ -48,7 +43,6 @@ from __future__ import annotations
 
 import json
 import os
-import shlex
 import sqlite3
 import subprocess
 import time
@@ -181,21 +175,6 @@ def _select_gate(db_path: str, gate_id: str) -> Optional[dict[str, Any]]:
         con.close()
 
 
-def _bash_subprocess(
-    script: str, env_extra: dict[str, str], timeout: int = 30
-) -> tuple[str, str, int]:
-    """Run a bash -c fragment with ``env_extra`` merged onto os.environ."""
-    env = {**os.environ, **env_extra}
-    proc = subprocess.run(
-        ["bash", "-c", script],
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-        env=env,
-    )
-    return proc.stdout, proc.stderr, proc.returncode
-
-
 def _evaluate_budget(context_json: str, condition: str) -> str:
     try:
         ctx = json.loads(context_json)
@@ -219,7 +198,8 @@ def _evaluate_scope(context_json: str, condition: str) -> str:
 def _evaluate_liveness(
     context_json: str, db_path: str, mini_ork_root: Optional[str]
 ) -> str:
-    """Subprocess bash to call mo_check_liveness_breaker in lib/circuit_breaker.sh."""
+    """Evaluate liveness through the native circuit-breaker port."""
+    del mini_ork_root  # retained in the public signature for caller compatibility
     try:
         ctx = json.loads(context_json)
         run_id = ctx.get("run_id", "")
@@ -228,25 +208,10 @@ def _evaluate_liveness(
     if not run_id:
         return "defer"
 
-    root = mini_ork_root or os.environ.get("MINI_ORK_ROOT", "")
-    cb_path = os.path.join(root, "lib", "circuit_breaker.sh") if root else ""
-    if not cb_path or not os.path.isfile(cb_path):
-        return "defer"
-
-    src = (
-        f'source "{cb_path}" 2>/dev/null || true; '
-        f'if declare -f mo_check_liveness_breaker >/dev/null 2>&1; then '
-        f'  mo_check_liveness_breaker "{run_id}" 2>/dev/null || true; '
-        f'else echo ""; fi'
-    )
-    stdout, _, _ = _bash_subprocess(
-        src, {"MINI_ORK_DB": db_path, "MINI_ORK_ROOT": root}, timeout=10
-    )
-    out = (stdout or "").strip()
-    if not out:
-        return "defer"
     try:
-        verdict = json.loads(out).get("verdict", "PROCEED")
+        from mini_ork.ported import circuit_breaker
+        payload, _rc = circuit_breaker.check_liveness_breaker(run_id, db=db_path)
+        verdict = payload.get("verdict", "PROCEED")
     except Exception:
         return "defer"
     if verdict == "LIVENESS_TRIP":
@@ -261,22 +226,14 @@ def _evaluate_external(
 ) -> str:
     """dispatch <condition> <context_json>; rc 0=pass, 2=defer, else fail.
 
-    Mirrors bash's ``declare -f`` + ``[[ -x ]]`` heuristic. We can't
-    introspect the caller's bash functions from Python, so we check
-    whether ``condition`` resolves to an executable path; otherwise
-    fall through to ``defer`` (matches bash's stderr-then-defer).
+    Only an explicit executable is a supported external gate contract.
+    Missing paths and former shell-function names defer.
     """
     if not condition:
         return "defer"
-    if os.path.isfile(condition) and os.access(condition, os.X_OK):
-        cmd = [condition, context_json]
-    else:
-        # Try as a function name by shelling through bash with an
-        # empty env-stripped prelude: only succeeds if the test
-        # process sourced lib/gate_registry.sh. The parity test
-        # intentionally sources a helper to exercise this path; if
-        # the function isn't found, bash exits 127 → fall to fail.
-        cmd = ["bash", "-c", f'{condition} "$1"', "bash", context_json]
+    if not (os.path.isfile(condition) and os.access(condition, os.X_OK)):
+        return "defer"
+    cmd = [condition, context_json]
     try:
         proc = subprocess.run(
             cmd,
@@ -295,7 +252,12 @@ def _evaluate_external(
     return "fail"
 
 
-def gate_evaluate(db_path: str, gate_id: str, context_json: str) -> str:
+def gate_evaluate(
+    db_path: str,
+    gate_id: str,
+    context_json: str,
+    mini_ork_root: Optional[str] = None,
+) -> str:
     """Evaluate a single gate. Returns ``'pass' | 'fail' | 'defer'``."""
     ensure_table(db_path)
     row = _select_gate(db_path, gate_id)
@@ -312,7 +274,7 @@ def gate_evaluate(db_path: str, gate_id: str, context_json: str) -> str:
     if gtype == "scope_gate":
         return _evaluate_scope(context_json, condition)
     if gtype == "liveness_gate":
-        return _evaluate_liveness(context_json, db_path, None)
+        return _evaluate_liveness(context_json, db_path, mini_ork_root)
     if gtype in ("deployment_gate", "reviewer_gate", "deterministic_verifier", "custom"):
         return _evaluate_external(condition, context_json, db_path)
     return "defer"
@@ -387,38 +349,14 @@ def gate_run_all(
     for g in gates:
         gid = g["gate_id"]
         gtype = g["gate_type"]
-        cond = g["condition"]
         safety = bool(g["safety"])
 
-        # Mirror the bash inline branch table in gate_run_all.
-        if gtype == "budget_gate":
-            verdict = _evaluate_budget(context_json, cond)
-        elif gtype == "human_gate":
-            verdict = "defer"
-        elif gtype == "scope_gate":
-            verdict = _evaluate_scope(context_json, cond)
-        else:
-            # Bash fall-through: subprocess gate_evaluate from the
-            # sourced shell, capturing stdout. The port reproduces
-            # this path exactly because the verdict is determined by
-            # either mo_check_liveness_breaker (liveness_gate) or the
-            # function-name rc protocol (external types) — both of
-            # which are bash-side state.
-            root = mini_ork_root or os.environ.get("MINI_ORK_ROOT", "")
-            cb_src = (
-                f'source "{root}/lib/gate_registry.sh" 2>/dev/null; '
-                f'gate_evaluate "{gid}" {shlex.quote(context_json)}'
-            )
-            try:
-                stdout, _, _ = _bash_subprocess(
-                    cb_src,
-                    {"MINI_ORK_DB": db_path, "MINI_ORK_ROOT": root},
-                    timeout=30,
-                )
-                v = stdout.strip()
-                verdict = v if v in ("pass", "fail", "defer") else "defer"
-            except Exception:
-                verdict = "defer"
+        verdict = gate_evaluate(
+            db_path,
+            gid,
+            context_json,
+            mini_ork_root=mini_ork_root,
+        )
 
         if verdict != "pass":
             all_pass = False

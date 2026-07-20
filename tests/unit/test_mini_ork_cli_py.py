@@ -21,11 +21,16 @@ BIN = REPO / "bin" / "mini-ork"
 
 
 def _launcher(*args: str, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+    clean_env = {key: value for key, value in os.environ.items() if key not in {
+        "MINI_ORK_ENGINE_ROOT", "MINI_ORK_PROJECT_HOME", "MINI_ORK_TARGET_REPO",
+        "MINI_ORK_ROOT", "MINI_ORK_HOME", "MINI_ORK_RUN_DIR", "MINI_ORK_RUN_ID",
+        "GLM_API_KEY", "KIMI_API_KEY", "MINIMAX_API_KEY", "DEEPSEEK_API_KEY",
+    }}
     return subprocess.run(
         [str(BIN), *args],
         capture_output=True,
         text=True,
-        env={**os.environ, **(env or {})},
+        env={**clean_env, **(env or {})},
         check=False,
     )
 
@@ -107,6 +112,7 @@ def test_deadline_validation_golden_contract(capsys):
 
 def test_closed_commands_route_to_native_modules_and_execute_stays_live(monkeypatch):
     calls: list[tuple[list[str], dict[str, str] | None]] = []
+    execute_calls: list[tuple[list[str], str]] = []
 
     def fake_run(argv, **kwargs):
         calls.append((list(argv), kwargs.get("env")))
@@ -122,8 +128,16 @@ def test_closed_commands_route_to_native_modules_and_execute_stays_live(monkeypa
             "arg",
         ]
 
+    from mini_ork.ported import mini_ork_execute
+
+    def _fake_execute(argv, *, root=None, dispatch_fn=None):
+        del dispatch_fn
+        execute_calls.append((list(argv), root))
+        return 0
+
+    monkeypatch.setattr(mini_ork_execute, "main", _fake_execute)
     assert cli.main(["execute", "arg"], root=str(REPO)) == 0
-    assert calls[-1][0] == [str(REPO / "bin" / "mini-ork-execute"), "arg"]
+    assert execute_calls == [(["arg"], str(REPO))]
 
 
 def test_apply_remains_a_public_sibling_command(monkeypatch):

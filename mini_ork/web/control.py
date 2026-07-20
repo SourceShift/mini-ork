@@ -46,7 +46,7 @@ def pause_cost_run(
 
     Companion to lib/cost_pause.sh (Epic E4). The HTTP layer lets
     operators trigger a pause without waiting for the cost-threshold
-    crossing. The dispatcher (bin/mini-ork-execute) checks the
+    crossing. The dispatcher (mini_ork/ported/mini_ork_execute.py) checks the
     sentinel before each LLM call and bails with
     finish_reason=paused_for_approval. Resume via the /resume-cost
     POST or via `bin/mini-ork-resume <run_id>`.
@@ -128,7 +128,7 @@ def resume_cost_run(
 def stop_run(home: Path, db: StateDB, task_run_id: str) -> dict[str, Any]:
     """Soft stop: touch .stop-requested in the run dir.
 
-    The dispatcher (bin/mini-ork-execute:_dispatch_node) checks this flag
+    The dispatcher (mini_ork/ported/mini_ork_execute.py:_dispatch_node) checks this flag
     before each node dispatch and bails cleanly. The current in-flight
     node finishes naturally — that's the soft-stop semantic.
     """
