@@ -1,5 +1,15 @@
 # Remaining bash→Python Migration — Agent Handoff Document
 
+## Lower-level port ownership plan
+
+Before retiring more lower-level libraries, run the report-only inventory in
+`docs/migration/ported-module-ownership-recursive-plan.md`. It closes the gap
+between "a Python port exists" and "the supported runtime owns and uses that
+port," and defines safe `integrate`, `retain`, `delete`, and `defer` outcomes.
+The execution kickoff is
+`kickoffs/migration/ported-module-ownership.md`; its first unit is the duplicated
+similarity implementation in the context assembler.
+
 ## Context
 
 The self-migrate recipe (PR #184, merged at commit 6bf438a) implements integration-point-first migration: close ONE fork (bash↔Python seam) at a time as a complete unit — make Python sole, repoint every inbound reference, retire bash entrypoint — gated on byte-parity, feature-acceptance, and static-feature ledger.
