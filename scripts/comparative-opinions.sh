@@ -27,16 +27,13 @@ set -uo pipefail
 MINI_ORK_ROOT="${MINI_ORK_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 cd "$MINI_ORK_ROOT"
 
-# shellcheck source=/dev/null
-source "$MINI_ORK_ROOT/lib/llm-dispatch.sh"
-
 TS=$(date +%s)
 RUN_DIR="$MINI_ORK_ROOT/.mini-ork/runs/comparative-opinions-$TS"
 mkdir -p "$RUN_DIR"
 export MINI_ORK_RUN_DIR="$RUN_DIR"
 
-COMPARISON_DOC="$MINI_ORK_ROOT/docs/research/omnigent-vs-mini-ork-comparison.md"
-IMPROVEMENT_DOC="$MINI_ORK_ROOT/docs/research/omnigent-mini-ork-improvement-plan.md"
+COMPARISON_DOC="${MO_COMPARISON_DOC:-$MINI_ORK_ROOT/docs/research/omnigent-vs-mini-ork-comparison.md}"
+IMPROVEMENT_DOC="${MO_IMPROVEMENT_DOC:-$MINI_ORK_ROOT/docs/research/omnigent-mini-ork-improvement-plan.md}"
 
 if [ ! -f "$COMPARISON_DOC" ] || [ ! -f "$IMPROVEMENT_DOC" ]; then
   echo "[fatal] required input docs missing" >&2
@@ -110,7 +107,7 @@ dispatch_lens() {
     # Pass --model directly so we bypass the no-opus override in
     # .mini-ork/config/agents.yaml for this one-off research dispatch.
     # The no-opus directive remains in force for production recipes.
-    if llm_dispatch \
+    if python3 -m mini_ork.ported.llm_dispatch \
         --task-class "comparative_opinion" \
         --node-type  "${family}_lens" \
         --model      "$family" \
@@ -128,7 +125,9 @@ dispatch_lens() {
   } > "$out_path"
 }
 
-FAMILIES=(codex minimax glm kimi opus)
+# Keep the historical five-family default. Operators and migration probes may
+# narrow the panel without editing the script (for example: glm_current only).
+IFS=' ' read -r -a FAMILIES <<< "${MO_COMPARATIVE_FAMILIES:-codex minimax glm kimi opus}"
 
 # Fire all 10 in background; collect at end.
 PIDS=()

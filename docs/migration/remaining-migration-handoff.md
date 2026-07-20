@@ -64,6 +64,18 @@ single-lens GLM 5.2 probe returned a valid result. No MiniMax request ran.
 entrypoint/library fork below the frontier and still block dispatcher
 retirement. Refresh promoted main before selecting the next caller.
 
+The next direct caller unit rewired `scripts/comparative-opinions.sh` from
+sourcing `lib/llm-dispatch.sh` to invoking
+`python3 -m mini_ork.ported.llm_dispatch`. The ten-lens background fan-out,
+per-lens files, failure markers, manifest, and summary remain Bash-owned. A
+deterministic acceptance test exercised all ten default calls without a Bash
+dispatcher library. A real script-level probe narrowed the panel to two
+`glm_current` lenses, used minimal temporary input documents, produced two
+substantive opinions and a valid manifest, and made no MiniMax request. The
+historical five-family and canonical-document defaults remain unchanged;
+environment overrides only make bounded validation and operator-selected runs
+possible. Refresh promoted main before continuing to the Bash library forks.
+
 ## Context
 
 The self-migrate recipe (PR #184, merged at commit 6bf438a) implements integration-point-first migration: close ONE fork (bash↔Python seam) at a time as a complete unit — make Python sole, repoint every inbound reference, retire bash entrypoint — gated on byte-parity, feature-acceptance, and static-feature ledger.

@@ -31,7 +31,7 @@ The port is already native; the engine just calls the bash instead. Rewire = rep
 | lib | port native? | engine shell-out site | note |
 |---|---|---|---|
 | `decision_service` | ✅ | execute.py | **DONE** (PR #179) |
-| `llm-dispatch` | ✅ (native on execute, invoke-prompt, profile_answerer.py, and pre_push_review.py) | Bash review entrypoint/library, scripts, reflection/gradient and fixtures | Four Python runtime callers are rewired; migrate remaining callers one at a time with real-provider evidence |
+| `llm-dispatch` | ✅ (native on execute, invoke-prompt, profile_answerer.py, pre_push_review.py, and comparative-opinions) | Bash review/profile libraries, reflection/gradient and fixtures | Four Python callers plus the comparative research script are rewired; migrate remaining callers one at a time with real-provider evidence |
 | `gate_bootstrap` | ✅ | non-execute callers | Execute now uses native bootstrap/registry behavior; retire the Bash lib only after every other caller moves |
 | `gradient_extractor` | partial | reflection_pipeline.py | LLM-backed `gradient_extract` intentionally not ported (shells to claude) — needs porting that too |
 
@@ -120,6 +120,20 @@ Per subsystem, in this order — **never a blind sweep** (a wrong port breaks ev
   and the temporary provider registry; no MiniMax request ran.
 - `bin/mini-ork-review` plus `lib/pre_push_review.sh` remain a separate fork;
   this caller unit does not authorize their deletion or dispatcher retirement.
+
+### Completed caller unit: `scripts/comparative-opinions.sh` — 2026-07-20
+
+- The Bash orchestration script now invokes the native dispatcher module and
+  no longer sources `lib/llm-dispatch.sh`.
+- Ten-lens background execution, output/error files, status markers, manifest,
+  and summary behavior remain unchanged.
+- A deterministic acceptance test exercised all ten default calls with no Bash
+  dispatcher library; shell syntax and focused Pyright passed.
+- A real script-level probe ran two `glm_current` lenses, produced substantive
+  opinions and a valid manifest, and made no MiniMax request.
+- `MO_COMPARATIVE_FAMILIES`, `MO_COMPARISON_DOC`, and `MO_IMPROVEMENT_DOC`
+  permit bounded/operator-selected runs; defaults retain the historical five
+  families and canonical research documents.
 
 ## Tooling
 - **framework-edit** must use a dedicated temporary runtime home with only
