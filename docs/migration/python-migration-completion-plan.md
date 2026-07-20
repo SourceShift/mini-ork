@@ -98,15 +98,15 @@ Per subsystem, in this order — **never a blind sweep** (a wrong port breaks ev
 
 - The planner-injected path was already native; the standalone/default path
   now calls `mini_ork.ported.llm_dispatch` in-process too.
-- The historical DeepSeek → Kimi fallback, including fallback on whitespace
-  success, remains intact. Provider diagnostics stay outside the JSON payload.
-- The focused profile/planner suite passed 27 tests with one optional replay
-  fixture skipped; focused Pyright reported zero errors.
-- A real GLM 5.2 probe passed through the native default seam using only
-  process-local credentials and a temporary provider registry. Migration
-  validation made no DeepSeek or MiniMax request.
-- This closes the Python caller edge only. `lib/profile_answerer.sh` and the
-  Bash dispatcher remain until their independent callers/tests are migrated.
+- Commit `00176709` is the latest provider contract: Kimi primary plus one Kimi
+  retry on failure or whitespace. The retirement audit corrected a native-port
+  regression that had restored the older, banned DeepSeek primary.
+- Standalone golden contracts now preserve prompt bytes, validation, fence and
+  balanced-object recovery, completeness checks, exact JSON persistence, and
+  native Kimi retry behavior without sourcing a Bash oracle.
+- The planner was already the only production inbound caller. The web smoke
+  assertion now verifies native ownership and `lib/profile_answerer.sh` is
+  retired, closing this fork and one more `llm-dispatch.sh` blocker.
 
 ### Completed caller unit: `pre_push_review.py` — 2026-07-20
 
