@@ -1867,7 +1867,7 @@ def _envsubst(s):
 def _execute_gate_check(plan_path, run_dir, dry_run):
     """Port of bash execute pre-dispatch gate (:1142-1203). A plan with
     plan_status=needs_answers AND real human_questions must NOT dispatch: print the
-    refusal, write blocked.json, mark the run failed/BLOCKED, emit an execute_blocked
+    refusal, write blocked.json, mark the run failed/ESCALATE, emit an execute_blocked
     run_event, and signal exit 6. Returns True when blocked. Opt out via
     MINI_ORK_EXECUTE_GATE=0; skipped under dry-run."""
     if os.environ.get("MINI_ORK_EXECUTE_GATE", "1") != "1" or dry_run:
@@ -1905,8 +1905,13 @@ def _execute_gate_check(plan_path, run_dir, dry_run):
             con = sqlite3.connect(db, timeout=5.0)
             con.execute("PRAGMA busy_timeout = 5000")
             try:
+                # verdict='ESCALATE' (not 'BLOCKED'): the task_runs CHECK constraint
+                # (0013_task_runs.sql:33) only permits APPROVE/REQUEST_CHANGES/ESCALATE/
+                # CRASH or NULL. A needs_answers plan escalates to a human for answers,
+                # so ESCALATE is the correct verdict; the "blocked" provenance lives in
+                # status='failed' + the execute_blocked run_event + notes + blocked.json.
                 con.execute(
-                    "UPDATE task_runs SET status='failed', verdict=COALESCE(verdict,'BLOCKED'), "
+                    "UPDATE task_runs SET status='failed', verdict=COALESCE(verdict,'ESCALATE'), "
                     "updated_at=?, ended_at=COALESCE(ended_at,?), "
                     "notes=COALESCE(notes || '; ','') || "
                     "'execute gate: plan_status=needs_answers — nothing dispatched' "

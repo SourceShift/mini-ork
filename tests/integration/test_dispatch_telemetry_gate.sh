@@ -114,7 +114,7 @@ cat > "$HOME_DIR/runs/run-gate/plan.json" <<'EOF'
 {"plan_status":"needs_answers","blocked_by":"run_profile","human_questions":["q1"],"decomposition":[]}
 EOF
 sqlite3 "$HOME_DIR/state.db" "
-CREATE TABLE task_runs(id TEXT PRIMARY KEY, status TEXT, verdict TEXT, updated_at INTEGER, ended_at INTEGER, notes TEXT, trace_id TEXT, created_at INTEGER, recipe TEXT, cost_usd REAL);
+CREATE TABLE task_runs(id TEXT PRIMARY KEY, status TEXT, verdict TEXT CHECK (verdict IN ('APPROVE','REQUEST_CHANGES','ESCALATE','CRASH') OR verdict IS NULL), updated_at INTEGER, ended_at INTEGER, notes TEXT, trace_id TEXT, created_at INTEGER, recipe TEXT, cost_usd REAL);
 CREATE TABLE run_events(event_id TEXT, run_id TEXT, event_type TEXT, payload_json TEXT, created_at INTEGER);
 INSERT INTO task_runs(id,status,created_at) VALUES('run-gate','planned',strftime('%s','now'));
 "
@@ -126,7 +126,7 @@ MINI_ORK_HOME="$HOME_DIR" MINI_ORK_RUN_ID="run-gate" MINI_ORK_DRY_RUN=0 \
 rc=$?
 [ "$rc" -eq 6 ] && _ok "gate exits 6" || _fail "gate rc=$rc (want 6)"
 row=$(sqlite3 "$HOME_DIR/state.db" "SELECT status||'|'||verdict FROM task_runs WHERE id='run-gate';")
-[ "$row" = "failed|BLOCKED" ] && _ok "task_run marked failed/BLOCKED (not CRASH)" || _fail "task_run row: $row"
+[ "$row" = "failed|ESCALATE" ] && _ok "task_run marked failed/ESCALATE (schema-valid verdict)" || _fail "task_run row: $row"
 ev=$(sqlite3 "$HOME_DIR/state.db" "SELECT count(*) FROM run_events WHERE event_type='execute_blocked';")
 [ "$ev" = "1" ] && _ok "execute_blocked event emitted" || _fail "execute_blocked events: $ev"
 [ -f "$HOME_DIR/runs/run-gate/blocked.json" ] && _ok "blocked.json artifact written" || _fail "blocked.json missing"
