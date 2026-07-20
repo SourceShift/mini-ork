@@ -3,7 +3,7 @@
 # exist, are non-empty, and cite enough sources.
 #
 # Inputs (via env):
-#   MINI_ORK_RUN_DIR     run directory (set by mini-ork-execute)
+#   MINI_ORK_RUN_DIR     run directory (set by the native execute runtime)
 #
 # Output: JSON to stdout
 #   { "verifier": "source-completeness", "pass": bool, "evidence_path": "...",

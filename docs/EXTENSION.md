@@ -99,7 +99,7 @@ MINI_ORK_DRY_RUN=1 bin/mini-ork run my-recipe kickoff.md
 ### Node type dispatch semantics
 
 The `workflow.yaml` fields above describe the *shape* of a node. They don't
-describe what `bin/mini-ork-execute` actually *does* with each `type` at
+describe what `mini_ork/ported/mini_ork_execute.py` actually *does* with each `type` at
 dispatch time — and the difference matters: two node types that look
 interchangeable have very different guarantees about whether your LLM
 call's output actually becomes a usable artifact.

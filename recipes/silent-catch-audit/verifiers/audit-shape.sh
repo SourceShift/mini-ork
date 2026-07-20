@@ -2,7 +2,7 @@
 # verifiers/audit-shape.sh - validate silent-catch-audit recipe shape and outputs.
 #
 # Inputs (via env):
-#   MINI_ORK_RUN_DIR - run directory (set by mini-ork-execute)
+#   MINI_ORK_RUN_DIR - run directory (set by the native execute runtime)
 #
 # Output: JSON to stdout
 #   { "verifier": "audit-shape", "pass": bool, "evidence_path": "...",

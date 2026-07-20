@@ -53,9 +53,9 @@ existed.
 | Signal | Table | Writer | When | What it captures |
 |---|---|---|---|---|
 | **PRM** (Process Reward) | `execution_traces.process_reward` | `lib/process_reward.sh::prm_score_trace` | inline, per node | heuristic 0–1 quality of one node's work |
-| **GRPO** (Group Relative Policy Opt.) | `agent_performance_memory.relative_advantage` | `mo_learning_write_grpo_advantages` (`bin/mini-ork-execute:252`) | end-of-run | which lane beats its peers on a task class |
+| **GRPO** (Group Relative Policy Opt.) | `agent_performance_memory.relative_advantage` | `mo_learning_write_grpo_advantages` (`mini_ork/ported/mini_ork_execute.py`) | end-of-run | which lane beats its peers on a task class |
 | **RHO** (prompt win rates) | `prompt_win_rates` | `mini_ork/ported/rho_aggregator.py::aggregate_win_rates` (native and called by the Python reflect entrypoint) | reflect / conductor | which prompt version wins per task class |
-| **Conductor writeback** | `conductor_decisions.outcome` / `realized_score` | `mo_learning_update_conductor_outcomes` (`bin/mini-ork-execute:218`) | end-of-run | did the chosen topology/recipe pay off |
+| **Conductor writeback** | `conductor_decisions.outcome` / `realized_score` | `mo_learning_update_conductor_outcomes` (`mini_ork/ported/mini_ork_execute.py`) | end-of-run | did the chosen topology/recipe pay off |
 | **Grounded rejections** | `grounded_rejections` | _table ready; prod writer = open task #9_ | review/oracle gates | refuted claims + evidence (anti-reward) |
 
 A sixth, longer-horizon loop — **self-improve / gradient** (`gradient_records`,
@@ -68,7 +68,7 @@ separately in `docs/RECURSIVE-SELF-IMPROVE.md`.
 
 ## 3. Write half — how a trace becomes a learning signal
 
-### 3.1 Lane routing + stamping (`_dispatch_node`, `bin/mini-ork-execute:1335`)
+### 3.1 Lane routing + stamping (`_dispatch_node`, `mini_ork/ported/mini_ork_execute.py`)
 
 ```bash
 local dispatch_lane="${node_model_lane:-$node_type}"          # recipe default
@@ -99,7 +99,7 @@ heuristic, additive, capped at 1.0:
 > the heuristic covers the obvious cases (no files touched, no tool calls,
 > vacuous status) and is the score GRPO consumes.
 
-### 3.3 End-of-run writeback (`bin/mini-ork-execute:2376`)
+### 3.3 End-of-run writeback (`mini_ork/ported/mini_ork_execute.py`)
 
 ```bash
 if [ "${MO_LEARNING_WRITEBACK:-1}" = "1" ]; then   # default ON
@@ -128,7 +128,7 @@ Rows upsert on `(agent_version_id, task_class)`.
 
 ## 4. Read half — how the next run uses the signal
 
-### 4.1 The routing seam (`_mo_policy_route_lane`, `bin/mini-ork-execute:1183`)
+### 4.1 The routing seam (`_mo_policy_route_lane`, `mini_ork/ported/mini_ork_execute.py`)
 
 ```bash
 local policy="${MO_ROUTING_POLICY:-learning_governed}"   # default ON
@@ -169,7 +169,7 @@ routing override once it has earned the evidence; it can never subtract.
 ## 5. Defaults: why "always" is true now
 
 The loop benefits **every** real run with no opt-in, because three gates default
-ON in `bin/mini-ork-execute`:
+ON in `mini_ork/ported/mini_ork_execute.py`:
 
 | Env var | Default | Effect | Opt-out |
 |---|---|---|---|
@@ -238,14 +238,14 @@ Two honest caveats:
 
 | Concern | Location |
 |---|---|
-| Routing seam + policies | `bin/mini-ork-execute:1183` (`_mo_policy_route_lane`) |
-| Learning-governed gate | `bin/mini-ork-execute:157` (`_mo_learning_governed_lane`) |
-| Lane stamping onto trace | `bin/mini-ork-execute:1335`, `:1079`, `:1037` |
+| Routing seam + policies | `mini_ork/ported/mini_ork_execute.py` (`_mo_policy_route_lane`) |
+| Learning-governed gate | `mini_ork/ported/mini_ork_execute.py` (`_mo_learning_governed_lane`) |
+| Lane stamping onto trace | `mini_ork/ported/mini_ork_execute.py`, `:1079`, `:1037` |
 | PRM scorer | `lib/process_reward.sh` |
-| GRPO writer | `bin/mini-ork-execute:252` (`mo_learning_write_grpo_advantages`) |
-| Conductor writeback | `bin/mini-ork-execute:218` (`mo_learning_update_conductor_outcomes`) |
+| GRPO writer | `mini_ork/ported/mini_ork_execute.py` (`mo_learning_write_grpo_advantages`) |
+| Conductor writeback | `mini_ork/ported/mini_ork_execute.py` (`mo_learning_update_conductor_outcomes`) |
 | RHO aggregator | `mini_ork/ported/rho_aggregator.py` (native, used by the Python-sole reflect entrypoint) |
-| End-of-run writeback callsite | `bin/mini-ork-execute:2376` |
+| End-of-run writeback callsite | `mini_ork/ported/mini_ork_execute.py` |
 | Closure proof gate | `scripts/learning-loop-closure-gate.sh` |
 | Machinery smoke harness | `scripts/smoke-learning-loops.sh` |
 | Schema | `db/migrations/0039_learning_column_repairs.sql`, `0040_grounded_rejections.sql` |

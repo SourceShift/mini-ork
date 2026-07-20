@@ -76,7 +76,7 @@ high-quality"). Those become advisory rubric items, not hard gates.
 # verifiers/<NAME>.sh — <one-line purpose>
 #
 # Inputs (via env):
-#   MINI_ORK_RUN_DIR — run directory (set by mini-ork-execute)
+#   MINI_ORK_RUN_DIR — run directory (set by the native execute runtime)
 #
 # Output: JSON to stdout
 #   { "verifier": "<NAME>", "pass": bool, "evidence_path": "...",

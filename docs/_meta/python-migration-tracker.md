@@ -1,7 +1,8 @@
 # Bash → Python migration tracker (ADR-001)
 
-Strangler-fig: bash stays until each Python port is parity-verified against the
-LIVE bash. Every ported module has a test that invokes the real bash function.
+Strangler-fig: Bash stays until each Python port is parity-verified against the
+live Bash implementation. After retirement, durable pre-retirement receipts and
+standalone Python golden contracts replace tests that require deleted code.
 
 ## DONE + verified (15 modules)
 
@@ -26,8 +27,8 @@ config_resolve · rho_aggregator — 7 modules, ~700 LOC. Resumable loop:
   coalition_gate.sh, process_reward.sh (done in clone → port to main), config_resolve.sh
   (done in clone → port), recursive_policy.
 - **Tier B:** finish `llm-dispatch.sh` (tool-summary sidecar, retire bash), `context_assembler.sh` (713, context-engine).
-- **Tier C:** `bin/mini-ork-execute` (2942), `bin/mini-ork-plan` (1077),
-  `bin/mini-ork-reflect` (247), `bin/mini-ork-scheduler` (300 — concurrent-scheduler win).
+- **Tier C top-level forks:** verify, reflect, classify, plan, CLI, and execute
+  are closed. `bin/mini-ork-scheduler` remains a separate scheduler migration.
 
 ## Test all ported trunk modules
     cd <repo> && python3 -m pytest tests/unit/test_cache_py.py \
@@ -52,13 +53,12 @@ graded reward_g, bash+python), lane-fallback hang-proofing (dispatch_with_fallba
   ContextNest planner packs + generic atoms/recent-session fallbacks,
   active-state injection, and persisted context packs. Remaining shell-only
   surfaces belong to non-planner roles and operator steering.
-- reflection_pipeline.sh (358) + gradient_extractor.sh (379) + bin/mini-ork-reflect (247)
-- bin/mini-ork-execute — remaining large loop entrypoint. `bin/mini-ork-plan`
-  retired on 2026-07-20 after native profile/context/trace completion.
-- top-level CLI — isolated closure completed on 2026-07-20 at `27b1f40d`: the
-  public `bin/mini-ork` path is a Python launcher, closed direct commands route
-  to native modules, the full path contract is native, and `execute` remains
-  the one live Bash command fork. Pending focused promotion to trunk.
+- reflection_pipeline.sh (358) + gradient_extractor.sh (379); the public
+  reflect fork is native, while these lower-level library seams remain separate
+  migration units.
+- top-level CLI and execute — closed on 2026-07-20. `bin/mini-ork` is the
+  Python launcher, `mini-ork execute` routes in-process, and the retired
+  `bin/mini-ork-execute` implementation is absent.
 - llm-dispatch.sh remainder (tool-summary sidecar; then flip MO_DISPATCH_BACKEND default)
 - assorted leaves: workflow_lifecycle, operator_steering, steering_checkpoint,
   mid_node_injector, role_evolver, runs-tracker, spec-split, artifact_contract,

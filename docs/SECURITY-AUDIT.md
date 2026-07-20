@@ -198,7 +198,7 @@ rejected over.
 
 ### P3-006 — `recipes/<recipe>/lib/*.sh` not validated before execution
 
-**Component:** `bin/mini-ork-execute` (when dispatching to recipe libs)
+**Component:** `mini_ork/ported/mini_ork_execute.py` (when dispatching to recipe libs)
 
 A recipe author can ship arbitrary bash in `recipes/<recipe>/lib/`
 and the framework will source it during `mini-ork run`. This is BY

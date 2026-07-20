@@ -38,7 +38,7 @@ bin/mini-ork-self-improve --resume --soft-cap-hours 3 --hard-cap-hours 5
                                        │
                                        ▼  per iteration
                       ┌──────────────────────────────────────────┐
-                      │  bin/mini-ork-execute                    │
+                      │  mini_ork/ported/mini_ork_execute.py                    │
                       │  --recipe recursive-self-improve         │
                       └──────────────────────────────────────────┘
                                        │
@@ -100,7 +100,7 @@ The outer runner stages `config/agents.recursive-self-improve.yaml` into
      data is available; implementer's own report does not say
      `refused-*` or `failed-*`.
 5. **Hard budget caps.** `--hard-cap-hours` kills mid-iteration via
-   `timeout(1)` on `mini-ork-execute`. Defaults: 3h soft / 5h hard.
+   `timeout(1)` around the native execute runtime. Defaults: 3h soft / 5h hard.
 6. **Convergence shortcut.** When the bottleneck scanner emits
    `## Status: converged`, the outer loop exits cleanly without running
    further iterations.
