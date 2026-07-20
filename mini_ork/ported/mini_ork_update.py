@@ -12,8 +12,8 @@ Bash-side contract this port mirrors (verbatim from bin/mini-ork-update):
   - Subprocess delegation (strangler-fig — bash is single source of truth):
       * git pull sequence  → `git -C "$ROOT" …` via subprocess.run (3 calls)
       * sqlite3 schema check → bash `sqlite3 file:DB?mode=ro | grep -qx 1`
-      * migration apply    → `bash db/init.sh` (same idiom as
-        mini_ork_invoke_prompt.py delegates to lib/llm-dispatch.sh)
+      * migration apply    → `bash db/init.sh` (this database initializer
+        remains an intentional subprocess boundary)
   - Output bytes MUST match bash. The [OK]/[WARN]/[FAIL] status helpers, the
     per-line spacing ('  [OK]   ' vs '  [WARN] ' / '  [FAIL] ' — three spaces
     vs one space), the '           suggested: …' followups (11 leading spaces),

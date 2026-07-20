@@ -212,10 +212,11 @@ All three gaps fixed in-repo:
   resolves to `Epic`, keeping the PR-3 smoke green).
 - **Gap 2 — missing role-pack call sites.** Two chokepoints now invoke
   `context_role_pack_md`:
-  - `bin/mini-ork-invoke-prompt` injects a role pack keyed on
+  - The native `mini_ork.ported.mini_ork_invoke_prompt` implementation behind
+    `bin/mini-ork-invoke-prompt` injects a role pack keyed on
     `MINI_ORK_NODE_TYPE` for every recipe-internal node (reviewer / reflector /
-    publisher / researcher …) — one edit covers all of them, with the
-    *substituted* prompt text used as the brief.
+    publisher / researcher …), with the *substituted* prompt text used as the
+    brief.
   - `bin/_worker-launcher.sh` inlines the **implementer** pack into every
     spawned worker's prompt (previously the implementer pack was defined but
     never called).

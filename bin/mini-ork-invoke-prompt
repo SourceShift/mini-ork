@@ -1,104 +1,23 @@
-#!/usr/bin/env bash
-# mini-ork-invoke-prompt — single-prompt LLM invocation helper for recipe scripts.
-#
-# A recipe's lib/dispatch.sh (or any other recipe-internal helper) can call this
-# to fire ONE prompt against the configured LLM lane without owning the whole
-# planner/execute lifecycle. Useful for stage-internal sub-steps like
-# spec_author or spec_reviewer that compose under the recipe's own orchestration.
-#
-# Inputs (via env, NOT positional args — easier to pipe from caller):
-#   MINI_ORK_PROMPT_FILE   path to the prompt .md (REQUIRED)
-#   MINI_ORK_NODE_TYPE     node-type tag for tracing (default: "implementer")
-#   MINI_ORK_TASK_CLASS    task class for llm-dispatch routing (default: "generic")
-#   MINI_ORK_RECIPE        recipe name (for trace tagging, optional)
-#   MINI_ORK_RUN_ID        parent run_id for trace correlation (optional)
-#
-# Placeholder substitution: any {{ENV_VAR}} in the prompt file is replaced with
-# the corresponding shell env var's value at invocation time. Use python
-# str.replace under the hood (sed crashes on multi-line payloads).
-#
-# Output: stdout = raw LLM response. Caller is responsible for parsing.
-# Exit codes: 0 on success, 1 on LLM failure, 2 on bad args, 3 on lib missing.
-set -Eeuo pipefail
+#!/usr/bin/env python3
+"""Public launcher for the native single-prompt invocation utility."""
 
-MINI_ORK_ROOT="${MINI_ORK_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
-export MINI_ORK_ROOT
-# Runtime cutover (bash→Python): MINI_ORK_RUNTIME=python execs the ported module.
-{ [ -f "$MINI_ORK_ROOT/lib/runtime-select.sh" ] && . "$MINI_ORK_ROOT/lib/runtime-select.sh" && mo_runtime_maybe_delegate "${BASH_SOURCE[0]}" "$@"; } || true
+from __future__ import annotations
+
+import os
+import sys
+from pathlib import Path
+
+ENGINE_ROOT = Path(
+    os.environ.get("MINI_ORK_ENGINE_ROOT")
+    or os.environ.get("MINI_ORK_ROOT")
+    or Path(__file__).resolve().parents[1]
+).expanduser().resolve(strict=False)
+os.environ.setdefault("MINI_ORK_ENGINE_ROOT", str(ENGINE_ROOT))
+os.environ.setdefault("MINI_ORK_ROOT", str(ENGINE_ROOT))
+sys.path.insert(0, str(ENGINE_ROOT))
+
+from mini_ork.ported.mini_ork_invoke_prompt import main  # noqa: E402
 
 
-PROMPT_FILE="${MINI_ORK_PROMPT_FILE:?MINI_ORK_PROMPT_FILE required}"
-NODE_TYPE="${MINI_ORK_NODE_TYPE:-implementer}"
-TASK_CLASS="${MINI_ORK_TASK_CLASS:-generic}"
-
-[ -f "$PROMPT_FILE" ] || { echo "prompt not found: $PROMPT_FILE" >&2; exit 2; }
-
-# ── lib guards ────────────────────────────────────────────────────────────────
-_require_lib() {
-  local lib="$MINI_ORK_ROOT/lib/${1}.sh"
-  [ -f "$lib" ] || { echo "lib/${1}.sh not present" >&2; exit 3; }
-  # shellcheck source=/dev/null
-  source "$lib"
-}
-_require_lib llm-dispatch
-
-# ── placeholder substitution ──────────────────────────────────────────────────
-# Replace {{VAR}} with $VAR for every UPPER_CASE env var currently exported.
-# Python is used (sed crashes on multi-line values).
-PROMPT_TEXT=$(python3 - "$PROMPT_FILE" <<'PY'
-import os, re, sys, pathlib
-
-tpl = pathlib.Path(sys.argv[1]).read_text()
-
-def sub(match):
-    name = match.group(1)
-    return os.environ.get(name, match.group(0))
-
-out = re.sub(r"\{\{([A-Z][A-Z0-9_]*)\}\}", sub, tpl)
-sys.stdout.write(out)
-PY
-)
-
-# ── ContextNest role pack (PR-3 wiring; best-effort) ──────────────────────────
-# Every recipe-internal node (reviewer / reflector / publisher / researcher …)
-# routes through here, so this is the single chokepoint that gives each node
-# its role-tailored substrate slice. Keyed on NODE_TYPE; context_role_pack_md
-# maps the role and falls back to a generic pack for unknown roles. The
-# substituted PROMPT_TEXT (not the raw template) is used as the brief so query
-# extraction sees the real task subject, not {{PLACEHOLDERS}}. Silent + bounded:
-# never blocks or fails the invocation.
-if [ "${MO_USE_ROLE_PACKS:-1}" = "1" ] && [ "${MO_DISABLE_CN:-0}" != "1" ] \
-   && [ -f "$MINI_ORK_ROOT/lib/context_role_packs.sh" ]; then
-  # shellcheck source=/dev/null
-  source "$MINI_ORK_ROOT/lib/context_role_packs.sh" 2>/dev/null || true
-  if declare -f context_role_pack_md >/dev/null 2>&1; then
-    _cn_brief_tmp=$(mktemp 2>/dev/null) || _cn_brief_tmp=""
-    if [ -n "$_cn_brief_tmp" ]; then
-      printf '%s' "$PROMPT_TEXT" > "$_cn_brief_tmp"
-      _cn_node_pack="$(context_role_pack_md "$NODE_TYPE" "$_cn_brief_tmp" "" 2>/dev/null || true)"
-      [ -n "$_cn_node_pack" ] && PROMPT_TEXT="${PROMPT_TEXT}"$'\n\n'"${_cn_node_pack}"$'\n'
-      rm -f "$_cn_brief_tmp"
-    fi
-  fi
-fi
-
-# ── trace start ───────────────────────────────────────────────────────────────
-TRACE_ID="tr-invoke-$(date +%s)-$$"
-if [ -f "$MINI_ORK_ROOT/lib/trace_store.sh" ] && [ -n "${MINI_ORK_DB:-}" ]; then
-  _require_lib trace_store
-  trace_write "{\"trace_id\":\"$TRACE_ID\",\"task_class\":\"${TASK_CLASS}\",\"status\":\"running\",\"prompt_version_hash\":\"$(echo -n "$PROMPT_TEXT" | shasum | cut -c1-16)\"}" >/dev/null 2>&1 || true
-fi
-
-# ── invoke ────────────────────────────────────────────────────────────────────
-RESPONSE=$(llm_dispatch \
-  --task-class "$TASK_CLASS" \
-  --node-type "$NODE_TYPE" \
-  --prompt-text "$PROMPT_TEXT" 2>&1) || {
-  echo "[invoke-prompt] LLM dispatch failed for $NODE_TYPE" >&2
-  trace_write "{\"trace_id\":\"$TRACE_ID\",\"status\":\"failure\"}" >/dev/null 2>&1 || true
-  exit 1
-}
-
-printf '%s\n' "$RESPONSE"
-
-trace_write "{\"trace_id\":\"$TRACE_ID\",\"status\":\"success\"}" >/dev/null 2>&1 || true
+if __name__ == "__main__":
+    raise SystemExit(main())
