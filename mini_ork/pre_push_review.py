@@ -7,20 +7,23 @@ The six heuristic checks are transcribed verbatim from the bash's embedded pytho
 pre_push_reviews row, persists each finding to pre_push_review_issues, and
 computes the same severity/consensus verdict via SQL.
 
-The LLM panel (``_run_llm_panel``) is a seam — the default shells out to
-mo_llm_dispatch exactly as the bash; overridable for tests.
+The LLM panel (``_default_llm_panel``) calls the native model dispatcher
+in-process and remains overridable for tests.
 
     review_run(source_sha, target_branch, mode="heuristic", base=None, *, db, root) -> int
     review_verdict_for(rid, *, db) / review_show(rid, *, db) / review_forward_to_bug_reports(rid, *, db, root)
 """
 from __future__ import annotations
 
+import contextlib
+import io
 import os
 import re
 import sqlite3
 import subprocess
 import sys
 import tempfile
+from collections.abc import Callable
 
 
 def _db_path() -> str:
@@ -194,12 +197,16 @@ If you find no issues, return {"issues": []}.
 """
 
 
-def _default_llm_panel(diff_text: str) -> list[dict]:
-    """Seam: run the MO_REVIEW_PANEL via mo_llm_dispatch (lib/llm-dispatch.sh)."""
+def _default_llm_panel(
+    diff_text: str,
+    *,
+    dispatch_fn: Callable[..., int] | None = None,
+) -> list[dict]:
+    """Run the configured review panel through the native model dispatcher."""
     import json
-    dispatch = os.path.join(_root(), "lib", "llm-dispatch.sh")
-    if not os.path.isfile(dispatch):
-        return []
+    from mini_ork.ported import llm_dispatch as native_dispatch
+
+    dispatch_fn = dispatch_fn or native_dispatch.mo_llm_dispatch
     panel = os.environ.get("MO_REVIEW_PANEL", "codex kimi glm minimax").split()
     timeout = os.environ.get("MO_REVIEW_LENS_TIMEOUT_S", "180")
     out = []
@@ -209,11 +216,14 @@ def _default_llm_panel(diff_text: str) -> list[dict]:
         with tempfile.NamedTemporaryFile("w", suffix=".out", delete=False) as of:
             out_file = of.name
         try:
-            rc = subprocess.run(
-                ["bash", "-c",
-                 f'source "{dispatch}" 2>/dev/null && mo_llm_dispatch "$1" "$2" "$3" "$4" 4 >/dev/null 2>&1',
-                 "_", model, _REVIEW_PROMPT + diff_text, out_file, timeout],
-                capture_output=True).returncode
+            try:
+                with contextlib.redirect_stdout(io.StringIO()), \
+                        contextlib.redirect_stderr(io.StringIO()):
+                    rc = dispatch_fn(
+                        model, _REVIEW_PROMPT + diff_text, out_file, timeout, 4,
+                    )
+            except Exception:
+                rc = 1
             if rc != 0:
                 continue
             try:
