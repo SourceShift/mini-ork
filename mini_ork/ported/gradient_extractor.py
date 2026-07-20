@@ -1,11 +1,14 @@
-"""Python port of lib/gradient_extractor.sh.
+"""Native textual-gradient extraction and persistence.
 
-The bash implementation remains the source of truth; this module keeps the same
-SQLite writes and error semantics for in-process callers.
+The deterministic SQLite and parsing contracts are kept in process, and the
+default agentic boundary calls :mod:`mini_ork.ported.llm_dispatch` directly so
+reflection no longer depends on or silently skips a Bash dispatcher.
 """
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import re
@@ -14,7 +17,7 @@ import sys
 import time
 import uuid
 from collections.abc import Callable, Iterable
-from typing import Any
+from typing import Any, NoReturn, cast
 
 
 _GRADIENT_EXTRACTOR_PROMPT_TEMPLATE = """You are a recipe-design improvement analyst.
@@ -121,7 +124,7 @@ def _tokens(s: str) -> set[str]:
     return set(re.findall(r"[a-z0-9_]+", s.lower())) - _STOP
 
 
-def _fail(msg: str) -> None:
+def _fail(msg: str) -> NoReturn:
     print(msg, file=sys.stderr)
     raise SystemExit(1)
 
@@ -242,10 +245,74 @@ def _extract_objects_balanced(text: str) -> list[dict[str, Any]]:
     return objs
 
 
+def _parse_llm_output(raw: str, trace_id: str) -> list[dict[str, Any]]:
+    """Recover gradient objects from complete, fenced, or truncated arrays."""
+    cleaned = re.sub(r"^```[a-z]*\n?", "", raw.strip(), flags=re.MULTILINE)
+    cleaned = re.sub(r"\n?```$", "", cleaned, flags=re.MULTILINE).strip()
+    try:
+        parsed = json.loads(cleaned)
+        items = parsed if isinstance(parsed, list) else []
+    except json.JSONDecodeError:
+        match = re.search(r"\[.*?\]", cleaned, re.DOTALL)
+        if match:
+            try:
+                candidate = json.loads(match.group())
+                items = candidate if isinstance(candidate, list) else []
+            except (json.JSONDecodeError, TypeError):
+                items = _extract_objects_balanced(cleaned)
+        else:
+            items = _extract_objects_balanced(cleaned)
+
+    normalized: list[dict[str, Any]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        value = dict(item)
+        value.setdefault("evidence", trace_id)
+        value.setdefault("confidence", 0.5)
+        normalized.append(value)
+    return normalized
+
+
+def _default_dispatch(
+    prompt: str,
+    *,
+    repo_root: str | os.PathLike | None = None,
+    dispatch_fn: Callable[..., int] | None = None,
+    model: str | None = None,
+) -> tuple[int, str]:
+    """Call the native telemetry-aware dispatcher and isolate diagnostics."""
+    from mini_ork.ported import llm_dispatch as native_dispatch
+
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    argv = [
+        "--model", model or os.environ.get("MINI_ORK_GRADIENT_MODEL", "codex"),
+        "--node-type", "gradient-extract",
+        "--prompt-text", prompt,
+        "--timeout", "120",
+        "--max-turns", "5",
+    ]
+    try:
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            rc = native_dispatch.llm_dispatch(
+                argv,
+                root=str(repo_root or os.environ.get("MINI_ORK_ROOT") or os.getcwd()),
+                dispatch_fn=dispatch_fn,
+            )
+    except Exception:
+        return 1, ""
+    return rc, stdout.getvalue()
+
+
 def extract(
     trace_id: str,
     db: str | None = None,
     override_fn: Callable[[str, str], Iterable[dict[str, Any]]] | None = None,
+    *,
+    dispatch_fn: Callable[..., int] | None = None,
+    repo_root: str | os.PathLike | None = None,
+    emit: bool = True,
 ) -> list[dict[str, Any]]:
     """Extract gradients for a trace, print one JSON object per line."""
     con = _connect(db)
@@ -260,15 +327,26 @@ def extract(
         fn_name = os.environ.get("MINI_ORK_GRADIENT_EXTRACTOR_FN", "")
         candidate = globals().get(fn_name) if fn_name else None
         if callable(candidate):
-            override_fn = candidate
+            override_fn = cast(
+                Callable[[str, str], Iterable[dict[str, Any]]], candidate
+            )
         elif fn_name:
             _fail(f"gradient_extract: override fn {fn_name} not defined")
 
     if override_fn is None:
-        return []
+        prompt = _GRADIENT_EXTRACTOR_PROMPT_TEMPLATE.replace("<<<TRACE_JSON>>>", trace_json)
+        rc, raw = _default_dispatch(
+            prompt,
+            repo_root=repo_root,
+            dispatch_fn=dispatch_fn,
+        )
+        if rc != 0:
+            _fail("gradient_extract: LLM dispatch failed")
+        items = _parse_llm_output(raw, trace_id)
+    else:
+        items = list(override_fn(trace_id, trace_json))
 
-    items = list(override_fn(trace_id, trace_json))
-    for item in items:
-        print(json.dumps(item))
+    if emit:
+        for item in items:
+            print(json.dumps(item))
     return items
-
