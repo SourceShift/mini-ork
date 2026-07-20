@@ -31,7 +31,7 @@ The port is already native; the engine just calls the bash instead. Rewire = rep
 | lib | port native? | engine shell-out site | note |
 |---|---|---|---|
 | `decision_service` | ✅ | execute.py | **DONE** (PR #179) |
-| `llm-dispatch` | ✅ (native on execute, invoke-prompt, and profile_answerer.py) | pre_push_review.py, scripts, reflection/gradient and fixtures | Three Python runtime callers are rewired; migrate remaining callers one at a time with real-provider evidence |
+| `llm-dispatch` | ✅ (native on execute, invoke-prompt, profile_answerer.py, and pre_push_review.py) | Bash review entrypoint/library, scripts, reflection/gradient and fixtures | Four Python runtime callers are rewired; migrate remaining callers one at a time with real-provider evidence |
 | `gate_bootstrap` | ✅ | non-execute callers | Execute now uses native bootstrap/registry behavior; retire the Bash lib only after every other caller moves |
 | `gradient_extractor` | partial | reflection_pipeline.py | LLM-backed `gradient_extract` intentionally not ported (shells to claude) — needs porting that too |
 
@@ -107,6 +107,19 @@ Per subsystem, in this order — **never a blind sweep** (a wrong port breaks ev
   validation made no DeepSeek or MiniMax request.
 - This closes the Python caller edge only. `lib/profile_answerer.sh` and the
   Bash dispatcher remain until their independent callers/tests are migrated.
+
+### Completed caller unit: `pre_push_review.py` — 2026-07-20
+
+- The sequential LLM panel calls native `mo_llm_dispatch` in-process and no
+  longer checks for or sources `lib/llm-dispatch.sh`.
+- Panel order, Gemini exclusion, timeout, four-turn limit, fail-open behavior,
+  JSON recovery, normalization, and eight-issues-per-lens cap are preserved.
+- Five focused tests and focused Pyright passed. A no-Bash fixture proves
+  ownership closure for this Python caller.
+- A real single-lens GLM 5.2 panel probe passed with process-local credentials
+  and the temporary provider registry; no MiniMax request ran.
+- `bin/mini-ork-review` plus `lib/pre_push_review.sh` remain a separate fork;
+  this caller unit does not authorize their deletion or dispatcher retirement.
 
 ## Tooling
 - **framework-edit** must use a dedicated temporary runtime home with only

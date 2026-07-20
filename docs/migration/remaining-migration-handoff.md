@@ -53,6 +53,17 @@ its pre-retirement oracle still exist; this unit closes only the Python
 module's `llm-dispatch.sh` edge. Refresh from promoted main again before the
 next caller.
 
+The next caller unit removed `mini_ork/pre_push_review.py`'s Bash dispatcher
+edge. Its sequential panel now calls native `mo_llm_dispatch` in-process while
+preserving configured panel order, Gemini exclusion, per-lens timeout and
+four-turn cap, fail-open behavior, prose-wrapped JSON recovery, issue limits,
+and normalization. Five focused tests and focused Pyright passed, including a
+fixture that proves the panel works without `lib/llm-dispatch.sh`; a real
+single-lens GLM 5.2 probe returned a valid result. No MiniMax request ran.
+`bin/mini-ork-review` and `lib/pre_push_review.sh` remain a separate
+entrypoint/library fork below the frontier and still block dispatcher
+retirement. Refresh promoted main before selecting the next caller.
+
 ## Context
 
 The self-migrate recipe (PR #184, merged at commit 6bf438a) implements integration-point-first migration: close ONE fork (bash↔Python seam) at a time as a complete unit — make Python sole, repoint every inbound reference, retire bash entrypoint — gated on byte-parity, feature-acceptance, and static-feature ledger.

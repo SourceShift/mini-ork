@@ -116,3 +116,62 @@ def test_verdict_and_show(tmp_path):
     assert ppr.review_verdict_for(rid, db=db) == "block"
     show = ppr.review_show(rid, db=db)
     assert "heuristic.secret_leak" in show and "critical" in show
+
+
+def test_native_llm_panel_contract_and_normalization(tmp_path, monkeypatch):
+    """The panel calls the native model seam without requiring the Bash lib."""
+    empty_root = tmp_path / "engine"
+    empty_root.mkdir()
+    calls = []
+
+    def dispatch(model, prompt, out_file, timeout, max_turns):
+        calls.append((model, prompt, timeout, max_turns))
+        payload = {
+            "issues": [{
+                "severity": "unexpected",
+                "file": "app.py",
+                "line": 7,
+                "title": f"{model} issue",
+                "description": "concrete problem",
+                "suggested_fix": "fix it",
+            }]
+        }
+        Path(out_file).write_text("preface\n" + json.dumps(payload) + "\npostscript")
+        return 0
+
+    monkeypatch.setenv("MINI_ORK_ROOT", str(empty_root))
+    monkeypatch.setenv("MO_REVIEW_PANEL", "codex gemini glm")
+    monkeypatch.setenv("MO_REVIEW_LENS_TIMEOUT_S", "17")
+    issues = ppr._default_llm_panel("diff body", dispatch_fn=dispatch)
+
+    assert not (empty_root / "lib" / "llm-dispatch.sh").exists()
+    assert [call[0] for call in calls] == ["codex", "glm"]
+    assert all(call[1] == ppr._REVIEW_PROMPT + "diff body" for call in calls)
+    assert all(call[2:] == ("17", 4) for call in calls)
+    assert issues == [
+        {
+            "lens": "llm.codex", "severity": "medium", "file": "app.py", "line": 7,
+            "title": "codex issue", "description": "concrete problem",
+            "suggested_fix": "fix it",
+        },
+        {
+            "lens": "llm.glm", "severity": "medium", "file": "app.py", "line": 7,
+            "title": "glm issue", "description": "concrete problem",
+            "suggested_fix": "fix it",
+        },
+    ]
+
+
+def test_native_llm_panel_fails_open_per_lens(monkeypatch):
+    calls = []
+
+    def dispatch(model, prompt, out_file, timeout, max_turns):
+        calls.append(model)
+        if model == "kimi":
+            raise RuntimeError("provider exploded")
+        Path(out_file).write_text('{"issues":[]}')
+        return 0
+
+    monkeypatch.setenv("MO_REVIEW_PANEL", "kimi glm")
+    assert ppr._default_llm_panel("diff", dispatch_fn=dispatch) == []
+    assert calls == ["kimi", "glm"]
