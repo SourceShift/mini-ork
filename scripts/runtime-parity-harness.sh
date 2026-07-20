@@ -62,7 +62,8 @@ _check "review no-arg"  "$BIN/mini-ork-review"
 _check "review bad-sub" "$BIN/mini-ork-review" bogus
 
 echo "  --help/usage (strict stdout+stderr+rc — full usage text transcribed):"
-_check "plan --help"      "$BIN/mini-ork-plan" --help
+_check "plan --help"      env PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+  python3 -m mini_ork.ported.mini_ork_plan --help
 _check "classify --help"  env PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
   python3 -m mini_ork.ported.mini_ork_classify --help
 _check "conductor --help" "$BIN/mini-ork-conductor" --help
@@ -75,7 +76,9 @@ printf '# Ship widget\n\n## Success\n- widget renders\n\n## Verification command
 _dryplan() {   # runtime passed as $1; writes plan.json, prints its content
   local rt="$1" home="$TMP/home-$1"
   MINI_ORK_RUNTIME="$rt" MINI_ORK_HOME="$home" MINI_ORK_TASK_CLASS=code_fix \
-    "$BIN/mini-ork-plan" "$TMP/k.md" --out "$TMP/plan-$rt.json" --dry-run >/dev/null 2>&1
+    env PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+      python3 -m mini_ork.ported.mini_ork_plan "$TMP/k.md" \
+      --out "$TMP/plan-$rt.json" --dry-run >/dev/null 2>&1
   cat "$TMP/plan-$rt.json" 2>/dev/null | _norm
 }
 if [ "$(_dryplan bash)" = "$(_dryplan python)" ]; then

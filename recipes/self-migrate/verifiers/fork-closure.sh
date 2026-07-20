@@ -13,11 +13,12 @@ REPO_ROOT="${MO_TARGET_CWD:-${MINI_ORK_ROOT:-$(pwd)}}"
 FORK="${MO_FORK:?MO_FORK required}"
 ENTRYPOINT="$REPO_ROOT/bin/mini-ork-$FORK"
 NEEDLE="bin/mini-ork-$FORK"
-DYNAMIC_PATTERN="_bin\\([^)]*['\"]${FORK}['\"]"
+DYNAMIC_PATTERN="_bin\\([^)]*['\"]${FORK}['\"]|['\"]bin['\"][[:space:]]*/[[:space:]]*['\"]mini-ork-${FORK}['\"]"
 EVIDENCE="$RUN_DIR/verifier-fork-closure.log"
 
 pass=true
 reasons=()
+mkdir -p "$RUN_DIR"
 
 if [ -e "$ENTRYPOINT" ]; then
   pass=false
@@ -40,10 +41,10 @@ fi
 
 if [ -d "$REPO_ROOT/mini_ork" ] && (
   cd "$REPO_ROOT"
-  rg -n --regexp "$DYNAMIC_PATTERN" mini_ork
+  rg -n --regexp "$DYNAMIC_PATTERN" mini_ork tests scripts bin lib
 ) >>"$EVIDENCE" 2>&1; then
   pass=false
-  reasons+=("dynamic _bin(..., '$FORK') references remain — see verifier-fork-closure.log")
+  reasons+=("dynamic runtime references for '$FORK' remain — see verifier-fork-closure.log")
 fi
 
 python3 - "$pass" "$EVIDENCE" "$FORK" "${reasons[@]:-}" <<'PY'

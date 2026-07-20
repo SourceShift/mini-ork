@@ -120,7 +120,7 @@ export SESSION_KILL_FLAG
 # The recursive-self-improve recipe's success criteria live in the verifier
 # triple (bottlenecks-found / self-tests-pass / no-regression), NOT in the
 # planner's run_profile.confidence score. The profile-gate added by iter 19
-# (bin/mini-ork-plan +MINI_ORK_PROFILE_GATE) is designed for one-shot recipes
+# (mini_ork.ported.mini_ork_plan + MINI_ORK_PROFILE_GATE) is designed for one-shot recipes
 # where the kickoff IS the contract. For the recursive loop the kickoff is
 # intentionally meta ("find your own bottlenecks") so profile confidence
 # always reads ~0.55 — the gate would block every iter.
@@ -132,7 +132,7 @@ export SESSION_KILL_FLAG
 export MINI_ORK_PROFILE_GATE
 echo "[info] MINI_ORK_PROFILE_GATE=$MINI_ORK_PROFILE_GATE (recursive-self-improve uses verifier-triple for success criteria, not planner profile confidence)"
 
-# Stage the lane-policy override so mini-ork-plan picks it up.
+# Stage the lane-policy override so the Python planner picks it up.
 AGENTS_OVR="$MINI_ORK_ROOT/config/agents.recursive-self-improve.yaml"
 AGENTS_DEST="$MINI_ORK_HOME/config/agents.yaml"
 if [ -f "$AGENTS_OVR" ]; then

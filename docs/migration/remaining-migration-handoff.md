@@ -24,7 +24,7 @@ The fork unit prevents the "leaf migration" anti-pattern where a Python module g
 | **verify** | 0 | 7+ live refs | Cleanest proof case; the original five-ref snapshot omitted the top-level and legacy execute callers |
 | **reflect** | 2 | 8 | Medium |
 | **classify** | 0 | 18 | High inbound, no outbound |
-| **plan** | 0 | 21 | High inbound, no outbound |
+| **plan** | 1 | 25+ | High inbound; native dispatcher plus profile/context/trace contracts had to close together |
 | **execute** | 4 | 37 | Monster: 4 outbound, 37 inbound |
 | **cli** | 3 (dispatcher-level) | — | Critical path |
 
@@ -269,7 +269,7 @@ Run the self-migrate recipe on each fork in recommended order:
 1. ✅ verify (closed and source-applied from the fully verified isolated Run 3 proposal; see the live evidence below)
 2. ✅ reflect (closed and source-applied from `run-1784503045-70610`; see the live evidence below)
 3. ✅ classify (closed and source-applied from `run-1784528328-42404`; see the live evidence below)
-4. plan
+4. ✅ plan (closed by the completion audit after partial `run-1784532524-76798`; see live evidence below)
 5. cli
 6. execute
 
@@ -414,6 +414,59 @@ it without separate explicit approval.
   their required `recipe`, `verdict_file`, or `current_round` context and then
   treats `defer` as failure. This was diagnosed without a paid retry and did not
   invalidate the green fork-specific evidence.
+
+## Live plan evidence — 2026-07-20
+
+### Partial proposal and blocker discovery: `run-1784532524-76798`
+
+- Isolated target: `/private/tmp/mini-ork-self-migrate-plan`, baseline
+  `928db915`.
+- Provider policy used only Kimi, Codex, and GLM: Kimi planned, Codex migrated,
+  and GLM 5.2 mapped seams, built the ledger, and reviewed. MiniMax and DeepSeek
+  gateway variables were unset for the run.
+- The pre-retirement Bash/Python oracle was captured green before Codex edited
+  the target. Post-change parity, feature acceptance, and ledger shape also
+  passed.
+- Codex's second requirements audit found four Bash-owned contracts missing
+  from the original integration map: profile normalization/question handling,
+  planner context injection, context-pack persistence, and planner trace
+  lifecycle writes. It restored `bin/mini-ork-plan`; fork closure failed; GLM
+  correctly rejected the proposal. No paid retry ran.
+
+### Completion audit and closure
+
+- The Python planner now calls the native dispatcher in-process while preserving
+  the injectable `(returncode, combined_output)` contract and merged stream
+  capture.
+- Native profile handling preserves zero-question normalization,
+  non-interactive auto-answering, `/dev/tty` interactive answers, confidence
+  updates, profile answer artifacts, and fail-closed blocking.
+- Native context orchestration preserves learned failure modes, prior runs,
+  the ContextNest planner role pack with generic fallback, recent-file sessions,
+  active-state injection, and the auditable `context-pack.json` artifact.
+- Planner running, blocked, failure, fallback, and success traces use
+  `mini_ork.trace_store`. Migration `0054_execution_traces_status_blocked.sql`
+  fixes the pre-existing schema contradiction that silently rejected the Bash
+  planner's `blocked` status; applying it to a pre-0054 database preserved the
+  existing trace and accepted a blocked trace.
+- Every executable caller and test was repointed to
+  `python3 -m mini_ork.ported.mini_ork_plan`; `bin/mini-ork-plan` was deleted.
+- Independent post-retirement evidence is green: 39 focused planner/context
+  tests, 25 CLI/context tests, 10 plan integration assertions, 7 given-plan
+  assertions, the recursive profile-gate verifier, 5 path-traversal assertions,
+  29 web-smoke passes (25 environment skips), focused Pyright, post-retirement
+  parity, feature acceptance, the 58-row completion ledger, deterministic fork
+  closure, and database-migration preservation.
+- The model-authored detailed verdict remains the honest rejected partial-run
+  record. Promotion is based on the later deterministic five-gate evidence plus
+  two source-requirements audits; the rejected verdict was not rewritten and no
+  paid reviewer replay was hidden.
+
+### Next safe action
+
+The next fork is `cli`. Prepare its kickoff and isolated target from the pushed
+plan-closure commit. A new paid self-migrate run still requires separate
+approval; do not reuse or replay the plan run.
 
 Each fork closure produces:
 - `self-migrate.diff` (reviewable, apply or reject)

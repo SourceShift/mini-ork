@@ -91,6 +91,36 @@ if [ "$FORK" = "classify" ]; then
   done
 fi
 
+# Plan retirement has several executable callers whose contracts are broader
+# than the focused unit module: module-level CLI behavior, given-plan bypass,
+# recipe dry-runs, hostile kickoff input, and the web provenance surface.
+if [ "$FORK" = "plan" ]; then
+  PLAN_TESTS=(
+    tests/integration/test_bin_plan.sh
+    tests/integration/test_given_plan.sh
+    tests/e2e/test_e2e_recipe_bdd_first.sh
+    tests/e2e/test_e2e_recipe_code_fix.sh
+    tests/security/test_sec_hooks_attack_surface.sh
+    tests/security/test_sec_kickoff_command_injection.sh
+    tests/security/test_sec_oversized_input.sh
+  )
+  for plan_test in "${PLAN_TESTS[@]}"; do
+    if ( cd "$REPO_ROOT" && bash "$plan_test" ) >>"$EVIDENCE" 2>&1; then
+      echo "[plan-contract] $plan_test PASS" >>"$EVIDENCE"
+    else
+      pass=false; reasons+=("$plan_test failed")
+    fi
+  done
+  if (
+    cd "$REPO_ROOT"
+    python3 -m pytest tests/test_web_smoke.py -q -p no:cacheprovider
+  ) >>"$EVIDENCE" 2>&1; then
+    echo "[pytest] tests/test_web_smoke.py PASS" >>"$EVIDENCE"
+  else
+    pass=false; reasons+=("tests/test_web_smoke.py failed")
+  fi
+fi
+
 # (c) type-check the migrated port and the Python callers changed by the rewire.
 TYPE_TARGETS=("mini_ork/ported/mini_ork_${FORK}.py")
 if [ "$FORK" = "reflect" ]; then
@@ -98,6 +128,9 @@ if [ "$FORK" = "reflect" ]; then
 fi
 if [ "$FORK" = "classify" ]; then
   TYPE_TARGETS+=("mini_ork/ported/mini_ork_cli.py" "mini_ork/web/routes/run_detail.py")
+fi
+if [ "$FORK" = "plan" ]; then
+  TYPE_TARGETS+=("mini_ork/ported/mini_ork_cli.py")
 fi
 if [ -n "$FORK" ] && [ -f "$REPO_ROOT/${TYPE_TARGETS[0]}" ]; then
   if ( cd "$REPO_ROOT" && python3 -m pyright "${TYPE_TARGETS[@]}" ) >>"$EVIDENCE" 2>&1; then

@@ -395,7 +395,13 @@ def _run_lifecycle(argv, root) -> int:
         return 0
 
     # ── plan ──
-    pl = subprocess.run([_bin(root, "plan"), kickoff], capture_output=True, text=True)
+    plan_env = dict(os.environ)
+    plan_env["PYTHONPATH"] = root + (os.pathsep + plan_env["PYTHONPATH"]
+                                      if plan_env.get("PYTHONPATH") else "")
+    pl = subprocess.run(
+        [sys.executable, "-m", "mini_ork.ported.mini_ork_plan", kickoff],
+        capture_output=True, text=True, env=plan_env,
+    )
     if pl.returncode != 0:
         sys.stderr.write(pl.stderr); return pl.returncode
     sys.stdout.write(pl.stdout)

@@ -117,3 +117,41 @@ def test_role_pack_md_requires_role():
     assert rc != 0
     with pytest.raises(ValueError, match="role required"):
         crp.role_pack_md("", "/tmp/whatever", cn_available=False)
+
+
+def test_planner_role_pack_uses_native_contextnest_client(tmp_path):
+    brief = _write(tmp_path, "planner.json", '{"title":"Migrate planner","task_class":"self_migrate"}')
+
+    class Client:
+        @staticmethod
+        def capsule(query, since):
+            assert query == "Migrate" and since == "14d"
+            return "# Prompt Context\n## Risks\n" + ("x" * 120)
+
+        @staticmethod
+        def sessions_by_intent(task_class):
+            assert task_class == "self_migrate"
+            return '{"sessions":[{"session_id":"abcdef1234","last_seen":"2026-07-20T00:00:00Z","title":"Earlier plan"}]}'
+
+        @staticmethod
+        def inbox_filtered(urgency, limit):
+            assert (urgency, limit) == ("now", 5)
+            return '{"items":[]}'
+
+        @staticmethod
+        def render_inbox_md(payload, limit):
+            return ""
+
+        @staticmethod
+        def basins(project, limit):
+            assert limit == 5
+            return '{"basins":[]}'
+
+        @staticmethod
+        def render_basins_md(payload, limit):
+            return ""
+
+    rendered = crp.role_pack_md("planner", brief, cn_available=True, client=Client)
+
+    assert "ContextNest planner pack — substrate digest" in rendered
+    assert "abcdef12 (2026-07-20) Earlier plan" in rendered
