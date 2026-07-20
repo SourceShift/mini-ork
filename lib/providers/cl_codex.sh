@@ -367,7 +367,7 @@ rm -f "$_CODEX_LAST_MESSAGE"
 #   codex
 #   <assistant answer>
 #
-# If we pass that whole transcript through, mini-ork-plan's balanced JSON
+# If we pass that whole transcript through, the Python planner's balanced JSON
 # extractor sees the prompt's example JSON before the actual answer. Keep text
 # after the final bare `codex` marker when present, then remove status lines.
 # RAW_OUT is transformed by now (last-message body / agent text), so it can't

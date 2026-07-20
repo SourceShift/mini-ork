@@ -5,7 +5,7 @@
 #
 # THREAT MODEL:
 #   An attacker passes a crafted path as the kickoff argument to mini-ork-classify
-#   or mini-ork-plan.  Goals: (a) read sensitive files like /etc/passwd or
+#   or the Python plan runtime. Goals: (a) read sensitive files like /etc/passwd or
 #   $MINI_ORK_HOME/../../../etc/shadow and expose their content on stdout,
 #   (b) write a task_runs row whose kickoff_path column contains the traversal
 #   string, leaking the fact that /etc/passwd was read.

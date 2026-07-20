@@ -1,16 +1,17 @@
-"""Parity gate: mini_ork.ported.mini_ork_plan vs bin/mini-ork-plan.
+"""Standalone golden and behavioral contracts for the Python plan runtime.
 
 The planner LLM dispatch is the one non-deterministic seam; MO_GIVEN_PLAN skips it
 and flows a supplied plan through the SAME extraction → validation → fallback →
-overlay → write → DB pipeline. We drive both the live bash and the port through
-MO_GIVEN_PLAN (valid / markdown-fenced+z-insight-bleed / rejected shapes) plus
---dry-run, the profile gate, and flag errors — comparing plan.json + stdout +
-exit code + the task_runs row.
+overlay → write → DB pipeline. The Bash oracle was captured by the durable
+pre-retirement parity report before its entrypoint was removed. These tests keep
+the certified golden values and exercise MO_GIVEN_PLAN, dry-run, profile gates,
+flag errors, repair limits, native dispatch capture, and DB writes directly.
 """
 from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 from pathlib import Path
@@ -18,8 +19,6 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
 from mini_ork.ported import mini_ork_plan as plan  # noqa: E402
-
-BIN = REPO / "bin" / "mini-ork-plan"
 
 _VALID = {
     "objective": "Ship widget", "assumptions": ["a"],
@@ -55,11 +54,6 @@ def _env(home, db, given=None, extra=None):
     if extra:
         e.update(extra)
     return e
-
-
-def _run_bash(home, db, kickoff, out, given=None, extra=None):
-    return subprocess.run(["bash", str(BIN), kickoff, "--out", out],
-                          capture_output=True, text=True, env=_env(home, db, given, extra))
 
 
 def _run_py(home, db, kickoff, out, given=None, extra=None):
@@ -107,103 +101,276 @@ def _given(tmp, obj_or_text, name="given.json"):
     return str(p)
 
 
-def _parity(tmp_path, name, given_text, *, extra=None):
-    hb, db_b = _home(tmp_path, name + "b"); hp, db_p = _home(tmp_path, name + "p")
+def _contract(tmp_path, name, given_text, *, extra=None):
+    home, db = _home(tmp_path, name)
     k = _kick(tmp_path)
     g = _given(tmp_path, given_text, name + ".json")
-    ob = str(tmp_path / (name + "b.json")); op = str(tmp_path / (name + "p.json"))
-    cb = _run_bash(hb, db_b, k, ob, given=g, extra=extra)
-    rc_p = _run_py(hp, db_p, k, op, given=g, extra=extra)
-    assert cb.returncode == rc_p, f"{name}: rc bash={cb.returncode} py={rc_p}\n{cb.stderr}"
-    fb = Path(ob).read_text() if Path(ob).exists() else ""
-    fp = Path(op).read_text() if Path(op).exists() else ""
-    assert fb == fp, f"{name}: plan.json differs\nBASH:{fb}\nPY:{fp}"
-    assert _taskrow(db_b) == _taskrow(db_p), f"{name}: task_runs differ"
-    return cb.returncode, fp
+    out = str(tmp_path / (name + ".out.json"))
+    rc = _run_py(home, db, k, out, given=g, extra=extra)
+    rendered = Path(out).read_text() if Path(out).exists() else ""
+    return rc, rendered, _taskrow(db)
 
 
 def test_valid_given_plan(tmp_path):
-    rc, fp = _parity(tmp_path, "valid", _VALID)
+    rc, fp, taskrow = _contract(tmp_path, "valid", _VALID)
     assert rc == 0 and json.loads(fp)["objective"] == "Ship widget"
     assert json.loads(fp)["task_class"] == "code_fix"    # overlay stamps it
+    assert taskrow.startswith("planned|")
 
 
 def test_fenced_and_zinsight_bleed(tmp_path):
     # markdown fence + a trailing z-insight object; extraction must pick the plan
     raw = "```json\n" + json.dumps(_VALID) + "\n```\n<z-insight>{\"domain\":\"x\"}</z-insight>\n"
-    rc, fp = _parity(tmp_path, "fenced", raw)
+    rc, fp, _ = _contract(tmp_path, "fenced", raw)
     assert rc == 0 and json.loads(fp)["objective"] == "Ship widget"
 
 
 def test_missing_verifier_no_recipe_rejected(tmp_path):
     bad = {**_VALID, "verifier_contract": {"checks": []}}
-    rc, _ = _parity(tmp_path, "noverif", bad)
+    rc, _, _ = _contract(tmp_path, "noverif", bad)
     assert rc == 1
 
 
 def test_bad_node_type_rejected(tmp_path):
     bad = {**_VALID, "decomposition": [{"id": "s1", "node_type": "wizard", "depends_on": []}]}
-    rc, _ = _parity(tmp_path, "badnt", bad)
+    rc, _, _ = _contract(tmp_path, "badnt", bad)
     assert rc == 1
 
 
 def test_placeholder_rejected(tmp_path):
     bad = {**_VALID, "objective": "<fill in>"}
-    rc, _ = _parity(tmp_path, "ph", bad)
+    rc, _, _ = _contract(tmp_path, "ph", bad)
     assert rc == 1
 
 
 def test_parse_error_no_recipe_rejected(tmp_path):
-    rc, _ = _parity(tmp_path, "parse", "this is not json at all")
+    rc, _, _ = _contract(tmp_path, "parse", "this is not json at all")
     assert rc == 1
 
 
-def test_dry_run_parity(tmp_path):
-    hb, db_b = _home(tmp_path, "drb"); hp, db_p = _home(tmp_path, "drp")
+def test_dry_run_golden(tmp_path):
+    home, db = _home(tmp_path, "dry-run")
     k = _kick(tmp_path)
-    ob = str(tmp_path / "drb.json"); op = str(tmp_path / "drp.json")
-    cb = subprocess.run(["bash", str(BIN), k, "--out", ob, "--dry-run"],
-                        capture_output=True, text=True, env=_env(hb, db_b))
-    old = dict(os.environ); os.environ.clear(); os.environ.update(_env(hp, db_p))
+    out = str(tmp_path / "dry-run.json")
+    old = dict(os.environ); os.environ.clear(); os.environ.update(_env(home, db))
     try:
-        rc = plan.main([k, "--out", op, "--dry-run"], root=str(REPO))
+        rc = plan.main([k, "--out", out, "--dry-run"], root=str(REPO))
     finally:
         os.environ.clear(); os.environ.update(old)
-    assert cb.returncode == rc == 0
-    assert Path(ob).read_text() == Path(op).read_text()
-    assert "dry-run placeholder" in Path(op).read_text()
+    assert rc == 0
+    assert Path(out).read_text() == plan._DRY_RUN_PLACEHOLDER
 
 
-def test_profile_gate_parity(tmp_path):
-    hb, db_b = _home(tmp_path, "pgb"); hp, db_p = _home(tmp_path, "pgp")
+def test_profile_gate_golden(tmp_path):
+    home, db = _home(tmp_path, "profile-gate")
     k = _kick(tmp_path)
     # a needs_answers profile → gate blocks
     prof = tmp_path / "prof.json"
     prof.write_text(json.dumps({"profile_status": "needs_answers", "confidence": 0.4,
                                 "human_questions": ["what?"]}))
-    ob = str(tmp_path / "pgb.json"); op = str(tmp_path / "pgp.json")
+    out = str(tmp_path / "profile-gate.json")
     extra = {"MINI_ORK_PROFILE_GATE": "1", "MINI_ORK_PROFILE_PATH": str(prof)}
-    cb = subprocess.run(["bash", str(BIN), k, "--out", ob],
-                        capture_output=True, text=True, env=_env(hb, db_b, extra=extra))
-    old = dict(os.environ); os.environ.clear(); os.environ.update(_env(hp, db_p, extra=extra))
+    old = dict(os.environ); os.environ.clear(); os.environ.update(_env(home, db, extra=extra))
     try:
-        rc = plan.main([k, "--out", op], root=str(REPO))
+        rc = plan.main([k, "--out", out], root=str(REPO))
     finally:
         os.environ.clear(); os.environ.update(old)
-    assert cb.returncode == rc == 0
-    assert json.loads(Path(ob).read_text()) == json.loads(Path(op).read_text())
-    assert json.loads(Path(op).read_text())["plan_status"] == "needs_answers"
+    assert rc == 0
+    payload = json.loads(Path(out).read_text())
+    assert payload["plan_status"] == "needs_answers"
+    assert payload["blocked_by"] == "run_profile"
+    assert payload["confidence"] == 0.4
+    assert payload["human_questions"] == ["what?"]
 
 
-def test_flag_errors_parity(tmp_path):
-    hb, db_b = _home(tmp_path, "fe")
-    e = _env(hb, db_b)
-    assert subprocess.run(["bash", str(BIN), "--help"], capture_output=True, env=e).returncode == \
-        plan.main(["--help"], root=str(REPO)) == 0
-    assert subprocess.run(["bash", str(BIN), "--bogus"], capture_output=True, env=e).returncode == \
-        plan.main(["--bogus"], root=str(REPO)) == 2
-    assert subprocess.run(["bash", str(BIN), "/no/such.md"], capture_output=True, env=e).returncode == \
-        plan.main(["/no/such.md"], root=str(REPO)) == 2
+def test_profile_zero_questions_normalizes_and_continues(tmp_path):
+    home, db = _home(tmp_path, "profile-normalize")
+    kickoff = _kick(tmp_path)
+    profile = tmp_path / "normalize-profile.json"
+    profile.write_text(json.dumps({
+        "profile_status": "needs_answers",
+        "confidence": 0.8,
+        "human_questions": [],
+        "recipe": "demo",
+    }))
+    given = _given(tmp_path, _VALID, "normalize-given.json")
+    out = str(tmp_path / "normalize-plan.json")
+
+    rc = _run_py(home, db, kickoff, out, given=given, extra={
+        "MINI_ORK_PROFILE_GATE": "1",
+        "MINI_ORK_PROFILE_PATH": str(profile),
+    })
+
+    normalized = json.loads(profile.read_text())
+    assert rc == 0
+    assert normalized["profile_status"] == "ready"
+    assert normalized["profile_status_normalized"].startswith("needs_answers->ready")
+
+
+def test_noninteractive_profile_auto_answer_uses_native_dispatch(tmp_path):
+    home, db = _home(tmp_path, "profile-auto")
+    kickoff = _kick(tmp_path)
+    profile = tmp_path / "auto-profile.json"
+    profile.write_text(json.dumps({
+        "profile_status": "needs_answers",
+        "confidence": 0.4,
+        "human_questions": ["Which module?"],
+    }))
+    out = str(tmp_path / "auto-plan.json")
+    calls = []
+
+    def dispatch(task_class, node_type, prompt):
+        calls.append((task_class, node_type, prompt))
+        if node_type == "profile_answerer":
+            return 0, json.dumps({
+                "answers": [{"question": "Which module?", "answer": "planner"}],
+                "auto_answered": True,
+            })
+        return 0, json.dumps(_VALID)
+
+    rc = _run_py_dispatch(home, db, kickoff, out, dispatch, extra={
+        "MINI_ORK_PROFILE_GATE": "1",
+        "MINI_ORK_PROFILE_PATH": str(profile),
+        "MO_AUTO_ANSWER_PROFILE": "1",
+    })
+
+    updated = json.loads(profile.read_text())
+    assert rc == 0
+    assert [call[1] for call in calls] == ["profile_answerer", "planner"]
+    assert updated["profile_status"] == "ready"
+    assert updated["confidence"] == 0.9
+    assert updated["answers"] == {"Which module?": "planner"}
+    assert json.loads((profile.parent / "profile-answers.json").read_text())["auto_answered"] is True
+
+
+def test_interactive_profile_answers_continue_dispatch(tmp_path, monkeypatch):
+    home, db = _home(tmp_path, "profile-interactive")
+    kickoff = _kick(tmp_path)
+    profile = tmp_path / "interactive-profile.json"
+    profile.write_text(json.dumps({
+        "profile_status": "needs_answers",
+        "confidence": 0.2,
+        "human_questions": ["Proceed?"],
+    }))
+    out = str(tmp_path / "interactive-plan.json")
+    monkeypatch.setattr(plan, "_can_prompt_profile", lambda: True)
+
+    def prompt(questions, profile_path):
+        assert questions == ["Proceed?"]
+        assert plan._apply_profile_answers(
+            profile_path, {"answers": {"Proceed?": "yes"}, "auto_answered": False}
+        )
+        return str(Path(profile_path).parent / "profile-answers.json")
+
+    monkeypatch.setattr(plan, "_prompt_profile_questions", prompt)
+    dispatch = _fake_dispatch(json.dumps(_VALID))
+
+    rc = _run_py_dispatch(home, db, kickoff, out, dispatch, extra={
+        "MINI_ORK_PROFILE_GATE": "1",
+        "MINI_ORK_PROFILE_PATH": str(profile),
+        "MINI_ORK_NONINTERACTIVE": "0",
+    })
+
+    assert rc == 0
+    assert dispatch.calls["n"] == 1
+    assert json.loads(profile.read_text())["answers"] == {"Proceed?": "yes"}
+
+
+def test_context_blocks_order_and_context_pack_persist(tmp_path, monkeypatch):
+    home, db = _home(tmp_path, "context")
+    kickoff = _kick(tmp_path)
+    out = str(tmp_path / "context" / "plan.json")
+    captured = {}
+
+    from mini_ork import context_assembler
+    from mini_ork.ported import active_state_index, context_role_packs
+
+    monkeypatch.setattr(context_assembler, "failure_modes_md", lambda *a, **k: "FAILURES")
+    monkeypatch.setattr(context_assembler, "prior_runs_md", lambda *a, **k: "PRIOR")
+    monkeypatch.setattr(context_assembler, "context_assemble",
+                        lambda *a, **k: {"schema": "context-pack", "items": [1]})
+    monkeypatch.setattr(context_role_packs, "role_pack_md", lambda *a, **k: "ROLE-PACK")
+    monkeypatch.setattr(active_state_index, "render_active_state_block",
+                        lambda *a, **k: "ACTIVE-STATE")
+    monkeypatch.setattr(plan, "_contextnest_recent_sessions_md", lambda *a, **k: "RECENT")
+
+    def dispatch(_task_class, _node_type, prompt):
+        captured["prompt"] = prompt
+        return 0, json.dumps(_VALID)
+
+    rc = _run_py_dispatch(home, db, kickoff, out, dispatch, extra={
+        "MO_INJECT_LEARNINGS": "1",
+        "MO_USE_ROLE_PACKS": "1",
+    })
+
+    prompt = captured["prompt"]
+    assert rc == 0
+    assert prompt.index("FAILURES") < prompt.index("PRIOR") < prompt.index("ROLE-PACK")
+    assert prompt.index("ROLE-PACK") < prompt.index("RECENT") < prompt.index("ACTIVE-STATE")
+    assert json.loads((Path(out).parent / "context-pack.json").read_text()) == {
+        "schema": "context-pack", "items": [1]
+    }
+
+
+def test_trace_lifecycle_records_success_and_blocked(tmp_path):
+    home, db = _home(tmp_path, "trace")
+    kickoff = _kick(tmp_path)
+    given = _given(tmp_path, _VALID, "trace-given.json")
+    success_out = str(tmp_path / "trace-success.json")
+
+    assert _run_py(home, db, kickoff, success_out, given=given) == 0
+    with sqlite3.connect(db) as con:
+        success = con.execute(
+            "SELECT status, final_artifact_ref FROM execution_traces "
+            "WHERE trace_id LIKE 'tr-plan-%' ORDER BY created_at DESC LIMIT 1"
+        ).fetchone()
+    assert success == ("success", success_out)
+
+    profile = tmp_path / "trace-profile.json"
+    profile.write_text(json.dumps({
+        "profile_status": "needs_answers",
+        "confidence": 0.1,
+        "human_questions": ["Need input"],
+    }))
+    blocked_out = str(tmp_path / "trace-blocked.json")
+    assert _run_py(home, db, kickoff, blocked_out, extra={
+        "MINI_ORK_PROFILE_GATE": "1",
+        "MINI_ORK_PROFILE_PATH": str(profile),
+    }) == 0
+    with sqlite3.connect(db) as con:
+        blocked = con.execute(
+            "SELECT status, reviewer_verdict FROM execution_traces "
+            "WHERE trace_id LIKE 'tr-plan-%' ORDER BY created_at DESC LIMIT 1"
+        ).fetchone()
+    assert blocked == ("blocked", "run_profile_needs_answers")
+
+
+def test_flag_error_contracts():
+    assert plan.main(["--help"], root=str(REPO)) == 0
+    assert plan.main(["--bogus"], root=str(REPO)) == 2
+    assert plan.main(["/no/such.md"], root=str(REPO)) == 2
+
+
+def test_default_dispatch_uses_native_module_and_merges_streams(monkeypatch):
+    calls = []
+
+    def fake_native(argv, *, root):
+        calls.append((argv, root))
+        print("diagnostic", file=sys.stderr)
+        print(json.dumps(_VALID))
+        return 0
+
+    from mini_ork.ported import llm_dispatch as native_dispatch
+    monkeypatch.setattr(native_dispatch, "llm_dispatch", fake_native)
+
+    rc, combined = plan._default_llm_dispatch(str(REPO))(
+        "code_fix", "planner", "make a plan"
+    )
+
+    assert rc == 0
+    assert combined == "diagnostic\n" + json.dumps(_VALID) + "\n"
+    assert calls == [(["--task-class", "code_fix", "--node-type", "planner",
+                       "--prompt-text", "make a plan"], str(REPO))]
 
 
 def test_repair_recovers_parse_error(tmp_path):

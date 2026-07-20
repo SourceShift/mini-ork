@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
-# tests/integration/test_bin_plan.sh — integration tests for bin/mini-ork-plan
+# tests/integration/test_bin_plan.sh — Python plan entrypoint integration tests
 set -uo pipefail
 
 MINI_ORK_ROOT="${MINI_ORK_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 export MINI_ORK_ROOT
 export PATH="$MINI_ORK_ROOT/bin:$PATH"
+plan_cmd=(env "PYTHONPATH=$MINI_ORK_ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+  python3 -m mini_ork.ported.mini_ork_plan)
 export MINI_ORK_DRY_RUN=1
 
 # Isolated tmp project
@@ -33,20 +35,20 @@ Off-by-one in computeTotal().
 - ONLY tally.js may be edited.
 EOF
 
-echo "── integration: mini-ork-plan ──"
+echo "── integration: Python plan runtime ──"
 
 # === TESTS START ===
 
 # 1. --help exits 0 and prints usage
 echo ""
 echo "--- 1. --help exits 0 ---"
-if mini-ork-plan --help >/dev/null 2>&1; then
+if "${plan_cmd[@]}" --help >/dev/null 2>&1; then
   _ok "--help exits 0"
 else
   _fail "--help exited non-zero"
 fi
 
-HELP_OUT=$(mini-ork-plan --help 2>&1 || true)
+HELP_OUT=$("${plan_cmd[@]}" --help 2>&1 || true)
 if echo "$HELP_OUT" | grep -qi "plan\|kickoff\|usage\|verifier"; then
   _ok "--help output mentions expected keywords"
 else
@@ -57,7 +59,7 @@ fi
 echo ""
 echo "--- 2. Missing required arg exits 2 ---"
 EXITCODE=0
-mini-ork-plan 2>/dev/null || EXITCODE=$?
+"${plan_cmd[@]}" 2>/dev/null || EXITCODE=$?
 if [ "$EXITCODE" -eq 2 ]; then
   _ok "no args → exit 2"
 else
@@ -68,7 +70,7 @@ fi
 echo ""
 echo "--- 3. Nonexistent file exits 2 ---"
 EXITCODE=0
-mini-ork-plan /tmp/does-not-exist-ork-$$$.md 2>/dev/null || EXITCODE=$?
+"${plan_cmd[@]}" /tmp/does-not-exist-ork-$$$.md 2>/dev/null || EXITCODE=$?
 if [ "$EXITCODE" -eq 2 ]; then
   _ok "nonexistent kickoff → exit 2"
 else
@@ -79,8 +81,8 @@ fi
 echo ""
 echo "--- 4. Dry-run: writes plan.json + emits plan_path= ---"
 export MINI_ORK_RUN_ID="run-test-plan-$$"
-OUT=$(mini-ork-plan --dry-run "$TMPROOT/kickoff.md" 2>/dev/null || true)
-STDERR_OUT=$(mini-ork-plan --dry-run "$TMPROOT/kickoff.md" 2>&1 >/dev/null || true)
+OUT=$("${plan_cmd[@]}" --dry-run "$TMPROOT/kickoff.md" 2>/dev/null || true)
+STDERR_OUT=$("${plan_cmd[@]}" --dry-run "$TMPROOT/kickoff.md" 2>&1 >/dev/null || true)
 
 if echo "$OUT" | grep -qE '^plan_path='; then
   PLAN_PATH=$(echo "$OUT" | grep -E '^plan_path=' | head -1 | cut -d= -f2)
@@ -98,7 +100,7 @@ fi
 # 5. plan.json written by dry-run is valid JSON with verifier_contract
 echo ""
 echo "--- 5. Dry-run plan.json is valid JSON with verifier_contract ---"
-PLAN_PATH=$(mini-ork-plan --dry-run "$TMPROOT/kickoff.md" 2>/dev/null \
+PLAN_PATH=$("${plan_cmd[@]}" --dry-run "$TMPROOT/kickoff.md" 2>/dev/null \
   | grep -E '^plan_path=' | head -1 | cut -d= -f2 || true)
 if [ -n "$PLAN_PATH" ] && [ -f "$PLAN_PATH" ]; then
   VALID_JSON=$(python3 -c "import json,sys; json.load(open(sys.argv[1])); print('ok')" "$PLAN_PATH" 2>/dev/null || echo "bad")
@@ -127,7 +129,7 @@ fi
 echo ""
 echo "--- 6. --task-class override accepted ---"
 export MINI_ORK_RUN_ID="run-test-plan-tc-$$"
-OUT=$(mini-ork-plan --dry-run --task-class "test_class" "$TMPROOT/kickoff.md" 2>/dev/null || true)
+OUT=$("${plan_cmd[@]}" --dry-run --task-class "test_class" "$TMPROOT/kickoff.md" 2>/dev/null || true)
 if echo "$OUT" | grep -qE 'task_class=test_class'; then
   _ok "--task-class test_class reflected in stdout"
 else
@@ -139,7 +141,7 @@ echo ""
 echo "--- 7. --out flag: writes plan to given path ---"
 CUSTOM_OUT="$TMPROOT/custom-plan.json"
 export MINI_ORK_RUN_ID="run-test-plan-out-$$"
-mini-ork-plan --dry-run --out "$CUSTOM_OUT" "$TMPROOT/kickoff.md" >/dev/null 2>&1 || true
+"${plan_cmd[@]}" --dry-run --out "$CUSTOM_OUT" "$TMPROOT/kickoff.md" >/dev/null 2>&1 || true
 if [ -f "$CUSTOM_OUT" ]; then
   _ok "--out $CUSTOM_OUT: file written"
 else

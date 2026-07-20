@@ -80,8 +80,8 @@ declared closed while any edge into it survives. Read-only; produced first.
 | Loop role | Lane | Backoff | Rationale |
 |---|---|---|---|
 | implementer / worker (the code transform) | **codex** | codex | reliable in this env; implementer must never be GLM (analysis-only) or opus |
-| mapper / verifier / reviewer (judgment — the moat) | **opus** | codex | strongest reasoner maps each seam's contract + decides "did parity hold / did a feature break" |
-| discovery lens (non-critical) | **GLM** | codex | cheap analysis; GLM's 429 "Fair Usage" silently sinks runs, so codex-backoff is mandatory |
+| planner / broad discovery | **Kimi** | codex | authenticated coding lane for decomposition and broad discovery |
+| mapper / ledger / reviewer (judgment — the moat) | **GLM 5.2** | codex | maps each seam, owns the cost/verifiability ledger, and reviews closure evidence |
 
 ### Per-fork pipeline (less deterministic — the agent reasons per seam)
 

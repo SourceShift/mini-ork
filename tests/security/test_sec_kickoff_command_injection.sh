@@ -12,7 +12,7 @@
 #   arithmetic), injection fires.
 #
 # EXPECTED BEHAVIOUR (hardened):
-#   mini-ork-classify and mini-ork-plan --dry-run MUST exit 0 or 2 after
+#   classify and plan Python modules in dry-run MUST exit 0 or 2 after
 #   processing the malicious body WITHOUT executing any side-effects encoded
 #   inside it.  The canary file /tmp/mo-sec-injection-canary-$$ must remain
 #   present (i.e. the rm/touch inside the payloads must NOT have fired).
@@ -74,7 +74,9 @@ done
 classify_module="$MINI_ORK_ROOT/mini_ork/ported/mini_ork_classify.py"
 classify_cmd=(env "PYTHONPATH=$MINI_ORK_ROOT${PYTHONPATH:+:$PYTHONPATH}" \
   python3 -m mini_ork.ported.mini_ork_classify)
-plan_bin="$MINI_ORK_ROOT/bin/mini-ork-plan"
+plan_module="$MINI_ORK_ROOT/mini_ork/ported/mini_ork_plan.py"
+plan_cmd=(env "PYTHONPATH=$MINI_ORK_ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+  python3 -m mini_ork.ported.mini_ork_plan)
 
 [[ ! -f "$classify_module" ]] && { _skip "Python classify module unavailable"; echo ""; echo "=== Results: $PASS OK  $SKIP SKIP  $FAIL FAIL ==="; exit 0; }
 
@@ -165,8 +167,8 @@ EOF
 run_injection_test "curl exfil" "$P4"
 echo ""
 
-# ── Also test mini-ork-plan --dry-run with same payloads ─────────────────────
-if [[ -x "$plan_bin" ]]; then
+# ── Also test the Python plan module in dry-run with same payloads ───────────
+if [[ -f "$plan_module" ]]; then
   echo "--- Plan --dry-run with injection payload ---"
   P5="$TMPDIR_TEST/kickoff_plan.md"
   cat > "$P5" <<EOF
@@ -174,7 +176,7 @@ if [[ -x "$plan_bin" ]]; then
 BODY: \$(touch "$NEW_CANARY")
 EOF
   local_exit=0
-  MINI_ORK_DRY_RUN=1 MINI_ORK_TASK_CLASS=generic bash "$plan_bin" "$P5" --dry-run >/dev/null 2>&1 || local_exit=$?
+  MINI_ORK_DRY_RUN=1 MINI_ORK_TASK_CLASS=generic "${plan_cmd[@]}" "$P5" --dry-run >/dev/null 2>&1 || local_exit=$?
   if [[ -f "$CANARY" ]]; then
     _ok "plan --dry-run: canary intact after injection in body"
   else
@@ -186,7 +188,7 @@ EOF
     _fail "plan --dry-run: NEW CANARY CREATED via plan injection!"
   fi
 else
-  _skip "mini-ork-plan not executable — plan injection test skipped"
+  _skip "Python plan module unavailable — plan injection test skipped"
 fi
 
 # ── Final summary ─────────────────────────────────────────────────────────────
