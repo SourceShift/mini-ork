@@ -17,7 +17,7 @@ import pytest
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
-from mini_ork.ported import mini_ork_execute as ex  # noqa: E402
+from mini_ork.cli import execute as ex
 
 
 @pytest.fixture(autouse=True)
@@ -139,7 +139,7 @@ def test_dispatch_chain_parity():
 
 
 def test_default_dispatch_preserves_resolved_fallback_chain(monkeypatch):
-    from mini_ork.ported import llm_dispatch
+    from mini_ork.dispatch import llm_dispatch
 
     captured = {}
 
@@ -559,7 +559,7 @@ def test_live_publisher_and_rollback_status(tmp_path, monkeypatch):
     common = dict(root=str(REPO), run_dir=str(rd), plan_path=_plan(tmp_path),
                   task_class="code_fix", db=db, run_id="r1", dispatch_fn=_fake(""))
     # No recipe → no artifact_contract.yaml. Bash returns 0 WITHOUT publishing
-    # (mini_ork/ported/mini_ork_execute.py:3017-3019). The old port stub wrongly always marked
+    # (mini_ork/cli/execute.py:3017-3019). The old port stub wrongly always marked
     # 'published' (panel finding 2); the faithful port leaves status unchanged.
     rc, _ = ex.dispatch_node(_fields("pub", "publisher"), **common)
     assert rc == 0 and _sql(db, "SELECT status FROM task_runs WHERE id='r1';").stdout.strip() != "published"

@@ -1,4 +1,4 @@
-"""Parity gate: mini_ork.ported.context_role_packs vs lib/context_role_packs.sh.
+"""Parity gate: mini_ork.steering.context_role_packs vs lib/context_role_packs.sh.
 
 The deterministic surface is the two brief extractors and the dispatcher's
 graceful-degradation contract. Each extractor is driven through the LIVE bash
@@ -18,7 +18,7 @@ import pytest
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
-from mini_ork.ported import context_role_packs as crp  # noqa: E402
+from mini_ork.steering import context_role_packs as crp
 
 SH = REPO / "lib" / "context_role_packs.sh"
 

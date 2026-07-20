@@ -11,7 +11,7 @@ Run under audit: `run-1784503045-70610`
 ## Requirements confirmed
 
 - The isolated proposal deletes `bin/mini-ork-reflect` and repoints every
-  runtime caller to `mini_ork.ported.mini_ork_reflect`.
+  runtime caller to `mini_ork.cli.reflect`.
 - The live target diff is byte-identical to the preserved
   `self-migrate.diff` (`sha256: 173793e43fb3d24355b4d0683101c3d9578fa536157ceb7d51ed4efaecfb8f03`).
 - Pre-retirement parity, post-retirement parity, feature acceptance, the
@@ -77,7 +77,7 @@ Completed: 2026-07-20
   workflow, artifact contract, and all five verifier reports after applying the
   proposal.
 - Confirmed every runtime caller now uses
-  `mini_ork.ported.mini_ork_reflect`, the Bash entrypoint is deleted, and the
+  `mini_ork.cli.reflect`, the Bash entrypoint is deleted, and the
   deterministic closure verifier passes against the source checkout.
 - Confirmed reviewer assembly now includes the standalone pre-retirement
   report plus recipe-specific verifier reports, map, ledger, detailed verdict,

@@ -1,4 +1,4 @@
-"""Standalone unit tests for ``mini_ork.ported.mutation_adversary``.
+"""Standalone unit tests for ``mini_ork.gates.mutation_adversary``.
 
 Replaces the bash-parity gate as part of the bash->Python migration: the
 Python port is now the sole implementation, so its coverage no longer runs
@@ -40,7 +40,7 @@ import textwrap
 
 import pytest
 
-from mini_ork.ported import mutation_adversary as ma
+from mini_ork.gates import mutation_adversary as ma
 
 # ─────────────────────────────────────────────────────────────────────────────
 # compute_cache_hash
@@ -685,7 +685,7 @@ class TestEmitCacheRow:
         con.close()
         assert expires_at.endswith("Z")
         # Parse with the SAME format string the port uses to build it
-        # (mini_ork/ported/mutation_adversary.py:482 — "%Y-%m-%dT%H:%M:%f",
+        # (mini_ork/gates/mutation_adversary.py:482 — "%Y-%m-%dT%H:%M:%f",
         # which has no "%S" field, so the seconds component is folded away;
         # only minute-precision + microsecond survive the round-trip). The
         # tolerance window below is wide enough to absorb that ~<1min skew.

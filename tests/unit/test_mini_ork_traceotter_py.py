@@ -1,4 +1,4 @@
-"""Parity gate: mini_ork.ported.mini_ork_traceotter vs bin/mini-ork-traceotter.
+"""Parity gate: mini_ork.cli.traceotter vs bin/mini-ork-traceotter.
 
 The distill step needs the TraceOtter venv + real runs, so full render parity is
 an integration concern; here we compare the deterministic preflight exit codes
@@ -15,7 +15,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
-from mini_ork.ported import mini_ork_traceotter as tot  # noqa: E402
+from mini_ork.cli import traceotter as tot
 
 BIN = REPO / "bin" / "mini-ork-traceotter"
 _REAL_PY = Path("/Volumes/docker-ssd/ps/TraceOtter/.venv/bin/python")

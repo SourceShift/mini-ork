@@ -1,4 +1,4 @@
-"""Standalone unit tests for ``mini_ork.ported.profile_gate``.
+"""Standalone unit tests for ``mini_ork.gates.profile_gate``.
 
 Replaces the bash-parity gate (against ``lib/profile_gate.sh``) as part of
 the bash→Python migration: the Python port is now the sole implementation,
@@ -17,7 +17,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from mini_ork.ported.profile_gate import normalize_zero_questions
+from mini_ork.gates.profile_gate import normalize_zero_questions
 
 _MARKER = "needs_answers->ready (0 questions: nothing to answer)"
 

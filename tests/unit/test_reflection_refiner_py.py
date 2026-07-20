@@ -1,4 +1,4 @@
-"""Standalone unit tests for ``mini_ork.ported.reflection_refiner``.
+"""Standalone unit tests for ``mini_ork.learning.reflection_refiner``.
 
 Replaces the bash-parity gate as part of the bash->Python migration: the
 Python port is now the sole implementation, so its coverage no longer shells
@@ -16,7 +16,7 @@ import json
 import sqlite3
 from pathlib import Path
 
-from mini_ork.ported.reflection_refiner import (
+from mini_ork.learning.reflection_refiner import (
     append_to_feedback,
     build_prompt,
     extract_reflection,

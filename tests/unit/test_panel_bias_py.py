@@ -1,4 +1,4 @@
-"""Standalone unit tests for ``mini_ork.ported.panel_bias``.
+"""Standalone unit tests for ``mini_ork.gates.panel_bias``.
 
 Replaces the bash-parity gate as part of the bash→Python migration: the
 Python port is now the sole implementation, so its coverage no longer runs
@@ -16,7 +16,7 @@ import json
 
 import pytest
 
-from mini_ork.ported.panel_bias import (
+from mini_ork.gates.panel_bias import (
     _LABELS,
     _iter_rankings,
     _list_lens_files,

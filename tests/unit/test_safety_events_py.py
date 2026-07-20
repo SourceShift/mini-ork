@@ -1,4 +1,4 @@
-"""Parity gate: mini_ork.ported.safety_events vs lib/safety_events.sh.
+"""Parity gate: mini_ork.stores.safety_events vs lib/safety_events.sh.
 
 Each test invokes the LIVE ``bash lib/safety_events.sh`` subprocess
 (after sourcing) on identical inputs as the Python port and asserts
@@ -55,7 +55,7 @@ import pytest
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
-from mini_ork.ported import safety_events as se  # noqa: E402
+from mini_ork.stores import safety_events as se
 
 SH = REPO / "lib" / "safety_events.sh"
 INIT_SH = REPO / "db" / "init.sh"

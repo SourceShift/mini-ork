@@ -1,4 +1,4 @@
-"""Parity gate: mini_ork.ported.mini_ork_mcp_steering vs live bash fetch.
+"""Parity gate: mini_ork.steering.mcp_server vs live bash fetch.
 
 The bash function consumes rows as it reads them, so parity cases use paired
 temp DBs seeded with identical rows: one for live bash and one for the Python
@@ -20,7 +20,7 @@ import pytest
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
-from mini_ork.ported import mini_ork_mcp_steering as mcp_ops  # noqa: E402
+from mini_ork.steering import mcp_server as mcp_ops
 
 SH = REPO / "lib" / "operator_steering.sh"
 INIT_SH = REPO / "db" / "init.sh"

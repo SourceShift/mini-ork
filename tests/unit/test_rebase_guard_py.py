@@ -1,4 +1,4 @@
-"""Standalone unit tests for ``mini_ork.ported.rebase_guard``.
+"""Standalone unit tests for ``mini_ork.vcs.rebase_guard``.
 
 Replaces the bash-parity gate (previously ran ``lib/rebase-guard.sh`` in a
 bash subprocess and diffed outcomes) as part of the bash→Python migration:
@@ -21,7 +21,7 @@ from pathlib import Path
 
 import pytest
 
-from mini_ork.ported import rebase_guard as rg
+from mini_ork.vcs import rebase_guard as rg
 
 _ENV = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@e",
         "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@e"}

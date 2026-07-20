@@ -1,4 +1,4 @@
-"""Parity gate: mini_ork.ported.mo_otel vs lib/mo_otel.sh.
+"""Parity gate: mini_ork.observability.otel vs lib/mo_otel.sh.
 
 Each test invokes the LIVE bash subprocess (the bash source `mo_otel_*`
 family) against a per-case `MINI_ORK_RUN_DIR` temp dir, then invokes
@@ -34,7 +34,7 @@ import pytest
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
-from mini_ork.ported import mo_otel as py  # noqa: E402
+from mini_ork.observability import otel as py
 
 SH = REPO / "lib" / "mo_otel.sh"
 INIT_SH = REPO / "db" / "init.sh"

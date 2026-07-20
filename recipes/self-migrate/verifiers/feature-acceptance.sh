@@ -143,22 +143,22 @@ if [ "$FORK" = "plan" ]; then
 fi
 
 # (c) type-check the migrated port and the Python callers changed by the rewire.
-TYPE_TARGETS=("mini_ork/ported/mini_ork_${FORK}.py")
+TYPE_TARGETS=("mini_ork/cli/${FORK}.py")
 if [ "$FORK" = "reflect" ]; then
-  TYPE_TARGETS+=("mini_ork/ported/mini_ork_cli.py" "mini_ork/ported/mini_ork_execute.py")
+  TYPE_TARGETS+=("mini_ork/cli/main.py" "mini_ork/cli/execute.py")
 fi
 if [ "$FORK" = "classify" ]; then
-  TYPE_TARGETS+=("mini_ork/ported/mini_ork_cli.py" "mini_ork/web/routes/run_detail.py")
+  TYPE_TARGETS+=("mini_ork/cli/main.py" "mini_ork/web/routes/run_detail.py")
 fi
 if [ "$FORK" = "plan" ]; then
-  TYPE_TARGETS+=("mini_ork/ported/mini_ork_cli.py")
+  TYPE_TARGETS+=("mini_ork/cli/main.py")
 fi
 if [ "$FORK" = "execute" ]; then
   TYPE_TARGETS+=(
-    "mini_ork/ported/mini_ork_cli.py"
-    "mini_ork/ported/intervention_gate.py"
-    "mini_ork/ported/lane_helpers.py"
-    "mini_ork/ported/gate_registry.py"
+    "mini_ork/cli/main.py"
+    "mini_ork/gates/intervention_gate.py"
+    "mini_ork/dispatch/lane_helpers.py"
+    "mini_ork/gates/gate_registry.py"
   )
 fi
 if [ -n "$FORK" ] && [ -f "$REPO_ROOT/${TYPE_TARGETS[0]}" ]; then

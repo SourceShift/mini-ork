@@ -1,4 +1,4 @@
-"""Parity gate: mini_ork.ported.role_evolver vs lib/role_evolver.sh.
+"""Parity gate: mini_ork.learning.role_evolver vs lib/role_evolver.sh.
 
 Each test seeds a temp DB via ``db/init.sh``, then invokes the live bash
 subprocess (``bash -c '. lib/role_evolver.sh && role_evolver_propose ...'``)
@@ -27,7 +27,7 @@ import pytest
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
-from mini_ork.ported import role_evolver as re  # noqa: E402
+from mini_ork.learning import role_evolver as re
 
 SH = REPO / "lib" / "role_evolver.sh"
 INIT_SH = REPO / "db" / "init.sh"

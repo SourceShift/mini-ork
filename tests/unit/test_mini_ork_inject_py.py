@@ -1,4 +1,4 @@
-"""Parity gate: bin/mini-ork-inject (bash wrapper) vs mini_ork.ported.mini_ork_inject.
+"""Parity gate: bin/mini-ork-inject (bash wrapper) vs mini_ork.cli.inject.
 
 Each test invokes the LIVE bash subprocess ``bin/mini-ork-inject`` (which
 sources ``lib/operator_steering.sh`` and runs its argparse-equivalent
@@ -50,7 +50,7 @@ sys.path.insert(0, str(REPO))
 # Importing the production module: the parity test exercises main() via a
 # subprocess-like isolated environment, but importing it gives us the
 # in-process surface for fast assertions.
-from mini_ork.ported import mini_ork_inject as py_cli  # noqa: E402
+from mini_ork.cli import inject as py_cli
 
 INJECT_BIN = REPO / "bin" / "mini-ork-inject"
 SH_LIB = REPO / "lib" / "operator_steering.sh"

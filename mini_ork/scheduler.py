@@ -22,7 +22,7 @@ import sys
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 
-from mini_ork.ported import epic_graph
+from mini_ork.orchestration import epic_graph
 
 
 _USAGE = """mini-ork scheduler — autonomous multi-epic delivery loop.

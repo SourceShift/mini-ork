@@ -56,7 +56,7 @@ _assert "options verifier exists" test -f "$OPTIONS_VERIFIER"
 _assert "selected-option gate exists" test -f "$DECISION_VERIFIER"
 
 OUT="$(PYTHONPATH="$MINI_ORK_ROOT${PYTHONPATH:+:$PYTHONPATH}" \
-  python3 -m mini_ork.ported.mini_ork_classify \
+  python3 -m mini_ork.cli.classify \
   --dry-run "$TMPROOT/kickoff.md" 2>/dev/null || true)"
 CLASS="$(printf '%s\n' "$OUT" | grep -E '^task_class=' | head -1 | cut -d= -f2)"
 if [ "$CLASS" = "post_mvp_delivery" ]; then

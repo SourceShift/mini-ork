@@ -1,11 +1,11 @@
-"""Parity gate: ``mini_ork.ported.mini_ork_topology`` vs ``bin/mini-ork-topology``.
+"""Parity gate: ``mini_ork.cli.topology`` vs ``bin/mini-ork-topology``.
 
 Each test in this module builds a small ``execution_traces`` (and, where
 relevant, ``panel_topology_telemetry``) corpus, materialises it into a
 temp sqlite DB using the minimal DDL bash's heredocs require, then
 invokes the LIVE bash CLI (``bash bin/mini-ork-topology ...``) on the
 same DB. The Python port runs against the same DB via the matching
-``cmd_*`` function (or via ``python3 -m mini_ork.ported.mini_ork_topology
+``cmd_*`` function (or via ``python3 -m mini_ork.cli.topology
 ...`` for end-to-end CLI parity). The test asserts:
 
   * ``--compute`` — stdout parses into (rho, C, I, telemetry_id) fields;
@@ -55,7 +55,7 @@ sys.path.insert(0, str(REPO_ROOT))
 # The Python port is invoked as a subprocess via ``python3 -m`` in every
 # test below; the import here is exercised in ``test_python_import_smoke``
 # as a fast-fail check that the module resolves from REPO_ROOT.
-from mini_ork.ported import mini_ork_topology  # noqa: E402
+from mini_ork.cli import topology as mini_ork_topology
 
 # Float parity tolerance — kickoff requirement.
 _FLOAT_TOL = 1e-6
@@ -215,7 +215,7 @@ def _run_python_cli(
     env["MINI_ORK_DB"] = str(db_path)
     env["MINI_ORK_ROOT"] = str(REPO_ROOT)
     return subprocess.run(
-        [sys.executable, "-m", "mini_ork.ported.mini_ork_topology", *args],
+        [sys.executable, "-m", "mini_ork.cli.topology", *args],
         cwd=str(REPO_ROOT),
         env=env,
         capture_output=True,

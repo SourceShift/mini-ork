@@ -1076,7 +1076,7 @@ mo_llm_dispatch() {
   # v0.2-pt23 (D-048 fix, 2026-06-01): when MO_TRACE_RICH=1, switch to
   # --output-format stream-json so we can additionally parse tool_use
   # events into a .tool-summary sidecar — populates tool_calls + files_read
-  # for execution_traces (was hardcoded [] at mini_ork/ported/mini_ork_execute.py:240-241,
+  # for execution_traces (was hardcoded [] at mini_ork/cli/execute.py:240-241,
   # the single confirmed D-048 root cause per
   # .agentflow/mini-orch/handoffs/20260601-2100-minimax-gateway-perf-report.md).
   local _format="${MO_LLM_FORMAT:-json}"

@@ -56,12 +56,12 @@ if [[ -f "$MINI_ORK_ROOT/db/init.sh" ]]; then
   bash "$MINI_ORK_ROOT/db/init.sh" >/dev/null 2>&1 || true
 fi
 
-classify_module="$MINI_ORK_ROOT/mini_ork/ported/mini_ork_classify.py"
+classify_module="$MINI_ORK_ROOT/mini_ork/cli/classify.py"
 classify_cmd=(env "PYTHONPATH=$MINI_ORK_ROOT${PYTHONPATH:+:$PYTHONPATH}" \
-  python3 -m mini_ork.ported.mini_ork_classify)
-plan_module="$MINI_ORK_ROOT/mini_ork/ported/mini_ork_plan.py"
+  python3 -m mini_ork.cli.classify)
+plan_module="$MINI_ORK_ROOT/mini_ork/cli/plan.py"
 plan_cmd=(env "PYTHONPATH=$MINI_ORK_ROOT${PYTHONPATH:+:$PYTHONPATH}" \
-  python3 -m mini_ork.ported.mini_ork_plan)
+  python3 -m mini_ork.cli.plan)
 [[ ! -f "$classify_module" ]] && {
   _skip "Python classify module unavailable — oversized input tests skipped"
   echo ""

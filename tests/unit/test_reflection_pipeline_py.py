@@ -28,8 +28,8 @@ import pytest
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
-from mini_ork.ported import reflection_pipeline as rp  # noqa: E402
-from mini_ork.ported import pattern_store  # noqa: E402
+from mini_ork.learning import reflection_pipeline as rp
+from mini_ork.stores import pattern_store
 
 INIT_SH = REPO / "db" / "init.sh"
 

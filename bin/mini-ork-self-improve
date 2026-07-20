@@ -120,7 +120,7 @@ export SESSION_KILL_FLAG
 # The recursive-self-improve recipe's success criteria live in the verifier
 # triple (bottlenecks-found / self-tests-pass / no-regression), NOT in the
 # planner's run_profile.confidence score. The profile-gate added by iter 19
-# (mini_ork.ported.mini_ork_plan + MINI_ORK_PROFILE_GATE) is designed for one-shot recipes
+# (mini_ork.cli.plan + MINI_ORK_PROFILE_GATE) is designed for one-shot recipes
 # where the kickoff IS the contract. For the recursive loop the kickoff is
 # intentionally meta ("find your own bottlenecks") so profile confidence
 # always reads ~0.55 — the gate would block every iter.
@@ -673,7 +673,7 @@ EOF
   fi
 
   # Backstop: task_runs.status is the dispatch-level ground truth, written
-  # by mini_ork/ported/mini_ork_execute.py's _d021_set_status. If it says failed or
+  # by mini_ork/cli/execute.py's _d021_set_status. If it says failed or
   # rolled_back, the loop MUST NOT claim success — that's the iter-34 class
   # of bug where exec_rc was 0 at script-eval time (timeout wrapper /
   # bin/mini-ork swallowed the signal) but execute genuinely failed and

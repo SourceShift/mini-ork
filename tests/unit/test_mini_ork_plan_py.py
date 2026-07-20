@@ -18,7 +18,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
-from mini_ork.ported import mini_ork_plan as plan  # noqa: E402
+from mini_ork.cli import plan
 
 _VALID = {
     "objective": "Ship widget", "assumptions": ["a"],
@@ -283,7 +283,8 @@ def test_context_blocks_order_and_context_pack_persist(tmp_path, monkeypatch):
     captured = {}
 
     from mini_ork import context_assembler
-    from mini_ork.ported import active_state_index, context_role_packs
+    from mini_ork.orchestration import active_state_index
+    from mini_ork.steering import context_role_packs
 
     monkeypatch.setattr(context_assembler, "failure_modes_md", lambda *a, **k: "FAILURES")
     monkeypatch.setattr(context_assembler, "prior_runs_md", lambda *a, **k: "PRIOR")
@@ -360,7 +361,7 @@ def test_default_dispatch_uses_native_module_and_merges_streams(monkeypatch):
         print(json.dumps(_VALID))
         return 0
 
-    from mini_ork.ported import llm_dispatch as native_dispatch
+    from mini_ork.dispatch import llm_dispatch as native_dispatch
     monkeypatch.setattr(native_dispatch, "llm_dispatch", fake_native)
 
     rc, combined = plan._default_llm_dispatch(str(REPO))(

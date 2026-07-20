@@ -1,4 +1,4 @@
-"""Standalone unit tests for ``mini_ork.ported.langfuse_score_mapper``.
+"""Standalone unit tests for ``mini_ork.observability.langfuse_score_mapper``.
 
 Replaces the bash-parity gate (which drove ``bash -c 'source
 lib/langfuse_score_mapper.sh; ...'`` in a subprocess) as part of the
@@ -16,7 +16,7 @@ from typing import Dict, Tuple
 
 import pytest
 
-from mini_ork.ported.langfuse_score_mapper import (
+from mini_ork.observability.langfuse_score_mapper import (
     ORACLE_MAP,
     PROMOTION_MAP,
     REVIEWER_MAP,

@@ -64,7 +64,7 @@ def main(argv: list[str] | None = None) -> int:
     # Sidecar contract the bash executor + reward path depend on (parity with
     # lib/llm-dispatch.sh mo_llm_dispatch): <out>.cost per-call cost, <out>.err.log
     # on failure, and $MINI_ORK_RUN_DIR/.last-llm-cost + .last-llm-duration-ms
-    # (read by mini_ork/ported/mini_ork_execute.py:_trace_write_node_rich and the D-022 cost
+    # (read by mini_ork/cli/execute.py:_trace_write_node_rich and the D-022 cost
     # charger). Best-effort — never changes the exit code.
     if args.out:
         try:

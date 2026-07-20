@@ -1,4 +1,4 @@
-"""Parity gate: mini_ork.ported.coord_gate vs lib/coord_gate.sh.
+"""Parity gate: mini_ork.gates.coord_gate vs lib/coord_gate.sh.
 
 Each test drives the LIVE bash function via
 ``bash -c 'source lib/coord_gate.sh; coord_gate_check ...'`` against the
@@ -42,7 +42,7 @@ import pytest
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
-from mini_ork.ported import coord_gate as cg  # noqa: E402
+from mini_ork.gates import coord_gate as cg
 
 SH = REPO / "lib" / "coord_gate.sh"
 REGISTRY_SH = REPO / "lib" / "coord_registry.sh"

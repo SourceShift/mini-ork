@@ -1,4 +1,4 @@
-"""Parity gate: ``mini_ork.ported.mini_ork_resume`` vs ``bin/mini-ork-resume``.
+"""Parity gate: ``mini_ork.cli.resume`` vs ``bin/mini-ork-resume``.
 
 Each test seeds the SAME run-dir state (missing / no sentinel / sentinel
 present) and runs the scenario through both the LIVE bash dispatcher and
@@ -16,7 +16,7 @@ the bash script stays in place; the Python port must match its
 observable behavior exactly so the migration can proceed module-by-module
 without breaking operator workflows.
 
-The Python port is invoked via subprocess (``python -m mini_ork.ported.mini_ork_resume``)
+The Python port is invoked via subprocess (``python -m mini_ork.cli.resume``)
 so stdout/stderr match the real CLI surface, mirroring the bash path.
 
 Cases (6, at the kickoff's >=6 floor):
@@ -47,7 +47,7 @@ REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
 
 BASH = REPO / "bin" / "mini-ork-resume"
-PY_MOD = "mini_ork.ported.mini_ork_resume"
+PY_MOD = "mini_ork.cli.resume"
 
 # Sentinel body shape — cost_pause writes JSON with a trailing newline.
 SENTINEL_BODY = (
@@ -93,7 +93,7 @@ def _bash_resume(args, tmp_run_dir, env_overrides=None, user=None):
 
 
 def _py_resume(args, tmp_run_dir, env_overrides=None, user=None):
-    """Run mini_ork.ported.mini_ork_resume via subprocess; return same shape."""
+    """Run mini_ork.cli.resume via subprocess; return same shape."""
     env = dict(os.environ)
     if env_overrides:
         env.update(env_overrides)

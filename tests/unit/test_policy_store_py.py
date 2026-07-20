@@ -1,4 +1,4 @@
-"""Parity gate: mini_ork.ported.policy_store vs lib/policy_store.sh.
+"""Parity gate: mini_ork.stores.policy_store vs lib/policy_store.sh.
 
 Each test invokes the LIVE bash subprocess sourcing
 ``lib/policy_store.sh`` (which uses the ``[ "${0:-}" = "${BASH_SOURCE[0]:-}" ]``
@@ -47,7 +47,7 @@ import pytest
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
-from mini_ork.ported import policy_store as ps  # noqa: E402
+from mini_ork.stores import policy_store as ps
 
 PS_SH = REPO / "lib" / "policy_store.sh"
 INIT_SH = REPO / "db" / "init.sh"

@@ -1,6 +1,6 @@
 import pytest
 
-from mini_ork.ported.llm_dispatch import (
+from mini_ork.dispatch.llm_dispatch import (
     backoff_seconds_raw,
     glm_fair_usage_retryable,
     throttle_retryable,

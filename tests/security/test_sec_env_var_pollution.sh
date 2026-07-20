@@ -63,7 +63,7 @@ export MINI_ORK_DRY_RUN=1
 
 trap 'rm -rf "$TMPDIR_TEST"' EXIT
 
-classify_module="$MINI_ORK_ROOT/mini_ork/ported/mini_ork_classify.py"
+classify_module="$MINI_ORK_ROOT/mini_ork/cli/classify.py"
 PYTHON_BIN="$(command -v python3)"
 [[ ! -f "$classify_module" ]] && {
   _skip "Python classify module unavailable — PATH pollution tests skipped"
@@ -119,7 +119,7 @@ CLASSIFY_EXIT=0
 PATH="$EVIL_BIN_DIR:$PATH" \
   MINI_ORK_DRY_RUN=1 \
   PYTHONPATH="$MINI_ORK_ROOT${PYTHONPATH:+:$PYTHONPATH}" \
-  "$PYTHON_BIN" -m mini_ork.ported.mini_ork_classify \
+  "$PYTHON_BIN" -m mini_ork.cli.classify \
   "$VALID_KICKOFF" --dry-run >/dev/null 2>&1 \
   || CLASSIFY_EXIT=$?
 

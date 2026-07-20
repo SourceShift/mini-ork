@@ -236,7 +236,7 @@ else
 fi
 
 if bash -n "$MINI_ORK_ROOT/bin/mini-ork-spawn" \
-  && python3 -m py_compile "$MINI_ORK_ROOT/mini_ork/ported/mini_ork_execute.py" \
+  && python3 -m py_compile "$MINI_ORK_ROOT/mini_ork/cli/execute.py" \
   && python3 -m py_compile "$MINI_ORK_ROOT/recipes/epic-runner/lib/epic_dispatcher.py" \
     "$MINI_ORK_ROOT/recipes/epic-runner/lib/wave_aggregator.py"; then
   _ok "modified shell/Python entrypoints pass syntax checks"

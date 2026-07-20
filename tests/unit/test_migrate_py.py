@@ -1,4 +1,4 @@
-"""Parity gate: mini_ork.ported.migrate vs lib/migrate.sh.
+"""Parity gate: mini_ork.stores.migrate vs lib/migrate.sh.
 
 Drives the live bash functions via subprocess against a temp DB + temp
 migrations dir and compares checksums, schema_migrations rows (applied_at
@@ -16,7 +16,7 @@ import pytest
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
-from mini_ork.ported import migrate as mig  # noqa: E402
+from mini_ork.stores import migrate as mig
 
 SH = REPO / "lib" / "migrate.sh"
 

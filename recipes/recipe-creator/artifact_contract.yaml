@@ -19,10 +19,10 @@ rollback_policy: >
 # Publisher path (D-037). The recipe-creator's arbiter writes the chosen
 # draft to ${RUN_DIR}/chosen/<derived_recipe_name>/ AND records the slug
 # in ${RUN_DIR}/chosen/recipe_name (single line). The publisher branch
-# in mini_ork/ported/mini_ork_execute.py reads recipe_name and exports
+# in mini_ork/cli/execute.py reads recipe_name and exports
 # MINI_ORK_DERIVED_RECIPE_NAME before resolving the ${VAR} substitutions
 # in source_artifact + outputs[] below. envsubst (or bash eval fallback)
-# does the actual expansion. See mini_ork/ported/mini_ork_execute.py publisher node.
+# does the actual expansion. See mini_ork/cli/execute.py publisher node.
 source_artifact: chosen/${MINI_ORK_DERIVED_RECIPE_NAME}/
 outputs:
   - recipes/${MINI_ORK_DERIVED_RECIPE_NAME}/

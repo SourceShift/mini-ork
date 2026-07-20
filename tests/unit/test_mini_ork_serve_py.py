@@ -1,4 +1,4 @@
-"""Parity gate: mini_ork.ported.mini_ork_serve vs bin/mini-ork-serve.
+"""Parity gate: mini_ork.cli.serve vs bin/mini-ork-serve.
 
 The uvicorn launch itself can't be parity-tested (it binds a port and blocks),
 but every path before the exec — --help, unknown-flag, and the missing-state.db
@@ -16,7 +16,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
-from mini_ork.ported import mini_ork_serve as srv  # noqa: E402
+from mini_ork.cli import serve as srv
 
 BIN = REPO / "bin" / "mini-ork-serve"
 

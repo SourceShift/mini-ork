@@ -1,4 +1,4 @@
-"""Parity gate: mini_ork.ported.mini_ork_update vs bin/mini-ork-update.
+"""Parity gate: mini_ork.cli.update vs bin/mini-ork-update.
 
 Both backends invoke the LIVE bash subprocess for db/init.sh (the not-yet-ported
 peer) so the parity check compares two end-to-end flows against the same
@@ -45,7 +45,7 @@ sys.path.insert(0, str(REPO))
 BIN = REPO / "bin" / "mini-ork-update"
 
 # Re-imported so we can assert on the live _USAGE constant for the help cases.
-from mini_ork.ported.mini_ork_update import _USAGE  # noqa: E402
+from mini_ork.cli.update import _USAGE  # noqa: E402
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -97,7 +97,7 @@ def _py_update(
     args: list[str], env: dict, cwd: Path | None = None
 ) -> subprocess.CompletedProcess:
     return subprocess.run(
-        [sys.executable, "-m", "mini_ork.ported.mini_ork_update", *args],
+        [sys.executable, "-m", "mini_ork.cli.update", *args],
         env=env,
         cwd=str(cwd) if cwd else str(REPO),
         capture_output=True,

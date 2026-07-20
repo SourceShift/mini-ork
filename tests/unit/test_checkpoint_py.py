@@ -1,4 +1,4 @@
-"""Parity gate: mini_ork.ported.checkpoint vs lib/checkpoint.sh.
+"""Parity gate: mini_ork.stores.checkpoint vs lib/checkpoint.sh.
 
 Each test invokes the LIVE bash subprocess (sourcing ``lib/checkpoint.sh``
 in a single ``bash -c`` block so the functions are visible to the caller)
@@ -53,7 +53,7 @@ import pytest
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
-from mini_ork.ported import checkpoint as ck  # noqa: E402
+from mini_ork.stores import checkpoint as ck
 
 SH = REPO / "lib" / "checkpoint.sh"
 

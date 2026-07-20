@@ -1,4 +1,4 @@
-"""Parity gate: mini_ork.ported.adaptive_stability vs lib/adaptive_stability.sh.
+"""Parity gate: mini_ork.gates.adaptive_stability vs lib/adaptive_stability.sh.
 
 Each test drives the LIVE bash function ``mo_check_panel_stability`` via
 ``bash -c 'source lib/adaptive_stability.sh; mo_check_panel_stability ...'``
@@ -35,7 +35,7 @@ import pytest
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
 from mini_ork import trace_store  # noqa: E402
-from mini_ork.ported import adaptive_stability as ast  # noqa: E402
+from mini_ork.gates import adaptive_stability as ast
 
 SH = REPO / "lib" / "adaptive_stability.sh"
 

@@ -1,9 +1,9 @@
-"""Parity gate: mini_ork.ported.memory vs lib/memory.sh.
+"""Parity gate: mini_ork.memory.store vs lib/memory.sh.
 
 Sends each call through both sides:
 - bash: ``. lib/memory.sh && fn args`` invoked in a fresh tmp MINI_ORK_HOME
   seeded by db/init.sh with a pinned REPO_ROOT
-- python: mini_ork.ported.memory.fn() against a separate tmp MINI_ORK_HOME
+- python: mini_ork.memory.store.fn() against a separate tmp MINI_ORK_HOME
   also seeded by db/init.sh with the same REPO_ROOT
 
 The two DBs are then projected as JSON, non-deterministic fields
@@ -31,7 +31,7 @@ import pytest
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
-from mini_ork.ported import memory as m  # noqa: E402
+from mini_ork.memory import store as m
 
 class _py_env:
     """Context manager: pin MINI_ORK_DB/HOME/REPO_ROOT to the python-side

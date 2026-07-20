@@ -31,7 +31,7 @@ _run() { # <label> <cmd...>  → prints PASS/FAIL, updates rc_all
 _probe_entrypoint() { # <cmd>
   local cmd="$1"
   local bin="$ROOT/bin/mini-ork-$cmd"
-  local module="mini_ork.ported.mini_ork_$cmd"
+  local module="mini_ork.cli.$cmd"
   # (a) --help works through the live Python entrypoint. Before retirement this
   # exercises runtime-select delegation; after retirement it exercises the
   # canonical module directly instead of turning deletion into a vacuous SKIP.

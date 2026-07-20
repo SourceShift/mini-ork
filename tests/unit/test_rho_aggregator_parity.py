@@ -1,4 +1,4 @@
-"""Parity gate: ``mini_ork.ported.rho_aggregator`` vs ``bash lib/rho_aggregator.sh``.
+"""Parity gate: ``mini_ork.learning.rho_aggregator`` vs ``bash lib/rho_aggregator.sh``.
 
 For each fixture we seed a self-contained SQLite database under ``tmp_path``
 (both ``execution_traces`` and ``prompt_win_rates`` tables), invoke the LIVE
@@ -46,7 +46,7 @@ from pathlib import Path
 import pytest
 import sqlite3
 
-from mini_ork.ported.rho_aggregator import aggregate_win_rates, top_prompts
+from mini_ork.learning.rho_aggregator import aggregate_win_rates, top_prompts
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 LIB_RHO = REPO_ROOT / "lib" / "rho_aggregator.sh"

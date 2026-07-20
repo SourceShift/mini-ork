@@ -1,4 +1,4 @@
-"""Parity gate: ``mini_ork.ported.krippendorff_alpha_gate.check_panel_alpha``
+"""Parity gate: ``mini_ork.gates.krippendorff_alpha_gate.check_panel_alpha``
 vs ``lib/krippendorff_alpha_gate.sh:mo_check_panel_alpha``.
 
 Every case invokes the LIVE bash function in a fresh subprocess — the
@@ -36,7 +36,7 @@ import pytest
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
-from mini_ork.ported import krippendorff_alpha_gate as kag  # noqa: E402
+from mini_ork.gates import krippendorff_alpha_gate as kag
 
 SH = REPO / "lib" / "krippendorff_alpha_gate.sh"
 

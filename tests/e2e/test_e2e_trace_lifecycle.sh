@@ -168,7 +168,7 @@ if [[ -d "$RECIPE_DIR" ]]; then
   fi
 
   CLASSIFY_OUT="$(PYTHONPATH="$MINI_ORK_ROOT${PYTHONPATH:+:$PYTHONPATH}" \
-    python3 -m mini_ork.ported.mini_ork_classify \
+    python3 -m mini_ork.cli.classify \
     --dry-run "$KICKOFF_TMP" 2>/dev/null || echo "")"
   _assert "classify --dry-run exits 0 and emits task_class=" '[[ "$CLASSIFY_OUT" == *task_class=* ]]'
 

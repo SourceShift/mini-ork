@@ -1,7 +1,7 @@
 # Harsh-critic panel verdict — ported executor + runtime cutover
 
 **Date:** 2026-07-08
-**Target:** `mini_ork/ported/mini_ork_execute.py` (`dispatch_node` + live path) under `MINI_ORK_RUNTIME=python`, vs bash `bin/mini-ork-execute`.
+**Target:** `mini_ork/cli/execute.py` (`dispatch_node` + live path) under `MINI_ORK_RUNTIME=python`, vs bash `bin/mini-ork-execute`.
 **Panel:** two independent adversarial reviewers (opus, separate contexts), refute-or-promote discipline. Cross-vendor lanes (kimi/codex) were unavailable this run — this is a single-family (Anthropic) panel; a kimi/codex second pass is still advisable but the findings below are code-grounded, not judgment calls, so family diversity does not change them.
 **Gate #1 (live-dispatch harness):** PASS — a real sonnet dispatch through the ported live path called the LLM, wrote the artifact, charged cost $0.34, rc 0. The *wiring* is live; the *fidelity* is where the gaps are.
 

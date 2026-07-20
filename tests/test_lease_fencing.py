@@ -25,8 +25,8 @@ import pytest
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 
-from mini_ork.ported import lease  # noqa: E402
-from mini_ork.ported import mini_ork_checkpoints as mc  # noqa: E402
+from mini_ork.stores import lease
+from mini_ork.stores import checkpoints as mc
 
 # E3 schema — mirror of db/migrations/0052_run_leases_recovery_requests.sql.
 LEASE_SCHEMA = """

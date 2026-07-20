@@ -1,4 +1,4 @@
-"""Parity gate: mini_ork.ported.finalize vs lib/finalize.sh.
+"""Parity gate: mini_ork.recovery.finalize vs lib/finalize.sh.
 
 Runs the LIVE bash function ``mo_finalize`` (from ``lib/finalize.sh``)
 via subprocess against the SAME fixture (run_dir + SQLite DB + git
@@ -56,7 +56,7 @@ import pytest
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
-from mini_ork.ported import finalize as fin  # noqa: E402
+from mini_ork.recovery import finalize as fin
 
 SH = REPO / "lib" / "finalize.sh"
 DB_INIT = REPO / "db" / "init.sh"

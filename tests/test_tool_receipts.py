@@ -12,7 +12,7 @@ import pytest
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 
-from mini_ork.ported import tool_receipts as tr  # noqa: E402
+from mini_ork.stores import tool_receipts as tr
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS tool_receipts (

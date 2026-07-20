@@ -18,7 +18,7 @@ Remaining parts: none.
 Implementation details:
 
 - `bin/mini-ork` is an executable Python launcher that resolves symlinks and
-  imports `mini_ork.ported.mini_ork_cli.main` without runtime selection.
+  imports `mini_ork.cli.main.main` without runtime selection.
 - CLI-specialized closure proves the public path exists and is Python-only.
 - Golden launcher tests cover exact version/help/unknown behavior and symlink
   invocation.

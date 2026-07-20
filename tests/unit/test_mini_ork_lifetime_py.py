@@ -1,4 +1,4 @@
-"""Parity gate: mini_ork.ported.mini_ork_lifetime vs bin/mini-ork-lifetime.
+"""Parity gate: mini_ork.orchestration.lifetime vs bin/mini-ork-lifetime.
 
 Each test invokes the LIVE bash subprocess against a temp DB seeded by
 ``db/init.sh`` (and optionally data tables), then invokes the Python port
@@ -94,7 +94,7 @@ import pytest
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
-from mini_ork.ported import mini_ork_lifetime as py  # noqa: E402
+from mini_ork.orchestration import lifetime as py
 
 SH = REPO / "bin" / "mini-ork-lifetime"
 INIT_SH = REPO / "db" / "init.sh"

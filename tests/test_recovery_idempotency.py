@@ -19,7 +19,7 @@ import pytest
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 
-from mini_ork.ported import lease  # noqa: E402
+from mini_ork.stores import lease
 
 RECOVERY_SCHEMA = """
 CREATE TABLE IF NOT EXISTS recovery_requests (

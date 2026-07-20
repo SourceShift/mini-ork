@@ -3,7 +3,7 @@
 These tests intentionally do not source a Bash library. They preserve the
 retired implementation's externally observable prompt, validation, parsing,
 persistence, and Kimi-retry contracts while proving that the supported runtime
-has one owner: :mod:`mini_ork.ported.profile_answerer`.
+has one owner: :mod:`mini_ork.steering.profile_answerer`.
 """
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ import pytest
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
-from mini_ork.ported import profile_answerer as pa  # noqa: E402
+from mini_ork.steering import profile_answerer as pa
 
 
 def test_prompt_build_golden_contract(tmp_path: Path) -> None:
@@ -187,7 +187,7 @@ def test_end_to_end_replay_golden_contract(tmp_path: Path) -> None:
 
 def test_default_dispatch_uses_native_kimi_primary(monkeypatch: pytest.MonkeyPatch) -> None:
     """The standalone default path reaches native Kimi, never Bash."""
-    from mini_ork.ported import llm_dispatch as native_dispatch
+    from mini_ork.dispatch import llm_dispatch as native_dispatch
 
     calls = []
 
@@ -217,7 +217,7 @@ def test_default_dispatch_uses_native_kimi_primary(monkeypatch: pytest.MonkeyPat
 
 def test_default_dispatch_retries_kimi_on_whitespace(monkeypatch: pytest.MonkeyPatch) -> None:
     """Whitespace success is unusable and retains the historical Kimi retry."""
-    from mini_ork.ported import llm_dispatch as native_dispatch
+    from mini_ork.dispatch import llm_dispatch as native_dispatch
 
     calls = 0
     models = []

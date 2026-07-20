@@ -9,7 +9,7 @@ export MINI_ORK_DRY_RUN=1
 
 mini_ork_verify() {
   env PYTHONPATH="$MINI_ORK_ROOT${PYTHONPATH:+:$PYTHONPATH}" \
-    python3 -m mini_ork.ported.mini_ork_verify "$@"
+    python3 -m mini_ork.cli.verify "$@"
 }
 
 # Isolated tmp project
