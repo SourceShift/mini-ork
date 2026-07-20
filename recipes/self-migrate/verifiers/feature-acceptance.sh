@@ -65,10 +65,39 @@ if [ "$FORK" = "reflect" ]; then
   fi
 fi
 
+# Classify has a broad inbound surface: shell integration callers plus the
+# hostile-input contracts that protect its kickoff and environment boundary.
+if [ "$FORK" = "classify" ]; then
+  if ( cd "$REPO_ROOT" && bash tests/integration/test_bin_classify.sh ) >>"$EVIDENCE" 2>&1; then
+    echo "[integration] tests/integration/test_bin_classify.sh PASS" >>"$EVIDENCE"
+  else
+    pass=false; reasons+=("classify integration suite failed")
+  fi
+  SECURITY_TESTS=(
+    tests/security/test_sec_env_var_pollution.sh
+    tests/security/test_sec_hooks_attack_surface.sh
+    tests/security/test_sec_kickoff_command_injection.sh
+    tests/security/test_sec_kickoff_path_traversal.sh
+    tests/security/test_sec_malformed_yaml.sh
+    tests/security/test_sec_oversized_input.sh
+    tests/security/test_sec_sql_injection_run_id.sh
+  )
+  for security_test in "${SECURITY_TESTS[@]}"; do
+    if ( cd "$REPO_ROOT" && bash "$security_test" ) >>"$EVIDENCE" 2>&1; then
+      echo "[security] $security_test PASS" >>"$EVIDENCE"
+    else
+      pass=false; reasons+=("$security_test failed")
+    fi
+  done
+fi
+
 # (c) type-check the migrated port and the Python callers changed by the rewire.
 TYPE_TARGETS=("mini_ork/ported/mini_ork_${FORK}.py")
 if [ "$FORK" = "reflect" ]; then
   TYPE_TARGETS+=("mini_ork/ported/mini_ork_cli.py" "mini_ork/ported/mini_ork_execute.py")
+fi
+if [ "$FORK" = "classify" ]; then
+  TYPE_TARGETS+=("mini_ork/ported/mini_ork_cli.py" "mini_ork/web/routes/run_detail.py")
 fi
 if [ -n "$FORK" ] && [ -f "$REPO_ROOT/${TYPE_TARGETS[0]}" ]; then
   if ( cd "$REPO_ROOT" && python3 -m pyright "${TYPE_TARGETS[@]}" ) >>"$EVIDENCE" 2>&1; then

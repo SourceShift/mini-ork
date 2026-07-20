@@ -93,7 +93,8 @@ if [[ -f "$RECIPE_DIR/task_class.yaml" ]]; then
 fi
 
 export MINI_ORK_RUN_ID="run-e2e-code-fix-001"
-CLASSIFY_OUT="$("$MINI_ORK_ROOT/bin/mini-ork-classify" --dry-run "$KICKOFF" 2>/dev/null)"
+CLASSIFY_OUT="$(PYTHONPATH="$MINI_ORK_ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+  python3 -m mini_ork.ported.mini_ork_classify --dry-run "$KICKOFF" 2>/dev/null)"
 CLASSIFY_EXIT=$?
 _assert "classify --dry-run exits 0" '[[ "$CLASSIFY_EXIT" -eq 0 ]]'
 _assert "classify emits task_class= on stdout" '[[ "$CLASSIFY_OUT" == *task_class=* ]]'

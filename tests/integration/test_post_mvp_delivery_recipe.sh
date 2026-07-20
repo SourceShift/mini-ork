@@ -55,7 +55,9 @@ _assert "recipe workflow.yaml exists" test -f "$WORKFLOW"
 _assert "options verifier exists" test -f "$OPTIONS_VERIFIER"
 _assert "selected-option gate exists" test -f "$DECISION_VERIFIER"
 
-OUT="$(mini-ork-classify --dry-run "$TMPROOT/kickoff.md" 2>/dev/null || true)"
+OUT="$(PYTHONPATH="$MINI_ORK_ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+  python3 -m mini_ork.ported.mini_ork_classify \
+  --dry-run "$TMPROOT/kickoff.md" 2>/dev/null || true)"
 CLASS="$(printf '%s\n' "$OUT" | grep -E '^task_class=' | head -1 | cut -d= -f2)"
 if [ "$CLASS" = "post_mvp_delivery" ]; then
   _ok "post-MVP kickoff classifies to post_mvp_delivery"

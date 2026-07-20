@@ -14,7 +14,7 @@
 #   $1  kickoff.md path (required)
 #
 # Env:
-#   MINI_ORK_TASK_CLASS     Set by mini-ork-classify (or pass --task-class)
+#   MINI_ORK_TASK_CLASS     Set by the classify runtime (or pass --task-class)
 #   MINI_ORK_WORKFLOW       Path to active workflow.yaml
 #   MINI_ORK_RECIPE         Active recipe name
 #   MO_PLAN_MAX_REPAIRS     Recoverable planner-output repair retries (default: 2)
