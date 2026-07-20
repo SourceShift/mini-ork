@@ -44,7 +44,7 @@ mo_sandbox_local_dispatch() {
     return 2
   fi
   # Local backend just shells out to bin/mini-ork in the workspace's
-  # working directory. The recipe arg is optional - mini-ork-classify
+  # working directory. The recipe arg is optional - the classify runtime
   # will pick the right one if omitted.
   local _root="${MINI_ORK_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
   (
