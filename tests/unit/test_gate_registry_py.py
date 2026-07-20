@@ -127,6 +127,32 @@ def _bash_register(
     return proc.stdout.strip()
 
 
+def _bash_register_rc(db_path: Path, *args: str) -> int:
+    """Invoke live bash ``gate_register`` with arbitrary args; return exit code.
+
+    Unlike ``_bash_register`` this does NOT ``check=True`` — it drives the
+    error-path parity cases where a non-zero exit IS the asserted contract
+    (unknown gate_type, or missing required positional args).
+    """
+    quoted = " ".join(shlex_quote(a) for a in args)
+    src = textwrap.dedent(
+        f"""
+        source {shlex_quote(str(LIB_GATE_REGISTRY))} 2>/dev/null
+        gate_register {quoted}
+        """
+    ).strip()
+    env = os.environ.copy()
+    env["MINI_ORK_DB"] = str(db_path)
+    proc = subprocess.run(
+        ["bash", "-c", src],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env=env,
+    )
+    return proc.returncode
+
+
 def _bash_evaluate(db_path: Path, gate_id: str, context_json: str) -> str:
     src = textwrap.dedent(
         f"""
@@ -367,3 +393,37 @@ def test_run_all_summary(db):
     py_v = sorted(g["verdict"] for g in py_summary["gates"])
     bash_v = sorted(g["verdict"] for g in bash_summary["gates"])
     assert py_v == bash_v == ["pass", "pass"]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# (9) invalid gate_type rejected on both sides
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_register_invalid_gate_type_rejected(db):
+    """An unknown gate_type is rejected by BOTH implementations: bash's
+    validate loop returns non-zero and the Python port raises ValueError
+    (gate_registry.py:128, "mirrors bash"). Subsumes the retired
+    gate_registry bash fixture's 'invalid gate_type exits non-zero' case
+    into this live-bash parity gate.
+    """
+    with pytest.raises(ValueError):
+        gr.gate_register(str(db), "invalid_gate_type", "condition")
+    assert _bash_register_rc(db, "invalid_gate_type", "condition", "") != 0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# (10) missing required args rejected on both sides
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_register_missing_args_rejected(db):
+    """Calling gate_register with no gate_type/condition is rejected by BOTH
+    sides: bash's ${1:?}/${2:?} required-parameter guards exit non-zero, and
+    the Python port raises TypeError for the missing required positional
+    arguments. Subsumes the retired gate_registry bash fixture's 'no args
+    exits non-zero' case.
+    """
+    with pytest.raises(TypeError):
+        gr.gate_register(str(db))  # type: ignore[call-arg]
+    assert _bash_register_rc(db) != 0
