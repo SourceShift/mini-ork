@@ -541,7 +541,7 @@ def main(argv=None, *, root=None) -> int:
         print("")
         print("Lib presence:")
         for lib in ("trace_store", "llm-dispatch", "gate_registry", "group_evolver",
-                    "reflection_pipeline", "benchmark_suite", "utility_function",
+                    "benchmark_suite", "utility_function",
                     "promotion_gate", "version_registry", "paths"):
             if os.path.isfile(os.path.join(root, "lib", f"{lib}.sh")):
                 print(f"  [OK]      lib/{lib}.sh")

@@ -1,6 +1,6 @@
 -- gradient_records — textual gradient store.
 --
--- Was lazy-created by lib/gradient_extractor.sh::_gradient_ensure_table when
+-- Was originally lazy-created by the gradient schema initializer when
 -- the extractor ran. Other libs (role_evolver, context_assembler) read the
 -- table without first sourcing the extractor, so on a fresh DB they hit
 -- 'no such table: gradient_records'. Promote to a real migration so the

@@ -24,7 +24,7 @@ log(){ printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" >> "$LOG"; }
 # Ordered smallest-first. The 3 runtime-core giants are deliberately NOT here.
 LIBS="cost_pause gate_bootstrap lane-helpers gate_registry gates_common circuit_breaker \
 db_open config_resolve cw_por deadline_budget benchmark_suite promotion_gate \
-trace_store utility_function version_registry gradient_extractor reflection_pipeline \
+trace_store utility_function version_registry \
 process_reward policy_store lane_router coord_gate coord_registry"
 
 log "=== recursive-migrate START on $BRANCH — $(echo $LIBS | wc -w | tr -d ' ') candidate libs ==="

@@ -33,7 +33,7 @@ echo "  E2E: full self-improvement cycle (all 7 steps)"
 echo "══════════════════════════════════════════════════════"
 echo ""
 
-REQUIRED_LIBS=(trace_store gradient_extractor pattern_store group_evolver benchmark_suite utility_function promotion_gate version_registry reflection_pipeline)
+REQUIRED_LIBS=(trace_store pattern_store group_evolver benchmark_suite utility_function promotion_gate version_registry)
 for lib in "${REQUIRED_LIBS[@]}"; do
   if [[ ! -f "$MINI_ORK_ROOT/lib/${lib}.sh" ]]; then
     _skip "lib/${lib}.sh not found — all tests deferred"
@@ -59,14 +59,6 @@ for lib in "${REQUIRED_LIBS[@]}"; do
 done
 
 # ── LLM stubs ─────────────────────────────────────────────────────────────────
-_stub_gradient_extractor_full() {
-  local tid="$1"
-  # Always emit one gradient pointing at the executor node
-  echo "{\"target\":\"workflow.node.executor\",\"signal\":\"slow_execution\",\"suggested_change\":\"add parallelism\",\"evidence\":\"${tid}\",\"confidence\":0.75}"
-}
-export -f _stub_gradient_extractor_full
-export MINI_ORK_GRADIENT_EXTRACTOR_FN="_stub_gradient_extractor_full"
-
 _stub_runner_full() {
   # Reads task JSON from stdin; always passes with high utility
   echo '{"passed": true, "utility_score": 0.82}'
@@ -100,8 +92,23 @@ echo ""
 echo "=== Step 2: REFLECT — extract gradients ==="
 
 for tid in "${TRACE_IDS[@]}"; do
-  G="$(gradient_extract "$tid" 2>/dev/null || true)"
-  [[ -n "$G" ]] && gradient_store "$G" >/dev/null 2>&1 || true
+  python3 - "$MINI_ORK_ROOT" "$MINI_ORK_DB" "$tid" <<'PY' >/dev/null
+import sys
+sys.path.insert(0, sys.argv[1])
+from mini_ork.ported import gradient_extractor
+
+db, trace_id = sys.argv[2], sys.argv[3]
+def stub(tid, _trace_json):
+    return [{
+        "target": "workflow.node.executor",
+        "signal": "slow_execution",
+        "suggested_change": "add parallelism",
+        "evidence": tid,
+        "confidence": 0.75,
+    }]
+for gradient in gradient_extractor.extract(trace_id, db=db, override_fn=stub, emit=False):
+    gradient_extractor.store(gradient, db=db, dedup_sim=0)
+PY
 done
 
 G_COUNT="$(python3 - "$MINI_ORK_DB" <<'PY'

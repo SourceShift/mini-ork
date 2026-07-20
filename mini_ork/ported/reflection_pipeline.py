@@ -78,7 +78,7 @@ _gradient_ensure_table = _default_gradient_ensure_table
 
 
 def set_gradient_extract(fn) -> None:
-    """Inject a stub/replacement for lib/gradient_extractor.sh::gradient_extract.
+    """Inject a replacement for the default native gradient extractor.
 
     The callable receives a single `trace_id: str` argument and returns an
     iterable of gradient JSON strings (one per yielded gradient). Mirrors the
@@ -90,7 +90,7 @@ def set_gradient_extract(fn) -> None:
 
 
 def set_gradient_store(fn) -> None:
-    """Inject a stub/replacement for lib/gradient_extractor.sh::gradient_store.
+    """Inject a replacement for the default native gradient store.
 
     The callable receives a single `gradient_json: str` argument and persists
     it. Bash convention: `gradient_store "$gradient" >/dev/null || true`
@@ -101,7 +101,7 @@ def set_gradient_store(fn) -> None:
 
 
 def set_gradient_ensure_table(fn) -> None:
-    """Inject a stub/replacement for lib/gradient_extractor.sh::_gradient_ensure_table.
+    """Inject a replacement for native gradient schema initialization.
 
     Called once at the top of `reflection_extract_gradients` before iterating
     trace_ids. Idempotent CREATE TABLE is fine; the table is also created by
@@ -474,10 +474,10 @@ def _list_distinct_cluster_ids(db_path: str) -> list[str]:
     return [r[0] for r in rows]
 
 
-# ── Public functions (mirror lib/reflection_pipeline.sh) ─────────────────────
+# ── Public reflection functions ──────────────────────────────────────────────
 
 def reflection_extract_gradients(since_ts: int = 0) -> None:
-    """Mirror lib/reflection_pipeline.sh::reflection_extract_gradients.
+    """Extract and persist gradients for eligible traces.
 
     Selects execution_traces created on/after `since_ts` (unix epoch) via the
     bounded `_extract_trace_ids_sql` query, then for each trace_id calls the
@@ -612,7 +612,7 @@ def reflection_restore_per_node_credit(db_path: str | None = None) -> int:
 
 
 def reflection_deduplicate(gradients_table: str = "gradient_records") -> None:
-    """Mirror lib/reflection_pipeline.sh::reflection_deduplicate.
+    """Deduplicate persisted gradient records.
 
     Two-pass dedupe:
       Pass 1 — exact (target, signal) merge, global.
@@ -654,7 +654,7 @@ def reflection_deduplicate(gradients_table: str = "gradient_records") -> None:
 
 
 def reflection_link_failures(failure_table: str = "execution_traces") -> None:
-    """Mirror lib/reflection_pipeline.sh::reflection_link_failures.
+    """Link failed traces to their evidence-backed gradients.
 
     Correlate failure-status traces with gradient targets; update failure_links
     table. Stdout: empty. Stderr: `reflection_link_failures: N links
@@ -669,7 +669,7 @@ def reflection_link_failures(failure_table: str = "execution_traces") -> None:
 
 
 def reflection_detect_stale(memory_table: str) -> None:
-    """Mirror lib/reflection_pipeline.sh::reflection_detect_stale.
+    """Report stale records from a timestamped table.
 
     Detect memory entries not updated within MINI_ORK_STALE_DAYS (default 14).
     Stdout: JSON `{"table": ..., "stale_ids": [...], "stale_before_epoch": ...}`.
@@ -686,7 +686,7 @@ def reflection_detect_stale(memory_table: str) -> None:
 
 
 def reflection_summarize_patterns(cluster_id: str) -> dict:
-    """Mirror lib/reflection_pipeline.sh::reflection_summarize_patterns.
+    """Summarize the records in one pattern cluster.
 
     Summarize all pattern_records belonging to a cluster. Returns the dict that
     is json.dumps'd to stdout; the function also prints it (matching bash's
@@ -700,7 +700,7 @@ def reflection_summarize_patterns(cluster_id: str) -> dict:
 
 
 def reflection_suggest_promotions(patterns_table: str = "pattern_records") -> list[dict]:
-    """Mirror lib/reflection_pipeline.sh::reflection_suggest_promotions.
+    """Build promotion suggestions for frequent patterns.
 
     Suggest promotion candidates where frequency >= MINI_ORK_PROMOTION_MIN_FREQ
     (default 3). Stdout: JSON array. Returns the parsed list for in-process
@@ -714,7 +714,7 @@ def reflection_suggest_promotions(patterns_table: str = "pattern_records") -> li
 
 
 def reflection_persist_suggestions(suggestions_json: str) -> int:
-    """Mirror lib/reflection_pipeline.sh::reflection_persist_suggestions.
+    """Persist promotion suggestions as emergent patterns.
 
     Persist suggestions as durable rows in emergent_patterns (status='proposed').
     Idempotent upsert keyed by pattern_id (PK). Stdout: persisted count.
@@ -728,7 +728,7 @@ def reflection_persist_suggestions(suggestions_json: str) -> int:
 
 
 def reflection_verify_patterns() -> int:
-    """Mirror lib/reflection_pipeline.sh::reflection_verify_patterns.
+    """Approve emergent patterns that meet evidence and strength floors.
 
     Judge-gate (extract→distill→verify): transition emergent_patterns rows from
     status='proposed' → 'approved' when they clear the evidence/strength floor
@@ -780,7 +780,7 @@ def reflection_verify_patterns() -> int:
 
 
 def reflection_run(since_ts: int | None = None) -> str:
-    """Mirror lib/reflection_pipeline.sh::reflection_run.
+    """Run the native reflection pipeline.
 
     Orchestrate all 6 reflection steps sequentially. `since_ts` defaults to 24h
     ago (matching bash's `$(( $(_rfl_now) - 86400 ))`). Stdout: JSON suggestions
