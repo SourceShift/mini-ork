@@ -268,7 +268,7 @@ This ledger tells us WHERE to optimize mini-ork itself — the migration's real 
 Run the self-migrate recipe on each fork in recommended order:
 1. ✅ verify (closed and source-applied from the fully verified isolated Run 3 proposal; see the live evidence below)
 2. ✅ reflect (closed and source-applied from `run-1784503045-70610`; see the live evidence below)
-3. classify
+3. ✅ classify (closed and source-applied from `run-1784528328-42404`; see the live evidence below)
 4. plan
 5. cli
 6. execute
@@ -379,13 +379,38 @@ reviewer evidence assembly, and verdict preservation.
 
 ### Next safe action
 
-The canonical `kickoffs/migration/classify.md` and clean isolated target
-`/private/tmp/mini-ork-self-migrate-classify` are prepared at the focused
-reflect-closure commit `86eba5e7`. Its pre-retirement baseline passes 5 unit
-parity tests, 9 integration assertions, classify feature acceptance, and
-Pyright. The next action is the paid self-migrate launch using only Kimi,
-Codex, and GLM with credentials loaded process-locally from
-`/Users/admin/ps/scripts`. Do not start it without separate explicit approval.
+The next fork is `plan`. Prepare its canonical kickoff and isolated target from
+the focused classify-closure commit, then run the same five-verifier pipeline
+using only Kimi, Codex, and GLM with credentials loaded process-locally from
+`/Users/admin/ps/scripts`. Do not start that paid run without separate explicit
+approval.
+
+## Live classify evidence — 2026-07-20
+
+### Passing proposal: `run-1784528328-42404`
+
+- Isolated target: `/private/tmp/mini-ork-self-migrate-classify`.
+- Provider policy used only Kimi, Codex, and GLM: Kimi planned, Codex migrated,
+  and GLM 5.2 mapped seams, built the authoritative ledger, and reviewed.
+- The proposal deletes `bin/mini-ork-classify` and repoints the top-level Bash
+  dispatcher, Python CLI lifecycle, validation, integration, E2E, security,
+  parity-harness, and user-facing references to
+  `python -m mini_ork.ported.mini_ork_classify`.
+- The Python runtime now preserves Bash trace start/success side effects through
+  a best-effort native trace-store call while keeping dry-run side-effect free.
+- All five migration reports pass: durable pre-retirement parity,
+  post-retirement parity, feature acceptance, the 29-row static-feature ledger,
+  and deterministic fork closure. The GLM reviewer and detailed
+  `verdict.json` also pass.
+- Independent replay passed 15 classify/CLI unit tests, 9 classify integration
+  assertions, 16 post-MVP integration assertions, 43 security assertions, 53
+  E2E assertions, feature acceptance, focused Pyright, all post-retirement
+  migration gates, and diff hygiene.
+- The outer command exited non-zero after the passing workflow because the
+  generic Python verifier invokes globally registered oracle gates without
+  their required `recipe`, `verdict_file`, or `current_round` context and then
+  treats `defer` as failure. This was diagnosed without a paid retry and did not
+  invalidate the green fork-specific evidence.
 
 Each fork closure produces:
 - `self-migrate.diff` (reviewable, apply or reject)

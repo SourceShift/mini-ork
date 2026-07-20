@@ -232,7 +232,7 @@ def get_correlation(
         "bridge_methods": methods,
         "issues": issues,
         "remediation": (
-            "Re-run with the updated bin/mini-ork-classify + bin/mini-ork-execute "
+            "Re-run with the Python classify runtime + bin/mini-ork-execute "
             "which write trace_id to task_runs. Legacy rows can be backfilled with: "
             "UPDATE task_runs SET trace_id = 'tr-backfill-' || id WHERE trace_id IS NULL;"
             if not tr.get("trace_id")

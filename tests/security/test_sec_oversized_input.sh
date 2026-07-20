@@ -59,10 +59,12 @@ if [[ -f "$MINI_ORK_ROOT/db/init.sh" ]]; then
   bash "$MINI_ORK_ROOT/db/init.sh" >/dev/null 2>&1 || true
 fi
 
-classify_bin="$MINI_ORK_ROOT/bin/mini-ork-classify"
+classify_module="$MINI_ORK_ROOT/mini_ork/ported/mini_ork_classify.py"
+classify_cmd=(env "PYTHONPATH=$MINI_ORK_ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+  python3 -m mini_ork.ported.mini_ork_classify)
 plan_bin="$MINI_ORK_ROOT/bin/mini-ork-plan"
-[[ ! -x "$classify_bin" ]] && {
-  _skip "mini-ork-classify not executable — oversized input tests skipped"
+[[ ! -f "$classify_module" ]] && {
+  _skip "Python classify module unavailable — oversized input tests skipped"
   echo ""
   echo "=== Results: $PASS OK  $SKIP SKIP  $FAIL FAIL ==="
   exit 0
@@ -111,7 +113,7 @@ echo "--- 1. classify completes within 30s ---"
 CLASSIFY_START=$(date +%s)
 CLASSIFY_OUT=""
 CLASSIFY_EXIT=0
-CLASSIFY_OUT=$(timeout 30 bash "$classify_bin" "$LARGE_KICKOFF" --dry-run 2>&1) \
+CLASSIFY_OUT=$(timeout 30 "${classify_cmd[@]}" "$LARGE_KICKOFF" --dry-run 2>&1) \
   || CLASSIFY_EXIT=$?
 CLASSIFY_END=$(date +%s)
 ELAPSED=$(( CLASSIFY_END - CLASSIFY_START ))

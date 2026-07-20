@@ -70,7 +70,7 @@ echo "── 5. inspect task_runs ───────────────�
 rows=$(sqlite3 "$MINI_ORK_DB" "SELECT COUNT(*) FROM task_runs;" 2>/dev/null || echo 0)
 if [ "$rows" -eq 0 ]; then
   if [ "$MINI_ORK_DRY_RUN" = "1" ]; then
-    echo "  (no task_runs row in dry-run mode — bin/mini-ork-classify"
+    echo "  (no task_runs row in dry-run mode — the Python classify runtime"
     echo "   early-exits before INSERT when MINI_ORK_DRY_RUN=1, by design;"
     echo "   set MINI_ORK_DRY_RUN=0 to populate the row via real LLM calls)"
   else

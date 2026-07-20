@@ -251,7 +251,7 @@ print(json.dumps(d))' "$metadata_json")
   local run_id="${MINI_ORK_RUN_ID:-}"
   local traceparent="${MO_TRACEPARENT:-}"
   # Auto-derive traceparent from the task_runs row if env wasn't set —
-  # covers bin/mini-ork-plan + bin/mini-ork-classify (and anywhere else)
+  # covers bin/mini-ork-plan + the Python classify runtime (and anywhere else)
   # that doesn't explicitly export MO_TRACEPARENT. The dispatcher does
   # export it after reading task_runs.trace_id, but earlier stages
   # (classify writes the row, plan runs before execute) need this fallback.

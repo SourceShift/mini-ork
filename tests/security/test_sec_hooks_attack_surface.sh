@@ -70,11 +70,13 @@ if [[ -f "$MINI_ORK_ROOT/db/init.sh" ]]; then
   bash "$MINI_ORK_ROOT/db/init.sh" >/dev/null 2>&1 || true
 fi
 
-classify_bin="$MINI_ORK_ROOT/bin/mini-ork-classify"
+classify_module="$MINI_ORK_ROOT/mini_ork/ported/mini_ork_classify.py"
+classify_cmd=(env "PYTHONPATH=$MINI_ORK_ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+  python3 -m mini_ork.ported.mini_ork_classify)
 plan_bin="$MINI_ORK_ROOT/bin/mini-ork-plan"
 
-[[ ! -x "$classify_bin" ]] && {
-  _skip "mini-ork-classify not executable"
+[[ ! -f "$classify_module" ]] && {
+  _skip "Python classify module unavailable"
   echo ""
   echo "=== Results: $PASS OK  $SKIP SKIP  $FAIL FAIL ==="
   exit 0
@@ -117,7 +119,7 @@ rm -f "$HOOK_CANARY"
 echo "--- 1. classify does not auto-execute scripts in hooks/ ---"
 
 CLASSIFY_EXIT=0
-MINI_ORK_DRY_RUN=1 bash "$classify_bin" "$VALID_KICKOFF" --dry-run >/dev/null 2>&1 \
+MINI_ORK_DRY_RUN=1 "${classify_cmd[@]}" "$VALID_KICKOFF" --dry-run >/dev/null 2>&1 \
   || CLASSIFY_EXIT=$?
 
 if [[ -f "$HOOK_CANARY" ]]; then

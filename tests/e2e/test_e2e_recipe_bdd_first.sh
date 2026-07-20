@@ -36,8 +36,13 @@ fi
 
 # ── isolated project dir ──────────────────────────────────────────────────────
 TEST_DIR="$(mktemp -d /tmp/mini-ork-e2e-bdd-XXXXXX)"
+TEST_DIR="$(cd "$TEST_DIR" && pwd -P)"
 export MINI_ORK_HOME="$TEST_DIR/.mini-ork"
 export MINI_ORK_DB="$MINI_ORK_HOME/state.db"
+export MINI_ORK_ENGINE_ROOT="$MINI_ORK_ROOT"
+export MINI_ORK_PROJECT_HOME="$MINI_ORK_HOME"
+export MINI_ORK_TARGET_REPO="$TEST_DIR"
+unset MINI_ORK_RUN_DIR MINI_ORK_RUN_ID MINI_ORK_PLAN_PATH MINI_ORK_RECIPE MINI_ORK_TASK_CLASS
 trap 'rm -rf "$TEST_DIR"' EXIT
 
 echo "--- mini-ork init ---"
@@ -101,7 +106,8 @@ if [[ -f "$RECIPE_DIR/task_class.yaml" ]]; then
 fi
 
 export MINI_ORK_RUN_ID="run-e2e-bdd-001"
-CLASSIFY_OUT="$("$MINI_ORK_ROOT/bin/mini-ork-classify" --dry-run "$KICKOFF" 2>/dev/null)"
+CLASSIFY_OUT="$(PYTHONPATH="$MINI_ORK_ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+  python3 -m mini_ork.ported.mini_ork_classify --dry-run "$KICKOFF" 2>/dev/null)"
 CLASSIFY_EXIT=$?
 _assert "classify --dry-run exits 0" '[[ "$CLASSIFY_EXIT" -eq 0 ]]'
 _assert "classify emits task_class= line" '[[ "$CLASSIFY_OUT" == *task_class=* ]]'
