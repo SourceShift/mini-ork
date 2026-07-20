@@ -70,14 +70,14 @@ Dispatch table mapping mini-ork's 8 workflow node types to role-specific CN endp
 
 Public entry: `context_role_pack_md <role> <task_brief_path> [files_csv]` → emits multi-section markdown. Empty when CN unreachable or `MO_DISABLE_CN=1`.
 
-Unknown role → falls back to the generic `context_contextnest_atoms_md` from `context_assembler.sh`.
+Unknown role → falls back to `python3 -m mini_ork.context_assembler contextnest-atoms`.
 
 ### Planner pre-fetch (`bin/mini-ork-plan`)
 
 Inside the existing `MO_INJECT_LEARNINGS` block, runs in order:
 1. **PR-3** role pack for `planner` via `context_role_pack_md`
-2. Generic `context_contextnest_atoms_md` fallback (PR-1 capsule swap, then retrieve)
-3. `context_contextnest_recent_sessions_md` for file-touch history
+2. Native `contextnest_atoms_md` fallback (PR-1 capsule swap, then retrieve)
+3. Native `contextnest_recent_sessions_md` for file-touch history
 
 Step 1 is gated by `MO_USE_ROLE_PACKS=1` (default on); set to `0` to skip role packs and use only the generic path.
 
@@ -129,7 +129,7 @@ Plus the hermetic unit tests:
 
 ```bash
 bash tests/unit/test_cn_client.sh          # 10 cases, in-process http stub
-bash tests/unit/test_context_assembler.sh  # 9 cases incl. CN-disabled paths
+python3 -m pytest -q tests/unit/test_context_assembler_py.py
 ```
 
 All harnesses produce evidence files with per-assertion verdicts + captured outputs — a reviewer reads the evidence file before approving the PR.

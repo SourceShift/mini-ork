@@ -1,9 +1,4 @@
-"""Parity gate: mini_ork.context_assembler vs lib/context_assembler.sh (core).
-
-Byte-for-byte comparison of the two prompt blocks (failure modes, prior runs)
-against the LIVE bash emitters, and structural equality of the ContextPack
-(volatile keys assembled_at/tokens_estimated stripped) on the same seeded DB.
-"""
+"""Standalone contracts for the native context assembler."""
 from __future__ import annotations
 
 import json
@@ -20,9 +15,6 @@ REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
 from mini_ork import context_assembler as ca  # noqa: E402
 from mini_ork import trace_store  # noqa: E402
-
-CA_SH = REPO / "lib" / "context_assembler.sh"
-
 
 @pytest.fixture
 def db(tmp_path_factory):
@@ -49,25 +41,14 @@ def db(tmp_path_factory):
         trace_store.trace_write(
             {"trace_id": f"t{i}", "run_id": run, "task_class": "code-fix",
              "status": status, "cost_usd": 0.5, "duration_ms": 2000,
-             "agent_version_id": "minimax"}, db=dbp)
+             "agent_version_id": "codex"}, db=dbp)
     return dbp
 
 
-def _bash_fn(db, fn, *args, extra_env=None):
-    r = subprocess.run(
-        ["bash", "-c", f'. "{CA_SH}" && {fn} "$@"', "_", *args],
-        env={**os.environ, "MINI_ORK_DB": db, "MINI_ORK_ROOT": str(REPO),
-             **(extra_env or {})},
-        capture_output=True, text=True)
-    return r.stdout.rstrip("\n")
-
-
-def test_failure_modes_md_parity(db, monkeypatch):
+def test_failure_modes_md(db, monkeypatch):
     monkeypatch.setenv("MINI_ORK_DB", db)
     monkeypatch.delenv("MO_TARGET_CWD", raising=False)
     py = ca.failure_modes_md("code-fix", 5, db=db)
-    bash = _bash_fn(db, "context_failure_modes_md", "code-fix", "5")
-    assert py == bash
     assert "auth.middleware" in py and "lowconf.target" not in py
 
 
@@ -77,32 +58,25 @@ def test_failure_modes_project_scope_filter(db, monkeypatch, tmp_path):
     monkeypatch.setenv("MINI_ORK_ROOT", str(REPO))
     monkeypatch.setenv("MO_TARGET_CWD", str(tmp_path))
     py = ca.failure_modes_md("code-fix", 5, db=db)
-    bash = _bash_fn(db, "context_failure_modes_md", "code-fix", "5",
-                    extra_env={"MO_TARGET_CWD": str(tmp_path)})
-    assert py == bash
     assert "workflow.gate" not in py and "auth.middleware" in py
 
 
-def test_prior_runs_md_parity(db, monkeypatch):
+def test_prior_runs_md(db, monkeypatch):
     monkeypatch.setenv("MINI_ORK_DB", db)
     monkeypatch.delenv("MINI_ORK_RUN_ID", raising=False)
     py = ca.prior_runs_md("code-fix", 5, db=db)
-    bash = _bash_fn(db, "context_prior_runs_md", "code-fix", "5")
-    assert py == bash
     assert "r1: success" in py and "1/2 nodes failed" in py
 
 
-def test_context_assemble_parity(db, tmp_path, monkeypatch):
+def test_context_assemble_shape(db, tmp_path, monkeypatch):
     brief = tmp_path / "brief.json"
     brief.write_text(json.dumps({"task_class": "code-fix", "goal": "fix auth tests"}))
     monkeypatch.setenv("MINI_ORK_DB", db)
     py_pack = ca.context_assemble(str(brief), "implementer", db=db)
-    bash_out = _bash_fn(db, "context_assemble", str(brief), "implementer")
-    bash_pack = json.loads(bash_out)
-    for volatile in ("assembled_at", "tokens_estimated"):
-        py_pack.pop(volatile, None)
-        bash_pack.pop(volatile, None)
-    assert py_pack == bash_pack
+    assert py_pack["workflow_node"] == "implementer"
+    assert py_pack["task_brief"]["content"]["task_class"] == "code-fix"
+    assert py_pack["known_failure_modes"]
+    assert py_pack["prior_similar_runs"]
 
 
 def _seed_bug_lessons(db):
@@ -188,7 +162,7 @@ def _seed_emergent(db, rows):
 
 def test_verified_emergent_md_readback(db, monkeypatch):
     """failure_modes_md surfaces judge-gate 'approved' emergent patterns and
-    hides 'proposed' ones; bash and python md output stay byte-identical."""
+    hides 'proposed' ones."""
     monkeypatch.setenv("MINI_ORK_DB", db)
     monkeypatch.delenv("MO_TARGET_CWD", raising=False)
     _seed_emergent(db, [
@@ -198,8 +172,6 @@ def test_verified_emergent_md_readback(db, monkeypatch):
          ["adr"], 9.0, "proposed"),
     ])
     py = ca.failure_modes_md("code-fix", 5, db=db)
-    bash = _bash_fn(db, "context_failure_modes_md", "code-fix", "5")
-    assert py == bash
     assert "Verified emergent patterns" in py
     assert "empty verifier output means silent failure" in py
     # The 'proposed' (unverified) pattern must NOT reach the prompt.
@@ -208,31 +180,23 @@ def test_verified_emergent_md_readback(db, monkeypatch):
 
 def test_verified_emergent_optout_and_json(db, monkeypatch):
     """MO_EMERGENT_INJECT=0 suppresses the block; JSON pack carries approved rows
-    under verified_emergent_patterns with bash/python parity."""
+    under verified_emergent_patterns."""
     monkeypatch.setenv("MINI_ORK_DB", db)
     _seed_emergent(db, [
         ("emg-ok", "cross-run lesson", ["verifier_addition"], 6.0, "approved"),
     ])
-    # opt-out hides the md block on both sides
+    # opt-out hides the markdown block.
     monkeypatch.setenv("MO_EMERGENT_INJECT", "0")
     py_off = ca.failure_modes_md("code-fix", 5, db=db)
-    bash_off = _bash_fn(db, "context_failure_modes_md", "code-fix", "5",
-                        extra_env={"MO_EMERGENT_INJECT": "0"})
-    assert py_off == bash_off
     assert "Verified emergent patterns" not in py_off
     monkeypatch.delenv("MO_EMERGENT_INJECT", raising=False)
 
-    # JSON path: verified_emergent_patterns populated + parity.
+    # JSON path: verified_emergent_patterns populated.
     import tempfile
     brief = os.path.join(tempfile.mkdtemp(), "brief.json")
     with open(brief, "w") as f:
         f.write(json.dumps({"task_class": "code-fix", "goal": "x"}))
     pack = ca.context_assemble(brief, "implementer", db=db)
-    bash_out = _bash_fn(db, "context_assemble", brief, "implementer")
-    bpack = json.loads(bash_out)
-    for v in ("assembled_at", "tokens_estimated"):
-        pack.pop(v, None); bpack.pop(v, None)
-    assert pack == bpack
     ids = [e["cite"] for e in pack["verified_emergent_patterns"]]
     assert "emergent_patterns/emg-ok" in ids
 
@@ -246,3 +210,104 @@ def test_truncation_budget(db, tmp_path, monkeypatch):
     monkeypatch.delenv("MINI_ORK_CTX_BUDGET_TOKENS")
     assert pack.get("_truncated") is True
     assert "_truncation_summary" in pack
+
+
+class _FakeContextNest:
+    def __init__(self, capsule_text="", retrieved=None, sessions=None):
+        self.capsule_text = capsule_text
+        self.retrieved = retrieved or {"hits": []}
+        self.sessions = sessions or {}
+        self.calls = []
+
+    def available(self):
+        return True
+
+    def capsule(self, query, since):
+        self.calls.append(("capsule", query, since))
+        return self.capsule_text
+
+    def retrieve(self, query, limit):
+        self.calls.append(("retrieve", query, limit))
+        return json.dumps(self.retrieved)
+
+    def render_atoms_md(self, payload, limit):
+        from mini_ork import cn_client
+        return cn_client.render_atoms_md(payload, limit)
+
+    def sessions_by_file(self, path):
+        self.calls.append(("sessions", path))
+        return json.dumps(self.sessions.get(path, {}))
+
+
+def test_contextnest_atoms_capsule_and_retrieve_fallback(tmp_path, monkeypatch):
+    brief = tmp_path / "brief.json"
+    brief.write_text(json.dumps({
+        "title": "Authentication migration",
+        "description": "Repair session middleware",
+        "task_class": "code-fix",
+    }))
+    capsule = "# Prompt Context\n\n## Risks\n- expired sessions" + (" x" * 60)
+    client = _FakeContextNest(capsule_text=capsule)
+    rendered = ca.contextnest_atoms_md(str(brief), 4, client=client)
+    assert rendered.startswith("--- ContextNest capsule")
+    assert "expired sessions" in rendered
+    assert client.calls == [("capsule", "Authentication", "14d")]
+
+    fallback = _FakeContextNest(retrieved={"hits": [{
+        "similarity": 0.9,
+        "metadata": {"kind": "risk", "ts": "2026-07-20T00:00:00Z"},
+        "session_id": "session-1234",
+        "content": "session cookies can expire during migration",
+    }]})
+    rendered = ca.contextnest_atoms_md(str(brief), 4, client=fallback)
+    assert "ContextNest atoms" in rendered
+    assert "session cookies" in rendered
+    assert [call[0] for call in fallback.calls] == ["capsule", "retrieve"]
+
+    monkeypatch.setenv("MO_DISABLE_CN", "1")
+    assert ca.contextnest_atoms_md(str(brief), client=fallback) == ""
+
+
+def test_contextnest_recent_sessions_from_file_hints(tmp_path):
+    brief = tmp_path / "brief.json"
+    brief.write_text(json.dumps({
+        "files": ["src/auth.py", {"path": "tests/test_auth.py"}],
+    }))
+    client = _FakeContextNest(sessions={
+        "src/auth.py": {"sessions": [{
+            "session_id": "abcdef123456",
+            "last_seen": "2026-07-19T10:00:00Z",
+            "title": "Auth middleware repair",
+        }]},
+    })
+    rendered = ca.contextnest_recent_sessions_md(str(brief), 2, client=client)
+    assert "src/auth.py" in rendered
+    assert "abcdef12" in rendered
+    assert "tests/test_auth.py" not in rendered
+
+
+def test_operator_steering_render_and_consume(db, monkeypatch):
+    from mini_ork.ported import operator_steering
+
+    monkeypatch.setenv("MINI_ORK_RUN_ID", "run-context")
+    monkeypatch.setattr(operator_steering, "fetch_for", lambda run_id, role, db_path=None: [{
+        "severity": "critical",
+        "source": "operator",
+        "message": "Do not change the public schema",
+    }])
+    rendered = ca.operator_steering_md("planner", db=db)
+    assert "1 message(s)" in rendered
+    assert "[CRITICAL] (from operator) Do not change the public schema" in rendered
+
+
+def test_active_state_delegates_to_native_owner(db, monkeypatch):
+    from mini_ork.ported import active_state_index
+
+    calls = []
+    monkeypatch.setattr(
+        active_state_index,
+        "render_active_state_block",
+        lambda task_class, days, db_path: calls.append((task_class, days, db_path)) or "ACTIVE",
+    )
+    assert ca.active_state_md("code-fix", 14, db=db) == "ACTIVE"
+    assert calls == [("code-fix", 14, db)]

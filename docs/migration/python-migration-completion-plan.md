@@ -48,7 +48,6 @@ The "port" still shells to its own bash. Reimplement the shelled functions in Py
 ### 3. No port → port from scratch
 | lib | lines |
 |---|---|
-| `context_assembler` | 786 |
 | `trace_store` | — |
 | `lane_router` | ✅; reflect caller native | Bash callers/tests below the frontier remain |
 | `intervention_gate` | native execute extension point added; no shipped Bash hook existed |
@@ -63,7 +62,7 @@ A lib can only be `git rm`'d when **all** of these are clear — check by basena
 Coupling hubs to break first (each unblocks a group):
 - `tests/integration/test_meta_orchestrator_loop.sh` → epic_graph, topology, role_evolver (Python port `test_meta_orchestrator_loop_py.py` already written this session)
 - `tests/integration/test_gate_grounded_rejection.sh` → the 5 gates + gates_common (Python port already written)
-- `tests/integration/test_autonomous_epic_pipeline.sh` → epic_graph, context_assembler
+- `tests/integration/test_autonomous_epic_pipeline.sh` → epic_graph; its context assembler call is native
 - the e2e suites → promotion_gate, version_registry, trace_store, benchmark_suite
 
 ## Execution pattern (proven this session)
@@ -209,7 +208,7 @@ Per subsystem, in this order — **never a blind sweep** (a wrong port breaks ev
 ## Recommended order (ROI × safety)
 1. `llm-dispatch` boundary — biggest lever; do one caller at a time with real-LLM parity.
 2. Wrappers: `gate_registry` → then `gate_bootstrap` rewire; `lane-helpers`; `config_resolve`; `rho_aggregator`.
-3. No-ports: `context_assembler`, `trace_store`, `lane_router`, `intervention_gate`.
+3. Remaining ownership hubs: `trace_store`, `lane_router`, `intervention_gate`.
 4. Retirement cleanup: port the bash integration/e2e tests + repoint benchmark fixtures, then delete the freed bash.
 
 Realistic size: ~24K lines of remaining bash, most load-bearing. This is a multi-week, per-subsystem

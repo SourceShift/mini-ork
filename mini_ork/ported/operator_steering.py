@@ -41,7 +41,7 @@ _VALID_ROLES = ("planner", "implementer", "reviewer", "verifier", "any")
 _VALID_SEVERITIES = ("info", "warn", "critical")
 
 
-def _resolve_db() -> str:
+def _resolve_db(db_path: str | None = None) -> str:
     """Mirror ``_operator_steering_db`` in lib/operator_steering.sh:
 
         echo "${MINI_ORK_DB:-${MINI_ORK_HOME:-$(pwd)/.mini-ork}/state.db}"
@@ -50,6 +50,8 @@ def _resolve_db() -> str:
     cwd/.mini-ork/state.db. Tests always set MINI_ORK_DB via subprocess
     env= so the cwd fallback rarely fires.
     """
+    if db_path:
+        return db_path
     if "MINI_ORK_DB" in os.environ and os.environ["MINI_ORK_DB"]:
         return os.environ["MINI_ORK_DB"]
     if "MINI_ORK_HOME" in os.environ and os.environ["MINI_ORK_HOME"]:
@@ -152,7 +154,12 @@ def emit(
         con.close()
 
 
-def fetch_for(run_id: str, role: str = "any") -> list[dict]:
+def fetch_for(
+    run_id: str,
+    role: str = "any",
+    *,
+    db_path: str | None = None,
+) -> list[dict]:
     """Mirror ``operator_steering_fetch_for`` in lib/operator_steering.sh.
 
     Returns up to 10 unconsumed, unexpired steering rows for the given
@@ -167,7 +174,7 @@ def fetch_for(run_id: str, role: str = "any") -> list[dict]:
     the kickoff's "no fallbacks" constraint: silent return on missing
     DB IS the bash behavior, not a fallback).
     """
-    db = _resolve_db()
+    db = _resolve_db(db_path)
     if not os.path.isfile(db):
         return []
 

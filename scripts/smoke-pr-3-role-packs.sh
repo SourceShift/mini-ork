@@ -193,7 +193,6 @@ fi
 if [[ "$cn_code" == "200" ]]; then
   T6=$(cd "$MINI_ORK_ROOT" && bash -c '
     export MINI_ORK_ROOT="$PWD"
-    source lib/context_assembler.sh
     source lib/context_role_packs.sh
     context_role_pack_md "totally-unknown-role" "'"$KICKOFF"'" ""
   ' 2>&1)
