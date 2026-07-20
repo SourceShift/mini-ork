@@ -270,33 +270,18 @@ CREATE INDEX IF NOT EXISTS idx_my_ns_task ON my_namespace_records(task_id);
 
 Run `mini-ork init --migrate` to apply.
 
-### Option B — Override context assembly per task class
+### Option B — Extend native context assembly
 
-Drop an override script:
+Context assembly is owned by `mini_ork/context_assembler.py`. Add a bounded
+producer there and compose its result in `context_assemble()` or the relevant
+prompt helper. Keep database access parameterized with `db`, cite every emitted
+record, enforce `MINI_ORK_CTX_BUDGET_TOKENS`, and add standalone contracts in
+`tests/unit/test_context_assembler_py.py`.
 
-```bash
-# ${MINI_ORK_HOME}/config/context_assemblers/my_task_class.sh
-# Override lib/context_assembler.sh:context_assemble() for task class my_task_class
-
-context_assemble() {
-  local task_id="$1"
-  local budget_tokens="${MINI_ORK_CTX_BUDGET_TOKENS:-8000}"
-
-  # Call base assembler
-  source "${MINI_ORK_HOME}/lib/context_assembler.sh"
-  local base_ctx
-  base_ctx=$(context_assemble_base "$task_id" "$budget_tokens")
-
-  # Inject custom namespace records
-  local my_records
-  my_records=$(sqlite3 "${MINI_ORK_DB}" \
-    "SELECT content FROM my_namespace_records WHERE task_id='${task_id}' LIMIT 5")
-
-  printf '%s\n\n## Custom Context\n%s\n' "$base_ctx" "$my_records"
-}
-```
-
-The framework calls `context_assemble()` before dispatching each node. If a task-class override exists, it wins over the default implementation.
+There is no supported shell override directory. The previously documented
+`${MINI_ORK_HOME}/config/context_assemblers/*.sh` hook was never implemented by
+the runtime and was removed from the public configuration map when the Bash
+assembler was retired.
 
 ---
 

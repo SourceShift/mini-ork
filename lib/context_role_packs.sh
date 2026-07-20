@@ -28,7 +28,7 @@
 # CN_TIMEOUT_SEC * num_calls (default 8s * 4 = 32s worst case, far
 # under planner LLM wall-clock).
 #
-# Falls back to the generic context_contextnest_atoms_md output when:
+# Falls back to the native generic context-assembler output when:
 #   - role is unknown (no error, just generic)
 #   - CN is unreachable (silent empty)
 #   - all CN calls return empty (silent empty)
@@ -213,7 +213,7 @@ _role_pack_researcher() {
   query=$(_role_pack_extract_query "$task_brief_path")
   [ -z "$query" ] && return 0
 
-  # 1. Broad retrieve — semantic top-N (use the existing context_contextnest_atoms_md).
+  # 1. Broad retrieve — semantic top-N from the native context assembler.
   if declare -f cn_retrieve >/dev/null 2>&1; then
     local hits
     hits=$(cn_retrieve "$query" 8 2>/dev/null)
@@ -260,11 +260,16 @@ _role_pack_implementer() {
   local files_csv="${2:-}"
 
   # 1. Recent sessions per file in scope.
-  if [ -n "$files_csv" ] && declare -f context_contextnest_recent_sessions_md >/dev/null 2>&1; then
-    # Reuse the existing helper from context_assembler.sh.
+  if [ -n "$files_csv" ]; then
     if declare -f context_contextnest_recent_sessions_md >/dev/null 2>&1; then
       local rendered
       rendered=$(context_contextnest_recent_sessions_md "$task_brief_path" 4 2>/dev/null)
+      [ -n "$rendered" ] && printf '%s\n\n' "$rendered"
+    else
+      local rendered
+      rendered=$(PYTHONPATH="${MINI_ORK_ROOT}:${PYTHONPATH:-}" \
+        python3 -m mini_ork.context_assembler \
+          contextnest-recent-sessions "$task_brief_path" 4 2>/dev/null || true)
       [ -n "$rendered" ] && printf '%s\n\n' "$rendered"
     fi
   fi
@@ -432,7 +437,7 @@ _role_pack_publisher() {
 
 # desc: PUBLIC ENTRY POINT. Dispatch table mapping workflow node type
 #       to the appropriate sub-pack. Falls back to generic
-#       context_contextnest_atoms_md for unknown roles.
+#       the native context-assembler CLI for unknown roles.
 #
 #       Args:
 #         $1  role            (planner|researcher|implementer|worker|reviewer|verifier|reflector|publisher|rollback)
@@ -482,10 +487,13 @@ context_role_pack_md() {
       _role_pack_publisher "$task_brief_path"
       ;;
     *)
-      # Unknown role → fall back to the generic atoms_md helper
-      # from context_assembler.sh.
+      # Unknown role → fall back to the canonical native context helper.
       if declare -f context_contextnest_atoms_md >/dev/null 2>&1; then
         context_contextnest_atoms_md "$task_brief_path" 6
+      else
+        PYTHONPATH="${MINI_ORK_ROOT}:${PYTHONPATH:-}" \
+          python3 -m mini_ork.context_assembler \
+            contextnest-atoms "$task_brief_path" 6 2>/dev/null || true
       fi
       ;;
   esac

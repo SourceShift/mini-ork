@@ -142,6 +142,28 @@ also passed, while garden retained the existing missing operator env-var-doc
 warning. Refresh from promoted main and select the next inventory edge; the
 remaining context-assembler surface is the next item in this ownership group.
 
+The context-assembler ownership fork is now closed. The native
+`mini_ork.context_assembler` owns bounded packs, failure/prior-run blocks,
+ContextNest capsule/retrieve and recent-session helpers, operator-steering
+rendering, active-state injection, and a narrow module CLI for the Bash
+fixtures that remain below the frontier. Role-pack fallbacks and the autonomous
+epic/slice/smoke fixtures now call that native CLI; standalone pytest contracts
+replace the Bash oracle, and `lib/context_assembler.sh` plus its redundant Bash
+unit suite are removed. The focused context/role/steering suite passed 40
+tests, the autonomous epic pipeline passed 13 assertions, both slice-provider
+budget regimes completed, focused Pyright reported zero errors, and the
+repository-wide suite passed 1,850 tests with 13 expected skips and two
+unrelated deprecation warnings. Validation passed; garden retained only the
+pre-existing missing operator env-var-document warning. The rewired CN bridge
+and capsule-swap smokes passed 8 and 6 assertions, and the 13 MB oversized-input
+security test passed all 6 checks. The live role-pack smoke passed 7 of 8
+assertions because the current ContextNest corpus returned no reviewer slice;
+unchanged main produced the same result, while both CN-down contracts passed.
+A zero-reference executable scan is required at every future refresh;
+historical filenames remain in kickoff, changelog, research, and refactor
+records only. Continue from promoted main with the refreshed lower-level
+ownership inventory.
+
 ## Context
 
 The self-migrate recipe (PR #184, merged at commit 6bf438a) implements integration-point-first migration: close ONE fork (bash↔Python seam) at a time as a complete unit — make Python sole, repoint every inbound reference, retire bash entrypoint — gated on byte-parity, feature-acceptance, and static-feature ledger.

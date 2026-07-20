@@ -1,11 +1,10 @@
-"""Bounded ContextPack builder — Python port of lib/context_assembler.sh (core).
+"""Canonical bounded ContextPack builder and prompt-context helpers.
 
-Ported here: context_assemble (the ContextPack JSON builder with the rlm-6
+Owns context_assemble (the ContextPack JSON builder with the rlm-6
 slice-provider seam), failure_modes_md (the "Learned failure modes" prompt
 block, incl. the 2026-06-13 project-scope filter), prior_runs_md (per-RUN
 outcome memory block). The ContextNest capsule/retrieve wrappers and the
-operator-steering block call an external service / another lib and are ported
-separately (see tracker).
+operator-steering and active-state blocks delegate to their native owners.
 
 This module is the context-engine seam: what it emits is exactly what gets
 injected into planner/worker prompts, so an evolvable-playbook loop (GEPA-style
@@ -13,9 +12,11 @@ weight-free improvement) plugs in here by scoring which emitted lessons help.
 """
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import sqlite3
+import sys
 import time
 
 from mini_ork.similarity import rank_raw
@@ -78,7 +79,7 @@ SLICE_PROVIDERS = {"default": slice_provider_default, "paged": slice_provider_pa
 def context_assemble(task_brief_path: str, workflow_node: str,
                      db: str | None = None,
                      verifier_contract: dict | None = None) -> dict:
-    """Build the bounded ContextPack (same shape/keys as bash context_assemble)."""
+    """Build the canonical bounded ContextPack."""
     with open(task_brief_path, encoding="utf-8") as fh:
         brief_raw = fh.read()
     budget = int(os.environ.get("MINI_ORK_CTX_BUDGET_TOKENS", "64000"))
@@ -352,3 +353,180 @@ def prior_runs_md(task_class: str, limit: int = 5, db: str | None = None) -> str
         out.append(f"- {run_key}: {outcome} ({nodes} nodes, cost {cost_s}, {dur_s})")
     out.append("--- /prior runs ---")
     return "\n".join(out)
+
+
+def operator_steering_md(role: str, db: str | None = None) -> str:
+    """Consume and render operator guidance targeted at one agent role."""
+    from mini_ork.ported import operator_steering
+
+    rows = operator_steering.fetch_for(
+        os.environ.get("MINI_ORK_RUN_ID", ""), role, db_path=db
+    )
+    if not rows:
+        return ""
+    out = [
+        "--- Operator steering (injected supervisor guidance) ---",
+        f"{len(rows)} message(s) targeted at this node. Treat as load-bearing:",
+    ]
+    for row in rows:
+        severity = str(row.get("severity", "info")).upper()
+        source = row.get("source") or "unknown"
+        out.append(f"- [{severity}] (from {source}) {row.get('message', '')}")
+    out.append("--- /operator steering ---")
+    return "\n".join(out)
+
+
+def _contextnest_query(task_brief_path: str) -> str:
+    try:
+        with open(task_brief_path, encoding="utf-8") as fh:
+            raw = fh.read()
+    except OSError:
+        return ""
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return raw[:512].strip()
+    if not isinstance(data, dict):
+        return raw[:512].strip()
+    parts = [
+        value.strip()
+        for key in ("title", "objective", "description", "task_class")
+        if isinstance((value := data.get(key)), str) and value.strip()
+    ]
+    return " ".join(parts)[:600] if parts else raw[:512].strip()
+
+
+def _capsule_query(query: str) -> str:
+    for raw_token in query.split()[:5]:
+        token = raw_token.strip("`#*.,:;!?()[]{}\"'")
+        if len(token) >= 4 and any(char.isalnum() for char in token):
+            return token
+    return ""
+
+
+def contextnest_atoms_md(
+    task_brief_path: str,
+    limit: int = 5,
+    *,
+    client=None,
+) -> str:
+    """Render ContextNest capsule content, falling back to retrieved atoms."""
+    if os.environ.get("MO_DISABLE_CN", "0") == "1" or not os.path.isfile(task_brief_path):
+        return ""
+    from mini_ork import cn_client
+
+    client = client or cn_client
+    if not client.available():
+        return ""
+    query = _contextnest_query(task_brief_path)
+    if not query:
+        return ""
+    capsule = client.capsule(_capsule_query(query), "14d")
+    try:
+        min_chars = int(os.environ.get("CN_CAPSULE_MIN_CHARS", "100"))
+    except ValueError:
+        min_chars = 100
+    if len(capsule) > min_chars and any(
+        line.startswith("## ") for line in capsule.splitlines()
+    ):
+        return (
+            "--- ContextNest capsule (kind-ordered substrate digest) ---\n"
+            f"{capsule}\n"
+            "--- /ContextNest capsule ---\n"
+        )
+    return client.render_atoms_md(client.retrieve(query, int(limit)), int(limit))
+
+
+def contextnest_recent_sessions_md(
+    task_brief_path: str,
+    max_files: int = 3,
+    *,
+    client=None,
+) -> str:
+    """Render recent ContextNest sessions for file hints in a task brief."""
+    if os.environ.get("MO_DISABLE_CN", "0") == "1" or not os.path.isfile(task_brief_path):
+        return ""
+    from mini_ork import cn_client
+
+    client = client or cn_client
+    if not client.available():
+        return ""
+    try:
+        with open(task_brief_path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except Exception:
+        return ""
+    candidates: list[str] = []
+    if isinstance(data, dict):
+        for key in ("files", "paths", "relevant_files", "targets"):
+            value = data.get(key)
+            if not isinstance(value, list):
+                continue
+            for item in value:
+                if isinstance(item, str):
+                    candidates.append(item)
+                elif isinstance(item, dict):
+                    path = item.get("path") or item.get("file") or item.get("name")
+                    if isinstance(path, str):
+                        candidates.append(path)
+    sections: list[str] = []
+    for path in candidates[: int(max_files)]:
+        try:
+            payload = json.loads(client.sessions_by_file(path))
+        except Exception:
+            continue
+        sessions = payload.get("sessions") or payload.get("hits") or []
+        if not sessions:
+            continue
+        lines = [f"- File `{path}` recently touched in:"]
+        for session in sessions[:3]:
+            session_id = session.get("session_id") or session.get("id", "")
+            timestamp = (session.get("last_seen") or session.get("ts") or "")[:10]
+            title = (session.get("title") or session.get("intent") or "").strip()[:80]
+            lines.append(f"  - {session_id[:8]} ({timestamp}) {title}")
+        sections.extend(lines)
+    if not sections:
+        return ""
+    return (
+        "--- ContextNest: recent sessions for relevant files ---\n"
+        + "\n".join(sections)
+        + "\n--- /ContextNest: recent sessions ---\n"
+    )
+
+
+def active_state_md(task_class: str = "__any__", days: int = 30, db: str | None = None) -> str:
+    """Render the native active-state index for prompt injection."""
+    if os.environ.get("MO_DISABLE_ACTIVE_STATE", "0") == "1":
+        return ""
+    from mini_ork.ported.active_state_index import render_active_state_block
+
+    return render_active_state_block(task_class, days, db_path=db)
+
+
+def main(argv: list[str] | None = None) -> int:
+    """CLI used by shell integration fixtures while their owners remain Bash."""
+    parser = argparse.ArgumentParser(prog="python -m mini_ork.context_assembler")
+    sub = parser.add_subparsers(dest="command", required=True)
+    assemble = sub.add_parser("assemble")
+    assemble.add_argument("task_brief_path")
+    assemble.add_argument("workflow_node")
+    atoms = sub.add_parser("contextnest-atoms")
+    atoms.add_argument("task_brief_path")
+    atoms.add_argument("limit", nargs="?", type=int, default=5)
+    recent = sub.add_parser("contextnest-recent-sessions")
+    recent.add_argument("task_brief_path")
+    recent.add_argument("max_files", nargs="?", type=int, default=3)
+    args = parser.parse_args(argv)
+    if args.command == "assemble":
+        print(json.dumps(context_assemble(args.task_brief_path, args.workflow_node)))
+    elif args.command == "contextnest-atoms":
+        sys.stdout.write(contextnest_atoms_md(args.task_brief_path, args.limit))
+    else:
+        sys.stdout.write(
+            contextnest_recent_sessions_md(args.task_brief_path, args.max_files)
+        )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

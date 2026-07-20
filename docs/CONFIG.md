@@ -41,7 +41,6 @@ ${MINI_ORK_HOME}/
     utility_functions/      # per-class utility score overrides (optional)
       db_migration.sh
 
-    context_assemblers/     # per-class context assembly overrides (optional)
       research_synthesis.sh
 
     safety.yaml             # immutable safety constraints

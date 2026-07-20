@@ -8,7 +8,7 @@
 #           broken engine (never compound a break across a self-migration).
 #
 # Excludes the highest-risk runtime-core (llm-dispatch 2000L, decision_service
-# routing-brain, context_assembler no-port) — those need reviewed handling, not
+# routing-brain and other runtime-core giants) — those need reviewed handling, not
 # blind auto-land.  Detached; logs to $LOG.  Cost is bounded by framework-edit's
 # own $50/day circuit.
 set -uo pipefail
