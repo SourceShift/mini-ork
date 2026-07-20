@@ -105,6 +105,72 @@ def test_context_assemble_parity(db, tmp_path, monkeypatch):
     assert py_pack == bash_pack
 
 
+def _seed_bug_lessons(db):
+    con = sqlite3.connect(db)
+    now = int(time.time())
+    rows = [
+        (f"similar-{index}", "auth middleware failure", f"fix-{index}")
+        for index in range(1, 5)
+    ]
+    con.executemany(
+        """INSERT INTO bug_reports (
+               fingerprint, agent_role, title, description, suggested_fix,
+               first_seen_at, last_seen_at, updated_at
+           ) VALUES (?, 'reviewer', ?, '', ?, ?, ?, ?)""",
+        [(fingerprint, title, fix, now, now, now) for fingerprint, title, fix in rows],
+    )
+    con.execute(
+        """INSERT INTO bug_reports (
+               fingerprint, agent_role, title, description, suggested_fix,
+               first_seen_at, last_seen_at, updated_at
+           ) VALUES ('unrelated', 'reviewer', 'database backup rotation', '',
+                     'not relevant', ?, ?, ?)""",
+        (now, now, now),
+    )
+    con.commit()
+    con.close()
+
+
+def test_similar_lessons_shape_threshold_top_three_and_stable_ties(
+        db, tmp_path, monkeypatch):
+    _seed_bug_lessons(db)
+    brief = tmp_path / "brief.json"
+    brief.write_text(json.dumps({
+        "task_class": "code-fix",
+        "goal": "auth middleware failure",
+    }))
+    monkeypatch.setenv("MINI_ORK_DB", db)
+
+    pack = ca.context_assemble(str(brief), "implementer", db=db)
+    bugs = [lesson for lesson in pack["similar_lessons"] if lesson["kind"] == "bug"]
+
+    assert len(bugs) == 3
+    assert [lesson["suggested_fix"] for lesson in bugs] == ["fix-1", "fix-2", "fix-3"]
+    assert all(set(lesson) == {"cite", "kind", "score", "title", "suggested_fix"}
+               for lesson in bugs)
+    assert all(lesson["score"] >= 0.15 for lesson in bugs)
+    assert all(lesson["title"] == "auth middleware failure" for lesson in bugs)
+    assert all("unrelated" not in lesson["title"] for lesson in bugs)
+
+
+def test_similar_lessons_skip_missing_source_table(db, tmp_path, monkeypatch):
+    con = sqlite3.connect(db)
+    con.execute("DROP TABLE bug_reports")
+    con.commit()
+    con.close()
+    brief = tmp_path / "brief.json"
+    brief.write_text(json.dumps({
+        "task_class": "code-fix",
+        "goal": "tests skipped silently",
+    }))
+    monkeypatch.setenv("MINI_ORK_DB", db)
+
+    pack = ca.context_assemble(str(brief), "implementer", db=db)
+
+    assert isinstance(pack["similar_lessons"], list)
+    assert any(lesson["kind"] == "gradient" for lesson in pack["similar_lessons"])
+
+
 def _seed_emergent(db, rows):
     """rows: (pattern_id, cluster_label, features_list, strength, status)."""
     con = sqlite3.connect(db)

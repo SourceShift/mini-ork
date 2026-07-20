@@ -14,12 +14,11 @@ weight-free improvement) plugs in here by scoring which emitted lessons help.
 from __future__ import annotations
 
 import json
-import math
 import os
-import re
 import sqlite3
 import time
-from collections import Counter
+
+from mini_ork.similarity import rank_raw
 
 FRAMEWORK_INTERNAL_PREFIXES = (
     "workflow.", "verifier.", "gate.", "recipe.",
@@ -171,23 +170,6 @@ def context_assemble(task_brief_path: str, workflow_node: str,
             brief.get("description", "") if isinstance(brief, dict) else "",
             task_class]))
 
-        def _stok(s):
-            s = (s or "").lower()
-            s = re.sub(r"[^\w./_-]+", " ", s)
-            return [t for t in s.split() if len(t) >= 3]
-
-        def _stf(toks):
-            c = Counter(toks)
-            total = sum(c.values()) or 1
-            return {t: cnt / total for t, cnt in c.items()}
-
-        def _scos(a, b):
-            keys = set(a) | set(b)
-            dot = sum(a.get(k, 0) * b.get(k, 0) for k in keys)
-            na = math.sqrt(sum(v * v for v in a.values()))
-            nb = math.sqrt(sum(v * v for v in b.values()))
-            return dot / (na * nb) if na and nb else 0.0
-
         for tbl, col, kind in (("bug_reports", "title", "bug"),
                                ("gradient_records", "signal", "gradient"),
                                ("learning_record", "title", "learning")):
@@ -196,20 +178,12 @@ def context_assemble(task_brief_path: str, workflow_node: str,
                     f"SELECT rowid AS rid, * FROM {tbl} LIMIT 2000").fetchall()
             except sqlite3.OperationalError:
                 continue
-            docs = [_stok((r[col] or "")) for r in rows]
-            df = Counter()
-            for d in docs:
-                for t in set(d):
-                    df[t] += 1
-            n = max(len(docs), 1)
-            idf = {t: math.log(1.0 + n / (1 + c)) for t, c in df.items()}
-
-            def _svec(toks):
-                return {t: w * idf.get(t, 0.0) for t, w in _stf(toks).items()}
-            q_vec = _svec(_stok(query_text))
-            scored = [(s, r) for r, d in zip(rows, docs)
-                      if (s := _scos(q_vec, _svec(d))) >= 0.15]
-            scored.sort(reverse=True, key=lambda p: p[0])
+            docs = [(r[col] or "") for r in rows]
+            scored = [
+                (score, rows[index])
+                for score, index in rank_raw(query_text, docs)
+                if score >= 0.15
+            ]
             for s, r in scored[:3]:
                 similar_lessons.append({
                     "cite": f"{tbl}/{r['rid']}", "kind": kind,
