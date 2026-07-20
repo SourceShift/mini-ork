@@ -1,6 +1,6 @@
 """Native reflection pipeline sub-routines.
 
-The 8 public functions retain the Bash-era stdout, stderr, database, and exit
+The public functions retain the Bash-era stdout, stderr, database, and exit
 contracts. Pre-retirement parity remains covered against the Bash library while
 the supported public reflect path uses this module in process.
 
@@ -15,6 +15,8 @@ Pipeline map (bash function → Python):
   reflection_summarize_patterns → reflection_summarize_patterns
   reflection_suggest_promotions → reflection_suggest_promotions
   reflection_persist_suggestions→ reflection_persist_suggestions
+  reflection_apply_per_node_credit   → reflection_apply_per_node_credit
+  reflection_restore_per_node_credit → reflection_restore_per_node_credit
   reflection_run                → reflection_run
 """
 from __future__ import annotations
@@ -36,6 +38,8 @@ __all__ = [
     "reflection_suggest_promotions",
     "reflection_persist_suggestions",
     "reflection_verify_patterns",
+    "reflection_apply_per_node_credit",
+    "reflection_restore_per_node_credit",
     "reflection_run",
 ]
 
@@ -128,6 +132,7 @@ def _extract_trace_ids_sql(db_path: str, since_ts: int, batch: int) -> list[str]
         rows = con.execute(
             "SELECT trace_id FROM execution_traces "
             "WHERE CAST(strftime('%s', created_at) AS INTEGER) >= ? "
+            "AND (task_class IS NULL OR substr(task_class, 1, 2) != '__') "
             "ORDER BY created_at LIMIT ?",
             (int(since_ts), int(batch)),
         ).fetchall()
@@ -493,8 +498,14 @@ def reflection_extract_gradients(since_ts: int = 0) -> None:
         os.environ.get("MINI_ORK_DB", ""), int(since_ts), int(os.environ.get("MO_REFLECTION_BATCH", 500))
     )
     extracted = 0
+    skipped_watermark = 0
     for tid in trace_ids:
         if not tid:
+            continue
+        from mini_ork.ported import gradient_extractor
+
+        if gradient_extractor.has_watermark(tid):
+            skipped_watermark += 1
             continue
         for gradient in _gradient_extract(tid):
             if not gradient:
@@ -506,10 +517,98 @@ def reflection_extract_gradients(since_ts: int = 0) -> None:
                 pass
             print(gradient)
             extracted += 1
+    if skipped_watermark:
+        print(
+            "reflection_extract_gradients: skipped "
+            f"{skipped_watermark} already-extracted trace(s) (watermark)",
+            file=sys.stderr,
+        )
     print(
         f"reflection_extract_gradients: extracted {extracted} gradients since {since_ts}",
         file=sys.stderr,
     )
+
+
+def reflection_apply_per_node_credit(db_path: str | None = None) -> int:
+    """Temporarily reweight ``reward_g`` using verifier process rewards.
+
+    Originals are saved in a transient side table so the lane router can
+    consume the adjusted values without changing the durable trace record.
+    Returns the number of adjusted rows; all unsupported-schema cases are
+    fail-open no-ops, matching the legacy reflection side channel.
+    """
+    if os.environ.get("MO_ROUTER_PER_NODE_CREDIT", "0") != "1":
+        return 0
+    resolved = db_path or os.environ.get("MINI_ORK_DB")
+    if not resolved or not os.path.isfile(resolved):
+        return 0
+    try:
+        gamma = float(os.environ.get("MO_ROUTER_PER_NODE_CREDIT_GAMMA", "1.0"))
+    except (TypeError, ValueError):
+        gamma = 1.0
+    gamma = max(0.0, min(2.0, gamma))
+
+    con = _connect(resolved)
+    try:
+        cols = {row[1] for row in con.execute("PRAGMA table_info(execution_traces)")}
+        if not {"reward_g", "process_reward"}.issubset(cols):
+            return 0
+        con.execute(
+            "CREATE TABLE IF NOT EXISTS per_node_credit_backup ("
+            "id INTEGER PRIMARY KEY, original_reward_g REAL NOT NULL)"
+        )
+        con.execute(
+            "INSERT OR REPLACE INTO per_node_credit_backup (id, original_reward_g) "
+            "SELECT rowid, reward_g FROM execution_traces "
+            "WHERE reward_g IS NOT NULL AND process_reward IS NOT NULL"
+        )
+        rows = con.execute(
+            "SELECT rowid, reward_g, process_reward FROM execution_traces "
+            "WHERE reward_g IS NOT NULL AND process_reward IS NOT NULL"
+        ).fetchall()
+        updated = 0
+        for rowid, reward_g, process_reward in rows:
+            try:
+                weight = 1.0 + gamma * (float(process_reward) - 0.5)
+                effective = max(-1.0, min(1.0, float(reward_g) * weight))
+            except (TypeError, ValueError):
+                continue
+            con.execute(
+                "UPDATE execution_traces SET reward_g=? WHERE rowid=?",
+                (round(effective, 6), rowid),
+            )
+            updated += 1
+        con.commit()
+        return updated
+    except sqlite3.OperationalError:
+        return 0
+    finally:
+        con.close()
+
+
+def reflection_restore_per_node_credit(db_path: str | None = None) -> int:
+    """Restore rewards saved by :func:`reflection_apply_per_node_credit`."""
+    resolved = db_path or os.environ.get("MINI_ORK_DB")
+    if not resolved or not os.path.isfile(resolved):
+        return 0
+    con = _connect(resolved)
+    try:
+        try:
+            rows = con.execute(
+                "SELECT id, original_reward_g FROM per_node_credit_backup"
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return 0
+        for rowid, original in rows:
+            con.execute(
+                "UPDATE execution_traces SET reward_g=? WHERE rowid=?",
+                (original, rowid),
+            )
+        con.execute("DROP TABLE IF EXISTS per_node_credit_backup")
+        con.commit()
+        return len(rows)
+    finally:
+        con.close()
 
 
 def reflection_deduplicate(gradients_table: str = "gradient_records") -> None:
