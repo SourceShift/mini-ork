@@ -31,9 +31,9 @@ The port is already native; the engine just calls the bash instead. Rewire = rep
 | lib | port native? | engine shell-out site | note |
 |---|---|---|---|
 | `decision_service` | ✅ | execute.py | **DONE** (PR #179) |
-| `llm-dispatch` | ✅ (native on execute, invoke-prompt, profile_answerer.py, pre_push_review.py, and comparative-opinions) | Bash review/profile libraries, reflection/gradient and fixtures | Four Python callers plus the comparative research script are rewired; migrate remaining callers one at a time with real-provider evidence |
+| `llm-dispatch` | ✅ (native on execute, invoke-prompt, profile_answerer.py, pre_push_review.py, comparative-opinions, and reflection gradients) | Bash review library and fixtures | The reflection gradient boundary is native; close remaining review/test callers before retiring the dispatcher |
 | `gate_bootstrap` | ✅ | non-execute callers | Execute now uses native bootstrap/registry behavior; retire the Bash lib only after every other caller moves |
-| `gradient_extractor` | partial | reflection_pipeline.py | LLM-backed `gradient_extract` intentionally not ported (shells to claude) — needs porting that too |
+| `gradient_extractor` | ✅ | none in supported Python path | Native dispatch, framework filtering, and per-trace watermark are closed; Bash library/tests await physical retirement |
 
 ### 2. Wrapper ports → native-ize first (real porting), then rewire
 The "port" still shells to its own bash. Reimplement the shelled functions in Python.
@@ -50,7 +50,7 @@ The "port" still shells to its own bash. Reimplement the shelled functions in Py
 |---|---|
 | `context_assembler` | 786 |
 | `trace_store` | — |
-| `lane_router` | — |
+| `lane_router` | ✅; reflect caller native | Bash callers/tests below the frontier remain |
 | `intervention_gate` | native execute extension point added; no shipped Bash hook existed |
 
 ### 4. Retirement blockers (even after the port is native)
@@ -166,6 +166,21 @@ Per subsystem, in this order — **never a blind sweep** (a wrong port breaks ev
   MiniMax or DeepSeek request ran.
 - This closes the production caller edge. The Bash gradient/reflection libraries
   and their Bash tests remain until the independent retirement fork closes.
+
+### Completed contract unit: reflection retirement prerequisites — 2026-07-20
+
+- Framework-internal `__*` traces are excluded before gradient dispatch, and
+  an evidence watermark makes overlapping reflection windows idempotent.
+- D5 per-node credit apply/restore is native, gamma-clamped, transient, and
+  restored in a `finally` block around router recomputation.
+- The public reflect entrypoint calls `mini_ork.lane_router` directly; it no
+  longer sources `lib/lane_router.sh` for this side channel.
+- Thirty-three focused Python tests, 23 legacy contract checks, focused
+  Pyright, reflect acceptance, and validation passed; the one legacy skip and
+  garden warning are unchanged environment/documentation baselines.
+- Physical deletion remains a separate fork because unique Bash semantic
+  dedup, writeback, integration, and E2E contracts must first become
+  standalone Python tests.
 
 ## Tooling
 - **framework-edit** must use a dedicated temporary runtime home with only

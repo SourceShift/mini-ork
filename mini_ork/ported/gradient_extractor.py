@@ -95,6 +95,36 @@ def _connect(db: str | None) -> sqlite3.Connection:
     return con
 
 
+def is_framework_agent(task_class: str | None) -> bool:
+    """Return whether ``task_class`` is reserved for framework self-work.
+
+    Framework traces use the ``__name__`` namespace and are operational
+    telemetry rather than evidence from a user task.  Reflection must exclude
+    them before paying for gradient extraction.
+    """
+    return bool(task_class and task_class.startswith("__"))
+
+
+def has_watermark(trace_id: str, db: str | None = None) -> bool:
+    """Return whether a gradient already names ``trace_id`` as evidence.
+
+    A missing ``gradient_records`` table is the fresh-database case and means
+    the trace has not been processed yet.
+    """
+    con = _connect(db)
+    try:
+        try:
+            row = con.execute(
+                "SELECT 1 FROM gradient_records WHERE evidence=? LIMIT 1",
+                (trace_id,),
+            ).fetchone()
+        except sqlite3.OperationalError:
+            row = None
+    finally:
+        con.close()
+    return row is not None
+
+
 def init_schema(db: str | None = None) -> None:
     """Ensure gradient_records exists, mirroring _gradient_ensure_table."""
     con = _connect(db)

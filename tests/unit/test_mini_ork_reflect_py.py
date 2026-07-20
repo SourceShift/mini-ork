@@ -210,6 +210,7 @@ def test_happy_path_default():
     assert any("[pattern_miner]" in ln for ln in rp_lines)
     assert any("[cross_epic_gradient]" in ln for ln in rp_lines)
     assert any("[bug_report_sweep]" in ln for ln in rp_lines)
+    assert any("[lane_router]" in ln for ln in rp_lines)
 
     cp = _row_counts(fresh_py_db)
     # The 2 trace-A/trace-B seed rows plus the reflect trace row gives >=3
