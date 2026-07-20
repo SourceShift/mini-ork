@@ -132,7 +132,7 @@ experience and feeds it forward:
 | `mini-ork-topology` | Panel topology measurement |
 | `mini-ork-self-improve` | Wall-clock-budgeted self-improvement driver |
 | `mini-ork-serve` | Observability UI server |
-| `mini-ork-invoke-prompt` | Single-prompt lane dispatch utility |
+| `mini-ork-invoke-prompt` | Python-owned single-prompt lane dispatch utility |
 
 ### Substrate
 

@@ -1,4 +1,4 @@
-"""mini_ork/ported/mini_ork_invoke_prompt — Python port of bin/mini-ork-invoke-prompt.
+"""Native implementation of the ``mini-ork-invoke-prompt`` utility.
 
 Bash-side contract this port mirrors (verbatim from bin/mini-ork-invoke-prompt):
   - Inputs (env, NOT positional): MINI_ORK_PROMPT_FILE (required),
@@ -8,27 +8,29 @@ Bash-side contract this port mirrors (verbatim from bin/mini-ork-invoke-prompt):
   - Placeholder substitution: {{[A-Z][A-Z0-9_]*}} -> os.environ[name]; missing
     var leaves the token verbatim (matches bash's `os.environ.get(name,
     match.group(0))` heredoc).
-  - llm-dispatch + trace-store peers are NOT ported; we delegate to bash
-    subprocesses for those two calls (strangler-fig: bash is single source of
-    truth). context_role_packs IS ported and imported directly.
+  - LLM dispatch is owned by ``mini_ork.ported.llm_dispatch``. Trace-store is
+    still a Bash peer and remains a separate migration seam.
   - Exit codes: 0 success, 1 llm-failure, 2 bad-args (prompt file missing OR
-    env var unset), 3 missing-lib (lib/llm-dispatch.sh not present).
+    env var unset).
   - Output: bash's `RESPONSE=$(... 2>&1)` strips trailing newlines, then
     `printf '%s\\n' "$RESPONSE"` adds one back. This port mirrors via
     `response.rstrip('\\n') + '\\n'` so multi-newline LLM outputs remain
     byte-equal across backends.
-  - Stderr merging: bash uses `$(... 2>&1)`; subprocess calls use
-    `stderr=subprocess.STDOUT` to capture the same merged stream.
+  - Stderr merging: the native dispatcher's stdout and stderr are redirected
+    to the same buffer, preserving the former shell ``2>&1`` contract.
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
+import io
 import os
 import re
 import shlex
 import subprocess
 import sys
 import time as _time
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -130,34 +132,44 @@ def _trace_write(mini_ork_root: Path, payload: str, env: dict) -> None:
         return
 
 
+@contextlib.contextmanager
+def _temporary_environ(env: dict[str, str]) -> Iterator[None]:
+    """Expose a subprocess-style environment to an in-process native call."""
+    previous = dict(os.environ)
+    os.environ.clear()
+    os.environ.update(env)
+    try:
+        yield
+    finally:
+        os.environ.clear()
+        os.environ.update(previous)
+
+
 def _llm_dispatch(
     mini_ork_root: Path,
     task_class: str,
     node_type: str,
     prompt_text: str,
     env: dict,
+    dispatch_fn: Optional[Callable[..., int]] = None,
 ) -> Tuple[int, str]:
-    """Delegate to bash llm_dispatch (not yet ported). Returns (rc, merged_stdout).
+    """Call the native dispatcher and return its former merged-stream result."""
+    from mini_ork.ported import llm_dispatch as native_dispatch
 
-    Mirrors bash's `RESPONSE=$(llm_dispatch ... 2>&1)` via stderr=STDOUT so the
-    captured string is byte-equal to what bash command-substitution saw. When
-    the lib is missing, mirrors bash's `_require_lib` stderr message + rc=3.
-    """
-    lib = mini_ork_root / "lib" / "llm-dispatch.sh"
-    if not lib.is_file():
-        print("lib/llm-dispatch.sh not present", file=sys.stderr)
-        return 3, ""
-    cmd = (
-        f'. "{lib}" && llm_dispatch '
-        f'--task-class {shlex.quote(task_class)} '
-        f'--node-type {shlex.quote(node_type)} '
-        f'--prompt-text {shlex.quote(prompt_text)}'
-    )
-    res = subprocess.run(
-        ["bash", "-c", cmd],
-        env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-    )
-    return res.returncode, res.stdout
+    combined = io.StringIO()
+    try:
+        with _temporary_environ(env), contextlib.redirect_stdout(combined), \
+                contextlib.redirect_stderr(combined):
+            rc = native_dispatch.llm_dispatch(
+                ["--task-class", task_class, "--node-type", node_type,
+                 "--prompt-text", prompt_text],
+                root=str(mini_ork_root),
+                dispatch_fn=dispatch_fn,
+            )
+    except Exception as exc:
+        combined.write(f"llm_dispatch: {exc}\n")
+        rc = 1
+    return rc, combined.getvalue()
 
 
 def invoke(
@@ -167,8 +179,9 @@ def invoke(
     mini_ork_root: Optional[str | Path] = None,
     state_db: Optional[str | Path] = None,
     env: Optional[dict] = None,
+    dispatch_fn: Optional[Callable[..., int]] = None,
 ) -> Tuple[int, str]:
-    """Mirror bin/mini-ork-invoke-prompt. Returns (rc, response_text).
+    """Invoke one prompt through the native lane dispatcher.
 
     Args:
         prompt_file: path to the prompt .md (defaults to $MINI_ORK_PROMPT_FILE).
@@ -176,9 +189,10 @@ def invoke(
         task_class: defaults to $MINI_ORK_TASK_CLASS or "generic".
         mini_ork_root: defaults to $MINI_ORK_ROOT or repo root (2 parents up).
         state_db: optional override for $MINI_ORK_DB (for trace routing).
-        env: subprocess env; defaults to os.environ with overrides applied.
+        env: invocation environment; defaults to os.environ with overrides.
+        dispatch_fn: injectable model-provider boundary used by tests.
 
-    Exit codes: 0 success, 1 llm-failure, 2 bad-args, 3 missing-lib.
+    Exit codes: 0 success, 1 llm-failure, 2 bad-args.
     """
     root = _resolve_root(mini_ork_root)
     nt = _resolve_node_type(node_type)
@@ -206,7 +220,8 @@ def invoke(
 
     # Pure prompt build.
     try:
-        prompt_text = _build_prompt_text(prompt_path, nt, root)
+        with _temporary_environ(sub_env):
+            prompt_text = _build_prompt_text(prompt_path, nt, root)
     except FileNotFoundError:
         print(f"prompt not found: {pf}", file=sys.stderr)
         return 2, ""
@@ -227,11 +242,9 @@ def invoke(
     _trace_write(root, running_payload, sub_env)
 
     # Invoke llm_dispatch.
-    rc, response = _llm_dispatch(root, tc, nt, prompt_text, sub_env)
-    if rc == 3:
-        # bash's `_require_lib llm-dispatch` exits 3 BEFORE the llm_dispatch
-        # call. Propagate rc=3 here so parity matches when the lib is missing.
-        return 3, response
+    rc, response = _llm_dispatch(
+        root, tc, nt, prompt_text, sub_env, dispatch_fn=dispatch_fn,
+    )
     if rc != 0:
         print(f"[invoke-prompt] LLM dispatch failed for {nt}", file=sys.stderr)
         failure_payload = (
