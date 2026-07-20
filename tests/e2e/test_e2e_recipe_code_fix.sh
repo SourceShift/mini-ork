@@ -156,12 +156,12 @@ fi
 echo ""
 echo "--- mini-ork execute (dry-run) ---"
 
-EXECUTE_OUT="$("$MINI_ORK_ROOT/bin/mini-ork-execute" 2>/dev/null || echo '[execute-skipped]')"
+EXECUTE_OUT="$("$MINI_ORK_ROOT/bin/mini-ork" execute 2>/dev/null || echo '[execute-skipped]')"
 # execute may not exist yet or may require further setup in dry-run — accept 0 or presence
-if [[ -x "$MINI_ORK_ROOT/bin/mini-ork-execute" ]]; then
+if [[ -x "$MINI_ORK_ROOT/bin/mini-ork" ]]; then
   _assert "execute script exists and ran" '[[ -n "${EXECUTE_OUT:-}" ]]'
 else
-  _skip "mini-ork-execute not found — execute step skipped"
+  _skip "public mini-ork CLI not found — execute step skipped"
 fi
 
 echo ""

@@ -278,6 +278,7 @@ def mo_llm_dispatch(model, prompt, out_file, timeout_s=1500, max_turns=60) -> in
     try:
         open(out_file, "w", encoding="utf-8").write(res.text)
         open(out_file + ".cost", "w", encoding="utf-8").write(f"{res.cost_usd:.6f}")
+        open(out_file + ".model", "w", encoding="utf-8").write(res.model or lanes[0])
     except OSError:
         pass
     u = res.usage
@@ -397,7 +398,12 @@ def llm_dispatch(argv=None, *, root=None, dispatch_fn=None) -> int:
             continue
         break
 
-    provider = provider_for_model(model)
+    selected_model = str(model).split(",", 1)[0].strip()
+    try:
+        selected_model = open(out_file + ".model", encoding="utf-8").read().strip() or selected_model
+    except OSError:
+        pass
+    provider = provider_for_model(selected_model)
     feature = f"mini-ork:{node_type or 'unknown'}"
     actor = os.environ.get("MO_LANE_ACTOR") or node_type or os.environ.get("USER", "unknown")
     tier = os.environ.get("MO_LANE_TIER", "default")
@@ -414,7 +420,7 @@ def llm_dispatch(argv=None, *, root=None, dispatch_fn=None) -> int:
         if os.path.isfile(out_file + ".tokens"):
             parts = (open(out_file + ".tokens").read().split("\t") + ["0"] * 4)[:4]
             in_tok, out_tok, cached_in, cache_create = (_int_or(p, 0) for p in parts)
-        write_llm_calls_row(db, provider, model, tier, feature, actor, "success",
+        write_llm_calls_row(db, provider, selected_model, tier, feature, actor, "success",
                             duration_ms, cost_usd, "", in_tok, out_tok, "{}", cached_in, cache_create)
         run_dir = os.environ.get("MINI_ORK_RUN_DIR", "")
         if os.path.isfile(out_file + ".cost") and run_dir:
@@ -423,7 +429,7 @@ def llm_dispatch(argv=None, *, root=None, dispatch_fn=None) -> int:
                 os.remove(out_file + ".cost")
             except OSError:
                 pass
-        for side in (out_file + ".tokens",):
+        for side in (out_file + ".tokens", out_file + ".model"):
             try:
                 os.remove(side)
             except OSError:
@@ -443,8 +449,12 @@ def llm_dispatch(argv=None, *, root=None, dispatch_fn=None) -> int:
     except OSError:
         pass
     err = redact_secrets(err)
-    write_llm_calls_row(db, provider, model, tier, feature, actor, "failed", 0, 0, err)
+    write_llm_calls_row(db, provider, selected_model, tier, feature, actor, "failed", 0, 0, err)
     sys.stderr.write(f"[llm_dispatch FAIL model={model} rc={rc}]\n")
+    try:
+        os.remove(out_file + ".model")
+    except OSError:
+        pass
     if tmp_out:
         try:
             os.remove(tmp_out)

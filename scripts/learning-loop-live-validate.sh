@@ -44,11 +44,23 @@ export MO_LEARNING_MIN_SAMPLES="${MO_LEARNING_MIN_SAMPLES:-3}"
 
 [ -f "$MINI_ORK_DB" ] || { echo "FATAL: live DB not found at $MINI_ORK_DB" >&2; exit 1; }
 
-# Load the learning functions (defined above the SOURCE_ONLY guard at execute:353).
-export MINI_ORK_EXECUTE_SOURCE_ONLY=1
-# shellcheck source=../bin/mini-ork-execute
-source "$MINI_ORK_ROOT/bin/mini-ork-execute"
-unset MINI_ORK_EXECUTE_SOURCE_ONLY
+# Call the Python-owned learning helpers without sourcing an executor entrypoint.
+_mo_learning_static_lane() {
+  PYTHONPATH="$MINI_ORK_ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 -c \
+    'from mini_ork.ported.mini_ork_execute import learning_static_lane; import sys; print(learning_static_lane(sys.argv[1], sys.argv[2]))' "$@"
+}
+_mo_learning_governed_lane() {
+  PYTHONPATH="$MINI_ORK_ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 -c \
+    'from mini_ork.ported.mini_ork_execute import learning_governed_lane; import os,sys; print(learning_governed_lane(sys.argv[1], sys.argv[2], root=os.environ["MINI_ORK_ROOT"]))' "$@"
+}
+mo_learning_write_grpo_advantages() {
+  PYTHONPATH="$MINI_ORK_ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 -c \
+    'from mini_ork.ported.mini_ork_execute import write_grpo_advantages; import os; write_grpo_advantages(os.environ["MINI_ORK_DB"])'
+}
+mo_learning_update_conductor_outcomes() {
+  PYTHONPATH="$MINI_ORK_ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 -c \
+    'from mini_ork.ported.mini_ork_execute import learning_update_conductor_outcomes; import os; learning_update_conductor_outcomes(os.environ["MINI_ORK_DB"])'
+}
 # RHO aggregation is native Python now (lib/rho_aggregator.sh retired); fire_writers
 # calls it directly via PYTHONPATH below.
 
@@ -73,7 +85,7 @@ snapshot() {
 }
 
 probe_router() {
-  # Mirror the production learning_governed seam (bin/mini-ork-execute:1208):
+  # Mirror the production learning_governed seam in the native executor:
   # governed lane over the static-hybrid baseline. We compose the two fns
   # directly because _mo_policy_route_lane lives below the SOURCE_ONLY guard
   # and isn't defined here, whereas these two are.

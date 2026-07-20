@@ -232,7 +232,7 @@ def get_correlation(
         "bridge_methods": methods,
         "issues": issues,
         "remediation": (
-            "Re-run with the Python classify runtime + bin/mini-ork-execute "
+            "Re-run with the Python classify runtime + mini_ork/ported/mini_ork_execute.py "
             "which write trace_id to task_runs. Legacy rows can be backfilled with: "
             "UPDATE task_runs SET trace_id = 'tr-backfill-' || id WHERE trace_id IS NULL;"
             if not tr.get("trace_id")
@@ -408,7 +408,7 @@ def get_learning(
             "injection_points": [
                 {
                     "name": "known_failure_modes",
-                    "where": "mini_ork.ported.mini_ork_plan + bin/mini-ork-execute (context_failure_modes_md)",
+                    "where": "mini_ork.ported.mini_ork_plan + mini_ork/ported/mini_ork_execute.py (context_failure_modes_md)",
                     "how": "gradient_records matching the task_class with confidence >= 0.6 are appended as a 'Learned failure modes' block to planner/researcher/implementer/reviewer prompts.",
                     "wired": True,
                 },
@@ -772,7 +772,7 @@ def get_dag(
     """Return the recipe DAG with node statuses derived from run_events.
 
     Status rules (derived from node_start/node_end events emitted by
-    bin/mini-ork-execute:_dispatch_node via lib/mo_node_events.sh):
+    mini_ork/ported/mini_ork_execute.py:_dispatch_node via lib/mo_node_events.sh):
       - never_seen : no node_start event for this node
       - running    : node_start present, no node_end yet
       - done       : node_end present, no verdict failure

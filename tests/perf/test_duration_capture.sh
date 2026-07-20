@@ -20,18 +20,27 @@ mkdir -p "$RUN_DIR" "$MINI_ORK_HOME/config" "$TMPROOT/root/lib/providers" "$TMPR
 
 cat > "$MINI_ORK_HOME/config/agents.yaml" <<'YAML'
 lanes:
-  implementer: codex
+  implementer: fixture
+YAML
+
+cat > "$MINI_ORK_HOME/config/providers.yaml" <<'YAML'
+providers:
+  fixture:
+    kind: executable
+    family: fixture
+    script: lib/providers/cl_fixture.sh
 YAML
 
 ln -s "$MINI_ORK_ROOT_REAL/lib/llm-dispatch.sh" "$TMPROOT/root/lib/llm-dispatch.sh"
 ln -s "$MINI_ORK_ROOT_REAL/lib/trace_store.sh" "$TMPROOT/root/lib/trace_store.sh"
+ln -s "$MINI_ORK_ROOT_REAL/mini_ork" "$TMPROOT/root/mini_ork"
 
-cat > "$TMPROOT/root/lib/providers/cl_codex.sh" <<'SH'
+cat > "$TMPROOT/root/lib/providers/cl_fixture.sh" <<'SH'
 #!/usr/bin/env bash
 sleep 0.05
 printf 'fixture dispatch complete\n'
 SH
-chmod +x "$TMPROOT/root/lib/providers/cl_codex.sh"
+chmod +x "$TMPROOT/root/lib/providers/cl_fixture.sh"
 
 cat > "$RUN_DIR/plan.json" <<'JSON'
 {
@@ -60,7 +69,10 @@ MINI_ORK_ROOT="$TMPROOT/root" \
 MINI_ORK_PLAN_PATH="$RUN_DIR/plan.json" \
 MINI_ORK_DRY_RUN=0 \
 MO_TRACE_RICH=0 \
-  "$MINI_ORK_ROOT_REAL/bin/mini-ork-execute" --node-type implementer >/dev/null
+  "$MINI_ORK_ROOT_REAL/bin/mini-ork" execute --node-type implementer >/dev/null || {
+    cat "$RUN_DIR/execute.log" >&2 2>/dev/null || true
+    exit 1
+  }
 
 after=$(sqlite3 "$MINI_ORK_DB" "SELECT COUNT(*) FROM execution_traces WHERE task_class='duration_capture' AND COALESCE(duration_ms,0)>0")
 

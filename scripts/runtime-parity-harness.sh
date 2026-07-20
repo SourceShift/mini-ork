@@ -26,24 +26,22 @@ if [ -n "$FORK" ]; then
     echo "FAIL — no focused runtime contract for fork '$FORK': $FORK_TEST" >&2
     exit 1
   fi
-  if [ "$FORK" = "cli" ]; then
-    PRE_REPORT="${MO_PRE_RETIREMENT_REPORT:?MO_PRE_RETIREMENT_REPORT required for cli closure}"
-    PRE_EVIDENCE="${MO_PRE_RETIREMENT_EVIDENCE:?MO_PRE_RETIREMENT_EVIDENCE required for cli closure}"
-    python3 - "$PRE_REPORT" "$PRE_EVIDENCE" <<'PY'
+  PRE_REPORT="${MO_PRE_RETIREMENT_REPORT:?MO_PRE_RETIREMENT_REPORT required for fork closure}"
+  PRE_EVIDENCE="${MO_PRE_RETIREMENT_EVIDENCE:?MO_PRE_RETIREMENT_EVIDENCE required for fork closure}"
+  python3 - "$PRE_REPORT" "$PRE_EVIDENCE" "$FORK" <<'PY'
 import json
 import os
 import sys
 
-report, evidence = sys.argv[1:]
+report, evidence, fork = sys.argv[1:]
 if not os.path.isfile(evidence) or os.path.getsize(evidence) == 0:
     raise SystemExit("pre-retirement evidence is missing or empty")
 with open(report, encoding="utf-8") as handle:
     state = json.load(handle)
-if state.get("fork") != "cli" or state.get("pass") is not True:
-    raise SystemExit("pre-retirement CLI oracle did not pass")
+if state.get("fork") != fork or state.get("pass") is not True:
+    raise SystemExit(f"pre-retirement {fork} oracle did not pass")
 print(f"[ok] durable pre-retirement oracle: {report}")
 PY
-  fi
   echo "── focused post-retirement contract: $FORK ──"
   exec python3 -m pytest "$FORK_TEST" -q -p no:cacheprovider
 fi
@@ -87,7 +85,6 @@ _check "classify --help"  env PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
 _check "conductor --help" "$BIN/mini-ork-conductor" --help
 _check "scheduler --help" "$BIN/mini-ork-scheduler" --help
 _check "epics --help"     "$BIN/mini-ork-epics" --help
-_check "execute --help"   "$BIN/mini-ork-execute" --help
 
 # plan --dry-run: a full deterministic pipeline (classify→profile→plan placeholder)
 printf '# Ship widget\n\n## Success\n- widget renders\n\n## Verification commands\n- `pytest`\n' > "$TMP/k.md"

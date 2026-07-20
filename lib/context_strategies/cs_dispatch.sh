@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # cs_dispatch.sh — context-strategy dispatcher. The single entry point
-# for mini-ork-execute (and downstream callers) to prepare per-lens
+# for the native executor (and downstream callers) to prepare per-lens
 # context via the strategy registry.
 #
 # Public API:

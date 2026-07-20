@@ -10,7 +10,7 @@
 #      → _mo_llm_strip_protocol_blocks.
 #   3. codex CLI exposes no billing figure → cl_codex.sh estimates cost from
 #      harvested tokens at env-overridable list rates (MO_COST_FILE sidecar).
-#   4. mini-ork-execute dispatched plans the planner had already declared
+#   4. the native executor dispatched plans the planner had already declared
 #      blocked (plan_status=needs_answers) → pre-dispatch execute gate.
 
 set -uo pipefail
@@ -107,7 +107,7 @@ else
 fi
 
 # ── 4. execute pre-dispatch gate ──────────────────────────────────────────────
-echo "── mini-ork-execute: needs_answers plan refused before dispatch ──"
+echo "── native execute: needs_answers plan refused before dispatch ──"
 HOME_DIR="$TMP/home"
 mkdir -p "$HOME_DIR/runs/run-gate"
 cat > "$HOME_DIR/runs/run-gate/plan.json" <<'EOF'
@@ -122,7 +122,7 @@ INSERT INTO task_runs(id,status,created_at) VALUES('run-gate','planned',strftime
 # (execute:299), and CI exports MINI_ORK_DRY_RUN=1 globally — without the
 # pin this test asserts different behavior depending on ambient env.
 MINI_ORK_HOME="$HOME_DIR" MINI_ORK_RUN_ID="run-gate" MINI_ORK_DRY_RUN=0 \
-  "$ROOT/bin/mini-ork-execute" "$HOME_DIR/runs/run-gate/plan.json" >/dev/null 2>&1
+  "$ROOT/bin/mini-ork" execute "$HOME_DIR/runs/run-gate/plan.json" >/dev/null 2>&1
 rc=$?
 [ "$rc" -eq 6 ] && _ok "gate exits 6" || _fail "gate rc=$rc (want 6)"
 row=$(sqlite3 "$HOME_DIR/state.db" "SELECT status||'|'||verdict FROM task_runs WHERE id='run-gate';")
@@ -133,7 +133,7 @@ ev=$(sqlite3 "$HOME_DIR/state.db" "SELECT count(*) FROM run_events WHERE event_t
 
 # Override env lets the plan through (dry-run so nothing dispatches)
 MINI_ORK_HOME="$HOME_DIR" MINI_ORK_RUN_ID="run-gate" MINI_ORK_EXECUTE_GATE=0 \
-  "$ROOT/bin/mini-ork-execute" "$HOME_DIR/runs/run-gate/plan.json" --dry-run >/dev/null 2>&1
+  "$ROOT/bin/mini-ork" execute "$HOME_DIR/runs/run-gate/plan.json" --dry-run >/dev/null 2>&1
 [ $? -eq 0 ] && _ok "MINI_ORK_EXECUTE_GATE=0 bypasses gate" || _fail "gate override broken"
 
 echo ""

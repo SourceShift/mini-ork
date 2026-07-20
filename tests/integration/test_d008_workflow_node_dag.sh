@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # tests/integration/test_d008_workflow_node_dag.sh
-# D-008 regression: mini-ork-execute must read node DAG from workflow.yaml
+# D-008 regression: the native executor must read node DAG from workflow.yaml
 # (not plan.json.decomposition[]). Asserts:
 #   1. dry-run output lists 9 nodes for refactor-audit (workflow.yaml node count)
 #   2. each node has a non-empty node_type (not "type=" silent skip)

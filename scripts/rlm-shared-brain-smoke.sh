@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # rlm-shared-brain-smoke.sh — prove the SHARED brain (lib/decision_service.sh
-# + lib/lane_router.sh + bin/mini-ork-execute GRPO writers) routes each
+# + lib/lane_router.sh + the native executor's GRPO writers) routes each
 # objective_domain slice to its own learned lane, NOT a single global argmax.
 #
 # Vehicle: seed two known objective slices (code-delivery + book-gen) on the
@@ -80,12 +80,12 @@ export MINI_ORK_DB="$TMP_DB"
 
 bash "$MINI_ORK_ROOT/db/init.sh" >"$TMP_DIR/init.log" 2>&1
 
-# --- Source the brain libs + execute (SOURCE_ONLY gates the strict mode) ---
+# --- Load the remaining brain libs + native execute writer ----------------
 
-export MINI_ORK_EXECUTE_SOURCE_ONLY=1
-# shellcheck source=../bin/mini-ork-execute
-source "$MINI_ORK_ROOT/bin/mini-ork-execute"
-unset MINI_ORK_EXECUTE_SOURCE_ONLY
+mo_learning_write_grpo_advantages() {
+  PYTHONPATH="$MINI_ORK_ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 -c \
+    'from mini_ork.ported.mini_ork_execute import write_grpo_advantages; import os; write_grpo_advantages(os.environ["MINI_ORK_DB"])'
+}
 # shellcheck disable=SC1091
 . "${MINI_ORK_ROOT}/lib/decision_service.sh"
 # shellcheck disable=SC1091

@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# tests/integration/test_bin_execute.sh — integration tests for bin/mini-ork-execute
+# tests/integration/test_bin_execute.sh — integration tests for the native execute route
 set -uo pipefail
 
 MINI_ORK_ROOT="${MINI_ORK_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 export MINI_ORK_ROOT
+unset MINI_ORK_ENGINE_ROOT MINI_ORK_PROJECT_HOME MINI_ORK_TARGET_REPO
 export PATH="$MINI_ORK_ROOT/bin:$PATH"
 export MINI_ORK_DRY_RUN=1
 
@@ -54,20 +55,20 @@ cat > "$PLAN_PATH" <<'JSON'
 JSON
 export MINI_ORK_PLAN_PATH="$PLAN_PATH"
 
-echo "── integration: mini-ork-execute ──"
+echo "── integration: mini-ork execute ──"
 
 # === TESTS START ===
 
 # 1. --help exits 0 and prints usage
 echo ""
 echo "--- 1. --help exits 0 ---"
-if mini-ork-execute --help >/dev/null 2>&1; then
+if mini-ork execute --help >/dev/null 2>&1; then
   _ok "--help exits 0"
 else
   _fail "--help exited non-zero"
 fi
 
-HELP_OUT=$(mini-ork-execute --help 2>&1 || true)
+HELP_OUT=$(mini-ork execute --help 2>&1 || true)
 if echo "$HELP_OUT" | grep -qi "execute\|plan\|node.type\|dispatch"; then
   _ok "--help output mentions expected keywords"
 else
@@ -82,10 +83,11 @@ trap 'rm -rf "$TMPROOT2"' EXIT
 (
   export MINI_ORK_HOME="$TMPROOT2/.mini-ork"
   export MINI_ORK_DB="$TMPROOT2/.mini-ork/state.db"
-  unset MINI_ORK_PLAN_PATH
+  unset MINI_ORK_PLAN_PATH MINI_ORK_RUN_ID MINI_ORK_RUN_DIR MINI_ORK_RECIPE \
+    MINI_ORK_WORKFLOW MINI_ORK_RECOVERY_CLOSURE MINI_ORK_RECOVERY_FROM
   mkdir -p "$TMPROOT2/.mini-ork/runs"
   EXITCODE=0
-  mini-ork-execute 2>/dev/null || EXITCODE=$?
+  mini-ork execute 2>/dev/null || EXITCODE=$?
   echo "EXIT:$EXITCODE"
 ) | grep -q "EXIT:2" && _ok "no plan found → exit 2" || _fail "no plan → expected exit 2"
 
@@ -96,7 +98,7 @@ echo "--- 3. Nonexistent plan path exits 2 ---"
 EXITCODE=0
 (
   unset MINI_ORK_PLAN_PATH
-  mini-ork-execute /tmp/no-such-plan-$$$.json 2>/dev/null
+  mini-ork execute /tmp/no-such-plan-$$$.json 2>/dev/null
   echo "$?"
 ) | grep -q "^2$" && _ok "nonexistent plan path → exit 2" || _fail "nonexistent plan path → expected exit 2"
 
@@ -105,7 +107,7 @@ EXITCODE=0
 # (execute's arg parser treats it as "Unexpected argument" when env is already set).
 echo ""
 echo "--- 4. Dry-run: reads plan via env + prints dispatch lines ---"
-OUT=$(mini-ork-execute --dry-run 2>&1 || true)
+OUT=$(mini-ork execute --dry-run 2>&1 || true)
 if echo "$OUT" | grep -qi "dry.run\|would dispatch\|execute"; then
   _ok "dry-run output mentions dispatch/dry-run"
 else
@@ -113,7 +115,7 @@ else
 fi
 
 EXITCODE=0
-mini-ork-execute --dry-run >/dev/null 2>&1 || EXITCODE=$?
+mini-ork execute --dry-run >/dev/null 2>&1 || EXITCODE=$?
 if [ "$EXITCODE" -eq 0 ]; then
   _ok "dry-run exits 0"
 else
@@ -124,7 +126,7 @@ fi
 echo ""
 echo "--- 5. --node-type filter accepted ---"
 EXITCODE=0
-mini-ork-execute --dry-run --node-type "implementer" >/dev/null 2>&1 || EXITCODE=$?
+mini-ork execute --dry-run --node-type "implementer" >/dev/null 2>&1 || EXITCODE=$?
 if [ "$EXITCODE" -eq 0 ]; then
   _ok "--node-type implementer dry-run exits 0"
 else
@@ -135,7 +137,7 @@ fi
 echo ""
 echo "--- 6. --dispatch-mode override accepted ---"
 EXITCODE=0
-mini-ork-execute --dry-run --dispatch-mode "parallel" >/dev/null 2>&1 || EXITCODE=$?
+mini-ork execute --dry-run --dispatch-mode "parallel" >/dev/null 2>&1 || EXITCODE=$?
 if [ "$EXITCODE" -eq 0 ]; then
   _ok "--dispatch-mode parallel dry-run exits 0"
 else
@@ -146,26 +148,24 @@ fi
 echo ""
 echo "--- 7. Unknown flag exits 2 ---"
 EXITCODE=0
-mini-ork-execute --unknown-flag-xyz 2>/dev/null || EXITCODE=$?
+mini-ork execute --unknown-flag-xyz 2>/dev/null || EXITCODE=$?
 if [ "$EXITCODE" -eq 2 ]; then
   _ok "unknown flag → exit 2"
 else
   _fail "unknown flag → expected exit 2, got exit $EXITCODE"
 fi
 
-# 8. Per-node parallel batching must enforce the same cap as global parallel.
+# 8. The public CLI must own execute in-process, outside sibling Bash routing.
 echo ""
-echo "--- 8. Per-node parallel path uses max-parallel cap ---"
-if awk '
-  /case "\$\{node_dmode:-serial\}" in/ { in_serial=1 }
-  in_serial && /parallel\)/ { in_parallel=1 }
-  in_parallel && /_maybe_flush_batch_at_cap PIDS/ { found=1 }
-  in_parallel && /\( _dispatch_node/ { saw_spawn=1; exit }
-  END { exit !(found && saw_spawn) }
-' "$MINI_ORK_ROOT/bin/mini-ork-execute"; then
-  _ok "per-node parallel spawn is guarded by _maybe_flush_batch_at_cap"
+echo "--- 8. execute is an in-process native route ---"
+if PYTHONPATH="$MINI_ORK_ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 - <<'PY'
+from mini_ork.ported import mini_ork_cli
+assert "execute" not in mini_ork_cli._EXEC_SUBS
+PY
+then
+  _ok "execute bypasses sibling-entrypoint subprocess routing"
 else
-  _fail "per-node parallel spawn is missing _maybe_flush_batch_at_cap"
+  _fail "execute remains in sibling-entrypoint subprocess routing"
 fi
 
 # === TESTS END ===

@@ -102,6 +102,16 @@ if [ "$FORK" = "cli" ]; then
   fi
 fi
 
+# Execute closure owns the public subcommand route plus the native outbound
+# seams, so verify both its standalone golden contract and the real launcher.
+if [ "$FORK" = "execute" ]; then
+  if ( cd "$REPO_ROOT" && bash tests/integration/test_bin_execute.sh ) >>"$EVIDENCE" 2>&1; then
+    echo "[integration] tests/integration/test_bin_execute.sh PASS" >>"$EVIDENCE"
+  else
+    pass=false; reasons+=("execute integration suite failed")
+  fi
+fi
+
 # Plan retirement has several executable callers whose contracts are broader
 # than the focused unit module: module-level CLI behavior, given-plan bypass,
 # recipe dry-runs, hostile kickoff input, and the web provenance surface.
@@ -142,6 +152,14 @@ if [ "$FORK" = "classify" ]; then
 fi
 if [ "$FORK" = "plan" ]; then
   TYPE_TARGETS+=("mini_ork/ported/mini_ork_cli.py")
+fi
+if [ "$FORK" = "execute" ]; then
+  TYPE_TARGETS+=(
+    "mini_ork/ported/mini_ork_cli.py"
+    "mini_ork/ported/intervention_gate.py"
+    "mini_ork/ported/lane_helpers.py"
+    "mini_ork/ported/gate_registry.py"
+  )
 fi
 if [ -n "$FORK" ] && [ -f "$REPO_ROOT/${TYPE_TARGETS[0]}" ]; then
   if ( cd "$REPO_ROOT" && python3 -m pyright "${TYPE_TARGETS[@]}" ) >>"$EVIDENCE" 2>&1; then
