@@ -59,9 +59,11 @@ if [[ -f "$MINI_ORK_ROOT/db/init.sh" ]]; then
   bash "$MINI_ORK_ROOT/db/init.sh" >/dev/null 2>&1 || true
 fi
 
-classify_bin="$MINI_ORK_ROOT/bin/mini-ork-classify"
-[[ ! -x "$classify_bin" ]] && {
-  _skip "mini-ork-classify not executable — path traversal tests skipped"
+classify_module="$MINI_ORK_ROOT/mini_ork/ported/mini_ork_classify.py"
+classify_cmd=(env "PYTHONPATH=$MINI_ORK_ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+  python3 -m mini_ork.ported.mini_ork_classify)
+[[ ! -f "$classify_module" ]] && {
+  _skip "Python classify module unavailable — path traversal tests skipped"
   echo ""
   echo "=== Results: $PASS OK  $SKIP SKIP  $FAIL FAIL ==="
   exit 0
@@ -77,7 +79,7 @@ run_traversal_check() {
   local path_arg="$2"
 
   local out exit_code=0
-  out=$(MINI_ORK_DRY_RUN=1 bash "$classify_bin" "$path_arg" --dry-run 2>&1) || exit_code=$?
+  out=$(MINI_ORK_DRY_RUN=1 "${classify_cmd[@]}" "$path_arg" --dry-run 2>&1) || exit_code=$?
 
   # Check for passwd-file content markers (any line matching user:x: or user:*: patterns)
   if echo "$out" | grep -qE '^[a-z_][a-z0-9_-]*:[x*!]:'; then
@@ -161,7 +163,7 @@ echo ""
 echo "--- 5. Non-existent path exits 2 ---"
 NONEXISTENT="$TMPDIR_TEST/does-not-exist/kickoff.md"
 local_exit=0
-bash "$classify_bin" "$NONEXISTENT" --dry-run >/dev/null 2>&1 || local_exit=$?
+"${classify_cmd[@]}" "$NONEXISTENT" --dry-run >/dev/null 2>&1 || local_exit=$?
 if [[ "$local_exit" -eq 2 ]]; then
   _ok "non-existent kickoff path exits 2 (file-not-found)"
 elif [[ "$local_exit" -eq 0 ]]; then

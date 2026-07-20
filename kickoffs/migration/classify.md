@@ -1,6 +1,7 @@
 # Close the `classify` integration fork
 
-Status: prepared on 2026-07-20; paid self-migrate execution not started.
+Status: completed and source-applied on 2026-07-20 from the passing proposal
+produced by `run-1784528328-42404`.
 
 ## Goal
 
@@ -34,6 +35,25 @@ The recipe's pre-retirement node must capture its own durable green report
 before the Bash entrypoint can be removed. The workflow-phase-aware hollow-run
 guard allows that baseline verifier to run before final artifacts exist; later
 verifiers remain fail-closed.
+
+## Completion evidence
+
+- The run used Kimi for planning, Codex for implementation, and GLM 5.2 for
+  seam mapping, the authoritative ledger, and review. MiniMax was not selected.
+- The durable pre-retirement oracle passed before the Bash entrypoint was
+  removed. Post-retirement parity, feature acceptance, the 29-row ledger, and
+  deterministic fork closure also pass.
+- The proposal deletes `bin/mini-ork-classify`, preserves the classify stdout,
+  exit-code, dry-run, DB, trace, override, size-limit, and hostile-input
+  contracts, and repoints all mapped runtime and test callers to the Python
+  module.
+- The detailed `verdict.json`, GLM reviewer, and run-level workflow verdict
+  pass. The outer command returned non-zero only because the generic Python
+  verifier passed incomplete context to globally registered oracle gates;
+  their `defer` results were aggregated as a failure. No paid replay was used.
+- The reviewed proposal applied cleanly to the source checkout and was replayed
+  with focused unit, integration, security, E2E, Pyright, migration-gate, and
+  diff-hygiene checks.
 
 ## Provider policy
 

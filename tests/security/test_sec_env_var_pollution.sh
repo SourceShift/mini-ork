@@ -63,9 +63,10 @@ export MINI_ORK_DRY_RUN=1
 
 trap 'rm -rf "$TMPDIR_TEST"' EXIT
 
-classify_bin="$MINI_ORK_ROOT/bin/mini-ork-classify"
-[[ ! -x "$classify_bin" ]] && {
-  _skip "mini-ork-classify not executable — PATH pollution tests skipped"
+classify_module="$MINI_ORK_ROOT/mini_ork/ported/mini_ork_classify.py"
+PYTHON_BIN="$(command -v python3)"
+[[ ! -f "$classify_module" ]] && {
+  _skip "Python classify module unavailable — PATH pollution tests skipped"
   echo ""
   echo "=== Results: $PASS OK  $SKIP SKIP  $FAIL FAIL (WARN: $WARN) ==="
   exit 0
@@ -117,7 +118,9 @@ rm -f "$CANARY"
 CLASSIFY_EXIT=0
 PATH="$EVIL_BIN_DIR:$PATH" \
   MINI_ORK_DRY_RUN=1 \
-  bash "$classify_bin" "$VALID_KICKOFF" --dry-run >/dev/null 2>&1 \
+  PYTHONPATH="$MINI_ORK_ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+  "$PYTHON_BIN" -m mini_ork.ported.mini_ork_classify \
+  "$VALID_KICKOFF" --dry-run >/dev/null 2>&1 \
   || CLASSIFY_EXIT=$?
 
 if [[ -f "$CANARY" ]]; then
@@ -132,7 +135,7 @@ echo ""
 echo "--- 2. Inspect classify for absolute-path pinning patterns ---"
 
 # Grep for absolute paths or command-v pinning
-if grep -qE '^[A-Z_]+=\$\(command -v|^SQLITE3=|^PYTHON3=|^JQ=|^YQ=' "$classify_bin" 2>/dev/null; then
+if grep -qE '^[A-Z_]+=\$\(command -v|^SQLITE3=|^PYTHON3=|^JQ=|^YQ=' "$classify_module" 2>/dev/null; then
   _ok "classify pins at least one tool path via command -v assignment"
 else
   _warn "classify does NOT pin absolute tool paths. Hardening suggestion: add near top of each bin/mini-ork-* script:
