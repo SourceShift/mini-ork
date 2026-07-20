@@ -1,4 +1,4 @@
-"""Parity gate: ``mini_ork.ported.promotion_gate`` vs ``lib/promotion_gate.sh``.
+"""Parity gate: ``mini_ork.gates.promotion_gate`` vs ``lib/promotion_gate.sh``.
 
 Each test drives the LIVE bash function via
 ``bash -c 'source lib/promotion_gate.sh; ...'`` against the SAME
@@ -54,7 +54,7 @@ LIB = REPO / "lib" / "promotion_gate.sh"
 DB_INIT = REPO / "db" / "init.sh"
 
 sys.path.insert(0, str(REPO))
-from mini_ork.ported import promotion_gate as pg  # noqa: E402
+from mini_ork.gates import promotion_gate as pg
 
 _FLOAT_TOL = 1e-6
 

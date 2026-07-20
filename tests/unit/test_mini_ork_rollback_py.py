@@ -1,4 +1,4 @@
-"""Parity gate: ``mini_ork.ported.mini_ork_rollback`` vs ``bin/mini-ork-rollback``.
+"""Parity gate: ``mini_ork.cli.rollback`` vs ``bin/mini-ork-rollback``.
 
 Each test invokes the LIVE bash subprocess (``bin/mini-ork-rollback``)
 against a temp DB seeded by ``db/init.sh``, then invokes the Python
@@ -37,7 +37,7 @@ Notes:
     once bash is invoked once (in any of the bash calls below), the
     bash-side DB gets the table. For the py-side DB and for any
     *seeding* SQL we run before bash has touched the DB, we call
-    ``mini_ork.ported.version_registry.ensure_table(db)`` to mirror
+    ``mini_ork.registries.version_registry.ensure_table(db)`` to mirror
     the bash-side schema-bootstrap path explicitly.
   * ``db/init.sh`` does NOT create the ``version_registry`` table —
     migration ``0011_evolution.sql`` only creates
@@ -68,8 +68,8 @@ import pytest
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
-from mini_ork.ported import mini_ork_rollback as py  # noqa: E402
-from mini_ork.ported import version_registry as vr  # noqa: E402
+from mini_ork.cli import rollback as py
+from mini_ork.registries import version_registry as vr
 
 SH = REPO / "bin" / "mini-ork-rollback"
 INIT_SH = REPO / "db" / "init.sh"

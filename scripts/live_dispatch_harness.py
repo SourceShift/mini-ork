@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """live_dispatch_harness.py — real-LLM integration gate for the ported executor.
 
-The deterministic surface of mini_ork.ported.mini_ork_execute is unit-parity- and
+The deterministic surface of mini_ork.cli.execute is unit-parity- and
 harness-tested (see tests/unit/test_mini_ork_execute_py.py + runtime-parity-harness.sh).
 The LIVE per-node dispatch path (dispatch_node with the real llm_dispatch seam) can
 only be verified against a real provider — that is this harness. It fires ONE cheap
@@ -33,7 +33,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from mini_ork.ported import mini_ork_execute as ex  # noqa: E402
+from mini_ork.cli import execute as ex
 
 
 def main() -> int:

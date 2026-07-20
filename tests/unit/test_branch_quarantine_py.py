@@ -1,4 +1,4 @@
-"""Parity gate: mini_ork.ported.branch_quarantine vs lib/branch-quarantine.sh.
+"""Parity gate: mini_ork.vcs.branch_quarantine vs lib/branch-quarantine.sh.
 
 Builds identical temp git repos (worktree branch clean / contaminated with
 auto-revert commits / at merge-base / dirty) and compares detect counts, reset
@@ -19,7 +19,7 @@ import pytest
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
-from mini_ork.ported import branch_quarantine as bq  # noqa: E402
+from mini_ork.vcs import branch_quarantine as bq
 
 SH = REPO / "lib" / "branch-quarantine.sh"
 _ENV = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@e",

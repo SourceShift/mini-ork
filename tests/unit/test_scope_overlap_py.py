@@ -1,4 +1,4 @@
-"""Standalone unit tests for ``mini_ork.ported.scope_overlap``.
+"""Standalone unit tests for ``mini_ork.gates.scope_overlap``.
 
 Replaces the bash-parity gate as part of the bash→Python migration: the
 Python port is now the sole implementation under test, so its coverage no
@@ -7,7 +7,7 @@ asserts the port's behaviour directly. Expected values below were derived
 by hand-tracing the port's YAML line-state machine and union-find (both are
 faithful transcriptions of the bash ``awk`` state machines and
 ``_mo_uf_find``/``_mo_uf_union``, documented inline in
-``mini_ork/ported/scope_overlap.py``), not by re-running bash.
+``mini_ork/gates/scope_overlap.py``), not by re-running bash.
 
 The only external dependency the port has is ``git ls-files`` (used to
 expand glob patterns against the repo's tracked files). Tests that exercise
@@ -56,7 +56,7 @@ from pathlib import Path
 
 import pytest
 
-import mini_ork.ported.scope_overlap as scope_overlap
+import mini_ork.gates.scope_overlap as scope_overlap
 
 
 def _write_yaml(home: Path, body: str) -> Path:

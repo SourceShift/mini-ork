@@ -1,4 +1,4 @@
-"""Parity gate: mini_ork.ported.mini_ork_promote vs bin/mini-ork-promote.
+"""Parity gate: mini_ork.cli.promote vs bin/mini-ork-promote.
 
 The decision logic lives in promotion_gate (already parity-tested), so this
 gate tests the CLI's own surface: --help, the candidate-status preflight gates
@@ -18,7 +18,7 @@ import pytest
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
-from mini_ork.ported import mini_ork_promote as promo  # noqa: E402
+from mini_ork.cli import promote as promo
 
 BIN = REPO / "bin" / "mini-ork-promote"
 

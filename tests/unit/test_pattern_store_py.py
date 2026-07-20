@@ -1,4 +1,4 @@
-"""Parity gate: ``mini_ork.ported.pattern_store`` vs ``lib/pattern_store.sh``.
+"""Parity gate: ``mini_ork.stores.pattern_store`` vs ``lib/pattern_store.sh``.
 
 Each test allocates two fresh sqlite DBs (one for the LIVE bash
 subprocess, one for the Python port), initialises both via
@@ -132,7 +132,7 @@ def _run_bash(func: str, args: str, db_path: Path) -> tuple[str, str, int]:
 
 def _run_py(func_name: str, *args, db_path: str, **kwargs):
     """Invoke the Python port entry point. Returns the function's return value."""
-    from mini_ork.ported import pattern_store as ps
+    from mini_ork.stores import pattern_store as ps
     func = getattr(ps, func_name)
     return func(*args, db_path=db_path, **kwargs)
 
@@ -540,7 +540,7 @@ def test_invalid_json_no_db_change(tmp_path):
 # ─────────────────────────────────────────────────────────────────────────────
 def test_module_imports_clean():
     """Confirms the public API surface matches bash's CLI surface."""
-    from mini_ork.ported.pattern_store import (
+    from mini_ork.stores.pattern_store import (
         _ON_NEW_HOOKS,
         mine_from_traces,
         on_new_register,
@@ -609,7 +609,7 @@ def test_on_new_register_module_global(tmp_path):
     store() calls. The hooks receive (pid, payload); errors must be
     swallowed (bash `|| true` parity)."""
     _which_bash()
-    from mini_ork.ported import pattern_store as ps
+    from mini_ork.stores import pattern_store as ps
 
     py_db = tmp_path / "py.sqlite"
     _init_temp_db(py_db)

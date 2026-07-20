@@ -1,4 +1,4 @@
-"""Parity gate: mini_ork.ported.cost_pause vs lib/cost_pause.sh.
+"""Parity gate: mini_ork.dispatch.cost_pause vs lib/cost_pause.sh.
 
 Same spend sequence through the LIVE bash functions and the Python port in
 separate run-dirs; rc, sentinel presence, accumulated spend, and status JSON
@@ -14,7 +14,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
-from mini_ork.ported import cost_pause as cp  # noqa: E402
+from mini_ork.dispatch import cost_pause as cp
 
 CP_SH = REPO / "lib" / "cost_pause.sh"
 

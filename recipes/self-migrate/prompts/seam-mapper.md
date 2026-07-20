@@ -2,7 +2,7 @@
 
 You are mapping a single **integration fork** so it can be closed completely,
 with no dangling edge left behind. The fork is named in the kickoff (e.g.
-`verify` → the `bin/mini-ork-verify` ↔ `mini_ork/ported/mini_ork_verify.py`
+`verify` → the `bin/mini-ork-verify` ↔ `mini_ork/cli/verify.py`
 seam).
 
 ## Produce `${MINI_ORK_RUN_DIR}/integration-map.json`

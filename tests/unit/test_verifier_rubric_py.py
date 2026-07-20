@@ -1,4 +1,4 @@
-"""Parity gate: mini_ork.ported.verifier_rubric vs lib/verifier_rubric.sh.
+"""Parity gate: mini_ork.gates.verifier_rubric vs lib/verifier_rubric.sh.
 
 Seven cases (kickoff floor: >=6; 1-case buffer):
 
@@ -55,7 +55,7 @@ import pytest
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
-from mini_ork.ported import verifier_rubric as vr  # noqa: E402
+from mini_ork.gates import verifier_rubric as vr
 
 SH = REPO / "lib" / "verifier_rubric.sh"
 INIT_SH = REPO / "db" / "init.sh"

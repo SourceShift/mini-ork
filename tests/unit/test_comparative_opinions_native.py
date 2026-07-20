@@ -26,7 +26,7 @@ def test_comparative_panel_uses_native_module_without_bash_library(tmp_path: Pat
     python_wrapper = fake_bin / "python3"
     python_wrapper.write_text(
         """#!/usr/bin/env bash
-if [ "$1" = "-m" ] && [ "$2" = "mini_ork.ported.llm_dispatch" ]; then
+if [ "$1" = "-m" ] && [ "$2" = "mini_ork.dispatch.llm_dispatch" ]; then
   shift 2
   model=""
   node_type=""

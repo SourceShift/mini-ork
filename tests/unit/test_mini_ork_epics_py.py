@@ -1,4 +1,4 @@
-"""Parity gate: mini_ork.ported.mini_ork_epics vs bin/mini-ork-epics.
+"""Parity gate: mini_ork.cli.epics vs bin/mini-ork-epics.
 
 Same roadmap ingested/split through the LIVE bash CLI and the port on separate
 seeded state.dbs; epics + epic_dependencies rows, kickoff files + kickoff_path,
@@ -15,7 +15,7 @@ import pytest
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
-from mini_ork.ported import mini_ork_epics as ep  # noqa: E402
+from mini_ork.cli import epics as ep
 
 BIN = REPO / "bin" / "mini-ork-epics"
 

@@ -23,7 +23,7 @@ Run: bash tests/test_obs_surface.sh
 ## Why this exists
 
 This recipe is the **canonical observability regression suite**. After
-any change to `mini_ork/ported/mini_ork_execute.py`, `lib/llm-dispatch.sh`, or any
+any change to `mini_ork/cli/execute.py`, `lib/llm-dispatch.sh`, or any
 emit point, re-run this and `tests/test_obs_surface.sh` to confirm
 every surface still populates:
 

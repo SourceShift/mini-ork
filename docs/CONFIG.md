@@ -178,7 +178,7 @@ human_gate:
 | `MINI_ORK_TYPECHECK_CMD` | `npx tsc --noEmit` | Typecheck command for `typecheck` verifier |
 | `MINI_ORK_TEST_CMD` | `npm test -- --passWithNoTests` | Test runner command |
 | `MINI_ORK_PLAYWRIGHT_CMD` | `npx playwright test` | E2E test command |
-| `MINI_ORK_GRADIENT_EXTRACTOR_FN` | unset | Optional named in-process test/extension override; production uses `mini_ork.ported.gradient_extractor` with native LLM dispatch |
+| `MINI_ORK_GRADIENT_EXTRACTOR_FN` | unset | Optional named in-process test/extension override; production uses `mini_ork.learning.gradient_extractor` with native LLM dispatch |
 | `MINI_ORK_GRADIENT_MODEL` | `codex` | Provider lane used by native textual-gradient extraction |
 
 ### Run behavior

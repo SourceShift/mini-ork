@@ -21,7 +21,7 @@ import pytest
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 
-from mini_ork.ported import recovery_planner as rp  # noqa: E402
+from mini_ork.recovery import planner as rp
 
 # E2 schema (checkpoints + attempts + task_runs) + E3 schema (leases + requests).
 SCHEMA_SQL = """

@@ -13,7 +13,7 @@ Remaining parts: none for this ownership fork.
 1. Status: completed
    Last worked on: 2026-07-20
    Remaining parts: none. The planner is the only production inbound caller
-   and already imports `mini_ork.ported.profile_answerer` directly.
+   and already imports `mini_ork.steering.profile_answerer` directly.
 2. Status: completed
    Last worked on: 2026-07-20
    Remaining parts: none. Tests use standalone golden contracts rather than a

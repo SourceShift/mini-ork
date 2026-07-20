@@ -6,7 +6,7 @@
 # at 2985cae has a recursive loop that, today, replays from node 0
 # on every verifier failure even when nodes 1-3 already passed. That
 # wastes 5-15x the LLM cost it should. This file is the primitive.
-# Wiring into mini_ork/ported/mini_ork_execute.py (which dispatches each node) is a
+# Wiring into mini_ork/cli/execute.py (which dispatches each node) is a
 # deliberate follow-up so reviewers can audit this shape first.
 #
 # Public API:

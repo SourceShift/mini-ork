@@ -14,7 +14,7 @@ import pytest
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 
-from mini_ork.ported import recovery_admin as ra  # noqa: E402
+from mini_ork.recovery import admin as ra
 
 SCHEMA = """
 CREATE TABLE node_checkpoints(run_id TEXT,node_id TEXT,attempt INT DEFAULT 1,status TEXT,

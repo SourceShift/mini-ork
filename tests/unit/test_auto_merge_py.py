@@ -1,4 +1,4 @@
-"""Parity gate: mini_ork.ported.auto_merge vs lib/auto-merge.sh.
+"""Parity gate: mini_ork.vcs.auto_merge vs lib/auto-merge.sh.
 
 Builds a full scenario (repo with main + an APPROVE epic branch ahead, a real
 state.db via db/init.sh, orch run dirs with verdict.json, kickoff with a Branch
@@ -21,7 +21,7 @@ import pytest
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
-from mini_ork.ported import auto_merge as am  # noqa: E402
+from mini_ork.vcs import auto_merge as am
 
 SH = REPO / "lib" / "auto-merge.sh"
 JOB = "job-test-1"

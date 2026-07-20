@@ -1,4 +1,4 @@
-"""Parity gate: mini_ork.ported.active_state_index vs lib/active_state_index.sh.
+"""Parity gate: mini_ork.orchestration.active_state_index vs lib/active_state_index.sh.
 
 Eight cases (kickoff floor: >=6; 2-case buffer):
 
@@ -43,7 +43,7 @@ import pytest
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
-from mini_ork.ported import active_state_index as asi  # noqa: E402
+from mini_ork.orchestration import active_state_index as asi
 
 SH = REPO / "lib" / "active_state_index.sh"
 INIT_SH = REPO / "db" / "init.sh"

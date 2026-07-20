@@ -95,7 +95,7 @@ for tid in "${TRACE_IDS[@]}"; do
   python3 - "$MINI_ORK_ROOT" "$MINI_ORK_DB" "$tid" <<'PY' >/dev/null
 import sys
 sys.path.insert(0, sys.argv[1])
-from mini_ork.ported import gradient_extractor
+from mini_ork.learning import gradient_extractor
 
 db, trace_id = sys.argv[2], sys.argv[3]
 def stub(tid, _trace_json):

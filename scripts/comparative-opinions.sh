@@ -107,7 +107,7 @@ dispatch_lens() {
     # Pass --model directly so we bypass the no-opus override in
     # .mini-ork/config/agents.yaml for this one-off research dispatch.
     # The no-opus directive remains in force for production recipes.
-    if python3 -m mini_ork.ported.llm_dispatch \
+    if python3 -m mini_ork.dispatch.llm_dispatch \
         --task-class "comparative_opinion" \
         --node-type  "${family}_lens" \
         --model      "$family" \

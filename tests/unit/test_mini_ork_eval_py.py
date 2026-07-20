@@ -1,4 +1,4 @@
-"""Parity gate: ``mini_ork.ported.mini_ork_eval`` vs ``bin/mini-ork-eval``.
+"""Parity gate: ``mini_ork.cli.eval`` vs ``bin/mini-ork-eval``.
 
 Each test drives the LIVE bash entry point via subprocess against the
 SAME SQLite fixture as the Python port, then deep-compares both
@@ -47,7 +47,7 @@ REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
 
 BASH_BIN = REPO / "bin" / "mini-ork-eval"
-PY_MOD = "mini_ork.ported.mini_ork_eval"
+PY_MOD = "mini_ork.cli.eval"
 
 _FLOAT_TOL = 1e-6
 CANDIDATE_ID = "cand-001"

@@ -1,4 +1,4 @@
-"""Parity gate: mini_ork.ported.benchmark_suite vs lib/benchmark_suite.sh.
+"""Parity gate: mini_ork.learning.benchmark_suite vs lib/benchmark_suite.sh.
 
 Each test drives the LIVE bash function (``benchmark_add`` /
 ``benchmark_list`` / ``benchmark_run`` / ``benchmark_results``) via
@@ -40,7 +40,7 @@ import pytest
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
-from mini_ork.ported import benchmark_suite as bench  # noqa: E402
+from mini_ork.learning import benchmark_suite as bench
 
 SH = REPO / "lib" / "benchmark_suite.sh"
 

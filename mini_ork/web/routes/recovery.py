@@ -14,7 +14,7 @@ from fastapi import APIRouter, Depends
 
 from ..deps import get_db
 from ..db import StateDB
-from ...ported.recovery_admin import recovery_projection
+from ...recovery.admin import recovery_projection
 
 router = APIRouter(prefix="/api/v1", tags=["recovery"])
 

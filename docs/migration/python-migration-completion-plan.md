@@ -11,7 +11,7 @@ execute-fork closure. Ports were built ~Jul 3–4; the remaining work is
   Python core), and the **routing brain is native** — `learning_governed_lane` calls
   `decision_service.decide()` in-process (byte-parity verified, EPSILON=0).
 - **Top-level migration cycle complete:** verify, reflect, classify, plan, CLI,
-  and execute are Python-owned. `mini_ork/ported/mini_ork_execute.py` is the
+  and execute are Python-owned. `mini_ork/cli/execute.py` is the
   sole executor, the CLI routes to it in-process, and `bin/mini-ork-execute` is
   retired. Provider, git, and executable verifier subprocesses remain
   intentional external boundaries.
@@ -78,7 +78,7 @@ Per subsystem, in this order — **never a blind sweep** (a wrong port breaks ev
 - The stable public path is retained as a thin Python launcher.
 - All three BDD-first recipe callers use the utility's documented
   `MINI_ORK_PROMPT_FILE` input contract.
-- `mini_ork.ported.mini_ork_invoke_prompt` calls the native dispatcher
+- `mini_ork.cli.invoke_prompt` calls the native dispatcher
   in-process and temporarily overlays the invocation environment so provider,
   routing, timeout, telemetry, and budget settings retain subprocess semantics.
 - Its golden-contract suite does not create `lib/llm-dispatch.sh`; therefore a
@@ -96,7 +96,7 @@ Per subsystem, in this order — **never a blind sweep** (a wrong port breaks ev
 ### Completed caller unit: `profile_answerer.py` — 2026-07-20
 
 - The planner-injected path was already native; the standalone/default path
-  now calls `mini_ork.ported.llm_dispatch` in-process too.
+  now calls `mini_ork.dispatch.llm_dispatch` in-process too.
 - Commit `00176709` is the latest provider contract: Kimi primary plus one Kimi
   retry on failure or whitespace. The retirement audit corrected a native-port
   regression that had restored the older, banned DeepSeek primary.

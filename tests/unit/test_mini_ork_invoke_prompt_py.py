@@ -14,7 +14,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
 
-from mini_ork.ported import mini_ork_invoke_prompt as invoke_prompt
+from mini_ork.cli import invoke_prompt
 
 BIN = REPO / "bin" / "mini-ork-invoke-prompt"
 REAL_TRACE_STORE = REPO / "lib" / "trace_store.sh"
@@ -77,7 +77,7 @@ def test_native_dispatch_succeeds_without_bash_library(tmp_path: Path) -> None:
 def test_native_wrapper_receives_exact_contract(
     tmp_path: Path, monkeypatch,
 ) -> None:
-    from mini_ork.ported import llm_dispatch as native_dispatch
+    from mini_ork.dispatch import llm_dispatch as native_dispatch
 
     root = _root(tmp_path)
     marker = StubProvider()

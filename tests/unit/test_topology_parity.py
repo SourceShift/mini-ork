@@ -1,4 +1,4 @@
-"""Parity gate: ``mini_ork.ported.topology.aggregate_traces`` vs ``bash lib/topology.sh``.
+"""Parity gate: ``mini_ork.orchestration.topology.aggregate_traces`` vs ``bash lib/topology.sh``.
 
 For each fixture we build a small ``execution_traces`` corpus (and an
 optional ``workflow_memory`` join), materialise it into a temp sqlite DB,
@@ -24,7 +24,7 @@ from typing import Any
 
 import pytest
 
-from mini_ork.ported.topology import aggregate_traces
+from mini_ork.orchestration.topology import aggregate_traces
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 LIB_TOPOLOGY = REPO_ROOT / "lib" / "topology.sh"

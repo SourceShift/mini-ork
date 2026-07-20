@@ -69,7 +69,7 @@ for tid in "$TID_A1" "$TID_A2" "$TID_A3" "$TID_B1" "$TID_B2"; do
   python3 - "$MINI_ORK_ROOT" "$MINI_ORK_DB" "$tid" <<'PY' >/dev/null
 import json, sys
 sys.path.insert(0, sys.argv[1])
-from mini_ork.ported import gradient_extractor
+from mini_ork.learning import gradient_extractor
 
 db, trace_id = sys.argv[2], sys.argv[3]
 def stub(tid, trace_json):
@@ -177,7 +177,7 @@ SINCE_TS=0
 ROUT="$(MO_REFLECTION_EXTRACT_GRADIENTS=0 python3 - "$MINI_ORK_ROOT" "$SINCE_TS" <<'PY' 2>/dev/null || echo "FAILED"
 import sys
 sys.path.insert(0, sys.argv[1])
-from mini_ork.ported import reflection_pipeline
+from mini_ork.learning import reflection_pipeline
 reflection_pipeline.reflection_run(int(sys.argv[2]))
 PY
 )"

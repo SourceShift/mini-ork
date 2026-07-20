@@ -1,4 +1,4 @@
-"""Standalone unit tests for ``mini_ork.ported.runs_tracker``.
+"""Standalone unit tests for ``mini_ork.stores.runs_tracker``.
 
 Replaces the bash-parity gate as part of the bash->Python migration: the
 Python port is now the sole implementation, so its coverage no longer runs
@@ -55,7 +55,7 @@ import pytest
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
-from mini_ork.ported import runs_tracker as rt  # noqa: E402
+from mini_ork.stores import runs_tracker as rt
 
 TS_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$")
 

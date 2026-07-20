@@ -33,7 +33,7 @@ from mini_ork.optimize import MiniOrkGepaAdapter, run_suggestion
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-REFLECT_MODULE = "mini_ork.ported.mini_ork_reflect"
+REFLECT_MODULE = "mini_ork.cli.reflect"
 
 TARGET_TOKEN = "gepa_target_token"
 

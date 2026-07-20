@@ -16,8 +16,8 @@ import pytest
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
 from mini_ork import trace_store  # noqa: E402
-from mini_ork.ported import gradient_extractor as ge  # noqa: E402
-from mini_ork.ported import reflection_pipeline as rp  # noqa: E402
+from mini_ork.learning import gradient_extractor as ge
+from mini_ork.learning import reflection_pipeline as rp
 
 @pytest.fixture
 def db(tmp_path):
@@ -237,7 +237,7 @@ def test_extract_default_uses_native_dispatch(db, monkeypatch):
     trace_id = trace_store.trace_write(
         {"trace_id": "tr-native", "task_class": "grad-native"}, db=db
     )
-    from mini_ork.ported import llm_dispatch as native_dispatch
+    from mini_ork.dispatch import llm_dispatch as native_dispatch
 
     calls = []
 

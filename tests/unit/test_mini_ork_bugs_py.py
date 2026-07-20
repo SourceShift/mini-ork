@@ -1,4 +1,4 @@
-"""Parity gate: ``mini_ork.ported.mini_ork_bugs`` vs ``bin/mini-ork-bugs``.
+"""Parity gate: ``mini_ork.cli.bugs`` vs ``bin/mini-ork-bugs``.
 
 Each test invokes the LIVE bash dispatcher against a temp DB seeded by
 ``db/init.sh``, then invokes the Python port against the SAME temp DB
@@ -50,7 +50,7 @@ import pytest
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
-from mini_ork.ported import mini_ork_bugs as py  # noqa: E402
+from mini_ork.cli import bugs as py
 
 BASH = REPO / "bin" / "mini-ork-bugs"
 INIT_SH = REPO / "db" / "init.sh"
@@ -102,11 +102,11 @@ def _run_bash(args: list[str], *, env_extra: dict[str, str] | None = None) -> su
 
 
 def _run_py(args: list[str], *, env_extra: dict[str, str] | None = None) -> subprocess.CompletedProcess:
-    """Run ``python3 -m mini_ork.ported.mini_ork_bugs <args>`` with the
+    """Run ``python3 -m mini_ork.cli.bugs <args>`` with the
     caller's env. Python inherits MINI_ORK_HOME/MINI_ORK_DB via os.environ
     from the parent pytest process."""
     return subprocess.run(
-        [sys.executable, "-m", "mini_ork.ported.mini_ork_bugs", *args],
+        [sys.executable, "-m", "mini_ork.cli.bugs", *args],
         env={**os.environ, **(env_extra or {})},
         capture_output=True, text=True,
     )

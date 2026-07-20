@@ -1,4 +1,4 @@
-"""Parity gate: mini_ork.ported.cross_epic_gradient vs lib/cross_epic_gradient.sh.
+"""Parity gate: mini_ork.learning.cross_epic_gradient vs lib/cross_epic_gradient.sh.
 
 Each test seeds a temp DB (created via db/init.sh — kickoff requirement) and
 invokes the LIVE bash subprocess on a sibling DB; the Python port is called on
@@ -55,7 +55,7 @@ import pytest
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
-from mini_ork.ported import cross_epic_gradient as cx  # noqa: E402
+from mini_ork.learning import cross_epic_gradient as cx
 
 SH = REPO / "lib" / "cross_epic_gradient.sh"
 INIT_SH = REPO / "db" / "init.sh"

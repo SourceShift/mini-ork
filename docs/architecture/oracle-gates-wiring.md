@@ -9,7 +9,7 @@ mini-ork ships 6 oracle-hardening primitives under `lib/` (v0.3-rc1):
 | Synthesis-promote (W1-D) | `lib/promotion_gate.sh` | `mo_promote_synthesis_gate` | Single-signal promotion of LLM-judged candidates (Adapala 2025) |
 | Adaptive stability (W2-B) | `lib/adaptive_stability.sh` | `mo_check_panel_stability` | Wasted compute on stabilized debate panels (Hu et al 2025) |
 | Circuit breaker (W2-C) | `lib/circuit_breaker.sh` | `mo_check_liveness_breaker` | Spend-under-cap-but-zero-progress runs |
-| Gradient reframe (D-048) | `mini_ork/ported/gradient_extractor.py` | recipe-shaped prompt | Audit recipes returning `[]` (coordination vs algorithmic shape) |
+| Gradient reframe (D-048) | `mini_ork/learning/gradient_extractor.py` | recipe-shaped prompt | Audit recipes returning `[]` (coordination vs algorithmic shape) |
 
 The native gradient primitive has standalone pytest coverage; the remaining
 Bash gate primitives retain inline self-tests plus unit coverage.
@@ -219,7 +219,7 @@ This wire-up closes Phase N + O at primitive-level:
   - Round-stability drift (`gates/stability.sh`)
   Each fail-opens when it cannot measure — no silent blocking.
 
-Future work: wire these into mini_ork/ported/mini_ork_execute.py's central dispatch
+Future work: wire these into mini_ork/cli/execute.py's central dispatch
 loop so they fire automatically for any recipe without per-recipe
 opt-in. That's a 3-subagent-consensus-pass-first change per the
 project skill rules.

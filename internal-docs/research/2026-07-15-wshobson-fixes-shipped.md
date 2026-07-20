@@ -14,7 +14,7 @@ Python runtime parity gates.
   defaults:
   - `bin/mini-ork`, `bin/mini-ork-epics`, `bin/mini-ork-scheduler`,
     `bin/mini-ork-plan`, `bin/mini-ork-execute`, `bin/mini-ork-verify`
-- `bin/mini-ork-init` + `mini_ork/ported/mini_ork_init.py` now write a relative
+- `bin/mini-ork-init` + `mini_ork/cli/init.py` now write a relative
   `.mini-ork/engine` pointer and gitignore the generated state while committing
   the pointer.
 - `lib/llm-dispatch.sh` now sources `lib/paths.sh` and pins `MO_TARGET_CWD` for

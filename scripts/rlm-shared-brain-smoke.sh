@@ -84,7 +84,7 @@ bash "$MINI_ORK_ROOT/db/init.sh" >"$TMP_DIR/init.log" 2>&1
 
 mo_learning_write_grpo_advantages() {
   PYTHONPATH="$MINI_ORK_ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 -c \
-    'from mini_ork.ported.mini_ork_execute import write_grpo_advantages; import os; write_grpo_advantages(os.environ["MINI_ORK_DB"])'
+    'from mini_ork.cli.execute import write_grpo_advantages; import os; write_grpo_advantages(os.environ["MINI_ORK_DB"])'
 }
 # shellcheck disable=SC1091
 . "${MINI_ORK_ROOT}/lib/decision_service.sh"

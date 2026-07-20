@@ -1,4 +1,4 @@
-"""Parity gate: ``mini_ork.ported.gate_registry`` vs ``lib/gate_registry.sh``.
+"""Parity gate: ``mini_ork.gates.gate_registry`` vs ``lib/gate_registry.sh``.
 
 Each test seeds a fresh temp DB via ``db/init.sh`` (the same way the
 production system initialises state), then evaluates the SAME
@@ -49,7 +49,7 @@ LIB_GATE_REGISTRY = REPO_ROOT / "lib" / "gate_registry.sh"
 DB_INIT = REPO_ROOT / "db" / "init.sh"
 
 sys.path.insert(0, str(REPO_ROOT))
-from mini_ork.ported import gate_registry as gr  # noqa: E402
+from mini_ork.gates import gate_registry as gr
 
 # gate_id format: 'gate-<gtype[:6]>-<uuid4().hex[:8]>'. The suffix is
 # random; we only assert the prefix shape.

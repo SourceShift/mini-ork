@@ -1,4 +1,4 @@
-"""Standalone unit tests for ``mini_ork.ported.spec_split``.
+"""Standalone unit tests for ``mini_ork.orchestration.spec_split``.
 
 Replaces the bash-parity gate (the previous version of this file, which
 invoked the live ``lib/spec-split.sh`` via ``subprocess`` + ``jq`` + ``bash``
@@ -27,7 +27,7 @@ import pathlib
 
 import pytest
 
-from mini_ork.ported import spec_split as ss
+from mini_ork.orchestration import spec_split as ss
 
 # ─────────────────────────────────────────────────────────────────────────────
 # split_visible_hidden
@@ -381,7 +381,7 @@ class TestDecideSkipHiddenSuite:
         `test_file_with_test_call_at_start_does_not_skip` above, which shows
         the function works when `test(` happens to be the very first thing
         in the file). Fixing it requires `re.MULTILINE` (or an
-        `re.search`-per-line loop) in `mini_ork/ported/spec_split.py`, which
+        `re.search`-per-line loop) in `mini_ork/orchestration/spec_split.py`, which
         is out of scope for this test-only change."""
         hidden_path = tmp_path / "hidden_spec.ts"
         hidden_path.write_text(

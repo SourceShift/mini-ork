@@ -1,4 +1,4 @@
-"""Parity gate: mini_ork.ported.mo_node_events vs lib/mo_node_events.sh.
+"""Parity gate: mini_ork.observability.node_events vs lib/mo_node_events.sh.
 
 Each test invokes the LIVE bash subprocess (the bash source `mo_node_emit`/
 `mo_node_start`/`mo_node_end` family) against a temp DB seeded by
@@ -32,7 +32,7 @@ import pytest
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
-from mini_ork.ported import mo_node_events as py  # noqa: E402
+from mini_ork.observability import node_events as py
 
 SH = REPO / "lib" / "mo_node_events.sh"
 INIT_SH = REPO / "db" / "init.sh"
@@ -591,7 +591,7 @@ def test_mo_node_emit_end_trap_rc_nonzero_defaults_to_error(tmp_db):
     """Default finish_reason on rc != 0 is 'error' (bash lines 142-145).
     The port mirrors that. We can't reuse `temp_db` because the fixture is
     scoped to the previous tests — use a local temp DB."""
-    from mini_ork.ported import mo_node_events as p
+    from mini_ork.observability import node_events as p
     home = tmp_db
     dbp = _seed_db(home)
     start_ms = p._now_ms() - 1000

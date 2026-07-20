@@ -20,7 +20,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
-from mini_ork.ported import mini_ork_execute as ex  # noqa: E402
+from mini_ork.cli import execute as ex
 
 
 def _git(repo: Path, *args: str) -> None:

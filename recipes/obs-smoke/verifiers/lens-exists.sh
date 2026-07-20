@@ -13,7 +13,7 @@
 #     (tool_calls or files_written non-empty). Skipped (not failed) when
 #     MINI_ORK_DB / run id are not in scope (ad-hoc invocation).
 #
-# Emits JSON to stdout (consumed by mini_ork/ported/mini_ork_execute.py) + writes the
+# Emits JSON to stdout (consumed by mini_ork/cli/execute.py) + writes the
 # canonical verifier-result-lens-exists.json sidecar to the run dir.
 
 set -uo pipefail

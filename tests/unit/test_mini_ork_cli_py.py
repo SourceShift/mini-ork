@@ -15,7 +15,7 @@ from types import SimpleNamespace
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
-from mini_ork.ported import mini_ork_cli as cli  # noqa: E402
+from mini_ork.cli import main as cli
 
 BIN = REPO / "bin" / "mini-ork"
 
@@ -41,7 +41,7 @@ def test_launcher_is_executable_python_only_and_symlink_safe(tmp_path):
     assert os.access(BIN, os.X_OK)
     assert "runtime-select" not in source
     assert "MINI_ORK_RUNTIME" not in source
-    assert "mini_ork.ported.mini_ork_cli import main" in source
+    assert "mini_ork.cli.main import main" in source
 
     link = tmp_path / "mini-ork"
     link.symlink_to(BIN)
@@ -124,11 +124,11 @@ def test_closed_commands_route_to_native_modules_and_execute_stays_live(monkeypa
         assert calls[-1][0] == [
             sys.executable,
             "-m",
-            f"mini_ork.ported.mini_ork_{command}",
+            f"mini_ork.cli.{command}",
             "arg",
         ]
 
-    from mini_ork.ported import mini_ork_execute
+    from mini_ork.cli import execute as mini_ork_execute
 
     def _fake_execute(argv, *, root=None, dispatch_fn=None):
         del dispatch_fn

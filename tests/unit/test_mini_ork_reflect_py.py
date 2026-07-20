@@ -29,7 +29,7 @@ import pytest
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
 INIT_SH = REPO / "db" / "init.sh"
-PY_MODULE = "mini_ork.ported.mini_ork_reflect"
+PY_MODULE = "mini_ork.cli.reflect"
 
 FIXED_SINCE = "1700000000"
 EXPECTED_HELP = (
@@ -76,11 +76,11 @@ def temp_db(tmp_path_factory, monkeypatch):
 
 def _run_py(args: list[str], env_extra: dict | None = None,
             wrap_gradients: bool = False) -> subprocess.CompletedProcess:
-    """Invoke the Python port via `python3 -m mini_ork.ported.mini_ork_reflect`.
+    """Invoke the Python port via `python3 -m mini_ork.cli.reflect`.
 
     For happy-path cases, set MINI_ORK_GRADIENT_EXTRACTOR_FN=_rfl_stub in env.
     The ported mini_ork_reflect.main() reads this var and looks up `_rfl_stub`
-    in `mini_ork.ported.reflection_pipeline`'s globals, installing it as the
+    in `mini_ork.learning.reflection_pipeline`'s globals, installing it as the
     gradient_extract injection. This matches the bash CLI's
     `MINI_ORK_GRADIENT_EXTRACTOR_FN` semantics.
 
