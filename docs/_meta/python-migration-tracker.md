@@ -53,9 +53,9 @@ graded reward_g, bash+python), lane-fallback hang-proofing (dispatch_with_fallba
   ContextNest planner packs + generic atoms/recent-session fallbacks,
   active-state injection, and persisted context packs. Remaining shell-only
   surfaces belong to non-planner roles and operator steering.
-- reflection_pipeline.sh (358) + gradient_extractor.sh (379); the public
-  reflect fork is native, while these lower-level library seams remain separate
-  migration units.
+- reflection_pipeline.sh + gradient_extractor.sh: the public reflect fork now
+  uses native gradient dispatch, parsing, and storage by default. Bash library
+  and Bash-test retirement remains the next ownership unit.
 - top-level CLI and execute — closed on 2026-07-20. `bin/mini-ork` is the
   Python launcher, `mini-ork execute` routes in-process, and the retired
   `bin/mini-ork-execute` implementation is absent.

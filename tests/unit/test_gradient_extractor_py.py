@@ -17,6 +17,7 @@ REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
 from mini_ork import trace_store  # noqa: E402
 from mini_ork.ported import gradient_extractor as ge  # noqa: E402
+from mini_ork.ported import reflection_pipeline as rp  # noqa: E402
 
 GE_SH = REPO / "lib" / "gradient_extractor.sh"
 TS_SH = REPO / "lib" / "trace_store.sh"
@@ -221,6 +222,94 @@ def test_extract_missing_trace_exits_nonzero(db):
     rc, _, _ = _py_extract("tr-doesnotexist", db)
     assert b.returncode != 0
     assert rc != 0
+
+
+def test_parse_llm_output_recovers_fenced_and_truncated_arrays():
+    fenced = """```json
+[{"target":"workflow.node.plan","signal":"s","suggested_change":"c"}]
+```"""
+    truncated = (
+        '[{"target":"workflow.node.plan","signal":"s1","suggested_change":"c1"},'
+        '{"target":"workflow.node.verify","signal":"s2","suggested_change":"c2"}'
+    )
+
+    assert ge._parse_llm_output(fenced, "tr-fenced") == [{
+        "target": "workflow.node.plan",
+        "signal": "s",
+        "suggested_change": "c",
+        "evidence": "tr-fenced",
+        "confidence": 0.5,
+    }]
+    recovered = ge._parse_llm_output(truncated, "tr-truncated")
+    assert [item["target"] for item in recovered] == [
+        "workflow.node.plan", "workflow.node.verify"
+    ]
+    assert {item["evidence"] for item in recovered} == {"tr-truncated"}
+
+
+def test_extract_default_uses_native_dispatch(db, monkeypatch):
+    trace_id = trace_store.trace_write(
+        {"trace_id": "tr-native", "task_class": "grad-native"}, db=db
+    )
+    from mini_ork.ported import llm_dispatch as native_dispatch
+
+    calls = []
+
+    def fake(argv, *, root, dispatch_fn):
+        calls.append((argv, root, dispatch_fn))
+        print('[{"target":"workflow.node.verify","signal":"missed edge",'
+              '"suggested_change":"add assertion","confidence":0.8}]', end="")
+        return 0
+
+    marker = lambda *args: 0
+    monkeypatch.setattr(native_dispatch, "llm_dispatch", fake)
+    monkeypatch.setenv("MINI_ORK_GRADIENT_MODEL", "glm_current")
+
+    items = ge.extract(
+        trace_id,
+        db=db,
+        dispatch_fn=marker,
+        repo_root="/engine",
+        emit=False,
+    )
+
+    assert items == [{
+        "target": "workflow.node.verify",
+        "signal": "missed edge",
+        "suggested_change": "add assertion",
+        "confidence": 0.8,
+        "evidence": trace_id,
+    }]
+    argv, root, seen_marker = calls[0]
+    assert root == "/engine" and seen_marker is marker
+    assert argv[:4] == ["--model", "glm_current", "--node-type", "gradient-extract"]
+    assert argv[-4:] == ["--timeout", "120", "--max-turns", "5"]
+    assert "<<<TRACE_JSON>>>" not in argv[argv.index("--prompt-text") + 1]
+
+
+def test_reflection_defaults_use_native_gradient_owner(monkeypatch):
+    extracted = [{
+        "target": "workflow.node.plan",
+        "signal": "s",
+        "suggested_change": "c",
+        "evidence": "tr-1",
+        "confidence": 0.7,
+    }]
+    calls = []
+
+    monkeypatch.setattr(ge, "extract", lambda trace_id, emit: (
+        calls.append(("extract", trace_id, emit)) or extracted
+    ))
+    monkeypatch.setattr(ge, "store", lambda payload: calls.append(("store", payload)))
+    monkeypatch.setattr(ge, "init_schema", lambda: calls.append(("schema",)))
+
+    assert rp._default_gradient_extract("tr-1") == [json.dumps(extracted[0])]
+    rp._default_gradient_store(json.dumps(extracted[0]))
+    rp._default_gradient_ensure_table()
+
+    assert calls[0] == ("extract", "tr-1", False)
+    assert calls[1][0] == "store"
+    assert calls[2] == ("schema",)
 
 
 def test_db_row_diff_bash_vs_python(tmp_path):

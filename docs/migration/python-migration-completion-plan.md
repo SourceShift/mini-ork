@@ -152,6 +152,21 @@ Per subsystem, in this order — **never a blind sweep** (a wrong port breaks ev
   zero errors, validation passed, and garden reported zero errors with the
   pre-existing missing env-var documentation warning.
 
+### Completed caller unit: native reflection gradient boundary — 2026-07-20
+
+- The default Python gradient extractor calls the native dispatcher in process
+  with the established `gradient-extract` node, 120-second timeout, five-turn
+  cap, and `MINI_ORK_GRADIENT_MODEL` (`codex` by default).
+- Fenced, prose-wrapped, complete, and truncated JSON arrays retain recovery;
+  missing evidence/confidence fields default to trace id and `0.5`.
+- The native reflection pipeline now owns extract, store, and schema defaults;
+  injection remains only as a deterministic extension/test seam.
+- Twenty-nine focused tests and focused Pyright passed. A real GLM 5.2 probe
+  extracted three valid gradients from a persisted failed-verifier trace; no
+  MiniMax or DeepSeek request ran.
+- This closes the production caller edge. The Bash gradient/reflection libraries
+  and their Bash tests remain until the independent retirement fork closes.
+
 ## Tooling
 - **framework-edit** must use a dedicated temporary runtime home with only
   Kimi, Codex, and GLM lanes; do not edit the user's `.mini-ork` policy and do
