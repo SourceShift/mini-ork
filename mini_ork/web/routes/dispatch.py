@@ -230,7 +230,8 @@ def dispatch(
     so that the caller can subscribe to the trajectory BEFORE the process starts. That is what
     makes the correlation deterministic instead of a race (see orca/coevolve/ATTACH.md).
 
-    `MINI_ORK_RUN_ID` is injectable — bin/mini-ork:135 reads `${MINI_ORK_RUN_ID:-<generated>}`.
+    `MINI_ORK_RUN_ID` is injectable; the Python CLI keeps a supplied value and
+    generates one only when the caller did not provide it.
     """
     if not req.kickoff.strip():
         raise HTTPException(status_code=400, detail="kickoff is required")

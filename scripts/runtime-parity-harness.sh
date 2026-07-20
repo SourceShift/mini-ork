@@ -18,7 +18,7 @@ FORK="${1:-}"
 
 # A closed fork no longer has a Bash runtime to invoke. Its pre-retirement
 # oracle receipt is durable in the migration run, so the post-retirement
-# harness validates the captured standalone Python contract instead. Keep the
+# harness validates both that receipt and the standalone Python contract. Keep
 # no-argument mode as the full cross-runtime matrix for forks still in flight.
 if [ -n "$FORK" ]; then
   FORK_TEST="$ROOT/tests/unit/test_mini_ork_${FORK}_py.py"
@@ -26,7 +26,25 @@ if [ -n "$FORK" ]; then
     echo "FAIL — no focused runtime contract for fork '$FORK': $FORK_TEST" >&2
     exit 1
   fi
-  echo "── focused runtime contract: $FORK ──"
+  if [ "$FORK" = "cli" ]; then
+    PRE_REPORT="${MO_PRE_RETIREMENT_REPORT:?MO_PRE_RETIREMENT_REPORT required for cli closure}"
+    PRE_EVIDENCE="${MO_PRE_RETIREMENT_EVIDENCE:?MO_PRE_RETIREMENT_EVIDENCE required for cli closure}"
+    python3 - "$PRE_REPORT" "$PRE_EVIDENCE" <<'PY'
+import json
+import os
+import sys
+
+report, evidence = sys.argv[1:]
+if not os.path.isfile(evidence) or os.path.getsize(evidence) == 0:
+    raise SystemExit("pre-retirement evidence is missing or empty")
+with open(report, encoding="utf-8") as handle:
+    state = json.load(handle)
+if state.get("fork") != "cli" or state.get("pass") is not True:
+    raise SystemExit("pre-retirement CLI oracle did not pass")
+print(f"[ok] durable pre-retirement oracle: {report}")
+PY
+  fi
+  echo "── focused post-retirement contract: $FORK ──"
   exec python3 -m pytest "$FORK_TEST" -q -p no:cacheprovider
 fi
 

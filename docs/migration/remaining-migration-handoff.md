@@ -461,24 +461,40 @@ the live plan evidence below.
   two source-requirements audits; the rejected verdict was not rewritten and no
   paid reviewer replay was hidden.
 
+### CLI closure proposal — 2026-07-20
+
+- Isolated target: `/private/tmp/mini-ork-self-migrate-cli`, branch
+  `migration/cli`. The proposal is uncommitted and has not been applied to the
+  real checkout.
+- `bin/mini-ork` remains the executable public path but is now a thin Python
+  launcher. It resolves symlinks, imports `mini_ork_cli.main`, and never reads
+  `MINI_ORK_RUNTIME` or sources `runtime-select.sh`.
+- Direct `classify`, `plan`, `verify`, and `reflect` commands route to native
+  Python modules. The missing `apply` dispatch was restored. `execute` remains
+  the one intentional live Bash command fork.
+- Deadline state, per-run config snapshots, repository healing, rubric
+  scoring, and reward grading use native Python ports with their prior
+  best-effort or return-code contracts preserved.
+- The public-path inbound callers remain unchanged because the path, executable
+  bit, argv, stdout/stderr, and exit-code contracts remain stable. A stale web
+  line-number comment was updated.
+- A third audit found that the original parity helper did not force
+  `MINI_ORK_RUNTIME=bash` and could therefore compare Python with Python. The
+  untouched pushed-main dispatcher was rerun in explicit Bash mode: all 40
+  legacy dispatcher assertions passed, and exact version/help/doctor/error
+  parity now passes against the Python launcher. The corrected evidence also
+  drove native `lib/paths.sh`-equivalent environment and engine-pointer
+  resolution into the launcher.
+- Evidence is green: the durable pre-retirement oracle, 8 standalone CLI tests,
+  46 dispatcher assertions, focused Pyright, post-retirement parity, feature
+  acceptance, the 48-row completion ledger, deterministic CLI closure, diff
+  hygiene, and three requirements audits.
+
 ### Next safe action
 
-The next fork is `cli`. Its isolated target and kickoff now exist at
-`/private/tmp/mini-ork-self-migrate-cli` and `kickoffs/migration/cli.md`, based
-on pushed main commit `55af2901`. Pre-retirement evidence is green: 6 CLI
-parity tests, 40 dispatcher assertions, focused Pyright, and the durable
-pre-retirement gate all pass.
-
-CLI preflight found one closure blocker that belongs in this fork: the live
-Bash dispatcher still routes direct `plan`, `verify`, and `reflect` commands to
-already-retired files, and the Python dispatcher still routes direct `plan`
-and `reflect` commands to those paths. CLI closure must route all four closed
-commands to native modules and replace the Bash body at the public
-`bin/mini-ork` path with a Python launcher. It must not delete that installed
-command path.
-
-A new paid self-migrate run still requires separate approval; do not reuse or
-replay the plan run.
+Review and apply `${MINI_ORK_RUN_DIR}/self-migrate.diff` if the proposal is
+accepted. After CLI closure lands, `execute` is the next top-level fork; do not
+remove or bypass `bin/mini-ork-execute` as part of the CLI proposal.
 
 Each fork closure produces:
 - `self-migrate.diff` (reviewable, apply or reject)
