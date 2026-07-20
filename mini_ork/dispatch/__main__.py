@@ -22,6 +22,7 @@ import sys
 from .models import DispatchRequest
 from .providers import dispatch_model, provider_for_model
 from .telemetry import persist_artifact, persist_call
+from .transcripts import write_exec_transcript
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -78,6 +79,11 @@ def main(argv: list[str] | None = None) -> int:
             except OSError:
                 pass
     run_dir = os.environ.get("MINI_ORK_RUN_DIR", "")
+    if args.out:
+        try:
+            write_exec_transcript(args.out, args.model)
+        except Exception as exc:  # transcript generation must never break dispatch
+            sys.stderr.write(f"[mini_ork.dispatch] transcript write failed: {exc}\n")
     if run_dir and os.path.isdir(run_dir):
         try:
             with open(os.path.join(run_dir, ".last-llm-cost"), "w", encoding="utf-8") as fh:
