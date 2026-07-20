@@ -32,7 +32,6 @@ The following remain intentionally live because their Bash contracts are not
 fully retired:
 
 - `lib/llm-dispatch.sh`
-- `tests/unit/test_tool_grants.sh`
 - `tests/test_provider_registry.sh`
 - `tests/unit/test_providers_live.sh`
 - `tests/unit/test_provider_wrappers.sh`
@@ -62,24 +61,34 @@ fully retired:
 
 ## Remaining work queue
 
-### 1. Finish tool-grant fixture retirement
+### 1. Finish tool-grant fixture retirement — DONE
 
-Native behavior is covered by `tests/unit/test_tool_grants_py.py`, but the Bash
-fixture still contains source-shape and subprocess assertions.
+`tests/unit/test_tool_grants.sh` is retired. Its unique coverage was ported
+into native tests in `tests/unit/test_tool_grants_py.py`:
 
-Inspect `tests/unit/test_tool_grants.sh` and replace these remaining checks:
+- real `recipes/code-fix/workflow.yaml` producer resolution
+  (`test_real_workflow_producer_resolution`);
+- undeclared implementer/planner/reviewer defaults
+  (`test_undeclared_nodes_fall_through_to_type_defaults`);
+- `mcp__<server>` rendering (existing `test_mcp_rendering_and_claude_argv`);
+- subprocess argv contract for the canonical Python backend — a real
+  `python3 -m mini_ork.dispatch` run against a stub `claude` asserting
+  `--allowedTools`, `--strict-mcp-config`, `--mcp-config`, and that
+  `--permission-mode bypassPermissions` survives the grant insertion
+  (`test_python_dispatch_subprocess_folds_tool_grants`);
+- the dead Context7 instruction check on `bin/_worker-launcher.sh`
+  (`test_worker_launcher_context7_instruction_resolved`);
+- the implementer-has-no-comms/web-MCP structural invariant
+  (`test_implementer_profile_has_no_comms_or_web_mcp`);
+- the `providers.py` grant-flag source contract
+  (`test_providers_source_references_all_grant_flags`).
 
-- real `recipes/code-fix/workflow.yaml` producer resolution;
-- undeclared implementer/planner/reviewer defaults;
-- `mcp__<server>` rendering;
-- stub-Claude argv assertions for `--allowedTools`,
-  `--strict-mcp-config`, and `--mcp-config`;
-- the dead Context7 instruction check in `bin/_worker-launcher.sh`.
+The only assertions deliberately dropped were the `grep -c ... lib/llm-dispatch.sh`
+source-shape checks: those asserted content of the Bash file being retired and
+are superseded by the `providers.py` grant-flag contract above. The Bash
+argv path is not re-tested because Python is now the canonical dispatch owner.
 
-Delete the Bash fixture only when all of those checks have native or isolated
-Python subprocess equivalents.
-
-Suggested focused commands:
+Regression guard:
 
 ```bash
 python3 -m pytest tests/unit/test_tool_grants_py.py -q -p no:cacheprovider
