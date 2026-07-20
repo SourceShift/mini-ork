@@ -287,7 +287,9 @@ The refreshed queue must cover these non-skippable remaining program tracks:
 1. finish native `llm-dispatch` adoption by every remaining caller, then retire
    `lib/llm-dispatch.sh` only after real-provider and closure evidence passes;
 2. migrate the separate `mini-ork-scheduler` entrypoint together with all of its
-   callers and tests as its own integration fork;
+   callers and tests as its own integration fork — completed on 2026-07-20 by
+   making `mini_ork.scheduler` canonical and retiring the Bash and duplicate
+   serial Python owners;
 3. close reflection/gradient and the remaining context-assembler surfaces,
    including the similarity seed unit;
 4. rewire and retire lower-level gate, steering, lifecycle, role, and artifact
