@@ -40,6 +40,19 @@ Do not retire the library yet: `profile_answerer`, pre-push review, reflection/
 gradient paths, scripts, and Bash fixtures still depend on it. Refresh the
 inventory from the promoted main before selecting the next caller.
 
+The subsequent caller unit made `mini_ork.ported.profile_answerer` native on
+its standalone/default path as well as its already-native planner path. The
+default preserves the DeepSeek-first, Kimi-on-failure-or-whitespace contract,
+captures provider stdout without feeding diagnostics into the JSON parser, and
+keeps the provider boundary injectable. Its focused profile/planner suite
+passed 27 tests with one optional replay fixture skipped, focused Pyright
+reported zero errors, and a process-local GLM 5.2 probe passed through the
+native seam. No DeepSeek or MiniMax request was made for migration validation.
+`lib/profile_answerer.sh` remains below the frontier because Bash callers and
+its pre-retirement oracle still exist; this unit closes only the Python
+module's `llm-dispatch.sh` edge. Refresh from promoted main again before the
+next caller.
+
 ## Context
 
 The self-migrate recipe (PR #184, merged at commit 6bf438a) implements integration-point-first migration: close ONE fork (bash↔Python seam) at a time as a complete unit — make Python sole, repoint every inbound reference, retire bash entrypoint — gated on byte-parity, feature-acceptance, and static-feature ledger.
