@@ -1,9 +1,10 @@
-# Remaining Dispatcher Migration — Agent Handoff
+# Remaining Dispatcher Migration — Sub-Handoff
 
 Status: active after `main` commit `be2fa515` (2026-07-20).
 
-This document is the execution contract for the next agent completing the
-lower-level Bash-to-Python migration around `lib/llm-dispatch.sh`.
+This document covers only the dispatcher workstream. The master handoff for the
+whole migration program is
+`docs/migration/remaining-migration-full-handoff.md`.
 
 ## Objective
 
