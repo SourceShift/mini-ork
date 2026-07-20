@@ -10,8 +10,8 @@
 # existing cost-pause sentinel (operator opt-in via cost-pause hint).
 #
 # Implementation: thin wrapper. The real planner lives in
-# mini_ork/ported/recovery_planner.py — same strangler-fig pattern as
-# bin/mini-ork-resume → mini_ork.ported.mini_ork_resume.
+# mini_ork/recovery/planner.py — same strangler-fig pattern as
+# bin/mini-ork-resume → mini_ork.cli.resume.
 
 set -Eeuo pipefail
 
@@ -23,4 +23,4 @@ export MINI_ORK_ROOT
 
 # Forward all args to the python planner. The planner parses argv
 # itself (mirrors mini-ork-resume's bash-script-now-thin-wrapper shape).
-exec python3 -m mini_ork.ported.recovery_planner "$@"
+exec python3 -m mini_ork.recovery.planner "$@"

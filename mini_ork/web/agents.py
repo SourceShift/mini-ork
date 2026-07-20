@@ -71,7 +71,7 @@ def _task_run_snapshot_select(db: StateDB) -> str:
 
 
 def _dispatcher_alive(home: Path, task_run_id: str) -> bool:
-    """Probe the dispatcher .pid written by mini_ork/ported/mini_ork_execute.py. Missing
+    """Probe the dispatcher .pid written by mini_ork/cli/execute.py. Missing
     file or dead pid → not alive. PermissionError on the signal-0 probe
     means the process exists under another uid → treat as alive."""
     pid_file = home / "runs" / task_run_id / ".pid"
@@ -102,7 +102,7 @@ def _reconcile_stale_running(ev: dict[str, Any], run_is_dead: bool) -> dict[str,
 
 
 # Heuristic mapping: recipe node → output artifact filename emitted by
-# mini_ork/ported/mini_ork_execute.py's per-node-type case branches.
+# mini_ork/cli/execute.py's per-node-type case branches.
 def _expected_artifacts(node_id: str, node_type: str) -> list[str]:
     candidates: list[str] = []
     # Researcher / lens nodes write lens-<short>.md per the _lens heuristic

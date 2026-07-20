@@ -1,4 +1,4 @@
-"""Parity gate: mini_ork.ported.mini_ork_watchdog vs bin/mini-ork-watchdog.
+"""Parity gate: mini_ork.orchestration.watchdog vs bin/mini-ork-watchdog.
 
 Each test drives the LIVE bash ``bin/mini-ork-watchdog --once`` against a
 temp DB seeded by ``db/init.sh``, then invokes ``pass_once`` against the
@@ -38,7 +38,7 @@ import pytest
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
-from mini_ork.ported import mini_ork_watchdog as py  # noqa: E402
+from mini_ork.orchestration import watchdog as py
 
 BASH = REPO / "bin" / "mini-ork-watchdog"
 INIT_SH = REPO / "db" / "init.sh"

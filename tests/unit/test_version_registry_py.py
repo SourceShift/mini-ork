@@ -1,4 +1,4 @@
-"""Parity gate: mini_ork.ported.version_registry vs lib/version_registry.sh.
+"""Parity gate: mini_ork.registries.version_registry vs lib/version_registry.sh.
 
 Same operations through the LIVE bash functions and the Python port on separate
 copies of the DB; resulting version_registry rows + stdout must match. The
@@ -22,7 +22,7 @@ import pytest
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
-from mini_ork.ported import version_registry as vr  # noqa: E402
+from mini_ork.registries import version_registry as vr
 
 SH = REPO / "lib" / "version_registry.sh"
 _TIME_COLS = {"created_at", "promoted_at", "quarantined_at"}

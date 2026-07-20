@@ -1,4 +1,4 @@
-"""Parity gate: mini_ork.ported.gates_common vs lib/gates_common.sh.
+"""Parity gate: mini_ork.gates.common vs lib/gates_common.sh.
 
 Each test invokes the LIVE bash subprocess (sourcing ``lib/gates_common.sh``
 in a single ``bash -c`` block so the function bodies are visible to the
@@ -43,7 +43,7 @@ import pytest
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
-from mini_ork.ported import gates_common as gc  # noqa: E402
+from mini_ork.gates import common as gc
 
 GC_SH = REPO / "lib" / "gates_common.sh"
 INIT_SH = REPO / "db" / "init.sh"

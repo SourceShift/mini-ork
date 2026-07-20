@@ -17,7 +17,7 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
-from mini_ork.ported.mini_ork_execute import learning_update_conductor_outcomes
+from mini_ork.cli.execute import learning_update_conductor_outcomes
 
 MIGRATION = Path(__file__).parent.parent / "db" / "migrations" / "0050_conductor_calibration.sql"
 

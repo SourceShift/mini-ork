@@ -71,12 +71,12 @@ for recipe_dir in "$MINI_ORK_ROOT/recipes/"/*/; do
     "$MINI_ORK_HOME/config/task_classes/$(basename "$recipe_dir").yaml" && break
 done
 
-classify_module="$MINI_ORK_ROOT/mini_ork/ported/mini_ork_classify.py"
+classify_module="$MINI_ORK_ROOT/mini_ork/cli/classify.py"
 classify_cmd=(env "PYTHONPATH=$MINI_ORK_ROOT${PYTHONPATH:+:$PYTHONPATH}" \
-  python3 -m mini_ork.ported.mini_ork_classify)
-plan_module="$MINI_ORK_ROOT/mini_ork/ported/mini_ork_plan.py"
+  python3 -m mini_ork.cli.classify)
+plan_module="$MINI_ORK_ROOT/mini_ork/cli/plan.py"
 plan_cmd=(env "PYTHONPATH=$MINI_ORK_ROOT${PYTHONPATH:+:$PYTHONPATH}" \
-  python3 -m mini_ork.ported.mini_ork_plan)
+  python3 -m mini_ork.cli.plan)
 
 [[ ! -f "$classify_module" ]] && { _skip "Python classify module unavailable"; echo ""; echo "=== Results: $PASS OK  $SKIP SKIP  $FAIL FAIL ==="; exit 0; }
 

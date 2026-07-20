@@ -38,11 +38,11 @@ config_resolve · rho_aggregator — 7 modules, ~700 LOC. Resumable loop:
 ## Session 2 additions (Fable, committed on feat/python-migration)
 | module | python | test | notes |
 |---|---|---|---|
-| coalition_gate.sh | mini_ork/ported/coalition_gate.py | test_coalition_gate_py.py (3) | rho taken as input; measure_rho port deferred |
-| decision_service.sh | mini_ork/ported/decision_service.py | test_decision_service_py.py (3) | full decide() surface; composes ported lane_router |
-| epic_graph.sh | mini_ork/ported/epic_graph.py | test_epic_graph_py.py (4) | dep DAG + cascade |
+| coalition_gate.sh | mini_ork/gates/coalition_gate.py | test_coalition_gate_py.py (3) | rho taken as input; measure_rho port deferred |
+| decision_service.sh | mini_ork/steering/decision_service.py | test_decision_service_py.py (3) | full decide() surface; composes ported lane_router |
+| epic_graph.sh | mini_ork/orchestration/epic_graph.py | test_epic_graph_py.py (4) | dep DAG + cascade |
 | mini-ork-scheduler | mini_ork/scheduler.py | test_scheduler_py.py | **win #1 active**: the public Python launcher owns the concurrent epic pool (MO_SCHED_MAX_PARALLEL); duplicate Bash and ported-Python owners retired |
-| cost_pause.sh | mini_ork/ported/cost_pause.py | test_cost_pause_py.py (2) | window-crossing pause + sentinel |
+| cost_pause.sh | mini_ork/dispatch/cost_pause.py | test_cost_pause_py.py (2) | window-crossing pause + sentinel |
 
 Also landed earlier on this branch: win #3 (mo_grade_run_reward: rubric 0-8 ->
 graded reward_g, bash+python), lane-fallback hang-proofing (dispatch_with_fallback

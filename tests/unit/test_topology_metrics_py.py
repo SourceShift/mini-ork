@@ -1,4 +1,4 @@
-"""Parity gate: ``mini_ork.ported.topology_metrics`` vs ``lib/topology_metrics.sh``.
+"""Parity gate: ``mini_ork.observability.topology_metrics`` vs ``lib/topology_metrics.sh``.
 
 Each test in this module builds a small ``execution_traces`` corpus,
 materialises it into a temp sqlite DB that mirrors the canonical
@@ -44,7 +44,7 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[2]
 LIB_TOPOLOGY_METRICS = REPO_ROOT / "lib" / "topology_metrics.sh"
 sys.path.insert(0, str(REPO_ROOT))
-from mini_ork.ported import topology_metrics as tm  # noqa: E402
+from mini_ork.observability import topology_metrics as tm
 
 # Float parity tolerance — kickoff requirement.
 _FLOAT_TOL = 1e-6

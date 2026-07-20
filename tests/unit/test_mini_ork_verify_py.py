@@ -9,7 +9,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
-from mini_ork.ported import mini_ork_verify as ver  # noqa: E402
+from mini_ork.cli import verify as ver
 
 def _env(home, db):
     return {

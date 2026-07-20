@@ -20,7 +20,7 @@ a customer's private repo. See THIRD_PARTY.md for attribution.
 
 Deliberate divergence: `verifiers` scores with rubric/judge Criteria. Crucible
 does NOT. Verdicts here are anchored on execution status; a judge may only veto,
-never approve (see mini_ork.ported.mini_ork_execute.reward_from_status, PR #168).
+never approve (see mini_ork.cli.execute.reward_from_status, PR #168).
 """
 from mini_ork.runtime.engine import Crucible, ExecOutcome, RuntimeSpec
 

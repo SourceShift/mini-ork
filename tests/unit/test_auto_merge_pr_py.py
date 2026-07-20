@@ -1,4 +1,4 @@
-"""Parity gate: mini_ork.ported.auto_merge_pr vs lib/auto-merge-pr.sh.
+"""Parity gate: mini_ork.vcs.auto_merge_pr vs lib/auto-merge-pr.sh.
 
 A configurable fake `gh` on PATH (checks/review/createdAt/merge responses via
 env) makes the gate ladder deterministic and offline. Compares
@@ -18,7 +18,7 @@ import pytest
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
-from mini_ork.ported import auto_merge_pr as amp  # noqa: E402
+from mini_ork.vcs import auto_merge_pr as amp
 
 SH = REPO / "lib" / "auto-merge-pr.sh"
 

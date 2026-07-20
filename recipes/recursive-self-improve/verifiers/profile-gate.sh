@@ -37,7 +37,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, sys.argv[1])
-from mini_ork.ported import mini_ork_plan
+from mini_ork.cli import plan as mini_ork_plan
 
 
 def dispatch(_task_class, _node_type, _prompt):

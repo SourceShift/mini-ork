@@ -1,6 +1,6 @@
 import pytest
 
-from mini_ork.ported.llm_dispatch import redact_secrets
+from mini_ork.dispatch.llm_dispatch import redact_secrets
 
 
 @pytest.mark.parametrize("secret, context", [

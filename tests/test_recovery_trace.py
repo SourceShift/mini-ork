@@ -11,7 +11,7 @@ import pytest
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 
-from mini_ork.ported import recovery_trace as rt  # noqa: E402
+from mini_ork.recovery import trace as rt
 
 
 @pytest.fixture(autouse=True)

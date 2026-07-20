@@ -40,10 +40,8 @@ import pytest
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 
-from mini_ork.ported import (  # noqa: E402
-    mini_ork_execute as mex,
-    recovery_planner as rp,
-)
+from mini_ork.cli import execute as mex
+from mini_ork.recovery import planner as rp
 
 
 # 0050 schema — copy of db/migrations/0050_node_dag_checkpoints.sql.
@@ -547,7 +545,7 @@ def test_resume_cost_pause_unchanged() -> None:
     touched by E2. We verify by reading the bash script and the
     python port for the E2-era marker:
       * bin/mini-ork-resume still has its cost-pause body
-      * mini_ork/ported/mini_ork_resume.py still has ``resume()`` +
+      * mini_ork/cli/resume.py still has ``resume()`` +
         ``_format_audit_row`` returning the audit-row string verbatim
       * The E2 planner does NOT import mini_ork_resume (the two paths
         must remain decoupled)
@@ -555,7 +553,7 @@ def test_resume_cost_pause_unchanged() -> None:
     bash_path = REPO / "bin" / "mini-ork-resume"
     py_port = REPO / "mini_ork" / "ported" / "mini_ork_resume.py"
     assert bash_path.is_file(), "bin/mini-ork-resume must exist"
-    assert py_port.is_file(), "mini_ork.ported.mini_ork_resume must exist"
+    assert py_port.is_file(), "mini_ork.cli.resume must exist"
     bash_text = bash_path.read_text()
     # cost-pause sentinel handling must still be in the bash script.
     assert ".cost-pause" in bash_text, "bash resume lost .cost-pause reference"
@@ -584,7 +582,7 @@ def test_resume_cost_pause_unchanged() -> None:
         # Make the run dir exist so the script gets past its first check.
         os.makedirs(os.path.join(td, "runs", "run-doesnotexist-001"))
         rc = subprocess.run(
-            ["python3", "-m", "mini_ork.ported.mini_ork_resume",
+            ["python3", "-m", "mini_ork.cli.resume",
              "run-doesnotexist-001"],
             env=env2, cwd=str(REPO), capture_output=True, text=True,
         )

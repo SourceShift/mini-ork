@@ -1,4 +1,4 @@
-"""Parity gate: ``mini_ork.ported.citation_verifier_mechanical`` vs ``lib/citation_verifier_mechanical.sh``.
+"""Parity gate: ``mini_ork.gates.citation_verifier_mechanical`` vs ``lib/citation_verifier_mechanical.sh``.
 
 For each fixture we build a synthetic repo + synthesis doc, invoke the LIVE
 ``mo_check_citations`` bash function via subprocess (no mocking), then call
@@ -24,7 +24,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
-from mini_ork.ported import citation_verifier_mechanical as cv  # noqa: E402
+from mini_ork.gates import citation_verifier_mechanical as cv
 
 LIB_SH = REPO / "lib" / "citation_verifier_mechanical.sh"
 

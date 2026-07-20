@@ -1,4 +1,4 @@
-"""Parity gate: mini_ork.ported.steering_checkpoint vs lib/steering_checkpoint.sh.
+"""Parity gate: mini_ork.steering.steering_checkpoint vs lib/steering_checkpoint.sh.
 
 Each test invokes the LIVE bash subprocess (sourcing lib/steering_checkpoint.sh,
 which itself sources lib/operator_steering.sh, in a single ``bash -c`` block so
@@ -43,7 +43,7 @@ import pytest
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
-from mini_ork.ported import steering_checkpoint as sc  # noqa: E402
+from mini_ork.steering import steering_checkpoint as sc
 
 SC_SH = REPO / "lib" / "steering_checkpoint.sh"
 INIT_SH = REPO / "db" / "init.sh"

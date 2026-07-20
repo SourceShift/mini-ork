@@ -5,7 +5,7 @@
 # resume once steering arrives. It composes two primitives that already exist:
 #   - operator_steering (lib/operator_steering.sh + the HTTP /steer endpoint)
 #     carries the steering message,
-#   - the dispatcher's plan-status gate (mini_ork/ported/mini_ork_execute.py) does the
+#   - the dispatcher's plan-status gate (mini_ork/cli/execute.py) does the
 #     pause/resume, exactly like plan_status=needs_answers.
 #
 # A recipe signals a checkpoint by emitting plan_status=needs_steering in its

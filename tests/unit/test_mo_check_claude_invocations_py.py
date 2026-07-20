@@ -1,4 +1,4 @@
-"""Parity gate: mini_ork.ported.mo_check_claude_invocations vs the bash lint.
+"""Parity gate: mini_ork.observability.check_claude_invocations vs the bash lint.
 
 A fixture repo (good/bad/comment/doc/provider invocations) is scanned by the
 LIVE bash entrypoint and the port; the return code and the set of violations
@@ -13,7 +13,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
-from mini_ork.ported import mo_check_claude_invocations as chk  # noqa: E402
+from mini_ork.observability import check_claude_invocations as chk
 
 BIN = REPO / "bin" / "mo-check-claude-invocations"
 

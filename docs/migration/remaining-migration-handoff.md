@@ -21,8 +21,8 @@ and GLM 5.2 required no repairs.
 
 The next inventory-selected unit closed the first remaining `llm-dispatch`
 caller: `bin/mini-ork-invoke-prompt` is now a thin Python launcher and
-`mini_ork.ported.mini_ork_invoke_prompt` calls
-`mini_ork.ported.llm_dispatch` in-process. Its provider boundary remains
+`mini_ork.cli.invoke_prompt` calls
+`mini_ork.dispatch.llm_dispatch` in-process. Its provider boundary remains
 injectable; combined stdout/stderr ordering, environment overlays,
 placeholder substitution, role-pack injection, trace writes, and exit behavior
 have standalone golden-contract coverage. The tests deliberately run without
@@ -41,7 +41,7 @@ comparative-opinions units closed two callers, but pre-push review, reflection/
 gradient paths, and Bash fixtures still depend on it. Refresh the inventory
 from the promoted main before selecting the next caller.
 
-The subsequent caller unit made `mini_ork.ported.profile_answerer` native on
+The subsequent caller unit made `mini_ork.steering.profile_answerer` native on
 its standalone/default path as well as its already-native planner path. A
 follow-up ownership audit found that the supported Bash implementation had
 already moved to Kimi-only dispatch in `00176709`, while the first native port
@@ -84,7 +84,7 @@ any part of `lib/llm-dispatch.sh`.
 
 The next direct caller unit rewired `scripts/comparative-opinions.sh` from
 sourcing `lib/llm-dispatch.sh` to invoking
-`python3 -m mini_ork.ported.llm_dispatch`. The ten-lens background fan-out,
+`python3 -m mini_ork.dispatch.llm_dispatch`. The ten-lens background fan-out,
 per-lens files, failure markers, manifest, and summary remain Bash-owned. A
 deterministic acceptance test exercised all ten default calls without a Bash
 dispatcher library. A real script-level probe narrowed the panel to two
@@ -110,11 +110,11 @@ runtime-parity harness still has unrelated legacy conductor/init failures that
 reproduce with `MINI_ORK_RUNTIME=bash`; they are not scheduler regressions.
 
 The next reflection/gradient unit closed the silent no-op in the supported
-Python path. `mini_ork.ported.gradient_extractor` now builds the established
-recipe-improvement prompt, calls `mini_ork.ported.llm_dispatch` in process,
+Python path. `mini_ork.learning.gradient_extractor` now builds the established
+recipe-improvement prompt, calls `mini_ork.dispatch.llm_dispatch` in process,
 preserves telemetry/cost controls and the Codex default lane, and recovers
 complete, fenced, prose-wrapped, or truncated JSON arrays with evidence and
-confidence defaults. `mini_ork.ported.reflection_pipeline` now uses native
+confidence defaults. `mini_ork.learning.reflection_pipeline` now uses native
 extract/store/schema helpers unless a deterministic override is injected.
 Twenty-nine focused gradient/reflection/reflect tests passed, Pyright was clean,
 and an evidence-rich failed verifier trace produced three valid gradients via a
@@ -381,10 +381,10 @@ The static-feature ledger is NOT optional — it's the migration's strategic pay
 ### verify fork (example)
 - `/Volumes/docker-ssd/ps/mini-ork/bin/mini-ork`
 - `/Volumes/docker-ssd/ps/mini-ork/bin/mini-ork-execute`
-- `/Volumes/docker-ssd/ps/mini-ork/mini_ork/ported/mini_ork_verify.py`
+- `/Volumes/docker-ssd/ps/mini-ork/mini_ork/cli/verify.py`
 - `/Volumes/docker-ssd/ps/mini-ork/bin/mini-ork-verify`
-- `/Volumes/docker-ssd/ps/mini-ork/mini_ork/ported/mini_ork_execute.py` (repoint bin/mini-ork-verify invocation)
-- `/Volumes/docker-ssd/ps/mini-ork/mini_ork/ported/mini_ork_cli.py` (direct and run-lifecycle dynamic `_bin(root, "verify")` dispatch)
+- `/Volumes/docker-ssd/ps/mini-ork/mini_ork/cli/execute.py` (repoint bin/mini-ork-verify invocation)
+- `/Volumes/docker-ssd/ps/mini-ork/mini_ork/cli/main.py` (direct and run-lifecycle dynamic `_bin(root, "verify")` dispatch)
 - `/Volumes/docker-ssd/ps/mini-ork/tests/e2e/test_e2e_recipe_code_fix.sh`
 - `/Volumes/docker-ssd/ps/mini-ork/tests/integration/test_bin_verify.sh`
 - `/Volumes/docker-ssd/ps/mini-ork/tests/unit/test_mini_ork_verify_py.py`
@@ -467,13 +467,13 @@ Run the self-migrate recipe on each fork in recommended order:
 - Isolated target: `/private/tmp/mini-ork-self-migrate-verify-v2`.
 - Result: `needs_revision` / partial, unapplied; rollback ran and no retirement reached the source checkout.
 - Functional evidence: 11 verify unit tests, 3 executor verifier-node tests, 8 integration assertions, feature acceptance, Pyright, shell syntax, diff hygiene, and both runtime-selector CLI smoke paths passed.
-- Closure blocker: `mini_ork/ported/mini_ork_cli.py` still resolves `_bin(root, "verify")` for direct and run-lifecycle dispatch. It was outside the run's allowlist, so the migrator correctly retained `bin/mini-ork-verify`.
+- Closure blocker: `mini_ork/cli/main.py` still resolves `_bin(root, "verify")` for direct and run-lifecycle dispatch. It was outside the run's allowlist, so the migrator correctly retained `bin/mini-ork-verify`.
 - Review evidence: `review-diff.patch` contains the real isolated-worktree delta and is byte-identical to the restored `self-migrate.diff` (31,513 bytes).
 - Canonical artifacts: `.mini-ork/runs/run-1784478877-84933/` contains the partial diff, complete 52-row feature ledger, detailed `verdict.json`, preserved generic `run-verdict.json`, both requirements reviews, and verifier evidence.
 
 ### Repairs after run 2
 
-- Added `mini_ork/ported/mini_ork_cli.py` to the corrected verify scope and taught `fork-closure.sh` to detect dynamic `_bin(..., "verify")` dispatch.
+- Added `mini_ork/cli/main.py` to the corrected verify scope and taught `fork-closure.sh` to detect dynamic `_bin(..., "verify")` dispatch.
 - Made all five recipe verifier exit statuses mirror their JSON `.pass`; a failed closure report can no longer be counted as a successful process gate.
 - Made `ledger-shape.sh` recognize qualified feature names while still requiring a row for every changed public function.
 - Preserved heterogeneous run-local artifacts and the explicit isolated target with focused regression coverage.
@@ -482,7 +482,7 @@ Run the self-migrate recipe on each fork in recommended order:
 
 - Isolated target: `/private/tmp/mini-ork-self-migrate-verify-v3`.
 - The isolated migration verdict passed: 11 changed files, a complete 33-row ledger, durable pre-retirement evidence, post-retirement parity, feature acceptance, ledger shape, and fork closure all green.
-- The proposal removed `bin/mini-ork-verify`, repointed the top-level shell dispatcher, legacy executor, Python CLI, and Python executor to `python -m mini_ork.ported.mini_ork_verify`, and converted parity tests to standalone golden contracts.
+- The proposal removed `bin/mini-ork-verify`, repointed the top-level shell dispatcher, legacy executor, Python CLI, and Python executor to `python -m mini_ork.cli.verify`, and converted parity tests to standalone golden contracts.
 - The canonical Python verifier now executes command-backed checks once, captures combined stdout/stderr as evidence, and preserves verifier trace telemetry without making observability a failure mode.
 - The generated diff was reviewed, applied to the source checkout, and byte-compared against every file in the verified worktree.
 - Post-apply verification passed: 9 verify tests, 47 executor tests, 6 CLI tests, 8 integration assertions, 18 E2E assertions, focused runtime parity, Pyright across verify/CLI/executor, all five self-migrate gates, and `git diff --check`.
@@ -533,7 +533,7 @@ reviewer evidence assembly, and verdict preservation.
   and GLM 5.2 mapped seams, built the authoritative ledger, and reviewed.
 - The proposal deletes `bin/mini-ork-reflect` and repoints the top-level CLI,
   legacy executor, Python CLI, Python executor, GEPA wiring, and integration
-  coverage to `python -m mini_ork.ported.mini_ork_reflect`.
+  coverage to `python -m mini_ork.cli.reflect`.
 - All five migration reports pass: durable pre-retirement parity,
   post-retirement parity, feature acceptance, the 27-row static-feature ledger,
   and deterministic fork closure. The GLM reviewer and detailed
@@ -578,7 +578,7 @@ the live plan evidence below.
 - The proposal deletes `bin/mini-ork-classify` and repoints the top-level Bash
   dispatcher, Python CLI lifecycle, validation, integration, E2E, security,
   parity-harness, and user-facing references to
-  `python -m mini_ork.ported.mini_ork_classify`.
+  `python -m mini_ork.cli.classify`.
 - The Python runtime now preserves Bash trace start/success side effects through
   a best-effort native trace-store call while keeping dry-run side-effect free.
 - All five migration reports pass: durable pre-retirement parity,
@@ -630,7 +630,7 @@ the live plan evidence below.
   planner's `blocked` status; applying it to a pre-0054 database preserved the
   existing trace and accepted a blocked trace.
 - Every executable caller and test was repointed to
-  `python3 -m mini_ork.ported.mini_ork_plan`; `bin/mini-ork-plan` was deleted.
+  `python3 -m mini_ork.cli.plan`; `bin/mini-ork-plan` was deleted.
 - Independent post-retirement evidence is green: 39 focused planner/context
   tests, 25 CLI/context tests, 10 plan integration assertions, 7 given-plan
   assertions, the recursive profile-gate verifier, 5 path-traversal assertions,
@@ -676,7 +676,7 @@ the live plan evidence below.
   review returned `needs_revision`; no paid retry was made. The completion
   audit repaired the PRM, minimal-scaffold, resolved-model routing, and plan
   task-class gaps deterministically.
-- `mini_ork/ported/mini_ork_execute.py` owns the complete executor lifecycle,
+- `mini_ork/cli/execute.py` owns the complete executor lifecycle,
   including bounded process-isolated concurrency. Direct `execute` and the
   full run lifecycle route to it in-process.
 - Dispatch, capability checks, learned context, operator steering,
@@ -733,7 +733,7 @@ The run exposed five contract gaps:
 5. Target resolution derived `/private/tmp` from the temporary kickoff path and
    hid the real worktree diff from the reviewer. A valid explicit
    `MO_TARGET_CWD` now wins over kickoff-location inference.
-6. The second run found a dynamic caller in `mini_ork/ported/mini_ork_cli.py`:
+6. The second run found a dynamic caller in `mini_ork/cli/main.py`:
    `_bin(root, "verify")`. The canonical kickoff now scopes that file and the
    closure gate checks dynamic resolver calls as well as literal paths.
 7. The third run closed and source-applied the verify fork, but its outer

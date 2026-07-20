@@ -1,4 +1,4 @@
-"""Parity gate: mini_ork.ported.agent_registry vs lib/agent_registry.sh.
+"""Parity gate: mini_ork.registries.agent_registry vs lib/agent_registry.sh.
 
 Strangler-fig co-existence: bash stays in place, this is the additive Python
 port. Every case runs the bash source AND the Python port in separate temp
@@ -29,7 +29,7 @@ import pytest
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
-from mini_ork.ported import agent_registry as ar  # noqa: E402
+from mini_ork.registries import agent_registry as ar
 
 AR_SH = REPO / "lib" / "agent_registry.sh"
 TRACE_SH = REPO / "lib" / "trace_store.sh"
@@ -104,7 +104,7 @@ def test_register_returns_version_id_and_get_returns_row():
             ["python3", "-c",
              "import os, sys, json; sys.path.insert(0, '.'); "
              "os.environ['MINI_ORK_DB']=sys.argv[1]; "
-             "from mini_ork.ported.agent_registry import register; "
+             "from mini_ork.registries.agent_registry import register; "
              "print(register('planner', json.loads(sys.argv[2])))",
              py_db, payload],
             capture_output=True, text=True, cwd=str(REPO))
@@ -125,7 +125,7 @@ def test_register_returns_version_id_and_get_returns_row():
             ["python3", "-c",
              "import os, sys, json; sys.path.insert(0, '.'); "
              "os.environ['MINI_ORK_DB']=sys.argv[1]; "
-             "from mini_ork.ported.agent_registry import get; "
+             "from mini_ork.registries.agent_registry import get; "
              "r = get('planner', sys.argv[2]); "
              "print(json.dumps(r) if r else 'null')",
              py_db, vid_py],
@@ -182,7 +182,7 @@ def test_register_retires_previous_active():
             ["python3", "-c",
              "import os, sys, json; sys.path.insert(0, '.'); "
              "os.environ['MINI_ORK_DB']=sys.argv[1]; "
-             "from mini_ork.ported.agent_registry import register; "
+             "from mini_ork.registries.agent_registry import register; "
              "print(register('planner', json.loads(sys.argv[2])))",
              py_db, payload_a],
             capture_output=True, text=True, cwd=str(REPO))
@@ -191,7 +191,7 @@ def test_register_retires_previous_active():
             ["python3", "-c",
              "import os, sys, json; sys.path.insert(0, '.'); "
              "os.environ['MINI_ORK_DB']=sys.argv[1]; "
-             "from mini_ork.ported.agent_registry import register; "
+             "from mini_ork.registries.agent_registry import register; "
              "print(register('planner', json.loads(sys.argv[2])))",
              py_db, payload_b],
             capture_output=True, text=True, cwd=str(REPO))
@@ -231,7 +231,7 @@ def test_current_returns_active_or_null():
             ["python3", "-c",
              "import os, sys; sys.path.insert(0, '.'); "
              "os.environ['MINI_ORK_DB']=sys.argv[1]; "
-             "from mini_ork.ported.agent_registry import register, current; "
+             "from mini_ork.registries.agent_registry import register, current; "
              "register('planner', {'model':'m1'}); "
              "import json; r = current('planner'); "
              "print(json.dumps(r) if r else 'null')",
@@ -253,7 +253,7 @@ def test_current_returns_active_or_null():
             ["python3", "-c",
              "import os, sys, json; sys.path.insert(0, '.'); "
              "os.environ['MINI_ORK_DB']=sys.argv[1]; "
-             "from mini_ork.ported.agent_registry import current; "
+             "from mini_ork.registries.agent_registry import current; "
              "r = current('role-no-such-xyz'); "
              "print(json.dumps(r) if r else 'null')",
              py_db],
@@ -284,7 +284,7 @@ def test_get_unknown_version_returns_none():
             ["python3", "-c",
              "import os, sys, json; sys.path.insert(0, '.'); "
              "os.environ['MINI_ORK_DB']=sys.argv[1]; "
-             "from mini_ork.ported.agent_registry import get; "
+             "from mini_ork.registries.agent_registry import get; "
              "r = get('planner', 'av-doesnotexist'); "
              "print(json.dumps(r) if r else 'null')",
              py_db],
@@ -312,7 +312,7 @@ def test_performance_aggregates_traces():
             ["python3", "-c",
              "import os, sys; sys.path.insert(0, '.'); "
              "os.environ['MINI_ORK_DB']=sys.argv[1]; "
-             "from mini_ork.ported.agent_registry import register; "
+             "from mini_ork.registries.agent_registry import register; "
              "print(register('planner', {'model':'m1'}))",
              py_db],
             capture_output=True, text=True, cwd=str(REPO))
@@ -345,7 +345,7 @@ def test_performance_aggregates_traces():
             ["python3", "-c",
              "import os, sys, json; sys.path.insert(0, '.'); "
              "os.environ['MINI_ORK_DB']=sys.argv[1]; "
-             "from mini_ork.ported.agent_registry import performance; "
+             "from mini_ork.registries.agent_registry import performance; "
              "print(json.dumps(performance('planner')))",
              py_db],
             capture_output=True, text=True, cwd=str(REPO))
@@ -401,7 +401,7 @@ def test_register_errors_match():
             "import os, sys\n"
             "sys.path.insert(0, '.')\n"
             "os.environ['MINI_ORK_DB'] = sys.argv[1]\n"
-            "from mini_ork.ported.agent_registry import register\n"
+            "from mini_ork.registries.agent_registry import register\n"
             "try:\n"
             "    register('executor', 'not-json')\n"
             "except ValueError as e:\n"
@@ -422,7 +422,7 @@ def test_register_errors_match():
             "import os, sys\n"
             "sys.path.insert(0, '.')\n"
             "os.environ['MINI_ORK_DB'] = sys.argv[1]\n"
-            "from mini_ork.ported.agent_registry import register\n"
+            "from mini_ork.registries.agent_registry import register\n"
             "try:\n"
             "    register('executor', {'provider': 'anthropic'})\n"
             "except ValueError as e:\n"
@@ -474,7 +474,7 @@ def test_init_sh_bootstrapped_db(tmp_path):
             ["python3", "-c",
              "import os, sys; sys.path.insert(0, '.'); "
              "os.environ['MINI_ORK_DB']=sys.argv[1]; "
-             "from mini_ork.ported.agent_registry import register; "
+             "from mini_ork.registries.agent_registry import register; "
              "print(register('planner', {'model':'m1'}))",
              py_db],
             capture_output=True, text=True, cwd=str(REPO))

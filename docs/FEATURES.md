@@ -46,7 +46,7 @@ is structural:
 | Stage-level memoization | `lib/cache.sh` | LLM stages emit cache rows; identical stages reuse prior output instead of re-paying. |
 | Rubric pre-screen | `lib/rubric-prescreen.sh` | Cheap 8-item context-grounded checklist runs *before* expensive test execution (arXiv 2601.04171). |
 | Deterministic verifiers | `recipes/*/verifiers/*.sh` | Pass/fail is a shell script exit code — zero tokens spent on judging what a test suite can decide. |
-| Escalate-up-only ladder | `config/agents/*.yaml` (`fallback_above`) + `escalates_to` edges in `mini_ork/ported/mini_ork_execute.py` | Work starts on the cheapest capable model. DAG `escalates_to` edges fire only on gate failure; agent definitions declare a `fallback_above` precision ladder terminating at opus (see `config/README.md`). |
+| Escalate-up-only ladder | `config/agents/*.yaml` (`fallback_above`) + `escalates_to` edges in `mini_ork/cli/execute.py` | Work starts on the cheapest capable model. DAG `escalates_to` edges fire only on gate failure; agent definitions declare a `fallback_above` precision ladder terminating at opus (see `config/README.md`). |
 | Throttle guard | `lib/throttle-guard.sh` | Classifies provider throttles, applies per-lane exponential backoff, halts systemically at 3 simultaneous provider failures — no retry storms. |
 | Free dry-run mode | `MINI_ORK_DRY_RUN=1` | Full classify → plan → execute → verify walk with zero LLM calls. Debug pipelines for free. |
 | Cheap observability smoke | `recipes/obs-smoke/` | 2-node recipe that exercises every telemetry surface for pennies. |
@@ -61,9 +61,9 @@ experience and feeds it forward:
 | Persistent state substrate | `.mini-ork/state.db` (SQLite, WAL) | `task_runs`, `execution_traces`, `gradient_records`, `pattern_records`, `benchmark_results`, `version_registry` survive across sessions, branches, machines. |
 | 8 memory namespaces | `db/migrations/` (19 migrations) | task / workflow / agent_performance / failure / recovery / user_preference / artifact / benchmark. |
 | Execution traces with lineage | `lib/trace_store.sh` | Every node dispatch records tool calls, files read/written, cost, duration, workflow-version hash, and prompt-template hash — full provenance per artifact. |
-| Textual gradient extraction | `mini_ork/ported/mini_ork_reflect.py` + `mini_ork/ported/reflection_pipeline.py` | Reflection turns failed/successful traces into natural-language "gradients": what to do differently next time, with confidence scores. |
+| Textual gradient extraction | `mini_ork/cli/reflect.py` + `mini_ork/learning/reflection_pipeline.py` | Reflection turns failed/successful traces into natural-language "gradients": what to do differently next time, with confidence scores. |
 | Prior-run memory injection | `mini_ork/context_assembler.py` + native plan runtime | The planner prompt receives outcomes of the 5 most recent same-class runs (per-run: nodes, failures, cost, duration) — plans calibrate against history. |
-| Learned-failure-mode injection | `mini_ork/ported/mini_ork_execute.py` | High-confidence gradients for the task class are injected into node prompts at dispatch time. |
+| Learned-failure-mode injection | `mini_ork/cli/execute.py` | High-confidence gradients for the task class are injected into node prompts at dispatch time. |
 | Auditable context packs | `bin/mini-ork-plan` (`context-pack.json`) | The full cite-tagged memory bundle available at plan time is persisted next to the plan — you can audit what the planner knew. |
 | Pattern store | `lib/pattern_store.sh` | Recurring gradients consolidate into durable pattern records. |
 | Agent performance history | `agent_performance_memory` + `lib/agent_registry.sh` | Success rate, cost, and latency accumulate per agent version — dispatch decisions get data. |

@@ -287,7 +287,7 @@ def test_contextnest_recent_sessions_from_file_hints(tmp_path):
 
 
 def test_operator_steering_render_and_consume(db, monkeypatch):
-    from mini_ork.ported import operator_steering
+    from mini_ork.steering import operator_steering
 
     monkeypatch.setenv("MINI_ORK_RUN_ID", "run-context")
     monkeypatch.setattr(operator_steering, "fetch_for", lambda run_id, role, db_path=None: [{
@@ -301,7 +301,7 @@ def test_operator_steering_render_and_consume(db, monkeypatch):
 
 
 def test_active_state_delegates_to_native_owner(db, monkeypatch):
-    from mini_ork.ported import active_state_index
+    from mini_ork.orchestration import active_state_index
 
     calls = []
     monkeypatch.setattr(

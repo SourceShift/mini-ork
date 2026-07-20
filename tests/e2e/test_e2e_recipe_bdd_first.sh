@@ -107,7 +107,7 @@ fi
 
 export MINI_ORK_RUN_ID="run-e2e-bdd-001"
 CLASSIFY_OUT="$(PYTHONPATH="$MINI_ORK_ROOT${PYTHONPATH:+:$PYTHONPATH}" \
-  python3 -m mini_ork.ported.mini_ork_classify --dry-run "$KICKOFF" 2>/dev/null)"
+  python3 -m mini_ork.cli.classify --dry-run "$KICKOFF" 2>/dev/null)"
 CLASSIFY_EXIT=$?
 _assert "classify --dry-run exits 0" '[[ "$CLASSIFY_EXIT" -eq 0 ]]'
 _assert "classify emits task_class= line" '[[ "$CLASSIFY_OUT" == *task_class=* ]]'
@@ -134,7 +134,7 @@ export MINI_ORK_RECIPE="bdd-first-delivery"
 export MINI_ORK_WORKFLOW="$RECIPE_DIR/workflow.yaml"
 
 PLAN_OUT="$(PYTHONPATH="$MINI_ORK_ROOT${PYTHONPATH:+:$PYTHONPATH}" \
-  python3 -m mini_ork.ported.mini_ork_plan --dry-run "$KICKOFF" 2>/dev/null)"
+  python3 -m mini_ork.cli.plan --dry-run "$KICKOFF" 2>/dev/null)"
 PLAN_EXIT=$?
 _assert "plan --dry-run exits 0" '[[ "$PLAN_EXIT" -eq 0 ]]'
 _assert "plan emits plan_path= on stdout" '[[ "$PLAN_OUT" == *plan_path=* ]]'

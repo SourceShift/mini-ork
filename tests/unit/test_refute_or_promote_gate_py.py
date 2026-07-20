@@ -1,4 +1,4 @@
-"""Standalone unit tests for ``mini_ork.ported.refute_or_promote_gate``.
+"""Standalone unit tests for ``mini_ork.gates.refute_or_promote_gate``.
 
 Replaces the bash-parity gate as part of the bash→Python migration: the
 Python port is now the sole implementation, so its coverage no longer runs
@@ -18,7 +18,7 @@ from typing import Any
 
 import pytest
 
-from mini_ork.ported.refute_or_promote_gate import (
+from mini_ork.gates.refute_or_promote_gate import (
     check_fabrication_survival,
     generate_fabrications,
 )

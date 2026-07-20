@@ -1,4 +1,4 @@
-"""Parity gate: ``mini_ork.ported.mini_ork_init`` vs ``bin/mini-ork-init``.
+"""Parity gate: ``mini_ork.cli.init`` vs ``bin/mini-ork-init``.
 
 Each test invokes the LIVE bash init script via subprocess and runs the
 Python port in a separate Python subprocess against an equivalent project
@@ -47,7 +47,7 @@ def _run_py(project_root: Path, env_overrides: dict[str, str] | None = None) -> 
     code = (
         "from pathlib import Path\n"
         "import sys\n"
-        "from mini_ork.ported.mini_ork_init import mini_ork_init\n"
+        "from mini_ork.cli.init import mini_ork_init\n"
         f"sys.stdout.write(mini_ork_init(Path.cwd(), {str(REPO_ROOT)!r}))\n"
     )
     return subprocess.run(
@@ -86,7 +86,7 @@ def _db_path(project: Path, env_overrides: dict[str, str] | None = None) -> Path
 
 
 def _rows(db: Path, sql: str) -> list[tuple]:
-    from mini_ork.ported.db_open import mo_sqlite
+    from mini_ork.stores.db_open import mo_sqlite
 
     return mo_sqlite(str(db), sql)[1:]
 

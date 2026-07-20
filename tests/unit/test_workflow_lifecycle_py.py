@@ -1,4 +1,4 @@
-"""Standalone unit tests for ``mini_ork.ported.workflow_lifecycle``.
+"""Standalone unit tests for ``mini_ork.orchestration.workflow_lifecycle``.
 
 Replaces the bash-parity gate as part of the bash->Python migration: the
 Python port is now the sole implementation, so its coverage no longer runs
@@ -22,7 +22,7 @@ from pathlib import Path
 
 import pytest
 
-from mini_ork.ported import workflow_lifecycle as wl
+from mini_ork.orchestration import workflow_lifecycle as wl
 
 WORKFLOW_MEMORY_SCHEMA = """
 CREATE TABLE workflow_memory (

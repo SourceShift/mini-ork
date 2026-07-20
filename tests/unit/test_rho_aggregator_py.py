@@ -1,4 +1,4 @@
-"""Standalone unit tests for ``mini_ork.ported.rho_aggregator``.
+"""Standalone unit tests for ``mini_ork.learning.rho_aggregator``.
 
 Replaces the former ``test_rho_aggregator_parity.py`` (which shelled out to
 ``lib/rho_aggregator.sh`` via ``subprocess`` and diffed byte-for-byte). The
@@ -17,7 +17,7 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
-from mini_ork.ported.rho_aggregator import aggregate_win_rates, top_prompts
+from mini_ork.learning.rho_aggregator import aggregate_win_rates, top_prompts
 
 # ── Schema (identical to the retired parity fixture) ─────────────────────────
 _DDL = """

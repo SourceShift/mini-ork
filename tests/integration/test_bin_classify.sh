@@ -9,7 +9,7 @@ export MINI_ORK_DRY_RUN=1
 
 classify_cmd() {
   PYTHONPATH="$MINI_ORK_ROOT${PYTHONPATH:+:$PYTHONPATH}" \
-    python3 -m mini_ork.ported.mini_ork_classify "$@"
+    python3 -m mini_ork.cli.classify "$@"
 }
 
 # Isolated tmp project

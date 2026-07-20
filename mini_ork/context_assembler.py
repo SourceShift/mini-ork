@@ -357,7 +357,7 @@ def prior_runs_md(task_class: str, limit: int = 5, db: str | None = None) -> str
 
 def operator_steering_md(role: str, db: str | None = None) -> str:
     """Consume and render operator guidance targeted at one agent role."""
-    from mini_ork.ported import operator_steering
+    from mini_ork.steering import operator_steering
 
     rows = operator_steering.fetch_for(
         os.environ.get("MINI_ORK_RUN_ID", ""), role, db_path=db
@@ -498,7 +498,7 @@ def active_state_md(task_class: str = "__any__", days: int = 30, db: str | None 
     """Render the native active-state index for prompt injection."""
     if os.environ.get("MO_DISABLE_ACTIVE_STATE", "0") == "1":
         return ""
-    from mini_ork.ported.active_state_index import render_active_state_block
+    from mini_ork.orchestration.active_state_index import render_active_state_block
 
     return render_active_state_block(task_class, days, db_path=db)
 

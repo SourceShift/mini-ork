@@ -1,7 +1,7 @@
-"""Parity gate: ``mini_ork.ported.mini_ork_improve`` vs ``bin/mini-ork-improve``.
+"""Parity gate: ``mini_ork.cli.improve`` vs ``bin/mini-ork-improve``.
 
 Faithful Python port of bin/mini-ork-improve, locked by a parity test that
-drives LIVE bash subprocess vs ``python3 -m mini_ork.ported.mini_ork_improve``
+drives LIVE bash subprocess vs ``python3 -m mini_ork.cli.improve``
 against a ``db/init.sh``-seeded tmp DB. No mocks, no hardcoded outputs:
 every expected output is whatever the live bash produced in this run.
 
@@ -41,7 +41,7 @@ REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
 
 BASH = REPO / "bin" / "mini-ork-improve"
-PY_MOD = "mini_ork.ported.mini_ork_improve"
+PY_MOD = "mini_ork.cli.improve"
 
 CAND_ID_RE = re.compile(r"^wc-[0-9a-f]{6,}$")
 

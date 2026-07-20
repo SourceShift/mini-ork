@@ -1,4 +1,4 @@
-"""Parity gate: ``mini_ork.ported.lane_helpers`` vs ``lib/lane-helpers.sh``.
+"""Parity gate: ``mini_ork.dispatch.lane_helpers`` vs ``lib/lane-helpers.sh``.
 
 Each test invokes the LIVE ``bash lib/lane-helpers.sh <op>`` subprocess
 (or ``bash -c '. lib/lane-helpers.sh && mo_<op> …'`` for ops that
@@ -55,7 +55,7 @@ import pytest
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
-from mini_ork.ported import lane_helpers as lh  # noqa: E402
+from mini_ork.dispatch import lane_helpers as lh
 
 LIB = REPO / "lib" / "lane-helpers.sh"
 

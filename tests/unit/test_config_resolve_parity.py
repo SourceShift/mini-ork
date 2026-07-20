@@ -1,4 +1,4 @@
-"""Parity gate: ``mini_ork.ported.config_resolve`` vs ``lib/config_resolve.sh``.
+"""Parity gate: ``mini_ork.dispatch.config_resolve`` vs ``lib/config_resolve.sh``.
 
 For each fixture we seed a self-contained home/root/run-dir tree under
 ``tmp_path``, invoke the LIVE bash functions via subprocess (no
@@ -28,7 +28,7 @@ from pathlib import Path
 
 import pytest
 
-from mini_ork.ported.config_resolve import (
+from mini_ork.dispatch.config_resolve import (
     resolve_agents_yaml,
     snapshot_run_config,
 )
@@ -327,7 +327,7 @@ def test_snapshot_parity(tmp_path, builder):
 
 def test_smoke_import_no_io():
     """Module imports cleanly; public API is callable with no I/O."""
-    import mini_ork.ported.config_resolve as mod
+    import mini_ork.dispatch.config_resolve as mod
     assert mod.resolve_agents_yaml.__name__ == "resolve_agents_yaml"
     assert mod.snapshot_run_config.__name__ == "snapshot_run_config"
     assert callable(mod.resolve_agents_yaml)

@@ -31,7 +31,7 @@ Homepage = "https://github.com/SourceShift/mini-ork"
 Documentation = "https://github.com/SourceShift/mini-ork/tree/main/docs"
 
 [project.scripts]
-mini-ork-python = "mini_ork.cli:main"
+mini-ork-python = "mini_ork.cli.facade:main"
 
 [tool.setuptools.packages.find]
 include = ["mini_ork*"]

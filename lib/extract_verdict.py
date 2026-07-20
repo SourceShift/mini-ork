@@ -4,7 +4,7 @@
 Reviewer LLMs are asked to "Respond with JSON: {"verdict": ...}" but
 routinely surround the JSON with prose (preamble like "Artifact read and
 verified..." or trailing chat) — same failure class as D-011/D-016 in
-mini_ork.ported.mini_ork_plan. A strict json.load on the review file then yields
+mini_ork.cli.plan. A strict json.load on the review file then yields
 verdict=unknown, which cascades: verifier fails review_verdict, FAIL_COUNT
 increments, rollback fires, and a passing run is marked failed
 (observed: run-1781105320-64712).

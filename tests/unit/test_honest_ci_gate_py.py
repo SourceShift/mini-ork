@@ -1,4 +1,4 @@
-"""Parity gate: mini_ork.ported.honest_ci_gate vs lib/honest_ci_gate.sh.
+"""Parity gate: mini_ork.gates.honest_ci_gate vs lib/honest_ci_gate.sh.
 
 Every case constructs a tmp findings JSON, runs the LIVE bash subprocess
 (via ``bash -c '. "$LIB" && mo_compute_finding_cis ...'``) AND the
@@ -21,7 +21,7 @@ from typing import Any
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
-from mini_ork.ported import honest_ci_gate as hci  # noqa: E402
+from mini_ork.gates import honest_ci_gate as hci
 
 SH = REPO / "lib" / "honest_ci_gate.sh"
 

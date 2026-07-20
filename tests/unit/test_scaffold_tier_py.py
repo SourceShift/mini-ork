@@ -1,4 +1,4 @@
-"""Parity gate: mini_ork.ported.scaffold_tier vs lib/scaffold_tier.sh.
+"""Parity gate: mini_ork.orchestration.scaffold_tier vs lib/scaffold_tier.sh.
 
 Eight cases (kickoff floor: ``>=6``; 2-case buffer):
 
@@ -41,7 +41,7 @@ import pytest
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
-from mini_ork.ported import scaffold_tier as st  # noqa: E402
+from mini_ork.orchestration import scaffold_tier as st
 
 SH = REPO / "lib" / "scaffold_tier.sh"
 

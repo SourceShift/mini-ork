@@ -50,12 +50,12 @@ import pytest
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
 
-from mini_ork.ported import gates_common as gc  # noqa: E402
-from mini_ork.ported import coalition_gate as coalition  # noqa: E402
-from mini_ork.ported import krippendorff_alpha_gate as krippendorff  # noqa: E402
-from mini_ork.ported import citation_verifier_mechanical as citation  # noqa: E402
-from mini_ork.ported import refute_or_promote_gate as refute  # noqa: E402
-from mini_ork.ported import honest_ci_gate as honest_ci  # noqa: E402
+from mini_ork.gates import common as gc
+from mini_ork.gates import coalition_gate as coalition
+from mini_ork.gates import krippendorff_alpha_gate as krippendorff
+from mini_ork.gates import citation_verifier_mechanical as citation
+from mini_ork.gates import refute_or_promote_gate as refute
+from mini_ork.gates import honest_ci_gate as honest_ci
 
 MIGRATION_0037 = REPO / "db" / "migrations" / "0037_grounded_rejection.sql"
 AGENTS_YAML = str(REPO / "config" / "agents.yaml")

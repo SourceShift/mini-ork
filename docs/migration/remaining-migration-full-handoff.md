@@ -93,7 +93,7 @@ omitted.
 Canonical owners:
 
 - `mini_ork.dispatch.*`
-- `mini_ork.ported.llm_dispatch`
+- `mini_ork.dispatch.llm_dispatch`
 - `mini_ork.dispatch.transcripts`
 
 Remaining work includes provider registry/wrapper fixtures, live-provider
@@ -108,18 +108,18 @@ subqueue and its validation rules.
 
 Known Bash/Python ownership pairs include:
 
-- `lib/gate_bootstrap.sh` / `mini_ork.ported.gate_bootstrap`
-- `lib/gate_registry.sh` / `mini_ork.ported.gate_registry`
-- `lib/gates_common.sh` / `mini_ork.ported.gates_common`
-- `lib/coalition_gate.sh` / `mini_ork.ported.coalition_gate`
-- `lib/circuit_breaker.sh` / `mini_ork.ported.circuit_breaker`
-- `lib/adaptive_stability.sh` / `mini_ork.ported.adaptive_stability`
-- `lib/cw_por.sh` / `mini_ork.ported.cw_por`
-- `lib/honest_ci_gate.sh` / `mini_ork.ported.honest_ci_gate`
-- `lib/krippendorff_alpha_gate.sh` / `mini_ork.ported.krippendorff_alpha_gate`
+- `lib/gate_bootstrap.sh` / `mini_ork.gates.gate_bootstrap`
+- `lib/gate_registry.sh` / `mini_ork.gates.gate_registry`
+- `lib/gates_common.sh` / `mini_ork.gates.common`
+- `lib/coalition_gate.sh` / `mini_ork.gates.coalition_gate`
+- `lib/circuit_breaker.sh` / `mini_ork.recovery.circuit_breaker`
+- `lib/adaptive_stability.sh` / `mini_ork.gates.adaptive_stability`
+- `lib/cw_por.sh` / `mini_ork.gates.cw_por`
+- `lib/honest_ci_gate.sh` / `mini_ork.gates.honest_ci_gate`
+- `lib/krippendorff_alpha_gate.sh` / `mini_ork.gates.krippendorff_alpha_gate`
 - `lib/citation_verifier_mechanical.sh` /
-  `mini_ork.ported.citation_verifier_mechanical`
-- `lib/promotion_gate.sh` / `mini_ork.ported.promotion_gate`
+  `mini_ork.gates.citation_verifier_mechanical`
+- `lib/promotion_gate.sh` / `mini_ork.gates.promotion_gate`
 
 Live shell consumers include `gates/coalition.sh`, `gates/stability.sh`,
 `gates/liveness.sh`, `gates/panel-health.sh`, `gates/synthesis-promote.sh`,
@@ -137,16 +137,16 @@ side effects.
 
 Known ownership pairs include:
 
-- `lib/policy_store.sh` / `mini_ork.ported.policy_store`
-- `lib/decision_service.sh` / `mini_ork.ported.decision_service`
-- `lib/config_resolve.sh` / `mini_ork.ported.config_resolve`
-- `lib/lane-helpers.sh` / `mini_ork.ported.lane_helpers`
-- `lib/pricing_strategy.sh` / `mini_ork.ported.pricing_strategy`
-- `lib/cost_pause.sh` / `mini_ork.ported.cost_pause`
-- `lib/deadline_budget.sh` / `mini_ork.ported.deadline_budget`
-- `lib/throttle-guard.sh` / `mini_ork.ported.throttle_guard`
-- `lib/scaffold_tier.sh` / `mini_ork.ported.scaffold_tier`
-- `lib/active_state_index.sh` / `mini_ork.ported.active_state_index`
+- `lib/policy_store.sh` / `mini_ork.stores.policy_store`
+- `lib/decision_service.sh` / `mini_ork.steering.decision_service`
+- `lib/config_resolve.sh` / `mini_ork.dispatch.config_resolve`
+- `lib/lane-helpers.sh` / `mini_ork.dispatch.lane_helpers`
+- `lib/pricing_strategy.sh` / `mini_ork.dispatch.pricing_strategy`
+- `lib/cost_pause.sh` / `mini_ork.dispatch.cost_pause`
+- `lib/deadline_budget.sh` / `mini_ork.dispatch.deadline_budget`
+- `lib/throttle-guard.sh` / `mini_ork.dispatch.throttle_guard`
+- `lib/scaffold_tier.sh` / `mini_ork.orchestration.scaffold_tier`
+- `lib/active_state_index.sh` / `mini_ork.orchestration.active_state_index`
 
 Additional live dependencies include `lib/lane_router.sh`,
 `lib/process_reward.sh`, the shared-brain smoke test, executor routing, and
@@ -161,11 +161,11 @@ boundaries merely to eliminate Bash.
 
 Known ownership pairs include:
 
-- `lib/context_role_packs.sh` / `mini_ork.ported.context_role_packs`
-- `lib/operator_steering.sh` / `mini_ork.ported.operator_steering`
-- `lib/steering_checkpoint.sh` / `mini_ork.ported.steering_checkpoint`
-- `lib/mid_node_injector.sh` / `mini_ork.ported.mid_node_injector`
-- `lib/mo_node_events.sh` / `mini_ork.ported.mo_node_events`
+- `lib/context_role_packs.sh` / `mini_ork.steering.context_role_packs`
+- `lib/operator_steering.sh` / `mini_ork.steering.operator_steering`
+- `lib/steering_checkpoint.sh` / `mini_ork.steering.steering_checkpoint`
+- `lib/mid_node_injector.sh` / `mini_ork.steering.mid_node_injector`
+- `lib/mo_node_events.sh` / `mini_ork.observability.node_events`
 
 Current shell callers include `bin/_worker-launcher.sh`, role-pack smoke tests,
 and operator-steering fixtures. Context assembler itself is already native; do
@@ -179,19 +179,19 @@ stdout/stderr discipline.
 
 Known ownership pairs include:
 
-- `lib/checkpoint.sh` / `mini_ork.ported.checkpoint`
-- `lib/finalize.sh` / `mini_ork.ported.finalize`
+- `lib/checkpoint.sh` / `mini_ork.stores.checkpoint`
+- `lib/finalize.sh` / `mini_ork.recovery.finalize`
 - `lib/recursive_orchestration.sh` /
-  `mini_ork.ported.recursive_orchestration`
-- `lib/epic_graph.sh` / `mini_ork.ported.epic_graph`
-- `lib/coord_registry.sh` / `mini_ork.ported.coord_registry`
-- `lib/coord_gate.sh` / `mini_ork.ported.coord_gate`
-- `lib/branch_quarantine.sh` / `mini_ork.ported.branch_quarantine`
-- `lib/repo_integrity_guard.sh` / `mini_ork.ported.repo_integrity_guard`
-- `lib/safety_events.sh` / `mini_ork.ported.safety_events`
-- `lib/auto-merge.sh` / `mini_ork.ported.auto_merge`
-- `lib/auto-merge-pr.sh` / `mini_ork.ported.auto_merge_pr`
-- `lib/pr-create.sh` / `mini_ork.ported.pr_create`
+  `mini_ork.orchestration.recursive`
+- `lib/epic_graph.sh` / `mini_ork.orchestration.epic_graph`
+- `lib/coord_registry.sh` / `mini_ork.registries.coord_registry`
+- `lib/coord_gate.sh` / `mini_ork.gates.coord_gate`
+- `lib/branch_quarantine.sh` / `mini_ork.vcs.branch_quarantine`
+- `lib/repo_integrity_guard.sh` / `mini_ork.vcs.repo_integrity_guard`
+- `lib/safety_events.sh` / `mini_ork.stores.safety_events`
+- `lib/auto-merge.sh` / `mini_ork.vcs.auto_merge`
+- `lib/auto-merge-pr.sh` / `mini_ork.vcs.auto_merge_pr`
+- `lib/pr-create.sh` / `mini_ork.vcs.pr_create`
 
 `lib/finalize.sh` sources auto-merge and PR creation, so treat that set as one
 dependency graph. Coordination tests source both registry and gate libraries;
@@ -204,14 +204,14 @@ branch safety, cascade ordering, pause/budget exits, and public CLI exit codes.
 
 Known ownership pairs include:
 
-- `lib/artifact_contract.sh` / `mini_ork.ported.artifact_contract`
-- `lib/harness_wrapper.sh` / `mini_ork.ported.harness_wrapper`
-- `lib/mo_otel.sh` / `mini_ork.ported.mo_otel`
-- `lib/db_open.sh` / `mini_ork.ported.db_open`
-- `lib/memory.sh` / `mini_ork.ported.memory`
-- `lib/pattern_store.sh` / `mini_ork.ported.pattern_store`
-- `lib/anchor_corpus.sh` / `mini_ork.ported.anchor_corpus`
-- `lib/bug_report.sh` / `mini_ork.ported.bug_report`
+- `lib/artifact_contract.sh` / `mini_ork.gates.artifact_contract`
+- `lib/harness_wrapper.sh` / `mini_ork.orchestration.harness_wrapper`
+- `lib/mo_otel.sh` / `mini_ork.observability.otel`
+- `lib/db_open.sh` / `mini_ork.stores.db_open`
+- `lib/memory.sh` / `mini_ork.memory.store`
+- `lib/pattern_store.sh` / `mini_ork.stores.pattern_store`
+- `lib/anchor_corpus.sh` / `mini_ork.stores.anchor_corpus`
+- `lib/bug_report.sh` / `mini_ork.observability.bug_report`
 
 Preserve artifact path security, schema-adaptive inserts, hashes and byte
 counts, compression/retention behavior, WAL/busy-timeout semantics, trace and
@@ -223,18 +223,18 @@ Do not commit databases, transcripts, run directories, or generated evidence.
 
 Known ownership pairs include:
 
-- `lib/benchmark_suite.sh` / `mini_ork.ported.benchmark_suite`
-- `lib/utility_function.sh` / `mini_ork.ported.utility_function`
-- `lib/version_registry.sh` / `mini_ork.ported.version_registry`
-- `lib/group_evolver.sh` / `mini_ork.ported.group_evolver`
-- `lib/role_evolver.sh` / `mini_ork.ported.role_evolver`
-- `lib/cross_epic_gradient.sh` / `mini_ork.ported.cross_epic_gradient`
-- `lib/blame_attributor.sh` / `mini_ork.ported.blame_attributor`
-- `lib/rho_aggregator.sh` / `mini_ork.ported.rho_aggregator`
-- `lib/topology.sh` / `mini_ork.ported.topology`
-- `lib/topology_metrics.sh` / `mini_ork.ported.topology_metrics`
-- `lib/verifier_rubric.sh` / `mini_ork.ported.verifier_rubric`
-- `lib/rubric-prescreen.sh` / `mini_ork.ported.rubric_prescreen`
+- `lib/benchmark_suite.sh` / `mini_ork.learning.benchmark_suite`
+- `lib/utility_function.sh` / `mini_ork.learning.utility_function`
+- `lib/version_registry.sh` / `mini_ork.registries.version_registry`
+- `lib/group_evolver.sh` / `mini_ork.learning.group_evolver`
+- `lib/role_evolver.sh` / `mini_ork.learning.role_evolver`
+- `lib/cross_epic_gradient.sh` / `mini_ork.learning.cross_epic_gradient`
+- `lib/blame_attributor.sh` / `mini_ork.observability.blame_attributor`
+- `lib/rho_aggregator.sh` / `mini_ork.learning.rho_aggregator`
+- `lib/topology.sh` / `mini_ork.orchestration.topology`
+- `lib/topology_metrics.sh` / `mini_ork.observability.topology_metrics`
+- `lib/verifier_rubric.sh` / `mini_ork.gates.verifier_rubric`
+- `lib/rubric-prescreen.sh` / `mini_ork.gates.rubric_prescreen`
 
 The benchmark, utility, promotion, and version-registry tests form a coupled
 E2E cluster. Preserve candidate status transitions, baseline selection,
@@ -248,10 +248,10 @@ their remaining downstream consumers, not the retired reflection libraries.
 
 Known ownership pairs include:
 
-- `lib/agent_registry.sh` / `mini_ork.ported.agent_registry`
-- `lib/healer.sh` / `mini_ork.ported.healer`
-- `lib/mo-healer-bridge.sh` / `mini_ork.ported.mo_healer_bridge`
-- `lib/cleaner.sh` / `mini_ork.ported.cleaner`
+- `lib/agent_registry.sh` / `mini_ork.registries.agent_registry`
+- `lib/healer.sh` / `mini_ork.recovery.healer`
+- `lib/mo-healer-bridge.sh` / `mini_ork.recovery.healer_bridge`
+- `lib/cleaner.sh` / `mini_ork.recovery.cleaner`
 - `lib/recovery_planner.sh` or other live recovery surfaces mapped to their
   native owners
 

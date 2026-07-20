@@ -1,4 +1,4 @@
-"""Parity gate: mini_ork.ported.rubric_prescreen vs lib/rubric-prescreen.sh.
+"""Parity gate: mini_ork.gates.rubric_prescreen vs lib/rubric-prescreen.sh.
 
 Seven cases (kickoff floor: >=6; 1-case buffer):
 
@@ -73,7 +73,7 @@ import pytest
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
-from mini_ork.ported import rubric_prescreen as rp  # noqa: E402
+from mini_ork.gates import rubric_prescreen as rp
 
 SH = REPO / "lib" / "rubric-prescreen.sh"
 CACHE_SH = REPO / "lib" / "cache.sh"

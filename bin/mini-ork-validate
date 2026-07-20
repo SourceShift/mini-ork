@@ -68,7 +68,7 @@ done
 if [ -n "$KICKOFF" ] && [ -z "$RECIPE" ]; then
   if [ -f "$KICKOFF" ]; then
     RECIPE=$(MINI_ORK_DRY_RUN=1 PYTHONPATH="${MINI_ORK_ROOT}${PYTHONPATH:+:$PYTHONPATH}" \
-      python3 -m mini_ork.ported.mini_ork_classify "$KICKOFF" 2>/dev/null \
+      python3 -m mini_ork.cli.classify "$KICKOFF" 2>/dev/null \
       | grep -E '^task_class=' | head -1 | cut -d= -f2 | tr '_' '-' || true)
   fi
 fi

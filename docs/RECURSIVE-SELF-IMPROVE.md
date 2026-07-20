@@ -38,7 +38,7 @@ bin/mini-ork-self-improve --resume --soft-cap-hours 3 --hard-cap-hours 5
                                        │
                                        ▼  per iteration
                       ┌──────────────────────────────────────────┐
-                      │  mini_ork/ported/mini_ork_execute.py                    │
+                      │  mini_ork/cli/execute.py                    │
                       │  --recipe recursive-self-improve         │
                       └──────────────────────────────────────────┘
                                        │

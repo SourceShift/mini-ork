@@ -1,4 +1,4 @@
-"""Standalone unit tests for ``mini_ork.ported.mo_emit_hook``.
+"""Standalone unit tests for ``mini_ork.observability.emit_hook``.
 
 Replaces the bash-parity gate as part of the bash→Python migration: the
 Python port is now the sole implementation, so its coverage no longer
@@ -41,8 +41,8 @@ from typing import Any
 
 import pytest
 
-from mini_ork.ported import mo_emit_hook as mod
-from mini_ork.ported.mo_emit_hook import mo_emit_hook
+from mini_ork.observability import emit_hook as mod
+from mini_ork.observability.emit_hook import mo_emit_hook
 
 
 class _RecordingRun:

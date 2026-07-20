@@ -42,12 +42,12 @@ for forbidden in ("MINI_ORK_RUNTIME", "runtime-select", "BASH_SOURCE", "source "
 tree = ast.parse(source, filename=path)
 imports_cli = any(
     isinstance(node, ast.ImportFrom)
-    and node.module == "mini_ork.ported.mini_ork_cli"
+    and node.module == "mini_ork.cli.main"
     and any(alias.name == "main" for alias in node.names)
     for node in ast.walk(tree)
 )
 if not imports_cli:
-    raise SystemExit("launcher does not import mini_ork.ported.mini_ork_cli.main")
+    raise SystemExit("launcher does not import mini_ork.cli.main.main")
 print("CLI launcher is executable, Python-only, and delegates to the native dispatcher")
 PY
   then

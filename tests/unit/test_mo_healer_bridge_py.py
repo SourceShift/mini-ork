@@ -1,4 +1,4 @@
-"""Parity gate: mini_ork.ported.mo_healer_bridge vs lib/mo-healer-bridge.sh.
+"""Parity gate: mini_ork.recovery.healer_bridge vs lib/mo-healer-bridge.sh.
 
 Each test invokes the LIVE bash subprocess (sourcing
 ``lib/mo-healer-bridge.sh``) on identical inputs as the Python port and
@@ -54,7 +54,7 @@ import pytest
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
-from mini_ork.ported import mo_healer_bridge as mhb  # noqa: E402
+from mini_ork.recovery import healer_bridge as mhb
 
 SH = REPO / "lib" / "mo-healer-bridge.sh"
 

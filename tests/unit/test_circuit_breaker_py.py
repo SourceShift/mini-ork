@@ -1,4 +1,4 @@
-"""Parity gate: mini_ork.ported.circuit_breaker vs lib/circuit_breaker.sh.
+"""Parity gate: mini_ork.recovery.circuit_breaker vs lib/circuit_breaker.sh.
 
 Each test drives the LIVE bash function ``mo_check_liveness_breaker`` via
 ``bash -c 'source lib/circuit_breaker.sh; mo_check_liveness_breaker ...'``
@@ -41,7 +41,7 @@ import pytest
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
-from mini_ork.ported import circuit_breaker as cb  # noqa: E402
+from mini_ork.recovery import circuit_breaker as cb
 
 SH = REPO / "lib" / "circuit_breaker.sh"
 

@@ -94,7 +94,7 @@ fi
 
 export MINI_ORK_RUN_ID="run-e2e-code-fix-001"
 CLASSIFY_OUT="$(PYTHONPATH="$MINI_ORK_ROOT${PYTHONPATH:+:$PYTHONPATH}" \
-  python3 -m mini_ork.ported.mini_ork_classify --dry-run "$KICKOFF" 2>/dev/null)"
+  python3 -m mini_ork.cli.classify --dry-run "$KICKOFF" 2>/dev/null)"
 CLASSIFY_EXIT=$?
 _assert "classify --dry-run exits 0" '[[ "$CLASSIFY_EXIT" -eq 0 ]]'
 _assert "classify emits task_class= on stdout" '[[ "$CLASSIFY_OUT" == *task_class=* ]]'
@@ -108,7 +108,7 @@ echo ""
 echo "--- mini-ork plan (dry-run) ---"
 
 PLAN_OUT="$(PYTHONPATH="$MINI_ORK_ROOT${PYTHONPATH:+:$PYTHONPATH}" \
-  python3 -m mini_ork.ported.mini_ork_plan --dry-run "$KICKOFF" 2>/dev/null)"
+  python3 -m mini_ork.cli.plan --dry-run "$KICKOFF" 2>/dev/null)"
 PLAN_EXIT=$?
 _assert "plan --dry-run exits 0" '[[ "$PLAN_EXIT" -eq 0 ]]'
 _assert "plan emits plan_path= on stdout" '[[ "$PLAN_OUT" == *plan_path=* ]]'
@@ -168,7 +168,7 @@ echo ""
 echo "--- mini-ork verify (dry-run) ---"
 
 VERIFY_OUT="$(env PYTHONPATH="$MINI_ORK_ROOT${PYTHONPATH:+:$PYTHONPATH}" \
-  python3 -m mini_ork.ported.mini_ork_verify 2>/dev/null || echo '[verify-failed]')"
+  python3 -m mini_ork.cli.verify 2>/dev/null || echo '[verify-failed]')"
 _assert "Python verify module ran" '[[ -n "${VERIFY_OUT:-}" ]]'
 
 echo ""

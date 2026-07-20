@@ -1,9 +1,9 @@
-"""Parity gate: mini_ork.ported.mini_ork_coord vs bin/mini-ork-coord.
+"""Parity gate: mini_ork.orchestration.coord vs bin/mini-ork-coord.
 
 Each test invokes the LIVE bash CLI dispatcher ``bin/mini-ork-coord <subcmd>
 <args>`` AS A SUBPROCESS against the SAME pinned COORD_REGISTRY_STATE_FILE /
 COORD_GATE_METRICS_FILE / COORD_GATE_AUDIT_FILE env as the Python port, then
-invokes the Python CLI dispatcher ``python -m mini_ork.ported.mini_ork_coord
+invokes the Python CLI dispatcher ``python -m mini_ork.orchestration.coord
 <subcmd> <args>`` AS A SUBPROCESS on identical inputs, and deep-compares:
     - return code (rc)            — exact-equal
     - stdout bytes                — shape-equal (lease_id is hex; deadlock
@@ -112,7 +112,7 @@ def _py(*args: str, env: dict | None = None) -> tuple[str, str, int]:
     .mini_ork_coord``. cwd=REPO so the package is importable. Returns
     (stdout, stderr, rc) mirroring the bash helper."""
     r = subprocess.run(
-        [sys.executable, "-m", "mini_ork.ported.mini_ork_coord", *args],
+        [sys.executable, "-m", "mini_ork.orchestration.coord", *args],
         cwd=str(REPO), env=env, capture_output=True, text=True,
     )
     return r.stdout, r.stderr, r.returncode
