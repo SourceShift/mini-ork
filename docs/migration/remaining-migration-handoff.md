@@ -124,6 +124,24 @@ is still physical retirement: convert the unique
 Bash gradient/reflection integration contracts to standalone Python, remove
 the two Bash libraries, and prove a zero-reference closure scan.
 
+That physical retirement fork is now complete. The live-oracle Python suites
+are standalone native contracts; unique cross-target store dedup, semantic
+trace-noise collapse, distinct-intent preservation, D5 credit restoration, and
+pattern-miner-to-promotion writeback remain covered. The mixed reflection and
+full self-improvement E2Es call the native modules directly without losing
+their still-Bash downstream coverage. Five redundant Bash suites and both
+legacy libraries were removed, and doctor/recursive-migration metadata no
+longer advertises them. The focused native suite passed 35 tests, the two E2Es
+passed 8 and 13 assertions, the remaining router suite passed 2 checks with its
+unchanged environment-dependent D1b skip, and focused Pyright was clean. A
+closure scan finds no executable reference to either retired library; old
+filenames remain only in historical changelog, kickoff, research, and refactor
+records. The repository-wide Python suite passed 1,831 tests with 28 expected
+skips and two unrelated deprecation warnings; reflect acceptance and validation
+also passed, while garden retained the existing missing operator env-var-doc
+warning. Refresh from promoted main and select the next inventory edge; the
+remaining context-assembler surface is the next item in this ownership group.
+
 ## Context
 
 The self-migrate recipe (PR #184, merged at commit 6bf438a) implements integration-point-first migration: close ONE fork (bash↔Python seam) at a time as a complete unit — make Python sole, repoint every inbound reference, retire bash entrypoint — gated on byte-parity, feature-acceptance, and static-feature ledger.

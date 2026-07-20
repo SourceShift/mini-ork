@@ -59,8 +59,8 @@ existed.
 | **Grounded rejections** | `grounded_rejections` | _table ready; prod writer = open task #9_ | review/oracle gates | refuted claims + evidence (anti-reward) |
 
 A sixth, longer-horizon loop — **self-improve / gradient** (`gradient_records`,
-4597 live rows) — is produced by `lib/reflection_pipeline.sh`,
-`lib/gradient_extractor.sh`, and `lib/cross_epic_gradient.sh`. It proposes
+4597 live rows) — is produced by `mini_ork/ported/reflection_pipeline.py`,
+`mini_ork/ported/gradient_extractor.py`, and `lib/cross_epic_gradient.sh`. It proposes
 prompt/role/recipe *changes* rather than per-run lane routing, and is documented
 separately in `docs/RECURSIVE-SELF-IMPROVE.md`.
 

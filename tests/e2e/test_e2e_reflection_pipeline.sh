@@ -25,7 +25,7 @@ echo "  E2E: reflection pipeline"
 echo "══════════════════════════════════════════════════════"
 echo ""
 
-for lib in trace_store gradient_extractor pattern_store reflection_pipeline; do
+for lib in trace_store pattern_store; do
   if [[ ! -f "$MINI_ORK_ROOT/lib/${lib}.sh" ]]; then
     _skip "lib/${lib}.sh not found — all tests deferred"
     echo ""; echo "── Results: ${PASS} OK  ${SKIP} SKIP  ${FAIL} FAIL ──"; exit 0
@@ -47,35 +47,7 @@ test_apply_migrations >/dev/null
 # shellcheck source=/dev/null
 source "$MINI_ORK_ROOT/lib/trace_store.sh"
 # shellcheck source=/dev/null
-source "$MINI_ORK_ROOT/lib/gradient_extractor.sh"
-# shellcheck source=/dev/null
 source "$MINI_ORK_ROOT/lib/pattern_store.sh"
-# shellcheck source=/dev/null
-source "$MINI_ORK_ROOT/lib/reflection_pipeline.sh"
-
-# ── LLM stub: deterministic gradient extractor ────────────────────────────────
-# Returns 1 gradient per trace, with signal keyed on the trace's task_class+status.
-# Two distinct failure patterns: "missing_context" and "timeout_error".
-_stub_gradient_extractor() {
-  local tid="$1"
-  local trace_json="$2"
-  local tc status signal
-  tc="$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('task_class','unknown'))" "$trace_json" 2>/dev/null || echo 'unknown')"
-  status="$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('status','unknown'))" "$trace_json" 2>/dev/null || echo 'unknown')"
-
-  if [[ "$status" == "failure" && "$tc" == "pattern-a"* ]]; then
-    signal="missing_context"
-    echo "{\"target\":\"workflow.node.executor\",\"signal\":\"${signal}\",\"suggested_change\":\"add context window pre-fetch\",\"evidence\":\"${tid}\",\"confidence\":0.85}"
-  elif [[ "$status" == "failure" && "$tc" == "pattern-b"* ]]; then
-    signal="timeout_error"
-    echo "{\"target\":\"workflow.node.verifier\",\"signal\":\"${signal}\",\"suggested_change\":\"increase timeout to 300s\",\"evidence\":\"${tid}\",\"confidence\":0.70}"
-  else
-    # success traces → no gradient
-    true
-  fi
-}
-export -f _stub_gradient_extractor
-export MINI_ORK_GRADIENT_EXTRACTOR_FN="_stub_gradient_extractor"
 
 echo "--- seed: 5 synthetic execution traces (2 distinct failure patterns) ---"
 
@@ -94,10 +66,27 @@ echo ""
 echo "--- gradient extraction per trace ---"
 
 for tid in "$TID_A1" "$TID_A2" "$TID_A3" "$TID_B1" "$TID_B2"; do
-  G="$(gradient_extract "$tid" 2>/dev/null || true)"
-  if [[ -n "$G" ]]; then
-    gradient_store "$G" >/dev/null 2>&1 || true
-  fi
+  python3 - "$MINI_ORK_ROOT" "$MINI_ORK_DB" "$tid" <<'PY' >/dev/null
+import json, sys
+sys.path.insert(0, sys.argv[1])
+from mini_ork.ported import gradient_extractor
+
+db, trace_id = sys.argv[2], sys.argv[3]
+def stub(tid, trace_json):
+    trace = json.loads(trace_json)
+    task_class, status = trace.get("task_class", ""), trace.get("status", "")
+    if status == "failure" and task_class.startswith("pattern-a"):
+        return [{"target": "workflow.node.executor", "signal": "missing_context",
+                 "suggested_change": "add context window pre-fetch",
+                 "evidence": tid, "confidence": 0.85}]
+    if status == "failure" and task_class.startswith("pattern-b"):
+        return [{"target": "workflow.node.verifier", "signal": "timeout_error",
+                 "suggested_change": "increase timeout to 300s",
+                 "evidence": tid, "confidence": 0.70}]
+    return []
+for gradient in gradient_extractor.extract(trace_id, db=db, override_fn=stub, emit=False):
+    gradient_extractor.store(gradient, db=db, dedup_sim=0)
+PY
 done
 
 GRAD_COUNT="$(python3 - "$MINI_ORK_DB" <<'PY'
@@ -185,7 +174,13 @@ echo ""
 echo "--- reflection_run: orchestrates all steps without LLM crash ---"
 
 SINCE_TS=0
-ROUT="$(reflection_run --since "$SINCE_TS" 2>/dev/null || echo "FAILED")"
+ROUT="$(MO_REFLECTION_EXTRACT_GRADIENTS=0 python3 - "$MINI_ORK_ROOT" "$SINCE_TS" <<'PY' 2>/dev/null || echo "FAILED"
+import sys
+sys.path.insert(0, sys.argv[1])
+from mini_ork.ported import reflection_pipeline
+reflection_pipeline.reflection_run(int(sys.argv[2]))
+PY
+)"
 _assert "reflection_run completes without crashing" '[[ "$ROUT" != "FAILED" ]]'
 
 echo ""

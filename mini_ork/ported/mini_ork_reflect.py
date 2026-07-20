@@ -266,7 +266,7 @@ def main(argv: list[str] | None = None) -> int:
     # Inject a deterministic gradient-extraction stub if the env var names a
     # function defined in `reflection_pipeline`'s globals. This is the Python
     # mirror of bash's MINI_ORK_GRADIENT_EXTRACTOR_FN override hook (see
-    # lib/gradient_extractor.sh). The test fixture defines `_rfl_stub` in this
+    # the native extractor). The test fixture defines `_rfl_stub` in this
     # module so happy-path cases can run without a live LLM.
     fn_name = os.environ.get("MINI_ORK_GRADIENT_EXTRACTOR_FN", "")
     if fn_name == "_rfl_stub":

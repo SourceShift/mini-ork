@@ -119,7 +119,7 @@ function/feature:
 |---|---|---|---|---|
 | `aggregate_win_rates` (rho) | **static** (sqlite) | byte-parity (high) | ~0 | keep static — a unit of the moat |
 | `lane_router_*` | **static** (sqlite, 588L) | byte-parity (high) | ~0 | confirm + keep static |
-| `gradient_extract` | **agentic** (shells Claude) | LLM-judge (weak) | $$ / call | **cost-down candidate**: make template/deterministic, or gate with a deterministic check |
+| `gradient_extract` | **agentic** (native dispatcher) | LLM-judge (weak) | $$ / call | **cost-down candidate**: make template/deterministic, or gate with a deterministic check |
 | `<a runtime-select fork>` | **integration** | — | — | note whether the seam itself is static or agentic |
 
 - **static** confirmed → a unit of the moat proven (cheap + hard-verifiable).
