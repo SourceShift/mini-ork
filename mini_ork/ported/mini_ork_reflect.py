@@ -3,14 +3,14 @@
 Mirrors the bash CLI byte-for-byte: same flags, same stdout/stderr lines,
 same env-var opt-out toggles (MO_PATTERN_MINER, MO_CROSS_EPIC_GRADIENTS,
 MO_BUG_REPORT_SWEEP, MO_RHO_AGGREGATE, MO_LANE_ROUTER), same SQLite writes
-via subprocess to the unported bash libs.
+through the remaining unported Bash side-channel libraries.
 
 This module owns the CLI surface and dispatches
 the load-bearing pipeline call (`reflection_run`) to the ported Python
-implementation in `mini_ork.ported.reflection_pipeline`, while side-channel
-libs (pattern_store, cross_epic_gradient, bug_report, rho_aggregator,
-lane_router) are invoked via `subprocess.run(['bash','-c', ...])` so their
-sqlite writes are byte-identical to the bash CLI. Parity is enforced by
+implementation in `mini_ork.ported.reflection_pipeline`. The rho aggregator
+and lane router are native; pattern-store, cross-epic-gradient, and bug-report
+side channels keep their legacy boundary until their own retirement slices.
+Parity is enforced by
 `tests/unit/test_mini_ork_reflect_py.py` (eight standalone golden and
 behavioral contracts captured after pre-retirement byte parity passed).
 
@@ -403,14 +403,19 @@ def main(argv: list[str] | None = None) -> int:
         sys.stdout.write(f"  [rho_aggregate] upserted {rho_updated or 0} prompt_win_rates row(s)\n")
 
     # ── side-channel: lane_router (MO_LANE_ROUTER) ──────────────────────────
-    if (os.environ.get("MO_LANE_ROUTER", "1") != "0"
-            and os.path.isfile(os.path.join(os.environ["MINI_ORK_ROOT"], "lib", "lane_router.sh"))):
-        lanes_updated = _bash_lib_call(
-            "lane_router",
-            "lane_router_recompute_advantages",
-            f"--since {since}",
-            subprocess_env,
-        )
+    if os.environ.get("MO_LANE_ROUTER", "1") != "0":
+        from mini_ork import lane_router
+
+        rp.reflection_apply_per_node_credit(db_path)
+        try:
+            try:
+                lanes_updated = lane_router.recompute_advantages(
+                    since=int(since or 0), db=db_path
+                )
+            except Exception:
+                lanes_updated = 0
+        finally:
+            rp.reflection_restore_per_node_credit(db_path)
         sys.stdout.write(
             f"  [lane_router] recomputed advantage for {lanes_updated or 0} "
             f"(lane, task_class) pair(s)\n"

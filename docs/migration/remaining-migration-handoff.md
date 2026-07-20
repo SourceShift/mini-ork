@@ -106,6 +106,24 @@ garden retained only the pre-existing operator env-var-document warning. This
 unit makes the production reflection path native; the Bash gradient/reflection
 libraries and their Bash-oracle/E2E tests remain the next retirement fork.
 
+The follow-up reflection contract-closure unit ports the three remaining
+load-bearing behaviors discovered before physical retirement. Native gradient
+helpers now identify framework-internal `__*` task classes and detect the
+per-trace evidence watermark; native reflection excludes internal traces and
+skips already-processed traces before dispatch. Per-node credit reweighting is
+native, transient, gamma-clamped, and restored after routing even when router
+recomputation fails. The public reflect entrypoint now calls
+`mini_ork.lane_router.recompute_advantages` directly instead of sourcing
+`lib/lane_router.sh`. Standalone contracts cover framework filtering,
+watermark idempotency, reward apply/restore/off behavior, and the native router
+side channel. Thirty-three focused Python tests passed, the two legacy contract
+suites passed 23 checks with one environment-dependent routing skip, focused
+Pyright was clean, reflect acceptance and validation passed, and garden kept
+only the pre-existing missing operator env-var-document warning. The next fork
+is still physical retirement: convert the unique
+Bash gradient/reflection integration contracts to standalone Python, remove
+the two Bash libraries, and prove a zero-reference closure scan.
+
 ## Context
 
 The self-migrate recipe (PR #184, merged at commit 6bf438a) implements integration-point-first migration: close ONE fork (bash↔Python seam) at a time as a complete unit — make Python sole, repoint every inbound reference, retire bash entrypoint — gated on byte-parity, feature-acceptance, and static-feature ledger.

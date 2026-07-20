@@ -171,6 +171,118 @@ def _capture_py_stderr(fn) -> str:
     return buf.getvalue()
 
 
+def test_extract_excludes_framework_traces_and_honors_watermark(temp_db):
+    """Internal traces never dispatch; previously-linked traces never repeat."""
+    con = sqlite3.connect(temp_db)
+    con.execute(
+        "INSERT OR IGNORE INTO epics(id, title, status) "
+        "VALUES ('e-native-extract', 't', 'in progress')"
+    )
+    con.execute(
+        "INSERT INTO runs(epic_id, run_dir, branch, baseline_sha, agent) "
+        "VALUES ('e-native-extract', 'run-native-extract', 'main', 'sha', 'glm')"
+    )
+    run_id = con.execute("SELECT last_insert_rowid()").fetchone()[0]
+    for trace_id, task_class, created_at in (
+        ("trace-native", "code_review", "2026-07-04T00:00:00.000Z"),
+        ("trace-seen", "code_review", "2026-07-04T00:00:01.000Z"),
+        ("trace-internal", "__reflect__", "2026-07-04T00:00:02.000Z"),
+    ):
+        con.execute(
+            "INSERT INTO execution_traces(trace_id, run_id, task_class, status, created_at) "
+            "VALUES (?, ?, ?, 'success', ?)",
+            (trace_id, run_id, task_class, created_at),
+        )
+    con.execute(
+        "INSERT INTO gradient_records(gradient_id, target, signal, suggested_change, "
+        "evidence, confidence, created_at, task_class) "
+        "VALUES ('gr-seen', 'workflow.node.verify', 's', 'c', 'trace-seen', "
+        "0.8, 1700000000, 'code_review')"
+    )
+    con.commit()
+    con.close()
+
+    dispatched: list[str] = []
+
+    def _stub_extract(trace_id: str):
+        dispatched.append(trace_id)
+        yield json.dumps({
+            "gradient_id": f"gr-{trace_id}",
+            "target": "workflow.node.verify",
+            "signal": "s",
+            "suggested_change": "c",
+            "evidence": trace_id,
+            "confidence": 0.5,
+        })
+
+    rp.set_gradient_extract(_stub_extract)
+    try:
+        stderr = _capture_py_stderr(lambda: rp.reflection_extract_gradients(0))
+    finally:
+        rp.set_gradient_extract(rp._default_gradient_extract)
+
+    assert dispatched == ["trace-native"]
+    assert "skipped 1 already-extracted trace(s) (watermark)" in stderr
+    assert "extracted 1 gradients since 0" in stderr
+
+
+def test_per_node_credit_apply_restore_and_off(temp_db, monkeypatch):
+    con = sqlite3.connect(temp_db)
+    con.execute(
+        "INSERT OR IGNORE INTO epics(id, title, status) "
+        "VALUES ('e-credit', 't', 'in progress')"
+    )
+    con.execute(
+        "INSERT INTO runs(epic_id, run_dir, branch, baseline_sha, agent) "
+        "VALUES ('e-credit', 'run-credit', 'main', 'sha', 'glm')"
+    )
+    run_id = con.execute("SELECT last_insert_rowid()").fetchone()[0]
+    con.execute(
+        "INSERT INTO execution_traces(trace_id, run_id, task_class, status, "
+        "reward_g, process_reward, created_at) "
+        "VALUES ('trace-credit-high', ?, 'code_review', 'success', 0.8, 1.0, "
+        "'2026-07-04T00:00:00.000Z')",
+        (run_id,),
+    )
+    con.execute(
+        "INSERT INTO execution_traces(trace_id, run_id, task_class, status, "
+        "reward_g, process_reward, created_at) "
+        "VALUES ('trace-credit-low', ?, 'code_review', 'success', 0.8, 0.3, "
+        "'2026-07-04T00:00:01.000Z')",
+        (run_id,),
+    )
+    con.commit()
+    con.close()
+
+    monkeypatch.setenv("MO_ROUTER_PER_NODE_CREDIT", "1")
+    monkeypatch.setenv("MO_ROUTER_PER_NODE_CREDIT_GAMMA", "1.0")
+    assert rp.reflection_apply_per_node_credit(temp_db) == 2
+    con = sqlite3.connect(temp_db)
+    adjusted = dict(con.execute(
+        "SELECT trace_id, reward_g FROM execution_traces "
+        "WHERE trace_id LIKE 'trace-credit-%'"
+    ).fetchall())
+    con.close()
+    assert adjusted == {"trace-credit-high": 1.0, "trace-credit-low": 0.64}
+
+    assert rp.reflection_restore_per_node_credit(temp_db) == 2
+    con = sqlite3.connect(temp_db)
+    restored = dict(con.execute(
+        "SELECT trace_id, reward_g FROM execution_traces "
+        "WHERE trace_id LIKE 'trace-credit-%'"
+    ).fetchall())
+    backup_exists = con.execute(
+        "SELECT COUNT(*) FROM sqlite_master "
+        "WHERE type='table' AND name='per_node_credit_backup'"
+    ).fetchone()[0]
+    con.close()
+    assert restored == {"trace-credit-high": 0.8, "trace-credit-low": 0.8}
+    assert backup_exists == 0
+
+    monkeypatch.setenv("MO_ROUTER_PER_NODE_CREDIT", "0")
+    assert rp.reflection_apply_per_node_credit(temp_db) == 0
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # (2) reflection_deduplicate — pass-2 fuzzy merge (difflib signal ratio)
 # ─────────────────────────────────────────────────────────────────────────────
