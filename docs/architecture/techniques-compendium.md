@@ -126,9 +126,9 @@ Persists to `agent_performance_memory` (global), `lane_domain_advantage`, `lane_
 
 ### A7. Reflection — "gradients" (TextGrad-style)
 
-A **gradient** is a *textual* improvement signal: `{gradient_id, target, signal, suggested_change, evidence(trace_id), confidence, task_class}` in `gradient_records` (`lib/gradient_extractor.sh:24-56`, migration 0038). `target` ∈ `workflow.node.<n> | agent.<role>.prompt | workflow.edge.<n> | verifier.<n> | workflow.recipe.<n>`.
+A **gradient** is a *textual* improvement signal: `{gradient_id, target, signal, suggested_change, evidence(trace_id), confidence, task_class}` in `gradient_records` (`mini_ork/ported/gradient_extractor.py`, migration 0038). `target` ∈ `workflow.node.<n> | agent.<role>.prompt | workflow.edge.<n> | verifier.<n> | workflow.recipe.<n>`.
 
-`reflection_run` (`reflection_pipeline.sh:391-445`) runs 7 stages: **extract_gradients** (LLM 0–5 per trace, model `codex`, brace-balanced JSON recovery) → **deduplicate** (exact then `difflib` ≥0.55) → **link_failures** → **detect_stale** (`>14d`) → **summarize_patterns** (`pattern_records`) → **suggest_promotions** (`frequency ≥ 3`) → **persist** (idempotent upsert to `emergent_patterns`). **cross_epic_gradient** promotes a target recurring across ≥2 task_classes at conf ≥0.7 to `__cross_class__` with id `gr-cx-<sha256(target)[:12]>`.
+`reflection_run` (`mini_ork/ported/reflection_pipeline.py`) runs 7 stages: **extract_gradients** (LLM 0–5 per trace, model `codex`, brace-balanced JSON recovery) → **deduplicate** (exact then `difflib` ≥0.55) → **link_failures** → **detect_stale** (`>14d`) → **summarize_patterns** (`pattern_records`) → **suggest_promotions** (`frequency ≥ 3`) → **persist** (idempotent upsert to `emergent_patterns`). **cross_epic_gradient** promotes a target recurring across ≥2 task_classes at conf ≥0.7 to `__cross_class__` with id `gr-cx-<sha256(target)[:12]>`.
 
 ### A8. Gates
 

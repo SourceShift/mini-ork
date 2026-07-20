@@ -212,8 +212,8 @@ The system watches its own agents work and, when something goes wrong, **writes 
 A "gradient" is a **textual improvement signal** (TextGrad-style), stored in `gradient_records`: `{target, signal, suggested_change, confidence, evidence(trace_id)}`. The Python reflection pipeline (`mini_ork/ported/mini_ork_reflect.py` + `mini_ork/ported/reflection_pipeline.py`) does: **extract** (an LLM reads low-reward traces and proposes 0–5 gradients each) → **dedup** → **cluster** → hand off to the apply loop.
 
 Three properties that make it production-safe (shipped 2026-07-11):
-- **Idempotent extraction:** a per-trace watermark skips any trace already mined (`gradient_extractor.sh`) and excludes framework-internal `__reflect__` traces — so re-running reflect over an overlapping window doesn't re-generate the same gradient. (Before this fix: 9,777 gradients from only 1,603 traces — a 6× duplicate pile.)
-- **Semantic-signature dedup** (`reflection_pipeline.sh`): near-identical gradients that differ only in trace-specific noise (durations like "2.7min", costs like "$1.62", trace-ids) are normalized to a **semantic signature** and collapsed. This is why 172 differently-worded "reviewer must cite evidence" observations become **one** lesson.
+- **Idempotent extraction:** a per-trace watermark in `mini_ork/ported/gradient_extractor.py` skips any trace already mined and excludes framework-internal `__reflect__` traces — so re-running reflect over an overlapping window doesn't re-generate the same gradient. (Before this fix: 9,777 gradients from only 1,603 traces — a 6× duplicate pile.)
+- **Semantic-signature dedup** (`mini_ork/ported/reflection_pipeline.py`): near-identical gradients that differ only in trace-specific noise (durations like "2.7min", costs like "$1.62", trace-ids) are normalized to a **semantic signature** and collapsed. This is why 172 differently-worded "reviewer must cite evidence" observations become **one** lesson.
 - **Confidence + evidence:** each gradient carries a 0–1 confidence and the trace-ids that produced it, so the apply loop can rank and audit.
 
 ### Worked example

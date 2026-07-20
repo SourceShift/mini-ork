@@ -1,9 +1,4 @@
-"""Parity gate: mini_ork.ported.reflection_pipeline vs lib/reflection_pipeline.sh.
-
-Each test invokes the LIVE bash subprocess (the authoritative source) on the
-same inputs as the Python port and asserts byte-identical stdout/stderr. No
-mocks, no hardcoded expected outputs — expected is always derived from a
-control bash invocation that shares the inputs.
+"""Standalone contracts for the native reflection pipeline.
 
 8 cases (matching the bash public API):
   (1) reflection_deduplicate        — pass-1 exact merge against seeded gradient_records
@@ -15,11 +10,8 @@ control bash invocation that shares the inputs.
   (7) reflection_persist_suggestions— INSERT OR REPLACE into emergent_patterns (idempotent)
   (8) reflection_extract_gradients  — SQL trace_id selection + injected gradient_extract stub
 
-All cases use a temp DB initialised by db/init.sh (kickoff requirement). The
-case (8) bash control sets MINI_ORK_ROOT=/tmp/empty-lib-stub so the internal
-`source lib/gradient_extractor.sh` silently fails — our pre-defined stubs win,
-mirroring the Python injection contract (set_gradient_extract / set_gradient_store
-/ set_gradient_ensure_table).
+All cases use a temp DB initialized by ``db/init.sh`` and assert durable output
+and database contracts without retaining a second runtime implementation.
 """
 from __future__ import annotations
 
@@ -37,10 +29,9 @@ import pytest
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
 from mini_ork.ported import reflection_pipeline as rp  # noqa: E402
+from mini_ork.ported import pattern_store  # noqa: E402
 
-SH = REPO / "lib" / "reflection_pipeline.sh"
 INIT_SH = REPO / "db" / "init.sh"
-STUB_ROOT = "/tmp/empty-lib-stub"  # bash MINI_ORK_ROOT for case (8)
 
 
 # ── Fixtures ────────────────────────────────────────────────────────────────
@@ -48,10 +39,7 @@ STUB_ROOT = "/tmp/empty-lib-stub"  # bash MINI_ORK_ROOT for case (8)
 @pytest.fixture
 def temp_db(tmp_path_factory, monkeypatch):
     """Spin up a real mini-ork SQLite DB via db/init.sh AND point the in-process
-    Python port at it via `os.environ["MINI_ORK_DB"]`. Without the env override
-    the port would silently read from a project-level DB inherited from the
-    parent shell, breaking parity with the bash subprocess (which gets the temp
-    DB via subprocess env)."""
+    Python port at it via `os.environ["MINI_ORK_DB"]`."""
     home = tmp_path_factory.mktemp("home")
     dbp = str(home / "state.db")
     subprocess.run(
@@ -82,30 +70,13 @@ def _seed_epic_run(con: sqlite3.Connection, epic_id: str, run_dir: str) -> int:
     return con.execute("SELECT last_insert_rowid()").fetchone()[0]
 
 
-def _run_bash_function(db_path: str, bash_body: str, env_extra: dict | None = None) -> subprocess.CompletedProcess:
-    """Source lib/reflection_pipeline.sh under bash, run `bash_body`, capture stdout/stderr."""
-    env = {**os.environ, "MINI_ORK_DB": db_path, "MO_REFLECTION_BATCH": "500",
-           "MO_DEDUP_BATCH": "10000", "MO_DEDUP_FUZZY": "0.55",
-           "MINI_ORK_STALE_DAYS": "14", "MINI_ORK_PROMOTION_MIN_FREQ": "3"}
-    if env_extra:
-        env.update(env_extra)
-    wrapper = f'. "{SH}"\n{bash_body}\n'
-    return subprocess.run(
-        ["bash", "-c", wrapper],
-        env=env, capture_output=True, text=True,
-    )
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 # (1) reflection_deduplicate — pass-1 exact (target, signal) merge
 # ─────────────────────────────────────────────────────────────────────────────
 def test_reflection_deduplicate_pass1_exact(temp_db):
-    """Python `reflection_deduplicate` matches live bash pass-1 against seeded
+    """Exact duplicate pairs keep the highest-confidence row.
     gradient_records: 5 rows, two pairs of identical (target, signal); the lower-
-    confidence row in each pair is deleted. Stderr summary must match byte-for-byte.
-
-    Runs Python first, then re-seeds the DB to the pre-dedup state, then runs
-    bash — so each implementation observes the same input."""
+    confidence row in each pair is deleted."""
     seed_rows = [
         ("g-a-high",   "wf.node.foo", "verifier_output is empty",      "fix parser",    "trace-1", 0.9, "code_review"),
         ("g-a-low",    "wf.node.foo", "verifier_output is empty",      "fix parser",    "trace-1", 0.3, "code_review"),
@@ -128,23 +99,13 @@ def test_reflection_deduplicate_pass1_exact(temp_db):
         con.commit()
         con.close()
 
-    # Run Python first on the populated DB.
     _seed()
     py_stderr = _capture_py_stderr(lambda: rp.reflection_deduplicate("gradient_records"))
-
-    # Re-seed and run bash.
-    _seed()
-    r = _run_bash_function(temp_db, "reflection_deduplicate gradient_records")
-    assert r.returncode == 0, f"bash dedup failed: {r.stderr}"
-    bash_stderr = r.stderr
-
-    # Byte-parity on stderr.
-    assert py_stderr == bash_stderr, (
-        f"stderr mismatch.\n  py:   {py_stderr!r}\n  bash: {bash_stderr!r}"
+    assert py_stderr == (
+        "reflection_deduplicate: removed 2 duplicates "
+        "(2 exact, 0 fuzzy@0.55)\n"
     )
-    assert "reflection_deduplicate: removed 2 duplicates (2 exact, 0 fuzzy@0.55)" in py_stderr
 
-    # Row-diff: after bash ran on the re-seeded DB, 3 rows remain.
     con = sqlite3.connect(temp_db)
     survivors = sorted(r[0] for r in con.execute(
         "SELECT gradient_id FROM gradient_records ORDER BY gradient_id"
@@ -154,11 +115,8 @@ def test_reflection_deduplicate_pass1_exact(temp_db):
         f"unexpected survivors: {survivors!r}"
     )
 
-    # Idempotent re-run on the now-clean DB: both emit "no duplicates found".
     py_idem = _capture_py_stderr(lambda: rp.reflection_deduplicate("gradient_records"))
-    r2 = _run_bash_function(temp_db, "reflection_deduplicate gradient_records")
-    assert py_idem == r2.stderr
-    assert "no duplicates found" in py_idem
+    assert py_idem == "reflection_deduplicate: no duplicates found\n"
 
 
 def _capture_py_stderr(fn) -> str:
@@ -287,12 +245,11 @@ def test_per_node_credit_apply_restore_and_off(temp_db, monkeypatch):
 # (2) reflection_deduplicate — pass-2 fuzzy merge (difflib signal ratio)
 # ─────────────────────────────────────────────────────────────────────────────
 def test_reflection_deduplicate_pass2_fuzzy(temp_db):
-    """Python `reflection_deduplicate` matches live bash pass-2 fuzzy merge.
+    """Fuzzy duplicates keep the highest-confidence row.
 
     Seed two rows whose `signal` strings are rephrasings of the same lesson
     (similarity > 0.55). Different signal so pass-1 doesn't catch them; same
-    (task_class, target) so pass-2 groups them. Same seed strategy as (1): run
-    Python first, re-seed, then bash.
+    (task_class, target) so pass-2 groups them.
     """
     seed_rows = [
         ("g-fuzzy-hi", "wf.node.foo",
@@ -320,17 +277,11 @@ def test_reflection_deduplicate_pass2_fuzzy(temp_db):
     _seed()
     py_stderr = _capture_py_stderr(lambda: rp.reflection_deduplicate("gradient_records"))
 
-    _seed()
-    r = _run_bash_function(temp_db, "reflection_deduplicate gradient_records")
-    assert r.returncode == 0, f"bash dedup failed: {r.stderr}"
-
-    # Summary form: 1 fuzzy@0.55 removal (the lower-confidence row).
-    assert py_stderr == r.stderr, (
-        f"stderr mismatch.\n  py:   {py_stderr!r}\n  bash: {r.stderr!r}"
+    assert py_stderr == (
+        "reflection_deduplicate: removed 1 duplicates "
+        "(0 exact, 1 fuzzy@0.55)\n"
     )
-    assert "reflection_deduplicate: removed 1 duplicates (0 exact, 1 fuzzy@0.55)" in py_stderr
 
-    # Row-diff: only g-fuzzy-hi survives (DB now post-bash).
     con = sqlite3.connect(temp_db)
     survivors = [r[0] for r in con.execute(
         "SELECT gradient_id FROM gradient_records"
@@ -339,19 +290,79 @@ def test_reflection_deduplicate_pass2_fuzzy(temp_db):
     assert survivors == ["g-fuzzy-hi"], f"unexpected survivors: {survivors!r}"
 
 
+def test_semantic_noise_collapses_but_distinct_intents_survive(temp_db):
+    """Trace-local timing/cost noise collapses without merging distinct advice."""
+    now = int(time.time())
+    rows = [
+        (
+            "gr-trace-1", "agent.reviewer.prompt",
+            "verifier spent 2.7min and cost $1.62 on the empty-object fix",
+            "add a guard against empty verifier_output before re-extracting",
+            "tr-aaaa1111", 0.55,
+        ),
+        (
+            "gr-trace-2", "agent.reviewer.prompt",
+            "verifier spent 8.9min and cost $5.10 on the empty-object fix",
+            "add a guard against empty verifier_output before re-extracting",
+            "tr-bbbb2222", 0.62,
+        ),
+        (
+            "gr-trace-3", "agent.reviewer.prompt",
+            "verifier spent 633s and cost $3.53 on the empty-object fix",
+            "add a guard against empty verifier_output before re-extracting",
+            "tr-cccc3333", 0.50,
+        ),
+        (
+            "gr-intent-A", "agent.planner.prompt",
+            "planner skipped the verifier link step in the original trace",
+            "inject the verifier_output schema before the planner prompt",
+            "tr-1111aaaa", 0.7,
+        ),
+        (
+            "gr-intent-B", "agent.planner.prompt",
+            "planner emitted the wrong aggregation for the panel review",
+            "switch the lens-count aggregator from sum to majority_vote",
+            "tr-2222bbbb", 0.8,
+        ),
+    ]
+    con = sqlite3.connect(temp_db)
+    con.executemany(
+        "INSERT INTO gradient_records(gradient_id, target, signal, suggested_change, "
+        "evidence, confidence, created_at, task_class) VALUES (?,?,?,?,?,?,?,'framework_edit')",
+        [(*row, now) for row in rows],
+    )
+    con.commit()
+    con.close()
+
+    rp.reflection_deduplicate("gradient_records")
+    con = sqlite3.connect(temp_db)
+    reviewer = con.execute(
+        "SELECT gradient_id FROM gradient_records "
+        "WHERE target='agent.reviewer.prompt'"
+    ).fetchall()
+    planner = {
+        row[0] for row in con.execute(
+            "SELECT gradient_id FROM gradient_records "
+            "WHERE target='agent.planner.prompt'"
+        )
+    }
+    con.close()
+    assert reviewer == [("gr-trace-2",)]
+    assert planner == {"gr-intent-A", "gr-intent-B"}
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # (3) reflection_link_failures — row count + failure_links row content
 # ─────────────────────────────────────────────────────────────────────────────
 def test_reflection_link_failures(temp_db):
-    """Python `reflection_link_failures` matches live bash: creates failure_links
+    """Failure gradients create stable trace links.
     rows linking each (failure-status trace, gradient with that trace_id as
     evidence) pair. Counter increments per pair regardless of INSERT OR IGNORE.
 
-    Note on link_id collisions: bash truncates `link_id = fl-<tid[:8]>-<gid[:8]>`,
+    Note on link_id collisions: IDs truncate to `fl-<tid[:8]>-<gid[:8]>`,
     so 3 different (trace, gradient) pairs share the same link_id
     `fl-trace-fa-gid-fail`. INSERT OR IGNORE keeps only the first; the bash
-    counter still says "3 created/verified". The Python port mirrors this
-    exactly — including the 3-vs-1 mismatch between counter and actual rows."""
+    counter still says "3 created/verified"."""
     now = int(time.time())
 
     def _seed():
@@ -400,16 +411,7 @@ def test_reflection_link_failures(temp_db):
     _seed()
     py_stderr = _capture_py_stderr(lambda: rp.reflection_link_failures("execution_traces"))
 
-    _seed()
-    r = _run_bash_function(temp_db, "reflection_link_failures execution_traces")
-    assert r.returncode == 0, f"bash link failed: {r.stderr}"
-
-    # Stderr: same counter on both sides ("3 created/verified") despite the
-    # link_id collision (both implementations share this bash quirk).
-    assert py_stderr == r.stderr, (
-        f"stderr mismatch.\n  py:   {py_stderr!r}\n  bash: {r.stderr!r}"
-    )
-    assert "reflection_link_failures: 3 links created/verified" in py_stderr
+    assert py_stderr == "reflection_link_failures: 3 links created/verified\n"
 
     # Row-diff: link_id collision means only 1 row actually exists.
     con = sqlite3.connect(temp_db)
@@ -428,8 +430,7 @@ def test_reflection_link_failures(temp_db):
 # (4) reflection_detect_stale — JSON shape (table/stale_ids/stale_before_epoch)
 # ─────────────────────────────────────────────────────────────────────────────
 def test_reflection_detect_stale(temp_db):
-    """Python `reflection_detect_stale` matches live bash: JSON stdout with
-    {table, stale_ids, stale_before_epoch} keys + stderr summary."""
+    """Stale detection emits the documented JSON and stderr summary."""
     now = int(time.time())
     very_old = now - int(60 * 86400)  # 60 days ago → stale under default 14-day cutoff
     not_stale = now - int(2 * 86400)   # 2 days ago → not stale
@@ -453,9 +454,6 @@ def test_reflection_detect_stale(temp_db):
     con.commit()
     con.close()
 
-    r = _run_bash_function(temp_db, "reflection_detect_stale gradient_records")
-    assert r.returncode == 0, f"bash detect_stale failed: {r.stderr}"
-    # Python port.
     import io
     from contextlib import redirect_stdout, redirect_stderr
     py_out_buf = io.StringIO()
@@ -465,36 +463,26 @@ def test_reflection_detect_stale(temp_db):
     py_out = py_out_buf.getvalue()
     py_err = py_err_buf.getvalue()
 
-    # Parse JSON from both and compare structurally (timestamp floats may
-    # differ between bash and Python by sub-second noise — both compute
-    # `int(time.time()) - days * 86400` so they should match exactly).
-    bash_json = json.loads(r.stdout.strip())
     py_json = json.loads(py_out.strip())
-    assert bash_json["table"] == py_json["table"] == "gradient_records"
-    assert sorted(bash_json["stale_ids"]) == sorted(py_json["stale_ids"]) == [
+    assert py_json["table"] == "gradient_records"
+    assert sorted(py_json["stale_ids"]) == [
         "g-stale-1", "g-stale-2",
     ]
-    # Bash and Python compute `now` in two separate subprocesses; when the
-    # window base is truncated to integer seconds, the two calls can land on
-    # opposite sides of a second boundary and differ by exactly 1 (observed:
-    # bash=…654 vs py=…655). Tolerate a full-second straddle — a 1e-6 gate was
-    # a CI time-bomb that flaked whenever the calls crossed a second.
-    assert math.isclose(bash_json["stale_before_epoch"], py_json["stale_before_epoch"],
-                        rel_tol=0, abs_tol=2), (
-        f"stale_before_epoch mismatch: bash={bash_json['stale_before_epoch']} py={py_json['stale_before_epoch']}"
+    expected_cutoff = int(time.time()) - 14 * 86400
+    assert math.isclose(
+        py_json["stale_before_epoch"], expected_cutoff, rel_tol=0, abs_tol=2
     )
-    # Stderr summary must match byte-for-byte.
-    assert py_err == r.stderr, f"stderr mismatch.\n  py:   {py_err!r}\n  bash: {r.stderr!r}"
+    assert py_err == "reflection_detect_stale: 2 stale entries in gradient_records\n"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # (5) reflection_summarize_patterns — JSON shape for populated cluster_id
 # ─────────────────────────────────────────────────────────────────────────────
 def test_reflection_summarize_patterns(temp_db):
-    """Python `reflection_summarize_patterns` matches live bash JSON shape.
+    """Pattern summaries retain ordering, totals, and empty-cluster shape.
 
     The pattern_records schema (migration 0011) does NOT include cluster_id —
-    the bash function's `WHERE cluster_id = ?` would otherwise crash. We ALTER
+    the query's `WHERE cluster_id = ?` would otherwise fail. We ALTER
     TABLE to add cluster_id (same as a production migration would have done).
     """
     now = "2026-07-04T00:00:00.000Z"
@@ -524,8 +512,6 @@ def test_reflection_summarize_patterns(temp_db):
     con.commit()
     con.close()
 
-    r = _run_bash_function(temp_db, "reflection_summarize_patterns cluster-A")
-    assert r.returncode == 0, f"bash summarize failed: {r.stderr}"
     import io
     from contextlib import redirect_stdout
     py_buf = io.StringIO()
@@ -533,13 +519,7 @@ def test_reflection_summarize_patterns(temp_db):
         rp.reflection_summarize_patterns("cluster-A")
     py_out = py_buf.getvalue()
 
-    # Both must produce JSON-serialisable summaries that match in shape.
-    bash_summary = json.loads(r.stdout.strip())
     py_summary = json.loads(py_out.strip())
-    assert bash_summary == py_summary, (
-        f"summarize mismatch.\n  bash: {bash_summary!r}\n  py:   {py_summary!r}"
-    )
-    # And the shape is correct.
     assert py_summary["cluster_id"] == "cluster-A"
     assert py_summary["pattern_count"] == 2
     assert py_summary["total_frequency"] == 8  # 5 + 3
@@ -549,11 +529,9 @@ def test_reflection_summarize_patterns(temp_db):
     assert {p["pattern_id"] for p in py_summary["patterns"]} == {"p-1", "p-2"}
 
     # Also exercise the missing-cluster path: empty patterns list.
-    r2 = _run_bash_function(temp_db, "reflection_summarize_patterns cluster-Z")
     py_buf2 = io.StringIO()
     with redirect_stdout(py_buf2):
         rp.reflection_summarize_patterns("cluster-Z")
-    assert json.loads(r2.stdout.strip()) == json.loads(py_buf2.getvalue().strip())
     assert json.loads(py_buf2.getvalue().strip())["pattern_count"] == 0
 
 
@@ -561,11 +539,9 @@ def test_reflection_summarize_patterns(temp_db):
 # (6) reflection_suggest_promotions — JSON array shape with frequency-filter
 # ─────────────────────────────────────────────────────────────────────────────
 def test_reflection_suggest_promotions(temp_db):
-    """Python `reflection_suggest_promotions` matches live bash JSON array.
+    """Promotion suggestions honor frequency, ordering, and JSON shape.
 
-    Seed 4 patterns: 2 above the min_freq threshold, 2 below. Both implementations
-    must return the same 2-element array with rationale strings + sorted by
-    frequency DESC.
+    Seed 4 patterns: 2 above the min_freq threshold and 2 below.
     """
     con = sqlite3.connect(temp_db)
     con.execute("PRAGMA busy_timeout=5000")
@@ -586,8 +562,6 @@ def test_reflection_suggest_promotions(temp_db):
     con.commit()
     con.close()
 
-    r = _run_bash_function(temp_db, "reflection_suggest_promotions pattern_records")
-    assert r.returncode == 0, f"bash suggest failed: {r.stderr}"
     import io
     from contextlib import redirect_stdout
     py_buf = io.StringIO()
@@ -595,11 +569,7 @@ def test_reflection_suggest_promotions(temp_db):
         rp.reflection_suggest_promotions("pattern_records")
     py_out = py_buf.getvalue()
 
-    bash_arr = json.loads(r.stdout.strip())
     py_arr = json.loads(py_out.strip())
-    assert bash_arr == py_arr, (
-        f"suggest mismatch.\n  bash: {bash_arr!r}\n  py:   {py_arr!r}"
-    )
     assert len(py_arr) == 2
     assert [s["pattern_id"] for s in py_arr] == ["p-high-A", "p-high-B"]
     # Rationale must include the observed count + threshold (3).
@@ -618,8 +588,7 @@ def test_reflection_suggest_promotions(temp_db):
 # (7) reflection_persist_suggestions — INSERT OR REPLACE (idempotent)
 # ─────────────────────────────────────────────────────────────────────────────
 def test_reflection_persist_suggestions(temp_db):
-    """Python `reflection_persist_suggestions` matches live bash: writes
-    emergent_patterns rows keyed by pattern_id, idempotent on re-run."""
+    """Suggestions persist by pattern id and remain idempotent."""
     suggestions = [
         {
             "pattern_id": "p-1",
@@ -643,10 +612,6 @@ def test_reflection_persist_suggestions(temp_db):
     ]
     sj = json.dumps(suggestions)
 
-    r = _run_bash_function(temp_db, f"reflection_persist_suggestions {shlex_quote(sj)}")
-    assert r.returncode == 0, f"bash persist failed: {r.stderr}"
-    assert r.stdout.strip() == "2", f"bash persist count: {r.stdout!r}"
-    # Python port — also returns the count.
     py_count = rp.reflection_persist_suggestions(sj)
     assert py_count == 2, f"py persist count: {py_count}"
 
@@ -658,8 +623,6 @@ def test_reflection_persist_suggestions(temp_db):
         "strength_score, status FROM emergent_patterns ORDER BY pattern_id"
     ).fetchall()
     assert len(rows) == 2, f"unexpected row count: {rows!r}"
-    # Row content match — bash and python both write via the same INSERT OR
-    # REPLACE statement; compare to expected computed from input.
     by_id = {r[0]: r for r in rows}
     assert set(by_id.keys()) == {"p-1", "p-2"}
     p1 = by_id["p-1"]
@@ -677,10 +640,7 @@ def test_reflection_persist_suggestions(temp_db):
     assert json.loads(p2[3]) == ["adr"]
     con.close()
 
-    # Idempotent re-run: bash re-run with the same JSON → still 2 rows, still
-    # status='proposed', resolved_at=NULL.
-    r2 = _run_bash_function(temp_db, f"reflection_persist_suggestions {shlex_quote(sj)}")
-    assert r2.stdout.strip() == "2"
+    # Idempotent re-run keeps two proposed rows with no resolution timestamp.
     py_count2 = rp.reflection_persist_suggestions(sj)
     assert py_count2 == 2
     con = sqlite3.connect(temp_db)
@@ -695,9 +655,63 @@ def test_reflection_persist_suggestions(temp_db):
     con.close()
 
 
-def shlex_quote(s: str) -> str:
-    """Minimal sh-quote for shell-arg passing; tests run on macOS."""
-    return "'" + s.replace("'", "'\"'\"'") + "'"
+def test_learning_loop_writeback_from_trace_cluster(temp_db):
+    """Trace mining produces an evidence-backed, idempotent promotion row."""
+    from datetime import datetime, timedelta, timezone
+
+    con = sqlite3.connect(temp_db)
+    run_id = _seed_epic_run(con, "epic-writeback", "run-writeback")
+    recent = (datetime.now(timezone.utc) - timedelta(hours=1)).strftime(
+        "%Y-%m-%dT%H:%M:%S.000Z"
+    )
+    con.executemany(
+        "INSERT INTO execution_traces(trace_id, run_id, task_class, status, created_at) "
+        "VALUES (?, ?, 'code_fix', ?, ?)",
+        [
+            ("tr-fix-fail-1", run_id, "failure", recent),
+            ("tr-fix-fail-2", run_id, "failure", recent),
+            ("tr-fix-fail-3", run_id, "failure", recent),
+            ("tr-fix-fail-4", run_id, "failure", recent),
+            ("tr-fix-ok-1", run_id, "success", recent),
+            ("tr-fix-ok-2", run_id, "success", recent),
+        ],
+    )
+    con.commit()
+    con.close()
+
+    assert pattern_store.mine_from_traces(
+        db_path=temp_db, window="7d", min_cluster=3
+    ) == 1
+    con = sqlite3.connect(temp_db)
+    pattern = con.execute(
+        "SELECT pattern_id, description, frequency, output_type, evidence_trace_ids "
+        "FROM pattern_records WHERE frequency >= 3"
+    ).fetchone()
+    con.close()
+    assert pattern is not None
+    evidence = json.loads(pattern[4])
+    assert len(evidence) == 4
+    suggestions = json.dumps([{
+        "pattern_id": pattern[0],
+        "description": pattern[1],
+        "frequency": pattern[2],
+        "suggested_promotion_type": pattern[3],
+        "evidence_trace_ids": evidence,
+        "rationale": f"observed {pattern[2]} times",
+    }])
+
+    assert rp.reflection_persist_suggestions(suggestions) == 1
+    assert rp.reflection_persist_suggestions(suggestions) == 1
+    con = sqlite3.connect(temp_db)
+    rows = con.execute(
+        "SELECT member_item_ids_json, status FROM emergent_patterns "
+        "WHERE pattern_id=?",
+        (pattern[0],),
+    ).fetchall()
+    con.close()
+    assert len(rows) == 1
+    assert rows[0][1] == "proposed"
+    assert len(json.loads(rows[0][0])) == 4
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -725,20 +739,13 @@ def test_reflection_verify_patterns_gate(temp_db):
     """Judge-gate promotes only evidence-backed 'proposed' rows to 'approved'.
 
     Floor (defaults): strength_score >= 3 AND member-evidence count >= 1.
-    Rows below either bound stay 'proposed'. Byte-parity on the stdout count
-    between the live bash function and the Python port (run bash first, re-seed,
-    then Python — each observes the same input)."""
+    Rows below either bound stay 'proposed'."""
     seed = [
         ("p-strong",   [{"item_table": "execution_traces", "item_id": "t1"}], 5.0, "proposed"),  # pass
         ("p-weak-str", [{"item_table": "execution_traces", "item_id": "t2"}], 2.0, "proposed"),  # fail: strength
         ("p-no-ev",    [],                                                     9.0, "proposed"),  # fail: evidence
         ("p-already",  [{"item_table": "execution_traces", "item_id": "t3"}], 8.0, "approved"),  # not proposed
     ]
-
-    _seed_emergent(temp_db, seed)
-    r = _run_bash_function(temp_db, "reflection_verify_patterns")
-    assert r.returncode == 0, f"bash verify failed: {r.stderr}"
-    assert r.stdout.strip() == "1", f"bash approved count: {r.stdout!r}"
 
     _seed_emergent(temp_db, seed)
     import io
@@ -766,9 +773,6 @@ def test_reflection_verify_patterns_optout(temp_db, monkeypatch):
     """MO_EMERGENT_VERIFY=0 is a hard opt-out: nothing is promoted, count 0."""
     seed = [("p-strong", [{"item_table": "execution_traces", "item_id": "t1"}], 5.0, "proposed")]
     _seed_emergent(temp_db, seed)
-    r = _run_bash_function(temp_db, "reflection_verify_patterns",
-                           env_extra={"MO_EMERGENT_VERIFY": "0"})
-    assert r.stdout.strip() == "0"
     monkeypatch.setenv("MO_EMERGENT_VERIFY", "0")
     import io
     from contextlib import redirect_stdout
@@ -783,14 +787,12 @@ def test_reflection_verify_patterns_optout(temp_db, monkeypatch):
 
 
 def test_reflection_verify_patterns_cold(temp_db):
-    """Cold-safe: no emergent_patterns rows → count 0, no crash (both sides)."""
+    """Cold-safe: no emergent patterns returns zero without crashing."""
     con = sqlite3.connect(temp_db)
     con.execute("PRAGMA busy_timeout=5000")
     con.execute("DELETE FROM emergent_patterns")
     con.commit()
     con.close()
-    r = _run_bash_function(temp_db, "reflection_verify_patterns")
-    assert r.returncode == 0 and r.stdout.strip() == "0"
     import io
     from contextlib import redirect_stdout
     buf = io.StringIO()
@@ -803,15 +805,10 @@ def test_reflection_verify_patterns_cold(temp_db):
 # (8) reflection_extract_gradients — SQL trace_id selection + injected stub
 # ─────────────────────────────────────────────────────────────────────────────
 def test_reflection_extract_gradients(temp_db):
-    """Python `reflection_extract_gradients` matches live bash: selects the same
-    trace_ids via SQL, calls the injected `gradient_extract` stub once per trace,
+    """Extraction selects bounded trace ids, calls the injected extractor,
     emits one stdout line per gradient, writes the summary line to stderr.
 
-    `gradient_extract / gradient_store / _gradient_ensure_table` are stubbed on
-    BOTH sides (bash: pre-define functions before sourcing reflection_pipeline.sh;
-    Python: set_gradient_* before calling the port). MINI_ORK_ROOT is set to
-    `/tmp/empty-lib-stub` so bash's internal `source lib/gradient_extractor.sh`
-    silently fails and our stubs win.
+    Extract/store/schema hooks are stubbed to keep this contract deterministic.
     """
     now = "2026-07-04T12:00:00.000Z"
     con = sqlite3.connect(temp_db)
@@ -830,44 +827,6 @@ def test_reflection_extract_gradients(temp_db):
     con.commit()
     con.close()
 
-    # Stub: each trace yields 2 deterministic gradient JSON lines.
-    # We emit exactly 2 JSON objects per trace so stdout is 4 lines total
-    # (2 trace_ids × 2 gradients each).
-    stub = (
-        '_gradient_ensure_table() { return 0; }\n'
-        'gradient_store() { return 0; }\n'
-        'gradient_extract() {\n'
-        '  local tid="$1"\n'
-        '  if [ "$tid" = "trace-A" ]; then\n'
-        '    echo \'{"gradient_id":"g-A-0","target":"t","signal":"s0","suggested_change":"c0","evidence":"trace-A","confidence":0.5}\'\n'
-        '    echo \'{"gradient_id":"g-A-1","target":"t","signal":"s1","suggested_change":"c1","evidence":"trace-A","confidence":0.4}\'\n'
-        '  elif [ "$tid" = "trace-B" ]; then\n'
-        '    echo \'{"gradient_id":"g-B-0","target":"t","signal":"s0","suggested_change":"c0","evidence":"trace-B","confidence":0.7}\'\n'
-        '    echo \'{"gradient_id":"g-B-1","target":"t","signal":"s1","suggested_change":"c1","evidence":"trace-B","confidence":0.6}\'\n'
-        '  fi\n'
-        '}\n'
-        'export -f _gradient_ensure_table gradient_store gradient_extract\n'
-    )
-
-    # Bash wrapper: source reflection_pipeline.sh AFTER defining stubs so they
-    # remain authoritative; use a MINI_ORK_ROOT that doesn't have
-    # lib/gradient_extractor.sh so the internal source silently fails.
-    os.makedirs(STUB_ROOT, exist_ok=True)
-    bash_wrapper = (
-        f'MINI_ORK_ROOT="{STUB_ROOT}" MINI_ORK_DB="{temp_db}" MO_REFLECTION_BATCH=500\n'
-        f'{stub}'
-        f'. "{SH}"\n'
-        f'reflection_extract_gradients 0\n'
-    )
-    r = subprocess.run(
-        ["bash", "-c", bash_wrapper],
-        env={**os.environ, "MINI_ORK_DB": temp_db, "MO_REFLECTION_BATCH": "500",
-             "MINI_ORK_ROOT": STUB_ROOT},
-        capture_output=True, text=True,
-    )
-    assert r.returncode == 0, f"bash extract failed: {r.stderr}"
-
-    # Python port: install equivalent stubs.
     def _stub_ensure():
         return None
 
@@ -902,22 +861,13 @@ def test_reflection_extract_gradients(temp_db):
         rp.set_gradient_store(rp._default_gradient_store)
         rp.set_gradient_ensure_table(rp._default_gradient_ensure_table)
 
-    # stdout: 4 lines, one per gradient.
-    bash_lines = [ln for ln in r.stdout.splitlines() if ln]
     py_lines = [ln for ln in py_out.splitlines() if ln]
-    assert bash_lines == py_lines, (
-        f"stdout mismatch.\n  bash: {bash_lines!r}\n  py:   {py_lines!r}"
-    )
-    assert len(bash_lines) == 4
+    assert len(py_lines) == 4
     # Each line is JSON-decodable.
-    for ln in bash_lines:
+    for ln in py_lines:
         d = json.loads(ln)
         assert "gradient_id" in d and "evidence" in d
 
-    # stderr: same summary line on both sides.
-    assert py_err.strip() == r.stderr.strip(), (
-        f"stderr mismatch.\n  py:   {py_err!r}\n  bash: {r.stderr!r}"
-    )
     assert py_err.strip() == "reflection_extract_gradients: extracted 4 gradients since 0", (
         f"unexpected summary: {py_err!r}"
     )

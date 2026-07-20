@@ -33,7 +33,7 @@ The port is already native; the engine just calls the bash instead. Rewire = rep
 | `decision_service` | ✅ | execute.py | **DONE** (PR #179) |
 | `llm-dispatch` | ✅ (native on execute, invoke-prompt, profile_answerer.py, pre_push_review.py, comparative-opinions, and reflection gradients) | Bash review library and fixtures | The reflection gradient boundary is native; close remaining review/test callers before retiring the dispatcher |
 | `gate_bootstrap` | ✅ | non-execute callers | Execute now uses native bootstrap/registry behavior; retire the Bash lib only after every other caller moves |
-| `gradient_extractor` | ✅ | none in supported Python path | Native dispatch, framework filtering, and per-trace watermark are closed; Bash library/tests await physical retirement |
+| `gradient_extractor` | ✅; Bash retired | none | Native dispatch, framework filtering, watermark, persistence, dedup, and standalone contracts own the full surface |
 
 ### 2. Wrapper ports → native-ize first (real porting), then rewire
 The "port" still shells to its own bash. Reimplement the shelled functions in Python.
@@ -64,7 +64,7 @@ Coupling hubs to break first (each unblocks a group):
 - `tests/integration/test_meta_orchestrator_loop.sh` → epic_graph, topology, role_evolver (Python port `test_meta_orchestrator_loop_py.py` already written this session)
 - `tests/integration/test_gate_grounded_rejection.sh` → the 5 gates + gates_common (Python port already written)
 - `tests/integration/test_autonomous_epic_pipeline.sh` → epic_graph, context_assembler
-- the e2e suites → promotion_gate, version_registry, reflection_pipeline, trace_store, benchmark_suite
+- the e2e suites → promotion_gate, version_registry, trace_store, benchmark_suite
 
 ## Execution pattern (proven this session)
 
@@ -181,6 +181,21 @@ Per subsystem, in this order — **never a blind sweep** (a wrong port breaks ev
 - Physical deletion remains a separate fork because unique Bash semantic
   dedup, writeback, integration, and E2E contracts must first become
   standalone Python tests.
+
+### Completed retirement unit: native reflection and gradients — 2026-07-20
+
+- Removed the two legacy libraries after converting both Python parity suites
+  to standalone golden/database contracts.
+- Ported the unique cross-target containment dedup, trace-noise semantic dedup,
+  distinct-intent preservation, and pattern-miner-to-promotion writeback tests.
+- Rewired the reflection and seven-stage self-improvement E2Es to invoke native
+  gradient/reflection APIs while preserving their still-Bash downstream stages.
+- Removed five redundant Bash-only suites, removed the retired libraries from
+  doctor/recursive-migration metadata, and retained D1b/D4 router coverage
+  without its former reflection dependency.
+- The repository-wide suite passed 1,831 tests with 28 expected skips; focused
+  Pyright, both rewired E2Es, reflect acceptance, and validation passed. Garden
+  retained only the pre-existing missing operator env-var-document warning.
 
 ## Tooling
 - **framework-edit** must use a dedicated temporary runtime home with only
