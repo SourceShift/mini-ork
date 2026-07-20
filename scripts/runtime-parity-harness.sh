@@ -63,7 +63,8 @@ _check "review bad-sub" "$BIN/mini-ork-review" bogus
 
 echo "  --help/usage (strict stdout+stderr+rc — full usage text transcribed):"
 _check "plan --help"      "$BIN/mini-ork-plan" --help
-_check "classify --help"  "$BIN/mini-ork-classify" --help
+_check "classify --help"  env PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+  python3 -m mini_ork.ported.mini_ork_classify --help
 _check "conductor --help" "$BIN/mini-ork-conductor" --help
 _check "scheduler --help" "$BIN/mini-ork-scheduler" --help
 _check "epics --help"     "$BIN/mini-ork-epics" --help

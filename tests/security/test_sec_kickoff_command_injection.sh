@@ -71,10 +71,12 @@ for recipe_dir in "$MINI_ORK_ROOT/recipes/"/*/; do
     "$MINI_ORK_HOME/config/task_classes/$(basename "$recipe_dir").yaml" && break
 done
 
-classify_bin="$MINI_ORK_ROOT/bin/mini-ork-classify"
+classify_module="$MINI_ORK_ROOT/mini_ork/ported/mini_ork_classify.py"
+classify_cmd=(env "PYTHONPATH=$MINI_ORK_ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+  python3 -m mini_ork.ported.mini_ork_classify)
 plan_bin="$MINI_ORK_ROOT/bin/mini-ork-plan"
 
-[[ ! -x "$classify_bin" ]] && { _skip "mini-ork-classify not found or not executable"; echo ""; echo "=== Results: $PASS OK  $SKIP SKIP  $FAIL FAIL ==="; exit 0; }
+[[ ! -f "$classify_module" ]] && { _skip "Python classify module unavailable"; echo ""; echo "=== Results: $PASS OK  $SKIP SKIP  $FAIL FAIL ==="; exit 0; }
 
 # ── Helper: run classify on kickoff, check exit code and canary ───────────────
 
@@ -93,7 +95,7 @@ run_injection_test() {
 
   # Run classify (dry-run, swallow non-security errors)
   local exit_code=0
-  MINI_ORK_DRY_RUN=1 bash "$classify_bin" "$kickoff_path" --dry-run >/dev/null 2>&1 || exit_code=$?
+  MINI_ORK_DRY_RUN=1 "${classify_cmd[@]}" "$kickoff_path" --dry-run >/dev/null 2>&1 || exit_code=$?
 
   # Accept exit 0 (handled safely) or 2 (rejected) — never silent failure
   if [[ "$exit_code" -ne 0 && "$exit_code" -ne 2 ]]; then

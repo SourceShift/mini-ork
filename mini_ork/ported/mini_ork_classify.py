@@ -1,4 +1,4 @@
-"""Python port of bin/mini-ork-classify — keyword task router.
+"""Canonical Python classify runtime — keyword task router.
 
 Strangler-fig parity port. Scores each config/task_classes/*.yaml +
 recipes/*/task_class.yaml against the kickoff (keyword word-boundary hits,
@@ -15,6 +15,8 @@ import re
 import sys
 import time
 from pathlib import Path
+
+from mini_ork import trace_store
 
 try:
     import yaml
@@ -103,6 +105,14 @@ def _candidate_class(yaml_file: str) -> str:
     return cc.replace("-", "_")
 
 
+def _safe_trace_write(payload: dict, db: str) -> None:
+    """Best-effort trace side-channel matching Bash's ``|| true`` contract."""
+    try:
+        trace_store.trace_write(payload, db=db)
+    except Exception:
+        pass
+
+
 def main(argv: list[str] | None = None, *, db: str | None = None, root: str | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     root = root or os.environ.get("MINI_ORK_ROOT") or os.getcwd()
@@ -144,6 +154,15 @@ def main(argv: list[str] | None = None, *, db: str | None = None, root: str | No
     if not os.path.isdir(tcd):
         tcd = os.path.join(root, "config", "task_classes")
 
+    trace_id = f"tr-classify-{int(time.time())}-{os.getpid()}"
+    if dry_run == 0:
+        _safe_trace_write({
+            "trace_id": trace_id,
+            "task_class": "__classify__",
+            "status": "running",
+            "workflow_version_id": "classify-start",
+        }, db)
+
     kickoff_text = open(kickoff, encoding="utf-8", errors="replace").read()
     task_class, best = "generic", 0
     if force:
@@ -169,6 +188,7 @@ def main(argv: list[str] | None = None, *, db: str | None = None, root: str | No
         sys.stdout.write(f"[dry-run] would write task_class={task_class} to DB run row\n")
         return 0
 
+    run_id = None
     if os.path.isfile(db):
         import sqlite3
         run_id = os.environ.get("MINI_ORK_RUN_ID") or f"run-{int(time.time())}-{os.getpid()}"
@@ -186,13 +206,19 @@ def main(argv: list[str] | None = None, *, db: str | None = None, root: str | No
                     trace_id=COALESCE(task_runs.trace_id, excluded.trace_id),
                     updated_at=excluded.updated_at
             """, (run_id, task_class, recipe, resolved_wf, kickoff,
-                  f"tr-classify-{now}", now, now))
+                  trace_id, now, now))
             con.commit()
             sys.stdout.write(f"run_id={run_id}\n")
         except sqlite3.OperationalError as e:
             sys.stderr.write(f"[warn] task_runs table not yet created ({e}); DB write skipped\n")
         finally:
             con.close()
+    _safe_trace_write({
+        "trace_id": trace_id,
+        "run_id": run_id,
+        "task_class": task_class,
+        "status": "success",
+    }, db)
     return 0
 
 

@@ -1,7 +1,8 @@
 """Python port of the mini-ork entrypoint / universal-loop dispatcher.
 
 Strangler-fig parity port. Simple subcommands delegate to bin/mini-ork-<sub>
-(still bash until ported); the `run` recipe-runner walks classify → profile →
+(still bash until ported), except closed forks run as modules; the `run`
+recipe-runner walks classify → profile →
 plan → execute → rubric → verify → reflect with deadline soft-gates between
 stages. The two embedded-python blocks (recipe resolution + run-profile
 generation) are transcribed verbatim so their output byte-matches the bash.
@@ -22,7 +23,7 @@ import sys
 import time
 from pathlib import Path
 
-_EXEC_SUBS = {"classify", "plan", "execute", "reflect", "improve", "eval",
+_EXEC_SUBS = {"plan", "execute", "reflect", "improve", "eval",
               "promote", "init", "update", "spawn", "scheduler", "epics", "bugs",
               "inject", "review", "traceotter", "metrics", "rollback", "resume", "recover",
               "serve", "validate", "garden", "recipe-eval"}
@@ -293,8 +294,12 @@ def _run_lifecycle(argv, root) -> int:
 
     if os.path.isfile(first):
         kickoff = first
-        probe = subprocess.run([_bin(root, "classify"), kickoff],
-                               capture_output=True, text=True, env={**os.environ, "MINI_ORK_DRY_RUN": "1"})
+        probe = subprocess.run(
+            [sys.executable, "-m", "mini_ork.ported.mini_ork_classify", kickoff],
+            capture_output=True,
+            text=True,
+            env={**_module_env(root), "MINI_ORK_DRY_RUN": "1"},
+        )
         if probe.returncode != 0:
             sys.stderr.write(probe.stderr); return probe.returncode
         probed_class = _grep_kv(probe.stdout, "task_class")
@@ -337,8 +342,13 @@ def _run_lifecycle(argv, root) -> int:
                        capture_output=True)
 
     # ── classify ──
-    cl = subprocess.run([_bin(root, "classify"), "--task-class", derived, kickoff],
-                        capture_output=True, text=True)
+    cl = subprocess.run(
+        [sys.executable, "-m", "mini_ork.ported.mini_ork_classify",
+         "--task-class", derived, kickoff],
+        capture_output=True,
+        text=True,
+        env=_module_env(root),
+    )
     if cl.returncode != 0:
         sys.stderr.write(cl.stderr); return cl.returncode
     sys.stdout.write(cl.stdout)
@@ -461,6 +471,11 @@ def main(argv=None, *, root=None) -> int:
     if sub == "verify":
         return subprocess.run(
             [sys.executable, "-m", "mini_ork.ported.mini_ork_verify", *rest],
+            env=_module_env(root),
+        ).returncode
+    if sub == "classify":
+        return subprocess.run(
+            [sys.executable, "-m", "mini_ork.ported.mini_ork_classify", *rest],
             env=_module_env(root),
         ).returncode
     if sub in _EXEC_SUBS:

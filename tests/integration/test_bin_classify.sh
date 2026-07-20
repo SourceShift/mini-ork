@@ -1,11 +1,16 @@
 #!/usr/bin/env bash
-# tests/integration/test_bin_classify.sh — integration tests for bin/mini-ork-classify
+# tests/integration/test_bin_classify.sh — integration tests for Python classify runtime
 set -uo pipefail
 
 MINI_ORK_ROOT="${MINI_ORK_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 export MINI_ORK_ROOT
 export PATH="$MINI_ORK_ROOT/bin:$PATH"
 export MINI_ORK_DRY_RUN=1
+
+classify_cmd() {
+  PYTHONPATH="$MINI_ORK_ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+    python3 -m mini_ork.ported.mini_ork_classify "$@"
+}
 
 # Isolated tmp project
 TMPROOT=$(mktemp -d /tmp/ork-int-test-XXXXXX)
@@ -48,13 +53,13 @@ echo "── integration: mini-ork-classify ──"
 # 1. --help exits 0 and prints usage
 echo ""
 echo "--- 1. --help exits 0 ---"
-if mini-ork-classify --help >/dev/null 2>&1; then
+if classify_cmd --help >/dev/null 2>&1; then
   _ok "--help exits 0"
 else
   _fail "--help exited non-zero"
 fi
 
-HELP_OUT=$(mini-ork-classify --help 2>&1 || true)
+HELP_OUT=$(classify_cmd --help 2>&1 || true)
 if echo "$HELP_OUT" | grep -qi "classify\|usage\|kickoff\|task.class"; then
   _ok "--help output mentions expected keywords"
 else
@@ -65,7 +70,7 @@ fi
 echo ""
 echo "--- 2. Missing required arg exits 2 ---"
 EXITCODE=0
-mini-ork-classify 2>/dev/null || EXITCODE=$?
+classify_cmd 2>/dev/null || EXITCODE=$?
 if [ "$EXITCODE" -eq 2 ]; then
   _ok "no args → exit 2"
 else
@@ -76,7 +81,7 @@ fi
 echo ""
 echo "--- 3. Nonexistent file exits 2 ---"
 EXITCODE=0
-mini-ork-classify /tmp/does-not-exist-ork-$$$.md 2>/dev/null || EXITCODE=$?
+classify_cmd /tmp/does-not-exist-ork-$$$.md 2>/dev/null || EXITCODE=$?
 if [ "$EXITCODE" -eq 2 ]; then
   _ok "nonexistent kickoff → exit 2"
 else
@@ -86,7 +91,7 @@ fi
 # 4. Happy path: classify produces task_class= on stdout
 echo ""
 echo "--- 4. Happy path: task_class= emitted ---"
-OUT=$(mini-ork-classify "$TMPROOT/kickoff.md" 2>/dev/null || true)
+OUT=$(classify_cmd "$TMPROOT/kickoff.md" 2>/dev/null || true)
 if echo "$OUT" | grep -qE '^task_class='; then
   CLASS=$(echo "$OUT" | grep -E '^task_class=' | head -1 | cut -d= -f2)
   _ok "task_class=${CLASS} emitted on stdout"
@@ -97,7 +102,7 @@ fi
 # 5. keyword-matched kickoff → known task class (code_fix or similar)
 echo ""
 echo "--- 5. Keyword match → code_fix class ---"
-OUT=$(mini-ork-classify "$TMPROOT/kickoff.md" 2>/dev/null || true)
+OUT=$(classify_cmd "$TMPROOT/kickoff.md" 2>/dev/null || true)
 CLASS=$(echo "$OUT" | grep -E '^task_class=' | head -1 | cut -d= -f2)
 if [ "$CLASS" = "code_fix" ] || [ "$CLASS" = "code-fix" ]; then
   _ok "kickoff with 'fix bug' → task_class=${CLASS} (expected code_fix)"
@@ -113,7 +118,7 @@ fi
 # 6. Unrecognised kickoff → generic fallback
 echo ""
 echo "--- 6. Unrecognised content → generic fallback ---"
-OUT=$(mini-ork-classify "$TMPROOT/kickoff-generic.md" 2>/dev/null || true)
+OUT=$(classify_cmd "$TMPROOT/kickoff-generic.md" 2>/dev/null || true)
 CLASS=$(echo "$OUT" | grep -E '^task_class=' | head -1 | cut -d= -f2)
 if [ -n "$CLASS" ]; then
   _ok "unrecognised kickoff → task_class=${CLASS} (fallback emitted)"
@@ -124,7 +129,7 @@ fi
 # 7. --dry-run: prints dry-run message and exits 0
 echo ""
 echo "--- 7. --dry-run exits 0 + prints dry-run marker ---"
-OUT=$(mini-ork-classify --dry-run "$TMPROOT/kickoff.md" 2>&1 || true)
+OUT=$(classify_cmd --dry-run "$TMPROOT/kickoff.md" 2>&1 || true)
 if echo "$OUT" | grep -qi "dry.run\|dry_run"; then
   _ok "--dry-run output mentions dry-run"
 else
@@ -134,7 +139,7 @@ fi
 # 8. --workflow-version override reflected in stdout
 echo ""
 echo "--- 8. --workflow-version override emitted ---"
-OUT=$(mini-ork-classify --workflow-version "v99" "$TMPROOT/kickoff.md" 2>/dev/null || true)
+OUT=$(classify_cmd --workflow-version "v99" "$TMPROOT/kickoff.md" 2>/dev/null || true)
 if echo "$OUT" | grep -qE 'workflow_version=v99'; then
   _ok "--workflow-version v99 reflected in stdout"
 else
