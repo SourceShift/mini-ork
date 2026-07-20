@@ -9,10 +9,10 @@ mini-ork ships 6 oracle-hardening primitives under `lib/` (v0.3-rc1):
 | Synthesis-promote (W1-D) | `lib/promotion_gate.sh` | `mo_promote_synthesis_gate` | Single-signal promotion of LLM-judged candidates (Adapala 2025) |
 | Adaptive stability (W2-B) | `lib/adaptive_stability.sh` | `mo_check_panel_stability` | Wasted compute on stabilized debate panels (Hu et al 2025) |
 | Circuit breaker (W2-C) | `lib/circuit_breaker.sh` | `mo_check_liveness_breaker` | Spend-under-cap-but-zero-progress runs |
-| Gradient reframe (D-048) | `lib/gradient_extractor.sh` | recipe-shaped prompt | Audit recipes returning `[]` (coordination vs algorithmic shape) |
+| Gradient reframe (D-048) | `mini_ork/ported/gradient_extractor.py` | recipe-shaped prompt | Audit recipes returning `[]` (coordination vs algorithmic shape) |
 
-Each primitive ships with inline self-tests (`bash lib/<name>.sh`) +
-unit-test coverage under `tests/unit/test_<name>.sh`.
+The native gradient primitive has standalone pytest coverage; the remaining
+Bash gate primitives retain inline self-tests plus unit coverage.
 
 ## Recipe-level opt-in pattern
 
