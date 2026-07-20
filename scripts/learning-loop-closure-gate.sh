@@ -16,7 +16,7 @@ set -Eeuo pipefail
 
 MINI_ORK_ROOT="${MINI_ORK_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 DB="${MINI_ORK_DB:-$MINI_ORK_ROOT/.mini-ork/state.db}"
-EXEC="$MINI_ORK_ROOT/mini_ork/ported/mini_ork_execute.py"
+EXEC="$MINI_ORK_ROOT/mini_ork/cli/execute.py"
 PASS=0
 FAIL=0
 

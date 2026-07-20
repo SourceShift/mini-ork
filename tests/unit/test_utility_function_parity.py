@@ -1,4 +1,4 @@
-"""Parity gate: ``mini_ork.ported.utility_function.score`` vs ``bash lib/utility_function.sh``.
+"""Parity gate: ``mini_ork.learning.utility_function.score`` vs ``bash lib/utility_function.sh``.
 
 For each fixture we invoke the LIVE bash function via subprocess (no mocking,
 exactly as the production runtime would), capture stdout as a float, then call
@@ -25,7 +25,7 @@ from pathlib import Path
 
 import pytest
 
-from mini_ork.ported.utility_function import score
+from mini_ork.learning.utility_function import score
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 LIB_UTILITY = REPO_ROOT / "lib" / "utility_function.sh"

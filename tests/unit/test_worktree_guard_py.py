@@ -1,4 +1,4 @@
-"""Standalone unit tests for ``mini_ork.ported.worktree_guard``.
+"""Standalone unit tests for ``mini_ork.vcs.worktree_guard``.
 
 Replaces the bash-parity gate (subprocess round-trips through
 ``lib/worktree-guard.sh``) as part of the bash→Python migration: the Python
@@ -43,7 +43,7 @@ from pathlib import Path
 
 import pytest
 
-from mini_ork.ported import worktree_guard as wg
+from mini_ork.vcs import worktree_guard as wg
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Shared fixtures / helpers

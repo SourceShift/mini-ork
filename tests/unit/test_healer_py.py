@@ -1,4 +1,4 @@
-"""Parity gate: ``mini_ork.ported.healer.decide`` vs ``lib/healer.sh``.
+"""Parity gate: ``mini_ork.recovery.healer.decide`` vs ``lib/healer.sh``.
 
 Every test invokes the LIVE bash subprocess (``bash lib/healer.sh EPIC RUN_DIR``)
 with no mocks and no hardcoded expected outputs — the expected surface is
@@ -37,7 +37,7 @@ import pytest
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
-from mini_ork.ported import healer as hl  # noqa: E402
+from mini_ork.recovery import healer as hl
 
 SH = REPO / "lib" / "healer.sh"
 

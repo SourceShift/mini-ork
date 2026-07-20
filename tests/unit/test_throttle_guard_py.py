@@ -1,4 +1,4 @@
-"""Parity gate: mini_ork.ported.throttle_guard vs lib/throttle-guard.sh.
+"""Parity gate: mini_ork.dispatch.throttle_guard vs lib/throttle-guard.sh.
 
 Each test invokes the LIVE bash subprocess (no mocks, no hardcoded expected
 outputs — expected is always derived from a control bash invocation that
@@ -35,7 +35,7 @@ import pytest
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
-from mini_ork.ported import throttle_guard as tg  # noqa: E402
+from mini_ork.dispatch import throttle_guard as tg
 
 SH = REPO / "lib" / "throttle-guard.sh"
 
@@ -448,7 +448,7 @@ def test_classify_run_failures(tmp_path):
         assert b["last_error"] == p["last_error"]
         # cool_seconds varies by classification but must be one of {60, 300,
         # 600, 1800, ...} or 0 for auth — verify the ladder entry.
-        from mini_ork.ported.throttle_guard import BACKOFFS
+        from mini_ork.dispatch.throttle_guard import BACKOFFS
         assert b["cool_down_until"] in set(BACKOFFS + (0, 60))
 
 

@@ -1,4 +1,4 @@
-"""Parity gate: mini_ork.ported.mid_node_injector vs lib/mid_node_injector.sh.
+"""Parity gate: mini_ork.steering.mid_node_injector vs lib/mid_node_injector.sh.
 
 Each test invokes the LIVE bash subprocess (sourcing lib/mid_node_injector.sh
 in a single ``bash -c`` block so the functions are visible to the caller)
@@ -51,7 +51,7 @@ import pytest
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
-from mini_ork.ported import mid_node_injector as mni  # noqa: E402
+from mini_ork.steering import mid_node_injector as mni
 
 SH = REPO / "lib" / "mid_node_injector.sh"
 INIT_SH = REPO / "db" / "init.sh"

@@ -52,7 +52,7 @@ prepare function + delivers the output to the lens.
 
 1. Recipe's `workflow.yaml` adds `context_strategy: <name>` to one or
    more lens nodes.
-2. `mini_ork/ported/mini_ork_execute.py` (when reading the workflow) checks for the
+2. `mini_ork/cli/execute.py` (when reading the workflow) checks for the
    field; if present, calls `cs_dispatch <strategy_name>` BEFORE
    dispatching the lens.
 3. The lens receives the prepared context as its `KICKOFF_PATH`

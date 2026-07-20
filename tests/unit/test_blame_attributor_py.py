@@ -1,4 +1,4 @@
-"""Parity gate: mini_ork.ported.blame_attributor vs lib/blame_attributor.sh.
+"""Parity gate: mini_ork.observability.blame_attributor vs lib/blame_attributor.sh.
 
 A temp git repo with two trailer-tagged commits (run R1/opus lines 1-5, R2/sonnet
 lines 6-10) + a defect spanning both is blamed by the LIVE bash entry and the
@@ -18,7 +18,7 @@ import pytest
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
-from mini_ork.ported import blame_attributor as ba  # noqa: E402
+from mini_ork.observability import blame_attributor as ba
 
 SH = REPO / "lib" / "blame_attributor.sh"
 ENV = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "auth@e",

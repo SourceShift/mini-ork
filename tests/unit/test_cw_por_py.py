@@ -1,4 +1,4 @@
-"""Parity gate: ``mini_ork.ported.cw_por.compute_cw_por`` vs
+"""Parity gate: ``mini_ork.gates.cw_por.compute_cw_por`` vs
 ``lib/cw_por.sh:mo_compute_cw_por``.
 
 Every case invokes the LIVE bash function in a fresh subprocess — the bash
@@ -41,7 +41,7 @@ import pytest
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
-from mini_ork.ported import cw_por as cwp  # noqa: E402
+from mini_ork.gates import cw_por as cwp
 
 SH = REPO / "lib" / "cw_por.sh"
 

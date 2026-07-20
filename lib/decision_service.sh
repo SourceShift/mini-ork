@@ -138,7 +138,7 @@ decide() {
   fi
 
   # 1a) Epsilon-greedy exploration — rlm-4b-pre-b. With probability EPSILON
-  #     (default 0.10, recovered from the prior mini_ork/ported/mini_ork_execute.py argmax
+  #     (default 0.10, recovered from the prior mini_ork/cli/execute.py argmax
   #     so decide callers get the same explore/exploit semantics decide will
   #     replace), replace route with a deterministic exploration lane
   #     picked from config/agents.yaml (excluding the current exploit
@@ -195,7 +195,7 @@ if epsilon > 1.0:
     epsilon = 1.0
 
 # Seeded RNG for deterministic exploration; SystemRandom when unset so live
-# runs remain non-deterministic by default. Matches mini_ork/ported/mini_ork_execute.py's
+# runs remain non-deterministic by default. Matches mini_ork/cli/execute.py's
 # _mo_learning_governed_lane discipline.
 if seed:
     try:

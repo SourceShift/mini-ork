@@ -1,4 +1,4 @@
-"""Parity gate: mini_ork.ported.harness_wrapper vs lib/harness_wrapper.sh.
+"""Parity gate: mini_ork.orchestration.harness_wrapper vs lib/harness_wrapper.sh.
 
 Each fixture runs the LIVE bash function (via `bash -c 'source ... && mo_harness_wrap ...'`)
 and the Python port against the same workspace + harness + kickoff + env, then
@@ -27,7 +27,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
-from mini_ork.ported import harness_wrapper as hw  # noqa: E402
+from mini_ork.orchestration import harness_wrapper as hw
 
 HARNESS_WRAPPER_SH = REPO / "lib" / "harness_wrapper.sh"
 

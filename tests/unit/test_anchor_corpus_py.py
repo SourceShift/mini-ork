@@ -1,4 +1,4 @@
-"""Parity gate: mini_ork.ported.anchor_corpus vs lib/anchor_corpus.sh.
+"""Parity gate: mini_ork.stores.anchor_corpus vs lib/anchor_corpus.sh.
 
 Each test drives the LIVE bash functions ``anchor_corpus_load`` and
 ``anchor_corpus_recall`` via ``bash -c 'source lib/anchor_corpus.sh; ...'``
@@ -36,7 +36,7 @@ import pytest
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
-from mini_ork.ported import anchor_corpus as ac  # noqa: E402
+from mini_ork.stores import anchor_corpus as ac
 
 SH = REPO / "lib" / "anchor_corpus.sh"
 _FLOAT_TOL = 1e-6

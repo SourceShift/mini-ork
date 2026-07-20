@@ -17,8 +17,8 @@ import pytest
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
 from mini_ork import scheduler  # noqa: E402
-from mini_ork.ported import epic_graph as eg  # noqa: E402
-from mini_ork.ported import mini_ork_epics as epics  # noqa: E402
+from mini_ork.orchestration import epic_graph as eg
+from mini_ork.cli import epics
 
 BIN = REPO / "bin" / "mini-ork-scheduler"
 

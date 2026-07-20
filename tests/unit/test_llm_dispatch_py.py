@@ -1,4 +1,4 @@
-"""Parity gate: mini_ork.ported.llm_dispatch vs lib/llm-dispatch.sh.
+"""Parity gate: mini_ork.dispatch.llm_dispatch vs lib/llm-dispatch.sh.
 
 The provider invocation is already ported+tested in mini_ork.dispatch; here we
 parity the WRAPPER + pure helpers that remained in bash. Helpers are compared
@@ -16,7 +16,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
-from mini_ork.ported import llm_dispatch as ld  # noqa: E402
+from mini_ork.dispatch import llm_dispatch as ld
 
 LIB = REPO / "lib" / "llm-dispatch.sh"
 

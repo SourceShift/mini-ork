@@ -18,7 +18,7 @@ missing=()
 
 # Dispatcher names: researcher node `bottleneck_lens` → lens-bottleneck.md;
 # `arxiv_lens` → lens-arxiv.md (per the _lens-suffix heuristic in
-# mini_ork/ported/mini_ork_execute.py).
+# mini_ork/cli/execute.py).
 SCAN="$RUN_DIR/lens-bottleneck.md"
 SYNTH="$RUN_DIR/synthesis.md"
 ARXIV="$RUN_DIR/lens-arxiv.md"

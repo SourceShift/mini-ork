@@ -1,4 +1,4 @@
-"""Parity gate: ``mini_ork.ported.pricing_strategy.lookup`` vs ``bash lib/pricing_strategy.sh``.
+"""Parity gate: ``mini_ork.dispatch.pricing_strategy.lookup`` vs ``bash lib/pricing_strategy.sh``.
 
 For each fixture we seed a self-contained ``pricing.yaml`` under ``tmp_path``,
 invoke the LIVE bash function via subprocess (no mocking, exactly as the
@@ -29,7 +29,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from mini_ork.ported.pricing_strategy import lookup
+from mini_ork.dispatch.pricing_strategy import lookup
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 LIB_PRICING = REPO_ROOT / "lib" / "pricing_strategy.sh"

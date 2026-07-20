@@ -1,4 +1,4 @@
-"""Parity gate: mini_ork.ported.group_evolver vs lib/group_evolver.sh.
+"""Parity gate: mini_ork.learning.group_evolver vs lib/group_evolver.sh.
 
 Each test invokes the live bash subprocess (``bash -c '. lib/group_evolver.sh
 && group_propose ...'``) on the same history as the Python port and diffs
@@ -27,7 +27,7 @@ import pytest
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
-from mini_ork.ported import group_evolver as ge  # noqa: E402
+from mini_ork.learning import group_evolver as ge
 
 SH = REPO / "lib" / "group_evolver.sh"
 ND = {"candidate_id", "parent_id", "proposed_at"}

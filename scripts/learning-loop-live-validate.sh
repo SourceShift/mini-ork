@@ -47,19 +47,19 @@ export MO_LEARNING_MIN_SAMPLES="${MO_LEARNING_MIN_SAMPLES:-3}"
 # Call the Python-owned learning helpers without sourcing an executor entrypoint.
 _mo_learning_static_lane() {
   PYTHONPATH="$MINI_ORK_ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 -c \
-    'from mini_ork.ported.mini_ork_execute import learning_static_lane; import sys; print(learning_static_lane(sys.argv[1], sys.argv[2]))' "$@"
+    'from mini_ork.cli.execute import learning_static_lane; import sys; print(learning_static_lane(sys.argv[1], sys.argv[2]))' "$@"
 }
 _mo_learning_governed_lane() {
   PYTHONPATH="$MINI_ORK_ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 -c \
-    'from mini_ork.ported.mini_ork_execute import learning_governed_lane; import os,sys; print(learning_governed_lane(sys.argv[1], sys.argv[2], root=os.environ["MINI_ORK_ROOT"]))' "$@"
+    'from mini_ork.cli.execute import learning_governed_lane; import os,sys; print(learning_governed_lane(sys.argv[1], sys.argv[2], root=os.environ["MINI_ORK_ROOT"]))' "$@"
 }
 mo_learning_write_grpo_advantages() {
   PYTHONPATH="$MINI_ORK_ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 -c \
-    'from mini_ork.ported.mini_ork_execute import write_grpo_advantages; import os; write_grpo_advantages(os.environ["MINI_ORK_DB"])'
+    'from mini_ork.cli.execute import write_grpo_advantages; import os; write_grpo_advantages(os.environ["MINI_ORK_DB"])'
 }
 mo_learning_update_conductor_outcomes() {
   PYTHONPATH="$MINI_ORK_ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 -c \
-    'from mini_ork.ported.mini_ork_execute import learning_update_conductor_outcomes; import os; learning_update_conductor_outcomes(os.environ["MINI_ORK_DB"])'
+    'from mini_ork.cli.execute import learning_update_conductor_outcomes; import os; learning_update_conductor_outcomes(os.environ["MINI_ORK_DB"])'
 }
 # RHO aggregation is native Python now (lib/rho_aggregator.sh retired); fire_writers
 # calls it directly via PYTHONPATH below.
@@ -99,7 +99,7 @@ fire_writers() {
   mo_learning_write_grpo_advantages   >/dev/null 2>&1 || true
   mo_learning_update_conductor_outcomes >/dev/null 2>&1 || true
   PYTHONPATH="$MINI_ORK_ROOT" python3 -c \
-    "from mini_ork.ported.rho_aggregator import aggregate_win_rates as a; a('$MINI_ORK_DB', task_class='$TC')" \
+    "from mini_ork.learning.rho_aggregator import aggregate_win_rates as a; a('$MINI_ORK_DB', task_class='$TC')" \
     >/dev/null 2>&1 || true
 }
 

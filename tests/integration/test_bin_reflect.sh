@@ -9,7 +9,7 @@ export MINI_ORK_DRY_RUN=1
 
 reflect_cmd() {
   PYTHONPATH="${MINI_ORK_ROOT}${PYTHONPATH:+:$PYTHONPATH}" \
-    python3 -m mini_ork.ported.mini_ork_reflect "$@"
+    python3 -m mini_ork.cli.reflect "$@"
 }
 
 # Isolated tmp project

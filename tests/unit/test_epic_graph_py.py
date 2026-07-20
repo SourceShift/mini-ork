@@ -1,4 +1,4 @@
-"""Parity gate: mini_ork.ported.epic_graph vs lib/epic_graph.sh.
+"""Parity gate: mini_ork.orchestration.epic_graph vs lib/epic_graph.sh.
 
 Seeds an epic DAG (A -> B hard, A -> C soft, blocked D), then runs the same
 operations through the LIVE bash functions and the Python port on separate DB
@@ -17,7 +17,7 @@ import pytest
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
-from mini_ork.ported import epic_graph as eg  # noqa: E402
+from mini_ork.orchestration import epic_graph as eg
 
 EG_SH = REPO / "lib" / "epic_graph.sh"
 

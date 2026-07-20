@@ -64,9 +64,9 @@ if [[ ! -f "$MINI_ORK_DB" ]]; then
   exit 0
 fi
 
-classify_module="$MINI_ORK_ROOT/mini_ork/ported/mini_ork_classify.py"
+classify_module="$MINI_ORK_ROOT/mini_ork/cli/classify.py"
 classify_cmd=(env "PYTHONPATH=$MINI_ORK_ROOT${PYTHONPATH:+:$PYTHONPATH}" \
-  python3 -m mini_ork.ported.mini_ork_classify)
+  python3 -m mini_ork.cli.classify)
 [[ ! -f "$classify_module" ]] && {
   _skip "Python classify module unavailable"
   echo ""

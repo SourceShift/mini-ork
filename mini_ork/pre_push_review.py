@@ -76,7 +76,7 @@ from typing import Any, Callable, Iterable
 # Re-import the peer port so review_forward_to_bug_reports can call into
 # it without shelling out to bash (parity tests verify the same DB state
 # is reached whether we use bash sourcing or in-process Python helpers).
-from mini_ork.ported import bug_report as _bug_report
+from mini_ork.observability import bug_report as _bug_report
 
 __all__ = [
     "review_run",
@@ -485,7 +485,7 @@ def _default_llm_panel(
     dispatch_fn: Callable[..., int] | None = None,
 ) -> list[dict]:
     """Run the configured review panel through the native dispatcher."""
-    from mini_ork.ported import llm_dispatch
+    from mini_ork.dispatch import llm_dispatch
 
     dispatch_fn = dispatch_fn or llm_dispatch.mo_llm_dispatch
     panel = os.environ.get("MO_REVIEW_PANEL", "codex kimi glm").split()
@@ -1028,9 +1028,9 @@ def review_forward_to_bug_reports(
     """Mirror bash ``review_forward_to_bug_reports <rid>``.
 
     For each open issue on the review, emit a ``bug_report`` via
-    :func:`mini_ork.ported.bug_report.bug_report_emit` (in-process — no
+    :func:`mini_ork.observability.bug_report.bug_report_emit` (in-process — no
     shell-out to ``lib/bug_report.sh``) and then run
-    :func:`mini_ork.ported.bug_report.bug_report_sweep` with ``--all``.
+    :func:`mini_ork.observability.bug_report.bug_report_sweep` with ``--all``.
 
     Returns:
         Number of issues forwarded.

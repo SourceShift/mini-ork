@@ -1,4 +1,4 @@
-"""Parity gate: mini_ork.ported.coalition_gate vs lib/coalition_gate.sh.
+"""Parity gate: mini_ork.gates.coalition_gate vs lib/coalition_gate.sh.
 
 rho is neutralised (MO_RHO_THRESHOLD=999) so the verdict is driven purely by
 family collision — deterministic across bash's measured rho and the Python port.
@@ -16,7 +16,7 @@ import pytest
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
 from mini_ork import trace_store  # noqa: E402
-from mini_ork.ported import coalition_gate as cg  # noqa: E402
+from mini_ork.gates import coalition_gate as cg
 
 CG_SH = REPO / "lib" / "coalition_gate.sh"
 AGENTS = str(REPO / "config" / "agents.yaml")

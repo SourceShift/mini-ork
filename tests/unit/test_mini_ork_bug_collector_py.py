@@ -1,4 +1,4 @@
-"""Parity gate: ``mini_ork.ported.mini_ork_bug_collector`` vs ``bin/mini-ork-bug-collector``.
+"""Parity gate: ``mini_ork.observability.bug_collector`` vs ``bin/mini-ork-bug-collector``.
 
 Each test invokes the LIVE bash subprocess against a sandbox run-dir,
 then invokes the Python port via ``python -m`` against a parallel
@@ -45,7 +45,7 @@ import pytest
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
-from mini_ork.ported import mini_ork_bug_collector as py  # noqa: E402
+from mini_ork.observability import bug_collector as py
 
 BASH = REPO / "bin" / "mini-ork-bug-collector"
 
@@ -71,9 +71,9 @@ def _run_bash(args: list[str], *, env_extra: dict[str, str] | None = None) -> su
 
 
 def _run_py(args: list[str], *, env_extra: dict[str, str] | None = None) -> subprocess.CompletedProcess:
-    """Run ``python -m mini_ork.ported.mini_ork_bug_collector <args>``."""
+    """Run ``python -m mini_ork.observability.bug_collector <args>``."""
     return subprocess.run(
-        [sys.executable, "-m", "mini_ork.ported.mini_ork_bug_collector", *args],
+        [sys.executable, "-m", "mini_ork.observability.bug_collector", *args],
         env={**os.environ, **(env_extra or {})},
         capture_output=True, text=True,
     )

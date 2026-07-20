@@ -1,4 +1,4 @@
-"""Parity gate: ``mini_ork.ported.deadline_budget`` vs ``lib/deadline_budget.sh``.
+"""Parity gate: ``mini_ork.dispatch.deadline_budget`` vs ``lib/deadline_budget.sh``.
 
 The bash stays the source of truth. Each case drives the live bash via
 ``subprocess.run`` AND drives the Python port in-process (with a frozen
@@ -28,7 +28,7 @@ import pytest
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
-from mini_ork.ported import deadline_budget as db  # noqa: E402
+from mini_ork.dispatch import deadline_budget as db
 
 DL_SH = REPO / "lib" / "deadline_budget.sh"
 

@@ -1,4 +1,4 @@
-"""Parity gate: mini_ork.ported.cleaner vs lib/cleaner.sh.
+"""Parity gate: mini_ork.recovery.cleaner vs lib/cleaner.sh.
 
 The claude-worker + gauntlet paths are non-deterministic seams (LLM spawn) and
 are an integration concern. Here we parity-test every branch that reaches a
@@ -15,7 +15,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
-from mini_ork.ported import cleaner  # noqa: E402
+from mini_ork.recovery import cleaner
 
 BIN = REPO / "lib" / "cleaner.sh"
 

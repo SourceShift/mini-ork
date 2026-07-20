@@ -79,9 +79,9 @@ _check "review bad-sub" "$BIN/mini-ork-review" bogus
 
 echo "  --help/usage (strict stdout+stderr+rc — full usage text transcribed):"
 _check "plan --help"      env PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
-  python3 -m mini_ork.ported.mini_ork_plan --help
+  python3 -m mini_ork.cli.plan --help
 _check "classify --help"  env PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
-  python3 -m mini_ork.ported.mini_ork_classify --help
+  python3 -m mini_ork.cli.classify --help
 _check "conductor --help" "$BIN/mini-ork-conductor" --help
 _check "scheduler --help" "$BIN/mini-ork-scheduler" --help
 _check "epics --help"     "$BIN/mini-ork-epics" --help
@@ -92,7 +92,7 @@ _dryplan() {   # runtime passed as $1; writes plan.json, prints its content
   local rt="$1" home="$TMP/home-$1"
   MINI_ORK_RUNTIME="$rt" MINI_ORK_HOME="$home" MINI_ORK_TASK_CLASS=code_fix \
     env PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
-      python3 -m mini_ork.ported.mini_ork_plan "$TMP/k.md" \
+      python3 -m mini_ork.cli.plan "$TMP/k.md" \
       --out "$TMP/plan-$rt.json" --dry-run >/dev/null 2>&1
   cat "$TMP/plan-$rt.json" 2>/dev/null | _norm
 }

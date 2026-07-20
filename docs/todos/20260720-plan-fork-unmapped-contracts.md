@@ -40,7 +40,7 @@ Remaining parts: none.
 ## Work completed in this attempt
 
 - Replaced the Python planner's Bash `llm-dispatch.sh` subprocess with the
-  native `mini_ork.ported.llm_dispatch.llm_dispatch` API.
+  native `mini_ork.dispatch.llm_dispatch.llm_dispatch` API.
 - Preserved combined stdout/stderr capture and added a standalone native seam
   contract.
 - Repointed known executable callers and expanded the plan feature verifier.

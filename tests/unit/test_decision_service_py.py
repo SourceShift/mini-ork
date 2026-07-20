@@ -1,4 +1,4 @@
-"""Parity gate: mini_ork.ported.decision_service.decide vs lib/decision_service.sh.
+"""Parity gate: mini_ork.steering.decision_service.decide vs lib/decision_service.sh.
 
 EPSILON=0 disables exploration so both sides are deterministic. Two paths:
 cold-start (no traces -> agents.yaml default lane) and learned (seeded winner
@@ -19,7 +19,7 @@ import pytest
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
 from mini_ork import lane_router, trace_store  # noqa: E402
-from mini_ork.ported import decision_service as ds  # noqa: E402
+from mini_ork.steering import decision_service as ds
 
 DS_SH = REPO / "lib" / "decision_service.sh"
 

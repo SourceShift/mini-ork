@@ -15,8 +15,8 @@ import pytest
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 
-from mini_ork.ported import resume_prep as rpre  # noqa: E402
-from mini_ork.ported import session_store as ss  # noqa: E402
+from mini_ork.recovery import resume_prep as rpre
+from mini_ork.stores import session_store as ss
 
 FAKE_CWD = "/work/proj-y"
 

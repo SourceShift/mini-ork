@@ -1,4 +1,4 @@
-"""Parity gate: mini_ork.ported.mini_ork_self_improve vs bin/mini-ork-self-improve.
+"""Parity gate: mini_ork.cli.self_improve vs bin/mini-ork-self-improve.
 
 The outer loop creates git worktrees + dispatches LLM runs — integration. Here we
 parity the deterministic surface: early-exit flag handling vs live bash, the
@@ -16,7 +16,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
-from mini_ork.ported import mini_ork_self_improve as si  # noqa: E402
+from mini_ork.cli import self_improve as si
 
 BIN = REPO / "bin" / "mini-ork-self-improve"
 

@@ -1,4 +1,4 @@
-"""Parity gate: mini_ork.ported.gate_bootstrap vs lib/gate_bootstrap.sh.
+"""Parity gate: mini_ork.gates.gate_bootstrap vs lib/gate_bootstrap.sh.
 
 Live bash invocation via subprocess + direct Python import. Compares the final
 row content of the gate_registry table on fresh temp DBs seeded via db/init.sh.
@@ -20,7 +20,7 @@ import pytest
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
-from mini_ork.ported import gate_bootstrap as gb  # noqa: E402
+from mini_ork.gates import gate_bootstrap as gb
 
 GB_SH = REPO / "lib" / "gate_bootstrap.sh"
 

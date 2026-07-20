@@ -17,7 +17,7 @@ MINI_ORK_ROOT="${MINI_ORK_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && p
 export MINI_ORK_ROOT
 export PATH="$MINI_ORK_ROOT/bin:$PATH"
 plan_cmd=(env "PYTHONPATH=$MINI_ORK_ROOT${PYTHONPATH:+:$PYTHONPATH}" \
-  python3 -m mini_ork.ported.mini_ork_plan)
+  python3 -m mini_ork.cli.plan)
 # The CI integration harness exports MINI_ORK_DRY_RUN=1 globally (to keep tests
 # LLM-free). The given-plan branch lives AFTER the --dry-run short-circuit, so
 # these invocations MUST run non-dry to reach it — and they still make no LLM

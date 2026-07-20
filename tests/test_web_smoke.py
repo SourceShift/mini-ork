@@ -463,7 +463,7 @@ def test_correlation_reports_bridge_methods(db) -> None:
     assert "bridge_methods" in out
     assert "run_events.run_id" in out["bridge_methods"], (
         "run_events.run_id should always be listed — it's the deterministic bridge for "
-        "node lifecycle events emitted by mini_ork/ported/mini_ork_execute.py"
+        "node lifecycle events emitted by mini_ork/cli/execute.py"
     )
     # If trace_id is set (post-fix or backfill), strict methods must be available
     if out["trace_id"]:
@@ -1117,7 +1117,7 @@ def test_llm_calls_route_tolerates_null_taxonomy_columns(tmp_path: Path) -> None
 
 
 def test_profile_answerer_has_one_native_owner() -> None:
-    from mini_ork.ported import profile_answerer
+    from mini_ork.steering import profile_answerer
 
     assert not (ROOT / "lib" / "profile_answerer.sh").exists()
     assert callable(profile_answerer.answer_profile_questions)
@@ -1129,7 +1129,7 @@ def test_python_plan_references_native_auto_answer() -> None:
     plan = (ROOT / "mini_ork" / "ported" / "mini_ork_plan.py").read_text()
 
     assert "MO_AUTO_ANSWER_PROFILE" in plan
-    assert "mini_ork.ported.profile_answerer" in plan
+    assert "mini_ork.steering.profile_answerer" in plan
     assert "answer_profile_questions" in plan
 
 

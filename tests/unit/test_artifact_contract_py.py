@@ -1,4 +1,4 @@
-"""Parity gate: mini_ork.ported.artifact_contract vs lib/artifact_contract.sh.
+"""Parity gate: mini_ork.gates.artifact_contract vs lib/artifact_contract.sh.
 
 Each test invokes the LIVE bash subprocess on the same inputs as the Python
 port and asserts byte/JSON-identical output. No mocks, no hardcoded expected
@@ -32,7 +32,7 @@ import pytest
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
-from mini_ork.ported import artifact_contract as ac  # noqa: E402
+from mini_ork.gates import artifact_contract as ac
 
 SH = REPO / "lib" / "artifact_contract.sh"
 INIT_SH = REPO / "db" / "init.sh"

@@ -29,7 +29,7 @@ Items where ≥2 lenses converge. ★ = 2-lens, ★★ = 3-lens, ★★★ = 4-l
 
 ### ★★ GRPO lane routing is the only adaptive decision-maker (GLM-1 + Kimi-1)
 
-`agent_performance_memory` ← writes from `lane_router.py:235-245` (EMA-blended `relative_advantage` with shrinkage, recency, defect penalty); `lane_*_advantage` ← writes from `lane_router.py:247-279`; `preferred_lane` ← reads at `lane_router.py:286-330`; `decide()` consumes at `mini_ork/ported/decision_service.py:284-287` and `lib/decision_service.sh:80-217`. Region→domain→global fallback (GLM-21, Kimi-1) gives graceful degradation. This is the closest thing to a closed loop in the repo. The Kimi verdict "INTELLIGENT but NOISE-DOMINATED at floor" is the more honest reading; GLM calls it "INTELLIGENT closed loop" without quantifying the floor's variance cost. Both agree: it is the only one.
+`agent_performance_memory` ← writes from `lane_router.py:235-245` (EMA-blended `relative_advantage` with shrinkage, recency, defect penalty); `lane_*_advantage` ← writes from `lane_router.py:247-279`; `preferred_lane` ← reads at `lane_router.py:286-330`; `decide()` consumes at `mini_ork/steering/decision_service.py:284-287` and `lib/decision_service.sh:80-217`. Region→domain→global fallback (GLM-21, Kimi-1) gives graceful degradation. This is the closest thing to a closed loop in the repo. The Kimi verdict "INTELLIGENT but NOISE-DOMINATED at floor" is the more honest reading; GLM calls it "INTELLIGENT closed loop" without quantifying the floor's variance cost. Both agree: it is the only one.
 
 ### ★★ Reward starvation is the structural failure mode of the learning rail (GLM-12 + Kimi-3)
 
@@ -189,10 +189,10 @@ Three regimes, in order of likelihood for real usage:
 ## 7. Source manifest (for the verifier)
 
 ### From lens-glm (`lens-glm.md`)
-- File anchors: `mini_ork/lane_router.py:235-330` (write/read), `mini_ork/ported/decision_service.py:98-309` (decide), `mini_ork/trace_store.py:28-223` (reward), `lib/lane_router.sh:8-18,87-525` (bash mirror), `lib/decision_service.sh:80-460` (consume), `lib/process_reward.sh:99-100` (PRM bash), `mini_ork/learning/process_reward.py:55-124` (PRM python), `mini_ork/context_assembler.py:118,249` (gradient read), `lib/gradient_extractor.sh:57,97,383` (idempotent), `lib/reflection_pipeline.sh:266,396-437,494-506` (reflection chain), `bin/mini-ork-conductor:9,48,113,139,154,181,213,207-222,248-256` (header claim vs actual; predicted model), `bin/mini-ork-execute:289-319,352,1665-1737,1808-1866` (reward + region), `bin/mini-ork-classify:90,129,181-200,219,227,241` (classifier), `config/agents.yaml:16-57` (role/lens map), `config/providers.yaml:47-63` (model pins), `mini_ork/dispatch/providers.py:28-36,158-167,269-299` (provider/cwd), `mini_ork/cost_advisor.py:81-201` (advisor), `lib/pattern_store.sh:99,167-230` (patterns), `lib/context_assembler.sh:443-486` (prior runs context), `lib/topology.sh:127-136` (topology), `lib/rho_aggregator.sh:108-111` (rho), `lib/cw_por.sh`, `lib/adaptive_stability.sh`, `lib/krippendorff_alpha_gate.sh`, `lib/policy_store.sh` (gates/policy), `bin/mini-ork-conductor:204-222` (plasticity budget).
+- File anchors: `mini_ork/lane_router.py:235-330` (write/read), `mini_ork/steering/decision_service.py:98-309` (decide), `mini_ork/trace_store.py:28-223` (reward), `lib/lane_router.sh:8-18,87-525` (bash mirror), `lib/decision_service.sh:80-460` (consume), `lib/process_reward.sh:99-100` (PRM bash), `mini_ork/learning/process_reward.py:55-124` (PRM python), `mini_ork/context_assembler.py:118,249` (gradient read), `lib/gradient_extractor.sh:57,97,383` (idempotent), `lib/reflection_pipeline.sh:266,396-437,494-506` (reflection chain), `bin/mini-ork-conductor:9,48,113,139,154,181,213,207-222,248-256` (header claim vs actual; predicted model), `bin/mini-ork-execute:289-319,352,1665-1737,1808-1866` (reward + region), `bin/mini-ork-classify:90,129,181-200,219,227,241` (classifier), `config/agents.yaml:16-57` (role/lens map), `config/providers.yaml:47-63` (model pins), `mini_ork/dispatch/providers.py:28-36,158-167,269-299` (provider/cwd), `mini_ork/cost_advisor.py:81-201` (advisor), `lib/pattern_store.sh:99,167-230` (patterns), `lib/context_assembler.sh:443-486` (prior runs context), `lib/topology.sh:127-136` (topology), `lib/rho_aggregator.sh:108-111` (rho), `lib/cw_por.sh`, `lib/adaptive_stability.sh`, `lib/krippendorff_alpha_gate.sh`, `lib/policy_store.sh` (gates/policy), `bin/mini-ork-conductor:204-222` (plasticity budget).
 
 ### From lens-kimi (`lens-kimi.md`)
-- File anchors: `mini_ork/lane_router.py:286-330,195-199,270-279`; `mini_ork/ported/decision_service.py:98-309`; `mini_ork/trace_store.py:28-40,195-223`; `lib/lane_router.sh:8-18,173-187`; `bin/mini-ork-execute:453-509,753-754`; `mini_ork/optimize/gepa.py:55-91`; `mini_ork/web/routes/trajectory.py:170`; `run_detail.py:295,310,375`; `bin/mini-ork-reflect:184,301`; `bin/mini-ork-metrics:105`; `tests/unit/test_lane_router.sh:78`; `tests/test_gepa_wiring_py.py:215`; `mini_ork/ported/cost_pause.py:24-57`.
+- File anchors: `mini_ork/lane_router.py:286-330,195-199,270-279`; `mini_ork/steering/decision_service.py:98-309`; `mini_ork/trace_store.py:28-40,195-223`; `lib/lane_router.sh:8-18,173-187`; `bin/mini-ork-execute:453-509,753-754`; `mini_ork/optimize/gepa.py:55-91`; `mini_ork/web/routes/trajectory.py:170`; `run_detail.py:295,310,375`; `bin/mini-ork-reflect:184,301`; `bin/mini-ork-metrics:105`; `tests/unit/test_lane_router.sh:78`; `tests/test_gepa_wiring_py.py:215`; `mini_ork/dispatch/cost_pause.py:24-57`.
 - Papers (≥10 inline): [arxiv:2507.19457] GEPA; [arxiv:2402.03300] GRPO/DeepSeekMath; [arxiv:1707.06347] PPO; [arxiv:2402.14740] RLOO; [arxiv:2501.03262] REINFORCE++; [arxiv:2606.16733] first-principles PG; [arxiv:2603.01162] GRPO as U-statistic; [arxiv:2502.10985] Elo reliability; [arxiv:2503.12020] variance-dependent bandit regret; [arxiv:2502.05145] finite-horizon bandits; [arxiv:2310.03714] DSPy; [arxiv:2406.07496] TextGrad; [arxiv:2303.11366] Reflexion; [arxiv:2605.29463] reflexive confabulation. Plus classics: (Elo 1978), (Herbrich, Minka & Graepel 2007), (Williams 1992), (Auer, Cesa-Bianchi & Fischer 2002), (Langford & Zhang 2008).
 
 ### From lens-codex (`lens-codex.md`)
@@ -215,7 +215,7 @@ The full list of mechanisms that satisfy the write→read→decision criterion (
 
 | # | mechanism | write site | read site | loop status |
 |---|-----------|------------|-----------|-------------|
-| 1 | GRPO lane routing | `mini_ork/lane_router.py:235-279` (`agent_performance_memory` UPSERT; `lane_*_advantage` UPSERT) | `mini_ork/lane_router.py:286-330` (`preferred_lane`); consumed at `mini_ork/ported/decision_service.py:284-287`, `lib/decision_service.sh:80-217` | **INTELLIGENT** (structure) / **EFFECTIVELY-STATIC** (reward starvation + floor noise) — Dispute 1 |
+| 1 | GRPO lane routing | `mini_ork/lane_router.py:235-279` (`agent_performance_memory` UPSERT; `lane_*_advantage` UPSERT) | `mini_ork/lane_router.py:286-330` (`preferred_lane`); consumed at `mini_ork/steering/decision_service.py:284-287`, `lib/decision_service.sh:80-217` | **INTELLIGENT** (structure) / **EFFECTIVELY-STATIC** (reward starvation + floor noise) — Dispute 1 |
 | 2 | Gradient → context_assembler | `lib/gradient_extractor.sh:57,97,383` (`gradient_records` insert) | `mini_ork/context_assembler.py:118,249`; `lib/context_assembler.sh:143,374` (failure-mode injection) | **INTELLIGENT** (closed) |
 | 3 | Gradient → role-evolver | `lib/gradient_extractor.sh:57,97,383` | `lib/role_evolver.sh:114` (proposals) | **INTELLIGENT** (closed) |
 | 4 | Pattern → reflection chain | `lib/pattern_store.sh:99,167-230` (`pattern_records`) | `lib/reflection_pipeline.sh:320,494` (cluster→promotion summarizer) | **INTELLIGENT** (closed upstream of emergent_patterns) |
@@ -248,14 +248,14 @@ The full list of mechanisms that satisfy the write→read→decision criterion (
 - Plasticity budget `bin/mini-ork-conductor:204-222` — daily mutation cap `5`, predicted-score gain `0.3`
 - Error taxonomy `lib/llm-dispatch.sh:1279-1295,168-205` — frozen regex/keyword table
 - Gates `lib/cw_por.sh` / `lib/adaptive_stability.sh` / `lib/krippendorff_alpha_gate.sh` — fixed thresholds
-- Recursion/depth `mini_ork/ported/decision_service.py:265-275` — pure env read, no data input
+- Recursion/depth `mini_ork/steering/decision_service.py:265-275` — pure env read, no data input
 
 ### B.2 WRITE-ONLY (rows produced and counted, no decision reads them)
 
 | # | table | write site | why it's not consulted |
 |---|-------|-----------|------------------------|
 | 1 | `emergent_patterns` | `lib/reflection_pipeline.sh:396-437` (status='proposed') | no `SELECT … emergent_patterns` in routing, decision, or context_assembler paths (GLM-12) |
-| 2 | `prompt_win_rates` | `lib/rho_aggregator.sh` / `mini_ork/ported/rho_aggregator.py` | only `rho_top_prompts` + lifetime reporting; `bin/mini-ork-conductor:9` *claims* to read it but body queries only `topology_win_rates` + `agent_performance_memory` (GLM-12, header is stale) |
+| 2 | `prompt_win_rates` | `lib/rho_aggregator.sh` / `mini_ork/learning/rho_aggregator.py` | only `rho_top_prompts` + lifetime reporting; `bin/mini-ork-conductor:9` *claims* to read it but body queries only `topology_win_rates` + `agent_performance_memory` (GLM-12, header is stale) |
 | 3 | `conductor_decisions.outcome` / `realized_score` | `bin/mini-ork-conductor:248-256` | only `scripts/smoke-learning-loops.sh:142` (asserts `success:1.0`); conductor's predicted-score model never regresses on it |
 | 4 | Reflection chain (w.r.t. routing) | `lib/gradient_extractor.sh:57`; `lib/reflection_pipeline.sh:266`; `bin/mini-ork-reflect:301,184`; `bin/mini-ork-metrics:105` | readers are UI counts (`mini_ork/web/routes/trajectory.py:170`, `run_detail.py:295,310,375`) + tests; no `decide()`/`lane_router` reader by key (Kimi-5) |
 | 5 | `bug_reports` (emission half) | `lib/bug_report.sh` + `bin/mini-ork-bug-collector` (regex/severity/confidence) | ingestion is LIVE; emission is regex heuristic (same shape as `mini_ork-classify`), precision bounded by hand-written patterns |
@@ -270,9 +270,9 @@ The full list of mechanisms that satisfy the write→read→decision criterion (
 
 | # | mechanism | file:line | why it isn't |
 |---|-----------|-----------|--------------|
-| 1 | `coalition_ok` field in `decide()` return | `mini_ork/ported/decision_service.py:123-197` | computed AFTER `route` is fixed at `:287`; output-only diagnostic, not a decision input |
-| 2 | `reward_summary` field in `decide()` return | `mini_ork/ported/decision_service.py:200-262` | same — computed after route is fixed; no external caller branches on it |
-| 3 | `cost_pause` sidecar | `mini_ork/ported/cost_pause.py:24-57` | self-read same run only; within-run accounting, not cross-run learning |
+| 1 | `coalition_ok` field in `decide()` return | `mini_ork/steering/decision_service.py:123-197` | computed AFTER `route` is fixed at `:287`; output-only diagnostic, not a decision input |
+| 2 | `reward_summary` field in `decide()` return | `mini_ork/steering/decision_service.py:200-262` | same — computed after route is fixed; no external caller branches on it |
+| 3 | `cost_pause` sidecar | `mini_ork/dispatch/cost_pause.py:24-57` | self-read same run only; within-run accounting, not cross-run learning |
 
 ---
 

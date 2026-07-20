@@ -1,4 +1,4 @@
-"""Parity gate: mini_ork.ported.bug_report vs lib/bug_report.sh.
+"""Parity gate: mini_ork.observability.bug_report vs lib/bug_report.sh.
 
 Each test invokes the LIVE bash subprocess against a temp DB seeded by
 ``db/init.sh``, then invokes the Python port against a parallel temp DB
@@ -52,7 +52,7 @@ import pytest
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
-from mini_ork.ported import bug_report as py  # noqa: E402
+from mini_ork.observability import bug_report as py
 
 SH = REPO / "lib" / "bug_report.sh"
 INIT_SH = REPO / "db" / "init.sh"

@@ -1,4 +1,4 @@
-"""Standalone unit tests for ``mini_ork.ported.mo_steer``.
+"""Standalone unit tests for ``mini_ork.steering.steer``.
 
 Replaces the bash-parity gate that used to live in this file (it drove a
 LIVE ``bash lib/mo-steer.sh`` subprocess for eight cases, including a
@@ -28,7 +28,7 @@ from pathlib import Path
 
 import pytest
 
-from mini_ork.ported import mo_steer as ms
+from mini_ork.steering import steer as ms
 
 
 def _hb_line(state: str) -> str:

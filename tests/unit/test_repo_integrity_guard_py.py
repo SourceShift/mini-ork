@@ -1,4 +1,4 @@
-"""Parity gate: mini_ork.ported.repo_integrity_guard vs lib/repo_integrity_guard.sh.
+"""Parity gate: mini_ork.vcs.repo_integrity_guard vs lib/repo_integrity_guard.sh.
 
 Builds identical temp git repos with FIXED commit dates (so SHAs are
 deterministic and identical across the bash-run and port-run repos) and
@@ -15,7 +15,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
-from mini_ork.ported import repo_integrity_guard as rig  # noqa: E402
+from mini_ork.vcs import repo_integrity_guard as rig
 
 SH = REPO / "lib" / "repo_integrity_guard.sh"
 DA, DB, DC = "2026-01-01T00:00:00Z", "2026-06-01T00:00:00Z", "2025-01-01T00:00:00Z"

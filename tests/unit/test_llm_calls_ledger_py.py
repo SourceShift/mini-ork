@@ -1,6 +1,6 @@
 import sqlite3
 
-from mini_ork.ported.llm_dispatch import write_llm_calls_row
+from mini_ork.dispatch.llm_dispatch import write_llm_calls_row
 
 
 def test_native_writer_persists_success_row_and_optional_cost_columns(tmp_path, monkeypatch):

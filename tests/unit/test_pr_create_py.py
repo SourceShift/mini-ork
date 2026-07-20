@@ -1,4 +1,4 @@
-"""Parity gate: mini_ork.ported.pr_create vs lib/pr-create.sh.
+"""Parity gate: mini_ork.vcs.pr_create vs lib/pr-create.sh.
 
 `gh` and `git push` are the only network ops; a fake `gh` on PATH (printing a
 fixed PR URL) + a real bare local origin make the happy path deterministic and
@@ -16,7 +16,7 @@ from shutil import which as shutil_which
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
-from mini_ork.ported import pr_create as pc  # noqa: E402
+from mini_ork.vcs import pr_create as pc
 
 SH = REPO / "lib" / "pr-create.sh"
 ENV = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@e",

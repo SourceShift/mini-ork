@@ -6,7 +6,7 @@ MINI_ORK_ROOT="${MINI_ORK_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && p
 export MINI_ORK_ROOT
 export PATH="$MINI_ORK_ROOT/bin:$PATH"
 plan_cmd=(env "PYTHONPATH=$MINI_ORK_ROOT${PYTHONPATH:+:$PYTHONPATH}" \
-  python3 -m mini_ork.ported.mini_ork_plan)
+  python3 -m mini_ork.cli.plan)
 export MINI_ORK_DRY_RUN=1
 
 # Isolated tmp project

@@ -51,7 +51,7 @@ import pytest
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 
-from mini_ork.ported import mini_ork_checkpoints as mc  # noqa: E402
+from mini_ork.stores import checkpoints as mc
 
 # Canonical 0050 schema — copy of db/migrations/0050_node_dag_checkpoints.sql
 # (the test mirrors it so it does not depend on the migrate.py harness /

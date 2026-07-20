@@ -1,4 +1,4 @@
-"""Parity gate: mini_ork.ported.mini_ork_metrics vs bin/mini-ork-metrics.
+"""Parity gate: mini_ork.cli.metrics vs bin/mini-ork-metrics.
 
 Bash stays untouched (strangler-fig); the port must produce byte-identical output
 to the live bash on >=6 cases covering: empty DB (default + future --since),
@@ -22,7 +22,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
-from mini_ork.ported import mini_ork_metrics as pm  # noqa: E402
+from mini_ork.cli import metrics as pm
 
 SH = REPO / "bin" / "mini-ork-metrics"
 

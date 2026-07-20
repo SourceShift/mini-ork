@@ -53,15 +53,15 @@ assert_ge() {
 
 mo_learning_update_conductor_outcomes() {
   PYTHONPATH="$MINI_ORK_ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 -c \
-    'from mini_ork.ported.mini_ork_execute import learning_update_conductor_outcomes; import os; learning_update_conductor_outcomes(os.environ["MINI_ORK_DB"])'
+    'from mini_ork.cli.execute import learning_update_conductor_outcomes; import os; learning_update_conductor_outcomes(os.environ["MINI_ORK_DB"])'
 }
 mo_learning_write_grpo_advantages() {
   PYTHONPATH="$MINI_ORK_ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 -c \
-    'from mini_ork.ported.mini_ork_execute import write_grpo_advantages; import os; write_grpo_advantages(os.environ["MINI_ORK_DB"])'
+    'from mini_ork.cli.execute import write_grpo_advantages; import os; write_grpo_advantages(os.environ["MINI_ORK_DB"])'
 }
 _mo_learning_governed_lane() {
   PYTHONPATH="$MINI_ORK_ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 -c \
-    'from mini_ork.ported.mini_ork_execute import learning_governed_lane; import os,sys; print(learning_governed_lane(sys.argv[1], sys.argv[2], root=os.environ["MINI_ORK_ROOT"]))' "$@"
+    'from mini_ork.cli.execute import learning_governed_lane; import os,sys; print(learning_governed_lane(sys.argv[1], sys.argv[2], root=os.environ["MINI_ORK_ROOT"]))' "$@"
 }
 
 TS="ll$(date +%s)-$$"

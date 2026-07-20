@@ -1,4 +1,4 @@
-"""Parity gate: mini_ork.ported.mini_ork_conductor vs bin/mini-ork-conductor.
+"""Parity gate: mini_ork.orchestration.conductor vs bin/mini-ork-conductor.
 
 Seed a ready epic + a topology_win_rate, run --once --dry-run through the LIVE
 bash conductor and the port on separate DBs, and compare the logged
@@ -14,7 +14,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
-from mini_ork.ported import mini_ork_conductor as cond  # noqa: E402
+from mini_ork.orchestration import conductor as cond
 
 BIN = REPO / "bin" / "mini-ork-conductor"
 

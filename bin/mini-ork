@@ -66,7 +66,7 @@ except (OSError, ValueError) as exc:
     raise SystemExit(2) from exc
 sys.path.insert(0, str(ENGINE_ROOT))
 
-from mini_ork.ported.mini_ork_cli import main  # noqa: E402
+from mini_ork.cli.main import main  # noqa: E402
 
 
 if __name__ == "__main__":

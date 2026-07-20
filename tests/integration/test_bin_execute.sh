@@ -159,7 +159,7 @@ fi
 echo ""
 echo "--- 8. execute is an in-process native route ---"
 if PYTHONPATH="$MINI_ORK_ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 - <<'PY'
-from mini_ork.ported import mini_ork_cli
+from mini_ork.cli import main as mini_ork_cli
 assert "execute" not in mini_ork_cli._EXEC_SUBS
 PY
 then

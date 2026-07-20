@@ -6,23 +6,23 @@ and driving ``bin/mini-ork-conductor`` + ``bin/mini-ork-lifetime`` against
 ``.mini-ork/state.db``. Both bin entrypoints already delegate to their Python
 ports via ``lib/runtime-select.sh::mo_runtime_maybe_delegate`` whenever
 ``MINI_ORK_RUNTIME`` is unset or ``python`` (the default) — so the bash test
-was, in practice, already exercising ``mini_ork.ported.mini_ork_conductor``
-and ``mini_ork.ported.mini_ork_lifetime`` for phases 6-7. This port drives
+was, in practice, already exercising ``mini_ork.orchestration.conductor``
+and ``mini_ork.orchestration.lifetime`` for phases 6-7. This port drives
 those two modules directly (in-process, ``main(db=..., root=...)``) instead
 of shelling out, and drives the three ``lib/*.sh`` equivalents
-(``mini_ork.ported.epic_graph``, ``mini_ork.ported.topology``,
-``mini_ork.ported.role_evolver``) for phases 1-5.
+(``mini_ork.orchestration.epic_graph``, ``mini_ork.orchestration.topology``,
+``mini_ork.learning.role_evolver``) for phases 1-5.
 
 Phase-by-phase correspondence (same behavioral assertions, not weakened):
 
   1. Seed root + dependent epic via epic_dependencies
      -> direct sqlite3 INSERT (same rows the bash heredoc inserts).
   2. epic_graph_ready_now picks only the unblocked root
-     -> mini_ork.ported.epic_graph.ready_now()
+     -> mini_ork.orchestration.epic_graph.ready_now()
   3. epic_graph_on_done cascades dep unblock
-     -> mini_ork.ported.epic_graph.on_done()
+     -> mini_ork.orchestration.epic_graph.on_done()
   4. Seed execution_traces + recompute topology win-rates
-     -> mini_ork.ported.topology.aggregate_traces() (the pure-logic port of
+     -> mini_ork.orchestration.topology.aggregate_traces() (the pure-logic port of
         lib/topology.sh::topology_recompute_win_rates, parity-proven against
         the live bash function by tests/unit/test_topology_parity.py), then
         persisted into topology_win_rates with the identical upsert SQL
@@ -30,11 +30,11 @@ Phase-by-phase correspondence (same behavioral assertions, not weakened):
         intentionally I/O-free by design — see its module docstring — so the
         caller performs the read/write; this mirrors that contract exactly).
   5. role_evolver_propose runs cleanly
-     -> mini_ork.ported.role_evolver.propose()
+     -> mini_ork.learning.role_evolver.propose()
   6. conductor --once --dry-run --explain emits JSON decision
-     -> mini_ork.ported.mini_ork_conductor.main(db=..., root=...)
+     -> mini_ork.orchestration.conductor.main(db=..., root=...)
   7. lifetime summary prints non-empty leaderboards
-     -> mini_ork.ported.mini_ork_lifetime.summary()
+     -> mini_ork.orchestration.lifetime.summary()
 
 Note on lib/bug_report.sh: the bash test's header comment lists "bug_report
 channel (lib/bug_report.sh)" as in-scope, but the script body never sources
@@ -58,11 +58,11 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
 
-from mini_ork.ported import epic_graph  # noqa: E402
-from mini_ork.ported import mini_ork_conductor as conductor  # noqa: E402
-from mini_ork.ported import mini_ork_lifetime as lifetime  # noqa: E402
-from mini_ork.ported import role_evolver  # noqa: E402
-from mini_ork.ported.topology import aggregate_traces  # noqa: E402
+from mini_ork.orchestration import epic_graph
+from mini_ork.orchestration import conductor
+from mini_ork.orchestration import lifetime
+from mini_ork.learning import role_evolver
+from mini_ork.orchestration.topology import aggregate_traces  # noqa: E402
 
 INIT_SH = REPO_ROOT / "db" / "init.sh"
 

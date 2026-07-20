@@ -164,7 +164,7 @@ notices while doing its main work but does not have scope to fix.
 
 Two trigger styles:
 
-- **Per-agent (auto)**: `mini_ork/ported/mini_ork_execute.py` calls
+- **Per-agent (auto)**: `mini_ork/cli/execute.py` calls
   `bin/mini-ork-bug-collector` after every node's `_trace_write_node_rich`.
   The collector (heuristic mode by default) regex-scans the agent's
   output for `noticed ... but`, `out of scope but`, `should fix`,
@@ -325,7 +325,7 @@ SELECT id, severity, frequency, ROUND(confidence,2),
 | Symptom | Likely cause | Recovery |
 |---|---|---|
 | Epic stays `not started` despite no deps | Scheduler not running or budget cap hit | Check `MO_DAILY_BUDGET_USD` vs 24h spend; inspect scheduler log. |
-| Epic flips to `escalated` while inner recipe verifiers passed | Verdict file name mismatch — the native owner checks `panel-verdict.json` then `verdict.json`. If a recipe introduces another filename, extend `mini_ork/scheduler.py::_verdict_from_log`. | Set the epic to `done`, then call `mini_ork.ported.epic_graph.on_done(epic_id, db=...)` to cascade. |
+| Epic flips to `escalated` while inner recipe verifiers passed | Verdict file name mismatch — the native owner checks `panel-verdict.json` then `verdict.json`. If a recipe introduces another filename, extend `mini_ork/scheduler.py::_verdict_from_log`. | Set the epic to `done`, then call `mini_ork.orchestration.epic_graph.on_done(epic_id, db=...)` to cascade. |
 | Bug-collector floods queue with TODOs | Heuristic is conservative but can over-fire on agent commentary. | Raise `MO_BUG_REPORT_AUTO_PROMOTE` minimum severity, or `UPDATE bug_reports SET status='wontfix' WHERE severity='low'`. |
 | Cross-class gradient list dominated by one target | Single recipe is generating noisy gradients. | Inspect `gradient_records WHERE target=?`. Reduce gradient extraction noise upstream or raise `MO_CROSS_EPIC_MIN_CONF` to 0.8+. |
 | Scheduler picks an old leftover smoke epic | `epic_graph_ready_now` is oldest-first fair. | `UPDATE epics SET archived_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id LIKE 'old-prefix-%';` |

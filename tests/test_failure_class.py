@@ -14,7 +14,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 
-from mini_ork.ported import failure_classifier as fc  # noqa: E402
+from mini_ork.learning import failure_classifier as fc
 
 
 # ── the load-bearing rule: max-turns is provider_limit, never auto-retry ───

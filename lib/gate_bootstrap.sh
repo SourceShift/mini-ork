@@ -4,7 +4,7 @@
 # Per 3-subagent consensus (2026-06-05, recorded in
 # docs/architecture/oracle-gates-wiring.md): the central wire-up fires
 # all oracle gates once-per-cycle at a single chokepoint inside
-# mini_ork/ported/mini_ork_execute.py (modeled on the measure_topology call site).
+# mini_ork/cli/execute.py (modeled on the measure_topology call site).
 # That chokepoint requires the gates to be REGISTERED in the gate_registry
 # table before gate_run_all can dispatch them. This bootstrap runs at the
 # top of the publisher case-branch and idempotently inserts the gate

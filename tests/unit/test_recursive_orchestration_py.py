@@ -1,4 +1,4 @@
-"""Parity gate: mini_ork.ported.recursive_orchestration vs lib/recursive_orchestration.sh.
+"""Parity gate: mini_ork.orchestration.recursive vs lib/recursive_orchestration.sh.
 
 Each test invokes the LIVE bash subprocess against a temp DB seeded by
 ``db/init.sh``, then invokes the Python port against a parallel temp DB
@@ -35,7 +35,7 @@ import pytest
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
-from mini_ork.ported import recursive_orchestration as py  # noqa: E402
+from mini_ork.orchestration import recursive as py
 
 SH = REPO / "lib" / "recursive_orchestration.sh"
 INIT_SH = REPO / "db" / "init.sh"

@@ -1,4 +1,4 @@
-"""Parity gate: mini_ork.ported.mini_ork_spawn vs bin/mini-ork-spawn.
+"""Parity gate: mini_ork.cli.spawn vs bin/mini-ork-spawn.
 
 Each test invokes the LIVE bash binary (``bin/mini-ork-spawn``) via subprocess
 against a temp DB seeded by ``db/init.sh``, then invokes the Python port
@@ -102,7 +102,7 @@ def _run_bash(args: list[str], *, db: str, home, extra_env: dict | None = None
 
 def _run_py(args: list[str], *, db: str, home,
             extra_env: dict | None = None) -> tuple[int, str, str]:
-    """Invoke `python -m mini_ork.ported.mini_ork_spawn` against the temp DB."""
+    """Invoke `python -m mini_ork.cli.spawn` against the temp DB."""
     env = {
         **os.environ,
         "MINI_ORK_ROOT": str(REPO),
@@ -113,7 +113,7 @@ def _run_py(args: list[str], *, db: str, home,
     if extra_env:
         env.update(extra_env)
     proc = subprocess.run(
-        [sys.executable, "-m", "mini_ork.ported.mini_ork_spawn", *args],
+        [sys.executable, "-m", "mini_ork.cli.spawn", *args],
         env=env, capture_output=True, text=True, cwd=str(REPO),
     )
     return proc.returncode, proc.stdout, proc.stderr

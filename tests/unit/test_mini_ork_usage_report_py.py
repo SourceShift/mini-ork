@@ -1,4 +1,4 @@
-"""Parity gate: mini_ork.ported.mini_ork_usage_report vs bin/mini-ork-usage-report.
+"""Parity gate: mini_ork.observability.usage_report vs bin/mini-ork-usage-report.
 
 Each test invokes the LIVE bash subprocess against a temp DB seeded by
 ``db/init.sh`` (and optionally data tables), then invokes the Python
@@ -58,7 +58,7 @@ import pytest
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
-from mini_ork.ported import mini_ork_usage_report as py  # noqa: E402
+from mini_ork.observability import usage_report as py
 
 SH = REPO / "bin" / "mini-ork-usage-report"
 INIT_SH = REPO / "db" / "init.sh"

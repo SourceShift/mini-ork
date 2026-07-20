@@ -1,4 +1,4 @@
-"""Parity gate: ``mini_ork.ported.db_open`` vs ``lib/db_open.sh``.
+"""Parity gate: ``mini_ork.stores.db_open`` vs ``lib/db_open.sh``.
 
 For each fixture we seed a self-contained temp DB (via the real
 ``db/init.sh`` for the round-trip case, or an empty file for the
@@ -35,7 +35,7 @@ from typing import Iterable
 
 import pytest
 
-from mini_ork.ported.db_open import mo_sqlite, mo_sqlite_py_pragmas
+from mini_ork.stores.db_open import mo_sqlite, mo_sqlite_py_pragmas
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 LIB_DB_OPEN = REPO_ROOT / "lib" / "db_open.sh"
@@ -341,7 +341,7 @@ def test_py_pragmas_override_parity():
 
 def test_smoke_import_no_io():
     """Module imports cleanly; public API is callable with no DB I/O."""
-    import mini_ork.ported.db_open as mod
+    import mini_ork.stores.db_open as mod
     assert mod.mo_sqlite.__name__ == "mo_sqlite"
     assert mod.mo_sqlite_py_pragmas.__name__ == "mo_sqlite_py_pragmas"
     assert callable(mod.mo_sqlite)

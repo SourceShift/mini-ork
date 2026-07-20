@@ -5,7 +5,7 @@
 > OTLP/JSON (env-gated on `LANGFUSE_PUBLIC_KEY`/`LANGFUSE_SECRET_KEY`,
 > `--dry-run` prints the payload; tests in `tests/test_otel_export.py`).
 > Live in-process span emission is wired: `MO_OTEL=1` makes
-> `mini_ork/ported/mini_ork_execute.py` buffer lifecycle events to
+> `mini_ork/cli/execute.py` buffer lifecycle events to
 > `$MINI_ORK_RUN_DIR/.otel-spans.jsonl` via `lib/mo_otel.sh` (root span at
 > startup/EXIT trap, agent spans piggybacked on the node-end trap in
 > `lib/mo_node_events.sh`) and flush at run end through
@@ -68,7 +68,7 @@ Pure-python helper invoked from bash. Buffers spans as JSONL at
 
 | Where | Span emitted |
 |---|---|
-| `mini_ork/ported/mini_ork_execute.py` startup | root span "task_run" |
+| `mini_ork/cli/execute.py` startup | root span "task_run" |
 | `_dispatch_node` entry | child span "agent" |
 | `_mo_llm_write_llm_calls_row` | grandchild span "llm_call" |
 | dispatcher exit trap | flush + end root span |
@@ -98,7 +98,7 @@ export LANGFUSE_SECRET_KEY="sk-lf-..."
    traceId/spanId so the backend dedupes.
 2. **`lib/mo_otel.sh`** — bash span buffer (root_begin/root_end/agent
    events as JSONL; `MO_OTEL=1` gated; every entry point returns 0).
-3. **Wired** into `mini_ork/ported/mini_ork_execute.py` (source + root_begin after
+3. **Wired** into `mini_ork/cli/execute.py` (source + root_begin after
    `MINI_ORK_RUN_DIR` export; root_end + flush in the EXIT trap) and
    `lib/mo_node_events.sh` (`mo_node_emit_end_trap` emits the agent span).
 

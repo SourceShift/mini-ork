@@ -16,7 +16,7 @@ os.environ.setdefault("MINI_ORK_ENGINE_ROOT", str(ENGINE_ROOT))
 os.environ.setdefault("MINI_ORK_ROOT", str(ENGINE_ROOT))
 sys.path.insert(0, str(ENGINE_ROOT))
 
-from mini_ork.ported.mini_ork_invoke_prompt import main  # noqa: E402
+from mini_ork.cli.invoke_prompt import main  # noqa: E402
 
 
 if __name__ == "__main__":
