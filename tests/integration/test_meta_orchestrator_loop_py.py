@@ -40,7 +40,7 @@ Note on lib/bug_report.sh: the bash test's header comment lists "bug_report
 channel (lib/bug_report.sh)" as in-scope, but the script body never sources
 or calls it — it is not exercised by any phase below either. bug_report.sh
 has real, unrelated couplings (bin/mini-ork-bugs, bin/mini-ork-bug-collector,
-lib/pre_push_review.sh::review_forward_to_bug_reports) so its retirement
+the native pre-push review forwarder) so its retirement
 status is untouched by this port either way.
 """
 

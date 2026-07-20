@@ -1,33 +1,9 @@
-"""Parity gate: mini_ork.ported.mini_ork_review vs lib/pre_push_review.sh + bin/mini-ork-review.
+"""Standalone native contracts for review persistence, policy, CLI, and forwarding.
 
-Each test invokes the LIVE bash subprocess against a temp DB seeded by
-``db/init.sh`` and a throwaway git repo, then invokes the Python port
-against the same DB + repo, and asserts the resulting
-``pre_push_reviews`` + ``pre_push_review_issues`` rows + stdout strings
-match exactly. No mocks, no hardcoded expected outputs — expected is
-always derived from the live control bash invocation.
-
-Cases (6, at the kickoff's >=6 floor):
-  (a) review_run on a synthetic bash-syntax-issue diff → identical
-      pre_push_reviews + pre_push_review_issues rows + verdict='block'.
-  (b) review_run on a clean diff → verdict='approve' + zero issues.
-  (c) check_secret_patterns vs bash for AKIA / ghp_ / sk- / xoxb- keys
-      → identical JSONL shape (keys + values, line by line).
-  (d) review_verdict_for + review_show + review_list stdout format
-      parity (string-exact where ints match, 1e-6 elsewhere).
-  (e) compute_verdict policy table — 6-row matrix of (critical, high,
-      heuristic_high, consensus_high, target) → (verdict) ensuring the
-      approve/warn/block distribution matches bash.
-  (f) review_forward_to_bug_reports forward-count parity — open issues
-      are emitted + swept into ``bug_reports`` rows identical to what
-      the bash forward produces on the same DB.
-
-Tolerance notes:
-  * lines_added / lines_removed ints compared exactly.
-  * reviewed_at / first_seen_at / last_seen_at / updated_at allowed
-    within a 1-second window.
-  * JSONL row ordering: same line count, identical dict per line
-    (sort_keys=False, separators=(",", ":"), UTF-8).
+The suite uses real temporary SQLite databases and Git repositories. It covers
+syntax and secret findings, clean approval, read-only CLI formatting, the full
+verdict matrix, newline-safe bug forwarding, and argument validation without a
+Bash review oracle.
 """
 from __future__ import annotations
 
@@ -43,10 +19,9 @@ import pytest
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
-from mini_ork.ported import mini_ork_review as py  # noqa: E402
+from mini_ork import pre_push_review as py  # noqa: E402
 
-SH = REPO / "lib" / "pre_push_review.sh"
-SH_CLI = REPO / "bin" / "mini-ork-review"
+PUBLIC_CLI = REPO / "bin" / "mini-ork-review"
 INIT_SH = REPO / "db" / "init.sh"
 
 
@@ -57,10 +32,8 @@ def _which_tools() -> None:
     for tool in ("bash", "sqlite3", "python3", "git"):
         if not shutil.which(tool):
             pytest.skip(f"{tool} not on PATH")
-    if not SH.exists():
-        pytest.skip(f"missing lib/pre_push_review.sh at {SH}")
-    if not SH_CLI.exists():
-        pytest.skip(f"missing bin/mini-ork-review at {SH_CLI}")
+    if not PUBLIC_CLI.exists():
+        pytest.skip(f"missing bin/mini-ork-review at {PUBLIC_CLI}")
     if not INIT_SH.exists():
         pytest.skip(f"missing db/init.sh at {INIT_SH}")
 
@@ -136,46 +109,6 @@ def _add_and_commit(repo: Path, files: dict[str, str], msg: str = "feature") -> 
     return sha
 
 
-def _bash_run_func(
-    func: str,
-    args: list[str],
-    *,
-    db: str,
-    cwd: Path | None = None,
-    home: str | None = None,
-    extra_env: dict[str, str] | None = None,
-) -> subprocess.CompletedProcess:
-    """Source the bash library and call ``func`` with positional args.
-
-    Mirrors ``test_bug_report_py.py::_bash_run_func``. Sets
-    ``MINI_ORK_DB`` + ``MINI_ORK_HOME`` so the bash subprocess lands on
-    the same DB as the Python port. ``cwd`` is exported so ``git
-    merge-base`` + ``git diff`` resolve to the throwaway repo.
-    """
-    def _q(a: str) -> str:
-        return '"' + a.replace("\\", "\\\\").replace('"', '\\"') + '"'
-    arg_str = " ".join(_q(a) for a in args)
-    script = f'. "{SH}"\n{func} {arg_str}\n'
-    env = {
-        **os.environ,
-        "MINI_ORK_DB": db,
-        "MINI_ORK_HOME": home or str(Path(db).parent),
-    }
-    if cwd is not None:
-        env["MINI_ORK_ROOT"] = str(REPO)
-        # git commands inside the bash function read cwd of the subprocess.
-        # subprocess.run respects cwd= below.
-        pass
-    if extra_env:
-        env.update(extra_env)
-    return subprocess.run(
-        ["bash", "-c", script],
-        cwd=str(cwd) if cwd is not None else None,
-        env=env,
-        capture_output=True, text=True,
-    )
-
-
 def _row_dicts(db: str, table: str) -> list[dict]:
     """Dump all rows of ``table`` as dicts. Ordered by the table's rowid."""
     con = sqlite3.connect(db)
@@ -185,40 +118,6 @@ def _row_dicts(db: str, table: str) -> list[dict]:
         return [dict(zip(cols, r)) for r in rows]
     finally:
         con.close()
-
-
-def _normalize_issue_row(row: dict) -> dict:
-    """Strip volatile fields the parity check should ignore.
-
-    ``review_id`` / ``id`` are AUTOINCREMENT-dependent on insert order;
-    bash and py run identically so we compare by the invariant fields.
-    Timestamps get a 1-second window.
-    """
-    return {k: row.get(k) for k in (
-        "lens", "severity", "file_path", "line_no",
-        "title", "description", "suggested_fix", "status",
-    )}
-
-
-def _normalize_review_row(row: dict) -> dict:
-    """Return the invariant fields of a pre_push_reviews row.
-
-    Volatile: ``id`` (AUTOINCREMENT may differ across db runs — both
-    insert exactly one row, so the parity is "first row of each set"),
-    ``reviewed_at`` (1-second window), ``fix_epic_id`` / ``cost_usd``
-    (defaults).
-    """
-    return {
-        "source_sha": row["source_sha"],
-        "target_branch": row["target_branch"],
-        "reviewer_mode": row["reviewer_mode"],
-        "verdict": row["verdict"],
-        "files_changed": row["files_changed"],
-        "lines_added": row["lines_added"],
-        "lines_removed": row["lines_removed"],
-        "issues_open": row["issues_open"],
-        "issues_critical": row["issues_critical"],
-    }
 
 
 def _insert_issue_rows(db: str, rid: int, issues: list[dict]) -> None:
@@ -250,56 +149,17 @@ def _insert_issue_rows(db: str, rid: int, issues: list[dict]) -> None:
 # (a) review_run with bash-syntax issue → verdict='block' parity
 # ─────────────────────────────────────────────────────────────────────────────
 def test_review_run_bash_syntax_issue_blocks_parity(temp_db, fake_repo):
-    """A diff that adds a ``lib/`` ``.sh`` file with real bash syntax
-    error must produce a ``block`` verdict in BOTH ports, with identical
-    ``pre_push_reviews`` invariant columns and identical issue rows."""
+    """A new Bash syntax error produces a critical issue and blocks main."""
     bad_sh = "#!/usr/bin/env bash\nif [ broken\n"  # `bash -n` will fail
     sha = _add_and_commit(fake_repo, {"lib/test_syntax.sh": bad_sh})
-
-    # Bash review_run
-    bash_r = _bash_run_func(
-        "review_run", [sha, "main"],
-        db=temp_db["db"], cwd=fake_repo,
-    )
-    assert bash_r.returncode == 0, f"bash review_run failed: {bash_r.stderr}"
-    bash_rid = int(bash_r.stdout.strip())
-
-    # Python review_run — same DB, same cwd
-    py_rid = py.review_run(
-        sha, "main", cwd=fake_repo, db=temp_db["db"],
-    )
-
-    # Same number of reviews (exactly one each).
-    bash_reviews = _row_dicts(temp_db["db"], "pre_push_reviews")
-    py_reviews = _row_dicts(temp_db["db"], "pre_push_reviews")
-    assert len(bash_reviews) == 2, f"expected 2 reviews (bash+py), got {len(bash_reviews)}"
-    assert len(py_reviews) == 2
-
-    # Match each bash row to a py row by invariant columns (id will differ).
-    py_review = next(r for r in py_reviews if r["id"] == py_rid)
-    bash_review = next(r for r in bash_reviews if r["id"] == bash_rid)
-    assert _normalize_review_row(bash_review) == _normalize_review_row(py_review), (
-        f"review row mismatch:\n  bash={_normalize_review_row(bash_review)}\n"
-        f"  py  ={_normalize_review_row(py_review)}"
-    )
-
-    # Verdict must be 'block' (critical bash-syntax issue present).
-    assert bash_review["verdict"] == "block"
+    py_rid = py.review_run(sha, "main", cwd=fake_repo, db=temp_db["db"])
+    reviews = _row_dicts(temp_db["db"], "pre_push_reviews")
+    py_review = next(row for row in reviews if row["id"] == py_rid)
     assert py_review["verdict"] == "block"
-
-    # Issues identical (modulo AUTOINCREMENT id + review_id).
-    bash_issues = _row_dicts(temp_db["db"], "pre_push_review_issues")
-    py_issues = _row_dicts(temp_db["db"], "pre_push_review_issues")
-    bash_norm = [_normalize_issue_row(r) for r in bash_issues
-                 if r["review_id"] == bash_rid]
-    py_norm = [_normalize_issue_row(r) for r in py_issues
-               if r["review_id"] == py_rid]
-    assert len(bash_norm) == len(py_norm), (
-        f"issue count mismatch: bash={len(bash_norm)} py={len(py_norm)}"
-    )
-    for b, p in zip(sorted(bash_norm, key=lambda x: (x["lens"], x["title"])),
-                    sorted(py_norm, key=lambda x: (x["lens"], x["title"]))):
-        assert b == p, f"issue row mismatch:\n  bash={b}\n  py  ={p}"
+    issues = [row for row in _row_dicts(temp_db["db"], "pre_push_review_issues")
+              if row["review_id"] == py_rid]
+    assert any(row["lens"] == "heuristic.bash_syntax" and row["severity"] == "critical"
+               for row in issues)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -313,28 +173,12 @@ def test_review_run_clean_diff_approves_parity(temp_db, fake_repo):
         "docs/example.md": "# hello\n\nA trivial doc-only diff.\n",
     })
 
-    bash_r = _bash_run_func(
-        "review_run", [sha, "main"],
-        db=temp_db["db"], cwd=fake_repo,
-    )
-    assert bash_r.returncode == 0, f"bash review_run failed: {bash_r.stderr}"
-    bash_rid = int(bash_r.stdout.strip())
-
     py_rid = py.review_run(
         sha, "main", cwd=fake_repo, db=temp_db["db"],
     )
-
-    bash_reviews = _row_dicts(temp_db["db"], "pre_push_reviews")
-    py_reviews = _row_dicts(temp_db["db"], "pre_push_reviews")
-    bash_review = next(r for r in bash_reviews if r["id"] == bash_rid)
-    py_review = next(r for r in py_reviews if r["id"] == py_rid)
-    assert _normalize_review_row(bash_review) == _normalize_review_row(py_review), (
-        f"review row mismatch:\n  bash={_normalize_review_row(bash_review)}\n"
-        f"  py  ={_normalize_review_row(py_review)}"
-    )
-    assert bash_review["verdict"] == "approve"
+    reviews = _row_dicts(temp_db["db"], "pre_push_reviews")
+    py_review = next(r for r in reviews if r["id"] == py_rid)
     assert py_review["verdict"] == "approve"
-    assert bash_review["issues_open"] == 0
     assert py_review["issues_open"] == 0
 
 
@@ -348,17 +192,8 @@ def test_review_run_clean_diff_approves_parity(temp_db, fake_repo):
     ("+SLACK_TOKEN=xoxb-1234567890-9876543210-", "Slack"),
     ("+-----BEGIN RSA PRIVATE KEY-----", "private key"),
 ])
-def test_check_secret_patterns_vs_bash_parity(secret_line: str, kind: str, tmp_path):
-    """For each of the 5 secret patterns, both ports must emit exactly
-    one critical issue with the same JSONL shape.
-
-    The bash ``_check_secret_patterns`` heredoc previously ended with a
-    top-level Python ``return`` (a SyntaxError → silent no-op → dead secret
-    scanner). That was FIXED in PR #131 (``return`` → ``sys.exit(0)``). This
-    test now enforces true bash+py parity: both must succeed, emit exactly one
-    critical finding per matched pattern (returning on the first match), and
-    produce the identical finding field-for-field.
-    """
+def test_check_secret_patterns_contract(secret_line: str, kind: str, tmp_path):
+    """Each supported secret pattern emits one critical finding."""
     diff_text = (
         "diff --git a/lib/example.sh b/lib/example.sh\n"
         "new file mode 100755\n"
@@ -372,25 +207,6 @@ def test_check_secret_patterns_vs_bash_parity(secret_line: str, kind: str, tmp_p
     diff_path = tmp_path / "diff.txt"
     diff_path.write_text(diff_text)
 
-    bash_r = _bash_run_func(
-        "_check_secret_patterns", [str(diff_path)],
-        db=str(tmp_path / "unused.db"),
-    )
-    # The bash secret scanner bug (top-level `return` → SyntaxError → silent
-    # no-op) was FIXED (lib/pre_push_review.sh: `return` → `sys.exit(0)`, PR #131).
-    # It must now succeed and emit the SAME single finding as the Python port.
-    assert bash_r.returncode == 0, (
-        f"{kind}: bash secret check failed: {bash_r.stderr!r}"
-    )
-    import json as _json
-    bash_lines = [ln for ln in bash_r.stdout.splitlines() if ln.strip()]
-    assert len(bash_lines) == 1, (
-        f"{kind}: bash expected exactly 1 JSONL finding, got {bash_lines!r}"
-    )
-    bash_issue = _json.loads(bash_lines[0])
-
-    # Python port — must emit exactly one critical issue per match with
-    # the bash-INTENDED shape.
     py_issues = py.check_secret_patterns(diff_text)
     assert len(py_issues) == 1, (
         f"{kind}: py expected exactly 1 issue, got {len(py_issues)}: "
@@ -406,12 +222,6 @@ def test_check_secret_patterns_vs_bash_parity(secret_line: str, kind: str, tmp_p
         f"{kind}: title prefix mismatch: {issue['title']!r}"
     )
     assert issue["suggested_fix"].startswith("Remove the secret")
-    # bash+py parity on the fixed behavior: identical finding, field for field.
-    # The bash JSONL omits the `line` key entirely; the port emits an explicit
-    # `line: None` — semantically identical, so normalize before comparing.
-    assert {**bash_issue, "line": bash_issue.get("line")} == issue, (
-        f"{kind}: bash/py secret finding mismatch:\n bash={bash_issue!r}\n py  ={issue!r}"
-    )
 
 
 def test_check_secret_patterns_returns_on_first_match():
@@ -440,73 +250,26 @@ def test_check_secret_patterns_returns_on_first_match():
 # ─────────────────────────────────────────────────────────────────────────────
 # (d) review_verdict_for + review_show + review_list stdout format parity
 # ─────────────────────────────────────────────────────────────────────────────
-def test_readonly_stdout_format_parity(temp_db, fake_repo):
-    """Seed one review + one issue via the bash port, then assert the
-    Python port's ``review_verdict_for`` + ``review_show`` +
-    ``review_list`` outputs are byte-identical (modulo ``reviewed_at``
-    which is localtime-formatted identically because both run within the
-    same second)."""
-    # Stage a real diff that will produce one bash-syntax issue.
+def test_readonly_stdout_and_public_cli(temp_db, fake_repo):
+    """Read-only helpers and the public launcher expose the stored review."""
     bad_sh = "#!/usr/bin/env bash\nif [ broken\n"
     sha = _add_and_commit(fake_repo, {"lib/x.sh": bad_sh})
-
-    # Bash review_run → leaves a row with verdict='block' + 1 issue.
-    bash_r = _bash_run_func(
-        "review_run", [sha, "main"],
-        db=temp_db["db"], cwd=fake_repo,
-    )
-    assert bash_r.returncode == 0, bash_r.stderr
-    bash_rid = int(bash_r.stdout.strip())
-
-    # Insert a SECOND review via the Python port so review_list has 2 rows.
     py_rid = py.review_run(
         sha, "main", cwd=fake_repo, db=temp_db["db"],
     )
-
-    # review_verdict_for: bash
-    bash_v = _bash_run_func(
-        "review_verdict_for", [str(bash_rid)],
-        db=temp_db["db"],
-    )
-    assert bash_v.returncode == 0, bash_v.stderr
-    # review_verdict_for: py
-    py_v = py.review_verdict_for(bash_rid, db=temp_db["db"])
-    assert bash_v.stdout == py_v, (
-        f"verdict_for mismatch:\n  bash={bash_v.stdout!r}\n  py  ={py_v!r}"
-    )
-    assert bash_v.stdout.strip() == "block"
-
-    # review_show: bash vs py
-    bash_s = _bash_run_func(
-        "review_show", [str(bash_rid)],
-        db=temp_db["db"],
-    )
-    assert bash_s.returncode == 0, bash_s.stderr
-    py_s = py.review_show(bash_rid, db=temp_db["db"])
-    assert bash_s.stdout == py_s, (
-        f"show mismatch:\n  bash={bash_s.stdout!r}\n  py  ={py_s!r}"
-    )
-    # Header row then blank line then 1 issue row
-    assert bash_s.stdout.count("\n") >= 3
-
-    # review_list: bash (via bin/mini-ork-review) vs py
-    list_bash = subprocess.run(
-        ["bash", str(SH_CLI), "list", "10"],
+    assert py.review_verdict_for(py_rid, db=temp_db["db"]).strip() == "block"
+    shown = py.review_show(py_rid, db=temp_db["db"])
+    assert shown.count("\n") >= 3
+    list_cli = subprocess.run(
+        [str(PUBLIC_CLI), "list", "10"],
         env={**os.environ, "MINI_ORK_DB": temp_db["db"],
              "MINI_ORK_HOME": temp_db["home"]},
         capture_output=True, text=True,
     )
-    assert list_bash.returncode == 0, list_bash.stderr
+    assert list_cli.returncode == 0, list_cli.stderr
     list_py = py.review_list(10, db=temp_db["db"])
-    assert list_bash.stdout == list_py, (
-        f"list mismatch:\n  bash={list_bash.stdout!r}\n  py  ={list_py!r}"
-    )
-    # Both ports should list 2 reviews.
-    assert list_py.count("\n") == 2
-    # The list ordering is reviewed_at DESC — the most recently inserted
-    # row (py) is first.
+    assert list_cli.stdout == list_py
     assert str(py_rid) in list_py
-    assert str(bash_rid) in list_py
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -629,24 +392,10 @@ PY
 # ─────────────────────────────────────────────────────────────────────────────
 # (f) review_forward_to_bug_reports forward-count parity
 # ─────────────────────────────────────────────────────────────────────────────
-# KNOWN BASH BUG (do NOT edit lib/pre_push_review.sh per the kickoff's
-# strangler-fig rule): the bash forward parses sqlite3 tab-separated
-# output with ``IFS=$'\t' read -r ...``. Issue descriptions can contain
-# newlines (e.g. ``bash -n`` error text ends with ``\n``). The bash
-# read-loop treats that newline as a row separator, mis-parses the
-# next line, and calls ``bug_report_emit`` with an empty title field
-# — which aborts with "title required". The Python port uses
-# sqlite3's parameterized row fetching (one full row per Python
-# iteration), so it correctly handles descriptions with newlines.
-#
-# This test asserts that:
-#   * Bash forward aborts with the known "title required" bug.
-#   * Python forward succeeds and writes the right number of
-#     bug_reports rows + observed_in entries.
+# The native forward uses parameterized SQLite rows, preserving descriptions
+# with embedded newlines that the retired tab-separated shell loop corrupted.
 def test_review_forward_to_bug_reports_parity(temp_db, fake_repo):
-    """Bash forward is broken (descriptions with newlines confuse the
-    ``IFS=$'\\t' read`` loop); Python port correctly forwards every open
-    issue into bug_reports rows via in-process bug_report_emit + sweep."""
+    """Forwarding preserves newline-bearing descriptions without shell parsing."""
     bad_sh = "#!/usr/bin/env bash\nif [ broken\n"
     sha = _add_and_commit(fake_repo, {"lib/y.sh": bad_sh})
 
@@ -663,21 +412,6 @@ def test_review_forward_to_bug_reports_parity(temp_db, fake_repo):
     open_for_py = [r for r in pre if r["review_id"] == py_rid and r["status"] == "open"]
     assert len(open_for_py) >= 2, (
         f"expected >=2 open issues for py review, got {len(open_for_py)}"
-    )
-
-    # Bash forward — known broken on this code path.
-    # We still call it so the test documents the bug end-to-end.
-    bash_f = _bash_run_func(
-        "review_forward_to_bug_reports", [str(py_rid)],
-        db=temp_db["db"], home=temp_db["home"],
-    )
-    assert bash_f.returncode != 0, (
-        f"bash forward unexpectedly succeeded — bash source bug is "
-        f"fixed upstream; tighten this test to enforce bash+py parity."
-    )
-    assert "title required" in bash_f.stderr, (
-        f"bash forward failed but not with the expected 'title required' "
-        f"stderr: {bash_f.stderr!r}"
     )
 
     # Python forward — succeeds and writes the expected rows.
