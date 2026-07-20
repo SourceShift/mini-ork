@@ -1261,3 +1261,79 @@ def test_dry_run_node_type_filter(tmp_path):
     finally:
         os.environ.clear(); os.environ.update(old)
     assert len(_dispatch_lines(buf.getvalue())) == 1   # only res1
+
+
+# ── execute pre-dispatch gate (port of tests/integration/test_dispatch_telemetry_gate.sh §4) ──
+# A plan_status=needs_answers plan carrying real human_questions must be REFUSED
+# before any node dispatches — the run has an open question only a human can
+# answer, so dispatching would burn LLM budget producing work against an
+# unresolved premise. The gate fires at mini_ork_execute:946 (before node
+# resolution), so these tests never call a provider.
+
+def _needs_answers_plan(questions=("q1",)):
+    return json.dumps({
+        "plan_status": "needs_answers", "blocked_by": "run_profile",
+        "human_questions": list(questions), "decomposition": [],
+    })
+
+
+def test_execute_gate_refuses_needs_answers_plan(tmp_path):
+    """End-to-end: ex.main on a needs_answers plan exits 6 and leaves a
+    fail-closed audit trail — blocked.json, a task_runs failed/ESCALATE row, and
+    exactly one execute_blocked run_event. Nothing dispatches."""
+    db = _seed_db(tmp_path, "gate")
+    home = Path(db).parent
+    _seed_task_run(db, rid="run-gate", status="planned")
+    run_dir = home / "runs" / "run-gate"; run_dir.mkdir(parents=True)
+    plan = run_dir / "plan.json"; plan.write_text(_needs_answers_plan())
+
+    env = {**os.environ, "MINI_ORK_ROOT": str(REPO), "MINI_ORK_HOME": str(home),
+           "MINI_ORK_DB": db, "MINI_ORK_RUN_ID": "run-gate", "MINI_ORK_DRY_RUN": "0"}
+    env.pop("MINI_ORK_EXECUTE_GATE", None)  # gate defaults ON
+    old = dict(os.environ); os.environ.clear(); os.environ.update(env)
+    import io
+    from contextlib import redirect_stdout
+    buf = io.StringIO()
+    try:
+        with redirect_stdout(buf):
+            rc = ex.main([str(plan)], root=str(REPO))
+    finally:
+        os.environ.clear(); os.environ.update(old)
+
+    assert rc == 6                                             # refused before dispatch
+    assert "[blocked]" in buf.getvalue()                       # human-readable refusal
+    assert (run_dir / "blocked.json").is_file()                # fail-closed artifact
+    # verdict='ESCALATE' (schema CHECK forbids 'BLOCKED'); the "blocked" identity lives
+    # in status='failed' + the execute_blocked run_event + notes + blocked.json.
+    assert _sql(db, "SELECT status||'|'||COALESCE(verdict,'') FROM task_runs "
+                    "WHERE id='run-gate';").stdout.strip() == "failed|ESCALATE"
+    assert _sql(db, "SELECT count(*) FROM run_events "
+                    "WHERE event_type='execute_blocked';").stdout.strip() == "1"
+
+
+def test_execute_gate_bypasses_override_dryrun_and_zero_question(tmp_path):
+    """The gate must NOT block when the operator overrides it
+    (MINI_ORK_EXECUTE_GATE=0), under dry-run, or on the needs_answers-with-ZERO-
+    questions contradiction — each returns False so the run proceeds. Exercised on
+    _execute_gate_check directly so no node ever dispatches."""
+    db = _seed_db(tmp_path, "bypass")
+    home = Path(db).parent
+    run_dir = home / "runs" / "run-gate"; run_dir.mkdir(parents=True)
+    blocking = run_dir / "plan.json"; blocking.write_text(_needs_answers_plan())
+    zero_q = run_dir / "plan_zero_q.json"; zero_q.write_text(_needs_answers_plan(questions=()))
+
+    base = {**os.environ, "MINI_ORK_HOME": str(home), "MINI_ORK_DB": db,
+            "MINI_ORK_RUN_ID": "run-gate"}
+
+    def _gate(plan_path, dry_run, gate):
+        env = {**base, "MINI_ORK_EXECUTE_GATE": gate}
+        old = dict(os.environ); os.environ.clear(); os.environ.update(env)
+        try:
+            return ex._execute_gate_check(str(plan_path), str(run_dir), dry_run)
+        finally:
+            os.environ.clear(); os.environ.update(old)
+
+    assert _gate(blocking, False, "1") is True    # sanity: the gate DOES block when armed
+    assert _gate(blocking, False, "0") is False   # operator override
+    assert _gate(blocking, True, "1") is False    # dry-run skip
+    assert _gate(zero_q, False, "1") is False     # needs_answers + 0 questions = not a real block
