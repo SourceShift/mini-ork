@@ -1,4 +1,4 @@
-"""Standalone unit tests for ``mini_ork.ported.similarity``.
+"""Standalone unit tests for the canonical ``mini_ork.similarity`` ranker.
 
 Replaces the bash-parity gate (``test_similarity_parity.py``) as part of the
 bash→Python migration: the Python port is now the sole implementation, so its
@@ -14,11 +14,12 @@ import math
 
 import pytest
 
-from mini_ork.ported.similarity import (
+from mini_ork.similarity import (
     ALLOWED,
     allowed_table_col,
     cos,
     rank,
+    rank_raw,
     tf,
     tok,
 )
@@ -103,3 +104,13 @@ class TestRank:
         out = rank("auth bug", self.DOCS, limit=5, round_ndigits=4)
         for s, _ in out:
             assert round(s, 4) == s
+
+    def test_raw_scores_preserve_precision_and_define_reported_order(self):
+        raw = rank_raw("auth bug", self.DOCS)
+        rounded = rank("auth bug", self.DOCS, limit=5)
+        assert any(score != round(score, 4) for score, _ in raw)
+        assert [index for _, index in rounded] == [index for _, index in raw]
+
+    def test_raw_limit_is_optional(self):
+        assert len(rank_raw("auth bug", self.DOCS, limit=1)) == 1
+        assert len(rank_raw("auth bug", self.DOCS)) == 2
