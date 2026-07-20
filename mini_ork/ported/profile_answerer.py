@@ -1,23 +1,10 @@
-"""Profile-answerer — Python port of lib/profile_answerer.sh.
+"""Native profile-question answerer.
 
-Faithful port of `mo_answer_profile_questions`. The bash heredocs in
-`lib/profile_answerer.sh` (prompt builder at lines 26-53; parser at lines
-73-164) are PURE PYTHON already — they are inlined `python3 - <<'PY'`
-blocks. This module lifts them verbatim into a regular Python module with
-no behavior change, then mirrors the bash glue (arg validation, mkdir -p,
-llm_dispatch fallback chain).
-
-The Python module is runtime-native. Deterministic parsing remains covered by
-the pre-retirement Bash oracle, while the default LLM boundary calls
-``mini_ork.ported.llm_dispatch`` in-process.
-
-Pipeline map (bash function → Python):
-  mo_answer_profile_questions:
-    arg validation                       → answer_profile_questions (ValueError /
-                                            FileNotFoundError, matching bash exit 2)
-    prompt builder (heredoc lines 26-53) → build_prompt
-    llm_dispatch (deepseek → kimi chain) → native default dispatch
-    parser (heredoc lines 73-164)        → parse_and_persist
+This module is the sole runtime owner of the former ``mo_answer_profile_questions``
+contract: argument validation, deterministic prompt construction, native LLM
+dispatch, tolerant JSON recovery, completeness checks, and JSON persistence.
+The provider path makes two Kimi attempts, preserving the latest supported
+pre-retirement behavior for failure or whitespace responses.
 """
 from __future__ import annotations
 
@@ -39,7 +26,6 @@ __all__ = [
 ]
 
 
-# Mirrors lib/profile_answerer.sh:85 — `re.compile(r"^```(?:json|JSON)?\s*\n?|\n?```\s*$", re.MULTILINE)`.
 # Case-sensitive except for the explicit `JSON` branch. Mirroring bash's
 # alternation order and flags is load-bearing — `re.I` would over-strip
 # 'JSON' substrings inside prose.
@@ -47,7 +33,7 @@ _FENCE_RE = re.compile(r"^```(?:json|JSON)?\s*\n?|\n?```\s*$", re.MULTILINE)
 
 
 def _strip_code_fences(raw: str) -> str:
-    """Mirror lib/profile_answerer.sh:85-86 fence-stripping.
+    """Strip optional provider-added Markdown fences.
 
     Strips optional ```json / ```JSON / ``` openers and ``` closers. Most
     instruction-tuned LLMs add fences for any structured payload even when
@@ -57,7 +43,7 @@ def _strip_code_fences(raw: str) -> str:
 
 
 def _extract_balanced_json_object(text: str) -> str:
-    """Mirror lib/profile_answerer.sh:90-116 balanced-brace scanner.
+    """Extract the first balanced JSON object from provider prose.
 
     Finds the FIRST `{` then walks forward tracking depth, skipping chars
     inside strings (with backslash escape handling). Returns the substring
@@ -65,8 +51,7 @@ def _extract_balanced_json_object(text: str) -> str:
     on failure — the caller raises on JSONDecodeError if extraction also
     fails.
 
-    The bash version emits `text[start:i + 1]` (inclusive close brace);
-    Python mirrors that byte-for-byte.
+    The returned slice includes the closing brace.
     """
     start = text.find("{")
     if start == -1:
@@ -97,7 +82,7 @@ def _extract_balanced_json_object(text: str) -> str:
 
 
 def _question_text(item) -> str:
-    """Mirror lib/profile_answerer.sh:136-141 question_text helper.
+    """Normalize supported question values to their contract text.
 
     str → return as-is; dict → return .text or .question or str(dict);
     anything else → str(item).
@@ -110,14 +95,12 @@ def _question_text(item) -> str:
 
 
 def build_prompt(kickoff_path: str | os.PathLike, questions_json: str) -> str:
-    """Mirror lib/profile_answerer.sh:25-53 prompt builder.
+    """Build the deterministic profile-answer prompt.
 
     Reads the kickoff file as UTF-8, slices to [:20000] chars (matches
-    bash's `kickoff[:20000]` cap), parses `questions_json` with a graceful
+    the historic `kickoff[:20000]` cap), parses `questions_json` with a graceful
     fallback to [] on JSONDecodeError, then renders the fixed prompt
-    template with `json.dumps(questions, ensure_ascii=True)` (matches bash).
-
-    The template is byte-for-byte the heredoc body at lines 37-51.
+    template with `json.dumps(questions, ensure_ascii=True)`.
     """
     kickoff = Path(kickoff_path).read_text(encoding="utf-8")[:20000]
     try:
@@ -151,7 +134,7 @@ def parse_and_persist(
     questions_json: str,
     out_path: str | os.PathLike,
 ) -> dict:
-    """Mirror lib/profile_answerer.sh:73-164 parser + writer.
+    """Normalize, validate, and persist a provider response.
 
     Args:
         raw: raw LLM text (already the dispatch return value; will be stripped).
@@ -227,21 +210,18 @@ def _default_dispatch(
     *,
     repo_root: str | os.PathLike,
     dispatch_fn: Callable[..., int] | None = None,
-    models: tuple[str, ...] = ("deepseek", "kimi"),
+    models: tuple[str, ...] = ("kimi", "kimi"),
 ) -> str:
-    """Run the native DeepSeek → Kimi fallback chain.
+    """Run the native Kimi primary attempt and one Kimi retry.
 
-    Mirrors lib/profile_answerer.sh:60-70 — primary call to
-    `llm_dispatch --model deepseek` with fallback to `llm_dispatch --model
-    kimi`. The empty-stdout check (bash's `|| [ -z "${raw// /}" ]`) is
-    preserved: deepseek under transient throttling sometimes exits 0 with
-    empty/whitespace output.
+    The second attempt runs when the first fails or returns empty/whitespace
+    output. ``models`` remains injectable for bounded provider validation.
 
     Args:
         prompt: full prompt text (built by `build_prompt`).
         repo_root: path to the mini-ork engine root.
         dispatch_fn: injectable model-provider boundary for tests.
-        models: ordered fallback chain; production retains DeepSeek → Kimi.
+        models: ordered attempt list; production retains Kimi → Kimi retry.
     """
     from mini_ork.ported import llm_dispatch as native_dispatch
 
@@ -279,7 +259,7 @@ def answer_profile_questions(
     dispatch=None,
     repo_root: str | os.PathLike | None = None,
 ) -> dict:
-    """Mirror lib/profile_answerer.sh::mo_answer_profile_questions.
+    """Answer and persist all profile questions.
 
     Args:
         kickoff_path: path to the kickoff markdown file.
@@ -288,7 +268,7 @@ def answer_profile_questions(
         dispatch: optional Callable[[str], str] taking the prompt text and
             returning raw LLM text. Tests inject a captured real LLM
             response; production callers should pass None to use the native
-            DeepSeek → Kimi fallback chain.
+            Kimi primary-and-retry chain.
         repo_root: required when dispatch is None — path to the mini-ork
             engine root.
 
@@ -297,10 +277,9 @@ def answer_profile_questions(
 
     Raises:
         ValueError: any of kickoff_path / questions_json / out_path is
-            empty (bash exits 2 with `usage: ...` on stderr).
+            empty.
         FileNotFoundError: kickoff_path is non-empty but the file does
-            not exist (bash exits 2 with `profile answerer kickoff not
-            found: ...` on stderr).
+            not exist.
         RuntimeError: the LLM output was non-JSON (after fence-strip +
             balanced-extraction) or the LLM omitted one or more input
             questions.

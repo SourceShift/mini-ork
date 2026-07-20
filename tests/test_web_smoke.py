@@ -1116,14 +1116,13 @@ def test_llm_calls_route_tolerates_null_taxonomy_columns(tmp_path: Path) -> None
     assert rows[0]["feature_name"] == "mini-ork:reviewer"
 
 
-def test_profile_answerer_helper_exists() -> None:
-    helper = ROOT / "lib" / "profile_answerer.sh"
-    text = helper.read_text()
+def test_profile_answerer_has_one_native_owner() -> None:
+    from mini_ork.ported import profile_answerer
 
-    assert "mo_answer_profile_questions" in text
-    assert "llm_dispatch" in text
-    assert "--node-type \"profile_answerer\"" in text
-    assert "\"auto_answered\": True" in text
+    assert not (ROOT / "lib" / "profile_answerer.sh").exists()
+    assert callable(profile_answerer.answer_profile_questions)
+    assert callable(profile_answerer.build_prompt)
+    assert callable(profile_answerer.parse_and_persist)
 
 
 def test_python_plan_references_native_auto_answer() -> None:
