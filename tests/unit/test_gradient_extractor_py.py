@@ -224,6 +224,29 @@ def test_extract_missing_trace_exits_nonzero(db):
     assert rc != 0
 
 
+def test_framework_agent_policy():
+    assert ge.is_framework_agent("__reflect__")
+    assert ge.is_framework_agent("__future_agent__")
+    assert not ge.is_framework_agent("framework_edit")
+    assert not ge.is_framework_agent("")
+    assert not ge.is_framework_agent(None)
+
+
+def test_watermark_detects_evidence_link(db):
+    ge.init_schema(db)
+    assert not ge.has_watermark("tr-watermarked", db)
+    ge.store({
+        "gradient_id": "gr-watermarked",
+        "target": "workflow.node.verify",
+        "signal": "missed boundary",
+        "suggested_change": "add a boundary assertion",
+        "evidence": "tr-watermarked",
+        "confidence": 0.8,
+    }, db=db)
+    assert ge.has_watermark("tr-watermarked", db)
+    assert not ge.has_watermark("tr-fresh", db)
+
+
 def test_parse_llm_output_recovers_fenced_and_truncated_arrays():
     fenced = """```json
 [{"target":"workflow.node.plan","signal":"s","suggested_change":"c"}]
