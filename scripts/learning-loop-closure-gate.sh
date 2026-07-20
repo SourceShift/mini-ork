@@ -16,7 +16,7 @@ set -Eeuo pipefail
 
 MINI_ORK_ROOT="${MINI_ORK_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 DB="${MINI_ORK_DB:-$MINI_ORK_ROOT/.mini-ork/state.db}"
-EXEC="$MINI_ORK_ROOT/bin/mini-ork-execute"
+EXEC="$MINI_ORK_ROOT/mini_ork/ported/mini_ork_execute.py"
 PASS=0
 FAIL=0
 
@@ -34,20 +34,24 @@ assert_grep() {
   fi
 }
 
-assert_grep "PRM scoring default-ON (MO_PRM_SCORE:-1)" \
-  'MO_PRM_SCORE:-1' "$EXEC"
-assert_grep "routing policy default learning_governed (MO_ROUTING_POLICY:-learning_governed)" \
-  'MO_ROUTING_POLICY:-learning_governed' "$EXEC"
-assert_grep "learning writeback default-ON (MO_LEARNING_WRITEBACK:-1)" \
-  'MO_LEARNING_WRITEBACK:-1' "$EXEC"
+assert_grep "process reward scoring default-ON" \
+  'os\.environ\.get\("MO_PRM_SCORE", "1"\) == "1"' "$EXEC"
+assert_grep "native process reward scorer wired" \
+  'from mini_ork\.learning\.process_reward import score_trace' "$EXEC"
+assert_grep "reward stamping default-ON" \
+  'os\.environ\.get\("MO_REWARD_STAMP", "1"\)' "$EXEC"
+assert_grep "routing policy default learning_governed" \
+  'os\.environ\.get\("MO_ROUTING_POLICY"\) or "learning_governed"' "$EXEC"
+assert_grep "learning writeback implementation present" \
+  '^def write_grpo_advantages\(' "$EXEC"
 assert_grep "agent_version_id stamped from dispatch_lane onto each trace" \
-  'agent_version_id = sys.argv' "$EXEC"
-assert_grep "dispatch_lane passed as trace payload arg" \
-  'dispatch_lane:-\}" 2>/dev/null' "$EXEC"
+  'extra\["agent_version_id"\] = lane' "$EXEC"
+assert_grep "resolved lane passed through the trace wrapper" \
+  'finish_reason, lane=lane' "$EXEC"
 assert_grep "GRPO writer present" \
-  'mo_learning_write_grpo_advantages' "$EXEC"
+  '^def write_grpo_advantages\(' "$EXEC"
 assert_grep "conductor outcome writer present" \
-  'mo_learning_update_conductor_outcomes' "$EXEC"
+  '^def learning_update_conductor_outcomes\(' "$EXEC"
 
 # --- [LIVE] state.db: schema + data exist to record/read learnings ----------
 

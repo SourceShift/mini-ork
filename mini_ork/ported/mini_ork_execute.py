@@ -1,14 +1,12 @@
-"""Python port of bin/mini-ork-execute — the executor (INCREMENTAL).
+"""The sole mini-ork executor implementation.
 
-bin/mini-ork-execute is the 3449-line node-dispatch engine. This port covers it
-in increments: deterministic helpers + GRPO writeback + orchestration backbone
-(NODE_IDS + --dry-run, all live-bash parity-gated) + the live per-node routing
-(dispatch_node), whose ONE LLM call is an injectable seam (dispatch_fn) — the live
-path is functionally verified (fake dispatch → ported-helper wiring), not
-bash-parity, since real model output can't be parity-tested. The default flip
-(bash→Python runtime) + a real-LLM integration harness remain.
+This module owns the complete node lifecycle: workflow selection, bounded
+process-isolated dispatch, provider routing, verification, learning writeback,
+publishing, rollback, checkpointing, telemetry, and failure propagation.  The
+LLM call remains an injectable external boundary through ``dispatch_fn``;
+native tests use deterministic dispatchers and never spend provider credits.
 
-Ported here (all pure / transcribed verbatim):
+Key public contracts:
     reward_from_status(status, verdict)     — status/verdict → GRPO reward
     dispatch_chain(node_type, lead)         — role-aware fallback lane chain (deduped)
     learning_static_lane(node_type, lane)   — static lane synthesis for unpinned nodes
@@ -23,8 +21,11 @@ Ported here (all pure / transcribed verbatim):
 """
 from __future__ import annotations
 
+import contextlib
+import concurrent.futures
 import datetime
 import hashlib
+import io
 import json
 import math
 import os
@@ -106,7 +107,13 @@ def learning_static_lane(node_type: str, current_lane: str) -> str:
     return current_lane
 
 
-def learning_governed_lane(node_type: str, current_lane: str, *, root=None) -> str:
+def learning_governed_lane(
+    node_type: str,
+    current_lane: str,
+    *,
+    root=None,
+    task_class: str | None = None,
+) -> str:
     """Port of bash `_mo_learning_governed_lane`: delegate the routing read to the
     canonical NATIVE `decide()` in ``mini_ork.ported.decision_service`` — the same
     brain every consumer uses. No state DB → static fallback (decide can't consult
@@ -118,7 +125,8 @@ def learning_governed_lane(node_type: str, current_lane: str, *, root=None) -> s
     db = os.environ.get("MINI_ORK_DB", "")
     if not db or not os.path.isfile(db):
         return learning_static_lane(node_type, current_lane)
-    task_class = os.environ.get("TASK_CLASS") or os.environ.get("MINI_ORK_TASK_CLASS") or "generic"
+    task_class = (task_class or os.environ.get("TASK_CLASS")
+                  or os.environ.get("MINI_ORK_TASK_CLASS") or "generic")
     objective_domain = (os.environ.get("MINI_ORK_OBJECTIVE_DOMAIN")
                         or os.environ.get("MO_OBJECTIVE_DOMAIN") or "code-delivery")
     try:
@@ -130,7 +138,14 @@ def learning_governed_lane(node_type: str, current_lane: str, *, root=None) -> s
         return current_lane
 
 
-def policy_route_lane(node_type: str, current_lane: str, *, dry_run=False, root=None) -> str:
+def policy_route_lane(
+    node_type: str,
+    current_lane: str,
+    *,
+    dry_run=False,
+    root=None,
+    task_class: str | None = None,
+) -> str:
     """Port of bash `_mo_policy_route_lane`. Applied to every live node BEFORE dispatch
     so the routed lane (not the raw node_type/workflow lane) reaches --node-type. Dry-run
     preserves the recipe's explicit lane (workflow-shape preview, not a policy preview)."""
@@ -158,7 +173,12 @@ def policy_route_lane(node_type: str, current_lane: str, *, dry_run=False, root=
         # keep their lane — consistent with learning_static_lane's pin-preservation.
         if current_lane != node_type:
             return current_lane
-        return learning_governed_lane(node_type, learning_static_lane(node_type, current_lane), root=root)
+        return learning_governed_lane(
+            node_type,
+            learning_static_lane(node_type, current_lane),
+            root=root,
+            task_class=task_class,
+        )
     if policy == "trace_governed":
         fail_count = int(os.environ.get("FAIL_COUNT", "0") or "0")
         if node_type == "reviewer":
@@ -730,6 +750,87 @@ def _emit_run_verdict(run_dir, fail_count, dispatched):
           f"(failed_nodes={fail_count})")
 
 
+def _max_parallel() -> int:
+    """Return the bounded worker count (Bash default: 4, minimum: 1)."""
+    try:
+        return max(1, int(os.environ.get("MINI_ORK_MAX_PARALLEL", "4")))
+    except ValueError:
+        return 4
+
+
+def _isolated_dispatch_worker(payload):
+    """Run one native node in a process-isolated environment.
+
+    Provider routing mutates process environment variables, so live concurrent
+    nodes cannot safely share threads. The worker recreates best-effort trace
+    and checkpoint writers locally and returns captured output to the parent.
+    """
+    (field, root, run_dir, plan_path, task_class, db, run_id,
+     recipe, workflow) = payload
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            rc, finish_reason = dispatch_node(
+                field,
+                root=root,
+                run_dir=run_dir,
+                plan_path=plan_path,
+                task_class=task_class,
+                db=db,
+                run_id=run_id,
+                dispatch_fn=_default_llm_dispatch(root),
+                recipe=recipe,
+                workflow=workflow,
+                trace_fn=_make_trace_fn(task_class, db, run_id),
+                checkpoint_fn=_make_checkpoint_fn(
+                    db, run_id, run_dir, recipe, task_class
+                ),
+            )
+    except Exception as exc:
+        rc, finish_reason = 1, "error"
+        stderr.write(f"native parallel worker failed: {exc}\n")
+    return rc, finish_reason, stdout.getvalue(), stderr.getvalue()
+
+
+def _run_parallel_batch(
+    fields,
+    *,
+    root,
+    run_dir,
+    plan_path,
+    task_class,
+    db,
+    run_id,
+    recipe,
+    workflow,
+    ignore_failures=False,
+):
+    """Dispatch a bounded batch and return its counted failure total."""
+    if not fields:
+        return 0
+    payloads = [
+        (field, root, run_dir, plan_path, task_class, db, run_id, recipe, workflow)
+        for field in fields
+    ]
+    try:
+        with concurrent.futures.ProcessPoolExecutor(
+            max_workers=min(_max_parallel(), len(payloads))
+        ) as pool:
+            results = list(pool.map(_isolated_dispatch_worker, payloads))
+    except Exception as exc:
+        print(f"  [warn] parallel worker pool unavailable; falling back to serial: {exc}",
+              file=sys.stderr)
+        results = [_isolated_dispatch_worker(payload) for payload in payloads]
+    failures = 0
+    for rc, _finish_reason, out, err in results:
+        sys.stdout.write(out)
+        sys.stderr.write(err)
+        if rc != 0 and not ignore_failures:
+            failures += 1
+    return failures
+
+
 def main(argv=None, *, root=None, dispatch_fn=None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     root = root or os.environ.get("MINI_ORK_ROOT") or os.getcwd()
@@ -946,7 +1047,14 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
     # dispatch_fn is the LLM seam (task_class, node_type, prompt) -> (rc, text);
     # defaults to the ported llm_dispatch. dispatch_node wires the ported helpers
     # (apply_impl_output, charge_node_cost, set_status, verdict gate) around it.
-    task_class = os.environ.get("MINI_ORK_TASK_CLASS", "generic")
+    task_class = ""
+    if plan_path:
+        try:
+            with open(plan_path, encoding="utf-8") as handle:
+                task_class = str((json.load(handle) or {}).get("task_class") or "")
+        except (OSError, ValueError, TypeError):
+            task_class = ""
+    task_class = task_class or os.environ.get("MINI_ORK_TASK_CLASS") or "generic"
     db = os.environ.get("MINI_ORK_DB") or os.path.join(
         os.environ.get("MINI_ORK_HOME", ".mini-ork"), "state.db")
     run_id = os.environ.get("MINI_ORK_RUN_ID", "")
@@ -963,24 +1071,82 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
     # treat the node as not-reusable on the next attempt (design §4).
     checkpoint_writer = _make_checkpoint_fn(db, run_id, live_run_dir, recipe, task_class)
     set_status(db, run_id, "executing")
-    ordered = ([f for nt in _NODE_TYPE_ORDER for f in fields_list if f[1] == nt]
-               if dispatch_mode == "partitioned" else fields_list)
-    for f in ordered:
-        if filter_node_type and f[1] != filter_node_type:
-            continue
-        if f[1] == "rollback" and fail_count == 0:
-            print("  [skip] rollback — no failures (escalates_to edge not triggered)")
-            continue
+    selected = [f for f in fields_list if not filter_node_type or f[1] == filter_node_type]
+
+    def _dispatch_serial(field):
         # D1: bash keeps FAIL_COUNT as a shell var visible to _mo_policy_route_lane's
         # trace_governed branch (:2014). Export it so the port's policy_route_lane sees
         # the live prefix-failure count (else trace_governed never escalates).
         os.environ["FAIL_COUNT"] = str(fail_count)
-        rc, _fr = dispatch_node(f, root=root, run_dir=live_run_dir, plan_path=plan_path,
+        return dispatch_node(field, root=root, run_dir=live_run_dir, plan_path=plan_path,
                                 task_class=task_class, db=db, run_id=run_id,
                                 dispatch_fn=llm, recipe=recipe, workflow=workflow,
                                 trace_fn=trace_writer, checkpoint_fn=checkpoint_writer)
-        if rc != 0:
-            fail_count += 1
+
+    def _parallel(batch, *, ignore_failures=False):
+        # Injected dispatchers stay in-process and serial for deterministic,
+        # provider-free tests. Production's default dispatcher gets real,
+        # process-isolated concurrency.
+        if dispatch_fn is not None:
+            counted = 0
+            for field in batch:
+                rc, _fr = _dispatch_serial(field)
+                if rc != 0 and not ignore_failures:
+                    counted += 1
+            return counted
+        os.environ["FAIL_COUNT"] = str(fail_count)
+        return _run_parallel_batch(
+            batch,
+            root=root,
+            run_dir=live_run_dir,
+            plan_path=plan_path,
+            task_class=task_class,
+            db=db,
+            run_id=run_id,
+            recipe=recipe,
+            workflow=workflow,
+            ignore_failures=ignore_failures,
+        )
+
+    rollback_fields = [field for field in selected if field[1] == "rollback"]
+    work_fields = [field for field in selected if field[1] != "rollback"]
+
+    if dispatch_mode == "parallel":
+        fail_count += _parallel(work_fields)
+    elif dispatch_mode == "speculative":
+        _parallel(work_fields, ignore_failures=True)
+    elif dispatch_mode == "partitioned":
+        for node_type in _NODE_TYPE_ORDER:
+            if node_type == "rollback":
+                continue
+            group = [field for field in work_fields if field[1] == node_type]
+            fail_count += _parallel(group)
+    else:
+        pending = []
+
+        def _flush_pending():
+            nonlocal fail_count, pending
+            if pending:
+                fail_count += _parallel(pending)
+                pending = []
+
+        for field in work_fields:
+            if field[4] == "parallel" and dispatch_fn is None:
+                pending.append(field)
+                if len(pending) >= _max_parallel():
+                    _flush_pending()
+                continue
+            _flush_pending()
+            rc, _fr = _dispatch_serial(field)
+            if rc != 0:
+                fail_count += 1
+        _flush_pending()
+
+    if rollback_fields and fail_count > 0:
+        for field in rollback_fields:
+            _dispatch_serial(field)
+    elif rollback_fields:
+        print("  [skip] rollback — no failures (escalates_to edge not triggered)")
     _emit_run_verdict(live_run_dir, fail_count, len(fields_list))
     # Close the eval loop (bash mo_grade_run_reward, :3271): feed the rubric's GRADED
     # 0-8 run score into reward_g on every trace of this run. When rubric.json exists it
@@ -990,6 +1156,14 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
         try:
             from mini_ork import trace_store  # noqa: PLC0415
             trace_store.grade_run_reward(live_run_dir, run_id, db=db)
+        except Exception:
+            pass
+    # Close the learning writeback loop after the final reward is known. Both
+    # writers are deterministic DB side-channels and remain best-effort.
+    if os.environ.get("MO_LEARNING_WRITEBACK", "1") == "1":
+        try:
+            learning_update_conductor_outcomes(db)
+            write_grpo_advantages(db)
         except Exception:
             pass
     if fail_count > 0:
@@ -1067,13 +1241,12 @@ def charge_node_cost(db, run_id, cost_file="", *, dry_run=False, root=None):
         con.commit(); con.close()
     except Exception:
         pass
-    root = root or os.environ.get("MINI_ORK_ROOT", "")
-    pause = os.path.join(root, "lib", "cost_pause.sh") if root else ""
-    if pause and os.path.isfile(pause):
-        r = subprocess.run(["bash", "-c", f'source "{pause}"; mo_cost_pause_check "$1" "$2"',
-                            "_", run_id, cost], capture_output=True)
-        if r.returncode != 0:
+    try:
+        from mini_ork.ported import cost_pause
+        if cost_pause.check(run_id, float(cost)) != 0:
             os.environ["MO_NODE_FINISH_REASON"] = "paused_for_approval"
+    except Exception:
+        pass
 
 
 def apply_impl_output(impl_log, target):
@@ -1249,17 +1422,23 @@ def _run_verifier_ref(script, evidence_path, *, plan_path="", artifact_path="", 
 
 
 def _default_llm_dispatch(root):
-    """The real LLM seam: shell to llm_dispatch, capturing stdout+stderr as the
-    node result — mirrors bash's
+    """The real LLM seam: call the native dispatcher, capturing stdout+stderr as
+    the node result — mirrors bash's
     RESULT=$(llm_dispatch --task-class X --node-type Y --prompt-text Z 2>&1)."""
-    lib = os.path.join(root, "lib", "llm-dispatch.sh")
-
     def d(task_class, node_type, prompt):
-        r = subprocess.run(
-            ["bash", "-c", f'source "{lib}"; llm_dispatch --task-class "$1" '
-             '--node-type "$2" --prompt-text "$3" 2>&1', "_", task_class, node_type, prompt],
-            capture_output=True, text=True)
-        return r.returncode, r.stdout
+        from mini_ork.ported import llm_dispatch
+        model = os.environ.get("MO_DISPATCH_CHAIN") or node_type
+        captured = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(captured), contextlib.redirect_stderr(captured):
+                rc = llm_dispatch.llm_dispatch(
+                    ["--task-class", task_class, "--node-type", node_type,
+                     "--model", model, "--prompt-text", prompt],
+                    root=root,
+                )
+            return rc, captured.getvalue()
+        except Exception as exc:
+            return 1, captured.getvalue() + str(exc)
     return d
 
 
@@ -1364,17 +1543,16 @@ def _resolve_target_cwd(run_dir_eff):
 
 
 def _assert_lane_capability(root, lane, required):
-    """Shell to lib/lane-helpers.sh mo_assert_lane_capability (rc 0 = satisfiable).
-    Not re-implemented — the capability taxonomy lives in the bash lib."""
-    lib = os.path.join(root, "lib", "lane-helpers.sh")
-    if not os.path.isfile(lib) or not required:
+    """Call the native capability taxonomy (True = satisfiable)."""
+    del root
+    if not required:
         return True
     try:
-        r = subprocess.run(
-            ["bash", "-c", f'source "{lib}"; MO_LANE_REQUIRES_CAPABILITY="$2" '
-             'mo_assert_lane_capability "$1"', "_", lane, required],
-            capture_output=True, text=True, timeout=15)
-        return r.returncode == 0
+        from mini_ork.ported import lane_helpers
+        lane_helpers.assert_lane_capability(lane, required)
+        return True
+    except RuntimeError:
+        return False
     except Exception:
         return True
 
@@ -1632,46 +1810,48 @@ def _assemble_reviewer_inputs(run_dir):
 def _learned_block(root, task_class, node_type):
     """F5-B (bash _dispatch_node:2357-2382): inject reflect-learned failure modes +
     unconsumed operator-steering messages into LLM node prompts — the READ side of
-    the learning loop. Shells to lib/context_assembler.sh (the same code the bash path
-    runs). Empty when opt-out (MO_INJECT_LEARNINGS=0), non-LLM node, or lib absent."""
+    the learning loop. Empty when opt-out or for a non-LLM node."""
     if os.environ.get("MO_INJECT_LEARNINGS", "1") != "1":
         return ""
     if node_type not in ("researcher", "implementer", "reviewer"):
         return ""
-    lib = os.path.join(root, "lib", "context_assembler.sh")
-    if not os.path.isfile(lib):
-        return ""
+    del root
     block = ""
     try:
-        fm = subprocess.run(
-            ["bash", "-c", 'source "$1"; declare -f context_failure_modes_md >/dev/null 2>&1 '
-             '&& context_failure_modes_md "$2" 5 || true', "_", lib, task_class or "generic"],
-            capture_output=True, text=True, timeout=30).stdout.strip()
+        from mini_ork import context_assembler
+        fm = context_assembler.failure_modes_md(
+            task_class or "generic", 5, db=os.environ.get("MINI_ORK_DB")
+        ).strip()
         if fm:
             block = "\n\n" + fm + "\n"
-        st = subprocess.run(
-            ["bash", "-c", 'source "$1"; declare -f context_operator_steering_md >/dev/null 2>&1 '
-             '&& context_operator_steering_md "$2" || true', "_", lib, node_type],
-            capture_output=True, text=True, timeout=30).stdout.strip()
-        if st:
-            block = block + "\n" + st + "\n"
+        from mini_ork.ported import operator_steering
+        rows = operator_steering.fetch_for(
+            os.environ.get("MINI_ORK_RUN_ID", ""), node_type
+        )
+        if rows:
+            lines = [
+                "--- Operator steering (injected supervisor guidance) ---",
+                f"{len(rows)} message(s) targeted at this node. Treat as load-bearing:",
+            ]
+            for row in rows:
+                severity = str(row.get("severity", "info")).upper()
+                source = row.get("source") or "unknown"
+                lines.append(f"- [{severity}] (from {source}) {row.get('message', '')}")
+            lines.append("--- /operator steering ---")
+            block += "\n" + "\n".join(lines) + "\n"
     except Exception:
         pass
     return block
 
 
 def _intervention_gate_check(root, node_id, node_type, lane, node_desc):
-    """Shell to lib/intervention_gate.sh intervention_gate_check (rc 0 = proceed).
-    Absent lib → proceed (matches bash `[ -f "$gate_lib" ] || return 0`)."""
-    lib = os.path.join(root, "lib", "intervention_gate.sh")
-    if not os.path.isfile(lib):
-        return True
+    """Call the Python-owned optional intervention policy."""
+    del root
     try:
-        r = subprocess.run(
-            ["bash", "-c", f'source "{lib}"; intervention_gate_check "$1" "$2" "$3" "$4"',
-             "_", node_id, node_type, lane, node_desc],
-            capture_output=True, text=True, timeout=15)
-        return r.returncode == 0
+        from mini_ork.ported import intervention_gate
+        return intervention_gate.intervention_gate_check(
+            node_id, node_type, lane, node_desc
+        )
     except Exception:
         return True
 
@@ -1821,6 +2001,34 @@ def _make_trace_fn(task_class, db, run_id):
         try:
             payload = trace_store.trace_write_node(task_class, status, extra)
             trace_id = trace_store.trace_write(payload, db=db)
+            # Track-B PRM scoring was default-on in the retired executor. Keep
+            # that integration native: score the persisted row so its JSON
+            # fields and DB defaults exactly match what downstream GRPO reads.
+            # Best-effort and opt-out preserve the prior shell contract.
+            if (trace_id and db and os.path.isfile(db)
+                    and os.environ.get("MO_PRM_SCORE", "1") == "1"):
+                try:
+                    from mini_ork.learning.process_reward import score_trace
+                    score_con = sqlite3.connect(db, timeout=5.0)
+                    score_con.execute("PRAGMA busy_timeout=5000")
+                    score_con.row_factory = sqlite3.Row
+                    try:
+                        row = score_con.execute(
+                            "SELECT * FROM execution_traces WHERE trace_id=?",
+                            (trace_id,),
+                        ).fetchone()
+                        if row is not None:
+                            process_reward = score_trace(dict(row))
+                            score_con.execute(
+                                "UPDATE execution_traces SET process_reward=? "
+                                "WHERE trace_id=?",
+                                (process_reward, trace_id),
+                            )
+                            score_con.commit()
+                    finally:
+                        score_con.close()
+                except Exception:
+                    pass
             # code_region UPDATE (bash _mo_update_trace_code_region:1744) — the GRPO
             # grouping key alongside (objective_domain, task_class, node_type).
             region = infer_trace_code_region(json.dumps(payload))
@@ -2006,25 +2214,21 @@ def publisher_node(root, run_dir, db, run_id, recipe, task_class, review_file=""
     Returns (rc, finish_reason). Template ${VAR} paths resolved via expandvars
     (envsubst-equivalent)."""
     # ── oracle gates: fire once pre-publish; only a definitive safety_violation blocks
-    if (os.environ.get("MO_ORACLE_GATES_AUTO", "1") == "1" and run_id and db
-            and os.path.isfile(os.path.join(root, "lib", "gate_bootstrap.sh"))):
+    if os.environ.get("MO_ORACLE_GATES_AUTO", "1") == "1" and run_id and db:
         verdict_file = os.path.join(run_dir, "panel-verdict.json")
         ctx = json.dumps({"panel_run_id": run_id, "recipe": recipe or "unknown",
                           "task_class": task_class or "generic",
                           "verdict_file": verdict_file, "current_round": 1})
         try:
-            r = subprocess.run(
-                ["bash", "-c",
-                 'source "$1/lib/gate_bootstrap.sh" 2>/dev/null || true; '
-                 'declare -f mo_bootstrap_oracle_gates >/dev/null 2>&1 && mo_bootstrap_oracle_gates 2>/dev/null || true; '
-                 'source "$1/lib/gate_registry.sh" 2>/dev/null || true; '
-                 'declare -f gate_run_all >/dev/null 2>&1 && gate_run_all "$2" "$3" 2>/dev/null || echo "{}"',
-                 "_", root, task_class or "generic", ctx],
-                capture_output=True, text=True, timeout=120)
-            try:
-                sv = json.loads(r.stdout.strip() or "{}").get("safety_violation", False)
-            except Exception:
-                sv = False
+            from mini_ork.ported import gate_bootstrap, gate_registry
+            gate_bootstrap.bootstrap_oracle_gates(db=db, root=root)
+            result = gate_registry.gate_run_all(
+                db,
+                task_class or "generic",
+                ctx,
+                mini_ork_root=root,
+            )
+            sv = result.get("safety_violation", False)
             if sv is True or str(sv) == "True":
                 print("  [BLOCK] oracle-gates: safety_violation — publish refused (COALITION_ABORT or equivalent)")
                 return 1, "safety_violation"
@@ -2189,7 +2393,13 @@ def dispatch_node(fields, *, root, run_dir, plan_path, task_class, db, run_id,
     # so the routed lane — not the raw workflow/node_type lane — reaches --node-type.
     # Without this the whole GRPO/learning-governed router is inert (panel finding 1).
     workflow_lane = model_lane or node_type
-    lane = policy_route_lane(node_type, workflow_lane, dry_run=False, root=root)
+    lane = policy_route_lane(
+        node_type,
+        workflow_lane,
+        dry_run=False,
+        root=root,
+        task_class=task_class,
+    )
     _base_trace = trace_fn or (lambda *a, **k: None)
     # F4: durable DAG checkpoint writer (E1). Single seam — the trace
     # wrapper below — so every node completion site publishes a row in
@@ -2380,6 +2590,35 @@ def dispatch_node(fields, *, root, run_dir, plan_path, task_class, db, run_id,
         target = _resolve_target_cwd(run_dir_eff)
         os.environ["MO_TARGET_CWD"] = target
         print(f"  [cwd] codex target: {target}", file=sys.stderr)
+
+        # R5b: the opt-in minimal scaffold is a real executor behavior, not
+        # merely a resolver module. Its default remains ``harness``. Capture
+        # the resolver's parity stdout so it cannot leak into execute output.
+        try:
+            from mini_ork.ported import scaffold_tier
+            with contextlib.redirect_stdout(io.StringIO()):
+                tier = scaffold_tier.mo_scaffold_tier(
+                    node_type, task_class
+                ).strip()
+        except Exception:
+            tier = "harness"
+        if tier == "minimal":
+            try:
+                from mini_ork.agent.minimal import run_minimal
+                result = run_minimal(prompt, cwd=target)
+                output = result.final_output or ""
+                with open(impl_log, "w", encoding="utf-8") as handle:
+                    handle.write(output)
+                if output:
+                    print(f"  [ok] minimal scaffold implementer output → {impl_log}")
+                    trace(node_id, "success", "implementer", impl_log, "", "done")
+                    return 0, "done"
+            except Exception:
+                pass
+            print("  [err] minimal scaffold implementer failed", file=sys.stderr)
+            trace(node_id, "failure", "implementer", impl_log, "", "error")
+            return 1, "error"
+
         rc, result = dispatch_fn(task_class, lane, prompt)
         if rc != 0:
             fr = finish_reason_for_failure(rc, result)

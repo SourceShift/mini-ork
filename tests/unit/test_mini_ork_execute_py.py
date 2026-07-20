@@ -1,62 +1,43 @@
-"""Parity gate: mini_ork.ported.mini_ork_execute helper layer vs bin/mini-ork-execute.
+"""Standalone golden contract for the Python-owned executor.
 
-bin/mini-ork-execute is a CLI (runs setup at top level), so we EXTRACT each pure
-helper's definition by name, source that in isolation, and compare its output to
-the port. Covers the deterministic helper layer (reward/lane/chain/finish-reason/
-code-region); the orchestration core (_dispatch_node + DAG loop) is a separate,
-harsh-critic-gated increment.
+The pre-retirement migration verifier captured byte parity against Bash. These
+tests preserve that verified public/helper surface without reading or executing
+a retired implementation.
 """
 from __future__ import annotations
 
 import json
 import os
-import re
 import subprocess
 import sys
 from pathlib import Path
 
 import yaml
+import pytest
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
 from mini_ork.ported import mini_ork_execute as ex  # noqa: E402
 
-BIN = REPO / "bin" / "mini-ork-execute"
-_SRC = BIN.read_text().splitlines()
 
-
-def _extract(name: str) -> str:
-    """Pull `<name>() { ... }` (closing brace at column 0) from the CLI."""
-    start = None
-    for i, ln in enumerate(_SRC):
-        if re.match(rf"^{re.escape(name)}\(\) *\{{", ln):
-            start = i
-            break
-    assert start is not None, f"function {name} not found"
-    body = [_SRC[start]]
-    for ln in _SRC[start + 1:]:
-        body.append(ln)
-        if ln == "}":
-            break
-    return "\n".join(body)
-
-
-def _call(name, *args, env=None):
-    fn = _extract(name)
-    script = f'{fn}\n{name} "$@"'
-    return subprocess.run(["bash", "-c", script, "_", *map(str, args)],
-                          capture_output=True, text=True,
-                          env={**os.environ, **(env or {})}).stdout.strip()
-
+@pytest.fixture(autouse=True)
+def _isolate_run_environment(monkeypatch):
+    for name in (
+        "MINI_ORK_RUN_DIR", "MINI_ORK_RECIPE", "MINI_ORK_PLAN_PATH",
+        "MINI_ORK_RUN_ID", "MO_TARGET_CWD", "MO_APPLY_IMPL_OUTPUT",
+    ):
+        monkeypatch.delenv(name, raising=False)
 
 def test_reward_from_status_parity():
-    cases = [("", "approve"), ("", "needs_revision"), ("published", ""), ("failed", ""),
-             ("reviewing", ""), ("success", "pass"), ("", "ESCALATE"), ("PUBLISHED", ""),
-             ("weird", "weird")]
-    for status, verdict in cases:
-        rb = _call("_mo_reward_from_status", status, verdict)
-        rp = ex.reward_from_status(status, verdict)
-        assert rb == rp, f"({status!r},{verdict!r}): bash={rb!r} py={rp!r}"
+    cases = {
+        ("", "approve"): "1.0", ("", "needs_revision"): "0.5",
+        ("published", ""): "1.0", ("failed", ""): "0.0",
+        ("reviewing", ""): "0.5", ("success", "pass"): "1.0",
+        ("", "ESCALATE"): "0.5", ("PUBLISHED", ""): "1.0",
+        ("weird", "weird"): "0.5",
+    }
+    for args, expected in cases.items():
+        assert ex.reward_from_status(*args) == expected
 
 
 # --- Anti-Goodhart reward anchor: status is primary, verdict only vetoes ---
@@ -115,10 +96,7 @@ def test_no_signal_half():
 
 
 def test_bash_python_parity():
-    # Bash _mo_reward_from_status and python reward_from_status MUST return
-    # identical values on the full (status, verdict) truth table. GRPO trains
-    # on whichever side the trainer reads — a divergence is silent skill
-    # corruption (parity is non-negotiable, not nice-to-have).
+    # Preserve the full pre-retirement truth table as a standalone golden.
     statuses = ("", "success", "published", "done", "pass",
                 "failure", "failed", "rolled_back", "blocked", "crash",
                 "escalated", "reject", "weird", "approve", "approved",
@@ -128,53 +106,95 @@ def test_bash_python_parity():
                 "escalate", "fail", "failed", "weird")
     for s in statuses:
         for v in verdicts:
-            rb = _call("_mo_reward_from_status", s, v)
-            rp = ex.reward_from_status(s, v)
-            assert rb == rp, (
-                f"PARITY FAIL ({s!r},{v!r}): bash={rb!r} py={rp!r} — "
-                "bash and python MUST match byte-for-byte (silent GRPO "
-                "skill corruption if they diverge)"
-            )
+            sl, vl = s.lower(), v.lower()
+            if sl in {"failure", "failed", "rolled_back", "blocked", "crash", "escalated", "reject"}:
+                expected = "0.0"
+            elif sl in {"success", "published", "done", "pass"}:
+                expected = "0.0" if vl in {"reject", "needs_revision", "request_changes", "escalate"} else "1.0"
+            elif sl == "":
+                expected = "1.0" if vl in {"approve", "approved", "pass", "passed", "success", "ok"} else "0.5"
+            else:
+                expected = "0.5"
+            assert ex.reward_from_status(s, v) == expected
 
 
 def test_dispatch_chain_parity():
-    env = {"MO_FALLBACK_CODING": "minimax,codex,sonnet", "MO_FALLBACK_REVIEW": "opus,kimi,sonnet"}
-    for nt, lead in [("implementer", "minimax"), ("implementer", "glm"), ("reviewer", "opus"),
-                     ("reviewer", "sonnet"), ("verifier", "kimi"), ("unknown_role", "codex"),
-                     ("planner", "codex")]:
-        rb = _call("_mo_dispatch_chain", nt, lead, env=env)
-        rp = ex.dispatch_chain(nt, lead)
-        assert rb == rp, f"({nt},{lead}): bash={rb!r} py={rp!r}"
+    old = dict(os.environ)
+    os.environ.update({"MO_FALLBACK_CODING": "minimax,codex,sonnet",
+                       "MO_FALLBACK_REVIEW": "opus,kimi,sonnet"})
+    cases = {
+        ("implementer", "minimax"): "minimax,codex,sonnet",
+        ("implementer", "glm"): "glm,minimax,codex,sonnet",
+        ("reviewer", "opus"): "opus,kimi,sonnet",
+        ("reviewer", "sonnet"): "sonnet,opus,kimi",
+        ("verifier", "kimi"): "kimi,opus,sonnet",
+        ("unknown_role", "codex"): "codex",
+        ("planner", "codex"): "codex,minimax,sonnet",
+    }
+    try:
+        for args, expected in cases.items():
+            assert ex.dispatch_chain(*args) == expected
+    finally:
+        os.environ.clear(); os.environ.update(old)
+
+
+def test_default_dispatch_preserves_resolved_fallback_chain(monkeypatch):
+    from mini_ork.ported import llm_dispatch
+
+    captured = {}
+
+    def fake_dispatch(argv, *, root):
+        captured["argv"] = argv
+        captured["root"] = root
+        return 0
+
+    monkeypatch.setattr(llm_dispatch, "llm_dispatch", fake_dispatch)
+    monkeypatch.setenv("MO_DISPATCH_CHAIN", "glm,codex,kimi")
+
+    rc, output = ex._default_llm_dispatch("/engine")(
+        "code_fix", "glm", "repair the target"
+    )
+
+    assert rc == 0
+    assert output == ""
+    assert captured["root"] == "/engine"
+    assert captured["argv"] == [
+        "--task-class", "code_fix",
+        "--node-type", "glm",
+        "--model", "glm,codex,kimi",
+        "--prompt-text", "repair the target",
+    ]
 
 
 def test_router_respects_pins_no_monoculture():
     # Router-monoculture fix (bash + py parity): under learning_governed (the default),
     # recipe-pinned panel lenses keep their DISTINCT lanes instead of the governed router
     # collapsing all 4 same-node-type researchers onto one global-slice winner.
-    env = {"MO_ROUTING_POLICY": "learning_governed", "DRY_RUN": "0"}
     for lens in ("glm_lens", "kimi_lens", "codex_lens", "opus_lens"):
-        rb = _call("_mo_policy_route_lane", "researcher", lens, env=env)
         rp = ex.policy_route_lane("researcher", lens)
-        assert rb == lens and rp == lens, \
-            f"pinned {lens} must be preserved: bash={rb!r} py={rp!r} — monoculture NOT fixed"
+        assert rp == lens, f"pinned {lens} must be preserved"
 
 
 def test_learning_static_lane_parity():
-    env = {"MO_FRONTIER_LANE": "opus_lens", "MO_CHEAP_LANE": "kimi_lens"}
-    for nt, lane in [("reviewer", "reviewer"), ("researcher", "researcher"),
-                     ("implementer", "implementer"), ("planner", "planner"),
-                     ("researcher", "glm_lens"), ("reviewer", "custom_lane")]:
-        rb = _call("_mo_learning_static_lane", nt, lane, env=env)
-        rp = ex.learning_static_lane(nt, lane)
-        assert rb == rp, f"({nt},{lane}): bash={rb!r} py={rp!r}"
+    cases = {
+        ("reviewer", "reviewer"): "opus_lens",
+        ("researcher", "researcher"): "kimi_lens",
+        ("implementer", "implementer"): "kimi_lens",
+        ("planner", "planner"): "planner",
+        ("researcher", "glm_lens"): "glm_lens",
+        ("reviewer", "custom_lane"): "custom_lane",
+    }
+    for args, expected in cases.items():
+        assert ex.learning_static_lane(*args) == expected
 
 
 def test_finish_reason_parity():
-    for rc, text in [(124, ""), (43, ""), (1, "lane_fuse_open here"),
-                     (1, "cost_circuit_open spent"), (2, "generic error"), (0, "")]:
-        rb = _call("_mo_finish_reason_for_failure", rc, text)
-        rp = ex.finish_reason_for_failure(rc, text)
-        assert rb == rp, f"({rc},{text!r}): bash={rb!r} py={rp!r}"
+    cases = [((124, ""), "timeout"), ((43, ""), "error"),
+             ((1, "lane_fuse_open here"), "error"),
+             ((1, "cost_circuit_open spent"), "cost_limit"),
+             ((2, "generic error"), "error"), ((0, ""), "error")]
+    for args, expected in cases:
+        assert ex.finish_reason_for_failure(*args) == expected
 
 
 def test_infer_code_region_parity(tmp_path):
@@ -190,17 +210,15 @@ def test_infer_code_region_parity(tmp_path):
     ]
     # run both with MINI_ORK_RUN_DIR unset + a shared cwd so relative paths match
     env = {k: v for k, v in os.environ.items() if k not in ("MINI_ORK_RUN_DIR", "RUN_DIR")}
-    for p in payloads:
-        rb = subprocess.run(["bash", "-c", f'{_extract("_mo_infer_trace_code_region")}\n'
-                             '_mo_infer_trace_code_region "$1"', "_", p],
-                            capture_output=True, text=True, cwd=tmp_path, env=env).stdout.strip()
+    expected = ["src", "(root)", "", "lib", "pkg", "", ""]
+    for p, golden in zip(payloads, expected):
         old = dict(os.environ); os.environ.clear(); os.environ.update(env)
         cwd = os.getcwd(); os.chdir(tmp_path)
         try:
             rp = ex.infer_trace_code_region(p)
         finally:
             os.chdir(cwd); os.environ.clear(); os.environ.update(old)
-        assert rb == rp, f"{p!r}: bash={rb!r} py={rp!r}"
+        assert rp == golden, f"{p!r}: expected={golden!r} py={rp!r}"
 
 
 # ── GRPO writeback parity (DB-deterministic) ──
@@ -240,44 +258,34 @@ def _apm_rows(db):
 
 
 def test_grpo_advantages_parity(tmp_path):
-    db_b = _seed_db(tmp_path, "gb"); db_p = _seed_db(tmp_path, "gp")
-    _seed_traces(db_b); _seed_traces(db_p)
-    # halflife=0 disables recency drift so bash/py compute identical weights
-    env = {"MO_LEARNING_HALFLIFE_DAYS": "0", "MINI_ORK_DB": db_b}
-    nb = subprocess.run(["bash", "-c", f'{_extract("mo_learning_write_grpo_advantages")}\n'
-                         'mo_learning_write_grpo_advantages', "_"],
-                        capture_output=True, text=True, env={**os.environ, **env}).stdout.strip()
+    db_p = _seed_db(tmp_path, "gp")
+    _seed_traces(db_p)
+    # halflife=0 preserves the deterministic pre-retirement golden.
     old = dict(os.environ)
     os.environ.update({"MO_LEARNING_HALFLIFE_DAYS": "0"})
     try:
         np_ = ex.write_grpo_advantages(db_p)
     finally:
         os.environ.clear(); os.environ.update(old)
-    assert nb == str(np_), f"count bash={nb} py={np_}"
-    assert _apm_rows(db_b) == _apm_rows(db_p) and _apm_rows(db_p), "agent_performance_memory differs"
+    assert np_ == 2
+    assert _apm_rows(db_p), "agent_performance_memory must be populated"
 
 
 def test_grpo_sigma_zero_tiebreak_parity(tmp_path):
     # all-success same-reward group → std==0 → cost tiebreak path
-    db_b = _seed_db(tmp_path, "sb"); db_p = _seed_db(tmp_path, "sp")
-    for db in (db_b, db_p):
-        for tid, av, cost in [("a", "opus_lens", 2.0), ("b", "kimi_lens", 0.1)]:
-            _sql(db, "INSERT INTO execution_traces (trace_id,run_id,workflow_version_id,"
-                     "agent_version_id,task_class,prompt_version_hash,context_bundle_hash,tool_calls,"
-                     "files_read,files_written,verifier_output,reviewer_verdict,cost_usd,duration_ms,"
-                     "final_artifact_ref,status,created_at) VALUES "
-                     f"('{tid}','r','w','{av}','code_fix','p','c','[]','[]','[]',"
-                     f"'{{\"node_type\":\"impl\"}}','',{cost},100,'','success','2026-07-01T00:00:00Z');")
-    env = {"MO_LEARNING_HALFLIFE_DAYS": "0", "MINI_ORK_DB": db_b}
-    subprocess.run(["bash", "-c", f'{_extract("mo_learning_write_grpo_advantages")}\n'
-                    'mo_learning_write_grpo_advantages', "_"],
-                   capture_output=True, text=True, env={**os.environ, **env})
+    db_p = _seed_db(tmp_path, "sp")
+    for tid, av, cost in [("a", "opus_lens", 2.0), ("b", "kimi_lens", 0.1)]:
+        _sql(db_p, "INSERT INTO execution_traces (trace_id,run_id,workflow_version_id,"
+             "agent_version_id,task_class,prompt_version_hash,context_bundle_hash,tool_calls,"
+             "files_read,files_written,verifier_output,reviewer_verdict,cost_usd,duration_ms,"
+             "final_artifact_ref,status,created_at) VALUES "
+             f"('{tid}','r','w','{av}','code_fix','p','c','[]','[]','[]',"
+             f"'{{\"node_type\":\"impl\"}}','',{cost},100,'','success','2026-07-01T00:00:00Z');")
     old = dict(os.environ); os.environ.update({"MO_LEARNING_HALFLIFE_DAYS": "0"})
     try:
         ex.write_grpo_advantages(db_p)
     finally:
         os.environ.clear(); os.environ.update(old)
-    assert _apm_rows(db_b) == _apm_rows(db_p)
     # cheaper lane (kimi) got the positive bump
     kimi = _sql(db_p, "SELECT relative_advantage FROM agent_performance_memory "
                       "WHERE agent_version_id='kimi_lens';").stdout.strip()
@@ -285,19 +293,14 @@ def test_grpo_sigma_zero_tiebreak_parity(tmp_path):
 
 
 def test_conductor_outcomes_parity(tmp_path):
-    db_b = _seed_db(tmp_path, "cb"); db_p = _seed_db(tmp_path, "cp")
-    for db in (db_b, db_p):
-        _sql(db, "INSERT INTO epics (id,title,status) VALUES ('e1','E1','done'),('e2','E2','escalated');")
-        _sql(db, "INSERT INTO conductor_decisions (decided_at,epic_id,task_class,outcome) VALUES "
-                 "(1,'e1','x','pending'),(1,'e2','x','pending');")
-    nb = subprocess.run(["bash", "-c", f'{_extract("mo_learning_update_conductor_outcomes")}\n'
-                         'mo_learning_update_conductor_outcomes', "_"],
-                        capture_output=True, text=True,
-                        env={**os.environ, "MINI_ORK_DB": db_b}).stdout.strip()
+    db_p = _seed_db(tmp_path, "cp")
+    _sql(db_p, "INSERT INTO epics (id,title,status) VALUES ('e1','E1','done'),('e2','E2','escalated');")
+    _sql(db_p, "INSERT INTO conductor_decisions (decided_at,epic_id,task_class,outcome) VALUES "
+         "(1,'e1','x','pending'),(1,'e2','x','pending');")
     np_ = ex.learning_update_conductor_outcomes(db_p)
-    assert nb == str(np_) == "2"
+    assert np_ == 2
     q = "SELECT epic_id,outcome,realized_score FROM conductor_decisions ORDER BY epic_id;"
-    assert _sql(db_b, q).stdout == _sql(db_p, q).stdout
+    assert _sql(db_p, q).stdout == "e1|success|1.0\ne2|failure|0.0\n"
 
 
 # ── live-path support helpers (increment 4) ──
@@ -309,55 +312,37 @@ def _seed_task_run(db, rid="r1", status="planned", cost=0.0):
 
 
 def test_set_status_parity(tmp_path):
-    db_b, db_p = _seed_db(tmp_path, "ssb"), _seed_db(tmp_path, "ssp")
-    for db in (db_b, db_p):
-        _seed_task_run(db)
-    fn = _extract("_d021_set_status")
-    subprocess.run(["bash", "-c", f'DRY_RUN=0\nMINI_ORK_DB="{db_b}"\nMINI_ORK_RUN_ID="r1"\n{fn}\n'
-                    '_d021_set_status "published"'], capture_output=True, text=True)
+    db_p = _seed_db(tmp_path, "ssp")
+    _seed_task_run(db_p)
     ex.set_status(db_p, "r1", "published")
     q = "SELECT status, ended_at IS NOT NULL AND ended_at>0, duration_ms>0 FROM task_runs WHERE id='r1';"
-    assert _sql(db_b, q).stdout.strip() == _sql(db_p, q).stdout.strip()
     assert _sql(db_p, q).stdout.strip() == "published|1|1"   # terminal stamps ended_at + duration
     # non-terminal transition: no ended_at
-    for db in (db_b, db_p):
-        _seed_task_run(db, rid="r2")
-    subprocess.run(["bash", "-c", f'DRY_RUN=0\nMINI_ORK_DB="{db_b}"\nMINI_ORK_RUN_ID="r2"\n{fn}\n'
-                    '_d021_set_status "reviewing"'], capture_output=True, text=True)
+    _seed_task_run(db_p, rid="r2")
     ex.set_status(db_p, "r2", "reviewing")
     q2 = "SELECT status, ended_at FROM task_runs WHERE id='r2';"
-    assert _sql(db_b, q2).stdout == _sql(db_p, q2).stdout
     assert _sql(db_p, q2).stdout.strip() == "reviewing|"
 
 
 def test_charge_node_cost_parity(tmp_path):
-    db_b, db_p = _seed_db(tmp_path, "ccb"), _seed_db(tmp_path, "ccp")
-    for db in (db_b, db_p):
-        _seed_task_run(db, cost=0.10)
+    db_p = _seed_db(tmp_path, "ccp")
+    _seed_task_run(db_p, cost=0.10)
     cost_file = tmp_path / "cost"; cost_file.write_text("0.037")
-    fn = _extract("_d022_charge_node_cost")
-    subprocess.run(["bash", "-c", f'DRY_RUN=0\nMINI_ORK_DB="{db_b}"\nMINI_ORK_RUN_ID="r1"\n'
-                    f'MINI_ORK_ROOT="{tmp_path}"\n{fn}\n_d022_charge_node_cost "{cost_file}"'],
-                   capture_output=True, text=True)
     ex.charge_node_cost(db_p, "r1", str(cost_file), root=str(tmp_path))
     q = "SELECT printf('%.4f', cost_usd) FROM task_runs WHERE id='r1';"
-    assert _sql(db_b, q).stdout == _sql(db_p, q).stdout
     assert _sql(db_p, q).stdout.strip() == "0.1370"   # 0.10 + 0.037
     # invalid cost file → $0.01 placeholder on both
-    for db in (db_b, db_p):
-        _seed_task_run(db, rid="r3", cost=0)
+    _seed_task_run(db_p, rid="r3", cost=0)
     bad = tmp_path / "bad"; bad.write_text("not-a-number")
-    subprocess.run(["bash", "-c", f'DRY_RUN=0\nMINI_ORK_DB="{db_b}"\nMINI_ORK_RUN_ID="r3"\n'
-                    f'{fn}\n_d022_charge_node_cost "{bad}"'], capture_output=True, text=True)
     ex.charge_node_cost(db_p, "r3", str(bad))
     q3 = "SELECT printf('%.4f', cost_usd) FROM task_runs WHERE id='r3';"
-    assert _sql(db_b, q3).stdout == _sql(db_p, q3).stdout == "0.0100\n"
+    assert _sql(db_p, q3).stdout == "0.0100\n"
 
 
 def _git_repo(d):
     d.mkdir(parents=True)
     for a in (["init", "-q", "-b", "main"], ["config", "user.email", "t@e"],
-              ["config", "user.name", "t"]):
+              ["config", "user.name", "t"], ["config", "commit.gpgsign", "false"]):
         subprocess.run(["git", "-C", str(d), *a], capture_output=True)
     (d / "app.py").write_text("x = 1\n")
     subprocess.run(["git", "-C", str(d), "add", "-A"], capture_output=True)
@@ -385,27 +370,18 @@ done.
 """
 
 
-def _run_bash_apply(impl_log, target):
-    fn = _extract("mo_apply_impl_output")
-    subprocess.run(["bash", "-c", f'MO_APPLY_IMPL_OUTPUT=1\n{fn}\n'
-                    f'mo_apply_impl_output "{impl_log}" "{target}"'], capture_output=True, text=True)
-
-
 def test_apply_impl_output_diff_parity(tmp_path):
     logf = tmp_path / "impl.log"; logf.write_text(_DIFF_LOG)
-    rb = _git_repo(tmp_path / "rb"); rp = _git_repo(tmp_path / "rp")
-    _run_bash_apply(str(logf), str(rb))
+    rp = _git_repo(tmp_path / "rp")
     ex.apply_impl_output(str(logf), str(rp))
-    assert (rb / "app.py").read_text() == (rp / "app.py").read_text() == "x = 1\ny = 2\n"
+    assert (rp / "app.py").read_text() == "x = 1\ny = 2\n"
 
 
 def test_apply_impl_output_fenced_parity(tmp_path):
     logf = tmp_path / "impl.log"; logf.write_text(_FENCED_LOG)
-    rb = _git_repo(tmp_path / "rb"); rp = _git_repo(tmp_path / "rp")
-    _run_bash_apply(str(logf), str(rb))
+    rp = _git_repo(tmp_path / "rp")
     ex.apply_impl_output(str(logf), str(rp))
-    assert (rb / "newmod.py").exists() and (rp / "newmod.py").exists()
-    assert (rb / "newmod.py").read_text() == (rp / "newmod.py").read_text()
+    assert (rp / "newmod.py").exists()
     assert 'def hello():' in (rp / "newmod.py").read_text()
 
 
@@ -583,7 +559,7 @@ def test_live_publisher_and_rollback_status(tmp_path, monkeypatch):
     common = dict(root=str(REPO), run_dir=str(rd), plan_path=_plan(tmp_path),
                   task_class="code_fix", db=db, run_id="r1", dispatch_fn=_fake(""))
     # No recipe → no artifact_contract.yaml. Bash returns 0 WITHOUT publishing
-    # (bin/mini-ork-execute:3017-3019). The old port stub wrongly always marked
+    # (mini_ork/ported/mini_ork_execute.py:3017-3019). The old port stub wrongly always marked
     # 'published' (panel finding 2); the faithful port leaves status unchanged.
     rc, _ = ex.dispatch_node(_fields("pub", "publisher"), **common)
     assert rc == 0 and _sql(db, "SELECT status FROM task_runs WHERE id='r1';").stdout.strip() != "published"
@@ -628,6 +604,93 @@ def test_publisher_preserves_heterogeneous_run_local_artifacts(tmp_path, monkeyp
     assert json.loads(ledger.read_text()) == {"features": []}
     assert json.loads(verdict.read_text()) == {"pass": False}
     assert statuses == ["published"]
+
+
+def test_publisher_commit_stages_only_reviewed_files(tmp_path):
+    repo = _git_repo(tmp_path / "publish-repo")
+    reviewed = repo / "app.py"
+    reviewed.write_text("x = 2\n")
+    unrelated = repo / "local-only.txt"
+    unrelated.write_text("must not enter the commit\n")
+    run_dir = tmp_path / "publish-run"
+    run_dir.mkdir()
+    review = run_dir / "review-verdict.json"
+    review.write_text('{"verdict":"approve"}\n')
+    (run_dir / "implementer-summary.json").write_text(json.dumps({
+        "files_changed": [str(reviewed)],
+        "worktree_path": str(repo),
+    }))
+
+    assert ex._publisher_try_commit_files(
+        str(REPO), str(repo), str(run_dir), str(review), "approve",
+        "code-fix", "implementer", "run-publish",
+    ) is True
+    committed = subprocess.check_output(
+        ["git", "-C", str(repo), "show", "--name-only", "--format=", "HEAD"],
+        text=True,
+    ).splitlines()
+    assert committed == ["app.py"]
+    assert unrelated.exists()
+    assert "local-only.txt" in subprocess.check_output(
+        ["git", "-C", str(repo), "status", "--porcelain"], text=True
+    )
+
+
+def test_publisher_commit_rejects_unapproved_or_outside_paths(tmp_path):
+    repo = _git_repo(tmp_path / "reject-repo")
+    base_head = subprocess.check_output(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"], text=True
+    ).strip()
+    run_dir = tmp_path / "reject-run"
+    run_dir.mkdir()
+    review = run_dir / "review-verdict.json"
+    review.write_text('{"verdict":"needs_revision","pass":false}\n')
+    (run_dir / "implementer-summary.json").write_text(json.dumps({
+        "files_changed": [str(repo / "app.py")],
+    }))
+    assert ex._publisher_try_commit_files(
+        str(REPO), str(repo), str(run_dir), str(review), "needs_revision",
+        "code-fix", "implementer", "run-reject",
+    ) is False
+
+    outside = tmp_path / "outside.txt"
+    outside.write_text("outside\n")
+    review.write_text('{"verdict":"approve"}\n')
+    (run_dir / "implementer-summary.json").write_text(json.dumps({
+        "files_changed": [str(outside)],
+    }))
+    assert ex._publisher_try_commit_files(
+        str(REPO), str(repo), str(run_dir), str(review), "approve",
+        "code-fix", "implementer", "run-outside",
+    ) is False
+    assert subprocess.check_output(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"], text=True
+    ).strip() == base_head
+
+
+def test_reviewer_input_assembly_preserves_summary_verifiers_and_diff(tmp_path):
+    repo = _git_repo(tmp_path / "review-repo")
+    (repo / "app.py").write_text("x = 2\n")
+    run_dir = tmp_path / "review-run"
+    run_dir.mkdir()
+    (run_dir / "implementer-summary.json").write_text(json.dumps({
+        "files_changed": [str(repo / "app.py")],
+        "worktree_path": str(repo),
+        "rationale": "review this change",
+    }))
+    (run_dir / "verifier_typecheck.json").write_text(
+        '{"verifier":"typecheck","pass":true}\n'
+    )
+    (run_dir / "verifier_test.json").write_text(
+        '{"verifier":"test","pass":true}\n'
+    )
+
+    block = ex._assemble_reviewer_inputs(str(run_dir))
+    assert "review this change" in block
+    assert "# verifier_typecheck.json" in block
+    assert "# verifier_test.json" in block
+    assert "x = 2" in block
+    assert "app.py" in (run_dir / "review-diff.patch").read_text()
 
 
 def test_resolve_target_cwd_prefers_explicit_worktree_over_external_kickoff(tmp_path, monkeypatch):
@@ -829,6 +892,31 @@ def test_main_live_run_wired(tmp_path, monkeypatch):
                  "WHERE run_id='run-x' AND reward_value IS NOT NULL;").stdout.strip()
     assert int(n) >= 2
 
+    # Exercise the production process-isolated branch without a provider call:
+    # planner nodes are handled locally by dispatch_node and therefore cost $0.
+    parallel_wf = tmp_path / "parallel-wf.yaml"
+    parallel_wf.write_text(
+        "dispatch_mode: parallel\nnodes:\n" +
+        "".join(f"  - {{name: plan{i}, type: planner, description: plan {i}}}\n"
+                for i in range(4))
+    )
+    parallel_rd = home / "runs" / "run-parallel"
+    parallel_rd.mkdir()
+    parallel_plan = parallel_rd / "plan.json"
+    parallel_plan.write_text(json.dumps({"objective": "parallel", "decomposition": []}))
+    _seed_task_run(db, rid="run-parallel")
+    for key, value in {
+        "MINI_ORK_WORKFLOW": str(parallel_wf),
+        "MINI_ORK_PLAN_PATH": str(parallel_plan),
+        "MINI_ORK_RUN_DIR": str(parallel_rd),
+        "MINI_ORK_RUN_ID": "run-parallel",
+        "MINI_ORK_MAX_PARALLEL": "2",
+    }.items():
+        monkeypatch.setenv(key, value)
+    assert ex._max_parallel() == 2
+    assert ex.main([], root=str(REPO)) == 0
+    assert (parallel_rd / "verdict.json").is_file()
+
 
 def test_trace_fn_stamps_scoping(tmp_path, monkeypatch):
     # Scoping-stamp fix: the per-node trace_fn must land code_region (from an in-repo
@@ -844,9 +932,65 @@ def test_trace_fn_stamps_scoping(tmp_path, monkeypatch):
     monkeypatch.setenv("MINI_ORK_OBJECTIVE_DOMAIN", "book-gen")
     tf = ex._make_trace_fn("code_fix", db, "run-s")
     tf("impl1", "success", "implementer", output_file=str(edited), finish_reason="done")
-    row = _sql(db, "SELECT objective_domain, code_region FROM execution_traces "
-                   "WHERE run_id='run-s';").stdout.strip()
-    assert row == "book-gen|lib"
+    row = _sql(db, "SELECT objective_domain, code_region, process_reward "
+                   "FROM execution_traces WHERE run_id='run-s';").stdout.strip()
+    objective_domain, code_region, process_reward = row.split("|")
+    assert (objective_domain, code_region) == ("book-gen", "lib")
+    assert float(process_reward) >= 0.5
+
+
+def test_trace_fn_process_reward_opt_out(tmp_path, monkeypatch):
+    db = _seed_db(tmp_path, "prm-off")
+    _seed_task_run(db, rid="run-prm-off", status="executing")
+    monkeypatch.setenv("MINI_ORK_DB", db)
+    monkeypatch.setenv("MO_PRM_SCORE", "0")
+    ex._make_trace_fn("code_fix", db, "run-prm-off")(
+        "r1", "success", "researcher"
+    )
+    assert _sql(
+        db,
+        "SELECT process_reward IS NULL FROM execution_traces "
+        "WHERE run_id='run-prm-off';",
+    ).stdout.strip() == "1"
+
+
+def test_minimal_scaffold_routes_without_harness_dispatch(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from mini_ork.agent import minimal
+
+    db = _seed_db(tmp_path, "minimal")
+    _seed_task_run(db)
+    rd = tmp_path / "run-minimal"
+    rd.mkdir()
+    repo = _git_repo(tmp_path / "minimal-repo")
+    monkeypatch.setenv("MO_TARGET_CWD", str(repo))
+    monkeypatch.setenv("MO_SCAFFOLD_TIER", "minimal")
+    monkeypatch.setattr(
+        minimal,
+        "run_minimal",
+        lambda task, cwd: SimpleNamespace(
+            final_output="COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT\n",
+            exit_status="complete",
+        ),
+    )
+
+    def forbidden_dispatch(*_args):
+        raise AssertionError("harness dispatcher must not run in minimal mode")
+
+    rc, reason = ex.dispatch_node(
+        _fields("impl-min", "implementer", "codex"),
+        root=str(REPO),
+        run_dir=str(rd),
+        plan_path=_plan(tmp_path),
+        task_class="code_fix",
+        db=db,
+        run_id="r1",
+        dispatch_fn=forbidden_dispatch,
+    )
+    assert (rc, reason) == (0, "done")
+    assert (rd / "impl-impl-min.log").read_text() == (
+        "COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT\n"
+    )
 
 
 def test_trace_fn_objective_domain_defaults(tmp_path, monkeypatch):
@@ -936,21 +1080,7 @@ def test_implementer_trace_code_region_from_target_repo(tmp_path, monkeypatch):
     assert region == "app", f"expected 'app' from target-repo edit, got {region!r}"
 
 
-# ── orchestration backbone parity (NODE_IDS + --dry-run) ──
-
-def _py_blocks():
-    lines = BIN.read_text().splitlines()
-    blocks, cur = [], None
-    for ln in lines:
-        if cur is None and re.search(r"<<'PY'", ln):
-            cur = []
-        elif cur is not None and ln.strip() == "PY":
-            blocks.append("\n".join(cur)); cur = None
-        elif cur is not None:
-            cur.append(ln)
-    wf = next(b for b in blocks if "requires_capabilities" in b and 'wf.get("nodes"' in b)
-    plan = next(b for b in blocks if "decomposition" in b and "wf_by_name" in b)
-    return wf, plan
+# ── orchestration backbone golden contract (NODE_IDS + --dry-run) ──
 
 
 _WF = """dispatch_mode: serial
@@ -989,10 +1119,13 @@ def _write(tmp, name, content):
 
 def test_nodes_from_workflow_parity(tmp_path):
     wf = _write(tmp_path, "wf.yaml", _WF)
-    blk = tmp_path / "wfblk.py"; blk.write_text(_py_blocks()[0])
-    rb = subprocess.run(["python3", str(blk), wf], capture_output=True, text=True).stdout
-    rp = "\n".join(ex.nodes_from_workflow(wf)) + ("\n" if ex.nodes_from_workflow(wf) else "")
-    assert rb == rp, f"BASH:{rb!r}\nPY:{rp!r}"
+    assert ex.nodes_from_workflow(wf) == [
+        "plan1\x1fplanner\x1fmake a plan\x1f\x1fserial\x1f\x1fopus_lens\x1f",
+        "res1\x1fresearcher\x1fresearch it\x1f\x1fparallel\x1f\x1fkimi_lens\x1f",
+        "impl1\x1fimplementer\x1fbuild it\x1f\x1fserial\x1f\x1fimplementer\x1f",
+        "rev1\x1freviewer\x1freview it\x1f\x1fserial\x1fverifiers/check.sh\x1freviewer\x1f",
+        "rb1\x1frollback\x1fundo\x1f\x1fserial\x1f\x1frollback\x1f",
+    ]
 
 
 def test_self_migrate_workflow_orders_pre_retirement_parity_before_migrator():
@@ -1071,11 +1204,11 @@ def test_self_migrate_verifier_exit_status_matches_false_json(tmp_path):
 def test_nodes_from_plan_parity(tmp_path):
     wf = _write(tmp_path, "wf.yaml", _WF)
     plan = _write(tmp_path, "plan.json", _PLAN)
-    blk = tmp_path / "planblk.py"; blk.write_text(_py_blocks()[1])
-    rb = subprocess.run(["python3", str(blk), plan], capture_output=True, text=True,
-                        env={**os.environ, "WORKFLOW_PATH": wf}).stdout
-    rp = "\n".join(ex.nodes_from_plan(plan, wf)) + ("\n" if ex.nodes_from_plan(plan, wf) else "")
-    assert rb == rp, f"BASH:{rb!r}\nPY:{rp!r}"
+    assert ex.nodes_from_plan(plan, wf) == [
+        "res1\x1fresearcher\x1fresearch\x1f\x1fparallel\x1f\x1fkimi_lens\x1f",
+        "impl1\x1fimplementer\x1fbuild\x1f\x1fserial\x1f\x1fimplementer\x1f",
+        "bad\x1fimplementer\x1fno type defaults to implementer\x1f\x1fserial\x1f\x1fimplementer\x1f",
+    ]
 
 
 def _dispatch_lines(text):
@@ -1097,7 +1230,6 @@ def test_dry_run_end_to_end_parity(tmp_path):
     env = {**os.environ, "MINI_ORK_ROOT": str(REPO), "MINI_ORK_WORKFLOW": wf,
            "MINI_ORK_HOME": str(home), "MINI_ORK_DB": db, "MINI_ORK_PLAN_PATH": plan,
            "MINI_ORK_TASK_CLASS": "code_fix", "MINI_ORK_DRY_RUN": "1"}
-    cb = subprocess.run(["bash", str(BIN), "--dry-run"], capture_output=True, text=True, env=env)
     old = dict(os.environ); os.environ.clear(); os.environ.update(env)
     import io
     from contextlib import redirect_stdout
@@ -1107,9 +1239,7 @@ def test_dry_run_end_to_end_parity(tmp_path):
             rc = ex.main(["--dry-run"], root=str(REPO))
     finally:
         os.environ.clear(); os.environ.update(old)
-    assert cb.returncode == rc == 0, cb.stderr
-    assert _dispatch_lines(cb.stdout) == _dispatch_lines(buf.getvalue()), \
-        f"BASH:{_dispatch_lines(cb.stdout)}\nPY:{_dispatch_lines(buf.getvalue())}"
+    assert rc == 0
     # workflow source has 5 nodes; 4 dispatch + 1 rollback skip
     assert len(_dispatch_lines(buf.getvalue())) == 5
     assert any("rollback" in ln for ln in _dispatch_lines(buf.getvalue()))
@@ -1121,8 +1251,6 @@ def test_dry_run_node_type_filter(tmp_path):
     plan = str(home / "plan.json"); Path(plan).write_text(_PLAN)
     env = {**os.environ, "MINI_ORK_ROOT": str(REPO), "MINI_ORK_WORKFLOW": wf,
            "MINI_ORK_HOME": str(home), "MINI_ORK_PLAN_PATH": plan, "MINI_ORK_DRY_RUN": "1"}
-    cb = subprocess.run(["bash", str(BIN), "--dry-run", "--node-type", "researcher"],
-                        capture_output=True, text=True, env=env)
     old = dict(os.environ); os.environ.clear(); os.environ.update(env)
     import io
     from contextlib import redirect_stdout
@@ -1132,5 +1260,4 @@ def test_dry_run_node_type_filter(tmp_path):
             ex.main(["--dry-run", "--node-type", "researcher"], root=str(REPO))
     finally:
         os.environ.clear(); os.environ.update(old)
-    assert _dispatch_lines(cb.stdout) == _dispatch_lines(buf.getvalue())
     assert len(_dispatch_lines(buf.getvalue())) == 1   # only res1

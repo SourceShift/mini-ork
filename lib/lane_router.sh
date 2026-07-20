@@ -366,7 +366,7 @@ if _has_defect_attributions:
         _hlf_raw = _pr["decay_halflife_days"]
         # NOTE: this 30.0 is the DEFECT-ATTRIBUTION penalty-decay halflife, a
         # DIFFERENT quantity from the GRPO recency halflife (MO_LEARNING_HALFLIFE_DAYS,
-        # default 14, at line ~89 and bin/mini-ork-execute). It is only a fallback
+        # default 14, at line ~89 and mini_ork/ported/mini_ork_execute.py). It is only a fallback
         # for a NULL decay_halflife_days column and MUST match that column's write
         # default in lib/blame_attributor.sh (DECAY=30.0 / DEFAULT 30.0) — not the
         # learning halflife. The two are intentionally not unified.

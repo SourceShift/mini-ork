@@ -549,7 +549,7 @@ EOF
   local exec_log="$RUN_DIR/execute.log"
   local exec_rc=0
   # The lifecycle entrypoint `mini-ork run <recipe> <kickoff>` walks
-  # classify → plan → execute → verify. Driving mini-ork-execute
+  # classify → plan → execute → verify. Driving the native execute route
   # directly skips plan generation and immediately errors on
   # "Unknown flag: --recipe" (seen live on iter 1, rc=2).
   #
@@ -673,7 +673,7 @@ EOF
   fi
 
   # Backstop: task_runs.status is the dispatch-level ground truth, written
-  # by bin/mini-ork-execute's _d021_set_status. If it says failed or
+  # by mini_ork/ported/mini_ork_execute.py's _d021_set_status. If it says failed or
   # rolled_back, the loop MUST NOT claim success — that's the iter-34 class
   # of bug where exec_rc was 0 at script-eval time (timeout wrapper /
   # bin/mini-ork swallowed the signal) but execute genuinely failed and
