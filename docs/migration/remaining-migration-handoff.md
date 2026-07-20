@@ -17,8 +17,28 @@ unit then moved pure ranking to `mini_ork/similarity.py` and rewired the context
 assembler to its raw-score API while preserving database access, the `0.15`
 threshold, top-three-per-source policy, lesson shape, raw ordering, and
 missing-table behavior. Its focused suite passed 30 tests, Pyright was clean,
-and GLM 5.2 required no repairs. Refresh the inventory from the promoted main
-before choosing the next ownership unit.
+and GLM 5.2 required no repairs.
+
+The next inventory-selected unit closed the first remaining `llm-dispatch`
+caller: `bin/mini-ork-invoke-prompt` is now a thin Python launcher and
+`mini_ork.ported.mini_ork_invoke_prompt` calls
+`mini_ork.ported.llm_dispatch` in-process. Its provider boundary remains
+injectable; combined stdout/stderr ordering, environment overlays,
+placeholder substitution, role-pack injection, trace writes, and exit behavior
+have standalone golden-contract coverage. The tests deliberately run without
+`lib/llm-dispatch.sh`, proving that this caller no longer owns a Bash edge.
+The three BDD-first recipe callers now pass the documented
+`MINI_ORK_PROMPT_FILE` variable instead of the stale `MINI_ORK_PROMPT` name.
+The focused invoke/dispatcher suite passed 19 tests, focused Pyright reported
+zero errors, and the unchanged public executable completed a real GLM 5.2
+prompt through a run-local provider registry. Kimi's configured model codes
+were rejected by its gateway, so they were not counted as migration evidence;
+no MiniMax provider was used. The BDD-first dry-run E2E passed 18 assertions,
+`mini-ork validate` passed, and `mini-ork garden` reported zero errors with the
+same missing operator env-var-document warning reproduced on unchanged main.
+Do not retire the library yet: `profile_answerer`, pre-push review, reflection/
+gradient paths, scripts, and Bash fixtures still depend on it. Refresh the
+inventory from the promoted main before selecting the next caller.
 
 ## Context
 
