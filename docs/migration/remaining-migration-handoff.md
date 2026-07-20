@@ -65,6 +65,23 @@ single-lens GLM 5.2 probe returned a valid result. No MiniMax request ran.
 entrypoint/library fork below the frontier and still block dispatcher
 retirement. Refresh promoted main before selecting the next caller.
 
+That review-entrypoint fork is now closed. The CLI-complete runtime and the
+newer native-panel implementation were consolidated into
+`mini_ork.pre_push_review`; `bin/mini-ork-review` is a thin Python launcher,
+and both `lib/pre_push_review.sh` and the duplicate
+`mini_ork.ported.mini_ork_review` owner are retired. The native panel defaults
+to Codex, Kimi, and GLM only. Standalone contracts preserve syntax/secret
+findings, clean approval, verdict policy, list/show/verdict CLI output,
+newline-safe bug forwarding, long-diff handling, and LLM normalization. The
+focused review/meta suite passed 27 tests, focused Pyright reported zero
+errors, and a real public-CLI review persisted a finalized `approve` verdict.
+The ordered repository suite passed 1,838 tests with 28 state-dependent skips
+and one existing Starlette deprecation warning. Validation passed; garden kept
+only the pre-existing missing operator env-var-document warning.
+The remaining dispatcher blockers are lower-level provider/telemetry/tool-grant
+fixtures rather than the review runtime. Refresh promoted main before retiring
+any part of `lib/llm-dispatch.sh`.
+
 The next direct caller unit rewired `scripts/comparative-opinions.sh` from
 sourcing `lib/llm-dispatch.sh` to invoking
 `python3 -m mini_ork.ported.llm_dispatch`. The ten-lens background fan-out,
