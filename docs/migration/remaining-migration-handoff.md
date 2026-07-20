@@ -463,9 +463,22 @@ the live plan evidence below.
 
 ### Next safe action
 
-The next fork is `cli`. Prepare its kickoff and isolated target from the pushed
-plan-closure commit. A new paid self-migrate run still requires separate
-approval; do not reuse or replay the plan run.
+The next fork is `cli`. Its isolated target and kickoff now exist at
+`/private/tmp/mini-ork-self-migrate-cli` and `kickoffs/migration/cli.md`, based
+on pushed main commit `55af2901`. Pre-retirement evidence is green: 6 CLI
+parity tests, 40 dispatcher assertions, focused Pyright, and the durable
+pre-retirement gate all pass.
+
+CLI preflight found one closure blocker that belongs in this fork: the live
+Bash dispatcher still routes direct `plan`, `verify`, and `reflect` commands to
+already-retired files, and the Python dispatcher still routes direct `plan`
+and `reflect` commands to those paths. CLI closure must route all four closed
+commands to native modules and replace the Bash body at the public
+`bin/mini-ork` path with a Python launcher. It must not delete that installed
+command path.
+
+A new paid self-migrate run still requires separate approval; do not reuse or
+replay the plan run.
 
 Each fork closure produces:
 - `self-migrate.diff` (reviewable, apply or reject)
