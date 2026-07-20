@@ -3,7 +3,7 @@
 # the benchmark task suite and computes a UtilityScore.
 #
 # For each benchmark task:
-#   1. Dispatches the candidate workflow via mini-ork-execute (bounded recursion)
+#   1. Dispatches the candidate workflow via the public native CLI (bounded recursion)
 #   2. Computes UtilityScore via lib/utility_function.sh
 #
 # Emits aggregate utility_delta vs current baseline on stdout.
@@ -130,12 +130,12 @@ if [ "$DRY_RUN" -eq 1 ]; then
   exit 0
 fi
 
-# Write candidate workflow to a temp file for mini-ork-execute to use
+# Write candidate workflow to a temp file for the executor to use
 CANDIDATE_WF_FILE=$(mktemp /tmp/mini-ork-candidate-XXXXXX.yaml)
 echo "$CANDIDATE_WORKFLOW" > "$CANDIDATE_WF_FILE"
 
 # benchmark_run iterates benchmark tasks; for each task it invokes the
-# callback we provide (here: mini-ork-execute with the candidate workflow)
+# callback we provide (here: the public native CLI with the candidate workflow)
 TOTAL_UTILITY=0
 BASELINE_UTILITY=0
 TASK_COUNT=0
@@ -144,7 +144,7 @@ benchmark_run \
   --suite "$SUITE_NAME" \
   --candidate-id "$CANDIDATE_ID" \
   --workflow-file "$CANDIDATE_WF_FILE" \
-  --executor "$MINI_ORK_ROOT/bin/mini-ork-execute" \
+  --executor "$MINI_ORK_ROOT/bin/mini-ork" \
   --on-result-callback "_eval_result_cb"
 
 _eval_result_cb() {

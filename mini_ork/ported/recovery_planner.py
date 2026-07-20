@@ -918,7 +918,7 @@ def main(argv: list[str] | None = None) -> int:
         os.environ["MINI_ORK_LEASE_TOKEN"] = _token
 
     # Active strategies: emit the env, print the plan, hand off to
-    # mini-ork-execute which honors MINI_ORK_RECOVERY_FROM + CLOSURE.
+    # the native executor which honors MINI_ORK_RECOVERY_FROM + CLOSURE.
     _emit_recovery_env(plan)
     sys.stdout.write(format_status(plan))
     sys.stdout.write(

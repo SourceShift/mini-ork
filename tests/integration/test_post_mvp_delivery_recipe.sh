@@ -269,7 +269,7 @@ DRY_OUT="$(
   MINI_ORK_WORKFLOW="$WORKFLOW" \
   MINI_ORK_RECIPE="post-mvp-delivery" \
   MINI_ORK_PLAN_PATH="$TMPROOT/plan.json" \
-  mini-ork-execute --dry-run 2>&1
+  mini-ork execute --dry-run 2>&1
 )"
 
 for expected in \

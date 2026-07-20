@@ -17,7 +17,7 @@
 #
 # Context JSON contract:
 #   { "run_id": "<run-id>" }
-#   OR (back-compat with the central wire-up in bin/mini-ork-execute):
+#   OR (back-compat with the central wire-up in mini_ork/ported/mini_ork_execute.py):
 #   { "panel_run_id": "<run-id>" }
 #
 # Env knobs (forwarded to the lib):
@@ -43,7 +43,7 @@ if [ -z "$context" ]; then
 fi
 
 # Accept either `run_id` (preferred) or `panel_run_id` (the central
-# wire-up in bin/mini-ork-execute uses the latter as a shared key across
+# wire-up in mini_ork/ported/mini_ork_execute.py uses the latter as a shared key across
 # all oracle gates). Liveness operates on the top-level task_runs.id, so
 # either form maps to the same lookup.
 run_id=$(printf '%s' "$context" | jq -r '.run_id // .panel_run_id // empty' 2>/dev/null)

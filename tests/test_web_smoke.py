@@ -463,7 +463,7 @@ def test_correlation_reports_bridge_methods(db) -> None:
     assert "bridge_methods" in out
     assert "run_events.run_id" in out["bridge_methods"], (
         "run_events.run_id should always be listed — it's the deterministic bridge for "
-        "node lifecycle events emitted by bin/mini-ork-execute"
+        "node lifecycle events emitted by mini_ork/ported/mini_ork_execute.py"
     )
     # If trace_id is set (post-fix or backfill), strict methods must be available
     if out["trace_id"]:

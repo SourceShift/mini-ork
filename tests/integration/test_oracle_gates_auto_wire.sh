@@ -121,7 +121,7 @@ _seed_collision_panel "run-fixture-collision"
 #
 #  (a) Per-node-type auto-gate inside execute:
 #      MO_ORACLE_GATES_AUTO=1 MINI_ORK_RUN_ID=run-fixture-collision \
-#        bin/mini-ork-execute --plan-path <synthetic-plan-with-synthesizer-node>
+#        bin/mini-ork execute <synthetic-plan-with-synthesizer-node>
 #      Expect rc != 0 OR stderr contains "COALITION_ABORT".
 #
 #  (b) Single oracle-gate pass after lens dispatch:
@@ -133,7 +133,7 @@ _seed_collision_panel "run-fixture-collision"
 #
 # Until the wire-up lands + the invocation shape is known, this fixture
 # uses (c) as the most-portable surface (gate_run_all is testable
-# without invoking bin/mini-ork-execute).
+# without invoking the public executor route).
 
 source "$MINI_ORK_ROOT/lib/gate_bootstrap.sh"
 mo_bootstrap_oracle_gates
@@ -186,7 +186,7 @@ fixture3_out=$(
   MINI_ORK_RUN_ID=run-fixture-collision \
   MINI_ORK_RECIPE=__missing_oracle_gate_test_recipe__ \
   MINI_ORK_PLAN_PATH="$PLAN_PATH" \
-  "$MINI_ORK_ROOT/bin/mini-ork-execute" --node-type publisher 2>&1
+  "$MINI_ORK_ROOT/bin/mini-ork" execute --node-type publisher 2>&1
 )
 fixture3_rc=$?
 set +e

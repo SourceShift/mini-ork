@@ -51,10 +51,18 @@ assert_ge() {
   fi
 }
 
-export MINI_ORK_EXECUTE_SOURCE_ONLY=1
-# shellcheck source=../bin/mini-ork-execute
-source "$MINI_ORK_ROOT/bin/mini-ork-execute"
-unset MINI_ORK_EXECUTE_SOURCE_ONLY
+mo_learning_update_conductor_outcomes() {
+  PYTHONPATH="$MINI_ORK_ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 -c \
+    'from mini_ork.ported.mini_ork_execute import learning_update_conductor_outcomes; import os; learning_update_conductor_outcomes(os.environ["MINI_ORK_DB"])'
+}
+mo_learning_write_grpo_advantages() {
+  PYTHONPATH="$MINI_ORK_ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 -c \
+    'from mini_ork.ported.mini_ork_execute import write_grpo_advantages; import os; write_grpo_advantages(os.environ["MINI_ORK_DB"])'
+}
+_mo_learning_governed_lane() {
+  PYTHONPATH="$MINI_ORK_ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 -c \
+    'from mini_ork.ported.mini_ork_execute import learning_governed_lane; import os,sys; print(learning_governed_lane(sys.argv[1], sys.argv[2], root=os.environ["MINI_ORK_ROOT"]))' "$@"
+}
 
 TS="ll$(date +%s)-$$"
 TC="learning_loop_$TS"
@@ -122,6 +130,7 @@ TASK_CLASS="$TC"
 MO_ROUTING_POLICY=learning_governed
 MO_LEARNING_MIN_SAMPLES=2
 MO_LEARNING_EPSILON=0
+export TASK_CLASS MO_ROUTING_POLICY MO_LEARNING_MIN_SAMPLES MO_LEARNING_EPSILON
 ROUTED="$(_mo_learning_governed_lane implementer cheap_lens)"
 
 assert_sql "process_reward column exists" \

@@ -6,7 +6,7 @@
 # at the per-node traces emitted so far, computes a similarity match
 # against known-failing pattern_records clusters, and when the match score
 # exceeds MO_WATCHDOG_ABORT_THRESHOLD (default 0.65) writes
-# .stop-requested into the run dir. bin/mini-ork-execute checks that file
+# .stop-requested into the run dir. mini_ork/ported/mini_ork_execute.py checks that file
 # at the next node boundary and bails before more cost is sunk.
 #
 # Flags:

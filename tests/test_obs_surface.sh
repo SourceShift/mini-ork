@@ -3,7 +3,7 @@
 #
 # Runs the obs-smoke recipe and asserts every observability surface
 # populated correctly. Costs ~$0.05-$0.15 per execution. Should be
-# re-run after any change to bin/mini-ork-execute, lib/llm-dispatch.sh,
+# re-run after any change to mini_ork/ported/mini_ork_execute.py, lib/llm-dispatch.sh,
 # or any other emit site.
 #
 # Usage:

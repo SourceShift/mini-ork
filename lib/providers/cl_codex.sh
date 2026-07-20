@@ -174,7 +174,7 @@ export GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh -o BatchMode=yes -o NumberOfPassw
 
 # Real-time progress sidecar (2026-06-11 fix).
 # Problem: `RAW_OUT=$(codex exec ... 2>&1)` buffers ALL stdout until codex
-# exits, so a 15-20 min implementer turn writes ZERO lines to mini-ork-execute's
+# exits, so a 15-20 min implementer turn writes ZERO lines to the executor's
 # log until the very end. Observers (Monitor tail / UI / operator) cannot
 # distinguish a live codex run from a deadlock — diagnosed 2026-06-11
 # run-1781188025-72603 spent 17+ min looking like a hang to a tail-based

@@ -37,7 +37,7 @@ mo_runtime_maybe_delegate() {
   local _self="${1:-}"; shift || true
   local _base _module
   _base="$(basename "$_self")"
-  # mini-ork-execute → mini_ork_execute, mini-ork-self-improve → mini_ork_self_improve
+  # mini-ork-self-improve → mini_ork_self_improve
   _module="$(printf '%s' "$_base" | tr '-' '_')"
   local _root="${MINI_ORK_ROOT:-}"
   [ -n "$_root" ] && [ -f "$_root/mini_ork/ported/${_module}.py" ] || return 0
