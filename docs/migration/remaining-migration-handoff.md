@@ -77,6 +77,21 @@ historical five-family and canonical-document defaults remain unchanged;
 environment overrides only make bounded validation and operator-selected runs
 possible. Refresh promoted main before continuing to the Bash library forks.
 
+The scheduler integration fork consolidated three owners into one. The public
+`bin/mini-ork-scheduler` path is now a direct Python launcher for
+`mini_ork.scheduler`, the implementation selected by the migration tracker
+because it contains the bounded concurrent pool (`MO_SCHED_MAX_PARALLEL`). The
+serial duplicate `mini_ork.ported.mini_ork_scheduler` and the legacy Bash body
+were removed. Conductor and autonomous-pipeline callers retain the stable
+public executable; generated verification commands now compile it as Python.
+Fourteen standalone contracts cover priority inheritance, deterministic order,
+kickoff/verdict/cascade behavior, budget and pause exits, CLI errors, dry-run
+output/status safety, and public-main concurrency. The autonomous epic pipeline
+passed 13 assertions, focused Pyright was clean, validation passed, and garden
+retained only the pre-existing operator env-var-document warning. The broad
+runtime-parity harness still has unrelated legacy conductor/init failures that
+reproduce with `MINI_ORK_RUNTIME=bash`; they are not scheduler regressions.
+
 ## Context
 
 The self-migrate recipe (PR #184, merged at commit 6bf438a) implements integration-point-first migration: close ONE fork (bash↔Python seam) at a time as a complete unit — make Python sole, repoint every inbound reference, retire bash entrypoint — gated on byte-parity, feature-acceptance, and static-feature ledger.
