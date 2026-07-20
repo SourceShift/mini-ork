@@ -2,7 +2,7 @@
 # verifiers/epic-graph-complete.sh — validate epic-runner recipe shape and run artifacts.
 #
 # Inputs (via env):
-#   MINI_ORK_RUN_DIR — run directory (set by mini-ork-execute)
+#   MINI_ORK_RUN_DIR — run directory (set by the native execute runtime)
 #
 # Output: JSON to stdout
 #   { "verifier": "epic-graph-complete", "pass": bool, "evidence_path": "...",

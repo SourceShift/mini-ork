@@ -270,8 +270,8 @@ Run the self-migrate recipe on each fork in recommended order:
 2. ✅ reflect (closed and source-applied from `run-1784503045-70610`; see the live evidence below)
 3. ✅ classify (closed and source-applied from `run-1784528328-42404`; see the live evidence below)
 4. ✅ plan (closed by the completion audit after partial `run-1784532524-76798`; see live evidence below)
-5. cli
-6. execute
+5. ✅ cli (closed, merged, and pushed; see live evidence below)
+6. ✅ execute (closed by the completion audit after the one authorized provider run; see live evidence below)
 
 ## Live verify evidence — 2026-07-19
 
@@ -461,17 +461,16 @@ the live plan evidence below.
   two source-requirements audits; the rejected verdict was not rewritten and no
   paid reviewer replay was hidden.
 
-### CLI closure proposal — 2026-07-20
+### CLI closure — 2026-07-20
 
-- Isolated target: `/private/tmp/mini-ork-self-migrate-cli`, branch
-  `migration/cli`. Implementation is committed at `27b1f40d` after three
-  completion audits and is ready for focused promotion to `main`.
+- The isolated `migration/cli` implementation was completed after three
+  requirements audits, promoted to `main`, and pushed.
 - `bin/mini-ork` remains the executable public path but is now a thin Python
   launcher. It resolves symlinks, imports `mini_ork_cli.main`, and never reads
   `MINI_ORK_RUNTIME` or sources `runtime-select.sh`.
 - Direct `classify`, `plan`, `verify`, and `reflect` commands route to native
-  Python modules. The missing `apply` dispatch was restored. `execute` remains
-  the one intentional live Bash command fork.
+  Python modules. The missing `apply` dispatch was restored; execute was then
+  closed as the final top-level fork.
 - Deadline state, per-run config snapshots, repository healing, rubric
   scoring, and reward grading use native Python ports with their prior
   best-effort or return-code contracts preserved.
@@ -490,12 +489,34 @@ the live plan evidence below.
   acceptance, the 48-row completion ledger, deterministic CLI closure, diff
   hygiene, and three requirements audits.
 
-### Next safe action
+### Execute closure — 2026-07-20
 
-Promote only the CLI preflight and implementation commits from the isolated
-branch, verify them again on clean `main`, and push. After CLI closure lands,
-`execute` is the next top-level fork; do not remove or bypass
-`bin/mini-ork-execute` as part of the CLI promotion.
+- Exactly one authorized paid run used Kimi, Codex, and GLM. Its model-authored
+  review returned `needs_revision`; no paid retry was made. The completion
+  audit repaired the PRM, minimal-scaffold, resolved-model routing, and plan
+  task-class gaps deterministically.
+- `mini_ork/ported/mini_ork_execute.py` owns the complete executor lifecycle,
+  including bounded process-isolated concurrency. Direct `execute` and the
+  full run lifecycle route to it in-process.
+- Dispatch, capability checks, learned context, operator steering,
+  intervention gating, gate bootstrap, and liveness are native. Provider,
+  git, and executable verifier calls remain explicit external boundaries.
+- Every executable inbound edge is repointed and `bin/mini-ork-execute` is
+  deleted. Durable pre-retirement evidence replaces the old live-Bash parity
+  dependency.
+- Final evidence is green: 57 execute tests, 11 dispatcher tests, 88 adjacent
+  native-port/CLI tests, 10 execute integration assertions, broad E2E and
+  recursive integration, a non-zero duration trace, isolated observability,
+  focused Pyright, the 76-row ledger, and all five self-migrate gates.
+- Two requirements audits found no remaining execute-fork requirement. Secret
+  and scope checks exclude credential values, local adapters, runtime state,
+  logs, and the user's `.mini-ork/config/agents.yaml`.
+
+### Migration-cycle result
+
+All six top-level task-loop forks are closed. Future work in the completion
+plan concerns lower-level Bash libraries, scheduler/utility entrypoints, and
+historical fixture retirement; it is not an open execute-fork requirement.
 
 Each fork closure produces:
 - `self-migrate.diff` (reviewable, apply or reject)
@@ -503,7 +524,10 @@ Each fork closure produces:
 - `integration-map.json` (blast radius documentation)
 - `verdict.json` (pass/fail with reasons)
 
-**Final state:** pure Python runtime, no bash entrypoints, complete static-feature ledger for the entire codebase.
+**Final state for this cycle:** the public task loop and all six named forks are
+Python-owned. Remaining lower-level Bash units stay tracked in
+`docs/migration/python-migration-completion-plan.md` rather than being folded
+into this execute commit.
 
 ## Historical verify execution findings (2026-07-19)
 

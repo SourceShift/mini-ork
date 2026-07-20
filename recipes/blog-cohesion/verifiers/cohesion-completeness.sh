@@ -3,7 +3,7 @@
 # applied_post.md + apply_log.md exist, parse, and meet structural floors.
 #
 # Inputs (via env):
-#   MINI_ORK_RUN_DIR     run directory (set by mini-ork-execute)
+#   MINI_ORK_RUN_DIR     run directory (set by the native execute runtime)
 #
 # Output: JSON to stdout
 #   { "verifier": "cohesion-completeness", "pass": bool,

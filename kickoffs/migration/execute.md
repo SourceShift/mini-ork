@@ -1,6 +1,6 @@
 # Close the `execute` integration fork
 
-Status: ready for one authorized Kimi/Codex/GLM self-migrate run on 2026-07-20.
+Status: completed on 2026-07-20; ready for clean-main promotion.
 
 ## Goal
 
@@ -13,9 +13,8 @@ telemetry, concurrency, and failure contracts as one reviewable migration.
 ## Fork
 
 - **fork:** `execute`
-- **isolated target:** `/private/tmp/mini-ork-self-migrate-execute`
-- **python implementation:** `/private/tmp/mini-ork-self-migrate-execute/mini_ork/ported/mini_ork_execute.py`
-- **Bash entrypoint to retire:** `/private/tmp/mini-ork-self-migrate-execute/bin/mini-ork-execute`
+- **python implementation:** `mini_ork/ported/mini_ork_execute.py`
+- **Bash entrypoint retired:** `bin/mini-ork-execute`
 
 ## Required true-Bash oracle
 
@@ -96,10 +95,11 @@ and either ported or justified as an external executable contract.
 - Codex: migrator/implementer.
 - GLM 5.2: seam map, static-feature ledger, and reviewer.
 - MiniMax and DeepSeek are forbidden.
-- Load Kimi and GLM credentials process-locally from
-  `/Users/admin/ps/scripts/cl_kimi.sh` and `cl_glm.sh`; never persist values.
-- The user authorized exactly one paid execute migration run. Do not trigger a
-  paid retry or repair run without new approval.
+- Kimi and GLM credentials were loaded process-locally from the user's local
+  `~/ps/scripts` wrappers; no credential value or adapter was persisted.
+- The one authorized paid execute migration run was consumed. Its GLM review
+  returned `needs_revision`; deterministic completion fixed the reported PRM
+  and minimal-scaffold gaps without a paid retry.
 
 ## Files in scope
 
@@ -115,3 +115,16 @@ and either ported or justified as an external executable contract.
 The seam mapper must expand this list from the repository. A file is in scope
 only when it closes an execute runtime edge, preserves its observable contract,
 or records migration evidence; unrelated cleanup is forbidden.
+
+## Completion evidence
+
+- The true-Bash pre-retirement oracle is preserved and all five self-migrate
+  gates pass against the final diff.
+- The focused executor suite passes 57 tests; the native dispatcher suite
+  passes 11 tests; the adjacent native-port/CLI suite passes 88 tests; and
+  focused Pyright reports zero errors.
+- Execute integration, E2E, recursive, telemetry, performance, and isolated
+  observability checks pass. The duration probe confirms a real provider-free
+  dispatch persists a non-zero trace duration under the plan's task class.
+- `bin/mini-ork-execute` is absent, the public CLI routes execute in-process,
+  and no executable inbound edge references the retired path.
