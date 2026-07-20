@@ -7,28 +7,26 @@ blocks. This module lifts them verbatim into a regular Python module with
 no behavior change, then mirrors the bash glue (arg validation, mkdir -p,
 llm_dispatch fallback chain).
 
-Co-existence model (strangler-fig): bash `lib/profile_answerer.sh` is the
-authoritative source. This module mirrors it exactly. Parity is enforced by
-`tests/unit/test_profile_answerer_py.py` (>=6 cases that invoke the live
-bash subprocess against a stubbed `llm_dispatch` and diff against the
-Python output byte-for-byte).
+The Python module is runtime-native. Deterministic parsing remains covered by
+the pre-retirement Bash oracle, while the default LLM boundary calls
+``mini_ork.ported.llm_dispatch`` in-process.
 
 Pipeline map (bash function → Python):
   mo_answer_profile_questions:
     arg validation                       → answer_profile_questions (ValueError /
                                             FileNotFoundError, matching bash exit 2)
     prompt builder (heredoc lines 26-53) → build_prompt
-    llm_dispatch (deepseek → kimi chain) → default dispatch: subprocess bash
-                                            re-invokes the same llm-dispatch.sh
-                                            for parity at the LLM boundary
+    llm_dispatch (deepseek → kimi chain) → native default dispatch
     parser (heredoc lines 73-164)        → parse_and_persist
 """
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import re
-import subprocess
+from collections.abc import Callable
 from pathlib import Path
 
 __all__ = [
@@ -224,9 +222,14 @@ def parse_and_persist(
     return out
 
 
-def _default_dispatch(prompt: str, *, repo_root: str | os.PathLike) -> str:
-    """Default dispatch: shell out to bash's llm_dispatch for parity at
-    the LLM boundary.
+def _default_dispatch(
+    prompt: str,
+    *,
+    repo_root: str | os.PathLike,
+    dispatch_fn: Callable[..., int] | None = None,
+    models: tuple[str, ...] = ("deepseek", "kimi"),
+) -> str:
+    """Run the native DeepSeek → Kimi fallback chain.
 
     Mirrors lib/profile_answerer.sh:60-70 — primary call to
     `llm_dispatch --model deepseek` with fallback to `llm_dispatch --model
@@ -236,34 +239,36 @@ def _default_dispatch(prompt: str, *, repo_root: str | os.PathLike) -> str:
 
     Args:
         prompt: full prompt text (built by `build_prompt`).
-        repo_root: path to the mini-ork repo root (so the default dispatch
-            can find `lib/llm-dispatch.sh`).
+        repo_root: path to the mini-ork engine root.
+        dispatch_fn: injectable model-provider boundary for tests.
+        models: ordered fallback chain; production retains DeepSeek → Kimi.
     """
-    bash_script = (
-        'set +e\n'
-        f'source "{repo_root}/lib/llm-dispatch.sh"\n'
-        f'raw=$(llm_dispatch '
-        f'--task-class "profile_answerer" '
-        f'--node-type "profile_answerer" '
-        f'--model "deepseek" '
-        f'--prompt-text "$1")\n'
-        f'rc=$?\n'
-        f'stripped=$(printf "%s" "$raw" | tr -d " \\t\\n\\r")\n'
-        f'if [ $rc -ne 0 ] || [ -z "$stripped" ]; then\n'
-        f'  raw=$(llm_dispatch '
-        f'--task-class "profile_answerer" '
-        f'--node-type "profile_answerer" '
-        f'--model "kimi" '
-        f'--prompt-text "$1") || raw=""\n'
-        f'fi\n'
-        f'printf "%s" "$raw"\n'
-    )
-    result = subprocess.run(
-        ["bash", "-c", bash_script, "_", prompt],
-        capture_output=True,
-        text=True,
-    )
-    return result.stdout
+    from mini_ork.ported import llm_dispatch as native_dispatch
+
+    def call(model: str) -> tuple[int, str]:
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                rc = native_dispatch.llm_dispatch(
+                    [
+                        "--task-class", "profile_answerer",
+                        "--node-type", "profile_answerer",
+                        "--model", model,
+                        "--prompt-text", prompt,
+                    ],
+                    root=str(repo_root),
+                    dispatch_fn=dispatch_fn,
+                )
+        except Exception:
+            return 1, ""
+        return rc, stdout.getvalue()
+
+    for model in models:
+        rc, raw = call(model)
+        if rc == 0 and raw.strip():
+            return raw
+    return ""
 
 
 def answer_profile_questions(
@@ -282,10 +287,10 @@ def answer_profile_questions(
         out_path: where to write the answers JSON. Parent dir is created.
         dispatch: optional Callable[[str], str] taking the prompt text and
             returning raw LLM text. Tests inject a captured real LLM
-            response; production callers should pass None to use the
-            default bash-subprocess fallback chain (deepseek → kimi).
+            response; production callers should pass None to use the native
+            DeepSeek → Kimi fallback chain.
         repo_root: required when dispatch is None — path to the mini-ork
-            repo so the default dispatch can source lib/llm-dispatch.sh.
+            engine root.
 
     Returns:
         The dict written to `out_path`.
@@ -319,7 +324,7 @@ def answer_profile_questions(
         if repo_root is None:
             raise ValueError(
                 "repo_root is required when dispatch is None "
-                "(default dispatch shells to bash's llm-dispatch.sh)"
+                "(default dispatch uses the native llm dispatcher)"
             )
         raw = _default_dispatch(prompt, repo_root=repo_root)
     else:

@@ -31,7 +31,7 @@ The port is already native; the engine just calls the bash instead. Rewire = rep
 | lib | port native? | engine shell-out site | note |
 |---|---|---|---|
 | `decision_service` | ✅ | execute.py | **DONE** (PR #179) |
-| `llm-dispatch` | ✅ (native on execute and invoke-prompt) | profile_answerer.py, pre_push_review.py, scripts and fixtures | Execute and the public single-prompt utility are rewired; migrate remaining callers one at a time with real-provider evidence |
+| `llm-dispatch` | ✅ (native on execute, invoke-prompt, and profile_answerer.py) | pre_push_review.py, scripts, reflection/gradient and fixtures | Three Python runtime callers are rewired; migrate remaining callers one at a time with real-provider evidence |
 | `gate_bootstrap` | ✅ | non-execute callers | Execute now uses native bootstrap/registry behavior; retire the Bash lib only after every other caller moves |
 | `gradient_extractor` | partial | reflection_pipeline.py | LLM-backed `gradient_extract` intentionally not ported (shells to claude) — needs porting that too |
 
@@ -93,6 +93,20 @@ Per subsystem, in this order — **never a blind sweep** (a wrong port breaks ev
   ownership seam.
 - This unit does **not** authorize deleting `lib/llm-dispatch.sh`; the remaining
   caller and fixture blockers above still have to close.
+
+### Completed caller unit: `profile_answerer.py` — 2026-07-20
+
+- The planner-injected path was already native; the standalone/default path
+  now calls `mini_ork.ported.llm_dispatch` in-process too.
+- The historical DeepSeek → Kimi fallback, including fallback on whitespace
+  success, remains intact. Provider diagnostics stay outside the JSON payload.
+- The focused profile/planner suite passed 27 tests with one optional replay
+  fixture skipped; focused Pyright reported zero errors.
+- A real GLM 5.2 probe passed through the native default seam using only
+  process-local credentials and a temporary provider registry. Migration
+  validation made no DeepSeek or MiniMax request.
+- This closes the Python caller edge only. `lib/profile_answerer.sh` and the
+  Bash dispatcher remain until their independent callers/tests are migrated.
 
 ## Tooling
 - **framework-edit** must use a dedicated temporary runtime home with only
