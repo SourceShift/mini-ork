@@ -40,8 +40,9 @@ def _fixture(tmp_path: Path) -> Path:
     return tmp_path
 
 
-def test_registry_executable_and_openai_resolution(tmp_path):
+def test_registry_executable_and_openai_resolution(tmp_path, monkeypatch):
     root = _fixture(tmp_path)
+    monkeypatch.setenv("MINI_ORK_PROVIDERS", str(root / "config" / "providers.yaml"))
     executable = resolve_provider("stubexec", root)
     assert executable.command[0].endswith("scripts/registry_stub.sh")
     openai = resolve_provider("oaitest", root)
@@ -54,6 +55,7 @@ def test_registry_executable_and_openai_resolution(tmp_path):
 
 def test_registry_anthropic_env_and_health(tmp_path, monkeypatch):
     root = _fixture(tmp_path)
+    monkeypatch.setenv("MINI_ORK_PROVIDERS", str(root / "config" / "providers.yaml"))
     monkeypatch.setenv("TEST_GW_KEY", "gw-key-ok")
     provider = resolve_provider("gwtest", root)
     assert provider.env["ANTHROPIC_AUTH_TOKEN"] == "gw-key-ok"
@@ -65,8 +67,9 @@ def test_registry_anthropic_env_and_health(tmp_path, monkeypatch):
     assert not lane_health("gwtest", root).ok
 
 
-def test_unknown_registry_lane_fails_closed(tmp_path):
+def test_unknown_registry_lane_fails_closed(tmp_path, monkeypatch):
     root = _fixture(tmp_path)
+    monkeypatch.setenv("MINI_ORK_PROVIDERS", str(root / "config" / "providers.yaml"))
     health = lane_health("no_such_provider", root)
     assert not health.ok
     assert "unknown lane" in health.reason
