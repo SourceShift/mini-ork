@@ -95,7 +95,7 @@ the autonomy you want.
 | Component | Where | Job |
 |---|---|---|
 | `bin/mini-ork-epics`    | E6 | Ingest roadmap → epics + dep edges. Split roadmap → per-epic kickoffs. |
-| `bin/mini-ork-scheduler`| E4 | Pick next ready epic, dispatch, mark done or escalated, cascade. |
+| `bin/mini-ork-scheduler` → `mini_ork/scheduler.py` | E4 | Public Python launcher and canonical concurrent owner: pick ready epics, dispatch, mark done or escalated, cascade. |
 | `lib/epic_graph.sh`     | E5 | `epic_graph_ready_now`, `epic_graph_on_done`, dep cascade. |
 | `lib/pr-create.sh`      | E3 | `mo_open_pr` opens a real GitHub PR per epic when `MO_OPEN_PR=1`. |
 | `lib/auto-merge-pr.sh`  | E8 | Polls CI + approval + soak; `gh pr merge --squash --auto`. |
@@ -325,7 +325,7 @@ SELECT id, severity, frequency, ROUND(confidence,2),
 | Symptom | Likely cause | Recovery |
 |---|---|---|
 | Epic stays `not started` despite no deps | Scheduler not running or budget cap hit | Check `MO_DAILY_BUDGET_USD` vs 24h spend; inspect scheduler log. |
-| Epic flips to `escalated` while inner recipe verifiers passed | Verdict file name mismatch — already fixed in `bin/mini-ork-scheduler` (panel-verdict.json + verdict.json fallback). If you ship a new recipe with a different verdict filename, extend the loop at `bin/mini-ork-scheduler:131-160`. | `UPDATE epics SET status='done' WHERE id=...` + `source lib/epic_graph.sh; epic_graph_on_done <id>` to cascade. |
+| Epic flips to `escalated` while inner recipe verifiers passed | Verdict file name mismatch — the native owner checks `panel-verdict.json` then `verdict.json`. If a recipe introduces another filename, extend `mini_ork/scheduler.py::_verdict_from_log`. | Set the epic to `done`, then call `mini_ork.ported.epic_graph.on_done(epic_id, db=...)` to cascade. |
 | Bug-collector floods queue with TODOs | Heuristic is conservative but can over-fire on agent commentary. | Raise `MO_BUG_REPORT_AUTO_PROMOTE` minimum severity, or `UPDATE bug_reports SET status='wontfix' WHERE severity='low'`. |
 | Cross-class gradient list dominated by one target | Single recipe is generating noisy gradients. | Inspect `gradient_records WHERE target=?`. Reduce gradient extraction noise upstream or raise `MO_CROSS_EPIC_MIN_CONF` to 0.8+. |
 | Scheduler picks an old leftover smoke epic | `epic_graph_ready_now` is oldest-first fair. | `UPDATE epics SET archived_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id LIKE 'old-prefix-%';` |

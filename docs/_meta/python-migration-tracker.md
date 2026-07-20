@@ -4,7 +4,7 @@ Strangler-fig: Bash stays until each Python port is parity-verified against the
 live Bash implementation. After retirement, durable pre-retirement receipts and
 standalone Python golden contracts replace tests that require deleted code.
 
-## DONE + verified (15 modules)
+## DONE + verified (16 modules)
 
 ### Trunk / Tier A — the learning brain (main repo, bash-parity tests)
 | module | python | test | notes |
@@ -27,8 +27,8 @@ config_resolve · rho_aggregator — 7 modules, ~700 LOC. Resumable loop:
   coalition_gate.sh, process_reward.sh (done in clone → port to main), config_resolve.sh
   (done in clone → port), recursive_policy.
 - **Tier B:** finish `llm-dispatch.sh` (tool-summary sidecar, retire bash), `context_assembler.sh` (713, context-engine).
-- **Tier C top-level forks:** verify, reflect, classify, plan, CLI, and execute
-  are closed. `bin/mini-ork-scheduler` remains a separate scheduler migration.
+- **Tier C top-level forks:** verify, reflect, classify, plan, CLI, execute, and
+  the separate scheduler integration fork are closed.
 
 ## Test all ported trunk modules
     cd <repo> && python3 -m pytest tests/unit/test_cache_py.py \
@@ -40,7 +40,7 @@ config_resolve · rho_aggregator — 7 modules, ~700 LOC. Resumable loop:
 | coalition_gate.sh | mini_ork/ported/coalition_gate.py | test_coalition_gate_py.py (3) | rho taken as input; measure_rho port deferred |
 | decision_service.sh | mini_ork/ported/decision_service.py | test_decision_service_py.py (3) | full decide() surface; composes ported lane_router |
 | epic_graph.sh | mini_ork/ported/epic_graph.py | test_epic_graph_py.py (4) | dep DAG + cascade |
-| mini-ork-scheduler | mini_ork/scheduler.py | test_scheduler_py.py (4) | **win #1 landed**: run_pool() concurrent epic pool (MO_SCHED_MAX_PARALLEL) |
+| mini-ork-scheduler | mini_ork/scheduler.py | test_scheduler_py.py | **win #1 active**: the public Python launcher owns the concurrent epic pool (MO_SCHED_MAX_PARALLEL); duplicate Bash and ported-Python owners retired |
 | cost_pause.sh | mini_ork/ported/cost_pause.py | test_cost_pause_py.py (2) | window-crossing pause + sentinel |
 
 Also landed earlier on this branch: win #3 (mo_grade_run_reward: rubric 0-8 ->

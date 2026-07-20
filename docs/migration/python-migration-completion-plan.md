@@ -135,6 +135,23 @@ Per subsystem, in this order — **never a blind sweep** (a wrong port breaks ev
   permit bounded/operator-selected runs; defaults retain the historical five
   families and canonical research documents.
 
+### Completed integration fork: `mini-ork-scheduler` — 2026-07-20
+
+- `bin/mini-ork-scheduler` is a stable direct Python launcher for the canonical
+  `mini_ork.scheduler` implementation.
+- The canonical owner activates the bounded concurrent epic pool controlled by
+  `MO_SCHED_MAX_PARALLEL`; a CLI-main timing contract proves three independent
+  epics do not silently fall back to serial execution.
+- The duplicate serial `mini_ork.ported.mini_ork_scheduler`, the legacy Bash
+  scheduler body, and their Bash-oracle test were retired.
+- Conductor and autonomous-pipeline callers keep the public executable path.
+  Generated verification hints compile the launcher as Python instead of
+  applying `bash -n` to it.
+- Fourteen focused contracts, 26 combined scheduler/conductor/epics caller
+  tests, and the 13-assertion autonomous epic pipeline passed; Pyright reported
+  zero errors, validation passed, and garden reported zero errors with the
+  pre-existing missing env-var documentation warning.
+
 ## Tooling
 - **framework-edit** must use a dedicated temporary runtime home with only
   Kimi, Codex, and GLM lanes; do not edit the user's `.mini-ork` policy and do
