@@ -71,8 +71,8 @@ bfd_synth_spec() {
     printf '[bfd-dispatch] spec_author sub_epic=%s iter=%s\n' "${sub_epic_id}" "${sub_iter}" >&2
 
     # Invoke spec_author (framework dispatches this via model_lane resolution).
-    # The framework passes MINI_ORK_PROMPT, SUB_EPIC_ID, WORKDIR, FEEDBACK_FILE.
-    MINI_ORK_PROMPT="${MINI_ORK_HOME}/recipes/bdd-first-delivery/prompts/spec_author.md" \
+    # The framework passes MINI_ORK_PROMPT_FILE, SUB_EPIC_ID, WORKDIR, FEEDBACK_FILE.
+    MINI_ORK_PROMPT_FILE="${MINI_ORK_HOME}/recipes/bdd-first-delivery/prompts/spec_author.md" \
     SUB_EPIC_ID="${sub_epic_id}" \
     WORKDIR="${worktree}" \
     FEEDBACK_FILE="${feedback}" \
@@ -103,7 +103,7 @@ bfd_synth_spec() {
     local review_log="${iter_dir}/spec-reviewer.log"
     printf '[bfd-dispatch] spec_reviewer sub_epic=%s iter=%s spec=%s\n' "${sub_epic_id}" "${sub_iter}" "${spec_file}" >&2
 
-    MINI_ORK_PROMPT="${MINI_ORK_HOME}/recipes/bdd-first-delivery/prompts/spec_reviewer.md" \
+    MINI_ORK_PROMPT_FILE="${MINI_ORK_HOME}/recipes/bdd-first-delivery/prompts/spec_reviewer.md" \
     SUB_EPIC_ID="${sub_epic_id}" \
     WORKDIR="${worktree}" \
     SPEC_PATH="${spec_file}" \
@@ -179,7 +179,7 @@ bfd_dispatch_parallel() {
       fi
 
       # Implementer.
-      MINI_ORK_PROMPT="${MINI_ORK_HOME}/recipes/bdd-first-delivery/prompts/implementer.md" \
+      MINI_ORK_PROMPT_FILE="${MINI_ORK_HOME}/recipes/bdd-first-delivery/prompts/implementer.md" \
       SUB_EPIC_ID="${sub_epic_id}" \
       WORKDIR="${worktree}" \
       ITER=1 \
