@@ -1,6 +1,7 @@
 # Close the `cli` integration fork
 
-Status: preflight complete on 2026-07-20; implementation not yet started.
+Status: completed locally on 2026-07-20 from `run-1784537432-5641`;
+implementation commit `27b1f40d` is ready for focused promotion to `main`.
 
 ## Goal
 
@@ -24,11 +25,16 @@ whose shebang and runtime contain no Bash delegation.
 
 ## Pre-retirement evidence
 
-- `tests/unit/test_mini_ork_cli_py.py`: 6 passed against the live Bash oracle.
-- `tests/integration/test_bin_dispatcher.sh`: 40 assertions passed.
+- The initial 6-test helper could delegate back to Python because it did not
+  force `MINI_ORK_RUNTIME=bash`; it is retained only as historical preflight.
+- Corrected explicit-Bash evidence: the untouched pushed-main dispatcher passed
+  40 assertions, and exact version/help/doctor/error parity passed against the
+  new Python launcher.
 - `python3 -m pyright mini_ork/ported/mini_ork_cli.py`: 0 errors.
 - `pre-retirement-parity.sh` recorded a passing CLI oracle under
   `/private/tmp/mini-ork-cli-preflight`.
+- Corrected durable evidence is stored under the paid run as
+  `true-bash-parity-evidence.log`.
 
 ## Outbound seams to close or preserve explicitly
 
@@ -114,4 +120,3 @@ not removal of the public command string.
 - `recipes/self-migrate/verifiers/fork-closure.sh`
 - Runtime callers of `bin/mini-ork` discovered by the seam map.
 - Current CLI/operator/migration documentation describing the implementation.
-

@@ -55,10 +55,10 @@ graded reward_g, bash+python), lane-fallback hang-proofing (dispatch_with_fallba
 - reflection_pipeline.sh (358) + gradient_extractor.sh (379) + bin/mini-ork-reflect (247)
 - bin/mini-ork-execute — remaining large loop entrypoint. `bin/mini-ork-plan`
   retired on 2026-07-20 after native profile/context/trace completion.
-- top-level CLI — isolated closure proposal completed on 2026-07-20: the public
-  `bin/mini-ork` path becomes a Python launcher, closed direct commands route to
-  native modules, and `execute` remains live. This is reviewable run output,
-  not merged trunk state.
+- top-level CLI — isolated closure completed on 2026-07-20 at `27b1f40d`: the
+  public `bin/mini-ork` path is a Python launcher, closed direct commands route
+  to native modules, the full path contract is native, and `execute` remains
+  the one live Bash command fork. Pending focused promotion to trunk.
 - llm-dispatch.sh remainder (tool-summary sidecar; then flip MO_DISPATCH_BACKEND default)
 - assorted leaves: workflow_lifecycle, operator_steering, steering_checkpoint,
   mid_node_injector, role_evolver, runs-tracker, spec-split, artifact_contract,

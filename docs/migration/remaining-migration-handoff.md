@@ -464,8 +464,8 @@ the live plan evidence below.
 ### CLI closure proposal — 2026-07-20
 
 - Isolated target: `/private/tmp/mini-ork-self-migrate-cli`, branch
-  `migration/cli`. The proposal is uncommitted and has not been applied to the
-  real checkout.
+  `migration/cli`. Implementation is committed at `27b1f40d` after three
+  completion audits and is ready for focused promotion to `main`.
 - `bin/mini-ork` remains the executable public path but is now a thin Python
   launcher. It resolves symlinks, imports `mini_ork_cli.main`, and never reads
   `MINI_ORK_RUNTIME` or sources `runtime-select.sh`.
@@ -492,9 +492,10 @@ the live plan evidence below.
 
 ### Next safe action
 
-Review and apply `${MINI_ORK_RUN_DIR}/self-migrate.diff` if the proposal is
-accepted. After CLI closure lands, `execute` is the next top-level fork; do not
-remove or bypass `bin/mini-ork-execute` as part of the CLI proposal.
+Promote only the CLI preflight and implementation commits from the isolated
+branch, verify them again on clean `main`, and push. After CLI closure lands,
+`execute` is the next top-level fork; do not remove or bypass
+`bin/mini-ork-execute` as part of the CLI promotion.
 
 Each fork closure produces:
 - `self-migrate.diff` (reviewable, apply or reject)
