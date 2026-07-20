@@ -1,21 +1,11 @@
-"""Reflection pipeline sub-routines — Python port of lib/reflection_pipeline.sh.
+"""Native reflection pipeline sub-routines.
 
-Faithful, byte/JSON-identical Python mirror of `lib/reflection_pipeline.sh`. The
-8 public functions emit the same stdout/stderr as their bash counterparts and
-return the same exit codes (0 on success, non-zero on hard failure). Bash remains
-the authoritative source per the strangler-fig migration policy.
+The 8 public functions retain the Bash-era stdout, stderr, database, and exit
+contracts. Pre-retirement parity remains covered against the Bash library while
+the supported public reflect path uses this module in process.
 
-Co-existence model (strangler-fig): bash `lib/reflection_pipeline.sh` is the
-authoritative source. This module mirrors its sub-pipelines exactly. Parity is
-enforced by `tests/unit/test_reflection_pipeline_py.py` (>=6 cases that invoke
-the live bash subprocess via `subprocess.run(['bash','-c', ...])` and diff
-against the Python output byte-for-byte; floats 1e-6).
-
-The LLM-backed helpers (`gradient_extract`, `gradient_store`,
-`_gradient_ensure_table`) live in `lib/gradient_extractor.sh` and are NOT
-ported here — they require a live model and provider env scripts. The port
-accepts them as module-level injectable callables; the parity test installs a
-deterministic stub before invoking `reflection_extract_gradients`.
+The default gradient helpers call the native gradient extractor/store. Tests
+may still inject deterministic callables through the same public seams.
 
 Pipeline map (bash function → Python):
   reflection_extract_gradients  → reflection_extract_gradients
@@ -51,35 +41,31 @@ __all__ = [
 
 
 # ── Injection hooks ──────────────────────────────────────────────────────────
-# Bash reflection_extract_gradients sources lib/gradient_extractor.sh +
-# lib/trace_store.sh. Those are LLM-backed (gradient_extract shells out to
-# claude) and out of scope for the port + parity test. We expose them as
-# module-level settable callables; the defaults raise NotImplementedError so
-# callers cannot accidentally invoke them without injecting. The parity test
-# installs deterministic stubs (return known JSON lines, no-op write) before
-# driving reflection_extract_gradients.
+# Injectable seams remain for deterministic tests, but production defaults are
+# real native operations.
 
 def _default_gradient_extract(trace_id: str):
-    raise NotImplementedError(
-        f"reflection_pipeline.gradient_extract not injected "
-        f"(called with trace_id={trace_id!r}); "
-        f"call set_gradient_extract(fn) before reflection_extract_gradients"
-    )
+    from mini_ork.ported import gradient_extractor
+
+    return [
+        json.dumps(item)
+        for item in gradient_extractor.extract(trace_id, emit=False)
+    ]
 
 
 def _default_gradient_store(gradient_json: str) -> None:
-    raise NotImplementedError(
-        f"reflection_pipeline.gradient_store not injected "
-        f"(called with gradient_json={gradient_json!r}); "
-        f"call set_gradient_store(fn) before reflection_extract_gradients"
-    )
+    import io
+    from contextlib import redirect_stdout
+    from mini_ork.ported import gradient_extractor
+
+    with redirect_stdout(io.StringIO()):
+        gradient_extractor.store(gradient_json)
 
 
 def _default_gradient_ensure_table() -> None:
-    raise NotImplementedError(
-        "reflection_pipeline._gradient_ensure_table not injected; "
-        "call set_gradient_ensure_table(fn) before reflection_extract_gradients"
-    )
+    from mini_ork.ported import gradient_extractor
+
+    gradient_extractor.init_schema()
 
 
 _gradient_extract = _default_gradient_extract
