@@ -3,7 +3,7 @@
 # `$MINI_ORK_DB` so unit tests can source libs whose contract assumes
 # `mini-ork init` ran first.
 #
-# Background: several libs (trace_store.sh, memory.sh, context_assembler.sh,
+# Background: several components (trace_store.sh, memory.sh, context assembler,
 # and the others without `_ensure_table` helpers) removed their inline
 # `CREATE TABLE IF NOT EXISTS` blocks after the 2026-06-01 D-039 fix —
 # they rely on migrations 0001..NNNN having been applied via the

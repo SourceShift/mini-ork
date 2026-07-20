@@ -196,7 +196,7 @@ Add your own under `recipes/<name>/` — see [docs/EXTENSION.md](docs/EXTENSION.
 1. **WorkflowGraph** — add nodes + edges via `workflow.yaml` in your recipe. Schema: [schemas/workflow.schema.json](schemas/workflow.schema.json).
 2. **AgentRegistry** — register new roles / model bindings via `lib/agent_registry.sh:agent_register`. No code change.
 3. **VerifierRegistry** — drop a `<name>.sh` under `recipes/<recipe>/verifiers/` and reference it in `workflow.yaml`.
-4. **ExperienceMemory** — add namespaces via DB migrations or override `lib/context_assembler.sh` per task class.
+4. **ExperienceMemory** — add namespaces via DB migrations and extend the native `mini_ork.context_assembler` producers.
 
 Python embed is first-class: `MiniOrk().run(RunRequest(...))` — see [docs/PYTHON_FRAMEWORK.md](docs/PYTHON_FRAMEWORK.md).
 

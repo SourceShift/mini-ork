@@ -19,13 +19,10 @@
 #   - context_assembler either truncates to MINI_ORK_CTX_BUDGET_TOKENS or
 #     refuses gracefully.
 #
-# KNOWN GAP (v0.1):
-#   context_assembler.sh reads the full file into brief_raw = briefcontent and
-#   passes it as sys.argv[2] to python3.  On macOS, `getconf ARG_MAX` is ~1MB
-#   for a single argv element; on Linux it's typically 128KB per element.
-#   A 10MB file will likely fail with "Argument list too long" (E2BIG) when
-#   passed as argv.  This is an unhandled crash, not a graceful rejection.
-#   The correct fix is to pass the content via stdin pipe or a temp file, not argv.
+# MIGRATION NOTE:
+#   The retired Bash assembler passed the full brief body as a Python argv
+#   value and could hit E2BIG. The native assembler accepts the brief path and
+#   reads it in-process, so the body no longer crosses an argv boundary.
 #
 # VULNERABILITY SHAPE IF FAILING:
 #   Process killed before 30s (OOM), MemoryError in stderr, or DB row with

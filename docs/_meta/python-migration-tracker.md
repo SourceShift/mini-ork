@@ -26,7 +26,8 @@ config_resolve · rho_aggregator — 7 modules, ~700 LOC. Resumable loop:
 - **decision_service.sh** (496) — composition; needs deps ported first:
   coalition_gate.sh, process_reward.sh (done in clone → port to main), config_resolve.sh
   (done in clone → port), recursive_policy.
-- **Tier B:** finish `llm-dispatch.sh` (tool-summary sidecar, retire bash), `context_assembler.sh` (713, context-engine).
+- **Tier B:** finish `llm-dispatch.sh` (tool-summary sidecar, retire bash). The
+  context assembler is native and its Bash owner is retired.
 - **Tier C top-level forks:** verify, reflect, classify, plan, CLI, execute, and
   the separate scheduler integration fork are closed.
 
@@ -48,14 +49,11 @@ graded reward_g, bash+python), lane-fallback hang-proofing (dispatch_with_fallba
 + role-aware chains in executor).
 
 ## REMAINING (trunk)
-- context_assembler.sh — CORE PORTED (`mini_ork/context_assembler.py`). The
-  Python-only planner now consumes native failure/prior-run blocks,
-  ContextNest planner packs + generic atoms/recent-session fallbacks,
-  active-state injection, and persisted context packs. Remaining shell-only
-  surfaces belong to non-planner roles and operator steering.
-- reflection_pipeline.sh + gradient_extractor.sh: the public reflect fork now
-  uses native gradient dispatch, parsing, and storage by default. Bash library
-  and Bash-test retirement remains the next ownership unit.
+- context_assembler.sh — RETIRED. `mini_ork/context_assembler.py` owns bounded
+  packs, failure/prior-run blocks, ContextNest atoms and recent sessions,
+  operator-steering rendering, active-state injection, and its fixture CLI.
+- reflection_pipeline.sh + gradient_extractor.sh — RETIRED. Native reflection,
+  gradients, routing, and standalone contracts own the complete surface.
 - top-level CLI and execute — closed on 2026-07-20. `bin/mini-ork` is the
   Python launcher, `mini-ork execute` routes in-process, and the retired
   `bin/mini-ork-execute` implementation is absent.

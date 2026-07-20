@@ -291,7 +291,9 @@ The refreshed queue must cover these non-skippable remaining program tracks:
    making `mini_ork.scheduler` canonical and retiring the Bash and duplicate
    serial Python owners;
 3. close reflection/gradient and the remaining context-assembler surfaces,
-   including the similarity seed unit;
+   including the similarity seed unit — completed on 2026-07-20: both
+   reflection libraries and `lib/context_assembler.sh` are retired, and their
+   unique contracts are native;
 4. rewire and retire lower-level gate, steering, lifecycle, role, and artifact
    libraries one ownership seam at a time;
 5. convert the Bash integration/E2E suites and benchmark fixtures that are
