@@ -57,7 +57,9 @@ graded reward_g, bash+python), lane-fallback hang-proofing (dispatch_with_fallba
 - top-level CLI and execute — closed on 2026-07-20. `bin/mini-ork` is the
   Python launcher, `mini-ork execute` routes in-process, and the retired
   `bin/mini-ork-execute` implementation is absent.
-- llm-dispatch.sh remainder (tool-summary sidecar; then flip MO_DISPATCH_BACKEND default)
+- llm-dispatch.sh remainder: runtime review callers are closed; convert the
+  provider, telemetry, retry, artifact, and tool-grant fixtures before retiring
+  the Bash dispatcher.
 - assorted leaves: workflow_lifecycle, operator_steering, steering_checkpoint,
   mid_node_injector, role_evolver, runs-tracker, spec-split, artifact_contract,
   reflection-refiner, cross_epic_gradient

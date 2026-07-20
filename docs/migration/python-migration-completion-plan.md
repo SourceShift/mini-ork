@@ -31,7 +31,7 @@ The port is already native; the engine just calls the bash instead. Rewire = rep
 | lib | port native? | engine shell-out site | note |
 |---|---|---|---|
 | `decision_service` | ✅ | execute.py | **DONE** (PR #179) |
-| `llm-dispatch` | ✅ (native on execute, invoke-prompt, profile_answerer.py, pre_push_review.py, comparative-opinions, and reflection gradients) | Bash review library and fixtures | The reflection gradient boundary is native; close remaining review/test callers before retiring the dispatcher |
+| `llm-dispatch` | ✅ (native on execute, invoke-prompt, profile answerer, review, comparative opinions, and reflection gradients) | Provider/telemetry/tool-grant fixtures | Runtime review callers are closed; convert the remaining dispatcher fixtures before retirement |
 | `gate_bootstrap` | ✅ | non-execute callers | Execute now uses native bootstrap/registry behavior; retire the Bash lib only after every other caller moves |
 | `gradient_extractor` | ✅; Bash retired | none | Native dispatch, framework filtering, watermark, persistence, dedup, and standalone contracts own the full surface |
 
@@ -119,6 +119,18 @@ Per subsystem, in this order — **never a blind sweep** (a wrong port breaks ev
   and the temporary provider registry; no MiniMax request ran.
 - `bin/mini-ork-review` plus `lib/pre_push_review.sh` remain a separate fork;
   this caller unit does not authorize their deletion or dispatcher retirement.
+
+### Completed ownership fork: public pre-push review — 2026-07-20
+
+- `mini_ork.pre_push_review` is the sole implementation, combining the
+  CLI-complete runtime with native Codex/Kimi/GLM panel dispatch.
+- `bin/mini-ork-review` is a direct Python launcher; the Bash library and the
+  duplicate `mini_ork.ported.mini_ork_review` module are retired.
+- Standalone contracts cover persistence, heuristics, policy, CLI formatting,
+  forwarding, LLM normalization/fail-open behavior, and long unified diffs.
+- This closes the review runtime blocker, but does not authorize dispatcher
+  retirement while provider, telemetry, retry, artifact, and tool-grant
+  fixtures still source `lib/llm-dispatch.sh`.
 
 ### Completed caller unit: `scripts/comparative-opinions.sh` — 2026-07-20
 
