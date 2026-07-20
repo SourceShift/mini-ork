@@ -167,7 +167,9 @@ if [[ -d "$RECIPE_DIR" ]]; then
     cp "$RECIPE_DIR/task_class.yaml" "$MINI_ORK_HOME/config/task_classes/code-fix.yaml"
   fi
 
-  CLASSIFY_OUT="$("$MINI_ORK_ROOT/bin/mini-ork-classify" --dry-run "$KICKOFF_TMP" 2>/dev/null || echo "")"
+  CLASSIFY_OUT="$(PYTHONPATH="$MINI_ORK_ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+    python3 -m mini_ork.ported.mini_ork_classify \
+    --dry-run "$KICKOFF_TMP" 2>/dev/null || echo "")"
   _assert "classify --dry-run exits 0 and emits task_class=" '[[ "$CLASSIFY_OUT" == *task_class=* ]]'
 
   # dry-run does not write traces, but verify table still queryable (idempotent)

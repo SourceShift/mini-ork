@@ -17,8 +17,12 @@ set -Eeuo pipefail
 sub="${1:-help}"; shift || true
 
 case "$sub" in
+  classify)
+    exec env PYTHONPATH="${MINI_ORK_ROOT}${PYTHONPATH:+:$PYTHONPATH}" \
+      python3 -m mini_ork.ported.mini_ork_classify "$@" ;;
+
   # Universal loop subcommands
-  classify|plan|execute|verify|reflect|improve|eval|promote|init|update|spawn|scheduler|epics|bugs|inject|review|apply|traceotter|validate|garden|recipe-eval)
+  plan|execute|verify|reflect|improve|eval|promote|init|update|spawn|scheduler|epics|bugs|inject|review|apply|traceotter|validate|garden|recipe-eval)
     exec "$MINI_ORK_ROOT/bin/mini-ork-$sub" "$@" ;;
 
   # Phase C: trajectory metrics across DF cycles (v0.2-pt13)
@@ -99,7 +103,9 @@ case "$sub" in
       # Probe classify in dry-run mode, resolve the matching recipe, then run
       # the normal lifecycle with the recipe exported before the DB write.
       kickoff="$first"
-      probe_out=$(MINI_ORK_DRY_RUN=1 "$MINI_ORK_ROOT/bin/mini-ork-classify" "$kickoff") || exit $?
+      probe_out=$(MINI_ORK_DRY_RUN=1 \
+        PYTHONPATH="${MINI_ORK_ROOT}${PYTHONPATH:+:$PYTHONPATH}" \
+        python3 -m mini_ork.ported.mini_ork_classify "$kickoff") || exit $?
       probed_class=$(printf '%s\n' "$probe_out" | grep -E '^task_class=' | head -1 | cut -d= -f2)
       recipe=$(python3 - "$MINI_ORK_ROOT" "$probed_class" <<'PY'
 import os, sys, yaml
@@ -174,7 +180,9 @@ except Exception:
     [ -f "$MINI_ORK_ROOT/lib/repo_integrity_guard.sh" ] && source "$MINI_ORK_ROOT/lib/repo_integrity_guard.sh" && repo_integrity_check_and_heal || true
 
     # ── classify ───────────────────────────────────────────────────────────────
-    classify_out=$("$MINI_ORK_ROOT/bin/mini-ork-classify" --task-class "$derived_class" "$kickoff") || exit $?
+    classify_out=$(PYTHONPATH="${MINI_ORK_ROOT}${PYTHONPATH:+:$PYTHONPATH}" \
+      python3 -m mini_ork.ported.mini_ork_classify \
+      --task-class "$derived_class" "$kickoff") || exit $?
     printf '%s\n' "$classify_out"
     MINI_ORK_TASK_CLASS=$(printf '%s\n' "$classify_out" | grep -E '^task_class=' | head -1 | cut -d= -f2)
     export MINI_ORK_TASK_CLASS

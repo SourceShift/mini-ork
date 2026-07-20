@@ -55,9 +55,11 @@ if [[ -f "$MINI_ORK_ROOT/db/init.sh" ]]; then
   bash "$MINI_ORK_ROOT/db/init.sh" >/dev/null 2>&1 || true
 fi
 
-classify_bin="$MINI_ORK_ROOT/bin/mini-ork-classify"
-[[ ! -x "$classify_bin" ]] && {
-  _skip "mini-ork-classify not executable"
+classify_module="$MINI_ORK_ROOT/mini_ork/ported/mini_ork_classify.py"
+classify_cmd=(env "PYTHONPATH=$MINI_ORK_ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+  python3 -m mini_ork.ported.mini_ork_classify)
+[[ ! -f "$classify_module" ]] && {
+  _skip "Python classify module unavailable"
   echo ""
   echo "=== Results: $PASS OK  $SKIP SKIP  $FAIL FAIL ==="
   exit 0
@@ -89,7 +91,7 @@ EOF
 run_classify_timed() {
   local timeout_secs="${1:-15}"
   local exit_code=0
-  timeout "$timeout_secs" bash "$classify_bin" "$VALID_KICKOFF" --dry-run 2>&1 || exit_code=$?
+  timeout "$timeout_secs" "${classify_cmd[@]}" "$VALID_KICKOFF" --dry-run 2>&1 || exit_code=$?
   echo "__EXIT:$exit_code"
 }
 

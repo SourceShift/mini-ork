@@ -64,9 +64,11 @@ if [[ ! -f "$MINI_ORK_DB" ]]; then
   exit 0
 fi
 
-classify_bin="$MINI_ORK_ROOT/bin/mini-ork-classify"
-[[ ! -x "$classify_bin" ]] && {
-  _skip "mini-ork-classify not executable"
+classify_module="$MINI_ORK_ROOT/mini_ork/ported/mini_ork_classify.py"
+classify_cmd=(env "PYTHONPATH=$MINI_ORK_ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+  python3 -m mini_ork.ported.mini_ork_classify)
+[[ ! -f "$classify_module" ]] && {
+  _skip "Python classify module unavailable"
   echo ""
   echo "=== Results: $PASS OK  $SKIP SKIP  $FAIL FAIL ==="
   exit 0
@@ -115,7 +117,7 @@ else
 
   INJECT_RUN_ID="x'; DROP TABLE task_runs; --"
   local_exit=0
-  MINI_ORK_RUN_ID="$INJECT_RUN_ID" bash "$classify_bin" "$VALID_KICKOFF" >/dev/null 2>&1 || local_exit=$?
+  MINI_ORK_RUN_ID="$INJECT_RUN_ID" "${classify_cmd[@]}" "$VALID_KICKOFF" >/dev/null 2>&1 || local_exit=$?
 
   if table_exists "task_runs"; then
     _ok "task_runs STILL EXISTS after DROP TABLE injection in RUN_ID (parameterized query protected it)"
@@ -141,7 +143,7 @@ else
   SAFE_MARKER="LITERAL-MARKER-$$"
   INJECT_RUN_ID="${SAFE_MARKER}'; SELECT 1; --"
   local_exit=0
-  MINI_ORK_RUN_ID="$INJECT_RUN_ID" bash "$classify_bin" "$VALID_KICKOFF" >/dev/null 2>&1 || local_exit=$?
+  MINI_ORK_RUN_ID="$INJECT_RUN_ID" "${classify_cmd[@]}" "$VALID_KICKOFF" >/dev/null 2>&1 || local_exit=$?
 
   # Check whether the literal string was stored
   STORED=$(sqlite3 "$MINI_ORK_DB" \
@@ -169,7 +171,7 @@ if ! table_exists "task_runs"; then
 else
   INJECT_CLASS="x'); DROP TABLE task_runs; --"
   local_exit=0
-  MINI_ORK_TASK_CLASS="$INJECT_CLASS" bash "$classify_bin" "$VALID_KICKOFF" >/dev/null 2>&1 || local_exit=$?
+  MINI_ORK_TASK_CLASS="$INJECT_CLASS" "${classify_cmd[@]}" "$VALID_KICKOFF" >/dev/null 2>&1 || local_exit=$?
 
   if table_exists "task_runs"; then
     _ok "task_runs intact after DROP TABLE in MINI_ORK_TASK_CLASS"
