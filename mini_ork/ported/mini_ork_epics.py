@@ -154,8 +154,11 @@ def _path_hints(body):
 
 
 def _synth_verify(paths):
-    shells = [p for p in paths if p.endswith(".sh") or p.startswith("bin/")]
-    pys = [p for p in paths if p.endswith(".py")]
+    python_bins = {"bin/mini-ork-scheduler"}
+    shells = [p for p in paths if p.endswith(".sh") or (
+        p.startswith("bin/") and p not in python_bins
+    )]
+    pys = [p for p in paths if p.endswith(".py") or p in python_bins]
     sqls = [p for p in paths if p.endswith(".sql")]
     cmds = []
     if shells:
@@ -165,7 +168,7 @@ def _synth_verify(paths):
     if sqls:
         cmds.append("# Apply: sqlite3 .mini-ork/state.db < " + sqls[0])
     if not cmds:
-        cmds = ["bash -n bin/mini-ork-epics bin/mini-ork-scheduler",
+        cmds = ["bash -n bin/mini-ork-epics && python3 -m py_compile bin/mini-ork-scheduler",
                 "bash tests/integration/test_autonomous_epic_pipeline.sh"]
     return cmds
 

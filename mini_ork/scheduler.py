@@ -1,4 +1,4 @@
-"""Autonomous multi-epic scheduler — Python port of bin/mini-ork-scheduler.
+"""Canonical autonomous multi-epic scheduler.
 
 Faithful port of the pick/dispatch/verdict/cascade mechanics PLUS the win #1
 concurrency seam: the bash scheduler computed the full ready-set and then threw
@@ -8,7 +8,7 @@ pool (MO_SCHED_MAX_PARALLEL, default 3) over the whole priority-ordered
 ready-set; as each epic completes, its deps cascade and newly-unblocked epics
 join the pool. Priority-inheritance (Track B5) ordering is preserved exactly.
 
-Semantics kept from bash: budget cap over rolling-24h task_runs spend,
+Public semantics: budget cap over rolling-24h task_runs spend,
 cost-pause sentinels, kickoff resolution order, verdict resolution from
 {panel-verdict,verdict}.json, done->cascade / fail->escalated.
 """
@@ -18,10 +18,35 @@ import json
 import os
 import sqlite3
 import subprocess
+import sys
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 
 from mini_ork.ported import epic_graph
+
+
+_USAGE = """mini-ork scheduler — autonomous multi-epic delivery loop.
+
+Pulls the next-ready epic from `epics` (status='not started' AND all hard
+deps resolved) and dispatches it via `mini-ork run epic-runner <kickoff>`.
+On verdict=success, marks epic 'done' and cascades dep resolution. On
+failure, marks epic 'escalated' (visible in `mini-ork-epics list`).
+
+Flags:
+  --once               Run a single pick→dispatch→verdict cycle then exit
+  --idle-secs N        Sleep N seconds between empty-queue polls (default 60)
+  --max-iters N        Hard stop after N dispatches (default unlimited)
+  --budget-cap-usd X   Daily cost cap; refuses to dispatch when exceeded
+                       (defaults to MO_DAILY_BUDGET_USD or 50.0)
+  --dry-run            Print what would be dispatched, do not invoke runner
+  --help
+
+Exit codes:
+  0   queue drained (no ready epics) OR --once cycle finished cleanly
+  1   fatal: missing deps (no DB, no epic-runner recipe)
+  2   cost-pause sentinel encountered or budget cap reached
+  3   max-iters reached
+"""
 
 
 def _db_path(db: str | None) -> str:
@@ -212,6 +237,9 @@ def dispatch_epic(epic_id: str, root: str, home: str, recipe: str,
     log_path = os.path.join(log_dir, f"dispatch-{int(time.time())}-{epic_id}.log")
 
     if dry_run:
+        sys.stdout.write(
+            f"  [dry-run] would dispatch: {root}/bin/mini-ork run {recipe} {kickoff}\n"
+        )
         _set_status(db, epic_id, "not started")
         return "dry_run", 0
 
@@ -266,3 +294,124 @@ def run_pool(root: str, home: str, recipe: str = "epic-runner",
             if max_iters > 0 and dispatched >= max_iters and not in_flight:
                 break
     return dispatched
+
+
+def main(
+    argv: list[str] | None = None,
+    *,
+    db: str | None = None,
+    root: str | None = None,
+    home: str | None = None,
+    runner_cmd: list[str] | None = None,
+) -> int:
+    """Run the scheduler CLI over the canonical concurrent scheduler core.
+
+    ``--once`` admits exactly one epic. Normal operation drains ready work with
+    ``MO_SCHED_MAX_PARALLEL`` workers, then resumes the historic idle loop.
+    ``runner_cmd`` is an acceptance-test seam; production uses ``bin/mini-ork``.
+    """
+    args = list(sys.argv[1:] if argv is None else argv)
+    root = root or os.environ.get("MINI_ORK_ROOT") or os.getcwd()
+    home = home or os.environ.get("MINI_ORK_HOME") or os.path.join(root, ".mini-ork")
+    db = db or os.environ.get("MINI_ORK_DB") or os.path.join(home, "state.db")
+    recipe = os.environ.get("MO_SCHED_RECIPE", "epic-runner")
+    once = False
+    idle_secs = 60
+    max_iters = 0
+    dry_run = False
+    budget_cap = float(os.environ.get("MO_DAILY_BUDGET_USD", "50.0"))
+
+    def value_after(index: int, flag: str) -> str | None:
+        if index + 1 < len(args):
+            return args[index + 1]
+        sys.stderr.write(f"scheduler: {flag} requires a value\n")
+        return None
+
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg == "--once":
+            once = True
+            i += 1
+        elif arg == "--dry-run":
+            dry_run = True
+            i += 1
+        elif arg in {"--help", "-h"}:
+            sys.stdout.write(_USAGE)
+            return 0
+        elif arg in {"--idle-secs", "--max-iters", "--budget-cap-usd"}:
+            value = value_after(i, arg)
+            if value is None:
+                return 2
+            try:
+                if arg == "--idle-secs":
+                    idle_secs = int(value)
+                elif arg == "--max-iters":
+                    max_iters = int(value)
+                else:
+                    budget_cap = float(value)
+            except ValueError:
+                sys.stderr.write(f"scheduler: invalid value for {arg}: {value}\n")
+                return 2
+            i += 2
+        else:
+            sys.stderr.write(f"scheduler: unknown flag {arg}\n")
+            return 2
+
+    if not os.path.isfile(db):
+        sys.stderr.write(f"scheduler: state.db not found at {db}\n")
+        return 1
+    if not os.path.isdir(os.path.join(root, "recipes", recipe)):
+        sys.stderr.write(f"scheduler: recipe not found: recipes/{recipe}\n")
+        return 1
+
+    ensure_priority_column(db)
+    dispatched_total = 0
+    while True:
+        if cost_pause_active(home):
+            sys.stderr.write("scheduler: cost-pause active — exiting\n")
+            return 2
+        spent = today_cost_usd(db)
+        if spent >= budget_cap:
+            sys.stderr.write(
+                f"scheduler: 24h spend ${spent} ≥ cap ${budget_cap} — refusing dispatch\n"
+            )
+            return 2
+
+        ready = pick_ready(db)
+        if not ready:
+            if once:
+                sys.stdout.write("scheduler: queue empty (--once) → exit 0\n")
+                return 0
+            sys.stdout.write(f"scheduler: queue empty; idle {idle_secs}s\n")
+            time.sleep(idle_secs)
+            continue
+
+        sys.stdout.write(
+            f"scheduler: iter {dispatched_total + 1} — next={ready[0]} "
+            f"spent=${spent} / cap=${budget_cap}\n"
+        )
+        remaining = 1 if once else (
+            max_iters - dispatched_total if max_iters > 0 else 0
+        )
+        dispatched = run_pool(
+            root,
+            home,
+            recipe,
+            db=db,
+            max_iters=remaining,
+            budget_cap=budget_cap,
+            dry_run=dry_run,
+            runner_cmd=runner_cmd,
+        )
+        dispatched_total += dispatched
+
+        if once:
+            return 0
+        if max_iters > 0 and dispatched_total >= max_iters:
+            sys.stderr.write(f"scheduler: max-iters {max_iters} reached → exit 3\n")
+            return 3
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
