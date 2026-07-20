@@ -36,22 +36,23 @@ were rejected by its gateway, so they were not counted as migration evidence;
 no MiniMax provider was used. The BDD-first dry-run E2E passed 18 assertions,
 `mini-ork validate` passed, and `mini-ork garden` reported zero errors with the
 same missing operator env-var-document warning reproduced on unchanged main.
-Do not retire the library yet: `profile_answerer`, pre-push review, reflection/
-gradient paths, scripts, and Bash fixtures still depend on it. Refresh the
-inventory from the promoted main before selecting the next caller.
+Do not retire the dispatcher library yet: the later profile-answerer and
+comparative-opinions units closed two callers, but pre-push review, reflection/
+gradient paths, and Bash fixtures still depend on it. Refresh the inventory
+from the promoted main before selecting the next caller.
 
 The subsequent caller unit made `mini_ork.ported.profile_answerer` native on
-its standalone/default path as well as its already-native planner path. The
-default preserves the DeepSeek-first, Kimi-on-failure-or-whitespace contract,
-captures provider stdout without feeding diagnostics into the JSON parser, and
-keeps the provider boundary injectable. Its focused profile/planner suite
-passed 27 tests with one optional replay fixture skipped, focused Pyright
-reported zero errors, and a process-local GLM 5.2 probe passed through the
-native seam. No DeepSeek or MiniMax request was made for migration validation.
-`lib/profile_answerer.sh` remains below the frontier because Bash callers and
-its pre-retirement oracle still exist; this unit closes only the Python
-module's `llm-dispatch.sh` edge. Refresh from promoted main again before the
-next caller.
+its standalone/default path as well as its already-native planner path. A
+follow-up ownership audit found that the supported Bash implementation had
+already moved to Kimi-only dispatch in `00176709`, while the first native port
+had accidentally restored an older DeepSeek-first default. The retirement unit
+corrected the native owner to two Kimi attempts, preserving retry-on-failure-or-
+whitespace behavior, stdout isolation, and the injectable provider boundary.
+It converted the live Bash-oracle suite to standalone golden contracts,
+rewired the web smoke assertion, and removed `lib/profile_answerer.sh`. The
+planner remains the only production inbound caller and already imports the
+native module directly. This fork is now closed; refresh from promoted main
+before selecting the next caller.
 
 The next caller unit removed `mini_ork/pre_push_review.py`'s Bash dispatcher
 edge. Its sequential panel now calls native `mo_llm_dispatch` in-process while
