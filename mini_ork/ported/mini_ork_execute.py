@@ -2241,7 +2241,7 @@ def dispatch_node(fields, *, root, run_dir, plan_path, task_class, db, run_id,
     # planner/reflector don't dispatch an LLM — handled after the intervention gate
     # (bash routes them through the same gate then falls to their case).
     if node_type == "planner":
-        print("  [skip] planner node handled by mini-ork-plan")
+        print("  [skip] planner node handled by the Python plan runtime")
         return 0, "done"
     if node_type == "reflector":
         # Preserve bash's `… || true`: reflection is a side-channel and must

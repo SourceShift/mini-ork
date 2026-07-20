@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # tests/integration/test_given_plan.sh — MO_GIVEN_PLAN caller-supplied plan path.
 #
-# Contract (bin/mini-ork-plan, PR #72):
+# Contract (Python plan runtime, PR #72):
 #   MO_GIVEN_PLAN=<path> supplies a complete plan JSON, so the planner LLM
 #   dispatch is skipped — but the supplied plan flows through the SAME
 #   extraction + schema/validation gates as an LLM-produced plan.
@@ -16,6 +16,8 @@ set -uo pipefail
 MINI_ORK_ROOT="${MINI_ORK_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 export MINI_ORK_ROOT
 export PATH="$MINI_ORK_ROOT/bin:$PATH"
+plan_cmd=(env "PYTHONPATH=$MINI_ORK_ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+  python3 -m mini_ork.ported.mini_ork_plan)
 # The CI integration harness exports MINI_ORK_DRY_RUN=1 globally (to keep tests
 # LLM-free). The given-plan branch lives AFTER the --dry-run short-circuit, so
 # these invocations MUST run non-dry to reach it — and they still make no LLM
@@ -62,7 +64,7 @@ cat > "$GIVEN" <<JSON
 }
 JSON
 
-echo "── integration: mini-ork-plan MO_GIVEN_PLAN ──"
+echo "── integration: Python plan runtime MO_GIVEN_PLAN ──"
 
 # ── (A) happy path: given plan used verbatim, planner LLM skipped ──
 echo ""
@@ -70,7 +72,7 @@ echo "--- A. given plan is used + planner skipped ---"
 export MINI_ORK_RUN_ID="run-givenplan-use-$$"
 A_OUT_FILE="$TMPROOT/out-a.json"
 A_RC=0
-A_STDOUT=$(MO_GIVEN_PLAN="$GIVEN" mini-ork-plan --out "$A_OUT_FILE" "$TMPROOT/kickoff.md" 2>"$TMPROOT/a.err") || A_RC=$?
+A_STDOUT=$(MO_GIVEN_PLAN="$GIVEN" "${plan_cmd[@]}" --out "$A_OUT_FILE" "$TMPROOT/kickoff.md" 2>"$TMPROOT/a.err") || A_RC=$?
 A_STDERR=$(cat "$TMPROOT/a.err")
 
 [ "$A_RC" -eq 0 ] && _ok "given-plan run exits 0" \
@@ -109,7 +111,7 @@ echo "--- B. unreadable MO_GIVEN_PLAN → exit 1 ---"
 export MINI_ORK_RUN_ID="run-givenplan-bad-$$"
 B_RC=0
 B_STDERR=$(MO_GIVEN_PLAN="$TMPROOT/nope-does-not-exist-$$.json" \
-  mini-ork-plan --out "$TMPROOT/out-b.json" "$TMPROOT/kickoff.md" 2>&1 >/dev/null) || B_RC=$?
+  "${plan_cmd[@]}" --out "$TMPROOT/out-b.json" "$TMPROOT/kickoff.md" 2>&1 >/dev/null) || B_RC=$?
 
 [ "$B_RC" -eq 1 ] && _ok "unreadable given-plan → exit 1" \
   || _fail "unreadable given-plan → expected exit 1, got $B_RC"

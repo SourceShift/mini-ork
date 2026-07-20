@@ -8,9 +8,9 @@
 # and remaining decision variables in a compact block placed BEFORE
 # the projected chronological history.
 #
-# Mini-ork wiring: invoked from bin/mini-ork-plan:176 MO_INJECT_LEARNINGS
+# Mini-ork wiring: invoked from mini_ork.ported.mini_ork_plan via MO_INJECT_LEARNINGS
 # block, immediately after the ContextNest atoms wiring restored by
-# PR #19 at bin/mini-ork-plan:195. Adds a top-of-prompt JSON + markdown
+# PR #19 in the Python planner. Adds a top-of-prompt JSON + markdown
 # block sourced from live state.db rows.
 #
 # Public API:

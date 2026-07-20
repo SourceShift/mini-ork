@@ -107,7 +107,8 @@ _assert "task_class is non-empty" '[[ -n "$TASK_CLASS" ]]'
 echo ""
 echo "--- mini-ork plan (dry-run) ---"
 
-PLAN_OUT="$("$MINI_ORK_ROOT/bin/mini-ork-plan" --dry-run "$KICKOFF" 2>/dev/null)"
+PLAN_OUT="$(PYTHONPATH="$MINI_ORK_ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+  python3 -m mini_ork.ported.mini_ork_plan --dry-run "$KICKOFF" 2>/dev/null)"
 PLAN_EXIT=$?
 _assert "plan --dry-run exits 0" '[[ "$PLAN_EXIT" -eq 0 ]]'
 _assert "plan emits plan_path= on stdout" '[[ "$PLAN_OUT" == *plan_path=* ]]'

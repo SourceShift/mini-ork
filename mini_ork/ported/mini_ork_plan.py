@@ -1,4 +1,4 @@
-"""Python port of bin/mini-ork-plan — the Planner node.
+"""Python Planner node runtime.
 
 Strangler-fig parity port. Reads task_class + kickoff, builds the planner prompt
 (recipe > workflow > built-in), injects learnings/CN context (best-effort),
@@ -20,12 +20,14 @@ fallback, dry-run/gate placeholders, overlay, DB write) is transcribed verbatim.
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
+import io
 import json
 import os
 import re
-import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -34,7 +36,7 @@ _NODE_TYPES = {"planner", "researcher", "implementer", "reviewer", "verifier",
 _RECOVERABLE_VERDICTS = {"parse_error", "missing_verifier_contract",
                          "bad_artifact_contract", "bad_node_types"}
 
-# Verbatim heredoc from bin/mini-ork-plan (dry-run placeholder, inline objects).
+# Golden dry-run placeholder retained from the retired Bash runtime.
 _DRY_RUN_PLACEHOLDER = """{
   "objective": "<dry-run: not generated>",
   "assumptions": [],
@@ -247,8 +249,9 @@ def _detect_truncation(raw: str) -> bool:
     return depth > 0
 
 
-def _build_repair_prompt(root, kickoff, workflow, profile_path, raw_invalid, verdict, truncated) -> str:
-    original = _build_prompt(root, kickoff, workflow, profile_path)
+def _build_repair_prompt(root, kickoff, workflow, profile_path, raw_invalid, verdict, truncated,
+                         original_prompt=None) -> str:
+    original = original_prompt or _build_prompt(root, kickoff, workflow, profile_path)
     truncation_note = "yes" if truncated else "no"
     return f"""{original}
 
@@ -416,10 +419,272 @@ def _read_profile_meta(profile_path):
         profile = {}
     status = str(profile.get("profile_status") or "")
     try:
-        confidence = float(profile.get("confidence"))
+        confidence = float(str(profile.get("confidence")))
     except (TypeError, ValueError):
         confidence = 0.0
     return status, confidence, profile.get("human_questions") or []
+
+
+def _trace_plan(trace_id, task_class, status, db, **extra):
+    """Best-effort planner lifecycle trace; never pollute the CLI streams."""
+    if not trace_id:
+        return
+    try:
+        from mini_ork import trace_store
+        payload = {"trace_id": trace_id, "task_class": task_class, "status": status, **extra}
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            trace_store.trace_write(payload, db=db)
+    except Exception:
+        pass
+
+
+def _normalize_profile(profile_path):
+    if not profile_path:
+        return ""
+    try:
+        from mini_ork.ported.profile_gate import normalize_zero_questions
+        return normalize_zero_questions(profile_path)
+    except Exception:
+        return ""
+
+
+def _apply_profile_answers(profile_path, answer_payload) -> bool:
+    if not profile_path:
+        return False
+    items = answer_payload.get("answers") if isinstance(answer_payload, dict) else None
+    if isinstance(items, dict):
+        answers = {str(k): str(v) for k, v in items.items() if str(v).strip()}
+    else:
+        answers = {
+            str(item.get("question")): str(item.get("answer"))
+            for item in (items or [])
+            if isinstance(item, dict) and item.get("question") and item.get("answer")
+        }
+    if not answers:
+        return False
+    try:
+        with open(profile_path, encoding="utf-8") as fh:
+            profile = json.load(fh)
+    except Exception:
+        profile = {}
+    profile.setdefault("answers", {}).update(answers)
+    profile["profile_answers_auto_answered"] = bool(answer_payload.get("auto_answered"))
+    profile["profile_status"] = "ready"
+    try:
+        current_confidence = float(profile.get("confidence", 0) or 0)
+    except (TypeError, ValueError):
+        current_confidence = 0.0
+    profile["confidence"] = max(current_confidence, 0.9)
+    profile["human_questions"] = []
+    with open(profile_path, "w", encoding="utf-8") as fh:
+        json.dump(profile, fh, indent=2)
+        fh.write("\n")
+    return True
+
+
+def _auto_answer_profile(kickoff, questions, profile_path, dispatch_fn) -> str:
+    if not profile_path or dispatch_fn is None:
+        return ""
+    from mini_ork.ported.profile_answerer import answer_profile_questions
+    answers_path = os.path.join(os.path.dirname(profile_path), "profile-answers.json")
+
+    def answer_dispatch(prompt):
+        rc, raw = dispatch_fn("profile_answerer", "profile_answerer", prompt)
+        if rc != 0 or not raw.strip():
+            raise RuntimeError("profile answerer dispatch failed")
+        return raw
+
+    payload = answer_profile_questions(
+        kickoff,
+        json.dumps(questions),
+        answers_path,
+        dispatch=answer_dispatch,
+    )
+    return answers_path if _apply_profile_answers(profile_path, payload) else ""
+
+
+def _can_prompt_profile() -> bool:
+    if os.environ.get("MINI_ORK_NONINTERACTIVE", "0") == "1":
+        return False
+    try:
+        with open("/dev/tty", encoding="utf-8"):
+            return True
+    except OSError:
+        return False
+
+
+def _prompt_profile_questions(questions, profile_path) -> str:
+    answers = {}
+    try:
+        with open("/dev/tty", "r", encoding="utf-8") as tty_r, \
+                open("/dev/tty", "w", encoding="utf-8") as tty_w:
+            for index, question in enumerate(questions, 1):
+                if isinstance(question, str):
+                    text = question
+                elif isinstance(question, dict):
+                    text = question.get("text") or question.get("question") or str(question)
+                else:
+                    text = str(question)
+                tty_w.write(f"\n  Q{index}: {text}\n  > ")
+                tty_w.flush()
+                answer = tty_r.readline().strip()
+                if answer:
+                    answers[text] = answer
+                else:
+                    tty_w.write("  [skipped]\n")
+                    tty_w.flush()
+    except (OSError, KeyboardInterrupt):
+        return ""
+    if not answers:
+        return ""
+    answers_path = os.path.join(os.path.dirname(profile_path), "profile-answers.json")
+    with open(answers_path, "w", encoding="utf-8") as fh:
+        json.dump(answers, fh, indent=2)
+        fh.write("\n")
+    payload = {"answers": answers, "auto_answered": False}
+    return answers_path if _apply_profile_answers(profile_path, payload) else ""
+
+
+def _brief_query(path) -> str:
+    try:
+        raw = Path(path).read_text(encoding="utf-8")
+        try:
+            data = json.loads(raw)
+        except Exception:
+            return raw[:512].strip()
+        parts = [str(data.get(key)).strip() for key in
+                 ("title", "objective", "description", "task_class")
+                 if isinstance(data.get(key), str) and data.get(key).strip()]
+        return " ".join(parts)[:600] if parts else raw[:512].strip()
+    except Exception:
+        return ""
+
+
+def _contextnest_atoms_md(brief_path, limit=6) -> str:
+    try:
+        from mini_ork import cn_client
+        from mini_ork.ported.context_role_packs import extract_query
+        if not cn_client.available():
+            return ""
+        capsule = cn_client.capsule(extract_query(brief_path), "14d")
+        try:
+            min_chars = int(os.environ.get("CN_CAPSULE_MIN_CHARS", "100"))
+        except ValueError:
+            min_chars = 100
+        if len(capsule) > min_chars and any(line.startswith("## ") for line in capsule.splitlines()):
+            return ("--- ContextNest capsule (kind-ordered substrate digest) ---\n"
+                    + capsule + "\n--- /ContextNest capsule ---\n")
+        query = _brief_query(brief_path)
+        return cn_client.render_atoms_md(cn_client.retrieve(query, limit), limit) if query else ""
+    except Exception:
+        return ""
+
+
+def _contextnest_recent_sessions_md(brief_path, max_files=4) -> str:
+    try:
+        from mini_ork import cn_client
+        if not cn_client.available():
+            return ""
+        data = json.loads(Path(brief_path).read_text(encoding="utf-8"))
+        candidates = []
+        for key in ("files", "paths", "relevant_files", "targets"):
+            for item in data.get(key) or []:
+                if isinstance(item, str):
+                    candidates.append(item)
+                elif isinstance(item, dict):
+                    path = item.get("path") or item.get("file") or item.get("name")
+                    if isinstance(path, str):
+                        candidates.append(path)
+        rendered = []
+        for path in candidates[:max_files]:
+            try:
+                payload = json.loads(cn_client.sessions_by_file(path))
+            except Exception:
+                continue
+            sessions = payload.get("sessions") or payload.get("hits") or []
+            if not sessions:
+                continue
+            lines = [f"- File `{path}` recently touched in:"]
+            for session in sessions[:3]:
+                sid = session.get("session_id") or session.get("id", "")
+                ts = (session.get("last_seen") or session.get("ts") or "")[:10]
+                title = (session.get("title") or session.get("intent") or "").strip()[:80]
+                lines.append(f"  - {sid[:8]} ({ts}) {title}")
+            rendered.append("\n".join(lines))
+        if not rendered:
+            return ""
+        return ("--- ContextNest: recent sessions for relevant files ---\n"
+                + "\n".join(rendered)
+                + "\n--- /ContextNest: recent sessions ---\n")
+    except Exception:
+        return ""
+
+
+def _inject_context(prompt, kickoff, task_class, db, out_file, dry_run) -> str:
+    if os.environ.get("MO_INJECT_LEARNINGS", "1") != "1":
+        return prompt
+    blocks = []
+    try:
+        from mini_ork import context_assembler
+        for producer in (context_assembler.failure_modes_md, context_assembler.prior_runs_md):
+            try:
+                block = producer(task_class, 5, db=db)
+            except Exception:
+                block = ""
+            if block:
+                blocks.append(block)
+
+        role_pack = ""
+        if os.environ.get("MO_USE_ROLE_PACKS", "1") == "1":
+            try:
+                from mini_ork.ported.context_role_packs import role_pack_md
+                role_pack = role_pack_md("planner", kickoff, "")
+            except Exception:
+                role_pack = ""
+        generic = "" if role_pack else _contextnest_atoms_md(kickoff, 6)
+        if role_pack or generic:
+            blocks.append(role_pack or generic)
+        recent = _contextnest_recent_sessions_md(kickoff, 4)
+        if recent:
+            blocks.append(recent)
+        try:
+            from mini_ork.ported.active_state_index import render_active_state_block
+            active = render_active_state_block(task_class, 30, db_path=db)
+        except Exception:
+            active = ""
+        if active:
+            blocks.append(active)
+
+        if not dry_run:
+            brief_path = ""
+            try:
+                with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False,
+                                                 prefix="mini-ork-brief-", suffix=".json") as fh:
+                    json.dump({"task_class": task_class,
+                               "kickoff": Path(kickoff).read_text(encoding="utf-8")[:20000]}, fh)
+                    brief_path = fh.name
+                pack = context_assembler.context_assemble(brief_path, "planner", db=db)
+                pack_path = os.path.join(os.path.dirname(out_file), "context-pack.json")
+                os.makedirs(os.path.dirname(pack_path), exist_ok=True)
+                with open(pack_path, "w", encoding="utf-8") as fh:
+                    json.dump(pack, fh, indent=2)
+                    fh.write("\n")
+            except Exception:
+                try:
+                    os.remove(os.path.join(os.path.dirname(out_file), "context-pack.json"))
+                except OSError:
+                    pass
+            finally:
+                if brief_path:
+                    try:
+                        os.remove(brief_path)
+                    except OSError:
+                        pass
+    except Exception:
+        return prompt
+    for block in blocks:
+        prompt += "\n\n" + block.rstrip("\n") + "\n"
+    return prompt
 
 
 def main(argv=None, *, root=None, dispatch=None) -> int:
@@ -466,11 +731,23 @@ def main(argv=None, *, root=None, dispatch=None) -> int:
         run_dir = os.path.join(home, "runs", run_id)
         os.makedirs(run_dir, exist_ok=True)
         out_file = os.path.join(run_dir, "plan.json")
+    run_dir = os.path.dirname(out_file)
+    trace_id = "" if dry_run else f"tr-plan-{int(time.time())}-{os.getpid()}"
+    _trace_plan(trace_id, task_class, "running", db)
+    dispatch_fn = dispatch
 
     profile_path = os.environ.get("MINI_ORK_PROFILE_PATH", "")
     profile_status, confidence, human_questions = "", 1.0, []
     if profile_path and os.path.isfile(profile_path):
         profile_status, confidence, human_questions = _read_profile_meta(profile_path)
+        if profile_status == "needs_answers" and not human_questions:
+            if _normalize_profile(profile_path) == "ready":
+                profile_status, confidence, human_questions = _read_profile_meta(profile_path)
+                sys.stderr.write("  [ok] profile flagged needs_answers with 0 questions — "
+                                 "nothing to answer; treating as ready\n")
+
+    prompt = _build_prompt(root, kickoff, workflow, profile_path)
+    prompt = _inject_context(prompt, kickoff, task_class, db, out_file, dry_run)
 
     # ── dry-run ──
     if dry_run:
@@ -496,9 +773,42 @@ def main(argv=None, *, root=None, dispatch=None) -> int:
         print(f"task_class={task_class}")
         return 0
 
-    # ── profile gate ──
+    # ── profile question handling + gate ──
     profile_gate = os.environ.get("MINI_ORK_PROFILE_GATE", "1") == "1"
-    floor = float(os.environ.get("MINI_ORK_PLAN_CONFIDENCE_FLOOR", "0.7"))
+    try:
+        floor = float(os.environ.get("MINI_ORK_PLAN_CONFIDENCE_FLOOR", "0.7"))
+    except ValueError:
+        floor = 0.7
+    can_prompt = _can_prompt_profile()
+    if (profile_status == "needs_answers" and not can_prompt
+            and os.environ.get("MO_AUTO_ANSWER_PROFILE", "1") == "1"):
+        try:
+            answers_path = _auto_answer_profile(
+                kickoff, human_questions, profile_path, dispatch_fn
+            )
+        except Exception:
+            answers_path = ""
+        if answers_path:
+            profile_status, confidence, human_questions = _read_profile_meta(profile_path)
+            sys.stderr.write(f"  [ok] profile questions auto-answered ({answers_path}) — "
+                             "continuing planner dispatch\n")
+        else:
+            sys.stderr.write("  [skip] profile auto-answer failed — falling through to gate-block\n")
+    if profile_status == "needs_answers" and can_prompt:
+        sys.stderr.write(
+            "\n──────────────────────────────────────────────────────────────────────\n"
+            "  mini-ork planner needs your input before dispatching agents.\n"
+            f"  Profile confidence: {confidence} (floor: {floor})\n"
+            f"  Run: {run_id}\n"
+            "──────────────────────────────────────────────────────────────────────\n"
+        )
+        answers_path = _prompt_profile_questions(human_questions, profile_path)
+        if answers_path:
+            profile_status, confidence, human_questions = _read_profile_meta(profile_path)
+            sys.stderr.write(f"  [ok] answers captured ({answers_path}) — "
+                             "continuing planner dispatch\n\n")
+        else:
+            sys.stderr.write("  [skip] no answers provided — falling through to gate-block\n")
     if profile_gate and (profile_status == "needs_answers" or confidence < floor):
         os.makedirs(os.path.dirname(out_file), exist_ok=True)
         plan = {"plan_status": "needs_answers", "blocked_by": "run_profile",
@@ -515,6 +825,8 @@ def main(argv=None, *, root=None, dispatch=None) -> int:
         print(f"plan_path={out_file}")
         print(f"task_class={task_class}")
         print('{"plan_status":"needs_answers","blocked_by":"run_profile"}')
+        _trace_plan(trace_id, task_class, "blocked", db,
+                    reviewer_verdict="run_profile_needs_answers")
         return 0
 
     # ── get raw plan: MO_GIVEN_PLAN | force-recipe-fallback | LLM dispatch ──
@@ -528,27 +840,36 @@ def main(argv=None, *, root=None, dispatch=None) -> int:
         open(out_file, "w").write((fb or "") + "\n" if fb else "")
         print(f"plan_path={out_file}")
         print(f"task_class={task_class}")
+        _trace_plan(trace_id, task_class, "success", db,
+                    final_artifact_ref=out_file, reviewer_verdict="recipe_fallback")
         return 0
     if given:
         if not os.access(given, os.R_OK):
-            sys.stderr.write(f"MO_GIVEN_PLAN is set but not readable: {given}\n"); return 1
+            sys.stderr.write(f"MO_GIVEN_PLAN is set but not readable: {given}\n")
+            _trace_plan(trace_id, task_class, "failure", db,
+                        reason="given_plan_unreadable")
+            return 1
         raw = open(given).read()
         sys.stderr.write(f"plan: using given plan from MO_GIVEN_PLAN={given} (planner LLM skipped)\n")
     else:
-        prompt = _build_prompt(root, kickoff, workflow, profile_path)
-        if dispatch is None:
-            sys.stderr.write("LLM dispatch unavailable (no seam provided)\n"); return 1
-        rc, raw = dispatch(task_class, "planner", prompt)
+        if dispatch_fn is None:
+            sys.stderr.write("LLM dispatch unavailable (no seam provided)\n")
+            _trace_plan(trace_id, task_class, "failure", db)
+            return 1
+        rc, raw = dispatch_fn(task_class, "planner", prompt)
         if rc != 0:
             sys.stderr.write("LLM dispatch failed for planner node\n")
             _charge_cost(db, run_id)
+            _trace_plan(trace_id, task_class, "failure", db)
             return 1
 
     plan_json = extract_plan_json(raw)
-    _charge_cost(db, run_id)
+    if not given:
+        _charge_cost(db, run_id)
     verdict = validate_plan(plan_json)
 
     if not given and verdict in _RECOVERABLE_VERDICTS:
+        assert dispatch_fn is not None
         first_verdict = verdict
         _preserve_raw(home, run_id, first_verdict, raw, plan_json)
         if os.environ.get("MO_PLAN_DETERMINISTIC_FALLBACK", "0") == "1":
@@ -565,12 +886,15 @@ def main(argv=None, *, root=None, dispatch=None) -> int:
                 sys.stderr.write(f"PLAN REPAIR: retrying planner output repair ({attempt}/{max_repairs}) after {verdict}.\n")
                 truncated = _detect_truncation(raw)
                 repair_prompt = _build_repair_prompt(root, kickoff, workflow, profile_path,
-                                                     raw, verdict, truncated)
-                rc, repaired = dispatch(task_class, "planner", repair_prompt)
+                                                     raw, verdict, truncated,
+                                                     original_prompt=prompt)
+                rc, repaired = dispatch_fn(task_class, "planner", repair_prompt)
                 _charge_cost(db, run_id)
                 if rc != 0:
                     sys.stderr.write("LLM dispatch failed for planner repair\n")
                     _mark_failed(db, run_id, first_verdict)
+                    _trace_plan(trace_id, task_class, "failure", db,
+                                reviewer_verdict=first_verdict)
                     return 1
                 raw = repaired
                 plan_json = extract_plan_json(raw)
@@ -583,19 +907,29 @@ def main(argv=None, *, root=None, dispatch=None) -> int:
 
     if verdict == "missing_verifier_contract":
         sys.stderr.write("PLAN REJECTED: verifier_contract.checks is missing or empty.\n")
-        _mark_failed(db, run_id, verdict); return 1
+        _mark_failed(db, run_id, verdict)
+        _trace_plan(trace_id, task_class, "failure", db, reviewer_verdict=verdict)
+        return 1
     if verdict == "placeholder_plan":
         sys.stderr.write("PLAN REJECTED: planner emitted a template plan with placeholder values.\n")
-        _preserve_raw(home, run_id, verdict, raw, plan_json); _mark_failed(db, run_id, verdict); return 1
+        _preserve_raw(home, run_id, verdict, raw, plan_json); _mark_failed(db, run_id, verdict)
+        _trace_plan(trace_id, task_class, "failure", db, reviewer_verdict=verdict)
+        return 1
     if verdict == "bad_artifact_contract":
         sys.stderr.write("PLAN REJECTED: artifact_contract must be an object.\n")
-        _mark_failed(db, run_id, verdict); return 1
+        _mark_failed(db, run_id, verdict)
+        _trace_plan(trace_id, task_class, "failure", db, reviewer_verdict=verdict)
+        return 1
     if verdict == "bad_node_types":
         sys.stderr.write("PLAN REJECTED: one or more decomposition[].node_type values are empty or invalid (D-008b).\n")
-        _mark_failed(db, run_id, verdict); return 1
+        _mark_failed(db, run_id, verdict)
+        _trace_plan(trace_id, task_class, "failure", db, reviewer_verdict=verdict)
+        return 1
     if verdict == "parse_error":
         sys.stderr.write("PLAN REJECTED: planner emitted non-JSON output.\n")
-        _mark_failed(db, run_id, verdict); return 1
+        _mark_failed(db, run_id, verdict)
+        _trace_plan(trace_id, task_class, "failure", db, reviewer_verdict=verdict)
+        return 1
 
     plan_json = overlay_plan(plan_json, task_class, profile_path, root)
     os.makedirs(os.path.dirname(out_file), exist_ok=True)
@@ -605,6 +939,7 @@ def main(argv=None, *, root=None, dispatch=None) -> int:
 
     plan_hash = hashlib.sha256((plan_json + "\n").encode()).hexdigest()[:16]
     _db_write(db, run_id, task_class, out_file, plan_hash)
+    _trace_plan(trace_id, task_class, "success", db, final_artifact_ref=out_file)
     return 0
 
 
@@ -627,19 +962,27 @@ def _build_prompt(root, kickoff, workflow, profile_path) -> str:
 
 
 def _default_llm_dispatch(root):
-    """Default planner LLM seam for the CLI entry — shells to llm_dispatch, mirroring
-    bash bin/mini-ork-plan:656 (RESULT=$(llm_dispatch --node-type planner …)). Without
-    this, a python-runtime `mini-ork run` hard-fails at plan ('LLM dispatch unavailable')
-    because __main__ passed no dispatch. The seam stays injectable for tests (which pass
-    dispatch= explicitly or use MO_GIVEN_PLAN); only the CLI boundary wires this default."""
-    lib = os.path.join(root, "lib", "llm-dispatch.sh")
+    """Return the native dispatch seam with the former merged-stream contract.
+
+    The dispatcher emits the provider reply on stdout and diagnostics on stderr.
+    Redirecting both to one buffer preserves shell ``2>&1`` ordering and prevents
+    dispatcher output from leaking into the planner's public stdout.
+    """
+    from mini_ork.ported import llm_dispatch as native_dispatch
 
     def d(task_class, node_type, prompt):
-        r = subprocess.run(
-            ["bash", "-c", f'source "{lib}"; llm_dispatch --task-class "$1" '
-             '--node-type "$2" --prompt-text "$3" 2>&1', "_", task_class, node_type, prompt],
-            capture_output=True, text=True)
-        return r.returncode, r.stdout
+        combined = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(combined), contextlib.redirect_stderr(combined):
+                rc = native_dispatch.llm_dispatch(
+                    ["--task-class", task_class, "--node-type", node_type,
+                     "--prompt-text", prompt],
+                    root=root,
+                )
+        except Exception as exc:
+            combined.write(f"llm_dispatch: {exc}\n")
+            rc = 1
+        return rc, combined.getvalue()
     return d
 
 

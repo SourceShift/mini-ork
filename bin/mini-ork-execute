@@ -1183,7 +1183,7 @@ declare -f mo_otel_root_begin >/dev/null 2>&1 && mo_otel_root_begin "$MINI_ORK_T
 # _trace_write_node_rich below — populates execution_traces.tool_calls /
 # files_read (previously hardcoded []). Opt-out via MO_TRACE_RICH=0.
 export MO_TRACE_RICH="${MO_TRACE_RICH:-1}"
-# task_class resolution order: plan.json (stamped by mini-ork-plan) →
+# task_class resolution order: plan.json (stamped by the Python planner) →
 # MINI_ORK_TASK_CLASS env (set by the run lifecycle) → generic. Older
 # plans lack the stamp, so the env fallback matters: without it the
 # learned-failure-mode injection queries the wrong class and finds nothing.
@@ -1200,7 +1200,7 @@ TASK_CLASS="${TASK_CLASS:-${MINI_ORK_TASK_CLASS:-generic}}"
 # run-1781095892-69202: plan_status=needs_answers + empty decomposition, yet
 # the workflow DAG dispatched anyway — a 34s codex implementer call burned to
 # re-discover what plan.json already said. The plan-side gate
-# (bin/mini-ork-plan MINI_ORK_PROFILE_GATE) stops interactive flows; this is
+# (mini_ork.ported.mini_ork_plan MINI_ORK_PROFILE_GATE) stops interactive flows; this is
 # the execute-side defense for callers that chain plan→execute unconditionally.
 # Opt out via MINI_ORK_EXECUTE_GATE=0 (mirrors the plan-side env contract).
 if [ "${MINI_ORK_EXECUTE_GATE:-1}" = "1" ] && [ "$DRY_RUN" -eq 0 ]; then
@@ -1210,7 +1210,7 @@ with open(sys.argv[1]) as f:
     p = json.load(f)
 status = p.get("plan_status") or ""
 _questions = p.get("human_questions") or []
-# Defense-in-depth (mirrors bin/mini-ork-plan's normalization): a needs_answers
+# Defense-in-depth (mirrors the Python planner's normalization): a needs_answers
 # plan with ZERO questions is a contradiction — there is nothing to answer, so
 # do NOT block. Only block when there are real unanswered questions.
 if status == "needs_answers" and _questions:
@@ -2483,8 +2483,8 @@ _dispatch_node() {
 
   case "$node_type" in
     planner)
-      # Already handled by mini-ork-plan — log and skip
-      echo "  [skip] planner node handled by mini-ork-plan"
+      # Already handled by the Python plan runtime — log and skip
+      echo "  [skip] planner node handled by the Python plan runtime"
       ;;
 
     researcher)

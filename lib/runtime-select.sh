@@ -40,7 +40,7 @@ mo_runtime_maybe_delegate() {
   if [ "$_base" = "mini-ork" ]; then
     _module="mini_ork_cli"
   else
-    # mini-ork-plan → mini_ork_plan, mini-ork-self-improve → mini_ork_self_improve
+    # mini-ork-execute → mini_ork_execute, mini-ork-self-improve → mini_ork_self_improve
     _module="$(printf '%s' "$_base" | tr '-' '_')"
   fi
   local _root="${MINI_ORK_ROOT:-}"

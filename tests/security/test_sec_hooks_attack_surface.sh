@@ -25,7 +25,7 @@
 #     classify/plan/execute runs.
 #
 # EXPECTED BEHAVIOUR (hardened):
-#   - mini-ork-classify and mini-ork-plan do NOT auto-execute scripts from hooks/.
+#   - classify and plan Python modules do NOT auto-execute scripts from hooks/.
 #   - The framework does NOT source or exec files under hooks/ during classify/plan.
 #   - A malicious hooks/evil.sh canary script is NOT invoked.
 #
@@ -73,7 +73,9 @@ fi
 classify_module="$MINI_ORK_ROOT/mini_ork/ported/mini_ork_classify.py"
 classify_cmd=(env "PYTHONPATH=$MINI_ORK_ROOT${PYTHONPATH:+:$PYTHONPATH}" \
   python3 -m mini_ork.ported.mini_ork_classify)
-plan_bin="$MINI_ORK_ROOT/bin/mini-ork-plan"
+plan_module="$MINI_ORK_ROOT/mini_ork/ported/mini_ork_plan.py"
+plan_cmd=(env "PYTHONPATH=$MINI_ORK_ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+  python3 -m mini_ork.ported.mini_ork_plan)
 
 [[ ! -f "$classify_module" ]] && {
   _skip "Python classify module unavailable"
@@ -131,11 +133,11 @@ echo ""
 
 # ── Test 2: plan does not auto-execute hooks ───────────────────────────────────
 rm -f "$HOOK_CANARY"
-if [[ -x "$plan_bin" ]]; then
+if [[ -f "$plan_module" ]]; then
   echo "--- 2. plan does not auto-execute scripts in hooks/ ---"
 
   PLAN_EXIT=0
-  MINI_ORK_DRY_RUN=1 bash "$plan_bin" "$VALID_KICKOFF" --dry-run >/dev/null 2>&1 \
+  MINI_ORK_DRY_RUN=1 "${plan_cmd[@]}" "$VALID_KICKOFF" --dry-run >/dev/null 2>&1 \
     || PLAN_EXIT=$?
 
   if [[ -f "$HOOK_CANARY" ]]; then
@@ -144,7 +146,7 @@ if [[ -x "$plan_bin" ]]; then
     _ok "No hook canary created during plan"
   fi
 else
-  _skip "mini-ork-plan not executable — plan hook test skipped"
+  _skip "Python plan module unavailable — plan hook test skipped"
 fi
 echo ""
 
