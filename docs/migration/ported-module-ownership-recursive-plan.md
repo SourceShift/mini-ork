@@ -1,8 +1,12 @@
 # Ported-module ownership — recursive migration plan
 
-_Status: ready for a report-only inventory run. No source file may be changed
-until the inventory and first module contract are accepted by the deterministic
-gates below._
+_Status: Phase 0 inventory passed on 2026-07-20 at baseline `c7ccc512` with
+126/126 modules, zero deletion authorizations, Kimi history synthesis, GLM 5.2
+review, and 38/38 deterministic checks. The similarity seed unit is complete:
+pure ranking now lives at `mini_ork/similarity.py`, the context assembler uses
+its raw-score API, 30 focused tests and Pyright pass, and the GLM 5.2
+implementation review requires no repairs. Refresh Phase 0 after promotion
+before selecting the next unit._
 
 ## Goal
 
@@ -247,6 +251,21 @@ Expected implementation shape:
 
 This unit must not delete similarity behavior. Its purpose is to make the
 ported implementation the canonical runtime owner.
+
+### Similarity closure — 2026-07-20
+
+- `mini_ork/ported/similarity.py` moved to `mini_ork/similarity.py` without a
+  compatibility shim.
+- `mini_ork/context_assembler.py` imports `rank_raw`; the duplicated
+  tokenization, term-frequency, cosine, and ranking implementation is removed.
+- Database access, the three source tables, the 2,000-row cap, inclusive
+  `0.15` threshold, top-three-per-source selection, citations, suggested fixes,
+  four-decimal output, and missing-table best-effort behavior remain in the
+  context-assembler layer.
+- Raw scores determine ordering before reported values are rounded.
+- Focused verification: 30 pytest cases passed; focused Pyright reported zero
+  errors; mini-ork validate and garden completed with zero errors; GLM 5.2
+  review passed without required repairs.
 
 ## Queue order after similarity
 
