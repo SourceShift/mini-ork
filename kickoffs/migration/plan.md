@@ -1,6 +1,12 @@
 # Close the `plan` integration fork
 
-Status: prepared on 2026-07-20; paid self-migrate execution not started.
+Status: completed on 2026-07-20; merged to `main` after two completion audits.
+
+Run `run-1784532524-76798` produced a partial proposal and correctly retained
+the Bash entrypoint after finding four unmapped contracts. The completion audit
+ported those profile, context, context-pack, and trace contracts natively,
+passed the five migration gates, and retired `bin/mini-ork-plan` without a paid
+retry. See `docs/migration/remaining-migration-handoff.md` for the evidence.
 
 ## Goal
 
