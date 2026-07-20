@@ -379,11 +379,14 @@ reviewer evidence assembly, and verdict preservation.
 
 ### Next safe action
 
-The next fork is `plan`. Prepare its canonical kickoff and isolated target from
-the focused classify-closure commit, then run the same five-verifier pipeline
-using only Kimi, Codex, and GLM with credentials loaded process-locally from
-`/Users/admin/ps/scripts`. Do not start that paid run without separate explicit
-approval.
+The canonical `kickoffs/migration/plan.md` and clean isolated target
+`/private/tmp/mini-ork-self-migrate-plan` are prepared at the focused
+classify-closure commit `928db915`. Its no-cost baseline passes 9 unit tests,
+17 integration assertions, and plan feature acceptance. Focused Pyright has
+three documented baseline errors that the plan migration must close. The next
+action is the paid self-migrate launch using only Kimi, Codex, and GLM with
+credentials loaded process-locally from `/Users/admin/ps/scripts`. Do not start
+it without separate explicit approval.
 
 ## Live classify evidence — 2026-07-20
 
