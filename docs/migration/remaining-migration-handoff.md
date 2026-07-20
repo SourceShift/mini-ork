@@ -10,6 +10,16 @@ The execution kickoff is
 `kickoffs/migration/ported-module-ownership.md`; its first unit is the duplicated
 similarity implementation in the context assembler.
 
+The Phase 0 inventory completed on 2026-07-20 at `c7ccc512`: all 126 ported
+modules were covered, no deletion was authorized, and the report-only verifier
+passed 38/38 checks after Kimi synthesis and GLM 5.2 review. The first bounded
+unit then moved pure ranking to `mini_ork/similarity.py` and rewired the context
+assembler to its raw-score API while preserving database access, the `0.15`
+threshold, top-three-per-source policy, lesson shape, raw ordering, and
+missing-table behavior. Its focused suite passed 30 tests, Pyright was clean,
+and GLM 5.2 required no repairs. Refresh the inventory from the promoted main
+before choosing the next ownership unit.
+
 ## Context
 
 The self-migrate recipe (PR #184, merged at commit 6bf438a) implements integration-point-first migration: close ONE fork (bash↔Python seam) at a time as a complete unit — make Python sole, repoint every inbound reference, retire bash entrypoint — gated on byte-parity, feature-acceptance, and static-feature ledger.

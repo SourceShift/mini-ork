@@ -1,30 +1,26 @@
-"""Pure-logic port of ``lib/similarity.sh``'s TF-IDF cosine ranker.
+"""Canonical deterministic TF-IDF cosine ranker.
 
-Faithful port of the deterministic core of ``lib/similarity.sh::similarity_query``.
-The bash function is a thin shell that opens sqlite3 and delegates all math
-to an embedded Python heredoc. This module lifts that math into a regular
-import, strips the sqlite3 I/O (the test layer owns I/O), and exposes a
-``rank(query, docs, limit)`` public entry point plus the underlying
-deterministic primitives (``tok``, ``tf``, ``cos``).
+The module owns pure tokenization, weighting, cosine, and ranking behavior.
+Callers own data access and product policy such as score thresholds, per-source
+limits, citations, and result shaping. ``rank_raw`` exposes unrounded scores so
+policy callers can filter and sort without losing precision; ``rank`` is the
+rounded compatibility API.
 
-``tests/unit/test_similarity_parity.py`` enforces exact parity (floats
-within ``1e-6``, strings exact, JSON byte-stable on score rendering) between
-this module's output and the live bash function over a corpus of
-representative inputs.
+``tests/unit/test_similarity_py.py`` pins the deterministic contract after the
+Bash predecessor was retired.
 
 Public API::
 
-    from mini_ork.ported.similarity import (
+    from mini_ork.similarity import (
         tok, tf, cos,                     # deterministic primitives
         allowed_table_col, ALLOWED,       # table/column whitelist
-        rank,                             # top-level ranking pipeline
+        rank_raw, rank,                   # raw and rounded ranking APIs
     )
 
     scored = rank("auth bug", ["auth fix in middleware", "unrelated doc"], limit=5)
     # -> [(0.83, 0)]              # (rounded score, original doc index)
 
-Score rendering matches bash's ``round(s, 4)`` via the ``round_ndigits=4``
-default — keep these values in lockstep.
+Score rendering uses ``round(s, 4)`` via the ``round_ndigits=4`` default.
 """
 
 from __future__ import annotations
@@ -58,8 +54,8 @@ def cos(a: dict[str, float], b: dict[str, float]) -> float:
     return dot / (na * nb) if na and nb else 0.0
 
 
-# Mirrors the ALLOWED table+text-column whitelist in lib/similarity.sh verbatim.
-# Extend here ONLY in lockstep with the bash file.
+# Supported table/text-column pairs retained for callers that validate context
+# retrieval sources before delegating pure ranking to this module.
 ALLOWED: dict[str, set[str]] = {
     "bug_reports":      {"title", "description", "suggested_fix"},
     "gradient_records": {"signal", "suggested_change", "target"},
@@ -73,18 +69,15 @@ def allowed_table_col(table: str, text_col: str) -> bool:
     return table in ALLOWED and text_col in ALLOWED[table]
 
 
-def rank(
+def rank_raw(
     query: str,
     docs: Iterable[str],
-    limit: int = 5,
-    round_ndigits: int = 4,
+    limit: int | None = None,
 ) -> list[tuple[float, int]]:
-    """Score ``docs`` against ``query`` by TF-IDF cosine, return top ``limit``.
+    """Return positive matches ordered by their unrounded cosine score.
 
-    Returns ``(score, doc_index)`` pairs sorted by score descending, only
-    entries with score > 0, truncated to ``limit``. Identical math to
-    ``similarity_query`` in ``lib/similarity.sh``; parity (including score
-    rounding) is verified by ``test_similarity_parity``.
+    Equal scores retain document order. Passing ``None`` keeps all positive
+    matches so a policy caller can apply its own threshold before truncating.
     """
     doc_list = list(docs)
     doc_toks = [tok(d) for d in doc_list]
@@ -103,6 +96,19 @@ def rank(
     for i, d in enumerate(doc_toks):
         s = cos(q_vec, vec(d))
         if s > 0:
-            scored.append((round(s, round_ndigits), i))
+            scored.append((s, i))
     scored.sort(key=lambda p: p[0], reverse=True)
-    return scored[:limit]
+    return scored if limit is None else scored[:limit]
+
+
+def rank(
+    query: str,
+    docs: Iterable[str],
+    limit: int = 5,
+    round_ndigits: int = 4,
+) -> list[tuple[float, int]]:
+    """Return rounded top matches while preserving raw-score ordering."""
+    return [
+        (round(score, round_ndigits), index)
+        for score, index in rank_raw(query, docs, limit=limit)
+    ]
