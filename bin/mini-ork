@@ -1,641 +1,73 @@
-#!/usr/bin/env bash
-# mini-ork — task operating system for agents (universal task loop runtime)
-# Classify → Plan → Execute → Verify → Reflect → Improve
-set -Eeuo pipefail
+#!/usr/bin/env python3
+"""Public mini-ork launcher for the native Python CLI dispatcher."""
 
-# readlink -f: install.sh symlinks this script into ~/.local/bin — without
-# resolving the link, ROOT would become ~/.local and every subcommand exec fails.
-# Source the single path-resolution contract before anything else.
-# This exports MINI_ORK_ENGINE_ROOT, MINI_ORK_PROJECT_HOME, MINI_ORK_TARGET_REPO
-# and legacy aliases MINI_ORK_ROOT / MINI_ORK_HOME.
-# shellcheck source=lib/paths.sh
-. "$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)/lib/paths.sh"
-# Runtime cutover (bash→Python): MINI_ORK_RUNTIME=python execs the ported module.
-{ [ -f "$MINI_ORK_ROOT/lib/runtime-select.sh" ] && . "$MINI_ORK_ROOT/lib/runtime-select.sh" && mo_runtime_maybe_delegate "${BASH_SOURCE[0]}" "$@"; } || true
+from __future__ import annotations
 
-
-sub="${1:-help}"; shift || true
-
-case "$sub" in
-  classify)
-    exec env PYTHONPATH="${MINI_ORK_ROOT}${PYTHONPATH:+:$PYTHONPATH}" \
-      python3 -m mini_ork.ported.mini_ork_classify "$@" ;;
-
-  # Universal loop subcommands
-  plan|execute|verify|reflect|improve|eval|promote|init|update|spawn|scheduler|epics|bugs|inject|review|apply|traceotter|validate|garden|recipe-eval)
-    exec "$MINI_ORK_ROOT/bin/mini-ork-$sub" "$@" ;;
-
-  # Phase C: trajectory metrics across DF cycles (v0.2-pt13)
-  metrics)
-    exec "$MINI_ORK_ROOT/bin/mini-ork-metrics" "$@" ;;
-
-  # Evolution + promotion: rollback a workflow or agent to its previous stable version
-  rollback)
-    exec "$MINI_ORK_ROOT/bin/mini-ork-rollback" "$@" ;;
-
-  # Epic E4: clear a cost-pause sentinel so the next dispatch step can proceed
-  resume)
-    exec "$MINI_ORK_ROOT/bin/mini-ork-resume" "$@" ;;
-
-  # Epic E2: dependency-closure recovery — reuse E1 checkpoints, rerun only
-  # the failed-node subtree. Distinct from `resume` (cost-pause); the two
-  # subcommands are NEVER conflated. The python planner is the load-bearing
-  # seam; bin/mini-ork-recover is a thin runtime-cutover wrapper.
-  recover)
-    exec "$MINI_ORK_ROOT/bin/mini-ork-recover" "$@" ;;
-
-  # Read-only observability UI (React SPA + FastAPI + SSE)
-  serve)
-    exec "$MINI_ORK_ROOT/bin/mini-ork-serve" "$@" ;;
-
-  # Convenience: run is a recipe-level entry
-  # Walks classify → plan → execute → verify. Each step's output (key=value
-  # lines on stdout) is parsed to thread state into the next step's env.
-  run)
-    _RUN_T0=$(date +%s)   # auto-reflect window start (see reflect step below)
-    recipe=""
-    kickoff=""
-    first=""
-
-    # ── pre-parse flags ─────────────────────────────────────────────────────
-    # Pull --deadline <seconds> out of "$@" before positional handling so the
-    # user-first probe-classify path doesn't accidentally treat it as the
-    # kickoff path. Forward-compatible: unknown flags pass through untouched
-    # so positional `mini-ork run <recipe> <kickoff>` callers stay green.
-    DEADLINE_SECS=""
-    _mo_args=()
-    while [ "$#" -gt 0 ]; do
-      case "$1" in
-        --deadline)
-          if [ "$#" -lt 2 ]; then
-            echo "--deadline requires <seconds>" >&2
-            exit 2
-          fi
-          case "$2" in
-            ''|*[!0-9]*)
-              echo "--deadline: seconds must be a positive integer (got '$2')" >&2
-              exit 2 ;;
-          esac
-          DEADLINE_SECS="$2"
-          shift 2 ;;
-        --deadline=*)
-          _v="${1#*=}"
-          case "$_v" in
-            ''|*[!0-9]*)
-              echo "--deadline: seconds must be a positive integer (got '$_v')" >&2
-              exit 2 ;;
-          esac
-          DEADLINE_SECS="$_v"
-          shift ;;
-        *) _mo_args+=("$1"); shift ;;
-      esac
-    done
-    if [ "${#_mo_args[@]}" -gt 0 ]; then
-      set -- "${_mo_args[@]}"
-    else
-      set --
-    fi
-    unset _mo_args _v
-
-    first="${1:?recipe name or kickoff.md path required}"; shift
-    if [ -f "$first" ]; then
-      # User-first path: `mini-ork run kickoff.md`.
-      # Probe classify in dry-run mode, resolve the matching recipe, then run
-      # the normal lifecycle with the recipe exported before the DB write.
-      kickoff="$first"
-      probe_out=$(MINI_ORK_DRY_RUN=1 \
-        PYTHONPATH="${MINI_ORK_ROOT}${PYTHONPATH:+:$PYTHONPATH}" \
-        python3 -m mini_ork.ported.mini_ork_classify "$kickoff") || exit $?
-      probed_class=$(printf '%s\n' "$probe_out" | grep -E '^task_class=' | head -1 | cut -d= -f2)
-      recipe=$(python3 - "$MINI_ORK_ROOT" "$probed_class" <<'PY'
-import os, sys, yaml
-root, task_class = sys.argv[1:3]
-recipes = os.path.join(root, "recipes")
-for name in sorted(os.listdir(recipes)):
-    tc = os.path.join(recipes, name, "task_class.yaml")
-    if not os.path.isfile(tc):
-        continue
-    try:
-        with open(tc) as f:
-            data = yaml.safe_load(f) or {}
-    except Exception:
-        continue
-    if (data.get("name") or "").strip() == task_class:
-        print(name)
-        raise SystemExit(0)
-fallback = task_class.replace("_", "-")
-if os.path.isdir(os.path.join(recipes, fallback)):
-    print(fallback)
-PY
-)
-      [ -n "$recipe" ] || { echo "could not resolve recipe for task_class=$probed_class" >&2; exit 2; }
-    else
-      # Explicit path: `mini-ork run <recipe> kickoff.md`.
-      recipe="$first"
-      kickoff="${1:?kickoff.md path required}"; shift || true
-      # Underscore→dash normalization — matches the user-first path's fallback
-      # (line ~65). Without this, `mini-ork run bdd_first_delivery <kickoff>`
-      # fails because recipes are dir-named with dashes (`bdd-first-delivery/`)
-      # while task_class names use underscores (`bdd_first_delivery`). 2026-06-15.
-      if [ ! -d "$MINI_ORK_ROOT/recipes/$recipe" ] && [ -d "$MINI_ORK_ROOT/recipes/${recipe//_/-}" ]; then
-        recipe="${recipe//_/-}"
-      fi
-    fi
-    [ -d "$MINI_ORK_ROOT/recipes/$recipe" ] || {
-      echo "no recipe: $recipe (ls $MINI_ORK_ROOT/recipes/)" >&2; exit 2
-    }
-    export MINI_ORK_RECIPE="$recipe"
-    export MINI_ORK_WORKFLOW="$MINI_ORK_ROOT/recipes/$recipe/workflow.yaml"
-    [ -f "$kickoff" ] || { echo "kickoff not found: $kickoff" >&2; exit 2; }
-    # Pre-allocate a shared run_id so every step writes to the same task_runs row.
-    export MINI_ORK_RUN_ID="${MINI_ORK_RUN_ID:-run-$(date +%s)-$$}"
-
-    # Derive the task_class from the recipe's task_class.yaml::name when
-    # present, falling back to the recipe directory name with hyphens
-    # converted to underscores. This makes the explicit recipe arg win
-    # over the classifier's keyword-count routing — fixes the
-    # 2026-06-04 bug where `mini-ork run code-fix <kickoff>` silently
-    # wrote task_class=generic when the kickoff had few code-fix
-    # keywords. See docs/fixes/20260604-dispatch-classifier-overrides-explicit-recipe.md.
-    recipe_tc_yaml="$MINI_ORK_ROOT/recipes/$recipe/task_class.yaml"
-    if [ -f "$recipe_tc_yaml" ] && command -v python3 >/dev/null 2>&1; then
-      derived_class=$(python3 -c "
-import sys, yaml
-try:
-    with open(sys.argv[1]) as f:
-        d = yaml.safe_load(f) or {}
-    print((d.get('name') or '').strip())
-except Exception:
-    pass
-" "$recipe_tc_yaml" 2>/dev/null)
-    fi
-    [ -z "${derived_class:-}" ] && derived_class="${recipe//-/_}"
-
-    # ── repo-integrity guard ─────────────────────────────────────────────────
-    # Standing check on every `mini-ork run` startup: detects a cross-repo
-    # `git reset --hard` clobber of the current branch ref and self-heals.
-    # Source is guarded so a missing/older mini-ork host still runs cleanly;
-    # `|| true` ensures a guard failure NEVER aborts the caller's run (we
-    # are healing, not gating). Defensive `|| true` is load-bearing.
-    [ -f "$MINI_ORK_ROOT/lib/repo_integrity_guard.sh" ] && source "$MINI_ORK_ROOT/lib/repo_integrity_guard.sh" && repo_integrity_check_and_heal || true
-
-    # ── classify ───────────────────────────────────────────────────────────────
-    classify_out=$(PYTHONPATH="${MINI_ORK_ROOT}${PYTHONPATH:+:$PYTHONPATH}" \
-      python3 -m mini_ork.ported.mini_ork_classify \
-      --task-class "$derived_class" "$kickoff") || exit $?
-    printf '%s\n' "$classify_out"
-    MINI_ORK_TASK_CLASS=$(printf '%s\n' "$classify_out" | grep -E '^task_class=' | head -1 | cut -d= -f2)
-    export MINI_ORK_TASK_CLASS
-
-    # ── profile ───────────────────────────────────────────────────────────────
-    # Build the run profile before planning so the planner sees operational
-    # context that is easy to inspect and easy for callers to answer later.
-    # PROJECT_HOME was resolved by lib/paths.sh; runs live under it.
-    RUN_DIR="$MINI_ORK_HOME/runs/$MINI_ORK_RUN_ID"
-    mkdir -p "$RUN_DIR"
-    # T1.0 per-run config isolation: freeze the effective lane policy into the
-    # run-dir at launch so a concurrent edit to the global agents.yaml (another
-    # run, or an operator) can't perturb this run's routing mid-flight.
-    # shellcheck source=lib/config_resolve.sh
-    source "$MINI_ORK_ROOT/lib/config_resolve.sh" 2>/dev/null \
-      && mo_snapshot_run_config "$RUN_DIR" || true
-    MINI_ORK_PROFILE_PATH="$RUN_DIR/run_profile.json"
-    export MINI_ORK_PROFILE_PATH
-
-    # ── deadline arming ────────────────────────────────────────────────────
-    # Source the deadline helper and arm the budget when --deadline was
-    # passed. Must run after RUN_DIR exists so the sidecar lives next to
-    # other run artifacts. --deadline 0 / unset = no budget (open).
-    # shellcheck source=lib/deadline_budget.sh
-    source "$MINI_ORK_ROOT/lib/deadline_budget.sh" 2>/dev/null || {
-      echo "failed to source lib/deadline_budget.sh" >&2
-      exit 2
-    }
-    if [ -n "$DEADLINE_SECS" ] && [ "$DEADLINE_SECS" -gt 0 ] 2>/dev/null; then
-      mo_deadline_init "$MINI_ORK_RUN_ID" "$DEADLINE_SECS" "$RUN_DIR" || {
-        echo "deadline init failed" >&2
-        exit 2
-      }
-    fi
-
-    # ── deadline gate (between classify and profile) ────────────────────────
-    # Soft-stop model: check is between stages, never mid-stage. A long
-    # stage can overshoot; that's recorded in the deadline_hit payload.
-    # MUST run after deadline_budget.sh is sourced + armed above, otherwise
-    # mo_deadline_check is undefined and the gate misfires on every run.
-    if [ -n "$DEADLINE_SECS" ] && ! mo_deadline_check "$MINI_ORK_RUN_ID"; then
-      echo "deadline_hit after classify; no best-so-far artifact yet; exiting cleanly" >&2
-      exit 0
-    fi
-
-    profile_out=$(python3 - "$kickoff" "$MINI_ORK_ROOT" "$recipe" "$MINI_ORK_TASK_CLASS" "$MINI_ORK_PROFILE_PATH" "${MINI_ORK_HOME}/config/agents.yaml" <<'PY'
-import json
-import re
+import os
 import sys
 from pathlib import Path
 
-kickoff_path, root, recipe, task_class, profile_path, agents_path = sys.argv[1:7]
-root = Path(root)
-kickoff = Path(kickoff_path)
-profile = Path(profile_path)
-text = kickoff.read_text(encoding="utf-8", errors="replace")
+# Keep a regex-readable version literal for lib/migrate.sh's installed-version
+# discovery contract: mini-ork 0.6.0.
 
 
-def section_lines(names):
-    wanted = {n.lower() for n in names}
-    current = None
-    lines = []
-    for raw in text.splitlines():
-        m = re.match(r"^\s*#{2,6}\s+(.+?)\s*$", raw)
-        if m:
-            title = m.group(1).strip().lower()
-            current = title if any(w in title for w in wanted) else None
+def _absolute(path: str | Path) -> Path:
+    return Path(path).expanduser().resolve(strict=False)
+
+
+def _resolve_engine_root() -> Path:
+    for variable in ("MINI_ORK_ENGINE_ROOT", "MINI_ORK_ROOT"):
+        if value := os.environ.get(variable):
+            return _absolute(value)
+
+    pointer_candidates: list[Path] = []
+    if home := os.environ.get("MINI_ORK_HOME"):
+        pointer_candidates.append(Path(home) / "engine")
+    pointer_candidates.append(Path.cwd() / ".mini-ork" / "engine")
+    for pointer in pointer_candidates:
+        if not pointer.is_file():
             continue
-        if current:
-            lines.append(raw.rstrip())
-    return [line for line in lines if line.strip()]
+        lines = pointer.read_text(encoding="utf-8").splitlines()
+        target = lines[0].strip() if lines else ""
+        if not target:
+            raise ValueError(f"mini-ork: empty engine pointer: {pointer}")
+        candidate = Path(target)
+        if not candidate.is_absolute():
+            candidate = pointer.parent / candidate
+        return _absolute(candidate)
+
+    return Path(__file__).resolve().parents[1]
 
 
-def bullets(lines):
-    items = []
-    for line in lines:
-        stripped = re.sub(r"^\s*[-*]\s*", "", line).strip()
-        if stripped:
-            items.append(stripped)
-    return items
+def _configure_paths() -> Path:
+    engine_root = _resolve_engine_root()
+    project_home = _absolute(
+        os.environ.get("MINI_ORK_PROJECT_HOME")
+        or os.environ.get("MINI_ORK_HOME")
+        or Path.cwd() / ".mini-ork"
+    )
+    target_repo = _absolute(os.environ.get("MINI_ORK_TARGET_REPO") or Path.cwd())
+    os.environ.update(
+        {
+            "MINI_ORK_ENGINE_ROOT": str(engine_root),
+            "MINI_ORK_PROJECT_HOME": str(project_home),
+            "MINI_ORK_TARGET_REPO": str(target_repo),
+            "MINI_ORK_ROOT": str(engine_root),
+            "MINI_ORK_HOME": str(project_home),
+        }
+    )
+    return engine_root
 
 
-def first_heading():
-    for line in text.splitlines():
-        m = re.match(r"^\s*#\s+(.+?)\s*$", line)
-        if m:
-            return m.group(1).strip()
-    return kickoff.stem.replace("-", " ").replace("_", " ")
+try:
+    ENGINE_ROOT = _configure_paths()
+except (OSError, ValueError) as exc:
+    print(exc, file=sys.stderr)
+    raise SystemExit(2) from exc
+sys.path.insert(0, str(ENGINE_ROOT))
+
+from mini_ork.ported.mini_ork_cli import main  # noqa: E402
 
 
-def load_yaml(path):
-    try:
-        import yaml
-        with open(path, encoding="utf-8") as f:
-            return yaml.safe_load(f) or {}
-    except Exception:
-        return {}
-
-
-def command_hints():
-    patterns = [
-        r"\bpnpm\s+(?:test|run\s+test|type-check)\b[^\n`]*",
-        r"\bnpm\s+(?:test|run\s+test)\b[^\n`]*",
-        r"\bpytest\b[^\n`]*",
-        r"\bcargo\s+test\b[^\n`]*",
-        r"\bgo\s+test\b[^\n`]*",
-        r"\bbash\s+tests/[^\n`]+",
-        r"\bmake\s+(?:test|check|verify|smoke|probe|coverage|lint|ci)[A-Za-z0-9_.:-]*(?:\s+&&\s+make\s+[A-Za-z0-9_.:-]+)*[^\n`]*",
-        # Recipe-shipped verifiers (recipes/<name>/verifiers/*.sh) — bash
-        # invocations of these count as the "verification command" for
-        # meta-recipes whose proof of success IS their own verifier suite.
-        # Closes the recipe_authoring needs_answers gate when the kickoff
-        # names its own validator.
-        r"\bbash\s+recipes/[^\s`]+\.sh\b[^\n`]*",
-        r"\bbash\s+verifiers/[^\s`]+\.sh\b[^\n`]*",
-        r"\b\./verifiers/[^\s`]+\.sh\b[^\n`]*",
-        r"\bbin/mini-ork(?:-[a-z]+)?\s+(?:verify|run|classify|plan)\b[^\n`]*",
-    ]
-    found = []
-    for pattern in patterns:
-        found.extend(m.group(0).strip().rstrip(".") for m in re.finditer(pattern, text, re.I))
-    return list(dict.fromkeys(found))
-
-
-success = bullets(section_lines(["success", "definition of done", "done when", "acceptance"]))
-scope_allow = bullets(section_lines(["scope allow", "in scope", "scope"]))
-scope_deny = bullets(section_lines(["scope deny", "out of scope", "forbidden"]))
-commands = command_hints()
-# 2026-06-13: kickoff bullets under "## Verification commands" / "## Verification
-# command" sections are taken verbatim as commands. command_hints() only matches
-# a fixed regex catalog (pnpm test, pytest, cargo test, etc.) and skips real-
-# world verifiers like `npx tsc --noEmit -p tsconfig.json` or `pnpm vitest run
-# <path>` — diagnosed during CWT-A dispatch where the kickoff had an explicit
-# `## Verification commands` section but the planner still raised
-# "What command should prove this run succeeded?" because none of the bullets
-# matched the regex catalog. Only accept lines starting with `-` or `*` so the
-# section's preamble prose doesn't become a "command". Strip outer backticks so
-# the bullet's `cmd` form yields `cmd`. Place after command_hints() so explicit
-# bullets win over heuristic regex matches.
-def _bullet_only(lines):
-    out = []
-    for line in lines:
-        m = re.match(r"^\s*[-*]\s+(.+?)\s*$", line)
-        if m:
-            out.append(m.group(1).strip())
-    return out
-_explicit_verify = _bullet_only(section_lines([
-    "verification command", "verification commands", "proof of success",
-]))
-for _c in _explicit_verify:
-    _c = _c.strip()
-    if _c.startswith("`") and _c.endswith("`") and len(_c) >= 2:
-        _c = _c[1:-1].strip()
-    if _c and _c not in commands:
-        commands.append(_c)
-
-task_yaml = load_yaml(root / "recipes" / recipe / "task_class.yaml")
-artifact_yaml = load_yaml(root / "recipes" / recipe / "artifact_contract.yaml")
-agents_yaml = load_yaml(agents_path)
-
-outputs = artifact_yaml.get("outputs") or []
-if isinstance(outputs, str):
-    outputs = [outputs]
-
-lanes = {}
-if isinstance(agents_yaml.get("lanes"), dict):
-    lanes = agents_yaml["lanes"]
-
-questions = []
-if not success:
-    questions.append("What exact success criteria should the verifier use?")
-if not scope_allow:
-    questions.append("Which files or directories are explicitly in scope?")
-if not commands:
-    questions.append("What command should prove this run succeeded?")
-if task_class == "db_migration":
-    questions = [
-        "Which database engine and version should this migration target?",
-        "Is downtime allowed, and what is the maximum acceptable window?",
-        "What exact rollback or backup restore path should the planner assume?",
-    ]
-elif task_class == "ui_audit" and len(questions) < 3:
-    questions.append("Which target user profile or viewport should the audit prioritize?")
-
-questions = questions[:3]
-confidence = 0.35
-confidence += 0.15 if success else 0
-confidence += 0.15 if scope_allow else 0
-confidence += 0.15 if commands else 0
-confidence += 0.10 if outputs else 0
-confidence += 0.10 if lanes else 0
-confidence = min(confidence, 0.95)
-
-high_risk = task_class in {"db_migration", "bdd_first_delivery"}
-status = "ready"
-if questions:
-    status = "blocked_profile" if high_risk else "needs_answers"
-
-data = {
-    "schema_version": "1.0",
-    "kickoff_path": str(kickoff.resolve()),
-    "target_repo": str(Path.cwd().resolve()),
-    "recipe": recipe,
-    "task_class": task_class,
-    "user_goal": first_heading(),
-    "success_criteria": success,
-    "scope_allow": scope_allow,
-    "scope_deny": scope_deny,
-    "risk_tolerance": "conservative" if high_risk else "standard",
-    "budget_cap_usd": task_yaml.get("budget_cap_usd"),
-    "provider_policy": {
-        "source": str(Path(agents_path).resolve()),
-        "lanes": lanes,
-        "env": {"MINI_ORK_PROVIDER_POLICY": str(Path(agents_path).resolve()) if lanes else ""},
-    },
-    "artifact_destination": outputs,
-    "verification_command": commands[:3],
-    "human_questions": questions,
-    "confidence": round(confidence, 2),
-    "profile_status": status,
-}
-
-profile.parent.mkdir(parents=True, exist_ok=True)
-profile.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-print(f"profile_path={profile}")
-print(f"profile_status={status}")
-print(f"profile_confidence={data['confidence']:.2f}")
-if questions:
-    print("profile_questions=" + json.dumps(questions, separators=(",", ":")))
-PY
-)
-    printf '%s\n' "$profile_out"
-    profile_status=$(printf '%s\n' "$profile_out" | grep -E '^profile_status=' | head -1 | cut -d= -f2)
-    if [ "${MINI_ORK_PROFILE_STRICT:-0}" = "1" ] && [ "$profile_status" = "blocked_profile" ]; then
-      echo "profile blocked: answer profile_questions before planning" >&2
-      exit 2
-    fi
-
-    # ── deadline gate (between profile and plan) ─────────────────────────────
-    if [ -n "$DEADLINE_SECS" ] && ! mo_deadline_check "$MINI_ORK_RUN_ID"; then
-      echo "deadline_hit after profile; no best-so-far artifact yet; exiting cleanly" >&2
-      exit 0
-    fi
-
-    # ── plan ───────────────────────────────────────────────────────────────────
-    plan_out=$(env PYTHONPATH="$MINI_ORK_ROOT${PYTHONPATH:+:$PYTHONPATH}" \
-      python3 -m mini_ork.ported.mini_ork_plan "$kickoff") || exit $?
-    printf '%s\n' "$plan_out"
-    MINI_ORK_PLAN_PATH=$(printf '%s\n' "$plan_out" | grep -E '^plan_path=' | head -1 | cut -d= -f2)
-    export MINI_ORK_PLAN_PATH
-
-    # ── deadline gate (between plan and execute) ─────────────────────────────
-    if [ -n "$DEADLINE_SECS" ] && ! mo_deadline_check "$MINI_ORK_RUN_ID"; then
-      echo "deadline_hit after plan; best-so-far artifact: ${MINI_ORK_PLAN_PATH:-<none>}" >&2
-      exit 0
-    fi
-
-    # ── execute (plan path passed via env, not positional) ─────────────────────
-    # Failures do NOT exit here: failed runs are the strongest learning
-    # signal, so verify + reflect must still fire. _run_rc carries the
-    # worst exit code to the final `exit` after reflect.
-    _run_rc=0
-    execute_out=$("$MINI_ORK_ROOT/bin/mini-ork-execute") || _run_rc=$?
-    printf '%s\n' "$execute_out"
-    MINI_ORK_ARTIFACT_PATH=$(printf '%s\n' "$execute_out" | grep -E '^artifact_path=' | head -1 | cut -d= -f2 || true)
-    export MINI_ORK_ARTIFACT_PATH
-
-    # ── deadline gate (between execute and rubric/verify) ────────────────────
-    # mo_deadline_check records MINI_ORK_ARTIFACT_PATH in the .deadline-hit
-    # sentinel payload so downstream tools can find the best-so-far output.
-    if [ -n "$DEADLINE_SECS" ] && ! mo_deadline_check "$MINI_ORK_RUN_ID"; then
-      echo "deadline_hit after execute; best-so-far artifact: ${MINI_ORK_ARTIFACT_PATH:-<none>}" >&2
-      exit "$_run_rc"
-    fi
-
-    # Persist execute output in the run dir (obs contract — asserted by
-    # tests/test_obs_surface.sh). Skip when the file already exists:
-    # mini-ork-self-improve streams the WHOLE lifecycle into the same
-    # $RUN_DIR/execute.log via redirect, and truncating it mid-stream
-    # from in here would corrupt that capture.
-    #
-    # Resolution order for _run_dir:
-    #   1. MINI_ORK_RUN_DIR if set (authoritative — what mini-ork-execute uses)
-    #   2. dirname of MINI_ORK_PLAN_PATH (back-compat for older callers)
-    # Then refuse to write if the resolved dir is empty or '.' — that's the
-    # silent-skip bug that left execute.log missing on path-confused dispatches.
-    _run_dir="${MINI_ORK_RUN_DIR:-}"
-    if [ -z "$_run_dir" ] && [ -n "${MINI_ORK_PLAN_PATH:-}" ]; then
-      _run_dir=$(dirname "$MINI_ORK_PLAN_PATH")
-    fi
-    if [ -n "$_run_dir" ] && [ "$_run_dir" != "." ] \
-       && [ -d "$_run_dir" ] && [ ! -f "$_run_dir/execute.log" ]; then
-      printf '%s\n' "$execute_out" > "$_run_dir/execute.log" 2>/dev/null || true
-    fi
-
-    # ── rubric pre-screen (advisory scoring) ──────────────────────────────────
-    # Scores the run's artifacts against the kickoff via an 8-item rubric
-    # (lib/rubric-prescreen.sh). Advisory — never changes _run_rc — but the
-    # outcome is written as an execution trace, so the reflect step below
-    # converts rubric FAIL items into gradients that future runs of this
-    # task_class get injected into their prompts. Also writes
-    # panel-verdict.json, making lib/promotion_gate.sh's panel-score gate
-    # evaluate real data instead of fail-opening. Opt-out: MO_RUBRIC=0.
-    if [ "${MO_RUBRIC:-1}" = "1" ] && [ -d "$_run_dir" ]; then
-      echo "── rubric (advisory pre-screen) ──"
-      # shellcheck source=lib/llm-dispatch.sh
-      source "$MINI_ORK_ROOT/lib/llm-dispatch.sh" 2>/dev/null || true
-      # shellcheck source=lib/trace_store.sh
-      source "$MINI_ORK_ROOT/lib/trace_store.sh" 2>/dev/null || true
-      # shellcheck source=lib/rubric-prescreen.sh
-      source "$MINI_ORK_ROOT/lib/rubric-prescreen.sh" 2>/dev/null || true
-      if declare -f mo_rubric_run_score >/dev/null 2>&1; then
-        mo_rubric_run_score "$kickoff" "$_run_dir" "${MINI_ORK_TASK_CLASS:-generic}" \
-          || echo "  [warn] rubric pre-screen failed (advisory — run unaffected)" >&2
-        # Close the eval loop (win #3): feed the rubric's GRADED 0-8 score into
-        # the learning reward so lane_router learns from run quality, not a
-        # flattened pass/fail. Best-effort — never affects the run outcome.
-        if declare -f mo_grade_run_reward >/dev/null 2>&1; then
-          mo_grade_run_reward "$_run_dir" "${MINI_ORK_RUN_ID:-${MINI_ORK_TASK_RUN_ID:-}}" \
-            || echo "  [warn] grade-run-reward failed (advisory)" >&2
-        fi
-      else
-        echo "  [warn] mo_rubric_run_score unavailable — skipping rubric" >&2
-      fi
-    fi
-
-    # ── verify ─────────────────────────────────────────────────────────────────
-    # MINI_ORK_RUN_DIR was set inside the mini-ork-execute subshell and never
-    # reached this process, so run-dir-relative verifiers (RUN_DIR defaults to
-    # '.') reported "lens-tiny.md missing at ./lens-tiny.md" against artifacts
-    # that exist — and evidence landed in the global runs/evidence/ instead of
-    # the run's own dir. Export the _run_dir already resolved above.
-    if [ -n "$_run_dir" ] && [ "$_run_dir" != "." ] && [ -d "$_run_dir" ]; then
-      export MINI_ORK_RUN_DIR="$_run_dir"
-    fi
-    _verify_rc=0
-    if [ -n "${MINI_ORK_ARTIFACT_PATH:-}" ]; then
-      env PYTHONPATH="$MINI_ORK_ROOT${PYTHONPATH:+:$PYTHONPATH}" \
-        python3 -m mini_ork.ported.mini_ork_verify "$MINI_ORK_ARTIFACT_PATH" || _verify_rc=$?
-    else
-      env PYTHONPATH="$MINI_ORK_ROOT${PYTHONPATH:+:$PYTHONPATH}" \
-        python3 -m mini_ork.ported.mini_ork_verify || _verify_rc=$?
-    fi
-    [ "$_run_rc" -eq 0 ] && _run_rc=$_verify_rc
-
-    # ── deadline gate (between verify and reflect) ──────────────────────────
-    if [ -n "$DEADLINE_SECS" ] && ! mo_deadline_check "$MINI_ORK_RUN_ID"; then
-      echo "deadline_hit after verify; best-so-far artifact: ${MINI_ORK_ARTIFACT_PATH:-<none>}" >&2
-      exit "$_run_rc"
-    fi
-
-    # ── reflect (learning extraction) ──────────────────────────────────────────
-    # Close the learning loop: extract gradients from THIS run's traces so the
-    # next run of the same task_class gets them injected into node prompts
-    # (context_failure_modes_md). Best-effort — a reflect failure must never
-    # fail an otherwise green run. Opt-out: MO_AUTO_REFLECT=0.
-    if [ "${MO_AUTO_REFLECT:-1}" = "1" ]; then
-      echo "── reflect (auto, since run start) ──"
-      MO_REFLECTION_BATCH="${MO_REFLECTION_BATCH:-25}" \
-        env PYTHONPATH="${MINI_ORK_ROOT}${PYTHONPATH:+:$PYTHONPATH}" \
-        python3 -m mini_ork.ported.mini_ork_reflect --since "$_RUN_T0" \
-        || echo "  [warn] auto-reflect failed (run itself unaffected)" >&2
-    fi
-    exit "$_run_rc"
-    ;;
-
-  doctor)
-    echo "=== mini-ork doctor ==="
-    for d in bash sqlite3 jq git yq curl claude python3; do
-      command -v "$d" >/dev/null && echo "  [OK]      $d" || echo "  [MISSING] $d"
-    done
-    [ -n "${MINI_ORK_HOME:-}" ] \
-      && echo "  [OK]      MINI_ORK_HOME=$MINI_ORK_HOME" \
-      || echo "  [WARN]    MINI_ORK_HOME unset (default: <project>/.mini-ork)"
-    [ -n "${MINI_ORK_DB:-}" ] \
-      && echo "  [OK]      MINI_ORK_DB=$MINI_ORK_DB" \
-      || echo "  [WARN]    MINI_ORK_DB unset (default: \$MINI_ORK_HOME/state.db)"
-    echo ""
-    echo "Lib presence:"
-    for lib in trace_store llm-dispatch gate_registry group_evolver \
-                reflection_pipeline benchmark_suite utility_function \
-                promotion_gate version_registry paths; do
-      if [ -f "$MINI_ORK_ROOT/lib/${lib}.sh" ]; then
-        echo "  [OK]      lib/${lib}.sh"
-      else
-        echo "  [MISSING] lib/${lib}.sh (P1 in flight?)"
-      fi
-    done
-    echo ""
-    echo "Provider preflight:"
-    _provider_ok() { echo "  [OK]      $1"; }
-    _provider_warn() { echo "  [WARN]    $1"; }
-    # Built-in family checks.
-    if command -v claude >/dev/null 2>&1; then
-      _provider_ok "anthropic (claude CLI present)"
-    else
-      _provider_warn "anthropic (claude CLI missing)"
-    fi
-    if command -v codex >/dev/null 2>&1; then
-      _provider_ok "codex (codex CLI present)"
-    else
-      _provider_warn "codex (codex CLI missing)"
-    fi
-    for _kv in "GLM_API_KEY:glm" "KIMI_API_KEY:kimi" "MINIMAX_API_KEY:minimax" "DEEPSEEK_API_KEY:deepseek"; do
-      _env_var="${_kv%%:*}"; _family="${_kv#*:}"
-      if [ -n "${!_env_var:-}" ]; then
-        _provider_ok "$_family (\$_env_var set)"
-      else
-        _provider_warn "$_family (\$_env_var unset)"
-      fi
-    done
-    ;;
-
-  version) echo "mini-ork 0.6.0 (universal task loop runtime)" ;;
-
-  help|--help|-h)
-    cat <<'EOF'
-mini-ork — task operating system for agents (v0.1)
-
-Universal loop subcommands:
-  classify <kickoff.md>          Route kickoff to a task_class
-  plan <kickoff.md>              Generate plan (decomposition + verifier contract)
-  execute [<plan.json>]          Dispatch to workflow nodes (planner/researcher/
-                                   implementer/reviewer/verifier/reflector/
-                                   publisher/rollback)
-  verify <artifact-path>         Run verifiers + gates for the artifact contract
-  reflect [--since <timestamp>]  Extract gradients + patterns from recent runs
-  improve                        Propose workflow candidates via group_evolver
-  eval --candidate <id>          Run benchmark suite against a workflow candidate
-  promote --candidate <id>       Promotion gate decision (promote|quarantine)
-  apply --task-class <name>      Close the apply loop: pick→materialize→score→gate→
-  --target <file>                write|quarantine (IMPL-3, opt-in via MO_APPLY_ENABLED=1)
-
-Recipe runner:
-  run <kickoff.md>               Classify kickoff, resolve recipe, then walk
-                                   classify → plan → execute → verify
-  run <recipe-name> <kickoff.md> Force a recipe, then walk the same lifecycle
-
-Lifecycle:
-  init                           Bootstrap project (creates .mini-ork/)
-  update                         Apply migrations + report config drift
-  doctor                         Check deps + env vars + lib presence + provider preflight
-  validate                       Pre-run static checks with Fix: hints
-  garden                         Drift detection (collisions, orphans, stale runs)
-  recipe-eval                    Static evaluation of recipe definitions
-  version
-
-Environment:
-  MINI_ORK_HOME   project home dir  (default: .mini-ork/)
-  MINI_ORK_DB     sqlite3 state db  (default: $MINI_ORK_HOME/state.db)
-  MINI_ORK_DRY_RUN  set to 1 for dry-run mode on all subcommands
-EOF
-    ;;
-
-  *) echo "Unknown subcommand: $sub. Try: mini-ork help" >&2; exit 2 ;;
-esac
+if __name__ == "__main__":
+    raise SystemExit(main(root=str(ENGINE_ROOT)))

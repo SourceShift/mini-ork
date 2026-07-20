@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # runtime-select.sh — bash→Python runtime cutover switch.
 #
-# The strangler-fig migration ports every bin/mini-ork-* entrypoint to
-# mini_ork/ported/mini_ork_<name>.py (bin/mini-ork → mini_ork_cli) behind live-bash
-# parity gates. This shim lets a single env flag flip the runtime:
+# The public bin/mini-ork launcher is Python-owned. This shim remains only for
+# suffixed bin/mini-ork-* entrypoints whose individual forks are still behind
+# live-Bash parity gates. It lets a single env flag flip those runtimes:
 #
 #   MINI_ORK_RUNTIME=python  (default) — exec the ported module (the live runtime).
 #   MINI_ORK_RUNTIME=bash              — run the legacy bash entrypoint (escape hatch).
@@ -37,12 +37,8 @@ mo_runtime_maybe_delegate() {
   local _self="${1:-}"; shift || true
   local _base _module
   _base="$(basename "$_self")"
-  if [ "$_base" = "mini-ork" ]; then
-    _module="mini_ork_cli"
-  else
-    # mini-ork-execute → mini_ork_execute, mini-ork-self-improve → mini_ork_self_improve
-    _module="$(printf '%s' "$_base" | tr '-' '_')"
-  fi
+  # mini-ork-execute → mini_ork_execute, mini-ork-self-improve → mini_ork_self_improve
+  _module="$(printf '%s' "$_base" | tr '-' '_')"
   local _root="${MINI_ORK_ROOT:-}"
   [ -n "$_root" ] && [ -f "$_root/mini_ork/ported/${_module}.py" ] || return 0
   exec env PYTHONPATH="${_root}${PYTHONPATH:+:$PYTHONPATH}" \

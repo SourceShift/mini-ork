@@ -27,7 +27,7 @@ _run() { # <label> <cmd...>  → prints PASS/FAIL, updates rc_all
   if "$@" >/dev/null 2>&1; then echo "PASS  $label"; else echo "FAIL  $label"; rc_all=1; fi
 }
 
-# ── entrypoint smoke: the command runs under the Python runtime AND matches bash ──
+# ── entrypoint smoke for still-suffixed command forks ──
 _probe_entrypoint() { # <cmd>
   local cmd="$1"
   local bin="$ROOT/bin/mini-ork-$cmd"
@@ -45,6 +45,20 @@ _probe_entrypoint() { # <cmd>
   _run "$cmd:module-imports" python3 -c "import importlib,sys; sys.path.insert(0,'$ROOT'); m=importlib.import_module('$module'); assert hasattr(m,'main')"
 }
 
+_probe_cli() {
+  local bin="$ROOT/bin/mini-ork"
+  local tmp
+  tmp="$(mktemp -d)"
+  printf '# Fix widget\n\n## Success\n- tests pass\n\n## Scope\n- widget.py\n\n## Verification commands\n- `pytest`\n' >"$tmp/kickoff.md"
+  _run "cli:help" "$bin" help
+  _run "cli:version" "$bin" version
+  _run "cli:unknown-exits-2" bash -c '"$1" unknown-for-acceptance >/dev/null 2>&1; [ "$?" -eq 2 ]' _ "$bin"
+  _run "cli:dry-run-lifecycle" env \
+    MINI_ORK_DRY_RUN=1 MINI_ORK_HOME="$tmp/home" MINI_ORK_RUN_ID="cli-acceptance-$$" \
+    MO_RUBRIC=0 "$bin" run code-fix "$tmp/kickoff.md"
+  rm -rf "$tmp"
+}
+
 # ── higher-order feature probes (delegate to existing gates where they exist) ──
 _probe_routing() {
   local s="$ROOT/scripts/learning-loop-live-validate.sh"
@@ -58,10 +72,12 @@ _probe_learning_loop() {
 }
 
 case "$TARGET" in
+  cli) _probe_cli ;;
   classify|plan|execute|verify|reflect) _probe_entrypoint "$TARGET" ;;
   routing)        _probe_routing ;;
   learning-loop)  _probe_learning_loop ;;
   all)
+    _probe_cli
     for c in classify plan execute verify reflect; do _probe_entrypoint "$c"; done
     _probe_routing
     _probe_learning_loop

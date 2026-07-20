@@ -91,6 +91,17 @@ if [ "$FORK" = "classify" ]; then
   done
 fi
 
+# CLI closure preserves an unsuffixed public launcher and its whole lifecycle
+# contract, so include the dispatcher integration suite in addition to the
+# focused standalone Python contract above.
+if [ "$FORK" = "cli" ]; then
+  if ( cd "$REPO_ROOT" && bash tests/integration/test_bin_dispatcher.sh ) >>"$EVIDENCE" 2>&1; then
+    echo "[integration] tests/integration/test_bin_dispatcher.sh PASS" >>"$EVIDENCE"
+  else
+    pass=false; reasons+=("CLI dispatcher integration suite failed")
+  fi
+fi
+
 # Plan retirement has several executable callers whose contracts are broader
 # than the focused unit module: module-level CLI behavior, given-plan bypass,
 # recipe dry-runs, hostile kickoff input, and the web provenance surface.
