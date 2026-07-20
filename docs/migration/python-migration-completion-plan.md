@@ -1,7 +1,8 @@
 # Python migration — completion plan (the honest remaining map)
 
-_Written 2026-07-18 after a full audit. Ports were built ~Jul 3–4; the remaining work is
-**un-shelling the engine**, not creating ports._
+_Written 2026-07-18 after a full audit and updated 2026-07-20 after the
+execute-fork closure. Ports were built ~Jul 3–4; the remaining work is
+**un-shelling the rest of the engine**, not creating ports._
 
 ## State
 
@@ -9,9 +10,14 @@ _Written 2026-07-18 after a full audit. Ports were built ~Jul 3–4; the remaini
 - **Done (PR #179):** 16 leaf libs retired, BYO providers (`config/providers.yaml` read by the
   Python core), and the **routing brain is native** — `learning_governed_lane` calls
   `decision_service.decide()` in-process (byte-parity verified, EPSILON=0).
-- **Not done:** the runtime-load-bearing core still **shells out to bash on every run.**
-  `mini_ork_execute.py`/`mini_ork_cli.py`/etc. do `bash -c 'source lib/X.sh; …'`. Until each
-  caller is rewired to the native port, the bash is the live implementation and cannot be deleted.
+- **Top-level migration cycle complete:** verify, reflect, classify, plan, CLI,
+  and execute are Python-owned. `mini_ork/ported/mini_ork_execute.py` is the
+  sole executor, the CLI routes to it in-process, and `bin/mini-ork-execute` is
+  retired. Provider, git, and executable verifier subprocesses remain
+  intentional external boundaries.
+- **Still not done globally:** other runtime modules and libraries retain Bash
+  seams and must be migrated fork-by-fork before the whole engine is pure
+  Python.
 
 `flip/runtime-default-python` is **stale** (last commit Jul-10, 43 behind main) — abandon it;
 build from main.
@@ -25,8 +31,8 @@ The port is already native; the engine just calls the bash instead. Rewire = rep
 | lib | port native? | engine shell-out site | note |
 |---|---|---|---|
 | `decision_service` | ✅ | execute.py | **DONE** (PR #179) |
-| `llm-dispatch` | ✅ (467L) | profile_answerer.py, cli.py — **17 sites** | LLM boundary; highest-stakes; verify each with a **real LLM call**, not dry-run |
-| `gate_bootstrap` | ✅ | execute.py | call is **compound** (also invokes `gate_registry`, a wrapper) — do after gate_registry |
+| `llm-dispatch` | ✅ (native on execute) | profile_answerer.py, cli.py and other callers | Execute is rewired; migrate remaining callers one at a time with real-provider evidence |
+| `gate_bootstrap` | ✅ | non-execute callers | Execute now uses native bootstrap/registry behavior; retire the Bash lib only after every other caller moves |
 | `gradient_extractor` | partial | reflection_pipeline.py | LLM-backed `gradient_extract` intentionally not ported (shells to claude) — needs porting that too |
 
 ### 2. Wrapper ports → native-ize first (real porting), then rewire
@@ -34,8 +40,8 @@ The "port" still shells to its own bash. Reimplement the shelled functions in Py
 
 | lib | shell-outs in port | lines |
 |---|---|---|
-| `gate_registry` | 12 | 450 |
-| `lane-helpers` | 10 | 332 |
+| `gate_registry` | execute seam closed; other callers remain | 450 |
+| `lane-helpers` | execute seam closed; other callers remain | 332 |
 | `config_resolve` | 1 | 94 |
 | `rho_aggregator` | 1 | 179 |
 
@@ -45,7 +51,7 @@ The "port" still shells to its own bash. Reimplement the shelled functions in Py
 | `context_assembler` | 786 |
 | `trace_store` | — |
 | `lane_router` | — |
-| `intervention_gate` | — |
+| `intervention_gate` | native execute extension point added; no shipped Bash hook existed |
 
 ### 4. Retirement blockers (even after the port is native)
 A lib can only be `git rm`'d when **all** of these are clear — check by basename across the tree:

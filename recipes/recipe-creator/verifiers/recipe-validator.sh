@@ -9,7 +9,7 @@
 #                   enum; every edge endpoint exists
 #
 # Inputs (via env):
-#   MINI_ORK_RUN_DIR   run directory (set by mini-ork-execute)
+#   MINI_ORK_RUN_DIR   run directory (set by the native execute runtime)
 #   MINI_ORK_ROOT      repo root (set by mini-ork wrappers)
 #
 # Output: single JSON object on stdout

@@ -81,7 +81,7 @@ Inside the existing `MO_INJECT_LEARNINGS` block, runs in order:
 
 Step 1 is gated by `MO_USE_ROLE_PACKS=1` (default on); set to `0` to skip role packs and use only the generic path.
 
-### Worker pre-fetch (`hooks/subagent-prefetch.sh` + `bin/mini-ork-execute`)
+### Worker pre-fetch (`hooks/subagent-prefetch.sh` + `mini_ork/ported/mini_ork_execute.py`)
 
 `UserPromptSubmit` hook for worker subagents (gated on `MINI_ORK_RUN_ID`). On the first turn (refresh cadence `CN_PREFETCH_REFRESH_SEC`, default 30 min) it fetches:
 - Semantic atoms for the prompt itself
@@ -90,7 +90,7 @@ Step 1 is gated by `MO_USE_ROLE_PACKS=1` (default on); set to `0` to skip role p
 
 …and writes them to `$MO_CN_PREFETCH_DIR/<session_id>.md`.
 
-`bin/mini-ork-execute` exports `MO_CN_PREFETCH_DIR=$RUN_DIR/cn_prefetch` so all dispatched workers inherit it. The 3 default code-fix prompts (`recipes/code-fix/prompts/{planner,implementer,reviewer}.md`) include an opening **Step 0 — ContextNest prefetch** section that instructs workers to `ls {{MO_CN_PREFETCH_DIR}}` and cat any `*.md` files before reading the main inputs.
+`mini_ork/ported/mini_ork_execute.py` exports `MO_CN_PREFETCH_DIR=$RUN_DIR/cn_prefetch` so all dispatched workers inherit it. The 3 default code-fix prompts (`recipes/code-fix/prompts/{planner,implementer,reviewer}.md`) include an opening **Step 0 — ContextNest prefetch** section that instructs workers to `ls {{MO_CN_PREFETCH_DIR}}` and cat any `*.md` files before reading the main inputs.
 
 ### Hook mirroring (`hooks/subagent-spawn.sh` + `hooks/subagent-stop.sh`)
 
@@ -172,7 +172,7 @@ real run artifacts plus a direct live-test of the planner role pack.
 ### Gaps (wired for delivery, not yet consumed)
 
 1. **Worker prefetch dir is delivered but only consumed by `code-fix`.**
-   `bin/mini-ork-execute` exports `MO_CN_PREFETCH_DIR` and
+   `mini_ork/ported/mini_ork_execute.py` exports `MO_CN_PREFETCH_DIR` and
    `hooks/subagent-prefetch.sh` writes the per-session prefetch file, but only
    **3 of 160** prompt templates reference `MO_CN_PREFETCH_DIR`
    (`recipes/code-fix/prompts/{planner,implementer,reviewer}.md`). Every other

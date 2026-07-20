@@ -29,7 +29,7 @@ Run `ls {{MO_CN_PREFETCH_DIR}}` — if any `*.md` files exist there, cat each on
 | `verifier_test.json` | test.sh output (same shape) |
 | `review-diff.patch` | Unified diff of the files listed in `implementer-summary.files_changed`, scoped to the implementer's worktree |
 
-> **Inputs are pre-assembled for you.** `bin/mini-ork-execute` writes these four
+> **Inputs are pre-assembled for you.** `mini_ork/ported/mini_ork_execute.py` writes these four
 > files into `$RUN_DIR` (under `implementer-summary.json`, `verifier_typecheck.json`,
 > `verifier_test.json`, `review-diff.patch`) and embeds their contents inline in
 > the prompt below as a "Reviewer inputs" block. Read THAT block — do not try

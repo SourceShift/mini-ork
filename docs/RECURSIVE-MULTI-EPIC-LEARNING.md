@@ -164,7 +164,7 @@ notices while doing its main work but does not have scope to fix.
 
 Two trigger styles:
 
-- **Per-agent (auto)**: `bin/mini-ork-execute` calls
+- **Per-agent (auto)**: `mini_ork/ported/mini_ork_execute.py` calls
   `bin/mini-ork-bug-collector` after every node's `_trace_write_node_rich`.
   The collector (heuristic mode by default) regex-scans the agent's
   output for `noticed ... but`, `out of scope but`, `should fix`,

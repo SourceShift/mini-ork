@@ -2,7 +2,7 @@
 # verifiers/deterministic-checks.sh - runtime artifact validation for researcher-qdrant-contract.
 #
 # Inputs (via env):
-#   MINI_ORK_RUN_DIR - run directory set by mini-ork-execute
+#   MINI_ORK_RUN_DIR - run directory set by the native execute runtime
 #
 # Output: JSON to stdout. Exit code is always 0; caller reads .pass.
 
