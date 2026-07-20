@@ -49,4 +49,3 @@ Implementation details:
 - Added regression coverage for symlink invocation, project-local engine
   pointers, canonical project-home output, and the Python-only launcher shape.
 - Updated the run-local ledger to describe the complete native path contract.
-
