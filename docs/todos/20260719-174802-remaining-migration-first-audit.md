@@ -52,15 +52,14 @@ Current status: completed and source-applied from the green isolated proposal pr
 
 ## Later forks
 
-Current status: `reflect` and `classify` are closed and source-applied from the
+Current status: `reflect`, `classify`, and `plan` are closed and source-applied from the
 passing isolated proposals in `run-1784503045-70610` and
-`run-1784528328-42404`. The `plan` kickoff and isolated target are prepared at
-`928db915`; `cli` and `execute` are not started, and the ordering is unchanged.
+`run-1784528328-42404`, plus the audited completion of partial plan run
+`run-1784532524-76798`. `cli` and `execute` are not started, and the ordering
+is unchanged.
 
-Remaining parts: the isolated `plan` target and canonical kickoff are prepared
-at `928db915`, with 9 unit tests, 17 integration assertions, and feature
-acceptance green. Focused Pyright has three documented baseline errors that are
-part of the plan closure contract. After explicit approval, run the same
+Remaining parts: prepare the isolated `cli` target and canonical kickoff from
+the pushed plan-closure commit. After explicit approval, run the same
 five-verifier pipeline with only Kimi, Codex, and GLM. Load Kimi/GLM credentials
 process-locally from `/Users/admin/ps/scripts`, apply only passing diffs, update
 migration documentation, and repeat the requirements audit after each closure.
@@ -99,6 +98,7 @@ Completed: 2026-07-19
 - Confirmed 15 verify/CLI unit tests, 8 integration assertions, 18 E2E assertions, Pyright, validate, shell syntax, diff hygiene, and garden (0 errors, 0 warnings) pass.
 - Ran the repository-wide suite directly because `make test` has no target: 1,805 passed, 5 skipped, and 3 source-checkout-state failures (one user-owned capability-policy mismatch and two reflect cases). The reflect failures reproduced in the dirty source checkout, were not changed, and do not reproduce in the clean isolated migration target, where all 8 tests pass.
 
-The verify, reflect, and classify forks and their artifact-handoff prerequisites
-are done locally. The later three forks remain pending in the required order and
-need explicit cost approval one run at a time; the next paid run is `plan`.
+The verify, reflect, classify, and plan forks and their artifact-handoff
+prerequisites are done locally. The later two forks remain pending in the
+required order and need explicit cost approval one run at a time; the next paid
+run is `cli`.

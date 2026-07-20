@@ -377,16 +377,15 @@ reviewer evidence assembly, and verdict preservation.
 - The executor/CLI suite passes all 57 tests after both repairs; Pyright reports
   zero errors on execute, CLI, and reflect.
 
-### Next safe action
+### Historical plan preflight
 
 The canonical `kickoffs/migration/plan.md` and clean isolated target
 `/private/tmp/mini-ork-self-migrate-plan` are prepared at the focused
 classify-closure commit `928db915`. Its no-cost baseline passes 9 unit tests,
 17 integration assertions, and plan feature acceptance. Focused Pyright has
-three documented baseline errors that the plan migration must close. The next
-action is the paid self-migrate launch using only Kimi, Codex, and GLM with
-credentials loaded process-locally from `/Users/admin/ps/scripts`. Do not start
-it without separate explicit approval.
+three documented baseline errors that the plan migration had to close. This
+preflight led to `run-1784532524-76798` and the completion audit documented in
+the live plan evidence below.
 
 ## Live classify evidence — 2026-07-20
 
