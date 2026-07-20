@@ -363,7 +363,7 @@ def get_learning(
 
     known_failure_modes: list[dict[str, Any]] = []
     if task_class and db.has_table("gradient_records"):
-        # Filter MUST mirror lib/context_assembler.sh::context_failure_modes_md
+        # Filter MUST mirror mini_ork.context_assembler.failure_modes_md.
         # (task_class = ? OR target LIKE ?) — this panel claims to show what
         # gets injected, so the queries have to agree. target-LIKE alone
         # missed rows whose task_class matches but whose target doesn't
@@ -402,7 +402,7 @@ def get_learning(
         "injected_candidates": {
             "prior_similar_runs": prior_similar_runs,
             "known_failure_modes": known_failure_modes,
-            "source": "lib/context_assembler.sh",
+            "source": "mini_ork/context_assembler.py",
             # "wired" = the injection actually happens in the live run
             # pipeline today.
             "injection_points": [

@@ -106,7 +106,7 @@ if [[ "$cn_code" == "200" ]]; then
     cd "$MINI_ORK_ROOT" && bash -c '
       export MINI_ORK_ROOT="$PWD"
       rm -f .mini-ork/state/cn_ping.cache 2>/dev/null
-      source lib/context_assembler.sh
+      context_contextnest_atoms_md() { PYTHONPATH="$PWD:${PYTHONPATH:-}" python3 -m mini_ork.context_assembler contextnest-atoms "$@"; }
       context_contextnest_atoms_md "'"$KICKOFF"'" 6
     ' 2>&1
   )
@@ -173,7 +173,7 @@ T4_OUT=$(
     export MINI_ORK_ROOT="$PWD"
     export CN_BASE_URL=http://127.0.0.1:1
     rm -f .mini-ork/state/cn_ping.cache 2>/dev/null
-    source lib/context_assembler.sh
+    context_contextnest_atoms_md() { PYTHONPATH="$PWD:${PYTHONPATH:-}" python3 -m mini_ork.context_assembler contextnest-atoms "$@"; }
     out=$(context_contextnest_atoms_md "'"$KICKOFF"'" 6)
     echo "len=${#out}"
   ' 2>&1
@@ -192,7 +192,7 @@ T5_OUT=$(
     export MINI_ORK_ROOT="$PWD"
     export MO_DISABLE_CN=1
     rm -f .mini-ork/state/cn_ping.cache 2>/dev/null
-    source lib/context_assembler.sh
+    context_contextnest_atoms_md() { PYTHONPATH="$PWD:${PYTHONPATH:-}" python3 -m mini_ork.context_assembler contextnest-atoms "$@"; }
     out=$(context_contextnest_atoms_md "'"$KICKOFF"'" 6)
     echo "len=${#out}"
   ' 2>&1

@@ -79,7 +79,7 @@ Gates are registered at boot via `lib/gate_registry.sh:gate_register`. Custom ga
 
 ## 8 Memory Namespaces
 
-Memory is scoped. Agents receive only the namespaces relevant to their role, assembled by `lib/context_assembler.sh` to a bounded token budget.
+Memory is scoped. Agents receive only the namespaces relevant to their role, assembled by `mini_ork.context_assembler` to a bounded token budget.
 
 | Namespace | Table(s) | What it holds |
 |---|---|---|
@@ -268,7 +268,7 @@ sequenceDiagram
 
 **Retry via `retries` edge** (automatic, within a run):
 - Triggered when a verifier gate fires `FAIL` and `iter < max_iters`.
-- `lib/context_assembler.sh` packs correction context (verifier output + reviewer feedback) into the implementer's next prompt.
+- `mini_ork.context_assembler` packs correction context (verifier output + reviewer feedback) into the implementer's next prompt.
 - `lib/healer.sh` re-invokes the implementer node with the augmented context.
 
 **Rollback via `rollback` node** (on max-retry exhaustion):

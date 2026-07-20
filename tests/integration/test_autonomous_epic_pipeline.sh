@@ -137,9 +137,9 @@ _t "7. cross_class gradients appear in epic_runner_delivery context pack"
 RUNDIR="/tmp/e1-pack-$TS"
 mkdir -p "$RUNDIR"
 echo '{"task_class":"epic_runner_delivery","goal":"E1 verify"}' > "$RUNDIR/brief.json"
-# Subshell isolates assembler sourcing — avoids pollution / inherited traps.
-( source "$MINI_ORK_ROOT/lib/context_assembler.sh" \
-  && context_assemble "$RUNDIR/brief.json" "planner" > "$RUNDIR/pack.json" 2>/dev/null ) || true
+PYTHONPATH="$MINI_ORK_ROOT:${PYTHONPATH:-}" MINI_ORK_DB="$STATE_DB" \
+  python3 -m mini_ork.context_assembler \
+    assemble "$RUNDIR/brief.json" "planner" > "$RUNDIR/pack.json" 2>/dev/null || true
 CROSS_N=$(python3 -c "
 import json, sys
 try:

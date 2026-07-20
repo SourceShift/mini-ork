@@ -62,7 +62,7 @@ experience and feeds it forward:
 | 8 memory namespaces | `db/migrations/` (19 migrations) | task / workflow / agent_performance / failure / recovery / user_preference / artifact / benchmark. |
 | Execution traces with lineage | `lib/trace_store.sh` | Every node dispatch records tool calls, files read/written, cost, duration, workflow-version hash, and prompt-template hash — full provenance per artifact. |
 | Textual gradient extraction | `mini_ork/ported/mini_ork_reflect.py` + `mini_ork/ported/reflection_pipeline.py` | Reflection turns failed/successful traces into natural-language "gradients": what to do differently next time, with confidence scores. |
-| Prior-run memory injection | `lib/context_assembler.sh` + `bin/mini-ork-plan` | The planner prompt receives outcomes of the 5 most recent same-class runs (per-run: nodes, failures, cost, duration) — plans calibrate against history. |
+| Prior-run memory injection | `mini_ork/context_assembler.py` + native plan runtime | The planner prompt receives outcomes of the 5 most recent same-class runs (per-run: nodes, failures, cost, duration) — plans calibrate against history. |
 | Learned-failure-mode injection | `mini_ork/ported/mini_ork_execute.py` | High-confidence gradients for the task class are injected into node prompts at dispatch time. |
 | Auditable context packs | `bin/mini-ork-plan` (`context-pack.json`) | The full cite-tagged memory bundle available at plan time is persisted next to the plan — you can audit what the planner knew. |
 | Pattern store | `lib/pattern_store.sh` | Recurring gradients consolidate into durable pattern records. |
@@ -107,7 +107,6 @@ experience and feeds it forward:
 | Python facade | `mini_ork/` + `docs/PYTHON_FRAMEWORK.md` | Typed `MiniOrk().run(RunRequest(...))` embedding — host mini-ork inside your own app. |
 | Recursive orchestration | `bin/mini-ork-spawn` + `lib/recursive_orchestration.sh` | Bounded parent/child mini-ork delegation with lineage tracking and policy limits. |
 | Custom utility scoring | `${MINI_ORK_HOME}/config/utility_functions/` | Override the promotion utility function per task class. |
-| Custom context assembly | `${MINI_ORK_HOME}/config/context_assemblers/` | Override memory retrieval per task class. |
 
 ---
 

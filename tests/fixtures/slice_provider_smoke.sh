@@ -37,7 +37,7 @@ OUT_DIR="${SLICE_BASELINE_DIR:-/tmp/slice-provider-baseline-$$}"
 mkdir -p "$OUT_DIR"
 
 # ── Build a populated test DB ──────────────────────────────────────────
-DB="$(mktemp /tmp/slice-provider-db-XXXXXX.db)"
+DB="$(mktemp /tmp/slice-provider-db-XXXXXX)"
 export MINI_ORK_DB="$DB"
 export MINI_ORK_HOME="$(mktemp -d)"
 # shellcheck source=/dev/null
@@ -85,26 +85,28 @@ con.close()
 PY
 
 # ── Case 1: under-budget (no truncation) ─────────────────────────────
-BRIEF_A="$(mktemp /tmp/slice-brief-A-XXXXXX.json)"
+BRIEF_A="$(mktemp /tmp/slice-brief-A-XXXXXX)"
 cat >"$BRIEF_A" <<'JSON'
 {"task_class":"smoke-task","title":"Under-budget smoke"}
 JSON
 export MINI_ORK_CTX_BUDGET_TOKENS=200000
 PACK_A="$(MINI_ORK_DB="$DB" MINI_ORK_HOME="$MINI_ORK_HOME" \
-  bash -c "source '$WT_ROOT/lib/context_assembler.sh' && context_assemble '$BRIEF_A' 'under_node'")"
+  PYTHONPATH="$WT_ROOT:${PYTHONPATH:-}" python3 -m mini_ork.context_assembler \
+    assemble "$BRIEF_A" "under_node")"
 echo "$PACK_A" > "$OUT_DIR/under-budget.json"
 _mask_dynamic "$OUT_DIR/under-budget.json"
 sha256sum "$OUT_DIR/under-budget.json" > "$OUT_DIR/under-budget.sha256"
 rm -f "$BRIEF_A"
 
 # ── Case 2: over-budget (truncation path) ─────────────────────────────
-BRIEF_B="$(mktemp /tmp/slice-brief-B-XXXXXX.json)"
+BRIEF_B="$(mktemp /tmp/slice-brief-B-XXXXXX)"
 cat >"$BRIEF_B" <<'JSON'
 {"task_class":"smoke-task","title":"Over-budget smoke"}
 JSON
 export MINI_ORK_CTX_BUDGET_TOKENS=300
 PACK_B="$(MINI_ORK_DB="$DB" MINI_ORK_HOME="$MINI_ORK_HOME" \
-  bash -c "source '$WT_ROOT/lib/context_assembler.sh' && context_assemble '$BRIEF_B' 'over_node'")"
+  PYTHONPATH="$WT_ROOT:${PYTHONPATH:-}" python3 -m mini_ork.context_assembler \
+    assemble "$BRIEF_B" "over_node")"
 echo "$PACK_B" > "$OUT_DIR/over-budget.json"
 _mask_dynamic "$OUT_DIR/over-budget.json"
 sha256sum "$OUT_DIR/over-budget.json" > "$OUT_DIR/over-budget.sha256"
