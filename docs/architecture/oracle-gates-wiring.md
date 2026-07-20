@@ -219,7 +219,7 @@ This wire-up closes Phase N + O at primitive-level:
   - Round-stability drift (`gates/stability.sh`)
   Each fail-opens when it cannot measure — no silent blocking.
 
-Future work: wire these into bin/mini-ork-execute's central dispatch
+Future work: wire these into mini_ork/ported/mini_ork_execute.py's central dispatch
 loop so they fire automatically for any recipe without per-recipe
 opt-in. That's a 3-subagent-consensus-pass-first change per the
 project skill rules.

@@ -11,7 +11,7 @@
 # tier-4 lens reports were missing and tier4_synth hung forever.
 #
 # Inputs (via env):
-#   MINI_ORK_RUN_DIR — run directory written by mini-ork-execute
+#   MINI_ORK_RUN_DIR — run directory written by the native execute runtime
 #   MO_TIER4_QUORUM  — minimum non-empty lens reports (default 3)
 #
 # Output: JSON to stdout with shape:

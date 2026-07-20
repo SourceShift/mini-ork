@@ -2,7 +2,7 @@
 # verifiers/test.sh — apply framework-edit.diff to a copy and run smoke tests.
 #
 # Inputs (via env):
-#   MINI_ORK_RUN_DIR — run directory set by mini-ork-execute
+#   MINI_ORK_RUN_DIR — run directory set by the native execute runtime
 #   MINI_ORK_ROOT    — optional repo root
 #
 # Output: JSON to stdout. Exit code is always 0; caller reads .pass.

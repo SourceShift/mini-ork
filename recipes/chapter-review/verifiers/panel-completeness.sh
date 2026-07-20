@@ -2,7 +2,7 @@
 # verifiers/panel-completeness.sh - verify 4-lens coverage and disagreement math.
 #
 # Inputs (via env):
-#   MINI_ORK_RUN_DIR - run directory (set by mini-ork-execute)
+#   MINI_ORK_RUN_DIR - run directory (set by the native execute runtime)
 #
 # Output: JSON to stdout
 #   { "verifier": "panel-completeness", "pass": bool,

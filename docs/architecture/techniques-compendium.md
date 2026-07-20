@@ -66,7 +66,7 @@ Stages recognised by the dispatcher (`bin/mini-ork:15`): `classify → plan → 
 |---|---|---|
 | classify | `bin/mini-ork-classify` | Rank-by-hit-count keyword/regex scan of `config/task_classes/*.yaml` + `recipes/*/task_class.yaml` (`:162-253`). Word-boundary literals; regex hit +2; class-alias +3. `--task-class` forces override. Kickoff DoS cap `MO_MAX_KICKOFF_BYTES=1048576`. Writes `task_runs` status `classified`. |
 | plan | `bin/mini-ork-plan` | Emits `plan.json` with `artifact_contract.success_verifiers[]` + `verifier_contract.checks[]`. |
-| execute | `bin/mini-ork-execute` | Dispatches workflow nodes; hosts the GRPO write-half (`mo_learning_write_grpo_advantages`, `:432+`) and the lane-routing switch (`_mo_policy_route_lane`, `:1971`). |
+| execute | `mini_ork/ported/mini_ork_execute.py` | Dispatches workflow nodes; hosts the GRPO write-half (`mo_learning_write_grpo_advantages`, `:432+`) and the lane-routing switch (`_mo_policy_route_lane`, `:1971`). |
 | verify | `bin/mini-ork-verify` | Runs `success_verifiers[]` then `gate_run_all` (`:305`). Empty-evidence exit-0 = `[fail] vacuous` (`:271-278`); zero verifiers run = verdict `vacuous`, not `pass` (`:317-323`). |
 | reflect | `mini_ork/ported/mini_ork_reflect.py` | Delegates to `reflection_run`, then pattern_miner, cross_epic_gradient, bug_report_sweep, rho_aggregate, lane_router_recompute, optional GEPA. |
 | improve | `bin/mini-ork-improve` | Reads per-task_class perf from `execution_traces`, calls `group_propose`, persists `workflow_candidates`. |
@@ -79,7 +79,7 @@ Stages recognised by the dispatcher (`bin/mini-ork:15`): `classify → plan → 
 
 Seven model families via `lib/providers/cl_{opus,sonnet,codex,deepseek,glm,kimi,minimax}.sh`. Lane→role mapping in `config/agents.yaml`: `planner:sonnet, implementer:sonnet, reviewer:opus, verifier:sonnet, reflector:sonnet, decomposer:deepseek, brain:opus`. Heterogeneous-family lens lanes (`glm_lens, kimi_lens, codex_lens, opus_lens, minimax_lens`) each a distinct family to lower panel pairwise correlation (Rajan 2025). Budgets: per_epic $5, per_run $0.50, daily $50.
 
-**Routing policy switch** `_mo_policy_route_lane` (`bin/mini-ork-execute:1971-2022`), env `MO_ROUTING_POLICY` default `learning_governed`. Policies: `workflow_default`, `frontier_only`, `cheap_only`, `static_hybrid`, `learning_governed`, `trace_governed` (escalate to frontier when `FAIL_COUNT>0`). Dry-run preserves recipe lanes.
+**Routing policy switch** `_mo_policy_route_lane` (`mini_ork/ported/mini_ork_execute.py`), env `MO_ROUTING_POLICY` default `learning_governed`. Policies: `workflow_default`, `frontier_only`, `cheap_only`, `static_hybrid`, `learning_governed`, `trace_governed` (escalate to frontier when `FAIL_COUNT>0`). Dry-run preserves recipe lanes.
 
 `learning_governed` → `_mo_learning_governed_lane` (`:344-394`): resolves `task_class` + `objective_domain` (default `code-delivery`), delegates to `decide()`, reads `.route`. Epsilon exploration deliberately lives on the brain side, not here.
 
@@ -87,7 +87,7 @@ Seven model families via `lib/providers/cl_{opus,sonnet,codex,deepseek,glm,kimi,
 
 `mini_ork/lane_router.py` (Python port of `lib/lane_router.sh`). The policy is *argmax relative advantage per group*:
 
-- **Advantage**: `relative_advantage[i] = score[i] − mean(group)`, `score = reward_g` (NULL skipped) (`lane_router.py:97,164`). The bash write-half uses **z-score** `(score − mean)/std` instead (`bin/mini-ork-execute:726`).
+- **Advantage**: `relative_advantage[i] = score[i] − mean(group)`, `score = reward_g` (NULL skipped) (`lane_router.py:97,164`). The bash write-half uses **z-score** `(score − mean)/std` instead (`mini_ork/ported/mini_ork_execute.py`).
 - **Group key** = `(objective_domain, task_class, node_type, code_region)` (`:132`); groups of size <2 skipped.
 - **Recency weight** `w = exp(−ln2·age_days/HALFLIFE)`, `MO_LEARNING_HALFLIFE_DAYS=14` (`:127-129`).
 - **Weighted group mean** → per-lane `lane_adv = lane_mean − wmean + lane_bonus` (`:163-164`).
@@ -103,7 +103,7 @@ Persists to `agent_performance_memory` (global), `lane_domain_advantage`, `lane_
 ### A4. Reward — three stacked signals
 
 1. **`compute_reward_g`** (`mini_ork/trace_store.py:28-40`): `reward_g = sign·(value−anchor)/|anchor|`; `sign=+1` if higher-is-better else `−1`; **`anchor==0 → None`** (unanchored = no signal). Scale-free, direction-normalised gain the router reads.
-2. **Verifiable-first shaping** (`bin/mini-ork-execute:572-641`): precedence `process_reward` → status anchor (0.85 success / 0.15 fail) → reviewer-verdict tie-break `±0.10`, zeroed on same-family lanes. The 0.5 anchor gap means an adversarial reviewer can't flip a known-good/bad trace.
+2. **Verifiable-first shaping** (`mini_ork/ported/mini_ork_execute.py`): precedence `process_reward` → status anchor (0.85 success / 0.15 fail) → reviewer-verdict tie-break `±0.10`, zeroed on same-family lanes. The 0.5 anchor gap means an adversarial reviewer can't flip a known-good/bad trace.
 3. **Process Reward Model (PRM)** (`lib/process_reward.sh` + `mini_ork/learning/process_reward.py:55-124`): additive weights `W_STATUS=0.40, W_TOOL=0.20, W_FILE=0.10, W_VERDICT=0.15, W_DURATION=0.10, W_COST=0.05`. **Goodhart guard** `ACTIVITY_CAP=0.15` clamps tool+file so noisy failed work can't outscore bare success. Bash/Python parity enforced to 1e-6 (`test_process_reward_parity.py`).
 
 **`grade_run_reward`** (`trace_store.py:195-223`): rubric `score/8` normalised against neutral **anchor 0.5** → `reward_g=(val−0.5)/0.5 ∈ [−1,+1]`, `reward_source='rubric@v1'`.

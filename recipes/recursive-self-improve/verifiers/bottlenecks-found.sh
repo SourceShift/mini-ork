@@ -4,7 +4,7 @@
 # at least one patch.
 #
 # Inputs (via env):
-#   MINI_ORK_RUN_DIR     run directory (set by mini-ork-execute)
+#   MINI_ORK_RUN_DIR     run directory (set by the native execute runtime)
 #
 # Output: JSON to stdout. Exit 0 always (caller reads .pass from JSON).
 
@@ -18,7 +18,7 @@ missing=()
 
 # Dispatcher names: researcher node `bottleneck_lens` → lens-bottleneck.md;
 # `arxiv_lens` → lens-arxiv.md (per the _lens-suffix heuristic in
-# bin/mini-ork-execute:410-415).
+# mini_ork/ported/mini_ork_execute.py).
 SCAN="$RUN_DIR/lens-bottleneck.md"
 SYNTH="$RUN_DIR/synthesis.md"
 ARXIV="$RUN_DIR/lens-arxiv.md"

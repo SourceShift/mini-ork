@@ -65,7 +65,7 @@ done
 
 ## What the worker agent sees
 
-When `mini-ork-execute` builds the prompt for an `implementer` /
+When the native execute runtime builds the prompt for an `implementer` /
 `reviewer` / `researcher` node, `context_assembler` reads unconsumed
 operator-steering rows targeting `<run_id, role>` (or the wildcard
 `any`) and prepends a block to the prompt:
