@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # verifiers/parity.sh — the byte-parity moat for a fork migration.
 #
-# The un-gameable oracle: the same deterministic entrypoint invocations run
-# under both runtimes (MINI_ORK_RUNTIME=bash vs =python via runtime-select) must
-# produce identical stdout/stderr/exit-code. Reuses scripts/runtime-parity-harness.sh.
+# Open forks compare both runtimes. Closed forks validate the durable passing
+# pre-retirement receipt plus their standalone post-retirement contract.
+# Reuses scripts/runtime-parity-harness.sh.
 #
 # Inputs (env): MINI_ORK_RUN_DIR (required), MINI_ORK_ROOT (repo root),
 #               MO_FORK (the fork being migrated, e.g. "verify") — informational.
@@ -25,6 +25,8 @@ if [ -n "$FORK" ] && [ -f "$FORK_TEST" ] && [ -f "$HARNESS" ]; then
     cd "$REPO_ROOT"
     env -u MINI_ORK_RUN_DIR -u MINI_ORK_RECIPE -u MINI_ORK_RUN_ID \
       -u MINI_ORK_PLAN_PATH -u MINI_ORK_TASK_CLASS \
+      MO_PRE_RETIREMENT_REPORT="$RUN_DIR/pre-retirement-parity.json" \
+      MO_PRE_RETIREMENT_EVIDENCE="$RUN_DIR/pre-retirement-parity-evidence.log" \
       bash "$HARNESS" "$FORK"
   ) >"$EVIDENCE" 2>&1; then
     pass=true

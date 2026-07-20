@@ -37,6 +37,52 @@ echo "── integration: mini-ork (top-level dispatcher) ──"
 
 # === TESTS START ===
 
+# 0. The preserved public path is now an executable Python-only launcher.
+echo ""
+echo "--- 0. public launcher is Python-only ---"
+if [ "$(head -1 "$MINI_ORK_ROOT/bin/mini-ork")" = "#!/usr/bin/env python3" ] \
+  && [ -x "$MINI_ORK_ROOT/bin/mini-ork" ]; then
+  _ok "bin/mini-ork is an executable Python launcher"
+else
+  _fail "bin/mini-ork is not an executable Python launcher"
+fi
+if ! grep -qE 'MINI_ORK_RUNTIME|runtime-select|BASH_SOURCE' "$MINI_ORK_ROOT/bin/mini-ork"; then
+  _ok "launcher has no Bash runtime delegation"
+else
+  _fail "launcher still contains Bash runtime delegation"
+fi
+
+# Closed command forks must route through their native modules when invoked
+# directly, while the full run lifecycle keeps execute as its live fork.
+echo ""
+echo "--- 0b. direct closed-command routes are native ---"
+DIRECT_CLASSIFY=$(mini-ork classify --dry-run --task-class code_fix "$TMPROOT/kickoff.md" 2>&1 || true)
+if echo "$DIRECT_CLASSIFY" | grep -q '^task_class=code_fix$'; then
+  _ok "direct classify reaches the native module"
+else
+  _fail "direct classify did not reach the native module"
+fi
+
+DIRECT_PLAN="$TMPROOT/direct-plan.json"
+if MINI_ORK_TASK_CLASS=code_fix mini-ork plan --dry-run --out "$DIRECT_PLAN" "$TMPROOT/kickoff.md" >/dev/null 2>&1 \
+  && [ -f "$DIRECT_PLAN" ]; then
+  _ok "direct plan reaches the native module"
+else
+  _fail "direct plan did not reach the native module"
+fi
+
+if mini-ork verify --dry-run >/dev/null 2>&1; then
+  _ok "direct verify reaches the native module"
+else
+  _fail "direct verify did not reach the native module"
+fi
+
+if mini-ork reflect --dry-run --since 0 >/dev/null 2>&1; then
+  _ok "direct reflect reaches the native module"
+else
+  _fail "direct reflect did not reach the native module"
+fi
+
 # 1. mini-ork help exits 0 and mentions all subcommands
 echo ""
 echo "--- 1. mini-ork help exits 0 ---"

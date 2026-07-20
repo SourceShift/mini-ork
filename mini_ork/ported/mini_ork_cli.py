@@ -1,20 +1,20 @@
-"""Python port of the mini-ork entrypoint / universal-loop dispatcher.
+"""Native mini-ork entrypoint / universal-loop dispatcher.
 
-Strangler-fig parity port. Simple subcommands delegate to bin/mini-ork-<sub>
-(still bash until ported), except closed forks run as modules; the `run`
-recipe-runner walks classify → profile →
-plan → execute → rubric → verify → reflect with deadline soft-gates between
-stages. The two embedded-python blocks (recipe resolution + run-profile
-generation) are transcribed verbatim so their output byte-matches the bash.
+Simple subcommands delegate to bin/mini-ork-<sub> while their forks remain
+open; closed forks run as Python modules. The `run` recipe-runner walks
+classify → profile → plan → execute → rubric → verify → reflect with deadline
+soft-gates between stages. Recipe resolution and profile generation preserve
+the golden outputs captured before Bash retirement.
 
     main(argv=None, *, root=None) -> int
 
-Note: bash uses `exec` for the simple subcommands (process replacement); this
-port uses subprocess with inherited stdio and returns the child's exit code —
-observationally identical (same stdout/stderr, same exit code).
+Sibling command forks use subprocess with inherited stdio and return the
+child's exit code, preserving the public stdout/stderr/exit-code contract.
 """
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import re
@@ -23,9 +23,19 @@ import sys
 import time
 from pathlib import Path
 
-_EXEC_SUBS = {"plan", "execute", "reflect", "improve", "eval",
+from mini_ork import trace_store
+from mini_ork.ported import (
+    config_resolve,
+    deadline_budget,
+    repo_integrity_guard,
+    rubric_prescreen,
+)
+
+_NATIVE_SUBS = {"classify", "plan", "verify", "reflect"}
+
+_EXEC_SUBS = {"execute", "improve", "eval",
               "promote", "init", "update", "spawn", "scheduler", "epics", "bugs",
-              "inject", "review", "traceotter", "metrics", "rollback", "resume", "recover",
+              "inject", "review", "apply", "traceotter", "metrics", "rollback", "resume", "recover",
               "serve", "validate", "garden", "recipe-eval"}
 
 _HELP = """mini-ork — task operating system for agents (v0.1)
@@ -41,6 +51,8 @@ Universal loop subcommands:
   improve                        Propose workflow candidates via group_evolver
   eval --candidate <id>          Run benchmark suite against a workflow candidate
   promote --candidate <id>       Promotion gate decision (promote|quarantine)
+  apply --task-class <name>      Close the apply loop: pick→materialize→score→gate→
+  --target <file>                write|quarantine (IMPL-3, opt-in via MO_APPLY_ENABLED=1)
 
 Recipe runner:
   run <kickoff.md>               Classify kickoff, resolve recipe, then walk
@@ -50,7 +62,7 @@ Recipe runner:
 Lifecycle:
   init                           Bootstrap project (creates .mini-ork/)
   update                         Apply migrations + report config drift
-  doctor                         Check deps + env vars + lib presence
+  doctor                         Check deps + env vars + lib presence + provider preflight
   validate                       Pre-run static checks with Fix: hints
   garden                         Drift detection (collisions, orphans, stale runs)
   recipe-eval                    Static evaluation of recipe definitions
@@ -257,12 +269,15 @@ def _grep_kv(text: str, key: str) -> str:
     return ""
 
 
-def _deadline(root, *args) -> subprocess.CompletedProcess:
-    """Shell into lib/deadline_budget.sh (not yet ported) for init/check."""
-    lib = os.path.join(root, "lib", "deadline_budget.sh")
+def _deadline(root, *args) -> int:
+    """Call the native deadline port while retaining the old helper contract."""
+    del root
     fn = args[0]
-    return subprocess.run(["bash", "-c", f'source "{lib}" && {fn} "$@"', "_", *args[1:]],
-                          capture_output=True, text=True)
+    if fn == "mo_deadline_init":
+        return deadline_budget.init(args[1], int(args[2]), args[3])
+    if fn == "mo_deadline_check":
+        return deadline_budget.check(args[1])
+    raise ValueError(f"unsupported deadline function: {fn}")
 
 
 def _run_lifecycle(argv, root) -> int:
@@ -335,11 +350,11 @@ def _run_lifecycle(argv, root) -> int:
     if not derived:
         derived = recipe.replace("-", "_")
 
-    # repo-integrity guard (best-effort bash)
-    guard = os.path.join(root, "lib", "repo_integrity_guard.sh")
-    if os.path.isfile(guard):
-        subprocess.run(["bash", "-c", f'source "{guard}" && repo_integrity_check_and_heal || true'],
-                       capture_output=True)
+    # repo-integrity guard (best-effort native side-channel)
+    try:
+        repo_integrity_guard.check_and_heal()
+    except Exception:
+        pass
 
     # ── classify ──
     cl = subprocess.run(
@@ -358,19 +373,19 @@ def _run_lifecycle(argv, root) -> int:
     home = os.environ.setdefault("MINI_ORK_HOME", os.path.join(os.getcwd(), ".mini-ork"))
     run_dir = os.path.join(home, "runs", run_id)
     os.makedirs(run_dir, exist_ok=True)
-    cfg = os.path.join(root, "lib", "config_resolve.sh")
-    if os.path.isfile(cfg):
-        subprocess.run(["bash", "-c", f'source "{cfg}" && mo_snapshot_run_config "$1" || true', "_", run_dir],
-                       capture_output=True)
+    try:
+        config_resolve.snapshot_run_config(run_dir)
+    except Exception:
+        pass
     profile_path = os.path.join(run_dir, "run_profile.json")
     os.environ["MINI_ORK_PROFILE_PATH"] = profile_path
 
     if deadline and int(deadline) > 0:
-        if _deadline(root, "mo_deadline_init", run_id, deadline, run_dir).returncode != 0:
+        if _deadline(root, "mo_deadline_init", run_id, deadline, run_dir) != 0:
             sys.stderr.write("deadline init failed\n"); return 2
 
     def _gate(where, artifact="") -> bool:
-        if deadline and _deadline(root, "mo_deadline_check", run_id).returncode != 0:
+        if deadline and _deadline(root, "mo_deadline_check", run_id) != 0:
             tail = f"; best-so-far artifact: {artifact or '<none>'}" if artifact else \
                    "; no best-so-far artifact yet"
             sys.stderr.write(f"deadline_hit after {where}{tail}; exiting cleanly\n")
@@ -417,7 +432,7 @@ def _run_lifecycle(argv, root) -> int:
     artifact = _grep_kv(ex.stdout, "artifact_path")
     if artifact:
         os.environ["MINI_ORK_ARTIFACT_PATH"] = artifact
-    if deadline and _deadline(root, "mo_deadline_check", run_id).returncode != 0:
+    if deadline and _deadline(root, "mo_deadline_check", run_id) != 0:
         sys.stderr.write(f"deadline_hit after execute; best-so-far artifact: {artifact or '<none>'}\n")
         return run_rc
 
@@ -431,15 +446,31 @@ def _run_lifecycle(argv, root) -> int:
         except OSError:
             pass
 
-    # ── rubric pre-screen (advisory, bash) ──
+    # ── rubric pre-screen (advisory, native side-channel) ──
     if os.environ.get("MO_RUBRIC", "1") == "1" and _run_dir and os.path.isdir(_run_dir):
         sys.stdout.write("── rubric (advisory pre-screen) ──\n")
-        subprocess.run(["bash", "-c",
-            'source "$1/lib/llm-dispatch.sh" 2>/dev/null||true; source "$1/lib/trace_store.sh" 2>/dev/null||true; '
-            'source "$1/lib/rubric-prescreen.sh" 2>/dev/null||true; '
-            'declare -f mo_rubric_run_score >/dev/null 2>&1 && mo_rubric_run_score "$2" "$3" "$4"; '
-            'declare -f mo_grade_run_reward >/dev/null 2>&1 && mo_grade_run_reward "$3" "$5" || true',
-            "_", root, kickoff, _run_dir, task_class or "generic", run_id])
+        try:
+            # The parity port contains real print() calls; keep the launcher's
+            # stdout reserved for lifecycle key/value and verdict output.
+            with contextlib.redirect_stdout(io.StringIO()):
+                rubric_prescreen.mo_rubric_run_score(
+                    kickoff,
+                    _run_dir,
+                    task_class or "generic",
+                    mini_ork_root=root,
+                    mini_ork_home=home,
+                    mini_ork_db=os.environ.get("MINI_ORK_DB"),
+                )
+        except Exception:
+            pass
+        try:
+            trace_store.grade_run_reward(
+                _run_dir,
+                run_id,
+                db=os.environ.get("MINI_ORK_DB"),
+            )
+        except Exception:
+            pass
 
     # ── verify ──
     if _run_dir and _run_dir != "." and os.path.isdir(_run_dir):
@@ -474,14 +505,9 @@ def main(argv=None, *, root=None) -> int:
     sub = argv[0] if argv else "help"
     rest = argv[1:]
 
-    if sub == "verify":
+    if sub in _NATIVE_SUBS:
         return subprocess.run(
-            [sys.executable, "-m", "mini_ork.ported.mini_ork_verify", *rest],
-            env=_module_env(root),
-        ).returncode
-    if sub == "classify":
-        return subprocess.run(
-            [sys.executable, "-m", "mini_ork.ported.mini_ork_classify", *rest],
+            [sys.executable, "-m", f"mini_ork.ported.mini_ork_{sub}", *rest],
             env=_module_env(root),
         ).returncode
     if sub in _EXEC_SUBS:
@@ -522,9 +548,9 @@ def main(argv=None, *, root=None) -> int:
         for env_var, family in (("GLM_API_KEY", "glm"), ("KIMI_API_KEY", "kimi"),
                                 ("MINIMAX_API_KEY", "minimax"), ("DEEPSEEK_API_KEY", "deepseek")):
             if os.environ.get(env_var):
-                print(f"  [OK]      {family} (${env_var} set)")
+                print(f"  [OK]      {family} ($_env_var set)")
             else:
-                print(f"  [WARN]    {family} (${env_var} unset)")
+                print(f"  [WARN]    {family} ($_env_var unset)")
         return 0
     if sub == "version":
         print("mini-ork 0.6.0 (universal task loop runtime)")
