@@ -645,3 +645,55 @@ def test_on_new_register_module_global(tmp_path):
     ]
 
     ps._ON_NEW_HOOKS.clear()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# (10) LIVE bash pattern_on_new hook fires on NEW only, with (pid, payload)
+# ─────────────────────────────────────────────────────────────────────────────
+def test_on_new_hook_fires_live_bash(tmp_path):
+    """Subsumes the retired bash fixture's ``pattern_on_new`` case by driving
+    the LIVE ``lib/pattern_store.sh`` hook directly (case 9 covers only the
+    Python port's ``_ON_NEW_HOOKS`` registry). Registers a bash hook fn,
+    stores a NEW pattern, then upserts the SAME pattern_id, and asserts the
+    hook fired exactly once — on the new insert only (``is_new=="new"`` guard
+    at pattern_store.sh:135) — receiving ``(pid, payload)`` (line 138). Keeps
+    the retained MINI_ORK_RUNTIME=bash new-pattern hook path under coverage.
+    """
+    _which_bash()
+    bash_db = tmp_path / "bash.sqlite"
+    _init_temp_db(bash_db)
+    marker = tmp_path / "hook.log"
+
+    pid = "pat-hooktest01"  # fixed id so the 2nd store re-hits the same row
+    payload_new = json.dumps(
+        {"pattern_id": pid, "description": "hook trigger",
+         "output_type": "adr", "evidence_trace_ids": []}
+    )
+    payload_upd = json.dumps(
+        {"pattern_id": pid, "description": "hook trigger",
+         "output_type": "adr", "evidence_trace_ids": ["e1"]}
+    )
+
+    # Hook logs pid + whether it received a non-empty payload arg. Written to
+    # a marker file (not stdout) so it is not conflated with the pid echo.
+    script = (
+        f'. "{LIB_PATTERN_STORE}"\n'
+        f'_h() {{ printf "FIRED pid=%s haspayload=%s\\n" '
+        f'"$1" "$([ -n "$2" ] && echo yes || echo no)" >> "{marker}"; }}\n'
+        f'pattern_on_new _h\n'
+        f"pattern_store '{payload_new}' >/dev/null\n"
+        f"pattern_store '{payload_upd}' >/dev/null\n"
+    )
+    env = {**os.environ, "MINI_ORK_DB": str(bash_db), "MINI_ORK_ROOT": str(REPO)}
+    r = subprocess.run(
+        ["bash", "-c", script], env=env, cwd=str(REPO),
+        capture_output=True, text=True,
+    )
+    assert r.returncode == 0, f"bash rc={r.returncode} stderr={r.stderr}"
+
+    fired = marker.read_text().splitlines() if marker.exists() else []
+    # Fires exactly once — on the NEW insert, not the upsert.
+    assert len(fired) == 1, f"hook must fire once on new only; got {fired!r}"
+    assert fired[0] == f"FIRED pid={pid} haspayload=yes", (
+        f"hook received wrong (pid, payload): {fired[0]!r}"
+    )
