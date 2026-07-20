@@ -47,9 +47,14 @@ graded reward_g, bash+python), lane-fallback hang-proofing (dispatch_with_fallba
 + role-aware chains in executor).
 
 ## REMAINING (trunk)
-- context_assembler.sh — CORE PORTED (mini_ork/context_assembler.py: context_assemble + failure_modes_md + prior_runs_md, test_context_assembler_py.py, 5 tests). Remaining: contextnest_atoms_md / recent_sessions_md (CN HTTP) + operator_steering_md (needs operator_steering port) + active_state_md
+- context_assembler.sh — CORE PORTED (`mini_ork/context_assembler.py`). The
+  Python-only planner now consumes native failure/prior-run blocks,
+  ContextNest planner packs + generic atoms/recent-session fallbacks,
+  active-state injection, and persisted context packs. Remaining shell-only
+  surfaces belong to non-planner roles and operator steering.
 - reflection_pipeline.sh (358) + gradient_extractor.sh (379) + bin/mini-ork-reflect (247)
-- bin/mini-ork-execute (2942) + bin/mini-ork-plan (1077) — the big loop, last
+- bin/mini-ork-execute — remaining large loop entrypoint. `bin/mini-ork-plan`
+  retired on 2026-07-20 after native profile/context/trace completion.
 - llm-dispatch.sh remainder (tool-summary sidecar; then flip MO_DISPATCH_BACKEND default)
 - assorted leaves: workflow_lifecycle, operator_steering, steering_checkpoint,
   mid_node_injector, role_evolver, runs-tracker, spec-split, artifact_contract,

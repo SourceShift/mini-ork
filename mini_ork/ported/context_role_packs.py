@@ -24,6 +24,8 @@ import json
 import os
 import re
 
+from mini_ork import cn_client
+
 # Structural / filler words that must never become the scoping token — they
 # match unrelated atoms across the whole substrate. Verbatim from the bash.
 _STOP = {
@@ -92,8 +94,51 @@ def extract_task_class(brief_path: str | os.PathLike) -> str:
     return ""
 
 
+def _render_sessions(payload: str) -> str:
+    try:
+        data = json.loads(payload)
+    except Exception:
+        return ""
+    sessions = data.get("sessions") or data.get("matches") or data.get("hits") or []
+    if not sessions:
+        return ""
+    lines = ["--- ContextNest planner pack — prior sessions with same intent ---"]
+    for session in sessions[:5]:
+        sid = (session.get("session_id") or session.get("id", ""))[:8]
+        ts = (session.get("last_seen") or session.get("ts") or "")[:10]
+        title = (session.get("title") or session.get("intent") or "").strip()[:100]
+        lines.append(f"- {sid} ({ts}) {title}")
+    lines.append("--- /prior sessions ---")
+    return "\n".join(lines)
+
+
+def _planner_pack(task_brief_path: str | os.PathLike, client) -> str:
+    query = extract_query(task_brief_path)
+    task_class = extract_task_class(task_brief_path)
+    sections: list[str] = []
+
+    capsule = client.capsule(query, "14d")
+    if len(capsule) > 100:
+        sections.append(
+            "--- ContextNest planner pack — substrate digest (capsule) ---\n"
+            + capsule
+            + "\n--- /capsule ---"
+        )
+    if task_class:
+        rendered = _render_sessions(client.sessions_by_intent(task_class))
+        if rendered:
+            sections.append(rendered)
+    rendered = client.render_inbox_md(client.inbox_filtered("now", 5), 5)
+    if rendered:
+        sections.append(rendered.rstrip("\n"))
+    rendered = client.render_basins_md(client.basins(os.getcwd(), 5), 5)
+    if rendered:
+        sections.append(rendered.rstrip("\n"))
+    return "\n\n".join(sections) + ("\n" if sections else "")
+
+
 def role_pack_md(role: str, task_brief_path: str | os.PathLike, files_csv: str = "",
-                 *, cn_available: bool = False) -> str:
+                 *, cn_available: bool | None = None, client=None) -> str:
     """Mirror context_role_pack_md's guard/degradation contract.
 
     Returns "" when: MO_DISABLE_CN=1, the brief is missing, or ContextNest is
@@ -107,8 +152,15 @@ def role_pack_md(role: str, task_brief_path: str | os.PathLike, files_csv: str =
         return ""
     if not os.path.isfile(task_brief_path):
         return ""
+    client = client or cn_client
+    if cn_available is None:
+        cn_available = client.available()
     if not cn_available:
         return ""
-    # CN-available role dispatch is the follow-on (needs the Python CN client);
-    # bash produces nothing here without ContextNest, so "" preserves parity.
+    if role == "planner":
+        try:
+            return _planner_pack(task_brief_path, client)
+        except Exception:
+            return ""
+    # Other role packs remain fail-soft until their Python orchestration lands.
     return ""

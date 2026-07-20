@@ -1119,12 +1119,12 @@ def test_profile_answerer_helper_exists() -> None:
     assert "\"auto_answered\": True" in text
 
 
-def test_mini_ork_plan_references_auto_answer_env() -> None:
-    plan = (ROOT / "bin" / "mini-ork-plan").read_text()
+def test_python_plan_references_native_auto_answer() -> None:
+    plan = (ROOT / "mini_ork" / "ported" / "mini_ork_plan.py").read_text()
 
     assert "MO_AUTO_ANSWER_PROFILE" in plan
-    assert "profile_answerer.sh" in plan
-    assert "mo_answer_profile_questions" in plan
+    assert "mini_ork.ported.profile_answerer" in plan
+    assert "answer_profile_questions" in plan
 
 
 # ── project switcher (GET /projects, POST /projects/switch) ─────────────────

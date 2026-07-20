@@ -36,7 +36,7 @@ jobs:
       # Severity tiers:
       # - severity=error  → PR-blocking (real bugs: syntax, undefined vars, etc)
       # - severity=warning → advisory, non-blocking (style + best-practice)
-      # bin/ engine scripts are extensionless (mini-ork-execute, mini-ork-plan,
+      # bin/ engine scripts are extensionless (mini-ork-execute, mini-ork-verify,
       # ...) so a bare `-name "*.sh"` silently skips ALL of them — match
       # bin/mini-ork* explicitly.
       - name: Run shellcheck (errors block CI)

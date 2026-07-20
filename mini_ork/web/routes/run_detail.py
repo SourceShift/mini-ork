@@ -408,7 +408,7 @@ def get_learning(
             "injection_points": [
                 {
                     "name": "known_failure_modes",
-                    "where": "bin/mini-ork-plan + bin/mini-ork-execute (context_failure_modes_md)",
+                    "where": "mini_ork.ported.mini_ork_plan + bin/mini-ork-execute (context_failure_modes_md)",
                     "how": "gradient_records matching the task_class with confidence >= 0.6 are appended as a 'Learned failure modes' block to planner/researcher/implementer/reviewer prompts.",
                     "wired": True,
                 },
@@ -420,13 +420,13 @@ def get_learning(
                 },
                 {
                     "name": "prior_similar_runs",
-                    "where": "bin/mini-ork-plan (context_prior_runs_md)",
+                    "where": "mini_ork.ported.mini_ork_plan (context_prior_runs_md)",
                     "how": "per-run outcomes (nodes, failures, cost, duration) of the 5 most recent same-task_class runs — grouped by run_id, excluding this run's own traces — are appended as a 'Prior runs' block to the planner prompt.",
                     "wired": True,
                 },
                 {
                     "name": "context_pack",
-                    "where": "bin/mini-ork-plan (context_assemble)",
+                    "where": "mini_ork.ported.mini_ork_plan (context_assemble)",
                     "how": "the full bounded ContextPack (prior runs, failure modes, prefs, constraints — cite-tagged, token-budgeted) is persisted as context-pack.json next to plan.json as the auditable record of memory available at plan time.",
                     "wired": True,
                 },

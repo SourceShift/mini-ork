@@ -768,7 +768,7 @@ PY
 
 # Active-State Index helper — HarnessBridge Technique 1 (arxiv:2606.12882).
 # Wraps lib/active_state_index.sh:1 mo_active_state_block so the planner
-# block at bin/mini-ork-plan:176 can call it through the same
+# block in mini_ork.ported.mini_ork_plan can call it through the same
 # convention as the other context_*_md helpers.
 context_active_state_md() {
   local task_class="${1:-__any__}"

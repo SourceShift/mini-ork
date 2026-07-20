@@ -62,7 +62,9 @@ fi
 classify_module="$MINI_ORK_ROOT/mini_ork/ported/mini_ork_classify.py"
 classify_cmd=(env "PYTHONPATH=$MINI_ORK_ROOT${PYTHONPATH:+:$PYTHONPATH}" \
   python3 -m mini_ork.ported.mini_ork_classify)
-plan_bin="$MINI_ORK_ROOT/bin/mini-ork-plan"
+plan_module="$MINI_ORK_ROOT/mini_ork/ported/mini_ork_plan.py"
+plan_cmd=(env "PYTHONPATH=$MINI_ORK_ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+  python3 -m mini_ork.ported.mini_ork_plan)
 [[ ! -f "$classify_module" ]] && {
   _skip "Python classify module unavailable — oversized input tests skipped"
   echo ""
@@ -170,10 +172,10 @@ fi
 echo ""
 
 # ── Test 4: plan --dry-run on oversized input ─────────────────────────────────
-if [[ -x "$plan_bin" ]]; then
+if [[ -f "$plan_module" ]]; then
   echo "--- 4. plan --dry-run completes within 30s on 10MB input ---"
   PLAN_EXIT=0
-  PLAN_OUT=$(timeout 30 bash "$plan_bin" "$LARGE_KICKOFF" --dry-run 2>&1) || PLAN_EXIT=$?
+  PLAN_OUT=$(timeout 30 "${plan_cmd[@]}" "$LARGE_KICKOFF" --dry-run 2>&1) || PLAN_EXIT=$?
 
   if [[ "$PLAN_EXIT" -eq 124 ]]; then
     _fail "plan TIMED OUT on 10MB input (>30s)"
@@ -191,7 +193,7 @@ if [[ -x "$plan_bin" ]]; then
     _ok "No MemoryError in plan output for 10MB input"
   fi
 else
-  _skip "mini-ork-plan not executable — plan oversized test skipped"
+  _skip "Python plan module unavailable — plan oversized test skipped"
 fi
 echo ""
 

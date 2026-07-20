@@ -29,6 +29,43 @@ cat > "$TMPROOT/root/lib/trace_store.sh" <<'SH'
 trace_write() { return 0; }
 SH
 
+cat > "$TMPROOT/run-python-plan.py" <<'PY'
+import json
+import os
+import sqlite3
+import sys
+from pathlib import Path
+
+sys.path.insert(0, sys.argv[1])
+from mini_ork.ported import mini_ork_plan
+
+
+def dispatch(_task_class, _node_type, _prompt):
+    Path(os.environ["PROFILE_GATE_DISPATCH_MARKER"]).write_text("called\n")
+    con = sqlite3.connect(os.environ["MINI_ORK_DB"])
+    con.execute(
+        "INSERT INTO node_runs (run_id, node_id, node_type, lane) "
+        "VALUES (?, 'planner', 'planner', 'codex')",
+        (os.environ.get("MINI_ORK_RUN_ID", ""),),
+    )
+    con.commit()
+    con.close()
+    return 0, json.dumps({
+        "objective": "ready profile dispatch fixture",
+        "assumptions": [],
+        "decomposition": [],
+        "dependencies": [],
+        "risk_notes": [],
+        "artifact_contract": {"outputs": [], "success_verifiers": []},
+        "verifier_contract": {
+            "checks": [{"id": "ready", "description": "ready profile dispatch happened"}]
+        },
+    })
+
+
+raise SystemExit(mini_ork_plan.main(sys.argv[2:], root=os.environ["MINI_ORK_ROOT"], dispatch=dispatch))
+PY
+
 cat > "$TMPROOT/root/lib/llm-dispatch.sh" <<'SH'
 llm_dispatch() {
   printf 'called\n' >> "${PROFILE_GATE_DISPATCH_MARKER:?PROFILE_GATE_DISPATCH_MARKER required}"
@@ -83,9 +120,12 @@ NEEDS_STDOUT=$(
   MINI_ORK_DB="$TEST_DB" \
   MINI_ORK_RUN_ID="profile-gate-needs" \
   MINI_ORK_PROFILE_GATE=1 \
+  MINI_ORK_NONINTERACTIVE=1 \
+  MO_AUTO_ANSWER_PROFILE=0 \
   MINI_ORK_PROFILE_PATH="$WT/tests/fixtures/run_profile-needs-answers.json" \
   PROFILE_GATE_DISPATCH_MARKER="$NEEDS_MARKER" \
-  "$WT/bin/mini-ork-plan" --out "$NEEDS_OUT" "$TMPROOT/kickoff.md" 2>"$TMPROOT/needs.err"
+  python3 "$TMPROOT/run-python-plan.py" "$WT" \
+    --out "$NEEDS_OUT" "$TMPROOT/kickoff.md" 2>"$TMPROOT/needs.err"
 )
 needs_rc=$?
 
@@ -147,7 +187,8 @@ MINI_ORK_RUN_ID="profile-gate-ready" \
 MINI_ORK_PROFILE_GATE=1 \
 MINI_ORK_PROFILE_PATH="$READY_PROFILE" \
 PROFILE_GATE_DISPATCH_MARKER="$READY_MARKER" \
-"$WT/bin/mini-ork-plan" --out "$READY_OUT" "$TMPROOT/kickoff.md" >/dev/null 2>"$TMPROOT/ready.err"
+python3 "$TMPROOT/run-python-plan.py" "$WT" \
+  --out "$READY_OUT" "$TMPROOT/kickoff.md" >/dev/null 2>"$TMPROOT/ready.err"
 ready_rc=$?
 
 if [ "$ready_rc" -ne 0 ]; then
