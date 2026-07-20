@@ -387,3 +387,52 @@ def test_end_to_end_replay_parity(tmp_path):
     assert _round_floats(bash_payload) == _round_floats(py_payload), (
         f"bash={bash_payload!r}\npython={py_payload!r}"
     )
+
+
+def test_default_dispatch_uses_native_primary(monkeypatch):
+    """The standalone default path reaches the native wrapper, never Bash."""
+    from mini_ork.ported import llm_dispatch as native_dispatch
+
+    calls = []
+
+    def fake(argv, *, root, dispatch_fn):
+        calls.append((argv, root, dispatch_fn))
+        print('{"answers":[]}', end="")
+        return 0
+
+    marker = lambda *args: 0
+    monkeypatch.setattr(native_dispatch, "llm_dispatch", fake)
+    raw = pa._default_dispatch(
+        "profile prompt", repo_root="/engine", dispatch_fn=marker,
+    )
+
+    assert raw == '{"answers":[]}'
+    assert calls == [(
+        [
+            "--task-class", "profile_answerer",
+            "--node-type", "profile_answerer",
+            "--model", "deepseek",
+            "--prompt-text", "profile prompt",
+        ],
+        "/engine",
+        marker,
+    )]
+
+
+def test_default_dispatch_falls_back_to_kimi_on_whitespace(monkeypatch):
+    """Whitespace success is unusable and retains the historical Kimi fallback."""
+    from mini_ork.ported import llm_dispatch as native_dispatch
+
+    models = []
+
+    def fake(argv, *, root, dispatch_fn):
+        model = argv[argv.index("--model") + 1]
+        models.append(model)
+        print("   " if model == "deepseek" else '{"answers":[]}', end="")
+        return 0
+
+    monkeypatch.setattr(native_dispatch, "llm_dispatch", fake)
+    raw = pa._default_dispatch("profile prompt", repo_root="/engine")
+
+    assert raw == '{"answers":[]}'
+    assert models == ["deepseek", "kimi"]
