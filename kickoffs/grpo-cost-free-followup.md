@@ -12,7 +12,7 @@ provable. Still **zero** extra model calls on the default path.
 - `lib/decision_service.sh` — D1 ε-reroute + D4 propensity writer
 - `lib/reflection_pipeline.sh`, `bin/mini-ork-reflect` — D5 per-node credit
 - `scripts/router_replay_eval.py` — new (D6)
-- `tests/unit/test_lane_router_py.py`, `tests/unit/test_lane_router.sh` — new bandit assertions
+- `tests/unit/test_lane_router_py.py` — new bandit assertions (retired `test_lane_router.sh`; its cases now live in the native parity gate)
 - `docs/architecture/coevolve-ecosystem.md` — Appendix A1 rewrite
 
 Out of scope: `mini_ork/lane_router.py` estimator internals (already shipped),
@@ -20,7 +20,7 @@ provider config, weights/training.
 
 ## Success command
 ```
-python3 -m pytest tests/unit/test_lane_router_py.py -q && bash tests/unit/test_lane_router.sh && python3 scripts/router_replay_eval.py --db .mini-ork/state.db
+python3 -m pytest tests/unit/test_lane_router_py.py -q && python3 scripts/router_replay_eval.py --db .mini-ork/state.db
 ```
 
 ## D1b — decision_service ε-reroute

@@ -104,8 +104,8 @@ TIEBREAK = int(os.environ.get("MO_LEARNING_TIEBREAK", "1"))
 #   MO_ROUTER_SINGLE_SAMPLE default 1   → single-sample baselines on
 #   MO_ROUTER_CONTEXTUAL   default 0   → NeuralUCB off (zero-cost default)
 # Setting all three to 0 reproduces the legacy within-group-mean router
-# byte-for-byte (verifier regression gate; tests/unit/test_lane_router.sh
-# + tests/unit/test_lane_router_py.py both pin UCB_C=0).
+# byte-for-byte (verifier regression gate: tests/unit/test_lane_router_py.py
+# drives the live bash lib and diffs the advantage recompute).
 UCB_C = float(os.environ.get("MO_ROUTER_UCB_C", "0.5"))
 SINGLE_SAMPLE = int(os.environ.get("MO_ROUTER_SINGLE_SAMPLE", "1"))
 BANDIT_ON = UCB_C > 0.0
