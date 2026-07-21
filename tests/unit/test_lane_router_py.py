@@ -15,6 +15,7 @@ revive its behaviours as genuinely-executing live-bash parity cases.
 from __future__ import annotations
 
 import datetime
+import itertools
 import os
 import shutil
 import sqlite3
@@ -388,3 +389,181 @@ def test_lr_fold_malformed_halflife_skipped_parity(tmp_path):
     # sh9: malformed halflife=0.0 skipped — kimi_lens regionA unchanged
     assert _radv(db_bash, "kimi_lens", "regionA") == base_km_a
     _assert_all_tables_parity(db_bash, db_py)
+
+
+# ── GRPO write-half refinement parity (subsumes retired
+#    tests/unit/test_lane_router_refinements.sh) ──
+#
+# Provenance: that fixture drove lane_router_recompute_advantages over a canonical
+# db/init.sh schema with 5 assertions, each toggling ONE knob against its legacy
+# escape hatch to prove the knob moves the stored relative_advantage in the
+# documented direction (so a vacuous port cannot pass):
+#   (1) n-aware shrinkage — SHRINK_K=5 pulls a small-n (n=1) advantage below its
+#       SHRINK_K=0 raw value;
+#   (2) sigma-zero cost tie-break — on a flat-score group TIEBREAK=1 favours the
+#       cheaper lane (adv>0) over the dearer (adv<0); TIEBREAK=0 leaves it at 0;
+#   (3) EMA decay blend — a second recompute with DECAY_ALPHA=0.30 blends toward
+#       the stored prior (0.30*batch2 + 0.70*batch1 = +0.20) instead of overwriting;
+#   (4) recency weighting — HALFLIFE=14 down-weights an old opposing trace, lifting
+#       the advantage above the HALFLIFE=0 (flat) value.
+# Unlike the frc-a5 fold above, this fixture was LIVE at retirement (5 OK / 0 FAIL).
+# Each case below re-seeds the scenario, runs the LIVE bash recompute and the port
+# on identical DB copies with the SAME knobs, and asserts BOTH the .sh's directional
+# behaviour (on the bash side — anti-vacuous) AND bash==port. That is strictly
+# stronger than the .sh, which never cross-checked the port. The top parity gate
+# pins HALFLIFE=0 and does a single recompute, so it never exercised the recency (4)
+# or two-pass-EMA (3) paths these cases add.
+
+_NOW = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+_OLD = (datetime.datetime.now(datetime.timezone.utc)
+        - datetime.timedelta(days=60)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+_TRACE_SEQ = itertools.count(1)  # monotonic trace_id counter, unique across the session
+
+
+def _ins_trace(db, lane, rg, cost, created_at, region=""):
+    """Insert one success trace (task_class='tc', objective_domain='code-delivery',
+    node_type='implementer'), mirroring the retired refinements fixture's _ins."""
+    n = next(_TRACE_SEQ)
+    con = sqlite3.connect(db)
+    con.execute(
+        "INSERT INTO execution_traces (trace_id, agent_version_id, task_class, "
+        "objective_domain, code_region, verifier_output, reward_g, cost_usd, "
+        "status, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+        (f"t-{lane}-{n}", lane, "tc", "code-delivery", region,
+         '{"node_type":"implementer"}', rg, cost, "success", created_at))
+    con.commit()
+    con.close()
+
+
+def _recompute_bash_knobs(db, knobs):
+    subprocess.run(
+        ["bash", "-c", f'. "{LR_SH}" && lane_router_recompute_advantages --since 0'],
+        env={**os.environ, **knobs, "MINI_ORK_DB": db, "MO_STORE_DB": db},
+        capture_output=True, text=True, check=True)
+
+
+def _recompute_py_knobs(db, knobs):
+    old = os.environ.copy()
+    os.environ.update(knobs)
+    try:
+        lane_router.recompute_advantages(since=0, db=db)
+    finally:
+        os.environ.clear()
+        os.environ.update(old)
+
+
+def test_lr_ref_shrinkage_parity(tmp_path):
+    """Subsumes refinements #1: SHRINK_K=5 pulls a small-n advantage below its
+    SHRINK_K=0 raw value (LIVE bash side); bash==port."""
+    db = _init_db(tmp_path, "shrink.db")
+    _ins_trace(db, "laneA", 1.0, 1, _NOW)
+    _ins_trace(db, "laneB", 0.0, 1, _NOW)
+    common = {"MO_LEARNING_DECAY_ALPHA": "1.0", "MO_LEARNING_HALFLIFE_DAYS": "0",
+              "MO_LEARNING_TIEBREAK": "0"}
+
+    def pair(shrink_k):
+        b, p = f"{db}.s{shrink_k}b", f"{db}.s{shrink_k}p"
+        shutil.copy(db, b)
+        shutil.copy(db, p)
+        knobs = {**common, "MO_LEARNING_SHRINKAGE_K": str(shrink_k)}
+        _recompute_bash_knobs(b, knobs)
+        _recompute_py_knobs(p, knobs)
+        return _gadv(b, "laneA", tc="tc"), _gadv(p, "laneA", tc="tc")
+
+    shrunk_b, shrunk_p = pair(5)
+    raw_b, raw_p = pair(0)
+    assert shrunk_b is not None and raw_b is not None
+    assert 0 < shrunk_b < raw_b and raw_b > 0.4, f"shrunk={shrunk_b} raw={raw_b}"
+    assert shrunk_b == shrunk_p and raw_b == raw_p, \
+        f"parity shrunk=({shrunk_b},{shrunk_p}) raw=({raw_b},{raw_p})"
+
+
+def test_lr_ref_tiebreak_parity(tmp_path):
+    """Subsumes refinements #2: on a flat-score group TIEBREAK=1 favours the
+    cheaper lane over the dearer, TIEBREAK=0 leaves it at 0 (LIVE bash side);
+    bash==port."""
+    db = _init_db(tmp_path, "tie.db")
+    _ins_trace(db, "laneC", 0.5, 1, _NOW)
+    _ins_trace(db, "laneD", 0.5, 100, _NOW)
+    common = {"MO_LEARNING_DECAY_ALPHA": "1.0", "MO_LEARNING_HALFLIFE_DAYS": "0",
+              "MO_LEARNING_SHRINKAGE_K": "0"}
+
+    def pair(tb):
+        b, p = f"{db}.t{tb}b", f"{db}.t{tb}p"
+        shutil.copy(db, b)
+        shutil.copy(db, p)
+        knobs = {**common, "MO_LEARNING_TIEBREAK": str(tb)}
+        _recompute_bash_knobs(b, knobs)
+        _recompute_py_knobs(p, knobs)
+        return b, p
+
+    b1, p1 = pair(1)
+    c_b, d_b = _gadv(b1, "laneC", tc="tc"), _gadv(b1, "laneD", tc="tc")
+    c_p, d_p = _gadv(p1, "laneC", tc="tc"), _gadv(p1, "laneD", tc="tc")
+    b0, p0 = pair(0)
+    c0_b, c0_p = _gadv(b0, "laneC", tc="tc"), _gadv(p0, "laneC", tc="tc")
+
+    assert c_b is not None and d_b is not None and c0_b is not None
+    assert c_b > d_b, f"TIEBREAK=1 cheaper C={c_b} !> dearer D={d_b}"
+    assert -0.0001 <= c0_b <= 0.0001, f"TIEBREAK=0 flat group C={c0_b} != ~0"
+    assert (c_b, d_b) == (c_p, d_p), f"TB1 parity bash=({c_b},{d_b}) py=({c_p},{d_p})"
+    assert c0_b == c0_p, f"TB0 parity bash={c0_b} py={c0_p}"
+
+
+def test_lr_ref_ema_blend_parity(tmp_path):
+    """Subsumes refinements #3: a second recompute with DECAY_ALPHA=0.30 blends
+    toward the stored prior (→ +0.20) rather than overwriting (LIVE bash side);
+    bash==port. The top parity gate never exercises this two-pass EMA path."""
+    db = _init_db(tmp_path, "ema.db")
+    b, p = db + ".b", db + ".p"
+    shutil.copy(db, b)
+    shutil.copy(db, p)
+    pass1 = {"MO_LEARNING_SHRINKAGE_K": "0", "MO_LEARNING_HALFLIFE_DAYS": "0",
+             "MO_LEARNING_TIEBREAK": "0", "MO_LEARNING_DECAY_ALPHA": "1.0"}
+    pass2 = {**pass1, "MO_LEARNING_DECAY_ALPHA": "0.30"}
+    for dbx, recompute in ((b, _recompute_bash_knobs), (p, _recompute_py_knobs)):
+        _ins_trace(dbx, "laneA", 1.0, 1, _NOW)
+        _ins_trace(dbx, "laneB", 0.0, 1, _NOW)
+        recompute(dbx, pass1)
+        con = sqlite3.connect(dbx)   # drop only traces; keep the stored prior
+        con.execute("DELETE FROM execution_traces")
+        con.commit()
+        con.close()
+        _ins_trace(dbx, "laneA", 0.0, 1, _NOW)
+        _ins_trace(dbx, "laneB", 1.0, 1, _NOW)
+        recompute(dbx, pass2)
+
+    blended_b = _gadv(b, "laneA", tc="tc")
+    blended_p = _gadv(p, "laneA", tc="tc")
+    assert blended_b is not None
+    assert 0.1 < blended_b < 0.3, f"EMA blended bash={blended_b} (expect ~0.20)"
+    assert blended_b == blended_p, f"EMA parity bash={blended_b} py={blended_p}"
+
+
+def test_lr_ref_recency_parity(tmp_path):
+    """Subsumes refinements #4: HALFLIFE=14 down-weights an old opposing trace,
+    lifting laneA's advantage above the HALFLIFE=0 (flat) value (LIVE bash side);
+    bash==port within 5e-4 (each side reads its own utcnow for the age). The top
+    parity gate pins HALFLIFE=0, so this recency path was previously untested."""
+    common = {"MO_LEARNING_SHRINKAGE_K": "0", "MO_LEARNING_DECAY_ALPHA": "1.0",
+              "MO_LEARNING_TIEBREAK": "0"}
+
+    def pair(hl):
+        db = _init_db(tmp_path, f"rec{hl}.db")
+        _ins_trace(db, "laneA", 1.0, 1, _NOW)
+        _ins_trace(db, "laneA", 0.0, 1, _OLD)
+        _ins_trace(db, "laneB", 0.5, 1, _NOW)
+        b, p = db + ".b", db + ".p"
+        shutil.copy(db, b)
+        shutil.copy(db, p)
+        knobs = {**common, "MO_LEARNING_HALFLIFE_DAYS": str(hl)}
+        _recompute_bash_knobs(b, knobs)
+        _recompute_py_knobs(p, knobs)
+        return _gadv(b, "laneA", tc="tc"), _gadv(p, "laneA", tc="tc")
+
+    rec_b, rec_p = pair(14)
+    flat_b, flat_p = pair(0)
+    assert rec_b is not None and flat_b is not None
+    assert rec_b > flat_b, f"recency h14={rec_b} !> h0={flat_b}"
+    assert abs(rec_b - rec_p) < 5e-4, f"recency parity bash={rec_b} py={rec_p}"
+    assert flat_b == flat_p, f"flat parity bash={flat_b} py={flat_p}"
