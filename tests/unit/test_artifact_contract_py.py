@@ -5,7 +5,7 @@ port and asserts byte/JSON-identical output. No mocks, no hardcoded expected
 outputs — expected is always derived from a control bash invocation that
 shares the inputs.
 
->=7 cases (per the kickoff: >=6 required):
+>=8 cases (per the kickoff: >=6 required):
   (1) load default contract (no file)              — JSON byte-equal
   (2) load YAML contract (patch + request_changes) — JSON byte-equal
   (3) load JSON-with-.yaml-extension contract      — JSON byte-equal
@@ -14,10 +14,14 @@ shares the inputs.
   (6) validate nonexistent artifact path          — 'fail' + JSON byte-equal
   (7) DB-coupled: contract with sqlite3 verifier,
       temp DB seeded by db/init.sh, row-count diff — 'pass' + row diff
+  (8) missing-args error path (both entrypoints)   — live bash rc!=0 + port raises
 
-The bash-side unit test (``bash tests/unit/test_artifact_contract.sh``) is
-run separately as a regression guard to prove the bash script was not
-disturbed.
+This file subsumes tests/unit/test_artifact_contract.sh (retired): every one of
+that fixture's 9 assertions drives the live bash lib here. Case (8) was ported
+from the .sh error-path assertions #8/#9 (``artifact_contract_load`` /
+``artifact_contract_validate`` with no args exit non-zero) — the only two the
+value-path helpers never drove, since ``_bash_load``/``_bash_validate`` always
+pass args.
 """
 from __future__ import annotations
 
@@ -356,3 +360,65 @@ def test_validate_db_coupled_verifier_parity(temp_db, monkeypatch):
         f"python verifier wrote {after_py - after_bash} new rows "
         f"(expected 1, total = 2)"
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# (8) missing-args error path — bash ${1:?} guard vs port required-positional.
+#     Ports test_artifact_contract.sh assertions #8/#9: both entrypoints called
+#     with NO args exit non-zero on the live bash side, and the port rejects the
+#     same no-args call by raising (Python's missing-required-positional
+#     TypeError is the analog of bash's ${1:?task_class required}). This is the
+#     one error path the value-path helpers never drove — _bash_load /
+#     _bash_validate always pass args, so the ${1:?} branch was untested here.
+#
+#     Scope note: bash's ${1:?} (colon variant) also errors on an EMPTY-string
+#     arg, whereas the port returns the default contract for load_contract("").
+#     That divergence is out of scope — the .sh only asserts the no-args case
+#     (lines 99/108), so no-args is the faithful port; empty-string parity is
+#     deliberately NOT asserted here (it would not hold).
+# ─────────────────────────────────────────────────────────────────────────────
+def test_missing_args_error_parity():
+    """Both entrypoints reject a no-args call: live bash exits non-zero and the
+    port raises TypeError (missing required positional) — same shape as the
+    benchmark_suite / group_evolver error-path parity cases."""
+    # --- live bash: artifact_contract_load with no args → rc != 0 (${1:?}).
+    # stderr is captured (not routed to /dev/null) so we can prove the ${1:?}
+    # guard actually fired — a missing-function 127 would also be non-zero, so
+    # rc alone could pass vacuously if sourcing ever regressed.
+    r_load = subprocess.run(
+        ["bash", "-c", f'. "{SH}"; artifact_contract_load'],
+        env={**os.environ, "MINI_ORK_ROOT": str(REPO)},
+        capture_output=True, text=True,
+    )
+    assert r_load.returncode != 0, (
+        f"bash artifact_contract_load no-args rc={r_load.returncode} "
+        f"(expected !=0); stdout={r_load.stdout!r} stderr={r_load.stderr!r}"
+    )
+    assert "required" in r_load.stderr, (
+        f"expected the ${{1:?task_class required}} guard to fire, not a "
+        f"source/lookup failure; stderr={r_load.stderr!r}"
+    )
+
+    # --- live bash: artifact_contract_validate with no args → rc != 0. $1 is
+    # checked before $2, so the task_class guard fires first (line 97).
+    r_val = subprocess.run(
+        ["bash", "-c", f'. "{SH}"; artifact_contract_validate'],
+        env={**os.environ, "MINI_ORK_ROOT": str(REPO)},
+        capture_output=True, text=True,
+    )
+    assert r_val.returncode != 0, (
+        f"bash artifact_contract_validate no-args rc={r_val.returncode} "
+        f"(expected !=0); stdout={r_val.stdout!r} stderr={r_val.stderr!r}"
+    )
+    assert "required" in r_val.stderr, (
+        f"expected the ${{1:?task_class required}} guard to fire, not a "
+        f"source/lookup failure; stderr={r_val.stderr!r}"
+    )
+
+    # --- port: same no-args call raises (bash ${1:?} analog). load_contract's
+    # first required positional is task_class; validate()'s is task_class too
+    # (the composer that mirrors artifact_contract_validate <tc> <artifact>).
+    with pytest.raises(TypeError):
+        ac.load_contract()  # type: ignore[call-arg]
+    with pytest.raises(TypeError):
+        ac.validate()  # type: ignore[call-arg]
