@@ -44,6 +44,25 @@ while read -r _old new ref; do
     HEAD | refs/heads/* | refs/codex/*) ;;
     *) continue ;;  # remotes, tags, notes, stash, etc. are not the vector
   esac
+  # worktree-guard: keep implementation work off the main checkout. Creating a
+  # feature branch here (zero -> commit on refs/heads/<x>, x != main/master) is
+  # blocked; branch through a worktree instead. scripts/mini-ork-worktree.sh
+  # sets ALLOW_WORKTREE_BRANCH_CREATE=1 for its own `worktree add -b`.
+  if [ "${ALLOW_WORKTREE_BRANCH_CREATE:-}" != "1" ]; then
+    case "$ref" in
+      refs/heads/main | refs/heads/master) ;;
+      refs/heads/*)
+        if [ "$_old" = "$zero" ] && [ "$new" != "$zero" ]; then
+          echo "[worktree-guard] REJECT direct feature-branch creation: ${ref#refs/heads/}" >&2
+          echo "  Create task branches through a worktree instead:" >&2
+          echo "    scripts/mini-ork-worktree.sh create <task-slug>" >&2
+          echo "  (bypass for a deliberate case: ALLOW_WORKTREE_BRANCH_CREATE=1)" >&2
+          reject=1
+          continue
+        fi
+        ;;
+    esac
+  fi
   [ "$new" = "$zero" ] && continue              # deletions are fine
   git cat-file -e "${new}^{commit}" 2>/dev/null || continue  # non-commit → skip
   # FOREIGN iff it shares no merge-base with our anchor.
