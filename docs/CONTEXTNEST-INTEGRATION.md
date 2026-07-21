@@ -128,7 +128,7 @@ Per the Smoke Test Standard in ContextNest's `docs/roadmap/epics/agent-context-p
 Plus the hermetic unit tests:
 
 ```bash
-bash tests/unit/test_cn_client.sh          # 10 cases, in-process http stub
+python3 -m pytest -q tests/unit/test_cn_client_py.py   # 5 cases, live-bash-vs-port parity (in-process http stub)
 python3 -m pytest -q tests/unit/test_context_assembler_py.py
 ```
 
