@@ -167,3 +167,23 @@ def test_novelty_score_formula_matches_bash_at_1e_6_for_diverse_seeded_inputs():
         bash_score = float(r.stdout.strip())
         assert py_score == pytest.approx(bash_score, abs=1e-6)
         assert 0.0 <= py_score <= 1.0 and 0.0 <= bash_score <= 1.0
+
+
+# (h) — live-bash gaps ported from the retired tests/unit/test_group_evolver.sh.
+# Its "candidate has parent_id" assertion and its non-default
+# MINI_ORK_GROUP_CANDIDATES=2 count check were the only two .sh assertions the
+# parity gate did not drive on the LIVE bash side: test (f) only ever invoked
+# _bash at n=5, which equals the default, so it could not distinguish "honors
+# the env var" from "hardcodes 5", and parent_id (a nondeterministic-envelope
+# key stripped before the structural diff) was never asserted present on bash.
+# No production change: bash group_propose already emits parent_id and honors
+# MINI_ORK_GROUP_CANDIDATES; this only closes the subsumption gap.
+@pytest.mark.parametrize("n", [2, 3])
+def test_bash_nondefault_count_and_parent_id_parity(n):
+    bash = _bash(deepcopy(HISTORY), n=n)
+    py = ge.propose(deepcopy(HISTORY), n_candidates=n)
+    assert len(bash) == n == len(py)  # non-default env count honored by live bash + port
+    for c in bash:
+        assert "parent_id" in c, f"live bash candidate missing parent_id key: {c}"
+    for c in py:
+        assert "parent_id" in c, f"port candidate missing parent_id key: {c}"
