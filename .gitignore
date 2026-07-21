@@ -101,3 +101,14 @@ kickoffs/*autonomy-pluggability*
 .mini-ork/*
 
 !.mini-ork/engine
+
+# Confidential fundraising / strategy / pitch material — NEVER ship to the OSS repo.
+# Open-source repo carries the recipe + engine, not the investor-facing narrative.
+# (see also docs/business-plans/ above). These live locally under internal-docs/.
+docs/pitch/
+internal-docs/**/vc-*.md
+internal-docs/**/*vc-plan*.md
+internal-docs/**/selim-*.md
+internal-docs/**/*nowicki*.md
+recipes/pitch-critique-panel/
+kickoffs/strategy-vs-reality-panel.md
