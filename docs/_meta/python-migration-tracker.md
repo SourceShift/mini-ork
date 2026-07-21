@@ -11,7 +11,7 @@ standalone Python golden contracts replace tests that require deleted code.
 |---|---|---|---|
 | cache.sh | `mini_ork/cache.py` | `test_cache_py.py` (7) | **win #2**: dropped `iter` from match → cross-iteration hits; widened stage set. Proven vs bash (bash misses cross-iter). |
 | trace_store.sh | `mini_ork/trace_store.py` | `test_trace_store_py.py` (3) | reward_g write path; 9-payload reward_g parity. Carries **win #1** natively. |
-| lane_router.sh | `mini_ork/lane_router.py` | `test_lane_router_py.py` (2) | GRPO advantage (shrinkage/EMA/halflife/tiebreak/3-slices) — bit-parity + preferred_lane. |
+| lane_router.sh | `mini_ork/lane_router.py` | `test_lane_router_py.py` (6) | GRPO advantage (shrinkage/EMA/halflife/tiebreak/3-slices) + frc-a5 delayed-penalty fold — bit-parity + preferred_lane. Retired `test_lane_router.sh` (dead fixture at HEAD: migration-subset never created `schema_migrations`, so 0 OK / 1 SKIP); its 9 fold assertions revived as live-bash parity cases. |
 
 ### Dispatch (Phase 1, earlier this session)
 - `mini_ork/dispatch/` is a live backend behind `MO_DISPATCH_BACKEND=python` in
