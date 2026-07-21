@@ -17,7 +17,6 @@ Exit 1 = at least one check failed (see `[FAIL]` lines).
 | File | What it tests | Requires |
 |---|---|---|
 | `tests/smoke.sh` | Deps, DB init, bash syntax, shellcheck | `sqlite3`, `jq`, `git`, `bash 4+` |
-| `tests/unit/test_memory.sh` | `lib/memory.sh` CRUD assertions | `lib/memory.sh` + `db/init.sh` |
 | `tests/unit/test_dispatch.sh` | `lib/dispatch.sh` error-handling | `lib/dispatch.sh` + `db/init.sh` |
 | `tests/integration/test_bin_spawn.sh` | `mini-ork spawn` CLI lineage, child workspace, and child cap | `sqlite3`, `git`, dry-run mode |
 | `tests/e2e/test_e2e_recursive_orchestration.sh` | root -> child -> grandchild recursive orchestration | `sqlite3`, `git`, dry-run mode |
@@ -28,7 +27,6 @@ Exit 1 = at least one check failed (see `[FAIL]` lines).
 ## Running Individual Tests
 
 ```bash
-bash tests/unit/test_memory.sh
 bash tests/unit/test_dispatch.sh
 bash tests/integration/test_bin_spawn.sh
 bash tests/e2e/test_e2e_recursive_orchestration.sh
@@ -61,7 +59,6 @@ jobs:
         run: bash tests/smoke.sh
       - name: Run unit tests
         run: |
-          bash tests/unit/test_memory.sh
           bash tests/unit/test_dispatch.sh
 ```
 
@@ -73,7 +70,6 @@ smoke:
   script:
     - apt-get install -y sqlite3 jq shellcheck git bash
     - bash tests/smoke.sh
-    - bash tests/unit/test_memory.sh
     - bash tests/unit/test_dispatch.sh
 ```
 
@@ -82,7 +78,6 @@ smoke:
 ```makefile
 test:
 	bash tests/smoke.sh
-	bash tests/unit/test_memory.sh
 	bash tests/unit/test_dispatch.sh
 ```
 

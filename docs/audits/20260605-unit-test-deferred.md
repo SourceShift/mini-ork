@@ -63,6 +63,8 @@ The function REQUIRES a `workflow_candidates` row to exist for the given `candid
 
 **Why it's deferred:** the new memory API is itself in active flux per the v3-refactor migrations (0006_v2_refactor_layers.sql, 0007_v3_refactor_layers.sql). Locking a test against `mo_mem_*` today freezes work-in-progress; better to defer until the memory shape stabilizes.
 
+**Superseded — 2026-07-21:** the `mo_mem_*` API has stabilized — no epic-CRUD verbs remain in `lib/memory.sh` (grep-confirmed), and the shape is now `arch_spec` / `node_annotation` / `inspector_run` / `module_plan` / `atom_pr` / `adr` / `task` / `failure`. The live API is covered by the strangler-fig parity gate `tests/unit/test_memory_py.py` (10 passed), which drives `lib/memory.sh` via subprocess. `test_memory.sh` — which had run 0 assertions since the API-drift guard landed — is therefore **retired** as a dead fixture: it tested the removed epic-CRUD model, not the current API, so removing it loses zero coverage (the current API's coverage lives in the parity gate). This closes the "deferred until the memory shape stabilizes" recommendation above.
+
 ## What this does NOT cover
 
 This audit is scoped to `tests/unit/`. Adjacent gaps (each its own follow-up):
