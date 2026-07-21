@@ -43,6 +43,8 @@ The function REQUIRES a `workflow_candidates` row to exist for the given `candid
 
 **Why it's deferred:** my W1-D `mo_promote_synthesis_gate` function has its own dedicated test (`tests/unit/test_promotion_synthesis_gate.sh`, 15 assertions, all green). The OLD `promotion_evaluate` API is functional but its test predates the workflow_candidates dependency — fixing it doesn't unblock v0.3 work.
 
+**Retired — 2026-07-21:** the 5 failed assertions above were fixed on 2026-06-06 (`c411b08`, → 7 OK / 0 FAIL — see the resolution table below), and the fixture is now **retired**. The `promotion_evaluate` / `promotion_approve` / `mo_promote_synthesis_gate` surface is covered by the strangler-fig parity gate `tests/unit/test_promotion_gate_py.py` (9 passed), which drives the LIVE `lib/promotion_gate.sh` via subprocess (seeding `workflow_candidates` + `workflow_memory` the way this audit prescribed) and deep-compares rc/stdout/state against the port `mini_ork.gates.promotion_gate`. All 7 `.sh` assertions are subsumed as live-bash cases; the one gap — assertion #7, `promotion_evaluate` with no args → non-zero exit — was ported as `test_promotion_evaluate_missing_arg_error_parity` (asserts live-bash `rc != 0` AND `candidate_id required` in stderr, proving the `${1:?}` guard fired; the port raises `TypeError` as the analog), so removing the `.sh` loses zero coverage of the retained `MINI_ORK_RUNTIME=bash` fallback path. No production change was required.
+
 ### 2. `tests/unit/test_benchmark_suite.sh` — 2 failed assertions
 
 **Symptom:**
