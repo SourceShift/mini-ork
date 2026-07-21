@@ -7,6 +7,7 @@ excluded — bash stamps strftime('now')), applied schema, and status/verify.
 from __future__ import annotations
 
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -162,3 +163,58 @@ def test_verify_parity(tmp_path, migdir):
         con.commit(); con.close()
     _, _, rc_b2 = _bash("mo_migrate_verify", migdir, db=db_b)
     assert rc_b2 == mig.migrate_verify(migdir, db=db_p) == 1
+
+
+def test_failing_migration_rollback_parity(tmp_path):
+    """A migration with invalid SQL must roll back on BOTH sides: rc=1, the
+    partial DDL is NOT committed (the bad table is absent), and the migration is
+    NOT recorded in schema_migrations — while a preceding good migration stays
+    committed. Mirrors tests/unit/test_migrate.sh case 6 (transactional
+    rollback), which the parity gate did not exercise (all MIGS are valid SQL).
+    The port's _apply_one wraps each migration in BEGIN;…COMMIT; and ROLLBACKs
+    on sqlite3.Error, so no production change is required."""
+    d = tmp_path / "migrations"; d.mkdir()
+    (d / "001_ok.sql").write_text("CREATE TABLE good (id INTEGER);\n")
+    (d / "002_bad.sql").write_text(
+        "CREATE TABLE bad (id INTEGER);\nTHIS IS NOT VALID SQL;\n")
+    migdir = str(d)
+    db_b, db_p = str(tmp_path / "b.db"), str(tmp_path / "p.db")
+
+    _, _, rc_b = _bash("mo_migrate_apply", migdir, "0", db=db_b)
+    rc_p, _ = mig.migrate_apply(migdir, db=db_p)
+    assert rc_b == rc_p == 1  # both fail on the bad migration
+
+    # identical end-state on both sides: good table + schema_migrations only.
+    assert _tables(db_b) == _tables(db_p)
+    assert "good" in _tables(db_b) and "bad" not in _tables(db_b)  # partial DDL not committed
+    # bad migration NOT recorded; good migration recorded — identical rows.
+    assert _sm_rows(db_b) == _sm_rows(db_p)
+    recorded = {r[0] for r in _sm_rows(db_b)}
+    assert "001_ok.sql" in recorded and "002_bad.sql" not in recorded
+
+
+def test_status_counts_parity(tmp_path, migdir):
+    """mo_migrate_status's 'N applied, M pending, K drifted (of T)' summary must
+    agree with the port's (applied, pending, drifted, total) tuple across all
+    three counters. Mirrors tests/unit/test_migrate.sh case 7a, which the parity
+    gate did not drive (no _py.py case invoked mo_migrate_status). Scenario
+    exercises every counter at once: apply the 3 MIGS, add a never-applied
+    migration (pending) and drift one applied migration (drifted)."""
+    db_b, db_p = str(tmp_path / "b.db"), str(tmp_path / "p.db")
+    _bash("mo_migrate_apply", migdir, "0", db=db_b)
+    mig.migrate_apply(migdir, db=db_p)
+
+    Path(migdir, "004_pending.sql").write_text("CREATE TABLE pend (id INTEGER);\n")
+    for db in (db_b, db_p):
+        con = sqlite3.connect(db)
+        con.execute("UPDATE schema_migrations SET checksum=? WHERE filename='002_bar.sql'",
+                    ("d" * 64,))  # real-but-wrong 64-hex → drift, not legacy
+        con.commit(); con.close()
+
+    out_b, _, _ = _bash("mo_migrate_status", migdir, db=db_b)
+    port = mig.migrate_status(migdir, db=db_p)  # (applied, pending, drifted, total)
+
+    m = re.search(r"(\d+) applied, (\d+) pending, (\d+) drifted \(of (\d+)\)", out_b)
+    assert m, f"no summary line in bash mo_migrate_status output:\n{out_b}"
+    bash_counts = tuple(map(int, m.groups()))
+    assert bash_counts == port == (3, 1, 1, 4)
