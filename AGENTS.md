@@ -20,6 +20,29 @@ This file is the canonical context map. Detail lives in `docs/`; procedural know
 - Path contract: `lib/paths.sh` resolves `ENGINE_ROOT`, `PROJECT_HOME`, `TARGET_REPO`.
 - `mini-ork init` scaffolds `.mini-ork/` and writes a committed `.mini-ork/engine` pointer.
 
+## Dev loop — worktree first
+
+`main` stays clean: implementation work never happens in the main checkout. A
+`reference-transaction` guard (`.githooks/reference-transaction`) blocks direct
+feature-branch creation — branch through a worktree instead.
+
+```bash
+make worktree SLUG=<slug>            # new worktree + branch off origin/main
+#   … edit + commit inside the worktree …
+make worktree-merge SLUG=<slug>      # rebase origin/main → green-gate → push HEAD:main
+make worktree-clean SLUG=<slug>      # remove worktree + delete branch
+```
+
+- Worktrees live under `/Volumes/docker-ssd/ps/mini-ork-worktrees/<slug>`
+  (`MINI_ORK_WORKTREES_DIR` to override); branches are `wt/<slug>`.
+- `--owns <path>` claims a file surface (CAID registry); a second worktree whose
+  claim overlaps a live one is refused, so concurrent agents can't race a file.
+  `make worktree SLUG=x OWNS="mini_ork/foo.py tests/bar"`.
+- The green gate runs `python3 -m pytest -q` before pushing; scope it per-task
+  with `MINI_ORK_TEST_CMD` (e.g. a single parity gate for a fast merge).
+- Merge is `push HEAD:main` (no PR); never `reset --hard` or revert main.
+- One-time per clone: `make install-hooks` (activates `.githooks/`).
+
 ## Quality gates (run before committing)
 
 ```bash
