@@ -134,3 +134,79 @@ def test_grade_run_reward_bash_vs_python(db, tmp_path):
     # missing rubric → no-op (0 rows), leaves status-map reward intact
     empty = tmp_path / "no-rubric"; empty.mkdir()
     assert trace_store.grade_run_reward(str(empty), "grade-py", db=db) == 0
+
+
+# ── ported from test_trace_store.sh at retirement ──────────────────────────
+# The unit fixture's CRUD/query/error surface was disjoint from this gate's
+# reward_g/grading focus. These bash-vs-py parity cases port its un-subsumed
+# assertions: trace_query --status/--task-class filtering, trace_get unknown-id
+# → null, and the two write error-paths (invalid JSON, MINI_ORK_DB unset). The
+# fixture's trace_attach_artifact assertions are deliberately NOT ported: that
+# lib function has no Python port and stays covered live by
+# tests/e2e/test_e2e_trace_lifecycle.sh.
+
+def _init_db(home: Path) -> str:
+    home.mkdir(parents=True, exist_ok=True)
+    dbp = str(home / "state.db")
+    subprocess.run(
+        ["bash", str(REPO / "db" / "init.sh")],
+        env={**os.environ, "MINI_ORK_HOME": str(home), "MINI_ORK_DB": dbp},
+        capture_output=True, text=True, check=True,
+    )
+    return dbp
+
+
+def _bash_query(db, *args):
+    r = subprocess.run(
+        ["bash", "-c", f'. "{TS_SH}" && trace_query "$@"', "_", *args],
+        env={**os.environ, "MINI_ORK_DB": db}, capture_output=True, text=True, check=True,
+    )
+    return json.loads(r.stdout or "[]")
+
+
+def _bash_get(db, trace_id):
+    r = subprocess.run(
+        ["bash", "-c", f'. "{TS_SH}" && trace_get "$1"', "_", trace_id],
+        env={**os.environ, "MINI_ORK_DB": db}, capture_output=True, text=True, check=True,
+    )
+    return r.stdout.strip()
+
+
+def _bash_write_rc(env, payload):
+    return subprocess.run(
+        ["bash", "-c", f'. "{TS_SH}" && trace_write "$1"', "_", payload],
+        env=env, capture_output=True, text=True,
+    ).returncode
+
+
+def test_query_filters_parity(tmp_path):
+    db = _init_db(tmp_path / "qhome")
+    trace_store.trace_write({"trace_id": "q-1", "task_class": "unit-test", "status": "success"}, db=db)
+    trace_store.trace_write({"trace_id": "q-2", "task_class": "unit-test", "status": "failure"}, db=db)
+    trace_store.trace_write({"trace_id": "q-3", "task_class": "other-class", "status": "success"}, db=db)
+    # status filter: live bash trace_query --status X  ==  python trace_query(status=X)
+    assert len(_bash_query(db, "--status", "success")) == len(trace_store.trace_query(status="success", db=db)) == 2
+    assert len(_bash_query(db, "--status", "failure")) == len(trace_store.trace_query(status="failure", db=db)) == 1
+    # task-class filter
+    assert len(_bash_query(db, "--task-class", "unit-test")) == len(trace_store.trace_query(task_class="unit-test", db=db)) == 2
+    assert len(_bash_query(db, "--task-class", "other-class")) == len(trace_store.trace_query(task_class="other-class", db=db)) == 1
+
+
+def test_get_unknown_id_parity(tmp_path):
+    db = _init_db(tmp_path / "ghome")
+    assert _bash_get(db, "tr-doesnotexist") == "null"
+    assert trace_store.trace_get("tr-doesnotexist", db=db) is None
+
+
+def test_write_fail_closed_parity(tmp_path, monkeypatch):
+    db = _init_db(tmp_path / "ehome")
+    # invalid JSON → bash exits non-zero, python raises
+    assert _bash_write_rc({**os.environ, "MINI_ORK_DB": db}, "not-valid-json") != 0
+    with pytest.raises((ValueError, TypeError)):
+        trace_store.trace_write("not-valid-json", db=db)
+    # MINI_ORK_DB unset → bash exits non-zero, python raises RuntimeError
+    env_no_db = {k: v for k, v in os.environ.items() if k != "MINI_ORK_DB"}
+    assert _bash_write_rc(env_no_db, '{"task_class":"x"}') != 0
+    monkeypatch.delenv("MINI_ORK_DB", raising=False)
+    with pytest.raises(RuntimeError):
+        trace_store.trace_write({"task_class": "x"})
