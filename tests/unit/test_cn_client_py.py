@@ -96,6 +96,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path.startswith("/api/v1/substrate/health"):
             self._send("")
+        elif self.path.startswith("/api/v1/prompt-context/capsule"):
+            self._send(_CAPSULE_MD)
         elif self.path.startswith("/api/v1/inbox"):
             self._send('{"items":[{"kind":"todo","id":"x"}]}')
         else:
@@ -103,14 +105,47 @@ class _Handler(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self):
         ln = int(self.headers.get("Content-Length", 0))
-        self.rfile.read(ln)
+        raw = self.rfile.read(ln) if ln else b"{}"
+        # cc/hook/<event> — record the fire-and-forget hook and 204 (mirrors CN).
+        if self.path.startswith("/api/v1/cc/hook/"):
+            event = self.path.rsplit("/", 1)[-1]
+            try:
+                body = json.loads(raw)
+            except Exception:
+                body = {}
+            self.server.hook_events.append({"event": event, "body": body})
+            self.send_response(204)
+            self.end_headers()
+            return
         self._send('{"hits":[{"content":"hi","similarity":0.5}]}')
+
+
+# Markdown capsule body served at /api/v1/prompt-context/capsule — mirrors the
+# kind-ordered sections the retired .sh stub emitted (## Risks / ## Decisions).
+_CAPSULE_MD = (
+    "# Prompt Context\n\n"
+    "## Risks\n- [risk_flag x3] stub capsule risk\n\n"
+    "## Decisions\n- [decision_made x2] stub capsule decision\n"
+)
 
 
 def _server():
     srv = http.server.HTTPServer(("127.0.0.1", 0), _Handler)
+    srv.hook_events = []  # cc/hook POSTs land here (fire-and-forget, polled)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     return srv, f"http://127.0.0.1:{srv.server_address[1]}"
+
+
+def _poll_hooks(srv, want: int, timeout: float = 5.0):
+    """cn_hook_post is fire-and-forget on BOTH sides (bash `curl &`, port daemon
+    thread) — poll the server until `want` events land or timeout."""
+    import time as _t
+    deadline = _t.time() + timeout
+    while _t.time() < deadline:
+        if len(srv.hook_events) >= want:
+            break
+        _t.sleep(0.05)
+    return list(srv.hook_events)
 
 
 def test_http_parity(tmp_path):
@@ -155,3 +190,69 @@ def test_disabled_and_down_fallback(tmp_path):
     finally:
         os.environ.clear(); os.environ.update(old)
     assert rb.strip() == rp.strip() == "{}"
+
+
+# ---- 4. available / capsule / hook_post parity ----
+#
+# Ported from the retired tests/unit/test_cn_client.sh. Three of its assertions
+# drove live bash functions the parity gate never exercised: `cn_available`
+# (return code against a healthy stub — the gate only reached health transitively
+# via cn_retrieve), `cn_capsule` (## Risks / ## Decisions markdown — no case), and
+# `cn_hook_post` (fire-and-forget POST to /api/v1/cc/hook/<event> — no case, and
+# the mock server did not even implement that endpoint). The port is complete for
+# all three (available()/capsule()/hook_post()), so these are added as live-bash
+# parity cases; no production change was required. The mock server now serves
+# /api/v1/prompt-context/capsule and records /api/v1/cc/hook/ POSTs.
+def test_available_hook_capsule_parity(tmp_path):
+    srv, base = _server()
+    try:
+        # #1 cn_available — healthy stub → reachable on both sides.
+        env_b = {"CN_BASE_URL": base, "MINI_ORK_HOME": str(tmp_path / "a_b"),
+                 "CN_TIMEOUT_SEC": "5", "CN_PING_TTL": "0"}
+        rb = _bash_fn('if cn_available; then echo true; else echo false; fi', env=env_b)
+        old = dict(os.environ)
+        os.environ.update({"CN_BASE_URL": base, "MINI_ORK_HOME": str(tmp_path / "a_p"),
+                           "CN_TIMEOUT_SEC": "5", "CN_PING_TTL": "0"})
+        try:
+            avail_p = cn.available()
+        finally:
+            os.environ.clear(); os.environ.update(old)
+        assert rb.strip() == ("true" if avail_p else "false") == "true"
+
+        # #7/#8 cn_capsule — kind-ordered markdown, byte-parity + section markers.
+        env_b = {"CN_BASE_URL": base, "MINI_ORK_HOME": str(tmp_path / "c_b"),
+                 "CN_TIMEOUT_SEC": "5", "CN_PING_TTL": "0"}
+        rb = _bash_fn('cn_capsule "$1" "$2"', "stub", "14d", env=env_b)
+        old = dict(os.environ)
+        os.environ.update({"CN_BASE_URL": base, "MINI_ORK_HOME": str(tmp_path / "c_p"),
+                           "CN_TIMEOUT_SEC": "5", "CN_PING_TTL": "0"})
+        try:
+            rp = cn.capsule("stub", "14d")
+        finally:
+            os.environ.clear(); os.environ.update(old)
+        assert rb.strip() == rp.strip(), f"capsule\nBASH:{rb!r}\nPY:{rp!r}"
+        assert "## Risks" in rp and "## Decisions" in rp
+
+        # #6 cn_hook_post — fire-and-forget POST reaches /api/v1/cc/hook/session_start
+        # on BOTH sides. Distinct session_ids prove each side drove the endpoint.
+        srv.hook_events.clear()
+        env_b = {"CN_BASE_URL": base, "MINI_ORK_HOME": str(tmp_path / "h_b"),
+                 "CN_TIMEOUT_SEC": "5", "CN_HOOK_TIMEOUT_SEC": "5", "CN_PING_TTL": "0"}
+        _bash_fn('cn_hook_post "$1" "$2" "$3" "$4"', "session_start", "sess-bash", "/tmp", "",
+                 env=env_b)
+        old = dict(os.environ)
+        os.environ.update({"CN_BASE_URL": base, "MINI_ORK_HOME": str(tmp_path / "h_p"),
+                           "CN_TIMEOUT_SEC": "5", "CN_HOOK_TIMEOUT_SEC": "5", "CN_PING_TTL": "0"})
+        try:
+            cn.hook_post("session_start", "sess-py", "/tmp", "")
+        finally:
+            os.environ.clear(); os.environ.update(old)
+        got = _poll_hooks(srv, want=2, timeout=5.0)
+        assert len(got) >= 2, f"expected >=2 hook POSTs, got {got}"
+        sids = {e["body"].get("session_id") for e in got if e["event"] == "session_start"}
+        assert "sess-bash" in sids and "sess-py" in sids, f"hook session_ids={sids}"
+        for e in got:
+            assert e["event"] == "session_start"
+            assert e["body"].get("hook_event_name") == "session_start"
+    finally:
+        srv.shutdown()
