@@ -443,3 +443,42 @@ def test_run_with_runner_fn_parity(db):
     for r in py_summary["results"]:
         assert r["passed"] is True
         assert abs(r["utility_score"] - 0.5) <= _FLOAT_TOL
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# (j) run on an EMPTY task table → total_tasks=0 (no crash)
+#
+# Ported from the retired tests/unit/test_benchmark_suite.sh case #8. It was the
+# only .sh assertion the parity gate did not drive on the live bash side: cases
+# (g)/(i) always seed >=2 tasks before benchmark_run, so neither exercised the
+# empty-table branch. The function-scoped `db` fixture gives a fresh
+# benchmark_tasks table with zero rows, so no add()/DELETE is needed. No
+# production change is required: the port's run() returns total_tasks=len(tasks)
+# and guards avg_util with `if total else 0.0`, and bash benchmark_run already
+# emits total_tasks=0 on an empty table.
+# ─────────────────────────────────────────────────────────────────────────────
+def test_run_empty_task_table_parity(db):
+    _which_bash()
+    env_bash = {**os.environ, "MINI_ORK_ROOT": str(REPO), "MINI_ORK_DB": db}
+    src = (
+        f'source "{SH}"\n'
+        f'unset MINI_ORK_WORKFLOW_RUNNER_FN\n'
+        f'benchmark_run "cand-empty"\n'
+    )
+    r = subprocess.run(
+        ["bash", "-c", src], env=env_bash, capture_output=True, text=True,
+    )
+    assert r.returncode == 0, (
+        f"bash benchmark_run on empty table rc={r.returncode}\nstderr={r.stderr}"
+    )
+    bash_summary = json.loads(r.stdout.strip())
+
+    py_summary = bench.run("cand-empty", db=db)
+
+    # Strip the volatile ran_at, then deep-compare the full summary shape.
+    for obj in (bash_summary, py_summary):
+        obj.pop("ran_at", None)
+    _assert_parity(bash_summary, py_summary)
+
+    # The ported contract: live bash and port agree total_tasks == 0.
+    assert bash_summary["total_tasks"] == py_summary["total_tasks"] == 0
