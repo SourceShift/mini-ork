@@ -14,7 +14,8 @@
 # web-test            Run the observability smoke test suite.
 
 .PHONY: install-hooks uninstall-hooks readme-claim-check readme-drift-panel help \
-        web-deps web-build web-serve web-dev web-up web-test dev-all
+        web-deps web-build web-serve web-dev web-up web-test dev-all \
+        worktree worktree-merge worktree-clean worktree-list
 
 PORT ?= 7090
 
@@ -33,6 +34,12 @@ help:
 	@echo "  make web-up              boot API + Vite dev in parallel (Ctrl-C kills both)"
 	@echo "  make dev-all             alias for web-up — all FE+BE with hot reload"
 	@echo "  make web-test            run tests/test_web_smoke.py"
+	@echo ""
+	@echo "Worktree-first dev (keep main clean):"
+	@echo "  make worktree SLUG=<slug>       create a task worktree + branch"
+	@echo "  make worktree-merge [SLUG=<s>]  rebase origin/main, green-gate, push HEAD:main"
+	@echo "  make worktree-clean SLUG=<slug> remove worktree + delete branch"
+	@echo "  make worktree-list              list all worktrees"
 
 install-hooks:
 	@git config core.hooksPath .githooks
@@ -48,6 +55,21 @@ install-hooks:
 uninstall-hooks:
 	@git config --unset core.hooksPath 2>/dev/null || true
 	@echo "✓ hooks dir reset to git default"
+
+# ── worktree-first dev ───────────────────────────────────────────────────────
+worktree:
+	@[ -n "$(SLUG)" ] || { echo "usage: make worktree SLUG=<slug> [OWNS=\"path1 path2\"]"; exit 1; }
+	@bash scripts/mini-ork-worktree.sh create "$(SLUG)" $(if $(OWNS),$(foreach p,$(OWNS),--owns $(p)),)
+
+worktree-merge:
+	@bash scripts/mini-ork-worktree.sh merge $(SLUG)
+
+worktree-clean:
+	@[ -n "$(SLUG)" ] || { echo "usage: make worktree-clean SLUG=<slug>"; exit 1; }
+	@bash scripts/mini-ork-worktree.sh clean "$(SLUG)"
+
+worktree-list:
+	@bash scripts/mini-ork-worktree.sh list
 
 readme-claim-check:
 	@bash scripts/readme-claim-check.sh
