@@ -388,3 +388,41 @@ def test_has_unconsumed_mixed_rows_subset_parity(tmp_path_factory, monkeypatch):
         py_rc = sc.has_unconsumed(run_id, role)
         assert bash_rc == py_rc == expected, (
             f"probe=({run_id},{role}): bash={bash_rc} py={py_rc} exp={expected}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# (i) expired row → not actionable (expires_at in the past; the `expires_at >
+#     now` clause filters it) — mirrors tests/unit/test_steering_checkpoint.sh
+#     case 4, which the parity gate previously did not exercise.
+# ─────────────────────────────────────────────────────────────────────────────
+def test_has_unconsumed_expired_row_ignored_parity(tmp_path_factory, monkeypatch):
+    """A steering row whose expires_at is in the past is filtered by the
+    `expires_at > now` clause. The row is otherwise addressed to this run and
+    unconsumed, so this isolates the expiry filter — bash and Python both
+    report rc=1 (not actionable)."""
+    db, home = _init_db(tmp_path_factory)
+    env = _point_env(monkeypatch, db=db, home=home)
+
+    past = int(time.time() * 1000) - 1000  # 1s before now
+    _seed_row(db, run_id="r-exp", role_target="any", expires_at=past)
+
+    assert _bash_has_unconsumed(env, "r-exp")[0] == sc.has_unconsumed("r-exp") == 1
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# (j) consumed row → not actionable (consumed_at set; the `consumed_at IS NULL`
+#     clause filters it) — mirrors tests/unit/test_steering_checkpoint.sh case 5,
+#     which the parity gate previously did not exercise.
+# ─────────────────────────────────────────────────────────────────────────────
+def test_has_unconsumed_consumed_row_ignored_parity(tmp_path_factory, monkeypatch):
+    """A steering row that has already been consumed (consumed_at set) is
+    filtered by the `consumed_at IS NULL` clause. expires_at stays in the
+    future so this isolates the consumed filter — bash and Python both report
+    rc=1 (not actionable)."""
+    db, home = _init_db(tmp_path_factory)
+    env = _point_env(monkeypatch, db=db, home=home)
+
+    now = int(time.time() * 1000)
+    _seed_row(db, run_id="r-con", role_target="any", consumed_at=now)
+
+    assert _bash_has_unconsumed(env, "r-con")[0] == sc.has_unconsumed("r-con") == 1
