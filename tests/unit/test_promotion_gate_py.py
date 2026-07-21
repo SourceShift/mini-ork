@@ -9,9 +9,15 @@ return-code parity (rc=0/1/2).
 The test fixture initialises a fresh DB via ``db/init.sh`` (mirrors the
 production init path so migration 0011's promotion_records schema is
 present), then seeds ``workflow_memory`` + ``workflow_candidates`` rows
-the same way ``tests/unit/test_promotion_gate.sh`` does.
+the same way ``tests/unit/test_promotion_gate.sh`` (retired) did.
 
-Seven cases (above the kickoff's >=6 floor):
+This file subsumes that retired .sh fixture: every one of its 7 assertions
+drives the live bash lib here. Case (8) was ported from the .sh error-path
+assertion (``promotion_evaluate`` with no args exits non-zero) — the only one
+the value-path helper ``_bash_evaluate`` never drove, since it always passes a
+candidate_id.
+
+Eight cases (above the kickoff's >=6 floor):
 
   (1) ``promotion_evaluate`` with no benchmark rows → decision in
       {quarantined, rejected} AND JSON-key parity AND float equality at 1e-6.
@@ -31,6 +37,8 @@ Seven cases (above the kickoff's >=6 floor):
       test): (a) low_panel_score → rc=1 reason='low_panel_score';
       (b) high panel but no structural signal → rc=1 reason='no_structural_signal';
       (c) bad JSON file → rc=2.
+  (8) ``promotion_evaluate`` with no args → live bash exits non-zero
+      (${1:?candidate_id required} guard) AND the port raises TypeError.
 
 Floats: utility_before / utility_after / utility_delta equality at 1e-6
 after JSON-key normalisation. The bash function uses Python's f'{x:.4f}'
@@ -580,3 +588,45 @@ def test_mo_promote_synthesis_gate_rejections(tmp_path, db):
     pobj, prc = _py_synthesis(str(bad), "ui_audit")
     assert prc == 2
     assert "error" in pobj
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# (8) missing-arg error path — bash ${1:?} guard vs port required-positional.
+#     Ports test_promotion_gate.sh's error-path assertion (its line 137):
+#     `promotion_evaluate` with no args exits non-zero. This is the one .sh
+#     assertion the value-path cases never drove — _bash_evaluate always passes
+#     a candidate_id, so the ${1:?candidate_id required} guard branch (lib line
+#     53) was never exercised here. The port's promotion_evaluate declares
+#     db_path + candidate_id as required positionals, so a no-args call raises
+#     TypeError — the Python analog of bash's ${1:?}. Same parity shape as the
+#     artifact_contract / benchmark_suite error-path cases (live bash rc!=0 AND
+#     port raises).
+# ───────────────────────────────────────────────────────────────────────────
+
+
+def test_promotion_evaluate_missing_arg_error_parity():
+    """`promotion_evaluate` rejects a no-args call: live bash exits non-zero via
+    its ${1:?candidate_id required} guard, and the port raises TypeError."""
+    _which_tools()
+    # stderr is captured (not routed to /dev/null) so we can prove the ${1:?}
+    # guard fired — a missing-function 127 would also be non-zero, so rc alone
+    # could pass vacuously if sourcing ever regressed.
+    src = f'source "{_shlex_quote(str(LIB))}"; promotion_evaluate\n'
+    r = subprocess.run(
+        ["bash", "-c", src],
+        env={**os.environ, "MINI_ORK_ROOT": str(REPO)},
+        capture_output=True, text=True, timeout=30,
+    )
+    assert r.returncode != 0, (
+        f"bash promotion_evaluate no-args rc={r.returncode} (expected !=0); "
+        f"stdout={r.stdout!r} stderr={r.stderr!r}"
+    )
+    assert "candidate_id required" in r.stderr, (
+        f"expected the ${{1:?candidate_id required}} guard to fire, not a "
+        f"source/lookup failure; stderr={r.stderr!r}"
+    )
+
+    # Port: same no-args call raises (bash ${1:?} analog). Both positionals
+    # (db_path, candidate_id) are required, so binding fails before the body.
+    with pytest.raises(TypeError):
+        pg.promotion_evaluate()  # type: ignore[call-arg]
