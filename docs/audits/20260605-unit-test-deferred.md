@@ -55,6 +55,8 @@ The function REQUIRES a `workflow_candidates` row to exist for the given `candid
 
 **Why it's deferred:** same as above — doesn't block v0.3 phase delivery. The `benchmark_list` / `benchmark_run` / `benchmark_results` assertions all pass post-migration-patch.
 
+**Retired — 2026-07-21:** the two symptoms above were fixed on 2026-06-06 (`c6d735a`, → 10 OK / 0 FAIL), and the fixture is now **retired**. The `benchmark_add` / `benchmark_list` / `benchmark_run` / `benchmark_results` surface is covered by the strangler-fig parity gate `tests/unit/test_benchmark_suite_py.py` (10 passed), which drives the LIVE `lib/benchmark_suite.sh` via subprocess and deep-compares against the port `mini_ork.learning.benchmark_suite`. All 10 `.sh` assertions are subsumed as live-bash cases; the one gap — case #8, `benchmark_run` on an empty task table → `total_tasks=0` — was ported as `test_run_empty_task_table_parity` (case j), so removing the `.sh` loses zero coverage of the retained `MINI_ORK_RUNTIME=bash` fallback path. No production change was required.
+
 ### 3. `tests/unit/test_memory.sh` — 1 SKIP (was 1 FAIL)
 
 **Now SKIP-deferred** via API-drift guard added in commit `1dc17de` follow-up: `lib/memory.sh` no longer defines `memory_create_epic` / `memory_get_epic` / etc. — the lib pivoted to a `mo_mem_put_arch_spec` / `mo_mem_put_node_annotation` shape after the v3-refactor migrations. The test was never rewritten against the new API.
