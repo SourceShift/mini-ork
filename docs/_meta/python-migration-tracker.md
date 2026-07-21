@@ -63,3 +63,22 @@ graded reward_g, bash+python), lane-fallback hang-proofing (dispatch_with_fallba
 - assorted leaves: workflow_lifecycle, operator_steering, steering_checkpoint,
   mid_node_injector, role_evolver, runs-tracker, spec-split, artifact_contract,
   reflection-refiner, cross_epic_gradient
+
+## Fixture-retirement sweep (ADR-001 strangler-fig)
+Same-stem bash↔`_py.py` pairs split into two classes:
+- **Standalone-lib fixtures — model-(a), py gate drives LIVE bash → RETIRED:**
+  coord_gate, coord_registry_ttl, lane_router_refinements, trace_store,
+  active_state_index. Each ported its un-subsumed live-bash assertions into the
+  native parity gate before `git rm` (trace_store: query/unknown-id/write-error
+  cases; coord_gate: strict-no-conflict + live leases_held).
+- **repo_integrity_guard — DISQUALIFIED (not retired):** its fixture bundles the
+  guard (subsumed by the py gate) AND group (f), the `.githooks/pre-push`
+  README-drift tag-advisory/main-block downgrade, whose ONLY live coverage is
+  this fixture (a shell git hook, no Python port; test_pre_push_review_py.py
+  covers a different concern). `git rm` would orphan (f). Follow-up (hardening,
+  not retirement): port guard-native gaps — cold-start creates LKG, virgin
+  disabled writes nothing, not-in-worktree, slash-branch LKG sanitization.
+- **Dispatch-umbrella fixtures — DEFERRED to the llm-dispatch.sh port:**
+  provider_registry, run_artifacts, dispatch (+ telemetry/retry/tool-grant). Their
+  py gates test native `mini_ork.dispatch.*` while `lib/llm-dispatch.sh` is still
+  the runtime, so retiring now loses live-bash coverage. Retire WITH the dispatcher.
