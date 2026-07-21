@@ -17,7 +17,7 @@ runs when the gate is loaded as a script body (``BASH_SOURCE[0]``); when
 the gate is sourced as a library in a subshell, we source the registry
 explicitly so the auto-source path matches.
 
-Eight cases (above the kickoff's >=6 floor):
+Ten cases (above the kickoff's >=6 floor):
   (a) check advisory + no conflict        → rc=0, empty stdout, empty stderr
   (b) check advisory + active write holder → rc=0, stderr "WAIT before..."
   (c) check strict + in-scope conflict    → rc=11, stderr "strict deny..."
@@ -27,6 +27,14 @@ Eight cases (above the kickoff's >=6 floor):
   (f) metrics() on empty state             → 4-key default JSON
   (g) metrics_field after bump_sequence     → integer equality (no drift)
   (h) audit() bounded ring buffer           → most-recent-first, count/max
+  (i) check strict + no conflict           → rc=0, empty streams (parity)
+  (j) metrics coord_leases_held            → observe() counts the LIVE
+                                             registry snapshot (1, then 2)
+
+Cases (i) and (j) were ported from tests/integration/test_coord_gate.sh
+(strict-mode-no-conflict silence, and the observe()-driven live-lease count)
+when that bash fixture was retired — the two assertions the gate above did
+not already subsume.
 """
 from __future__ import annotations
 
@@ -443,3 +451,61 @@ def test_audit_bounded_ring_buffer_parity(home, monkeypatch):
     assert all(isinstance(v, int) for v in (
         bash_aud["count"], bash_aud["max"]))
     assert abs(float(bash_aud["count"]) - float(py_aud["count"])) <= _FLOAT_TOL
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# (i) check strict + NO conflict → rc=0, empty streams.
+#     Ported from test_coord_gate.sh test 3: strict mode must stay silent and
+#     allow (rc=0) when the registry holds no overlapping lease — the parity
+#     gate above only exercised strict mode WITH a conflict (c/d), so the
+#     "strict allows a clean path" branch went uncovered until this port.
+# ───────────────────────────────────────────────────────────────────────────
+def test_strict_no_conflict_silent_parity(home):
+    _which_bash()
+    _seed_registry(home)  # empty registry → nothing to conflict with
+    bso, bse, brc = _bash_check(home, "agent-a", "/scoped/x/y", "write",
+                                gate_mode="strict", gate_scope="/scoped")
+    pso, pse, prc = _py_check(home, "agent-a", "/scoped/x/y", "write",
+                              gate_mode="strict", gate_scope="/scoped")
+    _assert_parity(bso, pso, bse, pse, brc, prc)
+    assert brc == 0
+    assert bso == "" and bse == ""
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# (j) metrics coord_leases_held reflects the LIVE registry snapshot.
+#     Ported from test_coord_gate.sh test 4: a coord_gate_check runs observe(),
+#     which snapshots the registry into the metrics file; coord_leases_held
+#     must equal the number of active leases (1, then 2). The parity gate's
+#     other metrics cases only covered empty→0 (f) and record-based bumps (g),
+#     never the observe()-driven live count. A check on a NON-overlapping path
+#     is used so observe() fires without the check itself mutating the registry.
+# ───────────────────────────────────────────────────────────────────────────
+def test_leases_held_live_snapshot_parity(home):
+    _which_bash()
+
+    def _reset_state() -> None:
+        for name in ("metrics.json", "audit.json", "registry.json"):
+            p = home / name
+            if p.exists():
+                p.unlink()
+
+    def _leases(n: int) -> list[dict]:
+        return [{"lease_id": f"lid{i}", "agent": f"holder-{i}",
+                 "path": f"/held/p{i}", "mode": "write"} for i in range(n)]
+
+    def _bash_held(n: int) -> int:
+        _reset_state()
+        _seed_registry(home, leases=_leases(n))
+        # unrelated path → observe() fires, no conflict, no registry mutation
+        _bash_check(home, "req", "/unrelated/path", "write", gate_mode="advisory")
+        return json.loads(_bash_metrics(home).strip())["coord_leases_held"]
+
+    def _py_held(n: int) -> int:
+        _reset_state()
+        _seed_registry(home, leases=_leases(n))
+        _py_check(home, "req", "/unrelated/path", "write", gate_mode="advisory")
+        return json.loads(_py_metrics(home).strip())["coord_leases_held"]
+
+    assert _bash_held(1) == _py_held(1) == 1
+    assert _bash_held(2) == _py_held(2) == 2
