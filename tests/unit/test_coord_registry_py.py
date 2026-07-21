@@ -15,7 +15,9 @@ The bash heredoc normalises paths and writes atomic tmp→os.replace,
 exactly as the port does. Cross-process safety is via flock on a sibling
 .lock file — both sides honour that contract.
 
-Eight cases (above the kickoff's >=6 floor):
+Twelve cases (above the kickoff's >=6 floor). (a)-(h) predate the .sh
+retirement; (i)-(l) were ported from tests/unit/test_coord_registry.sh so its
+every assertion is driven on the LIVE bash side by this gate before it retires:
   (a) acquire-success           — two non-overlapping write leases, both rc=0
   (b) acquire-conflict-W+W      — overlapping prefix → rc=1 + "conflict" stderr
   (c) acquire-path-boundary     — src/api vs src/ap do NOT overlap
@@ -27,6 +29,12 @@ Eight cases (above the kickoff's >=6 floor):
                                   with rc=4 + JSON {status:abort, reason:deadlock,
                                   agent, cycle} on stdout AND its own wait edge
                                   is removed from the state file.
+  (i) conflict-variants         — .sh groups 1(exact W+W) + 2 (R+W both request
+                                  orders, incl. exact path) → rc=1 conflict.
+  (j) rr-allow-overlap          — .sh group 3: three overlapping readers coexist.
+  (k) validation-variants       — .sh group 6: empty mode + ttl 0/-1/abc → rc=2.
+  (l) higher-priority-no-preempt— .sh group 9 (inverse of h): the higher-priority
+                                  cycle requester blocks (rc=1), holders untouched.
 """
 from __future__ import annotations
 
@@ -484,3 +492,135 @@ def test_deadlock_abort_parity(tmp_path, monkeypatch):
     # bash_err4 is empty for the deadlock path (bash skips the "conflict..."
     # stderr branch on victim-self-abort).
     assert bash_err4 == ""
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# (i) Conflict variants — ports test_coord_registry.sh groups 1(exact W+W) + 2
+#     (R+W in both request orders, incl. exact path). A WRITE participant on an
+#     overlapping OR identical path always conflicts (rc=1), regardless of order;
+#     only R+R is exempt (see test (j)). Each scenario drives the live bash lib
+#     and the port through the same holder→requester sequence on a fresh state
+#     file and asserts rc/stdout/stderr parity plus rc=1 on the blocked acquire.
+# ──────────────────────────────────────────────────────────────────────────────
+def test_acquire_conflict_variants_parity(tmp_path):
+    _which_bash()
+    sf = str(tmp_path / "leases.json")
+
+    # (holder_mode, req_agent, req_path, req_mode, label)
+    scenarios = [
+        ("read", "agent-w2", "src/api/x.rs", "write", "R-holds W-child"),
+        ("write", "agent-r2", "src/api/x.rs", "read", "W-holds R-child"),
+        ("write", "agent-r2", "src/api", "read", "W-holds R-exact"),
+        ("write", "agent-w2", "src/api", "write", "W-holds W-exact"),
+    ]
+    for holder_mode, req_agent, req_path, req_mode, label in scenarios:
+        _reset_state(sf)
+        h_rc, _, _ = _bash_acquire(sf, "agent-h1", "src/api", holder_mode, 60)
+        b_rc, b_out, b_err = _bash_acquire(sf, req_agent, req_path, req_mode, 60)
+
+        _reset_state(sf)
+        cr.coord_acquire("agent-h1", "src/api", holder_mode, 60, state_file=sf)
+        p_rc, p_out, p_err = _run_py_acquire(sf, req_agent, req_path, req_mode, 60)
+
+        assert h_rc == 0, f"[{label}] holder acquire failed rc={h_rc}"
+        _assert_parity(b_rc, b_out, b_err, p_rc, p_out, p_err, label)
+        assert b_rc == 1 and p_rc == 1, f"[{label}] expected conflict rc=1"
+        assert "conflict" in b_err.lower() and "conflict" in p_err.lower()
+    _reset_state(sf)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# (j) R+R allow — ports test_coord_registry.sh group 3. Many readers may hold
+#     overlapping prefixes concurrently: reader1@src/api, reader2@src/api/x.rs
+#     (overlapping child), reader3@src/api (exact) all succeed (rc=0) and coexist
+#     as three live leases on both sides.
+# ──────────────────────────────────────────────────────────────────────────────
+def test_acquire_rr_allow_overlap_parity(tmp_path):
+    _which_bash()
+    sf = str(tmp_path / "leases.json")
+
+    _reset_state(sf)
+    b_rc1, _, _ = _bash_acquire(sf, "agent-r1", "src/api", "read", 60)
+    b_rc2, b_out2, b_err2 = _bash_acquire(sf, "agent-r2", "src/api/x.rs", "read", 60)
+    b_rc3, b_out3, b_err3 = _bash_acquire(sf, "agent-r3", "src/api", "read", 60)
+    bash_count = _state_lease_count(sf)
+
+    _reset_state(sf)
+    cr.coord_acquire("agent-r1", "src/api", "read", 60, state_file=sf)
+    p_rc2, p_out2, p_err2 = _run_py_acquire(sf, "agent-r2", "src/api/x.rs", "read", 60)
+    p_rc3, p_out3, p_err3 = _run_py_acquire(sf, "agent-r3", "src/api", "read", 60)
+    py_count = _state_lease_count(sf)
+
+    assert b_rc1 == 0
+    _assert_parity(b_rc2, b_out2, b_err2, p_rc2, p_out2, p_err2, "r+r overlap child")
+    _assert_parity(b_rc3, b_out3, b_err3, p_rc3, p_out3, p_err3, "r+r overlap exact")
+    assert b_rc2 == 0 and p_rc2 == 0
+    assert b_rc3 == 0 and p_rc3 == 0
+    assert bash_count == py_count == 3
+    _reset_state(sf)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# (k) Validation variants — ports test_coord_registry.sh group 6. Every
+#     invalid-arg form exits rc=2 with a byte-equal usage/validation message on
+#     both sides (empty mode hits the usage branch; bad ttl hits the ttl branch;
+#     mode='weird' is also covered standalone by test_acquire_mode_validation).
+# ──────────────────────────────────────────────────────────────────────────────
+def test_acquire_validation_variants_parity(tmp_path):
+    _which_bash()
+    sf = str(tmp_path / "leases.json")
+
+    # (mode, ttl, label)
+    variants = [
+        ("weird", "60", "mode=weird"),
+        ("", "60", "mode=empty"),
+        ("read", "0", "ttl=0"),
+        ("write", "-1", "ttl=-1"),
+        ("read", "abc", "ttl=abc"),
+    ]
+    for mode, ttl, label in variants:
+        b_rc, b_out, b_err = _bash_acquire(sf, "agent-x", "src/api", mode, ttl)
+        _reset_state(sf)
+        p_rc, p_out, p_err = _run_py_acquire(sf, "agent-x", "src/api", mode, ttl)
+        _assert_parity(b_rc, b_out, b_err, p_rc, p_out, p_err, label)
+        assert b_rc == 2 and p_rc == 2, f"[{label}] expected rc=2, got bash={b_rc} py={p_rc}"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# (l) Higher-priority requester does NOT preempt — ports test_coord_registry.sh
+#     group 9, the inverse of the deadlock-abort (h). Same A→B→A cycle but with
+#     the priorities flipped (agent-a=10, agent-b=20) so the cycle-completing
+#     requester (agent-b) is the HIGHER-priority participant. Wound-wait names
+#     the LOWER-priority agent (agent-a) as victim, so agent-b — not being the
+#     victim — simply blocks with rc=1 instead of aborting (rc=4), and the two
+#     active holder leases are left untouched on both sides.
+# ──────────────────────────────────────────────────────────────────────────────
+def test_higher_priority_no_preempt_parity(tmp_path, monkeypatch):
+    _which_bash()
+    sf = str(tmp_path / "leases.json")
+    monkeypatch.setenv("COORD_REGISTRY_AGENT_PRIORITIES", "agent-a=10,agent-b=20")
+    env_overrides = {"COORD_REGISTRY_AGENT_PRIORITIES": "agent-a=10,agent-b=20"}
+
+    _reset_state(sf)
+    rc1, _, _ = _bash_acquire(sf, "agent-a", "src/a", "write", 60, env=env_overrides)
+    rc2, _, _ = _bash_acquire(sf, "agent-b", "src/b", "write", 60, env=env_overrides)
+    rc3, _, _ = _bash_acquire(sf, "agent-a", "src/b", "write", 60, env=env_overrides)
+    bash_rc4, bash_out4, bash_err4 = _bash_acquire(sf, "agent-b", "src/a", "write", 60, env=env_overrides)
+    bash_state = _read_state(sf)
+
+    assert rc1 == 0 and rc2 == 0 and rc3 == 1, (
+        f"setup precondition failed: rc1={rc1} rc2={rc2} rc3={rc3}"
+    )
+    assert bash_rc4 == 1, f"higher-priority requester must block (rc=1), got rc={bash_rc4}"
+
+    _reset_state(sf)
+    cr.coord_acquire("agent-a", "src/a", "write", 60, state_file=sf)
+    cr.coord_acquire("agent-b", "src/b", "write", 60, state_file=sf)
+    cr.coord_acquire("agent-a", "src/b", "write", 60, state_file=sf)
+    py_rc4, py_out4, py_err4 = _run_py_acquire(sf, "agent-b", "src/a", "write", 60)
+    py_state = _read_state(sf)
+
+    assert py_rc4 == 1
+    _assert_parity(bash_rc4, bash_out4, bash_err4, py_rc4, py_out4, py_err4, "higher-prio no preempt")
+    # Holders untouched: exactly two active leases on both sides (no preemption).
+    assert len(bash_state["leases"]) == len(py_state["leases"]) == 2
