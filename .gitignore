@@ -96,6 +96,19 @@ Volumes/
 .mini-ork/research-notes/
 kickoffs/*autonomy-pluggability*
 
+# internal-docs/ is internal-only R&D (arxiv-driven research, architecture
+# design notes, runbooks, impl-analysis of other projects) — not shippable OSS
+# docs. Keep it on disk locally; never track it in this public repo.
+internal-docs/
+
+# Local dev-tooling artifacts (machine-specific, not project deliverables):
+# CodeGraph index/config, MCP server wiring, per-machine provider env script.
+.codegraph/
+codegraph.json
+.mcp.json
+claude_code_zai_env.sh
+*_zai_env.sh
+
 # mini-ork generated state (the engine pointer below is committed)
 
 .mini-ork/*
