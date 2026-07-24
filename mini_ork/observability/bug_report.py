@@ -484,7 +484,7 @@ def bug_report_show(bid: int) -> str:
         con.execute("PRAGMA busy_timeout=5000")
         row = con.execute(
             f"SELECT {_SHOW_COLUMNS[0]}, " + ", ".join(_SHOW_COLUMNS[1:]) +
-            f" FROM bug_reports WHERE id=?",
+            " FROM bug_reports WHERE id=?",
             (int(bid),),
         ).fetchone()
     finally:

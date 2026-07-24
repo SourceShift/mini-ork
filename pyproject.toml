@@ -45,3 +45,22 @@ include = ["mini_ork*"]
 #     under docs/research/experiments/fixtures/** (sample tasks, not real tests).
 pythonpath = ["."]
 testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 110
+extend-exclude = [
+    ".mini-ork",
+    "Volumes",
+    "mini_ork/web/static",
+    "peltier-thermal",
+]
+
+[tool.ruff.lint]
+# CI tiers (see .github/workflows/ci.yml `python-lint` job):
+#   BLOCKING  — this select list: pyflakes (F, real bugs) + pycodestyle errors
+#               that indicate broken code (E9). Keep this tier at zero.
+#   ADVISORY  — everything else (E4/E7 style, W, I, UP, B), reported
+#               non-blocking. Ratchet: clean a rule class, then promote it
+#               into `select`.
+select = ["F", "E9"]

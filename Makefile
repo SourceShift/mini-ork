@@ -15,6 +15,7 @@
 
 .PHONY: install-hooks uninstall-hooks readme-claim-check readme-drift-panel help \
         web-deps web-build web-serve web-dev web-up web-test dev-all \
+        lint lint-advisory \
         worktree worktree-merge worktree-clean worktree-list
 
 PORT ?= 7090
@@ -25,6 +26,8 @@ help:
 	@echo "  make uninstall-hooks     reset to git default hooks dir"
 	@echo "  make readme-claim-check  run mechanical README drift check (Layer 1)"
 	@echo "  make readme-drift-panel  run 4-lens LLM drift audit (Layer 2b, ~\$$0.30)"
+	@echo "  make lint                ruff blocking tier (F + E9) — must stay green"
+	@echo "  make lint-advisory       ruff advisory tier (E,W,I,UP,B) — ratchet report"
 	@echo ""
 	@echo "Observability UI:"
 	@echo "  make web-deps            install fastapi + uvicorn + pyyaml + pnpm install"
@@ -37,8 +40,7 @@ help:
 	@echo ""
 	@echo "Worktree-first dev (keep main clean):"
 	@echo "  make worktree SLUG=<slug>       create a task worktree + branch"
-	@echo "  make worktree-merge [SLUG=<s>]  rebase origin/main, green-gate, push HEAD:main"
-	@echo "  make worktree-clean SLUG=<slug> remove worktree + delete branch"
+	@echo "  make worktree-merge [SLUG=<s>]  rebase origin/main, green-gate, push HEAD:main"	@echo "  make worktree-clean SLUG=<slug> remove worktree + delete branch"
 	@echo "  make worktree-list              list all worktrees"
 
 install-hooks:
@@ -55,6 +57,17 @@ install-hooks:
 uninstall-hooks:
 	@git config --unset core.hooksPath 2>/dev/null || true
 	@echo "✓ hooks dir reset to git default"
+
+# ── python lint (ruff; tiers match the CI python-lint job) ──────────────────
+# Blocking tier is [tool.ruff.lint] select in pyproject.toml (F + E9).
+# Advisory tier is the non-blocking ratchet set (E,W,I,UP,B).
+lint:
+	@command -v ruff >/dev/null || { echo "ruff not found — pip install ruff"; exit 1; }
+	ruff check mini_ork/ tests/
+
+lint-advisory:
+	@command -v ruff >/dev/null || { echo "ruff not found — pip install ruff"; exit 1; }
+	-ruff check mini_ork/ tests/ --select E,W,I,UP,B --statistics
 
 # ── worktree-first dev ───────────────────────────────────────────────────────
 worktree:

@@ -333,7 +333,7 @@ def main(argv=None, *, root=None, dispatch=None) -> int:
         except Exception:
             pass
         if int(time.time()) >= soft_deadline:
-            print(f"[soft-cap] reached; exiting after this iter")
+            print("[soft-cap] reached; exiting after this iter")
             break
 
     print(f"\nself-improve session complete\n  iters_run:   {it}\n  db:          {db}")
