@@ -24,6 +24,9 @@ artifacts may be missing/corrupt (window 2 — validity check rejects,
 rerun, correct). Both windows are fail-closed by ``is_node_reusable``.
 
 Public API:
+  CheckpointRecord
+      Frozen dataclass carrying every per-checkpoint value (M8 ISP
+      refactor); an alternative to write_checkpoint's keyword args.
   write_checkpoint(...) -> int
       rc=0 on success, non-zero on failure. No exceptions bubble. Caller
       treats non-zero as "checkpoint not written; node will rerun on next
@@ -52,9 +55,11 @@ import json
 import os
 import sqlite3
 import sys
+from dataclasses import dataclass, field
 from typing import Iterable
 
 __all__ = [
+    "CheckpointRecord",
     "write_checkpoint",
     "is_node_reusable",
     "hash_file",
@@ -157,28 +162,86 @@ def compute_artifact_manifest(artifact_paths: Iterable[str], run_dir: str) -> li
     return out
 
 
+@dataclass(frozen=True)
+class CheckpointRecord:
+    """Typed parameter object for ``write_checkpoint`` (ISP refactor, M8).
+
+    Carries every per-checkpoint value so new call sites can build the
+    payload once instead of threading 15 keyword arguments through
+    closures. ``db`` / ``run_id`` / ``node_id`` are deliberately NOT
+    here — they stay positional routing args of ``write_checkpoint``.
+
+    Defaults mirror the historical ``write_checkpoint`` signature
+    exactly: fields that had real defaults keep them
+    (``node_type=""``, ``cost_usd=None``, ``provider_session_id=""``,
+    ``initiator="python"``, ``failure_class=None``, ``attempt=None``,
+    ``owner_token=None``); fields that were required keyword args
+    default to empty/None sentinels — the writer's own validation still
+    rejects those with rc=1, so a partially-populated record degrades
+    to the same fail-closed outcome as a bad kwargs call.
+    """
+
+    status: str = ""
+    input_hash: str = ""
+    recipe_version: str = ""
+    config_hash: str = ""
+    artifact_paths: Iterable[str] = field(default_factory=tuple)
+    run_dir: str = ""
+    node_type: str = ""
+    started_at: int | None = None
+    ended_at: int | None = None
+    cost_usd: float | None = None
+    provider_session_id: str = ""
+    initiator: str = "python"
+    failure_class: str | None = None
+    attempt: int | None = None
+    owner_token: str | None = None
+
+
+# Sentinel distinguishing "caller did not pass this kwarg" from an
+# explicit None (several kwargs legitimately take None). Lets the
+# signature keep the old required-kwarg TypeError behavior when no
+# record is supplied.
+_UNSET = object()
+
+
 def write_checkpoint(
     db: str,
     run_id: str,
     node_id: str,
     *,
-    status: str,
-    input_hash: str,
-    recipe_version: str,
-    config_hash: str,
-    artifact_paths: Iterable[str],
-    run_dir: str,
-    node_type: str = "",
-    started_at: int,
-    ended_at: int,
-    cost_usd: float | None = None,
-    provider_session_id: str = "",
-    initiator: str = "python",
-    failure_class: str | None = None,
-    attempt: int | None = None,
-    owner_token: str | None = None,
+    record: CheckpointRecord | None = None,
+    status=_UNSET,
+    input_hash=_UNSET,
+    recipe_version=_UNSET,
+    config_hash=_UNSET,
+    artifact_paths=_UNSET,
+    run_dir=_UNSET,
+    node_type=_UNSET,
+    started_at=_UNSET,
+    ended_at=_UNSET,
+    cost_usd=_UNSET,
+    provider_session_id=_UNSET,
+    initiator=_UNSET,
+    failure_class=_UNSET,
+    attempt=_UNSET,
+    owner_token=_UNSET,
 ) -> int:
     """Crash-safe per-node checkpoint publication. Returns 0 on success.
+
+    Two equivalent call shapes (ISP):
+
+      * kwargs (legacy, unchanged):
+        ``write_checkpoint(db, run_id, node_id, status=..., input_hash=...,
+        recipe_version=..., config_hash=..., artifact_paths=..., run_dir=...,
+        started_at=..., ended_at=..., ...)`` — the eight historically
+        required keyword args raise ``TypeError`` when omitted, exactly
+        as before.
+      * record:
+        ``write_checkpoint(db, run_id, node_id, record=CheckpointRecord(...))``
+        — the record supplies every value. Combining ``record`` with any
+        other keyword argument raises ``ValueError`` (ambiguous source
+        of truth).
 
     Publication order (design §4, encoded for the verifier to assert):
 
@@ -200,13 +263,57 @@ def write_checkpoint(
     and the runtime will rerun it on the next attempt — exactly the
     fail-closed behavior design §4 requires for crash window 1.
     """
+    supplied = {
+        "status": status,
+        "input_hash": input_hash,
+        "recipe_version": recipe_version,
+        "config_hash": config_hash,
+        "artifact_paths": artifact_paths,
+        "run_dir": run_dir,
+        "node_type": node_type,
+        "started_at": started_at,
+        "ended_at": ended_at,
+        "cost_usd": cost_usd,
+        "provider_session_id": provider_session_id,
+        "initiator": initiator,
+        "failure_class": failure_class,
+        "attempt": attempt,
+        "owner_token": owner_token,
+    }
+    explicit = {k: v for k, v in supplied.items() if v is not _UNSET}
+    if record is not None:
+        if explicit:
+            raise ValueError(
+                "write_checkpoint: record= cannot be combined with explicit "
+                f"keyword arguments: {sorted(explicit)}"
+            )
+        rec = record
+    else:
+        # Legacy kwargs path: the eight historically required keyword
+        # args keep their TypeError-on-missing behavior; the rest fall
+        # back to the same defaults the old signature had (which are
+        # exactly CheckpointRecord's field defaults).
+        required = (
+            "status", "input_hash", "recipe_version", "config_hash",
+            "artifact_paths", "run_dir", "started_at", "ended_at",
+        )
+        missing = [k for k in required if k not in explicit]
+        if missing:
+            plural = "s" if len(missing) > 1 else ""
+            raise TypeError(
+                f"write_checkpoint() missing {len(missing)} required "
+                f"keyword-only argument{plural}: "
+                + ", ".join(repr(m) for m in missing)
+            )
+        rec = CheckpointRecord(**explicit)
+
     if not db or not run_id or not node_id:
         _log_err("write_checkpoint: db, run_id, node_id are required")
         return 1
-    if status not in ("success", "failure", "skipped"):
-        _log_err(f"write_checkpoint: status must be success|failure|skipped, got {status!r}")
+    if rec.status not in ("success", "failure", "skipped"):
+        _log_err(f"write_checkpoint: status must be success|failure|skipped, got {rec.status!r}")
         return 1
-    if not input_hash or not recipe_version or not config_hash:
+    if not rec.input_hash or not rec.recipe_version or not rec.config_hash:
         _log_err("write_checkpoint: input_hash, recipe_version, config_hash are required")
         return 1
     if not os.path.isfile(db):
@@ -219,12 +326,12 @@ def write_checkpoint(
     # lease expired and was re-acquired by a newer recovery) from committing a
     # checkpoint over the top of live work (design §7). When no token is passed
     # (legacy non-recovery path) fencing is disabled — preserves E1's contract.
-    if owner_token is not None:
+    if rec.owner_token is not None:
         try:
             from mini_ork.stores.lease import is_lease_holder  # lazy: avoid load-order coupling
-            if not is_lease_holder(db, run_id, owner_token):
+            if not is_lease_holder(db, run_id, rec.owner_token):
                 _log_err(
-                    f"write_checkpoint: fence rejected — token {owner_token!r} is not the "
+                    f"write_checkpoint: fence rejected — token {rec.owner_token!r} is not the "
                     f"live lease holder of run {run_id!r}; refusing to publish {node_id!r}"
                 )
                 return 2
@@ -235,9 +342,9 @@ def write_checkpoint(
     # (a) + (b) build manifest and fsync artifacts BEFORE the row.
     # If we crash between (a) and (c) the next recovery sees no row
     # (window 1) and reruns — correct.
-    manifest = compute_artifact_manifest(artifact_paths, run_dir)
+    manifest = compute_artifact_manifest(rec.artifact_paths, rec.run_dir)
     for entry in manifest:
-        abs_path = os.path.join(run_dir, entry["path"])
+        abs_path = os.path.join(rec.run_dir, entry["path"])
         try:
             with open(abs_path, "rb") as fh:
                 os.fsync(fh.fileno())
@@ -246,8 +353,8 @@ def write_checkpoint(
             return 1
 
     manifest_json = json.dumps(manifest, separators=(",", ":"))
-    attempt_no = int(attempt) if attempt is not None else 1
-    now = int(ended_at) if ended_at else 0
+    attempt_no = int(rec.attempt) if rec.attempt is not None else 1
+    now = int(rec.ended_at) if rec.ended_at else 0
 
     # (E4) Persist the provider's session transcript into the run dir so a
     # future recovery can `claude --resume <session_id>` even after the worker
@@ -256,10 +363,10 @@ def write_checkpoint(
     # NOT affect is_node_reusable — session_ref is never read by the validity
     # check (design §6).
     session_ref: str | None = None
-    if provider_session_id and run_dir:
+    if rec.provider_session_id and rec.run_dir:
         try:
             from mini_ork.stores.session_store import persist_session  # lazy
-            ref = persist_session(run_dir, provider_session_id)
+            ref = persist_session(rec.run_dir, rec.provider_session_id)
             session_ref = ref or None
         except Exception as e:  # noqa: BLE001 — persistence is best-effort
             _log_err(f"write_checkpoint: session persist skipped ({e})")
@@ -278,9 +385,9 @@ def write_checkpoint(
                     session_ref, failure_class, created_at
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (run_id, node_id, attempt_no, status, input_hash,
-                 recipe_version, config_hash, manifest_json,
-                 session_ref, failure_class, now),
+                (run_id, node_id, attempt_no, rec.status, rec.input_hash,
+                 rec.recipe_version, rec.config_hash, manifest_json,
+                 session_ref, rec.failure_class, now),
             )
             con.execute(
                 """
@@ -290,10 +397,10 @@ def write_checkpoint(
                     checkpoint_produced, cost_usd, provider_session_id, initiator
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 1, ?, ?, ?)
                 """,
-                (run_id, node_id, attempt_no, node_type or "",
-                 int(started_at) if started_at else now, now,
-                 status, failure_class, cost_usd,
-                 provider_session_id or None, initiator or "python"),
+                (run_id, node_id, attempt_no, rec.node_type or "",
+                 int(rec.started_at) if rec.started_at else now, now,
+                 rec.status, rec.failure_class, rec.cost_usd,
+                 rec.provider_session_id or None, rec.initiator or "python"),
             )
             con.execute("COMMIT")
         finally:
