@@ -413,7 +413,7 @@ def test_approve_spawn_happy_path_parity(tmp_path, monkeypatch):
     assert bash_events[0]["event_type"] == "spawn.approved"
     _assert_event_row_parity(bash_events[0], py_events[0])
     # event_id must use the literal ``ev-<sec>-<child_run_id>`` shape.
-    assert bash_events[0]["event_id"].startswith(f"ev-")
+    assert bash_events[0]["event_id"].startswith("ev-")
     assert "child-d" in bash_events[0]["event_id"], (
         f"bash event_id missing child_run_id: {bash_events[0]['event_id']!r}"
     )

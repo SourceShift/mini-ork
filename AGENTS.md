@@ -47,9 +47,15 @@ make worktree-clean SLUG=<slug>      # remove worktree + delete branch
 
 ```bash
 make test                    # existing test suite
+make lint                    # ruff blocking tier (F + E9; advisory: make lint-advisory)
 mini-ork validate            # pre-run static checks
 mini-ork garden              # drift detection
 ```
+
+CI mirrors these: `.github/workflows/ci.yml` runs ruff (blocking + advisory
+tiers), pytest on 3.11/3.12, shellcheck, and the bash test layers;
+`.github/workflows/release.yml` re-runs the blocking lint + a unit-layer
+pytest smoke before building release artifacts.
 
 ## Extension points
 

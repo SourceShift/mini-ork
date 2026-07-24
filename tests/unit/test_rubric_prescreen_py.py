@@ -553,7 +553,7 @@ mo_cache_lookup "rubric" "E-LU" 1 "{input_hash}"
     # Miss case: lookup on a different input_hash.
     py_miss = rp.cache_lookup(temp_db, "rubric", "E-LU", 1, "nonexistent" * 4)
     bash_miss = _source_rp_and_call(
-        f'mo_cache_lookup "rubric" "E-LU" 1 "nonexistent"',
+        'mo_cache_lookup "rubric" "E-LU" 1 "nonexistent"',
         temp_db, extra_sources=f'. "{CACHE_SH}" >/dev/null 2>&1',
     ).stdout.strip()
     assert py_miss == bash_miss == "", (

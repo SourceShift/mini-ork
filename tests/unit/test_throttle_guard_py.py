@@ -186,7 +186,7 @@ def test_record_failure_backoff_ladder(tmp_path):
     for _ in range(4):
         r_bash = _bash(
             {"MINI_ORK_HOME": str(bash_home)},
-            f'_throttle_record_failure "glm" "capacity"',
+            '_throttle_record_failure "glm" "capacity"',
         )
         assert r_bash.returncode == 0
         monkey = pytest.MonkeyPatch()

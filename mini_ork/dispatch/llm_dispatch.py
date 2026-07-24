@@ -304,14 +304,14 @@ def llm_dispatch(argv=None, *, root=None, dispatch_fn=None) -> int:
     db = os.environ.get("MINI_ORK_DB") or os.path.join(home, "state.db")
     dispatch_fn = dispatch_fn or mo_llm_dispatch
 
-    task_class = node_type = prompt_text = out_file = model_override = ""
+    node_type = prompt_text = out_file = model_override = ""
     timeout_s = _int_or(os.environ.get("MO_NODE_TIMEOUT_S"), 1500)
     max_turns = _int_or(os.environ.get("MO_NODE_MAX_TURNS"), 60)
     i = 0
     while i < len(argv):
         a = argv[i]
         if a == "--task-class":
-            task_class = argv[i + 1]; i += 2
+            _task_class = argv[i + 1]; i += 2  # accepted for CLI compat; currently unused
         elif a == "--node-type":
             node_type = argv[i + 1]; i += 2
         elif a == "--prompt-text":

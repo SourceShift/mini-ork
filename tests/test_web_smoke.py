@@ -406,12 +406,10 @@ def test_run_inputs_endpoint_lists_and_reads_context(db) -> None:
 
     home = get_home()
     task_run_id = ""
-    inputs = []
     for run in runs:
         candidate = list_inputs(task_run_id=run["id"], db=db, home=home)
         if any(item["key"] == "kickoff" for item in candidate):
             task_run_id = run["id"]
-            inputs = candidate
             break
     if not task_run_id:
         pytest.skip("no task_runs with a readable kickoff input")

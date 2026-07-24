@@ -73,6 +73,37 @@ jobs:
             exit 0   # advisory only
           }
 
+  python-lint:
+    name: python lint (ruff)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install ruff
+        run: pip install "ruff>=0.6"
+
+      # Blocking tier — pyflakes (F: real bugs) + pycodestyle E9 (broken
+      # code). Configured as [tool.ruff.lint] select in pyproject.toml; must
+      # stay at zero.
+      - name: "Ruff (blocking: F + E9)"
+        run: ruff check mini_ork/ tests/
+
+      # Advisory tier — style + modernization (E/W/I/UP/B). Non-blocking
+      # ratchet: clean a rule class, then promote it into the blocking
+      # select list in pyproject.toml.
+      - name: "Ruff (advisory: E,W,I,UP,B)"
+        continue-on-error: true
+        run: |
+          ruff check mini_ork/ tests/ --select E,W,I,UP,B --statistics \
+            | tee ruff-advisory.log || true
+          TOTAL=$(grep -cE '^\s*[0-9]+' ruff-advisory.log || echo 0)
+          echo "::notice::ruff advisory findings: $TOTAL (non-blocking — see ratchet note in pyproject.toml)"
+
   bash-tests:
     name: bash tests (${{ matrix.layer }})
     runs-on: ubuntu-latest
