@@ -21,6 +21,7 @@ from fastapi import APIRouter, Depends
 
 from ..db import StateDB
 from ..deps import get_db
+from ..repositories import LearningRepository
 
 router = APIRouter(prefix="/api/v1/learning", tags=["learning"])
 
@@ -86,7 +87,6 @@ def gepa_state(db: StateDB = Depends(get_db), limit: int = 100) -> dict[str, Any
     """
     win_rates: list[dict[str, Any]] = []
     promotions: list[dict[str, Any]] = []
-    gradient_count = 0
 
     if db.has_table("prompt_win_rates"):
         win_rates = db.rows(
@@ -113,9 +113,7 @@ def gepa_state(db: StateDB = Depends(get_db), limit: int = 100) -> dict[str, Any
             (limit,),
         )
 
-    if db.has_table("gradient_records"):
-        rows = db.rows("SELECT COUNT(*) AS n FROM gradient_records")
-        gradient_count = int(rows[0]["n"]) if rows else 0
+    gradient_count = LearningRepository(db).gradient_count()
 
     return {
         "gradient_count": gradient_count,
