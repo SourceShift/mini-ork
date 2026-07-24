@@ -113,6 +113,15 @@ def set_gradient_ensure_table(fn) -> None:
 
 # ── Per-helper PRAGMA / DB helpers ──────────────────────────────────────────
 
+def _resolve_db(db_path: str | None = None) -> str:
+    """Single resolution point for the pipeline's db path (DIP): an explicit
+    argument wins; otherwise the MINI_ORK_DB env contract applies (KeyError
+    when unset — the historical fail-fast for a misconfigured runtime)."""
+    if db_path is not None:
+        return db_path
+    return os.environ["MINI_ORK_DB"]
+
+
 def _connect(db_path: str) -> sqlite3.Connection:
     con = sqlite3.connect(db_path)
     # v0.2-pt7 (F-11): per-connection busy_timeout; WAL is persistent but
@@ -611,7 +620,8 @@ def reflection_restore_per_node_credit(db_path: str | None = None) -> int:
         con.close()
 
 
-def reflection_deduplicate(gradients_table: str = "gradient_records") -> None:
+def reflection_deduplicate(gradients_table: str = "gradient_records", *,
+                           db_path: str | None = None) -> None:
     """Deduplicate persisted gradient records.
 
     Two-pass dedupe:
@@ -624,7 +634,7 @@ def reflection_deduplicate(gradients_table: str = "gradient_records") -> None:
     Stderr: `reflection_deduplicate: removed N duplicates (X exact, Y fuzzy@Z)`
             or `reflection_deduplicate: no duplicates found`.
     """
-    db_path = os.environ["MINI_ORK_DB"]
+    db_path = _resolve_db(db_path)
     batch = int(os.environ.get("MO_DEDUP_BATCH", 10000))
     fuzzy = float(os.environ.get("MO_DEDUP_FUZZY", 0.55))
 
@@ -653,14 +663,15 @@ def reflection_deduplicate(gradients_table: str = "gradient_records") -> None:
         print("reflection_deduplicate: no duplicates found", file=sys.stderr)
 
 
-def reflection_link_failures(failure_table: str = "execution_traces") -> None:
+def reflection_link_failures(failure_table: str = "execution_traces", *,
+                             db_path: str | None = None) -> None:
     """Link failed traces to their evidence-backed gradients.
 
     Correlate failure-status traces with gradient targets; update failure_links
     table. Stdout: empty. Stderr: `reflection_link_failures: N links
     created/verified`.
     """
-    db_path = os.environ["MINI_ORK_DB"]
+    db_path = _resolve_db(db_path)
     inserted = _link_failures_insert(db_path, failure_table)
     print(
         f"reflection_link_failures: {inserted} links created/verified",
@@ -668,14 +679,15 @@ def reflection_link_failures(failure_table: str = "execution_traces") -> None:
     )
 
 
-def reflection_detect_stale(memory_table: str) -> None:
+def reflection_detect_stale(memory_table: str, *,
+                            db_path: str | None = None) -> None:
     """Report stale records from a timestamped table.
 
     Detect memory entries not updated within MINI_ORK_STALE_DAYS (default 14).
     Stdout: JSON `{"table": ..., "stale_ids": [...], "stale_before_epoch": ...}`.
     Stderr: `reflection_detect_stale: N stale entries in <tbl>`.
     """
-    db_path = os.environ["MINI_ORK_DB"]
+    db_path = _resolve_db(db_path)
     stale_days = int(os.environ.get("MINI_ORK_STALE_DAYS", 14))
     result = _detect_stale_select(db_path, memory_table, stale_days)
     print(json.dumps(result))
@@ -685,7 +697,8 @@ def reflection_detect_stale(memory_table: str) -> None:
     )
 
 
-def reflection_summarize_patterns(cluster_id: str) -> dict:
+def reflection_summarize_patterns(cluster_id: str, *,
+                                  db_path: str | None = None) -> dict:
     """Summarize the records in one pattern cluster.
 
     Summarize all pattern_records belonging to a cluster. Returns the dict that
@@ -693,27 +706,29 @@ def reflection_summarize_patterns(cluster_id: str) -> dict:
     stdout emission) so direct callers get both the return value and the
     printed JSON.
     """
-    db_path = os.environ["MINI_ORK_DB"]
+    db_path = _resolve_db(db_path)
     summary = _summarize_patterns_query(db_path, cluster_id)
     print(json.dumps(summary))
     return summary
 
 
-def reflection_suggest_promotions(patterns_table: str = "pattern_records") -> list[dict]:
+def reflection_suggest_promotions(patterns_table: str = "pattern_records", *,
+                                  db_path: str | None = None) -> list[dict]:
     """Build promotion suggestions for frequent patterns.
 
     Suggest promotion candidates where frequency >= MINI_ORK_PROMOTION_MIN_FREQ
     (default 3). Stdout: JSON array. Returns the parsed list for in-process
     callers.
     """
-    db_path = os.environ["MINI_ORK_DB"]
+    db_path = _resolve_db(db_path)
     min_freq = int(os.environ.get("MINI_ORK_PROMOTION_MIN_FREQ", 3))
     suggestions = _suggest_promotions_query(db_path, patterns_table, min_freq)
     print(json.dumps(suggestions))
     return suggestions
 
 
-def reflection_persist_suggestions(suggestions_json: str) -> int:
+def reflection_persist_suggestions(suggestions_json: str, *,
+                                   db_path: str | None = None) -> int:
     """Persist promotion suggestions as emergent patterns.
 
     Persist suggestions as durable rows in emergent_patterns (status='proposed').
@@ -723,11 +738,11 @@ def reflection_persist_suggestions(suggestions_json: str) -> int:
     Float-compare gate: `strength_score` is written via `freq_f` (float coerced
     from `frequency`). Within the 1e-6 tolerance enforced by the parity test.
     """
-    db_path = os.environ["MINI_ORK_DB"]
+    db_path = _resolve_db(db_path)
     return _persist_suggestions_upsert(db_path, suggestions_json)
 
 
-def reflection_verify_patterns() -> int:
+def reflection_verify_patterns(*, db_path: str | None = None) -> int:
     """Approve emergent patterns that meet evidence and strength floors.
 
     Judge-gate (extract→distill→verify): transition emergent_patterns rows from
@@ -743,7 +758,7 @@ def reflection_verify_patterns() -> int:
         return 0
     min_strength = float(os.environ.get("MO_EMERGENT_VERIFY_MIN_STRENGTH", "3"))
     min_evidence = int(os.environ.get("MO_EMERGENT_VERIFY_MIN_EVIDENCE", "1"))
-    db_path = os.environ["MINI_ORK_DB"]
+    db_path = _resolve_db(db_path)
     con = _connect(db_path)
     try:
         try:
@@ -779,7 +794,8 @@ def reflection_verify_patterns() -> int:
     return approved
 
 
-def reflection_run(since_ts: int | None = None) -> str:
+def reflection_run(since_ts: int | None = None, *,
+                   db_path: str | None = None) -> str:
     """Run the native reflection pipeline.
 
     Orchestrate all 6 reflection steps sequentially. `since_ts` defaults to 24h
@@ -841,7 +857,7 @@ def reflection_run(since_ts: int | None = None) -> str:
         pass
 
     print("  [5/6] summarize_patterns (all clusters)", file=sys.stderr)
-    db_path = os.environ["MINI_ORK_DB"]
+    db_path = _resolve_db(db_path)
     cluster_ids = _list_distinct_cluster_ids(db_path)
     for cid in cluster_ids:
         _swallow_stdout(reflection_summarize_patterns, cid)
