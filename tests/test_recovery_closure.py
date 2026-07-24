@@ -551,7 +551,9 @@ def test_resume_cost_pause_unchanged() -> None:
         must remain decoupled)
     """
     bash_path = REPO / "bin" / "mini-ork-resume"
-    py_port = REPO / "mini_ork" / "ported" / "mini_ork_resume.py"
+    # The canonical Python port lives at mini_ork/cli/resume.py; the
+    # mini_ork/ported/ directory was retired by the OSS-scrub (f04f7e73).
+    py_port = REPO / "mini_ork" / "cli" / "resume.py"
     assert bash_path.is_file(), "bin/mini-ork-resume must exist"
     assert py_port.is_file(), "mini_ork.cli.resume must exist"
     bash_text = bash_path.read_text()
@@ -567,7 +569,7 @@ def test_resume_cost_pause_unchanged() -> None:
     # process from the bash wrapper, never as a library import).
     # Check the import statement specifically (the word itself may
     # appear in docstrings/comments as a reference).
-    planner_text = (REPO / "mini_ork" / "ported" / "recovery_planner.py").read_text()
+    planner_text = (REPO / "mini_ork" / "recovery" / "planner.py").read_text()
     assert "import mini_ork_resume" not in planner_text, \
         "recovery_planner must not import mini_ork_resume"
     # mini-ork-resume must still exit 0 on the "no sentinel" path —
