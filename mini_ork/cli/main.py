@@ -508,64 +508,116 @@ def main(argv=None, *, root=None) -> int:
     sub = argv[0] if argv else "help"
     rest = argv[1:]
 
-    if sub in _NATIVE_SUBS:
+    # Subcommand registry (OCP): adding a subcommand is register_subcommand()
+    # — no edit to this dispatcher. Invocation mechanism (python -m subprocess,
+    # in-process import, bash entrypoint) is a property of the handler.
+    handler = SUBCOMMAND_REGISTRY.get(sub)
+    if handler is None:
+        sys.stderr.write(f"Unknown subcommand: {sub}. Try: mini-ork help\n")
+        return 2
+    return handler(rest, root)
+
+
+# ── Subcommand registry (SOLID M7, OCP) ─────────────────────────────────────
+# Handler signature: (rest: list[str], root: str) -> int (exit code).
+
+
+def _native_module_handler(module: str):
+    def _handler(rest, root):
         return subprocess.run(
-            [sys.executable, "-m", f"mini_ork.cli.{sub}", *rest],
+            [sys.executable, "-m", module, *rest],
             env=_module_env(root),
         ).returncode
-    if sub == "execute":
-        from mini_ork.cli import execute as mini_ork_execute
-        return mini_ork_execute.main(rest, root=root)
-    if sub in _EXEC_SUBS:
-        return subprocess.run([_bin(root, sub), *rest]).returncode
-    if sub == "run":
-        return _run_lifecycle(rest, root)
-    if sub == "doctor":
-        import shutil
-        # lib/paths.sh semantics: default PROJECT_HOME is cwd/.mini-ork.
-        home = os.environ.get("MINI_ORK_HOME") or os.path.join(os.getcwd(), ".mini-ork")
-        print("=== mini-ork doctor ===")
-        for d in ("bash", "sqlite3", "jq", "git", "yq", "curl", "claude", "python3"):
-            print(f"  [OK]      {d}" if shutil.which(d) else f"  [MISSING] {d}")
-        if os.environ.get("MINI_ORK_HOME"):
-            print(f"  [OK]      MINI_ORK_HOME={os.environ['MINI_ORK_HOME']}")
-        elif home:
-            print(f"  [OK]      MINI_ORK_HOME={home}")
-        if os.environ.get("MINI_ORK_DB"):
-            print(f"  [OK]      MINI_ORK_DB={os.environ['MINI_ORK_DB']}")
+    return _handler
+
+
+def _bash_entrypoint_handler(name: str):
+    def _handler(rest, root):
+        return subprocess.run([_bin(root, name), *rest]).returncode
+    return _handler
+
+
+def _execute_inprocess(rest, root):
+    from mini_ork.cli import execute as mini_ork_execute
+    return mini_ork_execute.main(rest, root=root)
+
+
+def _run_handler(rest, root):
+    return _run_lifecycle(rest, root)
+
+
+def _doctor_handler(rest, root):
+    del rest
+    import shutil
+    # lib/paths.sh semantics: default PROJECT_HOME is cwd/.mini-ork.
+    home = os.environ.get("MINI_ORK_HOME") or os.path.join(os.getcwd(), ".mini-ork")
+    print("=== mini-ork doctor ===")
+    for d in ("bash", "sqlite3", "jq", "git", "yq", "curl", "claude", "python3"):
+        print(f"  [OK]      {d}" if shutil.which(d) else f"  [MISSING] {d}")
+    if os.environ.get("MINI_ORK_HOME"):
+        print(f"  [OK]      MINI_ORK_HOME={os.environ['MINI_ORK_HOME']}")
+    elif home:
+        print(f"  [OK]      MINI_ORK_HOME={home}")
+    if os.environ.get("MINI_ORK_DB"):
+        print(f"  [OK]      MINI_ORK_DB={os.environ['MINI_ORK_DB']}")
+    else:
+        print("  [WARN]    MINI_ORK_DB unset (default: $MINI_ORK_HOME/state.db)")
+    print("")
+    print("Lib presence:")
+    for lib in ("trace_store", "llm-dispatch", "gate_registry", "group_evolver",
+                "benchmark_suite", "utility_function",
+                "promotion_gate", "version_registry", "paths"):
+        if os.path.isfile(os.path.join(root, "lib", f"{lib}.sh")):
+            print(f"  [OK]      lib/{lib}.sh")
         else:
-            print("  [WARN]    MINI_ORK_DB unset (default: $MINI_ORK_HOME/state.db)")
-        print("")
-        print("Lib presence:")
-        for lib in ("trace_store", "llm-dispatch", "gate_registry", "group_evolver",
-                    "benchmark_suite", "utility_function",
-                    "promotion_gate", "version_registry", "paths"):
-            if os.path.isfile(os.path.join(root, "lib", f"{lib}.sh")):
-                print(f"  [OK]      lib/{lib}.sh")
-            else:
-                print(f"  [MISSING] lib/{lib}.sh (P1 in flight?)")
-        print("")
-        print("Provider preflight:")
-        for tool, name in (("claude", "anthropic"), ("codex", "codex")):
-            if shutil.which(tool):
-                print(f"  [OK]      {name} ({tool} CLI present)")
-            else:
-                print(f"  [WARN]    {name} ({tool} CLI missing)")
-        for env_var, family in (("GLM_API_KEY", "glm"), ("KIMI_API_KEY", "kimi"),
-                                ("MINIMAX_API_KEY", "minimax"), ("DEEPSEEK_API_KEY", "deepseek")):
-            if os.environ.get(env_var):
-                print(f"  [OK]      {family} ($_env_var set)")
-            else:
-                print(f"  [WARN]    {family} ($_env_var unset)")
-        return 0
-    if sub == "version":
-        print("mini-ork 0.6.0 (universal task loop runtime)")
-        return 0
-    if sub in ("help", "--help", "-h"):
-        sys.stdout.write(_HELP)
-        return 0
-    sys.stderr.write(f"Unknown subcommand: {sub}. Try: mini-ork help\n")
-    return 2
+            print(f"  [MISSING] lib/{lib}.sh (P1 in flight?)")
+    print("")
+    print("Provider preflight:")
+    for tool, name in (("claude", "anthropic"), ("codex", "codex")):
+        if shutil.which(tool):
+            print(f"  [OK]      {name} ({tool} CLI present)")
+        else:
+            print(f"  [WARN]    {name} ({tool} CLI missing)")
+    for env_var, family in (("GLM_API_KEY", "glm"), ("KIMI_API_KEY", "kimi"),
+                            ("MINIMAX_API_KEY", "minimax"), ("DEEPSEEK_API_KEY", "deepseek")):
+        if os.environ.get(env_var):
+            print(f"  [OK]      {family} ($_env_var set)")
+        else:
+            print(f"  [WARN]    {family} ($_env_var unset)")
+    return 0
+
+
+def _version_handler(rest, root):
+    del rest, root
+    print("mini-ork 0.6.0 (universal task loop runtime)")
+    return 0
+
+
+def _help_handler(rest, root):
+    del rest, root
+    sys.stdout.write(_HELP)
+    return 0
+
+
+def _build_default_registry() -> dict:
+    registry = {sub: _native_module_handler(f"mini_ork.cli.{sub}") for sub in _NATIVE_SUBS}
+    registry["execute"] = _execute_inprocess
+    for sub in _EXEC_SUBS:
+        registry[sub] = _bash_entrypoint_handler(sub)
+    registry["run"] = _run_handler
+    registry["doctor"] = _doctor_handler
+    registry["version"] = _version_handler
+    for alias in ("help", "--help", "-h"):
+        registry[alias] = _help_handler
+    return registry
+
+
+SUBCOMMAND_REGISTRY: dict = _build_default_registry()
+
+
+def register_subcommand(name: str, handler) -> None:
+    """Register (or replace) a subcommand: handler(rest, root) -> exit code."""
+    SUBCOMMAND_REGISTRY[name] = handler
 
 
 if __name__ == "__main__":
