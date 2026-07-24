@@ -54,6 +54,8 @@ Public surface (mirrors the bash signatures exactly where possible):
     cache_costline_from_log(log_path: str) -> tuple[float, int, int]
     mo_run_rubric_prescreen(epic, worktree, iter, repo_root, prompts_dir,
                             scripts_dir) -> None
+    RubricPrescreenConfig — typed parameter object capturing
+        mo_run_rubric_prescreen's env-fallback semantics (M8 ISP refactor).
     mo_rubric_run_score(kickoff_path, run_dir, task_class="generic") -> None
     mo_append_rubric_to_feedback(epic, iter, feedback_path) -> None
 
@@ -91,10 +93,12 @@ import re
 import secrets
 import sqlite3
 import subprocess
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
 
 __all__ = [
+    "RubricPrescreenConfig",
     "extract_rubric_json",
     "substitute_template",
     "artifact_summary",
@@ -499,6 +503,107 @@ def _is_free_lane(lane: str) -> bool:
 # Orchestrators (mirror lib/rubric-prescreen.sh 17-207 + 229-362)
 # ─────────────────────────────────────────────────────────────────────────────
 
+@dataclass(frozen=True)
+class RubricPrescreenConfig:
+    """Typed parameter object for ``mo_run_rubric_prescreen`` (ISP, M8).
+
+    Captures in ONE place the env-fallback semantics that previously
+    lived inline in the orchestrator (each ``None`` parameter fell back
+    to an ``os.environ`` read). ``None`` on a field means "unset" — the
+    ``resolve_*`` methods apply the built-in defaults, so the
+    resolution precedence is exactly the historical one:
+
+        explicit parameter  >  config field (env var)  >  built-in default
+
+    Env vars read by ``from_env`` (with their historical defaults):
+      MINI_ORK_HOME                 (default ".mini-ork", applied lazily
+                                     inside resolve_db only)
+      MINI_ORK_DB                   (default derived from home + "/state.db")
+      MO_RUBRIC_LANE                (default "kimi")
+      MO_RUBRIC_BUDGET_USD          (default 0.60)
+      MO_RUBRIC_EFFORT              (default "low")
+      MO_RUBRIC_MAX_OUTPUT_TOKENS   (default 2000)
+      MO_RUBRIC_TIMEOUT_SEC         (default 480)
+    """
+
+    mini_ork_home: Optional[str] = None
+    mini_ork_db: Optional[str] = None
+    lane: Optional[str] = None
+    rubric_budget_usd: Optional[float] = None
+    rubric_effort: Optional[str] = None
+    rubric_max_output_tokens: Optional[int] = None
+    rubric_timeout_sec: Optional[int] = None
+
+    @classmethod
+    def from_env(cls, env: Optional[Mapping[str, str]] = None) -> "RubricPrescreenConfig":
+        """Build a config from an env mapping (defaults to ``os.environ``).
+
+        Mirrors the historical inline reads verbatim, including the
+        float()/int() coercion semantics: a present-but-malformed
+        numeric var raises ValueError here, exactly as the inline
+        ``float(os.environ.get(...))`` did when the fallback fired.
+        """
+        env = os.environ if env is None else env
+        return cls(
+            mini_ork_home=env.get("MINI_ORK_HOME"),
+            mini_ork_db=env.get("MINI_ORK_DB"),
+            lane=env.get("MO_RUBRIC_LANE"),
+            rubric_budget_usd=(
+                float(env["MO_RUBRIC_BUDGET_USD"])
+                if "MO_RUBRIC_BUDGET_USD" in env else None
+            ),
+            rubric_effort=env.get("MO_RUBRIC_EFFORT"),
+            rubric_max_output_tokens=(
+                int(env["MO_RUBRIC_MAX_OUTPUT_TOKENS"])
+                if "MO_RUBRIC_MAX_OUTPUT_TOKENS" in env else None
+            ),
+            rubric_timeout_sec=(
+                int(env["MO_RUBRIC_TIMEOUT_SEC"])
+                if "MO_RUBRIC_TIMEOUT_SEC" in env else None
+            ),
+        )
+
+    def resolve_db(self, mini_ork_home: Optional[str] = None) -> str:
+        """Historical MINI_ORK_DB resolution, byte-for-byte.
+
+        Old inline form::
+
+            os.environ.get("MINI_ORK_DB",
+                f"{mini_ork_home or os.environ.get('MINI_ORK_HOME', '.mini-ork')}/state.db")
+
+        Note the corner cases preserved here: an env var that is SET
+        (even to the empty string) wins over the derived default, and
+        the explicit ``mini_ork_home`` parameter wins over the env home
+        only when truthy.
+        """
+        if self.mini_ork_db is not None:
+            return self.mini_ork_db
+        if mini_ork_home:
+            home = mini_ork_home
+        elif self.mini_ork_home is not None:
+            home = self.mini_ork_home
+        else:
+            home = ".mini-ork"
+        return f"{home}/state.db"
+
+    def resolve_lane(self) -> str:
+        return self.lane if self.lane is not None else "kimi"
+
+    def resolve_budget_usd(self) -> float:
+        return self.rubric_budget_usd if self.rubric_budget_usd is not None else 0.60
+
+    def resolve_effort(self) -> str:
+        return self.rubric_effort if self.rubric_effort is not None else "low"
+
+    def resolve_max_output_tokens(self) -> int:
+        return (self.rubric_max_output_tokens
+                if self.rubric_max_output_tokens is not None else 2000)
+
+    def resolve_timeout_sec(self) -> int:
+        return (self.rubric_timeout_sec
+                if self.rubric_timeout_sec is not None else 480)
+
+
 def mo_run_rubric_prescreen(
     epic: str,
     worktree: str,
@@ -524,25 +629,26 @@ def mo_run_rubric_prescreen(
 
     Args mirror the bash: ``epic worktree iter`` are positional, the
     rest come from env (caller can pass explicitly here for parity
-    with tests that don't source the bash env).
+    with tests that don't source the bash env). Env fallback
+    resolution is centralized in ``RubricPrescreenConfig.from_env`` —
+    precedence is unchanged: explicit parameter > env var > built-in
+    default.
     """
+    config = RubricPrescreenConfig.from_env()
     if mini_ork_db is None:
-        mini_ork_db = os.environ.get(
-            "MINI_ORK_DB",
-            f"{mini_ork_home or os.environ.get('MINI_ORK_HOME', '.mini-ork')}/state.db",
-        )
+        mini_ork_db = config.resolve_db(mini_ork_home)
 
     if lane is None:
-        lane = os.environ.get("MO_RUBRIC_LANE", "kimi")
+        lane = config.resolve_lane()
 
     if rubric_budget_usd is None:
-        rubric_budget_usd = float(os.environ.get("MO_RUBRIC_BUDGET_USD", "0.60"))
+        rubric_budget_usd = config.resolve_budget_usd()
     if rubric_effort is None:
-        rubric_effort = os.environ.get("MO_RUBRIC_EFFORT", "low")
+        rubric_effort = config.resolve_effort()
     if rubric_max_output_tokens is None:
-        rubric_max_output_tokens = int(os.environ.get("MO_RUBRIC_MAX_OUTPUT_TOKENS", "2000"))
+        rubric_max_output_tokens = config.resolve_max_output_tokens()
     if rubric_timeout_sec is None:
-        rubric_timeout_sec = int(os.environ.get("MO_RUBRIC_TIMEOUT_SEC", "480"))
+        rubric_timeout_sec = config.resolve_timeout_sec()
 
     iter_dir = f"{_run_dir(epic, mini_ork_home, repo_root)}/iter-{iter}"
     prompt_path = f"{iter_dir}/rubric-prompt.md"
