@@ -154,12 +154,13 @@ def get_embedder() -> Embedder:
 # ── Storage ────────────────────────────────────────────────────────────────
 
 
-_DEFAULT_DB = os.environ.get("MINI_ORK_DB") or ".mini-ork/state.db"
-
-
 def _resolve_db_path(db_path: str | os.PathLike[str] | None) -> str:
+    """Resolve the semantic-memory db path lazily (DIP): explicit argument
+    wins, else the MINI_ORK_DB env contract is read AT CALL TIME — never
+    frozen at import, so tests and long-running processes that repoint the
+    env see the current value."""
     if db_path is None:
-        return _DEFAULT_DB
+        return os.environ.get("MINI_ORK_DB") or ".mini-ork/state.db"
     return os.fspath(db_path)
 
 
