@@ -76,6 +76,7 @@ import sys
 # E1 seam — read by is_node_reusable for the per-node reuse decision.
 # Importing at module top means a runtime absence of E1 surfaces
 # immediately as ImportError on first call (fail loud).
+from mini_ork.context import apply_env_overrides
 from mini_ork.stores import checkpoints as mc
 
 # E3 seam — single-writer lease + idempotent recovery request. Guarded
@@ -688,17 +689,25 @@ def _resolve_default_paths(
 
 
 def _emit_recovery_env(plan: RecoveryPlan) -> None:
-    """Export the closure set + sku into the env so a follow-up
-    ``mini-ork execute`` invocation can pick it up. Keyed by run_id
+    """Publish the closure set + sku into the env so a follow-up
+    ``mini-ork execute`` can pick it up. Keyed by run_id
     so concurrent recoveries in different terminal sessions don't
     cross-contaminate.
+
+    CONTRACT (in-process only): these writes die with this process — the
+    hand-off works because the caller (test, API, or the in-process
+    execute flow) invokes the executor in the SAME process. A bash caller
+    gets the plan via stdout (format_status), not via env. Mutations go
+    through the canonical mini_ork.context helper.
     """
-    os.environ["MINI_ORK_RECOVERY_RUN_ID"] = plan.run_id
-    os.environ["MINI_ORK_RECOVERY_SKU"] = plan.sku
-    os.environ["MINI_ORK_RECOVERY_CLOSURE"] = " ".join(sorted(plan.closure))
+    apply_env_overrides({
+        "MINI_ORK_RECOVERY_RUN_ID": plan.run_id,
+        "MINI_ORK_RECOVERY_SKU": plan.sku,
+        "MINI_ORK_RECOVERY_CLOSURE": " ".join(sorted(plan.closure)),
+        "MINI_ORK_RECOVERY_STRATEGY": plan.strategy,
+    })
     if plan.first_node:
-        os.environ["MINI_ORK_RECOVERY_FROM"] = plan.first_node
-    os.environ["MINI_ORK_RECOVERY_STRATEGY"] = plan.strategy
+        apply_env_overrides({"MINI_ORK_RECOVERY_FROM": plan.first_node})
 
 
 def _task_class_for_recipe(recipe: str) -> str:
@@ -913,9 +922,9 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 0
         if _req is not None:
-            os.environ["MINI_ORK_RECOVERY_REQUEST"] = _req[0]
+            apply_env_overrides({"MINI_ORK_RECOVERY_REQUEST": _req[0]})
             _lease.mark_dispatched(db_path, _req[0], owner_token=_token, cost_usd=0.0)
-        os.environ["MINI_ORK_LEASE_TOKEN"] = _token
+        apply_env_overrides({"MINI_ORK_LEASE_TOKEN": _token})
 
     # Active strategies: emit the env, print the plan, hand off to
     # the native executor which honors MINI_ORK_RECOVERY_FROM + CLOSURE.
