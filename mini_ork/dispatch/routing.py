@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import os
 import sys
+from dataclasses import dataclass
+from typing import Callable
 
 _CODING_ROLES = {"implementer", "worker", "spec_author", "healer", "planner", "researcher",
                  "reflector", "replanner", "synthesizer", "bdd_runner"}
@@ -78,6 +80,92 @@ def learning_governed_lane(
         return current_lane
 
 
+# ── Routing policy registry (OCP) ────────────────────────────────────────────
+# A routing policy maps (node_type, current_lane, context) -> lane. Adding a
+# policy is ``register_policy(name, fn)`` — no executor edits. Selected via
+# MO_ROUTING_POLICY; unknown names warn + fall back to the workflow lane.
+
+_LLM_NODE_TYPES = ("researcher", "implementer", "reviewer")
+
+
+@dataclass(frozen=True)
+class RoutingContext:
+    node_type: str
+    current_lane: str
+    root: str | None = None
+    task_class: str | None = None
+
+
+RoutingPolicy = Callable[[RoutingContext], str]
+
+
+def _frontier_lane() -> str:
+    return os.environ.get("MO_FRONTIER_LANE", "opus_lens")
+
+
+def _cheap_lane() -> str:
+    return os.environ.get("MO_CHEAP_LANE", "kimi_lens")
+
+
+def _policy_workflow_default(ctx: RoutingContext) -> str:
+    return ctx.current_lane
+
+
+def _policy_frontier_only(ctx: RoutingContext) -> str:
+    return _frontier_lane() if ctx.node_type in _LLM_NODE_TYPES else ctx.current_lane
+
+
+def _policy_cheap_only(ctx: RoutingContext) -> str:
+    return _cheap_lane() if ctx.node_type in _LLM_NODE_TYPES else ctx.current_lane
+
+
+def _policy_static_hybrid(ctx: RoutingContext) -> str:
+    return learning_static_lane(ctx.node_type, ctx.current_lane)
+
+
+def _policy_learning_governed(ctx: RoutingContext) -> str:
+    # Router-monoculture fix: a recipe-pinned lane (current_lane != node_type) is a
+    # deliberate author choice — cross-family panel diversity (glm/kimi/codex/opus
+    # lenses) or a model-strength pin. The governed router must NOT override it with
+    # the single global-slice winner: that collapses every same-node-type panel node
+    # (4 researchers) onto ONE lane, destroying the diversity the recipe designed.
+    # Learning governs only UNPINNED nodes (current_lane == node_type); pinned nodes
+    # keep their lane — consistent with learning_static_lane's pin-preservation.
+    if ctx.current_lane != ctx.node_type:
+        return ctx.current_lane
+    return learning_governed_lane(
+        ctx.node_type,
+        learning_static_lane(ctx.node_type, ctx.current_lane),
+        root=ctx.root,
+        task_class=ctx.task_class,
+    )
+
+
+def _policy_trace_governed(ctx: RoutingContext) -> str:
+    fail_count = int(os.environ.get("FAIL_COUNT", "0") or "0")
+    if ctx.node_type == "reviewer":
+        return _frontier_lane()
+    if ctx.node_type in ("researcher", "implementer"):
+        return _frontier_lane() if fail_count > 0 else _cheap_lane()
+    return ctx.current_lane
+
+
+POLICY_REGISTRY: dict[str, RoutingPolicy] = {
+    "": _policy_workflow_default,
+    "workflow_default": _policy_workflow_default,
+    "frontier_only": _policy_frontier_only,
+    "cheap_only": _policy_cheap_only,
+    "static_hybrid": _policy_static_hybrid,
+    "learning_governed": _policy_learning_governed,
+    "trace_governed": _policy_trace_governed,
+}
+
+
+def register_policy(name: str, policy: RoutingPolicy) -> None:
+    """Register (or replace) a routing policy selectable via MO_ROUTING_POLICY."""
+    POLICY_REGISTRY[name] = policy
+
+
 def policy_route_lane(
     node_type: str,
     current_lane: str,
@@ -92,41 +180,10 @@ def policy_route_lane(
     if dry_run:
         return current_lane
     policy = os.environ.get("MO_ROUTING_POLICY") or "learning_governed"
-    frontier = os.environ.get("MO_FRONTIER_LANE", "opus_lens")
-    cheap = os.environ.get("MO_CHEAP_LANE", "kimi_lens")
-    llm_types = ("researcher", "implementer", "reviewer")
-    if policy in ("", "workflow_default"):
+    handler = POLICY_REGISTRY.get(policy)
+    if handler is None:
+        sys.stderr.write(f"  [warn] unknown MO_ROUTING_POLICY={policy} — using workflow lane {current_lane}\n")
         return current_lane
-    if policy == "frontier_only":
-        return frontier if node_type in llm_types else current_lane
-    if policy == "cheap_only":
-        return cheap if node_type in llm_types else current_lane
-    if policy == "static_hybrid":
-        return learning_static_lane(node_type, current_lane)
-    if policy == "learning_governed":
-        # Router-monoculture fix: a recipe-pinned lane (current_lane != node_type) is a
-        # deliberate author choice — cross-family panel diversity (glm/kimi/codex/opus
-        # lenses) or a model-strength pin. The governed router must NOT override it with
-        # the single global-slice winner: that collapses every same-node-type panel node
-        # (4 researchers) onto ONE lane, destroying the diversity the recipe designed.
-        # Learning governs only UNPINNED nodes (current_lane == node_type); pinned nodes
-        # keep their lane — consistent with learning_static_lane's pin-preservation.
-        if current_lane != node_type:
-            return current_lane
-        return learning_governed_lane(
-            node_type,
-            learning_static_lane(node_type, current_lane),
-            root=root,
-            task_class=task_class,
-        )
-    if policy == "trace_governed":
-        fail_count = int(os.environ.get("FAIL_COUNT", "0") or "0")
-        if node_type == "reviewer":
-            return frontier
-        if node_type in ("researcher", "implementer"):
-            return frontier if fail_count > 0 else cheap
-        return current_lane
-    sys.stderr.write(f"  [warn] unknown MO_ROUTING_POLICY={policy} — using workflow lane {current_lane}\n")
-    return current_lane
+    return handler(RoutingContext(node_type, current_lane, root=root, task_class=task_class))
 
 
