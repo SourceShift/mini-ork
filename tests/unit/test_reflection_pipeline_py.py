@@ -575,7 +575,7 @@ def test_reflection_suggest_promotions(temp_db):
     # Rationale must include the observed count + threshold (3).
     for s in py_arr:
         assert "Pattern observed" in s["rationale"]
-        assert f"threshold of 3" in s["rationale"], f"bad rationale: {s['rationale']!r}"
+        assert "threshold of 3" in s["rationale"], f"bad rationale: {s['rationale']!r}"
     # JSON shape: pattern_id, description, frequency, suggested_promotion_type,
     # evidence_trace_ids, rationale.
     assert set(py_arr[0].keys()) == {

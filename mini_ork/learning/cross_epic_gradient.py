@@ -118,7 +118,7 @@ def _upsert_cross_class(
     gid = "gr-cx-" + hashlib.sha256(target.encode("utf-8")).hexdigest()[:12]
     cx_target = f"cross_class:{target}"
     sig = top_signal or f"Target {target} flagged across task_classes"
-    suggested = top_change or f"Lesson fanned out across task_classes"
+    suggested = top_change or "Lesson fanned out across task_classes"
     evidence = top_evidence or ""
 
     exists = con.execute(

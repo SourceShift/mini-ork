@@ -231,7 +231,7 @@ def recompute_advantages(since: int = 0, db: str | None = None) -> int:
             if b["w"] > 0:
                 ex2 = b["wss"] / b["w"]
                 var = max(ex2 - lane_mean * lane_mean, 0.0)
-            std = math.sqrt(var)
+            _std = math.sqrt(var)  # computed for bash-port fidelity; var feeds var_sum
             wins = 1 if lane_adv > 0 else 0
             a = acc[(lane, _tc)]
             a["shr_sum"] += shrunken
