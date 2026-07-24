@@ -43,6 +43,8 @@ import subprocess
 import sys
 import time
 import uuid
+from dataclasses import dataclass
+from typing import Callable
 
 from mini_ork.context import (
     ENV_DISPATCH_CHAIN,
@@ -1761,27 +1763,11 @@ def dispatch_node(fields, *, root, run_dir, plan_path, task_class, db, run_id,
         return 1, "blocked"
 
     # planner/reflector don't dispatch an LLM — handled after the intervention gate
-    # (bash routes them through the same gate then falls to their case).
-    if node_type == "planner":
-        print("  [skip] planner node handled by the Python plan runtime")
-        return 0, "done"
-    if node_type == "reflector":
-        # Preserve bash's `… || true`: reflection is a side-channel and must
-        # never fail the workflow node. Capturing output also prevents the
-        # reflect report from leaking into execute's stdout contract.
-        try:
-            subprocess.run(
-                [sys.executable, "-m", "mini_ork.cli.reflect"],
-                capture_output=True,
-                env={
-                    **os.environ,
-                    "MINI_ORK_ROOT": root,
-                    "PYTHONPATH": root + os.pathsep + os.environ.get("PYTHONPATH", ""),
-                },
-            )
-        except OSError:
-            pass
-        return 0, "done"
+    # (bash routes them through the same gate then falls to their case). Early-phase
+    # handlers are registered in EARLY_NODE_HANDLERS (see register_node_handler).
+    early_handler = EARLY_NODE_HANDLERS.get(node_type)
+    if early_handler is not None:
+        return early_handler(root)
 
     # Capability assert (bash:2296-2306): a node's requires_capabilities must be
     # satisfiable by the resolved lane, else fail 'config' rather than dispatch to
@@ -1806,17 +1792,6 @@ def dispatch_node(fields, *, root, run_dir, plan_path, task_class, db, run_id,
         prompt_file = os.path.join(recipe_dir, "prompts", f"{node_type}.md")
     elif os.path.isfile(os.path.join(root, "prompts", f"{node_type}.md")):
         prompt_file = os.path.join(root, "prompts", f"{node_type}.md")
-
-    def _prepend():
-        return (f"\n\n--- Recipe prompt (system context) ---\n{open(prompt_file).read()}"
-                f"\n--- /recipe prompt ---\n\n") if prompt_file and os.path.isfile(prompt_file) else ""
-
-    def _write_preserving_agent(out_file, marker, result):
-        # preserve the agent's own tool-call Write when it touched out_file
-        if os.path.isfile(out_file) and os.path.getmtime(out_file) > os.path.getmtime(marker):
-            open(out_file + ".stdout.md", "w").write(result)
-        else:
-            open(out_file, "w").write(result)
 
     plan_content = open(plan_path).read() if plan_path and os.path.isfile(plan_path) else ""
     # F5-B: reflect-learned failure modes + operator steering, injected after node_desc
@@ -1848,251 +1823,396 @@ def dispatch_node(fields, *, root, run_dir, plan_path, task_class, db, run_id,
         except Exception as e:  # noqa: BLE001 — resume is best-effort
             print(f"  [resume] skipped for node_id={node_id}: {e}", file=sys.stderr)
 
-    if node_type == "researcher":
-        ctx = _researcher_output_file(run_dir, recipe or os.environ.get("MINI_ORK_RECIPE", ""), node_id)
-        prompt = f"{_prepend()}Task: {node_desc}{learned}\n\nPlan context:\n{plan_content}\n\nWrite your output to: {ctx}"
-        marker = os.path.join(run_dir, f".dispatch-marker-{node_id}"); open(marker, "w").write("")
-        rc, result = dispatch_fn(task_class, lane, prompt)
-        if rc != 0:
-            fr = finish_reason_for_failure(rc, result)
-            trace(node_id, "failure", "researcher", ctx, "", fr)
-            return 1, fr
-        _write_preserving_agent(ctx, marker, result)
-        try:
-            os.remove(marker)
-        except OSError:
-            pass
-        trace(node_id, "success", "researcher", ctx, "", "done")
-        _charge()
+    ctx = NodeDispatch(
+        node_id=node_id, node_type=node_type, node_desc=node_desc,
+        prompt_ref=prompt_ref, verifier_ref=verifier_ref, model_lane=model_lane,
+        node_requires_capabilities=node_requires_capabilities,
+        root=root, run_dir=run_dir, plan_path=plan_path, task_class=task_class,
+        db=db, run_id=run_id, recipe=recipe, workflow=workflow,
+        lane=lane, run_dir_eff=run_dir_eff, recipe_dir=recipe_dir,
+        prompt_file=prompt_file, plan_content=plan_content, learned=learned,
+        dispatch_fn=dispatch_fn, trace=trace, charge=_charge,
+    )
+    # Node-type handler registry (OCP): a new node type is
+    # register_node_handler("type", fn) — no edit to this function. Unknown
+    # types fall through to (0, "done") exactly as the bash catch-all did.
+    handler = NODE_HANDLER_REGISTRY.get(node_type)
+    if handler is None:
         return 0, "done"
+    return handler(ctx)
 
-    if node_type == "implementer":
-        # F6-B: implementer sub-mode dispatchers (bash :2493-2555). Orchestration
-        # recipes replace the single-LLM implementer with a python fan-out dispatcher.
-        recipe_eff = recipe or os.environ.get("MINI_ORK_RECIPE", "")
-        _submode = {
-            ("doc-to-features-loop", "per_feature_dispatcher"):
-                ("child-runs/_summary.json", "doc-to-features-loop/lib/per_feature_dispatcher.py"),
-            ("epic-runner", "epic_dispatcher"):
-                ("epic-results.json", "epic-runner/lib/epic_dispatcher.py"),
-            ("epic-runner", "wave_aggregator"):
-                ("wave-aggregate.json", "epic-runner/lib/wave_aggregator.py"),
-        }.get((recipe_eff, node_id))
-        if _submode:
-            impl_rel, script_rel = _submode
-            sub_log = os.path.join(run_dir, impl_rel)
-            script = os.path.join(root, "recipes", script_rel)
-            if not os.path.isfile(script):
-                print(f"dispatcher script missing: {script}", file=sys.stderr)
-                trace(node_id, "failure", "implementer", sub_log, "", "error")
-                return 1, "error"
-            os.makedirs(os.path.dirname(sub_log), exist_ok=True)
-            rc = subprocess.run(["python3", script]).returncode
-            if rc == 0:
-                print(f"  [ok] dispatcher results → {sub_log}")
-                trace(node_id, "success", "implementer", sub_log, "", "done")
-                return 0, "done"
-            print("dispatcher failed", file=sys.stderr)
-            trace(node_id, "failure", "implementer", sub_log, "", "error")
-            return 1, "error"
-        impl_log = os.path.join(run_dir, f"impl-{node_id}.log")
-        prompt = f"{_prepend()}Implement: {node_desc}{learned}\n\nPlan:\n{plan_content}"
-        # F4: pin the codex/gemini edit surface to the TARGET repo (kickoff's git
-        # toplevel), not os.getcwd(). Without this the implementer diff/writes land
-        # in mini-ork's own tree when cwd != target — the CWT-A corruption hazard
-        # (bash _dispatch_node:2626-2642). Export so cl_codex.sh reads it.
-        target = _resolve_target_cwd(run_dir_eff)
-        apply_env_overrides({ENV_TARGET_CWD: target})
-        print(f"  [cwd] codex target: {target}", file=sys.stderr)
 
-        # R5b: the opt-in minimal scaffold is a real executor behavior, not
-        # merely a resolver module. Its default remains ``harness``. Capture
-        # the resolver's parity stdout so it cannot leak into execute output.
-        try:
-            from mini_ork.orchestration import scaffold_tier
-            with contextlib.redirect_stdout(io.StringIO()):
-                tier = scaffold_tier.mo_scaffold_tier(
-                    node_type, task_class
-                ).strip()
-        except Exception:
-            tier = "harness"
-        if tier == "minimal":
-            try:
-                from mini_ork.agent.minimal import run_minimal
-                result = run_minimal(prompt, cwd=target)
-                output = result.final_output or ""
-                with open(impl_log, "w", encoding="utf-8") as handle:
-                    handle.write(output)
-                if output:
-                    print(f"  [ok] minimal scaffold implementer output → {impl_log}")
-                    trace(node_id, "success", "implementer", impl_log, "", "done")
-                    return 0, "done"
-            except Exception:
-                pass
-            print("  [err] minimal scaffold implementer failed", file=sys.stderr)
-            trace(node_id, "failure", "implementer", impl_log, "", "error")
-            return 1, "error"
+# ── Node-type handlers (SOLID M3, OCP) ───────────────────────────────────────
+# One function per node type; dispatch_node is preamble + registry lookup.
 
-        rc, result = dispatch_fn(task_class, lane, prompt)
-        if rc != 0:
-            fr = finish_reason_for_failure(rc, result)
-            trace(node_id, "failure", "implementer", impl_log, "", fr)
-            return 1, fr
-        open(impl_log, "w").write(result)
-        apply_impl_output(impl_log, target)   # ported "capture coin-flip" applier
-        if recipe_eff == "self-migrate":
-            harvested = _harvest_self_migrate_artifacts(run_dir_eff, target)
-            _write_self_migrate_implementer_summary(
-                run_dir_eff, target, impl_log, harvested
-            )
-        trace(node_id, "success", "implementer", impl_log, "", "done")
-        _charge()
-        return 0, "done"
+_IMPLEMENTER_SUBMODES: dict[tuple[str, str], tuple[str, str]] = {
+    # (recipe, node_id) -> (results artifact, dispatcher script), both
+    # repo-relative. Orchestration recipes replace the single-LLM implementer
+    # with a python fan-out dispatcher (bash :2493-2555).
+    ("doc-to-features-loop", "per_feature_dispatcher"):
+        ("child-runs/_summary.json", "doc-to-features-loop/lib/per_feature_dispatcher.py"),
+    ("epic-runner", "epic_dispatcher"):
+        ("epic-results.json", "epic-runner/lib/epic_dispatcher.py"),
+    ("epic-runner", "wave_aggregator"):
+        ("wave-aggregate.json", "epic-runner/lib/wave_aggregator.py"),
+}
 
-    if node_type == "reviewer":
-        # F3/F6: three-way classification matching bash _dispatch_node:2704-2727.
-        #  - recursive-validate-impl/tier4_synth is a PANEL GATE, not a synth: it
-        #    writes panel-verdict.json and MUST run the verdict gate (approval gate).
-        #  - other *synth* nodes are informational: write the artifact_contract
-        #    source_artifact (default synthesis.md) and never gate.
-        #  - everything else is a classic reviewer → review-<id>.json + gate.
-        recipe_eff = recipe or os.environ.get("MINI_ORK_RECIPE", "")
-        is_panel_gate = (recipe_eff == "recursive-validate-impl" and node_id == "tier4_synth")
-        if is_panel_gate:
-            review_file = os.path.join(run_dir, "panel-verdict.json")
-            is_synth = False
-        elif "synth" in node_id:
-            review_file = os.path.join(run_dir, _synth_artifact_name(root, recipe_eff))
-            is_synth = True
+
+def register_implementer_submode(recipe: str, node_id: str,
+                                 results_artifact: str, script: str) -> None:
+    """Register a fan-out dispatcher for (recipe, node_id) — data, not code edits."""
+    _IMPLEMENTER_SUBMODES[(recipe, node_id)] = (results_artifact, script)
+
+
+@dataclass
+class NodeDispatch:
+    """Everything a node-type handler needs from the dispatch preamble.
+
+    Handlers are (NodeDispatch) -> (rc, finish_reason) callables registered in
+    NODE_HANDLER_REGISTRY; the preamble (policy routing, env publish, gates,
+    prompt assembly) runs once in dispatch_node before the lookup.
+    """
+
+    node_id: str
+    node_type: str
+    node_desc: str
+    prompt_ref: str
+    verifier_ref: str
+    model_lane: str
+    node_requires_capabilities: str
+    root: str
+    run_dir: str
+    plan_path: str
+    task_class: str
+    db: str
+    run_id: str
+    recipe: str
+    workflow: str
+    lane: str
+    run_dir_eff: str
+    recipe_dir: str
+    prompt_file: str
+    plan_content: str
+    learned: str
+    dispatch_fn: Callable
+    trace: Callable
+    charge: Callable
+
+    @property
+    def recipe_eff(self) -> str:
+        return self.recipe or os.environ.get("MINI_ORK_RECIPE", "")
+
+    def prepend(self) -> str:
+        return (f"\n\n--- Recipe prompt (system context) ---\n{open(self.prompt_file).read()}"
+                f"\n--- /recipe prompt ---\n\n") \
+            if self.prompt_file and os.path.isfile(self.prompt_file) else ""
+
+    def write_preserving_agent(self, out_file, marker, result):
+        # preserve the agent's own tool-call Write when it touched out_file
+        if os.path.isfile(out_file) and os.path.getmtime(out_file) > os.path.getmtime(marker):
+            open(out_file + ".stdout.md", "w").write(result)
         else:
-            review_file = os.path.join(run_dir, f"review-{node_id}.json")
-            is_synth = False
-        # F2-B: per-case prompt matching bash :2739-2756. The classic reviewer gets the
-        # assembled inputs (summary + verifier verdicts + diff) AND the JSON envelope —
-        # without the envelope the LLM emits prose → verdict=unknown → false rollback.
-        if is_panel_gate:
-            prompt = (f"{_prepend()}Synthesize panel verdict for: {node_desc}{learned}\n\n"
-                      f"Plan:\n{plan_content}\n\nWrite strict JSON to: {review_file}")
-        elif is_synth:
-            prompt = (f"{_prepend()}Synthesize for: {node_desc}{learned}\n\n"
-                      f"Plan:\n{plan_content}\n\nWrite your synthesis to: {review_file}")
-        else:
-            reviewer_inputs = _assemble_reviewer_inputs(run_dir_eff)
-            prompt = (f"{_prepend()}Review the implementation for: {node_desc}{learned}\n\n"
-                      f"Plan:\n{plan_content}\n\n{reviewer_inputs}\n"
-                      'Respond with JSON: {"verdict": "pass|fail|needs_revision", "notes": []}')
-        marker = os.path.join(run_dir, f".dispatch-marker-{node_id}"); open(marker, "w").write("")
-        rc, result = dispatch_fn(task_class, lane, prompt)
-        if rc != 0:
-            fr = finish_reason_for_failure(rc, result)
-            trace(node_id, "failure", "reviewer", review_file, "", fr)
-            return 1, fr
-        _write_preserving_agent(review_file, marker, result)
-        try:
-            os.remove(marker)
-        except OSError:
-            pass
-        verdict = _extract_verdict(root, review_file)
-        print(f"  [info] reviewer verdict={verdict} → {review_file}")
-        vn = verdict.lower()
-        if is_synth:  # true synth only — panel gate falls through to the verdict gate
-            trace(node_id, "success", "reviewer", review_file, verdict, "done")
-            _charge()
-            return 0, "done"
-        if vn in _REVIEW_PASS:
-            trace(node_id, "success", "reviewer", review_file, verdict, "done")
-            _charge()
-            return 0, "done"
-        fr = "verdict_revise" if vn in _REVIEW_REVISE else "verdict_fail"
-        trace(node_id, "failure", "reviewer", review_file, verdict, fr)
-        _charge()
-        return 1, fr
+            open(out_file, "w").write(result)
 
-    if node_type == "verifier":
-        # Hollow-run guard: fail before any verifier runs if the recipe declares a
-        # concrete run-local artifact (absolute contract path) that is missing or
-        # zero-byte. Covers the verifier_ref branch (which bypasses the canonical
-        # verifier). A verifier ordered before the first implementer is a baseline
-        # oracle and cannot require artifacts that do not exist until implementation.
-        if (not _verifier_runs_before_implementer(workflow, node_id)
-                and not _required_artifacts_ok(plan_path)):
-            print("  [fail] verifier node: required artifact(s) missing or empty", file=sys.stderr)
-            return 1, "error"
-        artifact = ""
-        try:
-            ac = (json.load(open(plan_path)).get("artifact_contract") or {}) if plan_path else {}
-            outs = ac.get("outputs") or [] if isinstance(ac, dict) else []
-            artifact = outs[0] if outs else ""
-        except Exception:
-            artifact = ""
-        if not artifact:
-            # NEW-1: bash (:2899-2902) warns + sets error finish_reason but does NOT
-            # return 1 — a verifier node with no artifact_contract outputs does not
-            # fail the run. Return rc 0 to match (finish_reason error is informational).
-            print("  [warn] verifier node: no outputs in artifact_contract")
-            return 0, "error"
-        if verifier_ref and recipe_dir:
-            script = os.path.join(recipe_dir, verifier_ref)
-            if not os.path.isfile(script):
-                print(f"  [fail] verifier_ref not found: {verifier_ref}", file=sys.stderr)
-                return 1, "error"
-            ev_dir = os.path.join(os.environ.get("MINI_ORK_RUN_DIR", run_dir), "evidence")
-            os.makedirs(ev_dir, exist_ok=True)
-            ev = os.path.join(ev_dir, os.path.basename(verifier_ref).replace(".sh", "") + ".log")
-            rc = _run_verifier_ref(script, ev, plan_path=plan_path, artifact_path=artifact)
-            # F2-B: persist evidence to verifier_<stem>.json (bash :2886-2888) so the
-            # reviewer input assembly can read the typecheck/test verdicts. Before the
-            # rc return so failures are visible too (a missing verifier is real signal).
-            vstem = verifier_ref[len("verifiers/"):] if verifier_ref.startswith("verifiers/") else verifier_ref
-            vstem = vstem[:-3] if vstem.endswith(".sh") else vstem
-            persist_dir = os.environ.get("MINI_ORK_RUN_DIR", run_dir)
-            if persist_dir and os.path.isfile(ev) and os.path.getsize(ev) > 0:
-                try:
-                    shutil.copy(ev, os.path.join(persist_dir, f"verifier_{vstem}.json"))
-                except OSError:
-                    pass
-            return (0, "done") if rc == 0 else (1, "error")
-        module_env = dict(os.environ)
-        module_env["PYTHONPATH"] = root + (
-            os.pathsep + module_env["PYTHONPATH"] if module_env.get("PYTHONPATH") else ""
-        )
-        rc = subprocess.run([
-            sys.executable, "-m", "mini_ork.cli.verify", "--plan", plan_path,
-            "--task-class", task_class, artifact,
-        ], env=module_env).returncode
-        return (0, "done") if rc == 0 else (1, "error")
+    def dispatch(self, prompt: str):
+        return self.dispatch_fn(self.task_class, self.lane, prompt)
 
-    if node_type == "publisher":
-        recipe_eff = recipe or os.environ.get("MINI_ORK_RECIPE", "")
-        return publisher_node(root, run_dir_eff, db, run_id, recipe_eff, task_class,
-                              review_file=os.environ.get("REVIEW_FILE", ""),
-                              verdict_env=os.environ.get("VERDICT", ""))
 
-    if node_type == "rollback":
-        # F4: bash (:3205-3223) does a best-effort version_rollback (workflow then
-        # agent), succeeds regardless of whether a prior version exists, sets
-        # finish_reason=done and returns 0 — it does NOT set task_runs.status. Was:
-        # set_status('rolled_back') + return 1 (a no-op that also mis-set status and
-        # double-counted the failure). The upstream failure already failed the run.
-        from mini_ork.registries import version_registry as _vr
-        reverted = False
-        for kind, name in (("workflow", recipe or "default"), ("agent", "default")):
-            try:
-                _vr.rollback(kind, name, db=db)
-                reverted = True
-                break
-            except Exception:
-                continue
-        if not reverted:
-            print("  [ok] rollback: nothing to revert (no prior promoted version)", file=sys.stderr)
-        print("  [ok] rollback complete")
-        # NOTE: bash traces NO rollback node (:3205-3223 has no _trace_write_node_rich).
-        # Tracing it with status=success would write a spurious +1-reward execution_traces
-        # row — semantically inverted (rollback fires because the run FAILED) — that
-        # poisons GRPO/reflect. Deliberately no trace() here to stay faithful.
-        return 0, "done"
-
+def _handle_planner_early(root):
+    print("  [skip] planner node handled by the Python plan runtime")
     return 0, "done"
+
+
+def _handle_reflector_early(root):
+    # Preserve bash's `… || true`: reflection is a side-channel and must
+    # never fail the workflow node. Capturing output also prevents the
+    # reflect report from leaking into execute's stdout contract.
+    try:
+        subprocess.run(
+            [sys.executable, "-m", "mini_ork.cli.reflect"],
+            capture_output=True,
+            env={
+                **os.environ,
+                "MINI_ORK_ROOT": root,
+                "PYTHONPATH": root + os.pathsep + os.environ.get("PYTHONPATH", ""),
+            },
+        )
+    except OSError:
+        pass
+    return 0, "done"
+
+
+EARLY_NODE_HANDLERS: dict[str, Callable] = {
+    "planner": _handle_planner_early,
+    "reflector": _handle_reflector_early,
+}
+
+
+def _handle_researcher(ctx: NodeDispatch):
+    out_file = _researcher_output_file(ctx.run_dir, ctx.recipe_eff, ctx.node_id)
+    prompt = (f"{ctx.prepend()}Task: {ctx.node_desc}{ctx.learned}\n\nPlan context:\n"
+              f"{ctx.plan_content}\n\nWrite your output to: {out_file}")
+    marker = os.path.join(ctx.run_dir, f".dispatch-marker-{ctx.node_id}")
+    open(marker, "w").write("")
+    rc, result = ctx.dispatch(prompt)
+    if rc != 0:
+        fr = finish_reason_for_failure(rc, result)
+        ctx.trace(ctx.node_id, "failure", "researcher", out_file, "", fr)
+        return 1, fr
+    ctx.write_preserving_agent(out_file, marker, result)
+    try:
+        os.remove(marker)
+    except OSError:
+        pass
+    ctx.trace(ctx.node_id, "success", "researcher", out_file, "", "done")
+    ctx.charge()
+    return 0, "done"
+
+
+def _handle_implementer(ctx: NodeDispatch):
+    # F6-B: implementer sub-mode dispatchers (bash :2493-2555), registry-driven.
+    submode = _IMPLEMENTER_SUBMODES.get((ctx.recipe_eff, ctx.node_id))
+    if submode:
+        impl_rel, script_rel = submode
+        sub_log = os.path.join(ctx.run_dir, impl_rel)
+        script = os.path.join(ctx.root, "recipes", script_rel)
+        if not os.path.isfile(script):
+            print(f"dispatcher script missing: {script}", file=sys.stderr)
+            ctx.trace(ctx.node_id, "failure", "implementer", sub_log, "", "error")
+            return 1, "error"
+        os.makedirs(os.path.dirname(sub_log), exist_ok=True)
+        rc = subprocess.run(["python3", script]).returncode
+        if rc == 0:
+            print(f"  [ok] dispatcher results → {sub_log}")
+            ctx.trace(ctx.node_id, "success", "implementer", sub_log, "", "done")
+            return 0, "done"
+        print("dispatcher failed", file=sys.stderr)
+        ctx.trace(ctx.node_id, "failure", "implementer", sub_log, "", "error")
+        return 1, "error"
+    impl_log = os.path.join(ctx.run_dir, f"impl-{ctx.node_id}.log")
+    prompt = f"{ctx.prepend()}Implement: {ctx.node_desc}{ctx.learned}\n\nPlan:\n{ctx.plan_content}"
+    # F4: pin the codex/gemini edit surface to the TARGET repo (kickoff's git
+    # toplevel), not os.getcwd(). Without this the implementer diff/writes land
+    # in mini-ork's own tree when cwd != target — the CWT-A corruption hazard
+    # (bash _dispatch_node:2626-2642). Export so cl_codex.sh reads it.
+    target = _resolve_target_cwd(ctx.run_dir_eff)
+    apply_env_overrides({ENV_TARGET_CWD: target})
+    print(f"  [cwd] codex target: {target}", file=sys.stderr)
+
+    # R5b: the opt-in minimal scaffold is a real executor behavior, not
+    # merely a resolver module. Its default remains ``harness``. Capture
+    # the resolver's parity stdout so it cannot leak into execute output.
+    try:
+        from mini_ork.orchestration import scaffold_tier
+        with contextlib.redirect_stdout(io.StringIO()):
+            tier = scaffold_tier.mo_scaffold_tier(
+                ctx.node_type, ctx.task_class
+            ).strip()
+    except Exception:
+        tier = "harness"
+    if tier == "minimal":
+        try:
+            from mini_ork.agent.minimal import run_minimal
+            result = run_minimal(prompt, cwd=target)
+            output = result.final_output or ""
+            with open(impl_log, "w", encoding="utf-8") as handle:
+                handle.write(output)
+            if output:
+                print(f"  [ok] minimal scaffold implementer output → {impl_log}")
+                ctx.trace(ctx.node_id, "success", "implementer", impl_log, "", "done")
+                return 0, "done"
+        except Exception:
+            pass
+        print("  [err] minimal scaffold implementer failed", file=sys.stderr)
+        ctx.trace(ctx.node_id, "failure", "implementer", impl_log, "", "error")
+        return 1, "error"
+
+    rc, result = ctx.dispatch(prompt)
+    if rc != 0:
+        fr = finish_reason_for_failure(rc, result)
+        ctx.trace(ctx.node_id, "failure", "implementer", impl_log, "", fr)
+        return 1, fr
+    open(impl_log, "w").write(result)
+    apply_impl_output(impl_log, target)   # ported "capture coin-flip" applier
+    if ctx.recipe_eff == "self-migrate":
+        harvested = _harvest_self_migrate_artifacts(ctx.run_dir_eff, target)
+        _write_self_migrate_implementer_summary(
+            ctx.run_dir_eff, target, impl_log, harvested
+        )
+    ctx.trace(ctx.node_id, "success", "implementer", impl_log, "", "done")
+    ctx.charge()
+    return 0, "done"
+
+
+def _classify_review_node(recipe_eff: str, node_id: str, root: str, run_dir: str):
+    """F3/F6 three-way classification matching bash _dispatch_node:2704-2727:
+     - recursive-validate-impl/tier4_synth is a PANEL GATE, not a synth: it
+       writes panel-verdict.json and MUST run the verdict gate (approval gate).
+     - other *synth* nodes are informational: write the artifact_contract
+       source_artifact (default synthesis.md) and never gate.
+     - everything else is a classic reviewer → review-<id>.json + gate.
+    Returns (review_file, is_panel_gate, is_synth)."""
+    if recipe_eff == "recursive-validate-impl" and node_id == "tier4_synth":
+        return os.path.join(run_dir, "panel-verdict.json"), True, False
+    if "synth" in node_id:
+        return os.path.join(run_dir, _synth_artifact_name(root, recipe_eff)), False, True
+    return os.path.join(run_dir, f"review-{node_id}.json"), False, False
+
+
+def _handle_reviewer(ctx: NodeDispatch):
+    review_file, is_panel_gate, is_synth = _classify_review_node(
+        ctx.recipe_eff, ctx.node_id, ctx.root, ctx.run_dir)
+    # F2-B: per-case prompt matching bash :2739-2756. The classic reviewer gets the
+    # assembled inputs (summary + verifier verdicts + diff) AND the JSON envelope —
+    # without the envelope the LLM emits prose → verdict=unknown → false rollback.
+    if is_panel_gate:
+        prompt = (f"{ctx.prepend()}Synthesize panel verdict for: {ctx.node_desc}{ctx.learned}\n\n"
+                  f"Plan:\n{ctx.plan_content}\n\nWrite strict JSON to: {review_file}")
+    elif is_synth:
+        prompt = (f"{ctx.prepend()}Synthesize for: {ctx.node_desc}{ctx.learned}\n\n"
+                  f"Plan:\n{ctx.plan_content}\n\nWrite your synthesis to: {review_file}")
+    else:
+        reviewer_inputs = _assemble_reviewer_inputs(ctx.run_dir_eff)
+        prompt = (f"{ctx.prepend()}Review the implementation for: {ctx.node_desc}{ctx.learned}\n\n"
+                  f"Plan:\n{ctx.plan_content}\n\n{reviewer_inputs}\n"
+                  'Respond with JSON: {"verdict": "pass|fail|needs_revision", "notes": []}')
+    marker = os.path.join(ctx.run_dir, f".dispatch-marker-{ctx.node_id}")
+    open(marker, "w").write("")
+    rc, result = ctx.dispatch(prompt)
+    if rc != 0:
+        fr = finish_reason_for_failure(rc, result)
+        ctx.trace(ctx.node_id, "failure", "reviewer", review_file, "", fr)
+        return 1, fr
+    ctx.write_preserving_agent(review_file, marker, result)
+    try:
+        os.remove(marker)
+    except OSError:
+        pass
+    verdict = _extract_verdict(ctx.root, review_file)
+    print(f"  [info] reviewer verdict={verdict} → {review_file}")
+    vn = verdict.lower()
+    if is_synth:  # true synth only — panel gate falls through to the verdict gate
+        ctx.trace(ctx.node_id, "success", "reviewer", review_file, verdict, "done")
+        ctx.charge()
+        return 0, "done"
+    if vn in _REVIEW_PASS:
+        ctx.trace(ctx.node_id, "success", "reviewer", review_file, verdict, "done")
+        ctx.charge()
+        return 0, "done"
+    fr = "verdict_revise" if vn in _REVIEW_REVISE else "verdict_fail"
+    ctx.trace(ctx.node_id, "failure", "reviewer", review_file, verdict, fr)
+    ctx.charge()
+    return 1, fr
+
+
+def _handle_verifier(ctx: NodeDispatch):
+    # Hollow-run guard: fail before any verifier runs if the recipe declares a
+    # concrete run-local artifact (absolute contract path) that is missing or
+    # zero-byte. Covers the verifier_ref branch (which bypasses the canonical
+    # verifier). A verifier ordered before the first implementer is a baseline
+    # oracle and cannot require artifacts that do not exist until implementation.
+    if (not _verifier_runs_before_implementer(ctx.workflow, ctx.node_id)
+            and not _required_artifacts_ok(ctx.plan_path)):
+        print("  [fail] verifier node: required artifact(s) missing or empty", file=sys.stderr)
+        return 1, "error"
+    artifact = ""
+    try:
+        ac = (json.load(open(ctx.plan_path)).get("artifact_contract") or {}) if ctx.plan_path else {}
+        outs = ac.get("outputs") or [] if isinstance(ac, dict) else []
+        artifact = outs[0] if outs else ""
+    except Exception:
+        artifact = ""
+    if not artifact:
+        # NEW-1: bash (:2899-2902) warns + sets error finish_reason but does NOT
+        # return 1 — a verifier node with no artifact_contract outputs does not
+        # fail the run. Return rc 0 to match (finish_reason error is informational).
+        print("  [warn] verifier node: no outputs in artifact_contract")
+        return 0, "error"
+    if ctx.verifier_ref and ctx.recipe_dir:
+        script = os.path.join(ctx.recipe_dir, ctx.verifier_ref)
+        if not os.path.isfile(script):
+            print(f"  [fail] verifier_ref not found: {ctx.verifier_ref}", file=sys.stderr)
+            return 1, "error"
+        ev_dir = os.path.join(os.environ.get("MINI_ORK_RUN_DIR", ctx.run_dir), "evidence")
+        os.makedirs(ev_dir, exist_ok=True)
+        ev = os.path.join(ev_dir, os.path.basename(ctx.verifier_ref).replace(".sh", "") + ".log")
+        rc = _run_verifier_ref(script, ev, plan_path=ctx.plan_path, artifact_path=artifact)
+        # F2-B: persist evidence to verifier_<stem>.json (bash :2886-2888) so the
+        # reviewer input assembly can read the typecheck/test verdicts. Before the
+        # rc return so failures are visible too (a missing verifier is real signal).
+        vstem = ctx.verifier_ref[len("verifiers/"):] if ctx.verifier_ref.startswith("verifiers/") else ctx.verifier_ref
+        vstem = vstem[:-3] if vstem.endswith(".sh") else vstem
+        persist_dir = os.environ.get("MINI_ORK_RUN_DIR", ctx.run_dir)
+        if persist_dir and os.path.isfile(ev) and os.path.getsize(ev) > 0:
+            try:
+                shutil.copy(ev, os.path.join(persist_dir, f"verifier_{vstem}.json"))
+            except OSError:
+                pass
+        return (0, "done") if rc == 0 else (1, "error")
+    module_env = dict(os.environ)
+    module_env["PYTHONPATH"] = ctx.root + (
+        os.pathsep + module_env["PYTHONPATH"] if module_env.get("PYTHONPATH") else ""
+    )
+    rc = subprocess.run([
+        sys.executable, "-m", "mini_ork.cli.verify", "--plan", ctx.plan_path,
+        "--task-class", ctx.task_class, artifact,
+    ], env=module_env).returncode
+    return (0, "done") if rc == 0 else (1, "error")
+
+
+def _handle_publisher(ctx: NodeDispatch):
+    return publisher_node(ctx.root, ctx.run_dir_eff, ctx.db, ctx.run_id,
+                          ctx.recipe_eff, ctx.task_class,
+                          review_file=os.environ.get("REVIEW_FILE", ""),
+                          verdict_env=os.environ.get("VERDICT", ""))
+
+
+def _handle_rollback(ctx: NodeDispatch):
+    # F4: bash (:3205-3223) does a best-effort version_rollback (workflow then
+    # agent), succeeds regardless of whether a prior version exists, sets
+    # finish_reason=done and returns 0 — it does NOT set task_runs.status. Was:
+    # set_status('rolled_back') + return 1 (a no-op that also mis-set status and
+    # double-counted the failure). The upstream failure already failed the run.
+    from mini_ork.registries import version_registry as _vr
+    reverted = False
+    for kind, name in (("workflow", ctx.recipe or "default"), ("agent", "default")):
+        try:
+            _vr.rollback(kind, name, db=ctx.db)
+            reverted = True
+            break
+        except Exception:
+            continue
+    if not reverted:
+        print("  [ok] rollback: nothing to revert (no prior promoted version)", file=sys.stderr)
+    print("  [ok] rollback complete")
+    # NOTE: bash traces NO rollback node (:3205-3223 has no _trace_write_node_rich).
+    # Tracing it with status=success would write a spurious +1-reward execution_traces
+    # row — semantically inverted (rollback fires because the run FAILED) — that
+    # poisons GRPO/reflect. Deliberately no trace() here to stay faithful.
+    return 0, "done"
+
+
+NODE_HANDLER_REGISTRY: dict[str, Callable[[NodeDispatch], tuple[int, str]]] = {
+    "researcher": _handle_researcher,
+    "implementer": _handle_implementer,
+    "reviewer": _handle_reviewer,
+    "verifier": _handle_verifier,
+    "publisher": _handle_publisher,
+    "rollback": _handle_rollback,
+}
+
+
+def register_node_handler(node_type: str, handler: Callable, *, phase: str = "main") -> None:
+    """Register a node-type handler without editing the executor (OCP).
+
+    phase="early" runs right after the intervention gate (planner/reflector
+    semantics — no capability/watchdog gates, no prompt assembly);
+    phase="main" runs after the pre-dispatch gates with a full NodeDispatch.
+    """
+    if phase == "early":
+        EARLY_NODE_HANDLERS[node_type] = handler
+    else:
+        NODE_HANDLER_REGISTRY[node_type] = handler
 
 
 if __name__ == "__main__":
