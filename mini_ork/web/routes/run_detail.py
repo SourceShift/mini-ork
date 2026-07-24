@@ -15,6 +15,7 @@ from .. import agents as agent_mod, artifacts, recipes, why
 from ..db import StateDB
 from ..deps import get_db, get_home
 from ..recipes import mini_ork_root
+from ..repositories import LearningRepository
 
 router = APIRouter(prefix="/api/v1/task-runs", tags=["run-detail"])
 
@@ -254,13 +255,8 @@ def get_learning(
       - injected: prior memory that context_assemble would make available
       - self_improve: explicit cross-iteration learning rows, when present
     """
-    tr = db.row(
-        """
-        SELECT id, task_class, recipe, status, trace_id, created_at, ended_at
-        FROM task_runs WHERE id = ?
-        """,
-        (task_run_id,),
-    )
+    repo = LearningRepository(db)
+    tr = repo.fetch_task_run(task_run_id)
     if not tr:
         raise HTTPException(status_code=404, detail="task_run not found")
 
@@ -269,117 +265,38 @@ def get_learning(
     recipe_name = tr.get("recipe")
     recipe_nodes = _recipe_node_names(recipe_name)
 
-    # All node traces belonging to THIS run — gradients cite per-node trace
-    # ids (tr-researcher-*, tr-rubric-*, ...) as evidence, not the run's
-    # canonical task_runs.trace_id (the classify trace). Matching only the
-    # canonical id undercounted produced gradients ~7x.
-    run_trace_ids: list[str] = []
-    if db.has_table("execution_traces"):
-        run_trace_ids = [
-            r["trace_id"]
-            for r in db.rows(
-                "SELECT trace_id FROM execution_traces WHERE run_id = ?",
-                (task_run_id,),
-            )
-        ]
+    run_trace_ids = repo.fetch_execution_traces(task_run_id)
     if trace_id and trace_id not in run_trace_ids:
         run_trace_ids.append(trace_id)
 
-    gradients_produced: list[dict[str, Any]] = []
-    if run_trace_ids and db.has_table("gradient_records"):
-        placeholders = ",".join("?" * len(run_trace_ids))
-        gradients_produced = db.rows(
-            f"""
-            SELECT gradient_id, target, signal, suggested_change,
-                   evidence, confidence, created_at
-            FROM gradient_records
-            WHERE evidence IN ({placeholders})
-            ORDER BY created_at DESC
-            LIMIT 25
-            """,
-            tuple(run_trace_ids),
-        )
-        _attach_gradient_attribution(db, gradients_produced, recipe_nodes)
+    gradients_produced = repo.fetch_gradient_records(run_trace_ids)
+    _attach_gradient_attribution(repo, gradients_produced, recipe_nodes)
 
     patterns_evidenced: list[dict[str, Any]] = []
-    if trace_id and db.has_table("pattern_records"):
-        candidates = db.rows(
-            """
-            SELECT pattern_id, description, evidence_trace_ids, frequency,
-                   first_seen, last_seen, output_type, promoted_to, status
-            FROM pattern_records
-            WHERE evidence_trace_ids LIKE ?
-            ORDER BY frequency DESC, last_seen DESC
-            LIMIT 50
-            """,
-            (f"%{trace_id}%",),
-        )
+    if trace_id:
+        candidates = repo.fetch_pattern_candidates(trace_id)
         patterns_evidenced = [
             {**row, "evidence_trace_ids": _parse_json_array(row.get("evidence_trace_ids"))}
             for row in candidates
             if trace_id in _parse_json_array(row.get("evidence_trace_ids"))
         ][:25]
-        _attach_pattern_attribution(db, patterns_evidenced, recipe_nodes)
+        _attach_pattern_attribution(repo, patterns_evidenced, recipe_nodes)
 
-    learning_records: list[dict[str, Any]] = []
-    if db.has_table("learning_record"):
-        learning_records = db.rows(
-            """
-            SELECT id, run_id, iter, rank, category, title,
-                   evidence_paths, arxiv_refs, patch_summary, outcome,
-                   severity, confidence, benchmark_delta, created_at, updated_at
-            FROM learning_record
-            WHERE run_id = ?
-            ORDER BY rank ASC, updated_at DESC
-            LIMIT 25
-            """,
-            (task_run_id,),
-        )
-        for row in learning_records:
-            row["evidence_paths"] = _parse_json_array(row.get("evidence_paths"))
-            row["arxiv_refs"] = _parse_json_array(row.get("arxiv_refs"))
-        _attach_learning_record_attribution(learning_records, recipe_nodes)
+    learning_records = repo.fetch_learning_records(task_run_id)
+    for row in learning_records:
+        row["evidence_paths"] = _parse_json_array(row.get("evidence_paths"))
+        row["arxiv_refs"] = _parse_json_array(row.get("arxiv_refs"))
+    _attach_learning_record_attribution(learning_records, recipe_nodes)
 
     prior_similar_runs: list[dict[str, Any]] = []
-    if task_class and db.has_table("execution_traces"):
-        # Exclude ALL of this run's own node traces — excluding only the
-        # canonical trace_id made the panel list the current run's own
-        # rubric/verify/researcher traces as "prior runs".
+    if task_class:
         exclude = run_trace_ids or [""]
-        placeholders = ",".join("?" * len(exclude))
-        prior_similar_runs = db.rows(
-            f"""
-            SELECT trace_id, task_class, status, cost_usd, duration_ms,
-                   reviewer_verdict, final_artifact_ref, created_at
-            FROM execution_traces
-            WHERE task_class = ?
-              AND trace_id NOT IN ({placeholders})
-              AND (run_id IS NULL OR run_id != ?)
-            ORDER BY created_at DESC
-            LIMIT 10
-            """,
-            (task_class, *exclude, task_run_id),
-        )
+        prior_similar_runs = repo.fetch_prior_similar_runs(task_class, exclude, task_run_id)
 
     known_failure_modes: list[dict[str, Any]] = []
-    if task_class and db.has_table("gradient_records"):
-        # Filter MUST mirror mini_ork.context_assembler.failure_modes_md.
-        # (task_class = ? OR target LIKE ?) — this panel claims to show what
-        # gets injected, so the queries have to agree. target-LIKE alone
-        # missed rows whose task_class matches but whose target doesn't
-        # embed the class name (e.g. target=workflow.node.verify).
-        known_failure_modes = db.rows(
-            """
-            SELECT gradient_id, target, signal, suggested_change,
-                   evidence, confidence, created_at
-            FROM gradient_records
-            WHERE (task_class = ? OR target LIKE ?) AND confidence >= 0.6
-            ORDER BY confidence DESC, created_at DESC
-            LIMIT 10
-            """,
-            (task_class, f"%{task_class}%"),
-        )
-        _attach_gradient_attribution(db, known_failure_modes, recipe_nodes)
+    if task_class:
+        known_failure_modes = repo.fetch_failure_mode_gradients(task_class)
+        _attach_gradient_attribution(repo, known_failure_modes, recipe_nodes)
 
     return {
         "task_run_id": task_run_id,
@@ -446,12 +363,12 @@ def _recipe_node_names(recipe_name: str | None) -> list[str]:
 
 
 def _attach_gradient_attribution(
-    db: StateDB,
+    repo: LearningRepository,
     rows: list[dict[str, Any]],
     recipe_nodes: list[str],
 ) -> None:
     trace_ids = [str(r.get("evidence")) for r in rows if r.get("evidence")]
-    traces = _trace_lookup(db, trace_ids)
+    traces = repo.fetch_trace_summaries(trace_ids)
     for row in rows:
         row["agent_attribution"] = _infer_agent_attribution(
             recipe_nodes,
@@ -466,14 +383,14 @@ def _attach_gradient_attribution(
 
 
 def _attach_pattern_attribution(
-    db: StateDB,
+    repo: LearningRepository,
     rows: list[dict[str, Any]],
     recipe_nodes: list[str],
 ) -> None:
     trace_ids: list[str] = []
     for row in rows:
         trace_ids.extend(str(t) for t in row.get("evidence_trace_ids") or [])
-    traces = _trace_lookup(db, trace_ids)
+    traces = repo.fetch_trace_summaries(trace_ids)
     for row in rows:
         attributions = [
             _infer_agent_attribution(
@@ -510,25 +427,6 @@ def _attach_learning_record_attribution(
                 " ".join(str(p) for p in row.get("evidence_paths") or []),
             ],
         )
-
-
-def _trace_lookup(db: StateDB, trace_ids: list[str]) -> dict[str, dict[str, Any]]:
-    if not trace_ids or not db.has_table("execution_traces"):
-        return {}
-    out: dict[str, dict[str, Any]] = {}
-    for trace_id in sorted(set(t for t in trace_ids if t)):
-        row = db.row(
-            """
-            SELECT trace_id, agent_version_id, final_artifact_ref,
-                   verifier_output, reviewer_verdict, task_class
-            FROM execution_traces
-            WHERE trace_id = ?
-            """,
-            (trace_id,),
-        )
-        if row:
-            out[trace_id] = row
-    return out
 
 
 def _infer_agent_attribution(

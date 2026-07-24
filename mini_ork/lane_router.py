@@ -52,15 +52,51 @@ import os
 import sqlite3
 from collections import defaultdict
 
+from mini_ork.learning.advantage_store import AdvantageStore, resolve_db_path
+
 
 def _db_path(db: str | None) -> str:
-    if db:
-        return db
-    env = os.environ.get("MINI_ORK_DB") or os.environ.get("MO_STORE_DB")
-    if env:
-        return env
-    home = os.environ.get("MINI_ORK_HOME", ".mini-ork")
-    return os.path.join(home, "state.db")
+    """Kept for the two helpers below that still open short-lived connections
+    (log_propensity / z_score_advantage); resolution logic lives in
+    mini_ork/learning/advantage_store.resolve_db_path."""
+    return resolve_db_path(db)
+
+
+# ── pure math (M9: SQL lives in AdvantageStore; these stay here, DB-free) ────
+
+
+def _recency_weight(age_days: float, halflife_days: float) -> float:
+    """Exponential recency decay: 0.5 ** (age / halflife)."""
+    return math.exp(-math.log(2) * age_days / halflife_days)
+
+
+def _shrink(advantage: float, n_in_group: int, shrink_k: int) -> float:
+    """n-aware shrinkage toward 0: adv * n/(n+K); K<=0 disables shrinkage."""
+    factor = n_in_group / (n_in_group + shrink_k) if shrink_k > 0 else 1.0
+    return advantage * factor
+
+
+def _ema_blend(prior, batch, alpha: float):
+    """EMA blend of a stored prior with the fresh batch value.
+
+    alpha >= 1 → batch wins; alpha <= 0 → prior wins; unparseable prior → batch.
+    """
+    if prior is None or alpha >= 1.0:
+        return batch
+    if alpha <= 0.0:
+        return prior
+    try:
+        p = float(prior)
+    except (TypeError, ValueError):
+        return batch
+    return alpha * batch + (1.0 - alpha) * p
+
+
+def _zscore(value: float, mean: float, var: float) -> float:
+    """z = (value - mean) / max(std, 1e-3)."""
+    std = math.sqrt(max(var, 0.0))
+    denom = std if std > 1e-3 else 1e-3
+    return (value - mean) / denom
 
 
 def recompute_advantages(since: int = 0, db: str | None = None) -> int:
@@ -81,90 +117,15 @@ def recompute_advantages(since: int = 0, db: str | None = None) -> int:
     SINGLE_SAMPLE = int(os.environ.get("MO_ROUTER_SINGLE_SAMPLE", "1"))
     BANDIT_ON = UCB_C > 0.0
 
-    con = sqlite3.connect(_db_path(db))
-    con.execute("PRAGMA busy_timeout=5000")
-    con.row_factory = sqlite3.Row
+    store = AdvantageStore(db).open()
 
-    cols = {row[1] for row in con.execute("PRAGMA table_info(execution_traces)").fetchall()}
-    code_region_expr = "code_region" if "code_region" in cols else "NULL AS code_region"
-    ts_expr = "created_at" if "created_at" in cols else "NULL AS created_at"
-    cost_expr = "cost_usd" if "cost_usd" in cols else "0.0 AS cost_usd"
+    prior_apm = store.fetch_prior_apm()
+    store.ensure_advantage_tables()
+    prior_domain = store.fetch_prior_domain()
+    prior_region = store.fetch_prior_region()
+    prior_baseline = store.fetch_prior_baseline()
 
-    prior_apm, prior_domain, prior_region, prior_baseline = {}, {}, {}, {}
-    try:
-        for row in con.execute(
-                "SELECT agent_version_id, task_class, relative_advantage "
-                "FROM agent_performance_memory").fetchall():
-            prior_apm[(row[0], row[1])] = row[2]
-    except Exception:
-        pass
-
-    con.execute("""CREATE TABLE IF NOT EXISTS lane_domain_advantage (
-          agent_version_id TEXT NOT NULL, task_class TEXT NOT NULL,
-          node_type TEXT NOT NULL DEFAULT '', objective_domain TEXT NOT NULL DEFAULT '',
-          relative_advantage REAL NOT NULL DEFAULT 0.0, runs_count INTEGER NOT NULL DEFAULT 0,
-          success_count INTEGER NOT NULL DEFAULT 0,
-          advantage_var REAL NOT NULL DEFAULT 0.0, advantage_std REAL NOT NULL DEFAULT 0.0,
-          z_score_advantage REAL NOT NULL DEFAULT 0.0,
-          last_updated TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-          PRIMARY KEY (agent_version_id, task_class, node_type, objective_domain))""")
-    try:
-        for row in con.execute(
-                "SELECT agent_version_id, task_class, node_type, objective_domain, "
-                "relative_advantage FROM lane_domain_advantage").fetchall():
-            prior_domain[(row[0], row[1], row[2], row[3])] = row[4]
-    except Exception:
-        pass
-
-    con.execute("""CREATE TABLE IF NOT EXISTS lane_region_advantage (
-          agent_version_id TEXT NOT NULL, task_class TEXT NOT NULL,
-          node_type TEXT NOT NULL DEFAULT '', objective_domain TEXT NOT NULL DEFAULT '',
-          code_region TEXT NOT NULL DEFAULT '', relative_advantage REAL NOT NULL DEFAULT 0.0,
-          runs_count INTEGER NOT NULL DEFAULT 0, success_count INTEGER NOT NULL DEFAULT 0,
-          advantage_var REAL NOT NULL DEFAULT 0.0, advantage_std REAL NOT NULL DEFAULT 0.0,
-          z_score_advantage REAL NOT NULL DEFAULT 0.0,
-          last_updated TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-          PRIMARY KEY (agent_version_id, task_class, node_type, objective_domain, code_region))""")
-    con.execute("""CREATE INDEX IF NOT EXISTS idx_lane_region_adv ON lane_region_advantage(
-          task_class, node_type, objective_domain, code_region, relative_advantage DESC)""")
-    try:
-        for row in con.execute(
-                "SELECT agent_version_id, task_class, node_type, objective_domain, "
-                "code_region, relative_advantage FROM lane_region_advantage").fetchall():
-            prior_region[(row[0], row[1], row[2], row[3], row[4])] = row[5]
-    except Exception:
-        pass
-
-    # Defensive CREATE so a recompute against a DB where migration 0049 has
-    # not yet applied still finds lane_slice_baseline (D2). The schema lives
-    # in db/migrations/0049_lane_advantage_variance.sql.
-    con.execute("""CREATE TABLE IF NOT EXISTS lane_slice_baseline (
-          objective_domain TEXT NOT NULL DEFAULT '',
-          task_class       TEXT NOT NULL,
-          node_type        TEXT NOT NULL DEFAULT '',
-          code_region      TEXT NOT NULL DEFAULT '',
-          slice_mean       REAL NOT NULL DEFAULT 0.0,
-          slice_var        REAL NOT NULL DEFAULT 0.0,
-          slice_std        REAL NOT NULL DEFAULT 0.0,
-          runs_count       INTEGER NOT NULL DEFAULT 0,
-          last_updated     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-          PRIMARY KEY (objective_domain, task_class, node_type, code_region))""")
-    try:
-        for row in con.execute(
-                "SELECT objective_domain, task_class, node_type, code_region, slice_mean, "
-                "slice_var, runs_count FROM lane_slice_baseline").fetchall():
-            prior_baseline[(row[0], row[1], row[2], row[3])] = (row[4], row[5], row[6])
-    except Exception:
-        pass
-
-    rows = con.execute(f"""
-        SELECT objective_domain, task_class, agent_version_id, verifier_output,
-               reward_g, {code_region_expr}, {ts_expr}, {cost_expr}
-          FROM execution_traces
-         WHERE created_at >= ? AND task_class IS NOT NULL AND task_class <> ''
-           AND agent_version_id IS NOT NULL AND agent_version_id <> ''
-           AND objective_domain IS NOT NULL AND objective_domain <> ''
-           AND reward_g IS NOT NULL""", (since_iso,)).fetchall()
+    rows = store.fetch_source_rows(since_iso)
 
     def _node_type(row):
         try:
@@ -196,7 +157,7 @@ def recompute_advantages(since: int = 0, db: str | None = None) -> int:
         ts = _parse_ts(r["created_at"]) if "created_at" in keys else None
         if HALFLIFE > 0 and ts is not None:
             age_days = max((_now_utc - ts).total_seconds() / 86400.0, 0.0)
-            w = math.exp(-math.log(2) * age_days / HALFLIFE)
+            w = _recency_weight(age_days, HALFLIFE)
         else:
             w = 1.0
         groups[(r["objective_domain"], r["task_class"], _node_type(r), code_region)].append(
@@ -262,8 +223,7 @@ def recompute_advantages(since: int = 0, db: str | None = None) -> int:
             lane_mean = b["ws"] / b["w"] if b["w"] > 0 else 0.0
             lane_adv = lane_mean - wmean + lane_bonus.get(lane, 0.0)
             n_in_group = b["n"]
-            shrink_factor = n_in_group / (n_in_group + SHRINK_K) if SHRINK_K > 0 else 1.0
-            shrunken = lane_adv * shrink_factor
+            shrunken = _shrink(lane_adv, n_in_group, SHRINK_K)
             # Per-lane weighted variance of scores within the slice's group
             # window. var = E[x^2] - E[x]^2 (population formula; n >= 2
             # here). NaN-safe — wss=0 or w=0 yields 0.
@@ -294,17 +254,9 @@ def recompute_advantages(since: int = 0, db: str | None = None) -> int:
                 rr["n_for_var"] += 1
 
     _penalty_by_key = defaultdict(float)
-    try:
-        has_defect = con.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' "
-            "AND name='defect_attributions' LIMIT 1").fetchone()
-    except Exception:
-        has_defect = None
-    if has_defect:
+    if store.has_defect_attributions():
         _now_utc = datetime.datetime.utcnow()
-        for pr in con.execute(
-                "SELECT lane, code_region, task_class, penalty, decay_halflife_days, ts "
-                "FROM defect_attributions WHERE penalty IS NOT NULL AND penalty <> 0").fetchall():
+        for pr in store.fetch_defect_penalties():
             try:
                 pen = float(pr["penalty"])
                 hlf = float(pr["decay_halflife_days"]) if pr["decay_halflife_days"] is not None else 30.0
@@ -326,15 +278,7 @@ def recompute_advantages(since: int = 0, db: str | None = None) -> int:
             _penalty_by_key[(pr["lane"], pr["code_region"], pr["task_class"])] += pen * (0.5 ** (age_days / hlf))
 
     def _ema(prior, batch):
-        if prior is None or DECAY_ALPHA >= 1.0:
-            return batch
-        if DECAY_ALPHA <= 0.0:
-            return prior
-        try:
-            p = float(prior)
-        except (TypeError, ValueError):
-            return batch
-        return DECAY_ALPHA * batch + (1.0 - DECAY_ALPHA) * p
+        return _ema_blend(prior, batch, DECAY_ALPHA)
 
     # D2 EMA-blend slice baselines BEFORE the per-lane upserts so the
     # z-score normaliser in BANDIT_ON mode sees the same prior the lane
@@ -353,17 +297,9 @@ def recompute_advantages(since: int = 0, db: str | None = None) -> int:
             new_mean = _ema(prior_t[0], batch_mean)
             new_var = _ema(prior_t[1], batch_var)
         new_std = math.sqrt(max(new_var, 0.0))
-        con.execute("""INSERT INTO lane_slice_baseline
-                (objective_domain, task_class, node_type, code_region,
-                 slice_mean, slice_var, slice_std, runs_count, last_updated)
-                VALUES (?,?,?,?,?,?,?,?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
-                ON CONFLICT(objective_domain, task_class, node_type, code_region)
-                DO UPDATE SET slice_mean=excluded.slice_mean,
-                slice_var=excluded.slice_var, slice_std=excluded.slice_std,
-                runs_count=excluded.runs_count, last_updated=excluded.last_updated""",
-                    (_od, _tc, _nt, _cr,
-                     round(new_mean, 6), round(new_var, 6), round(new_std, 6),
-                     stats["n"]))
+        store.upsert_slice_baseline(_od, _tc, _nt, _cr,
+                                    round(new_mean, 6), round(new_var, 6),
+                                    round(new_std, 6), stats["n"])
         # Cache locally for the z-score step below.
         stats["mean"], stats["var"] = new_mean, new_var
 
@@ -375,11 +311,7 @@ def recompute_advantages(since: int = 0, db: str | None = None) -> int:
         baseline = acc_baseline.get(key)
         if not baseline or baseline.get("n", 0) == 0:
             return lane_adv
-        m = baseline.get("mean", 0.0)
-        v = baseline.get("var", 0.0)
-        std = math.sqrt(max(v, 0.0))
-        denom = std if std > 1e-3 else 1e-3
-        return (lane_adv - m) / denom
+        return _zscore(lane_adv, baseline.get("mean", 0.0), baseline.get("var", 0.0))
 
     upserted = 0
     for (lane, tc), stats in acc.items():
@@ -388,16 +320,9 @@ def recompute_advantages(since: int = 0, db: str | None = None) -> int:
         new_rel_adv = _ema(prior_apm.get((lane, tc)), stats["shr_sum"] / stats["groups"])
         top_node = (max(stats["node_types"].items(), key=lambda kv: kv[1])[0]
                     if stats["node_types"] else None)
-        con.execute("""INSERT INTO agent_performance_memory
-                (agent_version_id, role, model, task_class, runs_count, success_count,
-                 relative_advantage, last_updated)
-                VALUES (?,?,?,?,?,?,?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
-                ON CONFLICT(agent_version_id, task_class) DO UPDATE SET
-                role=excluded.role, model=excluded.model, runs_count=excluded.runs_count,
-                success_count=excluded.success_count,
-                relative_advantage=excluded.relative_advantage, last_updated=excluded.last_updated""",
-                    (lane, top_node or lane, lane, tc, stats["groups"], stats["wins"],
-                     round(new_rel_adv, 4)))
+        store.upsert_agent_performance(lane, top_node or lane, lane, tc,
+                                       stats["groups"], stats["wins"],
+                                       round(new_rel_adv, 4))
         upserted += 1
 
     for (lane, tc, nt, od), stats in acc_domain.items():
@@ -411,21 +336,10 @@ def recompute_advantages(since: int = 0, db: str | None = None) -> int:
             new_z = _z_score(new_rel_adv, (od, tc, nt or "", ""))
         else:
             adv_var, adv_std, new_z = 0.0, 0.0, 0.0
-        con.execute("""INSERT INTO lane_domain_advantage
-                (agent_version_id, task_class, node_type, objective_domain,
-                 relative_advantage, runs_count, success_count,
-                 advantage_var, advantage_std, z_score_advantage, last_updated)
-                VALUES (?,?,?,?,?,?,?,?,?,?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
-                ON CONFLICT(agent_version_id, task_class, node_type, objective_domain)
-                DO UPDATE SET relative_advantage=excluded.relative_advantage,
-                runs_count=excluded.runs_count, success_count=excluded.success_count,
-                advantage_var=excluded.advantage_var,
-                advantage_std=excluded.advantage_std,
-                z_score_advantage=excluded.z_score_advantage,
-                last_updated=excluded.last_updated""",
-                    (lane, tc, nt or "", od or "", round(new_rel_adv, 4),
-                     stats["groups"], stats["wins"],
-                     round(adv_var, 6), round(adv_std, 6), round(new_z, 4)))
+        store.upsert_domain_advantage(lane, tc, nt or "", od or "",
+                                      round(new_rel_adv, 4), stats["groups"],
+                                      stats["wins"], round(adv_var, 6),
+                                      round(adv_std, 6), round(new_z, 4))
 
     for (lane, tc, nt, od, cr), stats in acc_region.items():
         if stats["groups"] <= 0:
@@ -444,24 +358,13 @@ def recompute_advantages(since: int = 0, db: str | None = None) -> int:
             new_z = _z_score(new_rel_adv, (od, tc, nt or "", cr or ""))
         else:
             adv_var, adv_std, new_z = 0.0, 0.0, 0.0
-        con.execute("""INSERT INTO lane_region_advantage
-                (agent_version_id, task_class, node_type, objective_domain, code_region,
-                 relative_advantage, runs_count, success_count,
-                 advantage_var, advantage_std, z_score_advantage, last_updated)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
-                ON CONFLICT(agent_version_id, task_class, node_type, objective_domain, code_region)
-                DO UPDATE SET relative_advantage=excluded.relative_advantage,
-                runs_count=excluded.runs_count, success_count=excluded.success_count,
-                advantage_var=excluded.advantage_var,
-                advantage_std=excluded.advantage_std,
-                z_score_advantage=excluded.z_score_advantage,
-                last_updated=excluded.last_updated""",
-                    (lane, tc, nt or "", od or "", cr or "", round(new_rel_adv, 4),
-                     stats["groups"], stats["wins"],
-                     round(adv_var, 6), round(adv_std, 6), round(new_z, 4)))
+        store.upsert_region_advantage(lane, tc, nt or "", od or "", cr or "",
+                                      round(new_rel_adv, 4), stats["groups"],
+                                      stats["wins"], round(adv_var, 6),
+                                      round(adv_std, 6), round(new_z, 4))
 
-    con.commit()
-    con.close()
+    store.commit()
+    store.close()
     return upserted
 
 
@@ -489,49 +392,31 @@ def preferred_lane(task_class: str, node_type: str = "", objective_domain: str =
     contextual = int(os.environ.get("MO_ROUTER_CONTEXTUAL", "0"))
     bandit_on = ucb_c > 0.0
 
-    con = sqlite3.connect(_db_path(db))
-    con.execute("PRAGMA busy_timeout=5000")
-    con.row_factory = sqlite3.Row  # _select_best_lane reads rows by column name
+    store = AdvantageStore(db).open()  # Row factory: _select_best_lane reads by column name
     try:
         if objective_domain and code_region:
-            where = ("task_class=? AND objective_domain=? AND code_region=? AND runs_count>=?")
-            params = [task_class, objective_domain, code_region, min_samples]
-            if node_type:
-                where += " AND node_type=?"
-                params.append(node_type)
-            row = _select_best_lane(con, "lane_region_advantage", where, params,
+            candidates = store.fetch_region_candidates(
+                task_class, objective_domain, code_region, node_type, min_samples)
+            row = _select_best_lane(candidates,
                                     bandit_on, ucb_c, contextual,
                                     task_class, node_type, objective_domain, code_region)
             if row:
                 return row
         if objective_domain:
-            where = "task_class=? AND objective_domain=? AND runs_count>=?"
-            params = [task_class, objective_domain, min_samples]
-            if node_type:
-                where += " AND node_type=?"
-                params.append(node_type)
-            row = _select_best_lane(con, "lane_domain_advantage", where, params,
+            candidates = store.fetch_domain_candidates(
+                task_class, objective_domain, node_type, min_samples)
+            row = _select_best_lane(candidates,
                                     bandit_on, ucb_c, contextual,
                                     task_class, node_type, objective_domain, code_region)
             if row:
                 return row
-        where = "task_class=? AND runs_count>=?"
-        params = [task_class, min_samples]
-        if node_type:
-            where += " AND (role=? OR model=?)"
-            params += [node_type, node_type]
-        # Global (agent_performance_memory) has no per-slice z-score — bandit
-        # ordering degrades to relative_advantage DESC on the global pool.
-        row = con.execute(
-            f"SELECT agent_version_id, printf('%.3f', relative_advantage), runs_count "
-            f"FROM agent_performance_memory WHERE {where} "
-            f"ORDER BY relative_advantage DESC, runs_count DESC LIMIT 1", params).fetchone()
+        row = store.fetch_global_best(task_class, node_type, min_samples)
         return f"{row[0]}|{row[1]}|{row[2]}" if row else ""
     finally:
-        con.close()
+        store.close()
 
 
-def _select_best_lane(con, table: str, where: str, params: list,
+def _select_best_lane(candidates: list,
                       bandit_on: bool, ucb_c: float, contextual: int,
                       task_class: str, node_type: str,
                       objective_domain: str, code_region: str) -> str:
@@ -549,14 +434,11 @@ def _select_best_lane(con, table: str, where: str, params: list,
          NeuralUCB (HashEmbedder featurize → per-lane ridge) on the tied
          candidates. The embedder import + call live strictly inside this
          branch.
+
+    ``candidates`` comes pre-fetched from AdvantageStore (ordered by raw
+    relative_advantage DESC, runs_count DESC so we don't lose the cost
+    tie-break signal); this function is ranking math only — no SQL.
     """
-    cur = con.execute(
-        f"SELECT agent_version_id, printf('%.3f', relative_advantage) AS adv_str, "
-        f"runs_count, z_score_advantage "
-        f"FROM {table} WHERE {where} "
-        f"ORDER BY relative_advantage DESC, runs_count DESC",
-        params)
-    candidates = cur.fetchall()
     if not candidates:
         return ""
     if not bandit_on:
