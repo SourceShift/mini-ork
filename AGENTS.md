@@ -56,3 +56,25 @@ mini-ork garden              # drift detection
 - Recipes: add a directory under `recipes/` with `task_class.yaml`, `workflow.yaml`, `artifact_contract.yaml`.
 - Providers: add entries to `config/providers.yaml` and env vars to `config/secrets.local.sh`.
 - Gates: add a script under `gates/` and register it in `lib/gate_registry.sh`.
+
+### Python runtime registries (SOLID refactor, 2026-07)
+
+The Python runtime exposes registration APIs so new behavior lands without
+editing executor core modules:
+
+- `mini_ork.context` — canonical `RunContext` env contract; mutate process env
+  only via `apply_env_overrides` / `scoped_environ`.
+- Node types: `mini_ork.cli.execute.register_node_handler(type, fn, phase=)`
+  (+ `register_implementer_submode` for fan-out dispatchers).
+- Routing policies: `mini_ork.dispatch.routing.register_policy(name, fn)`
+  (selected via `MO_ROUTING_POLICY`).
+- Gate types: `mini_ork.gates.gate_registry.register_gate_evaluator(type, fn)`.
+- Provider kinds / transports: `mini_ork.dispatch.providers.register_provider_kind`
+  / `register_dispatch_backend`.
+- Subcommands: `mini_ork.cli.main.register_subcommand(name, handler)`.
+- Embedders: `mini_ork.memory.semantic.register_embedder_provider(name, factory)`
+  (selected via `MO_EMBED_PROVIDER`).
+
+Executor concerns live in dedicated modules: lane routing in
+`mini_ork/dispatch/routing.py`, GRPO writeback in `mini_ork/learning/writeback.py`,
+publish gates + delivery in `mini_ork/cli/publisher.py`.
