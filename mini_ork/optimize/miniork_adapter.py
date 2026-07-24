@@ -10,6 +10,11 @@ The adapter is offline for known prompt hashes: ``evaluate()`` reads cached
 ``reward_value`` rows keyed by ``prompt_version_hash`` and never dispatches a
 model on that fast path. Mutated prompt text intentionally drops the hash and
 uses ``held_out_score`` on the same cached rows as held-out examples.
+
+SIBLING MODULE: ``mini_ork.gepa.miniork_adapter`` is the LIVE adapter
+(external gepa framework, real runs, real spend). Use this module
+(``mini_ork.optimize``) for offline/cached optimization; use ``mini_ork.gepa``
+for live evolution.
 """
 
 from __future__ import annotations
