@@ -37,6 +37,16 @@ import sys
 import time
 import uuid
 
+from mini_ork.context import (
+    ENV_DISPATCH_CHAIN,
+    ENV_RESUME_SESSION_ID,
+    ENV_RUN_DIR,
+    ENV_TARGET_CWD,
+    RunContext,
+    apply_env_overrides,
+    node_env_overrides,
+)
+
 _SEP = "\x1f"
 _NODE_TYPE_ORDER = ("planner", "researcher", "implementer", "reviewer", "verifier",
                     "reflector", "publisher", "rollback")
@@ -834,7 +844,7 @@ def _run_parallel_batch(
 def main(argv=None, *, root=None, dispatch_fn=None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     root = root or os.environ.get("MINI_ORK_ROOT") or os.getcwd()
-    os.environ["MINI_ORK_ROOT"] = root
+    RunContext(root=root).apply()
 
     dry_run = os.environ.get("MINI_ORK_DRY_RUN", "0") == "1"
     filter_node_type = ""
@@ -987,7 +997,7 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
             try:
                 v = float(repair_budget)
                 if v > 0:
-                    os.environ["MO_REPAIR_BUDGET_USD"] = f"{v:.2f}"
+                    apply_env_overrides({"MO_REPAIR_BUDGET_USD": f"{v:.2f}"})
             except ValueError:
                 sys.stderr.write(
                     f"execute: --repair-budget must be a positive number, got {repair_budget!r}\n"
@@ -1014,9 +1024,9 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
         ]
         # Mark the run as a recovery dispatch so downstream trace / cost
         # seams can stamp the metadata without re-deriving the closure.
-        os.environ["MINI_ORK_RECOVERY_ACTIVE"] = "1"
+        apply_env_overrides({"MINI_ORK_RECOVERY_ACTIVE": "1"})
         if effective_from:
-            os.environ["MINI_ORK_RECOVERY_FROM"] = effective_from
+            apply_env_overrides({"MINI_ORK_RECOVERY_FROM": effective_from})
         print(
             f"    recovery: from_node={effective_from or '<unset>'} "
             f"closure={len(node_ids)}/{before_count} nodes"
@@ -1054,12 +1064,12 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
                 task_class = str((json.load(handle) or {}).get("task_class") or "")
         except (OSError, ValueError, TypeError):
             task_class = ""
-    task_class = task_class or os.environ.get("MINI_ORK_TASK_CLASS") or "generic"
-    db = os.environ.get("MINI_ORK_DB") or os.path.join(
-        os.environ.get("MINI_ORK_HOME", ".mini-ork"), "state.db")
-    run_id = os.environ.get("MINI_ORK_RUN_ID", "")
-    recipe = os.environ.get("MINI_ORK_RECIPE", "")
-    live_run_dir = os.environ.get("MINI_ORK_RUN_DIR") or run_dir
+    ctx = RunContext.from_env()
+    task_class = task_class or ctx.task_class_or_default()
+    db = ctx.db_or_default()
+    run_id = ctx.run_id
+    recipe = ctx.recipe
+    live_run_dir = ctx.run_dir or run_dir
     llm = dispatch_fn or _default_llm_dispatch(root)
     # F3: without a trace_fn the live path writes zero execution_traces rows and the
     # GRPO/reflect learning loop is inert. Wire the real writer (reward-stamped rows).
@@ -1075,9 +1085,9 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
 
     def _dispatch_serial(field):
         # D1: bash keeps FAIL_COUNT as a shell var visible to _mo_policy_route_lane's
-        # trace_governed branch (:2014). Export it so the port's policy_route_lane sees
+        # trace_governed branch (:2014). Publish it so the port's policy_route_lane sees
         # the live prefix-failure count (else trace_governed never escalates).
-        os.environ["FAIL_COUNT"] = str(fail_count)
+        apply_env_overrides({"FAIL_COUNT": str(fail_count)})
         return dispatch_node(field, root=root, run_dir=live_run_dir, plan_path=plan_path,
                                 task_class=task_class, db=db, run_id=run_id,
                                 dispatch_fn=llm, recipe=recipe, workflow=workflow,
@@ -1094,7 +1104,7 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
                 if rc != 0 and not ignore_failures:
                     counted += 1
             return counted
-        os.environ["FAIL_COUNT"] = str(fail_count)
+        apply_env_overrides({"FAIL_COUNT": str(fail_count)})
         return _run_parallel_batch(
             batch,
             root=root,
@@ -1244,7 +1254,7 @@ def charge_node_cost(db, run_id, cost_file="", *, dry_run=False, root=None):
     try:
         from mini_ork.dispatch import cost_pause
         if cost_pause.check(run_id, float(cost)) != 0:
-            os.environ["MO_NODE_FINISH_REASON"] = "paused_for_approval"
+            apply_env_overrides({"MO_NODE_FINISH_REASON": "paused_for_approval"})
     except Exception:
         pass
 
@@ -2295,7 +2305,8 @@ def publisher_node(root, run_dir, db, run_id, recipe, task_class, review_file=""
         chosen = os.path.join(run_dir, "chosen", "recipe_name")
         if os.path.isfile(chosen):
             try:
-                os.environ["MINI_ORK_DERIVED_RECIPE_NAME"] = "".join(open(chosen).read().split())
+                apply_env_overrides({
+                    "MINI_ORK_DERIVED_RECIPE_NAME": "".join(open(chosen).read().split())})
             except OSError:
                 pass
     src = os.path.join(run_dir, _envsubst(src_name))
@@ -2426,7 +2437,10 @@ def dispatch_node(fields, *, root, run_dir, plan_path, task_class, db, run_id,
     # artifact namespace. ``mini-ork run`` can derive the directory from the
     # plan without exporting it, so publish the resolved value at the node
     # boundary before any provider or verifier subprocess is invoked.
-    os.environ["MINI_ORK_RUN_DIR"] = run_dir_eff
+    # Publish the resolved run directory at the node boundary before any
+    # provider or verifier subprocess is invoked (canonical contract:
+    # mini_ork.context).
+    apply_env_overrides({ENV_RUN_DIR: run_dir_eff})
     # Snapshot the tree BEFORE any implementer node edits it, so the reviewer
     # diff captures only the implementer's delta (not pre-existing dirt from a
     # concurrent session sharing this in-place working tree). Non-destructive.
@@ -2438,7 +2452,7 @@ def dispatch_node(fields, *, root, run_dir, plan_path, task_class, db, run_id,
 
     # Export the role-aware fallback chain (lead = resolved lane) so a python
     # dispatch backend routes around a hung/flaky lead lane (bash:2224-2225, NEW-5).
-    os.environ["MO_DISPATCH_CHAIN"] = dispatch_chain(node_type, lane)
+    apply_env_overrides({ENV_DISPATCH_CHAIN: dispatch_chain(node_type, lane)})
 
     # ── Pre-dispatch gates, in bash _dispatch_node order (:2231-2318). These run
     # for every real dispatch; the dry-run preview path is _dry_dispatch_node. ──
@@ -2515,7 +2529,10 @@ def dispatch_node(fields, *, root, run_dir, plan_path, task_class, db, run_id,
     # F5-B: reflect-learned failure modes + operator steering, injected after node_desc
     # in the LLM prompts (the read side of the learning loop). Empty for non-LLM nodes.
     learned = _learned_block(root, task_class, node_type)
-    os.environ["MO_NODE_ID"] = node_id
+    # Publish the per-node identity + clear any stale resume session in one
+    # canonical step (None removes the variable).
+    apply_env_overrides(node_env_overrides(
+        node_id=node_id, run_dir=run_dir_eff, resume_session_id=None))
 
     # (E4 turn-resume) During an active recovery, restore this node's persisted
     # transcript and export MO_RESUME_SESSION_ID so a claude lane continues the
@@ -2523,7 +2540,6 @@ def dispatch_node(fields, *, root, run_dir, plan_path, task_class, db, run_id,
     # instead of starting the node over. Strictly recovery-scoped and fail-soft:
     # off recovery, for codex/gemini, or with no session it is a no-op and the
     # node runs normally.
-    os.environ.pop("MO_RESUME_SESSION_ID", None)
     if (os.environ.get("MINI_ORK_RECOVERY_CLOSURE", "").strip()
             or os.environ.get("MINI_ORK_RECOVERY_FROM", "").strip()):
         try:
@@ -2533,7 +2549,7 @@ def dispatch_node(fields, *, root, run_dir, plan_path, task_class, db, run_id,
                 cwd=os.environ.get("MO_TARGET_CWD") or None,
             )
             if _resume_sid:
-                os.environ["MO_RESUME_SESSION_ID"] = _resume_sid
+                apply_env_overrides({ENV_RESUME_SESSION_ID: _resume_sid})
                 print(f"  [resume] node_id={node_id} continuing session "
                       f"{_resume_sid[:12]}… via --resume", file=sys.stderr)
         except Exception as e:  # noqa: BLE001 — resume is best-effort
@@ -2593,7 +2609,7 @@ def dispatch_node(fields, *, root, run_dir, plan_path, task_class, db, run_id,
         # in mini-ork's own tree when cwd != target — the CWT-A corruption hazard
         # (bash _dispatch_node:2626-2642). Export so cl_codex.sh reads it.
         target = _resolve_target_cwd(run_dir_eff)
-        os.environ["MO_TARGET_CWD"] = target
+        apply_env_overrides({ENV_TARGET_CWD: target})
         print(f"  [cwd] codex target: {target}", file=sys.stderr)
 
         # R5b: the opt-in minimal scaffold is a real executor behavior, not
