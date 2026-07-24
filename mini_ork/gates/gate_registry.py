@@ -47,7 +47,7 @@ import sqlite3
 import subprocess
 import time
 import uuid
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 __all__ = [
     "ensure_table",
@@ -125,7 +125,11 @@ def gate_register(
     uuid collision path via ``ON CONFLICT(gate_id) DO NOTHING`` —
     bash prints nothing on collision so the port matches.
     """
-    if gate_type not in _VALID_GATE_TYPES:
+    # A type is valid when it is one of the historical built-ins OR has a
+    # registered evaluator (the OCP extension path: register_gate_evaluator
+    # makes a brand-new type registrable + evaluatable without editing this
+    # module). GATE_EVALUATORS is defined below; resolved at call time.
+    if gate_type not in _VALID_GATE_TYPES and gate_type not in GATE_EVALUATORS:
         raise ValueError(
             f"gate_register: unknown gate_type '{gate_type}'. "
             f"Valid: {' '.join(_VALID_GATE_TYPES)}"
@@ -252,6 +256,63 @@ def _evaluate_external(
     return "fail"
 
 
+# ── Gate-type evaluator registry (OCP) ──────────────────────────────────────
+# Evaluator signature: (condition, context_json, db_path, mini_ork_root)
+#   -> 'pass' | 'fail' | 'defer'.
+# Registering a gate of a NEW type in the DB now works: pair the gate_register
+# call with register_gate_evaluator() instead of editing gate_evaluate.
+
+GateEvaluator = Callable[[str, str, str, Optional[str]], str]
+
+
+def _eval_budget(condition: str, context_json: str, db_path: str,
+                 mini_ork_root: Optional[str]) -> str:
+    del db_path, mini_ork_root
+    return _evaluate_budget(context_json, condition)
+
+
+def _eval_human(condition: str, context_json: str, db_path: str,
+                mini_ork_root: Optional[str]) -> str:
+    del condition, context_json, db_path, mini_ork_root
+    return "defer"
+
+
+def _eval_scope(condition: str, context_json: str, db_path: str,
+                mini_ork_root: Optional[str]) -> str:
+    del db_path, mini_ork_root
+    return _evaluate_scope(context_json, condition)
+
+
+def _eval_liveness(condition: str, context_json: str, db_path: str,
+                   mini_ork_root: Optional[str]) -> str:
+    del condition
+    return _evaluate_liveness(context_json, db_path, mini_ork_root)
+
+
+def _eval_external(condition: str, context_json: str, db_path: str,
+                   mini_ork_root: Optional[str]) -> str:
+    del mini_ork_root
+    return _evaluate_external(condition, context_json, db_path)
+
+
+GATE_EVALUATORS: dict[str, GateEvaluator] = {
+    "budget_gate": _eval_budget,
+    "human_gate": _eval_human,
+    "scope_gate": _eval_scope,
+    "liveness_gate": _eval_liveness,
+    "deployment_gate": _eval_external,
+    "reviewer_gate": _eval_external,
+    "deterministic_verifier": _eval_external,
+    "custom": _eval_external,
+}
+
+
+def register_gate_evaluator(gate_type: str, evaluator: GateEvaluator) -> None:
+    """Register (or replace) the evaluator for a gate type. Unregistered types
+    keep the historical fail-safe: ``defer``."""
+    GATE_EVALUATORS[gate_type] = evaluator
+
+
 def gate_evaluate(
     db_path: str,
     gate_id: str,
@@ -264,20 +325,10 @@ def gate_evaluate(
     if row is None:
         return "fail"
 
-    gtype = row["gate_type"]
-    condition = row["condition"]
-
-    if gtype == "budget_gate":
-        return _evaluate_budget(context_json, condition)
-    if gtype == "human_gate":
+    evaluator = GATE_EVALUATORS.get(row["gate_type"])
+    if evaluator is None:
         return "defer"
-    if gtype == "scope_gate":
-        return _evaluate_scope(context_json, condition)
-    if gtype == "liveness_gate":
-        return _evaluate_liveness(context_json, db_path, mini_ork_root)
-    if gtype in ("deployment_gate", "reviewer_gate", "deterministic_verifier", "custom"):
-        return _evaluate_external(condition, context_json, db_path)
-    return "defer"
+    return evaluator(row["condition"], context_json, db_path, mini_ork_root)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
