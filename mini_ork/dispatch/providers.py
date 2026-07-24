@@ -16,7 +16,7 @@ import re
 import shlex
 import subprocess
 import sys
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -256,13 +256,10 @@ def _resolve_from_registry(
         raise ValueError(f"unknown lane: {name!r}")
 
     kind = entry.get("kind")
-    supported = {
-        "anthropic-native",
-        "anthropic-compat",
-        "openai-compat",
-        "executable",
-    }
-    if kind not in supported:
+    # Kind → ProviderSpec builder registry (OCP): a new provider kind is
+    # register_provider_kind(kind, builder) instead of an edit to this chain.
+    builder = PROVIDER_KIND_BUILDERS.get(kind)
+    if builder is None:
         raise ValueError(f"provider {name!r} has unsupported kind: {kind!r}")
 
     raw_extra_env = entry.get("extra_env") or {}
@@ -270,80 +267,97 @@ def _resolve_from_registry(
         raise ValueError(f"provider {name!r} field 'extra_env' must be a mapping")
     extra_env = {str(key): str(value) for key, value in raw_extra_env.items()}
     model_id = str(entry.get("model") or "")
+    return builder(name, entry, root, extra_env, model_id)
 
-    if kind in {"anthropic-native", "anthropic-compat"}:
-        env: dict[str, str] = {}
-        if kind == "anthropic-native":
-            if api_key := os.environ.get("ANTHROPIC_API_KEY"):
-                env["ANTHROPIC_API_KEY"] = api_key
-                if model_id:
-                    env["ANTHROPIC_MODEL"] = model_id
-        else:
-            base_url = entry.get("base_url")
-            if not isinstance(base_url, str) or not base_url:
-                raise ValueError(f"provider {name!r} missing required field 'base_url'")
-            api_key_env = entry.get("api_key_env")
-            if not isinstance(api_key_env, str) or not api_key_env:
-                raise ValueError(f"provider {name!r} missing required field 'api_key_env'")
-            env.update(
-                {
-                    "ANTHROPIC_AUTH_TOKEN": os.environ.get(api_key_env, ""),
-                    "ANTHROPIC_BASE_URL": base_url,
-                    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
-                }
-            )
-            if model_id:
-                env.update(
-                    {
-                        "ANTHROPIC_MODEL": model_id,
-                        "ANTHROPIC_SMALL_FAST_MODEL": model_id,
-                        "ANTHROPIC_DEFAULT_OPUS_MODEL": model_id,
-                        "ANTHROPIC_DEFAULT_SONNET_MODEL": model_id,
-                        "ANTHROPIC_DEFAULT_HAIKU_MODEL": model_id,
-                        "CLAUDE_CODE_SUBAGENT_MODEL": model_id,
-                    }
-                )
-        env.update(extra_env)
-        return ProviderSpec(
-            model=name,
-            command=(
-                "claude",
-                "--print",
-                "--permission-mode",
-                "bypassPermissions",
-                "--output-format",
-                "json",
-            ),
-            parse_usage=parse_claude_usage,
-            parse_cost=claude_cost,
-            parse_text=claude_result_text,
-            parse_session=claude_session_id,
-            env=env,
-        )
 
-    if kind == "openai-compat":
-        base_url = entry.get("base_url")
-        if not isinstance(base_url, str) or not base_url:
-            raise ValueError(f"provider {name!r} missing required field 'base_url'")
-        api_key_env = entry.get("api_key_env")
-        if not isinstance(api_key_env, str) or not api_key_env:
-            raise ValueError(f"provider {name!r} missing required field 'api_key_env'")
-        wrapper = mini_ork_root(root) / "lib" / "providers" / "cl_codex.sh"
-        if not wrapper.is_file():
-            raise FileNotFoundError(f"provider wrapper not found: {wrapper}")
-        env = {
-            "MO_OAI_BASE_URL": base_url,
-            "MO_OAI_ENV_KEY": api_key_env,
-        }
+# ── Provider-kind spec builders (SOLID M6, OCP) ─────────────────────────────
+# Builder signature: (name, entry, root, extra_env, model_id) -> ProviderSpec.
+
+
+def _claude_spec(name: str, env: Mapping[str, str]) -> ProviderSpec:
+    return ProviderSpec(
+        model=name,
+        command=(
+            "claude",
+            "--print",
+            "--permission-mode",
+            "bypassPermissions",
+            "--output-format",
+            "json",
+        ),
+        parse_usage=parse_claude_usage,
+        parse_cost=claude_cost,
+        parse_text=claude_result_text,
+        parse_session=claude_session_id,
+        env=env,
+    )
+
+
+def _build_anthropic_native(name, entry, root, extra_env, model_id) -> ProviderSpec:
+    del entry, root
+    env: dict[str, str] = {}
+    if api_key := os.environ.get("ANTHROPIC_API_KEY"):
+        env["ANTHROPIC_API_KEY"] = api_key
         if model_id:
-            env["MO_OAI_MODEL"] = model_id
-        env.update(extra_env)
-        return ProviderSpec(
-            model=name,
-            command=(str(wrapper), "--print", "--output-format", "text"),
-            env=env,
-        )
+            env["ANTHROPIC_MODEL"] = model_id
+    env.update(extra_env)
+    return _claude_spec(name, env)
 
+
+def _build_anthropic_compat(name, entry, root, extra_env, model_id) -> ProviderSpec:
+    del root
+    base_url = entry.get("base_url")
+    if not isinstance(base_url, str) or not base_url:
+        raise ValueError(f"provider {name!r} missing required field 'base_url'")
+    api_key_env = entry.get("api_key_env")
+    if not isinstance(api_key_env, str) or not api_key_env:
+        raise ValueError(f"provider {name!r} missing required field 'api_key_env'")
+    env = {
+        "ANTHROPIC_AUTH_TOKEN": os.environ.get(api_key_env, ""),
+        "ANTHROPIC_BASE_URL": base_url,
+        "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+    }
+    if model_id:
+        env.update(
+            {
+                "ANTHROPIC_MODEL": model_id,
+                "ANTHROPIC_SMALL_FAST_MODEL": model_id,
+                "ANTHROPIC_DEFAULT_OPUS_MODEL": model_id,
+                "ANTHROPIC_DEFAULT_SONNET_MODEL": model_id,
+                "ANTHROPIC_DEFAULT_HAIKU_MODEL": model_id,
+                "CLAUDE_CODE_SUBAGENT_MODEL": model_id,
+            }
+        )
+    env.update(extra_env)
+    return _claude_spec(name, env)
+
+
+def _build_openai_compat(name, entry, root, extra_env, model_id) -> ProviderSpec:
+    base_url = entry.get("base_url")
+    if not isinstance(base_url, str) or not base_url:
+        raise ValueError(f"provider {name!r} missing required field 'base_url'")
+    api_key_env = entry.get("api_key_env")
+    if not isinstance(api_key_env, str) or not api_key_env:
+        raise ValueError(f"provider {name!r} missing required field 'api_key_env'")
+    wrapper = mini_ork_root(root) / "lib" / "providers" / "cl_codex.sh"
+    if not wrapper.is_file():
+        raise FileNotFoundError(f"provider wrapper not found: {wrapper}")
+    env = {
+        "MO_OAI_BASE_URL": base_url,
+        "MO_OAI_ENV_KEY": api_key_env,
+    }
+    if model_id:
+        env["MO_OAI_MODEL"] = model_id
+    env.update(extra_env)
+    return ProviderSpec(
+        model=name,
+        command=(str(wrapper), "--print", "--output-format", "text"),
+        env=env,
+    )
+
+
+def _build_executable_script(name, entry, root, extra_env, model_id) -> ProviderSpec:
+    del model_id
     script_value = entry.get("script")
     if not isinstance(script_value, str) or not script_value:
         raise ValueError(f"provider {name!r} missing required field 'script'")
@@ -359,6 +373,19 @@ def _resolve_from_registry(
         command=(str(script), "--print", "--output-format", "text"),
         env=extra_env,
     )
+
+
+PROVIDER_KIND_BUILDERS: dict[str, Callable[..., ProviderSpec]] = {
+    "anthropic-native": _build_anthropic_native,
+    "anthropic-compat": _build_anthropic_compat,
+    "openai-compat": _build_openai_compat,
+    "executable": _build_executable_script,
+}
+
+
+def register_provider_kind(kind: str, builder: Callable[..., ProviderSpec]) -> None:
+    """Register (or replace) the ProviderSpec builder for a providers.yaml kind."""
+    PROVIDER_KIND_BUILDERS[kind] = builder
 
 
 def resolve_provider(
@@ -569,16 +596,11 @@ def dispatch_model(
         env=merged_env,
         cwd=target_cwd,
     )
-    if request.model == "codex":
-        return _dispatch_codex_via_wrapper(effective, spec)
-    result = dispatch(
-        effective,
-        spec.command,
-        parse_usage=spec.parse_usage,  # type: ignore[arg-type]
-        parse_cost=spec.parse_cost,  # type: ignore[arg-type]
-        parse_text=spec.parse_text,  # type: ignore[arg-type]
-        parse_session=spec.parse_session,  # type: ignore[arg-type]
-    )
+    # Per-model dispatch backend registry (OCP): a model with a bespoke
+    # transport (e.g. codex's wrapper+sidecar protocol) registers a backend
+    # instead of special-casing dispatch_model.
+    backend = MODEL_DISPATCH_BACKENDS.get(request.model, _dispatch_standard)
+    result = backend(effective, spec)
     _stash_session_id(result.session_id, merged_env)
     return result
 
@@ -907,6 +929,36 @@ def _dispatch_codex_via_wrapper(
                 os.unlink(path)
             except OSError:
                 pass
+
+
+# ── Per-model dispatch backends (SOLID M6, OCP) ─────────────────────────────
+# Backend signature: (effective: DispatchRequest, spec: ProviderSpec)
+#   -> DispatchResult. Default: the standard core.dispatch transport.
+
+
+def _dispatch_standard(request: DispatchRequest, spec: ProviderSpec) -> DispatchResult:
+    return dispatch(
+        request,
+        spec.command,
+        parse_usage=spec.parse_usage,  # type: ignore[arg-type]
+        parse_cost=spec.parse_cost,  # type: ignore[arg-type]
+        parse_text=spec.parse_text,  # type: ignore[arg-type]
+        parse_session=spec.parse_session,  # type: ignore[arg-type]
+    )
+
+
+MODEL_DISPATCH_BACKENDS: dict[
+    str, Callable[[DispatchRequest, ProviderSpec], DispatchResult]
+] = {
+    "codex": _dispatch_codex_via_wrapper,
+}
+
+
+def register_dispatch_backend(
+    model: str, backend: Callable[[DispatchRequest, ProviderSpec], DispatchResult]
+) -> None:
+    """Register (or replace) the transport backend for a model lane."""
+    MODEL_DISPATCH_BACKENDS[model] = backend
 
 
 def dispatch_with_fallback(
