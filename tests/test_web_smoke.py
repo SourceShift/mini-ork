@@ -1124,7 +1124,8 @@ def test_profile_answerer_has_one_native_owner() -> None:
 
 
 def test_python_plan_references_native_auto_answer() -> None:
-    plan = (ROOT / "mini_ork" / "ported" / "mini_ork_plan.py").read_text()
+    # Canonical plan runtime (mini_ork/ported/ was retired by the OSS-scrub).
+    plan = (ROOT / "mini_ork" / "cli" / "plan.py").read_text()
 
     assert "MO_AUTO_ANSWER_PROFILE" in plan
     assert "mini_ork.steering.profile_answerer" in plan
