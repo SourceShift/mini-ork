@@ -972,6 +972,7 @@ def _run_verifier_ref(script, evidence_path, *, plan_path="", artifact_path="", 
     verifier_env = {**os.environ,
                     "MINI_ORK_PLAN_PATH": plan_path,
                     "ARTIFACT_PATH": artifact_path}
+    verifier_env = {str(k): str(v) for k, v in verifier_env.items()}
     # A direct ``mini-ork execute`` invocation may know the run directory only
     # through ``evidence_path``/``run_dir`` and not export MINI_ORK_RUN_DIR.
     # Recipe verifiers use that variable as their artifact namespace, so make
