@@ -180,14 +180,13 @@ def main(argv: list[str] | None = None, *, db: str | None = None, root: str | No
     db = db or os.environ.get("MINI_ORK_DB") or os.path.join(home, "state.db")
     cap = float(os.environ.get("MO_DAILY_BUDGET_USD", "50.0"))
     plast = int(os.environ.get("MO_PLASTICITY_BUDGET", "5"))
-    once = max_iters = idle = dry_run = explain = 0
-    idle = 60
+    once = max_iters = dry_run = explain = 0
     i = 0
     while i < len(argv):
         a = argv[i]
         if a == "--once": once = 1; i += 1
         elif a == "--max-iters": max_iters = int(argv[i + 1]); i += 2
-        elif a == "--idle-secs": idle = int(argv[i + 1]); i += 2
+        elif a == "--idle-secs": _idle = int(argv[i + 1]); i += 2  # accepted; unused
         elif a == "--dry-run": dry_run = 1; i += 1
         elif a == "--explain": explain = 1; i += 1
         elif a in ("--help", "-h"):

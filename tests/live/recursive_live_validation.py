@@ -9,7 +9,6 @@ root run -> child spawn -> grandchild spawn -> lineage/event queries.
 from __future__ import annotations
 
 import json
-import os
 import sqlite3
 import subprocess
 import tempfile

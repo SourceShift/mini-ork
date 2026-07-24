@@ -146,7 +146,7 @@ def main(argv: list[str] | None = None, *, db: str | None = None, root: str | No
 
     max_bytes = int(os.environ.get("MO_MAX_KICKOFF_BYTES", "1048576"))
     if os.path.getsize(kickoff) > max_bytes:
-        sys.stderr.write(f"classify: kickoff exceeds MO_MAX_KICKOFF_BYTES\n"); return 2
+        sys.stderr.write("classify: kickoff exceeds MO_MAX_KICKOFF_BYTES\n"); return 2
 
     home = os.environ.get("MINI_ORK_HOME") or os.path.join(os.getcwd(), ".mini-ork")
     db = db or os.environ.get("MINI_ORK_DB") or os.path.join(home, "state.db")

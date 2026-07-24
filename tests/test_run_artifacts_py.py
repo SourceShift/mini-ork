@@ -9,7 +9,6 @@ from __future__ import annotations
 import sqlite3
 import time
 
-import pytest
 
 from mini_ork.dispatch.retention import (
     DEFAULT_TTL_DAYS,

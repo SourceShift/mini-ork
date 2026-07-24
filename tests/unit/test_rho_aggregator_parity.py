@@ -43,7 +43,6 @@ import re
 import subprocess
 from pathlib import Path
 
-import pytest
 import sqlite3
 
 from mini_ork.learning.rho_aggregator import aggregate_win_rates, top_prompts
