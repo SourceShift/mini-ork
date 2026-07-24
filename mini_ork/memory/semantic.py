@@ -22,6 +22,7 @@ import os
 import re
 import sqlite3
 import struct
+from collections.abc import Callable
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -115,27 +116,39 @@ class HashEmbedder:
         return out
 
 
-def _provider_embedder() -> Embedder:
-    """Thin provider-pluggable embedder stub. Real impls (sentence-transformers,
-    OpenAI, Cohere, etc.) would live behind a module-import branch gated on
-    ``MO_EMBED_PROVIDER``. We refuse to import third-party packages on the
-    default path (no new pip dep), so the stub raises unless a downstream
-    user supplies their own Embedder to ``add(..., embedder=...)`` or to
-    ``get_embedder()`` after a future module import."""
-    raise NotImplementedError(
-        "MO_EMBED_PROVIDER is set but no real provider is wired in this build. "
-        "Pass an Embedder to add(..., embedder=...) or unset MO_EMBED_PROVIDER "
-        "to use the default HashEmbedder."
-    )
+# ── Embedder provider registry (OCP/LSP) ────────────────────────────────────
+# A provider is a zero-arg factory returning a REAL Embedder — registered
+# implementations must satisfy the Embedder protocol (no NotImplementedError
+# stubs; an unregistered provider fails fast at the factory, before any
+# contract-breaking object can exist).
+
+EMBEDDER_PROVIDERS: dict[str, Callable[[], "Embedder"]] = {}
+
+
+def register_embedder_provider(name: str, factory: Callable[[], "Embedder"]) -> None:
+    """Register an Embedder factory selectable via MO_EMBED_PROVIDER=<name>.
+
+    Real impls (sentence-transformers, OpenAI, Cohere, …) plug in here from
+    downstream code, keeping third-party imports off the default path."""
+    EMBEDDER_PROVIDERS[name] = factory
 
 
 def get_embedder() -> Embedder:
-    """Factory: returns HashEmbedder unless ``MO_EMBED_PROVIDER`` is set, in
-    which case it returns the provider-pluggable stub (raises on embed until
-    a real provider ships)."""
-    if os.environ.get("MO_EMBED_PROVIDER"):
-        return _provider_embedder()
-    return HashEmbedder()
+    """Factory: returns HashEmbedder unless ``MO_EMBED_PROVIDER`` names a
+    registered provider. An unregistered provider raises immediately (fail
+    fast at configuration time — never return an Embedder that cannot embed)."""
+    provider = os.environ.get("MO_EMBED_PROVIDER", "").strip()
+    if not provider:
+        return HashEmbedder()
+    factory = EMBEDDER_PROVIDERS.get(provider)
+    if factory is None:
+        raise ValueError(
+            f"MO_EMBED_PROVIDER={provider!r} has no registered embedder. "
+            "Register one via register_embedder_provider(), pass an Embedder "
+            "to add(..., embedder=...), or unset MO_EMBED_PROVIDER to use the "
+            "default HashEmbedder."
+        )
+    return factory()
 
 
 # ── Storage ────────────────────────────────────────────────────────────────
