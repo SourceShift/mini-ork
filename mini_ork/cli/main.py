@@ -497,6 +497,16 @@ def _run_lifecycle(argv, root) -> int:
                 "MO_REFLECTION_BATCH": os.environ.get("MO_REFLECTION_BATCH", "25"),
             },
         )
+
+    # ── trajectory retention (roadmap Step 2 / A2): best-effort TTL prune of
+    # turn_jsonl artifacts. MO_TRAJECTORY_TTL_DAYS=0 disables; never gates.
+    try:
+        from mini_ork.dispatch import retention as _retention  # noqa: PLC0415
+        _pruned = _retention.prune_from_env()
+        if _pruned:
+            print(f"  [retention] pruned {_pruned} turn_jsonl artifact(s) past TTL")
+    except Exception:
+        pass
     return run_rc
 
 
