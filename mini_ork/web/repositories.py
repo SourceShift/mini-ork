@@ -196,6 +196,188 @@ class LearningRepository:
         )
 
 
+class RunDetailRepository:
+    """Read queries for the run-detail route handlers (M9 follow-up, SRP/DIP).
+
+    Covers the four concerns that remained inline in routes/run_detail.py:
+    the task_run row fetches, run events (run_events + mo_events bridges),
+    llm_calls correlation, and the DAG node-lifecycle events. SQL is moved
+    VERBATIM; has_table guards are preserved inside each fetch so a fresh
+    state.db yields ``[]`` / ``None``, never a 500 — exactly as the inline
+    probes did. Handlers keep param validation, bridge classification, and
+    response shaping.
+    """
+
+    def __init__(self, db: StateDB):
+        self._db = db
+
+    def has_table(self, name: str) -> bool:
+        return self._db.has_table(name)
+
+    # ── task_runs ────────────────────────────────────────────────────────────
+
+    def fetch_task_run_row(self, task_run_id: str) -> dict[str, Any] | None:
+        """The full task_runs row (the detail endpoint returns it wholesale)."""
+        return self._db.row("SELECT * FROM task_runs WHERE id = ?", (task_run_id,))
+
+    def fetch_input_paths(self, task_run_id: str) -> dict[str, Any] | None:
+        """kickoff/plan/recipe columns the inputs endpoint resolves to files."""
+        return self._db.row(
+            "SELECT kickoff_path, plan_path, recipe FROM task_runs WHERE id = ?",
+            (task_run_id,),
+        )
+
+    def fetch_correlation_row(self, task_run_id: str) -> dict[str, Any] | None:
+        """Columns the correlation diagnostic reports on."""
+        return self._db.row(
+            "SELECT id, trace_id, created_at, ended_at, kickoff_path FROM task_runs WHERE id = ?",
+            (task_run_id,),
+        )
+
+    def fetch_trace_window(self, task_run_id: str) -> dict[str, Any] | None:
+        """trace_id + [created_at, ended_at] — the events/llm-calls bridge input."""
+        return self._db.row(
+            "SELECT trace_id, created_at, ended_at FROM task_runs WHERE id = ?",
+            (task_run_id,),
+        )
+
+    def fetch_run_recipe(self, task_run_id: str) -> dict[str, Any] | None:
+        """Just the recipe name, for the DAG endpoint's fingerprint lookup."""
+        return self._db.row(
+            "SELECT recipe FROM task_runs WHERE id = ?", (task_run_id,)
+        )
+
+    # ── run_events ───────────────────────────────────────────────────────────
+
+    def fetch_last_run_event_ts(self, task_run_id: str) -> Any:
+        """Most recent run_events.created_at for staleness detection (None if
+        the table is absent or the run has no events)."""
+        if not self._db.has_table("run_events"):
+            return None
+        ev = self._db.row(
+            "SELECT MAX(created_at) AS ts FROM run_events WHERE run_id = ?",
+            (task_run_id,),
+        )
+        return ev.get("ts") if ev else None
+
+    def fetch_run_events(self, task_run_id: str, limit: int) -> list[dict[str, Any]]:
+        """run_events rows reshaped to the mo_events column layout, oldest first."""
+        if not self._db.has_table("run_events"):
+            return []
+        return self._db.rows(
+            """
+            SELECT event_id AS id, created_at AS ts, event_type,
+                   NULL AS actor, NULL AS status, NULL AS duration_ms,
+                   NULL AS cost_usd, NULL AS artifact_path, payload_json
+            FROM run_events WHERE run_id = ?
+            ORDER BY created_at ASC LIMIT ?
+            """,
+            (task_run_id, limit),
+        )
+
+    def fetch_node_lifecycle_events(self, task_run_id: str) -> list[dict[str, Any]]:
+        """node_start / node_end events the DAG status derivation consumes."""
+        if not self._db.has_table("run_events"):
+            return []
+        return self._db.rows(
+            """
+            SELECT event_type, created_at, payload_json
+            FROM run_events
+            WHERE run_id = ? AND event_type IN ('node_start', 'node_end')
+            ORDER BY created_at ASC
+            """,
+            (task_run_id,),
+        )
+
+    # ── mo_events ────────────────────────────────────────────────────────────
+
+    def fetch_mo_events_by_trace_id(
+        self, trace_id: str, limit: int
+    ) -> list[dict[str, Any]]:
+        """Strict trace_id bridge for the events endpoint."""
+        if not self._db.has_table("mo_events"):
+            return []
+        return self._db.rows(
+            """
+            SELECT id, ts, event_type, actor, status, duration_ms, cost_usd,
+                   artifact_path, payload_json
+            FROM mo_events WHERE trace_id = ?
+            ORDER BY ts ASC LIMIT ?
+            """,
+            (trace_id, limit),
+        )
+
+    def fetch_mo_events_in_window(
+        self, start: int, upper: int, limit: int
+    ) -> list[dict[str, Any]]:
+        """Best-effort time-window bridge for the events endpoint."""
+        if not self._db.has_table("mo_events"):
+            return []
+        return self._db.rows(
+            """
+            SELECT id, ts, event_type, actor, status, duration_ms, cost_usd,
+                   artifact_path, payload_json
+            FROM mo_events
+            -- CAST is load-bearing: strftime returns TEXT, and TEXT BETWEEN
+            -- INTEGER params is always false in SQLite (ints sort before text)
+            WHERE CAST(strftime('%s', ts) AS INTEGER) BETWEEN ? AND ?
+            ORDER BY ts ASC LIMIT ?
+            """,
+            (start, upper, limit),
+        )
+
+    # ── llm_calls ────────────────────────────────────────────────────────────
+
+    def _llm_calls_select(self) -> str:
+        """SELECT column list with the cached_input_tokens compat shim.
+
+        Older state.db files lack the cached_input_tokens column; the inline
+        code probed PRAGMA table_info and substituted a literal 0. That probe
+        moves here with the query.
+        """
+        llm_cols = {r["name"] for r in self._db.rows("PRAGMA table_info(llm_calls)")}
+        cached_input_expr = (
+            "cached_input_tokens"
+            if "cached_input_tokens" in llm_cols
+            else "0 AS cached_input_tokens"
+        )
+        return f"""
+            SELECT id, provider, model_id, tier, feature_name, actor,
+                   input_tokens, output_tokens, total_tokens, cost_usd,
+                   {cached_input_expr},
+                   duration_ms, status, finish_reason, ts
+            FROM llm_calls
+            """
+
+    def fetch_llm_calls_by_trace_id(self, trace_id: str) -> list[dict[str, Any]]:
+        """Strict traceparent-substring bridge for the llm-calls endpoint."""
+        if not self._db.has_table("llm_calls"):
+            return []
+        return self._db.rows(
+            self._llm_calls_select()
+            + """
+            WHERE traceparent LIKE ?
+            ORDER BY ts ASC
+            """,
+            (f"%{trace_id}%",),
+        )
+
+    def fetch_llm_calls_in_window(self, start: int, upper: int) -> list[dict[str, Any]]:
+        """Best-effort time-window bridge for the llm-calls endpoint."""
+        if not self._db.has_table("llm_calls"):
+            return []
+        return self._db.rows(
+            self._llm_calls_select()
+            + """
+            -- CAST is load-bearing: strftime returns TEXT, and TEXT BETWEEN
+            -- INTEGER params is always false in SQLite (ints sort before text)
+            WHERE CAST(strftime('%s', ts) AS INTEGER) BETWEEN ? AND ?
+            ORDER BY ts ASC
+            """,
+            (start, upper),
+        )
+
+
 class ArtifactsRepository:
     """Read queries for the run_artifacts trajectory store (migration 0047).
 
