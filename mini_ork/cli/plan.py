@@ -25,14 +25,31 @@ import hashlib
 import io
 import json
 import os
-import re
 import sys
 import tempfile
 import time
 from pathlib import Path
 
-_NODE_TYPES = {"planner", "researcher", "implementer", "reviewer", "verifier",
-               "reflector", "publisher", "rollback"}
+# ── extracted pure helpers (mini_ork.planning) — re-exported for parity ──
+# Plan-JSON shape/extraction/validation and the deterministic recipe fallback +
+# contract overlay now live in mini_ork.planning; the names below are re-exported
+# so existing `from mini_ork.cli import plan` consumers see an identical surface.
+from mini_ork.planning.plan_schema import (  # noqa: F401
+    _contains_placeholder,
+    _detect_truncation,
+    _is_plan,
+    _is_stub_string,
+    _NODE_TYPES,
+    _objects,
+    _PLACEHOLDER_HINT,
+    extract_plan_json,
+    validate_plan,
+)
+from mini_ork.planning.recipe_plan import (  # noqa: F401
+    overlay_plan,
+    recipe_fallback_plan,
+)
+
 _RECOVERABLE_VERDICTS = {"parse_error", "missing_verifier_contract",
                          "bad_artifact_contract", "bad_node_types"}
 
@@ -90,165 +107,6 @@ Respond with ONLY valid JSON. No markdown fences, no prose.
 """
 
 
-# ── plan-JSON extraction (D-011/016/052) ──
-
-def _objects(s):
-    i = 0
-    while True:
-        start = s.find("{", i)
-        if start < 0:
-            return
-        depth = 0
-        in_str = False
-        esc = False
-        for j in range(start, len(s)):
-            c = s[j]
-            if in_str:
-                if esc:
-                    esc = False
-                elif c == "\\":
-                    esc = True
-                elif c == '"':
-                    in_str = False
-                continue
-            if c == '"':
-                in_str = True
-            elif c == "{":
-                depth += 1
-            elif c == "}":
-                depth -= 1
-                if depth == 0:
-                    yield s[start:j + 1]
-                    i = j + 1
-                    break
-        else:
-            return
-
-
-# A genuine unfilled stub carries a stub word (the dry-run placeholder reads
-# "<dry-run: not generated>"). A bare angle-bracketed identifier does NOT.
-_PLACEHOLDER_HINT = re.compile(
-    r"\b(dry[- ]?run|not[- ]generated|todo|tbd|fixme|fill[- ]?(me|in)?|xxx|placeholder)\b",
-    re.I,
-)
-
-
-def _is_stub_string(v) -> bool:
-    """True only for an UNFILLED template value — not for code that uses angle brackets."""
-    if not isinstance(v, str):
-        return False
-    s = v.strip()
-    if not (s.startswith("<") and s.endswith(">")):
-        return False
-    inner = s[1:-1].strip()
-    if not inner:
-        return True
-    # "<dry-run: not generated>", "<TODO>", "<fill me>" -> a real stub
-    # "<ContentNodeCreationModal>", "<div>", "<Foo />"   -> real code
-    return bool(_PLACEHOLDER_HINT.search(inner))
-
-
-def _contains_placeholder(v):
-    """True when the PLAN ITSELF was never generated (i.e. it is the dry-run stub).
-
-    Scope matters. The old check recursed into EVERY nested string and flagged anything
-    shaped like `<...>`. That rejected two entirely legitimate things:
-
-      * JSX/HTML tags a plan naturally names — "<ContentNodeCreationModal>" — which made
-        mini-ork unable to plan work on ANY React/JSX codebase; and
-      * the planner's own step annotations — "<shell-only>", "<analysis-only — no edit>"
-        — meaning "this step edits no file".
-
-    A *placeholder plan* means the planner produced nothing: the dry-run stub, whose
-    objective is "<dry-run: not generated>" and whose decomposition is empty. Judge the
-    plan by its objective (and emptiness), not by every string inside it.
-    """
-    if isinstance(v, dict):
-        if _is_stub_string(v.get("objective")):
-            return True
-        # the dry-run stub is an empty shell: no objective, nothing to do
-        if not str(v.get("objective") or "").strip() and not (v.get("decomposition") or []):
-            return True
-        return False
-    return _is_stub_string(v)
-
-
-def _is_plan(obj):
-    if not isinstance(obj, dict):
-        return False
-    if not isinstance(obj.get("verifier_contract"), dict):
-        return False
-    if not obj.get("verifier_contract", {}).get("checks"):
-        return False
-    if _contains_placeholder(obj):
-        return False
-    return any(k in obj for k in ("objective", "decomposition", "artifact_contract"))
-
-
-def extract_plan_json(raw: str) -> str:
-    first = None
-    for chunk in _objects(raw):
-        if first is None:
-            first = chunk
-        try:
-            parsed = json.loads(chunk)
-        except Exception:
-            continue
-        if _is_plan(parsed):
-            return json.dumps(parsed, indent=2)
-    return first if first is not None else raw
-
-
-def validate_plan(plan_json: str) -> str:
-    """Return the HAS_VERIFIER verdict string (verbatim logic)."""
-    try:
-        p = json.loads(plan_json)
-        vc = p.get("verifier_contract", {})
-        if not vc.get("checks", []):
-            return "missing_verifier_contract"
-        if _contains_placeholder(p):
-            return "placeholder_plan"
-        ac = p.get("artifact_contract", {})
-        if not isinstance(ac, dict):
-            return "bad_artifact_contract"
-        bad = []
-        for i, step in enumerate(p.get("decomposition", []) or []):
-            nt = (step.get("node_type") or "").strip()
-            if not nt:
-                bad.append(f'step[{i}] {step.get("id", "?")}: empty node_type')
-            elif nt not in _NODE_TYPES:
-                bad.append(f'step[{i}] {step.get("id", "?")}: node_type={nt!r} not in {sorted(_NODE_TYPES)}')
-        if bad:
-            sys.stderr.write("bad_node_types:" + "|".join(bad) + "\n")
-            return "bad_node_types"
-        return "ok"
-    except Exception as e:
-        sys.stderr.write(f"parse_error:{e}\n")
-        return "parse_error"
-
-
-def _detect_truncation(raw: str) -> bool:
-    depth = 0
-    in_str = False
-    esc = False
-    for c in (raw or "").rstrip()[-200:]:
-        if in_str:
-            if esc:
-                esc = False
-            elif c == "\\":
-                esc = True
-            elif c == '"':
-                in_str = False
-            continue
-        if c == '"':
-            in_str = True
-        elif c == "{":
-            depth += 1
-        elif c == "}":
-            depth -= 1
-    return depth > 0
-
-
 def _build_repair_prompt(root, kickoff, workflow, profile_path, raw_invalid, verdict, truncated,
                          original_prompt=None) -> str:
     original = original_prompt or _build_prompt(root, kickoff, workflow, profile_path)
@@ -270,81 +128,6 @@ Return a corrected planner plan using this required JSON schema:
 
 No prose, no markdown fences, return ONLY valid JSON.
 """
-
-
-def recipe_fallback_plan(recipe, workflow_path, root, kickoff) -> str | None:
-    if not recipe or not workflow_path or not os.path.isfile(workflow_path):
-        return None
-    import yaml
-    workflow = yaml.safe_load(Path(workflow_path).read_text(encoding="utf-8")) or {}
-    nodes = workflow.get("nodes") or []
-    edges = workflow.get("edges") or []
-    contract_path = Path(root) / "recipes" / recipe / "artifact_contract.yaml"
-    contract = {}
-    if contract_path.exists():
-        contract = yaml.safe_load(contract_path.read_text(encoding="utf-8")) or {}
-    outputs = contract.get("outputs") or workflow.get("outputs") or []
-    success_verifiers = contract.get("success_verifiers") or workflow.get("success_verifiers") or []
-    plan = {
-        "objective": f"Execute recipe {recipe} for {kickoff}",
-        "assumptions": [
-            "Recipe workflow.yaml is the source of truth for dispatch order.",
-            "Planner LLM output was invalid JSON, so mini-ork generated this deterministic recipe plan.",
-        ],
-        "decomposition": [
-            {"id": n.get("name"),
-             "description": n.get("description") or f"{n.get('type', 'unknown')} node {n.get('name')}",
-             "node_type": n.get("type"),
-             "depends_on": [e.get("from") for e in edges if e.get("to") == n.get("name") and e.get("from")]}
-            for n in nodes if isinstance(n, dict) and n.get("name")],
-        "dependencies": [{"from": e.get("from"), "to": e.get("to")}
-                         for e in edges if isinstance(e, dict) and e.get("from") and e.get("to")],
-        "risk_notes": [
-            "Fallback plan does not include model-authored verifier shell commands.",
-            "Execution still uses the recipe workflow nodes and recipe verifier_ref scripts.",
-        ],
-        "artifact_contract": {"outputs": outputs, "success_verifiers": success_verifiers},
-        "verifier_contract": {"checks": [
-            {"id": "recipe-workflow-dispatch",
-             "description": f"Dispatch every node declared in recipes/{recipe}/workflow.yaml."},
-            {"id": "recipe-artifacts",
-             "description": "Recipe artifact contract is satisfied by execute/verify."}]},
-    }
-    return json.dumps(plan, indent=2)
-
-
-def overlay_plan(plan_json, task_class, profile_path, root) -> str:
-    try:
-        p = json.loads(plan_json)
-    except Exception:
-        return plan_json
-    p.setdefault("task_class", task_class)
-    recipe = ""
-    if profile_path and os.path.isfile(profile_path):
-        try:
-            recipe = (json.load(open(profile_path)).get("recipe") or "").strip()
-        except Exception:
-            recipe = ""
-    contract_yaml = os.path.join(root, "recipes", recipe, "artifact_contract.yaml") if recipe else ""
-    if contract_yaml and os.path.isfile(contract_yaml):
-        try:
-            import yaml
-            recipe_contract = yaml.safe_load(open(contract_yaml)) or {}
-            recipe_verifiers = recipe_contract.get("success_verifiers") or []
-            if recipe_verifiers:
-                ac = p.get("artifact_contract")
-                if not isinstance(ac, dict):
-                    ac = {}
-                prose = ac.get("success_verifiers") or []
-                if prose and prose != recipe_verifiers:
-                    ac.setdefault("acceptance_criteria", prose)
-                ac["success_verifiers"] = recipe_verifiers
-                if recipe_contract.get("outputs"):
-                    ac.setdefault("outputs", recipe_contract["outputs"])
-                p["artifact_contract"] = ac
-        except Exception:
-            pass
-    return json.dumps(p, indent=2)
 
 
 def _charge_cost(db, run_id):
