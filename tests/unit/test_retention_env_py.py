@@ -1,5 +1,4 @@
 """Unit tests for trajectory retention env wiring (roadmap Step 2 / A2)."""
-import os
 import sqlite3
 import time
 
