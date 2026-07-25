@@ -855,8 +855,16 @@ def apply_impl_output(impl_log, target):
                 subprocess.run(["git", "-C", target, "apply", "--whitespace=nowarn", "-"],
                                input=m.group(1), text=True, capture_output=True, check=True)
                 applied.append("<unified-diff>")
-            except subprocess.CalledProcessError:
-                pass
+            except subprocess.CalledProcessError as exc:
+                # Partial-apply accounting (roadmap Step 1 / A5): a failed
+                # `git apply` used to vanish silently — the run continued
+                # believing capture succeeded. Behavior is unchanged (fall
+                # through to the fenced-block parser) but the failure is now
+                # observable, with the rejected hunks counted.
+                rejected = (exc.stderr or "").count("error: patch failed")
+                print(f"  [warn] apply-impl-output: git apply failed "
+                      f"({rejected} hunk(s) rejected) — trying fenced-block fallback",
+                      file=sys.stderr)
     if not applied:
         lines = text.splitlines()
         i = 0
@@ -2166,6 +2174,94 @@ def _handle_publisher(ctx: NodeDispatch):
                           verdict_env=os.environ.get("VERDICT", ""))
 
 
+def _rollback_strategy(workflow_path: str) -> str:
+    """The workflow's declared compensation strategy (``rollback_strategy:``
+    in workflow.yaml). Empty when undeclared/unreadable — the handler then
+    keeps the historical version-registry-only behavior."""
+    if not workflow_path or not os.path.isfile(workflow_path):
+        return ""
+    try:
+        import yaml  # noqa: PLC0415
+        return str((yaml.safe_load(open(workflow_path)) or {}).get("rollback_strategy") or "")
+    except Exception:
+        return ""
+
+
+def _revert_working_tree(root: str, run_dir: str) -> bool:
+    """``revert_branch`` compensation (roadmap Step 1 / fix-tracker M3).
+
+    Restore exactly the implementer's ``files_changed`` in the TARGET repo —
+    never a blanket ``git checkout .``: each path is strict-child validated
+    against the target toplevel (the publisher's OSS-leak guard), tracked
+    files are restored via ``git checkout HEAD --``, implementer-created
+    untracked files are removed. Leftover changes are reported explicitly
+    (M3: "fully restore or clearly report leftover changes").
+    Returns True when the tree is clean of the recorded delta afterwards.
+    """
+    def log(msg):
+        print(msg, file=sys.stderr, flush=True)
+
+    summary_path = os.path.join(run_dir, "implementer-summary.json") if run_dir else ""
+    files: list[str] = []
+    if summary_path and os.path.isfile(summary_path):
+        try:
+            data = json.load(open(summary_path, encoding="utf-8"))
+            if isinstance(data, dict) and isinstance(data.get("files_changed"), list):
+                files = [e for e in data["files_changed"] if isinstance(e, str) and e]
+        except Exception:
+            files = []
+    if not files:
+        log("  [rollback] revert_branch: no files_changed recorded — working tree untouched")
+        return True
+    target_repo = os.environ.get("MO_TARGET_CWD", "")
+    if not target_repo:
+        try:
+            target_repo = subprocess.check_output(
+                ["git", "-C", root or ".", "rev-parse", "--show-toplevel"],
+                stderr=subprocess.DEVNULL).decode().strip()
+        except Exception:
+            target_repo = root or "."
+    real_root = os.path.realpath(target_repo)
+    restored, removed, rejected = [], [], []
+    for raw in files:
+        ap = raw if os.path.isabs(raw) else os.path.join(real_root, raw)
+        real = os.path.realpath(ap)
+        if real != real_root and not real.startswith(real_root + os.sep):
+            rejected.append(raw)
+            log(f"  [rollback] reject-revert: path escapes target repo: {raw}")
+            continue
+        rel = os.path.relpath(real, real_root)
+        tracked = subprocess.run(
+            ["git", "-C", real_root, "ls-files", "--error-unmatch", "--", rel],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+        if tracked:
+            rc = subprocess.run(
+                ["git", "-C", real_root, "checkout", "HEAD", "--", rel],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode
+            if rc == 0:
+                restored.append(rel)
+            else:
+                rejected.append(raw)
+        else:
+            # Implementer-created file (absent from HEAD): delete it.
+            try:
+                if os.path.isfile(real):
+                    os.remove(real)
+                    removed.append(rel)
+            except OSError:
+                rejected.append(raw)
+    log(f"  [rollback] revert_branch: restored {len(restored)} tracked file(s), "
+        f"removed {len(removed)} created file(s), rejected {len(rejected)}")
+    # Leftover report: any of the recorded paths still dirty?
+    leftover = subprocess.run(
+        ["git", "-C", real_root, "status", "--porcelain", "--", *files],
+        capture_output=True, text=True).stdout.strip()
+    if leftover:
+        log(f"  [warn] rollback: leftover changes after revert_branch:\n{leftover}")
+        return False
+    return True
+
+
 def _handle_rollback(ctx: NodeDispatch):
     # F4: bash (:3205-3223) does a best-effort version_rollback (workflow then
     # agent), succeeds regardless of whether a prior version exists, sets
@@ -2183,6 +2279,13 @@ def _handle_rollback(ctx: NodeDispatch):
             continue
     if not reverted:
         print("  [ok] rollback: nothing to revert (no prior promoted version)", file=sys.stderr)
+    # Working-tree compensation: honor the workflow's declared strategy
+    # (declared in recipes/code-fix/workflow.yaml but previously implemented
+    # nowhere — fix-tracker M3). Version-registry rollback handles DB state;
+    # revert_branch handles FILE state. rc contract unchanged: the rollback
+    # node always succeeds and reports, it never re-fails the run.
+    if _rollback_strategy(ctx.workflow) == "revert_branch":
+        _revert_working_tree(ctx.root, ctx.run_dir_eff or ctx.run_dir)
     print("  [ok] rollback complete")
     # NOTE: bash traces NO rollback node (:3205-3223 has no _trace_write_node_rich).
     # Tracing it with status=success would write a spurious +1-reward execution_traces
