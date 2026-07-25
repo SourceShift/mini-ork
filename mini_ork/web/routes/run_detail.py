@@ -15,7 +15,7 @@ from .. import agents as agent_mod, artifacts, recipes, why
 from ..db import StateDB
 from ..deps import get_db, get_home
 from ..recipes import mini_ork_root
-from ..repositories import LearningRepository
+from ..repositories import LearningRepository, RunDetailRepository
 
 router = APIRouter(prefix="/api/v1/task-runs", tags=["run-detail"])
 
@@ -31,7 +31,8 @@ def get_task_run(
     task_run_id: str = PathParam(..., description="task_runs.id"),
     db: StateDB = Depends(get_db),
 ) -> dict[str, Any]:
-    tr = db.row("SELECT * FROM task_runs WHERE id = ?", (task_run_id,))
+    repo = RunDetailRepository(db)
+    tr = repo.fetch_task_run_row(task_run_id)
     if not tr:
         raise HTTPException(status_code=404, detail=f"task_run {task_run_id} not found")
     if not tr.get("duration_ms") and tr.get("ended_at") and tr.get("created_at"):
@@ -39,13 +40,9 @@ def get_task_run(
     tr["stale"] = False
     if tr.get("status") not in TERMINAL_STATUSES:
         last_ts = int(tr.get("updated_at") or tr.get("created_at") or 0)
-        if db.has_table("run_events"):
-            ev = db.row(
-                "SELECT MAX(created_at) AS ts FROM run_events WHERE run_id = ?",
-                (task_run_id,),
-            )
-            if ev and ev.get("ts"):
-                last_ts = max(last_ts, int(ev["ts"]))
+        last_event_ts = repo.fetch_last_run_event_ts(task_run_id)
+        if last_event_ts:
+            last_ts = max(last_ts, int(last_event_ts))
         tr["last_activity_at"] = last_ts
         tr["stale"] = (time.time() - last_ts) > RUN_STALE_SECONDS
     return tr
@@ -86,10 +83,7 @@ def list_inputs(
     These are not output artifacts. They are the operator/kickoff/profile/plan
     inputs the UI should show before the DAG.
     """
-    tr = db.row(
-        "SELECT kickoff_path, plan_path, recipe FROM task_runs WHERE id = ?",
-        (task_run_id,),
-    )
+    tr = RunDetailRepository(db).fetch_input_paths(task_run_id)
     if not tr:
         raise HTTPException(status_code=404, detail="task_run not found")
 
@@ -205,10 +199,7 @@ def get_correlation(
     Reports trace_id, available bridge methods, and remediation hints —
     answers the UI's "why are some panels empty?" question.
     """
-    tr = db.row(
-        "SELECT id, trace_id, created_at, ended_at, kickoff_path FROM task_runs WHERE id = ?",
-        (task_run_id,),
-    )
+    tr = RunDetailRepository(db).fetch_correlation_row(task_run_id)
     if not tr:
         raise HTTPException(status_code=404, detail="task_run not found")
     methods: list[str] = ["run_events.run_id"]  # always works for our node events
@@ -506,10 +497,8 @@ def get_events(
 
     Each row carries `bridge` field telling the UI which method matched it.
     """
-    tr = db.row(
-        "SELECT trace_id, created_at, ended_at FROM task_runs WHERE id = ?",
-        (task_run_id,),
-    )
+    repo = RunDetailRepository(db)
+    tr = repo.fetch_trace_window(task_run_id)
     if not tr:
         raise HTTPException(status_code=404, detail="task_run not found")
 
@@ -526,49 +515,20 @@ def get_events(
         out.append(row)
 
     # 1. mo_events by trace_id (strict)
-    if db.has_table("mo_events") and tr.get("trace_id"):
-        for r in db.rows(
-            """
-            SELECT id, ts, event_type, actor, status, duration_ms, cost_usd,
-                   artifact_path, payload_json
-            FROM mo_events WHERE trace_id = ?
-            ORDER BY ts ASC LIMIT ?
-            """,
-            (tr["trace_id"], limit),
-        ):
+    if tr.get("trace_id"):
+        for r in repo.fetch_mo_events_by_trace_id(tr["trace_id"], limit):
             _add(r, "mo_events", "trace_id")
 
     # 2. mo_events by time window (best-effort fallback when trace_id is missing
     #    OR when this run also had nested emits with a different trace_id)
-    if db.has_table("mo_events") and tr.get("created_at"):
+    if tr.get("created_at"):
         upper = tr.get("ended_at") or int(__import__("time").time())
-        for r in db.rows(
-            """
-            SELECT id, ts, event_type, actor, status, duration_ms, cost_usd,
-                   artifact_path, payload_json
-            FROM mo_events
-            -- CAST is load-bearing: strftime returns TEXT, and TEXT BETWEEN
-            -- INTEGER params is always false in SQLite (ints sort before text)
-            WHERE CAST(strftime('%s', ts) AS INTEGER) BETWEEN ? AND ?
-            ORDER BY ts ASC LIMIT ?
-            """,
-            (int(tr["created_at"]), int(upper), limit),
-        ):
+        for r in repo.fetch_mo_events_in_window(int(tr["created_at"]), int(upper), limit):
             _add(r, "mo_events", "time-window")
 
     # 3. run_events scoped by run_id (always works for our node lifecycle emits)
-    if db.has_table("run_events"):
-        for r in db.rows(
-            """
-            SELECT event_id AS id, created_at AS ts, event_type,
-                   NULL AS actor, NULL AS status, NULL AS duration_ms,
-                   NULL AS cost_usd, NULL AS artifact_path, payload_json
-            FROM run_events WHERE run_id = ?
-            ORDER BY created_at ASC LIMIT ?
-            """,
-            (task_run_id, limit),
-        ):
-            _add(r, "run_events", "run_id")
+    for r in repo.fetch_run_events(task_run_id, limit):
+        _add(r, "run_events", "run_id")
 
     out.sort(key=lambda e: str(e.get("ts") or ""))
     return out
@@ -580,21 +540,13 @@ def get_llm_calls(
     db: StateDB = Depends(get_db),
 ) -> list[dict[str, Any]]:
     """LLM calls correlated to a task_run via trace_id (strict) or time window (fallback)."""
-    tr = db.row(
-        "SELECT trace_id, created_at, ended_at FROM task_runs WHERE id = ?",
-        (task_run_id,),
-    )
-    if not tr or not db.has_table("llm_calls"):
+    repo = RunDetailRepository(db)
+    tr = repo.fetch_trace_window(task_run_id)
+    if not tr or not repo.has_table("llm_calls"):
         return []
 
     out: list[dict[str, Any]] = []
     seen: set[int] = set()
-    llm_cols = {r["name"] for r in db.rows("PRAGMA table_info(llm_calls)")}
-    cached_input_expr = (
-        "cached_input_tokens"
-        if "cached_input_tokens" in llm_cols
-        else "0 AS cached_input_tokens"
-    )
 
     def _add(row: dict[str, Any], bridge: str) -> None:
         if row["id"] in seen:
@@ -606,37 +558,13 @@ def get_llm_calls(
     # 1. trace_id match (strict)
     trace_id = tr.get("trace_id")
     if trace_id:
-        for r in db.rows(
-            f"""
-            SELECT id, provider, model_id, tier, feature_name, actor,
-                   input_tokens, output_tokens, total_tokens, cost_usd,
-                   {cached_input_expr},
-                   duration_ms, status, finish_reason, ts
-            FROM llm_calls
-            WHERE traceparent LIKE ?
-            ORDER BY ts ASC
-            """,
-            (f"%{trace_id}%",),
-        ):
+        for r in repo.fetch_llm_calls_by_trace_id(trace_id):
             _add(r, "trace_id")
 
     # 2. time-window fallback
     if tr.get("created_at"):
         upper = tr.get("ended_at") or int(__import__("time").time())
-        for r in db.rows(
-            f"""
-            SELECT id, provider, model_id, tier, feature_name, actor,
-                   input_tokens, output_tokens, total_tokens, cost_usd,
-                   {cached_input_expr},
-                   duration_ms, status, finish_reason, ts
-            FROM llm_calls
-            -- CAST is load-bearing: strftime returns TEXT, and TEXT BETWEEN
-            -- INTEGER params is always false in SQLite (ints sort before text)
-            WHERE CAST(strftime('%s', ts) AS INTEGER) BETWEEN ? AND ?
-            ORDER BY ts ASC
-            """,
-            (int(tr["created_at"]), int(upper)),
-        ):
+        for r in repo.fetch_llm_calls_in_window(int(tr["created_at"]), int(upper)):
             _add(r, "time-window")
 
     return out
@@ -676,7 +604,7 @@ def get_dag(
       - done       : node_end present, no verdict failure
       - failed     : node_end present with verdict in {REQUEST_CHANGES, ESCALATE, CRASH}
     """
-    tr = db.row("SELECT recipe FROM task_runs WHERE id = ?", (task_run_id,))
+    tr = RunDetailRepository(db).fetch_run_recipe(task_run_id)
     if not tr or not tr.get("recipe"):
         raise HTTPException(status_code=404, detail="task_run or recipe not found")
     fp = recipes.fingerprint(tr["recipe"], home)
@@ -697,18 +625,7 @@ def get_dag(
 
 def _node_status_map(db: StateDB, task_run_id: str) -> dict[str, dict[str, Any]]:
     """Aggregate node_start / node_end events per node_id."""
-    if not db.has_table("run_events"):
-        return {}
-    rows = db.rows(
-        """
-        SELECT event_type, created_at, payload_json
-        FROM run_events
-        WHERE run_id = ? AND event_type IN ('node_start', 'node_end')
-        ORDER BY created_at ASC
-        """,
-        (task_run_id,),
-    )
-    import json
+    rows = RunDetailRepository(db).fetch_node_lifecycle_events(task_run_id)
 
     out: dict[str, dict[str, Any]] = {}
     for r in rows:
