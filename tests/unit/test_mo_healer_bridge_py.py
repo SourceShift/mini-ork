@@ -425,6 +425,14 @@ def test_e2e_cleaner_on_main_success(tmp_path, monkeypatch):
     assert set(bash_payload.keys()) == expected_keys, bash_payload.keys()
     assert set(py_payload.keys()) == expected_keys, py_payload.keys()
     for k in expected_keys:
+        if k == "detected_at":
+            # Second-granularity UTC stamps from two separate processes — the
+            # bash and python invocations legitimately straddle a second
+            # boundary under load. Compare shape, not equality.
+            import re as _re
+            assert _re.match(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$", bash_payload[k])
+            assert _re.match(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$", py_payload[k])
+            continue
         assert bash_payload[k] == py_payload[k], (
             f"key={k} bash={bash_payload[k]!r} py={py_payload[k]!r}")
 
