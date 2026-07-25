@@ -194,3 +194,56 @@ class LearningRepository:
             """,
             (task_run_id,),
         )
+
+
+class ArtifactsRepository:
+    """Read queries for the run_artifacts trajectory store (migration 0047).
+
+    Same StateDB-wrapping, has_table-guarded style as LearningRepository: an
+    old state.db without run_artifacts yields ``[]`` / ``None``, never a 500.
+    """
+
+    def __init__(self, db: StateDB):
+        self._db = db
+
+    def list_artifacts(
+        self, run_id: str, kind: str | None = None
+    ) -> list[dict[str, Any]]:
+        """All run_artifacts rows for a run, oldest first; optional kind filter."""
+        if not self._db.has_table("run_artifacts"):
+            return []
+        if kind:
+            return self._db.rows(
+                """
+                SELECT id, run_id, node_id, call_id, kind, rel_path,
+                       bytes, sha256, created_at
+                FROM run_artifacts
+                WHERE run_id = ? AND kind = ?
+                ORDER BY created_at ASC, id ASC
+                """,
+                (run_id, kind),
+            )
+        return self._db.rows(
+            """
+            SELECT id, run_id, node_id, call_id, kind, rel_path,
+                   bytes, sha256, created_at
+            FROM run_artifacts
+            WHERE run_id = ?
+            ORDER BY created_at ASC, id ASC
+            """,
+            (run_id,),
+        )
+
+    def fetch_artifact(self, run_id: str, artifact_id: int) -> dict[str, Any] | None:
+        """One row by primary key, scoped to the run (no cross-run reads)."""
+        if not self._db.has_table("run_artifacts"):
+            return None
+        return self._db.row(
+            """
+            SELECT id, run_id, node_id, call_id, kind, rel_path,
+                   bytes, sha256, created_at
+            FROM run_artifacts
+            WHERE id = ? AND run_id = ?
+            """,
+            (artifact_id, run_id),
+        )
