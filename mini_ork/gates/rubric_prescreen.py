@@ -1,4 +1,4 @@
-"""rubric_prescreen — Python port of lib/rubric-prescreen.sh.
+"""rubric_prescreen — Python port of lib/rubric-prescreen.sh (orchestration layer).
 
 Faithful port of the public surface of ``lib/rubric-prescreen.sh``. The
 bash file already lifts three Python heredocs into itself (extracting
@@ -19,20 +19,28 @@ non-deterministic subprocesses (claude -p, llm_dispatch); their parity
 is structural (same argv, same DB writes) and not covered by the
 test suite.
 
+SRP split (SOLID refactor): the pure parsing/scoring helpers live in
+``mini_ork/gates/rubric_scoring.py`` and the SQLite cache/DB layer in
+``mini_ork/gates/rubric_cache.py``. This module keeps the orchestration
++ lane dispatch + ``RubricPrescreenConfig`` and RE-EXPORTS every moved
+public name so existing importers and bash-parity tests are untouched
+(behavior is byte-identical — the bash line-reference comments moved
+with the code).
+
 Pipeline map (bash → Python; bash line ranges from
 ``lib/rubric-prescreen.sh`` and ``lib/cache.sh``):
 
-  extract_rubric_json       lines 140-159  → extract_rubric_json
-  artifact_summary          lines 247-267  → artifact_summary
-  substitute_template       lines 271-279  → substitute_template
-  build_parse_error_payload lines 187-191  → build_parse_error_payload
-  build_panel_verdict       lines 335-339  → build_panel_verdict
-  fetch_kickoff_path        lines 27-29    → fetch_kickoff_path
-  mo_cache_input_hash       cache.sh 69-75 → cache_input_hash
-  mo_cache_lookup           cache.sh 98-112 → cache_lookup
-  mo_cache_record_hit       cache.sh 115-128 → cache_record_hit
-  mo_cache_emit             cache.sh 135-163 → cache_emit
-  mo_cache_costline_from_log cache.sh 168-177 → cache_costline_from_log
+  extract_rubric_json       lines 140-159  → rubric_scoring.extract_rubric_json
+  artifact_summary          lines 247-267  → rubric_scoring.artifact_summary
+  substitute_template       lines 271-279  → rubric_scoring.substitute_template
+  build_parse_error_payload lines 187-191  → rubric_scoring.build_parse_error_payload
+  build_panel_verdict       lines 335-339  → rubric_scoring.build_panel_verdict
+  fetch_kickoff_path        lines 27-29    → rubric_cache.fetch_kickoff_path
+  mo_cache_input_hash       cache.sh 69-75 → rubric_cache.cache_input_hash
+  mo_cache_lookup           cache.sh 98-112 → rubric_cache.cache_lookup
+  mo_cache_record_hit       cache.sh 115-128 → rubric_cache.cache_record_hit
+  mo_cache_emit             cache.sh 135-163 → rubric_cache.cache_emit
+  mo_cache_costline_from_log cache.sh 168-177 → rubric_cache.cache_costline_from_log
   mo_run_rubric_prescreen   lines 17-207   → mo_run_rubric_prescreen
   mo_rubric_run_score       lines 229-362  → mo_rubric_run_score
   mo_append_rubric_to_feedback lines 365-383 → mo_append_rubric_to_feedback
@@ -89,13 +97,31 @@ from __future__ import annotations
 
 import json
 import os
-import re
-import secrets
 import sqlite3
 import subprocess
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
-from typing import Any, Mapping, Optional
+from datetime import datetime, timezone
+from typing import Mapping, Optional
+
+# Re-exports (SRP split): pure parsing/scoring lives in rubric_scoring,
+# SQLite cache/DB layer in rubric_cache. Names stay importable from
+# this module so existing importers and parity tests are untouched.
+from mini_ork.gates.rubric_cache import (
+    cache_costline_from_log,
+    cache_emit,
+    cache_input_hash,
+    cache_lookup,
+    cache_record_hit,
+    fetch_kickoff_path,
+)
+from mini_ork.gates.rubric_scoring import (
+    _extract_result_text,
+    artifact_summary,
+    build_panel_verdict,
+    build_parse_error_payload,
+    extract_rubric_json,
+    substitute_template,
+)
 
 __all__ = [
     "RubricPrescreenConfig",
@@ -114,378 +140,6 @@ __all__ = [
     "mo_rubric_run_score",
     "mo_append_rubric_to_feedback",
 ]
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Heredoc-lifted helpers (lines 140-159, 247-267, 271-279 of
-# lib/rubric-prescreen.sh — these were already Python source lifted into
-# bash heredocs; the port just lifts them into a module).
-# ─────────────────────────────────────────────────────────────────────────────
-
-def extract_rubric_json(text: str) -> Optional[str]:
-    """Mirror bash heredoc at lines 140-159.
-
-    Brace-balanced JSON scanner: finds the LAST ``{"pass":`` start in
-    the text, walks forward with a depth counter (respecting string
-    literals + backslash escapes) until the matching close brace, then
-    tries ``json.loads`` on the candidate. Returns the candidate
-    substring on success, ``None`` otherwise.
-
-    The bash heredoc iterates ``starts`` in REVERSED order — it
-    prefers the LAST ``{"pass":`` in the text, so a "Here's the
-    final rubric: {...}" preamble with an earlier ``{"pass"`` is
-    ignored. The port mirrors exactly.
-    """
-    starts = [m.start() for m in re.finditer(r'\{[^{]*?"pass"\s*:', text)]
-    for start in reversed(starts):
-        depth, in_str, esc = 0, False, False
-        for i in range(start, len(text)):
-            c = text[i]
-            if esc:
-                esc = False
-                continue
-            if c == "\\":
-                esc = True
-                continue
-            if c == '"' and not esc:
-                in_str = not in_str
-                continue
-            if in_str:
-                continue
-            if c == "{":
-                depth += 1
-            elif c == "}":
-                depth -= 1
-                if depth == 0:
-                    cand = text[start:i + 1]
-                    try:
-                        json.loads(cand)
-                    except Exception:
-                        break
-                    return cand
-    return None
-
-
-def substitute_template(template: str, kickoff_body: str, diff_summary: str) -> str:
-    """Mirror bash heredoc at lines 271-279.
-
-    First-occurrence-only replacement of ``{{KICKOFF_BODY}}`` and
-    ``{{DIFF_SUMMARY}}``. Mirrors the awk splitter at lines 57-66 of
-    the bash file which splits the template on the FIRST occurrence of
-    each marker. If a marker does not appear, it passes through
-    unchanged. ``str.replace`` would substitute every occurrence —
-    do NOT use it here, the parity test will catch the difference.
-
-    The ``diff_summary`` is rstripped of trailing newlines because the
-    bash caller feeds it via ``"$(python3 ...)"`` (artifact_summary
-    variable at line 247), and bash command-substitution strips
-    trailing newlines from ``$(...)`` outputs. The kickoff body is
-    passed as-is because the bash version reads it from a file via
-    ``open(kickoff).read()`` (no rstrip happens at that boundary).
-
-    The return value is rstripped of trailing newlines to match the
-    bash caller's ``prompt_text=$(python3 ...)`` capture, which
-    strips trailing newlines from ``$(...)`` outputs.
-    """
-    body = template
-    if "{{KICKOFF_BODY}}" in body:
-        body = body.replace("{{KICKOFF_BODY}}", kickoff_body, 1)
-    if "{{DIFF_SUMMARY}}" in body:
-        body = body.replace("{{DIFF_SUMMARY}}", diff_summary.rstrip("\n"), 1)
-    return body.rstrip("\n")
-
-
-def artifact_summary(run_dir: str, max_chars: int = 12000) -> str:
-    """Mirror bash heredoc at lines 247-267.
-
-    Bounded work-product summary: list files in ``run_dir`` (skipping
-    dotfiles), print ``### <filename> (<size> bytes)`` header, then the
-    first 25 lines (capped at 2000 chars) for text files (.md / .json /
-    .txt / .yaml / .log) that are non-empty. Output is capped at
-    ``max_chars`` total (default 12000 — matches bash).
-    """
-    lines: list[str] = []
-    try:
-        names = sorted(os.listdir(run_dir))
-    except FileNotFoundError:
-        return ""
-    for name in names:
-        path = os.path.join(run_dir, name)
-        if not os.path.isfile(path) or name.startswith("."):
-            continue
-        try:
-            size = os.path.getsize(path)
-        except OSError:
-            continue
-        lines.append(f"### {name} ({size} bytes)")
-        if name.endswith((".md", ".json", ".txt", ".yaml", ".log")) and size > 0:
-            try:
-                with open(path, errors="replace") as f:
-                    head = "".join(f.readlines()[:25])
-                lines.append(head[:2000].rstrip())
-            except Exception:
-                pass
-        lines.append("")
-    # Bash callers use ``$(python3 ...)`` which strips trailing
-    # newlines from the heredoc's print output. Match that semantic
-    # by rstripping the joined string so the parity test sees the
-    # same effective string on both sides.
-    return "\n".join(lines)[:max_chars].rstrip("\n")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# JSON payload builders
-# ─────────────────────────────────────────────────────────────────────────────
-
-def build_parse_error_payload(
-    diag: str = "",
-    log_path: Optional[str] = None,
-) -> dict[str, Any]:
-    """Mirror bash jq -n at lines 187-191.
-
-    When ``log_path`` is provided, the payload includes
-    ``parse_error_diagnostic`` (last 800 chars of the model output)
-    and ``parse_error_log_hint`` ("inspect last 200 lines of <path>")
-    so the operator can diagnose why all 4 extraction strategies
-    missed. When ``log_path`` is None, the diagnostic fields are
-    omitted (mirrors the dispatch-failure branch at lines 323-325
-    which only emits ``parse_error_diagnostic``).
-    """
-    payload: dict[str, Any] = {
-        "pass": False,
-        "score": -1,
-        "parse_error": True,
-        "items": [],
-    }
-    if log_path is not None:
-        payload["parse_error_diagnostic"] = diag
-        payload["parse_error_log_hint"] = f"inspect last 200 lines of {log_path}"
-    else:
-        payload["parse_error_diagnostic"] = diag
-    return payload
-
-
-def build_panel_verdict(
-    score: int,
-    pass_: bool,
-    task_class: str,
-    source: str = "rubric-prescreen",
-) -> dict[str, Any]:
-    """Mirror bash jq -n at lines 335-339.
-
-    Maps rubric score (0-8) to panel_score (0-100) via
-    ``panel_score = score * 12.5``. Consumed by lib/promotion_gate.sh.
-    """
-    return {
-        "panel_score": float(score) * 12.5,
-        "pass": pass_,
-        "source": source,
-        "task_class": task_class,
-        "scale": "rubric 0-8 mapped to 0-100",
-    }
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# DB helpers (mini_orch_sessions table, mirroring lib/cache.sh 98-177)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _open(db_path: str) -> sqlite3.Connection:
-    con = sqlite3.connect(db_path)
-    con.execute("PRAGMA busy_timeout=5000")
-    return con
-
-
-def fetch_kickoff_path(db_path: str, epic: str, repo_root: str) -> Optional[str]:
-    """Mirror bash SELECT at lines 27-29.
-
-    Returns the absolute kickoff path (``<repo_root>/<kickoff_path>``)
-    for the given epic, or ``None`` if the epic has no kickoff_path
-    set. Mirrors the bash's ``local kickoff_rel=$(sqlite3 ...)`` which
-    emits an empty string on no row, then the bash uses
-    ``$REPO_ROOT/$kickoff_rel``. The port collapses that into a
-    single ``Optional[str]`` return — None on miss.
-    """
-    con = _open(db_path)
-    try:
-        row = con.execute(
-            "SELECT kickoff_path FROM epics WHERE id=?",
-            (epic,),
-        ).fetchone()
-    finally:
-        con.close()
-    if row is None or not row[0]:
-        return None
-    kickoff_rel = row[0]
-    return f"{repo_root}/{kickoff_rel}"
-
-
-def cache_input_hash(data: str) -> str:
-    """Mirror bash ``mo_cache_input_hash`` (lib/cache.sh 69-75).
-
-    Prefers ``sha256sum`` if available, falls back to ``shasum -a 256``.
-    In Python this is a single ``hashlib.sha256`` call — both shells
-    produce the same hex digest on the same input.
-
-    Note: bash reads from stdin; this function takes a string argument.
-    The caller is responsible for feeding it the full bundle (use
-    ``hash_bundle`` if you need bash's record-separator semantics).
-    """
-    import hashlib
-    return hashlib.sha256(data.encode("utf-8")).hexdigest()
-
-
-def cache_lookup(
-    db_path: str,
-    stage: str,
-    epic: str,
-    iter: int,
-    input_hash: str,
-) -> str:
-    """Mirror bash ``mo_cache_lookup`` (lib/cache.sh 98-112).
-
-    Returns the output_path on a cache HIT (status=success, not
-    expired). Empty string on miss (matches bash's empty stdout).
-    """
-    con = _open(db_path)
-    try:
-        row = con.execute(
-            """
-            SELECT output_path FROM mini_orch_sessions
-            WHERE epic_id = ? AND iter = ? AND stage = ? AND input_hash = ?
-              AND status = 'success'
-              AND expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now')
-            ORDER BY updated_at DESC
-            LIMIT 1;
-            """,
-            (epic, iter, stage, input_hash),
-        ).fetchone()
-    finally:
-        con.close()
-    return row[0] if row else ""
-
-
-def cache_record_hit(
-    db_path: str,
-    stage: str,
-    epic: str,
-    iter: int,
-    input_hash: str,
-) -> None:
-    """Mirror bash ``mo_cache_record_hit`` (lib/cache.sh 115-128).
-
-    Bumps ``reused_count`` on the row that just served the hit. The
-    bash ``UPDATE`` does NOT include the WHERE condition ``status =
-    'success'`` (line 126) so it could increment a non-success row —
-    the port includes it as well to match verbatim.
-    """
-    con = _open(db_path)
-    try:
-        con.execute(
-            """
-            UPDATE mini_orch_sessions
-               SET reused_count = reused_count + 1,
-                   updated_at   = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-             WHERE epic_id = ? AND iter = ? AND stage = ? AND input_hash = ?
-               AND status = 'success';
-            """,
-            (epic, iter, stage, input_hash),
-        )
-        con.commit()
-    finally:
-        con.close()
-
-
-def _expires_at_30d() -> str:
-    """Mirror bash expires_at at lib/cache.sh 146-149.
-
-    ``now + 30 days`` formatted as ``%Y-%m-%dT%H:%M:%S.fZ`` (3-digit
-    millisecond precision, trailing Z). Matches the bash
-    ``python3 -c 'datetime.utcnow() + timedelta(days=30)'`` output
-    (utcnow is deprecated in 3.12 but the result is identical to
-    ``datetime.now(timezone.utc)`` for this use).
-    """
-    dt = datetime.now(timezone.utc) + timedelta(days=30)
-    return dt.strftime("%Y-%m-%dT%H:%M:%S") + f".{dt.microsecond // 1000:03d}Z"
-
-
-def cache_emit(
-    db_path: str,
-    stage: str,
-    epic: str,
-    iter: int,
-    input_hash: str,
-    status: str,
-    output_path: str,
-    log_path: str,
-    cost_usd: float,
-    turns: int,
-    duration_ms: int,
-    job_id: str = "unknown",
-    prompt_version: str = "v1",
-) -> None:
-    """Mirror bash ``mo_cache_emit`` (lib/cache.sh 135-163).
-
-    Insert a row at stage completion. uuid is ``secrets.token_hex(16)``
-    (32 hex chars, no hyphens) — differs from bash's hyphenated
-    ``uuidgen`` output, but the DB-row diff IGNORES the uuid column
-    per the plan's parity contract.
-    """
-    uuid = secrets.token_hex(16)
-    expires_at = _expires_at_30d()
-    con = _open(db_path)
-    try:
-        con.execute(
-            """
-            INSERT INTO mini_orch_sessions
-              (uuid, job_id, epic_id, iter, stage, input_hash, status,
-               output_path, log_path, cost_usd, turns, duration_ms,
-               expires_at, prompt_version)
-            VALUES
-              (?, ?, ?, ?, ?, ?, ?,
-               ?, ?, ?, ?, ?,
-               ?, ?)
-            ON CONFLICT (uuid) DO NOTHING;
-            """,
-            (
-                uuid, job_id, epic, iter, stage, input_hash, status,
-                output_path, log_path, cost_usd, turns, duration_ms,
-                expires_at, prompt_version,
-            ),
-        )
-        con.commit()
-    finally:
-        con.close()
-
-
-def cache_costline_from_log(log_path: str) -> tuple[float, int, int]:
-    """Mirror bash ``mo_cache_costline_from_log`` (lib/cache.sh 168-177).
-
-    Returns ``(cost_usd, turns, duration_ms)``. Emits ``(0.0, 0, 0)``
-    if the log file is missing or no ``"type":"result"`` line is
-    present (bash emits literal "0 0 0").
-    """
-    if not os.path.isfile(log_path):
-        return (0.0, 0, 0)
-    try:
-        with open(log_path, "r", errors="replace") as f:
-            text = f.read()
-    except OSError:
-        return (0.0, 0, 0)
-    # Match bash: grep '"type":"result"' | tail -1
-    m = None
-    for line in text.splitlines():
-        if '"type":"result"' in line:
-            m = line
-    if m is None:
-        return (0.0, 0, 0)
-    try:
-        obj = json.loads(m)
-    except (ValueError, TypeError):
-        return (0.0, 0, 0)
-    cost = float(obj.get("total_cost_usd") or 0)
-    nturns = int(obj.get("num_turns") or 0)
-    dur = int(obj.get("duration_ms") or 0)
-    return (cost, nturns, dur)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1072,51 +726,3 @@ def _run_dir(epic: str, mini_ork_home: Optional[str] = None,
 def _read_text(path: str) -> str:
     with open(path, encoding="utf-8", errors="replace") as f:
         return f.read()
-
-
-def _extract_result_text(log_path: str) -> str:
-    """Mirror bash jq fallbacks at lines 126-138.
-
-    Tries three extraction strategies in order:
-    1. ``.result`` field at the top level (--output-format json wrapper).
-    2. ``select(.type=="assistant") | .message.content[]?
-       | select(.type=="text") | .text`` (legacy stream-json shape).
-    3. ``grep '"type":"result"' | tail -1 | jq -r '.result'`` (mixed
-       deployment fallback).
-
-    Returns the extracted text or empty string on miss.
-    """
-    if not os.path.isfile(log_path):
-        return ""
-    try:
-        with open(log_path) as f:
-            text = f.read()
-    except OSError:
-        return ""
-
-    # Strategy 1: top-level .result from --output-format json.
-    for line in text.splitlines():
-        if '"type":"result"' in line:
-            try:
-                obj = json.loads(line)
-                if isinstance(obj, dict) and obj.get("result"):
-                    return str(obj["result"])
-            except (ValueError, TypeError):
-                pass
-
-    # Strategy 2: legacy stream-json shape.
-    for line in text.splitlines():
-        try:
-            obj = json.loads(line)
-        except (ValueError, TypeError):
-            continue
-        if obj.get("type") != "assistant":
-            continue
-        msg = obj.get("message") or {}
-        for chunk in (msg.get("content") or []):
-            if isinstance(chunk, dict) and chunk.get("type") == "text":
-                t = chunk.get("text")
-                if t:
-                    return str(t)
-
-    return ""
