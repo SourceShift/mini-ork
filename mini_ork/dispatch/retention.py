@@ -115,6 +115,28 @@ def gzip_run_stream(run_dir: str | Path) -> int:
             con.close()
 
 
+def prune_from_env(db_path: str | Path | None = None) -> int:
+    """Best-effort TTL prune wired into the run lifecycle (roadmap Step 2 / A2).
+
+    ``MO_TRAJECTORY_TTL_DAYS`` overrides the default TTL; 0/negative disables.
+    The db path follows the canonical contract (MINI_ORK_DB →
+    $MINI_ORK_HOME/state.db → .mini-ork/state.db). Never raises — retention is
+    housekeeping, not a run gate.
+    """
+    try:
+        ttl = int(os.environ.get("MO_TRAJECTORY_TTL_DAYS", str(DEFAULT_TTL_DAYS)))
+    except ValueError:
+        ttl = DEFAULT_TTL_DAYS
+    if ttl <= 0:
+        return 0
+    db = db_path or os.environ.get("MINI_ORK_DB") or os.path.join(
+        os.environ.get("MINI_ORK_HOME", ".mini-ork"), "state.db")
+    try:
+        return prune_old_trajectories(db, ttl_days=ttl)
+    except Exception:
+        return 0
+
+
 def prune_old_trajectories(
     db_path: str | Path, *, ttl_days: int = DEFAULT_TTL_DAYS
 ) -> int:
