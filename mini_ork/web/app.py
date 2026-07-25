@@ -11,6 +11,7 @@ from fastapi.staticfiles import StaticFiles
 
 from .deps import get_db, get_home, set_home_override
 from .routes import (
+    artifacts as artifacts_routes,
     control as control_routes,
     dispatch as dispatch_routes,
     fingerprint,
@@ -73,6 +74,10 @@ def create_app(home: Path | None = None, dev_cors: bool = True) -> FastAPI:
         )
 
     app.include_router(fleet.router)
+    # run-artifacts (DB registry over run_artifacts). Mounted at
+    # /artifact-records so it cannot shadow run_detail's /artifacts
+    # filesystem-scan endpoints the SPA consumes.
+    app.include_router(artifacts_routes.router)
     app.include_router(run_detail.router)
     app.include_router(trajectory.router)
     app.include_router(fingerprint.router)
