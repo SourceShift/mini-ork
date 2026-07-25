@@ -1,6 +1,5 @@
 """Unit tests for revert_branch working-tree rollback (roadmap Step 1 / A3)."""
 import json
-import os
 import subprocess
 
 import mini_ork.cli.execute as ex
