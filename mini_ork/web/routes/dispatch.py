@@ -189,7 +189,11 @@ def options(task_class: str | None = None, db: StateDB = Depends(get_db)) -> dic
 
 
 class DispatchRequest(BaseModel):
-    """What the composer sends when the user hits Dispatch."""
+    """What the composer sends when the user hits Dispatch.
+
+    NOT the provider-transport ``DispatchRequest`` dataclass in
+    ``mini_ork/dispatch/models.py`` — same name, different layer: this one is
+    the web API contract, that one is the LLM dispatch primitive."""
 
     kickoff: str
     recipe: str
