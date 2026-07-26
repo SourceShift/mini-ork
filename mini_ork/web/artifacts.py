@@ -34,28 +34,6 @@ def runs_root(home: Path) -> Path:
     return home / "runs"
 
 
-def list_run_dirs(home: Path) -> list[dict[str, Any]]:
-    root = runs_root(home)
-    if not root.exists():
-        return []
-    out: list[dict[str, Any]] = []
-    for p in sorted(root.iterdir(), reverse=True):
-        if not p.is_dir():
-            continue
-        try:
-            st = p.stat()
-        except OSError:
-            continue
-        out.append(
-            {
-                "id": p.name,
-                "path": str(p.relative_to(home)),
-                "mtime": int(st.st_mtime),
-                "file_count": sum(1 for _ in p.iterdir()),
-            }
-        )
-    return out
-
 
 def list_artifacts(home: Path, run_id: str) -> list[dict[str, Any]]:
     _validate_run_id(run_id)

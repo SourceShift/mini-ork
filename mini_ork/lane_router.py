@@ -49,7 +49,6 @@ import datetime
 import json
 import math
 import os
-import sqlite3
 from collections import defaultdict
 
 from mini_ork.learning.advantage_store import AdvantageStore, resolve_db_path
@@ -482,52 +481,4 @@ def _select_best_lane(candidates: list,
     return f"{best[0]}|{best[1]}|{best[2]}"
 
 
-def log_propensity(trace_id: int, source: str, explore: int, score: float,
-                   *, db: str | None = None) -> None:
-    """D4: stamp route_source / route_explore / route_score on a routed trace
-    row. Called by the executor after the lane is picked. Null-safe: leaves
-    the row untouched if the trace no longer exists."""
-    con = sqlite3.connect(_db_path(db))
-    try:
-        con.execute(
-            "UPDATE execution_traces SET route_source = ?, route_explore = ?, "
-            "route_score = ? WHERE id = ?",
-            (source, int(bool(explore)), float(score), trace_id))
-        con.commit()
-    except Exception:
-        pass
-    finally:
-        con.close()
 
-
-def z_score_advantage(lane: str, task_class: str, node_type: str = "",
-                      objective_domain: str = "", code_region: str = "",
-                      db: str | None = None) -> float:
-    """Read-only convenience for callers (and the bandit selector's tests):
-    return the most-specific z_score_advantage for ``lane`` in the slice, or
-    0.0 if no row clears the sample floor."""
-    min_samples = int(os.environ.get("MO_LEARNING_MIN_SAMPLES", "3"))
-    con = sqlite3.connect(_db_path(db))
-    try:
-        if objective_domain and code_region:
-            row = con.execute(
-                "SELECT z_score_advantage FROM lane_region_advantage "
-                "WHERE agent_version_id=? AND task_class=? AND node_type=? "
-                "AND objective_domain=? AND code_region=? AND runs_count>=? "
-                "ORDER BY runs_count DESC LIMIT 1",
-                (lane, task_class, node_type or "", objective_domain,
-                 code_region, min_samples)).fetchone()
-            if row:
-                return float(row[0] or 0.0)
-        if objective_domain:
-            row = con.execute(
-                "SELECT z_score_advantage FROM lane_domain_advantage "
-                "WHERE agent_version_id=? AND task_class=? AND node_type=? "
-                "AND objective_domain=? AND runs_count>=? "
-                "ORDER BY runs_count DESC LIMIT 1",
-                (lane, task_class, node_type or "", objective_domain, min_samples)).fetchone()
-            if row:
-                return float(row[0] or 0.0)
-    finally:
-        con.close()
-    return 0.0

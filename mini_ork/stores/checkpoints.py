@@ -37,7 +37,6 @@ Public API:
   hash_file(path) -> str
       sha256 hex of a file's bytes; returns "" on any error (caller
       decides what to do).
-  sha256_bytes(b) -> str
       Convenience for hashing an in-memory blob.
 
 Reader pattern (E2 will use this, E1 just needs it for tests):
@@ -63,7 +62,6 @@ __all__ = [
     "write_checkpoint",
     "is_node_reusable",
     "hash_file",
-    "sha256_bytes",
     "compute_artifact_manifest",
 ]
 
@@ -83,9 +81,6 @@ def _open(db: str) -> sqlite3.Connection:
     con.execute(f"PRAGMA busy_timeout={_DEFAULT_BUSY_MS}")
     return con
 
-
-def sha256_bytes(b: bytes) -> str:
-    return hashlib.sha256(b).hexdigest()
 
 
 def hash_file(path: str) -> str:
