@@ -15,6 +15,14 @@ dir whose ``lib/healer.sh`` echoes a fixture JSON and whose
 *function itself* is the real one — only its surroundings are
 substituted.
 
+WS5 cutover: the Python bridge no longer shells out — it calls the
+staged native ports ``mini_ork.recovery.healer.decide`` and
+``mini_ork.recovery.cleaner.main`` in-process (module seams
+``mhb._healer`` / ``mhb._cleaner``). The Python half of each e2e test
+therefore monkeypatches those seams with the SAME fixture the bash
+side's stub scripts serve, so both halves still exercise the identical
+decision branch.
+
 Cases (>=6):
   (a) parse_healer_output + classify_recovery — six fixture shapes
       (empty, non-JSON, missing fields, full, integer lesson_id, null).
@@ -323,7 +331,12 @@ def test_e2e_non_auto_apply_branches(tmp_path, monkeypatch, recovery,
     bash_rc = _bash_rc(proc)
     assert bash_rc == 1, f"recovery={recovery} bash_rc={bash_rc} stderr={proc.stderr}"
 
-    # Python
+    # Python — same fixture through the native healer seam (WS5).
+    monkeypatch.setattr(
+        mhb._healer, "decide",
+        lambda *a, **k: (0, fixture if fixture.endswith("\n")
+                         else fixture + "\n", ""),
+    )
     py_rc = mhb.mo_run_healer_on_escalate("epic-1", str(run_dir))
     assert py_rc == 1, f"recovery={recovery} py_rc={py_rc}"
 
@@ -378,6 +391,12 @@ def test_e2e_healer_missing(tmp_path, monkeypatch):
     assert bash_rc == 1
     assert "mo-healer not executable" in proc.stderr
 
+    # Python — the native healer port is always importable, so the
+    # "missing script" scenario maps to the port raising (e.g. stripped
+    # install): the bridge treats it as empty output → rc 1 (WS5).
+    def _boom(*a, **k):
+        raise OSError("healer port unavailable")
+    monkeypatch.setattr(mhb._healer, "decide", _boom)
     py_rc = mhb.mo_run_healer_on_escalate("epic-m", str(run_dir))
     assert py_rc == 1
 
@@ -403,11 +422,27 @@ def test_e2e_cleaner_on_main_success(tmp_path, monkeypatch):
     assert "cleaner-on-main succeeded for epic-clean" in bash_proc.stderr
 
     # Python — on its own run_dir so we can compare detective.json shape
-    # against bash's output side-by-side.
+    # against bash's output side-by-side. Native seams stubbed with the
+    # same fixture + a cleaner that mirrors the stub script's rc (WS5).
     py_run_dir = tmp_path / "py_run_dir"
     py_run_dir.mkdir()
+    monkeypatch.setattr(
+        mhb._healer, "decide",
+        lambda *a, **k: (0, fixture_path.read_text() + "\n", ""),
+    )
+    cleaner_calls = []
+    monkeypatch.setattr(
+        mhb._cleaner, "main",
+        lambda argv: (cleaner_calls.append(list(argv)), 0)[1],
+    )
     py_rc = mhb.mo_run_healer_on_escalate("epic-clean", str(py_run_dir))
     assert py_rc == 0
+    # The native cleaner seam received (brief_path, bridge_dir) exactly as
+    # the bash subprocess argv did.
+    assert cleaner_calls == [
+        [str(py_run_dir / "healer-cleaner" / "detective.json"),
+         str(py_run_dir / "healer-cleaner")]
+    ]
 
     # Both sides wrote detective.json with the same keys (the bash-written
     # file uses jq -n ordering; Python uses dict insertion order).
@@ -454,6 +489,11 @@ def test_e2e_cleaner_on_main_failure(tmp_path, monkeypatch):
     assert bash_rc == 1, f"stderr={bash_proc.stderr}"
     assert "cleaner-on-main failed" in bash_proc.stderr
 
+    monkeypatch.setattr(
+        mhb._healer, "decide",
+        lambda *a, **k: (0, fixture_path.read_text() + "\n", ""),
+    )
+    monkeypatch.setattr(mhb._cleaner, "main", lambda argv: 2)
     py_rc = mhb.mo_run_healer_on_escalate("epic-cfail", str(run_dir))
     assert py_rc == 1
 
@@ -485,7 +525,12 @@ def test_e2e_wait_and_retry_clamps(monkeypatch, tmp_path):
     # Bash sleep stub echoes the first arg; clamp brings 5 → 10.
     assert bash_proc.stdout.strip().startswith("10"), bash_proc.stdout
 
-    # Python — monkeypatch time.sleep so we capture the requested wait.
+    # Python — stub the native healer seam with the same fixture (WS5),
+    # and monkeypatch time.sleep so we capture the requested wait.
+    monkeypatch.setattr(
+        mhb._healer, "decide",
+        lambda *a, **k: (0, fixture_path.read_text() + "\n", ""),
+    )
     captured: list[int] = []
     import time as _time
     monkeypatch.setattr(_time, "sleep", lambda s: captured.append(int(s)))

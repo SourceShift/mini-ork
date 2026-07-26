@@ -6,8 +6,17 @@ out (network ops); the ported logic is the MO_OPEN_PR gate, idempotence
 (existing epics.pr_url short-circuit), the soft-skip pre-flight ladder, the
 title/body builders, and the create → view-fallback → persist flow.
 
-    open_pr(epic_id, branch, kickoff_path="", *, repo_root, state_db)
+    open_pr(epic_id, branch, kickoff_path="", *, repo_root, state_db, chatter=None)
         -> (rc, url)   rc: 0 ok / 1 permanent failure / 2 not-configured
+
+``chatter`` (optional list) mirrors the one piece of bash ``mo_open_pr``
+stdout that is NOT the URL: the `git push -u origin <branch> 2>&1 | sed
+'s/^/  [pr-create] /'` lines, which land on the function's stdout BEFORE
+the URL (and even on the push-failure path — pipefail makes the `||
+return 1` fire, but the sed-prefixed output is already emitted). Callers
+that capture bash stdout byte-faithfully (``recovery.finalize``'s
+Next-actions block) pass a list and receive those lines in order; the
+default None keeps the port silent (parity-suite behaviour).
 """
 from __future__ import annotations
 
@@ -58,7 +67,8 @@ def build_body(epic_id, kickoff_path) -> str:
 
 
 def open_pr(epic_id: str, branch: str, kickoff_path: str = "", *,
-            repo_root: str, state_db: str) -> tuple[int, str]:
+            repo_root: str, state_db: str,
+            chatter: "list[str] | None" = None) -> tuple[int, str]:
     if os.environ.get("MO_OPEN_PR", "0") != "1":
         return 2, ""
 
@@ -80,8 +90,17 @@ def open_pr(epic_id: str, branch: str, kickoff_path: str = "", *,
         return 1, ""
     if subprocess.run(["git", "-C", repo_root, "ls-remote", "--exit-code", "--heads",
                        "origin", branch], capture_output=True).returncode != 0:
-        if subprocess.run(["git", "-C", repo_root, "push", "-u", "origin", branch],
-                          capture_output=True).returncode != 0:
+        push = subprocess.run(["git", "-C", repo_root, "push", "-u", "origin", branch],
+                              capture_output=True, text=True)
+        if chatter is not None:
+            # bash: git push ... 2>&1 | sed 's/^/  [pr-create] /' — the pipe
+            # preserves ARRIVAL order; git's push report ("To …", the
+            # " * [new branch]" line) goes to unbuffered stderr and lands
+            # BEFORE the buffered-stdout "set up to track" line.
+            for chunk in (push.stderr, push.stdout):
+                for line in chunk.splitlines():
+                    chatter.append(f"  [pr-create] {line}")
+        if push.returncode != 0:
             return 1, ""
 
     title = build_title(epic_id, kickoff_path, state_db)
