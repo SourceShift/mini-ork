@@ -452,7 +452,7 @@ def _run_lifecycle(argv, root) -> int:
             pass
 
     # ── rubric pre-screen (advisory, native side-channel) ──
-    if os.environ.get("MO_RUBRIC", "1") == "1" and _run_dir and os.path.isdir(_run_dir):
+    if _should_run_rubric(_run_dir):
         sys.stdout.write("── rubric (advisory pre-screen) ──\n")
         try:
             # The parity port contains real print() calls; keep the launcher's
@@ -510,6 +510,22 @@ def _run_lifecycle(argv, root) -> int:
     except Exception:
         pass
     return run_rc
+
+
+def _should_run_rubric(run_dir: str) -> bool:
+    """Return whether the provider-backed rubric side channel may run.
+
+    A dry run may create plans and local artifacts, but it must not invoke a
+    model-provider CLI.  The rubric prescreen shells out to one, so keep it
+    out of that lifecycle while preserving the existing MO_RUBRIC opt-out for
+    real runs.
+    """
+    return (
+        os.environ.get("MO_RUBRIC", "1") == "1"
+        and os.environ.get("MINI_ORK_DRY_RUN", "0") != "1"
+        and bool(run_dir)
+        and os.path.isdir(run_dir)
+    )
 
 
 def main(argv=None, *, root=None) -> int:
