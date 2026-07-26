@@ -8,8 +8,9 @@ Bash-side contract this port mirrors (verbatim from bin/mini-ork-invoke-prompt):
   - Placeholder substitution: {{[A-Z][A-Z0-9_]*}} -> os.environ[name]; missing
     var leaves the token verbatim (matches bash's `os.environ.get(name,
     match.group(0))` heredoc).
-  - LLM dispatch is owned by ``mini_ork.dispatch.llm_dispatch``. Trace-store is
-    still a Bash peer and remains a separate migration seam.
+  - LLM dispatch is owned by ``mini_ork.dispatch.llm_dispatch``; trace writes
+    go through the native ``mini_ork.trace_store.trace_write`` (bash
+    ``lib/trace_store.sh`` retired at this call site).
   - Exit codes: 0 success, 1 llm-failure, 2 bad-args (prompt file missing OR
     env var unset).
   - Output: bash's `RESPONSE=$(... 2>&1)` strips trailing newlines, then
@@ -26,8 +27,6 @@ import hashlib
 import io
 import os
 import re
-import shlex
-import subprocess
 import sys
 import time as _time
 from collections.abc import Callable, Iterator
@@ -117,18 +116,21 @@ def _build_prompt_text(
     return prompt_text
 
 
-def _trace_write(mini_ork_root: Path, payload: str, env: dict) -> None:
-    """Delegate to bash trace_write (not yet ported). Best-effort, never raises."""
-    lib = mini_ork_root / "lib" / "trace_store.sh"
-    if not lib.is_file():
-        return
+def _trace_write(payload: str, env: dict) -> None:
+    """Write a trace via the native trace_store (bash trace_write retired here).
+
+    Best-effort, never raises — mirrors bash's `>/dev/null 2>&1 || true`.
+    Runs inside the invocation env so the payload-independent lineage fallbacks
+    (MINI_ORK_TASK_RUN_ID / MINI_ORK_RUN_ID / MINI_ORK_WORKFLOW_VERSION_ID /
+    MO_NODE_PROMPT_SHA / MINI_ORK_DB) resolve exactly as they did in the
+    former bash subprocess env.
+    """
+    from mini_ork import trace_store
+
     try:
-        subprocess.run(
-            ["bash", "-c", f'. "{lib}" && trace_write {shlex.quote(payload)}'],
-            env=env, capture_output=True,
-        )
+        with _temporary_environ(env):
+            trace_store.trace_write(payload)
     except Exception:
-        # bash's `>/dev/null 2>&1 || true` is best-effort — mirror by swallowing.
         return
 
 
@@ -239,7 +241,7 @@ def invoke(
         '"status":"running",'
         '"prompt_version_hash":"' + _prompt_version_hash(prompt_text) + '"}'
     )
-    _trace_write(root, running_payload, sub_env)
+    _trace_write(running_payload, sub_env)
 
     # Invoke llm_dispatch.
     rc, response = _llm_dispatch(
@@ -250,7 +252,7 @@ def invoke(
         failure_payload = (
             '{"trace_id":"' + trace_id + '","status":"failure"}'
         )
-        _trace_write(root, failure_payload, sub_env)
+        _trace_write(failure_payload, sub_env)
         return 1, response
 
     # Mirror bash: `printf '%s\n' "$RESPONSE"` = strip trailing newlines, add one.
@@ -259,7 +261,7 @@ def invoke(
     success_payload = (
         '{"trace_id":"' + trace_id + '","status":"success"}'
     )
-    _trace_write(root, success_payload, sub_env)
+    _trace_write(success_payload, sub_env)
     return 0, out
 
 

@@ -32,6 +32,15 @@ INIT_SH = REPO / "db" / "init.sh"
 PY_MODULE = "mini_ork.cli.reflect"
 
 FIXED_SINCE = "1700000000"
+
+
+def test_reflect_has_no_bash_trace_store_dependency() -> None:
+    """WS3 guard: reflect's trace-start/trace-end writes are native now — no
+    `_trace_write_bash` helper and no subprocess shell-out to lib/trace_store.sh."""
+    src = (REPO / "mini_ork" / "cli" / "reflect.py").read_text()
+    assert "_trace_write_bash" not in src
+    assert "import subprocess" not in src
+    assert "subprocess.run" not in src
 EXPECTED_HELP = (
     "Usage: mini-ork reflect [--since <timestamp>] [--task-class <name>] [--dry-run]\n"
     "\n"
