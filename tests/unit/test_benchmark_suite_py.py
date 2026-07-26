@@ -392,6 +392,9 @@ def test_results_returns_rows_parity(db):
 
 # ─────────────────────────────────────────────────────────────────────────────
 # (i) run with a fake runner_fn — util_score=0.5 + passed=True (all_pass=True)
+# WS5: the bash side keeps the legacy snippet runner (ground truth); the
+# python side uses the native callable-runner contract with the same
+# stdout-equivalent payload — summaries must match modulo ran_at.
 # ─────────────────────────────────────────────────────────────────────────────
 def test_run_with_runner_fn_parity(db):
     _which_bash()
@@ -426,8 +429,14 @@ def test_run_with_runner_fn_parity(db):
     )
     bash_summary = json.loads(r.stdout.strip())
 
-    # python side
-    py_summary = bench.run("cand-runner", runner_fn=runner, db=db)
+    # python side — WS5: the native runner contract. A callable returning
+    # a string is the stdout-equivalent of the bash snippet; the parse
+    # pipeline (json.loads → utility_score/passed) is the shared code path.
+    py_summary = bench.run(
+        "cand-runner",
+        runner_fn=lambda t: '{"utility_score":0.5,"passed":true}',
+        db=db,
+    )
 
     # Volatile: ran_at differs by seconds — strip before compare
     for obj in (bash_summary, py_summary):
@@ -482,3 +491,88 @@ def test_run_empty_task_table_parity(db):
 
     # The ported contract: live bash and port agree total_tasks == 0.
     assert bash_summary["total_tasks"] == py_summary["total_tasks"] == 0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# (k) [WS5] native runner shapes — dict / (rc, stdout) tuple / exception
+# ─────────────────────────────────────────────────────────────────────────────
+def test_run_native_callable_runner_shapes(db):
+    bench.add('{"id":"bt-nc1","task_class":"u","baseline_utility_score":0.1}',
+              db=db)
+    bench.add('{"id":"bt-nc2","task_class":"u","baseline_utility_score":0.2}',
+              db=db)
+
+    seen = []
+
+    def dict_runner(t):
+        seen.append(t["benchmark_id"])
+        return {"utility_score": 0.7, "passed": True}
+
+    summary = bench.run("cand-nc-dict", runner_fn=dict_runner, db=db)
+    assert sorted(seen) == ["bt-nc1", "bt-nc2"]
+    assert summary["all_pass"] is True
+    assert abs(summary["avg_utility_score"] - 0.7) <= _FLOAT_TOL
+    for r in summary["results"]:
+        assert r["passed"] is True
+        assert r["error"] is None
+
+    def tuple_runner(t):
+        # (rc, stdout) — bash subprocess semantics
+        return (0, '{"utility_score":0.3,"passed":false}')
+
+    summary2 = bench.run("cand-nc-tuple", runner_fn=tuple_runner, db=db)
+    assert summary2["passed"] == 0
+    assert all(abs(r["utility_score"] - 0.3) <= _FLOAT_TOL
+               for r in summary2["results"])
+
+    def boom(t):
+        raise RuntimeError("runner exploded")
+
+    summary3 = bench.run("cand-nc-boom", runner_fn=boom, db=db)
+    assert summary3["passed"] == 0
+    assert all(r["error"] == "runner exploded" for r in summary3["results"])
+    assert all(r["passed"] is False for r in summary3["results"])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# (l) [WS5] string "utility_score" → staged mini_ork.learning.utility_function
+# ─────────────────────────────────────────────────────────────────────────────
+def test_run_utility_score_string_native(db):
+    from mini_ork.learning import utility_function as uf
+
+    bench.add(
+        '{"id":"bt-us1","task_class":"u","success":true,"verifier_score":0.8,'
+        '"quality_score":0.6,"cost_usd":0.1,"max_cost_usd":1.0,'
+        '"duration_ms":100,"max_duration_ms":1000}',
+        db=db,
+    )
+    summary = bench.run("cand-us", runner_fn="utility_score", db=db)
+    r = summary["results"][0]
+    # The emulated stdout is the bare float f"{U:.6f}" — the shared parse
+    # path then behaves exactly like the bash one: json.loads succeeds
+    # (float), data.get raises, so util falls back to 1.0 when passed.
+    assert r["passed"] is True
+    assert r["error"] is None
+    assert abs(r["utility_score"] - 1.0) <= _FLOAT_TOL
+    # Cross-check the score the native port computed on the task payload —
+    # the DB row carries no flat success/verifier fields, so the default
+    # formula applies: 0.45*0 + 0.20*0 + 0.15*0.5 (quality default) = 0.075.
+    task = [t for t in bench.list_(db=db) if t["benchmark_id"] == "bt-us1"][0]
+    expected = uf.score(json.dumps(task))
+    assert 0.0 <= expected <= 1.0
+    assert abs(expected - 0.075) <= 1e-6
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# (m) [WS5] legacy shell-snippet runner_fn → graceful per-task error (no bash)
+# ─────────────────────────────────────────────────────────────────────────────
+def test_run_legacy_snippet_rejected(db):
+    bench.add('{"id":"bt-lg1","task_class":"u","baseline_utility_score":0.1}',
+              db=db)
+    summary = bench.run("cand-lg", runner_fn="echo hi", db=db)
+    assert summary["total_tasks"] == 1
+    assert summary["passed"] == 0
+    r = summary["results"][0]
+    assert r["passed"] is False
+    assert "shell snippet" in r["error"]
+    assert r["utility_score"] == 0.0
