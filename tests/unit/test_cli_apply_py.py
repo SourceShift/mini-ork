@@ -17,7 +17,7 @@ reference; these tests pin the ported behaviour against tmp sqlite fixtures:
  10. apply_run: enabled promote rewrites the target file + version_registry row
  11. apply_run: forced regression quarantines (file untouched)
  12. CLI: --help / usage errors / missing-flag-value exit codes
- 13. Native integration: apply is in _NATIVE_SUBS, not _EXEC_SUBS, and the
+ 13. Native integration: apply is in _NATIVE_SUBS, native dispatch (_EXEC_SUBS deleted), and the
      SUBCOMMAND_REGISTRY handler dispatches ``python -m mini_ork.cli.apply``.
 """
 from __future__ import annotations
@@ -455,12 +455,12 @@ def test_cli_main_end_to_end_no_candidate(db, tmp_path, capsys, envscrub):
 
 def test_apply_is_native_in_dispatcher(tmp_path, envscrub):
     assert "apply" in cli_main._NATIVE_SUBS
-    assert "apply" not in cli_main._EXEC_SUBS
+    assert not hasattr(cli_main, "_EXEC_SUBS"), "apply must dispatch natively — the bash trampoline set is gone"
 
     handler = cli_main.SUBCOMMAND_REGISTRY["apply"]
     # The handler must be a native-module handler (python -m mini_ork.cli.apply),
     # not the retired bin/mini-ork-apply bash trampoline.
-    assert handler is not cli_main._bash_entrypoint_handler("apply")
+    assert not hasattr(cli_main, "_bash_entrypoint_handler")
     envscrub.setenv("MINI_ORK_DB", str(tmp_path / "state.db"))
     rc = handler(["--help"], str(REPO))
     assert rc == 0
