@@ -199,7 +199,7 @@ def test_empty_recipes_dir_still_exits_zero(env, capsys):
 def test_recipe_eval_is_registered_natively():
     # The dash is not importable in a module name, so recipe-eval lives in the
     # explicit registry (mapped to mini_ork.cli.recipe_eval), not _NATIVE_SUBS.
-    assert "recipe-eval" not in cli._EXEC_SUBS
+    assert not hasattr(cli, "_EXEC_SUBS"), "recipe-eval must dispatch natively — the bash trampoline set is gone"
     assert "recipe-eval" in cli.SUBCOMMAND_REGISTRY
 
 
