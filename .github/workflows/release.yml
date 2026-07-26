@@ -29,7 +29,7 @@ jobs:
 
       - name: "Pytest smoke (unit layer)"
         run: |
-          pip install -e ".[yaml]" pytest fastapi uvicorn
+          pip install -e ".[yaml]" pytest fastapi uvicorn httpx2
           sudo apt-get update -qq && sudo apt-get install -y sqlite3 jq
           ./bin/mini-ork init
           python -m pytest tests/unit -q -p no:cacheprovider
