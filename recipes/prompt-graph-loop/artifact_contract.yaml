@@ -1,0 +1,42 @@
+task_class: prompt_graph_loop
+expected_artifact: composite
+
+success_verifiers:
+  - verifiers/graph-contract.sh
+  - verifiers/human-decision.sh
+
+failure_policy: escalate
+rollback_policy: keep_prompt_graph_evidence_and_decision_artifacts
+
+source_artifact: dspy-program.py
+outputs:
+  - path: "${MINI_ORK_RUN_DIR}/prompt-brief.json"
+    mime: application/json
+    description: Normalized user goal, constraints, and desired artifact.
+  - path: "${MINI_ORK_RUN_DIR}/semantic-signals.json"
+    mime: application/json
+    description: Tasks, actors, artifacts, risks, and missing context.
+  - path: "${MINI_ORK_RUN_DIR}/source-corpus.json"
+    mime: application/json
+    description: Retrieved source manifest with count, URLs, publication dates, and retrieval dates.
+  - path: "${MINI_ORK_RUN_DIR}/agent-graph.json"
+    mime: application/json
+    description: The generated agent graph and its output contract.
+  - path: "${MINI_ORK_RUN_DIR}/draft-artifact.md"
+    mime: text/markdown
+    description: Draft artifact generated from the graph.
+  - path: "${MINI_ORK_RUN_DIR}/verification-report.json"
+    mime: application/json
+    description: Claim, graph, and output-contract review report.
+  - path: "${MINI_ORK_RUN_DIR}/refinement-prompt.md"
+    mime: text/markdown
+    description: Smallest repair prompt derived from verifier findings.
+  - path: "${MINI_ORK_RUN_DIR}/human-review-packet.md"
+    mime: text/markdown
+    description: Operator packet containing the graph, draft, and verifier report.
+  - path: "${MINI_ORK_RUN_DIR}/human-decision.json"
+    mime: application/json
+    description: Durable operator approval or feedback decision.
+  - path: "${MINI_ORK_RUN_DIR}/dspy-program.py"
+    mime: text/x-python
+    description: DSPy signatures and modules exported from the approved graph.

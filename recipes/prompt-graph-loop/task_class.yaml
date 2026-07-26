@@ -1,0 +1,36 @@
+name: prompt_graph_loop
+task_class: prompt_graph_loop
+version: "0.1.0"
+description: >
+  Convert a natural-language request into an approved agent graph, a verified
+  draft artifact, and a DSPy program. The recipe preserves a durable artifact
+  trail across recursive repair and human feedback.
+
+artifact_contract_ref: artifact_contract.yaml
+default_workflow: workflow.yaml
+
+matches:
+  keywords:
+    - prompt graph
+    - dspy workflow
+    - agent loop
+    - recursive agent plan
+    - graph to dspy
+  regex:
+    - "DSPy"
+    - "agent graph"
+  path_globs:
+    - "recipes/prompt-graph-loop/**"
+
+default_gates:
+  - budget_gate
+  - scope_gate
+
+risk_class: high
+max_parallel_runs: 1
+budget_cap_usd: 20
+tags:
+  - artifact-graph
+  - dspy
+  - human-feedback
+  - recursive
