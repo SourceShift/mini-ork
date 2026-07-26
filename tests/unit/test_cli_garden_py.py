@@ -4,7 +4,7 @@ The unit tests drive the ported logic against tmp fixtures (recipes tree,
 .mini-ork home, target repo) and assert the exact stderr/stdout/exit-code
 contract of the retired ``bin/mini-ork-garden``. The integration tests prove
 ``mini-ork garden`` is dispatched natively (registered in ``_NATIVE_SUBS``,
-absent from ``_EXEC_SUBS``) and that ``python3 -m mini_ork.cli.garden
+native dispatch — ``_EXEC_SUBS`` is deleted) and that ``python3 -m mini_ork.cli.garden
 --help`` exits 0 without any ``bin/mini-ork-*`` entrypoint.
 """
 from __future__ import annotations
@@ -233,7 +233,7 @@ def test_orphan_stash_prints_but_does_not_count(env, capsys, tmp_path):
 
 def test_garden_is_registered_natively():
     assert "garden" in cli._NATIVE_SUBS
-    assert "garden" not in cli._EXEC_SUBS
+    assert not hasattr(cli, "_EXEC_SUBS"), "garden must dispatch natively — the bash trampoline set is gone"
     assert "garden" in cli.SUBCOMMAND_REGISTRY
 
 

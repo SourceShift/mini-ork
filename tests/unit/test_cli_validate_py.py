@@ -4,7 +4,7 @@ The unit tests drive the ported checks against tmp fixtures (kickoff files,
 recipe manifests, agents.yaml, providers.yaml) and assert the exact
 stderr/stdout/exit-code contract of the retired ``bin/mini-ork-validate``.
 The integration tests prove ``mini-ork validate`` is dispatched natively
-(registered in ``_NATIVE_SUBS``, absent from ``_EXEC_SUBS``) and that
+(registered in ``_NATIVE_SUBS``, native dispatch — ``_EXEC_SUBS`` is deleted) and that
 ``python3 -m mini_ork.cli.validate --help`` exits 0 without any
 ``bin/mini-ork-*`` entrypoint.
 """
@@ -264,7 +264,7 @@ def test_infer_recipe_maps_task_class_underscores_to_dashes(tmp_path):
 
 def test_validate_is_registered_natively():
     assert "validate" in cli._NATIVE_SUBS
-    assert "validate" not in cli._EXEC_SUBS
+    assert not hasattr(cli, "_EXEC_SUBS"), "validate must dispatch natively — the bash trampoline set is gone"
     assert "validate" in cli.SUBCOMMAND_REGISTRY
 
 
