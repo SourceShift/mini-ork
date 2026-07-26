@@ -7,7 +7,7 @@ import mini_ork.cli.execute as ex
 
 def test_registry_covers_builtin_node_types():
     assert set(ex.NODE_HANDLER_REGISTRY) == {
-        "researcher", "implementer", "reviewer", "verifier", "publisher", "rollback"}
+        "researcher", "transform", "implementer", "reviewer", "verifier", "publisher", "rollback"}
     assert set(ex.EARLY_NODE_HANDLERS) == {"planner", "reflector"}
 
 

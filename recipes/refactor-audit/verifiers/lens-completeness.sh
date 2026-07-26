@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# verifiers/lens-completeness.sh — verify all 4 lens reports + synthesis
+# verifiers/lens-completeness.sh — verify all 5 lens reports + anonymous synthesis
 # exist, are non-empty, and cite at least one file:line anchor.
 #
 # Inputs (via env):
@@ -20,7 +20,7 @@ exec 3>"$EVIDENCE"
 missing=()
 findings_total=0
 
-for lens in glm kimi codex opus; do
+for lens in glm kimi codex opus minimax; do
   f="$RUN_DIR/lens-$lens.md"
   if [ ! -f "$f" ]; then
     echo "MISSING: $f" >&3
@@ -40,14 +40,25 @@ for lens in glm kimi codex opus; do
   findings_total=$((findings_total + lines))
 done
 
-# Synthesis must exist + cross-reference all 4 lenses
+# The deterministic transform must materialize exactly one anonymous response
+# per lens. It may preserve evidence text but must not expose source filenames
+# through the consumer-facing response headings.
+panel="$RUN_DIR/panel-responses.md"
+if [ ! -f "$panel" ]; then
+  missing+=("panel-responses.md")
+elif [ "$(grep -cE '^## Response [A-E]$' "$panel" || true)" -ne 5 ]; then
+  missing+=("panel-responses.md (expected Response A through Response E)")
+fi
+
+# Synthesis must exist + cross-reference all five anonymous responses. The
+# synthesizer is deliberately not expected to reveal or recover lane identity.
 synth="$RUN_DIR/synthesis.md"
 if [ ! -f "$synth" ]; then
   missing+=("synthesis.md")
 else
-  for lens in glm kimi codex opus; do
-    if ! grep -qE "(lens-)?$lens" "$synth"; then
-      missing+=("synthesis.md (no reference to $lens lens)")
+  for response in A B C D E; do
+    if ! grep -q "Response $response\|$response-[0-9]" "$synth"; then
+      missing+=("synthesis.md (no reference to Response $response)")
     fi
   done
 fi

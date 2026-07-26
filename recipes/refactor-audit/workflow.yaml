@@ -1,40 +1,83 @@
-version: "0.1.0"
+version: "0.2.0"
 task_class: refactor_audit
 description: >
-  Multi-model audit recipe — 4 lens stances run in parallel
-  (glm/kimi/codex/opus) with opus AS ARCHITECTURAL LENS,
-  1 synthesis pass composes findings, publisher emits final audit doc.
+  Multi-model audit recipe: five parallel lenses produce declared reports,
+  a deterministic transform anonymizes the panel, synthesis consumes only the
+  anonymous bundle, and the publisher emits the final audit document.
 
 nodes:
-  - { name: planner,        type: planner,     model_lane: planner,      prompt_ref: prompts/planner.md,  dispatch_mode: serial }
-  # v0.2-pt14 (D-047): each lens routes to its NAMED family lane for
-  # heterogeneous-family review. Rajan 2025 motivates low-correlation
-  # detectors; Nasser 2026 motivates treating judge disposition as real.
-  # Was: 3 of 4 lenses collapsed to
-  # Sonnet via decomposer/spec_author/worker mapping — coalition by
-  # accident. Now: glm/kimi/codex/opus dispatch to 4 distinct families.
-  - { name: glm_lens,       type: researcher,  model_lane: glm_lens,     prompt_ref: prompts/lens-glm.md,    dispatch_mode: parallel, gates: [budget_gate] }
-  - { name: kimi_lens,      type: researcher,  model_lane: kimi_lens,    prompt_ref: prompts/lens-kimi.md,   dispatch_mode: parallel, gates: [budget_gate] }
-  - { name: codex_lens,     type: researcher,  model_lane: codex_lens,   prompt_ref: prompts/lens-codex.md,  dispatch_mode: parallel, gates: [budget_gate] }
-  - { name: opus_lens,      type: researcher,  model_lane: opus_lens,    prompt_ref: prompts/lens-opus.md,   dispatch_mode: parallel, gates: [budget_gate] }
-  # 5th lens (2026-06-25): MiniMax cross-system integration / data-flow tracing stance.
-  - { name: minimax_lens,   type: researcher,  model_lane: minimax_lens, prompt_ref: prompts/lens-minimax.md, dispatch_mode: parallel, gates: [budget_gate] }
-  - { name: synthesizer,    type: reviewer,    model_lane: reviewer,     prompt_ref: prompts/synthesis.md,    dispatch_mode: serial,   gates: [budget_gate] }
+  - { name: planner, type: planner, model_lane: planner, prompt_ref: prompts/planner.md, dispatch_mode: serial }
+  # Each lens retains its heterogeneous lane, but its report is an explicit
+  # contract output rather than an implicit path guessed by the synthesizer.
+  - name: glm_lens
+    type: researcher
+    model_lane: glm_lens
+    prompt_ref: prompts/lens-glm.md
+    dispatch_mode: parallel
+    gates: [budget_gate]
+    outputs: [{ name: report, kind: markdown, path: lens-glm.md }]
+  - name: kimi_lens
+    type: researcher
+    model_lane: kimi_lens
+    prompt_ref: prompts/lens-kimi.md
+    dispatch_mode: parallel
+    gates: [budget_gate]
+    outputs: [{ name: report, kind: markdown, path: lens-kimi.md }]
+  - name: codex_lens
+    type: researcher
+    model_lane: codex_lens
+    prompt_ref: prompts/lens-codex.md
+    dispatch_mode: parallel
+    gates: [budget_gate]
+    outputs: [{ name: report, kind: markdown, path: lens-codex.md }]
+  - name: opus_lens
+    type: researcher
+    model_lane: opus_lens
+    prompt_ref: prompts/lens-opus.md
+    dispatch_mode: parallel
+    gates: [budget_gate]
+    outputs: [{ name: report, kind: markdown, path: lens-opus.md }]
+  - name: minimax_lens
+    type: researcher
+    model_lane: minimax_lens
+    prompt_ref: prompts/lens-minimax.md
+    dispatch_mode: parallel
+    gates: [budget_gate]
+    outputs: [{ name: report, kind: markdown, path: lens-minimax.md }]
+  - name: anonymize_panel
+    type: transform
+    transform: panel.anonymize@v1
+    dispatch_mode: serial
+    inputs:
+      reports: { required: true, many: true }
+    outputs:
+      - { name: panel_responses, kind: markdown, path: panel-responses.md }
+      - { name: label_map, kind: json, path: workspace/system/anonymize-panel/label-map.json, visibility: system_only }
+  - name: synthesizer
+    type: reviewer
+    model_lane: reviewer
+    prompt_ref: prompts/synthesis.md
+    dispatch_mode: serial
+    gates: [budget_gate]
+    inputs:
+      panel_reports: { required: true }
+    outputs: [{ name: synthesis, kind: markdown, path: synthesis.md }]
   - { name: lens_completeness, type: verifier, verifier_ref: verifiers/lens-completeness.sh, dispatch_mode: serial }
-  - { name: publisher,      type: publisher,   prompt_ref: null, dispatch_mode: serial, gates: [scope_gate] }
-  - { name: rollback,       type: rollback,    prompt_ref: null, dispatch_mode: serial }
+  - { name: publisher, type: publisher, prompt_ref: null, dispatch_mode: serial, gates: [scope_gate] }
+  - { name: rollback, type: rollback, prompt_ref: null, dispatch_mode: serial }
 
 edges:
-  - { from: planner, to: glm_lens,   edge_type: depends_on }
-  - { from: planner, to: kimi_lens,  edge_type: depends_on }
+  - { from: planner, to: glm_lens, edge_type: depends_on }
+  - { from: planner, to: kimi_lens, edge_type: depends_on }
   - { from: planner, to: codex_lens, edge_type: depends_on }
-  - { from: planner, to: opus_lens,  edge_type: depends_on }
+  - { from: planner, to: opus_lens, edge_type: depends_on }
   - { from: planner, to: minimax_lens, edge_type: depends_on }
-  - { from: minimax_lens, to: synthesizer, edge_type: supplies_context_to }
-  - { from: glm_lens,   to: synthesizer, edge_type: supplies_context_to }
-  - { from: kimi_lens,  to: synthesizer, edge_type: supplies_context_to }
-  - { from: codex_lens, to: synthesizer, edge_type: supplies_context_to }
-  - { from: opus_lens,  to: synthesizer, edge_type: supplies_context_to }
+  - { from: glm_lens, to: anonymize_panel, edge_type: supplies_context_to, from_output: report, to_input: reports }
+  - { from: kimi_lens, to: anonymize_panel, edge_type: supplies_context_to, from_output: report, to_input: reports }
+  - { from: codex_lens, to: anonymize_panel, edge_type: supplies_context_to, from_output: report, to_input: reports }
+  - { from: opus_lens, to: anonymize_panel, edge_type: supplies_context_to, from_output: report, to_input: reports }
+  - { from: minimax_lens, to: anonymize_panel, edge_type: supplies_context_to, from_output: report, to_input: reports }
+  - { from: anonymize_panel, to: synthesizer, edge_type: supplies_context_to, from_output: panel_responses, to_input: panel_reports }
   - { from: synthesizer, to: lens_completeness, edge_type: verifies }
   - { from: lens_completeness, to: publisher, edge_type: depends_on }
   - { from: synthesizer, to: rollback, edge_type: escalates_to }

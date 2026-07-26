@@ -160,7 +160,7 @@ A recipe is `workflow.yaml` + `prompts/` + `verifiers/` + an `artifact_contract`
 | `code-fix` | Single-patch fix with typecheck, test, reviewer gates. Minimal reference recipe. |
 | `bdd-first-delivery` | BDD-first multi-epic: decompose → parallel (spec_author + implementer) → bdd_runner → reviewer → publisher. |
 | `docs` | Single-doc edit verified by grep-pattern assertions + relative-link integrity. |
-| `refactor-audit` | 4 lens stances in parallel (glm/kimi/codex/opus); mini-ork's own self-audit recipe. |
+| `refactor-audit` | 5 heterogeneous lenses in parallel, deterministic panel anonymization, then synthesis; mini-ork's own self-audit recipe. |
 | `research-synthesis` | 4-lens research synthesis (web/lit/code/narrative) → synthesizer → publisher. |
 | `post-mvp-delivery` | Discovery-first post-MVP product delivery: parallel research → options → user-gate → implementation. |
 | `recursive-self-improve` | Wall-clock-budgeted self-improvement loop for mini-ork itself. Outer driver: `bin/mini-ork-self-improve`. |
