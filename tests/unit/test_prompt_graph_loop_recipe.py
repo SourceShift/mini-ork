@@ -1,4 +1,4 @@
-"""Contracts for the artifact-led DSPy prompt graph recipe."""
+"""Contracts for the artifact-led prompt graph summary recipe."""
 from __future__ import annotations
 
 import json
@@ -28,34 +28,54 @@ def test_prompt_graph_loop_compiles_with_explicit_artifact_handoffs():
         "draft_executor",
         "verifier_gate",
     )
-    assert {binding.consumer_input for binding in compiled.bindings_for("dspy_exporter")} == {
+    assert {binding.consumer_input for binding in compiled.bindings_for("summary_finalizer")} == {
         "agent_plan",
+        "source_corpus",
+        "draft_artifact",
         "verification_report",
         "human_decision",
+    }
+    assert {binding.consumer_input for binding in compiled.bindings_for("aggregation_document")} == {
+        "final_summaries",
     }
     assert compiled.nodes["semantic_flow_extractor"].inputs["human_feedback"].required is False
     assert compiled.nodes["recursive_plan_composer"].inputs["refinement_prompt"].required is False
     assert "source_corpus" in compiled.nodes["recursive_plan_composer"].inputs
 
 
-def test_recipe_preserves_dspy_feedback_and_approval_routes():
+def test_recipe_preserves_feedback_and_approved_summary_routes():
     import yaml
 
     document = yaml.safe_load((RECIPE / "workflow.yaml").read_text(encoding="utf-8"))
     reflection = _edge(document, "reflection_loop", "recursive_plan_composer")
     feedback = _edge(document, "human_feedback_gate", "semantic_flow_extractor")
-    export = _edge(document, "human_feedback_gate", "dspy_exporter")
+    finalization = _edge(document, "human_feedback_gate", "summary_finalizer")
+    aggregation = _edge(document, "summary_finalizer", "aggregation_document")
 
     assert reflection["recursive"] is True
     assert reflection["from_output"] == "refinement_prompt"
     assert feedback["recursive"] is True
     assert feedback["condition"] == "revise"
     assert feedback["from_output"] == "human_decision"
-    assert export["edge_type"] == "human_decision_gate"
-    assert export["condition"] == "approved"
+    assert finalization["edge_type"] == "human_decision_gate"
+    assert finalization["condition"] == "approved"
+    assert aggregation["from_output"] == "final_summaries"
+    assert aggregation["to_input"] == "final_summaries"
     assert document["recursion"]["max_iterations"] == 5
     assert document["human_decision_artifact"] == "human-review-packet.md"
     assert document["selected_option_artifact"] == "human-decision.json"
+
+
+def test_recipe_terminal_contract_is_summary_aggregation_not_dspy_export():
+    workflow = (RECIPE / "workflow.yaml").read_text(encoding="utf-8").lower()
+    contract = (RECIPE / "artifact_contract.yaml").read_text(encoding="utf-8").lower()
+    readme = (RECIPE / "README.md").read_text(encoding="utf-8").lower()
+
+    assert "dspy" not in workflow
+    assert "dspy" not in contract
+    assert "dspy" not in readme
+    assert "final-summaries.json" in contract
+    assert "source_artifact: aggregation.md" in contract
 
 
 def test_graph_contract_verifier_writes_a_receipt(tmp_path):
@@ -93,7 +113,7 @@ def test_graph_contract_verifier_writes_a_receipt(tmp_path):
     }
 
 
-def test_human_feedback_gate_blocks_export_when_a_human_requests_revision(tmp_path):
+def test_human_feedback_gate_blocks_summary_finalization_when_a_human_requests_revision(tmp_path):
     decision = tmp_path / "human-decision.json"
     decision.write_text(
         json.dumps({"decision": "revise", "approver": "operator", "feedback_delta": "Add sources."}),

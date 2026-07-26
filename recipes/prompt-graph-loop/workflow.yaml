@@ -1,10 +1,11 @@
 version: "0.2.0"
 task_class: prompt_graph_loop
 description: >
-  Artifact-led translation of a DSPy-style agent loop. The initial DAG creates
-  a graph, draft, verification report, and human review packet. Bounded
+  Artifact-led prompt graph loop. The initial DAG creates a graph, source
+  corpus, draft, verification report, and human review packet. Bounded
   recursive edges feed verifier findings or operator feedback into the next
-  graph iteration. Only an approved human decision unlocks DSPy export.
+  graph iteration. Only an approved human decision unlocks finalized summaries
+  and their aggregation document.
 
 nodes:
   - name: prompt_intake
@@ -107,17 +108,29 @@ nodes:
       review_packet: { required: true }
     outputs: [{ name: human_decision, kind: json, path: human-decision.json }]
 
-  - name: dspy_exporter
+  - name: summary_finalizer
     type: researcher
     model_lane: worker
-    prompt_ref: prompts/dspy-exporter.md
+    prompt_ref: prompts/summary-finalizer.md
     dispatch_mode: serial
     gates: [budget_gate, scope_gate]
     inputs:
       agent_plan: { required: true }
+      source_corpus: { required: true }
+      draft_artifact: { required: true }
       verification_report: { required: true }
       human_decision: { required: true }
-    outputs: [{ name: dspy_program, kind: python, path: dspy-program.py }]
+    outputs: [{ name: final_summaries, kind: json, path: final-summaries.json }]
+
+  - name: aggregation_document
+    type: researcher
+    model_lane: worker
+    prompt_ref: prompts/aggregation-document.md
+    dispatch_mode: serial
+    gates: [budget_gate, scope_gate]
+    inputs:
+      final_summaries: { required: true }
+    outputs: [{ name: aggregation, kind: markdown, path: aggregation.md }]
 
   - { name: rollback, type: rollback, prompt_ref: null, dispatch_mode: serial }
 
@@ -137,22 +150,25 @@ edges:
   - { from: reflection_loop, to: recursive_plan_composer, edge_type: retries, recursive: true, from_output: refinement_prompt, to_input: refinement_prompt }
   - { from: human_review_packet, to: human_feedback_gate, edge_type: verifies_user_choice, from_output: review_packet, to_input: review_packet }
   - { from: human_feedback_gate, to: semantic_flow_extractor, edge_type: retries, condition: revise, recursive: true, from_output: human_decision, to_input: human_feedback }
-  - { from: human_feedback_gate, to: dspy_exporter, edge_type: human_decision_gate, condition: approved, from_output: human_decision, to_input: human_decision }
-  - { from: recursive_plan_composer, to: dspy_exporter, edge_type: supplies_context_to, from_output: agent_plan, to_input: agent_plan }
-  - { from: verifier_gate, to: dspy_exporter, edge_type: supplies_context_to, from_output: verification_report, to_input: verification_report }
+  - { from: human_feedback_gate, to: summary_finalizer, edge_type: human_decision_gate, condition: approved, from_output: human_decision, to_input: human_decision }
+  - { from: recursive_plan_composer, to: summary_finalizer, edge_type: supplies_context_to, from_output: agent_plan, to_input: agent_plan }
+  - { from: source_researcher, to: summary_finalizer, edge_type: supplies_context_to, from_output: source_corpus, to_input: source_corpus }
+  - { from: draft_executor, to: summary_finalizer, edge_type: supplies_context_to, from_output: draft_artifact, to_input: draft_artifact }
+  - { from: verifier_gate, to: summary_finalizer, edge_type: supplies_context_to, from_output: verification_report, to_input: verification_report }
+  - { from: summary_finalizer, to: aggregation_document, edge_type: supplies_context_to, from_output: final_summaries, to_input: final_summaries }
   - { from: graph_contract_gate, to: rollback, edge_type: escalates_to, condition: fail }
   - { from: human_feedback_gate, to: rollback, edge_type: escalates_to, condition: fail }
 
 recursion:
   max_iterations: 5
-  convergence_check: human_decision_approved_and_graph_contract_valid
+  convergence_check: human_decision_approved_and_aggregation_complete
   budget_cap_per_iter_usd: 4.00
   budget_cap_total_usd: 20.00
   divergence_kill: >
     Stop and escalate when two consecutive refinement prompts have the same
     SHA-256 or when the human decision is unchanged after two repair passes.
 
-rollback_strategy: keep_all_artifacts_discard_unapproved_dspy_export
+rollback_strategy: keep_all_artifacts_discard_unapproved_aggregation
 human_decision_artifact: human-review-packet.md
 selected_option_artifact: human-decision.json
-source_artifact: dspy-program.py
+source_artifact: aggregation.md

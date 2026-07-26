@@ -1,12 +1,12 @@
 # Prompt Graph Loop
 
-`prompt-graph-loop` turns a natural-language request into a verified,
-human-approved DSPy program without replacing MiniOrk's scheduler, artifact
-ledger, policy, or harness adapters.
+`prompt-graph-loop` turns a natural-language request into verified,
+human-approved final summaries and an aggregation document without replacing
+MiniOrk's scheduler, artifact ledger, policy, or harness adapters.
 
 ## Topology
 
-| Supplied DSPy stage | MiniOrk node | Durable artifact |
+| Workflow stage | MiniOrk node | Durable artifact |
 | --- | --- | --- |
 | PromptIntake | `prompt_intake` | `prompt-brief.json` |
 | SemanticFlowExtractor | `semantic_flow_extractor` | `semantic-signals.json` |
@@ -16,7 +16,8 @@ ledger, policy, or harness adapters.
 | VerifierGate | `verifier_gate` plus `graph_contract_gate` | `verification-report.json` |
 | ReflectionLoop | `reflection_loop` | `refinement-prompt.md` |
 | HumanFeedbackGate | `human_review_packet` plus `human_feedback_gate` | `human-decision.json` |
-| DSPyExporter | `dspy_exporter` | `dspy-program.py` |
+| Summary finalization | `summary_finalizer` | `final-summaries.json` |
+| Aggregation | `aggregation_document` | `aggregation.md` |
 
 Each consumer receives a materialized, hash-checked copy of only its declared
 inputs. `source_researcher` makes corpus requirements explicit: a request for
@@ -28,7 +29,7 @@ semantic extraction.
 ## Runtime Boundary
 
 This recipe is executable for its first graph pass and enforces artifact
-integrity plus export approval. MiniOrk's current generic executor compiles
+integrity plus approval-gated finalization. MiniOrk's current generic executor compiles
 recursive edges but does not yet replay them as an automatic iteration loop.
 An outer controller should use the existing recursive orchestration and
 `steering_checkpoint` seams to start the next pass from `refinement-prompt.md`
@@ -57,8 +58,8 @@ For revisions, use:
 ```
 
 `human_feedback_gate` validates this file deterministically. Only `approved`
-passes the gate and unlocks DSPy export. A valid `revise` decision is retained
-as evidence but exits non-zero, so the exporter is blocked. In a dashboard or
+passes the gate and unlocks summary finalization and aggregation. A valid `revise`
+decision is retained as evidence but exits non-zero, so finalization is blocked. In a dashboard or
 product integration, pair the packet with MiniOrk's `steering_checkpoint` and
 an operator-steering message so the outer driver pauses before the decision and
 starts the next bounded iteration with the retained feedback. The current recipe
