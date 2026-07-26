@@ -41,6 +41,33 @@
       "type": "string",
       "description": "Human-readable description of what this workflow accomplishes."
     },
+    "dispatch_mode": {
+      "type": "string",
+      "enum": ["serial", "parallel", "partitioned", "speculative"],
+      "description": "Default dispatch mode when a node does not override it."
+    },
+    "max_self_correction_iterations": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Maximum bounded repair iterations for this workflow."
+    },
+    "recursion": {
+      "type": "object",
+      "description": "Optional bounded recursion configuration for recursive recipes.",
+      "additionalProperties": true
+    },
+    "source_artifact": {
+      "type": ["string", "null"],
+      "description": "Named final artifact used by publishing or review recipes."
+    },
+    "human_decision_artifact": {
+      "type": ["string", "null"],
+      "description": "Artifact that records a human approval or decision boundary."
+    },
+    "selected_option_artifact": {
+      "type": ["string", "null"],
+      "description": "Artifact that records the option selected after a human decision gate."
+    },
     "tags": {
       "type": "array",
       "items": { "type": "string" }
@@ -63,6 +90,7 @@
           "enum": [
             "planner",
             "researcher",
+            "transform",
             "implementer",
             "reviewer",
             "verifier",
@@ -88,8 +116,13 @@
           "default": []
         },
         "prompt_ref": {
-          "type": "string",
+          "type": ["string", "null"],
           "description": "Path (relative to repo root) or key of the prompt template for this node.",
+          "default": ""
+        },
+        "verifier_ref": {
+          "type": ["string", "null"],
+          "description": "Recipe-relative deterministic verifier script for verifier nodes.",
           "default": ""
         },
         "timeout_minutes": {
@@ -110,6 +143,39 @@
           "minimum": 0,
           "maximum": 5,
           "default": 1
+        },
+        "partition_key": {
+          "type": "string",
+          "description": "Artifact or item key used to partition this node's work."
+        },
+        "requires_capabilities": {
+          "type": ["string", "array"],
+          "items": { "type": "string" },
+          "description": "Provider capabilities required by this node."
+        },
+        "tools": {
+          "type": ["array", "object"],
+          "description": "Recipe-declared harness tools, optionally grouped by native and MCP capability."
+        },
+        "transform": {
+          "type": "string",
+          "description": "Registered deterministic transform identifier; required for transform nodes."
+        },
+        "inputs": {
+          "type": "object",
+          "description": "Typed artifact input ports keyed by input name.",
+          "additionalProperties": {
+            "type": "object",
+            "properties": {
+              "required": { "type": "boolean", "default": true },
+              "many": { "type": "boolean", "default": false }
+            },
+            "additionalProperties": false
+          }
+        },
+        "outputs": {
+          "type": ["array", "object"],
+          "description": "Typed artifact output ports. Each output declares name, path, kind, and optional visibility."
         }
       }
     },
@@ -135,13 +201,28 @@
             "verifies",
             "blocks",
             "retries",
-            "escalates_to"
+            "escalates_to",
+            "human_decision_gate",
+            "verifies_user_choice"
           ]
         },
         "condition": {
           "type": "string",
           "description": "Optional CEL/shell expression that must evaluate to truthy for this edge to activate. Empty string = unconditional.",
           "default": ""
+        },
+        "from_output": {
+          "type": "string",
+          "description": "Producer output port for an explicit artifact handoff."
+        },
+        "to_input": {
+          "type": "string",
+          "description": "Consumer input port for an explicit artifact handoff."
+        },
+        "recursive": {
+          "type": "boolean",
+          "default": false,
+          "description": "Marks a bounded recursive control edge excluded from DAG readiness ordering."
         }
       }
     }

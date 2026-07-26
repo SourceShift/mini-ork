@@ -1,12 +1,12 @@
 task_class: refactor_audit
-expected_artifact: composite     # 4 lens reports + 1 synthesis markdown
+expected_artifact: composite     # 5 lens reports + anonymous panel bundle + synthesis markdown
 success_verifiers:
   - verifiers/lens-completeness.sh
 failure_policy: request_changes
 rollback_policy: >
-  Keep the 4 lens reports under runs/<id>/lens-*.md for inspection;
-  discard the synthesis if it failed verification. Lens reports remain
-  individually consumable.
+  Keep the five lens reports and the system-only label map for operator
+  inspection; discard the synthesis if it failed verification. The anonymous
+  panel bundle is the only cross-lens input exposed to the synthesizer.
 
 # v0.2-pt9 (D-037): publisher path. `source_artifact` names the file
 # produced in $MINI_ORK_RUN_DIR; `outputs[]` lists canonical repo paths

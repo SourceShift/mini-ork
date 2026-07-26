@@ -74,7 +74,7 @@ from mini_ork.cli.publisher import (  # noqa: F401
 )
 
 _SEP = "\x1f"
-_NODE_TYPE_ORDER = ("planner", "researcher", "implementer", "reviewer", "verifier",
+_NODE_TYPE_ORDER = ("planner", "researcher", "transform", "implementer", "reviewer", "verifier",
                     "reflector", "publisher", "rollback")
 
 
@@ -191,30 +191,18 @@ def _target_repo_changed_files() -> list[str]:
 # dispatch_fn seam is supplied.
 
 def nodes_from_workflow(wf_path: str) -> list[str]:
-    """workflow.yaml → NODE_IDS tuples (8 SEP-joined fields). Verbatim."""
-    import yaml
-    with open(wf_path) as f:
-        wf = yaml.safe_load(f) or {}
-    out = []
-    for n in wf.get("nodes", []) or []:
-        name = n.get("name", "")
-        typ = n.get("type", "")
-        desc = n.get("description", "") or name
-        pref = n.get("prompt_ref", "") or ""
-        dmode = n.get("dispatch_mode", "") or "serial"
-        vref = n.get("verifier_ref", "") or ""
-        mlane = n.get("model_lane", "") or typ
-        requires = n.get("requires_capabilities", []) or []
-        requires_csv = requires if isinstance(requires, str) else ",".join(str(x) for x in requires)
-        if not name or not typ:
-            continue
-        desc = desc.replace(_SEP, " ")
-        pref = pref.replace(_SEP, " ")
-        vref = vref.replace(_SEP, " ")
-        mlane = mlane.replace(_SEP, " ")
-        requires_csv = requires_csv.replace(_SEP, " ")
-        out.append(_SEP.join([name, typ, desc, pref, dmode, vref, mlane, requires_csv]))
-    return out
+    """Compile workflow.yaml into the executor's legacy 8-field node tuples.
+
+    Legacy workflows retain declaration order. A workflow that opts into
+    explicit artifact ports is scheduled in its compiler-validated topological
+    order, so a consumer cannot race a producer just because its YAML position
+    happened to be convenient.
+    """
+    from mini_ork.workflow import compile_workflow
+
+    compiled = compile_workflow(wf_path)
+    order = compiled.topological_order if compiled.bindings else compiled.declared_order
+    return [compiled.nodes[node_id].dispatch_fields(_SEP) for node_id in order]
 
 
 def nodes_from_plan(plan_path: str, wf_path: str = "") -> list[str]:
@@ -376,11 +364,10 @@ def _run_parallel_batch(
     run_id,
     recipe,
     workflow,
-    ignore_failures=False,
 ):
-    """Dispatch a bounded batch and return its counted failure total."""
+    """Dispatch a bounded batch and return each node's outcome in field order."""
     if not fields:
-        return 0
+        return []
     payloads = [
         (field, root, run_dir, plan_path, task_class, db, run_id, recipe, workflow)
         for field in fields
@@ -394,13 +381,12 @@ def _run_parallel_batch(
         print(f"  [warn] parallel worker pool unavailable; falling back to serial: {exc}",
               file=sys.stderr)
         results = [_isolated_dispatch_worker(payload) for payload in payloads]
-    failures = 0
-    for rc, _finish_reason, out, err in results:
+    outcomes = []
+    for field, (rc, finish_reason, out, err) in zip(fields, results):
         sys.stdout.write(out)
         sys.stderr.write(err)
-        if rc != 0 and not ignore_failures:
-            failures += 1
-    return failures
+        outcomes.append((field, rc, finish_reason))
+    return outcomes
 
 
 _USAGE = (
@@ -408,7 +394,7 @@ _USAGE = (
     "[--dispatch-mode <mode>] [--dry-run]\n"
     "                       [--from-node <id>] [--recovery] [--repair-budget <usd>]\n\n"
     "Dispatch plan steps to node-type handlers.\n\n"
-    "Node types: planner | researcher | implementer | reviewer | verifier |\n"
+    "Node types: planner | researcher | transform | implementer | reviewer | verifier |\n"
     "            reflector | publisher | rollback\n\n"
     "Dispatch modes: serial | parallel | partitioned | speculative\n\n"
     "Options:\n"
@@ -639,6 +625,11 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
 
     dispatch_mode = _resolve_dispatch_mode(args.dispatch_mode_override, workflow)
     fields_list = [tuple((e.split(_SEP) + [""] * 8)[:8]) for e in node_ids]
+    control_parents: dict[str, tuple[str, ...]] = {}
+    if workflow and os.path.isfile(workflow):
+        from mini_ork.workflow import compile_workflow
+
+        control_parents = compile_workflow(workflow).control_parents
 
     fail_count = 0
     out: list[str] = []
@@ -698,17 +689,16 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
                                 dispatch_fn=llm, recipe=recipe, workflow=workflow,
                                 trace_fn=trace_writer, checkpoint_fn=checkpoint_writer)
 
-    def _parallel(batch, *, ignore_failures=False):
+    def _parallel(batch):
         # Injected dispatchers stay in-process and serial for deterministic,
         # provider-free tests. Production's default dispatcher gets real,
         # process-isolated concurrency.
         if dispatch_fn is not None:
-            counted = 0
+            outcomes = []
             for field in batch:
-                rc, _fr = _dispatch_serial(field)
-                if rc != 0 and not ignore_failures:
-                    counted += 1
-            return counted
+                rc, finish_reason = _dispatch_serial(field)
+                outcomes.append((field, rc, finish_reason))
+            return outcomes
         apply_env_overrides({"FAIL_COUNT": str(fail_count)})
         return _run_parallel_batch(
             batch,
@@ -720,29 +710,124 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
             run_id=run_id,
             recipe=recipe,
             workflow=workflow,
-            ignore_failures=ignore_failures,
         )
 
     rollback_fields = [field for field in selected if field[1] == "rollback"]
     work_fields = [field for field in selected if field[1] != "rollback"]
 
-    if dispatch_mode == "parallel":
-        fail_count += _parallel(work_fields)
-    elif dispatch_mode == "speculative":
-        _parallel(work_fields, ignore_failures=True)
+    def _count_failures(outcomes):
+        return sum(1 for _field, rc, _finish_reason in outcomes if rc != 0)
+
+    def _dispatch_dependency_graph():
+        """Dispatch control/data dependencies in readiness waves.
+
+        ``compile_workflow`` has already proven the graph acyclic. This runtime
+        pass adds the missing operational half: a child starts only after every
+        selected parent succeeded; failed parents block descendants without
+        executing a publisher or consumer against partial state.
+        """
+        nonlocal fail_count
+        pending = {field[0]: field for field in work_fields}
+        statuses: dict[str, str] = {}
+        order = {field[0]: index for index, field in enumerate(work_fields)}
+        selected_ids = set(pending)
+
+        while pending:
+            blocked = []
+            for node_id in pending:
+                parents = set(control_parents.get(node_id, ())) & selected_ids
+                failed = sorted(
+                    parent for parent in parents
+                    if statuses.get(parent) in {"failed", "blocked"}
+                )
+                if failed:
+                    blocked.append((node_id, failed))
+            for node_id, failed in blocked:
+                pending.pop(node_id)
+                statuses[node_id] = "blocked"
+                fail_count += 1
+                print(
+                    f"  [skip] node_id={node_id} blocked by failed parent(s): {', '.join(failed)}",
+                    file=sys.stderr,
+                )
+            if not pending:
+                break
+
+            ready = []
+            for node_id, field in pending.items():
+                parents = set(control_parents.get(node_id, ())) & selected_ids
+                if all(statuses.get(parent) == "success" for parent in parents):
+                    ready.append(field)
+            ready.sort(key=lambda field: order[field[0]])
+            if not ready:
+                # Defensive fail-closed fallback. Compiler cycle validation makes
+                # this unreachable unless a filtered/externally mutated graph is
+                # inconsistent with the field list.
+                for node_id in sorted(pending, key=order.__getitem__):
+                    pending.pop(node_id)
+                    statuses[node_id] = "blocked"
+                    fail_count += 1
+                    print(
+                        f"  [skip] node_id={node_id} has unresolved workflow parents",
+                        file=sys.stderr,
+                    )
+                break
+
+            if dispatch_mode == "parallel":
+                batch = ready
+            elif dispatch_mode == "partitioned":
+                batch = []
+                for node_type in _NODE_TYPE_ORDER:
+                    batch = [field for field in ready if field[1] == node_type]
+                    if batch:
+                        break
+                if not batch:
+                    batch = [ready[0]]
+            elif ready[0][4] == "parallel" and dispatch_fn is None:
+                batch = [field for field in ready if field[4] == "parallel"]
+            else:
+                batch = [ready[0]]
+
+            for field in batch:
+                pending.pop(field[0])
+            for field, rc, _finish_reason in _parallel(batch):
+                if rc == 0:
+                    statuses[field[0]] = "success"
+                else:
+                    statuses[field[0]] = "failed"
+                    fail_count += 1
+
+    dependency_aware = any(
+        control_parents.get(field[0]) for field in work_fields
+    )
+    speculative_requested = dispatch_mode == "speculative" or any(
+        field[4] == "speculative" for field in work_fields
+    )
+
+    if speculative_requested:
+        # The schema's historical wording promised first-winner replicas, but
+        # this executor has no replica identity or loser cancellation. Running
+        # an arbitrary graph in this mode could report success after every node
+        # failed, so reject it until replica semantics are explicit.
+        print("  [config] speculative dispatch requires explicit replica semantics", file=sys.stderr)
+        fail_count += 1
+    elif dependency_aware:
+        _dispatch_dependency_graph()
+    elif dispatch_mode == "parallel":
+        fail_count += _count_failures(_parallel(work_fields))
     elif dispatch_mode == "partitioned":
         for node_type in _NODE_TYPE_ORDER:
             if node_type == "rollback":
                 continue
             group = [field for field in work_fields if field[1] == node_type]
-            fail_count += _parallel(group)
+            fail_count += _count_failures(_parallel(group))
     else:
         pending = []
 
         def _flush_pending():
             nonlocal fail_count, pending
             if pending:
-                fail_count += _parallel(pending)
+                fail_count += _count_failures(_parallel(pending))
                 pending = []
 
         for field in work_fields:
@@ -1786,6 +1871,47 @@ def dispatch_node(fields, *, root, run_dir, plan_path, task_class, db, run_id,
     # provider or verifier subprocess is invoked (canonical contract:
     # mini_ork.context).
     apply_env_overrides({ENV_RUN_DIR: run_dir_eff})
+
+    # The artifact ledger is a semantic boundary, not a replacement for an OS
+    # sandbox: it records exactly what the recipe declares, validates integrity
+    # on every consumer handoff, and materializes the allowed inputs under the
+    # run workspace. Existing recipes with no ports keep their current file
+    # conventions and incur only an empty manifest.
+    artifact_context = ""
+    artifact_ledger = None
+    compiled_workflow = None
+    if workflow and os.path.isfile(workflow):
+        try:
+            from mini_ork.workflow import (
+                ArtifactContractError,
+                ArtifactLedger,
+                WorkflowCompileError,
+                compile_workflow,
+            )
+
+            compiled_workflow = compile_workflow(workflow)
+            if node_id in compiled_workflow.nodes:
+                artifact_ledger = ArtifactLedger(run_dir_eff, run_id)
+                prepared_inputs = artifact_ledger.prepare_inputs(compiled_workflow, node_id)
+                artifact_context = artifact_ledger.prompt_context(prepared_inputs)
+                apply_env_overrides({
+                    "MINI_ORK_NODE_INPUT_MANIFEST": str(prepared_inputs.manifest_path),
+                    "MINI_ORK_NODE_INPUT_DIR": str(prepared_inputs.input_root),
+                })
+        except ArtifactContractError as exc:
+            print(f"  [artifact] node_id={node_id}: {exc}", file=sys.stderr)
+            return 1, "artifact_contract"
+        except WorkflowCompileError as exc:
+            print(f"  [artifact] node_id={node_id}: {exc}", file=sys.stderr)
+            return 1, "config"
+        except Exception as exc:
+            print(f"  [artifact] node_id={node_id}: unexpected artifact setup failure: {exc}", file=sys.stderr)
+            return 1, "config"
+    else:
+        apply_env_overrides({
+            "MINI_ORK_NODE_INPUT_MANIFEST": None,
+            "MINI_ORK_NODE_INPUT_DIR": None,
+        })
     # Snapshot the tree BEFORE any implementer node edits it, so the reviewer
     # diff captures only the implementer's delta (not pre-existing dirt from a
     # concurrent session sharing this in-place working tree). Non-destructive.
@@ -1882,6 +2008,8 @@ def dispatch_node(fields, *, root, run_dir, plan_path, task_class, db, run_id,
         lane=lane, run_dir_eff=run_dir_eff, recipe_dir=recipe_dir,
         prompt_file=prompt_file, plan_content=plan_content, learned=learned,
         dispatch_fn=dispatch_fn, trace=trace, charge=_charge,
+        artifact_context=artifact_context, artifact_ledger=artifact_ledger,
+        compiled_workflow=compiled_workflow,
     )
     # Node-type handler registry (OCP): a new node type is
     # register_node_handler("type", fn) — no edit to this function. Unknown
@@ -1947,6 +2075,9 @@ class NodeDispatch:
     dispatch_fn: Callable
     trace: Callable
     charge: Callable
+    artifact_context: str = ""
+    artifact_ledger: object | None = None
+    compiled_workflow: object | None = None
 
     @property
     def recipe_eff(self) -> str:
@@ -1966,6 +2097,37 @@ class NodeDispatch:
 
     def dispatch(self, prompt: str):
         return self.dispatch_fn(self.task_class, self.lane, prompt)
+
+    def declared_output_path(self, fallback: str) -> str:
+        """Use a recipe port as the write target when it is unambiguous.
+
+        Legacy handlers retain their file-name conventions. A new recipe with
+        one declared output gets a schema-owned target instead of needing a
+        node-id-specific branch in the executor.
+        """
+        if self.artifact_ledger is None or self.compiled_workflow is None:
+            return fallback
+        try:
+            outputs = self.compiled_workflow.nodes[self.node_id].outputs
+            if len(outputs) == 1:
+                output_name = next(iter(outputs))
+                return str(self.artifact_ledger.output_path(
+                    self.compiled_workflow, self.node_id, output_name
+                ))
+        except Exception:
+            pass
+        return fallback
+
+    def publish_declared_outputs(self) -> bool:
+        """Fail the node if its recipe-declared output contract is not met."""
+        if self.artifact_ledger is None or self.compiled_workflow is None:
+            return True
+        try:
+            self.artifact_ledger.publish_node_outputs(self.compiled_workflow, self.node_id)
+            return True
+        except Exception as exc:
+            print(f"  [artifact] node_id={self.node_id}: {exc}", file=sys.stderr)
+            return False
 
 
 def _handle_planner_early(root):
@@ -1999,9 +2161,12 @@ EARLY_NODE_HANDLERS: dict[str, Callable] = {
 
 
 def _handle_researcher(ctx: NodeDispatch):
-    out_file = _researcher_output_file(ctx.run_dir, ctx.recipe_eff, ctx.node_id)
+    out_file = ctx.declared_output_path(
+        _researcher_output_file(ctx.run_dir, ctx.recipe_eff, ctx.node_id)
+    )
+    os.makedirs(os.path.dirname(out_file) or ".", exist_ok=True)
     prompt = (f"{ctx.prepend()}Task: {ctx.node_desc}{ctx.learned}\n\nPlan context:\n"
-              f"{ctx.plan_content}\n\nWrite your output to: {out_file}")
+              f"{ctx.plan_content}{ctx.artifact_context}\n\nWrite your output to: {out_file}")
     marker = os.path.join(ctx.run_dir, f".dispatch-marker-{ctx.node_id}")
     open(marker, "w").write("")
     rc, result = ctx.dispatch(prompt)
@@ -2014,33 +2179,48 @@ def _handle_researcher(ctx: NodeDispatch):
         os.remove(marker)
     except OSError:
         pass
+    if not ctx.publish_declared_outputs():
+        ctx.trace(ctx.node_id, "failure", "researcher", out_file, "", "artifact_contract")
+        return 1, "artifact_contract"
     ctx.trace(ctx.node_id, "success", "researcher", out_file, "", "done")
     ctx.charge()
     return 0, "done"
 
 
 def _handle_implementer(ctx: NodeDispatch):
+    impl_log = ctx.declared_output_path(
+        os.path.join(ctx.run_dir, f"impl-{ctx.node_id}.log")
+    )
     # F6-B: implementer sub-mode dispatchers (bash :2493-2555), registry-driven.
     submode = _IMPLEMENTER_SUBMODES.get((ctx.recipe_eff, ctx.node_id))
     if submode:
         impl_rel, script_rel = submode
-        sub_log = os.path.join(ctx.run_dir, impl_rel)
+        fallback_sub_log = os.path.join(ctx.run_dir, impl_rel)
+        sub_log = ctx.declared_output_path(fallback_sub_log)
         script = os.path.join(ctx.root, "recipes", script_rel)
         if not os.path.isfile(script):
             print(f"dispatcher script missing: {script}", file=sys.stderr)
             ctx.trace(ctx.node_id, "failure", "implementer", sub_log, "", "error")
             return 1, "error"
+        os.makedirs(os.path.dirname(fallback_sub_log) or ".", exist_ok=True)
         os.makedirs(os.path.dirname(sub_log), exist_ok=True)
         rc = subprocess.run(["python3", script]).returncode
         if rc == 0:
+            if sub_log != fallback_sub_log and os.path.isfile(fallback_sub_log):
+                shutil.copy2(fallback_sub_log, sub_log)
             print(f"  [ok] dispatcher results → {sub_log}")
+            if not ctx.publish_declared_outputs():
+                ctx.trace(ctx.node_id, "failure", "implementer", sub_log, "", "artifact_contract")
+                return 1, "artifact_contract"
             ctx.trace(ctx.node_id, "success", "implementer", sub_log, "", "done")
             return 0, "done"
         print("dispatcher failed", file=sys.stderr)
         ctx.trace(ctx.node_id, "failure", "implementer", sub_log, "", "error")
         return 1, "error"
-    impl_log = os.path.join(ctx.run_dir, f"impl-{ctx.node_id}.log")
-    prompt = f"{ctx.prepend()}Implement: {ctx.node_desc}{ctx.learned}\n\nPlan:\n{ctx.plan_content}"
+    prompt = (f"{ctx.prepend()}Implement: {ctx.node_desc}{ctx.learned}\n\nPlan:\n"
+              f"{ctx.plan_content}{ctx.artifact_context}\n\n"
+              f"Write your execution summary to: {impl_log}")
+    os.makedirs(os.path.dirname(impl_log) or ".", exist_ok=True)
     # F4: pin the codex/gemini edit surface to the TARGET repo (kickoff's git
     # toplevel), not os.getcwd(). Without this the implementer diff/writes land
     # in mini-ork's own tree when cwd != target — the CWT-A corruption hazard
@@ -2069,6 +2249,9 @@ def _handle_implementer(ctx: NodeDispatch):
                 handle.write(output)
             if output:
                 print(f"  [ok] minimal scaffold implementer output → {impl_log}")
+                if not ctx.publish_declared_outputs():
+                    ctx.trace(ctx.node_id, "failure", "implementer", impl_log, "", "artifact_contract")
+                    return 1, "artifact_contract"
                 ctx.trace(ctx.node_id, "success", "implementer", impl_log, "", "done")
                 return 0, "done"
         except Exception:
@@ -2089,6 +2272,9 @@ def _handle_implementer(ctx: NodeDispatch):
         _write_self_migrate_implementer_summary(
             ctx.run_dir_eff, target, impl_log, harvested
         )
+    if not ctx.publish_declared_outputs():
+        ctx.trace(ctx.node_id, "failure", "implementer", impl_log, "", "artifact_contract")
+        return 1, "artifact_contract"
     ctx.trace(ctx.node_id, "success", "implementer", impl_log, "", "done")
     ctx.charge()
     return 0, "done"
@@ -2112,19 +2298,21 @@ def _classify_review_node(recipe_eff: str, node_id: str, root: str, run_dir: str
 def _handle_reviewer(ctx: NodeDispatch):
     review_file, is_panel_gate, is_synth = _classify_review_node(
         ctx.recipe_eff, ctx.node_id, ctx.root, ctx.run_dir)
+    review_file = ctx.declared_output_path(review_file)
+    os.makedirs(os.path.dirname(review_file) or ".", exist_ok=True)
     # F2-B: per-case prompt matching bash :2739-2756. The classic reviewer gets the
     # assembled inputs (summary + verifier verdicts + diff) AND the JSON envelope —
     # without the envelope the LLM emits prose → verdict=unknown → false rollback.
     if is_panel_gate:
         prompt = (f"{ctx.prepend()}Synthesize panel verdict for: {ctx.node_desc}{ctx.learned}\n\n"
-                  f"Plan:\n{ctx.plan_content}\n\nWrite strict JSON to: {review_file}")
+                  f"Plan:\n{ctx.plan_content}{ctx.artifact_context}\n\nWrite strict JSON to: {review_file}")
     elif is_synth:
         prompt = (f"{ctx.prepend()}Synthesize for: {ctx.node_desc}{ctx.learned}\n\n"
-                  f"Plan:\n{ctx.plan_content}\n\nWrite your synthesis to: {review_file}")
+                  f"Plan:\n{ctx.plan_content}{ctx.artifact_context}\n\nWrite your synthesis to: {review_file}")
     else:
         reviewer_inputs = _assemble_reviewer_inputs(ctx.run_dir_eff)
         prompt = (f"{ctx.prepend()}Review the implementation for: {ctx.node_desc}{ctx.learned}\n\n"
-                  f"Plan:\n{ctx.plan_content}\n\n{reviewer_inputs}\n"
+                  f"Plan:\n{ctx.plan_content}{ctx.artifact_context}\n\n{reviewer_inputs}\n"
                   'Respond with JSON: {"verdict": "pass|fail|needs_revision", "notes": []}')
     marker = os.path.join(ctx.run_dir, f".dispatch-marker-{ctx.node_id}")
     open(marker, "w").write("")
@@ -2138,6 +2326,9 @@ def _handle_reviewer(ctx: NodeDispatch):
         os.remove(marker)
     except OSError:
         pass
+    if not ctx.publish_declared_outputs():
+        ctx.trace(ctx.node_id, "failure", "reviewer", review_file, "", "artifact_contract")
+        return 1, "artifact_contract"
     verdict = _extract_verdict(ctx.root, review_file)
     print(f"  [info] reviewer verdict={verdict} → {review_file}")
     vn = verdict.lower()
@@ -2155,7 +2346,37 @@ def _handle_reviewer(ctx: NodeDispatch):
     return 1, fr
 
 
+def _handle_transform(ctx: NodeDispatch):
+    """Run a deterministic data transform between two artifact contracts.
+
+    Transforms run inside MiniOrk, not inside a coding harness. That makes
+    behavior such as anonymization reproducible and keeps sensitive routing
+    metadata out of the next agent's visible input set.
+    """
+    if ctx.artifact_ledger is None or ctx.compiled_workflow is None:
+        print(f"  [artifact] transform {ctx.node_id} has no compiled workflow", file=sys.stderr)
+        return 1, "config"
+    try:
+        from mini_ork.workflow.transforms import execute_transform
+
+        out_file = execute_transform(ctx.compiled_workflow, ctx.artifact_ledger, ctx.node_id)
+    except Exception as exc:
+        print(f"  [artifact] transform {ctx.node_id} failed: {exc}", file=sys.stderr)
+        ctx.trace(ctx.node_id, "failure", "transform", "", "", "artifact_contract")
+        return 1, "artifact_contract"
+    if not ctx.publish_declared_outputs():
+        ctx.trace(ctx.node_id, "failure", "transform", str(out_file), "", "artifact_contract")
+        return 1, "artifact_contract"
+    ctx.trace(ctx.node_id, "success", "transform", str(out_file), "", "done")
+    return 0, "done"
+
+
 def _handle_verifier(ctx: NodeDispatch):
+    def _publish_success():
+        if ctx.publish_declared_outputs():
+            return 0, "done"
+        return 1, "artifact_contract"
+
     # Hollow-run guard: fail before any verifier runs if the recipe declares a
     # concrete run-local artifact (absolute contract path) that is missing or
     # zero-byte. Covers the verifier_ref branch (which bypasses the canonical
@@ -2177,7 +2398,8 @@ def _handle_verifier(ctx: NodeDispatch):
         # return 1 — a verifier node with no artifact_contract outputs does not
         # fail the run. Return rc 0 to match (finish_reason error is informational).
         print("  [warn] verifier node: no outputs in artifact_contract")
-        return 0, "error"
+        rc, finish_reason = _publish_success()
+        return (rc, "error") if rc == 0 else (rc, finish_reason)
     if ctx.verifier_ref and ctx.recipe_dir:
         script = os.path.join(ctx.recipe_dir, ctx.verifier_ref)
         if not os.path.isfile(script):
@@ -2198,7 +2420,7 @@ def _handle_verifier(ctx: NodeDispatch):
                 shutil.copy(ev, os.path.join(persist_dir, f"verifier_{vstem}.json"))
             except OSError:
                 pass
-        return (0, "done") if rc == 0 else (1, "error")
+        return _publish_success() if rc == 0 else (1, "error")
     module_env = dict(os.environ)
     module_env["PYTHONPATH"] = ctx.root + (
         os.pathsep + module_env["PYTHONPATH"] if module_env.get("PYTHONPATH") else ""
@@ -2207,14 +2429,19 @@ def _handle_verifier(ctx: NodeDispatch):
         sys.executable, "-m", "mini_ork.cli.verify", "--plan", ctx.plan_path,
         "--task-class", ctx.task_class, artifact,
     ], env=module_env).returncode
-    return (0, "done") if rc == 0 else (1, "error")
+    return _publish_success() if rc == 0 else (1, "error")
 
 
 def _handle_publisher(ctx: NodeDispatch):
-    return publisher_node(ctx.root, ctx.run_dir_eff, ctx.db, ctx.run_id,
-                          ctx.recipe_eff, ctx.task_class,
-                          review_file=os.environ.get("REVIEW_FILE", ""),
-                          verdict_env=os.environ.get("VERDICT", ""))
+    rc, finish_reason = publisher_node(
+        ctx.root, ctx.run_dir_eff, ctx.db, ctx.run_id,
+        ctx.recipe_eff, ctx.task_class,
+        review_file=os.environ.get("REVIEW_FILE", ""),
+        verdict_env=os.environ.get("VERDICT", ""),
+    )
+    if rc == 0 and not ctx.publish_declared_outputs():
+        return 1, "artifact_contract"
+    return rc, finish_reason
 
 
 def _rollback_strategy(workflow_path: str) -> str:
@@ -2339,6 +2566,7 @@ def _handle_rollback(ctx: NodeDispatch):
 
 NODE_HANDLER_REGISTRY: dict[str, Callable[[NodeDispatch], tuple[int, str]]] = {
     "researcher": _handle_researcher,
+    "transform": _handle_transform,
     "implementer": _handle_implementer,
     "reviewer": _handle_reviewer,
     "verifier": _handle_verifier,

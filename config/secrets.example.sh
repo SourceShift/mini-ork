@@ -1,15 +1,23 @@
 #!/usr/bin/env bash
 # secrets.example.sh — template for mini-ork API keys.
 #
-# Copy to $MINI_ORK_HOME/config/secrets.local.sh (default:
-# .mini-ork/config/secrets.local.sh) and fill in the keys you use.
-# That path is gitignored (.gitignore: **/secrets.local.*) — NEVER commit
-# real keys. Override the location with MINI_ORK_SECRETS=/abs/path.
+# Preferred setup: `mini-ork providers configure minimax` prompts securely for
+# one lens, while `mini-ork providers configure --workflow <workflow.yaml>`
+# discovers all credentials required by a recipe. The command creates this
+# file atomically with 0600 permissions and never prints a value.
 #
-# lib/llm-dispatch.sh sources this file inside each dispatch subshell,
-# so keys exported here are visible to cl_*.sh wrappers and to
-# providers.yaml entries via their api_key_env field — but never leak
-# into the parent orchestrator process.
+# For automation, pipe NAME=value records to `mini-ork providers configure
+# --from-stdin <lane>`; never put a key in a command-line argument. This file
+# remains a useful reference and supports existing shell-based workflows.
+#
+# Path: $MINI_ORK_HOME/config/secrets.local.sh (default:
+# .mini-ork/config/secrets.local.sh). It is gitignored
+# (.gitignore: **/secrets.local.*) — NEVER commit real keys. Override the
+# location with MINI_ORK_SECRETS=/abs/path.
+#
+# Native Python dispatch parses only simple export NAME=value records from this
+# file; it never sources or executes it. Keep it owner-only (0600). Legacy
+# Bash dispatch still supports this export format.
 
 # --- BYO keys for config/providers.yaml entries -------------------------
 

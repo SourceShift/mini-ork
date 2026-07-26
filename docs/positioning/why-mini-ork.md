@@ -70,10 +70,12 @@ lanes:
   kimi_lens: kimi              # Moonshot
   codex_lens: codex            # OpenAI Codex
   opus_lens: opus              # Anthropic
+  minimax_lens: minimax        # MiniMax
 ```
 
-`recipes/refactor-audit/workflow.yaml` dispatches 4 named lenses to 4 distinct
-families. Pairwise ρ (per Rajan 2025) is low by construction.
+`recipes/refactor-audit/workflow.yaml` dispatches 5 named lenses to 5 distinct
+families, then passes only an anonymous panel bundle to synthesis. Pairwise ρ
+(per Rajan 2025) is low by construction.
 
 Provider wrappers ship at `lib/providers/cl_{glm,kimi,codex,deepseek,opus,sonnet,minimax}.sh`
 — 7 model-family routes available out-of-the-box.

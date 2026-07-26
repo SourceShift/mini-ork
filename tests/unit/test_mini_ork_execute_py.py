@@ -918,6 +918,94 @@ def test_main_live_run_wired(tmp_path, monkeypatch):
     assert (parallel_rd / "verdict.json").is_file()
 
 
+def test_parallel_graph_dispatches_artifact_dependencies_in_readiness_waves(tmp_path, monkeypatch):
+    workflow = tmp_path / "workflow.yaml"
+    workflow.write_text(
+        """\
+version: "0.2.0"
+task_class: artifact_test
+dispatch_mode: parallel
+nodes:
+  - { name: producer, type: researcher, model_lane: producer, dispatch_mode: parallel, outputs: [{ name: report, path: producer.md }] }
+  - { name: consumer, type: researcher, model_lane: consumer, dispatch_mode: parallel, inputs: { report: { required: true } }, outputs: [{ name: summary, path: consumer.md }] }
+edges:
+  - { from: producer, to: consumer, edge_type: supplies_context_to, from_output: report, to_input: report }
+""",
+        encoding="utf-8",
+    )
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    plan = run_dir / "plan.json"
+    plan.write_text(json.dumps({"objective": "o", "task_class": "artifact_test"}))
+    batches: list[list[str]] = []
+
+    def fake_parallel(fields, **_kwargs):
+        batches.append([field[0] for field in fields])
+        return [(field, 0, "done") for field in fields]
+
+    monkeypatch.setattr(ex, "_run_parallel_batch", fake_parallel)
+    for name, value in {
+        "MINI_ORK_ROOT": str(REPO),
+        "MINI_ORK_WORKFLOW": str(workflow),
+        "MINI_ORK_PLAN_PATH": str(plan),
+        "MINI_ORK_RUN_DIR": str(run_dir),
+        "MINI_ORK_RUN_ID": "graph-waves",
+        "MINI_ORK_DB": str(tmp_path / "state.db"),
+        "MINI_ORK_DRY_RUN": "0",
+        "MINI_ORK_EXECUTE_GATE": "0",
+        "MO_GRADE_RUN_REWARD": "0",
+        "MO_LEARNING_WRITEBACK": "0",
+    }.items():
+        monkeypatch.setenv(name, value)
+
+    assert ex.main([], root=str(REPO)) == 0
+    assert batches == [["producer"], ["consumer"]]
+
+
+def test_failed_parent_blocks_dependent_node(tmp_path, monkeypatch):
+    workflow = tmp_path / "workflow.yaml"
+    workflow.write_text(
+        """\
+version: "0.2.0"
+task_class: artifact_test
+dispatch_mode: serial
+nodes:
+  - { name: producer, type: researcher, model_lane: producer, dispatch_mode: serial }
+  - { name: publisher, type: researcher, model_lane: publisher, dispatch_mode: serial }
+edges:
+  - { from: producer, to: publisher, edge_type: depends_on }
+""",
+        encoding="utf-8",
+    )
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    plan = run_dir / "plan.json"
+    plan.write_text(json.dumps({"objective": "o", "task_class": "artifact_test"}))
+    calls: list[str] = []
+
+    def failing_producer(_task_class, lane, _prompt):
+        calls.append(lane)
+        return (1, "producer failed") if lane == "producer" else (0, "must not run")
+
+    for name, value in {
+        "MINI_ORK_ROOT": str(REPO),
+        "MINI_ORK_WORKFLOW": str(workflow),
+        "MINI_ORK_PLAN_PATH": str(plan),
+        "MINI_ORK_RUN_DIR": str(run_dir),
+        "MINI_ORK_RUN_ID": "blocked-child",
+        "MINI_ORK_DB": str(tmp_path / "state.db"),
+        "MINI_ORK_DRY_RUN": "0",
+        "MINI_ORK_EXECUTE_GATE": "0",
+        "MO_GRADE_RUN_REWARD": "0",
+        "MO_LEARNING_WRITEBACK": "0",
+    }.items():
+        monkeypatch.setenv(name, value)
+
+    assert ex.main([], root=str(REPO), dispatch_fn=failing_producer) == 1
+    assert calls == ["producer"]
+    assert json.loads((run_dir / "verdict.json").read_text())["failed_nodes"] == 2
+
+
 def test_trace_fn_stamps_scoping(tmp_path, monkeypatch):
     # Scoping-stamp fix: the per-node trace_fn must land code_region (from an in-repo
     # files_written path) and objective_domain (from MINI_ORK_OBJECTIVE_DOMAIN), the
