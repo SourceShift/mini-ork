@@ -149,7 +149,9 @@ def test_apply_remains_a_public_sibling_command(monkeypatch):
 
     monkeypatch.setattr(cli.subprocess, "run", fake_run)
     assert cli.main(["apply", "--help"], root=str(REPO)) == 0
-    assert calls == [[str(REPO / "bin" / "mini-ork-apply"), "--help"]]
+    # apply is a closed fork: it dispatches to the native Python module
+    # (mini_ork/cli/apply.py), not the retired bin/mini-ork-apply trampoline.
+    assert calls == [[sys.executable, "-m", "mini_ork.cli.apply", "--help"]]
 
 
 def _recipes(tmp_path: Path, mapping: dict[str, str | None]) -> Path:
