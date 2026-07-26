@@ -3,7 +3,8 @@
 Faithful Python port of the ``.mini-ork/`` scaffolder: creates the
 home directory tree, seeds ``config/task_classes/`` from every recipe's
 ``task_class.yaml``, copies ``agents.yaml`` and ``scope-patterns.yaml.example``
-into ``config/``, runs ``db/init.sh`` to populate ``state.db``, and
+into ``config/``, builds ``state.db`` via the native Python migration runner
+(``mini_ork.stores.migrate.init_db``, the db/init.sh port), and
 appends the canonical ``.gitignore`` entries to the project root's
 ``.gitignore``. Idempotent on re-run.
 
@@ -25,10 +26,11 @@ from __future__ import annotations
 
 import os
 import shutil
-import subprocess
 import sys
 from io import StringIO
 from pathlib import Path
+
+from mini_ork.stores.migrate import init_db
 
 _DEFAULT_AGENTS_YAML = """\
 # mini-ork agent configuration
@@ -177,22 +179,17 @@ def _copy_or_default(
         _ok(buf, msgs["default_created"])
 
 
-def _run_db_init(buf: StringIO, db_init_path: Path, env: dict) -> None:
-    """Mirror bash lines 154-165: invoke ``db/init.sh`` via subprocess.
+def _run_db_init(buf: StringIO, mini_ork_repo: Path, env: dict) -> None:
+    """Mirror bash lines 154-165 via the native Python migration runner
+    (``mini_ork.stores.migrate.init_db`` — the db/init.sh port).
 
-    Hard-exits (SystemExit(1)) on non-zero — the load-bearing safety
+    Hard-exits (SystemExit(1)) on failure — the load-bearing safety
     gate that prevents partial ``state.db`` migrations. On missing
-    ``db/init.sh`` emits a WARN and returns (does NOT raise).
+    ``db/migrations/`` emits a WARN and returns (does NOT raise).
     """
-    if db_init_path.is_file():
-        proc = subprocess.run(
-            ["bash", str(db_init_path)],
-            env=env,
-            cwd=str(db_init_path.parent.parent),
-            capture_output=True,
-            text=True,
-        )
-        if proc.returncode == 0:
+    if (mini_ork_repo / "db" / "migrations").is_dir():
+        rc, _out, _err = init_db(db=env["MINI_ORK_DB"], root=str(mini_ork_repo))
+        if rc == 0:
             _ok(buf, "state.db initialised via db/init.sh")
         else:
             sys.stderr.write(
@@ -238,7 +235,7 @@ def mini_ork_init(
 
     Args:
         project_root:    Where the .mini-ork/ tree (or override below) lives.
-        mini_ork_repo:   mini-ork repo root (provides recipes/, db/init.sh,
+        mini_ork_repo:   mini-ork repo root (provides recipes/, db/migrations,
                           examples/ for the next-steps block). Bash derives
                           this from ``$BASH_SOURCE``; Python has no
                           equivalent so it must be passed.
@@ -322,7 +319,7 @@ def mini_ork_init(
 
     # ── 3. state.db ──────────────────────────────────────────────────────────
     buf.write("--- Initialising state.db ---\n")
-    _run_db_init(buf, mini_ork_repo / "db" / "init.sh", env)
+    _run_db_init(buf, mini_ork_repo, env)
     buf.write("\n")
 
     # ── 4. .gitignore ────────────────────────────────────────────────────────
