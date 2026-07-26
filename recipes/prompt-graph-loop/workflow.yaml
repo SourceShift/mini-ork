@@ -1,0 +1,158 @@
+version: "0.2.0"
+task_class: prompt_graph_loop
+description: >
+  Artifact-led translation of a DSPy-style agent loop. The initial DAG creates
+  a graph, draft, verification report, and human review packet. Bounded
+  recursive edges feed verifier findings or operator feedback into the next
+  graph iteration. Only an approved human decision unlocks DSPy export.
+
+nodes:
+  - name: prompt_intake
+    type: researcher
+    model_lane: planner
+    prompt_ref: prompts/prompt-intake.md
+    dispatch_mode: serial
+    gates: [budget_gate]
+    outputs: [{ name: prompt_brief, kind: json, path: prompt-brief.json }]
+
+  - name: semantic_flow_extractor
+    type: researcher
+    model_lane: researcher
+    prompt_ref: prompts/semantic-flow-extractor.md
+    dispatch_mode: serial
+    gates: [budget_gate]
+    inputs:
+      prompt_brief: { required: true }
+      human_feedback: { required: false }
+    outputs: [{ name: semantic_signals, kind: json, path: semantic-signals.json }]
+
+  - name: source_researcher
+    type: researcher
+    model_lane: researcher
+    prompt_ref: prompts/source-researcher.md
+    dispatch_mode: serial
+    gates: [budget_gate]
+    inputs:
+      semantic_signals: { required: true }
+    outputs: [{ name: source_corpus, kind: json, path: source-corpus.json }]
+
+  - name: recursive_plan_composer
+    type: researcher
+    model_lane: planner
+    prompt_ref: prompts/recursive-plan-composer.md
+    dispatch_mode: serial
+    gates: [budget_gate]
+    inputs:
+      semantic_signals: { required: true }
+      source_corpus: { required: true }
+      refinement_prompt: { required: false }
+    outputs: [{ name: agent_plan, kind: json, path: agent-graph.json }]
+
+  - name: draft_executor
+    type: researcher
+    model_lane: worker
+    prompt_ref: prompts/draft-executor.md
+    dispatch_mode: serial
+    gates: [budget_gate]
+    inputs:
+      agent_plan: { required: true }
+    outputs: [{ name: draft_artifact, kind: markdown, path: draft-artifact.md }]
+
+  - name: verifier_gate
+    type: researcher
+    model_lane: reviewer
+    prompt_ref: prompts/verifier-gate.md
+    dispatch_mode: serial
+    gates: [budget_gate]
+    inputs:
+      agent_plan: { required: true }
+      draft_artifact: { required: true }
+    outputs: [{ name: verification_report, kind: json, path: verification-report.json }]
+
+  - name: graph_contract_gate
+    type: verifier
+    verifier_ref: verifiers/graph-contract.sh
+    dispatch_mode: serial
+    inputs:
+      verification_report: { required: true }
+    outputs: [{ name: graph_contract_report, kind: json, path: graph-contract-report.json }]
+
+  - name: reflection_loop
+    type: researcher
+    model_lane: reflector
+    prompt_ref: prompts/reflection-loop.md
+    dispatch_mode: serial
+    gates: [budget_gate]
+    inputs:
+      verification_report: { required: true }
+    outputs: [{ name: refinement_prompt, kind: markdown, path: refinement-prompt.md }]
+
+  - name: human_review_packet
+    type: researcher
+    model_lane: reviewer
+    prompt_ref: prompts/human-review-packet.md
+    dispatch_mode: serial
+    gates: [budget_gate]
+    inputs:
+      agent_plan: { required: true }
+      draft_artifact: { required: true }
+      verification_report: { required: true }
+    outputs: [{ name: review_packet, kind: markdown, path: human-review-packet.md }]
+
+  - name: human_feedback_gate
+    type: verifier
+    verifier_ref: verifiers/human-decision.sh
+    dispatch_mode: serial
+    inputs:
+      review_packet: { required: true }
+    outputs: [{ name: human_decision, kind: json, path: human-decision.json }]
+
+  - name: dspy_exporter
+    type: researcher
+    model_lane: worker
+    prompt_ref: prompts/dspy-exporter.md
+    dispatch_mode: serial
+    gates: [budget_gate, scope_gate]
+    inputs:
+      agent_plan: { required: true }
+      verification_report: { required: true }
+      human_decision: { required: true }
+    outputs: [{ name: dspy_program, kind: python, path: dspy-program.py }]
+
+  - { name: rollback, type: rollback, prompt_ref: null, dispatch_mode: serial }
+
+edges:
+  - { from: prompt_intake, to: semantic_flow_extractor, edge_type: supplies_context_to, from_output: prompt_brief, to_input: prompt_brief }
+  - { from: semantic_flow_extractor, to: source_researcher, edge_type: supplies_context_to, from_output: semantic_signals, to_input: semantic_signals }
+  - { from: semantic_flow_extractor, to: recursive_plan_composer, edge_type: supplies_context_to, from_output: semantic_signals, to_input: semantic_signals }
+  - { from: source_researcher, to: recursive_plan_composer, edge_type: supplies_context_to, from_output: source_corpus, to_input: source_corpus }
+  - { from: recursive_plan_composer, to: draft_executor, edge_type: supplies_context_to, from_output: agent_plan, to_input: agent_plan }
+  - { from: recursive_plan_composer, to: verifier_gate, edge_type: supplies_context_to, from_output: agent_plan, to_input: agent_plan }
+  - { from: draft_executor, to: verifier_gate, edge_type: supplies_context_to, from_output: draft_artifact, to_input: draft_artifact }
+  - { from: verifier_gate, to: graph_contract_gate, edge_type: verifies, from_output: verification_report, to_input: verification_report }
+  - { from: verifier_gate, to: reflection_loop, edge_type: supplies_context_to, from_output: verification_report, to_input: verification_report }
+  - { from: verifier_gate, to: human_review_packet, edge_type: supplies_context_to, from_output: verification_report, to_input: verification_report }
+  - { from: recursive_plan_composer, to: human_review_packet, edge_type: supplies_context_to, from_output: agent_plan, to_input: agent_plan }
+  - { from: draft_executor, to: human_review_packet, edge_type: supplies_context_to, from_output: draft_artifact, to_input: draft_artifact }
+  - { from: reflection_loop, to: recursive_plan_composer, edge_type: retries, recursive: true, from_output: refinement_prompt, to_input: refinement_prompt }
+  - { from: human_review_packet, to: human_feedback_gate, edge_type: verifies_user_choice, from_output: review_packet, to_input: review_packet }
+  - { from: human_feedback_gate, to: semantic_flow_extractor, edge_type: retries, condition: revise, recursive: true, from_output: human_decision, to_input: human_feedback }
+  - { from: human_feedback_gate, to: dspy_exporter, edge_type: human_decision_gate, condition: approved, from_output: human_decision, to_input: human_decision }
+  - { from: recursive_plan_composer, to: dspy_exporter, edge_type: supplies_context_to, from_output: agent_plan, to_input: agent_plan }
+  - { from: verifier_gate, to: dspy_exporter, edge_type: supplies_context_to, from_output: verification_report, to_input: verification_report }
+  - { from: graph_contract_gate, to: rollback, edge_type: escalates_to, condition: fail }
+  - { from: human_feedback_gate, to: rollback, edge_type: escalates_to, condition: fail }
+
+recursion:
+  max_iterations: 5
+  convergence_check: human_decision_approved_and_graph_contract_valid
+  budget_cap_per_iter_usd: 4.00
+  budget_cap_total_usd: 20.00
+  divergence_kill: >
+    Stop and escalate when two consecutive refinement prompts have the same
+    SHA-256 or when the human decision is unchanged after two repair passes.
+
+rollback_strategy: keep_all_artifacts_discard_unapproved_dspy_export
+human_decision_artifact: human-review-packet.md
+selected_option_artifact: human-decision.json
+source_artifact: dspy-program.py
