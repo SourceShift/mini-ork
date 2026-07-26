@@ -83,7 +83,13 @@ mo_emit_cache_flags() {
   # machine (observed on a fresh install with claude 2.1.47). Probe --help
   # once per process and degrade to cache-miss instead of hard failure.
   if [ -z "${_MO_CACHE_FLAG_SUPPORTED:-}" ]; then
-    if claude --help 2>/dev/null | grep -q -- '--exclude-dynamic-system-prompt-sections'; then
+    # Capture-then-grep: never pipe `claude --help` into `grep -q`. grep -q
+    # exits on first match; the producer then dies of SIGPIPE, and under
+    # `set -o pipefail` the pipeline's non-zero rc flips the probe to
+    # "unsupported" even though the flag IS present (~40% flake, CI red).
+    local _claude_help
+    _claude_help="$(claude --help 2>/dev/null)"
+    if grep -q -- '--exclude-dynamic-system-prompt-sections' <<< "$_claude_help"; then
       _MO_CACHE_FLAG_SUPPORTED=1
     else
       _MO_CACHE_FLAG_SUPPORTED=0
