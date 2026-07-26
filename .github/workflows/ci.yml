@@ -127,13 +127,18 @@ jobs:
           MINI_ORK_DRY_RUN: "1"   # offline mode — workers skip LLM calls
 
   python-tests:
-    name: python tests (${{ matrix.python-version }})
+    name: python tests (${{ matrix.python-version }} / ${{ matrix.shard }})
     runs-on: ubuntu-latest
     timeout-minutes: 35
     strategy:
       fail-fast: false
       matrix:
         python-version: ["3.11", "3.12"]
+        # Sharding: the suite is ~2,090 tests dominated by bash<->python
+        # parity subprocess costs (~14-17 min as one job). Split the big
+        # tests/unit tier odd/even by file (interleave balances the slow
+        # clusters) and run everything else as a third shard.
+        shard: [unit-a, unit-b, rest]
     steps:
       - uses: actions/checkout@v7
 
@@ -158,8 +163,17 @@ jobs:
       - name: Bootstrap state.db
         run: ./bin/mini-ork init
 
-      - name: Run pytest
-        run: python -m pytest tests/ -q -p no:cacheprovider
+      - name: Run pytest (unit shard A)
+        if: matrix.shard == 'unit-a'
+        run: ls tests/unit/*.py | awk 'NR % 2 == 1' | xargs python -m pytest -q -p no:cacheprovider
+
+      - name: Run pytest (unit shard B)
+        if: matrix.shard == 'unit-b'
+        run: ls tests/unit/*.py | awk 'NR % 2 == 0' | xargs python -m pytest -q -p no:cacheprovider
+
+      - name: Run pytest (root + non-unit layers)
+        if: matrix.shard == 'rest'
+        run: python -m pytest tests/ -q -p no:cacheprovider --ignore=tests/unit
 
   ui:
     name: ui typecheck + build

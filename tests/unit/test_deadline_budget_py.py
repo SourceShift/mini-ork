@@ -304,9 +304,11 @@ def test_status_hit_elapsed_remaining_within_1e6(tmp_path, monkeypatch):
     assert sb["sentinel_path"].endswith(".deadline-hit")
     # Float parity — anchored by START + frozen _now, the elapsed/remaining
     # arithmetic matches bash's $(( )) to whatever drift the subprocess hop
-    # introduced; floor + 1 buffer keeps it deterministic.
-    assert abs(sp["elapsed_seconds"] - sb["elapsed_seconds"]) < 1.0
-    assert abs(sp["remaining_seconds"] - sb["remaining_seconds"]) < 1.0
+    # introduced. The bash side is NOT clock-frozen, so a subprocess hop
+    # that straddles a second boundary drifts by 1s; allow that boundary
+    # crossing (observed under CI load) while still pinning the arithmetic.
+    assert abs(sp["elapsed_seconds"] - sb["elapsed_seconds"]) < 2.0
+    assert abs(sp["remaining_seconds"] - sb["remaining_seconds"]) < 2.0
 
 
 # ---------------------------------------------------------------------------
