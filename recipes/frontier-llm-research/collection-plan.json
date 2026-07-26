@@ -1,0 +1,30 @@
+{
+  "source": "arxiv",
+  "date_from": "2026-01-01",
+  "required_source_count": 200,
+  "results_per_query": 40,
+  "max_workers": 4,
+  "ranking_policy": "Rank only 2026 papers by multi-query topical coverage, LibWit relevance score, citation signals, and recency. Keep one unversioned arXiv URL per paper and retain the matched topics for auditability.",
+  "queries": [
+    {"topic": "inference-time compute", "query": "test-time compute scaling inference-time reasoning language models"},
+    {"topic": "adaptive deliberation", "query": "adaptive token budget dynamic inference compute language model reasoning"},
+    {"topic": "frontier reasoning", "query": "frontier language model reasoning tokens deliberation post-training"},
+    {"topic": "planning", "query": "LLM agent planning decomposition execution verification"},
+    {"topic": "search", "query": "language model test-time search tree search MCTS reasoning"},
+    {"topic": "reinforcement learning", "query": "test-time reinforcement learning reasoning language models verifiable rewards"},
+    {"topic": "process supervision", "query": "process reward model verifier reasoning language models"},
+    {"topic": "reflection", "query": "self-reflection critique refinement language model agents"},
+    {"topic": "recursive language models", "query": "recursive language models RLM long context reasoning"},
+    {"topic": "memory", "query": "long context memory compression retrieval language model agents"},
+    {"topic": "tool use", "query": "tool use agentic reasoning language models planning"},
+    {"topic": "prompting", "query": "prompt engineering instruction following prompting best practices language models"},
+    {"topic": "structured prompting", "query": "structured output prompt design language models reliability"},
+    {"topic": "transformer architecture", "query": "modern transformer architecture mixture of experts frontier language models"},
+    {"topic": "long-context architecture", "query": "attention KV cache long context efficient inference language models"},
+    {"topic": "reasoning architecture", "query": "reasoning language model architecture chain of thought inference"},
+    {"topic": "coding agents", "query": "code agents planning verification inference-time language models"},
+    {"topic": "multi-agent systems", "query": "multi-agent debate collaboration language model reasoning"},
+    {"topic": "efficient inference", "query": "speculative decoding efficient inference frontier language models"},
+    {"topic": "evaluation", "query": "evaluate inference-time reasoning planning prompting language models"}
+  ]
+}
