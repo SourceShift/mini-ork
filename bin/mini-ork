@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import os
 import sys
+from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
 
 # Keep a regex-readable version literal for lib/migrate.sh's installed-version
@@ -65,6 +66,25 @@ except (OSError, ValueError) as exc:
     print(exc, file=sys.stderr)
     raise SystemExit(2) from exc
 sys.path.insert(0, str(ENGINE_ROOT))
+
+
+def _bootstrap_install() -> int:
+    """Run installation without importing the optional full runtime stack."""
+    module_path = ENGINE_ROOT / "mini_ork" / "cli" / "install_command.py"
+    spec = spec_from_file_location("mini_ork_install_command", module_path)
+    if spec is None or spec.loader is None:
+        print(f"mini-ork: cannot load installer: {module_path}", file=sys.stderr)
+        return 2
+    module = module_from_spec(spec)
+    # Decorators such as @dataclass resolve their module through sys.modules
+    # while the file is executing, just as they do during a normal import.
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module.main(sys.argv[2:], root=str(ENGINE_ROOT))
+
+
+if len(sys.argv) > 1 and sys.argv[1] == "install":
+    raise SystemExit(_bootstrap_install())
 
 from mini_ork.cli.main import main  # noqa: E402
 
