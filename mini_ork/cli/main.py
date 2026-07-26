@@ -28,12 +28,12 @@ from mini_ork.dispatch import config_resolve, deadline_budget
 from mini_ork.vcs import repo_integrity_guard
 from mini_ork.gates import rubric_prescreen
 
-_NATIVE_SUBS = {"classify", "plan", "verify", "reflect"}
+_NATIVE_SUBS = {"apply", "classify", "plan", "verify", "reflect", "garden", "validate"}
 
 _EXEC_SUBS = {"improve", "eval",
               "promote", "init", "update", "spawn", "scheduler", "epics", "bugs",
-              "inject", "review", "apply", "traceotter", "metrics", "rollback", "resume", "recover",
-              "serve", "validate", "garden", "recipe-eval"}
+              "inject", "review", "traceotter", "metrics", "rollback", "resume", "recover",
+              "serve"}
 
 _HELP = """mini-ork — task operating system for agents (v0.1)
 
@@ -647,6 +647,9 @@ def _install_handler(rest, root):
 
 def _build_default_registry() -> dict:
     registry = {sub: _native_module_handler(f"mini_ork.cli.{sub}") for sub in _NATIVE_SUBS}
+    # "recipe-eval" is native too, but the dash is not importable in a module
+    # name — register it explicitly against mini_ork.cli.recipe_eval.
+    registry["recipe-eval"] = _native_module_handler("mini_ork.cli.recipe_eval")
     registry["execute"] = _execute_inprocess
     for sub in _EXEC_SUBS:
         registry[sub] = _bash_entrypoint_handler(sub)
