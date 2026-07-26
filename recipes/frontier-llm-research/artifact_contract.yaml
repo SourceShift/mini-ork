@@ -1,0 +1,23 @@
+source_artifact: aggregation.md
+task_class: frontier_llm_research
+expected_artifact: composite
+
+success_verifiers:
+  - verifiers/verify-aggregation.sh
+
+failure_policy: escalate
+rollback_policy: keep_all_source_and_summary_artifacts
+
+outputs:
+  - path: "${MINI_ORK_RUN_DIR}/source-corpus.json"
+    mime: application/json
+    description: LibWit source manifest with 200 distinct 2026 paper URLs and retrieval metadata.
+  - path: "${MINI_ORK_RUN_DIR}/technique-rollup.json"
+    mime: application/json
+    description: Schema-validated shard techniques and source index.
+  - path: "${MINI_ORK_RUN_DIR}/unified-techniques.md"
+    mime: text/markdown
+    description: Cross-source deduplication of prompt-writing techniques.
+  - path: "${MINI_ORK_RUN_DIR}/aggregation.md"
+    mime: text/markdown
+    description: Final document containing every per-paper summary and unified guidance.
