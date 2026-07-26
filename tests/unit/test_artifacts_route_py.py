@@ -13,7 +13,16 @@ import sys
 from pathlib import Path
 
 import pytest
-from fastapi.testclient import TestClient
+
+# TestClient needs an httpx backend: newer starlette hard-requires httpx2,
+# older starlette works with httpx (1). CI installs httpx2; local zero-dep
+# runs may have neither — skip cleanly instead of erroring at collection.
+try:
+    from fastapi.testclient import TestClient
+except (ImportError, RuntimeError) as _exc:  # RuntimeError: starlette>=httpx2-only
+    TestClient = None
+    pytestmark = pytest.mark.skip(
+        reason=f"starlette TestClient unavailable (needs httpx2 or httpx): {_exc}")
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
