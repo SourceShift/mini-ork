@@ -17,7 +17,6 @@ sys.path.insert(0, str(REPO))
 from mini_ork.cli import invoke_prompt
 
 BIN = REPO / "bin" / "mini-ork-invoke-prompt"
-REAL_TRACE_STORE = REPO / "lib" / "trace_store.sh"
 
 
 class StubProvider:
@@ -188,8 +187,8 @@ def test_context_role_pack_is_appended_after_substitution(
 
 def test_success_trace_row_is_written(tmp_path: Path) -> None:
     root = _root(tmp_path)
-    (root / "lib").mkdir()
-    (root / "lib" / "trace_store.sh").symlink_to(REAL_TRACE_STORE)
+    # No lib/trace_store.sh anywhere: trace writes are native now
+    # (mini_ork.trace_store), so the bash lib is not even consulted.
     prompt = tmp_path / "prompt.md"
     prompt.write_text("trace me")
     home = tmp_path / "home"
@@ -218,6 +217,20 @@ def test_success_trace_row_is_written(tmp_path: Path) -> None:
         ).fetchone()
     assert rc == 0
     assert row == ("code_fix", "success", "abcdef0123456789")
+    assert not (root / "lib" / "trace_store.sh").exists()
+
+
+def test_invoke_prompt_has_no_bash_trace_store_dependency() -> None:
+    """WS3 guard: the trace-write path must not shell out to bash anymore."""
+    src = (REPO / "mini_ork" / "cli" / "invoke_prompt.py").read_text()
+    assert "import subprocess" not in src
+    assert "subprocess.run" not in src
+
+
+def test_trace_write_is_best_effort_without_db(tmp_path: Path) -> None:
+    """bash parity: `trace_write ... || true` — no MINI_ORK_DB must not raise."""
+    invoke_prompt._trace_write('{"trace_id":"t","status":"success"}',
+                               _env(tmp_path))
 
 
 def test_public_launcher_is_python_and_preserves_bad_args_exit(tmp_path: Path) -> None:

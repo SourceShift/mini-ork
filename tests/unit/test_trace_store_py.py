@@ -83,6 +83,74 @@ def test_reward_g_parity_bash_vs_python(db):
             assert abs(float(bg) - float(pg)) < 1e-9, f"payload {i}: bash={bg} py={pg}"
 
 
+# ── WS3: full-row A/B parity for the exact call-site payload shapes ──────────
+# invoke_prompt.py (running / success / failure upserts) and reflect.py
+# (running + success w/ duration_ms + verifier_output) previously wrote through
+# `bash -c '. lib/trace_store.sh && trace_write …'`. Both now call the native
+# trace_store.trace_write. This gate proves the native-written row is identical
+# in shape to the bash-written row for the same inputs — two separate DBs,
+# full-column diff, modulo created_at (timestamp default) and the db path.
+
+CALL_SITE_PAYLOADS = [
+    # invoke_prompt: 'running' with the payload's prompt_version_hash key (which
+    # trace_write ignores — the column fills from MO_NODE_PROMPT_SHA).
+    {"trace_id": "ab-invoke", "task_class": "code_fix", "status": "running",
+     "prompt_version_hash": "deadbeefcafe1234"},
+    # invoke_prompt: success upsert onto the same trace_id.
+    {"trace_id": "ab-invoke", "status": "success"},
+    # invoke_prompt: failure upsert on a fresh trace_id.
+    {"trace_id": "ab-invoke-fail", "status": "failure"},
+    # reflect: 'running' then success upsert with duration + verifier_output.
+    {"trace_id": "ab-reflect", "task_class": "__reflect__", "status": "running"},
+    {"trace_id": "ab-reflect", "task_class": "__reflect__", "status": "success",
+     "duration_ms": 42000,
+     "verifier_output": {"traces_analyzed": 3, "gradients_written": 2,
+                         "since": 1781000000}},
+]
+
+LINEAGE_ENV = {
+    "MINI_ORK_RUN_ID": "run-42",
+    "MINI_ORK_TASK_RUN_ID": "task-run-7",
+    "MINI_ORK_WORKFLOW_VERSION_ID": "wfv-9",
+    "MO_NODE_PROMPT_SHA": "abcdef0123456789",
+}
+
+
+def _all_rows_by_trace_id(dbp):
+    con = sqlite3.connect(dbp)
+    con.row_factory = sqlite3.Row
+    rows = con.execute("SELECT * FROM execution_traces ORDER BY trace_id").fetchall()
+    con.close()
+    return {r["trace_id"]: dict(r) for r in rows}
+
+
+def test_full_row_ab_parity_bash_vs_python(tmp_path, monkeypatch):
+    db_a = _init_db(tmp_path / "ab-home-a")  # bash-written
+    db_b = _init_db(tmp_path / "ab-home-b")  # native-written
+    for k, v in LINEAGE_ENV.items():
+        monkeypatch.setenv(k, v)
+    for p in CALL_SITE_PAYLOADS:
+        payload = json.dumps(p)
+        subprocess.run(
+            ["bash", "-c", f'. "{TS_SH}" && trace_write "$1"', "_", payload],
+            env={**os.environ, **LINEAGE_ENV, "MINI_ORK_DB": db_a},
+            capture_output=True, text=True, check=True,
+        )
+        trace_store.trace_write(payload, db=db_b)
+    rows_a = _all_rows_by_trace_id(db_a)
+    rows_b = _all_rows_by_trace_id(db_b)
+    assert rows_a.keys() == rows_b.keys()
+    for tid in rows_a:
+        a = {k: v for k, v in rows_a[tid].items() if k != "created_at"}
+        b = {k: v for k, v in rows_b[tid].items() if k != "created_at"}
+        assert a == b, f"row drift for {tid}: " + ", ".join(
+            f"{k}: bash={a[k]!r} py={b[k]!r}" for k in a if a[k] != b[k])
+    # sanity: the lineage env fallbacks actually landed (not vacuously empty)
+    assert rows_b["ab-invoke"]["run_id"] == "task-run-7"
+    assert rows_b["ab-invoke"]["prompt_version_hash"] == "abcdef0123456789"
+    assert json.loads(rows_b["ab-reflect"]["verifier_output"])["traces_analyzed"] == 3
+
+
 def test_roundtrip_get(db):
     tid = trace_store.trace_write(
         {"trace_id": "rt-1", "task_class": "code-fix", "status": "success",
