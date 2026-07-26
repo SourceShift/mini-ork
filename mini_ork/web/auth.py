@@ -88,8 +88,3 @@ def require_token(request: Request) -> str:
     return label
 
 
-def auth_configured() -> bool:
-    """Helper for the serve startup banner: tells operators whether
-    the auth-tokens.txt file is present + non-empty.
-    """
-    return bool(_load_tokens(_token_file_path()))

@@ -25,7 +25,7 @@ import subprocess
 import uuid
 from dataclasses import dataclass, field
 
-__all__ = ["Crucible", "ExecOutcome", "RuntimeSpec", "available_backends", "docker_available"]
+__all__ = ["Crucible", "ExecOutcome", "RuntimeSpec", "available_backends"]
 
 # Backends we can execute in. "docker-cli" is ours (zero-dep); the rest come from the
 # `verifiers` runtime protocol and are what make cloud execution a config change rather
@@ -354,5 +354,3 @@ class Crucible:
         return path
 
 
-def docker_available() -> bool:
-    return shutil.which("docker") is not None
