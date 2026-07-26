@@ -283,6 +283,39 @@ truth)
     so killing a node aborts its children — completes the UI-kill work
     (`src/store/chat/slices/operation/types.ts`).
 
+### Proposed research track — verifier-led escalation and learning
+
+This is a research proposal informed by recent work on recovery-oriented RL
+initialization and interaction-budget policies. It is **not** a claim that
+MiniOrk currently trains or deploys this policy. It builds on the telemetry,
+rubric, checkpoint, and intervention-policy work above.
+
+1. **Decision-checkpoint evidence.** Record the available actions, verifier
+   state, uncertainty, cost, latency, and user-interruption outcome at every
+   escalation decision. A learning system cannot improve a decision it cannot
+   audit.
+2. **Recovery-behavior library.** Mine verifier-grounded failure traces for
+   reusable repair behaviors—reproduce, inspect, narrow scope, rerun a tool,
+   revise a plan, or escalate. Candidates remain human-reviewed or
+   externally verified; a frequent failure is not automatically a good fix.
+3. **Hierarchical escalation policy.** Route a blocked run among: continue
+   locally, use a cheap tool or model, re-plan, choose a stronger capable
+   lane, or interrupt the user. This extends the future `never | required |
+   always` intervention policy rather than replacing safety gates.
+4. **Reward verified information gain.** Evaluate a step by whether it
+   reduces verifier-relevant uncertainty or unlocks a valid next action,
+   then trade that progress against cost, latency, and interruption burden.
+   Do not optimize merely for fewer questions or more activity.
+5. **Offline evaluation before live learning.** Compare the learned router
+   with fixed escalation ladders on held-out, task-class-specific traces.
+   Report verifier pass rate, cost per verified success, time to resolution,
+   false-escalation rate, and unnecessary-interruption rate. Keep
+   deterministic-oracle and human-judged classes separate.
+
+Graduation criterion: a proposed policy needs reproducible improvement over a
+fixed baseline without lowering verifier pass rate or weakening the existing
+promotion and safety gates.
+
 ### Recipe portfolio
 
 - `recipes/research-synthesis/` — multi-source paper synthesis
@@ -330,6 +363,10 @@ These have been considered and intentionally excluded:
    abstraction
 
 ## Last updated
+
+2026-07-26 — README installation path validated in a clean Daytona sandbox;
+dry runs now skip the provider-backed rubric prescreen. Added the proposed
+verifier-led escalation and learning track, explicitly scoped as research.
 
 2026-06-13 — Calibration-list closed (Krippendorff α + citation coverage + Refute-or-Promote + honest CIs gates shipped); Wave 3 mechanical citation verifier landed; Wave 2-A substrate (anchor corpus loader + recall scorer) landed; Phase 2 item 6 (pricing strategy table) + Phase 3 items 8 (Langfuse score mapping) + 9 (verifier rubrics + ground-truth) + 10 (checkpoint/resume primitive) shipped; mini-ork rollback CLI verb wired; 4 session bugs closed (publisher dict-shape, child-implementer artifact path, defensive verdict-write, cleaner.sh stash-pop race causing working-tree file-reversion); OSS hygiene pass
 
