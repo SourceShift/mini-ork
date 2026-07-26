@@ -658,7 +658,15 @@ def dispatch_model(
                 model=request.model,
             )
     try:
-        spec = resolve_provider(request.model, root, environment=effective_env)
+        try:
+            spec = resolve_provider(request.model, root, environment=effective_env)
+        except TypeError as exc:
+            # Keep the resolver seam source-compatible for injected/custom
+            # two-argument resolvers while the built-in resolver consumes the
+            # scoped credential environment above.
+            if "unexpected keyword argument 'environment'" not in str(exc):
+                raise
+            spec = resolve_provider(request.model, root)
     except (ValueError, FileNotFoundError) as exc:
         return DispatchResult(ok=False, rc=2, error=str(exc), model=request.model)
     # Node-scoped tool grants (kickoff/tool-grant-hermetic-dispatch.md):
