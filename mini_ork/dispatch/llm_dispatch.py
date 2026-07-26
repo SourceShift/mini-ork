@@ -136,13 +136,6 @@ def backoff_seconds(attempt, *, _jitter=None) -> int:
                                os.environ.get("MO_DISPATCH_RETRY_BASE_S", "5"), _jitter=_jitter)
 
 
-def glm_backoff_seconds(attempt, *, _jitter=None) -> int:
-    return backoff_seconds_raw(
-        attempt,
-        os.environ.get("MO_GLM_RETRY_MAX_SLEEP_S", os.environ.get("MO_DISPATCH_RETRY_MAX_SLEEP_S", "45")),
-        os.environ.get("MO_GLM_RETRY_BASE_S", os.environ.get("MO_DISPATCH_RETRY_BASE_S", "5")),
-        _jitter=_jitter)
-
 
 def throttle_retryable(model, message, rc, attempt=1, max_attempts=1) -> bool:
     if not model:
