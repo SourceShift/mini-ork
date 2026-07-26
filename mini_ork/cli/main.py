@@ -58,6 +58,7 @@ Recipe runner:
 
 Lifecycle:
   init                           Bootstrap project (creates .mini-ork/)
+  install                        Install or repair the per-user mini-ork command
   update                         Apply migrations + report config drift
   doctor                         Check deps + env vars + lib presence + provider preflight
   providers                      Configure or inspect credentials for workflow lanes
@@ -623,6 +624,11 @@ def _providers_handler(rest, root):
     return providers.main(rest, root=root)
 
 
+def _install_handler(rest, root):
+    from mini_ork.cli import install_command
+    return install_command.main(rest, root=root)
+
+
 def _build_default_registry() -> dict:
     registry = {sub: _native_module_handler(f"mini_ork.cli.{sub}") for sub in _NATIVE_SUBS}
     registry["execute"] = _execute_inprocess
@@ -630,6 +636,7 @@ def _build_default_registry() -> dict:
         registry[sub] = _bash_entrypoint_handler(sub)
     registry["run"] = _run_handler
     registry["doctor"] = _doctor_handler
+    registry["install"] = _install_handler
     registry["providers"] = _providers_handler
     registry["version"] = _version_handler
     for alias in ("help", "--help", "-h"):

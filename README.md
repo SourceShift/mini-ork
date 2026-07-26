@@ -37,11 +37,18 @@ Three load-bearing ideas:
 
 ## Quickstart
 
-Prereqs: `bash` 4+, `sqlite3`, `jq`, `yq`, `git` 2.28+. Agents dispatch through vendor CLIs ([`claude`](https://docs.anthropic.com/en/docs/claude-code) and/or [`codex`](https://github.com/openai/codex)), not raw API keys — install + auth the CLIs your lanes need before any real run. Dry-run mode (`MINI_ORK_DRY_RUN=1`) needs neither.
+Prereqs for a real run: Python 3.11+, `bash` 4+, `sqlite3`, `jq`, `yq`, and `git` 2.28+. Agents dispatch through vendor CLIs ([`claude`](https://docs.anthropic.com/en/docs/claude-code) and/or [`codex`](https://github.com/openai/codex)), not raw API keys — install + auth the CLIs your lanes need before any real run. Dry-run mode (`MINI_ORK_DRY_RUN=1`) needs neither.
 
 ```bash
-# 1. Install (creates symlink in $HOME/.local/bin or /usr/local/bin)
-bash install.sh
+# 1. macOS, Linux, or WSL: install/repair the per-user command.
+./bin/mini-ork install
+
+# Native Windows PowerShell (from the checkout):
+# py -3 .\bin\mini-ork install
+
+# The installer writes a small launcher and updates the user PATH. Open a new
+# terminal after it reports a PATH change, then verify:
+mini-ork version
 
 # 2. Initialize a project (creates .mini-ork/ + seeds state.db + task_classes)
 cd ~/my-project
@@ -60,6 +67,13 @@ MINI_ORK_DRY_RUN=1 mini-ork run code-fix ./kickoff.md
 # 5. Real run — `claude` CLI must be authenticated
 mini-ork run ./kickoff.md
 ```
+
+`mini-ork install` is safe to re-run after moving or updating the checkout. It
+repairs an older MiniOrk launcher automatically, but refuses to replace another
+program named `mini-ork` unless you explicitly pass `--force`. Use
+`--bin-dir <path>` for a custom location, `--no-path` when profile management
+is controlled elsewhere, or `--dry-run` to inspect its changes. `bash install.sh`
+remains a compatibility alias on macOS, Linux, and WSL.
 
 `bin/mini-ork run` exits 0 on verified artifact, 1 on gate failure or escalation. State lives in `${MINI_ORK_DB}` (default: `.mini-ork/state.db`). Inspect with:
 
