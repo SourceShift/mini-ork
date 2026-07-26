@@ -2,14 +2,13 @@
 
 Mirrors the bash CLI byte-for-byte: same flags, same stdout/stderr lines,
 same env-var opt-out toggles (MO_PATTERN_MINER, MO_CROSS_EPIC_GRADIENTS,
-MO_BUG_REPORT_SWEEP, MO_RHO_AGGREGATE, MO_LANE_ROUTER), same SQLite writes
-through the remaining unported Bash side-channel libraries.
+MO_BUG_REPORT_SWEEP, MO_RHO_AGGREGATE, MO_LANE_ROUTER), same SQLite writes.
 
 This module owns the CLI surface and dispatches
 the load-bearing pipeline call (`reflection_run`) to the ported Python
-implementation in `mini_ork.learning.reflection_pipeline`. The rho aggregator
-and lane router are native; pattern-store, cross-epic-gradient, and bug-report
-side channels keep their legacy boundary until their own retirement slices.
+implementation in `mini_ork.learning.reflection_pipeline`. The rho aggregator,
+lane router, trace-store writes, pattern-store, cross-epic-gradient, and
+bug-report side channels are all native now (bash side-channel libs retired).
 Parity is enforced by
 `tests/unit/test_mini_ork_reflect_py.py` (eight standalone golden and
 behavioral contracts captured after pre-retirement byte parity passed).
@@ -26,7 +25,6 @@ import io
 import json
 import os
 import sqlite3
-import subprocess
 import sys
 import time
 from pathlib import Path
@@ -101,63 +99,33 @@ def _build_parser() -> argparse.ArgumentParser:
     return p
 
 
-# ── Subprocess wrapper for unported bash libs ────────────────────────────────
-def _bash_lib_call(lib_name: str, fn_name: str, args: str, env: dict) -> int:
-    """Invoke a bash lib function with the given args. Captures the LAST
-    integer token of stdout; returns 0 on parse failure (mirrors bash's
-    `|| echo 0` fallback).
-
-    The env dict MUST contain MINI_ORK_ROOT and MINI_ORK_DB. Errors on stderr
-    are swallowed (matches bash's `2>/dev/null` semantics) — bash would
-    silently downgrade the integer via the `|| echo 0` fallback.
-    """
-    script = (
-        f'set -Eeuo pipefail\n'
-        f'_require_lib() {{\n'
-        f'  local lib="${{MINI_ORK_ROOT}}/lib/${{1}}.sh"\n'
-        f'  [ ! -f "$lib" ] && {{ echo "lib/${{1}}.sh not yet present (P1 in flight?)" >&2; exit 3; }}\n'
-        f'  source "$lib"\n'
-        f'}}\n'
-        f'_require_lib {lib_name}\n'
-        f'{fn_name} {args}\n'
-    )
-    proc = subprocess.run(
-        ["bash", "-c", script],
-        env=env,
-        capture_output=True,
-        text=True,
-    )
-    if proc.returncode != 0:
-        return 0
-    out = proc.stdout.strip()
-    if not out:
-        return 0
+# ── Trace writes (native trace_store; bash lib/trace_store.sh retired) ──────
+@contextlib.contextmanager
+def _temporary_environ(env: dict):
+    """Expose a subprocess-style environment to an in-process native call."""
+    previous = dict(os.environ)
+    os.environ.clear()
+    os.environ.update(env)
     try:
-        return int(out.split()[-1])
-    except (ValueError, IndexError):
-        return 0
+        yield
+    finally:
+        os.environ.clear()
+        os.environ.update(previous)
 
 
-def _trace_write_bash(payload_json: str, env: dict) -> None:
-    """Write a trace via the unported bash trace_store. Mirrors bash's
+def _trace_write(payload_json: str, env: dict) -> None:
+    """Write a trace via the native mini_ork.trace_store (was: bash
+    lib/trace_store.sh::trace_write). Mirrors bash's
     `trace_write "$payload" >/dev/null 2>&1 || true` semantics — errors are
-    swallowed so reflect never aborts on a tracing failure."""
-    script = (
-        f'set -Eeuo pipefail\n'
-        f'_require_lib() {{\n'
-        f'  local lib="${{MINI_ORK_ROOT}}/lib/${{1}}.sh"\n'
-        f'  [ ! -f "$lib" ] && return 0\n'
-        f'  source "$lib"\n'
-        f'}}\n'
-        f'_require_lib trace_store\n'
-        f'trace_write {json.dumps(payload_json)} >/dev/null 2>&1 || true\n'
-    )
-    subprocess.run(
-        ["bash", "-c", script],
-        env=env,
-        capture_output=True,
-        text=True,
-    )
+    swallowed so reflect never aborts on a tracing failure. Runs inside the
+    given env so the lineage fallbacks (MINI_ORK_DB, MINI_ORK_RUN_ID, …)
+    resolve exactly as they did in the former bash subprocess env."""
+    from mini_ork import trace_store
+    try:
+        with _temporary_environ(env):
+            trace_store.trace_write(payload_json)
+    except Exception:
+        pass
 
 
 # ── Dry-run branch ───────────────────────────────────────────────────────────
@@ -238,7 +206,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # ── trace start ────────────────────────────────────────────────────────
     trace_id = f"tr-reflect-{int(time.time())}-{os.getpid()}"
-    subprocess_env = {
+    trace_env = {
         **os.environ,
         "MINI_ORK_ROOT": os.environ["MINI_ORK_ROOT"],
         "MINI_ORK_HOME": mini_ork_home,
@@ -246,13 +214,13 @@ def main(argv: list[str] | None = None) -> int:
     }
 
     if not dry_run:
-        _trace_write_bash(
+        _trace_write(
             json.dumps({
                 "trace_id": trace_id,
                 "task_class": "__reflect__",
                 "status": "running",
             }),
-            subprocess_env,
+            trace_env,
         )
 
     # ── dry-run branch ─────────────────────────────────────────────────────
@@ -312,7 +280,7 @@ def main(argv: list[str] | None = None) -> int:
     # Native: mine_from_traces() reimplements pattern_store_mine_from_traces in-
     # process (byte-parity verified on the real state.db — both return 9). Unlike
     # cross_epic's promote(), it returns without printing, so no stdout capture is
-    # needed. try/except mirrors _bash_lib_call's `|| echo 0`.
+    # needed. try/except mirrors the retired bash wrapper's `|| echo 0`.
     patterns_written = 0
     if os.environ.get("MO_PATTERN_MINER", "1") != "0":
         window = os.environ.get("MO_PATTERN_MINER_WINDOW", "7d")
@@ -345,7 +313,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # ── side-channel: cross_epic_gradient (MO_CROSS_EPIC_GRADIENTS) ────────
     # Native: promote() reimplements cross_epic_gradient_promote in-process (byte-
-    # parity verified on the real state.db). The try/except mirrors _bash_lib_call's
+    # parity verified on the real state.db). The try/except mirrors the retired bash wrapper's
     # `|| echo 0` — promote() itself propagates sqlite errors, but a side-channel
     # must never crash reflect.
     if os.environ.get("MO_CROSS_EPIC_GRADIENTS", "1") != "0":
@@ -356,7 +324,7 @@ def main(argv: list[str] | None = None) -> int:
         try:
             # promote() prints the count (a bash-heredoc parity artifact its own test
             # asserts) AND returns it; capture the print so it doesn't leak into
-            # reflect's stdout — exactly what _bash_lib_call did with the subprocess's.
+            # reflect's stdout — exactly what the retired bash wrapper did with the subprocess's.
             with contextlib.redirect_stdout(io.StringIO()):
                 cross_written = cross_epic_gradient.promote(
                     min_classes=int(min_classes),
@@ -372,7 +340,7 @@ def main(argv: list[str] | None = None) -> int:
     # Native: bug_report_sweep()/bug_report_promote() reimplement the bash lib in-
     # process (both return-only, no stdout to capture). sweep resolves the db from
     # MINI_ORK_DB (set above) and the runs dir from `home`; promote's repo_root=None
-    # falls back to $MINI_ORK_ROOT — matching the bash _bash_lib_call env. try/except
+    # falls back to $MINI_ORK_ROOT — matching the former bash wrapper env. try/except
     # mirrors `|| echo 0`.
     if os.environ.get("MO_BUG_REPORT_SWEEP", "1") != "0":
         from mini_ork.observability import bug_report
@@ -392,7 +360,7 @@ def main(argv: list[str] | None = None) -> int:
     # ── side-channel: rho_aggregator (MO_RHO_AGGREGATE) ────────────────────
     # Native: aggregate_win_rates() reimplements rho_aggregate_win_rates in-process
     # (byte-parity verified vs live bash on the real state.db — 114/114 rows). The
-    # try/except mirrors _bash_lib_call's `|| echo 0`: a side-channel failure must
+    # try/except mirrors the retired bash wrapper's `|| echo 0`: a side-channel failure must
     # never crash reflect.
     if os.environ.get("MO_RHO_AGGREGATE", "1") != "0":
         from mini_ork.learning import rho_aggregator
@@ -454,7 +422,7 @@ def main(argv: list[str] | None = None) -> int:
             "since": int(since_int),
         },
     })
-    _trace_write_bash(payload, subprocess_env)
+    _trace_write(payload, trace_env)
 
     sys.stdout.write(
         f"reflect: analyzed {traces_analyzed or 0} traces, "
