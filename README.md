@@ -24,26 +24,32 @@ This does **not** create a universal oracle. If there is no trustworthy external
 
 ## Start here
 
-Dry runs need Python 3.11+, Bash 4+, sqlite3, jq, yq, and Git. They do not call a model provider. Real runs additionally need the provider CLIs or provider configuration selected by your lanes.
+`make install` installs the supported local runtime: required OS tools, a checkout-local `.venv`, the `.[full]` Python profile (CLI, local web sidecar, and Crucible), and the per-user `mini-ork` command. Dry runs do not call a model provider. Real runs additionally need the provider CLIs or provider configuration selected by your lanes.
 
 ~~~bash
-# Get MiniOrk and install its per-user command (macOS, Linux, or WSL).
+# Get MiniOrk and install the full runtime (macOS, Linux, or WSL).
 git clone https://github.com/SourceShift/mini-ork.git
 cd mini-ork
-./bin/mini-ork install
+make install
 
-# Open a new terminal if the installer changed PATH, then confirm it works.
+# Open a new terminal if the installer changed PATH, then confirm it uses .venv.
 mini-ork version
 ~~~
 
-On native Windows PowerShell, run this from the checkout instead:
+On native Windows PowerShell, install the OS prerequisites with `winget` first
+(`Python.Python.3.11`, `Git.Git`, `jqlang.jq`, `MikeFarah.yq`, and
+`SQLite.SQLite`), then run this from the checkout:
 
 ~~~powershell
-py -3 .\bin\mini-ork install
+py -3 .\scripts\full_install.py
 mini-ork version
 ~~~
 
-The installer is safe to re-run after an upgrade. Use **mini-ork install --help** to see **--bin-dir**, **--no-path**, **--force**, and **--dry-run**.
+`make install` is safe to re-run after an upgrade. It reuses `.venv`, updates
+the editable package, repairs the managed command, and verifies the OS tools.
+Use `INSTALL_SYSTEM_DEPS=0` only when those tools are already managed outside
+MiniOrk. Use **mini-ork install --help** to see **--bin-dir**, **--no-path**,
+**--force**, and **--dry-run** for the command-only installer.
 
 ### Your first verifier-backed workflow
 
