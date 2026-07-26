@@ -11,9 +11,10 @@ Bash-side contract this port mirrors (verbatim from bin/mini-ork-update):
       MINI_ORK_DB    : state.db path; defaults to <MINI_ORK_HOME>/state.db.
   - Subprocess delegation (strangler-fig — bash is single source of truth):
       * git pull sequence  → `git -C "$ROOT" …` via subprocess.run (3 calls)
-      * sqlite3 schema check → bash `sqlite3 file:DB?mode=ro | grep -qx 1`
-      * migration apply    → `bash db/init.sh` (this database initializer
-        remains an intentional subprocess boundary)
+      * sqlite3 schema check → native Python sqlite query (ported from the
+        bash `sqlite3 file:DB?mode=ro | grep -qx 1` one-liner)
+      * migration apply    → `mini_ork.stores.migrate.init_db` (native Python
+        port of db/init.sh; stdout/stderr re-emitted byte-identically)
   - Output bytes MUST match bash. The [OK]/[WARN]/[FAIL] status helpers, the
     per-line spacing ('  [OK]   ' vs '  [WARN] ' / '  [FAIL] ' — three spaces
     vs one space), the '           suggested: …' followups (11 leading spaces),
@@ -27,11 +28,14 @@ status: alpha
 from __future__ import annotations
 
 import os
+import sqlite3
 import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional
+
+from mini_ork.stores.migrate import init_db
 
 
 def _dq(s: str) -> str:
@@ -112,18 +116,24 @@ def _project_root() -> Path:
 def _schema_has_migration(filename: str, db_path: Path) -> bool:
     """Mirror bash: `[ -f $DB ] || return 1; sqlite3 file:$DB?mode=ro "SELECT COUNT(*) FROM schema_migrations WHERE filename='$1';" 2>/dev/null | grep -qx 1`.
 
-    Delegate to bash subprocess so error formatting (missing DB, sqlite3 not on
-    PATH) is byte-identical between backends.
+    Native sqlite query (read-only URI, like bash's mode=ro). Any error —
+    missing schema_migrations table, unreadable DB — maps to False, matching
+    bash's `2>/dev/null | grep -qx 1` swallowing the sqlite3 error output.
     """
     if not db_path.is_file():
         return False
-    cmd = (
-        f"sqlite3 \"file:{db_path}?mode=ro\" "
-        f"\"SELECT COUNT(*) FROM schema_migrations WHERE filename='{filename}';\" "
-        f"2>/dev/null | grep -qx \"1\""
-    )
-    res = subprocess.run(["bash", "-c", cmd], capture_output=True)
-    return res.returncode == 0
+    try:
+        con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        try:
+            row = con.execute(
+                "SELECT COUNT(*) FROM schema_migrations WHERE filename=?",
+                (filename,),
+            ).fetchone()
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return False
+    return row is not None and row[0] == 1
 
 
 def _list_pending_schema_files(dir_path: Path, label: str, db_path: Path) -> None:
@@ -285,21 +295,16 @@ def update(argv: Optional[List[str]] = None) -> int:
         _list_pending_schema_files(mini_ork_repo / "db" / "views", "view", mini_ork_db)
         _ok("dry-run: state.db not modified")
     else:
-        init_sh = mini_ork_repo / "db" / "init.sh"
-        sub_env = {**os.environ, "MINI_ORK_HOME": str(mini_ork_home), "MINI_ORK_DB": str(mini_ork_db), "MINI_ORK_ROOT": str(mini_ork_repo)}
-        res = subprocess.run(
-            ["bash", str(init_sh)],
-            env=sub_env, capture_output=True, text=True,
-        )
+        rc, out_text, err_text = init_db(db=str(mini_ork_db), root=str(mini_ork_repo))
         # Mirror bash: `bash db/init.sh` inherits stdout/stderr to the parent
         # bash, which the test sees on its captured stdout. Re-emit so the
         # Python port's stdout contains the same lines (e.g. '[apply]   0001_…',
         # '[mini-ork init] Done. Tables: 103') byte-for-byte.
-        if res.stdout:
-            sys.stdout.write(res.stdout)
-        if res.stderr:
-            sys.stderr.write(res.stderr)
-        if res.returncode == 0:
+        if out_text:
+            sys.stdout.write(out_text)
+        if err_text:
+            sys.stderr.write(err_text)
+        if rc == 0:
             _ok("state.db migrations applied")
         else:
             _fail("db/init.sh exited non-zero")

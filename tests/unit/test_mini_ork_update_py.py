@@ -1,8 +1,10 @@
 """Parity gate: mini_ork.cli.update vs bin/mini-ork-update.
 
-Both backends invoke the LIVE bash subprocess for db/init.sh (the not-yet-ported
-peer) so the parity check compares two end-to-end flows against the same
-backing migration code, not two reimplementations.
+The bash backend invokes the LIVE bash db/init.sh; the Python backend runs the
+native Python port (``mini_ork.stores.migrate.init_db`` — which itself is
+gated byte-for-byte against db/init.sh in tests/unit/test_migrate_py.py).
+The parity check therefore compares two end-to-end flows whose migration
+layers are proven-equivalent implementations of the same contract.
 
 Determinism strategy: per-test fake ``MINI_ORK_ROOT`` whose ``db/``,
 ``lib/migrate.sh``, ``config/``, ``recipes/`` are COPIES (not symlinks) of the
