@@ -7,10 +7,17 @@ orchestrator); the ported logic is the epic-collection + verdict gating + branch
 resolution + squash-merge-under-mutex + DB status transition + worktree cleanup.
 
     auto_merge(repo_root, mini_orch_dir, job_id, *, mini_ork_home, state_db,
-               now_iso=None) -> (merged, skipped, failed)
+               now_iso=None, log=None, log_raw=None) -> (merged, skipped, failed)
 
 The mutex is the same mkdir-based cross-job lock (stale-PID takeover); the
 critical section serialises `git merge --squash` + commit across parallel jobs.
+
+Observability (WS5): bash mirrors every status line to stdout AND
+`$job_run_dir/merge.log` via `tee -a`, and appends the raw stdout/stderr of
+the rebase/checkout/merge/commit git commands to the log (`>> merge_log 2>&1`).
+Pass ``log`` (tee-style status lines) and/or ``log_raw`` (file-only command
+output) callables to reproduce that surface; the default ``None`` keeps the
+port silent (its parity-suite behaviour).
 """
 from __future__ import annotations
 
@@ -25,6 +32,28 @@ from pathlib import Path
 def _git(cwd, *args, env=None) -> tuple[str, int]:
     r = subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, text=True, env=env)
     return r.stdout.strip(), r.returncode
+
+
+def _git_full(cwd, *args, env=None) -> tuple[str, str, int]:
+    """Variant returning (stdout, stderr, rc) for the call sites where bash
+    appends the raw command output to merge.log (``>> log 2>&1``)."""
+    r = subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, text=True, env=env)
+    return r.stdout, r.stderr, r.returncode
+
+
+def _emit(log, line: str) -> None:
+    if log is not None:
+        log(line)
+
+
+def _emit_raw(log_raw, *chunks: str) -> None:
+    """Append raw git output (stdout then stderr, bash's `>> log 2>&1`
+    interleave order for the happy path where only one stream is non-empty)."""
+    if log_raw is None:
+        return
+    for chunk in chunks:
+        if chunk:
+            log_raw(chunk)
 
 
 def _identity_env(cwd) -> dict:
@@ -96,7 +125,8 @@ def release_main_mutex(mini_ork_home) -> None:
         shutil.rmtree(lock_path, ignore_errors=True)
 
 
-def stash_colliding_untracked(repo_root, branch, epic, job_id, mini_ork_home, now_stamp) -> int:
+def stash_colliding_untracked(repo_root, branch, epic, job_id, mini_ork_home, now_stamp,
+                              log=None) -> int:
     if os.environ.get("MO_AUTO_MERGE_STASH_UNTRACKED", "1") != "1":
         return 0
     added, _ = _git(repo_root, "diff", "--name-only", "--diff-filter=A", f"main..{branch}")
@@ -115,13 +145,18 @@ def stash_colliding_untracked(repo_root, branch, epic, job_id, mini_ork_home, no
             continue
         if moved == 0:
             os.makedirs(stash_dir, exist_ok=True)
+            _emit(log, f"[auto-merge] {epic} — stashing colliding untracked files to {stash_dir}")
         rel_dir = os.path.join(stash_dir, os.path.dirname(path))
         os.makedirs(rel_dir, exist_ok=True)
         try:
             shutil.move(abs_p, os.path.join(rel_dir, os.path.basename(path)))
             moved += 1
+            _emit(log, f"[auto-merge]   stashed: {path}")
         except OSError:
             pass
+    if moved > 0:
+        _emit(log, f"[auto-merge] {epic} — {moved} untracked file(s) moved aside; "
+                   "merge can now proceed")
     return moved
 
 
@@ -152,11 +187,14 @@ def _worktree_for(repo_root, branch) -> str:
 
 
 def auto_merge(repo_root, mini_orch_dir, job_id, *, mini_ork_home, state_db,
-               now_iso=None, now_stamp="00000000-000000") -> tuple[int, int, int]:
+               now_iso=None, now_stamp="00000000-000000",
+               log=None, log_raw=None) -> tuple[int, int, int]:
     job_run_dir = os.path.join(mini_orch_dir, "runs", job_id)
     merged = skipped = failed = 0
     now = now_iso or subprocess.run(
         ["date", "-u", "+%Y-%m-%dT%H:%M:%S.000Z"], capture_output=True, text=True).stdout.strip()
+
+    _emit(log, f"[auto-merge] starting for job={job_id}")
 
     # ── collect approved epics ──────────────────────────────────────────────
     approved: list[tuple[str, str]] = []
@@ -176,38 +214,53 @@ def auto_merge(repo_root, mini_orch_dir, job_id, *, mini_ork_home, state_db,
         except Exception:
             verdict = "UNKNOWN"
         if verdict != "APPROVE":
+            _emit(log, f"[auto-merge] skip {epic} — verdict={verdict}")
             skipped += 1
             continue
         if _sql(state_db, f"SELECT status FROM epics WHERE id='{epic}';") == "done":
+            _emit(log, f"[auto-merge] skip {epic} — already merged (status=done)")
             skipped += 1
             continue
         kickoff = _sql(state_db, f"SELECT kickoff_path FROM epics WHERE id='{epic}';")
         branch = _resolve_branch(repo_root, kickoff)
         if not branch:
+            _emit(log, f"[auto-merge] FAIL {epic} — no branch in kickoff")
             failed += 1
             continue
         approved.append((epic, branch))
 
     if not approved:
+        _emit(log, "[auto-merge] no approved epics to merge")
         return 0, skipped, failed
+
+    _emit(log, f"[auto-merge] will merge {len(approved)} epic(s): "
+               f"{' '.join(e for e, _ in approved)}")
 
     for epic, branch in approved:
         # 1. conflict pre-flight (rebase fallback omitted-from-happy-path; on
         #    conflict without a rebaseable worktree the epic fails, as in bash)
+        _emit(log, "")
+        _emit(log, f"[auto-merge] ── {epic} ({branch}) ──")
         _, rc = _git(repo_root, "merge-tree", "--write-tree", "main", branch)
         if rc != 0:
+            _emit(log, f"[auto-merge] {epic} has conflicts — attempting rebase first...")
             wt = _worktree_for(repo_root, branch)
             if wt and os.path.isdir(wt):
-                _, rebase_rc = _git(wt, "rebase", "main")
+                wt_out, wt_err, rebase_rc = _git_full(wt, "rebase", "main")
+                _emit_raw(log_raw, wt_out, wt_err)
                 if rebase_rc != 0:
+                    _emit(log, f"[auto-merge] FAIL {epic} — rebase failed, aborting")
                     _git(wt, "rebase", "--abort")
                     failed += 1
                     continue
+                _emit(log, f"[auto-merge] {epic} rebased successfully")
                 _, rc2 = _git(repo_root, "merge-tree", "--write-tree", "main", branch)
                 if rc2 != 0:
+                    _emit(log, f"[auto-merge] FAIL {epic} — still conflicts after rebase")
                     failed += 1
                     continue
             else:
+                _emit(log, f"[auto-merge] FAIL {epic} — no worktree for rebase, skipping")
                 failed += 1
                 continue
 
@@ -215,6 +268,7 @@ def auto_merge(repo_root, mini_orch_dir, job_id, *, mini_ork_home, state_db,
         commit_count = int(commit_count_s) if commit_count_s.isdigit() else 0
         commit_log, _ = _git(repo_root, "log", "--oneline", f"main..{branch}")
         if commit_count == 0:
+            _emit(log, f"[auto-merge] skip {epic} — no commits ahead of main")
             skipped += 1
             continue
 
@@ -222,36 +276,53 @@ def auto_merge(repo_root, mini_orch_dir, job_id, *, mini_ork_home, state_db,
                       f"Squash-merge of {commit_count} commit(s) from mini-ork job '{job_id}'.\n"
                       f"Reviewer verdict: APPROVE (evidence-based DoD).\n\nCommits:\n{commit_log}")
 
+        _emit(log, f"[auto-merge] squash-merging {commit_count} commits...")
+
         if not acquire_main_mutex(mini_ork_home, job_id):
+            _emit(log, f"[auto-merge] FAIL {epic} — could not acquire main-merge lock")
             failed += 1
             continue
         try:
             head_pre, _ = _git(repo_root, "symbolic-ref", "--short", "HEAD")
             if head_pre != "main":
-                _, rc = _git(repo_root, "checkout", "main")
+                _emit(log, f"[auto-merge] root HEAD was '{head_pre or 'DETACHED'}' — checking out main")
+                co_out, co_err, rc = _git_full(repo_root, "checkout", "main")
+                _emit_raw(log_raw, co_out, co_err)
                 if rc != 0:
+                    _emit(log, f"[auto-merge] FAIL {epic} — cannot checkout main (working tree dirty?)")
                     failed += 1
                     continue
-            stash_colliding_untracked(repo_root, branch, epic, job_id, mini_ork_home, now_stamp)
-            _, rc = _git(repo_root, "merge", "--squash", branch)
+            main_tip_before, _ = _git(repo_root, "rev-parse", "main")
+            stash_colliding_untracked(repo_root, branch, epic, job_id, mini_ork_home, now_stamp,
+                                      log=log)
+            mg_out, mg_err, rc = _git_full(repo_root, "merge", "--squash", branch)
+            _emit_raw(log_raw, mg_out, mg_err)
             if rc != 0:
                 _git(repo_root, "merge", "--abort")
                 _git(repo_root, "checkout", "--", ".")
+                _emit(log, f"[auto-merge] FAIL {epic} — squash merge failed")
                 failed += 1
                 continue
-            _, rc = _git(repo_root, "commit", "--no-verify", "-m", squash_msg,
-                         env=_identity_env(repo_root))
+            cm_out, cm_err, rc = _git_full(repo_root, "commit", "--no-verify", "-m", squash_msg,
+                                           env=_identity_env(repo_root))
+            _emit_raw(log_raw, cm_out, cm_err)
             if rc != 0:
                 _git(repo_root, "checkout", "--", ".")
+                _emit(log, f"[auto-merge] FAIL {epic} — commit failed (empty merge?)")
                 failed += 1
                 continue
             merged_sha, _ = _git(repo_root, "rev-parse", "HEAD")
             main_after, _ = _git(repo_root, "rev-parse", "main")
             if main_after != merged_sha:
+                _emit(log, f"[auto-merge] FATAL {epic} — race detected: commit {merged_sha} "
+                           f"is NOT on main (main={main_after}, was={main_tip_before}). "
+                           f"Recover via: git cherry-pick {merged_sha}")
                 failed += 1
                 continue
         finally:
             release_main_mutex(mini_ork_home)
+
+        _emit(log, f"[auto-merge] OK {epic} merged as {merged_sha}")
 
         # 4. DB updates
         latest_run = _sql(state_db, f"SELECT id FROM runs WHERE epic_id='{epic}' ORDER BY id DESC LIMIT 1;")
@@ -264,11 +335,20 @@ def auto_merge(repo_root, mini_orch_dir, job_id, *, mini_ork_home, state_db,
                  f"final_verdict, merged_sha, ended_at) VALUES ('{epic}', 'mini-ork/{job_id}/{epic}', "
                  f"'{branch}', '{base}', 'mini-ork', 'MERGED', '{merged_sha}', '{now}');")
         _sql(state_db, f"UPDATE epics SET status='done', updated_at='{now}' WHERE id='{epic}';")
+        final_status = _sql(state_db, f"SELECT status FROM epics WHERE id='{epic}';")
+        if final_status != "done":
+            _emit(log, f"[auto-merge] WARN {epic} — status update did not stick "
+                       f"(current='{final_status}'). May be blocked by "
+                       "trg_epics_no_done_without_merge.")
 
         wt = _worktree_for(repo_root, branch)
         if wt:
             _git(repo_root, "worktree", "remove", "--force", wt)
+            _emit(log, f"[auto-merge] worktree removed: {wt}")
         _git(repo_root, "branch", "-D", branch)
+        _emit(log, f"[auto-merge] branch deleted: {branch}")
         merged += 1
 
+    _emit(log, "")
+    _emit(log, f"[auto-merge] done: merged={merged} skipped={skipped} failed={failed}")
     return merged, skipped, failed

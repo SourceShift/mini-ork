@@ -96,3 +96,37 @@ def test_expired_not_returned_and_gc(db):
     con.close()
     assert cache.lookup("worker", "E2", "H3", db=db) is None
     assert cache.gc(db) >= 1
+
+
+def test_run_summary_parity(db):
+    """A/B (WS5): ``cache.run_summary`` vs live ``mo_cache_run_summary`` —
+    the sqlite3 ``-column -header`` table must be byte-identical (same CLI,
+    same SQL), including the empty-result case."""
+    con = sqlite3.connect(db)
+    rows = [
+        ("u1", "job-A", "E1", 1, "worker", "h1", "success", 0.5, 2),
+        ("u2", "job-A", "E1", 2, "reviewer", "h2", "success", 1.25, 1),
+        ("u3", "job-A", "E2", 1, "worker", "h1", "success", 0.5, 3),
+        ("u4", "job-B", "E1", 1, "worker", "h9", "success", 9.0, 5),
+        ("u5", "job-A", "E1", 3, "worker", "h0", "success", 0.5, 0),  # no reuses
+    ]
+    for uuid, job, epic, it, stage, h, status, cost, reused in rows:
+        con.execute(
+            "INSERT INTO mini_orch_sessions "
+            "(uuid, job_id, epic_id, iter, stage, input_hash, status, "
+            " output_path, log_path, cost_usd, turns, duration_ms, "
+            " expires_at, reused_count) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (uuid, job, epic, it, stage, h, status, "/o", "/l", cost, 1, 100,
+             "2099-01-01T00:00:00.000Z", reused),
+        )
+    con.commit()
+    con.close()
+
+    py_out = cache.run_summary("job-A", db=db)
+    bash_out = _bash(db, "mo_cache_run_summary job-A")
+    assert py_out.strip() == bash_out.strip()
+    assert "worker" in py_out and "reviewer" in py_out
+    # job with no reused rows → both sides empty
+    assert cache.run_summary("job-none", db=db).strip() == \
+        _bash(db, "mo_cache_run_summary job-none").strip()
