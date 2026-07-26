@@ -99,33 +99,48 @@ add_probe() {
   fi
 }
 
+add_optional_numeric_probe() {
+  # A concise README may link to the feature catalogue instead of repeating
+  # every inventory count. Audit a count when it is claimed; do not make the
+  # absence of an optional marketing claim look like documentation drift.
+  local name="$1" claimed="$2" actual="$3"
+  if [ -n "$claimed" ]; then
+    add_probe "$name" "$claimed" "$actual"
+  elif [ "$VERBOSE" -eq 1 ]; then
+    printf 'Skipping optional README inventory claim: %s\n' "$name"
+  fi
+}
+
 # Probe 1 — lib/*.sh count claim
 lib_count_claim=$(readme_int_after 'framework primitives')
 lib_count_actual=$(count_dir lib '*.sh')
-add_probe "lib/*.sh count"  "${lib_count_claim:-0}"  "$lib_count_actual"
+add_optional_numeric_probe "lib/*.sh count" "$lib_count_claim" "$lib_count_actual"
 
 # Probe 2 — bin/mini-ork-* entrypoint count claim
 bin_count_claim=$(readme_int_after 'user-facing.*bin/mini-ork.*entrypoints')
 bin_count_actual=$(ls bin/mini-ork* 2>/dev/null | wc -l | tr -d ' ')
-add_probe "bin/mini-ork-* entrypoints" "${bin_count_claim:-0}"  "$bin_count_actual"
+add_optional_numeric_probe "bin/mini-ork-* entrypoints" "$bin_count_claim" "$bin_count_actual"
 
 # Probe 3 — migrations count claim
 if [ "${MO_README_SKIP_MIGRATIONS:-0}" != "1" ]; then
   mig_count_claim=$(readme_int_after 'schema migrations')
   mig_count_actual=$(count_dir db/migrations '*.sql')
-  add_probe "db/migrations/*.sql count" "${mig_count_claim:-0}" "$mig_count_actual"
+  add_optional_numeric_probe "db/migrations/*.sql count" "$mig_count_claim" "$mig_count_actual"
 fi
 
-# Probe 4 — recipes table row count vs actual recipes/ dirs
+# Probe 4 — recipe inventory: audit a detailed table when present. A concise
+# README may defer the inventory to recipes/ and the feature catalogue.
 recipes_actual=$(count_subdirs recipes)
+if grep -q '^### RECIPES$' "$MO_README"; then
 recipes_table_rows=$(awk '/^### RECIPES/,/^Add your own/' "$MO_README" \
                      | grep -cE '^\| `[a-z0-9-]+` \|')
 add_probe "recipes table rows" "$recipes_actual" "$recipes_table_rows"
+fi
 
 # Probe 5 — providers count claim
 providers_claim=$(readme_int_after 'model-family wrappers ship')
 providers_actual=$(count_dir lib/providers 'cl_*.sh')
-add_probe "lib/providers/cl_*.sh count" "${providers_claim:-0}" "$providers_actual"
+add_optional_numeric_probe "lib/providers/cl_*.sh count" "$providers_claim" "$providers_actual"
 
 # ── regression-guard probes (specific strings that MUST or MUST NOT be present)
 # Probe 6 — `install.sh --check` MUST NOT come back (audit closed it)
