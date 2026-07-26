@@ -86,6 +86,53 @@ def _bootstrap_install() -> int:
 if len(sys.argv) > 1 and sys.argv[1] == "install":
     raise SystemExit(_bootstrap_install())
 
+
+def _configure_windows_git_bash() -> None:
+    """Use the Bash bundled with Git for Windows when it is not globally exposed."""
+    if os.name != "nt" or shutil.which("bash"):
+        return
+    roots = tuple(
+        Path(value)
+        for value in (os.environ.get("ProgramW6432"), os.environ.get("ProgramFiles"))
+        if value
+    )
+    for candidate in (root / "Git" / "bin" / "bash.exe" for root in roots):
+        if candidate.is_file():
+            os.environ["PATH"] = str(candidate.parent) + os.pathsep + os.environ.get("PATH", "")
+            return
+
+
+def _venv_python(root: Path) -> Path:
+    """Return the checkout runtime Python, optionally overridden for operators."""
+    if configured := os.environ.get("MINI_ORK_VENV"):
+        return _absolute(configured) / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    pointer = root / ".mini-ork" / "runtime-python"
+    if pointer.is_file():
+        try:
+            configured = pointer.read_text(encoding="utf-8").splitlines()
+            if configured and configured[0].strip():
+                return _absolute(configured[0].strip())
+        except OSError:
+            pass
+    venv = root / ".venv"
+    return venv / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+
+
+def _reexec_in_project_venv(root: Path) -> None:
+    """Keep the public command on the dependencies created by ``make install``."""
+    if os.environ.get("MINI_ORK_USE_VENV", "1") == "0" or os.environ.get("MINI_ORK_VENV_ACTIVE") == "1":
+        return
+    python = _venv_python(root)
+    if not python.is_file():
+        return
+    environment = dict(os.environ)
+    environment["MINI_ORK_VENV_ACTIVE"] = "1"
+    os.execve(str(python), [str(python), str(Path(__file__).resolve()), *sys.argv[1:]], environment)
+
+
+_configure_windows_git_bash()
+_reexec_in_project_venv(ENGINE_ROOT)
+
 from mini_ork.cli.main import main  # noqa: E402
 
 
