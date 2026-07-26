@@ -22,16 +22,30 @@ The bash ``mo_run_healer_on_escalate`` function:
 This port reproduces the decision logic and side-effect dispatch. The
 ``decide()`` function is pure and exhaustively parity-tested; the
 ``mo_run_healer_on_escalate()`` entry point mirrors the bash end-to-end
-behaviour (env override of ``MINI_ORK_ROOT``, subprocess to healer.sh /
-cleaner.sh, rc 0/1).
+behaviour (env override of ``MINI_ORK_ROOT``, rc 0/1).
+
+WS5 cutover: the ``bash lib/healer.sh`` / ``bash lib/cleaner.sh``
+subprocess calls are replaced by the staged native ports
+``mini_ork.recovery.healer.decide`` and ``mini_ork.recovery.cleaner.main``
+(imported below as module seams so tests can monkeypatch them, exactly
+like the bash tests stubbed ``$MINI_ORK_ROOT/lib/*.sh``). The stdout/
+stderr/rc forwarding contract is unchanged: healer's stdout is the
+parsed JSON line (its stderr is discarded, as before), and the cleaner's
+captured stdout/stderr lines are forwarded to this bridge's stderr with
+the same six-space indent.
 """
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import subprocess
 import sys
 import time
+
+from mini_ork.recovery import cleaner as _cleaner
+from mini_ork.recovery import healer as _healer
 
 
 WAIT_DEFAULT_S = 30
@@ -252,32 +266,32 @@ def _bump_lesson(lesson_id: "str | None", kind: str) -> None:
 
 def _apply_cleaner(epic: str, epic_run_dir: str,
                    lesson_id: "str | None") -> int:
-    """Apply the ``cleaner-on-main`` recovery (mirrors bash helper)."""
-    mini_root = _mini_ork_root()
-    cleaner = os.path.join(mini_root, "lib", "cleaner.sh")
-    if not os.path.isfile(cleaner):
-        sys.stderr.write("[mini-ork] cleaner.sh not executable — skip\n")
-        return 1
+    """Apply the ``cleaner-on-main`` recovery (mirrors bash helper).
 
+    WS5 cutover: ``bash $MINI_ORK_ROOT/lib/cleaner.sh <brief> <dir>`` →
+    in-process ``mini_ork.recovery.cleaner.main([brief, dir])``. The
+    module is always importable, so the bash "cleaner.sh not executable"
+    guard is obsolete. stdout/stderr are captured and forwarded with the
+    same six-space indent the bash bridge used on the subprocess streams
+    (stdout lines first, then stderr lines).
+    """
     bridge_dir = os.path.join(epic_run_dir, "healer-cleaner")
     brief_path = write_cleaner_brief(bridge_dir, epic, lesson_id)
 
     sys.stderr.write(f"[mini-ork] dispatching cleaner-on-main for {epic}...\n")
     rc = 0
+    out_buf = io.StringIO()
+    err_buf = io.StringIO()
     try:
-        proc = subprocess.run(
-            ["bash", cleaner, brief_path, bridge_dir],
-            capture_output=True, text=True,
-        )
-        for line in (proc.stdout or "").splitlines():
-            sys.stderr.write(f"      {line}\n")
-        if proc.returncode != 0:
-            rc = proc.returncode
-        if proc.stderr:
-            for line in proc.stderr.splitlines():
-                sys.stderr.write(f"      {line}\n")
-    except (OSError, subprocess.SubprocessError):
+        with contextlib.redirect_stdout(out_buf), \
+                contextlib.redirect_stderr(err_buf):
+            rc = int(_cleaner.main([brief_path, bridge_dir]))
+    except Exception:
         rc = 1
+    for line in out_buf.getvalue().splitlines():
+        sys.stderr.write(f"      {line}\n")
+    for line in err_buf.getvalue().splitlines():
+        sys.stderr.write(f"      {line}\n")
 
     if rc == 0:
         _bump_lesson(lesson_id, "success")
@@ -373,25 +387,20 @@ def mo_run_healer_on_escalate(epic: str, epic_run_dir: str,
     if is_bridge_disabled():
         return 1
 
-    mini_root = _mini_ork_root()
-    healer = os.path.join(mini_root, "lib", "healer.sh")
-    if not os.path.isfile(healer):
-        sys.stderr.write(
-            f"[mini-ork] mo-healer not executable at {healer} — bridge "
-            "skipped\n")
-        return 1
-
     sys.stderr.write(
         f"[mini-ork] mo-healer-bridge: classifying ESCALATE for {epic}\n")
 
+    # WS5 cutover: `bash $MINI_ORK_ROOT/lib/healer.sh <epic> <run_dir>` →
+    # in-process mini_ork.recovery.healer.decide. The module is always
+    # importable, so the bash "mo-healer not executable" guard is obsolete.
+    # As in the bash bridge, the healer's rc and stderr are discarded —
+    # only an empty/non-JSON stdout changes the flow.
     healer_out_raw = ""
     try:
-        proc = subprocess.run(
-            ["bash", healer, epic, epic_run_dir],
-            capture_output=True, text=True,
+        _healer_rc, healer_out_raw, _healer_err = _healer.decide(
+            epic, epic_run_dir, mini_ork_root=_mini_ork_root()
         )
-        healer_out_raw = proc.stdout or ""
-    except (OSError, subprocess.SubprocessError):
+    except Exception:
         healer_out_raw = ""
 
     if not healer_out_raw.strip():
@@ -410,9 +419,13 @@ def mo_run_healer_on_escalate(epic: str, epic_run_dir: str,
     lesson_id = decision["lesson_id"]
     matched = decision["matched"]
 
+    # bash prints the raw jq values: lesson as the literal string "null"
+    # when absent, matched as lowercase true/false.
+    lesson_disp = lesson_id if lesson_id is not None else "null"
+    matched_disp = "true" if matched else "false"
     sys.stderr.write(
-        f"[mini-ork] healer -> recovery={action} lesson={lesson_id} "
-        f"matched={matched}\n")
+        f"[mini-ork] healer -> recovery={action} lesson={lesson_disp} "
+        f"matched={matched_disp}\n")
 
     if decision["kind"] == "auto_apply":
         if action == "cleaner-on-main":

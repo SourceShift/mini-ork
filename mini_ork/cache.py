@@ -23,6 +23,7 @@ from __future__ import annotations
 import hashlib
 import os
 import sqlite3
+import subprocess
 import uuid as _uuid
 from datetime import datetime, timedelta, timezone
 
@@ -178,3 +179,36 @@ def gc(db: str | None = None) -> int:
         return cur.rowcount or 0
     finally:
         con.close()
+
+
+def run_summary(job_id: str, db: str | None = None) -> str:
+    """Port of ``mo_cache_run_summary`` (lib/cache.sh) — stats table for
+    COMPLETION_REPORT.md.
+
+    Bash runs ``sqlite3 "$db" -column -header <SQL> 2>/dev/null`` and lets the
+    CLI render the columnar table. The ``-column`` alignment is
+    sqlite3-version-dependent, so the faithful native port delegates the
+    rendering to the same ``sqlite3`` CLI (no bash): same binary, same SQL,
+    byte-identical stdout. Returns "" when sqlite3 is missing or errors —
+    matching bash's stderr-suppressed silent-empty behaviour.
+    """
+    resolved = db_path(db)
+    sql = (
+        "SELECT\n"
+        "      stage,\n"
+        "      SUM(reused_count) AS reuses,\n"
+        "      ROUND(SUM(CASE WHEN reused_count > 0 THEN cost_usd * reused_count ELSE 0 END), 2) AS saved_usd\n"
+        "    FROM mini_orch_sessions\n"
+        f"    WHERE job_id = '{job_id}' AND reused_count > 0\n"
+        "    GROUP BY stage;"
+    )
+    try:
+        proc = subprocess.run(
+            ["sqlite3", resolved, "-column", "-header", sql],
+            capture_output=True, text=True,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    if proc.returncode != 0:
+        return ""
+    return proc.stdout

@@ -31,6 +31,26 @@ DB resolution: bash uses ``${MINI_ORK_DB:?}`` (errors if unset). The
 port raises ValueError when ``db`` is None AND ``MINI_ORK_DB`` is
 unset — it never silently reads a cwd-relative default.
 
+WS5 cutover — runner execution:
+    The bash ``benchmark_run`` shelled out to
+    ``bash -c 'source $MINI_ORK_ROOT/lib/utility_function.sh; <runner_fn>'``
+    with the task JSON on stdin. ``runner_fn`` is now native:
+
+    - a **callable** — invoked in-process with the task dict; it may
+      return a dict (→ JSON-normalised stdout-equivalent), a JSON/plain
+      string (→ stdout-equivalent), or a ``(rc, stdout)`` tuple
+      (→ bash rc + stdout semantics). Exceptions map to the bash
+      subprocess-error path (``err_msg``, ``passed=False``).
+    - the string ``"utility_score"`` — the staged port
+      ``mini_ork.learning.utility_function.score`` computes the score on
+      the task JSON and the stdout contract (``f"{U:.6f}"``, rc 0;
+      rc 1 on invalid JSON) is emulated exactly.
+    - any other string — a legacy shell snippet; unsupported natively
+      (per-task error, ``passed=False``). Migrate to a callable.
+
+    The 300s subprocess timeout is a bash-only concern and is not
+    enforced for in-process runners.
+
 Public surface:
     add(task_json, db=None) -> str           (returns bench_id)
     list_(task_class=None, db=None) -> list[dict]
@@ -42,9 +62,10 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
-import subprocess
 import time
 import uuid
+
+from mini_ork.learning import utility_function as _utility_function
 
 
 def _resolve_db(db: str | None) -> str:
@@ -57,6 +78,46 @@ def _resolve_db(db: str | None) -> str:
 def _resolve_root(root: str | None) -> str:
     resolved = root or os.environ.get("MINI_ORK_ROOT", ".")
     return resolved
+
+
+def _execute_runner(runner_fn, task: dict) -> tuple[str, bool, str | None]:
+    """Execute one benchmark runner natively (WS5).
+
+    Returns ``(run_out, passed, err_msg)`` — the stdout-equivalent
+    (stripped, as the bash path's ``proc.stdout.strip()``), the pre-parse
+    pass flag (bash: ``rc == 0``), and an error message (None on the
+    happy path, mirroring bash's timeout/subprocess-error branches).
+    """
+    if callable(runner_fn):
+        try:
+            out = runner_fn(dict(task))
+        except Exception as e:
+            return "", False, str(e)
+        if isinstance(out, tuple) and len(out) == 2:
+            rc, stdout = out
+            return str(stdout).strip(), int(rc) == 0, None
+        if isinstance(out, (dict, list)):
+            return json.dumps(out), True, None
+        if out is None:
+            return "", True, None
+        return str(out).strip(), True, None
+
+    if isinstance(runner_fn, str) and runner_fn.strip() == "utility_score":
+        # The public API of the sourced lib/utility_function.sh, ported:
+        # score the payload the bash subprocess received on stdin and
+        # emulate its stdout (f"{U:.6f}") + rc contract.
+        try:
+            u = _utility_function.score(json.dumps(task))
+        except ValueError as e:
+            return "", False, str(e)
+        return f"{u:.6f}", True, None
+
+    return (
+        "",
+        False,
+        f"runner_fn {runner_fn!r} is a shell snippet; the bash runner was "
+        "removed (WS5) — pass a Python callable or 'utility_score'",
+    )
 
 
 def add(task_json: str, db: str | None = None) -> str:
@@ -142,7 +203,7 @@ def run(
       - INSERT INTO benchmark_results with the parent run_id
     """
     db = _resolve_db(db)
-    resolved_root = _resolve_root(root)
+    _resolve_root(root)  # accepted for bash-signature compat; runner is native now
     now = int(time.time())
 
     con = sqlite3.connect(db)
@@ -186,20 +247,8 @@ def run(
         err_msg: str | None = None
 
         if runner_fn:
-            try:
-                proc = subprocess.run(
-                    [
-                        "bash",
-                        "-c",
-                        f"source {resolved_root}/lib/utility_function.sh 2>/dev/null; {runner_fn}",
-                    ],
-                    input=json.dumps(t),
-                    capture_output=True,
-                    text=True,
-                    timeout=300,
-                )
-                run_out = proc.stdout.strip()
-                passed = proc.returncode == 0
+            run_out, passed, err_msg = _execute_runner(runner_fn, t)
+            if err_msg is None:
                 try:
                     data = json.loads(run_out)
                     util_score = float(data.get("utility_score", 0.0))
@@ -207,12 +256,6 @@ def run(
                     run_out = json.dumps(data)
                 except Exception:
                     util_score = 1.0 if passed else 0.0
-            except subprocess.TimeoutExpired:
-                err_msg = "timeout"
-                passed = False
-            except Exception as e:
-                err_msg = str(e)
-                passed = False
         else:
             run_out = json.dumps(
                 {"skipped": True, "reason": "no MINI_ORK_WORKFLOW_RUNNER_FN set"}

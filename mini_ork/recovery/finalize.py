@@ -9,10 +9,13 @@ cache-reuse summary table when ``mo_aggregate_cache_stats`` is loaded.
 Co-existence model (strangler-fig): ``lib/finalize.sh`` stays
 byte-identical. This port renders the same markdown section ordering,
 the same printf column widths, the same float-formats (``.4f`` for cost
-trace totals, ``.2f`` for cache-saved dollars), and delegates to the
-SAME bash helpers (``mo_cache_run_summary``, ``mo_auto_merge``,
-``mo_aggregate_cache_stats``) via subprocess so both sides share their
-output. Parity is enforced by the sibling test
+trace totals, ``.2f`` for cache-saved dollars). WS5 cutover: the former
+``bash -c 'source lib/{cache,finalize,auto-merge,pr-create}.sh'`` helpers
+are now the staged native ports — ``mini_ork.cache.run_summary``
+(``mo_cache_run_summary``), ``mini_ork.vcs.auto_merge.auto_merge``
+(``mo_auto_merge``), ``mini_ork.vcs.pr_create.open_pr`` (``mo_open_pr``)
+and ``mini_ork.dispatch.lane_helpers.aggregate_cache_stats``
+(``mo_aggregate_cache_stats``). Parity is enforced by the sibling test
 (``tests/unit/test_finalize_py.py``): >=6 live-subprocess cases; bash
 stdout is the ground-truth reference, deep-diffed against the Python
 report after stripping the volatile ``Generated:`` timestamp and the
@@ -38,10 +41,9 @@ import sqlite3
 import subprocess
 import sys
 
-_LIB_CACHE_SH = "lib/cache.sh"
-_LIB_FINALIZE_SH = "lib/finalize.sh"
-_LIB_AUTO_MERGE_SH = "lib/auto-merge.sh"
-_LIB_PR_CREATE_SH = "lib/pr-create.sh"
+from mini_ork import cache as _cache
+from mini_ork.vcs import auto_merge as _auto_merge
+from mini_ork.vcs import pr_create as _pr_create
 
 _BRANCH_RE = re.compile(r"^>?\s*\*\*Branch:\*\*")
 _ITER_DIR_RE = re.compile(r"iter-(\d+)$")
@@ -171,24 +173,31 @@ def _tail_result_line(log_path: str) -> dict | None:
 
 
 def _init_model(log_path: str) -> str:
-    """Mirror of bash:
+    """Native port of the bash pipeline:
         grep -m1 '"subtype":"init"' "$stage_log" | jq -r '.model // empty' \
           | sed 's/\\[.*\\]//'
-    Returns '?' when no init line or no model."""
+    Returns '?' when no init line, when the FIRST matching line is invalid
+    JSON (grep -m1 stops there — jq failing yields empty), or when the model
+    is missing/null/false (jq `.model // empty`). The sed truncates at the
+    first '[' (greedy .* backtracks to the last ']', always at/after the
+    first '[')."""
     try:
-        proc = subprocess.run(
-            [
-                "bash", "-c",
-                f"grep -m1 '\\\"subtype\\\":\\\"init\\\"' \"{log_path}\" 2>/dev/null"
-                " | jq -r '.model // empty' 2>/dev/null"
-                " | sed 's/\\[.*\\]//'",
-            ],
-            capture_output=True, text=True,
-        )
-        model = proc.stdout.strip()
-        return model or "?"
-    except Exception:
+        with open(log_path, "r", encoding="utf-8", errors="replace") as fh:
+            for raw in fh:
+                if '"subtype":"init"' not in raw:
+                    continue
+                try:
+                    obj = json.loads(raw)
+                except json.JSONDecodeError:
+                    return "?"
+                model = obj.get("model") if isinstance(obj, dict) else None
+                if model is None or model is False:
+                    return "?"
+                model = str(model).split("[", 1)[0].strip()
+                return model or "?"
+    except OSError:
         return "?"
+    return "?"
 
 
 def _render_epics_section(
@@ -230,6 +239,7 @@ def _render_epics_section(
             for cl in _commits_ahead(repo_root, branch):
                 lines.append(f"    {cl}")
         lines.append("")
+    lines.append("")  # bash: section-level `echo` after the epic loop
     return lines
 
 
@@ -316,15 +326,8 @@ def _render_cache_reuse_section(state_db: str, job_id: str) -> list[str]:
         lines.append("")
         lines.append("```")
         try:
-            proc = subprocess.run(
-                [
-                    "bash", "-c",
-                    f"source {_LIB_CACHE_SH}; mo_cache_run_summary \"$1\"",
-                    "_", job_id,
-                ],
-                capture_output=True, text=True,
-            )
-            lines.append(proc.stdout.rstrip("\n"))
+            summary = _cache.run_summary(job_id, db=state_db)
+            lines.append(summary.rstrip("\n"))
         except Exception:
             pass
         lines.append("```")
@@ -332,9 +335,10 @@ def _render_cache_reuse_section(state_db: str, job_id: str) -> list[str]:
         lines.append("Replay cache state:")
         lines.append("")
         lines.append("```")
-        lines.append("  mini-ork replay inspect $JOB_ID")
+        lines.append(f"  mini-ork replay inspect {job_id}")
         lines.append("  mini-ork replay stats")
         lines.append("```")
+    lines.append("")  # bash: section-level `echo` after the replay fence
     return lines
 
 
@@ -350,6 +354,7 @@ def _render_cost_trace(job_run_dir: str, job_run_basename: str) -> list[str]:
         f"{'-'*22} {'-'*22} {'-'*10} {'-'*5} {'-'*12}"
     )
     grand_cost = 0.0
+    rows_seen = 0
     bcap_count = 0
     err_count = 0
     for epic_entry in sorted(os.listdir(job_run_dir)):
@@ -358,9 +363,15 @@ def _render_cost_trace(job_run_dir: str, job_run_basename: str) -> list[str]:
         epic_dir = os.path.join(job_run_dir, epic_entry)
         if not os.path.isdir(epic_dir):
             continue
-        for iter_dir in _iter_dirs(epic_dir):
-            m = _ITER_DIR_RE.match(os.path.basename(iter_dir))
-            iter_n = m.group(1) if m is not None else "0"
+        # bash: for iter_dir in "$epic_dir"iter-*/  — ascending glob order.
+        for iter_name in sorted(os.listdir(epic_dir)):
+            iter_dir = os.path.join(epic_dir, iter_name)
+            if not os.path.isdir(iter_dir):
+                continue
+            m = _ITER_DIR_RE.match(iter_name)
+            if m is None:
+                continue
+            iter_n = m.group(1)
             for stage, log_path in _stage_log_iter(iter_dir):
                 obj = _tail_result_line(log_path)
                 if obj is None:
@@ -376,7 +387,10 @@ def _render_cost_trace(job_run_dir: str, job_run_basename: str) -> list[str]:
                     f"{turns:>5} {cost_fmt:>12}"
                 )
                 lines.append(row)
-                grand_cost += float(cost)
+                rows_seen += 1
+                # bash accumulates via awk 'printf "%.4f", g + c' per row —
+                # rounding to 4dp at EVERY step, not once at the end.
+                grand_cost = float(f"{grand_cost + cost:.4f}")
                 if subtype == "error_max_budget_usd":
                     bcap_count += 1
                 elif isinstance(subtype, str) and subtype.startswith("error_"):
@@ -384,7 +398,9 @@ def _render_cost_trace(job_run_dir: str, job_run_basename: str) -> list[str]:
     lines.append(
         f"{'-'*22} {'-'*22} {'-'*10} {'-'*5} {'-'*12}"
     )
-    grand_fmt = f"{grand_cost:.4f}"
+    # bash prints the raw $_grand_cost shell var: literal "0" when no rows
+    # ran (never awk-formatted), else the per-step-rounded .4f string.
+    grand_fmt = f"{grand_cost:.4f}" if rows_seen else "0"
     lines.append(f"{'TOTAL':<22} {'':<22} {'':<10} {'':>5} {grand_fmt:>12}")
     lines.append("```")
     if bcap_count > 0 or err_count > 0:
@@ -399,6 +415,7 @@ def _render_cost_trace(job_run_dir: str, job_run_basename: str) -> list[str]:
             lines.append(
                 f"- Other stage errors: **{err_count}** — inspect *.log for subtype"
             )
+    lines.append("")  # bash: section-level `echo` after the fence/failures
     return lines
 
 
@@ -437,14 +454,15 @@ def _render_ab_probe(job_run_dir: str, job_run_basename: str) -> list[str]:
                     v_status = "UNKNOWN"
             if os.path.isfile(os.path.join(iter_dir, "no-context-probe.flag")):
                 probe_count += 1
-                probe_cost_sum += sa_cost
+                # bash accumulates via awk 'printf "%.4f", s + c' per iter.
+                probe_cost_sum = float(f"{probe_cost_sum + sa_cost:.4f}")
                 if v_status == "APPROVE":
                     probe_approve += 1
                 if v_status == "REQUEST_CHANGES":
                     probe_reject += 1
             else:
                 control_count += 1
-                control_cost_sum += sa_cost
+                control_cost_sum = float(f"{control_cost_sum + sa_cost:.4f}")
                 if v_status == "APPROVE":
                     control_approve += 1
                 if v_status == "REQUEST_CHANGES":
@@ -452,17 +470,21 @@ def _render_ab_probe(job_run_dir: str, job_run_basename: str) -> list[str]:
     if probe_count == 0 and control_count == 0:
         lines.append("_No spec-author iters found in this run._")
     else:
+        # bash prints the raw shell accumulators: literal "0" for an arm
+        # that never ran (never awk-formatted), else the .4f string.
+        probe_sum_str = f"{probe_cost_sum:.4f}" if probe_count else "0"
+        control_sum_str = f"{control_cost_sum:.4f}" if control_count else "0"
         lines.append("```")
         lines.append(
             f"{'arm':<12} {'iters':>5} {'spec-author_sum':>16} "
             f"{'approves':>10} {'rejects':>10}"
         )
         lines.append(
-            f"{'no-context':<12} {probe_count:>5} {f'{probe_cost_sum:.4f}':>16} "
+            f"{'no-context':<12} {probe_count:>5} {probe_sum_str:>16} "
             f"{probe_approve:>10} {probe_reject:>10}"
         )
         lines.append(
-            f"{'control':<12} {control_count:>5} {f'{control_cost_sum:.4f}':>16} "
+            f"{'control':<12} {control_count:>5} {control_sum_str:>16} "
             f"{control_approve:>10} {control_reject:>10}"
         )
         lines.append("```")
@@ -472,6 +494,7 @@ def _render_ab_probe(job_run_dir: str, job_run_basename: str) -> list[str]:
             "memory hints aren't pulling weight on this epic-class — consider "
             "dropping. If much worse, hints are essential._"
         )
+    lines.append("")  # bash: section-level `echo` before Next actions
     return lines
 
 
@@ -497,24 +520,24 @@ def _render_next_actions(
             if kickoff_path else ""
         )
         if open_pr:
+            # bash: _pr_url=$(mo_open_pr ... 2>/dev/null || true) — captures
+            # the [pr-create] push chatter AND the URL (chatter first), then
+            # prints "  $epic → $_pr_url" verbatim (multi-line when a push
+            # happened). The chatter list reproduces that capture exactly.
+            chatter: list[str] = []
             try:
-                proc = subprocess.run(
-                    [
-                        "bash", "-c",
-                        f"source {_LIB_FINALIZE_SH}; source {_LIB_AUTO_MERGE_SH}; "
-                        f"source {_LIB_PR_CREATE_SH}; "
-                        f"mo_open_pr \"$1\" \"$2\" \"$3\"",
-                        "_", epic_entry, branch,
-                        os.path.join(repo_root, kickoff_path) if kickoff_path else "",
-                    ],
-                    capture_output=True, text=True,
+                _rc, url = _pr_create.open_pr(
+                    epic_entry, branch,
+                    os.path.join(repo_root, kickoff_path) if kickoff_path else "",
+                    repo_root=repo_root, state_db=state_db,
+                    chatter=chatter,
                 )
-                url = proc.stdout.strip()
-                if url:
-                    lines.append(f"  {epic_entry} → {url}")
-                else:
-                    lines.append(f"  {epic_entry} → (PR open skipped; see mini-ork logs)")
             except Exception:
+                url = ""
+            captured = "\n".join(chatter + ([url] if url else []))
+            if captured:
+                lines.append(f"  {epic_entry} → {captured}")
+            else:
                 lines.append(f"  {epic_entry} → (PR open skipped; see mini-ork logs)")
         else:
             lines.append(f"  gh pr create --base main --head {branch} --title \"...\"")
@@ -522,9 +545,22 @@ def _render_next_actions(
     return lines
 
 
-def _auto_merge_block(job_run_dir: str, state_db: str) -> list[str] | None:
+def _auto_merge_block(
+    repo_root: str, orch_dir: str, job_id: str, home: str,
+    job_run_dir: str, state_db: str,
+) -> list[str] | None:
     """Returns the lines to append to the report for the auto-merge phase,
-    or None if MO_AUTO_MERGE=0."""
+    or None if MO_AUTO_MERGE=0.
+
+    WS5 cutover: the bash ``mo_auto_merge`` subprocess is replaced by the
+    native ``mini_ork.vcs.auto_merge.auto_merge``. The bash contract it
+    reproduced:
+      - ``: > merge_log`` truncation at phase start,
+      - every ``[auto-merge] ...`` status line tee'd to BOTH stdout and
+        merge.log,
+      - raw rebase/checkout/merge/commit git output appended to merge.log
+        only (``>> merge_log 2>&1``).
+    The ``log``/``log_raw`` sinks below reproduce that surface exactly."""
     auto_merge = os.environ.get("MO_AUTO_MERGE", "1")
     if auto_merge == "0":
         sys.stderr.write("[mini-ork] auto-merge SKIPPED (MO_AUTO_MERGE=0)\n")
@@ -533,21 +569,41 @@ def _auto_merge_block(job_run_dir: str, state_db: str) -> list[str] | None:
     sys.stdout.write("─" * 65 + "\n")
     sys.stdout.write(" auto-merge phase\n")
     sys.stdout.write("─" * 65 + "\n")
+
+    merge_log = os.path.join(job_run_dir, "merge.log")
     try:
-        subprocess.run(
-            ["bash", "-c", f"source {_LIB_AUTO_MERGE_SH}; mo_auto_merge"],
-            env={**os.environ, "MINI_ORK_DB": state_db},
-            capture_output=False,
+        fh = open(merge_log, "w", encoding="utf-8")  # bash: `: > "$merge_log"`
+    except OSError:
+        fh = None
+
+    def _tee(line: str) -> None:
+        if fh is not None:
+            fh.write(line + "\n")
+            fh.flush()
+        sys.stdout.write(line + "\n")
+
+    def _raw(text: str) -> None:
+        if fh is not None:
+            fh.write(text)
+            fh.flush()
+
+    try:
+        _auto_merge.auto_merge(
+            repo_root, orch_dir, job_id,
+            mini_ork_home=home, state_db=state_db,
+            log=_tee, log_raw=_raw,
         )
     except Exception:
         sys.stderr.write(
             "[mini-ork] WARN auto-merge returned non-zero (some epics skipped)\n"
         )
+    finally:
+        if fh is not None:
+            fh.close()
     lines: list[str] = []
     lines.append("")
     lines.append("## Auto-merge results")
     lines.append("")
-    merge_log = os.path.join(job_run_dir, "merge.log")
     if os.path.isfile(merge_log):
         lines.append("```")
         with open(merge_log, "r", encoding="utf-8", errors="replace") as fh:
@@ -560,21 +616,23 @@ def _auto_merge_block(job_run_dir: str, state_db: str) -> list[str] | None:
 
 def _cache_reuse_summary_block(job_run_dir: str, state_db: str) -> list[str] | None:
     """Returns the lines to append for the prompt-cache summary section,
-    or None if ``mo_aggregate_cache_stats`` is not loaded."""
+    or None when the aggregate capability is not loaded.
+
+    WS5 cutover: bash gates this section on
+    ``declare -F mo_aggregate_cache_stats`` (i.e. the caller sourced
+    ``lib/lane-helpers.sh``) and then shells out to it per iter dir. The
+    native analog of "function declared in the ambient environment" is
+    "port importable in this process" — so the gate is a lazy import of
+    ``mini_ork.dispatch.lane_helpers.aggregate_cache_stats`` (the staged
+    parity port of ``mo_aggregate_cache_stats``). Callers that loaded the
+    bash helper get the section; native callers get it iff the port
+    module is present.
+    """
     try:
-        proc = subprocess.run(
-            [
-                "bash", "-c",
-                f"source {_LIB_CACHE_SH}; declare -F mo_aggregate_cache_stats "
-                f">/dev/null 2>&1 && echo OK || echo NO",
-            ],
-            env={**os.environ, "MINI_ORK_DB": state_db},
-            capture_output=True, text=True,
-        )
-        if proc.stdout.strip() != "OK":
-            return None
+        from mini_ork.dispatch.lane_helpers import aggregate_cache_stats
     except Exception:
         return None
+    del state_db  # bash threaded MINI_ORK_DB env; the aggregate never reads it
     lines: list[str] = []
     lines.append("")
     lines.append("## Cache reuse this run (prompt cache)")
@@ -590,32 +648,28 @@ def _cache_reuse_summary_block(job_run_dir: str, state_db: str) -> list[str] | N
             continue
         if epic_entry.startswith("_"):
             continue
-        for iter_dir in _iter_dirs(epic_dir):
+        # bash: for iter_dir in "$epic_dir"iter-*/  — ascending glob order.
+        for iter_name in sorted(os.listdir(epic_dir)):
+            if not iter_name.startswith("iter-"):
+                continue
+            iter_dir = os.path.join(epic_dir, iter_name)
+            if not os.path.isdir(iter_dir):
+                continue
             try:
-                subprocess.run(
-                    ["bash", "-c", f"source {_LIB_CACHE_SH}; mo_aggregate_cache_stats \"$1\"",
-                     "_", iter_dir],
-                    env={**os.environ, "MINI_ORK_DB": state_db},
-                    capture_output=True,
-                )
+                stats = aggregate_cache_stats(iter_dir)
             except Exception:
                 continue
-            stats_file = os.path.join(iter_dir, "cache-stats.json")
-            if not os.path.isfile(stats_file):
+            if not os.path.isfile(os.path.join(iter_dir, "cache-stats.json")):
                 continue
-            try:
-                with open(stats_file, "r", encoding="utf-8") as fh:
-                    stats = json.load(fh)
-            except (json.JSONDecodeError, OSError):
-                continue
-            m = _ITER_DIR_RE.match(os.path.basename(iter_dir))
-            iter_n = m.group(1) if m is not None else "0"
+            iter_n = iter_name[len("iter-"):]
             r = int(stats.get("cache_read_tokens") or 0)
             c = int(stats.get("cache_creation_tokens") or 0)
             u = int(stats.get("uncached_input_tokens") or 0)
             hr_val = float(stats.get("hit_rate") or 0)
             hr = f"{hr_val * 100:.1f}%"
-            saved = stats.get("estimated_usd_saved") or 0
+            # bash renders this cell via awk 'printf "%.4f"' upstream (the
+            # string survives jq's decNumber round-trip byte-identically).
+            saved = f"{float(stats.get('estimated_usd_saved') or 0):.4f}"
             total_read += r
             total_creation += c
             total_uncached += u
@@ -624,9 +678,11 @@ def _cache_reuse_summary_block(job_run_dir: str, state_db: str) -> list[str] | N
             )
     lines.append("")
     total_saved = total_read * 0.9 * 3 / 1000000
+    # The stray backslash is faithful: bash's printf format is single-quoted,
+    # so `\$` reaches stdout literally (unlike the double-quoted echo above).
     lines.append(
         f"**Totals:** {total_read} cache reads, {total_creation} writes, "
-        f"{total_uncached} uncached input tokens — **~${total_saved:.2f} saved** "
+        f"{total_uncached} uncached input tokens — **~\\${total_saved:.2f} saved** "
         "vs all-uncached."
     )
     return lines
@@ -675,7 +731,9 @@ def mo_finalize(
     with open(report, "w", encoding="utf-8") as fh:
         fh.write("\n".join(sections) + "\n")
 
-    auto_merge_block = _auto_merge_block(job_run_dir, state_db)
+    auto_merge_block = _auto_merge_block(
+        repo_root, orch_dir, job_id, resolved_home, job_run_dir, state_db
+    )
     if auto_merge_block is not None:
         with open(report, "a", encoding="utf-8") as fh:
             fh.write("\n".join(auto_merge_block) + "\n")
