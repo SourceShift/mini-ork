@@ -30,10 +30,27 @@ from mini_ork.gates import rubric_prescreen
 
 _NATIVE_SUBS = {"apply", "classify", "plan", "verify", "reflect", "garden", "validate"}
 
-_EXEC_SUBS = {"improve", "eval",
-              "promote", "init", "update", "spawn", "scheduler", "epics", "bugs",
-              "inject", "review", "traceotter", "metrics", "rollback", "resume", "recover",
-              "serve"}
+# Former bash-trampoline subcommands, now native (bash-removal WS1): sub name
+# → python module. The mapping mirrors lib/runtime-select.sh's delegation table.
+_NATIVE_MODULE_SUBS = {
+    "improve": "mini_ork.cli.improve",
+    "eval": "mini_ork.cli.eval",
+    "promote": "mini_ork.cli.promote",
+    "init": "mini_ork.cli.init",
+    "update": "mini_ork.cli.update",
+    "spawn": "mini_ork.cli.spawn",
+    "scheduler": "mini_ork.scheduler",
+    "epics": "mini_ork.cli.epics",
+    "bugs": "mini_ork.cli.bugs",
+    "inject": "mini_ork.cli.inject",
+    "review": "mini_ork.pre_push_review",
+    "traceotter": "mini_ork.cli.traceotter",
+    "metrics": "mini_ork.cli.metrics",
+    "rollback": "mini_ork.cli.rollback",
+    "resume": "mini_ork.cli.resume",
+    "recover": "mini_ork.recovery.planner",
+    "serve": "mini_ork.cli.serve",
+}
 
 _HELP = """mini-ork — task operating system for agents (v0.1)
 
@@ -72,10 +89,6 @@ Environment:
   MINI_ORK_DB     sqlite3 state db  (default: $MINI_ORK_HOME/state.db)
   MINI_ORK_DRY_RUN  set to 1 for dry-run mode on all subcommands
 """
-
-
-def _bin(root, name):
-    return os.path.join(root, "bin", f"mini-ork-{name}")
 
 
 def _module_env(root):
@@ -559,12 +572,6 @@ def _native_module_handler(module: str):
     return _handler
 
 
-def _bash_entrypoint_handler(name: str):
-    def _handler(rest, root):
-        return subprocess.run([_bin(root, name), *rest]).returncode
-    return _handler
-
-
 def _execute_inprocess(rest, root):
     from mini_ork.cli import execute as mini_ork_execute
     return mini_ork_execute.main(rest, root=root)
@@ -651,8 +658,8 @@ def _build_default_registry() -> dict:
     # name — register it explicitly against mini_ork.cli.recipe_eval.
     registry["recipe-eval"] = _native_module_handler("mini_ork.cli.recipe_eval")
     registry["execute"] = _execute_inprocess
-    for sub in _EXEC_SUBS:
-        registry[sub] = _bash_entrypoint_handler(sub)
+    for sub, module in _NATIVE_MODULE_SUBS.items():
+        registry[sub] = _native_module_handler(module)
     registry["run"] = _run_handler
     registry["doctor"] = _doctor_handler
     registry["install"] = _install_handler
