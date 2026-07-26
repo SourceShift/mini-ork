@@ -1,7 +1,7 @@
 Read the declared graph, draft, and verification report. Create a concise
 operator review packet with:
 
-1. What will be exported if approved.
+1. What will be finalized and included in the aggregation document if approved.
 2. The verifier verdict and unresolved risks.
 3. The exact decision JSON schema below.
 

@@ -8,8 +8,8 @@ Constraints:
 - Identify assumptions separately from supported claims.
 - Record every source URL, publication date, and retrieval date in a source corpus.
 - Keep the graph to no more than eight agentic nodes before deterministic gates.
-- Present the graph and draft for human approval before DSPy export.
+- Present the graph and draft for human approval before finalizing summaries.
 - On revision, preserve valid graph nodes and change only the parts named by
   verifier findings or human feedback.
 
-Desired artifact: a Python DSPy program that represents the approved graph.
+Desired artifact: finalized stage summaries and an aggregation document.
