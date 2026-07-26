@@ -1,0 +1,191 @@
+version: "0.1.0"
+task_class: frontier_llm_research
+description: >
+  Collect 200 recent LibWit papers deterministically, shard the corpus into
+  ten bounded artifact inputs, summarize each source exactly once, deduplicate
+  techniques, and assemble the final Markdown document without losing source
+  provenance.
+
+nodes:
+  - name: libwit_source_collector
+    type: verifier
+    verifier_ref: verifiers/collect-latest-libwit.sh
+    dispatch_mode: serial
+    gates: [budget_gate]
+    outputs: [{ name: source_corpus, kind: json, path: source-corpus.json }]
+
+  - name: corpus_sharder
+    type: verifier
+    verifier_ref: verifiers/shard-corpus.sh
+    dispatch_mode: serial
+    inputs:
+      source_corpus: { required: true }
+    outputs:
+      - { name: source_shard_01, kind: json, path: shards/source-shard-01.json }
+      - { name: source_shard_02, kind: json, path: shards/source-shard-02.json }
+      - { name: source_shard_03, kind: json, path: shards/source-shard-03.json }
+      - { name: source_shard_04, kind: json, path: shards/source-shard-04.json }
+      - { name: source_shard_05, kind: json, path: shards/source-shard-05.json }
+      - { name: source_shard_06, kind: json, path: shards/source-shard-06.json }
+      - { name: source_shard_07, kind: json, path: shards/source-shard-07.json }
+      - { name: source_shard_08, kind: json, path: shards/source-shard-08.json }
+      - { name: source_shard_09, kind: json, path: shards/source-shard-09.json }
+      - { name: source_shard_10, kind: json, path: shards/source-shard-10.json }
+
+  - name: summarize_shard_01
+    type: researcher
+    model_lane: researcher
+    prompt_ref: prompts/summarize-shard.md
+    dispatch_mode: parallel
+    gates: [budget_gate]
+    inputs: { source_shard: { required: true } }
+    outputs: [{ name: summary_shard_01, kind: json, path: summaries/shard-01.json }]
+  - name: summarize_shard_02
+    type: researcher
+    model_lane: researcher
+    prompt_ref: prompts/summarize-shard.md
+    dispatch_mode: parallel
+    gates: [budget_gate]
+    inputs: { source_shard: { required: true } }
+    outputs: [{ name: summary_shard_02, kind: json, path: summaries/shard-02.json }]
+  - name: summarize_shard_03
+    type: researcher
+    model_lane: researcher
+    prompt_ref: prompts/summarize-shard.md
+    dispatch_mode: parallel
+    gates: [budget_gate]
+    inputs: { source_shard: { required: true } }
+    outputs: [{ name: summary_shard_03, kind: json, path: summaries/shard-03.json }]
+  - name: summarize_shard_04
+    type: researcher
+    model_lane: researcher
+    prompt_ref: prompts/summarize-shard.md
+    dispatch_mode: parallel
+    gates: [budget_gate]
+    inputs: { source_shard: { required: true } }
+    outputs: [{ name: summary_shard_04, kind: json, path: summaries/shard-04.json }]
+  - name: summarize_shard_05
+    type: researcher
+    model_lane: researcher
+    prompt_ref: prompts/summarize-shard.md
+    dispatch_mode: parallel
+    gates: [budget_gate]
+    inputs: { source_shard: { required: true } }
+    outputs: [{ name: summary_shard_05, kind: json, path: summaries/shard-05.json }]
+  - name: summarize_shard_06
+    type: researcher
+    model_lane: researcher
+    prompt_ref: prompts/summarize-shard.md
+    dispatch_mode: parallel
+    gates: [budget_gate]
+    inputs: { source_shard: { required: true } }
+    outputs: [{ name: summary_shard_06, kind: json, path: summaries/shard-06.json }]
+  - name: summarize_shard_07
+    type: researcher
+    model_lane: researcher
+    prompt_ref: prompts/summarize-shard.md
+    dispatch_mode: parallel
+    gates: [budget_gate]
+    inputs: { source_shard: { required: true } }
+    outputs: [{ name: summary_shard_07, kind: json, path: summaries/shard-07.json }]
+  - name: summarize_shard_08
+    type: researcher
+    model_lane: researcher
+    prompt_ref: prompts/summarize-shard.md
+    dispatch_mode: parallel
+    gates: [budget_gate]
+    inputs: { source_shard: { required: true } }
+    outputs: [{ name: summary_shard_08, kind: json, path: summaries/shard-08.json }]
+  - name: summarize_shard_09
+    type: researcher
+    model_lane: researcher
+    prompt_ref: prompts/summarize-shard.md
+    dispatch_mode: parallel
+    gates: [budget_gate]
+    inputs: { source_shard: { required: true } }
+    outputs: [{ name: summary_shard_09, kind: json, path: summaries/shard-09.json }]
+  - name: summarize_shard_10
+    type: researcher
+    model_lane: researcher
+    prompt_ref: prompts/summarize-shard.md
+    dispatch_mode: parallel
+    gates: [budget_gate]
+    inputs: { source_shard: { required: true } }
+    outputs: [{ name: summary_shard_10, kind: json, path: summaries/shard-10.json }]
+
+  - name: technique_rollup
+    type: verifier
+    verifier_ref: verifiers/prepare-technique-rollup.sh
+    dispatch_mode: serial
+    inputs: { source_summaries: { required: true, many: true } }
+    outputs: [{ name: technique_rollup, kind: json, path: technique-rollup.json }]
+
+  - name: technique_synthesizer
+    type: researcher
+    model_lane: kimi_lens
+    prompt_ref: prompts/synthesize-techniques.md
+    dispatch_mode: serial
+    gates: [budget_gate]
+    inputs: { technique_rollup: { required: true } }
+    outputs: [{ name: unified_techniques, kind: markdown, path: unified-techniques.md }]
+
+  - name: aggregation_document
+    type: verifier
+    verifier_ref: verifiers/assemble-aggregation.sh
+    dispatch_mode: serial
+    inputs:
+      source_summaries: { required: true, many: true }
+      unified_techniques: { required: true }
+    outputs: [{ name: aggregation, kind: markdown, path: aggregation.md }]
+
+  - name: research_completeness
+    type: verifier
+    verifier_ref: verifiers/verify-aggregation.sh
+    dispatch_mode: serial
+    inputs: { aggregation: { required: true } }
+
+  - { name: rollback, type: rollback, prompt_ref: null, dispatch_mode: serial }
+
+edges:
+  - { from: libwit_source_collector, to: corpus_sharder, edge_type: supplies_context_to, from_output: source_corpus, to_input: source_corpus }
+  - { from: corpus_sharder, to: summarize_shard_01, edge_type: supplies_context_to, from_output: source_shard_01, to_input: source_shard }
+  - { from: corpus_sharder, to: summarize_shard_02, edge_type: supplies_context_to, from_output: source_shard_02, to_input: source_shard }
+  - { from: corpus_sharder, to: summarize_shard_03, edge_type: supplies_context_to, from_output: source_shard_03, to_input: source_shard }
+  - { from: corpus_sharder, to: summarize_shard_04, edge_type: supplies_context_to, from_output: source_shard_04, to_input: source_shard }
+  - { from: corpus_sharder, to: summarize_shard_05, edge_type: supplies_context_to, from_output: source_shard_05, to_input: source_shard }
+  - { from: corpus_sharder, to: summarize_shard_06, edge_type: supplies_context_to, from_output: source_shard_06, to_input: source_shard }
+  - { from: corpus_sharder, to: summarize_shard_07, edge_type: supplies_context_to, from_output: source_shard_07, to_input: source_shard }
+  - { from: corpus_sharder, to: summarize_shard_08, edge_type: supplies_context_to, from_output: source_shard_08, to_input: source_shard }
+  - { from: corpus_sharder, to: summarize_shard_09, edge_type: supplies_context_to, from_output: source_shard_09, to_input: source_shard }
+  - { from: corpus_sharder, to: summarize_shard_10, edge_type: supplies_context_to, from_output: source_shard_10, to_input: source_shard }
+  - { from: summarize_shard_01, to: technique_rollup, edge_type: supplies_context_to, from_output: summary_shard_01, to_input: source_summaries }
+  - { from: summarize_shard_02, to: technique_rollup, edge_type: supplies_context_to, from_output: summary_shard_02, to_input: source_summaries }
+  - { from: summarize_shard_03, to: technique_rollup, edge_type: supplies_context_to, from_output: summary_shard_03, to_input: source_summaries }
+  - { from: summarize_shard_04, to: technique_rollup, edge_type: supplies_context_to, from_output: summary_shard_04, to_input: source_summaries }
+  - { from: summarize_shard_05, to: technique_rollup, edge_type: supplies_context_to, from_output: summary_shard_05, to_input: source_summaries }
+  - { from: summarize_shard_06, to: technique_rollup, edge_type: supplies_context_to, from_output: summary_shard_06, to_input: source_summaries }
+  - { from: summarize_shard_07, to: technique_rollup, edge_type: supplies_context_to, from_output: summary_shard_07, to_input: source_summaries }
+  - { from: summarize_shard_08, to: technique_rollup, edge_type: supplies_context_to, from_output: summary_shard_08, to_input: source_summaries }
+  - { from: summarize_shard_09, to: technique_rollup, edge_type: supplies_context_to, from_output: summary_shard_09, to_input: source_summaries }
+  - { from: summarize_shard_10, to: technique_rollup, edge_type: supplies_context_to, from_output: summary_shard_10, to_input: source_summaries }
+  - { from: technique_rollup, to: technique_synthesizer, edge_type: supplies_context_to, from_output: technique_rollup, to_input: technique_rollup }
+  - { from: summarize_shard_01, to: aggregation_document, edge_type: supplies_context_to, from_output: summary_shard_01, to_input: source_summaries }
+  - { from: summarize_shard_02, to: aggregation_document, edge_type: supplies_context_to, from_output: summary_shard_02, to_input: source_summaries }
+  - { from: summarize_shard_03, to: aggregation_document, edge_type: supplies_context_to, from_output: summary_shard_03, to_input: source_summaries }
+  - { from: summarize_shard_04, to: aggregation_document, edge_type: supplies_context_to, from_output: summary_shard_04, to_input: source_summaries }
+  - { from: summarize_shard_05, to: aggregation_document, edge_type: supplies_context_to, from_output: summary_shard_05, to_input: source_summaries }
+  - { from: summarize_shard_06, to: aggregation_document, edge_type: supplies_context_to, from_output: summary_shard_06, to_input: source_summaries }
+  - { from: summarize_shard_07, to: aggregation_document, edge_type: supplies_context_to, from_output: summary_shard_07, to_input: source_summaries }
+  - { from: summarize_shard_08, to: aggregation_document, edge_type: supplies_context_to, from_output: summary_shard_08, to_input: source_summaries }
+  - { from: summarize_shard_09, to: aggregation_document, edge_type: supplies_context_to, from_output: summary_shard_09, to_input: source_summaries }
+  - { from: summarize_shard_10, to: aggregation_document, edge_type: supplies_context_to, from_output: summary_shard_10, to_input: source_summaries }
+  - { from: technique_synthesizer, to: aggregation_document, edge_type: supplies_context_to, from_output: unified_techniques, to_input: unified_techniques }
+  - { from: aggregation_document, to: research_completeness, edge_type: verifies, from_output: aggregation, to_input: aggregation }
+  - { from: libwit_source_collector, to: rollback, edge_type: escalates_to, condition: fail }
+  - { from: corpus_sharder, to: rollback, edge_type: escalates_to, condition: fail }
+  - { from: technique_rollup, to: rollback, edge_type: escalates_to, condition: fail }
+  - { from: aggregation_document, to: rollback, edge_type: escalates_to, condition: fail }
+  - { from: research_completeness, to: rollback, edge_type: escalates_to, condition: fail }
+
+rollback_strategy: retain_source_manifest_and_completed_shards
+source_artifact: aggregation.md
