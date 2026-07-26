@@ -1,5 +1,6 @@
 # mini-ork — operator targets.
 #
+# install             Provision system tools, the project venv, Python extras, and the command.
 # install-hooks       Activate .githooks/ as the project's hooks dir.
 # readme-claim-check  Run Layer 1 mechanical drift check (sub-second, free).
 # readme-drift-panel  Run Layer 2b 4-lens drift audit (manual; ~$0.30 / 30-60s).
@@ -13,15 +14,21 @@
 # web-up              Boot API + Vite dev in parallel (Ctrl-C kills both).
 # web-test            Run the observability smoke test suite.
 
-.PHONY: install-hooks uninstall-hooks readme-claim-check readme-drift-panel help test \
+.PHONY: install install-system-deps install-hooks uninstall-hooks readme-claim-check readme-drift-panel help test \
         web-deps web-build web-serve web-dev web-up web-test dev-all \
         lint lint-advisory \
         worktree worktree-merge worktree-clean worktree-list
 
 PORT ?= 7090
+VENV ?= .venv
+PYTHON ?= python3
+INSTALL_SYSTEM_DEPS ?= 1
+INSTALL_ARGS ?=
 
 help:
 	@echo "mini-ork operator targets:"
+	@echo "  make install             install system tools + .venv + full Python runtime + command"
+	@echo "  make install-system-deps install required OS commands through the available package manager"
 	@echo "  make install-hooks       activate .githooks/ (one-time setup per clone)"
 	@echo "  make uninstall-hooks     reset to git default hooks dir"
 	@echo "  make readme-claim-check  run mechanical README drift check (Layer 1)"
@@ -58,6 +65,17 @@ install-hooks:
 uninstall-hooks:
 	@git config --unset core.hooksPath 2>/dev/null || true
 	@echo "✓ hooks dir reset to git default"
+
+install-system-deps:
+	@bash scripts/install-system-deps.sh
+
+install:
+	@if [ "$(INSTALL_SYSTEM_DEPS)" = "1" ]; then \
+		$(MAKE) --no-print-directory install-system-deps; \
+	else \
+		echo "→ skipping system dependency provisioning (INSTALL_SYSTEM_DEPS=0)"; \
+	fi
+	@$(PYTHON) scripts/full_install.py --venv "$(VENV)" $(INSTALL_ARGS)
 
 test:
 	@python3 -m pytest -q
