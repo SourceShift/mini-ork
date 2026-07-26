@@ -8,7 +8,7 @@ success_verifiers:
 failure_policy: escalate
 rollback_policy: keep_prompt_graph_evidence_and_decision_artifacts
 
-source_artifact: dspy-program.py
+source_artifact: aggregation.md
 outputs:
   - path: "${MINI_ORK_RUN_DIR}/prompt-brief.json"
     mime: application/json
@@ -37,6 +37,9 @@ outputs:
   - path: "${MINI_ORK_RUN_DIR}/human-decision.json"
     mime: application/json
     description: Durable operator approval or feedback decision.
-  - path: "${MINI_ORK_RUN_DIR}/dspy-program.py"
-    mime: text/x-python
-    description: DSPy signatures and modules exported from the approved graph.
+  - path: "${MINI_ORK_RUN_DIR}/final-summaries.json"
+    mime: application/json
+    description: Finalized, evidence-linked summaries for every completed stage.
+  - path: "${MINI_ORK_RUN_DIR}/aggregation.md"
+    mime: text/markdown
+    description: Aggregated document built only from the finalized summaries.
