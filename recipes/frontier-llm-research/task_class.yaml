@@ -1,0 +1,37 @@
+name: frontier_llm_research
+version: "0.1.0"
+description: >
+  Evidence-led survey of current LibWit papers on frontier-LLM architecture,
+  inference-time compute, planning, prompting, RLMs, and tool use. The recipe
+  collects a dated corpus, summarizes fixed source shards, then preserves every
+  source summary while deduplicating cross-source prompt guidance.
+
+matches:
+  keywords:
+    - frontier LLM research
+    - inference-time compute
+    - test-time scaling
+    - RLM
+    - recursive language model
+    - prompt best practices
+    - latest LLM papers
+    - LibWit papers
+    - literature synthesis
+  regex: []
+
+artifact_contract_ref: artifact_contract.yaml
+default_workflow: workflow.yaml
+
+default_gates:
+  - budget_gate
+
+risk_class: low
+
+cost_model:
+  min_usd: 2
+  max_usd: 12
+  per_lens_usd: 0.8
+
+runtime_model:
+  min_minutes: 10
+  max_minutes: 60
