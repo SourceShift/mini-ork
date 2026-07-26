@@ -218,3 +218,210 @@ def test_status_counts_parity(tmp_path, migdir):
     assert m, f"no summary line in bash mo_migrate_status output:\n{out_b}"
     bash_counts = tuple(map(int, m.groups()))
     assert bash_counts == port == (3, 1, 1, 4)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# WS2: dot-command migrations + init_db (db/init.sh port)
+# ──────────────────────────────────────────────────────────────────────────────
+
+INIT_SH = REPO / "db" / "init.sh"
+
+# .read "|sh -c '…'" in the shape of the shipped 0042/0044/0049 guards: a shell
+# pipeline whose stdout (conditional ALTER TABLE) becomes SQL. Uses the same
+# backslash-escaped quoting style as the real migrations (\" inside the
+# double-quoted dot-command arg), which the sqlite3 CLI resolves via
+# resolve_backslashes() — the port mirrors that in _unquote.
+DOTCMD_MIGS = {
+    "001_seed.sql": "CREATE TABLE seeded (id INTEGER PRIMARY KEY, v TEXT);\n",
+    "002_dotcmd.sql": (
+        "-- exercises .read \"|sh -c …\" with MINI_ORK_DB from the environment\n"
+        ".read \"|sh -c 'db=\\\"${MINI_ORK_DB:?}\\\"; "
+        "have=$(sqlite3 \\\"$db\\\" \\\"SELECT COUNT(*) FROM pragma_table_info(\\\\\\\"seeded\\\\\\\") WHERE name = \\\\\\\"extra\\\\\\\";\\\"); "
+        "if [ \\\"${have:-0}\\\" = \\\"0\\\" ]; then printf \\\"%s\\\\n\\\" \\\"ALTER TABLE seeded ADD COLUMN extra TEXT DEFAULT NULL;\\\"; fi'\"\n"
+    ),
+}
+
+# .once / .read <file> / .shell in the shape of shipped 0039: generate SQL via a
+# SELECT into a temp file, read it back, then clean up.
+ONCE_MIGS = {
+    "001_seed.sql": "CREATE TABLE seed2 (id INTEGER PRIMARY KEY, v TEXT);\n",
+    "002_once.sql": (
+        ".once {tmp}\n"
+        "SELECT 'CREATE INDEX IF NOT EXISTS idx_seed2_v ON seed2(v);';\n"
+        ".read {tmp}\n"
+        ".shell rm -f {tmp}\n"
+    ),
+}
+
+
+def _dotcmd_migdir(tmp_path, migs):
+    d = tmp_path / "migrations"
+    d.mkdir()
+    for name, sql in migs.items():
+        (d / name).write_text(sql.replace("{tmp}", str(tmp_path / "gen.sql")))
+    return str(d)
+
+
+def _schema_dump(db):
+    """`.schema` via the sqlite3 CLI — the canonical text both sides produce."""
+    r = subprocess.run(["sqlite3", db, ".schema"], capture_output=True, text=True)
+    assert r.returncode == 0
+    return r.stdout
+
+
+def test_dot_command_read_pipe_parity(tmp_path):
+    """A migration using `.read "|sh -c '…'"` must produce identical DBs on the
+    bash runner and the Python port: the shell pipeline's stdout is inlined as
+    SQL (with MINI_ORK_DB exported), and its conditional ALTER fires."""
+    migdir = _dotcmd_migdir(tmp_path, DOTCMD_MIGS)
+    db_b, db_p = str(tmp_path / "b.db"), str(tmp_path / "p.db")
+
+    out_b, err_b, rc_b = _bash("mo_migrate_apply", migdir, "0", db=db_b)
+    rc_p, out_p = mig.migrate_apply(migdir, db=db_p)
+    assert rc_b == rc_p == 0, f"bash={rc_b} py={rc_p} stderr={err_b}"
+    assert _sm_rows(db_b) == _sm_rows(db_p)
+    assert _tables(db_b) == _tables(db_p)
+    assert _schema_dump(db_b) == _schema_dump(db_p)
+    # the conditional ALTER fired on both sides
+    assert "extra" in _schema_dump(db_p)
+    assert [l.strip() for l in out_b.splitlines() if "[ok]" in l] == \
+        [l.strip() for l in out_p if "[ok]" in l]
+
+
+def test_dot_command_once_read_shell_parity(tmp_path):
+    """`.once <file>` + SELECT + `.read <file>` + `.shell rm` (shipped 0039's
+    shape) must run identically on both backends: generated SQL is applied and
+    the scratch file is removed."""
+    migdir = _dotcmd_migdir(tmp_path, ONCE_MIGS)
+    db_b, db_p = str(tmp_path / "b.db"), str(tmp_path / "p.db")
+
+    _, _, rc_b = _bash("mo_migrate_apply", migdir, "0", db=db_b)
+    rc_p, _ = mig.migrate_apply(migdir, db=db_p)
+    assert rc_b == rc_p == 0
+    assert _schema_dump(db_b) == _schema_dump(db_p)
+    assert "idx_seed2_v" in _schema_dump(db_p)
+    assert not (tmp_path / "gen.sql").exists()  # .shell rm fired
+    assert _sm_rows(db_b) == _sm_rows(db_p)
+
+
+def test_dot_command_unsupported_fails_closed(tmp_path):
+    """A dot-command outside the supported subset must fail the migration
+    (rolled back, rc=1) rather than being silently skipped."""
+    d = tmp_path / "migrations"
+    d.mkdir()
+    (d / "001_ok.sql").write_text("CREATE TABLE good (id INTEGER);\n")
+    (d / "002_bad.sql").write_text(".mode csv\nCREATE TABLE bad (id INTEGER);\n")
+    db = str(tmp_path / "x.db")
+    rc, _ = mig.migrate_apply(str(d), db=db)
+    assert rc == 1
+    tables = _tables(db)
+    assert "good" in tables and "bad" not in tables
+
+
+def _clean_init_env(db):
+    env = {k: v for k, v in os.environ.items() if not k.startswith("MO_")}
+    env.pop("MINI_ORK_DB", None)
+    env["MINI_ORK_ROOT"] = str(REPO)
+    return env
+
+
+def test_init_db_real_repo_schema_parity(tmp_path):
+    """The A/B gate: bash db/init.sh on a fresh DB (A) vs init_db on a fresh
+    DB (B) against the REAL db/migrations + db/views — .schema dumps and
+    sqlite_master listings must be byte-identical, schema_migrations rows
+    identical (applied_at excluded), and stdout/stderr byte-equal modulo the
+    DB path."""
+    db_a, db_b = str(tmp_path / "a.db"), str(tmp_path / "b.db")
+    env = _clean_init_env(db_a)
+    rb = subprocess.run(["bash", str(INIT_SH)], env={**env, "MINI_ORK_DB": db_a},
+                        capture_output=True, text=True)
+    assert rb.returncode == 0, f"bash init.sh failed:\n{rb.stdout}\n{rb.stderr}"
+
+    old = os.environ.pop("MINI_ORK_DB", None)
+    try:
+        rc_p, out_p, err_p = mig.init_db(db=db_b, root=str(REPO))
+    finally:
+        if old is not None:
+            os.environ["MINI_ORK_DB"] = old
+    assert rc_p == 0, f"init_db failed:\n{out_p}\n{err_p}"
+
+    # stdout/stderr byte-equal modulo the db path spelling
+    assert rb.stdout.replace(db_a, "<DB>") == out_p.replace(db_b, "<DB>")
+    assert rb.stderr == err_p
+
+    # the core deliverable: schema A/B diff must be empty
+    assert _schema_dump(db_a) == _schema_dump(db_b)
+    names_a = [r[0] for r in sqlite3.connect(db_a).execute(
+        "SELECT name FROM sqlite_master ORDER BY name").fetchall()]
+    names_b = [r[0] for r in sqlite3.connect(db_b).execute(
+        "SELECT name FROM sqlite_master ORDER BY name").fetchall()]
+    assert names_a == names_b
+    assert _sm_rows(db_a) == _sm_rows(db_b)
+    # sanity: the full 111-table schema really got built
+    assert _schema_dump(db_b).count("CREATE TABLE") >= 100
+
+
+def test_init_db_idempotent_rerun(tmp_path):
+    """Second init_db run applies nothing and stays rc=0 with the same
+    stdout shape as bash's rerun (DB line + Done line only)."""
+    db_a, db_b = str(tmp_path / "a.db"), str(tmp_path / "b.db")
+    env = _clean_init_env(db_a)
+    for args, kw in ((["bash", str(INIT_SH)], {"env": {**env, "MINI_ORK_DB": db_a}}),
+                     (["bash", str(INIT_SH)], {"env": {**env, "MINI_ORK_DB": db_a}})):
+        r = subprocess.run(args, capture_output=True, text=True, **kw)
+        assert r.returncode == 0
+    rerun_bash = r
+
+    old = os.environ.pop("MINI_ORK_DB", None)
+    try:
+        rc1, _, _ = mig.init_db(db=db_b, root=str(REPO))
+        rc2, out2, err2 = mig.init_db(db=db_b, root=str(REPO))
+    finally:
+        if old is not None:
+            os.environ["MINI_ORK_DB"] = old
+    assert rc1 == rc2 == 0
+    assert rerun_bash.stdout.replace(db_a, "<DB>") == out2.replace(db_b, "<DB>")
+    assert rerun_bash.stderr == err2
+    assert "[apply]" not in out2
+    assert _schema_dump(db_a) == _schema_dump(db_b)
+
+
+def test_init_db_checksum_drift_refusal(tmp_path):
+    """A real-but-wrong checksum on an applied migration must make init_db
+    refuse (rc=1) with the same stderr FAIL lines as bash — never silently
+    re-run or skip."""
+    db_a, db_b = str(tmp_path / "a.db"), str(tmp_path / "b.db")
+    env = _clean_init_env(db_a)
+    r = subprocess.run(["bash", str(INIT_SH)], env={**env, "MINI_ORK_DB": db_a},
+                       capture_output=True, text=True)
+    assert r.returncode == 0
+    old = os.environ.pop("MINI_ORK_DB", None)
+    try:
+        rc0, _, _ = mig.init_db(db=db_b, root=str(REPO))
+    finally:
+        if old is not None:
+            os.environ["MINI_ORK_DB"] = old
+    assert rc0 == 0
+
+    for db in (db_a, db_b):
+        con = sqlite3.connect(db)
+        victim = con.execute(
+            "SELECT filename FROM schema_migrations ORDER BY filename LIMIT 1"
+        ).fetchone()[0]
+        con.execute("UPDATE schema_migrations SET checksum=? WHERE filename=?",
+                    ("b" * 64, victim))
+        con.commit()
+        con.close()
+
+    rb = subprocess.run(["bash", str(INIT_SH)], env={**env, "MINI_ORK_DB": db_a},
+                        capture_output=True, text=True)
+    old = os.environ.pop("MINI_ORK_DB", None)
+    try:
+        rc_p, out_p, err_p = mig.init_db(db=db_b, root=str(REPO))
+    finally:
+        if old is not None:
+            os.environ["MINI_ORK_DB"] = old
+    assert rb.returncode == rc_p == 1
+    assert "checksum drift" in rb.stderr and "checksum drift" in err_p
+    assert rb.stdout.replace(db_a, "<DB>") == out_p.replace(db_b, "<DB>")
+    assert rb.stderr == err_p
