@@ -29,11 +29,39 @@ fully responsive**; `kimi`, `glm`, `minimax` all timeout; `codex` rc=0
 but stderr contains `Reading additional input from stdin... codex_c
 ERROR`.
 
-## Step 1 — Verify API keys are loaded
+## Step 1 — Check and configure API keys
 
-Some providers read from env vars set in `.mini-ork/config/secrets.local.sh`
-(or `~/.config/mini-ork/secrets.local.sh`). To check WITHOUT printing the
-key values:
+Use the native command first. It resolves workflow aliases, validates the
+local store permissions, and never prints a credential:
+
+```bash
+mini-ork providers status --workflow recipes/refactor-audit/workflow.yaml
+mini-ork providers configure minimax
+mini-ork providers configure --workflow recipes/refactor-audit/workflow.yaml
+```
+
+For scripted terminal provisioning, use a hidden shell read and pass only a
+`NAME=value` line over standard input, never a command-line flag:
+
+```bash
+read -r -s -p 'MiniMax API key: ' MINIMAX_API_KEY; echo
+printf 'MINIMAX_API_KEY=%s\n' "$MINIMAX_API_KEY" \
+  | mini-ork providers configure --from-stdin minimax
+unset MINIMAX_API_KEY
+```
+
+CI should instead inject a masked secret through its standard-input or secret
+manager integration; do not place a literal key in a workflow command.
+
+The command stores values in `$MINI_ORK_HOME/config/secrets.local.sh` with
+owner-only permissions. An exported shell value takes precedence for a single
+run, which makes rotations and one-off smoke tests safe.
+
+For legacy Bash-only checks, some providers read from env vars set in
+`.mini-ork/config/secrets.local.sh` (or `~/.config/mini-ork/secrets.local.sh`).
+The old manual presence check is below; it is not needed for normal setup.
+
+To check WITHOUT printing the key values manually:
 
 ```bash
 (

@@ -27,6 +27,8 @@ from .providers import (
     parse_codex_usage,
     preflight,
     provider_for_model,
+    provider_environment,
+    required_secret_envs,
     resolve_provider,
     resolve_target_cwd,
 )
@@ -55,6 +57,8 @@ __all__ = [
     "preflight",
     "LaneHealth",
     "provider_for_model",
+    "provider_environment",
+    "required_secret_envs",
     "cwd_guard",
     "resolve_target_cwd",
 ]

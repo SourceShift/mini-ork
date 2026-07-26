@@ -3,23 +3,25 @@
 You are planning a multi-lens code audit. Read the kickoff below and emit
 a structured plan JSON.
 
-The audit is composed of 4 parallel **lens** stances (all map to
+The audit is composed of 5 parallel **lens** stances (all map to
 `node_type: "researcher"` in the plan, since they research the codebase):
 
 - **glm-lens** (researcher): fast tactical bottleneck scan (breadth > depth, grep-driven)
 - **kimi-lens** (researcher): code-level refactor proposals with concrete before/after diffs
 - **codex-lens** (researcher): LLM-dispatch / cost optimization deep-dive
 - **opus-lens** (researcher): architectural-shape + final synthesis perspective
+- **minimax-lens** (researcher): cross-system integration and data-flow tracing
 
 Plus 1 synthesizer node (`node_type: "reviewer"` — it reviews + composes
-the 4 lens reports) and 1 completeness-verifier (`node_type: "verifier"`)
-and 1 publisher (`node_type: "publisher"`).
+the anonymous panel bundle) and 1 completeness-verifier (`node_type:
+"verifier"`) and 1 publisher (`node_type: "publisher"`). The recipe declares
+the `anonymize_panel` transform statically; do not add it to plan decomposition.
 
 ## STRICT node_type ENUM (D-008b / D-017 requirement)
 
 Every `decomposition[].node_type` MUST be EXACTLY ONE of:
 - `planner` — emits the plan (you, this call)
-- `researcher` — investigates the codebase / scans / reads (USE FOR ALL 4 LENSES)
+- `researcher` — investigates the codebase / scans / reads (USE FOR ALL 5 LENSES)
 - `implementer` — writes code/files
 - `reviewer` — composes / synthesizes / passes verdict (USE FOR SYNTHESIZER)
 - `verifier` — runs deterministic checks (USE FOR COMPLETENESS VERIFIER)
@@ -27,9 +29,10 @@ Every `decomposition[].node_type` MUST be EXACTLY ONE of:
 - `publisher` — commits / merges / publishes artifact (USE FOR PUBLISHER)
 - `rollback` — undoes a publish on failure
 
-DO NOT invent new node_type values like `"lens"` or `"synthesizer"` or
-`"audit"` — the framework's execute step ONLY dispatches the above 8.
-Plans with unknown node_types are rejected at validation (D-008b).
+DO NOT invent plan node_type values like `"lens"`, `"synthesizer"`, or
+`"audit"`. The workflow may declare deterministic system nodes such as
+`transform`, but plan decomposition accepts agent roles only; unknown plan
+node types are rejected at validation (D-008b).
 
 ## STRICT output format (D-011 / D-016 requirement)
 
@@ -49,8 +52,8 @@ those break the parser. Emit ONE `{ ... }` and STOP.
   assuming (language, scale, deployment shape)
 - `decomposition` (array of `{id, description, node_type, depends_on[]}`)
   with node_type strictly from the enum above
-- `dependencies` (array of `{from, to}`) — the 4 researcher lenses must
-  depend on planner; the reviewer-synthesizer must depend on all 4 lenses
+- `dependencies` (array of `{from, to}`) — the 5 researcher lenses must
+  depend on planner; the reviewer-synthesizer must depend on all 5 lenses
 - `risk_notes` (string[]) — what could go wrong
 - `artifact_contract` (`{outputs: string[], success_verifiers: string[]}`)
   - **STRICT (D-018)**: `success_verifiers` MUST be filenames matching
@@ -59,11 +62,11 @@ those break the parser. Emit ONE `{ ... }` and STOP.
     Express acceptance criteria as `verifier_contract.checks[]` entries
     (those CAN be natural-language with optional `command` field) — NOT in
     `success_verifiers`.
-    Wrong: `"All 4 lens-*.md files exist..."`
+    Wrong: `"All 5 lens-*.md files exist..."`
     Right: `"verifiers/lens-completeness.sh"`
 - `verifier_contract` (`{checks: [{id, description, command?}]}`) —
-  REQUIRED. At minimum: "all 4 lens reports exist and non-empty",
-  "synthesis cross-references all 4 lenses", "each finding cites
+  REQUIRED. At minimum: "all 5 lens reports exist and non-empty",
+  "synthesis cross-references all 5 anonymous responses", "each finding cites
   file:line"
 
 --- KICKOFF ---

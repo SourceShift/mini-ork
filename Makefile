@@ -13,7 +13,7 @@
 # web-up              Boot API + Vite dev in parallel (Ctrl-C kills both).
 # web-test            Run the observability smoke test suite.
 
-.PHONY: install-hooks uninstall-hooks readme-claim-check readme-drift-panel help \
+.PHONY: install-hooks uninstall-hooks readme-claim-check readme-drift-panel help test \
         web-deps web-build web-serve web-dev web-up web-test dev-all \
         lint lint-advisory \
         worktree worktree-merge worktree-clean worktree-list
@@ -28,6 +28,7 @@ help:
 	@echo "  make readme-drift-panel  run 4-lens LLM drift audit (Layer 2b, ~\$$0.30)"
 	@echo "  make lint                ruff blocking tier (F + E9) — must stay green"
 	@echo "  make lint-advisory       ruff advisory tier (E,W,I,UP,B) — ratchet report"
+	@echo "  make test                run the Python test suite"
 	@echo ""
 	@echo "Observability UI:"
 	@echo "  make web-deps            install fastapi + uvicorn + pyyaml + pnpm install"
@@ -57,6 +58,9 @@ install-hooks:
 uninstall-hooks:
 	@git config --unset core.hooksPath 2>/dev/null || true
 	@echo "✓ hooks dir reset to git default"
+
+test:
+	@python3 -m pytest -q
 
 # ── python lint (ruff; tiers match the CI python-lint job) ──────────────────
 # Blocking tier is [tool.ruff.lint] select in pyproject.toml (F + E9).

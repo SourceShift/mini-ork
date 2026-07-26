@@ -24,6 +24,7 @@ import yaml
 
 from .core import dispatch
 from .models import DispatchRequest, DispatchResult, TokenUsage
+from .secrets import SecretStoreError, read_secret_exports, secret_store_path
 
 # Lanes mini-ork knows about. codex/gemini are EXECUTABLE wrappers (run the
 # cl_*.sh as a command); the rest are the CLAUDE family (source the cl_*.sh to
@@ -145,7 +146,10 @@ def apply_resume(command: Sequence[str], session_id: str) -> tuple[str, ...]:
 
 
 def claude_env_for(
-    model: str, root: str | os.PathLike[str] | None = None
+    model: str,
+    root: str | os.PathLike[str] | None = None,
+    *,
+    environment: Mapping[str, str] | None = None,
 ) -> dict[str, str]:
     """Capture the ANTHROPIC_*/CLAUDE_* env a claude-family wrapper exports, by
     sourcing it in a subshell. This reuses the committed cl_*.sh as the single
@@ -165,6 +169,7 @@ def claude_env_for(
         capture_output=True,
         text=True,
         timeout=10,
+        env=dict(os.environ if environment is None else environment),
     )
     env: dict[str, str] = {}
     for line in proc.stdout.splitlines():
@@ -247,6 +252,8 @@ def _resolve_from_registry(
     name: str,
     registry: Mapping[str, object],
     root: str | os.PathLike[str] | None = None,
+    *,
+    environment: Mapping[str, str] | None = None,
 ) -> ProviderSpec:
     entry = registry.get(name)
     if not isinstance(entry, Mapping):
@@ -267,7 +274,44 @@ def _resolve_from_registry(
         raise ValueError(f"provider {name!r} field 'extra_env' must be a mapping")
     extra_env = {str(key): str(value) for key, value in raw_extra_env.items()}
     model_id = str(entry.get("model") or "")
-    return builder(name, entry, root, extra_env, model_id)
+    spec = builder(name, entry, root, extra_env, model_id)
+    runtime = os.environ if environment is None else environment
+    if kind == "anthropic-native":
+        if api_key := runtime.get("ANTHROPIC_API_KEY"):
+            env = dict(spec.env)
+            env["ANTHROPIC_API_KEY"] = api_key
+            if model_id:
+                env["ANTHROPIC_MODEL"] = model_id
+            return ProviderSpec(
+                model=spec.model,
+                command=spec.command,
+                parse_usage=spec.parse_usage,
+                parse_cost=spec.parse_cost,
+                parse_text=spec.parse_text,
+                parse_session=spec.parse_session,
+                env=env,
+            )
+    if kind in {"anthropic-compat", "openai-compat"}:
+        api_key_env = str(entry.get("api_key_env") or "")
+        if api_key_env:
+            env = dict(spec.env)
+            if kind == "anthropic-compat":
+                env["ANTHROPIC_AUTH_TOKEN"] = runtime.get(api_key_env, "")
+            else:
+                # cl_codex.sh reads the name in MO_OAI_ENV_KEY from its own
+                # process environment, so retain the actual key as well.
+                if api_key := runtime.get(api_key_env):
+                    env[api_key_env] = api_key
+            return ProviderSpec(
+                model=spec.model,
+                command=spec.command,
+                parse_usage=spec.parse_usage,
+                parse_cost=spec.parse_cost,
+                parse_text=spec.parse_text,
+                parse_session=spec.parse_session,
+                env=env,
+            )
+    return spec
 
 
 # ── Provider-kind spec builders (SOLID M6, OCP) ─────────────────────────────
@@ -389,12 +433,17 @@ def register_provider_kind(kind: str, builder: Callable[..., ProviderSpec]) -> N
 
 
 def resolve_provider(
-    model: str, root: str | os.PathLike[str] | None = None
+    model: str,
+    root: str | os.PathLike[str] | None = None,
+    *,
+    environment: Mapping[str, str] | None = None,
 ) -> ProviderSpec:
     """Resolve a built-in wrapper or registry-defined model lane."""
     wrapper = mini_ork_root(root) / "lib" / "providers" / f"cl_{model}.sh"
     if model not in KNOWN_MODELS:
-        return _resolve_from_registry(model, _load_providers_registry(root), root)
+        return _resolve_from_registry(
+            model, _load_providers_registry(root), root, environment=environment
+        )
     if not wrapper.is_file():
         raise FileNotFoundError(f"provider wrapper not found: {wrapper}")
 
@@ -421,7 +470,7 @@ def resolve_provider(
         parse_cost=claude_cost,
         parse_text=claude_result_text,
         parse_session=claude_session_id,
-        env=claude_env_for(model, root),
+        env=claude_env_for(model, root, environment=environment),
     )
 
 
@@ -438,8 +487,51 @@ class LaneHealth:
     reason: str
 
 
-def lane_health(model: str, root: str | os.PathLike[str] | None = None) -> LaneHealth:
+def provider_environment(
+    environment: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    """Build a scoped provider environment without changing ``os.environ``.
+
+    A user-exported shell variable deliberately wins over the persisted
+    equivalent in the local store. This permits a one-off rotation/smoke test
+    while keeping normal configuration local to the project.
+    """
+    runtime = dict(os.environ if environment is None else environment)
+    stored = read_secret_exports(secret_store_path(runtime))
+    return {**stored, **runtime}
+
+
+def required_secret_envs(
+    model: str, root: str | os.PathLike[str] | None = None
+) -> tuple[str, ...]:
+    """Return declared credential variables for a lane, never their values."""
+    if model in KNOWN_MODELS:
+        wrapper = mini_ork_root(root) / "lib" / "providers" / f"cl_{model}.sh"
+        if not wrapper.is_file():
+            raise FileNotFoundError(f"provider wrapper not found: {wrapper}")
+        text = wrapper.read_text(encoding="utf-8")
+        return tuple(
+            dict.fromkeys(match.group(1) for match in _REQUIRED_KEY_RE.finditer(text))
+        )
+    registry = _load_providers_registry(root)
+    entry = registry.get(model)
+    if not isinstance(entry, Mapping):
+        raise ValueError(f"unknown lane: {model!r}")
+    if entry.get("kind") in {"anthropic-compat", "openai-compat"}:
+        api_key_env = entry.get("api_key_env")
+        if isinstance(api_key_env, str) and api_key_env:
+            return (api_key_env,)
+    return ()
+
+
+def lane_health(
+    model: str,
+    root: str | os.PathLike[str] | None = None,
+    *,
+    environment: Mapping[str, str] | None = None,
+) -> LaneHealth:
     """Cheap pre-dispatch check for wrapper and registry-defined lanes."""
+    runtime = os.environ if environment is None else environment
     if model in KNOWN_MODELS:
         wrapper = mini_ork_root(root) / "lib" / "providers" / f"cl_{model}.sh"
         if not wrapper.is_file():
@@ -450,7 +542,7 @@ def lane_health(model: str, root: str | os.PathLike[str] | None = None) -> LaneH
             return LaneHealth(False, f"wrapper unreadable: {exc}")
         for match in _REQUIRED_KEY_RE.finditer(text):
             key = match.group(1)
-            if not os.environ.get(key):
+            if not runtime.get(key):
                 return LaneHealth(
                     False, f"{model}: ${key} is not set — lane would die silently"
                 )
@@ -458,7 +550,7 @@ def lane_health(model: str, root: str | os.PathLike[str] | None = None) -> LaneH
 
     try:
         registry = _load_providers_registry(root)
-        _resolve_from_registry(model, registry, root)
+        _resolve_from_registry(model, registry, root, environment=runtime)
     except (FileNotFoundError, ValueError) as exc:
         return LaneHealth(False, str(exc))
 
@@ -468,7 +560,7 @@ def lane_health(model: str, root: str | os.PathLike[str] | None = None) -> LaneH
         "openai-compat",
     }:
         api_key_env = entry["api_key_env"]
-        if not os.environ.get(str(api_key_env)):
+        if not runtime.get(str(api_key_env)):
             return LaneHealth(
                 False,
                 f"{model}: ${api_key_env} is not set — lane would die silently",
@@ -477,11 +569,16 @@ def lane_health(model: str, root: str | os.PathLike[str] | None = None) -> LaneH
 
 
 def preflight(
-    models: Sequence[str], root: str | os.PathLike[str] | None = None
+    models: Sequence[str],
+    root: str | os.PathLike[str] | None = None,
+    *,
+    environment: Mapping[str, str] | None = None,
 ) -> dict[str, LaneHealth]:
     """Health-check several lanes at once (e.g. every lane a recipe will use).
     Returns {model: LaneHealth}; callers abort the run if any are unhealthy."""
-    return {m: lane_health(m, root) for m in dict.fromkeys(models)}
+    return {
+        m: lane_health(m, root, environment=environment) for m in dict.fromkeys(models)
+    }
 
 
 def resolve_target_cwd(
@@ -534,24 +631,34 @@ def dispatch_model(
     missing wrapper / unset API key / a framework-tree cwd come back as a
     structured ``ok=False`` result (fail-fast), not a raise, stall, or repo
     corruption."""
+    try:
+        runtime_env = provider_environment()
+    except SecretStoreError as exc:
+        return DispatchResult(
+            ok=False,
+            rc=2,
+            error=f"provider credential store failed: {exc}",
+            model=request.model,
+        )
+    effective_env = {**runtime_env, **request.env}
     # Always pin an explicit, absolute cwd so the provider can't inherit a
     # drifted one. The guard (below) is what refuses the dangerous case.
-    target_cwd = resolve_target_cwd(request)
+    target_cwd = resolve_target_cwd(request, env=effective_env)
     if preflight_check:
-        health = lane_health(request.model, root)
+        health = lane_health(request.model, root, environment=effective_env)
         if not health.ok:
             return DispatchResult(
                 ok=False, rc=2, error=f"lane preflight failed: {health.reason}",
                 model=request.model,
             )
-        guard = cwd_guard(target_cwd, root)
+        guard = cwd_guard(target_cwd, root, env=effective_env)
         if not guard.ok:
             return DispatchResult(
                 ok=False, rc=2, error=f"cwd guard failed: {guard.reason}",
                 model=request.model,
             )
     try:
-        spec = resolve_provider(request.model, root)
+        spec = resolve_provider(request.model, root, environment=effective_env)
     except (ValueError, FileNotFoundError) as exc:
         return DispatchResult(ok=False, rc=2, error=str(exc), model=request.model)
     # Node-scoped tool grants (kickoff/tool-grant-hermetic-dispatch.md):
@@ -563,7 +670,6 @@ def dispatch_model(
     # MO_TOOL_GRANTS_DISABLED=1 opt-out for local debugging, matching the bash
     # dispatch's escape hatch at lib/llm-dispatch.sh:981.
     if request.model not in EXECUTABLE_MODELS:
-        effective_env = {**os.environ, **request.env}
         command = spec.command
         if effective_env.get("MO_TOOL_GRANTS_DISABLED", "0") != "1":
             run_dir = effective_env.get("MINI_ORK_RUN_DIR", "") or None
@@ -587,7 +693,7 @@ def dispatch_model(
                 env=spec.env,
             )
     # Merge the lane's pinned env UNDER any per-request overrides; pin the cwd.
-    merged_env = {**dict(spec.env), **request.env}
+    merged_env = {**effective_env, **dict(spec.env), **request.env}
     effective = DispatchRequest(
         model=request.model,
         prompt=request.prompt,

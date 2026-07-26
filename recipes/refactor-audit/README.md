@@ -2,8 +2,8 @@
 
 A multi-model audit recipe that dogfoods mini-ork to audit a codebase
 (including mini-ork itself) for scalability, security, performance,
-or architectural shape — composed via 4 model-lens stances + 1
-synthesis pass.
+or architectural shape. Five model-lens stances run in parallel; a
+deterministic transform anonymizes their reports before a synthesis pass.
 
 ## What this recipe does
 
@@ -11,19 +11,22 @@ Given a kickoff describing **what to audit** and **what dimensions to
 audit on**, the recipe:
 
 1. **Classify** — routes to `refactor_audit` task class
-2. **Plan** — generates an audit plan with 4 lens nodes + 1 synthesis
-   node (the verifier_contract is "every lens produced a report at
-   `${MINI_ORK_HOME}/runs/<id>/lens-<name>.md`")
-3. **Execute** — dispatches the 4 lenses in **parallel** (each runs
+2. **Plan** — generates an audit plan with 5 lens nodes. The recipe also
+   declares a deterministic `anonymize_panel` node; it is not an LLM plan step.
+3. **Execute** — dispatches the 5 lenses in **parallel** (each runs
    under a different model lane per workflow.yaml node.model_lane):
    - **glm-lens** → tactical bottleneck scan (fast + broad)
    - **kimi-lens** → code-level refactor diffs (long-context)
    - **codex-lens** → LLM-dispatch / cost optimization (deep
      code-intelligence)
    - **opus-lens** → architectural shape + synthesis perspective
-4. **Verify** — checks all 4 lens reports exist + non-empty + cite
-   file:line anchors
-5. (Out-of-band) **Reflect** — gradients written from each lens's
+   - **minimax-lens** → cross-system integration and data-flow tracing
+4. **Transform** — materializes an anonymous `Response A` through `Response E`
+   panel bundle. The label map is system-only; synthesis receives no source
+   lane, producer node, or raw artifact path.
+5. **Verify** — checks all 5 lens reports, the anonymous panel bundle, and
+   synthesis references exist and contain the required evidence.
+6. (Out-of-band) **Reflect** — gradients written from each lens's
    trace; pattern emergence detects recurring findings across past
    audits
 
@@ -33,6 +36,11 @@ audit on**, the recipe:
 - `${MINI_ORK_HOME}/runs/<run_id>/lens-kimi.md`
 - `${MINI_ORK_HOME}/runs/<run_id>/lens-codex.md`
 - `${MINI_ORK_HOME}/runs/<run_id>/lens-opus.md`
+- `${MINI_ORK_HOME}/runs/<run_id>/lens-minimax.md`
+- `${MINI_ORK_HOME}/runs/<run_id>/panel-responses.md` — anonymous
+  response bundle for the synthesizer
+- `${MINI_ORK_HOME}/runs/<run_id>/workspace/system/anonymize-panel/label-map.json`
+  — system-only source-label receipt
 - `${MINI_ORK_HOME}/runs/<run_id>/synthesis.md` — composed final audit
 - (Optional) `docs/refactor/<slug>-AUDIT.md` published by the
   publisher node
@@ -58,8 +66,8 @@ audit on**, the recipe:
 | 50K LOC, full framework | $20-40 | 30-60 min |
 | 500K LOC, multi-service | $200-400 | 2-4 hours |
 
-Cost dominated by Opus synthesis (long context). GLM/Kimi/Codex are
-cheap-or-free lanes. Configure via `MO_REFACTOR_AUDIT_BUDGET_USD`.
+Cost is dominated by synthesis context and the selected provider lanes.
+Configure via `MO_REFACTOR_AUDIT_BUDGET_USD`.
 
 ## How to run
 
@@ -87,8 +95,9 @@ this recipe will run end-to-end via mini-ork itself.
 
 | Knob | Where | Effect |
 |---|---|---|
-| Lens count | `workflow.yaml` nodes | Add a 5th lens (e.g. "security-lens") by adding a node + prompt |
+| Lens count | `workflow.yaml` ports + edges | Add a lens output and bind it to `anonymize_panel.reports` |
 | Models per lens | `workflow.yaml` node.model_lane | Swap glm→haiku, opus→sonnet, etc. |
+| Panel transform | `workflow.yaml` `anonymize_panel` | Swap a registered transform without changing harness wiring |
 | Synthesis depth | `prompts/synthesis.md` | Customize the cross-lens ranking matrix |
 | Output target | `verifiers/audit-published.sh` | Publish to docs/, GitHub Issues, Slack, etc. |
 
