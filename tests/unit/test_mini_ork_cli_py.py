@@ -95,7 +95,7 @@ def test_doctor_golden_sections():
     assert "\nLib presence:\n" in run.stdout
     assert "\nProvider preflight:\n" in run.stdout
     assert f"  [OK]      MINI_ORK_HOME={Path(raw_home).resolve()}\n" in run.stdout
-    assert "  [WARN]    glm ($_env_var unset)\n" in run.stdout
+    assert "  [WARN]    glm ($GLM_API_KEY unset; run: mini-ork providers configure glm)\n" in run.stdout
 
 
 def test_deadline_validation_golden_contract(capsys):

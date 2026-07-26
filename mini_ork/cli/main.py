@@ -60,6 +60,7 @@ Lifecycle:
   init                           Bootstrap project (creates .mini-ork/)
   update                         Apply migrations + report config drift
   doctor                         Check deps + env vars + lib presence + provider preflight
+  providers                      Configure or inspect credentials for workflow lanes
   validate                       Pre-run static checks with Fix: hints
   garden                         Drift detection (collisions, orphans, stale runs)
   recipe-eval                    Static evaluation of recipe definitions
@@ -588,12 +589,20 @@ def _doctor_handler(rest, root):
             print(f"  [OK]      {name} ({tool} CLI present)")
         else:
             print(f"  [WARN]    {name} ({tool} CLI missing)")
+    from mini_ork.dispatch.providers import provider_environment
+    from mini_ork.dispatch.secrets import SecretStoreError
+
+    try:
+        provider_env = provider_environment()
+    except SecretStoreError as exc:
+        print(f"  [WARN]    local credential store unavailable: {exc}")
+        provider_env = dict(os.environ)
     for env_var, family in (("GLM_API_KEY", "glm"), ("KIMI_API_KEY", "kimi"),
                             ("MINIMAX_API_KEY", "minimax"), ("DEEPSEEK_API_KEY", "deepseek")):
-        if os.environ.get(env_var):
-            print(f"  [OK]      {family} ($_env_var set)")
+        if provider_env.get(env_var):
+            print(f"  [OK]      {family} (${env_var} set)")
         else:
-            print(f"  [WARN]    {family} ($_env_var unset)")
+            print(f"  [WARN]    {family} (${env_var} unset; run: mini-ork providers configure {family})")
     return 0
 
 
@@ -609,6 +618,11 @@ def _help_handler(rest, root):
     return 0
 
 
+def _providers_handler(rest, root):
+    from mini_ork.cli import providers
+    return providers.main(rest, root=root)
+
+
 def _build_default_registry() -> dict:
     registry = {sub: _native_module_handler(f"mini_ork.cli.{sub}") for sub in _NATIVE_SUBS}
     registry["execute"] = _execute_inprocess
@@ -616,6 +630,7 @@ def _build_default_registry() -> dict:
         registry[sub] = _bash_entrypoint_handler(sub)
     registry["run"] = _run_handler
     registry["doctor"] = _doctor_handler
+    registry["providers"] = _providers_handler
     registry["version"] = _version_handler
     for alias in ("help", "--help", "-h"):
         registry[alias] = _help_handler
