@@ -23,6 +23,12 @@ Design notes
   explicit executable contract with rc 0=pass, 2=defer, else=fail. Shell
   function names are intentionally not resolved through an implicit Bash
   process; unresolved conditions defer.
+* **Native oracle gates (WS4 bash-removal).** Conditions that name one of
+  the 5 oracle gates — either the ``native:<name>`` sentinel seeded by
+  ``gate_bootstrap`` or a legacy ``gates/<name>.sh`` script path from an
+  existing DB row — are evaluated IN-PROCESS via
+  ``mini_ork.gates.native_gates`` (no bash, no subprocess). Unrecognized
+  script paths keep the legacy executable contract.
 * **Bash ``null`` → Python ``None``** for missing/inactive rows.
 
 Public API (mirrors bash function names exactly)::
@@ -226,15 +232,32 @@ def _evaluate_liveness(
 
 
 def _evaluate_external(
-    condition: str, context_json: str, db_path: str
+    condition: str,
+    context_json: str,
+    db_path: str,
+    mini_ork_root: Optional[str] = None,
 ) -> str:
     """dispatch <condition> <context_json>; rc 0=pass, 2=defer, else fail.
 
-    Only an explicit executable is a supported external gate contract.
-    Missing paths and former shell-function names defer.
+    Resolution order (WS4):
+      1. Native oracle-gate evaluator (``native:<name>`` sentinel or a
+         legacy ``gates/<name>.sh`` basename) — evaluated in-process via
+         ``mini_ork.gates.native_gates``; the bash shim is never executed.
+      2. Legacy executable contract — an explicit executable path is run
+         with rc 0=pass, 2=defer, else fail. Missing paths and former
+         shell-function names defer.
     """
     if not condition:
         return "defer"
+    from mini_ork.gates import native_gates
+
+    native = native_gates.resolve_native_evaluator(condition)
+    if native is not None:
+        try:
+            verdict = native(condition, context_json, db_path, mini_ork_root)
+        except Exception:
+            return "defer"
+        return verdict if verdict in ("pass", "fail", "defer") else "defer"
     if not (os.path.isfile(condition) and os.access(condition, os.X_OK)):
         return "defer"
     cmd = [condition, context_json]
@@ -291,8 +314,7 @@ def _eval_liveness(condition: str, context_json: str, db_path: str,
 
 def _eval_external(condition: str, context_json: str, db_path: str,
                    mini_ork_root: Optional[str]) -> str:
-    del mini_ork_root
-    return _evaluate_external(condition, context_json, db_path)
+    return _evaluate_external(condition, context_json, db_path, mini_ork_root)
 
 
 GATE_EVALUATORS: dict[str, GateEvaluator] = {
