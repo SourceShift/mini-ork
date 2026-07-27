@@ -15,6 +15,7 @@ REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
 
 from mini_ork.cli import invoke_prompt
+from mini_ork.stores.migrate import init_db
 
 BIN = REPO / "bin" / "mini-ork-invoke-prompt"
 
@@ -194,12 +195,9 @@ def test_success_trace_row_is_written(tmp_path: Path) -> None:
     home = tmp_path / "home"
     home.mkdir()
     db = tmp_path / "state.db"
-    subprocess.run(
-        ["bash", str(REPO / "db" / "init.sh")],
-        env={**os.environ, "MINI_ORK_HOME": str(home), "MINI_ORK_DB": str(db)},
-        capture_output=True,
-        text=True,
-        check=True,
+    rc_init, out_init, err_init = init_db(db=str(db), root=str(REPO))
+    assert rc_init == 0, (
+        f"init_db failed rc={rc_init}\nstdout={out_init}\nstderr={err_init}"
     )
 
     rc, _ = invoke_prompt.invoke(
@@ -228,7 +226,7 @@ def test_invoke_prompt_has_no_bash_trace_store_dependency() -> None:
 
 
 def test_trace_write_is_best_effort_without_db(tmp_path: Path) -> None:
-    """bash parity: `trace_write ... || true` — no MINI_ORK_DB must not raise."""
+    """Best-effort contract: no MINI_ORK_DB must not raise."""
     invoke_prompt._trace_write('{"trace_id":"t","status":"success"}',
                                _env(tmp_path))
 

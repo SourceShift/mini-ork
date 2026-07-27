@@ -1,10 +1,10 @@
 """Unit tests for mini_ork.gates.rubric_scoring._extract_result_text.
 
-The bash-parity suite (test_rubric_prescreen_py.py) covers the public
-helpers via live ``bash -c`` subprocesses, but the internal
-``_extract_result_text`` log parser (mirror of the jq fallbacks at
-lib/rubric-prescreen.sh lines 126-138) had no direct coverage. These
-tests exercise its three extraction strategies in isolation.
+The rubric_prescreen suite (test_rubric_prescreen_py.py) covers the public
+helpers, but the internal ``_extract_result_text`` log parser (mirror of
+the jq fallbacks formerly at lib/rubric-prescreen.sh lines 126-138) needs
+direct coverage. These tests exercise its three extraction strategies in
+isolation.
 """
 from __future__ import annotations
 
