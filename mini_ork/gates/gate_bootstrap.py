@@ -1,17 +1,24 @@
 """Auto-register the 5 oracle gates at framework boot — Python port of lib/gate_bootstrap.sh.
 
-Faithful port of mo_bootstrap_oracle_gates. Registers the 5 oracle gates
-(coalition, panel-health, synthesis-promote, stability, liveness) into the
-gate_registry table if not already present. Idempotent. Fail-open — rc=0
-even on partial failures (matches bash semantics).
+Registers the 5 oracle gates (coalition, panel-health, synthesis-promote,
+stability, liveness) into the gate_registry table if not already present.
+Idempotent. Fail-open — rc=0 even on partial failures (matches bash
+semantics).
 
-Two-phase insert-then-rename mirrors the bash sequence exactly so row-diff
-parity can be asserted against the live bash via sha256 row-dump equality:
+WS4 (bash-removal): conditions are now ``native:<name>`` sentinels that
+``gate_registry`` maps to the in-process evaluators in
+``mini_ork.gates.native_gates`` — the production gate path no longer
+executes the ``gates/*.sh`` shims. Live DBs whose oracle-* rows still
+point at ``<root>/gates/<name>.sh`` keep working: the registry resolves
+those script basenames to the same native evaluators (the script is never
+executed for a recognized oracle gate), so no DB migration is required.
+
+Two-phase insert-then-rename mirrors the bash sequence exactly:
   (a) INSERT 5 candidate rows with UUID-suffixed gate_ids (matches the bash
       gate_register output: gate-custom-<hex8>), gate_type='custom',
       task_class_filter='' initially, safety per the bash roster
       (coalition/panel-health/synthesis-promote/liveness=1; stability=0),
-      condition=<root>/gates/<name>.sh
+      condition=native:<name>
   (b) UPDATE OR IGNORE the 5 newly-inserted rows to stable oracle-* IDs,
       DELETE the UUID rows
   (c) UPDATE task_class_filter=NULL for all oracle-* rows (so gate_list's
@@ -26,6 +33,8 @@ import time
 import uuid
 
 
+from mini_ork.gates.native_gates import native_condition
+
 _DDL = """
     CREATE TABLE IF NOT EXISTS gate_registry (
         gate_id             TEXT PRIMARY KEY,
@@ -39,20 +48,20 @@ _DDL = """
 """
 
 _ROSTER = (
-    # (gate_script_basename, safety_flag)
-    ("coalition.sh", 1),
-    ("panel-health.sh", 1),
-    ("synthesis-promote.sh", 1),
-    ("stability.sh", 0),
-    ("liveness.sh", 1),
+    # (native_gate_name, safety_flag)
+    ("coalition", 1),
+    ("panel-health", 1),
+    ("synthesis-promote", 1),
+    ("stability", 0),
+    ("liveness", 1),
 )
 
 _STABLE_IDS = {
-    "coalition.sh": "oracle-coalition",
-    "panel-health.sh": "oracle-panel-health",
-    "synthesis-promote.sh": "oracle-synthesis-promote",
-    "stability.sh": "oracle-stability",
-    "liveness.sh": "oracle-liveness",
+    "coalition": "oracle-coalition",
+    "panel-health": "oracle-panel-health",
+    "synthesis-promote": "oracle-synthesis-promote",
+    "stability": "oracle-stability",
+    "liveness": "oracle-liveness",
 }
 
 
@@ -86,8 +95,8 @@ def bootstrap_oracle_gates(db: str | None = None,
             if (cur[0] if cur else 0) >= 5:
                 return 0
             now = int(time.time())
-            for basename, safety in _ROSTER:
-                cond = f"{root}/gates/{basename}"
+            for name, safety in _ROSTER:
+                cond = native_condition(name)
                 gid = f"gate-custom-{uuid.uuid4().hex[:8]}"
                 con.execute(
                     "INSERT OR IGNORE INTO gate_registry "
@@ -96,9 +105,9 @@ def bootstrap_oracle_gates(db: str | None = None,
                     "VALUES (?, 'custom', ?, '', ?, 1, ?)",
                     (gid, cond, int(safety), now),
                 )
-            for basename in _STABLE_IDS:
-                new_id = _STABLE_IDS[basename]
-                cond = f"{root}/gates/{basename}"
+            for name in _STABLE_IDS:
+                new_id = _STABLE_IDS[name]
+                cond = native_condition(name)
                 rows = con.execute(
                     "SELECT gate_id FROM gate_registry WHERE condition=? "
                     "AND gate_id NOT LIKE 'oracle-%'", (cond,)

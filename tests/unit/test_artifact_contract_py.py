@@ -422,3 +422,91 @@ def test_missing_args_error_parity():
         ac.load_contract()  # type: ignore[call-arg]
     with pytest.raises(TypeError):
         ac.validate()  # type: ignore[call-arg]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# (9) WS4: gate-registry function verifiers dispatch NATIVELY (no
+#     `source lib/gate_registry.sh`). A/B against the live bash harness:
+#     `gate_list '<artifact>'` ignores the positional → rc 0 → 'pass' on both
+#     sides; `gate_evaluate '<artifact>'` hits bash's ${2:?} guard → rc 1 →
+#     'fail' on both sides, and the native TypeError maps to the same rc.
+# ─────────────────────────────────────────────────────────────────────────────
+def test_validate_gate_list_verifier_native_parity(temp_db, monkeypatch):
+    """A contract whose success_verifiers = ['gate_list'] passes on BOTH the
+    legacy bash harness (sources gate_registry.sh, arg loop ignores the
+    artifact positional) and the native dispatch (mini_ork.gates.gate_registry
+    .gate_list) — and the native path must not execute any bash."""
+    dbp, home = temp_db
+    monkeypatch.setenv("MINI_ORK_DB", dbp)
+    contracts_dir = home / "config" / "artifact_contracts"
+    contracts_dir.mkdir(parents=True, exist_ok=True)
+    (contracts_dir / "gate-list.yaml").write_text(
+        "task_type: gate-list\n"
+        "expected_artifact: data\n"
+        "failure_policy: escalate\n"
+        "rollback_policy: none\n"
+        "success_verifiers:\n"
+        "  - gate_list\n",
+        encoding="utf-8",
+    )
+    artifact = home / "data.json"
+    artifact.write_text('{"k":"v"}', encoding="utf-8")
+
+    bash_out = _bash_validate(
+        "gate-list", str(artifact), contracts_dir,
+        mini_ork_root=str(REPO), extra_env={"MINI_ORK_DB": dbp},
+    )
+    assert bash_out.splitlines()[0] == "pass", f"bash: {bash_out!r}"
+
+    py_out = _python_validate_stdout(
+        "gate-list", str(artifact), contracts_dir, mini_ork_root=str(REPO),
+    )
+    assert py_out == bash_out, f"bash: {bash_out!r}\npython: {py_out!r}"
+
+
+def test_validate_gate_evaluate_verifier_fails_both_sides(temp_db, monkeypatch):
+    """A contract whose success_verifiers = ['gate_evaluate'] fails on BOTH
+    sides: bash's ${2:?context_json required} guard fires (missing second
+    arg → the `bash -c` shell aborts with rc=127), the native dispatch
+    raises TypeError for the same missing context_json (mapped to rc=1).
+    Non-zero on both sides → identical fail verdict; only the numeric rc
+    and free-text reason tail differ across implementations."""
+    dbp, home = temp_db
+    monkeypatch.setenv("MINI_ORK_DB", dbp)
+    contracts_dir = home / "config" / "artifact_contracts"
+    contracts_dir.mkdir(parents=True, exist_ok=True)
+    (contracts_dir / "gate-eval.yaml").write_text(
+        "task_type: gate-eval\n"
+        "expected_artifact: data\n"
+        "failure_policy: escalate\n"
+        "rollback_policy: none\n"
+        "success_verifiers:\n"
+        "  - gate_evaluate\n",
+        encoding="utf-8",
+    )
+    artifact = home / "data.json"
+    artifact.write_text('{"k":"v"}', encoding="utf-8")
+
+    bash_out = _bash_validate(
+        "gate-eval", str(artifact), contracts_dir,
+        mini_ork_root=str(REPO), extra_env={"MINI_ORK_DB": dbp},
+    )
+    contract = ac.load_contract("gate-eval", contracts_dir=str(contracts_dir))
+    py_payload = ac.validate_artifact(contract, str(artifact),
+                                      mini_ork_root=str(REPO))
+
+    bash_lines = bash_out.splitlines()
+    assert bash_lines[0] == "fail", f"bash: {bash_out!r}"
+    bash_payload = json.loads(bash_lines[1])
+    assert py_payload["verdict"] == bash_payload["verdict"] == "fail"
+    # rc pins: bash's ${2:?} guard aborts the `bash -c` shell with rc=127;
+    # the native dispatch maps the missing-context TypeError to rc=1. Both
+    # are non-zero → the harness records the SAME fail verdict; only the
+    # numeric rc (and free-text tail) differs across implementations.
+    assert any(
+        r.startswith("verifier 'gate_evaluate' failed (rc=127)")
+        for r in bash_payload["reasons"]
+    ), f"bash reasons: {bash_payload['reasons']!r}"
+    assert any(
+        r.startswith("verifier 'gate_evaluate' failed (rc=1)")
+        for r in py_payload["reasons"]
+    ), f"py reasons: {py_payload['reasons']!r}"
