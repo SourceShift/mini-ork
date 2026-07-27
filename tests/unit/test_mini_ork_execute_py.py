@@ -536,6 +536,25 @@ def test_pre_implementer_verifier_does_not_require_final_artifact(tmp_path, monk
     assert not missing_final_artifact.exists()
 
 
+def test_verifier_only_workflow_is_pre_implementation(tmp_path):
+    workflow = tmp_path / "workflow.yaml"
+    workflow.write_text(
+        """\
+nodes:
+  - name: collect
+    type: verifier
+  - name: synthesize
+    type: researcher
+  - name: verify
+    type: verifier
+""",
+        encoding="utf-8",
+    )
+
+    assert ex._verifier_runs_before_implementer(str(workflow), "collect")
+    assert ex._verifier_runs_before_implementer(str(workflow), "verify")
+
+
 def test_run_verifier_ref(tmp_path):
     ok = tmp_path / "ok.sh"; ok.write_text('#!/usr/bin/env bash\necho \'{"pass": true}\'\n')
     bad = tmp_path / "bad.sh"; bad.write_text('#!/usr/bin/env bash\necho \'{"pass": false}\'\n')

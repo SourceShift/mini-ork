@@ -27,9 +27,11 @@ from .models import DispatchRequest, DispatchResult, TokenUsage
 from .secrets import SecretStoreError, read_secret_exports, secret_store_path
 
 # Lanes mini-ork knows about. codex/gemini are EXECUTABLE wrappers (run the
-# cl_*.sh as a command); the rest are the CLAUDE family (source the cl_*.sh to
-# pin ANTHROPIC_* env, then run `claude --print --output-format json`).
+# cl_*.sh as a command). Anthropic-compatible gateways source a wrapper to pin
+# ANTHROPIC_* env, but must use plain-text output because their Claude CLI path
+# does not guarantee the native Claude JSON envelope.
 EXECUTABLE_MODELS = frozenset({"codex", "gemini"})
+ANTHROPIC_COMPAT_MODELS = frozenset({"deepseek", "glm", "kimi", "minimax"})
 KNOWN_MODELS = frozenset(
     {"opus", "sonnet", "kimi", "glm", "minimax", "codex", "gemini", "deepseek"}
 )
@@ -455,7 +457,19 @@ def resolve_provider(
         command: tuple[str, ...] = (str(wrapper), "--print", "--output-format", "text")
         return ProviderSpec(model, command)
 
-    # Claude family: env-pin from the wrapper, then run claude with JSON output.
+    # Anthropic-compatible gateways return a plain assistant response through
+    # the Claude CLI. Requesting a native Claude JSON envelope causes gateway
+    # notices or unparseable output to masquerade as a successful empty result.
+    env = claude_env_for(model, root, environment=environment)
+    if model in ANTHROPIC_COMPAT_MODELS:
+        return ProviderSpec(
+            model=model,
+            command=("claude", "--print", "--permission-mode", "bypassPermissions",
+                     "--output-format", "text"),
+            env=env,
+        )
+
+    # Native Claude family: env-pin from the wrapper, then run claude with JSON output.
     # `--permission-mode bypassPermissions` is LOAD-BEARING: without it, `claude
     # --print` runs in the default permission mode and auto-denies every Write/
     # Edit/Bash-redirect in non-interactive mode, so an implementer/worker lane
@@ -470,7 +484,7 @@ def resolve_provider(
         parse_cost=claude_cost,
         parse_text=claude_result_text,
         parse_session=claude_session_id,
-        env=claude_env_for(model, root, environment=environment),
+        env=env,
     )
 
 
