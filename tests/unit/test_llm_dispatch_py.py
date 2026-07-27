@@ -1,11 +1,10 @@
-"""Parity gate: mini_ork.dispatch.llm_dispatch vs lib/llm-dispatch.sh.
+"""Unit tests: mini_ork.dispatch.llm_dispatch (bash parity halves removed; formerly vs lib/llm-dispatch.sh).
 
 The provider invocation is already ported+tested in mini_ork.dispatch; here we
-parity the WRAPPER + pure helpers that remained in bash. Helpers are compared
-against the LIVE bash functions (sourced). The deterministic gates in the
-llm_dispatch shim — cost circuit (rc 42), lane fuse (rc 43), lane resolution —
-are driven through the live bash shim vs the port. The retry/backoff loop is
-exercised with an injected stub dispatch (no real LLM).
+test the WRAPPER + pure helpers that remained in bash. The deterministic gates
+in the llm_dispatch shim — cost circuit (rc 42), lane fuse (rc 43), lane
+resolution — are driven through the port. The retry/backoff loop is exercised
+with an injected stub dispatch (no real LLM).
 """
 from __future__ import annotations
 
@@ -18,90 +17,90 @@ REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
 from mini_ork.dispatch import llm_dispatch as ld
 
-LIB = REPO / "lib" / "llm-dispatch.sh"
 
+# ── pure helpers ──
 
-def _bash_out(call, *args):
-    script = f'source "{LIB}" >/dev/null 2>&1; {call}'
-    return subprocess.run(["bash", "-c", script, "_", *map(str, args)],
-                          capture_output=True, text=True).stdout.strip()
-
-
-def _bash_rc(call, *args):
-    script = f'source "{LIB}" >/dev/null 2>&1; {call}'
-    return subprocess.run(["bash", "-c", script, "_", *map(str, args)],
-                          capture_output=True, text=True).returncode
-
-
-# ── pure helper parity ──
-
-_ERR_CASES = [
-    ("HTTP 401 unauthorized", ""), ("rate limit 429 capacity exceeded", ""),
-    ("429 monthly quota exceeded", ""), ("400 invalid request prompt too long", ""),
-    ("422 content filter", ""), ("connection refused", ""),
-    ("partial stream closed", ""), ("500 internal server error", ""),
-    ("something weird", ""), ("boom", "7"), ("boom", "28"), ("503 overload", ""),
-    ("bearer token", ""), ("no providers.yaml entry", ""),
+_CLASSIFY_CASES = [
+    ("HTTP 401 unauthorized", "", "auth"),
+    ("rate limit 429 capacity exceeded", "", "capacity"),
+    ("429 monthly quota exceeded", "", "quota"),
+    ("400 invalid request prompt too long", "", "request"),
+    ("422 content filter", "", "safety"),
+    ("connection refused", "", "network"),
+    ("partial stream closed", "", "stream"),
+    ("500 internal server error", "", "provider"),
+    ("something weird", "", "unknown"),
+    ("boom", "7", "network"),       # curl rc 7 = failed connect
+    ("boom", "28", "network"),      # curl rc 28 = timeout
+    ("503 overload", "", "capacity"),
+    ("bearer token", "", "unknown"),
+    ("no providers.yaml entry", "", "config"),
 ]
 
 
-def test_classify_error_parity():
-    for msg, rc in _ERR_CASES:
-        rb = _bash_out('_mo_llm_classify_error "$1" "$2"', msg, rc)
-        rp = ld.classify_error(msg, rc)
-        assert rb == rp, f"classify({msg!r},{rc!r}): bash={rb!r} py={rp!r}"
+def test_classify_error():
+    for msg, rc, expect in _CLASSIFY_CASES:
+        assert ld.classify_error(msg, rc) == expect, f"classify({msg!r},{rc!r})"
 
 
-def test_error_retryable_parity():
-    for cat in ("capacity", "network", "stream", "provider", "quota", "auth", "unknown"):
-        assert _bash_out('_mo_llm_error_retryable "$1"', cat) == ld.error_retryable(cat)
+def test_error_retryable():
+    for cat in ("capacity", "network", "stream", "provider"):
+        assert ld.error_retryable(cat) == "1", cat
+    for cat in ("quota", "auth", "unknown"):
+        assert ld.error_retryable(cat) == "0", cat
 
 
-def test_provider_for_model_parity():
-    for m in ("codex", "gpt-4o", "o1-mini", "gemini", "x-gemini-2", "minimax",
-              "glm", "kimi", "deepseek", "opus", "sonnet", "weird-lane"):
-        assert _bash_out('_mo_llm_provider_for_model "$1"', m) == ld.provider_for_model(m), m
+def test_provider_for_model():
+    expect = {
+        "codex": "openai", "gpt-4o": "openai", "o1-mini": "openai",
+        "gemini": "google", "x-gemini-2": "google",
+        "minimax": "gateway", "glm": "gateway", "kimi": "gateway",
+        "deepseek": "gateway",
+        "opus": "anthropic", "sonnet": "anthropic", "weird-lane": "anthropic",
+    }
+    for m, provider in expect.items():
+        assert ld.provider_for_model(m) == provider, m
 
 
-def test_redact_secrets_parity():
-    for s in ["ANTHROPIC_API_KEY=abc123secretvalue here",
-              "Bearer aXbYcZ12345678 done",
-              "sk-ant-abc12345678901234567890 tail",
-              "hash deadbeefdeadbeefdeadbeefdeadbeef end", "nothing to redact"]:
-        assert _bash_out('_mo_llm_redact_secrets "$1"', s) == ld.redact_secrets(s), s
+def test_redact_secrets():
+    cases = [
+        ("ANTHROPIC_API_KEY=abc123secretvalue here", "ANTHROPIC_API_KEY=[REDACTED] here"),
+        ("Bearer aXbYcZ12345678 done", "Bearer [REDACTED] done"),
+        ("sk-ant-abc12345678901234567890 tail", "[REDACTED_KEY] tail"),
+        ("hash deadbeefdeadbeefdeadbeefdeadbeef end", "hash [REDACTED_HEX] end"),
+        ("nothing to redact", "nothing to redact"),
+    ]
+    for s, expect in cases:
+        assert ld.redact_secrets(s) == expect, s
 
 
-def test_strip_protocol_blocks_parity(tmp_path):
-    for content in ['body text\n<z-insight>{"a":1}</z-insight>\ntail\n',
-                    'clean output no insight\n',
-                    'truncated <z-insight>{"unterminated": ']:
-        fb = tmp_path / "b.txt"; fp = tmp_path / "p.txt"
-        fb.write_text(content); fp.write_text(content)
-        _bash_out('_mo_llm_strip_protocol_blocks "$1"', str(fb))
+def test_strip_protocol_blocks(tmp_path):
+    cases = [
+        ('body text\n<z-insight>{"a":1}</z-insight>\ntail\n', 'body text\n\ntail\n'),
+        ('clean output no insight\n', 'clean output no insight\n'),
+        ('truncated <z-insight>{"unterminated": ', 'truncated\n'),
+    ]
+    for content, expect in cases:
+        fp = tmp_path / "p.txt"
+        fp.write_text(content)
         ld.strip_protocol_blocks(str(fp))
-        assert fb.read_text() == fp.read_text(), repr(content)
+        assert fp.read_text() == expect, repr(content)
 
 
-def test_retryable_predicates_parity():
+def test_retryable_predicates():
     # throttle_retryable: capacity is retryable while attempt < max
-    assert _bash_rc('_mo_llm_throttle_retryable "$1" "$2" "$3" "$4" "$5"',
-                    "sonnet", "429 capacity overload", "", "1", "3") == 0
     assert ld.throttle_retryable("sonnet", "429 capacity overload", "", 1, 3) is True
     # exhausted attempts → not retryable
-    assert _bash_rc('_mo_llm_throttle_retryable "$1" "$2" "$3" "$4" "$5"',
-                    "sonnet", "429 capacity overload", "", "3", "3") == 1
     assert ld.throttle_retryable("sonnet", "429 capacity overload", "", 3, 3) is False
     # glm fair-usage
-    assert _bash_rc('_mo_llm_glm_fair_usage_retryable "$1" "$2" "$3" "$4"',
-                    "glm", "1313 fair usage policy", "1", "3") == 0
     assert ld.glm_fair_usage_retryable("glm", "1313 fair usage policy", 1, 3) is True
     assert ld.glm_fair_usage_retryable("sonnet", "1313 fair usage policy", 1, 3) is False
 
 
-def test_backoff_bounds_parity():
-    # jitter is random (bash $RANDOM % 4); compare the base+cap+floor envelope.
+def test_backoff_bounds():
+    # jitter is random; assert the base+cap+floor envelope.
     for attempt in (1, 2, 3, 5, 20):
-        # fixed jitter=0 gives the base; bash adds 0..3, capped at 45
+        # fixed jitter=0 gives the base; jitter 0..3, capped at 45
         base = ld.backoff_seconds_raw(attempt, 45, 5, _jitter=0)
         assert 1 <= base <= 45
         capped = ld.backoff_seconds_raw(attempt, 45, 5, _jitter=3)
@@ -111,7 +110,7 @@ def test_backoff_bounds_parity():
     assert ld.backoff_seconds_raw(20, 45, 5, _jitter=0) == 45   # clamped attempt→12, capped
 
 
-# ── shim gate parity: cost circuit + fuse ──
+# ── shim gates: cost circuit + fuse ──
 
 def _seed(tmp, name):
     home = tmp / name / ".mini-ork"; home.mkdir(parents=True)
@@ -126,17 +125,11 @@ def _sql(db, s):
     return subprocess.run(["sqlite3", db, s], capture_output=True, text=True)
 
 
-def test_cost_circuit_parity(tmp_path):
-    hb, db_b = _seed(tmp_path, "cb"); hp, db_p = _seed(tmp_path, "cp")
-    for db in (db_b, db_p):
-        _sql(db, "INSERT INTO task_runs (id,task_class,workflow_version,kickoff_path,status,"
-                 "cost_usd,created_at,updated_at) VALUES ('r1','x','v1','k.md','published',100.0,"
-                 "strftime('%s','now'),strftime('%s','now'));")
-    env_b = {**os.environ, "MINI_ORK_ROOT": str(REPO), "MINI_ORK_HOME": hb, "MINI_ORK_DB": db_b,
-             "MO_DAILY_BUDGET_USD": "50"}
-    rb = subprocess.run(["bash", "-c", f'source "{LIB}" >/dev/null 2>&1; '
-                         'llm_dispatch --node-type planner --prompt-text hi', "_"],
-                        capture_output=True, text=True, env=env_b).returncode
+def test_cost_circuit(tmp_path):
+    hp, db_p = _seed(tmp_path, "cp")
+    _sql(db_p, "INSERT INTO task_runs (id,task_class,workflow_version,kickoff_path,status,"
+               "cost_usd,created_at,updated_at) VALUES ('r1','x','v1','k.md','published',100.0,"
+               "strftime('%s','now'),strftime('%s','now'));")
     old = dict(os.environ)
     os.environ.update({"MINI_ORK_ROOT": str(REPO), "MINI_ORK_HOME": hp, "MINI_ORK_DB": db_p,
                        "MO_DAILY_BUDGET_USD": "50"})
@@ -144,26 +137,20 @@ def test_cost_circuit_parity(tmp_path):
         rp = ld.llm_dispatch(["--node-type", "planner", "--prompt-text", "hi"], root=str(REPO))
     finally:
         os.environ.clear(); os.environ.update(old)
-    assert rb == rp == 42
+    assert rp == 42
 
 
-def test_lane_fuse_parity(tmp_path):
-    hb, db_b = _seed(tmp_path, "fb"); hp, db_p = _seed(tmp_path, "fp")
-    cols = _sql(db_b, "PRAGMA table_info(llm_calls);").stdout
+def test_lane_fuse(tmp_path):
+    hp, db_p = _seed(tmp_path, "fp")
+    cols = _sql(db_p, "PRAGMA table_info(llm_calls);").stdout
     if "error_category" not in cols or "retryable" not in cols:
         import pytest
         pytest.skip("llm_calls lacks error_category/retryable columns")
-    for db in (db_b, db_p):
-        for _ in range(3):
-            _sql(db, "INSERT INTO llm_calls (provider,model_id,tier,feature_name,input_tokens,"
-                     "output_tokens,total_tokens,cost_usd,duration_ms,status,metadata_json,"
-                     "error_category,retryable) VALUES ('gateway','sonnet','default',"
-                     "'mini-ork:planner',0,0,0,0,0,'failed','{}','capacity',1);")
-    env_b = {**os.environ, "MINI_ORK_ROOT": str(REPO), "MINI_ORK_HOME": hb, "MINI_ORK_DB": db_b,
-             "MO_FUSE_ENABLED": "1", "MO_DAILY_BUDGET_USD": "1000"}
-    rb = subprocess.run(["bash", "-c", f'source "{LIB}" >/dev/null 2>&1; '
-                         'llm_dispatch --node-type planner --prompt-text hi', "_"],
-                        capture_output=True, text=True, env=env_b).returncode
+    for _ in range(3):
+        _sql(db_p, "INSERT INTO llm_calls (provider,model_id,tier,feature_name,input_tokens,"
+                   "output_tokens,total_tokens,cost_usd,duration_ms,status,metadata_json,"
+                   "error_category,retryable) VALUES ('gateway','sonnet','default',"
+                   "'mini-ork:planner',0,0,0,0,0,'failed','{}','capacity',1);")
     old = dict(os.environ)
     os.environ.update({"MINI_ORK_ROOT": str(REPO), "MINI_ORK_HOME": hp, "MINI_ORK_DB": db_p,
                        "MO_FUSE_ENABLED": "1", "MO_DAILY_BUDGET_USD": "1000"})
@@ -171,10 +158,10 @@ def test_lane_fuse_parity(tmp_path):
         rp = ld.llm_dispatch(["--node-type", "planner", "--prompt-text", "hi"], root=str(REPO))
     finally:
         os.environ.clear(); os.environ.update(old)
-    assert rb == rp == 43
+    assert rp == 43
 
 
-def test_lane_resolution_parity(tmp_path):
+def test_lane_resolution(tmp_path):
     home = tmp_path / "lr" / ".mini-ork" / "config"; home.mkdir(parents=True)
     (home / "agents.yaml").write_text("lanes:\n  planner: opus\n  worker: sonnet\n")
     root = str(tmp_path / "lr"); hm = str(tmp_path / "lr" / ".mini-ork")

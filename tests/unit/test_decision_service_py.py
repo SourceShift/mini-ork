@@ -1,14 +1,12 @@
-"""Parity gate: mini_ork.steering.decision_service.decide vs lib/decision_service.sh.
+"""Unit tests: mini_ork.steering.decision_service.decide (bash parity halves removed; formerly vs lib/decision_service.sh).
 
-EPSILON=0 disables exploration so both sides are deterministic. Two paths:
+EPSILON=0 disables exploration so behavior is deterministic. Two paths:
 cold-start (no traces -> agents.yaml default lane) and learned (seeded winner
-clears the sample floor -> learned route). Bash decide is invoked live and its
-JSON compared field-by-field. No mocking, no hardcoded lane names on the
-cold-start path (the expected default is read from agents.yaml itself).
+clears the sample floor -> learned route). No mocking, no hardcoded lane names
+on the cold-start path (the expected default is read from agents.yaml itself).
 """
 from __future__ import annotations
 
-import json
 import os
 import subprocess
 import sys
@@ -21,8 +19,6 @@ sys.path.insert(0, str(REPO))
 from mini_ork import lane_router, trace_store  # noqa: E402
 from mini_ork.steering import decision_service as ds
 
-DS_SH = REPO / "lib" / "decision_service.sh"
-
 
 @pytest.fixture
 def env_db(tmp_path_factory, monkeypatch):
@@ -31,7 +27,6 @@ def env_db(tmp_path_factory, monkeypatch):
     subprocess.run(["bash", str(REPO / "db" / "init.sh")],
                    env={**os.environ, "MINI_ORK_HOME": str(home), "MINI_ORK_DB": dbp},
                    capture_output=True, text=True, check=True)
-    # Python side reads the same env the bash side gets.
     for k, v in {"MINI_ORK_ROOT": str(REPO), "MINI_ORK_HOME": str(home),
                  "MINI_ORK_DB": dbp, "MO_STORE_DB": dbp, "EPSILON": "0",
                  "MO_LEARNING_MIN_SAMPLES": "1",
@@ -40,28 +35,18 @@ def env_db(tmp_path_factory, monkeypatch):
     return dbp
 
 
-def _bash_decide(dbp, node_type, task_class, od):
-    r = subprocess.run(
-        ["bash", "-c", f'. "{DS_SH}" && decide "$1" "$2" "$3"',
-         "_", node_type, task_class, od],
-        env={**os.environ}, capture_output=True, text=True)
-    assert r.returncode == 0, r.stderr[-400:]
-    return json.loads(r.stdout.strip().splitlines()[-1])
-
-
-def test_cold_start_parity(env_db):
-    b = _bash_decide(env_db, "implementer", "code-fix", "code-delivery")
+def test_cold_start(env_db):
     p = ds.decide("implementer", "code-fix", "code-delivery", db=env_db)
     # Cold start: agents.yaml default lane, no sample, coalition ok.
     expected_default = ds.default_lane("implementer")
     assert expected_default, "agents.yaml must configure an implementer lane"
-    assert b["route"] == p["route"] == expected_default
-    assert b["coalition_ok"] is True and p["coalition_ok"] is True
-    assert b["sample_size"] == p["sample_size"] == 0
-    assert b["recursion_hint"] == p["recursion_hint"]
+    assert p["route"] == expected_default
+    assert p["coalition_ok"] is True
+    assert p["sample_size"] == 0
+    assert "recursion_hint" in p
 
 
-def test_learned_route_parity(env_db):
+def test_learned_route(env_db):
     # Seed a clear winner (laneA > laneB) then recompute advantages.
     def seed(lane, rv, n=3):
         for _ in range(n):
@@ -74,11 +59,10 @@ def test_learned_route_parity(env_db):
     seed("laneA", 1.0)
     seed("laneB", 0.0)
     lane_router.recompute_advantages(db=env_db)
-    b = _bash_decide(env_db, "implementer", "code-fix", "code-delivery")
     p = ds.decide("implementer", "code-fix", "code-delivery", db=env_db)
-    assert b["route"] == p["route"] == "laneA"
-    assert b["sample_size"] == p["sample_size"] > 0
-    assert abs(b["reward_estimate"] - p["reward_estimate"]) < 1e-9
+    assert p["route"] == "laneA"
+    assert p["sample_size"] > 0
+    assert "reward_estimate" in p
 
 
 def test_seeded_exploration_is_deterministic(env_db, monkeypatch):

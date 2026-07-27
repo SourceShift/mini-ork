@@ -1,18 +1,16 @@
-"""Parity gate: mini_ork.vcs.auto_merge vs lib/auto-merge.sh.
+"""Unit tests: mini_ork.vcs.auto_merge (bash parity halves removed; formerly vs lib/auto-merge.sh).
 
 Builds a full scenario (repo with main + an APPROVE epic branch ahead, a real
-state.db via db/init.sh, orch run dirs with verdict.json, kickoff with a Branch
-marker) ONCE, copies it for the live-bash run and the port run, then compares
-the merged main tree, epics status, runs verdict, branch deletion, and
-merged/skipped/failed counts. Plus focused parity on branch-resolution, the
-mutex, and untracked-stash. All git/DB in throwaway dirs.
+state.db via db/init.sh, orch run dirs with verdict.json, kickoff with a
+Branch marker), runs the port, then asserts the merged main tree, epics
+status, runs verdict, branch deletion, and merged/skipped/failed counts.
+Plus focused tests on branch-resolution, the mutex, and untracked-stash.
+All git/DB in throwaway dirs.
 """
 from __future__ import annotations
 
 import json
 import os
-import re
-import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -22,7 +20,6 @@ REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
 from mini_ork.vcs import auto_merge as am
 
-SH = REPO / "lib" / "auto-merge.sh"
 JOB = "job-test-1"
 ENV = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@e",
        "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@e"}
@@ -77,19 +74,6 @@ def _build(root: Path):
     return repo, home, orch, db
 
 
-def _run_bash(root: Path):
-    repo, home, orch, db = root / "repo", root / "home" / ".mini-ork", root / "orch", \
-        str(root / "home" / ".mini-ork" / "state.db")
-    script = f'. "{SH}" && mo_auto_merge'
-    env = {**os.environ, **ENV, "MINI_ORK_ROOT": str(REPO), "REPO_ROOT": str(repo),
-           "MINI_ORCH_DIR": str(orch), "JOB_ID": JOB, "MINI_ORK_HOME": str(home),
-           "MINI_ORK_DB": db}
-    subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=env)
-    log = (orch / "runs" / JOB / "merge.log").read_text()
-    m = re.search(r"merged=(\d+) skipped=(\d+) failed=(\d+)", log)
-    return (int(m[1]), int(m[2]), int(m[3])) if m else None
-
-
 def _snapshot(root: Path):
     repo = root / "repo"
     db = str(root / "home" / ".mini-ork" / "state.db")
@@ -101,35 +85,27 @@ def _snapshot(root: Path):
     }
 
 
-def test_auto_merge_approve_and_skip_parity(tmp_path):
-    _build(tmp_path / "src")
-    rb, rp = tmp_path / "b", tmp_path / "p"
-    shutil.copytree(tmp_path / "src", rb)
-    shutil.copytree(tmp_path / "src", rp)
+def test_auto_merge_approve_and_skip(tmp_path):
+    _build(tmp_path / "p")
+    rp = tmp_path / "p"
 
-    counts_b = _run_bash(rb)
     counts_p = am.auto_merge(str(rp / "repo"), str(rp / "orch"), JOB,
                              mini_ork_home=str(rp / "home" / ".mini-ork"),
                              state_db=str(rp / "home" / ".mini-ork" / "state.db"),
                              now_iso="2026-07-05T00:00:00.000Z")
-    assert counts_b == counts_p == (1, 1, 0)
-    snap_b, snap_p = _snapshot(rb), _snapshot(rp)
-    assert snap_b == snap_p
+    assert counts_p == (1, 1, 0)
+    snap_p = _snapshot(rp)
     assert snap_p["main_tree"] and snap_p["epic_status"] == "done"
     assert snap_p["run_verdict"] == "MERGED" and snap_p["branch_gone"] is True
     # merged main actually contains the feature file
     assert _g(rp / "repo", "cat-file", "-p", "main:feature.txt") == "the feature"
 
 
-def test_resolve_branch_parity(tmp_path):
+def test_resolve_branch(tmp_path):
     repo = tmp_path / "r"; repo.mkdir()
     (repo / "k.md").write_text("intro\n> **Branch:** `fix/some-thing_42`\nmore\n")
-    out_b = subprocess.run(
-        ["bash", "-c", f'. "{SH}"; grep -E "^>?[[:space:]]*\\*\\*Branch:\\*\\*" "{repo}/k.md" '
-         '| head -1 | sed -E "s/^[^\\`]*\\`([^\\`]+)\\`.*/\\1/"'],
-        capture_output=True, text=True).stdout.strip()
-    assert out_b == am._resolve_branch(str(repo), "k.md") == "fix/some-thing_42"
-    # no branch marker → empty on both
+    assert am._resolve_branch(str(repo), "k.md") == "fix/some-thing_42"
+    # no branch marker → empty
     (repo / "none.md").write_text("no marker here\n")
     assert am._resolve_branch(str(repo), "none.md") == ""
 
@@ -146,7 +122,7 @@ def test_mutex_acquire_release(tmp_path):
     am.release_main_mutex(home)
 
 
-def test_stash_colliding_untracked_parity(tmp_path):
+def test_stash_colliding_untracked(tmp_path):
     # build repo where feat branch ADDS a file that main has untracked
     src = tmp_path / "src"; src.mkdir()
     _g(src, "init", "-q", "-b", "main")
@@ -158,16 +134,8 @@ def test_stash_colliding_untracked_parity(tmp_path):
     # main has new.txt UNTRACKED (collides with branch's added file)
     (src / "new.txt").write_text("untracked on main\n")
 
-    rb, rp = tmp_path / "b", tmp_path / "p"
-    shutil.copytree(src, rb); shutil.copytree(src, rp)
-    hb, hp = str(tmp_path / "hb"), str(tmp_path / "hp")
-
-    out_b = subprocess.run(
-        ["bash", "-c", f'. "{SH}"; REPO_ROOT="{rb}"; JOB_ID="{JOB}"; MINI_ORK_HOME="{hb}"; '
-         '_mo_stash_colliding_untracked "feat/x" "epicX" "/dev/null"'],
-        capture_output=True, text=True, env={**os.environ, **ENV}).returncode
-    moved_p = am.stash_colliding_untracked(str(rp), "feat/x", "epicX", JOB, hp, "20260101-000000")
-    assert out_b == 0 and moved_p == 1
-    # both: new.txt moved out of the working tree
-    assert not (rp / "new.txt").exists()
-    assert not (rb / "new.txt").exists()
+    hp = str(tmp_path / "hp")
+    moved_p = am.stash_colliding_untracked(str(src), "feat/x", "epicX", JOB, hp, "20260101-000000")
+    assert moved_p == 1
+    # new.txt moved out of the working tree
+    assert not (src / "new.txt").exists()

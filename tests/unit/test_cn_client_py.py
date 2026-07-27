@@ -1,18 +1,18 @@
-"""Parity gate: mini_ork.cn_client vs lib/cn_client.sh.
+"""Unit tests: mini_ork.cn_client (bash parity halves removed; formerly vs lib/cn_client.sh).
 
 Three surfaces:
-  1. render_* markdown — run the LIVE bash renderer and the port on identical
-     JSON fixtures (incl. empty / truncation / missing-field edges); byte-equal.
-  2. HTTP round-trips — a mock CN server (health 200 + canned bodies); compare
-     bash `cn_retrieve` / `cn_inbox` vs the port against the same server.
-  3. Fallbacks — MO_DISABLE_CN=1 and a dead port both yield {} on reads, in both.
+  1. render_* markdown — run the port on JSON fixtures (incl. empty /
+     truncation / missing-field edges) and assert the rendered sections
+     semantically.
+  2. HTTP round-trips — a mock CN server (health 200 + canned bodies); the
+     port's `retrieve` / `inbox` return the served body verbatim.
+  3. Fallbacks — MO_DISABLE_CN=1 and a dead port both yield {} on reads.
 """
 from __future__ import annotations
 
 import http.server
 import json
 import os
-import subprocess
 import sys
 import threading
 from pathlib import Path
@@ -21,18 +21,8 @@ REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
 from mini_ork import cn_client as cn  # noqa: E402
 
-LIB = REPO / "lib" / "cn_client.sh"
 
-
-def _bash_fn(call: str, *args, env=None):
-    """source cn_client.sh and invoke one function; return stdout."""
-    script = f'source "{LIB}"; {call}'
-    argv = ["bash", "-c", script, "_", *[str(a) for a in args]]
-    return subprocess.run(argv, capture_output=True, text=True,
-                          env={**os.environ, **(env or {})}).stdout
-
-
-# ---- 1. render_* parity ----
+# ---- 1. render_* markdown ----
 
 _RETRIEVE = json.dumps({"hits": [
     {"similarity": 0.9123, "metadata": {"kind": "decision", "ts": "2026-07-05T10:00:00"},
@@ -54,35 +44,48 @@ _BASINS = json.dumps({"basins": [
 ]})
 
 
-def test_render_parity():
-    cases = [
-        ('cn_render_atoms_md "$1" "$2"', cn.render_atoms_md, _RETRIEVE, 5),
-        ('cn_render_features_md "$1" "$2" "$3"', None, _FEATURES, None),  # 3-arg, handled below
-        ('cn_render_inbox_md "$1" "$2"', cn.render_inbox_md, _INBOX, 5),
-        ('cn_render_basins_md "$1" "$2"', cn.render_basins_md, _BASINS, 5),
-    ]
-    # atoms / inbox / basins (2-arg)
-    for call, fn, payload, limit in cases:
-        if fn is None:
-            continue
-        rb = _bash_fn(call, payload, limit)
-        rp = fn(payload, limit)
-        assert rb == rp, f"{call}\nBASH:{rb!r}\nPY:  {rp!r}"
-    # features (3-arg: json, cwd, limit)
-    rb = _bash_fn('cn_render_features_md "$1" "$2" "$3"', _FEATURES, "/ps/mini-ork", 6)
+def test_render_atoms_md():
+    rp = cn.render_atoms_md(_RETRIEVE, 5)
+    assert rp.startswith("--- ContextNest atoms")
+    # first hit: kind/sim/date/session prefix + content flattened to one line
+    assert "- [decision sim=0.91 2026-07-05 sess=abcdef12] chose sqlite over pg for portability" in rp
+    # second hit: missing metadata falls back to defaults; long content truncated
+    assert "sess=zz" in rp and "..." in rp
+    assert rp.rstrip().endswith("--- /ContextNest atoms ---")
+
+
+def test_render_features_md():
     rp = cn.render_features_md(_FEATURES, "/ps/mini-ork", 6)
-    assert rb == rp, f"features\nBASH:{rb!r}\nPY:  {rp!r}"
+    assert rp.startswith("--- ContextNest features")
+    assert "(backend) [this project] eval node" in rp
+    assert "test: run pytest yyy" in rp
+    # missing fields degrade to placeholders
+    assert "(?) no-test feat" in rp
+
+
+def test_render_inbox_md():
+    rp = cn.render_inbox_md(_INBOX, 5)
+    assert rp.startswith("--- ContextNest attention inbox ---")
+    assert "[todo deadbeef]" in rp          # session_id truncated to 8 chars
+    assert "..." in rp                       # long subject truncated
+    assert "[user_action short] restart" in rp
+
+
+def test_render_basins_md():
+    rp = cn.render_basins_md(_BASINS, 5)
+    assert rp.startswith("--- ContextNest topic clusters (basins) ---")
+    assert "[b1234567 mass=12]" in rp        # basin_id truncated to 8 chars
+    assert "..." in rp                       # long representative truncated
+    assert "[b2 mass=3] schema work" in rp
 
 
 def test_render_empty_and_bad_json():
-    for call, fn in [('cn_render_atoms_md "$1" "$2"', cn.render_atoms_md),
-                     ('cn_render_inbox_md "$1" "$2"', cn.render_inbox_md),
-                     ('cn_render_basins_md "$1" "$2"', cn.render_basins_md)]:
+    for fn in (cn.render_atoms_md, cn.render_inbox_md, cn.render_basins_md):
         for payload in ('{}', '{"hits":[]}', 'not json'):
-            assert _bash_fn(call, payload, 5) == fn(payload, 5) == ""
+            assert fn(payload, 5) == ""
 
 
-# ---- 2. mock-server HTTP parity ----
+# ---- 2. mock-server HTTP round-trips ----
 
 class _Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, format, *args):  # noqa: A002 — match base signature
@@ -137,8 +140,8 @@ def _server():
 
 
 def _poll_hooks(srv, want: int, timeout: float = 5.0):
-    """cn_hook_post is fire-and-forget on BOTH sides (bash `curl &`, port daemon
-    thread) — poll the server until `want` events land or timeout."""
+    """cn_hook_post is fire-and-forget (daemon thread) — poll the server until
+    `want` events land or timeout."""
     import time as _t
     deadline = _t.time() + timeout
     while _t.time() < deadline:
@@ -148,109 +151,75 @@ def _poll_hooks(srv, want: int, timeout: float = 5.0):
     return list(srv.hook_events)
 
 
-def test_http_parity(tmp_path):
+def test_http_round_trips(tmp_path):
     srv, base = _server()
     try:
-        for i, (call, fn) in enumerate([
-                ('cn_retrieve "$1" "$2"', lambda: cn.retrieve("q", 3)),
-                ('cn_inbox "$1"', lambda: cn.inbox(5))]):
-            hb = tmp_path / f"hb{i}"; hp = tmp_path / f"hp{i}"
-            env_b = {"CN_BASE_URL": base, "MINI_ORK_HOME": str(hb), "CN_TIMEOUT_SEC": "5"}
-            rb = _bash_fn(call, "q", 3 if i == 0 else 5, env=env_b)
-            old = dict(os.environ)
-            os.environ.update({"CN_BASE_URL": base, "MINI_ORK_HOME": str(hp), "CN_TIMEOUT_SEC": "5"})
-            try:
-                rp = fn()
-            finally:
-                os.environ.clear(); os.environ.update(old)
-            assert rb.strip() == rp.strip(), f"{call}\nBASH:{rb!r}\nPY:{rp!r}"
+        old = dict(os.environ)
+        os.environ.update({"CN_BASE_URL": base, "MINI_ORK_HOME": str(tmp_path / "h"),
+                           "CN_TIMEOUT_SEC": "5"})
+        try:
+            rp_retrieve = cn.retrieve("q", 3)
+            rp_inbox = cn.inbox(5)
+        finally:
+            os.environ.clear(); os.environ.update(old)
+        assert json.loads(rp_retrieve) == {"hits": [{"content": "hi", "similarity": 0.5}]}
+        assert json.loads(rp_inbox) == {"items": [{"kind": "todo", "id": "x"}]}
     finally:
         srv.shutdown()
 
 
-# ---- 3. fallback parity ----
+# ---- 3. fallbacks ----
 
 def test_disabled_and_down_fallback(tmp_path):
     # disabled → {} on reads
     env = {"MO_DISABLE_CN": "1", "MINI_ORK_HOME": str(tmp_path / "d")}
-    rb = _bash_fn('cn_retrieve "$1"', "q", env=env)
     old = dict(os.environ); os.environ.update(env)
     try:
         rp = cn.retrieve("q")
     finally:
         os.environ.clear(); os.environ.update(old)
-    assert rb.strip() == rp.strip() == "{}"
+    assert rp.strip() == "{}"
     # dead port → {} on reads (fast timeout)
     env = {"CN_BASE_URL": "http://127.0.0.1:1", "MINI_ORK_HOME": str(tmp_path / "x"),
            "CN_TIMEOUT_SEC": "1"}
-    rb = _bash_fn('cn_retrieve "$1"', "q", env=env)
     old = dict(os.environ); os.environ.update(env)
     try:
         rp = cn.retrieve("q")
     finally:
         os.environ.clear(); os.environ.update(old)
-    assert rb.strip() == rp.strip() == "{}"
+    assert rp.strip() == "{}"
 
 
-# ---- 4. available / capsule / hook_post parity ----
-#
-# Ported from the retired tests/unit/test_cn_client.sh. Three of its assertions
-# drove live bash functions the parity gate never exercised: `cn_available`
-# (return code against a healthy stub — the gate only reached health transitively
-# via cn_retrieve), `cn_capsule` (## Risks / ## Decisions markdown — no case), and
-# `cn_hook_post` (fire-and-forget POST to /api/v1/cc/hook/<event> — no case, and
-# the mock server did not even implement that endpoint). The port is complete for
-# all three (available()/capsule()/hook_post()), so these are added as live-bash
-# parity cases; no production change was required. The mock server now serves
-# /api/v1/prompt-context/capsule and records /api/v1/cc/hook/ POSTs.
-def test_available_hook_capsule_parity(tmp_path):
+# ---- 4. available / capsule / hook_post ----
+
+def test_available_hook_capsule(tmp_path):
     srv, base = _server()
     try:
-        # #1 cn_available — healthy stub → reachable on both sides.
-        env_b = {"CN_BASE_URL": base, "MINI_ORK_HOME": str(tmp_path / "a_b"),
-                 "CN_TIMEOUT_SEC": "5", "CN_PING_TTL": "0"}
-        rb = _bash_fn('if cn_available; then echo true; else echo false; fi', env=env_b)
         old = dict(os.environ)
-        os.environ.update({"CN_BASE_URL": base, "MINI_ORK_HOME": str(tmp_path / "a_p"),
+        os.environ.update({"CN_BASE_URL": base, "MINI_ORK_HOME": str(tmp_path / "a"),
                            "CN_TIMEOUT_SEC": "5", "CN_PING_TTL": "0"})
         try:
-            avail_p = cn.available()
-        finally:
-            os.environ.clear(); os.environ.update(old)
-        assert rb.strip() == ("true" if avail_p else "false") == "true"
-
-        # #7/#8 cn_capsule — kind-ordered markdown, byte-parity + section markers.
-        env_b = {"CN_BASE_URL": base, "MINI_ORK_HOME": str(tmp_path / "c_b"),
-                 "CN_TIMEOUT_SEC": "5", "CN_PING_TTL": "0"}
-        rb = _bash_fn('cn_capsule "$1" "$2"', "stub", "14d", env=env_b)
-        old = dict(os.environ)
-        os.environ.update({"CN_BASE_URL": base, "MINI_ORK_HOME": str(tmp_path / "c_p"),
-                           "CN_TIMEOUT_SEC": "5", "CN_PING_TTL": "0"})
-        try:
+            assert cn.available() is True
             rp = cn.capsule("stub", "14d")
         finally:
             os.environ.clear(); os.environ.update(old)
-        assert rb.strip() == rp.strip(), f"capsule\nBASH:{rb!r}\nPY:{rp!r}"
+        # capsule: kind-ordered markdown served by the stub comes back verbatim
+        assert rp.strip() == _CAPSULE_MD.strip()
         assert "## Risks" in rp and "## Decisions" in rp
 
-        # #6 cn_hook_post — fire-and-forget POST reaches /api/v1/cc/hook/session_start
-        # on BOTH sides. Distinct session_ids prove each side drove the endpoint.
+        # hook_post — fire-and-forget POST reaches /api/v1/cc/hook/session_start
         srv.hook_events.clear()
-        env_b = {"CN_BASE_URL": base, "MINI_ORK_HOME": str(tmp_path / "h_b"),
-                 "CN_TIMEOUT_SEC": "5", "CN_HOOK_TIMEOUT_SEC": "5", "CN_PING_TTL": "0"}
-        _bash_fn('cn_hook_post "$1" "$2" "$3" "$4"', "session_start", "sess-bash", "/tmp", "",
-                 env=env_b)
         old = dict(os.environ)
-        os.environ.update({"CN_BASE_URL": base, "MINI_ORK_HOME": str(tmp_path / "h_p"),
+        os.environ.update({"CN_BASE_URL": base, "MINI_ORK_HOME": str(tmp_path / "hp"),
                            "CN_TIMEOUT_SEC": "5", "CN_HOOK_TIMEOUT_SEC": "5", "CN_PING_TTL": "0"})
         try:
             cn.hook_post("session_start", "sess-py", "/tmp", "")
         finally:
             os.environ.clear(); os.environ.update(old)
-        got = _poll_hooks(srv, want=2, timeout=5.0)
-        assert len(got) >= 2, f"expected >=2 hook POSTs, got {got}"
+        got = _poll_hooks(srv, want=1, timeout=5.0)
+        assert len(got) >= 1, f"expected >=1 hook POST, got {got}"
         sids = {e["body"].get("session_id") for e in got if e["event"] == "session_start"}
-        assert "sess-bash" in sids and "sess-py" in sids, f"hook session_ids={sids}"
+        assert "sess-py" in sids, f"hook session_ids={sids}"
         for e in got:
             assert e["event"] == "session_start"
             assert e["body"].get("hook_event_name") == "session_start"

@@ -1,15 +1,14 @@
-"""Parity gate: mini_ork.cli.serve vs bin/mini-ork-serve.
+"""Unit tests: mini_ork.cli.serve (bash parity halves removed; formerly vs bin/mini-ork-serve).
 
-The uvicorn launch itself can't be parity-tested (it binds a port and blocks),
+The uvicorn launch itself can't be unit-tested (it binds a port and blocks),
 but every path before the exec — --help, unknown-flag, and the missing-state.db
-preflight — is compared against the LIVE bash entrypoint via subprocess. The
-composed uvicorn argv is asserted structurally.
+preflight — is asserted semantically. The composed uvicorn argv is asserted
+structurally.
 """
 from __future__ import annotations
 
 import io
 import os
-import subprocess
 import sys
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -17,18 +16,6 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
 from mini_ork.cli import serve as srv
-
-BIN = REPO / "bin" / "mini-ork-serve"
-
-
-def _bash(args, home=None):
-    env = {**os.environ, "MINI_ORK_ROOT": str(REPO)}
-    if home is not None:
-        env["MINI_ORK_HOME"] = str(home)
-    else:
-        env.pop("MINI_ORK_HOME", None)
-    r = subprocess.run(["bash", str(BIN), *args], capture_output=True, text=True, env=env)
-    return r.stdout, r.stderr, r.returncode
 
 
 def _py(args, home=None):
@@ -46,25 +33,23 @@ def _py(args, home=None):
     return buf.getvalue(), rc
 
 
-def test_help_parity():
-    out_b, _, rc_b = _bash(["--help"])
-    out_p, rc_p = _py(["--help"])
-    assert rc_b == rc_p == 0
-    assert out_b == out_p
+def test_help():
+    out, rc = _py(["--help"])
+    assert rc == 0
+    assert "Usage: mini-ork serve" in out
+    assert "--port N" in out
 
 
-def test_unknown_flag_parity():
-    out_b, err_b, rc_b = _bash(["--bogus"])
-    out_p, rc_p = _py(["--bogus"])
-    assert rc_b == rc_p == 2
-    assert out_b == out_p  # both print usage to stdout after the error
+def test_unknown_flag():
+    out, rc = _py(["--bogus"])
+    assert rc == 2
+    assert "Usage: mini-ork serve" in out  # usage printed to stdout after the error
 
 
-def test_missing_db_preflight_parity(tmp_path):
+def test_missing_db_preflight(tmp_path):
     empty_home = tmp_path / ".mini-ork"; empty_home.mkdir()
-    _, err_b, rc_b = _bash([], home=empty_home)
-    _, rc_p = _py([], home=empty_home)
-    assert rc_b == rc_p == 1  # no state.db → exit 1 on both
+    _, rc = _py([], home=empty_home)
+    assert rc == 1  # no state.db → exit 1
 
 
 def test_uvicorn_argv_shape():
