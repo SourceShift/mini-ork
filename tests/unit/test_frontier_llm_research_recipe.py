@@ -54,6 +54,20 @@ def test_workflow_has_one_bounded_artifact_handoff_per_summary_shard():
     assert all(binding.consumer_input == "source_summaries" for binding in rollup_bindings)
 
 
+def test_deterministic_verifiers_emit_nonvacuous_pass_envelopes():
+    scripts = (
+        "collect-latest-libwit.sh",
+        "shard-corpus.sh",
+        "prepare-technique-rollup.sh",
+        "assemble-aggregation.sh",
+        "verify-aggregation.sh",
+    )
+
+    for script_name in scripts:
+        content = (RECIPE / "verifiers" / script_name).read_text(encoding="utf-8")
+        assert '"pass":true' in content, script_name
+
+
 def test_collector_identifies_the_mini_ork_client_to_libwit(monkeypatch, tmp_path: Path):
     pipeline = _pipeline()
     plan_path = tmp_path / "collection-plan.json"
