@@ -135,15 +135,36 @@ _seed_collision_panel "run-fixture-collision"
 # uses (c) as the most-portable surface (gate_run_all is testable
 # without invoking the public executor route).
 
-source "$MINI_ORK_ROOT/lib/gate_bootstrap.sh"
-mo_bootstrap_oracle_gates
-# Re-source registry now that bootstrap registered the 4 oracle gates.
-source "$MINI_ORK_ROOT/lib/gate_registry.sh"
+# WS4 (bash-removal): the bootstrap + gate_run_all half of this test now
+# drives the NATIVE path — mini_ork.gates.gate_bootstrap (which seeds
+# `native:<name>` sentinel conditions) + mini_ork.gates.gate_registry
+# .gate_run_all (whose registry maps those conditions to in-process
+# evaluators). No gate-condition bash script (gates/*.sh) is executed on
+# this path anymore. Fixture 3 still exercises the public executor route
+# via bin/mini-ork.
 
-# gate_run_all summary JSON shape (per lib/gate_registry.sh:327-333):
+_py_gate_run_all() {
+  # Usage: _py_gate_run_all <task_class> <context_json> → summary JSON on stdout.
+  local task_class="$1" context="$2"
+  PYTHONPATH="$MINI_ORK_ROOT" python3 - "$MINI_ORK_DB" "$task_class" "$context" "$MINI_ORK_ROOT" <<'PY'
+import json, sys
+from mini_ork.gates import gate_registry
+db, task_class, context, root = sys.argv[1:5]
+summary = gate_registry.gate_run_all(db, task_class, context, mini_ork_root=root)
+print(json.dumps(summary))
+PY
+}
+
+PYTHONPATH="$MINI_ORK_ROOT" python3 - "$MINI_ORK_DB" "$MINI_ORK_ROOT" <<'PY'
+import sys
+from mini_ork.gates import gate_bootstrap
+sys.exit(gate_bootstrap.bootstrap_oracle_gates(db=sys.argv[1], root=sys.argv[2]))
+PY
+
+# gate_run_all summary JSON shape (per mini_ork/gates/gate_registry.py):
 #   { task_class, all_pass, any_defer, safety_violation, gate_count, gates: [...] }
 context=$(printf '{"panel_run_id":"run-fixture-collision","recipe":"refactor-audit","task_class":"refactor_audit","current_round":1}')
-verdict_out=$(gate_run_all "refactor_audit" "$context" 2>/dev/null)
+verdict_out=$(_py_gate_run_all "refactor_audit" "$context" 2>/dev/null)
 fixture1_safety=$(echo "$verdict_out" | jq -r '.safety_violation // false' 2>/dev/null)
 _assert "Fixture 1: same-family panel → safety_violation=true" \
   '[[ "$fixture1_safety" == "true" ]]'
@@ -154,7 +175,7 @@ echo "--- Fixture 2: MO_ORACLE_GATES_AUTO=1 + diverse-family panel → expect pa
 _seed_diverse_panel "run-fixture-diverse"
 
 context=$(printf '{"panel_run_id":"run-fixture-diverse","recipe":"refactor-audit","task_class":"refactor_audit","current_round":1}')
-verdict_out=$(gate_run_all "refactor_audit" "$context" 2>/dev/null)
+verdict_out=$(_py_gate_run_all "refactor_audit" "$context" 2>/dev/null)
 fixture2_safety=$(echo "$verdict_out" | jq -r '.safety_violation // false' 2>/dev/null)
 _assert "Fixture 2: diverse-family panel → safety_violation=false (coalition passes)" \
   '[[ "$fixture2_safety" == "false" ]]'
@@ -201,7 +222,7 @@ echo
 echo "--- Fixture 4: single-node code-fix recipe + auto-wire ON → coalition gate fail-opens ──"
 
 context=$(printf '{"panel_run_id":"run-fixture-single-node","recipe":"code-fix","task_class":"code_fix","current_round":1}')
-verdict_out=$(gate_run_all "code_fix" "$context" 2>/dev/null)
+verdict_out=$(_py_gate_run_all "code_fix" "$context" 2>/dev/null)
 fixture4_safety=$(echo "$verdict_out" | jq -r '.safety_violation // false' 2>/dev/null)
 fixture4_gate_count=$(echo "$verdict_out" | jq -r '.gate_count // 0' 2>/dev/null)
 _assert "Fixture 4: single-node code-fix sees registered oracle gates" \
