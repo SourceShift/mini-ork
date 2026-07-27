@@ -1,21 +1,19 @@
 """Linear-history, stateless-action MinimalAgent.
 
 Each turn: dispatch → parse assistant reply for either a completion sentinel
-or a single fenced bash block → run the bash via ``mo_runtime_exec`` →
-append the result to the in-memory history. Stops on sentinel or after
-``max_turns``; never branches on ``MO_RUNTIME_BACKEND`` (the bash seam
-honors it transparently).
+or a single fenced bash block → run the bash via the native
+``mini_ork.runtime.contract.mo_runtime_exec`` → append the result to the
+in-memory history. Stops on sentinel or after ``max_turns``; never branches
+on ``MO_RUNTIME_BACKEND`` (the runtime seam honors it transparently).
 """
 from __future__ import annotations
 
-import os
 import re
-import shlex
-import subprocess
 from dataclasses import dataclass, field
 from typing import Any
 
 from mini_ork.dispatch import DispatchRequest, dispatch_model
+from mini_ork.runtime.contract import mo_runtime_exec
 
 _SENTINEL = "COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT"
 _SENTINEL_RE = re.compile(rf"^{re.escape(_SENTINEL)}\s*(.*)$", re.MULTILINE)
@@ -116,20 +114,9 @@ class MinimalAgent:
         return "\n".join(f"{m['role']}: {m['content']}" for m in messages)
 
     def _run_bash(self, cmd: str) -> tuple[str, int]:
-        root = os.environ.get("MINI_ORK_ROOT", "")
-        if not root:
-            return ("MINI_ORK_ROOT not set", 2)
-        bash_cmd = (
-            f'source "{root}/lib/runtime/contract.sh"; '
-            f"mo_runtime_exec {shlex.quote(cmd)} "
-            f"{shlex.quote(self.cwd)} {self.timeout}"
-        )
-        proc = subprocess.run(
-            ["bash", "-c", bash_cmd],
-            capture_output=True,
-            text=True,
-        )
-        return (proc.stdout or ""), proc.returncode
+        # Native port of the bash runtime contract (WS7): cwd pinned per turn,
+        # pgid-kill timeout semantics, merged stdout+stderr — no bash libs.
+        return mo_runtime_exec(cmd, cwd=self.cwd, timeout=self.timeout)
 
 
 def run_minimal(
