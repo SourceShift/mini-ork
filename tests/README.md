@@ -4,107 +4,41 @@
 
 ```bash
 # From the repo root:
-bash tests/smoke.sh
+python3 -m pytest -q
 ```
 
-Exit 0 = all checks passed or were cleanly skipped.
-Exit 1 = at least one check failed (see `[FAIL]` lines).
+The suite is pure Python (the bash test layers were removed in the
+2026-07 bash-removal — see `docs/plans/2026-07-26-bash-removal-plan.md`).
+`pyproject.toml` sets `pythonpath=["."]` and `testpaths=["tests"]`.
 
----
+## Layout
 
-## Test Files
+| Path | Contents |
+|---|---|
+| `tests/unit/` | Unit tests for `mini_ork/*` modules (`*_py.py`) |
+| `tests/` (root) | Integration-style suites (dispatch, recovery, web smoke, run artifacts, …) |
+| `tests/integration/` | Cross-component integration tests |
+| `tests/e2e/` | End-to-end flows |
+| `tests/optimize/` | GEPA/optimizer tests |
+| `tests/live/` | Live-provider tests (skipped without creds) |
 
-| File | What it tests | Requires |
-|---|---|---|
-| `tests/smoke.sh` | Deps, DB init, bash syntax, shellcheck | `sqlite3`, `jq`, `git`, `bash 4+` |
-| `tests/unit/test_dispatch.sh` | `lib/dispatch.sh` error-handling | `lib/dispatch.sh` + `db/init.sh` |
-| `tests/integration/test_bin_spawn.sh` | `mini-ork spawn` CLI lineage, child workspace, and child cap | `sqlite3`, `git`, dry-run mode |
-| `tests/e2e/test_e2e_recursive_orchestration.sh` | root -> child -> grandchild recursive orchestration | `sqlite3`, `git`, dry-run mode |
-| `tests/security/test_sec_recursive_spawn_limits.sh` | depth, authority, and orphan-parent spawn blocking | `sqlite3`, `git` |
+## Conventions
 
----
+- DB-backed tests bootstrap the schema with
+  `mini_ork.stores.migrate.init_db(db_path, root=repo)` — no subprocess,
+  ~1s. Use a `tmp_path` db per test.
+- Tests that drive CLIs prefer `python -m <module>` subprocesses or
+  in-process `main(argv)` calls.
+- The `conftest.py` autouse fixture snapshots/restores `os.environ` and
+  cwd — never leak either (a past leak of `.mini-ork/state.db` into the
+  suite cwd poisoned later tests).
+- Long-history: parity tests that compared the Python port against the
+  retired bash twins were converted to plain unit tests in Phase 3
+  (2026-07-27); expectations are semantic, not recorded goldens.
 
-## Running Individual Tests
+## CI
 
-```bash
-bash tests/unit/test_dispatch.sh
-bash tests/integration/test_bin_spawn.sh
-bash tests/e2e/test_e2e_recursive_orchestration.sh
-bash tests/security/test_sec_recursive_spawn_limits.sh
-```
-
-All test scripts follow the same convention:
-- `[OK]` — assertion passed
-- `[SKIP]` — precondition not met (dependency not yet present); not a failure
-- `[FAIL]` — assertion failed; exit 1
-
----
-
-## CI Integration
-
-### GitHub Actions
-
-```yaml
-# .github/workflows/smoke.yml
-name: smoke
-on: [push, pull_request]
-jobs:
-  smoke:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install deps
-        run: sudo apt-get install -y sqlite3 jq shellcheck
-      - name: Run smoke tests
-        run: bash tests/smoke.sh
-      - name: Run unit tests
-        run: |
-          bash tests/unit/test_dispatch.sh
-```
-
-### GitLab CI
-
-```yaml
-smoke:
-  image: ubuntu:24.04
-  script:
-    - apt-get install -y sqlite3 jq shellcheck git bash
-    - bash tests/smoke.sh
-    - bash tests/unit/test_dispatch.sh
-```
-
-### Makefile target
-
-```makefile
-test:
-	bash tests/smoke.sh
-	bash tests/unit/test_dispatch.sh
-```
-
----
-
-## Skips vs Failures
-
-A `[SKIP]` means a precondition was not met — typically because another
-agent is still building the dependency being tested. Skips are **not**
-counted as failures. The smoke test exits 0 if all results are `OK` or
-`SKIP` with zero `FAIL`.
-
-This design lets CI run cleanly on a partial repo while agents are still
-in-flight.
-
----
-
-## Adding New Tests
-
-1. Create `tests/unit/test_<module>.sh` using the same `_ok` / `_fail` /
-   `_skip` pattern as the existing unit tests.
-2. Add a guard at the top: skip if the library under test is not present.
-3. Use a `mktemp -d` isolated `MINI_ORK_HOME` — never write to the caller's
-   `.mini-ork/` directory.
-4. Clean up with `rm -rf "$TMP_DIR"` at the end.
-5. Add a row to the table in this README.
-
-The guard + skip pattern means tests can be added for features not yet
-implemented — they stay in the repo as forward documentation and flip to
-`[OK]` automatically once the implementation lands.
+`.github/workflows/ci.yml` runs ruff (blocking + advisory), pytest on
+3.11/3.12 (sharded `unit-a`/`unit-b`/`rest`), the UI typecheck, and the
+web smoke suite. The merge green-gate is `python3 -m pytest -q` (scope
+per task with `MINI_ORK_TEST_CMD`).
