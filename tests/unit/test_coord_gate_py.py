@@ -1,23 +1,15 @@
-"""Parity gate: mini_ork.gates.coord_gate vs lib/coord_gate.sh.
+"""Standalone unit tests for ``mini_ork.gates.coord_gate``.
 
-Each test drives the LIVE bash function via
-``bash -c 'source lib/coord_gate.sh; coord_gate_check ...'`` against the
-SAME JSON-file fixture as the Python port, then deep-compares the two
-outputs: stdout/stderr strings byte-equal, return code exact-equal. No
-mocks, no hardcoded outputs beyond what bash itself emits.
+Replaces the bash-parity gate (against ``lib/coord_gate.sh``) as part of
+the bash→Python migration: the Python port is now the sole implementation,
+so its coverage no longer drives the LIVE bash function via
+``bash -c 'source lib/coord_gate.sh; coord_gate_check ...'`` — it asserts
+the port's behaviour directly. The expected values below are the semantic
+contract the bash side used to pin (rc semantics, stderr nudge/deny
+messages, metrics shape, audit ring buffer), now asserted on the port's
+output.
 
-The bash function reads its knobs from the environment
-(``COORD_GATE_MODE`` / ``COORD_GATE_SCOPE`` / ``COORD_GATE_METRICS_FILE`` /
-``COORD_GATE_AUDIT_FILE`` / ``COORD_GATE_AUDIT_MAX`` /
-``COORD_REGISTRY_STATE_FILE``); the Python port takes them as explicit
-kwargs (where applicable) AND reads the same env vars at function entry.
-The bash subprocess MUST source ``lib/coord_registry.sh`` too — the gate
-auto-sources it at the bottom of the bash file, but the auto-source only
-runs when the gate is loaded as a script body (``BASH_SOURCE[0]``); when
-the gate is sourced as a library in a subshell, we source the registry
-explicitly so the auto-source path matches.
-
-Ten cases (above the kickoff's >=6 floor):
+Ten cases:
   (a) check advisory + no conflict        → rc=0, empty stdout, empty stderr
   (b) check advisory + active write holder → rc=0, stderr "WAIT before..."
   (c) check strict + in-scope conflict    → rc=11, stderr "strict deny..."
@@ -25,23 +17,19 @@ Ten cases (above the kickoff's >=6 floor):
                                              ...out of strict scope..."
   (e) check bad mode                       → rc=2, stderr "mode must be..."
   (f) metrics() on empty state             → 4-key default JSON
-  (g) metrics_field after bump_sequence     → integer equality (no drift)
+  (g) metrics_field after bump_sequence     → integer counters
   (h) audit() bounded ring buffer           → most-recent-first, count/max
-  (i) check strict + no conflict           → rc=0, empty streams (parity)
+  (i) check strict + no conflict           → rc=0, empty streams
   (j) metrics coord_leases_held            → observe() counts the LIVE
                                              registry snapshot (1, then 2)
 
 Cases (i) and (j) were ported from tests/integration/test_coord_gate.sh
-(strict-mode-no-conflict silence, and the observe()-driven live-lease count)
-when that bash fixture was retired — the two assertions the gate above did
-not already subsume.
+(strict-mode-no-conflict silence, and the observe()-driven live-lease
+count) when that bash fixture was retired.
 """
 from __future__ import annotations
 
 import json
-import os
-import shutil
-import subprocess
 import sys
 import time
 from pathlib import Path
@@ -52,52 +40,14 @@ REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
 from mini_ork.gates import coord_gate as cg
 
-SH = REPO / "lib" / "coord_gate.sh"
-REGISTRY_SH = REPO / "lib" / "coord_registry.sh"
-
-_FLOAT_TOL = 1e-6  # gate output is int-only but the helper applies tolerance
-
-
-# ── helpers ────────────────────────────────────────────────────────────────
-
-
-def _which_bash() -> None:
-    if not shutil.which("bash"):
-        pytest.skip("bash not on PATH")
-    if not shutil.which("python3"):
-        pytest.skip("python3 not on PATH (required by lib/coord_gate.sh)")
-    if not SH.exists():
-        pytest.skip(f"missing lib/coord_gate.sh at {SH}")
-    if not REGISTRY_SH.exists():
-        pytest.skip(f"missing lib/coord_registry.sh at {REGISTRY_SH}")
-
-
-def _env_for(home: Path, *, gate_mode: str | None = None,
-             gate_scope: str | None = None,
-             gate_audit_max: int | None = None) -> dict:
-    """Build the bash subprocess env. Inherits the per-test file-path pins
-    set by the `home` fixture; only overrides the gate-config knobs.
-    """
-    env = dict(os.environ)
-    env.pop("COORD_GATE_MODE", None)
-    env.pop("COORD_GATE_SCOPE", None)
-    env.pop("COORD_GATE_AUDIT_MAX", None)
-    if gate_mode is not None:
-        env["COORD_GATE_MODE"] = gate_mode
-    if gate_scope is not None:
-        env["COORD_GATE_SCOPE"] = gate_scope
-    if gate_audit_max is not None:
-        env["COORD_GATE_AUDIT_MAX"] = str(gate_audit_max)
-    return env
-
 
 @pytest.fixture
 def home(tmp_path_factory, monkeypatch):
-    """Fresh home dir per test — no db/init.sh needed (registry is JSON).
+    """Fresh home dir per test — no DB needed (registry is JSON).
 
-    Pins the file-path env knobs for BOTH the bash subprocess and the
-    in-process Python port via monkeypatch.setenv, so they always target
-    the same per-test temp dir regardless of the host shell's HOME.
+    Pins the file-path env knobs for the in-process Python port via
+    monkeypatch.setenv, so it always targets the per-test temp dir
+    regardless of the host shell's HOME.
     """
     h = tmp_path_factory.mktemp("home")
     monkeypatch.setenv("HOME", str(h))
@@ -133,105 +83,13 @@ def _seed_registry(home: Path, *, leases: list[dict] | None = None,
     (home / "registry.json").write_text(json.dumps(out, sort_keys=True) + "\n")
 
 
-def _bash_check(home: Path, agent: str, path: str, mode: str, **env_overrides
-                ) -> tuple[str, str, int]:
-    """Invoke LIVE bash ``coord_gate_check``; return (stdout, stderr, rc)."""
-    src = (
-        f'source "{REGISTRY_SH}"\n'
-        f'source "{SH}"\n'
-        f'coord_gate_check "$1" "$2" "$3"\n'
-    )
-    r = subprocess.run(
-        ["bash", "-c", src, "_", agent, path, mode],
-        env=_env_for(home, **env_overrides),
-        capture_output=True, text=True,
-    )
-    return r.stdout, r.stderr, r.returncode
-
-
-def _bash_metrics(home: Path, **env_overrides) -> str:
-    src = (
-        f'source "{REGISTRY_SH}"\n'
-        f'source "{SH}"\n'
-        f'coord_gate_metrics\n'
-    )
-    r = subprocess.run(
-        ["bash", "-c", src, "_"],
-        env=_env_for(home, **env_overrides),
-        capture_output=True, text=True,
-    )
-    assert r.returncode == 0, f"bash coord_gate_metrics rc={r.returncode} stderr={r.stderr}"
-    return r.stdout
-
-
-def _bash_metrics_field(home: Path, name: str, default: str = "0",
-                        **env_overrides) -> int:
-    src = (
-        f'source "{REGISTRY_SH}"\n'
-        f'source "{SH}"\n'
-        f'coord_gate_metrics_field "$1" "$2"\n'
-    )
-    r = subprocess.run(
-        ["bash", "-c", src, "_", name, default],
-        env=_env_for(home, **env_overrides),
-        capture_output=True, text=True,
-    )
-    assert r.returncode == 0, f"bash metrics_field rc={r.returncode} stderr={r.stderr}"
-    return int(r.stdout.strip())
-
-
-def _bash_audit(home: Path, n: int = 0, **env_overrides) -> dict:
-    src = (
-        f'source "{REGISTRY_SH}"\n'
-        f'source "{SH}"\n'
-        f'coord_gate_audit "$1"\n'
-    )
-    r = subprocess.run(
-        ["bash", "-c", src, "_", str(n)],
-        env=_env_for(home, **env_overrides),
-        capture_output=True, text=True,
-    )
-    assert r.returncode == 0, f"bash audit rc={r.returncode} stderr={r.stderr}"
-    return json.loads(r.stdout.strip().splitlines()[-1])
-
-
-def _bash_record_deadlock(home: Path, **env_overrides) -> None:
-    src = (
-        f'source "{REGISTRY_SH}"\n'
-        f'source "{SH}"\n'
-        f'coord_gate_record_deadlock\n'
-    )
-    r = subprocess.run(
-        ["bash", "-c", src, "_"],
-        env=_env_for(home, **env_overrides),
-        capture_output=True, text=True,
-    )
-    assert r.returncode == 0, f"bash deadlock rc={r.returncode} stderr={r.stderr}"
-
-
-def _bash_record_ttl_expiration(home: Path, delta: int = 1,
-                                **env_overrides) -> None:
-    src = (
-        f'source "{REGISTRY_SH}"\n'
-        f'source "{SH}"\n'
-        f'coord_gate_record_ttl_expiration "$1"\n'
-    )
-    r = subprocess.run(
-        ["bash", "-c", src, "_", str(delta)],
-        env=_env_for(home, **env_overrides),
-        capture_output=True, text=True,
-    )
-    assert r.returncode == 0, f"bash ttl rc={r.returncode} stderr={r.stderr}"
-
-
 def _py_check(home: Path, agent: str, path: str, mode: str,
               *, gate_mode: str | None = None,
               gate_scope: str | None = None) -> tuple[str, str, int]:
     """Run Python port; return (stdout, stderr, rc).
 
-    `gate_mode` / `gate_scope` are passed as explicit kwargs to the port so
-    both sides honour identical gate configuration. File-path env is pinned
-    by the `home` fixture.
+    `gate_mode` / `gate_scope` are passed as explicit kwargs to the port.
+    File-path env is pinned by the `home` fixture.
     """
     return cg.coord_gate_check(agent, path, mode,
                                mode_override=gate_mode,
@@ -251,72 +109,51 @@ def _py_audit(home: Path, n: int = 0) -> dict:
     return json.loads(out.strip().splitlines()[-1])
 
 
-def _assert_parity(bash_out: str, py_out: str,
-                   bash_err: str, py_err: str,
-                   bash_rc: int, py_rc: int) -> None:
-    """Deep-compare: stdout/stderr byte-equal, rc exact-equal."""
-    assert bash_rc == py_rc, f"rc mismatch: bash={bash_rc} py={py_rc}"
-    assert bash_out == py_out, f"stdout mismatch:\nbash={bash_out!r}\npy  ={py_out!r}"
-    assert bash_err == py_err, f"stderr mismatch:\nbash={bash_err!r}\npy  ={py_err!r}"
-
-
 # ───────────────────────────────────────────────────────────────────────────
 # (a) check advisory + no conflict → rc=0, empty streams.
 # ───────────────────────────────────────────────────────────────────────────
-def test_advisory_no_conflict_parity(home):
-    _which_bash()
+def test_advisory_no_conflict(home):
     _seed_registry(home)  # empty registry
-    bso, bse, brc = _bash_check(home, "agent-a", "/some/path", "write")
     pso, pse, prc = _py_check(home, "agent-a", "/some/path", "write")
-    _assert_parity(bso, pso, bse, pse, brc, prc)
-    assert brc == 0
-    assert bso == "" and bse == ""
+    assert prc == 0
+    assert pso == "" and pse == ""
 
 
 # ───────────────────────────────────────────────────────────────────────────
 # (b) check advisory + active write holder → rc=0, stderr WAIT nudge.
 # ───────────────────────────────────────────────────────────────────────────
-def test_advisory_with_conflict_parity(home):
-    _which_bash()
+def test_advisory_with_conflict(home):
     _seed_registry(home, leases=[{
         "lease_id": "lid1", "agent": "holder-1",
         "path": "/some/path", "mode": "write",
     }])
-    bso, bse, brc = _bash_check(home, "agent-a", "/some/path", "write",
-                                gate_mode="advisory")
     pso, pse, prc = _py_check(home, "agent-a", "/some/path", "write",
                               gate_mode="advisory")
-    _assert_parity(bso, pso, bse, pse, brc, prc)
-    assert brc == 0
-    assert "WAIT before editing" in bse
-    assert "holder-1" in bse
-    assert "/some/path" in bse
+    assert prc == 0
+    assert "WAIT before editing" in pse
+    assert "holder-1" in pse
+    assert "/some/path" in pse
 
 
 # ───────────────────────────────────────────────────────────────────────────
 # (c) check strict + in-scope conflict → rc=11, stderr "strict deny".
 # ───────────────────────────────────────────────────────────────────────────
-def test_strict_in_scope_deny_parity(home):
-    _which_bash()
+def test_strict_in_scope_deny(home):
     _seed_registry(home, leases=[{
         "lease_id": "lid1", "agent": "holder-2",
         "path": "/scoped/x", "mode": "write",
     }])
-    bso, bse, brc = _bash_check(home, "agent-a", "/scoped/x/y", "write",
-                                gate_mode="strict", gate_scope="/scoped")
     pso, pse, prc = _py_check(home, "agent-a", "/scoped/x/y", "write",
                               gate_mode="strict", gate_scope="/scoped")
-    _assert_parity(bso, pso, bse, pse, brc, prc)
-    assert brc == 11
-    assert "strict deny" in bse
-    assert "/scoped/x/y" in bse
+    assert prc == 11
+    assert "strict deny" in pse
+    assert "/scoped/x/y" in pse
 
 
 # ───────────────────────────────────────────────────────────────────────────
 # (d) check strict + out-of-scope conflict → rc=0, advisory fallback nudge.
 # ───────────────────────────────────────────────────────────────────────────
-def test_strict_out_of_scope_advisory_fallback_parity(home):
-    _which_bash()
+def test_strict_out_of_scope_advisory_fallback(home):
     # Holder lives under /other — OUTSIDE the strict scope /scoped. The
     # request also targets /other, so the lease DOES overlap (probe fires)
     # but the path is out of scope → advisory fallback (nudge, allow).
@@ -324,40 +161,29 @@ def test_strict_out_of_scope_advisory_fallback_parity(home):
         "lease_id": "lid1", "agent": "holder-3",
         "path": "/other", "mode": "write",
     }])
-    bso, bse, brc = _bash_check(home, "agent-a", "/other/file", "write",
-                                gate_mode="strict", gate_scope="/scoped")
     pso, pse, prc = _py_check(home, "agent-a", "/other/file", "write",
                               gate_mode="strict", gate_scope="/scoped")
-    _assert_parity(bso, pso, bse, pse, brc, prc)
-    assert brc == 0
-    assert "WAIT before editing" in bse
-    assert "out of strict scope" in bse
-    assert "holder-3" in bse
+    assert prc == 0
+    assert "WAIT before editing" in pse
+    assert "out of strict scope" in pse
+    assert "holder-3" in pse
 
 
 # ───────────────────────────────────────────────────────────────────────────
 # (e) check bad mode → rc=2, stderr usage message.
 # ───────────────────────────────────────────────────────────────────────────
-def test_bad_mode_usage_error_parity(home):
-    _which_bash()
+def test_bad_mode_usage_error(home):
     _seed_registry(home)
-    bso, bse, brc = _bash_check(home, "agent-a", "/x", "bogus")
     pso, pse, prc = _py_check(home, "agent-a", "/x", "bogus")
-    _assert_parity(bso, pso, bse, pse, brc, prc)
-    assert brc == 2
-    assert "mode must be" in bse
+    assert prc == 2
+    assert "mode must be" in pse
 
 
 # ───────────────────────────────────────────────────────────────────────────
 # (f) metrics() on empty state → 4-key default JSON.
 # ───────────────────────────────────────────────────────────────────────────
-def test_metrics_empty_state_parity(home):
-    _which_bash()
-    bash_out = _bash_metrics(home).strip()
+def test_metrics_empty_state(home):
     py_out = _py_metrics(home).strip()
-    assert bash_out == py_out, (
-        f"metrics mismatch:\nbash={bash_out!r}\npy  ={py_out!r}"
-    )
     obj = json.loads(py_out)
     assert set(obj.keys()) == {
         "coord_leases_held", "coord_queue_depth",
@@ -369,120 +195,76 @@ def test_metrics_empty_state_parity(home):
 
 
 # ───────────────────────────────────────────────────────────────────────────
-# (g) metrics_field after a bump_sequence → integer equality.
-#     Bash runs the bump sequence first, Python runs it second; we capture
-#     the post-bump counter values via metrics_field on each side.
-#     The metric we check is one that observe() does NOT overwrite.
+# (g) metrics_field after a bump sequence → integer counters.
+#     The metrics we check are ones that observe() does NOT overwrite.
 # ───────────────────────────────────────────────────────────────────────────
-def test_metrics_field_after_bumps_parity(home):
-    _which_bash()
-    # Bump via bash.
-    _bash_record_deadlock(home)
-    _bash_record_ttl_expiration(home, delta=3)
-    bash_deadlocks = _bash_metrics_field(home, "coord_deadlocks_broken")
-    bash_ttl = _bash_metrics_field(home, "coord_ttl_expirations")
-    # Reset file state so the Python side starts clean and bumps the same.
-    for name in ("metrics.json", "audit.json", "registry.json"):
-        p = home / name
-        if p.exists():
-            p.unlink()
-    # Bump via Python.
+def test_metrics_field_after_bumps(home):
     cg.coord_gate_record_deadlock()
     cg.coord_gate_record_ttl_expiration(3)
     py_deadlocks = _py_metrics_field(home, "coord_deadlocks_broken")
     py_ttl = _py_metrics_field(home, "coord_ttl_expirations")
-    assert bash_deadlocks == py_deadlocks == 1, (
-        f"deadlocks drifted: bash={bash_deadlocks} py={py_deadlocks}"
-    )
-    assert bash_ttl == py_ttl == 3, (
-        f"ttl drifted: bash={bash_ttl} py={py_ttl}"
-    )
+    assert py_deadlocks == 1
+    assert py_ttl == 3
 
 
 # ───────────────────────────────────────────────────────────────────────────
 # (h) audit() bounded ring buffer — most-recent-first, count + max preserved.
-#     Bash seeds 5 audit records via 5 separate coord_gate_check calls that
-#     each trigger a conflict. Python does the same. Both honour
-#     COORD_GATE_AUDIT_MAX=3 → ring buffer caps at 3 records.
+#     5 audit records via 5 coord_gate_check calls that each trigger a
+#     conflict; COORD_GATE_AUDIT_MAX=3 → ring buffer caps at 3 records.
 # ───────────────────────────────────────────────────────────────────────────
-def test_audit_bounded_ring_buffer_parity(home, monkeypatch):
-    _which_bash()
+def test_audit_bounded_ring_buffer(home, monkeypatch):
     monkeypatch.setenv("COORD_GATE_AUDIT_MAX", "3")
     _seed_registry(home, leases=[{
         "lease_id": "lid1", "agent": "holder-a",
         "path": "/x", "mode": "write",
     }])
-    bash_env = {"gate_mode": "advisory", "gate_audit_max": 3}
-    # Generate 5 conflicts on each side. Both sides read the audit-max from
-    # the env (which monkeypatch.setenv pinned for the py side; the bash
-    # subprocess inherits via _env_for + os.environ).
-    for i in range(5):
-        _bash_check(home, f"agent-{i}", "/x", "write", **bash_env)
     for i in range(5):
         _py_check(home, f"agent-{i}", "/x", "write", gate_mode="advisory")
 
-    bash_aud = _bash_audit(home, n=0, **bash_env)
     py_aud = _py_audit(home, n=0)
     # cap honoured
-    assert bash_aud["count"] == 3 == py_aud["count"], (
-        f"audit count drifted: bash={bash_aud['count']} py={py_aud['count']}"
-    )
-    assert bash_aud["max"] == 3 == py_aud["max"], (
-        f"audit max drifted: bash={bash_aud['max']} py={py_aud['max']}"
-    )
-    # Most-recent-first ordering — most-recent record is from the LAST call.
-    bash_first = bash_aud["events"][0]
-    py_first = py_aud["events"][0]
-    assert bash_first == py_first, (
-        f"most-recent audit record drifted:\nbash={bash_first}\npy  ={py_first}"
-    )
-    # Both sides appended the same holder (the seeded lease is the only
-    # conflicting agent) — the audit event schema is what parity must hold.
-    holders = [e["holder"] for e in bash_aud["events"]]
+    assert py_aud["count"] == 3
+    assert py_aud["max"] == 3
+    # Every event is a conflict against the seeded holder on /x.
+    for e in py_aud["events"]:
+        assert e["event"] == "conflict"
+        assert e["path"] == "/x"
+        assert e["requested_mode"] == "write"
+    # The seeded lease is the only conflicting agent.
+    holders = [e["holder"] for e in py_aud["events"]]
     assert holders == ["holder-a", "holder-a", "holder-a"], (
         f"unexpected holders: {holders}"
     )
     # ts strictly non-increasing across the recent records.
-    ts_list = [e["ts"] for e in bash_aud["events"]]
+    ts_list = [e["ts"] for e in py_aud["events"]]
     assert ts_list == sorted(ts_list, reverse=True), (
         f"ts not non-increasing: {ts_list}"
     )
-    # Float-tolerance no-op for int counters but exercise the helper.
-    assert all(isinstance(v, int) for v in (
-        bash_aud["count"], bash_aud["max"]))
-    assert abs(float(bash_aud["count"]) - float(py_aud["count"])) <= _FLOAT_TOL
+    assert all(isinstance(v, int) for v in (py_aud["count"], py_aud["max"]))
 
 
 # ───────────────────────────────────────────────────────────────────────────
 # (i) check strict + NO conflict → rc=0, empty streams.
-#     Ported from test_coord_gate.sh test 3: strict mode must stay silent and
-#     allow (rc=0) when the registry holds no overlapping lease — the parity
-#     gate above only exercised strict mode WITH a conflict (c/d), so the
-#     "strict allows a clean path" branch went uncovered until this port.
+#     Ported from test_coord_gate.sh test 3: strict mode must stay silent
+#     and allow (rc=0) when the registry holds no overlapping lease.
 # ───────────────────────────────────────────────────────────────────────────
-def test_strict_no_conflict_silent_parity(home):
-    _which_bash()
+def test_strict_no_conflict_silent(home):
     _seed_registry(home)  # empty registry → nothing to conflict with
-    bso, bse, brc = _bash_check(home, "agent-a", "/scoped/x/y", "write",
-                                gate_mode="strict", gate_scope="/scoped")
     pso, pse, prc = _py_check(home, "agent-a", "/scoped/x/y", "write",
                               gate_mode="strict", gate_scope="/scoped")
-    _assert_parity(bso, pso, bse, pse, brc, prc)
-    assert brc == 0
-    assert bso == "" and bse == ""
+    assert prc == 0
+    assert pso == "" and pse == ""
 
 
 # ───────────────────────────────────────────────────────────────────────────
 # (j) metrics coord_leases_held reflects the LIVE registry snapshot.
-#     Ported from test_coord_gate.sh test 4: a coord_gate_check runs observe(),
-#     which snapshots the registry into the metrics file; coord_leases_held
-#     must equal the number of active leases (1, then 2). The parity gate's
-#     other metrics cases only covered empty→0 (f) and record-based bumps (g),
-#     never the observe()-driven live count. A check on a NON-overlapping path
-#     is used so observe() fires without the check itself mutating the registry.
+#     Ported from test_coord_gate.sh test 4: a coord_gate_check runs
+#     observe(), which snapshots the registry into the metrics file;
+#     coord_leases_held must equal the number of active leases (1, then 2).
+#     A check on a NON-overlapping path is used so observe() fires without
+#     the check itself mutating the registry.
 # ───────────────────────────────────────────────────────────────────────────
-def test_leases_held_live_snapshot_parity(home):
-    _which_bash()
+def test_leases_held_live_snapshot(home):
 
     def _reset_state() -> None:
         for name in ("metrics.json", "audit.json", "registry.json"):
@@ -494,18 +276,12 @@ def test_leases_held_live_snapshot_parity(home):
         return [{"lease_id": f"lid{i}", "agent": f"holder-{i}",
                  "path": f"/held/p{i}", "mode": "write"} for i in range(n)]
 
-    def _bash_held(n: int) -> int:
-        _reset_state()
-        _seed_registry(home, leases=_leases(n))
-        # unrelated path → observe() fires, no conflict, no registry mutation
-        _bash_check(home, "req", "/unrelated/path", "write", gate_mode="advisory")
-        return json.loads(_bash_metrics(home).strip())["coord_leases_held"]
-
     def _py_held(n: int) -> int:
         _reset_state()
         _seed_registry(home, leases=_leases(n))
+        # unrelated path → observe() fires, no conflict, no registry mutation
         _py_check(home, "req", "/unrelated/path", "write", gate_mode="advisory")
         return json.loads(_py_metrics(home).strip())["coord_leases_held"]
 
-    assert _bash_held(1) == _py_held(1) == 1
-    assert _bash_held(2) == _py_held(2) == 2
+    assert _py_held(1) == 1
+    assert _py_held(2) == 2

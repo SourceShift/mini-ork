@@ -1,34 +1,31 @@
-"""Parity gate: ``mini_ork.gates.promotion_gate`` vs ``lib/promotion_gate.sh``.
+"""Standalone unit tests for ``mini_ork.gates.promotion_gate``.
 
-Each test drives the LIVE bash function via
-``bash -c 'source lib/promotion_gate.sh; ...'`` against the SAME
-SQLite database the Python port reads, then deep-compares the two
-outputs: JSON payload key-set + float equality at 1e-6, plus
-return-code parity (rc=0/1/2).
+Replaces the bash-parity gate (against ``lib/promotion_gate.sh``) as part
+of the bash→Python migration: the Python port is now the sole
+implementation, so its coverage no longer drives the LIVE bash function
+via ``bash -c 'source lib/promotion_gate.sh; ...'`` — it asserts the
+port's behaviour directly. The expected values below are the semantic
+contract the bash side used to pin (decisions, persisted-row schema,
+approve round-trip, synthesis-gate reasons, rc semantics), now asserted
+on the port's output.
 
-The test fixture initialises a fresh DB via ``db/init.sh`` (mirrors the
-production init path so migration 0011's promotion_records schema is
-present), then seeds ``workflow_memory`` + ``workflow_candidates`` rows
-the same way ``tests/unit/test_promotion_gate.sh`` (retired) did.
+This file subsumes the retired tests/unit/test_promotion_gate.sh fixture:
+every one of its 7 assertions is covered here. Case (8) was ported from
+the .sh error-path assertion (``promotion_evaluate`` with no args exits
+non-zero).
 
-This file subsumes that retired .sh fixture: every one of its 7 assertions
-drives the live bash lib here. Case (8) was ported from the .sh error-path
-assertion (``promotion_evaluate`` with no args exits non-zero) — the only one
-the value-path helper ``_bash_evaluate`` never drove, since it always passes a
-candidate_id.
-
-Eight cases (above the kickoff's >=6 floor):
+Eight cases:
 
   (1) ``promotion_evaluate`` with no benchmark rows → decision in
-      {quarantined, rejected} AND JSON-key parity AND float equality at 1e-6.
+      {quarantined, rejected, promoted} AND the decision-field key set.
   (2) ``MINI_ORK_REQUIRE_HUMAN_APPROVAL=true`` → decision=='pending_human_approval'.
   (3) ``promotion_evaluate`` persisted row → migration-0011 schema column
-      diff (promotion_id, candidate_id, from_version_id, to_version_id,
-      utility_*, decision, decided_by) AND 1e-6 float tolerance.
+      assertions (promotion_id, candidate_id, from_version_id,
+      to_version_id, utility_*, decision, decided_by).
   (4) ``promotion_approve`` round-trip: pre-create pending row via
       evaluate, then approve; verify decision=='promoted', approver
       matches, post-SELECT decided_by=='human'. Negative case: approve
-      on missing pending row → rc=1 on both sides.
+      on missing pending row → SystemExit.
   (5) ``mo_promote_synthesis_gate`` deterministic-class bypass:
       task_class='code_fix' with any panel_score → rc=0, reason='deterministic_class'.
   (6) ``mo_promote_synthesis_gate`` all-conditions-met path:
@@ -37,53 +34,29 @@ Eight cases (above the kickoff's >=6 floor):
       test): (a) low_panel_score → rc=1 reason='low_panel_score';
       (b) high panel but no structural signal → rc=1 reason='no_structural_signal';
       (c) bad JSON file → rc=2.
-  (8) ``promotion_evaluate`` with no args → live bash exits non-zero
-      (${1:?candidate_id required} guard) AND the port raises TypeError.
+  (8) ``promotion_evaluate`` with no args → the port raises TypeError
+      (the Python analog of bash's ${1:?candidate_id required} guard).
 
-Floats: utility_before / utility_after / utility_delta equality at 1e-6
-after JSON-key normalisation. The bash function uses Python's f'{x:.4f}'
-formatting in the rationale string; the rationale is NOT in the float-
-equality scope (only the JSON-output fields are).
+Floats: utility_before / utility_after / utility_delta are compared at
+1e-6 tolerance where cross-checked.
 """
 from __future__ import annotations
 
 import json
 import os
-import shutil
 import sqlite3
-import subprocess
 import sys
 from pathlib import Path
 
 import pytest
 
 REPO = Path(__file__).resolve().parents[2]
-LIB = REPO / "lib" / "promotion_gate.sh"
-DB_INIT = REPO / "db" / "init.sh"
 
 sys.path.insert(0, str(REPO))
-from mini_ork.gates import promotion_gate as pg
+from mini_ork.gates import promotion_gate as pg  # noqa: E402
+from mini_ork.stores import migrate as mig  # noqa: E402
 
 _FLOAT_TOL = 1e-6
-
-
-# ── helpers ────────────────────────────────────────────────────────────────
-
-
-def _shlex_quote(s: str) -> str:
-    import shlex
-    return shlex.quote(s)
-
-
-def _which_tools() -> None:
-    if not shutil.which("bash"):
-        pytest.skip("bash not on PATH")
-    if not shutil.which("python3"):
-        pytest.skip("python3 not on PATH")
-    if not LIB.exists():
-        pytest.skip(f"missing lib/promotion_gate.sh at {LIB}")
-    if not DB_INIT.exists():
-        pytest.skip(f"missing db/init.sh at {DB_INIT}")
 
 
 # ── fixtures ───────────────────────────────────────────────────────────────
@@ -91,24 +64,13 @@ def _which_tools() -> None:
 
 @pytest.fixture()
 def db(tmp_path):
-    """Initialise a fresh SQLite file via db/init.sh.
-
-    Mirrors the live-subprocess init pattern from
-    tests/unit/test_gate_registry_py.py. Sets MINI_ORK_HOME + MINI_ORK_DB
-    so the bash side (sourced inside subprocess.run) inherits them and
-    the in-process Python port reads the same DB path.
-    """
-    _which_tools()
+    """Initialise a fresh SQLite file via init_db (the Python port of
+    db/init.sh). Sets MINI_ORK_HOME + MINI_ORK_DB so the in-process port
+    reads the same DB path."""
     home = tmp_path
     db_path = home / "state.db"
-    env = os.environ.copy()
-    env["MINI_ORK_HOME"] = str(home)
-    env["MINI_ORK_DB"] = str(db_path)
-    env["MINI_ORK_ROOT"] = str(REPO)
-    subprocess.run(
-        ["bash", str(DB_INIT)],
-        env=env, capture_output=True, text=True, timeout=60, check=True,
-    )
+    rc, out, err = mig.init_db(db=str(db_path), root=str(REPO))
+    assert rc == 0, f"init_db failed:\n{out}\n{err}"
     os.environ["MINI_ORK_HOME"] = str(home)
     os.environ["MINI_ORK_DB"] = str(db_path)
     os.environ["MINI_ORK_ROOT"] = str(REPO)
@@ -117,8 +79,8 @@ def db(tmp_path):
 
 def _seed_workflow(db_path: Path) -> None:
     """Seed workflow_memory + workflow_candidates rows for every
-    candidate this test exercises. Mirrors tests/unit/test_promotion_gate.sh
-    lines 60-77 (so parity cases exercise the same fixtures)."""
+    candidate this test exercises. Mirrors the retired
+    tests/unit/test_promotion_gate.sh lines 60-77 fixtures."""
     con = sqlite3.connect(str(db_path))
     try:
         con.execute("""
@@ -172,65 +134,6 @@ def _seed_bench_all_pass(db_path: Path, candidate_id: str) -> None:
         con.close()
 
 
-# ── bash-side helpers (live subprocess) ─────────────────────────────────────
-
-
-def _bash_evaluate(db_path: Path, candidate_id: str,
-                   *, require_human: bool = False,
-                   bash_db_path: Path | None = None) -> tuple[str, str, int]:
-    """Run LIVE bash promotion_evaluate via subprocess. Returns (stdout, stderr, rc)."""
-    src = (
-        f'source "{_shlex_quote(str(LIB))}" 2>/dev/null\n'
-        f'promotion_evaluate "$1"\n'
-    )
-    env = os.environ.copy()
-    env["MINI_ORK_DB"] = str(bash_db_path or db_path)
-    env["MINI_ORK_ROOT"] = str(REPO)
-    if require_human:
-        env["MINI_ORK_REQUIRE_HUMAN_APPROVAL"] = "true"
-    else:
-        env.pop("MINI_ORK_REQUIRE_HUMAN_APPROVAL", None)
-    r = subprocess.run(
-        ["bash", "-c", src, "_", candidate_id],
-        env=env, capture_output=True, text=True, timeout=30,
-    )
-    return r.stdout, r.stderr, r.returncode
-
-
-def _bash_approve(db_path: Path, candidate_id: str,
-                  approver: str, rationale: str,
-                  bash_db_path: Path | None = None) -> tuple[str, str, int]:
-    """Run LIVE bash promotion_approve via subprocess. Returns (stdout, stderr, rc)."""
-    src = (
-        f'source "{_shlex_quote(str(LIB))}" 2>/dev/null\n'
-        f'promotion_approve "$1" "$2" "$3"\n'
-    )
-    env = os.environ.copy()
-    env["MINI_ORK_DB"] = str(bash_db_path or db_path)
-    env["MINI_ORK_ROOT"] = str(REPO)
-    r = subprocess.run(
-        ["bash", "-c", src, "_", candidate_id, approver, rationale],
-        env=env, capture_output=True, text=True, timeout=30,
-    )
-    return r.stdout, r.stderr, r.returncode
-
-
-def _bash_synthesis(verdict_file: str, task_class: str,
-                    *, bash_root: Path | None = None) -> tuple[str, str, int]:
-    """Run LIVE bash mo_promote_synthesis_gate via subprocess. Returns (stdout, stderr, rc)."""
-    src = (
-        f'source "{_shlex_quote(str(LIB))}" 2>/dev/null\n'
-        f'mo_promote_synthesis_gate "$1" "$2"\n'
-    )
-    env = os.environ.copy()
-    env["MINI_ORK_ROOT"] = str(bash_root or REPO)
-    r = subprocess.run(
-        ["bash", "-c", src, "_", verdict_file, task_class],
-        env=env, capture_output=True, text=True, timeout=30,
-    )
-    return r.stdout, r.stderr, r.returncode
-
-
 # ── python-side helpers (in-process port) ──────────────────────────────────
 
 
@@ -239,8 +142,7 @@ def _py_evaluate(db_path: Path, candidate_id: str,
     """Run in-process promotion_evaluate. Returns the JSON dict.
 
     Mirrors bash's exit-1 contract via SystemExit when the candidate has
-    no ``base_workflow_version_id`` row. We catch SystemExit so the
-    parity test can assert rc=1 parity.
+    no ``base_workflow_version_id`` row.
     """
     os.environ.pop("MINI_ORK_REQUIRE_HUMAN_APPROVAL", None)
     if require_human:
@@ -262,29 +164,8 @@ def _py_synthesis(verdict_file: str, task_class: str) -> tuple[dict, int]:
     return pg.mo_promote_synthesis_gate(verdict_file, task_class, mini_ork_root=str(REPO))
 
 
-# ── parity assertion helpers ───────────────────────────────────────────────
-
-
-def _parse_bash_json(stdout: str) -> dict | None:
-    """Bash sometimes prints the JSON across multiple lines; grab the first
-    line that parses as a JSON object."""
-    for line in stdout.strip().splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            obj = json.loads(line)
-            if isinstance(obj, dict):
-                return obj
-        except json.JSONDecodeError:
-            continue
-    return None
-
-
-def _assert_float_eq(label: str, bash_val, py_val, tol: float = _FLOAT_TOL) -> None:
-    assert abs(float(bash_val) - float(py_val)) <= tol, (
-        f"{label}: bash={bash_val} py={py_val} tol={tol}"
-    )
+def _assert_float_eq(label: str, a, b, tol: float = _FLOAT_TOL) -> None:
+    assert abs(float(a) - float(b)) <= tol, f"{label}: {a} vs {b} tol={tol}"
 
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -294,32 +175,26 @@ def _assert_float_eq(label: str, bash_val, py_val, tol: float = _FLOAT_TOL) -> N
 
 def test_promotion_evaluate_no_benchmark(db):
     _seed_workflow(db)
-    # No benchmark_results → brun is None → bash falls through to the
-    # else branch and emits decision='promoted' (with utility_delta=0.0
-    # and a no-bench rationale). The bash test accepts the
-    # {quarantined, rejected, promoted} set; we assert py==bash parity
-    # on the actual decision (which bash happens to produce).
-    bso, bse, brc = _bash_evaluate(db, "cand-no-bench")
-    assert brc == 0, f"bash rc={brc} stderr={bse}"
-    bobj = _parse_bash_json(bso)
-    assert bobj is not None, f"bash stdout not JSON: {bso!r}"
+    # No benchmark_results → brun is None → the port falls through to the
+    # no-bench branch. The retired .sh accepted the
+    # {quarantined, rejected, promoted} set.
     pobj = _py_evaluate(db, "cand-no-bench")
-    assert bobj["decision"] == pobj["decision"]
-    assert bobj["decision"] in {"quarantined", "rejected", "promoted"}
-    # JSON key-set parity on the decision fields.
+    assert pobj["decision"] in {"quarantined", "rejected", "promoted"}
+    # Decision-field key set.
     for k in (
         "decision", "rationale", "utility_before", "utility_after",
         "utility_delta", "benchmark_run_id", "all_pass", "safety_violations",
     ):
-        assert k in bobj, f"bash missing key: {k}"
-        assert k in pobj, f"py missing key: {k}"
-    # Float equality at 1e-6.
-    _assert_float_eq("utility_before", bobj["utility_before"], pobj["utility_before"])
-    _assert_float_eq("utility_after", bobj["utility_after"], pobj["utility_after"])
-    _assert_float_eq("utility_delta", bobj["utility_delta"], pobj["utility_delta"])
-    assert bobj["benchmark_run_id"] == pobj["benchmark_run_id"]
-    assert bobj["all_pass"] == pobj["all_pass"]
-    assert bobj["safety_violations"] == pobj["safety_violations"]
+        assert k in pobj, f"missing key: {k}"
+    # benchmark_run_id is unset or echoes the candidate_id (the port's
+    # documented no-bench shape).
+    assert pobj["benchmark_run_id"] in (None, "cand-no-bench")
+    _assert_float_eq("utility_delta", pobj["utility_delta"], 0.0)
+    _assert_float_eq(
+        "utility_consistency",
+        pobj["utility_after"] - pobj["utility_before"],
+        pobj["utility_delta"],
+    )
 
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -329,19 +204,13 @@ def test_promotion_evaluate_no_benchmark(db):
 
 def test_promotion_evaluate_require_human(db):
     _seed_workflow(db)
-    bso, bse, brc = _bash_evaluate(db, "cand-human", require_human=True)
-    assert brc == 0, f"bash rc={brc} stderr={bse}"
-    bobj = _parse_bash_json(bso)
-    assert bobj is not None
     pobj = _py_evaluate(db, "cand-human", require_human=True)
     assert pobj["decision"] == "pending_human_approval"
-    assert bobj["decision"] == pobj["decision"]
-    assert "Human gate required" in bobj["rationale"]
     assert "Human gate required" in pobj["rationale"]
 
 
 # ───────────────────────────────────────────────────────────────────────────
-# (3) Persisted-row schema diff — proves the port writes the migration-0011
+# (3) Persisted-row schema — proves the port writes the migration-0011
 #     schema (NOT the legacy CREATE-IF-NOT-EXISTS draft).
 # ───────────────────────────────────────────────────────────────────────────
 
@@ -349,53 +218,41 @@ def test_promotion_evaluate_require_human(db):
 def test_promotion_evaluate_persisted_row(db):
     _seed_workflow(db)
     _seed_bench_all_pass(db, "cand-persist")
-    # Use a separate DB for bash so each side inserts exactly one row
-    # (we then diff the row contents across the two DBs).
-    bash_db = db.parent / "bash.db"
-    shutil.copy(str(db), str(bash_db))
-    # Bash side writes its own row.
-    bso, bse, brc = _bash_evaluate(db, "cand-persist", bash_db_path=bash_db)
-    assert brc == 0, f"bash rc={brc} stderr={bse}"
-    bobj = _parse_bash_json(bso)
-    assert bobj is not None
-    # Python side writes its own row (to the original DB).
     pobj = _py_evaluate(db, "cand-persist")
-    # Both should yield "promoted" (all_pass=1, utility_delta > 0).
+    # All benchmarks pass with utility 0.92 → promoted.
     assert pobj["decision"] == "promoted"
-    assert bobj["decision"] == pobj["decision"]
-    # Each DB has exactly 1 promotion_records row for cand-persist.
-    for label, p in (("py", db), ("bash", bash_db)):
-        con = sqlite3.connect(str(p))
-        try:
-            rows = con.execute("""
-                SELECT promotion_id, candidate_id, from_version_id, to_version_id,
-                       utility_before, utility_after, benchmark_run_id,
-                       rationale, decision, decided_by
-                FROM promotion_records
-                WHERE candidate_id=?
-            """, ("cand-persist",)).fetchall()
-        finally:
-            con.close()
-        assert len(rows) == 1, f"{label}: expected 1 row, got {len(rows)}"
-        (prom_id, cid, fv, tv, ub, ua, bri_val, rat, dec, db_) = rows[0]
-        assert cid == "cand-persist"
-        assert fv == "test-wf-v1"
-        assert tv == "test-wf-v1"
-        assert dec == "promoted"
-        assert db_ == "gate"
-        assert prom_id.startswith("pr-")
-        # 1e-6 float tolerance on utility_* columns.
-        _assert_float_eq(f"{label}.utility_before", ub, pobj["utility_before"])
-        _assert_float_eq(f"{label}.utility_after", ua, pobj["utility_after"])
-        # benchmark_run_id is the candidate_id (matches bash output key).
-        assert bri_val is None or bri_val == "cand-persist"
-        # Both sides' rationale strings should match exactly (same f-string
-        # formatting against the same values).
-        assert rat == pobj["rationale"]
+
+    # Exactly 1 promotion_records row for cand-persist.
+    con = sqlite3.connect(str(db))
+    try:
+        rows = con.execute("""
+            SELECT promotion_id, candidate_id, from_version_id, to_version_id,
+                   utility_before, utility_after, benchmark_run_id,
+                   rationale, decision, decided_by
+            FROM promotion_records
+            WHERE candidate_id=?
+        """, ("cand-persist",)).fetchall()
+    finally:
+        con.close()
+    assert len(rows) == 1, f"expected 1 row, got {len(rows)}"
+    (prom_id, cid, fv, tv, ub, ua, bri_val, rat, dec, db_) = rows[0]
+    assert cid == "cand-persist"
+    assert fv == "test-wf-v1"
+    assert tv == "test-wf-v1"
+    assert dec == "promoted"
+    assert db_ == "gate"
+    assert prom_id.startswith("pr-")
+    # 1e-6 float tolerance on utility_* columns vs the returned payload.
+    _assert_float_eq("utility_before", ub, pobj["utility_before"])
+    _assert_float_eq("utility_after", ua, pobj["utility_after"])
+    # benchmark_run_id is the candidate_id (matches the output key).
+    assert bri_val is None or bri_val == "cand-persist"
+    # The persisted rationale matches the returned payload.
+    assert rat == pobj["rationale"]
 
 
 # ───────────────────────────────────────────────────────────────────────────
-# (4) promotion_approve round-trip + negative-path parity.
+# (4) promotion_approve round-trip + negative path.
 # ───────────────────────────────────────────────────────────────────────────
 
 
@@ -403,67 +260,33 @@ def test_promotion_approve_round_trip(db):
     _seed_workflow(db)
     # Pre-create pending_human_approval row via evaluate.
     _seed_bench_all_pass(db, "cand-approve-flow")
-    _bash_evaluate(db, "cand-approve-flow", require_human=True)
     _py_evaluate(db, "cand-approve-flow", require_human=True)
 
-    # Round-trip: approve via bash.
-    bso, bse, brc = _bash_approve(db, "cand-approve-flow",
-                                  "test-approver", "Approved in parity test")
-    assert brc == 0, f"bash rc={brc} stderr={bse}"
-    bobj = _parse_bash_json(bso)
-    assert bobj is not None
-    assert bobj["decision"] == "promoted"
-    assert bobj["approver"] == "test-approver"
-    assert bobj["candidate_id"] == "cand-approve-flow"
-
-    # Approve via python port — different (independent) candidate
-    # pre-seeded by _seed_workflow. Use a separate flow for the py side.
-    _seed_bench_all_pass(db, "cand-approve-flow-py" if False else "cand-persisted-decision")
-    con = sqlite3.connect(str(db))
-    try:
-        con.execute("""
-            INSERT OR IGNORE INTO workflow_candidates
-                (candidate_id, base_workflow_version_id, created_by)
-            VALUES ('cand-persisted-decision-py', 'test-wf-v1', 'human')
-        """)
-        con.commit()
-    finally:
-        con.close()
-    _seed_bench_all_pass(db, "cand-persisted-decision-py")
-    _py_evaluate(db, "cand-persisted-decision-py", require_human=True)
-    pobj = _py_approve(db, "cand-persisted-decision-py",
+    pobj = _py_approve(db, "cand-approve-flow",
                        "test-approver", "Approved in parity test")
     assert pobj["decision"] == "promoted"
     assert pobj["approver"] == "test-approver"
-    assert pobj["candidate_id"] == "cand-persisted-decision-py"
+    assert pobj["candidate_id"] == "cand-approve-flow"
     assert pobj["approved_at"] is not None
-    # Post-approval DB check: both sides flipped decided_by='human'.
+
+    # Post-approval DB check: decided_by flipped to 'human'.
     con = sqlite3.connect(str(db))
     try:
-        bash_decided_by = con.execute(
+        decided_by = con.execute(
             "SELECT decided_by FROM promotion_records "
             "WHERE candidate_id=? AND decision='promoted' "
             "ORDER BY decided_at DESC LIMIT 1",
             ("cand-approve-flow",),
         ).fetchone()[0]
-        py_decided_by = con.execute(
-            "SELECT decided_by FROM promotion_records "
-            "WHERE candidate_id=? AND decision='promoted' "
-            "ORDER BY decided_at DESC LIMIT 1",
-            ("cand-persisted-decision-py",),
-        ).fetchone()[0]
     finally:
         con.close()
-    assert bash_decided_by == "human" == py_decided_by
+    assert decided_by == "human"
 
 
 def test_promotion_approve_no_pending(db):
     _seed_workflow(db)
-    # Candidate has no pending row → bash exits rc=1.
-    _bash_out, _bash_err, brc = _bash_approve(db, "cand-no-bench",
-                                              "approver", "rationale")
-    assert brc != 0, f"bash should exit non-zero on missing pending row, got rc={brc}"
-    # Python side: SystemExit on no pending row.
+    # Candidate has no pending row → the port raises SystemExit (the
+    # Python analog of bash's rc=1).
     with pytest.raises(SystemExit):
         _py_approve(db, "cand-no-bench", "approver", "rationale")
 
@@ -477,13 +300,6 @@ def test_mo_promote_synthesis_gate_bypass(tmp_path, db):
     _seed_workflow(db)
     verdict = tmp_path / "det.json"
     verdict.write_text('{"panel_score":0,"voters":[],"structural":{}}')
-    bso, bse, brc = _bash_synthesis(str(verdict), "code_fix")
-    assert brc == 0, f"bash rc={brc} stderr={bse}"
-    bobj = _parse_bash_json(bso)
-    assert bobj is not None
-    assert bobj["decision"] == "approved"
-    assert bobj["reason"] == "deterministic_class"
-
     pobj, prc = _py_synthesis(str(verdict), "code_fix")
     assert prc == 0
     assert pobj["decision"] == "approved"
@@ -514,14 +330,6 @@ def test_mo_promote_synthesis_gate_all_conditions_met(tmp_path, db):
             "finding_cardinality": 11,
         },
     }))
-    bso, bse, brc = _bash_synthesis(str(verdict), "research_synthesis")
-    assert brc == 0, f"bash rc={brc} stderr={bse}"
-    bobj = _parse_bash_json(bso)
-    assert bobj is not None
-    assert bobj["decision"] == "approved"
-    assert bobj["reason"] == "all_conditions_met"
-    assert len(bobj["signals"]["structural_signals_met"]) >= 1
-
     pobj, prc = _py_synthesis(str(verdict), "research_synthesis")
     assert prc == 0
     assert pobj["decision"] == "approved"
@@ -548,14 +356,9 @@ def test_mo_promote_synthesis_gate_rejections(tmp_path, db):
             "finding_cardinality": 20,
         },
     }))
-    bso, _bash_err_low, brc = _bash_synthesis(str(low), "refactor_audit")
-    bobj = _parse_bash_json(bso)
-    assert bobj is not None, f"bash stdout not JSON: {bso!r}"
-    assert brc == 1
-    assert bobj["decision"] == "rejected"
-    assert bobj["reason"] == "low_panel_score"
     pobj, prc = _py_synthesis(str(low), "refactor_audit")
     assert prc == 1
+    assert pobj["decision"] == "rejected"
     assert pobj["reason"] == "low_panel_score"
 
     # (b) high panel_score but zero structural signals → rc=1,
@@ -570,63 +373,30 @@ def test_mo_promote_synthesis_gate_rejections(tmp_path, db):
             "finding_cardinality": 2,
         },
     }))
-    bso, _bash_err_no_sig, brc = _bash_synthesis(str(no_sig), "blog_post")
-    bobj = _parse_bash_json(bso)
-    assert bobj is not None, f"bash stdout not JSON: {bso!r}"
-    assert brc == 1
-    assert bobj["decision"] == "rejected"
-    assert bobj["reason"] == "no_structural_signal"
     pobj, prc = _py_synthesis(str(no_sig), "blog_post")
     assert prc == 1
+    assert pobj["decision"] == "rejected"
     assert pobj["reason"] == "no_structural_signal"
 
     # (c) bad JSON file → rc=2.
     bad = tmp_path / "bad.json"
     bad.write_text("{not valid json")
-    bso, bse, brc = _bash_synthesis(str(bad), "ui_audit")  # noqa: F841
-    assert brc == 2
     pobj, prc = _py_synthesis(str(bad), "ui_audit")
     assert prc == 2
     assert "error" in pobj
 
 
 # ───────────────────────────────────────────────────────────────────────────
-# (8) missing-arg error path — bash ${1:?} guard vs port required-positional.
-#     Ports test_promotion_gate.sh's error-path assertion (its line 137):
-#     `promotion_evaluate` with no args exits non-zero. This is the one .sh
-#     assertion the value-path cases never drove — _bash_evaluate always passes
-#     a candidate_id, so the ${1:?candidate_id required} guard branch (lib line
-#     53) was never exercised here. The port's promotion_evaluate declares
-#     db_path + candidate_id as required positionals, so a no-args call raises
-#     TypeError — the Python analog of bash's ${1:?}. Same parity shape as the
-#     artifact_contract / benchmark_suite error-path cases (live bash rc!=0 AND
-#     port raises).
+# (8) missing-arg error path — the port's required-positionals raise
+#     TypeError (the Python analog of bash's ${1:?candidate_id required}
+#     guard). Ports test_promotion_gate.sh's error-path assertion (its
+#     line 137): `promotion_evaluate` with no args exits non-zero.
 # ───────────────────────────────────────────────────────────────────────────
 
 
-def test_promotion_evaluate_missing_arg_error_parity():
-    """`promotion_evaluate` rejects a no-args call: live bash exits non-zero via
-    its ${1:?candidate_id required} guard, and the port raises TypeError."""
-    _which_tools()
-    # stderr is captured (not routed to /dev/null) so we can prove the ${1:?}
-    # guard fired — a missing-function 127 would also be non-zero, so rc alone
-    # could pass vacuously if sourcing ever regressed.
-    src = f'source "{_shlex_quote(str(LIB))}"; promotion_evaluate\n'
-    r = subprocess.run(
-        ["bash", "-c", src],
-        env={**os.environ, "MINI_ORK_ROOT": str(REPO)},
-        capture_output=True, text=True, timeout=30,
-    )
-    assert r.returncode != 0, (
-        f"bash promotion_evaluate no-args rc={r.returncode} (expected !=0); "
-        f"stdout={r.stdout!r} stderr={r.stderr!r}"
-    )
-    assert "candidate_id required" in r.stderr, (
-        f"expected the ${{1:?candidate_id required}} guard to fire, not a "
-        f"source/lookup failure; stderr={r.stderr!r}"
-    )
-
-    # Port: same no-args call raises (bash ${1:?} analog). Both positionals
-    # (db_path, candidate_id) are required, so binding fails before the body.
+def test_promotion_evaluate_missing_arg_error():
+    """`promotion_evaluate` rejects a no-args call: both positionals
+    (db_path, candidate_id) are required, so binding fails before the
+    body."""
     with pytest.raises(TypeError):
         pg.promotion_evaluate()  # type: ignore[call-arg]
