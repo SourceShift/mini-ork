@@ -1,12 +1,14 @@
 """End-to-end test for the Python dispatch CLI entrypoint (mini_ork.dispatch
-__main__) — driven entirely offline through a fixture codex wrapper. Proves the
-full chain: stdin prompt → dispatch_model → wrapper-over-stdin → codex sidecar
+__main__) — driven entirely offline through a fixture codex CLI. Proves the
+full chain: stdin prompt → dispatch_model → codex_transport (native Python
+replacement for cl_codex.sh since bash-removal WS6) → codex sidecar
 usage/cost → write out-file → persist llm_calls → faithful exit code.
 """
 
 from __future__ import annotations
 
 import io
+import os
 import sqlite3
 import stat
 
@@ -28,25 +30,58 @@ CREATE TABLE llm_calls (
 );
 """
 
-# Fake cl_codex.sh: reads the prompt from stdin (the wrapper-stdin contract),
-# writes the usage/cost sidecars cl_codex.sh would, and emits cleaned text on
-# stdout. Exits MO_TEST_RC (default 0) so we can test rc propagation.
-FIXTURE_WRAPPER = r"""#!/usr/bin/env bash
-prompt="$(cat)"
-[ -n "${MO_USAGE_FILE:-}" ] && printf '%s\t%s\n' 100 40 > "$MO_USAGE_FILE"
-[ -n "${MO_COST_FILE:-}" ]  && printf '0.001234\n' > "$MO_COST_FILE"
-printf 'ECHO:%s\n' "$prompt"
+# Stub cl_codex.sh: resolve_provider/lane_health still require the wrapper
+# file to exist for the built-in codex lane, even though the command run is
+# now the Python transport.
+STUB_WRAPPER = "#!/usr/bin/env bash\nexit 0\n"
+
+# Fake codex CLI: emits a JSONL event stream like `codex exec --json` (a
+# turn.completed with usage + an agent_message echoing the prompt after `--`),
+# writes no --output-last-message (so the transport exercises its
+# reconstruction path), and exits MO_TEST_RC (default 0) for rc propagation.
+FAKE_CODEX = r"""#!/usr/bin/env bash
+prompt=""
+seen_dd=0
+for a in "$@"; do
+  if [ "$seen_dd" = "1" ]; then prompt="$a"; fi
+  if [ "$a" = "--" ]; then seen_dd=1; fi
+done
+printf '%s\n' '{"type":"thread.started","thread_id":"thr-cli"}'
+printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":100,"output_tokens":40,"cached_input_tokens":0}}'
+printf '%s\n' "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"ECHO:$prompt\"}}"
 exit "${MO_TEST_RC:-0}"
 """
 
 
-def _fixture_root(tmp_path):
+def _fixture_root(tmp_path, monkeypatch):
     root = tmp_path / "root"
     prov = root / "lib" / "providers"
     prov.mkdir(parents=True)
     wrapper = prov / "cl_codex.sh"
-    wrapper.write_text(FIXTURE_WRAPPER)
+    wrapper.write_text(STUB_WRAPPER)
     wrapper.chmod(wrapper.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    fake = bindir / "codex"
+    fake.write_text(FAKE_CODEX)
+    fake.chmod(fake.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    monkeypatch.setenv("PATH", f"{bindir}:{os.environ.get('PATH', '')}")
+
+    # The transport's framework-tree cwd guard refuses the repo root the test
+    # suite runs from — point the dispatch at a plain target dir instead.
+    target = tmp_path / "target"
+    target.mkdir()
+    monkeypatch.setenv("MO_TARGET_CWD", str(target))
+    monkeypatch.delenv("MINI_ORK_TARGET_REPO", raising=False)
+    monkeypatch.delenv("MO_ALLOW_FRAMEWORK_CWD", raising=False)
+    monkeypatch.delenv("MO_OAI_BASE_URL", raising=False)
+    monkeypatch.delenv("MO_OAI_ENV_KEY", raising=False)
+    monkeypatch.delenv("MO_OAI_MODEL", raising=False)
+    # Deterministic cost rates (env overrides win over pricing.yaml/defaults).
+    monkeypatch.setenv("MO_CODEX_USD_PER_MTOK_IN", "1.0")
+    monkeypatch.setenv("MO_CODEX_USD_PER_MTOK_CACHED", "0.5")
+    monkeypatch.setenv("MO_CODEX_USD_PER_MTOK_OUT", "2.0")
     return root
 
 
@@ -60,7 +95,7 @@ def _db(tmp_path):
 
 
 def test_cli_dispatch_writes_text_persists_and_exits_ok(tmp_path, monkeypatch):
-    root = _fixture_root(tmp_path)
+    root = _fixture_root(tmp_path, monkeypatch)
     db = _db(tmp_path)
     out = tmp_path / "out.txt"
     monkeypatch.setenv("MINI_ORK_ROOT", str(root))
@@ -80,18 +115,20 @@ def test_cli_dispatch_writes_text_persists_and_exits_ok(tmp_path, monkeypatch):
     assert row[1] == "codex"
     assert row[2] == "success"
     assert row[3] == 100 and row[4] == 40  # usage from the sidecar
-    assert row[5] == pytest.approx(0.001234)  # cost from the sidecar
+    # cost from the sidecar: (100*1.0 + 0*0.5 + 40*2.0)/1e6
+    assert row[5] == pytest.approx(0.00018)
 
 
 def test_cli_propagates_nonzero_exit_code(tmp_path, monkeypatch):
-    root = _fixture_root(tmp_path)
+    root = _fixture_root(tmp_path, monkeypatch)
     monkeypatch.setenv("MINI_ORK_ROOT", str(root))
-    monkeypatch.setenv("MO_TEST_RC", "5")  # wrapper exits 5
+    monkeypatch.setenv("MO_TEST_RC", "5")  # codex CLI itself fails
     monkeypatch.delenv("MINI_ORK_DB", raising=False)
     monkeypatch.setattr("sys.stdin", io.StringIO("q"))
 
     rc = main(["codex"])  # stdout path (no --out)
-    assert rc == 5  # the provider's exit code is propagated to the CLI exit
+    # cl_codex.sh contract: a failed `codex exec` maps to wrapper rc 4.
+    assert rc == 4
 
 
 def test_cli_unknown_lane_exits_two(tmp_path, monkeypatch):
