@@ -62,7 +62,7 @@ nodes:
     inputs:
       panel_reports: { required: true }
     outputs: [{ name: synthesis, kind: markdown, path: synthesis.md }]
-  - { name: lens_completeness, type: verifier, verifier_ref: verifiers/lens-completeness.sh, dispatch_mode: serial }
+  - { name: lens_completeness, type: verifier, verifier_ref: verifiers/lens-completeness.py, dispatch_mode: serial }
   - { name: publisher, type: publisher, prompt_ref: null, dispatch_mode: serial, gates: [scope_gate] }
   - { name: rollback, type: rollback, prompt_ref: null, dispatch_mode: serial }
 

@@ -33,6 +33,6 @@ outputs:
     required: true
 
 success_verifiers:
-  - verifiers/runbook-completeness.sh
+  - verifiers/runbook-completeness.py
 
 risk_class: medium

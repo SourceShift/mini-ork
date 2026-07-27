@@ -33,13 +33,13 @@ nodes:
   - name: typecheck
     type: verifier
     prompt_ref: null
-    verifier_ref: verifiers/typecheck.sh
+    verifier_ref: verifiers/typecheck.py
     dispatch_mode: serial
 
   - name: test
     type: verifier
     prompt_ref: null
-    verifier_ref: verifiers/test.sh
+    verifier_ref: verifiers/test.py
     dispatch_mode: serial
 
   - name: reviewer

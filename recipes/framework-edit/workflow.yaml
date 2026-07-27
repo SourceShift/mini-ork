@@ -38,14 +38,14 @@ nodes:
     type: verifier
     model_lane: verifier
     prompt_ref: null
-    verifier_ref: verifiers/static-check.sh
+    verifier_ref: verifiers/static-check.py
     dispatch_mode: serial
 
   - name: test_verifier
     type: verifier
     model_lane: verifier
     prompt_ref: null
-    verifier_ref: verifiers/test.sh
+    verifier_ref: verifiers/test.py
     dispatch_mode: serial
 
   - name: reviewer

@@ -416,7 +416,7 @@ def test_mo_plan_deterministic_fallback_opt_in(tmp_path):
         "outputs:\n"
         "  - plan.json\n"
         "success_verifiers:\n"
-        "  - verifiers/test.sh\n"
+        "  - verifiers/test.py\n"
     )
     dispatch = _fake_dispatch("not json")
 

@@ -28,7 +28,7 @@ nodes:
 
   - name: bdd_runner
     type: verifier
-    verifier_ref: verifiers/playwright_runner.sh
+    verifier_ref: verifiers/playwright_runner.py
     dispatch_mode: partitioned
     partition_key: sub_epic_id
 

@@ -17,7 +17,7 @@ nodes:
   - { name: codex_lens,     type: researcher,  model_lane: codex_lens,    prompt_ref: prompts/lens-codex-code.md, dispatch_mode: parallel, gates: [budget_gate] }
   - { name: opus_lens,      type: researcher,  model_lane: opus_lens,     prompt_ref: prompts/lens-opus-narrative.md, dispatch_mode: parallel, gates: [budget_gate] }
   - { name: synthesizer,    type: reviewer,    model_lane: reviewer,      prompt_ref: prompts/synthesis.md,       dispatch_mode: serial,   gates: [budget_gate] }
-  - { name: source_completeness, type: verifier, verifier_ref: verifiers/source-completeness.sh, dispatch_mode: serial }
+  - { name: source_completeness, type: verifier, verifier_ref: verifiers/source-completeness.py, dispatch_mode: serial }
   - { name: publisher,      type: publisher,   prompt_ref: null, dispatch_mode: serial, gates: [scope_gate] }
   - { name: rollback,       type: rollback,    prompt_ref: null, dispatch_mode: serial }
 

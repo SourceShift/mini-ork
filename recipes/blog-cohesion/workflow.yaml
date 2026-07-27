@@ -22,7 +22,7 @@ nodes:
   # classic reviewers (write review-<id>.json verdict envelope only). The
   # arbiter role conceptually IS a synthesizer of 5 lens findings.
   - { name: synth_arbiter, type: reviewer, model_lane: reviewer, prompt_ref: prompts/arbiter.md, dispatch_mode: serial, gates: [budget_gate] }
-  - { name: cohesion_completeness, type: verifier, verifier_ref: verifiers/cohesion-completeness.sh, dispatch_mode: serial }
+  - { name: cohesion_completeness, type: verifier, verifier_ref: verifiers/cohesion-completeness.py, dispatch_mode: serial }
   - { name: publisher,    type: publisher,  prompt_ref: null, dispatch_mode: serial, gates: [scope_gate] }
   - { name: rollback,     type: rollback,   prompt_ref: null, dispatch_mode: serial }
 

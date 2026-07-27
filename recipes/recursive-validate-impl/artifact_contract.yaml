@@ -2,9 +2,9 @@ task_class: recursive_validate_impl
 expected_artifact: composite
 
 success_verifiers:
-  - verifiers/tier1-compile-typecheck.sh
-  - verifiers/tier2-scoped-unit.sh
-  - verifiers/tier3-property-mutation.sh
+  - verifiers/tier1-compile-typecheck.py
+  - verifiers/tier2-scoped-unit.py
+  - verifiers/tier3-property-mutation.py
 
 failure_policy: keep_failure_evidence_replan_or_escalate
 rollback_policy: >

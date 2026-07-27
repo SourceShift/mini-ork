@@ -12,9 +12,9 @@ nodes:
   - { name: integration_lens, type: researcher, model_lane: kimi_lens, prompt_ref: prompts/lens-integration.md, dispatch_mode: parallel, gates: [budget_gate] }
   - { name: validation_lens, type: researcher, model_lane: minimax_lens, prompt_ref: prompts/lens-validation.md, dispatch_mode: parallel, gates: [budget_gate] }
   - { name: options_synthesizer, type: reviewer, model_lane: reviewer, prompt_ref: prompts/options-synthesis.md, dispatch_mode: serial, gates: [budget_gate] }
-  - { name: options_completeness, type: verifier, verifier_ref: verifiers/options-completeness.sh, dispatch_mode: serial }
+  - { name: options_completeness, type: verifier, verifier_ref: verifiers/options-completeness.py, dispatch_mode: serial }
   - { name: delivery_planner, type: reviewer, model_lane: reviewer, prompt_ref: prompts/delivery-plan.md, dispatch_mode: serial }
-  - { name: selected_option_gate, type: verifier, verifier_ref: verifiers/selected-option-gate.sh, dispatch_mode: serial }
+  - { name: selected_option_gate, type: verifier, verifier_ref: verifiers/selected-option-gate.py, dispatch_mode: serial }
   - { name: implementer, type: implementer, model_lane: worker, prompt_ref: prompts/implementer.md, dispatch_mode: serial, gates: [scope_gate, budget_gate] }
   - { name: publisher, type: publisher, prompt_ref: null, dispatch_mode: serial, gates: [scope_gate] }
   - { name: rollback, type: rollback, prompt_ref: null, dispatch_mode: serial }

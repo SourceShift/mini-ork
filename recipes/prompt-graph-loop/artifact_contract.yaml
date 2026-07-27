@@ -2,8 +2,8 @@ task_class: prompt_graph_loop
 expected_artifact: composite
 
 success_verifiers:
-  - verifiers/graph-contract.sh
-  - verifiers/human-decision.sh
+  - verifiers/graph-contract.py
+  - verifiers/human-decision.py
 
 failure_policy: escalate
 rollback_policy: keep_prompt_graph_evidence_and_decision_artifacts

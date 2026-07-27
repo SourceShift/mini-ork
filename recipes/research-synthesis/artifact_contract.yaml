@@ -2,7 +2,7 @@ task_class: research_synthesis
 expected_artifact: composite   # 4 lens reports + 1 synthesis markdown
 
 success_verifiers:
-  - verifiers/source-completeness.sh
+  - verifiers/source-completeness.py
 
 failure_policy: request_changes
 rollback_policy: >

@@ -6,7 +6,7 @@ description: >
   does not mutate target source code and does not emit ESLint configuration.
 
 success_verifiers:
-  - verifiers/audit-shape.sh
+  - verifiers/audit-shape.py
 
 failure_policy: request_changes
 rollback_policy: >

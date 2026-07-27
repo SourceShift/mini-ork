@@ -6,7 +6,7 @@ expected_artifact: composite
 # example-kickoff.md, README.md} laid out under ${MINI_ORK_RUN_DIR}/chosen/.
 
 success_verifiers:
-  - verifiers/recipe-validator.sh
+  - verifiers/recipe-validator.py
 failure_policy: request_changes
 rollback_policy: >
   Keep all 3 drafter outputs under runs/<id>/drafts/<family>/ for

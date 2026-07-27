@@ -47,9 +47,9 @@ _assert "arch-lens prompt exists"           test -f "$RECIPE_DIR/prompts/lens-co
 _assert "arxiv-researcher prompt exists"    test -f "$RECIPE_DIR/prompts/arxiv-researcher.md"
 _assert "opus-synthesis prompt exists"      test -f "$RECIPE_DIR/prompts/opus-synthesis.md"
 _assert "implementer prompt exists"         test -f "$RECIPE_DIR/prompts/implementer.md"
-_assert "bottlenecks-found verifier exec"   test -x "$RECIPE_DIR/verifiers/bottlenecks-found.sh"
-_assert "self-tests-pass verifier exec"     test -x "$RECIPE_DIR/verifiers/self-tests-pass.sh"
-_assert "no-regression verifier exec"       test -x "$RECIPE_DIR/verifiers/no-regression.sh"
+_assert "bottlenecks-found verifier exec"   test -x "$RECIPE_DIR/verifiers/bottlenecks-found.py"
+_assert "self-tests-pass verifier exec"     test -x "$RECIPE_DIR/verifiers/self-tests-pass.py"
+_assert "no-regression verifier exec"       test -x "$RECIPE_DIR/verifiers/no-regression.py"
 _assert "outer runner exec"                 test -x "$MINI_ORK_ROOT/bin/mini-ork-self-improve"
 
 echo
@@ -148,15 +148,15 @@ fi
 # lens-bottleneck.md + lens-arxiv.md (matches dispatcher's _lens
 # naming heuristic), not the old bottleneck-scan.md / arxiv-refs.md
 # names. Inline assertion against the verifier source.
-if grep -q 'lens-bottleneck.md' "$RECIPE_DIR/verifiers/bottlenecks-found.sh" \
-   && grep -q 'lens-arxiv.md' "$RECIPE_DIR/verifiers/bottlenecks-found.sh"; then
+if grep -q 'lens-bottleneck.md' "$RECIPE_DIR/verifiers/bottlenecks-found.py" \
+   && grep -q 'lens-arxiv.md' "$RECIPE_DIR/verifiers/bottlenecks-found.py"; then
   _ok "bottlenecks-found verifier references lens-bottleneck.md + lens-arxiv.md"
 else
   _fail "bottlenecks-found verifier missing lens-*.md file names — will fail vs dispatcher output"
 fi
 
 # Empty run dir → bottlenecks-found should fail
-out=$(bash "$RECIPE_DIR/verifiers/bottlenecks-found.sh" 2>/dev/null)
+out=$(python3 "$RECIPE_DIR/verifiers/bottlenecks-found.py" 2>/dev/null)
 if echo "$out" | python3 -c "import sys,json; d=json.load(sys.stdin); sys.exit(0 if d['pass'] is False else 1)"; then
   _ok "bottlenecks-found fails on empty run dir"
 else
@@ -178,7 +178,7 @@ some narrative
 ─────────────
 | 1 | foo | perf | bar | x | 0.9 |
 MD
-out=$(bash "$RECIPE_DIR/verifiers/bottlenecks-found.sh" 2>/dev/null)
+out=$(python3 "$RECIPE_DIR/verifiers/bottlenecks-found.py" 2>/dev/null)
 if echo "$out" | python3 -c "import sys,json; d=json.load(sys.stdin); sys.exit(0 if d['pass'] is True else 1)"; then
   _ok "bottlenecks-found sanitizes ★ Insight banner from synthesis.md and accepts"
 else
@@ -206,7 +206,7 @@ cat > "$MINI_ORK_RUN_DIR/lens-perf.md" <<'MD'
 </z-insight>
 real perf analysis here
 MD
-out=$(bash "$RECIPE_DIR/verifiers/bottlenecks-found.sh" 2>/dev/null)
+out=$(python3 "$RECIPE_DIR/verifiers/bottlenecks-found.py" 2>/dev/null)
 if echo "$out" | python3 -c "import sys,json; d=json.load(sys.stdin); sys.exit(0 if d['pass'] is True else 1)"; then
   _ok "bottlenecks-found sanitizes <z-insight> envelope from lens-perf.md and accepts"
 else
@@ -225,10 +225,10 @@ cat > "$MINI_ORK_RUN_DIR/lens-perf.md" <<'MD'
 ★ Insight ─ this banner has no closer line
 real content here without a closing ───── line
 MD
-out=$(bash "$RECIPE_DIR/verifiers/bottlenecks-found.sh" 2>/dev/null)
+out=$(python3 "$RECIPE_DIR/verifiers/bottlenecks-found.py" 2>/dev/null)
 # (this CASE is now handled by the single-line strip — also passes after sanitize)
 # leave both behaviors documented; assertion is on rewritten state
-bash "$RECIPE_DIR/verifiers/bottlenecks-found.sh" >/dev/null 2>&1
+python3 "$RECIPE_DIR/verifiers/bottlenecks-found.py" >/dev/null 2>&1
 if ! grep -qE '^★ Insight ─' "$MINI_ORK_RUN_DIR/lens-perf.md"; then
   _ok "sanitizer also strips single-line ★ Insight banners with no closer"
 else
@@ -244,7 +244,7 @@ cat > "$MINI_ORK_RUN_DIR/synthesis.md" <<'MD'
 
 | 1 | perf-bottle | perf | drop redundant LLM call | trace=x | 0.85 |
 MD
-out=$(bash "$RECIPE_DIR/verifiers/bottlenecks-found.sh" 2>/dev/null)
+out=$(python3 "$RECIPE_DIR/verifiers/bottlenecks-found.py" 2>/dev/null)
 if echo "$out" | python3 -c "import sys,json; d=json.load(sys.stdin); sys.exit(0 if d['pass'] is True else 1)"; then
   _ok "bottlenecks-found accepts clean synthesis with 1 ranked patch"
 else
@@ -256,7 +256,7 @@ cat > "$MINI_ORK_RUN_DIR/lens-bottleneck.md" <<'MD'
 # Scan
 ## Status: converged
 MD
-out=$(bash "$RECIPE_DIR/verifiers/bottlenecks-found.sh" 2>/dev/null)
+out=$(python3 "$RECIPE_DIR/verifiers/bottlenecks-found.py" 2>/dev/null)
 if echo "$out" | python3 -c "import sys,json; d=json.load(sys.stdin); sys.exit(0 if (d['pass'] and d['converged']) else 1)"; then
   _ok "bottlenecks-found short-circuits on convergence"
 else
@@ -267,7 +267,7 @@ fi
 mkdir -p "$TMPROOT/wt-empty"
 git -C "$TMPROOT/wt-empty" init -q
 export MINI_ORK_SELF_IMPROVE_WORKTREE="$TMPROOT/wt-empty"
-out=$(bash "$RECIPE_DIR/verifiers/self-tests-pass.sh" 2>/dev/null)
+out=$(python3 "$RECIPE_DIR/verifiers/self-tests-pass.py" 2>/dev/null)
 if echo "$out" | python3 -c "import sys,json; d=json.load(sys.stdin); sys.exit(0 if d['pass'] is False else 1)"; then
   _ok "self-tests-pass refuses vacuous (no test suites)"
 else

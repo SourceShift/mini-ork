@@ -72,7 +72,7 @@ nodes:
 
   - name: graph_contract_gate
     type: verifier
-    verifier_ref: verifiers/graph-contract.sh
+    verifier_ref: verifiers/graph-contract.py
     dispatch_mode: serial
     inputs:
       verification_report: { required: true }
@@ -102,7 +102,7 @@ nodes:
 
   - name: human_feedback_gate
     type: verifier
-    verifier_ref: verifiers/human-decision.sh
+    verifier_ref: verifiers/human-decision.py
     dispatch_mode: serial
     inputs:
       review_packet: { required: true }

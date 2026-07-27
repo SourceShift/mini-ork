@@ -22,7 +22,7 @@ verdict_schema:
   rule: "pass == (epics_total > 0 && epics_passed == epics_total)"
 
 success_verifiers:
-  - verifiers/epic-graph-complete.sh
+  - verifiers/epic-graph-complete.py
 
 failure_policy: request_changes
 rollback_policy: >

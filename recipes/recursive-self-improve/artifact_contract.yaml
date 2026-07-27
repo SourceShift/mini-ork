@@ -2,9 +2,9 @@ task_class: recursive_self_improve
 expected_artifact: composite
 
 success_verifiers:
-  - verifiers/bottlenecks-found.sh
-  - verifiers/self-tests-pass.sh
-  - verifiers/no-regression.sh
+  - verifiers/bottlenecks-found.py
+  - verifiers/self-tests-pass.py
+  - verifiers/no-regression.py
 
 failure_policy: discard_patch_keep_learning
 rollback_policy: >
