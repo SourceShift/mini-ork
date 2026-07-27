@@ -192,11 +192,28 @@ def test_claude_env_for_empty_without_key(monkeypatch):
     assert "ANTHROPIC_AUTH_TOKEN" not in env
 
 
-def test_resolve_claude_lane_uses_claude_command():
+def test_resolve_gateway_lane_uses_plain_text_command():
     spec = resolve_provider("glm")
     assert spec.command[0] == "claude"
-    assert spec.parse_text is claude_result_text
-    assert spec.parse_usage is parse_claude_usage
+    assert spec.command[-1] == "text"
+    assert spec.parse_text is None
+    assert spec.parse_usage is None
+
+
+def test_resolve_all_anthropic_compatible_gateways_as_plain_text():
+    for lane in ("deepseek", "glm", "kimi", "minimax"):
+        spec = resolve_provider(lane)
+        assert spec.command[-1] == "text", lane
+        assert spec.parse_text is None, lane
+        assert spec.parse_usage is None, lane
+
+
+def test_resolve_native_claude_lane_uses_json_envelope():
+    for lane in ("sonnet", "opus"):
+        spec = resolve_provider(lane)
+        assert spec.command[-1] == "json", lane
+        assert spec.parse_text is claude_result_text, lane
+        assert spec.parse_usage is parse_claude_usage, lane
 
 
 def test_claude_lane_passes_bypass_permissions():
