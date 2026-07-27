@@ -127,9 +127,13 @@ def test_missing_api_key_env_names_field(tmp_path, monkeypatch):
         resolve_provider("broken", tmp_path)
 
 
-def test_builtin_wrapper_wins_over_same_named_registry_entry(tmp_path, monkeypatch):
+def test_builtin_transport_wins_over_same_named_registry_entry(tmp_path, monkeypatch):
+    """Precedence preserved after WS6: the codex lane resolves to the native
+    python transport (mini_ork.dispatch.codex_transport), never to a
+    same-named shadow registry entry. (Was: command[0] == the cl_codex.sh
+    wrapper path — the wrapper is no longer executed for codex.)"""
     _clear_registry_overrides(monkeypatch)
-    wrapper = _write_executable(tmp_path / "lib" / "providers" / "cl_codex.sh")
+    _write_executable(tmp_path / "lib" / "providers" / "cl_codex.sh")
     _write_registry(
         tmp_path,
         {
@@ -144,7 +148,8 @@ def test_builtin_wrapper_wins_over_same_named_registry_entry(tmp_path, monkeypat
 
     spec = resolve_provider("codex", tmp_path)
 
-    assert spec.command[0] == str(wrapper)
+    assert "mini_ork.dispatch.codex_transport" in spec.command
+    assert "shadow" not in " ".join(spec.command)
     assert "MO_OAI_BASE_URL" not in spec.env
 
 

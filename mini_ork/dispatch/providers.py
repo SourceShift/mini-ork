@@ -147,17 +147,81 @@ def apply_resume(command: Sequence[str], session_id: str) -> tuple[str, ...]:
     return tuple(out)
 
 
+def _lane_env_from_registry(
+    model: str,
+    entry: Mapping[str, object],
+    environment: Mapping[str, str],
+) -> dict[str, str]:
+    """Build the ANTHROPIC_*/CLAUDE_* env for a registry lane natively
+    (WS6 — replaces sourcing cl_<model>.sh in a bash subshell).
+
+    Mirrors the wrappers' contracts exactly:
+    - anthropic-compat: AUTH_TOKEN from api_key_env ({} when unset, matching
+      the wrapper's `${KEY:?}` abort-before-export), BASE_URL, all model
+      slots pinned to the entry model, DISABLE_NONESSENTIAL, then extra_env.
+    - anthropic-native WITHOUT a model pin: {} — the ambient-auth contract
+      of cl_opus.sh/cl_sonnet.sh (export nothing; the Claude Code login
+      supplies auth + model). With a model pin: AUTH_TOKEN from
+      ANTHROPIC_API_KEY when present + the model pin.
+    - other kinds: {} (executable/openai lanes don't use claude env).
+    """
+    kind = entry.get("kind")
+    if kind == "anthropic-compat":
+        key_env = str(entry.get("api_key_env") or "")
+        token = environment.get(key_env, "") if key_env else ""
+        if not token:
+            return {}
+        model_id = str(entry.get("model") or "")
+        env: dict[str, str] = {
+            "ANTHROPIC_AUTH_TOKEN": token,
+            "ANTHROPIC_BASE_URL": str(entry.get("base_url") or ""),
+            "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+        }
+        if model_id:
+            env.update(
+                {
+                    "ANTHROPIC_MODEL": model_id,
+                    "ANTHROPIC_SMALL_FAST_MODEL": model_id,
+                    "ANTHROPIC_DEFAULT_OPUS_MODEL": model_id,
+                    "ANTHROPIC_DEFAULT_SONNET_MODEL": model_id,
+                    "ANTHROPIC_DEFAULT_HAIKU_MODEL": model_id,
+                    "CLAUDE_CODE_SUBAGENT_MODEL": model_id,
+                }
+            )
+        extra = entry.get("extra_env") or {}
+        if isinstance(extra, Mapping):
+            env.update({str(k): str(v) for k, v in extra.items()})
+        return env
+    if kind == "anthropic-native":
+        model_id = str(entry.get("model") or "")
+        if not model_id:
+            return {}  # ambient-auth contract (cl_opus.sh / cl_sonnet.sh)
+        env = {}
+        if api_key := environment.get("ANTHROPIC_API_KEY"):
+            env["ANTHROPIC_API_KEY"] = api_key
+            env["ANTHROPIC_MODEL"] = model_id
+        return env
+    return {}
+
+
 def claude_env_for(
     model: str,
     root: str | os.PathLike[str] | None = None,
     *,
     environment: Mapping[str, str] | None = None,
 ) -> dict[str, str]:
-    """Capture the ANTHROPIC_*/CLAUDE_* env a claude-family wrapper exports, by
-    sourcing it in a subshell. This reuses the committed cl_*.sh as the single
-    source of truth for each lane's base_url/model/key-env — no duplication in
-    Python. Returns {} if the wrapper's required API key env var is unset (its
-    `${KEY:?}` guard aborts the source before any export runs)."""
+    """The ANTHROPIC_*/CLAUDE_* env for a claude-family lane.
+
+    WS6: the providers.yaml registry is the source of truth — when the lane
+    has a registry entry the env is built natively (no bash). The cl_*.sh
+    wrapper source remains only as a fallback for lanes with no registry
+    entry (deleted in the bash purge). Returns {} when the lane's required
+    API key env var is unset (the wrapper's `${KEY:?}` abort contract).
+    """
+    env_map = os.environ if environment is None else environment
+    entry = _load_providers_registry(root).get(model)
+    if isinstance(entry, Mapping):
+        return _lane_env_from_registry(model, entry, env_map)
     wrapper = mini_ork_root(root) / "lib" / "providers" / f"cl_{model}.sh"
     if not wrapper.is_file():
         raise FileNotFoundError(f"provider wrapper not found: {wrapper}")
@@ -171,7 +235,7 @@ def claude_env_for(
         capture_output=True,
         text=True,
         timeout=10,
-        env=dict(os.environ if environment is None else environment),
+        env=dict(env_map),
     )
     env: dict[str, str] = {}
     for line in proc.stdout.splitlines():
@@ -440,7 +504,15 @@ def resolve_provider(
     *,
     environment: Mapping[str, str] | None = None,
 ) -> ProviderSpec:
-    """Resolve a built-in wrapper or registry-defined model lane."""
+    """Resolve a built-in wrapper or registry-defined model lane.
+
+    Precedence: a lib/providers/cl_<name>.sh wrapper wins for built-in lanes
+    (pinned by test_builtin_wrapper_wins_over_same_named_registry_entry);
+    the providers.yaml registry defines BYO lanes. Note the wrapper's role
+    for anthropic lanes is only env sourcing — which claude_env_for now
+    resolves from the registry natively (WS6), so no bash runs for the
+    committed claude lanes even under this precedence.
+    """
     wrapper = mini_ork_root(root) / "lib" / "providers" / f"cl_{model}.sh"
     if model not in KNOWN_MODELS:
         return _resolve_from_registry(
@@ -450,11 +522,34 @@ def resolve_provider(
         raise FileNotFoundError(f"provider wrapper not found: {wrapper}")
 
     if model in EXECUTABLE_MODELS:
-        # Run the wrapper as a command; prompt arrives over stdin (core.dispatch).
-        # stdout is the CLEANED assistant text — cl_codex.sh redirects the codex
-        # JSONL to a stream file and writes usage/cost to MO_*_FILE sidecars, so
-        # there are no stdout parsers here; dispatch_model reads the sidecars.
-        command: tuple[str, ...] = (str(wrapper), "--print", "--output-format", "text")
+        # Prompt arrives over stdin (core.dispatch). stdout is the CLEANED
+        # assistant text — the codex transport redirects the codex JSONL to a
+        # stream file and writes usage/cost to MO_*_FILE sidecars, so there are
+        # no stdout parsers here; dispatch_model reads the sidecars.
+        if model == "codex":
+            # bash-removal WS6: native Python transport, a drop-in replacement
+            # for lib/providers/cl_codex.sh (same argv dialect + sidecar
+            # contract), so _dispatch_codex_via_wrapper works unchanged.
+            command: tuple[str, ...] = (
+                sys.executable,
+                "-m",
+                "mini_ork.dispatch.codex_transport",
+                "--print",
+                "--output-format",
+                "text",
+            )
+            # The dispatch runs with cwd pinned to the TARGET repo, so the
+            # transport module is only importable if the package root is on
+            # PYTHONPATH — the bash wrapper got this for free by being an
+            # absolute path. Prepend it under any operator PYTHONPATH.
+            runtime_env = os.environ if environment is None else environment
+            pkg_root = str(Path(__file__).resolve().parents[2])
+            existing_pp = runtime_env.get("PYTHONPATH", "")
+            pythonpath = (
+                f"{pkg_root}{os.pathsep}{existing_pp}" if existing_pp else pkg_root
+            )
+            return ProviderSpec(model, command, env={"PYTHONPATH": pythonpath})
+        command = (str(wrapper), "--print", "--output-format", "text")
         return ProviderSpec(model, command)
 
     # Anthropic-compatible gateways return a plain assistant response through

@@ -376,7 +376,12 @@ def mo_run_rubric_prescreen(
     )
 
     env_script = f"{scripts_dir}/cl_{lane}.sh"
-    if not os.path.isfile(env_script):
+    # WS6: a registry entry satisfies the lane even when the wrapper file is
+    # gone (post-purge); the env_script check is the wrapper-era fallback.
+    from mini_ork.dispatch.providers import _load_providers_registry  # noqa: PLC0415
+    _lane_root = os.path.dirname(os.path.dirname(scripts_dir.rstrip("/")))
+    _lane_in_registry = lane in _load_providers_registry(_lane_root)
+    if not _lane_in_registry and not os.path.isfile(env_script):
         print(
             f"[mini-ork] rubric: env script missing for lane={lane} → {env_script}",
             file=__import__("sys").stderr,
@@ -404,27 +409,32 @@ def mo_run_rubric_prescreen(
     sub_env = dict(os.environ)
     sub_env["CLAUDE_CODE_EFFORT_LEVEL"] = rubric_effort
     sub_env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] = str(rubric_max_output_tokens)
-    # Best-effort: source the env-script values into the subprocess env.
+    # Lane env: registry-native via claude_env_for (WS6); the cl_<lane>.sh
+    # file-parse remains as fallback for lanes without a registry entry.
     try:
-        with open(env_script) as f:
-            for line in f:
-                line = line.strip()
-                if line.startswith("export ") and "=" in line:
-                    kv = line[len("export "):].split("=", 1)
-                    if len(kv) == 2 and kv[0].strip().isidentifier():
-                        v = kv[1].strip().strip('"').strip("'")
-                        # Honor ${VAR:?...} only when VAR is set;
-                        # if not, skip (bash would error).
-                        if v.startswith("${") and ":" in v:
-                            inner = v[2:-1]
-                            var_name = inner.split(":", 1)[0]
-                            if var_name in os.environ:
-                                v = os.environ[var_name]
-                            else:
-                                continue
-                        sub_env[kv[0].strip()] = v
-    except OSError:
-        pass
+        from mini_ork.dispatch.providers import claude_env_for  # noqa: PLC0415
+        sub_env.update(claude_env_for(lane, root=_lane_root))
+    except Exception:
+        try:
+            with open(env_script) as f:
+                for line in f:
+                    line = line.strip()
+                    if line.startswith("export ") and "=" in line:
+                        kv = line[len("export "):].split("=", 1)
+                        if len(kv) == 2 and kv[0].strip().isidentifier():
+                            v = kv[1].strip().strip('"').strip("'")
+                            # Honor ${VAR:?...} only when VAR is set;
+                            # if not, skip (bash would error).
+                            if v.startswith("${") and ":" in v:
+                                inner = v[2:-1]
+                                var_name = inner.split(":", 1)[0]
+                                if var_name in os.environ:
+                                    v = os.environ[var_name]
+                                else:
+                                    continue
+                            sub_env[kv[0].strip()] = v
+        except OSError:
+            pass
 
     cmd = [
         "claude", "-p",
