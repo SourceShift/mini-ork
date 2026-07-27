@@ -1,12 +1,14 @@
-"""Parity gate: ``mini_ork.gates.cw_por.compute_cw_por`` vs
-``lib/cw_por.sh:mo_compute_cw_por``.
+"""Standalone unit tests for ``mini_ork.gates.cw_por.compute_cw_por``.
 
-Every case invokes the LIVE bash function in a fresh subprocess — the bash
-output is the control; the test never hardcodes an expected JSON. The
-Python port must match the bash output byte-for-byte (floats within 1e-6,
-rationale strings identical, structural dict equality).
+Replaces the bash-parity gate (against ``lib/cw_por.sh:mo_compute_cw_por``)
+as part of the bash→Python migration: the Python port is now the sole
+implementation, so its coverage no longer runs the LIVE bash function in a
+subprocess — it asserts the port's behaviour directly. The expected values
+below are the semantic contract the bash side used to pin (verdicts, pair
+counts, threshold semantics, error modes), now asserted on the port's
+output.
 
-Six parity cases:
+Six cases:
 
   (a) clean panel — 4 voters, correct votes dominate with higher
       confidence → ``verdict=panel_healthy``, ``cw_por < threshold``
@@ -16,24 +18,15 @@ Six parity cases:
   (c) indeterminate — all voters have ``ground_truth_match=None`` →
       ``cw_por`` is ``None``, ``verdict=indeterminate``,
       ``n_with_ground_truth=0``
-  (d) ``MO_CW_POR_THRESHOLD`` env override — set env to 0.05 in both
-      subprocess AND Python (``os.environ`` patching via monkeypatch),
-      both must honor it
-  (e) malformed JSON (missing ``.voters[]``) — bash returns rc=2 + stderr
-      JSON error, Python raises ``ValueError``; both sides must agree on
-      this failure mode (subprocess rc vs raised exception)
-  (f) missing verdict file — bash returns rc=2 + stderr error, Python
-      raises ``FileNotFoundError``
-
-Strangler-fig co-existence: ``lib/cw_por.sh`` is byte-identical before
-and after this test exists. The test only WRITES to ``tmp_path`` fixture
-files and READS from ``lib/cw_por.sh``.
+  (d) threshold override — explicit ``threshold=`` kwarg and the
+      ``MO_CW_POR_THRESHOLD`` env var both reach the port
+  (e) malformed JSON (missing ``.voters[]``) — Python raises
+      ``ValueError``
+  (f) missing verdict file — Python raises ``FileNotFoundError``
 """
 from __future__ import annotations
 
 import json
-import os
-import subprocess
 import sys
 from pathlib import Path
 
@@ -42,58 +35,6 @@ import pytest
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
 from mini_ork.gates import cw_por as cwp
-
-SH = REPO / "lib" / "cw_por.sh"
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Helpers
-# ─────────────────────────────────────────────────────────────────────────────
-def _bash(env: dict[str, str], body: str) -> subprocess.CompletedProcess:
-    """Run ``body`` in a fresh bash that has sourced lib/cw_por.sh.
-
-    The bash function ``mo_compute_cw_por`` is the production API; the
-    heredoc-python3 inside it is internal. We invoke the OUTER function
-    so the control matches what callers actually use.
-    """
-    wrapper = f'. "{SH}"\n{body}\n'
-    full_env = {**os.environ, **env}
-    return subprocess.run(
-        ["bash", "-c", wrapper], env=full_env, capture_output=True, text=True,
-    )
-
-
-def _bash_compute(verdict_file: str,
-                  extra_env: dict[str, str] | None = None
-                  ) -> subprocess.CompletedProcess:
-    """Invoke ``mo_compute_cw_por <verdict_file>`` in a fresh bash."""
-    env = dict(extra_env) if extra_env else {}
-    # Strip MO_CW_POR_THRESHOLD unless the caller explicitly set it, so
-    # tests don't inherit ambient thresholds from the developer shell.
-    env.setdefault("MO_CW_POR_THRESHOLD", "0.3")
-    return _bash(env, f'mo_compute_cw_por "{verdict_file}"')
-
-
-def _compare_payloads(py: dict, bash: dict, *,
-                      float_tol: float = 1e-6) -> None:
-    """Structural equality gate. Compares dict shapes, string fields
-    verbatim, and floats within ``float_tol``. The bash output goes
-    through json.loads first to normalize (since bash also prints JSON)."""
-    assert set(py.keys()) == set(bash.keys()), (
-        f"key mismatch: py={sorted(py.keys())} bash={sorted(bash.keys())}"
-    )
-    for k, v in py.items():
-        bv = bash[k]
-        if isinstance(v, float) or isinstance(bv, float):
-            assert abs(float(v) - float(bv)) <= float_tol, (
-                f"float mismatch at {k!r}: py={v!r} bash={bv!r}"
-            )
-        elif v is None or bv is None:
-            assert v is None and bv is None, (
-                f"None mismatch at {k!r}: py={v!r} bash={bv!r}"
-            )
-        else:
-            assert v == bv, f"field {k!r}: py={v!r} bash={bv!r}"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -116,12 +57,6 @@ def test_clean_panel_panel_healthy(tmp_path):
 
     py_rc, py_payload = cwp.compute_cw_por(str(panel))
     assert py_rc == 0
-
-    r_bash = _bash_compute(str(panel))
-    assert r_bash.returncode == 0, f"bash rc={r_bash.returncode} stderr={r_bash.stderr!r}"
-    bash_payload = json.loads(r_bash.stdout)
-
-    _compare_payloads(py_payload, bash_payload)
     assert py_payload["verdict"] == "panel_healthy"
     assert py_payload["cw_por"] < py_payload["threshold"]
     assert py_payload["n_correct"] == 3
@@ -150,12 +85,6 @@ def test_captured_panel_authority_capture_suspected(tmp_path):
 
     py_rc, py_payload = cwp.compute_cw_por(str(panel))
     assert py_rc == 0
-
-    r_bash = _bash_compute(str(panel))
-    assert r_bash.returncode == 0, f"bash rc={r_bash.returncode} stderr={r_bash.stderr!r}"
-    bash_payload = json.loads(r_bash.stdout)
-
-    _compare_payloads(py_payload, bash_payload)
     assert py_payload["verdict"] == "authority_capture_suspected"
     assert py_payload["cw_por"] > py_payload["threshold"]
     assert py_payload["n_correct"] == 1
@@ -182,45 +111,27 @@ def test_indeterminate_no_ground_truth_signal(tmp_path):
 
     py_rc, py_payload = cwp.compute_cw_por(str(panel))
     assert py_rc == 0
-
-    r_bash = _bash_compute(str(panel))
-    assert r_bash.returncode == 0, (
-        f"bash rc={r_bash.returncode} stderr={r_bash.stderr!r}"
-    )
-    bash_payload = json.loads(r_bash.stdout)
-
-    # Indeterminate branch has a DIFFERENT key set from the normal branch —
-    # compare shape, not the union.
-    assert set(py_payload.keys()) == set(bash_payload.keys())
     assert py_payload["cw_por"] is None
-    assert bash_payload["cw_por"] is None
     assert py_payload["verdict"] == "indeterminate"
-    assert bash_payload["verdict"] == "indeterminate"
     assert py_payload["n_with_ground_truth"] == 0
     assert py_payload["n_voters"] == 3
-    # Rationale string is verbatim equal (no float involvement here).
-    assert py_payload["rationale"] == bash_payload["rationale"]
+    assert py_payload["rationale"]
     # Normal-branch keys must NOT leak into indeterminate output.
     for k in ("n_correct", "n_wrong", "n_pairs_evaluated", "adopted_vote"):
         assert k not in py_payload
-        assert k not in bash_payload
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# (d) MO_CW_POR_THRESHOLD env override
+# (d) threshold override — kwarg AND env var both reach the port
 # ─────────────────────────────────────────────────────────────────────────────
 def test_threshold_env_override_honored(tmp_path):
-    # Build a panel whose bare-cw_por sits between 0.05 and 0.3 — a
-    # clean-panel layout at confidence 0.85 / 0.80 / 0.75 / 0.30 yields
-    # cw_por = 0 (no overrides; adopted=approve; correct_vote=approve),
-    # which won't trip the threshold either way. We need a panel that
-    # ACTUALLY produces a non-zero CW-POR to make the override observable.
-    #
-    # Use a captured-panel layout (wrong voters more confident, adopted
-    # vote == wrong vote) which yields cw_por > 0. With default 0.3 the
-    # verdict is "authority_capture_suspected". With 0.95 the verdict
-    # flips to "panel_healthy". The point of this test is that the env
-    # knob reaches BOTH implementations.
+    # A captured-panel layout (wrong voters more confident, adopted
+    # vote == wrong vote) which yields cw_por > 0.
+    # cw_por here: 1 pair (glm, kimi) delta=0.15, 1 pair (glm, codex)
+    # delta=0.10, adopted=reject, correct_vote=approve (correct[0].vote).
+    # Both deltas>0 and adopted==w.vote and adopted!=correct_vote → both
+    # count as overrides. overrides=0.25, pairs=2, cw_por=0.125. So
+    # threshold 0.05 → capture; threshold 0.95 → healthy.
     panel = tmp_path / "panel.json"
     panel.write_text(json.dumps({
         "voters": [
@@ -232,39 +143,22 @@ def test_threshold_env_override_honored(tmp_path):
              "ground_truth_match": False},
         ],
     }))
-    # cw_por here: 1 pair (glm, kimi) delta=0.15, 1 pair (glm, codex)
-    # delta=0.10, adopted=reject, correct_vote=approve (correct[0].vote).
-    # Both deltas>0 and adopted==w.vote and adopted!=correct_vote → both
-    # count as overrides. overrides=0.25, pairs=2, cw_por=0.125. So
-    # threshold 0.05 → capture; threshold 0.95 → healthy.
 
     # Sub-case 1: threshold=0.05 → authority_capture_suspected
-    py_rc, py_payload = cwp.compute_cw_por(
-        str(panel), threshold=0.05,
-    )
+    py_rc, py_payload = cwp.compute_cw_por(str(panel), threshold=0.05)
     assert py_rc == 0
-    r_bash = _bash_compute(str(panel), extra_env={"MO_CW_POR_THRESHOLD": "0.05"})
-    assert r_bash.returncode == 0, f"bash rc={r_bash.returncode} stderr={r_bash.stderr!r}"
-    bash_payload = json.loads(r_bash.stdout)
-    _compare_payloads(py_payload, bash_payload)
     assert py_payload["verdict"] == "authority_capture_suspected"
     assert py_payload["threshold"] == 0.05
+    assert abs(py_payload["cw_por"] - 0.125) <= 1e-6
 
     # Sub-case 2: threshold=0.95 → panel_healthy (cw_por=0.125 < 0.95)
-    py_rc2, py_payload2 = cwp.compute_cw_por(
-        str(panel), threshold=0.95,
-    )
+    py_rc2, py_payload2 = cwp.compute_cw_por(str(panel), threshold=0.95)
     assert py_rc2 == 0
-    r_bash2 = _bash_compute(str(panel), extra_env={"MO_CW_POR_THRESHOLD": "0.95"})
-    assert r_bash2.returncode == 0
-    bash_payload2 = json.loads(r_bash2.stdout)
-    _compare_payloads(py_payload2, bash_payload2)
     assert py_payload2["verdict"] == "panel_healthy"
     assert py_payload2["threshold"] == 0.95
 
-    # Sub-case 3: bash env override reaches bash via $MO_CW_POR_THRESHOLD
-    # even when Python is called WITHOUT an explicit threshold argument —
-    # both sides resolve the same env var and produce the same verdict.
+    # Sub-case 3: env var MO_CW_POR_THRESHOLD reaches the port when no
+    # explicit threshold argument is given.
     monkey = pytest.MonkeyPatch()
     monkey.setenv("MO_CW_POR_THRESHOLD", "0.05")
     try:
@@ -272,10 +166,6 @@ def test_threshold_env_override_honored(tmp_path):
     finally:
         monkey.undo()
     assert py_rc3 == 0
-    r_bash3 = _bash_compute(str(panel), extra_env={"MO_CW_POR_THRESHOLD": "0.05"})
-    assert r_bash3.returncode == 0
-    bash_payload3 = json.loads(r_bash3.stdout)
-    _compare_payloads(py_payload3, bash_payload3)
     assert py_payload3["verdict"] == "authority_capture_suspected"
     assert py_payload3["threshold"] == 0.05
 
@@ -287,19 +177,8 @@ def test_malformed_missing_voters_raises_value_error(tmp_path):
     bad = tmp_path / "bad.json"
     bad.write_text('{"verdict": "approve"}')
 
-    # Python: ValueError
     with pytest.raises(ValueError):
         cwp.compute_cw_por(str(bad))
-
-    # Bash: rc=2 + stderr JSON error matching the canonical message.
-    r_bash = _bash_compute(str(bad))
-    assert r_bash.returncode == 2
-    try:
-        bash_err = json.loads(r_bash.stderr.strip())
-    except json.JSONDecodeError:
-        pytest.fail(f"bash stderr not JSON: {r_bash.stderr!r}")
-    assert "error" in bash_err
-    assert "voters" in bash_err["error"].lower()
 
     # Also: an empty voters array must trigger the same failure mode.
     empty = tmp_path / "empty.json"
@@ -307,14 +186,6 @@ def test_malformed_missing_voters_raises_value_error(tmp_path):
 
     with pytest.raises(ValueError):
         cwp.compute_cw_por(str(empty))
-
-    r_bash_empty = _bash_compute(str(empty))
-    assert r_bash_empty.returncode == 2
-    try:
-        bash_empty_err = json.loads(r_bash_empty.stderr.strip())
-    except json.JSONDecodeError:
-        pytest.fail(f"bash stderr not JSON: {r_bash_empty.stderr!r}")
-    assert "error" in bash_empty_err
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -324,16 +195,5 @@ def test_missing_file_raises_file_not_found(tmp_path):
     missing = tmp_path / "does_not_exist.json"
     assert not missing.exists()
 
-    # Python: FileNotFoundError
     with pytest.raises(FileNotFoundError):
         cwp.compute_cw_por(str(missing))
-
-    # Bash: rc=2 + stderr JSON error mentioning "not found".
-    r_bash = _bash_compute(str(missing))
-    assert r_bash.returncode == 2
-    try:
-        bash_err = json.loads(r_bash.stderr.strip())
-    except json.JSONDecodeError:
-        pytest.fail(f"bash stderr not JSON: {r_bash.stderr!r}")
-    assert "error" in bash_err
-    assert "not found" in bash_err["error"].lower()
