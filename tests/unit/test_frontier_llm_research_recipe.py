@@ -56,11 +56,11 @@ def test_workflow_has_one_bounded_artifact_handoff_per_summary_shard():
 
 def test_deterministic_verifiers_emit_nonvacuous_pass_envelopes():
     scripts = (
-        "collect-latest-libwit.sh",
-        "shard-corpus.sh",
-        "prepare-technique-rollup.sh",
-        "assemble-aggregation.sh",
-        "verify-aggregation.sh",
+        "collect-latest-libwit.py",
+        "shard-corpus.py",
+        "prepare-technique-rollup.py",
+        "assemble-aggregation.py",
+        "verify-aggregation.py",
     )
 
     for script_name in scripts:
