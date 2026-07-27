@@ -1,21 +1,16 @@
-"""Parity gate: ``mini_ork.dispatch.config_resolve`` vs ``lib/config_resolve.sh``.
+"""Unit tests: ``mini_ork.dispatch.config_resolve`` (bash parity halves removed; formerly vs ``lib/config_resolve.sh``).
 
 For each fixture we seed a self-contained home/root/run-dir tree under
-``tmp_path``, invoke the LIVE bash functions via subprocess (no
-mocking), then call the Python port with the SAME env via in-process
-capture and compare raw stdout byte-for-byte.
+``tmp_path`` and call the Python port with a controlled env via
+in-process capture, asserting raw stdout and the snapshotted file body.
 
-Why raw stdout (no ``.strip()``): bash's ``printf '%s\\n' ...`` emits
+Why raw stdout (no ``.strip()``): the contract is ``printf '%s\\n'`` —
 exactly ``"path\\n"``. A ``strip()``-comparing harness would silently
-mask a regression that drops the trailing ``\\n``; the raw check
-surfaces it as a parity drift.
+mask a regression that drops the trailing ``\\n``.
 
 Env isolation: each fixture pops ``MINI_ORK_RUN_DIR`` / ``MINI_ORK_HOME`` /
 ``MINI_ORK_ROOT`` before applying its overrides so pytest's arbitrary
 collection order cannot leak a prior fixture's env into the next.
-
-Strangler-fig co-existence: ``lib/config_resolve.sh`` is byte-identical
-before and after this test exists.
 """
 
 from __future__ import annotations
@@ -23,7 +18,6 @@ from __future__ import annotations
 import contextlib
 import io
 import os
-import subprocess
 from pathlib import Path
 
 import pytest
@@ -34,46 +28,17 @@ from mini_ork.dispatch.config_resolve import (
 )
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
-LIB_CONFIG_RESOLVE = REPO_ROOT / "lib" / "config_resolve.sh"
 
 _THREE_VARS = ("MINI_ORK_RUN_DIR", "MINI_ORK_HOME", "MINI_ORK_ROOT")
 
 # Repo root contains real ``.mini-ork/config/agents.yaml`` and
-# ``config/agents.yaml``, both of which would satisfy bash's HOME/ROOT
+# ``config/agents.yaml``, both of which would satisfy the HOME/ROOT
 # fall-through. Every fixture that doesn't intentionally exercise the
 # defaults must override the irrelevant vars to this sentinel.
 _NONEXISTENT = "/nonexistent/__mo_migrate_config_resolve_fixture__"
 
 
-# ── Subprocess + in-process helpers ─────────────────────────────────────────
-
-
-def _build_env(overrides: dict) -> dict:
-    env = os.environ.copy()
-    for k in _THREE_VARS:
-        env.pop(k, None)
-    env.update(overrides)
-    return env
-
-
-def _bash_resolve(env: dict) -> str:
-    proc = subprocess.run(
-        ["bash", "-c",
-         f'. "{LIB_CONFIG_RESOLVE}" && mo_resolve_agents_yaml'],
-        cwd=str(REPO_ROOT), env=env, check=True,
-        capture_output=True, text=True,
-    )
-    return proc.stdout
-
-
-def _bash_snapshot(run_dir: Path, env: dict) -> str:
-    proc = subprocess.run(
-        ["bash", "-c",
-         f'. "{LIB_CONFIG_RESOLVE}" && mo_snapshot_run_config "{run_dir}"'],
-        cwd=str(REPO_ROOT), env=env, check=True,
-        capture_output=True, text=True,
-    )
-    return proc.stdout
+# ── In-process helpers ──────────────────────────────────────────────────────
 
 
 def _with_env(overrides: dict):
@@ -121,9 +86,6 @@ def _seed(tree: Path, body: str) -> None:
 
 # ── Resolve fixtures ────────────────────────────────────────────────────────
 # Each returns (id, env_overrides, expected_relative_or_absolute_path).
-# The expected path is what bash emits under that env; verified against
-# live bash before parity so a fixture drift surfaces as a fixture
-# failure, not a parity 'pass' on the wrong grounds.
 
 
 def _f01_run_dir_wins(tmp_path):
@@ -174,9 +136,8 @@ def _f03_root_only(tmp_path):
 
 def _f04_all_missing_returns_overridden_root(_tmp_path):
     # HOME and ROOT both overridden to known-missing absolute paths so
-    # bash's fall-through is reproducible regardless of accidental
-    # fixture files at the repo root. Bash echoes the literal ROOT
-    # value (no ``.`` → pwd resolution inside ``printf %s\\n``).
+    # the fall-through is reproducible regardless of accidental fixture
+    # files at the repo root. The literal ROOT value is echoed.
     fake_root = _NONEXISTENT + "_root"
     return (
         "04_all_missing_returns_overridden_root",
@@ -200,20 +161,13 @@ RESOLVE_BUILDERS = (
 @pytest.mark.parametrize(
     "builder", RESOLVE_BUILDERS, ids=lambda b: b.__name__,
 )
-def test_resolve_parity(tmp_path, builder):
+def test_resolve(tmp_path, builder):
     fixture_id, env_overrides, expected = builder(tmp_path)
     expected_nl = expected + "\n"
 
-    observed = _bash_resolve(_build_env(env_overrides))
-    assert observed == expected_nl, (
-        f"fixture expectation drift [{fixture_id}]: "
-        f"expected={expected_nl!r} bash-emitted={observed!r}"
-    )
-
     py_out = _capture_py_resolve(env_overrides)
     assert py_out == expected_nl, (
-        f"resolve stdout drift [{fixture_id}]: "
-        f"bash={observed!r} py={py_out!r}"
+        f"resolve stdout drift [{fixture_id}]: py={py_out!r}"
     )
 
 
@@ -300,13 +254,10 @@ SNAPSHOT_BUILDERS = (
 @pytest.mark.parametrize(
     "builder", SNAPSHOT_BUILDERS, ids=lambda b: b.__name__,
 )
-def test_snapshot_parity(tmp_path, builder):
+def test_snapshot(tmp_path, builder):
     fixture_id, run_dir, env_overrides, expected_body = builder(tmp_path)
     dest = run_dir / "config" / "agents.yaml"
 
-    # Bash writes to disk in its cwd (REPO_ROOT) but the dest path is
-    # absolute via the arg, so both sides converge on tmp_path.
-    _bash_snapshot(run_dir, _build_env(env_overrides))
     _capture_py_snapshot(run_dir, env_overrides)
 
     if expected_body is None:

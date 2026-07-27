@@ -1,18 +1,17 @@
-"""Parity gate: mini_ork.cli.metrics vs bin/mini-ork-metrics.
+"""Unit tests: mini_ork.cli.metrics (bash parity halves removed; formerly vs bin/mini-ork-metrics).
 
-Bash stays untouched (strangler-fig); the port must produce byte-identical output
-to the live bash on >=6 cases covering: empty DB (default + future --since),
-populated DB (markdown + JSON, with --recipe filter and --format json), and
-the CLI error paths (--help, unknown flag, missing DB). Each case drives the
-LIVE bash function via subprocess against the Python port on identical temp
-state.db seeded via db/init.sh.
+Covers: empty DB (default + future --since), populated DB (markdown + JSON,
+with --recipe filter and --format json), and the CLI error paths (--help,
+unknown flag, missing DB). Each case drives the Python port against a temp
+state.db seeded via db/init.sh and asserts the collected data + rendered
+outputs semantically.
 
-JSON is compared via json.loads + assertAlmostEqual on cost/total fields at
-1e-6; markdown is compared as raw stdout strings to lock trailing newlines and
-float f-string formats.
+JSON is checked via json.loads + 1e-6 tolerance on cost/total fields;
+markdown is checked for its structural markers.
 """
 from __future__ import annotations
 
+import io
 import json
 import os
 import sqlite3
@@ -23,8 +22,6 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
 from mini_ork.cli import metrics as pm
-
-SH = REPO / "bin" / "mini-ork-metrics"
 
 
 def _scenario(tmp_path: Path):
@@ -39,21 +36,6 @@ def _scenario(tmp_path: Path):
     )
     assert r.returncode == 0, f"db/init.sh failed: {r.stderr}"
     return home, db
-
-
-def _bash_metrics(home: Path, db: str, args, *, extra_env=None):
-    env = {
-        **os.environ,
-        "MINI_ORK_ROOT": str(REPO),
-        "MINI_ORK_HOME": str(home),
-        "MINI_ORK_DB": db,
-    }
-    if extra_env:
-        env.update(extra_env)
-    return subprocess.run(
-        ["bash", str(SH), *args],
-        capture_output=True, text=True, env=env,
-    )
 
 
 def _seed(db: str, task_rows, trace_rows=None, grad_rows=None):
@@ -97,8 +79,6 @@ def _seed(db: str, task_rows, trace_rows=None, grad_rows=None):
 PIN_BASE = 1768526400
 # 24h before
 PIN_DAY_BEFORE = PIN_BASE - 86400
-# 12h after
-PIN_12H_AFTER = PIN_BASE + 43200
 # Now-ish (used to exclude everything via --since)
 PIN_NOW = PIN_BASE + 7 * 86400  # 7 days after the seed → all seed rows excluded
 
@@ -137,104 +117,79 @@ def _seed_three_cycles(db: str):
 # ---------------------------------------------------------------------------
 # (a) empty DB → 'no cycles' markdown; JSON cycle_count=0
 # ---------------------------------------------------------------------------
-def test_empty_db_markdown_and_json_parity(tmp_path):
+def test_empty_db_markdown_and_json(tmp_path):
     home, db = _scenario(tmp_path)
-    # pin --since for both sides so the Window line is byte-stable
+    # pin --since so the Window line is stable
     PIN_EPOCH = 1700000000  # 2023-11-14T22:13:20 UTC
-    # bash markdown
-    rb = _bash_metrics(home, db, ["--since", str(PIN_EPOCH)])
     data = pm.collect_cycles(db, recipe_filter="", since=PIN_EPOCH)
     rp_md = pm.render_markdown(data)
-    assert rb.returncode == 0, rb.stderr
-    assert rb.stdout == rp_md
-    # bash JSON
-    rj = _bash_metrics(home, db, ["--since", str(PIN_EPOCH), "--format", "json"])
+    assert "_No cycles in window._" in rp_md
     rp_json = pm.render_json(data)
-    assert rj.returncode == 0
-    assert rj.stdout == rp_json
-    parsed = json.loads(rj.stdout)
+    parsed = json.loads(rp_json)
     assert parsed["totals"]["cycle_count"] == 0
     assert parsed["cycles"] == []
 
 
 # ---------------------------------------------------------------------------
-# (b) populated DB → byte-equal JSON + markdown
+# (b) populated DB → JSON totals + markdown markers
 # ---------------------------------------------------------------------------
-def test_populated_db_parity(tmp_path):
+def test_populated_db(tmp_path):
     home, db = _scenario(tmp_path)
     _seed_three_cycles(db)
     # pin --since to PIN_DAY_BEFORE so all 3 cycles fall in window
-    rb = _bash_metrics(home, db, ["--since", str(PIN_DAY_BEFORE)])
     rp_data = pm.collect_cycles(db, recipe_filter="", since=PIN_DAY_BEFORE)
     rp_md = pm.render_markdown(rp_data)
-    assert rb.returncode == 0, rb.stderr
-    # raw byte compare — lock trailing newlines + float f-string formats
-    assert rb.stdout == rp_md
+    # markdown mentions the runs + totals
+    assert "run-001-aaaaaaaaaaaa" in rp_md
+    assert "run-003-cccccccccccc" in rp_md
 
-    rj = _bash_metrics(home, db, ["--since", str(PIN_DAY_BEFORE), "--format", "json"])
     rp_json = pm.render_json(rp_data)
-    assert rj.stdout == rp_json
-    parsed_b = json.loads(rj.stdout)
     parsed_p = json.loads(rp_json)
-    assert parsed_b["totals"]["cycle_count"] == 3
     assert parsed_p["totals"]["cycle_count"] == 3
-    # float fields within 1e-6
-    assert abs(parsed_b["totals"]["total_cost_usd"] - parsed_p["totals"]["total_cost_usd"]) < 1e-6
-    assert parsed_b["totals"]["trace_count"] == parsed_p["totals"]["trace_count"] == 4
-    assert parsed_b["totals"]["gradient_count"] == parsed_p["totals"]["gradient_count"] == 2
-    assert len(parsed_b["cycles"]) == len(parsed_p["cycles"]) == 3
-    for cb, cp in zip(parsed_b["cycles"], parsed_p["cycles"]):
-        assert abs(cb["cost_usd"] - cp["cost_usd"]) < 1e-6
+    assert abs(parsed_p["totals"]["total_cost_usd"] - (0.1234 + 0.0567 + 0.0234)) < 1e-6
+    assert parsed_p["totals"]["trace_count"] == 4
+    assert parsed_p["totals"]["gradient_count"] == 2
+    assert len(parsed_p["cycles"]) == 3
+    costs = [c["cost_usd"] for c in parsed_p["cycles"]]
+    assert abs(costs[0] - 0.1234) < 1e-6
+    assert abs(costs[1] - 0.0567) < 1e-6
+    assert abs(costs[2] - 0.0234) < 1e-6
 
 
 # ---------------------------------------------------------------------------
 # (c) --recipe filter narrows to 1 row
 # ---------------------------------------------------------------------------
-def test_recipe_filter_parity(tmp_path):
+def test_recipe_filter(tmp_path):
     home, db = _scenario(tmp_path)
     _seed_three_cycles(db)
-    args = ["--since", str(PIN_DAY_BEFORE), "--recipe", "code-fix"]
-    rb = _bash_metrics(home, db, args)
     rp_data = pm.collect_cycles(db, recipe_filter="code-fix", since=PIN_DAY_BEFORE)
     rp_md = pm.render_markdown(rp_data)
-    assert rb.returncode == 0, rb.stderr
-    assert rb.stdout == rp_md
-    # JSON
-    rj = _bash_metrics(home, db, [*args, "--format", "json"])
-    assert rj.stdout == pm.render_json(rp_data)
-    parsed = json.loads(rj.stdout)
+    assert "run-003-cccccccccccc" in rp_md
+    assert "run-001-aaaaaaaaaaaa" not in rp_md
+    parsed = json.loads(pm.render_json(rp_data))
     assert parsed["totals"]["cycle_count"] == 1
     assert parsed["cycles"][0]["recipe"] == "code-fix"
     assert parsed["recipe_filter"] == "code-fix"
 
 
 # ---------------------------------------------------------------------------
-# (d) --since in the future → 'No cycles in window.' on both sides
+# (d) --since in the future → 'No cycles in window.'
 # ---------------------------------------------------------------------------
 def test_since_future_excludes_all(tmp_path):
     home, db = _scenario(tmp_path)
     _seed_three_cycles(db)
-    args = ["--since", str(PIN_NOW)]
-    rb = _bash_metrics(home, db, args)
     rp_data = pm.collect_cycles(db, recipe_filter="", since=PIN_NOW)
     rp_md = pm.render_markdown(rp_data)
-    assert rb.returncode == 0
-    assert rb.stdout == rp_md
-    assert "_No cycles in window._" in rb.stdout
-    parsed = json.loads(_bash_metrics(home, db, [*args, "--format", "json"]).stdout)
+    assert "_No cycles in window._" in rp_md
+    parsed = json.loads(pm.render_json(rp_data))
     assert parsed["totals"]["cycle_count"] == 0
 
 
 # ---------------------------------------------------------------------------
 # (e) --help → rc=0, stdout contains 'Usage:'
 # ---------------------------------------------------------------------------
-def test_help_parity(tmp_path):
+def test_help(tmp_path):
     home, db = _scenario(tmp_path)
-    rb = _bash_metrics(home, db, ["--help"])
-    assert rb.returncode == 0
-    assert "Usage:" in rb.stdout
-    # port
-    import io
     out, err = io.StringIO(), io.StringIO()
     rc = pm.main(["--help"], stdout=out, stderr=err)
     assert rc == 0
@@ -244,13 +199,8 @@ def test_help_parity(tmp_path):
 # ---------------------------------------------------------------------------
 # (f) unknown flag --bogus → rc=2, stderr contains 'Unknown flag'
 # ---------------------------------------------------------------------------
-def test_unknown_flag_parity(tmp_path):
+def test_unknown_flag(tmp_path):
     home, db = _scenario(tmp_path)
-    rb = _bash_metrics(home, db, ["--bogus"])
-    assert rb.returncode == 2
-    assert "Unknown flag" in rb.stderr
-    # port
-    import io
     out, err = io.StringIO(), io.StringIO()
     rc = pm.main(["--bogus"], stdout=out, stderr=err)
     assert rc == 2
@@ -260,14 +210,10 @@ def test_unknown_flag_parity(tmp_path):
 # ---------------------------------------------------------------------------
 # (g) missing DB → rc=1, stderr contains 'no state.db at'
 # ---------------------------------------------------------------------------
-def test_missing_db_parity(tmp_path):
+def test_missing_db(tmp_path):
     home = tmp_path / "home"; home.mkdir()
     nonexistent = str(home / "no-such.db")
-    rb = _bash_metrics(home, nonexistent, [])
-    assert rb.returncode == 1
-    assert "no state.db at" in rb.stderr
-    # port: feed MINI_ORK_DB via env, point main() at the same nonexistent path
-    import io
+    # port: feed MINI_ORK_DB via env, point main() at the nonexistent path
     old = os.environ.get("MINI_ORK_DB")
     os.environ["MINI_ORK_DB"] = nonexistent
     try:
@@ -283,28 +229,24 @@ def test_missing_db_parity(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# (h) --format json with 3 cycles → JSON byte-equal
+# (h) --format json with 3 cycles
 # ---------------------------------------------------------------------------
-def test_format_json_parity(tmp_path):
+def test_format_json(tmp_path):
     home, db = _scenario(tmp_path)
     _seed_three_cycles(db)
-    args = ["--since", str(PIN_DAY_BEFORE), "--format", "json"]
-    rb = _bash_metrics(home, db, args)
     rp_data = pm.collect_cycles(db, recipe_filter="", since=PIN_DAY_BEFORE)
     rp_json = pm.render_json(rp_data)
-    assert rb.returncode == 0
-    assert rb.stdout == rp_json
-    parsed = json.loads(rb.stdout)
+    parsed = json.loads(rp_json)
     assert parsed["totals"]["cycle_count"] == 3
 
 
 # ---------------------------------------------------------------------------
-# (i) gradient_records missing-table parity → OperationalError branch (try/except)
+# (i) gradient_records missing-table → OperationalError branch (try/except)
 # ---------------------------------------------------------------------------
-def test_missing_gradient_table_parity(tmp_path):
-    """Bash handles 'no such table: gradient_records' via try/except → 0.
+def test_missing_gradient_table(tmp_path):
+    """'no such table: gradient_records' is handled via try/except → 0.
 
-    DROP the table to simulate a pre-0038 DB; both sides must report gradient_count=0.
+    DROP the table to simulate a pre-0038 DB; gradient_count must be 0.
     """
     home, db = _scenario(tmp_path)
     _seed_three_cycles(db)
@@ -315,12 +257,8 @@ def test_missing_gradient_table_parity(tmp_path):
     finally:
         con.close()
 
-    args = ["--since", str(PIN_DAY_BEFORE), "--format", "json"]
-    rb = _bash_metrics(home, db, args)
-    assert rb.returncode == 0, rb.stderr
     rp_data = pm.collect_cycles(db, recipe_filter="", since=PIN_DAY_BEFORE)
     rp_json = pm.render_json(rp_data)
-    assert rb.stdout == rp_json
-    parsed = json.loads(rb.stdout)
+    parsed = json.loads(rp_json)
     assert parsed["totals"]["gradient_count"] == 0
     assert parsed["totals"]["trace_count"] == 4

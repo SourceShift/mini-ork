@@ -1,15 +1,13 @@
-"""Parity gate: mini_ork.cli.traceotter vs bin/mini-ork-traceotter.
+"""Unit tests: mini_ork.cli.traceotter (bash parity halves removed; formerly vs bin/mini-ork-traceotter).
 
-The distill step needs the TraceOtter venv + real runs, so full render parity is
-an integration concern; here we compare the deterministic preflight exit codes
-vs live bash, and unit-check the render functions (transcribed verbatim) against
-a fixture OUT dir.
+The distill step needs the TraceOtter venv + real runs, so full render is an
+integration concern; here we assert the deterministic preflight exit codes and
+unit-check the render functions against a fixture OUT dir.
 """
 from __future__ import annotations
 
 import json
 import os
-import subprocess
 import sys
 from pathlib import Path
 
@@ -17,40 +15,31 @@ REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
 from mini_ork.cli import traceotter as tot
 
-BIN = REPO / "bin" / "mini-ork-traceotter"
 _REAL_PY = Path("/Volumes/docker-ssd/ps/TraceOtter/.venv/bin/python")
 
 
-def _bash(env_extra, mode=None):
-    env = {**os.environ, **env_extra}
-    args = ["bash", str(BIN)] + ([mode] if mode else [])
-    return subprocess.run(args, capture_output=True, text=True, env=env).returncode
-
-
-def test_missing_traceotter_venv_parity(tmp_path):
+def test_missing_traceotter_venv(tmp_path):
     env = {"TRACEOTTER_HOME": str(tmp_path / "nope"), "MINI_ORK_HOME": str(tmp_path / ".mini-ork")}
-    rb = _bash(env)
     old = dict(os.environ); os.environ.update(env)
     try:
         rp = tot.main([])
     finally:
         os.environ.clear(); os.environ.update(old)
-    assert rb == rp == 2
+    assert rp == 2
 
 
-def test_missing_runs_parity(tmp_path):
+def test_missing_runs(tmp_path):
     if not (_REAL_PY.is_file() and os.access(_REAL_PY, os.X_OK)):
         import pytest
         pytest.skip("TraceOtter venv not present")
     home = tmp_path / ".mini-ork"; home.mkdir()   # no runs/ subdir
     env = {"MINI_ORK_HOME": str(home)}             # default TRACEOTTER_HOME (real)
-    rb = _bash(env)
     old = dict(os.environ); os.environ.update(env)
     try:
         rp = tot.main([])
     finally:
         os.environ.clear(); os.environ.update(old)
-    assert rb == rp == 2
+    assert rp == 2
 
 
 def _fixture_out(tmp_path):

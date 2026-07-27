@@ -1,13 +1,11 @@
-"""Parity gate: ``mini_ork.observability.topology_metrics`` vs ``lib/topology_metrics.sh``.
+"""Unit tests: ``mini_ork.observability.topology_metrics`` (bash parity halves removed; formerly vs ``lib/topology_metrics.sh``).
 
-Each test in this module builds a small ``execution_traces`` corpus,
-materialises it into a temp sqlite DB that mirrors the canonical
-``0010_benchmarks.sql`` DDL, then invokes the LIVE bash function via
-``bash -c 'source lib/topology_metrics.sh; measure_topology ...'`` on
-the same DB. The Python port runs against the SAME DB; the test
-asserts float parity to ``1e-6`` and exact string parity.
+Each test builds a small ``execution_traces`` corpus, materialises it into
+a temp sqlite DB that mirrors the canonical ``0010_benchmarks.sql`` DDL,
+then runs the Python port against the same DB. Floats asserted to
+``1e-6``; strings exact.
 
-Cases (eight, above the kickoff's >=6 floor):
+Cases (eight):
 
   (1) measure_rho fallback 0.0 on n=1 trace
   (2) measure_C fallback 0.0 on n=1 trace
@@ -17,36 +15,25 @@ Cases (eight, above the kickoff's >=6 floor):
   (6) rho=1.0 for identical 50-char-head verdicts, rho=0.0 for disjoint
   (7) classify_quadrant pure branch coverage — one case per quadrant
         (8 sub-asserts covering all 8 entries)
-  (8) measure_topology end-to-end vs LIVE bash subprocess (the big one)
-
-Strangler-fig co-existence preserved: ``lib/topology_metrics.sh`` is
-byte-identical before and after this test exists.
-
-Floats must match within ``1e-6``; strings must match exactly. The
-test DOES NOT mock bash, DOES NOT hardcode expected outputs beyond the
-shapes the bash function deterministically produces.
+  (8) measure_topology end-to-end (the big one)
 """
 
 from __future__ import annotations
 
 import json
 import math
-import os
 import re
-import shutil
 import sqlite3
-import subprocess
 import sys
 from pathlib import Path
 
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-LIB_TOPOLOGY_METRICS = REPO_ROOT / "lib" / "topology_metrics.sh"
 sys.path.insert(0, str(REPO_ROOT))
 from mini_ork.observability import topology_metrics as tm
 
-# Float parity tolerance — kickoff requirement.
+# Float tolerance.
 _FLOAT_TOL = 1e-6
 
 # Telemetry id format: 'pt-<panel_run_id[:16]>-<uuid6>'. Match prefix,
@@ -55,12 +42,7 @@ _TELEMETRY_ID_RE = re.compile(r"^pt-(.{0,16})-([0-9a-f]{6})$")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Schemas — minimal DDL echoing the columns bash touches.
-#
-# Verbatim echo of the relevant columns from db/migrations/0010_benchmarks.sql
-# (execution_traces DDL) + 0015_panel_topology_telemetry.sql.
-# A test DB with only these two tables accepts every bash heredoc SQL
-# verbatim.
+# Schemas — minimal DDL echoing the columns the port touches.
 # ─────────────────────────────────────────────────────────────────────────────
 
 _EXEC_TRACES_DDL = """
@@ -83,10 +65,6 @@ CREATE TABLE execution_traces (
 );
 """
 
-# The bash heredoc only INSERTs into the subset of columns it writes:
-# (telemetry_id, panel_run_id, recipe, rho, context_distance,
-#  inductive_distance, agent_count, n_traces, quadrant). target_topology
-# defaults NULL on the migration; our test row mirrors that.
 _PANEL_TOPOLOGY_TELEMETRY_DDL = """
 CREATE TABLE panel_topology_telemetry (
   telemetry_id      TEXT    PRIMARY KEY,
@@ -105,11 +83,11 @@ CREATE TABLE panel_topology_telemetry (
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Helpers — fixture seeding + bash invocation + row-content comparison.
+# Helpers — fixture seeding + row reads.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _init_db(db_path: Path) -> sqlite3.Connection:
-    """Make a fresh temp DB with the two tables bash touches."""
+    """Make a fresh temp DB with the two tables the port touches."""
     db_path.parent.mkdir(parents=True, exist_ok=True)
     con = sqlite3.connect(str(db_path))
     con.executescript(_EXEC_TRACES_DDL + _PANEL_TOPOLOGY_TELEMETRY_DDL)
@@ -129,7 +107,7 @@ def _seed_traces(
     traces: list[dict],
 ) -> None:
     """Insert each trace row. ``trace_id`` must echo ``panel_run_id`` so
-    the bash ``WHERE trace_id LIKE ? OR trace_id LIKE ?`` filter matches."""
+    the ``WHERE trace_id LIKE ? OR trace_id LIKE ?`` filter matches."""
     for t in traces:
         con.execute(
             "INSERT INTO execution_traces "
@@ -150,36 +128,8 @@ def _seed_traces(
     con.commit()
 
 
-def _run_bash_function(
-    db_path: Path,
-    payload: str,
-    env_extra: dict[str, str] | None = None,
-) -> subprocess.CompletedProcess:
-    """Source ``lib/topology_metrics.sh`` and call a function written
-    into ``payload``. ``payload`` is appended verbatim to the source line.
-
-    The function output goes to stdout; bash's ``_topology_ensure_table``
-    runs a migration file lookup that needs ``MINI_ORK_ROOT``. We also
-    set ``MINI_ORK_DB`` to ``db_path`` so the bash functions target our
-    temp DB.
-    """
-    env = os.environ.copy()
-    env["MINI_ORK_DB"] = str(db_path)
-    env["MINI_ORK_ROOT"] = str(REPO_ROOT)
-    if env_extra:
-        env.update(env_extra)
-    src = f'. "{LIB_TOPOLOGY_METRICS}"\n{payload}\n'
-    return subprocess.run(
-        ["bash", "-c", src],
-        cwd=str(REPO_ROOT),
-        env=env,
-        capture_output=True,
-        text=True,
-    )
-
-
-def _read_bash_output_rows(db_path: Path) -> list[dict]:
-    """Read every row bash wrote to ``panel_topology_telemetry``."""
+def _read_output_rows(db_path: Path) -> list[dict]:
+    """Read every row in ``panel_topology_telemetry``."""
     con = sqlite3.connect(str(db_path))
     con.row_factory = sqlite3.Row
     rows = con.execute(
@@ -190,77 +140,13 @@ def _read_bash_output_rows(db_path: Path) -> list[dict]:
     return out
 
 
-def _normalise_telemetry_id(tid: str, panel_run_id: str) -> str:
-    """Replace the random uuid6 suffix with a placeholder so two runs of
-    the same fixture compare equal. The prefix ``pt-<panel_run_id[:16]>-``
-    is part of the public contract and is left intact."""
-    m = _TELEMETRY_ID_RE.match(tid)
-    assert m, f"telemetry_id {tid!r} does not match pt-...-...... shape"
-    prefix_run = m.group(1)
-    assert prefix_run == panel_run_id[:16], (
-        f"telemetry_id prefix drift: got {prefix_run!r}, "
-        f"want {panel_run_id[:16]!r}"
-    )
-    return f"pt-{prefix_run}-<uuid6>"
-
-
-def _assert_row_parity(
-    bash_row: dict,
-    py_row: dict,
-    label: str,
-    panel_run_id: str,
-) -> None:
-    """Diff two ``panel_topology_telemetry`` rows modulo the random uuid."""
-    # String columns — exact.
-    for k in ("panel_run_id", "recipe", "quadrant"):
-        assert bash_row[k] == py_row[k], (
-            f"[{label}] {k} drift: bash={bash_row[k]!r} py={py_row[k]!r}"
-        )
-    # telemetry_id prefix + shape — random uuid6 normalised.
-    assert _normalise_telemetry_id(bash_row["telemetry_id"], panel_run_id) == (
-        _normalise_telemetry_id(py_row["telemetry_id"], panel_run_id)
-    ), (
-        f"[{label}] telemetry_id drift: bash={bash_row['telemetry_id']!r} "
-        f"py={py_row['telemetry_id']!r}"
-    )
-    # Int columns — exact.
-    for k in ("agent_count", "n_traces"):
-        assert int(bash_row[k]) == int(py_row[k]), (
-            f"[{label}] {k} drift: bash={bash_row[k]!r} py={py_row[k]!r}"
-        )
-    # Float columns — close.
-    for k in ("rho", "context_distance", "inductive_distance"):
-        assert math.isclose(
-            float(bash_row[k]), float(py_row[k]), abs_tol=_FLOAT_TOL
-        ), (
-            f"[{label}] {k} drift: bash={bash_row[k]!r} py={py_row[k]!r}"
-        )
-
-
-def _bash_run_metric(
-    fn: str, db_path: Path, panel_run_id: str
-) -> tuple[float, subprocess.CompletedProcess]:
-    """Invoke ``measure_<fn>`` (one of rho/C/I) on the bash side and parse stdout."""
-    proc = _run_bash_function(
-        db_path,
-        f'{fn} "{panel_run_id}"',
-    )
-    assert proc.returncode == 0, (
-        f"bash {fn} rc={proc.returncode} stderr={proc.stderr!r}"
-    )
-    return float(proc.stdout.strip()), proc
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Test fixtures.
 # ─────────────────────────────────────────────────────────────────────────────
 
-PANEL_RUN_ID = "p1abc2def3"
-
-
 def _fresh_panel_run_id(label: str) -> str:
-    """A per-fixture panel_run_id so the two LIKE-patterns in the bash
-    heredoc don't pick up traces from other tests sharing the temp DB."""
+    """A per-fixture panel_run_id so the LIKE-patterns don't pick up traces
+    from other tests sharing the temp DB."""
     # 12-char base + per-label suffix keeps total <=16 so the
     # telemetry_id prefix matches panel_run_id[:16] verbatim.
     return f"p{label}xyz1234"
@@ -271,8 +157,7 @@ def _fresh_panel_run_id(label: str) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def test_measure_rho_single_trace_returns_zero(tmp_path: Path) -> None:
-    """A panel with one trace has no pairwise distance — bash and port
-    both return 0.0 and do not raise."""
+    """A panel with one trace has no pairwise distance → 0.0."""
     db_path = tmp_path / "rho_single.db"
     panel_run_id = _fresh_panel_run_id("rs")
     con = _init_db(db_path)
@@ -282,10 +167,7 @@ def test_measure_rho_single_trace_returns_zero(tmp_path: Path) -> None:
     ])
     _close(con)
 
-    bash_val, _ = _bash_run_metric("measure_rho", db_path, panel_run_id)
     py_val = tm.measure_rho(str(db_path), panel_run_id)
-
-    assert bash_val == 0.0, f"bash measure_rho fallback: {bash_val}"
     assert py_val == 0.0, f"py measure_rho fallback: {py_val}"
 
 
@@ -303,9 +185,7 @@ def test_measure_C_single_trace_returns_zero(tmp_path: Path) -> None:
     ])
     _close(con)
 
-    bash_val, _ = _bash_run_metric("measure_C", db_path, panel_run_id)
     py_val = tm.measure_C(str(db_path), panel_run_id)
-    assert bash_val == 0.0
     assert py_val == 0.0
 
 
@@ -323,25 +203,19 @@ def test_measure_I_single_trace_returns_zero(tmp_path: Path) -> None:
     ])
     _close(con)
 
-    bash_val, _ = _bash_run_metric("measure_I", db_path, panel_run_id)
     py_val = tm.measure_I(str(db_path), panel_run_id, str(REPO_ROOT))
-    assert bash_val == 0.0
     assert py_val == 0.0
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # (4) I=1.0 for two distinct families, I=0.0 for two same-family traces.
-#
-# Build two DBMs from scratch so the bash subprocesses don't see each
-# other's traces. Family canonicalisation: FAMILY_CANON["sonnet"]=anthropic
-# vs FAMILY_CANON["glm"]=zhipu — opposite families.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def test_measure_I_distinct_vs_same_family(tmp_path: Path) -> None:
     panel_run_id_d = _fresh_panel_run_id("id")
     panel_run_id_s = _fresh_panel_run_id("is")
 
-    # distinct-family DB
+    # distinct-family DB (anthropic vs zhipu)
     db_d = tmp_path / "I_distinct.db"
     con = _init_db(db_d)
     _seed_traces(con, [
@@ -363,14 +237,10 @@ def test_measure_I_distinct_vs_same_family(tmp_path: Path) -> None:
     ])
     _close(con)
 
-    bash_d, _ = _bash_run_metric("measure_I", db_d, panel_run_id_d)
     py_d = tm.measure_I(str(db_d), panel_run_id_d, str(REPO_ROOT))
-    assert math.isclose(bash_d, 1.0, abs_tol=_FLOAT_TOL), f"bash I distinct={bash_d}"
     assert math.isclose(py_d, 1.0, abs_tol=_FLOAT_TOL), f"py I distinct={py_d}"
 
-    bash_s, _ = _bash_run_metric("measure_I", db_s, panel_run_id_s)
     py_s = tm.measure_I(str(db_s), panel_run_id_s, str(REPO_ROOT))
-    assert math.isclose(bash_s, 0.0, abs_tol=_FLOAT_TOL), f"bash I same={bash_s}"
     assert math.isclose(py_s, 0.0, abs_tol=_FLOAT_TOL), f"py I same={py_s}"
 
 
@@ -402,23 +272,15 @@ def test_measure_C_disjoint_vs_identical(tmp_path: Path) -> None:
     ])
     _close(con)
 
-    bash_d, _ = _bash_run_metric("measure_C", db_d, panel_run_id_d)
     py_d = tm.measure_C(str(db_d), panel_run_id_d)
-    assert math.isclose(bash_d, 1.0, abs_tol=_FLOAT_TOL), f"bash C disjoint={bash_d}"
     assert math.isclose(py_d, 1.0, abs_tol=_FLOAT_TOL), f"py C disjoint={py_d}"
 
-    bash_s, _ = _bash_run_metric("measure_C", db_s, panel_run_id_s)
     py_s = tm.measure_C(str(db_s), panel_run_id_s)
-    assert math.isclose(bash_s, 0.0, abs_tol=_FLOAT_TOL), f"bash C same={bash_s}"
     assert math.isclose(py_s, 0.0, abs_tol=_FLOAT_TOL), f"py C same={py_s}"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # (6) ρ=1.0 for identical 50-char-head verdicts; ρ=0.0 for disjoint verdicts.
-#
-# The bash heredoc strips+lowercases+head(50) before comparing. Both
-# fixtures use deterministic strings (no intermediate values that could
-# round-half-to-even diverge).
 # ─────────────────────────────────────────────────────────────────────────────
 
 def test_measure_rho_identical_vs_disjoint(tmp_path: Path) -> None:
@@ -451,24 +313,15 @@ def test_measure_rho_identical_vs_disjoint(tmp_path: Path) -> None:
     ])
     _close(con)
 
-    bash_i, _ = _bash_run_metric("measure_rho", db_i, panel_run_id_i)
     py_i = tm.measure_rho(str(db_i), panel_run_id_i)
-    assert math.isclose(bash_i, 1.0, abs_tol=_FLOAT_TOL), f"bash rho identical={bash_i}"
     assert math.isclose(py_i, 1.0, abs_tol=_FLOAT_TOL), f"py rho identical={py_i}"
 
-    bash_d, _ = _bash_run_metric("measure_rho", db_d, panel_run_id_d)
     py_d = tm.measure_rho(str(db_d), panel_run_id_d)
-    assert math.isclose(bash_d, 0.0, abs_tol=_FLOAT_TOL), f"bash rho disjoint={bash_d}"
     assert math.isclose(py_d, 0.0, abs_tol=_FLOAT_TOL), f"py rho disjoint={py_d}"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # (7) classify_quadrant — full branch coverage.
-#
-# Eight sub-asserts, one per quadrant, plus the unclassified sentinel.
-# This is a pure-Python exercise of the port; no bash involved because
-# _topology_quadrant is a private function in bash (would need an
-# indirect invocation). The test pins the mapping per the framework doc.
 # ─────────────────────────────────────────────────────────────────────────────
 
 @pytest.mark.parametrize(
@@ -502,7 +355,6 @@ def test_measure_rho_identical_vs_disjoint(tmp_path: Path) -> None:
         (0.10, 0.30, 0.50, "high_variance_discovery"),
         (0.0,  1.0,  1.0, "high_variance_discovery"),
         # boundary cases that exercise the >= comparison contract.
-        # The bash heredoc uses >= (lines 252-253).
         (0.5, 0.3, 0.5, "submodular_gain_target"),  # exact thresholds → all high
         (0.4999, 0.2999, 0.4999, "noise"),
     ],
@@ -512,11 +364,7 @@ def test_classify_quadrant_branch_coverage(rho, C, I, expected) -> None:
 
 
 def test_classify_quadrant_unknown_safe() -> None:
-    """No 9th quadrant exists in the doc — port must return ``unclassified``
-    for any tuple the bash heredoc's dict lookup can't resolve. With the
-    current threshold grid every (rho, C, I) maps to a key; we synthesise
-    the sentinel by bumping thresholds via the private API."""
-    # Internal sanity: all 8 quadrants are reachable and nothing else.
+    """All 8 quadrants are reachable and nothing else."""
     seen = set()
     for rho in (0.1, 0.9):
         for cc in (0.1, 0.5):
@@ -531,7 +379,7 @@ def test_classify_quadrant_unknown_safe() -> None:
 
 
 def test_family_of_smoke() -> None:
-    """Sanity: FAMILY_CANON mapped verbatim from bash."""
+    """Sanity: FAMILY_CANON mapping."""
     assert tm.family_of("sonnet-v1") == "anthropic"
     assert tm.family_of("opus_lens-v2") == "anthropic"
     assert tm.family_of("glm") == "zhipu"
@@ -541,7 +389,7 @@ def test_family_of_smoke() -> None:
     assert tm.family_of("gemini") == "google"
     assert tm.family_of("minimax") == "minimax"
     assert tm.family_of("minimax_lens") == "minimax"
-    # base="unknown" — not in FAMILY_CANON → returns "unknown" (bash line 217)
+    # base="unknown" — not in FAMILY_CANON → returns "unknown"
     assert tm.family_of("unknown-lane-v1") == "unknown"
     assert tm.family_of(None) == "unknown"
     # lane_to_family override + canonicalisation
@@ -552,17 +400,14 @@ def test_family_of_smoke() -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# (8) measure_topology end-to-end — the BIG one. Live bash subprocess
-# vs Python port on the SAME DB. Row content parity modulo the random
-# uuid6 suffix in ``telemetry_id``.
+# (8) measure_topology end-to-end — the BIG one.
 # ─────────────────────────────────────────────────────────────────────────────
 
-def test_measure_topology_end_to_end_parity(tmp_path: Path) -> None:
+def test_measure_topology_end_to_end(tmp_path: Path) -> None:
     """Build a corpus of three traces spanning (a) two anthropic + one
     zhipu, (b) overlapping but not identical files_read, (c) a long
-    matching reviewer_verdict. Run bash ``measure_topology`` and the
-    Python port on the same DB. Compare the persisted
-    ``panel_topology_telemetry`` rows."""
+    matching reviewer_verdict. Run the port and check the persisted
+    ``panel_topology_telemetry`` row."""
     db_path = tmp_path / "topology_e2e.db"
     panel_run_id = _fresh_panel_run_id("te")
     recipe_name = "code_fix_recipe"
@@ -603,72 +448,29 @@ def test_measure_topology_end_to_end_parity(tmp_path: Path) -> None:
     ])
     _close(con)
 
-    # Bash end-to-end: source + measure_topology. The bash function
-    # internally runs _topology_ensure_table which executes the
-    # migration at MINI_ORK_ROOT/db/migrations/0015_panel_topology_telemetry.sql;
-    # because we already created the table in _init_db, the migration
-    # is a no-op CREATE TABLE IF NOT EXISTS. measure_topology emits
-    # telemetry_id on stdout.
-    bash_proc = _run_bash_function(
-        db_path, f'measure_topology "{panel_run_id}" "{recipe_name}"',
-    )
-    assert bash_proc.returncode == 0, (
-        f"bash measure_topology rc={bash_proc.returncode}\n"
-        f"stderr={bash_proc.stderr!r}"
-    )
-    # ``measure_topology`` internally invokes ``measure_rho`` + ``measure_C``
-    # + ``measure_I`` (each is its own ``python3 - <<PY`` heredoc that prints
-    # the float), THEN the INSERT heredoc that prints the telemetry_id.
-    # The telemetry_id is on the LAST non-empty line of stdout.
-    bash_lines = [ln for ln in bash_proc.stdout.splitlines() if ln.strip()]
-    bash_telemetry_id = bash_lines[-1].strip()
-    assert _TELEMETRY_ID_RE.match(bash_telemetry_id), (
-        f"bash telemetry_id shape drift: {bash_telemetry_id!r} "
-        f"(full stdout={bash_proc.stdout!r})"
-    )
-
-    # Python end-to-end: same DB.
     py_telemetry_id = tm.measure_topology(
         str(db_path), panel_run_id, recipe_name, str(REPO_ROOT),
     )
     assert _TELEMETRY_ID_RE.match(py_telemetry_id), (
         f"py telemetry_id shape drift: {py_telemetry_id!r}"
     )
+    # prefix is the panel_run_id[:16]
+    assert py_telemetry_id.startswith(f"pt-{panel_run_id[:16]}-")
 
-    # Read both rows back. LOOK UP by telemetry_id (not by row order) —
-    # ``ORDER BY telemetry_id`` sorts strings alphabetically, which is
-    # NOT insertion order (u.uids can collide across both invocations).
-    rows = _read_bash_output_rows(db_path)
-    assert len(rows) == 2, f"expected 2 telemetry rows, got {len(rows)}: {rows}"
-    by_tid = {r["telemetry_id"]: r for r in rows}
-    assert bash_telemetry_id in by_tid, (
-        f"bash telemetry_id {bash_telemetry_id!r} not found in DB rows: "
-        f"{list(by_tid)}"
-    )
-    assert py_telemetry_id in by_tid, (
-        f"py telemetry_id {py_telemetry_id!r} not found in DB rows: "
-        f"{list(by_tid)}"
-    )
-    bash_row = by_tid[bash_telemetry_id]
-    py_row = by_tid[py_telemetry_id]
-    assert py_row["telemetry_id"] == py_telemetry_id, (
-        f"py row mismatch: saved {py_row['telemetry_id']!r} "
-        f"vs returned {py_telemetry_id!r}"
-    )
-
-    _assert_row_parity(bash_row, py_row, "e2e", panel_run_id)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# (safety) bash availability preflight.
-# ─────────────────────────────────────────────────────────────────────────────
-
-def test_bash_available() -> None:
-    """The parity tests above rely on a live ``bash`` subprocess; if it's
-    not on PATH we skip the bash-side asserts to keep the test green in
-    degenerate environments."""
-    if shutil.which("bash") is None:
-        pytest.skip("bash not on PATH")
-    assert LIB_TOPOLOGY_METRICS.is_file(), (
-        f"missing lib/topology_metrics.sh at {LIB_TOPOLOGY_METRICS}"
-    )
+    rows = _read_output_rows(db_path)
+    assert len(rows) == 1, f"expected 1 telemetry row, got {len(rows)}: {rows}"
+    row = rows[0]
+    assert row["telemetry_id"] == py_telemetry_id
+    assert row["panel_run_id"] == panel_run_id
+    assert row["recipe"] == recipe_name
+    assert row["agent_count"] == 3
+    assert row["n_traces"] == 3
+    # all three verdicts share the same 50-char head → rho = 1.0
+    assert math.isclose(row["rho"], 1.0, abs_tol=_FLOAT_TOL)
+    # files overlap partially → 0 < C < 1
+    assert 0.0 < row["context_distance"] < 1.0
+    # 2 anthropic + 1 zhipu → some but not all pairs cross families
+    assert 0.0 < row["inductive_distance"] < 1.0
+    # quadrant is consistent with the classify mapping on the stored floats
+    assert row["quadrant"] == tm.classify_quadrant(
+        row["rho"], row["context_distance"], row["inductive_distance"])
