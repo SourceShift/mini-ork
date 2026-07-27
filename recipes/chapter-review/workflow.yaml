@@ -23,12 +23,12 @@ nodes:
 
   # Verifier 1: JSON schema — asserts every required top-level key
   # and every C1..C9 sub-key by name, plus valid JSON syntax.
-  - { name: schema_verifier,       type: verifier, verifier_ref: verifiers/schema.sh,              dispatch_mode: serial }
+  - { name: schema_verifier,       type: verifier, verifier_ref: verifiers/schema.py,              dispatch_mode: serial }
 
   # Verifier 2: Panel completeness — asserts all 4 lens artifacts
   # exist pre-synthesis and that panel_disagreement_score is
   # derivable from the 4 lens score sets.
-  - { name: panel_completeness,    type: verifier, verifier_ref: verifiers/panel-completeness.sh,  dispatch_mode: serial }
+  - { name: panel_completeness,    type: verifier, verifier_ref: verifiers/panel-completeness.py,  dispatch_mode: serial }
 
   # Publisher commits chapter-review.json; rollback recovers on failure.
   - { name: publisher,      type: publisher,   prompt_ref: null, dispatch_mode: serial, gates: [scope_gate] }

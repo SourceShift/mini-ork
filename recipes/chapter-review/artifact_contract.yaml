@@ -1,8 +1,8 @@
 task_class: chapter_review
 expected_artifact: composite     # 4 lens JSONs + 1 synthesis JSON
 success_verifiers:
-  - verifiers/schema.sh
-  - verifiers/panel-completeness.sh
+  - verifiers/schema.py
+  - verifiers/panel-completeness.py
 failure_policy: request_changes
 rollback_policy: >
   Keep the 4 lens score JSONs under runs/<id>/lens-*.json for inspection;

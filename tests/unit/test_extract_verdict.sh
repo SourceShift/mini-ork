@@ -67,7 +67,7 @@ _assert_verdict "empty file" "unknown" ''
 _assert_verdict "nested braces in notes" "pass" \
 '{"verdict": "pass", "notes": ["object literal {a: {b: 1}} handled"]}'
 
-echo "== lens-exists.sh verifier tolerance =="
+echo "== lens-exists.py verifier tolerance =="
 
 RUN_DIR="$TEST_DIR/run"
 mkdir -p "$RUN_DIR"
@@ -75,7 +75,7 @@ printf '# Tiny Lens\n\n- point one\n- point two\n- point three\n' > "$RUN_DIR/le
 printf 'Preamble chatter.\n\n{"verdict": "pass", "notes": []}\n' > "$RUN_DIR/review-tiny_reviewer.json"
 
 if MINI_ORK_RUN_DIR="$RUN_DIR" MINI_ORK_DB="" \
-   bash "$MINI_ORK_ROOT/recipes/obs-smoke/verifiers/lens-exists.sh" > "$TEST_DIR/verifier.out" 2>&1; then
+   python3 "$MINI_ORK_ROOT/recipes/obs-smoke/verifiers/lens-exists.py" > "$TEST_DIR/verifier.out" 2>&1; then
   if grep -q '"review_verdict": true' "$TEST_DIR/verifier.out" \
      && grep -q '"review_json_strict": false' "$TEST_DIR/verifier.out"; then
     _ok "verifier passes preamble review + records strict-parse miss"
@@ -89,7 +89,7 @@ fi
 # Garbage review must still fail
 printf 'no json here at all\n' > "$RUN_DIR/review-tiny_reviewer.json"
 if MINI_ORK_RUN_DIR="$RUN_DIR" MINI_ORK_DB="" \
-   bash "$MINI_ORK_ROOT/recipes/obs-smoke/verifiers/lens-exists.sh" > "$TEST_DIR/verifier2.out" 2>&1; then
+   python3 "$MINI_ORK_ROOT/recipes/obs-smoke/verifiers/lens-exists.py" > "$TEST_DIR/verifier2.out" 2>&1; then
   _fail "verifier accepted verdict-less review"
 else
   _ok "verifier still fails verdict-less review"

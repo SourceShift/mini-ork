@@ -29,8 +29,8 @@ mini-ork init >/dev/null 2>&1
 
 RECIPE_DIR="$MINI_ORK_ROOT/recipes/post-mvp-delivery"
 WORKFLOW="$RECIPE_DIR/workflow.yaml"
-OPTIONS_VERIFIER="$RECIPE_DIR/verifiers/options-completeness.sh"
-DECISION_VERIFIER="$RECIPE_DIR/verifiers/selected-option-gate.sh"
+OPTIONS_VERIFIER="$RECIPE_DIR/verifiers/options-completeness.py"
+DECISION_VERIFIER="$RECIPE_DIR/verifiers/selected-option-gate.py"
 
 cat > "$TMPROOT/kickoff.md" <<'MD'
 # Deliver Post-MVP Admin Console
@@ -165,7 +165,7 @@ Run user-flow and integration tests.
 Pending user choice.
 MD
 
-if bash "$OPTIONS_VERIFIER" >/dev/null 2>&1; then
+if python3 "$OPTIONS_VERIFIER" >/dev/null 2>&1; then
   _ok "options verifier accepts complete options.md"
 else
   _fail "options verifier rejected complete options.md"
@@ -194,7 +194,7 @@ Run user-flow and integration tests.
 Pending user choice.
 MD
 
-if bash "$OPTIONS_VERIFIER" >/dev/null 2>&1; then
+if python3 "$OPTIONS_VERIFIER" >/dev/null 2>&1; then
   _ok "options verifier accepts recommended-default wording from live runs"
 else
   _fail "options verifier rejected recommended-default wording"
@@ -208,7 +208,7 @@ cat > "$MINI_ORK_RUN_DIR/options.md" <<'MD'
 Incomplete package.
 MD
 
-if bash "$OPTIONS_VERIFIER" >/dev/null 2>&1; then
+if python3 "$OPTIONS_VERIFIER" >/dev/null 2>&1; then
   _fail "options verifier accepted incomplete options.md"
 else
   _ok "options verifier rejects incomplete options.md"
@@ -237,7 +237,7 @@ Pending user choice.
 MD
 
 rm -f "$MINI_ORK_RUN_DIR/selected-option.md"
-if bash "$DECISION_VERIFIER" >/dev/null 2>&1; then
+if python3 "$DECISION_VERIFIER" >/dev/null 2>&1; then
   _fail "selected-option gate passed without a user choice"
 else
   _ok "selected-option gate blocks implementation without user choice"
@@ -249,7 +249,7 @@ cat > "$MINI_ORK_RUN_DIR/selected-option.md" <<'MD'
 Option A, because it is the smallest post-MVP delivery with clear validation.
 MD
 
-if bash "$DECISION_VERIFIER" >/dev/null 2>&1; then
+if python3 "$DECISION_VERIFIER" >/dev/null 2>&1; then
   _ok "selected-option gate passes with selected-option.md"
 else
   _fail "selected-option gate rejected selected-option.md"

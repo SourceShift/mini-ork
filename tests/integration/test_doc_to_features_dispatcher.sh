@@ -114,7 +114,7 @@ else
 fi
 
 if MINI_ORK_RUN_DIR="$TMPROOT/pass/run" \
-  bash "$MINI_ORK_ROOT/recipes/doc-to-features-loop/verifiers/per-feature-dispatch-results.sh" >/tmp/doc-features-verifier-pass.log; then
+  python3 "$MINI_ORK_ROOT/recipes/doc-to-features-loop/verifiers/per-feature-dispatch-results.py" >/tmp/doc-features-verifier-pass.log; then
   _ok "aggregate verifier accepts passed child dispatches"
 else
   cat /tmp/doc-features-verifier-pass.log

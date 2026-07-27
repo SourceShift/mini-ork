@@ -33,7 +33,7 @@ nodes:
 
   - name: harness_verifier
     type: verifier
-    verifier_ref: verifiers/harness-shape.sh
+    verifier_ref: verifiers/harness-shape.py
     prompt_ref: null
     dispatch_mode: serial
 

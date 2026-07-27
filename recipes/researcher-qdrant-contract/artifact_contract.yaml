@@ -21,8 +21,8 @@ verdict_schema:
   rule: "pass == (failed_checks == 0)"
 
 success_verifiers:
-  - verifiers/deterministic-checks.sh
-  - verifiers/recipe-validator.sh
+  - verifiers/deterministic-checks.py
+  - verifiers/recipe-validator.py
 
 failure_policy: request_changes
 rollback_policy: >

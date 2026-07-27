@@ -34,6 +34,6 @@ outputs:
     required: true
 
 success_verifiers:
-  - verifiers/draft-completeness.sh
+  - verifiers/draft-completeness.py
 
 risk_class: low

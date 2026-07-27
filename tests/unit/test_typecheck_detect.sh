@@ -10,7 +10,7 @@
 set -uo pipefail
 
 MINI_ORK_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-TYPECHECK="$MINI_ORK_ROOT/recipes/code-fix/verifiers/typecheck.sh"
+TYPECHECK="$MINI_ORK_ROOT/recipes/code-fix/verifiers/typecheck.py"
 
 PASS=0; FAIL=0
 _ok()   { echo "  [OK]   $*"; PASS=$((PASS+1)); }
@@ -45,7 +45,7 @@ EOF
 # verifier's command -v probes.
 MIN_PATH="/usr/bin:/bin"
 
-echo "== typecheck.sh: project-marker gating =="
+echo "== typecheck.py: project-marker gating =="
 
 # (a) empty tmp + fake tsc on PATH → skip(pass), tsc NOT invoked
 T1=$(mktemp -d)
@@ -53,7 +53,7 @@ SENT1="$T1/sentinel"
 B1="$T1/bin"
 _make_fake_tsc "$B1" "$SENT1"
 OUT1=$(cd "$T1" && PATH="$B1:$MIN_PATH" MINI_ORK_HOME="$T1/.mini-ork" \
-       MINI_ORK_RUN_ID="t1-$$" bash "$TYPECHECK" 2>&1) || true
+       MINI_ORK_RUN_ID="t1-$$" python3 "$TYPECHECK" 2>&1) || true
 RC1=$?
 if [ "$RC1" -eq 0 ] \
    && echo "$OUT1" | grep -q '"pass":true' \
@@ -72,7 +72,7 @@ echo '{}' > "$T2/tsconfig.json"
 B2="$T2/bin"
 _make_fake_tsc "$B2" "$SENT2"
 OUT2=$(cd "$T2" && PATH="$B2:$MIN_PATH" MINI_ORK_HOME="$T2/.mini-ork" \
-       MINI_ORK_RUN_ID="t2-$$" bash "$TYPECHECK" 2>&1) || true
+       MINI_ORK_RUN_ID="t2-$$" python3 "$TYPECHECK" 2>&1) || true
 RC2=$?
 if [ "$RC2" -eq 0 ] \
    && [ -f "$SENT2" ] \
@@ -92,7 +92,7 @@ _make_fake_tsc "$B3" "$SENT3"
 OUT3=$(cd "$T3" && PATH="$B3:$MIN_PATH" MINI_ORK_HOME="$T3/.mini-ork" \
        MINI_ORK_RUN_ID="t3-$$" \
        MINI_ORK_TYPECHECK_CMD="echo override-ran > $SENT3" \
-       bash "$TYPECHECK" 2>&1) || true
+       python3 "$TYPECHECK" 2>&1) || true
 RC3=$?
 if [ "$RC3" -eq 0 ] \
    && [ -f "$SENT3" ] \
@@ -110,7 +110,7 @@ printf '[project]\nname = "x"\n' > "$T4/pyproject.toml"
 B4="$T4/bin"
 _make_fake_tsc "$B4" "$SENT4"
 OUT4=$(cd "$T4" && PATH="$B4:$MIN_PATH" MINI_ORK_HOME="$T4/.mini-ork" \
-       MINI_ORK_RUN_ID="t4-$$" bash "$TYPECHECK" 2>&1) || true
+       MINI_ORK_RUN_ID="t4-$$" python3 "$TYPECHECK" 2>&1) || true
 RC4=$?
 if [ "$RC4" -eq 0 ] \
    && echo "$OUT4" | grep -q '"pass":true' \
@@ -128,7 +128,7 @@ printf '[project]\nname = "x"\n' > "$T5/pyproject.toml"
 B5="$T5/bin"
 _make_fake_mypy "$B5" "$SENT5"
 OUT5=$(cd "$T5" && PATH="$B5:$MIN_PATH" MINI_ORK_HOME="$T5/.mini-ork" \
-       MINI_ORK_RUN_ID="t5-$$" bash "$TYPECHECK" 2>&1) || true
+       MINI_ORK_RUN_ID="t5-$$" python3 "$TYPECHECK" 2>&1) || true
 RC5=$?
 if [ "$RC5" -eq 0 ] \
    && echo "$OUT5" | grep -q '"pass":true' \
@@ -146,7 +146,7 @@ printf '[project]\nname = "x"\n\n[tool.mypy]\nstrict = true\n' > "$T6/pyproject.
 B6="$T6/bin"
 _make_fake_mypy "$B6" "$SENT6"
 OUT6=$(cd "$T6" && PATH="$B6:$MIN_PATH" MINI_ORK_HOME="$T6/.mini-ork" \
-       MINI_ORK_RUN_ID="t6-$$" bash "$TYPECHECK" 2>&1) || true
+       MINI_ORK_RUN_ID="t6-$$" python3 "$TYPECHECK" 2>&1) || true
 RC6=$?
 if [ "$RC6" -eq 0 ] \
    && [ -f "$SENT6" ] \

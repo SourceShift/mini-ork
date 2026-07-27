@@ -55,7 +55,7 @@ nodes:
     type: verifier
     model_lane: verifier
     prompt_ref: null
-    verifier_ref: verifiers/deterministic-checks.sh
+    verifier_ref: verifiers/deterministic-checks.py
     dispatch_mode: serial
 
   - name: reviewer
