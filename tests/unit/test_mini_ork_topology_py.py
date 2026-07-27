@@ -870,10 +870,15 @@ def test_bash_available() -> None:
     )
 
 
-def test_python_import_smoke() -> None:
+def test_python_import_smoke(tmp_path, monkeypatch) -> None:
     """The Python port must be importable from REPO_ROOT — catches
     ModuleNotFoundError / SyntaxError without paying the cost of a full
     subprocess invocation."""
+    # main([]) resolves the default db at $MINI_ORK_HOME/state.db — point it
+    # at a tmp home or cmd_summary's ensure_table leaks a partial state.db
+    # into the suite's cwd (this poisoned later web_smoke tests in CI).
+    monkeypatch.setenv("MINI_ORK_HOME", str(tmp_path))
+    monkeypatch.delenv("MINI_ORK_DB", raising=False)
     assert hasattr(mini_ork_topology, "cmd_summary")
     assert hasattr(mini_ork_topology, "cmd_compute")
     assert hasattr(mini_ork_topology, "cmd_backfill")
