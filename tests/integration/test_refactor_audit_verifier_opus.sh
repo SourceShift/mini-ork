@@ -36,7 +36,7 @@ The synthesis cross-references lens-glm, lens-kimi, lens-codex, and
 lens-opus findings before ranking the final recommendations.
 MD
 
-OUT="$(bash "$MINI_ORK_ROOT/recipes/refactor-audit/verifiers/lens-completeness.sh" 2>&1)"
+OUT="$(python3 "$MINI_ORK_ROOT/recipes/refactor-audit/verifiers/lens-completeness.py" 2>&1)"
 RC=$?
 if [ "$RC" -eq 0 ]; then
   _ok "lens-completeness exits 0"

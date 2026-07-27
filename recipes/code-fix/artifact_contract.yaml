@@ -2,8 +2,8 @@ task_class: code_fix
 expected_artifact: patch
 
 success_verifiers:
-  - verifiers/typecheck.sh
-  - verifiers/test.sh
+  - verifiers/typecheck.py
+  - verifiers/test.py
 
 failure_policy: request_changes
 

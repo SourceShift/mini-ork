@@ -9,9 +9,9 @@ description: >
 nodes:
   - { name: planner, type: planner, model_lane: planner, prompt_ref: prompts/planner.md, dispatch_mode: serial, gates: [budget_gate] }
   - { name: implementer, type: implementer, model_lane: worker, prompt_ref: prompts/implementer.md, dispatch_mode: serial, gates: [budget_gate, scope_gate] }
-  - { name: tier1_compile, type: verifier, verifier_ref: verifiers/tier1-compile-typecheck.sh, dispatch_mode: serial }
-  - { name: tier2_unit, type: verifier, verifier_ref: verifiers/tier2-scoped-unit.sh, dispatch_mode: serial }
-  - { name: tier3_property, type: verifier, verifier_ref: verifiers/tier3-property-mutation.sh, dispatch_mode: serial }
+  - { name: tier1_compile, type: verifier, verifier_ref: verifiers/tier1-compile-typecheck.py, dispatch_mode: serial }
+  - { name: tier2_unit, type: verifier, verifier_ref: verifiers/tier2-scoped-unit.py, dispatch_mode: serial }
+  - { name: tier3_property, type: verifier, verifier_ref: verifiers/tier3-property-mutation.py, dispatch_mode: serial }
   # tier4 fans into 4 distinct-family lens nodes — Rajan 2025 submodularity
   # + Nasser 2026 cross-family α=0.042 require heterogeneous panels.
   # Standing directive 2026-06-12: no opus. Panel = glm + kimi + codex + minimax.
@@ -23,7 +23,7 @@ nodes:
   # 2+ tier-4 lens reports caused tier4_synth to hang indefinitely (observed
   # in run-1781333552-17796-identity-and-rbac + run-1781377882-65036-
   # intervention-policies-gate). Default MO_TIER4_QUORUM=3 of 4 lenses.
-  - { name: tier4_quorum,  type: verifier,   verifier_ref: verifiers/tier4-panel-quorum.sh, dispatch_mode: serial }
+  - { name: tier4_quorum,  type: verifier,   verifier_ref: verifiers/tier4-panel-quorum.py, dispatch_mode: serial }
   - { name: tier4_synth,   type: reviewer,   model_lane: reviewer,     prompt_ref: prompts/tier4-panel-synthesizer.md, dispatch_mode: serial, gates: [budget_gate] }
   - { name: reflector, type: reflector, model_lane: reflector, prompt_ref: prompts/reflector.md, dispatch_mode: serial, gates: [budget_gate] }
   - { name: replanner, type: planner, model_lane: planner, prompt_ref: prompts/replanner.md, dispatch_mode: serial, gates: [budget_gate] }

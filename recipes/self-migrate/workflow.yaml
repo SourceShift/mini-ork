@@ -39,7 +39,7 @@ nodes:
     type: verifier
     model_lane: verifier
     prompt_ref: null
-    verifier_ref: verifiers/pre-retirement-parity.sh
+    verifier_ref: verifiers/pre-retirement-parity.py
     dispatch_mode: serial
 
   # ── 3. make Python sole + repoint every inbound ref (codex implements) ──
@@ -55,28 +55,28 @@ nodes:
     type: verifier
     model_lane: verifier
     prompt_ref: null
-    verifier_ref: verifiers/parity.sh
+    verifier_ref: verifiers/parity.py
     dispatch_mode: serial
 
   - name: acceptance_verifier
     type: verifier
     model_lane: verifier
     prompt_ref: null
-    verifier_ref: verifiers/feature-acceptance.sh
+    verifier_ref: verifiers/feature-acceptance.py
     dispatch_mode: serial
 
   - name: ledger_verifier
     type: verifier
     model_lane: verifier
     prompt_ref: null
-    verifier_ref: verifiers/ledger-shape.sh
+    verifier_ref: verifiers/ledger-shape.py
     dispatch_mode: serial
 
   - name: closure_verifier
     type: verifier
     model_lane: verifier
     prompt_ref: null
-    verifier_ref: verifiers/fork-closure.sh
+    verifier_ref: verifiers/fork-closure.py
     dispatch_mode: serial
 
   # ── 5. final judgment: fork fully closed, no dangling edge, ledger complete ──

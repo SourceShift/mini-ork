@@ -1,7 +1,7 @@
 task_class: schema_judge_panel
 expected_artifact: composite
 success_verifiers:
-  - verifiers/panel-completeness.sh
+  - verifiers/panel-completeness.py
 failure_policy: request_changes
 rollback_policy: >
   Keep all five judge reports under runs/<id>/judge-*.md for human inspection.

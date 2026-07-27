@@ -3,7 +3,7 @@ task_class: frontier_llm_research
 expected_artifact: composite
 
 success_verifiers:
-  - verifiers/verify-aggregation.sh
+  - verifiers/verify-aggregation.py
 
 failure_policy: escalate
 rollback_policy: keep_all_source_and_summary_artifacts

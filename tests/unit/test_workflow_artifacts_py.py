@@ -370,10 +370,10 @@ def test_refactor_audit_verifier_requires_anonymous_panel_bundle(tmp_path):
         "\n".join(f"Response {label} supports {label}-1" for label in "ABCDE") + "\n",
         encoding="utf-8",
     )
-    script = REPO / "recipes/refactor-audit/verifiers/lens-completeness.sh"
+    script = REPO / "recipes/refactor-audit/verifiers/lens-completeness.py"
     env = {**os.environ, "MINI_ORK_RUN_DIR": str(tmp_path)}
 
-    missing_panel = subprocess.run(["bash", str(script)], capture_output=True, text=True, env=env)
+    missing_panel = subprocess.run([sys.executable, str(script)], capture_output=True, text=True, env=env)
     assert missing_panel.returncode == 0
     assert json.loads(missing_panel.stdout)["pass"] is False
 
@@ -381,6 +381,6 @@ def test_refactor_audit_verifier_requires_anonymous_panel_bundle(tmp_path):
         "\n".join(f"## Response {label}" for label in "ABCDE") + "\n",
         encoding="utf-8",
     )
-    complete = subprocess.run(["bash", str(script)], capture_output=True, text=True, env=env)
+    complete = subprocess.run([sys.executable, str(script)], capture_output=True, text=True, env=env)
     assert complete.returncode == 0
     assert json.loads(complete.stdout)["pass"] is True

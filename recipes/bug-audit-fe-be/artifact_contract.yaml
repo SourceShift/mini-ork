@@ -1,7 +1,7 @@
 task_class: refactor_audit
 expected_artifact: composite     # 4 lens reports + 1 synthesis markdown
 success_verifiers:
-  - verifiers/lens-completeness.sh
+  - verifiers/lens-completeness.py
 failure_policy: request_changes
 rollback_policy: >
   Keep the 4 lens reports under runs/<id>/lens-*.md for inspection;

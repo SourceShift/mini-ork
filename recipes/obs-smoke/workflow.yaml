@@ -14,7 +14,7 @@ description: >
 nodes:
   # Named *_lens on purpose: the executor's lens heuristic maps node ids
   # ending in _lens to lens-<stem>.md output (here lens-tiny.md), which is
-  # what verifiers/lens-exists.sh and artifact_contract.yaml expect. A
+  # what verifiers/lens-exists.py and artifact_contract.yaml expect. A
   # generic name like tiny_researcher would produce context-<id>.json and
   # fail the lens_exists verifier.
   - name: tiny_lens
@@ -32,7 +32,7 @@ nodes:
   - name: lens_exists
     type: verifier
     prompt_ref: null
-    verifier_ref: verifiers/lens-exists.sh
+    verifier_ref: verifiers/lens-exists.py
     dispatch_mode: serial
 
   - name: publisher

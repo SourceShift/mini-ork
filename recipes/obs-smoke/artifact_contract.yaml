@@ -1,6 +1,6 @@
 # obs-smoke is a telemetry smoke test: its artifacts (lens-tiny.md,
 # review-tiny_reviewer.json, verifier sidecars) live in the run dir and
-# are checked there by verifiers/lens-exists.sh + tests/test_obs_surface.sh.
+# are checked there by verifiers/lens-exists.py + tests/test_obs_surface.sh.
 #
 # outputs[] means "canonical repo paths the publisher copies + git-commits
 # the source_artifact to" (mini_ork/cli/execute.py publisher, D-037). A smoke

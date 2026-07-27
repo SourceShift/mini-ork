@@ -525,7 +525,7 @@ def test_pre_implementer_verifier_does_not_require_final_artifact(tmp_path, monk
     monkeypatch.setattr(ex, "_run_verifier_ref", passing_baseline_verifier)
     workflow = REPO / "recipes" / "self-migrate" / "workflow.yaml"
     rc, fr = ex.dispatch_node(
-        _fields("pre_retirement_parity", "verifier", vref="verifiers/pre-retirement-parity.sh"),
+        _fields("pre_retirement_parity", "verifier", vref="verifiers/pre-retirement-parity.py"),
         root=str(REPO), run_dir=str(rd), plan_path=str(plan), task_class="self_migrate",
         db=db, run_id="r1", dispatch_fn=_fake(""), recipe="self-migrate",
         workflow=str(workflow),
@@ -1268,21 +1268,21 @@ def test_self_migrate_verifier_exit_status_matches_false_json(tmp_path):
     failing_gate.chmod(0o755)
 
     cases = [
-        "pre-retirement-parity.sh",
-        "parity.sh",
-        "feature-acceptance.sh",
-        "ledger-shape.sh",
-        "fork-closure.sh",
+        "pre-retirement-parity.py",
+        "parity.py",
+        "feature-acceptance.py",
+        "ledger-shape.py",
+        "fork-closure.py",
     ]
     for name in cases:
-        run_dir = tmp_path / name.removesuffix(".sh")
+        run_dir = tmp_path / name.removesuffix(".py")
         run_dir.mkdir()
         legacy_entrypoint = target / "bin" / f"mini-ork-{'verify'}"
-        if name == "fork-closure.sh":
+        if name == "fork-closure.py":
             legacy_entrypoint.write_text("#!/usr/bin/env bash\n")
         script = REPO / "recipes" / "self-migrate" / "verifiers" / name
         result = subprocess.run(
-            ["bash", str(script)],
+            [sys.executable, str(script)],
             cwd=target,
             env={
                 **os.environ,
@@ -1314,7 +1314,7 @@ def test_self_migrate_verifier_exit_status_matches_false_json(tmp_path):
         "+    return 0\n"
     )
     ledger_result = subprocess.run(
-        ["bash", str(REPO / "recipes" / "self-migrate" / "verifiers" / "ledger-shape.sh")],
+        [sys.executable, str(REPO / "recipes" / "self-migrate" / "verifiers" / "ledger-shape.py")],
         env={**os.environ, "MINI_ORK_RUN_DIR": str(ledger_run)},
         capture_output=True,
         text=True,

@@ -2,8 +2,8 @@ task_class: post_mvp_delivery
 expected_artifact: options_then_delivery_plan
 
 success_verifiers:
-  - verifiers/options-completeness.sh
-  - verifiers/selected-option-gate.sh
+  - verifiers/options-completeness.py
+  - verifiers/selected-option-gate.py
 
 failure_policy: request_user_choice
 rollback_policy: >

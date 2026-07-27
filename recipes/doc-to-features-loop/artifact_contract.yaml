@@ -2,9 +2,9 @@ task_class: doc_to_features_loop
 expected_artifact: composite
 
 success_verifiers:
-  - verifiers/extraction-completeness.sh
-  - verifiers/arxiv-compliance-check.sh
-  - verifiers/per-feature-dispatch-results.sh
+  - verifiers/extraction-completeness.py
+  - verifiers/arxiv-compliance-check.py
+  - verifiers/per-feature-dispatch-results.py
 
 failure_policy: keep_failure_evidence_replan_or_escalate
 rollback_policy: >

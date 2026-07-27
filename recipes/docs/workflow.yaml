@@ -20,13 +20,13 @@ nodes:
   - name: grep_assert
     type: verifier
     prompt_ref: null
-    verifier_ref: verifiers/grep-assert.sh
+    verifier_ref: verifiers/grep-assert.py
     dispatch_mode: serial
 
   - name: link_verifier
     type: verifier
     prompt_ref: null
-    verifier_ref: verifiers/link-verifier.sh
+    verifier_ref: verifiers/link-verifier.py
     dispatch_mode: serial
 
   - name: publisher

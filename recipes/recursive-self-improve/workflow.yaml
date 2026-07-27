@@ -29,10 +29,10 @@ nodes:
   # via the _lens heuristic; the verifier reads markdown not JSON context.
   - { name: arxiv_lens,          type: researcher,  model_lane: codex_lens,      prompt_ref: prompts/arxiv-researcher.md,     dispatch_mode: parallel, gates: [budget_gate] }
   - { name: opus_synthesizer,    type: reviewer,    model_lane: opus_lens,       prompt_ref: prompts/opus-synthesis.md,       dispatch_mode: serial,   gates: [budget_gate] }
-  - { name: bottlenecks_found,   type: verifier,    verifier_ref: verifiers/bottlenecks-found.sh, dispatch_mode: serial }
+  - { name: bottlenecks_found,   type: verifier,    verifier_ref: verifiers/bottlenecks-found.py, dispatch_mode: serial }
   - { name: implementer,         type: implementer, model_lane: codex_lens,      prompt_ref: prompts/implementer.md,          dispatch_mode: serial,   gates: [scope_gate, budget_gate] }
-  - { name: self_tests_pass,     type: verifier,    verifier_ref: verifiers/self-tests-pass.sh,   dispatch_mode: serial }
-  - { name: no_regression,       type: verifier,    verifier_ref: verifiers/no-regression.sh,     dispatch_mode: serial }
+  - { name: self_tests_pass,     type: verifier,    verifier_ref: verifiers/self-tests-pass.py,   dispatch_mode: serial }
+  - { name: no_regression,       type: verifier,    verifier_ref: verifiers/no-regression.py,     dispatch_mode: serial }
   - { name: publisher,           type: publisher,   prompt_ref: null,                            dispatch_mode: serial,   gates: [scope_gate] }
   - { name: rollback,            type: rollback,    prompt_ref: null,                            dispatch_mode: serial }
 

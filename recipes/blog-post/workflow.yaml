@@ -17,7 +17,7 @@ nodes:
   - { name: audience_lens,   type: researcher, model_lane: opus_lens,      prompt_ref: prompts/lens-audience.md,     dispatch_mode: parallel, gates: [budget_gate] }
   - { name: counter_lens,    type: researcher, model_lane: minimax_lens,   prompt_ref: prompts/lens-counter.md,      dispatch_mode: parallel, gates: [budget_gate] }
   - { name: synthesizer,     type: reviewer,   model_lane: reviewer,       prompt_ref: prompts/synthesis.md,         dispatch_mode: serial,   gates: [budget_gate] }
-  - { name: draft_completeness, type: verifier, verifier_ref: verifiers/draft-completeness.sh, dispatch_mode: serial }
+  - { name: draft_completeness, type: verifier, verifier_ref: verifiers/draft-completeness.py, dispatch_mode: serial }
   - { name: publisher,       type: publisher,  prompt_ref: null, dispatch_mode: serial, gates: [scope_gate] }
   - { name: rollback,        type: rollback,   prompt_ref: null, dispatch_mode: serial }
 

@@ -44,7 +44,7 @@ nodes:
   - name: audit_shape
     type: verifier
     prompt_ref: null
-    verifier_ref: verifiers/audit-shape.sh
+    verifier_ref: verifiers/audit-shape.py
     dispatch_mode: serial
 
   - name: publisher

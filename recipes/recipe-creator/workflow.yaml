@@ -33,7 +33,7 @@ nodes:
 
   # Single combined validator: structure + heterogeneity (≥3 distinct
   # families, HARD per user direction) + dry-run parse.
-  - { name: recipe_validator, type: verifier,    verifier_ref: verifiers/recipe-validator.sh, dispatch_mode: serial }
+  - { name: recipe_validator, type: verifier,    verifier_ref: verifiers/recipe-validator.py, dispatch_mode: serial }
 
   - { name: publisher,        type: publisher,   prompt_ref: null,                          dispatch_mode: serial, gates: [scope_gate] }
   - { name: rollback,         type: rollback,    prompt_ref: null,                          dispatch_mode: serial }

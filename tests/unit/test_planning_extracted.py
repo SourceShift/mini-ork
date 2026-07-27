@@ -137,7 +137,7 @@ def test_recipe_fallback_plan_builds_from_workflow(tmp_path):
         "outputs:\n"
         "  - plan.json\n"
         "success_verifiers:\n"
-        "  - verifiers/test.sh\n"
+        "  - verifiers/test.py\n"
     )
     out = recipe_plan.recipe_fallback_plan("demo", str(workflow), str(tmp_path), "k.md")
     p = json.loads(out)
@@ -146,7 +146,7 @@ def test_recipe_fallback_plan_builds_from_workflow(tmp_path):
     assert p["decomposition"][1]["depends_on"] == ["implement"]
     assert p["dependencies"] == [{"from": "implement", "to": "verify"}]
     assert p["artifact_contract"] == {"outputs": ["plan.json"],
-                                      "success_verifiers": ["verifiers/test.sh"]}
+                                      "success_verifiers": ["verifiers/test.py"]}
     assert p["verifier_contract"]["checks"]  # non-empty → validate_plan ok
     assert plan_schema.validate_plan(out) == "ok"
 
@@ -168,14 +168,14 @@ def test_overlay_plan_applies_recipe_contract(tmp_path):
     recipe = tmp_path / "recipes" / "demo"
     recipe.mkdir(parents=True)
     (recipe / "artifact_contract.yaml").write_text(
-        "outputs:\n  - out.md\nsuccess_verifiers:\n  - verifiers/check.sh\n"
+        "outputs:\n  - out.md\nsuccess_verifiers:\n  - verifiers/check.py\n"
     )
     profile = tmp_path / "profile.json"
     profile.write_text(json.dumps({"recipe": "demo"}))
     out = json.loads(recipe_plan.overlay_plan(json.dumps(_VALID), "code_fix",
                                               str(profile), str(tmp_path)))
     ac = out["artifact_contract"]
-    assert ac["success_verifiers"] == ["verifiers/check.sh"]
+    assert ac["success_verifiers"] == ["verifiers/check.py"]
     assert ac["outputs"] == ["x"]  # setdefault keeps the planner's outputs
     # planner prose verifiers are preserved as acceptance_criteria
     assert ac["acceptance_criteria"] == ["v"]

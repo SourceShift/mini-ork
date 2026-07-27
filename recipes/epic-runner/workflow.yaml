@@ -32,7 +32,7 @@ nodes:
     type: verifier
     model_lane: verifier
     prompt_ref: prompts/epic-verifier.md
-    verifier_ref: verifiers/epic-graph-complete.sh
+    verifier_ref: verifiers/epic-graph-complete.py
     dispatch_mode: serial
 
   - name: final_reviewer

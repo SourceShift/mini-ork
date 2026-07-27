@@ -95,7 +95,7 @@ nodes:
   - name: lens_outputs_complete
     type: verifier
     prompt_ref: null
-    verifier_ref: verifiers/lens_outputs_complete.sh
+    verifier_ref: verifiers/lens_outputs_complete.py
     dispatch_mode: serial
 
   - name: publisher

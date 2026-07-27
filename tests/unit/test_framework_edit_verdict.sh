@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # tests/unit/test_framework_edit_verdict.sh — verifier verdict.json contract.
 # Direct unit coverage for the fix in recipes/framework-edit/verifiers/:
-#   * static-check and test.sh must WRITE $RUN_DIR/verdict.json (not assert
+#   * static-check.py and test.py must WRITE $RUN_DIR/verdict.json (not assert
 #     its pre-existence as a self-defeating gating check).
 #   * Either verifier may run first; the shared helper must merge keys
 #     tolerantly and produce the schema declared in artifact_contract.yaml:
@@ -17,9 +17,9 @@ set -uo pipefail
 MINI_ORK_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 export MINI_ORK_ROOT
 
-STATIC_CHECK="$MINI_ORK_ROOT/recipes/framework-edit/verifiers/static-check.sh"
-TEST_V="$MINI_ORK_ROOT/recipes/framework-edit/verifiers/test.sh"
-HELPER="$MINI_ORK_ROOT/recipes/framework-edit/verifiers/_verdict_merge.sh"
+STATIC_CHECK="$MINI_ORK_ROOT/recipes/framework-edit/verifiers/static-check.py"
+TEST_V="$MINI_ORK_ROOT/recipes/framework-edit/verifiers/test.py"
+HELPER="$MINI_ORK_ROOT/recipes/framework-edit/verifiers/_verdict_merge.py"
 
 PASS=0; FAIL=0
 _ok()   { echo "  [OK]   $*"; PASS=$((PASS+1)); }
@@ -83,31 +83,31 @@ _run_verifier() {
     cd "$repo"
     MINI_ORK_RUN_DIR="$run_dir" \
     MINI_ORK_ROOT="$repo" \
-      bash "$verifier" > "$run_dir/verifier.stdout" 2>&1
+      python3 "$verifier" > "$run_dir/verifier.stdout" 2>&1
   )
 }
 
 echo "== helper sanity =="
 
 # 1) Helper exposes write_verdict
-if grep -qE '^write_verdict\(\)' "$HELPER"; then
-  _ok "_verdict_merge.sh defines write_verdict()"
+if grep -qE '^def write_verdict' "$HELPER"; then
+  _ok "_verdict_merge.py defines write_verdict()"
 else
-  _fail "_verdict_merge.sh missing write_verdict() definition"
+  _fail "_verdict_merge.py missing write_verdict() definition"
 fi
 
-# 2) Static-check sources the helper
-if grep -q '_verdict_merge\.sh' "$STATIC_CHECK"; then
-  _ok "static-check.sh sources _verdict_merge.sh"
+# 2) Static-check imports the helper
+if grep -q '_verdict_merge' "$STATIC_CHECK"; then
+  _ok "static-check.py imports _verdict_merge"
 else
-  _fail "static-check.sh does not source _verdict_merge.sh"
+  _fail "static-check.py does not import _verdict_merge"
 fi
 
-# 3) Test verifier sources the helper
-if grep -q '_verdict_merge\.sh' "$TEST_V"; then
-  _ok "test.sh sources _verdict_merge.sh"
+# 3) Test verifier imports the helper
+if grep -q '_verdict_merge' "$TEST_V"; then
+  _ok "test.py imports _verdict_merge"
 else
-  _fail "test.sh does not source _verdict_merge.sh"
+  _fail "test.py does not import _verdict_merge"
 fi
 
 # 4) Neither verifier asserts verdict.json pre-existence anymore
@@ -124,11 +124,12 @@ else
   _fail "at least one verifier never calls write_verdict"
 fi
 
-# 6) bash -n on all four touched files
-if bash -n "$HELPER" "$STATIC_CHECK" "$TEST_V" "${BASH_SOURCE[0]}" 2>/dev/null; then
-  _ok "bash -n clean on helper + static-check + test + this test"
+# 6) py_compile on the three ported files + bash -n on this test
+if python3 -m py_compile "$HELPER" "$STATIC_CHECK" "$TEST_V" \
+   && bash -n "${BASH_SOURCE[0]}" 2>/dev/null; then
+  _ok "py_compile clean on helper + static-check + test; bash -n clean on this test"
 else
-  _fail "bash -n reported a syntax error"
+  _fail "py_compile/bash -n reported a syntax error"
 fi
 
 echo

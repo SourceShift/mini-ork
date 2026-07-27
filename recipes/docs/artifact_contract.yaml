@@ -2,14 +2,14 @@ task_class: docs
 expected_artifact: doc_patch
 
 success_verifiers:
-  - verifiers/grep-assert.sh
-  - verifiers/link-verifier.sh
+  - verifiers/grep-assert.py
+  - verifiers/link-verifier.py
 
 failure_policy: request_changes
 
 rollback_policy: >
   git restore --source=HEAD -- <changed-doc>
   if either verifier fails after 2 iterations. Triggered manually by
-  the operator on rc != 0 from grep-assert.sh or link-verifier.sh.
+  the operator on rc != 0 from grep-assert.py or link-verifier.py.
   No automated rollback node (docs edits are surgical + reversible
   via git restore, no need for a recipe-side rollback dispatcher).

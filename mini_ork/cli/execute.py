@@ -1107,6 +1107,18 @@ def _verifier_runs_before_implementer(workflow, node_id) -> bool:
     return current < first_implementer
 
 
+def _verifier_argv(script):
+    """Extension-native verifier dispatch: ``.py`` runs under the current
+    interpreter; ``.sh`` keeps working via bash (user-facing contract) with a
+    one-line deprecation warning; anything else keeps legacy bash behavior."""
+    if script.endswith(".py"):
+        return [sys.executable, script]
+    if script.endswith(".sh"):
+        print(f"warning: verifier '{script}' is a bash script — .sh verifiers are deprecated, port to .py",
+              file=sys.stderr)
+    return ["bash", script]
+
+
 def _run_verifier_ref(script, evidence_path, *, plan_path="", artifact_path="", cwd=None):
     """Port of _run_verifier_ref (minus the mo_runtime_exec seam): run the
     verifier script, capture evidence, and treat {"pass": true} as success."""
@@ -1122,7 +1134,7 @@ def _run_verifier_ref(script, evidence_path, *, plan_path="", artifact_path="", 
     # outer CLI process to have populated it.
     verifier_env.setdefault("MINI_ORK_RUN_DIR", os.path.dirname(evidence_path))
     with open(evidence_path, "wb") as fh:
-        rc = subprocess.run(["bash", script], cwd=cwd, stdout=fh, stderr=subprocess.STDOUT,
+        rc = subprocess.run(_verifier_argv(script), cwd=cwd, stdout=fh, stderr=subprocess.STDOUT,
                             env=verifier_env).returncode
     if not os.path.getsize(evidence_path):
         open(evidence_path, "w").write(f"vacuous pass: verifier exited {rc} but wrote no evidence")
@@ -2419,13 +2431,13 @@ def _handle_verifier(ctx: NodeDispatch):
             return 1, "error"
         ev_dir = os.path.join(os.environ.get("MINI_ORK_RUN_DIR", ctx.run_dir), "evidence")
         os.makedirs(ev_dir, exist_ok=True)
-        ev = os.path.join(ev_dir, os.path.basename(ctx.verifier_ref).replace(".sh", "") + ".log")
+        ev = os.path.join(ev_dir, os.path.basename(ctx.verifier_ref).replace(".sh", "").replace(".py", "") + ".log")
         rc = _run_verifier_ref(script, ev, plan_path=ctx.plan_path, artifact_path=artifact)
         # F2-B: persist evidence to verifier_<stem>.json (bash :2886-2888) so the
         # reviewer input assembly can read the typecheck/test verdicts. Before the
         # rc return so failures are visible too (a missing verifier is real signal).
         vstem = ctx.verifier_ref[len("verifiers/"):] if ctx.verifier_ref.startswith("verifiers/") else ctx.verifier_ref
-        vstem = vstem[:-3] if vstem.endswith(".sh") else vstem
+        vstem = vstem[:-3] if vstem.endswith((".sh", ".py")) else vstem
         persist_dir = os.environ.get("MINI_ORK_RUN_DIR", ctx.run_dir)
         if persist_dir and os.path.isfile(ev) and os.path.getsize(ev) > 0:
             try:
