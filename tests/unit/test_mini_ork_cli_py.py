@@ -80,6 +80,11 @@ def test_version_help_and_unknown_golden_contract():
     assert help_run.returncode == 0
     assert help_run.stdout == cli._HELP
     assert help_run.stderr == ""
+    assert "Provider credentials:\n" in help_run.stdout
+    assert "providers status <lane>" in help_run.stdout
+    assert "providers configure <lane>" in help_run.stdout
+    assert "providers configure --workflow <path>" in help_run.stdout
+    assert "keys never use CLI flags" in help_run.stdout
 
     unknown = _launcher("bogus")
     assert unknown.returncode == 2
