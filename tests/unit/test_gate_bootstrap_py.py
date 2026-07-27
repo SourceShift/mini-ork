@@ -1,23 +1,24 @@
-"""Parity gate: mini_ork.gates.gate_bootstrap vs lib/gate_bootstrap.sh.
+"""Standalone unit tests for ``mini_ork.gates.gate_bootstrap``.
 
-Live bash invocation via subprocess + direct Python import. Compares the final
-row content of the gate_registry table on fresh temp DBs seeded via db/init.sh.
-Row-set equality via sha256 of the sorted row dump — UUID gate_ids generated
-during the bash intermediate steps are non-deterministic across processes, so
-the comparison contract is the post-rename oracle-* rows only.
+Replaces the bash-parity gate (against ``lib/gate_bootstrap.sh``) as part
+of the bash→Python migration: the Python port is now the sole
+implementation, so its coverage no longer runs ``lib/gate_bootstrap.sh``
+in a subprocess — it asserts the port's behaviour directly. The legacy
+script-path backward-compat case seeds the ``<root>/gates/<name>.sh``
+condition rows directly via SQL (the exact rows the bash bootstrap used to
+write) instead of executing the bash bootstrap.
 
-WS4 note: the Python bootstrap now seeds ``native:<name>`` sentinel
-conditions (the registry maps them to in-process evaluators), while the
-bash bootstrap still seeds ``<root>/gates/<name>.sh`` script paths. The
-cross-implementation row parity test therefore compares every column
-EXCEPT ``condition`` and asserts each side's condition shape separately.
+Contract pinned here: cold bootstrap registers the 5 stable oracle-* ids
+with ``native:<name>`` sentinel conditions, warm bootstrap is idempotent,
+task_class_filter is SQL NULL, the safety distribution is 4×safety=1 +
+1×safety=0 (stability), fail-open rc=0 on missing db/root, and both
+native-sentinel and legacy script-path conditions evaluate through the
+native evaluators without executing any gate-condition bash script.
 """
 from __future__ import annotations
 
 import hashlib
-import os
 import sqlite3
-import subprocess
 import sys
 import time
 from pathlib import Path
@@ -26,9 +27,8 @@ import pytest
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
-from mini_ork.gates import gate_bootstrap as gb
-
-GB_SH = REPO / "lib" / "gate_bootstrap.sh"
+from mini_ork.gates import gate_bootstrap as gb  # noqa: E402
+from mini_ork.stores import migrate as mig  # noqa: E402
 
 
 EXPECTED_STABLE_IDS = {
@@ -44,11 +44,8 @@ EXPECTED_STABLE_IDS = {
 def db(tmp_path_factory):
     home = tmp_path_factory.mktemp("home")
     dbp = str(home / "state.db")
-    subprocess.run(
-        ["bash", str(REPO / "db" / "init.sh")],
-        env={**os.environ, "MINI_ORK_HOME": str(home), "MINI_ORK_DB": dbp},
-        capture_output=True, text=True, check=True,
-    )
+    rc, out, err = mig.init_db(db=dbp, root=str(REPO))
+    assert rc == 0, f"init_db failed:\n{out}\n{err}"
     return dbp
 
 
@@ -66,8 +63,7 @@ def _row_dump(db: str) -> list[tuple]:
 
 
 def _shape_dump(db: str) -> list[tuple]:
-    """Row shape excluding registered_at (process-clock-dependent across
-    subprocess boundaries; the load-bearing contract is id/type/cond/tcf/safety/active)."""
+    """Row shape excluding registered_at (process-clock-dependent)."""
     return [r[:-1] for r in _row_dump(db)]
 
 
@@ -76,48 +72,14 @@ def _dump_hash(db: str) -> str:
     return hashlib.sha256(canon.encode()).hexdigest()
 
 
-def _bash_bootstrap(db: str, *, root: str | None = None,
-                    extra_env: dict | None = None) -> int:
-    env = {**os.environ, "MINI_ORK_DB": db}
-    if root is not None:
-        env["MINI_ORK_ROOT"] = root
-    if extra_env:
-        env.update(extra_env)
-    env.pop("MINI_ORK_ROOT", None) if root is None else None
-    cmd = f'. "{GB_SH}" && mo_bootstrap_oracle_gates; echo "RC=$?"'
-    r = subprocess.run(["bash", "-c", cmd], env=env,
-                       capture_output=True, text=True)
-    last = r.stdout.strip().splitlines()[-1] if r.stdout.strip() else ""
-    try:
-        return int(last.split("=", 1)[1])
-    except (IndexError, ValueError):
-        return r.returncode
-
-
-def test_cold_bash_registers_five_oracle_gates(db):
-    rc = _bash_bootstrap(db, root=str(REPO))
-    assert rc == 0
-    ids = {r[0] for r in _row_dump(db)}
-    assert ids == EXPECTED_STABLE_IDS
-
-
-def test_cold_python_registers_five_oracle_gates(db):
+def test_cold_registers_five_oracle_gates(db):
     rc = gb.bootstrap_oracle_gates(db=db, root=str(REPO))
     assert rc == 0
     ids = {r[0] for r in _row_dump(db)}
     assert ids == EXPECTED_STABLE_IDS
 
 
-def test_warm_bash_idempotent(db):
-    assert _bash_bootstrap(db, root=str(REPO)) == 0
-    h1 = _dump_hash(db)
-    assert _bash_bootstrap(db, root=str(REPO)) == 0
-    h2 = _dump_hash(db)
-    assert h1 == h2
-    assert len(_row_dump(db)) == 5
-
-
-def test_warm_python_idempotent(db):
+def test_warm_idempotent(db):
     assert gb.bootstrap_oracle_gates(db=db, root=str(REPO)) == 0
     h1 = _dump_hash(db)
     assert gb.bootstrap_oracle_gates(db=db, root=str(REPO)) == 0
@@ -126,41 +88,20 @@ def test_warm_python_idempotent(db):
     assert len(_row_dump(db)) == 5
 
 
-def test_bash_vs_python_row_parity(db):
-    """Cross-implementation parity modulo the condition column.
-
-    WS4: python seeds native:<name> sentinels; bash seeds script paths.
-    The load-bearing contract (ids, gate_type, task_class_filter, safety,
-    active) must still match exactly; the condition column is asserted
-    per-side against its expected shape.
-    """
-    db_bash = db
-    db_py = db + ".py"
-    import shutil
-    shutil.copyfile(db_bash, db_py)
-    assert _bash_bootstrap(db_bash, root=str(REPO)) == 0
-    assert gb.bootstrap_oracle_gates(db=db_py, root=str(REPO)) == 0
-
-    def _without_condition(rows):
-        # (gate_id, gate_type, condition, tcf, safety, active, registered_at)
-        return sorted((r[0], r[1], r[3], r[4], r[5]) for r in rows)
-
-    bash_rows = _row_dump(db_bash)
-    py_rows = _row_dump(db_py)
-    assert _without_condition(bash_rows) == _without_condition(py_rows), (
-        bash_rows, py_rows,
-    )
-    # Per-side condition shape.
-    for r in bash_rows:
-        assert r[2].startswith(f"{REPO}/gates/") and r[2].endswith(".sh"), r
-    for r in py_rows:
+def test_native_condition_shape_and_registered_at(db):
+    """Post-bootstrap rows carry native:<name> sentinel conditions (the
+    WS4 contract) and a sane registered_at clock value."""
+    assert gb.bootstrap_oracle_gates(db=db, root=str(REPO)) == 0
+    rows = _row_dump(db)
+    assert len(rows) == 5
+    for r in rows:
         assert r[2].startswith("native:"), r
-    assert {r[2] for r in py_rows} == {
+    assert {r[2] for r in rows} == {
         "native:coalition", "native:panel-health", "native:synthesis-promote",
         "native:stability", "native:liveness",
     }
     now = int(time.time())
-    for r in bash_rows + py_rows:
+    for r in rows:
         assert now - 60 <= r[-1] <= now + 1, f"registered_at drift: {r}"
 
 
@@ -188,14 +129,28 @@ def test_native_conditions_evaluate_without_bash(db, tmp_path):
 
 
 def test_legacy_script_path_conditions_still_evaluate_natively(db):
-    """Backward-compat for live DBs: rows registered by the BASH bootstrap
-    (script-path conditions) evaluate through the native evaluators in the
-    Python registry — the .sh shim is never executed."""
+    """Backward-compat for live DBs: rows with the script-path conditions
+    the BASH bootstrap used to register evaluate through the native
+    evaluators in the Python registry — the .sh shim is never executed.
+    The rows are seeded directly (same shape the bash bootstrap wrote)."""
     from mini_ork.gates import gate_registry as gr
 
-    assert _bash_bootstrap(db, root=str(REPO)) == 0
+    # Bootstrap first (creates the table + rows), then rewrite the
+    # conditions to the legacy script paths the bash bootstrap wrote.
+    assert gb.bootstrap_oracle_gates(db=db, root=str(REPO)) == 0
+    names = ("coalition", "panel-health", "synthesis-promote",
+             "stability", "liveness")
+    con = sqlite3.connect(db)
+    for name in names:
+        con.execute(
+            "UPDATE gate_registry SET condition=? WHERE gate_id=?",
+            (f"{REPO}/gates/{name}.sh", f"oracle-{name}"),
+        )
+    con.commit()
+    con.close()
+
     rows = _row_dump(db)
-    assert all(r[2].endswith(".sh") for r in rows)  # bash-seeded paths
+    assert all(r[2].endswith(".sh") for r in rows)  # legacy bash-seeded paths
     ctx = ('{"panel_run_id":"run-no-traces","recipe":"code-fix",'
            '"task_class":"code_fix","current_round":1}')
     summary = gr.gate_run_all(db, "code_fix", ctx, mini_ork_root=str(REPO))
@@ -243,38 +198,12 @@ def test_safety_distribution(db):
 
 
 def test_db_unset_returns_zero_no_file_created(tmp_path):
-    target = tmp_path / "must_not_appear.db"
-    env = {k: v for k, v in os.environ.items()
-           if k not in {"MINI_ORK_DB", "MINI_ORK_ROOT"}}
-    r = subprocess.run(
-        ["bash", "-c",
-         f'. "{GB_SH}" && mo_bootstrap_oracle_gates; echo "RC=$?"'],
-        env=env, capture_output=True, text=True,
-    )
-    last = r.stdout.strip().splitlines()[-1] if r.stdout.strip() else "RC=-1"
-    assert last.startswith("RC=0")
-    assert not target.exists()
-
     rc_py = gb.bootstrap_oracle_gates(db=None, root=str(REPO))
     assert rc_py == 0
     assert not (tmp_path / "state.db").exists()
 
 
-def test_registry_sh_missing_bash_returns_zero(db, tmp_path):
-    """Bash fail-open: when lib/gate_registry.sh can't be sourced (root points
-    to a dir that lacks it), the function returns 0 without writing anything."""
-    fake_root = tmp_path / "fake_root"
-    fake_root.mkdir()
-    rc = _bash_bootstrap(db, root=str(fake_root))
-    assert rc == 0
-    try:
-        rows = _row_dump(db)
-        assert rows == []
-    except sqlite3.OperationalError:
-        pass
-
-
-def test_root_missing_python_returns_zero(db):
+def test_root_missing_returns_zero(db):
     rc = gb.bootstrap_oracle_gates(db=db, root="")
     assert rc == 0
     try:
