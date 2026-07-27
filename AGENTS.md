@@ -17,8 +17,8 @@ This file is the canonical context map. Detail lives in `docs/`; procedural know
 ## Working in this repo
 
 - Entrypoint: `bin/mini-ork <subcommand>`
-- Python runtime is live; set `MINI_ORK_RUNTIME=bash` to use legacy bash entrypoints.
-- Path contract: `lib/paths.sh` resolves `ENGINE_ROOT`, `PROJECT_HOME`, `TARGET_REPO`.
+- Python runtime is the only runtime (bash entrypoints removed in the 2026-07 bash-removal; see `docs/plans/2026-07-26-bash-removal-plan.md`).
+- Path contract: `mini_ork.context.RunContext` resolves `MINI_ORK_ROOT`/`MINI_ORK_HOME`/`MINI_ORK_DB` (formerly `lib/paths.sh`).
 - `mini-ork init` scaffolds `.mini-ork/` and writes a committed `.mini-ork/engine` pointer.
 
 ## Dev loop — worktree first
@@ -54,7 +54,7 @@ mini-ork garden              # drift detection
 ```
 
 CI mirrors these: `.github/workflows/ci.yml` runs ruff (blocking + advisory
-tiers), pytest on 3.11/3.12, shellcheck, and the bash test layers;
+tiers), pytest on 3.11/3.12 (sharded), UI typecheck, and web smoke;
 `.github/workflows/release.yml` re-runs the blocking lint + a unit-layer
 pytest smoke before building release artifacts.
 
@@ -62,7 +62,7 @@ pytest smoke before building release artifacts.
 
 - Recipes: add a directory under `recipes/` with `task_class.yaml`, `workflow.yaml`, `artifact_contract.yaml`.
 - Providers: add entries to `config/providers.yaml` and env vars to `config/secrets.local.sh`.
-- Gates: add a script under `gates/` and register it in `lib/gate_registry.sh`.
+- Gates: register an evaluator via `mini_ork.gates.gate_registry.register_gate_evaluator(type, fn)`.
 
 ### Python runtime registries (SOLID refactor, 2026-07)
 
