@@ -1,6 +1,8 @@
 """Contracts for the artifact-led prompt graph summary recipe."""
 from __future__ import annotations
 
+import sys
+
 import json
 import os
 import subprocess
@@ -99,7 +101,7 @@ def test_graph_contract_verifier_writes_a_receipt(tmp_path):
     )
 
     result = subprocess.run(
-        ["bash", str(RECIPE / "verifiers" / "graph-contract.sh")],
+        [sys.executable, str(RECIPE / "verifiers" / "graph-contract.py")],
         capture_output=True,
         text=True,
         env={**os.environ, "MINI_ORK_RUN_DIR": str(tmp_path)},
@@ -121,7 +123,7 @@ def test_human_feedback_gate_blocks_summary_finalization_when_a_human_requests_r
     )
 
     result = subprocess.run(
-        ["bash", str(RECIPE / "verifiers" / "human-decision.sh")],
+        [sys.executable, str(RECIPE / "verifiers" / "human-decision.py")],
         capture_output=True,
         text=True,
         env={**os.environ, "MINI_ORK_RUN_DIR": str(tmp_path)},
@@ -143,7 +145,7 @@ def test_human_feedback_gate_accepts_an_approved_durable_decision(tmp_path):
     )
 
     result = subprocess.run(
-        ["bash", str(RECIPE / "verifiers" / "human-decision.sh")],
+        [sys.executable, str(RECIPE / "verifiers" / "human-decision.py")],
         capture_output=True,
         text=True,
         env={**os.environ, "MINI_ORK_RUN_DIR": str(tmp_path)},
