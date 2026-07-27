@@ -54,7 +54,8 @@ help:
 install-hooks:
 	@git config core.hooksPath .githooks
 	@chmod +x .githooks/pre-push 2>/dev/null || true
-	@chmod +x scripts/readme-claim-check.sh \
+	@chmod +x scripts/readme_claim_check.py \
+	          scripts/mini_ork_worktree.py \
 	          scripts/readme-drift-gatekeeper.sh \
 	          scripts/readme-drift-panel.sh 2>/dev/null || true
 	@echo "✓ hooks installed: core.hooksPath = .githooks"
@@ -66,6 +67,8 @@ uninstall-hooks:
 	@git config --unset core.hooksPath 2>/dev/null || true
 	@echo "✓ hooks dir reset to git default"
 
+# TODO(bash-removal): scripts/install-system-deps.sh is still bash; port it to
+# Python (or fold it into scripts/full_install.py) and retarget this recipe.
 install-system-deps:
 	@bash scripts/install-system-deps.sh
 
@@ -94,21 +97,23 @@ lint-advisory:
 # ── worktree-first dev ───────────────────────────────────────────────────────
 worktree:
 	@[ -n "$(SLUG)" ] || { echo "usage: make worktree SLUG=<slug> [OWNS=\"path1 path2\"]"; exit 1; }
-	@bash scripts/mini-ork-worktree.sh create "$(SLUG)" $(if $(OWNS),$(foreach p,$(OWNS),--owns $(p)),)
+	@$(PYTHON) scripts/mini_ork_worktree.py create "$(SLUG)" $(if $(OWNS),$(foreach p,$(OWNS),--owns $(p)),)
 
 worktree-merge:
-	@bash scripts/mini-ork-worktree.sh merge $(SLUG)
+	@$(PYTHON) scripts/mini_ork_worktree.py merge $(SLUG)
 
 worktree-clean:
 	@[ -n "$(SLUG)" ] || { echo "usage: make worktree-clean SLUG=<slug>"; exit 1; }
-	@bash scripts/mini-ork-worktree.sh clean "$(SLUG)"
+	@$(PYTHON) scripts/mini_ork_worktree.py clean "$(SLUG)"
 
 worktree-list:
-	@bash scripts/mini-ork-worktree.sh list
+	@$(PYTHON) scripts/mini_ork_worktree.py list
 
 readme-claim-check:
-	@bash scripts/readme-claim-check.sh
+	@$(PYTHON) scripts/readme_claim_check.py
 
+# TODO(bash-removal): the drift panel/gatekeeper stay bash for now (LLM panel
+# tools; the ported pre-push hook still calls them). Port + retarget later.
 readme-drift-panel:
 	@bash scripts/readme-drift-panel.sh
 
@@ -135,7 +140,7 @@ web-build:
 
 web-serve:
 	@command -v python3 >/dev/null || { echo "python3 not on PATH"; exit 1; }
-	@bash bin/mini-ork-serve --port $(PORT)
+	@$(PYTHON) bin/mini-ork serve --port $(PORT)
 
 web-dev:
 	@cd ui && (command -v pnpm >/dev/null && pnpm dev || npm run dev)
@@ -170,7 +175,7 @@ web-up:
 	done
 	@echo "→ booting API on :$(PORT) (reload) + Vite dev on :$(UI_PORT) (Ctrl-C stops both)"
 	@trap 'kill 0' INT TERM; \
-	  ( bash bin/mini-ork-serve --port $(PORT) --reload 2>&1 | sed 's/^/[api] /' ) & \
+	  ( $(PYTHON) bin/mini-ork serve --port $(PORT) --reload 2>&1 | sed 's/^/[api] /' ) & \
 	  ( cd ui && (command -v pnpm >/dev/null && pnpm dev || npm run dev) 2>&1 | sed 's/^/[ui]  /' ) & \
 	  wait
 
@@ -180,8 +185,6 @@ dev-all: web-up
 
 web-test:
 	@python3 -m pytest tests/test_web_smoke.py tests/test_otel_export.py -v
-	@bash tests/test_self_improve_outcome.sh
-	@MINI_ORK_OBS_SMOKE_DRY=1 bash tests/test_obs_surface.sh
-	@echo ""
-	@echo "↑ for full LLM-using obs validation (~\$$0.05-\$$0.15):"
-	@echo "  bash tests/test_obs_surface.sh"
+	# NOTE(bash-removal): the legacy bash obs smoke layers
+	# (tests/test_self_improve_outcome.sh, tests/test_obs_surface.sh) were
+	# retired; the pytest modules above are the observability gate now.

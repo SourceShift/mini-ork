@@ -207,7 +207,6 @@ def _bandit_pool(con, train, min_samples, ucb_c):
               t["code_region"])].add(t["agent_version_id"])
     pool = defaultdict(list)
     cols_d = _detect_cols(con, "lane_domain_advantage")
-    cols_r = _detect_cols(con, "lane_region_advantage")
     if "z_score_advantage" not in cols_d:
         return pool
 
