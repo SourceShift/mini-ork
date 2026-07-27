@@ -2402,10 +2402,16 @@ def _handle_verifier(ctx: NodeDispatch):
     if not artifact:
         # NEW-1: bash (:2899-2902) warns + sets error finish_reason but does NOT
         # return 1 — a verifier node with no artifact_contract outputs does not
-        # fail the run. Return rc 0 to match (finish_reason error is informational).
+        # fail the run. Return rc 0 to match.
+        # 2026-07-27: the "informational" finish_reason='error' on a SUCCEEDED
+        # node is dropped. Consumers of run_events (the libwit DSP live-feed
+        # poller, run-miniork-agent.cjs) map finish_reason='error' to node
+        # failure, so every verifier node on a recipe with outputs:[] rendered
+        # as "failed / needs another attempt" even though it succeeded and the
+        # standalone verify phase passed. Success must report success; the warn
+        # line above keeps the diagnostic without poisoning machine consumers.
         print("  [warn] verifier node: no outputs in artifact_contract")
-        rc, finish_reason = _publish_success()
-        return (rc, "error") if rc == 0 else (rc, finish_reason)
+        return _publish_success()
     if ctx.verifier_ref and ctx.recipe_dir:
         script = os.path.join(ctx.recipe_dir, ctx.verifier_ref)
         if not os.path.isfile(script):
