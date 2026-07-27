@@ -19,10 +19,11 @@ Faithful port of the three public bash functions in
                                   ``blog-post``, ``ui-audit``,
                                   ``ops-runbook``). Three-condition
                                   conjunction (panel score, CW-POR, ≥1
-                                  structural signal). Soft-dep on
-                                  ``lib/cw_por.sh`` via subprocess
-                                  shell-out so the gate never raises
-                                  when W1-C is missing.
+                                  structural signal). Soft-dep on CW-POR via
+                                  the native ``mini_ork.gates.cw_por`` port
+                                  (WS4 — was a ``lib/cw_por.sh`` subprocess
+                                  shell-out) so the gate never raises when
+                                  the compute errors.
 
 Co-existence model (strangler-fig): ``lib/promotion_gate.sh`` stays
 byte-identical. This port gives Python callers an in-process target and
@@ -63,15 +64,16 @@ caching):
     MO_MIN_FINDING_CARDINALITY       → min finding cardinality (default 5)
     MO_DETERMINISTIC_TASK_CLASSES    → space-separated bypass list
                                         (default "code_fix db_migration")
-    MINI_ORK_ROOT                    → where to find ``lib/cw_por.sh`` for the
-                                        soft subprocess dep
+    MINI_ORK_ROOT                    → legacy: where to find ``lib/cw_por.sh``
+                                        (WS4: CW-POR is computed natively via
+                                        ``mini_ork.gates.cw_por``; the env var
+                                        is no longer consulted on this path)
 """
 from __future__ import annotations
 
 import json
 import os
 import sqlite3
-import subprocess
 import sys
 import uuid
 from typing import Any
@@ -363,60 +365,48 @@ def promotion_approve(
 # ── mo_promote_synthesis_gate (synthesis-class conjunction gate) ─────────────
 
 
-def _cw_por_subprocess(
+def _cw_por_compute(
     verdict_file: str,
     mini_ork_root: str | None = None,
 ) -> tuple[str, str]:
-    """Run lib/cw_por.sh::mo_compute_cw_por via subprocess shell-out.
+    """Compute CW-POR via the native ``mini_ork.gates.cw_por`` port.
 
-    Returns ``(cw_por_value, cw_por_status)`` matching bash semantics:
-      * ``('null', 'default_passed')`` — when lib/cw_por.sh missing
-      * ``('null', 'default_passed')`` — when mo_compute_cw_por missing
-      * ``(float_str | 'null', status_str)`` — when the function exists
+    Returns ``(cw_por_value, cw_por_status)`` matching the legacy bash
+    shell-out semantics (``lib/cw_por.sh::mo_compute_cw_por`` via
+    subprocess) exactly:
+      * ``('null', 'default_passed')`` — when the CW-POR implementation
+        is unavailable (bash: lib/cw_por.sh or the function missing;
+        native: import failure — both fail-open)
+      * ``('null', 'indeterminate_default_passed')`` — when the compute
+        errors or its output is unparseable (bash rc!=0 → the port's
+        FileNotFoundError/ValueError on the same inputs)
+      * ``(float_str | 'null', status_str)`` — otherwise, with
+        panel_healthy→passed, authority_capture_suspected→failed,
+        anything else→indeterminate_default_passed
 
-    The bash implementation calls the bash function in-process via
-    `source lib/cw_por.sh`. The Python port shells out so the parity
-    test (which also calls bash) sees the exact same byte-stream.
+    ``mini_ork_root`` is retained in the signature for caller
+    compatibility (the bash path used it to locate ``lib/cw_por.sh``);
+    the native port needs no root.
     """
-    if mini_ork_root is None:
-        mini_ork_root = os.environ.get("MINI_ORK_ROOT", "")
-    cw_por_sh = os.path.join(mini_ork_root, "lib", "cw_por.sh") if mini_ork_root else ""
-    if not cw_por_sh or not os.path.exists(cw_por_sh):
+    del mini_ork_root
+    try:
+        from mini_ork.gates import cw_por
+    except Exception:
         return ("null", "default_passed")
     try:
-        # Probe the function exists by sourcing it in a dry-run subshell.
-        probe = subprocess.run(
-            ["bash", "-c",
-             f'source "{cw_por_sh}" 2>/dev/null; '
-             f'declare -f mo_compute_cw_por >/dev/null 2>&1 && echo "Y" || echo "N"'],
-            capture_output=True, text=True, timeout=10,
-        )
-        if probe.stdout.strip() != "Y":
-            return ("null", "default_passed")
-        r = subprocess.run(
-            ["bash", "-c",
-             f'source "{cw_por_sh}" 2>/dev/null; mo_compute_cw_por "$1"',
-             "_", verdict_file],
-            capture_output=True, text=True, timeout=10,
-        )
-        if r.returncode != 0:
-            return ("null", "indeterminate_default_passed")
-        try:
-            payload = json.loads(r.stdout.strip())
-        except json.JSONDecodeError:
-            return ("null", "indeterminate_default_passed")
-        cw_value = payload.get("cw_por")
-        verdict = payload.get("verdict", "indeterminate")
-        cw_value_s = "null" if cw_value is None else str(cw_value)
-        if verdict == "panel_healthy":
-            status = "passed"
-        elif verdict == "authority_capture_suspected":
-            status = "failed"
-        else:
-            status = "indeterminate_default_passed"
-        return (cw_value_s, status)
+        _rc, payload = cw_por.compute_cw_por(verdict_file)
     except Exception:
         return ("null", "indeterminate_default_passed")
+    cw_value = payload.get("cw_por")
+    verdict = payload.get("verdict", "indeterminate")
+    cw_value_s = "null" if cw_value is None else str(cw_value)
+    if verdict == "panel_healthy":
+        status = "passed"
+    elif verdict == "authority_capture_suspected":
+        status = "failed"
+    else:
+        status = "indeterminate_default_passed"
+    return (cw_value_s, status)
 
 
 def mo_promote_synthesis_gate(
@@ -487,8 +477,9 @@ def mo_promote_synthesis_gate(
     if min_finding_cardinality is None:
         min_finding_cardinality = int(os.environ.get("MO_MIN_FINDING_CARDINALITY", "5"))
 
-    # ── CW-POR soft-dep shell-out (mirrors bash lines 326-346) ──
-    cw_value_s, cw_status = _cw_por_subprocess(verdict_file, mini_ork_root)
+    # ── CW-POR soft-dep — native mini_ork.gates.cw_por (WS4; mirrors
+    # bash lines 326-346 semantics without the subprocess shell-out) ──
+    cw_value_s, cw_status = _cw_por_compute(verdict_file, mini_ork_root)
 
     # ── JSON parse (mirrors bash lines 361-366) ──
     try:

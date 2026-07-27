@@ -5,6 +5,12 @@ row content of the gate_registry table on fresh temp DBs seeded via db/init.sh.
 Row-set equality via sha256 of the sorted row dump — UUID gate_ids generated
 during the bash intermediate steps are non-deterministic across processes, so
 the comparison contract is the post-rename oracle-* rows only.
+
+WS4 note: the Python bootstrap now seeds ``native:<name>`` sentinel
+conditions (the registry maps them to in-process evaluators), while the
+bash bootstrap still seeds ``<root>/gates/<name>.sh`` script paths. The
+cross-implementation row parity test therefore compares every column
+EXCEPT ``condition`` and asserts each side's condition shape separately.
 """
 from __future__ import annotations
 
@@ -121,18 +127,83 @@ def test_warm_python_idempotent(db):
 
 
 def test_bash_vs_python_row_parity(db):
+    """Cross-implementation parity modulo the condition column.
+
+    WS4: python seeds native:<name> sentinels; bash seeds script paths.
+    The load-bearing contract (ids, gate_type, task_class_filter, safety,
+    active) must still match exactly; the condition column is asserted
+    per-side against its expected shape.
+    """
     db_bash = db
     db_py = db + ".py"
     import shutil
     shutil.copyfile(db_bash, db_py)
     assert _bash_bootstrap(db_bash, root=str(REPO)) == 0
     assert gb.bootstrap_oracle_gates(db=db_py, root=str(REPO)) == 0
-    h_bash = _dump_hash(db_bash)
-    h_py = _dump_hash(db_py)
-    assert h_bash == h_py, (h_bash, h_py, _row_dump(db_bash), _row_dump(db_py))
+
+    def _without_condition(rows):
+        # (gate_id, gate_type, condition, tcf, safety, active, registered_at)
+        return sorted((r[0], r[1], r[3], r[4], r[5]) for r in rows)
+
+    bash_rows = _row_dump(db_bash)
+    py_rows = _row_dump(db_py)
+    assert _without_condition(bash_rows) == _without_condition(py_rows), (
+        bash_rows, py_rows,
+    )
+    # Per-side condition shape.
+    for r in bash_rows:
+        assert r[2].startswith(f"{REPO}/gates/") and r[2].endswith(".sh"), r
+    for r in py_rows:
+        assert r[2].startswith("native:"), r
+    assert {r[2] for r in py_rows} == {
+        "native:coalition", "native:panel-health", "native:synthesis-promote",
+        "native:stability", "native:liveness",
+    }
     now = int(time.time())
-    for r in _row_dump(db_bash) + _row_dump(db_py):
+    for r in bash_rows + py_rows:
         assert now - 60 <= r[-1] <= now + 1, f"registered_at drift: {r}"
+
+
+def test_native_conditions_evaluate_without_bash(db, tmp_path):
+    """End-to-end: python bootstrap rows evaluate through the native
+    evaluators — no gate-condition bash script is executed. A single-node
+    context fail-opens (coalition: single_agent_run → pass; liveness:
+    unknown run → PROCEED; stability/panel-health/synthesis-promote:
+    missing inputs → defer), so no safety violation may fire."""
+    from mini_ork.gates import gate_registry as gr
+
+    assert gb.bootstrap_oracle_gates(db=db, root=str(REPO)) == 0
+    ctx = ('{"panel_run_id":"run-no-traces","recipe":"code-fix",'
+           '"task_class":"code_fix","current_round":1}')
+    summary = gr.gate_run_all(db, "code_fix", ctx, mini_ork_root=str(REPO))
+    assert summary["gate_count"] == 5
+    assert summary["safety_violation"] is False
+    verdicts = {g["gate_id"]: g["verdict"] for g in summary["gates"]}
+    assert verdicts["oracle-coalition"] == "pass"
+    assert verdicts["oracle-liveness"] == "pass"
+    assert verdicts["oracle-stability"] == "pass"
+    # panel-health + synthesis-promote need verdict_file inputs → defer.
+    assert verdicts["oracle-panel-health"] == "defer"
+    assert verdicts["oracle-synthesis-promote"] == "defer"
+
+
+def test_legacy_script_path_conditions_still_evaluate_natively(db):
+    """Backward-compat for live DBs: rows registered by the BASH bootstrap
+    (script-path conditions) evaluate through the native evaluators in the
+    Python registry — the .sh shim is never executed."""
+    from mini_ork.gates import gate_registry as gr
+
+    assert _bash_bootstrap(db, root=str(REPO)) == 0
+    rows = _row_dump(db)
+    assert all(r[2].endswith(".sh") for r in rows)  # bash-seeded paths
+    ctx = ('{"panel_run_id":"run-no-traces","recipe":"code-fix",'
+           '"task_class":"code_fix","current_round":1}')
+    summary = gr.gate_run_all(db, "code_fix", ctx, mini_ork_root=str(REPO))
+    assert summary["gate_count"] == 5
+    assert summary["safety_violation"] is False
+    verdicts = {g["gate_id"]: g["verdict"] for g in summary["gates"]}
+    assert verdicts["oracle-coalition"] == "pass"
+    assert verdicts["oracle-liveness"] == "pass"
 
 
 def test_task_class_filter_is_sql_null(db):

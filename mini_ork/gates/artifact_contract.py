@@ -184,19 +184,76 @@ _TYPE_TO_EXTS: dict[str, list[str]] = {
 }
 
 
+# Gate-registry bash function names that the legacy harness made callable as
+# verifiers via `source lib/gate_registry.sh`. WS4: these dispatch to the
+# native mini_ork.gates.gate_registry equivalents — no bash, no source.
+_GATE_REGISTRY_FUNCTIONS = frozenset({
+    "gate_register", "gate_evaluate", "gate_list", "gate_run_all",
+})
+
+
+def _run_gate_registry_verifier(verifier: str, artifact_path: str) -> int:
+    """Native equivalent of ``source lib/gate_registry.sh; <fn> '<artifact>'``.
+
+    Mirrors the bash functions' argv semantics when invoked with the
+    artifact path as the sole argument (the harness always appends it):
+
+      * ``gate_register``  — bash ``${2:?condition required}`` guard aborts
+        the shell → rc 127 (the port raises TypeError for the missing
+        condition arg → mapped to rc 1; both non-zero → same fail verdict).
+      * ``gate_evaluate``  — bash ``${2:?context_json required}`` → rc 127.
+      * ``gate_run_all``   — bash ``${2:?context_json required}`` → rc 127.
+      * ``gate_list``      — bash's arg loop ignores unknown positionals
+        → lists all active gates, rc 0.
+
+    Returns the process exit code the bash invocation would have produced
+    (modulo the 127-vs-1 guard-abort numbering noted above; the harness
+    only distinguishes zero from non-zero).
+    """
+    from mini_ork.gates import gate_registry as gr
+
+    db = os.environ.get("MINI_ORK_DB", "")
+    try:
+        if verifier == "gate_list":
+            # artifact_path deliberately unused — bash shifts it away.
+            print(json.dumps(gr.gate_list(db)))
+            return 0
+        if verifier == "gate_register":
+            gr.gate_register(db, artifact_path)  # type: ignore[call-arg]
+        elif verifier == "gate_evaluate":
+            gr.gate_evaluate(db, artifact_path)  # type: ignore[call-arg]
+        elif verifier == "gate_run_all":
+            gr.gate_run_all(db, artifact_path)  # type: ignore[call-arg]
+        else:  # unreachable — guarded by _GATE_REGISTRY_FUNCTIONS
+            return 1
+        return 0
+    except Exception:
+        return 1
+
+
 def _run_verifier(verifier: str, artifact_path: str, mini_ork_root: str) -> str | None:
     """Run a single verifier shell command. Returns failure reason or None.
 
     Mirrors the bash subprocess invocation at lines 141-160 of
-    ``lib/artifact_contract.sh`` exactly:
-      - ``bash -c 'source {root}/lib/gate_registry.sh 2>/dev/null; <cmd> <artifact>'``
-      - inherits full env (so ``$MINI_ORK_DB`` etc. are visible)
-      - 60-second timeout
+    ``lib/artifact_contract.sh``:
+      - 60-second timeout, inherits full env (``$MINI_ORK_DB`` etc.)
+
+    WS4: the legacy ``source {root}/lib/gate_registry.sh`` prefix is gone.
+    Verifiers that name a gate-registry function (``gate_register`` /
+    ``gate_evaluate`` / ``gate_list`` / ``gate_run_all``) dispatch to the
+    native ``mini_ork.gates.gate_registry`` equivalents with identical rc
+    semantics; all other verifiers (recipe scripts, arbitrary shell
+    snippets) run via ``bash -c`` exactly as before.
     """
-    cmd = (
-        f"source {mini_ork_root}/lib/gate_registry.sh 2>/dev/null; "
-        f"{verifier} '{artifact_path}'"
-    )
+    if verifier.strip() in _GATE_REGISTRY_FUNCTIONS:
+        rc = _run_gate_registry_verifier(verifier.strip(), artifact_path)
+        if rc != 0:
+            return (
+                f"verifier '{verifier}' failed (rc={rc}): "
+                f"gate-registry native dispatch rejected the invocation"
+            )
+        return None
+    cmd = f"{verifier} '{artifact_path}'"
     try:
         proc = subprocess.run(
             ["bash", "-c", cmd],

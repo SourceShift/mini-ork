@@ -4,8 +4,9 @@ Strangler-fig parity port. Reads artifact_contract.success_verifiers[] from the
 plan, runs each verifier script/command, evaluates the ported
 ``gate_registry.gate_run_all``, and computes the verdict
 (pass|fail|partial|vacuous|dry-run) with the same minimum-evidence assertions as
-bash. Verifier scripts are executed via subprocess (they are bash); the ported
-logic is the resolution + verdict computation.
+bash. Verifier scripts are dispatched extension-natively (``.py`` → the current
+interpreter, ``.sh`` → bash with a deprecation warning); the ported logic is the
+resolution + verdict computation.
 
     main(argv=None, *, db=None, root=None) -> int   # 0 ok / 1 fail
 """
@@ -51,21 +52,43 @@ def _newest_plan(home):
     return newest or ""
 
 
-def _find_verifier_script(raw, root, home):
+def _verifier_stem(raw):
     stem = raw[len("verifiers/"):] if raw.startswith("verifiers/") else raw
-    stem = stem[:-3] if stem.endswith(".sh") else stem
+    return stem[:-3] if stem.endswith((".sh", ".py")) else stem
+
+
+def _find_verifier_script(raw, root, home):
+    stem = _verifier_stem(raw)
+    # Prefer the extension the contract named; fall back to the sibling so a
+    # .sh reference still resolves after a recipe ports its verifier to .py
+    # (and vice versa for not-yet-repointed contracts).
+    exts = [".py", ".sh"] if raw.endswith(".py") else [".sh", ".py"]
     recipe = os.environ.get("MINI_ORK_RECIPE")
-    for cand in ([os.path.join(root, "recipes", recipe, "verifiers", f"{stem}.sh")] if recipe else []) + [
-            os.path.join(home, "verifiers", f"{stem}.sh"),
-            os.path.join(root, "verifiers", f"{stem}.sh")]:
-        if os.path.isfile(cand):
-            return cand
+    bases = ([os.path.join(root, "recipes", recipe, "verifiers")] if recipe else []) + [
+        os.path.join(home, "verifiers"),
+        os.path.join(root, "verifiers")]
+    for ext in exts:
+        for base in bases:
+            cand = os.path.join(base, f"{stem}{ext}")
+            if os.path.isfile(cand):
+                return cand
     return ""
 
 
+def _verifier_argv(script):
+    """Extension-native verifier dispatch: ``.py`` runs under the current
+    interpreter; ``.sh`` keeps working via bash (user-facing contract) with a
+    one-line deprecation warning; anything else keeps legacy bash behavior."""
+    if script.endswith(".py"):
+        return [sys.executable, script]
+    if script.endswith(".sh"):
+        sys.stderr.write(
+            f"warning: verifier '{script}' is a bash script — .sh verifiers are deprecated, port to .py\n")
+    return ["bash", script]
+
+
 def _evidence_stem(raw):
-    stem = raw[len("verifiers/"):] if raw.startswith("verifiers/") else raw
-    stem = stem[:-3] if stem.endswith(".sh") else stem
+    stem = _verifier_stem(raw)
     stem = re.sub(r"[^A-Za-z0-9._-]+", "_", stem.strip()).strip("._-")
     return stem[:120] or "verifier"
 
@@ -191,7 +214,7 @@ def main(argv: list[str] | None = None, *, db: str | None = None, root: str | No
             ok = run.returncode == 0
         else:
             r = subprocess.run(
-                ["bash", script],
+                _verifier_argv(script),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 env={**os.environ, "ARTIFACT_PATH": artifact_path},
@@ -235,7 +258,12 @@ def main(argv: list[str] | None = None, *, db: str | None = None, root: str | No
                         artifact_fail = True
 
     gate_verdict = "pass"
-    if dry_run == 0 and os.path.isfile(os.path.join(root, "lib", "gate_registry.sh")):
+    # WS4: gates run through the Python gate_registry (native oracle-gate
+    # evaluators) — the legacy probe for lib/gate_registry.sh presence is
+    # retained only as an OR-fallback for pre-Python checkouts.
+    gates_available = hasattr(gate_registry, "gate_run_all") or os.path.isfile(
+        os.path.join(root, "lib", "gate_registry.sh"))
+    if dry_run == 0 and gates_available:
         ctx = json.dumps({"task_class": task_class, "artifact_path": artifact_path,
                           "plan_path": plan_path or "", "panel_run_id": os.environ.get("MINI_ORK_RUN_ID", ""),
                           "cost_usd": 0.0})
