@@ -1,11 +1,11 @@
-#!/usr/bin/env bash
+#!/usr/bin/env python3
 # .githooks/pre-push — README drift detection on push to main.
 #
 # Activate via:  git config core.hooksPath .githooks   (or `make install-hooks`)
 #
 # Layered architecture (closest layer wins):
 #
-#   ── Layer 1 — mechanical (scripts/readme-claim-check.sh) ──────
+#   ── Layer 1 — mechanical (scripts/readme_claim_check.py) ──────
 #   Fires on every push regardless of target. Sub-second, free.
 #   Catches numerical drift (counts, paths, regression strings).
 #   HARD BLOCK on mismatch.
@@ -29,235 +29,442 @@
 #
 # git invokes this hook with the remote name + URL on stdin:
 #   <local_ref> <local_sha> <remote_ref> <remote_sha>
+#
+# Ported from bash (bash-removal Phase 4) — semantics preserved line-for-line.
 
-set +e
-HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "$HOOK_DIR/.." && pwd)"
-cd "$REPO_ROOT" || exit 0
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+from pathlib import Path
 
-# Per-developer local env preferences (non-secret). Same pattern as
-# secrets.local.sh — gitignored, sourced into the hook env. Use it to
-# turn on per-machine defaults like MO_REVIEW_LLM_LENSES=1 without
-# touching the shipped hook code.
-_mo_local_env="${MINI_ORK_HOME:-$REPO_ROOT/.mini-ork}/config/local.sh"
-if [ -f "$_mo_local_env" ]; then
-  # shellcheck source=/dev/null
-  . "$_mo_local_env"
-fi
+HOOK_DIR = Path(__file__).resolve().parent
+REPO_ROOT = HOOK_DIR.parent
 
-# Master bypass — silently exit clean.
-if [ "${MO_README_DRIFT_SKIP:-0}" = "1" ]; then
-  echo "pre-push: MO_README_DRIFT_SKIP=1 — bypassing all drift checks"
-  exit 0
-fi
+_STRUCTURAL_RE = re.compile(
+    r"^(README\.md|ROADMAP\.md|lib/|bin/|recipes/|db/migrations/|schemas/)",
+    re.MULTILINE,
+)
+_NUMERIC_RE = re.compile(r"^[0-9]+$")
 
-# Read git's stdin to find out which refs are being pushed.
-target_main=0
-target_tag=0
-while read -r local_ref local_sha remote_ref remote_sha; do
-  case "$remote_ref" in
-    refs/heads/main|refs/heads/master) target_main=1 ;;
-    refs/tags/*) target_tag=1 ;;
-  esac
-done
 
-# ── Layer 1 — mechanical, ALWAYS runs ──────────────────────────────────────
-echo "pre-push: running Layer 1 (mechanical claim-check)…"
-bash "$REPO_ROOT/scripts/readme-claim-check.sh"
-L1_RC=$?
-if [ $L1_RC -ne 0 ]; then
-  # Release tags are immutable snapshots — README drift must never block a
-  # tag push. Downgrade to advisory on tag pushes; hard-block on every other
-  # ref (including refs/heads/main). Escape hatches (MO_README_DRIFT_SKIP /
-  # --no-verify) remain the user's path when a hard-block is undesired on
-  # feature branches.
-  if [ "$target_tag" -eq 1 ]; then
-    echo
-    echo "⚠ pre-push: Layer 1 found mechanical drift on tag push — advisory — tag push proceeds."
-    echo "  Fix README or pass MO_README_DRIFT_SKIP=1 (or --no-verify) to bypass in the future."
-    echo "  Falling through to Layer 3 / Layer 2 (whichever applies)."
-  else
-    echo
-    echo "✗ pre-push: Layer 1 found mechanical drift — push BLOCKED."
-    echo "  Fix README or pass MO_README_DRIFT_SKIP=1 (or --no-verify) to bypass."
-    exit 1
-  fi
-fi
-echo "✓ Layer 1 clean."
+def _git(*args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["git", *args], capture_output=True, text=True, check=False
+    )
 
-# Layer 3 runs on every push (it scales severity policy by target_branch
-# internally — block on main, warn on feature). The Layer 3 function lives
-# at the bottom of this file and exits when verdict=block.
-_layer3_run() {
-  [ "${MO_REVIEW_SKIP:-0}" = "1" ] && {
-    echo "pre-push: Layer 3 skipped (MO_REVIEW_SKIP=1)."; return 0; }
-  [ -f "$REPO_ROOT/lib/pre_push_review.sh" ] || {
-    echo "pre-push: Layer 3 not installed (lib/pre_push_review.sh missing) — skipping."
-    return 0; }
 
-  local _l3_push_sha _l3_push_base _l3_target _l3_review_id _l3_verdict _l3_mode
-  _l3_push_sha=$(git rev-parse HEAD)
-  _l3_push_base=$(git merge-base "$_l3_push_sha" "origin/main" 2>/dev/null || echo "")
-  [ -z "$_l3_push_base" ] && _l3_push_base=$(git rev-parse "$_l3_push_sha^" 2>/dev/null || echo "")
-  _l3_target="feature"; [ "$target_main" = 1 ] && _l3_target="main"
-  _l3_mode="heuristic"
-  [ "${MO_REVIEW_LLM_LENSES:-0}" = "1" ] && _l3_mode="hybrid"
+def _source_local_env(repo_root: Path) -> None:
+    """Parse simple KEY=VALUE lines from $MINI_ORK_HOME/config/local.sh.
 
-  echo "pre-push: running Layer 3 (code reviewer) — target=$_l3_target base=${_l3_push_base:0:12} sha=${_l3_push_sha:0:12}"
+    The bash hook sourced the file; here we only honor plain assignments
+    (optionally prefixed with `export`) — no eval, no command substitution.
+    Same pattern as secrets.local.sh — gitignored, merged into the hook env.
+    """
+    local_env = Path(
+        os.environ.get("MINI_ORK_HOME", str(repo_root / ".mini-ork"))
+    ) / "config" / "local.sh"
+    if not local_env.is_file():
+        return
+    assign = re.compile(r"^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$")
+    for raw in local_env.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        m = assign.match(line)
+        if not m:
+            continue
+        key, val = m.group(1), m.group(2).strip()
+        # Strip one layer of surrounding quotes, like a sourced assignment.
+        if len(val) >= 2 and val[0] == val[-1] and val[0] in ("'", '"'):
+            val = val[1:-1]
+        os.environ[key] = val
 
-  _l3_review_id=$(MINI_ORK_ROOT="$REPO_ROOT" \
-                  MINI_ORK_DB="${MINI_ORK_DB:-$REPO_ROOT/.mini-ork/state.db}" \
-    bash -c "source '$REPO_ROOT/lib/pre_push_review.sh'; \
-             review_run '$_l3_push_sha' '$_l3_target' --mode '$_l3_mode' \
-             ${_l3_push_base:+--base '$_l3_push_base'}" 2>&1 | tail -1)
 
-  if ! printf '%s' "$_l3_review_id" | grep -qE '^[0-9]+$'; then
-    echo "⚠ pre-push: Layer 3 reviewer error (review_id=$_l3_review_id) — fail-open."
+def _jq_field(output: str, field: str, default: str) -> str:
+    """Mirror `echo "$out" | jq -r '.<field> // "<default>"' 2>/dev/null`.
+
+    Invalid JSON (jq error) → empty string; missing/null field → default;
+    bools render as true/false; everything else via str().
+    """
+    try:
+        data = json.loads(output)
+    except (ValueError, TypeError):
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    val = data.get(field)
+    if val is None:
+        return default
+    if isinstance(val, bool):
+        return "true" if val else "false"
+    return str(val)
+
+
+def run_layer1(repo_root: Path) -> int:
+    """Layer 1 — mechanical claim-check. Returns the checker exit code."""
+    # TODO-port: scripts/readme-claim-check.sh is being ported to
+    # scripts/readme_claim_check.py (bash-removal Phase 4, scripts lane).
+    argv = [sys.executable, str(repo_root / "scripts" / "readme_claim_check.py")]
+    return subprocess.run(argv, check=False).returncode
+
+
+def _layer3_run(repo_root: Path, target_main: int) -> int:
+    if os.environ.get("MO_REVIEW_SKIP", "0") == "1":
+        print("pre-push: Layer 3 skipped (MO_REVIEW_SKIP=1).")
+        return 0
+    review_lib = repo_root / "lib" / "pre_push_review.sh"
+    if not review_lib.is_file():
+        print(
+            "pre-push: Layer 3 not installed (lib/pre_push_review.sh missing)"
+            " — skipping."
+        )
+        return 0
+
+    push_sha = _git("rev-parse", "HEAD").stdout.strip()
+    r = _git("merge-base", push_sha, "origin/main")
+    push_base = r.stdout.strip() if r.returncode == 0 else ""
+    if not push_base:
+        r = _git("rev-parse", push_sha + "^")
+        push_base = r.stdout.strip() if r.returncode == 0 else ""
+    target = "main" if target_main == 1 else "feature"
+    mode = "hybrid" if os.environ.get("MO_REVIEW_LLM_LENSES", "0") == "1" else "heuristic"
+
+    print(
+        f"pre-push: running Layer 3 (code reviewer) — target={target} "
+        f"base={push_base[:12]} sha={push_sha[:12]}"
+    )
+
+    l3_env = os.environ.copy()
+    l3_env["MINI_ORK_ROOT"] = str(repo_root)
+    l3_env["MINI_ORK_DB"] = os.environ.get(
+        "MINI_ORK_DB", str(repo_root / ".mini-ork" / "state.db")
+    )
+
+    # TODO-port: lib/pre_push_review.sh is still bash (operator review tool);
+    # invoke it through a bash subprocess with identical args until it lands
+    # in Python.
+    base_arg = f"--base {shlex.quote(push_base)}" if push_base else ""
+    run_cmd = (
+        f"source {shlex.quote(str(review_lib))}; "
+        f"review_run {shlex.quote(push_sha)} {shlex.quote(target)} "
+        f"--mode {shlex.quote(mode)} {base_arg}"
+    )
+    r = subprocess.run(
+        ["bash", "-c", run_cmd],
+        env=l3_env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,  # mirror `2>&1 | tail -1`
+        text=True,
+        check=False,
+    )
+    combined = r.stdout or ""
+    if combined.endswith("\n"):
+        combined = combined[:-1]
+    review_id = combined.split("\n")[-1] if combined else ""
+
+    if not _NUMERIC_RE.search(review_id):
+        print(
+            f"⚠ pre-push: Layer 3 reviewer error (review_id={review_id})"
+            " — fail-open."
+        )
+        return 0
+
+    verdict_cmd = (
+        f"source {shlex.quote(str(review_lib))}; review_verdict_for {review_id}"
+    )
+    r = subprocess.run(
+        ["bash", "-c", verdict_cmd],
+        env=l3_env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    verdict = r.stdout.strip()
+
+    print(f"  review_id={review_id} verdict={verdict}")
+
+    if verdict == "approve":
+        print("✓ pre-push: Layer 3 clean.")
+        return 0
+    if verdict == "warn":
+        subprocess.run(
+            [str(repo_root / "bin" / "mini-ork-review"), "show", review_id],
+            check=False,
+        )
+        print()
+        print(
+            f"⚠ pre-push: Layer 3 raised warnings but target is '{target}'"
+            " — push proceeds."
+        )
+        return 0
+    if verdict == "block":
+        subprocess.run(
+            [str(repo_root / "bin" / "mini-ork-review"), "show", review_id],
+            check=False,
+        )
+        if os.environ.get("MO_REVIEW_AUTO_FIX", "0") == "1":
+            print()
+            print(
+                "pre-push: MO_REVIEW_AUTO_FIX=1 — forwarding issues to"
+                " bug_reports."
+            )
+            fwd_cmd = (
+                f"source {shlex.quote(str(review_lib))}; "
+                f"review_forward_to_bug_reports {review_id}"
+            )
+            r = subprocess.run(
+                ["bash", "-c", fwd_cmd],
+                env=l3_env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            n = r.stdout.strip()
+            print(f"pre-push: forwarded {n} issue(s).")
+            print("         operator next:")
+            print(f"           bin/mini-ork bugs promote --top {n}")
+            print("           bin/mini-ork scheduler --once")
+        print()
+        print(
+            f"✗ pre-push: Layer 3 blocked push (verdict=block,"
+            f" review_id={review_id})."
+        )
+        print("  Fix the issues above, OR:")
+        print("    MO_REVIEW_SKIP=1 git push       # bypass Layer 3 only")
+        print(
+            "    MO_REVIEW_AUTO_FIX=1 git push   # dispatch a fix epic instead"
+            " of blocking"
+        )
+        print("    git push --no-verify            # bypass all hooks")
+        return 1
     return 0
-  fi
 
-  _l3_verdict=$(MINI_ORK_ROOT="$REPO_ROOT" \
-                MINI_ORK_DB="${MINI_ORK_DB:-$REPO_ROOT/.mini-ork/state.db}" \
-    bash -c "source '$REPO_ROOT/lib/pre_push_review.sh'; review_verdict_for $_l3_review_id")
 
-  echo "  review_id=$_l3_review_id verdict=$_l3_verdict"
+def main() -> int:
+    try:
+        os.chdir(REPO_ROOT)
+    except OSError:
+        return 0
 
-  case "$_l3_verdict" in
-    approve)
-      echo "✓ pre-push: Layer 3 clean."
-      return 0 ;;
-    warn)
-      "$REPO_ROOT/bin/mini-ork-review" show "$_l3_review_id"
-      echo
-      echo "⚠ pre-push: Layer 3 raised warnings but target is '$_l3_target' — push proceeds."
-      return 0 ;;
-    block)
-      "$REPO_ROOT/bin/mini-ork-review" show "$_l3_review_id"
-      if [ "${MO_REVIEW_AUTO_FIX:-0}" = "1" ]; then
-        echo
-        echo "pre-push: MO_REVIEW_AUTO_FIX=1 — forwarding issues to bug_reports."
-        local _l3_n
-        _l3_n=$(MINI_ORK_ROOT="$REPO_ROOT" \
-                MINI_ORK_DB="${MINI_ORK_DB:-$REPO_ROOT/.mini-ork/state.db}" \
-          bash -c "source '$REPO_ROOT/lib/pre_push_review.sh'; \
-                   review_forward_to_bug_reports $_l3_review_id")
-        echo "pre-push: forwarded $_l3_n issue(s)."
-        echo "         operator next:"
-        echo "           bin/mini-ork bugs promote --top $_l3_n"
-        echo "           bin/mini-ork scheduler --once"
-      fi
-      echo
-      echo "✗ pre-push: Layer 3 blocked push (verdict=block, review_id=$_l3_review_id)."
-      echo "  Fix the issues above, OR:"
-      echo "    MO_REVIEW_SKIP=1 git push       # bypass Layer 3 only"
-      echo "    MO_REVIEW_AUTO_FIX=1 git push   # dispatch a fix epic instead of blocking"
-      echo "    git push --no-verify            # bypass all hooks"
-      return 1 ;;
-  esac
-  return 0
-}
+    # Per-developer local env preferences (non-secret).
+    _source_local_env(REPO_ROOT)
 
-_layer3_run || exit 1
+    # Master bypass — silently exit clean.
+    if os.environ.get("MO_README_DRIFT_SKIP", "0") == "1":
+        print("pre-push: MO_README_DRIFT_SKIP=1 — bypassing all drift checks")
+        return 0
 
-# Layers 2a + 2b only fire on push to main, and only if structural diff exists.
-if [ "$target_main" -ne 1 ]; then
-  echo "pre-push: not pushing to main → skipping L2 panel."
-  exit 0
-fi
+    # Read git's stdin to find out which refs are being pushed.
+    # bash `while read` drops an unterminated final line.
+    target_main = 0
+    target_tag = 0
+    for line in sys.stdin.read().splitlines(keepends=True):
+        if not line.endswith("\n"):
+            continue
+        parts = line.split()
+        remote_ref = parts[2] if len(parts) > 2 else ""
+        if remote_ref in ("refs/heads/main", "refs/heads/master"):
+            target_main = 1
+        elif remote_ref.startswith("refs/tags/"):
+            target_tag = 1
 
-if [ "${MO_README_PANEL_SKIP:-0}" = "1" ]; then
-  echo "pre-push: MO_README_PANEL_SKIP=1 — skipping L2 panel by env."
-  exit 0
-fi
+    # ── Layer 1 — mechanical, ALWAYS runs ────────────────────────────────
+    print("pre-push: running Layer 1 (mechanical claim-check)…")
+    l1_rc = run_layer1(REPO_ROOT)
+    if l1_rc != 0:
+        # Release tags are immutable snapshots — README drift must never block
+        # a tag push. Downgrade to advisory on tag pushes; hard-block on every
+        # other ref (including refs/heads/main). Escape hatches
+        # (MO_README_DRIFT_SKIP / --no-verify) remain the user's path when a
+        # hard-block is undesired on feature branches.
+        if target_tag == 1:
+            print()
+            print(
+                "⚠ pre-push: Layer 1 found mechanical drift on tag push —"
+                " advisory — tag push proceeds."
+            )
+            print(
+                "  Fix README or pass MO_README_DRIFT_SKIP=1 (or --no-verify)"
+                " to bypass in the future."
+            )
+            print("  Falling through to Layer 3 / Layer 2 (whichever applies).")
+        else:
+            print()
+            print("✗ pre-push: Layer 1 found mechanical drift — push BLOCKED.")
+            print(
+                "  Fix README or pass MO_README_DRIFT_SKIP=1 (or --no-verify)"
+                " to bypass."
+            )
+            return 1
+    print("✓ Layer 1 clean.")
 
-# Pre-screen: did any structural file change?
-upstream_ref="origin/main"
-git rev-parse "$upstream_ref" >/dev/null 2>&1 || upstream_ref="HEAD~1"
-diff_files=$(git diff --name-only "$upstream_ref"...HEAD 2>/dev/null)
-trigger=0
-if echo "$diff_files" | grep -qE '^(README\.md|ROADMAP\.md|lib/|bin/|recipes/|db/migrations/|schemas/)'; then
-  trigger=1
-fi
-if [ $trigger -ne 1 ]; then
-  echo "pre-push: no structural / README diff vs $upstream_ref → skipping L2 panel."
-  exit 0
-fi
+    # Layer 3 runs on every push (it scales severity policy by target_branch
+    # internally — block on main, warn on feature).
+    if _layer3_run(REPO_ROOT, target_main) != 0:
+        return 1
 
-# ── Layer 2a — gatekeeper ──────────────────────────────────────────────────
-echo "pre-push: running Layer 2a (MiniMax gatekeeper)…"
-gate_out=$(bash "$REPO_ROOT/scripts/readme-drift-gatekeeper.sh" 2>/dev/null)
-gate_rc=$?
-gate_verdict=$(echo "$gate_out" | jq -r '.verdict // "PANEL_SKIP"' 2>/dev/null)
-gate_reason=$(echo "$gate_out" | jq -r '.reason  // ""' 2>/dev/null)
-echo "  gatekeeper: $gate_verdict — $gate_reason"
+    # Layers 2a + 2b only fire on push to main, and only if structural diff exists.
+    if target_main != 1:
+        print("pre-push: not pushing to main → skipping L2 panel.")
+        return 0
 
-if [ "$gate_verdict" != "PANEL_NEEDED" ]; then
-  echo "✓ pre-push: gatekeeper said $gate_verdict → push proceeds."
-  exit 0
-fi
+    if os.environ.get("MO_README_PANEL_SKIP", "0") == "1":
+        print("pre-push: MO_README_PANEL_SKIP=1 — skipping L2 panel by env.")
+        return 0
 
-# ── Layer 2a.5 — providers-doctor (cheap pre-flight liveness probe) ────────
-# Avoids burning 4 × 90s timeouts when the lens providers are all down.
-if [ -x "$REPO_ROOT/scripts/readme-drift-providers-doctor.sh" ] \
-   && [ "${MO_README_DOCTOR_SKIP:-0}" != "1" ]; then
-  echo "pre-push: running Layer 2a.5 (providers-doctor pre-flight)…"
-  doctor_out=$(bash "$REPO_ROOT/scripts/readme-drift-providers-doctor.sh" 2>/dev/null)
-  doctor_viable=$(echo "$doctor_out" | jq -r '.viable // false' 2>/dev/null)
-  doctor_count=$(echo "$doctor_out" | jq -r '.responsive_count // 0' 2>/dev/null)
-  doctor_threshold=$(echo "$doctor_out" | jq -r '.threshold // 2' 2>/dev/null)
-  echo "  doctor: viable=$doctor_viable responsive=$doctor_count/${doctor_threshold}"
-  if [ "$doctor_viable" != "true" ]; then
-    echo "⚠ pre-push: panel pre-flight FAILED — <$doctor_threshold lens providers responsive."
-    echo "  Skipping the 4-lens panel (would burn ~360s on guaranteed-empty calls)."
-    if [ "${MO_README_PANEL_INDETERMINATE:-fail-open}" = "block" ]; then
-      echo "  MO_README_PANEL_INDETERMINATE=block — push BLOCKED on panel_unavailable."
-      echo "  Fix provider auth (rotate keys / check gateway URLs in lib/providers/cl_*.sh)"
-      echo "  OR clear the env flag for fail-open behavior."
-      exit 1
-    fi
-    echo "  Treating as fail-open (set MO_README_PANEL_INDETERMINATE=block for strict)."
-    exit 0
-  fi
-fi
+    # Pre-screen: did any structural file change?
+    upstream_ref = "origin/main"
+    if _git("rev-parse", upstream_ref).returncode != 0:
+        upstream_ref = "HEAD~1"
+    diff_files = _git("diff", "--name-only", f"{upstream_ref}...HEAD").stdout
+    trigger = 1 if _STRUCTURAL_RE.search(diff_files or "") else 0
+    if trigger != 1:
+        print(
+            f"pre-push: no structural / README diff vs {upstream_ref} →"
+            " skipping L2 panel."
+        )
+        return 0
 
-# ── Layer 2b — 4-lens panel + opus arbiter ─────────────────────────────────
-echo "pre-push: running Layer 2b (4-lens panel + opus arbiter — wall ~30-60s)…"
-panel_out=$(bash "$REPO_ROOT/scripts/readme-drift-panel.sh" 2>/dev/null)
-panel_rc=$?
-panel_verdict=$(echo "$panel_out" | jq -r '.verdict // "NO_DRIFT"' 2>/dev/null)
-panel_report=$(echo "$panel_out" | jq -r '.report_path // ""' 2>/dev/null)
-panel_wall=$(echo "$panel_out" | jq -r '.wall_time_sec // 0' 2>/dev/null)
-panel_cost=$(echo "$panel_out" | jq -r '.cost_estimate_usd // 0' 2>/dev/null)
+    # ── Layer 2a — gatekeeper ────────────────────────────────────────────
+    # TODO-port: scripts/readme-drift-gatekeeper.sh is an operator-LLM tool
+    # still in bash; invoke via subprocess with identical args for now.
+    print("pre-push: running Layer 2a (MiniMax gatekeeper)…")
+    r = subprocess.run(
+        ["bash", str(REPO_ROOT / "scripts" / "readme-drift-gatekeeper.sh")],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        check=False,
+    )
+    gate_out = r.stdout or ""
+    gate_verdict = _jq_field(gate_out, "verdict", "PANEL_SKIP")
+    gate_reason = _jq_field(gate_out, "reason", "")
+    print(f"  gatekeeper: {gate_verdict} — {gate_reason}")
 
-echo "  panel: $panel_verdict (wall=${panel_wall}s, est-cost=\$${panel_cost})"
-[ -n "$panel_report" ] && echo "  report: $panel_report"
+    if gate_verdict != "PANEL_NEEDED":
+        print(f"✓ pre-push: gatekeeper said {gate_verdict} → push proceeds.")
+        return 0
 
-if [ "$panel_verdict" = "DRIFT" ]; then
-  echo
-  echo "✗ pre-push: 4-lens panel detected README drift — push BLOCKED."
-  echo "  Read the report at $panel_report for per-claim evidence + suggested fix."
-  echo "  Bypass options:"
-  echo "    - Fix the README so the audit passes (preferred)"
-  echo "    - MO_README_PANEL_SKIP=1 git push  (skip L2 panel only)"
-  echo "    - MO_README_DRIFT_SKIP=1 git push  (skip ALL drift checks)"
-  echo "    - git push --no-verify             (skip ALL git hooks)"
-  exit 1
-fi
+    # ── Layer 2a.5 — providers-doctor (cheap pre-flight liveness probe) ──
+    # Avoids burning 4 × 90s timeouts when the lens providers are all down.
+    doctor = REPO_ROOT / "scripts" / "readme-drift-providers-doctor.sh"
+    if os.access(doctor, os.X_OK) and os.environ.get(
+        "MO_README_DOCTOR_SKIP", "0"
+    ) != "1":
+        # TODO-port: still bash (operator-LLM tool); subprocess, identical args.
+        print("pre-push: running Layer 2a.5 (providers-doctor pre-flight)…")
+        r = subprocess.run(
+            ["bash", str(doctor)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            check=False,
+        )
+        doctor_out = r.stdout or ""
+        doctor_viable = _jq_field(doctor_out, "viable", "false")
+        doctor_count = _jq_field(doctor_out, "responsive_count", "0")
+        doctor_threshold = _jq_field(doctor_out, "threshold", "2")
+        print(
+            f"  doctor: viable={doctor_viable}"
+            f" responsive={doctor_count}/{doctor_threshold}"
+        )
+        if doctor_viable != "true":
+            print(
+                f"⚠ pre-push: panel pre-flight FAILED — <{doctor_threshold}"
+                " lens providers responsive."
+            )
+            print(
+                "  Skipping the 4-lens panel (would burn ~360s on"
+                " guaranteed-empty calls)."
+            )
+            if os.environ.get(
+                "MO_README_PANEL_INDETERMINATE", "fail-open"
+            ) == "block":
+                print(
+                    "  MO_README_PANEL_INDETERMINATE=block — push BLOCKED on"
+                    " panel_unavailable."
+                )
+                print(
+                    "  Fix provider auth (rotate keys / check gateway URLs in"
+                    " lib/providers/cl_*.sh)"
+                )
+                print("  OR clear the env flag for fail-open behavior.")
+                return 1
+            print(
+                "  Treating as fail-open (set"
+                " MO_README_PANEL_INDETERMINATE=block for strict)."
+            )
+            return 0
 
-if [ "$panel_verdict" = "INDETERMINATE" ]; then
-  echo
-  echo "⚠ pre-push: panel returned INDETERMINATE (lens pipeline broken — no actionable signal)."
-  echo "  Report: $panel_report"
-  if [ "${MO_README_PANEL_INDETERMINATE:-fail-open}" = "block" ]; then
-    echo "  MO_README_PANEL_INDETERMINATE=block — push BLOCKED."
-    echo "  Either fix providers (rotate API keys / check gateway URLs in lib/providers/cl_*.sh)"
-    echo "  OR clear the env flag for fail-open behavior."
-    exit 1
-  fi
-  echo "  MO_README_PANEL_INDETERMINATE not set to 'block' — fail-open, push proceeds."
-  echo "  (Set MO_README_PANEL_INDETERMINATE=block to make this a hard block.)"
-  exit 0
-fi
+    # ── Layer 2b — 4-lens panel + opus arbiter ───────────────────────────
+    # TODO-port: scripts/readme-drift-panel.sh is an operator-LLM tool still
+    # in bash; invoke via subprocess with identical args for now.
+    print(
+        "pre-push: running Layer 2b (4-lens panel + opus arbiter —"
+        " wall ~30-60s)…"
+    )
+    r = subprocess.run(
+        ["bash", str(REPO_ROOT / "scripts" / "readme-drift-panel.sh")],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        check=False,
+    )
+    panel_out = r.stdout or ""
+    panel_verdict = _jq_field(panel_out, "verdict", "NO_DRIFT")
+    panel_report = _jq_field(panel_out, "report_path", "")
+    panel_wall = _jq_field(panel_out, "wall_time_sec", "0")
+    panel_cost = _jq_field(panel_out, "cost_estimate_usd", "0")
 
-echo "✓ pre-push: panel clean — push proceeds."
-exit 0
+    print(f"  panel: {panel_verdict} (wall={panel_wall}s, est-cost=${panel_cost})")
+    if panel_report:
+        print(f"  report: {panel_report}")
+
+    if panel_verdict == "DRIFT":
+        print()
+        print("✗ pre-push: 4-lens panel detected README drift — push BLOCKED.")
+        print(
+            f"  Read the report at {panel_report} for per-claim evidence +"
+            " suggested fix."
+        )
+        print("  Bypass options:")
+        print("    - Fix the README so the audit passes (preferred)")
+        print("    - MO_README_PANEL_SKIP=1 git push  (skip L2 panel only)")
+        print("    - MO_README_DRIFT_SKIP=1 git push  (skip ALL drift checks)")
+        print("    - git push --no-verify             (skip ALL git hooks)")
+        return 1
+
+    if panel_verdict == "INDETERMINATE":
+        print()
+        print(
+            "⚠ pre-push: panel returned INDETERMINATE (lens pipeline broken —"
+            " no actionable signal)."
+        )
+        print(f"  Report: {panel_report}")
+        if os.environ.get("MO_README_PANEL_INDETERMINATE", "fail-open") == "block":
+            print("  MO_README_PANEL_INDETERMINATE=block — push BLOCKED.")
+            print(
+                "  Either fix providers (rotate API keys / check gateway URLs"
+                " in lib/providers/cl_*.sh)"
+            )
+            print("  OR clear the env flag for fail-open behavior.")
+            return 1
+        print(
+            "  MO_README_PANEL_INDETERMINATE not set to 'block' — fail-open,"
+            " push proceeds."
+        )
+        print(
+            "  (Set MO_README_PANEL_INDETERMINATE=block to make this a hard"
+            " block.)"
+        )
+        return 0
+
+    print("✓ pre-push: panel clean — push proceeds.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

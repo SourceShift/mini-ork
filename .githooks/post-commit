@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/usr/bin/env python3
 # .githooks/post-commit — file-reversion watchdog.
 #
 # Problem this solves: when a framework-edit (or other mini-ork) dispatch
@@ -29,105 +29,209 @@
 # The recovery log lives at .mini-ork/file-reversion-guard.log.
 # Each recovery is a tab-separated row:
 #   <iso-timestamp>\t<sha>\t<file>\t<recovered-from-sha>
+#
+# Ported from bash (bash-removal Phase 4) — semantics preserved line-for-line.
+# The watchdog is re-executed as a detached child (`__watchdog__` argv mode)
+# instead of a backgrounded subshell; externally observable behavior (log
+# format, restore semantics, immediate return) is identical.
 
-set -uo pipefail
+import os
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
 
-if [ "${MO_REVERSION_GUARD_DISABLED:-0}" = "1" ]; then
-  exit 0
-fi
+_ENV_PREFIX = "_MO_RG_"
 
-REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)"
-[ -z "$REPO_ROOT" ] && exit 0
-cd "$REPO_ROOT" || exit 0
 
-SHA="$(git rev-parse HEAD)"
-# Branch we committed onto (empty if detached) — used by the HEAD-clobber guard
-# below. A racing process (e.g. a confused cross-repo `codex` session) has been
-# observed `git reset`ing HEAD onto an UNRELATED/foreign commit seconds after a
-# commit, orphaning it. The original watchdog assumed "HEAD is intact"; it isn't
-# always, so we now guard the branch ref too.
-BRANCH="$(git symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
-WATCH_S="${MO_REVERSION_GUARD_WATCH_S:-60}"
-POLL_S="${MO_REVERSION_GUARD_POLL_S:-5}"
-LOG="$REPO_ROOT/.mini-ork/file-reversion-guard.log"
-mkdir -p "$REPO_ROOT/.mini-ork"
+def _git(repo_root: str, *args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["git", "-C", repo_root, *args], capture_output=True, text=True, check=False
+    )
 
-# Files this commit added or modified. Deletions in this commit are
-# intentional — don't re-add them.
-FILES="$(git diff-tree --no-commit-id --name-only --diff-filter=AM -r "$SHA" 2>/dev/null)"
-[ -z "$FILES" ] && exit 0
 
-# Spawn a detached watchdog. We use setsid + nohup to fully detach so the
-# commit shell can return immediately. The watchdog runs ENTIRELY in
-# this shell — no external scripts to install.
-(
-  # Detach from parent process group so the commit completes immediately.
-  trap '' HUP INT TERM
-  exec </dev/null >>"$LOG" 2>&1
-  END=$(( $(date +%s) + WATCH_S ))
-  while [ "$(date +%s)" -lt "$END" ]; do
-    sleep "$POLL_S"
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    # ── HEAD-clobber guard ────────────────────────────────────────────────
-    # If we're still on the same branch but its tip was moved OFF our commit
-    # to an OLDER commit that does not contain our commit (a sideways/foreign
-    # reset, not a legitimate follow-up commit/amend/rebase), restore the
-    # branch ref to our SHA. Two conditions keep this from fighting normal
-    # git use:
-    #   1. our SHA is no longer an ancestor of the tip (commit was orphaned)
-    #   2. the new tip is OLDER than our commit (a fresh amend/rebase would be
-    #      NEWER, so this only fires on a reset to a pre-existing/stale commit)
-    if [ -n "$BRANCH" ]; then
-      cur_branch="$(git -C "$REPO_ROOT" symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
-      cur_tip="$(git -C "$REPO_ROOT" rev-parse --verify -q HEAD 2>/dev/null || true)"
-      if [ "$cur_branch" = "$BRANCH" ] && [ -n "$cur_tip" ] && [ "$cur_tip" != "$SHA" ] \
-         && ! git -C "$REPO_ROOT" merge-base --is-ancestor "$SHA" "$cur_tip" 2>/dev/null; then
-        tip_ct="$(git -C "$REPO_ROOT" show -s --format=%ct "$cur_tip" 2>/dev/null || echo 0)"
-        our_ct="$(git -C "$REPO_ROOT" show -s --format=%ct "$SHA" 2>/dev/null || echo 0)"
-        if [ "${tip_ct:-0}" -lt "${our_ct:-0}" ]; then
-          if git -C "$REPO_ROOT" update-ref "refs/heads/$BRANCH" "$SHA" "$cur_tip" 2>/dev/null; then
-            printf '%s\t%s\t%s\trestored-HEAD-clobbered-from-%s\n' \
-              "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$SHA" "(branch:$BRANCH)" "$cur_tip"
-          fi
-        fi
-      fi
-    fi
 
-    while IFS= read -r f; do
-      [ -z "$f" ] && continue
-      if [ ! -f "$REPO_ROOT/$f" ]; then
-        # File deleted — restore from HEAD.
-        if git -C "$REPO_ROOT" checkout HEAD -- "$f" 2>/dev/null; then
-          printf '%s\t%s\t%s\trestored-deleted-from-%s\n' \
-            "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$SHA" "$f" "$SHA"
-        fi
-        continue
-      fi
-      # File present — check if content matches HEAD's blob.
-      head_blob="$(git -C "$REPO_ROOT" rev-parse "$SHA:$f" 2>/dev/null)"
-      [ -z "$head_blob" ] && continue
-      file_blob="$(git -C "$REPO_ROOT" hash-object "$REPO_ROOT/$f" 2>/dev/null)"
-      if [ -n "$file_blob" ] && [ "$file_blob" != "$head_blob" ]; then
-        # Working-tree content drifted from HEAD. Only restore if the
-        # drifted content matches a PARENT commit (i.e. someone reverted
-        # to an earlier state); otherwise it's a legitimate user edit
-        # and we leave it alone.
-        for parent_ref in "$SHA^" "$SHA^^" "$SHA^^^"; do
-          parent_blob="$(git -C "$REPO_ROOT" rev-parse "$parent_ref:$f" 2>/dev/null)" || continue
-          if [ "$file_blob" = "$parent_blob" ]; then
-            if git -C "$REPO_ROOT" checkout HEAD -- "$f" 2>/dev/null; then
-              parent_sha="$(git -C "$REPO_ROOT" rev-parse "$parent_ref" 2>/dev/null)"
-              printf '%s\t%s\t%s\trestored-reverted-to-%s\n' \
-                "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$SHA" "$f" "$parent_sha"
-            fi
-            break
-          fi
-        done
-      fi
-    done <<< "$FILES"
-  done
-) &
+def _watchdog(repo_root: str, sha: str, branch: str, files: list,
+              watch_s: int, poll_s: int, log_path: str) -> None:
+    end = time.time() + watch_s
+    with open(log_path, "a", encoding="utf-8") as log:
+        while time.time() < end:
+            time.sleep(poll_s)
 
-# Disown so the watchdog survives shell exit.
-disown $! 2>/dev/null || true
-exit 0
+            # ── HEAD-clobber guard ────────────────────────────────────────
+            # If we're still on the same branch but its tip was moved OFF our
+            # commit to an OLDER commit that does not contain our commit (a
+            # sideways/foreign reset, not a legitimate follow-up
+            # commit/amend/rebase), restore the branch ref to our SHA. Two
+            # conditions keep this from fighting normal git use:
+            #   1. our SHA is no longer an ancestor of the tip (orphaned)
+            #   2. the new tip is OLDER than our commit (a fresh amend/rebase
+            #      would be NEWER, so this only fires on a reset to a
+            #      pre-existing/stale commit)
+            if branch:
+                cur_branch = _git(
+                    repo_root, "symbolic-ref", "--quiet", "--short", "HEAD"
+                ).stdout.strip()
+                cur_tip = _git(
+                    repo_root, "rev-parse", "--verify", "-q", "HEAD"
+                ).stdout.strip()
+                if (
+                    cur_branch == branch
+                    and cur_tip
+                    and cur_tip != sha
+                    and _git(
+                        repo_root, "merge-base", "--is-ancestor", sha, cur_tip
+                    ).returncode
+                    != 0
+                ):
+                    tip_ct = _git(
+                        repo_root, "show", "-s", "--format=%ct", cur_tip
+                    ).stdout.strip() or "0"
+                    our_ct = _git(
+                        repo_root, "show", "-s", "--format=%ct", sha
+                    ).stdout.strip() or "0"
+                    if int(tip_ct) < int(our_ct):
+                        if (
+                            _git(
+                                repo_root,
+                                "update-ref",
+                                f"refs/heads/{branch}",
+                                sha,
+                                cur_tip,
+                            ).returncode
+                            == 0
+                        ):
+                            log.write(
+                                f"{_utc_now()}\t{sha}\t(branch:{branch})\t"
+                                f"restored-HEAD-clobbered-from-{cur_tip}\n"
+                            )
+                            log.flush()
+
+            for f in files:
+                if not f:
+                    continue
+                if not (Path(repo_root) / f).is_file():
+                    # File deleted — restore from HEAD.
+                    if _git(repo_root, "checkout", "HEAD", "--", f).returncode == 0:
+                        log.write(
+                            f"{_utc_now()}\t{sha}\t{f}\t"
+                            f"restored-deleted-from-{sha}\n"
+                        )
+                        log.flush()
+                    continue
+                # File present — check if content matches HEAD's blob.
+                head_blob = _git(repo_root, "rev-parse", f"{sha}:{f}").stdout.strip()
+                if not head_blob:
+                    continue
+                file_blob = _git(
+                    repo_root, "hash-object", str(Path(repo_root) / f)
+                ).stdout.strip()
+                if file_blob and file_blob != head_blob:
+                    # Working-tree content drifted from HEAD. Only restore if
+                    # the drifted content matches a PARENT commit (i.e. someone
+                    # reverted to an earlier state); otherwise it's a
+                    # legitimate user edit and we leave it alone.
+                    for parent_ref in (f"{sha}^", f"{sha}^^", f"{sha}^^^"):
+                        r = _git(repo_root, "rev-parse", f"{parent_ref}:{f}")
+                        if r.returncode != 0:
+                            continue
+                        parent_blob = r.stdout.strip()
+                        if file_blob == parent_blob:
+                            if (
+                                _git(repo_root, "checkout", "HEAD", "--", f).returncode
+                                == 0
+                            ):
+                                parent_sha = _git(
+                                    repo_root, "rev-parse", parent_ref
+                                ).stdout.strip()
+                                log.write(
+                                    f"{_utc_now()}\t{sha}\t{f}\t"
+                                    f"restored-reverted-to-{parent_sha}\n"
+                                )
+                                log.flush()
+                            break
+
+
+def main() -> int:
+    # Detached watchdog mode (spawned by the hook below; git never passes args).
+    if len(sys.argv) > 1 and sys.argv[1] == "__watchdog__":
+        env = os.environ
+        _watchdog(
+            repo_root=env[_ENV_PREFIX + "REPO_ROOT"],
+            sha=env[_ENV_PREFIX + "SHA"],
+            branch=env.get(_ENV_PREFIX + "BRANCH", ""),
+            files=env.get(_ENV_PREFIX + "FILES", "").split("\n"),
+            watch_s=int(env[_ENV_PREFIX + "WATCH_S"]),
+            poll_s=int(env[_ENV_PREFIX + "POLL_S"]),
+            log_path=env[_ENV_PREFIX + "LOG"],
+        )
+        return 0
+
+    if os.environ.get("MO_REVERSION_GUARD_DISABLED", "0") == "1":
+        return 0
+
+    r = _git(".", "rev-parse", "--show-toplevel")
+    repo_root = r.stdout.strip() if r.returncode == 0 else ""
+    if not repo_root:
+        return 0
+    try:
+        os.chdir(repo_root)
+    except OSError:
+        return 0
+
+    sha = _git(repo_root, "rev-parse", "HEAD").stdout.strip()
+    # Branch we committed onto (empty if detached) — used by the HEAD-clobber
+    # guard. A racing process (e.g. a confused cross-repo `codex` session) has
+    # been observed `git reset`ing HEAD onto an UNRELATED/foreign commit
+    # seconds after a commit, orphaning it. The original watchdog assumed
+    # "HEAD is intact"; it isn't always, so we guard the branch ref too.
+    branch = _git(
+        repo_root, "symbolic-ref", "--quiet", "--short", "HEAD"
+    ).stdout.strip()
+    watch_s = int(os.environ.get("MO_REVERSION_GUARD_WATCH_S", "60"))
+    poll_s = int(os.environ.get("MO_REVERSION_GUARD_POLL_S", "5"))
+    log_path = str(Path(repo_root) / ".mini-ork" / "file-reversion-guard.log")
+    (Path(repo_root) / ".mini-ork").mkdir(parents=True, exist_ok=True)
+
+    # Files this commit added or modified. Deletions in this commit are
+    # intentional — don't re-add them.
+    files_out = _git(
+        repo_root, "diff-tree", "--no-commit-id", "--name-only",
+        "--diff-filter=AM", "-r", sha,
+    ).stdout.strip()
+    if not files_out:
+        return 0
+
+    # Spawn a detached watchdog (start_new_session ≈ setsid + disown) so the
+    # commit shell can return immediately and the watchdog survives shell exit.
+    env = os.environ.copy()
+    env[_ENV_PREFIX + "REPO_ROOT"] = repo_root
+    env[_ENV_PREFIX + "SHA"] = sha
+    env[_ENV_PREFIX + "BRANCH"] = branch
+    env[_ENV_PREFIX + "FILES"] = files_out
+    env[_ENV_PREFIX + "WATCH_S"] = str(watch_s)
+    env[_ENV_PREFIX + "POLL_S"] = str(poll_s)
+    env[_ENV_PREFIX + "LOG"] = log_path
+    log_fd = open(log_path, "ab", buffering=0)
+    try:
+        subprocess.Popen(  # noqa: S603
+            [sys.executable, os.path.abspath(__file__), "__watchdog__"],
+            cwd=repo_root,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=log_fd,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+            close_fds=True,
+        )
+    finally:
+        log_fd.close()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
