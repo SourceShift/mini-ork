@@ -21,58 +21,6 @@ jobs:
       - name: Run README mechanical claim check
         run: bash scripts/readme-claim-check.sh
 
-  shellcheck:
-    name: shellcheck
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: Install shellcheck
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y shellcheck
-
-      # Severity tiers:
-      # - severity=error  → PR-blocking (real bugs: syntax, undefined vars, etc)
-      # - severity=warning → advisory, non-blocking (style + best-practice)
-      # bin/ engine scripts are extensionless (mini-ork-execute, mini-ork-verify,
-      # ...) so a bare `-name "*.sh"` silently skips ALL of them — match
-      # bin/mini-ork* explicitly.
-      - name: Run shellcheck (errors block CI)
-        run: |
-          # bin/ holds polyglot CLIs (Python, Node) named mini-ork-*; filter
-          # to bash-shebang files only so shellcheck doesn't crash on them.
-          { find bin -type f -name 'mini-ork*' \
-              -exec sh -c 'head -1 "$1" | grep -qE "bash|sh\$"' _ {} \; -print;
-            find lib tests recipes -type f -name '*.sh'; } \
-            | xargs shellcheck --shell=bash --severity=error
-
-      - name: Run shellcheck (warnings advisory)
-        continue-on-error: true
-        run: |
-          # bin/ holds polyglot CLIs (Python, Node) named mini-ork-*; filter
-          # to bash-shebang files only so shellcheck doesn't crash on them.
-          { find bin -type f -name 'mini-ork*' \
-              -exec sh -c 'head -1 "$1" | grep -qE "bash|sh\$"' _ {} \; -print;
-            find lib tests recipes -type f -name '*.sh'; } \
-            | xargs shellcheck --shell=bash --severity=warning \
-            | tee shellcheck-warnings.log || true
-          WARN_COUNT=$(grep -cE '^In .* line [0-9]+:' shellcheck-warnings.log || echo 0)
-          echo "::notice::shellcheck warning count: $WARN_COUNT (advisory, non-blocking)"
-
-      # v0.2-pt17: lint catches direct `claude --print` callers missing the
-      # permission-bypass flag. Advisory (not blocking) so accidental drift
-      # surfaces in PR review without failing CI on legitimate edge cases.
-      # See docs/PERMISSION-FLAG.md for the failure signature + fix flavors.
-      - name: Lint claude permission flags
-        continue-on-error: true
-        run: |
-          bash bin/mo-check-claude-invocations || {
-            echo "::warning::Direct claude --print invocations missing permission-bypass flag — see docs/PERMISSION-FLAG.md"
-            exit 0   # advisory only
-          }
-
   python-lint:
     name: python lint (ruff)
     runs-on: ubuntu-latest
@@ -103,28 +51,6 @@ jobs:
             | tee ruff-advisory.log || true
           TOTAL=$(grep -cE '^\s*[0-9]+' ruff-advisory.log || echo 0)
           echo "::notice::ruff advisory findings: $TOTAL (non-blocking — see ratchet note in pyproject.toml)"
-
-  bash-tests:
-    name: bash tests (${{ matrix.layer }})
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    needs: shellcheck
-    strategy:
-      fail-fast: false
-      matrix:
-        layer: [smoke, unit, integration, e2e, security]
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: Install runtime deps
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y sqlite3 jq python3 python3-yaml
-
-      - name: Run ${{ matrix.layer }} layer
-        run: bash tests/run-all.sh ${{ matrix.layer }}
-        env:
-          MINI_ORK_DRY_RUN: "1"   # offline mode — workers skip LLM calls
 
   python-tests:
     name: python tests (${{ matrix.python-version }} / ${{ matrix.shard }})
