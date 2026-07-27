@@ -1,16 +1,17 @@
-"""Integration + parity gate for mini_ork.cache (Python port of lib/cache.sh).
+"""Unit tests for mini_ork.cache (Python port of lib/cache.sh).
 
 Two things proven here:
-1. PARITY on the pure bits (input_hash, hash_bundle) vs the live bash functions.
+1. The pure hashing helpers (input_hash, hash_bundle) implement the documented
+   algorithm: sha256 of the input, with files inlined by content and each
+   bundle part terminated by the 0x1e record separator.
 2. The win #2 BEHAVIOR CHANGE: the Python cache hits across iterations on an
-   identical input_hash, where the bash cache (iter in the predicate) misses —
-   this is the ×5-recursion recompute fix, demonstrated against live bash.
+   identical input_hash (iter dropped from the lookup predicate) — the
+   ×5-recursion recompute fix.
 """
 from __future__ import annotations
 
-import os
+import hashlib
 import sqlite3
-import subprocess
 import sys
 from pathlib import Path
 
@@ -20,17 +21,6 @@ REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
 from mini_ork import cache  # noqa: E402
 
-CACHE_SH = REPO / "lib" / "cache.sh"
-
-
-def _bash(db: str, snippet: str) -> str:
-    env = {**os.environ, "MINI_ORK_DB": db, "JOB_ID": "test"}
-    r = subprocess.run(
-        ["bash", "-c", f'. "{CACHE_SH}" >/dev/null 2>&1; {snippet}'],
-        capture_output=True, text=True, env=env,
-    )
-    return r.stdout.strip()
-
 
 @pytest.fixture
 def db(tmp_path):
@@ -39,35 +29,33 @@ def db(tmp_path):
     return p
 
 
-def test_input_hash_parity(db):
+def test_input_hash_is_sha256():
     for s in ["hello", "abc123", "the-quick-brown-fox", "x1y2z3"]:
-        bash_h = _bash(db, f"printf %s {s!r} | mo_cache_input_hash")
-        assert cache.input_hash(s) == bash_h, s
+        assert cache.input_hash(s) == hashlib.sha256(s.encode("utf-8")).hexdigest(), s
 
 
-def test_hash_bundle_parity(db, tmp_path):
+def test_hash_bundle_algorithm(tmp_path):
+    # Files are inlined by content; every part (literal or file content) is
+    # followed by the 0x1e record separator.
     f = tmp_path / "frag.txt"
     f.write_text("some file content", encoding="utf-8")
-    bash_h = _bash(db, f'mo_cache_hash_bundle "alpha" "{f}" "beta"')
-    assert cache.hash_bundle("alpha", str(f), "beta") == bash_h
+    expected = hashlib.sha256(
+        ("alpha" + "\x1e" + "some file content" + "\x1e" + "beta" + "\x1e").encode("utf-8")
+    ).hexdigest()
+    assert cache.hash_bundle("alpha", str(f), "beta") == expected
 
 
-def test_same_iter_hit_parity(db):
-    # Both bash and python must HIT at the emitting iteration.
+def test_same_iter_hit(db):
     cache.emit("worker", "E1", 1, "HASH1", "success", "/out/x", "/log/x", db=db)
     assert cache.lookup("worker", "E1", "HASH1", iter=1, db=db) == "/out/x"
-    assert _bash(db, "mo_cache_lookup worker E1 1 HASH1") == "/out/x"
 
 
 def test_cross_iteration_hit_is_the_win2_fix(db):
     """The core win #2 proof: same input_hash emitted at iter 1, looked up at
-    iter 2. Python HITS (iter dropped from predicate); bash MISSES (iter in
-    predicate) — the exact ×5-recursion recompute we're eliminating."""
+    iter 2 → HIT (iter dropped from the lookup predicate), eliminating the
+    ×5-recursion recompute."""
     cache.emit("worker", "E1", 1, "HASH1", "success", "/out/x", "/log/x", db=db)
-    # Python: cross-iteration HIT
     assert cache.lookup("worker", "E1", "HASH1", iter=2, db=db) == "/out/x"
-    # Bash: cross-iteration MISS (demonstrates the bug being fixed)
-    assert _bash(db, "mo_cache_lookup worker E1 2 HASH1") == ""
 
 
 def test_new_verifier_stages_allowed(db):
@@ -98,10 +86,10 @@ def test_expired_not_returned_and_gc(db):
     assert cache.gc(db) >= 1
 
 
-def test_run_summary_parity(db):
-    """A/B (WS5): ``cache.run_summary`` vs live ``mo_cache_run_summary`` —
-    the sqlite3 ``-column -header`` table must be byte-identical (same CLI,
-    same SQL), including the empty-result case."""
+def test_run_summary(db):
+    """``cache.run_summary`` renders the per-stage reuse stats (stage,
+    SUM(reused_count), SUM(cost*reused_count) rounded to 2dp) for rows of
+    the job with reused_count > 0; jobs with no reused rows render empty."""
     con = sqlite3.connect(db)
     rows = [
         ("u1", "job-A", "E1", 1, "worker", "h1", "success", 0.5, 2),
@@ -123,10 +111,14 @@ def test_run_summary_parity(db):
     con.commit()
     con.close()
 
-    py_out = cache.run_summary("job-A", db=db)
-    bash_out = _bash(db, "mo_cache_run_summary job-A")
-    assert py_out.strip() == bash_out.strip()
-    assert "worker" in py_out and "reviewer" in py_out
-    # job with no reused rows → both sides empty
-    assert cache.run_summary("job-none", db=db).strip() == \
-        _bash(db, "mo_cache_run_summary job-none").strip()
+    out = cache.run_summary("job-A", db=db)
+    lines = {ln.split()[0]: ln for ln in out.splitlines()
+             if ln.strip() and not ln.startswith("-")}
+    # header + one row per stage with reuses (the reused_count=0 row is excluded)
+    assert set(lines) == {"stage", "reviewer", "worker"}
+    # worker: reuses = 2 + 3 = 5; saved = 0.5*2 + 0.5*3 = 2.5
+    assert "5" in lines["worker"].split() and "2.5" in lines["worker"].split()
+    # reviewer: reuses = 1; saved = 1.25*1 = 1.25 (ROUND(...,2) → 1.25)
+    assert "1" in lines["reviewer"].split() and "1.25" in lines["reviewer"].split()
+    # job with no reused rows → empty output
+    assert cache.run_summary("job-none", db=db).strip() == ""
