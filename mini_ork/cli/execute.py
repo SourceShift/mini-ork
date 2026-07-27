@@ -1085,8 +1085,10 @@ def _verifier_runs_before_implementer(workflow, node_id) -> bool:
     Baseline/parity capture nodes intentionally run before an implementer can
     produce the plan's final artifacts. Applying the hollow-run artifact guard
     to that phase creates a false failed-node count even when the baseline
-    verifier itself passes. Unknown or malformed workflows fail closed by
-    returning ``False``.
+    verifier itself passes. A workflow with no implementer is entirely
+    pre-implementation: its verifier scripts may be deterministic artifact
+    producers, so they must run their own contracts. Unknown or malformed
+    workflows fail closed by returning ``False``.
     """
     if not workflow or not node_id or not os.path.isfile(workflow):
         return False
@@ -1094,10 +1096,14 @@ def _verifier_runs_before_implementer(workflow, node_id) -> bool:
         import yaml  # noqa: PLC0415
         nodes = (yaml.safe_load(open(workflow, encoding="utf-8")) or {}).get("nodes") or []
         current = next(i for i, node in enumerate(nodes) if node.get("name") == node_id)
-        first_implementer = next(i for i, node in enumerate(nodes)
-                                 if node.get("type") == "implementer")
+        first_implementer = next(
+            (i for i, node in enumerate(nodes) if node.get("type") == "implementer"),
+            None,
+        )
     except (OSError, StopIteration, TypeError, AttributeError):
         return False
+    if first_implementer is None:
+        return True
     return current < first_implementer
 
 
