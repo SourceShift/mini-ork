@@ -54,6 +54,62 @@ def test_workflow_has_one_bounded_artifact_handoff_per_summary_shard():
     assert all(binding.consumer_input == "source_summaries" for binding in rollup_bindings)
 
 
+def test_collector_identifies_the_mini_ork_client_to_libwit(monkeypatch, tmp_path: Path):
+    pipeline = _pipeline()
+    plan_path = tmp_path / "collection-plan.json"
+    plan_path.write_text(
+        json.dumps(
+            {
+                "required_source_count": 1,
+                "results_per_query": 1,
+                "max_workers": 1,
+                "queries": [{"topic": "test", "query": "test query"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    captured: dict[str, object] = {}
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return json.dumps(
+                {
+                    "results": [
+                        {
+                            "results": [
+                                {
+                                    "paper_uid": "arxiv:2607.00001",
+                                    "arxiv_id": "2607.00001",
+                                    "title": "Test paper",
+                                    "published": "2026-07-01",
+                                    "abstract": "Test abstract",
+                                }
+                            ]
+                        }
+                    ]
+                }
+            ).encode("utf-8")
+
+    def fake_urlopen(request, timeout):
+        captured["user_agent"] = request.get_header("User-agent")
+        captured["timeout"] = timeout
+        return Response()
+
+    monkeypatch.setenv("ARXIV_API_TOKEN", "test-token")
+    monkeypatch.setattr(pipeline, "urlopen", fake_urlopen)
+
+    pipeline.collect(plan_path, tmp_path / "source-corpus.json")
+
+    assert captured["user_agent"].startswith("mini-ork/")
+    assert captured["timeout"] == 45.0
+
+
 def test_200_source_fixture_survives_sharding_rollup_and_assembly(tmp_path: Path):
     pipeline = _pipeline()
     corpus_path = tmp_path / "source-corpus.json"

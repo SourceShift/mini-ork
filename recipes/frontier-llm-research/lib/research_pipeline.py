@@ -130,7 +130,11 @@ def collect(plan_path: Path, output_path: Path) -> None:
     request = Request(
         f"{api_base}/search/batch",
         data=json.dumps({"queries": requests, "max_workers": int(plan.get("max_workers") or 4)}).encode("utf-8"),
-        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "User-Agent": "mini-ork/0.1 (+https://github.com/adelin-d/mini-ork)",
+        },
         method="POST",
     )
     try:
