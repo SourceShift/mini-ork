@@ -84,6 +84,12 @@ Lifecycle:
   recipe-eval                    Static evaluation of recipe definitions
   version
 
+Provider credentials:
+  providers status <lane>                    Safely show configured or missing credentials
+  providers configure <lane>                 Prompt securely to configure one provider lane
+  providers configure --workflow <path>      Configure every provider lane used by a workflow
+  providers --help                           See automation options; keys never use CLI flags
+
 Environment:
   MINI_ORK_HOME   project home dir  (default: .mini-ork/)
   MINI_ORK_DB     sqlite3 state db  (default: $MINI_ORK_HOME/state.db)
