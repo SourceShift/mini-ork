@@ -1,8 +1,8 @@
-"""Parity gate: mini_ork.vcs.pr_create vs lib/pr-create.sh.
+"""Unit tests: mini_ork.vcs.pr_create (bash parity halves removed; formerly vs lib/pr-create.sh).
 
 `gh` and `git push` are the only network ops; a fake `gh` on PATH (printing a
 fixed PR URL) + a real bare local origin make the happy path deterministic and
-offline. Compares mo_open_pr's rc + emitted URL + persisted epics.pr_url, plus
+offline. Asserts open_pr's rc + emitted URL + persisted epics.pr_url, plus
 the MO_OPEN_PR gate, idempotence, no-gh soft-skip, and title/body builders.
 """
 from __future__ import annotations
@@ -18,7 +18,6 @@ REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
 from mini_ork.vcs import pr_create as pc
 
-SH = REPO / "lib" / "pr-create.sh"
 ENV = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@e",
        "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@e"}
 URL = "https://github.com/o/r/pull/42"
@@ -74,92 +73,58 @@ def _scenario(root: Path, with_pr_url=False):
     return repo, db
 
 
-def _bash_open(repo, db, epic, branch, kickoff, path_prefix=None, env_extra=None):
-    env = {**os.environ, **ENV, "MINI_ORK_ROOT": str(REPO), "REPO_ROOT": str(repo),
-           "MINI_ORK_DB": db, "MO_OPEN_PR": "1"}
-    if path_prefix:
-        env["PATH"] = f"{path_prefix}:{env['PATH']}"
-    if env_extra:
-        env.update(env_extra)
-    r = subprocess.run(["bash", "-c", f'. "{SH}" && mo_open_pr "{epic}" "{branch}" "{kickoff}"'],
-                       capture_output=True, text=True, env=env)
-    return r.returncode, r.stdout.strip()
-
-
-def test_open_pr_happy_parity(tmp_path):
+def test_open_pr_happy(tmp_path):
     _fake_gh(tmp_path / "bin")
     prefix = str(tmp_path / "bin")
-    rb, db_b = _scenario(tmp_path / "b")
     rp, db_p = _scenario(tmp_path / "p")
-    kick_b = str(rb / "kickoffs" / "e.md")
     kick_p = str(rp / "kickoffs" / "e.md")
-    rc_b, url_b = _bash_open(rb, db_b, "e1", "feat/x", kick_b, path_prefix=prefix)
     os.environ["PATH"] = f"{prefix}:{os.environ['PATH']}"; os.environ["MO_OPEN_PR"] = "1"
     try:
         rc_p, url_p = pc.open_pr("e1", "feat/x", kick_p, repo_root=str(rp), state_db=db_p)
     finally:
         os.environ["PATH"] = os.environ["PATH"].split(":", 1)[1]; del os.environ["MO_OPEN_PR"]
-    assert rc_b == rc_p == 0
-    assert url_b == url_p == URL
-    assert _sql(db_b, "SELECT pr_url FROM epics WHERE id='e1';") == \
-        _sql(db_p, "SELECT pr_url FROM epics WHERE id='e1';") == URL
+    assert rc_p == 0
+    assert url_p == URL
+    assert _sql(db_p, "SELECT pr_url FROM epics WHERE id='e1';") == URL
 
 
 def test_open_pr_disabled_gate(tmp_path):
     rp, db_p = _scenario(tmp_path / "p")
-    r = subprocess.run(["bash", "-c", f'. "{SH}" && mo_open_pr e1 feat/x ""'],
-                       capture_output=True, text=True,
-                       env={**os.environ, **ENV, "MINI_ORK_ROOT": str(REPO), "REPO_ROOT": str(rp),
-                            "MINI_ORK_DB": db_p})  # MO_OPEN_PR unset
-    assert r.returncode == 2
+    # MO_OPEN_PR unset → gate closed
     assert pc.open_pr("e1", "feat/x", "", repo_root=str(rp), state_db=db_p) == (2, "")
 
 
 def test_open_pr_idempotent(tmp_path):
     rp, db_p = _scenario(tmp_path / "p", with_pr_url=True)
-    rc_b, url_b = _bash_open(rp, db_p, "e1", "feat/x", "")  # no gh needed — short-circuits
     os.environ["MO_OPEN_PR"] = "1"
     try:
         rc_p, url_p = pc.open_pr("e1", "feat/x", "", repo_root=str(rp), state_db=db_p)
     finally:
         del os.environ["MO_OPEN_PR"]
-    assert rc_b == rc_p == 0 and url_b == url_p == "https://existing/pr/1"
+    assert rc_p == 0 and url_p == "https://existing/pr/1"
 
 
-def test_build_title_and_body_parity(tmp_path):
+def test_build_title_and_body(tmp_path):
     rp, db_p = _scenario(tmp_path / "p")
     kick = str(rp / "kickoffs" / "e.md")
-    tb = subprocess.run(["bash", "-c", f'. "{SH}" && _mo_pr_build_title e1 "{kick}"'],
-                        capture_output=True, text=True,
-                        env={**os.environ, "MINI_ORK_ROOT": str(REPO), "MINI_ORK_DB": db_p}).stdout.strip()
-    assert tb == pc.build_title("e1", kick, db_p) == "My Epic Title"
+    assert pc.build_title("e1", kick, db_p) == "My Epic Title"
     # fallback to epics.title when kickoff has no heading
     (Path(kick).parent / "nohead.md").write_text("no heading\n")
     kick2 = str(Path(kick).parent / "nohead.md")
-    tb2 = subprocess.run(["bash", "-c", f'. "{SH}" && _mo_pr_build_title e1 "{kick2}"'],
-                         capture_output=True, text=True,
-                         env={**os.environ, "MINI_ORK_ROOT": str(REPO), "MINI_ORK_DB": db_p}).stdout.strip()
-    assert tb2 == pc.build_title("e1", kick2, db_p) == "Fallback Title"
-    bb = subprocess.run(["bash", "-c", f'. "{SH}" && _mo_pr_build_body e1 "{kick}"'],
-                        capture_output=True, text=True,
-                        env={**os.environ, "MINI_ORK_ROOT": str(REPO), "MINI_ORK_DB": db_p}).stdout
-    assert bb.strip() == pc.build_body("e1", kick).strip()
+    assert pc.build_title("e1", kick2, db_p) == "Fallback Title"
+    body = pc.build_body("e1", kick)
+    assert "Auto-opened by mini-ork epic delivery for **e1**" in body
+    assert "## Kickoff" in body and "My Epic Title" in body
 
 
 def test_no_gh_soft_skip(tmp_path):
     rp, db_p = _scenario(tmp_path / "p")
-    # minimal PATH: the tools the script needs, but NO gh
+    # minimal PATH: the tools the port needs, but NO gh
     nobin = tmp_path / "nobin"; nobin.mkdir()
-    for tool in ("bash", "git", "sqlite3", "grep", "sed", "awk", "cat", "mktemp", "rm", "head"):
+    for tool in ("git", "sqlite3"):
         src = shutil_which(tool)
         if src:
             os.symlink(src, nobin / tool)
-    r = subprocess.run(["bash", "-c", f'. "{SH}" && mo_open_pr e1 feat/x ""'],
-                       capture_output=True, text=True,
-                       env={"PATH": str(nobin), "MINI_ORK_ROOT": str(REPO), "REPO_ROOT": str(rp),
-                            "MINI_ORK_DB": db_p, "MO_OPEN_PR": "1",
-                            "HOME": os.environ.get("HOME", "/tmp"), **ENV})
-    assert r.returncode == 2
     # port: gh absent from PATH → (2, "")
     old = os.environ["PATH"]; os.environ["PATH"] = str(nobin); os.environ["MO_OPEN_PR"] = "1"
     try:

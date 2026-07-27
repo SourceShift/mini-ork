@@ -1,9 +1,9 @@
-"""Parity gate: mini_ork.recovery.cleaner vs lib/cleaner.sh.
+"""Unit tests: mini_ork.recovery.cleaner (bash parity halves removed; formerly vs lib/cleaner.sh).
 
 The claude-worker + gauntlet paths are non-deterministic seams (LLM spawn) and
-are an integration concern. Here we parity-test every branch that reaches a
-verdict WITHOUT spawning claude — usage, no-brief, not-on-main, lock-held, and
-the reuse fast-path (pure git) — against the LIVE bash in throwaway repos.
+are an integration concern. Here we test every branch that reaches a verdict
+WITHOUT spawning claude — usage, no-brief, not-on-main, lock-held, and the
+reuse fast-path (pure git) — in throwaway repos.
 """
 from __future__ import annotations
 
@@ -16,8 +16,6 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
 from mini_ork.recovery import cleaner
-
-BIN = REPO / "lib" / "cleaner.sh"
 
 
 def _repo(tmp, name, *, on_main=True, reuse_branch=False):
@@ -45,12 +43,6 @@ def _det(r, brief="fix the thing"):
     return str(p)
 
 
-def _run_bash(r, *args):
-    env = {**os.environ, "MINI_ORK_ROOT": str(r), "REPO_ROOT": str(r),
-           "MINI_ORK_HOME": str(r / ".mini-ork")}
-    return subprocess.run(["bash", str(BIN), *args], cwd=r, capture_output=True, text=True, env=env)
-
-
 def _run_py(r, *args):
     old = dict(os.environ)
     os.environ.update({"MINI_ORK_ROOT": str(r), "REPO_ROOT": str(r),
@@ -63,42 +55,36 @@ def _run_py(r, *args):
 
 
 def test_usage_missing_args(tmp_path):
-    rb, rp = _repo(tmp_path, "b"), _repo(tmp_path, "p")
-    assert _run_bash(rb).returncode == _run_py(rp) == 2
+    rp = _repo(tmp_path, "p")
+    assert _run_py(rp) == 2
 
 
 def test_no_brief(tmp_path):
-    rb, rp = _repo(tmp_path, "b"), _repo(tmp_path, "p")
-    db = _det(rb, brief=""); dp = _det(rp, brief="")
-    assert _run_bash(rb, db, str(rb / "out")).returncode == 4
+    rp = _repo(tmp_path, "p")
+    dp = _det(rp, brief="")
     assert _run_py(rp, dp, str(rp / "out")) == 4
 
 
 def test_not_on_main(tmp_path):
-    rb = _repo(tmp_path, "b", on_main=False); rp = _repo(tmp_path, "p", on_main=False)
-    assert _run_bash(rb, _det(rb), str(rb / "out")).returncode == 5
+    rp = _repo(tmp_path, "p", on_main=False)
     assert _run_py(rp, _det(rp), str(rp / "out")) == 5
 
 
 def test_lock_held(tmp_path):
-    rb, rp = _repo(tmp_path, "b"), _repo(tmp_path, "p")
-    for r in (rb, rp):
-        ld = r / ".mini-ork" / "locks" / "cleaner.lock.d"; ld.mkdir(parents=True)
-        (ld / "pid").write_text(f"{os.getpid()}\n")   # a live PID → not stale
-    assert _run_bash(rb, _det(rb), str(rb / "out")).returncode == 3
+    rp = _repo(tmp_path, "p")
+    ld = rp / ".mini-ork" / "locks" / "cleaner.lock.d"; ld.mkdir(parents=True)
+    (ld / "pid").write_text(f"{os.getpid()}\n")   # a live PID → not stale
     assert _run_py(rp, _det(rp), str(rp / "out")) == 3
 
 
 def test_reuse_fast_path(tmp_path):
-    rb = _repo(tmp_path, "b", reuse_branch=True); rp = _repo(tmp_path, "p", reuse_branch=True)
-    cb = _run_bash(rb, _det(rb), str(rb / "out"))
+    rp = _repo(tmp_path, "p", reuse_branch=True)
     cp = _run_py(rp, _det(rp), str(rp / "out"))
-    assert cb.returncode == cp == 0, cb.stderr
-    for r in (rb, rp):
-        v = json.load(open(r / "out" / "verdict.json"))
-        assert v["verdict"] == "PASS" and v["fast_path"] == "reuse" and v["squashed_commits"] == 1
-        # main now carries the cleaner branch's file
-        assert (r / "fix.txt").exists()
-        log = subprocess.run(["git", "log", "--oneline", "main"], cwd=r,
-                             capture_output=True, text=True).stdout
-        assert "reuse cleaner branch" in log
+    assert cp == 0
+    v = json.load(open(rp / "out" / "verdict.json"))
+    assert v["verdict"] == "PASS" and v["fast_path"] == "reuse" and v["squashed_commits"] == 1
+    # main now carries the cleaner branch's file
+    assert (rp / "fix.txt").exists()
+    log = subprocess.run(["git", "log", "--oneline", "main"], cwd=rp,
+                         capture_output=True, text=True).stdout
+    assert "reuse cleaner branch" in log

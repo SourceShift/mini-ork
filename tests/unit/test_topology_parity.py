@@ -1,215 +1,30 @@
-"""Parity gate: ``mini_ork.orchestration.topology.aggregate_traces`` vs ``bash lib/topology.sh``.
+"""Unit tests: ``mini_ork.orchestration.topology.aggregate_traces`` (bash parity halves removed; formerly vs ``lib/topology.sh``).
 
-For each fixture we build a small ``execution_traces`` corpus (and an
-optional ``workflow_memory`` join), materialise it into a temp sqlite DB,
-invoke the LIVE bash function via subprocess (no mocking — exactly as
-the production runtime would), read the upserted ``topology_win_rates``
-rows back out, then run the Python port against the same trace rows and
-assert exact parity. Floats must match within ``1e-6``; strings must
-match exactly.
+Pure-function tests over small ``execution_traces`` corpora (plus an
+optional ``workflow_memory`` join). Each fixture exercises one surface of
+the win/loss/tie bucketing contract:
 
-Strangler-fig co-existence is preserved: ``lib/topology.sh`` is
-byte-identical before and after this test exists. The test only WRITES
-to its ``tmp_path`` and READS from ``lib/topology.sh``.
+- win:  status='success' AND verdict not in (REJECT/ESCALATE/needs_revision)
+- loss: status='failure' OR a rejecting verdict on 'success'
+- tie:  status IS NULL or another recognized non-terminal status
+- unrecognized statuses contribute 0 to every bucket (and sample_size)
+- ``workflow_memory`` rows override topology_id (yaml_hash) + workflow_name
+
+Floats are asserted within ``1e-6``.
 """
 
 from __future__ import annotations
 
 import math
-import os
-import sqlite3
-import subprocess
-from pathlib import Path
 from typing import Any
 
 import pytest
 
 from mini_ork.orchestration.topology import aggregate_traces
 
-REPO_ROOT = Path(__file__).resolve().parent.parent.parent
-LIB_TOPOLOGY = REPO_ROOT / "lib" / "topology.sh"
-
-
-# Schemas lifted from the live migrations under db/migrations/. The bash
-# function expects these column names verbatim — keep them in lockstep.
-_EXEC_TRACES_DDL = """
-CREATE TABLE execution_traces (
-  trace_id           TEXT PRIMARY KEY,
-  workflow_version_id TEXT,
-  task_class         TEXT,
-  status             TEXT,
-  reviewer_verdict   TEXT,
-  cost_usd           REAL,
-  duration_ms        INTEGER,
-  created_at         TEXT
-);
-"""
-
-_WORKFLOW_MEMORY_DDL = """
-CREATE TABLE workflow_memory (
-  workflow_version_id TEXT PRIMARY KEY,
-  workflow_name       TEXT,
-  yaml_hash           TEXT
-);
-"""
-
-_TOPOLOGY_WIN_RATES_DDL = """
-CREATE TABLE topology_win_rates (
-  topology_id      TEXT NOT NULL,
-  workflow_name    TEXT NOT NULL,
-  task_class       TEXT NOT NULL,
-  wins             INTEGER NOT NULL DEFAULT 0,
-  losses           INTEGER NOT NULL DEFAULT 0,
-  ties             INTEGER NOT NULL DEFAULT 0,
-  win_rate         REAL    NOT NULL DEFAULT 0.0,
-  sample_size      INTEGER NOT NULL DEFAULT 0,
-  avg_cost_usd     REAL    NOT NULL DEFAULT 0.0,
-  avg_duration_ms  REAL    NOT NULL DEFAULT 0.0,
-  last_updated     TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-  UNIQUE (topology_id, task_class)
-);
-"""
-
-
-def _seed(
-    db_path: Path,
-    traces: list[dict[str, Any]],
-    workflow_memory: dict[str, dict[str, str]] | None = None,
-) -> None:
-    """Materialise the test corpus into a fresh sqlite DB.
-
-    The DB has only the three tables bash touches. ``created_at`` is fixed
-    to a recent ISO timestamp well past 1970 so the bash ``WHERE created_at
-    >= ?`` filter (with default ``--since=0``) admits every row.
-    """
-    con = sqlite3.connect(str(db_path))
-    con.executescript(
-        _EXEC_TRACES_DDL + _WORKFLOW_MEMORY_DDL + _TOPOLOGY_WIN_RATES_DDL
-    )
-    if workflow_memory:
-        for wvid, row in workflow_memory.items():
-            con.execute(
-                "INSERT INTO workflow_memory VALUES (?,?,?)",
-                (wvid, row["workflow_name"], row["yaml_hash"]),
-            )
-    for i, t in enumerate(traces):
-        con.execute(
-            "INSERT INTO execution_traces VALUES (?,?,?,?,?,?,?,?)",
-            (
-                f"tr-{i:04d}",
-                t.get("workflow_version_id"),
-                t.get("task_class"),
-                t.get("status"),
-                t.get("reviewer_verdict"),
-                t.get("cost_usd"),
-                t.get("duration_ms"),
-                t.get("created_at", "2026-01-01T00:00:00.000Z"),
-            ),
-        )
-    con.commit()
-    con.close()
-
-
-def _run_bash(db_path: Path) -> None:
-    """Source lib/topology.sh in a fresh bash and call topology_recompute_win_rates.
-
-    ``MINI_ORK_DB`` is set so the bash function targets our temp DB. The
-    function upserts rows into ``topology_win_rates`` and prints the
-    row count on stdout; we don't read it — we read the table instead.
-    """
-    env = os.environ.copy()
-    env["MINI_ORK_DB"] = str(db_path)
-    proc = subprocess.run(
-        ["bash", "-c", f'. "{LIB_TOPOLOGY}" && topology_recompute_win_rates'],
-        cwd=str(REPO_ROOT),
-        env=env,
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    # Sanity: bash prints the upsert count; assert it parses as int.
-    assert proc.stdout.strip().isdigit(), (
-        f"bash returned non-numeric upsert count: {proc.stdout!r}"
-        f" stderr={proc.stderr!r}"
-    )
-
-
-def _read_bash_aggregates(db_path: Path) -> list[dict[str, Any]]:
-    """Read back exactly what bash upserted, ordered for stable comparison."""
-    con = sqlite3.connect(str(db_path))
-    con.row_factory = sqlite3.Row
-    rows = con.execute(
-        """
-        SELECT topology_id, workflow_name, task_class,
-               wins, losses, ties, win_rate, sample_size,
-               avg_cost_usd, avg_duration_ms
-          FROM topology_win_rates
-         ORDER BY topology_id, task_class
-        """
-    ).fetchall()
-    out = [dict(r) for r in rows]
-    con.close()
-    return out
-
-
-def _read_traces(db_path: Path) -> list[dict[str, Any]]:
-    """Read the execution_traces rows we just seeded, in insertion order."""
-    con = sqlite3.connect(str(db_path))
-    con.row_factory = sqlite3.Row
-    rows = con.execute(
-        """
-        SELECT workflow_version_id, task_class, status, reviewer_verdict,
-               cost_usd, duration_ms, created_at
-          FROM execution_traces
-         ORDER BY trace_id
-        """
-    ).fetchall()
-    out = [dict(r) for r in rows]
-    con.close()
-    return out
-
-
-def _read_workflow_memory(db_path: Path) -> dict[str, dict[str, str]]:
-    con = sqlite3.connect(str(db_path))
-    con.row_factory = sqlite3.Row
-    rows = con.execute(
-        "SELECT workflow_version_id, workflow_name, yaml_hash FROM workflow_memory"
-    ).fetchall()
-    out = {r["workflow_version_id"]: {"workflow_name": r["workflow_name"],
-                                       "yaml_hash": r["yaml_hash"]}
-           for r in rows}
-    con.close()
-    return out
-
-
-def _assert_parity(
-    bash_rows: list[dict[str, Any]],
-    py_rows: list[dict[str, Any]],
-    label: str,
-) -> None:
-    assert len(bash_rows) == len(py_rows), (
-        f"[{label}] row-count drift: bash={len(bash_rows)} py={len(py_rows)}\n"
-        f"  bash={bash_rows!r}\n  py  ={py_rows!r}"
-    )
-    for b, p in zip(bash_rows, py_rows):
-        # String columns — exact match.
-        for k in ("topology_id", "workflow_name", "task_class"):
-            assert b[k] == p[k], f"[{label}] {k} drift: bash={b[k]!r} py={p[k]!r}"
-        # Int columns — exact match (sqlite returns int).
-        for k in ("wins", "losses", "ties", "sample_size"):
-            assert int(b[k]) == int(p[k]), (
-                f"[{label}] {k} drift: bash={b[k]!r} py={p[k]!r}"
-            )
-        # Float columns — close within 1e-6.
-        for k in ("win_rate", "avg_cost_usd", "avg_duration_ms"):
-            assert math.isclose(float(b[k]), float(p[k]), abs_tol=1e-6), (
-                f"[{label}] {k} drift: bash={b[k]!r} py={p[k]!r}"
-            )
-
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Fixtures. Each is a (traces, workflow_memory|None) pair, exercising one
-# specific surface of the bash CASE expression tree.
+# Fixtures. Each is a (traces, workflow_memory|None, expected rows) triple.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _f01_pure_wins() -> dict:
@@ -224,6 +39,11 @@ def _f01_pure_wins() -> dict:
              "cost_usd": 0.40, "duration_ms": 7000},
         ],
         "workflow_memory": None,
+        "expected": [
+            {"topology_id": "code_fix_v1", "workflow_name": "?", "task_class": "code_fix",
+             "wins": 2, "losses": 0, "ties": 0, "win_rate": 1.0, "sample_size": 2,
+             "avg_cost_usd": 0.45, "avg_duration_ms": 7500.0},
+        ],
     }
 
 
@@ -242,6 +62,11 @@ def _f02_pure_losses_via_rejection() -> dict:
              "cost_usd": 0.10, "duration_ms": 2000},
         ],
         "workflow_memory": None,
+        "expected": [
+            {"topology_id": "code_fix_v1", "workflow_name": "?", "task_class": "code_fix",
+             "wins": 0, "losses": 3, "ties": 0, "win_rate": 0.0, "sample_size": 3,
+             "avg_cost_usd": 0.2, "avg_duration_ms": 3000.0},
+        ],
     }
 
 
@@ -265,6 +90,14 @@ def _f03_mixed_outcomes_two_groups() -> dict:
              "status": "vacuous", "reviewer_verdict": None, "cost_usd": 0.0, "duration_ms": 0},
         ],
         "workflow_memory": None,
+        "expected": [
+            {"topology_id": "code_fix_v1", "workflow_name": "?", "task_class": "code_fix",
+             "wins": 1, "losses": 1, "ties": 1, "win_rate": 0.5, "sample_size": 3,
+             "avg_cost_usd": 1.0 / 3, "avg_duration_ms": 4000.0},
+            {"topology_id": "refactor_v1", "workflow_name": "?", "task_class": "refactor",
+             "wins": 1, "losses": 1, "ties": 1, "win_rate": 0.5, "sample_size": 3,
+             "avg_cost_usd": 1.0 / 3, "avg_duration_ms": 11500.0 / 3},
+        ],
     }
 
 
@@ -281,11 +114,16 @@ def _f04_unrecognized_status_yields_zero_tally() -> dict:
              "cost_usd": 0.5, "duration_ms": 5000},
         ],
         "workflow_memory": None,
+        "expected": [
+            {"topology_id": "code_fix_v1", "workflow_name": "?", "task_class": "code_fix",
+             "wins": 0, "losses": 0, "ties": 0, "win_rate": 0.0, "sample_size": 0,
+             "avg_cost_usd": 0.5, "avg_duration_ms": 5000.0},
+        ],
     }
 
 
 def _f05_workflow_memory_join_overrides() -> dict:
-    """The bash LEFT JOIN swaps in yaml_hash + workflow_name from workflow_memory."""
+    """The workflow_memory join swaps in yaml_hash + workflow_name."""
     return {
         "traces": [
             {"workflow_version_id": "code_fix_v3", "task_class": "code_fix",
@@ -298,18 +136,16 @@ def _f05_workflow_memory_join_overrides() -> dict:
         "workflow_memory": {
             "code_fix_v3": {"yaml_hash": "deadbeefcafe", "workflow_name": "code-fix"},
         },
+        "expected": [
+            {"topology_id": "deadbeefcafe", "workflow_name": "code-fix", "task_class": "code_fix",
+             "wins": 1, "losses": 1, "ties": 0, "win_rate": 0.5, "sample_size": 2,
+             "avg_cost_usd": 0.4, "avg_duration_ms": 3500.0},
+        ],
     }
 
 
 def _f06_null_status_counts_as_tie() -> dict:
-    """``status IS NULL`` is in the tie branch. Also tests missing cost/duration.
-
-    The bash function uses ``AVG(COALESCE(et.cost_usd, 0))`` — for rows with
-    ``cost_usd IS NULL`` the COALESCE substitutes 0, so the avg is computed
-    over 0.0. Our port has the same behavior via the ``if cost is not None``
-    guard, but to keep the comparison tight, every fixture sets cost_usd and
-    duration_ms on every row.
-    """
+    """``status IS NULL`` is in the tie branch. Also tests missing cost/duration."""
     return {
         "traces": [
             {"workflow_version_id": "code_fix_v1", "task_class": "code_fix",
@@ -320,6 +156,11 @@ def _f06_null_status_counts_as_tie() -> dict:
              "cost_usd": 0.0, "duration_ms": 0},
         ],
         "workflow_memory": None,
+        "expected": [
+            {"topology_id": "code_fix_v1", "workflow_name": "?", "task_class": "code_fix",
+             "wins": 0, "losses": 0, "ties": 2, "win_rate": 0.0, "sample_size": 2,
+             "avg_cost_usd": 0.0, "avg_duration_ms": 0.0},
+        ],
     }
 
 
@@ -342,6 +183,11 @@ def _f07_avg_cost_and_duration_precision() -> dict:
              "cost_usd": 0.50, "duration_ms": 3000},
         ],
         "workflow_memory": None,
+        "expected": [
+            {"topology_id": "code_fix_v1", "workflow_name": "?", "task_class": "code_fix",
+             "wins": 3, "losses": 0, "ties": 0, "win_rate": 1.0, "sample_size": 3,
+             "avg_cost_usd": 0.3, "avg_duration_ms": 2000.0},
+        ],
     }
 
 
@@ -359,6 +205,11 @@ def _f08_win_rate_rounding_boundaries() -> dict:
              "status": "failure", "reviewer_verdict": "APPROVE", "cost_usd": 0.1, "duration_ms": 1000},
         ],
         "workflow_memory": None,
+        "expected": [
+            {"topology_id": "code_fix_v1", "workflow_name": "?", "task_class": "code_fix",
+             "wins": 3, "losses": 1, "ties": 0, "win_rate": 0.75, "sample_size": 4,
+             "avg_cost_usd": 0.1, "avg_duration_ms": 1000.0},
+        ],
     }
 
 
@@ -374,21 +225,35 @@ FIXTURES = {
 }
 
 
+def _assert_rows(expected: list[dict[str, Any]], py_rows: list[dict[str, Any]], label: str) -> None:
+    assert len(expected) == len(py_rows), (
+        f"[{label}] row-count drift: expected={len(expected)} py={len(py_rows)}\n"
+        f"  expected={expected!r}\n  py      ={py_rows!r}"
+    )
+    for e, p in zip(expected, py_rows):
+        # String columns — exact match.
+        for k in ("topology_id", "workflow_name", "task_class"):
+            assert e[k] == p[k], f"[{label}] {k} drift: expected={e[k]!r} py={p[k]!r}"
+        # Int columns — exact match.
+        for k in ("wins", "losses", "ties", "sample_size"):
+            assert int(e[k]) == int(p[k]), (
+                f"[{label}] {k} drift: expected={e[k]!r} py={p[k]!r}"
+            )
+        # Float columns — close within 1e-6.
+        for k in ("win_rate", "avg_cost_usd", "avg_duration_ms"):
+            assert math.isclose(float(e[k]), float(p[k]), abs_tol=1e-6), (
+                f"[{label}] {k} drift: expected={e[k]!r} py={p[k]!r}"
+            )
+
+
 @pytest.mark.parametrize(
     "fix_id,fix",
     list(FIXTURES.items()),
     ids=list(FIXTURES.keys()),
 )
-def test_aggregate_traces_matches_bash(tmp_path, fix_id, fix):
-    db_path = tmp_path / "topology.db"
-    _seed(db_path, fix["traces"], fix.get("workflow_memory"))
-    _run_bash(db_path)
-    bash_rows = _read_bash_aggregates(db_path)
-    py_rows = aggregate_traces(
-        _read_traces(db_path),
-        _read_workflow_memory(db_path) or None,
-    )
-    _assert_parity(bash_rows, py_rows, fix_id)
+def test_aggregate_traces(fix_id, fix):
+    py_rows = aggregate_traces(fix["traces"], fix.get("workflow_memory"))
+    _assert_rows(fix["expected"], py_rows, fix_id)
 
 
 def test_smoke_import_and_aggregate_no_io():

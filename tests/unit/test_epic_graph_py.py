@@ -1,13 +1,12 @@
-"""Parity gate: mini_ork.orchestration.epic_graph vs lib/epic_graph.sh.
+"""Unit tests: mini_ork.orchestration.epic_graph (bash parity halves removed; formerly vs lib/epic_graph.sh).
 
-Seeds an epic DAG (A -> B hard, A -> C soft, blocked D), then runs the same
-operations through the LIVE bash functions and the Python port on separate DB
-copies, asserting identical ready-sets, deps_met, and on_done cascades.
+Seeds an epic DAG (A -> B hard, A -> C soft, blocked D), then runs the
+operations through the Python port, asserting ready-sets, deps_met, and
+on_done cascades.
 """
 from __future__ import annotations
 
 import os
-import shutil
 import sqlite3
 import subprocess
 import sys
@@ -18,16 +17,6 @@ import pytest
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
 from mini_ork.orchestration import epic_graph as eg
-
-EG_SH = REPO / "lib" / "epic_graph.sh"
-
-
-def _bash(db, snippet):
-    r = subprocess.run(["bash", "-c", f'. "{EG_SH}" && {snippet}'],
-                       env={**os.environ, "MINI_ORK_DB": db,
-                            "MINI_ORK_ROOT": str(REPO)},
-                       capture_output=True, text=True)
-    return r.stdout.strip(), r.returncode
 
 
 @pytest.fixture
@@ -56,30 +45,24 @@ def _seed_deps(db):
     eg.add_dep("B", "D", "hard", db=db)   # D blocked on B
 
 
-def test_ready_set_parity(db):
+def test_ready_set(db):
     _seed_deps(db)
     py = eg.ready_now(db=db)
-    bash_out, _ = _bash(db, "epic_graph_ready_now")
-    assert py == bash_out.splitlines()
     # A ready (no deps), C ready (only a soft dep); B/D blocked-status anyway.
     assert py == ["A", "C"]
 
 
-def test_deps_met_parity(db):
+def test_deps_met(db):
     _seed_deps(db)
-    for eid in ("A", "B", "C", "D"):
-        _, rc = _bash(db, f"epic_graph_deps_met {eid}")
-        assert eg.deps_met(eid, db=db) == (rc == 0), eid
+    assert eg.deps_met("A", db=db) is True
     assert eg.deps_met("B", db=db) is False   # unresolved hard dep
     assert eg.deps_met("C", db=db) is True    # soft dep never blocks
+    assert eg.deps_met("D", db=db) is False   # hard dep on blocked B
 
 
-def test_on_done_cascade_parity(db):
+def test_on_done_cascade(db):
     _seed_deps(db)
-    db_bash = db + ".bash"
-    shutil.copy(db, db_bash)
-    eg.on_done("A", db=db)                      # python side
-    _bash(db_bash, "epic_graph_on_done A")      # bash side
+    eg.on_done("A", db=db)
 
     def status(dbp, eid):
         con = sqlite3.connect(dbp)
@@ -87,9 +70,9 @@ def test_on_done_cascade_parity(db):
         con.close()
         return s
 
-    # B's only hard dep resolved -> unblocked, on both sides. D still blocked.
-    assert status(db, "B") == status(db_bash, "B") == "not started"
-    assert status(db, "D") == status(db_bash, "D") == "blocked"
+    # B's only hard dep resolved -> unblocked. D still blocked.
+    assert status(db, "B") == "not started"
+    assert status(db, "D") == "blocked"
     assert eg.ready_now(db=db) == ["A", "B", "C"]
 
 
