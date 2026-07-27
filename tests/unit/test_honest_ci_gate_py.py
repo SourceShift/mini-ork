@@ -1,110 +1,37 @@
-"""Parity gate: mini_ork.gates.honest_ci_gate vs lib/honest_ci_gate.sh.
+"""Standalone unit tests for ``mini_ork.gates.honest_ci_gate``.
 
-Every case constructs a tmp findings JSON, runs the LIVE bash subprocess
-(via ``bash -c '. "$LIB" && mo_compute_finding_cis ...'``) AND the
-in-process Python port, then compares the augmented findings-with-cis.json
-(for ``compute_finding_cis``) and verdict JSON (for ``check_ci_widths``)
-at 1e-6 float tolerance.
+Replaces the bash-parity gate (against ``lib/honest_ci_gate.sh``) as part
+of the bash→Python migration: the Python port is now the sole
+implementation, so its coverage no longer runs the LIVE bash subprocess
+(``bash -c '. "$LIB" && mo_compute_finding_cis ...'``) — it asserts the
+port's behaviour directly. The expected values below are the semantic
+contract the bash side used to pin (CI statistics from first principles,
+verdicts, rc semantics, env knobs), now asserted on the port's output.
 
-No mocks, no hardcoded expecteds — every expected is the live bash output.
-If bash breaks, this test breaks (intentional). Mirrors the parity pattern
-in test_coalition_gate_py.py / test_cost_pause_py.py.
+CI semantics pinned here (from the port's documented contract):
+
+    n           number of numeric lens votes
+    mean        statistics.fmean of the votes
+    sd          sample stddev (n-1 divisor)
+    sem         sd / sqrt(n)
+    ci_low/high mean +/- t_{conf, n-1} * sem
+    ci_width    ci_high - ci_low
+
+with t_critical(df=3, conf=0.95)=3.182 and conf>0.95 → 2.576.
 """
 from __future__ import annotations
 
 import json
-import os
-import subprocess
+import math
+import statistics
 import sys
 from pathlib import Path
-from typing import Any
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
 from mini_ork.gates import honest_ci_gate as hci
 
-SH = REPO / "lib" / "honest_ci_gate.sh"
-
-
-def _run_bash(args: list[str], **extra_env) -> subprocess.CompletedProcess:
-    """Source the bash lib, then run ``args`` (a literal bash fragment)."""
-    env = {**os.environ, "MINI_ORK_ROOT": str(REPO), **extra_env}
-    return subprocess.run(
-        ["bash", "-c", f'. "{SH}" && {args[0]}', *args[1:]],
-        env=env,
-        capture_output=True,
-        text=True,
-    )
-
-
-def _bash_compute(in_path: Path, out_path: Path,
-                  **extra_env) -> tuple[int, str]:
-    r = _run_bash(
-        ["mo_compute_finding_cis \"$1\" \"$2\"", "_", str(in_path), str(out_path)],
-        **extra_env,
-    )
-    return r.returncode, r.stdout
-
-
-def _bash_check(in_path: Path, report_dir: Path,
-                **extra_env) -> tuple[dict, int]:
-    r = _run_bash(
-        ["mo_check_ci_widths \"$1\" \"$2\"", "_", str(in_path), str(report_dir)],
-        **extra_env,
-    )
-    last = (r.stdout or "").strip().splitlines()
-    if not last:
-        raise AssertionError(
-            f"bash emitted no verdict JSON line. stdout={r.stdout!r} "
-            f"stderr={r.stderr!r} rc={r.returncode}"
-        )
-    return json.loads(last[-1]), r.returncode
-
-
-def _scrub_paths(v: Any) -> Any:
-    """Strip filesystem-path fields that legitimately differ between bash
-    and Python tmp dirs. Augmented JSON contents (the *file*) are still
-    diffed separately for compute_finding_cis cases.
-    """
-    if isinstance(v, dict) and "augmented_path" in v:
-        v = {**v, "augmented_path": "<tmp-path-stripped>"}
-    return v
-
-
-def _cmp(actual: Any, expected: Any, tol: float = 1e-6, path: str = "root") -> None:
-    """Recursively compare two parsed JSON values.
-
-    Dicts: same key set, recurse on values. Lists: same length, recurse.
-    Floats: abs(a-b) <= tol. Other: ==. Null matches None on both sides.
-    """
-    actual = _scrub_paths(actual)
-    expected = _scrub_paths(expected)
-    if isinstance(actual, dict) and isinstance(expected, dict):
-        assert set(actual.keys()) == set(expected.keys()), (
-            f"dict key mismatch at {path}: actual={sorted(actual.keys())} "
-            f"expected={sorted(expected.keys())}"
-        )
-        for k in actual:
-            _cmp(actual[k], expected[k], tol, f"{path}.{k}")
-        return
-    if isinstance(actual, list) and isinstance(expected, list):
-        assert len(actual) == len(expected), (
-            f"list len mismatch at {path}: {len(actual)} vs {len(expected)}"
-        )
-        for i, (a, e) in enumerate(zip(actual, expected)):
-            _cmp(a, e, tol, f"{path}[{i}]")
-        return
-    if isinstance(actual, float) and isinstance(expected, (int, float)):
-        assert abs(actual - expected) <= tol, (
-            f"float drift at {path}: actual={actual!r} expected={expected!r}"
-        )
-        return
-    if isinstance(expected, float) and isinstance(actual, (int, float)):
-        assert abs(actual - expected) <= tol, (
-            f"float drift at {path}: actual={actual!r} expected={expected!r}"
-        )
-        return
-    assert actual == expected, f"value mismatch at {path}: {actual!r} vs {expected!r}"
+_TOL = 1e-4  # port rounds CI fields to 4dp
 
 
 def _write_findings(tmp_path: Path, name: str, findings: list) -> Path:
@@ -113,48 +40,85 @@ def _write_findings(tmp_path: Path, name: str, findings: list) -> Path:
     return p
 
 
+def _expected_ci(votes: list[float], conf: float = 0.95) -> dict:
+    """First-principles CI for a vote vector (the formula the port
+    documents), for comparison at 4dp rounding."""
+    n = len(votes)
+    m = statistics.fmean(votes)
+    sd = statistics.stdev(votes)
+    sem = sd / math.sqrt(n)
+    tc = hci.t_critical(n - 1, conf)
+    half = tc * sem
+    return {
+        "n": n,
+        "mean": round(m, 4),
+        "sd": round(sd, 4),
+        "sem": round(sem, 4),
+        "ci_low": round(m - half, 4),
+        "ci_high": round(m + half, 4),
+        "ci_width": round(2 * half, 4),
+        "confidence": conf,
+        "t_critical": round(tc, 4),
+    }
+
+
 # ---------------------------------------------------------------------------
-# compute_finding_cis parity (4 cases)
+# compute_finding_cis (4 cases)
 # ---------------------------------------------------------------------------
 
 def test_compute_finding_cis_tight_panel(tmp_path):
+    """All four lenses agree per finding → sd=0 → zero-width CI pinned at
+    the vote value; df=3 t_critical=3.182 at the default conf=0.95."""
+    votes = {"glm": 2, "kimi": 2, "codex": 2, "minimax": 2}
     findings = [
-        {"id": "F-001", "title": "Auth retry storm",
-         "lens_votes": {"glm": 2, "kimi": 2, "codex": 2, "minimax": 2}},
+        {"id": "F-001", "title": "Auth retry storm", "lens_votes": dict(votes)},
         {"id": "F-002", "title": "Cache key collision",
          "lens_votes": {"glm": 3, "kimi": 3, "codex": 3, "minimax": 3}},
         {"id": "F-003", "title": "Null cursor crash",
          "lens_votes": {"glm": 1, "kimi": 1, "codex": 1, "minimax": 1}},
     ]
     in_path = _write_findings(tmp_path, "tight", findings)
-    bash_out = tmp_path / "tight-bash.json"
     py_out = tmp_path / "tight-py.json"
 
-    rc_bash, _ = _bash_compute(in_path, bash_out)
     rc_py = hci.compute_finding_cis(str(in_path), str(py_out))
+    assert rc_py == 0
 
-    assert rc_bash == 0 and rc_py == 0
-    _cmp(json.loads(py_out.read_text()), json.loads(bash_out.read_text()))
+    actual = json.loads(py_out.read_text())
+    assert [f["id"] for f in actual["findings"]] == ["F-001", "F-002", "F-003"]
+    for f, value in zip(actual["findings"], (2.0, 3.0, 1.0)):
+        ci = f["confidence_interval"]
+        assert ci["n"] == 4
+        assert ci["mean"] == value
+        assert ci["sd"] == 0.0
+        assert ci["sem"] == 0.0
+        assert ci["ci_low"] == ci["ci_high"] == value
+        assert ci["ci_width"] == 0.0
+        assert ci["t_critical"] == 3.182
+        assert ci["confidence"] == 0.95
 
 
 def test_compute_finding_cis_split_panel(tmp_path):
+    """Split votes → positive-width CIs matching the first-principles
+    formula at 4dp rounding."""
+    raw = [
+        ("F-001", [0, 3, 0, 3]),
+        ("F-002", [1, 4, 0, 5]),
+        ("F-003", [2, 2, 2, 2]),
+    ]
     findings = [
-        {"id": "F-001", "title": "Race condition",
-         "lens_votes": {"glm": 0, "kimi": 3, "codex": 0, "minimax": 3}},
-        {"id": "F-002", "title": "Stale cache read",
-         "lens_votes": {"glm": 1, "kimi": 4, "codex": 0, "minimax": 5}},
-        {"id": "F-003", "title": "Missing escape",
-         "lens_votes": {"glm": 2, "kimi": 2, "codex": 2, "minimax": 2}},
+        {"id": fid, "title": fid,
+         "lens_votes": dict(zip(("glm", "kimi", "codex", "minimax"), votes))}
+        for fid, votes in raw
     ]
     in_path = _write_findings(tmp_path, "split", findings)
-    bash_out = tmp_path / "split-bash.json"
     py_out = tmp_path / "split-py.json"
 
-    rc_bash, _ = _bash_compute(in_path, bash_out)
     rc_py = hci.compute_finding_cis(str(in_path), str(py_out))
+    assert rc_py == 0
 
-    assert rc_bash == 0 and rc_py == 0
-    _cmp(json.loads(py_out.read_text()), json.loads(bash_out.read_text()))
+    actual = json.loads(py_out.read_text())
+    for f, (fid, votes) in zip(actual["findings"], raw):
+        assert f["confidence_interval"] == _expected_ci([float(v) for v in votes])
 
 
 def test_single_vote_zero_width(tmp_path):
@@ -163,16 +127,11 @@ def test_single_vote_zero_width(tmp_path):
          "lens_votes": {"glm": 2}},
     ]
     in_path = _write_findings(tmp_path, "single", findings)
-    bash_out = tmp_path / "single-bash.json"
     py_out = tmp_path / "single-py.json"
 
-    rc_bash, _ = _bash_compute(in_path, bash_out)
     rc_py = hci.compute_finding_cis(str(in_path), str(py_out))
-
-    assert rc_bash == 0 and rc_py == 0
+    assert rc_py == 0
     actual = json.loads(py_out.read_text())
-    expected = json.loads(bash_out.read_text())
-    _cmp(actual, expected)
 
     ci = actual["findings"][0]["confidence_interval"]
     assert ci["n"] == 1
@@ -186,16 +145,11 @@ def test_no_numeric_votes(tmp_path):
         {"id": "F-001", "title": "Empty votes", "lens_votes": {}},
     ]
     in_path = _write_findings(tmp_path, "nonum", findings)
-    bash_out = tmp_path / "nonum-bash.json"
     py_out = tmp_path / "nonum-py.json"
 
-    rc_bash, _ = _bash_compute(in_path, bash_out)
     rc_py = hci.compute_finding_cis(str(in_path), str(py_out))
-
-    assert rc_bash == 0 and rc_py == 0
+    assert rc_py == 0
     actual = json.loads(py_out.read_text())
-    expected = json.loads(bash_out.read_text())
-    _cmp(actual, expected)
 
     ci = actual["findings"][0]["confidence_interval"]
     assert ci["n"] == 0
@@ -206,7 +160,7 @@ def test_no_numeric_votes(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# check_ci_widths parity (3 cases)
+# check_ci_widths (3 cases)
 # ---------------------------------------------------------------------------
 
 def test_check_ci_widths_within_band(tmp_path):
@@ -219,17 +173,19 @@ def test_check_ci_widths_within_band(tmp_path):
          "lens_votes": {"glm": 1, "kimi": 1, "codex": 1, "minimax": 1}},
     ]
     in_path = _write_findings(tmp_path, "tight", findings)
-    bash_dir = tmp_path / "bash"
     py_dir = tmp_path / "py"
-    bash_dir.mkdir()
     py_dir.mkdir()
 
-    v_bash, rc_bash = _bash_check(in_path, bash_dir)
     v_py, rc_py = hci.check_ci_widths(str(in_path), str(py_dir))
 
-    assert v_bash["verdict"] == "ci_within_band" and rc_bash == 0
     assert v_py["verdict"] == "ci_within_band" and rc_py == 0
-    _cmp(v_py, v_bash)
+    assert v_py["reason"] == "ok"
+    # All zero-width → nothing trips the 2.0 ceiling.
+    assert v_py["wide_count"] == 0
+    assert v_py["total"] == 3
+    assert v_py["wide_ratio"] == 0.0
+    assert v_py["ci_width_ceiling"] == 2.0
+    assert v_py["wide_ratio_ceiling"] == 0.3
 
 
 def test_check_ci_widths_too_wide(tmp_path):
@@ -242,32 +198,34 @@ def test_check_ci_widths_too_wide(tmp_path):
          "lens_votes": {"glm": 2, "kimi": 2, "codex": 2, "minimax": 2}},
     ]
     in_path = _write_findings(tmp_path, "split", findings)
-    bash_dir = tmp_path / "bash"
     py_dir = tmp_path / "py"
-    bash_dir.mkdir()
     py_dir.mkdir()
 
-    v_bash, rc_bash = _bash_check(in_path, bash_dir)
     v_py, rc_py = hci.check_ci_widths(str(in_path), str(py_dir))
 
-    assert v_bash["verdict"] == "CI_TOO_WIDE" and rc_bash == 1
     assert v_py["verdict"] == "CI_TOO_WIDE" and rc_py == 1
-    _cmp(v_py, v_bash)
+    assert v_py["reason"] == "wide_cis"
+    # F-001 (width≈5.51) and F-002 (width≈7.57) trip the 2.0 ceiling;
+    # F-003 is zero-width. 2/3 = 0.6667 > 0.3 ratio ceiling.
+    assert v_py["wide_count"] == 2
+    assert v_py["total"] == 3
+    assert abs(v_py["wide_ratio"] - 2 / 3) <= _TOL
 
 
 def test_missing_input_indeterminate(tmp_path):
-    bash_dir = tmp_path / "bash"
     py_dir = tmp_path / "py"
-    bash_dir.mkdir()
     py_dir.mkdir()
 
     bogus = tmp_path / "does-not-exist.json"
-    v_bash, rc_bash = _bash_check(bogus, bash_dir)
     v_py, rc_py = hci.check_ci_widths(str(bogus), str(py_dir))
 
-    assert v_bash["verdict"] == "indeterminate" and rc_bash == 0
     assert v_py["verdict"] == "indeterminate" and rc_py == 0
-    _cmp(v_py, v_bash)
+    assert v_py["reason"] == "missing_input"
+    assert v_py["wide_count"] == 0
+    assert v_py["total"] == 0
+    assert v_py["wide_ratio"] is None
+    # Early-return shape: NO augmented_path key.
+    assert "augmented_path" not in v_py
 
 
 # ---------------------------------------------------------------------------
@@ -289,30 +247,25 @@ def test_custom_confidence_and_ceiling(tmp_path, monkeypatch):
 
     # 1) compute_finding_cis: t_critical flips from 3.182 (df=3, conf=0.95)
     #    to 2.576 (conf=0.99 asymptote).
-    bash_out = tmp_path / "custom-bash.json"
     py_out = tmp_path / "custom-py.json"
-    rc_bash, _ = _bash_compute(in_path, bash_out)
     rc_py = hci.compute_finding_cis(str(in_path), str(py_out))
-
-    assert rc_bash == 0 and rc_py == 0
+    assert rc_py == 0
     actual = json.loads(py_out.read_text())
-    expected = json.loads(bash_out.read_text())
-    _cmp(actual, expected)
 
     for ci in actual["findings"]:
         assert ci["confidence_interval"]["t_critical"] == 2.576, ci
+        assert ci["confidence_interval"]["confidence"] == 0.99
 
-    # 2) check_ci_widths: ceiling flips to 0.5; default wide-ratio ceiling
-    #    0.3 still holds -> F-002 (ci_width ~ 4.461 at conf=0.99) trips the
-    #    CI_TOO_WIDE branch.
-    bash_dir = tmp_path / "bash2"
+    # 2) check_ci_widths: ceiling flips to 0.5; the default wide-ratio
+    #    ceiling 0.3 still holds -> F-002 (ci_width ~ 4.461 at conf=0.99)
+    #    trips the CI_TOO_WIDE branch.
     py_dir = tmp_path / "py2"
-    bash_dir.mkdir()
     py_dir.mkdir()
 
-    v_bash, rc_bash = _bash_check(in_path, bash_dir)
     v_py, rc_py = hci.check_ci_widths(str(in_path), str(py_dir))
 
-    assert v_bash["verdict"] == v_py["verdict"] == "CI_TOO_WIDE"
-    assert rc_bash == rc_py == 1
-    _cmp(v_py, v_bash)
+    assert v_py["verdict"] == "CI_TOO_WIDE"
+    assert rc_py == 1
+    assert v_py["ci_width_ceiling"] == 0.5
+    assert v_py["wide_count"] == 1  # only F-002 is wide at conf=0.99
+    assert v_py["total"] == 3

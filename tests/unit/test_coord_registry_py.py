@@ -1,23 +1,17 @@
-"""Parity gate: mini_ork.registries.coord_registry vs lib/coord_registry.sh.
+"""Standalone unit tests for ``mini_ork.registries.coord_registry``.
 
-Each test drives the LIVE bash function via
-``bash -c 'source lib/coord_registry.sh; coord_acquire "$@"' _ <args>``
-against the SAME isolated tmp state file the Python port uses, then
-diff-compares the two sides: return code, stdout bytes, stderr bytes,
-and resulting leases.json structure. No mocks, no hardcoded outputs
-beyond what bash itself emits.
+Replaces the bash-parity gate (against ``lib/coord_registry.sh``) as part
+of the bash→Python migration: the Python port is now the sole
+implementation, so its coverage no longer drives the LIVE bash function
+via ``bash -c 'source lib/coord_registry.sh; coord_acquire ...'`` — it
+asserts the port's behaviour directly. The expected values below are the
+semantic contract the bash side used to pin (rc semantics, stderr
+messages, state-file structure, TTL clamping, deadlock-abort payload),
+now asserted on the port's output.
 
-Both sides see identical env knobs (COORD_REGISTRY_STATE_FILE points at
-a tmp path; COORD_REGISTRY_AGENT_PRIORITIES / COORD_REGISTRY_AGENT_PRIORITY_*
-when priority resolution is under test).
-
-The bash heredoc normalises paths and writes atomic tmp→os.replace,
-exactly as the port does. Cross-process safety is via flock on a sibling
-.lock file — both sides honour that contract.
-
-Twelve cases (above the kickoff's >=6 floor). (a)-(h) predate the .sh
-retirement; (i)-(l) were ported from tests/unit/test_coord_registry.sh so its
-every assertion is driven on the LIVE bash side by this gate before it retires:
+Cases (a)-(l) predate the .sh retirement; (i)-(l) were ported from
+tests/unit/test_coord_registry.sh; (m)-(u) subsume the retired
+tests/unit/test_coord_registry_ttl.sh (Track B3, 19 assertions):
   (a) acquire-success           — two non-overlapping write leases, both rc=0
   (b) acquire-conflict-W+W      — overlapping prefix → rc=1 + "conflict" stderr
   (c) acquire-path-boundary     — src/api vs src/ap do NOT overlap
@@ -27,14 +21,30 @@ every assertion is driven on the LIVE bash side by this gate before it retires:
   (g) renew-not-holder          — rc=3 + "not the current holder" stderr
   (h) deadlock-abort            — A→B→A cycle, lower-priority requester aborts
                                   with rc=4 + JSON {status:abort, reason:deadlock,
-                                  agent, cycle} on stdout AND its own wait edge
+                                  agent, cycle} payload AND its own wait edge
                                   is removed from the state file.
-  (i) conflict-variants         — .sh groups 1(exact W+W) + 2 (R+W both request
-                                  orders, incl. exact path) → rc=1 conflict.
-  (j) rr-allow-overlap          — .sh group 3: three overlapping readers coexist.
-  (k) validation-variants       — .sh group 6: empty mode + ttl 0/-1/abc → rc=2.
-  (l) higher-priority-no-preempt— .sh group 9 (inverse of h): the higher-priority
+  (i) conflict-variants         — exact W+W + R+W both request orders → rc=1.
+  (j) rr-allow-overlap          — three overlapping readers coexist.
+  (k) validation-variants       — empty mode + ttl 0/-1/abc → rc=2.
+  (l) higher-priority-no-preempt— inverse of (h): the higher-priority
                                   cycle requester blocks (rc=1), holders untouched.
+  (m) default TTL = 120s on acquire (ttl omitted) — exact span
+  (n) default TTL = 120s on renew (ttl omitted) — delta window
+  (o) max TTL = 3600s; larger values capped silently (acquire + renew)
+  (p) expiry self-heal: expired lease frees on next acquire + is pruned
+  (q) renew rejects an expired lease (rc=1) and an unknown id (rc=1)
+  (r) renew arg-validation → rc=2 (missing args / bad ttl)
+  (s) renew holder/non-holder logic on a seeded live lease
+  (t) release of an expired lease returns rc=1
+  (u) a rejected (non-holder) renew must NOT mutate the lease
+
+TTL timing model: coord_acquire stores acquired_at == now, so
+expires_at - acquired_at == effective_ttl EXACTLY (clamp of the input:
+120 default, 3600 cap) with zero wall-clock skew -> exact ==. coord_renew
+updates expires_at = now + ttl but leaves acquired_at, so the span isn't
+the ttl; for renew we capture `now` in-test and assert expires_at - now
+within the retired .sh's own window (115..125 / 3595..3605), which is
+skew-robust.
 """
 from __future__ import annotations
 
@@ -43,72 +53,16 @@ import io
 import json
 import os
 import re
-import shutil
-import subprocess
 import sys
 import time
 from pathlib import Path
-
-import pytest
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
 from mini_ork.registries import coord_registry as cr
 
-SH = REPO / "lib" / "coord_registry.sh"
 
-
-def _which_bash() -> None:
-    if not shutil.which("bash"):
-        pytest.skip("bash not on PATH")
-    if not SH.exists():
-        pytest.skip(f"missing lib/coord_registry.sh at {SH}")
-
-
-# ─── live-bash subprocess helpers ─────────────────────────────────────────────
-
-
-def _bash_acquire(state_file, agent, path, mode, ttl=None, env=None):
-    base_env = {**os.environ, "COORD_REGISTRY_STATE_FILE": state_file}
-    if env:
-        base_env.update(env)
-    cmd = (
-        f'source "{SH}"\n'
-        f'coord_acquire "$1" "$2" "$3" "$4"\n'
-    )
-    args = ["bash", "-c", cmd, "_", agent, path, mode, "" if ttl is None else str(ttl)]
-    r = subprocess.run(args, env=base_env, capture_output=True, text=True)
-    return r.returncode, r.stdout, r.stderr
-
-
-def _bash_release(state_file, lease_id, env=None):
-    base_env = {**os.environ, "COORD_REGISTRY_STATE_FILE": state_file}
-    if env:
-        base_env.update(env)
-    cmd = (
-        f'source "{SH}"\n'
-        f'coord_release "$1"\n'
-    )
-    r = subprocess.run(
-        ["bash", "-c", cmd, "_", lease_id], env=base_env, capture_output=True, text=True,
-    )
-    return r.returncode, r.stdout, r.stderr
-
-
-def _bash_renew(state_file, agent, lease_id, ttl=None, env=None):
-    base_env = {**os.environ, "COORD_REGISTRY_STATE_FILE": state_file}
-    if env:
-        base_env.update(env)
-    cmd = (
-        f'source "{SH}"\n'
-        f'coord_renew "$1" "$2" "$3"\n'
-    )
-    args = ["bash", "-c", cmd, "_", agent, lease_id, "" if ttl is None else str(ttl)]
-    r = subprocess.run(args, env=base_env, capture_output=True, text=True)
-    return r.returncode, r.stdout, r.stderr
-
-
-# ─── python-port helpers (re-run under stderr capture for parity comparison) ─
+# ─── python-port helpers (stderr captured for message assertions) ────────────
 
 
 @contextlib.contextmanager
@@ -128,13 +82,13 @@ def _run_py_acquire(state_file, agent, path, mode, ttl=None):
 def _run_py_release(state_file, lease_id):
     with _captured_stderr() as buf:
         rc = cr.coord_release(lease_id, state_file=state_file)
-    return rc, "", buf.getvalue()
+    return rc, buf.getvalue()
 
 
 def _run_py_renew(state_file, agent, lease_id, ttl=None):
     with _captured_stderr() as buf:
         rc = cr.coord_renew(agent, lease_id, ttl, state_file=state_file)
-    return rc, "", buf.getvalue()
+    return rc, buf.getvalue()
 
 
 # ─── state inspection ─────────────────────────────────────────────────────────
@@ -162,200 +116,10 @@ def _reset_state(state_file) -> None:
         os.unlink(lock)
 
 
-# ─── parity core ──────────────────────────────────────────────────────────────
-
-
-def _assert_parity(bash_rc, bash_out, bash_err, py_rc, py_out, py_err, label):
-    """Compare rc + stderr + (for rc=4) payload between bash and python.
-
-    For rc=0, lease_ids are secrets.token_hex(8) (non-deterministic), so we
-    only assert format-validity and that both sides produced something. For
-    rc=4, the JSON deadlock payload is deterministic (sorted keys) and must
-    be byte-equal between the two sides.
-    """
-    assert bash_rc == py_rc, (
-        f"[{label}] rc mismatch: bash={bash_rc} py={py_rc} "
-        f"bash_stdout={bash_out!r} py_out={py_out!r}"
-    )
-    if bash_rc == 4:
-        assert isinstance(py_out, dict), (
-            f"[{label}] rc=4 must yield a dict payload, got {type(py_out).__name__}"
-        )
-        bash_payload = json.loads(bash_out.strip().splitlines()[-1])
-        assert bash_payload == py_out, (
-            f"[{label}] deadlock payload mismatch\n"
-            f"bash={bash_payload}\npy  ={dict(py_out)}"
-        )
-    elif bash_rc == 0:
-        # For acquire: bash_out is the lease_id (random hex), py_out is the
-        # same kind of lease_id. For release/renew: stdout is empty on both
-        # sides. Handle both: when stdout is non-empty, validate hex shape.
-        if bash_out.strip():
-            assert re.fullmatch(r"[A-Fa-f0-9]+", bash_out.strip()) is not None, (
-                f"[{label}] bash lease_id shape invalid: {bash_out!r}"
-            )
-            assert isinstance(py_out, str), (
-                f"[{label}] py should return a lease_id str on rc=0, got {type(py_out).__name__}"
-            )
-            assert re.fullmatch(r"[A-Fa-f0-9]+", py_out) is not None, (
-                f"[{label}] py lease_id shape invalid: {py_out!r}"
-            )
-        else:
-            # Empty stdout on rc=0 (release/renew path) — both sides silent.
-            assert not py_out, f"[{label}] py stdout non-empty on rc=0: {py_out!r}"
-    else:
-        # rc=1 (conflict/release-error), rc=2 (usage) — stdout should be empty.
-        assert bash_out == "", f"[{label}] bash stdout non-empty on rc={bash_rc}: {bash_out!r}"
-        assert not py_out, f"[{label}] py stdout non-empty on rc={py_rc}: {py_out!r}"
-    assert bash_err == py_err, (
-        f"[{label}] stderr mismatch\nbash={bash_err!r}\npy  ={py_err!r}"
-    )
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# (a) Two non-overlapping write leases — both succeed with distinct hex ids.
-# ──────────────────────────────────────────────────────────────────────────────
-def test_acquire_success_two_disjoint_writes_parity(tmp_path):
-    _which_bash()
-    sf = str(tmp_path / "leases.json")
-
-    # First write.
-    bash_rc1, bash_out1, bash_err1 = _bash_acquire(sf, "agent-w1", "src/api", "write", 60)
-    _reset_state(sf)
-    py_rc1, py_out1, py_err1 = _run_py_acquire(sf, "agent-w1", "src/api", "write", 60)
-    _assert_parity(bash_rc1, bash_out1, bash_err1, py_rc1, py_out1, py_err1, "first write")
-    assert bash_rc1 == 0 and py_rc1 == 0
-    assert re.fullmatch(r"[A-Fa-f0-9]+", bash_out1.strip()) is not None
-
-    # Second write (non-overlapping path).
-    bash_rc2, bash_out2, bash_err2 = _bash_acquire(sf, "agent-w2", "src/db", "write", 60)
-    _reset_state(sf)
-    cr.coord_acquire("agent-w1", "src/api", "write", 60, state_file=sf)
-    py_rc2, py_out2, py_err2 = _run_py_acquire(sf, "agent-w2", "src/db", "write", 60)
-    _assert_parity(bash_rc2, bash_out2, bash_err2, py_rc2, py_out2, py_err2, "second write")
-    assert bash_rc2 == 0 and py_rc2 == 0
-    assert bash_out1.strip() != bash_out2.strip(), "lease ids must differ"
-    assert _state_lease_count(sf) == 2
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# (b) Overlapping write+write — second write blocked with rc=1 + "conflict"
-#     on stderr. State still has only the first lease.
-# ──────────────────────────────────────────────────────────────────────────────
-def test_acquire_conflict_ww_overlap_parity(tmp_path):
-    _which_bash()
-    sf = str(tmp_path / "leases.json")
-
-    bash_rc1, _, _ = _bash_acquire(sf, "agent-w1", "src/api", "write", 60)
-    bash_rc2, bash_out2, bash_err2 = _bash_acquire(sf, "agent-w2", "src/api/x.rs", "write", 60)
-    _reset_state(sf)
-    cr.coord_acquire("agent-w1", "src/api", "write", 60, state_file=sf)
-    py_rc2, py_out2, py_err2 = _run_py_acquire(sf, "agent-w2", "src/api/x.rs", "write", 60)
-
-    assert bash_rc1 == 0
-    _assert_parity(bash_rc2, bash_out2, bash_err2, py_rc2, py_out2, py_err2, "w+w overlap")
-    assert bash_rc2 == 1 and py_rc2 == 1
-    assert "conflict" in bash_err2.lower()
-    assert "conflict" in py_err2.lower()
-    state = _read_state(sf)
-    assert len(state["leases"]) == 1
-    assert "agent-w2" in state.get("waits", {})
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# (c) Path boundary: writer holds /src/api; reader requests /src/ap. The
-#     trailing-slash trick prevents /src/ap from being treated as a prefix of
-#     /src/api — read allowed, rc=0.
-# ──────────────────────────────────────────────────────────────────────────────
-def test_acquire_path_boundary_parity(tmp_path):
-    _which_bash()
-    sf = str(tmp_path / "leases.json")
-
-    bash_rc1, _, _ = _bash_acquire(sf, "agent-w1", "src/api", "write", 60)
-    bash_rc2, bash_out2, bash_err2 = _bash_acquire(sf, "agent-r3", "src/ap", "read", 60)
-    _reset_state(sf)
-    cr.coord_acquire("agent-w1", "src/api", "write", 60, state_file=sf)
-    py_rc2, py_out2, py_err2 = _run_py_acquire(sf, "agent-r3", "src/ap", "read", 60)
-
-    assert bash_rc1 == 0
-    _assert_parity(bash_rc2, bash_out2, bash_err2, py_rc2, py_out2, py_err2, "boundary read")
-    assert bash_rc2 == 0 and py_rc2 == 0
-    assert re.fullmatch(r"[A-Fa-f0-9]+", bash_out2.strip()) is not None
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# (d) Mode validation: unknown mode → rc=2 + mode/usage stderr.
-# ──────────────────────────────────────────────────────────────────────────────
-def test_acquire_mode_validation_parity(tmp_path):
-    _which_bash()
-    sf = str(tmp_path / "leases.json")
-
-    bash_rc, bash_out, bash_err = _bash_acquire(sf, "agent-x", "src/api", "weird", 60)
-    _reset_state(sf)
-    py_rc, py_out, py_err = _run_py_acquire(sf, "agent-x", "src/api", "weird", 60)
-    _assert_parity(bash_rc, bash_out, bash_err, py_rc, py_out, py_err, "mode=weird")
-    assert bash_rc == 2 and py_rc == 2
-    assert "read" in bash_err and "write" in bash_err
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# (e) Release round-trip: valid → rc=0, double-release → rc=1, malformed → rc=1.
-#     Pattern: bash acquires the lease (gives us a deterministic id), then
-#     bash and python each try to release that SAME id. This way the stderr
-#     message ("coord_release: unknown lease id <id>") is byte-equal on both
-#     sides — the lease_id is shared, not random-per-side.
-# ──────────────────────────────────────────────────────────────────────────────
-def test_release_roundtrip_parity(tmp_path):
-    _which_bash()
-    sf = str(tmp_path / "leases.json")
-
-    # Step 1: valid release (rc=0). Bash acquires, gets lease_id; both sides
-    # release it (rc=0, stderr="").
-    _reset_state(sf)
-    bash_rc, bash_out, _ = _bash_acquire(sf, "agent-r1", "src/api", "read", 60)
-    bash_lease = bash_out.strip()
-    assert bash_rc == 0
-    assert re.fullmatch(r"[A-Fa-f0-9]+", bash_lease) is not None
-
-    bash_rel1_rc, bash_rel1_out, bash_rel1_err = _bash_release(sf, bash_lease)
-    # State is now empty (bash released). Set state back to "lease exists"
-    # by re-acquiring on the python side with the same lease_id... but the
-    # python acquire generates a random id. Instead, write the state file
-    # directly to mirror what bash just removed, then run python release.
-    _reset_state(sf)
-    _seed_lease(sf, bash_lease, "agent-r1")
-    py_rel1_rc, _, py_rel1_err = _run_py_release(sf, bash_lease)
-    _assert_parity(bash_rel1_rc, bash_rel1_out, bash_rel1_err,
-                   py_rel1_rc, "", py_rel1_err, "release valid")
-    assert bash_rel1_rc == 0 and py_rel1_rc == 0
-
-    # Step 2: double-release (rc=1). State is empty after step 1. Both sides
-    # try to release bash_lease (no longer present) → rc=1, stderr mentions
-    # bash_lease by id.
-    bash_rel2_rc, bash_rel2_out, bash_rel2_err = _bash_release(sf, bash_lease)
-    py_rel2_rc, _, py_rel2_err = _run_py_release(sf, bash_lease)
-    _assert_parity(bash_rel2_rc, bash_rel2_out, bash_rel2_err,
-                   py_rel2_rc, "", py_rel2_err, "double release")
-    assert bash_rel2_rc == 1 and py_rel2_rc == 1
-    assert "unknown" in bash_rel2_err.lower()
-    assert bash_lease in bash_rel2_err  # stderr embeds the shared id
-
-    # Step 3: malformed id (rc=1). Both sides reject "not-hex!" with
-    # "coord_release: malformed lease id\n".
-    bash_rel3_rc, bash_rel3_out, bash_rel3_err = _bash_release(sf, "not-hex!")
-    py_rel3_rc, _, py_rel3_err = _run_py_release(sf, "not-hex!")
-    _assert_parity(bash_rel3_rc, bash_rel3_out, bash_rel3_err,
-                   py_rel3_rc, "", py_rel3_err, "malformed lease id")
-    assert bash_rel3_rc == 1 and py_rel3_rc == 1
-    assert "malformed" in bash_rel3_err.lower()
-
-
 def _seed_lease(state_file: str, lease_id: str, agent: str) -> None:
-    """Write a single live lease into the state file (used when we need to
-    replicate a bash-side setup on the python side without re-acquiring)."""
-    now = int(os.environ.get("_FAKE_NOW", "0")) or __import__("time").time()
-    import time as _t
-    now = int(_t.time())
+    """Write a single live lease into the state file (used when we need a
+    deterministic shared lease id for error-path assertions)."""
+    now = int(time.time())
     state = {
         "leases": {
             lease_id: {
@@ -374,137 +138,184 @@ def _seed_lease(state_file: str, lease_id: str, agent: str) -> None:
         f.write("\n")
 
 
+def _assert_lease_id(value) -> None:
+    """rc=0 acquire returns a hex lease_id (secrets.token_hex(8))."""
+    assert isinstance(value, str), (
+        f"rc=0 acquire should return a lease_id str, got {type(value).__name__}"
+    )
+    assert re.fullmatch(r"[A-Fa-f0-9]+", value) is not None, (
+        f"lease_id shape invalid: {value!r}"
+    )
+
+
 # ──────────────────────────────────────────────────────────────────────────────
-# (f) renew-own extends expires_at. Each side independently acquires a lease,
-#     captures expires_at, renews it, captures expires_at again, then asserts
-#     the renewal advanced the timestamp. rc must be 0 on both sides.
+# (a) Two non-overlapping write leases — both succeed with distinct hex ids.
 # ──────────────────────────────────────────────────────────────────────────────
-def test_renew_own_extends_expires_parity(tmp_path):
-    _which_bash()
+def test_acquire_success_two_disjoint_writes(tmp_path):
     sf = str(tmp_path / "leases.json")
 
-    # Bash side.
-    bash_rc, bash_out, _ = _bash_acquire(sf, "agent-holder", "src/api", "write", 60)
-    bash_lease = bash_out.strip()
-    assert bash_rc == 0
-    bash_state_before = _read_state(sf)
-    bash_expires_before = int(bash_state_before["leases"][bash_lease]["expires_at"])
-    bash_renew_rc, bash_renew_out, bash_renew_err = _bash_renew(sf, "agent-holder", bash_lease, 600)
-    bash_state_after = _read_state(sf)
-    bash_expires_after = int(bash_state_after["leases"][bash_lease]["expires_at"])
+    # First write.
+    py_rc1, py_out1, py_err1 = _run_py_acquire(sf, "agent-w1", "src/api", "write", 60)
+    assert py_rc1 == 0 and py_err1 == ""
+    _assert_lease_id(py_out1)
 
-    # Python side (independent setup).
+    # Second write (non-overlapping path).
+    py_rc2, py_out2, py_err2 = _run_py_acquire(sf, "agent-w2", "src/db", "write", 60)
+    assert py_rc2 == 0 and py_err2 == ""
+    _assert_lease_id(py_out2)
+    assert py_out1 != py_out2, "lease ids must differ"
+    assert _state_lease_count(sf) == 2
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# (b) Overlapping write+write — second write blocked with rc=1 + "conflict"
+#     on stderr. State still has only the first lease.
+# ──────────────────────────────────────────────────────────────────────────────
+def test_acquire_conflict_ww_overlap(tmp_path):
+    sf = str(tmp_path / "leases.json")
+
+    py_rc1, _, _ = _run_py_acquire(sf, "agent-w1", "src/api", "write", 60)
+    py_rc2, py_out2, py_err2 = _run_py_acquire(sf, "agent-w2", "src/api/x.rs", "write", 60)
+
+    assert py_rc1 == 0
+    assert py_rc2 == 1
+    assert not py_out2
+    assert "conflict" in py_err2.lower()
+    state = _read_state(sf)
+    assert len(state["leases"]) == 1
+    assert "agent-w2" in state.get("waits", {})
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# (c) Path boundary: writer holds /src/api; reader requests /src/ap. The
+#     trailing-slash trick prevents /src/ap from being treated as a prefix of
+#     /src/api — read allowed, rc=0.
+# ──────────────────────────────────────────────────────────────────────────────
+def test_acquire_path_boundary(tmp_path):
+    sf = str(tmp_path / "leases.json")
+
+    py_rc1, _, _ = _run_py_acquire(sf, "agent-w1", "src/api", "write", 60)
+    py_rc2, py_out2, py_err2 = _run_py_acquire(sf, "agent-r3", "src/ap", "read", 60)
+
+    assert py_rc1 == 0
+    assert py_rc2 == 0 and py_err2 == ""
+    _assert_lease_id(py_out2)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# (d) Mode validation: unknown mode → rc=2 + mode/usage stderr.
+# ──────────────────────────────────────────────────────────────────────────────
+def test_acquire_mode_validation(tmp_path):
+    sf = str(tmp_path / "leases.json")
+
+    py_rc, py_out, py_err = _run_py_acquire(sf, "agent-x", "src/api", "weird", 60)
+    assert py_rc == 2
+    assert not py_out
+    assert "read" in py_err and "write" in py_err
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# (e) Release round-trip: valid → rc=0, double-release → rc=1, malformed → rc=1.
+#     The unknown-id stderr message embeds the lease id; a shared seeded id
+#     keeps the assertion deterministic.
+# ──────────────────────────────────────────────────────────────────────────────
+def test_release_roundtrip(tmp_path):
+    sf = str(tmp_path / "leases.json")
+
+    # Step 1: valid release (rc=0, stderr="").
     _reset_state(sf)
+    _seed_lease(sf, "cafebabe", "agent-r1")
+    py_rel1_rc, py_rel1_err = _run_py_release(sf, "cafebabe")
+    assert py_rel1_rc == 0 and py_rel1_err == ""
+
+    # Step 2: double-release (rc=1). State is empty after step 1 → stderr
+    # mentions the id.
+    py_rel2_rc, py_rel2_err = _run_py_release(sf, "cafebabe")
+    assert py_rel2_rc == 1
+    assert "unknown" in py_rel2_err.lower()
+    assert "cafebabe" in py_rel2_err
+
+    # Step 3: malformed id (rc=1) → "malformed lease id" stderr.
+    py_rel3_rc, py_rel3_err = _run_py_release(sf, "not-hex!")
+    assert py_rel3_rc == 1
+    assert "malformed" in py_rel3_err.lower()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# (f) renew-own extends expires_at, rc=0.
+# ──────────────────────────────────────────────────────────────────────────────
+def test_renew_own_extends_expires(tmp_path):
+    sf = str(tmp_path / "leases.json")
+
     py_rc, py_lease, _ = _run_py_acquire(sf, "agent-holder", "src/api", "write", 60)
     assert py_rc == 0
     py_state_before = _read_state(sf)
     py_expires_before = int(py_state_before["leases"][py_lease]["expires_at"])
-    py_renew_rc, _, py_renew_err = _run_py_renew(sf, "agent-holder", py_lease, 600)
+    py_renew_rc, py_renew_err = _run_py_renew(sf, "agent-holder", py_lease, 600)
     py_state_after = _read_state(sf)
     py_expires_after = int(py_state_after["leases"][py_lease]["expires_at"])
 
-    _assert_parity(bash_renew_rc, bash_renew_out, bash_renew_err,
-                   py_renew_rc, "", py_renew_err, "renew own")
-    assert bash_renew_rc == 0 and py_renew_rc == 0
-
-    # Both sides must show advance, by a similar magnitude.
-    bash_delta = bash_expires_after - bash_expires_before
+    assert py_renew_rc == 0 and py_renew_err == ""
     py_delta = py_expires_after - py_expires_before
-    assert bash_delta >= 500, f"bash renew delta too small: {bash_delta}"
-    assert py_delta >= 500, f"py renew delta too small: {py_delta}"
+    assert py_delta >= 500, f"renew delta too small: {py_delta}"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # (g) renew-not-holder: rc=3 + "not the current holder" on stderr.
 # ──────────────────────────────────────────────────────────────────────────────
-def test_renew_not_holder_parity(tmp_path):
-    _which_bash()
+def test_renew_not_holder(tmp_path):
     sf = str(tmp_path / "leases.json")
 
-    # Bash side.
-    bash_rc, bash_out, _ = _bash_acquire(sf, "agent-holder", "src/api", "write", 60)
-    bash_lease = bash_out.strip()
-    assert bash_rc == 0
-    bash_renew_rc, bash_renew_out, bash_renew_err = _bash_renew(sf, "agent-other", bash_lease, 60)
-
-    # Python side (independent setup).
-    _reset_state(sf)
     py_rc, py_lease, _ = _run_py_acquire(sf, "agent-holder", "src/api", "write", 60)
     assert py_rc == 0
-    py_renew_rc, _, py_renew_err = _run_py_renew(sf, "agent-other", py_lease, 60)
+    py_renew_rc, py_renew_err = _run_py_renew(sf, "agent-other", py_lease, 60)
 
-    _assert_parity(bash_renew_rc, bash_renew_out, bash_renew_err,
-                   py_renew_rc, "", py_renew_err, "renew not-holder")
-    assert bash_renew_rc == 3 and py_renew_rc == 3
-    assert "not the current holder" in bash_renew_err.lower()
+    assert py_renew_rc == 3
+    assert "not the current holder" in py_renew_err.lower()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # (h) Deadlock abort: A→B→A cycle. agent-a priority 20, agent-b priority 10.
 #     agent-b is the lowest-priority participant → its blocked cycle acquire
-#     aborts with rc=4 + JSON payload on stdout AND its own wait edge is
-#     removed from the state file. agent-a's wait edge (a→b) remains.
+#     aborts with rc=4 + JSON payload AND its own wait edge is removed from
+#     the state file. agent-a's wait edge (a→b) remains.
 # ──────────────────────────────────────────────────────────────────────────────
-def test_deadlock_abort_parity(tmp_path, monkeypatch):
-    _which_bash()
+def test_deadlock_abort(tmp_path, monkeypatch):
     sf = str(tmp_path / "leases.json")
     monkeypatch.setenv("COORD_REGISTRY_AGENT_PRIORITIES", "agent-a=20,agent-b=10")
-    env_overrides = {"COORD_REGISTRY_AGENT_PRIORITIES": "agent-a=20,agent-b=10"}
 
-    # Bash side: build the cycle in a single tmp dir.
     _reset_state(sf)
-    rc1, _, _ = _bash_acquire(sf, "agent-a", "src/a", "write", 60, env=env_overrides)
-    rc2, _, _ = _bash_acquire(sf, "agent-b", "src/b", "write", 60, env=env_overrides)
-    rc3, _, _ = _bash_acquire(sf, "agent-a", "src/b", "write", 60, env=env_overrides)
-    bash_rc4, bash_out4, bash_err4 = _bash_acquire(sf, "agent-b", "src/a", "write", 60, env=env_overrides)
-    bash_state = _read_state(sf)
-
-    assert rc1 == 0 and rc2 == 0 and rc3 == 1, (
-        f"setup precondition: a holds, b holds, a-waits-blocked; got rc1={rc1} rc2={rc2} rc3={rc3}"
-    )
-    assert bash_rc4 == 4
-    bash_payload = json.loads(bash_out4.strip().splitlines()[-1])
-
-    # Python side: rebuild from clean state.
-    _reset_state(sf)
-    cr.coord_acquire("agent-a", "src/a", "write", 60, state_file=sf)
-    cr.coord_acquire("agent-b", "src/b", "write", 60, state_file=sf)
-    cr.coord_acquire("agent-a", "src/b", "write", 60, state_file=sf)
+    _, rc1 = cr.coord_acquire("agent-a", "src/a", "write", 60, state_file=sf)
+    _, rc2 = cr.coord_acquire("agent-b", "src/b", "write", 60, state_file=sf)
+    _, rc3 = cr.coord_acquire("agent-a", "src/b", "write", 60, state_file=sf)
     py_out4, py_rc4 = cr.coord_acquire("agent-b", "src/a", "write", 60, state_file=sf)
     py_state = _read_state(sf)
 
+    assert rc1 == 0 and rc2 == 0 and rc3 == 1, (
+        f"setup precondition: a holds, b holds, a-waits-blocked; "
+        f"got rc1={rc1} rc2={rc2} rc3={rc3}"
+    )
     assert py_rc4 == 4
 
-    # State structure parity.
-    assert len(bash_state["leases"]) == len(py_state["leases"]) == 2
-    assert set(bash_state["waits"].keys()) == set(py_state["waits"].keys())
-    assert "agent-b" not in bash_state["waits"]
+    # State structure.
+    assert len(py_state["leases"]) == 2
     assert "agent-b" not in py_state["waits"]
-    assert bash_state["waits"].get("agent-a") == ["agent-b"]
     assert py_state["waits"].get("agent-a") == ["agent-b"]
 
-    # Payload byte-for-byte.
-    assert bash_payload == py_out4
-    assert bash_payload["status"] == "abort"
-    assert bash_payload["reason"] == "deadlock"
-    assert bash_payload["agent"] == "agent-b"
-    assert sorted(bash_payload["cycle"]) == ["agent-a", "agent-b"]
-
-    # bash_err4 is empty for the deadlock path (bash skips the "conflict..."
-    # stderr branch on victim-self-abort).
-    assert bash_err4 == ""
+    # Payload.
+    assert isinstance(py_out4, dict)
+    assert py_out4["status"] == "abort"
+    assert py_out4["reason"] == "deadlock"
+    assert py_out4["agent"] == "agent-b"
+    assert sorted(py_out4["cycle"]) == ["agent-a", "agent-b"]
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# (i) Conflict variants — ports test_coord_registry.sh groups 1(exact W+W) + 2
-#     (R+W in both request orders, incl. exact path). A WRITE participant on an
-#     overlapping OR identical path always conflicts (rc=1), regardless of order;
-#     only R+R is exempt (see test (j)). Each scenario drives the live bash lib
-#     and the port through the same holder→requester sequence on a fresh state
-#     file and asserts rc/stdout/stderr parity plus rc=1 on the blocked acquire.
+# (i) Conflict variants — exact W+W + R+W in both request orders. A WRITE
+#     participant on an overlapping OR identical path always conflicts (rc=1),
+#     regardless of order; only R+R is exempt (see test (j)).
 # ──────────────────────────────────────────────────────────────────────────────
-def test_acquire_conflict_variants_parity(tmp_path):
-    _which_bash()
+def test_acquire_conflict_variants(tmp_path):
     sf = str(tmp_path / "leases.json")
 
     # (holder_mode, req_agent, req_path, req_mode, label)
@@ -516,59 +327,44 @@ def test_acquire_conflict_variants_parity(tmp_path):
     ]
     for holder_mode, req_agent, req_path, req_mode, label in scenarios:
         _reset_state(sf)
-        h_rc, _, _ = _bash_acquire(sf, "agent-h1", "src/api", holder_mode, 60)
-        b_rc, b_out, b_err = _bash_acquire(sf, req_agent, req_path, req_mode, 60)
-
-        _reset_state(sf)
-        cr.coord_acquire("agent-h1", "src/api", holder_mode, 60, state_file=sf)
+        h_rc, _, _ = _run_py_acquire(sf, "agent-h1", "src/api", holder_mode, 60)
         p_rc, p_out, p_err = _run_py_acquire(sf, req_agent, req_path, req_mode, 60)
 
         assert h_rc == 0, f"[{label}] holder acquire failed rc={h_rc}"
-        _assert_parity(b_rc, b_out, b_err, p_rc, p_out, p_err, label)
-        assert b_rc == 1 and p_rc == 1, f"[{label}] expected conflict rc=1"
-        assert "conflict" in b_err.lower() and "conflict" in p_err.lower()
+        assert p_rc == 1, f"[{label}] expected conflict rc=1"
+        assert not p_out
+        assert "conflict" in p_err.lower()
     _reset_state(sf)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# (j) R+R allow — ports test_coord_registry.sh group 3. Many readers may hold
-#     overlapping prefixes concurrently: reader1@src/api, reader2@src/api/x.rs
-#     (overlapping child), reader3@src/api (exact) all succeed (rc=0) and coexist
-#     as three live leases on both sides.
+# (j) R+R allow — many readers may hold overlapping prefixes concurrently:
+#     reader1@src/api, reader2@src/api/x.rs (overlapping child), reader3@src/api
+#     (exact) all succeed (rc=0) and coexist as three live leases.
 # ──────────────────────────────────────────────────────────────────────────────
-def test_acquire_rr_allow_overlap_parity(tmp_path):
-    _which_bash()
+def test_acquire_rr_allow_overlap(tmp_path):
     sf = str(tmp_path / "leases.json")
 
     _reset_state(sf)
-    b_rc1, _, _ = _bash_acquire(sf, "agent-r1", "src/api", "read", 60)
-    b_rc2, b_out2, b_err2 = _bash_acquire(sf, "agent-r2", "src/api/x.rs", "read", 60)
-    b_rc3, b_out3, b_err3 = _bash_acquire(sf, "agent-r3", "src/api", "read", 60)
-    bash_count = _state_lease_count(sf)
-
-    _reset_state(sf)
-    cr.coord_acquire("agent-r1", "src/api", "read", 60, state_file=sf)
+    p_rc1, _, _ = _run_py_acquire(sf, "agent-r1", "src/api", "read", 60)
     p_rc2, p_out2, p_err2 = _run_py_acquire(sf, "agent-r2", "src/api/x.rs", "read", 60)
     p_rc3, p_out3, p_err3 = _run_py_acquire(sf, "agent-r3", "src/api", "read", 60)
-    py_count = _state_lease_count(sf)
 
-    assert b_rc1 == 0
-    _assert_parity(b_rc2, b_out2, b_err2, p_rc2, p_out2, p_err2, "r+r overlap child")
-    _assert_parity(b_rc3, b_out3, b_err3, p_rc3, p_out3, p_err3, "r+r overlap exact")
-    assert b_rc2 == 0 and p_rc2 == 0
-    assert b_rc3 == 0 and p_rc3 == 0
-    assert bash_count == py_count == 3
+    assert p_rc1 == 0
+    assert p_rc2 == 0 and p_err2 == ""
+    assert p_rc3 == 0 and p_err3 == ""
+    _assert_lease_id(p_out2)
+    _assert_lease_id(p_out3)
+    assert _state_lease_count(sf) == 3
     _reset_state(sf)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# (k) Validation variants — ports test_coord_registry.sh group 6. Every
-#     invalid-arg form exits rc=2 with a byte-equal usage/validation message on
-#     both sides (empty mode hits the usage branch; bad ttl hits the ttl branch;
-#     mode='weird' is also covered standalone by test_acquire_mode_validation).
+# (k) Validation variants — every invalid-arg form exits rc=2 with a
+#     usage/validation message (empty mode hits the usage branch; bad ttl hits
+#     the ttl branch; mode='weird' is also covered standalone by test (d)).
 # ──────────────────────────────────────────────────────────────────────────────
-def test_acquire_validation_variants_parity(tmp_path):
-    _which_bash()
+def test_acquire_validation_variants(tmp_path):
     sf = str(tmp_path / "leases.json")
 
     # (mode, ttl, label)
@@ -580,76 +376,47 @@ def test_acquire_validation_variants_parity(tmp_path):
         ("read", "abc", "ttl=abc"),
     ]
     for mode, ttl, label in variants:
-        b_rc, b_out, b_err = _bash_acquire(sf, "agent-x", "src/api", mode, ttl)
         _reset_state(sf)
         p_rc, p_out, p_err = _run_py_acquire(sf, "agent-x", "src/api", mode, ttl)
-        _assert_parity(b_rc, b_out, b_err, p_rc, p_out, p_err, label)
-        assert b_rc == 2 and p_rc == 2, f"[{label}] expected rc=2, got bash={b_rc} py={p_rc}"
+        assert p_rc == 2, f"[{label}] expected rc=2, got py={p_rc}"
+        assert not p_out
+        assert p_err
+    _reset_state(sf)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# (l) Higher-priority requester does NOT preempt — ports test_coord_registry.sh
-#     group 9, the inverse of the deadlock-abort (h). Same A→B→A cycle but with
-#     the priorities flipped (agent-a=10, agent-b=20) so the cycle-completing
-#     requester (agent-b) is the HIGHER-priority participant. Wound-wait names
-#     the LOWER-priority agent (agent-a) as victim, so agent-b — not being the
-#     victim — simply blocks with rc=1 instead of aborting (rc=4), and the two
-#     active holder leases are left untouched on both sides.
+# (l) Higher-priority requester does NOT preempt — the inverse of the
+#     deadlock-abort (h). Same A→B→A cycle but with the priorities flipped
+#     (agent-a=10, agent-b=20) so the cycle-completing requester (agent-b) is
+#     the HIGHER-priority participant. Wound-wait names the LOWER-priority
+#     agent (agent-a) as victim, so agent-b — not being the victim — simply
+#     blocks with rc=1 instead of aborting (rc=4), and the two active holder
+#     leases are left untouched.
 # ──────────────────────────────────────────────────────────────────────────────
-def test_higher_priority_no_preempt_parity(tmp_path, monkeypatch):
-    _which_bash()
+def test_higher_priority_no_preempt(tmp_path, monkeypatch):
     sf = str(tmp_path / "leases.json")
     monkeypatch.setenv("COORD_REGISTRY_AGENT_PRIORITIES", "agent-a=10,agent-b=20")
-    env_overrides = {"COORD_REGISTRY_AGENT_PRIORITIES": "agent-a=10,agent-b=20"}
 
     _reset_state(sf)
-    rc1, _, _ = _bash_acquire(sf, "agent-a", "src/a", "write", 60, env=env_overrides)
-    rc2, _, _ = _bash_acquire(sf, "agent-b", "src/b", "write", 60, env=env_overrides)
-    rc3, _, _ = _bash_acquire(sf, "agent-a", "src/b", "write", 60, env=env_overrides)
-    bash_rc4, bash_out4, bash_err4 = _bash_acquire(sf, "agent-b", "src/a", "write", 60, env=env_overrides)
-    bash_state = _read_state(sf)
+    _, rc1 = cr.coord_acquire("agent-a", "src/a", "write", 60, state_file=sf)
+    _, rc2 = cr.coord_acquire("agent-b", "src/b", "write", 60, state_file=sf)
+    _, rc3 = cr.coord_acquire("agent-a", "src/b", "write", 60, state_file=sf)
+    py_rc4, py_out4, py_err4 = _run_py_acquire(sf, "agent-b", "src/a", "write", 60)
+    py_state = _read_state(sf)
 
     assert rc1 == 0 and rc2 == 0 and rc3 == 1, (
         f"setup precondition failed: rc1={rc1} rc2={rc2} rc3={rc3}"
     )
-    assert bash_rc4 == 1, f"higher-priority requester must block (rc=1), got rc={bash_rc4}"
-
-    _reset_state(sf)
-    cr.coord_acquire("agent-a", "src/a", "write", 60, state_file=sf)
-    cr.coord_acquire("agent-b", "src/b", "write", 60, state_file=sf)
-    cr.coord_acquire("agent-a", "src/b", "write", 60, state_file=sf)
-    py_rc4, py_out4, py_err4 = _run_py_acquire(sf, "agent-b", "src/a", "write", 60)
-    py_state = _read_state(sf)
-
-    assert py_rc4 == 1
-    _assert_parity(bash_rc4, bash_out4, bash_err4, py_rc4, py_out4, py_err4, "higher-prio no preempt")
-    # Holders untouched: exactly two active leases on both sides (no preemption).
-    assert len(bash_state["leases"]) == len(py_state["leases"]) == 2
+    assert py_rc4 == 1, f"higher-priority requester must block (rc=1), got rc={py_rc4}"
+    assert not py_out4
+    assert "conflict" in py_err4.lower()
+    # Holders untouched: exactly two active leases (no preemption).
+    assert len(py_state["leases"]) == 2
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TTL / time-bounded lease parity (subsumes retired
+# TTL / time-bounded lease tests (subsumes retired
 #   tests/unit/test_coord_registry_ttl.sh, Track B3)
-#
-# That fixture was LIVE at retirement (19 OK / 0 SKIP / 0 FAIL). It drove
-# lib/coord_registry.sh's lease-lifetime surface directly. The existing gate
-# above (cases a-l) covers acquire/conflict/deadlock/release + renew rc=0 (f)
-# and rc=3 (g), but NOT the time-bounded behaviours the .sh existed to prove:
-# default/max TTL, expiry self-heal, renew rc=1 on expired/unknown, renew
-# arg-validation rc=2, the CLI wrapper, and expired-release rc. The cases below
-# revive every one of the .sh's 19 assertions, each driving the LIVE bash lib
-# via subprocess AND the port on the SAME state file and asserting bash==port.
-#
-# TTL timing model: coord_acquire stores acquired_at == now, so on a single
-# side expires_at - acquired_at == effective_ttl EXACTLY (clamp of the input:
-# 120 default, 3600 cap) with zero cross-process wall-clock skew -> exact ==.
-# coord_renew updates expires_at = now + ttl but leaves acquired_at, so the
-# span isn't the ttl; for renew we capture `now` in-test and assert
-# expires_at - now within the .sh's own window (115..125 / 3595..3605), which
-# is skew-robust. Error paths whose stderr embeds the (random) lease_id use a
-# SHARED seeded id so the bytes match on both sides (same trick as case (e)).
-# .sh section -> case:  §1->(m) §2->(n) §3->(o) §4->(p) §5->(f) §6->(g)+(u)
-#                       §7->(q) §8->(r) §9->(s) §10->(t)
 # ══════════════════════════════════════════════════════════════════════════════
 
 
@@ -678,98 +445,59 @@ def _only_lease(state_file):
     return leases[0]
 
 
-# ── (m) default TTL = 120s on acquire (ttl omitted) — exact span parity ────────
-def test_ttl_default_120_on_acquire_parity(tmp_path):
-    _which_bash()
+# ── (m) default TTL = 120s on acquire (ttl omitted) — exact span ───────────────
+def test_ttl_default_120_on_acquire(tmp_path):
     sf = str(tmp_path / "leases.json")
-
-    _reset_state(sf)
-    b_rc, b_out, b_err = _bash_acquire(sf, "agent-a", "src/api", "write", None)
-    b_span = _ttl_span(sf, b_out.strip())
 
     _reset_state(sf)
     p_rc, p_lease, p_err = _run_py_acquire(sf, "agent-a", "src/api", "write", None)
     p_span = _ttl_span(sf, p_lease)
 
-    _assert_parity(b_rc, b_out, b_err, p_rc, p_lease, p_err, "default ttl acquire")
-    assert b_rc == 0 and p_rc == 0
-    assert b_span == 120, f"bash default acquire span={b_span} != 120"
-    assert b_span == p_span == 120, f"span parity bash={b_span} py={p_span}"
+    assert p_rc == 0 and p_err == ""
+    assert p_span == 120, f"default acquire span={p_span} != 120"
 
 
-# ── (n) default TTL = 120s on renew (ttl omitted) — delta-window parity ────────
-def test_ttl_default_120_on_renew_parity(tmp_path):
-    _which_bash()
+# ── (n) default TTL = 120s on renew (ttl omitted) — delta window ───────────────
+def test_ttl_default_120_on_renew(tmp_path):
     sf = str(tmp_path / "leases.json")
-
-    _reset_state(sf)
-    _bash_acquire(sf, "agent-a", "src/api", "write", 60)
-    b_lease = _only_lease(sf)
-    now_b = int(time.time())
-    b_rc, b_out, b_err = _bash_renew(sf, "agent-a", b_lease, None)
-    b_delta = int(_read_state(sf)["leases"][b_lease]["expires_at"]) - now_b
 
     _reset_state(sf)
     _run_py_acquire(sf, "agent-a", "src/api", "write", 60)
     p_lease = _only_lease(sf)
     now_p = int(time.time())
-    p_rc, _, p_err = _run_py_renew(sf, "agent-a", p_lease, None)
+    p_rc, p_err = _run_py_renew(sf, "agent-a", p_lease, None)
     p_delta = int(_read_state(sf)["leases"][p_lease]["expires_at"]) - now_p
 
-    _assert_parity(b_rc, b_out, b_err, p_rc, "", p_err, "default ttl renew")
-    assert b_rc == 0 and p_rc == 0
-    assert 115 <= b_delta <= 125, f"bash renew default delta={b_delta} not ~120"
-    assert 115 <= p_delta <= 125, f"py renew default delta={p_delta} not ~120"
+    assert p_rc == 0 and p_err == ""
+    assert 115 <= p_delta <= 125, f"renew default delta={p_delta} not ~120"
 
 
 # ── (o) max TTL = 3600s; larger values capped silently (acquire + renew) ───────
-def test_ttl_max_cap_3600_parity(tmp_path):
-    _which_bash()
+def test_ttl_max_cap_3600(tmp_path):
     sf = str(tmp_path / "leases.json")
 
-    # acquire ttl=99999 → span exactly 3600 on both sides.
-    _reset_state(sf)
-    _bash_acquire(sf, "agent-a", "src/api", "write", 99999)
-    b_span = _ttl_span(sf, _only_lease(sf))
+    # acquire ttl=99999 → span exactly 3600.
     _reset_state(sf)
     _run_py_acquire(sf, "agent-a", "src/api", "write", 99999)
     p_span = _ttl_span(sf, _only_lease(sf))
-    assert b_span == 3600, f"bash acquire cap span={b_span} != 3600"
-    assert b_span == p_span == 3600, f"acquire cap parity bash={b_span} py={p_span}"
+    assert p_span == 3600, f"acquire cap span={p_span} != 3600"
 
-    # renew ttl=99999 → delta ~3600 on both sides.
-    _reset_state(sf)
-    _bash_acquire(sf, "agent-a", "src/api", "write", 60)
-    b_lease = _only_lease(sf)
-    now_b = int(time.time())
-    b_rc, b_out, b_err = _bash_renew(sf, "agent-a", b_lease, 99999)
-    b_delta = int(_read_state(sf)["leases"][b_lease]["expires_at"]) - now_b
-
+    # renew ttl=99999 → delta ~3600.
     _reset_state(sf)
     _run_py_acquire(sf, "agent-a", "src/api", "write", 60)
     p_lease = _only_lease(sf)
     now_p = int(time.time())
-    p_rc, _, p_err = _run_py_renew(sf, "agent-a", p_lease, 99999)
+    p_rc, p_err = _run_py_renew(sf, "agent-a", p_lease, 99999)
     p_delta = int(_read_state(sf)["leases"][p_lease]["expires_at"]) - now_p
 
-    _assert_parity(b_rc, b_out, b_err, p_rc, "", p_err, "renew cap")
-    assert 3595 <= b_delta <= 3605, f"bash renew cap delta={b_delta} not ~3600"
-    assert 3595 <= p_delta <= 3605, f"py renew cap delta={p_delta} not ~3600"
+    assert p_rc == 0 and p_err == ""
+    assert 3595 <= p_delta <= 3605, f"renew cap delta={p_delta} not ~3600"
 
 
 # ── (p) expiry self-heal: a crashed holder's expired lease frees on next acquire
 #        and is pruned from state; the competing writer gets a fresh id ─────────
-def test_ttl_expiry_self_heal_parity(tmp_path):
-    _which_bash()
+def test_ttl_expiry_self_heal(tmp_path):
     sf = str(tmp_path / "leases.json")
-
-    _reset_state(sf)
-    _bash_acquire(sf, "agent-crashed", "src/api", "write", 60)
-    b_old = _only_lease(sf)
-    _expire_all(sf)
-    b_rc, b_out, b_err = _bash_acquire(sf, "agent-rescue", "src/api", "write", 30)
-    b_new = b_out.strip()
-    b_pruned = b_old not in _read_state(sf)["leases"]
 
     _reset_state(sf)
     _run_py_acquire(sf, "agent-crashed", "src/api", "write", 60)
@@ -778,41 +506,38 @@ def test_ttl_expiry_self_heal_parity(tmp_path):
     p_rc, p_new, p_err = _run_py_acquire(sf, "agent-rescue", "src/api", "write", 30)
     p_pruned = p_old not in _read_state(sf)["leases"]
 
-    _assert_parity(b_rc, b_out, b_err, p_rc, p_new, p_err, "self-heal rescue")
-    assert b_rc == 0 and p_rc == 0, "competing writer must succeed after holder expiry"
-    assert b_new and b_new != b_old, f"bash rescue must get fresh id (old={b_old} new={b_new})"
-    assert p_new and p_new != p_old, f"py rescue must get fresh id (old={p_old} new={p_new})"
-    assert b_pruned and p_pruned, f"expired lease must be pruned bash={b_pruned} py={p_pruned}"
+    assert p_rc == 0 and p_err == "", (
+        "competing writer must succeed after holder expiry"
+    )
+    assert p_new and p_new != p_old, (
+        f"rescue must get fresh id (old={p_old} new={p_new})"
+    )
+    assert p_pruned, "expired lease must be pruned"
 
 
 # ── (q) renew rejects an expired lease (rc=1) and an unknown id (rc=1) ─────────
-def test_renew_rejects_expired_and_unknown_parity(tmp_path):
-    _which_bash()
+def test_renew_rejects_expired_and_unknown(tmp_path):
     sf = str(tmp_path / "leases.json")
-    shared = "abc123ef"  # valid hex; shared so stderr (which embeds the id) matches
+    shared = "abc123ef"  # valid hex; shared so stderr (which embeds the id) is deterministic
 
-    # Expired: seed the same live lease on each run, expire it, then renew.
+    # Expired: seed a live lease, expire it, then renew.
     _reset_state(sf); _seed_lease(sf, shared, "agent-h"); _expire_all(sf)
-    b_rc, b_out, b_err = _bash_renew(sf, "agent-h", shared, 60)
-    _reset_state(sf); _seed_lease(sf, shared, "agent-h"); _expire_all(sf)
-    p_rc, _, p_err = _run_py_renew(sf, "agent-h", shared, 60)
-    _assert_parity(b_rc, b_out, b_err, p_rc, "", p_err, "renew expired")
-    assert b_rc == 1 and p_rc == 1, f"renew expired rc bash={b_rc} py={p_rc} (expected 1)"
+    p_rc, p_err = _run_py_renew(sf, "agent-h", shared, 60)
+    assert p_rc == 1, f"renew expired rc={p_rc} (expected 1)"
+    assert shared in p_err
 
-    # Unknown id on empty state → rc=1, same shared literal so stderr matches.
+    # Unknown id on empty state → rc=1.
     _reset_state(sf)
-    b2_rc, b2_out, b2_err = _bash_renew(sf, "agent-h", shared, 60)
-    p2_rc, _, p2_err = _run_py_renew(sf, "agent-h", shared, 60)
-    _assert_parity(b2_rc, b2_out, b2_err, p2_rc, "", p2_err, "renew unknown")
-    assert b2_rc == 1 and p2_rc == 1, f"renew unknown rc bash={b2_rc} py={p2_rc} (expected 1)"
+    p2_rc, p2_err = _run_py_renew(sf, "agent-h", shared, 60)
+    assert p2_rc == 1, f"renew unknown rc={p2_rc} (expected 1)"
+    assert shared in p2_err
 
 
 # ── (r) renew arg-validation → rc=2 (missing args / bad ttl) ───────────────────
-def test_renew_arg_validation_parity(tmp_path):
-    _which_bash()
+def test_renew_arg_validation(tmp_path):
     sf = str(tmp_path / "leases.json")
 
-    # (agent, lease_id, ttl, label) — every form the .sh's group 8 exercises.
+    # (agent, lease_id, ttl, label) — every form the retired .sh's group 8 exercises.
     variants = [
         ("", "", "60", "missing agent+lease"),
         ("agent-x", "", "60", "missing lease_id"),
@@ -821,37 +546,15 @@ def test_renew_arg_validation_parity(tmp_path):
     ]
     for agent, lease, ttl, label in variants:
         _reset_state(sf)
-        b_rc, b_out, b_err = _bash_renew(sf, agent, lease, ttl)
-        p_rc, _, p_err = _run_py_renew(sf, agent, lease, ttl)
-        _assert_parity(b_rc, b_out, b_err, p_rc, "", p_err, label)
-        assert b_rc == 2 and p_rc == 2, f"[{label}] expected rc=2, got bash={b_rc} py={p_rc}"
+        p_rc, p_err = _run_py_renew(sf, agent, lease, ttl)
+        assert p_rc == 2, f"[{label}] expected rc=2, got py={p_rc}"
+        assert p_err
 
 
-# ── (s) bin/mini-ork-coord renew wrapper wires through to coord_renew ──────────
-def test_coord_wrapper_renew_parity(tmp_path):
-    _which_bash()
-    wrapper = REPO / "bin" / "mini-ork-coord"
-    if not os.access(wrapper, os.X_OK):
-        pytest.skip("bin/mini-ork-coord not executable")
+# ── (s) renew holder/non-holder logic on a seeded live lease ───────────────────
+def test_renew_holder_and_non_holder(tmp_path):
     sf = str(tmp_path / "leases.json")
-    env = {**os.environ, "COORD_REGISTRY_STATE_FILE": sf, "MINI_ORK_ROOT": str(REPO)}
 
-    # Wrapper acquires a lease, then holder-renew succeeds and non-holder is rejected.
-    _reset_state(sf)
-    acq = subprocess.run([str(wrapper), "acquire", "agent-w", "src/api", "write", "60"],
-                         env=env, capture_output=True, text=True)
-    assert acq.returncode == 0, f"wrapper acquire failed: {acq.stderr}"
-    lease = acq.stdout.strip()
-    assert re.fullmatch(r"[A-Fa-f0-9]+", lease), f"wrapper lease shape: {lease!r}"
-
-    ok = subprocess.run([str(wrapper), "renew", "agent-w", lease, "600"],
-                        env=env, capture_output=True, text=True)
-    bad = subprocess.run([str(wrapper), "renew", "agent-other", lease, "60"],
-                         env=env, capture_output=True, text=True)
-    assert ok.returncode == 0, f"wrapper holder renew rc={ok.returncode}: {ok.stderr}"
-    assert bad.returncode != 0, "wrapper non-holder renew must fail"
-
-    # Port cross-check: same holder/non-holder logic on a seeded live lease.
     _reset_state(sf)
     _seed_lease(sf, "cafebabe", "agent-w")
     assert cr.coord_renew("agent-w", "cafebabe", 600, state_file=sf) == 0
@@ -859,37 +562,28 @@ def test_coord_wrapper_renew_parity(tmp_path):
 
 
 # ── (t) release of an expired lease returns non-zero (rc=1) ───────────────────
-def test_expired_release_parity(tmp_path):
-    _which_bash()
+def test_expired_release(tmp_path):
     sf = str(tmp_path / "leases.json")
-    shared = "0ff1ce00"  # shared hex id so the "unknown lease id <id>" stderr matches
+    shared = "0ff1ce00"  # shared hex id so the "unknown lease id <id>" stderr is deterministic
 
     _reset_state(sf); _seed_lease(sf, shared, "agent-a"); _expire_all(sf)
-    b_rc, b_out, b_err = _bash_release(sf, shared)
-    _reset_state(sf); _seed_lease(sf, shared, "agent-a"); _expire_all(sf)
-    p_rc, _, p_err = _run_py_release(sf, shared)
+    p_rc, p_err = _run_py_release(sf, shared)
 
-    _assert_parity(b_rc, b_out, b_err, p_rc, "", p_err, "expired release")
-    assert b_rc == 1 and p_rc == 1, f"expired release rc bash={b_rc} py={p_rc} (expected 1)"
+    assert p_rc == 1, f"expired release rc={p_rc} (expected 1)"
+    assert "unknown" in p_err.lower()
+    assert shared in p_err
 
 
 # ── (u) a rejected (non-holder) renew must NOT mutate the lease ────────────────
-def test_renew_not_holder_no_mutation_parity(tmp_path):
-    _which_bash()
+def test_renew_not_holder_no_mutation(tmp_path):
     sf = str(tmp_path / "leases.json")
     shared = "beadfeed"
 
     _reset_state(sf); _seed_lease(sf, shared, "agent-holder")
-    b_before = int(_read_state(sf)["leases"][shared]["expires_at"])
-    b_rc, b_out, b_err = _bash_renew(sf, "agent-other", shared, 600)
-    b_after = int(_read_state(sf)["leases"][shared]["expires_at"])
-
-    _reset_state(sf); _seed_lease(sf, shared, "agent-holder")
     p_before = int(_read_state(sf)["leases"][shared]["expires_at"])
-    p_rc, _, p_err = _run_py_renew(sf, "agent-other", shared, 600)
+    p_rc, p_err = _run_py_renew(sf, "agent-other", shared, 600)
     p_after = int(_read_state(sf)["leases"][shared]["expires_at"])
 
-    _assert_parity(b_rc, b_out, b_err, p_rc, "", p_err, "renew not-holder no-mutation")
-    assert b_rc == 3 and p_rc == 3, f"non-holder renew rc bash={b_rc} py={p_rc} (expected 3)"
-    assert b_before == b_after, f"bash rejected renew mutated lease {b_before}->{b_after}"
-    assert p_before == p_after, f"py rejected renew mutated lease {p_before}->{p_after}"
+    assert p_rc == 3, f"non-holder renew rc={p_rc} (expected 3)"
+    assert "not the current holder" in p_err.lower()
+    assert p_before == p_after, f"rejected renew mutated lease {p_before}->{p_after}"
