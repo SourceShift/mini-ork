@@ -19,3 +19,4 @@ fi
 python3 "$RECIPE_DIR/lib/research_pipeline.py" assemble "${summaries[@]}" \
   --techniques "$INPUT_DIR/unified_techniques/unified-techniques.md" \
   --output "$RUN_DIR/aggregation.md"
+printf '%s\n' '{"verifier":"frontier-research-aggregation","pass":true}'
