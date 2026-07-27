@@ -1,9 +1,9 @@
-"""Parity gate: mini_ork.orchestration.conductor vs bin/mini-ork-conductor.
+"""Unit tests: mini_ork.orchestration.conductor (bash parity halves removed; formerly vs bin/mini-ork-conductor).
 
-Seed a ready epic + a topology_win_rate, run --once --dry-run through the LIVE
-bash conductor and the port on separate DBs, and compare the logged
-conductor_decisions row (decided_at excluded). Plus a unit check of the
-predicted-score / budget-bias branches.
+Seed a ready epic + a topology_win_rate, run --once --dry-run through the
+port and assert the logged conductor_decisions row (decided_at excluded).
+Plus unit checks of the predicted-score / budget-bias / adaptive-gain
+branches.
 """
 from __future__ import annotations
 
@@ -15,8 +15,6 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
 from mini_ork.orchestration import conductor as cond
-
-BIN = REPO / "bin" / "mini-ork-conductor"
 
 
 def _sql(db, stmt):
@@ -41,15 +39,11 @@ _DEC_COLS = ("epic_id,task_class,chosen_topology,chosen_recipe,chosen_lane_hints
              "predicted_score,budget_pct_used,rationale,outcome")
 
 
-def test_decision_logged_parity(tmp_path):
-    hb, db_b = _seed(tmp_path, "b")
+def test_decision_logged(tmp_path):
     _, db_p = _seed(tmp_path, "p")
-    subprocess.run(["bash", str(BIN), "--once", "--dry-run"], capture_output=True, text=True,
-                   env={**os.environ, "MINI_ORK_ROOT": str(REPO), "MINI_ORK_HOME": hb, "MINI_ORK_DB": db_b})
     cond.main(["--once", "--dry-run"], db=db_p, root=str(REPO))
-    q = f"SELECT {_DEC_COLS} FROM conductor_decisions"
-    rb, rp = _sql(db_b, q), _sql(db_p, q)
-    assert rb == rp and rb  # identical decision persisted
+    rp = _sql(db_p, f"SELECT {_DEC_COLS} FROM conductor_decisions")
+    assert rp  # a decision was persisted
     # sanity: chose topo-1 / code-fix, predicted 0.8 (no lane advantage available)
     assert "topo-1" in rp and "code-fix" in rp and "0.8" in rp
 
@@ -106,31 +100,18 @@ def test_adaptive_gain_optout_matches_cold(tmp_path, monkeypatch):
 
 def test_adaptive_gain_poor_record_damps_predicted(tmp_path, monkeypatch):
     """A poor realized track record (ema<0.5) shrinks the gain below 0.3 so the
-    lane-advantage boost is damped and predicted stays below the cold value.
-    Bash and python compute the identical fitted gain (parity)."""
+    lane-advantage boost is damped and predicted stays below the cold value."""
     monkeypatch.delenv("MO_CONDUCTOR_ADAPTIVE_GAIN", raising=False)
-    hb, db_b = _seed(tmp_path, "gpb")
     _, db_p = _seed(tmp_path, "gpp")
-    for d in (db_b, db_p):
-        _seed_lane_adv(d)
-        _seed_realized(d, [0.0, 0.0, 0.0, 0.0])   # all failures → ema=0 → gain floor 0.1
-    # Python port
+    _seed_lane_adv(db_p)
+    _seed_realized(db_p, [0.0, 0.0, 0.0, 0.0])   # all failures → ema=0 → gain floor 0.1
     dec = cond.decide_for_epic(db_p, "e1", spent=0.0, cap=50.0, plast_budget=5)
     # gain = clamp(0.3*2*ema=0, 0.1, 0.6) = 0.1 → 0.8*(1+1.0*0.1) = 0.88
     assert abs(dec["predicted_score"] - 0.88) < 1e-6
-    # Bash conductor logs the same predicted_score for the same DB state.
-    subprocess.run(["bash", str(BIN), "--once", "--dry-run"], capture_output=True, text=True,
-                   env={**os.environ, "MINI_ORK_ROOT": str(REPO), "MINI_ORK_HOME": hb,
-                        "MINI_ORK_DB": db_b})
-    got = _sql(db_b, "SELECT predicted_score FROM conductor_decisions WHERE epic_id='e1'")
-    assert abs(float(got) - 0.88) < 1e-6, f"bash predicted_score={got!r}"
 
 
 def test_empty_queue(tmp_path):
-    hb, db_b = _seed(tmp_path, "e")
+    _, db_b = _seed(tmp_path, "e")
     _sql(db_b, "UPDATE epics SET status='done' WHERE id='e1';")   # nothing ready
-    rb = subprocess.run(["bash", str(BIN), "--once"], capture_output=True, text=True,
-                        env={**os.environ, "MINI_ORK_ROOT": str(REPO), "MINI_ORK_HOME": hb,
-                             "MINI_ORK_DB": db_b}).returncode
     rp = cond.main(["--once"], db=db_b, root=str(REPO))
-    assert rb == rp == 2   # empty queue → _tick returns 2, sourced-lib errexit aborts
+    assert rp == 2   # empty queue → _tick returns 2

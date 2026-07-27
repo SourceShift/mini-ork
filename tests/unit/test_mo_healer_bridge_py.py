@@ -1,60 +1,30 @@
-"""Parity gate: mini_ork.recovery.healer_bridge vs lib/mo-healer-bridge.sh.
+"""Unit tests: mini_ork.recovery.healer_bridge (bash parity halves removed; formerly vs lib/mo-healer-bridge.sh).
 
-Each test invokes the LIVE bash subprocess (sourcing
-``lib/mo-healer-bridge.sh``) on identical inputs as the Python port and
-asserts byte-identical output — return code, the ``recovery -> ...`` log
-line, and the structural shape of any detective.json written for the
-cleaner-on-main branch.
+Each test drives the Python bridge with its module seams
+(``mhb._healer`` / ``mhb._cleaner``) monkeypatched with fixtures, and
+asserts return codes, stderr banners, and the structural shape of any
+detective.json written for the cleaner-on-main branch.
 
-The bash function ``mo_run_healer_on_escalate`` shells out to
-``$MINI_ORK_ROOT/lib/healer.sh`` (and, for ``cleaner-on-main``,
-``$MINI_ORK_ROOT/lib/cleaner.sh``). To make parity testable without
-mocking either bash function, each test sets ``MINI_ORK_ROOT`` to a temp
-dir whose ``lib/healer.sh`` echoes a fixture JSON and whose
-``lib/cleaner.sh`` exits 0 or 1 per env. The bash ``mo-healer-bridge``
-*function itself* is the real one — only its surroundings are
-substituted.
-
-WS5 cutover: the Python bridge no longer shells out — it calls the
-staged native ports ``mini_ork.recovery.healer.decide`` and
-``mini_ork.recovery.cleaner.main`` in-process (module seams
-``mhb._healer`` / ``mhb._cleaner``). The Python half of each e2e test
-therefore monkeypatches those seams with the SAME fixture the bash
-side's stub scripts serve, so both halves still exercise the identical
-decision branch.
-
-Cases (>=6):
+Cases:
   (a) parse_healer_output + classify_recovery — six fixture shapes
       (empty, non-JSON, missing fields, full, integer lesson_id, null).
   (b) clamp_wait_s — boundaries (0/9/10, 30/300/301), non-numeric input
-      (None / '' / 'abc' / '30.9'), mirrors bash case validation.
-  (c) decide() — every recovery_action branch maps to the same
-      kind/rc that bash produces, on identical parsed input.
+      (None / '' / 'abc' / '30.9').
+  (c) decide() — every recovery_action branch maps to the same kind/rc.
   (d) action_kind — terminal/hint/auto_apply/unknown enumeration,
-      including the empty-string case that triggers bash's default.
-  (e) extract_lesson_id + extract_matched — bash jq default semantics
+      including the empty-string case.
+  (e) extract_lesson_id + extract_matched — jq-default semantics
       (``null`` → None, missing → defaults, integer-coerced strings).
-  (f) End-to-end bash vs Python on terminal / hint / unknown / disabled
-      branches — bash returns 1, Python returns 1, stderr contains the
-      expected banner. (No cleaner / rebase / sleep side-effects; those
-      are exercised in cases (g) and (h).)
-  (g) End-to-end bash vs Python on ``cleaner-on-main`` — stub
-      ``lib/cleaner.sh`` to succeed; assert both return 0 and produce a
-      ``<run_dir>/healer-cleaner/detective.json`` with the same keys.
-  (h) End-to-end bash vs Python on ``wait-and-retry`` with
-      ``recovery_args.wait_s=5`` (below the 10s floor) — stub
-      ``time.sleep`` so we don't actually wait; assert both clamp to
-      10s and return 0.
-
-Every expected value is derived from the live bash subprocess, never
-hardcoded (other than the literal terminal-actions enum values the bash
-function itself checks for).
+  (f) End-to-end on terminal / hint / unknown / disabled branches —
+      rc 1, stderr banner.
+  (g) End-to-end on ``cleaner-on-main`` — cleaner succeeds; rc 0 and a
+      ``<run_dir>/healer-cleaner/detective.json`` with the expected keys.
+  (h) End-to-end on ``wait-and-retry`` with ``recovery_args.wait_s=5``
+      (below the 10s floor) — stub ``time.sleep``; clamp to 10s, rc 0.
 """
 from __future__ import annotations
 
 import json
-import os
-import subprocess
 import sys
 from pathlib import Path
 
@@ -63,109 +33,6 @@ import pytest
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
 from mini_ork.recovery import healer_bridge as mhb
-
-SH = REPO / "lib" / "mo-healer-bridge.sh"
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Test root fixtures: temp MINI_ORK_ROOT with stub lib/healer.sh + cleaner.sh.
-# The bash function under test is the REAL one — only its surroundings are
-# substituted so bash and Python see byte-identical inputs.
-# ─────────────────────────────────────────────────────────────────────────────
-def _setup_test_root(tmp_path: Path, *,
-                     cleaner_rc: int = 0) -> tuple[Path, Path]:
-    """Create a temp MINI_ORK_ROOT with stub ``lib/healer.sh`` (echoes
-    ``HEALER_FIXTURE_FILE``) and ``lib/cleaner.sh`` (returns ``cleaner_rc``).
-    Returns (mini_root, run_dir).
-    """
-    mini_root = tmp_path / "mini_root"
-    lib = mini_root / "lib"
-    lib.mkdir(parents=True)
-    run_dir = tmp_path / "run_dir"
-    run_dir.mkdir()
-
-    (lib / "healer.sh").write_text(
-        "#!/usr/bin/env bash\n"
-        "cat \"${HEALER_FIXTURE_FILE}\"\n"
-    )
-    (lib / "healer.sh").chmod(0o755)
-
-    (lib / "cleaner.sh").write_text(
-        "#!/usr/bin/env bash\n"
-        f"exit {cleaner_rc}\n"
-    )
-    (lib / "cleaner.sh").chmod(0o755)
-
-    return mini_root, run_dir
-
-
-def _write_fixture(mini_root: Path, payload: "dict | str") -> Path:
-    """Write the healer.sh fixture JSON and return its path."""
-    fixture_path = mini_root / "healer-fixture.json"
-    if isinstance(payload, str):
-        fixture_path.write_text(payload)
-    else:
-        fixture_path.write_text(json.dumps(payload))
-    return fixture_path
-
-
-def _bash_bridge(mini_root: Path, epic: str, run_dir: Path,
-                 fixture_path: "Path | None" = None,
-                 extra_env: "dict | None" = None,
-                 sleep_override: "str | None" = None,
-                 worktree_path: "str | None" = None,
-                 ) -> subprocess.CompletedProcess:
-    """Invoke the LIVE bash ``mo_run_healer_on_escalate`` against the
-    stubbed temp root. Returns the CompletedProcess.
-
-    The bash source uses ``${WORKTREE[$epic]:-}`` with ``set -u``, which
-    errors out unless ``WORKTREE`` is a declared associative array.
-    ``worktree_path`` (when set) becomes ``WORKTREE[$epic]``; otherwise
-    the array is declared empty so the helper skips the rebase branch.
-
-    When ``fixture_path`` is set, ``HEALER_FIXTURE_FILE`` is forwarded so
-    the stub ``healer.sh`` cats the JSON file at that path.
-    """
-    env = {**os.environ, "MINI_ORK_ROOT": str(mini_root)}
-    if fixture_path is not None:
-        env["HEALER_FIXTURE_FILE"] = str(fixture_path)
-    if extra_env:
-        env.update(extra_env)
-    sleep_prelude = ""
-    if sleep_override is not None:
-        sleep_prelude = (
-            f'sleep() {{ {sleep_override}; }}\n'
-            'export -f sleep\n'
-        )
-    if worktree_path is not None:
-        worktree_prelude = (
-            'declare -A WORKTREE\n'
-            f'WORKTREE["{epic}"]="{worktree_path}"\n'
-        )
-    else:
-        worktree_prelude = 'declare -A WORKTREE\n'
-    cmd = (
-        f'{sleep_prelude}'
-        f'{worktree_prelude}'
-        f'. "{SH}"\n'
-        f'mo_run_healer_on_escalate "{epic}" "{run_dir}"\n'
-        f'echo "RC=$?"\n'
-    )
-    return subprocess.run(
-        ["bash", "-c", cmd],
-        env=env, capture_output=True, text=True,
-    )
-
-
-def _bash_rc(proc: subprocess.CompletedProcess) -> int:
-    """Extract the rc from the bash subprocess (the trailing ``RC=`` line)."""
-    for line in proc.stdout.splitlines():
-        if line.startswith("RC="):
-            try:
-                return int(line.split("=", 1)[1])
-            except ValueError:
-                pass
-    return proc.returncode
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -253,7 +120,7 @@ def test_decide_all_branches():
 
 
 def test_decide_missing_recovery_action():
-    """Bash jq ``// ""`` default — empty dict → terminal branch."""
+    """jq ``// ""`` default — empty dict → terminal branch."""
     d = mhb.decide({})
     assert d == {"action": "", "kind": "terminal", "rc": 1, "wait_s": 0,
                  "lesson_id": None, "matched": False}
@@ -275,7 +142,7 @@ def test_action_kind_enum():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# (e) extract_lesson_id + extract_matched — bash jq default semantics
+# (e) extract_lesson_id + extract_matched — jq default semantics
 # ─────────────────────────────────────────────────────────────────────────────
 def test_extract_lesson_id_semantics():
     assert mhb.extract_lesson_id({}) is None
@@ -298,7 +165,7 @@ def test_extract_matched_semantics():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# (f) End-to-end bash vs Python on terminal / hint / unknown / disabled
+# (f) End-to-end on terminal / hint / unknown / disabled branches
 # ─────────────────────────────────────────────────────────────────────────────
 @pytest.mark.parametrize("recovery,fixture", [
     ("escalate-human",
@@ -316,22 +183,14 @@ def test_extract_matched_semantics():
     ("empty-recovery",
      '{"lesson_id":null}'),
 ])
-def test_e2e_non_auto_apply_branches(tmp_path, monkeypatch, recovery,
-                                      fixture):
-    """Bash and Python must agree on rc=1 for every non-auto-apply branch,
-    and the bash stderr must mention the right banner."""
-    mini_root, run_dir = _setup_test_root(tmp_path)
-    monkeypatch.setenv("MINI_ORK_ROOT", str(mini_root))
-    fixture_path = _write_fixture(mini_root, fixture)
-    monkeypatch.setenv("HEALER_FIXTURE_FILE", str(fixture_path))
+def test_e2e_non_auto_apply_branches(tmp_path, monkeypatch, capsys, recovery,
+                                     fixture):
+    """Every non-auto-apply branch returns rc=1; the stderr banner matches
+    the branch (hint → "healer suggests X"; unknown → "unknown recovery")."""
+    run_dir = tmp_path / "run_dir"
+    run_dir.mkdir()
+    monkeypatch.setenv("MINI_ORK_ROOT", str(tmp_path))
 
-    # Bash
-    proc = _bash_bridge(mini_root, "epic-1", run_dir,
-                        fixture_path=fixture_path)
-    bash_rc = _bash_rc(proc)
-    assert bash_rc == 1, f"recovery={recovery} bash_rc={bash_rc} stderr={proc.stderr}"
-
-    # Python — same fixture through the native healer seam (WS5).
     monkeypatch.setattr(
         mhb._healer, "decide",
         lambda *a, **k: (0, fixture if fixture.endswith("\n")
@@ -340,60 +199,37 @@ def test_e2e_non_auto_apply_branches(tmp_path, monkeypatch, recovery,
     py_rc = mhb.mo_run_healer_on_escalate("epic-1", str(run_dir))
     assert py_rc == 1, f"recovery={recovery} py_rc={py_rc}"
 
-    # Bash stderr banner mentions the recovery value (or lack thereof) on
-    # the auto-classify line. Hint branch has an extra "suggests" line;
-    # unknown branch has an extra "unknown recovery" line.
+    err = capsys.readouterr().err
     if recovery in ("switch-agent", "shrink-scope"):
-        assert f"healer suggests {recovery}" in proc.stderr, proc.stderr
-    elif recovery not in ("escalate-human", "mark-wontfix", "no-op",
-                          "empty-recovery"):
-        # The parametrize key (e.g. "unknown-action") may differ from the
-        # literal recovery_action value (e.g. "never-heard-of-it"); assert
-        # the banner is present without coupling to the exact value.
-        assert "mo-healer unknown recovery:" in proc.stderr, proc.stderr
+        assert f"healer suggests {recovery}" in err, err
+    elif recovery == "unknown-action":
+        assert "mo-healer unknown recovery:" in err, err
 
 
-def test_e2e_disabled_branch(tmp_path, monkeypatch):
-    """When MO_HEALER_BRIDGE_DISABLED=1, both sides return 1 without
-    invoking healer.sh. We use an empty fixture so the absence of any
-    'classifying ESCALATE' stderr line is the assertion."""
-    mini_root, run_dir = _setup_test_root(tmp_path)
-    monkeypatch.setenv("MINI_ORK_ROOT", str(mini_root))
+def test_e2e_disabled_branch(tmp_path, monkeypatch, capsys):
+    """When MO_HEALER_BRIDGE_DISABLED=1, return 1 without invoking the
+    healer seam (no 'classifying ESCALATE' stderr line)."""
+    run_dir = tmp_path / "run_dir"
+    run_dir.mkdir()
+    monkeypatch.setenv("MINI_ORK_ROOT", str(tmp_path))
     monkeypatch.setenv("MO_HEALER_BRIDGE_DISABLED", "1")
-    fixture_path = _write_fixture(mini_root, "")
-    monkeypatch.setenv("HEALER_FIXTURE_FILE", str(fixture_path))
 
-    proc = _bash_bridge(mini_root, "epic-d", run_dir,
-                        fixture_path=fixture_path)
-    bash_rc = _bash_rc(proc)
-    assert bash_rc == 1
-    # The disabled branch must NOT mention classifying or invoking healer.
-    assert "classifying ESCALATE" not in proc.stderr
-
+    def _boom(*a, **k):
+        raise AssertionError("healer seam must not be invoked when disabled")
+    monkeypatch.setattr(mhb._healer, "decide", _boom)
     py_rc = mhb.mo_run_healer_on_escalate("epic-d", str(run_dir))
     assert py_rc == 1
+    err = capsys.readouterr().err
+    assert "classifying ESCALATE" not in err
 
 
 def test_e2e_healer_missing(tmp_path, monkeypatch):
-    """When ``$MINI_ORK_ROOT/lib/healer.sh`` is missing, both sides
-    return 1 and bash prints the 'mo-healer not executable' banner."""
-    mini_root = tmp_path / "mini_root"
-    (mini_root / "lib").mkdir(parents=True)
+    """When the healer port is unavailable (raises), the bridge treats it
+    as empty output → rc 1."""
     run_dir = tmp_path / "run_dir"
     run_dir.mkdir()
-    monkeypatch.setenv("MINI_ORK_ROOT", str(mini_root))
-    fixture_path = _write_fixture(mini_root, "")
-    monkeypatch.setenv("HEALER_FIXTURE_FILE", str(fixture_path))
+    monkeypatch.setenv("MINI_ORK_ROOT", str(tmp_path))
 
-    proc = _bash_bridge(mini_root, "epic-m", run_dir,
-                        fixture_path=fixture_path)
-    bash_rc = _bash_rc(proc)
-    assert bash_rc == 1
-    assert "mo-healer not executable" in proc.stderr
-
-    # Python — the native healer port is always importable, so the
-    # "missing script" scenario maps to the port raising (e.g. stripped
-    # install): the bridge treats it as empty output → rc 1 (WS5).
     def _boom(*a, **k):
         raise OSError("healer port unavailable")
     monkeypatch.setattr(mhb._healer, "decide", _boom)
@@ -402,134 +238,95 @@ def test_e2e_healer_missing(tmp_path, monkeypatch):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# (g) End-to-end: cleaner-on-main succeeds, bash vs Python parity
+# (g) End-to-end: cleaner-on-main succeeds
 # ─────────────────────────────────────────────────────────────────────────────
-def test_e2e_cleaner_on_main_success(tmp_path, monkeypatch):
-    mini_root, run_dir = _setup_test_root(tmp_path, cleaner_rc=0)
-    monkeypatch.setenv("MINI_ORK_ROOT", str(mini_root))
-    fixture_path = _write_fixture(mini_root, {
+def test_e2e_cleaner_on_main_success(tmp_path, monkeypatch, capsys):
+    run_dir = tmp_path / "run_dir"
+    run_dir.mkdir()
+    monkeypatch.setenv("MINI_ORK_ROOT", str(tmp_path))
+    fixture = json.dumps({
         "lesson_id": 7, "matched": True,
         "recovery_action": "cleaner-on-main",
     })
-    monkeypatch.setenv("HEALER_FIXTURE_FILE", str(fixture_path))
 
-    # Bash
-    bash_proc = _bash_bridge(mini_root, "epic-clean", run_dir,
-                             fixture_path=fixture_path)
-    bash_rc = _bash_rc(bash_proc)
-    assert bash_rc == 0, f"stderr={bash_proc.stderr}"
-    assert "dispatching cleaner-on-main for epic-clean" in bash_proc.stderr
-    assert "cleaner-on-main succeeded for epic-clean" in bash_proc.stderr
-
-    # Python — on its own run_dir so we can compare detective.json shape
-    # against bash's output side-by-side. Native seams stubbed with the
-    # same fixture + a cleaner that mirrors the stub script's rc (WS5).
-    py_run_dir = tmp_path / "py_run_dir"
-    py_run_dir.mkdir()
     monkeypatch.setattr(
         mhb._healer, "decide",
-        lambda *a, **k: (0, fixture_path.read_text() + "\n", ""),
+        lambda *a, **k: (0, fixture + "\n", ""),
     )
     cleaner_calls = []
     monkeypatch.setattr(
         mhb._cleaner, "main",
         lambda argv: (cleaner_calls.append(list(argv)), 0)[1],
     )
-    py_rc = mhb.mo_run_healer_on_escalate("epic-clean", str(py_run_dir))
+    py_rc = mhb.mo_run_healer_on_escalate("epic-clean", str(run_dir))
     assert py_rc == 0
-    # The native cleaner seam received (brief_path, bridge_dir) exactly as
-    # the bash subprocess argv did.
+    err = capsys.readouterr().err
+    assert "dispatching cleaner-on-main for epic-clean" in err
+    assert "cleaner-on-main succeeded for epic-clean" in err
+    # The native cleaner seam received (brief_path, bridge_dir).
     assert cleaner_calls == [
-        [str(py_run_dir / "healer-cleaner" / "detective.json"),
-         str(py_run_dir / "healer-cleaner")]
+        [str(run_dir / "healer-cleaner" / "detective.json"),
+         str(run_dir / "healer-cleaner")]
     ]
 
-    # Both sides wrote detective.json with the same keys (the bash-written
-    # file uses jq -n ordering; Python uses dict insertion order).
-    bash_brief = run_dir / "healer-cleaner" / "detective.json"
-    py_brief = py_run_dir / "healer-cleaner" / "detective.json"
-    assert bash_brief.is_file(), f"missing: {bash_brief}"
+    # detective.json shape
+    py_brief = run_dir / "healer-cleaner" / "detective.json"
     assert py_brief.is_file(), f"missing: {py_brief}"
-
-    bash_payload = json.loads(bash_brief.read_text())
     py_payload = json.loads(py_brief.read_text())
 
     expected_keys = {"epic_id", "classification", "confidence", "evidence",
                      "recommendation", "cleaner_brief", "rationale",
                      "source", "detected_at"}
-    assert set(bash_payload.keys()) == expected_keys, bash_payload.keys()
     assert set(py_payload.keys()) == expected_keys, py_payload.keys()
-    for k in expected_keys:
-        if k == "detected_at":
-            # Second-granularity UTC stamps from two separate processes — the
-            # bash and python invocations legitimately straddle a second
-            # boundary under load. Compare shape, not equality.
-            import re as _re
-            assert _re.match(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$", bash_payload[k])
-            assert _re.match(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$", py_payload[k])
-            continue
-        assert bash_payload[k] == py_payload[k], (
-            f"key={k} bash={bash_payload[k]!r} py={py_payload[k]!r}")
+    assert py_payload["epic_id"] == "epic-clean"
+    assert py_payload["classification"] == "baseline_rot"
+    assert py_payload["confidence"] == 0.9
+    assert py_payload["recommendation"] == "cleaner-on-main"
+    assert py_payload["source"] == "mo-healer-bridge"
+    import re as _re
+    assert _re.match(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$",
+                     py_payload["detected_at"])
 
 
-def test_e2e_cleaner_on_main_failure(tmp_path, monkeypatch):
-    """When cleaner.sh exits non-zero, both sides return 1 and bump-failure
-    (the latter is a no-op in Python but the rc parity still holds)."""
-    mini_root, run_dir = _setup_test_root(tmp_path, cleaner_rc=2)
-    monkeypatch.setenv("MINI_ORK_ROOT", str(mini_root))
-    fixture_path = _write_fixture(mini_root, {
+def test_e2e_cleaner_on_main_failure(tmp_path, monkeypatch, capsys):
+    """When the cleaner returns non-zero, the bridge returns 1."""
+    run_dir = tmp_path / "run_dir"
+    run_dir.mkdir()
+    monkeypatch.setenv("MINI_ORK_ROOT", str(tmp_path))
+    fixture = json.dumps({
         "lesson_id": 7, "matched": True,
         "recovery_action": "cleaner-on-main",
     })
-    monkeypatch.setenv("HEALER_FIXTURE_FILE", str(fixture_path))
-
-    bash_proc = _bash_bridge(mini_root, "epic-cfail", run_dir,
-                             fixture_path=fixture_path)
-    bash_rc = _bash_rc(bash_proc)
-    assert bash_rc == 1, f"stderr={bash_proc.stderr}"
-    assert "cleaner-on-main failed" in bash_proc.stderr
 
     monkeypatch.setattr(
         mhb._healer, "decide",
-        lambda *a, **k: (0, fixture_path.read_text() + "\n", ""),
+        lambda *a, **k: (0, fixture + "\n", ""),
     )
     monkeypatch.setattr(mhb._cleaner, "main", lambda argv: 2)
     py_rc = mhb.mo_run_healer_on_escalate("epic-cfail", str(run_dir))
     assert py_rc == 1
+    err = capsys.readouterr().err
+    assert "cleaner-on-main failed" in err
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# (h) End-to-end: wait-and-retry with sub-floor wait_s → both clamp to 10s
+# (h) End-to-end: wait-and-retry with sub-floor wait_s → clamp to 10s
 # ─────────────────────────────────────────────────────────────────────────────
 def test_e2e_wait_and_retry_clamps(monkeypatch, tmp_path):
-    """wait_s=5 (below the 10s floor) must clamp to 10 on both sides. We
-    stub ``sleep`` on the bash side and monkeypatch ``time.sleep`` on the
-    Python side so neither waits 10 real seconds."""
-    mini_root, run_dir = _setup_test_root(tmp_path)
-    monkeypatch.setenv("MINI_ORK_ROOT", str(mini_root))
-    fixture_path = _write_fixture(mini_root, {
+    """wait_s=5 (below the 10s floor) must clamp to 10. We monkeypatch
+    ``time.sleep`` so we don't actually wait."""
+    run_dir = tmp_path / "run_dir"
+    run_dir.mkdir()
+    monkeypatch.setenv("MINI_ORK_ROOT", str(tmp_path))
+    fixture = json.dumps({
         "lesson_id": 9, "matched": True,
         "recovery_action": "wait-and-retry",
         "recovery_args": {"wait_s": 5},  # below floor → clamp to 10
     })
-    monkeypatch.setenv("HEALER_FIXTURE_FILE", str(fixture_path))
 
-    # Bash — override sleep to echo the duration.
-    bash_proc = _bash_bridge(
-        mini_root, "epic-w", run_dir,
-        fixture_path=fixture_path,
-        sleep_override='echo "$@"',
-    )
-    bash_rc = _bash_rc(bash_proc)
-    assert bash_rc == 0, f"stderr={bash_proc.stderr}"
-    # Bash sleep stub echoes the first arg; clamp brings 5 → 10.
-    assert bash_proc.stdout.strip().startswith("10"), bash_proc.stdout
-
-    # Python — stub the native healer seam with the same fixture (WS5),
-    # and monkeypatch time.sleep so we capture the requested wait.
     monkeypatch.setattr(
         mhb._healer, "decide",
-        lambda *a, **k: (0, fixture_path.read_text() + "\n", ""),
+        lambda *a, **k: (0, fixture + "\n", ""),
     )
     captured: list[int] = []
     import time as _time
@@ -540,7 +337,7 @@ def test_e2e_wait_and_retry_clamps(monkeypatch, tmp_path):
 
 
 def test_extract_wait_s_from_parsed():
-    """Recovery_args.wait_s parses + clamps identically to the bash jq path."""
+    """Recovery_args.wait_s parses + clamps through the jq-shaped path."""
     assert mhb.extract_wait_s({}) == 30  # default
     assert mhb.extract_wait_s({"recovery_args": {"wait_s": 15}}) == 15
     assert mhb.extract_wait_s({"recovery_args": {"wait_s": 5}}) == 10  # floor
@@ -550,10 +347,10 @@ def test_extract_wait_s_from_parsed():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# (i) write_cleaner_brief — structural parity with bash jq -n output
+# (i) write_cleaner_brief — structural contract
 # ─────────────────────────────────────────────────────────────────────────────
-def test_write_cleaner_brief_matches_bash_keys(tmp_path):
-    """The bash jq -n emits a fixed set of keys; Python must emit the same."""
+def test_write_cleaner_brief_matches_expected_keys(tmp_path):
+    """write_cleaner_brief emits the fixed key set in order."""
     out_dir = tmp_path / "bridge"
     path = mhb.write_cleaner_brief(str(out_dir), "epic-X", "42")
     assert Path(path).is_file()
