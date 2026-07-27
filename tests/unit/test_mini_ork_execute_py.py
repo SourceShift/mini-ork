@@ -841,6 +841,21 @@ def test_verifier_no_artifact_does_not_fail_run(tmp_path):
     assert rc == 0
 
 
+def test_verifier_no_artifact_success_does_not_stamp_error_finish_reason(tmp_path):
+    # 2026-07-27: a SUCCEEDED verifier node must not carry finish_reason='error'.
+    # run_events consumers (libwit DSP live-feed poller) map 'error' to node
+    # failure — the informational stamp rendered every outputs:[] verifier as
+    # failed even though the node succeeded. Success reports success.
+    db = _seed_db(tmp_path, "vf2"); _seed_task_run(db)
+    rd = tmp_path / "run"; rd.mkdir()
+    plan = tmp_path / "noout.json"; plan.write_text('{"artifact_contract": {"outputs": []}}')
+    rc, fr = ex.dispatch_node(_fields("v1", "verifier"), root=str(REPO), run_dir=str(rd),
+                              plan_path=str(plan), task_class="code_fix", db=db, run_id="r1",
+                              dispatch_fn=_fake(""))
+    assert rc == 0
+    assert fr != "error"
+
+
 def test_publisher_panel_gate_blocks_without_approval(tmp_path, monkeypatch):
     # F2/F3: the recursive-validate-impl publisher MUST block when panel-verdict.json
     # is missing or not approved (bash :2986-3013). The old stub shipped regardless.
