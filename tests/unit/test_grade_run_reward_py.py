@@ -1,13 +1,11 @@
 """Eval-loop closure (win #3): the rubric's graded 0-8 run score must reach the
 learning reward as a graded reward_g, not a flattened pass/fail. Verifies the
-grading curve and bash↔python parity of mo_grade_run_reward.
+grading curve of the native ``trace_store.grade_run_reward``.
 """
 from __future__ import annotations
 
 import json
-import os
 import sqlite3
-import subprocess
 import sys
 from pathlib import Path
 
@@ -16,17 +14,15 @@ import pytest
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
 from mini_ork import trace_store  # noqa: E402
-
-TS_SH = REPO / "lib" / "trace_store.sh"
+from mini_ork.stores.migrate import init_db  # noqa: E402
 
 
 @pytest.fixture
 def db(tmp_path_factory):
     home = tmp_path_factory.mktemp("home")
     dbp = str(home / "state.db")
-    subprocess.run(["bash", str(REPO / "db" / "init.sh")],
-                   env={**os.environ, "MINI_ORK_HOME": str(home), "MINI_ORK_DB": dbp},
-                   capture_output=True, text=True, check=True)
+    rc, out, err = init_db(db=dbp, root=str(REPO))
+    assert rc == 0, f"init_db failed rc={rc}\nstdout={out}\nstderr={err}"
     return dbp
 
 
@@ -55,16 +51,18 @@ def test_graded_curve_python(db, tmp_path, score, expected):
     n = trace_store.grade_run_reward(str(rd), run_id, db=db)
     assert n == 2  # both traces of the run graded
     assert abs(_reward_g(db, f"{run_id}-0") - expected) < 1e-9
+    assert abs(_reward_g(db, f"{run_id}-1") - expected) < 1e-9
 
 
-def test_bash_python_parity(db, tmp_path):
+def test_grade_only_touches_target_run(db, tmp_path):
     rd = tmp_path / "rd"
     rd.mkdir()
     (rd / "rubric.json").write_text(json.dumps({"pass": True, "score": 6, "items": []}))
-    _seed(db, "run-py")
-    _seed(db, "run-bash")
-    trace_store.grade_run_reward(str(rd), "run-py", db=db)
-    subprocess.run(
-        ["bash", "-c", f'. "{TS_SH}" && mo_grade_run_reward "$1" "$2"', "_", str(rd), "run-bash"],
-        env={**os.environ, "MINI_ORK_DB": db}, capture_output=True, text=True, check=True)
-    assert _reward_g(db, "run-py-0") == _reward_g(db, "run-bash-0") == 0.5
+    _seed(db, "run-target")
+    _seed(db, "run-other")
+    n = trace_store.grade_run_reward(str(rd), "run-target", db=db)
+    assert n == 2
+    assert _reward_g(db, "run-target-0") == 0.5
+    # the other run's traces keep their status-map reward (NULL here: no
+    # reward_value/anchor seeded)
+    assert _reward_g(db, "run-other-0") is None

@@ -1,69 +1,33 @@
-"""Parity gate: ``mini_ork.learning.utility_function.score`` vs ``bash lib/utility_function.sh``.
+"""Unit tests for ``mini_ork.learning.utility_function.score``.
 
-For each fixture we invoke the LIVE bash function via subprocess (no mocking,
-exactly as the production runtime would), capture stdout as a float, then call
-the Python port with the same JSON string and assert
-``|bash_score - python_score| < 1e-6``.
+Asserts the documented default formula against hand-computed expectations:
 
-The bash ``utility_score`` checks for a per-task override under
-``${MINI_ORK_HOME}/config/utility_functions/<task_class>.sh`` and dispatches
-to it if present. That path is impure I/O and is intentionally not ported;
-every fixture here omits ``task_class`` so both bash and Python fall through
-to the default formula branch.
+    U = w_success*success + w_verifier*verifier_score + w_quality*quality_score
+        - w_cost*norm_cost - w_latency*norm_latency - w_risk*risk_penalty
 
-Strangler-fig co-existence is preserved: ``lib/utility_function.sh`` is
-byte-identical before and after this test exists. The test only WRITES to
-its ``tmp_path`` (not used here) and READS from ``lib/utility_function.sh``.
+with all components clamped to [0, 1], U clamped to [0, 1], and default
+weights success=0.45, verifier=0.20, quality=0.15, cost=0.10, latency=0.05,
+risk=0.05 (overridable via the ``weights`` dict or ``MINI_ORK_W_*`` env).
+
+The per-task override path (``${MINI_ORK_HOME}/config/utility_functions/
+<task_class>.sh``) is impure I/O and intentionally not ported; every fixture
+here omits ``task_class`` so the default formula branch runs.
 """
 
 from __future__ import annotations
 
 import math
-import os
-import subprocess
-from pathlib import Path
 
 import pytest
 
 from mini_ork.learning.utility_function import score
 
-REPO_ROOT = Path(__file__).resolve().parent.parent.parent
-LIB_UTILITY = REPO_ROOT / "lib" / "utility_function.sh"
 
-
-def _run_bash_score(run_json: str, env_overrides: dict[str, str] | None = None) -> float:
-    """Shell out to bash and invoke ``utility_score <json>`` against the live file.
-
-    ``env_overrides`` is merged on top of the current process env so per-test
-    weight overrides (``MINI_ORK_W_*``) reach bash exactly as a runtime
-    caller would set them. No mocking — the bash function runs verbatim.
-    """
-    env = os.environ.copy()
-    env.pop("MINI_ORK_W_SUCCESS", None)
-    env.pop("MINI_ORK_W_VERIFIER", None)
-    env.pop("MINI_ORK_W_QUALITY", None)
-    env.pop("MINI_ORK_W_COST", None)
-    env.pop("MINI_ORK_W_LATENCY", None)
-    env.pop("MINI_ORK_W_RISK", None)
-    if env_overrides:
-        env.update(env_overrides)
-
-    proc = subprocess.run(["bash", "-c", f". '{REPO_ROOT}/lib/utility_function.sh' && utility_score '{run_json}'"], cwd=str(REPO_ROOT), env=env, check=True, capture_output=True, text=True)
-    return float(proc.stdout.strip())
-
-
-def _parity(run_json: str, weights: dict | None = None,
-            env_overrides: dict[str, str] | None = None) -> tuple[float, float]:
-    """Run both sides with identical inputs; return (bash, python)."""
-    bash_score = _run_bash_score(run_json, env_overrides=env_overrides)
-    py_score = score(run_json, weights=weights)
-    return bash_score, py_score
-
-
-def _assert_close(bash_score: float, py_score: float, label: str) -> None:
-    assert math.isclose(bash_score, py_score, abs_tol=1e-6), (
-        f"parity drift [{label}]: bash={bash_score!r} py={py_score!r}"
-    )
+@pytest.fixture(autouse=True)
+def _clean_weight_env(monkeypatch):
+    """Pin the default weights regardless of the developer's shell env."""
+    for k in ("SUCCESS", "VERIFIER", "QUALITY", "COST", "LATENCY", "RISK"):
+        monkeypatch.delenv(f"MINI_ORK_W_{k}", raising=False)
 
 
 def test_f01_success_true_with_full_fields():
@@ -73,51 +37,41 @@ def test_f01_success_true_with_full_fields():
         ' "cost_usd": 0.5, "max_cost_usd": 1.0, "duration_ms": 5000,'
         ' "max_duration_ms": 10000, "risk_penalty": 0.1}'
     )
-    b, p = _parity(run_json)
-    _assert_close(b, p, "f01_success_true_full")
+    # 0.45*1 + 0.20*0.8 + 0.15*0.7 - 0.10*0.5 - 0.05*0.5 - 0.05*0.1 = 0.635
+    assert math.isclose(score(run_json), 0.635, abs_tol=1e-6)
 
 
 def test_f02_success_false_with_quality_default():
     """success=False; verifier_score/risk_penalty default to 0; quality_score defaults to 0.5."""
-    run_json = '{"success": false}'
-    b, p = _parity(run_json)
-    _assert_close(b, p, "f02_success_false")
-    # Sanity: known bash result for this fixture.
-    assert math.isclose(b, 0.075, abs_tol=1e-6)
+    # 0.15 * 0.5 = 0.075
+    assert math.isclose(score('{"success": false}'), 0.075, abs_tol=1e-6)
 
 
 def test_f03_verifier_score_clamped_to_one():
     """verifier_score > 1 must clamp to 1.0 before weighting."""
-    run_json = '{"success": true, "verifier_score": 1.7}'
-    b, p = _parity(run_json)
-    _assert_close(b, p, "f03_verifier_clamp")
+    # 0.45*1 + 0.20*1.0 (clamped from 1.7) + 0.15*0.5 = 0.725
+    assert math.isclose(score('{"success": true, "verifier_score": 1.7}'), 0.725, abs_tol=1e-6)
 
 
 def test_f04_custom_max_cost_usd_normalization():
     """Custom ceiling changes norm_cost denominator."""
-    run_json = '{"success": true, "cost_usd": 0.25, "max_cost_usd": 0.5}'
-    b, p = _parity(run_json)
-    _assert_close(b, p, "f04_custom_max_cost")
+    # 0.45 + 0.15*0.5 - 0.10*(0.25/0.5) = 0.475
+    assert math.isclose(
+        score('{"success": true, "cost_usd": 0.25, "max_cost_usd": 0.5}'),
+        0.475, abs_tol=1e-6)
 
 
 def test_f05_custom_max_duration_ms_normalization():
     """Custom ceiling changes norm_latency denominator."""
-    run_json = '{"success": true, "duration_ms": 3000, "max_duration_ms": 6000}'
-    b, p = _parity(run_json)
-    _assert_close(b, p, "f05_custom_max_duration")
+    # 0.45 + 0.15*0.5 - 0.05*(3000/6000) = 0.5
+    assert math.isclose(
+        score('{"success": true, "duration_ms": 3000, "max_duration_ms": 6000}'),
+        0.5, abs_tol=1e-6)
 
 
-def test_f06_weight_override_via_env():
-    """Bash reads MINI_ORK_W_* from env at source time; the Python port
-    reads them at call time. To make both sides agree we thread the same
-    overrides through BOTH mechanisms: env to bash, dict to Python, then
-    verify parity.
-
-    Bash evaluates ``_UTILITY_W_<NAME>="${MINI_ORK_W_<NAME>:-<default>}"``
-    once when the file is sourced, so subprocess must re-source with the
-    overrides in env. The Python side's ``weights`` parameter is the
-    equivalent for in-process callers.
-    """
+def test_f06_weight_override_via_weights_dict_and_env(monkeypatch):
+    """The ``weights`` parameter and the ``MINI_ORK_W_*`` env vars are two
+    names for the same override channel — both must yield the same score."""
     run_json = '{"success": true, "verifier_score": 0.5, "quality_score": 0.5}'
     weights = {
         "success": 0.30,
@@ -127,18 +81,15 @@ def test_f06_weight_override_via_env():
         "latency": 0.03,
         "risk": 0.04,
     }
-    env_overrides = {f"MINI_ORK_W_{k.upper()}": str(v) for k, v in weights.items()}
-    b, p = _parity(run_json, weights=weights, env_overrides=env_overrides)
-    _assert_close(b, p, "f06_env_weight_override")
+    # 0.30*1 + 0.30*0.5 + 0.30*0.5 = 0.60
+    assert math.isclose(score(run_json, weights=weights), 0.60, abs_tol=1e-6)
+    for k, v in weights.items():
+        monkeypatch.setenv(f"MINI_ORK_W_{k.upper()}", str(v))
+    assert math.isclose(score(run_json), 0.60, abs_tol=1e-6)
 
 
-def test_f07_explicit_weights_dict_overrides_env():
-    """Caller-supplied ``weights`` dict wins over env on the Python side.
-
-    Bash has no equivalent parameter (it reads env only); we re-mirror this
-    fixture by passing the same weights through env on the bash side so
-    both produce the same score.
-    """
+def test_f07_explicit_weights_dict_overrides_env(monkeypatch):
+    """Caller-supplied ``weights`` dict wins over env."""
     run_json = '{"success": true, "verifier_score": 1.0}'
     weights = {
         "success": 0.50,
@@ -148,37 +99,40 @@ def test_f07_explicit_weights_dict_overrides_env():
         "latency": 0.02,
         "risk": 0.01,
     }
-    env_overrides = {f"MINI_ORK_W_{k.upper()}": str(v) for k, v in weights.items()}
-    b, p = _parity(run_json, weights=weights, env_overrides=env_overrides)
-    _assert_close(b, p, "f07_explicit_weights")
+    monkeypatch.setenv("MINI_ORK_W_SUCCESS", "0.99")  # must be ignored
+    # 0.50*1 + 0.40*1.0 + 0.05*0.5 = 0.925
+    assert math.isclose(score(run_json, weights=weights), 0.925, abs_tol=1e-6)
 
 
 def test_f08_empty_input_defaults():
     """Empty JSON — only quality_score default (0.5) contributes positively."""
-    run_json = '{}'
-    b, p = _parity(run_json)
-    _assert_close(b, p, "f08_empty_defaults")
-    # 0.15 * 0.5 = 0.075 — confirmed against bash.
-    assert math.isclose(b, 0.075, abs_tol=1e-6)
+    # 0.15 * 0.5 = 0.075
+    assert math.isclose(score('{}'), 0.075, abs_tol=1e-6)
 
 
 @pytest.mark.parametrize(
-    "raw_success,expected_label",
+    "raw_success,expected",
     [
-        ("true", "json_bool_true"),
-        ("1", "json_int_one"),
-        ('"true"', "json_string_true"),
-        ('"1"', "json_string_one"),
-        ("false", "json_bool_false"),
-        ("0", "json_int_zero"),
+        ("true", 0.525),       # 0.45*1 + 0.15*0.5
+        ("1", 0.525),
+        ('"true"', 0.525),
+        ('"1"', 0.525),
+        ("false", 0.075),      # 0.45*0 + 0.15*0.5
+        ("0", 0.075),
     ],
 )
-def test_f09_success_truthiness_matrix(raw_success: str, expected_label: str):
-    """Bash's success membership test accepts True/1/'true'/'1'; all four must
+def test_f09_success_truthiness_matrix(raw_success: str, expected: float):
+    """The success membership test accepts True/1/'true'/'1'; all four must
     yield 1.0 before weighting. Bool-False and 0 must yield 0.0."""
     run_json = '{"success": ' + raw_success + '}'
-    b, p = _parity(run_json)
-    _assert_close(b, p, f"f09_{expected_label}")
+    assert math.isclose(score(run_json), expected, abs_tol=1e-6)
+
+
+def test_score_clamped_to_unit_interval():
+    """Huge penalties can't push U below 0; huge positives can't exceed 1."""
+    assert score('{"success": false, "risk_penalty": 1.0, "cost_usd": 5,'
+                 ' "max_cost_usd": 1, "duration_ms": 9, "max_duration_ms": 1,'
+                 ' "quality_score": 0.0}') == 0.0
 
 
 def test_smoke_import_and_score_no_io():
