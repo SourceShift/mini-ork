@@ -27,11 +27,11 @@ verdict_schema:
   rule: "pass == (parity_pass && acceptance_pass && ledger_complete && no_dangling_edge)"
 
 success_verifiers:
-  - verifiers/pre-retirement-parity.sh
-  - verifiers/parity.sh
-  - verifiers/feature-acceptance.sh
-  - verifiers/ledger-shape.sh
-  - verifiers/fork-closure.sh
+  - verifiers/pre-retirement-parity.py
+  - verifiers/parity.py
+  - verifiers/feature-acceptance.py
+  - verifiers/ledger-shape.py
+  - verifiers/fork-closure.py
 
 failure_policy: request_changes
 rollback_policy: >

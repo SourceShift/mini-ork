@@ -33,6 +33,6 @@ outputs:
     required: true
 
 success_verifiers:
-  - verifiers/findings-completeness.sh
+  - verifiers/findings-completeness.py
 
 risk_class: low

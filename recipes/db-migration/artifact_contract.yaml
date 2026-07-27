@@ -33,6 +33,6 @@ outputs:
     required: true
 
 success_verifiers:
-  - verifiers/migration-completeness.sh
+  - verifiers/migration-completeness.py
 
 risk_class: high

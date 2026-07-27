@@ -44,7 +44,7 @@ artifact:
 # Verifiers that must all pass before publisher is allowed to run.
 verifiers:
   - name: bdd_runner
-    ref: verifiers/playwright_runner.sh
+    ref: verifiers/playwright_runner.py
     description: >
       Runs npx playwright test against each sub-epic's spec file from within
       the implementer's worktree. All sub-epics must reach verdict=PASS (or

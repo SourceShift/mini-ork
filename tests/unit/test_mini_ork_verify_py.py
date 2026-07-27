@@ -29,8 +29,8 @@ def _scenario(tmp_path, verifiers):
     subprocess.run(["bash", str(REPO / "db" / "init.sh")], env=_env(home, db),
                    capture_output=True, text=True, check=True)
     vdir = home / "verifiers"; vdir.mkdir()
-    (vdir / "goodv.sh").write_text('echo "ok"\nexit 0\n')
-    (vdir / "badv.sh").write_text('echo "nope"\nexit 1\n')
+    (vdir / "goodv.py").write_text('print("ok")\n')
+    (vdir / "badv.py").write_text('import sys\nprint("nope")\nsys.exit(1)\n')
     plan = home / "plan.json"
     plan.write_text(json.dumps({"task_class": "code_fix",
                                 "artifact_contract": {"success_verifiers": verifiers}}))

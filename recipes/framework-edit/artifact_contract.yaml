@@ -20,9 +20,9 @@ verdict_schema:
   rule: "pass == (tests_pass && static_pass)"
 
 success_verifiers:
-  - verifiers/static-check.sh
-  - verifiers/test.sh
-  - verifiers/framework-edit-shape.sh
+  - verifiers/static-check.py
+  - verifiers/test.py
+  - verifiers/framework-edit-shape.py
 
 failure_policy: request_changes
 rollback_policy: >

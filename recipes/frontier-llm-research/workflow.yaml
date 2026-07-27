@@ -9,14 +9,14 @@ description: >
 nodes:
   - name: libwit_source_collector
     type: verifier
-    verifier_ref: verifiers/collect-latest-libwit.sh
+    verifier_ref: verifiers/collect-latest-libwit.py
     dispatch_mode: serial
     gates: [budget_gate]
     outputs: [{ name: source_corpus, kind: json, path: source-corpus.json }]
 
   - name: corpus_sharder
     type: verifier
-    verifier_ref: verifiers/shard-corpus.sh
+    verifier_ref: verifiers/shard-corpus.py
     dispatch_mode: serial
     inputs:
       source_corpus: { required: true }
@@ -115,7 +115,7 @@ nodes:
 
   - name: technique_rollup
     type: verifier
-    verifier_ref: verifiers/prepare-technique-rollup.sh
+    verifier_ref: verifiers/prepare-technique-rollup.py
     dispatch_mode: serial
     inputs: { source_summaries: { required: true, many: true } }
     outputs: [{ name: technique_rollup, kind: json, path: technique-rollup.json }]
@@ -131,7 +131,7 @@ nodes:
 
   - name: aggregation_document
     type: verifier
-    verifier_ref: verifiers/assemble-aggregation.sh
+    verifier_ref: verifiers/assemble-aggregation.py
     dispatch_mode: serial
     inputs:
       source_summaries: { required: true, many: true }
@@ -140,7 +140,7 @@ nodes:
 
   - name: research_completeness
     type: verifier
-    verifier_ref: verifiers/verify-aggregation.sh
+    verifier_ref: verifiers/verify-aggregation.py
     dispatch_mode: serial
     inputs: { aggregation: { required: true } }
 

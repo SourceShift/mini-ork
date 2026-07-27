@@ -2,7 +2,7 @@ task_class: blog_cohesion
 expected_artifact: composite   # 5 lens JSONs + applied_post.md + apply_log.md
 
 success_verifiers:
-  - verifiers/cohesion-completeness.sh
+  - verifiers/cohesion-completeness.py
 
 failure_policy: request_changes
 rollback_policy: >
