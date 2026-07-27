@@ -123,9 +123,18 @@ def test_unknown_lane_is_structured_not_raised():
     assert "unknown lane" in res.error  # caught by the preflight gate, fail-fast
 
 
-def test_resolve_known_lane_points_at_wrapper():
+def test_resolve_codex_lane_uses_python_transport():
+    # bash-removal WS6: the codex lane runs the native Python transport
+    # (drop-in replacement for lib/providers/cl_codex.sh).
     spec = resolve_provider("codex")
-    assert spec.command[0].endswith("lib/providers/cl_codex.sh")
+    assert spec.command[0] == sys.executable
+    assert spec.command[1:] == (
+        "-m",
+        "mini_ork.dispatch.codex_transport",
+        "--print",
+        "--output-format",
+        "text",
+    )
     # codex telemetry comes from sidecars (dispatch_model), not stdout parsers.
     assert spec.parse_usage is None
 

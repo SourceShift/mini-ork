@@ -45,6 +45,54 @@
 #     reviewer: anthropic_api
 
 providers:
+  # ── Committed lanes (WS6: registry is now the source of truth; the
+  # lib/providers/cl_<name>.sh wrappers remain only as fallback until the
+  # bash purge). Contracts ported verbatim from the wrappers. ─────────────
+  glm:
+    kind: anthropic-compat
+    family: gateway  # bash coarse taxonomy (llm_calls.provider parity); the fine family lives in mini_ork.dispatch.providers._PROVIDER_FAMILY
+    model: GLM-5.1
+    base_url: https://api.z.ai/api/anthropic
+    api_key_env: GLM_API_KEY
+    extra_env:
+      CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
+  kimi:
+    kind: anthropic-compat
+    family: gateway  # bash coarse taxonomy (llm_calls.provider parity); the fine family lives in mini_ork.dispatch.providers._PROVIDER_FAMILY
+    model: kimi-k2.7-code
+    base_url: https://api.kimi.com/coding/
+    api_key_env: KIMI_API_KEY
+    extra_env:
+      ENABLE_TOOL_SEARCH: "false"
+  minimax:
+    kind: anthropic-compat
+    family: gateway  # bash coarse taxonomy (llm_calls.provider parity); the fine family lives in mini_ork.dispatch.providers._PROVIDER_FAMILY
+    model: MiniMax-M3
+    base_url: https://api.minimax.io/anthropic
+    api_key_env: MINIMAX_API_KEY
+    extra_env:
+      CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
+  deepseek:
+    kind: anthropic-compat
+    family: gateway  # bash coarse taxonomy (llm_calls.provider parity); the fine family lives in mini_ork.dispatch.providers._PROVIDER_FAMILY
+    model: "deepseek-v4-pro[1m]"
+    base_url: https://api.deepseek.com/anthropic
+    api_key_env: DEEPSEEK_API_KEY
+    extra_env:
+      ANTHROPIC_DEFAULT_HAIKU_MODEL: deepseek-v4-flash
+      CLAUDE_CODE_SUBAGENT_MODEL: deepseek-v4-flash
+      CLAUDE_CODE_EFFORT_LEVEL: high
+      CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
+  # Anthropic-native lanes with NO model pin and NO key export — the
+  # ambient Claude Code login supplies auth + model (the cl_opus.sh /
+  # cl_sonnet.sh "clear gateway pollution, export nothing" contract).
+  opus:
+    kind: anthropic-native
+    family: anthropic
+  sonnet:
+    kind: anthropic-native
+    family: anthropic
+
   # Claude CLI with your own raw Anthropic API key. Export
   # ANTHROPIC_API_KEY in secrets.local.sh; without it this falls back to
   # the ambient `claude` login (same behavior as the builtin `opus` lane).
