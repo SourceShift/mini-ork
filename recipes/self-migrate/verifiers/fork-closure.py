@@ -13,7 +13,7 @@
 import ast
 import json
 import os
-import subprocess
+import re
 import sys
 
 RUN_DIR = os.environ["MINI_ORK_RUN_DIR"]
@@ -36,11 +36,65 @@ open(EVIDENCE, "w").close()
 
 
 def _rg(args, append=True):
+    """Native replacement for the ripgrep subprocess (rg is not guaranteed on
+    CI/operator machines — its absence crashed this verifier with an empty
+    stdout, breaking the self-migrate exit-status gate). Same contract:
+    returns True when a match is found, writes matches (path:lineno:line)
+    to EVIDENCE. Supports the two arg shapes this file uses:
+    ``["-n", "--regexp", PATTERN, *dirs]`` and
+    ``["-n", "--fixed-strings", "--hidden", "--glob", "!.git/**", "--", NEEDLE, *dirs]``.
+    """
     mode = "ab" if append else "wb"
+    regexp = None
+    needle = None
+    paths: list[str] = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--regexp":
+            regexp = args[i + 1]
+            i += 2
+        elif a == "--fixed-strings":
+            i += 1
+        elif a in ("-n", "--hidden"):
+            i += 1
+        elif a == "--glob":
+            i += 2  # only !.git/** is used; handled by the .git skip below
+        elif a == "--":
+            needle = args[i + 1]
+            paths.extend(args[i + 2:])
+            break
+        else:
+            paths.append(a)
+            i += 1
+    pattern = None
+    if regexp is not None:
+        pattern = re.compile(regexp.replace("[[:space:]]", r"\s"))
+
+    def _files():
+        for p in paths:
+            ap = os.path.join(REPO_ROOT, p)
+            if os.path.isfile(ap):
+                yield ap
+            elif os.path.isdir(ap):
+                for dirpath, dirnames, filenames in os.walk(ap):
+                    dirnames[:] = [d for d in dirnames if d != ".git"]
+                    for fn in filenames:
+                        yield os.path.join(dirpath, fn)
+
+    found = False
     with open(EVIDENCE, mode) as f:
-        # rg exits 0 when matches found, 1 when none — a match means a dangling ref.
-        return subprocess.run(["rg"] + args, cwd=REPO_ROOT, stdout=f,
-                              stderr=subprocess.STDOUT).returncode == 0
+        for fp in _files():
+            try:
+                with open(fp, encoding="utf-8", errors="replace") as src:
+                    for lineno, line in enumerate(src, 1):
+                        hit = (needle in line) if needle is not None else bool(pattern.search(line))
+                        if hit:
+                            found = True
+                            f.write(f"{os.path.relpath(fp, REPO_ROOT)}:{lineno}:{line}")
+            except OSError:
+                continue
+    return found
 
 
 if FORK == "cli":
