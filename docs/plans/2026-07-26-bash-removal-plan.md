@@ -1,11 +1,17 @@
 # Plan — Bash removal: complete the Python cutover
 
-*2026-07-26 · status: proposed · supersedes the strangler-fig interim state*
+*2026-07-26 · implementation status updated 2026-07-29: Phases 0–4 complete; Phase 5 release verification remains*
 
-## 0. Reality check (why this is a cutover, not a deletion)
+> **Implementation record.** The Python runtime is now the only framework
+> runtime: `lib/` and `gates/` contain no shell runtime files, compatibility
+> commands in `bin/` re-exec the native dispatcher, and parity tests were
+> converted to native unit tests. The Phase 0–4 descriptions below are kept as
+> the decision record for the cutover, not as instructions to restore Bash.
 
-`MINI_ORK_RUNTIME=python` is the default and the Python runtime is live, but
-bash is still **load-bearing in the default production path**:
+## 0. Reality check at plan time (why this was a cutover, not a deletion)
+
+`MINI_ORK_RUNTIME=python` was the default and the Python runtime was live, but
+Bash was still **load-bearing in the default production path**:
 
 1. **Trampoline**: `mini-ork <sub>` → Python `cli/main.py` →
    `_bash_entrypoint_handler` → `bin/mini-ork-*` (bash) → `runtime-select.sh`
@@ -118,7 +124,7 @@ parity tests already prove equivalence.
 - **Exit:** all built-in recipes verify with no `.sh` under `recipes/`;
   external `.sh` verifiers still run (compat) but warn.
 
-## Phase 2 — Delete the bash runtime (1 day, after WS1–WS8)
+## Phase 2 — Delete the bash runtime (complete)
 
 - Delete `bin/mini-ork-*` bash bodies → replace each with a thin
   `exec python3 -m <module>` shim (or fold into `bin/mini-ork <sub>` only
@@ -128,9 +134,11 @@ parity tests already prove equivalence.
   6 `gates/*.sh`, `bin/_worker-launcher.sh`, `bin/mo-check-claude-invocations`
   (Python port exists).
 - Remove `MINI_ORK_RUNTIME` handling and the `doctor` lib-presence checks.
-- **Exit:** full pytest green with zero `.sh` in `bin/ lib/ gates/`.
+- **Exit:** full pytest green with zero `.sh` in `bin/ lib/ gates/`. Achieved
+  for the framework runtime; `db/init.sh` remains an external compatibility shim
+  that immediately `exec`s `mini_ork.stores.migrate`.
 
-## Phase 3 — Test migration (2–3 days)
+## Phase 3 — Test migration (complete)
 
 - Convert ~90 parity `*_py.py` tests to plain unit tests: drop the
   bash-subprocess half, keep the Python assertions (most already have
@@ -141,7 +149,7 @@ parity tests already prove equivalence.
 - **Exit:** pytest suite count stabilizes ≈ python-only; no test spawns
   `bash` except recipe-verifier compat tests (WS8).
 
-## Phase 4 — Tooling, CI, docs (1–2 days)
+## Phase 4 — Tooling, CI, docs (complete, with historical-doc sweep tracked separately)
 
 - **CI**: delete `shellcheck` + `bash-tests` jobs; delete
   `mo-check-claude-invocations` advisory step (port is Python — wire it as
@@ -160,10 +168,13 @@ parity tests already prove equivalence.
 - **Docs**: rewrite `AGENTS.md` (drop `MINI_ORK_RUNTIME=bash`,
   `lib/paths.sh`, shellcheck references), `docs/operator/*`, and sweep the
   106 files referencing `.sh` paths; update `.github/CODEOWNERS`.
-- **Exit:** `grep -r '\.sh' --include='*.py' mini_ork/ | grep -v test` →
-  empty; CI green with 2 jobs removed.
+- **Exit:** no internal Python subprocess targets a retired `lib/` or
+  `gates/` runtime path; CI green with the Bash-only jobs removed. Shell
+  execution remains allowed at explicit external boundaries: legacy recipe
+  verifiers, target-repository commands, migration SQL compatibility, and
+  sandboxed user commands.
 
-## Phase 5 — Verification & rollout
+## Phase 5 — Verification & rollout (remaining)
 
 - Full suite + live smoke (real lanes) in the mini-ork env.
 - Bump minor version; changelog entry: "bash runtime removed".

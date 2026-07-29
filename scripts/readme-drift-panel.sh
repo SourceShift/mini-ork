@@ -31,6 +31,7 @@
 set +e
 MO_README="${MO_README:-README.md}"
 MINI_ORK_ROOT="${MINI_ORK_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+export PYTHONPATH="$MINI_ORK_ROOT${PYTHONPATH:+:$PYTHONPATH}"
 SECRETS="${MO_SECRETS:-$MINI_ORK_ROOT/.mini-ork/config/secrets.local.sh}"
 [ -f "$SECRETS" ] || SECRETS="$HOME/.config/mini-ork/secrets.local.sh"
 [ -f "$SECRETS" ] && source "$SECRETS"
@@ -48,7 +49,7 @@ Repo inventory (current state, computed at $ts):
   bin/mini-ork-* entrypoint count: $(ls bin/mini-ork* 2>/dev/null | wc -l | tr -d ' ')
   db/migrations/*.sql count:       $(find db/migrations -maxdepth 1 -name '*.sql' -type f 2>/dev/null | wc -l | tr -d ' ')
   recipes/ subdir count:           $(find recipes -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')
-  lib/providers/cl_*.sh count:     $(find lib/providers -maxdepth 1 -name 'cl_*.sh' -type f 2>/dev/null | wc -l | tr -d ' ')
+  provider registry entries:        $(grep -c '^  [a-zA-Z0-9_-]*:$' config/providers.yaml 2>/dev/null || true)
 
 Recipes shipped:
 $(ls -d recipes/*/ 2>/dev/null | sed 's|^|  |; s|/$||')
@@ -106,20 +107,9 @@ dispatch_lens() {
 
 ${lens_suffix}"
 
-  local provider_path="$MINI_ORK_ROOT/lib/providers/cl_${provider}.sh"
-  if [ ! -f "$provider_path" ]; then
-    echo "{\"lens\":\"$lens_name\",\"verdict\":\"NO_DRIFT\",\"drifted_claims\":[],\"confidence\":0.0,\"error\":\"provider missing: $provider_path\"}" > "$out_file"
-    return
-  fi
-
   (
-    if [ "$provider" = "codex" ]; then
-      # cl_codex.sh is executable, not sourceable.
-      timeout 90 "$provider_path" --print --output-format text "$prompt" < /dev/null 2>"$err_file" > "$out_file.raw"
-    else
-      source "$provider_path" 2>/dev/null
-      timeout 90 claude --print --output-format text "$prompt" < /dev/null 2>"$err_file" > "$out_file.raw"
-    fi
+    printf '%s' "$prompt" | timeout 90 python3 -m mini_ork.dispatch "$provider" --timeout 90 \
+      2>"$err_file" > "$out_file.raw"
   )
 
   # Strip markdown code fences if present, then extract the FIRST complete
@@ -230,10 +220,8 @@ EOF
 
 arbiter_raw="$RUN_DIR/arbiter.raw"
 arbiter_json="$RUN_DIR/arbiter.json"
-(
-  source "$MINI_ORK_ROOT/lib/providers/cl_opus.sh" 2>/dev/null
-  timeout 120 claude --print --output-format text "$arbiter_prompt" < /dev/null 2>"$RUN_DIR/arbiter.err" > "$arbiter_raw"
-)
+printf '%s' "$arbiter_prompt" | timeout 120 python3 -m mini_ork.dispatch opus --timeout 120 \
+  2>"$RUN_DIR/arbiter.err" > "$arbiter_raw"
 
 python3 - "$arbiter_raw" "$RUN_DIR" > "$arbiter_json" 2>>"$RUN_DIR/arbiter.err" <<'PY'
 import json, os, re, sys

@@ -2,32 +2,51 @@
 `claude --print` / `claude -p` invocation carries a permission-bypass flag
 within 10 lines.
 
-Strangler-fig parity port. Pure static analysis over lib/ + bin/ (skipping
-lib/providers/ wrappers and comment/doc lines). Returns rc 0=clean, 1=violations.
+Static analysis over literal native-Python Claude argv lists plus executable
+CLI launchers. Python syntax parsing excludes comments and documentation;
+dynamic command assembly stays covered by the command helper tests. Returns
+rc 0=clean, 1=violations.
 
     check(root) -> (total, checked, violations)
     main(argv=None, root=None) -> int rc
 """
 from __future__ import annotations
 
+import ast
 import os
-import re
 import sys
-
-_CLAUDE_RE = re.compile(r"claude\s+(--print|-p\s)")
-_FLAG_RE = re.compile(
-    r"permission-mode\s+bypassPermissions|dangerously-skip-permissions|"
-    r"allow-dangerously-skip-permissions")
-
 
 def _scan_files(root: str) -> list[str]:
     out: list[str] = []
-    for base in ("lib", "bin"):
+    for base in ("mini_ork", "bin"):
         for dirpath, _dirs, files in os.walk(os.path.join(root, base)):
             for name in files:
-                if name.endswith(".sh") or name.startswith("mini-ork"):
+                if name.endswith(".py") or name.startswith("mini-ork"):
                     out.append(os.path.join(dirpath, name))
     return out
+
+
+def _argv_literals(node: ast.List | ast.Tuple) -> list[str | None]:
+    """Keep literal argv values while preserving dynamic-element positions."""
+    values: list[str | None] = []
+    for element in node.elts:
+        if isinstance(element, ast.Constant) and isinstance(element.value, str):
+            values.append(element.value)
+        else:
+            values.append(None)
+    return values
+
+
+def _has_permission_bypass(argv: list[str | None]) -> bool:
+    return (
+        "--dangerously-skip-permissions" in argv
+        or "--allow-dangerously-skip-permissions" in argv
+        or "--permission-mode=bypassPermissions" in argv
+        or any(
+            argv[index:index + 2] == ["--permission-mode", "bypassPermissions"]
+            for index in range(len(argv) - 1)
+        )
+    )
 
 
 def check(root: str) -> tuple[int, int, list[str]]:
@@ -35,27 +54,22 @@ def check(root: str) -> tuple[int, int, list[str]]:
     total = checked = 0
     violations: list[str] = []
     for f in files:
-        if os.sep + "lib" + os.sep + "providers" + os.sep in f + os.sep:
-            continue
         try:
-            lines = open(f, encoding="utf-8", errors="ignore").read().splitlines()
-        except OSError:
+            tree = ast.parse(open(f, encoding="utf-8", errors="ignore").read(), filename=f)
+        except (OSError, SyntaxError):
             continue
-        for i, line in enumerate(lines):
-            if not _CLAUDE_RE.search(line):
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.List, ast.Tuple)):
                 continue
-            if line.lstrip().startswith("#"):          # comment line
-                continue
-            pre = line[: line.find("claude")]           # doc-comment: # before claude
-            if "#" in pre:
+            argv = _argv_literals(node)
+            if not argv or argv[0] != "claude" or not ({"--print", "-p"} & set(argv)):
                 continue
             total += 1
-            window = "\n".join(lines[i: i + 11])        # this line + next 10
-            if _FLAG_RE.search(window):
+            if _has_permission_bypass(argv):
                 checked += 1
             else:
                 violations.append(
-                    f"{f}:{i + 1}: claude invocation without --permission-mode "
+                    f"{f}:{node.lineno}: claude invocation without --permission-mode "
                     f"bypassPermissions OR --dangerously-skip-permissions")
     return total, checked, violations
 

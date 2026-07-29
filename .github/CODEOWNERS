@@ -17,9 +17,9 @@
 # Safety-critical paths — explicit lead approval required
 /docs/SAFETY.md                @PROJECT_LEAD
 /db/migrations/0012_safety.sql @PROJECT_LEAD
-/lib/gate_registry.sh          @PROJECT_LEAD
-/lib/promotion_gate.sh         @PROJECT_LEAD
-/lib/version_registry.sh       @PROJECT_LEAD
+/mini_ork/gates/gate_registry.py @PROJECT_LEAD
+/mini_ork/gates/promotion_gate.py @PROJECT_LEAD
+/mini_ork/registries/version_registry.py @PROJECT_LEAD
 
 # Recipes — user-land, looser ownership (any reviewer can approve)
 /recipes/                      @PROJECT_LEAD

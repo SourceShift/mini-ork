@@ -1,7 +1,6 @@
 """Native mini-ork entrypoint / universal-loop dispatcher.
 
-Simple subcommands delegate to bin/mini-ork-<sub> while their forks remain
-open; closed forks run as Python modules. The `run` recipe-runner walks
+Subcommands run through native Python modules. The `run` recipe-runner walks
 classify → profile → plan → execute → rubric → verify → reflect with deadline
 soft-gates between stages. Recipe resolution and profile generation preserve
 the golden outputs captured before Bash retirement.
@@ -30,8 +29,8 @@ from mini_ork.gates import rubric_prescreen
 
 _NATIVE_SUBS = {"apply", "classify", "plan", "verify", "reflect", "garden", "validate"}
 
-# Former bash-trampoline subcommands, now native (bash-removal WS1): sub name
-# → python module. The mapping mirrors lib/runtime-select.sh's delegation table.
+# Native module subcommands. Compatibility launchers under bin/ re-exec this
+# dispatcher, so there is one public command implementation.
 _NATIVE_MODULE_SUBS = {
     "improve": "mini_ork.cli.improve",
     "eval": "mini_ork.cli.eval",
@@ -50,6 +49,14 @@ _NATIVE_MODULE_SUBS = {
     "resume": "mini_ork.cli.resume",
     "recover": "mini_ork.recovery.planner",
     "serve": "mini_ork.cli.serve",
+    "bug-collector": "mini_ork.observability.bug_collector",
+    "conductor": "mini_ork.orchestration.conductor",
+    "coord": "mini_ork.orchestration.coord",
+    "lifetime": "mini_ork.orchestration.lifetime",
+    "self-improve": "mini_ork.cli.self_improve",
+    "topology": "mini_ork.cli.topology",
+    "usage-report": "mini_ork.observability.usage_report",
+    "watchdog": "mini_ork.orchestration.watchdog",
 }
 
 _HELP = """mini-ork — task operating system for agents (v0.1)
@@ -77,7 +84,7 @@ Lifecycle:
   init                           Bootstrap project (creates .mini-ork/)
   install                        Install or repair the per-user mini-ork command
   update                         Apply migrations + report config drift
-  doctor                         Check deps + env vars + lib presence + provider preflight
+  doctor                         Check deps, environment, and provider preflight
   providers                      Configure or inspect credentials for workflow lanes
   validate                       Pre-run static checks with Fix: hints
   garden                         Drift detection (collisions, orphans, stale runs)
@@ -590,10 +597,10 @@ def _run_handler(rest, root):
 def _doctor_handler(rest, root):
     del rest
     import shutil
-    # lib/paths.sh semantics: default PROJECT_HOME is cwd/.mini-ork.
+    # The native path contract defaults project home to cwd/.mini-ork.
     home = os.environ.get("MINI_ORK_HOME") or os.path.join(os.getcwd(), ".mini-ork")
     print("=== mini-ork doctor ===")
-    for d in ("bash", "sqlite3", "jq", "git", "yq", "curl", "claude", "python3"):
+    for d in ("sqlite3", "git", "curl", "claude", "codex", "python3"):
         print(f"  [OK]      {d}" if shutil.which(d) else f"  [MISSING] {d}")
     if os.environ.get("MINI_ORK_HOME"):
         print(f"  [OK]      MINI_ORK_HOME={os.environ['MINI_ORK_HOME']}")
@@ -603,15 +610,6 @@ def _doctor_handler(rest, root):
         print(f"  [OK]      MINI_ORK_DB={os.environ['MINI_ORK_DB']}")
     else:
         print("  [WARN]    MINI_ORK_DB unset (default: $MINI_ORK_HOME/state.db)")
-    print("")
-    print("Lib presence:")
-    for lib in ("trace_store", "llm-dispatch", "gate_registry", "group_evolver",
-                "benchmark_suite", "utility_function",
-                "promotion_gate", "version_registry", "paths"):
-        if os.path.isfile(os.path.join(root, "lib", f"{lib}.sh")):
-            print(f"  [OK]      lib/{lib}.sh")
-        else:
-            print(f"  [MISSING] lib/{lib}.sh (P1 in flight?)")
     print("")
     print("Provider preflight:")
     for tool, name in (("claude", "anthropic"), ("codex", "codex")):

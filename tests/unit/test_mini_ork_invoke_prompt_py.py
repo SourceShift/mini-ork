@@ -158,7 +158,6 @@ def test_context_role_pack_is_appended_after_substitution(
     tmp_path: Path, monkeypatch,
 ) -> None:
     root = _root(tmp_path)
-    (root / "lib").mkdir()
     prompt = tmp_path / "prompt.md"
     prompt.write_text("review {{MINI_ORK_TARGET}}")
     provider = StubProvider()
@@ -166,6 +165,7 @@ def test_context_role_pack_is_appended_after_substitution(
     def role_pack(node_type: str, brief: Path, _: str) -> str:
         assert node_type == "reviewer"
         assert Path(brief).read_text() == "review patch.py"
+        assert brief.parent != root / "lib"
         return "ROLE PACK"
 
     monkeypatch.setattr(invoke_prompt._crp, "role_pack_md", role_pack)
@@ -184,6 +184,7 @@ def test_context_role_pack_is_appended_after_substitution(
 
     assert rc == 0
     assert provider.calls[0][1] == "review patch.py\n\nROLE PACK\n"
+    assert not (root / "lib").exists()
 
 
 def test_success_trace_row_is_written(tmp_path: Path) -> None:

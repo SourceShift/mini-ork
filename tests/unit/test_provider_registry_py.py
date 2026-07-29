@@ -32,9 +32,6 @@ def _fixture(tmp_path: Path) -> Path:
     (tmp_path / "config").mkdir()
     (tmp_path / "scripts").mkdir()
     (tmp_path / "config" / "providers.yaml").write_text(REGISTRY)
-    wrapper = tmp_path / "lib" / "providers"
-    wrapper.mkdir(parents=True)
-    (wrapper / "cl_codex.sh").write_text("#!/bin/sh\n")
     (tmp_path / "scripts" / "registry_stub.sh").write_text("#!/bin/sh\n")
     (tmp_path / "scripts" / "registry_stub.sh").chmod(0o755)
     return tmp_path
@@ -46,11 +43,10 @@ def test_registry_executable_and_openai_resolution(tmp_path, monkeypatch):
     executable = resolve_provider("stubexec", root)
     assert executable.command[0].endswith("scripts/registry_stub.sh")
     openai = resolve_provider("oaitest", root)
-    assert openai.env == {
-        "MO_OAI_BASE_URL": "https://example.invalid/v1",
-        "MO_OAI_ENV_KEY": "TEST_OAI_KEY",
-        "MO_OAI_MODEL": "test-model-7",
-    }
+    assert openai.env["MO_OAI_BASE_URL"] == "https://example.invalid/v1"
+    assert openai.env["MO_OAI_ENV_KEY"] == "TEST_OAI_KEY"
+    assert openai.env["MO_OAI_MODEL"] == "test-model-7"
+    assert "mini_ork.dispatch.codex_transport" in openai.command
 
 
 def test_registry_anthropic_env_and_health(tmp_path, monkeypatch):

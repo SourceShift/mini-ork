@@ -20,13 +20,22 @@ def _root(tmp_path: Path) -> Path:
         "lanes:\n  minimax_lens: minimax\n  glm_lens: glm\n",
         encoding="utf-8",
     )
-    providers_dir = root / "lib" / "providers"
-    providers_dir.mkdir(parents=True)
-    for model, key in (("minimax", "MINIMAX_API_KEY"), ("glm", "GLM_API_KEY")):
-        (providers_dir / f"cl_{model}.sh").write_text(
-            f'export ANTHROPIC_AUTH_TOKEN="${{{key}:?{key} required}}"\n',
-            encoding="utf-8",
-        )
+    (root / "config" / "providers.yaml").write_text(
+        "providers:\n"
+        "  minimax:\n"
+        "    kind: anthropic-compat\n"
+        "    family: minimax\n"
+        "    api_key_env: MINIMAX_API_KEY\n"
+        "    base_url: https://api.minimax.io/anthropic\n"
+        "    model: MiniMax-M2.5\n"
+        "  glm:\n"
+        "    kind: anthropic-compat\n"
+        "    family: zai\n"
+        "    api_key_env: GLM_API_KEY\n"
+        "    base_url: https://api.z.ai/api/anthropic\n"
+        "    model: glm-4.7\n",
+        encoding="utf-8",
+    )
     return root
 
 
