@@ -148,7 +148,6 @@ def ingest(roadmap: str, db: str) -> int:
 def _path_hints(body):
     p = re.findall(r"`([a-z_][\w./-]*\.(?:sh|py|sql|md|yaml|yml|json|ts|tsx|js|jsx))`", body, re.I)
     p += re.findall(r"`(bin/[\w-]+)`", body)
-    p += re.findall(r"`(lib/[\w_-]+\.sh)`", body)
     p += re.findall(r"`(recipes/[\w-]+/?[\w./-]*)`", body)
     return list(dict.fromkeys(p))
 

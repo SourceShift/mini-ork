@@ -28,6 +28,7 @@
 set +e
 MO_README="${MO_README:-README.md}"
 MINI_ORK_ROOT="${MINI_ORK_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+export PYTHONPATH="$MINI_ORK_ROOT${PYTHONPATH:+:$PYTHONPATH}"
 SECRETS="${MO_SECRETS:-$MINI_ORK_ROOT/.mini-ork/config/secrets.local.sh}"
 [ -f "$SECRETS" ] || SECRETS="$HOME/.config/mini-ork/secrets.local.sh"
 [ -f "$SECRETS" ] && source "$SECRETS"
@@ -74,12 +75,9 @@ REASON: <one short sentence>
 EOF
 )
 
-# Source the minimax wrapper in a subshell, fire claude --print with
-# prompt as POSITIONAL ARG (claude --print does not read stdin).
-out=$(
-  source "$MINI_ORK_ROOT/lib/providers/cl_minimax.sh" 2>/dev/null
-  timeout 45 claude --print --output-format text "$prompt" < /dev/null 2>/dev/null
-)
+# Native dispatch keeps credentials in a scoped environment and passes prompts
+# over stdin, so this gate no longer depends on a provider shell wrapper.
+out=$(printf '%s' "$prompt" | timeout 45 python3 -m mini_ork.dispatch minimax --timeout 45 2>/dev/null)
 rc=$?
 if [ $rc -ne 0 ] || [ -z "$out" ]; then
   printf '{"verdict":"PANEL_SKIP","reason":"gatekeeper LLM unreachable (rc=%d) — fail-open","cost_estimate_usd":0}\n' "$rc" >&2

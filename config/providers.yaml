@@ -1,14 +1,8 @@
 # providers.yaml — BYO (bring-your-own) provider registry for mini-ork.
 #
 # Lets developers use their own Anthropic / OpenAI-compatible API keys
-# without writing a lib/providers/cl_*.sh wrapper. Parsed by
-# lib/providers/registry.sh; consumed by lib/llm-dispatch.sh.
-#
-# PRECEDENCE: a lib/providers/cl_<name>.sh wrapper ALWAYS wins. The
-# registry is only consulted when no wrapper file exists for the model
-# name, so entries here can never change the behavior of the committed
-# providers (opus, sonnet, codex, glm, kimi, minimax, deepseek, gemini).
-# Give your entries new names and point config/agents.yaml lanes at them.
+# without writing a shell wrapper. The native Python dispatcher consumes this
+# registry directly, so it is the authoritative lane configuration.
 #
 # Resolution order for this file (first hit wins):
 #   1. $MINI_ORK_PROVIDERS                       (explicit override)
@@ -27,6 +21,7 @@
 #                             gateway (base_url + api_key_env required)
 #         openai-compat       codex CLI pointed at an OpenAI-compatible
 #                             /v1 endpoint (base_url + api_key_env required)
+#         codex-native        ambient Codex CLI login (no API key required)
 #         executable          your own script honoring the dispatcher
 #                             contract: <script> --print --output-format text "<prompt>"
 #   family:      provider family recorded in llm_calls telemetry
@@ -45,9 +40,7 @@
 #     reviewer: anthropic_api
 
 providers:
-  # ── Committed lanes (WS6: registry is now the source of truth; the
-  # lib/providers/cl_<name>.sh wrappers remain only as fallback until the
-  # bash purge). Contracts ported verbatim from the wrappers. ─────────────
+  # ── Committed lanes. The registry is the source of truth. ───────────────
   glm:
     kind: anthropic-compat
     family: gateway  # bash coarse taxonomy (llm_calls.provider parity); the fine family lives in mini_ork.dispatch.providers._PROVIDER_FAMILY
@@ -92,6 +85,11 @@ providers:
   sonnet:
     kind: anthropic-native
     family: anthropic
+
+  # Ambient Codex CLI login. Use openai_api below for a direct BYO API key.
+  codex:
+    kind: codex-native
+    family: openai
 
   # Claude CLI with your own raw Anthropic API key. Export
   # ANTHROPIC_API_KEY in secrets.local.sh; without it this falls back to

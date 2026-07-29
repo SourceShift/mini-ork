@@ -538,13 +538,13 @@ def test_execute_loop_no_dispatch_with_status_only(
     assert "MINI_ORK_RECOVERY_CLOSURE" not in os.environ
 
 
-# ─── resume (cost-pause) is untouched ──────────────────────────────────────
+# ─── resume (cost-pause) remains native ─────────────────────────────────────
 
 def test_resume_cost_pause_unchanged() -> None:
     """The existing ``mini-ork resume`` (cost-pause) path must not be
-    touched by E2. We verify by reading the bash script and the
-    python port for the E2-era marker:
-      * bin/mini-ork-resume still has its cost-pause body
+    touched by E2. We verify the compatibility launcher and the
+    canonical Python port for the E2-era marker:
+      * bin/mini-ork-resume delegates to the canonical ``resume`` command
       * mini_ork/cli/resume.py still has ``resume()`` +
         ``_format_audit_row`` returning the audit-row string verbatim
       * The E2 planner does NOT import mini_ork_resume (the two paths
@@ -556,14 +556,14 @@ def test_resume_cost_pause_unchanged() -> None:
     py_port = REPO / "mini_ork" / "cli" / "resume.py"
     assert bash_path.is_file(), "bin/mini-ork-resume must exist"
     assert py_port.is_file(), "mini_ork.cli.resume must exist"
-    bash_text = bash_path.read_text()
-    # cost-pause sentinel handling must still be in the bash script.
-    assert ".cost-pause" in bash_text, "bash resume lost .cost-pause reference"
-    assert "sentinel_payload" in bash_text, "bash resume lost audit-row field"
-    # python port must still expose the resume() API.
+    launcher_text = bash_path.read_text()
+    assert 'main("resume")' in launcher_text, "resume launcher lost its canonical route"
+    # The Python port owns the cost-pause sentinel and audit-row behavior.
     py_text = py_port.read_text()
     assert "def resume(" in py_text, "python port lost resume()"
     assert "_format_audit_row" in py_text, "python port lost audit-row helper"
+    assert ".cost-pause" in py_text, "native resume lost .cost-pause reference"
+    assert "sentinel_payload" in py_text, "native resume lost audit-row field"
     # E2 planner must NOT have pulled in mini_ork_resume (the two
     # subcommands stay decoupled — caller invokes resume as a child
     # process from the bash wrapper, never as a library import).
@@ -584,8 +584,7 @@ def test_resume_cost_pause_unchanged() -> None:
         # Make the run dir exist so the script gets past its first check.
         os.makedirs(os.path.join(td, "runs", "run-doesnotexist-001"))
         rc = subprocess.run(
-            ["python3", "-m", "mini_ork.cli.resume",
-             "run-doesnotexist-001"],
+            [str(bash_path), "run-doesnotexist-001"],
             env=env2, cwd=str(REPO), capture_output=True, text=True,
         )
         assert rc.returncode == 0, (

@@ -17,6 +17,7 @@
 set -uo pipefail
 
 MINI_ORK_ROOT="${MINI_ORK_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+export PYTHONPATH="$MINI_ORK_ROOT${PYTHONPATH:+:$PYTHONPATH}"
 DB="${MINI_ORK_DB:-${MINI_ORK_HOME:-.mini-ork}/state.db}"
 
 payload=""
@@ -88,15 +89,12 @@ sqlite3 "$DB" "
 # last-known offset and extracts memories/features. Fire-and-forget.
 # Restored 2026-06-16 after PR #18 silently dropped this hook augmentation
 # (regression caught by scripts/smoke-cn-bridge.sh).
-if [ -f "${MINI_ORK_ROOT}/lib/cn_client.sh" ]; then
-  # shellcheck source=../lib/cn_client.sh
-  source "${MINI_ORK_ROOT}/lib/cn_client.sh" 2>/dev/null || true
-  if declare -f cn_hook_post >/dev/null 2>&1; then
-    transcript_path=$(extract_field "transcript_path")
-    [ -z "$transcript_path" ] && transcript_path=$(extract_field "transcript")
-    target_session="${child_session:-$parent_session}"
-    cn_hook_post "subagent_stop" "$target_session" "$PWD" "$transcript_path" || true
-  fi
+if [ "${MO_DISABLE_CN:-0}" != "1" ]; then
+  transcript_path=$(extract_field "transcript_path")
+  [ -z "$transcript_path" ] && transcript_path=$(extract_field "transcript")
+  target_session="${child_session:-$parent_session}"
+  python3 -m mini_ork.cli.cn_hook post "subagent_stop" "$target_session" \
+    --cwd "$PWD" --transcript "$transcript_path" >/dev/null 2>&1 || true
 
   # PR-6 outcome feedback (2026-06-17). If the worker consumed atoms via
   # the prefetch hook (file at $MO_CN_PREFETCH_DIR/<sid>.md), extract the
@@ -114,7 +112,7 @@ if [ -f "${MINI_ORK_ROOT}/lib/cn_client.sh" ]; then
   # Outcome classification: subagent_runs.status (set above by the
   # UPDATE) → "success" | "failure". status comes from extract_field
   # earlier in this hook; default to "neutral" when unknown.
-  if declare -f cn_outcome_post >/dev/null 2>&1 && [ -n "${MO_CN_PREFETCH_DIR:-}" ]; then
+  if [ -n "${MO_CN_PREFETCH_DIR:-}" ]; then
     _outcome_session="${child_session:-$parent_session}"
     _prefetch_file="${MO_CN_PREFETCH_DIR}/${_outcome_session}.md"
     if [ -f "$_prefetch_file" ]; then
@@ -136,7 +134,8 @@ if [ -f "${MINI_ORK_ROOT}/lib/cn_client.sh" ]; then
         # captured upstream in this hook). Keeps the outcome trace
         # debuggable without paying the 480-char CN cap.
         _evidence="${result_excerpt:0:240}"
-        cn_outcome_post "$_outcome_str" "$_atom_ids_csv" "$_evidence" "$_outcome_session" || true
+        python3 -m mini_ork.cli.cn_hook outcome "$_outcome_str" "$_atom_ids_csv" \
+          --evidence "$_evidence" --session "$_outcome_session" >/dev/null 2>&1 || true
       fi
     fi
   fi

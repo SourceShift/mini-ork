@@ -7,7 +7,6 @@ returns sensible shapes when pointed at the repo's own .mini-ork/state.db.
 from __future__ import annotations
 
 import sqlite3
-import subprocess
 import json
 from pathlib import Path
 
@@ -731,14 +730,12 @@ def test_cache_cost_components_sum_to_cost_usd(tmp_path: Path) -> None:
     con.executescript((ROOT / "db/migrations/0024_cache_aware_cost.sql").read_text())
     con.close()
 
-    script = (
-        "source lib/llm-dispatch.sh; "
-        f"MINI_ORK_DB={db_path} _mo_llm_write_llm_calls_row "
-        "anthropic claude-opus-4 default mini-ork:test tester success 100 0.009 '' "
-        "1000 25 '{}' 200 300"
+    from mini_ork.dispatch.llm_dispatch import write_llm_calls_row
+
+    write_llm_calls_row(
+        str(db_path), "anthropic", "claude-opus-4", "default", "mini-ork:test",
+        "tester", "success", 100, 0.009, "", 1000, 25, "{}", 200, 300,
     )
-    result = subprocess.run(["bash", "-lc", script], cwd=ROOT)
-    assert result.returncode == 0
 
     con = sqlite3.connect(db_path)
     row = con.execute(
@@ -836,13 +833,9 @@ def test_lane_fuse_trips_after_three_retryable_failures(tmp_path: Path) -> None:
     )
     con.close()
 
-    script = (
-        "source lib/llm-dispatch.sh; "
-        f"MINI_ORK_DB={db_path} MO_FUSE_ENABLED=1 "
-        "_mo_check_lane_fuse glm_lens network >/dev/null"
-    )
-    result = subprocess.run(["bash", "-lc", script], cwd=ROOT)
-    assert result.returncode == 1
+    from mini_ork.dispatch.llm_dispatch import check_lane_fuse
+
+    assert check_lane_fuse(str(db_path), "glm_lens", "network") is True
 
 
 def test_lane_fuse_ignores_nonretryable_failures(tmp_path: Path) -> None:
@@ -866,13 +859,9 @@ def test_lane_fuse_ignores_nonretryable_failures(tmp_path: Path) -> None:
     )
     con.close()
 
-    script = (
-        "source lib/llm-dispatch.sh; "
-        f"MINI_ORK_DB={db_path} MO_FUSE_ENABLED=1 "
-        "_mo_check_lane_fuse glm_lens auth >/dev/null"
-    )
-    result = subprocess.run(["bash", "-lc", script], cwd=ROOT)
-    assert result.returncode == 0
+    from mini_ork.dispatch.llm_dispatch import check_lane_fuse
+
+    assert check_lane_fuse(str(db_path), "glm_lens", "auth") is False
 
 
 def test_agents_endpoint_legacy_null_snapshot_uses_fallback(tmp_path: Path, monkeypatch) -> None:
@@ -979,21 +968,9 @@ def test_agents_endpoint_prefers_dispatch_config_snapshot(tmp_path: Path, monkey
 
 
 def test_llm_dispatch_classifies_invalid_api_key_as_auth() -> None:
-    script = (
-        "set -euo pipefail; "
-        "MINI_ORK_ROOT=$PWD; "
-        "source lib/llm-dispatch.sh; "
-        "_mo_llm_classify_error 'HTTP 401 invalid api key' 1"
-    )
-    out = subprocess.run(
-        ["bash", "--noprofile", "--norc", "-c", script],
-        cwd=ROOT,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=True,
-    )
-    assert out.stdout.strip() == "auth"
+    from mini_ork.dispatch.llm_dispatch import classify_error
+
+    assert classify_error("HTTP 401 invalid api key", 1) == "auth"
 
 
 def test_agents_yaml_has_capabilities_section() -> None:
@@ -1007,49 +984,25 @@ def test_agents_yaml_has_capabilities_section() -> None:
         assert {"vision", "tools", "reasoning", "search"} <= set(capabilities[family])
 
 
-def test_capability_check_passes_when_family_supports_all() -> None:
+def test_capability_check_passes_when_family_supports_all(monkeypatch) -> None:
     # kimi_lens is the canonical "supports vision + tools" lane after the
     # 2026-06-13 no-opus standing directive removed opus_lens from
     # .mini-ork/config/agents.yaml. Kimi exposes vision=true + tools=true
     # in config/agents.yaml's capabilities map, which is what the gate
     # asserts against. opus_lens used to play this role but no longer
     # resolves under the override; codex / glm / minimax all lack vision.
-    script = (
-        "set -euo pipefail; "
-        "MINI_ORK_ROOT=$PWD; "
-        "MINI_ORK_HOME=$PWD/.mini-ork; "
-        "MO_LANE_REQUIRES_CAPABILITY='vision,tools'; "
-        "source lib/lane-helpers.sh; "
-        "mo_assert_lane_capability kimi_lens"
-    )
-    subprocess.run(
-        ["bash", "--noprofile", "--norc", "-c", script],
-        cwd=ROOT,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=True,
-    )
+    from mini_ork.dispatch.lane_helpers import assert_lane_capability
+
+    monkeypatch.setenv("MINI_ORK_ROOT", str(ROOT))
+    assert_lane_capability("kimi_lens", "vision,tools")
 
 
-def test_capability_check_fails_when_family_missing_one() -> None:
-    script = (
-        "set -euo pipefail; "
-        "MINI_ORK_ROOT=$PWD; "
-        "MINI_ORK_HOME=$PWD/.mini-ork; "
-        "MO_LANE_REQUIRES_CAPABILITY='vision,tools'; "
-        "source lib/lane-helpers.sh; "
-        "mo_assert_lane_capability codex_lens"
-    )
-    result = subprocess.run(
-        ["bash", "--noprofile", "--norc", "-c", script],
-        cwd=ROOT,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-    assert result.returncode == 1
-    assert result.stderr.strip() == "vision"
+def test_capability_check_fails_when_family_missing_one(monkeypatch) -> None:
+    from mini_ork.dispatch.lane_helpers import assert_lane_capability
+
+    monkeypatch.setenv("MINI_ORK_ROOT", str(ROOT))
+    with pytest.raises(RuntimeError, match="^vision$"):
+        assert_lane_capability("codex_lens", "vision,tools")
 
 
 def test_llm_calls_route_tolerates_null_taxonomy_columns(tmp_path: Path) -> None:

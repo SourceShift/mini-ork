@@ -1,52 +1,7 @@
-#!/usr/bin/env bash
-# mini-ork-rollback - Roll back a workflow or agent to its previous stable version.
+#!/usr/bin/env python3
+"""Compatibility launcher for mini-ork rollback."""
 
-set -Eeuo pipefail
+from _mini_ork_subcommand import main
 
-MINI_ORK_ROOT="${MINI_ORK_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
-export MINI_ORK_ROOT
-# Runtime cutover (bash→Python): MINI_ORK_RUNTIME=python execs the ported module.
-{ [ -f "$MINI_ORK_ROOT/lib/runtime-select.sh" ] && . "$MINI_ORK_ROOT/lib/runtime-select.sh" && mo_runtime_maybe_delegate "${BASH_SOURCE[0]}" "$@"; } || true
-
-
-_usage() {
-  cat <<'EOF'
-Usage: mini-ork rollback <workflow|agent> <name>
-
-Roll back a workflow or agent to its previous stable version.
-
-Arguments:
-  workflow|agent   Registry kind to roll back
-  name             Workflow or agent name
-
-Options:
-  --help, -h       Show this help
-EOF
-}
-
-if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
-  _usage
-  exit 0
-fi
-
-kind="${1:-}"
-name="${2:-}"
-
-if [[ "$kind" != "workflow" && "$kind" != "agent" ]]; then
-  _usage >&2
-  exit 2
-fi
-
-if [[ -z "$name" || $# -ne 2 ]]; then
-  _usage >&2
-  exit 2
-fi
-
-MINI_ORK_HOME="${MINI_ORK_HOME:-$(pwd)/.mini-ork}"
-MINI_ORK_DB="${MINI_ORK_DB:-$MINI_ORK_HOME/state.db}"
-export MINI_ORK_HOME MINI_ORK_DB
-
-# shellcheck source=lib/version_registry.sh
-source "$MINI_ORK_ROOT/lib/version_registry.sh"
-
-version_rollback "$kind" "$name"
+if __name__ == "__main__":
+    raise SystemExit(main("rollback"))

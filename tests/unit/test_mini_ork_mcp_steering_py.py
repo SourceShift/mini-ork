@@ -1,16 +1,12 @@
-"""Parity gate: mini_ork.steering.mcp_server vs live bash fetch.
+"""Native contract tests for operator-steering retrieval.
 
-The bash function consumes rows as it reads them, so parity cases use paired
-temp DBs seeded with identical rows: one for live bash and one for the Python
-port. Every DB is initialized by db/init.sh, and bash output is parsed from
-JSONL before comparison.
+Each case seeds two independent, identical databases and compares their native
+results. This catches accidental dependence on SQLite row state while keeping
+the consuming-read behavior entirely within the canonical Python service.
 """
 from __future__ import annotations
 
-import json
-import os
 import sqlite3
-import subprocess
 import sys
 import time
 from collections.abc import Iterable
@@ -21,22 +17,16 @@ import pytest
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
 from mini_ork.steering import mcp_server as mcp_ops
+from mini_ork.stores import migrate
 
-SH = REPO / "lib" / "operator_steering.sh"
-INIT_SH = REPO / "db" / "init.sh"
 STRIP_KEYS = {"id", "created_at", "expires_at"}
 
 
 def _init_db(tmp_path_factory: pytest.TempPathFactory, name: str) -> tuple[str, str]:
     home = tmp_path_factory.mktemp(name)
     db = str(home / "state.db")
-    subprocess.run(
-        ["bash", str(INIT_SH)],
-        env={**os.environ, "MINI_ORK_HOME": str(home), "MINI_ORK_DB": db},
-        capture_output=True,
-        text=True,
-        check=True,
-    )
+    rc, _out, err = migrate.init_db(db, root=str(REPO))
+    assert rc == 0, err
     return db, str(home)
 
 
@@ -90,29 +80,24 @@ def _seed_many(db: str, rows: Iterable[dict]) -> None:
         _seed_row(db, **row)
 
 
-def _paired_dbs(
+def _independent_dbs(
     tmp_path_factory: pytest.TempPathFactory,
     name: str,
     rows: Iterable[dict],
 ) -> tuple[str, str, str, str]:
-    bash_db, bash_home = _init_db(tmp_path_factory, f"{name}_bash")
-    py_db, py_home = _init_db(tmp_path_factory, f"{name}_py")
+    baseline_db, baseline_home = _init_db(tmp_path_factory, f"{name}_baseline")
+    py_db, py_home = _init_db(tmp_path_factory, f"{name}_native")
     row_list = list(rows)
-    _seed_many(bash_db, row_list)
+    _seed_many(baseline_db, row_list)
     _seed_many(py_db, row_list)
-    return bash_db, bash_home, py_db, py_home
+    return baseline_db, baseline_home, py_db, py_home
 
 
-def _bash_fetch(run_id: str, role: str, db: str, home: str) -> list[dict]:
-    wrapper = f'. "{SH}"\noperator_steering_fetch_for "{run_id}" "{role}"\n'
-    result = subprocess.run(
-        ["bash", "-c", wrapper],
-        env={**os.environ, "MINI_ORK_HOME": home, "MINI_ORK_DB": db},
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-    return [json.loads(line) for line in result.stdout.splitlines() if line]
+def _native_fetch(
+    monkeypatch: pytest.MonkeyPatch, run_id: str, role: str, db: str, home: str
+) -> list[dict]:
+    _point_python_env(monkeypatch, db, home)
+    return mcp_ops.get_operator_steering(run_id, role)
 
 
 def _norm(row: dict) -> dict:
@@ -122,11 +107,11 @@ def _norm(row: dict) -> dict:
     return out
 
 
-def _assert_rows_equal(py_rows: list[dict], bash_rows: list[dict]) -> None:
-    assert [_norm(row) for row in py_rows] == [_norm(row) for row in bash_rows]
-    assert len(py_rows) == len(bash_rows)
-    for py_row, bash_row in zip(py_rows, bash_rows, strict=True):
-        assert abs(float(py_row["confidence"]) - float(bash_row["confidence"])) <= 1e-6
+def _assert_rows_equal(left_rows: list[dict], right_rows: list[dict]) -> None:
+    assert [_norm(row) for row in left_rows] == [_norm(row) for row in right_rows]
+    assert len(left_rows) == len(right_rows)
+    for left_row, right_row in zip(left_rows, right_rows, strict=True):
+        assert abs(float(left_row["confidence"]) - float(right_row["confidence"])) <= 1e-6
 
 
 def test_get_operator_steering_happy_path_parity(tmp_path_factory, monkeypatch):
@@ -138,13 +123,13 @@ def test_get_operator_steering_happy_path_parity(tmp_path_factory, monkeypatch):
         "source": "seed-src",
         "confidence": 0.7,
     }]
-    bash_db, bash_home, py_db, py_home = _paired_dbs(tmp_path_factory, "a", rows)
+    baseline_db, baseline_home, py_db, py_home = _independent_dbs(tmp_path_factory, "a", rows)
 
-    bash_rows = _bash_fetch("r-a", "implementer", bash_db, bash_home)
+    baseline_rows = _native_fetch(monkeypatch, "r-a", "implementer", baseline_db, baseline_home)
     _point_python_env(monkeypatch, py_db, py_home)
     py_rows = mcp_ops.get_operator_steering("r-a", "implementer")
 
-    _assert_rows_equal(py_rows, bash_rows)
+    _assert_rows_equal(py_rows, baseline_rows)
     assert [row["message"] for row in py_rows] == ["hello-from-seed"]
 
 
@@ -155,13 +140,13 @@ def test_get_operator_steering_empty_for_unseen_run_parity(tmp_path_factory, mon
         "severity": "info",
         "message": "not-for-me",
     }]
-    bash_db, bash_home, py_db, py_home = _paired_dbs(tmp_path_factory, "b", rows)
+    baseline_db, baseline_home, py_db, py_home = _independent_dbs(tmp_path_factory, "b", rows)
 
-    bash_rows = _bash_fetch("r-missing", "any", bash_db, bash_home)
+    baseline_rows = _native_fetch(monkeypatch, "r-missing", "any", baseline_db, baseline_home)
     _point_python_env(monkeypatch, py_db, py_home)
     py_rows = mcp_ops.get_operator_steering("r-missing", "any")
 
-    assert py_rows == bash_rows == []
+    assert py_rows == baseline_rows == []
 
 
 def test_get_operator_steering_role_or_semantics_parity(tmp_path_factory, monkeypatch):
@@ -170,29 +155,29 @@ def test_get_operator_steering_role_or_semantics_parity(tmp_path_factory, monkey
         {"run_id": "r-c", "role_target": "implementer", "severity": "info", "message": "row-impl"},
         {"run_id": "r-c", "role_target": "reviewer", "severity": "info", "message": "row-rev"},
     ]
-    bash_db, bash_home, py_db, py_home = _paired_dbs(tmp_path_factory, "c1", rows)
+    baseline_db, baseline_home, py_db, py_home = _independent_dbs(tmp_path_factory, "c1", rows)
 
-    bash_rows = _bash_fetch("r-c", "implementer", bash_db, bash_home)
+    baseline_rows = _native_fetch(monkeypatch, "r-c", "implementer", baseline_db, baseline_home)
     _point_python_env(monkeypatch, py_db, py_home)
     py_rows = mcp_ops.get_operator_steering("r-c", "implementer")
 
-    _assert_rows_equal(py_rows, bash_rows)
+    _assert_rows_equal(py_rows, baseline_rows)
     assert sorted(row["message"] for row in py_rows) == ["row-any", "row-impl"]
 
-    bash_db, bash_home, py_db, py_home = _paired_dbs(tmp_path_factory, "c2", rows)
-    bash_rows = _bash_fetch("r-c", "reviewer", bash_db, bash_home)
+    baseline_db, baseline_home, py_db, py_home = _independent_dbs(tmp_path_factory, "c2", rows)
+    baseline_rows = _native_fetch(monkeypatch, "r-c", "reviewer", baseline_db, baseline_home)
     _point_python_env(monkeypatch, py_db, py_home)
     py_rows = mcp_ops.get_operator_steering("r-c", "reviewer")
 
-    _assert_rows_equal(py_rows, bash_rows)
+    _assert_rows_equal(py_rows, baseline_rows)
     assert sorted(row["message"] for row in py_rows) == ["row-any", "row-rev"]
 
-    bash_db, bash_home, py_db, py_home = _paired_dbs(tmp_path_factory, "c3", rows)
-    bash_rows = _bash_fetch("r-c", "any", bash_db, bash_home)
+    baseline_db, baseline_home, py_db, py_home = _independent_dbs(tmp_path_factory, "c3", rows)
+    baseline_rows = _native_fetch(monkeypatch, "r-c", "any", baseline_db, baseline_home)
     _point_python_env(monkeypatch, py_db, py_home)
     py_rows = mcp_ops.get_operator_steering("r-c", "any")
 
-    _assert_rows_equal(py_rows, bash_rows)
+    _assert_rows_equal(py_rows, baseline_rows)
     assert [row["message"] for row in py_rows] == ["row-any"]
 
 
@@ -250,13 +235,13 @@ def test_get_operator_steering_ordering_parity(tmp_path_factory, monkeypatch):
             "expires_at": now + 3600 * 1000,
         },
     ]
-    bash_db, bash_home, py_db, py_home = _paired_dbs(tmp_path_factory, "d", rows)
+    baseline_db, baseline_home, py_db, py_home = _independent_dbs(tmp_path_factory, "d", rows)
 
-    bash_rows = _bash_fetch("r-d", "any", bash_db, bash_home)
+    baseline_rows = _native_fetch(monkeypatch, "r-d", "any", baseline_db, baseline_home)
     _point_python_env(monkeypatch, py_db, py_home)
     py_rows = mcp_ops.get_operator_steering("r-d", "any")
 
-    _assert_rows_equal(py_rows, bash_rows)
+    _assert_rows_equal(py_rows, baseline_rows)
     assert [row["message"] for row in py_rows] == ["msg-D", "msg-E", "msg-C", "msg-B", "msg-A"]
 
 
@@ -267,27 +252,16 @@ def test_get_operator_steering_consumed_mark_parity(tmp_path_factory, monkeypatc
         "severity": "info",
         "message": "once",
     }]
-    bash_db, bash_home, py_db, py_home = _paired_dbs(tmp_path_factory, "e", rows)
-    wrapper = (
-        f'. "{SH}"\n'
-        'operator_steering_fetch_for "r-e" "any"\n'
-        'operator_steering_fetch_for "r-e" "any"\n'
-    )
-    result = subprocess.run(
-        ["bash", "-c", wrapper],
-        env={**os.environ, "MINI_ORK_HOME": bash_home, "MINI_ORK_DB": bash_db},
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-    bash_rows = [json.loads(line) for line in result.stdout.splitlines() if line]
+    baseline_db, baseline_home, py_db, py_home = _independent_dbs(tmp_path_factory, "e", rows)
+    baseline_first = _native_fetch(monkeypatch, "r-e", "any", baseline_db, baseline_home)
+    baseline_second = _native_fetch(monkeypatch, "r-e", "any", baseline_db, baseline_home)
 
     _point_python_env(monkeypatch, py_db, py_home)
     py_first = mcp_ops.get_operator_steering("r-e", "any")
     py_second = mcp_ops.get_operator_steering("r-e", "any")
 
-    _assert_rows_equal(py_first, bash_rows)
-    assert py_second == []
+    _assert_rows_equal(py_first, baseline_first)
+    assert py_second == baseline_second == []
 
 
 def test_get_operator_steering_expiry_and_consumed_filters_parity(tmp_path_factory, monkeypatch):
@@ -319,13 +293,13 @@ def test_get_operator_steering_expiry_and_consumed_filters_parity(tmp_path_facto
             "consumed_at": now - 1000,
         },
     ]
-    bash_db, bash_home, py_db, py_home = _paired_dbs(tmp_path_factory, "f", rows)
+    baseline_db, baseline_home, py_db, py_home = _independent_dbs(tmp_path_factory, "f", rows)
 
-    bash_rows = _bash_fetch("r-f", "any", bash_db, bash_home)
+    baseline_rows = _native_fetch(monkeypatch, "r-f", "any", baseline_db, baseline_home)
     _point_python_env(monkeypatch, py_db, py_home)
     py_rows = mcp_ops.get_operator_steering("r-f", "any")
 
-    _assert_rows_equal(py_rows, bash_rows)
+    _assert_rows_equal(py_rows, baseline_rows)
     assert [row["message"] for row in py_rows] == ["row-fresh"]
 
 
@@ -337,11 +311,11 @@ def test_get_operator_steering_float_confidence_parity(tmp_path_factory, monkeyp
         "message": "float-row",
         "confidence": 0.123456789,
     }]
-    bash_db, bash_home, py_db, py_home = _paired_dbs(tmp_path_factory, "g", rows)
+    baseline_db, baseline_home, py_db, py_home = _independent_dbs(tmp_path_factory, "g", rows)
 
-    bash_rows = _bash_fetch("r-g", "any", bash_db, bash_home)
+    baseline_rows = _native_fetch(monkeypatch, "r-g", "any", baseline_db, baseline_home)
     _point_python_env(monkeypatch, py_db, py_home)
     py_rows = mcp_ops.get_operator_steering("r-g", "any")
 
-    _assert_rows_equal(py_rows, bash_rows)
+    _assert_rows_equal(py_rows, baseline_rows)
     assert abs(py_rows[0]["confidence"] - 0.123456789) <= 1e-6

@@ -25,6 +25,7 @@
 set -uo pipefail
 
 MINI_ORK_ROOT="${MINI_ORK_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+export PYTHONPATH="$MINI_ORK_ROOT${PYTHONPATH:+:$PYTHONPATH}"
 DB="${MINI_ORK_DB:-${MINI_ORK_HOME:-.mini-ork}/state.db}"
 
 payload=""
@@ -92,12 +93,7 @@ sqlite3 "$DB" "
 # direct Claude Code sessions. Fire-and-forget; CN being down never blocks.
 # Restored 2026-06-16 after PR #18 silently dropped this hook augmentation
 # (regression caught by scripts/smoke-cn-bridge.sh).
-if [ -f "${MINI_ORK_ROOT}/lib/cn_client.sh" ]; then
-  # shellcheck source=../lib/cn_client.sh
-  source "${MINI_ORK_ROOT}/lib/cn_client.sh" 2>/dev/null || true
-  if declare -f cn_hook_post >/dev/null 2>&1; then
-    cn_hook_post "session_start" "miniork-spawn-${parent_session}-$(date +%s)" "$cwd" "" || true
-  fi
-fi
+python3 -m mini_ork.cli.cn_hook post "session_start" \
+  "miniork-spawn-${parent_session}-$(date +%s)" --cwd "$cwd" >/dev/null 2>&1 || true
 
 emit_continue

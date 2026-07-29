@@ -5,9 +5,9 @@ Determinism strategy: per-test fake ``MINI_ORK_ROOT`` whose ``db/``,
 ``config/``, ``recipes/`` are COPIES (not symlinks) of the real trees.
 
 The test strips MO_* env contamination, pins MINI_ORK_HOME / MINI_ORK_ROOT /
-MINI_ORK_DB per case, and asserts rc + stdout + stderr. For DB-modules cases
-(t5 dry-run, t6 apply), the test additionally seeds a fresh temp DB via
-``bash db/init.sh`` and diffs ``SELECT filename FROM schema_migrations ORDER
+MINI_ORK_DB per case, and asserts rc + stdout + stderr. For DB-module cases
+(t5 dry-run, t6 apply), the test additionally seeds a fresh temp DB via the
+native migration API and diffs ``SELECT filename FROM schema_migrations ORDER
 BY filename`` before vs after the Python invocation.
 
 Seven cases:
@@ -33,6 +33,7 @@ sys.path.insert(0, str(REPO))
 
 # Re-imported so we can assert on the live _USAGE constant for the help cases.
 from mini_ork.cli.update import _USAGE  # noqa: E402
+from mini_ork.stores import migrate  # noqa: E402
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -79,7 +80,6 @@ def _build_fake_root(
     fake_root: Path,
     *,
     copy_db: bool = True,
-    copy_lib: bool = True,
     copy_config: bool = False,
     copy_recipes: bool = True,
     extra_config: dict | None = None,
@@ -99,15 +99,9 @@ def _build_fake_root(
     if copy_db:
         db = fake_root / "db"
         db.mkdir(exist_ok=True)
-        shutil.copy(REPO / "db" / "init.sh", db / "init.sh")
         shutil.copytree(REPO / "db" / "migrations", db / "migrations")
         if (REPO / "db" / "views").is_dir():
             shutil.copytree(REPO / "db" / "views", db / "views")
-
-    if copy_lib:
-        lib = fake_root / "lib"
-        lib.mkdir(exist_ok=True)
-        shutil.copy(REPO / "lib" / "migrate.sh", lib / "migrate.sh")
 
     if copy_config or extra_config:
         cfg = fake_root / "config"
@@ -142,21 +136,12 @@ def _seed_home(fake_home: Path) -> Path:
 
 
 def _seed_db(db_path: Path, fake_home: Path, fake_root: Path) -> None:
-    """Run bash db/init.sh against a fresh DB to seed all migrations."""
+    """Seed all migrations through the native migration API."""
     db_path.parent.mkdir(parents=True, exist_ok=True)
     if db_path.exists():
         db_path.unlink()
-    env = _clean_env({}, fake_root, fake_home, db_path)
-    res = subprocess.run(
-        ["bash", str(fake_root / "db" / "init.sh")],
-        env=env,
-        capture_output=True,
-        text=True,
-    )
-    assert res.returncode == 0, (
-        f"db/init.sh seed failed rc={res.returncode}\n"
-        f"stdout: {res.stdout}\nstderr: {res.stderr}"
-    )
+    rc, out, err = migrate.init_db(str(db_path), root=str(fake_root))
+    assert rc == 0, f"native DB seed failed\nstdout: {out}\nstderr: {err}"
 
 
 def _schema_migrations_filenames(db_path: Path) -> list[str]:
@@ -248,7 +233,7 @@ def test_t4_missing_home_no_init(tmp_path: Path):
 def test_t5_dry_run_does_not_modify_state_db(tmp_path: Path):
     if not shutil.which("sqlite3"):
         import pytest
-        pytest.skip("sqlite3 not on PATH (required by db/init.sh)")
+        pytest.skip("sqlite3 not on PATH (required by shipped migrations)")
 
     fake_root = _build_fake_root(tmp_path / "fr")
     fake_home = _seed_home(tmp_path / "home")
@@ -322,7 +307,6 @@ def test_t7_config_drift(tmp_path: Path):
     fake_root = _build_fake_root(
         tmp_path / "fr",
         copy_db=False,
-        copy_lib=False,
         copy_config=False,
         copy_recipes=False,
         extra_config=drift_fixtures,
