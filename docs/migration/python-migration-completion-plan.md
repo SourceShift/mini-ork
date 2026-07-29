@@ -1,8 +1,13 @@
-# Python migration — completion plan (the honest remaining map)
+# Python migration — completion plan (historical)
 
 _Written 2026-07-18 after a full audit and updated 2026-07-20 after the
-execute-fork closure. Ports were built ~Jul 3–4; the remaining work is
-**un-shelling the rest of the engine**, not creating ports._
+execute-fork closure. Superseded by the 2026-07-29 framework-runtime closure._
+
+> **Historical plan.** The remaining engine cutover described below is
+> complete: retired `lib/` and `gates/` implementations have no executable,
+> test, fixture, or benchmark dependency. Keep this document for its
+> dependency analysis; do not use its Bash commands or live-status statements
+> as current operating instructions.
 
 ## State
 
@@ -15,9 +20,9 @@ execute-fork closure. Ports were built ~Jul 3–4; the remaining work is
   sole executor, the CLI routes to it in-process, and `bin/mini-ork-execute` is
   retired. Provider, git, and executable verifier subprocesses remain
   intentional external boundaries.
-- **Still not done globally:** other runtime modules and libraries retain Bash
-  seams and must be migrated fork-by-fork before the whole engine is pure
-  Python.
+- **Completed globally (2026-07-29):** framework runtime modules and libraries
+  have been cut over to Python. Phase 5 release verification remains a
+  separate release-management task.
 
 `flip/runtime-default-python` is **stale** (last commit Jul-10, 43 behind main) — abandon it;
 build from main.

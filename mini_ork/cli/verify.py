@@ -258,11 +258,10 @@ def main(argv: list[str] | None = None, *, db: str | None = None, root: str | No
                         artifact_fail = True
 
     gate_verdict = "pass"
-    # WS4: gates run through the Python gate_registry (native oracle-gate
-    # evaluators) — the legacy probe for lib/gate_registry.sh presence is
-    # retained only as an OR-fallback for pre-Python checkouts.
-    gates_available = hasattr(gate_registry, "gate_run_all") or os.path.isfile(
-        os.path.join(root, "lib", "gate_registry.sh"))
+    # Gates are evaluated exclusively through the native registry. Recipe
+    # verifiers can still be external commands, but framework gates do not
+    # depend on a shell implementation being present on disk.
+    gates_available = hasattr(gate_registry, "gate_run_all")
     if dry_run == 0 and gates_available:
         ctx = json.dumps({"task_class": task_class, "artifact_path": artifact_path,
                           "plan_path": plan_path or "", "panel_run_id": os.environ.get("MINI_ORK_RUN_ID", ""),

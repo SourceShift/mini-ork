@@ -7,7 +7,6 @@ ops (codex's refs/codex resets) corrupt the framework repo.
 from __future__ import annotations
 
 import os
-import stat
 
 from mini_ork.dispatch import (
     DispatchRequest,
@@ -16,15 +15,19 @@ from mini_ork.dispatch import (
     resolve_target_cwd,
 )
 
-KEYED = '#!/usr/bin/env bash\nexport ANTHROPIC_AUTH_TOKEN="${GLM_API_KEY:?}"\n'
-
-
-def _wrapper(root, model, body):
-    prov = root / "lib" / "providers"
-    prov.mkdir(parents=True, exist_ok=True)
-    w = prov / f"cl_{model}.sh"
-    w.write_text(body)
-    w.chmod(w.stat().st_mode | stat.S_IXUSR)
+def _providers_registry(root):
+    config = root / "config"
+    config.mkdir(parents=True, exist_ok=True)
+    (config / "providers.yaml").write_text(
+        "providers:\n"
+        "  glm:\n"
+        "    kind: anthropic-compat\n"
+        "    family: zai\n"
+        "    api_key_env: GLM_API_KEY\n"
+        "    base_url: https://api.z.ai/api/anthropic\n"
+        "    model: glm-4.7\n",
+        encoding="utf-8",
+    )
 
 
 def test_resolve_target_cwd_precedence(tmp_path, monkeypatch):
@@ -69,7 +72,7 @@ def test_framework_cwd_allowed_with_optin(tmp_path, monkeypatch):
 def test_dispatch_model_fails_fast_on_framework_cwd(tmp_path, monkeypatch):
     # Healthy lane (key set) but the requested cwd is inside the framework tree
     # → dispatch_model must refuse BEFORE running the provider.
-    _wrapper(tmp_path, "glm", KEYED)
+    _providers_registry(tmp_path)
     monkeypatch.setenv("MINI_ORK_ROOT", str(tmp_path))
     monkeypatch.setenv("GLM_API_KEY", "set")
     monkeypatch.delenv("MO_ALLOW_FRAMEWORK_CWD", raising=False)

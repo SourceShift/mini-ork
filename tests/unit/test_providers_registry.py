@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import pytest
@@ -58,7 +59,6 @@ def test_registry_resolves_all_provider_kinds(tmp_path, monkeypatch):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "native-key")
     monkeypatch.setenv("COMPAT_KEY", "compat-key")
     monkeypatch.setenv("OPENAI_TEST_KEY", "openai-key")
-    codex = _write_executable(tmp_path / "lib" / "providers" / "cl_codex.sh")
     local = _write_executable(tmp_path / "scripts" / "local-provider.sh")
     _write_registry(
         tmp_path,
@@ -98,7 +98,11 @@ def test_registry_resolves_all_provider_kinds(tmp_path, monkeypatch):
     assert gateway.env["ANTHROPIC_BASE_URL"] == "https://gateway.example/anthropic"
     assert gateway.env["ANTHROPIC_AUTH_TOKEN"] == "compat-key"
     assert gateway.env["ENABLE_TOOL_SEARCH"] == "false"
-    assert openai.command[0] == str(codex)
+    assert openai.command[:3] == (
+        sys.executable,
+        "-m",
+        "mini_ork.dispatch.codex_transport",
+    )
     assert openai.env["MO_OAI_MODEL"] == "gpt-test"
     assert openai.env["MO_OAI_ENV_KEY"] == "OPENAI_TEST_KEY"
     assert executable.command[0] == str(local)
@@ -127,13 +131,9 @@ def test_missing_api_key_env_names_field(tmp_path, monkeypatch):
         resolve_provider("broken", tmp_path)
 
 
-def test_builtin_transport_wins_over_same_named_registry_entry(tmp_path, monkeypatch):
-    """Precedence preserved after WS6: the codex lane resolves to the native
-    python transport (mini_ork.dispatch.codex_transport), never to a
-    same-named shadow registry entry. (Was: command[0] == the cl_codex.sh
-    wrapper path — the wrapper is no longer executed for codex.)"""
+def test_named_codex_registry_lane_uses_native_transport(tmp_path, monkeypatch):
+    """A registry-defined Codex lane configures the native transport directly."""
     _clear_registry_overrides(monkeypatch)
-    _write_executable(tmp_path / "lib" / "providers" / "cl_codex.sh")
     _write_registry(
         tmp_path,
         {
@@ -149,14 +149,13 @@ def test_builtin_transport_wins_over_same_named_registry_entry(tmp_path, monkeyp
     spec = resolve_provider("codex", tmp_path)
 
     assert "mini_ork.dispatch.codex_transport" in spec.command
-    assert "shadow" not in " ".join(spec.command)
-    assert "MO_OAI_BASE_URL" not in spec.env
+    assert spec.env["MO_OAI_BASE_URL"] == "https://shadow.example/v1"
+    assert spec.env["MO_OAI_MODEL"] == "shadow-model"
 
 
 def test_registry_lane_health_is_runnable_with_key(tmp_path, monkeypatch):
     _clear_registry_overrides(monkeypatch)
     monkeypatch.setenv("PRIVATE_KEY", "set")
-    _write_executable(tmp_path / "lib" / "providers" / "cl_codex.sh")
     _write_registry(
         tmp_path,
         {
@@ -174,7 +173,6 @@ def test_registry_lane_health_is_runnable_with_key(tmp_path, monkeypatch):
 def test_registry_lane_health_names_unset_key(tmp_path, monkeypatch):
     _clear_registry_overrides(monkeypatch)
     monkeypatch.delenv("PRIVATE_KEY", raising=False)
-    _write_executable(tmp_path / "lib" / "providers" / "cl_codex.sh")
     _write_registry(
         tmp_path,
         {

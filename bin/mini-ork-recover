@@ -1,26 +1,7 @@
-#!/usr/bin/env bash
-# mini-ork-recover — operator entrypoint to resume a failed run by walking
-# the workflow DAG, reusing E1 checkpoints, and dispatching only the
-# failed-node closure.
-#
-# Distinct from `mini-ork resume` (cost-pause): that one clears the
-# cost sentinel; this one re-enters the execute loop at the closure
-# root. The two are NEVER conflated — this script explicitly delegates
-# to mini-ork_resume only when strategy=resume is paired with an
-# existing cost-pause sentinel (operator opt-in via cost-pause hint).
-#
-# Implementation: thin wrapper. The real planner lives in
-# mini_ork/recovery/planner.py — same strangler-fig pattern as
-# bin/mini-ork-resume → mini_ork.cli.resume.
+#!/usr/bin/env python3
+"""Compatibility launcher for mini-ork recover."""
 
-set -Eeuo pipefail
+from _mini_ork_subcommand import main
 
-MINI_ORK_ROOT="${MINI_ORK_ROOT:-$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)}"
-export MINI_ORK_ROOT
-# Runtime cutover (bash→Python): MINI_ORK_RUNTIME=python execs the ported module.
-{ [ -f "$MINI_ORK_ROOT/lib/runtime-select.sh" ] && . "$MINI_ORK_ROOT/lib/runtime-select.sh" && mo_runtime_maybe_delegate "${BASH_SOURCE[0]}" "$@"; } || true
-
-
-# Forward all args to the python planner. The planner parses argv
-# itself (mirrors mini-ork-resume's bash-script-now-thin-wrapper shape).
-exec python3 -m mini_ork.recovery.planner "$@"
+if __name__ == "__main__":
+    raise SystemExit(main("recover"))

@@ -15,7 +15,7 @@ independent auditors cross-checked.*
 | `checkpoints.sha256_bytes`, `web/artifacts.list_run_dirs`, `web/auth.auth_configured`, `runtime/engine.docker_available` | Dead | **Removed** |
 | `bin/mini-ork-conductor` sourcing missing `lib/budget_config.sh` | Real break (bash runtime aborted) | **Integrated**: recreated `lib/budget_config.sh` (`mo_daily_budget_cap`) per its documented contract (`9c6e7998`) |
 | 72 live-module env flags read-but-undocumented | Features exist but unreachable by operators | **Integrated**: cataloged with defaults in `docs/operator/feature-flags.md` |
-| 51 test-only parity ports | Migration debt — removing them would destroy the bash-retirement safety net; bulk cutover is the migration itself, not a cleanup | **Integrated by marking**: `docs/migration/parity-ports.md` registry + cutover procedure |
+| 51 test-only parity ports | Migration debt at audit time; the final Bash cutover converted their remaining assertions to native unit tests | **Resolved**: `docs/migration/parity-ports.md` is now a retired-counterpart registry |
 
 ## Verified clean
 

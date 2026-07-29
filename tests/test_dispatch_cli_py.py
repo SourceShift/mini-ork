@@ -30,11 +30,6 @@ CREATE TABLE llm_calls (
 );
 """
 
-# Stub cl_codex.sh: resolve_provider/lane_health still require the wrapper
-# file to exist for the built-in codex lane, even though the command run is
-# now the Python transport.
-STUB_WRAPPER = "#!/usr/bin/env bash\nexit 0\n"
-
 # Fake codex CLI: emits a JSONL event stream like `codex exec --json` (a
 # turn.completed with usage + an agent_message echoing the prompt after `--`),
 # writes no --output-last-message (so the transport exercises its
@@ -55,11 +50,11 @@ exit "${MO_TEST_RC:-0}"
 
 def _fixture_root(tmp_path, monkeypatch):
     root = tmp_path / "root"
-    prov = root / "lib" / "providers"
-    prov.mkdir(parents=True)
-    wrapper = prov / "cl_codex.sh"
-    wrapper.write_text(STUB_WRAPPER)
-    wrapper.chmod(wrapper.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    (root / "config").mkdir(parents=True)
+    (root / "config" / "providers.yaml").write_text(
+        "providers:\n  codex:\n    kind: codex-native\n    family: openai\n",
+        encoding="utf-8",
+    )
 
     bindir = tmp_path / "bin"
     bindir.mkdir()

@@ -1,32 +1,14 @@
-"""A/B parity: native oracle-gate evaluators vs the gates/*.sh bash shims (WS4).
+"""Native contract tests for the five registered oracle gates (WS4).
 
-For each of the 5 oracle gates (coalition, liveness, panel-health, stability,
-synthesis-promote) this suite drives the SAME fixture through
-
-  (A) the live bash shim ``gates/<name>.sh <context_json>`` via subprocess
-      (rc 0 → pass, 2 → defer, else fail — the registry's contract), and
-  (B) the native in-process evaluator through
-      ``gate_registry.gate_register`` + ``gate_evaluate``, once with the new
-      ``native:<name>`` sentinel condition and once with the legacy
-      ``<root>/gates/<name>.sh`` script-path condition (the shape live DBs
-      still hold — those rows must evaluate natively WITHOUT executing the
-      shim).
-
-Verdicts must be identical across A and B for every fixture.
-
-Fixtures use a real state.db seeded by ``db/init.sh`` (plus hand-seeded
-execution_traces / task_runs rows), and real verdict JSON files for the
-file-driven gates. Env knobs are pinned to defaults on BOTH sides
-(monkeypatch.delenv for the in-process side, a scrubbed env for the
-subprocess side) except the one advisory-mode case that sets them
-deliberately on both sides.
+Each fixture is evaluated through ``gate_registry.gate_register`` and
+``gate_evaluate`` using both the canonical ``native:<name>`` condition and the
+legacy ``gates/<name>.sh`` condition shape persisted by older state databases.
+The latter resolves to the native evaluator without requiring a shell shim.
 """
 from __future__ import annotations
 
 import json
-import os
 import sqlite3
-import subprocess
 import sys
 from pathlib import Path
 
@@ -37,11 +19,10 @@ sys.path.insert(0, str(REPO))
 
 from mini_ork.gates import gate_registry as gr  # noqa: E402
 from mini_ork.gates.native_gates import native_condition  # noqa: E402
+from mini_ork.stores import migrate  # noqa: E402
 
-DB_INIT = REPO / "db" / "init.sh"
-
-# Env knobs the bash libs read at function entry. Pinned to defaults on both
-# sides so the A/B comparison is deterministic regardless of ambient env.
+# Environment knobs read by native evaluators. Pin them so every fixture is
+# deterministic regardless of ambient operator settings.
 KNOB_ENVS = [
     "MO_RHO_THRESHOLD", "MO_FAMILY_DIVERSITY_GATE",
     "MO_CB_ARTIFACT_WINDOW", "MO_CB_VERDICT_WINDOW", "MO_CB_COST_THRESHOLD",
@@ -55,15 +36,12 @@ KNOB_ENVS = [
 
 @pytest.fixture()
 def db(tmp_path, monkeypatch):
-    """Fresh state.db via db/init.sh + a runs row (execution_traces FK)."""
+    """Fresh native-migrated state.db + a runs row (execution_traces FK)."""
     home = tmp_path / "home"
     home.mkdir()
     db_path = str(home / "state.db")
-    subprocess.run(
-        ["bash", str(DB_INIT)],
-        env={**os.environ, "MINI_ORK_HOME": str(home), "MINI_ORK_DB": db_path},
-        capture_output=True, text=True, timeout=60, check=True,
-    )
+    rc, _out, err = migrate.init_db(db_path, root=str(REPO))
+    assert rc == 0, err
     con = sqlite3.connect(db_path)
     con.execute(
         "INSERT OR IGNORE INTO runs (id, agent, final_verdict) "
@@ -77,30 +55,6 @@ def db(tmp_path, monkeypatch):
     for k in KNOB_ENVS:
         monkeypatch.delenv(k, raising=False)
     return db_path
-
-
-# ── A/B drivers ───────────────────────────────────────────────────────────────
-
-
-def _bash_verdict(gate_name: str, context_json: str, db: str,
-                  extra_env: dict | None = None) -> str:
-    """Run the live bash shim; map rc → registry verdict contract."""
-    script = REPO / "gates" / f"{gate_name}.sh"
-    env = {k: v for k, v in os.environ.items() if k not in KNOB_ENVS}
-    env["MINI_ORK_DB"] = db
-    env["MINI_ORK_ROOT"] = str(REPO)
-    if extra_env:
-        env.update(extra_env)
-    proc = subprocess.run(
-        [str(script), context_json],
-        capture_output=True, text=True, timeout=60, env=env,
-    )
-    rc = proc.returncode
-    if rc == 0:
-        return "pass"
-    if rc == 2:
-        return "defer"
-    return "fail"
 
 
 def _py_verdict(gate_name: str, context_json: str, db: str,
@@ -119,20 +73,11 @@ def _py_verdict(gate_name: str, context_json: str, db: str,
     return gr.gate_evaluate(db, gid, context_json, mini_ork_root=str(REPO))
 
 
-def assert_ab(gate_name: str, context_json: str, db: str, expected: str,
-              extra_env: dict | None = None) -> None:
-    """A/B assertion: bash shim verdict == native verdict == expected, for
-    BOTH condition forms (sentinel + legacy script path)."""
-    bash_v = _bash_verdict(gate_name, context_json, db, extra_env=extra_env)
-    assert bash_v == expected, (
-        f"[{gate_name}] bash shim verdict {bash_v!r} != expected {expected!r}"
-    )
+def assert_native(gate_name: str, context_json: str, db: str, expected: str) -> None:
+    """Assert canonical and persisted-legacy condition forms agree."""
     for form in ("sentinel", "script-path"):
         py_v = _py_verdict(gate_name, context_json, db, condition_form=form)
-        assert py_v == bash_v, (
-            f"[{gate_name}] native({form}) verdict {py_v!r} "
-            f"!= bash shim {bash_v!r}"
-        )
+        assert py_v == expected, f"[{gate_name}] native({form}) = {py_v!r}"
 
 
 # ── seeding helpers ───────────────────────────────────────────────────────────
@@ -187,7 +132,7 @@ def test_coalition_same_family_panel_aborts(db):
         (f"tr-4-{prun}", "opus", "APPROVE", 0.0, "[]"),
     ])
     ctx = json.dumps({"panel_run_id": prun, "recipe": "refactor-audit"})
-    assert_ab("coalition", ctx, db, "fail")
+    assert_native("coalition", ctx, db, "fail")
 
 
 def test_coalition_diverse_panel_passes(db):
@@ -200,7 +145,7 @@ def test_coalition_diverse_panel_passes(db):
         (f"tr-4-{prun}", "minimax", "ESCALATE: security gap C", 0.0, "[]"),
     ])
     ctx = json.dumps({"panel_run_id": prun, "recipe": "refactor-audit"})
-    assert_ab("coalition", ctx, db, "pass")
+    assert_native("coalition", ctx, db, "pass")
 
 
 def test_coalition_advisory_mode_passes_on_collision(db, monkeypatch):
@@ -215,20 +160,19 @@ def test_coalition_advisory_mode_passes_on_collision(db, monkeypatch):
         (f"tr-4-{prun}", "opus", "APPROVE", 0.0, "[]"),
     ])
     ctx = json.dumps({"panel_run_id": prun, "recipe": "refactor-audit"})
-    assert_ab("coalition", ctx, db, "pass",
-              extra_env={"MO_FAMILY_DIVERSITY_GATE": "advisory"})
+    assert_native("coalition", ctx, db, "pass")
 
 
 def test_coalition_single_agent_fail_open(db):
     prun = "run-ab-coal-single"
     _seed_traces(db, [(f"tr-1-{prun}", "sonnet", "APPROVE", 0.0, "[]")])
     ctx = json.dumps({"panel_run_id": prun, "recipe": "code-fix"})
-    assert_ab("coalition", ctx, db, "pass")
+    assert_native("coalition", ctx, db, "pass")
 
 
 def test_coalition_missing_context_defers(db):
-    assert_ab("coalition", "{}", db, "defer")
-    assert_ab("coalition", json.dumps({"panel_run_id": "x"}), db, "defer")
+    assert_native("coalition", "{}", db, "defer")
+    assert_native("coalition", json.dumps({"panel_run_id": "x"}), db, "defer")
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -237,16 +181,16 @@ def test_coalition_missing_context_defers(db):
 
 
 def test_liveness_unknown_run_proceeds(db):
-    assert_ab("liveness", json.dumps({"run_id": "run-not-in-db"}), db, "pass")
+    assert_native("liveness", json.dumps({"run_id": "run-not-in-db"}), db, "pass")
 
 
 def test_liveness_panel_run_id_backcompat_key(db):
     # The shim accepts panel_run_id as a fallback key for run_id.
-    assert_ab("liveness", json.dumps({"panel_run_id": "run-not-in-db"}), db, "pass")
+    assert_native("liveness", json.dumps({"panel_run_id": "run-not-in-db"}), db, "pass")
 
 
 def test_liveness_missing_run_id_defers(db):
-    assert_ab("liveness", "{}", db, "defer")
+    assert_native("liveness", "{}", db, "defer")
 
 
 def test_liveness_trip_fails(db):
@@ -269,7 +213,7 @@ def test_liveness_trip_fails(db):
         (f"tr-2-{rid}", "sonnet", "REQUEST_CHANGES", 0.5, "[]"),
         (f"tr-3-{rid}", "sonnet", "REQUEST_CHANGES", 0.5, "[]"),
     ])
-    assert_ab("liveness", json.dumps({"run_id": rid}), db, "fail")
+    assert_native("liveness", json.dumps({"run_id": rid}), db, "fail")
 
 
 def test_liveness_productive_run_proceeds(db):
@@ -284,7 +228,7 @@ def test_liveness_productive_run_proceeds(db):
         (f"tr-2-{rid}", "sonnet", "REQUEST_CHANGES", 0.1, '[{"path":"b.py"}]'),
         (f"tr-3-{rid}", "sonnet", "APPROVE", 0.1, '[{"path":"c.py"}]'),
     ])
-    assert_ab("liveness", json.dumps({"run_id": rid}), db, "pass")
+    assert_native("liveness", json.dumps({"run_id": rid}), db, "pass")
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -312,12 +256,12 @@ _HEALTHY_VOTERS = [
 
 def test_panel_health_authority_capture_fails(db, tmp_path):
     vf = _write_verdict(tmp_path, "capture.json", {"voters": _CAPTURE_VOTERS})
-    assert_ab("panel-health", json.dumps({"verdict_file": vf}), db, "fail")
+    assert_native("panel-health", json.dumps({"verdict_file": vf}), db, "fail")
 
 
 def test_panel_health_healthy_passes(db, tmp_path):
     vf = _write_verdict(tmp_path, "healthy.json", {"voters": _HEALTHY_VOTERS})
-    assert_ab("panel-health", json.dumps({"verdict_file": vf}), db, "pass")
+    assert_native("panel-health", json.dumps({"verdict_file": vf}), db, "pass")
 
 
 def test_panel_health_indeterminate_passes(db, tmp_path):
@@ -325,13 +269,13 @@ def test_panel_health_indeterminate_passes(db, tmp_path):
         {"voter_id": "a", "vote": "approve", "confidence": 0.9},
         {"voter_id": "b", "vote": "reject", "confidence": 0.8},
     ]})
-    assert_ab("panel-health", json.dumps({"verdict_file": vf}), db, "pass")
+    assert_native("panel-health", json.dumps({"verdict_file": vf}), db, "pass")
 
 
 def test_panel_health_missing_input_defers(db, tmp_path):
-    assert_ab("panel-health", "{}", db, "defer")
+    assert_native("panel-health", "{}", db, "defer")
     missing = str(tmp_path / "no-such-file.json")
-    assert_ab("panel-health", json.dumps({"verdict_file": missing}), db, "defer")
+    assert_native("panel-health", json.dumps({"verdict_file": missing}), db, "defer")
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -354,7 +298,7 @@ def test_stability_stabilized_panel_halts(db):
     same = {"glm": "approve: a", "kimi": "reject: b"}
     _seed_stability_rounds(db, prun, same, dict(same))
     ctx = json.dumps({"panel_run_id": prun, "current_round": 2})
-    assert_ab("stability", ctx, db, "fail")  # HALT → rc 1 → fail
+    assert_native("stability", ctx, db, "fail")  # HALT → rc 1 → fail
 
 
 def test_stability_moving_panel_continues(db):
@@ -365,7 +309,7 @@ def test_stability_moving_panel_continues(db):
         {"glm": "reject: c", "kimi": "approve: d"},
     )
     ctx = json.dumps({"panel_run_id": prun, "current_round": 2})
-    assert_ab("stability", ctx, db, "pass")
+    assert_native("stability", ctx, db, "pass")
 
 
 def test_stability_below_min_rounds_continues(db):
@@ -373,16 +317,16 @@ def test_stability_below_min_rounds_continues(db):
     same = {"glm": "approve: a", "kimi": "reject: b"}
     _seed_stability_rounds(db, prun, same, dict(same))
     ctx = json.dumps({"panel_run_id": prun, "current_round": 1})
-    assert_ab("stability", ctx, db, "pass")
+    assert_native("stability", ctx, db, "pass")
 
 
 def test_stability_no_traces_fail_open(db):
     ctx = json.dumps({"panel_run_id": "run-ab-stab-none", "current_round": 3})
-    assert_ab("stability", ctx, db, "pass")
+    assert_native("stability", ctx, db, "pass")
 
 
 def test_stability_missing_panel_run_id_defers(db):
-    assert_ab("stability", "{}", db, "defer")
+    assert_native("stability", "{}", db, "defer")
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -394,7 +338,7 @@ def test_synthesis_promote_deterministic_class_bypasses(db, tmp_path):
     vf = _write_verdict(tmp_path, "det.json",
                         {"panel_score": 0, "voters": [], "structural": {}})
     ctx = json.dumps({"verdict_file": vf, "task_class": "code_fix"})
-    assert_ab("synthesis-promote", ctx, db, "pass")
+    assert_native("synthesis-promote", ctx, db, "pass")
 
 
 def test_synthesis_promote_all_conditions_met(db, tmp_path):
@@ -405,7 +349,7 @@ def test_synthesis_promote_all_conditions_met(db, tmp_path):
                        "file_coverage_delta": 3, "finding_cardinality": 11},
     })
     ctx = json.dumps({"verdict_file": vf, "task_class": "research_synthesis"})
-    assert_ab("synthesis-promote", ctx, db, "pass")
+    assert_native("synthesis-promote", ctx, db, "pass")
 
 
 def test_synthesis_promote_low_score_rejects(db, tmp_path):
@@ -416,7 +360,7 @@ def test_synthesis_promote_low_score_rejects(db, tmp_path):
                        "file_coverage_delta": 5, "finding_cardinality": 20},
     })
     ctx = json.dumps({"verdict_file": vf, "task_class": "refactor_audit"})
-    assert_ab("synthesis-promote", ctx, db, "fail")
+    assert_native("synthesis-promote", ctx, db, "fail")
 
 
 def test_synthesis_promote_authority_capture_rejects(db, tmp_path):
@@ -427,25 +371,25 @@ def test_synthesis_promote_authority_capture_rejects(db, tmp_path):
                        "file_coverage_delta": 3, "finding_cardinality": 11},
     })
     ctx = json.dumps({"verdict_file": vf, "task_class": "research_synthesis"})
-    assert_ab("synthesis-promote", ctx, db, "fail")
+    assert_native("synthesis-promote", ctx, db, "fail")
 
 
 def test_synthesis_promote_missing_inputs_defer(db, tmp_path):
-    assert_ab("synthesis-promote", "{}", db, "defer")
+    assert_native("synthesis-promote", "{}", db, "defer")
     vf = _write_verdict(tmp_path, "ok2.json", {"panel_score": 90.0})
     # missing task_class
-    assert_ab("synthesis-promote", json.dumps({"verdict_file": vf}), db, "defer")
+    assert_native("synthesis-promote", json.dumps({"verdict_file": vf}), db, "defer")
     # verdict_file not found
     ctx = json.dumps({"verdict_file": str(tmp_path / "nope.json"),
                       "task_class": "ui_audit"})
-    assert_ab("synthesis-promote", ctx, db, "defer")
+    assert_native("synthesis-promote", ctx, db, "defer")
 
 
 def test_synthesis_promote_bad_json_defers(db, tmp_path):
     bad = tmp_path / "bad.json"
     bad.write_text("{not valid json", encoding="utf-8")
     ctx = json.dumps({"verdict_file": str(bad), "task_class": "ui_audit"})
-    assert_ab("synthesis-promote", ctx, db, "defer")
+    assert_native("synthesis-promote", ctx, db, "defer")
 
 
 # ═════════════════════════════════════════════════════════════════════════════

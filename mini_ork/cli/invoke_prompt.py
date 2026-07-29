@@ -28,6 +28,7 @@ import io
 import os
 import re
 import sys
+import tempfile
 import time as _time
 from collections.abc import Callable, Iterator
 from pathlib import Path
@@ -95,11 +96,14 @@ def _build_prompt_text(
         return prompt_text
     # bash: writes PROMPT_TEXT to a tmpfile, calls context_role_pack_md NODE_TYPE
     # <brief> "", appends `\n\n<pack>\n` if non-empty. Python mirrors with the
-    # ported helper; brief is a temp file under mini_ork_root/lib (matches
-    # bash's mktemp scope) and is always cleaned up.
-    brief_tmp = mini_ork_root / "lib" / f".__brief_{os.getpid()}.tmp"
+    # ported helper; the short-lived brief is an OS temp file and is always
+    # cleaned up. It must not depend on the retired framework lib/ tree.
+    with tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", prefix="mini-ork-brief-", suffix=".md", delete=False
+    ) as brief_file:
+        brief_file.write(prompt_text)
+        brief_tmp = Path(brief_file.name)
     try:
-        brief_tmp.write_text(prompt_text)
         # role_pack_md returns "" when MO_DISABLE_CN=1 (defensive) or
         # cn_available=False (default). With MO_USE_ROLE_PACKS=1 in tests we
         # need MO_DISABLE_CN=0 to even reach this branch — and parity is

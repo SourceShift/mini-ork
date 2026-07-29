@@ -84,16 +84,6 @@ _CACHE_CREATION_RE = re.compile(r'"cache_creation_input_tokens":(\d+)')
 _CACHE_READ_RE = re.compile(r'"cache_read_input_tokens":(\d+)')
 _INPUT_TOKENS_RE = re.compile(r'"input_tokens":(\d+)')
 
-# Full Claude Code flag set used by ``mo_claude_print`` — mirrors
-# ``lib/lane-helpers.sh`` lines 242-249 exactly.
-_CLAUDE_BASE = [
-    "--print",
-    "--permission-mode", "bypassPermissions",
-    "--output-format", "{format}",
-    "--max-turns", "{max_turns}",
-]
-
-
 def lane_is_free(lane: str) -> bool:
     """Mirror ``mo_lane_is_free`` — True for glm/kimi/minimax, False otherwise.
 
@@ -325,9 +315,17 @@ def claude_print(
     if not prompt:
         raise ValueError("prompt required")
     cache_flags = emit_cache_flags()
-    base = [
-        arg.format(format=output_format, max_turns=max_turns)
-        for arg in _CLAUDE_BASE
+    argv = [
+        "claude",
+        "--print",
+        "--permission-mode",
+        "bypassPermissions",
+        "--output-format",
+        output_format,
+        "--max-turns",
+        str(max_turns),
+        *cache_flags,
+        *extra,
+        prompt,
     ]
-    argv = ["claude", *base, *cache_flags, *extra, prompt]
     return subprocess.run(argv, capture_output=True, text=True)
