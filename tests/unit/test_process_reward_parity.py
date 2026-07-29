@@ -1,101 +1,21 @@
-"""Parity gate: mini_ork.learning.process_reward.score_trace vs bash prm_score_trace.
+"""Native contract tests for the deterministic process-reward scorer.
 
-For each fixture, we seed a fresh temp sqlite DB with the same row shape
-``lib/process_reward.sh::prm_score_trace`` consumes, invoke the live bash
-function via subprocess (no mocking), and assert ``|bash - python| < 1e-6``.
-
-The bash function reads JSON-as-TEXT from ``execution_traces`` and writes
-the score back to ``process_reward``. The Python port must therefore accept
-JSON strings for ``tool_calls`` / ``files_written`` / ``files_read`` —
-exactly what the row contains.
-
-Strangler-fig co-existence is preserved: ``lib/process_reward.sh`` is
-byte-identical before and after this test file exists.
+Fixtures preserve the SQLite row representation used by callers: activity
+fields are JSON strings, while status, verdict, duration, and cost retain the
+execution-trace shapes. Each expected score documents the reward policy rather
+than deriving expectations from a retired implementation.
 """
 
 from __future__ import annotations
 
 import json
-import math
-import os
-import sqlite3
-import subprocess
-from pathlib import Path
-
 import pytest
 
 from mini_ork.learning.process_reward import score_trace
 
-REPO_ROOT = Path(__file__).resolve().parent.parent.parent
-LIB_PROCESS_REWARD = REPO_ROOT / "lib" / "process_reward.sh"
-
-EXEC_TRACES_SCHEMA = """
-CREATE TABLE IF NOT EXISTS execution_traces (
-    trace_id           TEXT PRIMARY KEY,
-    status             TEXT,
-    tool_calls         TEXT NOT NULL DEFAULT '[]',
-    files_written      TEXT NOT NULL DEFAULT '[]',
-    files_read         TEXT NOT NULL DEFAULT '[]',
-    reviewer_verdict   TEXT,
-    duration_ms        INTEGER NOT NULL DEFAULT 0,
-    cost_usd           REAL NOT NULL DEFAULT 0.0,
-    process_reward     REAL
-);
-"""
-
-
-def _seed_db(db_path: Path, trace_id: str, fixture: dict) -> None:
-    con = sqlite3.connect(str(db_path))
-    con.executescript(EXEC_TRACES_SCHEMA)
-    con.execute(
-        "INSERT INTO execution_traces ("
-        "trace_id, status, tool_calls, files_written, files_read,"
-        "reviewer_verdict, duration_ms, cost_usd"
-        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        (
-            trace_id,
-            fixture.get("status"),
-            fixture.get("tool_calls", "[]"),
-            fixture.get("files_written", "[]"),
-            fixture.get("files_read", "[]"),
-            fixture.get("reviewer_verdict"),
-            fixture.get("duration_ms", 0),
-            fixture.get("cost_usd", 0.0),
-        ),
-    )
-    con.commit()
-    con.close()
-
-
-def _run_bash_prm(trace_id: str, db_path: Path) -> float:
-    env = os.environ.copy()
-    env["MINI_ORK_ROOT"] = str(REPO_ROOT)
-    env["MO_STORE_DB"] = str(db_path)
-    env["MO_STORE_BACKEND"] = "sqlite"
-    env.pop("MO_PRM_ACTIVITY_CAP", None)
-    proc = subprocess.run(
-        ["bash", "-c", f'. "{LIB_PROCESS_REWARD}" && prm_score_trace "{trace_id}"'],
-        cwd=str(REPO_ROOT),
-        env=env,
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    return float(proc.stdout.strip())
-
-
-def _parity(fixture: dict, tmp_path: Path, trace_id: str = "tr-fixture") -> tuple[float, float]:
-    db_path = tmp_path / f"{trace_id}.sqlite"
-    _seed_db(db_path, trace_id, fixture)
-    bash_score = _run_bash_prm(trace_id, db_path)
-    py_score = score_trace(fixture)
-    return bash_score, py_score
-
-
 # Fixture set — covers the trigger matrix of the weight table plus the
 # Goodhart activity cap and verdict gating. Fields omitted from a fixture
-# default to the empty/zero SQLite representation, which matches what
-# bash sees when those columns are NULL/0.
+# default to the empty/zero execution-trace representation.
 FIXTURES = {
     "bare_success": {"status": "success"},
     "bare_failed": {"status": "failure"},
@@ -174,13 +94,27 @@ FIXTURES = {
 }
 
 
-@pytest.mark.parametrize("fixture", list(FIXTURES.values()), ids=list(FIXTURES.keys()))
-def test_score_trace_matches_bash_prm(fixture, tmp_path):
-    bash_score, py_score = _parity(fixture, tmp_path)
-    assert math.isclose(bash_score, py_score, abs_tol=1e-6), (
-        f"parity drift: bash={bash_score!r} py={py_score!r} "
-        f"fixture={fixture!r}"
-    )
+EXPECTED_SCORES = {
+    "bare_success": 0.5,
+    "bare_failed": 0.0,
+    "failed_heavy_activity_capped": 0.0,
+    "success_verdict_approve": 0.85,
+    "success_verdict_fail": 0.55,
+    "failed_verdict_approve_gated": 0.0,
+    "duration_below_floor_999ms": 0.5,
+    "duration_at_floor_1000ms": 0.55,
+    "duration_at_ceiling_600000ms": 0.55,
+    "duration_above_ceiling_600001ms": 0.5,
+    "cost_zero_no_bonus": 0.55,
+    "cost_positive_bonus": 0.55,
+    "empty_none_fields": 0.0,
+    "tool_plus_file_activity_under_cap": 0.7,
+}
+
+
+@pytest.mark.parametrize("name,fixture", FIXTURES.items())
+def test_score_trace_matches_reward_policy(name, fixture):
+    assert score_trace(fixture) == EXPECTED_SCORES[name]
 
 
 def test_smoke_import_and_score():

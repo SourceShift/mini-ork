@@ -1,6 +1,15 @@
 # Complete Remaining Bash-to-Python Migration — Agent Handoff
 
-Status: active after `origin/main` commit `0bfdc3f6` on 2026-07-20.
+Status: archived as a historical handoff on 2026-07-29.
+
+> **Closure update.** The final framework Bash runtime was removed after its
+> callers, fixtures, gates, provider lanes, and compatibility launchers were
+> rewired to native Python. `lib/` and `gates/` now contain no shell runtime
+> files; the remaining shell files are external integration or compatibility
+> surfaces that delegate to Python. The inventories and commands below explain
+> the original dependency analysis; they do not describe live Bash ownership.
+> Phase 5 release verification and the separate historical-documentation sweep
+> remain follow-up work.
 
 This is the master handoff for the **whole remaining migration program**. The
 dispatcher work is only one track. Its detailed sub-handoff is
@@ -486,4 +495,3 @@ Assign the next agent this document and instruct it:
 > verify the remote commit, refresh the inventory, and continue until the
 > completion definition in this handoff is satisfied or every safe remaining
 > unit is explicitly deferred with evidence.
-

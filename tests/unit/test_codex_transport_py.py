@@ -1,10 +1,8 @@
-"""Unit + A/B tests for mini_ork.dispatch.codex_transport — the native Python
-port of lib/providers/cl_codex.sh (bash-removal WS6).
+"""Unit and subprocess contract tests for the native Codex transport.
 
-Unit tests drive main() in-process with a fake ``codex`` CLI on PATH. The A/B
-section runs the real bash wrapper and the Python transport side by side
-against the same fake codex and asserts byte-identical stdout, sidecars, and
-exit codes.
+Unit tests drive main() in-process with a fake ``codex`` CLI on PATH. The
+subprocess section verifies the installed module invocation, stdout, sidecars,
+and exit codes against the same fake CLI.
 """
 
 from __future__ import annotations
@@ -22,7 +20,6 @@ import pytest
 from mini_ork.dispatch import codex_transport as ct
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-BASH_WRAPPER = REPO_ROOT / "lib" / "providers" / "cl_codex.sh"
 
 # Fake codex CLI (python): logs its argv, emits a codex-style JSONL event
 # stream (thread.started + turn.completed with usage incl. cached tokens + an
@@ -499,11 +496,11 @@ def test_failed_codex_exits_4(fake_codex, target, monkeypatch, capsys):
     assert "codex exec failed with rc=1" in capsys.readouterr().err
 
 
-# ── A/B: bash wrapper vs python transport ───────────────────────────────────
+# ── subprocess contract ──────────────────────────────────────────────────────
 
 
-def _run_one(impl, fmt, tmp_path, target, monkeypatch, fake_rc="0"):
-    side = tmp_path / impl
+def _run_transport(fmt, tmp_path, target, monkeypatch, fake_rc="0"):
+    side = tmp_path / "native"
     side.mkdir()
     usage, turns, cost = (side / n for n in ("u.tokens", "turns.jsonl", "cost.txt"))
     env = dict(os.environ)
@@ -532,20 +529,16 @@ def _run_one(impl, fmt, tmp_path, target, monkeypatch, fake_rc="0"):
         "FAKE_CODEX_ARGV_LOG",
     ):
         env.pop(key, None)
-    if impl == "bash":
-        cmd = ["bash", str(BASH_WRAPPER), "--print", "--output-format", fmt, "Reply with alpha"]
-        env["PYTHONPATH"] = str(REPO_ROOT)
-    else:
-        cmd = [
-            sys.executable,
-            "-m",
-            "mini_ork.dispatch.codex_transport",
-            "--print",
-            "--output-format",
-            fmt,
-            "Reply with alpha",
-        ]
-        env["PYTHONPATH"] = str(REPO_ROOT)
+    cmd = [
+        sys.executable,
+        "-m",
+        "mini_ork.dispatch.codex_transport",
+        "--print",
+        "--output-format",
+        fmt,
+        "Reply with alpha",
+    ]
+    env["PYTHONPATH"] = str(REPO_ROOT)
     proc = subprocess.run(
         cmd,
         capture_output=True,
@@ -562,19 +555,15 @@ def _read_or_none(path: Path) -> str | None:
     return path.read_text() if path.exists() else None
 
 
-@pytest.mark.skipif(not BASH_WRAPPER.is_file(), reason="bash wrapper not present")
 @pytest.mark.parametrize("fmt", ["text", "json"])
-def test_ab_bash_vs_python_identical(fake_codex, target, tmp_path, monkeypatch, fmt):
-    bash_proc, bu, bt, bc = _run_one("bash", fmt, tmp_path, target, monkeypatch)
-    py_proc, pu, pt, pc = _run_one("py", fmt, tmp_path, target, monkeypatch)
+def test_native_subprocess_writes_expected_output_and_sidecars(
+    fake_codex, target, tmp_path, monkeypatch, fmt
+):
+    proc, usage, turns, cost = _run_transport(fmt, tmp_path, target, monkeypatch)
 
-    assert bash_proc.returncode == 0 and py_proc.returncode == 0
-    assert py_proc.stdout == bash_proc.stdout, (
-        f"stdout differs:\nbash={bash_proc.stdout!r}\npy={py_proc.stdout!r}"
-    )
-    assert _read_or_none(pu) == _read_or_none(bu) == "1500\t250\n"
-    assert _read_or_none(pt) == _read_or_none(bt)
-    assert json.loads(pt.read_text()) == {
+    assert proc.returncode == 0
+    assert _read_or_none(usage) == "1500\t250\n"
+    assert json.loads(turns.read_text()) == {
         "turn_index": 0,
         "input_tokens": 1500,
         "output_tokens": 250,
@@ -583,16 +572,10 @@ def test_ab_bash_vs_python_identical(fake_codex, target, tmp_path, monkeypatch, 
         "session_id": "thr-unit",
     }
     # (1000*1.0 + 500*0.1 + 250*5.0)/1e6 = 0.0023
-    assert _read_or_none(pc) == _read_or_none(bc) == "0.002300\n"
+    assert _read_or_none(cost) == "0.002300\n"
 
 
-@pytest.mark.skipif(not BASH_WRAPPER.is_file(), reason="bash wrapper not present")
-def test_ab_bash_vs_python_failure_rc4(fake_codex, target, tmp_path, monkeypatch):
-    bash_proc, *_ = _run_one("bash", "text", tmp_path, target, monkeypatch, fake_rc="1")
-    py_proc, *_ = _run_one("py", "text", tmp_path, target, monkeypatch, fake_rc="1")
-
-    assert bash_proc.returncode == 4
-    assert py_proc.returncode == 4
-    assert py_proc.stderr == bash_proc.stderr, (
-        f"stderr differs:\nbash={bash_proc.stderr!r}\npy={py_proc.stderr!r}"
-    )
+def test_native_subprocess_maps_codex_failure_to_rc4(fake_codex, target, tmp_path, monkeypatch):
+    proc, *_ = _run_transport("text", tmp_path, target, monkeypatch, fake_rc="1")
+    assert proc.returncode == 4
+    assert "codex exec failed with rc=1" in proc.stderr

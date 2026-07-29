@@ -84,11 +84,11 @@ def test_implementer_profile_has_no_comms_or_web_mcp():
     assert not any(tok in impl.lower() for tok in ("gmail", "web", "fetch", "http", "comms", "slack"))
 
 
-def test_worker_launcher_context7_instruction_resolved():
-    # The dead "Context7 MCP" instruction was removed; the ctx7 CLI is the live one.
-    launcher = (REPO_ROOT / "bin" / "_worker-launcher.sh").read_text()
-    assert "Context7 MCP" not in launcher
-    assert "ctx7" in launcher
+def test_retired_worker_launcher_has_no_live_dependency():
+    """Worker dispatch now routes through native subcommands, not a shell bridge."""
+    assert not (REPO_ROOT / "bin" / "_worker-launcher.sh").exists()
+    launcher = (REPO_ROOT / "bin" / "_mini_ork_subcommand.py").read_text()
+    assert "os.execv" in launcher
 
 
 def test_python_dispatch_subprocess_folds_tool_grants(tmp_path):

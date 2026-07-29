@@ -28,11 +28,13 @@ matching `sqlite3 -bail` aborting on an unrecognised command.
 """
 from __future__ import annotations
 
+import argparse
 import hashlib
 import os
 import re
 import sqlite3
 import subprocess
+import sys
 from pathlib import Path
 
 
@@ -475,3 +477,19 @@ def init_db(db: str | None = None, root: str | None = None) -> tuple[int, str, s
                    f" have been applied yet.")
     out.append(f"[mini-ork init] Done. Tables: {table_count}")
     return _result(0)
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Compatibility CLI behind db/init.sh and native callers."""
+    parser = argparse.ArgumentParser(prog="mini_ork.stores.migrate")
+    parser.add_argument("--db", default=os.environ.get("MINI_ORK_DB"))
+    parser.add_argument("--root", default=os.environ.get("MINI_ORK_ROOT"))
+    args = parser.parse_args(argv)
+    rc, stdout, stderr = init_db(db=args.db, root=args.root)
+    sys.stdout.write(stdout)
+    sys.stderr.write(stderr)
+    return rc
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

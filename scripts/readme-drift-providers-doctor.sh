@@ -30,6 +30,7 @@
 
 set +e
 MINI_ORK_ROOT="${MINI_ORK_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+export PYTHONPATH="$MINI_ORK_ROOT${PYTHONPATH:+:$PYTHONPATH}"
 SECRETS="${MO_SECRETS:-$MINI_ORK_ROOT/.mini-ork/config/secrets.local.sh}"
 [ -f "$SECRETS" ] || SECRETS="$HOME/.config/mini-ork/secrets.local.sh"
 [ -f "$SECRETS" ] && source "$SECRETS"
@@ -37,38 +38,23 @@ SECRETS="${MO_SECRETS:-$MINI_ORK_ROOT/.mini-ork/config/secrets.local.sh}"
 THRESHOLD="${MO_DRIFT_MIN_RESPONSIVE_LENSES:-2}"
 PROBE_TIMEOUT="${MO_DRIFT_PROBE_TIMEOUT_SEC:-20}"
 
-# Provider list: name + sourceable|executable.
+# Provider lanes configured in config/providers.yaml.
 LENSES=(
-  "codex_lens:codex:executable"
-  "kimi_lens:kimi:sourceable"
-  "minimax_lens:minimax:sourceable"
-  "glm_lens:glm:sourceable"
+  "codex_lens:codex"
+  "kimi_lens:kimi"
+  "minimax_lens:minimax"
+  "glm_lens:glm"
 )
 
 probe_one() {
-  local lens_name="$1" provider="$2" kind="$3"
-  local provider_path="$MINI_ORK_ROOT/lib/providers/cl_${provider}.sh"
+  local lens_name="$1" provider="$2"
   local t1 t2 rc out
   local note=""
 
-  if [ ! -f "$provider_path" ]; then
-    echo '{"responsive":false,"wall_sec":0,"rc":-1,"note":"provider script missing"}'
-    return
-  fi
-
   t1=$(date +%s)
-  if [ "$kind" = "executable" ]; then
-    out=$( timeout "$PROBE_TIMEOUT" "$provider_path" --print --output-format text \
-             "Say ${lens_name}_OK only." < /dev/null 2>/dev/null )
-    rc=$?
-  else
-    out=$(
-      source "$provider_path" 2>/dev/null
-      timeout "$PROBE_TIMEOUT" claude --print --output-format text \
-        "Say ${lens_name}_OK only." < /dev/null 2>/dev/null
-    )
-    rc=$?
-  fi
+  out=$(printf 'Say %s_OK only.' "$lens_name" | timeout "$PROBE_TIMEOUT" \
+    python3 -m mini_ork.dispatch "$provider" --timeout "$PROBE_TIMEOUT" 2>/dev/null)
+  rc=$?
   t2=$(date +%s)
   local wall=$((t2 - t1))
 
@@ -95,8 +81,8 @@ probe_one() {
 declare -a results=()
 responsive_count=0
 for spec in "${LENSES[@]}"; do
-  IFS=':' read -r lens_name provider kind <<< "$spec"
-  result=$(probe_one "$lens_name" "$provider" "$kind")
+  IFS=':' read -r lens_name provider <<< "$spec"
+  result=$(probe_one "$lens_name" "$provider")
   results+=("\"${lens_name}\":${result}")
   if echo "$result" | jq -e '.responsive' >/dev/null 2>&1; then
     responsive_count=$((responsive_count + 1))

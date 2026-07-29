@@ -97,7 +97,7 @@ def test_doctor_golden_sections():
     run = _launcher("doctor", env={"MINI_ORK_HOME": raw_home})
     assert run.returncode == 0
     assert run.stdout.startswith("=== mini-ork doctor ===\n")
-    assert "\nLib presence:\n" in run.stdout
+    assert "\nLib presence:\n" not in run.stdout
     assert "\nProvider preflight:\n" in run.stdout
     assert f"  [OK]      MINI_ORK_HOME={Path(raw_home).resolve()}\n" in run.stdout
     assert "  [WARN]    glm ($GLM_API_KEY unset; run: mini-ork providers configure glm)\n" in run.stdout

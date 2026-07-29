@@ -1,11 +1,8 @@
 """Provider registry + telemetry parsers for the Python dispatch layer.
 
-Maps a model lane to the command that runs it and the parsers that turn its
-output into typed telemetry. Faithful port of the harvest logic in
-lib/providers/cl_codex.sh (the codex JSONL usage/cost parse). The lane wrappers
-are reused as the command for now; making them read the prompt from stdin (so
-the whole chain is E2BIG-proof end-to-end, not just the Python boundary) is the
-next migration slice.
+Maps a model lane to the native command that runs it and the parsers that turn
+its output into typed telemetry. The registry is the sole source of lane
+configuration; providers never source ``lib/providers/cl_*.sh``.
 """
 
 from __future__ import annotations
@@ -13,8 +10,6 @@ from __future__ import annotations
 import json
 import os
 import re
-import shlex
-import subprocess
 import sys
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -26,14 +21,30 @@ from .core import dispatch
 from .models import DispatchRequest, DispatchResult, TokenUsage
 from .secrets import SecretStoreError, read_secret_exports, secret_store_path
 
-# Lanes mini-ork knows about. codex/gemini are EXECUTABLE wrappers (run the
-# cl_*.sh as a command). Anthropic-compatible gateways source a wrapper to pin
-# ANTHROPIC_* env, but must use plain-text output because their Claude CLI path
-# does not guarantee the native Claude JSON envelope.
-EXECUTABLE_MODELS = frozenset({"codex", "gemini"})
+# Lanes with a non-Claude CLI. Codex uses its native Python transport; other
+# provider kinds are described in config/providers.yaml.
+EXECUTABLE_MODELS = frozenset({"codex"})
 ANTHROPIC_COMPAT_MODELS = frozenset({"deepseek", "glm", "kimi", "minimax"})
 KNOWN_MODELS = frozenset(
-    {"opus", "sonnet", "kimi", "glm", "minimax", "codex", "gemini", "deepseek"}
+    {"opus", "sonnet", "kimi", "glm", "minimax", "codex", "deepseek"}
+)
+
+# Native Anthropic lanes intentionally run through the operator's ambient
+# Claude Code login. These variables are set by gateway lanes, so they must be
+# removed from the child process rather than merely omitted from ProviderSpec.env.
+ANTHROPIC_GATEWAY_ENV = frozenset(
+    {
+        "ANTHROPIC_AUTH_TOKEN",
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_BASE_URL",
+        "ANTHROPIC_MODEL",
+        "ANTHROPIC_DEFAULT_OPUS_MODEL",
+        "ANTHROPIC_DEFAULT_SONNET_MODEL",
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+        "ANTHROPIC_SMALL_FAST_MODEL",
+        "CLAUDE_CODE_SUBAGENT_MODEL",
+        "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
+    }
 )
 
 # Codex list-price defaults (USD per million tokens), matching cl_codex.sh.
@@ -212,37 +223,14 @@ def claude_env_for(
 ) -> dict[str, str]:
     """The ANTHROPIC_*/CLAUDE_* env for a claude-family lane.
 
-    WS6: the providers.yaml registry is the source of truth — when the lane
-    has a registry entry the env is built natively (no bash). The cl_*.sh
-    wrapper source remains only as a fallback for lanes with no registry
-    entry (deleted in the bash purge). Returns {} when the lane's required
-    API key env var is unset (the wrapper's `${KEY:?}` abort contract).
+    Providers.yaml is the source of truth. Returns {} when the lane's required
+    API key env var is unset, preserving the preflight failure contract.
     """
     env_map = os.environ if environment is None else environment
     entry = _load_providers_registry(root).get(model)
     if isinstance(entry, Mapping):
         return _lane_env_from_registry(model, entry, env_map)
-    wrapper = mini_ork_root(root) / "lib" / "providers" / f"cl_{model}.sh"
-    if not wrapper.is_file():
-        raise FileNotFoundError(f"provider wrapper not found: {wrapper}")
-    proc = subprocess.run(
-        [
-            "bash",
-            "-c",
-            f"source {shlex.quote(str(wrapper))} >/dev/null 2>&1; "
-            'env | grep -E "^(ANTHROPIC_|CLAUDE_CODE_)" || true',
-        ],
-        capture_output=True,
-        text=True,
-        timeout=10,
-        env=dict(env_map),
-    )
-    env: dict[str, str] = {}
-    for line in proc.stdout.splitlines():
-        if "=" in line:
-            key, _, value = line.partition("=")
-            env[key] = value
-    return env
+    raise ValueError(f"unknown lane: {model!r}")
 
 
 @dataclass(frozen=True)
@@ -256,6 +244,7 @@ class ProviderSpec:
     parse_text: object | None = None  # TextParser | None
     parse_session: object | None = None  # SessionParser | None (E4)
     env: Mapping[str, str] = field(default_factory=dict)
+    unset_env: frozenset[str] = field(default_factory=frozenset)
 
 
 # Provider family recorded in llm_calls.provider, per built-in lane.
@@ -263,7 +252,6 @@ _PROVIDER_FAMILY = {
     "opus": "anthropic",
     "sonnet": "anthropic",
     "codex": "openai",
-    "gemini": "google",
     "glm": "zai",
     "kimi": "moonshot",
     "minimax": "minimax",
@@ -356,6 +344,7 @@ def _resolve_from_registry(
                 parse_text=spec.parse_text,
                 parse_session=spec.parse_session,
                 env=env,
+                unset_env=spec.unset_env,
             )
     if kind in {"anthropic-compat", "openai-compat"}:
         api_key_env = str(entry.get("api_key_env") or "")
@@ -376,6 +365,7 @@ def _resolve_from_registry(
                 parse_text=spec.parse_text,
                 parse_session=spec.parse_session,
                 env=env,
+                unset_env=spec.unset_env,
             )
     return spec
 
@@ -384,7 +374,12 @@ def _resolve_from_registry(
 # Builder signature: (name, entry, root, extra_env, model_id) -> ProviderSpec.
 
 
-def _claude_spec(name: str, env: Mapping[str, str]) -> ProviderSpec:
+def _claude_spec(
+    name: str,
+    env: Mapping[str, str],
+    *,
+    unset_env: frozenset[str] = frozenset(),
+) -> ProviderSpec:
     return ProviderSpec(
         model=name,
         command=(
@@ -400,18 +395,15 @@ def _claude_spec(name: str, env: Mapping[str, str]) -> ProviderSpec:
         parse_text=claude_result_text,
         parse_session=claude_session_id,
         env=env,
+        unset_env=unset_env,
     )
 
 
 def _build_anthropic_native(name, entry, root, extra_env, model_id) -> ProviderSpec:
     del entry, root
     env: dict[str, str] = {}
-    if api_key := os.environ.get("ANTHROPIC_API_KEY"):
-        env["ANTHROPIC_API_KEY"] = api_key
-        if model_id:
-            env["ANTHROPIC_MODEL"] = model_id
     env.update(extra_env)
-    return _claude_spec(name, env)
+    return _claude_spec(name, env, unset_env=ANTHROPIC_GATEWAY_ENV)
 
 
 def _build_anthropic_compat(name, entry, root, extra_env, model_id) -> ProviderSpec:
@@ -449,9 +441,7 @@ def _build_openai_compat(name, entry, root, extra_env, model_id) -> ProviderSpec
     api_key_env = entry.get("api_key_env")
     if not isinstance(api_key_env, str) or not api_key_env:
         raise ValueError(f"provider {name!r} missing required field 'api_key_env'")
-    wrapper = mini_ork_root(root) / "lib" / "providers" / "cl_codex.sh"
-    if not wrapper.is_file():
-        raise FileNotFoundError(f"provider wrapper not found: {wrapper}")
+    del root
     env = {
         "MO_OAI_BASE_URL": base_url,
         "MO_OAI_ENV_KEY": api_key_env,
@@ -461,9 +451,25 @@ def _build_openai_compat(name, entry, root, extra_env, model_id) -> ProviderSpec
     env.update(extra_env)
     return ProviderSpec(
         model=name,
-        command=(str(wrapper), "--print", "--output-format", "text"),
+        command=_codex_transport_command(),
         env=env,
     )
+
+
+def _codex_transport_command() -> tuple[str, ...]:
+    return (
+        sys.executable,
+        "-m",
+        "mini_ork.dispatch.codex_transport",
+        "--print",
+        "--output-format",
+        "text",
+    )
+
+
+def _build_codex_native(name, entry, root, extra_env, model_id) -> ProviderSpec:
+    del entry, root, model_id
+    return ProviderSpec(model=name, command=_codex_transport_command(), env=extra_env)
 
 
 def _build_executable_script(name, entry, root, extra_env, model_id) -> ProviderSpec:
@@ -489,6 +495,7 @@ PROVIDER_KIND_BUILDERS: dict[str, Callable[..., ProviderSpec]] = {
     "anthropic-native": _build_anthropic_native,
     "anthropic-compat": _build_anthropic_compat,
     "openai-compat": _build_openai_compat,
+    "codex-native": _build_codex_native,
     "executable": _build_executable_script,
 }
 
@@ -498,96 +505,42 @@ def register_provider_kind(kind: str, builder: Callable[..., ProviderSpec]) -> N
     PROVIDER_KIND_BUILDERS[kind] = builder
 
 
+def _transport_pythonpath(environment: Mapping[str, str]) -> str:
+    package_root = str(Path(__file__).resolve().parents[2])
+    existing = environment.get("PYTHONPATH", "")
+    return f"{package_root}{os.pathsep}{existing}" if existing else package_root
+
+
 def resolve_provider(
     model: str,
     root: str | os.PathLike[str] | None = None,
     *,
     environment: Mapping[str, str] | None = None,
 ) -> ProviderSpec:
-    """Resolve a built-in wrapper or registry-defined model lane.
+    """Resolve a lane exclusively from ``providers.yaml``.
 
-    Precedence: a lib/providers/cl_<name>.sh wrapper wins for built-in lanes
-    (pinned by test_builtin_wrapper_wins_over_same_named_registry_entry);
-    the providers.yaml registry defines BYO lanes. Note the wrapper's role
-    for anthropic lanes is only env sourcing — which claude_env_for now
-    resolves from the registry natively (WS6), so no bash runs for the
-    committed claude lanes even under this precedence.
+    Built-in and user-defined lanes share one declarative contract. This keeps
+    credential preflight, native transports, and configuration precedence in
+    one place and makes deletion of provider shell wrappers safe.
     """
-    wrapper = mini_ork_root(root) / "lib" / "providers" / f"cl_{model}.sh"
-    if model not in KNOWN_MODELS:
-        return _resolve_from_registry(
-            model, _load_providers_registry(root), root, environment=environment
-        )
-    if not wrapper.is_file():
-        raise FileNotFoundError(f"provider wrapper not found: {wrapper}")
-
-    if model in EXECUTABLE_MODELS:
-        # Prompt arrives over stdin (core.dispatch). stdout is the CLEANED
-        # assistant text — the codex transport redirects the codex JSONL to a
-        # stream file and writes usage/cost to MO_*_FILE sidecars, so there are
-        # no stdout parsers here; dispatch_model reads the sidecars.
-        if model == "codex":
-            # bash-removal WS6: native Python transport, a drop-in replacement
-            # for lib/providers/cl_codex.sh (same argv dialect + sidecar
-            # contract), so _dispatch_codex_via_wrapper works unchanged.
-            command: tuple[str, ...] = (
-                sys.executable,
-                "-m",
-                "mini_ork.dispatch.codex_transport",
-                "--print",
-                "--output-format",
-                "text",
-            )
-            # The dispatch runs with cwd pinned to the TARGET repo, so the
-            # transport module is only importable if the package root is on
-            # PYTHONPATH — the bash wrapper got this for free by being an
-            # absolute path. Prepend it under any operator PYTHONPATH.
-            runtime_env = os.environ if environment is None else environment
-            pkg_root = str(Path(__file__).resolve().parents[2])
-            existing_pp = runtime_env.get("PYTHONPATH", "")
-            pythonpath = (
-                f"{pkg_root}{os.pathsep}{existing_pp}" if existing_pp else pkg_root
-            )
-            return ProviderSpec(model, command, env={"PYTHONPATH": pythonpath})
-        command = (str(wrapper), "--print", "--output-format", "text")
-        return ProviderSpec(model, command)
-
-    # Anthropic-compatible gateways return a plain assistant response through
-    # the Claude CLI. Requesting a native Claude JSON envelope causes gateway
-    # notices or unparseable output to masquerade as a successful empty result.
-    env = claude_env_for(model, root, environment=environment)
-    if model in ANTHROPIC_COMPAT_MODELS:
-        return ProviderSpec(
-            model=model,
-            command=("claude", "--print", "--permission-mode", "bypassPermissions",
-                     "--output-format", "text"),
-            env=env,
-        )
-
-    # Native Claude family: env-pin from the wrapper, then run claude with JSON output.
-    # `--permission-mode bypassPermissions` is LOAD-BEARING: without it, `claude
-    # --print` runs in the default permission mode and auto-denies every Write/
-    # Edit/Bash-redirect in non-interactive mode, so an implementer/worker lane
-    # can read but never write files — the port silently produces nothing. The
-    # bash path (lib/llm-dispatch.sh:938, lib/lane-helpers.sh:244) always passes
-    # it; the Python port dropped it (2026-07-04 migration batch, 3rd killer).
-    return ProviderSpec(
-        model=model,
-        command=("claude", "--print", "--permission-mode", "bypassPermissions",
-                 "--output-format", "json"),
-        parse_usage=parse_claude_usage,
-        parse_cost=claude_cost,
-        parse_text=claude_result_text,
-        parse_session=claude_session_id,
-        env=env,
+    runtime = os.environ if environment is None else environment
+    spec = _resolve_from_registry(
+        model, _load_providers_registry(root), root, environment=runtime
     )
-
-
-# A wrapper's `${SOME_API_KEY:?}` guard declares the key it requires. If that
-# var is unset the bash wrapper aborts and the lane produces nothing — the exact
-# "minimax died silently, 19-min stall" failure from prod sessions. We read that
-# declaration to fail FAST with a clear reason instead of stalling.
-_REQUIRED_KEY_RE = re.compile(r"\$\{([A-Z][A-Z0-9_]*_API_KEY)\s*:[?]")
+    if spec.command == _codex_transport_command():
+        env = dict(spec.env)
+        env["PYTHONPATH"] = _transport_pythonpath(runtime)
+        return ProviderSpec(
+            model=spec.model,
+            command=spec.command,
+            parse_usage=spec.parse_usage,
+            parse_cost=spec.parse_cost,
+            parse_text=spec.parse_text,
+            parse_session=spec.parse_session,
+            env=env,
+            unset_env=spec.unset_env,
+        )
+    return spec
 
 
 @dataclass(frozen=True)
@@ -614,14 +567,6 @@ def required_secret_envs(
     model: str, root: str | os.PathLike[str] | None = None
 ) -> tuple[str, ...]:
     """Return declared credential variables for a lane, never their values."""
-    if model in KNOWN_MODELS:
-        wrapper = mini_ork_root(root) / "lib" / "providers" / f"cl_{model}.sh"
-        if not wrapper.is_file():
-            raise FileNotFoundError(f"provider wrapper not found: {wrapper}")
-        text = wrapper.read_text(encoding="utf-8")
-        return tuple(
-            dict.fromkeys(match.group(1) for match in _REQUIRED_KEY_RE.finditer(text))
-        )
     registry = _load_providers_registry(root)
     entry = registry.get(model)
     if not isinstance(entry, Mapping):
@@ -639,24 +584,8 @@ def lane_health(
     *,
     environment: Mapping[str, str] | None = None,
 ) -> LaneHealth:
-    """Cheap pre-dispatch check for wrapper and registry-defined lanes."""
+    """Cheap pre-dispatch check for registry-defined lanes."""
     runtime = os.environ if environment is None else environment
-    if model in KNOWN_MODELS:
-        wrapper = mini_ork_root(root) / "lib" / "providers" / f"cl_{model}.sh"
-        if not wrapper.is_file():
-            return LaneHealth(False, f"wrapper missing: {wrapper}")
-        try:
-            text = wrapper.read_text(encoding="utf-8")
-        except OSError as exc:
-            return LaneHealth(False, f"wrapper unreadable: {exc}")
-        for match in _REQUIRED_KEY_RE.finditer(text):
-            key = match.group(1)
-            if not runtime.get(key):
-                return LaneHealth(
-                    False, f"{model}: ${key} is not set — lane would die silently"
-                )
-        return LaneHealth(True, "ok")
-
     try:
         registry = _load_providers_registry(root)
         _resolve_from_registry(model, registry, root, environment=runtime)
@@ -737,7 +666,7 @@ def dispatch_model(
     preflight_check: bool = True,
 ) -> DispatchResult:
     """Resolve ``request.model`` to a provider and dispatch it. Unknown lane /
-    missing wrapper / unset API key / a framework-tree cwd come back as a
+    unset API key / a framework-tree cwd come back as a
     structured ``ok=False`` result (fail-fast), not a raise, stall, or repo
     corruption."""
     try:
@@ -808,9 +737,16 @@ def dispatch_model(
                 parse_text=spec.parse_text,
                 parse_session=spec.parse_session,
                 env=spec.env,
+                unset_env=spec.unset_env,
             )
-    # Merge the lane's pinned env UNDER any per-request overrides; pin the cwd.
-    merged_env = {**effective_env, **dict(spec.env), **request.env}
+    # Merge lane env after removing stale gateway variables. Explicit request
+    # overrides are applied last so a caller can deliberately opt into a custom
+    # endpoint without mutating the process environment.
+    merged_env = dict(effective_env)
+    for key in spec.unset_env:
+        merged_env.pop(key, None)
+    merged_env.update(spec.env)
+    merged_env.update(request.env)
     effective = DispatchRequest(
         model=request.model,
         prompt=request.prompt,

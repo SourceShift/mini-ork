@@ -10,8 +10,8 @@ Pins the env-fallback contract that used to live inline in
   (c) resolution precedence is unchanged: explicit parameter > config
       field (env var) > built-in default — verified end-to-end through
       ``mo_run_rubric_prescreen`` for both MINI_ORK_DB and
-      MO_RUBRIC_LANE without spawning claude (the run bails at the
-      kickoff-miss / env-script-missing branches).
+      MO_RUBRIC_LANE without spawning Claude (the registry fixture uses a
+      non-Claude transport, so the run bails at the provider-capability gate).
 """
 from __future__ import annotations
 
@@ -128,21 +128,28 @@ def _mk_db(path: Path, kickoff_rel: str | None) -> str:
 
 
 @pytest.fixture
-def stage(tmp_path: Path):
+def stage(tmp_path: Path, monkeypatch):
     home = tmp_path / "home"
     repo = tmp_path / "repo"
     prompts = tmp_path / "prompts"
     scripts = tmp_path / "scripts"
     for d in (home, repo, prompts, scripts):
         d.mkdir()
+    providers = tmp_path / "providers.yaml"
+    providers.write_text(
+        "providers:\n"
+        "  kimi: {kind: codex-native, family: openai}\n"
+        "  glm: {kind: codex-native, family: openai}\n"
+        "  opus: {kind: codex-native, family: openai}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("MINI_ORK_PROVIDERS", str(providers))
     (repo / "kickoff.md").write_text("# kickoff\n", encoding="utf-8")
-    # NOTE: scripts dir intentionally has NO cl_<lane>.sh so the run
-    # bails at the env-script-missing branch (no claude subprocess).
     db_with_kickoff = _mk_db(tmp_path / "a.db", "kickoff.md")
     db_without_kickoff = _mk_db(tmp_path / "b.db", None)
     return {
         "home": str(home), "repo": str(repo),
-        "prompts": str(prompts), "scripts": str(scripts),
+        "prompts": str(prompts), "scripts": str(scripts), "providers": str(providers),
         "db_a": db_with_kickoff, "db_b": db_without_kickoff,
     }
 
@@ -182,7 +189,7 @@ def test_param_db_overrides_env_db(stage, monkeypatch):
     assert rub["parse_error"] is True
 
 
-def test_env_lane_feeds_env_script_lookup(stage, monkeypatch, capsys):
+def test_env_lane_feeds_provider_registry_lookup(stage, monkeypatch, capsys):
     monkeypatch.setenv("MINI_ORK_DB", stage["db_a"])
     monkeypatch.setenv("MO_RUBRIC_LANE", "glm")
     _run(stage)

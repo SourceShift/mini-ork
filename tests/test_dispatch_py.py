@@ -185,8 +185,8 @@ def test_dispatch_through_a_claude_style_stub():
     assert res.cost_usd == pytest.approx(0.0123)
 
 
-def test_claude_env_for_reuses_wrapper_as_source_of_truth(monkeypatch):
-    # With the lane's API key present, sourcing cl_glm.sh yields the z.ai pins.
+def test_claude_env_for_uses_registry_contract(monkeypatch):
+    # The native registry carries the gateway pin without sourcing a wrapper.
     monkeypatch.setenv("GLM_API_KEY", "dummy-key-for-test")
     env = claude_env_for("glm")
     assert env.get("ANTHROPIC_BASE_URL") == "https://api.z.ai/api/anthropic"
@@ -194,27 +194,26 @@ def test_claude_env_for_reuses_wrapper_as_source_of_truth(monkeypatch):
 
 
 def test_claude_env_for_empty_without_key(monkeypatch):
-    # Missing key → the wrapper's `${GLM_API_KEY:?}` guard aborts the source
-    # before any export, so we get nothing rather than a half-pinned env.
+    # A missing required key produces no half-pinned gateway environment.
     monkeypatch.delenv("GLM_API_KEY", raising=False)
     env = claude_env_for("glm")
     assert "ANTHROPIC_AUTH_TOKEN" not in env
 
 
-def test_resolve_gateway_lane_uses_plain_text_command():
+def test_resolve_gateway_lane_uses_json_envelope():
     spec = resolve_provider("glm")
     assert spec.command[0] == "claude"
-    assert spec.command[-1] == "text"
-    assert spec.parse_text is None
-    assert spec.parse_usage is None
+    assert spec.command[-1] == "json"
+    assert spec.parse_text is claude_result_text
+    assert spec.parse_usage is parse_claude_usage
 
 
-def test_resolve_all_anthropic_compatible_gateways_as_plain_text():
+def test_resolve_all_anthropic_compatible_gateways_as_json_envelopes():
     for lane in ("deepseek", "glm", "kimi", "minimax"):
         spec = resolve_provider(lane)
-        assert spec.command[-1] == "text", lane
-        assert spec.parse_text is None, lane
-        assert spec.parse_usage is None, lane
+        assert spec.command[-1] == "json", lane
+        assert spec.parse_text is claude_result_text, lane
+        assert spec.parse_usage is parse_claude_usage, lane
 
 
 def test_resolve_native_claude_lane_uses_json_envelope():
@@ -234,6 +233,6 @@ def test_claude_lane_passes_bypass_permissions():
         cmd = resolve_provider(lane).command
         assert "--permission-mode" in cmd and "bypassPermissions" in cmd, lane
         assert cmd[cmd.index("--permission-mode") + 1] == "bypassPermissions", lane
-    # codex/gemini are wrapper-executables with their own permission handling —
+    # Codex has its own permission handling —
     # they must NOT be handed claude's --permission-mode flag.
     assert "--permission-mode" not in resolve_provider("codex").command
