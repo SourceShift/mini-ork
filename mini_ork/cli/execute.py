@@ -2742,11 +2742,32 @@ def _handle_eval(ctx: NodeDispatch):
         recipe_prompt=recipe_prompt,
     )
 
-    rc, result = ctx.dispatch(prompt)
-    envelope = ej.parse_eval_envelope(result) if rc == 0 and result else None
-    axes = (envelope.get("axes") or {}) if envelope else {}
-    rationale = envelope.get("rationale", "") if envelope else ""
-    findings = envelope.get("trajectory_findings", []) if envelope else []
+    # Layer 3 — dispatch the judge as a DECORRELATED JURY when MO_EVAL_JURY_LANES
+    # (comma-separated lanes from different model families) is set; else a single
+    # judge (default). The jury's veto is consensus-based and abstains when the
+    # panel can't agree (jury_veto), so no one model owns the veto.
+    jury_lanes = [x.strip() for x in
+                  os.environ.get("MO_EVAL_JURY_LANES", "").split(",") if x.strip()]
+    envelopes = []
+    rc = 1
+    if jury_lanes:
+        for jlane in jury_lanes:
+            jrc, jres = ctx.dispatch_fn(ctx.task_class, jlane, prompt)
+            if jrc == 0 and jres:
+                env = ej.parse_eval_envelope(jres)
+                if env:
+                    envelopes.append(env)
+        rc = 0 if envelopes else 1
+    else:
+        rc, result = ctx.dispatch(prompt)
+        env = ej.parse_eval_envelope(result) if rc == 0 and result else None
+        if env:
+            envelopes.append(env)
+
+    primary = envelopes[0] if envelopes else None
+    axes = (primary.get("axes") or {}) if primary else {}
+    rationale = primary.get("rationale", "") if primary else ""
+    findings = primary.get("trajectory_findings", []) if primary else []
 
     # Layer 0 — execution reward is the backbone (EGCA: execution, not opinion).
     r_exec, exec_detail = ej.execution_reward(verifier_verdicts)
@@ -2754,16 +2775,18 @@ def _handle_eval(ctx: NodeDispatch):
         # Layer 1 — de-bias by the verifier's measured/prior FP-FN noise rates.
         fp_rate, fn_rate = _verifier_noise_rates(ctx.db, list(verifier_verdicts.keys()))
         r_corr = ej.noise_correct(r_exec, fp_rate, fn_rate)
-        # Layer 3 demotion — the judge may only VETO (safety/groundedness).
-        score = ej.judge_veto(r_corr, axes)
+        # Layer 3 — the jury (or single judge) may only VETO by consensus, and
+        # abstains when the panel disagrees. Empty panel → no veto (fail-open).
+        score, jury_meta = ej.jury_veto(r_corr, envelopes)
         source, verdict = ej.EXEC_SOURCE, ej.verdict_from_score(score)
         exec_meta = {"r_exec": r_exec, "r_corrected": r_corr,
-                     "fp_rate": fp_rate, "fn_rate": fn_rate, "verifiers": exec_detail}
-    elif envelope is not None:
+                     "fp_rate": fp_rate, "fn_rate": fn_rate,
+                     "verifiers": exec_detail, "jury": jury_meta}
+    elif primary is not None:
         # No execution signal (vacuous / no verifiers) → judge-only, lower trust.
-        score = ej.aggregate_axes(axes, envelope.get("score"))
+        score = ej.aggregate_axes(axes, primary.get("score"))
         source = ej.JUDGE_SOURCE
-        verdict = envelope.get("verdict") or ej.verdict_from_score(score)
+        verdict = primary.get("verdict") or ej.verdict_from_score(score)
         exec_meta = {"r_exec": None, "note": "no execution signal — judge-only reward"}
         print("  [eval] no execution signal — judge-only reward (lower trust)",
               file=sys.stderr)
