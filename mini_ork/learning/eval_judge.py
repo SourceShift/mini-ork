@@ -34,6 +34,17 @@ EVAL_SOURCE = "eval@v1"
 EVAL_ANCHOR = 0.5
 EVAL_PRIMARY_METRIC = "eval_score"
 
+# Truth-grounded stack (docs/plans/2026-07-30-truth-grounded-eval-stack.md).
+# The reward's backbone is EXECUTION, not the judge. reward_source splits so the
+# learning loop can tell a verifier-grounded reward from a judge-only fallback.
+EXEC_SOURCE = "eval-exec@v1"     # Layer 0+1: execution reward, noise-corrected
+JUDGE_SOURCE = "eval-judge@v1"   # Layer 3 fallback: no execution signal ran
+# Conservative default verifier noise priors when verifier_results is unlabeled
+# (arXiv 2510.00915 measured a rule-based verifier at ~10% FN / ~0% FP; a code
+# test can still false-pass through a coverage gap, hence a small nonzero FP).
+DEFAULT_FP_PRIOR = 0.05
+DEFAULT_FN_PRIOR = 0.10
+
 # Per-criterion axes (A1 of the 2026-07-24 best-practices review): the rubric is
 # hidden from the *generator* but explicit and verbalized to the *judge*, with
 # per-criterion sub-scores on a small discrete scale rather than one holistic score.
@@ -199,6 +210,76 @@ def aggregate_axes(axes: dict, overall=None) -> float:
     return clamp01(base * safety)
 
 
+# ── Layer 0: execution-grounded reward ───────────────────────────────────────
+def _verifier_passed(v: dict):
+    """True/False from one parsed verifier JSON, or None when it carries no real
+    signal (vacuous / dry-run / running). Supports the ``pass`` bool
+    (recipe verifiers like test.py) and the ``verdict``/``status`` string
+    (cli/verify.py)."""
+    if not isinstance(v, dict):
+        return None
+    if "pass" in v:
+        return bool(v["pass"])
+    verdict = str(v.get("verdict") or v.get("status") or "").strip().lower()
+    if verdict in ("pass", "passed", "success"):
+        return True
+    if verdict in ("fail", "failed", "failure", "reject"):
+        return False
+    return None  # vacuous / dry-run / running / unknown → no execution signal
+
+
+def execution_reward(verifier_results: dict) -> tuple[float | None, dict]:
+    """Layer 0: the fraction of the run's verifiers that passed — an
+    execution-grounded score (EGCA's R̂), NOT an opinion. Returns
+    (pass_fraction | None, per-verifier detail). None means no verifier produced
+    a real pass/fail signal (e.g. all vacuous) → the caller falls back to
+    judgment. A vacuous run must never earn a high reward."""
+    passes: list[float] = []
+    detail: dict = {}
+    for name, v in verifier_results.items():
+        p = _verifier_passed(v)
+        detail[name] = p
+        if p is not None:
+            passes.append(1.0 if p else 0.0)
+    if not passes:
+        return None, detail
+    return sum(passes) / len(passes), detail
+
+
+# ── Layer 1: verifier-noise correction (arXiv 2510.00915) ────────────────────
+def noise_correct(r, fp_rate: float, fn_rate: float) -> float:
+    """Backward correction: de-bias an observed execution reward given the
+    verifier's false-positive/false-negative rates.
+
+        R_corrected = (R − ρ_FP) / (1 − ρ_FP − ρ_FN)
+
+    Because even "objective" verifiers are noisy (the paper measures FN up to
+    38%, FP 35–68% for LLM verifiers; ~10%/0% for rule-based), the raw pass
+    signal over-credits false passes. Guard: if 1 − ρ_FP − ρ_FN ≤ 0 (rates
+    over-estimated) the inverse factor blows up variance, so we skip the
+    correction and return the raw reward — the paper's documented failure edge."""
+    r = clamp01(r)
+    fp = max(0.0, float(fp_rate))
+    fn = max(0.0, float(fn_rate))
+    denom = 1.0 - fp - fn
+    if denom <= 0.0:
+        return r
+    return clamp01((r - fp) / denom)
+
+
+# ── Layer 3 demotion: the judge can only veto, never lift ─────────────────────
+def judge_veto(reward: float, axes: dict) -> float:
+    """One-way downgrade of an execution reward by the judge's judgment-only
+    axes (safety, groundedness) — the dimensions execution cannot measure. The
+    veto multiplies the reward by min(those axes) ≤ 1, so the judge can pull the
+    reward DOWN but never above the execution ceiling. Empty axes → no change.
+    This is the anti-Goodhart 'reward verified execution; judge vetoes only'
+    rule (writeback.py) applied to the whole reward."""
+    veto_axes = [clamp01(axes[a]) for a in ("safety", "groundedness") if a in axes]
+    veto = min(veto_axes) if veto_axes else 1.0
+    return clamp01(reward * veto)
+
+
 def verdict_from_score(score: float, floor: float = 0.6) -> str:
     """Map an aggregated score to a coarse verdict (advisory label only)."""
     return "pass" if score >= floor else "needs_revision"
@@ -282,5 +363,8 @@ def trajectory_digest(traces: list[dict], verifier_verdicts: dict | None = None)
         lines.append(f"- status={status}{seg}")
     if verifier_verdicts:
         for name, v in verifier_verdicts.items():
-            lines.append(f"- verifier[{name}]: {v}")
+            if isinstance(v, dict):
+                lines.append(f"- verifier[{name}]: pass={_verifier_passed(v)}")
+            else:
+                lines.append(f"- verifier[{name}]: {str(v)[:160]}")
     return "\n".join(lines) if lines else ""
