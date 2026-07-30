@@ -2608,7 +2608,7 @@ def _read_run_trajectory(db: str, run_id: str, run_dir: str):
                 con.close()
         except Exception:
             traces = []
-    verifier_verdicts: dict[str, str] = {}
+    verifier_verdicts: dict[str, object] = {}
     if run_dir and os.path.isdir(run_dir):
         try:
             for fn in sorted(os.listdir(run_dir)):
@@ -2616,12 +2616,59 @@ def _read_run_trajectory(db: str, run_id: str, run_dir: str):
                     name = fn[len("verifier_"):-len(".json")]
                     try:
                         with open(os.path.join(run_dir, fn), encoding="utf-8") as fh:
-                            verifier_verdicts[name] = fh.read().strip()[:200]
+                            body = fh.read().strip()
                     except OSError:
-                        pass
+                        continue
+                    try:
+                        verifier_verdicts[name] = json.loads(body)  # parsed → pass/verdict
+                    except (ValueError, TypeError):
+                        verifier_verdicts[name] = {"raw": body[:200]}
         except OSError:
             pass
     return traces, verifier_verdicts
+
+
+def _verifier_noise_rates(db: str, verifier_names) -> tuple[float, float]:
+    """(ρ_FP, ρ_FN) for the run's verifiers — the Layer-1 noise model. Uses
+    labeled ``verifier_results`` (migration 0025) when present (FP via the
+    shipped verifier_fp_rate primitive, FN computed inline), else conservative
+    priors (MO_EVAL_VERIFIER_FP_PRIOR / _FN_PRIOR). Averaged across verifiers.
+    Best-effort and fail-open — any error returns the priors."""
+    from mini_ork.learning import eval_judge as ej  # noqa: PLC0415
+    try:
+        fp_prior = float(os.environ.get("MO_EVAL_VERIFIER_FP_PRIOR", ej.DEFAULT_FP_PRIOR))
+        fn_prior = float(os.environ.get("MO_EVAL_VERIFIER_FN_PRIOR", ej.DEFAULT_FN_PRIOR))
+    except ValueError:
+        fp_prior, fn_prior = ej.DEFAULT_FP_PRIOR, ej.DEFAULT_FN_PRIOR
+    if not (db and os.path.isfile(db) and verifier_names):
+        return fp_prior, fn_prior
+    fps: list[float] = []
+    fns: list[float] = []
+    try:
+        from mini_ork.gates.verifier_rubric import verifier_fp_rate  # noqa: PLC0415
+        con = sqlite3.connect(db, timeout=5.0)
+        con.execute("PRAGMA busy_timeout=5000")
+        try:
+            for name in verifier_names:
+                total = con.execute(
+                    "SELECT COUNT(*) FROM verifier_results WHERE verifier_name=?",
+                    (name,)).fetchone()[0]
+                if not total:
+                    continue  # unlabeled → let the prior stand for this verifier
+                fn_ct = con.execute(
+                    "SELECT COUNT(*) FROM verifier_results "
+                    "WHERE verifier_name=? AND is_false_negative=1", (name,)).fetchone()[0]
+                fns.append(fn_ct / total)
+                try:
+                    fps.append(float(verifier_fp_rate(db, name)))
+                except (ValueError, TypeError):
+                    fps.append(fp_prior)
+        finally:
+            con.close()
+    except Exception:
+        return fp_prior, fn_prior
+    return (sum(fps) / len(fps) if fps else fp_prior,
+            sum(fns) / len(fns) if fns else fn_prior)
 
 
 def _eval_artifact_text(ctx: NodeDispatch) -> tuple[str, str]:
@@ -2697,35 +2744,57 @@ def _handle_eval(ctx: NodeDispatch):
 
     rc, result = ctx.dispatch(prompt)
     envelope = ej.parse_eval_envelope(result) if rc == 0 and result else None
+    axes = (envelope.get("axes") or {}) if envelope else {}
+    rationale = envelope.get("rationale", "") if envelope else ""
+    findings = envelope.get("trajectory_findings", []) if envelope else []
 
-    if envelope is not None:
-        axes = envelope.get("axes") or {}
+    # Layer 0 — execution reward is the backbone (EGCA: execution, not opinion).
+    r_exec, exec_detail = ej.execution_reward(verifier_verdicts)
+    if r_exec is not None:
+        # Layer 1 — de-bias by the verifier's measured/prior FP-FN noise rates.
+        fp_rate, fn_rate = _verifier_noise_rates(ctx.db, list(verifier_verdicts.keys()))
+        r_corr = ej.noise_correct(r_exec, fp_rate, fn_rate)
+        # Layer 3 demotion — the judge may only VETO (safety/groundedness).
+        score = ej.judge_veto(r_corr, axes)
+        source, verdict = ej.EXEC_SOURCE, ej.verdict_from_score(score)
+        exec_meta = {"r_exec": r_exec, "r_corrected": r_corr,
+                     "fp_rate": fp_rate, "fn_rate": fn_rate, "verifiers": exec_detail}
+    elif envelope is not None:
+        # No execution signal (vacuous / no verifiers) → judge-only, lower trust.
         score = ej.aggregate_axes(axes, envelope.get("score"))
+        source = ej.JUDGE_SOURCE
         verdict = envelope.get("verdict") or ej.verdict_from_score(score)
-        source = ej.EVAL_SOURCE
-        rationale = envelope.get("rationale", "")
-        findings = envelope.get("trajectory_findings", [])
+        exec_meta = {"r_exec": None, "note": "no execution signal — judge-only reward"}
+        print("  [eval] no execution signal — judge-only reward (lower trust)",
+              file=sys.stderr)
     else:
+        # Judge unavailable AND no execution signal → heuristic fallback.
         score, source = ej.fallback_score(run_dir)
-        axes, verdict = {}, ej.verdict_from_score(score)
-        rationale = "judge unavailable — fell back to rubric/PRM heuristic"
-        findings = []
-        print(f"  [eval] judge unavailable (rc={rc}) → fallback {source} "
-              f"score={score:.2f}", file=sys.stderr)
+        verdict = ej.verdict_from_score(score)
+        rationale = "judge unavailable + no execution signal — rubric/PRM heuristic"
+        exec_meta = {"r_exec": None, "note": "judge unavailable"}
+        print(f"  [eval] judge unavailable (rc={rc}) + no execution signal → "
+              f"fallback {source} score={score:.2f}", file=sys.stderr)
 
     # Persist the envelope for offline graders + the data flywheel.
     try:
         with open(os.path.join(run_dir, "eval.json"), "w", encoding="utf-8") as fh:
             json.dump({"score": score, "axes": axes, "verdict": verdict,
                        "rationale": rationale, "trajectory_findings": findings,
-                       "reward_source": source}, fh, indent=2)
+                       "reward_source": source, "execution": exec_meta}, fh, indent=2)
     except OSError:
         pass
+
+    # Reward vector: numeric axes + execution numbers (DB-safe; detail → eval.json).
+    reward_vector = {k: v for k, v in axes.items() if isinstance(v, (int, float))}
+    if exec_meta.get("r_exec") is not None:
+        reward_vector["r_exec"] = exec_meta["r_exec"]
+        reward_vector["r_corrected"] = exec_meta["r_corrected"]
 
     # Write the graded reward onto the wired-but-empty 0042 reward columns.
     try:
         payload = ej.eval_reward_payload(
-            ctx.task_class, ctx.run_id, score, axes, verdict,
+            ctx.task_class, ctx.run_id, score, reward_vector, verdict,
             source=source, artifact_ref=artifact_ref)
         trace_store.trace_write(payload, db=ctx.db)
     except Exception as exc:  # noqa: BLE001 — advisory; never sink the run
@@ -2733,11 +2802,12 @@ def _handle_eval(ctx: NodeDispatch):
 
     if os.environ.get("MO_EVAL_STAMP_RUN", "0") == "1":
         try:
-            _stamp_run_eval_reward(ctx.db, ctx.run_id, score, axes, source)
+            _stamp_run_eval_reward(ctx.db, ctx.run_id, score, reward_vector, source)
         except Exception:
             pass
 
-    print(f"  [eval] {source} score={score:.2f} verdict={verdict} axes={axes}")
+    print(f"  [eval] {source} score={score:.2f} verdict={verdict} "
+          f"exec={exec_meta.get('r_exec')} axes={axes}")
     ctx.charge()
     return 0, "done"
 
