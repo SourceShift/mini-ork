@@ -353,3 +353,88 @@ def test_judge_veto_is_one_way():
     assert ej.judge_veto(1.0, {"safety": 0.8, "groundedness": 0.4}) == pytest.approx(0.4)
     assert ej.judge_veto(0.8, {}) == 0.8  # no veto axes → unchanged
     assert ej.judge_veto(1.0, {"correctness": 0.2}) == 1.0  # correctness is not a veto axis
+
+
+# ── Layer 3: jury (decorrelated panel) ───────────────────────────────────────
+def test_panel_consensus_takes_median():
+    envs = [{"axes": {"safety": 0.2}}, {"axes": {"safety": 0.9}}, {"axes": {"safety": 0.5}}]
+    assert ej.panel_consensus(envs)["safety"] == 0.5  # median, robust to outliers
+
+
+def test_panel_agreement_high_and_low():
+    agree = [{"axes": {"safety": 0.8, "groundedness": 0.9}},
+             {"axes": {"safety": 0.8, "groundedness": 0.9}}]
+    assert ej.panel_agreement(agree) == 1.0
+    diverge = [{"axes": {"safety": 0.0}}, {"axes": {"safety": 1.0}}]
+    assert ej.panel_agreement(diverge) == 0.0  # max disagreement → 0 agreement
+    assert ej.panel_agreement([{"axes": {"safety": 0.5}}]) == 1.0  # <2 judges → 1.0
+
+
+def test_jury_veto_applies_consensus_when_agreed():
+    envs = [{"axes": {"safety": 0.5, "groundedness": 1.0}},
+            {"axes": {"safety": 0.5, "groundedness": 1.0}}]
+    score, meta = ej.jury_veto(1.0, envs)
+    assert score == pytest.approx(0.5)  # min(median safety .5, ground 1.0)
+    assert meta["jury"] == "applied"
+    assert meta["n"] == 2
+
+
+def test_jury_veto_abstains_on_disagreement():
+    envs = [{"axes": {"safety": 0.0}}, {"axes": {"safety": 1.0}}]
+    score, meta = ej.jury_veto(0.9, envs)  # agreement 0 < alpha_min → abstain
+    assert score == 0.9  # execution reward stands; untrusted veto NOT applied
+    assert meta["jury"] == "abstain_low_agreement"
+
+
+def test_jury_veto_single_and_empty_degenerate():
+    s1, m1 = ej.jury_veto(1.0, [{"axes": {"safety": 0.5}}])
+    assert s1 == pytest.approx(0.5)
+    assert m1["jury"] == "single"
+    s0, m0 = ej.jury_veto(0.7, [])
+    assert s0 == 0.7  # empty panel → no veto (judge-unavailable fail-open)
+    assert m0["jury"] == "empty"
+
+
+def test_eval_node_jury_applies_consensus_veto(tmp_path, monkeypatch):
+    db = _migrated_db(tmp_path / "home")
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    _write_verifier(run_dir, "test", {"pass": True})  # execution reward 1.0
+    monkeypatch.setenv("MO_EVAL_JURY_LANES", "opus,kimi")
+
+    def dispatch(tc, lane, prompt):
+        return 0, '{"axes": {"safety": 0.5, "groundedness": 1.0}, "verdict": "pass"}'
+
+    from mini_ork.cli.execute import _handle_eval
+    ctx = _make_ctx(run_dir, db, dispatch_fn=dispatch)
+    rc, fr = _handle_eval(ctx)
+
+    assert (rc, fr) == (0, "done")
+    saved = json.loads((run_dir / "eval.json").read_text())
+    assert saved["reward_source"] == "eval-exec@v1"
+    assert saved["execution"]["jury"]["jury"] == "applied"
+    assert saved["execution"]["jury"]["n"] == 2
+    assert saved["score"] == pytest.approx(0.5)  # 1.0 vetoed by consensus safety 0.5
+
+
+def test_eval_node_jury_abstains_when_panel_disagrees(tmp_path, monkeypatch):
+    db = _migrated_db(tmp_path / "home")
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    _write_verifier(run_dir, "test", {"pass": True})  # execution reward 1.0
+    monkeypatch.setenv("MO_EVAL_JURY_LANES", "opus,kimi")
+
+    def dispatch(tc, lane, prompt):
+        if lane == "opus":
+            return 0, '{"axes": {"safety": 0.0, "groundedness": 0.0}, "verdict": "fail"}'
+        return 0, '{"axes": {"safety": 1.0, "groundedness": 1.0}, "verdict": "pass"}'
+
+    from mini_ork.cli.execute import _handle_eval
+    ctx = _make_ctx(run_dir, db, dispatch_fn=dispatch)
+    rc, fr = _handle_eval(ctx)
+
+    assert (rc, fr) == (0, "done")
+    saved = json.loads((run_dir / "eval.json").read_text())
+    assert saved["execution"]["jury"]["jury"] == "abstain_low_agreement"
+    # panel can't agree → no veto applied → execution reward stands
+    assert saved["score"] == 1.0
