@@ -7,15 +7,15 @@ from v0.1.
 
 **Major (X.0.0)** — backward-incompatible changes. After v1.0:
 - Removing or renaming a `bin/mini-ork-*` subcommand
-- Changing the signature of a `lib/*.sh` primitive function in a way that
-  breaks recipes
+- Changing a documented native Python extension point in a way that breaks
+  recipes or integrations
 - Removing or renaming a state.db table column without a migration that
   preserves the column under its old name
 - Changing the contract of an extension point (`schemas/*.schema.json`)
 
 **Minor (0.X.0)** — additive features that don't break v0.1+ recipes:
 - New `bin/` subcommand
-- New `lib/` primitive
+- New native Python primitive or extension point
 - New migration (always additive — never remove a column without major bump)
 - New recipe
 - New schema (existing schemas stay compatible)
@@ -38,23 +38,29 @@ the redesign trajectory. Each breaking change is called out in CHANGELOG.
    ### Added / Changed / Fixed / Removed / Deprecated / Security
    - one-line item
    ```
-3. **Update `bin/mini-ork version` string** if the version is bumped.
-4. **Tag** locally:
+3. **Update version surfaces**: `pyproject.toml`, the regex-readable version
+   literal in `bin/mini-ork`, and `mini-ork version`. Keep the CLI contract
+   tests aligned with the package metadata.
+4. **Verify the release commit**:
+   ```bash
+   make lint
+   make test
+   bin/mini-ork validate
+   bin/mini-ork garden
+   ```
+5. **Merge and push the verified release commit** using the worktree gate.
+6. **Tag the pushed `main` commit** locally:
    ```bash
    git tag -a vX.Y.Z -m "vX.Y.Z — <one-line title>"
    ```
-5. **Verify**:
+7. **Push the tag**:
    ```bash
-   bash tests/smoke.sh
-   bash -n $(find bin lib hooks tests -type f -name "*.sh")
+   git push origin vX.Y.Z
    ```
-6. **Push tag**:
-   ```bash
-   git push origin main vX.Y.Z
-   ```
-7. **GitHub release**: CI auto-creates a draft release on tag push (see
-   `.github/workflows/release.yml`). Edit the draft to match the CHANGELOG
-   entry, then publish.
+8. **GitHub release**: the tag workflow runs blocking Ruff and unit pytest,
+   builds the Python and UI artifacts, then publishes the GitHub release with
+   generated notes (see `.github/workflows/release.yml`). Confirm the workflow
+   and release assets before announcing it.
 
 ## Backward-compatibility commitments
 
