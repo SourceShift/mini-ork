@@ -94,6 +94,7 @@
             "implementer",
             "reviewer",
             "verifier",
+            "eval",
             "reflector",
             "publisher",
             "rollback"

@@ -2588,12 +2588,167 @@ def _handle_rollback(ctx: NodeDispatch):
     return 0, "done"
 
 
+def _read_run_trajectory(db: str, run_id: str, run_dir: str):
+    """Best-effort: this run's execution_traces rows + any verifier_*.json
+    verdicts in the run dir, for the judge's trajectory view. Fail-open — any
+    error yields empties so eval never sinks a run over a missing/locked db."""
+    traces: list[dict] = []
+    if db and run_id and os.path.isfile(db):
+        try:
+            con = sqlite3.connect(db, timeout=5.0)
+            con.execute("PRAGMA busy_timeout=5000")
+            con.row_factory = sqlite3.Row
+            try:
+                rows = con.execute(
+                    "SELECT status, reviewer_verdict, reward_source, reward_value, "
+                    "final_artifact_ref FROM execution_traces WHERE run_id=? "
+                    "ORDER BY created_at", (run_id,)).fetchall()
+                traces = [dict(r) for r in rows]
+            finally:
+                con.close()
+        except Exception:
+            traces = []
+    verifier_verdicts: dict[str, str] = {}
+    if run_dir and os.path.isdir(run_dir):
+        try:
+            for fn in sorted(os.listdir(run_dir)):
+                if fn.startswith("verifier_") and fn.endswith(".json"):
+                    name = fn[len("verifier_"):-len(".json")]
+                    try:
+                        with open(os.path.join(run_dir, fn), encoding="utf-8") as fh:
+                            verifier_verdicts[name] = fh.read().strip()[:200]
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+    return traces, verifier_verdicts
+
+
+def _eval_artifact_text(ctx: NodeDispatch) -> tuple[str, str]:
+    """Read the run's first declared final artifact (best-effort). Returns
+    (text, repo-relative-or-abs ref)."""
+    ref = ""
+    try:
+        ac = (json.load(open(ctx.plan_path)).get("artifact_contract") or {}) if ctx.plan_path else {}
+        outs = ac.get("outputs") or [] if isinstance(ac, dict) else []
+        ref = outs[0] if outs else ""
+    except Exception:
+        ref = ""
+    text = ""
+    if ref and os.path.isfile(ref):
+        try:
+            with open(ref, encoding="utf-8", errors="replace") as fh:
+                text = fh.read()
+        except OSError:
+            text = ""
+    return text, ref
+
+
+def _stamp_run_eval_reward(db, run_id, score, axes, source) -> None:
+    """Phase-1 rail (gated by MO_EVAL_STAMP_RUN): stamp the graded eval reward
+    across every delivery trace of this run so the GRPO router learns from the
+    judge instead of process_reward — mirrors trace_store.grade_run_reward for
+    the rubric. Excludes the dedicated eval row (reward_source=source) so it is
+    not overwritten. Best-effort."""
+    if not (db and run_id and os.path.isfile(db)):
+        return
+    from mini_ork.learning import eval_judge as ej  # noqa: PLC0415
+    s = ej.clamp01(score)
+    reward_g = (s - ej.EVAL_ANCHOR) / abs(ej.EVAL_ANCHOR)
+    vec = json.dumps({a: ej.clamp01(v) for a, v in axes.items()}) if axes else None
+    con = sqlite3.connect(db, timeout=5.0)
+    con.execute("PRAGMA busy_timeout=5000")
+    try:
+        con.execute(
+            "UPDATE execution_traces SET reward_value=?, reward_anchor=?, reward_g=?, "
+            "reward_direction='higher_is_better', reward_primary_metric=?, "
+            "reward_source=?, reward_vector_json=COALESCE(?, reward_vector_json) "
+            "WHERE run_id=? AND reward_source != ?",
+            (s, ej.EVAL_ANCHOR, reward_g, ej.EVAL_PRIMARY_METRIC, source, vec,
+             run_id, source))
+        con.commit()
+    finally:
+        con.close()
+
+
+def _handle_eval(ctx: NodeDispatch):
+    """Advisory per-run graded eval (roadmap Step-3). Dispatches a
+    trajectory-aware LLM judge, aggregates its per-axis sub-scores, and persists
+    the result to execution_traces under reward_source='eval@v1'. It NEVER gates:
+    any dispatch/parse failure falls open to the rubric/PRM heuristic and the
+    node still returns success. Logic lives in mini_ork/learning/eval_judge.py."""
+    from mini_ork import trace_store  # noqa: PLC0415
+    from mini_ork.learning import eval_judge as ej  # noqa: PLC0415
+
+    run_dir = ctx.run_dir_eff or ctx.run_dir
+    recipe_prompt = (open(ctx.prompt_file, encoding="utf-8").read()
+                     if ctx.prompt_file and os.path.isfile(ctx.prompt_file) else "")
+    artifact_text, artifact_ref = _eval_artifact_text(ctx)
+    traces, verifier_verdicts = _read_run_trajectory(ctx.db, ctx.run_id, run_dir)
+    trajectory_summary = ej.trajectory_digest(traces, verifier_verdicts)
+
+    prompt = ej.build_eval_prompt(
+        node_desc=ctx.node_desc,
+        plan_content=ej.truncate(ctx.plan_content, 4000),
+        artifact_text=ej.truncate(artifact_text),
+        trajectory_summary=ej.truncate(trajectory_summary, 4000),
+        recipe_prompt=recipe_prompt,
+    )
+
+    rc, result = ctx.dispatch(prompt)
+    envelope = ej.parse_eval_envelope(result) if rc == 0 and result else None
+
+    if envelope is not None:
+        axes = envelope.get("axes") or {}
+        score = ej.aggregate_axes(axes, envelope.get("score"))
+        verdict = envelope.get("verdict") or ej.verdict_from_score(score)
+        source = ej.EVAL_SOURCE
+        rationale = envelope.get("rationale", "")
+        findings = envelope.get("trajectory_findings", [])
+    else:
+        score, source = ej.fallback_score(run_dir)
+        axes, verdict = {}, ej.verdict_from_score(score)
+        rationale = "judge unavailable — fell back to rubric/PRM heuristic"
+        findings = []
+        print(f"  [eval] judge unavailable (rc={rc}) → fallback {source} "
+              f"score={score:.2f}", file=sys.stderr)
+
+    # Persist the envelope for offline graders + the data flywheel.
+    try:
+        with open(os.path.join(run_dir, "eval.json"), "w", encoding="utf-8") as fh:
+            json.dump({"score": score, "axes": axes, "verdict": verdict,
+                       "rationale": rationale, "trajectory_findings": findings,
+                       "reward_source": source}, fh, indent=2)
+    except OSError:
+        pass
+
+    # Write the graded reward onto the wired-but-empty 0042 reward columns.
+    try:
+        payload = ej.eval_reward_payload(
+            ctx.task_class, ctx.run_id, score, axes, verdict,
+            source=source, artifact_ref=artifact_ref)
+        trace_store.trace_write(payload, db=ctx.db)
+    except Exception as exc:  # noqa: BLE001 — advisory; never sink the run
+        print(f"  [eval] reward write skipped: {exc}", file=sys.stderr)
+
+    if os.environ.get("MO_EVAL_STAMP_RUN", "0") == "1":
+        try:
+            _stamp_run_eval_reward(ctx.db, ctx.run_id, score, axes, source)
+        except Exception:
+            pass
+
+    print(f"  [eval] {source} score={score:.2f} verdict={verdict} axes={axes}")
+    ctx.charge()
+    return 0, "done"
+
+
 NODE_HANDLER_REGISTRY: dict[str, Callable[[NodeDispatch], tuple[int, str]]] = {
     "researcher": _handle_researcher,
     "transform": _handle_transform,
     "implementer": _handle_implementer,
     "reviewer": _handle_reviewer,
     "verifier": _handle_verifier,
+    "eval": _handle_eval,
     "publisher": _handle_publisher,
     "rollback": _handle_rollback,
 }
