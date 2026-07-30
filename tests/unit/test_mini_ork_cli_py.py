@@ -10,6 +10,7 @@ import json
 import os
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -18,6 +19,11 @@ sys.path.insert(0, str(REPO))
 from mini_ork.cli import main as cli
 
 BIN = REPO / "bin" / "mini-ork"
+VERSION = tomllib.loads((REPO / "pyproject.toml").read_text(encoding="utf-8"))["project"]["version"]
+
+
+def _version_output() -> str:
+    return f"mini-ork {VERSION} (universal task loop runtime)\n"
 
 
 def _launcher(*args: str, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
@@ -47,7 +53,7 @@ def test_launcher_is_executable_python_only_and_symlink_safe(tmp_path):
     link.symlink_to(BIN)
     run = subprocess.run([str(link), "version"], capture_output=True, text=True, check=False)
     assert run.returncode == 0
-    assert run.stdout == "mini-ork 0.6.0 (universal task loop runtime)\n"
+    assert run.stdout == _version_output()
 
     project = tmp_path / "project"
     home = project / ".mini-ork"
@@ -72,7 +78,7 @@ def test_version_help_and_unknown_golden_contract():
     version = _launcher("version")
     assert (version.returncode, version.stdout, version.stderr) == (
         0,
-        "mini-ork 0.6.0 (universal task loop runtime)\n",
+        _version_output(),
         "",
     )
 

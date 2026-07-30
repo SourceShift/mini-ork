@@ -8,8 +8,8 @@ import sys
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
 
-# Keep a regex-readable version literal for lib/migrate.sh's installed-version
-# discovery contract: mini-ork 0.6.0.
+# Keep a regex-readable version literal for the native migration runner's
+# installed-version discovery contract: mini-ork 0.7.0.
 
 
 def _absolute(path: str | Path) -> Path:
