@@ -236,37 +236,84 @@ def _eval_rows(db: str, run_id: str) -> list[dict]:
     return [dict(r) for r in rows]
 
 
-def test_eval_node_writes_judged_reward(tmp_path):
+def _write_verifier(run_dir, name, obj):
+    (run_dir / f"verifier_{name}.json").write_text(json.dumps(obj))
+
+
+_ALL_PASS_JUDGE = ('{"axes": {"correctness": 1.0, "completeness": 1.0, '
+                   '"groundedness": 1.0, "safety": 1.0}, "verdict": "pass", '
+                   '"rationale": "clean", "trajectory_findings": []}')
+
+
+def test_eval_node_execution_is_the_backbone(tmp_path):
+    """With verifiers present, the reward comes from EXECUTION (eval-exec@v1),
+    and the judge can only veto — here safety=0.5 halves a perfect exec reward."""
     db = _migrated_db(tmp_path / "home")
     run_dir = tmp_path / "run"
     run_dir.mkdir()
-    envelope = ('{"axes": {"correctness": 1.0, "completeness": 1.0, '
-                '"groundedness": 1.0, "safety": 1.0}, "verdict": "pass", '
-                '"rationale": "clean", "trajectory_findings": []}')
+    _write_verifier(run_dir, "test", {"pass": True})
+    _write_verifier(run_dir, "typecheck", {"pass": True})
+    judge = ('{"axes": {"correctness": 1.0, "completeness": 1.0, '
+             '"groundedness": 1.0, "safety": 0.5}, "verdict": "pass"}')
     from mini_ork.cli.execute import _handle_eval
-    ctx = _make_ctx(run_dir, db, dispatch_fn=lambda tc, lane, prompt: (0, envelope))
+    ctx = _make_ctx(run_dir, db, dispatch_fn=lambda tc, lane, prompt: (0, judge))
     rc, fr = _handle_eval(ctx)
 
-    assert (rc, fr) == (0, "done")  # advisory: always succeeds
+    assert (rc, fr) == (0, "done")
     saved = json.loads((run_dir / "eval.json").read_text())
-    assert saved["score"] == 1.0
-    assert saved["reward_source"] == "eval@v1"
+    assert saved["reward_source"] == "eval-exec@v1"
+    assert saved["execution"]["r_exec"] == 1.0
+    assert saved["score"] == pytest.approx(0.5)  # exec 1.0 vetoed by safety 0.5
 
     rows = _eval_rows(db, "run-eval-1")
-    assert len(rows) == 1
-    assert rows[0]["reward_source"] == "eval@v1"
-    assert rows[0]["reward_value"] == 1.0
-    assert rows[0]["reward_g"] == pytest.approx(1.0)
-    assert rows[0]["reward_primary_metric"] == "eval_score"
-    assert json.loads(rows[0]["reward_vector_json"])["correctness"] == 1.0
+    assert rows[0]["reward_source"] == "eval-exec@v1"
+    assert rows[0]["reward_value"] == pytest.approx(0.5)
+    assert json.loads(rows[0]["reward_vector_json"])["r_exec"] == 1.0
 
 
-def test_eval_node_fails_open_when_judge_errors(tmp_path):
+def test_eval_node_execution_failure_scores_low(tmp_path):
+    """A failing verifier drives the reward down via execution, not the judge."""
+    db = _migrated_db(tmp_path / "home")
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    _write_verifier(run_dir, "test", {"pass": False})
+    _write_verifier(run_dir, "typecheck", {"pass": True})
+    from mini_ork.cli.execute import _handle_eval
+    ctx = _make_ctx(run_dir, db, dispatch_fn=lambda tc, lane, prompt: (0, _ALL_PASS_JUDGE))
+    rc, fr = _handle_eval(ctx)
+
+    assert (rc, fr) == (0, "done")
+    saved = json.loads((run_dir / "eval.json").read_text())
+    assert saved["reward_source"] == "eval-exec@v1"
+    assert saved["execution"]["r_exec"] == 0.5  # 1 of 2 verifiers passed
+    # noise_correct(0.5, .05, .10) = (0.5-0.05)/0.85 ≈ 0.529, judge safety=1 → no veto
+    assert saved["score"] == pytest.approx(0.45 / 0.85)
+
+
+def test_eval_node_judge_only_when_no_execution_signal(tmp_path):
+    """No verifiers → judge-only reward, tagged eval-judge@v1 (lower trust)."""
     db = _migrated_db(tmp_path / "home")
     run_dir = tmp_path / "run"
     run_dir.mkdir()
     from mini_ork.cli.execute import _handle_eval
-    # judge dispatch fails (rc!=0) → fallback to neutral heuristic, run not sunk
+    ctx = _make_ctx(run_dir, db, dispatch_fn=lambda tc, lane, prompt: (0, _ALL_PASS_JUDGE))
+    rc, fr = _handle_eval(ctx)
+
+    assert (rc, fr) == (0, "done")
+    saved = json.loads((run_dir / "eval.json").read_text())
+    assert saved["reward_source"] == "eval-judge@v1"
+    assert saved["score"] == 1.0
+    assert saved["execution"]["r_exec"] is None
+    rows = _eval_rows(db, "run-eval-1")
+    assert rows[0]["reward_source"] == "eval-judge@v1"
+
+
+def test_eval_node_fails_open_when_judge_errors_and_no_execution(tmp_path):
+    db = _migrated_db(tmp_path / "home")
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    from mini_ork.cli.execute import _handle_eval
+    # judge fails AND no verifiers → neutral heuristic, run not sunk
     ctx = _make_ctx(run_dir, db, dispatch_fn=lambda tc, lane, prompt: (1, "boom"))
     rc, fr = _handle_eval(ctx)
 
@@ -275,7 +322,34 @@ def test_eval_node_fails_open_when_judge_errors(tmp_path):
     assert saved["reward_source"] == "eval@v1-fallback-neutral"
     assert saved["score"] == 0.5
 
-    rows = _eval_rows(db, "run-eval-1")
-    assert len(rows) == 1
-    assert rows[0]["reward_source"] == "eval@v1-fallback-neutral"
-    assert rows[0]["reward_value"] == 0.5
+
+# ── Layer 0/1/3 pure functions ───────────────────────────────────────────────
+def test_execution_reward_pass_fraction():
+    assert ej.execution_reward({"a": {"pass": True}, "b": {"pass": True}})[0] == 1.0
+    assert ej.execution_reward({"a": {"pass": False}, "b": {"pass": True}})[0] == 0.5
+    assert ej.execution_reward({"a": {"verdict": "pass"}, "b": {"verdict": "fail"}})[0] == 0.5
+
+
+def test_execution_reward_none_when_no_signal():
+    assert ej.execution_reward({})[0] is None
+    assert ej.execution_reward({"a": {"verdict": "vacuous"}})[0] is None  # not a real pass
+    assert ej.execution_reward({"a": {"raw": "junk"}})[0] is None
+
+
+def test_noise_correct_backward_formula():
+    # (R - ρ_FP) / (1 - ρ_FP - ρ_FN)
+    assert ej.noise_correct(0.5, 0.1, 0.2) == pytest.approx((0.5 - 0.1) / 0.7)
+    assert ej.noise_correct(0.5, 0.0, 0.0) == 0.5
+    assert ej.noise_correct(1.0, 0.05, 0.10) == 1.0  # (0.95/0.85) clamps to 1.0
+
+
+def test_noise_correct_guards_overestimated_rates():
+    # 1 - 0.6 - 0.6 < 0 → skip correction, return raw (paper's failure edge)
+    assert ej.noise_correct(0.5, 0.6, 0.6) == 0.5
+
+
+def test_judge_veto_is_one_way():
+    assert ej.judge_veto(1.0, {"safety": 0.5}) == pytest.approx(0.5)
+    assert ej.judge_veto(1.0, {"safety": 0.8, "groundedness": 0.4}) == pytest.approx(0.4)
+    assert ej.judge_veto(0.8, {}) == 0.8  # no veto axes → unchanged
+    assert ej.judge_veto(1.0, {"correctness": 0.2}) == 1.0  # correctness is not a veto axis
