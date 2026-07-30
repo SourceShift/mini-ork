@@ -615,17 +615,32 @@ def main(argv=None, *, root=None, dispatch=None) -> int:
     # ── get raw plan: MO_GIVEN_PLAN | force-recipe-fallback | LLM dispatch ──
     recipe = os.environ.get("MINI_ORK_RECIPE", "")
     given = os.environ.get("MO_GIVEN_PLAN", "")
-    if os.environ.get("MO_FORCE_RECIPE_FALLBACK_PLAN", "0") == "1" and task_class == "doc_to_features_loop":
+    # Static-recipe-plan skip. A forced recipe whose workflow.yaml is the fixed
+    # dispatch DAG gives the planner LLM nothing to decide — recipe_fallback_plan
+    # renders the identical plan (nodes + edges + artifact contract) from
+    # workflow.yaml with zero LLM. Two opt-ins, kept distinct so callers don't
+    # collide: MO_FORCE_RECIPE_FALLBACK_PLAN keeps its historical
+    # doc_to_features_loop scope (and its always-write semantics); the general
+    # MO_STATIC_RECIPE_PLAN honours ANY forced recipe but zero-fallbacks to the
+    # LLM path if the workflow can't be rendered (fb is empty) rather than
+    # emitting a blank plan.
+    _force_doc_features = (
+        os.environ.get("MO_FORCE_RECIPE_FALLBACK_PLAN", "0") == "1"
+        and task_class == "doc_to_features_loop"
+    )
+    _static_recipe = os.environ.get("MO_STATIC_RECIPE_PLAN", "0") == "1"
+    if _force_doc_features or _static_recipe:
         fb = recipe_fallback_plan(recipe or "generic",
                                   workflow or os.path.join(root, "recipes", recipe or "generic", "workflow.yaml"),
                                   root, kickoff)
-        os.makedirs(os.path.dirname(out_file), exist_ok=True)
-        open(out_file, "w").write((fb or "") + "\n" if fb else "")
-        print(f"plan_path={out_file}")
-        print(f"task_class={task_class}")
-        _trace_plan(trace_id, task_class, "success", db,
-                    final_artifact_ref=out_file, reviewer_verdict="recipe_fallback")
-        return 0
+        if fb or _force_doc_features:
+            os.makedirs(os.path.dirname(out_file), exist_ok=True)
+            open(out_file, "w").write((fb or "") + "\n" if fb else "")
+            print(f"plan_path={out_file}")
+            print(f"task_class={task_class}")
+            _trace_plan(trace_id, task_class, "success", db,
+                        final_artifact_ref=out_file, reviewer_verdict="recipe_fallback")
+            return 0
     if given:
         if not os.access(given, os.R_OK):
             sys.stderr.write(f"MO_GIVEN_PLAN is set but not readable: {given}\n")
