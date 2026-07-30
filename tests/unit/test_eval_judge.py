@@ -438,3 +438,31 @@ def test_eval_node_jury_abstains_when_panel_disagrees(tmp_path, monkeypatch):
     assert saved["execution"]["jury"]["jury"] == "abstain_low_agreement"
     # panel can't agree → no veto applied → execution reward stands
     assert saved["score"] == 1.0
+
+
+def test_eval_node_jury_escalates_hung_panel_to_tiebreaker(tmp_path, monkeypatch):
+    db = _migrated_db(tmp_path / "home")
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    _write_verifier(run_dir, "test", {"pass": True})  # execution reward 1.0
+    monkeypatch.setenv("MO_EVAL_JURY_LANES", "opus,kimi")
+    monkeypatch.setenv("MO_EVAL_JURY_ESCALATE_LANE", "strong")
+
+    def dispatch(tc, lane, prompt):
+        if lane == "opus":
+            return 0, '{"axes": {"safety": 0.0}, "verdict": "fail"}'
+        if lane == "kimi":
+            return 0, '{"axes": {"safety": 1.0}, "verdict": "pass"}'
+        # the strong tiebreaker breaks the hung jury
+        return 0, '{"axes": {"safety": 0.3, "groundedness": 1.0}, "verdict": "needs_revision"}'
+
+    from mini_ork.cli.execute import _handle_eval
+    ctx = _make_ctx(run_dir, db, dispatch_fn=dispatch)
+    rc, fr = _handle_eval(ctx)
+
+    assert (rc, fr) == (0, "done")
+    saved = json.loads((run_dir / "eval.json").read_text())
+    jury = saved["execution"]["jury"]
+    assert jury["jury"] == "escalated"           # hung jury → tiebreaker decided
+    assert jury["tiebreaker_lane"] == "strong"
+    assert saved["score"] == pytest.approx(0.3)  # tiebreaker's safety veto applied
