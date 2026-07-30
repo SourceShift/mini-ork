@@ -215,6 +215,55 @@ def _is_pair(x: Any) -> bool:
     return isinstance(x, (tuple, list)) and len(x) == 2
 
 
+def negation_invariance() -> MetamorphicRelation:
+    """f(-x) == f(x) — for even / magnitude functions (abs, x², distance).
+    Applies only where expected; supply it via the relation set."""
+    return MetamorphicRelation(
+        "negation_invariance",
+        lambda x: -x if isinstance(x, (int, float)) and not isinstance(x, bool) else x,
+        lambda a, b: a == b, "f(-x) == f(x)")
+
+
+def order_invariance() -> MetamorphicRelation:
+    """f(reversed(seq)) == f(seq) — for order-independent aggregates (sum, max,
+    membership). Applies only where expected."""
+    return MetamorphicRelation(
+        "order_invariance",
+        lambda x: type(x)(reversed(x)) if isinstance(x, (list, tuple)) else x,
+        lambda a, b: a == b, "f(reversed(x)) == f(x)")
+
+
 UNIVERSAL_RELATIONS: tuple[MetamorphicRelation, ...] = (determinism(),)
 """Relations that hold for ANY correct pure function and need no task spec.
 Immutability is enforced separately via ``check(..., check_immutability=True)``."""
+
+
+# ── Vetted relation library — the safety boundary for auto-proposal ──────────
+# An LLM proposer may only SELECT relations from this whitelist by NAME (data),
+# never author executable predicates. resolve_relations drops unknown names, so
+# no model-supplied code ever runs — only these audited, deterministic relations.
+RELATION_LIBRARY: dict = {
+    "determinism": determinism,
+    "commutativity": commutativity,
+    "negation_invariance": negation_invariance,
+    "order_invariance": order_invariance,
+}
+
+
+def resolve_relations(names) -> list:
+    """Map relation NAMES to MetamorphicRelation objects from the vetted library.
+    Unknown names are silently dropped — this is the boundary that keeps
+    LLM-proposed relations to a safe whitelist (no arbitrary code)."""
+    out = []
+    for n in names or []:
+        factory = RELATION_LIBRARY.get(n)
+        if factory is not None:
+            out.append(factory())
+    return out
+
+
+def library_catalog() -> list:
+    """[{name, description}] for every library relation — fed to the proposer
+    prompt so the LLM knows what it may select."""
+    return [{"name": name, "description": factory().description}
+            for name, factory in RELATION_LIBRARY.items()]
