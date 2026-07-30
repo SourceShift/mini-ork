@@ -36,20 +36,47 @@ def _load_spec(path: str):
     return mod
 
 
-def main() -> int:
-    spec_path = os.environ.get("MO_METAMORPHIC_SPEC", "").strip()
-    if not spec_path or not os.path.isfile(spec_path):
-        print(json.dumps({"verdict": "vacuous", "note": "no metamorphic spec"}))
-        return 0
+def _load_json_spec(path: str):
+    """Safe data-driven spec (from the auto-proposer): relations are resolved by
+    NAME from the vetted library — no LLM-authored code is executed. The target
+    function is imported from the run's own (patched) module."""
+    import importlib
+    from mini_ork.learning import metamorphic as mm
+    with open(path, encoding="utf-8") as fh:
+        spec = json.load(fh)
+    tgt = spec["target"]
+    mod_ref, fn_name = tgt["module"], tgt["function"]
+    if os.path.isfile(mod_ref):
+        loaded = _load_spec(mod_ref)          # a file path → the patched module
+    else:
+        loaded = importlib.import_module(mod_ref)
+    target = getattr(loaded, fn_name)
+    relations = mm.resolve_relations(spec.get("relations", []))  # whitelist only
+    return target, list(spec.get("seed_inputs", [])), relations
 
-    try:
-        from mini_ork.learning import metamorphic as mm
-        mod = _load_spec(spec_path)
-        target = mod.TARGET
-        seeds = list(mod.SEED_INPUTS)
-        relations = list(getattr(mod, "RELATIONS", []))
-    except Exception as exc:  # noqa: BLE001 — a broken spec must not crash the run
-        print(json.dumps({"verdict": "vacuous", "note": f"spec load failed: {exc}"}))
+
+def main() -> int:
+    from mini_ork.learning import metamorphic as mm
+    json_spec = os.environ.get("MO_METAMORPHIC_SPEC_JSON", "").strip()
+    spec_path = os.environ.get("MO_METAMORPHIC_SPEC", "").strip()
+
+    if json_spec and os.path.isfile(json_spec):
+        try:
+            target, seeds, relations = _load_json_spec(json_spec)
+        except Exception as exc:  # noqa: BLE001 — a broken spec must not crash the run
+            print(json.dumps({"verdict": "vacuous", "note": f"json spec load failed: {exc}"}))
+            return 0
+    elif spec_path and os.path.isfile(spec_path):
+        try:
+            mod = _load_spec(spec_path)
+            target = mod.TARGET
+            seeds = list(mod.SEED_INPUTS)
+            relations = list(getattr(mod, "RELATIONS", []))
+        except Exception as exc:  # noqa: BLE001 — a broken spec must not crash the run
+            print(json.dumps({"verdict": "vacuous", "note": f"spec load failed: {exc}"}))
+            return 0
+    else:
+        print(json.dumps({"verdict": "vacuous", "note": "no metamorphic spec"}))
         return 0
 
     result = mm.check(target, seeds, relations)
