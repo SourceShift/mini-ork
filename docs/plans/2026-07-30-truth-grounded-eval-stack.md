@@ -63,7 +63,7 @@ conservative priors (`MO_EVAL_VERIFIER_FP_PRIOR` / `_FN_PRIOR`), logged as prior
 
 - **Phase 0 (shipped, `fe9ee3e2`)** — advisory judge node, per-axis + fail-open. Becomes Layer 3.
 - **Phase 1 (this change)** — Layers 0+1: execution-grounded reward as the backbone, backward noise correction, judge demoted to veto-only. `reward_source` splits into `eval-exec@v1` / `eval-judge@v1`.
-- **Phase 2** — metamorphic-relation verifier (gold-free amplification): a new `recipes/*/verifiers/metamorphic_*.py` + relation library. Catches coverage-gap cheats a single test misses.
+- **Phase 2 (engine shipped)** — metamorphic-relation verifier (gold-free amplification): `mini_ork/learning/metamorphic.py` (engine: relations + universal determinism/immutability checks; execution-grounded verdict via `to_verifier_json()` → feeds Layer 0 as one more `verifier_*.json`) + `recipes/code-fix/verifiers/metamorphic.py` (spec-driven via `MO_METAMORPHIC_SPEC`; a vacuous no-op without a spec). Proven to catch a coverage-gap cheat that a single extensional test passes. **Open — relation sourcing:** how per-task relations are produced. Shipped path = a declarative spec module. Follow-on = LLM-proposer (arXiv 2603.24774): the proposer emits `RELATIONS`, this same execution oracle certifies them, so proposer unreliability can't corrupt the verdict.
 - **Phase 3** — jury + selective escalation: route the veto/judgment through the coalition gate (decorrelated families) and only spend the strong judge on contested cases (exec-passes-but-signals-conflict), via the existing Cascaded-Selective-Evaluation rail.
 - **Phase 4** — online FN estimation ("appeals"): a cheap lane re-checks suspected false-negatives to estimate `ρ_FN` live and feed `verifier_results`.
 
