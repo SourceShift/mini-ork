@@ -2718,6 +2718,22 @@ def _stamp_run_eval_reward(db, run_id, score, axes, source) -> None:
         con.close()
 
 
+def _warn_if_jury_not_decorrelated(jury_lanes) -> None:
+    """Advisory (never blocks): a jury drawn from a single model family isn't
+    decorrelated, so its consensus is weak — correlated judges make the same
+    mistakes, which is exactly what a jury is meant to defeat. Reuses the
+    coalition gate's family map. Best-effort."""
+    try:
+        from mini_ork.gates.coalition_gate import family_of  # noqa: PLC0415
+        families = {family_of(lane) for lane in jury_lanes}
+        if len(families) < 2:
+            print(f"  [eval] jury lanes {jury_lanes} span only family "
+                  f"{sorted(families)} — not decorrelated; consensus is weak",
+                  file=sys.stderr)
+    except Exception:
+        pass
+
+
 def _handle_eval(ctx: NodeDispatch):
     """Advisory per-run graded eval (roadmap Step-3). Dispatches a
     trajectory-aware LLM judge, aggregates its per-axis sub-scores, and persists
@@ -2748,6 +2764,8 @@ def _handle_eval(ctx: NodeDispatch):
     # panel can't agree (jury_veto), so no one model owns the veto.
     jury_lanes = [x.strip() for x in
                   os.environ.get("MO_EVAL_JURY_LANES", "").split(",") if x.strip()]
+    if len(jury_lanes) >= 2:
+        _warn_if_jury_not_decorrelated(jury_lanes)
     envelopes = []
     rc = 1
     if jury_lanes:
@@ -2778,6 +2796,20 @@ def _handle_eval(ctx: NodeDispatch):
         # Layer 3 — the jury (or single judge) may only VETO by consensus, and
         # abstains when the panel disagrees. Empty panel → no veto (fail-open).
         score, jury_meta = ej.jury_veto(r_corr, envelopes)
+        # Selective escalation (2510.20369 — ask a strong judge when uncertain):
+        # a hung jury dispatches ONE strong tiebreaker lane whose veto decides,
+        # rather than silently abstaining. No escalate lane → abstain as before.
+        escalate_lane = os.environ.get("MO_EVAL_JURY_ESCALATE_LANE", "").strip()
+        if jury_meta.get("jury") == "abstain_low_agreement" and escalate_lane:
+            erc, eres = ctx.dispatch_fn(ctx.task_class, escalate_lane, prompt)
+            tie = ej.parse_eval_envelope(eres) if erc == 0 and eres else None
+            if tie is not None:
+                score = ej.judge_veto(r_corr, tie.get("axes") or {})
+                jury_meta = {**jury_meta, "jury": "escalated",
+                             "tiebreaker_lane": escalate_lane,
+                             "tiebreaker_axes": tie.get("axes") or {}}
+                print(f"  [eval] hung jury → escalated to {escalate_lane}",
+                      file=sys.stderr)
         source, verdict = ej.EXEC_SOURCE, ej.verdict_from_score(score)
         exec_meta = {"r_exec": r_exec, "r_corrected": r_corr,
                      "fp_rate": fp_rate, "fn_rate": fn_rate,
