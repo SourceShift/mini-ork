@@ -54,6 +54,7 @@ docs/business-plans/
 
 # Build artifacts
 dist/
+*.egg-info/
 design/
 
 # Temp + logs

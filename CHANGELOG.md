@@ -13,6 +13,42 @@ No unreleased changes yet.
 
 ---
 
+## [0.7.0] - 2026-07-30
+
+**Native Python runtime.** MiniOrk now runs its framework runtime entirely in
+Python while retaining the public `mini-ork` command surface and its
+verifier-first execution model.
+
+### Added
+
+- Native extension registries for node handlers, routing policies, gate
+  evaluators, provider kinds/transports, subcommands, and embedders.
+- Declarative provider lanes in `config/providers.yaml`, including a native
+  Codex transport with usage and cost sidecars.
+- Native ContextNest hook bridge, migration runner, gate evaluation, and
+  Python compatibility launchers for legacy `mini-ork-*` commands.
+
+### Changed
+
+- Provider, gate, migration, launcher, tracing, recovery, learning, and
+  orchestration ownership now resolves through the supported Python runtime.
+- The release process now verifies the current Ruff, pytest, validate, and
+  garden gates before tagging.
+
+### Removed
+
+- The internal Bash runtime: `lib/`, framework gate scripts, runtime selection,
+  Bash-only test/CI layers, and Bash provider wrappers.
+
+### Migration note
+
+- Custom integrations must no longer source internal `lib/*.sh` or
+  `gates/*.sh` files. Use the public `mini-ork` CLI, recipe contracts, or the
+  documented native Python extension points. Existing recipe verifier and
+  sandbox command boundaries continue to support shell commands where declared.
+
+---
+
 ## [0.6.0] - 2026-06-30
 
 **Live control plane, parallel-run safety, and the start of the Python

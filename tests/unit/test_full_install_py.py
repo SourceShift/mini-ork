@@ -13,6 +13,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
 BIN = REPO / "bin" / "mini-ork"
+VERSION = tomllib.loads((REPO / "pyproject.toml").read_text(encoding="utf-8"))["project"]["version"]
 
 
 def _installer_module():
@@ -130,7 +131,7 @@ def test_launcher_reexecs_the_configured_venv_for_normal_commands(tmp_path):
     run = subprocess.run([str(BIN), "version"], capture_output=True, text=True, env=environment, check=False)
 
     assert run.returncode == 0, run.stderr
-    assert run.stdout == "mini-ork 0.6.0 (universal task loop runtime)\n"
+    assert run.stdout == f"mini-ork {VERSION} (universal task loop runtime)\n"
     assert marker.read_text(encoding="utf-8") == str(python)
 
 
@@ -166,5 +167,5 @@ def test_launcher_reexecs_the_persisted_runtime_pointer(tmp_path):
     run = subprocess.run([str(launcher), "version"], capture_output=True, text=True, env=environment, check=False)
 
     assert run.returncode == 0, run.stderr
-    assert run.stdout == "mini-ork 0.6.0 (universal task loop runtime)\n"
+    assert run.stdout == f"mini-ork {VERSION} (universal task loop runtime)\n"
     assert marker.read_text(encoding="utf-8") == str(python)
