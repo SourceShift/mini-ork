@@ -636,7 +636,7 @@ def _doctor_handler(rest, root):
 
 def _version_handler(rest, root):
     del rest, root
-    print("mini-ork 0.6.0 (universal task loop runtime)")
+    print("mini-ork 0.7.0 (universal task loop runtime)")
     return 0
 
 
