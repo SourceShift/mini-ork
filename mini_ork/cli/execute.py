@@ -2244,6 +2244,11 @@ def _handle_implementer(ctx: NodeDispatch):
     # in mini-ork's own tree when cwd != target — the CWT-A corruption hazard
     # (bash _dispatch_node:2626-2642). Export so cl_codex.sh reads it.
     target = _resolve_target_cwd(ctx.run_dir_eff)
+    # P1b: opt-in shared-drive routing. No-op unless MO_SHARED_DRIVE_BACKEND is
+    # set, so the default host-tree cwd is unchanged; when set, every node in the
+    # run shares one virtual drive (lazy import keeps the seam side-effect-free).
+    from mini_ork.runtime.run_drive import resolve_run_drive_cwd
+    target = resolve_run_drive_cwd(target)
     apply_env_overrides({ENV_TARGET_CWD: target})
     print(f"  [cwd] codex target: {target}", file=sys.stderr)
 
