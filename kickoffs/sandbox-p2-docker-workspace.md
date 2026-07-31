@@ -165,9 +165,31 @@ produce the artifact?) belongs to the **behavioral-verify** epic
 ---
 
 ## Task ledger
-- [ ] **P1** DockerWorkspace backend + daemon-gated unit tests
-- [ ] **P2a** route agent tool-exec through Workspace (opt-in, `local` parity)
-- [ ] **P2b** provision run drive → mount into each container; 2-node E2E
-- [ ] **P2c** provider-transport (agent-scope) routing — behind `MO_SANDBOX_SCOPE=agent`
-- [ ] **P3** (separate epic) cloud Volume backends, behavioral-verify cross-link
-- Log each merge commit here as it lands.
+- [x] **P1** DockerWorkspace backend + daemon-gated unit tests — `mini_ork/runtime/backends/docker.py`,
+  `tests/unit/test_docker_workspace.py` (6 tests: registration/error paths + live
+  round-trip w/ bind-mount proof + timeout kill). Commit `3617703d`.
+- [x] **P2a** route agent tool-exec through Workspace (opt-in, `local` parity) —
+  `mini_ork/runtime/agent_workspace.py` (`resolve_agent_workspace`) +
+  `mini_ork/agent/minimal.py` (`MinimalAgent.workspace/exec_cwd`, `run_minimal`
+  lifecycle). Unset backend = byte-for-byte host path; `local` = LocalWorkspace
+  parity; unknown = loud ValueError.
+- [x] **P2b** provision run drive → mount into each container; 2-node E2E —
+  `tests/unit/test_sandbox_wiring.py::test_two_agents_distinct_containers_share_one_drive`
+  (two real containers, node B reads node A's `/workspace/from_a.txt`) +
+  runnable `scripts/demo_docker_shared_drive.py` (verified PASS live 2026-07-31:
+  distinct container ids, drive persists after teardown).
+- [ ] **P2c** provider-transport (agent-scope) routing — behind `MO_SANDBOX_SCOPE=agent`.
+  DEFERRED: needs a purpose-built agent image (coding-agent CLI + keys + egress
+  baked in). `sandbox_scope()` reads the flag today (defaults `tool`); wiring the
+  CLI transport (`dispatch/*`) into a container is the remaining work.
+- [ ] **P3** (separate epic) cloud Volume backends, behavioral-verify cross-link.
+- Merges: P1 `3617703d`; P2 (this batch) logged on merge.
+
+### Verified live (2026-07-31)
+- `scripts/demo_docker_shared_drive.py` → PASS: agent A (container 1) writes
+  `/workspace/shared.txt`, agent B (container 2, distinct id) reads it; drive
+  survives both teardowns (pet vs cattle).
+- colima caveat confirmed + handled: macOS `/var/folders` (TMPDIR) is NOT shared
+  into the VM; tests/demo probe for a bind-visible dir (fall back to `$HOME`).
+- Scope shipped: **tool**-exec routing only (`MO_SANDBOX_SCOPE=tool`, the default).
+  The whole coding-agent CLI in a container (`scope=agent`) is P2c.
