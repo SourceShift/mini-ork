@@ -1,0 +1,39 @@
+# Example observable descriptor for the `api_contract` behavioral verifier.
+#
+# Copy this, fill it in for your endpoint, and point the verifier at it:
+#   export MO_OBSERVABLE_SPEC=verifiers/my_api.observable.yaml
+# or set the equivalent MO_BEHAV_* env vars directly.
+#
+# The verifier hits the staging endpoint LIVE and returns an execution-anchored
+# verdict: PROVEN (all checks held), REFUTED (a check failed against a reachable
+# surface), or UNVERIFIED (surface unreachable / a relation we cannot evaluate).
+
+surface: api
+staging_url: ${MO_STAGING_URL}     # base URL of the staging deployment
+target: /api/v1/health             # path appended to staging_url
+method: GET
+
+# The declared acceptance list. Declaring it up front is what makes the check
+# complete — an incomplete checklist is the dominant failure mode in agentic
+# verification (WebTestBench 2603.25226).
+checklist:
+  - health endpoint returns 200 on staging
+  - response body is a JSON object carrying a "status" key
+
+expect_status: [200]
+
+# Minimal shape check (P0): top-level type + required keys.
+expect_json_schema:
+  type: object
+  required: [status]
+
+# Gold-free oracle: relations that must hold under input transformation. A single
+# request/response is enough to anchor idempotency (RESTOR 2607.23963).
+metamorphic:
+  - idempotent_repeat
+
+# Hard ceiling so a runaway agent cannot burn unbounded budget (naive
+# computer-use verification = 2.6-7.4M tokens/instance, WebTestBench).
+budget:
+  max_tokens: 200000
+  max_turns: 12
