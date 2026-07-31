@@ -72,7 +72,14 @@ def test_refuted_on_missing_required_key():
 
 def test_refuted_when_idempotent_repeat_diverges():
     obs = _api(metamorphic=["idempotent_repeat"])
-    reqr = FakeRequester(_ok(body={"status": "ok"}), _ok(body={"status": "changed"}))
+    # P2 amplification runs N=3 probes; queue a 3rd result that bounces back to
+    # the canonical body so the 3 amplify probes see {changed, ok, ok} — still
+    # divergent, so the verdict is REFUTED.
+    reqr = FakeRequester(
+        _ok(body={"status": "ok"}),
+        _ok(body={"status": "changed"}),
+        _ok(body={"status": "ok"}),
+    )
     v = run_api_check(obs, requester=reqr)
     assert v.status == REFUTED
 

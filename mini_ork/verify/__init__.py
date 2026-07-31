@@ -26,6 +26,7 @@ from mini_ork.verify.behavioral import (
     register_surface_handler,
     run,
     run_api_check,
+    run_journey_check,
     run_ui_check,
 )
 
@@ -47,5 +48,6 @@ __all__ = [
     "register_surface_handler",
     "run",
     "run_api_check",
+    "run_journey_check",
     "run_ui_check",
 ]

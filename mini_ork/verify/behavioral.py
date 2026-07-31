@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -60,6 +61,7 @@ __all__ = [
     "run",
     "run_api_check",
     "run_ui_check",
+    "run_journey_check",
     "observable_from_env",
     "main",
     "register_surface_handler",
@@ -123,6 +125,19 @@ class Check:
 
 
 @dataclass
+class _SchemaCheck:
+    """Result of :func:`_validate_json_schema` (lazy-import guarded).
+
+    Returned shape stays uniform whether the validator runs on real JSON Schema
+    (jsonschema installed) or falls back to the stdlib-only ``type``+``required``
+    probe — callers only ever see ``ok`` + ``reason``.
+    """
+
+    ok: bool
+    reason: str = ""
+
+
+@dataclass
 class Observable:
     """Parsed ``observable`` block from a behavioral verifier_contract."""
 
@@ -140,6 +155,9 @@ class Observable:
     expect_visible: list[str] = field(default_factory=list)
     expect_url: list[str] = field(default_factory=list)
     waits: list[str] = field(default_factory=list)
+    filter: str = ""
+    steps: list["Observable"] = field(default_factory=list)
+    extract: dict = field(default_factory=dict)
 
     @classmethod
     def from_mapping(cls, data: Any) -> "Observable":
@@ -181,6 +199,18 @@ class Observable:
             if isinstance(expect_url_raw, str)
             else [str(value) for value in expect_url_raw]
         )
+        filter_value = str(data.get("filter") or "")
+        extract_raw = data.get("extract") or {}
+        if not isinstance(extract_raw, dict):
+            raise ObservableError("observable.extract must be a mapping")
+        extract = {
+            "name": str(extract_raw.get("name") or ""),
+            "path": str(extract_raw.get("path") or ""),
+        }
+        steps_raw = data.get("steps") or []
+        if not isinstance(steps_raw, list):
+            raise ObservableError("observable.steps must be a list")
+        steps = [cls.from_mapping(item) for item in steps_raw]
         return cls(
             surface=surface,
             target=target,
@@ -196,6 +226,9 @@ class Observable:
             expect_visible=[str(value) for value in (data.get("expect_visible") or [])],
             expect_url=expect_url,
             waits=[str(value) for value in (data.get("waits") or [])],
+            filter=filter_value,
+            steps=steps,
+            extract=extract,
         )
 
 
@@ -288,12 +321,163 @@ def _shape_ok(body: Any, schema: dict) -> tuple[bool, str]:
     return True, ""
 
 
-def _eval_metamorphic(relation: str, primary: HttpResult, secondary: HttpResult) -> Check:
-    """Evaluate one metamorphic relation from two exchanges of the surface.
+def _validate_json_schema(body: Any, schema: dict) -> _SchemaCheck:
+    """Validate ``body`` against a JSON Schema (Draft 2020-12).
 
-    Relations that P0 cannot yet evaluate (they need an input transformation we
-    do not synthesize here) return ``ok=None`` so the overall verdict abstains
-    rather than falsely passing.
+    Tries to use :mod:`jsonschema` if it is importable (full Draft 2020-12
+    coverage — ``$defs``, ``oneOf``, ``format``, etc.). The import is
+    **lazy and per-call**: environments without ``jsonschema`` fall back to the
+    stdlib-only :func:`_shape_ok` probe (type + top-level ``required``) so this
+    module stays import-time-pure.
+
+    Returns a :class:`_SchemaCheck` whose ``reason`` always names the first
+    failure on the most informative path the validator exposes. Never raises
+    on a well-formed schema; bad schemas surface as a one-line REFUTED with the
+    jsonschema exception class name + message.
+    """
+    if not schema:
+        return _SchemaCheck(ok=True)
+    try:
+        import jsonschema  # type: ignore[import-not-found]
+        from jsonschema import Draft202012Validator  # type: ignore[import-not-found]
+    except Exception:  # ImportError or sys.modules['jsonschema']=None guard
+        ok, reason = _shape_ok(body, schema)
+        return _SchemaCheck(ok=ok, reason=reason or "shape matches (fallback)")
+    try:
+        Draft202012Validator(schema).validate(body)
+        return _SchemaCheck(ok=True)
+    except jsonschema.ValidationError as e:
+        return _SchemaCheck(ok=False, reason=f"{e.message} (path {list(e.path)})")
+    except jsonschema.SchemaError as e:
+        return _SchemaCheck(ok=False, reason=f"schema invalid: {e.message}")
+
+
+_VAR_RE = re.compile(r"\$\{([^}]+)\}")
+
+
+def _substitute(text: str, bindings: dict) -> str:
+    """Replace ``${name}`` occurrences in ``text`` from ``bindings``.
+
+    Unbound names are left verbatim (no KeyError, no silent empty string) so a
+    missing extract in step 1 surfaces as a literal ``${user_id}`` in step 2's
+    URL — easier to debug than a silent empty string.
+    """
+    if not text:
+        return text
+
+    def repl(match: "re.Match[str]") -> str:
+        name = match.group(1)
+        return str(bindings.get(name, match.group(0)))
+
+    return _VAR_RE.sub(repl, text)
+
+
+def _extract(body: Any, path: str) -> Any:
+    """Walk a dotted path through a dict/list body. Returns None on miss."""
+    if body is None or not path:
+        return None
+    cur: Any = body
+    for seg in path.split("."):
+        if isinstance(cur, dict):
+            cur = cur.get(seg)
+        elif isinstance(cur, list):
+            try:
+                cur = cur[int(seg)]
+            except (ValueError, IndexError):
+                return None
+        else:
+            return None
+        if cur is None:
+            return None
+    return cur
+
+
+def _amplify(
+    relation: str,
+    method: str,
+    url: str,
+    requester: Requester,
+    obs: Observable,
+    *,
+    n: int = 3,
+) -> Check:
+    """Run amplified probes for a metamorphic relation (P2).
+
+    - ``idempotent_repeat``: ``n`` probes must agree on the canonical body.
+    - ``order_invariant``: two probes must agree on the set of elements (abstains
+      if either body is not a list).
+    - ``filtered_subset_of_unfiltered``: an unfiltered probe plus a probe with
+      ``observable.filter`` applied; the filtered set must be a subset of the
+      unfiltered set. Abstains when ``filter`` is not declared.
+
+    ``n`` is capped against ``observable.budget.max_turns`` so a runaway
+    relation cannot burn unbounded budget (naive computer-use verification =
+    2.6–7.4M tokens/instance, WebTestBench 2603.25226). The cap is reported in
+    the check detail when it fires so the user knows amplification was
+    constrained.
+    """
+    budget_max = int((obs.budget or {}).get("max_turns") or 12)
+    requested = max(1, int(n))
+    capped = min(requested, max(1, budget_max))
+    cap_note = "" if capped == requested else f" (capped at budget.max_turns={budget_max})"
+
+    if relation == "idempotent_repeat":
+        probes = [requester(method, url) for _ in range(capped)]
+        if not all(p.ok_transport for p in probes):
+            bad = next(p for p in probes if not p.ok_transport)
+            return Check(relation, None, f"unreachable probe: {bad.error}")
+        canonicals = {_canonical(p.body) for p in probes}
+        if len(canonicals) == 1:
+            return Check(relation, True, f"{capped} probes identical{cap_note}")
+        return Check(
+            relation,
+            False,
+            f"{capped} probes diverged across {len(canonicals)} distinct bodies{cap_note}",
+        )
+
+    if relation == "order_invariant":
+        a = requester(method, url)
+        b = requester(method, url)
+        if not (a.ok_transport and b.ok_transport):
+            err = a.error if not a.ok_transport else b.error
+            return Check(relation, None, f"unreachable probe: {err}")
+        if isinstance(a.body, list) and isinstance(b.body, list):
+            sa = sorted(_canonical(x) for x in a.body)
+            sb = sorted(_canonical(x) for x in b.body)
+            if sa == sb:
+                return Check(relation, True, "same elements across probes (order-agnostic)")
+            return Check(relation, False, "element set differed across probes")
+        return Check(relation, None, "order_invariant needs list responses")
+
+    if relation == "filtered_subset_of_unfiltered":
+        if not obs.filter:
+            return Check(
+                relation,
+                None,
+                "filtered_subset_of_unfiltered needs observable.filter (no filter declared)",
+            )
+        unfiltered = requester(method, url)
+        filtered = requester(method, url, params={"filter": obs.filter})
+        if not (unfiltered.ok_transport and filtered.ok_transport):
+            err = unfiltered.error if not unfiltered.ok_transport else filtered.error
+            return Check(relation, None, f"unreachable probe: {err}")
+        if isinstance(unfiltered.body, list) and isinstance(filtered.body, list):
+            uf_set = {_canonical(x) for x in unfiltered.body}
+            f_set = {_canonical(x) for x in filtered.body}
+            if f_set <= uf_set:
+                return Check(relation, True, "filtered ⊆ unfiltered")
+            return Check(relation, False, "filtered not a subset of unfiltered")
+        return Check(relation, None, "filtered_subset_of_unfiltered needs list responses")
+
+    return Check(relation, None, f"unknown metamorphic relation {relation!r}")
+
+
+def _eval_metamorphic(relation: str, primary: HttpResult, secondary: HttpResult) -> Check:
+    """P0 compatibility shim — two-probe evaluation of a single relation.
+
+    Kept so any external caller pinning to the P0 signature still works; the
+    live verifier path goes through :func:`run_api_check`, which calls
+    :func:`_amplify` directly for richer probing and budget-aware n.
     """
     if not secondary.ok_transport:
         return Check(relation, None, f"second probe unreachable: {secondary.error}")
@@ -356,13 +540,14 @@ def run_api_check(obs: Observable, *, requester: Requester | None = None) -> Beh
         )
     )
     if obs.expect_json_schema:
-        ok, detail = _shape_ok(primary.body, obs.expect_json_schema)
-        checks.append(Check("json_shape", ok, detail or "body matches declared shape"))
+        sc = _validate_json_schema(primary.body, obs.expect_json_schema)
+        checks.append(
+            Check("json_shape", sc.ok, sc.reason or "body matches declared schema")
+        )
 
     if obs.metamorphic:
-        secondary = req(obs.method, url)
         for relation in obs.metamorphic:
-            checks.append(_eval_metamorphic(relation, primary, secondary))
+            checks.append(_amplify(relation, obs.method, url, req, obs, n=3))
 
     status = _resolve(checks)
     return BehavioralVerdict(
@@ -480,6 +665,129 @@ def run_ui_check(obs: Observable, *, driver: UiDriver | None = None) -> Behavior
         checks,
         evidence=_summarize(status, result.current_url or url, checks),
         target=result.current_url or url,
+    )
+
+
+def _run_journey_step(
+    step: Observable,
+    bindings: dict,
+    *,
+    requester: Optional[Requester],
+    driver: Optional[UiDriver],
+) -> tuple[BehavioralVerdict, Any, dict]:
+    """Run one journey step after ``${var}`` substitution; return (verdict, body, new_bindings).
+
+    Dispatches the step to its registered surface handler via :func:`run` so a
+    journey can mix api and ui steps. Re-issues the primary probe once after
+    the handler returns to grab the response body for extraction (the handler
+    returns a verdict, not the body — re-probing is the cheapest way to keep the
+    surface-handler API unchanged).
+    """
+    target = _substitute(step.target, bindings)
+    staging_url = _substitute(step.staging_url, bindings)
+    _guard_path_escape(target)  # every resolved target MUST pass the guard
+    # Build a substituted observable without mutating the caller's copy.
+    substituted = Observable(
+        surface=step.surface,
+        target=target,
+        staging_url=staging_url,
+        method=step.method,
+        checklist=list(step.checklist),
+        expect_status=list(step.expect_status),
+        expect_json_schema=dict(step.expect_json_schema),
+        metamorphic=list(step.metamorphic),
+        budget=dict(step.budget),
+        form=list(step.form),
+        submit=step.submit,
+        expect_visible=list(step.expect_visible),
+        expect_url=list(step.expect_url),
+        waits=list(step.waits),
+        filter=step.filter,
+        steps=list(step.steps),
+        extract=dict(step.extract),
+    )
+    verdict = run(substituted, requester=requester, driver=driver)
+    body: Any = None
+    if step.surface == "api" and step.extract and step.extract.get("name") and step.extract.get("path"):
+        # Only re-probe when an extraction is actually needed; otherwise the
+        # dispatcher's primary call is sufficient and a second probe would
+        # double the surface traffic (and any budget cap).
+        req = requester or _default_requester
+        url = staging_url + target if staging_url else target
+        if url:
+            primary = req(step.method, url)
+            if primary.ok_transport:
+                body = primary.body
+    new_bindings = dict(bindings)
+    if step.extract and step.extract.get("name") and step.extract.get("path"):
+        val = _extract(body, step.extract["path"])
+        if val is not None:
+            new_bindings[step.extract["name"]] = val
+    return verdict, body, new_bindings
+
+
+def run_journey_check(
+    obs: Observable,
+    *,
+    requester: Requester | None = None,
+    driver: UiDriver | None = None,
+) -> BehavioralVerdict:
+    """Run a multi-step journey (api/ui sequence with ${var} threading).
+
+    Each step is a nested :class:`Observable` whose ``target`` and
+    ``staging_url`` may reference ``${name}`` placeholders. Names are bound
+    from prior steps via ``extract: {name, path}`` (dotted path into the step's
+    response body). Every substituted target passes through
+    :func:`_guard_path_escape` so a malicious or buggy extraction cannot route
+    a later probe out of the surface (``..`` segments are rejected loudly).
+
+    Short-circuits at the first REFUTED step (no point burning budget on later
+    steps when an earlier one has already broken the contract).
+    """
+    if not obs.steps:
+        return BehavioralVerdict(
+            UNVERIFIED,
+            "journey",
+            [Check("declared", None, "no journey steps declared")],
+            evidence="UNVERIFIED: declare observable.steps[] for a journey surface",
+            target=obs.target,
+        )
+
+    bindings: dict = {}
+    checks: list[Check] = []
+    for idx, step in enumerate(obs.steps):
+        verdict, _body, bindings = _run_journey_step(
+            step, bindings, requester=requester, driver=driver,
+        )
+        step_label = f"step[{idx}]:{step.surface}"
+        if verdict.status == PROVEN:
+            checks.append(Check(step_label, True, f"step {idx} PROVEN"))
+        elif verdict.status == REFUTED:
+            checks.append(Check(step_label, False, f"step {idx} REFUTED: {verdict.evidence}"))
+            return BehavioralVerdict(
+                REFUTED,
+                "journey",
+                checks,
+                evidence=_summarize(REFUTED, obs.target, checks),
+                target=obs.target,
+            )
+        else:
+            checks.append(Check(step_label, None, f"step {idx} UNVERIFIED: {verdict.evidence}"))
+            return BehavioralVerdict(
+                UNVERIFIED,
+                "journey",
+                checks,
+                evidence=_summarize(UNVERIFIED, obs.target, checks),
+                target=obs.target,
+            )
+
+    status = _resolve(checks)
+    return BehavioralVerdict(
+        status,
+        "journey",
+        checks,
+        evidence=_summarize(status, obs.target, checks),
+        target=obs.target,
     )
 
 
@@ -649,7 +957,7 @@ def main(argv: list[str] | None = None, *, requester: Requester | None = None) -
 # effect (no I/O, no env mutation) — the same shape sandbox.py uses.
 register_surface_handler("api", run_api_check)
 register_surface_handler("ui", run_ui_check)
-register_surface_handler("journey", _unimplemented_surface)
+register_surface_handler("journey", run_journey_check)
 
 
 if __name__ == "__main__":

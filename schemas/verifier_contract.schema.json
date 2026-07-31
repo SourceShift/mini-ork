@@ -19,8 +19,57 @@
       "enum": ["deterministic", "reviewer", "llm_judge", "external", "behavioral"]
     },
     "observable": {
+      "$ref": "#/$defs/observable"
+    },
+    "script": {
+      "type": "string",
+      "description": "For kind=deterministic: path to executable script or shell command string. For kind=external: URL template. For kind=reviewer|llm_judge: prompt_ref key. Supports {artifact_path} and {evidence_path} substitutions.",
+      "default": ""
+    },
+    "pass_codes": {
+      "type": "array",
+      "description": "Exit codes that count as a pass for kind=deterministic. Default [0].",
+      "items": { "type": "integer" },
+      "default": [0],
+      "minItems": 1
+    },
+    "timeout_seconds": {
+      "type": "integer",
+      "description": "Wall-clock timeout for this verifier. Default 120.",
+      "minimum": 1,
+      "default": 120
+    },
+    "evidence_path_template": {
+      "type": "string",
+      "description": "Template for where to write verifier output (test reports, coverage XML, judge scores). Supports {run_id} and {verifier_name} substitutions.",
+      "default": ".mini-ork/evidence/{run_id}/{verifier_name}.json"
+    },
+    "min_score": {
+      "type": "number",
+      "description": "For kind=llm_judge: minimum score (0.0–1.0) required to pass.",
+      "minimum": 0.0,
+      "maximum": 1.0,
+      "default": 0.7
+    },
+    "rubric_ref": {
+      "type": "string",
+      "description": "For kind=llm_judge: path to rubric YAML file defining scoring criteria.",
+      "default": ""
+    },
+    "description": {
+      "type": "string",
+      "description": "Human-readable description of what this verifier checks."
+    },
+    "tags": {
+      "type": "array",
+      "items": { "type": "string" },
+      "default": []
+    }
+  },
+  "$defs": {
+    "observable": {
       "type": "object",
-      "description": "For kind=behavioral: describes the user- or data-journey surface to exercise live. The checklist is the declared acceptance list (an incomplete checklist is the dominant failure mode in agentic verification — WebTestBench 2603.25226), and metamorphic[] supplies the gold-free oracle (metamorphic REST testing, 2605.28321 / RESTOR 2607.23963).",
+      "description": "For kind=behavioral: describes the user- or data-journey surface to exercise live. The checklist is the declared acceptance list (an incomplete checklist is the dominant failure mode in agentic verification — WebTestBench 2603.25226), and metamorphic[] supplies the gold-free oracle (metamorphic REST testing, 2605.28321 / RESTOR 2607.23963). For surface=journey, steps[] runs an ordered sequence of nested observables with ${name} substitution fed from prior steps via `extract`.",
       "additionalProperties": false,
       "required": ["surface"],
       "properties": {
@@ -31,12 +80,12 @@
         },
         "target": {
           "type": "string",
-          "description": "For surface=ui: the route/path under test (e.g. /signup). For surface=api: the staging endpoint path appended to staging_url. Supports env expansion.",
+          "description": "For surface=ui: the route/path under test (e.g. /signup). For surface=api: the staging endpoint path appended to staging_url. For surface=journey steps: path with optional ${name} substitution. Supports env expansion.",
           "default": ""
         },
         "staging_url": {
           "type": "string",
-          "description": "For surface=api: base URL of the staging deployment to probe. Supports env expansion (e.g. ${MO_STAGING_URL}).",
+          "description": "For surface=api: base URL of the staging deployment to probe. Supports env expansion (e.g. ${MO_STAGING_URL}). For surface=journey steps: same, with optional ${name} substitution.",
           "default": ""
         },
         "form": {
@@ -95,12 +144,12 @@
         },
         "expect_json_schema": {
           "type": "object",
-          "description": "For surface=api: optional JSON Schema the response body must validate against (shape/required-keys check).",
+          "description": "For surface=api: optional JSON Schema the response body must validate against. Uses Draft 2020-12 when jsonschema is installed, falls back to type+required keys otherwise.",
           "default": {}
         },
         "metamorphic": {
           "type": "array",
-          "description": "Gold-free oracle: named metamorphic relations the surface must hold under input transformation (e.g. idempotent_repeat, order_invariant, filtered_subset_of_unfiltered). Each is checked by re-exercising the surface with the transformation applied.",
+          "description": "Gold-free oracle: named metamorphic relations the surface must hold under input transformation (e.g. idempotent_repeat, order_invariant, filtered_subset_of_unfiltered). Each is checked by re-exercising the surface with the transformation applied; the probe count is capped against budget.max_turns.",
           "items": {
             "type": "string",
             "enum": ["idempotent_repeat", "order_invariant", "filtered_subset_of_unfiltered"]
@@ -116,52 +165,29 @@
             "max_turns": { "type": "integer", "minimum": 1, "default": 12 }
           },
           "default": {}
+        },
+        "filter": {
+          "type": "string",
+          "description": "For metamorphic=filtered_subset_of_unfiltered: the substring/parameter applied to the filtered probe so the oracle can synthesize the transformed input (P0 abstains without this).",
+          "default": ""
+        },
+        "extract": {
+          "type": "object",
+          "description": "For surface=journey steps: bind a value from the response body into a named slot (e.g. {name: 'user_id', path: 'id'}) for ${name} substitution in later steps. Dotted path walks dict/list bodies.",
+          "additionalProperties": false,
+          "properties": {
+            "name": { "type": "string", "description": "Binding name referenced by ${name} in later steps." },
+            "path": { "type": "string", "description": "Dotted path into the response body (e.g. 'id', 'users.0.id')." }
+          },
+          "default": {}
+        },
+        "steps": {
+          "type": "array",
+          "description": "For surface=journey: ordered list of nested observables to run in sequence; later steps can use ${name} substitution fed from prior steps via `extract`. The journey REFUTES as soon as any step REFUTES, so a broken mid-flow probe fails the whole contract rather than hiding behind later steps.",
+          "items": { "$ref": "#/$defs/observable" },
+          "default": []
         }
       }
-    },
-    "script": {
-      "type": "string",
-      "description": "For kind=deterministic: path to executable script or shell command string. For kind=external: URL template. For kind=reviewer|llm_judge: prompt_ref key. Supports {artifact_path} and {evidence_path} substitutions.",
-      "default": ""
-    },
-    "pass_codes": {
-      "type": "array",
-      "description": "Exit codes that count as a pass for kind=deterministic. Default [0].",
-      "items": { "type": "integer" },
-      "default": [0],
-      "minItems": 1
-    },
-    "timeout_seconds": {
-      "type": "integer",
-      "description": "Wall-clock timeout for this verifier. Default 120.",
-      "minimum": 1,
-      "default": 120
-    },
-    "evidence_path_template": {
-      "type": "string",
-      "description": "Template for where to write verifier output (test reports, coverage XML, judge scores). Supports {run_id} and {verifier_name} substitutions.",
-      "default": ".mini-ork/evidence/{run_id}/{verifier_name}.json"
-    },
-    "min_score": {
-      "type": "number",
-      "description": "For kind=llm_judge: minimum score (0.0–1.0) required to pass.",
-      "minimum": 0.0,
-      "maximum": 1.0,
-      "default": 0.7
-    },
-    "rubric_ref": {
-      "type": "string",
-      "description": "For kind=llm_judge: path to rubric YAML file defining scoring criteria.",
-      "default": ""
-    },
-    "description": {
-      "type": "string",
-      "description": "Human-readable description of what this verifier checks."
-    },
-    "tags": {
-      "type": "array",
-      "items": { "type": "string" },
-      "default": []
     }
   }
 }

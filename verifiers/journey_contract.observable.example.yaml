@@ -1,0 +1,40 @@
+# Example observable descriptor for the `journey_contract` behavioral verifier.
+#
+# A journey runs nested api/ui steps in order, threading values from prior
+# responses into later targets via `${name}` substitution. Set
+# MO_OBSERVABLE_SPEC to this file after setting MO_STAGING_URL.
+#
+# Here the journey creates a user (POST /users) and then fetches the user it
+# just created (GET /users/${user_id}) — a classic create-then-read loop.
+# Failure on either step REFUTES the whole journey (short-circuit), so a
+# broken create endpoint is caught immediately rather than masquerading as a
+# later read failure.
+
+surface: journey
+
+steps:
+  - surface: api
+    staging_url: ${MO_STAGING_URL}
+    target: /users
+    method: POST
+    expect_status: [200, 201]
+    expect_json_schema:
+      type: object
+      required: [id]
+    extract:
+      name: user_id
+      path: id
+
+  - surface: api
+    target: /users/${user_id}
+    method: GET
+    expect_status: [200]
+    expect_json_schema:
+      type: object
+      required: [id]
+
+# Hard ceiling so a runaway journey cannot burn unbounded budget (naive
+# computer-use verification = 2.6-7.4M tokens/instance, WebTestBench).
+budget:
+  max_tokens: 200000
+  max_turns: 12
