@@ -306,6 +306,28 @@ def _deadline(root, *args) -> int:
 
 
 def _run_lifecycle(argv, root) -> int:
+    """Strip the machine-readable ``--json`` flag (accepted anywhere in argv),
+    run the lifecycle, and — when requested — emit one stable
+    ``mini_ork_result={...}`` line so in-process callers parse a single JSON
+    object instead of scraping scattered key=value lines."""
+    emit_json = False
+    inner: list[str] = []
+    for a in argv:
+        if a == "--json":
+            emit_json = True
+        else:
+            inner.append(a)
+    sink: dict = {}
+    rc = _run_lifecycle_impl(inner, root, sink)
+    if emit_json:
+        sink["returncode"] = rc
+        sys.stdout.write(
+            "mini_ork_result=" + json.dumps(sink, separators=(",", ":")) + "\n"
+        )
+    return rc
+
+
+def _run_lifecycle_impl(argv, root, sink) -> int:
     t0 = int(time.time())
     # ── flag pre-parse: pull --deadline out ──
     deadline = ""
@@ -362,6 +384,7 @@ def _run_lifecycle(argv, root) -> int:
     if not os.path.isfile(kickoff):
         sys.stderr.write(f"kickoff not found: {kickoff}\n"); return 2
     run_id = os.environ.setdefault("MINI_ORK_RUN_ID", f"run-{int(time.time())}-{os.getpid()}")
+    sink["run_id"] = run_id
 
     # derived task_class from recipe's task_class.yaml::name
     derived = ""
@@ -394,6 +417,7 @@ def _run_lifecycle(argv, root) -> int:
     sys.stdout.write(cl.stdout)
     task_class = _grep_kv(cl.stdout, "task_class")
     os.environ["MINI_ORK_TASK_CLASS"] = task_class
+    sink["task_class"] = task_class
 
     home = os.environ.setdefault("MINI_ORK_HOME", os.path.join(os.getcwd(), ".mini-ork"))
     run_dir = os.path.join(home, "runs", run_id)
@@ -426,6 +450,8 @@ def _run_lifecycle(argv, root) -> int:
     sys.stdout.write(f"profile_path={profile_path}\n")
     sys.stdout.write(f"profile_status={data['profile_status']}\n")
     sys.stdout.write(f"profile_confidence={data['confidence']:.2f}\n")
+    sink["profile_status"] = data["profile_status"]
+    sink["profile_confidence"] = round(float(data["confidence"]), 4)
     if data["human_questions"]:
         sys.stdout.write("profile_questions=" + json.dumps(data["human_questions"], separators=(",", ":")) + "\n")
     if os.environ.get("MINI_ORK_PROFILE_STRICT", "0") == "1" and data["profile_status"] == "blocked_profile":
@@ -447,6 +473,7 @@ def _run_lifecycle(argv, root) -> int:
     sys.stdout.write(pl.stdout)
     plan_path = _grep_kv(pl.stdout, "plan_path")
     os.environ["MINI_ORK_PLAN_PATH"] = plan_path
+    sink["plan_path"] = plan_path
     if not _gate("plan", plan_path):
         return 0
 
@@ -463,6 +490,7 @@ def _run_lifecycle(argv, root) -> int:
     artifact = _grep_kv(execute_out, "artifact_path")
     if artifact:
         os.environ["MINI_ORK_ARTIFACT_PATH"] = artifact
+        sink["artifact_path"] = artifact
     if deadline and _deadline(root, "mo_deadline_check", run_id) != 0:
         sys.stderr.write(f"deadline_hit after execute; best-so-far artifact: {artifact or '<none>'}\n")
         return run_rc
@@ -509,6 +537,9 @@ def _run_lifecycle(argv, root) -> int:
     vargs = [sys.executable, "-m", "mini_ork.cli.verify"] + ([artifact] if artifact else [])
     vr = subprocess.run(vargs, capture_output=True, text=True, env=_module_env(root))
     sys.stdout.write(vr.stdout); sys.stderr.write(vr.stderr)
+    _verdicts = re.findall(r'"verdict"\s*:\s*"([^"]+)"', vr.stdout)
+    if _verdicts:
+        sink["verdict"] = _verdicts[-1]
     if run_rc == 0:
         run_rc = vr.returncode
     if not _gate("verify", artifact):

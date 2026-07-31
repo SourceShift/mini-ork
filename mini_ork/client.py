@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import subprocess
@@ -41,7 +42,7 @@ class MiniOrk:
         if not kickoff.exists():
             raise MiniOrkError(f"kickoff not found: {kickoff}")
 
-        command = [str(self.root / "bin" / "mini-ork"), "run"]
+        command = [str(self.root / "bin" / "mini-ork"), "run", "--json"]
         if request.recipe:
             command.append(request.recipe)
         command.append(str(kickoff))
@@ -219,6 +220,28 @@ class MiniOrk:
         init_output: str = "",
     ) -> RunResult:
         events = tuple(RunEvent(line=line) for line in output.splitlines())
+        parsed = _parse_result_json(output)
+        if parsed is not None:
+            # `mini-ork run --json` contract: one machine-readable line carries
+            # every field, so there is nothing to scrape.
+            plan_raw = parsed.get("plan_path") or ""
+            return RunResult(
+                returncode=returncode,
+                command=tuple(command),
+                cwd=cwd,
+                output=output,
+                events=events,
+                run_id=parsed.get("run_id", ""),
+                task_class=parsed.get("task_class", ""),
+                plan_path=Path(plan_raw) if plan_raw else None,
+                verdict=parsed.get("verdict", ""),
+                retained_home=home,
+                init_ran=init_ran,
+                init_output=init_output,
+            )
+        # Fallback for output without the JSON contract — classify(), the
+        # auto-init subprocess, or an exit before the line is emitted: parse the
+        # legacy key=value / verdict lines.
         plan_raw = _last_value(output, "plan_path=")
         return RunResult(
             returncode=returncode,
@@ -266,6 +289,19 @@ def _last_value(output: str, prefix: str) -> str:
         if line.startswith(prefix):
             value = line.split("=", 1)[1].strip()
     return value
+
+
+def _parse_result_json(output: str) -> dict | None:
+    """Return the payload of the last ``mini_ork_result={...}`` line, or None
+    when the run did not emit the ``--json`` contract."""
+    line = _last_value(output, "mini_ork_result=")
+    if not line:
+        return None
+    try:
+        data = json.loads(line)
+    except (ValueError, TypeError):
+        return None
+    return data if isinstance(data, dict) else None
 
 
 def _jsonish_verdict(output: str) -> str:
