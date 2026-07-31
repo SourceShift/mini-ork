@@ -15,8 +15,73 @@
     },
     "kind": {
       "type": "string",
-      "description": "Execution mode: deterministic (pure script/binary, exit code checked), reviewer (LLM review agent returns structured verdict), llm_judge (LLM rates artifact on rubric, pass if score >= threshold), external (HTTP callback to external CI/CD system).",
-      "enum": ["deterministic", "reviewer", "llm_judge", "external"]
+      "description": "Execution mode: deterministic (pure script/binary, exit code checked), reviewer (LLM review agent returns structured verdict), llm_judge (LLM rates artifact on rubric, pass if score >= threshold), external (HTTP callback to external CI/CD system), behavioral (dispatch a cheap-fast agent to exercise an observable surface LIVE — API in staging or UI form via a browser driver — and return an execution-anchored PROVEN/REFUTED/UNVERIFIED verdict; configured by the `observable` block).",
+      "enum": ["deterministic", "reviewer", "llm_judge", "external", "behavioral"]
+    },
+    "observable": {
+      "type": "object",
+      "description": "For kind=behavioral: describes the user- or data-journey surface to exercise live. The checklist is the declared acceptance list (an incomplete checklist is the dominant failure mode in agentic verification — WebTestBench 2603.25226), and metamorphic[] supplies the gold-free oracle (metamorphic REST testing, 2605.28321 / RESTOR 2607.23963).",
+      "additionalProperties": false,
+      "required": ["surface"],
+      "properties": {
+        "surface": {
+          "type": "string",
+          "description": "Which observable surface to verify. api = hit a staging HTTP endpoint; ui = drive a browser against a route/form; journey = a multi-step user or data journey spanning surfaces.",
+          "enum": ["api", "ui", "journey"]
+        },
+        "target": {
+          "type": "string",
+          "description": "For surface=ui: the route/path under test (e.g. /signup). For surface=api: the staging endpoint path appended to staging_url. Supports env expansion.",
+          "default": ""
+        },
+        "staging_url": {
+          "type": "string",
+          "description": "For surface=api: base URL of the staging deployment to probe. Supports env expansion (e.g. ${MO_STAGING_URL}).",
+          "default": ""
+        },
+        "method": {
+          "type": "string",
+          "description": "For surface=api: HTTP method to exercise.",
+          "enum": ["GET", "POST", "PUT", "PATCH", "DELETE"],
+          "default": "GET"
+        },
+        "checklist": {
+          "type": "array",
+          "description": "Declared acceptance criteria the surface must satisfy. Each item is a human-readable check the agent must confirm live. Declaring these up front closes the incomplete-checklist bottleneck.",
+          "items": { "type": "string" },
+          "default": []
+        },
+        "expect_status": {
+          "type": "array",
+          "description": "For surface=api: HTTP status codes counted as success.",
+          "items": { "type": "integer" },
+          "default": [200]
+        },
+        "expect_json_schema": {
+          "type": "object",
+          "description": "For surface=api: optional JSON Schema the response body must validate against (shape/required-keys check).",
+          "default": {}
+        },
+        "metamorphic": {
+          "type": "array",
+          "description": "Gold-free oracle: named metamorphic relations the surface must hold under input transformation (e.g. idempotent_repeat, order_invariant, filtered_subset_of_unfiltered). Each is checked by re-exercising the surface with the transformation applied.",
+          "items": {
+            "type": "string",
+            "enum": ["idempotent_repeat", "order_invariant", "filtered_subset_of_unfiltered"]
+          },
+          "default": []
+        },
+        "budget": {
+          "type": "object",
+          "description": "Hard cost ceiling so a runaway agent cannot burn unbounded tokens/turns (naive computer-use verification = 2.6-7.4M tokens/instance, WebTestBench).",
+          "additionalProperties": false,
+          "properties": {
+            "max_tokens": { "type": "integer", "minimum": 0, "default": 200000 },
+            "max_turns": { "type": "integer", "minimum": 1, "default": 12 }
+          },
+          "default": {}
+        }
+      }
     },
     "script": {
       "type": "string",
