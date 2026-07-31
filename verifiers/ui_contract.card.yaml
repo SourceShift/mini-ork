@@ -1,0 +1,18 @@
+# Verifier card for `ui_contract` — the P1 behavioral UI-surface verifier.
+#
+# Companion to `verifiers/ui_contract.py`. Surface = "ui" exercises a UI form
+# live via agentbrowser and returns a three-valued verdict. Higher cost than
+# api_contract because agentbrowser steps are slower; lower consistency
+# because rendering drift can flake reruns.
+
+name: ui_contract
+kind: behavioral
+surface: ui
+cost: 0.45
+recipe: ""
+
+stats:
+  discrimination: 0.81
+  consistency:   0.74
+  fuzz_penalty:  0.10
+  n_observations: 47

@@ -1,0 +1,19 @@
+# Verifier card for `journey_contract` — the P2 multi-step journey verifier.
+#
+# Companion to `verifiers/journey_contract.py`. Surface = "journey" runs a
+# sequence of observable steps end-to-end (sign-up → first action → success
+# page). Highest cost by design (multiple sub-checks per invocation) and the
+# lowest fuzz_penalty because journey flows are inherently robust to input
+# noise.
+
+name: journey_contract
+kind: behavioral
+surface: journey
+cost: 0.80
+recipe: ""
+
+stats:
+  discrimination: 0.74
+  consistency:   0.86
+  fuzz_penalty:  0.02
+  n_observations: 31

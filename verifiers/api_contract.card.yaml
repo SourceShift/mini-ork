@@ -1,0 +1,22 @@
+# Verifier card for `api_contract` — the P0 behavioral API-surface verifier.
+#
+# Companion to `verifiers/api_contract.py` (the dispatcher script) and
+# `verifiers/api_contract.observable.example.yaml` (the observable template).
+# Discovered and validated by `mini_ork.verify.catalog.load_cards()`; never
+# imported at module-load time, so a malformed card fails the catalog load
+# rather than regressing `mini_ork.verify.behavioral`'s pure-stdlib contract.
+#
+# Stats below are seeded manually for the P3 kickoff — no fitted IRT model
+# yet. card_score = discrimination * consistency * (1/(1+cost)) - fuzz_penalty.
+
+name: api_contract
+kind: behavioral
+surface: api
+cost: 0.10
+recipe: ""
+
+stats:
+  discrimination: 0.78
+  consistency:   0.92
+  fuzz_penalty:  0.04
+  n_observations: 214

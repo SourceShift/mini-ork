@@ -1,0 +1,69 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mini-ork/schemas/verifier_card.schema.json",
+  "title": "VerifierCard",
+  "description": "Static catalog entry for one verifier (P3). Carries IRT-GRM-inspired quality stats and the surface / kind metadata used by the committee aggregator. Discovery and validation happen at catalog.load_cards() time, never at module import — the schema gate runs in the verify-framework-edit step.",
+  "type": "object",
+  "required": ["name", "kind", "cost", "stats"],
+  "additionalProperties": false,
+  "properties": {
+    "name": {
+      "type": "string",
+      "description": "Unique verifier name across the registry. Used as the dispatch key.",
+      "pattern": "^[a-z][a-z0-9_-]*$",
+      "minLength": 2
+    },
+    "kind": {
+      "type": "string",
+      "description": "Execution mode (verbatim from verifier_contract.schema.json).",
+      "enum": ["behavioral", "deterministic", "reviewer", "llm_judge", "external"]
+    },
+    "surface": {
+      "type": "string",
+      "description": "Behavioral surface for kind=behavioral; empty string for non-behavioral verifiers.",
+      "enum": ["api", "ui", "journey", ""],
+      "default": ""
+    },
+    "cost": {
+      "type": "number",
+      "description": "Unitless cost (0.0+); used in IRT-GRM-inspired score as 1/(1+cost).",
+      "minimum": 0.0
+    },
+    "recipe": {
+      "type": "string",
+      "description": "Path to a dedicated per-verifier recipe. Empty string when no dedicated recipe exists.",
+      "default": ""
+    },
+    "stats": {
+      "type": "object",
+      "description": "Quality statistics feeding card_score: discrimination * consistency * (1/(1+cost)) - fuzz_penalty.",
+      "required": ["discrimination", "consistency", "fuzz_penalty"],
+      "additionalProperties": false,
+      "properties": {
+        "discrimination": {
+          "type": "number",
+          "description": "IRT-GRM-inspired discrimination (0.0–1.0). Higher = better at separating pass vs fail.",
+          "minimum": 0.0,
+          "maximum": 1.0
+        },
+        "consistency": {
+          "type": "number",
+          "description": "Self-consistency across reruns (0.0–1.0). Higher = more stable.",
+          "minimum": 0.0,
+          "maximum": 1.0
+        },
+        "fuzz_penalty": {
+          "type": "number",
+          "description": "Penalty subtracted for false positives under fuzz (>=0). Higher = more penalty.",
+          "minimum": 0.0
+        },
+        "n_observations": {
+          "type": "integer",
+          "description": "Number of historical observations backing the stats (>=0).",
+          "minimum": 0,
+          "default": 0
+        }
+      }
+    }
+  }
+}
