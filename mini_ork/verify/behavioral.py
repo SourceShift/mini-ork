@@ -55,8 +55,11 @@ __all__ = [
     "BehavioralVerdict",
     "HttpResult",
     "Requester",
+    "UiResult",
+    "UiDriver",
     "run",
     "run_api_check",
+    "run_ui_check",
     "observable_from_env",
     "main",
     "register_surface_handler",
@@ -97,6 +100,20 @@ Requester = Callable[..., HttpResult]
 
 
 @dataclass
+class UiResult:
+    """Browser-driver result envelope for a live UI surface."""
+
+    ok_transport: bool
+    url: str
+    visible_text: str
+    current_url: str
+    error: str = ""
+
+
+UiDriver = Callable[..., UiResult]
+
+
+@dataclass
 class Check:
     """One evaluated acceptance check. ``ok=None`` means 'could not evaluate'."""
 
@@ -118,6 +135,11 @@ class Observable:
     expect_json_schema: dict = field(default_factory=dict)
     metamorphic: list[str] = field(default_factory=list)
     budget: dict = field(default_factory=dict)
+    form: list[dict[str, str]] = field(default_factory=list)
+    submit: str = ""
+    expect_visible: list[str] = field(default_factory=list)
+    expect_url: list[str] = field(default_factory=list)
+    waits: list[str] = field(default_factory=list)
 
     @classmethod
     def from_mapping(cls, data: Any) -> "Observable":
@@ -146,6 +168,19 @@ class Observable:
         budget = data.get("budget") or {}
         if not isinstance(budget, dict):
             raise ObservableError("observable.budget must be a mapping")
+        form = data.get("form") or []
+        if not isinstance(form, list) or any(not isinstance(item, dict) for item in form):
+            raise ObservableError("observable.form must be a list of mappings")
+        parsed_form = [
+            {"selector": str(item.get("selector") or ""), "value": str(item.get("value") or "")}
+            for item in form
+        ]
+        expect_url_raw = data.get("expect_url") or []
+        expect_url = (
+            [str(expect_url_raw)]
+            if isinstance(expect_url_raw, str)
+            else [str(value) for value in expect_url_raw]
+        )
         return cls(
             surface=surface,
             target=target,
@@ -156,6 +191,11 @@ class Observable:
             expect_json_schema=schema,
             metamorphic=metamorphic,
             budget=budget,
+            form=parsed_form,
+            submit=str(data.get("submit") or ""),
+            expect_visible=[str(value) for value in (data.get("expect_visible") or [])],
+            expect_url=expect_url,
+            waits=[str(value) for value in (data.get("waits") or [])],
         )
 
 
@@ -334,6 +374,115 @@ def run_api_check(obs: Observable, *, requester: Requester | None = None) -> Beh
     )
 
 
+def _default_ui_driver(
+    url: str,
+    *,
+    form: list[dict[str, str]],
+    submit: str,
+    waits: list[str],
+) -> UiResult:
+    import shutil
+    import subprocess
+
+    executable = shutil.which("agent-browser")
+    if executable is None:
+        return UiResult(False, url, "", "", error="agent-browser unavailable")
+
+    def invoke(*args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [executable, *args],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+
+    try:
+        opened = invoke("open", url)
+        if opened.returncode != 0:
+            error = opened.stderr.strip() or opened.stdout.strip() or "agent-browser open failed"
+            return UiResult(False, url, "", "", error=error)
+        for item in form:
+            filled = invoke("fill", item["selector"], item["value"])
+            if filled.returncode != 0:
+                error = filled.stderr.strip() or filled.stdout.strip() or "agent-browser fill failed"
+                return UiResult(False, url, "", "", error=error)
+        if submit:
+            clicked = invoke("click", submit)
+            if clicked.returncode != 0:
+                error = clicked.stderr.strip() or clicked.stdout.strip() or "agent-browser click failed"
+                return UiResult(False, url, "", "", error=error)
+        for wait in waits:
+            waited = invoke("wait", wait)
+            if waited.returncode != 0:
+                error = waited.stderr.strip() or waited.stdout.strip() or "agent-browser wait failed"
+                return UiResult(False, url, "", "", error=error)
+        snapshot = invoke("snapshot")
+        if snapshot.returncode != 0:
+            error = snapshot.stderr.strip() or snapshot.stdout.strip() or "agent-browser snapshot failed"
+            return UiResult(False, url, "", "", error=error)
+        current_url_result = invoke("get", "url")
+        current_url = current_url_result.stdout.strip() if current_url_result.returncode == 0 else url
+        return UiResult(True, url, snapshot.stdout, current_url)
+    except (OSError, subprocess.SubprocessError) as e:
+        return UiResult(False, url, "", "", error=f"{type(e).__name__}: {e}")
+
+
+def run_ui_check(obs: Observable, *, driver: UiDriver | None = None) -> BehavioralVerdict:
+    """Drive a live UI surface and evaluate declared text and URL assertions."""
+    drive = driver or _default_ui_driver
+    base = os.path.expandvars(obs.staging_url)
+    path = os.path.expandvars(obs.target)
+    _guard_path_escape(path)
+    url = base + path if base else path
+    if not url:
+        return BehavioralVerdict(
+            UNVERIFIED,
+            "ui",
+            [Check("declared", None, "no staging_url/target declared")],
+            evidence="UNVERIFIED: nothing to probe — declare observable.staging_url/target",
+            target=url,
+        )
+
+    for expected in obs.expect_url:
+        _guard_path_escape(expected)
+
+    result = drive(url, form=obs.form, submit=obs.submit, waits=obs.waits)
+    if not result.ok_transport:
+        return BehavioralVerdict(
+            UNVERIFIED,
+            "ui",
+            [Check("reachable", None, result.error)],
+            evidence=f"UNVERIFIED: surface unreachable at {url} ({result.error})",
+            target=url,
+        )
+
+    checks = [
+        Check(
+            f"visible:{expected}",
+            expected in result.visible_text,
+            f"expected visible text {expected!r}",
+        )
+        for expected in obs.expect_visible
+    ]
+    checks.extend(
+        Check(
+            f"url:{expected}",
+            expected in result.current_url,
+            f"current URL {result.current_url!r} must contain {expected!r}",
+        )
+        for expected in obs.expect_url
+    )
+    status = _resolve(checks)
+    return BehavioralVerdict(
+        status,
+        "ui",
+        checks,
+        evidence=_summarize(status, result.current_url or url, checks),
+        target=result.current_url or url,
+    )
+
+
 def _resolve(checks: list[Check]) -> str:
     """REFUTED if any check failed; else UNVERIFIED if any abstained; else PROVEN.
 
@@ -391,9 +540,23 @@ def get_surface_handler(surface: str) -> SurfaceHandler:
     return handler
 
 
-def run(obs: Observable, *, requester: Requester | None = None) -> BehavioralVerdict:
+def run(
+    obs: Observable,
+    *,
+    requester: Requester | None = None,
+    driver: UiDriver | None = None,
+) -> BehavioralVerdict:
     """Dispatch an observable to its registered surface handler."""
-    return get_surface_handler(obs.surface)(obs, requester=requester)
+    import inspect
+
+    handler = get_surface_handler(obs.surface)
+    parameters = inspect.signature(handler).parameters
+    kwargs: dict[str, Any] = {}
+    if "requester" in parameters:
+        kwargs["requester"] = requester
+    if "driver" in parameters:
+        kwargs["driver"] = driver
+    return handler(obs, **kwargs)
 
 
 # --------------------------------------------------------------------------- #
@@ -485,7 +648,7 @@ def main(argv: list[str] | None = None, *, requester: Requester | None = None) -
 # Built-in surfaces. Registering handlers in a dict is the only import-time
 # effect (no I/O, no env mutation) — the same shape sandbox.py uses.
 register_surface_handler("api", run_api_check)
-register_surface_handler("ui", _unimplemented_surface)
+register_surface_handler("ui", run_ui_check)
 register_surface_handler("journey", _unimplemented_surface)
 
 
