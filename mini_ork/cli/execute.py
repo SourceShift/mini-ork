@@ -2244,6 +2244,11 @@ def _handle_implementer(ctx: NodeDispatch):
     # in mini-ork's own tree when cwd != target — the CWT-A corruption hazard
     # (bash _dispatch_node:2626-2642). Export so cl_codex.sh reads it.
     target = _resolve_target_cwd(ctx.run_dir_eff)
+    # P1b: opt-in shared-drive routing. No-op unless MO_SHARED_DRIVE_BACKEND is
+    # set, so the default host-tree cwd is unchanged; when set, every node in the
+    # run shares one virtual drive (lazy import keeps the seam side-effect-free).
+    from mini_ork.runtime.run_drive import resolve_run_drive_cwd
+    target = resolve_run_drive_cwd(target)
     apply_env_overrides({ENV_TARGET_CWD: target})
     print(f"  [cwd] codex target: {target}", file=sys.stderr)
 
@@ -2588,12 +2593,292 @@ def _handle_rollback(ctx: NodeDispatch):
     return 0, "done"
 
 
+def _read_run_trajectory(db: str, run_id: str, run_dir: str):
+    """Best-effort: this run's execution_traces rows + any verifier_*.json
+    verdicts in the run dir, for the judge's trajectory view. Fail-open — any
+    error yields empties so eval never sinks a run over a missing/locked db."""
+    traces: list[dict] = []
+    if db and run_id and os.path.isfile(db):
+        try:
+            con = sqlite3.connect(db, timeout=5.0)
+            con.execute("PRAGMA busy_timeout=5000")
+            con.row_factory = sqlite3.Row
+            try:
+                rows = con.execute(
+                    "SELECT status, reviewer_verdict, reward_source, reward_value, "
+                    "final_artifact_ref FROM execution_traces WHERE run_id=? "
+                    "ORDER BY created_at", (run_id,)).fetchall()
+                traces = [dict(r) for r in rows]
+            finally:
+                con.close()
+        except Exception:
+            traces = []
+    verifier_verdicts: dict[str, object] = {}
+    if run_dir and os.path.isdir(run_dir):
+        try:
+            for fn in sorted(os.listdir(run_dir)):
+                if fn.startswith("verifier_") and fn.endswith(".json"):
+                    name = fn[len("verifier_"):-len(".json")]
+                    try:
+                        with open(os.path.join(run_dir, fn), encoding="utf-8") as fh:
+                            body = fh.read().strip()
+                    except OSError:
+                        continue
+                    try:
+                        verifier_verdicts[name] = json.loads(body)  # parsed → pass/verdict
+                    except (ValueError, TypeError):
+                        verifier_verdicts[name] = {"raw": body[:200]}
+        except OSError:
+            pass
+    return traces, verifier_verdicts
+
+
+def _verifier_noise_rates(db: str, verifier_names) -> tuple[float, float]:
+    """(ρ_FP, ρ_FN) for the run's verifiers — the Layer-1 noise model. Uses
+    labeled ``verifier_results`` (migration 0025) when present (FP via the
+    shipped verifier_fp_rate primitive, FN computed inline), else conservative
+    priors (MO_EVAL_VERIFIER_FP_PRIOR / _FN_PRIOR). Averaged across verifiers.
+    Best-effort and fail-open — any error returns the priors."""
+    from mini_ork.learning import eval_judge as ej  # noqa: PLC0415
+    try:
+        fp_prior = float(os.environ.get("MO_EVAL_VERIFIER_FP_PRIOR", ej.DEFAULT_FP_PRIOR))
+        fn_prior = float(os.environ.get("MO_EVAL_VERIFIER_FN_PRIOR", ej.DEFAULT_FN_PRIOR))
+    except ValueError:
+        fp_prior, fn_prior = ej.DEFAULT_FP_PRIOR, ej.DEFAULT_FN_PRIOR
+    if not (db and os.path.isfile(db) and verifier_names):
+        return fp_prior, fn_prior
+    fps: list[float] = []
+    fns: list[float] = []
+    try:
+        from mini_ork.gates.verifier_rubric import verifier_fp_rate  # noqa: PLC0415
+        con = sqlite3.connect(db, timeout=5.0)
+        con.execute("PRAGMA busy_timeout=5000")
+        try:
+            for name in verifier_names:
+                total = con.execute(
+                    "SELECT COUNT(*) FROM verifier_results WHERE verifier_name=?",
+                    (name,)).fetchone()[0]
+                if not total:
+                    continue  # unlabeled → let the prior stand for this verifier
+                fn_ct = con.execute(
+                    "SELECT COUNT(*) FROM verifier_results "
+                    "WHERE verifier_name=? AND is_false_negative=1", (name,)).fetchone()[0]
+                fns.append(fn_ct / total)
+                try:
+                    fps.append(float(verifier_fp_rate(db, name)))
+                except (ValueError, TypeError):
+                    fps.append(fp_prior)
+        finally:
+            con.close()
+    except Exception:
+        return fp_prior, fn_prior
+    return (sum(fps) / len(fps) if fps else fp_prior,
+            sum(fns) / len(fns) if fns else fn_prior)
+
+
+def _eval_artifact_text(ctx: NodeDispatch) -> tuple[str, str]:
+    """Read the run's first declared final artifact (best-effort). Returns
+    (text, repo-relative-or-abs ref)."""
+    ref = ""
+    try:
+        ac = (json.load(open(ctx.plan_path)).get("artifact_contract") or {}) if ctx.plan_path else {}
+        outs = ac.get("outputs") or [] if isinstance(ac, dict) else []
+        ref = outs[0] if outs else ""
+    except Exception:
+        ref = ""
+    text = ""
+    if ref and os.path.isfile(ref):
+        try:
+            with open(ref, encoding="utf-8", errors="replace") as fh:
+                text = fh.read()
+        except OSError:
+            text = ""
+    return text, ref
+
+
+def _stamp_run_eval_reward(db, run_id, score, axes, source) -> None:
+    """Phase-1 rail (gated by MO_EVAL_STAMP_RUN): stamp the graded eval reward
+    across every delivery trace of this run so the GRPO router learns from the
+    judge instead of process_reward — mirrors trace_store.grade_run_reward for
+    the rubric. Excludes the dedicated eval row (reward_source=source) so it is
+    not overwritten. Best-effort."""
+    if not (db and run_id and os.path.isfile(db)):
+        return
+    from mini_ork.learning import eval_judge as ej  # noqa: PLC0415
+    s = ej.clamp01(score)
+    reward_g = (s - ej.EVAL_ANCHOR) / abs(ej.EVAL_ANCHOR)
+    vec = json.dumps({a: ej.clamp01(v) for a, v in axes.items()}) if axes else None
+    con = sqlite3.connect(db, timeout=5.0)
+    con.execute("PRAGMA busy_timeout=5000")
+    try:
+        con.execute(
+            "UPDATE execution_traces SET reward_value=?, reward_anchor=?, reward_g=?, "
+            "reward_direction='higher_is_better', reward_primary_metric=?, "
+            "reward_source=?, reward_vector_json=COALESCE(?, reward_vector_json) "
+            "WHERE run_id=? AND reward_source != ?",
+            (s, ej.EVAL_ANCHOR, reward_g, ej.EVAL_PRIMARY_METRIC, source, vec,
+             run_id, source))
+        con.commit()
+    finally:
+        con.close()
+
+
+def _warn_if_jury_not_decorrelated(jury_lanes) -> None:
+    """Advisory (never blocks): a jury drawn from a single model family isn't
+    decorrelated, so its consensus is weak — correlated judges make the same
+    mistakes, which is exactly what a jury is meant to defeat. Reuses the
+    coalition gate's family map. Best-effort."""
+    try:
+        from mini_ork.gates.coalition_gate import family_of  # noqa: PLC0415
+        families = {family_of(lane) for lane in jury_lanes}
+        if len(families) < 2:
+            print(f"  [eval] jury lanes {jury_lanes} span only family "
+                  f"{sorted(families)} — not decorrelated; consensus is weak",
+                  file=sys.stderr)
+    except Exception:
+        pass
+
+
+def _handle_eval(ctx: NodeDispatch):
+    """Advisory per-run graded eval (roadmap Step-3). Dispatches a
+    trajectory-aware LLM judge, aggregates its per-axis sub-scores, and persists
+    the result to execution_traces under reward_source='eval@v1'. It NEVER gates:
+    any dispatch/parse failure falls open to the rubric/PRM heuristic and the
+    node still returns success. Logic lives in mini_ork/learning/eval_judge.py."""
+    from mini_ork import trace_store  # noqa: PLC0415
+    from mini_ork.learning import eval_judge as ej  # noqa: PLC0415
+
+    run_dir = ctx.run_dir_eff or ctx.run_dir
+    recipe_prompt = (open(ctx.prompt_file, encoding="utf-8").read()
+                     if ctx.prompt_file and os.path.isfile(ctx.prompt_file) else "")
+    artifact_text, artifact_ref = _eval_artifact_text(ctx)
+    traces, verifier_verdicts = _read_run_trajectory(ctx.db, ctx.run_id, run_dir)
+    trajectory_summary = ej.trajectory_digest(traces, verifier_verdicts)
+
+    prompt = ej.build_eval_prompt(
+        node_desc=ctx.node_desc,
+        plan_content=ej.truncate(ctx.plan_content, 4000),
+        artifact_text=ej.truncate(artifact_text),
+        trajectory_summary=ej.truncate(trajectory_summary, 4000),
+        recipe_prompt=recipe_prompt,
+    )
+
+    # Layer 3 — dispatch the judge as a DECORRELATED JURY when MO_EVAL_JURY_LANES
+    # (comma-separated lanes from different model families) is set; else a single
+    # judge (default). The jury's veto is consensus-based and abstains when the
+    # panel can't agree (jury_veto), so no one model owns the veto.
+    jury_lanes = [x.strip() for x in
+                  os.environ.get("MO_EVAL_JURY_LANES", "").split(",") if x.strip()]
+    if len(jury_lanes) >= 2:
+        _warn_if_jury_not_decorrelated(jury_lanes)
+    envelopes = []
+    rc = 1
+    if jury_lanes:
+        for jlane in jury_lanes:
+            jrc, jres = ctx.dispatch_fn(ctx.task_class, jlane, prompt)
+            if jrc == 0 and jres:
+                env = ej.parse_eval_envelope(jres)
+                if env:
+                    envelopes.append(env)
+        rc = 0 if envelopes else 1
+    else:
+        rc, result = ctx.dispatch(prompt)
+        env = ej.parse_eval_envelope(result) if rc == 0 and result else None
+        if env:
+            envelopes.append(env)
+
+    primary = envelopes[0] if envelopes else None
+    axes = (primary.get("axes") or {}) if primary else {}
+    rationale = primary.get("rationale", "") if primary else ""
+    findings = primary.get("trajectory_findings", []) if primary else []
+
+    # Layer 0 — execution reward is the backbone (EGCA: execution, not opinion).
+    r_exec, exec_detail = ej.execution_reward(verifier_verdicts)
+    if r_exec is not None:
+        # Layer 1 — de-bias by the verifier's measured/prior FP-FN noise rates.
+        fp_rate, fn_rate = _verifier_noise_rates(ctx.db, list(verifier_verdicts.keys()))
+        r_corr = ej.noise_correct(r_exec, fp_rate, fn_rate)
+        # Layer 3 — the jury (or single judge) may only VETO by consensus, and
+        # abstains when the panel disagrees. Empty panel → no veto (fail-open).
+        score, jury_meta = ej.jury_veto(r_corr, envelopes)
+        # Selective escalation (2510.20369 — ask a strong judge when uncertain):
+        # a hung jury dispatches ONE strong tiebreaker lane whose veto decides,
+        # rather than silently abstaining. No escalate lane → abstain as before.
+        escalate_lane = os.environ.get("MO_EVAL_JURY_ESCALATE_LANE", "").strip()
+        if jury_meta.get("jury") == "abstain_low_agreement" and escalate_lane:
+            erc, eres = ctx.dispatch_fn(ctx.task_class, escalate_lane, prompt)
+            tie = ej.parse_eval_envelope(eres) if erc == 0 and eres else None
+            if tie is not None:
+                score = ej.judge_veto(r_corr, tie.get("axes") or {})
+                jury_meta = {**jury_meta, "jury": "escalated",
+                             "tiebreaker_lane": escalate_lane,
+                             "tiebreaker_axes": tie.get("axes") or {}}
+                print(f"  [eval] hung jury → escalated to {escalate_lane}",
+                      file=sys.stderr)
+        source, verdict = ej.EXEC_SOURCE, ej.verdict_from_score(score)
+        exec_meta = {"r_exec": r_exec, "r_corrected": r_corr,
+                     "fp_rate": fp_rate, "fn_rate": fn_rate,
+                     "verifiers": exec_detail, "jury": jury_meta}
+    elif primary is not None:
+        # No execution signal (vacuous / no verifiers) → judge-only, lower trust.
+        score = ej.aggregate_axes(axes, primary.get("score"))
+        source = ej.JUDGE_SOURCE
+        verdict = primary.get("verdict") or ej.verdict_from_score(score)
+        exec_meta = {"r_exec": None, "note": "no execution signal — judge-only reward"}
+        print("  [eval] no execution signal — judge-only reward (lower trust)",
+              file=sys.stderr)
+    else:
+        # Judge unavailable AND no execution signal → heuristic fallback.
+        score, source = ej.fallback_score(run_dir)
+        verdict = ej.verdict_from_score(score)
+        rationale = "judge unavailable + no execution signal — rubric/PRM heuristic"
+        exec_meta = {"r_exec": None, "note": "judge unavailable"}
+        print(f"  [eval] judge unavailable (rc={rc}) + no execution signal → "
+              f"fallback {source} score={score:.2f}", file=sys.stderr)
+
+    # Persist the envelope for offline graders + the data flywheel.
+    try:
+        with open(os.path.join(run_dir, "eval.json"), "w", encoding="utf-8") as fh:
+            json.dump({"score": score, "axes": axes, "verdict": verdict,
+                       "rationale": rationale, "trajectory_findings": findings,
+                       "reward_source": source, "execution": exec_meta}, fh, indent=2)
+    except OSError:
+        pass
+
+    # Reward vector: numeric axes + execution numbers (DB-safe; detail → eval.json).
+    reward_vector = {k: v for k, v in axes.items() if isinstance(v, (int, float))}
+    if exec_meta.get("r_exec") is not None:
+        reward_vector["r_exec"] = exec_meta["r_exec"]
+        reward_vector["r_corrected"] = exec_meta["r_corrected"]
+
+    # Write the graded reward onto the wired-but-empty 0042 reward columns.
+    try:
+        payload = ej.eval_reward_payload(
+            ctx.task_class, ctx.run_id, score, reward_vector, verdict,
+            source=source, artifact_ref=artifact_ref)
+        trace_store.trace_write(payload, db=ctx.db)
+    except Exception as exc:  # noqa: BLE001 — advisory; never sink the run
+        print(f"  [eval] reward write skipped: {exc}", file=sys.stderr)
+
+    if os.environ.get("MO_EVAL_STAMP_RUN", "0") == "1":
+        try:
+            _stamp_run_eval_reward(ctx.db, ctx.run_id, score, reward_vector, source)
+        except Exception:
+            pass
+
+    print(f"  [eval] {source} score={score:.2f} verdict={verdict} "
+          f"exec={exec_meta.get('r_exec')} axes={axes}")
+    ctx.charge()
+    return 0, "done"
+
+
 NODE_HANDLER_REGISTRY: dict[str, Callable[[NodeDispatch], tuple[int, str]]] = {
     "researcher": _handle_researcher,
     "transform": _handle_transform,
     "implementer": _handle_implementer,
     "reviewer": _handle_reviewer,
     "verifier": _handle_verifier,
+    "eval": _handle_eval,
     "publisher": _handle_publisher,
     "rollback": _handle_rollback,
 }

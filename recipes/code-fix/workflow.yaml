@@ -50,6 +50,19 @@ nodes:
     tools:
       native: [Read, Bash]
 
+  # Advisory per-run graded eval (roadmap Step-3). Trajectory-aware LLM judge
+  # → reward_source='eval@v1' on execution_traces. NEVER gates: it always
+  # succeeds (falls open to the rubric/PRM heuristic when the judge is
+  # unavailable), so it does not escalate to rollback. Reuses the reviewer lane
+  # for now; a dedicated independent judge lane is the Phase-1 improvement.
+  - name: eval
+    type: eval
+    model_lane: reviewer
+    prompt_ref: prompts/eval.md
+    dispatch_mode: serial
+    tools:
+      native: [Read]
+
   - name: publisher
     type: publisher
     prompt_ref: null
@@ -68,7 +81,8 @@ edges:
   - { from: implementer, to: test,        edge_type: verifies      }
   - { from: typecheck,   to: reviewer,    edge_type: depends_on    }
   - { from: test,        to: reviewer,    edge_type: depends_on    }
-  - { from: reviewer,    to: publisher,   edge_type: depends_on    }
+  - { from: reviewer,    to: eval,        edge_type: depends_on    }
+  - { from: eval,        to: publisher,   edge_type: depends_on    }
   - { from: typecheck,   to: rollback,    edge_type: escalates_to  }
   - { from: test,        to: rollback,    edge_type: escalates_to  }
   - { from: reviewer,    to: rollback,    edge_type: escalates_to  }
