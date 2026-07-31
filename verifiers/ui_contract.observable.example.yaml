@@ -1,0 +1,19 @@
+# Example observable descriptor for the `ui_contract` behavioral verifier.
+# Point MO_OBSERVABLE_SPEC at this file after setting MO_STAGING_URL.
+
+surface: ui
+staging_url: ${MO_STAGING_URL}
+target: /signup
+
+form:
+  - selector: "#email"
+    value: user@example.com
+  - selector: "#password"
+    value: test-password
+submit: "button[type=submit]"
+
+expect_visible:
+  - Welcome
+expect_url: /dashboard
+waits:
+  - "#dashboard"
