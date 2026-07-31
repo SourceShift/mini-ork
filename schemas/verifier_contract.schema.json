@@ -39,6 +39,42 @@
           "description": "For surface=api: base URL of the staging deployment to probe. Supports env expansion (e.g. ${MO_STAGING_URL}).",
           "default": ""
         },
+        "form": {
+          "type": "array",
+          "description": "For surface=ui: selector/value pairs to fill before submission.",
+          "items": {
+            "type": "object",
+            "required": ["selector", "value"],
+            "additionalProperties": false,
+            "properties": {
+              "selector": { "type": "string" },
+              "value": { "type": "string" }
+            }
+          },
+          "default": []
+        },
+        "submit": {
+          "type": "string",
+          "description": "For surface=ui: selector to click after filling the form.",
+          "default": ""
+        },
+        "expect_visible": {
+          "type": "array",
+          "description": "For surface=ui: text substrings expected in the browser snapshot.",
+          "items": { "type": "string" },
+          "default": []
+        },
+        "expect_url": {
+          "type": "string",
+          "description": "For surface=ui: substring expected in the browser's current URL.",
+          "default": ""
+        },
+        "waits": {
+          "type": "array",
+          "description": "For surface=ui: explicit wait expressions run before assertions.",
+          "items": { "type": "string" },
+          "default": []
+        },
         "method": {
           "type": "string",
           "description": "For surface=api: HTTP method to exercise.",
