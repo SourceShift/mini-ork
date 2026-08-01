@@ -10,6 +10,7 @@ import { RunInputPage } from "./routes/RunInputPage";
 import { TrajectoryPage } from "./routes/TrajectoryPage";
 import { SelfImproveDetailPage } from "./routes/SelfImproveDetailPage";
 import { FingerprintPage } from "./routes/FingerprintPage";
+import { TerminalPage } from "./routes/TerminalPage";
 
 const rootRoute = createRootRoute({ component: Shell });
 
@@ -73,6 +74,16 @@ const fingerprintRoute = createRoute({
   component: FingerprintPage,
 });
 
+const terminalRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/terminal",
+  validateSearch: (search: Record<string, unknown>): { run?: string; cmd?: string } => ({
+    ...(typeof search.run === "string" ? { run: search.run } : {}),
+    ...(typeof search.cmd === "string" ? { cmd: search.cmd } : {}),
+  }),
+  component: TerminalPage,
+});
+
 export const routeTree = rootRoute.addChildren([
   fleetRoute,
   newRunRoute,
@@ -83,4 +94,5 @@ export const routeTree = rootRoute.addChildren([
   trajectoryRoute,
   selfImproveDetailRoute,
   fingerprintRoute,
+  terminalRoute,
 ]);
