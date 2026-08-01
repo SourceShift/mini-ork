@@ -1,0 +1,15 @@
+# Live-shell orchestrator config — copy to `.mini-ork/orchestrator.yaml`.
+#
+# One orchestrator per project, backed by a long-lived tmux session that the
+# UI's Live shell attaches to. This file picks which harness that session runs.
+# It is read by the opt-in PTY bridge (`MO_PTY_ENABLED=1`); the file itself is
+# local to the project (gitignored under .mini-ork/).
+#
+# Resolution precedence (highest first):
+#   1. explicit `cmd` from the Live-shell UI toggle
+#   2. this file's `harness:` key
+#   3. the MO_ORCHESTRATOR environment variable
+#   4. the built-in default: opencode
+#
+# Allowed harnesses: opencode | codex | claude | shell
+harness: opencode

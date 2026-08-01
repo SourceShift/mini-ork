@@ -1,16 +1,22 @@
-"""WebSocket PTY bridge — shell into a run (or launch opencode) from the UI.
+"""WebSocket PTY bridge — attach the UI to a project's orchestrator.
 
 A terminal in a browser is just bytes over a socket: the server owns a real
 pseudo-terminal (via ``os.forkpty``), the browser runs xterm.js, and this
 endpoint copies bytes both ways. Window resizes travel as an out-of-band
 control frame.
 
+Unlike a bare forkpty (where the shell was a child of the request and died on
+disconnect), this attaches to a long-lived per-project tmux session — see
+``orchestrator_shell``. Each WebSocket forkpty()'s into ``tmux attach-session``,
+so the orchestrator survives reconnects and replays scrollback. When tmux is
+unavailable the endpoint falls back to launching the harness argv directly.
+
 SAFETY — a PTY is remote code execution scoped to whoever can reach the socket.
 The server binds 127.0.0.1, but a browser tab on any origin can still open a
 same-machine WebSocket (CORS does not gate ``ws://``). So the endpoint is
 OPT-IN: it stays closed unless ``MO_PTY_ENABLED=1`` is set in the *serving*
-process's environment. The command that runs is allow-listed by keyword in
-``_resolve_command`` — a query param can never inject an arbitrary argv.
+process's environment. The harness is allow-listed by ``resolve_harness`` — a
+query param can select a vetted program but never inject an arbitrary argv.
 """
 
 from __future__ import annotations
@@ -26,39 +32,48 @@ from pathlib import Path
 
 from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect
 
-from ..deps import get_default_home
-from ..recipes import mini_ork_root
+from ..deps import get_home_lenient
+from ..orchestrator_shell import (
+    build_attach_argv,
+    ensure_session,
+    harness_argv,
+    resolve_harness,
+    session_name,
+    tmux_available,
+)
 
 router = APIRouter(prefix="/api/v1", tags=["pty"])
 
 _FALSEY = ("", "0", "false", "no", "off")
+
+# One asyncio lock per tmux session name so concurrent first-connects can't
+# race two `new-session` spawns for the same project.
+_session_locks: dict[str, asyncio.Lock] = {}
 
 
 def pty_enabled() -> bool:
     return os.environ.get("MO_PTY_ENABLED", "").strip().lower() not in _FALSEY
 
 
-def _resolve_cwd(run_id: str | None) -> Path:
-    """cwd for the shell: the run's own dir when it exists, else the repo root."""
+def _resolve_cwd(run_id: str | None, home: Path) -> Path:
+    """cwd for the shell: the run's own dir when it exists, else the project root.
+
+    ``home`` is the project's ``.mini-ork`` dir, so ``home.parent`` is the
+    project root — the natural cwd for a per-project orchestrator.
+    """
     if run_id:
-        run_dir = get_default_home() / "runs" / run_id
+        run_dir = home / "runs" / run_id
         if run_dir.is_dir():
             return run_dir
-    return mini_ork_root()
+    return home.parent
 
 
-def _resolve_command(kind: str) -> list[str]:
-    """Which program the PTY runs — the one policy knob (see module docstring).
-
-    Allow-list by keyword so the ``cmd`` query param selects a program but can
-    never smuggle its own argv. Extend the table to expose more launchers.
-    """
-    shell = os.environ.get("SHELL", "/bin/bash")
-    table: dict[str, list[str]] = {
-        "shell": [shell, "-l"],
-        "opencode": ["opencode"],
-    }
-    return table.get(kind, table["shell"])
+def _session_lock(name: str) -> asyncio.Lock:
+    lock = _session_locks.get(name)
+    if lock is None:
+        lock = asyncio.Lock()
+        _session_locks[name] = lock
+    return lock
 
 
 def _set_winsize(fd: int, rows: int, cols: int) -> None:
@@ -72,7 +87,8 @@ def _set_winsize(fd: int, rows: int, cols: int) -> None:
 async def pty_socket(
     ws: WebSocket,
     run_id: str | None = Query(default=None),
-    cmd: str = Query(default="shell"),
+    cmd: str = Query(default=""),
+    home: str | None = Query(default=None),
     cols: int = Query(default=80, ge=1, le=1000),
     rows: int = Query(default=24, ge=1, le=1000),
 ) -> None:
@@ -85,8 +101,20 @@ async def pty_socket(
         await ws.close(code=4403)
         return
 
-    cwd = _resolve_cwd(run_id)
-    argv = _resolve_command(cmd)
+    project_home = get_home_lenient(None, home)
+    harness = resolve_harness(cmd or None, project_home)
+    cwd = _resolve_cwd(run_id, project_home)
+
+    if tmux_available():
+        # One long-lived session per (harness, project): spawn it once, then
+        # this connection is just a thin attach client.
+        name = session_name(harness, project_home)
+        async with _session_lock(name):
+            await asyncio.to_thread(ensure_session, name, harness, cwd, cols, rows)
+        argv = build_attach_argv(name)
+    else:
+        # No tmux — run the harness directly; no reconnect persistence.
+        argv = harness_argv(harness)
 
     pid, master_fd = os.forkpty()
     if pid == 0:  # child → become the shell
