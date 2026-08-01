@@ -6,7 +6,7 @@ agent executes in and bind-mounts that same drive into it. Together they answer
 the whole ask — "each agent in its own environment, all sharing one directory":
 
     MO_SHARED_DRIVE_BACKEND=local-bind   # -> resolve_run_drive_cwd picks the dir
-    MO_SANDBOX_BACKEND=docker            # -> each agent gets its own container
+    MO_SANDBOX_BACKEND=microvm           # -> each agent gets its own microVM
     MO_SANDBOX_IMAGE=alpine:latest       #    bind-mounting that dir at /workspace
 
 Contract (opt-in, loud on error):
@@ -15,10 +15,16 @@ Contract (opt-in, loud on error):
     default path never touches a Workspace).
   * ``local`` → a :class:`LocalWorkspace` (which itself delegates to
     ``mo_runtime_exec``) → observable parity with the unset path.
+  * ``microvm`` → a per-node :class:`MicrovmWorkspace` (hardware-isolated
+    microVM via the microsandbox SDK) bind-mounting the shared drive at
+    ``/workspace``. This is the **default-preferred** isolation: millisecond
+    boot, hardware isolation, and the *same* self-hosted server runs locally or
+    in the cloud — the scalable cloud-launch path.
   * ``docker`` → a per-node :class:`DockerWorkspace` bind-mounting the shared
-    drive at ``/workspace``; ``exec_cwd`` is the in-container mount path, not the
-    host path. The docker backend module is imported *here, lazily*, so the
-    default path never imports it.
+    drive at ``/workspace``; the local/offline **fallback** when no microVM
+    server is available. ``exec_cwd`` is the in-container mount path, not the
+    host path. Both backend modules are imported *here, lazily*, so the default
+    path never imports either.
   * unknown backend → ``ValueError`` from :func:`get_workspace` — never a silent
     host fallback.
 
@@ -84,15 +90,19 @@ def resolve_agent_workspace(
     if backend == "local":
         # Parity: LocalWorkspace.exec delegates straight to mo_runtime_exec.
         return get_workspace("local", root=node_cwd), node_cwd
-    if backend == "docker":
-        # Lazy import: the docker backend is only pulled in when opted into,
-        # keeping the default path free of any daemon/CLI dependency.
-        import mini_ork.runtime.backends.docker  # noqa: F401  (registers "docker")
+    if backend in ("microvm", "docker"):
+        # Lazy import: the container/microVM backend is only pulled in when
+        # opted into, keeping the default path free of any SDK/CLI dependency.
+        # microvm is the default-preferred isolation; docker is the fallback.
+        if backend == "microvm":
+            import mini_ork.runtime.backends.microvm  # noqa: F401  (registers "microvm")
+        else:
+            import mini_ork.runtime.backends.docker  # noqa: F401  (registers "docker")
 
         root = drive_root or (src.get(ENV_DRIVE_ROOT) or "").strip() or node_cwd
         image = (src.get(ENV_IMAGE) or "").strip()
         ws = get_workspace(
-            "docker", image=image, drive_root=root, mount_path=MOUNT_PATH
+            backend, image=image, drive_root=root, mount_path=MOUNT_PATH
         )
         return ws, MOUNT_PATH
     # Unknown backend → loud ValueError (never a silent host fallback).
