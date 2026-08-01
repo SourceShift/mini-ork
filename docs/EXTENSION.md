@@ -2,7 +2,7 @@
 
 mini-ork has 4 canonical extension points. None require forking the framework. All extensions live in user-land config dirs or recipe dirs.
 
-For Python-first integrations, start with [`docs/PYTHON_FRAMEWORK.md`](PYTHON_FRAMEWORK.md).
+For Python-first integrations, start with [`docs/PYTHON-SDK.md`](PYTHON-SDK.md).
 The Python facade exposes typed `RunRequest`, `RunResult`, `WorkflowSpec`,
 `RecipeSpec`, `ProviderPolicy`, and `ExtensionRegistry` objects while preserving
 the existing recipe directory format underneath.
