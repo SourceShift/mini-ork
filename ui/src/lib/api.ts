@@ -682,12 +682,37 @@ export type DispatchResponse = {
 };
 
 // --- durable-dag recovery projection --------------------------------------
+// Shape mirrors mini_ork/recovery/admin.py::recovery_projection — assembled
+// from node_checkpoints/node_attempts/recovery_requests/run_leases, never log
+// scraping. Always returns nodes:[] + next_action so the UI can always render.
+
+export type RecoveryAttempt = {
+  attempt_no: number;
+  result: string | null;
+  failure_class: string | null;
+  started_at: number | null;
+  ended_at: number | null;
+};
+
+export type RecoveryNode = {
+  node_id: string;
+  status: string;
+  reusable: boolean;
+  attempts: RecoveryAttempt[];
+};
 
 export type RecoveryProjection = {
-  run_id?: string;
-  status?: string;
-  nodes: Array<Record<string, unknown>>;
-  [k: string]: unknown;
+  run_id: string;
+  nodes: RecoveryNode[];
+  active_recovery: {
+    request_id: string;
+    status: string;
+    from_node: string | null;
+    dispatch_count: number;
+    failure_class: string | null;
+  } | null;
+  lease: { owner_token: string; expires_at: number; live: boolean } | null;
+  next_action: string;
 };
 
 // --- endpoints -----------------------------------------------------------

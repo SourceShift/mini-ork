@@ -3,7 +3,8 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import clsx from "clsx";
 import type React from "react";
 import { useEffect, useRef, useState } from "react";
-import { Activity, BookMarked, BrainCircuit, ChevronDown, FolderOpen, GitBranch, Network, Radio, Rocket, Search, Telescope, X } from "lucide-react";
+import { Activity, BookMarked, BrainCircuit, ChevronDown, FolderOpen, GitBranch, Network, Radio, Rocket, Search, Telescope, TerminalSquare, X } from "lucide-react";
+import type { LucideIcon } from "lucide-react";
 
 import { api, getWorkspaceHome, setWorkspaceHome, type TaskRun } from "@/lib/api";
 import { formatCost } from "@/lib/format";
@@ -15,11 +16,27 @@ const NAV = [
   { to: "/recipes", label: "Recipes", icon: BookMarked, key: "3" },
   { to: "/trajectory", label: "Trajectory", icon: Telescope, key: "4" },
   { to: "/fingerprint", label: "Fingerprint", icon: Network, key: "5" },
+  { to: "/terminal", label: "Terminal", icon: TerminalSquare, key: "6" },
 ] as const;
 
 export function Shell() {
   const { location } = useRouterState();
   const router = useRouter();
+  const [paletteOpen, setPaletteOpen] = useState(false);
+
+  // Global ⌘K / Ctrl-K opens the command palette from anywhere — the one
+  // keyboard entry into navigation + run-jumping. Capture-phase so it fires
+  // even while an input (the rail grep, a steer box) holds focus.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
+        e.preventDefault();
+        setPaletteOpen((v) => !v);
+      }
+    };
+    document.addEventListener("keydown", onKey, true);
+    return () => document.removeEventListener("keydown", onKey, true);
+  }, []);
 
   // Keep ?ws= pinned in the URL so reloads/deep links resolve to the right
   // workspace. Router navigations strip unknown search params; re-append via
@@ -162,8 +179,167 @@ export function Shell() {
           <Radio size={11} />
           loopback · control
         </span>
-        <span className="kbd">⌘K</span>
+        <button
+          type="button"
+          onClick={() => setPaletteOpen(true)}
+          className="kbd hover:text-[var(--cyan)]"
+          data-testid="palette-open"
+          title="Command palette"
+        >
+          ⌘K
+        </button>
       </footer>
+
+      <CommandPalette open={paletteOpen} onClose={() => setPaletteOpen(false)} runs={runs ?? []} />
+    </div>
+  );
+}
+
+type PaletteAction = {
+  id: string;
+  group: string;
+  label: string;
+  hint?: string;
+  icon: LucideIcon;
+  run: () => void;
+};
+
+/** ⌘K command palette — the keyboard spine of the deck. No dependency: a plain
+ * filtered list over static navigation + the live fleet, so any run is two
+ * keystrokes away. Machine-proposes/human-runs holds here too — selecting a run
+ * navigates, it never launches. */
+function CommandPalette({ open, onClose, runs }: { open: boolean; onClose: () => void; runs: TaskRun[] }) {
+  const router = useRouter();
+  const [q, setQ] = useState("");
+  const [cursor, setCursor] = useState(0);
+  const inputRef = useRef<HTMLInputElement>(null);
+  const listRef = useRef<HTMLDivElement>(null);
+
+  // Fresh query + focus each time it opens; reset cursor so the first match is
+  // always primed for Enter.
+  useEffect(() => {
+    if (open) {
+      setQ("");
+      setCursor(0);
+      // focus after paint — the input mounts with the overlay
+      requestAnimationFrame(() => inputRef.current?.focus());
+    }
+  }, [open]);
+
+  const go = (to: string) => {
+    onClose();
+    void router.navigate({ to });
+  };
+  const goRun = (id: string) => {
+    onClose();
+    void router.navigate({ to: "/runs/$taskRunId", params: { taskRunId: id } });
+  };
+
+  const actions: PaletteAction[] = [
+    ...NAV.map((n) => ({
+      id: `nav:${n.to}`,
+      group: "Go to",
+      label: n.label,
+      hint: n.key,
+      icon: n.icon,
+      run: () => go(n.to),
+    })),
+    ...runs.slice(0, 40).map((r) => ({
+      id: `run:${r.id}`,
+      group: "Jump to run",
+      label: shortRunId(r.id),
+      hint: r.recipe ?? r.task_class,
+      icon: Activity,
+      run: () => goRun(r.id),
+    })),
+  ];
+
+  const needle = q.trim().toLowerCase();
+  const filtered = needle
+    ? actions.filter((a) => `${a.label} ${a.hint ?? ""}`.toLowerCase().includes(needle))
+    : actions;
+  const clampedCursor = Math.min(cursor, Math.max(0, filtered.length - 1));
+
+  const onKey = (e: React.KeyboardEvent) => {
+    if (e.key === "Escape") {
+      e.preventDefault();
+      onClose();
+    } else if (e.key === "ArrowDown") {
+      e.preventDefault();
+      setCursor((c) => Math.min(c + 1, filtered.length - 1));
+    } else if (e.key === "ArrowUp") {
+      e.preventDefault();
+      setCursor((c) => Math.max(c - 1, 0));
+    } else if (e.key === "Enter") {
+      e.preventDefault();
+      filtered[clampedCursor]?.run();
+    }
+  };
+
+  if (!open) return null;
+
+  // Group headers are rendered inline by tracking group transitions as we map.
+  let lastGroup = "";
+
+  return (
+    <div
+      className="fixed inset-0 z-[100] flex items-start justify-center bg-black/50 pt-[12vh]"
+      data-testid="command-palette"
+      onMouseDown={(e) => {
+        if (e.target === e.currentTarget) onClose();
+      }}
+    >
+      <div
+        className="w-[560px] max-w-[92vw] overflow-hidden rounded-[4px] border border-[var(--hair-2)] bg-[var(--bg)] shadow-2xl"
+        onKeyDown={onKey}
+      >
+        <label className="flex items-center gap-2 border-b border-[var(--hair)] px-3 py-2.5">
+          <Search size={14} className="text-ink-500" />
+          <input
+            ref={inputRef}
+            value={q}
+            onChange={(e) => {
+              setQ(e.target.value);
+              setCursor(0);
+            }}
+            placeholder="Jump to a page or run…"
+            className="w-full bg-transparent text-[13px] text-ink-100 outline-none placeholder:text-ink-600"
+            data-testid="palette-input"
+          />
+          <span className="kbd">esc</span>
+        </label>
+        <div ref={listRef} className="max-h-[52vh] overflow-auto thin py-1" data-testid="palette-list">
+          {filtered.map((a, i) => {
+            const header = a.group !== lastGroup ? a.group : null;
+            lastGroup = a.group;
+            const active = i === clampedCursor;
+            const Icon = a.icon;
+            return (
+              <div key={a.id}>
+                {header && (
+                  <div className="px-3 pb-1 pt-2 text-[9px] uppercase tracking-[0.18em] text-ink-600">{header}</div>
+                )}
+                <button
+                  type="button"
+                  onMouseEnter={() => setCursor(i)}
+                  onClick={() => a.run()}
+                  data-active={active}
+                  data-testid={`palette-item-${a.id}`}
+                  className={clsx(
+                    "flex w-full items-center gap-2.5 px-3 py-1.5 text-left text-[12px]",
+                    active ? "bg-[var(--cyan)]/12 text-ink-100" : "text-ink-300 hover:bg-white/[0.035]",
+                  )}
+                >
+                  <Icon size={14} />
+                  <span className="min-w-0 flex-1 truncate">{a.label}</span>
+                  {a.hint && <span className="shrink-0 text-[10px] text-ink-500">{a.hint}</span>}
+                </button>
+              </div>
+            );
+          })}
+          {!filtered.length && <div className="px-3 py-6 text-center text-[11px] text-ink-500">no match</div>}
+        </div>
+      </div>
     </div>
   );
 }
