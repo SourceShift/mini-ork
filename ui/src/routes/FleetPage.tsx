@@ -6,6 +6,7 @@ import { useState } from "react";
 import { api, type TaskRun } from "@/lib/api";
 import { formatCost, formatDuration, formatRelative } from "@/lib/format";
 import { StatusPill, VerdictPill } from "@/components/Pill";
+import { NewRunLauncher } from "@/components/NewRunLauncher";
 
 const MAP_RUN_LIMIT = 14;
 const MAP_WINDOWS = [
@@ -58,10 +59,12 @@ export function FleetPage() {
           </div>
           <div className="hidden md:flex items-center gap-2 text-[10px] uppercase tracking-[0.12em] text-ink-500">
             <span className="h-1.5 w-1.5 rounded-full bg-[var(--grn)] live-dot" style={{ color: "var(--grn)" }} />
-            query_only
+            control ready
           </div>
         </div>
       </header>
+
+      <NewRunLauncher compact />
 
       <section className="grid grid-cols-2 lg:grid-cols-4 gap-2" data-testid="fleet-stats">
         <Stat icon={<Boxes size={16} />} label="task_runs" value={totalRuns} testid="stat-task-runs" />

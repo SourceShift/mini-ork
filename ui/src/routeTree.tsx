@@ -2,6 +2,8 @@ import { createRootRoute, createRoute } from "@tanstack/react-router";
 
 import { Shell } from "./components/Shell";
 import { FleetPage } from "./routes/FleetPage";
+import { NewRunPage } from "./routes/NewRunPage";
+import { RecipesPage } from "./routes/RecipesPage";
 import { RunDetailPage } from "./routes/RunDetailPage";
 import { AgentDetailPage } from "./routes/AgentDetailPage";
 import { RunInputPage } from "./routes/RunInputPage";
@@ -15,6 +17,18 @@ const fleetRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/",
   component: FleetPage,
+});
+
+const newRunRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/new",
+  component: NewRunPage,
+});
+
+const recipesRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/recipes",
+  component: RecipesPage,
 });
 
 const runDetailRoute = createRoute({
@@ -61,6 +75,8 @@ const fingerprintRoute = createRoute({
 
 export const routeTree = rootRoute.addChildren([
   fleetRoute,
+  newRunRoute,
+  recipesRoute,
   runDetailRoute,
   agentDetailRoute,
   runInputRoute,
