@@ -74,8 +74,11 @@ The command deck. Four sections, top to bottom:
 1. **Stat cards** — total `task_runs`, currently executing (amber when >0),
    failed (red when >0), and cumulative spend from the `llm_calls` ledger.
 2. **Dispatch map** — up to 14 recent runs drawn as hexagons around the
-   central orchestrator. Green pulse = executing now; red + `!` = failed;
-   gray = finished. Solid spokes are active dispatches, dashed are settled.
+   central orchestrator. Use the `1h` / `1d` / `7d` / `all` window control to
+   restrict the map by run creation time without hiding rows from the evidence
+   table below. Green pulse = executing now; red + `!` = failed; gray =
+   finished. Solid spokes are active dispatches, dashed are settled. Compact
+   labels preserve both ends of long run IDs; hover a node for the full ID.
    Every hexagon is a link to that run's forensics page.
 3. **Active runs table** — heartbeat-tracked in-flight dispatches (epic,
    agent, branch, started, last heartbeat, test status, cost). Refreshes
