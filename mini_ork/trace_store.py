@@ -203,8 +203,15 @@ def grade_run_reward(run_dir: str, run_id: str, db: str | None = None) -> int:
     rubric_path = os.path.join(run_dir, "rubric.json")
     try:
         with open(rubric_path, encoding="utf-8") as fh:
-            score = float(json.load(fh).get("score"))
+            rubric = json.load(fh)
+        score = float(rubric.get("score"))
     except (ValueError, TypeError, KeyError, OSError):
+        return 0
+    # A rubric that failed to parse writes {"parse_error": true, "score": -1}.
+    # That -1 is a grader-failure SENTINEL, not a real 0/8 — normalizing it would
+    # stamp reward_g=-1 on every trace of the run, punishing the whole run for the
+    # grader's own failure and poisoning the GRPO signal. No-op instead.
+    if rubric.get("parse_error") or score < 0:
         return 0
     val = max(0.0, min(1.0, score / 8.0))
     anchor = 0.5
