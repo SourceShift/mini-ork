@@ -21,8 +21,16 @@ needs a container/runtime — but it shows how you would construct it.
 
 from __future__ import annotations
 
+import sys
 import tempfile
 from pathlib import Path
+
+# Run from a fresh clone without `pip install`: put the repo root on the path
+# so `import mini_ork` resolves even though this script lives two levels down.
+if "mini_ork" not in sys.modules:
+    _repo_root = Path(__file__).resolve().parents[2]
+    if (_repo_root / "mini_ork" / "__init__.py").exists():
+        sys.path.insert(0, str(_repo_root))
 
 from mini_ork import (
     DispatchRequest,
