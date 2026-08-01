@@ -219,6 +219,10 @@ ask a person rather than manufacture confidence. That discipline is wired in, no
 
 ## Learn more
 
+Embedding mini-ork in your own app? The [Python SDK](docs/PYTHON-SDK.md) covers both
+the importable primitives (verification, dispatch, memory, routing) and the `MiniOrk`
+orchestrator client.
+
 Read the [architecture](docs/ARCHITECTURE.md), [operator guide](docs/operator),
 [safety model](docs/SAFETY.md), and [feature inventory](docs/reference/FEATURE-INVENTORY.md)
 when you need the detailed contracts.

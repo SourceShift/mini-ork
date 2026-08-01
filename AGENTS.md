@@ -10,6 +10,7 @@ This file is the canonical context map. Detail lives in `docs/`; procedural know
 - **[docs/architecture](docs/architecture)** — system design and component diagrams
 - **[Artifact graph contracts](docs/architecture/artifact-graph.md)** — declared ports, run-local manifests, transforms, and visibility limits
 - **[docs/operator](docs/operator)** — running mini-ork, env vars, troubleshooting
+- **[Python SDK](docs/PYTHON-SDK.md)** — embed mini-ork: importable primitives + the `MiniOrk` orchestrator client
 - **[recipes](recipes)** — available task recipes (`code-fix`, `bug-audit-cmgk`, `framework-edit`, …)
 - **[schemas](schemas)** — `task_class.schema.json`, `workflow.schema.json`, `artifact_contract.schema.json`
 - **[tests](tests)** — unit and e2e tests

@@ -104,7 +104,7 @@ experience and feeds it forward:
 |---|---|---|
 | 4 canonical extension points | `docs/EXTENSION.md` | WorkflowGraph (YAML), AgentRegistry, VerifierRegistry, ExperienceMemory — all user-land. |
 | Recipe system | `recipes/` (12 shipped) | Pipeline shapes are data, not framework code. Copy one, edit YAML, run. |
-| Python facade | `mini_ork/` + `docs/PYTHON_FRAMEWORK.md` | Typed `MiniOrk().run(RunRequest(...))` embedding — host mini-ork inside your own app. |
+| Python SDK | `mini_ork/` + `docs/PYTHON-SDK.md` | Importable primitives (verification, dispatch, memory, routing) **and** the typed `MiniOrk().run(RunRequest(...))` orchestrator — embed mini-ork inside your own app. |
 | Recursive orchestration | `bin/mini-ork-spawn` + `lib/recursive_orchestration.sh` | Bounded parent/child mini-ork delegation with lineage tracking and policy limits. |
 | Custom utility scoring | `${MINI_ORK_HOME}/config/utility_functions/` | Override the promotion utility function per task class. |
 
