@@ -2356,7 +2356,13 @@ def _handle_reviewer(ctx: NodeDispatch):
     print(f"  [info] reviewer verdict={verdict} → {review_file}")
     vn = verdict.lower()
     if is_synth:  # true synth only — panel gate falls through to the verdict gate
-        ctx.trace(ctx.node_id, "success", "reviewer", review_file, verdict, "done")
+        # BUG6: a synthesizer produces a document, not a pass/fail verdict, so
+        # _extract_verdict finds no JSON and returns 'unknown'. Stamping that on
+        # the trace misreports the synth as an ambiguous REVIEW — which poisons
+        # rho_aggregator (win/loss counting) and the gradient extractor (it read
+        # reviewer_verdict='unknown' as a real defect). Trace no verdict instead.
+        synth_verdict = "" if vn == "unknown" else verdict
+        ctx.trace(ctx.node_id, "success", "reviewer", review_file, synth_verdict, "done")
         ctx.charge()
         return 0, "done"
     if vn in _REVIEW_PASS:
