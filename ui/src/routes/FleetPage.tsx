@@ -6,7 +6,6 @@ import { useState } from "react";
 import { api, type TaskRun } from "@/lib/api";
 import { formatCost, formatDuration, formatRelative } from "@/lib/format";
 import { StatusPill, VerdictPill } from "@/components/Pill";
-import { NewRunLauncher } from "@/components/NewRunLauncher";
 import { NeedsYouStrip } from "@/components/NeedsYouStrip";
 import { RunControls } from "@/components/RunControls";
 import { FlywheelPanel } from "@/components/FlywheelPanel";
@@ -69,8 +68,6 @@ export function FleetPage() {
       </header>
 
       <NeedsYouStrip taskRuns={runs.data ?? []} activeRuns={active.data ?? []} />
-
-      <NewRunLauncher compact />
 
       <section className="grid grid-cols-2 lg:grid-cols-4 gap-2" data-testid="fleet-stats">
         <Stat icon={<Boxes size={16} />} label="task_runs" value={totalRuns} testid="stat-task-runs" />
