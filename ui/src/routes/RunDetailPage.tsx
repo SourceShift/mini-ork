@@ -6,6 +6,7 @@ import {
   ArrowLeft,
   Bot,
   BrainCircuit,
+  ChevronDown,
   Clock,
   Database,
   FileInput,
@@ -14,6 +15,7 @@ import {
   Route,
   ShieldCheck,
   ScrollText,
+  TerminalSquare,
 } from "lucide-react";
 
 import { api, type AgentSummary, type ArtifactEntry, type DagNode, type Diagnostic, type LearningAttribution, type LlmCall, type RunEvent, type RunInput, type RunLearning, type TaskRun } from "@/lib/api";
@@ -25,6 +27,8 @@ import { WhyCard } from "@/components/WhyCard";
 import { RunControls } from "@/components/RunControls";
 import { NeedsAnswersPanel } from "@/components/NeedsAnswersPanel";
 import { RunInputModal } from "@/components/RunInputModal";
+import { ResumePanel } from "@/components/ResumePanel";
+import { TerminalPanel } from "@/components/TerminalPanel";
 import { useEventStream } from "@/lib/sse";
 
 export function RunDetailPage() {
@@ -162,6 +166,7 @@ export function RunDetailPage() {
       {activeTab === "overview" && (
         <>
           <NeedsAnswersPanel taskRunId={taskRunId} />
+          <ResumePanel taskRunId={taskRunId} />
           <PipelineCard
             nodes={dagNodes}
             taskRunId={taskRunId}
@@ -207,8 +212,39 @@ export function RunDetailPage() {
           </section>
         </>
       )}
+      <EmbeddedTerminal taskRunId={taskRunId} />
       <RunInputModal taskRunId={taskRunId} input={selectedInput} onClose={() => setSelectedInput(null)} />
     </div>
+  );
+}
+
+/** Collapsible live shell into this run's directory. Default-collapsed and
+ * lazily mounted: the PTY bridge is opt-in (MO_PTY_ENABLED=1) and we don't
+ * open a socket until the operator asks for it. */
+function EmbeddedTerminal({ taskRunId }: { taskRunId: string }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <section className="card !p-0 overflow-hidden" data-testid="run-terminal-section">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        className="flex w-full items-center gap-2 px-3 py-2 text-left panel-title !m-0"
+        data-testid="run-terminal-toggle"
+        data-open={open}
+      >
+        <TerminalSquare size={13} className="text-[var(--cyan)]" />
+        <span>Terminal</span>
+        <span className="text-[9.5px] font-normal normal-case tracking-normal text-ink-600">
+          live shell into this run&apos;s directory
+        </span>
+        <ChevronDown size={13} className={`ml-auto transition-transform ${open ? "" : "-rotate-90"}`} />
+      </button>
+      {open && (
+        <div className="p-2 pt-0">
+          <TerminalPanel runId={taskRunId} cmd="shell" />
+        </div>
+      )}
+    </section>
   );
 }
 
