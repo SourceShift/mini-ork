@@ -6,3 +6,8 @@ allowBuilds:
   esbuild: true
 onlyBuiltDependencies:
   - esbuild
+# Force every postcss copy (direct + autoprefixer/tailwind peers) to a version
+# patched for GHSA sourceMappingURL path traversal (fixed in 8.5.18).
+# pnpm 11 reads overrides here, not from package.json's pnpm field.
+overrides:
+  postcss: "^8.5.18"
