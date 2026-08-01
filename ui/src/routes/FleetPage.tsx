@@ -1,12 +1,24 @@
 import { useQuery } from "@tanstack/react-query";
 import { Link } from "@tanstack/react-router";
 import { Activity, Banknote, Boxes, GaugeCircle } from "lucide-react";
+import { useState } from "react";
 
 import { api, type TaskRun } from "@/lib/api";
 import { formatCost, formatDuration, formatRelative } from "@/lib/format";
 import { StatusPill, VerdictPill } from "@/components/Pill";
 
+const MAP_RUN_LIMIT = 14;
+const MAP_WINDOWS = [
+  { value: "1h", label: "1h", seconds: 60 * 60, description: "1 hour" },
+  { value: "1d", label: "1d", seconds: 24 * 60 * 60, description: "1 day" },
+  { value: "7d", label: "7d", seconds: 7 * 24 * 60 * 60, description: "7 days" },
+  { value: "all", label: "all", seconds: null, description: "all recent runs" },
+] as const;
+
+type MapWindow = (typeof MAP_WINDOWS)[number]["value"];
+
 export function FleetPage() {
+  const [mapWindow, setMapWindow] = useState<MapWindow>("all");
   // Fleet polls — browsers cap ~6 concurrent HTTP/1.1 connections per
   // origin, so over-eager polling competes with SSE + nav clicks and
   // surfaces as stalled requests in DevTools. SSE already pushes deltas
@@ -30,6 +42,8 @@ export function FleetPage() {
   const totalRuns = summary.data?.by_status.reduce((acc, s) => acc + s.count, 0) ?? 0;
   const activeRuns = active.data?.length ?? summary.data?.by_status.find((s) => s.status === "executing")?.count ?? 0;
   const failedRuns = summary.data?.by_status.find((s) => s.status === "failed")?.count ?? 0;
+  const mapRuns = filterRunsByWindow(runs.data ?? [], mapWindow);
+  const activeMapWindow = MAP_WINDOWS.find((option) => option.value === mapWindow) ?? MAP_WINDOWS[3];
 
   return (
     <div className="p-3 space-y-3 max-w-[1500px] mx-auto" data-testid="fleet-page">
@@ -74,8 +88,46 @@ export function FleetPage() {
       </section>
 
       <section className="card !p-0 overflow-hidden" data-testid="fleet-dispatch-map-section">
-        <div className="panel-title !m-0">Fleet · dispatch map</div>
-        <FleetDispatchMap runs={runs.data ?? []} activeCount={activeRuns} totalCount={totalRuns} />
+        <div className="panel-title !m-0 !h-auto min-h-[26px] flex-wrap justify-between gap-2 py-1">
+          <span>Fleet · dispatch map</span>
+          <div
+            className="ml-auto flex items-center gap-1 font-mono text-[9px] font-normal tracking-normal text-ink-500"
+            role="group"
+            aria-label="Filter dispatch map by run age"
+            data-testid="fleet-map-window-control"
+          >
+            <span className="mr-1 uppercase tracking-[0.1em] text-ink-600">window</span>
+            {MAP_WINDOWS.map((option) => {
+              const selected = mapWindow === option.value;
+              return (
+                <button
+                  key={option.value}
+                  type="button"
+                  onClick={() => setMapWindow(option.value)}
+                  aria-pressed={selected}
+                  title={option.seconds === null ? "Show all recent runs" : `Show runs newer than ${option.description}`}
+                  className={
+                    selected
+                      ? "h-5 rounded-[2px] border border-[var(--cyan)] bg-white/[0.06] px-1.5 text-[var(--cyan)]"
+                      : "h-5 rounded-[2px] border border-[var(--hair)] px-1.5 text-ink-500 hover:border-[var(--hair-2)] hover:text-ink-300"
+                  }
+                  data-testid={`fleet-map-window-${option.value}`}
+                >
+                  {option.label}
+                </button>
+              );
+            })}
+            <span className="ml-1 border-l border-[var(--hair)] pl-2 text-ink-600" data-testid="fleet-map-shown-count">
+              {Math.min(mapRuns.length, MAP_RUN_LIMIT)} shown
+            </span>
+          </div>
+        </div>
+        <FleetDispatchMap
+          runs={mapRuns}
+          activeCount={activeRuns}
+          totalCount={totalRuns}
+          windowDescription={activeMapWindow.description}
+        />
       </section>
 
       <section className="card" data-testid="active-runs-section">
@@ -193,12 +245,14 @@ function FleetDispatchMap({
   runs,
   activeCount,
   totalCount,
+  windowDescription,
 }: {
   runs: TaskRun[];
   activeCount: number;
   totalCount: number;
+  windowDescription: string;
 }) {
-  const shown = runs.slice(0, 14);
+  const shown = runs.slice(0, MAP_RUN_LIMIT);
   const width = 900;
   const height = 300;
   const cx = width / 2;
@@ -209,7 +263,9 @@ function FleetDispatchMap({
   if (!shown.length) {
     return (
       <div className="empty m-3" data-testid="fleet-dispatch-map-empty">
-        <div className="sm">No runs to map.</div>
+        <div className="sm">
+          {windowDescription === "all recent runs" ? "No runs to map." : `No runs newer than ${windowDescription}.`}
+        </div>
       </div>
     );
   }
@@ -266,10 +322,17 @@ function FleetDispatchMap({
 function RunMapNode({ run, x, y }: { run: TaskRun; x: number; y: number }) {
   const ring = run.status === "executing" ? "var(--grn)" : run.status === "failed" ? "var(--red)" : "var(--edge)";
   const fill = run.status === "failed" ? "rgba(240,88,78,0.16)" : run.status === "executing" ? "rgba(79,209,160,0.16)" : "rgba(255,255,255,0.045)";
-  const label = run.id.length > 13 ? run.id.slice(0, 13) : run.id;
+  const label = compactRunId(run.id);
   return (
-    <Link to="/runs/$taskRunId" params={{ taskRunId: run.id }} data-testid={`fleet-map-node-${run.id}`}>
+    <Link
+      to="/runs/$taskRunId"
+      params={{ taskRunId: run.id }}
+      aria-label={`${run.id}: ${run.status}`}
+      data-testid={`fleet-map-node-${run.id}`}
+      data-map-label={label}
+    >
       <g className="cursor-pointer">
+        <title>{run.id}</title>
         {run.status === "executing" && (
           <circle cx={x} cy={y} r="22" fill="none" stroke="var(--grn)" strokeWidth="1" opacity="0.35">
             <animate attributeName="r" values="18;28" dur="1.8s" repeatCount="indefinite" />
@@ -293,6 +356,20 @@ function RunMapNode({ run, x, y }: { run: TaskRun; x: number; y: number }) {
       </g>
     </Link>
   );
+}
+
+function compactRunId(id: string, maxLength = 17): string {
+  if (id.length <= maxLength) return id;
+  const tailLength = 6;
+  const headLength = maxLength - tailLength - 1;
+  return `${id.slice(0, headLength)}…${id.slice(-tailLength)}`;
+}
+
+function filterRunsByWindow(runs: TaskRun[], window: MapWindow, nowSeconds = Date.now() / 1000): TaskRun[] {
+  const option = MAP_WINDOWS.find((candidate) => candidate.value === window);
+  if (!option?.seconds) return runs;
+  const cutoff = nowSeconds - option.seconds;
+  return runs.filter((run) => run.created_at >= cutoff);
 }
 
 function OrchestratorNode({ x, y }: { x: number; y: number }) {
