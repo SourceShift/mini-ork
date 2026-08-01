@@ -93,8 +93,79 @@ print(result.run_id, result.verdict, result.ok)
 `RunResult` is populated from the CLI's machine-readable `--json` contract
 (`mini_ork_result={…}`), so `run_id` / `task_class` / `plan_path` / `verdict` /
 `returncode` are parsed from one structured line rather than scraped from human
-output. Define recipes in code with `RecipeBuilder` (see `mini_ork.extensions`)
-or point at YAML — both are supported.
+output. Define recipes in code with `RecipeBuilder` (see below) or point at
+YAML — both are supported.
+
+### Provider policy & auto-init
+
+`RunRequest` can carry a `ProviderPolicy` (e.g. `ProviderPolicy.codex_only()`),
+which mini-ork writes to `.mini-ork/config/agents.yaml` before the run.
+`auto_init=True` bootstraps `.mini-ork/` on first use (matching `mini-ork init`);
+set it to `False` when your app manages initialization itself.
+
+```python
+from mini_ork import MiniOrk, ProviderPolicy, RunRequest
+result = MiniOrk().run(RunRequest(
+    kickoff="kickoff.md", recipe="docs", mode="dry-run",
+    provider_policy=ProviderPolicy.codex_only(), auto_init=True,
+))
+```
+
+### Recursive delegation — `spawn`
+
+A run can spawn child runs. `spawn` is parent-centric: you name the parent run,
+and mini-ork enforces recursion limits before approving a child.
+
+```python
+from mini_ork import MiniOrk, SpawnRequest
+child = MiniOrk().spawn(SpawnRequest(
+    parent_run_id="run-root-123", kickoff="child-task.md",
+    recipe="code-fix", allow_child_spawn=True, mode="dry-run",
+))
+print(child.spawn_id, child.child_workspace, child.spawn_status)
+```
+
+Limits (env vars, with defaults): `MINI_ORK_RECURSIVE_MAX_DEPTH` (2),
+`MINI_ORK_RECURSIVE_MAX_CHILDREN` (4), `MINI_ORK_RECURSIVE_MAX_DESCENDANTS`
+(16), `MINI_ORK_RECURSIVE_MAX_PARALLEL` (4). Children run under
+`.mini-ork/runs/<parent>/children/<child>/worktree/` and share the parent's
+state db; the parent owns merge and publish.
+
+### Defining recipes in code — `RecipeBuilder`
+
+Build a recipe as typed Python instead of hand-writing YAML, then register it:
+
+```python
+from mini_ork import ExtensionRegistry, NodeSpec, RecipeBuilder
+
+registry = ExtensionRegistry()
+recipe = (
+    RecipeBuilder("invoice-audit", "invoice_audit", "Audit invoices")
+    .keywords("invoice", "tax", "vat")
+    .node(NodeSpec(name="planner", type="planner", model_lane="planner"))
+    .node(NodeSpec(name="verifier", type="verifier", verifier_ref="verifiers/check.sh"))
+    .edge("planner", "verifier", "verifies")
+    .build()
+)
+registry.recipe(recipe)
+
+@registry.verifier("invoice-total")
+def verify_invoice_total(artifact_path, plan_path):
+    return artifact_path.exists() and plan_path.exists()
+```
+
+`RecipeBuilder` targets the same `recipes/<name>/` format the CLI reads
+(`workflow.yaml`, `task_class.yaml`, prompts, verifiers) — code and YAML are two
+front-ends to one contract.
+
+### Transparency — what every result carries
+
+`RunResult` is a transparency contract, not just a return code: it exposes the
+exact `command`, the full `output`, line-by-line `events` (for streaming
+adapters), `plan_path`, the retained `.mini-ork` home (`retained_home`), and
+whether bootstrap ran (`init_ran` / `init_output`). `SpawnResult` adds
+`spawn_id`, `child_run_id`, and `child_workspace`. A caller never has to scrape
+terminal output or guess where evidence was written.
 
 ## Runnable example
 
