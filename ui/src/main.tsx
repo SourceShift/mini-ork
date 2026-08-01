@@ -4,11 +4,13 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { RouterProvider, createRouter } from "@tanstack/react-router";
 
 import { routeTree } from "./routeTree";
-import { initWorkspaceFromUrl } from "./lib/api";
+import { initWorkspaceFromUrl, initOperatorTokenFromStorage } from "./lib/api";
 import "./index.css";
 
-// Resolve the workspace (?ws= / localStorage) before any query fires.
+// Resolve the workspace (?ws= / localStorage) before any query fires, and load
+// any stored operator token so privileged writes (steer/pause) carry auth.
 initWorkspaceFromUrl();
+initOperatorTokenFromStorage();
 
 const queryClient = new QueryClient({
   defaultOptions: {
