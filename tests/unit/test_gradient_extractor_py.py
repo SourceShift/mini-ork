@@ -142,7 +142,11 @@ def test_store_semantic_dedup_and_explicit_id_contract(db, monkeypatch):
     first_id = ge.store(first, db=db)
     second_id = ge.store(second, db=db)
     assert second_id == first_id
-    assert float(_row(db, first_id)["confidence"]) == 0.9
+    # BUG5: a near-duplicate is ABSORBED into the existing gradient without
+    # ratcheting its confidence up. The old contract raised 0.8 -> 0.9 on every
+    # re-sighting, which let a repeated confabulation climb past the 0.6
+    # injection bar purely by being re-emitted. Confidence must stay 0.8.
+    assert float(_row(db, first_id)["confidence"]) == 0.8
 
     monkeypatch.setenv("MO_GRADIENT_DEDUP_SIM", "0")
     third_id = ge.store({**second, "confidence": 0.6}, db=db)
@@ -166,7 +170,14 @@ def test_store_missing_field_exits_nonzero(db):
 
 
 def test_extract_via_override(db):
-    trace_id = trace_store.trace_write({"trace_id": "tr-override", "task_class": "grad-test"}, db=db)
+    # duration_ms>0 keeps this out of the degenerate-node skip (BUG4a): a
+    # zero-cost, zero-duration, no-evidence trace is a control node the
+    # extractor now abstains on. This test exercises the override wiring, so
+    # give it a real work signal.
+    trace_id = trace_store.trace_write(
+        {"trace_id": "tr-override", "task_class": "grad-test", "duration_ms": 1200},
+        db=db,
+    )
 
     def stub(_trace_id: str, _trace_json: str):
         return [{
@@ -234,8 +245,18 @@ def test_parse_llm_output_recovers_fenced_and_truncated_arrays():
 
 
 def test_extract_default_uses_native_dispatch(db, monkeypatch):
+    # verifier_output makes this a grounded node so neither the degenerate-node
+    # skip (BUG4a) nor the ungrounded-confidence cap (BUG4b) fires — this test
+    # asserts the native-dispatch argv contract, not the grounding gates, so the
+    # extracted item must pass through with its original 0.8 confidence.
     trace_id = trace_store.trace_write(
-        {"trace_id": "tr-native", "task_class": "grad-native"}, db=db
+        {
+            "trace_id": "tr-native",
+            "task_class": "grad-native",
+            "duration_ms": 1200,
+            "verifier_output": {"verdict": "pass"},
+        },
+        db=db,
     )
     from mini_ork.dispatch import llm_dispatch as native_dispatch
 
