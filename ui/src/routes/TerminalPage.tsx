@@ -3,8 +3,9 @@ import { useSearch } from "@tanstack/react-router";
 import { TerminalSquare, Info } from "lucide-react";
 
 import { TerminalPanel } from "@/components/TerminalPanel";
+import type { Harness } from "@/lib/api";
 
-type Cmd = "shell" | "opencode";
+const HARNESSES: Harness[] = ["opencode", "codex", "claude", "shell"];
 
 /** Standalone live shell into the workspace (or a run's directory) over the
  * opt-in PTY bridge. A deep link like `/terminal?run=<id>&cmd=opencode` lands
@@ -15,9 +16,12 @@ type Cmd = "shell" | "opencode";
 export function TerminalPage() {
   const search = useSearch({ from: "/terminal" });
   const runFromUrl = typeof search.run === "string" ? search.run : "";
-  const cmdFromUrl: Cmd = search.cmd === "opencode" ? "opencode" : "shell";
+  const cmdRaw = typeof search.cmd === "string" ? search.cmd : "";
+  const cmdFromUrl: Harness = (HARNESSES as string[]).includes(cmdRaw)
+    ? (cmdRaw as Harness)
+    : "opencode";
 
-  const [cmd, setCmd] = useState<Cmd>(cmdFromUrl);
+  const [cmd, setCmd] = useState<Harness>(cmdFromUrl);
   const [runDraft, setRunDraft] = useState(runFromUrl);
   const [runId, setRunId] = useState(runFromUrl);
 
@@ -82,8 +86,8 @@ export function TerminalPage() {
   );
 }
 
-function CmdToggle({ cmd, onChange }: { cmd: Cmd; onChange: (c: Cmd) => void }) {
-  const opts: Cmd[] = ["shell", "opencode"];
+function CmdToggle({ cmd, onChange }: { cmd: Harness; onChange: (c: Harness) => void }) {
+  const opts = HARNESSES;
   return (
     <div className="flex flex-col gap-1">
       <span className="text-[9.5px] uppercase tracking-[0.13em] text-ink-500">command</span>
