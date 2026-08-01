@@ -29,7 +29,6 @@ from .routes import (
 )
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
-WEBLITE_DIR = Path(__file__).resolve().parents[2] / "web-lite"
 
 
 def create_app(home: Path | None = None, dev_cors: bool = True) -> FastAPI:
@@ -95,15 +94,6 @@ def create_app(home: Path | None = None, dev_cors: bool = True) -> FastAPI:
     # WebSocket PTY bridge (opt-in via MO_PTY_ENABLED=1). Registered before the
     # SPA catch-all so `/api/v1/pty` is never shadowed by the index.html fallback.
     app.include_router(pty_routes.router)
-
-    # web-lite: zero-build Preact+htm+xterm observability/terminal UI, served as
-    # static files at /lite. Mounted before the SPA catch-all for the same reason.
-    if WEBLITE_DIR.exists() and (WEBLITE_DIR / "index.html").exists():
-        app.mount(
-            "/lite",
-            StaticFiles(directory=str(WEBLITE_DIR), html=True),
-            name="lite",
-        )
 
     @app.get("/api")
     def api_index() -> JSONResponse:
