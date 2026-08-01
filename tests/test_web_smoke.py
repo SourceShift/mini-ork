@@ -1088,6 +1088,36 @@ def test_python_plan_references_native_auto_answer() -> None:
 # ── project switcher (GET /projects, POST /projects/switch) ─────────────────
 
 
+def test_project_home_resolution_is_idempotent(monkeypatch, tmp_path) -> None:
+    """The validate -> switch -> request flow must keep one canonical home."""
+    import sqlite3
+
+    from mini_ork.web.deps import get_default_home, get_home, set_home_override
+    from mini_ork.web.routes.projects import switch_project, validate_project
+
+    monkeypatch.setenv("MINI_ORK_PROJECTS_FILE", str(tmp_path / "projects.json"))
+    project = tmp_path / "researcher"
+    project_home = project / ".mini-ork"
+    nested_home = project_home / ".mini-ork"
+    nested_home.mkdir(parents=True)
+    sqlite3.connect(project_home / "state.db").close()
+    sqlite3.connect(nested_home / "state.db").close()
+    previous_home = get_default_home()
+
+    try:
+        checked = validate_project(str(project), previous_home)
+        assert checked["home"] == str(project_home)
+
+        switched = switch_project({"home": checked["home"]})
+        assert switched["active"] == str(project_home)
+        assert switched["name"] == "researcher"
+
+        assert get_home(str(project_home), None) == project_home
+        assert get_home(None, str(project_home)) == project_home
+    finally:
+        set_home_override(previous_home)
+
+
 def test_projects_list_includes_active(db, home, monkeypatch, tmp_path) -> None:
     from mini_ork.web.deps import get_home
     from mini_ork.web.routes.projects import list_projects
@@ -1120,7 +1150,7 @@ def test_projects_switch_swaps_db_and_registers(db, home, monkeypatch, tmp_path)
     import sqlite3
 
     from mini_ork.web.deps import get_db, get_home, set_home_override
-    from mini_ork.web.routes.projects import list_projects, switch_project
+    from mini_ork.web.routes.projects import list_projects, switch_project, validate_project
 
     monkeypatch.setenv("MINI_ORK_PROJECTS_FILE", str(tmp_path / "projects.json"))
 
@@ -1131,9 +1161,19 @@ def test_projects_switch_swaps_db_and_registers(db, home, monkeypatch, tmp_path)
     con.commit()
     con.close()
 
+    # Regression: a second, accidentally nested home must not make the
+    # validate -> switch UI flow descend from researcher/.mini-ork into
+    # researcher/.mini-ork/.mini-ork.
+    nested = other / ".mini-ork"
+    nested.mkdir()
+    sqlite3.connect(nested / "state.db").close()
+
     try:
-        # convenience: project folder (parent of .mini-ork) is accepted too
-        out = switch_project({"home": str(other.parent)})
+        # The UI validates the project folder, then switches using the
+        # canonical home returned by validation.
+        checked = validate_project(str(other.parent), home)
+        assert checked["home"] == str(other)
+        out = switch_project({"home": checked["home"]})
         assert out["ok"] is True
         assert out["active"] == str(other)
         assert out["name"] == "researcher"
@@ -1165,12 +1205,17 @@ def test_projects_validate_and_add(db, home, monkeypatch, tmp_path) -> None:
     other = tmp_path / "researcher" / ".mini-ork"
     other.mkdir(parents=True)
     sqlite3.connect(other / "state.db").close()
+    nested = other / ".mini-ork"
+    nested.mkdir()
+    sqlite3.connect(nested / "state.db").close()
 
     good = validate_project(str(other.parent), active)  # project folder accepted
     assert good["ok"] is True
     assert good["home"] == str(other)
     assert good["name"] == "researcher"
     assert good["registered"] is False
+    # A direct home is already canonical, even if a nested state DB exists.
+    assert validate_project(str(other), active)["home"] == str(other)
 
     out = add_project({"home": str(other.parent)}, active)
     assert out["ok"] is True and out["project"]["home"] == str(other)
@@ -1194,6 +1239,9 @@ def test_workspace_scoped_home_resolution(db, home, tmp_path) -> None:
     other = tmp_path / "researcher" / ".mini-ork"
     other.mkdir(parents=True)
     sqlite3.connect(other / "state.db").close()
+    nested = other / ".mini-ork"
+    nested.mkdir()
+    sqlite3.connect(nested / "state.db").close()
 
     assert get_home(str(other.parent), None) == other  # project folder accepted
     assert get_home(None, str(other)) == other  # query param (SSE) works

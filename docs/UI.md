@@ -33,6 +33,10 @@ The SPA bundle is served from `mini_ork/web/static/` (built with
 - **Top bar** — project switcher, then live fleet vitals: in-flight count,
   total spend, failure count, run count, and the backing DB (`state.db`).
   These come from `/api/v1/task-runs/summary` and refresh continuously.
+  Selecting either a project folder or its `.mini-ork` directory mounts the
+  same home; the resolver never descends into `.mini-ork/.mini-ork`. Each
+  project's tables come only from its selected `state.db`—runs are not
+  aggregated across project databases.
 - **Left nav** — Fleet / Trajectory / Fingerprint (with keyboard ordinals
   1/2/3). Below it, a **fleet sidebar**: a greppable list of recent runs
   (colored dot = status) so you can jump between runs from anywhere.

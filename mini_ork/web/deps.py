@@ -32,12 +32,25 @@ def get_default_home() -> Path:
     return _default_home or resolve_home(None)
 
 
-def _resolve_request_home(raw: str) -> Path:
+def resolve_workspace_home(raw: str | Path) -> Path:
+    """Resolve a project folder or its ``.mini-ork`` directory to one home.
+
+    A valid home is a fixed point: resolving ``project/.mini-ork`` again must
+    not reinterpret an unrelated ``project/.mini-ork/.mini-ork`` database as
+    the selected workspace.  This matters because the UI validates a project
+    path before sending the returned home through the switch endpoint.
+    """
     home = Path(raw).expanduser().resolve()
-    # Accept the project folder or the home itself; prefer the real
-    # <folder>/.mini-ork over stray state.db debris at the folder root.
-    if (home / ".mini-ork" / "state.db").exists():
-        home = home / ".mini-ork"
+    if home.name == ".mini-ork" and (home / "state.db").exists():
+        return home
+    project_home = home / ".mini-ork"
+    if (project_home / "state.db").exists():
+        return project_home
+    return home
+
+
+def _resolve_request_home(raw: str) -> Path:
+    home = resolve_workspace_home(raw)
     if not (home / "state.db").exists():
         raise HTTPException(
             status_code=404, detail=f"workspace not found: no state.db under {home}"
