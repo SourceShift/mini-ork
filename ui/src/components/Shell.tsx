@@ -318,7 +318,13 @@ function AddProjectForm({
     staleTime: 5_000,
   });
 
-  const { data: tree } = useQuery({
+  const {
+    data: tree,
+    error: browseError,
+    isError: browseFailed,
+    isFetching: browseLoading,
+    refetch: retryBrowse,
+  } = useQuery({
     queryKey: ["project-browse", browsePath ?? "~"],
     queryFn: () => api.browseDirs(browsePath),
     enabled: browsing,
@@ -373,6 +379,9 @@ function AddProjectForm({
         <button
           type="button"
           onClick={() => setBrowsing((v) => !v)}
+          aria-controls="folder-browser"
+          aria-expanded={browsing}
+          aria-label="Browse folders"
           className={clsx(
             "flex h-7 w-7 shrink-0 items-center justify-center rounded-[3px] border text-ink-400 hover:border-[var(--cyan)]",
             browsing ? "border-[var(--cyan)] text-[var(--cyan)]" : "border-[var(--hair-2)]",
@@ -383,58 +392,90 @@ function AddProjectForm({
           <FolderOpen size={13} />
         </button>
       </div>
-      {browsing && tree && (
-        <div className="rounded-[3px] border border-[var(--hair-2)]" data-testid="folder-browser">
-          <div className="flex items-center gap-1 border-b border-[var(--hair)] px-2 py-1">
-            <button
-              type="button"
-              disabled={!tree.parent}
-              onClick={() => setBrowsePath(tree.parent ?? undefined)}
-              className="kbd disabled:opacity-30"
-              title="up one level"
-            >
-              ..
-            </button>
-            <span className="min-w-0 flex-1 truncate font-mono text-[9.5px] text-ink-500" title={tree.path}>
-              {tree.path}
-            </span>
-            {tree.is_project && (
-              <button
-                type="button"
-                onClick={() => pick(tree.path)}
-                className="shrink-0 rounded-[3px] border border-[var(--grn)] px-1.5 text-[9.5px] uppercase text-[var(--grn)]"
-              >
-                use this
-              </button>
-            )}
-          </div>
-          <div className="max-h-[180px] overflow-auto thin">
-            {tree.dirs.map((d) => (
-              <div key={d.path} className="group flex items-center">
+      {browsing && (
+        <div
+          id="folder-browser"
+          className="rounded-[3px] border border-[var(--hair-2)]"
+          data-testid="folder-browser"
+          aria-busy={browseLoading}
+        >
+          {tree && (
+            <>
+              <div className="flex items-center gap-1 border-b border-[var(--hair)] px-2 py-1">
                 <button
                   type="button"
-                  onClick={() => setBrowsePath(d.path)}
-                  className="flex min-w-0 flex-1 items-center gap-2 px-2 py-1 text-left text-[10.5px] hover:bg-white/[0.035]"
+                  disabled={!tree.parent || browseLoading}
+                  onClick={() => setBrowsePath(tree.parent ?? undefined)}
+                  className="kbd disabled:opacity-30"
+                  title="up one level"
                 >
-                  <FolderOpen size={11} className={d.is_project ? "text-[var(--grn)]" : "text-ink-600"} />
-                  <span className={clsx("font-mono truncate", d.is_project ? "text-[var(--grn)]" : "text-ink-300")}>
-                    {d.name}
-                  </span>
+                  ..
                 </button>
-                {d.is_project && (
+                <span className="min-w-0 flex-1 truncate font-mono text-[9.5px] text-ink-500" title={tree.path}>
+                  {tree.path}
+                </span>
+                {tree.is_project && (
                   <button
                     type="button"
-                    onClick={() => pick(d.path)}
-                    className="invisible mr-2 shrink-0 rounded-[3px] border border-[var(--grn)] px-1.5 text-[9.5px] uppercase text-[var(--grn)] group-hover:visible"
-                    data-testid={`pick-${d.name}`}
+                    onClick={() => pick(tree.path)}
+                    className="shrink-0 rounded-[3px] border border-[var(--grn)] px-1.5 text-[9.5px] uppercase text-[var(--grn)]"
                   >
-                    select
+                    use this
                   </button>
                 )}
               </div>
-            ))}
-            {!tree.dirs.length && <div className="px-3 py-2 text-[10px] text-ink-600">no subfolders</div>}
-          </div>
+              <div className="max-h-[180px] overflow-auto thin">
+                {tree.dirs.map((d) => (
+                  <div key={d.path} className="group flex items-center">
+                    <button
+                      type="button"
+                      disabled={browseLoading}
+                      onClick={() => setBrowsePath(d.path)}
+                      className="flex min-w-0 flex-1 items-center gap-2 px-2 py-1 text-left text-[10.5px] hover:bg-white/[0.035] disabled:opacity-50"
+                    >
+                      <FolderOpen size={11} className={d.is_project ? "text-[var(--grn)]" : "text-ink-600"} />
+                      <span className={clsx("font-mono truncate", d.is_project ? "text-[var(--grn)]" : "text-ink-300")}>
+                        {d.name}
+                      </span>
+                    </button>
+                    {d.is_project && (
+                      <button
+                        type="button"
+                        onClick={() => pick(d.path)}
+                        className="invisible mr-2 shrink-0 rounded-[3px] border border-[var(--grn)] px-1.5 text-[9.5px] uppercase text-[var(--grn)] group-hover:visible"
+                        data-testid={`pick-${d.name}`}
+                      >
+                        select
+                      </button>
+                    )}
+                  </div>
+                ))}
+                {!tree.dirs.length && <div className="px-3 py-2 text-[10px] text-ink-600">no subfolders</div>}
+              </div>
+            </>
+          )}
+          {!tree && browseLoading && (
+            <div className="px-3 py-2 text-[10px] text-ink-500" data-testid="folder-browser-loading">
+              loading folders…
+            </div>
+          )}
+          {browseFailed && !browseLoading && (
+            <div className="space-y-1.5 px-3 py-2 text-[10px]" role="alert" data-testid="folder-browser-error">
+              <div className="text-[var(--red)]">Could not load folders.</div>
+              <div className="break-words font-mono text-[9.5px] text-ink-500">{(browseError as Error).message}</div>
+              <div className="flex items-center gap-2 text-ink-500">
+                <span>In development, make sure the API is running on :7090.</span>
+                <button
+                  type="button"
+                  onClick={() => void retryBrowse()}
+                  className="shrink-0 rounded-[3px] border border-[var(--hair-2)] px-1.5 py-0.5 uppercase text-ink-300 hover:border-[var(--cyan)]"
+                  data-testid="folder-browser-retry"
+                >
+                  retry
+                </button>
+              </div>
+            </div>
+          )}
         </div>
       )}
       <div className="min-h-[14px] text-[10px]" data-testid="add-project-feedback">
