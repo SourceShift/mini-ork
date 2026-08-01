@@ -55,6 +55,42 @@ function wsHeaders(): Record<string, string> {
   return workspaceHome ? { "X-Mini-Ork-Home": workspaceHome } : {};
 }
 
+// --- operator token (privileged writes) -----------------------------------
+// stop/kill trust the loopback bind, but the cost-approval + steering writes
+// are Bearer-gated and fail-closed server-side (see mini_ork/web/auth.py). The
+// token identifies the operator on the audit record, so it lives per-browser in
+// localStorage and rides along on every request — harmless on endpoints that
+// don't check it.
+
+const TOKEN_KEY = "mini-ork.operator-token";
+let operatorToken: string | null = null;
+
+export function getOperatorToken(): string | null {
+  return operatorToken;
+}
+
+export function setOperatorToken(token: string | null): void {
+  operatorToken = token && token.trim() ? token.trim() : null;
+  try {
+    if (operatorToken) localStorage.setItem(TOKEN_KEY, operatorToken);
+    else localStorage.removeItem(TOKEN_KEY);
+  } catch {
+    // private browsing — header still works for this session
+  }
+}
+
+export function initOperatorTokenFromStorage(): void {
+  try {
+    operatorToken = localStorage.getItem(TOKEN_KEY);
+  } catch {
+    operatorToken = null;
+  }
+}
+
+function authHeaders(): Record<string, string> {
+  return operatorToken ? { Authorization: `Bearer ${operatorToken}` } : {};
+}
+
 async function get<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(`${BASE}${path}`, {
     ...init,
@@ -73,6 +109,7 @@ async function post<T>(path: string, body?: unknown): Promise<T> {
     headers: {
       Accept: "application/json",
       ...wsHeaders(),
+      ...authHeaders(),
       ...(body !== undefined ? { "Content-Type": "application/json" } : {}),
     },
     ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
@@ -546,6 +583,101 @@ export type IdeaTreeNodeDetail = Omit<IdeaTreeNode, "depth"> & {
 export type CostByDayRow = { day: string; recipe: string; cost: number; run_count: number };
 export type WallTimeRow = { day: string; recipe: string; avg_ms: number; max_ms: number; run_count: number };
 
+// --- dispatch (the composer: price an edit against measured evidence) ------
+// Mirrors mini_ork/web/routes/dispatch.py. HONESTY CONTRACT: any lane/topology
+// with evidence:"none" has fewer than `min_samples` runs — success_rate/win_rate
+// and ci are null, and the UI must NOT invent a number for it. A 75% from n=4 is
+// a coincidence with a percent sign; the backend refuses to ship it, so must we.
+
+export type Evidence = "measured" | "none";
+
+export type DispatchRecipeNode = {
+  name: string | null;
+  type: string | null;
+  lane: string | null;
+  dispatch_mode: string;
+  gates: string[];
+  verifier_ref: string | null;
+};
+
+export type DispatchRecipe = {
+  recipe: string;
+  task_class: string | null;
+  description: string | null;
+  nodes: DispatchRecipeNode[];
+};
+
+export type DispatchLane = {
+  lane: string;
+  task_class: string | null;
+  runs: number;
+  successes: number;
+  avg_cost_usd: number | null;
+  avg_duration_ms: number | null;
+  advantage: number | null;
+  top_failure_modes: string | null;
+  /** null when evidence==="none" (thin sample). Never render a fabricated rate. */
+  success_rate: number | null;
+  /** Wilson 95% interval [lo, hi]; null when thin. */
+  ci: [number, number] | null;
+  evidence: Evidence;
+};
+
+export type DispatchTopology = {
+  topology_id: string;
+  workflow_name: string | null;
+  task_class: string | null;
+  wins: number;
+  losses: number;
+  sample_size: number;
+  win_rate: number | null;
+  ci: [number, number] | null;
+  avg_cost_usd: number | null;
+  avg_duration_ms: number | null;
+  evidence: Evidence;
+};
+
+export type DispatchOptions = {
+  recipes: DispatchRecipe[];
+  lanes: DispatchLane[];
+  topologies: DispatchTopology[];
+  min_samples: number;
+  note: string;
+};
+
+export type DispatchRequest = {
+  kickoff: string;
+  recipe: string;
+  task_class?: string | null;
+  worktree?: string | null;
+  /** What the machine suggested before the human touched it — half the label. */
+  proposed_recipe?: string | null;
+  proposed_topology?: string | null;
+  proposed_lane_hints?: string | null;
+  /** What the human chose. node → lane; rides into the run as MINI_ORK_LANE_<NODE>. */
+  lane_overrides?: Record<string, string>;
+  override_reason?: string | null;
+  epic_id?: string | null;
+};
+
+export type DispatchResponse = {
+  run_id: string;
+  command: string;
+  env: Record<string, string>;
+  decision_id: number | null;
+  decided_by: "human" | "conductor";
+  overrode: boolean;
+};
+
+// --- durable-dag recovery projection --------------------------------------
+
+export type RecoveryProjection = {
+  run_id?: string;
+  status?: string;
+  nodes: Array<Record<string, unknown>>;
+  [k: string]: unknown;
+};
+
 // --- endpoints -----------------------------------------------------------
 
 export type Project = {
@@ -660,4 +792,53 @@ export const api = {
   wallTime: () => get<WallTimeRow[]>("/api/v1/trajectory/wall-time"),
   recipes: () => get<string[]>("/api/v1/fingerprint/recipes"),
   fingerprint: (recipe: string) => get<Fingerprint>(`/api/v1/fingerprint?recipe=${encodeURIComponent(recipe)}`),
+  // ── dispatch (compose + decide, does NOT spawn) ──
+  dispatchOptions: (taskClass?: string) =>
+    get<DispatchOptions>(`/api/v1/dispatch/options${taskClass ? `?task_class=${encodeURIComponent(taskClass)}` : ""}`),
+  dispatch: (req: DispatchRequest) => post<DispatchResponse>("/api/v1/dispatch", req),
+  // ── privileged control (Bearer-token gated server-side) ──
+  pauseCost: (id: string, thresholdUsd = 25.0) =>
+    post<{ ok: boolean; task_run_id: string; operator?: string; note?: string }>(
+      `/api/v1/task-runs/${encodeURIComponent(id)}/pause-cost`,
+      { threshold_usd: thresholdUsd },
+    ),
+  resumeCost: (id: string) =>
+    post<{ ok: boolean; task_run_id: string; operator?: string; note?: string }>(
+      `/api/v1/task-runs/${encodeURIComponent(id)}/resume-cost`,
+    ),
+  steer: (
+    id: string,
+    opts: {
+      message: string;
+      role_target?: "planner" | "implementer" | "reviewer" | "verifier" | "any";
+      severity?: "info" | "warn" | "critical";
+      confidence?: number;
+      ttl_secs?: number;
+    },
+  ) =>
+    post<{ ok: boolean; task_run_id: string; operator?: string; note?: string }>(
+      `/api/v1/task-runs/${encodeURIComponent(id)}/steer`,
+      {
+        message: opts.message,
+        role_target: opts.role_target ?? "any",
+        severity: opts.severity ?? "info",
+        confidence: opts.confidence ?? 0.8,
+        ttl_secs: opts.ttl_secs ?? 3600,
+      },
+    ),
+  recovery: (runId: string) =>
+    get<RecoveryProjection>(`/api/v1/runs/${encodeURIComponent(runId)}/recovery`),
 };
+
+/** WebSocket URL for the opt-in PTY bridge (server gates on MO_PTY_ENABLED=1).
+ * EventSource/WebSocket can't send headers, so workspace rides as ?home=. */
+export function ptyWebsocketUrl(opts: { runId?: string; cmd?: "shell" | "opencode"; cols: number; rows: number }): string {
+  const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
+  const q = new URLSearchParams();
+  if (opts.runId) q.set("run_id", opts.runId);
+  q.set("cmd", opts.cmd ?? "shell");
+  q.set("cols", String(opts.cols));
+  q.set("rows", String(opts.rows));
+  if (workspaceHome) q.set("home", workspaceHome);
+  return `${proto}//${window.location.host}/api/v1/pty?${q.toString()}`;
+}

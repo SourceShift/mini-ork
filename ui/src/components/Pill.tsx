@@ -1,5 +1,6 @@
 import clsx from "clsx";
 import { familyColor, statusPillClass } from "@/lib/format";
+import { evidencePillClass, type EvidenceView } from "@/lib/evidence";
 
 export function StatusPill({ status }: { status: string | null | undefined }) {
   if (!status)
@@ -25,6 +26,22 @@ export function VerdictPill({ verdict }: { verdict: string | null | undefined })
   return (
     <span className={statusPillClass(verdict)} data-testid="pill-verdict" data-verdict={verdict}>
       {verdict}
+    </span>
+  );
+}
+
+/** Renders a measured rate honestly: a % only when evidence exists, else the
+ * raw sample. `title` carries the interval/reason so the number never travels
+ * without its uncertainty. See lib/evidence.ts for the honesty rules. */
+export function EvidenceBadge({ view }: { view: EvidenceView }) {
+  return (
+    <span
+      className={evidencePillClass(view.tone)}
+      data-testid="pill-evidence"
+      data-evidence={view.hasRate ? "measured" : "none"}
+      title={view.detail}
+    >
+      {view.label}
     </span>
   );
 }

@@ -3,15 +3,17 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import clsx from "clsx";
 import type React from "react";
 import { useEffect, useRef, useState } from "react";
-import { Activity, BrainCircuit, ChevronDown, FolderOpen, GitBranch, Network, Radio, Search, Telescope, X } from "lucide-react";
+import { Activity, BookMarked, BrainCircuit, ChevronDown, FolderOpen, GitBranch, Network, Radio, Rocket, Search, Telescope, X } from "lucide-react";
 
 import { api, getWorkspaceHome, setWorkspaceHome, type TaskRun } from "@/lib/api";
 import { formatCost } from "@/lib/format";
 
 const NAV = [
   { to: "/", label: "Fleet", icon: Activity, key: "1" },
-  { to: "/trajectory", label: "Trajectory", icon: Telescope, key: "2" },
-  { to: "/fingerprint", label: "Fingerprint", icon: Network, key: "3" },
+  { to: "/new", label: "New Run", icon: Rocket, key: "2" },
+  { to: "/recipes", label: "Recipes", icon: BookMarked, key: "3" },
+  { to: "/trajectory", label: "Trajectory", icon: Telescope, key: "4" },
+  { to: "/fingerprint", label: "Fingerprint", icon: Network, key: "5" },
 ] as const;
 
 export function Shell() {
@@ -157,7 +159,7 @@ export function Shell() {
         <span className="font-mono truncate flex-1">{pathLabel}</span>
         <span className="hidden md:inline-flex items-center gap-1">
           <Radio size={11} />
-          loopback · readonly
+          loopback · control
         </span>
         <span className="kbd">⌘K</span>
       </footer>
@@ -606,6 +608,8 @@ function Tele({
 function sectionLabel(pathname: string): string {
   if (pathname.startsWith("/runs/") && pathname.includes("/agents/")) return "agent forensics";
   if (pathname.startsWith("/runs/")) return "run forensics";
+  if (pathname.startsWith("/new")) return "dispatch";
+  if (pathname.startsWith("/recipes")) return "catalog";
   if (pathname.startsWith("/trajectory")) return "trajectory";
   if (pathname.startsWith("/fingerprint")) return "fingerprint";
   return "fleet";
