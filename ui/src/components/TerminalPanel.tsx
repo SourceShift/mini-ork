@@ -4,7 +4,7 @@ import { FitAddon } from "@xterm/addon-fit";
 import { RotateCw, TerminalSquare } from "lucide-react";
 import "@xterm/xterm/css/xterm.css";
 
-import { ptyWebsocketUrl } from "@/lib/api";
+import { ptyWebsocketUrl, type Harness } from "@/lib/api";
 
 type ConnState = "connecting" | "open" | "closed" | "disabled" | "error";
 
@@ -33,15 +33,18 @@ const THEME = {
  *
  * `autoType` types a command into the shell WITHOUT pressing enter: this is the
  * Phase-1 promise made honest — the composer hands the exact command here, the
- * terminal types it, and the human decides whether to run it. */
+ * terminal types it, and the human decides whether to run it.
+ *
+ * `cmd` selects the harness; when omitted the server resolves the project's
+ * configured orchestrator (default opencode). */
 export function TerminalPanel({
   runId,
-  cmd = "shell",
+  cmd,
   autoType,
   className,
 }: {
   runId?: string;
-  cmd?: "shell" | "opencode";
+  cmd?: Harness;
   autoType?: string;
   className?: string;
 }) {
@@ -124,7 +127,7 @@ export function TerminalPanel({
     <div className={`card !p-0 overflow-hidden ${className ?? ""}`} data-testid="terminal-panel" data-state={state}>
       <div className="panel-title !m-0 flex items-center gap-2">
         <TerminalSquare size={13} />
-        <span>{cmd === "opencode" ? "opencode" : "shell"}{runId ? ` · ${runId.slice(0, 14)}` : ""}</span>
+        <span>{cmd ?? "orchestrator"}{runId ? ` · ${runId.slice(0, 14)}` : ""}</span>
         <StateBadge state={state} />
         <button
           type="button"

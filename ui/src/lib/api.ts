@@ -867,13 +867,18 @@ export const api = {
     get<RecoveryProjection>(`/api/v1/runs/${encodeURIComponent(runId)}/recovery`),
 };
 
+/** Orchestrator harnesses the PTY bridge can launch (server allow-list). */
+export type Harness = "opencode" | "codex" | "claude" | "shell";
+
 /** WebSocket URL for the opt-in PTY bridge (server gates on MO_PTY_ENABLED=1).
- * EventSource/WebSocket can't send headers, so workspace rides as ?home=. */
-export function ptyWebsocketUrl(opts: { runId?: string; cmd?: "shell" | "opencode"; cols: number; rows: number }): string {
+ * EventSource/WebSocket can't send headers, so workspace rides as ?home=.
+ * `cmd` is omitted when absent so the server resolves the project's configured
+ * orchestrator (.mini-ork/orchestrator.yaml → MO_ORCHESTRATOR → opencode). */
+export function ptyWebsocketUrl(opts: { runId?: string; cmd?: Harness; cols: number; rows: number }): string {
   const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
   const q = new URLSearchParams();
   if (opts.runId) q.set("run_id", opts.runId);
-  q.set("cmd", opts.cmd ?? "shell");
+  if (opts.cmd) q.set("cmd", opts.cmd);
   q.set("cols", String(opts.cols));
   q.set("rows", String(opts.rows));
   if (workspaceHome) q.set("home", workspaceHome);
