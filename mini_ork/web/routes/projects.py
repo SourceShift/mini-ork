@@ -20,7 +20,11 @@ from typing import Any
 
 from fastapi import APIRouter, Body, Depends, HTTPException
 
-from ..deps import get_home_lenient, set_home_override
+from ..deps import (
+    get_home_lenient,
+    resolve_workspace_home,
+    set_home_override,
+)
 
 router = APIRouter(prefix="/api/v1/projects", tags=["projects"])
 
@@ -115,12 +119,7 @@ def _normalize(raw: str) -> Path:
     raw = (raw or "").strip()
     if not raw:
         raise HTTPException(status_code=422, detail="path required")
-    home = _resolve(raw)
-    # Prefer <folder>/.mini-ork over a state.db directly in the folder —
-    # stray state.db files at project roots (test debris) must not win
-    # over the real home.
-    if (home / ".mini-ork" / "state.db").exists():
-        home = home / ".mini-ork"
+    home = resolve_workspace_home(raw)
     if not (home / "state.db").exists():
         hint = (
             "folder not found"
