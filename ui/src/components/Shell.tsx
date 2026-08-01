@@ -7,6 +7,7 @@ import { Activity, BookMarked, BrainCircuit, ChevronDown, FolderOpen, GitBranch,
 
 import { api, getWorkspaceHome, setWorkspaceHome, type TaskRun } from "@/lib/api";
 import { formatCost } from "@/lib/format";
+import { OperatorTokenControl } from "@/components/OperatorTokenControl";
 
 const NAV = [
   { to: "/", label: "Fleet", icon: Activity, key: "1" },
@@ -154,7 +155,7 @@ export function Shell() {
       </div>
 
       <footer className="ork-statusline" data-testid="app-status">
-        <span className="pill-ok rounded-none">operator</span>
+        <OperatorTokenControl />
         <span className="font-mono uppercase tracking-[0.08em]">{sectionLabel(location.pathname)}</span>
         <span className="font-mono truncate flex-1">{pathLabel}</span>
         <span className="hidden md:inline-flex items-center gap-1">

@@ -7,6 +7,8 @@ import { api, type TaskRun } from "@/lib/api";
 import { formatCost, formatDuration, formatRelative } from "@/lib/format";
 import { StatusPill, VerdictPill } from "@/components/Pill";
 import { NewRunLauncher } from "@/components/NewRunLauncher";
+import { NeedsYouStrip } from "@/components/NeedsYouStrip";
+import { RunControls } from "@/components/RunControls";
 
 const MAP_RUN_LIMIT = 14;
 const MAP_WINDOWS = [
@@ -63,6 +65,8 @@ export function FleetPage() {
           </div>
         </div>
       </header>
+
+      <NeedsYouStrip taskRuns={runs.data ?? []} activeRuns={active.data ?? []} />
 
       <NewRunLauncher compact />
 
@@ -147,6 +151,7 @@ export function FleetPage() {
                   <Th>Updated</Th>
                   <Th>State</Th>
                   <Th>Cost</Th>
+                  <Th>Controls</Th>
                 </tr>
               </thead>
               <tbody>
@@ -178,6 +183,13 @@ export function FleetPage() {
                       <Td>{formatRelative(r.last_heartbeat_at)}</Td>
                       <Td><StatusPill status={r.status ?? r.test_status} /></Td>
                       <Td>{formatCost(r.cost_usd)}</Td>
+                      <Td>
+                        {taskRunId ? (
+                          <RunControls compact taskRunId={taskRunId} status={r.status ?? r.test_status} />
+                        ) : (
+                          <span className="text-xs text-ink-500">—</span>
+                        )}
+                      </Td>
                     </tr>
                   );
                 })}

@@ -65,6 +65,17 @@ function wsHeaders(): Record<string, string> {
 const TOKEN_KEY = "mini-ork.operator-token";
 let operatorToken: string | null = null;
 
+// The token is a plain module var so non-React callers (fetch helpers) can read
+// it synchronously. React consumers subscribe here and bridge via
+// useSyncExternalStore so setting the token in one component re-renders every
+// control that gates on its presence.
+const tokenListeners = new Set<() => void>();
+
+export function subscribeOperatorToken(listener: () => void): () => void {
+  tokenListeners.add(listener);
+  return () => tokenListeners.delete(listener);
+}
+
 export function getOperatorToken(): string | null {
   return operatorToken;
 }
@@ -77,6 +88,7 @@ export function setOperatorToken(token: string | null): void {
   } catch {
     // private browsing — header still works for this session
   }
+  for (const listener of tokenListeners) listener();
 }
 
 export function initOperatorTokenFromStorage(): void {
