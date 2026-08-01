@@ -9,6 +9,8 @@ import { StatusPill, VerdictPill } from "@/components/Pill";
 import { NewRunLauncher } from "@/components/NewRunLauncher";
 import { NeedsYouStrip } from "@/components/NeedsYouStrip";
 import { RunControls } from "@/components/RunControls";
+import { FlywheelPanel } from "@/components/FlywheelPanel";
+import { LaneHealthPanel } from "@/components/LaneHealthPanel";
 
 const MAP_RUN_LIMIT = 14;
 const MAP_WINDOWS = [
@@ -92,6 +94,11 @@ export function FleetPage() {
           value={formatCost(summary.data?.total_cost_usd)}
           testid="stat-total-spend"
         />
+      </section>
+
+      <section className="grid grid-cols-1 lg:grid-cols-2 gap-2" data-testid="fleet-flywheel-row">
+        <FlywheelPanel />
+        <LaneHealthPanel />
       </section>
 
       <section className="card !p-0 overflow-hidden" data-testid="fleet-dispatch-map-section">
