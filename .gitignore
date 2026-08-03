@@ -115,3 +115,6 @@ claude_code_zai_env.sh
 .mini-ork/*
 
 !.mini-ork/engine
+
+tests/ui/snapshots/*.png
+tests/ui/test-results/

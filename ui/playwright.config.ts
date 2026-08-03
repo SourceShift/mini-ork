@@ -8,7 +8,7 @@ export default defineConfig({
   retries: 0,
   reporter: "list",
   use: {
-    baseURL: "http://127.0.0.1:7070",
+    baseURL: "http://[::1]:7070",
     trace: "retain-on-failure",
   },
   projects: [

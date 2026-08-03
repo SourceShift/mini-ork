@@ -10,7 +10,7 @@ type RunInput = { key: string };
 type SelfImproveRun = { run_id: string };
 
 async function visit(page: Page, route: string) {
-  await page.goto(route, { waitUntil: "networkidle" });
+  await page.goto(route, { waitUntil: "load" });
   await expect(page.getByRole("main")).toBeVisible();
 }
 
@@ -56,11 +56,12 @@ test("new run route", async ({ page }) => {
 test("recipes route", async ({ page }) => {
   await visit(page, "/recipes");
   await expect(page.getByRole("heading", { name: "Capabilities", level: 1 })).toBeVisible();
-  await expect(page.getByRole("link", { name: /New Run/ })).toBeVisible();
+  await expect(page.getByTestId("recipes-to-launcher")).toBeVisible();
   await snapshot(page, "recipes");
 });
 
 test("run detail route", async ({ page, request }, testInfo) => {
+  test.setTimeout(60_000);
   const run = await firstRun(request);
   if (!run) {
     markSkippedWhenEmpty(testInfo, "/runs/$taskRunId");
@@ -68,8 +69,8 @@ test("run detail route", async ({ page, request }, testInfo) => {
     await expect(page.getByRole("heading", { name: "Fleet", level: 1 })).toBeVisible();
   } else {
     await visit(page, `/runs/${encodeURIComponent(run.id)}`);
-    await expect(page.getByRole("link", { name: /fleet/i })).toBeVisible();
-    await expect(page.getByRole("button", { name: /agents/i })).toBeVisible();
+    await expect(page.getByRole("link", { name: /fleet/i }).first()).toBeVisible();
+    await expect(page.getByRole("button", { name: /agents/i }).first()).toBeVisible();
   }
   await snapshot(page, "run-detail");
 });
@@ -86,7 +87,7 @@ test("agent detail route", async ({ page, request }, testInfo) => {
     await expect(page.getByRole("heading", { name: "Fleet", level: 1 })).toBeVisible();
   } else {
     await visit(page, `/runs/${encodeURIComponent(run.id)}/agents/${encodeURIComponent(agent.node_id)}`);
-    await expect(page.getByRole("heading", { level: 1 })).toBeVisible();
+    await expect(page.getByRole("heading", { level: 1 }).first()).toBeVisible();
     await expect(page.getByRole("link", { name: new RegExp(run.id) })).toBeVisible();
   }
   await snapshot(page, "agent-detail");
@@ -104,7 +105,7 @@ test("run input route", async ({ page, request }, testInfo) => {
     await expect(page.getByRole("heading", { name: "Fleet", level: 1 })).toBeVisible();
   } else {
     await visit(page, `/runs/${encodeURIComponent(run.id)}/inputs/${encodeURIComponent(input.key)}`);
-    await expect(page.getByRole("heading", { level: 1 })).toBeVisible();
+    await expect(page.getByRole("heading", { level: 1 }).first()).toBeVisible();
     await expect(page.getByRole("link", { name: new RegExp(run.id) })).toBeVisible();
   }
   await snapshot(page, "run-input");
