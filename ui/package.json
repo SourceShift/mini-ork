@@ -26,6 +26,7 @@
     "tailwind-merge": "^3.6.0"
   },
   "devDependencies": {
+    "@playwright/test": "^1.59.1",
     "@types/node": "^25.9.3",
     "@types/react": "^18.3.5",
     "@types/react-dom": "^18.3.0",
