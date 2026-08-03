@@ -102,7 +102,9 @@ def test_minimal_agent_routes_through_native_contract(monkeypatch, tmp_path):
         calls.append((cmd, cwd, timeout))
         return ("spy-ok\n", 0)
 
-    monkeypatch.setattr("mini_ork.agent.minimal.mo_runtime_exec", _spy)
+    # Default workspace is LocalWorkspace; its .exec delegates to
+    # mini_ork.runtime.sandbox.mo_runtime_exec (the new import location).
+    monkeypatch.setattr("mini_ork.runtime.sandbox.mo_runtime_exec", _spy)
     from mini_ork.agent.minimal import MinimalAgent
 
     agent = MinimalAgent(cwd=str(tmp_path), timeout=17)

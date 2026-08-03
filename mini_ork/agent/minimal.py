@@ -5,12 +5,14 @@ or a single fenced bash block → run the bash → append the result to the
 in-memory history. Stops on sentinel or after ``max_turns``; never branches
 on ``MO_RUNTIME_BACKEND`` (the runtime seam honors it transparently).
 
-Tool-exec runs on the host via ``mini_ork.runtime.contract.mo_runtime_exec`` by
-default. When a ``Workspace`` is supplied (opt-in, resolved from
-``MO_SANDBOX_BACKEND``), the bash tool runs *inside that workspace* instead — a
-docker container, say — so an agent executes in its own environment while still
-reading/writing the shared drive mounted at ``exec_cwd``. Unset backend → no
-Workspace → byte-for-byte today's host behavior.
+Tool-exec always runs through the :class:`Workspace` protocol. The default
+backend is :class:`LocalWorkspace`, which delegates to
+``mini_ork.runtime.contract.mo_runtime_exec`` on the host — byte-for-byte
+today's behavior, no opt-in needed. When ``MO_SANDBOX_BACKEND`` is set
+(``docker``, ``microvm``, …), :func:`resolve_agent_workspace` returns a
+per-node :class:`Workspace` and the bash tool runs *inside* it — an agent
+executes in its own environment while still reading/writing the shared drive
+mounted at ``exec_cwd``.
 """
 from __future__ import annotations
 
@@ -19,8 +21,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from mini_ork.dispatch import DispatchRequest, dispatch_model
-from mini_ork.runtime.contract import mo_runtime_exec
-from mini_ork.runtime.sandbox import Workspace
+from mini_ork.runtime.sandbox import LocalWorkspace, Workspace
 
 _SENTINEL = "COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT"
 _SENTINEL_RE = re.compile(rf"^{re.escape(_SENTINEL)}\s*(.*)$", re.MULTILINE)
@@ -64,11 +65,14 @@ class MinimalAgent:
             "(```bash ... ```)."
         )
         self.timeout = timeout
-        # When set, bash tool-exec routes through the workspace (e.g. a docker
-        # container) instead of the host; ``exec_cwd`` is where commands run
-        # inside it (the in-container mount path for docker). ``None`` keeps
-        # today's exact host execution.
-        self.workspace = workspace
+        # Always non-None: defaults to LocalWorkspace (host parity) so the bash
+        # tool-exec always goes through the Workspace protocol — no opt-in
+        # branch in the hot path. ``exec_cwd`` is where commands run inside
+        # the workspace (the in-container mount path for docker; equals
+        # ``cwd`` for the default local backend).
+        self.workspace: Workspace = (
+            workspace if workspace is not None else LocalWorkspace()
+        )
         self.exec_cwd = exec_cwd or cwd
 
     def run(self, task: str) -> MinimalAgentResult:
@@ -129,16 +133,16 @@ class MinimalAgent:
         return "\n".join(f"{m['role']}: {m['content']}" for m in messages)
 
     def _run_bash(self, cmd: str) -> tuple[str, int]:
-        if self.workspace is not None:
-            # Route into the workspace (docker container, …). Workspace.exec
-            # returns (rc, output); flip to this method's (output, rc) shape.
-            rc, output = self.workspace.exec(
-                cmd, cwd=self.exec_cwd, timeout=self.timeout
-            )
-            return output, rc
-        # Native port of the bash runtime contract (WS7): cwd pinned per turn,
-        # pgid-kill timeout semantics, merged stdout+stderr — no bash libs.
-        return mo_runtime_exec(cmd, cwd=self.cwd, timeout=self.timeout)
+        # Always route through the Workspace protocol. The default
+        # LocalWorkspace delegates straight to mo_runtime_exec, so the
+        # default path is byte-for-byte today's host execution (WS7): cwd
+        # pinned per turn, pgid-kill timeout, merged stdout+stderr.
+        # ``exec_cwd`` is the in-workspace cwd; for the default local
+        # backend it equals ``self.cwd``.
+        rc, output = self.workspace.exec(
+            cmd, cwd=self.exec_cwd, timeout=self.timeout
+        )
+        return output, rc
 
 
 def run_minimal(
