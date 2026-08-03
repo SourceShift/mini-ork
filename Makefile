@@ -188,3 +188,6 @@ web-test:
 	# NOTE(bash-removal): the legacy bash obs smoke layers
 	# (tests/test_self_improve_outcome.sh, tests/test_obs_surface.sh) were
 	# retired; the pytest modules above are the observability gate now.
+
+web-snapshot:
+	@cd ui && npx playwright test ../tests/ui/parity.spec.ts
