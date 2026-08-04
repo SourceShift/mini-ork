@@ -84,7 +84,7 @@ else:
     passed = 0
 
 ev.close()
-print(json.dumps({
+result = {
     "verifier": "self-tests-pass",
     "pass": passed == 1,
     "evidence_path": EVIDENCE,
@@ -93,4 +93,13 @@ print(json.dumps({
     "tests_collected": collected,
     "tests_passed": n_passed,
     "tests_failed": n_failed,
-}))
+}
+print(json.dumps(result))
+# Canonical sidecar the outer runner reads (self_improve.read_verifier looks for
+# verifier-result-<name>.json). Without it a green pytest run is invisible to the
+# promotion decision — the port regression that kept the whole triple at pass=0.
+try:
+    with open(os.path.join(RUN_DIR, "verifier-result-self-tests-pass.json"), "w") as _sc:
+        json.dump(result, _sc)
+except OSError:
+    pass

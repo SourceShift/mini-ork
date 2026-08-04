@@ -138,7 +138,7 @@ benchmark_regression = bench_delta_ok == 0
 benchmark_inconclusive = bench_delta_ok == 2
 
 ev.close()
-print(json.dumps({
+result = {
     "verifier": "no-regression",
     "pass": passed == 1,
     "evidence_path": EVIDENCE,
@@ -147,4 +147,13 @@ print(json.dumps({
     "benchmark_summary": bench_obj,
     "benchmark_regression": benchmark_regression,
     "benchmark_inconclusive": benchmark_inconclusive,
-}))
+}
+print(json.dumps(result))
+# Canonical sidecar the outer runner reads (self_improve.read_verifier looks for
+# verifier-result-<name>.json). Dropped in the bash→Python port; without it the
+# runner never sees a regression pass, so the triple was structurally dead.
+try:
+    with open(os.path.join(RUN_DIR, "verifier-result-no-regression.json"), "w") as _sc:
+        json.dump(result, _sc)
+except OSError:
+    pass
