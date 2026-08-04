@@ -12,7 +12,7 @@ import os
 import re
 import sys
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import yaml
@@ -1126,6 +1126,7 @@ def dispatch_with_fallback(
     root: str | os.PathLike[str] | None = None,
     *,
     per_attempt_timeout_s: float | None = None,
+    accept: Callable[[DispatchResult], bool] | None = None,
 ) -> DispatchResult:
     """Dispatch ``request`` trying each lane in ``lanes`` in order, returning the
     first result that succeeds with non-empty output. A lane that fails preflight
@@ -1138,10 +1139,22 @@ def dispatch_with_fallback(
     fallback chain, a hung lane costs one attempt-timeout and the run continues
     on a healthy lane instead of stalling delivery.
 
+    ``accept`` is an optional *structural* predicate (SE-3 Phase A.2). When
+    given, a lane that returns ok+non-empty text but fails ``accept`` — e.g. a
+    planner lane that emitted prose where the node needs JSON — is treated as a
+    failure and the next lane is tried, instead of that structurally-wrong text
+    being served and killed late by the verifier. The predicate is structural
+    only (``predicates.looks_like_json``); semantic validation stays
+    ``validate_artifact``'s job. Passing ``None`` is the pre-A.2 behaviour.
+
     Returns the last failed result if every lane fails (so the caller still sees
-    a faithful rc/error, never a silent hang).
+    a faithful rc/error, never a silent hang). A final result rejected only by
+    ``accept`` is downgraded to ok=False with rc=SHAPE_REJECT_RC so the caller
+    sees "wrong shape", not a false success.
     """
     import sys
+
+    from mini_ork.dispatch.predicates import SHAPE_REJECT_RC
 
     last: DispatchResult | None = None
     tried: list[str] = []
@@ -1157,12 +1170,27 @@ def dispatch_with_fallback(
         result = dispatch_model(req, root)
         tried.append(lane)
         if result.ok and (result.text or "").strip():
-            if i > 0:
-                sys.stderr.write(
-                    f"[dispatch] lane fallback: {'/'.join(tried[:-1])} failed → "
-                    f"served by {lane}\n"
-                )
-            return result
+            if accept is None or accept(result):
+                if i > 0:
+                    sys.stderr.write(
+                        f"[dispatch] lane fallback: {'/'.join(tried[:-1])} failed → "
+                        f"served by {lane}\n"
+                    )
+                return result
+            # ran clean but produced the wrong shape → a fallback-worthy failure.
+            result = replace(
+                result,
+                ok=False,
+                rc=SHAPE_REJECT_RC,
+                error="dispatch result failed shape check "
+                f"({getattr(accept, '__name__', 'accept')})",
+            )
+            sys.stderr.write(
+                f"[dispatch] lane {lane} produced wrong shape "
+                f"(rc={result.rc} {result.error[:80]}); trying next\n"
+            )
+            last = result
+            continue
         sys.stderr.write(
             f"[dispatch] lane {lane} failed (rc={result.rc} "
             f"{(result.error or 'empty output')[:80]}); trying next\n"
