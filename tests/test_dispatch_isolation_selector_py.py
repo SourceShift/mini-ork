@@ -259,14 +259,18 @@ def test_local_workspace_satisfies_protocol() -> None:
     assert isinstance(LocalWorkspace(), Workspace)
 
 
-# ── 4. Unbuilt backends fail loudly (Increments 2/3) ────────────────────────
+# ── 4. Backend readiness: docker built (Inc 2), microvm still a stub (Inc 3) ─
 
 
-def test_docker_spawn_stub_raises_not_implemented(tmp_path: Path) -> None:
+def test_docker_spawn_is_built_and_guards_before_up(tmp_path: Path) -> None:
+    # Increment 2 landed: docker spawn is real, so it no longer raises
+    # NotImplementedError. Called before up() (no container yet) it fails loudly
+    # with the provisioning guard rather than silently no-op'ing — the deep
+    # transport contract is covered in tests/unit/test_docker_spawn.py.
     from mini_ork.runtime.backends.docker import DockerWorkspace
 
     ws = DockerWorkspace(image="alpine:latest", drive_root=str(tmp_path))
-    with pytest.raises(NotImplementedError, match="Increment 2"):
+    with pytest.raises(RuntimeError, match="before up"):
         ws.spawn([sys.executable], stdin="", timeout=5, env={}, cwd=None)
 
 

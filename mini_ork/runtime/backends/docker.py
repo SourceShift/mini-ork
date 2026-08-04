@@ -30,6 +30,59 @@ _DEFAULT_MOUNT = "/workspace"
 _TIMEOUT_RC = 124  # conventional "killed by timeout" return code (GNU timeout)
 _RUN_LABEL = "mo.sandbox=1"  # sweepable: `docker ps -qf label=mo.sandbox=1`
 
+# --- scope=agent env boundary (allowlist) ----------------------------------
+# The host process env handed to ``spawn`` is a grab-bag: the whole
+# ``os.environ`` (host PATH/HOME that don't exist in a Linux image; unrelated
+# SSH/AWS/npm/GitHub creds) plus the per-dispatch overrides. Forwarding it
+# verbatim would both clobber the container's own shell identity AND leak every
+# host secret into the container. So env crosses the boundary ALLOWLIST-first:
+# only the harness (``MO_*``) + LLM-provider namespaces + a generous
+# ``*_API_KEY`` suffix are forwarded. A dropped key fails LOUD (the CLI can't
+# auth → caught by the live docker smoke), whereas a leaked secret would be
+# silent — so we bias to the allowlist on this security axis. The ``*_API_KEY``
+# suffix deliberately does NOT match AWS ``*_ACCESS_KEY_ID`` /
+# ``*_SECRET_ACCESS_KEY``, so the catch-all cannot re-open that leak.
+# Decision: docs/decisions/20260804-docker-spawn-env-injection.md
+_AGENT_ENV_PREFIXES = (
+    "MO_",
+    "OPENAI_",
+    "ANTHROPIC_",
+    "CLAUDE_",
+    "CODEX_",
+    "GEMINI_",
+    "GOOGLE_GENAI_",
+    "GLM_",
+    "ZHIPU_",
+    "ZHIPUAI_",
+    "KIMI_",
+    "MOONSHOT_",
+    "MINIMAX_",
+    "DEEPSEEK_",
+    "OPENROUTER_",
+    "GROQ_",
+    "XAI_",
+    "MISTRAL_",
+    "TOGETHER_",
+    "FIREWORKS_",
+    "CEREBRAS_",
+    "PERPLEXITY_",
+)
+_AGENT_ENV_SUFFIXES = ("_API_KEY",)
+
+
+def _container_env(env: Mapping[str, str]) -> dict[str, str]:
+    """Filter a host env down to the keys a scope=agent CLI may carry into the
+    container (allowlist — see the module note above). Case-insensitive on the
+    key name; values pass through unchanged. Pure + daemon-free so the boundary
+    policy is unit-tested in one place (Increment 3's microVM backend will reuse
+    it)."""
+    out: dict[str, str] = {}
+    for key, val in env.items():
+        upper = key.upper()
+        if upper.startswith(_AGENT_ENV_PREFIXES) or upper.endswith(_AGENT_ENV_SUFFIXES):
+            out[key] = val
+    return out
+
 
 class DockerWorkspace:
     """A ``Workspace`` backed by one Docker container with a bind-mounted drive.
@@ -164,21 +217,54 @@ class DockerWorkspace:
         env: Mapping[str, str],
         cwd: str | None,
     ) -> tuple[int, str, str]:
-        """Spawn the harness CLI *inside* the container (scope=agent).
+        """Spawn the harness CLI *inside* the container (scope=agent) — the
+        hybrid's container TRANSPORT for the dispatch spawn contract.
 
-        NOT YET IMPLEMENTED — this is the hybrid's Increment-2 slice. It will run
-        ``docker exec -i`` (stdin piped, **no** ``-t`` so the container allocates
-        no TTY — the A.1 invariant re-established in the container's PID
-        namespace), streams kept separate, and a timeout reaped by stopping the
-        container (``rc=124``). Until then it fails loudly rather than silently
-        dropping a scope=agent CLI spawn back onto the host — an unbuilt backend
-        is a setup error, not a retryable lane failure."""
-        raise NotImplementedError(
-            "DockerWorkspace.spawn (scope=agent CLI-in-container) is not yet "
-            "implemented — it lands in SE-3 Increment 2 (`docker exec -i`, no "
-            "-t). Use MO_SANDBOX_SCOPE=tool for container tool-exec, or keep the "
-            "harness on the host (MO_SANDBOX_SCOPE unset/tool)."
-        )
+        Runs ``argv`` DIRECTLY (no shell) via ``docker exec -i`` into the warm
+        container, so it mirrors the host ``spawn_local`` shape byte-for-byte:
+        the prompt rides on **stdin** (never argv/env → E2BIG-proof), stdout and
+        stderr are kept **separate** (unlike :meth:`exec`, which merges — a
+        merged stream would corrupt the provider's JSON envelope on stdout), and
+        the return code is faithful (docker surfaces the CLI's own code, incl.
+        ``127`` when the CLI is not found in the image).
+
+        The A.1 invariant is re-established structurally in the container's PID
+        namespace: **no ``-t``** means no TTY is allocated, so nothing the CLI
+        spawns can open ``/dev/tty`` to block a headless run; and the whole tree
+        dies with the container (:meth:`down` = ``docker rm -f``), which is the
+        container-native equivalent of the host's ``start_new_session`` +
+        process-group SIGKILL. On timeout we ``docker stop`` the container —
+        killing the host-side ``docker exec`` client would leave the in-container
+        process running — and return the conventional ``rc=124`` with empty
+        stdout, so ``dispatch`` finalizes it exactly like a host timeout.
+
+        ``env`` is filtered through :func:`_container_env` (allowlist) so only the
+        harness + provider config crosses the boundary, never the host's shell
+        identity or unrelated secrets."""
+        if self._cid is None:
+            raise RuntimeError("DockerWorkspace.spawn called before up()")
+        workdir = cwd or self._mount_path
+        exec_argv = [self._exe(), "exec", "-i", "-w", workdir]
+        for key, val in sorted(_container_env(env).items()):
+            exec_argv += ["-e", f"{key}={val}"]
+        exec_argv += [self._cid, *argv]
+        try:
+            r = subprocess.run(
+                exec_argv,
+                input=stdin,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,  # SEPARATE — contrast exec's merge
+                text=True,
+                timeout=timeout,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            # Reap the in-container process by stopping the container (the
+            # host-side exec client dying does not stop it) — the container's
+            # PID-namespace analogue of the host pgid SIGKILL.
+            self._docker("stop", "-t", "1", self._cid, timeout=30)
+            return _TIMEOUT_RC, "", f"timeout after {timeout}s"
+        return r.returncode, r.stdout or "", r.stderr or ""
 
     def put(self, content: str) -> str:
         if self._cid is None:
