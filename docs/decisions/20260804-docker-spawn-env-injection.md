@@ -126,6 +126,24 @@ Security voter flagged is a real but *bounded, single-tenant, brief-window*
 exposure, and hardening it belongs at **both** `-e` sites uniformly, not just
 spawn. Recorded as a follow-up.
 
+**UPDATE (2026-08-04, follow-up #2 RESOLVED — transport hardened to bare `-e KEY`).**
+The Security voter's `ps` argv-exposure is now closed at **both** sites (`spawn`
+*and* `up()`), but with a *simpler* mechanism than the `--env-file` this doc
+proposed: docker's `-e KEY` **without** a value forwards the value from the
+docker *client's own process environment* rather than argv. So `spawn` emits bare
+`-e KEY` (sorted, allowlisted names) and launches `subprocess.run(env={**os.environ,
+**allowed})`; the secret lives only in `/proc/<pid>/environ` (owner+root-only —
+the same protection a 0600 `--env-file` gives) with **no tempfile to create,
+chmod, or unlink-in-`finally`, and nothing left on disk if the process crashes**.
+Verified live: `docker exec -e MO_SECRET_PROBE <cid> …` forwarded the value into
+the container while `ps aux` showed only the bare `-e MO_SECRET_PROBE` name, never
+the value. The allowlist still fully governs *what* crosses (only named keys are
+forwarded); this change only moves the *transport* of the value off argv. Daemon-
+free unit tests remain deterministic (assert the bare `-e KEY` names + that no
+value string appears in argv); a dedicated regression test
+(`test_spawn_never_puts_a_secret_value_in_argv`) makes a value-in-argv leak
+un-mergeable.
+
 ## Decision-risk audit
 
 | Risk | Mitigation |
@@ -134,7 +152,7 @@ spawn. Recorded as a follow-up.
 | Generous suffix re-opens the leak | `*_API_KEY` deliberately does NOT match AWS `*_ACCESS_KEY_ID`/`*_SECRET_ACCESS_KEY`; prefixes are namespaced |
 | Container shell env clobbered | PATH/HOME/USER/SHELL match no prefix/suffix → dropped → container keeps its own |
 | docker/microvm policy drift (Builder's risk) | `_container_env` is one named, tested symbol; Increment 3 EXTRACTS it to a shared module (see follow-up), not import-from-docker |
-| Host `ps` argv secret exposure | bounded/single-tenant; uniform `--env-file` hardening deferred (follow-up) |
+| Host `ps` argv secret exposure | RESOLVED — bare `-e KEY` forwards the value from the client's own env (`/proc/environ`, owner+root-only), never argv; applied at both `-e` sites; regression test blocks any value-in-argv reintroduction |
 
 ## Standards uplift
 
@@ -148,8 +166,10 @@ spawn. Recorded as a follow-up.
    constants OUT of `docker.py` into a shared `mini_ork/runtime/backends/
    _workspace_env.py` (or `runtime/workspace_env.py`); docker + microvm both
    import it. Do it under a worktree that claims both backend files.
-2. **Both `-e` sites:** evaluate `--env-file` (root-owned tempfile, unlinked in
+2. **Both `-e` sites:** ~~evaluate `--env-file` (root-owned tempfile, unlinked in
    `finally`) to close the host-`ps` argv exposure at `up()` *and* `spawn`
-   uniformly.
+   uniformly.~~ **DONE (2026-08-04)** — closed with bare `-e KEY` (value from the
+   client env, not argv) at both sites; strictly simpler than `--env-file` (no
+   tempfile/chmod/unlink, nothing on disk). See the UPDATE note in Synthesis.
 3. **Egress/proxy:** if a container needs `HTTP(S)_PROXY`/`NO_PROXY`, add those
    names to the allowlist explicitly (deliberately not forwarded today).

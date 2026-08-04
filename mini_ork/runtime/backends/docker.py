@@ -32,9 +32,11 @@ _TIMEOUT_RC = 124  # conventional "killed by timeout" return code (GNU timeout)
 _RUN_LABEL = "mo.sandbox=1"  # sweepable: `docker ps -qf label=mo.sandbox=1`
 
 # The scope=agent env boundary (allowlist) lives in ``_workspace_env`` so the
-# docker + microvm backends share ONE tested policy and cannot drift. ``spawn``
-# forwards each surviving key as ``-e KEY=VALUE`` (docker MERGEs it onto the
-# container's own env). Decision: docs/decisions/20260804-docker-spawn-env-injection.md
+# docker + microvm backends share ONE tested policy and cannot drift. Both `-e`
+# sites forward each surviving key by NAME (``-e KEY``, value pulled from the
+# client's own env — never argv, so host ``ps`` can't read the secret; docker
+# MERGEs it onto the container's own env). Decision + argv-exposure follow-up:
+# docs/decisions/20260804-docker-spawn-env-injection.md
 
 
 class DockerWorkspace:
@@ -129,9 +131,11 @@ class DockerWorkspace:
         if self._memory:
             args += ["--memory", str(self._memory)]
         for key in self._env_passthrough:
-            val = os.environ.get(key)
-            if val is not None:
-                args += ["-e", f"{key}={val}"]
+            # Bare `-e KEY` (no value): docker reads it from our own env, which the
+            # `_docker` subprocess inherits — so a passed-through secret never lands
+            # in the `docker run` argv where `ps aux` would expose it.
+            if os.environ.get(key) is not None:
+                args += ["-e", key]
         # `sleep infinity` keeps the container warm; `exec` targets it repeatedly.
         args += [self._image, "sh", "-c", "sleep infinity"]
         r = self._docker(*args, timeout=180)
@@ -197,10 +201,20 @@ class DockerWorkspace:
         if self._cid is None:
             raise RuntimeError("DockerWorkspace.spawn called before up()")
         workdir = cwd or self._mount_path
+        allowed = _container_env(env)
         exec_argv = [self._exe(), "exec", "-i", "-w", workdir]
-        for key, val in sorted(_container_env(env).items()):
-            exec_argv += ["-e", f"{key}={val}"]
+        # Forward each allowlisted key by NAME ONLY (`-e KEY`, no `=VALUE`): docker
+        # reads the value from THIS process's own env (built below), so the secret
+        # never lands in argv where any host user could read it via `ps aux`.
+        # /proc/<pid>/environ is owner+root-only — the protection a 0600 --env-file
+        # would give, with no tempfile to create, chmod, or unlink on crash.
+        for key in sorted(allowed):
+            exec_argv += ["-e", key]
         exec_argv += [self._cid, *argv]
+        # Overlay the allowlisted values (the per-dispatch source of truth) onto our
+        # env so the bare `-e KEY` flags forward exactly those; keep os.environ so
+        # the docker CLI itself still finds PATH / DOCKER_HOST / ~/.docker config.
+        child_env = {**os.environ, **allowed}
         try:
             r = subprocess.run(
                 exec_argv,
@@ -209,6 +223,7 @@ class DockerWorkspace:
                 stderr=subprocess.PIPE,  # SEPARATE — contrast exec's merge
                 text=True,
                 timeout=timeout,
+                env=child_env,
                 check=False,
             )
         except subprocess.TimeoutExpired:
