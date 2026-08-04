@@ -707,38 +707,19 @@ def dispatch_model(
             spec = resolve_provider(request.model, root)
     except (ValueError, FileNotFoundError) as exc:
         return DispatchResult(ok=False, rc=2, error=str(exc), model=request.model)
-    # Node-scoped tool grants (kickoff/tool-grant-hermetic-dispatch.md):
-    # resolve the active node's capability grant from MO_NODE_ID/MO_NODE_TYPE
-    # + workflow.yaml, then inject --allowedTools + --strict-mcp-config
-    # (+ --mcp-config when MCP grants are present and MINI_ORK_RUN_DIR is set)
-    # into the claude argv. EXECUTABLE_MODELS (codex/gemini) are skipped —
-    # their CLIs don't accept --allowedTools and bash never passes it to them.
-    # MO_TOOL_GRANTS_DISABLED=1 opt-out for local debugging, matching the bash
-    # dispatch's escape hatch at lib/llm-dispatch.sh:981.
-    if request.model not in EXECUTABLE_MODELS:
-        command = spec.command
-        if effective_env.get("MO_TOOL_GRANTS_DISABLED", "0") != "1":
-            run_dir = effective_env.get("MINI_ORK_RUN_DIR", "") or None
-            command = apply_tool_grants(command, env=effective_env, run_dir=run_dir)
-        # E4 turn-resume: the recovery path exports MO_RESUME_SESSION_ID for a
-        # node with a persisted session. Insert `--resume <id>` so the claude
-        # lane continues the interrupted conversation instead of starting over.
-        # Claude-family only — codex/gemini (EXECUTABLE_MODELS) are excluded
-        # above and fall back to node-level resume.
-        resume_id = effective_env.get("MO_RESUME_SESSION_ID", "").strip()
-        if resume_id:
-            command = apply_resume(command, resume_id)
+    # Engine-scoped argv rewrite (SE-3 Phase A.3): the claude CLI needs
+    # node-scoped tool grants (--allowedTools/--strict-mcp-config/--mcp-config)
+    # and E4 turn-resume (--resume) injected; executable engines (codex) accept
+    # neither. Instead of an inline `if model not in EXECUTABLE_MODELS` special
+    # case that the next non-claude engine must remember to extend, ask the
+    # model's engine and delegate to its registered command builder. An engine
+    # with no builder (codex) gets no injection by construction — the safe
+    # default is structural, pinned by test_engine_command_builder_py.
+    builder = ENGINE_COMMAND_BUILDERS.get(engine_of(request.model))
+    if builder is not None:
+        command = builder(spec.command, request=request, env=effective_env)
         if command != spec.command:
-            spec = ProviderSpec(
-                model=spec.model,
-                command=command,
-                parse_usage=spec.parse_usage,
-                parse_cost=spec.parse_cost,
-                parse_text=spec.parse_text,
-                parse_session=spec.parse_session,
-                env=spec.env,
-                unset_env=spec.unset_env,
-            )
+            spec = replace(spec, command=command)
     # Merge lane env after removing stale gateway variables. Explicit request
     # overrides are applied last so a caller can deliberately opt into a custom
     # endpoint without mutating the process environment.
@@ -1088,6 +1069,63 @@ def _dispatch_codex_via_wrapper(
                 os.unlink(path)
             except OSError:
                 pass
+
+
+# ── Per-engine command builders (SOLID M6, OCP; SE-3 Phase A.3) ─────────────
+# A model runs under a harness *engine* (the CLI that actually spawns it). The
+# claude engine needs argv rewritten before dispatch — node-scoped tool grants
+# and E4 turn-resume — that other engines (codex) neither accept nor want. Each
+# engine registers a command builder here; dispatch_model asks engine_of(model)
+# and delegates. A model whose engine has no builder is dispatched with its argv
+# untouched, so claude-only flags can never leak into a CLI that rejects them
+# without anyone maintaining a negative special-case. Builder signature:
+#   (command, *, request: DispatchRequest, env: Mapping[str, str])
+#     -> tuple[str, ...].
+
+
+def engine_of(model: str) -> str:
+    """The harness engine that runs ``model``. Every non-executable lane is
+    dispatched through the claude CLI, so they share the ``"claude"`` engine and
+    its command builder; executable models (codex) are their own engine and are
+    dispatched with their native argv untouched."""
+    return model if model in EXECUTABLE_MODELS else "claude"
+
+
+def _claude_command_builder(
+    command: tuple[str, ...],
+    *,
+    request: DispatchRequest,
+    env: Mapping[str, str],
+) -> tuple[str, ...]:
+    """Rewrite a claude argv for a dispatch: inject node-scoped tool grants
+    (--allowedTools/--strict-mcp-config/--mcp-config; kickoff/tool-grant-hermetic
+    -dispatch.md) unless MO_TOOL_GRANTS_DISABLED=1, then E4 turn-resume
+    (--resume <id>) when MO_RESUME_SESSION_ID is set. Both leaf helpers also
+    guard on ``command[0] == "claude"``, so this is defence in depth; the load-
+    bearing guarantee is that no builder is registered for executable engines."""
+    if env.get("MO_TOOL_GRANTS_DISABLED", "0") != "1":
+        run_dir = env.get("MINI_ORK_RUN_DIR", "") or None
+        command = apply_tool_grants(command, env=env, run_dir=run_dir)
+    resume_id = env.get("MO_RESUME_SESSION_ID", "").strip()
+    if resume_id:
+        command = apply_resume(command, resume_id)
+    return command
+
+
+ENGINE_COMMAND_BUILDERS: dict[
+    str, Callable[..., tuple[str, ...]]
+] = {
+    "claude": _claude_command_builder,
+}
+
+
+def register_engine_command_builder(
+    engine: str, builder: Callable[..., tuple[str, ...]]
+) -> None:
+    """Register (or replace) the argv builder for a harness engine (OCP). A new
+    engine that needs bespoke argv registers here instead of growing a
+    special-case in dispatch_model."""
+    ENGINE_COMMAND_BUILDERS[engine] = builder
 
 
 # ── Per-model dispatch backends (SOLID M6, OCP) ─────────────────────────────
