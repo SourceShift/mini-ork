@@ -13,11 +13,19 @@ breaking. Two structural guarantees the bash version could not make:
      object and returned. There is no `if cmd; then …; fi` (which, with no
      `else`, returns 0 even when the condition failed) to mask a hard failure as
      success.
+
+  3. **Process contract.** The harness is spawned into its own session
+     (`start_new_session=True`) so neither it nor anything it spawns has a
+     controlling terminal — no `/dev/tty` prompt can block a headless run. A
+     timeout SIGKILLs the whole detached process *group*, so a hung harness
+     can't orphan grandchildren that keep burning the lane (and can't deadlock
+     the output drain by holding the inherited stdout pipe).
 """
 
 from __future__ import annotations
 
 import os
+import signal
 import subprocess
 import time
 from collections.abc import Callable, Sequence
@@ -30,6 +38,24 @@ from .models import DispatchRequest, DispatchResult, TokenUsage
 UsageParser = Callable[[str], TokenUsage]
 CostParser = Callable[[str, TokenUsage], float]
 TextParser = Callable[[str], str]
+
+
+def _terminate_process_group(proc: "subprocess.Popen[str]") -> None:
+    """SIGKILL the whole session the child leads. The child was spawned with
+    ``start_new_session=True``, so it is its own process-group leader; killing
+    the *group* — not just the direct child — reaps any grandchildren the
+    harness spawned (claude's helpers, codex's sidecar). That matters twice: a
+    hung lane can't leave orphans that keep burning cost after we've abandoned
+    it, and it frees the inherited stdout pipe those grandchildren hold, which
+    is what would otherwise deadlock the drain ``communicate()``. Best-effort —
+    if the group is already gone, fall back to the direct child."""
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            proc.kill()
+        except OSError:
+            pass
 
 
 def dispatch(
@@ -55,22 +81,20 @@ def dispatch(
 
     start = time.monotonic()
     try:
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             list(command),
-            input=request.prompt,  # ← prompt over stdin: structurally E2BIG-proof
-            capture_output=True,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
             env=proc_env,
             cwd=request.cwd,  # None = inherit; pinned by the caller's cwd guard
-            timeout=request.timeout_s,
-        )
-    except subprocess.TimeoutExpired:
-        return DispatchResult(
-            ok=False,
-            rc=124,
-            error=f"timeout after {request.timeout_s}s",
-            model=request.model,
-            duration_ms=int((time.monotonic() - start) * 1000),
+            # Sever the controlling terminal: the harness — and everything it
+            # spawns — becomes its own session with no /dev/tty, so no code path
+            # (mini-ork's own plan.py prompt or the harness CLI) can open the
+            # terminal and block a headless run. It also makes the whole harness
+            # a single process group we can reap on timeout (below).
+            start_new_session=True,
         )
     except OSError as exc:
         return DispatchResult(
@@ -81,9 +105,28 @@ def dispatch(
             duration_ms=int((time.monotonic() - start) * 1000),
         )
 
+    try:
+        # Prompt over stdin (input=): structurally E2BIG-proof — never on argv/env.
+        stdout, stderr = proc.communicate(
+            input=request.prompt, timeout=request.timeout_s
+        )
+    except subprocess.TimeoutExpired:
+        # A hung harness is the single biggest reliability failure. Reap its
+        # whole detached group, drain the pipes to reap the zombie, then return
+        # a distinct rc=124 so dispatch_with_fallback abandons this lane.
+        _terminate_process_group(proc)
+        proc.communicate()
+        return DispatchResult(
+            ok=False,
+            rc=124,
+            error=f"timeout after {request.timeout_s}s",
+            model=request.model,
+            duration_ms=int((time.monotonic() - start) * 1000),
+        )
+
     duration_ms = int((time.monotonic() - start) * 1000)
     rc = proc.returncode
-    stdout = proc.stdout or ""
+    stdout = stdout or ""
     if rc != 0:
         # A FAILED node is exactly what E4 resumes — capture its session_id
         # from whatever envelope made it to stdout so the recovery can
@@ -92,7 +135,7 @@ def dispatch(
             ok=False,
             rc=rc,
             text=stdout,
-            error=(proc.stderr or "")[-2000:],
+            error=(stderr or "")[-2000:],
             model=request.model,
             duration_ms=duration_ms,
             session_id=parse_session(stdout) if parse_session else "",
