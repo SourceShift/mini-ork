@@ -22,6 +22,7 @@ import subprocess
 import uuid
 from typing import Any, Mapping, Sequence
 
+from mini_ork.runtime.backends._workspace_env import _container_env
 from mini_ork.runtime.sandbox import register_workspace_backend
 
 __all__ = ["DockerWorkspace", "register"]
@@ -30,58 +31,10 @@ _DEFAULT_MOUNT = "/workspace"
 _TIMEOUT_RC = 124  # conventional "killed by timeout" return code (GNU timeout)
 _RUN_LABEL = "mo.sandbox=1"  # sweepable: `docker ps -qf label=mo.sandbox=1`
 
-# --- scope=agent env boundary (allowlist) ----------------------------------
-# The host process env handed to ``spawn`` is a grab-bag: the whole
-# ``os.environ`` (host PATH/HOME that don't exist in a Linux image; unrelated
-# SSH/AWS/npm/GitHub creds) plus the per-dispatch overrides. Forwarding it
-# verbatim would both clobber the container's own shell identity AND leak every
-# host secret into the container. So env crosses the boundary ALLOWLIST-first:
-# only the harness (``MO_*``) + LLM-provider namespaces + a generous
-# ``*_API_KEY`` suffix are forwarded. A dropped key fails LOUD (the CLI can't
-# auth → caught by the live docker smoke), whereas a leaked secret would be
-# silent — so we bias to the allowlist on this security axis. The ``*_API_KEY``
-# suffix deliberately does NOT match AWS ``*_ACCESS_KEY_ID`` /
-# ``*_SECRET_ACCESS_KEY``, so the catch-all cannot re-open that leak.
-# Decision: docs/decisions/20260804-docker-spawn-env-injection.md
-_AGENT_ENV_PREFIXES = (
-    "MO_",
-    "OPENAI_",
-    "ANTHROPIC_",
-    "CLAUDE_",
-    "CODEX_",
-    "GEMINI_",
-    "GOOGLE_GENAI_",
-    "GLM_",
-    "ZHIPU_",
-    "ZHIPUAI_",
-    "KIMI_",
-    "MOONSHOT_",
-    "MINIMAX_",
-    "DEEPSEEK_",
-    "OPENROUTER_",
-    "GROQ_",
-    "XAI_",
-    "MISTRAL_",
-    "TOGETHER_",
-    "FIREWORKS_",
-    "CEREBRAS_",
-    "PERPLEXITY_",
-)
-_AGENT_ENV_SUFFIXES = ("_API_KEY",)
-
-
-def _container_env(env: Mapping[str, str]) -> dict[str, str]:
-    """Filter a host env down to the keys a scope=agent CLI may carry into the
-    container (allowlist — see the module note above). Case-insensitive on the
-    key name; values pass through unchanged. Pure + daemon-free so the boundary
-    policy is unit-tested in one place (Increment 3's microVM backend will reuse
-    it)."""
-    out: dict[str, str] = {}
-    for key, val in env.items():
-        upper = key.upper()
-        if upper.startswith(_AGENT_ENV_PREFIXES) or upper.endswith(_AGENT_ENV_SUFFIXES):
-            out[key] = val
-    return out
+# The scope=agent env boundary (allowlist) lives in ``_workspace_env`` so the
+# docker + microvm backends share ONE tested policy and cannot drift. ``spawn``
+# forwards each surviving key as ``-e KEY=VALUE`` (docker MERGEs it onto the
+# container's own env). Decision: docs/decisions/20260804-docker-spawn-env-injection.md
 
 
 class DockerWorkspace:
