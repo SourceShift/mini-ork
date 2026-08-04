@@ -1,5 +1,6 @@
 import React from "react";
 import { clearCachedAgentServerInfo } from "#/api/agent-server-compatibility";
+import { randomHex } from "#/utils/random-hex";
 import {
   getActiveSelection,
   getRegisteredBackends,
@@ -47,7 +48,7 @@ function generateId(): string {
   ) {
     return crypto.randomUUID();
   }
-  return `backend-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+  return `backend-${Date.now()}-${randomHex(4)}`;
 }
 
 function applyTelemetrySelectionBoundary(

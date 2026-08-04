@@ -52,7 +52,7 @@ function parseBackendUrl(backendUrl) {
 
 function writeInvalidBackendUrlResponse(req, res) {
   const message = "Invalid backend URL";
-  console.error(`Proxy error for ${req.url}: ${message}`);
+  console.error("Proxy error for %s: %s", req.url, message);
   if (!res.headersSent) {
     res.writeHead(502, { "Content-Type": "text/plain; charset=utf-8" });
     res.end(`Bad Gateway: ${message}`);
@@ -101,7 +101,7 @@ export function proxyServerInfoRequest(
 
       proxyRes.on("error", (err) => {
         if (!isBenignSocketError(err)) {
-          console.error(`Upstream response error for ${req.url}:`, err.message);
+          console.error("Upstream response error for %s:", req.url, err.message);
         }
         if (!res.headersSent) {
           res.writeHead(502);
@@ -157,7 +157,7 @@ export function proxyServerInfoRequest(
 
   proxyReq.on("error", (err) => {
     if (!isBenignSocketError(err)) {
-      console.error(`Proxy error for ${req.url}:`, err.message);
+      console.error("Proxy error for %s:", req.url, err.message);
     }
     if (!res.headersSent) {
       res.writeHead(502);
@@ -169,14 +169,14 @@ export function proxyServerInfoRequest(
 
   req.on("error", (err) => {
     if (!isBenignSocketError(err)) {
-      console.error(`Client request error for ${req.url}:`, err.message);
+      console.error("Client request error for %s:", req.url, err.message);
     }
     proxyReq.destroy();
   });
 
   res.on("error", (err) => {
     if (!isBenignSocketError(err)) {
-      console.error(`Client response error for ${req.url}:`, err.message);
+      console.error("Client response error for %s:", req.url, err.message);
     }
     proxyReq.destroy();
   });
@@ -227,7 +227,7 @@ export function createProxyHandlers({
     metrics.totalErrors += 1;
     const targetText = target ? ` -> ${target}` : "";
     if (!isBenignSocketError(err)) {
-      console.error(`[${label}] Proxy error${targetText}: ${err.message}`);
+      console.error("[%s] Proxy error%s: %s", label, targetText, err.message);
     }
     if (resOrSocket && typeof resOrSocket.writeHead === "function") {
       writeProxyError(resOrSocket, err.message);
@@ -250,7 +250,10 @@ export function createProxyHandlers({
       metrics.totalErrors += 1;
       if (!isBenignSocketError(err)) {
         console.error(
-          `[${label}] Proxy error for ${req.url} -> ${target}:`,
+          "[%s] Proxy error for %s -> %s:",
+          label,
+          req.url,
+          target,
           err,
         );
       }

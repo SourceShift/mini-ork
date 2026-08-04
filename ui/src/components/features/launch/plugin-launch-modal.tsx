@@ -106,8 +106,19 @@ export function PluginLaunchModal({
     if (source.startsWith("github:")) {
       return source.replace("github:", "");
     }
-    if (source.includes("github.com/")) {
-      return source.split("github.com/")[1]?.replace(".git", "") || source;
+    // Parse the host instead of substring-matching "github.com/". A substring
+    // check accepts `evil.com/path?github.com/` and `github.com.evil.com/…`;
+    // matching against `url.hostname` pins the decision to the real authority.
+    try {
+      const url = new URL(source);
+      if (
+        url.hostname === "github.com" ||
+        url.hostname.endsWith(".github.com")
+      ) {
+        return url.pathname.replace(/^\/+/, "").replace(/\.git$/, "") || source;
+      }
+    } catch {
+      // Not an absolute URL (e.g. "owner/repo") — fall through to raw source.
     }
     return source;
   };

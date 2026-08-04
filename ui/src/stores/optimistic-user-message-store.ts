@@ -1,4 +1,5 @@
 import { create } from "zustand";
+import { randomHex } from "#/utils/random-hex";
 
 export type PendingUserMessageStatus = "sending" | "error";
 
@@ -102,11 +103,10 @@ const initialState: OptimisticUserMessageState = {
 };
 
 // Use a timestamp + random suffix instead of a module-level counter so ids
-// stay unique across test resets and don't accumulate state between runs.
-// `crypto.randomUUID` would be ideal but isn't available in older test
-// environments, so a base36 random suffix is a safe lowest-common-denominator.
-const generatePendingId = (): string =>
-  `pending-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+// stay unique across test resets and don't accumulate state between runs. The
+// suffix comes from Web Crypto (`randomHex`), not `Math.random` — predictable
+// PRNG output must never seed an id-like value.
+const generatePendingId = (): string => `pending-${Date.now()}-${randomHex(4)}`;
 
 export const useOptimisticUserMessageStore = create<OptimisticUserMessageStore>(
   (set, get) => ({

@@ -16,8 +16,17 @@ interface ParseResult {
 
 function sanitizeMessage(message: string | null): string | undefined {
   if (!message) return undefined;
-  // Strip ALL HTML tags for plain text display
-  const stripped = message.replace(/<[^>]*>/g, "").slice(0, 500);
+  // Strip HTML tags to a fixpoint. A single `.replace(/<[^>]*>/g, "")` is
+  // bypassable: `<scr<script>ipt>` leaves `<script>` behind because the outer
+  // match consumes the inner tag's angle brackets. Looping until the string
+  // stops changing removes nested/overlapping tags that reconstruct on one pass.
+  let stripped = message;
+  let previous: string;
+  do {
+    previous = stripped;
+    stripped = stripped.replace(/<[^>]*>/g, "");
+  } while (stripped !== previous);
+  stripped = stripped.slice(0, 500);
   return stripped || undefined;
 }
 
