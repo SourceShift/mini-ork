@@ -39,5 +39,6 @@ justifies it with cited evidence.
 
 ## Verification Command
 
-- `bash tests/run-all.sh` (or whatever the harness binds to npm/pytest/etc.)
-- Plus `lib/benchmark_suite.sh` rollup of `benchmark_results` delta.
+- `python3 -m pytest -q` (the Python runtime is the only runtime; the
+  pre-2026-07 bash `tests/run-all.sh` is retired).
+- Plus the `benchmark_results` delta rollup (`mini-ork eval`).

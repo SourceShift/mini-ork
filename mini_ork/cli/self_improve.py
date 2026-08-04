@@ -366,8 +366,43 @@ def _iter_run(root, home, db, it, opts, parent, resolved_sha, soft_deadline, har
 
     run_dir = os.path.join(home, "runs", run_id)
     os.makedirs(os.path.join(run_dir, "patches"), exist_ok=True)
+    # A bare "Target: <path>" kickoff scores needs_answers at the run_profile
+    # gate (no scope / success-criteria / proof command → confidence ~0.55) and
+    # the planner refuses to dispatch. Emit the full scope block the classifier
+    # needs so the iteration actually plans. Mirrors
+    # recipes/recursive-self-improve/example-kickoff.md but with the current
+    # Python verification command (bash tests/run-all.sh was retired 2026-07).
     open(os.path.join(run_dir, "kickoff.md"), "w").write(
-        f"# Recursive Self-Improvement — iter {it}\n\nTarget: mini-ork checkout at `{wt_path}`.\n")
+        f"""# Recursive Self-Improvement — iter {it}
+
+## Goal
+Run mini-ork against itself: find and fix the single highest-impact bottleneck
+in performance, correctness, or architecture, grounded in cited evidence (run
+logs, code paths, benchmark deltas, and arXiv references).
+
+## Scope
+- Target repo: this mini-ork checkout at `{wt_path}` — an isolated git worktree
+  on branch `{branch}`.
+- Improvable surface: the `mini_ork/` Python package, `recipes/`, and
+  `schemas/`. Leave `.mini-ork/` (run state) untouched; tests are read-only
+  context unless the patch adds a regression test.
+- Exactly one patch this iteration; keep the diff minimal and reviewable.
+
+## Success Criteria
+- The bottleneck scanner yields a ranked list with at least one
+  evidence-grounded candidate.
+- The Opus synthesizer emits a patch plan citing both internal evidence (run
+  logs / code paths) and external evidence (arXiv refs).
+- All three verifiers pass: bottlenecks-found, self-tests-pass, no-regression.
+- Existing tests pass with a non-negative quality delta on the patch.
+
+## Provider Policy
+- Research lenses: `minimax_lens`, `kimi_lens`, `codex_lens` (no Anthropic).
+- Synthesis reviewer: `opus_lens`. Implementer: `codex_lens`.
+
+## Verification Command
+- `python3 -m pytest -q` (the Python runtime is the only runtime).
+""")
 
     if opts["dry_run"]:
         print(f"  [dry-run] would dispatch recipe recursive-self-improve inside {wt_path}")
