@@ -55,16 +55,37 @@ def pty_enabled() -> bool:
     return os.environ.get("MO_PTY_ENABLED", "").strip().lower() not in _FALSEY
 
 
+def _is_safe_run_id(run_id: str) -> bool:
+    """True iff ``run_id`` is a single, traversal-free path segment.
+
+    ``run_id`` arrives as an attacker-reachable query param and is joined onto
+    ``home/runs/`` to pick the shell's cwd. Without this guard a value like
+    ``../../../../etc`` (or an absolute path) would escape the runs directory
+    and let the caller open the orchestrator anywhere on disk. We require the
+    segment to contain no separators, NUL, or parent refs — i.e. its basename
+    must equal itself — which is a recognized barrier against path traversal.
+    """
+    if not run_id or run_id in (".", ".."):
+        return False
+    if "/" in run_id or "\\" in run_id or "\x00" in run_id:
+        return False
+    return Path(run_id).name == run_id
+
+
 def _resolve_cwd(run_id: str | None, home: Path) -> Path:
     """cwd for the shell: the run's own dir when it exists, else the project root.
 
     ``home`` is the project's ``.mini-ork`` dir, so ``home.parent`` is the
     project root — the natural cwd for a per-project orchestrator.
     """
-    if run_id:
+    if run_id and _is_safe_run_id(run_id):
         run_dir = home / "runs" / run_id
-        if run_dir.is_dir():
-            return run_dir
+        # Belt-and-suspenders: the resolved dir must still live under runs/,
+        # so even an exotic segment that slips past the guard can't escape.
+        runs_root = (home / "runs").resolve()
+        resolved = run_dir.resolve()
+        if resolved.is_dir() and (resolved == runs_root or runs_root in resolved.parents):
+            return resolved
     return home.parent
 
 
