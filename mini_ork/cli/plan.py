@@ -287,7 +287,28 @@ def _auto_answer_profile(kickoff, questions, profile_path, dispatch_fn) -> str:
 
 
 def _can_prompt_profile() -> bool:
+    """True only when a human is actually attached to answer the prompt.
+
+    SE-3 incident, Layer 1 (level a): a parent that spawns mini-ork headless —
+    the Node BE, a scheduler, CI — while a controlling terminal is still
+    inherited made the old ``open('/dev/tty')`` probe return True, so the run
+    blocked forever on a question no human would ever answer. Opening
+    ``/dev/tty`` only proves the *session* owns a controlling terminal; it does
+    NOT prove a human is watching *this process's* stdio (stdin may be a pipe or
+    /dev/null). The positive signal for "someone can type an answer" is stdin
+    being an interactive tty, so we gate on that FIRST. Ordering: an explicit
+    opt-out still wins; then stdin must be a real terminal; only then do we
+    confirm ``/dev/tty`` is actually reachable. This inverts the fragile
+    opt-out convention — forgetting ``MINI_ORK_NONINTERACTIVE`` now degrades to
+    the safe auto-answer path (plan.py gate below), never a deadlock.
+    """
     if os.environ.get("MINI_ORK_NONINTERACTIVE", "0") == "1":
+        return False
+    try:
+        if not sys.stdin.isatty():
+            return False
+    except (OSError, ValueError):
+        # A closed/detached stdin (e.g. daemonized) has no isatty → not a human.
         return False
     try:
         with open("/dev/tty", encoding="utf-8"):
