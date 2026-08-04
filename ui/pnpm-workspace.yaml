@@ -1,13 +1,8 @@
-# esbuild's postinstall compiles its native binary — without approval,
-# pnpm skips it and `vite build` fails at runtime.
-# allowBuilds = pnpm 11+ syntax; onlyBuiltDependencies = pnpm 10. Each
-# version ignores the other's key, so keep both for contributor compat.
-allowBuilds:
-  esbuild: true
 onlyBuiltDependencies:
+  - "@heroui/shared-utils"
+  - "@openrouter/sdk"
+  - electron-winstaller
   - esbuild
-# Force every postcss copy (direct + autoprefixer/tailwind peers) to a version
-# patched for GHSA sourceMappingURL path traversal (fixed in 8.5.18).
-# pnpm 11 reads overrides here, not from package.json's pnpm field.
-overrides:
-  postcss: "^8.5.18"
+  - msw
+  - unrs-resolver
+auto-install-peers: true
