@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import os
 import tempfile
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any, Callable, Protocol, runtime_checkable
 
@@ -48,6 +49,32 @@ class Workspace(Protocol):
 
     def exec(self, cmd: str, *, cwd: str, timeout: int) -> tuple[int, str]:
         """Run ``cmd`` with ``cwd`` pinned; return (returncode, merged output)."""
+        ...
+
+    def spawn(
+        self,
+        argv: Sequence[str],
+        *,
+        stdin: str,
+        timeout: float,
+        env: Mapping[str, str],
+        cwd: str | None,
+    ) -> tuple[int, str, str]:
+        """Spawn a harness CLI (``argv``, no shell) with the prompt fed on
+        ``stdin``; return ``(rc, stdout, stderr)`` with the two streams **kept
+        separate**.
+
+        This is the ``scope=agent`` verb — route the coding-agent CLI *itself*
+        into the workspace — and it deliberately differs from ``exec`` (the
+        ``scope=tool`` verb): ``exec`` is many warm calls returning ONE merged
+        stream with no stdin, right for shell tool-exec; ``spawn`` is a one-shot
+        with a stdin channel and separated stdout/stderr, the shape the dispatch
+        spawn contract requires (a merged stream would corrupt the provider's
+        JSON envelope on stdout). ``rc`` is faithful: ``124`` on timeout,
+        ``127`` on spawn failure, else the process's own code. Each backend
+        re-establishes the A.1 invariant in its own isolation domain (host:
+        ``start_new_session``; container: no host ``/dev/tty`` + dies with the
+        container)."""
         ...
 
     def put(self, content: str) -> str:
@@ -92,6 +119,25 @@ class LocalWorkspace:
     def exec(self, cmd: str, *, cwd: str, timeout: int) -> tuple[int, str]:
         output, rc = mo_runtime_exec(cmd, cwd=cwd, timeout=timeout, backend="local")
         return rc, output
+
+    def spawn(
+        self,
+        argv: Sequence[str],
+        *,
+        stdin: str,
+        timeout: float,
+        env: Mapping[str, str],
+        cwd: str | None,
+    ) -> tuple[int, str, str]:
+        # The host spawn transport IS core.spawn_local — today's dispatch Popen
+        # verbatim (TTY-severed, pgid-reaped, streams separated) — so the local
+        # backend is byte-for-byte the in-process path with zero regression.
+        # Imported lazily to keep this module's import-time surface stdlib-only
+        # and free of any dispatch dependency (no import cycle: dispatch.core
+        # imports only dispatch.models, never runtime).
+        from mini_ork.dispatch.core import spawn_local
+
+        return spawn_local(argv, stdin=stdin, timeout=timeout, env=env, cwd=cwd)
 
     def put(self, content: str) -> str:
         root = self._ensure_root()
