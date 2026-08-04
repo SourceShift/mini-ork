@@ -202,6 +202,18 @@ def test_app_factory_boots(home: Path) -> None:
     # must survive the SPA catch-all or the forked agent-canvas can't onboard.
     assert "/server_info" in paths
     assert "/api/settings" in paths
+    # Onboarding write-path: schemas + profile list must be JSON routes, not
+    # swallowed by the index.html catch-all (which would 200-with-HTML).
+    assert "/api/settings/agent-schema" in paths
+    assert "/api/settings/conversation-schema" in paths
+    assert "/api/agent-profiles" in paths
+    # PATCH must be a registered method on /api/settings, or onboarding's
+    # saveSettings hits 405 Method Not Allowed and the flow stalls.
+    settings_methods = set(app.openapi()["paths"]["/api/settings"].keys())
+    assert {"get", "patch"} <= settings_methods, (
+        f"/api/settings is missing methods {{'get','patch'}} - PATCH regression "
+        f"re-breaks onboarding; have {settings_methods}"
+    )
 
 
 # ── OpenHands agent-server protocol shim (SE-3 UI fork) ─────────────────────
@@ -252,6 +264,56 @@ def test_agent_server_settings_probe_shape() -> None:
     assert {"agent_settings", "conversation_settings", "llm_api_key_is_set"} <= set(out)
     assert isinstance(out["agent_settings"], dict)
     assert isinstance(out["conversation_settings"], dict)
+
+
+def test_agent_server_update_settings_deep_merges_diff() -> None:
+    """`SettingsClient.updateSettings` (PATCH /api/settings) is onboarding's
+    write step. It sends only the fields the user changed under ``*_diff`` keys;
+    the reported field bug was a missing PATCH handler → 405 Method Not Allowed,
+    which stalled onboarding. This pins the fix: the handler exists, deep-merges
+    the diff into the store, and returns a SettingsApiResponse reflecting it.
+
+    The store is a module global, so snapshot + restore to keep the test
+    hermetic and order-independent."""
+    import copy
+
+    from mini_ork.web.routes import agent_server as mod
+
+    saved = copy.deepcopy(mod._SETTINGS)
+    try:
+        # Exactly the payload from the reported curl reproduction.
+        out = mod.update_settings(
+            {"misc_settings_diff": {"app_preferences": {"user_consents_to_analytics": False}}}
+        )
+        assert out["misc_settings"]["app_preferences"]["user_consents_to_analytics"] is False
+        # A second, disjoint diff must not clobber the first (deep, not shallow).
+        out2 = mod.update_settings(
+            {"misc_settings_diff": {"app_preferences": {"language": "en"}}}
+        )
+        prefs = out2["misc_settings"]["app_preferences"]
+        assert prefs["language"] == "en"
+        assert prefs["user_consents_to_analytics"] is False
+        # Still a valid SettingsApiResponse shape.
+        assert {"agent_settings", "conversation_settings", "llm_api_key_is_set"} <= set(out2)
+    finally:
+        mod._SETTINGS.clear()
+        mod._SETTINGS.update(saved)
+
+
+def test_agent_server_form_schemas_and_profiles_are_json() -> None:
+    """The remaining onboarding reads must resolve to JSON, not the SPA
+    index.html catch-all (HTML-with-200 = false success the SDK can't parse).
+    Schemas are valid empty JSON Schemas; the profile list is a JSON array."""
+    from mini_ork.web.routes.agent_server import (
+        agent_schema,
+        conversation_schema,
+        list_agent_profiles,
+    )
+
+    for schema in (agent_schema(), conversation_schema()):
+        assert schema["type"] == "object"
+        assert isinstance(schema["properties"], dict)
+    assert isinstance(list_agent_profiles(), list)
 
 
 def test_idea_tree_roots_returns_backfilled_sessions(db) -> None:

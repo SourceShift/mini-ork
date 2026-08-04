@@ -130,8 +130,29 @@ def create_app(home: Path | None = None, dev_cors: bool = True) -> FastAPI:
             name="assets",
         )
 
-        @app.get("/{full_path:path}")
-        def spa_fallback(full_path: str) -> FileResponse:
+        # Prefixes that are wire-protocol surfaces, never client-side SPA
+        # routes. Anything reaching the catch-all under one of these was NOT
+        # matched by a real router, i.e. it is genuinely unimplemented — so we
+        # answer 404 JSON. Serving index.html (HTML, status 200) here is the
+        # silent-false-success trap: an SDK client parses HTML as JSON, fails
+        # opaquely, and the failure looks like "no data" rather than "not
+        # implemented". Same refusal-of-silent-empty posture as the CORS note.
+        _NON_SPA_PREFIXES = (
+            "api/",
+            "server_info",
+            "alive",
+            "health",
+            "ready",
+            "sockets",
+        )
+
+        # response_model=None: the union return (FileResponse | JSONResponse)
+        # is not a Pydantic-derivable type, so we opt out of response-model
+        # generation rather than let FastAPI try to build a schema from it.
+        @app.get("/{full_path:path}", response_model=None)
+        def spa_fallback(full_path: str) -> FileResponse | JSONResponse:
+            if full_path.startswith(_NON_SPA_PREFIXES):
+                return JSONResponse({"detail": "Not Found"}, status_code=404)
             return FileResponse(STATIC_DIR / "index.html")
     else:
 
