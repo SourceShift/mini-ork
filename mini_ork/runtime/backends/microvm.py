@@ -43,12 +43,28 @@ import os
 import uuid
 from typing import Any, Mapping, Sequence
 
+from mini_ork.runtime.backends._workspace_env import _container_env
 from mini_ork.runtime.sandbox import register_workspace_backend
 
 __all__ = ["MicrovmWorkspace", "register"]
 
 _DEFAULT_MOUNT = "/workspace"
 _TIMEOUT_RC = 124  # conventional "killed by timeout" return code (GNU timeout)
+_SPAWN_FAIL_RC = 127  # conventional "could not spawn the process" code (execve)
+
+
+def _is_spawn_start_failure(exc: BaseException) -> bool:
+    """True when an SDK exec error means the process never STARTED (missing or
+    non-executable binary) — the microVM analogue of the host's ``execve``
+    ``OSError``. Unlike host ``Popen`` / ``docker exec`` (which RETURN ``rc=127``
+    for a missing CLI), microsandbox RAISES; the Rust FFI renders it as
+    ``exec failed: spawn "<cmd>": <reason> (os error N)``. The ``spawn`` phase
+    token — plus the ENOENT text as a belt-and-suspenders — distinguishes a
+    never-started process (→ ``rc=127``, the dispatch spawn-fail contract) from a
+    runtime/infra fault (which must propagate loudly per ``_spawn_in_workspace``).
+    A test pins this wording so a future SDK message change trips a canary."""
+    msg = str(exc).lower()
+    return "exec failed: spawn" in msg or "no such file or directory" in msg
 
 
 class MicrovmWorkspace:
@@ -199,19 +215,87 @@ class MicrovmWorkspace:
         env: Mapping[str, str],
         cwd: str | None,
     ) -> tuple[int, str, str]:
-        """Spawn the harness CLI *inside* the microVM (scope=agent).
+        """Spawn the harness CLI *inside* the microVM (scope=agent) — the
+        hybrid's microVM TRANSPORT for the dispatch spawn contract.
 
-        NOT YET IMPLEMENTED — this is the hybrid's Increment-3 slice. It will
-        drive the microsandbox SDK's exec with the prompt on stdin, streams kept
-        separate, and a timeout mapped to ``rc=124`` — the A.1 invariant holds by
-        construction (the CLI runs in a hardware-isolated VM with no host
-        ``/dev/tty`` and dies with the VM). Until then it fails loudly rather
-        than silently dropping a scope=agent CLI spawn back onto the host."""
-        raise NotImplementedError(
-            "MicrovmWorkspace.spawn (scope=agent CLI-in-microVM) is not yet "
-            "implemented — it lands in SE-3 Increment 3 (microsandbox SDK exec). "
-            "Use MO_SANDBOX_SCOPE=tool for microVM tool-exec, or keep the harness "
-            "on the host (MO_SANDBOX_SCOPE unset/tool)."
+        Runs ``argv`` DIRECTLY (no shell) via the microsandbox SDK ``exec``, so it
+        mirrors the host ``spawn_local`` / docker ``spawn`` shape: the prompt rides
+        on **stdin** as BYTES (``exec(stdin=b"...")``; note a ``str`` stdin is a
+        *mode* selector — ``null``/``pipe``/``bytes`` — not the payload, so the
+        prompt must be encoded), stdout and stderr are kept **separate** (the SDK's
+        ``ExecOutput`` exposes them apart — unlike :meth:`exec`, which merges), and
+        the return code is faithful (``ExecOutput.exit_code``).
+
+        The A.1 invariant is re-established by construction: **``tty=False``** so no
+        pseudo-TTY is allocated and nothing the CLI spawns can open ``/dev/tty`` to
+        block a headless run, and the whole process tree dies with the microVM
+        (:meth:`down` stops+removes it) — the hardware-isolated analogue of the
+        host's ``start_new_session`` + process-group SIGKILL. ``env`` is filtered
+        through :func:`_container_env` (allowlist) and passed to ``exec(env=)``,
+        which MERGEs onto the VM's own env — so the VM keeps its own ``PATH``/
+        ``HOME`` while the harness + provider keys cross, never the host's shell
+        identity or unrelated secrets.
+
+        Two SDK divergences from the host/docker transports are normalized to the
+        one dispatch contract: (1) the SDK RAISES a timeout rather than returning,
+        so we map it to ``rc=124`` with empty stdout; (2) the SDK RAISES when the
+        binary can't be spawned (missing CLI) where host/docker RETURN ``rc=127``,
+        so a spawn-start failure (see :func:`_is_spawn_start_failure`) becomes
+        ``rc=127`` — while a genuine VM/infra fault propagates loudly."""
+        sb = self._sb
+        if sb is None:
+            raise RuntimeError("MicrovmWorkspace.spawn called before up()")
+        if not argv:
+            raise ValueError("MicrovmWorkspace.spawn requires a non-empty argv")
+        cmd, args = argv[0], list(argv[1:])
+        workdir = cwd or self._mount_path
+        cenv = _container_env(env)
+
+        # up() already proved the SDK importable; grab its typed timeout so a
+        # microVM-enforced timeout maps to rc=124 like the host/docker paths.
+        timeout_excs: tuple[type[BaseException], ...] = (asyncio.TimeoutError,)
+        exec_error_cls: type[BaseException] | None = None
+        try:
+            from microsandbox import ExecTimeoutError, MicrosandboxError
+
+            timeout_excs = (asyncio.TimeoutError, ExecTimeoutError)
+            exec_error_cls = MicrosandboxError
+        except ImportError:  # pragma: no cover
+            pass
+
+        try:
+            out = self._run(
+                lambda: sb.exec(
+                    cmd,
+                    args,
+                    cwd=workdir,
+                    env=cenv,
+                    timeout=float(timeout),
+                    stdin=stdin.encode("utf-8"),  # bytes = payload (str is a MODE)
+                    tty=False,  # A.1: no pseudo-TTY → nothing can open /dev/tty
+                )
+            )
+        except timeout_excs:
+            # Empty stdout so dispatch finalizes it exactly like a host timeout;
+            # the in-VM process is reaped by the SDK timeout and by down().
+            return _TIMEOUT_RC, "", f"timeout after {timeout}s"
+        except Exception as exc:
+            if exec_error_cls is not None and isinstance(exc, exec_error_cls):
+                # A never-started process (missing CLI) is the microVM analogue of
+                # the host's execve rc=127 — normalize it, don't leak an exception
+                # past the (rc, out, err) contract dispatch depends on.
+                if _is_spawn_start_failure(exc):
+                    return _SPAWN_FAIL_RC, "", f"spawn failed: {exc}"
+                # Some SDK builds word the timeout differently; catch that too.
+                if "timeout" in str(exc).lower():
+                    return _TIMEOUT_RC, "", f"timeout after {timeout}s"
+            raise  # genuine VM/infra fault → propagate loudly (setup error)
+
+        rc = getattr(out, "exit_code", None)
+        return (
+            (rc if rc is not None else 0),
+            getattr(out, "stdout_text", "") or "",
+            getattr(out, "stderr_text", "") or "",
         )
 
     def put(self, content: str) -> str:
