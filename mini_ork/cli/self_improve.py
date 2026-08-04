@@ -415,9 +415,17 @@ logs, code paths, benchmark deltas, and arXiv references).
     exec_log = os.path.join(run_dir, "execute.log")
     time_left = hard_deadline - int(time.time())
     per_iter = min(3600, time_left)
+    # The iteration worktree lives UNDER the framework tree (home/worktrees/…),
+    # so every lane dispatch trips providers.cwd_guard, which refuses a cwd inside
+    # mini-ork to stop a target-repo lane from corrupting the framework. Recursive
+    # self-improve IS the one sanctioned exception the guard names — a genuine
+    # mini-ork self-edit — so opt in explicitly; without it the planner (opus) and
+    # every other lane fail preflight with "cwd guard failed" and the iter dies
+    # before any research runs.
     env = {**os.environ, "MINI_ORK_RUN_ID": run_id, "MINI_ORK_RUN_DIR": run_dir,
            "MINI_ORK_RECIPE": "recursive-self-improve", "MINI_ORK_SELF_IMPROVE_ITER": str(it),
            "MINI_ORK_SELF_IMPROVE_WORKTREE": wt_path, "MINI_ORK_TIMESTAMP": ts,
+           "MO_ALLOW_FRAMEWORK_CWD": "1",
            "MO_RUNTIME_BACKEND": os.environ.get("MO_RUNTIME_BACKEND", "bubblewrap")}
     def _default_dispatch(wt, kickoff, log, timeout_s, e):
         with open(log, "wb") as fh:
