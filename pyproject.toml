@@ -8,7 +8,12 @@ version = "0.7.0"
 description = "Python framework facade for the mini-ork agent workflow runtime"
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = ["PyYAML>=6.0"]
+# jsonschema powers the behavioral oracle's deep (nested/typed) JSON-Schema
+# validation; without it the verifier silently degrades to shallow shape-matching
+# and cannot refute nested/type violations. A verifier must not downgrade by
+# accident, so it is declared, not optional. The lazy-import fallback in
+# mini_ork.verify.behavioral remains as defense-in-depth only.
+dependencies = ["PyYAML>=6.0", "jsonschema>=4.0"]
 license = { file = "LICENSE" }
 authors = [{ name = "SourceShift" }]
 keywords = ["agents", "workflow", "orchestration", "multi-agent", "llm"]
