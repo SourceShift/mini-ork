@@ -21,6 +21,9 @@ import re
 import sqlite3
 import sys
 import time
+from collections.abc import Callable
+
+from mini_ork.dispatch.predicates import looks_like_json
 
 
 # ── pure helpers (verbatim regex transcriptions) ──
@@ -259,15 +262,33 @@ def write_llm_calls_row(db, provider, model_id, tier, feature_name, actor, statu
 
 # ── model-level dispatch (delegates to the ported mini_ork.dispatch core) ──
 
-def mo_llm_dispatch(model, prompt, out_file, timeout_s=1500, max_turns=60) -> int:
+def mo_llm_dispatch(model, prompt, out_file, timeout_s=1500, max_turns=60, accept=None) -> int:
     """Provider call via mini_ork.dispatch; writes out_file + .cost/.err.log sidecars.
     Returns 0 on success, the provider rc otherwise. (llm_calls is owned by the
-    llm_dispatch wrapper, matching the bash split.)"""
+    llm_dispatch wrapper, matching the bash split.)
+
+    ``accept`` is an optional structural shape predicate (SE-3 Phase A.2). On the
+    multi-lane path it is threaded into ``dispatch_with_fallback`` so a
+    wrong-shape lane triggers fallback; on the single-lane path there is nobody
+    to fall back to, so a clean-but-wrong-shape result is downgraded to
+    ok=False/rc=SHAPE_REJECT_RC here — the same signal, so the caller never
+    writes a structurally-broken artifact that the verifier will kill late."""
     from mini_ork.dispatch.models import DispatchRequest
+    from mini_ork.dispatch.predicates import SHAPE_REJECT_RC
     from mini_ork.dispatch.providers import dispatch_model, dispatch_with_fallback
     lanes = [m.strip() for m in str(model).split(",") if m.strip()] or [str(model)]
     req = DispatchRequest(model=lanes[0], prompt=prompt, timeout_s=float(timeout_s))
-    res = dispatch_with_fallback(req, lanes) if len(lanes) > 1 else dispatch_model(req)
+    if len(lanes) > 1:
+        res = dispatch_with_fallback(req, lanes, accept=accept)
+    else:
+        res = dispatch_model(req)
+        if accept is not None and res.ok and (res.text or "").strip() and not accept(res):
+            from dataclasses import replace
+            res = replace(
+                res, ok=False, rc=SHAPE_REJECT_RC,
+                error="dispatch result failed shape check "
+                f"({getattr(accept, '__name__', 'accept')})",
+            )
     try:
         open(out_file, "w", encoding="utf-8").write(res.text)
         open(out_file + ".cost", "w", encoding="utf-8").write(f"{res.cost_usd:.6f}")
@@ -290,11 +311,33 @@ def mo_llm_dispatch(model, prompt, out_file, timeout_s=1500, max_turns=60) -> in
 
 # ── the llm_dispatch lane-routing wrapper ──
 
+# node_type → structural shape predicate (SE-3 Phase A.2). Keyed on the
+# --node-type the CLI receives. Deliberately minimal: only nodes whose artifact
+# is *known* to be JSON are gated, so prose-emitting nodes (researcher,
+# reviewer, reflector, …) are never false-rejected. `planner` is the SE-3
+# incident node — a planner lane that returned bad JSON produced no artifact and
+# the run died late at the verifier. Add an entry only once a node's JSON output
+# contract is confirmed; this is a structural gate, not the semantic
+# validate_artifact check. Override with MO_SHAPE_CHECK=0 (kill switch).
+_NODE_SHAPE_PREDICATES: dict[str, Callable[[object], bool]] = {
+    "planner": looks_like_json,
+}
+
+
+def _shape_predicate_for(node_type: str) -> Callable[[object], bool] | None:
+    if os.environ.get("MO_SHAPE_CHECK", "1") == "0":
+        return None
+    return _NODE_SHAPE_PREDICATES.get(node_type)
+
+
 def llm_dispatch(argv=None, *, root=None, dispatch_fn=None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     root = root or os.environ.get("MINI_ORK_ROOT") or os.getcwd()
     home = os.environ.get("MINI_ORK_HOME") or os.path.join(os.getcwd(), ".mini-ork")
     db = os.environ.get("MINI_ORK_DB") or os.path.join(home, "state.db")
+    # A test/caller-supplied dispatch_fn keeps the historic 5-arg contract and
+    # must never receive the A.2 accept= kwarg; only the default dispatcher does.
+    _default_dispatch = dispatch_fn is None
     dispatch_fn = dispatch_fn or mo_llm_dispatch
 
     node_type = prompt_text = out_file = model_override = ""
@@ -360,6 +403,9 @@ def llm_dispatch(argv=None, *, root=None, dispatch_fn=None) -> int:
     if model == "glm" and os.environ.get("MO_GLM_MAX_ATTEMPTS", "").isdigit():
         max_attempts = max(max_attempts, int(os.environ["MO_GLM_MAX_ATTEMPTS"]))
 
+    # A.2 boundary shape check — None unless this node's artifact is known JSON.
+    accept_fn = _shape_predicate_for(node_type)
+
     start_ms = int(time.time() * 1000)
     attempt = 1
     rc = 1
@@ -369,7 +415,11 @@ def llm_dispatch(argv=None, *, root=None, dispatch_fn=None) -> int:
                 os.remove(side)
             except OSError:
                 pass
-        rc = dispatch_fn(model, prompt_text, out_file, timeout_s, max_turns)
+        if _default_dispatch and accept_fn is not None:
+            rc = dispatch_fn(model, prompt_text, out_file, timeout_s, max_turns,
+                             accept=accept_fn)
+        else:
+            rc = dispatch_fn(model, prompt_text, out_file, timeout_s, max_turns)
         if rc == 0:
             break
         probe = ""
