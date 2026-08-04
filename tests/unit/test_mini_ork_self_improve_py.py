@@ -101,6 +101,44 @@ def test_record_run(tmp_path):
     assert _rows(db_p, q) == "run-9|2|/wt|br|100|200|success|all-pass"
 
 
+def _git(cwd, *args):
+    return subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, text=True)
+
+
+def test_restore_root_surface_leak(tmp_path):
+    """A rejected iteration must revert files the dispatch leaked into the main
+    checkout — but only those, never the operator's own in-flight work or files
+    outside the improvable surface."""
+    root = tmp_path / "repo"
+    (root / "mini_ork").mkdir(parents=True)
+    (root / "docs").mkdir()
+    _git(root, "init", "-q")
+    _git(root, "config", "user.email", "t@t")
+    _git(root, "config", "user.name", "t")
+    tracked = root / "mini_ork" / "keep.py"; tracked.write_text("v1\n")
+    outside = root / "docs" / "note.md"; outside.write_text("d1\n")
+    _git(root, "add", "-A"); _git(root, "commit", "-qm", "init")
+
+    # operator already has an in-flight edit inside the surface before the run
+    preexist = root / "mini_ork" / "wip.py"; preexist.write_text("in progress\n")
+    pre = si._root_surface_dirty(str(root))
+    assert "mini_ork/wip.py" in pre
+
+    # the run leaks: mutate a tracked surface file, create a new untracked one,
+    # and (out of scope) touch a file outside the surface
+    tracked.write_text("v1\nLEAKED\n")
+    leaked_new = root / "mini_ork" / "leaked_new.py"; leaked_new.write_text("leak\n")
+    outside.write_text("d1\nalso changed but outside surface\n")
+
+    restored = si._restore_root_surface_leak(str(root), pre)
+
+    assert set(restored) == {"mini_ork/keep.py", "mini_ork/leaked_new.py"}
+    assert tracked.read_text() == "v1\n"          # tracked leak reverted to HEAD
+    assert not leaked_new.exists()                # untracked leak removed
+    assert preexist.read_text() == "in progress\n"  # operator's WIP untouched
+    assert "also changed" in outside.read_text()  # outside-surface change untouched
+
+
 def test_record_success(tmp_path):
     db_p = _fresh_db(tmp_path, "p")
     # a pre-existing deferred row to be superseded
