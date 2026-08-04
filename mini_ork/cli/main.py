@@ -692,6 +692,8 @@ def _build_default_registry() -> dict:
     # "recipe-eval" is native too, but the dash is not importable in a module
     # name — register it explicitly against mini_ork.cli.recipe_eval.
     registry["recipe-eval"] = _native_module_handler("mini_ork.cli.recipe_eval")
+    # "sandbox-gc" — same dash-not-importable case; sweeps leaked sandboxes.
+    registry["sandbox-gc"] = _native_module_handler("mini_ork.cli.sandbox_gc")
     registry["execute"] = _execute_inprocess
     for sub, module in _NATIVE_MODULE_SUBS.items():
         registry[sub] = _native_module_handler(module)
