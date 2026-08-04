@@ -34,6 +34,18 @@ from pathlib import Path
 DEFAULT_HARNESS = "opencode"
 ALLOWED_HARNESSES = ("opencode", "codex", "claude", "shell")
 
+# Canonical, constant program name for each agent harness. Every value here is
+# a string *literal*, so looking a (possibly user-supplied) harness name up in
+# this map yields a constant that never carries the caller's taint into an exec
+# or subprocess sink. This is the barrier that makes the ``cmd`` query param
+# provably unable to smuggle an arbitrary program past ``resolve_harness`` —
+# both the invariant a reader relies on and the one a taint analyzer can see.
+_HARNESS_PROGRAM: dict[str, str] = {
+    "opencode": "opencode",
+    "codex": "codex",
+    "claude": "claude",
+}
+
 _FALSEY = ("", "0", "false", "no", "off")
 
 
@@ -44,14 +56,17 @@ def _shell() -> str:
 def harness_argv(harness: str) -> list[str]:
     """Direct argv for a harness — the forkpty fallback when tmux is absent.
 
-    ``shell`` becomes a login shell; an agent becomes just its own binary. This
-    is an allow-list (a ``cmd`` param selects a program, never smuggles argv).
+    ``shell`` becomes a login shell; an agent becomes just its own binary. The
+    program is looked up as a constant literal (``_HARNESS_PROGRAM``), so a
+    ``cmd`` param selects a vetted program and can never smuggle an argv — an
+    unrecognized name falls back to a login shell rather than executing itself.
     """
     if harness == "shell":
         return [_shell(), "-l"]
-    if harness in ALLOWED_HARNESSES:
-        return [harness]
-    return [_shell(), "-l"]
+    program = _HARNESS_PROGRAM.get(harness)
+    if program is None:
+        return [_shell(), "-l"]
+    return [program]
 
 
 def read_orchestrator_config(home: Path) -> dict:
@@ -98,8 +113,9 @@ def session_name(harness: str, home: Path) -> str:
     across projects while staying deterministic — the same project always
     reattaches to the same session.
     """
+    program = _HARNESS_PROGRAM.get(harness, "shell")
     digest = hashlib.sha1(str(Path(home).resolve()).encode()).hexdigest()[:8]
-    return f"mo-{harness}-{digest}"
+    return f"mo-{program}-{digest}"
 
 
 def _tmux_bin() -> str | None:
@@ -122,7 +138,10 @@ def _launch_command(harness: str) -> str | None:
     """
     if harness == "shell":
         return None
-    return f'{harness}; exec "${{SHELL:-/bin/sh}}" -i'
+    program = _HARNESS_PROGRAM.get(harness)
+    if program is None:
+        return None
+    return f'{program}; exec "${{SHELL:-/bin/sh}}" -i'
 
 
 def build_new_session_argv(
