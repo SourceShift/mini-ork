@@ -5,8 +5,10 @@ stdout/stderr, timeout→rc=124, spawn-fail→rc=127, telemetry parse) and deleg
 the *transport* to a thin per-backend ``Workspace.spawn`` primitive. The
 ``host`` backend keeps today's in-process ``Popen`` verbatim via
 ``core.spawn_local`` (zero regression); ``docker``/``microvm`` route the harness
-CLI *itself* into a container/microVM (implemented in Increments 2/3, stubbed
-here). ``DispatchRequest.workspace`` (default ``"host"``) is the selector.
+CLI *itself* into a container/microVM (both built — Increments 2/3; deep
+transport contracts live in tests/unit/test_docker_spawn.py +
+tests/unit/test_microvm_spawn.py). ``DispatchRequest.workspace`` (default
+``"host"``) is the selector.
 
 What is pinned here:
 
@@ -20,8 +22,9 @@ What is pinned here:
 3. **The delegation contract holds.** A non-host workspace is driven
    ``up() → spawn() → down()`` and its ``(rc, stdout, stderr)`` triple flows
    through the SAME finalize as the host path (telemetry parse applied once).
-4. **Unbuilt backends fail loudly.** ``docker``/``microvm`` spawn raise
-   ``NotImplementedError`` (not a silent host fallback) until Increments 2/3.
+4. **Built backends guard before up().** ``docker``/``microvm`` spawn are real
+   (Increments 2/3); called before ``up()`` they fail loudly with a provisioning
+   guard (``RuntimeError``), never a silent host fallback.
 5. **The selector precedence is correct** (explicit request > scope=agent > host).
 """
 
@@ -274,11 +277,15 @@ def test_docker_spawn_is_built_and_guards_before_up(tmp_path: Path) -> None:
         ws.spawn([sys.executable], stdin="", timeout=5, env={}, cwd=None)
 
 
-def test_microvm_spawn_stub_raises_not_implemented(tmp_path: Path) -> None:
+def test_microvm_spawn_is_built_and_guards_before_up(tmp_path: Path) -> None:
+    # Increment 3 landed: microvm spawn is real, so it no longer raises
+    # NotImplementedError. Called before up() (no microVM yet) it fails loudly
+    # with the provisioning guard rather than silently no-op'ing — the deep
+    # transport contract is covered in tests/unit/test_microvm_spawn.py.
     from mini_ork.runtime.backends.microvm import MicrovmWorkspace
 
     ws = MicrovmWorkspace(image="alpine:latest", drive_root=str(tmp_path))
-    with pytest.raises(NotImplementedError, match="Increment 3"):
+    with pytest.raises(RuntimeError, match="before up"):
         ws.spawn([sys.executable], stdin="", timeout=5, env={}, cwd=None)
 
 

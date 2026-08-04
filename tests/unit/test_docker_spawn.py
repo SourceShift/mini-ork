@@ -3,9 +3,11 @@ transport (SE-3 Increment 2).
 
 Two layers, matching ``test_docker_workspace.py``:
 
-* **Daemon-free** — the env allowlist (``_container_env``) is a pure function,
-  and the ``docker exec`` argv / stream-shape / timeout contract is proven by
-  faking the ``subprocess.run`` seam. These run everywhere.
+* **Daemon-free** — the ``docker exec`` argv / stream-shape / timeout contract is
+  proven by faking the ``subprocess.run`` seam. These run everywhere. (The pure
+  env-allowlist policy is shared with the microvm backend and tested once in
+  ``tests/unit/test_workspace_env.py`` — this file only proves docker *applies*
+  it, via the ``-e KEY=VALUE`` argv.)
 * **Daemon-gated** — a live ``alpine`` container proves the real round-trip
   (stdin → stdout, stderr kept separate, faithful rc, allowlisted env forwarded
   while host PATH is NOT), and that a runaway is reaped on timeout with
@@ -23,73 +25,9 @@ import subprocess
 import pytest
 
 from mini_ork.runtime.backends import docker as docker_backend
-from mini_ork.runtime.backends.docker import DockerWorkspace, _container_env
+from mini_ork.runtime.backends.docker import DockerWorkspace
 
 TEST_IMAGE = os.environ.get("MO_SANDBOX_TEST_IMAGE", "alpine:latest")
-
-
-# --- env allowlist (pure, no daemon) --------------------------------------
-
-
-def test_container_env_forwards_harness_and_provider_keys():
-    env = {
-        "MO_SANDBOX_SCOPE": "agent",
-        "MO_ROUTING_POLICY": "bandit",
-        "OPENAI_API_KEY": "sk-oai",
-        "ANTHROPIC_API_KEY": "sk-ant",
-        "DEEPSEEK_API_KEY": "ds",
-        "OPENROUTER_API_KEY": "or",
-    }
-    assert _container_env(env) == env  # every key is agent-relevant → all pass
-
-
-def test_container_env_api_key_suffix_catches_unknown_provider():
-    # A provider we never enumerated still crosses via the *_API_KEY suffix, so a
-    # newly-added key is not silently dropped.
-    assert _container_env({"FOO_API_KEY": "v"}) == {"FOO_API_KEY": "v"}
-
-
-def test_container_env_drops_host_shell_identity():
-    # PATH/HOME/USER/SHELL/TMPDIR are structurally wrong inside a Linux image;
-    # the container must keep its OWN, so these never cross.
-    env = {
-        "PATH": "/Users/admin/.pyenv/bin:/usr/bin",
-        "HOME": "/Users/admin",
-        "USER": "admin",
-        "SHELL": "/bin/zsh",
-        "TMPDIR": "/var/folders/xx",
-        "PWD": "/somewhere",
-        "TERM": "xterm",
-    }
-    assert _container_env(env) == {}
-
-
-def test_container_env_drops_unrelated_host_secrets():
-    # The confused-deputy case: unrelated creds in os.environ must not leak in.
-    env = {
-        "AWS_ACCESS_KEY_ID": "AKIA-LEAK",
-        "AWS_SECRET_ACCESS_KEY": "SECRET-LEAK",
-        "SSH_AUTH_SOCK": "/tmp/ssh.sock",
-        "GITHUB_TOKEN": "ghp_leak",
-        "NPM_TOKEN": "npm_leak",
-    }
-    assert _container_env(env) == {}
-
-
-def test_container_env_api_key_suffix_does_not_match_aws():
-    # The load-bearing security invariant: the generous *_API_KEY catch-all is
-    # safe ONLY because AWS names its creds *_ACCESS_KEY_ID / *_SECRET_ACCESS_KEY,
-    # neither of which ends in _API_KEY. If this ever changes, the allowlist
-    # re-opens the exact leak it exists to prevent.
-    out = _container_env(
-        {"AWS_SECRET_ACCESS_KEY": "x", "AWS_ACCESS_KEY_ID": "y", "REAL_API_KEY": "z"}
-    )
-    assert out == {"REAL_API_KEY": "z"}
-
-
-def test_container_env_case_insensitive_on_key_name():
-    assert _container_env({"openai_api_key": "v"}) == {"openai_api_key": "v"}
-    assert _container_env({"mo_foo": "v"}) == {"mo_foo": "v"}
 
 
 # --- docker exec argv / stream / timeout contract (faked subprocess) -------
