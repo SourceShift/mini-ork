@@ -20,7 +20,7 @@ import shlex
 import shutil
 import subprocess
 import uuid
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 from mini_ork.runtime.sandbox import register_workspace_backend
 
@@ -154,6 +154,31 @@ class DockerWorkspace:
             self._docker("stop", "-t", "1", self._cid, timeout=30)
             return _TIMEOUT_RC, f"timeout: exec exceeded {timeout}s and was killed\n"
         return r.returncode, r.stdout or ""
+
+    def spawn(
+        self,
+        argv: Sequence[str],
+        *,
+        stdin: str,
+        timeout: float,
+        env: Mapping[str, str],
+        cwd: str | None,
+    ) -> tuple[int, str, str]:
+        """Spawn the harness CLI *inside* the container (scope=agent).
+
+        NOT YET IMPLEMENTED — this is the hybrid's Increment-2 slice. It will run
+        ``docker exec -i`` (stdin piped, **no** ``-t`` so the container allocates
+        no TTY — the A.1 invariant re-established in the container's PID
+        namespace), streams kept separate, and a timeout reaped by stopping the
+        container (``rc=124``). Until then it fails loudly rather than silently
+        dropping a scope=agent CLI spawn back onto the host — an unbuilt backend
+        is a setup error, not a retryable lane failure."""
+        raise NotImplementedError(
+            "DockerWorkspace.spawn (scope=agent CLI-in-container) is not yet "
+            "implemented — it lands in SE-3 Increment 2 (`docker exec -i`, no "
+            "-t). Use MO_SANDBOX_SCOPE=tool for container tool-exec, or keep the "
+            "harness on the host (MO_SANDBOX_SCOPE unset/tool)."
+        )
 
     def put(self, content: str) -> str:
         if self._cid is None:

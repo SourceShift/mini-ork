@@ -659,6 +659,29 @@ def cwd_guard(
     )
 
 
+def _select_workspace(requested: str, env: Mapping[str, str]) -> str:
+    """Resolve the isolation selector for a dispatch (SE-3 SC3).
+
+    Precedence:
+      1. an explicit non-``"host"`` ``requested`` (a programmatic caller that
+         already chose a backend) wins outright;
+      2. else ``MO_SANDBOX_SCOPE=agent`` routes the harness CLI into the
+         configured ``MO_SANDBOX_BACKEND``;
+      3. else ``"host"`` — scope=tool/unset, or scope=agent with no backend
+         configured (nothing to isolate into → stay on the host, no surprise).
+
+    ``core.dispatch`` reads the result to pick ``spawn_local`` (host) vs a
+    ``Workspace.spawn`` backend. Extracted as a pure function so the precedence
+    is unit-testable without the full dispatch machinery."""
+    from ..runtime.agent_workspace import sandbox_backend, sandbox_scope
+
+    if requested != "host":
+        return requested
+    if sandbox_scope(env) == "agent":
+        return sandbox_backend(env) or "host"
+    return "host"
+
+
 def dispatch_model(
     request: DispatchRequest,
     root: str | os.PathLike[str] | None = None,
@@ -728,6 +751,9 @@ def dispatch_model(
         merged_env.pop(key, None)
     merged_env.update(spec.env)
     merged_env.update(request.env)
+    # Isolation selector (SE-3 SC3): decide WHICH workspace the harness CLI is
+    # spawned into (host in-process Popen vs a Workspace.spawn backend). See
+    # _select_workspace for the precedence rule.
     effective = DispatchRequest(
         model=request.model,
         prompt=request.prompt,
@@ -735,6 +761,7 @@ def dispatch_model(
         max_turns=request.max_turns,
         env=merged_env,
         cwd=target_cwd,
+        workspace=_select_workspace(request.workspace, merged_env),
     )
     # Per-model dispatch backend registry (OCP): a model with a bespoke
     # transport (e.g. codex's wrapper+sidecar protocol) registers a backend
@@ -1056,6 +1083,7 @@ def _dispatch_codex_via_wrapper(
             max_turns=request.max_turns,
             env=env,
             cwd=request.cwd,  # preserve the guarded target cwd through the codex path
+            workspace=request.workspace,  # carry the isolation selector through
         )
         result = dispatch(req, spec.command)
         if result.ok:
