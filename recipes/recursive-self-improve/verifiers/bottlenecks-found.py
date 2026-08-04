@@ -132,11 +132,22 @@ elif not missing and ranked_rows >= 1:
     passed = 1
 
 ev.close()
-print(json.dumps({
+result = {
     "verifier": "bottlenecks-found",
     "pass": passed == 1,
     "evidence_path": EVIDENCE,
     "ranked_patches": ranked_rows,
     "converged": converged == 1,
     "missing": missing,
-}))
+}
+print(json.dumps(result))
+# Canonical sidecar the outer runner reads (self_improve.read_verifier looks for
+# verifier-result-<name>.json). The bash→Python port dropped this write here and
+# in self-tests-pass/no-regression, silently disconnecting the whole verifier
+# triple from the promotion decision — a stdout-only JSON was invisible to the
+# runner, so every iteration saw pass=0 regardless of the real result.
+try:
+    with open(os.path.join(RUN_DIR, "verifier-result-bottlenecks-found.json"), "w") as _sc:
+        json.dump(result, _sc)
+except OSError:
+    pass
