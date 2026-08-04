@@ -125,9 +125,10 @@ web-deps:
 		{ echo "pip install failed — try: python3 -m pip install fastapi 'uvicorn[standard]' pyyaml"; exit 1; }
 	@echo "→ js deps"
 	@if [ -d ui ]; then \
-		cd ui && (command -v pnpm >/dev/null && pnpm install || \
-		           command -v npm  >/dev/null && npm install  || \
-		           { echo "neither pnpm nor npm found"; exit 1; }); \
+		cd ui && \
+		if command -v pnpm >/dev/null; then pnpm install; \
+		elif command -v npm >/dev/null; then npm install; \
+		else echo "neither pnpm nor npm found"; exit 1; fi; \
 	fi
 	@echo "✓ web-deps ready — run 'make web-up' or 'make web-serve'"
 
@@ -176,7 +177,7 @@ web-up:
 	@echo "→ booting API on :$(PORT) (reload) + Vite dev on :$(UI_PORT) (Ctrl-C stops both)"
 	@trap 'kill 0' INT TERM; \
 	  ( $(PYTHON) bin/mini-ork serve --port $(PORT) --reload 2>&1 | sed 's/^/[api] /' ) & \
-	  ( cd ui && (command -v pnpm >/dev/null && pnpm dev || npm run dev) 2>&1 | sed 's/^/[ui]  /' ) & \
+	  ( cd ui && (command -v pnpm >/dev/null && pnpm run dev:frontend || npm run dev:frontend) 2>&1 | sed 's/^/[ui]  /' ) & \
 	  wait
 
 # Everything needed for UI development, hot-reloading on both sides:
