@@ -134,6 +134,51 @@ def read_review_verdict(run_dir: str, node_id: str) -> int:
     return 1 if verdict in _REVIEW_PASS else 0
 
 
+# The improvable surface the kickoff hands the implementer. A rejected iteration
+# must leave the main checkout pristine over exactly this surface — the loop
+# edits a linked worktree that lives *under* the main tree, and the implementer
+# harness has been observed writing back into the parent checkout instead
+# (linked-worktree path resolution). This guard is a safety invariant, not a
+# root-cause fix: it never touches a path the operator already had dirty before
+# the run, so a concurrent hand-edit is safe.
+_SELF_IMPROVE_SURFACE = ("mini_ork", "recipes", "schemas", "tests")
+
+
+def _root_surface_dirty(root: str) -> set[str]:
+    """Paths under the improvable surface that are dirty (modified/staged/
+    untracked) in ``root`` right now. NUL-delimited so paths with spaces and
+    rename records don't corrupt the set."""
+    out = subprocess.run(
+        ["git", "-C", root, "status", "--porcelain", "-z", "--", *_SELF_IMPROVE_SURFACE],
+        capture_output=True, text=True).stdout
+    dirty: set[str] = set()
+    for rec in out.split("\0"):
+        if len(rec) > 3:
+            dirty.add(rec[3:])
+    return dirty
+
+
+def _restore_root_surface_leak(root: str, pre_dirty: set[str]) -> list[str]:
+    """Revert any surface path that went clean→dirty *during* the run. Paths the
+    operator already had dirty (in ``pre_dirty``) are never touched. Returns the
+    list of paths restored, for the run log."""
+    leaked = sorted(_root_surface_dirty(root) - pre_dirty)
+    for path in leaked:
+        # Untracked file created by the run → remove; tracked file mutated by the
+        # run → restore working tree + index from HEAD.
+        subprocess.run(["git", "-C", root, "checkout", "HEAD", "--", path], capture_output=True)
+        subprocess.run(["git", "-C", root, "reset", "-q", "--", path], capture_output=True)
+        full = os.path.join(root, path)
+        if os.path.lexists(full) and subprocess.run(
+                ["git", "-C", root, "ls-files", "--error-unmatch", "--", path],
+                capture_output=True).returncode != 0:
+            try:
+                os.remove(full)
+            except OSError:
+                pass
+    return leaked
+
+
 _VALID_CATEGORY = {"perf", "correctness", "arch", "meta"}
 _ARXIV_RE = re.compile(r"\b(\d{4}\.\d{4,6})\b")
 _PATH_RE = re.compile(r"\b([a-z_][\w./-]*\.(?:sh|py|sql|md|yaml|yml|json|toml|tsx?|jsx?))\b", re.I)
@@ -467,6 +512,10 @@ logs, code paths, benchmark deltas, and arXiv references).
                 ["timeout", str(timeout_s), os.path.join(root, "bin", "mini-ork"),
                  "run", "recursive-self-improve", kickoff],
                 cwd=wt, stdout=fh, stderr=subprocess.STDOUT, env=e).returncode
+    # Snapshot the operator's pre-run dirty surface so a leak the dispatch
+    # writes back into the main checkout can be told apart from work the
+    # operator already had in flight (see _restore_root_surface_leak).
+    pre_dirty = _root_surface_dirty(root)
     exec_rc = (dispatch or _default_dispatch)(
         wt_path, os.path.join(run_dir, "kickoff.md"), exec_log, per_iter, env)
 
@@ -515,6 +564,12 @@ logs, code paths, benchmark deltas, and arXiv references).
         with open(os.path.join(run_dir, "patches", f"iter-{it}.diff"), "wb") as fh:
             subprocess.run(["git", "-C", wt_path, "diff"], stdout=fh, stderr=subprocess.DEVNULL)
 
+    # Invariant: an iteration promotes only through the worktree branch + merge,
+    # never through the main checkout's working tree. Revert any surface path the
+    # dispatch leaked into root so main stays pristine regardless of outcome.
+    leaked = _restore_root_surface_leak(root, pre_dirty)
+    if leaked:
+        print(f"  [iter] restored {len(leaked)} leaked path(s) in main checkout: {', '.join(leaked)}")
     subprocess.run(["git", "-C", root, "worktree", "remove", "--force", wt_path], capture_output=True)
     record_run(db, run_id, it, outcome, notes, wt_path, branch, soft_deadline, hard_deadline)
     return 0, it
