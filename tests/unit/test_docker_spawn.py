@@ -7,7 +7,8 @@ Two layers, matching ``test_docker_workspace.py``:
   proven by faking the ``subprocess.run`` seam. These run everywhere. (The pure
   env-allowlist policy is shared with the microvm backend and tested once in
   ``tests/unit/test_workspace_env.py`` — this file only proves docker *applies*
-  it, via the ``-e KEY=VALUE`` argv.)
+  it, via bare ``-e KEY`` flags whose values are forwarded from the client's own
+  env, never the argv — so host ``ps`` can't read a secret.)
 * **Daemon-gated** — a live ``alpine`` container proves the real round-trip
   (stdin → stdout, stderr kept separate, faithful rc, allowlisted env forwarded
   while host PATH is NOT), and that a runaway is reaped on timeout with
@@ -106,12 +107,14 @@ def test_spawn_streams_separated_and_faithful_rc(tmp_path, monkeypatch):
     assert (rc, out, err) == (7, "the-out", "the-err")
 
 
-def test_spawn_forwards_only_allowlisted_env_sorted(tmp_path, monkeypatch):
+def test_spawn_forwards_only_allowlisted_env_by_name_not_value(tmp_path, monkeypatch):
+    """Allowlisted keys cross as bare ``-e KEY`` (name only, sorted); host-shell +
+    unrelated secrets are dropped; the VALUES ride in the child env, never argv."""
     captured: dict = {}
     monkeypatch.setattr(
         docker_backend.subprocess,
         "run",
-        lambda argv, **kw: captured.update(argv=argv)
+        lambda argv, **kw: captured.update(argv=argv, kwargs=kw)
         or subprocess.CompletedProcess(argv, 0, "", ""),
     )
     ws = _ws(tmp_path)
@@ -128,9 +131,43 @@ def test_spawn_forwards_only_allowlisted_env_sorted(tmp_path, monkeypatch):
         cwd=None,
     )
     argv = captured["argv"]
-    # collect every "-e K=V" pair
-    pairs = [argv[i + 1] for i, a in enumerate(argv) if a == "-e"]
-    assert pairs == ["MO_FOO=k2", "OPENAI_API_KEY=k1"]  # sorted, host env dropped
+    # every "-e" carries a bare KEY NAME (no "=VALUE"), sorted; host PATH + AWS drop
+    names = [argv[i + 1] for i, a in enumerate(argv) if a == "-e"]
+    assert names == ["MO_FOO", "OPENAI_API_KEY"]
+    assert "PATH" not in names and "AWS_SECRET_ACCESS_KEY" not in names
+    # the values are forwarded via the child process env (docker reads them there),
+    # NOT via argv — /proc/<pid>/environ is owner+root-only, unlike ps-readable argv
+    child_env = captured["kwargs"]["env"]
+    assert child_env["MO_FOO"] == "k2"
+    assert child_env["OPENAI_API_KEY"] == "k1"
+
+
+def test_spawn_never_puts_a_secret_value_in_argv(tmp_path, monkeypatch):
+    """Security regression guard. The whole reason for the bare ``-e KEY`` form is
+    that a secret VALUE in argv is world-readable via ``ps aux``; assert no
+    allowlisted value string appears anywhere in the argv (only the KEY names do)."""
+    captured: dict = {}
+    monkeypatch.setattr(
+        docker_backend.subprocess,
+        "run",
+        lambda argv, **kw: captured.update(argv=argv)
+        or subprocess.CompletedProcess(argv, 0, "", ""),
+    )
+    ws = _ws(tmp_path)
+    secret = "sk-super-secret-do-not-leak"
+    ws.spawn(
+        ["cli"],
+        stdin="",
+        timeout=5,
+        env={"ANTHROPIC_API_KEY": secret, "MO_TOKEN": secret},
+        cwd=None,
+    )
+    argv = captured["argv"]
+    assert all(secret not in tok for tok in argv), (
+        f"secret VALUE leaked into docker argv (host `ps` exposure): {argv}"
+    )
+    # the key NAMES are expected in argv (that is safe); only values must be absent
+    assert "ANTHROPIC_API_KEY" in argv and "MO_TOKEN" in argv
 
 
 def test_spawn_timeout_stops_container_and_returns_124(tmp_path, monkeypatch):
@@ -201,7 +238,9 @@ def test_spawn_live_roundtrip_streams_env_and_rc(tmp_path):
     try:
         # cat echoes stdin→stdout; a line goes to stderr; exit code is faithful;
         # $MO_PROBE is forwarded (allowlist) but $PATH is the CONTAINER's own,
-        # NOT the host /bogus we passed (proving host PATH was dropped).
+        # NOT the host /bogus we passed (proving host PATH was dropped). MO_PROBE
+        # crossing at all proves the bare `-e MO_PROBE` + child-env forwarding
+        # works end-to-end (a broken plumbing would leave probe= empty).
         script = "cat; echo to-stderr 1>&2; echo probe=$MO_PROBE; echo path=$PATH; exit 7"
         rc, out, err = ws.spawn(
             ["sh", "-c", script],
