@@ -11,6 +11,7 @@ from fastapi.staticfiles import StaticFiles
 
 from .deps import get_db, get_home, set_home_override
 from .routes import (
+    agent_server,
     artifacts as artifacts_routes,
     control as control_routes,
     dispatch as dispatch_routes,
@@ -94,6 +95,11 @@ def create_app(home: Path | None = None, dev_cors: bool = True) -> FastAPI:
     # WebSocket PTY bridge (opt-in via MO_PTY_ENABLED=1). Registered before the
     # SPA catch-all so `/api/v1/pty` is never shadowed by the index.html fallback.
     app.include_router(pty_routes.router)
+    # OpenHands agent-server protocol shim (SE-3 UI fork). Serves /server_info,
+    # /api/settings, /alive, /health, /ready so the forked agent-canvas SPA
+    # probes green and completes onboarding. Registered before the SPA catch-all
+    # so these exact paths aren't swallowed by the index.html fallback.
+    app.include_router(agent_server.router)
 
     @app.get("/api")
     def api_index() -> JSONResponse:
