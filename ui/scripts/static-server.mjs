@@ -580,7 +580,7 @@ export function startStaticServer(config) {
       rejectPrefixes,
       basePath,
     ).catch((err) => {
-      console.error(`Static handler error for ${req.url}:`, err);
+      console.error("Static handler error for %s:", req.url, err);
       if (!res.headersSent) {
         res.writeHead(500);
         res.end("Internal Server Error");

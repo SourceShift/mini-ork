@@ -1,4 +1,5 @@
 import axios from "axios";
+import { randomHex } from "#/utils/random-hex";
 import {
   clearPendingLocalTelemetryRevocation,
   getTelemetryConsent,
@@ -149,7 +150,7 @@ function generatePendingImportEvent(): string {
   ) {
     return `pending.${crypto.randomUUID()}`;
   }
-  return `pending.${Date.now()}.${Math.random().toString(36).slice(2, 10)}`;
+  return `pending.${Date.now()}.${randomHex(4)}`;
 }
 
 function buildCreateAutomationRequest(spec: AutomationSpec) {
