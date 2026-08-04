@@ -55,18 +55,27 @@ def validate_caps(soft: str, hard: str) -> bool:
 
 
 def decide_outcome(converged, exec_rc, pass_bottle, pass_tests, pass_reg,
-                   tr_status="") -> tuple[str, str]:
-    """Verbatim transcription of the outcome-decision cascade (steps 6+backstop)."""
+                   tr_status="", pass_critic=1) -> tuple[str, str]:
+    """Verbatim transcription of the outcome-decision cascade (steps 6+backstop).
+
+    pass_critic is the opus post-implementation patch-critic gate (the 4th
+    review layer). It defaults to 1 so callers that only supply the three
+    deterministic verifiers are unaffected; when the recipe carries the critic
+    node, a non-approving verdict blocks promotion exactly like a failed
+    deterministic verifier — the point of tightening review for a weak
+    implementer is that a diff which reds the critic never reaches success.
+    """
     if converged == 1:
         outcome, notes = "converged", "scanner-reported-convergence"
     elif exec_rc == 124:
         outcome, notes = "timed_out", "per-iter-timeout"
     elif exec_rc != 0:
         outcome = "rejected"
-        notes = f"execute-rc={exec_rc};verifier-bottle={pass_bottle};verifier-tests={pass_tests};verifier-reg={pass_reg}"
-    elif pass_bottle == 1 and pass_tests == 1 and pass_reg == 1:
+        notes = (f"execute-rc={exec_rc};verifier-bottle={pass_bottle};verifier-tests={pass_tests};"
+                 f"verifier-reg={pass_reg};critic={pass_critic}")
+    elif pass_bottle == 1 and pass_tests == 1 and pass_reg == 1 and pass_critic == 1:
         outcome, notes = "success", "all-verifiers-pass"
-    elif pass_bottle == 1 and (pass_tests == 0 or pass_reg == 0):
+    elif pass_bottle == 1 and (pass_tests == 0 or pass_reg == 0 or pass_critic == 0):
         outcome, notes = "rejected", "patch-failed-verifier"
     else:
         outcome, notes = "failed", "planner-or-synth-failed"
@@ -98,6 +107,31 @@ def read_verifier_triple(run_dir: str) -> tuple[int, int, int, int]:
         if pass_tests == 1:
             pass_reg, _ = read_verifier(run_dir, "no-regression")
     return pass_bottle, pass_tests, pass_reg, converged
+
+
+_REVIEW_PASS = {"pass", "approve", "approved"}
+
+
+def read_review_verdict(run_dir: str, node_id: str) -> int:
+    """The opus patch-critic's verdict, read from review-<node_id>.json (the
+    classic-reviewer artifact _handle_reviewer writes before it gates). Returns
+    1 only on an explicit approving verdict; a missing file, unparseable
+    payload, or any non-approving verdict is 0 — fail-closed, so a critic that
+    never ran (e.g. the run rolled back upstream) cannot be read as approval.
+    Mirrors execute._REVIEW_PASS so the runner and the node agree on the
+    vocabulary."""
+    jpath = os.path.join(run_dir, f"review-{node_id}.json")
+    if not os.path.isfile(jpath):
+        return 0
+    try:
+        verdict = str(json.load(open(jpath)).get("verdict", "")).strip().lower()
+    except Exception:
+        try:
+            m = re.search(r'"verdict"\s*:\s*"([^"]+)"', open(jpath).read())
+            verdict = m.group(1).strip().lower() if m else ""
+        except OSError:
+            verdict = ""
+    return 1 if verdict in _REVIEW_PASS else 0
 
 
 _VALID_CATEGORY = {"perf", "correctness", "arch", "meta"}
@@ -437,8 +471,13 @@ logs, code paths, benchmark deltas, and arXiv references).
         wt_path, os.path.join(run_dir, "kickoff.md"), exec_log, per_iter, env)
 
     pass_bottle, pass_tests, pass_reg, converged = read_verifier_triple(run_dir)
+    # 4th gate: the opus patch-critic reviews the implementer's actual diff after
+    # the deterministic triple passes. Read fail-closed — only an explicit approve
+    # counts — so a weak implementer's off-plan / gamed / no-op patch that slips the
+    # deterministic gates is still blocked before promotion.
+    pass_critic = read_review_verdict(run_dir, "opus_patch_critic")
     print(f"  [iter] verifiers: bottle={pass_bottle} tests={pass_tests} regression={pass_reg} "
-          f"converged={converged} exec_rc={exec_rc}")
+          f"critic={pass_critic} converged={converged} exec_rc={exec_rc}")
 
     tr_status = ""
     if os.path.isfile(db):
@@ -449,7 +488,8 @@ logs, code paths, benchmark deltas, and arXiv references).
             tr_status = r[0] if r else ""
         except Exception:
             tr_status = ""
-    outcome, notes = decide_outcome(converged, exec_rc, pass_bottle, pass_tests, pass_reg, tr_status)
+    outcome, notes = decide_outcome(converged, exec_rc, pass_bottle, pass_tests, pass_reg,
+                                    tr_status, pass_critic)
 
     if outcome == "success":
         dirty = (subprocess.run(["git", "-C", wt_path, "diff", "--quiet"], capture_output=True).returncode != 0
