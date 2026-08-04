@@ -33,6 +33,15 @@ nodes:
   - { name: implementer,         type: implementer, model_lane: codex_lens,      prompt_ref: prompts/implementer.md,          dispatch_mode: serial,   gates: [scope_gate, budget_gate] }
   - { name: self_tests_pass,     type: verifier,    verifier_ref: verifiers/self-tests-pass.py,   dispatch_mode: serial }
   - { name: no_regression,       type: verifier,    verifier_ref: verifiers/no-regression.py,     dispatch_mode: serial }
+  # opus_patch_critic (NOT *synth* so the executor takes the classic-reviewer
+  # path: it receives the assembled implementer diff + verifier verdicts and
+  # emits a pass/fail/needs_revision verdict to review-opus_patch_critic.json).
+  # This is the 4th, judgment-layer gate the outer runner reads via
+  # read_review_verdict — added because the implementer lane is a weak model, so
+  # a diff can pass pytest yet be off-plan, gamed, or a no-op. Runs only after
+  # the cheap deterministic triple passes (depends_on no_regression), so opus is
+  # never paid to review a patch already caught by tests.
+  - { name: opus_patch_critic,   type: reviewer,    model_lane: opus_lens,       prompt_ref: prompts/patch-critic.md,          dispatch_mode: serial,   gates: [budget_gate] }
   - { name: publisher,           type: publisher,   prompt_ref: null,                            dispatch_mode: serial,   gates: [scope_gate] }
   - { name: rollback,            type: rollback,    prompt_ref: null,                            dispatch_mode: serial }
 
@@ -49,10 +58,12 @@ edges:
   - { from: bottlenecks_found,  to: implementer,      edge_type: depends_on }
   - { from: implementer,        to: self_tests_pass,  edge_type: verifies }
   - { from: self_tests_pass,    to: no_regression,    edge_type: depends_on }
-  - { from: no_regression,      to: publisher,        edge_type: depends_on }
+  - { from: no_regression,      to: opus_patch_critic, edge_type: depends_on }
+  - { from: opus_patch_critic,  to: publisher,        edge_type: depends_on }
   - { from: bottlenecks_found,  to: rollback,         edge_type: escalates_to }
   - { from: self_tests_pass,    to: rollback,         edge_type: escalates_to }
   - { from: no_regression,      to: rollback,         edge_type: escalates_to }
+  - { from: opus_patch_critic,  to: rollback,         edge_type: escalates_to }
 
 rollback_strategy: keep_lens_reports_and_arxiv_refs_discard_patch
 max_self_correction_iterations: 2
