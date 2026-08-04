@@ -38,6 +38,15 @@ class DispatchRequest:
     # inside the mini-ork framework tree — that is the cwd-confusion that lets a
     # target-repo lane's git ops corrupt the framework repo.
     cwd: str | None = None
+    # Isolation selector (SE-3 SC3): WHICH Workspace the harness CLI itself is
+    # spawned into. "host" = today's in-process Popen on this machine (the
+    # default → zero regression). Any other value ("docker"/"microvm"/"local")
+    # routes the spawn through the matching Workspace.spawn backend, so a run can
+    # isolate the coding-agent CLI, not just its tool-exec. Set from
+    # MO_SANDBOX_SCOPE=agent at dispatch_model; the resolved backend name comes
+    # from MO_SANDBOX_BACKEND. Frozen with a default so every existing caller
+    # keeps host behavior untouched.
+    workspace: str = "host"
 
 
 @dataclass

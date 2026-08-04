@@ -28,7 +28,7 @@ import os
 import signal
 import subprocess
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 
 from .models import DispatchRequest, DispatchResult, TokenUsage
 
@@ -58,6 +58,89 @@ def _terminate_process_group(proc: "subprocess.Popen[str]") -> None:
             pass
 
 
+def spawn_local(
+    argv: Sequence[str],
+    *,
+    stdin: str,
+    timeout: float,
+    env: Mapping[str, str],
+    cwd: str | None,
+) -> tuple[int, str, str]:
+    """Host spawn primitive: run ``argv`` as a subprocess of THIS process and
+    return ``(rc, stdout, stderr)`` — raw, unparsed, streams **separated**.
+
+    This is the thin ``Workspace.spawn`` transport for the ``host`` backend, and
+    the single place the A.1 process contract lives (SE-3): ``start_new_session``
+    severs the controlling terminal so no ``/dev/tty`` prompt can block a
+    headless run and the harness becomes one reapable process group; a timeout
+    SIGKILLs that whole group and yields the conventional ``rc=124``; a failed
+    ``execve`` yields ``rc=127``. The prompt rides on stdin (``input=``), never
+    argv/env, so it is structurally E2BIG-proof. The separated-stream, stdin-fed
+    shape is exactly what ``dispatch`` needs and what ``Workspace.exec`` (merged
+    output, no stdin) deliberately cannot provide — which is why isolation of the
+    CLI spawn needs this verb, not ``exec``.
+    """
+    try:
+        proc = subprocess.Popen(
+            list(argv),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=dict(env),
+            cwd=cwd,  # None = inherit; pinned by the caller's cwd guard
+            start_new_session=True,
+        )
+    except OSError as exc:
+        return 127, "", f"spawn failed: {exc}"
+
+    try:
+        # Prompt over stdin (input=): structurally E2BIG-proof — never on argv/env.
+        stdout, stderr = proc.communicate(input=stdin, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        # A hung harness is the single biggest reliability failure. Reap its
+        # whole detached group, drain the pipes to reap the zombie, then surface
+        # the distinct rc=124 so dispatch_with_fallback abandons this lane.
+        _terminate_process_group(proc)
+        proc.communicate()
+        return 124, "", f"timeout after {timeout}s"
+    return proc.returncode, stdout or "", stderr or ""
+
+
+def _spawn_in_workspace(
+    backend: str,
+    argv: Sequence[str],
+    *,
+    stdin: str,
+    timeout: float,
+    env: Mapping[str, str],
+    cwd: str | None,
+) -> tuple[int, str, str]:
+    """Delegate a scope=agent CLI spawn to an isolation backend's
+    ``Workspace.spawn`` (SE-3 hybrid: this engine owns the spawn CONTRACT; the
+    backend owns only container TRANSPORT).
+
+    ``dispatch`` owns argv/stdin/stream-shape/timeout-rc/parse; this helper only
+    resolves the named ``Workspace`` and drives its one-shot lifecycle
+    ``up() → spawn() → down()`` (the CLI spawn is one-shot, so the container is
+    cattle: provisioned, used once, torn down). Resolution reuses
+    ``agent_workspace.resolve_spawn_workspace`` so container config (image, drive
+    root, mount path) stays defined in one place. Imported lazily to keep the
+    dispatch core free of the runtime/sandbox import at module load. A failed
+    resolve / ``up`` / ``spawn`` (e.g. a backend whose spawn is not yet
+    implemented) propagates loudly — an unbuilt or misconfigured isolation
+    backend is a setup error, not a retryable lane failure to mask as ok=False.
+    """
+    from mini_ork.runtime.agent_workspace import resolve_spawn_workspace
+
+    ws = resolve_spawn_workspace(backend, env=env, cwd=cwd)
+    ws.up()
+    try:
+        return ws.spawn(list(argv), stdin=stdin, timeout=timeout, env=env, cwd=cwd)
+    finally:
+        ws.down()
+
+
 def dispatch(
     request: DispatchRequest,
     command: Sequence[str],
@@ -80,52 +163,30 @@ def dispatch(
         proc_env.update({str(k): str(v) for k, v in request.env.items()})
 
     start = time.monotonic()
-    try:
-        proc = subprocess.Popen(
-            list(command),
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
+    # Isolation selector (SE-3 SC3): "host" keeps the exact in-process Popen
+    # (zero regression); any other backend routes the CLI spawn through that
+    # Workspace's spawn transport. Either way the same (rc, stdout, stderr)
+    # triple flows into ONE finalize below, so timeout/spawn-fail/parse semantics
+    # are defined once regardless of where the harness ran.
+    if request.workspace == "host":
+        rc, stdout, stderr = spawn_local(
+            command,
+            stdin=request.prompt,
+            timeout=request.timeout_s,
             env=proc_env,
-            cwd=request.cwd,  # None = inherit; pinned by the caller's cwd guard
-            # Sever the controlling terminal: the harness — and everything it
-            # spawns — becomes its own session with no /dev/tty, so no code path
-            # (mini-ork's own plan.py prompt or the harness CLI) can open the
-            # terminal and block a headless run. It also makes the whole harness
-            # a single process group we can reap on timeout (below).
-            start_new_session=True,
+            cwd=request.cwd,
         )
-    except OSError as exc:
-        return DispatchResult(
-            ok=False,
-            rc=127,
-            error=f"spawn failed: {exc}",
-            model=request.model,
-            duration_ms=int((time.monotonic() - start) * 1000),
-        )
-
-    try:
-        # Prompt over stdin (input=): structurally E2BIG-proof — never on argv/env.
-        stdout, stderr = proc.communicate(
-            input=request.prompt, timeout=request.timeout_s
-        )
-    except subprocess.TimeoutExpired:
-        # A hung harness is the single biggest reliability failure. Reap its
-        # whole detached group, drain the pipes to reap the zombie, then return
-        # a distinct rc=124 so dispatch_with_fallback abandons this lane.
-        _terminate_process_group(proc)
-        proc.communicate()
-        return DispatchResult(
-            ok=False,
-            rc=124,
-            error=f"timeout after {request.timeout_s}s",
-            model=request.model,
-            duration_ms=int((time.monotonic() - start) * 1000),
+    else:
+        rc, stdout, stderr = _spawn_in_workspace(
+            request.workspace,
+            command,
+            stdin=request.prompt,
+            timeout=request.timeout_s,
+            env=proc_env,
+            cwd=request.cwd,
         )
 
     duration_ms = int((time.monotonic() - start) * 1000)
-    rc = proc.returncode
     stdout = stdout or ""
     if rc != 0:
         # A FAILED node is exactly what E4 resumes — capture its session_id

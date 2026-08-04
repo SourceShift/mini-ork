@@ -45,6 +45,7 @@ __all__ = [
     "sandbox_backend",
     "sandbox_scope",
     "resolve_agent_workspace",
+    "resolve_spawn_workspace",
 ]
 
 ENV_BACKEND = "MO_SANDBOX_BACKEND"
@@ -107,3 +108,48 @@ def resolve_agent_workspace(
         return ws, MOUNT_PATH
     # Unknown backend → loud ValueError (never a silent host fallback).
     return get_workspace(backend, root=node_cwd), node_cwd
+
+
+def resolve_spawn_workspace(
+    backend: str,
+    *,
+    env: Mapping[str, str] | None = None,
+    cwd: str | None = None,
+) -> Workspace:
+    """Resolve the ``Workspace`` a harness CLI is SPAWNED into (scope=agent).
+
+    Sibling of :func:`resolve_agent_workspace`, but for routing the coding-agent
+    CLI *itself* (SE-3 SC3) rather than its tool-exec. ``backend`` is the explicit
+    selector the dispatch layer already chose (``DispatchRequest.workspace``:
+    ``docker``/``microvm``/``local``), NOT read from ``MO_SANDBOX_BACKEND`` here —
+    that decision was made upstream. Reuses the same lazy backend import and the
+    same image/drive kwargs as the tool-exec resolver so container config stays
+    defined in one place.
+
+    ``"host"`` (and ``""``) must never reach here: the host CLI spawn stays an
+    in-process Popen inside ``dispatch``. An unknown backend raises a loud
+    ``ValueError`` from :func:`get_workspace` — never a silent host fallback.
+    """
+    src = os.environ if env is None else env
+    if backend in ("", "host"):
+        raise ValueError(
+            "resolve_spawn_workspace is for isolated backends only; the host "
+            "CLI spawn stays an in-process Popen in dispatch"
+        )
+    if backend == "local":
+        # Parity: LocalWorkspace.spawn delegates straight to core.spawn_local.
+        return get_workspace("local", root=cwd or os.getcwd())
+    if backend in ("microvm", "docker"):
+        # Lazy import so the default path never pulls the CLI/SDK dependency;
+        # microvm is the default-preferred isolation, docker the fallback.
+        if backend == "microvm":
+            import mini_ork.runtime.backends.microvm  # noqa: F401  (registers "microvm")
+        else:
+            import mini_ork.runtime.backends.docker  # noqa: F401  (registers "docker")
+        root = (src.get(ENV_DRIVE_ROOT) or "").strip() or cwd or os.getcwd()
+        image = (src.get(ENV_IMAGE) or "").strip()
+        return get_workspace(
+            backend, image=image, drive_root=root, mount_path=MOUNT_PATH
+        )
+    # Unknown backend → loud ValueError (never a silent host fallback).
+    return get_workspace(backend, root=cwd or os.getcwd())

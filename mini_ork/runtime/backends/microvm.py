@@ -41,7 +41,7 @@ from __future__ import annotations
 import asyncio
 import os
 import uuid
-from typing import Any
+from typing import Any, Mapping, Sequence
 
 from mini_ork.runtime.sandbox import register_workspace_backend
 
@@ -189,6 +189,30 @@ class MicrovmWorkspace:
             raise
         rc = getattr(out, "exit_code", None)
         return (rc if rc is not None else 0), self._merge_output(out)
+
+    def spawn(
+        self,
+        argv: Sequence[str],
+        *,
+        stdin: str,
+        timeout: float,
+        env: Mapping[str, str],
+        cwd: str | None,
+    ) -> tuple[int, str, str]:
+        """Spawn the harness CLI *inside* the microVM (scope=agent).
+
+        NOT YET IMPLEMENTED — this is the hybrid's Increment-3 slice. It will
+        drive the microsandbox SDK's exec with the prompt on stdin, streams kept
+        separate, and a timeout mapped to ``rc=124`` — the A.1 invariant holds by
+        construction (the CLI runs in a hardware-isolated VM with no host
+        ``/dev/tty`` and dies with the VM). Until then it fails loudly rather
+        than silently dropping a scope=agent CLI spawn back onto the host."""
+        raise NotImplementedError(
+            "MicrovmWorkspace.spawn (scope=agent CLI-in-microVM) is not yet "
+            "implemented — it lands in SE-3 Increment 3 (microsandbox SDK exec). "
+            "Use MO_SANDBOX_SCOPE=tool for microVM tool-exec, or keep the harness "
+            "on the host (MO_SANDBOX_SCOPE unset/tool)."
+        )
 
     def put(self, content: str) -> str:
         # Use the SDK's filesystem API, not `exec(stdin=)`: this SDK's ``stdin``
