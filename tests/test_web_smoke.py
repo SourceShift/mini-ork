@@ -198,6 +198,60 @@ def test_app_factory_boots(home: Path) -> None:
     # Idea tree endpoints (plan: docs/plans/2026-06-11-arbor-techniques-into-mini-ork.md item 1)
     assert "/api/v1/idea-tree/roots" in paths
     assert "/api/v1/idea-tree/{root_node_id}" in paths
+    # OpenHands agent-server protocol shim (SE-3 UI fork). These exact paths
+    # must survive the SPA catch-all or the forked agent-canvas can't onboard.
+    assert "/server_info" in paths
+    assert "/api/settings" in paths
+
+
+# ── OpenHands agent-server protocol shim (SE-3 UI fork) ─────────────────────
+
+
+def _semver_tuple(version: str) -> tuple[int, int, int]:
+    """Parse a strict major.minor.patch triple, mirroring the frontend's
+    parseAgentServerVersion (ui/src/api/agent-server-compatibility.ts): the
+    canvas rejects anything that is not exactly three integer parts."""
+    core = version.strip().lstrip("v").split("+", 1)[0].split("-", 1)[0]
+    parts = core.split(".")
+    assert len(parts) == 3, f"version {version!r} is not major.minor.patch"
+    major, minor, patch = (int(p) for p in parts)
+    return major, minor, patch
+
+
+def test_agent_server_info_clears_frontend_compatibility_floor() -> None:
+    """The version we advertise must parse as a 3-part semver AND be >= the
+    canvas's minimumAgentServer floor. This is the load-bearing onboarding
+    contract: if the version regresses below the floor (or stops being a
+    clean triple), the forked agent-canvas throws
+    AgentServerUnsupportedVersionError / AgentServerUnknownVersionError and the
+    'add a backend' wall never drops. The floor is read from the same file the
+    UI reads (ui/config/defaults.json) so this test tracks the real contract."""
+    from mini_ork.web.routes.agent_server import server_info
+
+    defaults = json.loads((ROOT / "ui" / "config" / "defaults.json").read_text())
+    floor = _semver_tuple(defaults["compatibility"]["minimumAgentServer"])
+
+    out = server_info()
+    reported = _semver_tuple(out["version"])
+    assert reported >= floor, (
+        f"advertised agent-server version {out['version']} is below the canvas "
+        f"floor {defaults['compatibility']['minimumAgentServer']} — onboarding will break"
+    )
+    # ServerInfo requires uptime + idle_time (ui typescript-client base.d.ts).
+    assert isinstance(out["uptime"], (int, float))
+    assert isinstance(out["idle_time"], (int, float))
+
+
+def test_agent_server_settings_probe_shape() -> None:
+    """`SettingsClient.getSettings` (GET /api/settings) is the first probe call;
+    it must return a 200 SettingsApiResponse-shaped body or the probe never
+    reaches the version check."""
+    from mini_ork.web.routes.agent_server import get_settings
+
+    out = get_settings()
+    assert {"agent_settings", "conversation_settings", "llm_api_key_is_set"} <= set(out)
+    assert isinstance(out["agent_settings"], dict)
+    assert isinstance(out["conversation_settings"], dict)
 
 
 def test_idea_tree_roots_returns_backfilled_sessions(db) -> None:
