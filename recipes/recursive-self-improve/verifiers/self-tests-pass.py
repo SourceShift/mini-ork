@@ -1,21 +1,30 @@
 #!/usr/bin/env python3
-# verifiers/self-tests-pass.py — run mini-ork's own test suite inside
+# verifiers/self-tests-pass.py — run mini-ork's own pytest suite inside
 # the worktree the implementer patched. If any test fails, the patch
 # is rejected and the runner routes to rollback.
 #
-# Python port of self-tests-pass.sh (bash-removal WS8). Same rc semantics,
-# evidence text, and JSON output.
-#
 # Inputs (via env):
-#   MINI_ORK_RUN_DIR        run directory
+#   MINI_ORK_RUN_DIR                run directory
 #   MINI_ORK_SELF_IMPROVE_WORKTREE  worktree path (set by outer runner)
+#   MINI_ORK_SELF_IMPROVE_TEST_CMD  override test command (shlex-split);
+#                                   default: `python3 -m pytest -q`
 #
 # Output: JSON. Exit 0 always (caller reads .pass).
+#
+# History: this gate used to shell out to a fixed glob of `.sh` suites
+# (tests/unit/test_*.sh, tests/integration/*.sh). The bash test tree was
+# removed 2026-07 (Python is the only runtime), so those globs matched
+# ZERO files and the gate hit "refusing vacuous pass" on every iter —
+# a behavioral no-op that let a weak implementer's patch through the
+# whole verifier chain untested (self-improve iter 2026-08-04 confirmed:
+# tests=0, "no test suites found"). It now runs the real pytest suite —
+# the same green gate `make test` / `make worktree-merge` enforce — so a
+# patch that reds any test is actually caught here.
 
-import glob
 import json
 import os
-import stat
+import re
+import shlex
 import subprocess
 
 RUN_DIR = os.environ["MINI_ORK_RUN_DIR"]
@@ -28,74 +37,60 @@ try:
 except OSError:
     ev.write(f"worktree missing: {WT}\n")
 
-# Run mini-ork's own tests in DRY_RUN mode — most recipe integration
-# tests honor this flag and skip live LLM dispatch. Without it iter 1
-# burned ~20 min walking the full live-mode suite against an
-# un-patched worktree.
+# Run in DRY_RUN mode — the recipe integration tests honor this flag and
+# skip live LLM dispatch, so the gate never fires paid provider calls.
 os.environ["MINI_ORK_DRY_RUN"] = "1"
 
-# Coverage scope. Default: unit tests + the recipes' own integration
-# smoke tests (the ones the self-improve loop is most likely to break).
-# Operator override: MINI_ORK_SELF_IMPROVE_TEST_GLOBS as a space-
-# separated glob list relative to the worktree root.
-#
-# Wider coverage (full integration sweep) is intentionally OFF here
-# because the same gauntlet runs in CI on the merged branch — running
-# it per-iter costs ~20 min of wall-clock without catching anything
-# the per-patch unit + smoke pair misses.
-DEFAULT_GLOBS = [
-    "tests/unit/test_*.sh",
-    "tests/integration/test_recursive_self_improve_recipe.sh",
-    "tests/integration/test_post_mvp_delivery_recipe.sh",
-    "tests/integration/test_bin_execute.sh",
-    "tests/integration/test_d008_workflow_node_dag.sh",
-]
-GLOBS = os.environ.get("MINI_ORK_SELF_IMPROVE_TEST_GLOBS", "").split() or DEFAULT_GLOBS
+# The real test command. Default is the whole pytest suite — the same
+# gate the human worktree-merge flow enforces — because "tighten the
+# review" means the behavioral gate must actually exercise the code the
+# patch touched, not a hand-picked subset a weak patch could sidestep.
+# Operator can scope it (e.g. a fast layer) via MINI_ORK_SELF_IMPROVE_TEST_CMD.
+DEFAULT_CMD = "python3 -m pytest -q"
+cmd = shlex.split(os.environ.get("MINI_ORK_SELF_IMPROVE_TEST_CMD", "").strip() or DEFAULT_CMD)
 
-# We deliberately reject vacuous-pass cases (e.g. zero tests).
-ran = 0
-failed = 0
-suites = []
+ev.write(f"test_cmd={' '.join(cmd)}\ncwd={os.getcwd()}\n===== output =====\n")
+ev.flush()
 
+# Capture output so we can both stream it to the evidence log AND parse
+# the pytest summary line for a collected-count (the vacuous guard).
+proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+out = proc.stdout.decode("utf-8", "replace")
+ev.write(out)
+rc = proc.returncode
 
-def _run_suite(name, argv):
-    global ran, failed
-    ev.write(f"===== {name} =====\n")
-    ev.flush()
-    if subprocess.run(argv, stdout=ev, stderr=subprocess.STDOUT).returncode == 0:
-        suites.append(f"{name}:PASS")
-    else:
-        failed += 1
-        suites.append(f"{name}:FAIL")
-    ran += 1
+# pytest exit codes: 0=all passed, 1=tests failed, 2=interrupted,
+# 3=internal error, 4=usage error, 5=NO TESTS COLLECTED. Parse the
+# summary counts for evidence; the rc is authoritative for pass/fail.
+def _count(word):
+    m = re.search(rf"(\d+) {word}", out)
+    return int(m.group(1)) if m else 0
 
+n_passed = _count("passed")
+n_failed = _count("failed") + _count("error") + _count("errors")
+collected = n_passed + n_failed
 
-for g in GLOBS:
-    for t in sorted(glob.glob(os.path.join(WT, g))):
-        if not os.path.isfile(t):
-            continue
-        if not os.access(t, os.X_OK):
-            try:
-                os.chmod(t, os.stat(t).st_mode | stat.S_IXUSR)
-            except OSError:
-                pass
-        label = f"{os.path.basename(os.path.dirname(t))}:{os.path.basename(t)}"
-        _run_suite(label, ["bash", t])
-
-if ran == 0:
-    ev.write("no test suites found — refusing vacuous pass\n")
+# Vacuous-pass discipline: rc==5 (nothing collected) or a zero-test run
+# is NOT a pass — that is exactly the failure mode this rewrite fixes.
+if rc == 5 or (rc == 0 and collected == 0):
+    ev.write("no tests collected — refusing vacuous pass\n")
     passed = 0
-else:
+elif rc == 0:
     passed = 1
-    if failed > 0:
-        passed = 0
+else:
+    # rc==1 (failures) or any other non-zero (interrupt / internal /
+    # usage error) → reject. A gate that can't run its own suite fails
+    # closed, never open.
+    passed = 0
 
 ev.close()
 print(json.dumps({
     "verifier": "self-tests-pass",
     "pass": passed == 1,
     "evidence_path": EVIDENCE,
-    "suites_run": ran,
-    "suites_failed": failed,
-    "suites": suites,
+    "test_cmd": " ".join(cmd),
+    "pytest_rc": rc,
+    "tests_collected": collected,
+    "tests_passed": n_passed,
+    "tests_failed": n_failed,
 }))
