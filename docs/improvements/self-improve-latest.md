@@ -1,142 +1,262 @@
-# Synthesis — Recursive Self-Improvement, iter 36
+# Synthesis — Recursive Self-Improvement, iter 1 (20260806123316)
+
+All five lenses (bottleneck / perf / correctness / arch / arxiv) converge on a
+single load-bearing defect: **telemetry/provenance collapse at the
+dispatch→trace boundary**. 112/126 `recursive_self_improve` traces carry empty
+`tool_calls`/`files_read`/`files_written`; **126/126 carry empty
+`prompt_version_hash`/`context_bundle_hash`**. The second half of that is not
+merely a logging gap — it makes the recipe's own learning loop *structurally
+inert*: `optimize/gepa.py` and `learning/rho_aggregator.py` filter their input
+with `WHERE prompt_version_hash <> '' AND prompt_version_hash IS NOT NULL`
+(per lens-correctness §A4), so every self-improve row is discarded before it
+can teach anything. A recursive-self-improvement recipe that cannot feed its
+own GRPO loop is the highest-leverage fix on the board.
+
+**Grounding note (synthesizer correction).** The three code lenses name the
+trace-writer `build_trace_payload()`; the live function is
+`trace_write_node` (`mini_ork/trace_store.py:140`). Line ranges the lenses
+cite are correct; the symbol name is not. Patch 1 below uses the verified
+name. The write-site gap is confirmed by direct read: `_tf`
+(`mini_ork/cli/execute.py:1662-1672`) builds `extra` with `trace_id`,
+`run_id`, `objective_domain`, `verifier_output`, `agent_version_id` — and
+never sets either provenance hash; `trace_write_node`'s payload dict
+(`:184-188`) has no slot for them either.
 
 ## Ranked patch plan
 
 | Rank | Bottleneck | Category | Patch summary | Evidence | Confidence |
 |---|---|---|---|---|---|
-| 1 | `dedupe_check` verifier hallucinates `learning_record.signature` (3rd recurrence of planner-LLM-column-hallucination pattern) | correctness | Add a multi-table schema-truth block to the planner prompt covering every table any verifier command may reference (`learning_record`, `llm_calls`, `pattern_records`, `execution_traces`), and replace the `signature` pseudocolumn dedupe with a real `(title, category, iter)` composite key. | `lens-bottleneck.md:30`; `lens-correctness.md:15-35`; `lens-arch.md:21`; `db/migrations/0017_self_improve_learning.sql:30-52`; `bin/mini-ork-plan:144-148`; live probe `Error: no such column: signature`; arXiv `2512.22250`, `2603.23050`, `2605.00628` from `lens-arxiv.md:7-27` | 0.86 |
-| 2 | Plan/classify outer-span `trace_write` rows still emit `duration_ms=0`/`cost_usd=0` (91/91 = 100% of `recursive_self_improve` rows in 24h). | perf | Extract `_trace_write_node_rich` from `bin/mini-ork-execute:301-365` into `lib/trace_rich.sh` as `trace_write_node_rich`; replace 11 outer-span call sites in `bin/mini-ork-plan` + `bin/mini-ork-classify` so sidecars (`.last-llm-cost`, `.last-llm-duration-ms`) propagate. | `lens-bottleneck.md:32`; `lens-perf.md:22-46`; `bin/mini-ork-plan:108,307,321,497,505,512,520,527,577`; `bin/mini-ork-classify:113,308`; arXiv `2604.17092`, `2502.06318` (`lens-arxiv.md:55-68`) | 0.81 |
-| 3 | Synthesizer ranks 4–5 patches per iter; implementer ships 1; deferred patches evaporate (0 `rank≥1` rows in `learning_record` for any iter ≥ 18). | arch | Add `_promote_synthesis_findings` after `_self_improve_record_success` (`bin/mini-ork-self-improve:182-220`) that parses the ranked-patch table from `synthesis.md` and inserts one `learning_record` row per non-rank-1 patch with `outcome='deferred'`, keyed idempotently on `(run_id, iter, rank, title)`. Gate behind `MO_PROMOTE_SYNTHESIS_FINDINGS=1`. | `lens-bottleneck.md:33`; `lens-arch.md:97-112`; `bin/mini-ork-self-improve:182-220,481-484`; arXiv `2603.10600`, `2512.10696`, `2506.05109` (`lens-arxiv.md:78-99`) | 0.74 |
-| 4 | `trace_write … 2>/dev/null \|\| true` idiom at ≥ 31 sites silently swallows schema-drift errors (D-039 recurrence vector). | correctness | Add `trace_write_or_log` wrapper in `lib/trace_store.sh` that captures stderr to `${MINI_ORK_RUN_DIR}/trace-write-errors.log` and propagates the exit code; migrate plan/classify call sites first; leave `\|\| true` only on explicitly-best-effort telemetry paths. | `lens-bottleneck.md:34`; `lens-correctness.md:73-90`; `lib/trace_store.sh:35-50` (D-039 postmortem); arXiv `2604.22028`, `2511.18528` (`lens-arxiv.md:103-116`) | 0.68 |
-| 5 | `llm_calls.actor` taxonomy collapse — workflow role / model lane / run-id overload makes `provider_policy_researcher` structurally vacuous. | correctness | Pass `node_type` as `MO_WORKFLOW_ROLE` from `bin/mini-ork-execute:_dispatch_node` to `mo_llm_dispatch_universal`; in `lib/llm-dispatch.sh:519-522` write `actor = "${MO_LANE_ACTOR:-${MO_WORKFLOW_ROLE:-${node_type:-${USER:-unknown}}}}"` and add `metadata_json.workflow_role` + `metadata_json.model_lane`. Update verifier to query `json_extract(metadata_json,'$.workflow_role')='researcher'` with `actor` fallback for back-compat. | `lens-bottleneck.md:31`; `lens-correctness.md:37-71`; `lens-arch.md:75-94`; `bin/mini-ork-execute:402-404,480-483,517-520,573-576`; `lib/llm-dispatch.sh:519-522`; arXiv `2602.10133`, `2604.05119`, `2601.14567` (`lens-arxiv.md:29-51`) | 0.71 |
+| 1 | 126/126 self-improve traces have empty `prompt_version_hash`/`context_bundle_hash` → GEPA/rho_aggregator filter out 100% of rows → learning loop inert | correctness | In `_tf` (`execute.py:1662-1672`), stamp `prompt_version_hash` + `context_bundle_hash` into `extra`, computed **at the write site** from the node's recipe prompt file and the run's `context-pack.json` (materials provably present), so downstream `WHERE prompt_version_hash <> ''` filters return rows | `execute.py:1662-1672` (gap), `trace_store.py:184-191` (pass-through), lens-correctness §A4, lens-perf H2/F2, lens-arch RC1; arXiv 2605.17169, 2607.00941, 2606.07889 | 0.88 |
+| 2 | Verifier persists `{"verdict":"fail"}` only — 7 of 33 failures undiagnosable | correctness | At the verdict-write site (`verify.py:295-313`), carry the `results` array already built at `:295-303` plus a `failure_detail` list (`{rule_id, expected, observed, missing_inputs}`) into `verifier_output` | `verify.py:295-313`, `_safe_trace_write` `:307-313`, lens-correctness §A2, lens-bottleneck row 2; arXiv 2607.28871, 2412.13114, 2608.02011 | 0.82 |
+| 3 | `duration_ms`/`cost_usd` re-coerced to 0 when sidecar absent — 112/126 rows are 0, hung≡fast≡unmeasured | perf+correctness | In `trace_write_node` (`trace_store.py:169-182`), add `cost_observed`/`duration_observed` bools reflecting whether the sidecar was actually read; guard the 5 arithmetic consumers so unobserved-zero ≠ real-zero | `trace_store.py:169-188`, `context_assembler.py:332-333`, `otel_export.py:96,101,239,258,266`, lens-perf F1, lens-correctness §A1; arXiv 2605.08747, 2604.05119 | 0.80 |
+| 4 | Implementer no-op with `files_written=[101 paths]`, `tool_calls=[]`, accepted as success — audit cannot answer "what did it do?" | correctness | Implementer prompt mandates a per-file provenance block; `trace_write_node` downgrades `status` to `needs_provenance` when `cost_usd > floor AND tool_calls=[] AND files_read=[] AND files_written non-empty` | `trace_store.py:169-191`, `execute.py:1683`, `recipes/recursive-self-improve/prompts/implementer.md`, lens-correctness §A3, lens-bottleneck row 3; arXiv 2604.04035, 2603.14688, 2604.17557 | 0.74 |
+| 5 | Dual verifier filenames `verifier_*.json` (legacy) + `verifier-result-*.json` (current) both written every run | arch | Drop `"verifier_"` from the mirror tuple at `execute.py:1385`; canonicalize legacy source read-only | `execute.py:1385`, readers `self_improve.py:91`/`web/why.py:91`/`run_detail.py:169`, lens-arch RC2, lens-correctness §A5 | 0.70 |
+
+Only **Patch 1** is attempted this iteration (kickoff: "exactly one patch,
+minimal and reviewable"). Ranks 2–5 are queued to `learning_record` for
+subsequent iters.
 
 ## Top patch — detailed plan
 
-### Patch 1: schema-truth planner prompt + composite-key dedupe
+### Patch 1: Stamp `prompt_version_hash` + `context_bundle_hash` at the trace-write boundary
 
-**Problem statement.** The iter-36 kickoff `plan.json` verifier `dedupe_check` queries `learning_record.signature`, a column that has never existed in the schema (`db/migrations/0017_self_improve_learning.sql:30-52`). `sqlite3` errors out, the `grep -q '^0$'` pipeline produces empty stdout (grep exits 1), and the run-harness `|| true` swallow turns the failure into a vacuous PASS. This is the third recurrence of the same fingerprint in three consecutive iterations: iter-34 invented `llm_dispatch(role)`; iter-35 invented `iteration_id`/`notes`; iter-36 invented `signature`. The planner prompt at `bin/mini-ork-plan:144-148` hard-codes a one-table schema hint for `llm_calls` only.
+**Problem statement.** Every `recursive_self_improve` execution trace persists
+an empty `prompt_version_hash` and `context_bundle_hash` (126/126, queried this
+run). Both downstream learners — `optimize/gepa.py` and
+`learning/rho_aggregator.py` — filter their input on
+`prompt_version_hash <> '' AND prompt_version_hash IS NOT NULL`
+(lens-correctness §A4), so the recipe's entire output is discarded and the
+GRPO learning loop the recipe exists to feed never receives a row.
 
 **Evidence.**
-- Scan: `lens-bottleneck.md:30` (full row with file/line refs, live `Error: in prepare, no such column: signature` reproduction)
-- Correctness lens: `lens-correctness.md:15-35` (reproduction recipe R1), `lens-correctness.md:174-201` (proposed Fix 1 shape)
-- Arch lens: `lens-arch.md:21` (verifier-surface gap analysis), `lens-arch.md:172` ("avoid verifier surfaces that depend on unverified planner-invented schema")
-- Schema truth: `db/migrations/0017_self_improve_learning.sql:30-52` — columns are `id, run_id, iter, rank, category, title, evidence_paths, arxiv_refs, patch_summary, outcome, severity, confidence, benchmark_delta, created_at, updated_at`
-- Pattern frequency: 3 (iter-34, iter-35, iter-36) — `lens-bottleneck.md:58`
-- arXiv evidence (new infra not added; prompt-only change ≠ new infra, but cited for design grounding):
-  - `2512.22250` — Hallucination Detection for LLM-based Text-to-SQL Generation via Two-Stage Metamorphic Testing (`lens-arxiv.md:8-13`)
-  - `2603.23050` — DBAutoDoc automated schema documentation (`lens-arxiv.md:22-27`)
-  - `2605.00628` — EGREFINE execution-grounded schema refinement (`lens-arxiv.md:15-20`)
+- `mini_ork/cli/execute.py:1662-1672` — verified by direct read: the `_tf`
+  closure's `extra` dict is assembled with `trace_id`, `run_id`,
+  `objective_domain`, `verifier_output` (and `agent_version_id` at `:1677`);
+  **no path sets `prompt_version_hash` or `context_bundle_hash`.** The
+  adjacent `.tool-summary` merge (`:1693-1708`) demonstrates the exact,
+  in-place, best-effort pattern this patch reuses.
+- `mini_ork/trace_store.py:184-191` — the payload dict (`:184-188`) omits both
+  hash keys; the `extra`-merge loop (`:189-191`) copies any `extra` key into
+  the payload when absent/falsy, so once `_tf` sets the two keys they flow to
+  the row without touching `trace_write_node` at all.
+- Concrete offenders (from lens-bottleneck, this run's DB): researcher lens
+  trace `tr-researcher-arch_lens-4418b76a` (`duration_ms=367788`,
+  `cost_usd=1.785704`, final artifact written) with empty hashes;
+  `tr-researcher-arxiv_lens-9fee8d64` (`cost_usd=1.3366`) with empty hashes.
+- Matches the top 4 known_failure_modes in `context-pack.json` at conf.
+  0.96–0.98 (`cross_class:agent.researcher.prompt` — artifact with empty
+  prompt/context hashes) and the run's own learned-failure ledger
+  (`tr-researcher-arxiv_lens-9fee8d64`: "both prompt_version_hash and
+  context_bundle_hash are empty strings").
+- arXiv (from `lens-arxiv.md`): **2605.17169** (Hu et al., *Responsible
+  Agentic AI Requires Explicit Provenance* — the causal-attribution function
+  is precisely a per-trace provenance key; provenance is a structural
+  prerequisite, not optional); **2607.00941** (*Evidentiary-Adequacy
+  Criterion* — an empty-hash trace fails the completeness property);
+  **2606.07889** (*Strained Coherence* — a success trace whose provenance
+  fields are empty is the pre-failure signal these hashes make detectable).
 
-**Proposed change.**
+**Proposed change.** Compute both hashes from inputs that are **provably
+present at write time**, so the patch is not blocked on any upstream producer
+(the open question raised by lens-perf Q2 and lens-arch Q3 — "are the hashes
+computed upstream or dropped?" — is dissolved by computing them here):
 
-1. **Rewrite the schema-truth block in `bin/mini-ork-plan:144-148`** to cover every table any verifier command may reference. Generate it at plan time from `PRAGMA table_info` against the live DB so it cannot drift from migrations:
+1. Add a small helper in `mini_ork/cli/execute.py`, e.g.
+   `_provenance_hashes(node_id, node_type, task_class, run_dir) -> tuple[str, str]`:
+   - `context_bundle_hash = "sha256:" + sha256(context_pack_bytes)` where
+     `context_pack_bytes` is the byte content of `<run_dir>/context-pack.json`
+     (confirmed present in this run dir, 12.4 KB). This is the bundle
+     *version* identity: stable across identical bundles, changes when the
+     bundle changes.
+   - `prompt_version_hash = "sha256:" + sha256(prompt_file_bytes)` where
+     `prompt_file_bytes` is the node's recipe prompt under
+     `recipes/<recipe>/prompts/<node>.md`, resolved via the existing
+     recipe/node→file logic already present in `execute.py` (the same
+     resolution `_researcher_output_file` at `:1287-1319` relies on). This is
+     the *prompt version*, not the per-run rendered string — matching the
+     semantics the perf lens already assumed (`lens-perf-prompt-…-v1` =
+     "deterministic copy of the recipe prompt").
+   - Best-effort, mirroring `:1707-1708`: any resolution/IO failure returns
+     `("", "")` for the affected field and never raises. When a hash can't be
+     computed, also set `extra["prompt_hash_source"] = "unavailable"` so an
+     empty hash is *explained* rather than silently indistinguishable from a
+     bug (satisfies 2607.00941's atomicity/immutability intent without a
+     schema change).
+2. In `_tf` (`execute.py:1662-1672`), after building `extra`, call the helper
+   and set `extra["prompt_version_hash"]` / `extra["context_bundle_hash"]`.
+3. **Verify the persistence column-mapping** before claiming success: confirm
+   the `INSERT` in `trace_store.py` maps payload keys `prompt_version_hash` /
+   `context_bundle_hash` to their columns (the schema columns exist per all
+   three lenses). If the INSERT drops unknown keys, add the two columns to the
+   mapping — still within the LOC budget. Do **not** ship the `_tf` change
+   without confirming the row actually persists the value (otherwise it is the
+   no-op the perf lens warned about).
 
-   ```bash
-   _mo_plan_schema_truth_block() {
-     local db="${MINI_ORK_DB:-/Users/admin/ps/mini-ork/.mini-ork/state.db}"
-     local tables=(learning_record llm_calls pattern_records execution_traces)
-     printf '\n## Canonical schema (authoritative — every verifier_contract command MUST only reference columns listed here)\n\n'
-     for t in "${tables[@]}"; do
-       printf '### %s\n' "$t"
-       sqlite3 "$db" "PRAGMA table_info(${t});" 2>/dev/null \
-         | awk -F'|' '{printf "  - %s (%s)\n", $2, $3}'
-       printf '\n'
-     done
-     printf '### Dedupe key contract\n'
-     printf '  - learning_record has NO `signature` column. To dedupe a candidate bottleneck, key on (title, category, iter).\n'
-     printf '  - To check whether an iter-N candidate is novel, use: SELECT COUNT(*) FROM learning_record WHERE iter < N AND title = ? AND category = ?;\n'
-   }
-   ```
+Estimated size: helper + two assignments + INSERT-mapping check + tests ≈
+40–70 LOC. Comfortably under the 200-LOC ceiling; additive (new metadata
+fields, empty-string default preserved, no existing arithmetic touched).
 
-   Splice the function output into the planner prompt where the current static hint lives. If `PRAGMA table_info` returns nothing (DB unreachable), fall back to a hard-coded canonical block kept in `bin/mini-ork-plan` as a literal heredoc — never silently emit an empty block.
+**Regression test.** New file `tests/test_trace_provenance_hashes.py`:
 
-2. **Replace the `dedupe_check` verifier command at `plan.json` generation time** so future plans use the composite key. The fix lives in the planner prompt (step 1) — the schema-truth block now explicitly prescribes the correct dedupe query — so this is enforced by example. Add one more line to the prompt directives section:
+- `test_tf_stamps_nonempty_provenance_hashes` — dispatch a node through the
+  `_tf` path (or the smallest integration that writes a row) with a known
+  recipe prompt file and a known `context-pack.json`; assert the persisted
+  `execution_traces` row has
+  `prompt_version_hash != "" and prompt_version_hash is not None and
+  context_bundle_hash != ""`.
+- `test_provenance_hashes_are_stable` — two writes with the *same* prompt file
+  and *same* context-pack produce **identical** `prompt_version_hash` and
+  `context_bundle_hash` (attribution must not drift across identical runs).
+- `test_prompt_hash_changes_on_prompt_edit` — mutate one byte of the node's
+  prompt file; assert `prompt_version_hash` changes while `context_bundle_hash`
+  stays constant (sensitivity + independence of the two axes).
+- `test_learning_loop_filter_now_selects_rows` — after a self-improve node
+  writes, assert
+  `SELECT count(*) FROM execution_traces WHERE task_class='recursive_self_improve'
+   AND prompt_version_hash <> '' AND prompt_version_hash IS NOT NULL >= 1`
+  (the exact predicate GEPA/rho_aggregator use — proves the loop is no longer
+  starved).
+- `test_hash_failure_is_best_effort` — point prompt resolution at a missing
+  file; assert `_tf` does **not** raise and the row is still written with
+  `prompt_hash_source == "unavailable"`.
 
-   > When generating any `verifier_contract.checks[].command` that uses `sqlite3`, you MUST reference only columns listed in the Canonical schema block above. Verifier authors who reference an unlisted column will be rejected by the schema preflight (TODO patch 6).
+**Verification.** `python3 -m pytest -q` must stay green (the kickoff's only
+verification command). Existing trace/dispatch/learning tests must pass
+unchanged — the change is additive metadata; no aggregator reads these fields
+for arithmetic, so cost/duration/percentile numbers are byte-identical.
+Expected benchmark delta: the count of self-improve rows satisfying the GEPA
+filter moves **0 → N**, where N ≈ the number of LLM-backed nodes dispatched
+per run (this recipe's plan dispatches 13 nodes; expect a step increase of
+that order per iter, sign strictly non-negative). No expected change to
+`self-tests-pass` or `no-regression` beyond the new tests passing.
 
-3. **Add a one-shot validator pass in `bin/mini-ork-plan`** *before* writing `plan.json`: for each `verifier_contract.checks[].command` that contains `sqlite3`, regex-extract referenced column tokens of the form `<table>.<col>` plus bare columns in `SELECT … FROM <t>` clauses, then assert each is present in the canonical schema block. On mismatch, log to `${RUN_DIR}/plan-schema-preflight.log` and reject the plan with a structured error. (This is the metamorphic-testing principle from `2512.22250` adapted to shell.) Keep the regex deliberately narrow — false positives here halt the run, so a permissive matcher with an explicit allowlist for `count(*)`, `iif()`, `datetime()`, etc., is safer than a strict parser.
-
-**Regression test.** Add `tests/unit/test_plan_schema_truth.sh` with two assertions:
-
-- **A1 (negative).** A synthetic `verifier_contract` containing `SELECT signature FROM learning_record` must cause `bin/mini-ork-plan` to exit non-zero with stderr containing `schema-preflight: unknown column 'signature' on table 'learning_record'`.
-- **A2 (positive).** A synthetic `verifier_contract` containing `SELECT COUNT(*) FROM learning_record WHERE iter < 36 AND title = ? AND category = ?` must pass preflight and be written to `plan.json` unchanged.
-
-Test assertion text (literal): `assert plan-preflight rejects 'no such column: signature' AND accepts composite (title, category, iter) dedupe`.
-
-**Verification.**
-
-- `go vet ./...` — must remain green (no Go changes, but verifier requires it).
-- `go test ./...` — must remain green.
-- `bash tests/unit/test_plan_schema_truth.sh` — new test must pass.
-- Live probe: `sqlite3 /Users/admin/ps/mini-ork/.mini-ork/state.db "PRAGMA table_info(learning_record);" | grep -q signature` must return non-zero (negative control — confirms the column still does not exist and the preflight is doing real work, not vacuously passing).
-- Expected benchmark deltas:
-  - Iter-37 `lens-bottleneck.md` row "planner LLM hallucinates a column" → resolved or absent. Sign: downward (frequency 3 → 0).
-  - Iter-37 `plan.json` `verifier_contract.checks` for `dedupe_check` → references `title`+`category`+`iter`, not `signature`. Sign: structural change, magnitude binary.
-  - No expected change to `recursive_self_improve` zero-duration rate (that is Patch 2).
-
-**Rollback criteria.**
-
-- If `PRAGMA table_info` injection makes the planner prompt exceed the model's context window for any tier, revert to the static heredoc fallback only (keep the preflight validator).
-- If the preflight validator produces false positives on legitimate aggregate expressions (e.g. `COUNT(DISTINCT actor)`, `json_extract(metadata_json, '$.workflow_role')`), narrow the regex and ship; do not revert the schema-truth block.
-- If any of `go vet ./...` or `go test ./...` regresses, revert all changes — no part of Patch 1 should touch Go code, so a regression indicates an unrelated incidental change crept in.
-- Hard rollback: if iter-37 surfaces *any* new column-hallucination row, revert and escalate to Patch 6 (full pattern miner) in iter-38.
+**Rollback criteria.** Discard the patch if any of:
+- (a) any existing test regresses, or the new `INSERT` mapping rejects a
+  payload (column-type mismatch);
+- (b) `test_provenance_hashes_are_stable` fails — non-deterministic hashes
+  would *poison* attribution, which is worse than empty hashes;
+- (c) hash computation raises on any node despite the best-effort guard
+  (must behave like the `:1707-1708` `except: pass`);
+- (d) the persisted value is still empty after the change (the no-op failure
+  mode — means the source material or column mapping was mis-identified;
+  fix-forward rather than ship a cosmetic diff).
 
 ## Lower-ranked patches
 
-### Patch 2 (perf): hoist `_trace_write_node_rich` into `lib/trace_rich.sh`
+### Patch 2: Structured `failure_detail` on verifier output (correctness, ~15–25 LOC)
+`mini_ork/cli/verify.py:295-303` already builds a `results` array with
+`pass_count`/`fail_count`; `_safe_trace_write` (`:307-313`) throws it away and
+persists `{"verdict": verdict}` only. Extend the write to carry `results` plus
+a `failure_detail` list — one entry per failed check
+`{rule_id, expected, observed, missing_inputs, evidence_path}`. Directly fixes
+the learned-failure-mode `tr-verify-1785858934-69675`
+("verifier_output is only {\"verdict\": \"fail\"}") and its siblings.
+**Regression test:** `verify.py --artifact` with one failing check →
+`execution_traces.verifier_output` contains `failed_rule_ids: list[str]` and
+`results: list[dict]`, not bare verdict. arXiv: 2607.28871 (evidentiary-role
+classification is the verbatim `failure_detail` shape), 2412.13114
+(assume-guarantee: empty detail is a broken guarantee), 2608.02011 (Read-Gate:
+`verdict="fail"` requires non-empty detail). Back-compat: existing consumers
+that key on `verifier_output.verdict` are unaffected.
 
-**Problem.** 91/91 (100%) of `recursive_self_improve` `execution_traces` rows in the last 24h carry `duration_ms=0`; sidecars `.last-llm-cost` and `.last-llm-duration-ms` are populated but never read by plan/classify outer spans (`lens-perf.md:24-38`).
+### Patch 3: `cost_observed` / `duration_observed` flags (perf+correctness, ~30 LOC + 5 guards)
+`trace_write_node` (`trace_store.py:169-182`) pre-inits `cost=0.0`/
+`duration_ms=0` and the sidecar-absent branch silently leaves them at 0 — 3
+semantic states (ran in 0ms, sidecar never written, sidecar wrote 0) collapse
+to one value. Set `cost_observed = bool(c)` / `duration_observed = bool(d)` and
+emit them in the payload; guard the 5 arithmetic consumers
+(`context_assembler.py:332-333`, `otel_export.py:96,101,239,258,266`) with
+`WHERE cost_observed` (or `cost_observed OR cost_usd=0`) so unobserved-zero is
+excluded from sums/percentiles. Prefer the JSON-envelope form if Patch 3 ships
+alone; a `0043_*` nullable migration only if it lands with a consumer that
+needs `WHERE`. arXiv: 2605.08747 (VIGIL W/B decomposition — "measured" vs
+"reported" is exactly `*_observed`), 2604.05119 (typed telemetry beats coerced
+zeros). **Regression test:** an aggregator skips `duration_ms=0` rows when
+`duration_observed=False`. This is prior-iter (`20260804165336`) rank 2, never
+landed — re-ranked here, not a third variant.
 
-**Change.** Lift `_trace_write_node_rich` (`bin/mini-ork-execute:301-365`) into `lib/trace_rich.sh` as `trace_write_node_rich`. Parameterize `TASK_CLASS` as a positional arg, not an env read (mitigates `lens-perf.md:120` env-propagation hazard). Replace 11 outer-span call sites in `bin/mini-ork-plan` (108, 307, 321, 497, 505, 512, 520, 527, 577) and `bin/mini-ork-classify` (113, 308). ~50–80 LOC.
+### Patch 4: Implementer provenance gate (correctness, dual-surface)
+(a) `recipes/recursive-self-improve/prompts/implementer.md` mandates a
+`## Provenance` block: one `{path, op: read|set|write, source, justification}`
+per `files_written` entry. (b) `trace_write_node` downgrades `status` from
+`success` to a new terminal `needs_provenance` when
+`cost_usd > MO_PROVENANCE_COST_FLOOR (default 0.05) AND tool_calls=[] AND
+files_read=[] AND files_written non-empty`. Fixes
+`tr-implementer-implementer-f6b6c79a` (`cost_usd=1.308`, 101 writes, empty
+ledger). arXiv: 2604.04035 (causality laundering — the 101-path list *is* the
+laundered audit trail), 2603.14688 / 2604.17557 (causal-graph data shape).
+Wider blast radius (new status + patch-critic must accept
+`status IN ('success','needs_provenance')`) → deferred behind the two narrower
+correctness patches.
 
-**Test.** New benchmark `bench_outer_span_richness` per `lens-perf.md:82-86`: invoke `bin/mini-ork-plan` against a synthetic kickoff, assert `duration_ms > 0 AND cost_usd > 0` on the resulting trace row.
-
-**Verification.** `go vet ./... && go test ./...` green; iter-37 zero-dur rate < 10% (sign: down, magnitude: 100% → ≤ 10%).
-
-### Patch 3 (arch): synthesis → `learning_record` promoter
-
-**Problem.** Synthesizer ranks 4–5 patches; only the rank-0 success stub lands. 0 `rank≥1` rows for any iter ≥ 18 (`lens-bottleneck.md:33`).
-
-**Change.** Add `_promote_synthesis_findings` after `_self_improve_record_success` (`bin/mini-ork-self-improve:182-220`). Parse the `## Ranked patch plan` markdown table from `synthesis.md`, insert one row per rank-≥-2 patch with `outcome='deferred'`. Idempotent on `(run_id, iter, rank, title)`. Gate `MO_PROMOTE_SYNTHESIS_FINDINGS=1`.
-
-**arXiv grounding.** `2603.10600` (trajectory-informed memory), `2512.10696` (procedural memory lifecycle), `2506.05109` (metacognitive learning) — `lens-arxiv.md:78-99`.
-
-**Test.** After a successful iter-36 publish with the flag set, `SELECT COUNT(*) FROM learning_record WHERE iter=36 AND rank>=2` returns ≥ 4.
-
-### Patch 4 (correctness): `trace_write_or_log` wrapper
-
-**Problem.** D-039 recurrence vector: ≥ 31 `2>/dev/null || true` call sites silently swallow `INSERT` failures (`lens-correctness.md:73-90`).
-
-**Change.** Add `trace_write_or_log` in `lib/trace_store.sh` that redirects stderr to `${MINI_ORK_RUN_DIR}/trace-write-errors.log` and propagates the exit code. Migrate `bin/mini-ork-plan` and `bin/mini-ork-classify` call sites first; leave true best-effort callers explicitly `|| true`. Allow `SQLITE_BUSY` (exit 5) under a narrow `|| true` shim.
-
-**Test.** `tests/unit/test_trace_write_failure.sh` per `lens-correctness.md:240-251`: a drifted schema must cause `trace_write_or_log` to exit non-zero.
-
-### Patch 5 (correctness): normalize `llm_calls.actor` to workflow role
-
-**Problem.** `provider_policy_researcher` is structurally vacuous because `actor` collapses workflow role / model lane / run-id (`lens-correctness.md:37-71`, `lens-arch.md:75-94`).
-
-**Change.** Export `MO_WORKFLOW_ROLE="$node_type"` around dispatch in `bin/mini-ork-execute:_dispatch_node`. In `lib/llm-dispatch.sh:519-522`, prefer it for `actor`. Carry `workflow_role` and `model_lane` in `metadata_json` for back-compat. Rewrite the verifier to query `json_extract(metadata_json,'$.workflow_role')='researcher'` with `actor` fallback.
-
-**Test.** After fix, any researcher-lane dispatch must leave at least one row where `json_extract(metadata_json,'$.workflow_role')='researcher'`.
-
-**Note.** Patch 5 is the smallest correctness fix that unblocks the kickoff's own `provider_policy_researcher` check, but the schema-shim approach (metadata_json) is interim. The arch lens (`lens-arch.md:178`) flags first-class `workflow_role`/`model_lane` columns as the longer-term answer; this is left for iter-37+.
+### Patch 5: Drop the legacy `verifier_` mirror prefix (arch, ~1 LOC + cleanup)
+`execute.py:1385` mirrors both `("verifier_", "verifier-")`; both byte-
+identical files are written every run (confirmed on disk in
+`20260804165336`), while every canonical reader
+(`self_improve.py:91`, `web/why.py:91`, `run_detail.py:169`) reads the hyphen
+form only. Drop `"verifier_"`; canonicalize any legacy source read-only. No
+arXiv required (this is *removal*, not new infra — ranking rule 4 N/A).
+**Scope caveat:** `framework_edit` (out of scope per kickoff) shares this
+mirror path; the fix is recipe-agnostic at `:1385`, so grep
+`recipes/framework-edit/` for a live `verifier_` writer before merging.
 
 ## Convergence assessment
 
-**Not yet at diminishing returns.** Three signals say keep going:
+**Not converged — continue the loop.** Two signals point in opposite
+directions and the net is "more headroom, different surface":
 
-1. **Pattern frequency rising, not falling.** The "planner-LLM-hallucinates-a-column" fingerprint is now at frequency 3 across consecutive iters. If Patch 1 lands cleanly, iter-37 should show frequency 0 — a sharp drop that the next-iter bottleneck scanner will register, validating that the loop *can* close a class of bugs.
-2. **Structural memory deficit.** 0 `rank≥1` rows for any iter ≥ 18 means the loop has been operating without durable backlog. Patch 3 closes that gap; until it lands, every iter's deduplication is approximate (text-scrape over markdown).
-3. **Verifier-surface unverifiability.** Two of the iter-36 kickoff's own verifier checks (`dedupe_check`, `provider_policy_researcher`) are demonstrably vacuous. Until the schema-preflight (Patch 1) and actor normalization (Patch 5) land, the outer loop cannot trust its own success signal.
+- *Converging on the old surface:* the previously dominant failure pattern
+  `pat-c694ab5f46f0` (recursive_self_improve failure) collapsed **freq 28 → 3**
+  over the 8 days / 10 follow-up merges between `421a6862` and HEAD
+  `83553a58` (verifier-triple reconnection, real pytest, kickoff scope).
+- *New load-bearing surface:* telemetry/provenance collapse — dormant while
+  the old failures dominated — is now the top defect, and it is *self-
+  defeating* (the learning loop that would drive convergence is filtered to
+  empty by the very gap Patch 1 fixes). Until Patch 1 lands, the loop cannot
+  demonstrate diminishing returns because it receives no rows to learn from.
 
-The outer loop should continue for at least iters 37–39 and re-evaluate convergence after Patches 1, 2, and 3 have shipped. Iter-36 will only ship Patch 1.
+Recommendation: run at least one more iteration **after** Patch 1 to confirm
+the learning loop begins ingesting rows (the `test_learning_loop_filter_now_
+selects_rows` predicate turning non-zero in production is the convergence
+gate), then re-assess with Patches 2–4 queued. The outer loop should **not**
+terminate after this iteration.
 
 ## Provenance footer
 
-- Lenses consumed: minimax (perf), kimi (correctness), codex (arch), arXiv research lane
-- Synthesizer family: opus (Anthropic) — sole permitted Anthropic-family lane per provider policy
-- arXiv papers cited: 14 (`2512.22250`, `2605.00628`, `2603.23050`, `2602.10133`, `2604.05119`, `2601.14567`, `2502.06318`, `2604.17092`, `2604.14531`, `2603.10600`, `2512.10696`, `2506.05109`, `2604.22028`, `2511.18528`) — all sourced from `lens-arxiv.md`
-- Cross-iteration learnings applied: 8 rows from `learning_record` (live census in `lens-bottleneck.md:39-57`) plus iter-33/34/35 synthesis markdown text-scrape
-- Lens-availability notes:
-  - `lens-arch.md` content was emitted to the worktree mirror; orchestrator should promote `.mini-ork/runs/self-improve-iter-36-20260609122707/lens-arch.md` from the worktree if absent at the canonical run path
-  - `lens-arxiv.md` same — full content in worktree at `lens-arxiv.md`
+- Lenses consumed: minimax (perf, arch) / kimi (correctness) / codex
+  (bottleneck, arxiv) — all present; none degraded.
+- Synthesizer family: opus.
+- arXiv papers cited: 11 (2605.17169, 2607.00941, 2606.07889, 2607.28871,
+  2412.13114, 2608.02011, 2605.08747, 2604.05119, 2604.04035, 2603.14688,
+  2604.17557) — all appear in `lens-arxiv.md`; none invented.
+- Cross-iteration learnings applied: 4 — prior synthesis
+  `20260804165336` (its unfielded rank-2 duration-coercion re-ranked to Patch
+  3, not re-litigated as new); `learning_record` open rows 2/10/11/12
+  (consulted, none patchable on the `mini_ork/`+`recipes/`+`schemas/` surface
+  per kickoff scope); pattern-store collapse `pat-c694ab5f46f0` 28→3; the
+  run's 5 learned failure modes (top 4 map 1:1 to Patch 1's symptom cluster).
+- Synthesizer-verified against live source (files read this node):
+  `mini_ork/trace_store.py:140-209`, `mini_ork/cli/execute.py:1650-1719` —
+  corrected the lens symbol name `build_trace_payload` → `trace_write_node`.
+- Scope honored: no patch touches `.mini-ork/` run state or the
+  `framework_edit` recipe surface.
