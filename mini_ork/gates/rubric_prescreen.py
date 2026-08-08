@@ -565,20 +565,29 @@ def mo_rubric_run_score(
     print(f"  rubric: scoring run artifacts (task_class={task_class})", file=__import__("sys").stderr)
     raw = ""
     rc = 0
+    # In-process dispatch. The `llm_dispatch` CLI binary was removed in the
+    # 2026-07 bash-removal, so shelling out to it raised FileNotFoundError →
+    # rc=127 → every rubric score silently degraded to a parse-error payload.
+    # Call the native dispatcher directly (mirrors learning/gradient_extractor):
+    # on rc==0 it writes the model output to stdout, which we capture here.
+    import contextlib
+    import io as _io
+    from mini_ork.dispatch import llm_dispatch as native_dispatch
+    stdout_buf = _io.StringIO()
     try:
-        r = subprocess.run(
-            [
-                "llm_dispatch",
-                "--task-class", task_class,
-                "--node-type", "rubric",
-                "--prompt-text", prompt_text,
-            ],
-            capture_output=True, text=True, check=False,
-        )
-        raw = r.stdout
-        rc = r.returncode
-    except FileNotFoundError:
-        rc = 127
+        with contextlib.redirect_stdout(stdout_buf):
+            rc = native_dispatch.llm_dispatch(
+                [
+                    "--task-class", task_class,
+                    "--node-type", "rubric",
+                    "--prompt-text", prompt_text,
+                ],
+                root=mini_ork_root,
+            )
+        raw = stdout_buf.getvalue()
+    except Exception as exc:  # noqa: BLE001 — advisory-only, never raise
+        rc = 1
+        raw = str(exc)
 
     if rc != 0:
         print(
