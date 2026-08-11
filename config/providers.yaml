@@ -22,6 +22,7 @@
 #         openai-compat       codex CLI pointed at an OpenAI-compatible
 #                             /v1 endpoint (base_url + api_key_env required)
 #         codex-native        ambient Codex CLI login (no API key required)
+#         opencode-native     ambient opencode CLI login (no API key required)
 #         executable          your own script honoring the dispatcher
 #                             contract: <script> --print --output-format text "<prompt>"
 #   family:      provider family recorded in llm_calls telemetry
@@ -90,6 +91,14 @@ providers:
   codex:
     kind: codex-native
     family: openai
+
+  # Ambient opencode CLI login. Auth is read from
+  # ~/.local/share/opencode/auth.json (no API key env required). The model
+  # defaults to opencode's configured default; pin one with MO_OPENCODE_MODEL
+  # (provider/model format, e.g. zai-coding-plan/glm-5.1).
+  opencode:
+    kind: opencode-native
+    family: opencode
 
   # Claude CLI with your own raw Anthropic API key. Export
   # ANTHROPIC_API_KEY in secrets.local.sh; without it this falls back to
