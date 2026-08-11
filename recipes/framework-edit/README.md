@@ -34,7 +34,7 @@ The LLM-dispatching lanes intentionally span four model families:
 
 - `code_impact_lens`: `kimi_lens`
 - `prior_art_lens`: `codex_lens`
-- `implementer`: `glm_lens`
+- `implementer`: `minimax_lens`
 - `reviewer`: `opus_lens`
 
 Verifier, publisher, rollback, and decomposer lanes are operational lanes and
@@ -82,7 +82,7 @@ applied to main.
 - Current `recipes/framework-edit`: intentionally diverges. The existing
   canonical recipe has an 11-node shape with `opus_arbiter`, `verifier_smith`,
   `recipe_validator`, and a `codex_implementer`; this draft follows the v2
-  binding 9-node routine code-edit shape and uses `implementer` on `glm_lens`.
+  binding 9-node routine code-edit shape and uses `implementer` on `minimax_lens`.
 
 ## Verifiers
 
