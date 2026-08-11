@@ -1,9 +1,14 @@
 # Follow-up — promote the A.3 engine seam to a named `HarnessEngine` Protocol
 
 **Created:** 2026-08-04 12:58
-**Status:** EVALUATED 2026-08-11 — Phase B go/no-go assessed (lean **NO-GO** on
-openhands-sdk embed; Protocol promotion stays deferred). See "Phase B evaluation"
-below. Items 3 (ratchet) and 4 (isolation selector) are already shipped.
+**Status:** RE-TRIGGER MET 2026-08-11 — Phase B assessed **NO-GO** on
+openhands-sdk embed, but the named better re-trigger (opencode as a live lane)
+**shipped the same day** (`46cd76fc`, opencode-native dispatch engine). Two
+executable engines now exist (`EXECUTABLE_MODELS = {"codex","opencode"}`), so the
+Protocol can finally be designed against a genuinely heterogeneous adapter pair
+instead of claude+codex alone. Protocol promotion is now **actionable** (Task 1).
+Items 3 (ratchet) and 4 (isolation selector) are already shipped; the opencode
+engine preserved the ratchet by construction (no `ENGINE_COMMAND_BUILDERS` entry).
 **Origin:** SE-3 harness-engine standardization, decision record §11
 (`internal-docs/research/2026-08-04-harness-engine-standardization.md`)
 
@@ -37,14 +42,18 @@ Grounded in the live tree, not the roadmap:
 **Verdict.** NO-GO on embedding openhands-sdk as the trigger. Per this todo's own
 rule, the Protocol promotion stays deferred (the registry is sufficient).
 
-**Better re-trigger than openhands-sdk.** The real incoming second/third engine
-is **opencode** (cross-family panel already picked it as the worker-runtime
-replacement), which is *not yet a live dispatch engine*. Wiring opencode as an
-engine (new provider kind + command builder + transport backend) is the concrete,
-differently-shaped second adapter that would make the Protocol non-speculative —
-and is far lighter than embedding openhands-sdk. Re-open the Protocol promotion
-when opencode lands as a live lane, OR if an RQ6 embed-feasibility spike
-(§6 item 6) empirically falsifies the no-go.
+**Better re-trigger than openhands-sdk — NOW SATISFIED (2026-08-11).** opencode
+(cross-family panel's worker-runtime pick) is now a live dispatch engine as of
+`46cd76fc`: `kind: opencode-native` → a self-contained `opencode_transport.py`
+sidecar (mirrors codex), `engine_of("opencode") == "opencode"`, dispatchable as a
+lane, smoke-verified end to end (body/usage/cost from real opencode v1.18.4).
+This is the concrete, differently-shaped second adapter that makes the Protocol
+non-speculative — and it was far lighter than embedding openhands-sdk (one
+transport module + registry wiring, no new deps). **Task 1 is therefore
+unblocked:** derive the `HarnessEngine` verb set from the two executable adapters
+that now exist (codex transport + opencode transport) plus the claude CLI —
+three live engines, heterogeneously shaped. NO-GO on openhands-sdk stands; the
+Protocol no longer needs it.
 
 ## Context
 
