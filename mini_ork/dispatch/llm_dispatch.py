@@ -177,6 +177,34 @@ def resolve_lane_model(node_type, root, home) -> str:
         return "sonnet"
 
 
+def resolve_lane_family(lane: str, root: str = "", home: str = "") -> str:
+    """Resolve an agents.yaml lane ALIAS (e.g. 'codex_lens', 'decomposer') to its
+    family model via lanes.<alias>. A plain model name or unknown alias passes
+    through unchanged. Fail-open: any error returns the input lane verbatim.
+
+    Dispatch preflight keys on providers.yaml model names; '*_lens' aliases are
+    NOT providers.yaml keys, so an unresolved alias used as the fallback-chain
+    lead fails preflight and the MO_FALLBACK_* tail silently decides who serves
+    (the codex_lens->minimax bug). Resolving here makes the alias lead with its
+    real family model, keeping the tail as a genuine fallback."""
+    if not lane:
+        return lane
+    root = root or os.environ.get("MINI_ORK_ROOT", "")
+    home = home or os.environ.get("MINI_ORK_HOME", "")
+    agents = os.path.join(home, "config", "agents.yaml")
+    if not os.path.isfile(agents):
+        agents = os.path.join(root, "config", "agents.yaml")
+    if not os.path.isfile(agents):
+        return lane
+    try:
+        import yaml
+        d = yaml.safe_load(open(agents)) or {}
+        lanes = d.get("lanes", {}) or {}
+        return lanes.get(lane) or lane
+    except Exception:
+        return lane
+
+
 def cost_circuit_open(db, budget) -> bool:
     if not (db and os.path.isfile(db)):
         return False
