@@ -21,12 +21,12 @@ from .core import dispatch
 from .models import DispatchRequest, DispatchResult, TokenUsage
 from .secrets import SecretStoreError, read_secret_exports, secret_store_path
 
-# Lanes with a non-Claude CLI. Codex uses its native Python transport; other
-# provider kinds are described in config/providers.yaml.
-EXECUTABLE_MODELS = frozenset({"codex"})
+# Lanes with a non-Claude CLI. Codex + opencode use native Python transports;
+# other provider kinds are described in config/providers.yaml.
+EXECUTABLE_MODELS = frozenset({"codex", "opencode"})
 ANTHROPIC_COMPAT_MODELS = frozenset({"deepseek", "glm", "kimi", "minimax"})
 KNOWN_MODELS = frozenset(
-    {"opus", "sonnet", "kimi", "glm", "minimax", "codex", "deepseek"}
+    {"opus", "sonnet", "kimi", "glm", "minimax", "codex", "deepseek", "opencode"}
 )
 
 # Native Anthropic lanes intentionally run through the operator's ambient
@@ -252,6 +252,7 @@ _PROVIDER_FAMILY = {
     "opus": "anthropic",
     "sonnet": "anthropic",
     "codex": "openai",
+    "opencode": "opencode",
     "glm": "zai",
     "kimi": "moonshot",
     "minimax": "minimax",
@@ -467,9 +468,25 @@ def _codex_transport_command() -> tuple[str, ...]:
     )
 
 
+def _opencode_transport_command() -> tuple[str, ...]:
+    return (
+        sys.executable,
+        "-m",
+        "mini_ork.dispatch.opencode_transport",
+        "--print",
+        "--output-format",
+        "text",
+    )
+
+
 def _build_codex_native(name, entry, root, extra_env, model_id) -> ProviderSpec:
     del entry, root, model_id
     return ProviderSpec(model=name, command=_codex_transport_command(), env=extra_env)
+
+
+def _build_opencode_native(name, entry, root, extra_env, model_id) -> ProviderSpec:
+    del entry, root, model_id
+    return ProviderSpec(model=name, command=_opencode_transport_command(), env=extra_env)
 
 
 def _build_executable_script(name, entry, root, extra_env, model_id) -> ProviderSpec:
@@ -496,6 +513,7 @@ PROVIDER_KIND_BUILDERS: dict[str, Callable[..., ProviderSpec]] = {
     "anthropic-compat": _build_anthropic_compat,
     "openai-compat": _build_openai_compat,
     "codex-native": _build_codex_native,
+    "opencode-native": _build_opencode_native,
     "executable": _build_executable_script,
 }
 
@@ -527,7 +545,7 @@ def resolve_provider(
     spec = _resolve_from_registry(
         model, _load_providers_registry(root), root, environment=runtime
     )
-    if spec.command == _codex_transport_command():
+    if spec.command in (_codex_transport_command(), _opencode_transport_command()):
         env = dict(spec.env)
         env["PYTHONPATH"] = _transport_pythonpath(runtime)
         return ProviderSpec(
@@ -1099,6 +1117,45 @@ def _dispatch_codex_via_wrapper(
                 pass
 
 
+def _dispatch_opencode_via_wrapper(
+    request: DispatchRequest, spec: ProviderSpec
+) -> DispatchResult:
+    """opencode telemetry lives in the same sidecar files as codex
+    (MO_USAGE_FILE TSV + MO_COST_FILE float). The wrapper writes them; the
+    backend reads them back into the result so callers see usage/cost without
+    needing a JSON parser. MO_USAGE_FILE MUST end in ``.tokens`` — the opencode
+    transport derives its stream-file path from it."""
+    import tempfile
+
+    fd_u, usage_path = tempfile.mkstemp(suffix=".tokens")
+    os.close(fd_u)
+    fd_c, cost_path = tempfile.mkstemp(suffix=".cost")
+    os.close(fd_c)
+    try:
+        env = {**request.env, "MO_USAGE_FILE": usage_path, "MO_COST_FILE": cost_path}
+        req = DispatchRequest(
+            model=request.model,
+            prompt=request.prompt,
+            timeout_s=request.timeout_s,
+            max_turns=request.max_turns,
+            env=env,
+            cwd=request.cwd,  # preserve the guarded target cwd through the opencode path
+            workspace=request.workspace,  # carry the isolation selector through
+        )
+        result = dispatch(req, spec.command)
+        if result.ok:
+            usage, cost = _read_codex_sidecars(usage_path, cost_path)
+            result.usage = usage
+            result.cost_usd = cost
+        return result
+    finally:
+        for path in (usage_path, cost_path, f"{usage_path[:-7]}.stream.jsonl"):
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+
 # ── Per-engine command builders (SOLID M6, OCP; SE-3 Phase A.3) ─────────────
 # A model runs under a harness *engine* (the CLI that actually spawns it). The
 # claude engine needs argv rewritten before dispatch — node-scoped tool grants
@@ -1176,6 +1233,7 @@ MODEL_DISPATCH_BACKENDS: dict[
     str, Callable[[DispatchRequest, ProviderSpec], DispatchResult]
 ] = {
     "codex": _dispatch_codex_via_wrapper,
+    "opencode": _dispatch_opencode_via_wrapper,
 }
 
 
