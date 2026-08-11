@@ -14,42 +14,37 @@
 
 lanes:
   # Canonical loop-role lanes.
-  # 2026-06-15: STANDING DIRECTIVE — gemini is banned everywhere.
-  # opus and sonnet ARE allowed; pick the strongest reasoner for hard-
-  # judgment nodes (planner / reviewer / synthesizer / cross-epic
-  # prioritizer). The 2026-06-13 incident that motivated the original
-  # broad ban (run-1781333552-17796-identity-and-rbac burned $38 + 1h41m
-  # routing model_lane:reviewer to opus in auto-reflect) was about
-  # ACCIDENTAL opus routing via lane-name aliasing, not about opus
-  # itself being wrong. The fix is to keep explicit opus assignments
-  # (cost-conscious, judgment-binding) and continue to deny gemini.
-  # All role-lanes MUST map to one of glm / kimi / codex / minimax /
-  # opus / sonnet.
-  planner: minimax  # codex flaky in this env -> minimax workhorse
-  researcher: minimax  # codex flaky in this env -> minimax workhorse
-  implementer: minimax  # codex flaky in this env -> minimax workhorse
-  worker: minimax  # codex flaky in this env -> minimax workhorse
-  reviewer: minimax  # codex flaky in this env -> minimax workhorse
-  verifier: minimax  # codex flaky in this env -> minimax workhorse
-  reflector: minimax  # codex flaky in this env -> minimax workhorse
-  publisher: minimax  # codex flaky in this env -> minimax workhorse
-  rollback: minimax  # codex flaky in this env -> minimax workhorse
-  brain: minimax  # codex flaky in this env -> minimax workhorse
-  rubric: kimi               # was sonnet; cheap + reliable structured JSON
+  # 2026-06-09: planner switched codex → opus after Codex gpt-5.5 hit
+  # 'Selected model is at capacity' mid-iter-4 and the cascade killed
+  # iters 5-17. Opus is more capacity-stable but ~3x cost; the budget
+  # already accounts for opus on synthesizer so the marginal increase
+  # is one extra opus call per iter. Switch back to codex once OpenAI
+  # capacity stabilizes if cost matters more than throughput.
+  planner: opus
+  decomposer: opus           # framework-edit planner node routes here; absent
+                             # from this override = unresolved-lane planner fail
+  researcher: codex          # bottleneck-scan fallback if model_lane unset
+  implementer: codex
+  worker: codex
+  reviewer: opus             # opus_synthesizer routes through here when
+                             # workflow.yaml uses model_lane: reviewer; we
+                             # use opus_lens explicitly for clarity instead.
+  verifier: codex
+  reflector: codex
+  publisher: codex
+  rollback: codex
+  brain: opus
 
   # Heterogeneous-family lens lanes (must match workflow.yaml node.model_lane).
-  minimax_lens: minimax      # perf lens
-  kimi_lens: kimi            # correctness lens
-  codex_lens: codex          # codex review lens (non-critical; panel tolerates failure)
-  glm_lens: kimi             # no-glm -> kimi
-  opus_lens: opus            # real opus lens (claude CLI available) — 4 distinct lens families
-
-
+  minimax_lens: minimax      # perf lens — MiniMax-M3
+  kimi_lens: kimi            # correctness lens — Moonshot Kimi
+  codex_lens: codex          # arch + arxiv lens — OpenAI Codex wrapper
+  opus_lens: opus            # synthesizer + final patch reviewer — Anthropic Opus
 
 budget:
   # Per-iteration cap. Outer runner enforces wall-clock; this is the dollar
   # guard. Tuned for one full 6-lens iteration (~30 min, mostly Opus synth).
-  per_run_usd: 6.00
+  per_run_usd: 12.00
   # Per-epic / per-outer-loop cap. Set ~5h worth of iterations.
   per_epic_usd: 50.00
   # Daily hard cap. Outer runner refuses to start a new iteration once hit.
