@@ -1,9 +1,50 @@
 # Follow-up — promote the A.3 engine seam to a named `HarnessEngine` Protocol
 
 **Created:** 2026-08-04 12:58
-**Status:** BLOCKED — gated on Phase B (openhands-sdk go/no-go)
+**Status:** EVALUATED 2026-08-11 — Phase B go/no-go assessed (lean **NO-GO** on
+openhands-sdk embed; Protocol promotion stays deferred). See "Phase B evaluation"
+below. Items 3 (ratchet) and 4 (isolation selector) are already shipped.
 **Origin:** SE-3 harness-engine standardization, decision record §11
 (`internal-docs/research/2026-08-04-harness-engine-standardization.md`)
+
+## Phase B evaluation (2026-08-11)
+
+Grounded in the live tree, not the roadmap:
+
+- **openhands-sdk is absent** — not installed (`import openhands` fails), not in
+  `pyproject`, 0 refs in `mini_ork/`. The only trace is the UI fork's JS
+  `TestLLM` in `ui/playwright.mock-llm-docker.config.ts` — a frontend test
+  harness, not the framework runtime.
+- **RQ4 mismatch.** mini-ork's harnesses (claude, codex) are *whole autonomous
+  agents* = OpenHands' entire `Agent+LLM+Runtime` stack, not its `LLM` layer.
+  Embedding openhands-sdk means hosting its full agent stack (LiteLLM ~100
+  providers + agent-server + Docker/Apptainer/Remote workspaces) as one
+  heavyweight lane — a large dependency surface for a single engine.
+- **No concrete second consumer.** Only two engines exist today
+  (`EXECUTABLE_MODELS = frozenset({"codex"})` → `engine_of` ∈ {claude, codex}).
+  Promoting the registry to a named 5-verb `spawn/converse/observe/...` Protocol
+  now would validate it against claude+codex only — which the current
+  `ENGINE_COMMAND_BUILDERS`/`MODEL_DISPATCH_BACKENDS`/`workspace=` registries
+  already handle cleanly. That is exactly the premature-abstraction the §11 2/1
+  consensus rejected; nothing has changed since 2026-08-04 to add a real second
+  consumer.
+- **The parts worth having already shipped natively.** The `workspace=`
+  isolation axis is wired into dispatch (`_resolve_isolation` providers.py:663,
+  `_spawn_in_workspace` core.py:110, local/docker/microvm backends), and the A.2
+  boundary shape-check gives a typed-ish result contract. Embedding the sdk to
+  get these buys nothing.
+
+**Verdict.** NO-GO on embedding openhands-sdk as the trigger. Per this todo's own
+rule, the Protocol promotion stays deferred (the registry is sufficient).
+
+**Better re-trigger than openhands-sdk.** The real incoming second/third engine
+is **opencode** (cross-family panel already picked it as the worker-runtime
+replacement), which is *not yet a live dispatch engine*. Wiring opencode as an
+engine (new provider kind + command builder + transport backend) is the concrete,
+differently-shaped second adapter that would make the Protocol non-speculative —
+and is far lighter than embedding openhands-sdk. Re-open the Protocol promotion
+when opencode lands as a live lane, OR if an RQ6 embed-feasibility spike
+(§6 item 6) empirically falsifies the no-go.
 
 ## Context
 
