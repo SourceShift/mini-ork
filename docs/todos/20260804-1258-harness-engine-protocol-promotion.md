@@ -1,7 +1,15 @@
 # Follow-up — promote the A.3 engine seam to a named `HarnessEngine` Protocol
 
 **Created:** 2026-08-04 12:58
-**Status:** RE-TRIGGER MET 2026-08-11 — Phase B assessed **NO-GO** on
+**Status:** SHIPPED 2026-08-13 — Protocol promoted. Task 1 (verb doc) + Task 2
+(fold of the two engine-keyed registries into `HarnessEngine` objects, commit
+`1db481f7`) + Task 3 (ratchet, now structural via `capabilities().tool_grants`)
+all landed; Task 4 (isolation selector) shipped earlier. `ProviderSpec.parse_*`
+was intentionally NOT folded — it is kind-keyed (`PROVIDER_KIND_BUILDERS`) and
+resolved before `engine_of`, so it stays with the spec. Historical re-trigger
+context below.
+
+**Prior status:** RE-TRIGGER MET 2026-08-11 — Phase B assessed **NO-GO** on
 openhands-sdk embed, but the named better re-trigger (opencode as a live lane)
 **shipped the same day** (`46cd76fc`, opencode-native dispatch engine). Two
 executable engines now exist (`EXECUTABLE_MODELS = {"codex","opencode"}`), so the
@@ -82,8 +90,9 @@ only if a third engine lands.
 ## Task
 
 ### 1. Design the `HarnessEngine` Protocol against two real adapters
-- **Status:** not started
-- **Last worked:** —
+- **Status:** completed 2026-08-12 — verb set derived from the live executable
+  adapters (codex + opencode transports) plus the claude CLI, not the roadmap.
+- **Last worked:** 2026-08-12
 - **Remaining:** enumerate the verbs the two live engines (claude CLI, codex
   transport) actually need — argv-build (done, `ENGINE_COMMAND_BUILDERS`),
   spawn (`core.dispatch` today), telemetry-parse (`ProviderSpec.parse_*`),
@@ -91,8 +100,12 @@ only if a third engine lands.
   Derive the Protocol from the two adapters, not from the roadmap prose.
 
 ### 2. Fold the sibling seams into the engine
-- **Status:** not started
-- **Last worked:** —
+- **Status:** completed 2026-08-13 — `ENGINE_COMMAND_BUILDERS` +
+  `MODEL_DISPATCH_BACKENDS` folded into one `HarnessEngine` per engine
+  (claude/codex/opencode) in commit `1db481f7`; `register_*` OCP shims kept.
+  `PROVIDER_KIND_BUILDERS`/`ProviderSpec.parse_*` intentionally NOT folded
+  (kind-keyed, resolved before `engine_of`).
+- **Last worked:** 2026-08-13
 - **Remaining:** `ENGINE_COMMAND_BUILDERS` + `MODEL_DISPATCH_BACKENDS` +
   `ProviderSpec.parse_*` are three parallel per-lane registries. If the Protocol
   earns its keep, they collapse into one typed `HarnessEngine` object per
@@ -100,15 +113,19 @@ only if a third engine lands.
   external consumers don't break.
 
 ### 3. Preserve the ratchet
-- **Status:** not started
-- **Last worked:** —
+- **Status:** completed 2026-08-13 — ratchet is now structural: executable
+  engines expose `capabilities().tool_grants is False` + identity
+  `build_command`, so claude argv cannot leak by construction. Pinned by
+  `test_engine_command_builder_py` + `test_harness_engine.py`.
+- **Last worked:** 2026-08-13
 - **Remaining:** whatever shape lands, keep an equivalent of the A.3 ratchet —
   a test proving an engine that must NOT receive claude argv cannot, by
   construction (missing capability), not by a maintained negative condition.
 
 ### 4. Isolation selector (A.3 sibling, RQ5)
-- **Status:** not started (separately tracked in §8 item 5)
-- **Last worked:** —
+- **Status:** completed (shipped earlier) — local/docker/microVM expressed as
+  the `workspace=` axis on dispatch (`_resolve_isolation`, `_spawn_in_workspace`).
+- **Last worked:** shipped earlier
 - **Remaining:** re-express local/docker/microVM as a `workspace=` axis on the
   engine. Coordinate with the cloud-exec sandbox roadmap
   (`project_miniork_cloud_exec_sandbox_roadmap`).
