@@ -167,6 +167,58 @@ whether bootstrap ran (`init_ran` / `init_output`). `SpawnResult` adds
 `spawn_id`, `child_run_id`, and `child_workspace`. A caller never has to scrape
 terminal output or guess where evidence was written.
 
+## Prompt optimization — GEPA, bring-your-own-evaluator
+
+GEPA (Genetic-Pareto reflective prompt evolution) mutates a prompt by reflecting
+on an evaluator's *natural-language* feedback, keeping a Pareto front of
+candidates — ~35× fewer rollouts than RL. mini-ork wraps the external `gepa`
+framework (`pip install gepa`) two ways:
+
+- **Recipe mode** optimizes a recipe's node prompts, scored on real mini-ork runs
+  against the state db (`MiniOrkGEPAAdapter`).
+- **External mode** optimizes *any* seed prompt against *any* critic — no recipe,
+  no state db. The critic is a command (any language) that reads
+  `{"candidate": {...}, "task": {...}}` JSON on **stdin** and prints
+  `{"score": <0..1>, "feedback": "<text>"}` as the **last non-blank line of
+  stdout** (log freely above it). The critic's feedback is forwarded *verbatim*
+  into GEPA's reflection — that NL diagnosis is the signal GEPA turns into
+  targeted mutations.
+
+```bash
+python -m mini_ork.gepa.run_gepa \
+    --seed-file seed_prompt.json \        # {component: text} map, or raw text → {"prompt": text}
+    --eval-cmd "node dist/eval-c4.js" \    # your critic (stdin JSON → stdout {score,feedback})
+    --trainset fixtures/*.json \           # each file = a task object (or JSON array of them)
+    --reflection-lm anthropic/opus \
+    --budget 30 --out out/gepa-c4          # winning {component}.txt + best_candidate.json
+```
+
+The seam is three composable pieces in `mini_ork.gepa` — `backends` is pure
+stdlib (importable without the framework), the adapter composes it into GEPA:
+
+```python
+from mini_ork.gepa import (
+    SubprocessRunBackend,      # cross-process / cross-language critic
+    CallbackRunBackend,        # in-process Python: eval_fn(candidate, task) -> (score, feedback)
+    GEPARunBackendAdapter,     # composes any RunBackend into gepa's adapter (needs `pip install gepa`)
+)
+import gepa
+
+backend = CallbackRunBackend(lambda candidate, task: (score_it(candidate, task), "why"))
+adapter = GEPARunBackendAdapter(backend, components=["prompt"])
+result = gepa.optimize(
+    seed_candidate={"prompt": seed_text}, trainset=tasks, adapter=adapter,
+    reflection_lm="anthropic/opus", max_metric_calls=30,
+)
+```
+
+**Fail-loud (zero-fallback).** A non-zero exit, unparseable stdout, a missing
+`score`, or a `score` outside `[0, 1]` raises `EvaluatorError` and halts the run.
+A broken evaluator is never silently scored `0.0` — that would poison the Pareto
+front with a fake gradient. Multi-objective search comes for free: because GEPA's
+Pareto front is *instance-level* (each trainset task is its own objective),
+supplying several fixtures optimizes the whole vector, not just the mean.
+
 ## Runnable example
 
 ```bash
