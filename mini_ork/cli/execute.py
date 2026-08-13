@@ -40,6 +40,7 @@ import sqlite3
 import subprocess
 import sys
 import time
+import traceback
 import uuid
 from dataclasses import dataclass
 from typing import Callable
@@ -349,7 +350,12 @@ def _isolated_dispatch_worker(payload):
             )
     except Exception as exc:
         rc, finish_reason = 1, "error"
+        # The worker runs in a child process, so the traceback cannot cross the
+        # pool boundary as a live object — capture it as a string HERE, where the
+        # frames still exist, or the failing frame is lost and the crash is
+        # undiagnosable from the parent's stderr.
         stderr.write(f"native parallel worker failed: {exc}\n")
+        stderr.write(traceback.format_exc())
     return rc, finish_reason, stdout.getvalue(), stderr.getvalue()
 
 
@@ -1219,7 +1225,16 @@ def _watchdog_stale_heartbeat(root, db, run_id):
 
 def _synth_artifact_name(root, recipe):
     """Bash _dispatch_node:2710-2723 — the synth output file is the recipe's
-    artifact_contract.yaml `source_artifact` (default synthesis.md)."""
+    artifact_contract.yaml `source_artifact` (default synthesis.md).
+
+    For a reviewer/synth node this MUST resolve to a single output filename.
+    A list-valued `source_artifact` (the stale D-037 "input staging" form) has
+    no single-file meaning here; joining it onto a path yields an opaque
+    `TypeError` deep in posixpath — and since the reviewer node runs in a
+    ProcessPool child, that traceback never reaches the parent. Reject a
+    non-string value explicitly, naming the recipe + key, so the misconfig is
+    diagnosable at its source instead of surfacing as "N node(s) failed".
+    """
     default = "synthesis.md"
     contract = os.path.join(root, "recipes", recipe, "artifact_contract.yaml") if recipe else ""
     if not contract or not os.path.isfile(contract):
@@ -1227,9 +1242,19 @@ def _synth_artifact_name(root, recipe):
     try:
         import yaml  # noqa: PLC0415 — lazy, matches bash's inline python
         d = yaml.safe_load(open(contract, encoding="utf-8")) or {}
-        return (d.get("source_artifact") or default) if isinstance(d, dict) else default
+        value = d.get("source_artifact") if isinstance(d, dict) else None
     except Exception:
         return default
+    if not value:
+        return default
+    if not isinstance(value, str):
+        raise ValueError(
+            f"source_artifact in recipes/{recipe}/artifact_contract.yaml must be a "
+            f"single filename string for a reviewer/synth recipe, got "
+            f"{type(value).__name__}: {value!r}. The synthesizer writes ONE file "
+            f"into $MINI_ORK_RUN_DIR; name that file here (e.g. chapter-review.json)."
+        )
+    return value
 
 
 def _resolve_target_cwd(run_dir_eff):

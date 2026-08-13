@@ -447,6 +447,37 @@ def test_self_migrate_researcher_artifact_names(tmp_path):
     ) == str(tmp_path / "cost-verifiability-lens.md")
 
 
+def _write_contract(tmp_path, recipe, source_artifact_yaml):
+    d = tmp_path / "recipes" / recipe
+    d.mkdir(parents=True)
+    (d / "artifact_contract.yaml").write_text(source_artifact_yaml)
+
+
+def test_synth_artifact_name_single_string(tmp_path):
+    _write_contract(tmp_path, "chapter-review", "source_artifact: chapter-review.json\n")
+    assert ex._synth_artifact_name(str(tmp_path), "chapter-review") == "chapter-review.json"
+
+
+def test_synth_artifact_name_missing_or_empty_falls_back_to_default(tmp_path):
+    # No contract file at all → default.
+    assert ex._synth_artifact_name(str(tmp_path), "absent") == "synthesis.md"
+    # Present but no key → default.
+    _write_contract(tmp_path, "no-key", "task_class: x\n")
+    assert ex._synth_artifact_name(str(tmp_path), "no-key") == "synthesis.md"
+
+
+def test_synth_artifact_name_list_raises_clear_error_not_typeerror(tmp_path):
+    # A list-valued source_artifact has no single-file meaning for a synth node.
+    # It must raise a clear ValueError naming the recipe — NOT the opaque
+    # TypeError that used to surface deep in posixpath.join inside the
+    # ProcessPool child (undiagnosable "N node(s) failed").
+    _write_contract(
+        tmp_path, "bad", "source_artifact:\n  - chapter.md\n  - context.json\n"
+    )
+    with pytest.raises(ValueError, match="single filename string"):
+        ex._synth_artifact_name(str(tmp_path), "bad")
+
+
 def test_live_implementer_applies_diff(tmp_path, monkeypatch):
     db = _seed_db(tmp_path, "i"); _seed_task_run(db)
     rd = tmp_path / "run"; rd.mkdir()
