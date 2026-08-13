@@ -13,6 +13,7 @@ from __future__ import annotations
 from mini_ork.dispatch.models import DispatchRequest
 from mini_ork.dispatch.providers import (
     ENGINE_COMMAND_BUILDERS,
+    ENGINES,
     EXECUTABLE_MODELS,
     _claude_command_builder,
     engine_of,
@@ -111,3 +112,4 @@ def test_register_engine_command_builder_roundtrips():
         )
     finally:
         ENGINE_COMMAND_BUILDERS.pop("fake-engine", None)
+        ENGINES.pop("fake-engine", None)
