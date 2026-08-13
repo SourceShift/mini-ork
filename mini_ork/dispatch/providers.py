@@ -748,19 +748,12 @@ def dispatch_model(
             spec = resolve_provider(request.model, root)
     except (ValueError, FileNotFoundError) as exc:
         return DispatchResult(ok=False, rc=2, error=str(exc), model=request.model)
-    # Engine-scoped argv rewrite (SE-3 Phase A.3): the claude CLI needs
-    # node-scoped tool grants (--allowedTools/--strict-mcp-config/--mcp-config)
-    # and E4 turn-resume (--resume) injected; executable engines (codex) accept
-    # neither. Instead of an inline `if model not in EXECUTABLE_MODELS` special
-    # case that the next non-claude engine must remember to extend, ask the
-    # model's engine and delegate to its registered command builder. An engine
-    # with no builder (codex) gets no injection by construction — the safe
-    # default is structural, pinned by test_engine_command_builder_py.
-    builder = ENGINE_COMMAND_BUILDERS.get(engine_of(request.model))
-    if builder is not None:
-        command = builder(spec.command, request=request, env=effective_env)
-        if command != spec.command:
-            spec = replace(spec, command=command)
+    # Engine-scoped argv rewrite (SE-3 Phase A.3): every model is mapped to
+    # a harness engine object and receives that engine's command rewrite behavior.
+    engine = ENGINES.get(engine_of(request.model), _DEFAULT_ENGINE)
+    command = engine.build_command(spec.command, request=request, env=effective_env)
+    if command != spec.command:
+        spec = replace(spec, command=command)
     # Merge lane env after removing stale gateway variables. Explicit request
     # overrides are applied last so a caller can deliberately opt into a custom
     # endpoint without mutating the process environment.
@@ -781,10 +774,9 @@ def dispatch_model(
         cwd=target_cwd,
         workspace=_select_workspace(request.workspace, merged_env),
     )
-    # Per-model dispatch backend registry (OCP): a model with a bespoke
-    # transport (e.g. codex's wrapper+sidecar protocol) registers a backend
-    # instead of special-casing dispatch_model.
-    backend = MODEL_DISPATCH_BACKENDS.get(request.model, _dispatch_standard)
+    # Per-model dispatch backend registry (OCP): a model with a bespoke transport
+    # (e.g. codex/opencode sidecar protocol) registers a backend.
+    backend = MODEL_DISPATCH_BACKENDS.get(request.model, engine.dispatch)
     result = backend(effective, spec)
     _stash_session_id(result.session_id, merged_env)
     return result
@@ -1079,101 +1071,25 @@ def _read_codex_sidecars(usage_path: str, cost_path: str) -> tuple[TokenUsage, f
     return TokenUsage(input_tokens=in_tok, output_tokens=out_tok), cost
 
 
-def _dispatch_codex_via_wrapper(
-    request: DispatchRequest, spec: ProviderSpec
-) -> DispatchResult:
-    """codex telemetry lives in sidecar files the wrapper writes (stdout is the
-    cleaned text). Point MO_USAGE_FILE/MO_COST_FILE at temp files, dispatch, then
-    fold the sidecar usage/cost into the result. MO_USAGE_FILE MUST end in
-    ``.tokens`` — cl_codex.sh derives its stream-file path from it."""
-    import tempfile
-
-    fd_u, usage_path = tempfile.mkstemp(suffix=".tokens")
-    os.close(fd_u)
-    fd_c, cost_path = tempfile.mkstemp(suffix=".cost")
-    os.close(fd_c)
-    try:
-        env = {**request.env, "MO_USAGE_FILE": usage_path, "MO_COST_FILE": cost_path}
-        req = DispatchRequest(
-            model=request.model,
-            prompt=request.prompt,
-            timeout_s=request.timeout_s,
-            max_turns=request.max_turns,
-            env=env,
-            cwd=request.cwd,  # preserve the guarded target cwd through the codex path
-            workspace=request.workspace,  # carry the isolation selector through
-        )
-        result = dispatch(req, spec.command)
-        if result.ok:
-            usage, cost = _read_codex_sidecars(usage_path, cost_path)
-            result.usage = usage
-            result.cost_usd = cost
-        return result
-    finally:
-        for path in (usage_path, cost_path, f"{usage_path[:-7]}.stream.jsonl"):
-            try:
-                os.unlink(path)
-            except OSError:
-                pass
-
-
-def _dispatch_opencode_via_wrapper(
-    request: DispatchRequest, spec: ProviderSpec
-) -> DispatchResult:
-    """opencode telemetry lives in the same sidecar files as codex
-    (MO_USAGE_FILE TSV + MO_COST_FILE float). The wrapper writes them; the
-    backend reads them back into the result so callers see usage/cost without
-    needing a JSON parser. MO_USAGE_FILE MUST end in ``.tokens`` — the opencode
-    transport derives its stream-file path from it."""
-    import tempfile
-
-    fd_u, usage_path = tempfile.mkstemp(suffix=".tokens")
-    os.close(fd_u)
-    fd_c, cost_path = tempfile.mkstemp(suffix=".cost")
-    os.close(fd_c)
-    try:
-        env = {**request.env, "MO_USAGE_FILE": usage_path, "MO_COST_FILE": cost_path}
-        req = DispatchRequest(
-            model=request.model,
-            prompt=request.prompt,
-            timeout_s=request.timeout_s,
-            max_turns=request.max_turns,
-            env=env,
-            cwd=request.cwd,  # preserve the guarded target cwd through the opencode path
-            workspace=request.workspace,  # carry the isolation selector through
-        )
-        result = dispatch(req, spec.command)
-        if result.ok:
-            usage, cost = _read_codex_sidecars(usage_path, cost_path)
-            result.usage = usage
-            result.cost_usd = cost
-        return result
-    finally:
-        for path in (usage_path, cost_path, f"{usage_path[:-7]}.stream.jsonl"):
-            try:
-                os.unlink(path)
-            except OSError:
-                pass
-
-
 # ── Per-engine command builders (SOLID M6, OCP; SE-3 Phase A.3) ─────────────
-# A model runs under a harness *engine* (the CLI that actually spawns it). The
-# claude engine needs argv rewritten before dispatch — node-scoped tool grants
-# and E4 turn-resume — that other engines (codex) neither accept nor want. Each
-# engine registers a command builder here; dispatch_model asks engine_of(model)
-# and delegates. A model whose engine has no builder is dispatched with its argv
-# untouched, so claude-only flags can never leak into a CLI that rejects them
-# without anyone maintaining a negative special-case. Builder signature:
-#   (command, *, request: DispatchRequest, env: Mapping[str, str])
-#     -> tuple[str, ...].
+# A model runs under a harness *engine* (the CLI that actually spawns it).
+# The claude engine needs argv rewritten before dispatch — node-scoped tool grants
+# and E4 turn-resume — that other engines (codex/opencode) neither accept nor want.
+# The base class exposes both command and transport so new engines are extension-safe.
 
 
-def engine_of(model: str) -> str:
-    """The harness engine that runs ``model``. Every non-executable lane is
-    dispatched through the claude CLI, so they share the ``"claude"`` engine and
-    its command builder; executable models (codex) are their own engine and are
-    dispatched with their native argv untouched."""
-    return model if model in EXECUTABLE_MODELS else "claude"
+@dataclass(frozen=True)
+class Capabilities:
+    """Per-engine capability metadata used for behavior checks."""
+
+    # Accepts --allowedTools/--strict-mcp-config/--mcp-config.
+    tool_grants: bool = False
+    # Accepts --resume <id>.
+    resume: bool = False
+    # Captures a provider session_id in DispatchResult.
+    session_capture: bool = False
+    # Descriptive only; does not alter dispatch routing.
+    byo_endpoint: bool = False
 
 
 def _claude_command_builder(
@@ -1188,34 +1104,13 @@ def _claude_command_builder(
     (--resume <id>) when MO_RESUME_SESSION_ID is set. Both leaf helpers also
     guard on ``command[0] == "claude"``, so this is defence in depth; the load-
     bearing guarantee is that no builder is registered for executable engines."""
-    if env.get("MO_TOOL_GRANTS_DISABLED", "0") != "1":
-        run_dir = env.get("MINI_ORK_RUN_DIR", "") or None
+    if env.get('MO_TOOL_GRANTS_DISABLED', '0') != '1':
+        run_dir = env.get('MINI_ORK_RUN_DIR', '') or None
         command = apply_tool_grants(command, env=env, run_dir=run_dir)
-    resume_id = env.get("MO_RESUME_SESSION_ID", "").strip()
+    resume_id = env.get('MO_RESUME_SESSION_ID', '').strip()
     if resume_id:
         command = apply_resume(command, resume_id)
     return command
-
-
-ENGINE_COMMAND_BUILDERS: dict[
-    str, Callable[..., tuple[str, ...]]
-] = {
-    "claude": _claude_command_builder,
-}
-
-
-def register_engine_command_builder(
-    engine: str, builder: Callable[..., tuple[str, ...]]
-) -> None:
-    """Register (or replace) the argv builder for a harness engine (OCP). A new
-    engine that needs bespoke argv registers here instead of growing a
-    special-case in dispatch_model."""
-    ENGINE_COMMAND_BUILDERS[engine] = builder
-
-
-# ── Per-model dispatch backends (SOLID M6, OCP) ─────────────────────────────
-# Backend signature: (effective: DispatchRequest, spec: ProviderSpec)
-#   -> DispatchResult. Default: the standard core.dispatch transport.
 
 
 def _dispatch_standard(request: DispatchRequest, spec: ProviderSpec) -> DispatchResult:
@@ -1229,11 +1124,140 @@ def _dispatch_standard(request: DispatchRequest, spec: ProviderSpec) -> Dispatch
     )
 
 
+class HarnessEngine:
+    """Base harness engine with safe defaults for all engines."""
+
+    def __init__(
+        self,
+        *,
+        capabilities: Capabilities | None = None,
+        command_builder: Callable[..., tuple[str, ...]] | None = None,
+        dispatch_backend: Callable[[DispatchRequest, ProviderSpec], DispatchResult]
+        | None = None,
+    ) -> None:
+        self._capabilities = capabilities or Capabilities()
+        self._command_builder = command_builder or self._identity_build_command
+        self._dispatch_backend = dispatch_backend or _dispatch_standard
+
+    @staticmethod
+    def _identity_build_command(
+        command: tuple[str, ...], *, request: DispatchRequest, env: Mapping[str, str]
+    ) -> tuple[str, ...]:
+        del request, env
+        return command
+
+    def capabilities(self) -> Capabilities:
+        return self._capabilities
+
+    def build_command(
+        self, command: tuple[str, ...], *, request: DispatchRequest, env: Mapping[str, str]
+    ) -> tuple[str, ...]:
+        return self._command_builder(command, request=request, env=env)
+
+    def dispatch(self, request: DispatchRequest, spec: ProviderSpec) -> DispatchResult:
+        return self._dispatch_backend(request, spec)
+
+    def _set_command_builder(
+        self, builder: Callable[..., tuple[str, ...]]
+    ) -> None:
+        self._command_builder = builder
+
+    def _set_dispatch_backend(
+        self, backend: Callable[[DispatchRequest, ProviderSpec], DispatchResult]
+    ) -> None:
+        self._dispatch_backend = backend
+
+
+class ClaudeEngine(HarnessEngine):
+    """Claude CLI engine."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            capabilities=Capabilities(
+                tool_grants=True,
+                resume=True,
+                session_capture=True,
+            ),
+            command_builder=_claude_command_builder,
+        )
+
+
+class SidecarTelemetryEngine(HarnessEngine):
+    """Executable transport engine with sidecar usage/cost folding."""
+
+    def __init__(self, *, byo_endpoint: bool = False) -> None:
+        super().__init__(capabilities=Capabilities(byo_endpoint=byo_endpoint))
+
+    def dispatch(self, request: DispatchRequest, spec: ProviderSpec) -> DispatchResult:
+        import tempfile
+
+        fd_u, usage_path = tempfile.mkstemp(suffix='.tokens')
+        os.close(fd_u)
+        fd_c, cost_path = tempfile.mkstemp(suffix='.cost')
+        os.close(fd_c)
+        try:
+            env = {**request.env, 'MO_USAGE_FILE': usage_path, 'MO_COST_FILE': cost_path}
+            req = DispatchRequest(
+                model=request.model,
+                prompt=request.prompt,
+                timeout_s=request.timeout_s,
+                max_turns=request.max_turns,
+                env=env,
+                cwd=request.cwd,  # preserve the guarded target cwd through this path
+                workspace=request.workspace,
+            )
+            result = dispatch(req, spec.command)
+            if result.ok:
+                usage, cost = _read_codex_sidecars(usage_path, cost_path)
+                result.usage = usage
+                result.cost_usd = cost
+            return result
+        finally:
+            for path in (usage_path, cost_path, f"{usage_path[:-7]}.stream.jsonl"):
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+
+
+ENGINES: dict[str, HarnessEngine] = {
+    'claude': ClaudeEngine(),
+    'codex': SidecarTelemetryEngine(byo_endpoint=True),
+    'opencode': SidecarTelemetryEngine(),
+}
+_DEFAULT_ENGINE = ENGINES['claude']
+
+
+def engine_of(model: str) -> str:
+    """The harness engine that runs ``model``."""
+
+    return model if model in EXECUTABLE_MODELS else 'claude'
+
+
+ENGINE_COMMAND_BUILDERS: dict[str, Callable[..., tuple[str, ...]]] = {
+    'claude': _claude_command_builder,
+}
+
+
+def register_engine_command_builder(
+    engine: str, builder: Callable[..., tuple[str, ...]]
+) -> None:
+    """Register (or replace) the argv builder for a harness engine (OCP)."""
+    if engine not in ENGINES:
+        ENGINES[engine] = HarnessEngine()
+    ENGINES[engine]._set_command_builder(builder)
+    ENGINE_COMMAND_BUILDERS[engine] = builder
+
+# ── Per-model dispatch backends (SOLID M6, OCP) ─────────────────────────────
+# Backend signature: (effective: DispatchRequest, spec: ProviderSpec)
+#   -> DispatchResult. Default: the standard core.dispatch transport.
+
+
 MODEL_DISPATCH_BACKENDS: dict[
     str, Callable[[DispatchRequest, ProviderSpec], DispatchResult]
 ] = {
-    "codex": _dispatch_codex_via_wrapper,
-    "opencode": _dispatch_opencode_via_wrapper,
+    'codex': ENGINES['codex'].dispatch,
+    'opencode': ENGINES['opencode'].dispatch,
 }
 
 
@@ -1241,6 +1265,9 @@ def register_dispatch_backend(
     model: str, backend: Callable[[DispatchRequest, ProviderSpec], DispatchResult]
 ) -> None:
     """Register (or replace) the transport backend for a model lane."""
+    if model not in ENGINES:
+        ENGINES[model] = HarnessEngine()
+    ENGINES[model]._set_dispatch_backend(backend)
     MODEL_DISPATCH_BACKENDS[model] = backend
 
 
