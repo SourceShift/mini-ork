@@ -1,10 +1,23 @@
 # Remaining migration — first requirements audit gaps
 
-Status: in progress
+Status: completed — superseded by the 2026-07-29 framework-runtime closure.
 
-Last worked on: 2026-07-19 20:55 Europe/Berlin
+Last worked on: 2026-08-14
 
 Source task: `docs/migration/remaining-migration-handoff.md`
+
+## Closure note (2026-08-14)
+
+The only open residual here was the `cli` and `execute` forks (§"Later forks":
+"the next paid run is `cli`"; "`cli` and `execute` are not started"). Both are
+done. `docs/migration/python-migration-completion-plan.md` records the top-level
+migration cycle as complete — "verify, reflect, classify, plan, CLI, and execute
+are Python-owned; `mini_ork/cli/execute.py` is the sole executor; and
+`bin/mini-ork-execute` is retired" — and the framework runtime was globally cut
+over to Python on 2026-07-29. Every `bin/mini-ork*` entrypoint is now a Python
+executable (zero bash shims remain), and all sibling 2026-07-20 native-dispatch
+audits already read `Status: completed`. No further dispatch is warranted;
+closing.
 
 ## Verify fork closure
 
