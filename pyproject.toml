@@ -33,13 +33,22 @@ yaml = []
 # trace DAGs. Optional by design: Crucible falls back to the docker CLI when absent,
 # so mini-ork stays zero-dependency by default. Attribution: THIRD_PARTY.md
 runtime = ["verifiers>=0.2.0,<0.3"]
+# GEPA reflective prompt evolution (mini_ork/gepa/). Engine is the published
+# `gepa` framework (github.com/gepa-ai/gepa): reflective mutation + per-instance
+# multi-objective Pareto. Its BASE install is dependency-free (heavy litellm/dspy
+# deps sit behind gepa's own `full`/`confidence` extras), so this stays a light,
+# optional add. The bring-your-own-evaluator seam (backends.py) imports without
+# it; only the framework-composing adapters require it. Attribution: THIRD_PARTY.md
+optimize = ["gepa>=0.1.4,<0.2"]
 web = ["fastapi>=0.110", "uvicorn[standard]>=0.29"]
-# The supported installation profile: core CLI plus the local web sidecar and
-# Crucible runtime. Provider CLIs remain external because they need user auth.
+# The supported installation profile: core CLI plus the local web sidecar,
+# Crucible runtime, and GEPA optimization. Provider CLIs remain external because
+# they need user auth.
 full = [
     "fastapi>=0.110",
     "uvicorn[standard]>=0.29",
     "verifiers>=0.2.0,<0.3",
+    "gepa>=0.1.4,<0.2",
 ]
 
 [project.urls]
