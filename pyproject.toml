@@ -32,7 +32,7 @@ yaml = []
 # Engine is `verifiers` (MIT, Prime Intellect): isolated Docker/sandbox runtimes +
 # trace DAGs. Optional by design: Crucible falls back to the docker CLI when absent,
 # so mini-ork stays zero-dependency by default. Attribution: THIRD_PARTY.md
-runtime = ["verifiers>=0.2.0,<0.3"]
+runtime = ["verifiers>=0.2.0,<0.4"]
 # GEPA reflective prompt evolution (mini_ork/gepa/). Engine is the published
 # `gepa` framework (github.com/gepa-ai/gepa): reflective mutation + per-instance
 # multi-objective Pareto. Its BASE install is dependency-free (heavy litellm/dspy
@@ -47,7 +47,7 @@ web = ["fastapi>=0.110", "uvicorn[standard]>=0.29"]
 full = [
     "fastapi>=0.110",
     "uvicorn[standard]>=0.29",
-    "verifiers>=0.2.0,<0.3",
+    "verifiers>=0.2.0,<0.4",
     "gepa>=0.1.4,<0.2",
 ]
 
