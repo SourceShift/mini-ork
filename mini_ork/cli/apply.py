@@ -267,9 +267,9 @@ def score_candidate(candidate_id: str, scorer: str | None = None) -> str:
     """Score a candidate on a held-out set.
 
     Returns "<avg_utility_score> <n_examples>" (two floats on one line, like
-    bash's stdout). Default scorer is a deterministic mock; ``gepa`` delegates
-    to mini_ork.optimize.gepa (placeholder wiring, mirrors bash); an unknown
-    scorer returns a neutral "0.5 1".
+    bash's stdout). Default scorer is a deterministic mock; ``gepa`` is a neutral
+    placeholder pending the P2 real-execution evaluator (mini_ork.gepa.backends);
+    an unknown scorer returns a neutral "0.5 1".
     """
     if scorer is None:
         scorer = os.environ.get("MO_APPLY_SCORER", "mock")
@@ -289,14 +289,13 @@ def score_candidate(candidate_id: str, scorer: str | None = None) -> str:
         return f"{score:.4f} {n}"
 
     if scorer == "gepa":
-        # Real evaluator (IMPL-2). Placeholder wiring identical to bash:
-        # defer to held_out_score when the candidate has traces, otherwise
-        # echo the mock scores so the gate still runs.
-        try:
-            from mini_ork.optimize.gepa import held_out_score  # type: ignore  # noqa: F401
-            return "0.5 1"  # see IMPL-3 follow-up to wire real batch lookup
-        except Exception:
-            return "0.5 1"
+        # Neutral placeholder. The real GEPA scorer is the bring-your-own
+        # evaluator seam in mini_ork.gepa.backends (a RunBackend returning a
+        # fail-loud {score, feedback}); wiring it into the apply-loop gate is the
+        # P2 real-execution-evaluator step. Until then this returns a neutral
+        # constant so the non-regression gate is a no-op (before ≈ after) rather
+        # than promoting on a fabricated gradient.
+        return "0.5 1"
 
     return "0.5 1"  # unknown scorer → neutral
 
