@@ -22,11 +22,12 @@ Best-practice notes baked in:
 Running the search executes REAL mini-ork runs (real spend); do it from the
 mini-ork env. See run_gepa.py for the entry point.
 
-SIBLING MODULE: ``mini_ork.optimize.miniork_adapter`` is the OFFLINE adapter
-(cached execution_traces, no live dispatch) behind the ``GepaAdapter``
-Protocol in ``mini_ork.optimize.gepa``. Use this module (``mini_ork.gepa``)
-for live reflective Pareto evolution with the external gepa framework; use
-``mini_ork.optimize`` for offline/cached optimization loops and tests.
+SINGLE ENGINE: this module (``mini_ork.gepa``) is mini-ork's one GEPA engine —
+live reflective Pareto evolution composed on the external ``gepa`` framework
+(per-instance multi-objective Pareto). A former native reimplementation under
+``mini_ork.optimize`` (an offline cached-trace adapter behind its own
+single-objective loop) was retired in favor of this path; recover the old loop
+from git history if it is ever needed.
 """
 from __future__ import annotations
 
