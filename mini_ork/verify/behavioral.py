@@ -62,6 +62,7 @@ __all__ = [
     "run_api_check",
     "run_ui_check",
     "run_journey_check",
+    "run_function_check",
     "observable_from_env",
     "main",
     "register_surface_handler",
@@ -72,13 +73,27 @@ PROVEN = "PROVEN"
 REFUTED = "REFUTED"
 UNVERIFIED = "UNVERIFIED"
 
-_SURFACES = ("api", "ui", "journey")
+_SURFACES = ("api", "ui", "journey", "function")
 _METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE")
 _METAMORPHIC = ("idempotent_repeat", "order_invariant", "filtered_subset_of_unfiltered")
 
 
 class ObservableError(ValueError):
     """A malformed ``observable`` descriptor (bad surface, path escape, …)."""
+
+
+def _is_json_data(value: Any) -> bool:
+    """Return whether ``value`` is composed only of plain JSON data."""
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return True
+    if isinstance(value, list):
+        return all(_is_json_data(item) for item in value)
+    if isinstance(value, dict):
+        return all(
+            isinstance(key, str) and _is_json_data(item)
+            for key, item in value.items()
+        )
+    return False
 
 
 @dataclass
@@ -158,6 +173,10 @@ class Observable:
     filter: str = ""
     steps: list["Observable"] = field(default_factory=list)
     extract: dict = field(default_factory=dict)
+    module: str = ""
+    function: str = ""
+    seed_inputs: list = field(default_factory=list)
+    relations: list[str] = field(default_factory=list)
 
     @classmethod
     def from_mapping(cls, data: Any) -> "Observable":
@@ -178,6 +197,27 @@ class Observable:
             if m not in _METAMORPHIC:
                 raise ObservableError(
                     f"unknown metamorphic relation {m!r}; known: {_METAMORPHIC}"
+                )
+        seed_inputs_raw = data.get("seed_inputs", [])
+        seed_inputs = [] if seed_inputs_raw is None else seed_inputs_raw
+        if not isinstance(seed_inputs, list):
+            raise ObservableError("observable.seed_inputs must be a list")
+        if any(not _is_json_data(seed) for seed in seed_inputs):
+            raise ObservableError("observable.seed_inputs must contain only plain JSON data")
+        relations_raw = data.get("relations", [])
+        relations = [] if relations_raw is None else relations_raw
+        if not isinstance(relations, list) or any(
+            not isinstance(name, str) for name in relations
+        ):
+            raise ObservableError("observable.relations must be a list of strings")
+        if surface == "function":
+            from mini_ork.learning import metamorphic as mm
+
+            unknown = [name for name in relations if name not in mm.RELATION_LIBRARY]
+            if unknown:
+                known = tuple(mm.RELATION_LIBRARY)
+                raise ObservableError(
+                    f"unknown function relation {unknown[0]!r}; known: {known}"
                 )
         expect_status = [int(s) for s in (data.get("expect_status") or [200])]
         schema = data.get("expect_json_schema") or {}
@@ -229,6 +269,10 @@ class Observable:
             filter=filter_value,
             steps=steps,
             extract=extract,
+            module=str(data.get("module") or ""),
+            function=str(data.get("function") or ""),
+            seed_inputs=seed_inputs,
+            relations=relations,
         )
 
 
@@ -503,6 +547,160 @@ def _eval_metamorphic(relation: str, primary: HttpResult, secondary: HttpResult)
     # filtered_subset_of_unfiltered needs a declared filter parameter to build the
     # transformed input; P0 does not synthesize one, so it abstains (honest None).
     return Check(relation, None, f"{relation} not evaluable in P0")
+
+
+def _propose_relations(module: str, function: str, fn: Callable) -> list:
+    """Ask the configured model to select vetted relations for ``fn``.
+
+    This path is runtime-only and opt-in. The proposer returns data, and the
+    relation library resolves that data to audited predicates; model-authored
+    code is never evaluated.
+    """
+    import inspect
+
+    import mini_ork.dispatch as mo_dispatch
+    from mini_ork.learning import metamorphic as mm
+    from mini_ork.learning import metamorphic_proposer
+
+    try:
+        source = inspect.getsource(fn)
+    except (OSError, TypeError):
+        return []
+    prompt = metamorphic_proposer.build_proposer_prompt(
+        f"{module}.{function}", source
+    )
+    model = os.environ.get("MO_BEHAV_FN_MODEL") or os.environ.get(
+        "MINI_ORK_DEFAULT_MODEL", "sonnet"
+    )
+    try:
+        result = mo_dispatch.dispatch_model(
+            mo_dispatch.DispatchRequest(model=model, prompt=prompt)
+        )
+    except Exception:  # noqa: BLE001 - an unavailable optional lane means abstain
+        return []
+    if not result.ok:
+        return []
+    proposal = metamorphic_proposer.parse_proposal(result.text)
+    return mm.resolve_relations(proposal["relations"])
+
+
+def run_function_check(obs: Observable) -> BehavioralVerdict:
+    """Run function-level metamorphic checks with three-valued discipline."""
+    target = ".".join(part for part in (obs.module, obs.function) if part)
+    if not obs.module or not obs.function:
+        checks = [Check("declared", None, "no module/function declared")]
+        return BehavioralVerdict(
+            UNVERIFIED,
+            "function",
+            checks,
+            evidence=_summarize(UNVERIFIED, target, checks),
+            target=target,
+        )
+
+    import copy
+    import importlib
+
+    from mini_ork.learning import metamorphic as mm
+
+    try:
+        module = importlib.import_module(obs.module)
+        fn = getattr(module, obs.function)
+    except (ImportError, AttributeError) as exc:
+        checks = [Check("reachable", None, f"{type(exc).__name__}: {exc}")]
+        return BehavioralVerdict(
+            UNVERIFIED,
+            "function",
+            checks,
+            evidence=_summarize(UNVERIFIED, target, checks),
+            target=target,
+        )
+    if not callable(fn):
+        checks = [Check("reachable", None, f"target {target!r} is not callable")]
+        return BehavioralVerdict(
+            UNVERIFIED,
+            "function",
+            checks,
+            evidence=_summarize(UNVERIFIED, target, checks),
+            target=target,
+        )
+
+    if obs.relations:
+        relations = mm.resolve_relations(obs.relations)
+    elif os.environ.get("MO_BEHAV_FN_PROPOSE") == "1":
+        proposed = _propose_relations(obs.module, obs.function, fn)
+        proposed_names = [
+            item if isinstance(item, str) else getattr(item, "name", "")
+            for item in proposed
+        ]
+        relations = mm.resolve_relations(proposed_names)
+    else:
+        relations = mm.resolve_relations(
+            relation.name for relation in mm.UNIVERSAL_RELATIONS
+        )
+
+    if not obs.seed_inputs:
+        checks = [Check("seed_inputs", None, "no seed inputs - cannot anchor")]
+        return BehavioralVerdict(
+            UNVERIFIED,
+            "function",
+            checks,
+            evidence=_summarize(UNVERIFIED, target, checks),
+            target=target,
+        )
+    if not relations:
+        checks = [Check("relations", None, "no whitelisted relations resolved")]
+        return BehavioralVerdict(
+            UNVERIFIED,
+            "function",
+            checks,
+            evidence=_summarize(UNVERIFIED, target, checks),
+            target=target,
+        )
+
+    result = mm.check(
+        fn,
+        copy.deepcopy(obs.seed_inputs),
+        relations,
+        check_immutability=True,
+    )
+    if result.checks == 0:
+        checks = [Check("relations_exercised", None, "no metamorphic relation ran")]
+    else:
+        checks = []
+        for name, slot in result.per_relation.items():
+            violations = int(slot.get("violations", 0))
+            relation_counterexamples = [
+                counterexample
+                for counterexample in result.counterexamples
+                if counterexample.get("relation") == name
+            ]
+            if violations:
+                detail = (
+                    f"{violations} violation(s) across {slot.get('checks', 0)} check(s); "
+                    f"counterexamples={json.dumps(relation_counterexamples, sort_keys=True)}"
+                )
+            else:
+                detail = f"{slot.get('checks', 0)} check(s) passed"
+            checks.append(Check(name, violations == 0, detail))
+
+        relation_checks = sum(
+            int(slot.get("checks", 0))
+            for name, slot in result.per_relation.items()
+            if name != "input_immutability"
+        )
+        if relation_checks == 0:
+            checks.append(
+                Check("relations_exercised", None, "all metamorphic relations were skipped")
+            )
+
+    status = _resolve(checks)
+    return BehavioralVerdict(
+        status,
+        "function",
+        checks,
+        evidence=_summarize(status, target, checks),
+        target=target,
+    )
 
 
 def run_api_check(obs: Observable, *, requester: Requester | None = None) -> BehavioralVerdict:
@@ -888,6 +1086,15 @@ def _csv(raw: str) -> list[str]:
     return [x for x in (s.strip() for s in raw.split(",")) if x]
 
 
+def _json_seed_inputs(raw: str) -> Any:
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ObservableError(
+            f"MO_BEHAV_SEED_INPUTS must be valid JSON: {exc.msg}"
+        ) from exc
+
+
 def observable_from_env(env: Mapping[str, str] | None = None) -> Observable | None:
     """Build an Observable from the environment, or None if none is declared.
 
@@ -911,6 +1118,12 @@ def observable_from_env(env: Mapping[str, str] | None = None) -> Observable | No
             "method": source.get("MO_BEHAV_METHOD", "GET"),
             "expect_status": _int_list(source.get("MO_BEHAV_EXPECT_STATUS", "200")),
             "metamorphic": _csv(source.get("MO_BEHAV_METAMORPHIC", "")),
+            "module": source.get("MO_BEHAV_MODULE", ""),
+            "function": source.get("MO_BEHAV_FUNCTION", ""),
+            "seed_inputs": _json_seed_inputs(
+                source.get("MO_BEHAV_SEED_INPUTS", "[]")
+            ),
+            "relations": _csv(source.get("MO_BEHAV_RELATIONS", "")),
         }
     )
 
@@ -958,6 +1171,7 @@ def main(argv: list[str] | None = None, *, requester: Requester | None = None) -
 register_surface_handler("api", run_api_check)
 register_surface_handler("ui", run_ui_check)
 register_surface_handler("journey", run_journey_check)
+register_surface_handler("function", run_function_check)
 
 
 if __name__ == "__main__":
