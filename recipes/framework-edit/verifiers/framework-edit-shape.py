@@ -128,7 +128,7 @@ def _lane_bindings_verbatim():
         "planner": "decomposer",
         "code_impact_lens": "kimi_lens",
         "prior_art_lens": "codex_lens",
-        "implementer": "minimax_lens",
+        "implementer": "codex_lens",
         "static_check_verifier": "verifier",
         "test_verifier": "verifier",
         "reviewer": "opus_lens",
