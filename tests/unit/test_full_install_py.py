@@ -35,6 +35,7 @@ def test_package_declares_core_and_full_runtime_dependencies():
         "fastapi>=0.110",
         "uvicorn[standard]>=0.29",
         "verifiers>=0.2.0,<0.3",
+        "gepa>=0.1.4,<0.2",
     ]
 
 
