@@ -505,6 +505,15 @@ logs, code paths, benchmark deltas, and arXiv references).
            "MINI_ORK_RECIPE": "recursive-self-improve", "MINI_ORK_SELF_IMPROVE_ITER": str(it),
            "MINI_ORK_SELF_IMPROVE_WORKTREE": wt_path, "MINI_ORK_TIMESTAMP": ts,
            "MO_ALLOW_FRAMEWORK_CWD": "1",
+           # Skip the outer planner LLM — recursive-self-improve's workflow is
+           # fully declared in workflow.yaml + artifact_contract.yaml, so
+           # `recipe_fallback_plan` synthesizes the identical plan deterministically
+           # with zero opus dispatch. Opting in here removes an entire failure
+           # mode (opus returning a preamble instead of a strict JSON envelope →
+           # `dispatch result failed shape check (looks_like_json)` → iter dies at
+           # workflow step 1 before any lens, implementer, or verifier runs).
+           # Caller can force the LLM planner back with MO_STATIC_RECIPE_PLAN=0.
+           "MO_STATIC_RECIPE_PLAN": os.environ.get("MO_STATIC_RECIPE_PLAN", "1"),
            "MO_RUNTIME_BACKEND": os.environ.get("MO_RUNTIME_BACKEND", "bubblewrap")}
     def _default_dispatch(wt, kickoff, log, timeout_s, e):
         with open(log, "wb") as fh:
