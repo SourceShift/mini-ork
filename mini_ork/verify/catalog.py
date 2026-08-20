@@ -35,7 +35,7 @@ __all__ = [
 
 
 _KIND_ENUM = ("behavioral", "deterministic", "reviewer", "llm_judge", "external")
-_SURFACE_ENUM = ("api", "ui", "journey", "")
+_SURFACE_ENUM = ("api", "ui", "journey", "function", "")
 
 
 @dataclass(frozen=True)
@@ -70,7 +70,7 @@ class VerifierCard:
 
     ``recipe`` is a path to a dedicated per-verifier recipe (empty string
     means the verifier has no dedicated recipe). ``surface`` is the
-    behavioral surface (``api``/``ui``/``journey``) or ``""`` for
+    behavioral surface (``api``/``ui``/``journey``/``function``) or ``""`` for
     non-behavioral verifiers. ``cost`` is a unitless 0.0+ number used in
     the IRT-GRM-inspired score.
     """
