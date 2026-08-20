@@ -116,5 +116,8 @@ claude_code_zai_env.sh
 
 !.mini-ork/engine
 
+# Self-improve iter artifact written to the repo root by recursive-self-improve.
+.mini-ork-iter-report.md
+
 tests/ui/snapshots/*.png
 tests/ui/test-results/
