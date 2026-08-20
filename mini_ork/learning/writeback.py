@@ -198,7 +198,8 @@ def write_grpo_advantages(db) -> int:
     try:
         rows = con.execute(
             "SELECT trace_id, task_class, agent_version_id, verifier_output, status, "
-            "reviewer_verdict, cost_usd, duration_ms, process_reward, created_at "
+            "reviewer_verdict, cost_usd, duration_ms, process_reward, created_at, "
+            "COALESCE(validity, 'valid') AS validity "
             "FROM execution_traces WHERE task_class IS NOT NULL AND task_class <> '' "
             "AND agent_version_id IS NOT NULL AND agent_version_id <> ''").fetchall()
     except sqlite3.OperationalError:
@@ -267,7 +268,17 @@ def write_grpo_advantages(db) -> int:
             delta = 0.0
         return max(0.0, min(1.0, base + delta))
 
-    weight_rows = [(row, reward(row), recency_weight(row["created_at"])) for row in rows]
+    def _row_is_valid(row):
+        # Reward hygiene: rows stamped non-'valid' are INFRA exits (timeout /
+        # cost-circuit) the agent never controlled. Drop them ENTIRELY — not
+        # zero-weight — so they perturb neither the group mean/variance nor the
+        # cost-span tie-break. NULL/empty (legacy rows predating the stamp) count
+        # as valid so the historical corpus stays in the learning signal.
+        v = row["validity"]
+        return not v or str(v).strip().lower() == "valid"
+
+    weight_rows = [(row, reward(row), recency_weight(row["created_at"]))
+                   for row in rows if _row_is_valid(row)]
     groups = {}
     for row, score, w in weight_rows:
         groups.setdefault((node_type(row), row["task_class"]), []).append((row, score, w))

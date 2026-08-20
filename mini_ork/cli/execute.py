@@ -90,6 +90,23 @@ def finish_reason_for_failure(rc, text: str = "") -> str:
     return "error"
 
 
+# Reward hygiene: finish_reasons that mark an INFRA exit the agent never
+# controlled — a watchdog timeout or a cost-circuit trip. A node that aborts
+# for one of these never got a fair chance to produce a fix, so its low reward
+# must not enter the group-relative advantage the learning loop trains on
+# (see mini_ork/learning/writeback.py). These two reasons only ever accompany a
+# forced abort, never a capability outcome, so keying on them alone is safe.
+# Genuine capability failures (test-red / apply-fail / reviewer reject) carry
+# finish_reason 'error' and stay learnable. lane-fuse (rc43) currently collapses
+# into 'error' upstream and empty-text rc=0 lanes trace as success — both are a
+# finer detection problem deferred to the layered-reward slice.
+_NON_LEARNABLE_FINISH_REASONS = frozenset({"timeout", "cost_limit"})
+
+
+def is_non_learnable_exit(finish_reason: str) -> bool:
+    return (str(finish_reason) or "").lower() in _NON_LEARNABLE_FINISH_REASONS
+
+
 def infer_trace_code_region(payload: str) -> str:
     """files_written → the top-level dir of the first in-repo relative file
     ('(root)' for root-level files). Verbatim transcription of the bash's
@@ -1737,6 +1754,13 @@ def _make_trace_fn(task_class, db, run_id):
             extra["reviewer_verdict"] = verdict
         if finish_reason:
             extra["finish_reason"] = finish_reason
+        # Reward hygiene: mark infra exits (timeout / cost-circuit) non-'valid'
+        # so writeback drops them from the group-relative advantage instead of
+        # filing a low reward that drags the group mean down and hands undeserved
+        # advantage to whichever lane had healthy groupmates. Default stays
+        # 'valid' (trace_store) for every genuine capability outcome.
+        if is_non_learnable_exit(finish_reason):
+            extra["validity"] = "infra_failed"
         # Reward stamp (bash:1812-1815): activates the GRPO shared-brain loop.
         if os.environ.get("MO_REWARD_STAMP", "1") == "1":
             rv = reward_from_status(status, verdict)
