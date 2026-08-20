@@ -62,6 +62,9 @@ importers:
       framer-motion:
         specifier: 12.38.0
         version: 12.38.0(react-dom@19.2.5(react@19.2.5))(react@19.2.5)
+      hast-util-sanitize:
+        specifier: 5.0.2
+        version: 5.0.2
       httpxy:
         specifier: 0.5.3
         version: 0.5.3
@@ -137,6 +140,9 @@ importers:
       tailwind-scrollbar:
         specifier: 4.0.2
         version: 4.0.2(react@19.2.5)(tailwindcss@4.2.4)
+      unified:
+        specifier: 11.0.5
+        version: 11.0.5
       unist-util-visit:
         specifier: 5.1.0
         version: 5.1.0
