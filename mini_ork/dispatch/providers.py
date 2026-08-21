@@ -347,15 +347,16 @@ def _resolve_from_registry(
                 env=env,
                 unset_env=spec.unset_env,
             )
-    if kind in {"anthropic-compat", "openai-compat"}:
+    if kind in {"anthropic-compat", "openai-compat", "openai-chat"}:
         api_key_env = str(entry.get("api_key_env") or "")
         if api_key_env:
             env = dict(spec.env)
             if kind == "anthropic-compat":
                 env["ANTHROPIC_AUTH_TOKEN"] = runtime.get(api_key_env, "")
             else:
-                # cl_codex.sh reads the name in MO_OAI_ENV_KEY from its own
-                # process environment, so retain the actual key as well.
+                # The openai-compat/openai-chat transports read the key by the
+                # NAME in MO_OAI_ENV_KEY from their own process environment, so
+                # retain the actual key value under that name too.
                 if api_key := runtime.get(api_key_env):
                     env[api_key_env] = api_key
             return ProviderSpec(
@@ -457,6 +458,34 @@ def _build_openai_compat(name, entry, root, extra_env, model_id) -> ProviderSpec
     )
 
 
+def _build_openai_chat(name, entry, root, extra_env, model_id) -> ProviderSpec:
+    """OpenAI-*compatible* ``/chat/completions`` endpoints (OpenRouter, Groq,
+    Together, local vLLM). Unlike ``openai-compat`` — which routes through the
+    codex CLI and now REQUIRES OpenAI's proprietary ``wire_api = "responses"`` —
+    this kind speaks the plain chat wire over HTTP via a self-contained
+    stdlib transport, so any chat endpoint works again."""
+    base_url = entry.get("base_url")
+    if not isinstance(base_url, str) or not base_url:
+        raise ValueError(f"provider {name!r} missing required field 'base_url'")
+    api_key_env = entry.get("api_key_env")
+    if not isinstance(api_key_env, str) or not api_key_env:
+        raise ValueError(f"provider {name!r} missing required field 'api_key_env'")
+    del root
+    env = {
+        "MO_OAI_BASE_URL": base_url,
+        "MO_OAI_ENV_KEY": api_key_env,
+    }
+    if model_id:
+        env["MO_OAI_MODEL"] = model_id
+    env.update(extra_env)
+    script = Path(__file__).resolve().parent / "openai_chat_transport.py"
+    return ProviderSpec(
+        model=name,
+        command=(sys.executable, str(script), "--print", "--output-format", "text"),
+        env=env,
+    )
+
+
 def _codex_transport_command() -> tuple[str, ...]:
     return (
         sys.executable,
@@ -512,6 +541,7 @@ PROVIDER_KIND_BUILDERS: dict[str, Callable[..., ProviderSpec]] = {
     "anthropic-native": _build_anthropic_native,
     "anthropic-compat": _build_anthropic_compat,
     "openai-compat": _build_openai_compat,
+    "openai-chat": _build_openai_chat,
     "codex-native": _build_codex_native,
     "opencode-native": _build_opencode_native,
     "executable": _build_executable_script,
@@ -589,7 +619,7 @@ def required_secret_envs(
     entry = registry.get(model)
     if not isinstance(entry, Mapping):
         raise ValueError(f"unknown lane: {model!r}")
-    if entry.get("kind") in {"anthropic-compat", "openai-compat"}:
+    if entry.get("kind") in {"anthropic-compat", "openai-compat", "openai-chat"}:
         api_key_env = entry.get("api_key_env")
         if isinstance(api_key_env, str) and api_key_env:
             return (api_key_env,)
@@ -614,6 +644,7 @@ def lane_health(
     if isinstance(entry, Mapping) and entry.get("kind") in {
         "anthropic-compat",
         "openai-compat",
+        "openai-chat",
     }:
         api_key_env = entry["api_key_env"]
         if not runtime.get(str(api_key_env)):
