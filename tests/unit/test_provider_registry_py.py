@@ -2,7 +2,8 @@
 
 from pathlib import Path
 
-from mini_ork.dispatch.providers import lane_health, resolve_provider
+from mini_ork.context import run_context_scope
+from mini_ork.dispatch.providers import lane_health, mini_ork_root, resolve_provider
 
 
 REGISTRY = """
@@ -69,3 +70,23 @@ def test_unknown_registry_lane_fails_closed(tmp_path, monkeypatch):
     health = lane_health("no_such_provider", root)
     assert not health.ok
     assert "unknown lane" in health.reason
+
+
+def test_mini_ork_root_reads_run_context_over_process_env(tmp_path, monkeypatch):
+    """Bottleneck #1 slice 2a: a migrated dispatch reader honors the per-run
+    contextvar binding when set, and falls back to os.environ otherwise —
+    proving isolation is wired without regressing the legacy env path."""
+    scoped = tmp_path / "scoped"
+    from_env = tmp_path / "from_env"
+    scoped.mkdir()
+    from_env.mkdir()
+    monkeypatch.setenv("MINI_ORK_ROOT", str(from_env))
+
+    # No binding → falls back to the process env (behavior-preserving).
+    assert mini_ork_root() == from_env.resolve()
+
+    # A run-scoped binding wins over the leaked process value…
+    with run_context_scope({"MINI_ORK_ROOT": str(scoped)}):
+        assert mini_ork_root() == scoped.resolve()
+    # …and the fallback is restored on scope exit.
+    assert mini_ork_root() == from_env.resolve()

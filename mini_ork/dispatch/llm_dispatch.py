@@ -23,6 +23,7 @@ import sys
 import time
 from collections.abc import Callable
 
+from mini_ork.context import context_env
 from mini_ork.dispatch.predicates import looks_like_json
 
 
@@ -189,8 +190,8 @@ def resolve_lane_family(lane: str, root: str = "", home: str = "") -> str:
     real family model, keeping the tail as a genuine fallback."""
     if not lane:
         return lane
-    root = root or os.environ.get("MINI_ORK_ROOT", "")
-    home = home or os.environ.get("MINI_ORK_HOME", "")
+    root = root or context_env("MINI_ORK_ROOT")
+    home = home or context_env("MINI_ORK_HOME")
     agents = os.path.join(home, "config", "agents.yaml")
     if not os.path.isfile(agents):
         agents = os.path.join(root, "config", "agents.yaml")
@@ -273,7 +274,7 @@ def write_llm_calls_row(db, provider, model_id, tier, feature_name, actor, statu
     values = [provider, model_id, tier, feature_name, actor,
               status, _int_or(duration_ms, 0), float(cost_usd or 0.0), error_message or None,
               _int_or(os.environ.get("MO_RECURSIVE_ITER"), None),
-              os.environ.get("MINI_ORK_RUN_ID") or None, os.environ.get("MO_TRACEPARENT") or None,
+              context_env("MINI_ORK_RUN_ID") or None, os.environ.get("MO_TRACEPARENT") or None,
               in_tok, out_tok, in_tok + out_tok, metadata_json or "{}", _sess]
     for name, val in (("error_category", error_category), ("retryable", retryable),
                       ("cached_input_tokens", cached_in),
@@ -360,9 +361,9 @@ def _shape_predicate_for(node_type: str) -> Callable[[object], bool] | None:
 
 def llm_dispatch(argv=None, *, root=None, dispatch_fn=None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
-    root = root or os.environ.get("MINI_ORK_ROOT") or os.getcwd()
-    home = os.environ.get("MINI_ORK_HOME") or os.path.join(os.getcwd(), ".mini-ork")
-    db = os.environ.get("MINI_ORK_DB") or os.path.join(home, "state.db")
+    root = root or context_env("MINI_ORK_ROOT") or os.getcwd()
+    home = context_env("MINI_ORK_HOME") or os.path.join(os.getcwd(), ".mini-ork")
+    db = context_env("MINI_ORK_DB") or os.path.join(home, "state.db")
     # A test/caller-supplied dispatch_fn keeps the historic 5-arg contract and
     # must never receive the A.2 accept= kwarg; only the default dispatcher does.
     _default_dispatch = dispatch_fn is None
@@ -493,7 +494,7 @@ def llm_dispatch(argv=None, *, root=None, dispatch_fn=None) -> int:
             in_tok, out_tok, cached_in, cache_create = (_int_or(p, 0) for p in parts)
         write_llm_calls_row(db, provider, selected_model, tier, feature, actor, "success",
                             duration_ms, cost_usd, "", in_tok, out_tok, "{}", cached_in, cache_create)
-        run_dir = os.environ.get("MINI_ORK_RUN_DIR", "")
+        run_dir = context_env("MINI_ORK_RUN_DIR")
         if os.path.isfile(out_file + ".cost") and run_dir:
             try:
                 open(os.path.join(run_dir, ".last-llm-cost"), "w").write(open(out_file + ".cost").read())
@@ -535,7 +536,7 @@ def llm_dispatch(argv=None, *, root=None, dispatch_fn=None) -> int:
 
 
 def _write_duration_ms(ms):
-    rd = os.environ.get("MINI_ORK_RUN_DIR", "")
+    rd = context_env("MINI_ORK_RUN_DIR")
     if not rd:
         return
     try:
