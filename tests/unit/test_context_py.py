@@ -1,10 +1,14 @@
 """Unit tests for mini_ork.context — the canonical env contract."""
+import asyncio
 import os
+import threading
 
 from mini_ork.context import (
     RunContext,
     apply_env_overrides,
+    context_env,
     node_env_overrides,
+    run_context_scope,
     scoped_environ,
 )
 
@@ -85,3 +89,73 @@ def test_scoped_environ_restores(monkeypatch):
         assert os.environ["SCOPED_B"] == "new"
     assert os.environ["SCOPED_A"] == "orig"
     assert "SCOPED_B" not in os.environ
+
+
+# ── Per-run isolation layer (contextvars) ────────────────────────────────────
+
+
+def test_context_env_falls_back_to_os_environ(monkeypatch):
+    monkeypatch.setenv("MINI_ORK_RUN_ID", "run-123")
+    # nothing bound in this context → transparent fall-through to process env
+    assert context_env("MINI_ORK_RUN_ID") == "run-123"
+    assert context_env("NEVER_SET_XYZ", "dflt") == "dflt"
+
+
+def test_run_context_scope_binds_and_restores(monkeypatch):
+    monkeypatch.delenv("MO_NODE_ID", raising=False)
+    with run_context_scope({"MO_NODE_ID": "n1"}):
+        assert context_env("MO_NODE_ID") == "n1"
+        # binding lives in the contextvar, NOT the process env
+        assert "MO_NODE_ID" not in os.environ
+    assert context_env("MO_NODE_ID", "gone") == "gone"
+
+
+def test_run_context_scope_nests():
+    with run_context_scope({"MO_NODE_ID": "outer", "MO_DISPATCH_CHAIN": "a"}):
+        assert context_env("MO_NODE_ID") == "outer"
+        with run_context_scope({"MO_NODE_ID": "inner"}):
+            assert context_env("MO_NODE_ID") == "inner"
+            # sibling key from the outer scope still visible
+            assert context_env("MO_DISPATCH_CHAIN") == "a"
+        assert context_env("MO_NODE_ID") == "outer"
+
+
+def test_context_env_masks_none_binding(monkeypatch):
+    # a stale value leaked in the process env must not resurface when masked
+    monkeypatch.setenv("MO_RESUME_SESSION_ID", "stale-sess")
+    with run_context_scope({"MO_RESUME_SESSION_ID": None}):
+        assert context_env("MO_RESUME_SESSION_ID", "fresh") == "fresh"
+    # scope exit restores the fall-through to the process env
+    assert context_env("MO_RESUME_SESSION_ID") == "stale-sess"
+
+
+def test_run_context_scope_isolates_across_threads(monkeypatch):
+    monkeypatch.delenv("MO_NODE_ID", raising=False)
+    results: dict[str, str] = {}
+    barrier = threading.Barrier(2)
+
+    def worker(name: str) -> None:
+        with run_context_scope({"MO_NODE_ID": name}):
+            barrier.wait()  # hold both scopes live simultaneously
+            results[name] = context_env("MO_NODE_ID")
+
+    threads = [threading.Thread(target=worker, args=(n,)) for n in ("a", "b")]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert results == {"a": "a", "b": "b"}
+    assert "MO_NODE_ID" not in os.environ  # global env never touched
+
+
+def test_run_context_scope_isolates_across_asyncio_tasks():
+    async def worker(name: str) -> str:
+        with run_context_scope({"MO_NODE_ID": name}):
+            await asyncio.sleep(0)  # yield so the two tasks interleave
+            return context_env("MO_NODE_ID")
+
+    async def main() -> list[str]:
+        return list(await asyncio.gather(worker("task-a"), worker("task-b")))
+
+    assert asyncio.run(main()) == ["task-a", "task-b"]
