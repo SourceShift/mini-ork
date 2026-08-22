@@ -17,6 +17,7 @@ from pathlib import Path
 
 import yaml
 
+from ..context import context_env
 from .core import dispatch
 from .models import DispatchRequest, DispatchResult, TokenUsage
 from .secrets import SecretStoreError, read_secret_exports, secret_store_path
@@ -269,7 +270,7 @@ def mini_ork_root(root: str | os.PathLike[str] | None = None) -> Path:
     """Repo root: explicit arg → $MINI_ORK_ROOT → package parent."""
     if root is not None:
         return Path(root).resolve()
-    env = os.environ.get("MINI_ORK_ROOT")
+    env = context_env("MINI_ORK_ROOT")
     if env:
         return Path(env).resolve()
     return Path(__file__).resolve().parents[2]
@@ -281,7 +282,7 @@ def _load_providers_registry(
     candidates: list[Path] = []
     if override := os.environ.get("MINI_ORK_PROVIDERS"):
         candidates.append(Path(override))
-    home = Path(os.environ.get("MINI_ORK_HOME", ".mini-ork"))
+    home = Path(context_env("MINI_ORK_HOME", ".mini-ork"))
     candidates.append(home / "config" / "providers.yaml")
     candidates.append(mini_ork_root(root) / "config" / "providers.yaml")
 
@@ -821,8 +822,8 @@ def _stash_session_id(session_id: str, env: Mapping[str, str]) -> None:
     MO_NODE_ID which the execute loop sets before every node dispatch."""
     if not session_id:
         return
-    run_dir = env.get("MINI_ORK_RUN_DIR") or os.environ.get("MINI_ORK_RUN_DIR") or ""
-    node_id = env.get("MO_NODE_ID") or os.environ.get("MO_NODE_ID") or ""
+    run_dir = env.get("MINI_ORK_RUN_DIR") or context_env("MINI_ORK_RUN_DIR")
+    node_id = env.get("MO_NODE_ID") or context_env("MO_NODE_ID")
     if not run_dir or not node_id:
         return
     try:
