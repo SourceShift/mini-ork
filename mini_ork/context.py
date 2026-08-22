@@ -13,6 +13,12 @@ single source of truth for that contract:
   mutate process env: overrides are explicit mappings where ``None`` means
   "remove", and ``scoped_environ`` restores prior state for scopes that must
   not leak.
+- ``run_context_scope`` / ``context_env`` are the per-run isolation layer:
+  overrides live in a ``contextvars.ContextVar`` (isolated per thread and per
+  asyncio task) instead of the process-global ``os.environ``, so two runs can
+  share one process without clobbering each other's variables. Readers fall
+  back to ``os.environ`` for any key not bound in the current context, so the
+  migration off the global env message bus can proceed incrementally.
 
 Behavioral note: several consumers (in-process ``dispatch_fn`` seams, the
 provider layer, and parity tests) intentionally read ``os.environ`` *during*
@@ -23,6 +29,7 @@ declared once, here, instead of being re-derived at every call site.
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import os
 from dataclasses import dataclass, field
 from typing import Iterator, Mapping, MutableMapping
@@ -188,3 +195,58 @@ def scoped_environ(
                 env.pop(key, None)
             else:
                 env[key] = value  # type: ignore[assignment]
+
+
+# ── Per-run isolation layer (contextvars) ────────────────────────────────────
+#
+# ``scoped_environ`` restores prior state but still mutates the *process-global*
+# ``os.environ`` inside the block, so two runs sharing one process still clobber
+# each other's ``MINI_ORK_*``/``MO_*`` variables — the concurrency ceiling. This
+# layer holds run-scoped overrides in a ``contextvars.ContextVar`` instead, which
+# isolates per-OS-thread AND per-asyncio-task (a new Task runs in a copy of the
+# context at creation), so concurrent runs never see one another's values.
+#
+# Migration is incremental: writers bind via ``run_context_scope`` and readers
+# read via ``context_env``, which falls back to ``os.environ`` for any key not
+# yet bound in the current context — so unmigrated readers/writers keep working.
+
+_RUN_CONTEXT_VARS: contextvars.ContextVar[Mapping[str, str | None]] = (
+    contextvars.ContextVar("mini_ork_run_context", default={})
+)
+
+
+@contextlib.contextmanager
+def run_context_scope(overrides: Mapping[str, str | None]) -> Iterator[None]:
+    """Bind run-scoped variables for the current execution context only.
+
+    Unlike ``scoped_environ`` (which mutates the process-global ``os.environ``),
+    this layers ``overrides`` onto a ``contextvars.ContextVar`` — so concurrent
+    threads / asyncio tasks each keep their own values and never clobber one
+    another. ``None`` masks a key: ``context_env`` then returns its ``default``
+    rather than the process-env fallback (matching ``apply_env_overrides``'s
+    "None means remove"). Nested scopes accumulate; on exit the prior binding is
+    restored via the contextvar token.
+    """
+    merged: dict[str, str | None] = dict(_RUN_CONTEXT_VARS.get())
+    merged.update(overrides)
+    token = _RUN_CONTEXT_VARS.set(merged)
+    try:
+        yield
+    finally:
+        _RUN_CONTEXT_VARS.reset(token)
+
+
+def context_env(key: str, default: str = "") -> str:
+    """Read a run-scoped variable: contextvar binding first, else ``os.environ``.
+
+    The read half of the isolation contract. A key bound in the current context
+    via ``run_context_scope`` wins; a key bound to ``None`` is masked and returns
+    ``default`` (it does NOT fall through to the process env, so a stale leaked
+    value can't resurface). Any key not bound in the current context falls back
+    to ``os.environ`` so unmigrated writers keep working during migration.
+    """
+    overrides = _RUN_CONTEXT_VARS.get()
+    if key in overrides:
+        value = overrides[key]
+        return default if value is None else value
+    return os.environ.get(key, default)
