@@ -513,7 +513,6 @@ def llm_dispatch(argv=None, *, root=None, dispatch_fn=None) -> int:
                 pass
         return 0
 
-    os.environ["MO_LLM_LAST_RC"] = str(rc)
     _write_duration_ms(0)
     err = ""
     try:
