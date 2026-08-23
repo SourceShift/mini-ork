@@ -14,7 +14,7 @@ import shutil
 import subprocess
 import sys
 
-from mini_ork.context import apply_env_overrides
+from mini_ork.context import context_env, publish_env
 
 
 def set_status(db, run_id, new_status):  # late binding — avoids the execute<->publisher cycle
@@ -26,7 +26,7 @@ def _envsubst(s):
     unset vars (os.path.expandvars leaves them literal, which commits garbage
     ${VAR}-in-path files, the OSS-leak-garbage class the bash guard prevents)."""
     return re.sub(r'\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)',
-                  lambda m: os.environ.get(m.group(1) or m.group(2), ''), s)
+                  lambda m: context_env(m.group(1) or m.group(2)), s)
 
 
 
@@ -203,7 +203,7 @@ def publisher_node(root, run_dir, db, run_id, recipe, task_class, review_file=""
         chosen = os.path.join(run_dir, "chosen", "recipe_name")
         if os.path.isfile(chosen):
             try:
-                apply_env_overrides({
+                publish_env({
                     "MINI_ORK_DERIVED_RECIPE_NAME": "".join(open(chosen).read().split())})
             except OSError:
                 pass

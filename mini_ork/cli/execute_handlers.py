@@ -7,6 +7,7 @@ in this module is explicitly re-exported by ``execute``.
 from __future__ import annotations
 
 import contextlib
+import functools
 import io
 import json
 import os
@@ -22,6 +23,9 @@ from mini_ork.context import (
     ENV_RESUME_SESSION_ID,
     ENV_RUN_DIR,
     ENV_TARGET_CWD,
+    context_env,
+    publish_env,
+    run_context_scope,
 )
 
 
@@ -79,6 +83,25 @@ policy_route_lane = _execute_delegate("policy_route_lane")
 publisher_node = _execute_delegate("publisher_node")
 
 
+def _node_publish_boundary(fn):
+    """Own the per-node isolation boundary (bottleneck #1).
+
+    Everything dispatch_node dual-publishes into the run-context layer is wiped
+    when the node call returns, so bindings can never leak into the caller's
+    context — a bare publish_env outside a boundary would otherwise persist for
+    the process lifetime and shadow os.environ for every later reader (tests,
+    SDK embedders, sequential runs in one process). Run-level bindings published
+    by the enclosing run flow (FAIL_COUNT, recovery markers) remain visible via
+    the context-copy semantics of the scope.
+    """
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        with run_context_scope({}):
+            return fn(*args, **kwargs)
+    return wrapper
+
+
+@_node_publish_boundary
 def dispatch_node(fields, *, root, run_dir, plan_path, task_class, db, run_id,
                   dispatch_fn, recipe="", workflow="", trace_fn=None,
                   checkpoint_fn=None):
@@ -113,7 +136,7 @@ def dispatch_node(fields, *, root, run_dir, plan_path, task_class, db, run_id,
         # trace write. The wrapper unifies node-completion side effects so
         # E2's recovery code can rely on every success also having a row.
         _base_checkpoint(node_id, status, node_type, output_file)
-    run_dir_eff = os.environ.get("MINI_ORK_RUN_DIR", run_dir)
+    run_dir_eff = context_env(ENV_RUN_DIR, run_dir)
     # Node prompts and subprocess verifiers refer to MINI_ORK_RUN_DIR as their
     # artifact namespace. ``mini-ork run`` can derive the directory from the
     # plan without exporting it, so publish the resolved value at the node
@@ -121,7 +144,7 @@ def dispatch_node(fields, *, root, run_dir, plan_path, task_class, db, run_id,
     # Publish the resolved run directory at the node boundary before any
     # provider or verifier subprocess is invoked (canonical contract:
     # mini_ork.context).
-    apply_env_overrides({ENV_RUN_DIR: run_dir_eff})
+    publish_env({ENV_RUN_DIR: run_dir_eff})
 
     # The artifact ledger is a semantic boundary, not a replacement for an OS
     # sandbox: it records exactly what the recipe declares, validates integrity
@@ -145,7 +168,7 @@ def dispatch_node(fields, *, root, run_dir, plan_path, task_class, db, run_id,
                 artifact_ledger = ArtifactLedger(run_dir_eff, run_id)
                 prepared_inputs = artifact_ledger.prepare_inputs(compiled_workflow, node_id)
                 artifact_context = artifact_ledger.prompt_context(prepared_inputs)
-                apply_env_overrides({
+                publish_env({
                     "MINI_ORK_NODE_INPUT_MANIFEST": str(prepared_inputs.manifest_path),
                     "MINI_ORK_NODE_INPUT_DIR": str(prepared_inputs.input_root),
                 })
@@ -159,7 +182,7 @@ def dispatch_node(fields, *, root, run_dir, plan_path, task_class, db, run_id,
             print(f"  [artifact] node_id={node_id}: unexpected artifact setup failure: {exc}", file=sys.stderr)
             return 1, "config"
     else:
-        apply_env_overrides({
+        publish_env({
             "MINI_ORK_NODE_INPUT_MANIFEST": None,
             "MINI_ORK_NODE_INPUT_DIR": None,
         })
@@ -176,7 +199,7 @@ def dispatch_node(fields, *, root, run_dir, plan_path, task_class, db, run_id,
     # dispatch backend routes around a hung/flaky lead lane (bash:2224-2225, NEW-5).
     from mini_ork.dispatch.llm_dispatch import resolve_lane_family
     _chain_lead = resolve_lane_family(lane)
-    apply_env_overrides({ENV_DISPATCH_CHAIN: dispatch_chain(node_type, _chain_lead)})
+    publish_env({ENV_DISPATCH_CHAIN: dispatch_chain(node_type, _chain_lead)})
 
     # ── Pre-dispatch gates, in bash _dispatch_node order (:2231-2318). These run
     # for every real dispatch; the dry-run preview path is _dry_dispatch_node. ──
@@ -228,7 +251,7 @@ def dispatch_node(fields, *, root, run_dir, plan_path, task_class, db, run_id,
     learned = _learned_block(root, task_class, node_type)
     # Publish the per-node identity + clear any stale resume session in one
     # canonical step (None removes the variable).
-    apply_env_overrides(node_env_overrides(
+    publish_env(node_env_overrides(
         node_id=node_id, run_dir=run_dir_eff, resume_session_id=None))
 
     # (E4 turn-resume) During an active recovery, restore this node's persisted
@@ -237,16 +260,16 @@ def dispatch_node(fields, *, root, run_dir, plan_path, task_class, db, run_id,
     # instead of starting the node over. Strictly recovery-scoped and fail-soft:
     # off recovery, for codex/gemini, or with no session it is a no-op and the
     # node runs normally.
-    if (os.environ.get("MINI_ORK_RECOVERY_CLOSURE", "").strip()
-            or os.environ.get("MINI_ORK_RECOVERY_FROM", "").strip()):
+    if (context_env("MINI_ORK_RECOVERY_CLOSURE").strip()
+            or context_env("MINI_ORK_RECOVERY_FROM").strip()):
         try:
             from mini_ork.recovery.resume_prep import prepare_node_resume  # noqa: PLC0415
             _resume_sid = prepare_node_resume(
                 db, run_id, node_id, run_dir=run_dir, model=lane,
-                cwd=os.environ.get("MO_TARGET_CWD") or None,
+                cwd=context_env(ENV_TARGET_CWD) or None,
             )
             if _resume_sid:
-                apply_env_overrides({ENV_RESUME_SESSION_ID: _resume_sid})
+                publish_env({ENV_RESUME_SESSION_ID: _resume_sid})
                 print(f"  [resume] node_id={node_id} continuing session "
                       f"{_resume_sid[:12]}… via --resume", file=sys.stderr)
         except Exception as e:  # noqa: BLE001 — resume is best-effort
@@ -484,7 +507,7 @@ def _handle_implementer(ctx: NodeDispatch):
     # run shares one virtual drive (lazy import keeps the seam side-effect-free).
     from mini_ork.runtime.run_drive import resolve_run_drive_cwd
     target = resolve_run_drive_cwd(target)
-    apply_env_overrides({ENV_TARGET_CWD: target})
+    publish_env({ENV_TARGET_CWD: target})
     print(f"  [cwd] codex target: {target}", file=sys.stderr)
 
     # R5b: the opt-in minimal scaffold is a real executor behavior, not

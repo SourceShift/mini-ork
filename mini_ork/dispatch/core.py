@@ -30,6 +30,7 @@ import subprocess
 import time
 from collections.abc import Callable, Mapping, Sequence
 
+from ..context import context_env_snapshot
 from .models import DispatchRequest, DispatchResult, TokenUsage
 
 # Parser callables turn a provider's stdout into structured telemetry. They are
@@ -158,7 +159,7 @@ def dispatch(
     failure) and the captured stderr in ``error`` — the caller always gets a
     structured result, never an exception to wrangle.
     """
-    proc_env = dict(os.environ)
+    proc_env = context_env_snapshot()
     if request.env:
         proc_env.update({str(k): str(v) for k, v in request.env.items()})
 
