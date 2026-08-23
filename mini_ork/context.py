@@ -250,3 +250,42 @@ def context_env(key: str, default: str = "") -> str:
         value = overrides[key]
         return default if value is None else value
     return os.environ.get(key, default)
+
+
+def publish_env(overrides: Mapping[str, str | None]) -> None:
+    """Writer half of the isolation contract: dual-write ``overrides``.
+
+    Binds into the per-run contextvar layer (isolated per thread / asyncio task,
+    visible to every ``context_env`` reader) AND applies to ``os.environ``
+    (legacy readers still read the process env during migration). ``None``
+    means "remove" in both layers, matching ``apply_env_overrides``.
+
+    Bindings accumulate for the life of the current context, so sequential
+    per-node publishes (MO_NODE_ID, MO_TARGET_CWD, …) override cleanly — call
+    this inside a ``run_context_scope`` boundary so everything a run published
+    is wiped when the boundary exits. The ``os.environ`` write deliberately has
+    NO restore: that is the executor's existing leak-forever semantics, kept
+    byte-for-byte so legacy readers observe no behavior change.
+    """
+    merged = dict(_RUN_CONTEXT_VARS.get())
+    merged.update(overrides)
+    _RUN_CONTEXT_VARS.set(merged)
+    apply_env_overrides(overrides)
+
+
+def context_env_snapshot() -> dict[str, str]:
+    """``os.environ`` overlaid with the current run-context bindings.
+
+    The child-process seam: subprocesses receive an explicit env dict, so the
+    overlay is what makes a dispatch spawned by run A inherit A's values even
+    when a concurrent run B raced the process-global ``os.environ``. Masked
+    (``None``) bindings are removed from the snapshot. With nothing bound this
+    is a plain ``os.environ`` copy — behavior-identical pre-migration.
+    """
+    snapshot = dict(os.environ)
+    for key, value in _RUN_CONTEXT_VARS.get().items():
+        if value is None:
+            snapshot.pop(key, None)
+        else:
+            snapshot[key] = value
+    return snapshot

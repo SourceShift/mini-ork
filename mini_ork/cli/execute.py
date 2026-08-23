@@ -53,6 +53,8 @@ from mini_ork.context import (  # noqa: F401 -- compatibility re-exports
     RunContext,
     apply_env_overrides,
     node_env_overrides,
+    publish_env,
+    run_context_scope,
 )
 
 
@@ -569,7 +571,7 @@ def _apply_recovery_filter(node_ids: list[str], *, from_node: str,
         try:
             v = float(repair_budget)
             if v > 0:
-                apply_env_overrides({"MO_REPAIR_BUDGET_USD": f"{v:.2f}"})
+                publish_env({"MO_REPAIR_BUDGET_USD": f"{v:.2f}"})
         except ValueError:
             sys.stderr.write(
                 f"execute: --repair-budget must be a positive number, got {repair_budget!r}\n"
@@ -592,9 +594,9 @@ def _apply_recovery_filter(node_ids: list[str], *, from_node: str,
     ]
     # Mark the run as a recovery dispatch so downstream trace / cost
     # seams can stamp the metadata without re-deriving the closure.
-    apply_env_overrides({"MINI_ORK_RECOVERY_ACTIVE": "1"})
+    publish_env({"MINI_ORK_RECOVERY_ACTIVE": "1"})
     if effective_from:
-        apply_env_overrides({"MINI_ORK_RECOVERY_FROM": effective_from})
+        publish_env({"MINI_ORK_RECOVERY_FROM": effective_from})
     print(
         f"    recovery: from_node={effective_from or '<unset>'} "
         f"closure={len(node_ids)}/{before_count} nodes"
@@ -706,7 +708,9 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
         # D1: bash keeps FAIL_COUNT as a shell var visible to _mo_policy_route_lane's
         # trace_governed branch (:2014). Publish it so the port's policy_route_lane sees
         # the live prefix-failure count (else trace_governed never escalates).
-        apply_env_overrides({"FAIL_COUNT": str(fail_count)})
+        publish_env({"FAIL_COUNT": str(fail_count)})
+        # The per-node isolation boundary lives ON dispatch_node
+        # (_node_publish_boundary) so no caller can publish without it.
         return dispatch_node(field, root=root, run_dir=live_run_dir, plan_path=plan_path,
                                 task_class=task_class, db=db, run_id=run_id,
                                 dispatch_fn=llm, recipe=recipe, workflow=workflow,
@@ -722,7 +726,7 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
                 rc, finish_reason = _dispatch_serial(field)
                 outcomes.append((field, rc, finish_reason))
             return outcomes
-        apply_env_overrides({"FAIL_COUNT": str(fail_count)})
+        publish_env({"FAIL_COUNT": str(fail_count)})
         return _run_parallel_batch(
             batch,
             root=root,
@@ -967,7 +971,7 @@ def charge_node_cost(db, run_id, cost_file="", *, dry_run=False, root=None):
     try:
         from mini_ork.dispatch import cost_pause
         if cost_pause.check(run_id, float(cost)) != 0:
-            apply_env_overrides({"MO_NODE_FINISH_REASON": "paused_for_approval"})
+            publish_env({"MO_NODE_FINISH_REASON": "paused_for_approval"})
     except Exception:
         pass
 

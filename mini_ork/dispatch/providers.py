@@ -17,7 +17,7 @@ from pathlib import Path
 
 import yaml
 
-from ..context import context_env
+from ..context import context_env, context_env_snapshot
 from .core import dispatch
 from .models import DispatchRequest, DispatchResult, TokenUsage
 from .secrets import SecretStoreError, read_secret_exports, secret_store_path
@@ -227,7 +227,7 @@ def claude_env_for(
     Providers.yaml is the source of truth. Returns {} when the lane's required
     API key env var is unset, preserving the preflight failure contract.
     """
-    env_map = os.environ if environment is None else environment
+    env_map = context_env_snapshot() if environment is None else environment
     entry = _load_providers_registry(root).get(model)
     if isinstance(entry, Mapping):
         return _lane_env_from_registry(model, entry, env_map)
@@ -331,7 +331,7 @@ def _resolve_from_registry(
     extra_env = {str(key): str(value) for key, value in raw_extra_env.items()}
     model_id = str(entry.get("model") or "")
     spec = builder(name, entry, root, extra_env, model_id)
-    runtime = os.environ if environment is None else environment
+    runtime = context_env_snapshot() if environment is None else environment
     if kind == "anthropic-native":
         if api_key := runtime.get("ANTHROPIC_API_KEY"):
             env = dict(spec.env)
@@ -572,7 +572,7 @@ def resolve_provider(
     credential preflight, native transports, and configuration precedence in
     one place and makes deletion of provider shell wrappers safe.
     """
-    runtime = os.environ if environment is None else environment
+    runtime = context_env_snapshot() if environment is None else environment
     spec = _resolve_from_registry(
         model, _load_providers_registry(root), root, environment=runtime
     )
@@ -607,7 +607,7 @@ def provider_environment(
     equivalent in the local store. This permits a one-off rotation/smoke test
     while keeping normal configuration local to the project.
     """
-    runtime = dict(os.environ if environment is None else environment)
+    runtime = dict(context_env_snapshot() if environment is None else environment)
     stored = read_secret_exports(secret_store_path(runtime))
     return {**stored, **runtime}
 
@@ -634,7 +634,7 @@ def lane_health(
     environment: Mapping[str, str] | None = None,
 ) -> LaneHealth:
     """Cheap pre-dispatch check for registry-defined lanes."""
-    runtime = os.environ if environment is None else environment
+    runtime = context_env_snapshot() if environment is None else environment
     try:
         registry = _load_providers_registry(root)
         _resolve_from_registry(model, registry, root, environment=runtime)
@@ -675,7 +675,7 @@ def resolve_target_cwd(
     """The directory the provider runs in. Precedence: request.cwd →
     $MO_TARGET_CWD → the current process cwd. Returns an absolute path so the
     dispatch is never at the mercy of an inherited, drifted cwd."""
-    e = os.environ if env is None else env
+    e = context_env_snapshot() if env is None else env
     cwd = request.cwd or e.get("MO_TARGET_CWD") or os.getcwd()
     return os.path.abspath(cwd)
 
@@ -691,7 +691,7 @@ def cwd_guard(
     itself) under which the provider's own git operations — e.g. codex's
     `refs/codex/*` resets — corrupt the framework repo. A genuine mini-ork
     self-edit opts in with MO_ALLOW_FRAMEWORK_CWD=1."""
-    e = os.environ if env is None else env
+    e = context_env_snapshot() if env is None else env
     if e.get("MO_ALLOW_FRAMEWORK_CWD") == "1":
         return LaneHealth(True, "ok")
     framework = mini_ork_root(root)

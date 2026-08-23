@@ -7,7 +7,9 @@ from mini_ork.context import (
     RunContext,
     apply_env_overrides,
     context_env,
+    context_env_snapshot,
     node_env_overrides,
+    publish_env,
     run_context_scope,
     scoped_environ,
 )
@@ -159,3 +161,90 @@ def test_run_context_scope_isolates_across_asyncio_tasks():
         return list(await asyncio.gather(worker("task-a"), worker("task-b")))
 
     assert asyncio.run(main()) == ["task-a", "task-b"]
+
+
+# ── Writer half: publish_env dual-write + child-env snapshot ─────────────────
+
+
+def test_publish_env_dual_writes_and_accumulates(monkeypatch):
+    # pre-seed so monkeypatch teardown restores os.environ regardless of the
+    # publish_env legacy writes inside the test
+    monkeypatch.setenv("MO_PUB_A", "seed")
+    monkeypatch.delenv("MO_PUB_B", raising=False)
+
+    with run_context_scope({}):
+        publish_env({"MO_PUB_A": "v1"})
+        publish_env({"MO_PUB_B": "v2"})  # accumulates, doesn't reset A
+        assert context_env("MO_PUB_A") == "v1"
+        assert context_env("MO_PUB_B") == "v2"
+        # legacy layer still written (byte-for-byte old executor semantics)
+        assert os.environ["MO_PUB_A"] == "v1"
+        assert os.environ["MO_PUB_B"] == "v2"
+
+    # boundary exit wipes the contextvar layer: B's os.environ copy removed, so
+    # the only place "v2" could still live is the contextvar — and it's gone
+    os.environ.pop("MO_PUB_B", None)
+    assert context_env("MO_PUB_B", "gone") == "gone"
+    # … but the os.environ write persists (legacy leak-forever semantics kept),
+    # and context_env's fallback observes it exactly as legacy readers do
+    assert os.environ["MO_PUB_A"] == "v1"
+    assert context_env("MO_PUB_A") == "v1"
+
+
+def test_publish_env_none_removes_from_both_layers(monkeypatch):
+    monkeypatch.setenv("MO_PUB_MASK", "stale")
+    with run_context_scope({}):
+        publish_env({"MO_PUB_MASK": None})
+        assert context_env("MO_PUB_MASK", "masked") == "masked"
+        assert "MO_PUB_MASK" not in os.environ
+
+
+def test_context_env_snapshot_overlays_and_masks(monkeypatch):
+    monkeypatch.setenv("SNAP_PLAIN", "from-env")
+    monkeypatch.setenv("SNAP_MASKED", "stale-env")
+    monkeypatch.delenv("SNAP_BOUND", raising=False)
+
+    with run_context_scope({"SNAP_BOUND": "ctx", "SNAP_MASKED": None}):
+        snap = context_env_snapshot()
+        assert snap["SNAP_BOUND"] == "ctx"       # binding wins
+        assert "SNAP_MASKED" not in snap         # masked → removed
+        assert snap["SNAP_PLAIN"] == "from-env"  # unbound → process env
+    # with nothing bound the snapshot is a plain os.environ copy
+    plain = context_env_snapshot()
+    assert plain["SNAP_PLAIN"] == "from-env"
+    assert "SNAP_BOUND" not in plain
+
+
+def test_two_runs_isolated_through_publish_env(monkeypatch):
+    """The payoff property: two concurrent runs in one process, each publishing
+    through the real writer path, never observe one another's run/node vars —
+    even though the legacy os.environ layer IS raced (last writer wins)."""
+    monkeypatch.delenv("MINI_ORK_RUN_DIR", raising=False)
+    monkeypatch.delenv("MO_NODE_ID", raising=False)
+    barrier = threading.Barrier(2)
+    results: dict[str, dict[str, str]] = {}
+
+    def run(name: str) -> None:
+        # mirrors the executor: run-level scope boundary, publish inside
+        with run_context_scope({}):
+            publish_env({"MINI_ORK_RUN_DIR": f"/runs/{name}"})
+            publish_env({"MO_NODE_ID": f"{name}-n1"})
+            barrier.wait()  # both runs' bindings live simultaneously
+            results[name] = {
+                "run_dir": context_env("MINI_ORK_RUN_DIR"),
+                "node_id": context_env("MO_NODE_ID"),
+                "child_run_dir": context_env_snapshot()["MINI_ORK_RUN_DIR"],
+            }
+
+    threads = [threading.Thread(target=run, args=(n,)) for n in ("a", "b")]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert results["a"] == {
+        "run_dir": "/runs/a", "node_id": "a-n1", "child_run_dir": "/runs/a"}
+    assert results["b"] == {
+        "run_dir": "/runs/b", "node_id": "b-n1", "child_run_dir": "/runs/b"}
+    # the legacy layer was raced (one of the two) but never polluted with a mix
+    assert os.environ["MINI_ORK_RUN_DIR"] in {"/runs/a", "/runs/b"}
