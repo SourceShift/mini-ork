@@ -348,7 +348,7 @@ def _resolve_from_registry(
                 env=env,
                 unset_env=spec.unset_env,
             )
-    if kind in {"anthropic-compat", "openai-compat", "openai-chat"}:
+    if kind in {"anthropic-compat", "openai-compat", "openai-chat", "uhp"}:
         api_key_env = str(entry.get("api_key_env") or "")
         if api_key_env:
             env = dict(spec.env)
@@ -487,6 +487,38 @@ def _build_openai_chat(name, entry, root, extra_env, model_id) -> ProviderSpec:
     )
 
 
+def _build_uhp(name, entry, root, extra_env, model_id) -> ProviderSpec:
+    """UHP (Unified Harness Protocol, 2026-08-11) ``/v1/responses`` endpoints
+    (e.g. HarnessRouter Community Edition). Direct-HTTP SSE transport — no CLI
+    in the loop, just a stdlib POST. The harness server owns model routing
+    (``metadata.harness_id`` is optional); mini-ork only consumes the wire.
+
+    Mirrors the ``openai-chat`` builder shape (script-path dispatch, prompt on
+    stdin, raw text on stdout) so a future backend can wire usage/cost
+    sidecars without changing the spec contract.
+    """
+    base_url = entry.get("base_url")
+    if not isinstance(base_url, str) or not base_url:
+        raise ValueError(f"provider {name!r} missing required field 'base_url'")
+    api_key_env = entry.get("api_key_env")
+    if not isinstance(api_key_env, str) or not api_key_env:
+        raise ValueError(f"provider {name!r} missing required field 'api_key_env'")
+    del root
+    env = {
+        "MO_UHP_BASE_URL": base_url,
+        "MO_UHP_ENV_KEY": api_key_env,
+    }
+    if model_id:
+        env["MO_UHP_MODEL"] = model_id
+    env.update(extra_env)
+    script = Path(__file__).resolve().parent / "uhp.py"
+    return ProviderSpec(
+        model=name,
+        command=(sys.executable, str(script), "--print", "--output-format", "text"),
+        env=env,
+    )
+
+
 def _codex_transport_command() -> tuple[str, ...]:
     return (
         sys.executable,
@@ -543,6 +575,7 @@ PROVIDER_KIND_BUILDERS: dict[str, Callable[..., ProviderSpec]] = {
     "anthropic-compat": _build_anthropic_compat,
     "openai-compat": _build_openai_compat,
     "openai-chat": _build_openai_chat,
+    "uhp": _build_uhp,
     "codex-native": _build_codex_native,
     "opencode-native": _build_opencode_native,
     "executable": _build_executable_script,
@@ -620,7 +653,7 @@ def required_secret_envs(
     entry = registry.get(model)
     if not isinstance(entry, Mapping):
         raise ValueError(f"unknown lane: {model!r}")
-    if entry.get("kind") in {"anthropic-compat", "openai-compat", "openai-chat"}:
+    if entry.get("kind") in {"anthropic-compat", "openai-compat", "openai-chat", "uhp"}:
         api_key_env = entry.get("api_key_env")
         if isinstance(api_key_env, str) and api_key_env:
             return (api_key_env,)
@@ -646,6 +679,7 @@ def lane_health(
         "anthropic-compat",
         "openai-compat",
         "openai-chat",
+        "uhp",
     }:
         api_key_env = entry["api_key_env"]
         if not runtime.get(str(api_key_env)):

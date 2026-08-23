@@ -21,6 +21,13 @@
 #                             gateway (base_url + api_key_env required)
 #         openai-compat       codex CLI pointed at an OpenAI-compatible
 #                             /v1 endpoint (base_url + api_key_env required)
+#         openai-chat         direct-HTTP /chat/completions against any
+#                             OpenAI-compatible endpoint (OpenRouter, Groq,
+#                             vLLM). base_url + api_key_env required.
+#         uhp                 direct-HTTP UHP /v1/responses against a UHP
+#                             harness server (HarnessRouter CE). base_url +
+#                             api_key_env required; harness server owns
+#                             model routing.
 #         codex-native        ambient Codex CLI login (no API key required)
 #         opencode-native     ambient opencode CLI login (no API key required)
 #         executable          your own script honoring the dispatcher
@@ -45,7 +52,7 @@ providers:
   glm:
     kind: anthropic-compat
     family: gateway  # bash coarse taxonomy (llm_calls.provider parity); the fine family lives in mini_ork.dispatch.providers._PROVIDER_FAMILY
-    model: GLM-5.1
+    model: GLM-5.3
     base_url: https://api.z.ai/api/anthropic
     api_key_env: GLM_API_KEY
     extra_env:
@@ -116,6 +123,17 @@ providers:
     model: gpt-5.2-codex
     base_url: https://api.openai.com/v1
     api_key_env: OPENAI_API_KEY
+
+  # UHP (Unified Harness Protocol, 2026-08-11) against a local HarnessRouter
+  # Community Edition server. Direct-HTTP SSE transport — no CLI in the loop.
+  # base_url is overridable via UHP_HARNESSROUTER_URL (e.g. for staging);
+  # set UHP_API_KEY in secrets.local.sh to activate. The harness server
+  # owns model routing, so no `model:` pin is required.
+  uhp_harnessrouter:
+    kind: uhp
+    family: uhp
+    base_url: http://localhost:8080
+    api_key_env: UHP_API_KEY
 
   # --- More examples (uncomment + adapt) ---------------------------------
   #
