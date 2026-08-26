@@ -1137,10 +1137,12 @@ def _handle_eval(ctx: NodeDispatch):
     if r_exec is not None:
         # Layer 1 — de-bias by the verifier's measured/prior FP-FN noise rates.
         fp_rate, fn_rate = _verifier_noise_rates(ctx.db, list(verifier_verdicts.keys()))
-        # R4 (opt-in) — a per-run calibrated confidence γ from the judge shrinks the
-        # static FP/FN priors: a confident verdict is de-biased less. Default OFF.
+        # R4 — a per-run calibrated confidence γ from the judge shrinks the static
+        # FP/FN priors: a confident verdict is de-biased less. Default ON, but a
+        # no-op until a judge actually emits `confidence`, so zero blast radius on
+        # today's runs; set MO_EVAL_CALIBRATED_PRIORS=0 to disable.
         gamma = primary.get("confidence") if primary else None
-        if gamma is not None and os.environ.get("MO_EVAL_CALIBRATED_PRIORS", "0") == "1":
+        if gamma is not None and os.environ.get("MO_EVAL_CALIBRATED_PRIORS", "1") != "0":
             fp_rate, fn_rate = ej.calibrated_priors(gamma, fp_rate, fn_rate)
         r_corr = ej.noise_correct(r_exec, fp_rate, fn_rate)
         # Layer 3 — the jury (or single judge) may only VETO by consensus, and
@@ -1265,8 +1267,10 @@ def _handle_eval(ctx: NodeDispatch):
         except Exception:
             pass
 
-    # R7 (opt-in) — carry the VPRM process reward into the distillation loop.
-    if proc_score is not None and os.environ.get("MO_EVAL_STAMP_PROCESS", "0") == "1":
+    # R7 — carry the VPRM process reward into the distillation loop. Default ON;
+    # additive (writes the run-level process_reward onto non-eval traces), so the
+    # SLM loop sees process signal. Set MO_EVAL_STAMP_PROCESS=0 to disable.
+    if proc_score is not None and os.environ.get("MO_EVAL_STAMP_PROCESS", "1") != "0":
         try:
             _stamp_run_process_reward(ctx.db, ctx.run_id, proc_score, source)
         except Exception:
