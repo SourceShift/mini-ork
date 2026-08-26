@@ -5,8 +5,11 @@ real ``verifier_*.json`` files, and a stubbed judge dispatch (no model — codex
 LLM lanes are not required). Proves the four low-cost recommendations from
 ``internal-docs/research/2026-08-26-verifiable-process-reward-for-miniork.md``:
 
-  R2  coherence — the missing Layer 2 — catches "shipped success the steps
-      contradict" and, with MO_EVAL_COHERENCE_GATE=1, blocks it one-way.
+  R2  coherence — the missing Layer 2 — reads the INDEPENDENT execute/verify
+      process stages (not the verifier pass-fraction the backbone already uses),
+      so a failing verifier is NOT flagged but test-theater (a claimed pass over a
+      vacuous verifier) IS. Default-ON gate blocks that over-claimed success
+      one-way; MO_EVAL_COHERENCE_GATE=0 records without enforcing.
   R1  the wired-but-heuristic process_reward is populated by deterministic
       per-stage VPRM checks.
   R3  decomposing the reward into independent components restores the GRPO
@@ -94,34 +97,51 @@ def scenario_backbone_unchanged() -> None:
     _ok("coherent run → coherence=1.0, execution backbone score=1.0 (R1 process_reward populated)")
 
 
-def scenario_coherence_records_contradiction() -> None:
-    """R2 detects 'claimed pass but a step failed' even with the gate OFF."""
+def scenario_failing_verifier_is_not_incoherence() -> None:
+    """The rework's anti-redundancy guarantee: a FAILING concrete verifier is NOT
+    process incoherence. Coherence reads the independent execute/verify stages, not
+    the verifier pass-fraction the backbone already down-weights — so a partial
+    failure keeps coherence=1.0 and is NOT gated even with the gate on by default."""
+    os.environ.pop("MO_EVAL_COHERENCE_GATE", None)  # default ON
     with tempfile.TemporaryDirectory() as d:
         saved = _run_eval(Path(d),
                           {"test": {"pass": True}, "metamorphic": {"pass": False}},
                           _PASS_JUDGE)
+    assert saved["process"]["coherence"] == 1.0, saved["process"]
+    assert "gated_to" not in saved["process"]     # gate did not fire
+    assert saved["score"] > 0.0                    # graded execution reward stands
+    _ok("failing verifier is NOT incoherence → coherence=1.0, not gated (no double penalty)")
+
+
+def scenario_coherence_records_contradiction() -> None:
+    """R2 detects genuine test-theater — a claimed pass over a VACUOUS verifier (no
+    real pass/fail) → verify stage False → coherence 0 — even with the gate OFF."""
+    os.environ["MO_EVAL_COHERENCE_GATE"] = "0"
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            saved = _run_eval(Path(d), {"smoke": {"ran": True}}, _PASS_JUDGE)
+    finally:
+        del os.environ["MO_EVAL_COHERENCE_GATE"]
     assert saved["process"]["coherence"] == 0.0, saved["process"]
-    # gate OFF → score is still the execution reward, NOT blocked
+    # gate OFF → the judge-only score stands, NOT blocked
     assert saved["score"] > 0.0
     assert "gated_to" not in saved["process"]
-    _ok("incoherent run recorded (coherence=0.0) but NOT gated when the gate is off")
+    _ok("test-theater run recorded (coherence=0.0) but NOT gated when the gate is off")
 
 
 def scenario_coherence_gate_blocks() -> None:
-    """R2 gate ON: contradicted success is blocked one-way (score→0, needs_revision)."""
-    os.environ["MO_EVAL_COHERENCE_GATE"] = "1"
-    try:
-        with tempfile.TemporaryDirectory() as d:
-            saved = _run_eval(Path(d),
-                              {"test": {"pass": True}, "metamorphic": {"pass": False}},
-                              _PASS_JUDGE)
-    finally:
-        del os.environ["MO_EVAL_COHERENCE_GATE"]
+    """R2 gate default ON: over-claimed success (pass judge + vacuous verifier that
+    verified nothing) is blocked one-way (score→0, needs_revision). This is the case
+    the execution backbone cannot see (r_exec None → it would trust the judge)."""
+    os.environ.pop("MO_EVAL_COHERENCE_GATE", None)  # default ON
+    with tempfile.TemporaryDirectory() as d:
+        saved = _run_eval(Path(d), {"smoke": {"ran": True}}, _PASS_JUDGE)
     assert saved["process"]["coherence"] == 0.0
+    assert saved["process"]["overclaimed_success"] is True
     assert saved["process"]["gated_to"] == 0.0
     assert saved["score"] == 0.0
     assert saved["verdict"] == "needs_revision"
-    _ok("MO_EVAL_COHERENCE_GATE=1 → contradicted success blocked (score=0.0, needs_revision)")
+    _ok("default-ON gate → test-theater success blocked (score=0.0, needs_revision)")
 
 
 def scenario_decomposed_reward_primary() -> None:
@@ -184,6 +204,7 @@ def scenario_calibrated_priors() -> None:
 
 SCENARIOS = [
     scenario_backbone_unchanged,
+    scenario_failing_verifier_is_not_incoherence,
     scenario_coherence_records_contradiction,
     scenario_coherence_gate_blocks,
     scenario_decomposed_reward_primary,
