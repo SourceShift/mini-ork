@@ -126,7 +126,7 @@ def _lane_bindings_verbatim():
     actual = {n.get("id") or n.get("name"): n.get("model_lane") for n in _workflow().get("nodes", [])}
     expected = {
         "planner": "decomposer",
-        "code_impact_lens": "kimi_lens",
+        "code_impact_lens": "minimax_lens",
         "prior_art_lens": "codex_lens",
         "implementer": "codex_lens",
         "static_check_verifier": "verifier",

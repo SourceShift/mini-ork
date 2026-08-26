@@ -15,7 +15,7 @@ nodes:
 
   - name: code_impact_lens
     type: researcher
-    model_lane: kimi_lens
+    model_lane: minimax_lens
     prompt_ref: prompts/code-impact-lens.md
     dispatch_mode: parallel
     gates: [budget_gate]
