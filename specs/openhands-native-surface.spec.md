@@ -1,5 +1,13 @@
 # Feature: Expose mini-ork's Native Surface in the OpenHands Agent-Canvas FE
 
+> **Coverage-panel amendments folded in 2026-08-26.** A 3-lens mini-ork audit
+> (`specs/openhands-native-surface.coverage.md`, run `ui-parity-1787735868`)
+> catalogued 52 backend capabilities across 16 route modules and found 16
+> missing FRs + one FR-002 rescope. Those are folded into this spec (see
+> "## Coverage-Panel Amendments" below and the inline FR-002 rescope). The
+> coverage doc remains the evidence/audit trail; this spec is the authoritative
+> build contract.
+
 ## Overview
 
 The OpenHands agent-canvas SPA (`ui/`) currently speaks **only** the OpenHands
@@ -47,6 +55,12 @@ rather than a plain agent runner — instead of curling `/api/v1/*` by hand.
 | **3** | Dispatch & control (composer + launch; stop/kill/steer/cost-pause/answers) | native + projection | **high (writes)** |
 | **4** | Trajectory & distillation (trajectory, self-improve, gradients, TraceOtter, idea-tree, recovery) | native | low |
 
+**Amendments (2026-08-26).** P0 additionally carries: health-driven degradation
+(FR-NEW-01), project read+switch pulled forward from P4 (FR-NEW-02 — it mutates
+the data source under every P1–P3 panel), the per-endpoint auth table (FR-NEW-11),
+the tool-list contract (FR-NEW-13), the FR-002 lifecycle rescope (FR-NEW-15), and
+the planner-QA seam decision (FR-NEW-16). See "## Coverage-Panel Amendments".
+
 ---
 
 ## Functional Requirements
@@ -64,11 +78,30 @@ top-level "Console" nav entry exposing sub-routes `/console/fleet`,
 `/console/runs`, `/console/learning`, `/console/trajectory`, `/console/dispatch`
 alongside the unchanged OpenHands conversation UI.
 
-#### FR-002: Run→conversation projection (spawn)
+#### FR-002: Run→conversation projection (spawn + full lifecycle) — RESCOPED
 When a user creates a conversation whose target is a mini-ork run, the backend
 shall accept `POST /api/v1/app-conversations`, mint a `run_id`, spawn the run
 detached, remote-START it, and return a conversation descriptor consumable by
 the existing OpenHands conversation view.
+
+**Rescope (FR-NEW-15, 3/3 consensus).** FR-002 is NOT one POST — it is the full
+conversation-lifecycle projection and the single largest build item in the plan.
+The compat shim has **no conversation lifecycle at all** (`agent_server.py:22-25`
+states it "does NOT yet wire conversations/events to real mini-ork runs") while
+the FE is conversation-shaped end-to-end (`ui/src/routes.ts:8-42`). The backend
+shall therefore additionally project:
+- conversation GET/list/search (`GET /api/v1/app-conversations[/search]`,
+  `GET /api/v1/app-conversations/{id}/start-tasks` mapping run-state →
+  ExecutionStatus/SandboxStatus),
+- the event-stream projection (`GET /api/conversations/{id}/events[/search]` +
+  websocket) translating mini-ork `mo_events` rows → OpenHands `oh_event` shape
+  (schema mismatch is real: raw rows carry `payload_json`, not agent-server
+  events — reuse `stream.py` tail as the source, translate at the seam),
+- agent-state for the conversation.
+`POST /api/v1/app-conversations` is **backend-missing** (confirmed: the router at
+`agent_server.py:57` has no such route) — AC-002 cannot pass until it ships. It
+is the 3/3-consensus keystone: spawn-run-server-side = remote-START +
+Orca-launcher-replacement + canvas-functional in one move.
 
 #### FR-003: Feature flag
 Where `VITE_MINIORK_CONSOLE` is unset or false, the system shall hide the
@@ -370,6 +403,138 @@ Then an informative empty state renders instead of an error.
 
 ---
 
+## Coverage-Panel Amendments (folded 2026-08-26)
+
+Sixteen new FRs from `specs/openhands-native-surface.coverage.md`, grouped by
+phase. Each cites `file:line` evidence and its lens consensus. These are
+authoritative build requirements; the coverage doc is their audit trail.
+
+### Phase 0 — Foundation + seam (folded)
+
+- **FR-NEW-01 — Health-driven degradation (P0).** When the Console shell mounts,
+  the FE shall poll `GET /api/v1/health` (`fleet.py:21`) and drive the
+  runtime-unreachable banner + per-panel degraded states from it. Adjudicates
+  D2 in favour of exposing health (every native panel needs a degraded-state
+  source; cost of exposure is nil). (opus §3.1; 2/3)
+- **FR-NEW-02 — Project read+switch in shell chrome (P0, pulled forward from
+  P4).** When the user switches the active project (`GET /api/v1/projects`,
+  `POST /api/v1/projects/switch`, `projects.py:72,159`), the FE shall invalidate
+  ALL native query caches and re-establish SSE subscriptions — the switch
+  changes which `state.db` every panel reads (`projects.py:159-164`).
+  Read+switch move to P0/P1; browse/add/remove stay P4 (rest of FR-404).
+  (opus §3.2 + §2; 3/3 on the capability)
+- **FR-NEW-11 — Per-endpoint auth table (P0 spec change).** The security NFR's
+  "all writes Bearer" is contradicted by the backend and the "additive only"
+  rule forbids a server-side fix. Bearer: `/runs`, `/steer`, `/pause-cost`,
+  `/resume-cost`. Loopback-trust: `/stop`, `/kill` (`control.py:9-11`).
+  Unauthenticated: `/answers` (`control.py:65-74`), all project writes
+  (`projects.py:152`). The FE shall gate its token UX per-endpoint from this
+  table; AC-006/AC-007's uniform-token assumption is false (see NFR amendment
+  below). (opus §3.11, glm §7 corroborates; supersedes the uniform Security NFR)
+- **FR-NEW-13 — Tool-list contract (P0).** The shim reports `version:"1.39.1"`
+  with `usable_tools:[]` (`agent_server.py:122,127`); the probe treats a
+  non-array as "all tools available", so `[]` makes `isAgentServerToolAvailable`
+  return false-for-all. Document the contract and consider returning `None`
+  (→ "unknown") so the FE never silently enables tool affordances the backend
+  can't honor. (minimax M2 + opus §1; 2/3)
+- **FR-NEW-15 — Projection-seam re-scope (P0).** Folded inline into FR-002 above
+  (full conversation-lifecycle projection, not one POST). (opus §2; 3/3)
+- **FR-NEW-16 — Planner-QA seam decision (P0).** The spec shall decide in P0
+  whether planner Q&A (polled via `/profile`, `control.py:54-63`) is projected
+  into chat (requires synthesizing question events) or stays a native panel — it
+  is the single flow that most feels like chat. **Recommendation: native
+  PlannerQAPanel** (polling flow, typed inputs, post-answer next-step) with an
+  optional chat deep-link; do not synthesize fake chat events in P0. (opus §4)
+
+### Phase 1 — Observability (folded)
+
+- **FR-NEW-03 — Run lifecycle state machine (P1).** When rendering run controls,
+  the FE shall implement the status machine
+  (`executing/verifying/reviewing/published/rolled_back/failed` + `stale`,
+  `run_detail.py:22-48`; both staleness regimes `fleet.py:18` 6h /
+  `run_detail.py:26` 30min) and render stop/kill/steer/pause only in valid
+  states. (opus §3.3 + §2)
+- **FR-NEW-04 — Evidence resolution (P1).** WhyPanel evidence paths shall resolve
+  through `GET /task-runs/{id}/evidence?path=` (`run_detail.py:175-189`) with
+  403/404 handling, else evidence links dead-end. (opus §3.4 / minimax)
+- **FR-NEW-05 — Bridge-provenance honesty (P1).** When an event or LLM-call row's
+  `bridge` is `time-window` (`run_detail.py:213-216,514,555`), the FE shall
+  visually mark it approximate with a link to the correlation panel — otherwise
+  the UI confidently attributes another run's LLM spend. (opus §3.5 + minimax)
+- **FR-NEW-06 — Snapshot-then-subscribe (P1).** When opening any live view, the
+  FE shall REST-fetch a snapshot then subscribe to SSE from `hello`
+  (`stream.py:63`) and refetch on reconnect — the cursor starts at `MAX(id)` and
+  emits only post-connect events (`stream.py:45-53`). The fleet view shall use
+  the UNFILTERED stream (FR-105 currently names only `?task_run=`). (opus §3.6 +
+  minimax; amends FR-105)
+- **FR-NEW-07 — Live cost ribbon (P1).** When a run is active, run detail shall
+  accumulate `mo_events.cost_usd` (`stream.py:76`) into a live spend ribbon and
+  show the pause-threshold state when a cost-pause sentinel exists
+  (`control.py:80-101`) — cost governance is a headline claim with a control-only
+  surface today. (opus §3.7)
+- **FR-NEW-12 — Family attribution in P1 (P1).** Lane/family attribution is
+  already merged into run-DAG node rows (`run_detail.py:610-623`); it shall
+  render on nodes in Phase 1. The P4 fingerprint viewer covers cross-recipe
+  browsing only (fixes a P4 orphan). (opus §3.12)
+- **FR-NEW-14 — PTY semantics amendment (P1).** FR-106 shall state that
+  `/api/v1/pty` is a per-(project,harness) orchestrator attach over a persistent
+  tmux session (`pty.py:107-138`), NOT a per-run terminal; the FE shall not
+  advertise terminal-per-run and shall render the AC-008 disabled-state on the
+  4403 `MO_PTY_ENABLED` close. (minimax M3 + opus §1 + glm; amends FR-106,
+  resolves D4 → single project terminal tab)
+
+### Phase 3 — Dispatch & control (folded)
+
+- **FR-NEW-08 — Dispatch run_id threading (P3).** When launching after compose,
+  the FE shall thread the `/dispatch`-minted `run_id` (`dispatch.py:247`) into
+  the launch call (`runs.py:28` / app-conversations) so
+  `conductor_decisions.task_run_id` joins, and display derived
+  `decided_by`/`overrode` (`dispatch.py:253-257`) — else labelled-example
+  capture silently breaks. (opus §3.8 + §2)
+- **FR-NEW-09 — Evidence-honesty rendering (P3).** When a lane/topology has
+  `evidence:"none"` (n<`MIN_SAMPLES=5`, `dispatch.py:136-140,183-187`), the
+  composer shall render "insufficient evidence (n<5)" and never a bare rate or
+  bar. (opus §3.9 + minimax)
+- **FR-NEW-10 — Conductor calibration (P3).** The conductor panel shall surface
+  decisions with `outcome='pending'` and their eventual `realized_score`
+  (`dispatch.py:276`, `learning.py:379-389`) — the loop the dispatch endpoint
+  exists to feed. (opus §3.10)
+
+### Shared-primitive build notes (not FRs; blocking dependencies)
+
+1. **DagView** — one graph renderer reused by FR-101 run DAG, FR-107 recovery
+   overlay, FR-403 fingerprint viewer, FR-NEW-12 chips. Biggest single component
+   gap; no graph component exists in `ui/src/`. Build first in P1.
+2. **TextViewer** — markdown/yaml/json/log renderer with size cap, reused by
+   `/inputs`, `/artifacts`, `/evidence`, `/why`. Build second in P1.
+3. **Chart-lib decision** (recharts vs OpenHands-bundled) blocks FR-400 charts
+   AND the FR-201 `/topology` quadrant scatter — no chart component exists in
+   `ui/src/`. Decide in P2/P3 so it does not orphan the topology panel to P4.
+
+### NFR amendment — auth posture is per-endpoint, not uniform
+
+The "Security" NFR line ("All write/control endpoints … require the runtime's
+Bearer token") is **factually wrong against the backend** and, under the
+additive-only rule, cannot be fixed server-side. Replace the uniform assumption
+with the FR-NEW-11 per-endpoint table. AC-006/AC-007 shall be read against that
+table: Bearer-gated actions block-without-token; loopback/unauth actions
+(`/stop`, `/kill`, `/answers`, project writes) do not require a token and the FE
+must not present a false "authentication required" gate for them.
+
+### Architecture note — runs are DAGs, not lines (D5)
+
+The "runs-as-conversations" projection breaks for parallel fan-out: flattening
+concurrent nodes into one chat timeline misrepresents causality and buries
+per-node failure. Resolution: the DAG panel (`run_detail.py:592-654`) is
+canonical for structure; the conversation view carries only the linearizable
+surface (narrative events, terminal) with bidirectional deep links — **no
+per-node chat threads**. Steer authority (D6): if both a chat input and the
+native steering form can inject (`control.py:123-136`), the native steering form
+is authoritative; the chat input, if present, routes through the same
+`/steer` call (no second injection path). Bearer-token storage (D7) must NOT
+resolve to the shim's process-local settings store (`agent_server.py:59-69`) or
+tokens vanish on every restart — use the OpenHands secrets manager.
+
 ## Out of Scope
 - Rewriting or replacing the OpenHands conversation UI (reused as-is).
 - Changing existing `/api/v1/*` semantics (additive projection endpoints only).
@@ -377,9 +542,19 @@ Then an informative empty state renders instead of an error.
 - Removing the OpenHands agent-server compat shim.
 - The dead `ui.old/` tree (separate cleanup task).
 
-## Open Questions
-- [ ] Should the Console live as a **section inside** the conversation SPA (one app, one nav) or a **separate route tree** mounted at `/console`? (Assumed: same app, gated nav.)
-- [ ] Charting: reuse an OpenHands-bundled chart lib or add `recharts` (present in `ui.old/`)?
-- [ ] Does `POST /api/v1/app-conversations` already exist partially elsewhere, or is it net-new in the shim? (Discovery found the FE *expects* it; backend impl unconfirmed.)
-- [ ] Do we want per-run learning (FR-202) in Phase 1 (co-located with run detail) or held to Phase 2?
-- [ ] Bearer token source in the FE: reuse OpenHands secrets manager, or a dedicated mini-ork settings field?
+## Open Questions (resolved by the coverage panel 2026-08-26)
+- [x] Console as a **section inside** the SPA (one app, gated nav) vs separate
+  route tree → **section inside**, gated by `VITE_MINIORK_CONSOLE` (FR-001/FR-003).
+- [ ] Charting: reuse an OpenHands-bundled chart lib or add `recharts` (present
+  in `ui.old/`)? → **STILL OPEN**, but now time-boxed: decide in P2/P3 (shared
+  primitive #3) — it blocks FR-400 charts + the FR-201 `/topology` scatter.
+- [x] Does `POST /api/v1/app-conversations` exist? → **NET-NEW in the shim**
+  (confirmed: `agent_server.py:57` router has no such route). Backend build item
+  in P0. Separately, glm's claim that `POST /api/v1/runs` is also missing is
+  **wrong** — it exists at `runs.py:24-37` (D1 adjudicated against the tree).
+- [x] Per-run learning (FR-202) in P1 or P2 → **P1**, co-located with run detail
+  (`run_detail.py:236-343`, `injection_points[].wired` is load-bearing).
+- [x] Bearer token source in the FE → **OpenHands secrets manager**, NOT the
+  shim's process-local settings store (D7 — else tokens vanish on restart).
+- [x] PTY per-run vs per-project (D4) → **single project terminal tab**;
+  `/api/v1/pty` is a per-(project,harness) tmux attach, not per-run (FR-NEW-14).
