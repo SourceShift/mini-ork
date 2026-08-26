@@ -87,6 +87,20 @@ def _verifier_argv(script):
     return ["bash", script]
 
 
+def _evidence_tail(evidence) -> str:
+    """Last non-empty line of verifier output, capped at 200 chars.
+
+    Failure results carry this inline so run logs and the why-viewer surface
+    the actual breakage (rc + stderr tail) without opening the evidence file.
+    """
+    try:
+        text = (evidence or b"").decode("utf-8", "replace")
+    except AttributeError:
+        text = str(evidence or "")
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    return lines[-1][:200] if lines else ""
+
+
 def _evidence_stem(raw):
     stem = _verifier_stem(raw)
     stem = re.sub(r"[^A-Za-z0-9._-]+", "_", stem.strip()).strip("._-")
@@ -212,6 +226,7 @@ def main(argv: list[str] | None = None, *, db: str | None = None, root: str | No
                 evidence = f"verifier command exited 0: {command}\n".encode()
             Path(ev).write_bytes(evidence)
             ok = run.returncode == 0
+            rc, out_tail = run.returncode, _evidence_tail(evidence)
         else:
             r = subprocess.run(
                 _verifier_argv(script),
@@ -223,10 +238,12 @@ def main(argv: list[str] | None = None, *, db: str | None = None, root: str | No
             ok = r.returncode == 0
             if ok and os.path.getsize(ev) == 0:  # vacuous: exit 0 but no evidence → fail
                 ok = False
+            rc, out_tail = r.returncode, _evidence_tail(r.stdout)
         if ok:
             results.append(f'{{"verifier":"{name}","pass":true,"evidence_path":"{ev}"}}'); pass_count += 1
         else:
-            results.append(f'{{"verifier":"{name}","pass":false,"evidence_path":"{ev}"}}'); fail_count += 1
+            detail = json.dumps(out_tail or (f"exit {rc} with no output" if rc else "vacuous pass suppressed: exit 0 with empty evidence"))
+            results.append(f'{{"verifier":"{name}","pass":false,"rc":{rc},"detail":{detail},"evidence_path":"{ev}"}}'); fail_count += 1
 
     # Required-artifact assertion retained from the pre-retirement contract. A recipe that
     # declares a concrete, run-local artifact but produces nothing (missing OR
