@@ -466,3 +466,191 @@ def test_eval_node_jury_escalates_hung_panel_to_tiebreaker(tmp_path, monkeypatch
     assert jury["jury"] == "escalated"           # hung jury → tiebreaker decided
     assert jury["tiebreaker_lane"] == "strong"
     assert saved["score"] == pytest.approx(0.3)  # tiebreaker's safety veto applied
+
+
+# ── R2: coherence — the missing Layer 2 ──────────────────────────────────────
+def test_decide_from_steps():
+    assert ej.decide_from_steps([True, True]) == "pass"
+    assert ej.decide_from_steps([True, False]) == "fail"
+    assert ej.decide_from_steps([None, None]) is None        # no concrete signal
+    assert ej.decide_from_steps([True, None]) == "pass"      # vacuous steps drop out
+    assert ej.decide_from_steps([]) is None
+
+
+def test_coherence_catches_shipped_success_the_steps_contradict():
+    # test_green_wrong: run claims pass but a step concretely failed → incoherent.
+    assert ej.coherence("pass", [True, False]) == 0.0
+    assert ej.coherence("pass", [True, True]) == 1.0         # steps support the claim
+    assert ej.coherence("fail", [True, False]) == 1.0        # honest failure is coherent
+    assert ej.coherence("pass", [None, None]) == 1.0         # no signal → fail-open
+    assert ej.coherence("weird-verdict", [True, False]) == 1.0  # unknown verdict → open
+
+
+def test_coherence_gate_is_one_way():
+    assert ej.coherence_gate(0.9, 1.0) == pytest.approx(0.9)  # coherent → unchanged
+    assert ej.coherence_gate(0.9, 0.0) == 0.0                 # incoherent, default block
+    assert ej.coherence_gate(0.9, 0.0, penalty=0.5) == pytest.approx(0.45)  # soft
+
+
+# ── R1: VPRM per-stage process reward ────────────────────────────────────────
+def test_process_reward_sums_stage_checks():
+    score, detail = ej.process_reward(
+        {"plan": True, "execute": True, "verify": False, "coverage": 0.5})
+    assert score == pytest.approx(2.5 / 4)                    # (1+1+0+0.5)/4
+    assert detail == {"plan": 1.0, "execute": 1.0, "verify": 0.0, "coverage": 0.5}
+
+
+def test_process_reward_none_when_no_stage_signal():
+    score, detail = ej.process_reward({"plan": None, "execute": None})
+    assert score is None
+    assert detail == {"plan": None, "execute": None}
+
+
+def test_process_reward_missing_stages_renormalize():
+    # only the two present stages count; weights renormalize over them
+    score, _ = ej.process_reward({"plan": True, "execute": False})
+    assert score == pytest.approx(0.5)
+
+
+# ── R3: reward decomposition (SEVA advantage-collapse fix) ────────────────────
+def test_combine_components_symmetric_mean():
+    scalar, vec = ej.combine_components(
+        {"execution": 0.0, "coherence": 1.0, "process": 0.5})
+    assert scalar == pytest.approx(0.5)                      # (0+1+0.5)/3
+    assert vec == {"execution": 0.0, "coherence": 1.0, "process": 0.5}
+
+
+def test_combine_components_drops_none_and_renormalizes():
+    scalar, vec = ej.combine_components(
+        {"execution": 1.0, "coherence": None, "process": 0.0})
+    assert scalar == pytest.approx(0.5)                      # None drops → (1+0)/2
+    assert "coherence" not in vec
+
+
+def test_combine_components_restores_group_variance():
+    """SEVA Prop 1/2: a near-binary outcome collapses a GRPO group's advantage
+    spread; independent components keep it alive. Two rollouts that BOTH fail the
+    outcome (0.0) but differ on process/coherence must get DIFFERENT decomposed
+    rewards — otherwise the group-relative advantage is zero and the gradient dies."""
+    a, _ = ej.combine_components({"execution": 0.0, "coherence": 1.0, "process": 0.8})
+    b, _ = ej.combine_components({"execution": 0.0, "coherence": 0.0, "process": 0.2})
+    assert a != b                                            # variance survives
+    assert a > b                                             # the more-coherent rollout scores higher
+
+
+def test_combine_components_empty_is_zero():
+    assert ej.combine_components({}) == (0.0, {})
+    assert ej.combine_components({"x": None}) == (0.0, {})
+
+
+# ── R4: calibrated confidence ────────────────────────────────────────────────
+def test_calibrated_priors_shrink_with_confidence():
+    assert ej.calibrated_priors(0.0, 0.05, 0.10) == (0.05, 0.10)   # γ=0 → full prior
+    assert ej.calibrated_priors(1.0, 0.05, 0.10) == (0.0, 0.0)     # γ=1 → trust fully
+    fp, fn = ej.calibrated_priors(0.5, 0.04, 0.10)
+    assert (fp, fn) == pytest.approx((0.02, 0.05))
+
+
+def test_calibration_reward_rewards_confident_right_punishes_confident_wrong():
+    assert ej.calibration_reward(0.8, agreed=True) == pytest.approx(0.12)   # +γ·0.15
+    assert ej.calibration_reward(0.8, agreed=False) == pytest.approx(-0.08)  # −γ·0.10
+    assert ej.calibration_reward(0.0, agreed=False) == 0.0                   # hedged → ~0
+
+
+# ── R6: partial-progress from verifiable subproblems ─────────────────────────
+def test_subproblem_reward_partial_progress():
+    assert ej.subproblem_reward([True, True, True, False, False]) == pytest.approx(0.6)
+    assert ej.subproblem_reward([False, False]) == 0.0
+    assert ej.subproblem_reward([True, None, True]) == 1.0   # None drops out
+    assert ej.subproblem_reward([None, None]) is None        # no signal
+    assert ej.subproblem_reward([]) is None
+
+
+# ── R5: agentic forward/backward verifier (deterministic core) ───────────────
+def test_forward_backward_verify_requires_both_directions():
+    v, g, _ = ej.forward_backward_verify([("a", True, True), ("b", True, True)])
+    assert (v, g) == ("pass", 1.0)
+    # forward passes but backward fails → a false positive is caught
+    v, g, det = ej.forward_backward_verify([("a", True, True), ("b", True, False)])
+    assert v == "fail"
+    assert g == pytest.approx(0.75)                          # 3 of 4 directional checks agreed
+    assert det["checks"]["b"] == {"forward": True, "backward": False}
+    assert ej.forward_backward_verify([])[0] == "pass"       # no sub-checks → fail-open
+
+
+# ── wiring: gated behaviors through _handle_eval ──────────────────────────────
+def test_eval_records_coherence_and_process_without_gate(tmp_path):
+    """Default (no gate): coherence + process reward are RECORDED but the
+    execution-backbone score is unchanged — backward compatible."""
+    db = _migrated_db(tmp_path / "home")
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    _write_verifier(run_dir, "test", {"pass": True})
+    _write_verifier(run_dir, "metamorphic", {"pass": False})  # a step contradicts success
+    from mini_ork.cli.execute import _handle_eval
+    # judge claims pass despite the failed metamorphic step
+    judge = '{"axes": {"safety": 1.0}, "verdict": "pass"}'
+    ctx = _make_ctx(run_dir, db, dispatch_fn=lambda tc, lane, prompt: (0, judge))
+    rc, fr = _handle_eval(ctx)
+    assert (rc, fr) == (0, "done")
+    saved = json.loads((run_dir / "eval.json").read_text())
+    # coherence detected the contradiction (claimed pass, a step failed)
+    assert saved["process"]["coherence"] == 0.0
+    assert "process_reward" in saved["process"]
+    # but WITHOUT the gate the score is the execution reward, unchanged
+    assert saved["score"] == pytest.approx((0.5 - 0.05) / 0.85)  # noise_correct(0.5)
+    assert saved["verdict"] != "needs_revision" or saved["score"] > 0.0
+
+
+def test_eval_coherence_gate_blocks_contradicted_success(tmp_path, monkeypatch):
+    """MO_EVAL_COHERENCE_GATE=1: a run that claims success while a step failed is
+    gated to the penalty floor (0.0) — one-way downgrade, verdict → needs_revision."""
+    monkeypatch.setenv("MO_EVAL_COHERENCE_GATE", "1")
+    db = _migrated_db(tmp_path / "home")
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    _write_verifier(run_dir, "test", {"pass": True})
+    _write_verifier(run_dir, "metamorphic", {"pass": False})
+    from mini_ork.cli.execute import _handle_eval
+    judge = '{"axes": {"safety": 1.0}, "verdict": "pass"}'
+    ctx = _make_ctx(run_dir, db, dispatch_fn=lambda tc, lane, prompt: (0, judge))
+    rc, fr = _handle_eval(ctx)
+    assert (rc, fr) == (0, "done")
+    saved = json.loads((run_dir / "eval.json").read_text())
+    assert saved["process"]["coherence"] == 0.0
+    assert saved["process"]["gated_to"] == 0.0
+    assert saved["score"] == 0.0                             # blocked
+    assert saved["verdict"] == "needs_revision"
+
+
+def test_eval_decomposed_reward_flag_makes_components_primary(tmp_path, monkeypatch):
+    """MO_EVAL_DECOMPOSED_REWARD=1: the scalar becomes the symmetric mean of the
+    independent components, carrying its own variance (SEVA fix)."""
+    monkeypatch.setenv("MO_EVAL_DECOMPOSED_REWARD", "1")
+    db = _migrated_db(tmp_path / "home")
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    _write_verifier(run_dir, "test", {"pass": True})
+    from mini_ork.cli.execute import _handle_eval
+    ctx = _make_ctx(run_dir, db, dispatch_fn=lambda tc, lane, prompt: (0, _ALL_PASS_JUDGE))
+    rc, fr = _handle_eval(ctx)
+    assert (rc, fr) == (0, "done")
+    saved = json.loads((run_dir / "eval.json").read_text())
+    assert saved["score"] == pytest.approx(saved["process"]["decomposed_score"])
+    assert saved["process"]["components"]  # non-empty component vector recorded
+
+
+def test_eval_subproblem_partial_progress_recorded(tmp_path):
+    """A failing verifier that declares sub-cases still earns partial-progress
+    credit (R6) — recorded in the reward vector even when the run fails overall."""
+    db = _migrated_db(tmp_path / "home")
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    _write_verifier(run_dir, "suite", {"pass": False, "subtasks": [
+        {"pass": True}, {"pass": True}, {"pass": True}, {"pass": False}, {"pass": False}]})
+    from mini_ork.cli.execute import _handle_eval
+    ctx = _make_ctx(run_dir, db, dispatch_fn=lambda tc, lane, prompt: (0, _ALL_PASS_JUDGE))
+    rc, fr = _handle_eval(ctx)
+    assert (rc, fr) == (0, "done")
+    saved = json.loads((run_dir / "eval.json").read_text())
+    assert saved["process"]["subproblem_reward"] == pytest.approx(0.6)  # 3 of 5 sub-cases

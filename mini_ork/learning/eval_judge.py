@@ -133,6 +133,8 @@ def parse_eval_envelope(text: str) -> dict | None:
     }
     if "score" in obj:
         envelope["score"] = clamp01(obj.get("score"))
+    if "confidence" in obj:  # R4: verifier-emitted calibrated confidence γ ∈ [0,1]
+        envelope["confidence"] = clamp01(obj.get("confidence"))
     # Usable only if we recovered at least one axis or an overall score.
     if not axes and "score" not in envelope:
         return None
@@ -349,6 +351,192 @@ def jury_veto(reward: float, envelopes: list,
         return clamp01(reward), meta
     meta["jury"] = "applied" if len(envs) >= 2 else "single"
     return judge_veto(reward, consensus), meta
+
+
+# ── Layer 2 + reward decomposition (R1–R6) ───────────────────────────────────
+# The 2026 verifiable/process-reward cluster (VPRM 2601.17223, SEVA 2606.29713,
+# AgentV-RL 2604.16004, SCRL 2605.22074) says: extend the anti-Goodhart rule
+# mini-ork already applies to the OUTCOME (reward verified execution; judge only
+# vetoes) to the PROCESS. Four deterministic, gold-free primitives do that —
+# they slot into the empty Layer-2 slot and enrich the reward VECTOR the GRPO
+# router learns from. All are pure; the node handler wires them in behind flags.
+DEFAULT_COHERENCE_PENALTY = 0.0   # incoherent run → reward × penalty (0 = block)
+CALIB_K_RIGHT = 0.15              # SEVA calibration bonus for a confident-right verdict
+CALIB_K_WRONG = 0.10              # SEVA calibration penalty for a confident-wrong verdict
+# Symmetric VPRM stage weights (R1). SEVA's ASYMMETRIC diagnosis weighting induced
+# a 35.9% false-positive bias, so every stage carries equal weight by default.
+PROCESS_STAGE_WEIGHTS = {"plan": 1.0, "execute": 1.0, "verify": 1.0,
+                         "coverage": 1.0, "diagnose": 1.0}
+
+
+def _verdict_bool(verdict) -> bool | None:
+    """A claimed verdict → pass(True)/fail(False)/unknown(None). Shared vocabulary
+    with _verifier_passed so the coherence check speaks the same language the rest
+    of the stack does."""
+    v = str(verdict or "").strip().lower()
+    if v in ("pass", "passed", "success", "approve", "approved", "ok"):
+        return True
+    if v in ("fail", "failed", "failure", "reject", "needs_revision", "revise"):
+        return False
+    return None
+
+
+def decide_from_steps(step_labels: list) -> str | None:
+    """D(step_labels): the deterministic decision function VPRM's coherence metric
+    compares against. 'pass' iff there is at least one concrete step signal and NO
+    step concretely failed; 'fail' if any step failed; None when every step is
+    vacuous/unknown (nothing to decide on). Step labels are bools or None."""
+    concrete = [bool(b) for b in step_labels if b is not None]
+    if not concrete:
+        return None
+    return "pass" if all(concrete) else "fail"
+
+
+def coherence(final_verdict, step_labels: list) -> float:
+    """R2 (VPRM Coherence) — the missing Layer 2. Cᵢ = 1{ final_verdict == D(step_labels) }.
+
+    A *deterministic* detector for "shipped success but the steps don't support
+    it" — the ``test_green_wrong`` hard negatives that execution alone can't catch
+    because every verifier it was handed passed. Returns 1.0 (coherent) or 0.0
+    (incoherent). Fails OPEN (1.0) when the steps carry no concrete signal or the
+    verdict is unknown — nothing to contradict, so no downgrade (same fail-open
+    discipline as the judge-unavailable path)."""
+    d = decide_from_steps(step_labels)
+    if d is None:
+        return 1.0
+    fv = _verdict_bool(final_verdict)
+    if fv is None:
+        return 1.0
+    return 1.0 if fv == (d == "pass") else 0.0
+
+
+def coherence_gate(reward: float, coh: float,
+                   penalty: float = DEFAULT_COHERENCE_PENALTY) -> float:
+    """One-way downgrade by the coherence signal — coherence can only pull the
+    reward DOWN, never up (the Layer-3 veto philosophy applied to Layer 2). A
+    coherent run (coh ≥ 1) is unchanged; an incoherent run is multiplied toward
+    ``penalty`` (0.0 blocks it, a softer value like 0.5 downgrades it)."""
+    if clamp01(coh) >= 1.0:
+        return clamp01(reward)
+    p = clamp01(penalty)
+    return clamp01(reward * p)
+
+
+def process_reward(stage_checks: dict, weights: dict | None = None) -> tuple[float | None, dict]:
+    """R1 (VPRM) — populate the wired-but-heuristic ``process_reward`` with a
+    deterministic per-STAGE reward over the run's six-stage structured trace:
+
+        process_reward = Σ wₜ rₜ / Σ wₜ
+
+    Each rₜ ∈ [0,1] (a bool coerces to 1/0) is a rule-based check on one stage —
+    e.g. the plan enumerated the files that were actually edited; the execute
+    stage produced edits; the verifiers are non-vacuous; declared subtasks are
+    covered. Rule-based on purpose (StructReward 2608.08326): a learned PRM would
+    reintroduce the gaming that demoted the judge to veto-only, and VPRM measured
+    deterministic step checks beating a neural PRM 76.7 vs 56.1 F1. Returns
+    (score | None, per-stage detail); None when no stage produced a signal."""
+    weights = weights or PROCESS_STAGE_WEIGHTS
+    num = 0.0
+    den = 0.0
+    detail: dict = {}
+    for stage, r in stage_checks.items():
+        if r is None:
+            detail[stage] = None
+            continue
+        rv = 1.0 if r is True else 0.0 if r is False else clamp01(r)
+        w = float(weights.get(stage, 1.0))
+        detail[stage] = rv
+        num += w * rv
+        den += w
+    if den <= 0.0:
+        return None, detail
+    return clamp01(num / den), detail
+
+
+def combine_components(components: dict, weights: dict | None = None) -> tuple[float, dict]:
+    """R3 (SEVA Prop 2) — combine INDEPENDENT reward components into one scalar and
+    return the vector. SEVA Prop 1: when most rollouts in a GRPO group score ~0
+    (mini-ork's near-binary reward on hard tasks) the group-relative advantage
+    spread contracts and the gradient vanishes — a candidate root cause of the
+    flat compounding curve. Independent components each carry their own variance,
+    so the group keeps advantage spread *by construction* (Prop 2). Weights are
+    SYMMETRIC by default (equal, renormalized over present components); asymmetric
+    weighting is what induced SEVA's 35.9% false-positive bias, so avoid it.
+    Missing/None components drop out and the rest renormalize."""
+    present = {k: clamp01(v) for k, v in components.items() if v is not None}
+    if not present:
+        return 0.0, {}
+    if weights:
+        num = sum(float(weights.get(k, 0.0)) * v for k, v in present.items())
+        den = sum(float(weights.get(k, 0.0)) for k in present)
+        scalar = (num / den) if den > 0.0 else sum(present.values()) / len(present)
+    else:
+        scalar = sum(present.values()) / len(present)  # symmetric = equal weight
+    return clamp01(scalar), present
+
+
+def calibrated_priors(gamma: float, fp_base: float, fn_base: float) -> tuple[float, float]:
+    """R4 (SEVA calibration) — shrink the Layer-1 FP/FN priors toward 0 as verifier
+    confidence γ→1. A confident verdict needs less de-biasing; a hedged one keeps
+    the full prior. Linear shrink ρ = ρ_base·(1−γ). Feeds noise_correct so a
+    calibrated, per-run confidence replaces the static global FP/FN rates."""
+    g = clamp01(gamma)
+    return max(0.0, float(fp_base)) * (1.0 - g), max(0.0, float(fn_base)) * (1.0 - g)
+
+
+def calibration_reward(gamma: float, agreed: bool,
+                       k_right: float = CALIB_K_RIGHT,
+                       k_wrong: float = CALIB_K_WRONG) -> float:
+    """R4 (SEVA calibration term) — reward the verifier for being confidently right
+    and punish it for being confidently wrong: +γ·k_right when its confidence
+    agrees with the ground signal, −γ·k_wrong when it doesn't. A hedged (γ→0)
+    verdict is barely moved, so the verifier is trained to calibrate γ, not to
+    always shout. Symmetric-ish by design; the caller adds this to the reward."""
+    g = clamp01(gamma)
+    return g * float(k_right) if agreed else -g * float(k_wrong)
+
+
+def subproblem_reward(sub_results: list) -> float | None:
+    """R6 (SCRL 2605.22074) — partial-progress reward from a FAILED run. Decompose
+    the task into verifiable subproblems; the reward is the fraction that passed,
+    so "3 of 5 subtasks green" scores 0.6, not 0. This densifies the signal on
+    exactly the hard tasks where the outcome term is 0 (complements R3's variance
+    fix). Returns the fraction, or None when no subproblem produced a signal."""
+    concrete = [1.0 if b else 0.0 for b in sub_results if b is not None]
+    if not concrete:
+        return None
+    return sum(concrete) / len(concrete)
+
+
+def forward_backward_verify(subchecks: list) -> tuple[str, float, dict]:
+    """R5 (AgentV-RL 2604.16004) — deterministic core of an agentic, tool-grounded
+    verifier. Passive verification of a GIVEN suite is gameable through coverage
+    gaps; an ACTIVE verifier decomposes the solution and checks each sub-step both
+    FORWARD (premises → goal) and BACKWARD (goal → premises). A false positive
+    survives only if BOTH directions pass, killing "plausible-but-wrong" answers
+    that satisfy the forward pass alone.
+
+    ``subchecks`` is a list of (name, forward_ok, backward_ok) tuples already
+    evaluated by the tool layer (bools). Returns (verdict, gamma, detail): verdict
+    is 'pass' iff every sub-step passes both directions; gamma ∈ [0,1] is the
+    fraction of directional checks that agreed (a calibrated confidence, feedable
+    to R4). The LLM agent that generates the sub-checks and the distillation into
+    a cheap local model ride on top of this deterministic skeleton."""
+    if not subchecks:
+        return "pass", 1.0, {"n": 0, "note": "no sub-checks — fail-open"}
+    agree = 0
+    total = 0
+    both_pass = True
+    per: dict = {}
+    for name, fwd, bwd in subchecks:
+        f, b = bool(fwd), bool(bwd)
+        per[str(name)] = {"forward": f, "backward": b}
+        total += 2
+        agree += (1 if f else 0) + (1 if b else 0)
+        if not (f and b):
+            both_pass = False
+    gamma = agree / total if total else 1.0
+    return ("pass" if both_pass else "fail"), gamma, {"n": len(subchecks), "checks": per}
 
 
 def verdict_from_score(score: float, floor: float = 0.6) -> str:
