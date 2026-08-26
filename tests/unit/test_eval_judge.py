@@ -579,48 +579,71 @@ def test_forward_backward_verify_requires_both_directions():
 
 
 # ── wiring: gated behaviors through _handle_eval ──────────────────────────────
-def test_eval_records_coherence_and_process_without_gate(tmp_path):
-    """Default (no gate): coherence + process reward are RECORDED but the
-    execution-backbone score is unchanged — backward compatible."""
+def test_eval_failing_verifier_is_not_incoherence(tmp_path, monkeypatch):
+    """The rework's anti-redundancy guarantee: a FAILING verifier is NOT process
+    incoherence. Coherence reads the independent execute/verify stages, not the
+    verifier pass/fraction the execution backbone already down-weights — so a
+    partial failure keeps coherence=1.0 and the graded execution score stands (no
+    double penalty), even with the gate on by default."""
+    monkeypatch.delenv("MO_EVAL_COHERENCE_GATE", raising=False)  # default ON
     db = _migrated_db(tmp_path / "home")
     run_dir = tmp_path / "run"
     run_dir.mkdir()
     _write_verifier(run_dir, "test", {"pass": True})
-    _write_verifier(run_dir, "metamorphic", {"pass": False})  # a step contradicts success
-    from mini_ork.cli.execute import _handle_eval
-    # judge claims pass despite the failed metamorphic step
-    judge = '{"axes": {"safety": 1.0}, "verdict": "pass"}'
-    ctx = _make_ctx(run_dir, db, dispatch_fn=lambda tc, lane, prompt: (0, judge))
-    rc, fr = _handle_eval(ctx)
-    assert (rc, fr) == (0, "done")
-    saved = json.loads((run_dir / "eval.json").read_text())
-    # coherence detected the contradiction (claimed pass, a step failed)
-    assert saved["process"]["coherence"] == 0.0
-    assert "process_reward" in saved["process"]
-    # but WITHOUT the gate the score is the execution reward, unchanged
-    assert saved["score"] == pytest.approx((0.5 - 0.05) / 0.85)  # noise_correct(0.5)
-    assert saved["verdict"] != "needs_revision" or saved["score"] > 0.0
-
-
-def test_eval_coherence_gate_blocks_contradicted_success(tmp_path, monkeypatch):
-    """MO_EVAL_COHERENCE_GATE=1: a run that claims success while a step failed is
-    gated to the penalty floor (0.0) — one-way downgrade, verdict → needs_revision."""
-    monkeypatch.setenv("MO_EVAL_COHERENCE_GATE", "1")
-    db = _migrated_db(tmp_path / "home")
-    run_dir = tmp_path / "run"
-    run_dir.mkdir()
-    _write_verifier(run_dir, "test", {"pass": True})
-    _write_verifier(run_dir, "metamorphic", {"pass": False})
+    _write_verifier(run_dir, "metamorphic", {"pass": False})  # concrete → verify stage OK
     from mini_ork.cli.execute import _handle_eval
     judge = '{"axes": {"safety": 1.0}, "verdict": "pass"}'
     ctx = _make_ctx(run_dir, db, dispatch_fn=lambda tc, lane, prompt: (0, judge))
     rc, fr = _handle_eval(ctx)
     assert (rc, fr) == (0, "done")
     saved = json.loads((run_dir / "eval.json").read_text())
+    assert saved["process"]["coherence"] == 1.0              # NOT redundant with backbone
+    assert "gated_to" not in saved["process"]                # gate did not fire
+    assert saved["score"] == pytest.approx((0.5 - 0.05) / 0.85)  # graded exec reward stands
+
+
+def test_eval_coherence_gate_blocks_test_theater(tmp_path, monkeypatch):
+    """Genuine process incoherence (default-ON gate): the judge rubber-stamps a
+    pass but the run verified nothing real — a vacuous verifier (no pass/verdict)
+    → verify stage FALSE → coherence 0. The over-claimed success is blocked one-way
+    (score 0.0, needs_revision). This is the test-theater case the execution
+    backbone cannot see (r_exec is None → it would otherwise trust the judge)."""
+    monkeypatch.delenv("MO_EVAL_COHERENCE_GATE", raising=False)  # default ON
+    db = _migrated_db(tmp_path / "home")
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    _write_verifier(run_dir, "smoke", {"ran": True})  # vacuous: no pass/verdict signal
+    from mini_ork.cli.execute import _handle_eval
+    judge = '{"axes": {"safety": 1.0}, "verdict": "pass"}'
+    ctx = _make_ctx(run_dir, db, dispatch_fn=lambda tc, lane, prompt: (0, judge))
+    rc, fr = _handle_eval(ctx)
+    assert (rc, fr) == (0, "done")
+    saved = json.loads((run_dir / "eval.json").read_text())
     assert saved["process"]["coherence"] == 0.0
+    assert saved["process"]["overclaimed_success"] is True
     assert saved["process"]["gated_to"] == 0.0
     assert saved["score"] == 0.0                             # blocked
     assert saved["verdict"] == "needs_revision"
+
+
+def test_eval_records_incoherence_without_gate(tmp_path, monkeypatch):
+    """Recording ≠ enforcement: with the gate explicitly OFF, a process-incoherent
+    run (vacuous verifier + claimed pass) still RECORDS coherence=0 but the score
+    is NOT downgraded — the judge-only reward stands."""
+    monkeypatch.setenv("MO_EVAL_COHERENCE_GATE", "0")
+    db = _migrated_db(tmp_path / "home")
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    _write_verifier(run_dir, "smoke", {"ran": True})  # vacuous
+    from mini_ork.cli.execute import _handle_eval
+    judge = '{"axes": {"safety": 1.0}, "verdict": "pass"}'
+    ctx = _make_ctx(run_dir, db, dispatch_fn=lambda tc, lane, prompt: (0, judge))
+    rc, fr = _handle_eval(ctx)
+    assert (rc, fr) == (0, "done")
+    saved = json.loads((run_dir / "eval.json").read_text())
+    assert saved["process"]["coherence"] == 0.0
+    assert "gated_to" not in saved["process"]                # recorded, not enforced
+    assert saved["score"] > 0.0
 
 
 def test_eval_decomposed_reward_flag_makes_components_primary(tmp_path, monkeypatch):

@@ -367,6 +367,14 @@ CALIB_K_WRONG = 0.10              # SEVA calibration penalty for a confident-wro
 # a 35.9% false-positive bias, so every stage carries equal weight by default.
 PROCESS_STAGE_WEIGHTS = {"plan": 1.0, "execute": 1.0, "verify": 1.0,
                          "coverage": 1.0, "diagnose": 1.0}
+# The stages coherence (R2) compares the final verdict against — deliberately the
+# PROCESS stages, NOT `coverage` (which == Layer-0 r_exec). Reading coverage would
+# make coherence re-derive the execution backbone it's meant to complement, so it
+# would only fire where the backbone already down-weights (redundant, and harsher).
+# Restricting to execute+verify makes coherence catch what execution CANNOT: a run
+# that claims success while doing no work (execute=False) or verifying nothing real
+# (verify=False, i.e. vacuous verifiers) — the "test theater" hard negative.
+PROCESS_COHERENCE_STAGES = ("execute", "verify")
 
 
 def _verdict_bool(verdict) -> bool | None:
@@ -392,15 +400,39 @@ def decide_from_steps(step_labels: list) -> str | None:
     return "pass" if all(concrete) else "fail"
 
 
+def process_step_labels(stage_checks: dict,
+                        stages: tuple = PROCESS_COHERENCE_STAGES) -> list:
+    """The INDEPENDENT process-stage labels R2 coherence compares the final verdict
+    against. Pulls ``stages`` (execute, verify) out of the VPRM ``stage_checks`` and
+    coerces each to a bool|None: True/False pass through, a numeric stage passes iff
+    > 0, a missing/None stage stays None (vacuous → drops out of the decision).
+
+    Excludes ``coverage`` on purpose — that stage is the Layer-0 verifier pass
+    fraction (r_exec), so feeding it here would make coherence redundant with the
+    execution backbone. Restricting to execute+verify is what lets the gate earn a
+    default: it fires only on a process contradiction the backbone can't see."""
+    labels: list = []
+    for s in stages:
+        v = stage_checks.get(s)
+        if isinstance(v, bool) or v is None:
+            labels.append(v)
+        else:
+            labels.append(bool(v))
+    return labels
+
+
 def coherence(final_verdict, step_labels: list) -> float:
     """R2 (VPRM Coherence) — the missing Layer 2. Cᵢ = 1{ final_verdict == D(step_labels) }.
 
     A *deterministic* detector for "shipped success but the steps don't support
-    it" — the ``test_green_wrong`` hard negatives that execution alone can't catch
-    because every verifier it was handed passed. Returns 1.0 (coherent) or 0.0
-    (incoherent). Fails OPEN (1.0) when the steps carry no concrete signal or the
-    verdict is unknown — nothing to contradict, so no downgrade (same fail-open
-    discipline as the judge-unavailable path)."""
+    it". ``step_labels`` must be an INDEPENDENT process signal (see
+    ``process_step_labels`` — execute/verify stages), NOT the outcome verifier
+    pass/fail, or coherence just re-derives the execution backbone and fires
+    redundantly. With the process basis it catches what execution can't: a claimed
+    pass with no real work (execute=False) or no real verification (verify=False).
+    Returns 1.0 (coherent) or 0.0 (incoherent). Fails OPEN (1.0) when the steps
+    carry no concrete signal or the verdict is unknown — nothing to contradict, so
+    no downgrade (same fail-open discipline as the judge-unavailable path)."""
     d = decide_from_steps(step_labels)
     if d is None:
         return 1.0

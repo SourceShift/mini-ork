@@ -1189,20 +1189,30 @@ def _handle_eval(ctx: NodeDispatch):
     # RECORDED in the reward vector + eval.json; the score-CHANGING gates default OFF
     # so the execution-backbone reward is unchanged unless a run opts in.
     claimed_verdict = (primary.get("verdict") if primary else "") or verdict
-    step_labels = [ej._verifier_passed(v) for v in verifier_verdicts.values()
-                   if isinstance(v, dict)]
-    coh = ej.coherence(claimed_verdict, step_labels)                       # R2
-    proc_score, proc_detail = ej.process_reward(                          # R1
-        _stage_checks(bool((ctx.plan_content or "").strip()), artifact_ref,
-                      traces, verifier_verdicts, r_exec))
+    # One VPRM stage vector feeds both R1 (process_reward over ALL stages) and R2
+    # (coherence over the INDEPENDENT execute+verify stages — excluding coverage so
+    # it doesn't just re-derive the execution backbone).
+    stage_checks = _stage_checks(bool((ctx.plan_content or "").strip()),
+                                 artifact_ref, traces, verifier_verdicts, r_exec)
+    coh_labels = ej.process_step_labels(stage_checks)                      # R2 basis
+    coh = ej.coherence(claimed_verdict, coh_labels)                        # R2
+    proc_score, proc_detail = ej.process_reward(stage_checks)             # R1
     sub_score = ej.subproblem_reward(_subproblem_labels(verifier_verdicts))  # R6
     process_meta = {"coherence": coh, "claimed_verdict": claimed_verdict,
-                    "step_labels": step_labels, "process_reward": proc_score,
-                    "process_detail": proc_detail, "subproblem_reward": sub_score}
+                    "coherence_basis": dict(zip(ej.PROCESS_COHERENCE_STAGES, coh_labels)),
+                    "process_reward": proc_score, "process_detail": proc_detail,
+                    "subproblem_reward": sub_score}
 
-    # R2 gate (opt-in): an incoherent run — shipped success the steps don't support
-    # (test_green_wrong) — is downgraded one-way, coherence can only pull DOWN.
-    if coh < 1.0 and os.environ.get("MO_EVAL_COHERENCE_GATE", "0") == "1":
+    # R2 gate (default ON since the rework — the basis is now an INDEPENDENT process
+    # signal, so it fires only on a real contradiction the backbone can't see:
+    # claimed success with no work / no real verification (test theater). ONE-WAY:
+    # it only downgrades an OVERCLAIMED SUCCESS (claimed pass, process says fail).
+    # A claimed fail that the process would pass is the judge being conservative —
+    # the normal veto path — never penalized here. Set MO_EVAL_COHERENCE_GATE=0 off.
+    overclaimed_success = ej._verdict_bool(claimed_verdict) is True
+    process_meta["overclaimed_success"] = overclaimed_success
+    if (overclaimed_success and coh < 1.0
+            and os.environ.get("MO_EVAL_COHERENCE_GATE", "1") != "0"):
         try:
             penalty = float(os.environ.get(
                 "MO_EVAL_COHERENCE_PENALTY", ej.DEFAULT_COHERENCE_PENALTY))
@@ -1210,7 +1220,7 @@ def _handle_eval(ctx: NodeDispatch):
             penalty = ej.DEFAULT_COHERENCE_PENALTY
         gated = ej.coherence_gate(score, coh, penalty)
         process_meta.update(gated_from=score, gated_to=gated)
-        print(f"  [eval] INCOHERENT run (coh=0) → gate {score:.2f}→{gated:.2f} "
+        print(f"  [eval] INCOHERENT success (coh=0) → gate {score:.2f}→{gated:.2f} "
               f"verdict=needs_revision", file=sys.stderr)
         score, verdict = gated, "needs_revision"
 
