@@ -897,6 +897,57 @@ def _read_run_trajectory(db: str, run_id: str, run_dir: str):
     return traces, verifier_verdicts
 
 
+def _stage_checks(plan_present: bool, artifact_ref: str, traces: list,
+                  verifier_verdicts: dict, r_exec: float | None) -> dict:
+    """Derive VPRM per-stage checks (R1) from the run's structured trace. Each is a
+    deterministic signal on one of the six stages, tri-valued (True/False/None so a
+    stage with no signal drops out of Σ wₜrₜ rather than scoring 0):
+
+      plan     — the plan stage produced a non-empty contract.
+      execute  — the run actually did work: a success trace or a declared artifact.
+      verify   — at least one verifier is non-vacuous (produced a real pass/fail).
+      coverage — the pass FRACTION over the concrete verifiers (== Layer-0 r_exec),
+                 crediting *how much* verified, not just that verification ran.
+
+    Kept deliberately rule-based (StructReward): no learned PRM."""
+    from mini_ork.learning import eval_judge as ej  # noqa: PLC0415
+    checks: dict = {}
+    checks["plan"] = True if plan_present else None
+    any_success = any((t.get("status") or "") == "success" for t in traces)
+    checks["execute"] = True if (any_success or artifact_ref) else (
+        False if traces else None)
+    concrete = [ej._verifier_passed(v) for v in verifier_verdicts.values()
+                if isinstance(v, dict)]
+    concrete = [c for c in concrete if c is not None]
+    checks["verify"] = True if concrete else (False if verifier_verdicts else None)
+    checks["coverage"] = r_exec  # already the [0,1] pass fraction, or None
+    return checks
+
+
+def _subproblem_labels(verifier_verdicts: dict) -> list:
+    """Flatten the run's verifiers into verifiable-subproblem labels (R6/SCRL). A
+    verifier that declares sub-cases (``subtasks``/``subresults``/``cases`` — a
+    list of items each carrying ``pass``/``verdict``) contributes one label per
+    case, so a run that fails overall still earns partial progress for the cases it
+    passed. A verifier with no sub-cases contributes its own single pass/fail."""
+    from mini_ork.learning import eval_judge as ej  # noqa: PLC0415
+    labels: list = []
+    for v in verifier_verdicts.values():
+        if not isinstance(v, dict):
+            continue
+        cases = None
+        for key in ("subtasks", "subresults", "cases"):
+            if isinstance(v.get(key), list):
+                cases = v[key]
+                break
+        if cases:
+            for c in cases:
+                labels.append(ej._verifier_passed(c) if isinstance(c, dict) else bool(c))
+        else:
+            labels.append(ej._verifier_passed(v))
+    return labels
+
+
 def _verifier_noise_rates(db: str, verifier_names) -> tuple[float, float]:
     """(ρ_FP, ρ_FN) for the run's verifiers — the Layer-1 noise model. Uses
     labeled ``verifier_results`` (migration 0025) when present (FP via the
@@ -987,6 +1038,31 @@ def _stamp_run_eval_reward(db, run_id, score, axes, source) -> None:
         con.close()
 
 
+def _stamp_run_process_reward(db, run_id, proc_score, exclude_source) -> None:
+    """R7 rail (gated by MO_EVAL_STAMP_PROCESS): write the run-level VPRM process
+    reward (R1) onto every non-eval delivery trace's ``process_reward`` column, so
+    the reflection per-node credit and the SLM distillation learn from PROCESS, not
+    just outcome — small models gain more from process than outcome rewards
+    (2607.02869). Excludes the dedicated eval row. Best-effort."""
+    if not (db and run_id and os.path.isfile(db)):
+        return
+    from mini_ork.learning import eval_judge as ej  # noqa: PLC0415
+    p = ej.clamp01(proc_score)
+    con = sqlite3.connect(db, timeout=5.0)
+    con.execute("PRAGMA busy_timeout=5000")
+    try:
+        cols = {r[1] for r in con.execute("PRAGMA table_info(execution_traces)").fetchall()}
+        if "process_reward" not in cols:
+            return
+        con.execute(
+            "UPDATE execution_traces SET process_reward=? "
+            "WHERE run_id=? AND (reward_source IS NULL OR reward_source != ?)",
+            (p, run_id, exclude_source))
+        con.commit()
+    finally:
+        con.close()
+
+
 def _warn_if_jury_not_decorrelated(jury_lanes) -> None:
     """Advisory (never blocks): a jury drawn from a single model family isn't
     decorrelated, so its consensus is weak — correlated judges make the same
@@ -1061,6 +1137,11 @@ def _handle_eval(ctx: NodeDispatch):
     if r_exec is not None:
         # Layer 1 — de-bias by the verifier's measured/prior FP-FN noise rates.
         fp_rate, fn_rate = _verifier_noise_rates(ctx.db, list(verifier_verdicts.keys()))
+        # R4 (opt-in) — a per-run calibrated confidence γ from the judge shrinks the
+        # static FP/FN priors: a confident verdict is de-biased less. Default OFF.
+        gamma = primary.get("confidence") if primary else None
+        if gamma is not None and os.environ.get("MO_EVAL_CALIBRATED_PRIORS", "0") == "1":
+            fp_rate, fn_rate = ej.calibrated_priors(gamma, fp_rate, fn_rate)
         r_corr = ej.noise_correct(r_exec, fp_rate, fn_rate)
         # Layer 3 — the jury (or single judge) may only VETO by consensus, and
         # abstains when the panel disagrees. Empty panel → no veto (fail-open).
@@ -1100,20 +1181,74 @@ def _handle_eval(ctx: NodeDispatch):
         print(f"  [eval] judge unavailable (rc={rc}) + no execution signal → "
               f"fallback {source} score={score:.2f}", file=sys.stderr)
 
+    # ── Layer 2 (R2) + process reward (R1) + partial progress (R6) + decomposition (R3) ──
+    # Deterministic, gold-free extensions of the anti-Goodhart rule from the OUTCOME
+    # to the PROCESS (2026 verifiable/process-reward cluster). Everything here is
+    # RECORDED in the reward vector + eval.json; the score-CHANGING gates default OFF
+    # so the execution-backbone reward is unchanged unless a run opts in.
+    claimed_verdict = (primary.get("verdict") if primary else "") or verdict
+    step_labels = [ej._verifier_passed(v) for v in verifier_verdicts.values()
+                   if isinstance(v, dict)]
+    coh = ej.coherence(claimed_verdict, step_labels)                       # R2
+    proc_score, proc_detail = ej.process_reward(                          # R1
+        _stage_checks(bool((ctx.plan_content or "").strip()), artifact_ref,
+                      traces, verifier_verdicts, r_exec))
+    sub_score = ej.subproblem_reward(_subproblem_labels(verifier_verdicts))  # R6
+    process_meta = {"coherence": coh, "claimed_verdict": claimed_verdict,
+                    "step_labels": step_labels, "process_reward": proc_score,
+                    "process_detail": proc_detail, "subproblem_reward": sub_score}
+
+    # R2 gate (opt-in): an incoherent run — shipped success the steps don't support
+    # (test_green_wrong) — is downgraded one-way, coherence can only pull DOWN.
+    if coh < 1.0 and os.environ.get("MO_EVAL_COHERENCE_GATE", "0") == "1":
+        try:
+            penalty = float(os.environ.get(
+                "MO_EVAL_COHERENCE_PENALTY", ej.DEFAULT_COHERENCE_PENALTY))
+        except ValueError:
+            penalty = ej.DEFAULT_COHERENCE_PENALTY
+        gated = ej.coherence_gate(score, coh, penalty)
+        process_meta.update(gated_from=score, gated_to=gated)
+        print(f"  [eval] INCOHERENT run (coh=0) → gate {score:.2f}→{gated:.2f} "
+              f"verdict=needs_revision", file=sys.stderr)
+        score, verdict = gated, "needs_revision"
+
+    # R3 decomposition: independent components, each with its own variance, keep the
+    # GRPO group's advantage spread alive when the outcome term is near-binary (SEVA
+    # Prop 1/2). Recorded always; becomes the PRIMARY score only under the flag.
+    components = {
+        "execution": exec_meta.get("r_corrected", exec_meta.get("r_exec")),
+        "coherence": coh, "process": proc_score, "subproblem": sub_score,
+        "correctness": axes.get("correctness"), "groundedness": axes.get("groundedness"),
+    }
+    decomposed, comp_vec = ej.combine_components(components)
+    process_meta["components"] = comp_vec
+    process_meta["decomposed_score"] = decomposed
+    if os.environ.get("MO_EVAL_DECOMPOSED_REWARD", "0") == "1":
+        process_meta["decomposed_from"] = score
+        score, verdict = decomposed, ej.verdict_from_score(decomposed)
+
     # Persist the envelope for offline graders + the data flywheel.
     try:
         with open(os.path.join(run_dir, "eval.json"), "w", encoding="utf-8") as fh:
             json.dump({"score": score, "axes": axes, "verdict": verdict,
                        "rationale": rationale, "trajectory_findings": findings,
-                       "reward_source": source, "execution": exec_meta}, fh, indent=2)
+                       "reward_source": source, "execution": exec_meta,
+                       "process": process_meta}, fh, indent=2)
     except OSError:
         pass
 
-    # Reward vector: numeric axes + execution numbers (DB-safe; detail → eval.json).
+    # Reward vector: numeric axes + execution numbers + process components (R1/R2/R3/R6).
+    # DB-safe (numbers only); the full detail lives in eval.json.
     reward_vector = {k: v for k, v in axes.items() if isinstance(v, (int, float))}
     if exec_meta.get("r_exec") is not None:
         reward_vector["r_exec"] = exec_meta["r_exec"]
         reward_vector["r_corrected"] = exec_meta["r_corrected"]
+    reward_vector["coherence"] = coh
+    if proc_score is not None:
+        reward_vector["process_reward"] = proc_score
+    if sub_score is not None:
+        reward_vector["subproblem_reward"] = sub_score
+    reward_vector["decomposed"] = decomposed
 
     # Write the graded reward onto the wired-but-empty 0042 reward columns.
     try:
@@ -1130,7 +1265,15 @@ def _handle_eval(ctx: NodeDispatch):
         except Exception:
             pass
 
-    print(f"  [eval] {source} score={score:.2f} verdict={verdict} "
+    # R7 (opt-in) — carry the VPRM process reward into the distillation loop.
+    if proc_score is not None and os.environ.get("MO_EVAL_STAMP_PROCESS", "0") == "1":
+        try:
+            _stamp_run_process_reward(ctx.db, ctx.run_id, proc_score, source)
+        except Exception:
+            pass
+
+    print(f"  [eval] {source} score={score:.2f} verdict={verdict} coh={coh} "
+          f"proc={proc_score} "
           f"exec={exec_meta.get('r_exec')} axes={axes}")
     ctx.charge()
     return 0, "done"
