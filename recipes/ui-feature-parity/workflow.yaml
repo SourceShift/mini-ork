@@ -1,0 +1,39 @@
+version: "0.1.0"
+task_class: ui_feature_parity
+description: >
+  Spec gap-closure panel — 3 heterogeneous-family lenses (glm/minimax/opus)
+  read the mini-ork backend route surface, the current OpenHands-native-surface
+  spec, and the ui/ frontend, then each emits the DELTA: backend capabilities
+  not yet covered by an FR or not surfaced in the FE. Opus synthesizes the three
+  gap reports into a single backend→FE coverage matrix + the missing FRs, so the
+  implementation stage misses no feature.
+
+nodes:
+  - { name: planner,           type: planner,    model_lane: planner,      prompt_ref: prompts/planner.md,     dispatch_mode: serial }
+  # D-047: each lens routes to its NAMED family lane. glm (Zhipu) / minimax
+  # (MiniMax) / opus (Anthropic) are 3 distinct families → low-correlation
+  # detectors (Rajan 2025), so the union of their gap lists covers each
+  # single model's consistent blind spot. Opus doubles as the synthesizer
+  # (strongest reasoner for the merge), but decorrelation lives at the lens tier.
+  - { name: glm_lens,          type: researcher, model_lane: glm_lens,     prompt_ref: prompts/lens-glm.md,     dispatch_mode: parallel, gates: [budget_gate] }
+  - { name: minimax_lens,      type: researcher, model_lane: minimax_lens, prompt_ref: prompts/lens-minimax.md, dispatch_mode: parallel, gates: [budget_gate] }
+  - { name: opus_lens,         type: researcher, model_lane: opus_lens,    prompt_ref: prompts/lens-opus.md,    dispatch_mode: parallel, gates: [budget_gate] }
+  - { name: synthesizer,       type: reviewer,   model_lane: reviewer,     prompt_ref: prompts/synthesis.md,    dispatch_mode: serial,   gates: [budget_gate] }
+  - { name: lens_completeness, type: verifier,   verifier_ref: verifiers/lens-completeness.py, dispatch_mode: serial }
+  - { name: publisher,         type: publisher,  prompt_ref: null, dispatch_mode: serial, gates: [scope_gate] }
+  - { name: rollback,          type: rollback,   prompt_ref: null, dispatch_mode: serial }
+
+edges:
+  - { from: planner,      to: glm_lens,          edge_type: depends_on }
+  - { from: planner,      to: minimax_lens,      edge_type: depends_on }
+  - { from: planner,      to: opus_lens,         edge_type: depends_on }
+  - { from: glm_lens,     to: synthesizer,       edge_type: supplies_context_to }
+  - { from: minimax_lens, to: synthesizer,       edge_type: supplies_context_to }
+  - { from: opus_lens,    to: synthesizer,       edge_type: supplies_context_to }
+  - { from: synthesizer,  to: lens_completeness, edge_type: verifies }
+  - { from: lens_completeness, to: publisher,    edge_type: depends_on }
+  - { from: synthesizer,  to: rollback,          edge_type: escalates_to }
+  - { from: lens_completeness, to: rollback,     edge_type: escalates_to }
+
+rollback_strategy: keep_lens_reports_discard_synthesis
+max_self_correction_iterations: 3

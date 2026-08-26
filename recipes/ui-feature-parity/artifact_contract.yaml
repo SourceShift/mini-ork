@@ -1,0 +1,16 @@
+task_class: ui_feature_parity
+expected_artifact: composite     # 3 lens gap reports + 1 synthesis markdown
+success_verifiers:
+  - verifiers/lens-completeness.py
+failure_policy: request_changes
+rollback_policy: >
+  Keep the 3 lens gap reports under runs/<id>/lens-*.md for inspection;
+  discard the synthesis if it failed verification. Lens reports remain
+  individually consumable.
+
+# Publisher writes the synthesized coverage matrix + missing-FR addendum to a
+# sibling of the hand-written spec (does NOT overwrite it); the implementation
+# stage consumes both the original spec and this coverage doc.
+source_artifact: synthesis.md
+outputs:
+  - specs/openhands-native-surface.coverage.md

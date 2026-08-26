@@ -1,0 +1,38 @@
+name: ui_feature_parity
+version: "0.1.0"
+description: >
+  Read-only multi-lens audit that measures the gap between the mini-ork
+  backend surface (web routes, dispatch, learning, trajectory) and what the
+  OpenHands agent-canvas frontend exposes, then produces a coverage matrix
+  plus the missing functional requirements needed to close it.
+
+# Invoked explicitly by name (`bin/mini-ork run ui-feature-parity <kickoff>`),
+# so the matcher is informational; keywords let the classifier also route here.
+matches:
+  keywords:
+    - ui parity
+    - feature parity
+    - frontend parity
+    - surface coverage
+    - coverage matrix
+    - expose backend in ui
+    - openhands surface
+  regex: []
+
+artifact_contract_ref: artifact_contract.yaml
+default_workflow: workflow.yaml
+
+default_gates:
+  - budget_gate
+  - scope_gate
+
+risk_class: low   # Read-only analysis; no source mutation. Publisher writes one spec doc.
+
+cost_model:
+  min_usd: 1
+  max_usd: 20
+  per_lens_usd: 4
+
+runtime_model:
+  min_minutes: 3
+  max_minutes: 45
