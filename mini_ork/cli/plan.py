@@ -677,9 +677,9 @@ def main(argv=None, *, root=None, dispatch=None) -> int:
             return 1
         rc, raw = dispatch_fn(task_class, "planner", prompt)
         if rc != 0:
-            sys.stderr.write("LLM dispatch failed for planner node\n")
+            sys.stderr.write(f"LLM dispatch failed for planner node (rc={rc}): {_dispatch_error_detail(raw)}\n")
             _charge_cost(db, run_id)
-            _trace_plan(trace_id, task_class, "failure", db)
+            _trace_plan(trace_id, task_class, "failure", db, reason=f"planner_dispatch_rc_{rc}")
             return 1
 
     plan_json = extract_plan_json(raw)
@@ -710,10 +710,10 @@ def main(argv=None, *, root=None, dispatch=None) -> int:
                 rc, repaired = dispatch_fn(task_class, "planner", repair_prompt)
                 _charge_cost(db, run_id)
                 if rc != 0:
-                    sys.stderr.write("LLM dispatch failed for planner repair\n")
+                    sys.stderr.write(f"LLM dispatch failed for planner repair (rc={rc}): {_dispatch_error_detail(raw)}\n")
                     _mark_failed(db, run_id, first_verdict)
                     _trace_plan(trace_id, task_class, "failure", db,
-                                reviewer_verdict=first_verdict)
+                                reviewer_verdict=first_verdict, reason=f"planner_repair_rc_{rc}")
                     return 1
                 raw = repaired
                 plan_json = extract_plan_json(raw)
@@ -778,6 +778,20 @@ def _build_prompt(root, kickoff, workflow, profile_path) -> str:
     if profile_path and os.path.isfile(profile_path):
         prompt += "\n\n--- RUN PROFILE ---\n" + open(profile_path).read() + "\n--- /RUN PROFILE ---\n"
     return prompt
+
+
+def _dispatch_error_detail(raw):
+    """One-line, capped tail of the dispatcher's combined output.
+
+    The dispatch callable returns ``(rc, combined_stdout_stderr)``; on failure
+    the buffer holds the provider CLI's own error prints (e.g. claude CLI
+    usage errors, rc=2). Surface the last non-empty line so run logs show the
+    real cause instead of a generic 'LLM dispatch failed'.
+    """
+    lines = [ln.strip() for ln in (raw or "").splitlines() if ln.strip()]
+    if not lines:
+        return "no dispatcher output"
+    return lines[-1][:200]
 
 
 def _default_llm_dispatch(root):
