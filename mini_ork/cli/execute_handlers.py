@@ -83,6 +83,30 @@ policy_route_lane = _execute_delegate("policy_route_lane")
 publisher_node = _execute_delegate("publisher_node")
 
 
+def resolve_prompt_file(root, recipe, prompt_ref, node_type) -> str:
+    """Resolve a node prompt, preferring a flat per-run override directory."""
+    override_dir = os.environ.get("MINI_ORK_PROMPT_OVERRIDE_DIR", "").strip()
+    if override_dir and prompt_ref:
+        override_file = os.path.join(override_dir, os.path.basename(prompt_ref))
+        if os.path.isfile(override_file):
+            return override_file
+
+    recipe_dir = os.path.join(root, "recipes", recipe) if recipe else ""
+    if (
+        prompt_ref
+        and recipe_dir
+        and os.path.isfile(os.path.join(recipe_dir, prompt_ref))
+    ):
+        return os.path.join(recipe_dir, prompt_ref)
+    if recipe_dir and os.path.isfile(
+        os.path.join(recipe_dir, "prompts", f"{node_type}.md")
+    ):
+        return os.path.join(recipe_dir, "prompts", f"{node_type}.md")
+    if os.path.isfile(os.path.join(root, "prompts", f"{node_type}.md")):
+        return os.path.join(root, "prompts", f"{node_type}.md")
+    return ""
+
+
 def _node_publish_boundary(fn):
     """Own the per-node isolation boundary (bottleneck #1).
 
@@ -237,13 +261,19 @@ def dispatch_node(fields, *, root, run_dir, plan_path, task_class, db, run_id,
             return 1, "timeout"
 
     recipe_dir = os.path.join(root, "recipes", recipe) if recipe else ""
-    prompt_file = ""
-    if prompt_ref and recipe_dir and os.path.isfile(os.path.join(recipe_dir, prompt_ref)):
-        prompt_file = os.path.join(recipe_dir, prompt_ref)
-    elif recipe_dir and os.path.isfile(os.path.join(recipe_dir, "prompts", f"{node_type}.md")):
-        prompt_file = os.path.join(recipe_dir, "prompts", f"{node_type}.md")
-    elif os.path.isfile(os.path.join(root, "prompts", f"{node_type}.md")):
-        prompt_file = os.path.join(root, "prompts", f"{node_type}.md")
+    prompt_file = resolve_prompt_file(root, recipe, prompt_ref, node_type)
+    override_dir = os.environ.get("MINI_ORK_PROMPT_OVERRIDE_DIR", "").strip()
+    override_name = os.path.basename(prompt_ref) if prompt_ref else ""
+    if (
+        override_dir
+        and override_name
+        and prompt_file == os.path.join(override_dir, override_name)
+    ):
+        print(
+            f"[prompt-override] node_id={node_id} using {override_name} "
+            "from MINI_ORK_PROMPT_OVERRIDE_DIR",
+            file=sys.stderr,
+        )
 
     plan_content = open(plan_path).read() if plan_path and os.path.isfile(plan_path) else ""
     # F5-B: reflect-learned failure modes + operator steering, injected after node_desc
