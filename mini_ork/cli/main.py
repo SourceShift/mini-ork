@@ -585,11 +585,32 @@ def _should_run_rubric(run_dir: str) -> bool:
     )
 
 
+def _load_secret_store_env() -> None:
+    """Bash-dispatcher parity: the retired dispatcher `source`d
+    secrets.local.sh at startup, so MO_*/MINI_ORK_* overrides in the store
+    reached every child process — nodes, transports, AND verifiers. Native
+    dispatch only fed the store to provider transports, which silently
+    stranded non-credential overrides (e.g. MINI_ORK_TYPECHECK_CMD) outside
+    the verifier env. Load the store here with setdefault so the whole
+    process tree inherits it while real environment variables still win.
+    An unreadable store degrades to a warning: `mini-ork help` must not fail
+    on a mis-permissioned credential file (mirrors the doctor handler)."""
+    from mini_ork.dispatch.secrets import SecretStoreError, read_secret_exports
+    try:
+        stored = read_secret_exports()
+    except SecretStoreError as exc:
+        sys.stderr.write(f"warning: secret store not loaded: {exc}\n")
+        return
+    for name, value in stored.items():
+        os.environ.setdefault(name, value)
+
+
 def main(argv=None, *, root=None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     root = root or os.environ.get("MINI_ORK_ROOT") or os.path.dirname(
         os.path.dirname(os.path.realpath(__file__)))
     os.environ["MINI_ORK_ROOT"] = root
+    _load_secret_store_env()
     sub = argv[0] if argv else "help"
     rest = argv[1:]
 
