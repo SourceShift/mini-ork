@@ -106,9 +106,24 @@ def _claude_envelope(stdout: str) -> dict:
 
 
 def claude_result_text(stdout: str) -> str:
-    """Extract the assistant body from claude's JSON envelope (.result)."""
+    """Extract the assistant body from claude's JSON envelope (.result).
+
+    Strips any ``<z-insight>…</z-insight>`` protocol block the nested claude CLI
+    appends when it auto-discovers a global ``~/.claude/CLAUDE.md`` (the
+    z-dashboard reporting protocol). Left in place, that trailing block corrupts
+    JSON-shaped node output: the planner shape gate (``looks_like_json``) slices
+    the widest ``{..}`` span, lands the closing brace inside the z-insight JSON,
+    and rejects an otherwise-valid plan (rc=65). Cleaning at this single
+    chokepoint yields a clean ``res.text`` for every downstream path (shape
+    check, artifact write, multi-lane fallback) and every claude-binary lane
+    (sonnet/opus review plus the minimax/glm builders that route through the
+    claude binary)."""
     env = _claude_envelope(stdout)
-    return str(env.get("result") or "") if env else stdout
+    body = str(env.get("result") or "") if env else stdout
+    if "<z-insight>" in body:
+        body = re.sub(r"<z-insight>.*?</z-insight>", "", body, flags=re.S)
+        body = re.sub(r"<z-insight>.*\Z", "", body, flags=re.S).rstrip()
+    return body
 
 
 def parse_claude_usage(stdout: str) -> TokenUsage:
