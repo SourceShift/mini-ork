@@ -109,6 +109,10 @@ def test_transport_requires_key(monkeypatch, capsys):
 
 def test_openai_chat_kind_resolves_to_http_transport(tmp_path, monkeypatch):
     monkeypatch.delenv("MINI_ORK_PROVIDERS", raising=False)
+    # Pin the home so ONLY the registry written below is consulted — otherwise
+    # the loader's first candidate ($MINI_ORK_HOME or CWD-relative .mini-ork)
+    # shadows it and the lane resolves as unknown on machines with a live home.
+    monkeypatch.setenv("MINI_ORK_HOME", str(tmp_path / ".mini-ork"))
     monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test")
     registry = tmp_path / ".mini-ork" / "config"
     registry.mkdir(parents=True)
