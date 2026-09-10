@@ -37,13 +37,13 @@ def _sql(db, s):
     return subprocess.run(["sqlite3", db, s], capture_output=True, text=True)
 
 
-def _insert_trace(db, tid, av, status, cost, dur, validity=None):
+def _insert_trace(db, tid, av, status, cost, dur, validity=None, verdict=""):
     cols = ("trace_id,run_id,workflow_version_id,agent_version_id,task_class,"
             "prompt_version_hash,context_bundle_hash,tool_calls,files_read,"
             "files_written,verifier_output,reviewer_verdict,cost_usd,duration_ms,"
             "final_artifact_ref,status,created_at")
     vals = (f"'{tid}','r1','wf1','{av}','code_fix','ph','ch','[]','[]','[]',"
-            f"'{{\"node_type\":\"researcher\"}}','',{cost},{dur},'','{status}',"
+            f"'{{\"node_type\":\"researcher\"}}','{verdict}',{cost},{dur},'','{status}',"
             f"'2026-07-01T00:00:00Z'")
     if validity is not None:
         cols += ",validity"
@@ -128,3 +128,22 @@ def test_is_non_learnable_exit_predicate():
     assert not is_non_learnable_exit("done")
     assert not is_non_learnable_exit("")
     assert not is_non_learnable_exit("success")
+
+
+def test_failure_status_scores_via_base_band_not_early_return(tmp_path):
+    # F1 regression pin: the schema's status is 'failure' (singular — see the
+    # execution_traces CHECK constraint, which _insert_trace enforces loudly).
+    # reward() must score it through the designed base band (failure 0.15,
+    # verdict can nudge ±0.10), never through the unknown-status early return
+    # that flat-zeroed verdict-less failures and ranked approved failures
+    # ABOVE successes at 1.0. Non-family lanes so the verdict band applies.
+    db = _seed_db(tmp_path, "vocab")
+    _insert_trace(db, "t1", "alpha_lane", "failure", 0.5, 800, verdict="approve")
+    _insert_trace(db, "t2", "beta_lane", "failure", 0.5, 800)
+    _insert_trace(db, "t3", "gamma_lane", "success", 1.0, 1000)
+    write_grpo_advantages(db)
+    # Designed rewards: approve-failure 0.25 < plain failure 0.15 < success 0.85
+    # — a failure must never outrank a success, whatever the reviewer said.
+    assert (float(_adv(db, "beta_lane"))
+            < float(_adv(db, "alpha_lane"))
+            < float(_adv(db, "gamma_lane")))
