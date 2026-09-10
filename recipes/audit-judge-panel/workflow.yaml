@@ -1,0 +1,25 @@
+version: "0.1.0"
+task_class: audit_judge_panel
+description: >
+  Two independent judges verify audit findings against live evidence
+  (state DB + source code), then a synthesizer reconciles their verdicts.
+  All nodes are read-only with respect to repo source.
+
+nodes:
+  - { name: opus_judge, type: researcher, model_lane: opus_lens, prompt_ref: prompts/opus-judge.md, dispatch_mode: parallel, gates: [budget_gate] }
+  - { name: minimax_judge, type: researcher, model_lane: minimax_lens, prompt_ref: prompts/minimax-judge.md, dispatch_mode: parallel, gates: [budget_gate] }
+  - { name: synthesizer, type: reviewer, model_lane: reviewer, prompt_ref: prompts/synthesis.md, dispatch_mode: serial, gates: [budget_gate] }
+  - { name: panel_completeness, type: verifier, verifier_ref: verifiers/panel-completeness.py, dispatch_mode: serial }
+  - { name: publisher, type: publisher, prompt_ref: null, dispatch_mode: serial }
+  - { name: rollback, type: rollback, prompt_ref: null, dispatch_mode: serial }
+
+edges:
+  - { from: opus_judge, to: synthesizer, edge_type: supplies_context_to }
+  - { from: minimax_judge, to: synthesizer, edge_type: supplies_context_to }
+  - { from: synthesizer, to: panel_completeness, edge_type: verifies }
+  - { from: panel_completeness, to: publisher, edge_type: depends_on }
+  - { from: synthesizer, to: rollback, edge_type: escalates_to }
+  - { from: panel_completeness, to: rollback, edge_type: escalates_to }
+
+rollback_strategy: keep_judge_reports_discard_synthesis
+max_self_correction_iterations: 1

@@ -1,0 +1,31 @@
+name: audit_judge_panel
+version: "0.1.0"
+description: >
+  Two-lane read-only judge panel (Anthropic claude-opus-4-8 via opus_lens +
+  MiniMax-M3 via minimax_lens) that independently verifies audit findings
+  against the live state DB and source, then synthesizes agreement.
+
+matches:
+  keywords:
+    - audit judge panel
+    - judge audit findings
+    - findings review panel
+    - audit verdict panel
+  regex: []
+
+artifact_contract_ref: artifact_contract.yaml
+default_workflow: workflow.yaml
+
+default_gates:
+  - budget_gate
+
+risk_class: low
+
+cost_model:
+  min_usd: 2
+  max_usd: 20
+  per_lens_usd: 5
+
+runtime_model:
+  min_minutes: 5
+  max_minutes: 45
