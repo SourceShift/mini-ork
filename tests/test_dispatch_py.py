@@ -190,7 +190,7 @@ def test_claude_env_for_uses_registry_contract(monkeypatch):
     monkeypatch.setenv("GLM_API_KEY", "dummy-key-for-test")
     env = claude_env_for("glm")
     assert env.get("ANTHROPIC_BASE_URL") == "https://api.z.ai/api/anthropic"
-    assert env.get("ANTHROPIC_MODEL") == "GLM-5.1"
+    assert env.get("ANTHROPIC_MODEL") == "GLM-5.3"
 
 
 def test_claude_env_for_empty_without_key(monkeypatch):
