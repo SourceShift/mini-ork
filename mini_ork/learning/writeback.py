@@ -251,7 +251,7 @@ def write_grpo_advantages(db) -> int:
         verdict = (row["reviewer_verdict"] or "").lower()
         status = (row["status"] or "").lower()
         same_family = _lane_family(row["agent_version_id"]) is not None
-        if status not in {"success", "failed"}:
+        if status not in _REWARD_SUCCESS_STATUSES and status not in _REWARD_FAILURE_STATUSES:
             if verdict in _APPROVE:
                 return 1.0
             if verdict in _REJECT:
