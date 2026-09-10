@@ -1017,8 +1017,8 @@ def test_agents_endpoint_legacy_null_snapshot_uses_fallback(tmp_path: Path, monk
     monkeypatch.setenv("MINI_ORK_ROOT", str(ROOT))
     out = list_agents(task_run_id="run-legacy", db=StateDB(db_path), home=home)
     code_lens = next(a for a in out["agents"] if a["node_id"] == "code_impact_lens")
-    assert code_lens["model_lane"] == "kimi_lens"
-    assert code_lens["family"] == "kimi"
+    assert code_lens["model_lane"] == "minimax_lens"
+    assert code_lens["family"] == "minimax"
     assert code_lens["model_id"] is None
 
 
@@ -1030,7 +1030,7 @@ def test_agents_endpoint_prefers_dispatch_config_snapshot(tmp_path: Path, monkey
     home.mkdir()
     db_path = home / "state.db"
     snapshot = {
-        "kimi_lens": {
+        "minimax_lens": {
             "family": "historical-family",
             "model_id": "historical-model",
             "provider": "historical-provider",
