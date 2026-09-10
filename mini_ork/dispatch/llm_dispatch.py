@@ -513,19 +513,31 @@ def llm_dispatch(argv=None, *, root=None, dispatch_fn=None) -> int:
                 pass
         return 0
 
-    _write_duration_ms(0)
+    duration_ms = int(time.time() * 1000) - start_ms
+    _write_duration_ms(duration_ms)
     err = ""
     try:
         err = (open(out_file + ".err.log", errors="ignore").read()[-200:])
     except OSError:
         pass
     err = redact_secrets(err)
-    write_llm_calls_row(db, provider, selected_model, tier, feature, actor, "failed", 0, 0, err)
+    # A failed call still burned wall-clock, and partial provider usage often
+    # survives in the sidecars — record both instead of hard zeros.
+    cost_usd = "0"
+    if os.path.isfile(out_file + ".cost"):
+        cost_usd = open(out_file + ".cost").read().strip() or "0"
+    in_tok = out_tok = cached_in = cache_create = 0
+    if os.path.isfile(out_file + ".tokens"):
+        parts = (open(out_file + ".tokens").read().split("\t") + ["0"] * 4)[:4]
+        in_tok, out_tok, cached_in, cache_create = (_int_or(p, 0) for p in parts)
+    write_llm_calls_row(db, provider, selected_model, tier, feature, actor, "failed",
+                        duration_ms, cost_usd, err, in_tok, out_tok, "{}", cached_in, cache_create)
     sys.stderr.write(f"[llm_dispatch FAIL model={model} rc={rc}]\n")
-    try:
-        os.remove(out_file + ".model")
-    except OSError:
-        pass
+    for side in (out_file + ".tokens", out_file + ".model"):
+        try:
+            os.remove(side)
+        except OSError:
+            pass
     if tmp_out:
         try:
             os.remove(tmp_out)
