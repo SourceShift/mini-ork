@@ -33,6 +33,11 @@ Public surface (mirrors the bash API one-for-one):
 
 Env contract (identical to bash):
     MO_APPLY_ENABLED=1            master gate (default OFF)
+    MO_APPLY_UNVETTED=1           allow promotes while only the mock/gepa
+                                  placeholder scorer is wired (operator
+                                  opt-in; otherwise → pending_human_approval)
+    MO_APPLY_MODE=append|replace  append = idempotent directive block (default,
+                                  F3 2026-09-12); replace = legacy whole-file
     MO_APPLY_DRY_RUN=1            skip file write + version_registry write
     MO_APPLY_NONREGRESSION_DELTA  default 0.0
     MO_APPLY_REGRESSION_TOLERANCE default 0 (strict per-task no-regression)
@@ -236,15 +241,19 @@ def pick_candidate(task_class: str, target_kind: str, target_name: str,
                 "cluster_label": row["cluster_label"],
             })
 
-        # Priority 3: gradient_records fallback — only as last resort.
+        # Priority 3: gradient_records fallback — only as last resort. The
+        # gradient's `target` (e.g. agent.reviewer.prompt) must match the
+        # requested target_name exactly: without the filter, any gradient of
+        # the task_class wins and a workflow.node.* directive could be
+        # appended to an agent prompt file.
         row = con.execute("""
             SELECT gradient_id AS id, suggested_change, signal, confidence,
                    row_number() OVER (ORDER BY confidence DESC) AS rank
             FROM gradient_records
-            WHERE task_class=?
+            WHERE task_class=? AND target=?
             ORDER BY confidence DESC
             LIMIT 1
-        """, (task_class,)).fetchone()
+        """, (task_class, target_name)).fetchone()
         if row is not None:
             return json.dumps({
                 "source_kind": "gradient_records",
@@ -474,12 +483,35 @@ def materialize_candidate(task_class: str, target_kind: str, target_name: str,
 # ─────────────────────────────────────────────────────────────────────────────
 # apply_apply_mutation
 # ─────────────────────────────────────────────────────────────────────────────
+def _directive_block(new_prompt: str, *, source_ref: str = "",
+                     context: str = "") -> str:
+    """Render one appended learning directive. The HTML-comment marker line
+    carries the idempotency key (source_ref) and is also the audit anchor a
+    human greps for; the observation/directive pair stays visible so the
+    executing model gets the rationale, GEPA-style."""
+    marker = f"<!-- applied:{source_ref} -->" if source_ref else "<!-- applied -->"
+    lines = [marker]
+    if context:
+        lines.append(f"- Observation: {context.strip()}")
+    lines.append(f"- Directive: {new_prompt.strip()}")
+    return "\n".join(lines)
 def apply_mutation(candidate_id: str, target_file: str, new_prompt: str,
-                   db: str | None = None) -> str:
-    """On PROMOTED decisions, rewrite the target prompt file and write a
+                   db: str | None = None, *, source_ref: str = "",
+                   context: str = "") -> str:
+    """On PROMOTED decisions, mutate the target prompt file and write a
     version_registry row. NO-OP (returns "") unless MO_APPLY_ENABLED=1 and
     MO_APPLY_DRY_RUN is unset/0. Returns the version_id ("" when skipped or
-    when the version register call fails — bash's `|| true` swallows it)."""
+    when the version register call fails — bash's `|| true` swallows it).
+
+    F3 semantics (2026-09-12): when the target file already exists and
+    MO_APPLY_MODE is "append" (default), the change lands as an idempotent
+    learning-directive block APPENDED to the prompt — gradient
+    ``suggested_change`` text is a one-sentence directive, not a full prompt,
+    so whole-file replacement would erase the prompt. ``source_ref`` (e.g.
+    "gradient_records:gr-…") is the idempotency marker: a re-apply of the
+    same source is skipped. MO_APPLY_MODE=replace restores the legacy
+    whole-file rewrite for callers that pass a complete prompt.
+    """
     apply_enabled = os.environ.get("MO_APPLY_ENABLED", "0")
     dry_run = os.environ.get("MO_APPLY_DRY_RUN", "0")
 
@@ -490,17 +522,33 @@ def apply_mutation(candidate_id: str, target_file: str, new_prompt: str,
         )
         return ""
 
+    mode = os.environ.get("MO_APPLY_MODE", "append")
+    existing = ""
+    if os.path.isfile(target_file):
+        with open(target_file, encoding="utf-8", errors="replace") as fh:
+            existing = fh.read()
+        if mode == "append" and source_ref and source_ref in existing:
+            sys.stderr.write(
+                f"apply_apply_mutation: {source_ref} already applied to "
+                f"{target_file}; skipping (idempotent)\n")
+            return ""
+
     # Snapshot the previous file content into a rollback handle BEFORE writing.
     prev_hash = ""
-    if os.path.isfile(target_file):
-        with open(target_file, "rb") as fh:
-            prev_hash = hashlib.sha256(fh.read()).hexdigest()
+    if existing:
+        prev_hash = hashlib.sha256(existing.encode("utf-8")).hexdigest()
         shutil.copyfile(target_file, f"{target_file}.apply-rollback-{os.getpid()}")
 
-    # Write the new prompt content (bash: printf '%s\n' > file).
+    if existing and mode == "append":
+        block = _directive_block(new_prompt, source_ref=source_ref,
+                                 context=context)
+        out = existing.rstrip("\n") + "\n\n" + block + "\n"
+    else:
+        out = f"{new_prompt}\n"
+
     try:
         with open(target_file, "w") as fh:
-            fh.write(f"{new_prompt}\n")
+            fh.write(out)
     except OSError:
         sys.stderr.write(f"apply_apply_mutation: FAILED to write {target_file}\n")
         raise
@@ -667,6 +715,25 @@ def apply_run(task_class: str, target_kind: str, target_name: str,
     gate_rationale = gate["rationale"]
     utility_delta = gate["utility_delta"]
 
+    # 4b. Evaluator honesty (F3 enable, 2026-09-12). The mock scorer and the
+    #     gepa placeholder fabricate utility numbers (mock centers after≈0.55
+    #     against a 0.0 baseline → the scalar gate promotes EVERYTHING). A
+    #     promote on fabricated numbers is only allowed under an explicit
+    #     operator opt-in (MO_APPLY_UNVETTED=1); otherwise it is recorded as
+    #     pending_human_approval so the audit trail never claims a measured
+    #     improvement that was not measured.
+    scorer = os.environ.get("MO_APPLY_SCORER", "mock")
+    if gate_decision == "promoted" and scorer in ("mock", "gepa"):
+        if os.environ.get("MO_APPLY_UNVETTED", "0") == "1":
+            gate_rationale = (f"UNVETTED promote (scorer={scorer} fabricates "
+                              f"utility; operator-enabled via MO_APPLY_UNVETTED); "
+                              f"{gate_rationale}")
+        else:
+            gate_decision = "pending_human_approval"
+            gate_rationale = (f"no real evaluator wired (scorer={scorer}); "
+                              f"refusing unvetted promote — set MO_APPLY_UNVETTED=1 "
+                              f"to allow unvetted applies; {gate_rationale}")
+
     # 5. Promotion record (audit). For quarantined / pending_human_approval
     #    decisions the promotion row still exists (it's the audit trail of
     #    why we did NOT promote).
@@ -678,7 +745,10 @@ def apply_run(task_class: str, target_kind: str, target_name: str,
     version_id = ""
     if gate_decision == "promoted" and target_file and suggested_change:
         try:
-            version_id = apply_mutation(candidate_id, target_file, suggested_change, db=db)
+            version_id = apply_mutation(
+                candidate_id, target_file, suggested_change, db=db,
+                source_ref=f"{source_kind}:{source_id}" if source_id else "",
+                context=parsed.get("signal", ""))
         except OSError:
             # bash: `version_id=$(apply_apply_mutation ... || true)` swallows
             # the write-failure rc; the flow continues with an empty id.

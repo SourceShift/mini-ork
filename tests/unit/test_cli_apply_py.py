@@ -134,6 +134,7 @@ CREATE TABLE apply_attempts (
 _APPLY_ENV = [
     "MINI_ORK_DB", "MINI_ORK_HOME", "MINI_ORK_ROOT",
     "MO_APPLY_ENABLED", "MO_APPLY_DRY_RUN", "MO_APPLY_SCORER",
+    "MO_APPLY_UNVETTED", "MO_APPLY_MODE",
     "MO_APPLY_NONREGRESSION_DELTA", "MO_APPLY_MIN_EXAMPLES",
     "MO_APPLY_REGRESSION_TOLERANCE", "MO_APPLY_PERTASK_JSON",
     "MO_APPLY_MOCK_BASELINE", "MO_APPLY_MOCK_DELTA",
@@ -315,11 +316,13 @@ def test_apply_run_dry_run_promote_writes_no_file(db, tmp_path, capsys):
     target = tmp_path / "reviewer.md"
     target.write_text("ORIGINAL PROMPT\n")
     # Master gate OFF (default) → stage + score + audit, but never write.
+    # Honest default: the mock scorer fabricates utility, so without
+    # MO_APPLY_UNVETTED=1 the promote is recorded as pending_human_approval.
     rc = ap.apply_run("reviewer", "prompt_file", "prompts/reviewer.md",
                       str(target), db=db)
     assert rc == 0
     summary = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
-    assert summary["decision"] == "promoted"  # mock beats the 0.0 baseline
+    assert summary["decision"] == "pending_human_approval"
     assert summary["candidate_id"].startswith("cand-")
     assert summary["promotion_id"].startswith("pr-")
     assert summary["version_id"] == ""  # no write while disabled
@@ -335,12 +338,13 @@ def test_apply_run_dry_run_promote_writes_no_file(db, tmp_path, capsys):
 
     promos = _rows(db, "promotion_records")
     assert len(promos) == 1
-    assert promos[0]["decision"] == "promoted"
+    assert promos[0]["decision"] == "pending_human_approval"
     assert promos[0]["decided_by"] == "gate"
+    assert "no real evaluator" in promos[0]["rationale"]
 
     attempts = _rows(db, "apply_attempts")
     assert len(attempts) == 1
-    assert attempts[0]["decision"] == "promoted"
+    assert attempts[0]["decision"] == "pending_human_approval"
     assert attempts[0]["dry_run"] == 0
     assert attempts[0]["apply_enabled"] == 0
 
@@ -350,13 +354,18 @@ def test_apply_run_enabled_rewrites_file_and_registers_version(db, tmp_path, cap
     target = tmp_path / "reviewer.md"
     target.write_text("ORIGINAL PROMPT\n")
     envscrub.setenv("MO_APPLY_ENABLED", "1")
+    envscrub.setenv("MO_APPLY_UNVETTED", "1")
     rc = ap.apply_run("reviewer", "prompt_file", "prompts/reviewer.md",
                       str(target), db=db)
     assert rc == 0
     summary = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
     assert summary["decision"] == "promoted"
-    # printf '%s\n' semantics: content + trailing newline
-    assert target.read_text() == "improve prompts/reviewer.md wording\n"
+    # F3 append semantics: the original prompt survives, the change lands as
+    # an idempotent directive block below it.
+    applied = target.read_text()
+    assert applied.startswith("ORIGINAL PROMPT\n")
+    assert "<!-- applied:pattern_records:pat-1 -->" in applied
+    assert "- Directive: improve prompts/reviewer.md wording" in applied
     # rollback snapshot next to the target (bash: <file>.apply-rollback-$$)
     rollbacks = list(tmp_path.glob("reviewer.md.apply-rollback-*"))
     assert len(rollbacks) == 1
@@ -371,6 +380,8 @@ def test_apply_run_enabled_rewrites_file_and_registers_version(db, tmp_path, cap
     assert payload["candidate_id"] == summary["candidate_id"]
     assert summary["version_id"] == versions[0]["version_id"]
     assert _rows(db, "apply_attempts")[0]["apply_enabled"] == 1
+    # the audit rationale admits the promote is unvetted
+    assert "UNVETTED" in _rows(db, "promotion_records")[0]["rationale"]
 
 
 def test_apply_run_forced_regression_quarantines(db, tmp_path, capsys, envscrub):
@@ -394,6 +405,75 @@ def test_apply_run_forced_regression_quarantines(db, tmp_path, capsys, envscrub)
     assert promos[0]["decision"] == "quarantined"
     assert "regression" in promos[0]["rationale"]
     assert _rows(db, "apply_attempts")[0]["decision"] == "quarantined"
+
+
+# ── 11b. F3 enable semantics (append + unvetted honesty + target filter) ─────
+
+def test_apply_run_refuses_unvetted_promote_by_default(db, tmp_path, capsys, envscrub):
+    """ENABLED alone must not produce a file write: the mock scorer fabricates
+    utility, so the honest default records pending_human_approval."""
+    _seed_pattern(db)
+    target = tmp_path / "reviewer.md"
+    target.write_text("ORIGINAL PROMPT\n")
+    envscrub.setenv("MO_APPLY_ENABLED", "1")
+    rc = ap.apply_run("reviewer", "prompt_file", "prompts/reviewer.md",
+                      str(target), db=db)
+    assert rc == 0
+    summary = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert summary["decision"] == "pending_human_approval"
+    assert summary["version_id"] == ""
+    assert target.read_text() == "ORIGINAL PROMPT\n"
+    assert not list(tmp_path.glob("reviewer.md.apply-rollback-*"))
+    assert "MO_APPLY_UNVETTED=1" in _rows(db, "promotion_records")[0]["rationale"]
+
+
+def test_apply_mutation_append_idempotent(db, tmp_path, envscrub):
+    target = tmp_path / "reviewer.md"
+    target.write_text("ORIGINAL PROMPT\n")
+    envscrub.setenv("MO_APPLY_ENABLED", "1")
+    kw = {"source_ref": "gradient_records:gr-9", "context": "empty traces"}
+    v1 = ap.apply_mutation("cand-1", str(target), "emit an action ledger", db=db, **kw)
+    assert v1  # version registered
+    applied = target.read_text()
+    assert applied.startswith("ORIGINAL PROMPT\n")
+    assert "<!-- applied:gradient_records:gr-9 -->" in applied
+    assert "- Observation: empty traces" in applied
+    assert "- Directive: emit an action ledger" in applied
+    # Re-apply of the same source is a no-op (idempotency marker).
+    v2 = ap.apply_mutation("cand-2", str(target), "emit an action ledger", db=db, **kw)
+    assert v2 == ""
+    assert target.read_text() == applied  # byte-identical
+
+
+def test_apply_mutation_replace_mode_restores_whole_file(db, tmp_path, envscrub):
+    target = tmp_path / "reviewer.md"
+    target.write_text("ORIGINAL PROMPT\n")
+    envscrub.setenv("MO_APPLY_ENABLED", "1")
+    envscrub.setenv("MO_APPLY_MODE", "replace")
+    ap.apply_mutation("cand-1", str(target), "FULL NEW PROMPT", db=db)
+    assert target.read_text() == "FULL NEW PROMPT\n"
+
+
+def test_pick_candidate_gradient_filters_by_target(db):
+    con = sqlite3.connect(db)
+    con.executemany(
+        "INSERT INTO gradient_records"
+        " (gradient_id, target, signal, suggested_change, evidence, confidence, created_at, task_class)"
+        " VALUES (?,?,?,?,?,?,?,?)",
+        [("gr-a", "agent.reviewer.prompt", "sig-a", "change-a", "[]", 0.9, 100, "framework_edit"),
+         ("gr-b", "workflow.node.verify", "sig-b", "change-b", "[]", 0.99, 101, "framework_edit")],
+    )
+    con.commit()
+    con.close()
+    # Must pick THIS target's gradient (gr-a), not the task_class-wide
+    # highest-confidence one (gr-b lives on a different target).
+    picked = json.loads(ap.pick_candidate("framework_edit", "prompt_file",
+                                          "agent.reviewer.prompt", db=db))
+    assert picked["source_id"] == "gr-a"
+    assert picked["suggested_change"] == "change-a"
+    # Unknown target → no candidate, not a mismatched borrow.
+    assert ap.pick_candidate("framework_edit", "prompt_file",
+                             "agent.planner.prompt", db=db) == ""
 
 
 # ── 12. CLI surface (bin/mini-ork-apply parity) ──────────────────────────────
