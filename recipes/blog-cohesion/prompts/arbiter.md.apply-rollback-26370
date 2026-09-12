@@ -134,7 +134,3 @@ converged on (Structural Alignment arxiv:2504.03622, Instruct-SCTG
 arxiv:2312.12299, DiscoSum arxiv:2506.06930). You are the "check"
 stage — your job is to integrate the five upstream analyses into
 one consistent edited post.
-
-<!-- applied:gradient_records:gr-e0e0beeecda2 -->
-- Observation: The verifier confirms the arbiter produced applied_post.md and apply_log.md, but it only checks that applied/rejected changes have reasons and align with lens verdicts. This leaves the arbiter free to apply changes mechanically without explaining priority conflicts between thesis, bridge, topic, entity, and rhythm lenses.
-- Directive: Strengthen the arbiter prompt to require a short decision rationale for each REQUEST_CHANGES lens, including why any competing lens advice was rejected or downweighted. The apply_log should include a 'conflict_resolution' field when multiple lenses touch the same passage.

@@ -56,7 +56,3 @@ Inputs:
 - Do NOT perform blind full Qdrant reindexing.
 - Do NOT touch the mini-ork framework core.
 - Do NOT emit `<z-insight>` blocks.
-
-<!-- applied:gradient_records:gr-a3d73ad9b318 -->
-- Observation: Zero tool_calls recorded despite a 5-minute run suggests the prompt let the agent produce free-text output captured only in the log rather than driving file-writing tool use.
-- Directive: Add an explicit output contract to the implementer prompt: enumerate the exact artifact file(s) to write via tools and forbid concluding without at least one non-log file written.

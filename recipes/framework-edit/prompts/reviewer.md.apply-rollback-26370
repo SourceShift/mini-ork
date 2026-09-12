@@ -19,7 +19,3 @@ Return one JSON object with:
 Reject if `verdict.json` does not use exactly these keys in this order in
 documentation and examples: `files_changed`, `tests_pass`, `static_pass`,
 `pass`.
-
-<!-- applied:gradient_records:gr-becc5b498213 -->
-- Observation: Reviewer spent 111s and $0.65 producing only a JSON stub with node_type and finish_reason — no findings, no rationale, no file references. The prompt is not forcing structured evidence-bound output.
-- Directive: Rewrite the reviewer prompt to require a findings[] array where each finding cites file:line and quotes the offending snippet, and make verdict_revise invalid unless findings[] is non-empty. Cap thinking budget so cost matches the depth of output.

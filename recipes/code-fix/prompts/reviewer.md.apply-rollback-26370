@@ -119,7 +119,3 @@ Emit a single JSON object on stdout. No prose before or after.
   maps to REQUEST_CHANGES with a specific probe question in `suggested_changes`.
 - Skip the `evidence` array — every verdict must be grounded.
 - Approve if any verifier failed, even if you believe the failure is minor.
-
-<!-- applied:gradient_records:gr-104ae59b748b -->
-- Observation: Reviewer node voted 'pass' on a code_fix task with files_read=[] and tool_calls=[] — it never inspected the implementer's diff or artifact before approving.
-- Directive: Make the reviewer prompt explicitly require reading the implementer's artifact (e.g. the diff or final_artifact_ref) and citing at least one specific finding (file:line or claim) before the verdict is accepted; refusal-to-inspect should map to needs_revision, not pass.
