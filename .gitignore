@@ -121,3 +121,4 @@ claude_code_zai_env.sh
 
 tests/ui/snapshots/*.png
 tests/ui/test-results/
+*.apply-rollback-*
