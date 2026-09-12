@@ -32,7 +32,7 @@ from .providers import (
     resolve_provider,
     resolve_target_cwd,
 )
-from .telemetry import cache_aware_cost, persist_call
+from .telemetry import cache_aware_cost, family_of, persist_call, rates_for
 
 __all__ = [
     "dispatch",
@@ -53,6 +53,8 @@ __all__ = [
     "EXECUTABLE_MODELS",
     "persist_call",
     "cache_aware_cost",
+    "family_of",
+    "rates_for",
     "lane_health",
     "preflight",
     "LaneHealth",
