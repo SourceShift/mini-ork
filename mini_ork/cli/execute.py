@@ -975,7 +975,13 @@ def charge_node_cost(db, run_id, cost_file="", *, dry_run=False, root=None):
         raw = open(cost_file).read().strip()
         try:
             v = float(raw)
-            if 0 < v < 10:
+            # Upper bound is a garbage-value guard, not a plausibility clamp:
+            # the old `v < 10` silently re-billed every node whose real bill
+            # hit $10+ at $0.01 — on the live DB that zeroed ~$425 of June
+            # 2026 giant-context runs from task_runs (run-1781280905: $40.79
+            # real, $0.62 recorded). $1000 keeps the guard against corrupt
+            # sidecars while admitting any legitimate per-node bill.
+            if 0 < v < 1000:
                 cost = raw
         except ValueError:
             pass
