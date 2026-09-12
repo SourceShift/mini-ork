@@ -79,7 +79,3 @@ The kickoff content is below. Read it, then emit your plan.
 --- kickoff brief ---
 
 {{KICKOFF_CONTENT}}
-
-<!-- applied:gradient_records:gr-34c3297700fe -->
-- Observation: The final artifact is a plan.json, but there is no indication that the planner encoded research scope, source strategy, verification criteria, or expected downstream outputs. A planner prompt that only emits a plan can let empty or placeholder work pass as complete.
-- Directive: Update the planner prompt to require explicit research questions, source requirements, artifact schema, verifier expectations, and stop conditions for insufficient context.

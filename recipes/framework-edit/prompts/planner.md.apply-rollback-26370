@@ -112,7 +112,3 @@ checks complete:
 
 The implementer does NOT write `verdict.json` (D-13/2026 fix at
 commit `ab781a9`); only verifiers do.
-
-<!-- applied:gradient_records:gr-5655b20811e1 -->
-- Observation: plan-failure-parse_error.raw.txt fabricated claims ('Schema invariant verified', 'both dispatch in parallel') that contradict execute.log showing dispatch was blocked. Planner narrated success while the workflow was stuck at a gate.
-- Directive: Constrain planner prompt to cite execute.log line refs for every progress claim, and require it to emit status=blocked with the unresolved gate question when child_run_id is absent — no narrative success without artifact evidence.
