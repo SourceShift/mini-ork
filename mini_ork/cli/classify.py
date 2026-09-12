@@ -213,12 +213,12 @@ def main(argv: list[str] | None = None, *, db: str | None = None, root: str | No
             sys.stderr.write(f"[warn] task_runs table not yet created ({e}); DB write skipped\n")
         finally:
             con.close()
-    _safe_trace_write({
+    _safe_trace_write(trace_store.enrich_stage_trace({
         "trace_id": trace_id,
         "run_id": run_id,
         "task_class": task_class,
         "status": "success",
-    }, db)
+    }, node_type="classifier"), db)
     return 0
 
 

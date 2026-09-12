@@ -137,34 +137,80 @@ def trace_write(payload: dict | str, db: str | None = None) -> str:
     return trace_id
 
 
-def trace_write_node(task_class: str, status: str = "success",
-                     extra: dict | None = None) -> dict:
-    """Build a node-trace payload, enriched with cost/duration from the dispatch
-    sidecars in $MINI_ORK_RUN_DIR (freshness-gated). Returns the payload dict."""
-    extra = dict(extra or {})
+def _read_fresh_sidecar(name: str) -> str | None:
+    """Freshness-gated sidecar read from $MINI_ORK_RUN_DIR. A sidecar older than
+    5x MO_DISPATCH_TIMEOUT is treated as absent so a stale lane/cost from an
+    earlier dispatch can never be attributed to the current trace."""
     run_dir = os.environ.get("MINI_ORK_RUN_DIR", "")
+    if not run_dir:
+        return None
     try:
         timeout = int(os.environ.get("MO_DISPATCH_TIMEOUT", "1500"))
     except ValueError:
         timeout = 1500
     freshness_s = 5 * timeout
-    now = time.time()
+    path = os.path.join(run_dir, name)
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    if time.time() - st.st_mtime > freshness_s:
+        return None
+    try:
+        with open(path) as fh:
+            return fh.read().strip()
+    except OSError:
+        return None
+
+
+def enrich_stage_trace(payload: dict, *, node_type: str, verdict: str = "") -> dict:
+    """Stamp node_type, lane, and the status-anchored reward on a pipeline-stage
+    trace payload (classify/plan/verify/reflect). Stage writers used to emit
+    bare status rows — reward-less AND lane-less — so every completed stage
+    trace was invisible to both advantage writebacks (they filter on
+    agent_version_id <> '' and reward_g IS NOT NULL) and landed as
+    node_type='unknown' when they did appear.
+
+      * node_type keeps lane_router's grouping from lumping every stage into
+        one 'unknown' bucket.
+      * lane comes from the .last-llm-lane sidecar llm_dispatch writes after a
+        stage's LLM call; deterministic stages (no dispatch) simply get none.
+      * reward reuses reward_from_status (MO_REWARD_STAMP-gated) so stage rows
+        live on the same [-1,+1] reward_g scale as node traces.
+
+    Mutates and returns ``payload`` for inline use."""
+    p = payload
+    vo = p.get("verifier_output")
+    if not isinstance(vo, dict):
+        vo = {}
+    vo.setdefault("node_type", node_type or "unknown")
+    p["verifier_output"] = vo
+    if not p.get("agent_version_id"):
+        lane = _read_fresh_sidecar(".last-llm-lane")
+        if lane:
+            p["agent_version_id"] = lane
+    if (p.get("reward_value") is None
+            and os.environ.get("MO_REWARD_STAMP", "1") == "1"):
+        from mini_ork.learning.writeback import reward_from_status
+        rv = reward_from_status(str(p.get("status") or ""),
+                                verdict or str(p.get("reviewer_verdict") or ""))
+        try:
+            p["reward_value"] = float(rv)
+            p["reward_anchor"] = float(os.environ.get("MO_REWARD_ANCHOR", "0.5"))
+            p["reward_direction"] = "higher_is_better"
+        except (TypeError, ValueError):
+            pass
+    return p
+
+
+def trace_write_node(task_class: str, status: str = "success",
+                     extra: dict | None = None) -> dict:
+    """Build a node-trace payload, enriched with cost/duration from the dispatch
+    sidecars in $MINI_ORK_RUN_DIR (freshness-gated). Returns the payload dict."""
+    extra = dict(extra or {})
 
     def _read_sidecar(name):
-        if not run_dir:
-            return None
-        path = os.path.join(run_dir, name)
-        try:
-            st = os.stat(path)
-        except OSError:
-            return None
-        if now - st.st_mtime > freshness_s:
-            return None
-        try:
-            with open(path) as fh:
-                return fh.read().strip()
-        except OSError:
-            return None
+        return _read_fresh_sidecar(name)
 
     cost = 0.0
     c = _read_sidecar(".last-llm-cost")
@@ -194,7 +240,7 @@ def trace_write_node(task_class: str, status: str = "success",
 
 def grade_run_reward(run_dir: str, run_id: str, db: str | None = None) -> int:
     """Close the eval loop (win #3): stamp the rubric's GRADED 0-8 run score as
-    reward_g on every trace of this run, instead of the binary verdict flatten.
+    reward_g on the traces of this run that carry no per-node reward yet.
     Reads <run_dir>/rubric.json {score}, normalizes score/8 → [0,1] against a
     fixed neutral anchor 0.5 → reward_g in [-1,+1]. Returns rows updated.
     Best-effort: a missing/garbled rubric.json is a no-op (returns 0)."""
@@ -218,10 +264,16 @@ def grade_run_reward(run_dir: str, run_id: str, db: str | None = None) -> int:
     reward_g = (val - anchor) / abs(anchor)
     con = sqlite3.connect(_db_path(db))
     con.execute("PRAGMA busy_timeout=5000")
+    # Fill-ONLY: a per-node reward already on the row (status-anchored stamp from
+    # the trace_fn, or an eval@v1 score) encodes WITHIN-run lane differentiation;
+    # overwriting every trace of the run with one uniform rubric value zeroes
+    # lane_adv = lane_mean - group_mean across the run's lanes and freezes the
+    # router at 0.0 (the exact starvation the 2026-07 LRA rows show). The rubric
+    # grades only traces the per-node stamp missed.
     con.execute(
         "UPDATE execution_traces SET reward_value=?, reward_anchor=?, reward_g=?, "
         "reward_direction='higher_is_better', reward_primary_metric='rubric_score', "
-        "reward_source='rubric@v1' WHERE run_id=?",
+        "reward_source='rubric@v1' WHERE run_id=? AND reward_g IS NULL",
         (val, anchor, reward_g, run_id),
     )
     n = con.total_changes
