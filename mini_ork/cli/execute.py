@@ -1556,7 +1556,10 @@ def _assemble_reviewer_inputs(run_dir):
 
     def _sec(title, path):
         if os.path.isfile(path) and os.path.getsize(path) > 0:
-            return f"\n# {title}\n{open(path).read()}\n"
+            from mini_ork.context_assembler import cap_block
+            body = cap_block(open(path, encoding="utf-8", errors="replace").read(),
+                             label=title)
+            return f"\n# {title}\n{body}\n"
         return f"\n# {title}\n(not available)\n"
 
     block = "--- Reviewer inputs (assembled by mini-ork-execute) ---\n"
@@ -1588,7 +1591,9 @@ def _assemble_reviewer_inputs(run_dir):
         if os.path.isfile(path) and os.path.getsize(path) > 0:
             block += _sec(name, path)
     if os.path.isfile(diff_path) and os.path.getsize(diff_path) > 0:
-        block += f"\n# review-diff.patch\n{open(diff_path).read()}\n"
+        from mini_ork.context_assembler import cap_block
+        block += (f"\n# review-diff.patch\n"
+                  f"{cap_block(open(diff_path, encoding='utf-8', errors='replace').read(), label='review-diff.patch')}\n")
     else:
         block += "\n# review-diff.patch\n(no diff)\n"
     block += ("\n--- End reviewer inputs ---\n\n"
