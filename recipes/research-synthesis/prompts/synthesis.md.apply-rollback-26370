@@ -78,7 +78,3 @@ verifier to confirm sources are real and reachable.
    least one lens-anchor.
 
 Write to `${MINI_ORK_RUN_DIR}/synthesis.md`.
-
-<!-- applied:gradient_records:gr-273f14dc50f3 -->
-- Observation: With no files_written and zero duration, the synthesizer prompt either was never dispatched or produced vacuous output that was swallowed — audit trail shows no evidence the prompt was even loaded.
-- Directive: Add an instrumented pre-flight assertion in the synthesis prompt requiring the agent to emit a manifest block (run_id, source artifact paths, output path) as its first action; absence of the manifest in the captured tool_calls becomes a verifiable recipe defect.

@@ -15,7 +15,3 @@ Report:
 
 Do not propose a new workflow topology unless the requested edit explicitly
 changes recipe orchestration.
-
-<!-- applied:gradient_records:gr-093a20cdc2ac -->
-- Observation: The prior-art lens completed without reading any files, yet the task_class was framework_edit. That suggests the lens prompt allowed unsupported analysis instead of grounding claims in the framework artifact or surrounding docs.
-- Directive: Require the prior-art lens to read the target framework file and at least one relevant local context artifact before writing its lens output. Add a prompt checklist that every prior-art claim must cite a concrete file path, section, or trace evidence.
