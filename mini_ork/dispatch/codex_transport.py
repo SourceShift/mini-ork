@@ -215,11 +215,14 @@ def harvest(
 ) -> None:
     """Parse the JSONL event stream into the dispatcher's sidecar files.
 
-    ``usage_path`` gets the TSV ``in<TAB>out`` envelope totals; ``turns_path``
-    gets stream-json-shaped per-turn lines; ``cost_path`` gets the estimated
-    cost at 6 decimals. ``usage.input_tokens`` INCLUDES cached tokens (billed
-    at the discounted rate), so they are subtracted before the full input
-    rate — same as cl_codex.sh. Missing/empty paths skip that sidecar."""
+    ``usage_path`` gets the TSV ``in<TAB>out<TAB>cached<TAB>cache_creation``
+    envelope totals (F2: the 2-field form dropped cached tokens at the sidecar
+    boundary, so llm_calls.cached_input_tokens was always 0 for codex lanes);
+    ``turns_path`` gets stream-json-shaped per-turn lines; ``cost_path`` gets
+    the estimated cost at 6 decimals. ``usage.input_tokens`` INCLUDES cached
+    tokens (billed at the discounted rate), so they are subtracted before the
+    full input rate — same as cl_codex.sh. Missing/empty paths skip that
+    sidecar."""
     in_tok = out_tok = cached_tok = 0
     turns: list[dict] = []
     thread_id = None
@@ -246,7 +249,7 @@ def harvest(
             )
     if usage_path and (in_tok or out_tok):
         with open(usage_path, "w", encoding="utf-8") as f:
-            f.write(f"{in_tok}\t{out_tok}\n")
+            f.write(f"{in_tok}\t{out_tok}\t{cached_tok}\t0\n")
     if turns_path and turns:
         with open(turns_path, "w", encoding="utf-8") as f:
             for t in turns:

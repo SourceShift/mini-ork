@@ -1133,15 +1133,16 @@ def apply_tool_grants(
 
 
 def _read_codex_sidecars(usage_path: str, cost_path: str) -> tuple[TokenUsage, float]:
-    """Read cl_codex.sh's sidecars: MO_USAGE_FILE is a TSV ``in<TAB>out`` line;
-    MO_COST_FILE is a single float. Missing/garbled → zeros."""
-    in_tok = out_tok = 0
+    """Read the transports' sidecars: MO_USAGE_FILE is a TSV
+    ``in<TAB>out[<TAB>cached<TAB>cache_creation]`` line (F2 extended the
+    2-field cl_codex.sh form, which dropped cached tokens at the sidecar
+    boundary); MO_COST_FILE is a single float. Missing/garbled → zeros."""
+    in_tok = out_tok = cached_tok = create_tok = 0
     cost = 0.0
     try:
         with open(usage_path, encoding="utf-8") as fh:
-            parts = fh.read().strip().split("\t")
-            if len(parts) >= 2:
-                in_tok, out_tok = int(parts[0] or 0), int(parts[1] or 0)
+            parts = (fh.read().strip().split("\t") + ["0", "0", "0", "0"])[:4]
+            in_tok, out_tok, cached_tok, create_tok = (int(p or 0) for p in parts)
     except (OSError, ValueError):
         pass
     try:
@@ -1149,7 +1150,10 @@ def _read_codex_sidecars(usage_path: str, cost_path: str) -> tuple[TokenUsage, f
             cost = float(fh.read().strip() or 0.0)
     except (OSError, ValueError):
         pass
-    return TokenUsage(input_tokens=in_tok, output_tokens=out_tok), cost
+    return TokenUsage(
+        input_tokens=in_tok, output_tokens=out_tok,
+        cached_input_tokens=cached_tok, cache_creation_tokens=create_tok,
+    ), cost
 
 
 # ── Per-engine command builders (SOLID M6, OCP; SE-3 Phase A.3) ─────────────

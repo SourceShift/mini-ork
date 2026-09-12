@@ -372,7 +372,7 @@ def _harvest(tmp_path, **paths):
 
 def test_harvest_usage_and_turns_exact(tmp_path):
     usage, turns, _cost = _harvest(tmp_path)
-    assert usage.read_text() == "3000\t1200\n"
+    assert usage.read_text() == "3000\t1200\t300\t141\n"  # F2: +cached(200+100)+creation(99+42)
     lines = turns.read_text().splitlines()
     assert json.loads(lines[0]) == {
         "turn_index": 0,
@@ -512,7 +512,7 @@ def test_native_subprocess_writes_expected_output_and_sidecars(
     proc, usage, turns, cost = _run_transport(fmt, tmp_path, target, monkeypatch)
 
     assert proc.returncode == 0
-    assert _read_or_none(usage) == "1500\t250\n"
+    assert _read_or_none(usage) == "1500\t250\t500\t0\n"
     assert json.loads(turns.read_text()) == {
         "turn_index": 0,
         "input_tokens": 1500,

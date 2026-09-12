@@ -27,30 +27,81 @@ from pathlib import Path
 
 from .models import DispatchResult, TokenUsage
 
-# Per-Mtok USD rates for the cache-aware input cost split — same defaults as the
-# bash writer (lib/llm-dispatch.sh). Overridable per call for correct
-# per-provider pricing.
-DEFAULT_RATE_UNCACHED_IN = 15.0
-DEFAULT_RATE_CACHED_IN = 1.5
-DEFAULT_RATE_CACHE_WRITE = 18.75
+# Per-Mtok USD rates for the cache-aware input cost split, keyed by provider
+# FAMILY (audit F2). The old code applied the bash writer's Anthropic list
+# prices (15/1.5/18.75) to every provider and subtracted cached+creation from
+# input unconditionally — right for neither family: Anthropic's envelope
+# reports input EXCLUDING cache (live receipt: rows with input=44k /
+# cached=261k — the inclusive reading would be negative), so the subtraction
+# zeroed real uncached cost ($0.0017 total across 2,856 rows), while codex
+# rows got a 10x-overstated breakdown at Anthropic rates ($1,160 phantom vs
+# $115.73 real). Families WITHOUT a known table (gateway proxies serving
+# minimax/glm/kimi/deepseek, google) resolve to None → a zero breakdown: the
+# real billed cost still lands in cost_usd from the provider envelope, and a
+# zero is honest where a fabricated number is not.
+PROVIDER_FAMILY_RATES: dict[str, tuple[float, float, float] | None] = {
+    "anthropic": (15.0, 1.5, 18.75),   # sonnet-class list prices
+    "openai": (1.25, 0.125, 0.0),      # gpt-5 list (codex lanes); no cache-write bill
+    "gateway": None,                   # per-model prices; envelope carries the real cost
+    "google": None,
+    "unknown": None,
+}
+
+# Families whose reported input_tokens INCLUDE cached tokens (OpenAI chat
+# usage semantics: prompt_tokens ⊇ cached_tokens). Anthropic-style envelopes
+# report input EXCLUDING cache read and creation, so uncached input is
+# input_tokens as-is for every family not listed here.
+INPUT_INCLUDES_CACHE: frozenset[str] = frozenset({"openai"})
+
+_LANE_FAMILY = {
+    "anthropic": "anthropic", "opus": "anthropic", "sonnet": "anthropic",
+    "openai": "openai", "codex": "openai", "gpt": "openai",
+    "gateway": "gateway", "minimax": "gateway", "glm": "gateway",
+    "kimi": "gateway", "deepseek": "gateway",
+    "google": "google", "gemini": "google",
+}
+
+
+def family_of(provider: str) -> str:
+    """Collapse a lane alias or llm_calls.provider value to its rate family."""
+    return _LANE_FAMILY.get((provider or "").strip().lower(), "unknown")
+
+
+def rates_for(provider: str) -> tuple[float, float, float] | None:
+    """(uncached_in, cached_in, cache_write) USD/MTok for a provider/lane, or
+    None when the family has no known table (breakdown must stay zero)."""
+    return PROVIDER_FAMILY_RATES.get(family_of(provider))
 
 
 def cache_aware_cost(
     usage: TokenUsage,
     *,
-    rate_uncached_in: float = DEFAULT_RATE_UNCACHED_IN,
-    rate_cached_in: float = DEFAULT_RATE_CACHED_IN,
-    rate_cache_write: float = DEFAULT_RATE_CACHE_WRITE,
+    provider: str = "anthropic",
+    rate_uncached_in: float | None = None,
+    rate_cached_in: float | None = None,
+    rate_cache_write: float | None = None,
 ) -> tuple[float, float, float]:
-    """(uncached_input, cached_input, cache_write) USD. input_tokens INCLUDES the
-    cached + cache-creation tokens, so subtract them before the uncached rate."""
-    uncached_in = max(
-        usage.input_tokens - usage.cached_input_tokens - usage.cache_creation_tokens, 0
-    )
+    """(uncached_input, cached_input, cache_write) USD at the provider family's
+    rates. Token semantics are family-aware: for openai-style streams
+    input_tokens INCLUDES cached+creation (subtract before the uncached rate);
+    for anthropic-style envelopes input EXCLUDES them (use as-is). Families
+    without a known rate table — and unknown providers — price the breakdown at
+    zero rather than fabricating precision. Explicit rate kwargs override the
+    family table."""
+    rates = rates_for(provider) or (0.0, 0.0, 0.0)
+    r_in = rate_uncached_in if rate_uncached_in is not None else rates[0]
+    r_cached = rate_cached_in if rate_cached_in is not None else rates[1]
+    r_write = rate_cache_write if rate_cache_write is not None else rates[2]
+    if family_of(provider) in INPUT_INCLUDES_CACHE:
+        uncached_in = max(
+            usage.input_tokens - usage.cached_input_tokens - usage.cache_creation_tokens, 0
+        )
+    else:
+        uncached_in = max(usage.input_tokens, 0)
     return (
-        uncached_in * rate_uncached_in / 1_000_000,
-        usage.cached_input_tokens * rate_cached_in / 1_000_000,
-        usage.cache_creation_tokens * rate_cache_write / 1_000_000,
+        uncached_in * r_in / 1_000_000,
+        usage.cached_input_tokens * r_cached / 1_000_000,
+        usage.cache_creation_tokens * r_write / 1_000_000,
     )
 
 
@@ -76,7 +127,9 @@ def persist_call(
         return None
 
     usage = result.usage
-    uncached_cost, cached_cost, cache_write_cost = cache_aware_cost(usage)
+    uncached_cost, cached_cost, cache_write_cost = cache_aware_cost(
+        usage, provider=provider
+    )
     md: dict[str, object] = dict(metadata or {})
     if session_id and "session_id" not in md:
         md["session_id"] = session_id

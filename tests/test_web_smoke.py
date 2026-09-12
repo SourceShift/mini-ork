@@ -865,7 +865,8 @@ def test_cache_cost_components_sum_to_cost_usd(tmp_path: Path) -> None:
 
     assert row[4] == 200
     assert row[5] == 300
-    expected_input_cost = (500 * 15.0 + 200 * 1.5 + 300 * 18.75) / 1_000_000
+    # F2: anthropic input_tokens EXCLUDES cache — uncached is input as-is
+    expected_input_cost = (1000 * 15.0 + 200 * 1.5 + 300 * 18.75) / 1_000_000
     component_sum = row[0] + row[1] + row[2]
     assert component_sum == pytest.approx(expected_input_cost)
     assert row[3] == pytest.approx(0.009)
