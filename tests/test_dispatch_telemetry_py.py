@@ -121,8 +121,8 @@ def test_cost_breakdown_persisted(tmp_path):
         (rowid,),
     ).fetchone()
     con.close()
-    # uncached_in = 1000-200-100 = 700
-    assert uncached == pytest.approx(700 * 15.0 / 1_000_000)
+    # F2: anthropic input_tokens EXCLUDES cache -> uncached is input as-is
+    assert uncached == pytest.approx(1000 * 15.0 / 1_000_000)
     assert cached == pytest.approx(200 * 1.5 / 1_000_000)
     assert cw == pytest.approx(100 * 18.75 / 1_000_000)
 
@@ -144,9 +144,22 @@ def test_missing_db_is_noop_not_crash(tmp_path):
     assert persist_call(tmp_path / "nope.db", _ok_result(), provider="x", feature_name="f") is None
 
 
-def test_cache_aware_cost_subtracts_cached_and_creation():
+def test_cache_aware_cost_family_semantics():
+    # F2: token semantics + rates are per provider family. Anthropic envelopes
+    # report input EXCLUDING cache (uncached = input as-is); openai-style
+    # streams INCLUDE it (subtract). The old test pinned the unconditional
+    # subtraction for anthropic — an assumption the live data disproves (rows
+    # with input=44k / cached=261k cannot be inclusive).
     u = TokenUsage(input_tokens=1000, cached_input_tokens=200, cache_creation_tokens=100)
-    uncached, cached, cw = cache_aware_cost(u)
-    assert uncached == pytest.approx(700 * 15.0 / 1_000_000)
+    uncached, cached, cw = cache_aware_cost(u, provider="anthropic")
+    assert uncached == pytest.approx(1000 * 15.0 / 1_000_000)
     assert cached == pytest.approx(200 * 1.5 / 1_000_000)
     assert cw == pytest.approx(100 * 18.75 / 1_000_000)
+    # openai family: input includes cached; gpt-5 rates; no cache-write bill
+    uncached, cached, cw = cache_aware_cost(u, provider="openai")
+    assert uncached == pytest.approx(700 * 1.25 / 1_000_000)
+    assert cached == pytest.approx(200 * 0.125 / 1_000_000)
+    assert cw == 0.0
+    # gateway: no known rate table -> zero breakdown, never fabricated
+    assert cache_aware_cost(u, provider="gateway") == (0.0, 0.0, 0.0)
+    assert cache_aware_cost(u, provider="minimax") == (0.0, 0.0, 0.0)

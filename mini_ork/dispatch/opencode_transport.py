@@ -171,9 +171,12 @@ def harvest(
     that carries usage tokens (``part.tokens.{input,output}`` plus a nested
     ``part.tokens.cache.{read,write}``) and an optional cost (``part.cost``). Absent fields are coerced to 0 rather than
     failing the harvest — a model that doesn't surface tokens shouldn't break
-    dispatch. ``usage_path``/``turns_path``/``cost_path`` left empty skip that
+    dispatch. ``usage_path`` gets the 4-field TSV
+    ``in<TAB>out<TAB>cached<TAB>cache_creation`` (F2: cache.write is the
+    creation half — the 2-field form dropped both cache fields at the sidecar
+    boundary). ``usage_path``/``turns_path``/``cost_path`` left empty skip that
     sidecar (matches the codex transport's contract)."""
-    in_tok = out_tok = cached_tok = 0
+    in_tok = out_tok = cached_tok = create_tok = 0
     cost_total = 0.0
     turns: list[dict] = []
     session_id = ""
@@ -187,16 +190,20 @@ def harvest(
             t_in = _coerce_int(tokens.get("input"))
             t_out = _coerce_int(tokens.get("output"))
             # opencode emits `tokens.cache` as a nested {"write","read"} object;
-            # cache-read is the billable-relevant half. Fall back to a scalar
+            # cache-read is the billable-relevant half, cache-write maps to the
+            # anthropic-style creation bucket. Fall back to a scalar
             # `cache`/`cached` for forward-compat with a flatter shape.
             cache = tokens.get("cache")
             if isinstance(cache, Mapping):
                 t_cached = _coerce_int(cache.get("read"))
+                t_cre = _coerce_int(cache.get("write"))
             else:
                 t_cached = _coerce_int(cache if cache is not None else tokens.get("cached"))
+                t_cre = 0
             in_tok += t_in
             out_tok += t_out
             cached_tok += t_cached
+            create_tok += t_cre
             cost_total += _coerce_float(part.get("cost"))
             turns.append(
                 {
@@ -210,7 +217,7 @@ def harvest(
             )
     if usage_path and (in_tok or out_tok):
         with open(usage_path, "w", encoding="utf-8") as f:
-            f.write(f"{in_tok}\t{out_tok}\n")
+            f.write(f"{in_tok}\t{out_tok}\t{cached_tok}\t{create_tok}\n")
     if turns_path and turns:
         with open(turns_path, "w", encoding="utf-8") as f:
             for t in turns:

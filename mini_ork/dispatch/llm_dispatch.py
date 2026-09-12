@@ -243,7 +243,7 @@ def check_lane_fuse(db, lane, category) -> bool:
                for status, err, retryable in rows)
 
 
-# ── llm_calls row writer (verbatim cost math + schema-adaptive cols) ──
+# ── llm_calls row writer (family-aware cost math + schema-adaptive cols) ──
 
 def write_llm_calls_row(db, provider, model_id, tier, feature_name, actor, status,
                         duration_ms, cost_usd, error_message, input_tokens=0, output_tokens=0,
@@ -255,10 +255,18 @@ def write_llm_calls_row(db, provider, model_id, tier, feature_name, actor, statu
     out_tok = _int_or(output_tokens, 0)
     cached_in = _int_or(cached_input_tokens, 0)
     cache_create = _int_or(cache_creation_input_tokens, 0)
-    uncached_in = max(in_tok - cached_in - cache_create, 0)
-    cost_input_uncached = uncached_in * 15.0 / 1_000_000
-    cost_input_cached = cached_in * 1.5 / 1_000_000
-    cost_cache_write = cache_create * 18.75 / 1_000_000
+    # F2: per-provider-family rates + token semantics (anthropic envelopes
+    # exclude cache from input; openai-style streams include it) live in ONE
+    # place — telemetry.cache_aware_cost. The inline math this replaces priced
+    # every provider at Anthropic list rates and always subtracted cache from
+    # input, zeroing anthropic uncached cost and 10x-ing the codex breakdown.
+    from mini_ork.dispatch.models import TokenUsage
+    from mini_ork.dispatch.telemetry import cache_aware_cost
+    cost_input_uncached, cost_input_cached, cost_cache_write = cache_aware_cost(
+        TokenUsage(input_tokens=in_tok, output_tokens=out_tok,
+                   cached_input_tokens=cached_in, cache_creation_tokens=cache_create),
+        provider=str(provider or ""),
+    )
     import json as _json
     try:
         _md = _json.loads(metadata_json or "{}")
