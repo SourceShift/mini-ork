@@ -74,6 +74,42 @@ def slice_provider_paged(pack: dict, budget: int) -> dict:
 SLICE_PROVIDERS = {"default": slice_provider_default, "paged": slice_provider_paged}
 
 
+# ── per-call prompt-block cap (F6a) ───────────────────────────────────────────
+
+DEFAULT_SECTION_MAX_CHARS = 80_000
+
+
+def section_max_chars() -> int:
+    """MO_CTX_SECTION_MAX_CHARS, default 80K chars (~20K tokens) per inlined
+    section. <=0 disables capping."""
+    try:
+        return int(os.environ.get("MO_CTX_SECTION_MAX_CHARS",
+                                  str(DEFAULT_SECTION_MAX_CHARS)))
+    except ValueError:
+        return DEFAULT_SECTION_MAX_CHARS
+
+
+def cap_block(text: str, max_chars: int | None = None, *, label: str = "") -> str:
+    """F6a: bound one prompt-inlined section. Live-DB receipts (audit F6a):
+    reviewer/panel prompts inlined whole verifier JSONs, ledgers and diffs —
+    multi-MB sections rode every agentic round-trip (worst measured lens call:
+    14.77M input tokens, $2.89, 27 sibling calls with zero output). Keeps the
+    head (setup/manifest) and tail (verdict/result) around an omission marker
+    so both ends of a section stay reviewable."""
+    if max_chars is None:
+        max_chars = section_max_chars()
+    if max_chars <= 0 or len(text) <= max_chars:
+        return text
+    head = int(max_chars * 0.6)
+    tail = max_chars - head
+    omitted = len(text) - head - tail
+    name = f" of {label!r}" if label else ""
+    return (f"{text[:head]}\n"
+            f"…[context cap: omitted {omitted} chars{name}; "
+            f"read the full file at the path above if needed]\n"
+            f"{text[len(text) - tail:]}")
+
+
 # ── the ContextPack builder ──────────────────────────────────────────────────
 
 def context_assemble(task_brief_path: str, workflow_node: str,

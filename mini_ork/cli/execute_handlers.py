@@ -394,6 +394,9 @@ class NodeDispatch:
                 f"\n--- /recipe prompt ---\n\n") \
             if self.prompt_file and os.path.isfile(self.prompt_file) else ""
 
+    def scope_guard(self) -> str:
+        return scope_guard_block(self.run_dir_eff)
+
     def write_preserving_agent(self, out_file, marker, result):
         # preserve the agent's own tool-call Write when it touched out_file
         if os.path.isfile(out_file) and os.path.getmtime(out_file) > os.path.getmtime(marker):
@@ -436,6 +439,23 @@ class NodeDispatch:
             return False
 
 
+def scope_guard_block(run_dir: str) -> str:
+    """F6a: keep agentic lanes (codex / claude CLI) out of OTHER runs'
+    artifacts. Live-DB receipt: .mini-ork/runs held 529 past runs / 3.8 GB
+    inside MO_TARGET_CWD, and lens agents enumerated them — every tool
+    round-trip re-billed that context (worst measured call: 14.77M input
+    tokens, $2.89; 27 sibling lens calls returned zero output). No lens,
+    researcher, or reviewer legitimately needs another run's directory."""
+    return (
+        "\n--- Scope guard (hard constraint) ---\n"
+        f"The ONLY run directory you may read is: {run_dir}\n"
+        "Do NOT enumerate, glob, grep, or read files under any other run "
+        "directory (sibling runs under .mini-ork/runs/), .git internals, or "
+        "node_modules. Past-run artifacts are not evidence for this task and "
+        "scanning them wastes the context budget.\n"
+        "--- /scope guard ---\n")
+
+
 def _handle_planner_early(root):
     print("  [skip] planner node handled by the Python plan runtime")
     return 0, "done"
@@ -472,7 +492,8 @@ def _handle_researcher(ctx: NodeDispatch):
     )
     os.makedirs(os.path.dirname(out_file) or ".", exist_ok=True)
     prompt = (f"{ctx.prepend()}Task: {ctx.node_desc}{ctx.learned}\n\nPlan context:\n"
-              f"{ctx.plan_content}{ctx.artifact_context}\n\nWrite your output to: {out_file}")
+              f"{ctx.plan_content}{ctx.artifact_context}{ctx.scope_guard()}\n\n"
+              f"Write your output to: {out_file}")
     marker = os.path.join(ctx.run_dir, f".dispatch-marker-{ctx.node_id}")
     open(marker, "w").write("")
     rc, result = ctx.dispatch(prompt)
@@ -524,7 +545,7 @@ def _handle_implementer(ctx: NodeDispatch):
         ctx.trace(ctx.node_id, "failure", "implementer", sub_log, "", "error")
         return 1, "error"
     prompt = (f"{ctx.prepend()}Implement: {ctx.node_desc}{ctx.learned}\n\nPlan:\n"
-              f"{ctx.plan_content}{ctx.artifact_context}\n\n"
+              f"{ctx.plan_content}{ctx.artifact_context}{ctx.scope_guard()}\n\n"
               f"Write your execution summary to: {impl_log}")
     os.makedirs(os.path.dirname(impl_log) or ".", exist_ok=True)
     # F4: pin the codex/gemini edit surface to the TARGET repo (kickoff's git
@@ -616,14 +637,16 @@ def _handle_reviewer(ctx: NodeDispatch):
     # without the envelope the LLM emits prose → verdict=unknown → false rollback.
     if is_panel_gate:
         prompt = (f"{ctx.prepend()}Synthesize panel verdict for: {ctx.node_desc}{ctx.learned}\n\n"
-                  f"Plan:\n{ctx.plan_content}{ctx.artifact_context}\n\nWrite strict JSON to: {review_file}")
+                  f"Plan:\n{ctx.plan_content}{ctx.artifact_context}{ctx.scope_guard()}\n\n"
+                  f"Write strict JSON to: {review_file}")
     elif is_synth:
         prompt = (f"{ctx.prepend()}Synthesize for: {ctx.node_desc}{ctx.learned}\n\n"
-                  f"Plan:\n{ctx.plan_content}{ctx.artifact_context}\n\nWrite your synthesis to: {review_file}")
+                  f"Plan:\n{ctx.plan_content}{ctx.artifact_context}{ctx.scope_guard()}\n\n"
+                  f"Write your synthesis to: {review_file}")
     else:
         reviewer_inputs = _assemble_reviewer_inputs(ctx.run_dir_eff)
         prompt = (f"{ctx.prepend()}Review the implementation for: {ctx.node_desc}{ctx.learned}\n\n"
-                  f"Plan:\n{ctx.plan_content}{ctx.artifact_context}\n\n{reviewer_inputs}\n"
+                  f"Plan:\n{ctx.plan_content}{ctx.artifact_context}{ctx.scope_guard()}\n\n{reviewer_inputs}\n"
                   'Respond with JSON: {"verdict": "pass|fail|needs_revision", "notes": []}')
     marker = os.path.join(ctx.run_dir, f".dispatch-marker-{ctx.node_id}")
     open(marker, "w").write("")
