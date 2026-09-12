@@ -174,23 +174,32 @@ def test_objective_domain_passthrough(db):
 
 
 def test_grade_run_reward(db, tmp_path):
-    # Win #3 graded bridge: rubric.json {score 0-8} → reward_g in [-1,+1] stamped on
-    # every trace of the run, overwriting the binary status-map reward.
+    # Win #3 graded bridge, FILL-ONLY since 2026-09: rubric.json {score 0-8}
+    # → reward_g in [-1,+1] stamped only on traces carrying no per-node reward.
+    # The old overwrite stamped one uniform value on every trace of the run,
+    # zeroing within-run lane differentiation and freezing the router's
+    # region/domain advantages at 0.0 (F5; see test_stage_reward_coverage_py).
     rd = tmp_path / "grade-run"; rd.mkdir()
     (rd / "rubric.json").write_text(json.dumps({"score": 6}))
-    # seed one trace under the run, initial reward_g = -1 (status-map fail)
+    # stamped trace keeps its per-node status-map reward (failure → -1)
     trace_store.trace_write(
         {"trace_id": "gp-1", "run_id": "grade-py", "task_class": "code-fix", "status": "failure",
          "reward_value": 0.0, "reward_anchor": 0.5, "reward_direction": "higher_is_better"},
         db=db)
+    # unstamped trace of the same run receives the rubric fill
+    trace_store.trace_write(
+        {"trace_id": "gp-2", "run_id": "grade-py", "task_class": "code-fix", "status": "success"},
+        db=db)
     n = trace_store.grade_run_reward(str(rd), "grade-py", db=db)
     assert n == 1
     graded = (6 / 8 - 0.5) / 0.5   # 0.5
-    assert abs(float(_reward_g(db, "gp-1")) - graded) < 1e-9
-    # missing rubric → no-op (0 rows), leaves status-map reward intact
+    assert abs(float(_reward_g(db, "gp-2")) - graded) < 1e-9
+    assert abs(float(_reward_g(db, "gp-1")) - (-1.0)) < 1e-9
+    # missing rubric → no-op (0 rows), leaves rewards intact
     empty = tmp_path / "no-rubric"; empty.mkdir()
     assert trace_store.grade_run_reward(str(empty), "grade-py", db=db) == 0
-    assert abs(float(_reward_g(db, "gp-1")) - graded) < 1e-9
+    assert abs(float(_reward_g(db, "gp-2")) - graded) < 1e-9
+    assert abs(float(_reward_g(db, "gp-1")) - (-1.0)) < 1e-9
 
 
 # ── CRUD/query/error surface (ported from the retired bash fixture) ─────────

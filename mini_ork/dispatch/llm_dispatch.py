@@ -476,6 +476,7 @@ def llm_dispatch(argv=None, *, root=None, dispatch_fn=None) -> int:
     except OSError:
         pass
     provider = provider_for_model(selected_model)
+    _write_lane_sidecar(selected_model)
     feature = f"mini-ork:{node_type or 'unknown'}"
     actor = os.environ.get("MO_LANE_ACTOR") or node_type or os.environ.get("USER", "unknown")
     tier = os.environ.get("MO_LANE_TIER", "default")
@@ -552,6 +553,20 @@ def _write_duration_ms(ms):
         return
     try:
         open(os.path.join(rd, ".last-llm-duration-ms"), "w").write(str(ms))
+    except OSError:
+        pass
+
+
+def _write_lane_sidecar(lane):
+    """Persist the RESOLVED lane so stage-trace writers can attribute the call —
+    without it the model that actually served a planner/verifier dispatch dies
+    inside this process and the stage trace lands lane-less (invisible to both
+    advantage writebacks). Freshness-gated on read in trace_store."""
+    rd = context_env("MINI_ORK_RUN_DIR")
+    if not rd or not lane:
+        return
+    try:
+        open(os.path.join(rd, ".last-llm-lane"), "w").write(str(lane))
     except OSError:
         pass
 

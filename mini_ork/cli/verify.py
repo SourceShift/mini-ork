@@ -321,12 +321,12 @@ def main(argv: list[str] | None = None, *, db: str | None = None, root: str | No
     sys.stdout.write(output)
     if dry_run == 0:
         status = "failure" if verdict == "fail" else ("vacuous" if verdict == "vacuous" else "success")
-        _safe_trace_write({
+        _safe_trace_write(trace_store.enrich_stage_trace({
             "trace_id": trace_id,
             "task_class": task_class,
             "status": status,
             "verifier_output": {"verdict": verdict},
-        }, db)
+        }, node_type="verifier", verdict=verdict), db)
     return 1 if verdict == "fail" else 0
 
 

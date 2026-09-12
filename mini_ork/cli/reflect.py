@@ -411,7 +411,8 @@ def main(argv: list[str] | None = None) -> int:
     except Exception:
         pass
 
-    payload = json.dumps({
+    from mini_ork import trace_store  # noqa: PLC0415
+    payload = json.dumps(trace_store.enrich_stage_trace({
         "trace_id": trace_id,
         "task_class": "__reflect__",
         "status": "success",
@@ -421,7 +422,7 @@ def main(argv: list[str] | None = None) -> int:
             "gradients_written": int(gradients_written or 0),
             "since": int(since_int),
         },
-    })
+    }, node_type="reflector"))
     _trace_write(payload, trace_env)
 
     sys.stdout.write(

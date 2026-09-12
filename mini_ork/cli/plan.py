@@ -214,7 +214,10 @@ def _trace_plan(trace_id, task_class, status, db, **extra):
         return
     try:
         from mini_ork import trace_store
-        payload = {"trace_id": trace_id, "task_class": task_class, "status": status, **extra}
+        payload = trace_store.enrich_stage_trace(
+            {"trace_id": trace_id, "task_class": task_class, "status": status, **extra},
+            node_type="planner",
+            verdict=str(extra.get("reviewer_verdict") or ""))
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
             trace_store.trace_write(payload, db=db)
     except Exception:
