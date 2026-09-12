@@ -337,6 +337,19 @@ def test_charge_node_cost_parity(tmp_path):
     ex.charge_node_cost(db_p, "r3", str(bad))
     q3 = "SELECT printf('%.4f', cost_usd) FROM task_runs WHERE id='r3';"
     assert _sql(db_p, q3).stdout == "0.0100\n"
+    # a >=$10 real bill must be charged in full (old clamp re-billed it at
+    # $0.01 — the June-2026 task_runs 34% undercount), while garbage >=$1000
+    # still falls back to the placeholder
+    _seed_task_run(db_p, rid="r4", cost=0)
+    big = tmp_path / "big"; big.write_text("28.64")
+    ex.charge_node_cost(db_p, "r4", str(big), root=str(tmp_path))
+    q4 = "SELECT printf('%.4f', cost_usd) FROM task_runs WHERE id='r4';"
+    assert _sql(db_p, q4).stdout == "28.6400\n"
+    _seed_task_run(db_p, rid="r5", cost=0)
+    garbage = tmp_path / "garbage"; garbage.write_text("9999")
+    ex.charge_node_cost(db_p, "r5", str(garbage), root=str(tmp_path))
+    q5 = "SELECT printf('%.4f', cost_usd) FROM task_runs WHERE id='r5';"
+    assert _sql(db_p, q5).stdout == "0.0100\n"
 
 
 def _git_repo(d):
