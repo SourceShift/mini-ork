@@ -875,24 +875,7 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
     elif rollback_fields:
         print("  [skip] rollback — no failures (escalates_to edge not triggered)")
     _emit_run_verdict(live_run_dir, fail_count, len(fields_list))
-    # Close the eval loop (bash mo_grade_run_reward, :3271): feed the rubric's GRADED
-    # 0-8 run score into reward_g on every trace of this run. When rubric.json exists it
-    # overwrites the per-node status-map reward with the graded value; absent → no-op,
-    # leaving the reward_from_status fallback the trace_fn already stamped. Best-effort.
-    if os.environ.get("MO_GRADE_RUN_REWARD", "1") == "1":
-        try:
-            from mini_ork import trace_store  # noqa: PLC0415
-            trace_store.grade_run_reward(live_run_dir, run_id, db=db)
-        except Exception:
-            pass
-    # Close the learning writeback loop after the final reward is known. Both
-    # writers are deterministic DB side-channels and remain best-effort.
-    if os.environ.get("MO_LEARNING_WRITEBACK", "1") == "1":
-        try:
-            learning_update_conductor_outcomes(db)
-            write_grpo_advantages(db)
-        except Exception:
-            pass
+    _post_run_learning(db, live_run_dir, run_id)
     if fail_count > 0:
         set_status(db, run_id, "failed")
         sys.stderr.write(f"execute: {fail_count} node(s) failed\n")
@@ -901,12 +884,49 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
     return 0
 
 
-# ── per-node live-path support helpers (deterministic; increment 4) ──
-#
+# ── post-run learning side-channels ──
+
+
+def _post_run_learning(db, run_dir, run_id):
+    """Post-run learning side-channels (each best-effort; never fail the run):
+
+    1. rubric grading — fill-ONLY: a per-node reward already on the row
+       (status-anchored stamp or eval@v1) encodes within-run lane
+       differentiation a uniform rubric value would erase.
+    2. conductor outcome reconciliation + GRPO writeback (the global APM face).
+    3. region/domain advantage recompute. preferred_lane() reads
+       region → domain → global, but the region/domain tables were refreshed
+       exclusively inside `mini-ork reflect`, so between reflects the router
+       rode stale slice advantages (live DB: region frozen 2026-07-19 while
+       APM updated per-run). Full-history window is one cheap EMA step over
+       the reward-bearing rows — the same shape reflect runs at since=0.
+    """
+    if os.environ.get("MO_GRADE_RUN_REWARD", "1") == "1":
+        try:
+            from mini_ork import trace_store  # noqa: PLC0415
+            trace_store.grade_run_reward(run_dir, run_id, db=db)
+        except Exception:
+            pass
+    if os.environ.get("MO_LEARNING_WRITEBACK", "1") == "1":
+        try:
+            learning_update_conductor_outcomes(db)
+            write_grpo_advantages(db)
+        except Exception:
+            pass
+    if os.environ.get("MO_LANE_ROUTER", "1") != "0":
+        try:
+            from mini_ork import lane_router  # noqa: PLC0415
+            lane_router.recompute_advantages(since=0, db=db)
+        except Exception:
+            pass
+
+
 # These are the deterministic operations _dispatch_node's live (non-dry-run)
 # branches wire around the LLM call: DB status/cost writes and the "capture
 # coin-flip" output applier. Ported + parity-gated ahead of the live routing
 # (whose LLM dispatch is integration territory).
+#
+# ── per-node live-path support helpers (deterministic; increment 4) ──
 
 def set_status(db, run_id, new_status, *, dry_run=False):
     """Verbatim port of _d021_set_status: retrying task_runs status write;
