@@ -191,7 +191,17 @@ def _materialize_arm(task_class: str, target_file: str | None, directive_block: 
     mutated = None
     if target_file and directive_block:
         rel = target_file.replace("\\", "/")
-        cand = os.path.join(dst, rel) if not os.path.isabs(rel) else rel
+        if os.path.isabs(rel):
+            # An absolute target must land inside the TEMP copy, never the
+            # original recipe (auto_sweep passes absolute paths): relativize
+            # against the source recipe dir; outside it → nothing to measure.
+            try:
+                rel = os.path.relpath(os.path.abspath(rel), os.path.abspath(src))
+            except ValueError:
+                rel = "../../unreachable"
+            if rel.startswith(".."):
+                return name, None
+        cand = os.path.join(dst, rel)
         if not os.path.isfile(cand):
             cand = os.path.join(dst, "prompts", os.path.basename(rel))
         if os.path.isfile(cand):

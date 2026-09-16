@@ -607,6 +607,31 @@ def test_probe_scorer_two_arms_vectors_and_cleanup(tmp_path, monkeypatch):
     assert [p.name for p in (tmp_path / "recipes").iterdir()] == ["obs-smoke"]
 
 
+def test_probe_scorer_absolute_target_lands_in_temp_copy(tmp_path, monkeypatch):
+    """auto_sweep passes ABSOLUTE target paths: the directive must land in
+    the TEMP candidate recipe, never the original — a quarantine must leave
+    the live recipe untouched."""
+    ps, recipe = _probe_fixture(tmp_path, monkeypatch)
+    seen = {}
+
+    def fake_launch(recipe_name, kickoff):
+        mut = tmp_path / "recipes" / recipe_name / "prompts" / "tiny-researcher.md"
+        if "__probe_" in recipe_name and recipe_name.endswith("_1"):
+            seen["cand"] = mut.read_text()
+        return f'mini_ork_result={{"run_id": "r-{recipe_name}"}}\n', f"r-{recipe_name}", 0.0
+
+    monkeypatch.setattr(ps, "_launch_run", fake_launch)
+    monkeypatch.setattr(ps, "_run_outcome", lambda rid: 1.0)
+    abs_target = str(tmp_path / "recipes" / "obs-smoke" / "prompts" / "tiny-researcher.md")
+    out = ps.probe_score("obs_smoke", abs_target, "directive text",
+                         source_ref="gradient_records:gr-x")
+    assert out["n"] == 2 and out["after"] == 1.0
+    assert "- Directive: directive text" in seen["cand"]
+    assert (recipe / "prompts" / "tiny-researcher.md").read_text() == "BASE PROMPT\n"
+    # An absolute target OUTSIDE the recipe dir measures nothing → None.
+    assert ps.probe_score("obs_smoke", str(tmp_path / "elsewhere" / "x.md"), "d") is None
+
+
 def test_probe_scorer_budget_zero_truncates_to_nothing(tmp_path, monkeypatch, envscrub):
     ps, _ = _probe_fixture(tmp_path, monkeypatch)
     envscrub.setenv("MO_APPLY_PROBE_BUDGET_USD", "0")
@@ -756,6 +781,44 @@ def test_apply_run_probe_regression_quarantines(db, tmp_path, capsys, envscrub, 
     assert summary["decision"] == "quarantined"
     assert target.read_text() == "ORIGINAL PROMPT\n"
     assert _rows(db, "apply_attempts")[0]["decision"] == "quarantined"
+
+
+def test_apply_run_probe_dead_arms_refuse_promote(db, tmp_path, capsys, envscrub, monkeypatch):
+    """Live-smoke finding (2026-09-16): every probe launch failing for an
+    infra reason yields n>0 with 0.0-vs-0.0 utilities — the scalar gate would
+    read that as non-regression and promote on a dead harness. Both arms
+    entirely dead must refuse; only 0→positive stays promotable."""
+    from mini_ork.learning import probe_scorer as ps
+    _seed_gradient(db, target="prompts/reviewer.md", task_class="reviewer")
+    target = tmp_path / "reviewer.md"
+    target.write_text("ORIGINAL PROMPT\n")
+    envscrub.setenv("MO_APPLY_SCORER", "probe")
+    envscrub.setenv("MO_APPLY_ENABLED", "1")
+    dead = {"before": 0.0, "after": 0.0, "n": 2,
+            "pertask_json": json.dumps({"before": [0, 0], "after": [0, 0],
+                                        "ids": ["probe-1.md", "probe-2.md"]}),
+            "runs": [], "cost_usd": 0.0}
+    monkeypatch.setattr(ps, "probe_score", lambda *a, **k: dict(dead))
+    rc = ap.apply_run("reviewer", "prompt_file", "prompts/reviewer.md",
+                      str(target), db=db)
+    assert rc == 0
+    summary = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert summary["decision"] == "pending_human_approval"
+    assert summary["version_id"] == ""
+    assert target.read_text() == "ORIGINAL PROMPT\n"
+    att = _rows(db, "apply_attempts")[0]
+    assert "dead harness" in att["rationale"]
+
+    # 0 → positive is a genuine improvement and stays promotable.
+    revive = {"before": 0.0, "after": 0.5, "n": 2,
+              "pertask_json": json.dumps({"before": [0, 0], "after": [1, 0],
+                                          "ids": ["probe-1.md", "probe-2.md"]}),
+              "runs": [], "cost_usd": 0.1}
+    monkeypatch.setattr(ps, "probe_score", lambda *a, **k: dict(revive))
+    ap.apply_run("reviewer", "prompt_file", "prompts/reviewer.md",
+                 str(target), db=db)
+    summary = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert summary["decision"] == "promoted"
 
 
 def test_apply_run_launch_failure_is_caught_not_fatal(db, tmp_path, capsys, envscrub, monkeypatch):
