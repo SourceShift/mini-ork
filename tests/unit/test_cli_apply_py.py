@@ -689,6 +689,7 @@ def test_launch_run_scrubs_run_scoped_env(tmp_path, monkeypatch, envscrub):
         assert leak not in env, f"{leak} leaked into the probe launch env"
     assert env["MINI_ORK_ROOT"] == str(tmp_path)
     assert env["MINI_ORK_NONINTERACTIVE"] == "1"
+    assert env["MO_STATIC_RECIPE_PLAN"] == "1"  # frozen planning, no LLM planner
     assert captured["cwd"] == str(tmp_path)
 
 
