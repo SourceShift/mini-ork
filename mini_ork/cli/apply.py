@@ -35,7 +35,9 @@ Env contract (identical to bash):
     MO_APPLY_ENABLED=1            master gate (default OFF)
     MO_APPLY_UNVETTED=1           allow promotes while only the mock/gepa
                                   placeholder scorer is wired (operator
-                                  opt-in; otherwise → pending_human_approval)
+                                  opt-in; otherwise → pending_human_approval).
+                                  Does NOT apply to scorer=probe — its
+                                  utilities come from real held-out runs
     MO_APPLY_MODE=append|replace  append = idempotent directive block (default,
                                   F3 2026-09-12); replace = legacy whole-file
     MO_APPLY_DRY_RUN=1            skip file write + version_registry write
@@ -43,9 +45,13 @@ Env contract (identical to bash):
     MO_APPLY_REGRESSION_TOLERANCE default 0 (strict per-task no-regression)
     MO_APPLY_PERTASK_JSON         optional {"before":[...],"after":[...]}
     MO_APPLY_MIN_EXAMPLES         default 1
-    MO_APPLY_SCORER               mock (default) | gepa
+    MO_APPLY_SCORER               mock (default) | gepa | probe (frozen
+                                  probe-set held-out evaluation, task #18)
     MO_APPLY_MOCK_BASELINE        mock baseline (score: 0.5; gate: 0.0)
     MO_APPLY_MOCK_DELTA           mock delta (default 0.05)
+    MO_APPLY_PROBE_MAX_TASKS      probe scorer: max probes per eval (default 2)
+    MO_APPLY_PROBE_BUDGET_USD     probe scorer: spend ceiling (default 2.0)
+    MO_APPLY_PROBE_TIMEOUT_S      probe scorer: per-launch timeout (default 600)
     MO_APPLY_FORCE_REGRESSION=1   test seam: forces a regression score
     MINI_ORK_REQUIRE_HUMAN_APPROVAL=true  force pending_human_approval
 
@@ -93,12 +99,19 @@ _VALID_TARGET_KINDS = (
 USAGE_TEXT = (
     "Usage: bin/mini-ork apply --task-class <name> --target <file>\n"
     "                          [--target-kind prompt_file|agent_prompt|workflow_node|workflow_edge]\n"
-    "                          [--dry-run] [--scorer mock|gepa] [--enable]\n"
+    "                          [--dry-run] [--scorer mock|gepa|probe] [--enable]\n"
     "\n"
     "Close the apply loop: turn the highest-confidence proposed prompt change\n"
     "into a scored workflow_candidate, gated by a non-regression rule, and\n"
     "either rewrite the prompt file (on promote) or quarantine with reason\n"
     "(on regression).\n"
+    "\n"
+    "Scorers:\n"
+    "  mock           deterministic placeholder (fabricates utility)\n"
+    "  gepa           neutral placeholder\n"
+    "  probe          frozen probe-set held-out evaluation (real runs,\n"
+    "                 recipes/<recipe>/probes/*.md; vetted promotes — no\n"
+    "                 MO_APPLY_UNVETTED needed)\n"
     "\n"
     "Defaults:\n"
     "  --target-kind  prompt_file\n"
@@ -653,6 +666,28 @@ def record_promotion(candidate_id: str, utility_before, utility_after,
 # ─────────────────────────────────────────────────────────────────────────────
 # apply_run — top-level orchestrator
 # ─────────────────────────────────────────────────────────────────────────────
+def _previously_failed(task_class: str, target_name: str, source_id: str,
+                       db: str | None = None) -> bool:
+    """Edit-memory lookup: has this exact (task_class, target, source_id)
+    directive already failed a gate (quarantined or rejected)?"""
+    if not source_id:
+        return False
+    try:
+        con = sqlite3.connect(_db_path(db))
+    except sqlite3.Error:
+        return False
+    try:
+        row = con.execute(
+            "SELECT 1 FROM apply_attempts WHERE task_class=? AND target_name=? "
+            "AND source_id=? AND decision IN ('quarantined','rejected') LIMIT 1",
+            (task_class, target_name, source_id)).fetchone()
+        return row is not None
+    except sqlite3.Error:
+        return False  # table missing → nothing remembered yet
+    finally:
+        con.close()
+
+
 def apply_run(task_class: str, target_kind: str, target_name: str,
               target_file: str = "", db: str | None = None) -> int:
     """Run pick → materialize → score → gate → write (or quarantine).
@@ -690,6 +725,26 @@ def apply_run(task_class: str, target_kind: str, target_name: str,
     confidence = parsed.get("confidence", 0.0)
     suggested_change = parsed.get("suggested_change", "")
 
+    # 1b. Outcome-tagged edit memory (GRAO 2604.20714 — task #19 prerequisite).
+    #     A directive that failed a gate once is never re-proposed: without
+    #     this memory the optimizer keeps re-proposing failed edits and
+    #     performance collapses below baseline by iteration 4.
+    if _previously_failed(task_class, target_name, source_id, db=db):
+        aid = attempt_record(
+            task_class, target_kind, target_name,
+            source_kind, source_id, "", "", "",
+            "", "", "", "rejected",
+            "edit memory: (task_class, target, source) already has a "
+            "quarantined/rejected apply_attempts row — never re-proposed "
+            "(GRAO 2604.20714)",
+            dry_flag, apply_enabled, db=db)
+        sys.stdout.write(aid + "\n")
+        sys.stdout.write(
+            f'{{"decision":"rejected","task_class":"{task_class}",'
+            f'"target":"{target_name}","source_id":"{source_id}"}}\n'
+        )
+        return 0
+
     # 2. Materialize the candidate.
     candidate_id = materialize_candidate(
         task_class, target_kind, target_name,
@@ -697,23 +752,70 @@ def apply_run(task_class: str, target_kind: str, target_name: str,
 
     # 3. Score. utility_before = baseline utility of the CURRENT prompt so
     #    the non-regression gate compares against the real baseline.
+    #    scorer=probe runs the real held-out evaluation (task #18, GRASP
+    #    2605.29668): two arms over the frozen probe set, utilities from
+    #    task_runs outcomes — never fabricated numbers.
+    scorer = os.environ.get("MO_APPLY_SCORER", "mock")
     utility_before = "0.0"
-    if os.environ.get("MO_APPLY_SCORER", "mock") == "mock":
+    pertask_json = os.environ.get("MO_APPLY_PERTASK_JSON", "")
+    if scorer == "mock":
         utility_before = os.environ.get("MO_APPLY_MOCK_BASELINE", "0.0")
-    score_out = score_candidate(candidate_id)
-    parts = score_out.split()
-    utility_after = parts[0] if parts else ""
+
+    probe_result = None
+    probe_unmeasured = False
+    utility_after = ""
+    if scorer == "probe":
+        from mini_ork.learning import probe_scorer as _ps  # deferred: cycle-safe
+        try:
+            probe_result = _ps.probe_score(
+                task_class, target_file, suggested_change,
+                source_ref=f"{source_kind}:{source_id}" if source_id else "",
+                context=parsed.get("signal", ""))
+        except RuntimeError as exc:
+            sys.stderr.write(f"[probe-scorer] {exc}\n")
+            probe_result = None
+        if probe_result is not None and probe_result.get("n", 0) > 0:
+            utility_before = f"{probe_result['before']:.4f}"
+            utility_after = f"{probe_result['after']:.4f}"
+            if probe_result.get("pertask_json"):
+                pertask_json = probe_result["pertask_json"]
+        else:
+            # No frozen probe set (or budget exhausted before any pair
+            # completed): NOTHING was measured. Fall through to no gate
+            # promote — a neutral 0.5-vs-0.5 delta of 0 would otherwise
+            # satisfy the scalar non-regression gate and promote on zero
+            # evidence, which is exactly the fabrication this scorer exists
+            # to retire.
+            probe_unmeasured = True
+            utility_after = "0.0"
+    else:
+        score_out = score_candidate(candidate_id)
+        parts = score_out.split()
+        utility_after = parts[0] if parts else ""
 
     # 4. Gate. Pass the optional per-task held-out vector so the in-loop
     #    no-regression gate can block a candidate that regresses a
     #    previously-solved task even when the aggregate improved (2607.14004).
-    gate_json = evaluate_gate(
-        candidate_id, float(utility_before), float(utility_after),
-        os.environ.get("MO_APPLY_PERTASK_JSON", ""))
-    gate = json.loads(gate_json)
-    gate_decision = gate["decision"]
-    gate_rationale = gate["rationale"]
-    utility_delta = gate["utility_delta"]
+    if probe_unmeasured:
+        gate_decision = "pending_human_approval"
+        gate_rationale = ("probe scorer measured nothing (no frozen probe set under "
+                          "recipes/<recipe>/probes/, unresolvable target file, or budget "
+                          "exhausted) — refusing to promote without held-out evaluation")
+        utility_delta = 0.0
+    else:
+        gate_json = evaluate_gate(
+            candidate_id, float(utility_before), float(utility_after),
+            pertask_json)
+        gate = json.loads(gate_json)
+        gate_decision = gate["decision"]
+        gate_rationale = gate["rationale"]
+        utility_delta = gate["utility_delta"]
+        if probe_result is not None:
+            gate_rationale = (f"probe: n={probe_result['n']} "
+                              f"before={probe_result['before']:.2f} "
+                              f"after={probe_result['after']:.2f} "
+                              f"cost=${probe_result.get('cost_usd', 0.0):.2f}; "
+                              f"{gate_rationale}")
 
     # 4b. Evaluator honesty (F3 enable, 2026-09-12). The mock scorer and the
     #     gepa placeholder fabricate utility numbers (mock centers after≈0.55
@@ -721,8 +823,8 @@ def apply_run(task_class: str, target_kind: str, target_name: str,
     #     promote on fabricated numbers is only allowed under an explicit
     #     operator opt-in (MO_APPLY_UNVETTED=1); otherwise it is recorded as
     #     pending_human_approval so the audit trail never claims a measured
-    #     improvement that was not measured.
-    scorer = os.environ.get("MO_APPLY_SCORER", "mock")
+    #     improvement that was not measured. The probe scorer is deliberately
+    #     absent from this list: its utilities come from real held-out runs.
     if gate_decision == "promoted" and scorer in ("mock", "gepa"):
         if os.environ.get("MO_APPLY_UNVETTED", "0") == "1":
             gate_rationale = (f"UNVETTED promote (scorer={scorer} fabricates "
@@ -768,6 +870,103 @@ def apply_run(task_class: str, target_kind: str, target_name: str,
         f'"confidence":{confidence},"dry_run":"{dry_run}"}}\n'
     )
     return 0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Post-run auto-apply sweep (task #19, AutoSaddler 2608.23041).
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _recipe_dir_for(task_class: str) -> str:
+    root = _resolve_root()
+    for name in (task_class, task_class.replace("_", "-"), task_class.replace("-", "_")):
+        path = os.path.join(root, "recipes", name)
+        if os.path.isdir(path):
+            return path
+    return ""
+
+
+def _prompt_file_for(recipe_dir: str, target: str) -> str:
+    """Gradient target → an existing recipe prompt path.
+
+    ``agent.<role>.prompt`` (reflect's agent-targeted form) maps to
+    ``prompts/<role>.md`` with ``_``/``-`` interchange; a ``prompts/<name>``
+    target is already a recipe-relative path. No match → '' (target skipped,
+    never guessed)."""
+    if not recipe_dir:
+        return ""
+    if target.startswith("agent.") and target.endswith(".prompt"):
+        role = target[len("agent."):-len(".prompt")]
+        for name in sorted({role, role.replace("-", "_"), role.replace("_", "-")}):
+            path = os.path.join(recipe_dir, "prompts", name + ".md")
+            if os.path.isfile(path):
+                return path
+        return ""
+    if target.startswith("prompts/"):
+        path = os.path.join(recipe_dir, target)
+        return path if os.path.isfile(path) else ""
+    return ""
+
+
+def auto_sweep(task_class: str, db: str | None = None,
+               max_targets: int | None = None) -> list[dict]:
+    """Bounded post-run apply sweep: top-1 gradient per agent-prompt target,
+    every candidate still passes through the SAME gated apply_run — nothing
+    promotes without the gate (dev-set filter, AutoSaddler's core rule).
+    Returns per-target result dicts for the caller's log."""
+    if max_targets is None:
+        try:
+            max_targets = max(1, int(os.environ.get("MO_AUTO_APPLY_MAX_TARGETS", "1")))
+        except ValueError:
+            max_targets = 1
+    con = None
+    try:
+        con = sqlite3.connect(_db_path(db))
+        rows = con.execute(
+            "SELECT target, suggested_change FROM gradient_records "
+            "WHERE task_class=? AND target LIKE 'agent.%' "
+            "AND target NOT LIKE 'cross_class:%' "
+            "ORDER BY confidence DESC", (task_class,)).fetchall()
+    except sqlite3.Error:
+        return []
+    finally:
+        if con:
+            con.close()
+    targets: list[str] = []
+    for target, change in rows:
+        if not change or target in targets:
+            continue  # top-1 per target only
+        targets.append(target)
+        if len(targets) >= max_targets:
+            break
+    print(f"[auto-apply] sweep task_class={task_class} targets={len(targets)} "
+          f"(max={max_targets})")
+    results = []
+    recipe = _recipe_dir_for(task_class)
+    for target in targets:
+        target_file = _prompt_file_for(recipe, target)
+        if not target_file:
+            print(f"[auto-apply] {target}: skipped (no prompt file in recipe)")
+            results.append({"target": target, "skipped": "no prompt file"})
+            continue
+        apply_run(task_class, "prompt_file", target, target_file, db=db)
+        con = None
+        try:
+            con = sqlite3.connect(_db_path(db))
+            row = con.execute(
+                "SELECT decision, rationale FROM apply_attempts "
+                "WHERE task_class=? AND target_name=? "
+                "ORDER BY rowid DESC LIMIT 1", (task_class, target)).fetchone()
+        except sqlite3.Error:
+            row = None
+        finally:
+            if con:
+                con.close()
+        decision = row[0] if row else "unknown"
+        rationale = (row[1] if row else "")[:200]
+        print(f"[auto-apply] {target}: {decision}")
+        results.append({"target": target, "decision": decision,
+                        "rationale": rationale})
+    return results
 
 
 # ─────────────────────────────────────────────────────────────────────────────
