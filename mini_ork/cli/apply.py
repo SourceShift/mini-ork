@@ -763,6 +763,7 @@ def apply_run(task_class: str, target_kind: str, target_name: str,
 
     probe_result = None
     probe_unmeasured = False
+    probe_dead_arms = False
     utility_after = ""
     if scorer == "probe":
         from mini_ork.learning import probe_scorer as _ps  # deferred: cycle-safe
@@ -775,10 +776,22 @@ def apply_run(task_class: str, target_kind: str, target_name: str,
             sys.stderr.write(f"[probe-scorer] {exc}\n")
             probe_result = None
         if probe_result is not None and probe_result.get("n", 0) > 0:
-            utility_before = f"{probe_result['before']:.4f}"
-            utility_after = f"{probe_result['after']:.4f}"
-            if probe_result.get("pertask_json"):
-                pertask_json = probe_result["pertask_json"]
+            if probe_result["before"] <= 0.0 and probe_result["after"] <= 0.0:
+                # Live-smoke finding (2026-09-16): every probe launch can fail
+                # for an infra reason (needs_answers block, dead lane, bad env)
+                # and n>0 with 0.0-vs-0.0 utilities then sails through the
+                # scalar gate as a "non-regression" — promoting on a dead
+                # harness, the exact fabrication this scorer retires. Both
+                # arms entirely dead is NOT a measurement. (0→positive is a
+                # genuine improvement and stays promotable.)
+                probe_unmeasured = True
+                probe_dead_arms = True
+                utility_after = "0.0"
+            else:
+                utility_before = f"{probe_result['before']:.4f}"
+                utility_after = f"{probe_result['after']:.4f}"
+                if probe_result.get("pertask_json"):
+                    pertask_json = probe_result["pertask_json"]
         else:
             # No frozen probe set (or budget exhausted before any pair
             # completed): NOTHING was measured. Fall through to no gate
@@ -798,9 +811,15 @@ def apply_run(task_class: str, target_kind: str, target_name: str,
     #    previously-solved task even when the aggregate improved (2607.14004).
     if probe_unmeasured:
         gate_decision = "pending_human_approval"
-        gate_rationale = ("probe scorer measured nothing (no frozen probe set under "
-                          "recipes/<recipe>/probes/, unresolvable target file, or budget "
-                          "exhausted) — refusing to promote without held-out evaluation")
+        if probe_dead_arms:
+            gate_rationale = ("probe scorer: BOTH arms failed every probe "
+                              "(before=0.00 after=0.00) — the probe launches are "
+                              "broken (needs_answers block, dead lane, bad env), not "
+                              "the candidate; refusing to promote on a dead harness")
+        else:
+            gate_rationale = ("probe scorer measured nothing (no frozen probe set under "
+                              "recipes/<recipe>/probes/, unresolvable target file, or budget "
+                              "exhausted) — refusing to promote without held-out evaluation")
         utility_delta = 0.0
     else:
         gate_json = evaluate_gate(
