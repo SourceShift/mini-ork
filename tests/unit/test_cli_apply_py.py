@@ -625,6 +625,48 @@ def test_run_id_from_stdout_sink_and_fallback():
     assert ps._run_id_from_stdout('mini_ork_result=not-json') is None
 
 
+def test_launch_run_scrubs_run_scoped_env(tmp_path, monkeypatch, envscrub):
+    """Run-scoped env must never leak into the nested probe launch: an
+    inherited MINI_ORK_RUN_ID makes the nested run REUSE the parent's
+    task_runs row (outcome attribution reads the wrong status), and an
+    inherited MO_AUTO_APPLY fires a sweep inside every probe run —
+    unbounded recursion."""
+    from mini_ork.learning import probe_scorer as ps
+    captured = {}
+
+    class FakeProc:
+        returncode = 0
+        stdout = 'mini_ork_result={"run_id": "run-1-1"}\n'
+        stderr = ""
+
+    def fake_run(_cmd, **kw):
+        captured.update(kw)
+        return FakeProc()
+
+    monkeypatch.setattr(ps.subprocess, "run", fake_run)
+    monkeypatch.setattr(ps, "_ROOT", str(tmp_path))
+    for var, val in (("MINI_ORK_RUN_ID", "run-parent-99"),
+                     ("MINI_ORK_TASK_RUN_ID", "run-parent-99"),
+                     ("MINI_ORK_RUN_DIR", "/tmp/parent"),
+                     ("MINI_ORK_PLAN_PATH", "/tmp/parent/plan.json"),
+                     ("MINI_ORK_WORKFLOW", "/tmp/parent/workflow.yaml"),
+                     ("MINI_ORK_RECIPE", "parent-recipe"),
+                     ("MO_AUTO_APPLY", "1")):
+        envscrub.setenv(var, val)
+    envscrub.setenv("MINI_ORK_DB", str(tmp_path / "no.db"))  # _run_cost → 0.0
+    stdout, run_id, cost = ps._launch_run("obs_smoke", "probe-1.md")
+    assert run_id == "run-1-1"
+    assert cost == 0.0
+    env = captured["env"]
+    for leak in ("MINI_ORK_RUN_ID", "MINI_ORK_TASK_RUN_ID", "MINI_ORK_RUN_DIR",
+                 "MINI_ORK_PLAN_PATH", "MINI_ORK_WORKFLOW", "MINI_ORK_RECIPE",
+                 "MO_AUTO_APPLY"):
+        assert leak not in env, f"{leak} leaked into the probe launch env"
+    assert env["MINI_ORK_ROOT"] == str(tmp_path)
+    assert env["MINI_ORK_NONINTERACTIVE"] == "1"
+    assert captured["cwd"] == str(tmp_path)
+
+
 def _seed_gradient(db_path, gradient_id="gr-1", target="agent.reviewer.prompt",
                    change="be more specific", confidence=0.42, task_class="reviewer",
                    signal="rubric"):
