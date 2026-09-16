@@ -23,6 +23,7 @@ reference; these tests pin the ported behaviour against tmp sqlite fixtures:
 from __future__ import annotations
 
 import json
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -139,6 +140,9 @@ _APPLY_ENV = [
     "MO_APPLY_REGRESSION_TOLERANCE", "MO_APPLY_PERTASK_JSON",
     "MO_APPLY_MOCK_BASELINE", "MO_APPLY_MOCK_DELTA",
     "MO_APPLY_FORCE_REGRESSION", "MINI_ORK_REQUIRE_HUMAN_APPROVAL",
+    "MO_AUTO_APPLY", "MO_AUTO_APPLY_MAX_TARGETS",
+    "MO_APPLY_PROBE_MAX_TASKS", "MO_APPLY_PROBE_BUDGET_USD",
+    "MO_APPLY_PROBE_TIMEOUT_S",
 ]
 
 
@@ -529,6 +533,287 @@ def test_cli_main_end_to_end_no_candidate(db, tmp_path, capsys, envscrub):
     out = capsys.readouterr().out
     assert "    apply_enabled: 1\n" in out
     assert "    dry_run:    1\n" in out
+
+
+# ── 12b. Probe scorer (#18): frozen probe set, two arms, vetted gate ─────────
+
+def _probe_fixture(tmp_path, monkeypatch):
+    """A fake recipe with a frozen probe set; probe_scorer._ROOT pinned to it."""
+    from mini_ork.learning import probe_scorer as ps
+    recipe = tmp_path / "recipes" / "obs-smoke"
+    (recipe / "prompts").mkdir(parents=True)
+    (recipe / "prompts" / "tiny-researcher.md").write_text("BASE PROMPT\n")
+    for i in (1, 2, 3):  # 3 probes; default cap keeps 2
+        (recipe / "probes").mkdir(exist_ok=True)
+        (recipe / "probes" / f"probe-{i}.md").write_text(f"probe {i}\n")
+    monkeypatch.setattr(ps, "_ROOT", str(tmp_path))
+    return ps, recipe
+
+
+def test_probe_scorer_no_probes_returns_none(tmp_path, monkeypatch):
+    ps, _ = _probe_fixture(tmp_path, monkeypatch)
+    shutil.rmtree(tmp_path / "recipes" / "obs-smoke" / "probes")
+    assert ps.probe_score("obs_smoke", "prompts/tiny-researcher.md", "d") is None
+
+
+def test_probe_scorer_missing_directive_or_target_returns_none(tmp_path, monkeypatch):
+    ps, _ = _probe_fixture(tmp_path, monkeypatch)
+    assert ps.probe_score("obs_smoke", "", "d") is None
+    assert ps.probe_score("obs_smoke", "prompts/tiny-researcher.md", "") is None
+
+
+def test_probe_scorer_two_arms_vectors_and_cleanup(tmp_path, monkeypatch):
+    ps, recipe = _probe_fixture(tmp_path, monkeypatch)
+    launches = []
+    outcomes = {}
+
+    def fake_launch(recipe_name, kickoff):
+        arm = "cand" if "__probe_" in recipe_name and recipe_name.endswith("_1") else "base"
+        rid = f"run-{arm}-{len(launches)}"
+        # Prove the candidate arm actually carries the directive block.
+        mut = tmp_path / "recipes" / recipe_name / "prompts" / "tiny-researcher.md"
+        if arm == "cand":
+            assert "<!-- applied:gradient_records:gr-9 -->" in mut.read_text()
+        else:
+            assert mut.read_text() == "BASE PROMPT\n"
+        assert not (tmp_path / "recipes" / recipe_name / "probes").exists()
+        launches.append((recipe_name, kickoff, arm))
+        return f"mini_ork_result={{\"run_id\": \"{rid}\"}}\n", rid, 0.01
+
+    def fake_outcome(run_id):
+        return outcomes.get(run_id, 1.0)
+
+    monkeypatch.setattr(ps, "_launch_run", fake_launch)
+    monkeypatch.setattr(ps, "_run_outcome", fake_outcome)
+    outcomes.update({"run-base-0": 1.0, "run-base-2": 1.0,
+                     "run-cand-1": 0.0, "run-cand-3": 1.0})
+
+    out = ps.probe_score("obs_smoke", "prompts/tiny-researcher.md",
+                         "emit an action ledger",
+                         source_ref="gradient_records:gr-9", context="sig")
+    assert out["n"] == 2  # 3 probes on disk, cap 2
+    assert out["before"] == 1.0
+    assert out["after"] == 0.5
+    pertask = json.loads(out["pertask_json"])
+    assert pertask == {"before": [1, 1], "after": [0, 1],
+                       "ids": ["probe-1.md", "probe-2.md"]}
+    assert len(out["runs"]) == 4
+    assert out["cost_usd"] == pytest.approx(0.04)
+    # Both arms ran per probe, base first.
+    arms = [(probe.rsplit("/", 1)[-1], arm) for _r, probe, arm in launches]
+    assert arms == [("probe-1.md", "base"), ("probe-1.md", "cand"),
+                    ("probe-2.md", "base"), ("probe-2.md", "cand")]
+    # Temp recipes removed; only the original recipe remains.
+    assert [p.name for p in (tmp_path / "recipes").iterdir()] == ["obs-smoke"]
+
+
+def test_probe_scorer_budget_zero_truncates_to_nothing(tmp_path, monkeypatch, envscrub):
+    ps, _ = _probe_fixture(tmp_path, monkeypatch)
+    envscrub.setenv("MO_APPLY_PROBE_BUDGET_USD", "0")
+    monkeypatch.setattr(ps, "_launch_run", lambda *a: pytest.fail("must not launch"))
+    out = ps.probe_score("obs_smoke", "prompts/tiny-researcher.md", "d")
+    assert out["n"] == 0 and out["truncated_by_budget"] is True
+    assert [p.name for p in (tmp_path / "recipes").iterdir()] == ["obs-smoke"]
+
+
+def test_run_id_from_stdout_sink_and_fallback():
+    from mini_ork.learning import probe_scorer as ps
+    sink = 'noise\nmini_ork_result={"run_id": "run-123-456", "status": "published"}\n'
+    assert ps._run_id_from_stdout(sink) == "run-123-456"
+    assert ps._run_id_from_stdout("banner run-999-1 mid run-999-2 end") == "run-999-2"
+    assert ps._run_id_from_stdout("nothing here") is None
+    assert ps._run_id_from_stdout('mini_ork_result=not-json') is None
+
+
+def _seed_gradient(db_path, gradient_id="gr-1", target="agent.reviewer.prompt",
+                   change="be more specific", confidence=0.42, task_class="reviewer",
+                   signal="rubric"):
+    con = sqlite3.connect(db_path)
+    con.execute(
+        "INSERT INTO gradient_records"
+        " (gradient_id, target, signal, suggested_change, evidence, confidence, created_at, task_class)"
+        " VALUES (?,?,?,?,?,?,?,?)",
+        (gradient_id, target, signal, change, "[]", confidence, 100, task_class),
+    )
+    con.commit()
+    con.close()
+
+
+def test_apply_run_probe_no_probe_set_never_promotes(db, tmp_path, capsys, envscrub, monkeypatch):
+    """probe scorer with nothing measured must NOT ride the delta>=0 gate."""
+    from mini_ork.learning import probe_scorer as ps
+    _seed_gradient(db, target="prompts/reviewer.md", task_class="reviewer")
+    target = tmp_path / "reviewer.md"
+    target.write_text("ORIGINAL PROMPT\n")
+    envscrub.setenv("MO_APPLY_SCORER", "probe")
+    envscrub.setenv("MO_APPLY_ENABLED", "1")
+    monkeypatch.setattr(ps, "probe_score", lambda *a, **k: None)
+    rc = ap.apply_run("reviewer", "prompt_file", "prompts/reviewer.md",
+                      str(target), db=db)
+    assert rc == 0
+    summary = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert summary["decision"] == "pending_human_approval"
+    assert summary["version_id"] == ""
+    assert target.read_text() == "ORIGINAL PROMPT\n"
+    att = _rows(db, "apply_attempts")[0]
+    assert att["decision"] == "pending_human_approval"
+    assert "measured nothing" in att["rationale"]
+
+
+def test_apply_run_probe_vetted_promote_without_unvetted(db, tmp_path, capsys, envscrub, monkeypatch):
+    """A probe-measured no-regression candidate promotes VETTED — no
+    MO_APPLY_UNVETTED needed (that flag exists only for fabricated scorers)."""
+    from mini_ork.learning import probe_scorer as ps
+    _seed_gradient(db, target="prompts/reviewer.md", task_class="reviewer",
+                   change="improve wording")
+    target = tmp_path / "reviewer.md"
+    target.write_text("ORIGINAL PROMPT\n")
+    envscrub.setenv("MO_APPLY_SCORER", "probe")
+    envscrub.setenv("MO_APPLY_ENABLED", "1")
+    probe_out = {"before": 1.0, "after": 1.0, "n": 2,
+                 "pertask_json": json.dumps({"before": [1, 1], "after": [1, 1],
+                                             "ids": ["probe-1.md", "probe-2.md"]}),
+                 "runs": [], "cost_usd": 0.08}
+    monkeypatch.setattr(ps, "probe_score", lambda *a, **k: dict(probe_out))
+    rc = ap.apply_run("reviewer", "prompt_file", "prompts/reviewer.md",
+                      str(target), db=db)
+    assert rc == 0
+    summary = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert summary["decision"] == "promoted"
+    assert summary["version_id"]  # file + version_registry written
+    applied = target.read_text()
+    assert applied.startswith("ORIGINAL PROMPT\n")
+    assert "- Directive: improve wording" in applied
+    promo = _rows(db, "promotion_records")[0]
+    assert promo["decision"] == "promoted"
+    assert "UNVETTED" not in promo["rationale"]
+    assert "probe: n=2" in promo["rationale"]
+    assert "cost=$0.08" in promo["rationale"]
+    att = _rows(db, "apply_attempts")[0]
+    assert att["utility_before"] == pytest.approx(1.0)
+    assert att["utility_after"] == pytest.approx(1.0)
+
+
+def test_apply_run_probe_regression_quarantines(db, tmp_path, capsys, envscrub, monkeypatch):
+    from mini_ork.learning import probe_scorer as ps
+    _seed_gradient(db, target="prompts/reviewer.md", task_class="reviewer",
+                   change="break it")
+    target = tmp_path / "reviewer.md"
+    target.write_text("ORIGINAL PROMPT\n")
+    envscrub.setenv("MO_APPLY_SCORER", "probe")
+    envscrub.setenv("MO_APPLY_ENABLED", "1")
+    probe_out = {"before": 1.0, "after": 0.0, "n": 2,
+                 "pertask_json": json.dumps({"before": [1, 1], "after": [0, 0],
+                                             "ids": ["probe-1.md", "probe-2.md"]}),
+                 "runs": [], "cost_usd": 0.08}
+    monkeypatch.setattr(ps, "probe_score", lambda *a, **k: dict(probe_out))
+    rc = ap.apply_run("reviewer", "prompt_file", "prompts/reviewer.md",
+                      str(target), db=db)
+    assert rc == 0
+    summary = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert summary["decision"] == "quarantined"
+    assert target.read_text() == "ORIGINAL PROMPT\n"
+    assert _rows(db, "apply_attempts")[0]["decision"] == "quarantined"
+
+
+def test_apply_run_launch_failure_is_caught_not_fatal(db, tmp_path, capsys, envscrub, monkeypatch):
+    from mini_ork.learning import probe_scorer as ps
+    _seed_gradient(db, target="prompts/reviewer.md", task_class="reviewer")
+    envscrub.setenv("MO_APPLY_SCORER", "probe")
+    envscrub.setenv("MO_APPLY_ENABLED", "1")
+
+    def boom(*a, **k):
+        raise RuntimeError("probe launch reported no run_id (rc=1)")
+
+    monkeypatch.setattr(ps, "probe_score", boom)
+    rc = ap.apply_run("reviewer", "prompt_file", "prompts/reviewer.md",
+                      str(tmp_path / "reviewer.md"), db=db)
+    assert rc == 0
+    summary = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert summary["decision"] == "pending_human_approval"
+
+
+# ── 12c. Edit memory (#19 prereq) + auto_sweep (#19) + execute wiring ────────
+
+def test_edit_memory_never_reproposes_failed_directive(db, tmp_path, capsys, envscrub):
+    _seed_gradient(db, target="prompts/reviewer.md", task_class="reviewer")
+    target = tmp_path / "reviewer.md"
+    target.write_text("ORIGINAL PROMPT\n")
+    envscrub.setenv("MO_APPLY_ENABLED", "1")
+    envscrub.setenv("MO_APPLY_MOCK_BASELINE", "0.5")
+    envscrub.setenv("MO_APPLY_FORCE_REGRESSION", "1")
+    args = ("reviewer", "prompt_file", "prompts/reviewer.md", str(target))
+    # 1st attempt: gate quarantines the regression.
+    ap.apply_run(*args, db=db)
+    summary = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert summary["decision"] == "quarantined"
+    # 2nd attempt with the SAME source: edit memory rejects instantly —
+    # no re-score, no re-spend (GRASP/GRAO: never re-propose a failed edit).
+    envscrub.setenv("MO_APPLY_FORCE_REGRESSION", "0")
+    ap.apply_run(*args, db=db)
+    summary = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert summary["decision"] == "rejected"
+    attempts = _rows(db, "apply_attempts")
+    assert [a["decision"] for a in attempts] == ["quarantined", "rejected"]
+    assert "2604.20714" in attempts[1]["rationale"]
+    assert attempts[1]["utility_after"] is None  # nothing was re-measured
+    # A DIFFERENT source on the same target is unaffected.
+    _seed_gradient(db, gradient_id="gr-2", target="prompts/reviewer.md",
+                   change="another idea", confidence=0.9)
+    ap.apply_run(*args, db=db)
+    summary = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert summary["decision"] != "rejected"
+
+
+def test_auto_sweep_top1_per_target_through_gate(db, tmp_path, capsys, envscrub, monkeypatch):
+    recipe = tmp_path / "recipes" / "obs-smoke" / "prompts"
+    recipe.mkdir(parents=True)
+    (recipe / "tiny-researcher.md").write_text("R\n")
+    (recipe / "tiny-reviewer.md").write_text("V\n")
+    monkeypatch.setattr(ap, "_resolve_root", lambda: str(tmp_path))
+    _seed_gradient(db, gradient_id="gr-hi", target="agent.tiny-researcher.prompt",
+                   change="directive one", confidence=0.9, task_class="obs_smoke")
+    _seed_gradient(db, gradient_id="gr-lo", target="agent.tiny-researcher.prompt",
+                   change="directive one-dup", confidence=0.5, task_class="obs_smoke")
+    _seed_gradient(db, gradient_id="gr-rev", target="agent.tiny-reviewer.prompt",
+                   change="directive two", confidence=0.8, task_class="obs_smoke")
+    _seed_gradient(db, gradient_id="gr-x", target="cross_class:whatever",
+                   change="cross-class", confidence=0.99, task_class="obs_smoke")
+    envscrub.setenv("MO_APPLY_ENABLED", "1")  # gate master on; scorer=mock default
+    results = ap.auto_sweep("obs_smoke", db=db, max_targets=2)
+    # top-1 per target, confidence-ordered, cross_class excluded
+    assert [r["target"] for r in results] == ["agent.tiny-researcher.prompt",
+                                              "agent.tiny-reviewer.prompt"]
+    # mock scorer without UNVETTED → both gated to pending_human_approval
+    assert all(r["decision"] == "pending_human_approval" for r in results)
+    attempts = _rows(db, "apply_attempts")
+    assert len(attempts) == 2
+    assert {a["source_id"] for a in attempts} == {"gr-hi", "gr-rev"}
+    # nothing written (gate refused)
+    assert (recipe / "tiny-researcher.md").read_text() == "R\n"
+    capsys.readouterr()  # drain
+
+
+def test_auto_sweep_no_recipe_skips(db, tmp_path, envscrub, monkeypatch):
+    monkeypatch.setattr(ap, "_resolve_root", lambda: str(tmp_path))
+    _seed_gradient(db, target="agent.ghost.prompt", task_class="obs_smoke")
+    results = ap.auto_sweep("obs_smoke", db=db)
+    assert results == [{"target": "agent.ghost.prompt", "skipped": "no prompt file"}]
+
+
+def test_post_run_learning_auto_apply_wiring(db, envscrub, monkeypatch):
+    from mini_ork.cli import execute as ex
+    calls = []
+    monkeypatch.setattr(ap, "auto_sweep",
+                        lambda tc, db=None, max_targets=None: calls.append(tc) or [])
+    envscrub.setenv("MO_AUTO_APPLY", "1")
+    envscrub.setenv("MO_APPLY_ENABLED", "1")
+    ex._post_run_learning(db, "/nonexistent-run-dir", "run-x", "obs_smoke")
+    assert calls == ["obs_smoke"]
+    # master gate off → no sweep even with MO_AUTO_APPLY=1
+    envscrub.delenv("MO_APPLY_ENABLED")
+    ex._post_run_learning(db, "/nonexistent-run-dir", "run-y", "obs_smoke")
+    assert calls == ["obs_smoke"]
 
 
 # ── 13. Native integration through the dispatcher ────────────────────────────

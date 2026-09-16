@@ -875,7 +875,7 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
     elif rollback_fields:
         print("  [skip] rollback — no failures (escalates_to edge not triggered)")
     _emit_run_verdict(live_run_dir, fail_count, len(fields_list))
-    _post_run_learning(db, live_run_dir, run_id)
+    _post_run_learning(db, live_run_dir, run_id, task_class)
     if fail_count > 0:
         set_status(db, run_id, "failed")
         sys.stderr.write(f"execute: {fail_count} node(s) failed\n")
@@ -887,7 +887,7 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
 # ── post-run learning side-channels ──
 
 
-def _post_run_learning(db, run_dir, run_id):
+def _post_run_learning(db, run_dir, run_id, task_class=""):
     """Post-run learning side-channels (each best-effort; never fail the run):
 
     1. rubric grading — fill-ONLY: a per-node reward already on the row
@@ -900,6 +900,10 @@ def _post_run_learning(db, run_dir, run_id):
        rode stale slice advantages (live DB: region frozen 2026-07-19 while
        APM updated per-run). Full-history window is one cheap EMA step over
        the reward-bearing rows — the same shape reflect runs at since=0.
+    4. auto-apply sweep (task #19, AutoSaddler 2608.23041) — bounded top-1
+       gradient per agent-prompt target, gated through the same apply_run.
+       Opt-in twice (MO_AUTO_APPLY=1 AND MO_APPLY_ENABLED=1): a sweep without
+       the master gate would audit but never write, which is pure noise.
     """
     if os.environ.get("MO_GRADE_RUN_REWARD", "1") == "1":
         try:
@@ -917,6 +921,14 @@ def _post_run_learning(db, run_dir, run_id):
         try:
             from mini_ork import lane_router  # noqa: PLC0415
             lane_router.recompute_advantages(since=0, db=db)
+        except Exception:
+            pass
+    if (os.environ.get("MO_AUTO_APPLY", "0") == "1"
+            and os.environ.get("MO_APPLY_ENABLED", "0") == "1"
+            and task_class):
+        try:
+            from mini_ork.cli import apply as _apply  # noqa: PLC0415
+            _apply.auto_sweep(task_class, db=db)
         except Exception:
             pass
 
