@@ -84,6 +84,16 @@ def _launch_run(recipe_name: str, kickoff: str) -> tuple[str, str, float]:
     except ValueError:
         timeout_s = 600.0
     env = {**os.environ, "MINI_ORK_ROOT": root, "MINI_ORK_NONINTERACTIVE": "1"}
+    # Run-scoped env must NOT leak into the probe launch: an inherited
+    # MINI_ORK_RUN_ID makes the nested run REUSE this run's task_runs row
+    # (outcome attribution then reads the wrong status), inherited
+    # RUN_DIR/PLAN_PATH/WORKFLOW route the nested run into this run's
+    # artifacts, and an inherited MO_AUTO_APPLY would fire a sweep inside
+    # every probe run — unbounded recursion.
+    for leak in ("MINI_ORK_RUN_ID", "MINI_ORK_TASK_RUN_ID", "MINI_ORK_RUN_DIR",
+                 "MINI_ORK_PLAN_PATH", "MINI_ORK_WORKFLOW", "MINI_ORK_RECIPE",
+                 "MO_AUTO_APPLY"):
+        env.pop(leak, None)
     proc = subprocess.run(
         [sys.executable, "-m", "mini_ork.cli.main", "run", recipe_name, kickoff],
         cwd=root, env=env, capture_output=True, text=True, timeout=timeout_s,
