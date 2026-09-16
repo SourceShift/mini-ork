@@ -83,7 +83,13 @@ def _launch_run(recipe_name: str, kickoff: str) -> tuple[str, str, float]:
         timeout_s = float(os.environ.get("MO_APPLY_PROBE_TIMEOUT_S", "600"))
     except ValueError:
         timeout_s = 600.0
-    env = {**os.environ, "MINI_ORK_ROOT": root, "MINI_ORK_NONINTERACTIVE": "1"}
+    # MO_STATIC_RECIPE_PLAN freezes planning: the probe measures the EXECUTION
+    # effect of the directive, not the planner's mood. A stochastic planner
+    # shape-fail (observed twice live on opus) would randomly kill an arm and
+    # fabricate a regression signal. recipe_fallback_plan renders the temp
+    # recipe's workflow.yaml deterministically, zero LLM.
+    env = {**os.environ, "MINI_ORK_ROOT": root, "MINI_ORK_NONINTERACTIVE": "1",
+           "MO_STATIC_RECIPE_PLAN": "1"}
     # Run-scoped env must NOT leak into the probe launch: an inherited
     # MINI_ORK_RUN_ID makes the nested run REUSE this run's task_runs row
     # (outcome attribution then reads the wrong status), inherited
