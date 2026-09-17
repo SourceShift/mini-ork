@@ -6,6 +6,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 from pathlib import Path
 from typing import Iterable
 
@@ -34,6 +35,16 @@ class MiniOrk:
         self.home = Path(home).resolve() if home else None
         self.db = Path(db).resolve() if db else None
 
+    def _cli_command(self, *args: str) -> list[str]:
+        """Launcher invocation prefix, pinned to the embedding interpreter.
+
+        The launcher's `#!/usr/bin/env python3` is a human-shell convenience;
+        an embedding app already runs an interpreter under which mini-ork's
+        deps are importable (it imported this module), so pin sys.executable
+        instead of trusting whatever PATH's `python3` resolves to.
+        """
+        return [sys.executable, str(self.root / "bin" / "mini-ork"), *args]
+
     def run(self, request: RunRequest) -> RunResult:
         cwd = Path(request.cwd or Path.cwd()).resolve()
         kickoff = Path(request.kickoff)
@@ -42,7 +53,7 @@ class MiniOrk:
         if not kickoff.exists():
             raise MiniOrkError(f"kickoff not found: {kickoff}")
 
-        command = [str(self.root / "bin" / "mini-ork"), "run", "--json"]
+        command = self._cli_command("run", "--json")
         if request.recipe:
             command.append(request.recipe)
         command.append(str(kickoff))
@@ -51,7 +62,7 @@ class MiniOrk:
         init_output = ""
         init_ran = False
         if request.auto_init and not self._is_initialized(Path(env["MINI_ORK_HOME"])):
-            init_command = [str(self.root / "bin" / "mini-ork"), "init"]
+            init_command = self._cli_command("init")
             init_completed = subprocess.run(
                 init_command,
                 cwd=cwd,
@@ -98,7 +109,7 @@ class MiniOrk:
 
     def classify(self, kickoff: Path | str, cwd: Path | str | None = None) -> RunResult:
         run_cwd = Path(cwd or Path.cwd()).resolve()
-        command = [str(self.root / "bin" / "mini-ork"), "classify", str(kickoff)]
+        command = self._cli_command("classify", str(kickoff))
         completed = subprocess.run(
             command,
             cwd=run_cwd,
@@ -141,8 +152,7 @@ class MiniOrk:
         if not kickoff.exists():
             raise MiniOrkError(f"kickoff not found: {kickoff}")
 
-        command = [
-            str(self.root / "bin" / "mini-ork"),
+        command = self._cli_command(
             "spawn",
             "--parent-run",
             request.parent_run_id,
@@ -150,7 +160,7 @@ class MiniOrk:
             str(kickoff),
             "--authority",
             f"{request.authority_level:.3f}",
-        ]
+        )
         if request.recipe:
             command.extend(["--recipe", request.recipe])
         if request.child_run_id:
@@ -167,7 +177,7 @@ class MiniOrk:
         env.update(request.extra_env)
 
         if request.auto_init and not self._is_initialized(Path(env["MINI_ORK_HOME"])):
-            init_command = [str(self.root / "bin" / "mini-ork"), "init"]
+            init_command = self._cli_command("init")
             subprocess.run(
                 init_command,
                 cwd=cwd,
