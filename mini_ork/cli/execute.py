@@ -1520,6 +1520,60 @@ def _write_self_migrate_implementer_summary(run_dir, target, impl_log, harvested
         handle.write("\n")
 
 
+def _write_implementer_summary(run_dir, target, impl_log):
+    """Materialize the implementer-summary.json the publisher's commit gate reads.
+
+    Only self-migrate had a writer, so every other recipe (code-fix included) left
+    the file absent — publisher._publisher_try_commit_files then found no
+    files_changed and skipped the commit, meaning a passing run could never
+    publish. Derive the list from the working tree instead of trusting the model's
+    self-report, scoped by <run_dir>/pre-implementer-ref so a concurrent session's
+    pre-existing dirt is never swept into the commit (the same baseline
+    _assemble_reviewer_inputs uses for the reviewer diff). Untracked files are
+    included because a newly created file is exactly the kind of change the commit
+    must carry; anything under run_dir is excluded so run sidecars (which may live
+    inside an in-place target tree) can never be committed.
+    """
+    if not run_dir or not target:
+        return
+    baseline = ""
+    ref_path = os.path.join(run_dir, "pre-implementer-ref")
+    if os.path.isfile(ref_path):
+        try:
+            baseline = open(ref_path, encoding="utf-8").read().strip()
+        except OSError:
+            baseline = ""
+    under_run_dir = os.path.realpath(run_dir)
+    files: list[str] = []
+    try:
+        args = ["git", "-C", target, "diff", "--name-only"]
+        if baseline:
+            args.append(baseline)
+        rels: list[str] = []
+        for argv in (args, ["git", "-C", target, "ls-files", "--others", "--exclude-standard"]):
+            proc = subprocess.run(argv, capture_output=True, text=True, timeout=15)
+            if proc.returncode == 0:
+                rels.extend(line.strip() for line in proc.stdout.splitlines() if line.strip())
+        for rel in rels:
+            full = os.path.join(target, rel)
+            real = os.path.realpath(full)
+            if real == under_run_dir or real.startswith(under_run_dir + os.sep):
+                continue
+            if real not in files:
+                files.append(real)
+    except Exception:
+        files = []
+    payload = {
+        "status": "implemented",
+        "worktree_path": target,
+        "files_changed": files,
+        "implementation_log": impl_log,
+    }
+    with open(os.path.join(run_dir, "implementer-summary.json"), "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2)
+        handle.write("\n")
+
+
 def _assemble_reviewer_inputs(run_dir):
     """F2-B (bash _mo_assemble_reviewer_inputs:182-275). Build the reviewer input block:
     implementer-summary.json + verifier_{typecheck,test}.json + a generated

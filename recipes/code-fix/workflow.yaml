@@ -53,11 +53,14 @@ nodes:
   # Advisory per-run graded eval (roadmap Step-3). Trajectory-aware LLM judge
   # → reward_source='eval@v1' on execution_traces. NEVER gates: it always
   # succeeds (falls open to the rubric/PRM heuristic when the judge is
-  # unavailable), so it does not escalate to rollback. Reuses the reviewer lane
-  # for now; a dedicated independent judge lane is the Phase-1 improvement.
+  # unavailable), so it does not escalate to rollback. Runs on the dedicated
+  # `judge` lane (agents.yaml) rather than `reviewer`: the node's resolved lane
+  # is what gets published into MO_DISPATCH_CHAIN, which the dispatcher reads
+  # ahead of any per-juror lane argument — sharing `reviewer` silently pinned
+  # the judge to Opus and made MO_EVAL_JURY_LANES inert.
   - name: eval
     type: eval
-    model_lane: reviewer
+    model_lane: judge
     prompt_ref: prompts/eval.md
     dispatch_mode: serial
     tools:

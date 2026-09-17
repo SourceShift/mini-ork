@@ -51,6 +51,14 @@ lanes:
   # node.model_lane: minimax_lens (NOT auto-added to existing 4-lens
   # workflows — that's a per-recipe cost-budget decision).
   minimax_lens: minimax  # MiniMax (Anthropic-compatible gateway, M3)
+  # Dedicated judge lane for advisory eval nodes (recipes/code-fix workflow.yaml
+  # node `eval`). Split out of `reviewer` because the eval node's lane string is
+  # ALSO what reaches the judge: the node's resolved lane is published into
+  # MO_DISPATCH_CHAIN, which _default_llm_dispatch reads BEFORE the jury's
+  # per-juror lane argument — so a shared `reviewer` lane pinned the judge to
+  # Opus and made MO_EVAL_JURY_LANES inert. A distinct lane lets the judge run
+  # on a non-reviewer family and makes cross-family juries actually fire.
+  judge: minimax         # MiniMax-M3 — independent judge, never gates
 budget:
   per_epic_usd: 5.00
   per_run_usd: 0.50
