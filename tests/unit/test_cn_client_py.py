@@ -42,6 +42,15 @@ _BASINS = json.dumps({"basins": [
     {"basin_id": "b1234567xx", "active_mass": 12, "representative": "w" * 200},
     {"id": "b2", "size": 3, "centroid_text": "schema work"},
 ]})
+_GRAPH_NEIGHBORS = json.dumps({"neighbors": [
+    {"id": "a1b2c3d4deadbeefcafebabe00112233", "weight": 0.8321},
+    {"id": "99887766deadbeefcafebabe00112233"},
+], "total": 2})
+_GRAPH_PATH = json.dumps({
+    "found": True,
+    "nodes": ["a1b2c3d4deadbeefcafebabe00112233", "e5f6a7b8deadbeefcafebabe00112233"],
+    "hops": 2, "total_weight": 1.23, "confidence": 0.9, "algorithm": "dijkstra",
+})
 
 
 def test_render_atoms_md():
@@ -79,8 +88,29 @@ def test_render_basins_md():
     assert "[b2 mass=3] schema work" in rp
 
 
+def test_render_graph_neighbors_md():
+    rp = cn.render_graph_neighbors_md(_GRAPH_NEIGHBORS, 5)
+    assert rp.startswith("--- ContextNest graph — neighbours of the top retrieved memory ---")
+    assert "- a1b2c3d4 w=0.83" in rp        # id truncated to 8 chars, weight 2 decimals
+    assert "- 99887766 w=0.00" in rp        # missing weight defaults to 0.00
+    assert rp.rstrip().endswith("--- /graph neighbours ---")
+    for payload in ('{}', '{"neighbors":[]}', 'not json'):
+        assert cn.render_graph_neighbors_md(payload, 5) == ""
+
+
+def test_render_graph_path_md():
+    rp = cn.render_graph_path_md(_GRAPH_PATH, 3)
+    assert rp.startswith("--- ContextNest graph — how the top two memories connect ---")
+    assert "- a1b2c3d4 -> e5f6a7b8 (2 hops, w=1.23, dijkstra)" in rp
+    assert rp.rstrip().endswith("--- /graph path ---")
+    # no route between the two endpoints is rendered as silence
+    assert cn.render_graph_path_md('{"found": false}', 3) == ""
+    assert cn.render_graph_path_md('not json', 3) == ""
+
+
 def test_render_empty_and_bad_json():
-    for fn in (cn.render_atoms_md, cn.render_inbox_md, cn.render_basins_md):
+    for fn in (cn.render_atoms_md, cn.render_inbox_md, cn.render_basins_md,
+               cn.render_graph_neighbors_md, cn.render_graph_path_md):
         for payload in ('{}', '{"hits":[]}', 'not json'):
             assert fn(payload, 5) == ""
 
@@ -103,6 +133,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             self._send(_CAPSULE_MD)
         elif self.path.startswith("/api/v1/inbox"):
             self._send('{"items":[{"kind":"todo","id":"x"}]}')
+        elif self.path.startswith("/api/v1/graph/neighbors"):
+            self._send(_GRAPH_NEIGHBORS)
         else:
             self._send("{}")
 
@@ -160,10 +192,13 @@ def test_http_round_trips(tmp_path):
         try:
             rp_retrieve = cn.retrieve("q", 3)
             rp_inbox = cn.inbox(5)
+            rp_graph = cn.graph_neighbors("x")
         finally:
             os.environ.clear(); os.environ.update(old)
         assert json.loads(rp_retrieve) == {"hits": [{"content": "hi", "similarity": 0.5}]}
         assert json.loads(rp_inbox) == {"items": [{"kind": "todo", "id": "x"}]}
+        # graph route round-trips the served neighbours body (not the {} fallback)
+        assert json.loads(rp_graph) == json.loads(_GRAPH_NEIGHBORS)
     finally:
         srv.shutdown()
 

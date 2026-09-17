@@ -131,7 +131,103 @@ def test_planner_role_pack_uses_native_contextnest_client(tmp_path):
         def render_basins_md(payload, limit):
             return ""
 
+        @staticmethod
+        def retrieve(query, limit):
+            assert (query, limit) == ("Migrate", 2)
+            return ('{"hits":[{"id":"a1b2c3d4deadbeefcafebabe00112233"},'
+                    '{"id":"e5f6a7b8deadbeefcafebabe00112233"}]}')
+
+        @staticmethod
+        def graph_neighbors(node_id, limit):
+            assert (node_id, limit) == ("a1b2c3d4deadbeefcafebabe00112233", 5)
+            return '{"neighbors":[]}'
+
+        @staticmethod
+        def render_graph_neighbors_md(payload, limit):
+            assert limit == 5
+            return ("--- ContextNest graph — neighbours of the top retrieved memory ---\n"
+                    "- a1b2c3d4 w=0.83\n--- /graph neighbours ---\n")
+
+        @staticmethod
+        def graph_path(src, dst):
+            assert (src, dst) == ("a1b2c3d4deadbeefcafebabe00112233",
+                                  "e5f6a7b8deadbeefcafebabe00112233")
+            return '{"found": false}'
+
+        @staticmethod
+        def render_graph_path_md(payload, limit):
+            assert limit == 3
+            return ("--- ContextNest graph — how the top two memories connect ---\n"
+                    "- a1b2c3d4 -> e5f6a7b8 (2 hops, w=1.23, dijkstra)\n"
+                    "--- /graph path ---\n")
+
     rendered = crp.role_pack_md("planner", brief, cn_available=True, client=Client)
 
     assert "ContextNest planner pack — substrate digest" in rendered
     assert "abcdef12 (2026-07-20) Earlier plan" in rendered
+    # both graph sections, seeded from retrieve's hit ids, are wired into the pack
+    assert "--- ContextNest graph — neighbours of the top retrieved memory ---" in rendered
+    assert "--- ContextNest graph — how the top two memories connect ---" in rendered
+
+
+def test_planner_pack_seeds_graph_from_top_hit_ids(tmp_path):
+    """The graph reads must be seeded with retrieve's own fragment ids: a
+    mis-wired seed silently yields an empty neighbourhood instead of failing."""
+    brief = _write(tmp_path, "seed.json",
+                   '{"title":"Migrate planner","task_class":"self_migrate"}')
+    first, second = "deadbeef" * 4, "cafebabe" * 4
+    calls = []
+
+    class Client:
+        @staticmethod
+        def capsule(query, since):
+            return ""
+
+        @staticmethod
+        def sessions_by_intent(task_class):
+            return '{"sessions":[]}'
+
+        @staticmethod
+        def inbox_filtered(urgency, limit):
+            return '{"items":[]}'
+
+        @staticmethod
+        def render_inbox_md(payload, limit):
+            return ""
+
+        @staticmethod
+        def basins(project, limit):
+            return '{"basins":[]}'
+
+        @staticmethod
+        def render_basins_md(payload, limit):
+            return ""
+
+        @staticmethod
+        def retrieve(query, limit):
+            calls.append(("retrieve", query, limit))
+            return '{"hits":[{"id":"%s"},{"id":"%s"}]}' % (first, second)
+
+        @staticmethod
+        def graph_neighbors(node_id, limit):
+            calls.append(("graph_neighbors", node_id, limit))
+            return '{"neighbors":[]}'
+
+        @staticmethod
+        def render_graph_neighbors_md(payload, limit):
+            return ""
+
+        @staticmethod
+        def graph_path(src, dst):
+            calls.append(("graph_path", src, dst))
+            return '{"found": false}'
+
+        @staticmethod
+        def render_graph_path_md(payload, limit):
+            return ""
+
+    crp.role_pack_md("planner", brief, cn_available=True, client=Client)
+
+    assert calls[0] == ("retrieve", "Migrate", 2)
+    assert ("graph_neighbors", first, 5) in calls
+    assert ("graph_path", first, second) in calls
