@@ -57,6 +57,8 @@ import sys
 import time
 from pathlib import Path
 
+from mini_ork.context import context_env
+
 __all__ = [
     "mo_otel_enabled",
     "mo_otel_buf",
@@ -80,7 +82,7 @@ def mo_otel_enabled() -> bool:
     """
     return (
         os.environ.get("MO_OTEL", "0") == "1"
-        and bool(os.environ.get("MINI_ORK_RUN_DIR"))
+        and bool(context_env("MINI_ORK_RUN_DIR"))
     )
 
 
@@ -95,7 +97,7 @@ def mo_otel_buf() -> str:
     here, so callers that don't intend to write can still call this for
     the parity case (g).
     """
-    run_dir = os.environ.get("MINI_ORK_RUN_DIR") or "/"
+    run_dir = context_env("MINI_ORK_RUN_DIR") or "/"
     return os.path.join(run_dir, ".otel-spans.jsonl")
 
 

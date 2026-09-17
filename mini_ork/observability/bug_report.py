@@ -55,6 +55,8 @@ import sqlite3
 import time
 from pathlib import Path
 
+from mini_ork.context import context_env
+
 __all__ = [
     "bug_report_emit",
     "bug_report_sweep",
@@ -108,16 +110,16 @@ def _resolve_db() -> str:
     Resolution order (mirrors bash line 40):
       $MINI_ORK_DB → ${MINI_ORK_HOME:-.mini-ork}/state.db
     """
-    env_db = os.environ.get("MINI_ORK_DB")
+    env_db = context_env("MINI_ORK_DB")
     if env_db:
         return env_db
-    home = os.environ.get("MINI_ORK_HOME") or ".mini-ork"
+    home = context_env("MINI_ORK_HOME") or ".mini-ork"
     return os.path.join(home, "state.db")
 
 
 def _resolve_run_dir() -> str:
     """Return the per-run sink dir, mirrors bash `MINI_ORK_RUN_DIR:-/tmp`."""
-    return os.environ.get("MINI_ORK_RUN_DIR") or "/tmp"
+    return context_env("MINI_ORK_RUN_DIR") or "/tmp"
 
 
 def _resolve_home() -> str:

@@ -40,6 +40,8 @@ import os
 import secrets
 from typing import Any
 
+from mini_ork.context import context_env
+
 
 _CLAIM_TEMPLATES = [
     "Race condition between the {id} handler and its retry path.",
@@ -135,7 +137,7 @@ def check_fabrication_survival(
     if ceiling is None:
         ceiling = _ceiling_default()
     if report_dir is None:
-        report_dir = os.environ.get("MINI_ORK_RUN_DIR", ".")
+        report_dir = context_env("MINI_ORK_RUN_DIR", ".")
 
     report_path = os.path.join(report_dir, "refute-survival.tsv")
 

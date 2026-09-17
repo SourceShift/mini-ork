@@ -80,6 +80,8 @@ import sys
 import time
 from typing import Any
 
+from mini_ork.context import context_env
+
 DEFAULT_TTL = 120
 MAX_TTL = 3600
 
@@ -95,8 +97,8 @@ def _state_file_path(explicit: str | None = None) -> str:
     if env_explicit:
         return env_explicit
     base = ""
-    if os.environ.get("MINI_ORK_RUN_DIR"):
-        base = os.environ["MINI_ORK_RUN_DIR"]
+    if context_env("MINI_ORK_RUN_DIR"):
+        base = context_env("MINI_ORK_RUN_DIR")
     elif os.environ.get("MINI_ORK_HOME"):
         base = os.environ["MINI_ORK_HOME"]
     elif os.environ.get("HOME"):

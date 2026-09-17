@@ -53,6 +53,8 @@ import re
 import sys
 from pathlib import Path
 
+from mini_ork.context import context_env
+
 __all__ = [
     "main",
     "heuristic_scan",
@@ -324,7 +326,7 @@ def main(argv: list[str]) -> int:
         # runs, so no stderr is emitted. Mirror exactly.
         if not targets:
             return 0
-        run_dir = os.environ.get("MINI_ORK_RUN_DIR") or "/tmp"
+        run_dir = context_env("MINI_ORK_RUN_DIR") or "/tmp"
         try:
             heuristic_scan(
                 targets,

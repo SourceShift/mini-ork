@@ -62,6 +62,7 @@ import sqlite3
 import threading
 import time
 
+from mini_ork.context import context_env
 from mini_ork.steering.operator_steering import fetch_for as _steer_fetch
 
 __all__ = [
@@ -81,7 +82,7 @@ def _resolve_pid_path() -> str:
     The /tmp fallback rarely fires in production but is preserved for
     parity so tests that omit MINI_ORK_RUN_DIR exercise the same path.
     """
-    base = os.environ.get("MINI_ORK_RUN_DIR") or "/tmp"
+    base = context_env("MINI_ORK_RUN_DIR") or "/tmp"
     return os.path.join(base, ".mid-node-injector.pid")
 
 

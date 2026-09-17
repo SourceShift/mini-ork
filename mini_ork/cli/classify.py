@@ -17,6 +17,7 @@ import time
 from pathlib import Path
 
 from mini_ork import trace_store
+from mini_ork.context import context_env
 
 try:
     import yaml
@@ -191,7 +192,7 @@ def main(argv: list[str] | None = None, *, db: str | None = None, root: str | No
     run_id = None
     if os.path.isfile(db):
         import sqlite3
-        run_id = os.environ.get("MINI_ORK_RUN_ID") or f"run-{int(time.time())}-{os.getpid()}"
+        run_id = context_env("MINI_ORK_RUN_ID") or f"run-{int(time.time())}-{os.getpid()}"
         recipe = os.environ.get("MINI_ORK_RECIPE") or None
         now = int(time.time())
         con = sqlite3.connect(db); con.execute("PRAGMA journal_mode=WAL")

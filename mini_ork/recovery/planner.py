@@ -85,7 +85,7 @@ import sys
 # E1 seam — read by is_node_reusable for the per-node reuse decision.
 # Importing at module top means a runtime absence of E1 surfaces
 # immediately as ImportError on first call (fail loud).
-from mini_ork.context import apply_env_overrides
+from mini_ork.context import apply_env_overrides, context_env
 
 # DAG + plan-computation seams (SRP split; re-exported for parity).
 from mini_ork.recovery.dag import DAG, load_dag
@@ -167,13 +167,13 @@ def _resolve_default_paths(
     The same precedence mirrors mini_ork_resume (see :44-49) so the
     two subcommands agree on where the artifacts live.
     """
-    run_dir_env = os.environ.get("MINI_ORK_RUN_DIR", "").strip()
-    home = os.environ.get("MINI_ORK_HOME") or os.path.join(os.getcwd(), ".mini-ork")
+    run_dir_env = context_env("MINI_ORK_RUN_DIR", "").strip()
+    home = context_env("MINI_ORK_HOME") or os.path.join(os.getcwd(), ".mini-ork")
     if run_dir_env:
         run_dir = run_dir_env
     else:
         run_dir = os.path.join(home, "runs", run_id)
-    db = os.environ.get("MINI_ORK_DB") or os.path.join(home, "state.db")
+    db = context_env("MINI_ORK_DB") or os.path.join(home, "state.db")
     workflow = os.environ.get("MINI_ORK_WORKFLOW") or ""
     recipe = os.environ.get("MINI_ORK_RECIPE") or ""
     if not workflow and recipe:

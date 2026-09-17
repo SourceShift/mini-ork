@@ -26,6 +26,7 @@ import re
 import sqlite3
 
 from mini_ork import lane_router
+from mini_ork.context import context_env
 
 LANE_TO_FAMILY = {
     "sonnet": "anthropic", "opus": "anthropic",
@@ -52,7 +53,7 @@ def resolve_agents_yaml() -> str:
     """Run-dir-first agents.yaml path (T1.0 precedence), mirrors
     mo_resolve_agents_yaml: $MINI_ORK_RUN_DIR/config -> $MINI_ORK_HOME/config
     -> $MINI_ORK_ROOT/config. Always returns a path."""
-    run_dir = os.environ.get("MINI_ORK_RUN_DIR", "")
+    run_dir = context_env("MINI_ORK_RUN_DIR", "")
     if run_dir:
         cand = os.path.join(run_dir, "config", "agents.yaml")
         if os.path.isfile(cand):
