@@ -364,6 +364,196 @@ def test_agent_server_form_schemas_and_profiles_are_json() -> None:
     assert isinstance(list_agent_profiles(), list)
 
 
+def _fake_launch_run_factory(calls: list[dict]):
+    """Stand-in for control.launch_run that records calls and always succeeds.
+
+    Mirrors the real return shape (web/control.py): {ok, run_id, recipe, pid,
+    kickoff_path, log_path} — notably NO run_dir, which the route must not
+    pretend exists.
+    """
+
+    def fake(home, recipe, kickoff, run_id=None):
+        calls.append(
+            {"home": home, "recipe": recipe, "kickoff": kickoff, "run_id": run_id}
+        )
+        return {
+            "ok": True,
+            "run_id": run_id,
+            "recipe": recipe,
+            "pid": 4242,
+            "kickoff_path": str(Path(home) / "runs-inbox" / f"{run_id}.md"),
+            "log_path": str(Path(home) / "logs" / f"{run_id}.log"),
+        }
+
+    return fake
+
+
+def test_agent_server_create_conversation_launches_run(tmp_path, monkeypatch) -> None:
+    """Slice-2 keystone: POST /api/conversations with an initial_message must
+    spawn a mini-ork run under the CLIENT-chosen conversation id (the canvas
+    mints a uuidv4 and routes on it — reusing it as the run id is what makes
+    deterministic attach possible) and report execution_status "running"."""
+    from mini_ork.web.routes import agent_server as mod
+    import mini_ork.web.control as control
+
+    calls: list[dict] = []
+    monkeypatch.setattr(control, "launch_run", _fake_launch_run_factory(calls))
+
+    out = mod.create_conversation(
+        {
+            "conversation_id": "conv-1234-abcd",
+            "initial_message": {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Fix the flaky login test"},
+                    {"type": "image_url", "image_url": {"url": "data:..."}},
+                ],
+            },
+        },
+        home=tmp_path,
+    )
+
+    assert out["id"] == "conv-1234-abcd"
+    assert out["execution_status"] == "running"
+    # Title falls back to the first line of the initial message.
+    assert out["title"] == "Fix the flaky login test"
+    # Required-by-type ConversationInfo fields are filled honestly.
+    assert out["agent"]["llm"]["model"]
+    assert out["confirmation_policy"] == {"type": "never"}
+
+    assert len(calls) == 1
+    assert calls[0]["run_id"] == "conv-1234-abcd"
+    assert "Fix the flaky login test" in calls[0]["kickoff"]
+    # Image content parts are dropped, not stringified into the kickoff.
+    assert "data:" not in calls[0]["kickoff"]
+    # persistence_dir carries the launcher-visible run handle (the log path).
+    assert out["persistence_dir"].endswith("conv-1234-abcd.log")
+
+
+def test_agent_server_create_conversation_recipe_is_server_owned(
+    tmp_path, monkeypatch
+) -> None:
+    """The recipe a conversation runs is server policy (MO_AGENT_SERVER_RECIPE,
+    default code-fix) — the canvas's agent_settings/llm_model are cosmetic."""
+    from mini_ork.web.routes import agent_server as mod
+    import mini_ork.web.control as control
+
+    calls: list[dict] = []
+    monkeypatch.setattr(control, "launch_run", _fake_launch_run_factory(calls))
+    monkeypatch.setenv(mod.CONVERSATION_RECIPE_ENV, "framework-edit")
+
+    out = mod.create_conversation(
+        {
+            "conversation_id": "conv-recipe-1",
+            "initial_message": "do a thing",
+            # Client-side LLM picks must NOT leak into the launch.
+            "agent_settings": {"llm_model": "gpt-9-max"},
+        },
+        home=tmp_path,
+    )
+    assert out["execution_status"] == "running"
+    assert calls[0]["recipe"] == "framework-edit"
+
+    monkeypatch.delenv(mod.CONVERSATION_RECIPE_ENV)
+    calls.clear()
+    mod.create_conversation(
+        {"conversation_id": "conv-recipe-2", "initial_message": "do another"},
+        home=tmp_path,
+    )
+    assert calls[0]["recipe"] == mod.DEFAULT_CONVERSATION_RECIPE
+
+
+def test_agent_server_create_conversation_without_message_stays_idle(
+    tmp_path, monkeypatch
+) -> None:
+    """No initial_message → conversation registered idle, no run spawned (the
+    run starts when the first chat message arrives — sendMessage wiring is a
+    later slice). Sidecar persists so GET rehydrates the same ConversationInfo."""
+    from mini_ork.web.routes import agent_server as mod
+    import mini_ork.web.control as control
+
+    calls: list[dict] = []
+    monkeypatch.setattr(control, "launch_run", _fake_launch_run_factory(calls))
+
+    out = mod.create_conversation(
+        {"conversation_id": "conv-idle-1", "title": "Scratchpad"}, home=tmp_path
+    )
+    assert out["execution_status"] == "idle"
+    assert calls == []
+
+    # Explicit title is honored rather than derived.
+    assert out["title"] == "Scratchpad"
+    # Round-trip through the registry sidecar.
+    again = mod.get_conversation("conv-idle-1", home=tmp_path)
+    assert again["id"] == "conv-idle-1"
+    assert again["execution_status"] == "idle"
+    assert again["title"] == "Scratchpad"
+
+
+def test_agent_server_create_conversation_rejects_unsafe_ids(tmp_path) -> None:
+    """conversation_id becomes a filename under <home>/conversations/ — path
+    traversal and exotic characters must 400, not escape the registry dir."""
+    from fastapi import HTTPException
+    from mini_ork.web.routes import agent_server as mod
+
+    for bad in ("../escape", "a/b", "has space", "semi;colon"):
+        with pytest.raises(HTTPException) as exc:
+            mod.create_conversation({"conversation_id": bad}, home=tmp_path)
+        assert exc.value.status_code == 400
+
+
+def test_agent_server_create_conversation_mints_uuid_when_absent(tmp_path) -> None:
+    """conversation_id is optional in the payload — the canvas always sends
+    one, but a bare create must still round-trip on a server-minted uuid."""
+    from mini_ork.web.routes import agent_server as mod
+
+    out = mod.create_conversation({"title": "No id"}, home=tmp_path)
+    assert out["id"]
+    assert mod._safe_conversation_id(out["id"])
+    again = mod.get_conversation(out["id"], home=tmp_path)
+    assert again["id"] == out["id"]
+
+
+def test_agent_server_get_conversation_unknown_404(tmp_path) -> None:
+    from fastapi import HTTPException
+    from mini_ork.web.routes import agent_server as mod
+
+    with pytest.raises(HTTPException) as exc:
+        mod.get_conversation("never-created-xyz", home=tmp_path)
+    assert exc.value.status_code == 404
+
+
+def test_agent_server_create_conversation_launch_failure_500s(
+    tmp_path, monkeypatch
+) -> None:
+    """A failed spawn must 500 with the launcher's error surfaced, and must
+    NOT register the sidecar — a conversation whose run never started should
+    not haunt the canvas list as a phantom."""
+    from fastapi import HTTPException
+    from mini_ork.web.routes import agent_server as mod
+    import mini_ork.web.control as control
+
+    def failing(home, recipe, kickoff, run_id=None):
+        return {"ok": False, "error": "no such recipe"}
+
+    monkeypatch.setattr(control, "launch_run", failing)
+
+    with pytest.raises(HTTPException) as exc:
+        mod.create_conversation(
+            {"conversation_id": "conv-dead-1", "initial_message": "go"}, home=tmp_path
+        )
+    assert exc.value.status_code == 500
+    assert "no such recipe" in exc.value.detail
+
+    import json as _json
+
+    assert not (tmp_path / "conversations" / "conv-dead-1.json").exists()
+    assert not (tmp_path / "conversations").exists() or not any(
+        _json.loads(p.read_text()).get("id") == "conv-dead-1"
+        for p in (tmp_path / "conversations").glob("*.json")
+    )
+
+
 def test_idea_tree_roots_returns_backfilled_sessions(db) -> None:
     """list_roots() must surface every root node with subtree counts.
 

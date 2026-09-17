@@ -39,10 +39,16 @@ back so the form round-trips, but nothing downstream reads them yet.
 
 from __future__ import annotations
 
+import json
+import os
 import time
+import uuid
+from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends, HTTPException
+
+from ..deps import get_home
 
 # The agent-server wire version this fork was cut against
 # (ui/config/defaults.json → versions.agentServer). Must stay a 3-part semver
@@ -195,6 +201,184 @@ def list_agent_profiles() -> list[dict[str, Any]]:
     explicitly so the path is JSON, not the HTML catch-all.
     """
     return []
+
+
+# ── Conversation lifecycle (Slice 2 keystone) ─────────────────────────────────
+#
+# The fork's LOCAL backend creates conversations through the SDK's
+# ConversationClient — POST /api/conversations with a loose payload and a
+# ConversationInfo-shaped response. (POST /api/v1/app-conversations is the
+# cloud-only path; the local canvas never calls it.) A conversation IS a
+# mini-ork run: the id the client sends (it mints a uuidv4 and passes it as
+# ``conversation_id``) becomes the run id, so the canvas's routing and the
+# spawned run agree on one key with no translation table — the deterministic
+# attach MINI_ORK_RUN_ID injection enables.
+#
+# Registry: <home>/conversations/<id>.json sidecars hold the ConversationInfo
+# projection (title, timestamps, execution_status, recipe). P0 trusts the
+# sidecar; refining execution_status from live run state is a later slice.
+# Unauthenticated like the rest of the shim (local posture — the canvas sends
+# no bearer token), but note this endpoint launches real, billable runs.
+
+#: Recipe a canvas-launched conversation runs. Server-owned: the canvas's
+#: agent_settings/llm_model are cosmetic here (mini-ork owns lanes).
+CONVERSATION_RECIPE_ENV = "MO_AGENT_SERVER_RECIPE"
+DEFAULT_CONVERSATION_RECIPE = "code-fix"
+
+
+def _conversations_dir(home: Path) -> Path:
+    return Path(home) / "conversations"
+
+
+def _conversation_path(home: Path, conversation_id: str) -> Path:
+    return _conversations_dir(home) / f"{conversation_id}.json"
+
+
+def _safe_conversation_id(conversation_id: str) -> bool:
+    return (
+        bool(conversation_id)
+        and ".." not in conversation_id
+        and all(c.isalnum() or c in "-_" for c in conversation_id)
+        and len(conversation_id) <= 64
+    )
+
+
+def _load_conversation(home: Path, conversation_id: str) -> dict[str, Any] | None:
+    path = _conversation_path(home, conversation_id)
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _save_conversation(home: Path, record: dict[str, Any]) -> None:
+    path = _conversation_path(home, str(record["id"]))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(record, fh, indent=2)
+
+
+def _initial_message_text(payload: dict[str, Any]) -> str:
+    """Flatten the SDK's SendMessageRequest ({role, content[]}) to plain text.
+
+    Only ``text`` content parts are kept (images/files have no kickoff
+    equivalent yet); a plain-string initial_message is tolerated too.
+    """
+    message = payload.get("initial_message")
+    if isinstance(message, str):
+        return message.strip()
+    if not isinstance(message, dict):
+        return ""
+    content = message.get("content")
+    if isinstance(content, str):
+        return content.strip()
+    if not isinstance(content, list):
+        return ""
+    parts: list[str] = []
+    for block in content:
+        if isinstance(block, dict) and block.get("type") == "text":
+            text = block.get("text")
+            if isinstance(text, str) and text.strip():
+                parts.append(text.strip())
+    return "\n\n".join(parts)
+
+
+def _conversation_info(record: dict[str, Any]) -> dict[str, Any]:
+    """Project a registry record to the ConversationInfo contract.
+
+    Required-by-type fields the canvas reads are filled honestly: mini-ork
+    owns the agent/LLM server-side, so ``agent.llm.model`` names the lane
+    policy rather than a client LLM, and ``persistence_dir`` is the run
+    directory namespace the id maps to.
+    """
+    return {
+        "id": record["id"],
+        "execution_status": record.get("execution_status", "idle"),
+        "confirmation_policy": {"type": "never"},
+        "activated_knowledge_skills": [],
+        "agent": {"kind": "mini-ork", "llm": {"model": "mini-ork-routed"}},
+        "workspace": record.get("workspace"),
+        "persistence_dir": str(record.get("persistence_dir", "")),
+        "max_iterations": record.get("max_iterations"),
+        "title": record.get("title"),
+        "created_at": record.get("created_at"),
+        "updated_at": record.get("updated_at"),
+        "leaf_event_id": None,
+    }
+
+
+@router.post("/api/conversations")
+def create_conversation(
+    payload: dict[str, Any], home=Depends(get_home)
+) -> dict[str, Any]:
+    """Create a conversation (`ConversationClient.createConversation`).
+
+    With an ``initial_message`` the mini-ork run launches detached
+    immediately (control.launch_run — the same spawn seam POST /api/v1/runs
+    uses); without one the conversation is registered idle and the run starts
+    when the first chat message arrives (a later slice wires sendMessage).
+    The response is a ConversationInfo; ``execution_status`` is "running"
+    once launched, "idle" otherwise.
+    """
+    from .. import control
+
+    conversation_id = str(payload.get("conversation_id") or "").strip() or str(
+        uuid.uuid4()
+    )
+    if not _safe_conversation_id(conversation_id):
+        raise HTTPException(status_code=400, detail="invalid conversation_id")
+
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    title = str(payload.get("title") or "").strip() or None
+    initial_text = _initial_message_text(payload)
+    if title is None and initial_text:
+        title = initial_text.splitlines()[0][:80]
+
+    recipe = os.environ.get(CONVERSATION_RECIPE_ENV, "").strip() or DEFAULT_CONVERSATION_RECIPE
+
+    record: dict[str, Any] = {
+        "id": conversation_id,
+        "title": title,
+        "created_at": now,
+        "updated_at": now,
+        "execution_status": "idle",
+        "recipe": recipe,
+        "run_launched": False,
+    }
+
+    if initial_text:
+        kickoff = f"# {title or 'Conversation'}\n\n{initial_text}\n" if title else f"{initial_text}\n"
+        result = control.launch_run(home, recipe, kickoff, run_id=conversation_id)
+        if not result.get("ok"):
+            raise HTTPException(
+                status_code=500,
+                detail=f"run launch failed: {result.get('error', 'unknown')}",
+            )
+        record["run_launched"] = True
+        record["execution_status"] = "running"
+        # launch_run answers {ok, run_id, recipe, pid, kickoff_path, log_path}
+        # — no run_dir. The run's artifacts land under <home>/runs/<run_id>/
+        # (created by the run lifecycle, not the launcher), so we persist the
+        # log path as the one launcher-visible handle on the run's filesystem.
+        record["persistence_dir"] = str(result.get("log_path") or "")
+
+    _save_conversation(home, record)
+    return _conversation_info(record)
+
+
+@router.get("/api/conversations/{conversation_id}")
+def get_conversation(
+    conversation_id: str, home=Depends(get_home)
+) -> dict[str, Any]:
+    """Hydrate a conversation (`ConversationClient.getConversation`)."""
+    if not _safe_conversation_id(conversation_id):
+        raise HTTPException(status_code=400, detail="invalid conversation_id")
+    record = _load_conversation(home, conversation_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="conversation not found")
+    return _conversation_info(record)
 
 
 @router.get("/alive")
