@@ -48,6 +48,14 @@ def test_dispatch_model_fails_fast_on_missing_key(tmp_path, monkeypatch):
     # (every dev checkout) the guard fires BEFORE preflight and masks the
     # missing-key failure this test exists to exercise.
     monkeypatch.setenv("MO_TARGET_CWD", str(tmp_path))
+    # Point the secret store at an empty scratch file: dispatch_model sources
+    # <home>/config/secrets.local.sh into env, so on a checkout with a live
+    # .mini-ork (any dev machine) deleting GLM_API_KEY from env is not enough —
+    # the sourced key resurrects the lane and the test dispatches REAL spend.
+    scratch_secrets = tmp_path / "secrets.local.sh"
+    scratch_secrets.write_text("")
+    scratch_secrets.chmod(0o600)
+    monkeypatch.setenv("MINI_ORK_SECRETS", str(scratch_secrets))
     monkeypatch.delenv("GLM_API_KEY", raising=False)
     res = dispatch_model(DispatchRequest(model="glm", prompt="hi"))
     assert res.ok is False
