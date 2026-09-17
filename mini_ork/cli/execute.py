@@ -52,6 +52,7 @@ from mini_ork.context import (  # noqa: F401 -- compatibility re-exports
     ENV_TARGET_CWD,
     RunContext,
     apply_env_overrides,
+    context_env,
     node_env_overrides,
     publish_env,
     run_context_scope,
@@ -117,8 +118,8 @@ def infer_trace_code_region(payload: str) -> str:
         data = json.loads(payload or "{}")
     except json.JSONDecodeError:
         return ""
-    run_dir = os.environ.get("MINI_ORK_RUN_DIR") or os.environ.get("RUN_DIR") or ""
-    roots = [os.environ.get("MO_TARGET_CWD") or "", os.environ.get("MINI_ORK_ROOT") or "", os.getcwd()]
+    run_dir = context_env("MINI_ORK_RUN_DIR") or os.environ.get("RUN_DIR") or ""
+    roots = [context_env("MO_TARGET_CWD") or "", context_env("MINI_ORK_ROOT") or "", os.getcwd()]
     roots = [os.path.abspath(r) for r in roots if r]
 
     def _decode_files(value):
@@ -182,7 +183,7 @@ def _target_repo_changed_files() -> list[str]:
     --others --exclude-standard`, which honours .gitignore so .mini-ork/runs
     artifacts never leak in). Best-effort: any git failure yields [] and the
     caller falls back to the impl.log path (prior behaviour)."""
-    target = os.environ.get("MO_TARGET_CWD") or ""
+    target = context_env("MO_TARGET_CWD") or ""
     if not target or not os.path.isdir(target):
         return []
     files: list[str] = []
@@ -625,7 +626,7 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
     if not workflow and os.environ.get("MINI_ORK_RECIPE"):
         workflow = os.path.join(root, "recipes", os.environ["MINI_ORK_RECIPE"], "workflow.yaml")
     run_dir = (os.path.dirname(plan_path) if plan_path
-               else (os.environ.get("MINI_ORK_RUN_DIR") or "."))
+               else (context_env("MINI_ORK_RUN_DIR") or "."))
 
     # Pre-dispatch execute gate (bash :1136-1203): refuse to dispatch a
     # needs_answers plan (exit 6). Needs a plan.json; a from-workflow recovery
@@ -1187,7 +1188,7 @@ def _verifier_argv(script):
 def _run_verifier_ref(script, evidence_path, *, plan_path="", artifact_path="", cwd=None):
     """Port of _run_verifier_ref (minus the mo_runtime_exec seam): run the
     verifier script, capture evidence, and treat {"pass": true} as success."""
-    cwd = cwd or os.environ.get("MO_TARGET_CWD") or os.getcwd()
+    cwd = cwd or context_env("MO_TARGET_CWD") or os.getcwd()
     verifier_env = {**os.environ,
                     "MINI_ORK_PLAN_PATH": plan_path,
                     "ARTIFACT_PATH": artifact_path}
@@ -1219,7 +1220,7 @@ def _default_llm_dispatch(root):
     RESULT=$(llm_dispatch --task-class X --node-type Y --prompt-text Z 2>&1)."""
     def d(task_class, node_type, prompt):
         from mini_ork.dispatch import llm_dispatch
-        model = os.environ.get("MO_DISPATCH_CHAIN") or node_type
+        model = context_env("MO_DISPATCH_CHAIN") or node_type
         captured = io.StringIO()
         try:
             with contextlib.redirect_stdout(captured), contextlib.redirect_stderr(captured):
@@ -1321,7 +1322,7 @@ def _resolve_target_cwd(run_dir_eff):
     from an explicit valid $MO_TARGET_CWD, otherwise the run kickoff's git-toplevel.
     This is
     the CWT-A corruption fix — pins codex to the TARGET repo, not MINI_ORK_ROOT."""
-    explicit = os.environ.get("MO_TARGET_CWD") or ""
+    explicit = context_env("MO_TARGET_CWD") or ""
     if explicit and os.path.isdir(explicit):
         try:
             r = subprocess.run(["git", "-C", explicit, "rev-parse", "--show-toplevel"],
@@ -1426,7 +1427,7 @@ def _capture_pre_impl_baseline(run_dir):
     ref_path = os.path.join(run_dir, "pre-implementer-ref")
     if os.path.isfile(ref_path):
         return
-    cwd = os.environ.get("MO_TARGET_CWD") or os.getcwd()
+    cwd = context_env("MO_TARGET_CWD") or os.getcwd()
     try:
         if subprocess.run(["git", "-C", cwd, "rev-parse", "--git-dir"],
                           capture_output=True).returncode != 0:
@@ -1596,7 +1597,7 @@ def _assemble_reviewer_inputs(run_dir):
         except Exception:
             pass
     if not worktree or not os.path.isdir(worktree):
-        worktree = os.environ.get("MO_TARGET_CWD") or os.getcwd()
+        worktree = context_env("MO_TARGET_CWD") or os.getcwd()
     diff_path = os.path.join(run_dir, "review-diff.patch")
     # Diff against the pre-implementer baseline (captured at run start by
     # _capture_pre_impl_baseline) so the reviewer sees ONLY the implementer's
@@ -1696,7 +1697,7 @@ def _learned_block(root, task_class, node_type):
             block = "\n\n" + fm + "\n"
         from mini_ork.steering import operator_steering
         rows = operator_steering.fetch_for(
-            os.environ.get("MINI_ORK_RUN_ID", ""), node_type
+            context_env("MINI_ORK_RUN_ID", ""), node_type
         )
         if rows:
             lines = [
@@ -1757,9 +1758,9 @@ def _execute_gate_check(plan_path, run_dir, dry_run):
         pass
     # Resolve db with the same MINI_ORK_HOME/state.db fallback bash uses (:958) —
     # callers set MINI_ORK_HOME but not always MINI_ORK_DB.
-    home = os.environ.get("MINI_ORK_HOME") or os.path.join(os.getcwd(), ".mini-ork")
-    db = os.environ.get("MINI_ORK_DB") or os.path.join(home, "state.db")
-    run_id = (os.environ.get("MINI_ORK_RUN_ID") or os.environ.get("MINI_ORK_TASK_RUN_ID")
+    home = context_env("MINI_ORK_HOME") or os.path.join(os.getcwd(), ".mini-ork")
+    db = context_env("MINI_ORK_DB") or os.path.join(home, "state.db")
+    run_id = (context_env("MINI_ORK_RUN_ID") or os.environ.get("MINI_ORK_TASK_RUN_ID")
               or os.path.basename(run_dir))
     if db and os.path.isfile(db) and run_id:
         try:

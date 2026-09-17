@@ -26,6 +26,8 @@ import hashlib
 import os
 from typing import Optional
 
+from mini_ork.context import context_env
+
 __all__ = ["root_trace_id", "attempt_span_attrs", "ROOT_TRACE_ENV"]
 
 ROOT_TRACE_ENV = "MINI_ORK_ROOT_TRACE_ID"
@@ -85,7 +87,7 @@ def attempt_span_attrs(
     rrid = recovery_request_id or os.environ.get("MINI_ORK_RECOVERY_REQUEST", "").strip()
     if rrid:
         attrs["recovery.request_id"] = rrid
-    resume_sid = os.environ.get("MO_RESUME_SESSION_ID", "").strip()
+    resume_sid = context_env("MO_RESUME_SESSION_ID", "").strip()
     if resume_sid:
         attrs["resume.session_id"] = resume_sid
     return attrs

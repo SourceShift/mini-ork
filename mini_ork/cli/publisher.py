@@ -188,7 +188,7 @@ def publisher_node(root, run_dir, db, run_id, recipe, task_class, review_file=""
         pass
     if not outputs:
         # M1 empty-outputs: commit the implementer's in-place edits (code-fix recipes)
-        target_repo = os.environ.get("MO_TARGET_CWD", "")
+        target_repo = context_env("MO_TARGET_CWD", "")
         if not target_repo:
             try:
                 target_repo = subprocess.check_output(

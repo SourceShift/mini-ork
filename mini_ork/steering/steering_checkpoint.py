@@ -35,6 +35,8 @@ import sqlite3
 import sys
 import time
 
+from mini_ork.context import context_env
+
 __all__ = [
     "has_unconsumed",
     "mark",
@@ -88,7 +90,7 @@ def _log(level: str, msg: str) -> None:
 def _run_dir(run_id: str) -> str:
     """Mirror ``_mo_steering_run_dir``: MINI_ORK_RUN_DIR when set+isdir, else
     ``${MINI_ORK_HOME:-.mini-ork}/runs/<run_id>``."""
-    run_dir = os.environ.get("MINI_ORK_RUN_DIR", "")
+    run_dir = context_env("MINI_ORK_RUN_DIR", "")
     if run_dir and os.path.isdir(run_dir):
         return run_dir
     home = os.environ.get("MINI_ORK_HOME") or ".mini-ork"

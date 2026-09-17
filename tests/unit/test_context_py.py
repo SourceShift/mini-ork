@@ -248,3 +248,26 @@ def test_two_runs_isolated_through_publish_env(monkeypatch):
         "run_dir": "/runs/b", "node_id": "b-n1", "child_run_dir": "/runs/b"}
     # the legacy layer was raced (one of the two) but never polluted with a mix
     assert os.environ["MINI_ORK_RUN_DIR"] in {"/runs/a", "/runs/b"}
+
+
+def test_migrated_readers_see_contextvar_bindings(monkeypatch, tmp_path):
+    """Non-dispatch reader clusters (gates / observability / stores) consult the
+    contextvar layer after the reader migration: a value bound only in the
+    context layer is resolved WITHOUT touching os.environ, and a masked
+    (None) binding beats a stale leaked process-env value."""
+    from mini_ork.gates import coord_gate
+    from mini_ork.observability import bug_report
+    from mini_ork.stores import checkpoint
+
+    monkeypatch.delenv("MINI_ORK_RUN_DIR", raising=False)
+
+    with run_context_scope({"MINI_ORK_RUN_DIR": str(tmp_path)}):
+        assert "MINI_ORK_RUN_DIR" not in os.environ
+        assert coord_gate._state_base() == str(tmp_path)
+        assert bug_report._resolve_run_dir() == str(tmp_path)
+        assert checkpoint._resolve_path() == (os.path.join(str(tmp_path), ".checkpoint.json"), 0)
+
+    monkeypatch.setenv("MINI_ORK_RUN_DIR", "/stale")
+    with run_context_scope({"MINI_ORK_RUN_DIR": None}):
+        assert coord_gate._state_base() != "/stale"
+        assert bug_report._resolve_run_dir() == "/tmp"

@@ -30,6 +30,8 @@ import tempfile
 import time
 from pathlib import Path
 
+from mini_ork.context import apply_env_overrides, context_env
+
 # ── extracted pure helpers (mini_ork.planning) — re-exported for parity ──
 # Plan-JSON shape/extraction/validation and the deterministic recipe fallback +
 # contract overlay now live in mini_ork.planning; the names below are re-exported
@@ -534,13 +536,16 @@ def main(argv=None, *, root=None, dispatch=None) -> int:
     if not os.path.isfile(kickoff):
         sys.stderr.write(f"kickoff not found: {kickoff}\n"); return 2
 
-    home = os.environ.get("MINI_ORK_HOME") or os.path.join(os.getcwd(), ".mini-ork")
-    db = os.environ.get("MINI_ORK_DB") or os.path.join(home, "state.db")
-    os.environ["MINI_ORK_HOME"] = home; os.environ["MINI_ORK_DB"] = db
+    home = context_env("MINI_ORK_HOME") or os.path.join(os.getcwd(), ".mini-ork")
+    db = context_env("MINI_ORK_DB") or os.path.join(home, "state.db")
+    # Plan runs as a subprocess stage of the lifecycle — it does not own the
+    # run context, so it writes the process env only (historical semantics).
+    # Only the lifecycle (run owner) publishes into the contextvar layer.
+    apply_env_overrides({"MINI_ORK_HOME": home, "MINI_ORK_DB": db})
     task_class = task_class or "generic"
-    workflow = os.environ.get("MINI_ORK_WORKFLOW", "")
-    run_id = os.environ.get("MINI_ORK_RUN_ID") or f"run-{int(time.time())}-{os.getpid()}"
-    os.environ["MINI_ORK_RUN_ID"] = run_id
+    workflow = context_env("MINI_ORK_WORKFLOW", "")
+    run_id = context_env("MINI_ORK_RUN_ID") or f"run-{int(time.time())}-{os.getpid()}"
+    apply_env_overrides({"MINI_ORK_RUN_ID": run_id})
     if not out_file:
         run_dir = os.path.join(home, "runs", run_id)
         os.makedirs(run_dir, exist_ok=True)

@@ -40,6 +40,8 @@ import json
 import os
 from typing import Any
 
+from mini_ork.context import context_env
+
 __all__ = ["load_corpus", "score_recall", "AnchorCorpusShapeError"]
 
 
@@ -147,7 +149,7 @@ def score_recall(
         floor = float(os.environ.get("MO_CORPUS_RECALL_FLOOR", "0.8"))
 
     if report_dir is None:
-        report_dir = os.environ.get("MINI_ORK_RUN_DIR") or "."
+        report_dir = context_env("MINI_ORK_RUN_DIR") or "."
 
     report_path = os.path.join(report_dir, "corpus-recall.tsv")
 

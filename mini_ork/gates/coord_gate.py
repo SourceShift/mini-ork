@@ -56,6 +56,8 @@ import os
 import time
 from typing import Any
 
+from mini_ork.context import context_env
+
 __all__ = [
     "coord_gate_check",
     "coord_gate_metrics",
@@ -86,8 +88,8 @@ DEFAULT_SCHEMA: dict[str, int] = {
 
 
 def _state_base() -> str | None:
-    if os.environ.get("MINI_ORK_RUN_DIR"):
-        return os.environ["MINI_ORK_RUN_DIR"]
+    if context_env("MINI_ORK_RUN_DIR"):
+        return context_env("MINI_ORK_RUN_DIR")
     if os.environ.get("MINI_ORK_HOME"):
         return os.environ["MINI_ORK_HOME"]
     home = os.environ.get("HOME")

@@ -43,6 +43,8 @@ import subprocess
 import time
 import uuid
 
+from mini_ork.context import context_env
+
 
 # ─── Env resolution (mirrors `${VAR:-default}` semantics) ─────────────
 
@@ -501,7 +503,7 @@ _CATEGORY_WHITELIST = {"verifier_fail", "timeout", "cost_overrun", "dispatch_err
 
 
 def _resolve_runs_id(uid: str = "") -> int:
-    rid_str = uid or os.environ.get("MINI_ORK_RUN_ID", "")
+    rid_str = uid or context_env("MINI_ORK_RUN_ID", "")
     if not rid_str:
         return 0
     try:
@@ -520,7 +522,7 @@ def _resolve_runs_id(uid: str = "") -> int:
 
 
 def _trace_err_path() -> str:
-    return os.environ.get("MINI_ORK_RUN_DIR", "/tmp") + "/trace-write-errors.log"
+    return context_env("MINI_ORK_RUN_DIR", "/tmp") + "/trace-write-errors.log"
 
 
 def write_task(task_class: str, outcome: str = "success",
@@ -531,7 +533,7 @@ def write_task(task_class: str, outcome: str = "success",
     Mirrors the bash idem-potent sentinel contract: if MINI_ORK_RUN_DIR is
     set and the run already has .task_memory_written, the call is a no-op.
     """
-    run_dir = os.environ.get("MINI_ORK_RUN_DIR", "")
+    run_dir = context_env("MINI_ORK_RUN_DIR", "")
     if run_dir:
         sentinel = f"{run_dir}/.task_memory_written"
         if os.path.isfile(sentinel):

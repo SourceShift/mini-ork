@@ -52,6 +52,8 @@ import statistics
 import sys
 from typing import Optional
 
+from mini_ork.context import context_env
+
 __all__ = ["compute_finding_cis", "check_ci_widths", "t_critical"]
 
 DEFAULT_CONFIDENCE: float = 0.95
@@ -241,7 +243,7 @@ def check_ci_widths(findings_json: str,
     wide_ratio_ceiling = _read_wide_ratio_ceiling(wide_ratio_ceiling)
 
     if report_dir is None:
-        report_dir = os.environ.get("MINI_ORK_RUN_DIR") or "."
+        report_dir = context_env("MINI_ORK_RUN_DIR") or "."
 
     # Mirror bash lines 193-197: missing-input branch returns BEFORE any
     # mkdir (no augmented_path either — 8-key shape).
