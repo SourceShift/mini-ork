@@ -216,7 +216,13 @@ def test_resolve_all_anthropic_compatible_gateways_as_json_envelopes():
         assert spec.parse_usage is parse_claude_usage, lane
 
 
-def test_resolve_native_claude_lane_uses_json_envelope():
+def test_resolve_native_claude_lane_uses_json_envelope(tmp_path, monkeypatch):
+    # Pin the home to an empty scratch registry so the loader consults the
+    # REPO config: a live home (CWD-relative .mini-ork or MINI_ORK_HOME) that
+    # predates the `sonnet` lane shadows the repo registry and this resolves
+    # as "unknown lane" instead of the anthropic transport under test.
+    monkeypatch.delenv("MINI_ORK_PROVIDERS", raising=False)
+    monkeypatch.setenv("MINI_ORK_HOME", str(tmp_path / ".mini-ork"))
     for lane in ("sonnet", "opus"):
         spec = resolve_provider(lane)
         assert spec.command[-1] == "json", lane
@@ -224,11 +230,15 @@ def test_resolve_native_claude_lane_uses_json_envelope():
         assert spec.parse_usage is parse_claude_usage, lane
 
 
-def test_claude_lane_passes_bypass_permissions():
+def test_claude_lane_passes_bypass_permissions(tmp_path, monkeypatch):
     """Regression guard for the 3rd migration-batch killer: a claude-family
     worker MUST run with `--permission-mode bypassPermissions`, or `claude
     --print` auto-denies file writes in non-interactive mode and the
     implementer produces nothing. Parity with lib/llm-dispatch.sh:938."""
+    # Same home pin as above: the lane loop includes `sonnet`, which only the
+    # repo registry defines on machines carrying a live older home.
+    monkeypatch.delenv("MINI_ORK_PROVIDERS", raising=False)
+    monkeypatch.setenv("MINI_ORK_HOME", str(tmp_path / ".mini-ork"))
     for lane in ("glm", "minimax", "kimi", "sonnet", "opus"):
         cmd = resolve_provider(lane).command
         assert "--permission-mode" in cmd and "bypassPermissions" in cmd, lane

@@ -69,7 +69,51 @@ def bandit_policy(db: StateDB = Depends(get_db), limit: int = 200) -> dict[str, 
             (limit,),
         )
 
-    return {"domain": domain, "region": region}
+    # lane_slice_baseline: the persistent EMA prior the advantage blend reads
+    # before any lane has enough fresh samples (lane_router). Served here so
+    # the bandit view shows BOTH the learned policy and the prior it decays to.
+    baseline: list[dict[str, Any]] = []
+    if db.has_table("lane_slice_baseline"):
+        baseline = db.rows(
+            """
+            SELECT objective_domain, task_class, node_type, code_region,
+                   slice_mean, slice_var, slice_std, runs_count, last_updated
+            FROM lane_slice_baseline
+            ORDER BY runs_count DESC, last_updated DESC
+            LIMIT ?
+            """,
+            (limit,),
+        )
+
+    return {"domain": domain, "region": region, "baseline": baseline}
+
+
+# ── the apply gate — every decision, and why ─────────────────────────────────
+
+
+@router.get("/applies")
+def applies(db: StateDB = Depends(get_db), limit: int = 100) -> list[dict[str, Any]]:
+    """The apply-gate audit trail (apply_attempts, migration 0048).
+
+    Every gate decision — promoted / quarantined / rejected / pending_human_approval
+    / no_candidate — with the measured utilities and the rationale. This is
+    where you check that a promoted prompt change was actually MEASURED (probe
+    scorer rationale carries n=, before/after, cost=$) rather than fabricated.
+    """
+    if not db.has_table("apply_attempts"):
+        return []
+    return db.rows(
+        """
+        SELECT attempt_id, task_class, target_kind, target_name,
+               source_kind, source_id, candidate_id, promotion_id,
+               utility_before, utility_after, utility_delta,
+               decision, rationale, dry_run, apply_enabled, created_at
+        FROM apply_attempts
+        ORDER BY created_at DESC, rowid DESC
+        LIMIT ?
+        """,
+        (limit,),
+    )
 
 
 # ── GEPA — not just the gradients, but whether they won ──────────────────────
