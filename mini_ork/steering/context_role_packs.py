@@ -112,6 +112,21 @@ def _render_sessions(payload: str) -> str:
     return "\n".join(lines)
 
 
+def _top_hit_ids(client, query: str, want: int) -> list[str]:
+    """Fragment ids of the top `want` retrieval hits. [] on any failure —
+    the graph sections are best-effort and must never break the pack."""
+    try:
+        hits = (json.loads(client.retrieve(query, want)) or {}).get("hits") or []
+    except Exception:
+        return []
+    out = []
+    for h in hits:
+        hid = h.get("id") if isinstance(h, dict) else None
+        if isinstance(hid, str) and hid:
+            out.append(hid)
+    return out[:want]
+
+
 def _planner_pack(task_brief_path: str | os.PathLike, client) -> str:
     query = extract_query(task_brief_path)
     task_class = extract_task_class(task_brief_path)
@@ -134,6 +149,16 @@ def _planner_pack(task_brief_path: str | os.PathLike, client) -> str:
     rendered = client.render_basins_md(client.basins(os.getcwd(), 5), 5)
     if rendered:
         sections.append(rendered.rstrip("\n"))
+    if query:
+        ids = _top_hit_ids(client, query, 2)
+        if ids:
+            rendered = client.render_graph_neighbors_md(client.graph_neighbors(ids[0], 5), 5)
+            if rendered:
+                sections.append(rendered.rstrip("\n"))
+            if len(ids) > 1:
+                rendered = client.render_graph_path_md(client.graph_path(ids[0], ids[1]), 3)
+                if rendered:
+                    sections.append(rendered.rstrip("\n"))
     return "\n\n".join(sections) + ("\n" if sections else "")
 
 
