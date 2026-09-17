@@ -39,6 +39,8 @@ from io import StringIO
 from pathlib import Path
 from unittest import mock
 
+import pytest
+
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
 from mini_ork.learning import cross_epic_gradient as cx  # noqa: E402
@@ -124,6 +126,18 @@ def _promote_capture(db: str):
 
 def _gradient_id(target: str) -> str:
     return "gr-cx-" + hashlib.sha256(target.encode("utf-8")).hexdigest()[:12]
+
+
+@pytest.fixture(autouse=True)
+def _no_cn(monkeypatch):
+    """promote() must never reach a live CN from a unit test — record the
+    projection payloads here instead of firing them."""
+    calls: list[tuple[list, list]] = []
+    monkeypatch.setattr(
+        "mini_ork.cn_client.graph_upsert_batched",
+        lambda nodes, edges, source="mini-ork": calls.append((nodes, edges)),
+    )
+    return calls
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -410,3 +424,58 @@ def test_promote_end_to_end_row_contents(tmp_path_factory):
         assert r[1] == s["target"]
         assert r[6] == s["task_class"]
         assert math.isclose(r[5], s["confidence"], abs_tol=1e-6)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# (10) graph projection — one OF_CLASS edge per class in the CSV
+# ─────────────────────────────────────────────────────────────────────────────
+def test_promote_projects_one_of_class_edge_per_class(tmp_path_factory, _no_cn):
+    """The class fan-out `_find_recurring_targets` computes is projected, not
+    discarded: one GradientTarget -OF_CLASS-> TaskClass edge per class in the
+    CSV, and exactly one node per entity."""
+    target = "agent.reviewer.prompt"
+    db = _seed_db(tmp_path_factory, [
+        {"gradient_id": "g1", "target": target, "task_class": "tcA", "confidence": 0.8,
+         "signal": "sig-lo"},
+        {"gradient_id": "g2", "target": target, "task_class": "tcB", "confidence": 0.95,
+         "signal": "sig-BEST"},
+        {"gradient_id": "g3", "target": target, "task_class": "tcC", "confidence": 0.85,
+         "signal": "sig-mid"},
+    ])
+
+    _promote_capture(db)
+
+    assert len(_no_cn) == 1, f"expected one batched emit, got {_no_cn}"
+    nodes, edges = _no_cn[0]
+    assert {n["id"] for n in nodes if n["label"] == "TaskClass"} == {"tcA", "tcB", "tcC"}
+    of_class = [e for e in edges if e["type"] == "OF_CLASS"]
+    assert {e["to"] for e in of_class} == {"tcA", "tcB", "tcC"}
+    assert all(e["from_label"] == "GradientTarget" and e["to_label"] == "TaskClass"
+               for e in of_class)
+    gradient = [n for n in nodes if n["label"] == "GradientTarget"]
+    assert [n["id"] for n in gradient] == [target]  # deduped, not one per class
+    assert gradient[0]["props"] == {"signal": "sig-BEST", "confidence": 0.95}
+
+    node_ids = {n["id"] for n in nodes}
+    assert all(e["from"] and e["to"] for e in edges)
+    for e in edges:
+        assert e["from"] in node_ids and e["to"] in node_ids
+
+
+def test_promote_skips_blank_class_ids(tmp_path_factory, _no_cn):
+    """A whitespace-only class in the GROUP_CONCAT CSV must not become a node or
+    an edge — an empty-string id would create a junk TaskClass."""
+    target = "agent.reviewer.prompt"
+    db = _seed_db(tmp_path_factory, [
+        {"gradient_id": "g1", "target": target, "task_class": "tcA", "confidence": 0.8},
+        {"gradient_id": "g2", "target": target, "task_class": "tcB", "confidence": 0.9},
+        {"gradient_id": "g3", "target": target, "task_class": "   ", "confidence": 0.85},
+    ])
+
+    returned, stdout = _promote_capture(db)
+
+    assert stdout == "1\n" and returned == 1
+    nodes, edges = _no_cn[0]
+    assert {n["id"] for n in nodes if n["label"] == "TaskClass"} == {"tcA", "tcB"}
+    assert all(n["id"] for n in nodes)
+    assert {e["to"] for e in edges} == {"tcA", "tcB"}

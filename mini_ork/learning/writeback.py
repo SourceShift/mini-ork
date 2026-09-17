@@ -13,6 +13,8 @@ import math
 import os
 import sqlite3
 
+from mini_ork import cn_client
+
 # Anti-Goodhart reward anchor (per arXiv 2601.18533 chain-veto semantics):
 # execution status is the PRIMARY (verified) anchor; the reviewer verdict can
 # only VETO (downgrade), never fabricate a positive. The prior implementation
@@ -199,7 +201,7 @@ def write_grpo_advantages(db) -> int:
         rows = con.execute(
             "SELECT trace_id, task_class, agent_version_id, verifier_output, status, "
             "reviewer_verdict, cost_usd, duration_ms, process_reward, created_at, "
-            "COALESCE(validity, 'valid') AS validity "
+            "COALESCE(validity, 'valid') AS validity, run_id "
             "FROM execution_traces WHERE task_class IS NOT NULL AND task_class <> '' "
             "AND agent_version_id IS NOT NULL AND agent_version_id <> ''").fetchall()
     except sqlite3.OperationalError:
@@ -365,7 +367,34 @@ def write_grpo_advantages(db) -> int:
                  bucket["cost"] / runs, bucket["duration"] / runs, round(rel_adv, 6)))
             written += 1
     con.commit()
+
+    # Project Run / Trace / HAS_TRACE onto CN's graph. Only rows carrying a run
+    # key can produce the edge — 260 of 2650 live rows have an empty run_id, and
+    # the migration's INTEGER declaration is a lie (live values are TEXT run
+    # keys), so treat it as an opaque string and never int-cast it.
+    proj_nodes: list[dict] = []
+    proj_edges: list[dict] = []
+    for row in rows:
+        nodes = cn_client._graph_ids(trace_id=row["trace_id"],
+                                     task_class=row["task_class"],
+                                     run_id=row["run_id"])
+        if "Run" not in nodes or "Trace" not in nodes:
+            continue
+        nodes["Trace"]["props"] = {"status": row["status"],
+                                   "task_class": row["task_class"],
+                                   "reward_g": reward(row)}
+        proj_nodes.extend(nodes.values())
+        proj_edges.append(
+            cn_client._graph_edge("HAS_TRACE", "Run", "Trace", nodes)
+        )
+
     con.close()
+    try:
+        cn_client.graph_upsert_batched(proj_nodes, proj_edges)
+    except Exception:
+        # Best-effort projection: a client/transport failure must never fail the
+        # writeback (same contract as _fire's own swallow).
+        pass
     return written
 
 
