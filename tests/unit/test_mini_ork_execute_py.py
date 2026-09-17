@@ -503,6 +503,10 @@ def test_live_implementer_applies_diff(tmp_path, monkeypatch):
     assert rc == 0 and fr == "done"
     assert (rd / "impl-impl1.log").read_text() == _DIFF_LOG
     assert (repo / "app.py").read_text() == "x = 1\ny = 2\n"   # diff applied to clean tree
+    # The publisher's commit gate reads files_changed from this file; before this
+    # only self-migrate wrote one, so code-fix runs could never commit.
+    summary = json.loads((rd / "implementer-summary.json").read_text())
+    assert summary["files_changed"] == [os.path.realpath(repo / "app.py")]
 
 
 def test_live_reviewer_verdict_gate(tmp_path):
@@ -513,9 +517,13 @@ def test_live_reviewer_verdict_gate(tmp_path):
     rc_pass, _ = ex.dispatch_node(_fields("rev1", "reviewer", "opus"),
                                   dispatch_fn=_fake('{"verdict": "pass"}'), **common)
     assert rc_pass == 0
+    # Nodes run in a ProcessPoolExecutor, so env-based handoff dies with the worker;
+    # the verdict must land in run_dir for the publisher's process to observe it.
+    assert json.loads((rd / "review-verdict.json").read_text()) == {"verdict": "pass"}
     rc_fail, fr_fail = ex.dispatch_node(_fields("rev2", "reviewer", "opus"),
                                         dispatch_fn=_fake('{"verdict": "fail"}'), **common)
     assert rc_fail == 1 and fr_fail == "verdict_fail"
+    assert json.loads((rd / "review-verdict.json").read_text()) == {"verdict": "fail"}
     rc_rev, fr_rev = ex.dispatch_node(_fields("rev3", "reviewer", "opus"),
                                       dispatch_fn=_fake('{"verdict": "needs_revision"}'), **common)
     assert rc_rev == 1 and fr_rev == "verdict_revise"
@@ -729,6 +737,48 @@ def test_publisher_commit_rejects_unapproved_or_outside_paths(tmp_path):
     assert subprocess.check_output(
         ["git", "-C", str(repo), "rev-parse", "HEAD"], text=True
     ).strip() == base_head
+
+
+def test_code_fix_publish_seam_survives_the_process_split(tmp_path, monkeypatch):
+    # End-to-end through the real seam: implementer → reviewer → publisher with
+    # review_file="" and verdict_env="" — exactly what the publisher sees in
+    # production, because nodes run in a ProcessPoolExecutor and any env-based
+    # handoff dies with the reviewer's worker process. Before the run_dir handoff
+    # the publisher resolved '<none>' here and skipped every code-fix commit.
+    db = _seed_db(tmp_path, "seam"); _seed_task_run(db)
+    rd = tmp_path / "run"; rd.mkdir()
+    repo = _git_repo(tmp_path / "seam-repo")
+    monkeypatch.setenv("MO_TARGET_CWD", str(repo))
+    common = dict(root=str(REPO), run_dir=str(rd), plan_path=_plan(tmp_path),
+                  task_class="code_fix", db=db, run_id="r1")
+
+    rc_impl, _ = ex.dispatch_node(_fields("impl1", "implementer", "codex"),
+                                  dispatch_fn=_fake(_DIFF_LOG), **common)
+    assert rc_impl == 0
+    rc_rev, _ = ex.dispatch_node(_fields("rev1", "reviewer", "opus"),
+                                 dispatch_fn=_fake('{"verdict": "pass"}'), **common)
+    assert rc_rev == 0
+
+    assert ex._publisher_try_commit_files(
+        str(REPO), str(repo), str(rd), "", "", "code-fix", "implementer", "run-seam",
+    ) is True
+    committed = subprocess.check_output(
+        ["git", "-C", str(repo), "show", "--name-only", "--format=", "HEAD"], text=True,
+    ).splitlines()
+    assert committed == ["app.py"]
+
+
+def test_publisher_skip_message_names_the_actual_verdict(tmp_path, capsys):
+    # A reviewer that DID return verdict='fail' must not be reported as '<none>' —
+    # that reads as "no verdict found at all" and sends the reader hunting a file
+    # that is present.
+    repo = _git_repo(tmp_path / "fail-repo")
+    run_dir = tmp_path / "fail-run"; run_dir.mkdir()
+    (run_dir / "review-verdict.json").write_text('{"verdict": "fail"}\n')
+    assert ex._publisher_try_commit_files(
+        str(REPO), str(repo), str(run_dir), "", "", "code-fix", "implementer", "run-fail",
+    ) is False
+    assert "resolved: 'fail'" in capsys.readouterr().err
 
 
 def test_reviewer_input_assembly_preserves_summary_verifiers_and_diff(tmp_path):
