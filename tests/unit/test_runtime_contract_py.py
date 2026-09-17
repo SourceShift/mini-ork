@@ -50,7 +50,11 @@ def test_cwd_missing_fails_126(tmp_path):
 def test_empty_cwd_inherits():
     out, rc = exec_local("pwd")
     assert rc == 0
-    assert out.strip() == str(Path.cwd())
+    # resolve() both sides: where the checkout sits behind a firmlink/symlink
+    # (/Volumes/x ≡ /Users/y on this host) the child bash prints the physical
+    # spelling while pytest's cwd keeps the logical one — same directory,
+    # different spelling, and both resolve to the same real path.
+    assert Path(out.strip()).resolve() == Path.cwd().resolve()
 
 
 def test_timeout_kills_group_rc124():

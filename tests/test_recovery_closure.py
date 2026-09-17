@@ -584,7 +584,9 @@ def test_resume_cost_pause_unchanged() -> None:
         # Make the run dir exist so the script gets past its first check.
         os.makedirs(os.path.join(td, "runs", "run-doesnotexist-001"))
         rc = subprocess.run(
-            [str(bash_path), "run-doesnotexist-001"],
+            # sys.executable prefix: the resume launcher's shebang resolves
+            # PATH's `python3`, which on dev machines may lack mini-ork's deps.
+            [sys.executable, str(bash_path), "run-doesnotexist-001"],
             env=env2, cwd=str(REPO), capture_output=True, text=True,
         )
         assert rc.returncode == 0, (
