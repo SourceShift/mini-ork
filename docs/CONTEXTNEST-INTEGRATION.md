@@ -13,7 +13,7 @@ mini-ork reads from and writes to a local [ContextNest](https://github.com/Sourc
 | **PR-4 worker prompt wiring** (`MO_CN_PREFETCH_DIR` + Step 0 prompt sections) | ✅ shipped | mini-ork eb9bd5d + restoration #22 |
 | **PR-5 composed CN endpoint** | ⏸ gated on PR-3 latency measurement | — |
 | **PR-6 outcome feedback loop** (EvoMem pattern) | ⏸ planned | — |
-| **Graph projection** (`POST /api/v1/graph/upsert` written best-effort from the learning pipeline) | ✅ shipped (this PR) | mini-ork #?? |
+| **Graph projection** (`POST /api/v1/graph/upsert` written best-effort from the learning pipeline) | ✅ shipped | mini-ork #204 |
 
 Full epic spec: `docs/roadmap/epics/agent-context-pack.md` in the ContextNest repo.
 
