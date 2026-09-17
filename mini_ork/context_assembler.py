@@ -13,6 +13,7 @@ weight-free improvement) plugs in here by scoring which emitted lessons help.
 from __future__ import annotations
 
 import argparse
+import datetime
 import json
 import os
 import sqlite3
@@ -251,6 +252,32 @@ def context_assemble(task_brief_path: str, workflow_node: str,
         pass
     con.close()
 
+    # graph_context — failure-linked evidence for the same three sources the
+    # prompt block reads. Init-before-try so the key survives any DB failure.
+    graph_context = {"linked_gradients": [], "failure_hotspots": [],
+                     "outstanding_blame": []}
+    try:
+        gc_db = _db_path(db)
+        if os.environ.get("MO_GRAPH_CONTEXT", "1") == "1" and os.path.isfile(gc_db):
+            gc_linked, gc_hotspots, gc_blame = _graph_context_rows(task_class, 5, gc_db)
+            graph_context["linked_gradients"] = [
+                {"cite": f"gradient_records/{r[0]}", "target": r[0],
+                 "signal": r[1], "suggested_change": r[2], "confidence": r[3],
+                 "target_class": r[4], "link_count": r[5]}
+                for r in gc_linked]
+            graph_context["failure_hotspots"] = [
+                {"cite": f"failure_memory/{r[0]}/{r[1]}", "workflow_stage": r[0],
+                 "failure_category": r[1], "count": r[2], "last_at": r[3],
+                 "last_error": r[4]}
+                for r in gc_hotspots]
+            graph_context["outstanding_blame"] = [
+                {"cite": f"defect_attributions/{r[0]}/{r[1]}", "lane": r[0],
+                 "code_region": r[1], "task_class": r[2], "severity": r[3],
+                 "penalty": r[4], "decay_halflife_days": r[5], "ts": r[6]}
+                for r in gc_blame]
+    except Exception:
+        pass
+
     pack = {
         "task_brief": {"content": brief, "cite": "task_brief_path"},
         "workflow_node": workflow_node,
@@ -259,6 +286,7 @@ def context_assemble(task_brief_path: str, workflow_node: str,
         "known_failure_modes": failure_modes,
         "verified_emergent_patterns": verified_emergent,
         "similar_lessons": similar_lessons,
+        "graph_context": graph_context,
         "user_preferences": user_prefs,
         "constraints": constraints,
         "forbidden_fallbacks": forbidden_fallbacks,
@@ -388,6 +416,140 @@ def prior_runs_md(task_class: str, limit: int = 5, db: str | None = None) -> str
         dur_s = f"{int(dur_ms) // 1000}s" if isinstance(dur_ms, (int, float)) else "?"
         out.append(f"- {run_key}: {outcome} ({nodes} nodes, cost {cost_s}, {dur_s})")
     out.append("--- /prior runs ---")
+    return "\n".join(out)
+
+
+def _graph_context_rows(task_class: str, limit: int, dbp: str,
+                        strip_framework: bool = False) -> tuple[list, list, list]:
+    """The three graph-context sources over one cold-safe connection.
+
+    Shared by graph_context_md and context_assemble so the prompt block and the
+    pack entry can never disagree. Each query degrades to [] on its own
+    sqlite3.OperationalError — a missing table is the expected case for
+    failure_links, which reflection_pipeline creates on demand rather than
+    db/init.sh. The failure_links JOIN is deliberately INNER: gradient_id is
+    nullable, and a LEFT JOIN would surface null-target rows.
+    """
+    linked: list = []
+    hotspots: list = []
+    blame: list = []
+    con = sqlite3.connect(dbp)
+    con.execute("PRAGMA busy_timeout=5000")
+    try:
+        try:
+            linked = con.execute("""
+                SELECT g.target, g.signal, g.suggested_change, g.confidence,
+                       g.task_class AS target_class, COUNT(*) AS link_count
+                  FROM failure_links fl
+                  JOIN gradient_records g ON g.gradient_id = fl.gradient_id
+                 WHERE fl.task_class = ?
+                 GROUP BY g.target, g.signal, g.suggested_change, g.confidence, g.task_class
+                 ORDER BY link_count DESC, g.confidence DESC
+                 LIMIT ?
+            """, (task_class, limit * 4 if strip_framework else limit)).fetchall()
+        except sqlite3.OperationalError:
+            linked = []
+        try:
+            hotspots = con.execute("""
+                SELECT fm.workflow_stage, fm.failure_category, COUNT(*) AS n,
+                       MAX(fm.occurred_at) AS last_at,
+                       (SELECT fm2.error_message FROM failure_memory fm2
+                         WHERE fm2.workflow_stage = fm.workflow_stage
+                           AND fm2.failure_category = fm.failure_category
+                         ORDER BY fm2.occurred_at DESC LIMIT 1) AS last_error
+                  FROM failure_memory fm
+                 GROUP BY fm.workflow_stage, fm.failure_category
+                 ORDER BY n DESC, last_at DESC
+                 LIMIT ?
+            """, (limit,)).fetchall()
+        except sqlite3.OperationalError:
+            hotspots = []
+        try:
+            blame = con.execute("""
+                SELECT lane, code_region, task_class, severity, penalty,
+                       decay_halflife_days, ts
+                  FROM defect_attributions
+                 WHERE task_class = ?
+                 ORDER BY ts DESC
+                 LIMIT ?
+            """, (task_class, limit)).fetchall()
+        except sqlite3.OperationalError:
+            blame = []
+    finally:
+        con.close()
+    return linked, hotspots, blame
+
+
+def graph_context_md(task_class: str, limit: int = 5, db: str | None = None) -> str:
+    """Failure-linked graph context block; '' when gated off, the DB is missing,
+    or all three sub-sections are empty. Includes the same project-scope filter
+    as failure_modes_md: framework-internal targets are stripped when MO_TARGET_CWD
+    is set and differs from MINI_ORK_ROOT. Never raises, for any DB state."""
+    if os.environ.get("MO_GRAPH_CONTEXT", "1") != "1":
+        return ""
+    dbp = _db_path(db)
+    if not os.path.isfile(dbp):
+        return ""
+    strip_framework = False
+    tgt, root = os.environ.get("MO_TARGET_CWD", ""), os.environ.get("MINI_ORK_ROOT", "")
+    if tgt and root:
+        try:
+            strip_framework = os.path.realpath(tgt) != os.path.realpath(root)
+        except OSError:
+            strip_framework = False
+    linked, hotspots, blame = _graph_context_rows(task_class, limit, dbp, strip_framework)
+    if strip_framework:
+        linked = [r for r in linked
+                  if not r[0].startswith(FRAMEWORK_INTERNAL_PREFIXES)][:limit]
+    else:
+        linked = linked[:limit]
+
+    now_utc = datetime.datetime.utcnow()
+    blame_lines = []
+    for lane, region, _task_class, severity, penalty, halflife, ts in blame:
+        try:
+            pen = float(penalty)
+            hlf = float(halflife) if halflife is not None else 30.0
+        except (TypeError, ValueError):
+            continue
+        if hlf <= 0:
+            continue
+        tsv = str(ts).strip().rstrip("Z").replace("T", " ")
+        parsed = None
+        for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S"):
+            try:
+                parsed = datetime.datetime.strptime(tsv, fmt)
+                break
+            except ValueError:
+                parsed = None
+        if parsed is None:
+            continue
+        age_days = max((now_utc - parsed).total_seconds() / 86400.0, 0.0)
+        decayed = pen * (0.5 ** (age_days / hlf))
+        blame_lines.append(
+            f"- [{lane}/{region}] severity={severity} decayed_penalty={decayed:.3f}")
+
+    if not linked and not hotspots and not blame_lines:
+        return ""
+    out = ["--- Learned graph context (failure-linked) ---"]
+    if linked:
+        out.append("Gradient targets evidenced by real failures (INNER JOIN):")
+        for target, signal, change, _confidence, target_class, link_count in linked:
+            scope = (f" [class: {target_class}]"
+                     if target_class and target_class != task_class else "")
+            out.append(f"- [{target}]{scope} {link_count} failure link(s): "
+                       f"{(signal or '').strip()}")
+            out.append(f"  Fix applied going forward: {(change or '').strip()}")
+    if hotspots:
+        out.append("Recurring failure hotspots:")
+        for stage, category, n, last_at, last_error in hotspots:
+            detail = (last_error or "").strip().replace("\n", " ")
+            detail = f" — {detail[:200]}" if detail else ""
+            out.append(f"- [{stage}/{category}] {n}x (last {last_at}){detail}")
+    if blame_lines:
+        out.append("Outstanding defect blame (decay-weighted):")
+        out.extend(blame_lines)
+    out.append("--- /learned graph context ---")
     return "\n".join(out)
 
 
