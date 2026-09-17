@@ -602,3 +602,47 @@ def test_lane_health_missing_key_returns_unhealthy(tmp_path, monkeypatch):
 
     assert health.ok is False
     assert "UHP_API_KEY" in health.reason
+
+
+def test_transport_sends_capability_envelope_on_the_wire(monkeypatch, capsys):
+    """SE-3 Phase B2: the node-boundary envelope vars (MO_MCP_SERVERS /
+    MO_SKILLS / MO_AGENT_DOC) ride the /v1/responses payload so the harness
+    SERVER translates them per target harness."""
+    server = _FakeUHPServer()
+    try:
+        server.script(
+            _Script(
+                status=200,
+                body_chunks=_sse(
+                    [
+                        (
+                            "response.completed",
+                            {
+                                "type": "response.completed",
+                                "response": {
+                                    "id": "resp_env",
+                                    "output": [
+                                        {"content": [{"text": "ok", "type": "output_text"}]}
+                                    ],
+                                },
+                            },
+                        ),
+                    ]
+                ),
+            )
+        )
+        _env(monkeypatch, server)
+        monkeypatch.setenv("MO_MCP_SERVERS", "websearch, github")
+        monkeypatch.setenv("MO_SKILLS", "doc-writer")
+        monkeypatch.setenv("MO_AGENT_DOC", "prompts/AGENTS.md")
+        monkeypatch.setattr("sys.stdin", io.StringIO("Do research"))
+
+        rc = transport.run(["--print", "--output-format", "text"])
+
+        assert rc == 0
+        body = server.requests[0]["body"]
+        assert body["mcp_servers"] == ["websearch", "github"]
+        assert body["skills"] == ["doc-writer"]
+        assert body["agent_doc"] == "prompts/AGENTS.md"
+    finally:
+        server.close()

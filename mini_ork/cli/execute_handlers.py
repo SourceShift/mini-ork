@@ -211,6 +211,26 @@ def dispatch_node(fields, *, root, run_dir, plan_path, task_class, db, run_id,
             "MINI_ORK_NODE_INPUT_MANIFEST": None,
             "MINI_ORK_NODE_INPUT_DIR": None,
         })
+    # Capability envelope (SE-3 Phase B2): publish the node's harness-level
+    # declarations (workflow.yaml mcp_servers/skills/agent_doc) on the node
+    # bus. Masked to None when the node declares nothing so a prior node's
+    # envelope can never leak into the next dispatch (MO_RESUME_SESSION_ID
+    # discipline). dispatch_model rejects lanes whose engine cannot translate
+    # a declared axis instead of silently dropping it.
+    _envelope: dict[str, str | None] = {
+        "MO_MCP_SERVERS": None,
+        "MO_SKILLS": None,
+        "MO_AGENT_DOC": None,
+    }
+    if compiled_workflow is not None and node_id in compiled_workflow.nodes:
+        _decl = compiled_workflow.nodes[node_id]
+        if _decl.mcp_servers:
+            _envelope["MO_MCP_SERVERS"] = ",".join(_decl.mcp_servers)
+        if _decl.skills:
+            _envelope["MO_SKILLS"] = ",".join(_decl.skills)
+        if _decl.agent_doc:
+            _envelope["MO_AGENT_DOC"] = _decl.agent_doc
+    publish_env(_envelope)
     # Snapshot the tree BEFORE any implementer node edits it, so the reviewer
     # diff captures only the implementer's delta (not pre-existing dirt from a
     # concurrent session sharing this in-place working tree). Non-destructive.

@@ -49,6 +49,80 @@ class DispatchRequest:
     workspace: str = "host"
 
 
+# SE-3 Phase B2: a dispatch refused because the resolved engine cannot honor
+# the node's capability envelope (e.g. a node that declares MCP servers routed
+# to an engine with no MCP translation). Distinct from SHAPE_REJECT_RC (65) so
+# callers can tell "lane can't carry the capability" from "lane emitted the
+# wrong artifact shape".
+ENVELOPE_REJECT_RC = 66
+
+# Node-boundary env vars carrying the envelope (published by dispatch_node,
+# masked to None when the node declares nothing — the MO_RESUME_SESSION_ID
+# stale-leak discipline).
+ENV_MCP_SERVERS = "MO_MCP_SERVERS"
+ENV_SKILLS = "MO_SKILLS"
+ENV_AGENT_DOC = "MO_AGENT_DOC"
+
+
+@dataclass(frozen=True)
+class CapabilityEnvelope:
+    """Per-node harness capability declarations (SE-3 Phase B2).
+
+    What a workflow node asks its harness for beyond the prompt: MCP servers,
+    named skills, and an agent-doc. Engines declare per-axis support via
+    ``Capabilities``; a node declaring an axis the resolved engine cannot
+    translate is rejected loudly (rc=ENVELOPE_REJECT_RC) instead of silently
+    dispatching with the capability dropped — the lane-binding failure class
+    where a recipe works on one lane and quietly degrades on another.
+
+    Values are server/skill *names* resolved by the receiving side: the claude
+    engine materializes MCP names against the operator's mcp_servers.json;
+    a UHP server translates them into its target harness's native config.
+    """
+
+    mcp_servers: tuple[str, ...] = ()
+    skills: tuple[str, ...] = ()
+    agent_doc: str = ""
+
+    def is_empty(self) -> bool:
+        return not (self.mcp_servers or self.skills or self.agent_doc)
+
+    def as_env(self) -> dict[str, str]:
+        out: dict[str, str] = {}
+        if self.mcp_servers:
+            out[ENV_MCP_SERVERS] = ",".join(self.mcp_servers)
+        if self.skills:
+            out[ENV_SKILLS] = ",".join(self.skills)
+        if self.agent_doc:
+            out[ENV_AGENT_DOC] = self.agent_doc
+        return out
+
+    def unsupported_axes(self, capabilities) -> tuple[str, ...]:
+        """The envelope axes ``capabilities`` (a ``Capabilities`` instance)
+        does not accept, as axis names for the rejection message. An axis with
+        nothing declared is never unsupported."""
+        checks = (
+            ("mcp_servers", not self.mcp_servers or capabilities.mcp_servers),
+            ("skills", not self.skills or capabilities.skills),
+            ("agent_doc", not self.agent_doc or capabilities.agent_doc),
+        )
+        return tuple(name for name, ok in checks if not ok)
+
+
+def envelope_from_env(read) -> "CapabilityEnvelope":
+    """Build an envelope by reading the carrier vars through ``read(key)``
+    (pass ``context_env`` at dispatch seams, ``env.get`` in tests/transports).
+    Missing/blank vars contribute nothing."""
+    def _csv(value: str) -> tuple[str, ...]:
+        return tuple(tok.strip() for tok in (value or "").split(",") if tok.strip())
+
+    return CapabilityEnvelope(
+        mcp_servers=_csv(read(ENV_MCP_SERVERS)),
+        skills=_csv(read(ENV_SKILLS)),
+        agent_doc=(read(ENV_AGENT_DOC) or "").strip(),
+    )
+
+
 @dataclass
 class DispatchResult:
     """The outcome of a dispatch. `rc` is propagated faithfully from the
