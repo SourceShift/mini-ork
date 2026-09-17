@@ -79,6 +79,7 @@ from typing import Any, Callable, Iterable
 # Re-import the peer port so review_forward_to_bug_reports can call into
 # it without shelling out to bash (parity tests verify the same DB state
 # is reached whether we use bash sourcing or in-process Python helpers).
+from mini_ork.context import run_context_scope, scoped_environ
 from mini_ork.observability import bug_report as _bug_report
 
 # ── Re-exports: implementation moved to focused submodules (SRP split).
@@ -443,9 +444,11 @@ def review_forward_to_bug_reports(
     # bug_report_emit lands in the right dir.
     run_dir = Path(home) / "runs" / f"review-{rid}"
     run_dir.mkdir(parents=True, exist_ok=True)
-    prev_run_dir = os.environ.get("MINI_ORK_RUN_DIR")
-    os.environ["MINI_ORK_RUN_DIR"] = str(run_dir)
-    try:
+    # Scope the override in BOTH env layers so context_env readers (bug_report's
+    # run-dir resolver) and legacy os.environ readers agree, with restore on exit
+    # so nothing leaks into other tests.
+    with run_context_scope({"MINI_ORK_RUN_DIR": str(run_dir)}), \
+            scoped_environ({"MINI_ORK_RUN_DIR": str(run_dir)}):
         for _, lens, sev, file_path, title, desc, fix in rows:
             _bug_report.bug_report_emit(
                 f"review.{lens}",
@@ -458,12 +461,6 @@ def review_forward_to_bug_reports(
                 run_dir=str(run_dir),
             )
         _bug_report.bug_report_sweep("--all", home=home)
-    finally:
-        # Restore env so we don't leak into other tests.
-        if prev_run_dir is None:
-            os.environ.pop("MINI_ORK_RUN_DIR", None)
-        else:
-            os.environ["MINI_ORK_RUN_DIR"] = prev_run_dir
     return len(rows)
 
 

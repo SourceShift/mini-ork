@@ -30,6 +30,8 @@ import os
 import re
 from typing import Any
 
+from mini_ork.context import context_env
+
 
 # Regex lifted verbatim from the bash heredoc — left boundary excludes word
 # chars and slashes; path allows letters/digits/._-/; extension whitelist
@@ -145,7 +147,7 @@ def check_citations(
         env_root = os.environ.get("MINI_ORK_ROOT")
         root = env_root if env_root else _default_root()
     if report_dir is None:
-        report_dir = os.environ.get("MINI_ORK_RUN_DIR", ".")
+        report_dir = context_env("MINI_ORK_RUN_DIR", ".")
 
     # Shell-level early return: missing/empty doc — matches bash printf path
     # that OMITS ``report_path`` from the dict. Rc=0.

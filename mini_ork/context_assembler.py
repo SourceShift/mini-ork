@@ -20,6 +20,7 @@ import sqlite3
 import sys
 import time
 
+from mini_ork.context import context_env
 from mini_ork.similarity import rank_raw
 
 FRAMEWORK_INTERNAL_PREFIXES = (
@@ -31,7 +32,7 @@ FRAMEWORK_INTERNAL_PREFIXES = (
 def _db_path(db: str | None) -> str:
     if db:
         return db
-    env = os.environ.get("MINI_ORK_DB")
+    env = context_env("MINI_ORK_DB")
     if not env:
         raise RuntimeError("MINI_ORK_DB unset")
     return env
@@ -129,7 +130,7 @@ def context_assemble(task_brief_path: str, workflow_node: str,
 
     con = sqlite3.connect(_db_path(db))
     con.row_factory = sqlite3.Row
-    cur_run = os.environ.get("MINI_ORK_RUN_ID", "")
+    cur_run = context_env("MINI_ORK_RUN_ID", "")
 
     prior_runs = []
     try:
@@ -234,7 +235,7 @@ def context_assemble(task_brief_path: str, workflow_node: str,
 
     user_prefs = {}
     try:
-        cfg_path = os.path.join(os.environ.get("MINI_ORK_HOME", ".mini-ork"),
+        cfg_path = os.path.join(context_env("MINI_ORK_HOME", ".mini-ork"),
                                 "config", "user_preferences.json")
         user_prefs = json.load(open(cfg_path, encoding="utf-8"))
         user_prefs["cite"] = cfg_path
@@ -243,7 +244,7 @@ def context_assemble(task_brief_path: str, workflow_node: str,
 
     constraints, forbidden_fallbacks = [], []
     try:
-        cfg_path = os.path.join(os.environ.get("MINI_ORK_HOME", ".mini-ork"),
+        cfg_path = os.path.join(context_env("MINI_ORK_HOME", ".mini-ork"),
                                 "config", "constraints.json")
         cfg = json.load(open(cfg_path, encoding="utf-8"))
         constraints = cfg.get("constraints", [])
@@ -309,7 +310,7 @@ def failure_modes_md(task_class: str, limit: int = 5, db: str | None = None) -> 
     if not os.path.isfile(dbp):
         return ""
     strip_framework = False
-    tgt, root = os.environ.get("MO_TARGET_CWD", ""), os.environ.get("MINI_ORK_ROOT", "")
+    tgt, root = context_env("MO_TARGET_CWD", ""), context_env("MINI_ORK_ROOT", "")
     if tgt and root:
         try:
             strip_framework = os.path.realpath(tgt) != os.path.realpath(root)
@@ -385,7 +386,7 @@ def prior_runs_md(task_class: str, limit: int = 5, db: str | None = None) -> str
     dbp = _db_path(db)
     if not os.path.isfile(dbp):
         return ""
-    cur_run = os.environ.get("MINI_ORK_RUN_ID", "")
+    cur_run = context_env("MINI_ORK_RUN_ID", "")
     con = sqlite3.connect(dbp)
     con.execute("PRAGMA busy_timeout=5000")
     try:
@@ -491,7 +492,7 @@ def graph_context_md(task_class: str, limit: int = 5, db: str | None = None) -> 
     if not os.path.isfile(dbp):
         return ""
     strip_framework = False
-    tgt, root = os.environ.get("MO_TARGET_CWD", ""), os.environ.get("MINI_ORK_ROOT", "")
+    tgt, root = context_env("MO_TARGET_CWD", ""), context_env("MINI_ORK_ROOT", "")
     if tgt and root:
         try:
             strip_framework = os.path.realpath(tgt) != os.path.realpath(root)
@@ -558,7 +559,7 @@ def operator_steering_md(role: str, db: str | None = None) -> str:
     from mini_ork.steering import operator_steering
 
     rows = operator_steering.fetch_for(
-        os.environ.get("MINI_ORK_RUN_ID", ""), role, db_path=db
+        context_env("MINI_ORK_RUN_ID", ""), role, db_path=db
     )
     if not rows:
         return ""

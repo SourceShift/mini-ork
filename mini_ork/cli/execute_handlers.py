@@ -767,7 +767,7 @@ def _handle_verifier(ctx: NodeDispatch):
         if not os.path.isfile(script):
             print(f"  [fail] verifier_ref not found: {ctx.verifier_ref}", file=sys.stderr)
             return 1, "error"
-        ev_dir = os.path.join(os.environ.get("MINI_ORK_RUN_DIR", ctx.run_dir), "evidence")
+        ev_dir = os.path.join(context_env("MINI_ORK_RUN_DIR", ctx.run_dir), "evidence")
         os.makedirs(ev_dir, exist_ok=True)
         ev = os.path.join(ev_dir, os.path.basename(ctx.verifier_ref).replace(".sh", "").replace(".py", "") + ".log")
         rc = _run_verifier_ref(script, ev, plan_path=ctx.plan_path, artifact_path=artifact)
@@ -776,7 +776,7 @@ def _handle_verifier(ctx: NodeDispatch):
         # rc return so failures are visible too (a missing verifier is real signal).
         vstem = ctx.verifier_ref[len("verifiers/"):] if ctx.verifier_ref.startswith("verifiers/") else ctx.verifier_ref
         vstem = vstem[:-3] if vstem.endswith((".sh", ".py")) else vstem
-        persist_dir = os.environ.get("MINI_ORK_RUN_DIR", ctx.run_dir)
+        persist_dir = context_env("MINI_ORK_RUN_DIR", ctx.run_dir)
         if persist_dir and os.path.isfile(ev) and os.path.getsize(ev) > 0:
             try:
                 shutil.copy(ev, os.path.join(persist_dir, f"verifier_{vstem}.json"))
@@ -845,7 +845,7 @@ def _revert_working_tree(root: str, run_dir: str) -> bool:
     if not files:
         log("  [rollback] revert_branch: no files_changed recorded — working tree untouched")
         return True
-    target_repo = os.environ.get("MO_TARGET_CWD", "")
+    target_repo = context_env("MO_TARGET_CWD", "")
     if not target_repo:
         try:
             target_repo = subprocess.check_output(

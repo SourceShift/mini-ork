@@ -42,6 +42,8 @@ import os
 import sys
 import time
 
+from mini_ork.context import context_env
+
 __all__ = ["write", "can_resume", "clear", "summary"]
 
 
@@ -58,7 +60,7 @@ def _resolve_path() -> tuple[str, int]:
     Returns (path, rc). rc=0 on success. On failure writes the same
     stderr text bash writes and returns rc=2 — case (h) asserts this.
     """
-    rd = os.environ.get("MINI_ORK_RUN_DIR", "")
+    rd = context_env("MINI_ORK_RUN_DIR", "")
     if not rd:
         _log_err("checkpoint.sh: MINI_ORK_RUN_DIR unset; cannot persist")
         return ("", 2)

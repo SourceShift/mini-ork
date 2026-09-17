@@ -23,6 +23,12 @@ import time
 from pathlib import Path
 
 from mini_ork import trace_store
+from mini_ork.context import (
+    context_env,
+    context_env_snapshot,
+    publish_env,
+    run_context_scope,
+)
 from mini_ork.dispatch import config_resolve, deadline_budget
 from mini_ork.vcs import repo_integrity_guard
 from mini_ork.gates import rubric_prescreen
@@ -105,7 +111,7 @@ Environment:
 
 
 def _module_env(root):
-    env = dict(os.environ)
+    env = context_env_snapshot()
     env["PYTHONPATH"] = root + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
     return env
 
@@ -318,7 +324,13 @@ def _run_lifecycle(argv, root) -> int:
         else:
             inner.append(a)
     sink: dict = {}
-    rc = _run_lifecycle_impl(inner, root, sink)
+    # Run-level boundary: everything the lifecycle publishes (artifact path,
+    # run dir, per-node MO_* vars) is wiped from the contextvar layer when
+    # the run exits. The lifecycle owns the run context; in-process callers
+    # (SDK, tests) must not inherit a finished run's bindings. The os.environ
+    # write keeps its historical leak-forever semantics.
+    with run_context_scope({}):
+        rc = _run_lifecycle_impl(inner, root, sink)
     if emit_json:
         sink["returncode"] = rc
         sys.stdout.write(
@@ -489,13 +501,13 @@ def _run_lifecycle_impl(argv, root, sink) -> int:
     sys.stderr.write(execute_err)
     artifact = _grep_kv(execute_out, "artifact_path")
     if artifact:
-        os.environ["MINI_ORK_ARTIFACT_PATH"] = artifact
+        publish_env({"MINI_ORK_ARTIFACT_PATH": artifact})
         sink["artifact_path"] = artifact
     if deadline and _deadline(root, "mo_deadline_check", run_id) != 0:
         sys.stderr.write(f"deadline_hit after execute; best-so-far artifact: {artifact or '<none>'}\n")
         return run_rc
 
-    _run_dir = os.environ.get("MINI_ORK_RUN_DIR", "")
+    _run_dir = context_env("MINI_ORK_RUN_DIR", "")
     if not _run_dir and plan_path:
         _run_dir = os.path.dirname(plan_path)
     if _run_dir and _run_dir != "." and os.path.isdir(_run_dir) \
@@ -518,7 +530,7 @@ def _run_lifecycle_impl(argv, root, sink) -> int:
                     task_class or "generic",
                     mini_ork_root=root,
                     mini_ork_home=home,
-                    mini_ork_db=os.environ.get("MINI_ORK_DB"),
+                    mini_ork_db=context_env("MINI_ORK_DB") or None,
                 )
         except Exception:
             pass
@@ -526,14 +538,14 @@ def _run_lifecycle_impl(argv, root, sink) -> int:
             trace_store.grade_run_reward(
                 _run_dir,
                 run_id,
-                db=os.environ.get("MINI_ORK_DB"),
+                db=context_env("MINI_ORK_DB") or None,
             )
         except Exception:
             pass
 
     # ── verify ──
     if _run_dir and _run_dir != "." and os.path.isdir(_run_dir):
-        os.environ["MINI_ORK_RUN_DIR"] = _run_dir
+        publish_env({"MINI_ORK_RUN_DIR": _run_dir})
     vargs = [sys.executable, "-m", "mini_ork.cli.verify"] + ([artifact] if artifact else [])
     vr = subprocess.run(vargs, capture_output=True, text=True, env=_module_env(root))
     sys.stdout.write(vr.stdout); sys.stderr.write(vr.stderr)

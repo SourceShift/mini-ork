@@ -15,6 +15,8 @@ import sqlite3
 import time
 import uuid
 
+from mini_ork.context import context_env
+
 
 def _db_path(db: str | None) -> str:
     if db:
@@ -70,7 +72,7 @@ def trace_write(payload: dict | str, db: str | None = None) -> str:
     p = json.loads(payload) if isinstance(payload, str) else dict(payload)
     trace_id = p.get("trace_id") or f"tr-{uuid.uuid4().hex[:16]}"
     run_id = (p.get("run_id") or os.environ.get("MINI_ORK_TASK_RUN_ID")
-              or os.environ.get("MINI_ORK_RUN_ID"))
+              or context_env("MINI_ORK_RUN_ID") or None)
     workflow_version_id = (p.get("workflow_version_id")
                            or os.environ.get("MINI_ORK_WORKFLOW_VERSION_ID"))
     prompt_version = (p.get("prompt_version") or os.environ.get("MO_NODE_PROMPT_SHA") or "")
@@ -141,7 +143,7 @@ def _read_fresh_sidecar(name: str) -> str | None:
     """Freshness-gated sidecar read from $MINI_ORK_RUN_DIR. A sidecar older than
     5x MO_DISPATCH_TIMEOUT is treated as absent so a stale lane/cost from an
     earlier dispatch can never be attributed to the current trace."""
-    run_dir = os.environ.get("MINI_ORK_RUN_DIR", "")
+    run_dir = context_env("MINI_ORK_RUN_DIR", "")
     if not run_dir:
         return None
     try:

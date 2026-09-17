@@ -61,6 +61,8 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 
+from mini_ork.context import context_env
+
 HARNESSES = ("claude-code", "codex-cli", "gemini-cli")
 BINARIES = {
     "claude-code": "claude",
@@ -331,7 +333,7 @@ def mo_harness_wrap(harness: str, kickoff_path: str) -> int:
         _log("error", f"kickoff not found: {kickoff_path}")
         return 2
 
-    run_dir = os.environ.get("MINI_ORK_RUN_DIR")
+    run_dir = context_env("MINI_ORK_RUN_DIR") or None
     workspace = run_dir if run_dir else os.path.join(os.getcwd(), ".mini-ork", "harness-work")
     os.makedirs(workspace, exist_ok=True)
     return _run(harness, kickoff_path, workspace)

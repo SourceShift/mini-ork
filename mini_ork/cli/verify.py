@@ -21,6 +21,7 @@ import time
 from pathlib import Path
 
 from mini_ork import trace_store
+from mini_ork.context import context_env
 
 from mini_ork.gates import gate_registry
 
@@ -172,7 +173,7 @@ def main(argv: list[str] | None = None, *, db: str | None = None, root: str | No
     if not plan_path:
         plan_path = _newest_plan(home)
 
-    run_dir = os.environ.get("MINI_ORK_RUN_DIR")
+    run_dir = context_env("MINI_ORK_RUN_DIR") or None
     evidence_dir = (os.path.join(run_dir, "evidence") if run_dir and os.path.isdir(run_dir)
                     else os.path.join(home, "runs", "evidence"))
     os.makedirs(evidence_dir, exist_ok=True)
@@ -281,7 +282,7 @@ def main(argv: list[str] | None = None, *, db: str | None = None, root: str | No
     gates_available = hasattr(gate_registry, "gate_run_all")
     if dry_run == 0 and gates_available:
         ctx = json.dumps({"task_class": task_class, "artifact_path": artifact_path,
-                          "plan_path": plan_path or "", "panel_run_id": os.environ.get("MINI_ORK_RUN_ID", ""),
+                          "plan_path": plan_path or "", "panel_run_id": context_env("MINI_ORK_RUN_ID", ""),
                           "cost_usd": 0.0})
         try:
             summary = gate_registry.gate_run_all(db, task_class, ctx, mini_ork_root=root)
