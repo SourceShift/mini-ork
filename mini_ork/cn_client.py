@@ -164,10 +164,16 @@ def basins(project: str = "", limit: int = 20) -> str:
     return _get(f"/api/v1/field/basins?{q}")
 
 
-def connections_for(node_id: str, limit: int = 8) -> str:
+def graph_neighbors(node_id: str, limit: int = 8) -> str:
     if _disabled() or not available():
         return "{}"
-    return _get(f"/api/v1/connections?node_id={_enc(node_id)}&limit={limit}")
+    return _get(f"/api/v1/graph/neighbors?node_id={_enc(node_id)}&limit={limit}")
+
+
+def graph_path(src: str, dst: str) -> str:
+    if _disabled() or not available():
+        return "{}"
+    return _get(f"/api/v1/graph/path?from={_enc(src)}&to={_enc(dst)}")
 
 
 def inbox_filtered(urgency: str = "", limit: int = 10) -> str:
@@ -304,4 +310,53 @@ def render_basins_md(payload: str, limit: int = 5) -> str:
             rep = rep[:157] + "..."
         out.append(f"- [{bid} mass={mass}] {rep}")
     out.append("--- /ContextNest topic clusters ---")
+    return "\n".join(out) + "\n"
+
+
+def render_graph_neighbors_md(payload: str, limit: int = 5) -> str:
+    try:
+        d = json.loads(payload)
+    except Exception:
+        return ""
+    ns = d.get("neighbors") or []
+    if not ns:
+        return ""
+    out = ["--- ContextNest graph — neighbours of the top retrieved memory ---"]
+    for n in ns[:int(limit)]:
+        nid = (n.get("id") or "")[:8]
+        try:
+            w = float(n.get("weight") or 0.0)
+        except (TypeError, ValueError):
+            w = 0.0
+        out.append(f"- {nid} w={w:.2f}")
+    out.append("--- /graph neighbours ---")
+    return "\n".join(out) + "\n"
+
+
+def render_graph_path_md(payload: str, limit: int = 3) -> str:
+    try:
+        d = json.loads(payload)
+    except Exception:
+        return ""
+    if not d.get("found"):
+        return ""
+    nodes = [n for n in (d.get("nodes") or []) if n]
+    if not nodes:
+        return ""
+    # `limit` decides whether the intermediate hops are worth spelling out — it
+    # must NOT be applied before picking the endpoints, or a path longer than
+    # the limit would print a middle hop as the destination. Truncating to the
+    # endpoint pair keeps both ends truthful.
+    if len(nodes) > int(limit):
+        nodes = [nodes[0], nodes[-1]]
+    hops = d.get("hops") or 0
+    try:
+        total_weight = float(d.get("total_weight") or 0.0)
+    except (TypeError, ValueError):
+        total_weight = 0.0
+    algorithm = d.get("algorithm") or "?"
+    chain = " -> ".join(n[:8] for n in nodes)
+    out = ["--- ContextNest graph — how the top two memories connect ---",
+           f"- {chain} ({hops} hops, w={total_weight:.2f}, {algorithm})",
+           "--- /graph path ---"]
     return "\n".join(out) + "\n"
