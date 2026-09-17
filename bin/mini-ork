@@ -102,16 +102,32 @@ def _configure_windows_git_bash() -> None:
             return
 
 
+def _unresolved(value: str | Path, root: Path) -> Path:
+    """Absolute path WITHOUT resolving symlinks (normpath-collapsed only)."""
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        path = root / path
+    return Path(os.path.normpath(path))
+
+
 def _venv_python(root: Path) -> Path:
-    """Return the checkout runtime Python, optionally overridden for operators."""
+    """Return the checkout runtime Python, optionally overridden for operators.
+
+    The returned path MUST stay unresolved: a venv's bin/python is a symlink
+    into the base interpreter, and CPython discovers pyvenv.cfg relative to
+    the executable path it was exec'd as. Handing execve the RESOLVED real
+    binary (what Path.resolve() produces) makes the re-exec'd process wake up
+    with the BASE prefix and no venv site-packages — every dependency import
+    (yaml, ...) then dies with ModuleNotFoundError.
+    """
     if configured := os.environ.get("MINI_ORK_VENV"):
-        return _absolute(configured) / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+        return _unresolved(configured, root) / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
     pointer = root / ".mini-ork" / "runtime-python"
     if pointer.is_file():
         try:
             configured = pointer.read_text(encoding="utf-8").splitlines()
             if configured and configured[0].strip():
-                return _absolute(configured[0].strip())
+                return _unresolved(configured[0].strip(), root)
         except OSError:
             pass
     venv = root / ".venv"
