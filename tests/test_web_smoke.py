@@ -31,10 +31,58 @@ def db(home: Path):
     return get_db()
 
 
-def test_health(db) -> None:
+@pytest.fixture()
+def seeded_db(tmp_path: Path):
+    """Hermetic migrated state.db with one finished code-fix run.
+
+    The module `home` fixture points at the checkout's own .mini-ork/state.db,
+    which works only where that db has real history — a fresh worktree's init
+    leaves a 0-byte state.db (no tables), and tests that assert on table
+    presence fail there. This fixture builds the FULL migrated schema via the
+    real migration runner, then seeds exactly what those assertions need:
+    a task_runs row (recipe=code-fix) plus planner node_start/node_end events.
+    """
+    from mini_ork.stores.migrate import init_db
+    from mini_ork.web.db import StateDB
+
+    h = tmp_path / ".mini-ork"
+    h.mkdir()
+    dbp = h / "state.db"
+    rc, out, err = init_db(db=str(dbp), root=str(ROOT))
+    assert rc == 0, f"init_db failed rc={rc}\nstdout={out}\nstderr={err}"
+
+    con = sqlite3.connect(dbp)
+    con.execute(
+        """
+        INSERT INTO task_runs (id, task_class, recipe, status, verdict,
+                               kickoff_path, cost_usd, created_at, updated_at, ended_at)
+        VALUES ('run-hermetic-1', 'code_fix', 'code-fix', 'published', 'APPROVE',
+                '/tmp/kickoff.md', 0.01, 1700000000, 1700000000, 1700000000)
+        """
+    )
+    con.executemany(
+        "INSERT INTO run_events (event_id, run_id, event_type, payload_json, created_at)"
+        " VALUES (?, ?, ?, ?, ?)",
+        [
+            ("ev-1", "run-hermetic-1", "node_start",
+             '{"node_id": "planner"}', 1700000001),
+            ("ev-2", "run-hermetic-1", "node_end",
+             '{"node_id": "planner", "verdict": "APPROVE", "duration_ms": 1200,'
+             ' "artifact_path": "/tmp/plan.json"}', 1700000002),
+        ],
+    )
+    con.commit()
+    con.close()
+    return StateDB(dbp)
+
+
+def test_health(seeded_db) -> None:
+    """Hermetic: asserts the migrated schema is present, not that this
+    checkout happens to have run real work (a 0-byte fresh-worktree db
+    made the old env-dependent version fail)."""
     from mini_ork.web.routes.fleet import health
 
-    out = health(db)
+    out = health(seeded_db)
     assert out["ok"] is True
     assert out["has_task_runs"] is True
 
@@ -554,13 +602,17 @@ def test_run_learning_endpoint_exposes_memory_and_injection(db) -> None:
         assert "agent_attribution" in row
 
 
-def test_summary_endpoint_uses_cache(db) -> None:
-    """Two summary calls within TTL must return the same object (cache hit)."""
+def test_summary_endpoint_uses_cache(seeded_db) -> None:
+    """Two summary calls within TTL must return the same object (cache hit).
+
+    Hermetic: with no task_runs table the route early-returns a fresh dict per
+    call (cache never engages), so this must run against a db that HAS the
+    migrated table."""
     from mini_ork.web.routes.fleet import task_runs_summary
 
-    db._result_cache.clear()
-    a = task_runs_summary(db)
-    b = task_runs_summary(db)
+    seeded_db._result_cache.clear()
+    a = task_runs_summary(seeded_db)
+    b = task_runs_summary(seeded_db)
     assert a is b, "second call within TTL should return the cached object"
 
 
@@ -599,30 +651,19 @@ def test_events_carry_bridge_attribution(db) -> None:
             assert e["bridge"] in ("trace_id", "run_id", "time-window")
 
 
-def test_dag_carries_node_status(db, home) -> None:
+def test_dag_carries_node_status(seeded_db, home) -> None:
     """DAG endpoint must merge node_start/node_end events into per-node status.
 
-    Looks for any task_run with node events; skips when none exist (typical
-    of fresh checkouts before any runs have completed).
+    Hermetic: runs against the seeded code-fix run (planner start+end → done).
+    The old env-dependent version skipped on fresh checkouts and RAISED on a
+    fresh worktree's tableless state.db ("no such table: task_runs").
     """
     from mini_ork.web.routes.run_detail import get_dag
 
-    rows = db.rows(
-        """
-        SELECT DISTINCT t.id
-        FROM task_runs t
-        JOIN run_events e ON e.run_id = t.id
-        WHERE e.event_type IN ('node_start', 'node_end') AND t.recipe IS NOT NULL
-        LIMIT 1
-        """
-    )
-    if not rows:
-        pytest.skip("no task_runs with node events yet — re-run after a real dispatch")
-    task_run_id = rows[0]["id"]
-    out = get_dag(task_run_id=task_run_id, db=db, home=home)
+    out = get_dag(task_run_id="run-hermetic-1", db=seeded_db, home=home)
     statuses = {n["name"]: n["status"] for n in out["nodes"]}
-    assert any(s in ("running", "done", "failed") for s in statuses.values()), (
-        f"expected at least one observed node, got: {statuses}"
+    assert statuses.get("planner") == "done", (
+        f"expected seeded planner to be done, got: {statuses}"
     )
 
 

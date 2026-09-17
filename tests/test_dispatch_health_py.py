@@ -44,6 +44,10 @@ def test_unknown_lane_is_unhealthy(tmp_path, monkeypatch):
 
 def test_dispatch_model_fails_fast_on_missing_key(tmp_path, monkeypatch):
     monkeypatch.setenv("MINI_ORK_ROOT", str(REPO))
+    # Route the cwd guard at a scratch dir: running from the framework tree
+    # (every dev checkout) the guard fires BEFORE preflight and masks the
+    # missing-key failure this test exists to exercise.
+    monkeypatch.setenv("MO_TARGET_CWD", str(tmp_path))
     monkeypatch.delenv("GLM_API_KEY", raising=False)
     res = dispatch_model(DispatchRequest(model="glm", prompt="hi"))
     assert res.ok is False

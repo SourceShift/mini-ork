@@ -32,6 +32,7 @@ ENDPOINTS = [
     "/api/v1/learning/patterns",
     "/api/v1/learning/topology",
     "/api/v1/learning/circuit-breakers",
+    "/api/v1/learning/applies",
 ]
 
 
@@ -81,10 +82,68 @@ def test_bandit_and_gepa_are_keyed_not_flat(client: TestClient) -> None:
     was PROPOSED is not the same as one that was PROMOTED.
     """
     bandit = client.get("/api/v1/learning/bandit").json()
-    assert set(bandit) == {"domain", "region"}
+    assert set(bandit) == {"domain", "region", "baseline"}
 
     gepa = client.get("/api/v1/learning/gepa").json()
     assert set(gepa) == {"gradient_count", "win_rates", "promotions"}
+
+
+def test_applies_serves_gate_decisions_with_measurements(tmp_path: Path) -> None:
+    """/applies must show not just WHAT the apply gate decided but the measured
+    utilities behind it — a promoted row without a measured before/after is the
+    exact fabricated-utility failure mode the gate exists to prevent."""
+    home = tmp_path / ".mini-ork"
+    home.mkdir()
+    con = sqlite3.connect(home / "state.db")
+    con.executescript(
+        """
+        CREATE TABLE apply_attempts (
+            attempt_id TEXT PRIMARY KEY, task_class TEXT, target_kind TEXT,
+            target_name TEXT, source_kind TEXT, source_id TEXT,
+            candidate_id TEXT, promotion_id TEXT, base_workflow_version_id TEXT,
+            utility_before REAL, utility_after REAL, utility_delta REAL,
+            decision TEXT, rationale TEXT, dry_run INTEGER, apply_enabled INTEGER,
+            created_at TEXT
+        );
+        INSERT INTO apply_attempts VALUES
+          ('apply-1', 'obs_smoke', 'prompt_file', 'agent.tiny-researcher.prompt',
+           'gradient_records', 'gr-1', 'cand-1', 'pr-1', NULL,
+           1.0, 1.0, 0.0, 'promoted',
+           'probe: n=2 before=1.00 after=1.00 cost=$1.64; non-regression cleared', 0, 1,
+           '2026-09-16T10:00:00Z'),
+          ('apply-2', 'obs_smoke', 'prompt_file', 'agent.tiny-researcher.prompt',
+           'gradient_records', 'gr-2', NULL, NULL, NULL,
+           NULL, NULL, NULL, 'rejected',
+           'edit memory: already has a quarantined/rejected apply_attempts row', 0, 1,
+           '2026-09-16T10:01:00Z');
+        CREATE TABLE lane_slice_baseline (
+            objective_domain TEXT, task_class TEXT, node_type TEXT,
+            code_region TEXT, slice_mean REAL, slice_var REAL, slice_std REAL,
+            runs_count INTEGER, last_updated TEXT,
+            PRIMARY KEY (objective_domain, task_class, node_type, code_region)
+        );
+        INSERT INTO lane_slice_baseline VALUES
+          ('swe', 'code_fix', 'implementer', '', 0.62, 0.01, 0.1, 40,
+           '2026-09-16T09:00:00Z');
+        """
+    )
+    con.commit()
+    con.close()
+
+    client = TestClient(create_app(home=home))
+    rows = client.get("/api/v1/learning/applies").json()
+    assert len(rows) == 2
+    # newest first, with the measurement trail intact
+    assert rows[0]["attempt_id"] == "apply-2"
+    assert rows[0]["decision"] == "rejected"
+    assert rows[1]["decision"] == "promoted"
+    assert rows[1]["utility_before"] == 1.0 and rows[1]["utility_after"] == 1.0
+    assert "cost=$1.64" in rows[1]["rationale"]
+
+    baseline = client.get("/api/v1/learning/bandit").json()["baseline"]
+    assert len(baseline) == 1
+    assert baseline[0]["slice_mean"] == pytest.approx(0.62)
+    assert baseline[0]["runs_count"] == 40
 
 
 def test_cors_allows_electron_and_localhost_but_not_the_web(client: TestClient) -> None:
