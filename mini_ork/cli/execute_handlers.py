@@ -70,6 +70,7 @@ _run_verifier_ref = _execute_delegate("_run_verifier_ref")
 _synth_artifact_name = _execute_delegate("_synth_artifact_name")
 _verifier_runs_before_implementer = _execute_delegate("_verifier_runs_before_implementer")
 _watchdog_stale_heartbeat = _execute_delegate("_watchdog_stale_heartbeat")
+_write_implementer_summary = _execute_delegate("_write_implementer_summary")
 _write_self_migrate_implementer_summary = _execute_delegate(
     "_write_self_migrate_implementer_summary"
 )
@@ -604,6 +605,8 @@ def _handle_implementer(ctx: NodeDispatch):
         _write_self_migrate_implementer_summary(
             ctx.run_dir_eff, target, impl_log, harvested
         )
+    else:
+        _write_implementer_summary(ctx.run_dir_eff, target, impl_log)
     if not ctx.publish_declared_outputs():
         ctx.trace(ctx.node_id, "failure", "implementer", impl_log, "", "artifact_contract")
         return 1, "artifact_contract"
@@ -665,6 +668,19 @@ def _handle_reviewer(ctx: NodeDispatch):
         return 1, "artifact_contract"
     verdict = _extract_verdict(ctx.root, review_file)
     print(f"  [info] reviewer verdict={verdict} → {review_file}")
+    # Hand the verdict to the publisher through run_dir, NOT the environment: nodes
+    # execute in a ProcessPoolExecutor (cli/execute.py), so a publish_env write in
+    # this worker dies with the worker and the publisher's own process observes
+    # nothing — REVIEW_FILE/VERDICT read as "" there, which silently skipped every
+    # commit. publisher._publisher_try_commit_files already scans run_dir for
+    # panel-verdict.json / review-verdict.json; this is that missing writer, and
+    # run_dir is the one surface that actually crosses the process split.
+    try:
+        with open(os.path.join(ctx.run_dir, "review-verdict.json"), "w",
+                  encoding="utf-8") as handle:
+            json.dump({"verdict": verdict}, handle)
+    except OSError:
+        pass
     vn = verdict.lower()
     if is_synth:  # true synth only — panel gate falls through to the verdict gate
         # BUG6: a synthesizer produces a document, not a pass/fail verdict, so

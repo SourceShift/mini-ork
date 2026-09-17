@@ -55,9 +55,15 @@ def _publisher_try_commit_files(root, target_repo, run_dir, review_file, verdict
             continue
         if not isinstance(data, dict):
             continue
-        if data.get("pass") is True or str(data.get("verdict", "")).strip().lower() in {"approve", "approved", "pass"}:
+        seen = str(data.get("verdict", "")).strip().lower()
+        if data.get("pass") is True or seen in {"approve", "approved", "pass"}:
             verdict = "approve"
             break
+        # Keep a non-approving verdict for the skip message below. Reporting
+        # '<none>' when a reviewer DID return verdict='fail' reads as "no verdict
+        # found at all" and sends the reader hunting a missing file that is present.
+        if seen and not verdict:
+            verdict = seen
     if verdict != "approve" and review_file and root:
         try:
             out = subprocess.check_output(
