@@ -4,11 +4,9 @@ served by the next lane, instead of blocking for the full 25-min timeout.
 """
 from __future__ import annotations
 
-import shutil
+import os
 import sys
 from pathlib import Path
-
-import pytest
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
@@ -16,17 +14,31 @@ from mini_ork.dispatch.models import DispatchRequest  # noqa: E402
 from mini_ork.dispatch.providers import dispatch_with_fallback  # noqa: E402
 
 
-@pytest.mark.skipif(
-    shutil.which("codex") is None,
-    reason="fallback target 'codex' CLI not installed in this env (e.g. CI) — "
-    "the test asserts a *successful* fallback dispatch, which needs a real working lane",
-)
-def test_dead_primary_falls_back_to_working_lane(monkeypatch):
+def test_dead_primary_falls_back_to_working_lane(tmp_path, monkeypatch):
+    # Hermetic: stub the codex CLI on PATH. The codex lane resolves to
+    # `python -m mini_ork.dispatch.codex_transport`, which shells out to
+    # `codex exec ... --output-last-message <file>`; the stub answers that
+    # contract for zero spend. (The previous version ran the operator's REAL
+    # codex and rotted with the ambient login: ChatGPT accounts reject the
+    # configured default model → rc=1 → the fallback assertion failed for
+    # reasons unrelated to fallback.)
+    stub_bin = tmp_path / "bin"
+    stub_bin.mkdir()
+    (stub_bin / "codex").write_text(
+        "#!/usr/bin/env python3\n"
+        "import sys\n"
+        "argv = sys.argv[1:]\n"
+        "if '--output-last-message' in argv:\n"
+        "    with open(argv[argv.index('--output-last-message') + 1], 'w') as fh:\n"
+        "        fh.write('OK\\n')\n"
+    )
+    (stub_bin / "codex").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{stub_bin}{os.pathsep}{os.environ['PATH']}")
     # Force glm 'dead' (unset key → preflight fails instantly, standing in for a
-    # hang). The chain must fall back to codex (works in this env) and succeed.
+    # hang). The chain must fall back to codex (stubbed) and succeed.
     monkeypatch.setenv("GLM_API_KEY", "")
     req = DispatchRequest(model="glm", prompt="Reply with exactly one word: OK",
-                          timeout_s=120, cwd="/tmp")  # /tmp: outside framework, cwd_guard ok
+                          timeout_s=120, cwd=str(tmp_path))  # scratch: outside framework, cwd_guard ok
     r = dispatch_with_fallback(req, ["glm", "codex"], per_attempt_timeout_s=110)
     assert r.ok, f"expected fallback to codex to succeed, got rc={r.rc} {r.error}"
     assert (r.text or "").strip(), "served lane returned empty output"

@@ -117,6 +117,12 @@ def test_python_dispatch_subprocess_folds_tool_grants(tmp_path):
     env = os.environ.copy()
     env["PATH"] = f"{stub_bin}{os.pathsep}{env['PATH']}"
     env["MINI_ORK_ROOT"] = str(REPO_ROOT)
+    # Pin the home to a scratch registry so the lane resolves from the REPO
+    # config: a live CWD-relative .mini-ork that predates the `sonnet` lane
+    # makes the backend's lane_health preflight reject the lane as unknown
+    # BEFORE the argv is built — the stub claude is then never invoked.
+    env.pop("MINI_ORK_PROVIDERS", None)
+    env["MINI_ORK_HOME"] = str(tmp_path / "home" / ".mini-ork")
     env["MINI_ORK_RUN_DIR"] = str(run_dir)
     env["MO_NODE_ID"] = "implementer"
     env["MO_NODE_TYPE"] = "implementer"
