@@ -33,7 +33,11 @@ def _launcher(*args: str, env: dict[str, str] | None = None) -> subprocess.Compl
         "GLM_API_KEY", "KIMI_API_KEY", "MINIMAX_API_KEY", "DEEPSEEK_API_KEY",
     }}
     return subprocess.run(
-        [str(BIN), *args],
+        # Pin the interpreter running the suite: the launcher's shebang
+        # resolves `python3` from PATH, which on dev machines may be a bare
+        # pyenv python without mini-ork's deps (ModuleNotFoundError: yaml).
+        # These tests assert CLI logic and golden output, not shebang luck.
+        [sys.executable, str(BIN), *args],
         capture_output=True,
         text=True,
         env={**clean_env, **(env or {})},
@@ -51,7 +55,9 @@ def test_launcher_is_executable_python_only_and_symlink_safe(tmp_path):
 
     link = tmp_path / "mini-ork"
     link.symlink_to(BIN)
-    run = subprocess.run([str(link), "version"], capture_output=True, text=True, check=False)
+    # sys.executable prefix (see _launcher): __file__ still resolves through
+    # the symlink, so the symlink-safety property stays under test.
+    run = subprocess.run([sys.executable, str(link), "version"], capture_output=True, text=True, check=False)
     assert run.returncode == 0
     assert run.stdout == _version_output()
 
@@ -60,7 +66,7 @@ def test_launcher_is_executable_python_only_and_symlink_safe(tmp_path):
     home.mkdir(parents=True)
     (home / "engine").write_text(os.path.relpath(REPO, home) + "\n", encoding="utf-8")
     pointer_run = subprocess.run(
-        [str(link), "doctor"],
+        [sys.executable, str(link), "doctor"],
         cwd=project,
         capture_output=True,
         text=True,

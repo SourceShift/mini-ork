@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -57,7 +58,10 @@ def test_dry_run_client(tmp_path: Path) -> None:
     assert_true(result.ok, f"dry-run failed:\n{result.output}")
     assert_true(result.task_class == "docs", "task_class parsed")
     assert_true(result.plan_path is not None, "plan path parsed")
-    assert_true(result.command[:2] == (str(ROOT / "bin" / "mini-ork"), "run"), "command preserved")
+    # The SDK pins the embedding interpreter before the launcher path (see
+    # MiniOrk._cli_command) — command[0] is sys.executable.
+    assert_true(result.command[0] == sys.executable, "embedding interpreter pinned")
+    assert_true(result.command[1:3] == (str(ROOT / "bin" / "mini-ork"), "run"), "command preserved")
     assert_true(result.init_ran, "client auto-initialized the project")
     assert_true("=== mini-ork init ===" in result.init_output, "init output preserved")
 
