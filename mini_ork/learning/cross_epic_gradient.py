@@ -32,6 +32,8 @@ import time
 from pathlib import Path
 from typing import Optional
 
+from mini_ork import cn_client
+
 __all__ = ["promote", "_parse_window"]
 
 _WINDOW_RE = re.compile(r"^(\d+)([dh])$")
@@ -177,12 +179,19 @@ def promote(
     Mirrors lib/cross_epic_gradient.sh::cross_epic_gradient_promote byte-for-byte.
     `sqlite3.Error` propagates (no silent-0 fallback — bash's heredoc also raises
     via uncaught Python, so the parity holds).
+
+    The class fan-out that `_find_recurring_targets` already computes is also
+    projected onto CN's graph (one OF_CLASS edge per class, emitted once after
+    the commit) so "which target recurs across which classes" is queryable.
     """
     db_path = _resolve_db(db)
     secs = _parse_window(window)
     since = int(time.time()) - secs
 
     con = sqlite3.connect(db_path)
+    proj_nodes: list[dict] = []
+    proj_edges: list[dict] = []
+    seen_nodes: set[tuple[str, str]] = set()
     try:
         con.execute("PRAGMA busy_timeout=5000")
         recurring = _find_recurring_targets(con, since, min_confidence, min_classes)
@@ -200,8 +209,33 @@ def promote(
                 continue
             if _upsert_cross_class(con, target, exemplar):
                 promoted += 1
+            for cls in (row[1] or "").split(","):
+                nodes = cn_client._graph_ids(
+                    task_class=cls.strip(), gradient_id=target
+                )
+                if "GradientTarget" not in nodes or "TaskClass" not in nodes:
+                    continue
+                nodes["GradientTarget"]["props"] = {
+                    "signal": exemplar[1], "confidence": exemplar[0],
+                }
+                proj_edges.append(
+                    cn_client._graph_edge(
+                        "OF_CLASS", "GradientTarget", "TaskClass", nodes
+                    )
+                )
+                for label in ("GradientTarget", "TaskClass"):
+                    key = (label, nodes[label]["id"])
+                    if key not in seen_nodes:
+                        seen_nodes.add(key)
+                        proj_nodes.append(nodes[label])
         con.commit()
     finally:
         con.close()
+    try:
+        cn_client.graph_upsert_batched(proj_nodes, proj_edges)
+    except Exception:
+        # Best-effort projection: a client/transport failure must never fail the
+        # promotion (same contract as _fire's own swallow).
+        pass
     print(promoted)
     return promoted
