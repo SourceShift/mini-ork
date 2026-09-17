@@ -13,6 +13,7 @@ mini-ork reads from and writes to a local [ContextNest](https://github.com/Sourc
 | **PR-4 worker prompt wiring** (`MO_CN_PREFETCH_DIR` + Step 0 prompt sections) | ✅ shipped | mini-ork eb9bd5d + restoration #22 |
 | **PR-5 composed CN endpoint** | ⏸ gated on PR-3 latency measurement | — |
 | **PR-6 outcome feedback loop** (EvoMem pattern) | ⏸ planned | — |
+| **Graph projection** (`POST /api/v1/graph/upsert` written best-effort from the learning pipeline) | ✅ shipped | mini-ork #204 |
 
 Full epic spec: `docs/roadmap/epics/agent-context-pack.md` in the ContextNest repo.
 
@@ -48,6 +49,7 @@ Bash wrapper over CN's HTTP API. Every call has a tight timeout and a silent fal
 | `cn_basins [project] [limit]` | **PR-3.** Topic-cluster basins (attractor-formed) | `GET /api/v1/field/basins` |
 | `cn_connections_for <node_id> [limit]` | **PR-3.** Graph neighbours of a fragment | `GET /api/v1/connections` |
 | `cn_hook_post <event> <session_id> [cwd] [transcript]` | Fire-and-forget hook POST | `POST /api/v1/cc/hook/<event>` |
+| `graph_upsert [nodes] [edges] [source]` | **Graph projection.** Best-effort upsert of `Run`/`Trace`/`GradientTarget`/`TaskClass` nodes + `HAS_TRACE`/`LINKED_TO`/`OF_CLASS` edges, chunked at 500 combined items per request | `POST /api/v1/graph/upsert` |
 | `cn_render_atoms_md <json> [limit]` | JSON hits → markdown block | (client-side render) |
 | `cn_render_features_md <json> [cwd] [limit]` | **PR-3.** Features list → markdown block | (client-side render) |
 | `cn_render_inbox_md <json> [limit]` | **PR-3.** Inbox items → markdown block | (client-side render) |
@@ -136,7 +138,13 @@ All harnesses produce evidence files with per-assertion verdicts + captured outp
 
 ## What's NOT in scope
 
-- **No direct CN write path from mini-ork.** Canonical writes go through CN's session-ingest pipeline only.
+- **No direct CN write path from mini-ork — with one deliberate exception.** Canonical
+  **memory** writes go through CN's session-ingest pipeline only. The **graph projection**
+  (`POST /api/v1/graph/upsert` via `graph_upsert`, called best-effort from the learning
+  pipeline) is that exception, and it is not a second canonical write path: it projects
+  *derived* entities (`Run`/`Trace`/`GradientTarget`/`TaskClass` and their edges) that
+  mini-ork already owns in its own sqlite. It is fire-and-forget — the substrate is
+  unaffected when CN is unavailable, and no projection failure can fail a learning run.
 - **No fallback to a different memory backend.** When CN is down, mini-ork's local sqlite (`task_memory`, `failure_memory`) carries the load alone.
 - **No training of a retrieve-gating model.** Threshold-based gates only; revisit if signal proves weak.
 - **No tool-call-level instrumentation.** Hook framework only — substrate ingest stays at session-transcript granularity.
