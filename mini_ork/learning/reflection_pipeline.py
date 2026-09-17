@@ -29,6 +29,8 @@ import sys
 import time
 from difflib import SequenceMatcher
 
+from mini_ork import cn_client
+
 __all__ = [
     "reflection_extract_gradients",
     "reflection_deduplicate",
@@ -225,8 +227,15 @@ def _link_failures_insert(db_path: str, ftbl: str) -> int:
 
     Note: counter increments per (failure × gradient) pair even when INSERT
     OR IGNORE skipped the row — this matches bash's behaviour verbatim.
+
+    Each kept link is also projected onto CN's graph (Trace → GradientTarget
+    LINKED_TO, plus OF_CLASS edges to the trace's task class). The projection is
+    accumulated and emitted once, after the commit — a per-row call would spawn
+    one daemon thread per row (2023 on a full backfill).
     """
     con = _connect(db_path)
+    proj_nodes: list[dict] = []
+    proj_edges: list[dict] = []
     try:
         con.execute(
             """
@@ -246,10 +255,15 @@ def _link_failures_insert(db_path: str, ftbl: str) -> int:
         inserted = 0
         for tid, tc in failures:
             gradients = con.execute(
-                "SELECT gradient_id FROM gradient_records WHERE evidence=?",
+                "SELECT gradient_id, target, signal, confidence "
+                "FROM gradient_records WHERE evidence=?",
                 (tid,),
             ).fetchall()
-            for (gid,) in gradients:
+            for gid, target, signal, confidence in gradients:
+                if not gid:
+                    # gradient_id is nullable — a NULL segment would both break
+                    # the link_id format below and project a junk node.
+                    continue
                 link_id = f"fl-{tid[:8]}-{gid[:8]}"
                 con.execute(
                     """
@@ -260,9 +274,39 @@ def _link_failures_insert(db_path: str, ftbl: str) -> int:
                     (link_id, tid, gid, tc, now),
                 )
                 inserted += 1
+                nodes = cn_client._graph_ids(
+                    trace_id=tid, task_class=tc, gradient_id=gid
+                )
+                if "Trace" not in nodes or "GradientTarget" not in nodes:
+                    continue
+                nodes["Trace"]["props"] = {
+                    "status": "failure", "task_class": tc, "reward_g": 0.0,
+                }
+                nodes["GradientTarget"]["props"] = {
+                    "target": target, "signal": signal, "confidence": confidence,
+                }
+                proj_nodes.extend(nodes.values())
+                proj_edges.append(
+                    cn_client._graph_edge("LINKED_TO", "Trace", "GradientTarget", nodes)
+                )
+                if "TaskClass" in nodes:
+                    proj_edges.append(
+                        cn_client._graph_edge("OF_CLASS", "Trace", "TaskClass", nodes)
+                    )
+                    proj_edges.append(
+                        cn_client._graph_edge(
+                            "OF_CLASS", "GradientTarget", "TaskClass", nodes
+                        )
+                    )
         con.commit()
     finally:
         con.close()
+    try:
+        cn_client.graph_upsert_batched(proj_nodes, proj_edges)
+    except Exception:
+        # Best-effort projection: a client/transport failure must never fail the
+        # link step (same contract as _fire's own swallow).
+        pass
     return inserted
 
 

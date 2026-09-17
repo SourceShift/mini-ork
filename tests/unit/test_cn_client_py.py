@@ -153,6 +153,14 @@ class _Handler(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         ln = int(self.headers.get("Content-Length", 0))
         raw = self.rfile.read(ln) if ln else b"{}"
+        # graph/upsert — record the fire-and-forget projection body, 200 (mirrors CN).
+        if self.path.startswith("/api/v1/graph/upsert"):
+            try:
+                self.server.graph_upserts.append(json.loads(raw))
+            except Exception:
+                self.server.graph_upserts.append({})
+            self._send('{"accepted":0,"nodes_upserted":0,"edges_upserted":0,"skipped":true}')
+            return
         # cc/hook/<event> — record the fire-and-forget hook and 204 (mirrors CN).
         if self.path.startswith("/api/v1/cc/hook/"):
             event = self.path.rsplit("/", 1)[-1]
@@ -179,6 +187,7 @@ _CAPSULE_MD = (
 def _server():
     srv = http.server.HTTPServer(("127.0.0.1", 0), _Handler)
     srv.hook_events = []  # cc/hook POSTs land here (fire-and-forget, polled)
+    srv.graph_upserts = []  # graph/upsert bodies land here (fire-and-forget, polled)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     return srv, f"http://127.0.0.1:{srv.server_address[1]}"
 
@@ -193,6 +202,18 @@ def _poll_hooks(srv, want: int, timeout: float = 5.0):
             break
         _t.sleep(0.05)
     return list(srv.hook_events)
+
+
+def _poll_graph(srv, want: int, timeout: float = 5.0):
+    """graph_upsert goes through `_fire` (daemon thread) — same polling contract
+    as `_poll_hooks`, or the assertion races the thread."""
+    import time as _t
+    deadline = _t.time() + timeout
+    while _t.time() < deadline:
+        if len(srv.graph_upserts) >= want:
+            break
+        _t.sleep(0.05)
+    return list(srv.graph_upserts)
 
 
 def test_http_round_trips(tmp_path):
@@ -272,3 +293,79 @@ def test_available_hook_capsule(tmp_path):
             assert e["body"].get("hook_event_name") == "session_start"
     finally:
         srv.shutdown()
+
+
+# ---- 5. graph projection (graph_upsert / graph_upsert_batched) ----
+
+def test_graph_upsert_posts_body(tmp_path):
+    """The projection POSTs the exact body: nodes, edges, source.
+
+    The payload must be built through the shared id convention, so edge
+    endpoints and node ids are the same strings — the server matches an edge
+    endpoint against node ids and silently drops the edge when they differ."""
+    srv, base = _server()
+    old = dict(os.environ)
+    os.environ.update({"CN_BASE_URL": base, "MINI_ORK_HOME": str(tmp_path / "gu"),
+                       "CN_TIMEOUT_SEC": "5", "CN_HOOK_TIMEOUT_SEC": "5",
+                       "CN_PING_TTL": "0"})
+    try:
+        nodes = cn._graph_ids(trace_id="tr-1", task_class="code_fix", gradient_id="gr-1")
+        nodes["Trace"]["props"] = {"status": "failure", "task_class": "code_fix",
+                                   "reward_g": 0.0}
+        edges = [cn._graph_edge("LINKED_TO", "Trace", "GradientTarget", nodes)]
+        assert cn.graph_upsert(list(nodes.values()), edges) == 0
+        # _fire is a daemon thread — poll while the env still points at the mock,
+        # or the thread resolves the default CN_BASE_URL instead.
+        got = _poll_graph(srv, want=1, timeout=5.0)
+    finally:
+        os.environ.clear(); os.environ.update(old)
+        srv.shutdown()
+
+    # an empty key yields no node rather than an empty-string id
+    assert "TaskClass" not in cn._graph_ids(task_class="")
+    assert len(got) == 1, f"expected exactly 1 upsert POST, got {got}"
+    assert got[0] == {"nodes": list(nodes.values()), "edges": edges,
+                      "source": "mini-ork"}
+
+
+def test_graph_upsert_disabled_makes_no_request(tmp_path):
+    """MO_DISABLE_CN=1 short-circuits before any network call."""
+    srv, base = _server()
+    old = dict(os.environ)
+    os.environ.update({"CN_BASE_URL": base, "MINI_ORK_HOME": str(tmp_path / "gd"),
+                       "CN_HOOK_TIMEOUT_SEC": "5", "MO_DISABLE_CN": "1"})
+    try:
+        cn.graph_upsert([{"id": "run-1", "label": "Run", "props": {}}], [])
+        got = _poll_graph(srv, want=1, timeout=0.3)
+    finally:
+        os.environ.clear(); os.environ.update(old)
+        srv.shutdown()
+    assert got == []
+
+
+def test_graph_upsert_batched_chunks_combined_items(tmp_path):
+    """600 nodes + 600 edges must arrive as several requests, none over the
+    500-item budget — a single request is the 413 the server returns."""
+    srv, base = _server()
+    old = dict(os.environ)
+    os.environ.update({"CN_BASE_URL": base, "MINI_ORK_HOME": str(tmp_path / "gb"),
+                       "CN_TIMEOUT_SEC": "5", "CN_HOOK_TIMEOUT_SEC": "5",
+                       "CN_PING_TTL": "0"})
+    nodes = [{"id": f"tr-{i}", "label": "Trace", "props": {}} for i in range(600)]
+    edges = [{"from": f"tr-{i}", "from_label": "Trace", "type": "LINKED_TO",
+              "to": f"gr-{i}", "to_label": "GradientTarget", "props": {}}
+             for i in range(600)]
+    try:
+        requests = cn.graph_upsert_batched(nodes, edges)
+        got = _poll_graph(srv, want=requests, timeout=5.0)
+    finally:
+        os.environ.clear(); os.environ.update(old)
+        srv.shutdown()
+
+    assert requests > 1, "600 + 600 items must not fit in one request"
+    assert len(got) == requests
+    for body in got:
+        assert len(body["nodes"]) + len(body["edges"]) <= 500
+    # every item is sent exactly once across the chunks
+    assert sum(len(b["nodes"]) for b in got) == 600
+    assert sum(len(b["edges"]) for b in got) == 600

@@ -37,12 +37,13 @@ def _sql(db, s):
     return subprocess.run(["sqlite3", db, s], capture_output=True, text=True)
 
 
-def _insert_trace(db, tid, av, status, cost, dur, validity=None, verdict=""):
+def _insert_trace(db, tid, av, status, cost, dur, validity=None, verdict="",
+                  run_id="r1"):
     cols = ("trace_id,run_id,workflow_version_id,agent_version_id,task_class,"
             "prompt_version_hash,context_bundle_hash,tool_calls,files_read,"
             "files_written,verifier_output,reviewer_verdict,cost_usd,duration_ms,"
             "final_artifact_ref,status,created_at")
-    vals = (f"'{tid}','r1','wf1','{av}','code_fix','ph','ch','[]','[]','[]',"
+    vals = (f"'{tid}','{run_id}','wf1','{av}','code_fix','ph','ch','[]','[]','[]',"
             f"'{{\"node_type\":\"researcher\"}}','{verdict}',{cost},{dur},'','{status}',"
             f"'2026-07-01T00:00:00Z'")
     if validity is not None:
@@ -60,6 +61,18 @@ def _adv(db, av):
         "SELECT printf('%.6f',relative_advantage) FROM agent_performance_memory "
         f"WHERE agent_version_id='{av}';",
     ).stdout.strip()
+
+
+@pytest.fixture(autouse=True)
+def _no_cn(monkeypatch):
+    """write_grpo_advantages must never reach a live CN from a unit test — the
+    graph projection is best-effort, so record the payloads here instead."""
+    calls: list[tuple[list, list]] = []
+    monkeypatch.setattr(
+        "mini_ork.cn_client.graph_upsert_batched",
+        lambda nodes, edges, source="mini-ork": calls.append((nodes, edges)),
+    )
+    return calls
 
 
 @pytest.fixture(autouse=True)
@@ -147,3 +160,26 @@ def test_failure_status_scores_via_base_band_not_early_return(tmp_path):
     assert (float(_adv(db, "beta_lane"))
             < float(_adv(db, "alpha_lane"))
             < float(_adv(db, "gamma_lane")))
+
+
+def test_projection_skips_empty_run_id(tmp_path, _no_cn):
+    # Run / Trace / HAS_TRACE are projected from the rows already in hand. A row
+    # with the empty run_id that 260 of 2650 live rows carry must project
+    # nothing — an empty id would create a junk Run node and an edge to it.
+    db = _seed_db(tmp_path, "proj")
+    _insert_trace(db, "t1", "opus_lens", "success", 1.0, 1000, run_id="run-real-1")
+    _insert_trace(db, "t2", "kimi_lens", "failure", 0.5, 800, run_id="")
+    write_grpo_advantages(db)
+
+    assert len(_no_cn) == 1, f"expected one batched emit, got {_no_cn}"
+    nodes, edges = _no_cn[0]
+    assert [n["id"] for n in nodes if n["label"] == "Run"] == ["run-real-1"]
+    traces = {n["id"]: n for n in nodes if n["label"] == "Trace"}
+    assert set(traces) == {"t1"}
+    assert "t2" not in {n["id"] for n in nodes}
+    # reward_g is reward(row): opus is a family lane (no verdict band), so a
+    # success scores the 0.85 base.
+    assert traces["t1"]["props"] == {"status": "success", "task_class": "code_fix",
+                                     "reward_g": 0.85}
+    assert edges == [{"from": "run-real-1", "from_label": "Run", "type": "HAS_TRACE",
+                      "to": "t1", "to_label": "Trace", "props": {}}]

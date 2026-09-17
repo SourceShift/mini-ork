@@ -224,6 +224,91 @@ def outcome_post(outcome: str, atom_ids_csv: str = "", evidence: str = "", sessi
     return 0
 
 
+# ── graph projection (PR-6): mini-ork learning entities → CN's durable graph ──
+#
+# The server whitelists node labels and edge triples (anything else is a 400)
+# and matches an edge endpoint against node ids, so the id convention and the
+# triple table live here rather than being re-spelled at each call site.
+
+_GRAPH_CHUNK_MAX = 500
+_GRAPH_EDGE_TRIPLES = frozenset({
+    ("HAS_TRACE", "Run", "Trace"),
+    ("LINKED_TO", "Trace", "GradientTarget"),
+    ("OF_CLASS", "Trace", "TaskClass"),
+    ("OF_CLASS", "GradientTarget", "TaskClass"),
+})
+
+
+def _graph_ids(trace_id=None, task_class=None, gradient_id=None, run_id=None) -> dict:
+    """Build the ``{label: node}`` map for one projection, dropping empty keys.
+
+    Ids are the raw keys — no ``run:``/``trace:`` prefix — and ``TaskClass``
+    carries the bare class name because that is what the server stores in
+    ``name``. An empty/NULL key yields no node: an empty-string id would create
+    a junk node that every read route then returns.
+
+    An edge endpoint that does not byte-equal a node id silently matches
+    nothing server-side (200 plus a plausible-looking count), so callers must
+    build edges with :func:`_graph_edge` from this same map.
+    """
+    out = {}
+    for label, key in (("Run", run_id), ("Trace", trace_id),
+                       ("GradientTarget", gradient_id), ("TaskClass", task_class)):
+        if key is None or not str(key):
+            continue
+        out[label] = {"id": str(key), "label": label, "props": {}}
+    return out
+
+
+def _graph_edge(edge_type: str, from_label: str, to_label: str, nodes: dict,
+                props: dict | None = None) -> dict:
+    """Build an edge whose endpoints are the ids of `nodes` — never a hand-built
+    string, which is how a projection silently loses edges."""
+    if (edge_type, from_label, to_label) not in _GRAPH_EDGE_TRIPLES:
+        raise ValueError(
+            f"graph edge triple not whitelisted: {edge_type}/{from_label}/{to_label}"
+        )
+    return {"from": nodes[from_label]["id"], "from_label": from_label,
+            "type": edge_type, "to": nodes[to_label]["id"],
+            "to_label": to_label, "props": props or {}}
+
+
+def graph_upsert(nodes: list, edges: list, source: str = "mini-ork") -> int:
+    """Project learning entities into ContextNest's graph. Best-effort: returns 0
+    and does nothing when CN is disabled or unreachable."""
+    if _disabled() or not available():
+        return 0
+    if not nodes and not edges:
+        return 0
+    _fire("/api/v1/graph/upsert", json.dumps({"nodes": nodes, "edges": edges,
+                                              "source": source}))
+    return 0
+
+
+def graph_upsert_batched(nodes: list, edges: list, source: str = "mini-ork") -> int:
+    """Chunked :func:`graph_upsert`; returns the number of requests fired.
+
+    The server 413s above 2000 combined items and a full ``failure_links``
+    backfill is 2023 rows, so a single request would be rejected. Slicing on the
+    COMBINED count matters: 500 nodes plus 500 edges is 1000 items, not two
+    chunks.
+    """
+    if _disabled() or not available():
+        return 0
+    sent = 0
+    n_i = e_i = 0
+    while n_i < len(nodes) or e_i < len(edges):
+        room = _GRAPH_CHUNK_MAX
+        chunk_nodes = nodes[n_i:n_i + room]
+        room -= len(chunk_nodes)
+        chunk_edges = edges[e_i:e_i + room]
+        n_i += len(chunk_nodes)
+        e_i += len(chunk_edges)
+        graph_upsert(chunk_nodes, chunk_edges, source)
+        sent += 1
+    return sent
+
+
 # --- render_* : transcribed verbatim from the bash's embedded python ---
 
 def render_atoms_md(payload: str, limit: int = 5) -> str:

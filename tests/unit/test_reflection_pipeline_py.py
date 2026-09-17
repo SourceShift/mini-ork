@@ -56,6 +56,19 @@ def temp_db(tmp_path_factory, monkeypatch):
     return dbp
 
 
+@pytest.fixture(autouse=True)
+def _no_cn(monkeypatch):
+    """The learning pipeline must never reach a live CN from a unit test — the
+    graph projection call sites are best-effort, so record the payloads here
+    instead of firing them."""
+    calls: list[tuple[list, list]] = []
+    monkeypatch.setattr(
+        "mini_ork.cn_client.graph_upsert_batched",
+        lambda nodes, edges, source="mini-ork": calls.append((nodes, edges)),
+    )
+    return calls
+
+
 def _seed_epic_run(con: sqlite3.Connection, epic_id: str, run_dir: str) -> int:
     """Insert a minimal epic + run row; return the new runs.id."""
     con.execute(
@@ -424,6 +437,69 @@ def test_reflection_link_failures(temp_db):
     assert lid == "fl-trace-fa-gid-fail", f"unexpected link_id {lid!r}"
     assert tid == "trace-fail-1", f"first-writer wins: tid={tid!r}"
     assert gid == "gid-fail-1-a", f"first-writer wins: gid={gid!r}"
+
+
+def test_link_failures_projects_trace_and_gradient(temp_db, _no_cn):
+    """A kept link also projects Trace + GradientTarget + LINKED_TO onto the graph.
+
+    Edge endpoints must byte-equal the node ids: the server matches an endpoint
+    against node ids and drops the edge (with a 200) when they differ. A NULL
+    gradient_id row and an empty task_class row must produce no node.
+    """
+    now = int(time.time())
+    con = sqlite3.connect(temp_db)
+    run_id = _seed_epic_run(con, "epic-proj", "run-proj")
+    for trace_id, task_class in (("trace-proj-fail", "code_fix"),
+                                 ("trace-proj-blank", ""),
+                                 ("trace-proj-null", "code_fix")):
+        con.execute(
+            "INSERT INTO execution_traces(trace_id, run_id, task_class, status, created_at) "
+            "VALUES (?, ?, ?, 'failure', '2026-07-04T00:00:00.000Z')",
+            (trace_id, run_id, task_class),
+        )
+    for gid, target, evidence in (
+        ("gr-proj-1", "agent.reviewer.prompt", "trace-proj-fail"),
+        (None,       "agent.planner.prompt",  "trace-proj-null"),
+        ("gr-proj-3", "verifier.lens",        "trace-proj-blank"),
+    ):
+        con.execute(
+            "INSERT INTO gradient_records(gradient_id, target, signal, suggested_change, "
+            "evidence, confidence, created_at, task_class) VALUES (?,?,?,?,?,?,?,?)",
+            (gid, target, f"sig-{target}", "c", evidence, 0.8, now, "code_fix"),
+        )
+    con.commit()
+    con.close()
+
+    # The NULL-gradient row is skipped entirely (its link_id would be malformed).
+    assert rp._link_failures_insert(temp_db, "execution_traces") == 2
+
+    assert len(_no_cn) == 1, f"expected one batched emit, got {_no_cn}"
+    nodes, edges = _no_cn[0]
+    by_label: dict[str, list] = {}
+    for n in nodes:
+        by_label.setdefault(n["label"], []).append(n)
+
+    trace = next(n for n in by_label["Trace"] if n["id"] == "trace-proj-fail")
+    assert trace["props"] == {"status": "failure", "task_class": "code_fix",
+                              "reward_g": 0.0}
+    gradient = next(n for n in by_label["GradientTarget"] if n["id"] == "gr-proj-1")
+    assert gradient["props"] == {"target": "agent.reviewer.prompt",
+                                 "signal": "sig-agent.reviewer.prompt",
+                                 "confidence": 0.8}
+
+    # no TaskClass for the blank class, no node at all for the NULL-gradient row
+    assert {n["id"] for n in by_label["TaskClass"]} == {"code_fix"}
+    assert {n["id"] for n in by_label["Trace"]} == {"trace-proj-fail",
+                                                    "trace-proj-blank"}
+    assert {n["id"] for n in by_label["GradientTarget"]} == {"gr-proj-1", "gr-proj-3"}
+
+    assert {"from": "trace-proj-fail", "from_label": "Trace", "type": "LINKED_TO",
+            "to": "gr-proj-1", "to_label": "GradientTarget",
+            "props": {}} in edges
+    node_ids = {n["id"] for n in nodes}
+    assert all(n["id"] for n in nodes)  # never an empty-string id
+    for e in edges:
+        assert e["from"] in node_ids and e["to"] in node_ids
 
 
 # ─────────────────────────────────────────────────────────────────────────────
