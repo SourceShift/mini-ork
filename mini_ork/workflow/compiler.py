@@ -43,6 +43,11 @@ class WorkflowNode:
     model_lane: str = ""
     dispatch_mode: str = "serial"
     requires_capabilities: tuple[str, ...] = ()
+    # Capability envelope (SE-3 Phase B2): harness-level declarations that
+    # travel with the node to dispatch (MO_MCP_SERVERS/MO_SKILLS/MO_AGENT_DOC).
+    mcp_servers: tuple[str, ...] = ()
+    skills: tuple[str, ...] = ()
+    agent_doc: str = ""
     inputs: dict[str, ArtifactInput] = field(default_factory=dict)
     outputs: dict[str, ArtifactOutput] = field(default_factory=dict)
     transform: str = ""
@@ -163,6 +168,16 @@ def _node_from_yaml(raw: Any) -> WorkflowNode:
         capabilities = tuple(str(part).strip() for part in requires if str(part).strip())
     else:
         raise WorkflowCompileError(f"node {name} requires_capabilities must be a string or list")
+    def _str_tuple(raw: Any) -> tuple[str, ...]:
+        if isinstance(raw, str):
+            return tuple(part.strip() for part in raw.split(",") if part.strip())
+        if isinstance(raw, list):
+            return tuple(str(part).strip() for part in raw if str(part).strip())
+        return ()
+
+    mcp_servers = _str_tuple(details.get("mcp_servers"))
+    skills = _str_tuple(details.get("skills"))
+    agent_doc = str(details.get("agent_doc") or "").strip()
     transform = str(details.get("transform") or "").strip()
     if node_type == "transform" and not transform:
         raise WorkflowCompileError(f"transform node {name} requires a transform identifier")
@@ -183,6 +198,9 @@ def _node_from_yaml(raw: Any) -> WorkflowNode:
         model_lane=str(details.get("model_lane") or ""),
         dispatch_mode=str(details.get("dispatch_mode") or "serial"),
         requires_capabilities=capabilities,
+        mcp_servers=mcp_servers,
+        skills=skills,
+        agent_doc=agent_doc,
         inputs=inputs,
         outputs=outputs,
         transform=transform,

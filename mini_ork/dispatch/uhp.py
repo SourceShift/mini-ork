@@ -28,6 +28,13 @@ Configuration rides on the environment the provider builder injects:
     MO_UHP_SESSION_FILE  sidecar path for ``previous_response_id`` continuation
     MO_UHP_ERR_LOG       sidecar path for the ``[uhp] <class>: <msg>`` error line
 
+Capability envelope (SE-3 Phase B2) — published at the node boundary, sent as
+payload fields for the harness server to translate per target harness:
+
+    MO_MCP_SERVERS       comma-separated MCP server names  → ``mcp_servers``
+    MO_SKILLS            comma-separated skill names       → ``skills``
+    MO_AGENT_DOC         agent-doc path/text               → ``agent_doc``
+
 ``--print --output-format text`` are accepted as no-op flags so the argv shape
 matches every other harness CLI the dispatcher spawns.
 """
@@ -75,6 +82,10 @@ def _read_prompt(argv: list[str]) -> str:
     if not sys.stdin.isatty():
         return sys.stdin.read()
     return ""
+
+
+def _csv_env(name: str) -> list[str]:
+    return [tok.strip() for tok in (os.environ.get(name) or "").split(",") if tok.strip()]
 
 
 def _split_url(url: str) -> tuple[str, int, bool]:
@@ -297,6 +308,19 @@ def run(argv: list[str]) -> int:
     previous_id = _read_previous_session_id()
     if previous_id:
         payload["previous_response_id"] = previous_id
+    # Capability envelope (SE-3 Phase B2): the node boundary publishes
+    # MO_MCP_SERVERS/MO_SKILLS/MO_AGENT_DOC; on the UHP wire they ride the
+    # request payload and the harness SERVER translates them into the target
+    # harness's native format (.mcp.json / config.toml / skill dirs / AGENTS.md).
+    mcp_servers = _csv_env("MO_MCP_SERVERS")
+    if mcp_servers:
+        payload["mcp_servers"] = mcp_servers
+    skills = _csv_env("MO_SKILLS")
+    if skills:
+        payload["skills"] = skills
+    agent_doc = (os.environ.get("MO_AGENT_DOC") or "").strip()
+    if agent_doc:
+        payload["agent_doc"] = agent_doc
 
     resp_tuple = _post_sse(base_url, payload, api_key, timeout_s)
     conn, resp, err_class = resp_tuple

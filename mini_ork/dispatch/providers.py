@@ -19,7 +19,13 @@ import yaml
 
 from ..context import context_env, context_env_snapshot
 from .core import dispatch
-from .models import DispatchRequest, DispatchResult, TokenUsage
+from .models import (
+    DispatchRequest,
+    DispatchResult,
+    ENVELOPE_REJECT_RC,
+    TokenUsage,
+    envelope_from_env,
+)
 from .secrets import SecretStoreError, read_secret_exports, secret_store_path
 
 # Lanes with a non-Claude CLI. Codex + opencode use native Python transports;
@@ -261,6 +267,10 @@ class ProviderSpec:
     parse_session: object | None = None  # SessionParser | None (E4)
     env: Mapping[str, str] = field(default_factory=dict)
     unset_env: frozenset[str] = field(default_factory=frozenset)
+    # Provider kind (e.g. "uhp") — lets dispatch_model pick the engine by
+    # transport shape, not just model name (B2: uhp lanes accept the full
+    # capability envelope on the wire).
+    kind: str = ""
 
 
 # Provider family recorded in llm_calls.provider, per built-in lane.
@@ -531,6 +541,7 @@ def _build_uhp(name, entry, root, extra_env, model_id) -> ProviderSpec:
         model=name,
         command=(sys.executable, str(script), "--print", "--output-format", "text"),
         env=env,
+        kind="uhp",
     )
 
 
@@ -831,7 +842,27 @@ def dispatch_model(
         return DispatchResult(ok=False, rc=2, error=str(exc), model=request.model)
     # Engine-scoped argv rewrite (SE-3 Phase A.3): every model is mapped to
     # a harness engine object and receives that engine's command rewrite behavior.
-    engine = ENGINES.get(engine_of(request.model), _DEFAULT_ENGINE)
+    # B2: a spec-declared kind (uhp) picks its engine by transport shape.
+    engine_name = spec.kind if spec.kind in ENGINES else engine_of(request.model)
+    engine = ENGINES.get(engine_name, _DEFAULT_ENGINE)
+    # Capability envelope (SE-3 Phase B2): the node boundary publishes
+    # MO_MCP_SERVERS/MO_SKILLS/MO_AGENT_DOC (contextvar + os.environ). Lift
+    # them into effective_env once so the engine check, the claude grants
+    # merge, and the spawned transport env all see the same values.
+    envelope = envelope_from_env(context_env)
+    if not envelope.is_empty():
+        effective_env = {**effective_env, **envelope.as_env()}
+        unsupported = envelope.unsupported_axes(engine.capabilities())
+        if unsupported:
+            return DispatchResult(
+                ok=False,
+                rc=ENVELOPE_REJECT_RC,
+                error=(
+                    f"capability envelope not supported by engine "
+                    f"{engine_name!r}: {', '.join(unsupported)}"
+                ),
+                model=request.model,
+            )
     command = engine.build_command(spec.command, request=request, env=effective_env)
     if command != spec.command:
         spec = replace(spec, command=command)
@@ -1106,9 +1137,21 @@ def apply_tool_grants(
     if not command or command[0] != "claude":
         return tuple(command)
     resolved = _resolve_node_tools(env)
-    if not resolved or "|" not in resolved:
+    native_csv, mcp_csv = ("", "")
+    if resolved and "|" in resolved:
+        native_csv, mcp_csv = resolved.split("|", 1)
+    # Capability envelope (B2): a node's declared mcp_servers union into the
+    # MCP grant set — the same --allowedTools/--mcp-config materialization as
+    # tools-block grants, so a recipe can pin server access without a tools
+    # block and routed-away lanes can't silently drop it (they reject instead).
+    envelope_servers = [
+        tok.strip() for tok in (env.get("MO_MCP_SERVERS") or "").split(",") if tok.strip()
+    ]
+    if envelope_servers:
+        merged = {tok for tok in mcp_csv.split(",") if tok.strip()} | set(envelope_servers)
+        mcp_csv = ",".join(sorted(merged))
+    if not native_csv and not mcp_csv:
         return tuple(command)
-    native_csv, mcp_csv = resolved.split("|", 1)
     allowed = _build_allowed_tools_arg(native_csv, mcp_csv)
     if not allowed:
         return tuple(command)
@@ -1175,6 +1218,12 @@ class Capabilities:
     session_capture: bool = False
     # Descriptive only; does not alter dispatch routing.
     byo_endpoint: bool = False
+    # Accepts the capability-envelope axes (SE-3 Phase B2): mcp_servers is
+    # materialized into --mcp-config by the claude builder; skills/agent_doc
+    # have no claude-CLI translation yet (honest False until one exists).
+    mcp_servers: bool = False
+    skills: bool = False
+    agent_doc: bool = False
 
 
 def _claude_command_builder(
@@ -1262,6 +1311,7 @@ class ClaudeEngine(HarnessEngine):
                 tool_grants=True,
                 resume=True,
                 session_capture=True,
+                mcp_servers=True,
             ),
             command_builder=_claude_command_builder,
         )
@@ -1305,10 +1355,31 @@ class SidecarTelemetryEngine(HarnessEngine):
                     pass
 
 
+class UhpEngine(HarnessEngine):
+    """UHP wire engine (B1/B2): the capability envelope rides the
+    /v1/responses payload (mcp_servers/skills/agent_doc), and the harness
+    SERVER translates it into the target harness's native format — mini-ork
+    only consumes the wire, so every axis is accepted here. Session
+    continuation is the transport's previous_response_id + MO_UHP_SESSION_FILE
+    sidecar (resume); no session_id is parsed back out of the stream yet, so
+    session_capture stays honestly False until a parser is wired."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            capabilities=Capabilities(
+                resume=True,
+                mcp_servers=True,
+                skills=True,
+                agent_doc=True,
+            ),
+        )
+
+
 ENGINES: dict[str, HarnessEngine] = {
     'claude': ClaudeEngine(),
     'codex': SidecarTelemetryEngine(byo_endpoint=True),
     'opencode': SidecarTelemetryEngine(),
+    'uhp': UhpEngine(),
 }
 _DEFAULT_ENGINE = ENGINES['claude']
 

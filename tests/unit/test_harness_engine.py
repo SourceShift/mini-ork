@@ -33,8 +33,9 @@ def _resp(*, usage: TokenUsage | None = None, cost_usd: float = 0.0) -> Dispatch
     )
 
 
-def test_engines_is_three_and_expected():
-    assert set(ENGINES.keys()) == {"claude", "codex", "opencode"}
+def test_engines_is_four_and_expected():
+    # B2 adds the uhp wire engine (envelope accepted on /v1/responses).
+    assert set(ENGINES.keys()) == {"claude", "codex", "opencode", "uhp"}
 
 
 def test_executable_engines_are_tool_grant_false_ratchet():
