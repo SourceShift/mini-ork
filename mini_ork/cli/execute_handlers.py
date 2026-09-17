@@ -665,6 +665,14 @@ def _handle_reviewer(ctx: NodeDispatch):
         return 1, "artifact_contract"
     verdict = _extract_verdict(ctx.root, review_file)
     print(f"  [info] reviewer verdict={verdict} → {review_file}")
+    # Hand the verdict to the publisher node, which reads REVIEW_FILE/VERDICT from
+    # the environment (see _publisher_try_commit_files below). Without this the
+    # publisher's review_file/verdict_env are always "", its only other verdict
+    # candidates (panel-verdict.json, review-verdict.json) are never written by
+    # recipes like code-fix, and publish is skipped unconditionally — so no recipe
+    # that relies on a classic reviewer could ever commit. publish_env leaks to
+    # os.environ by design, which is what carries these across node boundaries.
+    publish_env({"REVIEW_FILE": review_file, "VERDICT": verdict})
     vn = verdict.lower()
     if is_synth:  # true synth only — panel gate falls through to the verdict gate
         # BUG6: a synthesizer produces a document, not a pass/fail verdict, so
