@@ -106,6 +106,18 @@ def test_render_graph_path_md():
     # no route between the two endpoints is rendered as silence
     assert cn.render_graph_path_md('{"found": false}', 3) == ""
     assert cn.render_graph_path_md('not json', 3) == ""
+    # a path that fits within `limit` spells out every hop
+    three = json.dumps({"found": True, "nodes": [c * 8 for c in "abc"],
+                        "hops": 2, "total_weight": 1.0, "algorithm": "dijkstra"})
+    assert "- aaaaaaaa -> bbbbbbbb -> cccccccc" in cn.render_graph_path_md(three, 3)
+    # regression: a path longer than `limit` must keep the TRUE endpoints.
+    # Slicing nodes[:limit] before picking dst relabelled a middle hop as the
+    # destination, so the section claimed a connection between the wrong pair.
+    long_path = json.dumps({"found": True, "nodes": [c * 8 for c in "abcdef"],
+                            "hops": 5, "total_weight": 2.5, "algorithm": "dijkstra"})
+    rp_long = cn.render_graph_path_md(long_path, 3)
+    assert "- aaaaaaaa -> ffffffff (5 hops, w=2.50, dijkstra)" in rp_long
+    assert "cccccccc" not in rp_long
 
 
 def test_render_empty_and_bad_json():

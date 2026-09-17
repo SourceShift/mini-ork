@@ -340,16 +340,23 @@ def render_graph_path_md(payload: str, limit: int = 3) -> str:
         return ""
     if not d.get("found"):
         return ""
-    nodes = d.get("nodes") or []
+    nodes = [n for n in (d.get("nodes") or []) if n]
     if not nodes:
         return ""
-    nodes = nodes[:int(limit)]
-    src = (nodes[0] or "")[:8]
-    dst = (nodes[-1] or "")[:8]
+    # `limit` decides whether the intermediate hops are worth spelling out — it
+    # must NOT be applied before picking the endpoints, or a path longer than
+    # the limit would print a middle hop as the destination. Truncating to the
+    # endpoint pair keeps both ends truthful.
+    if len(nodes) > int(limit):
+        nodes = [nodes[0], nodes[-1]]
     hops = d.get("hops") or 0
-    total_weight = d.get("total_weight") or 0
+    try:
+        total_weight = float(d.get("total_weight") or 0.0)
+    except (TypeError, ValueError):
+        total_weight = 0.0
     algorithm = d.get("algorithm") or "?"
+    chain = " -> ".join(n[:8] for n in nodes)
     out = ["--- ContextNest graph — how the top two memories connect ---",
-           f"- {src} -> {dst} ({hops} hops, w={total_weight:.2f}, {algorithm})",
+           f"- {chain} ({hops} hops, w={total_weight:.2f}, {algorithm})",
            "--- /graph path ---"]
     return "\n".join(out) + "\n"
