@@ -68,6 +68,64 @@ def test_prior_runs_md(db, monkeypatch):
     assert "r1: success" in py and "1/2 nodes failed" in py
 
 
+def _seed_failure_links(db):
+    """DDL mirrors reflection_pipeline._link_failures_insert — the table is
+    created on demand there, never by db/init.sh."""
+    con = sqlite3.connect(db)
+    con.execute(
+        """
+        CREATE TABLE IF NOT EXISTS failure_links (
+            link_id      TEXT PRIMARY KEY,
+            trace_id     TEXT NOT NULL,
+            gradient_id  TEXT,
+            task_class   TEXT,
+            linked_at    INTEGER NOT NULL
+        )
+        """
+    )
+    now = int(time.time())
+    con.executemany(
+        "INSERT OR IGNORE INTO failure_links "
+        "(link_id, trace_id, gradient_id, task_class, linked_at) VALUES (?,?,?,?,?)",
+        [("fl-1", "t2", "g1", "code-fix", now),
+         ("fl-2", "t2", "g1", "code-fix", now),
+         ("fl-3", "t2", "g2", "code-fix", now)])
+    con.commit()
+    con.close()
+
+
+def test_graph_context_md_join_and_link_count_ordering(db, monkeypatch):
+    monkeypatch.setenv("MINI_ORK_DB", db)
+    monkeypatch.delenv("MO_TARGET_CWD", raising=False)
+    monkeypatch.delenv("MO_GRAPH_CONTEXT", raising=False)
+    _seed_failure_links(db)
+
+    py = ca.graph_context_md("code-fix", 5, db=db)
+
+    assert "Learned graph context" in py and "/learned graph context" in py
+    assert "auth.middleware" in py
+    assert "workflow.gate" in py
+    # g1 has two links, g2 one → link_count DESC puts auth.middleware first.
+    assert py.index("auth.middleware") < py.index("workflow.gate")
+    # g3/g4 have no failure_links row: the INNER JOIN must drop them.
+    assert "db.migration" not in py and "lowconf.target" not in py
+
+
+def test_graph_context_md_cold_safe_zero_cases(db, monkeypatch):
+    monkeypatch.setenv("MINI_ORK_DB", db)
+    monkeypatch.delenv("MO_TARGET_CWD", raising=False)
+    monkeypatch.delenv("MO_GRAPH_CONTEXT", raising=False)
+
+    # Stock fixture has no failure_links table: missing-table path, not a raise.
+    assert ca.graph_context_md("code-fix", 5, db=db) == ""
+    assert ca.graph_context_md("code-fix", 5, db="/nonexistent/state.db") == ""
+
+    _seed_failure_links(db)
+    monkeypatch.setenv("MO_GRAPH_CONTEXT", "0")
+    assert ca.graph_context_md("code-fix", 5, db=db) == ""
+    monkeypatch.delenv("MO_GRAPH_CONTEXT", raising=False)
+
+
 def test_context_assemble_shape(db, tmp_path, monkeypatch):
     brief = tmp_path / "brief.json"
     brief.write_text(json.dumps({"task_class": "code-fix", "goal": "fix auth tests"}))
@@ -77,6 +135,7 @@ def test_context_assemble_shape(db, tmp_path, monkeypatch):
     assert py_pack["task_brief"]["content"]["task_class"] == "code-fix"
     assert py_pack["known_failure_modes"]
     assert py_pack["prior_similar_runs"]
+    assert "graph_context" in py_pack
 
 
 def _seed_bug_lessons(db):
@@ -210,6 +269,19 @@ def test_truncation_budget(db, tmp_path, monkeypatch):
     monkeypatch.delenv("MINI_ORK_CTX_BUDGET_TOKENS")
     assert pack.get("_truncated") is True
     assert "_truncation_summary" in pack
+
+
+def test_graph_context_survives_truncation(db, tmp_path, monkeypatch):
+    """graph_context is bounded by SQL LIMIT only — slice_provider_default must
+    never pop it under budget pressure."""
+    brief = tmp_path / "brief.json"
+    brief.write_text(json.dumps({"task_class": "code-fix"}))
+    monkeypatch.setenv("MINI_ORK_DB", db)
+    monkeypatch.setenv("MINI_ORK_CTX_BUDGET_TOKENS", "120")
+    pack = ca.context_assemble(str(brief), "implementer", db=db)
+    monkeypatch.delenv("MINI_ORK_CTX_BUDGET_TOKENS")
+    assert pack.get("_truncated") is True
+    assert "graph_context" in pack
 
 
 class _FakeContextNest:

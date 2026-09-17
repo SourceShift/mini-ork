@@ -441,6 +441,13 @@ def _inject_context(prompt, kickoff, task_class, db, out_file, dry_run) -> str:
             if block:
                 blocks.append(block)
 
+        try:
+            graph_block = context_assembler.graph_context_md(task_class, 5, db=db)
+        except Exception:
+            graph_block = ""
+        if graph_block:
+            blocks.append(graph_block)
+
         role_pack = ""
         if os.environ.get("MO_USE_ROLE_PACKS", "1") == "1":
             try:
