@@ -486,12 +486,22 @@ def test_mo_promote_synthesis_gate_rejections(tmp_path, db):
     assert pobj["decision"] == "rejected"
     assert pobj["reason"] == "low_panel_score"
 
-    # (b) high panel_score but zero structural signals → rc=1,
-    # reason='no_structural_signal'.
+    # (b) high panel_score and a healthy panel, but zero structural signals →
+    # rc=1, reason='no_structural_signal'. The voters carry real ground truth so
+    # CW-POR clears; with an empty panel this case is now rejected earlier as
+    # cw_por_unverified, which would stop the test proving the structural
+    # condition is reachable at all.
     no_sig = tmp_path / "no_signal.json"
     no_sig.write_text(json.dumps({
         "panel_score": 95.0,
-        "voters": [],
+        "voters": [
+            {"voter_id": "c1", "vote": "approve", "confidence": 0.90,
+             "ground_truth_match": True},
+            {"voter_id": "c2", "vote": "approve", "confidence": 0.85,
+             "ground_truth_match": True},
+            {"voter_id": "w1", "vote": "reject", "confidence": 0.60,
+             "ground_truth_match": False},
+        ],
         "structural": {
             "citation_density_per_lens": 1.0,
             "file_coverage_delta": 0,
