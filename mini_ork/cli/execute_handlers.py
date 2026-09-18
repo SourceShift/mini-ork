@@ -27,6 +27,7 @@ from mini_ork.context import (
     publish_env,
     run_context_scope,
 )
+from mini_ork.workflow.store import make_artifact_store
 
 
 def _execute_module():
@@ -174,14 +175,19 @@ def dispatch_node(fields, *, root, run_dir, plan_path, task_class, db, run_id,
         # trace write. The wrapper unifies node-completion side effects so
         # E2's recovery code can rely on every success also having a row.
         _base_checkpoint(node_id, status, node_type, output_file)
-    run_dir_eff = context_env(ENV_RUN_DIR, run_dir)
+    # Resolve this run's artifact root from its STABLE identity (run_id) via the
+    # artifact store — NOT from an ambient MINI_ORK_RUN_DIR. A long-lived worker
+    # can leak that env var and split one run across two directories (producer
+    # writes here, verifier reads there); run_id is injected once and never
+    # leaks, so keying resolution on it makes that split structurally impossible.
+    # base_dir=run_dir keeps the caller's authoritative plan-derived path as the
+    # fallback for benchmark/test runs that don't live under <home>/runs.
+    _artifact_store = make_artifact_store(run_id, base_dir=run_dir)
+    run_dir_eff = str(_artifact_store.run_root)
     # Node prompts and subprocess verifiers refer to MINI_ORK_RUN_DIR as their
     # artifact namespace. ``mini-ork run`` can derive the directory from the
     # plan without exporting it, so publish the resolved value at the node
     # boundary before any provider or verifier subprocess is invoked.
-    # Publish the resolved run directory at the node boundary before any
-    # provider or verifier subprocess is invoked (canonical contract:
-    # mini_ork.context).
     publish_env({ENV_RUN_DIR: run_dir_eff})
 
     # The artifact ledger is a semantic boundary, not a replacement for an OS
@@ -203,7 +209,10 @@ def dispatch_node(fields, *, root, run_dir, plan_path, task_class, db, run_id,
 
             compiled_workflow = compile_workflow(workflow)
             if node_id in compiled_workflow.nodes:
-                artifact_ledger = ArtifactLedger(run_dir_eff, run_id)
+                # Reuse the run_id-addressed store built above so producer and
+                # consumer nodes resolve to the SAME physical root regardless of
+                # any leaked ambient run-dir.
+                artifact_ledger = ArtifactLedger(store=_artifact_store)
                 prepared_inputs = artifact_ledger.prepare_inputs(compiled_workflow, node_id)
                 artifact_context = artifact_ledger.prompt_context(prepared_inputs)
                 publish_env({

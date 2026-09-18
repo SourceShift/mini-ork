@@ -10,6 +10,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from .store import ArtifactStore, ArtifactStoreError, LocalArtifactStore
+
 if TYPE_CHECKING:
     from .compiler import CompiledWorkflow
 
@@ -58,19 +60,34 @@ class ArtifactLedger:
     recipe outputs and the exact copies a consumer is allowed to receive.
     """
 
-    def __init__(self, run_dir: str | Path, run_id: str) -> None:
-        self.run_dir = Path(run_dir).resolve()
-        self.run_id = run_id or self.run_dir.name
-        self.workspace = self.run_dir / "workspace"
+    def __init__(
+        self,
+        run_dir: str | Path | None = None,
+        run_id: str = "",
+        *,
+        store: ArtifactStore | None = None,
+    ) -> None:
+        # The store is the single physical resolver. Legacy positional callers
+        # (run_dir, run_id) get a local store rooted at that dir unchanged; the
+        # run flow injects a run_id-addressed store so a leaked ambient
+        # MINI_ORK_RUN_DIR can't split the run's artifacts.
+        if store is None:
+            if run_dir is None:
+                raise ArtifactContractError("ArtifactLedger requires run_dir or store")
+            store = LocalArtifactStore(run_dir, run_id)
+        self.store = store
+        self.run_id = run_id or store.run_id
+        self.run_dir = store.run_root
+        self.workspace = store.run_root / "workspace"
         self.manifest_dir = self.workspace / "manifests"
         self.inputs_root = self.workspace / "inputs"
         self._prepared: dict[str, PreparedInputs] = {}
 
     def _resolve_rel(self, rel_path: str) -> Path:
-        candidate = (self.run_dir / rel_path).resolve()
-        if candidate != self.run_dir and self.run_dir not in candidate.parents:
-            raise ArtifactContractError(f"artifact path escapes run directory: {rel_path}")
-        return candidate
+        try:
+            return self.store.local_path(rel_path)
+        except ArtifactStoreError as exc:
+            raise ArtifactContractError(str(exc)) from exc
 
     def _manifest_path(self, node_id: str) -> Path:
         return self.manifest_dir / f"{node_id}.outputs.json"
@@ -105,6 +122,9 @@ class ArtifactLedger:
                     visibility=output.visibility,
                 )
             )
+            # Mirror the freshly written local artifact to the backing store.
+            # No-op for the local backend; a remote backend uploads here.
+            self.store.publish(output.path)
         payload = {
             "node_id": node_id,
             "run_id": self.run_id,
@@ -141,6 +161,10 @@ class ArtifactLedger:
                 raise ArtifactContractError(
                     f"system-only artifact {binding.producer_node}.{binding.producer_output} cannot be materialized"
                 )
+            # Materialize the producer artifact into the local working root
+            # before copy. No-op for the local backend; a remote backend
+            # downloads here.
+            self.store.fetch(artifact.rel_path)
             source = self._resolve_rel(artifact.rel_path)
             destination_dir = input_root / binding.consumer_input
             destination_dir.mkdir(parents=True, exist_ok=True)
