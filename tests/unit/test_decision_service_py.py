@@ -73,3 +73,43 @@ def test_seeded_exploration_is_deterministic(env_db, monkeypatch):
     r1 = ds._explore_route("sonnet", 1.0, "42", ds.resolve_agents_yaml())
     r2 = ds._explore_route("sonnet", 1.0, "42", ds.resolve_agents_yaml())
     assert r1 == r2 and r1 != "sonnet"
+
+
+def test_route_provenance_labels_the_decision(env_db, monkeypatch):
+    """Every route carries WHY it was chosen. Without this the three sources are
+    indistinguishable after the fact, so no outcome can be credited to (or debited
+    from) the decision that produced it — which is the signal EquiRouter ranks on."""
+    # cold start -> the agents.yaml default, never an invented lane
+    p = ds.decide("implementer", "code-fix", "code-delivery", db=env_db)
+    assert p["route_source"] == "default"
+    assert p["route_explore"] is False
+    assert p["route_score"] is None
+
+    def seed(lane, rv, n=3):
+        for _ in range(n):
+            trace_store.trace_write(
+                {"task_class": "code-fix", "status": "success",
+                 "agent_version_id": lane, "objective_domain": "code-delivery",
+                 "verifier_output": {"node_type": "implementer"},
+                 "reward_value": rv, "reward_anchor": 0.5,
+                 "reward_direction": "higher_is_better"}, db=env_db)
+    seed("laneA", 1.0)
+    seed("laneB", 0.0)
+    lane_router.recompute_advantages(db=env_db)
+
+    # learned -> the route is attributable to the advantage row that won it
+    p = ds.decide("implementer", "code-fix", "code-delivery", db=env_db)
+    assert p["route"] == "laneA"
+    assert p["route_source"] == "learned"
+    assert p["route_explore"] is False
+    assert p["route_score"] is not None
+
+    # explore -> an epsilon-greedy swap is labelled as one, not as a learn
+    monkeypatch.setenv("EPSILON", "1.0")
+    monkeypatch.setenv("SEED", "42")
+    q = ds.decide("implementer", "code-fix", "code-delivery", db=env_db)
+    assert q["route"] != "laneA"
+    assert q["route_source"] == "explore"
+    assert q["route_explore"] is True
+    # the score still reports the estimate that was overridden, not the swap
+    assert q["route_score"] == p["route_score"]

@@ -7,6 +7,7 @@ mini_ork.cli.execute for backward compatibility.
 """
 from __future__ import annotations
 
+import contextvars
 import os
 import sys
 from dataclasses import dataclass
@@ -15,6 +16,26 @@ from typing import Callable
 _CODING_ROLES = {"implementer", "worker", "spec_author", "healer", "planner", "researcher",
                  "reflector", "replanner", "synthesizer", "bdd_runner"}
 _REVIEW_ROLES = {"reviewer", "spec_reviewer", "verifier", "brain"}
+
+# Provenance of the lane currently being routed, published by the policy layer and
+# read by the dispatcher. A policy handler returns only a lane string, so the
+# reason it chose that lane has nowhere else to travel: without this record a
+# learned route, an epsilon-greedy exploration swap, a recipe pin, and a
+# trace-governed failover are all just "a lane". EquiRouter and any later
+# attribution of an outcome to the decision that produced it need the label.
+_ROUTE_PROVENANCE: contextvars.ContextVar[dict] = contextvars.ContextVar(
+    "mo_route_provenance", default={})
+
+
+def _record_route(**fields) -> None:
+    """Merge provenance fields for the lane being routed right now."""
+    _ROUTE_PROVENANCE.set({**_ROUTE_PROVENANCE.get(), **fields})
+
+
+def last_route_provenance() -> dict:
+    """Provenance recorded by the most recent ``policy_route_lane`` call in this
+    node's context. Empty dict when routing never ran (dry-run, non-policy path)."""
+    return dict(_ROUTE_PROVENANCE.get())
 
 
 def dispatch_chain(node_type: str, lead: str) -> str:
@@ -66,6 +87,7 @@ def learning_governed_lane(
     in-process native port — routing no longer shells out per dispatch."""
     db = os.environ.get("MINI_ORK_DB", "")
     if not db or not os.path.isfile(db):
+        _record_route(route_source="static", route_explore=False)
         return learning_static_lane(node_type, current_lane)
     task_class = (task_class or os.environ.get("TASK_CLASS")
                   or os.environ.get("MINI_ORK_TASK_CLASS") or "generic")
@@ -73,10 +95,21 @@ def learning_governed_lane(
                         or os.environ.get("MO_OBJECTIVE_DOMAIN") or "code-delivery")
     try:
         from mini_ork.steering import decision_service
-        route = decision_service.decide(
-            node_type, task_class, objective_domain, db=db).get("route", "")
+        decision = decision_service.decide(
+            node_type, task_class, objective_domain, db=db)
+        route = decision.get("route", "")
+        if route:
+            # Stamp the brain's own account of the decision so the dispatcher can
+            # persist it. ``decide`` already distinguishes learned / explore /
+            # default; recording it here is what makes the route attributable.
+            _record_route(
+                route_source=decision.get("route_source") or "learned",
+                route_explore=bool(decision.get("route_explore")),
+                route_score=decision.get("route_score"),
+            )
         return route or current_lane
     except Exception:
+        _record_route(route_source="fallback", route_explore=False)
         return current_lane
 
 
@@ -132,6 +165,7 @@ def _policy_learning_governed(ctx: RoutingContext) -> str:
     # Learning governs only UNPINNED nodes (current_lane == node_type); pinned nodes
     # keep their lane — consistent with learning_static_lane's pin-preservation.
     if ctx.current_lane != ctx.node_type:
+        _record_route(route_source="pinned", route_explore=False)
         return ctx.current_lane
     return learning_governed_lane(
         ctx.node_type,
@@ -177,6 +211,9 @@ def policy_route_lane(
     """Port of bash `_mo_policy_route_lane`. Applied to every live node BEFORE dispatch
     so the routed lane (not the raw node_type/workflow lane) reaches --node-type. Dry-run
     preserves the recipe's explicit lane (workflow-shape preview, not a policy preview)."""
+    # Cleared up front: a stale record from the previous node must never be
+    # attributed to this one's lane — and a dry-run must leave no record at all.
+    _ROUTE_PROVENANCE.set({})
     if dry_run:
         return current_lane
     policy = os.environ.get("MO_ROUTING_POLICY") or "learning_governed"
@@ -184,6 +221,18 @@ def policy_route_lane(
     if handler is None:
         sys.stderr.write(f"  [warn] unknown MO_ROUTING_POLICY={policy} — using workflow lane {current_lane}\n")
         return current_lane
-    return handler(RoutingContext(node_type, current_lane, root=root, task_class=task_class))
+    lane = handler(RoutingContext(node_type, current_lane, root=root, task_class=task_class))
+    if _ROUTE_PROVENANCE.get():
+        _record_route(route_policy=policy)
+    else:
+        # A policy that never consulted the brain — a recipe pin, or a purely
+        # rule-based branch. Attribute it to the policy so no lane is origin-less.
+        _record_route(route_source="policy", route_explore=False,
+                      route_policy=policy)
+    sys.stderr.write(
+        f"  [route] policy={policy} node={node_type} "
+        f"lane={current_lane}->{lane} "
+        f"source={_ROUTE_PROVENANCE.get().get('route_source', '')}\n")
+    return lane
 
 
