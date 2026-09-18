@@ -268,6 +268,33 @@ def _write_final_verdict(state_dir: str | Path, payload: dict[str, Any]) -> Path
     return out
 
 
+def _env_int(name: str, default: int) -> int:
+    """Read an int from the environment, falling back to ``default`` when unset.
+
+    A set-but-unparseable value raises rather than silently defaulting: these are
+    published by the executor from a validated ``recursion:`` block, so garbage
+    here means something upstream is broken, and a quiet fallback would hide it.
+    """
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return int(raw.strip())
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer, got {raw!r}") from exc
+
+
+def _env_float(name: str, default: float) -> float:
+    """Read a float from the environment, falling back to ``default`` when unset."""
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return float(raw.strip())
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a number, got {raw!r}") from exc
+
+
 def drive(
     goal_id: str,
     target_cwd: str,
@@ -275,17 +302,28 @@ def drive(
     predicate_cmd: str,
     child_recipe: str,
     *,
-    max_waves: int = 30,
-    budget_total_usd: float = 150.0,
+    max_waves: int | None = None,
+    budget_total_usd: float | None = None,
     run_wave_fn: Callable[[int, set[str]], dict[str, Any]] | None = None,
     cost_fn: Callable[[], float] | None = None,
     state_dir: str | Path | None = None,
 ) -> dict[str, Any]:
     """Run the outer cross-wave loop until a stop condition fires.
 
+    The two caps resolve caller → declared → literal: an explicit argument wins,
+    otherwise the recipe's ``recursion:`` block (published by the executor as
+    ``MO_RECURSION_*``), otherwise the historical literal. So a recipe's YAML is
+    the source of truth for its own loop, and a caller that passes nothing still
+    gets today's behavior when no recipe declares a block.
+
     Returns the FINAL-VERDICT payload (also written to ``final-verdict.json``).
     Every stop path writes the file before returning.
     """
+    if max_waves is None:
+        max_waves = _env_int("MO_RECURSION_MAX_ITERATIONS", 30)
+    if budget_total_usd is None:
+        budget_total_usd = _env_float("MO_RECURSION_BUDGET_CAP_TOTAL_USD", 150.0)
+
     if max_waves <= 0:
         raise ValueError("max_waves must be > 0")
 
@@ -454,8 +492,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--units-cmd", required=True)
     parser.add_argument("--predicate-cmd", required=True)
     parser.add_argument("--child-recipe", required=True)
-    parser.add_argument("--max-waves", type=int, default=30)
-    parser.add_argument("--budget-usd", type=float, default=150.0)
+    parser.add_argument(
+        "--max-waves", type=int, default=None,
+        help="Default: the recipe's recursion.max_iterations, else 30",
+    )
+    parser.add_argument(
+        "--budget-usd", type=float, default=None,
+        help="Default: the recipe's recursion.budget_cap_total_usd, else 150.0",
+    )
     parser.add_argument("--state-dir", default=None,
                         help="Default: ${MINI_ORK_HOME}/goal-loop/<goal-id>/")
     args = parser.parse_args(argv)

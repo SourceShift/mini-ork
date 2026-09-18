@@ -193,6 +193,22 @@ def _check_recipe(root: str, recipe: str, findings: Findings) -> None:
             f"recipe {recipe} workflow.yaml is not valid YAML",
             f"fix YAML syntax in {wf}",
         )
+    elif os.path.isfile(wf):
+        # The `recursion:` block is read at dispatch time and a malformed one
+        # raises there. Surface it pre-run instead, so an incomplete block is a
+        # validate finding rather than a crash in the middle of a live run.
+        from mini_ork.workflow.recursion import (
+            RecursionConfigError,
+            load_recursion_config,
+        )
+
+        try:
+            load_recursion_config(wf)
+        except RecursionConfigError as exc:
+            findings.error(
+                f"recipe {recipe} has an invalid recursion block",
+                str(exc),
+            )
 
     # artifact_contract.yaml: output-path collision guard
     ac = os.path.join(recipe_dir, "artifact_contract.yaml")
