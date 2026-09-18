@@ -175,12 +175,62 @@ def _policy_learning_governed(ctx: RoutingContext) -> str:
     )
 
 
+def _trace_escalation(task_class: str | None) -> bool | None:
+    """Should this node escalate to the frontier, per the persisted trace record?
+
+    ``True`` / ``False`` when the trace table carries evidence for this task
+    class, ``None`` when there is nothing to govern on (no task class, no db, no
+    rows, or an unreadable store) so the caller can fall back.
+
+    A task class is required: without one the query would span every task in the
+    database, which is exactly the blunt global signal this replaces.
+
+    Rows routed from a recipe pin are excluded. A pinned lane is deliberate
+    author intent (cross-family panel diversity, a model-strength pin), so its
+    failure says nothing about whether the router's own choice was wrong and
+    must not by itself trigger an escalation. Rows written before provenance was
+    recorded carry no ``route_source`` and are counted, since silence is not a
+    pin.
+    """
+    if not task_class:
+        return None
+    db = os.environ.get("MINI_ORK_DB", "")
+    if not db or not os.path.isfile(db):
+        return None
+    try:
+        from mini_ork import trace_store
+        rows = trace_store.trace_query(task_class=task_class, limit=50, db=db)
+    except Exception:
+        # Missing table or older schema: no evidence beats a crashed router.
+        return None
+    governed = [r for r in rows if (r.get("route_source") or "") != "pinned"]
+    if not governed:
+        return None
+    return any((r.get("status") or "success") != "success" for r in governed)
+
+
 def _policy_trace_governed(ctx: RoutingContext) -> str:
-    fail_count = int(os.environ.get("FAIL_COUNT", "0") or "0")
+    """Escalate researcher/implementer to the frontier when the trace record for
+    this task class shows a failure on a lane the router itself chose.
+
+    Previously the signal was a bare ``FAIL_COUNT`` integer injected into the
+    environment — a global counter with no task, no node, and no record of which
+    lane actually failed, so no decision's outcome could be attributed to the
+    decision. The persisted traces (route_source, status) are that attribution,
+    and they are consulted first.
+
+    ``FAIL_COUNT`` still governs when no trace evidence exists — a fresh
+    database, a dry run, or a caller that has already counted failures. That
+    keeps the documented bash contract and its tests intact.
+    """
     if ctx.node_type == "reviewer":
         return _frontier_lane()
     if ctx.node_type in ("researcher", "implementer"):
-        return _frontier_lane() if fail_count > 0 else _cheap_lane()
+        escalate = _trace_escalation(ctx.task_class)
+        if escalate is None:
+            escalate = int(os.environ.get("FAIL_COUNT", "0") or "0") > 0
+        _record_route(route_source="trace_governed", route_explore=False)
+        return _frontier_lane() if escalate else _cheap_lane()
     return ctx.current_lane
 
 

@@ -70,3 +70,87 @@ def test_route_provenance_absent_on_dry_run(monkeypatch):
 
     assert routing.policy_route_lane("reviewer", "kimi_lens", dry_run=True) == "kimi_lens"
     assert routing.last_route_provenance() == {}
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# trace_governed: escalate on the persisted trace record, not a global counter.
+#
+# FAIL_COUNT carried no task, no node, and no record of which lane failed, so
+# no outcome could be attributed to the decision that produced it. These tests
+# pin the attribution: the escalation follows the traces, and a recipe pin's
+# failure is not the router's to answer for.
+# ───────────────────────────────────────────────────────────────────────────
+
+
+def _trace_db(tmp_path, rows, monkeypatch):
+    """Minimal execution_traces store; ``rows`` is [(status, route_source), …].
+
+    Also pins the policy: ``policy_route_lane`` defaults MO_ROUTING_POLICY to
+    ``learning_governed``, so a test that leaves it unset silently exercises a
+    different policy and passes or fails for the wrong reason.
+    """
+    import sqlite3
+
+    monkeypatch.setenv("MO_ROUTING_POLICY", "trace_governed")
+    db = tmp_path / "state.db"
+    con = sqlite3.connect(db)
+    con.execute(
+        "CREATE TABLE execution_traces ("
+        " trace_id TEXT PRIMARY KEY, run_id TEXT, task_class TEXT, status TEXT,"
+        " route_source TEXT, route_explore INTEGER, route_score REAL,"
+        " created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%S.000Z','now')))")
+    for i, (status, route_source) in enumerate(rows):
+        con.execute(
+            "INSERT INTO execution_traces (trace_id, task_class, status, route_source)"
+            " VALUES (?,?,?,?)", (f"t{i}", "code-fix", status, route_source))
+    con.commit()
+    con.close()
+    monkeypatch.setenv("MINI_ORK_DB", str(db))
+    return str(db)
+
+
+def test_trace_governed_escalates_on_a_recorded_failure(tmp_path, monkeypatch):
+    """A failed attempt the router chose justifies the frontier — with the
+    injected counter saying otherwise, so the traces are what decided."""
+    _trace_db(tmp_path, [("success", "learned"), ("failure", "learned")], monkeypatch)
+    monkeypatch.setenv("FAIL_COUNT", "0")
+
+    assert routing.policy_route_lane(
+        "researcher", "researcher", task_class="code-fix") == "opus_lens"
+
+
+def test_trace_governed_stays_cheap_when_the_record_is_clean(tmp_path, monkeypatch):
+    """All-success traces hold the cheap lane even with FAIL_COUNT raised."""
+    _trace_db(tmp_path, [("success", "learned"), ("success", "learned")], monkeypatch)
+    monkeypatch.setenv("FAIL_COUNT", "9")
+
+    assert routing.policy_route_lane(
+        "researcher", "researcher", task_class="code-fix") == "kimi_lens"
+
+
+def test_trace_governed_ignores_pinned_failures(tmp_path, monkeypatch):
+    """A pinned lane's failure is the author's pin failing, not the router's
+    choice — it must not be what escalates the router."""
+    _trace_db(tmp_path, [("failure", "pinned"), ("success", "learned")], monkeypatch)
+    monkeypatch.setenv("FAIL_COUNT", "0")
+
+    assert routing.policy_route_lane(
+        "implementer", "implementer", task_class="code-fix") == "kimi_lens"
+
+
+def test_trace_governed_falls_back_to_fail_count_without_evidence(tmp_path, monkeypatch):
+    """No rows to govern on → the documented FAIL_COUNT contract still holds."""
+    _trace_db(tmp_path, [], monkeypatch)
+    monkeypatch.setenv("FAIL_COUNT", "2")
+
+    assert routing.policy_route_lane(
+        "researcher", "researcher", task_class="code-fix") == "opus_lens"
+
+
+def test_trace_governed_without_task_class_uses_fail_count(tmp_path, monkeypatch):
+    """No task class means no scope to query — a global trace scan is the blunt
+    signal this replaced, so the counter governs instead."""
+    _trace_db(tmp_path, [("failure", "learned")], monkeypatch)
+    monkeypatch.setenv("FAIL_COUNT", "0")
+
+    assert routing.policy_route_lane("researcher", "researcher") == "kimi_lens"
