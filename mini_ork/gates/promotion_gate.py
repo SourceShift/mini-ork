@@ -143,6 +143,35 @@ def ensure_table(db_path: str) -> None:
 
 # ── promotion_evaluate (deterministic-oracle gate) ───────────────────────────
 
+# The shipped independence floor. ``MO_PROMOTION_MIN_RUNS`` may raise it but
+# never lower it — a floor that an environment can lower is not a floor, and the
+# hole this closes (one benchmark run emitting N rows) would be open again by
+# configuration.
+_MIN_INDEPENDENT_RUNS = 3
+
+
+def _evidence_run_ids(con, candidate_id: str) -> list[str]:
+    """Distinct benchmark runs behind a candidate's evidence, sorted.
+
+    ``benchmark_results.run_id`` references ``runs(id)`` — one row per execution
+    run. Counting DISTINCT runs is what separates "30 samples" from "30 runs":
+    the promotion gate used to aggregate every row for a candidate and never
+    read ``run_id`` at all, so a single run emitting 30 passing rows promoted the
+    candidate with no more evidence than one run provides.
+
+    A NULL/blank run_id is unproven independence and is dropped, never assumed —
+    which is also why nothing here backfills a synthetic id: that would
+    fabricate the exact independence being demanded.
+    """
+    rows = con.execute(
+        "SELECT DISTINCT NULLIF(TRIM(COALESCE(run_id,'')),'') AS rid "
+        "FROM benchmark_results WHERE candidate_id=? "
+        "AND NULLIF(TRIM(COALESCE(run_id,'')),'') IS NOT NULL "
+        "ORDER BY rid",
+        (candidate_id,),
+    ).fetchall()
+    return [str(r[0]) for r in rows]
+
 
 def promotion_evaluate(
     db_path: str,
@@ -159,9 +188,11 @@ def promotion_evaluate(
       * baseline ``utility_score`` from ``version_registry`` (default 0.0
         when missing) — guarded by a sqlite_master existence check
       * decision tree: no ``benchmark_results`` rows at all → rejected (no
-        measurement, no promote); not all_pass → rejected; utility_delta≤0 →
-        quarantined; else promoted. There is no human branch: a gate decision
-        is a measurement verdict, never a request for approval.
+        measurement, no promote); not all_pass → rejected; evidence from fewer
+        than ``max(3, MO_PROMOTION_MIN_RUNS)`` DISTINCT runs → rejected
+        (insufficient independent evidence); utility_delta≤0 → quarantined;
+        else promoted. There is no human branch: a gate decision is a
+        measurement verdict, never a request for approval.
       * INSERTs into ``promotion_records`` (migration 0011 schema:
         ``promotion_id`` PK, ``from_version_id`` + ``to_version_id`` NOT
         NULL FKs to workflow_memory, ``decided_by``='gate')
@@ -217,6 +248,21 @@ def promotion_evaluate(
         utility_after = float(brun["avg_utility_score"]) if brun else 0.0
         all_pass = bool(brun["all_pass"]) if brun else False
 
+        # ── Evidence independence ────────────────────────────────────────
+        # The aggregate above counts every row for the candidate regardless of
+        # which run produced it, so one run emitting 30 passing rows looked
+        # identical to 30 runs agreeing. Independence is a distinct property of
+        # the evidence, measured separately and never inferred from the count.
+        evidence_runs = _evidence_run_ids(con, candidate_id)
+        n_runs = len(evidence_runs)
+        try:
+            min_runs = max(
+                _MIN_INDEPENDENT_RUNS,
+                int(os.environ.get("MO_PROMOTION_MIN_RUNS",
+                                   _MIN_INDEPENDENT_RUNS)))
+        except (TypeError, ValueError):
+            min_runs = _MIN_INDEPENDENT_RUNS
+
         # ── safety_violations: bash swallows the try/except → []
         # (mirrors bash lines 109-119). DO NOT populate from gate_registry.
         safety_violations: list[Any] = []
@@ -243,6 +289,15 @@ def promotion_evaluate(
                 f"Not all benchmark tasks passed "
                 f"({brun['passed']}/{brun['total_tasks']})"
             )
+        elif n_runs < min_runs:
+            # Rejected rather than quarantined: this is a defect in the
+            # evidence, not a verdict withheld from the candidate. N samples
+            # from one run are one observation (PoisonedEvolution, 2608.05563).
+            decision = "rejected"
+            rationale = (
+                f"insufficient independent evidence: {n_runs} distinct run(s), "
+                f"{min_runs} required; {brun['total_tasks']} sample(s) recorded"
+            )
         elif utility_delta <= 0:
             decision = "quarantined"
             rationale = (
@@ -257,13 +312,24 @@ def promotion_evaluate(
                 f"all benchmark tasks passed."
             )
 
+        # The evidence pointer: which runs the decision actually rested on.
+        # Before this the row stored a bare NULL, so the audit trail could not
+        # answer the one question a promotion decision has to answer — how much
+        # independent measurement stood behind it. A multi-run decision has no
+        # single ``benchmark_memory.summary_id`` to name, so the column carries
+        # the comma-joined run list; application connections never enable FK
+        # enforcement, and a promote that rests on several runs is exactly the
+        # case the column previously could not express.
+        benchmark_run_id = ",".join(evidence_runs) if evidence_runs else None
+
         result = {
             "decision": decision,
             "rationale": rationale,
             "utility_before": round(utility_before, 6),
             "utility_after": round(utility_after, 6),
             "utility_delta": round(utility_delta, 6),
-            "benchmark_run_id": candidate_id,
+            "benchmark_run_id": benchmark_run_id,
+            "n_runs": n_runs,
             "all_pass": all_pass,
             "safety_violations": safety_violations,
         }
@@ -290,7 +356,7 @@ def promotion_evaluate(
             VALUES (?,?,?,?,?,?,?,?,?,?)
         """, (
             record_id, candidate_id, base_ver, base_ver,
-            utility_before, utility_after, None,
+            utility_before, utility_after, benchmark_run_id,
             rationale, decision, "gate",
         ))
         con.commit()
