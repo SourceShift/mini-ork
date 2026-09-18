@@ -90,6 +90,29 @@ variable is unset.*
 | `MO_OPTIMIZER_MODEL` | `"minimax"` | GEPA optimizer lane |
 | `MO_OPTIMIZER_BUDGET` | `"4"` | GEPA optimizer budget |
 
+### Recipe-declared loop caps (`MO_RECURSION_*`)
+
+These five are **derived, not set by hand**. When a recipe's `workflow.yaml`
+declares a `recursion:` block, the executor reads it at dispatch and publishes
+it under these names; the recipe's driver resolves its caps from them. For a
+recipe that declares a block, editing the YAML is the supported way to change
+its bounds — dispatch republishes these on every run and overwrites whatever
+was in the environment. A recipe with no block publishes nothing, so its driver
+keeps its own historical defaults.
+
+| Variable | Driver fallback | Source in `workflow.yaml` |
+|---|---|---|
+| `MO_RECURSION_MAX_ITERATIONS` | `"30"` | `recursion.max_iterations` |
+| `MO_RECURSION_CONVERGENCE_CHECK` | *(unset)* | `recursion.convergence_check` |
+| `MO_RECURSION_BUDGET_CAP_PER_ITER_USD` | *(unset)* | `recursion.budget_cap_per_iter_usd` |
+| `MO_RECURSION_BUDGET_CAP_TOTAL_USD` | `"150.0"` | `recursion.budget_cap_total_usd` |
+| `MO_RECURSION_DIVERGENCE_KILL` | *(unset)* | `recursion.divergence_kill` |
+
+The fallbacks above apply only when no recipe declares a block, or when a
+caller passes nothing and no recipe governs the loop. A partial `recursion:`
+block fails `mini-ork validate` rather than silently half-applying; declare all
+five keys or none.
+
 ## Context / memory
 
 | Variable | Default | Effect |

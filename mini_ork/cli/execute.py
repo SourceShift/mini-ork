@@ -657,6 +657,22 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
 
         control_parents = compile_workflow(workflow).control_parents
 
+        # A recipe that declares a `recursion:` block owns its own loop caps.
+        # Publish them so the driver honors the declaration instead of its own
+        # hand-copied default. Recipes without a block publish nothing, so they
+        # stay byte-identical to before this existed.
+        from mini_ork.workflow.recursion import load_recursion_config
+
+        recursion = load_recursion_config(workflow)
+        if recursion is not None:
+            publish_env({
+                "MO_RECURSION_MAX_ITERATIONS": str(recursion.max_iterations),
+                "MO_RECURSION_CONVERGENCE_CHECK": recursion.convergence_check,
+                "MO_RECURSION_BUDGET_CAP_PER_ITER_USD": f"{recursion.budget_cap_per_iter_usd:.2f}",
+                "MO_RECURSION_BUDGET_CAP_TOTAL_USD": f"{recursion.budget_cap_total_usd:.2f}",
+                "MO_RECURSION_DIVERGENCE_KILL": recursion.divergence_kill,
+            })
+
     fail_count = 0
     out: list[str] = []
     if dry_run:

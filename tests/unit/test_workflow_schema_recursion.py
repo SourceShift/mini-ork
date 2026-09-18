@@ -14,6 +14,7 @@ RECURSION_SUB = SCHEMA["properties"]["recursion"]
 
 RECIPES = [
     "doc-to-features-loop",
+    "goal-loop",
     "prompt-graph-loop",
     "recursive-validate-impl",
 ]
