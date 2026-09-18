@@ -518,6 +518,90 @@ def add(
     return events
 
 
+def upsert(
+    text: str,
+    *,
+    scope: str,
+    key: str,
+    db_path: str | os.PathLike[str] | None = None,
+    embedder: Embedder | None = None,
+) -> int:
+    """Insert or update the memory in ``scope`` identified by ``key``.
+
+    Identity comes from ``key`` (kept in the ``meta`` column), *not* from
+    similarity. That is the difference from ``add()``, and it matters for any
+    caller mirroring a source table: two rows of the source that happen to read
+    alike are still two rows, and ``add()``'s similarity reconcile
+    (``UPDATE_THRESHOLD``) would silently collapse them into one. A mirror needs
+    "one memory per source row", which only a real key can give it.
+
+    A re-upsert refreshes the text and embedding and preserves ``uses`` /
+    ``wins`` — the track record belongs to the key, not to the wording — so a
+    mirror can re-sync on every read without eroding what it has learned.
+    Returns the memory id.
+    """
+    if not isinstance(scope, str) or not scope.strip():
+        raise ValueError("scope must be a non-empty string")
+    if not isinstance(key, str) or not key.strip():
+        raise ValueError("key must be a non-empty string")
+    if not isinstance(text, str) or not text.strip():
+        raise ValueError("text must be a non-empty string")
+
+    db = _resolve_db_path(db_path)
+    vec = (embedder or get_embedder()).embed([text])[0]
+    meta = json.dumps({"key": key}, sort_keys=True)
+    now = time.time()
+
+    conn = _connect(db)
+    try:
+        row = conn.execute(
+            "SELECT id FROM semantic_memory WHERE scope = ? AND meta = ?",
+            (scope, meta),
+        ).fetchone()
+        if row is None:
+            cur = conn.execute(
+                "INSERT INTO semantic_memory"
+                "(scope, text, embedding, created_at, meta) VALUES (?, ?, ?, ?, ?)",
+                (scope, text, _pack_embedding(vec), now, meta),
+            )
+            mid = _last_id(cur)
+        else:
+            mid = int(row["id"])
+            # Text and embedding only — uses/wins are untouched on purpose.
+            conn.execute(
+                "UPDATE semantic_memory SET text = ?, embedding = ?, created_at = ? "
+                "WHERE id = ?",
+                (text, _pack_embedding(vec), now, mid),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    return mid
+
+
+def _utility(uses: int, wins: int) -> float:
+    """Laplace-smoothed win rate — the Beta(1,1) posterior mean.
+
+    Smoothing is what gives the "never fully buried" floor for free: a memory
+    with no wins from one use scores 1/3 rather than 0, so a single
+    unattributed retrieval cannot consign it to the bottom forever. It also
+    damps credit-assignment noise, which matters because attribution here is
+    "retrieved during a run that passed" — evidence, not proof.
+    """
+    return (wins + 1.0) / (uses + 2.0)
+
+
+def _exploration(uses: int, n_total: int) -> float:
+    """UCB1 bonus: ``sqrt(ln N / (n + 1))`` over the scope's total retrievals.
+
+    Largest for a memory never retrieved, shrinking as it is used and as the
+    scope as a whole accumulates evidence. The ``+1`` mirrors the ``+2`` in
+    ``_utility`` — it keeps the very first retrieval from dividing by zero and
+    makes the untried case finite rather than infinite.
+    """
+    return math.sqrt(math.log(n_total + 1.0) / (uses + 1.0))
+
+
 def search(
     query: str,
     *,
@@ -574,8 +658,8 @@ def search(
     for sim, r in pool:
         uses = int(r["uses"])
         wins = int(r["wins"])
-        utility = (wins + 1.0) / (uses + 2.0)
-        exploration = math.sqrt(math.log(n_total + 1.0) / (uses + 1.0))
+        utility = _utility(uses, wins)
+        exploration = _exploration(uses, n_total)
         composite = (
             sim
             + W_UTILITY * (utility - UTILITY_NEUTRAL)
@@ -596,6 +680,108 @@ def search(
         }
         for composite, sim, utility, uses, wins, r in ranked[:top_k]
     ]
+
+
+def rank_with_prior(
+    candidates: Sequence[tuple[int, float]],
+    *,
+    scope: str,
+    top_k: int = 5,
+    db_path: str | os.PathLike[str] | None = None,
+) -> list[dict]:
+    """Rank keyed memories by an external prior, adjusted by utility and
+    exploration (SimUtil-UCB without a query).
+
+    ``search()`` answers "which of these is closest to the query"; this
+    answers "which of these has the best claim to be shown", for callers whose
+    candidate set is already decided — a mirrored source table, say — and
+    whose relevance signal lives outside the store. Same policy, different
+    relevance term: the prior stands in for similarity, and it keeps the same
+    role — **the prior gates, utility and exploration only reorder inside the
+    gate.** The pool is the top ``top_k * POOL_FACTOR`` candidates by prior,
+    and the return is that pool re-sorted by the composite and cut to
+    ``top_k``.
+
+    Gate and reorder on the same scale is what makes the policy meaningful
+    here. If utility could reach any candidate, a single lucky retrieval would
+    outrank a pattern observed forty times more often; if it could reach none,
+    the record would be decorative. Confining the record to reordering *near
+    peers* is the middle it is meant to be, and it is exactly the rule
+    ``search()`` applies to cosine similarity.
+
+    The prior is min-max normalised over the pool, so:
+
+      * **An untried scope reproduces the prior's order exactly.** With no
+        retrievals anywhere, ``n_total`` is 0, so exploration is 0 and every
+        utility is the neutral 0.5 — the composite collapses to the normalised
+        prior and nothing moves. A caller introducing this ranking changes
+        nothing until evidence exists to change it.
+      * **Exploration is the only way an untried memory is ever tried.** Its
+        bonus is identical for every unused candidate, so they keep their
+        prior order among themselves while the group drifts up relative to
+        used ones as the scope's evidence grows. Without that drift, whichever
+        memories were sampled first would be sampled forever.
+
+    ``candidates`` is ``(memory_id, prior)`` pairs; ids outside ``scope``, or
+    that do not exist, are dropped. Returns the same dict shape as
+    ``search()``, with ``prior`` in place of ``similarity``.
+    """
+    if not isinstance(scope, str) or not scope.strip():
+        raise ValueError("scope must be a non-empty string")
+    if top_k <= 0:
+        raise ValueError("top_k must be positive")
+    prior_of = {int(mid): float(prior) for mid, prior in candidates}
+    if not prior_of:
+        return []
+    wanted = list(prior_of)
+
+    db = _resolve_db_path(db_path)
+    conn = _connect(db)
+    try:
+        placeholders = ",".join("?" * len(wanted))
+        rows = conn.execute(
+            f"SELECT id, text, uses, wins FROM semantic_memory "
+            f"WHERE scope = ? AND id IN ({placeholders})",
+            (scope, *wanted),
+        ).fetchall()
+        n_total = int(conn.execute(
+            "SELECT COALESCE(SUM(uses), 0) FROM semantic_memory WHERE scope = ?",
+            (scope,),
+        ).fetchone()[0] or 0)
+    finally:
+        conn.close()
+
+    # Gate: the prior chooses the pool.
+    rows.sort(key=lambda r: prior_of[int(r["id"])], reverse=True)
+    pool = rows[: max(top_k * POOL_FACTOR, top_k)]
+
+    lo = min(prior_of[int(r["id"])] for r in pool) if pool else 0.0
+    hi = max(prior_of[int(r["id"])] for r in pool) if pool else 0.0
+    span = hi - lo
+
+    out = []
+    for r in pool:
+        mid = int(r["id"])
+        uses, wins = int(r["uses"]), int(r["wins"])
+        utility = _utility(uses, wins)
+        # A pool with one distinct prior has no order to preserve; the flat
+        # 0.0 leaves the ranking to utility and exploration alone.
+        norm = (prior_of[mid] - lo) / span if span > 0 else 0.0
+        out.append({
+            "memory_id": mid,
+            "text": r["text"],
+            "prior": prior_of[mid],
+            "score": norm
+                     + W_UTILITY * (utility - UTILITY_NEUTRAL)
+                     + W_EXPLORE * _exploration(uses, n_total),
+            "utility": utility,
+            "uses": uses,
+            "wins": wins,
+        })
+    # Stable sort, so candidates the composite cannot separate keep the order
+    # the gate gave them.
+    out.sort(key=lambda hit: hit["score"], reverse=True)
+    return out[:top_k]
 
 
 # ── Retrieval ledger (the utility signal's source) ─────────────────────────
@@ -708,3 +894,62 @@ def record_outcome(
     finally:
         conn.close()
     return len(rows)
+
+
+def resolve_finished_runs(
+    *,
+    db_path: str | os.PathLike[str] | None = None,
+) -> int:
+    """Resolve pending retrievals for every run whose traces have finished.
+
+    The outcome is already in the database: ``execution_traces`` records a
+    status per node, and a run is over when none of its traces is still
+    'running'. Sweeping that table at retrieval time closes the feedback loop
+    for *every* recipe, not just the one with a ``type: eval`` node — which
+    matters because an unresolved retrieval counts toward ``uses`` forever and
+    therefore decays a memory's utility toward zero. Silence must not look like
+    failure for a run that actually succeeded.
+
+    A run resolves iff it has traces and none is running; it passes iff none
+    failed. Runs with **no** traces at all are left pending: there is nothing
+    recorded to judge them by, and guessing is the fabrication this whole
+    design exists to avoid.
+
+    Idempotent (``record_outcome`` touches only 'pending' rows) and cold-safe —
+    a missing ``execution_traces`` table yields 0 rather than raising.
+
+    Call this before reading memories, so a run's own outcome from a previous
+    invocation is reflected in the ranking it is about to influence.
+    """
+    db = _resolve_db_path(db_path)
+    conn = _connect(db)
+    try:
+        try:
+            rows = conn.execute(
+                """
+                SELECT u.run_id AS run_id,
+                       COUNT(t.trace_id) AS n,
+                       SUM(CASE WHEN t.status = 'running' THEN 1 ELSE 0 END) AS running,
+                       SUM(CASE WHEN t.status NOT IN ('success', 'running')
+                                THEN 1 ELSE 0 END) AS failed
+                FROM semantic_memory_uses u
+                JOIN execution_traces t ON t.run_id = u.run_id
+                WHERE u.outcome = 'pending' AND u.run_id != ''
+                GROUP BY u.run_id
+                """
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return 0
+    finally:
+        conn.close()
+
+    resolved = 0
+    for row in rows:
+        if int(row["n"] or 0) == 0 or int(row["running"] or 0) > 0:
+            continue
+        resolved += record_outcome(
+            str(row["run_id"]),
+            int(row["failed"] or 0) == 0,
+            db_path=db,
+        )
+    return resolved

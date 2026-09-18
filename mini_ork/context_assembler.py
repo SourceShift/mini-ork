@@ -354,31 +354,154 @@ def failure_modes_md(task_class: str, limit: int = 5, db: str | None = None) -> 
             emg_limit = int(os.environ.get("MO_EMERGENT_INJECT_LIMIT", "3"))
         except ValueError:
             emg_limit = 3
-        con2 = sqlite3.connect(dbp)
-        con2.execute("PRAGMA busy_timeout=5000")
-        try:
-            emg = con2.execute("""
-                SELECT cluster_label, feature_set_json, strength_score
-                FROM emergent_patterns
-                WHERE status='approved'
-                ORDER BY strength_score DESC, detected_at DESC LIMIT ?
-            """, (emg_limit,)).fetchall()
-        except sqlite3.OperationalError:
-            emg = []
-        finally:
-            con2.close()
-        if emg:
-            out.append("--- Verified emergent patterns (cross-run, judge-gate approved) ---")
-            for cluster_label, feature_set_json, _strength in emg:
-                try:
-                    feats = json.loads(feature_set_json) if feature_set_json else []
-                except Exception:
-                    feats = []
-                feat = feats[0] if feats else "emergent"
-                out.append(f"- [{feat}] {(cluster_label or '').strip()}")
-            out.append("--- /verified emergent patterns ---")
+        # The semantic channel owns this block when it can serve it: it ranks
+        # the same approved patterns by earned utility rather than the static
+        # strength_score, and closes the retrieval loop while it is there. An
+        # unavailable or opted-out channel degrades to the static ordering —
+        # never to nothing, because the lessons are still evidence.
+        block = semantic_lessons_md(task_class, emg_limit, db=dbp)
+        if not block:
+            block = _static_emergent_block(dbp, emg_limit)
+        if block:
+            out.append(block)
 
     return "\n".join(out)
+
+
+# ── emergent-pattern read-back (static + utility-ranked) ─────────────────────
+
+def _approved_emergent_rows(dbp: str) -> list[tuple]:
+    """Approved (judge-gated) emergent patterns, strongest first.
+
+    Cold-safe: a missing table, or one predating any of these columns, is an
+    empty list and not an error — this runs on the prompt-injection path.
+    """
+    con = sqlite3.connect(dbp)
+    con.execute("PRAGMA busy_timeout=5000")
+    try:
+        return con.execute("""
+            SELECT pattern_id, cluster_label, feature_set_json, strength_score
+            FROM emergent_patterns
+            WHERE status='approved'
+            ORDER BY strength_score DESC, detected_at DESC
+        """).fetchall()
+    except sqlite3.OperationalError:
+        return []
+    finally:
+        con.close()
+
+
+def _emergent_text(feature_set_json: str | None, cluster_label: str | None) -> str:
+    """The one-line form of a pattern — `[feat] label`.
+
+    Shared by the static block and the semantic mirror so a memory reads
+    exactly as the pattern it came from.
+    """
+    try:
+        feats = json.loads(feature_set_json) if feature_set_json else []
+    except Exception:
+        feats = []
+    feat = feats[0] if feats else "emergent"
+    return f"[{feat}] {(cluster_label or '').strip()}"
+
+
+def _static_emergent_block(dbp: str, limit: int) -> str:
+    """Strength-ordered read-back — the pre-semantic behaviour, kept as the
+    degradation path. Ordering is unchanged; only the LIMIT moved to Python.
+    """
+    rows = _approved_emergent_rows(dbp)[:limit]
+    if not rows:
+        return ""
+    lines = ["--- Verified emergent patterns (cross-run, judge-gate approved) ---"]
+    lines.extend(
+        f"- {_emergent_text(feats, label)}" for _pid, label, feats, _strength in rows
+    )
+    lines.append("--- /verified emergent patterns ---")
+    return "\n".join(lines)
+
+
+def semantic_lessons_md(task_class: str, limit: int = 5, db: str | None = None) -> str:
+    """The emergent-pattern block, ranked by earned utility (SimUtil-UCB).
+
+    Same rows, same shape as `_static_emergent_block` — different order. The
+    channel mirrors each approved pattern into the semantic store under a key
+    derived from its `pattern_id` (so a pattern is one memory, however alike it
+    reads to another), sweeps finished runs to resolve retrievals already in
+    flight, then ranks the mirrors by `strength_score` adjusted for what each
+    has actually earned.
+
+    `strength_score` is the prior, not the query: it is a measured frequency,
+    so it still decides *which* patterns are eligible — but it is the only
+    thing doing so today, and it cannot know whether a pattern helped. Utility
+    and exploration reorder inside that gate. An untried scope reproduces the
+    static block exactly, so this is a non-regressive default; from then on
+    the block also samples eligible patterns nobody has tried, which is the
+    only way they ever get evidence.
+
+    Returns '' when the channel is opted out, unavailable, or has nothing to
+    say — the caller decides what to fall back to.
+    """
+    from mini_ork import memory as semantic
+
+    if os.environ.get("MO_SEMANTIC_INJECT", "1") != "1":
+        return ""
+    dbp = _db_path(db)
+    if not os.path.isfile(dbp):
+        return ""
+    rows = _approved_emergent_rows(dbp)
+    if not rows:
+        return ""
+
+    scope = task_class or "generic"
+    try:
+        # Close the loop before reading. A run that already finished has its
+        # verdict sitting in execution_traces, and a retrieval left pending
+        # counts toward `uses` forever with no chance of a win — so failing to
+        # sweep here would silently decay every memory the run used.
+        semantic.resolve_finished_runs(db_path=dbp)
+
+        candidates = []
+        for pattern_id, label, feats, strength in rows:
+            memory_id = semantic.upsert(
+                _emergent_text(feats, label),
+                scope=scope,
+                key=str(pattern_id),
+                db_path=dbp,
+            )
+            candidates.append((int(memory_id), float(strength or 0.0)))
+
+        ordered = semantic.rank_with_prior(
+            candidates, scope=scope, top_k=limit, db_path=dbp,
+        )
+
+        # Log the retrieval only when the caller is inside a run: an
+        # unattributable retrieval can never be resolved to a win, so writing
+        # one would depress this memory's utility for no information gained.
+        run_id = context_env("MINI_ORK_RUN_ID", "")
+        if run_id:
+            semantic.record_retrievals(
+                [hit["memory_id"] for hit in ordered],
+                scope=scope,
+                run_id=run_id,
+                task_class=task_class or "",
+                db_path=dbp,
+            )
+
+        lines = ["--- Verified emergent patterns (cross-run, judge-gate approved) ---"]
+        for hit in ordered:
+            # Credit is only ever claimed, never speculated: a retrieval whose
+            # run has not reported yet says nothing about this memory, so it
+            # gets no suffix rather than an implied "helped 0/N".
+            suffix = ""
+            if hit["wins"] > 0:
+                suffix = f"  (helped {hit['wins']}/{hit['uses']} retrievals)"
+            lines.append(f"- {hit['text']}{suffix}")
+        lines.append("--- /verified emergent patterns ---")
+        return "\n".join(lines)
+    except Exception:
+        # Any failure here degrades to the static block upstream. The prompt
+        # path must never break because the ranking layer could not run.
+        return ""
 
 
 def prior_runs_md(task_class: str, limit: int = 5, db: str | None = None) -> str:
