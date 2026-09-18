@@ -10,31 +10,32 @@ approve round-trip, synthesis-gate reasons, rc semantics), now asserted
 on the port's output.
 
 This file subsumes the retired tests/unit/test_promotion_gate.sh fixture:
-every one of its 7 assertions is covered here. Case (8) was ported from
+every one of its 7 assertions is covered here. Case (7) was ported from
 the .sh error-path assertion (``promotion_evaluate`` with no args exits
 non-zero).
 
-Eight cases:
+Seven cases:
 
-  (1) ``promotion_evaluate`` with no benchmark rows → decision in
-      {quarantined, rejected, promoted} AND the decision-field key set.
-  (2) ``MINI_ORK_REQUIRE_HUMAN_APPROVAL=true`` → decision=='pending_human_approval'.
-  (3) ``promotion_evaluate`` persisted row → migration-0011 schema column
+  (1) ``promotion_evaluate`` with no benchmark rows → decision=='rejected'
+      (no measurement ⇒ no promote) AND the decision-field key set.
+  (2) ``promotion_evaluate`` persisted row → migration-0011 schema column
       assertions (promotion_id, candidate_id, from_version_id,
       to_version_id, utility_*, decision, decided_by).
-  (4) ``promotion_approve`` round-trip: pre-create pending row via
-      evaluate, then approve; verify decision=='promoted', approver
+  (3) ``promotion_approve`` round-trip against a directly-seeded legacy
+      ``pending_human_approval`` row; verify decision=='promoted', approver
       matches, post-SELECT decided_by=='human'. Negative case: approve
-      on missing pending row → SystemExit.
-  (5) ``mo_promote_synthesis_gate`` deterministic-class bypass:
+      on missing pending row → SystemExit. The gate no longer produces
+      that decision (the human approval gate was removed), so the row is
+      seeded by hand — this covers resolving rows that predate the removal.
+  (4) ``mo_promote_synthesis_gate`` deterministic-class bypass:
       task_class='code_fix' with any panel_score → rc=0, reason='deterministic_class'.
-  (6) ``mo_promote_synthesis_gate`` all-conditions-met path:
+  (5) ``mo_promote_synthesis_gate`` all-conditions-met path:
       panel_score=87.5 + structural signals → rc=0, reason='all_conditions_met'.
-  (7) ``mo_promote_synthesis_gate`` rejection paths (3 sub-asserts in one
+  (6) ``mo_promote_synthesis_gate`` rejection paths (3 sub-asserts in one
       test): (a) low_panel_score → rc=1 reason='low_panel_score';
       (b) high panel but no structural signal → rc=1 reason='no_structural_signal';
       (c) bad JSON file → rc=2.
-  (8) ``promotion_evaluate`` with no args → the port raises TypeError
+  (7) ``promotion_evaluate`` with no args → the port raises TypeError
       (the Python analog of bash's ${1:?candidate_id required} guard).
 
 Floats: utility_before / utility_after / utility_delta are compared at
@@ -89,7 +90,7 @@ def _seed_workflow(db_path: Path) -> None:
             VALUES ('test-wf-v1', 'test-wf', 'deadbeef', '# test')
         """)
         for cid in (
-            "cand-no-bench", "cand-human", "cand-approve",
+            "cand-no-bench", "cand-approve",
             "cand-persist", "cand-approve-flow", "cand-persisted-decision",
         ):
             con.execute("""
@@ -97,6 +98,28 @@ def _seed_workflow(db_path: Path) -> None:
                     (candidate_id, base_workflow_version_id, created_by)
                 VALUES (?, 'test-wf-v1', 'human')
             """, (cid,))
+        con.commit()
+    finally:
+        con.close()
+
+
+def _seed_legacy_pending(db_path: Path, candidate_id: str) -> None:
+    """Write a ``pending_human_approval`` row directly.
+
+    The human approval gate was removed, so ``promotion_evaluate`` never emits
+    this decision. Rows carrying it still exist in live DBs from before the
+    removal, and ``promotion_approve`` is kept to resolve them — seeding the
+    row by hand is the only way to exercise that path.
+    """
+    con = sqlite3.connect(str(db_path))
+    try:
+        con.execute("""
+            INSERT INTO promotion_records
+                (promotion_id, candidate_id, from_version_id, to_version_id,
+                 utility_before, utility_after, rationale, decision, decided_by)
+            VALUES (?, ?, 'test-wf-v1', 'test-wf-v1', 0.0, 0.0,
+                    'legacy pending row', 'pending_human_approval', 'gate')
+        """, (f"pr-legacy-{candidate_id}", candidate_id))
         con.commit()
     finally:
         con.close()
@@ -137,16 +160,12 @@ def _seed_bench_all_pass(db_path: Path, candidate_id: str) -> None:
 # ── python-side helpers (in-process port) ──────────────────────────────────
 
 
-def _py_evaluate(db_path: Path, candidate_id: str,
-                 *, require_human: bool = False) -> dict:
+def _py_evaluate(db_path: Path, candidate_id: str) -> dict:
     """Run in-process promotion_evaluate. Returns the JSON dict.
 
     Mirrors bash's exit-1 contract via SystemExit when the candidate has
     no ``base_workflow_version_id`` row.
     """
-    os.environ.pop("MINI_ORK_REQUIRE_HUMAN_APPROVAL", None)
-    if require_human:
-        os.environ["MINI_ORK_REQUIRE_HUMAN_APPROVAL"] = "true"
     try:
         return pg.promotion_evaluate(str(db_path), candidate_id)
     except SystemExit:
@@ -156,7 +175,6 @@ def _py_evaluate(db_path: Path, candidate_id: str,
 
 def _py_approve(db_path: Path, candidate_id: str,
                 approver: str, rationale: str) -> dict:
-    os.environ.pop("MINI_ORK_REQUIRE_HUMAN_APPROVAL", None)
     return pg.promotion_approve(str(db_path), candidate_id, approver, rationale)
 
 
@@ -174,12 +192,19 @@ def _assert_float_eq(label: str, a, b, tol: float = _FLOAT_TOL) -> None:
 
 
 def test_promotion_evaluate_no_benchmark(db):
+    """Zero benchmark_results rows must never promote.
+
+    The decision tree used to guard every branch with ``and brun``, so
+    ``brun is None`` (nothing measured) slipped through to the final
+    ``else: promoted`` — asserting in the rationale that "all benchmark
+    tasks passed" when no task had run. No measurement ⇒ no promote.
+    """
     _seed_workflow(db)
-    # No benchmark_results → brun is None → the port falls through to the
-    # no-bench branch. The retired .sh accepted the
-    # {quarantined, rejected, promoted} set.
     pobj = _py_evaluate(db, "cand-no-bench")
-    assert pobj["decision"] in {"quarantined", "rejected", "promoted"}
+    assert pobj["decision"] == "rejected"
+    assert "no benchmark measurement" in pobj["rationale"]
+    # The fabricated claim that the old fall-through emitted.
+    assert "all benchmark tasks passed" not in pobj["rationale"]
     # Decision-field key set.
     for k in (
         "decision", "rationale", "utility_before", "utility_after",
@@ -195,22 +220,20 @@ def test_promotion_evaluate_no_benchmark(db):
         pobj["utility_after"] - pobj["utility_before"],
         pobj["utility_delta"],
     )
+    # The persisted row records the refusal, not a promote.
+    con = sqlite3.connect(str(db))
+    try:
+        row = con.execute(
+            "SELECT decision FROM promotion_records WHERE candidate_id=?",
+            ("cand-no-bench",),
+        ).fetchone()
+    finally:
+        con.close()
+    assert row is not None and row[0] == "rejected"
 
 
 # ───────────────────────────────────────────────────────────────────────────
-# (2) MINI_ORK_REQUIRE_HUMAN_APPROVAL=true → pending_human_approval.
-# ───────────────────────────────────────────────────────────────────────────
-
-
-def test_promotion_evaluate_require_human(db):
-    _seed_workflow(db)
-    pobj = _py_evaluate(db, "cand-human", require_human=True)
-    assert pobj["decision"] == "pending_human_approval"
-    assert "Human gate required" in pobj["rationale"]
-
-
-# ───────────────────────────────────────────────────────────────────────────
-# (3) Persisted-row schema — proves the port writes the migration-0011
+# (2) Persisted-row schema — proves the port writes the migration-0011
 #     schema (NOT the legacy CREATE-IF-NOT-EXISTS draft).
 # ───────────────────────────────────────────────────────────────────────────
 
@@ -252,15 +275,14 @@ def test_promotion_evaluate_persisted_row(db):
 
 
 # ───────────────────────────────────────────────────────────────────────────
-# (4) promotion_approve round-trip + negative path.
+# (3) promotion_approve round-trip + negative path.
 # ───────────────────────────────────────────────────────────────────────────
 
 
 def test_promotion_approve_round_trip(db):
     _seed_workflow(db)
-    # Pre-create pending_human_approval row via evaluate.
-    _seed_bench_all_pass(db, "cand-approve-flow")
-    _py_evaluate(db, "cand-approve-flow", require_human=True)
+    # A legacy pending row — the removed gate wrote these; nothing writes one now.
+    _seed_legacy_pending(db, "cand-approve-flow")
 
     pobj = _py_approve(db, "cand-approve-flow",
                        "test-approver", "Approved in parity test")
@@ -292,7 +314,7 @@ def test_promotion_approve_no_pending(db):
 
 
 # ───────────────────────────────────────────────────────────────────────────
-# (5) mo_promote_synthesis_gate deterministic-class bypass.
+# (4) mo_promote_synthesis_gate deterministic-class bypass.
 # ───────────────────────────────────────────────────────────────────────────
 
 
@@ -307,7 +329,7 @@ def test_mo_promote_synthesis_gate_bypass(tmp_path, db):
 
 
 # ───────────────────────────────────────────────────────────────────────────
-# (6) mo_promote_synthesis_gate all-conditions-met path.
+# (5) mo_promote_synthesis_gate all-conditions-met path.
 # ───────────────────────────────────────────────────────────────────────────
 
 
@@ -338,7 +360,7 @@ def test_mo_promote_synthesis_gate_all_conditions_met(tmp_path, db):
 
 
 # ───────────────────────────────────────────────────────────────────────────
-# (7) mo_promote_synthesis_gate rejection paths — three sub-asserts.
+# (6) mo_promote_synthesis_gate rejection paths — three sub-asserts.
 # ───────────────────────────────────────────────────────────────────────────
 
 
@@ -387,7 +409,7 @@ def test_mo_promote_synthesis_gate_rejections(tmp_path, db):
 
 
 # ───────────────────────────────────────────────────────────────────────────
-# (8) missing-arg error path — the port's required-positionals raise
+# (7) missing-arg error path — the port's required-positionals raise
 #     TypeError (the Python analog of bash's ${1:?candidate_id required}
 #     guard). Ports test_promotion_gate.sh's error-path assertion (its
 #     line 137): `promotion_evaluate` with no args exits non-zero.

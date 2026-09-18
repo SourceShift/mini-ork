@@ -9,10 +9,11 @@ Faithful port of the three public bash functions in
                                   baseline and writes a row to
                                   ``promotion_records`` (migration 0011
                                   schema).
-  * ``promotion_approve``      — resolves a ``pending_human_approval`` row
-                                  by UPDATE-then-SELECT and returns a
+  * ``promotion_approve``      — resolves a legacy ``pending_human_approval``
+                                  row by UPDATE-then-SELECT and returns a
                                   JSON payload with the post-update
-                                  ``decided_at``.
+                                  ``decided_at``. Nothing writes that
+                                  decision any more; kept for old rows.
   * ``mo_promote_synthesis_gate`` — selective-feedback conjunction gate for
                                   synthesis-class task classes
                                   (``research_synthesis``, ``refactor_audit``,
@@ -25,23 +26,27 @@ Faithful port of the three public bash functions in
                                   shell-out) so the gate never raises when
                                   the compute errors.
 
-Co-existence model (strangler-fig): ``lib/promotion_gate.sh`` stays
-byte-identical. This port gives Python callers an in-process target and
-gives ``tests/unit/test_promotion_gate_py.py`` a stable surface to diff
-against the LIVE bash subprocess (no mocks, no hardcoded outputs).
+History: this began as a strangler-fig port whose fidelity was checked by
+diffing against ``lib/promotion_gate.sh``. That script is gone (2026-07 bash
+removal), so the port is now the only implementation and this module is its
+contract.
 
 Public API mirrors the bash contract:
 
     promotion_evaluate(db_path, candidate_id, *,
-                       require_human=None, mini_ork_root=None) -> dict
+                       mini_ork_root=None) -> dict
         Returns the decision JSON as a dict. Raises ``SystemExit`` when
         the candidate has no ``base_workflow_version_id`` row (rc=1 in
         bash). Floats are rounded to 6 decimals (round(_, 6)).
+        ``pending_human_approval`` is never produced. It remains a legal
+        value in the ``promotion_records`` CHECK so that rows written before
+        the human gate was removed keep their meaning.
 
     promotion_approve(db_path, candidate_id, approver, rationale) -> dict
         Returns ``{candidate_id, decision, approver, approved_at}``.
         Raises ``SystemExit`` when no pending row was updated (rc=1 in
-        bash).
+        bash). Retained only to resolve legacy ``pending_human_approval``
+        rows written before the gate was removed; nothing produces new ones.
 
     mo_promote_synthesis_gate(verdict_file, task_class, *,
                               mini_ork_root=None,
@@ -57,7 +62,6 @@ Env knobs (bash reads these at function entry; the Python port reads the
 same env names with the same defaults at function entry — NO import-time
 caching):
 
-    MINI_ORK_REQUIRE_HUMAN_APPROVAL  → promotion_evaluate require_human (default "false")
     MO_PROMOTE_SCORE_THRESHOLD       → synthesis gate panel-score floor (default 80)
     MO_CW_POR_THRESHOLD              → CW-POR ceiling (default 0.3)
     MO_MIN_CITATION_DENSITY          → min citation density per lens (default 3)
@@ -144,7 +148,6 @@ def promotion_evaluate(
     db_path: str,
     candidate_id: str,
     *,
-    require_human: str | None = None,
     mini_ork_root: str | None = None,  # noqa: ARG001 - parity with bash; unused
 ) -> dict[str, Any]:
     """Evaluate a candidate for promotion.
@@ -155,9 +158,10 @@ def promotion_evaluate(
         ``benchmark_results`` for the candidate_id
       * baseline ``utility_score`` from ``version_registry`` (default 0.0
         when missing) — guarded by a sqlite_master existence check
-      * decision tree: ``require_human`` → pending_human_approval; not
-        all_pass && total_tasks>0 → rejected; utility_delta≤0 → quarantined;
-        else promoted
+      * decision tree: no ``benchmark_results`` rows at all → rejected (no
+        measurement, no promote); not all_pass → rejected; utility_delta≤0 →
+        quarantined; else promoted. There is no human branch: a gate decision
+        is a measurement verdict, never a request for approval.
       * INSERTs into ``promotion_records`` (migration 0011 schema:
         ``promotion_id`` PK, ``from_version_id`` + ``to_version_id`` NOT
         NULL FKs to workflow_memory, ``decided_by``='gate')
@@ -175,9 +179,6 @@ def promotion_evaluate(
         raise SystemExit("promotion_evaluate: candidate_id required")
 
     ensure_table(db_path)
-
-    if require_human is None:
-        require_human = os.environ.get("MINI_ORK_REQUIRE_HUMAN_APPROVAL", "false")
 
     # Connect — match bash: PRAGMA busy_timeout=5000 not strictly needed
     # for in-process reads, but keeps parity with the embedded heredocs
@@ -223,16 +224,26 @@ def promotion_evaluate(
         utility_delta = utility_after - utility_before
 
         # ── Decision logic (mirrors bash lines 123-140) ──
-        if require_human.lower() == "true":
-            decision = "pending_human_approval"
-            rationale = "Human gate required (MINI_ORK_REQUIRE_HUMAN_APPROVAL=true)"
-        elif (not all_pass) and brun and brun["total_tasks"] > 0:
+        if brun is None:
+            # Zero benchmark_results rows: nothing was measured. The old
+            # fall-through promoted here, and the rationale asserted "all
+            # benchmark tasks passed" — a promote on no evidence, recorded in
+            # the audit trail indistinguishably from a measured improvement.
+            # Rejected rather than quarantined: unmeasured is re-evaluatable,
+            # a verdict on the candidate it is not. No measurement ⇒ no promote.
+            decision = "rejected"
+            rationale = (
+                "no benchmark measurement recorded for this candidate "
+                "(0 benchmark_results rows); refusing promote without a real "
+                "held-out evaluation"
+            )
+        elif not all_pass:
             decision = "rejected"
             rationale = (
                 f"Not all benchmark tasks passed "
                 f"({brun['passed']}/{brun['total_tasks']})"
             )
-        elif utility_delta <= 0 and brun:
+        elif utility_delta <= 0:
             decision = "quarantined"
             rationale = (
                 f"Utility did not improve: before={utility_before:.4f}, "

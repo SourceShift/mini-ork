@@ -135,11 +135,11 @@ CREATE TABLE apply_attempts (
 _APPLY_ENV = [
     "MINI_ORK_DB", "MINI_ORK_HOME", "MINI_ORK_ROOT",
     "MO_APPLY_ENABLED", "MO_APPLY_DRY_RUN", "MO_APPLY_SCORER",
-    "MO_APPLY_UNVETTED", "MO_APPLY_MODE",
+    "MO_APPLY_MODE",
     "MO_APPLY_NONREGRESSION_DELTA", "MO_APPLY_MIN_EXAMPLES",
     "MO_APPLY_REGRESSION_TOLERANCE", "MO_APPLY_PERTASK_JSON",
     "MO_APPLY_MOCK_BASELINE", "MO_APPLY_MOCK_DELTA",
-    "MO_APPLY_FORCE_REGRESSION", "MINI_ORK_REQUIRE_HUMAN_APPROVAL",
+    "MO_APPLY_FORCE_REGRESSION",
     "MO_AUTO_APPLY", "MO_AUTO_APPLY_MAX_TARGETS",
     "MO_APPLY_PROBE_MAX_TASKS", "MO_APPLY_PROBE_BUDGET_USD",
     "MO_APPLY_PROBE_TIMEOUT_S",
@@ -289,12 +289,51 @@ def test_evaluate_gate_pertask_no_regression(db, envscrub):
     assert tol["decision"] == "promoted"
 
 
-def test_evaluate_gate_human_approval_override(db, envscrub):
+def test_evaluate_gate_measured_path_requires_strict_improvement(db):
+    """A real held-out measurement must show a GAIN, not merely the absence of
+    a regression.
+
+    On the scalar-only path (no per-task vectors) delta == dt promotes — that
+    is the legacy "no regression" rule, pinned by
+    test_evaluate_gate_scalar_paths. Once per-task vectors exist, a real probe
+    run has happened, and a candidate whose publish rate equals the baseline's
+    is indistinguishable from a directive that does nothing — as is a probe
+    harness where every probe fails in BOTH arms. Both used to promote.
+    """
+    # Every probe publishes in both arms: the measurement found no difference.
+    flat = json.loads(ap.evaluate_gate(
+        "cand-test", 1.0, 1.0, '{"before":[1,1],"after":[1,1],"ids":["p1","p2"]}'))
+    assert flat["decision"] == "quarantined"
+    assert flat["rationale"].startswith("no measured improvement")
+    assert flat["regressed_tasks"] == 0
+
+    # Every probe fails in both arms (broken harness): also no evidence.
+    dead = json.loads(ap.evaluate_gate(
+        "cand-test", 0.0, 0.0, '{"before":[0,0],"after":[0,0],"ids":["p1","p2"]}'))
+    assert dead["decision"] == "quarantined"
+    assert dead["rationale"].startswith("no measured improvement")
+
+    # One probe recovered (0→1), none regressed: a measured gain.
+    gain = json.loads(ap.evaluate_gate(
+        "cand-test", 0.5, 1.0, '{"before":[0,1],"after":[1,1],"ids":["p1","p2"]}'))
+    assert gain["decision"] == "promoted"
+
+    # The scalar path is untouched: no vectors ⇒ delta >= dt still promotes.
+    assert json.loads(ap.evaluate_gate("cand-test", 0.5, 0.5))["decision"] == "promoted"
+
+
+def test_evaluate_gate_human_approval_flag_is_inert(db, envscrub):
+    """The old human gate is gone, and its env var cannot bring it back.
+
+    ``MINI_ORK_REQUIRE_HUMAN_APPROVAL`` used to divert every gate decision to
+    ``pending_human_approval``. The gate is now a measurement verdict with no
+    approval branch, so the variable has no reader: setting it must not change
+    the outcome, and ``needs_human`` must not be part of the payload.
+    """
     envscrub.setenv("MINI_ORK_REQUIRE_HUMAN_APPROVAL", "true")
     out = json.loads(ap.evaluate_gate("cand-test", 0.5, 0.9))
-    assert out["decision"] == "pending_human_approval"
-    assert out["needs_human"] is True
-    assert out["rationale"] == "human approval required (MINI_ORK_REQUIRE_HUMAN_APPROVAL=true)"
+    assert out["decision"] == "promoted"       # the measurement verdict, unchanged
+    assert "needs_human" not in out
 
 
 # ── 8. apply_run: no_candidate ───────────────────────────────────────────────
@@ -362,8 +401,11 @@ def test_apply_run_enabled_rewrites_file_and_registers_version(db, tmp_path, cap
     target = tmp_path / "reviewer.md"
     target.write_text("ORIGINAL PROMPT\n")
     envscrub.setenv("MO_APPLY_ENABLED", "1")
-    probe_out = {"before": 1.0, "after": 1.0, "n": 2,
-                 "pertask_json": json.dumps({"before": [1, 1], "after": [1, 1],
+    # A measured GAIN (one probe recovered, none regressed) — the only shape
+    # that promotes now that the human gate is gone: see
+    # test_evaluate_gate_measured_path_requires_strict_improvement.
+    probe_out = {"before": 0.5, "after": 1.0, "n": 2,
+                 "pertask_json": json.dumps({"before": [0, 1], "after": [1, 1],
                                              "ids": ["probe-1.md", "probe-2.md"]}),
                  "runs": [], "cost_usd": 0.08}
     monkeypatch.setattr(ps, "probe_score", lambda *a, **k: dict(probe_out))
@@ -585,7 +627,7 @@ def test_probe_scorer_two_arms_vectors_and_cleanup(tmp_path, monkeypatch):
     launches = []
     outcomes = {}
 
-    def fake_launch(recipe_name, kickoff):
+    def fake_launch(recipe_name, kickoff, target_cwd=None):
         arm = "cand" if "__probe_" in recipe_name and recipe_name.endswith("_1") else "base"
         rid = f"run-{arm}-{len(launches)}"
         # Prove the candidate arm actually carries the directive block.
@@ -595,6 +637,9 @@ def test_probe_scorer_two_arms_vectors_and_cleanup(tmp_path, monkeypatch):
         else:
             assert mut.read_text() == "BASE PROMPT\n"
         assert not (tmp_path / "recipes" / recipe_name / "probes").exists()
+        # obs-smoke's probes declare no fixture: they write only into their own
+        # run dir, so there is no target to hand over.
+        assert target_cwd is None
         launches.append((recipe_name, kickoff, arm))
         return f"mini_ork_result={{\"run_id\": \"{rid}\"}}\n", rid, 0.01
 
@@ -632,7 +677,7 @@ def test_probe_scorer_absolute_target_lands_in_temp_copy(tmp_path, monkeypatch):
     ps, recipe = _probe_fixture(tmp_path, monkeypatch)
     seen = {}
 
-    def fake_launch(recipe_name, kickoff):
+    def fake_launch(recipe_name, kickoff, target_cwd=None):
         mut = tmp_path / "recipes" / recipe_name / "prompts" / "tiny-researcher.md"
         if "__probe_" in recipe_name and recipe_name.endswith("_1"):
             seen["cand"] = mut.read_text()
@@ -648,6 +693,50 @@ def test_probe_scorer_absolute_target_lands_in_temp_copy(tmp_path, monkeypatch):
     assert (recipe / "prompts" / "tiny-researcher.md").read_text() == "BASE PROMPT\n"
     # An absolute target OUTSIDE the recipe dir measures nothing → None.
     assert ps.probe_score("obs_smoke", str(tmp_path / "elsewhere" / "x.md"), "d") is None
+
+
+def test_probe_scorer_gives_each_arm_a_fresh_target_copy(tmp_path, monkeypatch):
+    """A file-editing recipe needs somewhere to edit that is not the framework
+    tree, and each (probe, arm) launch needs its OWN copy.
+
+    Without a target, both arms run in MINI_ORK_ROOT — refused by
+    providers.cwd_guard, and shared between arms even where it is not, so the
+    candidate would start from the baseline's edits. Fresh per (probe, arm),
+    not per arm: the recipe arms are materialized once and reused across the
+    whole probe loop, so one probe's edits would otherwise be visible to the
+    next launch.
+    """
+    ps, recipe = _probe_fixture(tmp_path, monkeypatch)
+    # Give both probes a fixture: probes/fixtures/<stem>/
+    for i in (1, 2, 3):
+        fx = recipe / "probes" / "fixtures" / f"probe-{i}"
+        fx.mkdir(parents=True)
+        (fx / "tally.py").write_text("ORIGINAL\n")
+
+    targets = []
+
+    def fake_launch(recipe_name, kickoff, target_cwd=None):
+        assert target_cwd is not None, "fixture probe must hand over a target"
+        # Hand each arm a mutated copy, then prove the next launch is untouched.
+        p = Path(target_cwd) / "tally.py"
+        assert p.read_text() == "ORIGINAL\n"
+        p.write_text(f"MUTATED BY {recipe_name}\n")
+        targets.append(target_cwd)
+        rid = f"run-{len(targets)}"
+        return f'mini_ork_result={{"run_id": "{rid}"}}\n', rid, 0.0
+
+    monkeypatch.setattr(ps, "_launch_run", fake_launch)
+    monkeypatch.setattr(ps, "_run_outcome", lambda rid: 1.0)
+    out = ps.probe_score("obs_smoke", "prompts/tiny-researcher.md", "d")
+
+    # 2 probes × 2 arms == 4 launches, each in its own directory.
+    assert len(targets) == 4
+    assert len(set(targets)) == 4
+    assert out["n"] == 2
+    # Every scratch target is removed on the way out.
+    assert not any(Path(t).exists() for t in targets)
+    # The frozen fixture is untouched.
+    assert (recipe / "probes" / "fixtures" / "probe-1" / "tally.py").read_text() == "ORIGINAL\n"
 
 
 def test_probe_scorer_budget_zero_truncates_to_nothing(tmp_path, monkeypatch, envscrub):
@@ -738,11 +827,11 @@ def test_apply_run_probe_no_probe_set_never_promotes(db, tmp_path, capsys, envsc
                       str(target), db=db)
     assert rc == 0
     summary = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
-    assert summary["decision"] == "pending_human_approval"
+    assert summary["decision"] == "quarantined"
     assert summary["version_id"] == ""
     assert target.read_text() == "ORIGINAL PROMPT\n"
     att = _rows(db, "apply_attempts")[0]
-    assert att["decision"] == "pending_human_approval"
+    assert att["decision"] == "quarantined"
     assert "measured nothing" in att["rationale"]
 
 
@@ -756,8 +845,11 @@ def test_apply_run_probe_vetted_promote_without_unvetted(db, tmp_path, capsys, e
     target.write_text("ORIGINAL PROMPT\n")
     envscrub.setenv("MO_APPLY_SCORER", "probe")
     envscrub.setenv("MO_APPLY_ENABLED", "1")
-    probe_out = {"before": 1.0, "after": 1.0, "n": 2,
-                 "pertask_json": json.dumps({"before": [1, 1], "after": [1, 1],
+    # A measured GAIN (one probe recovered, none regressed) — the only shape
+    # that promotes now that the human gate is gone: see
+    # test_evaluate_gate_measured_path_requires_strict_improvement.
+    probe_out = {"before": 0.5, "after": 1.0, "n": 2,
+                 "pertask_json": json.dumps({"before": [0, 1], "after": [1, 1],
                                              "ids": ["probe-1.md", "probe-2.md"]}),
                  "runs": [], "cost_usd": 0.08}
     monkeypatch.setattr(ps, "probe_score", lambda *a, **k: dict(probe_out))
@@ -776,7 +868,7 @@ def test_apply_run_probe_vetted_promote_without_unvetted(db, tmp_path, capsys, e
     assert "probe: n=2" in promo["rationale"]
     assert "cost=$0.08" in promo["rationale"]
     att = _rows(db, "apply_attempts")[0]
-    assert att["utility_before"] == pytest.approx(1.0)
+    assert att["utility_before"] == pytest.approx(0.5)
     assert att["utility_after"] == pytest.approx(1.0)
 
 
@@ -822,13 +914,19 @@ def test_apply_run_probe_dead_arms_refuse_promote(db, tmp_path, capsys, envscrub
                       str(target), db=db)
     assert rc == 0
     summary = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
-    assert summary["decision"] == "pending_human_approval"
+    assert summary["decision"] == "quarantined"
     assert summary["version_id"] == ""
     assert target.read_text() == "ORIGINAL PROMPT\n"
     att = _rows(db, "apply_attempts")[0]
     assert "dead harness" in att["rationale"]
 
-    # 0 → positive is a genuine improvement and stays promotable.
+    # 0 → positive is a genuine improvement and stays promotable. A FRESH
+    # directive is needed: the dead-harness refusal is a recorded verdict, so
+    # edit memory would reject a re-proposal of gr-1 outright (that is the
+    # spend containment — an unmeasured attempt is not re-run forever). Seed
+    # a higher-confidence one so pick_candidate selects it over gr-1.
+    _seed_gradient(db, gradient_id="gr-2", target="prompts/reviewer.md",
+                   change="revive idea", confidence=0.9, task_class="reviewer")
     revive = {"before": 0.0, "after": 0.5, "n": 2,
               "pertask_json": json.dumps({"before": [0, 0], "after": [1, 0],
                                           "ids": ["probe-1.md", "probe-2.md"]}),
@@ -854,7 +952,7 @@ def test_apply_run_launch_failure_is_caught_not_fatal(db, tmp_path, capsys, envs
                       str(tmp_path / "reviewer.md"), db=db)
     assert rc == 0
     summary = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
-    assert summary["decision"] == "pending_human_approval"
+    assert summary["decision"] == "quarantined"
 
 
 # ── 12c. Edit memory (#19 prereq) + auto_sweep (#19) + execute wiring ────────
@@ -904,13 +1002,18 @@ def test_auto_sweep_top1_per_target_through_gate(db, tmp_path, capsys, envscrub,
                    change="directive two", confidence=0.8, task_class="obs_smoke")
     _seed_gradient(db, gradient_id="gr-x", target="cross_class:whatever",
                    change="cross-class", confidence=0.99, task_class="obs_smoke")
-    envscrub.setenv("MO_APPLY_ENABLED", "1")  # gate master on; scorer=mock default
+    envscrub.setenv("MO_APPLY_ENABLED", "1")
+    # Pin the fabricating scorer explicitly. The default is now `probe`, and
+    # `recipes/obs-smoke/probes/` exists in the real tree, so leaving it unset
+    # would launch real held-out runs from a unit test.
+    envscrub.setenv("MO_APPLY_SCORER", "mock")
     results = ap.auto_sweep("obs_smoke", db=db, max_targets=2)
     # top-1 per target, confidence-ordered, cross_class excluded
     assert [r["target"] for r in results] == ["agent.tiny-researcher.prompt",
                                               "agent.tiny-reviewer.prompt"]
-    # mock scorer without UNVETTED → both gated to pending_human_approval
-    assert all(r["decision"] == "pending_human_approval" for r in results)
+    # mock fabricates utility (after≈0.55 against a 0.0 baseline), so the
+    # fabrication guard refuses the promote: quarantined, never promoted.
+    assert all(r["decision"] == "quarantined" for r in results)
     attempts = _rows(db, "apply_attempts")
     assert len(attempts) == 2
     assert {a["source_id"] for a in attempts} == {"gr-hi", "gr-rev"}
