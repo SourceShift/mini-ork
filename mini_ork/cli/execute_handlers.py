@@ -168,7 +168,8 @@ def dispatch_node(fields, *, root, run_dir, plan_path, task_class, db, run_id,
                     lane=lane,
                     route_source=_route_prov.get("route_source", ""),
                     route_explore=bool(_route_prov.get("route_explore")),
-                    route_score=_route_prov.get("route_score"))
+                    route_score=_route_prov.get("route_score"),
+                    route_margin=_route_prov.get("route_margin"))
         # F4: publish the durable checkpoint at the SAME single seam as the
         # trace write. The wrapper unifies node-completion side effects so
         # E2's recovery code can rely on every success also having a row.

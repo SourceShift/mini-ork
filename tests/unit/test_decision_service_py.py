@@ -17,6 +17,7 @@ import pytest
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
 from mini_ork import lane_router, trace_store  # noqa: E402
+from mini_ork.dispatch import calibration as cal  # noqa: E402
 from mini_ork.steering import decision_service as ds
 
 
@@ -113,3 +114,80 @@ def test_route_provenance_labels_the_decision(env_db, monkeypatch):
     assert q["route_explore"] is True
     # the score still reports the estimate that was overridden, not the swap
     assert q["route_score"] == p["route_score"]
+
+
+def test_calibrated_escalation_labels_the_route(env_db, monkeypatch):
+    """UCCI turns the margin into a predicted error and escalates past it.
+
+    The learned lane wins the router's ranking, but the calibration map says a
+    win this narrow has historically meant an error for this task class, so the
+    decision escalates to the frontier lane. The point of the label is that the
+    escalation is distinguishable after the fact from a learned pick or an
+    agents.yaml default — otherwise the escalation's own outcome is unattributable
+    and the threshold can never be re-derived from what it predicted.
+    """
+    monkeypatch.setenv("MO_UCCI_CACHE_TTL", "0")
+    monkeypatch.delenv("MO_UCCI", raising=False)
+    monkeypatch.delenv("MO_UCCI_TARGET_ERROR", raising=False)
+    monkeypatch.setenv("MO_FRONTIER_LANE", "opus_lens")
+    cal.clear_cache()
+
+    def seed(lane, rv, n=3, margin=None, status="success"):
+        for _ in range(n):
+            payload = {"task_class": "code-fix", "status": status,
+                       "agent_version_id": lane, "objective_domain": "code-delivery",
+                       "verifier_output": {"node_type": "implementer"},
+                       "reward_value": rv, "reward_anchor": 0.5,
+                       "reward_direction": "higher_is_better"}
+            if margin is not None:
+                payload["route_margin"] = margin
+            trace_store.trace_write(payload, db=env_db)
+
+    # laneA wins the ranking with laneB as runner-up, so the margin is thin.
+    seed("laneA", 1.0)
+    seed("laneB", 0.0)
+    # Other lanes' narrow losses fill the pooled map (laneA itself has no margin
+    # rows, so the per-lane fit abstains and the pooled slice answers).
+    for lane in ("laneC", "laneD", "laneE"):
+        seed(lane, 0.0, n=4, margin=0.05, status="failure")
+    lane_router.recompute_advantages(db=env_db)
+
+    p = ds.decide("implementer", "code-fix", "code-delivery", db=env_db)
+    assert p["route"] == "opus_lens"
+    assert p["route_source"] == "calibrated_escalation"
+    assert p["route_explore"] is False
+    assert p["predicted_error"] is not None and p["predicted_error"] > 0.15
+    # The escalation replaces the lane, not the record of the comparison it
+    # replaced — the winning estimate stays visible for the next refit.
+    assert p["route_score"] is not None
+
+
+def test_opt_out_restores_uncalibrated_routing(env_db, monkeypatch):
+    """MO_UCCI=0 leaves the learned lane in place: the margin is still recorded
+    (so the map keeps accumulating rows) but nothing escalates on it."""
+    monkeypatch.setenv("MO_UCCI_CACHE_TTL", "0")
+    monkeypatch.setenv("MO_UCCI", "0")
+    monkeypatch.setenv("MO_FRONTIER_LANE", "opus_lens")
+    cal.clear_cache()
+
+    def seed(lane, rv, n=3, margin=None, status="success"):
+        for _ in range(n):
+            payload = {"task_class": "code-fix", "status": status,
+                       "agent_version_id": lane, "objective_domain": "code-delivery",
+                       "verifier_output": {"node_type": "implementer"},
+                       "reward_value": rv, "reward_anchor": 0.5,
+                       "reward_direction": "higher_is_better"}
+            if margin is not None:
+                payload["route_margin"] = margin
+            trace_store.trace_write(payload, db=env_db)
+
+    seed("laneA", 1.0)
+    seed("laneB", 0.0)
+    for lane in ("laneC", "laneD", "laneE"):
+        seed(lane, 0.0, n=4, margin=0.05, status="failure")
+    lane_router.recompute_advantages(db=env_db)
+
+    p = ds.decide("implementer", "code-fix", "code-delivery", db=env_db)
+    assert p["route"] == "laneA"
+    assert p["route_source"] == "learned"
+    assert p["predicted_error"] is None

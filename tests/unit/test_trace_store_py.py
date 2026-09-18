@@ -282,3 +282,52 @@ def test_route_provenance_roundtrip(tmp_path):
     assert row["route_source"] == "default"
     assert row["route_explore"] == 0
     assert row["route_score"] is None
+
+
+def test_route_margin_roundtrip(tmp_path):
+    """route_margin survives write, is replaced by a stated UPSERT, and is
+    preserved by a re-write that omits it — the same three-place hazard as the
+    other route columns, asserted here for the calibration input.
+
+    A negative margin is load-bearing, not an error: the EntroRouter recovery
+    floor can lift a lane above the bandit winner, and that is exactly the
+    comparison the calibration map must learn to be wrong about."""
+    db = _init_db(tmp_path / "margin-home")
+    trace_store.trace_write({
+        "trace_id": "tr-margin", "task_class": "code-fix", "status": "success",
+        "agent_version_id": "glm_lens",
+        "route_source": "learned", "route_explore": False,
+        "route_score": 0.4213, "route_margin": 0.1875,
+    }, db=db)
+    row = trace_store.trace_get("tr-margin", db=db)
+    assert row["route_margin"] == pytest.approx(0.1875)
+
+    # A stated margin overwrites, including a negative one (floor beat the winner).
+    trace_store.trace_write({
+        "trace_id": "tr-margin", "task_class": "code-fix", "status": "failure",
+        "route_source": "learned", "route_explore": False,
+        "route_score": 0.10, "route_margin": -0.3201,
+    }, db=db)
+    row = trace_store.trace_get("tr-margin", db=db)
+    assert row["route_margin"] == pytest.approx(-0.3201)
+
+    # Re-write with no margin leaves the recorded calibration input alone.
+    trace_store.trace_write(
+        {"trace_id": "tr-margin", "task_class": "code-fix", "status": "success"}, db=db)
+    row = trace_store.trace_get("tr-margin", db=db)
+    assert row["route_margin"] == pytest.approx(-0.3201)
+
+    # No margin recorded is NULL, never 0.0 — 0.0 is a real dead-heat margin.
+    trace_store.trace_write({
+        "trace_id": "tr-margin-none", "task_class": "code-fix", "status": "success",
+        "route_source": "default", "route_explore": False,
+    }, db=db)
+    row = trace_store.trace_get("tr-margin-none", db=db)
+    assert row["route_margin"] is None
+
+    trace_store.trace_write({
+        "trace_id": "tr-margin-zero", "task_class": "code-fix", "status": "success",
+        "route_source": "learned", "route_explore": False, "route_margin": 0.0,
+    }, db=db)
+    row = trace_store.trace_get("tr-margin-zero", db=db)
+    assert row["route_margin"] == pytest.approx(0.0)

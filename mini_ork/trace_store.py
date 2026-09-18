@@ -103,8 +103,8 @@ def trace_write(payload: dict | str, db: str | None = None) -> str:
             objective_domain, segment, reward_primary_metric, reward_direction,
             reward_value, reward_anchor, reward_g, reward_vector_json,
             reward_source, validity,
-            route_source, route_explore, route_score
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            route_source, route_explore, route_score, route_margin
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(trace_id) DO UPDATE SET
             status=excluded.status, run_id=COALESCE(excluded.run_id, run_id),
             verifier_output=excluded.verifier_output,
@@ -118,7 +118,8 @@ def trace_write(payload: dict | str, db: str | None = None) -> str:
             reward_source=excluded.reward_source, validity=excluded.validity,
             route_source=COALESCE(excluded.route_source, route_source),
             route_explore=COALESCE(excluded.route_explore, route_explore),
-            route_score=COALESCE(excluded.route_score, route_score)""",
+            route_score=COALESCE(excluded.route_score, route_score),
+            route_margin=COALESCE(excluded.route_margin, route_margin)""",
         (
             trace_id, run_id, p.get("task_class", ""), prompt_version,
             p.get("context_bundle_hash", "") or "",
@@ -139,6 +140,7 @@ def trace_write(payload: dict | str, db: str | None = None) -> str:
             p.get("route_source"),
             (int(bool(p["route_explore"])) if p.get("route_explore") is not None else None),
             (float(p["route_score"]) if p.get("route_score") is not None else None),
+            (float(p["route_margin"]) if p.get("route_margin") is not None else None),
         ),
     )
     con.commit()
