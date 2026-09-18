@@ -62,7 +62,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import shutil
 import sqlite3
 import sys
 import time
@@ -572,11 +571,15 @@ def apply_mutation(candidate_id: str, target_file: str, new_prompt: str,
                 f"{target_file}; skipping (idempotent)\n")
             return ""
 
-    # Snapshot the previous file content into a rollback handle BEFORE writing.
+    # Snapshot the previous file content BEFORE writing. It travels in the
+    # registry payload (see below), not in a `<target>.apply-rollback-<pid>`
+    # sidecar: the sidecar only survives as long as nobody cleans the worktree,
+    # and version_registry.rollback() had no way to locate it anyway — which is
+    # why a rollback used to move status columns and leave the promoted text on
+    # disk. The hash is kept as a cheap integrity check on the stored content.
     prev_hash = ""
     if existing:
         prev_hash = hashlib.sha256(existing.encode("utf-8")).hexdigest()
-        shutil.copyfile(target_file, f"{target_file}.apply-rollback-{os.getpid()}")
 
     if existing and mode == "append":
         block = _directive_block(new_prompt, source_ref=source_ref,
@@ -593,10 +596,12 @@ def apply_mutation(candidate_id: str, target_file: str, new_prompt: str,
         raise
 
     # Record the version. kind='agent' because prompt rewrites are agent-side
-    # changes. The payload carries the prior hash + target path so
-    # version_rollback can recover. Bash sourced lib/version_registry.sh with
-    # `|| true` and skipped the call when unavailable — mirror by swallowing
-    # any failure and returning "".
+    # changes. The payload carries both file texts — ``content`` is what this
+    # promotion wrote, ``baseline_content`` is what was there before — so
+    # version_registry.rollback() can put real bytes back, and can mint the
+    # first promotion's predecessor row from the same text. Bash sourced
+    # lib/version_registry.sh with `|| true` and skipped the call when
+    # unavailable — mirror by swallowing any failure and returning "".
     version_id = ""
     try:
         from mini_ork.registries import version_registry
@@ -606,6 +611,11 @@ def apply_mutation(candidate_id: str, target_file: str, new_prompt: str,
             "status": "stable",
             "utility_score": 0.0,
             "rollback_hash": prev_hash,
+            "content": out,
+            # None when the target did not exist before this mutation: there is
+            # no predecessor state to restore, so no baseline row is minted and
+            # a later rollback raises rather than guessing.
+            "baseline_content": existing or None,
             "candidate_id": candidate_id,
             "target_path": target_file,
         })
