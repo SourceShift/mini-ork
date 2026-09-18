@@ -691,6 +691,14 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
     db = ctx.db_or_default()
     run_id = ctx.run_id
     recipe = ctx.recipe
+    # Recipe-local register.py bootstrap. Skipped when the workflow came from
+    # MINI_ORK_WORKFLOW (non-standard recipe location) or when no recipe name
+    # was resolved — both cases must not introduce a new failure mode. Any
+    # load error propagates as RecipeRegisterError (rc != 0).
+    if recipe and not os.environ.get("MINI_ORK_WORKFLOW"):
+        from pathlib import Path as _Path
+        from mini_ork.cli.recipe_register import load_recipe_register
+        load_recipe_register(_Path(os.path.join(root, "recipes", recipe)))
     live_run_dir = ctx.run_dir or run_dir
     llm = dispatch_fn or _default_llm_dispatch(root)
     # F3: without a trace_fn the live path writes zero execution_traces rows and the
