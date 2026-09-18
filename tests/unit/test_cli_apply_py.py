@@ -10,11 +10,12 @@ reference; these tests pin the ported behaviour against tmp sqlite fixtures:
   4. score_candidate: deterministic mock + forced-regression seam
   5. evaluate_gate: equal / regression / improvement (bash self-test cases)
   6. evaluate_gate: per-task no-regression gate (2607.14004) + tolerance seam
-  7. evaluate_gate: human-approval override
+  7. evaluate_gate: the retired human-approval flag is inert
   8. apply_run: no_candidate path (audit row + summary line)
   9. apply_run: full dry-run promote path (candidate + promotion + attempt rows,
      no file write while MO_APPLY_ENABLED is off)
- 10. apply_run: enabled promote rewrites the target file + version_registry row
+ 10. apply_run: enabled promote rewrites the target file + the version_registry
+     rows (promoted + baseline) that make it reversible
  11. apply_run: forced regression quarantines (file untouched)
  12. CLI: --help / usage errors / missing-flag-value exit codes
  13. Native integration: apply is in _NATIVE_SUBS, native dispatch (_EXEC_SUBS deleted), and the
@@ -420,19 +421,27 @@ def test_apply_run_enabled_rewrites_file_and_registers_version(db, tmp_path, cap
     assert applied.startswith("ORIGINAL PROMPT\n")
     assert "<!-- applied:pattern_records:pat-1 -->" in applied
     assert "- Directive: improve prompts/reviewer.md wording" in applied
-    # rollback snapshot next to the target (bash: <file>.apply-rollback-$$)
-    rollbacks = list(tmp_path.glob("reviewer.md.apply-rollback-*"))
-    assert len(rollbacks) == 1
-    assert rollbacks[0].read_text() == "ORIGINAL PROMPT\n"
-    # version_registry row exists and the summary carries its id
+    # The rollback handle is in the registry payload, not a
+    # `<target>.apply-rollback-<pid>` sidecar: the sidecar survived only as long
+    # as nobody cleaned the worktree, and rollback() could not locate it anyway.
+    assert list(tmp_path.glob("reviewer.md.apply-rollback-*")) == []
     versions = _rows(db, "version_registry")
-    assert len(versions) == 1
-    assert versions[0]["kind"] == "agent"
-    assert versions[0]["name"] == str(target)
-    payload = json.loads(versions[0]["payload"])
+    # Two rows: the promoted version, plus the baseline row minted for the
+    # pre-mutation text so this first promotion has somewhere to roll back to.
+    assert len(versions) == 2
+    promoted = [v for v in versions if not json.loads(v["payload"]).get("baseline")]
+    baseline = [v for v in versions if json.loads(v["payload"]).get("baseline")]
+    assert len(promoted) == 1 and len(baseline) == 1
+    assert promoted[0]["kind"] == "agent"
+    assert promoted[0]["name"] == str(target)
+    assert promoted[0]["promoted_at"] is not None
+    assert promoted[0]["previous_stable_version"] == baseline[0]["version_id"]
+    payload = json.loads(promoted[0]["payload"])
     assert payload["rollback_hash"]
+    assert payload["content"] == applied
     assert payload["candidate_id"] == summary["candidate_id"]
-    assert summary["version_id"] == versions[0]["version_id"]
+    assert json.loads(baseline[0]["payload"])["content"] == "ORIGINAL PROMPT\n"
+    assert summary["version_id"] == promoted[0]["version_id"]
     assert _rows(db, "apply_attempts")[0]["apply_enabled"] == 1
     # the promote is measured, not fabricated
     rationale = _rows(db, "promotion_records")[0]["rationale"]

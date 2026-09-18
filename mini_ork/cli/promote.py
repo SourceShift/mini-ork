@@ -24,10 +24,11 @@ _USAGE = """Usage: mini-ork promote --candidate <id> [--force] [--dry-run]
 Run the promotion gate for a workflow candidate.
 
 Decisions:
-  promoted     → version_registry.sh:version_register is called; candidate goes live
+  promoted     → version_registry.register is called; candidate goes live
   rejected     → candidate remains in evaluated state; no version bump
   quarantined  → candidate is permanently blocked; cannot be re-evaluated
-                 (use: mini-ork version_clear_quarantine --candidate <id> to unblock)
+                 (no CLI clears this — call version_registry.clear_quarantine
+                 from Python; see docs/SAFETY.md "Quarantine and Rollback")
 
 Outputs PromotionDecision JSON on stdout.
 
