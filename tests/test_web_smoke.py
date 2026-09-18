@@ -554,6 +554,343 @@ def test_agent_server_create_conversation_launch_failure_500s(
     )
 
 
+# ── Conversation events + sendMessage (Slice 3) ───────────────────────────────
+
+
+def _seed_state_db(
+    tmp_path: Path,
+    run_id: str,
+    *,
+    status: str = "running",
+    verdict: str | None = None,
+) -> int:
+    """Create a minimal <home>/state.db with run_events + task_runs for run_id.
+
+    Raw DDL (not the migration runner): the events projection only reads
+    these two tables, and a hand-seeded schema keeps the test independent of
+    migration drift. Returns the base epoch used for seeded timestamps.
+    """
+    import json as _json
+    import sqlite3
+    import time as _time
+
+    base = int(_time.time()) - 100
+    con = sqlite3.connect(tmp_path / "state.db")
+    con.execute(
+        """CREATE TABLE run_events (
+             event_id TEXT, run_id TEXT, event_type TEXT,
+             payload_json TEXT, created_at INTEGER)"""
+    )
+    con.execute(
+        """CREATE TABLE task_runs (
+             id TEXT PRIMARY KEY, status TEXT, verdict TEXT,
+             created_at INTEGER, ended_at INTEGER)"""
+    )
+    con.execute(
+        "INSERT INTO task_runs VALUES (?, ?, ?, ?, ?)",
+        (run_id, status, verdict, base, base + 90),
+    )
+    rows = [
+        ("evt-start-planner", "node_start", {"node_id": "planner", "node_type": "plan"}, base + 10),
+        (
+            "evt-end-planner",
+            "node_end",
+            {"node_id": "planner", "node_type": "plan", "finish_reason": "ok"},
+            base + 20,
+        ),
+        (
+            "evt-end-implementer",
+            "node_end",
+            {"node_id": "implementer", "node_type": "code", "finish_reason": "ok"},
+            base + 30,
+        ),
+    ]
+    for event_id, event_type, payload, ts in rows:
+        con.execute(
+            "INSERT INTO run_events VALUES (?, ?, ?, ?, ?)",
+            (event_id, run_id, event_type, _json.dumps(payload), ts),
+        )
+    con.commit()
+    con.close()
+    return base
+
+
+def test_agent_server_events_search_projects_run_events(tmp_path, monkeypatch) -> None:
+    """The transcript projection: sidecar user message + run_events rows →
+    oh_events. DESC default page (the canvas's initial load), structural
+    shapes the canvas type-guards on (BaseEvent fields, llm_message on
+    message events), and count matches."""
+    from mini_ork.web.routes import agent_server as mod
+    import mini_ork.web.control as control
+
+    calls: list[dict] = []
+    monkeypatch.setattr(control, "launch_run", _fake_launch_run_factory(calls))
+    mod.create_conversation(
+        {
+            "conversation_id": "conv-evt-1",
+            "initial_message": "Fix the failing test",
+        },
+        home=tmp_path,
+    )
+    _seed_state_db(tmp_path, "conv-evt-1")
+
+    page = mod.search_conversation_events("conv-evt-1", home=tmp_path)
+    items = page["items"]
+    assert page["next_page_id"] is None  # 4 events < limit
+
+    # DESC: newest first (user message was created "now", run events seeded
+    # up to base+30 — the user message is newest).
+    assert [e["id"] for e in items] == [
+        "conv-evt-1-user-0",
+        "evt-end-implementer",
+        "evt-end-planner",
+        "evt-start-planner",
+    ]
+
+    by_id = {e["id"]: e for e in items}
+    # User message projects as a MessageEvent the transcript renders.
+    user = by_id["conv-evt-1-user-0"]
+    assert user["source"] == "user"
+    assert user["llm_message"]["role"] == "user"
+    assert user["llm_message"]["content"] == [
+        {"type": "text", "text": "Fix the failing test"}
+    ]
+    assert user["activated_microagents"] == []
+    # node_end projects as an assistant message with a human-readable summary.
+    end = by_id["evt-end-planner"]
+    assert end["source"] == "agent"
+    assert end["llm_message"]["role"] == "assistant"
+    assert "planner" in end["llm_message"]["content"][0]["text"]
+    assert "ok" in end["llm_message"]["content"][0]["text"]
+    # node_start projects as an environment lifecycle event, not a message.
+    start = by_id["evt-start-planner"]
+    assert start["source"] == "environment"
+    assert start["event_type"] == "node_start"
+    assert start["node_id"] == "planner"
+    assert "llm_message" not in start
+
+    assert mod.count_conversation_events("conv-evt-1", home=tmp_path) == 4
+
+
+def test_agent_server_events_search_filters_and_pagination(tmp_path, monkeypatch) -> None:
+    """timestamp__lt / timestamp__gte windows, sort_order=TIMESTAMP asc, and
+    the page_id continue-after cursor with truncation-driven next_page_id."""
+    from mini_ork.web.routes import agent_server as mod
+    import mini_ork.web.control as control
+
+    calls: list[dict] = []
+    monkeypatch.setattr(control, "launch_run", _fake_launch_run_factory(calls))
+    mod.create_conversation(
+        {"conversation_id": "conv-evt-2", "initial_message": "hello"},
+        home=tmp_path,
+    )
+    _seed_state_db(tmp_path, "conv-evt-2")
+
+    asc = mod.search_conversation_events(
+        "conv-evt-2", home=tmp_path, sort_order="TIMESTAMP"
+    )
+    assert asc["items"][0]["id"] == "evt-start-planner"
+    assert asc["items"][-1]["id"] == "conv-evt-2-user-0"
+
+    # load-older window: everything strictly older than the planner node_end.
+    planner_end_ts = next(
+        e["timestamp"] for e in asc["items"] if e["id"] == "evt-end-planner"
+    )
+    older = mod.search_conversation_events(
+        "conv-evt-2", home=tmp_path, timestamp__lt=planner_end_ts
+    )
+    assert [e["id"] for e in older["items"]] == ["evt-start-planner"]
+
+    # since-window: everything at/after the planner node_end (WS replay shape).
+    since = mod.search_conversation_events(
+        "conv-evt-2", home=tmp_path, timestamp__gte=planner_end_ts, sort_order="TIMESTAMP"
+    )
+    assert [e["id"] for e in since["items"]] == [
+        "evt-end-planner",
+        "evt-end-implementer",
+        "conv-evt-2-user-0",
+    ]
+
+    # Truncation: limit=2 asc → first two, next_page_id = boundary item; the
+    # export path continues with page_id and gets the remainder.
+    first = mod.search_conversation_events(
+        "conv-evt-2", home=tmp_path, limit=2, sort_order="TIMESTAMP"
+    )
+    assert [e["id"] for e in first["items"]] == ["evt-start-planner", "evt-end-planner"]
+    assert first["next_page_id"] == "evt-end-planner"
+    second = mod.search_conversation_events(
+        "conv-evt-2", home=tmp_path, limit=2, sort_order="TIMESTAMP",
+        page_id=first["next_page_id"],
+    )
+    assert [e["id"] for e in second["items"]] == ["evt-end-implementer", "conv-evt-2-user-0"]
+
+
+def test_agent_server_events_single_and_terminal_status(tmp_path, monkeypatch) -> None:
+    """Single-event fetch (404 on unknown), the terminal projection (final
+    assistant event + execution_status lifted to finished), and event count
+    growing by one for the final event."""
+    from fastapi import HTTPException
+    from mini_ork.web.routes import agent_server as mod
+    import mini_ork.web.control as control
+
+    calls: list[dict] = []
+    monkeypatch.setattr(control, "launch_run", _fake_launch_run_factory(calls))
+    mod.create_conversation(
+        {"conversation_id": "conv-evt-3", "initial_message": "ship it"},
+        home=tmp_path,
+    )
+    _seed_state_db(
+        tmp_path, "conv-evt-3", status="published", verdict="APPROVE"
+    )
+
+    event = mod.get_conversation_event("conv-evt-3", "evt-end-planner", home=tmp_path)
+    assert event["id"] == "evt-end-planner"
+    with pytest.raises(HTTPException) as exc:
+        mod.get_conversation_event("conv-evt-3", "no-such-event", home=tmp_path)
+    assert exc.value.status_code == 404
+
+    # Terminal run: a final assistant event is appended. It is newer than the
+    # seeded run events (ended_at = now-10) but older than the user message
+    # (created at real `now`), so in DESC order it sits right after the user
+    # message — find it by id rather than position.
+    page = mod.search_conversation_events("conv-evt-3", home=tmp_path)
+    final = next(e for e in page["items"] if e["id"] == "conv-evt-3-final")
+    assert final["llm_message"]["role"] == "assistant"
+    assert final["source"] == "agent"
+    assert "published" in final["llm_message"]["content"][0]["text"]
+    assert "APPROVE" in final["llm_message"]["content"][0]["text"]
+    assert mod.count_conversation_events("conv-evt-3", home=tmp_path) == 5
+
+    # get_conversation lifts execution_status from the live task_runs row.
+    info = mod.get_conversation("conv-evt-3", home=tmp_path)
+    assert info["execution_status"] == "finished"
+
+
+def test_agent_server_send_event_launches_idle_conversation(
+    tmp_path, monkeypatch
+) -> None:
+    """sendEvent on an idle conversation = the promised idle→running kickoff:
+    same launch seam as create, run_id = conversation id, ledger records the
+    text so it projects as a user MessageEvent immediately."""
+    from mini_ork.web.routes import agent_server as mod
+    import mini_ork.web.control as control
+
+    calls: list[dict] = []
+    monkeypatch.setattr(control, "launch_run", _fake_launch_run_factory(calls))
+    mod.create_conversation({"conversation_id": "conv-send-1"}, home=tmp_path)
+    assert calls == []
+
+    out = mod.send_conversation_event(
+        {
+            "role": "user",
+            "content": [{"type": "text", "text": "Start by reproducing the bug"}],
+            "run": True,
+        },
+        "conv-send-1",
+        home=tmp_path,
+    )
+    assert out["ok"] is True
+    assert len(calls) == 1
+    assert calls[0]["run_id"] == "conv-send-1"
+    assert "Start by reproducing the bug" in calls[0]["kickoff"]
+
+    info = mod.get_conversation("conv-send-1", home=tmp_path)
+    assert info["execution_status"] == "running"
+
+    page = mod.search_conversation_events("conv-send-1", home=tmp_path)
+    assert [e["id"] for e in page["items"]] == ["conv-send-1-user-0"]
+    assert page["items"][0]["llm_message"]["content"][0]["text"] == (
+        "Start by reproducing the bug"
+    )
+
+
+def test_agent_server_send_event_steers_running_conversation(
+    tmp_path, monkeypatch
+) -> None:
+    """sendEvent on a live run = operator steering injection (no second run),
+    the sent text still lands in the ledger for transcript projection."""
+    from mini_ork.web.routes import agent_server as mod
+    import mini_ork.web.control as control
+
+    launches: list[dict] = []
+    monkeypatch.setattr(control, "launch_run", _fake_launch_run_factory(launches))
+    steers: list[dict] = []
+
+    def fake_steer(db, task_run_id, message, **kwargs):
+        steers.append({"run_id": task_run_id, "message": message, **kwargs})
+        return {"ok": True, "steering_id": 7}
+
+    monkeypatch.setattr(control, "steer_run", fake_steer)
+
+    mod.create_conversation(
+        {"conversation_id": "conv-send-2", "initial_message": "first"}, home=tmp_path
+    )
+    _seed_state_db(tmp_path, "conv-send-2", status="running")
+
+    out = mod.send_conversation_event(
+        {"role": "user", "content": "also check the migrations", "run": True},
+        "conv-send-2",
+        home=tmp_path,
+    )
+    assert out["ok"] is True
+    # No second launch — mid-run messages steer, they don't spawn.
+    assert len(launches) == 1
+    assert len(steers) == 1
+    assert steers[0]["run_id"] == "conv-send-2"
+    assert steers[0]["message"] == "also check the migrations"
+    assert steers[0]["source"] == "agent-server-canvas"
+
+    page = mod.search_conversation_events("conv-send-2", home=tmp_path)
+    texts = [e for e in page["items"] if e["id"] == "conv-send-2-user-1"]
+    assert texts and texts[0]["llm_message"]["content"][0]["text"] == (
+        "also check the migrations"
+    )
+
+
+def test_agent_server_send_event_terminal_409(tmp_path, monkeypatch) -> None:
+    """A mini-ork conversation is a one-shot DAG: sends after terminal status
+    409 (the real agent-server would loop the agent; we diverge loudly
+    instead of silently steering a dead run)."""
+    from fastapi import HTTPException
+    from mini_ork.web.routes import agent_server as mod
+    import mini_ork.web.control as control
+
+    launches: list[dict] = []
+    monkeypatch.setattr(control, "launch_run", _fake_launch_run_factory(launches))
+    mod.create_conversation(
+        {"conversation_id": "conv-send-3", "initial_message": "done work"}, home=tmp_path
+    )
+    _seed_state_db(tmp_path, "conv-send-3", status="failed")
+
+    with pytest.raises(HTTPException) as exc:
+        mod.send_conversation_event(
+            {"role": "user", "content": "one more thing", "run": True},
+            "conv-send-3",
+            home=tmp_path,
+        )
+    assert exc.value.status_code == 409
+
+
+def test_agent_server_send_event_rejects_bad_requests(tmp_path) -> None:
+    """Empty text 400s; unknown conversation 404s; no state.db + live-run
+    steer attempt 500s instead of crashing on a missing db."""
+    from fastapi import HTTPException
+    from mini_ork.web.routes import agent_server as mod
+
+    mod.create_conversation({"conversation_id": "conv-send-4"}, home=tmp_path)
+    with pytest.raises(HTTPException) as exc:
+        mod.send_conversation_event(
+            {"role": "user", "content": []}, "conv-send-4", home=tmp_path
+        )
+    assert exc.value.status_code == 400
+
+    with pytest.raises(HTTPException) as exc:
+        mod.send_conversation_event(
+            {"role": "user", "content": "hi"}, "never-existed", home=tmp_path
+        )
+    assert exc.value.status_code == 404
+
+
 def test_idea_tree_roots_returns_backfilled_sessions(db) -> None:
     """list_roots() must surface every root node with subtree counts.
 
