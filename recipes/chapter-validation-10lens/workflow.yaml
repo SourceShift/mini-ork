@@ -20,71 +20,61 @@ nodes:
     type: reviewer
     model_lane: lens_01
     prompt_ref: prompts/lens_01_structure.md
-    dispatch_mode: partitioned
-    partition_key: lens_id
+    dispatch_mode: parallel
 
   - name: lens_02_factuality
     type: reviewer
     model_lane: lens_02
     prompt_ref: prompts/lens_02_factuality.md
-    dispatch_mode: partitioned
-    partition_key: lens_id
+    dispatch_mode: parallel
 
   - name: lens_03_voice_tone
     type: reviewer
     model_lane: lens_03
     prompt_ref: prompts/lens_03_voice_tone.md
-    dispatch_mode: partitioned
-    partition_key: lens_id
+    dispatch_mode: parallel
 
   - name: lens_04_length_density
     type: reviewer
     model_lane: lens_04
     prompt_ref: prompts/lens_04_length_density.md
-    dispatch_mode: partitioned
-    partition_key: lens_id
+    dispatch_mode: parallel
 
   - name: lens_05_forbidden_constructs
     type: reviewer
     model_lane: lens_05
     prompt_ref: prompts/lens_05_forbidden_constructs.md
-    dispatch_mode: partitioned
-    partition_key: lens_id
+    dispatch_mode: parallel
 
   - name: lens_06_markdown_format
     type: reviewer
     model_lane: lens_06
     prompt_ref: prompts/lens_06_markdown_format.md
-    dispatch_mode: partitioned
-    partition_key: lens_id
+    dispatch_mode: parallel
 
   - name: lens_07_coverage
     type: reviewer
     model_lane: lens_07
     prompt_ref: prompts/lens_07_coverage.md
-    dispatch_mode: partitioned
-    partition_key: lens_id
+    dispatch_mode: parallel
 
   - name: lens_08_coherence
     type: reviewer
     model_lane: lens_08
     prompt_ref: prompts/lens_08_coherence.md
-    dispatch_mode: partitioned
-    partition_key: lens_id
+    dispatch_mode: parallel
 
   - name: lens_09_reader_contract
     type: reviewer
     model_lane: lens_09
     prompt_ref: prompts/lens_09_reader_contract.md
-    dispatch_mode: partitioned
-    partition_key: lens_id
+    dispatch_mode: parallel
 
   - name: lens_10_synthesis_originality
     type: reviewer
     model_lane: lens_10
     prompt_ref: prompts/lens_10_synthesis_originality.md
-    dispatch_mode: partitioned
-    partition_key: lens_id
+    dispatch_mode: parallel
 
   - name: synthesizer
     type: reviewer
@@ -103,4 +93,26 @@ nodes:
     prompt_ref: prompts/publisher.md
     dispatch_mode: serial
 
-edges: []
+edges:
+  - {from: planner, to: lens_01_structure, edge_type: depends_on}
+  - {from: planner, to: lens_02_factuality, edge_type: depends_on}
+  - {from: planner, to: lens_03_voice_tone, edge_type: depends_on}
+  - {from: planner, to: lens_04_length_density, edge_type: depends_on}
+  - {from: planner, to: lens_05_forbidden_constructs, edge_type: depends_on}
+  - {from: planner, to: lens_06_markdown_format, edge_type: depends_on}
+  - {from: planner, to: lens_07_coverage, edge_type: depends_on}
+  - {from: planner, to: lens_08_coherence, edge_type: depends_on}
+  - {from: planner, to: lens_09_reader_contract, edge_type: depends_on}
+  - {from: planner, to: lens_10_synthesis_originality, edge_type: depends_on}
+  - {from: lens_01_structure, to: synthesizer, edge_type: depends_on}
+  - {from: lens_02_factuality, to: synthesizer, edge_type: depends_on}
+  - {from: lens_03_voice_tone, to: synthesizer, edge_type: depends_on}
+  - {from: lens_04_length_density, to: synthesizer, edge_type: depends_on}
+  - {from: lens_05_forbidden_constructs, to: synthesizer, edge_type: depends_on}
+  - {from: lens_06_markdown_format, to: synthesizer, edge_type: depends_on}
+  - {from: lens_07_coverage, to: synthesizer, edge_type: depends_on}
+  - {from: lens_08_coherence, to: synthesizer, edge_type: depends_on}
+  - {from: lens_09_reader_contract, to: synthesizer, edge_type: depends_on}
+  - {from: lens_10_synthesis_originality, to: synthesizer, edge_type: depends_on}
+  - {from: synthesizer, to: lens_outputs_complete, edge_type: depends_on}
+  - {from: lens_outputs_complete, to: publisher, edge_type: depends_on}
