@@ -142,6 +142,69 @@ def _safe_trace_write(payload: dict, db: str) -> None:
         pass
 
 
+def _first_verifier_command(plan_path):
+    """First command named in the plan's ``verifier_contract``, or ``""``."""
+    if not plan_path or not os.path.isfile(plan_path):
+        return ""
+    try:
+        checks = json.load(open(plan_path, encoding="utf-8")).get(
+            "verifier_contract", {}).get("checks", [])
+    except Exception:
+        return ""
+    if not isinstance(checks, list):
+        return ""
+    for check in checks:
+        if isinstance(check, dict) and str(check.get("command") or "").strip():
+            return str(check["command"]).strip()
+    return ""
+
+
+def _default_mutation_report(artifact_path):
+    """Where the campaign writes its report and the gate later looks for it."""
+    if not artifact_path:
+        return ""
+    return os.path.join(os.path.dirname(os.path.abspath(artifact_path)),
+                        "mutation-validation.json")
+
+
+def _run_mutation_campaign(artifact_path, plan_path):
+    """Run the adversarial-mutation campaign so the mutation gate has evidence.
+
+    SWE-ABS's move: mutate the candidate into plausible-but-wrong variants and
+    check whether the suite still passes them. A variant that survives is a
+    coverage gap — precisely what a green test run cannot tell you, and the
+    failure mode this repo's extensional verifier is known to allow.
+
+    Every input is resolved from the environment and the plan. A missing input
+    means the campaign does not run, and the gate then reads the absence of a
+    report as ``defer``: an unmeasured check is not a satisfied one. The
+    workspace is never the mini-ork checkout unless it was named explicitly, so
+    a campaign cannot mutate the framework that is running it.
+    """
+    if os.environ.get("MO_MUTATION_ADVERSARY", "1") == "0":
+        return None
+    workspace = (os.environ.get("MO_TARGET_CWD")
+                 or os.environ.get("MINI_ORK_TARGET_REPO") or "")
+    if not workspace or not os.path.isdir(workspace):
+        return None
+    test_cmd = os.environ.get("MO_MUTATION_TEST_CMD") or _first_verifier_command(plan_path)
+    if not test_cmd:
+        return None
+    report_path = os.environ.get("MO_MUTATION_REPORT") or _default_mutation_report(artifact_path)
+    if not report_path:
+        return None
+    log_path = os.environ.get("MO_MUTATION_LOG") or os.path.join(
+        context_env("MINI_ORK_RUN_DIR", ""), "execute.log")
+    try:
+        from mini_ork.gates import mutation_adversary
+
+        return mutation_adversary.run_campaign(
+            workspace, test_cmd, log_path=log_path, report_path=report_path,
+            max_mutations=mutation_adversary.max_mutations())
+    except Exception:
+        return None
+
+
 def main(argv: list[str] | None = None, *, db: str | None = None, root: str | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     root = root or os.environ.get("MINI_ORK_ROOT") or os.getcwd()
@@ -281,29 +344,46 @@ def main(argv: list[str] | None = None, *, db: str | None = None, root: str | No
     # depend on a shell implementation being present on disk.
     gates_available = hasattr(gate_registry, "gate_run_all")
     if dry_run == 0 and gates_available:
-        # The mutation-adversary gate reads a campaign report written next to
-        # the artifact by mutation_adversary.run_adversary. It is seeded scoped
-        # to its own task class, so supplying the path costs nothing for every
-        # other task class — the gate is not selected for them at all.
-        mutation_report = os.environ.get("MO_MUTATION_REPORT", "")
-        if not mutation_report and artifact_path:
-            mutation_report = os.path.join(
-                os.path.dirname(os.path.abspath(artifact_path)),
-                "mutation-validation.json")
+        # Run the adversarial campaign first, so the mutation gate below has a
+        # measurement to read rather than an absent report. It resolves its own
+        # inputs and quietly returns None when any is missing — an unrun check
+        # is a `defer`, which is visible in the verdict, not a silent pass.
+        _run_mutation_campaign(artifact_path, plan_path)
+        # The mutation-adversary gate reads the campaign report written next to
+        # the artifact above.
+        mutation_report = (os.environ.get("MO_MUTATION_REPORT", "")
+                           or _default_mutation_report(artifact_path))
         ctx = json.dumps({"task_class": task_class, "artifact_path": artifact_path,
                           "plan_path": plan_path or "", "panel_run_id": context_env("MINI_ORK_RUN_ID", ""),
                           "mutation_report": mutation_report,
+                          "workspace": (os.environ.get("MO_TARGET_CWD")
+                                        or os.environ.get("MINI_ORK_TARGET_REPO") or ""),
                           "cost_usd": 0.0})
         try:
             summary = gate_registry.gate_run_all(db, task_class, ctx, mini_ork_root=root)
-            gates_ok = bool(summary.get("all_pass", True))
+            gate_failed = bool(summary.get("any_fail", True))
+            unmeasured = [g.get("gate_id", "") for g in summary.get("gates", [])
+                          if g.get("verdict") == "defer"]
         except Exception:
-            gates_ok = True
-        if not gates_ok:
+            # A broken registry must not red every run; the gates defer rather
+            # than inventing a verdict either way.
+            gate_failed = False
+            unmeasured = []
+        if gate_failed:
             gate_verdict = "fail"; fail_count += 1
             results.append('{"verifier":"__gates__","pass":false,"evidence_path":"gate_registry"}')
         else:
             results.append('{"verifier":"__gates__","pass":true,"evidence_path":"gate_registry"}')
+        if unmeasured:
+            # Neither pass nor fail: the check did not run. Recorded so "we could
+            # not measure this" is distinguishable from "we measured it and it
+            # held" — otherwise an unrun gate and a satisfied one look identical.
+            results.append(json.dumps({
+                "verifier": "__gates_unmeasured__",
+                "pass": None,
+                "detail": "gate(s) did not run: " + ", ".join(sorted(unmeasured)),
+                "evidence_path": "gate_registry:defer",
+            }))
 
     if dry_run == 1:
         verdict = "dry-run"
