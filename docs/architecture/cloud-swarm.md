@@ -91,20 +91,27 @@ case.
 
 - When `MO_SANDBOX_BACKEND` is set, resolve the child's workspace the way
   dispatch already does (`resolve_spawn_workspace`, `agent_workspace.py`) and
-  launch the child argv **inside it**: kickoff written via `workspace.put()`,
-  child cwd = the in-container drive mount (`/workspace`), child env built by
-  `container_env` (allowlist) instead of `{**os.environ}`. The recursive
-  lineage keys (`MINI_ORK_RUN_ID`, `MINI_ORK_PARENT_RUN_ID`,
-  `MINI_ORK_ALLOW_CHILD_SPAWN`) are `MO_*`-shaped and already cross the
-  allowlist.
-- The child image must carry mini-ork itself (the argv is `bin/mini-ork run
-  …`). Ship a documented image expectation (mini-ork importable, provider CLIs
-  present) rather than a mandatory custom image; `MO_SANDBOX_IMAGE` already
-  selects it.
+  launch the child argv **inside it**: the child's cwd and kickoff become the
+  in-sandbox view of the drive mount (`/workspace/…`, remapped from the host
+  tree, with a path escaping the drive a loud error), and the AMBIENT host env
+  crosses through `container_env` (allowlist) instead of `{**os.environ}`. The
+  run contract — `MINI_ORK_HOME`/`MINI_ORK_DB` plus the recursive lineage keys
+  (`MINI_ORK_RUN_ID`, `MINI_ORK_PARENT_RUN_ID`, `MINI_ORK_ALLOW_CHILD_SPAWN`) —
+  is `MINI_ORK_*`, which the `MO_*` allowlist does **not** match, so it is
+  injected explicitly *after* the filter: the allowlist governs the ambient
+  environment; the run contract is always ours to set.
+- The child image must carry mini-ork itself (the asked-for argv is
+  `mini-ork run …`, `MO_SANDBOX_MINI_ORK_CLI` to override). Ship a documented
+  image expectation (mini-ork on `PATH`, provider CLIs present) rather than a
+  mandatory custom image; `MO_SANDBOX_IMAGE` already selects it.
 - Backend unset ⇒ byte-for-byte today's `subprocess.run` path (dead-code-proof
   default, matching `resolve_agent_workspace`'s discipline).
 - `spawn-child.log` persists as today — streams come back from
-  `Workspace.spawn` in the same `(rc, stdout, stderr)` shape.
+  `Workspace.spawn` in the same `(rc, stdout, stderr)` shape (a small
+  proc-like shim keeps that logger at one signature across both transports).
+- The transport takes a wall-clock budget where `subprocess.run` took none:
+  `MO_SANDBOX_CHILD_TIMEOUT`, defaulting to effectively unbounded (7 days) so
+  routing the child never adds a cap the host path did not have.
 
 **DoD:** a recursive spawn completes under `MO_SANDBOX_BACKEND=docker` with the
 child's run dir appearing on the drive mount; env-leak test proves a
