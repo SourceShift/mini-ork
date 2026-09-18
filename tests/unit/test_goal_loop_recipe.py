@@ -125,12 +125,18 @@ def test_load_recipe_register_returns_true_and_registers_goal_sweep():
     # Recipe uses the hyphenated "goal-loop" recipe name (matches existing
     # submodes at mini_ork/cli/execute_handlers.py:357-362). The kickoff
     # refers to this as the "goal_sweep submode"; the registry key is the
-    # (recipe, node_id) pair and the script name uses goal_sweep_stub.py.
+    # (recipe, node_id) pair and U4b replaces the stub script with the
+    # real driver (lib/drive.py) so the registered script path now ends in
+    # drive.py — this assertion is the direct probe of register.py state.
     assert ("goal-loop", "sweep_dispatcher") in ex._IMPLEMENTER_SUBMODES
     results_artifact, script_path = ex._IMPLEMENTER_SUBMODES[("goal-loop", "sweep_dispatcher")]
     assert results_artifact == "sweep-result.json"
-    assert Path(script_path).name == "goal_sweep_stub.py"
-    assert Path(script_path).is_file()
+    assert Path(script_path).name == "drive.py"
+    # register.py stores the script path relative to the recipes root
+    # (matches sibling recipes — see register.py:_DRIVER_SCRIPT). Resolve
+    # against RECIPE_DIR before asserting the file is on disk.
+    resolved_script = (REPO / "recipes" / script_path).resolve()
+    assert resolved_script.is_file(), resolved_script
 
 
 def test_load_recipe_register_is_idempotent():

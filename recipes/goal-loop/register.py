@@ -20,9 +20,13 @@ What this module does:
    file).
 
 2. Registers the ``(goal-loop, sweep_dispatcher)`` implementer submode with
-   a stub dispatcher script (``lib/goal_sweep_stub.py``) so the
-   recipe-local loader contract is dogfooded end-to-end. U4b will replace
-   this stub with the real fan-out driver.
+   the U4b driver script (``lib/drive.py``). When invoked by the dispatch
+   layer (no args), ``drive.py`` falls through to ``sweep_run()``, which
+   reads ``<run_dir>/sweep-plan.json``, fans out
+   ``mini_ork.cli.spawn.spawn(...)`` per planned unit honoring
+   ``MINI_ORK_RECURSIVE_MAX_PARALLEL``, and writes
+   ``<run_dir>/sweep-result.json``. ``MO_GOAL_SPAWN_DRY=1`` records the
+   planned spawns without invoking ``spawn`` (unit-test seam).
 """
 from __future__ import annotations
 
@@ -33,7 +37,10 @@ from pathlib import Path
 from mini_ork.cli.execute_handlers import register_implementer_submode
 
 _RECIPE_DIR = Path(__file__).resolve().parent
-_STUB_SCRIPT = str(_RECIPE_DIR / "lib" / "goal_sweep_stub.py")
+# Relative-from-recipes path; sibling recipes (doc-to-features-loop,
+# epic-runner) use the same form. The dispatcher does
+# ``os.path.join(ctx.root, "recipes", script_rel)`` (execute_handlers.py:548).
+_DRIVER_SCRIPT = "goal-loop/lib/drive.py"
 _TRANSFORMS_PATH = _RECIPE_DIR / "lib" / "transforms.py"
 
 # Eagerly load the transforms module so the @register_transform decorators
@@ -56,5 +63,5 @@ register_implementer_submode(
     recipe="goal-loop",
     node_id="sweep_dispatcher",
     results_artifact="sweep-result.json",
-    script=_STUB_SCRIPT,
+    script=_DRIVER_SCRIPT,
 )
