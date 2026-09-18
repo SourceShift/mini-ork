@@ -363,3 +363,44 @@ def test_merge_decision_accepted(temp_db):
     # run_spawns.status flipped to 'merged'.
     py_spawn = _row_dicts(temp_db, "run_spawns")[0]
     assert py_spawn["status"] == "merged"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# (i) _persist_child_log — the child's captured stdout/stderr is written into
+#     its run dir so a non-zero child is diagnosable (was silently discarded).
+# ─────────────────────────────────────────────────────────────────────────────
+def test_persist_child_log_writes_stdout_stderr_and_exit(tmp_path):
+    from types import SimpleNamespace
+
+    from mini_ork.cli.spawn import _persist_child_log
+
+    proc = SimpleNamespace(
+        returncode=1,
+        stdout="reviewer node: needs_revision\n",
+        stderr="traceback: boom\n",
+    )
+    log_path = _persist_child_log(
+        str(tmp_path), "child-xyz",
+        ["/bin/mini-ork", "run", "code-fix", "/k.md"], proc,
+    )
+
+    assert log_path == str(tmp_path / "runs" / "child-xyz" / "spawn-child.log")
+    body = Path(log_path).read_text(encoding="utf-8")
+    assert "$ /bin/mini-ork run code-fix /k.md" in body
+    assert "exit_code=1" in body
+    assert "reviewer node: needs_revision" in body   # stdout captured
+    assert "traceback: boom" in body                 # stderr captured
+
+
+def test_persist_child_log_best_effort_never_raises(tmp_path):
+    """A logging failure must NOT mask the child's real exit — an unwritable
+    home (a FILE where the runs/ dir would go) returns None, no exception."""
+    from types import SimpleNamespace
+
+    from mini_ork.cli.spawn import _persist_child_log
+
+    blocker = tmp_path / "home_is_a_file"
+    blocker.write_text("not a dir", encoding="utf-8")  # runs/ can't be made here
+
+    proc = SimpleNamespace(returncode=2, stdout="x", stderr="y")
+    assert _persist_child_log(str(blocker), "child-z", ["cli"], proc) is None
