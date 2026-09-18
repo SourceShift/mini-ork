@@ -1,9 +1,10 @@
-"""Auto-register the 5 oracle gates at framework boot — Python port of lib/gate_bootstrap.sh.
+"""Auto-register the oracle gates at framework boot — Python port of lib/gate_bootstrap.sh.
 
 Registers the 5 oracle gates (coalition, panel-health, synthesis-promote,
-stability, liveness) into the gate_registry table if not already present.
-Idempotent. Fail-open — rc=0 even on partial failures (matches bash
-semantics).
+stability, liveness) into the gate_registry table if not already present, plus
+the scoped mutation-adversary gate (see ``_MUTATION_GATE_ID``; not part of the
+oracle-* family, and inert for every task class but its own). Idempotent.
+Fail-open — rc=0 even on partial failures (matches bash semantics).
 
 WS4 (bash-removal): conditions are now ``native:<name>`` sentinels that
 ``gate_registry`` maps to the in-process evaluators in
@@ -64,6 +65,33 @@ _STABLE_IDS = {
     "liveness": "oracle-liveness",
 }
 
+# The mutation-adversary gate is seeded OUTSIDE the oracle-* family on purpose.
+#
+# ``gate_run_all`` treats every non-pass verdict as ``all_pass=False``, and
+# ``cli/verify.py`` reads that as a failing gate — so a gate that defers when no
+# campaign ran would push a healthy verify from ``pass`` to ``partial``. The 5
+# oracle gates avoid this only because they defer *together* when the run has no
+# panel evidence yet; a sixth that defers alone is a regression, not a check.
+#
+# ``task_class_filter`` is the schema's own scoping mechanism (gate_list matches
+# ``task_class_filter IS NULL OR task_class_filter=?``), so a campaign can opt
+# into the gate by running under this task class and every other task class is
+# untouched.
+_MUTATION_GATE_ID = "mutation-adversary-gate"
+_MUTATION_GATE_NAME = "mutation-adversary"
+_MUTATION_TASK_CLASS = "mutation-adversary"
+
+
+def _count(con: sqlite3.Connection, where: str, params: tuple = ()) -> int:
+    """Rows in ``gate_registry`` matching ``where`` (0 when the table is absent)."""
+    try:
+        cur = con.execute(
+            f"SELECT COUNT(*) FROM gate_registry WHERE {where}", params
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return 0
+    return int(cur[0]) if cur else 0
+
 
 def bootstrap_oracle_gates(db: str | None = None,
                            root: str | None = None) -> int:
@@ -89,42 +117,58 @@ def bootstrap_oracle_gates(db: str | None = None,
         con = sqlite3.connect(db)
         try:
             con.execute(_DDL)
-            cur = con.execute(
-                "SELECT COUNT(*) FROM gate_registry WHERE gate_id LIKE 'oracle-%'"
-            ).fetchone()
-            if (cur[0] if cur else 0) >= 5:
-                return 0
             now = int(time.time())
-            for name, safety in _ROSTER:
-                cond = native_condition(name)
-                gid = f"gate-custom-{uuid.uuid4().hex[:8]}"
+            have_oracle = _count(con, "gate_id LIKE 'oracle-%'") >= 5
+            have_mutation = _count(con, "gate_id = ?", (_MUTATION_GATE_ID,)) >= 1
+            if have_oracle and have_mutation:
+                return 0
+
+            if not have_oracle:
+                for name, safety in _ROSTER:
+                    cond = native_condition(name)
+                    gid = f"gate-custom-{uuid.uuid4().hex[:8]}"
+                    con.execute(
+                        "INSERT OR IGNORE INTO gate_registry "
+                        "(gate_id, gate_type, condition, task_class_filter, "
+                        " safety, active, registered_at) "
+                        "VALUES (?, 'custom', ?, '', ?, 1, ?)",
+                        (gid, cond, int(safety), now),
+                    )
+                for name in _STABLE_IDS:
+                    new_id = _STABLE_IDS[name]
+                    cond = native_condition(name)
+                    rows = con.execute(
+                        "SELECT gate_id FROM gate_registry WHERE condition=? "
+                        "AND gate_id NOT LIKE 'oracle-%'", (cond,)
+                    ).fetchall()
+                    for (old_id,) in rows:
+                        con.execute(
+                            "UPDATE OR IGNORE gate_registry SET gate_id=? "
+                            "WHERE gate_id=?", (new_id, old_id)
+                        )
+                        con.execute(
+                            "DELETE FROM gate_registry WHERE gate_id=?",
+                            (old_id,),
+                        )
+                con.execute(
+                    "UPDATE gate_registry SET task_class_filter=NULL "
+                    "WHERE gate_id LIKE 'oracle-%' AND task_class_filter=''"
+                )
+
+            if not have_mutation:
+                # safety=0: the kill rate is a measurement, not a publish
+                # blocker. It becomes visible through gate_run_all's summary
+                # (and so through cli/verify.py's verdict) without gaining the
+                # power to refuse a publish.
                 con.execute(
                     "INSERT OR IGNORE INTO gate_registry "
                     "(gate_id, gate_type, condition, task_class_filter, "
                     " safety, active, registered_at) "
-                    "VALUES (?, 'custom', ?, '', ?, 1, ?)",
-                    (gid, cond, int(safety), now),
+                    "VALUES (?, 'custom', ?, ?, 0, 1, ?)",
+                    (_MUTATION_GATE_ID, native_condition(_MUTATION_GATE_NAME),
+                     _MUTATION_TASK_CLASS, now),
                 )
-            for name in _STABLE_IDS:
-                new_id = _STABLE_IDS[name]
-                cond = native_condition(name)
-                rows = con.execute(
-                    "SELECT gate_id FROM gate_registry WHERE condition=? "
-                    "AND gate_id NOT LIKE 'oracle-%'", (cond,)
-                ).fetchall()
-                for (old_id,) in rows:
-                    con.execute(
-                        "UPDATE OR IGNORE gate_registry SET gate_id=? "
-                        "WHERE gate_id=?", (new_id, old_id)
-                    )
-                    con.execute(
-                        "DELETE FROM gate_registry WHERE gate_id=?",
-                        (old_id,),
-                    )
-            con.execute(
-                "UPDATE gate_registry SET task_class_filter=NULL "
-                "WHERE gate_id LIKE 'oracle-%' AND task_class_filter=''"
-            )
+
             con.commit()
         finally:
             con.close()

@@ -268,6 +268,41 @@ def _eval_synthesis_promote(
     return "defer"
 
 
+# ── mutation-adversary (mutation_adversary.py) ───────────────────────────────
+
+
+def _eval_mutation_adversary(
+    condition: str, context_json: str, db_path: str, mini_ork_root: Optional[str]
+) -> str:
+    """Verdict from the persisted mutation-adversary campaign report.
+
+    The campaign is expensive — it applies and tests every mutation — so it is
+    run by whoever owns the workspace (``mutation_adversary.run_adversary``) and
+    this only reads the report it left behind. A missing report means the check
+    did not run, which is ``defer``, the same answer every other oracle gate
+    gives without evidence; it is deliberately not a pass.
+
+    ``mutation_adversary.gate_verdict`` owns the mapping and explains why the
+    unmeasured states (skipped, worktree-dirty, zero mutations) defer even
+    though the bare threshold would score some of them as passing.
+    """
+    del condition, db_path, mini_ork_root
+    ctx = _parse_context(context_json)
+    if ctx is None:
+        return "defer"
+    report_path = (ctx.get("mutation_report")
+                   or os.environ.get("MO_MUTATION_REPORT", ""))
+    if not report_path:
+        return "defer"
+    try:
+        from mini_ork.gates import mutation_adversary
+
+        return mutation_adversary.gate_verdict(
+            mutation_adversary.load_report(report_path))
+    except Exception:
+        return "defer"
+
+
 # ── registry ──────────────────────────────────────────────────────────────────
 
 NATIVE_GATE_EVALUATORS: dict[str, NativeGateEvaluator] = {
@@ -276,6 +311,7 @@ NATIVE_GATE_EVALUATORS: dict[str, NativeGateEvaluator] = {
     "panel-health": _eval_panel_health,
     "stability": _eval_stability,
     "synthesis-promote": _eval_synthesis_promote,
+    "mutation-adversary": _eval_mutation_adversary,
 }
 
 
