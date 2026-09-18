@@ -238,6 +238,8 @@ def test_pick_candidate_gradient_last_resort(db):
 # ── 4. score_candidate ───────────────────────────────────────────────────────
 
 def test_score_candidate_mock_deterministic(db, envscrub):
+    # mock is no longer the default (probe is); select it explicitly.
+    envscrub.setenv("MO_APPLY_SCORER", "mock")
     first = ap.score_candidate("cand-abc")
     second = ap.score_candidate("cand-abc")
     assert first == second
@@ -315,18 +317,19 @@ def test_apply_run_no_candidate(db, capsys):
 
 # ── 9-11. apply_run full pipelines ───────────────────────────────────────────
 
-def test_apply_run_dry_run_promote_writes_no_file(db, tmp_path, capsys):
+def test_apply_run_mock_score_quarantines_and_writes_no_file(db, tmp_path, capsys, envscrub):
     _seed_pattern(db)
     target = tmp_path / "reviewer.md"
     target.write_text("ORIGINAL PROMPT\n")
     # Master gate OFF (default) → stage + score + audit, but never write.
-    # Honest default: the mock scorer fabricates utility, so without
-    # MO_APPLY_UNVETTED=1 the promote is recorded as pending_human_approval.
+    # The mock scorer fabricates utility, so even a "passing" score is refused:
+    # the candidate is quarantined, not promoted.
+    envscrub.setenv("MO_APPLY_SCORER", "mock")
     rc = ap.apply_run("reviewer", "prompt_file", "prompts/reviewer.md",
                       str(target), db=db)
     assert rc == 0
     summary = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
-    assert summary["decision"] == "pending_human_approval"
+    assert summary["decision"] == "quarantined"
     assert summary["candidate_id"].startswith("cand-")
     assert summary["promotion_id"].startswith("pr-")
     assert summary["version_id"] == ""  # no write while disabled
@@ -342,23 +345,28 @@ def test_apply_run_dry_run_promote_writes_no_file(db, tmp_path, capsys):
 
     promos = _rows(db, "promotion_records")
     assert len(promos) == 1
-    assert promos[0]["decision"] == "pending_human_approval"
+    assert promos[0]["decision"] == "quarantined"
     assert promos[0]["decided_by"] == "gate"
-    assert "no real evaluator" in promos[0]["rationale"]
+    assert "fabricates utility" in promos[0]["rationale"]
 
     attempts = _rows(db, "apply_attempts")
     assert len(attempts) == 1
-    assert attempts[0]["decision"] == "pending_human_approval"
+    assert attempts[0]["decision"] == "quarantined"
     assert attempts[0]["dry_run"] == 0
     assert attempts[0]["apply_enabled"] == 0
 
 
-def test_apply_run_enabled_rewrites_file_and_registers_version(db, tmp_path, capsys, envscrub):
+def test_apply_run_enabled_rewrites_file_and_registers_version(db, tmp_path, capsys, envscrub, monkeypatch):
+    from mini_ork.learning import probe_scorer as ps
     _seed_pattern(db)
     target = tmp_path / "reviewer.md"
     target.write_text("ORIGINAL PROMPT\n")
     envscrub.setenv("MO_APPLY_ENABLED", "1")
-    envscrub.setenv("MO_APPLY_UNVETTED", "1")
+    probe_out = {"before": 1.0, "after": 1.0, "n": 2,
+                 "pertask_json": json.dumps({"before": [1, 1], "after": [1, 1],
+                                             "ids": ["probe-1.md", "probe-2.md"]}),
+                 "runs": [], "cost_usd": 0.08}
+    monkeypatch.setattr(ps, "probe_score", lambda *a, **k: dict(probe_out))
     rc = ap.apply_run("reviewer", "prompt_file", "prompts/reviewer.md",
                       str(target), db=db)
     assert rc == 0
@@ -384,8 +392,10 @@ def test_apply_run_enabled_rewrites_file_and_registers_version(db, tmp_path, cap
     assert payload["candidate_id"] == summary["candidate_id"]
     assert summary["version_id"] == versions[0]["version_id"]
     assert _rows(db, "apply_attempts")[0]["apply_enabled"] == 1
-    # the audit rationale admits the promote is unvetted
-    assert "UNVETTED" in _rows(db, "promotion_records")[0]["rationale"]
+    # the promote is measured, not fabricated
+    rationale = _rows(db, "promotion_records")[0]["rationale"]
+    assert "probe: n=2" in rationale
+    assert "fabricates utility" not in rationale
 
 
 def test_apply_run_forced_regression_quarantines(db, tmp_path, capsys, envscrub):
@@ -393,6 +403,7 @@ def test_apply_run_forced_regression_quarantines(db, tmp_path, capsys, envscrub)
     target = tmp_path / "reviewer.md"
     target.write_text("ORIGINAL PROMPT\n")
     envscrub.setenv("MO_APPLY_ENABLED", "1")
+    envscrub.setenv("MO_APPLY_SCORER", "mock")
     # before=0.5 (mock baseline), after=max(0, 0.5-0.10-0.05)=0.35 → regression
     envscrub.setenv("MO_APPLY_MOCK_BASELINE", "0.5")
     envscrub.setenv("MO_APPLY_FORCE_REGRESSION", "1")
@@ -413,22 +424,29 @@ def test_apply_run_forced_regression_quarantines(db, tmp_path, capsys, envscrub)
 
 # ── 11b. F3 enable semantics (append + unvetted honesty + target filter) ─────
 
-def test_apply_run_refuses_unvetted_promote_by_default(db, tmp_path, capsys, envscrub):
-    """ENABLED alone must not produce a file write: the mock scorer fabricates
-    utility, so the honest default records pending_human_approval."""
+def test_apply_run_mock_never_promotes(db, tmp_path, capsys, envscrub):
+    """A fabricating scorer cannot promote, and no flag restores the ability.
+
+    This is the invariant that makes removing the human approval gate safe:
+    the audit trail can never claim a measured improvement that was not measured.
+    """
     _seed_pattern(db)
     target = tmp_path / "reviewer.md"
     target.write_text("ORIGINAL PROMPT\n")
     envscrub.setenv("MO_APPLY_ENABLED", "1")
+    envscrub.setenv("MO_APPLY_SCORER", "mock")
+    # The retired escape hatch: setting it must change nothing.
+    envscrub.setenv("MO_APPLY_UNVETTED", "1")
     rc = ap.apply_run("reviewer", "prompt_file", "prompts/reviewer.md",
                       str(target), db=db)
     assert rc == 0
     summary = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
-    assert summary["decision"] == "pending_human_approval"
+    assert summary["decision"] == "quarantined"
     assert summary["version_id"] == ""
     assert target.read_text() == "ORIGINAL PROMPT\n"
     assert not list(tmp_path.glob("reviewer.md.apply-rollback-*"))
-    assert "MO_APPLY_UNVETTED=1" in _rows(db, "promotion_records")[0]["rationale"]
+    assert "fabricates utility" in _rows(db, "promotion_records")[0]["rationale"]
+    assert _rows(db, "apply_attempts")[0]["decision"] == "quarantined"
 
 
 def test_apply_mutation_append_idempotent(db, tmp_path, envscrub):
@@ -519,7 +537,7 @@ def test_cli_main_end_to_end_no_candidate(db, tmp_path, capsys, envscrub):
         "    task_class: reviewer\n"
         "    target:     prompts/reviewer.md\n"
         "    target_kind:prompt_file\n"
-        "    scorer:     mock\n"
+        "    scorer:     probe\n"
         "    apply_enabled: 0\n"
         "    dry_run:    0\n"
         "\n"
@@ -846,6 +864,7 @@ def test_edit_memory_never_reproposes_failed_directive(db, tmp_path, capsys, env
     target = tmp_path / "reviewer.md"
     target.write_text("ORIGINAL PROMPT\n")
     envscrub.setenv("MO_APPLY_ENABLED", "1")
+    envscrub.setenv("MO_APPLY_SCORER", "mock")
     envscrub.setenv("MO_APPLY_MOCK_BASELINE", "0.5")
     envscrub.setenv("MO_APPLY_FORCE_REGRESSION", "1")
     args = ("reviewer", "prompt_file", "prompts/reviewer.md", str(target))

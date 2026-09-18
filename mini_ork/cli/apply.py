@@ -33,11 +33,6 @@ Public surface (mirrors the bash API one-for-one):
 
 Env contract (identical to bash):
     MO_APPLY_ENABLED=1            master gate (default OFF)
-    MO_APPLY_UNVETTED=1           allow promotes while only the mock/gepa
-                                  placeholder scorer is wired (operator
-                                  opt-in; otherwise → pending_human_approval).
-                                  Does NOT apply to scorer=probe — its
-                                  utilities come from real held-out runs
     MO_APPLY_MODE=append|replace  append = idempotent directive block (default,
                                   F3 2026-09-12); replace = legacy whole-file
     MO_APPLY_DRY_RUN=1            skip file write + version_registry write
@@ -45,15 +40,15 @@ Env contract (identical to bash):
     MO_APPLY_REGRESSION_TOLERANCE default 0 (strict per-task no-regression)
     MO_APPLY_PERTASK_JSON         optional {"before":[...],"after":[...]}
     MO_APPLY_MIN_EXAMPLES         default 1
-    MO_APPLY_SCORER               mock (default) | gepa | probe (frozen
-                                  probe-set held-out evaluation, task #18)
+    MO_APPLY_SCORER               probe (default) | mock | gepa. mock/gepa are
+                                  TEST-ONLY: they fabricate utility and can
+                                  never promote, regardless of env
     MO_APPLY_MOCK_BASELINE        mock baseline (score: 0.5; gate: 0.0)
     MO_APPLY_MOCK_DELTA           mock delta (default 0.05)
     MO_APPLY_PROBE_MAX_TASKS      probe scorer: max probes per eval (default 2)
     MO_APPLY_PROBE_BUDGET_USD     probe scorer: spend ceiling (default 2.0)
     MO_APPLY_PROBE_TIMEOUT_S      probe scorer: per-launch timeout (default 600)
     MO_APPLY_FORCE_REGRESSION=1   test seam: forces a regression score
-    MINI_ORK_REQUIRE_HUMAN_APPROVAL=true  force pending_human_approval
 
 Exit code mapping (mirrors bash exactly):
     0  success (promote, quarantine, and no_candidate all exit 0 — a
@@ -91,6 +86,13 @@ _VALID_TARGET_KINDS = (
     "prompt_file", "agent_prompt", "workflow_node", "workflow_edge",
 )
 
+# Scorers that invent a utility number instead of measuring one. They exist as
+# test seams only: a promote on fabricated numbers is indistinguishable in the
+# audit trail from a measured improvement, and once the human approval gate is
+# gone there is no longer any reviewer to catch it. Not configurable by env —
+# that is the point.
+FABRICATING_SCORERS = ("mock", "gepa")
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Help text — verbatim copy of bash's `cat <<'EOF' … EOF` block in _usage().
 # The heredoc body ends with a blank line before EOF, so the emitted output
@@ -99,7 +101,7 @@ _VALID_TARGET_KINDS = (
 USAGE_TEXT = (
     "Usage: bin/mini-ork apply --task-class <name> --target <file>\n"
     "                          [--target-kind prompt_file|agent_prompt|workflow_node|workflow_edge]\n"
-    "                          [--dry-run] [--scorer mock|gepa|probe] [--enable]\n"
+    "                          [--dry-run] [--scorer probe|mock|gepa] [--enable]\n"
     "\n"
     "Close the apply loop: turn the highest-confidence proposed prompt change\n"
     "into a scored workflow_candidate, gated by a non-regression rule, and\n"
@@ -107,15 +109,16 @@ USAGE_TEXT = (
     "(on regression).\n"
     "\n"
     "Scorers:\n"
-    "  mock           deterministic placeholder (fabricates utility)\n"
-    "  gepa           neutral placeholder\n"
     "  probe          frozen probe-set held-out evaluation (real runs,\n"
-    "                 recipes/<recipe>/probes/*.md; vetted promotes — no\n"
-    "                 MO_APPLY_UNVETTED needed)\n"
+    "                 recipes/<recipe>/probes/*.md) — the only promotable\n"
+    "                 scorer; without a measurement the candidate is quarantined\n"
+    "  mock           TEST-ONLY deterministic placeholder (fabricates utility,\n"
+    "                 never promotes)\n"
+    "  gepa           TEST-ONLY neutral placeholder (never promotes)\n"
     "\n"
     "Defaults:\n"
     "  --target-kind  prompt_file\n"
-    "  --scorer       mock\n"
+    "  --scorer       probe\n"
     "  --dry-run      off unless MO_APPLY_DRY_RUN=1\n"
     "\n"
     "Flags:\n"
@@ -289,12 +292,14 @@ def score_candidate(candidate_id: str, scorer: str | None = None) -> str:
     """Score a candidate on a held-out set.
 
     Returns "<avg_utility_score> <n_examples>" (two floats on one line, like
-    bash's stdout). Default scorer is a deterministic mock; ``gepa`` is a neutral
-    placeholder pending the P2 real-execution evaluator (mini_ork.gepa.backends);
-    an unknown scorer returns a neutral "0.5 1".
+    bash's stdout). ``mock`` is a deterministic placeholder and ``gepa`` a
+    neutral placeholder pending the P2 real-execution evaluator
+    (mini_ork.gepa.backends); both FABRICATE utility and can never promote (see
+    ``FABRICATING_SCORERS``), so they exist only as test seams. An unknown
+    scorer returns a neutral "0.5 1".
     """
     if scorer is None:
-        scorer = os.environ.get("MO_APPLY_SCORER", "mock")
+        scorer = os.environ.get("MO_APPLY_SCORER", "probe")
 
     if scorer == "mock":
         # Deterministic score derived from candidate_id hash so tests get
@@ -755,7 +760,7 @@ def apply_run(task_class: str, target_kind: str, target_name: str,
     #    scorer=probe runs the real held-out evaluation (task #18, GRASP
     #    2605.29668): two arms over the frozen probe set, utilities from
     #    task_runs outcomes — never fabricated numbers.
-    scorer = os.environ.get("MO_APPLY_SCORER", "mock")
+    scorer = os.environ.get("MO_APPLY_SCORER", "probe")
     utility_before = "0.0"
     pertask_json = os.environ.get("MO_APPLY_PERTASK_JSON", "")
     if scorer == "mock":
@@ -836,24 +841,17 @@ def apply_run(task_class: str, target_kind: str, target_name: str,
                               f"cost=${probe_result.get('cost_usd', 0.0):.2f}; "
                               f"{gate_rationale}")
 
-    # 4b. Evaluator honesty (F3 enable, 2026-09-12). The mock scorer and the
-    #     gepa placeholder fabricate utility numbers (mock centers after≈0.55
-    #     against a 0.0 baseline → the scalar gate promotes EVERYTHING). A
-    #     promote on fabricated numbers is only allowed under an explicit
-    #     operator opt-in (MO_APPLY_UNVETTED=1); otherwise it is recorded as
-    #     pending_human_approval so the audit trail never claims a measured
-    #     improvement that was not measured. The probe scorer is deliberately
-    #     absent from this list: its utilities come from real held-out runs.
-    if gate_decision == "promoted" and scorer in ("mock", "gepa"):
-        if os.environ.get("MO_APPLY_UNVETTED", "0") == "1":
-            gate_rationale = (f"UNVETTED promote (scorer={scorer} fabricates "
-                              f"utility; operator-enabled via MO_APPLY_UNVETTED); "
-                              f"{gate_rationale}")
-        else:
-            gate_decision = "pending_human_approval"
-            gate_rationale = (f"no real evaluator wired (scorer={scorer}); "
-                              f"refusing unvetted promote — set MO_APPLY_UNVETTED=1 "
-                              f"to allow unvetted applies; {gate_rationale}")
+    # 4b. Evaluator honesty. The mock scorer and the gepa placeholder fabricate
+    #     utility numbers (mock centers after≈0.55 against a 0.0 baseline → the
+    #     scalar gate promotes EVERYTHING). A promote on fabricated numbers is
+    #     indistinguishable in the audit trail from a measured improvement, so
+    #     it is refused outright — there is no opt-in flag that restores it.
+    #     The probe scorer is deliberately absent from this list: its utilities
+    #     come from real held-out runs.
+    if gate_decision == "promoted" and scorer in FABRICATING_SCORERS:
+        gate_decision = "quarantined"
+        gate_rationale = (f"refusing promote: scorer={scorer} fabricates utility "
+                          f"(no real held-out measurement); {gate_rationale}")
 
     # 5. Promotion record (audit). For quarantined / pending_human_approval
     #    decisions the promotion row still exists (it's the audit trail of
@@ -1020,7 +1018,7 @@ def main(argv: list[str] | None = None) -> int:
     target = ""
     target_kind = "prompt_file"
     dry_run = os.environ.get("MO_APPLY_DRY_RUN", "0")
-    scorer = os.environ.get("MO_APPLY_SCORER", "mock")
+    scorer = os.environ.get("MO_APPLY_SCORER", "probe")
     enable_now = False
 
     def _missing_value(flag: str) -> int:
