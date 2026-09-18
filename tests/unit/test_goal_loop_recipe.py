@@ -30,6 +30,7 @@ import yaml
 from mini_ork.cli import execute_handlers as ex
 from mini_ork.cli import recipe_register as rr
 from mini_ork.cli.recipe_register import load_recipe_register
+from mini_ork.workflow.artifacts import ArtifactContractError
 from mini_ork.workflow.compiler import compile_workflow
 
 REPO = Path(__file__).resolve().parents[2]
@@ -48,6 +49,20 @@ sys.modules.setdefault(_spec.name, _mod)
 _spec.loader.exec_module(_mod)
 evaluate_units = _mod.evaluate_units
 list_units = _mod.list_units
+
+# Same file-path load for the transforms module, to bind the ledger-free
+# ``_run_apply`` core of goal_apply_deploy for direct unit tests. The
+# @register_transform side effects mirror what register.py does; the
+# _reset_loader_state fixture snapshots + restores _TRANSFORMS so this is
+# benign.
+_TRANSFORMS_PATH = RECIPE_DIR / "lib" / "transforms.py"
+_tspec = importlib.util.spec_from_file_location("goal_loop_transforms", _TRANSFORMS_PATH)
+if _tspec is None or _tspec.loader is None:
+    raise ImportError(f"could not load transforms module from {_TRANSFORMS_PATH}")
+_tmod = importlib.util.module_from_spec(_tspec)
+sys.modules.setdefault(_tspec.name, _tmod)
+_tspec.loader.exec_module(_tmod)
+run_apply = _tmod._run_apply
 
 
 # ── Module-state fixtures ──────────────────────────────────────────────────
@@ -95,7 +110,7 @@ def test_workflow_yaml_parses_and_validates_recursion():
     assert set(wf["recursion"].keys()) == expected
 
 
-def test_workflow_compiles_with_five_edge_chain():
+def test_workflow_compiles_with_six_edge_chain():
     # register.py must load so the @register_transform decorators fire BEFORE
     # compile_workflow() looks up transform identifiers.
     assert load_recipe_register(RECIPE_DIR) is True
@@ -106,17 +121,20 @@ def test_workflow_compiles_with_five_edge_chain():
         "goal_state": ("planner",),
         "sweep_dispatcher": ("goal_state",),
         "sweep": ("sweep_dispatcher",),
-        "goal_check": ("sweep",),
+        "goal_apply": ("sweep",),
+        "goal_check": ("goal_apply",),
         "publisher": ("goal_check",),
     }
     for node_id, parents in expected_parents.items():
         actual = tuple(compiled.control_parents.get(node_id, ()))
         assert sorted(actual) == sorted(parents), (node_id, actual, parents)
 
-    assert compiled.topological_order.index("planner") < compiled.topological_order.index("goal_state")
-    assert compiled.topological_order.index("sweep_dispatcher") < compiled.topological_order.index("sweep")
-    assert compiled.topological_order.index("sweep") < compiled.topological_order.index("goal_check")
-    assert compiled.topological_order.index("goal_check") < compiled.topological_order.index("publisher")
+    order = compiled.topological_order
+    assert order.index("planner") < order.index("goal_state")
+    assert order.index("sweep_dispatcher") < order.index("sweep")
+    assert order.index("sweep") < order.index("goal_apply")
+    assert order.index("goal_apply") < order.index("goal_check")
+    assert order.index("goal_check") < order.index("publisher")
 
 
 def test_workflow_declares_sweep_implementer_node_between_dispatcher_and_check():
@@ -131,7 +149,11 @@ def test_workflow_declares_sweep_implementer_node_between_dispatcher_and_check()
 
     edges = {(e["from"], e["to"]) for e in wf["edges"]}
     assert ("sweep_dispatcher", "sweep") in edges
-    assert ("sweep", "goal_check") in edges
+    assert ("sweep", "goal_apply") in edges
+    assert ("goal_apply", "goal_check") in edges
+    # sweep no longer wires straight into goal_check — the apply node is the
+    # loop-closing seam between them.
+    assert ("sweep", "goal_check") not in edges
     assert ("sweep_dispatcher", "goal_check") not in edges
 
 
@@ -285,3 +307,121 @@ def test_goal_check_handles_zero_units(tmp_path, monkeypatch):
     assert payload["reason"] == "no_units"
     assert payload["total_units"] == 0
     assert payload["failing_units"] == []
+
+
+# ── 5. goal_apply_deploy core (_run_apply): disabled / dry / live ────────
+# The loop-closing node. Tests drive the ledger-free ``_run_apply`` core
+# directly with fake commands + a tmp run dir; all wait windows collapse to
+# zero so the block is instant.
+
+
+def _write_sweep_result(run_dir: Path, units: list[dict]) -> None:
+    (run_dir / "sweep-result.json").write_text(
+        json.dumps({"status": "fanned_out", "units": units}), encoding="utf-8",
+    )
+
+
+def _arm_apply_env(monkeypatch, target_cwd: Path) -> None:
+    """Common armed-but-fast env: no deploy-await command + zero waits."""
+    monkeypatch.setenv("MO_GOAL_APPLY", "1")
+    monkeypatch.setenv("MO_GOAL_TARGET_CWD", str(target_cwd))
+    monkeypatch.delenv("MO_GOAL_APPLY_DRY", raising=False)
+    monkeypatch.delenv("MO_GOAL_AWAIT_DEPLOY_CMD", raising=False)
+    monkeypatch.setenv("MO_GOAL_DEPLOY_SETTLE_SECONDS", "0")
+    monkeypatch.setenv("MO_GOAL_APPLY_POLL_SECONDS", "0")
+    monkeypatch.setenv("MO_GOAL_APPLY_AWAIT_SECONDS", "0")
+
+
+def test_apply_disabled_is_noop_passthrough(tmp_path, monkeypatch):
+    monkeypatch.delenv("MO_GOAL_APPLY", raising=False)
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    _write_sweep_result(run_dir, [{"unit_id": "1", "status": "spawned"}])
+    payload = run_apply(str(run_dir))
+    assert payload["status"] == "disabled"
+    assert payload["units"] == []
+
+
+def test_apply_armed_requires_deploy_and_redispatch_cmds(tmp_path, monkeypatch):
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    _write_sweep_result(run_dir, [{"unit_id": "1", "status": "spawned"}])
+    monkeypatch.setenv("MO_GOAL_APPLY", "1")
+    monkeypatch.setenv("MO_GOAL_TARGET_CWD", str(tmp_path))
+    monkeypatch.delenv("MO_GOAL_APPLY_CMD", raising=False)
+    monkeypatch.delenv("MO_GOAL_REDISPATCH_CMD", raising=False)
+    with pytest.raises(ArtifactContractError):
+        run_apply(str(run_dir))
+
+
+def test_apply_dry_records_plan_without_executing(tmp_path, monkeypatch):
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    # unit 2 is 'deferred' — never touched the tree, so it must be excluded.
+    _write_sweep_result(run_dir, [
+        {"unit_id": "1", "status": "spawned"},
+        {"unit_id": "2", "status": "deferred"},
+    ])
+    sentinel = tmp_path / "SHOULD_NOT_EXIST"
+    monkeypatch.setenv("MO_GOAL_APPLY", "1")
+    monkeypatch.setenv("MO_GOAL_APPLY_DRY", "1")
+    monkeypatch.setenv("MO_GOAL_TARGET_CWD", str(tmp_path))
+    monkeypatch.setenv("MO_GOAL_APPLY_CMD", f"touch {sentinel}")
+    monkeypatch.setenv("MO_GOAL_REDISPATCH_CMD", f"touch {sentinel}")
+    payload = run_apply(str(run_dir))
+    assert payload["status"] == "dry_run"
+    assert [u["unit_id"] for u in payload["units"]] == ["1"]
+    assert not sentinel.exists()  # dry never runs the deploy/redispatch
+
+
+def test_apply_live_deploys_redispatches_with_argv_and_awaits(tmp_path, monkeypatch):
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    _write_sweep_result(run_dir, [{"unit_id": "1", "status": "spawned"}])
+
+    deploy_marker = tmp_path / "deployed"
+    redispatch_log = tmp_path / "redispatch.log"
+    redispatch = tmp_path / "redispatch.sh"
+    redispatch.write_text(
+        f"#!/usr/bin/env bash\necho \"redispatch $1\" >> {redispatch_log}\nexit 0\n",
+        encoding="utf-8",
+    )
+    redispatch.chmod(0o755)
+    terminal = tmp_path / "terminal.sh"  # settles immediately
+    terminal.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+    terminal.chmod(0o755)
+
+    _arm_apply_env(monkeypatch, tmp_path)
+    monkeypatch.setenv("MO_GOAL_APPLY_CMD", f"touch {deploy_marker}")
+    monkeypatch.setenv("MO_GOAL_REDISPATCH_CMD", str(redispatch))
+    monkeypatch.setenv("MO_GOAL_TERMINAL_CMD", str(terminal))
+
+    payload = run_apply(str(run_dir))
+    assert payload["status"] == "applied"
+    assert deploy_marker.exists()  # deploy command ran once
+    assert payload["deploy"]["rc"] == 0
+    # unit id handed to redispatch as a discrete argv slot (never shell-split).
+    assert redispatch_log.read_text().strip() == "redispatch 1"
+    assert payload["units"][0]["await_regen"]["settled"] is True
+
+
+def test_apply_live_failed_status_still_deploys_and_await_gives_up(tmp_path, monkeypatch):
+    # A 'failed' child commonly leaves a real patch behind; it must still be
+    # deployed. And a unit that never settles must make the await BLOCK give up
+    # (settled False) rather than hang forever.
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    _write_sweep_result(run_dir, [{"unit_id": "1", "status": "failed"}])
+    terminal = tmp_path / "terminal.sh"  # never settles
+    terminal.write_text("#!/usr/bin/env bash\nexit 1\n", encoding="utf-8")
+    terminal.chmod(0o755)
+
+    _arm_apply_env(monkeypatch, tmp_path)
+    monkeypatch.setenv("MO_GOAL_APPLY_CMD", "true")
+    monkeypatch.setenv("MO_GOAL_REDISPATCH_CMD", "true")
+    monkeypatch.setenv("MO_GOAL_TERMINAL_CMD", str(terminal))
+
+    payload = run_apply(str(run_dir))
+    assert payload["status"] == "applied"
+    assert payload["units"][0]["unit_id"] == "1"
+    assert payload["units"][0]["await_regen"]["settled"] is False
