@@ -9,8 +9,15 @@ held-out mini-ork runs, not a fabricated mock.
 
 The probe set lives in ``recipes/<recipe>/probes/*.md`` — ordinary kickoff
 files. A recipe without a probe directory has no frozen probe set, and
-``probe_score`` returns None so the gate can record a pending_human_approval
-instead of promoting on a fabricated neutral score.
+``probe_score`` returns None so the gate quarantines instead of promoting on
+a fabricated neutral score.
+
+A probe whose recipe EDITS FILES needs somewhere to edit that is not the
+framework tree: each launch gets a private copy of ``probes/fixtures/<stem>/``
+handed over as ``MO_TARGET_CWD``. Without it both arms would run in
+``MINI_ORK_ROOT`` — refused by the dispatch cwd guard, and shared between arms
+even where it is not. Recipes that only write into their own run directory
+(obs-smoke) declare no fixture and are unaffected.
 
 run_id capture is deliberately stdout-based: the state.db ``runs`` table is
 vestigial (written only by benchmark_suite / auto_merge) while ``task_runs``
@@ -29,6 +36,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import tempfile
 
 _ROOT = None
 
@@ -69,11 +77,35 @@ def _frozen_probes(task_class: str) -> list[str]:
     return [os.path.join(probes_dir, n) for n in names[:cap]]
 
 
+def _probe_fixture(probe_path: str) -> str | None:
+    """The probe's target project, or None when it declares none.
+
+    A probe that drives a FILE-EDITING recipe needs somewhere to edit. Each
+    arm of the two-arm comparison gets its own copy of this directory, handed
+    to the run as ``MO_TARGET_CWD``: without it both arms would run in
+    ``MINI_ORK_ROOT``, where the mutating arm's edits are visible to the other
+    arm and (via providers.cwd_guard) the dispatch is refused outright.
+
+    Convention: ``probes/fixtures/<probe-stem>/`` sits beside the probe. Kept
+    out of the ``*.md`` glob so it is never mistaken for a probe, and shipped
+    in-repo so the fixture is frozen with the probe it grades.
+    """
+    stem = os.path.splitext(os.path.basename(probe_path))[0]
+    fixture = os.path.join(os.path.dirname(probe_path), "fixtures", stem)
+    return fixture if os.path.isdir(fixture) else None
+
+
 # ── injectable seams (unit tests monkeypatch these two, never the caller) ──
 
 
-def _launch_run(recipe_name: str, kickoff: str) -> tuple[str, str, float]:
+def _launch_run(recipe_name: str, kickoff: str,
+                target_cwd: str | None = None) -> tuple[str, str, float]:
     """Run one probe through the real CLI. Returns (stdout, run_id, cost_usd).
+
+    ``target_cwd`` is the arm's private copy of the probe fixture (see
+    ``_probe_fixture``); it becomes the run's ``MO_TARGET_CWD``. Without it a
+    mutating recipe would edit ``MINI_ORK_ROOT`` — refused by the dispatch cwd
+    guard, and shared between arms even where it is not.
 
     Fail-loud: a launch that produces no run_id raises RuntimeError — the
     caller must never score a run it cannot identify.
@@ -95,11 +127,15 @@ def _launch_run(recipe_name: str, kickoff: str) -> tuple[str, str, float]:
     # (outcome attribution then reads the wrong status), inherited
     # RUN_DIR/PLAN_PATH/WORKFLOW route the nested run into this run's
     # artifacts, and an inherited MO_AUTO_APPLY would fire a sweep inside
-    # every probe run — unbounded recursion.
+    # every probe run — unbounded recursion. MO_TARGET_CWD leaks the OUTER
+    # run's target into both arms, which would make the two arms share one
+    # working tree; each arm sets its own below.
     for leak in ("MINI_ORK_RUN_ID", "MINI_ORK_TASK_RUN_ID", "MINI_ORK_RUN_DIR",
                  "MINI_ORK_PLAN_PATH", "MINI_ORK_WORKFLOW", "MINI_ORK_RECIPE",
-                 "MO_AUTO_APPLY"):
+                 "MO_AUTO_APPLY", "MO_TARGET_CWD"):
         env.pop(leak, None)
+    if target_cwd:
+        env["MO_TARGET_CWD"] = target_cwd
     proc = subprocess.run(
         [sys.executable, "-m", "mini_ork.cli.main", "run", recipe_name, kickoff],
         cwd=root, env=env, capture_output=True, text=True, timeout=timeout_s,
@@ -217,6 +253,22 @@ def _materialize_arm(task_class: str, target_file: str | None, directive_block: 
     return name, mutated
 
 
+def _materialize_target(probe_path: str) -> str | None:
+    """A fresh scratch copy of the probe's fixture, or None when it has none.
+
+    Fresh per (probe, arm), not per arm: the two recipe arms are materialized
+    once and reused across the whole probe loop, so a target shared between
+    runs would let the mutating arm's edits — or one probe's edits — be
+    observed by the next launch. Each run starts from the frozen fixture.
+    """
+    fixture = _probe_fixture(probe_path)
+    if not fixture:
+        return None
+    dst = tempfile.mkdtemp(prefix="mo-probe-target-")
+    shutil.copytree(fixture, dst, dirs_exist_ok=True)
+    return dst
+
+
 def probe_score(task_class: str, target_file: str | None,
                 directive: str, *, source_ref: str = "", context: str = "") -> dict | None:
     """Two-arm held-out evaluation of one directive mutation.
@@ -250,6 +302,7 @@ def probe_score(task_class: str, target_file: str | None,
     block = _directive_block(directive, source_ref=source_ref, context=context)
 
     temp_dirs: list[str] = []
+    temp_targets: list[str] = []
     runs: list[dict] = []
     before_v: list[float] = []
     after_v: list[float] = []
@@ -269,7 +322,10 @@ def probe_score(task_class: str, target_file: str | None,
             for arm, recipe_name in (("baseline", base_name), ("candidate", cand_name)):
                 if spent >= budget:
                     break
-                _stdout, run_id, cost = _launch_run(recipe_name, probe)
+                target = _materialize_target(probe)
+                if target:
+                    temp_targets.append(target)
+                _stdout, run_id, cost = _launch_run(recipe_name, probe, target_cwd=target)
                 spent += cost
                 outcome = _run_outcome(run_id)
                 runs.append({"probe": os.path.basename(probe), "arm": arm,
@@ -285,6 +341,8 @@ def probe_score(task_class: str, target_file: str | None,
             path = os.path.join(root, "recipes", name)
             if os.path.isdir(path):
                 shutil.rmtree(path, ignore_errors=True)
+        for path in temp_targets:
+            shutil.rmtree(path, ignore_errors=True)
 
     n = min(len(before_v), len(after_v))
     before_v, after_v, ids = before_v[:n], after_v[:n], ids[:n]

@@ -11,6 +11,34 @@ own output.
 It is for teams who want an agent to do real work without treating fluent output, a
 green-looking diff, or a panel of agreeing models as proof.
 
+## Warning: this system modifies itself, unattended
+
+mini-ork's apply loop can rewrite its own recipe prompts, agent prompts, and workflow
+nodes and edges — and **promote those changes without a human approving each one**. It
+runs the candidate change over a held-out probe set, compares the publish rate before
+and after, and promotes only on a measured improvement that does not regress a
+previously-passing task. There is no "review this first" gate in that loop, and no
+environment variable that puts one back.
+
+Read that as what it is: the machine is allowed to rewrite itself while you are not
+looking. The measurement is real — no promote happens without one — but a measurement
+is evidence, not a guarantee. A probe set is only as strong as its probes, and the loop
+cannot know what it never tested.
+
+**If that is not what you want, the safe configuration is:**
+
+- Leave `MO_APPLY_ENABLED` and `MO_AUTO_APPLY` unset. Both default to off, and the
+  unattended sweep requires *both* to be `1`.
+- Run it on a throwaway worktree, never on a checkout you care about.
+- Know your caps: `MO_APPLY_PROBE_BUDGET_USD` and `MO_APPLY_PROBE_MAX_TASKS` bound what
+  a single apply run can spend.
+- Keep the target repository under version control. **Your VCS is the backstop** —
+  review the promoted diffs the way you would review a junior engineer's commit.
+
+This is a research-grade, self-improving system under active development. A promotion
+is a change that has already landed, not a proposal waiting for you. See
+[docs/SAFETY.md](docs/SAFETY.md) for the full posture and the gates that do hold.
+
 ## Why this exists
 
 AI agents now write code faster than any team can review it. The bottleneck moved from
@@ -96,8 +124,9 @@ open-source — is the wedge, and it doesn't exist together anywhere else today.
 
 Honest about the edges: the execution oracle is only as strong as what you can *run*, so
 its guarantees are richest on code with real tests and thinnest on subjective or
-untestable work — where mini-ork is designed to surface uncertainty or ask a person
-rather than manufacture confidence.
+untestable work — where mini-ork is built to surface the uncertainty and refuse the
+promote rather than manufacture confidence. (Refusing does not mean asking you: the
+self-improvement loop has no approval prompt. See the [warning](#warning-this-system-modifies-itself-unattended) above.)
 
 ## What is in the box
 
@@ -191,7 +220,9 @@ mini-ork run code-fix ./kickoff.md
    diagnosis; it does not replace deterministic verification.
 5. **Read the evidence before promotion.** mini-ork retains traces and can learn from
    runs, but automatic promotion is intentionally restricted to classes with measurable
-   external evidence.
+   external evidence. Note that this is the *only* thing standing between a learned
+   directive and your recipe files — there is no human approval step to catch a bad
+   promote.
 
 ### Pick a starting recipe
 
@@ -209,13 +240,16 @@ artifact contract, prompts, and verifiers; see the [extension guide](docs/EXTENS
 ## Honesty by design
 
 mini-ork does **not** claim a universal oracle. Where there is no trustworthy external
-check — a subjective product decision, untestable code — it should surface uncertainty or
-ask a person rather than manufacture confidence. That discipline is wired in, not aspirational:
+check — a subjective product decision, untestable code — it surfaces the uncertainty
+rather than manufacturing confidence. That discipline is wired in, not aspirational:
 
 - A run whose verification is absent or meaningless is reported as **vacuous**.
 - The dispatch and learning surfaces refuse to invent a number below their evidence
   threshold (Wilson-CI honesty: `<5` samples returns `evidence: "none"`).
 - Every gate rejection cites the evidence trace it was based on, so a "no" is auditable.
+- The promotion gate has no human branch. "Not promotable" is a recorded verdict with a
+  reason attached, never a request sent to a person — the loop has nobody to ask, and it
+  does not pretend otherwise.
 
 ## Learn more
 
