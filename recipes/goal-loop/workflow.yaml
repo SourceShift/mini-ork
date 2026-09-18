@@ -35,6 +35,13 @@ nodes:
     prompt_ref: null
     dispatch_mode: serial
 
+  - name: goal_apply
+    type: transform
+    transform: goal_apply_deploy
+    dispatch_mode: serial
+    outputs:
+      - { name: apply_result, path: apply-result.json, kind: file, visibility: consumer }
+
   - name: goal_check
     type: verifier
     prompt_ref: null
@@ -52,7 +59,8 @@ edges:
   - { from: planner,          to: goal_state,        edge_type: depends_on }
   - { from: goal_state,       to: sweep_dispatcher,  edge_type: depends_on, from_output: goal_state, to_input: goal_state }
   - { from: sweep_dispatcher, to: sweep,             edge_type: depends_on }
-  - { from: sweep,            to: goal_check,        edge_type: depends_on }
+  - { from: sweep,            to: goal_apply,        edge_type: depends_on }
+  - { from: goal_apply,       to: goal_check,        edge_type: depends_on }
   - { from: goal_check,       to: publisher,         edge_type: depends_on }
 
 recursion:
