@@ -49,6 +49,18 @@ def _evidence(msg: str) -> None:
         fh.write(msg + "\n")
 
 
+def _emit(payload: dict) -> None:
+    # The executor grades a verifier_ref on its captured STDOUT, not on the
+    # self-managed EVIDENCE log: _run_verifier_ref/verify.py redirect stdout
+    # into the evidence file and treat an empty capture as a vacuous pass
+    # (suppressed -> node fails). Print the verdict JSON so the capture is
+    # non-empty. The payload deliberately carries NO "pass" key, so
+    # _run_verifier_ref propagates this script's own exit code: 0 for a valid
+    # wave (incl. verdict=fail) and non-zero only for undecidable state.
+    sys.stdout.write(json.dumps(payload, sort_keys=True) + "\n")
+    sys.stdout.flush()
+
+
 def _missing_env() -> list[str]:
     needed = ("MO_GOAL_TARGET_CWD", "MO_GOAL_UNITS_CMD", "MO_GOAL_PREDICATE_CMD")
     return [name for name in needed if not os.environ.get(name)]
@@ -58,7 +70,9 @@ def main() -> int:
     open(EVIDENCE, "w").close()
     missing = _missing_env()
     if missing:
-        _evidence(f"missing required env: {', '.join(missing)}")
+        reason = f"missing required env: {', '.join(missing)}"
+        _evidence(reason)
+        _emit({"verdict": "error", "reason": reason})
         return 1
 
     target_cwd = os.environ["MO_GOAL_TARGET_CWD"]
@@ -68,7 +82,9 @@ def main() -> int:
     try:
         units = list_units(target_cwd, units_cmd)
     except RuntimeError as exc:
-        _evidence(f"units lister failed: {exc}")
+        reason = f"units lister failed: {exc}"
+        _evidence(reason)
+        _emit({"verdict": "error", "reason": reason})
         return 1
 
     states = evaluate_units(target_cwd, predicate_cmd, units)
@@ -104,6 +120,7 @@ def main() -> int:
         f"verdict={verdict} total={total} failing={len(failing)} "
         f"units={list(states.keys())[:10]}{'…' if len(states) > 10 else ''}"
     )
+    _emit(payload)
     return 0
 
 

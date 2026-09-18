@@ -25,6 +25,8 @@ nodes:
     type: transform
     transform: goal_sweep_plan
     dispatch_mode: serial
+    inputs:
+      goal_state: { required: true }
     outputs:
       - { name: sweep_plan, path: sweep-plan.json, kind: file, visibility: consumer }
 
@@ -48,7 +50,7 @@ nodes:
 
 edges:
   - { from: planner,          to: goal_state,        edge_type: depends_on }
-  - { from: goal_state,       to: sweep_dispatcher,  edge_type: depends_on }
+  - { from: goal_state,       to: sweep_dispatcher,  edge_type: depends_on, from_output: goal_state, to_input: goal_state }
   - { from: sweep_dispatcher, to: sweep,             edge_type: depends_on }
   - { from: sweep,            to: goal_check,        edge_type: depends_on }
   - { from: goal_check,       to: publisher,         edge_type: depends_on }
