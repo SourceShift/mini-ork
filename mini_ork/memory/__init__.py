@@ -23,14 +23,20 @@ from .semantic import (
     add,
     record_outcome,
     record_retrievals,
+    rank_with_prior,
+    resolve_finished_runs,
     search,
+    upsert,
 )
 
 __all__ = [
     "add",
+    "upsert",
     "search",
+    "rank_with_prior",
     "record_retrievals",
     "record_outcome",
+    "resolve_finished_runs",
     "Embedder",
     "HashEmbedder",
 ]
