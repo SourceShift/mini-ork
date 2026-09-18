@@ -42,13 +42,20 @@ def test_builtin_evaluation_unchanged(tmp_path):
 
 # ── Native oracle-gate evaluators (WS4 bash-removal) ──────────────────────────
 
+#: The gates seeded for every task class by ``gate_bootstrap``.
+_ORACLE_GATE_NAMES = {
+    "coalition", "liveness", "panel-health", "stability", "synthesis-promote"}
+
 
 def test_native_gate_names_registered():
     from mini_ork.gates import native_gates
 
-    assert set(native_gates.NATIVE_GATE_EVALUATORS) == {
-        "coalition", "liveness", "panel-health", "stability",
-        "synthesis-promote"}
+    # mutation-adversary is registered here but is NOT one of the oracle gates:
+    # it is seeded scoped to its own task class, so it joins only the runs that
+    # opted in. Asserting the exact set (rather than a superset) keeps a silent
+    # removal of any name caught.
+    assert set(native_gates.NATIVE_GATE_EVALUATORS) == (
+        _ORACLE_GATE_NAMES | {"mutation-adversary"})
 
 
 def test_resolve_native_evaluator_sentinel_and_script_path():
