@@ -620,12 +620,16 @@ def test_induce_pending_without_a_database_is_a_no_op(tmp_path, monkeypatch):
 
 # ── the reflect wiring ──────────────────────────────────────────────────────
 
-def _drive_reflect(db: str, argv: list[str] | None = None) -> str:
+def _drive_reflect(monkeypatch, db: str, argv: list[str] | None = None) -> str:
     """Run `reflect.main` in-process with its LLM-bound stages stubbed.
 
     Only the induction block is left live, so what this asserts is the wiring:
     whether reflect reaches the stage at all. The trace write is stubbed
     because the scratch DB carries no epics/runs rows — an unrelated table.
+
+    Every stub goes through `monkeypatch`: these are module attributes, so a
+    bare assignment outlives the test and poisons every later file in the
+    process that calls the same function.
     """
     from contextlib import redirect_stdout
 
@@ -633,9 +637,9 @@ def _drive_reflect(db: str, argv: list[str] | None = None) -> str:
     from mini_ork.learning import reflection_pipeline as rp
     from mini_ork.stores import pattern_store
 
-    rp.reflection_run = lambda since: "[]"
-    pattern_store.mine_from_traces = lambda **k: 0
-    reflect._trace_write = lambda *a, **k: None
+    monkeypatch.setattr(rp, "reflection_run", lambda since: "[]")
+    monkeypatch.setattr(pattern_store, "mine_from_traces", lambda **k: 0)
+    monkeypatch.setattr(reflect, "_trace_write", lambda *a, **k: None)
 
     buf = io.StringIO()
     with redirect_stdout(buf):
@@ -668,7 +672,7 @@ def test_reflect_reaches_the_induction_stage(tmp_path, monkeypatch):
     monkeypatch.delenv("MO_PATTERN_INDUCE", raising=False)
     calls = _stub_analyst_citing_members(monkeypatch, ["t0", "t1", "t2"])
 
-    out = _drive_reflect(db)
+    out = _drive_reflect(monkeypatch, db)
     assert len(calls) == 1, "reflect never called the analyst"
     assert "pattern_induct" in out
 
@@ -688,6 +692,6 @@ def test_reflect_skips_the_induction_stage_when_opted_out(tmp_path, monkeypatch)
     monkeypatch.setenv("MO_PATTERN_INDUCE", "0")
     calls = _stub_analyst_citing_members(monkeypatch, ["t0", "t1", "t2"])
 
-    out = _drive_reflect(db)
+    out = _drive_reflect(monkeypatch, db)
     assert calls == [], "the opt-out did not stop the analyst call"
     assert "pattern_induct" not in out
