@@ -303,6 +303,26 @@ def _eval_mutation_adversary(
         return "defer"
 
 
+# ── step-rules (step_rules.py) ───────────────────────────────────────────────
+
+
+def _eval_step_rules(
+    condition: str, context_json: str, db_path: str, mini_ork_root: Optional[str]
+) -> str:
+    """Verdict from the deterministic rules on the intermediate artifact (VPRMs).
+
+    These rules are lookups, not measurements over a sample, so unlike the
+    mutation campaign they run inline rather than reading a report left behind by
+    someone else. The mapping — any rule failing is a fail, no rule firing at all
+    is a defer — lives in ``step_rules.gate_verdict`` alongside the rules
+    themselves, so the honest partial coverage the technique demands is enforced
+    where the coverage is decided.
+    """
+    from mini_ork.gates import step_rules
+
+    return step_rules.evaluate(condition, context_json, db_path, mini_ork_root)
+
+
 # ── registry ──────────────────────────────────────────────────────────────────
 
 NATIVE_GATE_EVALUATORS: dict[str, NativeGateEvaluator] = {
@@ -312,6 +332,7 @@ NATIVE_GATE_EVALUATORS: dict[str, NativeGateEvaluator] = {
     "stability": _eval_stability,
     "synthesis-promote": _eval_synthesis_promote,
     "mutation-adversary": _eval_mutation_adversary,
+    "step-rules": _eval_step_rules,
 }
 
 

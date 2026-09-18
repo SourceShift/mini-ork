@@ -117,9 +117,13 @@ def test_native_conditions_evaluate_without_bash(db, tmp_path):
     ctx = ('{"panel_run_id":"run-no-traces","recipe":"code-fix",'
            '"task_class":"code_fix","current_round":1}')
     summary = gr.gate_run_all(db, "code_fix", ctx, mini_ork_root=str(REPO))
-    assert summary["gate_count"] == 5
     assert summary["safety_violation"] is False
     verdicts = {g["gate_id"]: g["verdict"] for g in summary["gates"]}
+    # All five oracle gates participate. The exact total is not asserted — other
+    # gates (mutation-adversary) legitimately join this run, and this test is
+    # about the oracle five evaluating natively, not about the registry size.
+    assert {"oracle-coalition", "oracle-liveness", "oracle-stability",
+            "oracle-panel-health", "oracle-synthesis-promote"} <= set(verdicts)
     assert verdicts["oracle-coalition"] == "pass"
     assert verdicts["oracle-liveness"] == "pass"
     assert verdicts["oracle-stability"] == "pass"
@@ -154,7 +158,6 @@ def test_legacy_script_path_conditions_still_evaluate_natively(db):
     ctx = ('{"panel_run_id":"run-no-traces","recipe":"code-fix",'
            '"task_class":"code_fix","current_round":1}')
     summary = gr.gate_run_all(db, "code_fix", ctx, mini_ork_root=str(REPO))
-    assert summary["gate_count"] == 5
     assert summary["safety_violation"] is False
     verdicts = {g["gate_id"]: g["verdict"] for g in summary["gates"]}
     assert verdicts["oracle-coalition"] == "pass"

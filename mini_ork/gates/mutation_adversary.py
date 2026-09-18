@@ -61,6 +61,10 @@ Public surface:
     threshold_pass(kill_rate)                 -> str  ("PASS"|"FAIL")
     run_adversary(mutations_json, workspace, test_cmd, *,
                   report_path=None)           -> dict
+    run_campaign(workspace, test_cmd, *, log_path="",
+                 mutations_json=None, report_path=None,
+                 max_mutations=5)              -> dict
+    max_mutations()                           -> int
     load_report(path)                         -> dict | None
     gate_verdict(report)                      -> str  ("pass"|"fail"|"defer")
     _emit_cache_row(db_path, epic, iter, hash, cost, turns, dur,
@@ -72,6 +76,7 @@ from __future__ import annotations
 import datetime as _dt
 import hashlib
 import json
+import os
 import re
 import shlex
 import sqlite3
@@ -88,6 +93,8 @@ __all__ = [
     "compute_validation_results",
     "threshold_pass",
     "run_adversary",
+    "run_campaign",
+    "max_mutations",
     "load_report",
     "gate_verdict",
     "_emit_cache_row",
@@ -444,6 +451,30 @@ def compute_validation_results(
 _APPLY_TIMEOUT_S = 60
 _TEST_TIMEOUT_S = 900
 
+#: How many mutations one campaign applies before stopping. Each one runs the
+#: target's whole test command, so this is the knob that bounds a campaign's
+#: cost.
+_DEFAULT_MAX_MUTATIONS = 5
+#: Hard ceiling on that knob, so a typo in the env cannot launch a thousand-run
+#: sweep.
+_MAX_MUTATIONS_CEILING = 50
+
+
+def max_mutations() -> int:
+    """Mutations per campaign. ``MO_MUTATION_MAX`` may only *raise* the default.
+
+    Tighten-only, the same shape as every other floor in this codebase: buying
+    less coverage is the one thing a measured check must not offer, because a
+    smaller sample is easier to pass. An operator who wants no campaign at all
+    sets ``MO_MUTATION_ADVERSARY=0`` — a decision that is visible in the verdict
+    as an unmeasured gate, rather than a quiet thinning that still reports pass.
+    """
+    try:
+        want = int(os.environ.get("MO_MUTATION_MAX", _DEFAULT_MAX_MUTATIONS))
+    except (TypeError, ValueError):
+        want = _DEFAULT_MAX_MUTATIONS
+    return min(max(_DEFAULT_MAX_MUTATIONS, want), _MAX_MUTATIONS_CEILING)
+
 
 def _worktree_dirty(workspace: str) -> bool:
     """True when ``workspace`` has uncommitted changes (bash line 228's check).
@@ -605,6 +636,45 @@ def run_adversary(
         Path(report_path).parent.mkdir(parents=True, exist_ok=True)
         Path(report_path).write_text(json.dumps(result, indent=2), encoding="utf-8")
     return result
+
+
+def run_campaign(
+    workspace: str,
+    test_cmd: "str | Sequence[str]",
+    *,
+    log_path: str = "",
+    mutations_json: Optional[dict] = None,
+    report_path: Optional[str] = None,
+    max_mutations: int = _DEFAULT_MAX_MUTATIONS,
+) -> dict:
+    """Produce the mutations (if not supplied), apply them, and report the kill rate.
+
+    The live entry point for the whole chain: it turns "a log the implementer
+    wrote" into "a report the gate can read", which is what ``run_adversary``
+    alone could not do because nothing produced its input.
+
+    Args:
+        workspace:      git worktree the mutations are applied in.
+        test_cmd:       the command whose non-zero exit is a kill.
+        log_path:       where to read mutations from when ``mutations_json`` is
+                        not supplied (a Claude stream-json log).
+        mutations_json: pre-built mutations; skips extraction entirely.
+        report_path:    where to persist the report for the gate.
+        max_mutations:  cap on how many mutations are applied. A campaign is
+                        bounded by this because each iteration runs the target's
+                        full test command.
+
+    Returns:
+        The ``compute_validation_results`` report. When extraction finds nothing
+        this is the zero-mutation shape, which ``gate_verdict`` reads as
+        ``defer`` — an extraction failure is an unrun check, not a clean one.
+    """
+    if mutations_json is None:
+        mutations_json = build_mutations_json(extract_mutations_from_log(log_path))
+    muts = mutations_json.get("mutations") or []
+    if max_mutations > 0 and len(muts) > max_mutations:
+        mutations_json = {**mutations_json, "mutations": muts[:max_mutations]}
+    return run_adversary(mutations_json, workspace, test_cmd, report_path=report_path)
 
 
 def _revert(workspace: str, patch: str, diff: str, timeout_s: int) -> bool:
