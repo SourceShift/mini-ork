@@ -811,16 +811,44 @@ def _seed_emergent(temp_db, rows):
     con.close()
 
 
-def test_reflection_verify_patterns_gate(temp_db):
-    """Judge-gate promotes only evidence-backed 'proposed' rows to 'approved'.
+def _seed_traces(temp_db, rows):
+    """rows: list of (trace_id, run_id). Evidence must RESOLVE to be counted."""
+    now = int(time.time())
+    con = sqlite3.connect(temp_db)
+    con.execute("PRAGMA busy_timeout=5000")
+    con.executemany(
+        "INSERT INTO execution_traces(trace_id, run_id, task_class, status, created_at) "
+        "VALUES (?, ?, 'code_fix', 'success', ?)",
+        [(tid, rid, now) for tid, rid in rows],
+    )
+    con.commit()
+    con.close()
 
-    Floor (defaults): strength_score >= 3 AND member-evidence count >= 1.
-    Rows below either bound stay 'proposed'."""
+
+def test_reflection_verify_patterns_gate(temp_db):
+    """Judge-gate promotes only INDEPENDENTLY evidence-backed 'proposed' rows.
+
+    Floor (defaults): strength_score >= 3 AND evidence resolving to >= 3 DISTINCT
+    runs. A raw member count is not the measure: three traces from one run are one
+    observation, and one trace id repeated is one observation however it is
+    listed. Rows below either bound stay 'proposed'."""
+    _seed_traces(temp_db, [
+        ("tr-strong-1", "run-a"), ("tr-strong-2", "run-b"), ("tr-strong-3", "run-c"),
+        ("tr-weak-str", "run-d"),
+    ])
     seed = [
-        ("p-strong",   [{"item_table": "execution_traces", "item_id": "t1"}], 5.0, "proposed"),  # pass
-        ("p-weak-str", [{"item_table": "execution_traces", "item_id": "t2"}], 2.0, "proposed"),  # fail: strength
+        ("p-strong", [
+            {"item_table": "execution_traces", "item_id": "tr-strong-1"},
+            {"item_table": "execution_traces", "item_id": "tr-strong-2"},
+            {"item_table": "execution_traces", "item_id": "tr-strong-3"},
+        ], 5.0, "proposed"),  # pass: 3 distinct runs
+        ("p-weak-str", [
+            {"item_table": "execution_traces", "item_id": "tr-weak-str"},
+        ], 2.0, "proposed"),  # fail: strength
         ("p-no-ev",    [],                                                     9.0, "proposed"),  # fail: evidence
-        ("p-already",  [{"item_table": "execution_traces", "item_id": "t3"}], 8.0, "approved"),  # not proposed
+        ("p-already",  [
+            {"item_table": "execution_traces", "item_id": "tr-strong-1"},
+        ], 8.0, "approved"),  # not proposed
     ]
 
     _seed_emergent(temp_db, seed)
@@ -843,6 +871,104 @@ def test_reflection_verify_patterns_gate(temp_db):
     assert statuses["p-weak-str"] == "proposed"
     assert statuses["p-no-ev"] == "proposed"
     assert statuses["p-already"] == "approved"
+
+
+def _verify_and_status(temp_db, monkeypatch, pattern_id, env=None):
+    """Run the gate; return the resulting status of one pattern."""
+    if env:
+        for k, v in env.items():
+            monkeypatch.setenv(k, v)
+    import io
+    from contextlib import redirect_stdout
+    with redirect_stdout(io.StringIO()):
+        rp.reflection_verify_patterns()
+    con = sqlite3.connect(temp_db)
+    st = con.execute(
+        "SELECT status FROM emergent_patterns WHERE pattern_id=?", (pattern_id,)
+    ).fetchone()[0]
+    con.close()
+    return st
+
+
+def _members(*trace_ids):
+    return [{"item_table": "execution_traces", "item_id": t} for t in trace_ids]
+
+
+def test_reflection_verify_patterns_repeated_trace_id_is_one_observation(
+        temp_db, monkeypatch):
+    """One trace id listed three times is ONE observation, not three.
+
+    The forgeable path this closes: `len(json.loads(members))` counts the listing,
+    so a single trace id repeated three times cleared a floor of three and flipped
+    proposed→approved — and only approved rows reach the agent's context."""
+    _seed_traces(temp_db, [("tr-dup", "run-a")])
+    _seed_emergent(temp_db, [
+        ("p-dup", _members("tr-dup", "tr-dup", "tr-dup"), 9.0, "proposed"),
+    ])
+
+    assert _verify_and_status(temp_db, monkeypatch, "p-dup") == "proposed"
+
+
+def test_reflection_verify_patterns_one_run_is_one_observation(temp_db, monkeypatch):
+    """Three distinct traces from a SINGLE run are one observation.
+
+    This is the PoisonedEvolution bar (2608.05563): three consistent records
+    inside one batch suffice to promote an attacker-chosen behaviour."""
+    _seed_traces(temp_db, [("tr-s1", "run-solo"), ("tr-s2", "run-solo"),
+                           ("tr-s3", "run-solo")])
+    _seed_emergent(temp_db, [
+        ("p-one-run", _members("tr-s1", "tr-s2", "tr-s3"), 9.0, "proposed"),
+    ])
+
+    assert _verify_and_status(temp_db, monkeypatch, "p-one-run") == "proposed"
+
+
+def test_reflection_verify_patterns_null_run_id_is_unproven(temp_db, monkeypatch):
+    """A NULL/empty run_id is unproven independence, never assumed independence."""
+    now = int(time.time())
+    con = sqlite3.connect(temp_db)
+    con.execute("PRAGMA busy_timeout=5000")
+    con.executemany(
+        "INSERT INTO execution_traces(trace_id, run_id, task_class, status, created_at) "
+        "VALUES (?, ?, 'code_fix', 'success', ?)",
+        [("tr-n1", None, now), ("tr-n2", "", now), ("tr-n3", "run-real", now)],
+    )
+    con.commit()
+    con.close()
+    _seed_emergent(temp_db, [
+        ("p-null", _members("tr-n1", "tr-n2", "tr-n3"), 9.0, "proposed"),
+    ])
+
+    assert _verify_and_status(temp_db, monkeypatch, "p-null") == "proposed"
+
+
+def test_reflection_verify_patterns_floor_cannot_be_lowered(temp_db, monkeypatch):
+    """MO_EMERGENT_VERIFY_MIN_EVIDENCE may raise the floor but never lower it.
+
+    A safety floor is not a setting: if an env var could restore the forgeable
+    bar, the hole would be open again by configuration."""
+    _seed_traces(temp_db, [("tr-one", "run-only")])
+    _seed_emergent(temp_db, [
+        ("p-env1", _members("tr-one"), 9.0, "proposed"),
+    ])
+
+    assert _verify_and_status(
+        temp_db, monkeypatch, "p-env1",
+        {"MO_EMERGENT_VERIFY_MIN_EVIDENCE": "1"},
+    ) == "proposed"
+
+
+def test_reflection_verify_patterns_floor_can_be_raised(temp_db, monkeypatch):
+    """The env var raises the bar: 3 independent runs do not clear 5."""
+    _seed_traces(temp_db, [("tr-r1", "run-1"), ("tr-r2", "run-2"), ("tr-r3", "run-3")])
+    _seed_emergent(temp_db, [
+        ("p-env5", _members("tr-r1", "tr-r2", "tr-r3"), 9.0, "proposed"),
+    ])
+
+    assert _verify_and_status(
+        temp_db, monkeypatch, "p-env5",
+        {"MO_EMERGENT_VERIFY_MIN_EVIDENCE": "5"},
+    ) == "proposed"
 
 
 def test_reflection_verify_patterns_optout(temp_db, monkeypatch):
