@@ -19,6 +19,7 @@ import importlib.util
 import json
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 # File-path import pattern (recipes/ is not a Python package).
 RECIPE_DIR = Path(__file__).resolve().parents[2] / "recipes" / "goal-loop"
@@ -263,3 +264,120 @@ def test_sweep_run_deferred_on_value_error(tmp_path, monkeypatch):
     result = json.loads((run_dir / "sweep-result.json").read_text())
     assert result["units"][0]["status"] == "deferred"
     assert "cap hit" in result["units"][0]["reason"]
+
+
+# ── 7-9. U4c per-unit kickoff templating ────────────────────────────────
+
+
+def _capture_spawn(monkeypatch):
+    """Patch ``mini_ork.cli.spawn.spawn`` and return the captured-kwargs dict.
+
+    ``_default_spawn_fn`` reaches the spawn via a lazy import
+    (``from mini_ork.cli.spawn import spawn`` inside the function body, so the
+    ``spawn`` symbol is rebound on every call). Monkeypatching
+    ``mini_ork.cli.spawn.spawn`` is what the lazy import will pick up next.
+    """
+    captured: dict = {}
+
+    def fake_spawn(*args, **kwargs):
+        captured.clear()
+        captured.update(kwargs)
+        return SimpleNamespace(exit_code=0, spawn_id="fake-id", child_run_id=None)
+
+    import mini_ork.cli.spawn as spawn_mod
+    monkeypatch.setattr(spawn_mod, "spawn", fake_spawn)
+    return captured
+
+
+def test_default_spawn_fn_templating_substitutes_unit_and_reason(tmp_path, monkeypatch):
+    """File template with {{unit_id}} and {{reason}} → materialized per-unit.
+
+    The spawned kickoff path lives under the run dir, its filename has NO
+    ``/`` from the unit id (sanitized), and its body carries both fields with
+    no ``{{`` remaining.
+    """
+    template = tmp_path / "template.md"
+    template.write_text(
+        "# Fix {{unit_id}}\n\nReason: {{reason}}\n", encoding="utf-8",
+    )
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    monkeypatch.setenv("MINI_ORK_RUN_DIR", str(run_dir))
+    monkeypatch.setenv("MO_GOAL_CHILD_KICKOFF", str(template))
+    monkeypatch.setenv("MINI_ORK_ALLOW_CHILD_SPAWN", "1")
+    monkeypatch.setenv("MO_GOAL_NO_EXECUTE", "0")
+
+    captured = _capture_spawn(monkeypatch)
+    default = _DRIVE._default_spawn_fn  # noqa: SLF001 — test seam
+
+    result = default({
+        "unit_id": "docs/ch-01.md",
+        "child_recipe": "code-fix",
+        "kickoff_hint": {"unit_id": "docs/ch-01.md", "reason": "lens 04 failed"},
+    })
+
+    assert result["status"] == "spawned"
+    kickoff_path = captured["kickoff"]
+    assert kickoff_path.startswith(str(run_dir)), kickoff_path
+    assert "/" not in Path(kickoff_path).name
+    body = Path(kickoff_path).read_text(encoding="utf-8")
+    assert "docs/ch-01.md" in body
+    assert "lens 04 failed" in body
+    assert "{{" not in body
+
+
+def test_default_spawn_fn_passthrough_for_template_without_placeholders(tmp_path, monkeypatch):
+    """Template file with NO placeholders → spawn receives the ORIGINAL path."""
+    template = tmp_path / "static_template.md"
+    template.write_text("# Static kickoff\nNo placeholders here.\n", encoding="utf-8")
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    monkeypatch.setenv("MINI_ORK_RUN_DIR", str(run_dir))
+    monkeypatch.setenv("MO_GOAL_CHILD_KICKOFF", str(template))
+    monkeypatch.setenv("MINI_ORK_ALLOW_CHILD_SPAWN", "1")
+
+    captured = _capture_spawn(monkeypatch)
+    default = _DRIVE._default_spawn_fn  # noqa: SLF001 — test seam
+
+    result = default({
+        "unit_id": "docs/ch-02.md",
+        "child_recipe": "code-fix",
+        "kickoff_hint": {"reason": "ignored"},
+    })
+
+    assert result["status"] == "spawned"
+    # ORIGINAL template path passes through unchanged.
+    assert captured["kickoff"] == str(template)
+    # No materialized file is written under the run dir.
+    assert list(run_dir.glob("_inline_kickoff_*")) == []
+
+
+def test_default_spawn_fn_templating_for_inline_body(tmp_path, monkeypatch):
+    """Inline (non-file) MO_GOAL_CHILD_KICKOFF body with placeholders → file written."""
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    monkeypatch.setenv("MINI_ORK_RUN_DIR", str(run_dir))
+    # Inline body (NOT a file path) with placeholders.
+    monkeypatch.setenv(
+        "MO_GOAL_CHILD_KICKOFF",
+        "# Fix {{unit_id}}\nreason: {{reason}}\n",
+    )
+    monkeypatch.setenv("MINI_ORK_ALLOW_CHILD_SPAWN", "1")
+
+    captured = _capture_spawn(monkeypatch)
+    default = _DRIVE._default_spawn_fn  # noqa: SLF001 — test seam
+
+    result = default({
+        "unit_id": "src/api.py",
+        "child_recipe": "code-fix",
+        "kickoff_hint": {"reason": "lens 07 timeout"},
+    })
+
+    assert result["status"] == "spawned"
+    kickoff_path = captured["kickoff"]
+    assert kickoff_path.startswith(str(run_dir)), kickoff_path
+    assert "/" not in Path(kickoff_path).name
+    body = Path(kickoff_path).read_text(encoding="utf-8")
+    assert "src/api.py" in body
+    assert "lens 07 timeout" in body
+    assert "{{" not in body

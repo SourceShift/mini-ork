@@ -552,7 +552,7 @@ def _handle_implementer(ctx: NodeDispatch):
             return 1, "error"
         os.makedirs(os.path.dirname(fallback_sub_log) or ".", exist_ok=True)
         os.makedirs(os.path.dirname(sub_log), exist_ok=True)
-        rc = subprocess.run(["python3", script]).returncode
+        rc = subprocess.run([sys.executable, script]).returncode
         if rc == 0:
             if sub_log != fallback_sub_log and os.path.isfile(fallback_sub_log):
                 shutil.copy2(fallback_sub_log, sub_log)

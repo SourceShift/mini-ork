@@ -19,7 +19,7 @@ What this module does:
    forbids touching files outside ``recipes/goal-loop/`` + the one test
    file).
 
-2. Registers the ``(goal-loop, sweep_dispatcher)`` implementer submode with
+2. Registers the ``(goal-loop, sweep)`` implementer submode with
    the U4b driver script (``lib/drive.py``). When invoked by the dispatch
    layer (no args), ``drive.py`` falls through to ``sweep_run()``, which
    reads ``<run_dir>/sweep-plan.json``, fans out
@@ -61,7 +61,7 @@ _TRANSFORMS_SPEC.loader.exec_module(_TRANSFORMS_MODULE)
 
 register_implementer_submode(
     recipe="goal-loop",
-    node_id="sweep_dispatcher",
+    node_id="sweep",
     results_artifact="sweep-result.json",
     script=_DRIVER_SCRIPT,
 )
