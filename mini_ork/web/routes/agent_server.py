@@ -18,9 +18,12 @@ against so the whole client SDK treats us as a supported peer.
 This slice makes the Local backend probe flip green AND lets onboarding walk
 its settings write-path to completion. The probe is a read-only handshake, but
 onboarding then *writes*: it PATCHes settings, reads the agent/conversation
-form schemas, and lists agent profiles. Those are implemented here too. It does
-NOT yet wire conversations/events to real mini-ork runs — that is a later
-slice. Endpoints here are unauthenticated on purpose: the canvas runs in local
+form schemas, and lists agent profiles. Those are implemented here too.
+Conversations ARE wired to real mini-ork runs — create, event history,
+sendMessage — but the live WebSocket (`/ws`) is NOT implemented: the canvas
+degrades to REST (history via `/events/search`, sends via POST `/events`,
+its documented fallback when the socket is not OPEN). Endpoints here are
+unauthenticated on purpose: the canvas runs in local
 mode (`isAuthRequired()` false) where any session key is accepted, matching the
 real agent-server's local posture.
 
@@ -260,13 +263,12 @@ def _save_conversation(home: Path, record: dict[str, Any]) -> None:
         json.dump(record, fh, indent=2)
 
 
-def _initial_message_text(payload: dict[str, Any]) -> str:
-    """Flatten the SDK's SendMessageRequest ({role, content[]}) to plain text.
+def _flatten_message(message: Any) -> str:
+    """Flatten the SDK's message shape ({role, content[]}) to plain text.
 
     Only ``text`` content parts are kept (images/files have no kickoff
-    equivalent yet); a plain-string initial_message is tolerated too.
+    equivalent yet); a plain-string content is tolerated too.
     """
-    message = payload.get("initial_message")
     if isinstance(message, str):
         return message.strip()
     if not isinstance(message, dict):
@@ -283,6 +285,11 @@ def _initial_message_text(payload: dict[str, Any]) -> str:
             if isinstance(text, str) and text.strip():
                 parts.append(text.strip())
     return "\n\n".join(parts)
+
+
+def _initial_message_text(payload: dict[str, Any]) -> str:
+    """CreateConversation payload → kickoff text (flattens initial_message)."""
+    return _flatten_message(payload.get("initial_message"))
 
 
 def _conversation_info(record: dict[str, Any]) -> dict[str, Any]:
@@ -318,7 +325,7 @@ def create_conversation(
     With an ``initial_message`` the mini-ork run launches detached
     immediately (control.launch_run — the same spawn seam POST /api/v1/runs
     uses); without one the conversation is registered idle and the run starts
-    when the first chat message arrives (a later slice wires sendMessage).
+    when the first chat message arrives (POST .../events below).
     The response is a ConversationInfo; ``execution_status`` is "running"
     once launched, "idle" otherwise.
     """
@@ -346,6 +353,11 @@ def create_conversation(
         "execution_status": "idle",
         "recipe": recipe,
         "run_launched": False,
+        # Ledger of user-authored message texts (kickoff + every send). The
+        # events projection replays these as user MessageEvents — the source
+        # of truth for "what did the human actually say" without re-reading
+        # kickoff files or parsing run payloads.
+        "messages": [],
     }
 
     if initial_text:
@@ -363,6 +375,7 @@ def create_conversation(
         # (created by the run lifecycle, not the launcher), so we persist the
         # log path as the one launcher-visible handle on the run's filesystem.
         record["persistence_dir"] = str(result.get("log_path") or "")
+        record["messages"].append({"text": initial_text, "ts": now})
 
     _save_conversation(home, record)
     return _conversation_info(record)
@@ -378,7 +391,340 @@ def get_conversation(
     record = _load_conversation(home, conversation_id)
     if record is None:
         raise HTTPException(status_code=404, detail="conversation not found")
+    _refresh_execution_status(home, record)
     return _conversation_info(record)
+
+
+# ── Conversation events + sendMessage (Slice 3) ───────────────────────────────
+#
+# The canvas renders a conversation from two REST surfaces (both via the SDK):
+#
+#     GET  /api/conversations/{id}/events/search  → ConversationClient.searchEvents
+#     GET  /api/conversations/{id}/events/count   → ConversationClient.getEventCount
+#     GET  /api/conversations/{id}/events/{eid}   → ConversationClient.getEvent
+#     POST /api/conversations/{id}/events         → ConversationClient.sendEvent
+#
+# History pagination is TIMESTAMP-driven, not cursor-driven: the initial load
+# asks `sort_order=TIMESTAMP_DESC&limit=50`, load-older asks the same plus
+# `timestamp__lt=<oldest ts>`, and the WebSocket `since` replay uses
+# `timestamp__gte`. `page_id` (continue-after-id) is only used by the ascending
+# transcript-export path. All four knobs are honored here.
+#
+# Projection (mini-ork → oh_event): the canvas type-guards events structurally
+# (ui/src/types/agent-server/type-guards.ts) — a BaseEvent is {id, timestamp,
+# source ∈ user|agent|environment|hook}; a transcript MessageEvent adds
+# llm_message{role, content[]}. We project:
+#   - sidecar `messages` ledger        → user MessageEvents (what the human said)
+#   - run_events node_end rows         → assistant MessageEvents (node summary)
+#   - run_events other rows            → environment events (raw lifecycle)
+#   - terminal task_runs status        → final assistant MessageEvent
+# A conversation with no launched run still serves its user messages, so an
+# idle conversation shows its own (empty) transcript instead of erroring.
+
+# task_runs terminal set (mini_ork/cli/execute.py set_status). Everything
+# else (running/blocked/needs_revision/…) means the run is still live.
+_TERMINAL_RUN_STATUSES = {"published", "rolled_back", "failed"}
+_TERMINAL_STATUS_MAP = {"published": "finished", "rolled_back": "error", "failed": "error"}
+
+_MAX_EVENT_PAGE = 100  # EventService caps pages at 100; enforce server-side too
+
+
+def _state_db(home: Path):
+    """Read-only StateDB on <home>/state.db, or None when absent.
+
+    A canvas-only home (conversations created, no runs yet) has no state.db —
+    every caller must tolerate None (projects zero run events).
+    """
+    from ..db import StateDB
+
+    db_path = Path(home) / "state.db"
+    if not db_path.is_file():
+        return None
+    try:
+        return StateDB(db_path)
+    except FileNotFoundError:
+        return None
+
+
+def _epoch_to_iso(seconds: Any) -> str:
+    try:
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(int(seconds)))
+    except (TypeError, ValueError):
+        return "1970-01-01T00:00:00Z"
+
+
+def _message_event(
+    event_id: str, timestamp: str, role: str, text: str
+) -> dict[str, Any]:
+    """A transcript-renderable MessageEvent (see ui MessageEvent type).
+
+    ``source`` (who emitted it: user|agent) and ``llm_message.role`` (chat
+    role: user|assistant) are DISTINCT axes — the canvas type-guards on
+    both, and assistant messages must carry source="agent" with
+    role="assistant", never role="agent".
+    """
+    source = "user" if role == "user" else "agent"
+    return {
+        "id": event_id,
+        "timestamp": timestamp,
+        "source": source,
+        "llm_message": {"role": role, "content": [{"type": "text", "text": text}]},
+        "activated_microagents": [],
+        "extended_content": [],
+    }
+
+
+def _refresh_execution_status(home: Path, record: dict[str, Any]) -> None:
+    """Lift execution_status from the live task_runs row, in place.
+
+    The sidecar records launch-time state ("running"); the run's real
+    trajectory lives in task_runs. Terminal statuses map onto the canvas
+    ConversationExecutionStatus vocabulary; a live/unknown row keeps
+    "running"; no row yet (run still bootstrapping) keeps the sidecar value.
+    """
+    if not record.get("run_launched"):
+        return
+    db = _state_db(home)
+    if db is None:
+        return
+    try:
+        row = db.row("SELECT status FROM task_runs WHERE id = ?", (record["id"],))
+    except Exception:
+        return
+    if not row:
+        return
+    status = str(row.get("status") or "")
+    if status in _TERMINAL_STATUS_MAP:
+        record["execution_status"] = _TERMINAL_STATUS_MAP[status]
+    else:
+        record["execution_status"] = "running"
+
+
+def _conversation_events(home: Path, record: dict[str, Any]) -> list[dict[str, Any]]:
+    """All oh_events for a conversation, oldest first (deterministic order).
+
+    Sorts by (timestamp, id): timestamps are ISO-Zulu from one formatter, so
+    lexical comparison is chronological; the id tiebreak keeps equal-second
+    events stable across polls (the canvas dedupes by id).
+    """
+    cid = str(record["id"])
+    events: list[dict[str, Any]] = []
+
+    for idx, msg in enumerate(record.get("messages") or []):
+        text = str(msg.get("text") or "").strip()
+        if not text:
+            continue
+        ts = str(msg.get("ts") or record.get("created_at") or "")
+        events.append(_message_event(f"{cid}-user-{idx}", ts, "user", text))
+
+    db = _state_db(home)
+    if record.get("run_launched") and db is not None and db.has_table("run_events"):
+        rows = db.rows(
+            """
+            SELECT event_id AS id, event_type, payload_json, created_at
+            FROM run_events WHERE run_id = ? ORDER BY created_at ASC
+            """,
+            (cid,),
+        )
+        for row in rows:
+            try:
+                payload = json.loads(row.get("payload_json") or "{}")
+            except ValueError:
+                payload = {}
+            if not isinstance(payload, dict):
+                payload = {}
+            ts = _epoch_to_iso(row.get("created_at"))
+            node_id = str(payload.get("node_id") or "node")
+            node_type = str(payload.get("node_type") or row.get("event_type") or "")
+            if row.get("event_type") == "node_end":
+                text = f"{node_id} ({node_type}) completed"
+                reason = payload.get("finish_reason") or payload.get("status")
+                if reason:
+                    text += f": {reason}"
+                events.append(_message_event(str(row["id"]), ts, "assistant", text))
+            else:
+                events.append(
+                    {
+                        "id": str(row["id"]),
+                        "timestamp": ts,
+                        "source": "environment",
+                        "event_type": str(row.get("event_type") or ""),
+                        "node_id": node_id,
+                        "node_type": node_type,
+                    }
+                )
+
+        if db.has_table("task_runs"):
+            tr = db.row(
+                "SELECT status, verdict, ended_at FROM task_runs WHERE id = ?", (cid,)
+            )
+            if tr and str(tr.get("status") or "") in _TERMINAL_RUN_STATUSES:
+                status = str(tr["status"])
+                text = f"Run {status}"
+                if tr.get("verdict"):
+                    text += f" — verdict {tr['verdict']}"
+                events.append(
+                    _message_event(
+                        f"{cid}-final",
+                        _epoch_to_iso(tr.get("ended_at")),
+                        "assistant",
+                        text,
+                    )
+                )
+
+    events.sort(key=lambda e: (e["timestamp"], e["id"]))
+    return events
+
+
+def _load_conversation_or_404(home: Path, conversation_id: str) -> dict[str, Any]:
+    if not _safe_conversation_id(conversation_id):
+        raise HTTPException(status_code=400, detail="invalid conversation_id")
+    record = _load_conversation(home, conversation_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="conversation not found")
+    return record
+
+
+@router.get("/api/conversations/{conversation_id}/events/search")
+def search_conversation_events(
+    conversation_id: str,
+    home=Depends(get_home),
+    limit: int = 100,
+    sort_order: str = "TIMESTAMP_DESC",
+    page_id: str | None = None,
+    timestamp__gte: str | None = None,
+    timestamp__lt: str | None = None,
+) -> dict[str, Any]:
+    """Event history page (`ConversationClient.searchEvents`).
+
+    Returns ``{items, next_page_id}`` — items in the requested order (the
+    canvas reverses DESC pages itself), next_page_id set only when the page
+    was actually truncated so `hasMore` heuristics don't loop.
+    """
+    record = _load_conversation_or_404(home, conversation_id)
+    events = _conversation_events(home, record)
+
+    if timestamp__gte:
+        events = [e for e in events if e["timestamp"] >= timestamp__gte]
+    if timestamp__lt:
+        events = [e for e in events if e["timestamp"] < timestamp__lt]
+    if page_id:
+        # Ascending continue-after cursor (transcript-export path). If the
+        # cursor id is unknown (pruned/filtered), treat as page start.
+        for idx, e in enumerate(events):
+            if e["id"] == page_id:
+                events = events[idx + 1 :]
+                break
+
+    ascending = sort_order == "TIMESTAMP"
+    events.sort(key=lambda e: (e["timestamp"], e["id"]), reverse=not ascending)
+
+    page_limit = max(1, min(limit, _MAX_EVENT_PAGE))
+    truncated = len(events) > page_limit
+    page = events[:page_limit]
+    next_page_id = page[-1]["id"] if truncated and page else None
+    return {"items": page, "next_page_id": next_page_id}
+
+
+@router.get("/api/conversations/{conversation_id}/events/count")
+def count_conversation_events(
+    conversation_id: str, home=Depends(get_home)
+) -> int:
+    """Total event count (`ConversationClient.getEventCount`).
+
+    The WebSocket context and transcript export use this to detect events
+    they haven't seen; it counts ALL projected events, pre-filter.
+    """
+    record = _load_conversation_or_404(home, conversation_id)
+    return len(_conversation_events(home, record))
+
+
+@router.get("/api/conversations/{conversation_id}/events/{event_id}")
+def get_conversation_event(
+    conversation_id: str, event_id: str, home=Depends(get_home)
+) -> dict[str, Any]:
+    """Single event (`ConversationClient.getEvent`; 404 on unknown id).
+
+    The SDK's getEvents batch swallows 404s, so a pruned id degrades to null
+    instead of erroring the batch.
+    """
+    record = _load_conversation_or_404(home, conversation_id)
+    for event in _conversation_events(home, record):
+        if event["id"] == event_id:
+            return event
+    raise HTTPException(status_code=404, detail="event not found")
+
+
+@router.post("/api/conversations/{conversation_id}/events")
+def send_conversation_event(
+    payload: dict[str, Any], conversation_id: str, home=Depends(get_home)
+) -> dict[str, Any]:
+    """Send a message / start the agent loop (`ConversationClient.sendEvent`).
+
+    Body is a SendMessageRequest plus ``run: true``. Three regimes:
+      - run not launched → this message BECOMES the kickoff (launch_run,
+        same seam as conversation-create): the idle→running promise.
+      - run live         → operator steering injection (control.steer_run):
+        the message rides the next context_assemble pack of any in-flight
+        node; it does NOT spawn a second run.
+      - run terminal     → 409: a mini-ork conversation is a one-shot DAG;
+        follow-ups need a new conversation (documented divergence from the
+        real agent-server, which would loop the agent again).
+    Sent text is appended to the sidecar ledger either way, so it projects
+    as a user MessageEvent immediately.
+    """
+    from .. import control
+
+    record = _load_conversation_or_404(home, conversation_id)
+    # The send payload IS the message ({role, content[], run}) — unlike
+    # create, which nests it under `initial_message`.
+    text = _flatten_message(payload)
+    if not text:
+        raise HTTPException(status_code=400, detail="message text required")
+
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+    if not record.get("run_launched"):
+        if not record.get("title"):
+            record["title"] = text.splitlines()[0][:80]
+        kickoff = (
+            f"# {record['title']}\n\n{text}\n" if record.get("title") else f"{text}\n"
+        )
+        recipe = str(record.get("recipe") or DEFAULT_CONVERSATION_RECIPE)
+        result = control.launch_run(home, recipe, kickoff, run_id=conversation_id)
+        if not result.get("ok"):
+            raise HTTPException(
+                status_code=500,
+                detail=f"run launch failed: {result.get('error', 'unknown')}",
+            )
+        record["run_launched"] = True
+        record["execution_status"] = "running"
+        record["persistence_dir"] = str(result.get("log_path") or "")
+    else:
+        _refresh_execution_status(home, record)
+        if record["execution_status"] in ("finished", "error"):
+            raise HTTPException(
+                status_code=409,
+                detail="conversation run already finished — start a new conversation",
+            )
+        db = _state_db(home)
+        if db is None:
+            raise HTTPException(
+                status_code=500, detail="state db unavailable for steering"
+            )
+        result = control.steer_run(
+            db, conversation_id, text, source="agent-server-canvas"
+        )
+        if not result.get("ok"):
+            raise HTTPException(
+                status_code=500,
+                detail=f"steering failed: {result.get('error', 'unknown')}",
+            )
+
+    record.setdefault("messages", []).append({"text": text, "ts": now})
+    record["updated_at"] = now
+    _save_conversation(home, record)
+    return {"ok": True}
 
 
 @router.get("/alive")
