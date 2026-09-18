@@ -95,7 +95,7 @@ def test_workflow_yaml_parses_and_validates_recursion():
     assert set(wf["recursion"].keys()) == expected
 
 
-def test_workflow_compiles_with_four_edge_chain():
+def test_workflow_compiles_with_five_edge_chain():
     # register.py must load so the @register_transform decorators fire BEFORE
     # compile_workflow() looks up transform identifiers.
     assert load_recipe_register(RECIPE_DIR) is True
@@ -105,7 +105,8 @@ def test_workflow_compiles_with_four_edge_chain():
     expected_parents = {
         "goal_state": ("planner",),
         "sweep_dispatcher": ("goal_state",),
-        "goal_check": ("sweep_dispatcher",),
+        "sweep": ("sweep_dispatcher",),
+        "goal_check": ("sweep",),
         "publisher": ("goal_check",),
     }
     for node_id, parents in expected_parents.items():
@@ -113,7 +114,25 @@ def test_workflow_compiles_with_four_edge_chain():
         assert sorted(actual) == sorted(parents), (node_id, actual, parents)
 
     assert compiled.topological_order.index("planner") < compiled.topological_order.index("goal_state")
+    assert compiled.topological_order.index("sweep_dispatcher") < compiled.topological_order.index("sweep")
+    assert compiled.topological_order.index("sweep") < compiled.topological_order.index("goal_check")
     assert compiled.topological_order.index("goal_check") < compiled.topological_order.index("publisher")
+
+
+def test_workflow_declares_sweep_implementer_node_between_dispatcher_and_check():
+    wf_path = RECIPE_DIR / "workflow.yaml"
+    wf = yaml.safe_load(wf_path.read_text(encoding="utf-8"))
+
+    names = [n["name"] for n in wf["nodes"]]
+    assert names.index("sweep_dispatcher") < names.index("sweep") < names.index("goal_check")
+
+    sweep_node = next(n for n in wf["nodes"] if n["name"] == "sweep")
+    assert sweep_node["type"] == "implementer"
+
+    edges = {(e["from"], e["to"]) for e in wf["edges"]}
+    assert ("sweep_dispatcher", "sweep") in edges
+    assert ("sweep", "goal_check") in edges
+    assert ("sweep_dispatcher", "goal_check") not in edges
 
 
 # ── 2. load_recipe_register + goal_sweep submode registry ────────────────
@@ -128,8 +147,9 @@ def test_load_recipe_register_returns_true_and_registers_goal_sweep():
     # (recipe, node_id) pair and U4b replaces the stub script with the
     # real driver (lib/drive.py) so the registered script path now ends in
     # drive.py — this assertion is the direct probe of register.py state.
-    assert ("goal-loop", "sweep_dispatcher") in ex._IMPLEMENTER_SUBMODES
-    results_artifact, script_path = ex._IMPLEMENTER_SUBMODES[("goal-loop", "sweep_dispatcher")]
+    assert ("goal-loop", "sweep") in ex._IMPLEMENTER_SUBMODES
+    assert ("goal-loop", "sweep_dispatcher") not in ex._IMPLEMENTER_SUBMODES
+    results_artifact, script_path = ex._IMPLEMENTER_SUBMODES[("goal-loop", "sweep")]
     assert results_artifact == "sweep-result.json"
     assert Path(script_path).name == "drive.py"
     # register.py stores the script path relative to the recipes root

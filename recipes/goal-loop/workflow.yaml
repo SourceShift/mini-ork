@@ -28,6 +28,11 @@ nodes:
     outputs:
       - { name: sweep_plan, path: sweep-plan.json, kind: file, visibility: consumer }
 
+  - name: sweep
+    type: implementer
+    prompt_ref: null
+    dispatch_mode: serial
+
   - name: goal_check
     type: verifier
     prompt_ref: null
@@ -44,7 +49,8 @@ nodes:
 edges:
   - { from: planner,          to: goal_state,        edge_type: depends_on }
   - { from: goal_state,       to: sweep_dispatcher,  edge_type: depends_on }
-  - { from: sweep_dispatcher, to: goal_check,        edge_type: depends_on }
+  - { from: sweep_dispatcher, to: sweep,             edge_type: depends_on }
+  - { from: sweep,            to: goal_check,        edge_type: depends_on }
   - { from: goal_check,       to: publisher,         edge_type: depends_on }
 
 recursion:
