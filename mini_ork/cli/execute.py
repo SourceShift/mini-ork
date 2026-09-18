@@ -339,6 +339,33 @@ def _max_parallel() -> int:
         return 4
 
 
+def _bootstrap_recipe_register(root, recipe: str) -> None:
+    """Fire a recipe's optional ``register.py`` side effects in THIS process.
+
+    A recipe may ship ``recipes/<recipe>/register.py`` to self-register artifact
+    transforms and implementer submodes (e.g. goal-loop's ``goal_state_eval`` /
+    ``goal_sweep_plan``). Those registrations live in per-process module globals
+    (``mini_ork.workflow.transforms._TRANSFORMS``), so EVERY process that
+    compiles or executes the workflow must load them — not just the parent.
+    macOS ``ProcessPoolExecutor`` children are ``spawn``-ed with a fresh import
+    state, so a register loaded only in ``execute.main`` is invisible to the
+    child running a ``type:transform`` node, which then dies with "unknown
+    artifact transform". Hence this is called BOTH in ``main`` and in
+    ``_isolated_dispatch_worker``.
+
+    Guarded on a real recipe directory so pure custom-workflow runs stay a
+    no-op; ``load_recipe_register`` itself is a no-op when ``register.py`` is
+    absent and is idempotent per process. A load error propagates as
+    ``RecipeRegisterError``.
+    """
+    if recipe and os.path.isdir(os.path.join(root, "recipes", recipe)):
+        from pathlib import Path as _Path
+
+        from mini_ork.cli.recipe_register import load_recipe_register
+
+        load_recipe_register(_Path(os.path.join(root, "recipes", recipe)))
+
+
 def _isolated_dispatch_worker(payload):
     """Run one native node in a process-isolated environment.
 
@@ -348,6 +375,9 @@ def _isolated_dispatch_worker(payload):
     """
     (field, root, run_dir, plan_path, task_class, db, run_id,
      recipe, workflow) = payload
+    # Spawned pool child: re-run the recipe register bootstrap here or a
+    # type:transform node cannot resolve its recipe-local transform.
+    _bootstrap_recipe_register(root, recipe)
     stdout = io.StringIO()
     stderr = io.StringIO()
     try:
@@ -707,14 +737,11 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
     db = ctx.db_or_default()
     run_id = ctx.run_id
     recipe = ctx.recipe
-    # Recipe-local register.py bootstrap. Skipped when the workflow came from
-    # MINI_ORK_WORKFLOW (non-standard recipe location) or when no recipe name
-    # was resolved — both cases must not introduce a new failure mode. Any
-    # load error propagates as RecipeRegisterError (rc != 0).
-    if recipe and not os.environ.get("MINI_ORK_WORKFLOW"):
-        from pathlib import Path as _Path
-        from mini_ork.cli.recipe_register import load_recipe_register
-        load_recipe_register(_Path(os.path.join(root, "recipes", recipe)))
+    # Recipe-local register.py bootstrap in the PARENT (serial/in-process
+    # dispatch + compile_workflow above). The process-isolated path also
+    # bootstraps inside each pool child (_isolated_dispatch_worker) — a spawned
+    # child does not inherit this. See _bootstrap_recipe_register.
+    _bootstrap_recipe_register(root, recipe)
     live_run_dir = ctx.run_dir or run_dir
     llm = dispatch_fn or _default_llm_dispatch(root)
     # F3: without a trace_fn the live path writes zero execution_traces rows and the

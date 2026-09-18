@@ -1,0 +1,21 @@
+task_class: goal_loop
+expected_artifact: panel-verdict.json
+
+# The wave's proof artifact. goal_check.py (the verifier_ref) re-runs the units
+# lister + predicate over every unit and writes panel-verdict.json into
+# $MINI_ORK_RUN_DIR. A relative source_artifact/outputs entry is a run-local
+# publish target (exempt from the absolute-path hollow-run guard in
+# _required_artifacts_ok), and — critically — a non-empty artifact_contract.outputs
+# is what makes the verifier node take its verifier_ref branch instead of the
+# "no outputs in artifact_contract" early return, so goal_check actually runs.
+source_artifact: panel-verdict.json
+outputs:
+  - panel-verdict.json
+
+success_verifiers:
+  - verifiers/goal_check.py
+
+# A failing wave is a VALID wave — the outer driver (drive.py) re-runs waves
+# until the goal predicate passes or a stop condition fires. So a fail verdict
+# must NOT roll back or hard-error the run; it is recorded and the loop continues.
+failure_policy: request_changes
