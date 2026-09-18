@@ -119,7 +119,11 @@ def test_safe_whitelist_rejects_descriptors_and_filters_proposals(monkeypatch):
     monkeypatch.setattr(
         behavioral,
         "_propose_relations",
-        lambda module, function, fn: ["determinism", "; rm -rf /"],
+        lambda module, function, fn: {
+            "target": {"module": module, "function": function},
+            "seed_inputs": [2],
+            "relations": ["determinism", "; rm -rf /"],
+        },
     )
     monkeypatch.setenv("MO_BEHAV_FN_PROPOSE", "1")
 
@@ -127,6 +131,116 @@ def test_safe_whitelist_rejects_descriptors_and_filters_proposals(monkeypatch):
 
     assert verdict.status == PROVEN
     assert seen == ["determinism"]
+
+
+def test_proposed_seeds_anchor_the_check_when_the_recipe_declares_none(monkeypatch):
+    """The proposer's seed inputs are used, not discarded.
+
+    A relation with nothing to transform cannot be exercised, so a proposal that
+    named relations and carried no anchor would resolve to an abstention the run
+    could never get past. Adopting the seeds is what makes the opt-in propose
+    path reach a real measurement.
+    """
+    seen: list = []
+    real_check = mm.check
+
+    def recording_check(fn, seed_inputs, relations, **kwargs):
+        seen.extend(seed_inputs)
+        return real_check(fn, seed_inputs, relations, **kwargs)
+
+    monkeypatch.setattr(mm, "check", recording_check)
+    monkeypatch.setattr(
+        behavioral,
+        "_propose_relations",
+        lambda module, function, fn: {
+            "target": {"module": module, "function": function},
+            "seed_inputs": [7, 9],
+            "relations": ["determinism"],
+        },
+    )
+    monkeypatch.setenv("MO_BEHAV_FN_PROPOSE", "1")
+
+    verdict = run_function_check(
+        _observable("_deterministic", seeds=[], relations=[]))
+
+    assert verdict.status == PROVEN
+    assert seen == [7, 9]
+    # ...and the verdict says where the anchor came from, without letting that
+    # note move it (the check is True, and `_resolve` reads only False/None).
+    source = [c for c in verdict.checks if c.name == "seed_source"]
+    assert len(source) == 1 and source[0].ok is True
+
+
+def test_the_real_proposer_body_reaches_to_spec(monkeypatch):
+    """`to_spec` is genuinely called, not merely importable.
+
+    Everything above stubs ``_propose_relations`` away, which proves the caller
+    reads a spec but not that a spec is ever built. Here only the model dispatch
+    is stubbed, so ``inspect.getsource`` → ``build_proposer_prompt`` →
+    ``parse_proposal`` → ``to_spec`` all run for real and the spec they produce
+    is what anchors the check. Without this, ``to_spec`` could lose its last
+    caller again and the suite would not notice.
+    """
+    import mini_ork.dispatch as mo_dispatch
+
+    seen_prompt: list[str] = []
+
+    class _Result:
+        ok = True
+        text = ('```json\n{"relations": ["determinism", "not-a-real-relation"], '
+                '"seed_inputs": [4]}\n```')
+
+    def fake_dispatch(request):
+        seen_prompt.append(request.prompt)
+        return _Result()
+
+    monkeypatch.setattr(mo_dispatch, "dispatch_model", fake_dispatch)
+    monkeypatch.setenv("MO_BEHAV_FN_PROPOSE", "1")
+
+    seen_seeds: list = []
+    real_check = mm.check
+
+    def recording_check(fn, seed_inputs, relations, **kwargs):
+        seen_seeds.extend(seed_inputs)
+        return real_check(fn, seed_inputs, relations, **kwargs)
+
+    monkeypatch.setattr(mm, "check", recording_check)
+
+    verdict = run_function_check(
+        _observable("_deterministic", seeds=[], relations=[]))
+
+    assert seen_prompt and "_deterministic" in seen_prompt[0]
+    # The unresolvable name was dropped by the whitelist and the valid one ran.
+    assert seen_seeds == [4]
+    assert verdict.status == PROVEN
+
+
+def test_a_declared_seed_outranks_a_proposed_one(monkeypatch):
+    """A recipe's own anchor wins; the proposal is a fallback, never an override."""
+    seen: list = []
+    real_check = mm.check
+
+    def recording_check(fn, seed_inputs, relations, **kwargs):
+        seen.extend(seed_inputs)
+        return real_check(fn, seed_inputs, relations, **kwargs)
+
+    monkeypatch.setattr(mm, "check", recording_check)
+    monkeypatch.setattr(
+        behavioral,
+        "_propose_relations",
+        lambda module, function, fn: {
+            "target": {"module": module, "function": function},
+            "seed_inputs": [7, 9],
+            "relations": ["determinism"],
+        },
+    )
+    monkeypatch.setenv("MO_BEHAV_FN_PROPOSE", "1")
+
+    verdict = run_function_check(
+        _observable("_deterministic", seeds=[3], relations=[]))
+
+    assert seen == [3]
+    assert not [c for c in verdict.checks if c.name == "seed_source"]
 
 
 def test_function_verdict_json_and_environment_shape():
