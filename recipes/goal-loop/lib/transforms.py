@@ -10,7 +10,14 @@ MO_GOAL_MAX_CHILDREN_PER_WAVE failing units, and writes the wave's
 fix-children plan. U4a only PLANS — actual child spawning arrives with the
 U4b driver.
 
-Both transforms are decorated with ``@register_transform`` so workflow.yaml
+`goal_apply_deploy` CLOSES the loop: after the sweep node produces a fix in
+the target worktree, this node deploys it (a caller-supplied commit+push
+command), waits for the deploy to land, re-dispatches every swept unit, and
+BLOCKS until each unit reaches a terminal state — so the downstream
+goal_check verifier observes the true post-deploy result inside the same
+wave. It is a no-op passthrough unless armed with MO_GOAL_APPLY=1.
+
+All transforms are decorated with ``@register_transform`` so workflow.yaml
 can name them in the ``transform:`` field of type:transform nodes. They run
 inside the MiniOrk Python process (NOT inside a coding harness), keeping the
 subprocess I/O reproducible and inspectable from the receipt layer.
@@ -20,8 +27,12 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import shlex
+import subprocess
 import sys
+import time
 from pathlib import Path
+from typing import Any, Callable
 
 from mini_ork.workflow.artifacts import ArtifactContractError, ArtifactLedger
 from mini_ork.workflow.compiler import CompiledWorkflow
@@ -126,4 +137,214 @@ def goal_sweep_plan(workflow: CompiledWorkflow, ledger: ArtifactLedger, node_id:
         for unit_id in selected
     ]
     out_path.write_text(json.dumps(plan, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return out_path
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# goal_apply_deploy — the loop-closing node (deploy fix -> re-dispatch -> await)
+# ─────────────────────────────────────────────────────────────────────────
+
+# Sweep outcomes whose fix child actually ran against the target worktree, so a
+# candidate patch may be present to deploy. ``deferred`` (spawn-cap) and
+# ``dry_run`` never touched the tree. A ``failed`` child still commonly leaves a
+# real patch behind (a later node — reviewer/eval — reddened the child while its
+# earlier edit survived), so it is included; whether there is anything to ship is
+# decided by MO_GOAL_APPLY_CMD (a clean tree makes the deploy a harmless no-op).
+_APPLIED_SWEEP_STATUSES = frozenset({"spawned", "failed", "fanned_out"})
+
+
+def _int_env(name: str, default: int) -> int:
+    """Read an int env var; a blank/absent/garbage value falls back to default."""
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return int(raw.strip())
+    except ValueError:
+        return default
+
+
+def _run(cmd: list[str] | str, *, cwd: str | None, shell: bool) -> dict[str, Any]:
+    """Run a command, capturing a truncated stdout/stderr receipt. Never raises."""
+    try:
+        proc = subprocess.run(
+            cmd, cwd=cwd, shell=shell, capture_output=True, text=True,
+        )
+        return {
+            "cmd": cmd,
+            "rc": proc.returncode,
+            "stdout": (proc.stdout or "")[-4000:],
+            "stderr": (proc.stderr or "")[-2000:],
+        }
+    except OSError as exc:
+        return {"cmd": cmd, "rc": 127, "stdout": "", "stderr": f"exec failed: {exc}"}
+
+
+def _poll_until_zero(
+    run_fn: Callable[[], int], *, timeout_s: int, poll_s: int,
+) -> dict[str, Any]:
+    """Call ``run_fn`` until it returns 0 or ``timeout_s`` elapses.
+
+    ``poll_s == 0`` (test seam) collapses to at most two probes: the wait
+    accounting jumps past the timeout so the loop cannot spin CPU-hot forever
+    on a predicate that never settles.
+    """
+    step = poll_s if poll_s > 0 else (timeout_s + 1)
+    waited = 0
+    last: int | None = None
+    while True:
+        last = run_fn()
+        if last == 0:
+            return {"ok": True, "waited_s": waited, "last_rc": last}
+        if waited >= timeout_s:
+            return {"ok": False, "waited_s": waited, "last_rc": last}
+        if poll_s > 0:
+            time.sleep(poll_s)
+        waited += step
+
+
+def _units_to_apply(run_dir: str) -> list[str]:
+    """Read ``sweep-result.json`` and return the swept unit ids worth deploying."""
+    sweep_path = Path(run_dir) / "sweep-result.json"
+    if not sweep_path.is_file():
+        return []
+    try:
+        data = json.loads(sweep_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return []
+    units = data.get("units", []) if isinstance(data, dict) else []
+    out: list[str] = []
+    for entry in units:
+        if not isinstance(entry, dict):
+            continue
+        if str(entry.get("status", "")) in _APPLIED_SWEEP_STATUSES:
+            uid = entry.get("unit_id")
+            if uid is not None:
+                out.append(str(uid))
+    return out
+
+
+def _await_deploy() -> dict[str, Any]:
+    """Block until the pushed fix is live on the target system.
+
+    Two modes: poll ``MO_GOAL_AWAIT_DEPLOY_CMD`` until exit 0 (the caller's
+    proof the new code is running), or — when that command is unset — sleep a
+    fixed settle window that covers the target's auto-deploy latency.
+    """
+    cmd = os.environ.get("MO_GOAL_AWAIT_DEPLOY_CMD")
+    if not cmd:
+        settle = _int_env("MO_GOAL_DEPLOY_SETTLE_SECONDS", 600)
+        if settle > 0:
+            time.sleep(settle)
+        return {"mode": "settle", "seconds": settle}
+    timeout_s = _int_env("MO_GOAL_DEPLOY_TIMEOUT_SECONDS", 900)
+    poll_s = _int_env("MO_GOAL_APPLY_POLL_SECONDS", 60)
+    result = _poll_until_zero(
+        lambda: _run(cmd, cwd=None, shell=True)["rc"],
+        timeout_s=timeout_s, poll_s=poll_s,
+    )
+    return {"mode": "poll", "deployed": result["ok"], **result}
+
+
+def _await_terminal(unit_id: str, cwd: str) -> dict[str, Any]:
+    """Block until ``unit_id`` reaches a terminal state after re-dispatch.
+
+    Polls ``MO_GOAL_TERMINAL_CMD`` (argv prefix + unit_id) when set, else falls
+    back to ``MO_GOAL_PREDICATE_CMD`` (terminal == the goal predicate passes).
+    The unit id is always the final argv slot — never shell-interpolated.
+    """
+    terminal_cmd = os.environ.get("MO_GOAL_TERMINAL_CMD") or os.environ.get(
+        "MO_GOAL_PREDICATE_CMD",
+    )
+    if not terminal_cmd:
+        return {"settled": False, "reason": "no MO_GOAL_TERMINAL_CMD/PREDICATE_CMD"}
+    argv = shlex.split(terminal_cmd) + [unit_id]
+    timeout_s = _int_env("MO_GOAL_APPLY_AWAIT_SECONDS", 5400)
+    poll_s = _int_env("MO_GOAL_APPLY_POLL_SECONDS", 60)
+    result = _poll_until_zero(
+        lambda: _run(argv, cwd=cwd, shell=False)["rc"],
+        timeout_s=timeout_s, poll_s=poll_s,
+    )
+    return {"settled": result["ok"], "unit_id": unit_id, **result}
+
+
+def _run_apply(run_dir: str) -> dict[str, Any]:
+    """Core of ``goal_apply_deploy`` — env-driven, ledger-free, unit-testable.
+
+    Returns the ``apply-result.json`` payload. The transform wrapper only
+    resolves the output path and writes the returned dict.
+    """
+    if os.environ.get("MO_GOAL_APPLY", "").strip() != "1":
+        return {"status": "disabled", "units": []}
+
+    target_cwd = os.environ.get("MO_GOAL_TARGET_CWD")
+    apply_cmd = os.environ.get("MO_GOAL_APPLY_CMD")
+    redispatch_cmd = os.environ.get("MO_GOAL_REDISPATCH_CMD")
+    missing = [
+        name
+        for name, val in (
+            ("MO_GOAL_TARGET_CWD", target_cwd),
+            ("MO_GOAL_APPLY_CMD", apply_cmd),
+            ("MO_GOAL_REDISPATCH_CMD", redispatch_cmd),
+        )
+        if not val
+    ]
+    if missing:
+        raise ArtifactContractError(
+            "goal_apply_deploy (MO_GOAL_APPLY=1) requires " + ", ".join(missing),
+        )
+    assert target_cwd and apply_cmd and redispatch_cmd  # narrowed for type-checkers
+
+    units = _units_to_apply(run_dir)
+
+    if os.environ.get("MO_GOAL_APPLY_DRY", "").strip() == "1":
+        return {
+            "status": "dry_run",
+            "target_cwd": target_cwd,
+            "deploy_cmd": apply_cmd,
+            "redispatch_cmd": redispatch_cmd,
+            "units": [
+                {"unit_id": u, "would": ["deploy", "await_deploy", "redispatch", "await_regen"]}
+                for u in units
+            ],
+        }
+
+    # ── live: DEPLOY -> await-deploy -> REDISPATCH -> await-regen ──
+    # Ordering is load-bearing: re-dispatching before the new code is live would
+    # let the stale worker pick the unit up and re-fail with the same bug.
+    deploy = _run(apply_cmd, cwd=target_cwd, shell=True)
+    await_deploy = _await_deploy()
+    unit_results: list[dict[str, Any]] = []
+    for unit_id in units:
+        redispatch = _run(
+            shlex.split(redispatch_cmd) + [unit_id], cwd=target_cwd, shell=False,
+        )
+        settled = _await_terminal(unit_id, target_cwd)
+        unit_results.append(
+            {"unit_id": unit_id, "redispatch": redispatch, "await_regen": settled},
+        )
+    return {
+        "status": "applied",
+        "deploy": deploy,
+        "await_deploy": await_deploy,
+        "units": unit_results,
+    }
+
+
+@register_transform("goal_apply_deploy")
+def goal_apply_deploy(workflow: CompiledWorkflow, ledger: ArtifactLedger, node_id: str) -> Path:
+    """Deploy the sweep's fix, re-dispatch swept units, and await their terminal state.
+
+    No-op passthrough (status ``disabled``) unless MO_GOAL_APPLY=1. See
+    ``_run_apply`` for the full env contract; the wrapper only resolves the
+    run-local ``apply-result.json`` output and persists the payload.
+    """
+    node = workflow.nodes[node_id]
+    if "apply_result" not in node.outputs:
+        raise ArtifactContractError("goal_apply_deploy requires an apply_result output")
+    out_path = ledger.output_path(workflow, node_id, "apply_result")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    run_dir = os.environ.get("MINI_ORK_RUN_DIR", str(out_path.parent))
+    payload = _run_apply(run_dir)
+    out_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return out_path
