@@ -374,6 +374,52 @@ def _equirouter_enabled() -> bool:
     return os.environ.get("MO_EQUIROUTER", "1").strip().lower() not in ("0", "false", "no", "")
 
 
+def _entrorouter_enabled() -> bool:
+    """EntroRouter entropy regulation is ON by default; ``MO_ENTROROUTER=0``
+    restores the constant-C selector. It engages only when a per-lane offline
+    capability estimate exists, so a database with no
+    ``agent_performance_memory`` rows routes exactly as it does today."""
+    return os.environ.get("MO_ENTROROUTER", "1").strip().lower() not in ("0", "false", "no", "")
+
+
+def _recovery_floor(capability: float, n: int, anchor: float, tau: float) -> float:
+    """Soft-anchored recovery floor for a lane whose observed estimate sank.
+
+    EntroRouter (2606.29424) names the failure it prevents *Trust Region
+    Collapse*: a capable lane gets one unlucky sample early, its estimate sinks,
+    and it is never selected again — so it never gets the chance to recover, and
+    the router settles on a lane that is merely acceptable. UCB does not save it,
+    because the competitor's score stays above the sunk lane's even after the
+    bonus shrinks on both sides.
+
+    Two stages, matching the paper:
+
+      * **Soft supervision** — the floor starts high and decays as the lane
+        accumulates observations (``tau / (tau + n)``). The prior keeps
+        exploration honest while evidence is thin; once the lane has been
+        sampled enough times its own record decides, not the prior.
+      * **Soft anchor** — the floor is scaled by the lane's *offline* capability
+        estimate, so it rescues lanes known to be strong and leaves weak lanes
+        where they are. A lane with no positive offline estimate gets no floor
+        at all, which is what keeps this a no-op on a cold database.
+
+    Returned as a floor rather than an additive bonus: adding it would inflate
+    the incumbent that is already winning, which is not a lane that needs
+    rescuing. ``max`` only ever lifts a sunk lane up to a fighting chance.
+
+    *When it engages*: the floor decays as ``1/n`` while the UCB bonus decays as
+    ``1/sqrt(n)``, so the floor is relatively strongest at small ``n`` and the
+    bonus overtakes it as the slice fills. In a warm slice the bonus already
+    gives every lane a fighting chance, so the floor changes nothing; it decides
+    in the cold slice the paper is about — both lanes' ``z`` negative, few runs
+    each — which is exactly where the collapse happens.
+    """
+    if capability <= 0.0:
+        return 0.0
+    entropy = tau / (tau + n) if tau > 0 else 1.0
+    return anchor * capability * entropy
+
+
 def _slice_rankings(store, task_class: str, node_type: str,
                     objective_domain: str, code_region: str,
                     min_samples: int) -> dict:
@@ -489,6 +535,29 @@ def preferred_lane(task_class: str, node_type: str = "", objective_domain: str =
     ``rank_lanes``, restricted to lanes that already cleared the floor here.
     With a single slice it is a no-op, because that slice's own ordering is
     already what ``_select_best_lane`` consumed."""
+    return _pick_lane(task_class, node_type, objective_domain, code_region,
+                      db)["pick"]
+
+
+def preferred_lane_detail(task_class: str, node_type: str = "",
+                          objective_domain: str = "", code_region: str = "",
+                          db: str | None = None) -> dict:
+    """``preferred_lane``'s pick plus how confidently it was made.
+
+    ``{"pick", "lane", "adv", "runs", "margin", "source"}``, where ``source``
+    names the slice that produced the pick (``region`` / ``domain`` / ``global``
+    / ``""``). ``margin`` is None when the comparison does not exist — see
+    ``_select_best_lane_scored``. Callers that only need the lane string keep
+    using ``preferred_lane``; this exists so the uncertainty signal survives
+    the decision instead of being recomputed by whoever wants it.
+    """
+    return _pick_lane(task_class, node_type, objective_domain, code_region, db)
+
+
+def _pick_lane(task_class: str, node_type: str, objective_domain: str,
+               code_region: str, db: str | None) -> dict:
+    """One slice-walk shared by ``preferred_lane`` and ``preferred_lane_detail``
+    so the string contract and the provenance view can never disagree."""
     min_samples = int(os.environ.get("MO_LEARNING_MIN_SAMPLES", "3"))
     ucb_c = float(os.environ.get("MO_ROUTER_UCB_C", "0.5"))
     contextual = int(os.environ.get("MO_ROUTER_CONTEXTUAL", "0"))
@@ -496,30 +565,52 @@ def preferred_lane(task_class: str, node_type: str = "", objective_domain: str =
 
     store = AdvantageStore(db).open()  # Row factory: _select_best_lane reads by column name
     try:
-        if objective_domain and code_region:
-            candidates = store.fetch_region_candidates(
+        # EntroRouter's offline capability table. Fetched once per pick — the
+        # ranking function itself stays DB-free. An absent table yields {} and
+        # EntroRouter degrades to the constant-C selector.
+        caps: dict = {}
+        if _entrorouter_enabled():
+            caps = store.fetch_lane_capabilities(task_class)
+        for source, candidates in (
+            ("region", store.fetch_region_candidates(
                 task_class, objective_domain, code_region, node_type, min_samples)
-            row = _select_best_lane(candidates,
-                                    bandit_on, ucb_c, contextual,
-                                    task_class, node_type, objective_domain, code_region)
-            if row:
-                return _equirouter_pick(store, candidates, row, task_class,
-                                        node_type, objective_domain, code_region,
-                                        min_samples)
-        if objective_domain:
-            candidates = store.fetch_domain_candidates(
+                if (objective_domain and code_region) else []),
+            ("domain", store.fetch_domain_candidates(
                 task_class, objective_domain, node_type, min_samples)
-            row = _select_best_lane(candidates,
-                                    bandit_on, ucb_c, contextual,
-                                    task_class, node_type, objective_domain, code_region)
-            if row:
-                return _equirouter_pick(store, candidates, row, task_class,
-                                        node_type, objective_domain, code_region,
-                                        min_samples)
+                if objective_domain else []),
+        ):
+            pick, margin = _select_best_lane_scored(
+                candidates, bandit_on, ucb_c, contextual,
+                task_class, node_type, objective_domain, code_region, caps)
+            if not pick:
+                continue
+            overridden = _equirouter_pick(store, candidates, pick, task_class,
+                                          node_type, objective_domain, code_region,
+                                          min_samples)
+            if overridden != pick:
+                # The Borda pick is an aggregate of other slices' orderings, not
+                # a margin comparison against this slice's runner-up, so the
+                # margin no longer describes the lane that was chosen.
+                return _detail(overridden, None, source)
+            return _detail(pick, margin, source)
         row = store.fetch_global_best(task_class, node_type, min_samples)
-        return f"{row[0]}|{row[1]}|{row[2]}" if row else ""
+        # The global table carries no z-score, so bandit ordering degrades to
+        # relative_advantage DESC and there is no runner-up to measure against.
+        return _detail(f"{row[0]}|{row[1]}|{row[2]}" if row else "", None, "global")
     finally:
         store.close()
+
+
+def _detail(pick: str, margin: float | None, source: str) -> dict:
+    parts = (pick or "").split("|")
+    return {
+        "pick": pick or "",
+        "lane": parts[0] if parts and parts[0] else "",
+        "adv": parts[1] if len(parts) > 1 else "",
+        "runs": parts[2] if len(parts) > 2 else "",
+        "margin": margin,
+        "source": source if pick else "",
+    }
 
 
 def _equirouter_pick(store, candidates: list, legacy: str, task_class: str,
@@ -559,35 +650,45 @@ def _equirouter_pick(store, candidates: list, legacy: str, task_class: str,
     return legacy
 
 
-def _select_best_lane(candidates: list,
-                      bandit_on: bool, ucb_c: float, contextual: int,
-                      task_class: str, node_type: str,
-                      objective_domain: str, code_region: str) -> str:
-    """D1/D7 lane picker. Returns the bash-format 'lane|adv|runs' string.
+def _select_best_lane_scored(candidates: list,
+                             bandit_on: bool, ucb_c: float, contextual: int,
+                             task_class: str, node_type: str,
+                             objective_domain: str, code_region: str,
+                             capabilities: dict | None = None):
+    """The lane picker, returning ``(pick, margin)``.
 
-    Bandit path:
-      1. SELECT all lanes clearing the sample floor, ordered by raw
-         relative_advantage DESC so we don't lose the cost tie-break signal.
-      2. If bandit_on and the table has z-scored rows, recompute the UCB
-         score ``z_score_advantage + C * sqrt(2 ln N_total / n_lane)`` and
-         return the lane with the highest UCB. The ``adv`` field shown
-         stays the legacy ``relative_advantage`` so bash/python parity is
-         maintained for callers that diff the string.
-      3. If contextual=1 and the top two UCB scores tie within 1e-6, run
-         NeuralUCB (HashEmbedder featurize → per-lane ridge) on the tied
-         candidates. The embedder import + call live strictly inside this
-         branch.
+    ``margin`` is the winning UCB score minus the runner-up's — how confidently
+    the router preferred this lane over its nearest alternative. It is computed
+    and discarded today, which is why no escalation rule can be calibrated: the
+    router's own uncertainty signal dies at the return statement. UCCI consumes
+    it as the raw input to an isotonic error map, so a thin margin reads as a
+    high predicted error rate.
 
-    ``candidates`` comes pre-fetched from AdvantageStore (ordered by raw
-    relative_advantage DESC, runs_count DESC so we don't lose the cost
-    tie-break signal); this function is ranking math only — no SQL.
+    ``None`` (not ``0.0``) when the margin is *unknown* rather than zero: bandit
+    off, fewer than two candidates, or a later override (EquiRouter / NeuralUCB)
+    that moved the pick to something this comparison does not describe. Keeping
+    unknown distinct from certain is load-bearing — a calibration fitted on
+    zeros would read every unknown as maximal disagreement.
+
+    ``capabilities`` maps lane -> offline relative advantage and is optional so
+    the pure ranking math stays DB-free; the caller fetches it. EntroRouter is a
+    no-op when it is absent or empty.
     """
     if not candidates:
-        return ""
+        return "", None
     if not bandit_on:
         # Legacy face: take the first row (already sorted by relative_advantage DESC).
         first = candidates[0]
-        return f"{first[0]}|{first[1]}|{first[2]}"
+        return f"{first[0]}|{first[1]}|{first[2]}", None
+    entro = None
+    if capabilities and _entrorouter_enabled():
+        try:
+            anchor = float(os.environ.get("MO_ROUTER_ANCHOR", "0.5"))
+            tau = float(os.environ.get("MO_ROUTER_ENTROPY_TAU", "3"))
+        except (TypeError, ValueError):
+            anchor, tau = 0.5, 3.0
+        if anchor > 0.0:
+            entro = (capabilities, anchor, tau)
     total_runs = sum(int(r["runs_count"]) for r in candidates) or 1
     scored = []
     for r in candidates:
@@ -595,7 +696,13 @@ def _select_best_lane(candidates: list,
         n = max(int(r["runs_count"]), 1)
         # UCB1 with slice-wide N_total — favours lanes with high z and low n.
         bonus = ucb_c * math.sqrt(2.0 * math.log(total_runs + 1) / n)
-        scored.append((z + bonus, r))
+        score = z + bonus
+        if entro:
+            caps, anchor, tau = entro
+            floor = _recovery_floor(float(caps.get(r[0], 0.0) or 0.0), n, anchor, tau)
+            if floor > score:
+                score = floor
+        scored.append((score, r))
     scored.sort(key=lambda t: t[0], reverse=True)
     if contextual and len(scored) >= 2:
         # Tie-break via NeuralUCB on top-2 candidates (D7).
@@ -622,7 +729,38 @@ def _select_best_lane(candidates: list,
                 # selector for tie-break noise.
                 pass
     best = scored[0][1]
-    return f"{best[0]}|{best[1]}|{best[2]}"
+    margin = scored[0][0] - scored[1][0] if len(scored) >= 2 else None
+    return f"{best[0]}|{best[1]}|{best[2]}", margin
+
+
+def _select_best_lane(candidates: list,
+                      bandit_on: bool, ucb_c: float, contextual: int,
+                      task_class: str, node_type: str,
+                      objective_domain: str, code_region: str) -> str:
+    """D1/D7 lane picker. Returns the bash-format 'lane|adv|runs' string.
+
+    Bandit path:
+      1. SELECT all lanes clearing the sample floor, ordered by raw
+         relative_advantage DESC so we don't lose the cost tie-break signal.
+      2. If bandit_on and the table has z-scored rows, recompute the UCB
+         score ``z_score_advantage + C * sqrt(2 ln N_total / n_lane)`` and
+         return the lane with the highest UCB. The ``adv`` field shown
+         stays the legacy ``relative_advantage`` so bash/python parity is
+         maintained for callers that diff the string.
+      3. If contextual=1 and the top two UCB scores tie within 1e-6, run
+         NeuralUCB (HashEmbedder featurize → per-lane ridge) on the tied
+         candidates. The embedder import + call live strictly inside this
+         branch.
+
+    ``candidates`` comes pre-fetched from AdvantageStore (ordered by raw
+    relative_advantage DESC, runs_count DESC so we don't lose the cost
+    tie-break signal); this function is ranking math only — no SQL. The
+    margin half of ``_select_best_lane_scored`` is dropped here so callers
+    that only want the lane keep their existing signature.
+    """
+    return _select_best_lane_scored(
+        candidates, bandit_on, ucb_c, contextual,
+        task_class, node_type, objective_domain, code_region)[0]
 
 
 

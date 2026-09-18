@@ -98,6 +98,7 @@ def _trace_db(tmp_path, rows, monkeypatch):
         "CREATE TABLE execution_traces ("
         " trace_id TEXT PRIMARY KEY, run_id TEXT, task_class TEXT, status TEXT,"
         " route_source TEXT, route_explore INTEGER, route_score REAL,"
+        " route_margin REAL,"
         " created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%S.000Z','now')))")
     for i, (status, route_source) in enumerate(rows):
         con.execute(

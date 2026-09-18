@@ -27,6 +27,7 @@ import sqlite3
 
 from mini_ork import lane_router
 from mini_ork.context import context_env
+from mini_ork.dispatch import calibration
 
 LANE_TO_FAMILY = {
     "sonnet": "anthropic", "opus": "anthropic",
@@ -276,6 +277,31 @@ def recursion_hint() -> dict:
     }
 
 
+def frontier_lane() -> str:
+    """The lane UCCI (and the trace-governed policy) escalates to when the
+    cheap pick is predicted wrong. ``MO_FRONTIER_LANE``, default ``opus_lens``."""
+    return os.environ.get("MO_FRONTIER_LANE", "opus_lens")
+
+
+def _escalation_target(node_type: str, candidate: str) -> str:
+    """``candidate`` if it is a lane agents.yaml actually configures, else ''.
+
+    Escalating to a lane nobody defines is worse than not escalating: the
+    dispatch would fail instead of merely running cheap. Unconfigured
+    ``MO_FRONTIER_LANE`` therefore means "no escalation", never a broken route.
+
+    A routable name is either side of the ``lanes:`` mapping — a *key* is a role
+    or lens name (``opus_lens``) and a *value* is a model (``opus``), and the
+    dispatcher resolves both. ``decide`` returns a value on the default path and
+    a key on the policy path, so checking only one side rejects half of the
+    lanes the runtime actually offers.
+    """
+    if not candidate:
+        return ""
+    lanes = _load_lanes(resolve_agents_yaml())
+    return candidate if candidate in set(lanes) | set(lanes.values()) else ""
+
+
 def _learned_score(learned: str) -> float | None:
     """Advantage component of ``preferred_lane``'s ``lane|adv|runs`` string.
 
@@ -297,9 +323,15 @@ def decide(node_type: str, task_class: str, objective_domain: str = "",
     code_region = segment if (segment and segment != "default") else ""
     dbp = _db_path(db)
 
-    learned = lane_router.preferred_lane(
+    # ``preferred_lane_detail`` carries the winner's *margin* over the runner-up
+    # alongside the pick. The margin is what a calibration map needs to turn a
+    # routing decision into a probability of being wrong, so it has to survive
+    # the return trip; ``pick`` is the same "lane|adv|runs" string
+    # ``preferred_lane`` would have returned, so nothing downstream shifts.
+    detail = lane_router.preferred_lane_detail(
         task_class, node_type, objective_domain, code_region, db=dbp)
-    learned_route = learned.split("|")[0] if learned else ""
+    learned = detail["pick"]
+    learned_route = detail["lane"]
     route = learned_route or default_lane(node_type)
 
     # Provenance of the route itself, persisted to execution_traces.route_*.
@@ -310,6 +342,21 @@ def decide(node_type: str, task_class: str, objective_domain: str = "",
     route_source = "learned" if learned_route else "default"
     route_score = _learned_score(learned)
     explore = False
+
+    # UCCI: turn the margin into an error probability and escalate past the
+    # point where the cheap pick is predicted wrong. This runs BEFORE
+    # exploration on purpose — if the pick is already predicted bad, spending
+    # the epsilon-greedy draw on it buys nothing, and escalating a lane that
+    # never entered the comparison the margin describes would misattribute it.
+    predicted_error = None
+    if learned_route and detail["margin"] is not None:
+        escalate, predicted_error = calibration.should_escalate(
+            dbp, task_class, detail["margin"], lane=learned_route)
+        target = _escalation_target(node_type, frontier_lane()) if escalate else ""
+        if target and target != route:
+            route = target
+            route_source = "calibrated_escalation"
+            learned_route = ""  # suppress exploration below
 
     if learned_route:
         epsilon_s = os.environ.get("EPSILON",
@@ -334,6 +381,16 @@ def decide(node_type: str, task_class: str, objective_domain: str = "",
         "route_source": route_source,
         "route_explore": explore,
         "route_score": route_score,
+        # The margin describes the *comparison the pick won*. An exploration swap
+        # replaces the pick with a lane that never entered that comparison, so its
+        # margin would be a number about a different decision — report None rather
+        # than misattribute it. A calibration map fits margin -> error and a
+        # mispaired margin poisons the fit.
+        "route_margin": detail["margin"] if not explore else None,
+        # The calibrated error probability behind an escalation. Recorded even
+        # when it did not escalate, so the threshold can be re-derived from what
+        # it actually predicted rather than re-guessed.
+        "predicted_error": predicted_error,
         "coalition_ok": ok,
         "reward_estimate": mean,
         "recursion_hint": recursion_hint(),

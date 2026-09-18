@@ -137,6 +137,34 @@ class AdvantageStore:
             pass
         return prior
 
+    def fetch_lane_capabilities(self, task_class: str) -> dict:
+        """Per-lane offline capability estimate for ``task_class``.
+
+        The EntroRouter anchor reads this: a lane whose *observed* advantage has
+        sunk below its *offline* capability is the Trust-Region-Collapse case —
+        one bad early sample that the lane never recovers from because the
+        selector stops picking it. ``agent_performance_memory`` is the global
+        (non-sliced) face, so it survives the slice filters that emptied the
+        per-region tables.
+
+        Empty dict on a missing table: a router with no capability estimates must
+        degrade to the plain bandit, never raise.
+        """
+        try:
+            rows = self.con.execute(
+                "SELECT agent_version_id, relative_advantage "
+                "FROM agent_performance_memory WHERE task_class=?",
+                (task_class,)).fetchall()
+        except sqlite3.OperationalError:
+            return {}
+        caps: dict = {}
+        for lane, adv in rows:
+            try:
+                caps[lane] = float(adv)
+            except (TypeError, ValueError):
+                continue
+        return caps
+
     def fetch_prior_domain(self) -> dict:
         prior: dict = {}
         try:

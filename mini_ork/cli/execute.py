@@ -1852,11 +1852,13 @@ def _make_trace_fn(task_class, db, run_id):
     writes a row with a reward stamp (reward_from_status) + code_region so
     lane_router_recompute_advantages has real signal to learn from.
     Signature matches dispatch_node's `trace(node_id, status, node_type, output_file,
-    verdict, finish_reason, lane, route_source, route_explore, route_score)`."""
+    verdict, finish_reason, lane, route_source, route_explore, route_score,
+    route_margin)`."""
     from mini_ork import trace_store  # noqa: PLC0415
 
     def _tf(node_id, status, node_type, output_file="", verdict="", finish_reason="",
-            lane="", route_source="", route_explore=False, route_score=None):
+            lane="", route_source="", route_explore=False, route_score=None,
+            route_margin=None):
         extra = {
             "trace_id": f"tr-{node_type}-{node_id}-{uuid.uuid4().hex[:8]}",
             "run_id": run_id,
@@ -1882,6 +1884,11 @@ def _make_trace_fn(task_class, db, run_id):
             extra["route_explore"] = bool(route_explore)
             if route_score is not None:
                 extra["route_score"] = float(route_score)
+            # The margin over the runner-up, signed by the router. UCCI fits a
+            # monotone map from this margin to the observed error rate, so a
+            # missing margin just means "uncalibratable row", not a broken write.
+            if route_margin is not None:
+                extra["route_margin"] = float(route_margin)
         # Implementer code_region must reflect the TARGET repo's edited source,
         # not the .mini-ork run-log path. Seed files_written from git-visible
         # target-repo changes FIRST so infer_trace_code_region resolves the
