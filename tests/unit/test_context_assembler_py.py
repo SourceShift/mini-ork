@@ -383,3 +383,257 @@ def test_active_state_delegates_to_native_owner(db, monkeypatch):
     )
     assert ca.active_state_md("code-fix", 14, db=db) == "ACTIVE"
     assert calls == [("code-fix", 14, db)]
+
+
+# ── semantic read-back: utility-ranked emergent patterns ────────────────────
+
+
+def _mirrored(db, needle):
+    """The id of the memory mirrored from a seeded pattern, found by text.
+
+    Mirrors are created on read, so this emits once to materialise them before
+    looking any up — otherwise a caller seeding a track record has no id to
+    seed it against.
+    """
+    ca.semantic_lessons_md("code-fix", 3, db=db)
+    con = sqlite3.connect(db)
+    try:
+        rows = con.execute(
+            "SELECT id, text FROM semantic_memory WHERE scope = 'code-fix'",
+        ).fetchall()
+    finally:
+        con.close()
+    matches = [mid for mid, text in rows if needle in text]
+    assert len(matches) == 1, f"expected one mirror of {needle!r}: {rows}"
+    return matches[0]
+
+
+def _ledger(db):
+    con = sqlite3.connect(db)
+    try:
+        return con.execute(
+            "SELECT run_id, outcome FROM semantic_memory_uses",
+        ).fetchall()
+    finally:
+        con.close()
+
+
+def test_semantic_lessons_cold_store_matches_the_static_block(db, monkeypatch):
+    """The non-regression property the whole tranche rests on: with no track
+    record anywhere, the utility-ranked block IS the strength-ordered one. A
+    cold install must not see different lessons than it saw before."""
+    monkeypatch.setenv("MINI_ORK_DB", db)
+    monkeypatch.delenv("MINI_ORK_RUN_ID", raising=False)
+    _seed_emergent(db, [
+        ("a", "strongest pattern", ["adr"], 9.0, "approved"),
+        ("b", "middling pattern", ["adr"], 5.0, "approved"),
+        ("c", "weakest pattern", ["adr"], 1.0, "approved"),
+    ])
+
+    warm = ca.semantic_lessons_md("code-fix", 3, db=db)
+    assert warm == ca._static_emergent_block(db, 3)
+    assert warm.index("strongest") < warm.index("middling") < warm.index("weakest")
+    assert "(helped" not in warm, "nothing proven yet, so no credit to report"
+
+
+def _seed_strength_ladder(db, count=20, top=9.0, step=0.05):
+    """`count` approved patterns on a fine strength grid, strongest first.
+
+    A fine grid is what makes reordering observable: with a coarse one the
+    normalised prior gaps are so large that no record and no exploration bonus
+    can cross them, and a test would pass whether or not the ranking worked.
+    """
+    _seed_emergent(db, [
+        (f"p{index:02d}", f"pattern-{index:02d} says something", ["adr"],
+         top - index * step, "approved")
+        for index in range(count)
+    ])
+
+
+def test_semantic_lessons_rank_by_earned_utility(db, monkeypatch):
+    """The point of the tranche: a pattern that has actually worked outranks
+    equally-prior'd patterns that have not. With no prior to separate them,
+    the record is the entire ranking."""
+    monkeypatch.setenv("MINI_ORK_DB", db)
+    monkeypatch.delenv("MINI_ORK_RUN_ID", raising=False)
+    _seed_emergent(db, [
+        ("emg-a", "first pattern", ["adr"], 7.0, "approved"),
+        ("emg-b", "second pattern that works", ["adr"], 7.0, "approved"),
+        ("emg-c", "third pattern", ["adr"], 7.0, "approved"),
+    ])
+
+    from mini_ork import memory as semantic
+    mid = _mirrored(db, "second pattern that works")
+    for i in range(3):
+        semantic.record_retrievals([mid], scope="code-fix", run_id=f"r{i}", db_path=db)
+        semantic.record_outcome(f"r{i}", True, db_path=db)
+
+    py = ca.semantic_lessons_md("code-fix", 3, db=db)
+    bullets = [ln for ln in py.splitlines() if ln.startswith("- ")]
+    assert bullets[0].startswith("- [adr] second pattern that works"), (
+        f"the pattern with a record did not lead its equals: {py!r}"
+    )
+    assert "(helped 3/3 retrievals)" in py
+    assert "first pattern" in py and "third pattern" in py, "no peer was dropped"
+
+
+def test_semantic_lessons_demote_a_pattern_that_never_helps(db, monkeypatch):
+    """A pattern at the top of the prior order that has been retrieved twenty
+    times and helped none of them loses its place to untried peers. The prior
+    gates — it chose the pool — but inside the pool the record overrules it."""
+    monkeypatch.setenv("MINI_ORK_DB", db)
+    monkeypatch.delenv("MINI_ORK_RUN_ID", raising=False)
+    _seed_strength_ladder(db, count=20)
+    from mini_ork import memory as semantic
+    failed = _mirrored(db, "pattern-00 says something")
+    # Forty, not a handful: the penalty is bounded, so a long losing record is
+    # what makes the demotion decisive rather than a knife-edge tie with the
+    # peer it has to fall behind.
+    for i in range(40):
+        semantic.record_retrievals([failed], scope="code-fix", run_id=f"r{i}", db_path=db)
+        semantic.record_outcome(f"r{i}", False, db_path=db)
+
+    py = ca.semantic_lessons_md("code-fix", 3, db=db)
+
+    assert "pattern-00 says something" not in py, (
+        f"a pattern that never once helped held its place: {py!r}"
+    )
+    assert py.count("- [") == 3
+    # The ones that displaced it are its near-prior peers, not distant ones —
+    # the gate still bounds how far the record can reach.
+    assert all(f"pattern-{i:02d}" in py for i in (1, 2, 3)), py
+
+
+def test_semantic_lessons_gate_keeps_low_prior_patterns_out(db, monkeypatch):
+    """Utility may reorder the pool; it may not reach past it. A pattern far
+    down the prior order cannot buy its way in with a perfect record — the
+    gate is the only thing standing between a measured ranking and a single
+    lucky streak."""
+    monkeypatch.setenv("MINI_ORK_DB", db)
+    monkeypatch.delenv("MINI_ORK_RUN_ID", raising=False)
+    _seed_strength_ladder(db, count=20)
+    from mini_ork import memory as semantic
+    outsider = _mirrored(db, "pattern-19 says something")  # weakest prior
+    for i in range(20):
+        semantic.record_retrievals([outsider], scope="code-fix", run_id=f"r{i}", db_path=db)
+        semantic.record_outcome(f"r{i}", True, db_path=db)
+
+    py = ca.semantic_lessons_md("code-fix", 3, db=db)
+
+    assert "pattern-19 says something" not in py, (
+        f"a perfect record reached past the prior gate: {py!r}"
+    )
+    assert len(py.splitlines()) == 5, "block shape unchanged"
+
+
+def test_semantic_lessons_optout_restores_the_static_order(db, monkeypatch):
+    """MO_SEMANTIC_INJECT=0 is the way back, not the way in: the block still
+    ships, in the ordering it had before this channel existed."""
+    monkeypatch.setenv("MINI_ORK_DB", db)
+    monkeypatch.delenv("MINI_ORK_RUN_ID", raising=False)
+    _seed_emergent(db, [
+        ("emg-strong", "broad vague advice", ["adr"], 9.0, "approved"),
+        ("emg-weak", "specific narrow fix", ["verifier_addition"], 1.0, "approved"),
+    ])
+    from mini_ork import memory as semantic
+    ca.semantic_lessons_md("code-fix", 3, db=db)  # mirror-on-read creates the row
+    mid = _mirrored(db, "specific narrow")
+    semantic.record_retrievals([mid], scope="code-fix", run_id="r0", db_path=db)
+    semantic.record_outcome("r0", True, db_path=db)
+
+    monkeypatch.setenv("MO_SEMANTIC_INJECT", "0")
+    assert ca.semantic_lessons_md("code-fix", 3, db=db) == ""
+    py = ca.failure_modes_md("code-fix", 3, db=db)
+    assert "broad vague" in py and "specific narrow" in py
+    assert py.index("broad vague") < py.index("specific narrow"), "static order back"
+    assert "Verified emergent patterns" in py, "the block must not disappear"
+
+
+def test_semantic_lessons_log_retrieval_only_inside_a_run(db, monkeypatch):
+    """A retrieval with no run to attribute it to can never resolve to a win,
+    so writing one would depress the memory's utility for nothing. Outside a
+    run the block is emitted and nothing is logged."""
+    monkeypatch.setenv("MINI_ORK_DB", db)
+    _seed_emergent(db, [("emg-1", "a lesson", ["adr"], 5.0, "approved")])
+
+    monkeypatch.delenv("MINI_ORK_RUN_ID", raising=False)
+    assert ca.semantic_lessons_md("code-fix", 3, db=db) != ""
+    assert _ledger(db) == [], "no run → nothing to attribute → nothing logged"
+
+    monkeypatch.setenv("MINI_ORK_RUN_ID", "run-x")
+    assert ca.semantic_lessons_md("code-fix", 3, db=db) != ""
+    assert _ledger(db) == [("run-x", "pending")]
+
+
+def test_semantic_lessons_close_the_loop_across_injections(db, monkeypatch):
+    """End to end over two injections of the same run: the first logs a
+    retrieval, the run finishes, and the second injection's sweep resolves it
+    before ranking — so the prompt that follows reports credit the first one
+    earned."""
+    monkeypatch.setenv("MINI_ORK_DB", db)
+    monkeypatch.setenv("MINI_ORK_RUN_ID", "run-loop")
+    _seed_emergent(db, [("emg-1", "lesson that helped", ["adr"], 1.0, "approved")])
+
+    first = ca.semantic_lessons_md("code-fix", 3, db=db)
+    assert "lesson that helped" in first and "(helped" not in first
+    assert _ledger(db) == [("run-loop", "pending")]
+
+    trace_store.trace_write(
+        {"trace_id": "tl-1", "run_id": "run-loop", "task_class": "code-fix",
+         "status": "success", "cost_usd": 0.1, "duration_ms": 10,
+         "agent_version_id": "codex"}, db=db)
+
+    second = ca.semantic_lessons_md("code-fix", 3, db=db)
+    assert second == first.replace("- [adr] lesson that helped",
+                                  "- [adr] lesson that helped  (helped 1/1 retrievals)"), (
+        f"the completed run's win was not reflected: {second!r}"
+    )
+
+
+def test_semantic_lessons_hold_a_still_running_run_pending(db, monkeypatch):
+    """The sweep must not credit a run whose traces are still live."""
+    monkeypatch.setenv("MINI_ORK_DB", db)
+    monkeypatch.setenv("MINI_ORK_RUN_ID", "run-live")
+    _seed_emergent(db, [("emg-1", "a lesson", ["adr"], 5.0, "approved")])
+    ca.semantic_lessons_md("code-fix", 3, db=db)
+
+    trace_store.trace_write(
+        {"trace_id": "tn-1", "run_id": "run-live", "task_class": "code-fix",
+         "status": "running", "cost_usd": 0.0, "duration_ms": 0,
+         "agent_version_id": "codex"}, db=db)
+    py = ca.semantic_lessons_md("code-fix", 3, db=db)
+
+    assert "(helped" not in py, f"an unfinished run earned credit: {py!r}"
+    assert [o for _r, o in _ledger(db)] == ["pending", "pending"]
+
+
+def test_semantic_lessons_cold_safe_without_the_patterns_table(db, monkeypatch):
+    monkeypatch.setenv("MINI_ORK_DB", db)
+    con = sqlite3.connect(db)
+    con.execute("DROP TABLE emergent_patterns")
+    con.commit()
+    con.close()
+
+    assert ca.semantic_lessons_md("code-fix", 5, db=db) == ""
+    assert ca._static_emergent_block(db, 5) == ""
+    assert "Verified emergent patterns" not in ca.failure_modes_md("code-fix", 5, db=db)
+
+
+def test_semantic_lessons_do_not_leak_proposed_patterns(db, monkeypatch):
+    """The confabulation guard survives the channel change: only judge-gated
+    'approved' rows are ever mirrored, so a 'proposed' self-diagnosis cannot
+    reach the prompt by being ranked."""
+    monkeypatch.setenv("MINI_ORK_DB", db)
+    monkeypatch.delenv("MINI_ORK_RUN_ID", raising=False)
+    _seed_emergent(db, [
+        ("emg-raw", "unverified confabulated self-diagnosis", ["adr"], 99.0, "proposed"),
+    ])
+
+    assert ca.semantic_lessons_md("code-fix", 5, db=db) == ""
+    assert "confabulated" not in ca.failure_modes_md("code-fix", 5, db=db)
+    con = sqlite3.connect(db)
+    try:
+        n = con.execute("SELECT COUNT(*) FROM semantic_memory").fetchone()[0]
+    finally:
+        con.close()
+    assert n == 0, "a proposed pattern must not even be mirrored"

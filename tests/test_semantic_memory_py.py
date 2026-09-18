@@ -19,7 +19,13 @@ from pathlib import Path
 import pytest
 
 from mini_ork.dispatch import DispatchResult
-from mini_ork.memory import add, record_outcome, record_retrievals, search
+from mini_ork.memory import (
+    add,
+    rank_with_prior,
+    record_outcome,
+    record_retrievals,
+    search,
+)
 from mini_ork.memory.semantic import _connect as _semantic_connect
 from mini_ork.memory.semantic import _pack_embedding as _pack_vector
 from mini_ork.stores.migrate import migrate_apply
@@ -616,3 +622,284 @@ def test_connect_upgrades_a_table_that_predates_the_utility_columns(db_path):
         conn.close()
     assert {"uses", "wins"} <= cols, f"columns not upgraded: {cols}"
     assert "semantic_memory_uses" in tables, "ledger not bootstrapped"
+
+
+# ── upsert(): mirror-a-source-table identity ─────────────────────────────────
+
+
+def _seed_traces(db_path, rows) -> None:
+    """Minimal ``execution_traces`` modelled on 0054, carrying only the three
+    columns ``resolve_finished_runs`` reads. The real table is created by a
+    migration this fixture does not run, so the sweep's JOIN needs a stand-in.
+    """
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS execution_traces ("
+            "  trace_id TEXT PRIMARY KEY,"
+            "  run_id TEXT,"
+            "  status TEXT NOT NULL"
+            ")"
+        )
+        conn.executemany(
+            "INSERT INTO execution_traces(trace_id, run_id, status) VALUES (?,?,?)",
+            rows,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_upsert_keys_identity_not_similarity(db_path):
+    """A mirror of a source table needs one memory per source row. `add()`
+    cannot give that: it reconciles by similarity, so two rows that read alike
+    collapse into one. `upsert()` keys on the caller's key instead — which is
+    the only thing that can tell two look-alike source rows apart."""
+    from mini_ork.memory import upsert
+
+    emb = _FixedEmbedder({"first": [1.0, 0.0], "second": [1.0, 0.0]})
+    a = upsert("first", scope="s", key="row-1", db_path=db_path, embedder=emb)
+    b = upsert("second", scope="s", key="row-2", db_path=db_path, embedder=emb)
+
+    assert a != b, "distinct keys must be distinct memories"
+    assert len(_rows(db_path, "s")) == 2, (
+        "identical embeddings collapsed two keyed rows — identity leaked back "
+        "into similarity"
+    )
+
+
+def test_upsert_refreshes_text_and_preserves_the_track_record(db_path):
+    """Re-syncing a source row must not reset what the memory has earned. A
+    refresh that zeroed `uses`/`wins` would launder a bad track record and
+    hand every memory a fresh exploration bonus on every sync."""
+    from mini_ork.memory import upsert
+
+    emb = _FixedEmbedder({"old text": [1.0, 0.0], "new text": [1.0, 0.0]})
+    mid = upsert("old text", scope="s", key="row-1", db_path=db_path, embedder=emb)
+    record_retrievals([mid], scope="s", run_id="r1", db_path=db_path)
+    record_outcome("r1", True, db_path=db_path)
+    assert _by_text(db_path, "s")["old text"][1:] == (1, 1)
+
+    again = upsert("new text", scope="s", key="row-1", db_path=db_path, embedder=emb)
+
+    assert again == mid, "the same key must address the same row"
+    rows = _rows(db_path, "s")
+    assert len(rows) == 1, "a re-upsert must not insert a second row"
+    assert rows[0][1] == "new text", "text should refresh"
+    assert rows[0][2:] == (1, 1), "uses/wins must survive the refresh"
+
+
+def test_upsert_scopes_the_same_key_independently(db_path):
+    """Two task classes can hold a row with the same key without colliding."""
+    from mini_ork.memory import upsert
+
+    emb = _FixedEmbedder({"x": [1.0, 0.0]})
+    one = upsert("x", scope="one", key="k", db_path=db_path, embedder=emb)
+    two = upsert("x", scope="two", key="k", db_path=db_path, embedder=emb)
+    assert one != two
+    assert len(_rows(db_path, "one")) == 1 and len(_rows(db_path, "two")) == 1
+
+
+# ── resolve_finished_runs(): the sweep that closes the loop ─────────────────
+
+
+def test_resolve_finished_runs_sweeps_only_terminal_runs(db_path):
+    """Three runs retrieved the same memory. Sweeping must resolve the one that
+    finished, leave the one still executing alone, and leave the one with no
+    traces at all pending — nothing was recorded to judge it by."""
+    from mini_ork.memory import resolve_finished_runs
+
+    emb = _FixedEmbedder({"m": [1.0, 0.0]})
+    add("m", scope="s", infer=False, db_path=db_path, embedder=emb)
+    mid = _by_text(db_path, "s")["m"][0]
+
+    for run in ("done", "live", "absent"):
+        record_retrievals([mid], scope="s", run_id=run, db_path=db_path)
+    _seed_traces(db_path, [
+        ("t1", "done", "success"),
+        ("t2", "done", "success"),
+        ("t3", "live", "success"),
+        ("t4", "live", "running"),
+    ])
+
+    assert resolve_finished_runs(db_path=db_path) == 1
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        outcomes = dict(conn.execute(
+            "SELECT run_id, outcome FROM semantic_memory_uses",
+        ).fetchall())
+    finally:
+        conn.close()
+    assert outcomes == {"done": "win", "live": "pending", "absent": "pending"}
+    assert _by_text(db_path, "s")["m"][1:] == (3, 1), "one win, on the ledger"
+
+
+def test_resolve_finished_runs_marks_a_failed_run_as_loss(db_path):
+    """The rule is `prior_runs_md`'s: a run is clean iff no node is anything
+    but success-or-running. Same tables, same verdict — the memory cannot be
+    credited by a run the prompt block would call failed."""
+    from mini_ork.memory import resolve_finished_runs
+
+    emb = _FixedEmbedder({"m": [1.0, 0.0]})
+    add("m", scope="s", infer=False, db_path=db_path, embedder=emb)
+    mid = _by_text(db_path, "s")["m"][0]
+
+    record_retrievals([mid], scope="s", run_id="bad", db_path=db_path)
+    _seed_traces(db_path, [("t1", "bad", "success"), ("t2", "bad", "failure")])
+
+    assert resolve_finished_runs(db_path=db_path) == 1
+    assert _by_text(db_path, "s")["m"][1:] == (1, 0), "a loss must not bump wins"
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        outcome = conn.execute(
+            "SELECT outcome FROM semantic_memory_uses WHERE run_id = 'bad'",
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    assert outcome == "loss"
+
+
+def test_resolve_finished_runs_is_idempotent(db_path):
+    from mini_ork.memory import resolve_finished_runs
+
+    emb = _FixedEmbedder({"m": [1.0, 0.0]})
+    add("m", scope="s", infer=False, db_path=db_path, embedder=emb)
+    mid = _by_text(db_path, "s")["m"][0]
+    record_retrievals([mid], scope="s", run_id="done", db_path=db_path)
+    _seed_traces(db_path, [("t1", "done", "success")])
+
+    assert resolve_finished_runs(db_path=db_path) == 1
+    assert resolve_finished_runs(db_path=db_path) == 0
+    assert _by_text(db_path, "s")["m"][1:] == (1, 1), "wins must not double-count"
+
+
+def test_resolve_finished_runs_is_cold_safe_without_the_traces_table(db_path):
+    """A DB that never ran the migration creating `execution_traces` must not
+    raise on the prompt-injection path — there is simply nothing to resolve."""
+    from mini_ork.memory import resolve_finished_runs
+
+    emb = _FixedEmbedder({"m": [1.0, 0.0]})
+    add("m", scope="s", infer=False, db_path=db_path, embedder=emb)
+    mid = _by_text(db_path, "s")["m"][0]
+    record_retrievals([mid], scope="s", run_id="r", db_path=db_path)
+
+    assert resolve_finished_runs(db_path=db_path) == 0
+    assert _by_text(db_path, "s")["m"][1:] == (1, 0), "left pending, not guessed"
+
+
+def test_resolve_finished_runs_ignores_retrievals_without_a_run_id(db_path):
+    """An unattributable retrieval has no run to look up, so it stays pending
+    forever. That is the fail-closed rule, restated at the sweep boundary."""
+    from mini_ork.memory import resolve_finished_runs
+
+    emb = _FixedEmbedder({"m": [1.0, 0.0]})
+    add("m", scope="s", infer=False, db_path=db_path, embedder=emb)
+    mid = _by_text(db_path, "s")["m"][0]
+    record_retrievals([mid], scope="s", db_path=db_path)  # run_id=''
+    _seed_traces(db_path, [("t1", "", "success")])
+
+    assert resolve_finished_runs(db_path=db_path) == 0
+    assert _by_text(db_path, "s")["m"][1:] == (1, 0)
+
+
+# ── rank_with_prior: an external prior gates, utility reorders in the gate ───
+
+
+def test_rank_with_prior_cold_reproduces_the_prior_order(db_path):
+    """With nothing retrieved anywhere, exploration is zero and every utility
+    is the neutral 0.5, so the composite is the normalised prior and nothing
+    else. A scope nobody has tried ranks exactly as its prior says."""
+    strong = _seed(db_path, "s", "strong", [1.0, 0.0])
+    mid = _seed(db_path, "s", "mid", [1.0, 0.0])
+    weak = _seed(db_path, "s", "weak", [1.0, 0.0])
+    candidates = [(strong, 3.0), (mid, 2.0), (weak, 1.0)]
+
+    out = rank_with_prior(candidates, scope="s", top_k=3, db_path=db_path)
+
+    assert [h["text"] for h in out] == ["strong", "mid", "weak"]
+    assert [h["prior"] for h in out] == [3.0, 2.0, 1.0]
+    assert [h["utility"] for h in out] == [pytest.approx(0.5)] * 3
+    # Normalised over the pool: the top prior is 1.0, the bottom 0.0. The cold
+    # score is that normalised prior, with no bonus to move anything.
+    assert [h["score"] for h in out] == pytest.approx([1.0, 0.5, 0.0])
+
+
+def test_rank_with_prior_reorders_by_record_inside_equal_priors(db_path):
+    """Equal priors leave no order for the gate to preserve, so the record is
+    the whole ranking — the one case where utility alone decides."""
+    a = _seed(db_path, "s", "alpha", [1.0, 0.0], uses=3, wins=3)
+    b = _seed(db_path, "s", "beta", [1.0, 0.0])
+    c = _seed(db_path, "s", "gamma", [1.0, 0.0], uses=4, wins=0)
+
+    out = rank_with_prior(
+        [(a, 7.0), (b, 7.0), (c, 7.0)], scope="s", top_k=3, db_path=db_path,
+    )
+
+    assert [h["text"] for h in out] == ["alpha", "beta", "gamma"]
+    assert out[0]["utility"] == pytest.approx(4 / 5)   # (3+1)/(3+2)
+    assert out[1]["utility"] == pytest.approx(0.5)     # untried → neutral
+    assert out[2]["utility"] == pytest.approx(1 / 6)   # (0+1)/(4+2)
+
+
+def test_rank_with_prior_exploration_outranks_a_break_even_record(db_path):
+    """A memory retrieved 20 times and helped exactly half is neither proven
+    nor discredited — its utility is dead neutral and all it carries is the
+    small bonus for having been tried. An untried peer with the same prior
+    outranks it, because sampling what nobody has tried is the only way any
+    memory ever acquires a record."""
+    tried = _seed(db_path, "s", "tried", [1.0, 0.0], uses=20, wins=10)
+    untried = _seed(db_path, "s", "untried", [1.0, 0.0])
+
+    out = rank_with_prior(
+        [(tried, 2.0), (untried, 2.0)], scope="s", top_k=2, db_path=db_path,
+    )
+
+    assert out[0]["utility"] == pytest.approx(0.5), "the control: break-even"
+    assert [h["text"] for h in out] == ["untried", "tried"]
+    assert out[0]["score"] > out[1]["score"]
+
+
+def test_rank_with_prior_gate_bounds_a_perfect_record(db_path):
+    """Utility may only reorder what the prior admitted. A perfect record far
+    down the prior order cannot buy its way into a small top_k — the gate is
+    what stands between a measured ranking and one lucky streak."""
+    ids = {
+        name: _seed(db_path, "s", name, [1.0, 0.0])
+        for name in ("p6", "p5", "p4", "p3", "p2", "p1")
+    }
+    candidates = [(ids[n], float(n[1:])) for n in ids]   # priors 6.0 … 1.0
+    # Touch the weakest one so it has wins on the books.
+    record_retrievals([ids["p1"]], scope="s", run_id="r", db_path=db_path)
+    record_outcome("r", True, db_path=db_path)
+
+    out = rank_with_prior(candidates, scope="s", top_k=1, db_path=db_path)
+
+    assert len(out) == 1
+    assert out[0]["text"] == "p6", "the gate, not the record, chose the pool"
+
+
+def test_rank_with_prior_drops_candidates_it_cannot_vouch_for(db_path):
+    """A prior is a claim about a memory in *this* scope. One pointing at a
+    different scope's row, or at no row at all, is a claim nothing supports —
+    so it is dropped rather than ranked on a prior nothing can check."""
+    mine = _seed(db_path, "s", "mine", [1.0, 0.0])
+    theirs = _seed(db_path, "other", "theirs", [1.0, 0.0])
+
+    out = rank_with_prior(
+        [(mine, 2.0), (theirs, 9.0), (999_999, 8.0)],
+        scope="s", top_k=5, db_path=db_path,
+    )
+
+    assert [h["text"] for h in out] == ["mine"]
+
+
+def test_rank_with_prior_rejects_a_scope_or_top_k_it_cannot_honour(db_path):
+    """Both are caller errors with no sensible default: an empty scope would
+    silently rank across every scope, and a non-positive top_k asks for a
+    result set that cannot exist."""
+    with pytest.raises(ValueError):
+        rank_with_prior([(1, 1.0)], scope="", top_k=1, db_path=db_path)
+    with pytest.raises(ValueError):
+        rank_with_prior([(1, 1.0)], scope="s", top_k=0, db_path=db_path)
