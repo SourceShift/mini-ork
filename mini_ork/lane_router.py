@@ -367,6 +367,102 @@ def recompute_advantages(since: int = 0, db: str | None = None) -> int:
     return upserted
 
 
+def _equirouter_enabled() -> bool:
+    """EquiRouter ranking is ON by default; ``MO_EQUIROUTER=0`` restores the
+    legacy selector. Default-ON with an opt-out follows the MO_APPLY_SCORER
+    precedent: the env var exists to go back, not to switch a capability on."""
+    return os.environ.get("MO_EQUIROUTER", "1").strip().lower() not in ("0", "false", "no", "")
+
+
+def _slice_rankings(store, task_class: str, node_type: str,
+                    objective_domain: str, code_region: str,
+                    min_samples: int) -> dict:
+    """``(objective_domain, code_region) -> [(lane, relative_advantage), …]``.
+
+    One entry per slice that has at least two lanes clearing ``min_samples``,
+    each lane list ordered best-first. Slices with a single lane carry no
+    preference information (nothing to prefer it *over*), so they are dropped
+    — ``recompute_advantages`` already skips their advantage entirely.
+
+    ``code_region`` is deliberately NOT filtered: the region axis is the slice
+    dimension EquiRouter aggregates over. ``objective_domain`` is filtered when
+    given, because lanes observed in a different objective domain are evidence
+    about a different task and must not vote here.
+    """
+    where = "task_class=? AND node_type=? AND runs_count>=?"
+    params: list = [task_class, node_type, min_samples]
+    if objective_domain:
+        where += " AND objective_domain=?"
+        params.append(objective_domain)
+    rows = store.con.execute(
+        f"SELECT agent_version_id, objective_domain, code_region, "
+        f"relative_advantage, runs_count FROM lane_region_advantage "
+        f"WHERE {where} ORDER BY objective_domain, code_region, "
+        f"relative_advantage DESC, runs_count DESC, agent_version_id",
+        params).fetchall()
+    slices: dict = defaultdict(list)
+    for lane, od, cr, adv, _runs in rows:
+        slices[(od, cr)].append((lane, float(adv or 0.0)))
+    return {k: v for k, v in slices.items() if len(v) >= 2}
+
+
+def rank_lanes(node_type: str, task_class: str, objective_domain: str = "",
+               code_region: str = "", *, db: str | None = None,
+               min_samples: int | None = None) -> list[tuple[str, float]]:
+    """Rank lanes by Borda count aggregated across slices, best first.
+
+    EquiRouter (2602.03478): a lane's correct object of learning is its
+    *ordering* against the alternatives, not its absolute score. Training a
+    scalar invites collapse toward whichever lane happens to carry the largest
+    magnitude (caution C8 in the paper); a Borda count is scale-free — it uses
+    only each slice's ordinal preference, so a lane winning a slice by +5.0 and
+    one winning by +0.1 contribute identical points.
+
+    Each slice ``(objective_domain, code_region)`` ranks its lanes by
+    ``relative_advantage`` DESC and awards ``len(slice) - position`` points.
+    Points are summed across slices. Ties break on mean advantage, then lane
+    name, so the result is deterministic.
+
+    Returns ``[]`` when fewer than two slices carry a preference — a single
+    slice has nothing to aggregate, and its own ordering is already what the
+    legacy selector consumes.
+    """
+    if min_samples is None:
+        min_samples = int(os.environ.get("MO_LEARNING_MIN_SAMPLES", "3"))
+    store = AdvantageStore(db).open()
+    try:
+        slices = _slice_rankings(store, task_class, node_type,
+                                 objective_domain, code_region, min_samples)
+    finally:
+        store.close()
+    if len(slices) < 2:
+        return []
+    return _borda(slices)
+
+
+def _borda(slices: dict) -> list[tuple[str, float]]:
+    """Borda-count the per-slice lane orderings into one ranking.
+
+    Shared by ``rank_lanes`` and ``preferred_lane``'s override so the two can
+    never drift into disagreeing about what "ranked first" means.
+    """
+    points: dict = defaultdict(float)
+    adv_sum: dict = defaultdict(float)
+    adv_n: dict = defaultdict(int)
+    # sorted() so float accumulation order is stable run to run.
+    for key in sorted(slices):
+        lanes = slices[key]
+        size = len(lanes)
+        for pos, (lane, adv) in enumerate(lanes):
+            points[lane] += size - pos
+            adv_sum[lane] += adv
+            adv_n[lane] += 1
+    return sorted(
+        ((lane, points[lane]) for lane in points),
+        key=lambda t: (-t[1], -(adv_sum[t[0]] / adv_n[t[0]]), t[0]),
+    )
+
+
 def preferred_lane(task_class: str, node_type: str = "", objective_domain: str = "",
                    code_region: str = "", db: str | None = None) -> str:
     """Highest-advantage lane for the slice (sample floor MO_LEARNING_MIN_SAMPLES,
@@ -385,7 +481,14 @@ def preferred_lane(task_class: str, node_type: str = "", objective_domain: str =
     ``(task_class, node_type, code_region)`` is run through a per-lane ridge
     regression and the lane with the higher ridge score wins. The embedder
     import + call happen ONLY in this branch — the default path makes zero
-    extra per-task model calls (D7)."""
+    extra per-task model calls (D7).
+
+    EquiRouter (default ON, ``MO_EQUIROUTER=0`` restores the above verbatim)
+    sits on top of whichever branch fired: when two or more slices carry a lane
+    preference, the pick is re-ordered by the cross-slice Borda ranking from
+    ``rank_lanes``, restricted to lanes that already cleared the floor here.
+    With a single slice it is a no-op, because that slice's own ordering is
+    already what ``_select_best_lane`` consumed."""
     min_samples = int(os.environ.get("MO_LEARNING_MIN_SAMPLES", "3"))
     ucb_c = float(os.environ.get("MO_ROUTER_UCB_C", "0.5"))
     contextual = int(os.environ.get("MO_ROUTER_CONTEXTUAL", "0"))
@@ -400,7 +503,9 @@ def preferred_lane(task_class: str, node_type: str = "", objective_domain: str =
                                     bandit_on, ucb_c, contextual,
                                     task_class, node_type, objective_domain, code_region)
             if row:
-                return row
+                return _equirouter_pick(store, candidates, row, task_class,
+                                        node_type, objective_domain, code_region,
+                                        min_samples)
         if objective_domain:
             candidates = store.fetch_domain_candidates(
                 task_class, objective_domain, node_type, min_samples)
@@ -408,11 +513,50 @@ def preferred_lane(task_class: str, node_type: str = "", objective_domain: str =
                                     bandit_on, ucb_c, contextual,
                                     task_class, node_type, objective_domain, code_region)
             if row:
-                return row
+                return _equirouter_pick(store, candidates, row, task_class,
+                                        node_type, objective_domain, code_region,
+                                        min_samples)
         row = store.fetch_global_best(task_class, node_type, min_samples)
         return f"{row[0]}|{row[1]}|{row[2]}" if row else ""
     finally:
         store.close()
+
+
+def _equirouter_pick(store, candidates: list, legacy: str, task_class: str,
+                     node_type: str, objective_domain: str,
+                     code_region: str, min_samples: int) -> str:
+    """Re-order a slice's pick by the cross-slice Borda ranking.
+
+    Only engages when at least two slices carry a preference — with one slice
+    there is nothing to aggregate, and that slice's own ordering is exactly
+    what ``_select_best_lane`` already consumed. Keeping the single-slice path
+    untouched is what lets the UCB exploration bonus keep working where it is
+    the only signal available.
+
+    The winning lane must already be in ``candidates`` (the lanes that cleared
+    the sample floor for the requested slice), so this can reorder qualified
+    lanes but can never invent one — the cold-start invariant that routing
+    never routes to a lane with no evidence is preserved.
+
+    The returned string keeps the bash ``lane|adv|runs`` shape, carrying the
+    chosen lane's own ``relative_advantage`` so callers that diff the string
+    against the bash port still see a value from that lane.
+    """
+    if not legacy or not _equirouter_enabled() or not objective_domain:
+        return legacy
+    slices = _slice_rankings(store, task_class, node_type,
+                             objective_domain, code_region, min_samples)
+    if len(slices) < 2:
+        return legacy
+
+    allowed = {r[0] for r in candidates}
+    ranked = [lane for lane, _ in _borda(slices) if lane in allowed]
+    if not ranked or ranked[0] == legacy.split("|")[0]:
+        return legacy
+    for r in candidates:
+        if r[0] == ranked[0]:
+            return f"{r[0]}|{r[1]}|{r[2]}"
+    return legacy
 
 
 def _select_best_lane(candidates: list,
