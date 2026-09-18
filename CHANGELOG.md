@@ -13,6 +13,83 @@ No unreleased changes yet.
 
 ---
 
+## [0.8.0] - 2026-09-18
+
+**Agent frontend + harness engines + verified learning.** mini-ork grows a
+first-class web frontend (the OpenHands agent-canvas), speaks the
+agent-server wire protocol so the canvas can drive real runs, standardizes
+its harness/engine seam (including a UHP client and per-node capability
+envelopes), and closes the learn→apply loop with measurement-gated
+promotion.
+
+### Added
+
+- **Web frontend**: wholesale OpenHands agent-canvas fork vendored under
+  `ui/` and served from `mini-ork serve` — command deck with control
+  plane, flywheel + lane-health panels, needs-you triage, embedded
+  terminal, durable-resume surface, and a ⌘K palette; zero-build lite UI
+  for constrained environments.
+- **Agent-server protocol shim** (`mini_ork/web/routes/agent_server.py`):
+  the canvas's handshake/onboarding path, conversation create (a
+  conversation IS a run — client uuid becomes the run id), event history
+  with the full pagination matrix (sort windows, since-replay, cursor),
+  and sendMessage (idle→launch, live→steering injection, terminal→409).
+- **Harness engine standardization (SE-3 Phase A + B)**: hybrid-delegate
+  spawn seam re-expressing local/docker/microVM as a `Workspace.spawn`
+  axis; per-engine command-builder registry; UHP client backend (`uhp`
+  provider kind, direct-HTTP `/v1/responses` transport); per-node
+  capability envelope (`mcp_servers`/`skills`/`agent_doc` riding the node
+  env bus, rc=66 envelope-reject so fallback routing can honor declared
+  capabilities).
+- **New dispatch engines/wires**: `opencode-native` executable engine;
+  `openai-chat` direct-HTTP provider kind.
+- **Sandbox backends**: DockerWorkspace per-agent containers on a shared
+  drive; microVM isolation via microsandbox (default-preferred); leaked-
+  sandbox reaper + `mini-ork sandbox-gc`.
+- **Behavioral verifier (P0–P3)**: live API-surface checks, oracle
+  hardening, IRT-ranked catalog with committee, and a function-level
+  metamorphic engine wired as a behavioral surface.
+- **Eval in the run flow**: `type: eval` node writing reward columns;
+  verifiable process-reward stack (coherence gate default-ON, decomposed
+  reward, VPRM step-checks) with the LLM judge demoted to veto-only.
+- **Apply loop (learn→apply closed)**: GEPA-style gradient sweeps via
+  `bin/mini-ork-apply`; probe-set held-out scorer + bounded auto-sweep;
+  promotion requires a real measurement — fabrication and dead harnesses
+  are refused; bring-your-own external evaluator seam.
+- **Learning + memory**: mini-ork learning entities projected into
+  ContextNest's graph; planner graph pack (neighbours + path routes);
+  router as a cost-free contextual bandit.
+- **Durable DAG resume**: checkpoints, lease/idempotency, tool receipts,
+  and `--resume` at STEP or TURN granularity.
+- **RSI goal-loop**: goal-agnostic wave recipe skeleton + cross-wave
+  driver with RSI stops (GRAO, UCCI, divergence-kill).
+- **Runtime**: contextvar-based per-run env isolation (dual-write
+  publish, reader migration); stable `--json` run contract; in-process
+  SDK primitives exposed from the top-level package; tmux-backed Live
+  shell; recipe-local `register.py` loader; prompt override dir; new
+  recipes (goal-loop, 10lens with gating edges, audit-judge-panel,
+  ui-feature-parity).
+
+### Changed
+
+- Learning hygiene: non-learnable infra exits masked from GRPO advantage;
+  the gradient/reward loop refuses empty and ungrounded traces; opus
+  patch-critic added as a fourth promotion gate.
+- Launcher re-exec hardening (venv entry point resolution) and
+  secrets/env propagation through Python dispatch.
+
+### Fixed
+
+- Lane-health fail-fast pre-dispatch (no silent stalls); transient
+  throttle retry on all lanes; typecheck verifier keyed on project
+  markers instead of global tool presence; publisher commits
+  `files_changed` on APPROVE; `task_runs` cost clamp past the old
+  10-dollar ceiling; framework-edit verdict/lane-binding class;
+  headless runs severed from controlling TTY with planner shape-check
+  rejection (rc=65).
+
+---
+
 ## [0.7.0] - 2026-07-30
 
 **Native Python runtime.** MiniOrk now runs its framework runtime entirely in
