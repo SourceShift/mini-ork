@@ -18,6 +18,8 @@ from __future__ import annotations
 import importlib.util
 import json
 import sys
+
+import pytest
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -381,3 +383,90 @@ def test_default_spawn_fn_templating_for_inline_body(tmp_path, monkeypatch):
     assert "src/api.py" in body
     assert "lens 07 timeout" in body
     assert "{{" not in body
+
+
+# ── 10-12. U4d wave-kickoff env resolution ────────────────────────────────
+
+
+def _capture_run_wave(monkeypatch):
+    """Patch ``subprocess.run`` at the drive module and return captured argv.
+
+    ``_default_run_wave_fn`` does a top-level ``import subprocess`` (drive.py:30)
+    and reads ``subprocess.run`` at call time, so monkeypatching the bound
+    attribute on the loaded module redirects the call. Pytest restores the
+    real ``subprocess.run`` on teardown.
+    """
+    captured: dict = {}
+
+    def fake_run(argv, *args, **kwargs):
+        captured.clear()
+        captured["argv"] = argv
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(_DRIVE.subprocess, "run", fake_run)
+    return captured
+
+
+def test_default_run_wave_fn_prefers_wave_kickoff(tmp_path, monkeypatch):
+    """When BOTH env vars are set, the WAVE kickoff is the one shelled to ``bin/mini-ork``."""
+    wave_kickoff = tmp_path / "wave.md"
+    wave_kickoff.write_text("# WAVE\n", encoding="utf-8")
+    child_kickoff = tmp_path / "child.md"
+    child_kickoff.write_text("# CHILD\n", encoding="utf-8")
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    monkeypatch.setenv("MINI_ORK_RUN_DIR", str(run_dir))
+    monkeypatch.setenv("MO_GOAL_WAVE_KICKOFF", str(wave_kickoff))
+    monkeypatch.setenv("MO_GOAL_CHILD_KICKOFF", str(child_kickoff))
+
+    captured = _capture_run_wave(monkeypatch)
+    default = _DRIVE._default_run_wave_fn  # noqa: SLF001 — test seam
+
+    payload = default(1, set())
+
+    argv = captured["argv"]
+    assert argv[1:3] == ["run", "goal-loop"]
+    assert argv[3] == str(wave_kickoff)
+    assert argv[3] != str(child_kickoff)
+    # Panel-verdict.json absent → payload keeps verdict='fail' (kickoff ¶60).
+    assert payload["verdict"] == "fail"
+    assert payload["wave"] == 1
+    assert payload["quarantined"] == []
+
+
+def test_default_run_wave_fn_falls_back_to_child_kickoff(tmp_path, monkeypatch):
+    """With only ``MO_GOAL_CHILD_KICKOFF`` set, the CHILD kickoff is shelled (backward compat)."""
+    child_kickoff = tmp_path / "child.md"
+    child_kickoff.write_text("# CHILD\n", encoding="utf-8")
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    monkeypatch.setenv("MINI_ORK_RUN_DIR", str(run_dir))
+    monkeypatch.delenv("MO_GOAL_WAVE_KICKOFF", raising=False)
+    monkeypatch.setenv("MO_GOAL_CHILD_KICKOFF", str(child_kickoff))
+
+    captured = _capture_run_wave(monkeypatch)
+    default = _DRIVE._default_run_wave_fn  # noqa: SLF001 — test seam
+
+    payload = default(1, set())
+
+    argv = captured["argv"]
+    assert argv[1:3] == ["run", "goal-loop"]
+    assert argv[3] == str(child_kickoff)
+    assert payload["verdict"] == "fail"
+
+
+def test_default_run_wave_fn_raises_when_both_kickoffs_unset(tmp_path, monkeypatch):
+    """Neither var set → ``RuntimeError`` naming BOTH env vars."""
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    monkeypatch.setenv("MINI_ORK_RUN_DIR", str(run_dir))
+    monkeypatch.delenv("MO_GOAL_WAVE_KICKOFF", raising=False)
+    monkeypatch.delenv("MO_GOAL_CHILD_KICKOFF", raising=False)
+
+    default = _DRIVE._default_run_wave_fn  # noqa: SLF001 — test seam
+
+    with pytest.raises(RuntimeError) as exc_info:
+        default(1, set())
+    msg = str(exc_info.value)
+    assert "MO_GOAL_WAVE_KICKOFF" in msg
+    assert "MO_GOAL_CHILD_KICKOFF" in msg
