@@ -92,6 +92,7 @@ def _seed_workflow(db_path: Path) -> None:
         for cid in (
             "cand-no-bench", "cand-approve",
             "cand-persist", "cand-approve-flow", "cand-persisted-decision",
+            "cand-one-run", "cand-floor",
         ):
             con.execute("""
                 INSERT OR IGNORE INTO workflow_candidates
@@ -125,36 +126,51 @@ def _seed_legacy_pending(db_path: Path, candidate_id: str) -> None:
         con.close()
 
 
-def _seed_bench_all_pass(db_path: Path, candidate_id: str) -> None:
-    """Seed 4 benchmark_results rows, all pass=1, utility_score=0.92."""
+def _seed_bench(db_path: Path, candidate_id: str, rows) -> None:
+    """Seed benchmark_results rows. ``rows``: list of (benchmark_id, run_id, pass).
+
+    ``run_id`` is NOT NULL and references ``runs(id)``, so the referenced runs
+    rows are created first.
+    """
     con = sqlite3.connect(str(db_path))
     try:
-        # Need a benchmark_tasks row + a runs row for the FK.
-        con.execute("""
-            INSERT OR IGNORE INTO benchmark_tasks
-                (benchmark_id, task_class)
-            VALUES ('bench-task-1', 'code_fix')
-        """)
-        con.execute("""
-            INSERT OR IGNORE INTO runs (id, started_at)
-            VALUES (1, strftime('%s','now'))
-        """)
-        for bid in ("bench-task-1", "bench-task-2", "bench-task-3", "bench-task-4"):
+        for bid in {r[0] for r in rows}:
             con.execute("""
                 INSERT OR IGNORE INTO benchmark_tasks
                     (benchmark_id, task_class)
                 VALUES (?, 'code_fix')
             """, (bid,))
-        for i, bid in enumerate(("bench-task-1", "bench-task-2", "bench-task-3", "bench-task-4"), start=1):
+        for rid in {r[1] for r in rows}:
+            con.execute("""
+                INSERT OR IGNORE INTO runs (id, started_at)
+                VALUES (?, strftime('%s','now'))
+            """, (rid,))
+        for i, (bid, rid, passed) in enumerate(rows, start=1):
             con.execute("""
                 INSERT OR IGNORE INTO benchmark_results
                     (result_id, benchmark_id, candidate_id, run_id,
                      pass, utility_score)
-                VALUES (?, ?, ?, 1, 1, 0.92)
-            """, (f"res-{candidate_id}-{i}", bid, candidate_id))
+                VALUES (?, ?, ?, ?, ?, 0.92)
+            """, (f"res-{candidate_id}-{i}", bid, candidate_id, rid, passed))
         con.commit()
     finally:
         con.close()
+
+
+def _seed_bench_all_pass(db_path: Path, candidate_id: str) -> None:
+    """Seed 4 passing benchmark_results rows across 3 INDEPENDENT runs.
+
+    Four samples from one run are one observation, so a helper that seeded them
+    all with ``run_id=1`` could not clear the independence floor however well it
+    passed. The four rows are spread over runs 1-3 — still 4 samples, now with
+    three runs of evidence behind them.
+    """
+    _seed_bench(db_path, candidate_id, [
+        ("bench-task-1", 1, 1),
+        ("bench-task-2", 2, 1),
+        ("bench-task-3", 3, 1),
+        ("bench-task-4", 1, 1),
+    ])
 
 
 # ── python-side helpers (in-process port) ──────────────────────────────────
@@ -211,9 +227,11 @@ def test_promotion_evaluate_no_benchmark(db):
         "utility_delta", "benchmark_run_id", "all_pass", "safety_violations",
     ):
         assert k in pobj, f"missing key: {k}"
-    # benchmark_run_id is unset or echoes the candidate_id (the port's
-    # documented no-bench shape).
-    assert pobj["benchmark_run_id"] in (None, "cand-no-bench")
+    # No measurement ⇒ no evidence runs, and no run to name. The column used to
+    # echo the candidate_id here, which asserted a benchmark backing that did
+    # not exist.
+    assert pobj["benchmark_run_id"] is None
+    assert pobj["n_runs"] == 0
     _assert_float_eq("utility_delta", pobj["utility_delta"], 0.0)
     _assert_float_eq(
         "utility_consistency",
@@ -268,10 +286,95 @@ def test_promotion_evaluate_persisted_row(db):
     # 1e-6 float tolerance on utility_* columns vs the returned payload.
     _assert_float_eq("utility_before", ub, pobj["utility_before"])
     _assert_float_eq("utility_after", ua, pobj["utility_after"])
-    # benchmark_run_id is the candidate_id (matches the output key).
-    assert bri_val is None or bri_val == "cand-persist"
+    # benchmark_run_id names the runs the decision rested on — not the
+    # candidate_id the old shape echoed, which said nothing about evidence.
+    assert bri_val == "1,2,3"
+    assert pobj["n_runs"] == 3
     # The persisted rationale matches the returned payload.
     assert rat == pobj["rationale"]
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# (2b) Evidence independence — N samples from one run are ONE observation.
+# ───────────────────────────────────────────────────────────────────────────
+
+
+def test_promotion_rejects_evidence_from_a_single_run(db):
+    """30 passing rows from one run must not promote.
+
+    The gate aggregated every ``benchmark_results`` row for a candidate and
+    never read ``run_id``, so one run emitting many tasks was indistinguishable
+    from many runs agreeing. Independence is measured, never inferred from the
+    sample count."""
+    _seed_workflow(db)
+    _seed_bench(db, "cand-one-run",
+                [("bench-task-1", 1, 1), ("bench-task-1", 1, 1),
+                 ("bench-task-1", 1, 1), ("bench-task-1", 1, 1)])
+
+    pobj = _py_evaluate(db, "cand-one-run")
+
+    assert pobj["decision"] == "rejected"
+    assert "insufficient independent evidence" in pobj["rationale"]
+    assert "1 distinct run(s), 3 required" in pobj["rationale"]
+    assert pobj["n_runs"] == 1
+    # The refusal is persisted, not cosmetic: the audit trail records a
+    # rejection and never claims the candidate was promoted.
+    con = sqlite3.connect(str(db))
+    try:
+        decision, bri = con.execute(
+            "SELECT decision, benchmark_run_id FROM promotion_records "
+            "WHERE candidate_id='cand-one-run'"
+        ).fetchone()
+    finally:
+        con.close()
+    assert decision == "rejected"
+    assert bri == "1"
+
+
+def test_promotion_floor_cannot_be_lowered(db, monkeypatch):
+    """MO_PROMOTION_MIN_RUNS may raise the floor but never lower it.
+
+    A safety floor is not a setting: if an env var could restore the forgeable
+    bar, one run would promote again by configuration."""
+    _seed_workflow(db)
+    _seed_bench(db, "cand-floor", [("bench-task-1", 1, 1), ("bench-task-2", 1, 1)])
+
+    monkeypatch.setenv("MO_PROMOTION_MIN_RUNS", "1")
+    pobj = _py_evaluate(db, "cand-floor")
+
+    assert pobj["decision"] == "rejected"
+    assert "3 required" in pobj["rationale"]
+
+
+def test_promotion_floor_can_be_raised(db, monkeypatch):
+    """The env var raises the bar: 3 independent runs do not clear 5."""
+    _seed_workflow(db)
+    _seed_bench(db, "cand-persist", [("bench-task-1", 1, 1), ("bench-task-2", 2, 1),
+                                     ("bench-task-3", 3, 1)])
+
+    monkeypatch.setenv("MO_PROMOTION_MIN_RUNS", "5")
+    pobj = _py_evaluate(db, "cand-persist")
+
+    assert pobj["decision"] == "rejected"
+    assert "5 required" in pobj["rationale"]
+
+
+def test_evidence_run_ids_drops_null_and_blank(tmp_path):
+    """A NULL/blank run_id is unproven independence and is dropped, not assumed.
+
+    The migrated schema declares ``run_id INTEGER NOT NULL``, so this cannot
+    arise there — but the guard must hold for loose or legacy tables too, and
+    a helper that quietly counted a blank id as a run would restore the hole."""
+    db_path = tmp_path / "loose.db"
+    con = sqlite3.connect(str(db_path))
+    con.execute("CREATE TABLE benchmark_results (candidate_id TEXT, run_id)")
+    con.executemany("INSERT INTO benchmark_results VALUES (?,?)", [
+        ("c", None), ("c", ""), ("c", "  "), ("c", "7"), ("c", "7"), ("c", "8"),
+    ])
+    con.commit()
+
+    assert pg._evidence_run_ids(con, "c") == ["7", "8"]
+    con.close()
 
 
 # ───────────────────────────────────────────────────────────────────────────
