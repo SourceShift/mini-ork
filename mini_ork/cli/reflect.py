@@ -294,6 +294,31 @@ def main(argv: list[str] | None = None) -> int:
             patterns_written = 0
         sys.stdout.write(f"  [pattern_miner] wrote {patterns_written or 0} pattern_records rows\n")
 
+    # ── side-channel: pattern induction (MO_PATTERN_INDUCE) ────────────────
+    # The miner above names clusters; it does not understand them. This is the
+    # step that reads the member traces and authors the lesson, following
+    # Trace2Skill 2603.25158 stage 2 (parallel analyst proposal) and stage 3
+    # (merge). Runs after the miner so a freshly-mined cluster is eligible in
+    # the same pass. Default ON with an opt-out, like every other new gate here;
+    # a cluster that already carries a lesson is never re-authored.
+    induce_report = None
+    try:
+        from mini_ork.learning import pattern_induction
+        if pattern_induction._induct_enabled():
+            induce_report = pattern_induction.induce_pending(
+                db_path=db_path,
+                limit=int(os.environ.get("MO_PATTERN_INDUCE_LIMIT", "20")),
+                min_cluster=int(os.environ.get("MO_PATTERN_MINER_MIN_CLUSTER", "3")),
+            )
+    except Exception as exc:  # a side-channel must never crash reflect
+        sys.stderr.write(f"  [pattern_induct] skipped: {exc}\n")
+        induce_report = None
+    if induce_report is not None:
+        sys.stdout.write(
+            f"  [pattern_induct] authored {induce_report.get('induced', 0)} lesson(s), "
+            f"{len(induce_report.get('skipped') or [])} cluster(s) left without one\n"
+        )
+
     # ── learning-loop write-back ───────────────────────────────────────────
     suggestions_written = 0
     try:

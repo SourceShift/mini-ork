@@ -623,17 +623,18 @@ def test_reflection_suggest_promotions(temp_db):
     con.execute("PRAGMA busy_timeout=5000")
     con.execute("ALTER TABLE pattern_records ADD COLUMN cluster_id TEXT")
     rows = [
-        ("p-high-A", "Most frequent pattern",        '["t1","t2"]', 7, "verifier_addition"),
-        ("p-high-B", "Second most frequent",         '["t3"]',      4, "adr"),
-        ("p-low-C",  "Below threshold",              '["t4"]',      2, "workflow_change"),
-        ("p-low-D",  "Way below threshold",          '[]',          1, "prompt_change"),
+        ("p-high-A", "Most frequent pattern",        '["t1","t2"]', 7, "verifier_addition",
+         "When the verifier emits no output: treat the node as failed"),
+        ("p-high-B", "Second most frequent",         '["t3"]',      4, "adr", None),
+        ("p-low-C",  "Below threshold",              '["t4"]',      2, "workflow_change", None),
+        ("p-low-D",  "Way below threshold",          '[]',          1, "prompt_change", None),
     ]
-    for pid, desc, ev, freq, ot in rows:
+    for pid, desc, ev, freq, ot, lesson in rows:
         con.execute(
             "INSERT INTO pattern_records(pattern_id, description, evidence_trace_ids, frequency, "
-            "first_seen, last_seen, output_type, status) "
-            "VALUES (?, ?, ?, ?, '2026-07-04T00:00:00.000Z', '2026-07-04T00:00:00.000Z', ?, 'observed')",
-            (pid, desc, ev, freq, ot),
+            "first_seen, last_seen, output_type, status, lesson_text) "
+            "VALUES (?, ?, ?, ?, '2026-07-04T00:00:00.000Z', '2026-07-04T00:00:00.000Z', ?, 'observed', ?)",
+            (pid, desc, ev, freq, ot, lesson),
         )
     con.commit()
     con.close()
@@ -653,11 +654,19 @@ def test_reflection_suggest_promotions(temp_db):
         assert "Pattern observed" in s["rationale"]
         assert "threshold of 3" in s["rationale"], f"bad rationale: {s['rationale']!r}"
     # JSON shape: pattern_id, description, frequency, suggested_promotion_type,
-    # evidence_trace_ids, rationale.
+    # evidence_trace_ids, lesson_text, rationale. `lesson_text` rides along so
+    # the authored lesson survives the promotion path into emergent_patterns —
+    # the description it replaces is only a cluster key.
     assert set(py_arr[0].keys()) == {
         "pattern_id", "description", "frequency", "suggested_promotion_type",
-        "evidence_trace_ids", "rationale",
+        "evidence_trace_ids", "lesson_text", "rationale",
     }
+    assert py_arr[0]["lesson_text"] == (
+        "When the verifier emits no output: treat the node as failed"
+    )
+    # A pattern no model has read yet carries no lesson, and says so with ''
+    # rather than inventing one from its label.
+    assert py_arr[1]["lesson_text"] == ""
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -729,6 +738,61 @@ def test_reflection_persist_suggestions(temp_db):
     ).fetchall()
     assert resolved == [], f"resolved_at should be NULL, got: {resolved!r}"
     con.close()
+
+
+def test_persist_suggestions_does_not_drop_an_authored_lesson(temp_db):
+    """An authored lesson survives a re-persist that carries none.
+
+    `INSERT OR REPLACE` deletes the conflicting row, so every column the new
+    INSERT does not name is lost. The induction stage writes `lesson_text`
+    directly to this table when it authors one, and the next reflect pass
+    re-persists the same pattern_id from a source that may not have been
+    re-induced yet — without the carry-forward, that would erase the lesson
+    every pass and the prompt would silently fall back to the cluster key.
+    """
+    con = sqlite3.connect(temp_db)
+    con.execute("PRAGMA busy_timeout=5000")
+    con.execute(
+        "INSERT INTO emergent_patterns(pattern_id, cluster_label, member_item_ids_json, "
+        "feature_set_json, strength_score, status, detected_at, lesson_text) "
+        "VALUES ('p-1','cluster: x','[]','[\"adr\"]',5.0,'proposed',1,"
+        "'When the verifier emits no output: treat the node as failed')"
+    )
+    con.commit()
+    con.close()
+
+    # Same pattern id, no lesson in the source — as a re-mined cluster that has
+    # not been re-induced yet would present.
+    rp.reflection_persist_suggestions(json.dumps([{
+        "pattern_id": "p-1", "description": "cluster: x", "frequency": 9,
+        "suggested_promotion_type": "adr", "evidence_trace_ids": [],
+        "lesson_text": "", "rationale": "r",
+    }]))
+
+    con = sqlite3.connect(temp_db)
+    row = con.execute(
+        "SELECT lesson_text, strength_score FROM emergent_patterns WHERE pattern_id='p-1'"
+    ).fetchone()
+    con.close()
+    assert row[0] == "When the verifier emits no output: treat the node as failed", (
+        f"the re-persist dropped the authored lesson: {row!r}"
+    )
+    # The refresh still happened — only the unnamed column is preserved.
+    assert math.isclose(row[1], 9.0, rel_tol=0, abs_tol=1e-6)
+
+    # A newly authored lesson does supersede the old one.
+    rp.reflection_persist_suggestions(json.dumps([{
+        "pattern_id": "p-1", "description": "cluster: x", "frequency": 9,
+        "suggested_promotion_type": "adr", "evidence_trace_ids": [],
+        "lesson_text": "When the verifier emits no output: abort the run",
+        "rationale": "r",
+    }]))
+    con = sqlite3.connect(temp_db)
+    after = con.execute(
+        "SELECT lesson_text FROM emergent_patterns WHERE pattern_id='p-1'"
+    ).fetchone()[0]
+    con.close()
+    assert after == "When the verifier emits no output: abort the run"
 
 
 def test_learning_loop_writeback_from_trace_cluster(temp_db):

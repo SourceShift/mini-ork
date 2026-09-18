@@ -30,6 +30,7 @@ import time
 from difflib import SequenceMatcher
 
 from mini_ork import cn_client
+from mini_ork.stores import pattern_store
 
 __all__ = [
     "reflection_extract_gradients",
@@ -385,18 +386,27 @@ def _summarize_patterns_query(db_path: str, cluster_id: str | None) -> dict:
 
 
 def _suggest_promotions_query(db_path: str, tbl: str, min_freq: int) -> list[dict]:
-    """Mirror bash suggest_promotions heredoc. Returns the suggestions array."""
+    """Mirror bash suggest_promotions heredoc. Returns the suggestions array.
+
+    ``lesson_text`` is carried through when the source table has it. Probed
+    rather than assumed: it arrives with migration 0056, and on a database that
+    predates it the suggestions must still be produced — only the lesson is
+    absent, which is the honest state.
+    """
     con = _connect(db_path)
     try:
-        rows = con.execute(
-            f"""
-            SELECT pattern_id, description, frequency, output_type, evidence_trace_ids
-            FROM {tbl}
-            WHERE frequency >= ?
-            ORDER BY frequency DESC
-            """,
-            (min_freq,),
-        ).fetchall()
+        base = (
+            f"SELECT pattern_id, description, frequency, output_type, "
+            f"evidence_trace_ids{{extra}} FROM {tbl} "
+            f"WHERE frequency >= ? ORDER BY frequency DESC"
+        )
+        try:
+            rows = con.execute(base.format(extra=", lesson_text"), (min_freq,)).fetchall()
+        except sqlite3.OperationalError:
+            rows = [
+                (r[0], r[1], r[2], r[3], r[4], None)
+                for r in con.execute(base.format(extra=""), (min_freq,)).fetchall()
+            ]
     finally:
         con.close()
     suggestions: list[dict] = []
@@ -410,6 +420,7 @@ def _suggest_promotions_query(db_path: str, tbl: str, min_freq: int) -> list[dic
                 "frequency": r[2],
                 "suggested_promotion_type": r[3],
                 "evidence_trace_ids": ev,
+                "lesson_text": (r[5] or "").strip() if len(r) > 5 else "",
                 "rationale": (
                     f"Pattern observed {r[2]} times — meets promotion threshold of {min_freq}"
                 ),
@@ -447,10 +458,31 @@ def _persist_suggestions_upsert(db_path: str, suggestions_json: str) -> int:
                 status               TEXT NOT NULL DEFAULT 'proposed'
                                      CHECK(status IN ('proposed','approved','rejected','superseded')),
                 detected_at          INTEGER NOT NULL,
-                resolved_at          INTEGER
+                resolved_at          INTEGER,
+                lesson_text          TEXT
             )
             """
         )
+        # An existing table predating 0056 needs the column before the INSERT
+        # below can name it. Reuses the same guarded ALTER the induction stage
+        # uses, over this connection: opening a second one here would block on
+        # the write lock this transaction holds and silently do nothing.
+        pattern_store.add_lesson_column(con, "emergent_patterns")
+        # INSERT OR REPLACE deletes the conflicting row and inserts a new one,
+        # so any column the new INSERT does not name is *lost*. A re-mined
+        # cluster that has not been re-induced would lose its authored lesson
+        # on every pass. Carrying the prior value forward is what makes the
+        # lesson durable rather than until-next-reflect.
+        try:
+            prior_lessons = {
+                str(r[0]): r[1]
+                for r in con.execute(
+                    "SELECT pattern_id, lesson_text FROM emergent_patterns "
+                    "WHERE COALESCE(lesson_text,'') != ''"
+                ).fetchall()
+            }
+        except sqlite3.OperationalError:
+            prior_lessons = {}
         now = int(time.time())
         persisted = 0
         for s in suggestions:
@@ -479,13 +511,14 @@ def _persist_suggestions_upsert(db_path: str, suggestions_json: str) -> int:
             ]
             features = [output_type] if output_type else []
             rationale = s.get("rationale") or None
+            lesson = (s.get("lesson_text") or "").strip() or prior_lessons.get(str(pid))
             con.execute(
                 """
                 INSERT OR REPLACE INTO emergent_patterns
                     (pattern_id, cluster_label, member_item_ids_json,
                      feature_set_json, strength_score, suggested_meta_adr,
-                     status, detected_at, resolved_at)
-                VALUES (?,?,?,?,?,?,?,?,NULL)
+                     status, detected_at, resolved_at, lesson_text)
+                VALUES (?,?,?,?,?,?,?,?,NULL,?)
                 """,
                 (
                     pid,
@@ -496,6 +529,7 @@ def _persist_suggestions_upsert(db_path: str, suggestions_json: str) -> int:
                     rationale,
                     "proposed",
                     now,
+                    lesson,
                 ),
             )
             persisted += 1
