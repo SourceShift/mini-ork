@@ -79,6 +79,7 @@ apply_impl_output = _execute_delegate("apply_impl_output")
 charge_node_cost = _execute_delegate("charge_node_cost")
 dispatch_chain = _execute_delegate("dispatch_chain")
 finish_reason_for_failure = _execute_delegate("finish_reason_for_failure")
+last_route_provenance = _execute_delegate("last_route_provenance")
 node_env_overrides = _execute_delegate("node_env_overrides")
 policy_route_lane = _execute_delegate("policy_route_lane")
 publisher_node = _execute_delegate("publisher_node")
@@ -153,10 +154,21 @@ def dispatch_node(fields, *, root, run_dir, plan_path, task_class, db, run_id,
     # which the runtime treats as rerun (design §4 fail-closed).
     _base_checkpoint = checkpoint_fn or (lambda *a, **k: None)
 
+    # Provenance of the routing decision that produced ``lane`` — read from the
+    # context the policy layer just wrote. Persisting it is what lets an outcome
+    # be credited to (or debited from) the decision that caused it; without it a
+    # learned route, an explore swap, and a recipe pin are indistinguishable
+    # after the fact.
+    _route_prov = last_route_provenance()
+
     # Bind the resolved lane into every trace() call so agent_version_id is stamped
     # (bash passes the shell var dispatch_lane into _trace_write_node_rich's payload).
     def trace(node_id, status, node_type, output_file="", verdict="", finish_reason=""):
-        _base_trace(node_id, status, node_type, output_file, verdict, finish_reason, lane=lane)
+        _base_trace(node_id, status, node_type, output_file, verdict, finish_reason,
+                    lane=lane,
+                    route_source=_route_prov.get("route_source", ""),
+                    route_explore=bool(_route_prov.get("route_explore")),
+                    route_score=_route_prov.get("route_score"))
         # F4: publish the durable checkpoint at the SAME single seam as the
         # trace write. The wrapper unifies node-completion side effects so
         # E2's recovery code can rely on every success also having a row.

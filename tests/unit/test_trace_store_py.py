@@ -234,3 +234,51 @@ def test_write_fail_closed(tmp_path, monkeypatch):
     monkeypatch.delenv("MINI_ORK_DB", raising=False)
     with pytest.raises(RuntimeError):
         trace_store.trace_write({"task_class": "x"})
+
+
+def test_route_provenance_roundtrip(tmp_path):
+    """route_source / route_explore / route_score survive a WRITE, are replaced by
+    an UPSERT that states them, and are PRESERVED by a re-write that does not.
+
+    The three-place edit hazard this covers: a column added to the INSERT list but
+    omitted from ON CONFLICT would pass the insert assertions and silently drop
+    provenance on every re-write — which is the common path, since trace_write is
+    an UPSERT."""
+    db = _init_db(tmp_path / "route-home")
+    trace_store.trace_write({
+        "trace_id": "tr-route", "task_class": "code-fix", "status": "success",
+        "agent_version_id": "glm_lens",
+        "route_source": "learned", "route_explore": True, "route_score": 0.4213,
+    }, db=db)
+    row = trace_store.trace_get("tr-route", db=db)
+    assert row["route_source"] == "learned"
+    assert row["route_explore"] == 1
+    assert row["route_score"] == pytest.approx(0.4213)
+
+    # UPSERT that states provenance overwrites it.
+    trace_store.trace_write({
+        "trace_id": "tr-route", "task_class": "code-fix", "status": "failure",
+        "route_source": "explore", "route_explore": False, "route_score": 1.5,
+    }, db=db)
+    row = trace_store.trace_get("tr-route", db=db)
+    assert row["route_source"] == "explore"
+    assert row["route_explore"] == 0
+    assert row["route_score"] == pytest.approx(1.5)
+
+    # Re-write with no provenance leaves the recorded decision alone (COALESCE).
+    trace_store.trace_write(
+        {"trace_id": "tr-route", "task_class": "code-fix", "status": "success"}, db=db)
+    row = trace_store.trace_get("tr-route", db=db)
+    assert row["route_source"] == "explore"
+    assert row["route_explore"] == 0
+    assert row["route_score"] == pytest.approx(1.5)
+
+    # route_explore=False is a real observation (0), not "unknown" (NULL).
+    trace_store.trace_write({
+        "trace_id": "tr-route-default", "task_class": "code-fix",
+        "status": "success", "route_source": "default", "route_explore": False,
+    }, db=db)
+    row = trace_store.trace_get("tr-route-default", db=db)
+    assert row["route_source"] == "default"
+    assert row["route_explore"] == 0
+    assert row["route_score"] is None

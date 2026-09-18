@@ -58,7 +58,8 @@ def home(tmp_path: Path) -> Path:
             objective_domain TEXT, segment TEXT, reward_primary_metric TEXT,
             reward_direction TEXT, reward_value REAL, reward_anchor REAL,
             reward_g REAL, reward_vector_json TEXT, reward_source TEXT,
-            validity TEXT
+            validity TEXT, route_source TEXT, route_explore INTEGER,
+            route_score REAL
         );
         """
     )
