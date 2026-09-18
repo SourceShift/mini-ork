@@ -26,6 +26,7 @@ import argparse
 import importlib.util
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -61,6 +62,14 @@ def _default_spawn_fn(plan_entry: dict[str, Any]) -> dict[str, Any]:
 
     Honors ``MO_GOAL_SPAWN_DRY=1`` (dry-run) and the per-unit caps by letting
     the spawn API raise ``ValueError`` (caller marks ``deferred``).
+
+    Per-unit kickoff templating (U4c): when ``kickoff_text`` is a file path
+    AND contains no ``{{unit_id}}``/``{{reason}}`` placeholders, the original
+    path is passed through unchanged. Otherwise the body is materialized
+    per-unit into ``<run_dir>/_inline_kickoff_<slug>.md`` where ``slug`` is a
+    filesystem-safe rendering of the unit id (unit ids are usually relative
+    FILE PATHS containing ``/`` — the previous f-string filename silently broke
+    on them).
     """
     if os.environ.get("MO_GOAL_SPAWN_DRY", "").strip() == "1":
         return {
@@ -83,14 +92,27 @@ def _default_spawn_fn(plan_entry: dict[str, Any]) -> dict[str, Any]:
             "or include kickoff_hint.kickoff in sweep-plan entry)"
         )
 
-    if os.path.isfile(kickoff_text):
+    is_file_source = os.path.isfile(kickoff_text)
+    if is_file_source:
+        body = Path(kickoff_text).read_text(encoding="utf-8")
+    else:
+        body = kickoff_text
+
+    unit = str(plan_entry.get("unit_id", "") or "")
+    reason = str((plan_entry.get("kickoff_hint") or {}).get("reason", "") or "")
+    materialized = (
+        body.replace("{{unit_id}}", unit).replace("{{reason}}", reason)
+    )
+
+    if is_file_source and materialized == body:
+        # No placeholders + file source → pass the original file path
+        # unchanged (zero-regression shortcut for the common static template).
         kickoff_path = kickoff_text
     else:
-        # Treat the hint as inline kickoff body — write to a temp file next
-        # to the run dir and pass that path to spawn.
         run_dir = os.environ.get("MINI_ORK_RUN_DIR", ".")
-        kickoff_path = os.path.join(run_dir, f"_inline_kickoff_{plan_entry.get('unit_id','x')}.md")
-        Path(kickoff_path).write_text(kickoff_text, encoding="utf-8")
+        slug = re.sub(r"[^A-Za-z0-9._-]", "_", unit)[:80] or "x"
+        kickoff_path = os.path.join(run_dir, f"_inline_kickoff_{slug}.md")
+        Path(kickoff_path).write_text(materialized, encoding="utf-8")
 
     result = spawn(
         parent_run=run_id,
