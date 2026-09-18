@@ -46,16 +46,19 @@ def test_builtin_evaluation_unchanged(tmp_path):
 _ORACLE_GATE_NAMES = {
     "coalition", "liveness", "panel-health", "stability", "synthesis-promote"}
 
+#: Registered natives that are NOT oracle gates. Both are seeded with a NULL
+#: task-class filter and safety=0: they are measurements of the artifact that
+#: every run should carry in its verdict, not publish blockers.
+_NON_ORACLE_GATE_NAMES = {"mutation-adversary", "step-rules"}
+
 
 def test_native_gate_names_registered():
     from mini_ork.gates import native_gates
 
-    # mutation-adversary is registered here but is NOT one of the oracle gates:
-    # it is seeded scoped to its own task class, so it joins only the runs that
-    # opted in. Asserting the exact set (rather than a superset) keeps a silent
-    # removal of any name caught.
+    # Asserting the exact set (rather than a superset) keeps a silent removal of
+    # any name caught.
     assert set(native_gates.NATIVE_GATE_EVALUATORS) == (
-        _ORACLE_GATE_NAMES | {"mutation-adversary"})
+        _ORACLE_GATE_NAMES | _NON_ORACLE_GATE_NAMES)
 
 
 def test_resolve_native_evaluator_sentinel_and_script_path():

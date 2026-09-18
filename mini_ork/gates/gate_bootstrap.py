@@ -2,9 +2,9 @@
 
 Registers the 5 oracle gates (coalition, panel-health, synthesis-promote,
 stability, liveness) into the gate_registry table if not already present, plus
-the scoped mutation-adversary gate (see ``_MUTATION_GATE_ID``; not part of the
-oracle-* family, and inert for every task class but its own). Idempotent.
-Fail-open — rc=0 even on partial failures (matches bash semantics).
+the mutation-adversary gate (see ``_MUTATION_GATE_ID``; outside the oracle-*
+family, and applicable to every task class). Idempotent. Fail-open — rc=0 even
+on partial failures (matches bash semantics).
 
 WS4 (bash-removal): conditions are now ``native:<name>`` sentinels that
 ``gate_registry`` maps to the in-process evaluators in
@@ -65,21 +65,46 @@ _STABLE_IDS = {
     "liveness": "oracle-liveness",
 }
 
-# The mutation-adversary gate is seeded OUTSIDE the oracle-* family on purpose.
+# The mutation-adversary gate is seeded OUTSIDE the oracle-* family, and it
+# applies to every task class.
 #
-# ``gate_run_all`` treats every non-pass verdict as ``all_pass=False``, and
-# ``cli/verify.py`` reads that as a failing gate — so a gate that defers when no
-# campaign ran would push a healthy verify from ``pass`` to ``partial``. The 5
-# oracle gates avoid this only because they defer *together* when the run has no
-# panel evidence yet; a sixth that defers alone is a regression, not a check.
+# It used to be scoped to ``task_class_filter='mutation-adversary'`` for one
+# reason: ``gate_run_all`` counted every non-pass verdict as ``all_pass=False``
+# and ``cli/verify.py`` read that as a failing gate, so a gate that deferred
+# when no campaign ran would push a healthy verify from ``pass`` to
+# ``partial``. The 5 oracle gates escaped that only because they defer
+# *together* when a run has no panel evidence yet; a sixth deferring alone was
+# a regression, not a check.
 #
-# ``task_class_filter`` is the schema's own scoping mechanism (gate_list matches
-# ``task_class_filter IS NULL OR task_class_filter=?``), so a campaign can opt
-# into the gate by running under this task class and every other task class is
-# untouched.
+# That conflation is fixed at the source: ``gate_run_all`` now reports
+# ``any_fail`` separately from ``any_defer`` and ``verify.py`` reads the failure
+# signal, so an unrun check no longer reads as a failed one. With that gone the
+# scoping has nothing left to do, and the gate joins real task classes — which
+# is the whole point, since a coverage gap in the suite is a property of the
+# *recipe's* verifier, not of one task class.
+#
+# ``safety=0`` is unchanged: the kill rate is a measurement, not a publish
+# blocker. A low kill rate surfaces in ``verify``'s verdict without gaining the
+# power to refuse a publish.
 _MUTATION_GATE_ID = "mutation-adversary-gate"
 _MUTATION_GATE_NAME = "mutation-adversary"
-_MUTATION_TASK_CLASS = "mutation-adversary"
+#: The filter earlier seeds used. Kept only to repair those rows in place.
+_MUTATION_GATE_LEGACY_FILTER = "mutation-adversary"
+
+# The step-rules gate (VPRMs, ``step_rules.py``) is seeded the same way and for
+# the same reason: it is a property of the artifact, not of a task class, so it
+# is scoped to NULL and joins every run. It is the rule-based counterpart to the
+# mutation campaign — where that one measures whether the suite *would* catch a
+# wrong patch, this one looks a wrong patch in the face (a diff that will not
+# apply, a verifier that names a file the target does not have) with no model in
+# the loop and no sample to average over.
+#
+# ``safety=0`` matches: a rule failing is a finding about the artifact that the
+# verdict must show, not a veto over publishing. The rules cover only steps
+# somebody wrote a rule for, and a rule with no input defers, so this gate spends
+# most of its life unmeasured and says so.
+_STEP_RULES_GATE_ID = "step-rules-gate"
+_STEP_RULES_GATE_NAME = "step-rules"
 
 
 def _count(con: sqlite3.Connection, where: str, params: tuple = ()) -> int:
@@ -120,7 +145,21 @@ def bootstrap_oracle_gates(db: str | None = None,
             now = int(time.time())
             have_oracle = _count(con, "gate_id LIKE 'oracle-%'") >= 5
             have_mutation = _count(con, "gate_id = ?", (_MUTATION_GATE_ID,)) >= 1
-            if have_oracle and have_mutation:
+            have_step_rules = _count(
+                con, "gate_id = ?", (_STEP_RULES_GATE_ID,)) >= 1
+
+            # Repair a row seeded while defer still counted as failure. This
+            # has to run before the early return below: a DB that already has
+            # every family present would otherwise take that return and keep
+            # the gate inert for every real task class forever.
+            con.execute(
+                "UPDATE gate_registry SET task_class_filter=NULL "
+                "WHERE gate_id=? AND task_class_filter=?",
+                (_MUTATION_GATE_ID, _MUTATION_GATE_LEGACY_FILTER),
+            )
+
+            if have_oracle and have_mutation and have_step_rules:
+                con.commit()
                 return 0
 
             if not have_oracle:
@@ -155,18 +194,17 @@ def bootstrap_oracle_gates(db: str | None = None,
                     "WHERE gate_id LIKE 'oracle-%' AND task_class_filter=''"
                 )
 
-            if not have_mutation:
-                # safety=0: the kill rate is a measurement, not a publish
-                # blocker. It becomes visible through gate_run_all's summary
-                # (and so through cli/verify.py's verdict) without gaining the
-                # power to refuse a publish.
+            # Both non-oracle gates: NULL filter (they join every task class)
+            # and safety=0 (each is a measurement that belongs in the verdict,
+            # not a publish blocker).
+            for gid, gname in ((_MUTATION_GATE_ID, _MUTATION_GATE_NAME),
+                               (_STEP_RULES_GATE_ID, _STEP_RULES_GATE_NAME)):
                 con.execute(
                     "INSERT OR IGNORE INTO gate_registry "
                     "(gate_id, gate_type, condition, task_class_filter, "
                     " safety, active, registered_at) "
-                    "VALUES (?, 'custom', ?, ?, 0, 1, ?)",
-                    (_MUTATION_GATE_ID, native_condition(_MUTATION_GATE_NAME),
-                     _MUTATION_TASK_CLASS, now),
+                    "VALUES (?, 'custom', ?, NULL, 0, 1, ?)",
+                    (gid, native_condition(gname), now),
                 )
 
             con.commit()

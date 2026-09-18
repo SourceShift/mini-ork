@@ -401,6 +401,7 @@ def gate_run_all(
         {
           "task_class":       <str>,
           "all_pass":         <bool>,
+          "any_fail":         <bool>,
           "any_defer":        <bool>,
           "safety_violation": <bool>,
           "gate_count":       <int>,
@@ -410,12 +411,25 @@ def gate_run_all(
             ...
           ],
         }
+
+    The three top-level verdict flags decompose cleanly, which is what makes
+    them safe to reason about: ``all_pass`` is exactly ``not any_fail and not
+    any_defer``. A consumer that wants "did anything actually fail" must read
+    ``any_fail``, not ``all_pass``.
+
+    Which one a consumer wants depends on what it is deciding. A *verdict on an
+    artifact* (`cli/verify.py`) asks "did a check fail?" — an unrun check is not
+    a defect in the artifact, so a deferred gate must not turn a clean run red.
+    A *promotion* asks "may this become permanent?", where an unavailable check
+    must not resolve to permission; that boundary is enforced separately and
+    fails closed (`promotion_gate._cw_por_compute`), because a promote is
+    irreversible and a verify verdict is not.
     """
     ensure_table(db_path)
     gates = gate_list(db_path, task_class=task_class)
 
     results: list[dict[str, Any]] = []
-    all_pass = True
+    any_fail = False
     any_defer = False
     safety_fail = False
 
@@ -431,8 +445,8 @@ def gate_run_all(
             mini_ork_root=mini_ork_root,
         )
 
-        if verdict != "pass":
-            all_pass = False
+        if verdict == "fail":
+            any_fail = True
         if verdict == "defer":
             any_defer = True
         if verdict == "fail" and safety:
@@ -454,7 +468,10 @@ def gate_run_all(
 
     return {
         "task_class": task_class_ctx,
-        "all_pass": all_pass,
+        # Derived, not bookkept: a verdict is "not pass" exactly when it was a
+        # fail or a defer, so the decomposition holds by construction.
+        "all_pass": not any_fail and not any_defer,
+        "any_fail": any_fail,
         "any_defer": any_defer,
         "safety_violation": safety_fail,
         "gate_count": len(results),
