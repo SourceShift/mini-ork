@@ -321,7 +321,11 @@ def dispatch_node(fields, *, root, run_dir, plan_path, task_class, db, run_id,
     plan_content = open(plan_path).read() if plan_path and os.path.isfile(plan_path) else ""
     # F5-B: reflect-learned failure modes + operator steering, injected after node_desc
     # in the LLM prompts (the read side of the learning loop). Empty for non-LLM nodes.
-    learned = _learned_block(root, task_class, node_type)
+    # The routed ``lane`` and the ``node_id`` travel with the injection so the
+    # retrieval ledger can attribute the memory spend to the decision that
+    # caused it (LIMBO); note ``node_id`` is a local here — the env publish that
+    # would make it ambient happens on the next line, too late for this call.
+    learned = _learned_block(root, task_class, node_type, lane, node_id)
     # Publish the per-node identity + clear any stale resume session in one
     # canonical step (None removes the variable).
     publish_env(node_env_overrides(

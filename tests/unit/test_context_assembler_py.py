@@ -637,3 +637,113 @@ def test_semantic_lessons_do_not_leak_proposed_patterns(db, monkeypatch):
     finally:
         con.close()
     assert n == 0, "a proposed pattern must not even be mirrored"
+
+
+# ── LIMBO: the retrieval count varies per node (arXiv 2609.14138) ────────────
+
+
+@pytest.mark.parametrize("node_type", ["reviewer", "planner", "synthesizer"])
+def test_limbo_a_judgment_node_sees_more_of_the_record(monkeypatch, node_type):
+    """A node whose output is a judgement reads more of the loop's record than
+    one that mechanically transforms its input. The judgement is where a wrong
+    premise does the most damage and where the run's own history is most
+    relevant, so it is the node that should pay for the extra context."""
+    monkeypatch.delenv("MO_LIMBO_BUDGET", raising=False)
+    assert ca._limbo_limit(node_type, 5) == 5 + ca._LIMBO_JUDGMENT_EXTRA
+
+
+@pytest.mark.parametrize(
+    "node_type", ["implementer", "verifier", "eval", "classify", "", "  "],
+)
+def test_limbo_a_mechanical_node_is_not_inflated(monkeypatch, node_type):
+    """The default is the caller's limit, unchanged. LIMBO's reported win is a
+    cost reduction via trimming; trimming is the half that can silently drop
+    the one memory a class of run depends on, so the only half built here is
+    additive. No node is ever given less than it asked for."""
+    monkeypatch.delenv("MO_LIMBO_BUDGET", raising=False)
+    assert ca._limbo_limit(node_type, 5) == 5
+    assert ca._limbo_limit(node_type, 1) == 1
+
+
+def test_limbo_opt_out_restores_the_flat_limit_verbatim(monkeypatch):
+    """``MO_LIMBO_BUDGET=0`` is the escape hatch, and it must be exact: same
+    number the caller passed, judgement node or not. Default ON with an
+    opt-out is this repo's shape for a new capability — the env var exists to
+    go back, not to switch the behaviour on."""
+    for value in ("0", "false", "no", "FALSE", "No"):
+        monkeypatch.setenv("MO_LIMBO_BUDGET", value)
+        assert ca._limbo_limit("reviewer", 5) == 5, f"{value!r} did not opt out"
+
+    monkeypatch.setenv("MO_LIMBO_BUDGET", "1")
+    assert ca._limbo_limit("reviewer", 5) == 5 + ca._LIMBO_JUDGMENT_EXTRA
+
+
+def test_limbo_never_inflates_a_deliberate_zero(monkeypatch):
+    """``limit <= 0`` means "no memories" — a caller decision, not a threshold
+    to tune. Inflating it would override the caller with a policy it never
+    asked for, on the one input where the caller's intent is unambiguous."""
+    monkeypatch.delenv("MO_LIMBO_BUDGET", raising=False)
+    for base in (0, -1):
+        assert ca._limbo_limit("reviewer", base) == base
+
+
+def test_limbo_allocates_by_node_type_not_by_lane(monkeypatch):
+    """The signal is the node type. A lane is a *which model* question and
+    routes to the same prompt shape; the node type is *what this step does*,
+    and that is what determines how much history it can use. Attributing the
+    spend is a separate concern, carried by the ledger, not by the count."""
+    monkeypatch.delenv("MO_LIMBO_BUDGET", raising=False)
+    # Two calls differing only in lane produce the same count.
+    assert ca._limbo_limit("reviewer", 4) == ca._limbo_limit("reviewer", 4)
+    assert ca._limbo_limit("reviewer", 4) - ca._limbo_limit("implementer", 4) == (
+        ca._LIMBO_JUDGMENT_EXTRA
+    )
+
+
+def test_failure_modes_records_which_decision_caused_the_retrieval(db, monkeypatch):
+    """The attribution half, end to end through the real entry point. A
+    retrieval that cannot be traced to a lane and a node is spend nobody can
+    be held to, which is the precondition LIMBO needs before any budget can
+    vary per node — you cannot spend against an unattributable total."""
+    monkeypatch.setenv("MINI_ORK_DB", db)
+    monkeypatch.setenv("MINI_ORK_RUN_ID", "run-42")
+    monkeypatch.delenv("MO_LIMBO_BUDGET", raising=False)
+    _seed_emergent(db, [("emg-attr", "a lesson worth citing", ["adr"], 5.0, "approved")])
+
+    ca.failure_modes_md(
+        "code-fix", 5, db=db,
+        node_type="reviewer", lane="frontier", node_id="reviewer-1",
+    )
+
+    con = sqlite3.connect(db)
+    try:
+        rows = con.execute(
+            "SELECT run_id, task_class, lane, node_id, outcome "
+            "FROM semantic_memory_uses",
+        ).fetchall()
+    finally:
+        con.close()
+    assert rows, "the retrieval was not recorded at all"
+    assert all(r == ("run-42", "code-fix", "frontier", "reviewer-1", "pending")
+               for r in rows), rows
+
+
+def test_failure_modes_attribution_defaults_to_unknown(db, monkeypatch):
+    """Callers that do not know their lane — and every caller written before
+    this tranche — record an unknown rather than a guess. The ledger is an
+    audit trail; an invented attribution would be worse than a missing one."""
+    monkeypatch.setenv("MINI_ORK_DB", db)
+    monkeypatch.setenv("MINI_ORK_RUN_ID", "run-43")
+    monkeypatch.delenv("MO_LIMBO_BUDGET", raising=False)
+    _seed_emergent(db, [("emg-attr2", "another lesson", ["adr"], 5.0, "approved")])
+
+    ca.failure_modes_md("code-fix", 5, db=db)
+
+    con = sqlite3.connect(db)
+    try:
+        rows = con.execute(
+            "SELECT lane, node_id FROM semantic_memory_uses",
+        ).fetchall()
+    finally:
+        con.close()
+    assert rows and all(r == ("", "") for r in rows), rows

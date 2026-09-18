@@ -1730,10 +1730,19 @@ def _assemble_reviewer_inputs(run_dir):
     return block
 
 
-def _learned_block(root, task_class, node_type):
+def _learned_block(root, task_class, node_type, lane="", node_id=""):
     """F5-B (bash _dispatch_node:2357-2382): inject reflect-learned failure modes +
     unconsumed operator-steering messages into LLM node prompts — the READ side of
-    the learning loop. Empty when opt-out or for a non-LLM node."""
+    the learning loop. Empty when opt-out or for a non-LLM node.
+
+    ``lane`` and ``node_id`` are the identity of the dispatch that is asking.
+    They are recorded on the retrieval ledger alongside the injected memories so
+    the memory spend this block costs is attributable to the routed lane and the
+    node that chose it (LIMBO, arXiv 2609.14138) instead of being invisible;
+    they do not change which memories come back. ``node_type`` also sets the
+    retrieval count — a judgment node sees more of the loop's record than a
+    mechanical one (see context_assembler._limbo_limit).
+    """
     if os.environ.get("MO_INJECT_LEARNINGS", "1") != "1":
         return ""
     if node_type not in ("researcher", "implementer", "reviewer"):
@@ -1743,7 +1752,8 @@ def _learned_block(root, task_class, node_type):
     try:
         from mini_ork import context_assembler
         fm = context_assembler.failure_modes_md(
-            task_class or "generic", 5, db=os.environ.get("MINI_ORK_DB")
+            task_class or "generic", 5, db=os.environ.get("MINI_ORK_DB"),
+            node_type=node_type, lane=lane, node_id=node_id,
         ).strip()
         if fm:
             block = "\n\n" + fm + "\n"
