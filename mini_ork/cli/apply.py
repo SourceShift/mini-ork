@@ -334,8 +334,9 @@ def evaluate_gate(candidate_id: str, utility_before: float,
                   utility_after: float, pertask_json: str = "") -> str:
     """Apply the non-regression gate to a candidate with two utility numbers.
 
-    Returns a JSON line: {"decision":"promoted"|"quarantined"|
-    "pending_human_approval"|"rejected", "rationale":"...", ...}.
+    Returns a JSON line: {"decision":"promoted"|"quarantined"|"rejected",
+    "rationale":"...", ...}. There is no human gate: every non-promote is a
+    quarantine or a rejection, recorded with its reason.
 
     Candidates are only PROMOTED when utility_after >= utility_before (no
     regression), with a configurable delta threshold. Below threshold →
@@ -344,13 +345,18 @@ def evaluate_gate(candidate_id: str, utility_before: float,
     (MO_APPLY_PERTASK_JSON), previously-PASSING held-out tasks that now FAIL
     block promotion past MO_APPLY_REGRESSION_TOLERANCE regardless of the
     aggregate (arXiv 2607.14004).
+
+    Per-task vectors also raise the promote bar from "no regression" to "a
+    measured improvement": with a real held-out measurement in hand, a delta of
+    exactly the threshold means the candidate is indistinguishable from the
+    baseline, and equality is not evidence. The scalar-only path (no vectors)
+    keeps the historical ``delta >= dt`` rule.
     """
     del candidate_id  # bash accepted it positionally but never used it
     ub = float(utility_before)
     ua = float(utility_after)
     dt = float(os.environ.get("MO_APPLY_NONREGRESSION_DELTA", "0.0"))
     me = int(os.environ.get("MO_APPLY_MIN_EXAMPLES", "1"))
-    ha = os.environ.get("MINI_ORK_REQUIRE_HUMAN_APPROVAL", "false").lower() == "true"
     regress_tol = int(os.environ.get("MO_APPLY_REGRESSION_TOLERANCE", "0"))
 
     delta = ua - ub
@@ -376,6 +382,16 @@ def evaluate_gate(candidate_id: str, utility_before: float,
             regressed = -1  # malformed vector → treat as absent, never crash the gate
 
     has_pertask_regression = regressed > regress_tol
+    measured = regressed >= 0  # per-task vectors present == a real held-out run happened
+
+    # For a MEASURED candidate, equality is not evidence. delta == dt means the
+    # candidate's publish rate over the probe set is indistinguishable from the
+    # baseline's — and "indistinguishable" is exactly what a directive that does
+    # nothing produces, as does a probe harness where every probe fails in both
+    # arms. Promoting there is a promote on no evidence, recorded in the audit
+    # trail identically to a measured improvement. The scalar-only path
+    # (regressed < 0, no per-task data) keeps its historical delta >= dt rule.
+    improved = delta > dt if measured else delta >= dt
 
     # ── decision rule ───────────────────────────────────────────────────────
     if has_pertask_regression:
@@ -387,33 +403,39 @@ def evaluate_gate(candidate_id: str, utility_before: float,
                      f"{delta:+.4f} but the candidate regresses solved work{_ids} "
                      f"(2607.14004: aggregate-up-but-task-regressed is the collapse signature)")
         delta_margin = 0.0
-        needs_human = False
-    elif delta >= dt:
+    elif improved:
         decision = "promoted"
         rationale = (f"non-regression cleared: utility_after={ua:.4f} >= "
                      f"utility_before={ub:.4f} (delta={delta:+.4f} >= threshold={dt:+.4f})")
         if regressed == 0:
             rationale += "; 0 per-task regressions"
         delta_margin = 0.0
-        needs_human = False
-    elif abs(delta - dt) < 0.02 and not ha:
-        # Utility is within measurement noise of the baseline AND we are NOT
-        # already in a human-approval-required mode → ask for human review.
-        decision = "pending_human_approval"
-        rationale = f"ambiguous delta={delta:+.4f} (threshold={dt:+.4f}); requesting human review"
+    elif measured:
+        # A real held-out measurement ran and it found no gain. Quarantined: there
+        # is nothing for a human to adjudicate — the measurement answered the
+        # question, and the answer was "no difference".
+        decision = "quarantined"
+        rationale = (f"no measured improvement: utility_after={ua:.4f} == "
+                     f"utility_before={ub:.4f} over the held-out probe set "
+                     f"(delta={delta:+.4f} <= threshold={dt:+.4f}, 0 regressions); "
+                     f"a measured candidate must strictly beat the baseline to promote")
         delta_margin = 0.0
-        needs_human = True
+    elif abs(delta - dt) < 0.02:
+        # Scalar path only: utility is within measurement noise of the baseline
+        # and there is no per-task vector to resolve it either way. An ambiguous
+        # measurement is simply not promotable — there is no human in this loop
+        # to break the tie (see the module docstring on the RSI posture). This
+        # feeds _previously_failed, so an ambiguous directive is never re-proposed.
+        decision = "quarantined"
+        rationale = (f"ambiguous delta={delta:+.4f} (threshold={dt:+.4f}): within "
+                     f"measurement noise of the baseline and no per-task vector to "
+                     f"resolve it; not promotable without a measured improvement")
+        delta_margin = 0.0
     else:
         decision = "quarantined"
         rationale = (f"regression: utility_after={ua:.4f} < utility_before={ub:.4f} "
                      f"(delta={delta:+.4f} < threshold={dt:+.4f})")
         delta_margin = 0.0
-        needs_human = False
-
-    if needs_human or ha:
-        # Honor human-approval override at the very end so override beats all rules.
-        decision = "pending_human_approval"
-        rationale = "human approval required (MINI_ORK_REQUIRE_HUMAN_APPROVAL=true)"
 
     result = {
         "decision": decision,
@@ -425,7 +447,6 @@ def evaluate_gate(candidate_id: str, utility_before: float,
         "min_examples": me,
         "regressed_tasks": regressed,          # -1 = no per-task data (scalar-only path)
         "regression_tolerance": regress_tol,
-        "needs_human": needs_human or ha,
     }
     return json.dumps(result)
 
@@ -815,7 +836,14 @@ def apply_run(task_class: str, target_kind: str, target_name: str,
     #    no-regression gate can block a candidate that regresses a
     #    previously-solved task even when the aggregate improved (2607.14004).
     if probe_unmeasured:
-        gate_decision = "pending_human_approval"
+        # quarantine, not pending_human_approval: there is no human in this loop
+        # (see the module docstring on the RSI posture). An unmeasured candidate is
+        # never promotable, and the reason travels with the row either way.
+        # Consequence, and it is intended: a quarantine feeds _previously_failed,
+        # so this directive is not re-proposed. That is the containment — a sweep
+        # over a target with a dead harness would otherwise re-launch real probe
+        # runs every cycle, and re-proposing never becomes a measurement.
+        gate_decision = "quarantined"
         if probe_dead_arms:
             gate_rationale = ("probe scorer: BOTH arms failed every probe "
                               "(before=0.00 after=0.00) — the probe launches are "
@@ -853,9 +881,9 @@ def apply_run(task_class: str, target_kind: str, target_name: str,
         gate_rationale = (f"refusing promote: scorer={scorer} fabricates utility "
                           f"(no real held-out measurement); {gate_rationale}")
 
-    # 5. Promotion record (audit). For quarantined / pending_human_approval
-    #    decisions the promotion row still exists (it's the audit trail of
-    #    why we did NOT promote).
+    # 5. Promotion record (audit). For a non-promoted decision (quarantined /
+    #    rejected) the promotion row still exists (it's the audit trail of why
+    #    we did NOT promote).
     promotion_id = record_promotion(
         candidate_id, utility_before, utility_after,
         gate_decision, gate_rationale, db=db)

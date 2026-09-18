@@ -67,7 +67,7 @@ independently surfaced the feature.
 
 ## Verification & gates (11 features)
 - **Gate registry (8 types, OCP)** — `deterministic_verifier|reviewer_gate|human_gate|budget_gate|scope_gate|deployment_gate|liveness_gate|custom`; `register_gate_evaluator` extends — `mini_ork/gates/gate_registry.py:117` (`gate_register`), `mini_ork/gates/gate_registry.py:67` (`_VALID_GATE_TYPES`). [CONSENSUS: 3/4] [shipped]
-- **Promotion gate** — decision tree require_human→pending / not-all-pass→rejected / Δutility≤0→quarantined / else promoted → `promotion_records` — `mini_ork/gates/promotion_gate.py:143` (`promotion_evaluate`), `mini_ork/cli/promote.py:49`. [CONSENSUS: 3/4] [shipped]
+- **Promotion gate** — decision tree no-measurement→rejected / not-all-pass→rejected / Δutility≤0→quarantined / else promoted → `promotion_records`. No human branch: `require_human` and its env var were removed, a fabricated-scorer promote is quarantined, and a measured candidate must strictly beat the baseline — `mini_ork/gates/promotion_gate.py:147` (`promotion_evaluate`), `mini_ork/cli/apply.py:333` (`evaluate_gate`), `mini_ork/cli/promote.py:49`. [CONSENSUS: 3/4] [shipped]
 - **Native oracle gates (in-process)** — `native:<name>` sentinels evaluated without bash spawn; `gate_bootstrap` seeds them — `mini_ork/gates/native_gates.py:1`, `mini_ork/gates/gate_registry.py:252`. [CONSENSUS: 2/4] [shipped]
 - **Verifier dispatcher** — recipe verifiers + extension `.py`/`.sh` + required-artifact assertion + gate hookup — `mini_ork/cli/verify.py:130`, `mini_ork/cli/verify.py:185`. [CONSENSUS: 2/4] [shipped]
 - **Per-recipe verifier scripts** — canonical typecheck+test verifier-pair topology — `recipes/code-fix/workflow.yaml:33`. [CONSENSUS: 2/4] [shipped]
