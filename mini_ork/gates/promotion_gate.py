@@ -448,18 +448,26 @@ def _cw_por_compute(
 ) -> tuple[str, str]:
     """Compute CW-POR via the native ``mini_ork.gates.cw_por`` port.
 
-    Returns ``(cw_por_value, cw_por_status)`` matching the legacy bash
-    shell-out semantics (``lib/cw_por.sh::mo_compute_cw_por`` via
-    subprocess) exactly:
-      * ``('null', 'default_passed')`` — when the CW-POR implementation
-        is unavailable (bash: lib/cw_por.sh or the function missing;
-        native: import failure — both fail-open)
-      * ``('null', 'indeterminate_default_passed')`` — when the compute
-        errors or its output is unparseable (bash rc!=0 → the port's
-        FileNotFoundError/ValueError on the same inputs)
-      * ``(float_str | 'null', status_str)`` — otherwise, with
-        panel_healthy→passed, authority_capture_suspected→failed,
-        anything else→indeterminate_default_passed
+    Returns ``(cw_por_value, cw_por_status)``. The check FAILS CLOSED: every
+    way it can fail to produce a healthy verdict yields a status that is not
+    ``passed``, so an authority-capture check that could not run can never
+    license a promote.
+
+      * ``('null', 'unavailable')`` — the CW-POR implementation could not be
+        imported, so no check happened at all
+      * ``('null', 'error')`` — the compute raised, or its input was
+        unparseable; the check ran and produced nothing usable
+      * ``('null', 'indeterminate')`` — the check ran but had no ground-truth
+        signal to compute from (``cw_por``'s own ``indeterminate`` verdict)
+      * ``(float_str | 'null', 'failed')`` — authority capture suspected
+      * ``(float_str | 'null', 'passed')`` — panel healthy
+
+    The three non-``passed`` failure statuses used to resolve to
+    ``'default_passed'`` / ``'indeterminate_default_passed'``, and the caller
+    blocked only on ``'failed'`` — so deleting the checker, breaking its
+    import, or feeding it a panel with no ground truth all silently *permitted*
+    the promote. An unavailable check must not resolve to permission, which is
+    the same principle that makes the evidence-independence floors fail closed.
 
     ``mini_ork_root`` is retained in the signature for caller
     compatibility (the bash path used it to locate ``lib/cw_por.sh``);
@@ -469,11 +477,11 @@ def _cw_por_compute(
     try:
         from mini_ork.gates import cw_por
     except Exception:
-        return ("null", "default_passed")
+        return ("null", "unavailable")
     try:
         _rc, payload = cw_por.compute_cw_por(verdict_file)
     except Exception:
-        return ("null", "indeterminate_default_passed")
+        return ("null", "error")
     cw_value = payload.get("cw_por")
     verdict = payload.get("verdict", "indeterminate")
     cw_value_s = "null" if cw_value is None else str(cw_value)
@@ -482,7 +490,7 @@ def _cw_por_compute(
     elif verdict == "authority_capture_suspected":
         status = "failed"
     else:
-        status = "indeterminate_default_passed"
+        status = "indeterminate"
     return (cw_value_s, status)
 
 
@@ -502,7 +510,10 @@ def mo_promote_synthesis_gate(
 
     Exit-code contract:
         rc=0  all conditions met (or deterministic-class bypass)
-        rc=1  any of {low_panel_score, authority_capture, no_structural_signal}
+        rc=1  any of {low_panel_score, authority_capture, cw_por_unverified,
+              no_structural_signal}. ``cw_por_unverified`` covers the CW-POR
+              checker being unavailable, erroring, or having no ground truth —
+              only an affirmative ``passed`` clears that condition.
         rc=2  malformed input (file missing, json parse fail, missing
               .panel_score)
 
@@ -607,11 +618,29 @@ def mo_promote_synthesis_gate(
         )
 
     # ── Condition 2: CW-POR gate (mirrors bash lines 397-415) ──
-    if cw_status == "failed":
+    # Only an affirmative 'passed' clears this. This branch used to fire on
+    # 'failed' alone, so a checker that was unavailable, that raised, or that
+    # had no ground truth to compute from all fell through to the structural
+    # condition and licensed the promote — an authority-capture check that
+    # could not run resolving to permission.
+    if cw_status != "passed":
+        if cw_status == "failed":
+            reason = "authority_capture"
+            rationale = (
+                f"CW-POR={cw_val} exceeds threshold "
+                f"{cw_por_threshold:.2f}; authority capture suspected"
+            )
+        else:
+            reason = "cw_por_unverified"
+            rationale = (
+                f"CW-POR check did not clear: status={cw_status}; "
+                f"an authority-capture check that cannot run must not "
+                f"license a promote"
+            )
         return (
             {
                 "decision": "rejected",
-                "reason": "authority_capture",
+                "reason": reason,
                 "task_class": task_class,
                 "signals": {
                     "panel_score": panel_score,
@@ -620,10 +649,7 @@ def mo_promote_synthesis_gate(
                     "cw_por_threshold": cw_por_threshold,
                     "structural": structural,
                 },
-                "rationale": (
-                    f"CW-POR={cw_val} exceeds threshold "
-                    f"{cw_por_threshold:.2f}; authority capture suspected"
-                ),
+                "rationale": rationale,
             },
             1,
         )
