@@ -208,9 +208,11 @@ def _default_state_dir(goal_id: str) -> str:
 
 def _default_run_wave_fn(wave_no: int, quarantined: set[str]) -> dict[str, Any]:
     """Production wave runner — shells ``bin/mini-ork run goal-loop <kickoff>``."""
-    kickoff = os.environ.get("MO_GOAL_CHILD_KICKOFF")
+    kickoff = os.environ.get("MO_GOAL_WAVE_KICKOFF") or os.environ.get("MO_GOAL_CHILD_KICKOFF")
     if not kickoff:
-        raise RuntimeError("MO_GOAL_CHILD_KICKOFF must be set for default run_wave_fn")
+        raise RuntimeError(
+            "MO_GOAL_WAVE_KICKOFF or MO_GOAL_CHILD_KICKOFF must be set for default run_wave_fn"
+        )
     run_dir = os.environ.get("MINI_ORK_RUN_DIR")
     if not run_dir:
         raise RuntimeError("MINI_ORK_RUN_DIR must be set for default run_wave_fn")
