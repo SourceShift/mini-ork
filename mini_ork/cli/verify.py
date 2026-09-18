@@ -281,8 +281,18 @@ def main(argv: list[str] | None = None, *, db: str | None = None, root: str | No
     # depend on a shell implementation being present on disk.
     gates_available = hasattr(gate_registry, "gate_run_all")
     if dry_run == 0 and gates_available:
+        # The mutation-adversary gate reads a campaign report written next to
+        # the artifact by mutation_adversary.run_adversary. It is seeded scoped
+        # to its own task class, so supplying the path costs nothing for every
+        # other task class — the gate is not selected for them at all.
+        mutation_report = os.environ.get("MO_MUTATION_REPORT", "")
+        if not mutation_report and artifact_path:
+            mutation_report = os.path.join(
+                os.path.dirname(os.path.abspath(artifact_path)),
+                "mutation-validation.json")
         ctx = json.dumps({"task_class": task_class, "artifact_path": artifact_path,
                           "plan_path": plan_path or "", "panel_run_id": context_env("MINI_ORK_RUN_ID", ""),
+                          "mutation_report": mutation_report,
                           "cost_usd": 0.0})
         try:
             summary = gate_registry.gate_run_all(db, task_class, ctx, mini_ork_root=root)

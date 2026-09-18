@@ -59,6 +59,10 @@ Public surface:
     compute_validation_results(mutations_json, outcomes, *,
                                worktree_dirty=False) -> dict
     threshold_pass(kill_rate)                 -> str  ("PASS"|"FAIL")
+    run_adversary(mutations_json, workspace, test_cmd, *,
+                  report_path=None)           -> dict
+    load_report(path)                         -> dict | None
+    gate_verdict(report)                      -> str  ("pass"|"fail"|"defer")
     _emit_cache_row(db_path, epic, iter, hash, cost, turns, dur,
                     output_path=\"\", log_path=\"\", status=\"success\",
                     prompt_version=\"v1\", job_id=\"unknown\") -> None
@@ -69,10 +73,13 @@ import datetime as _dt
 import hashlib
 import json
 import re
+import shlex
 import sqlite3
+import subprocess
+import tempfile
 import uuid
 from pathlib import Path
-from typing import Iterator, List, Optional, Tuple
+from typing import Iterator, List, Optional, Sequence, Tuple
 
 __all__ = [
     "compute_cache_hash",
@@ -80,6 +87,9 @@ __all__ = [
     "build_mutations_json",
     "compute_validation_results",
     "threshold_pass",
+    "run_adversary",
+    "load_report",
+    "gate_verdict",
     "_emit_cache_row",
     "_iter_assistant_text",
     "_read_fallback_result_text",
@@ -414,6 +424,259 @@ def compute_validation_results(
         "skipped": False,
         "results": results,
     }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Apply loop — the Python entry point for the campaign
+#
+# ``lib/mutation-adversary.sh`` applied each mutation to a worktree, ran the
+# target's test command, and recorded whether the suite killed it. That loop
+# was the one piece with no Python port, which is why the validator math above
+# had no production caller: nothing produced ``per_mutation_outcomes``.
+#
+# The loop was never intrinsically bash-only — it needed a worktree and a test
+# command, and Playwright only because the original caller targeted a web app.
+# Taking the command as a parameter makes it runnable for any target, and is
+# what lets ``mini_ork.gates`` evaluate a kill rate from a real measurement
+# rather than a hand-supplied number.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_APPLY_TIMEOUT_S = 60
+_TEST_TIMEOUT_S = 900
+
+
+def _worktree_dirty(workspace: str) -> bool:
+    """True when ``workspace`` has uncommitted changes (bash line 228's check).
+
+    A dirty tree makes "the mutation was applied" unobservable — a pre-existing
+    edit is indistinguishable from the patch — so the campaign bails rather than
+    reporting a kill rate it cannot attribute.
+
+    ``--untracked-files=no`` is deliberate. The question here is only whether a
+    *tracked* file already differs from HEAD, because that is the ambiguity the
+    bail guards against and ``git apply`` only writes tracked paths. Counting
+    untracked entries would make the check trip on the campaign's own
+    side-effects — running a Python test command leaves a ``__pycache__`` — so
+    the first campaign would succeed and every repeat would bail as dirty
+    without a single edit having been made by hand.
+    """
+    try:
+        r = subprocess.run(
+            ["git", "-C", workspace, "status", "--porcelain",
+             "--untracked-files=no"],
+            capture_output=True, text=True, timeout=_APPLY_TIMEOUT_S,
+        )
+    except Exception:
+        return True
+    return r.returncode != 0 or bool(r.stdout.strip())
+
+
+def _patch_paths(diff: str) -> List[str]:
+    """Files a unified diff touches, read off its ``+++ b/<path>`` headers."""
+    out: List[str] = []
+    for line in diff.splitlines():
+        if not line.startswith("+++ "):
+            continue
+        rest = line[4:].strip()
+        if rest in ("/dev/null", ""):
+            continue
+        if rest.startswith("b/"):
+            rest = rest[2:]
+        if rest not in out:
+            out.append(rest)
+    return out
+
+
+def _as_argv(test_cmd: "str | Sequence[str]") -> List[str]:
+    """Normalise a test command to argv without ever going through a shell.
+
+    ``shell=True`` would make the command string a code-execution surface for
+    whatever wrote the recipe; ``shlex.split`` gives the same convenience
+    (quoting works) with argv semantics, so nothing in the command is
+    interpreted as a shell operator.
+    """
+    if isinstance(test_cmd, str):
+        return shlex.split(test_cmd)
+    return [str(a) for a in test_cmd]
+
+
+def run_adversary(
+    mutations_json: dict,
+    workspace: str,
+    test_cmd: "str | Sequence[str]",
+    *,
+    report_path: Optional[str] = None,
+    require_clean: bool = True,
+    apply_timeout_s: int = _APPLY_TIMEOUT_S,
+    test_timeout_s: int = _TEST_TIMEOUT_S,
+) -> dict:
+    """Apply each mutation in ``workspace`` and record whether the tests kill it.
+
+    Port of the ``mo_run_mutation_validator`` apply loop (bash lines 209-296,
+    minus the Playwright special-casing): for each mutation, ``git apply`` the
+    patch, run ``test_cmd``, and count it *caught* when the command fails — a
+    mutation the suite still passes is a coverage gap, which is the whole
+    quantity being measured.
+
+    The tree is restored after every mutation: ``git apply -R`` first, falling
+    back to ``git checkout --`` for only the paths the patch names. A mutation
+    left applied would silently contaminate every later measurement, and a
+    blanket ``git checkout -- .`` would discard work the campaign does not own.
+
+    Args:
+        mutations_json: ``{mutations: [{id, diff, target_scenario}, …]}`` as
+                        produced by ``build_mutations_json``.
+        workspace:      git worktree the mutations are applied in. The caller
+                        owns it; nothing outside it is touched.
+        test_cmd:       command whose non-zero exit means "caught". A string is
+                        split with ``shlex`` (never run through a shell).
+        report_path:    when given, the report is also written here so a gate
+                        can evaluate it later.
+        require_clean:  bail with the ``worktree dirty`` result rather than
+                        measuring on a tree whose state cannot be attributed.
+
+    Returns:
+        The ``compute_validation_results`` report (``kill_rate``, ``total``,
+        ``killed``, ``results``), or its skipped / zero / dirty early-bail shape.
+    """
+    if bool(mutations_json.get("skipped", False)):
+        return compute_validation_results(mutations_json)
+    if not (mutations_json.get("mutations") or []):
+        return compute_validation_results(mutations_json)
+    if require_clean and _worktree_dirty(workspace):
+        return compute_validation_results(mutations_json, worktree_dirty=True)
+
+    argv = _as_argv(test_cmd)
+    outcomes: List[Tuple[str, str, bool, bool, str]] = []
+    for i, m in enumerate(mutations_json.get("mutations") or []):
+        if not isinstance(m, dict):
+            continue
+        mid = str(m.get("id") or f"M{i}")
+        target = str(m.get("target_scenario") or "")
+        diff = m.get("diff") or ""
+        if not diff:
+            outcomes.append((mid, target, False, False, "mutation carries no diff"))
+            continue
+
+        with tempfile.NamedTemporaryFile("w", suffix=".patch", delete=False) as fh:
+            fh.write(diff)
+            patch = fh.name
+        applied = caught = False
+        try:
+            try:
+                ar = subprocess.run(
+                    ["git", "-C", workspace, "apply", "--whitespace=nowarn", patch],
+                    capture_output=True, text=True, timeout=apply_timeout_s,
+                )
+                applied = ar.returncode == 0
+                reason = (f"apply failed: {(ar.stderr or '').strip().splitlines()[:1]}"
+                          if not applied else "")
+            except subprocess.TimeoutExpired:
+                reason = "apply timed out"
+            except Exception as e:  # noqa: BLE001 — one bad patch must not end the campaign
+                reason = f"apply error: {e!r}"
+
+            if applied:
+                try:
+                    tr = subprocess.run(
+                        argv, cwd=workspace, capture_output=True, text=True,
+                        timeout=test_timeout_s,
+                    )
+                    caught = tr.returncode != 0
+                    reason = ("tests failed with the mutation applied"
+                              if caught else "tests still pass — coverage gap")
+                except subprocess.TimeoutExpired:
+                    # A mutation that hangs the suite is a kill: the tests did
+                    # detect something. Timing out is not "passed".
+                    caught = True
+                    reason = "tests timed out with the mutation applied"
+                except Exception as e:  # noqa: BLE001
+                    reason = f"test command error: {e!r}"
+                if not _revert(workspace, patch, diff, apply_timeout_s):
+                    reason += " (revert FAILED — workspace left dirty)"
+                    outcomes.append((mid, target, applied, caught, reason))
+                    break
+        finally:
+            Path(patch).unlink(missing_ok=True)
+        outcomes.append((mid, target, applied, caught, reason))
+
+    result = compute_validation_results(mutations_json, outcomes)
+    if report_path:
+        Path(report_path).parent.mkdir(parents=True, exist_ok=True)
+        Path(report_path).write_text(json.dumps(result, indent=2), encoding="utf-8")
+    return result
+
+
+def _revert(workspace: str, patch: str, diff: str, timeout_s: int) -> bool:
+    """Undo one applied mutation. ``git apply -R``, else checkout its own paths."""
+    try:
+        r = subprocess.run(
+            ["git", "-C", workspace, "apply", "-R", "--whitespace=nowarn", patch],
+            capture_output=True, text=True, timeout=timeout_s,
+        )
+        if r.returncode == 0:
+            return True
+    except Exception:
+        pass
+    paths = _patch_paths(diff)
+    if not paths:
+        return False
+    try:
+        r = subprocess.run(
+            ["git", "-C", workspace, "checkout", "--", *paths],
+            capture_output=True, text=True, timeout=timeout_s,
+        )
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def load_report(path: str) -> Optional[dict]:
+    """Load a persisted campaign report, or ``None`` when absent or unusable."""
+    p = Path(path)
+    if not p.is_file():
+        return None
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def gate_verdict(report: Optional[dict]) -> str:
+    """Map a campaign report onto a gate verdict: ``pass`` | ``fail`` | ``defer``.
+
+    ``defer`` is the estate's "the check did not run" — it is what gate_registry
+    returns for an unavailable check, and it is deliberately NOT permission. So
+    every state that measured nothing resolves to ``defer`` rather than to the
+    ``PASS`` that ``threshold_pass`` would report for the same input:
+
+      * no report / not a dict      — the campaign never ran;
+      * ``skipped``                 — the adversary was not attempted. The bash
+                                      threshold scores this 1.0, which is right
+                                      for reporting and wrong for a verdict:
+                                      nothing was tested, so nothing is cleared;
+      * ``kill_rate < 0``           — the worktree-dirty bail; unmeasurable;
+      * ``total == 0``              — zero mutations validated, no measurement.
+
+    Only a measured kill rate reaches the ≥0.8 bar.
+    """
+    if not isinstance(report, dict):
+        return "defer"
+    if bool(report.get("skipped", False)):
+        return "defer"
+    kill_rate = report.get("kill_rate")
+    if kill_rate is None:
+        return "defer"
+    try:
+        kill_rate = float(kill_rate)
+    except (TypeError, ValueError):
+        return "defer"
+    if kill_rate < 0:
+        return "defer"
+    if int(report.get("total") or 0) <= 0:
+        return "defer"
+    return "pass" if threshold_pass(kill_rate) == "PASS" else "fail"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
