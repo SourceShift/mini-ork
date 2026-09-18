@@ -1,10 +1,19 @@
-"""Standalone, opt-in semantic long-term memory (mem-a).
+"""Standalone semantic long-term memory (mem-a) with a utility-aware
+retrieval policy (mem-b).
 
 Mem0-style ADD/UPDATE/DELETE reconcile over a per-scope SQLite index, with a
 default stdlib-only HashEmbedder so the module imports and runs with zero new
 pip dependency. A real Embedder is wired behind a thin provider stub that
 activates only when ``MO_EMBED_PROVIDER`` is set (no third-party import path
 on the default branch).
+
+Retrieval ranks on relevance *plus* historical utility plus an exploration
+bonus (RetroAgent SimUtil-UCB, arXiv 2603.08561) rather than similarity alone
+— see the ``W_UTILITY`` / ``W_EXPLORE`` block below for the formula. The
+utility signal comes from a retrieval ledger: ``record_retrievals()`` is
+called when memories are injected into a prompt, and ``record_outcome()``
+resolves those rows to win/loss once the run's result is known. Relevance
+still gates — utility and exploration only reorder what similarity admitted.
 
 Test-monkeypatch contract: tests patch ``mini_ork.memory.semantic.dispatch_model``
 (imported here from ``mini_ork.dispatch``). The two names refer to the same
@@ -52,6 +61,46 @@ DELETE_ADD_THRESHOLD = 0.80
 # enough that 4096-token text hashes give distinct-enough projections for the
 # reconcile thresholds above to discriminate paraphrase vs contradiction.
 HASH_DIM = 256
+
+
+# ── SimUtil-UCB retrieval weights (RetroAgent 2603.08561) ───────────────────
+#
+# Ranking by similarity alone cannot separate two memories that read alike but
+# have different track records: a vague memory similar to everything is
+# retrieved forever, while a narrow one that actually worked keeps losing on
+# wording. These weights add the missing signal — how useful this memory has
+# been, and how much is still unknown about it.
+#
+#   score = sim + W_UTILITY * (utility - 0.5) + W_EXPLORE * exploration
+#
+#   utility     = (wins + 1) / (uses + 2)     Laplace-smoothed pass rate; the
+#               Beta(1,1) posterior mean, so an untried memory sits at 0.5 and
+#               contributes nothing. Smoothing rather than a raw ratio is what
+#               creates the "never fully buried" floor DeltaMem asks for: a
+#               memory with 0 wins from 1 use scores 1/3, not 0, and recovers.
+#               It also protects against the credit-assignment noise the survey
+#               flags — one unlucky retrieval cannot condemn a good memory.
+#   exploration = sqrt(ln(N_total + 1) / (uses + 1))   UCB1 bonus, largest for
+#               memories never retrieved, decaying as evidence accumulates.
+#
+# The subtraction of 0.5 centres utility: a memory must do better than
+# chance-and-neutral to gain, and the exploration term is what gives an unproven
+# memory its first chance.
+#
+# CRITICAL: both terms only REORDER candidates that relevance already admitted.
+# Exploration must not be able to drag an irrelevant memory into a prompt — the
+# survey's own caution is that the bonus "deliberately surfaces untested
+# memories", which is exactly what you must not let it surface. Relevance
+# selects the candidate pool; utility and exploration order it.
+#
+# The pool is the top (top_k * POOL_FACTOR) by similarity. Using a relative pool
+# rather than an absolute similarity floor is deliberate: HashEmbedder cosines
+# are signed, so "sim > 0" would silently drop legitimate memories, and any
+# fixed floor is a magic number that has to be re-tuned per embedder.
+W_UTILITY = 0.30
+W_EXPLORE = 0.10
+UTILITY_NEUTRAL = 0.5
+POOL_FACTOR = 4
 
 
 # ── Embedder protocol + default impl ───────────────────────────────────────
@@ -165,9 +214,9 @@ def _resolve_db_path(db_path: str | os.PathLike[str] | None) -> str:
 
 
 # Idempotent migration SQL — a slim copy of the canonical
-# db/migrations/0046_semantic_memory.sql so the module bootstraps a tmp DB
-# without requiring the migration loader to have run. Kept in lock-step with
-# the .sql file by hand (one table, one index, additive). Re-running this
+# db/migrations/0046_semantic_memory.sql plus 0055_semantic_memory_utility.sql,
+# so the module bootstraps a tmp DB without requiring the migration loader to
+# have run. Kept in lock-step with the .sql files by hand. Re-running this
 # block on an existing DB is a no-op (IF NOT EXISTS).
 _BOOTSTRAP_SQL = """
 CREATE TABLE IF NOT EXISTS semantic_memory (
@@ -176,21 +225,56 @@ CREATE TABLE IF NOT EXISTS semantic_memory (
   text       TEXT    NOT NULL,
   embedding  BLOB    NOT NULL,
   created_at REAL    NOT NULL,
-  meta       TEXT
+  meta       TEXT,
+  uses       INTEGER NOT NULL DEFAULT 0,
+  wins       INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_semantic_memory_scope
   ON semantic_memory(scope);
+CREATE TABLE IF NOT EXISTS semantic_memory_uses (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  memory_id    INTEGER NOT NULL,
+  scope        TEXT    NOT NULL,
+  run_id       TEXT    NOT NULL DEFAULT '',
+  task_class   TEXT    NOT NULL DEFAULT '',
+  retrieved_at REAL    NOT NULL,
+  outcome      TEXT    NOT NULL DEFAULT 'pending'
+               CHECK (outcome IN ('pending','win','loss'))
+);
+CREATE INDEX IF NOT EXISTS idx_semantic_memory_uses_run
+  ON semantic_memory_uses(run_id);
+CREATE INDEX IF NOT EXISTS idx_semantic_memory_uses_memory
+  ON semantic_memory_uses(memory_id);
 """
+
+# Columns added after 0046 shipped. A DB created at 0046 — or by an earlier
+# version of this module's bootstrap — has the table without them, and
+# `CREATE TABLE IF NOT EXISTS` will not add them, so the presence of the table
+# is not evidence the columns are there. Guarded ALTER, same shape as
+# mini_ork/stores/migrate.py::_ensure_column.
+_ADDED_COLUMNS = (
+    ("uses", "INTEGER NOT NULL DEFAULT 0"),
+    ("wins", "INTEGER NOT NULL DEFAULT 0"),
+)
+
+
+def _ensure_columns(conn: sqlite3.Connection) -> None:
+    have = {r[1] for r in conn.execute("PRAGMA table_info('semantic_memory')")}
+    for name, ddl in _ADDED_COLUMNS:
+        if name not in have:
+            conn.execute(f"ALTER TABLE semantic_memory ADD COLUMN {name} {ddl}")
 
 
 def _connect(db_path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     # Self-bootstrap. Idempotent — the SQL uses IF NOT EXISTS, so applying it
-    # to a DB that already has the table is a no-op. The migration loader is
-    # not on the test path; this is how the module guarantees the schema
+    # to a DB that already has the tables is a no-op, and _ensure_columns
+    # upgrades a table that predates the utility columns. The migration loader
+    # is not on the test path; this is how the module guarantees the schema
     # exists when called from a fresh tmp DB.
     conn.executescript(_BOOTSTRAP_SQL)
+    _ensure_columns(conn)
     conn.commit()
     return conn
 
@@ -442,8 +526,17 @@ def search(
     db_path: str | os.PathLike[str] | None = None,
     embedder: Embedder | None = None,
 ) -> list[dict]:
-    """Cosine-rank memories in ``scope`` against ``query``. The scope filter
-    is mandatory — empty/whitespace raises ValueError."""
+    """Rank memories in ``scope`` against ``query`` by utility-aware
+    similarity (SimUtil-UCB). The scope filter is mandatory —
+    empty/whitespace raises ValueError.
+
+    Relevance admits the candidates; utility and exploration reorder them.
+    The candidate pool is the top ``top_k * POOL_FACTOR`` by cosine, and the
+    returned list is that pool re-sorted by the composite and cut to
+    ``top_k``. ``score`` is the composite (what the ranking used) —
+    ``similarity``, ``utility``, ``uses`` and ``wins`` are returned alongside
+    it so a caller can see why a memory placed where it did.
+    """
     if not isinstance(scope, str) or not scope.strip():
         raise ValueError("scope must be a non-empty string")
     if not isinstance(query, str) or not query.strip():
@@ -458,18 +551,160 @@ def search(
     conn = _connect(db)
     try:
         rows = conn.execute(
-            "SELECT id, text, embedding FROM semantic_memory WHERE scope = ?",
+            "SELECT id, text, embedding, uses, wins "
+            "FROM semantic_memory WHERE scope = ?",
             (scope,),
         ).fetchall()
+        # The N in UCB1's ln(N) is the scope's total retrieval count, not the
+        # row's — it is what makes the bonus shrink as the scope as a whole
+        # accumulates evidence. Read once, outside the per-row loop.
+        n_total = sum(int(r["uses"]) for r in rows)
     finally:
         conn.close()
 
-    scored: list[tuple[float, sqlite3.Row]] = []
+    # Gate: relevance chooses the pool.
+    by_sim: list[tuple[float, sqlite3.Row]] = []
     for r in rows:
-        v = _unpack_embedding(r["embedding"])
-        scored.append((_cosine(qv, v), r))
-    scored.sort(key=lambda t: t[0], reverse=True)
+        by_sim.append((_cosine(qv, _unpack_embedding(r["embedding"])), r))
+    by_sim.sort(key=lambda t: t[0], reverse=True)
+    pool = by_sim[: max(top_k * POOL_FACTOR, top_k)]
+
+    # Reorder: utility and exploration act only inside the pool.
+    ranked: list[tuple[float, float, float, int, int, sqlite3.Row]] = []
+    for sim, r in pool:
+        uses = int(r["uses"])
+        wins = int(r["wins"])
+        utility = (wins + 1.0) / (uses + 2.0)
+        exploration = math.sqrt(math.log(n_total + 1.0) / (uses + 1.0))
+        composite = (
+            sim
+            + W_UTILITY * (utility - UTILITY_NEUTRAL)
+            + W_EXPLORE * exploration
+        )
+        ranked.append((composite, sim, utility, uses, wins, r))
+    ranked.sort(key=lambda t: t[0], reverse=True)
+
     return [
-        {"memory_id": int(r["id"]), "text": r["text"], "score": float(s)}
-        for s, r in scored[:top_k]
+        {
+            "memory_id": int(r["id"]),
+            "text": r["text"],
+            "score": float(composite),
+            "similarity": float(sim),
+            "utility": float(utility),
+            "uses": uses,
+            "wins": wins,
+        }
+        for composite, sim, utility, uses, wins, r in ranked[:top_k]
     ]
+
+
+# ── Retrieval ledger (the utility signal's source) ─────────────────────────
+
+
+def record_retrievals(
+    memory_ids: Sequence[int],
+    *,
+    scope: str,
+    run_id: str = "",
+    task_class: str = "",
+    db_path: str | os.PathLike[str] | None = None,
+) -> int:
+    """Log that these memories were injected into a prompt for ``run_id``.
+
+    One pending ledger row per memory, plus a bump of each row's denormalized
+    ``uses`` counter. The run's outcome is unknown at injection time, so the
+    rows start 'pending' and are resolved at run end by ``record_outcome()``.
+
+    A retrieval that is never resolved counts toward ``uses`` forever and
+    never toward ``wins`` — an unattributed retrieval can only make a memory
+    look worse, never better. That is deliberate: the failure mode worth
+    guarding is a memory silently earning credit it never proved, and failing
+    closed is the only way to make an unattributed retrieval harmless.
+
+    Only ids that actually exist in ``scope`` are recorded — the ledger is the
+    authoritative audit trail and should never assert a retrieval of something
+    that was not there. Returns the number of retrievals recorded.
+    """
+    if not isinstance(scope, str) or not scope.strip():
+        raise ValueError("scope must be a non-empty string")
+    # Dedupe, preserve order: the same memory injected twice in one prompt is
+    # one retrieval.
+    ids = list(dict.fromkeys(int(m) for m in memory_ids))
+    if not ids:
+        return 0
+
+    db = _resolve_db_path(db_path)
+    now = time.time()
+    conn = _connect(db)
+    try:
+        placeholders = ",".join("?" * len(ids))
+        present = [
+            int(r["id"]) for r in conn.execute(
+                f"SELECT id FROM semantic_memory "
+                f"WHERE scope = ? AND id IN ({placeholders}) ORDER BY id",
+                (scope, *ids),
+            )
+        ]
+        if not present:
+            return 0
+        conn.executemany(
+            "INSERT INTO semantic_memory_uses"
+            "(memory_id, scope, run_id, task_class, retrieved_at, outcome) "
+            "VALUES (?, ?, ?, ?, ?, 'pending')",
+            [(mid, scope, run_id, task_class, now) for mid in present],
+        )
+        conn.executemany(
+            "UPDATE semantic_memory SET uses = uses + 1 WHERE id = ?",
+            [(mid,) for mid in present],
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return len(present)
+
+
+def record_outcome(
+    run_id: str,
+    passed: bool,
+    *,
+    db_path: str | os.PathLike[str] | None = None,
+) -> int:
+    """Resolve every pending retrieval for ``run_id`` to win/loss.
+
+    Called at run end, once the run's result is known. A win bumps the
+    memory's ``wins``; a loss only closes its ledger row, because ``uses`` was
+    already counted at retrieval and a loss is precisely "used, did not help".
+
+    Only 'pending' rows are touched, so this is idempotent — a resumed or
+    re-stamped run cannot double-count a win. Returns the number of rows
+    resolved.
+    """
+    if not isinstance(run_id, str) or not run_id.strip():
+        raise ValueError("run_id must be a non-empty string")
+
+    db = _resolve_db_path(db_path)
+    outcome = "win" if passed else "loss"
+    conn = _connect(db)
+    try:
+        rows = conn.execute(
+            "SELECT id, memory_id FROM semantic_memory_uses "
+            "WHERE run_id = ? AND outcome = 'pending'",
+            (run_id,),
+        ).fetchall()
+        if not rows:
+            return 0
+        conn.execute(
+            "UPDATE semantic_memory_uses SET outcome = ? "
+            "WHERE run_id = ? AND outcome = 'pending'",
+            (outcome, run_id),
+        )
+        if passed:
+            # One bump per resolved row, in lock-step with the ledger.
+            conn.executemany(
+                "UPDATE semantic_memory SET wins = wins + 1 WHERE id = ?",
+                [(int(r["memory_id"]),) for r in rows],
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    return len(rows)
