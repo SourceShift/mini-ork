@@ -42,6 +42,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 from mini_ork.orchestration import recursive as ro
 
@@ -273,6 +274,33 @@ class SpawnResult:
         self.child_exit_code = child_exit_code
 
 
+def _persist_child_log(home: str, child_run_id: str,
+                       cli_argv: list[str], proc: Any) -> str | None:
+    """Write the child subprocess's captured stdout/stderr into its run dir.
+
+    ``spawn()`` runs the child with ``capture_output=True``; without persisting
+    the result, that output is discarded and a non-zero child (e.g. the
+    goal-loop sweep's code-fix child) leaves NO trail explaining WHY it failed —
+    the outer driver only sees ``exit_code != 0`` with nothing to self-diagnose.
+    Best-effort by contract: a logging failure must never mask the child's real
+    exit code, so OSErrors are swallowed and ``None`` is returned.
+    """
+    try:
+        child_run_dir = os.path.join(home, "runs", child_run_id)
+        os.makedirs(child_run_dir, exist_ok=True)
+        log_path = os.path.join(child_run_dir, "spawn-child.log")
+        with open(log_path, "w", encoding="utf-8") as fh:
+            fh.write(f"$ {' '.join(cli_argv)}\n")
+            fh.write(f"exit_code={getattr(proc, 'returncode', '')}\n\n")
+            fh.write("=== stdout ===\n")
+            fh.write(getattr(proc, "stdout", None) or "")
+            fh.write("\n=== stderr ===\n")
+            fh.write(getattr(proc, "stderr", None) or "")
+        return log_path
+    except OSError:
+        return None
+
+
 # Mirrors bin/mini-ork-spawn:88-141 (the orchestrate-run-execute-mark flow).
 def spawn(
     parent_run: str,
@@ -373,6 +401,7 @@ def spawn(
     proc = subprocess.run(cli_argv, cwd=paths["child_workspace"], env=child_env,
                           capture_output=True, text=True)
     child_exit = proc.returncode
+    _persist_child_log(resolved_home, child_run_id, cli_argv, proc)
 
     if child_exit == 0:
         ro.mo_recursive_mark_spawn(child_run_id, "completed")
