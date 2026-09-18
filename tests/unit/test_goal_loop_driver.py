@@ -470,3 +470,132 @@ def test_default_run_wave_fn_raises_when_both_kickoffs_unset(tmp_path, monkeypat
     msg = str(exc_info.value)
     assert "MO_GOAL_WAVE_KICKOFF" in msg
     assert "MO_GOAL_CHILD_KICKOFF" in msg
+
+
+# ── 7. the declared recursion block governs the driver ─────────────────────
+#
+# The executor publishes a recipe's `recursion:` block as MO_RECURSION_*
+# (mini_ork/cli/execute.py). These tests pin the consumption side: caller beats
+# declared beats literal, and a malformed value fails loud rather than quietly
+# reverting to a default the recipe never declared.
+
+
+def test_drive_reads_declared_budget_from_env(tmp_path, monkeypatch):
+    """No kwarg + env set ⇒ the declared total budget is the one enforced.
+
+    Mirrors scenario 4 (budget stop after wave 2) with the 12.0 arriving through
+    the environment instead of the argument, which is the path a recipe takes.
+    """
+    state_dir = tmp_path / "state"
+
+    def run_wave(wave_no, quarantined):
+        return {"verdict": "fail", "failing_before": ["u1"], "failing_after": ["u1"],
+                "cost_usd": 5.0, "run_id": f"r{wave_no}"}
+
+    monkeypatch.setenv("MO_RECURSION_BUDGET_CAP_TOTAL_USD", "12.0")
+    monkeypatch.delenv("MO_RECURSION_MAX_ITERATIONS", raising=False)
+
+    verdict = drive(
+        goal_id="g7", target_cwd="/tmp", units_cmd="echo u1",
+        predicate_cmd="echo ok", child_recipe="code-fix",
+        run_wave_fn=run_wave, cost_fn=lambda: 10.0, state_dir=state_dir,
+    )
+
+    assert verdict["stop"] == "budget"
+    assert verdict["budget_total_usd"] == 12.0
+
+
+def test_drive_reads_declared_max_iterations_from_env(tmp_path, monkeypatch):
+    """max_waves cap comes from the declared max_iterations when no kwarg is given."""
+    state_dir = tmp_path / "state"
+    waves_run: list[int] = []
+
+    def run_wave(wave_no, quarantined):
+        waves_run.append(wave_no)
+        # Never converges, never diverges (distinct failing sets each wave) —
+        # so the only thing that can stop the loop is the wave cap.
+        return {"verdict": "fail", "failing_before": [],
+                "failing_after": [f"u{wave_no}"],
+                "cost_usd": 0.0, "run_id": f"r{wave_no}"}
+
+    monkeypatch.setenv("MO_RECURSION_MAX_ITERATIONS", "3")
+    monkeypatch.delenv("MO_RECURSION_BUDGET_CAP_TOTAL_USD", raising=False)
+
+    verdict = drive(
+        goal_id="g8", target_cwd="/tmp", units_cmd="echo u",
+        predicate_cmd="echo ok", child_recipe="code-fix",
+        run_wave_fn=run_wave, cost_fn=lambda: 0.0, state_dir=state_dir,
+    )
+
+    assert verdict["stop"] == "max_waves_reached"
+    assert verdict["waves"] == 3
+    assert waves_run == [1, 2, 3]
+
+
+def test_explicit_argument_beats_declared_env(tmp_path, monkeypatch):
+    """An explicit caller value wins over the recipe's declaration."""
+    state_dir = tmp_path / "state"
+    waves_run: list[int] = []
+
+    def run_wave(wave_no, quarantined):
+        waves_run.append(wave_no)
+        return {"verdict": "fail", "failing_before": [],
+                "failing_after": [f"u{wave_no}"],
+                "cost_usd": 0.0, "run_id": f"r{wave_no}"}
+
+    monkeypatch.setenv("MO_RECURSION_MAX_ITERATIONS", "2")
+
+    verdict = drive(
+        goal_id="g9", target_cwd="/tmp", units_cmd="echo u",
+        predicate_cmd="echo ok", child_recipe="code-fix",
+        max_waves=4, budget_total_usd=100.0,
+        run_wave_fn=run_wave, cost_fn=lambda: 0.0, state_dir=state_dir,
+    )
+
+    assert verdict["stop"] == "max_waves_reached"
+    assert waves_run == [1, 2, 3, 4]
+
+
+def test_absent_env_keeps_historical_defaults(monkeypatch):
+    """Nothing declared, nothing passed ⇒ today's literals, not zero and not a crash.
+
+    Asserted at the seam ``drive()`` itself uses, because observing 30 waves
+    would mean running a 30-wave loop to prove a default.
+    """
+    monkeypatch.delenv("MO_RECURSION_MAX_ITERATIONS", raising=False)
+    monkeypatch.delenv("MO_RECURSION_BUDGET_CAP_TOTAL_USD", raising=False)
+
+    assert _DRIVE._env_int("MO_RECURSION_MAX_ITERATIONS", 30) == 30  # noqa: SLF001
+    assert _DRIVE._env_float("MO_RECURSION_BUDGET_CAP_TOTAL_USD", 150.0) == 150.0  # noqa: SLF001
+
+
+def test_empty_env_value_is_treated_as_absent(monkeypatch):
+    """An exported-but-blank var is absence, not a parse error."""
+    monkeypatch.setenv("MO_RECURSION_MAX_ITERATIONS", "")
+    assert _DRIVE._env_int("MO_RECURSION_MAX_ITERATIONS", 30) == 30  # noqa: SLF001
+
+
+def test_malformed_declared_value_fails_loud(monkeypatch):
+    """Garbage in a published cap raises — a silent fallback would hide a broken
+    upstream and run the loop at a bound the recipe never declared."""
+    monkeypatch.setenv("MO_RECURSION_MAX_ITERATIONS", "thirty")
+    with pytest.raises(ValueError, match="MO_RECURSION_MAX_ITERATIONS"):
+        _DRIVE._env_int("MO_RECURSION_MAX_ITERATIONS", 30)  # noqa: SLF001
+
+    monkeypatch.setenv("MO_RECURSION_BUDGET_CAP_TOTAL_USD", "lots")
+    with pytest.raises(ValueError, match="MO_RECURSION_BUDGET_CAP_TOTAL_USD"):
+        _DRIVE._env_float("MO_RECURSION_BUDGET_CAP_TOTAL_USD", 150.0)  # noqa: SLF001
+
+
+def test_cli_max_waves_flag_reaches_the_driver():
+    """``--max-waves`` is threaded to drive(), not swallowed by a default.
+
+    A zero cap trips drive()'s own guard, so this proves the flag arrived
+    without running a single wave or subprocess.
+    """
+    rc = _DRIVE.main([
+        "--goal-id", "g10", "--target-cwd", "/tmp",
+        "--units-cmd", "echo u", "--predicate-cmd", "echo ok",
+        "--child-recipe", "code-fix", "--max-waves", "0",
+    ])
+    assert rc == 2

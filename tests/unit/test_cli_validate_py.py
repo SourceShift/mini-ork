@@ -155,6 +155,58 @@ def test_invalid_workflow_yaml(env, capsys):
             f"          Fix: fix YAML syntax in {d}/workflow.yaml\n") in captured.err
 
 
+_FULL_RECURSION = (
+    "nodes: []\n"
+    "recursion:\n"
+    "  max_iterations: 5\n"
+    "  convergence_check: all_done\n"
+    "  budget_cap_per_iter_usd: 1.0\n"
+    "  budget_cap_total_usd: 5.0\n"
+    "  divergence_kill: stop on repeat\n"
+)
+
+
+def test_partial_recursion_block_is_an_error(env, capsys):
+    """The schema permits a partial block; executing one would raise mid-run.
+
+    Validate must surface it pre-run instead — that is the whole reason the
+    runtime loader is stricter than the schema.
+    """
+    root, _home = env
+    _recipe(root, "demo", workflow="nodes: []\nrecursion:\n  max_iterations: 5\n")
+
+    assert validate.main(["--recipe", "demo"]) == 1
+    captured = capsys.readouterr()
+    assert "[error]   recipe demo has an invalid recursion block" in captured.err
+    # The detail names the missing keys, so the fix is obvious without reading source.
+    assert "missing" in captured.err
+    assert "convergence_check" in captured.err
+
+
+def test_typo_recursion_key_is_an_error(env, capsys):
+    root, _home = env
+    _recipe(root, "demo", workflow=(
+        "nodes: []\n"
+        "recursion:\n"
+        "  max_iterations: 5\n"
+        "  convergence_check: x\n"
+        "  budget_cap_per_iter_usd: 1.0\n"
+        "  budget_cap_total: 5.0\n"  # typo: _total, not _total_usd
+        "  divergence_kill: y\n"
+    ))
+
+    assert validate.main(["--recipe", "demo"]) == 1
+    assert "unknown recursion key" in capsys.readouterr().err
+
+
+def test_complete_recursion_block_is_clean(env, capsys):
+    root, _home = env
+    _recipe(root, "demo", workflow=_FULL_RECURSION)
+
+    assert validate.main(["--recipe", "demo"]) == 0
+    assert capsys.readouterr().err == ""
+
+
 def test_output_collision_warns_with_other_recipe_count(env, capsys):
     root, _home = env
     d = _recipe(root, "demo", contract="outputs:\n  - dist/app.js\n")
