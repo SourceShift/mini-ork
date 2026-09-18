@@ -786,22 +786,97 @@ def reflection_persist_suggestions(suggestions_json: str, *,
     return _persist_suggestions_upsert(db_path, suggestions_json)
 
 
+# The shipped independence floor. ``MO_EMERGENT_VERIFY_MIN_EVIDENCE`` may raise
+# it but never lower it: the forgeable bar (a raw list length, which one repeated
+# trace id satisfies) is not a setting an environment can restore.
+_INDEPENDENT_EVIDENCE_FLOOR = 3
+
+
+def _member_trace_ids(members_json) -> list[str]:
+    """Trace ids named by an emergent_pattern's member list.
+
+    Members are stored as ``{"item_table": ..., "item_id": ...}`` objects; a bare
+    string is accepted too so hand-written and legacy rows still read. Members
+    naming a different table are dropped — they cannot be resolved, so they
+    cannot demonstrate independence.
+    """
+    try:
+        members = json.loads(members_json) if members_json else []
+    except (json.JSONDecodeError, TypeError):
+        return []
+    if not isinstance(members, list):
+        return []
+    ids: list[str] = []
+    for m in members:
+        if isinstance(m, dict):
+            if (m.get("item_table") or "execution_traces") != "execution_traces":
+                continue
+            mid = m.get("item_id")
+        else:
+            mid = m
+        if mid:
+            ids.append(str(mid))
+    return ids
+
+
+def _independent_evidence_count(con, ids: list[str]) -> int:
+    """Distinct RUNS behind a set of trace ids — the measure of independence.
+
+    A raw list length counts one observation many times: the same trace id
+    repeated, or N traces from a single run, is one piece of evidence however it
+    is listed. Counting ``DISTINCT run_id`` is what separates "seen 3 times" from
+    "seen in 3 independent runs" (PoisonedEvolution, 2608.05563: three consistent
+    records inside one batch are enough to promote an attacker-chosen behaviour).
+
+    Fail-closed on every gap: an id that does not resolve, and a row whose run_id
+    is NULL or empty, both contribute 0 — a missing run_id is unproven
+    independence, never assumed independence. If the traces table cannot be read
+    at all, fall back to the distinct-id count rather than crashing reflection
+    (which fires unattended at run end).
+    """
+    distinct = sorted(set(ids))
+    if not distinct:
+        return 0
+    placeholders = ",".join("?" * len(distinct))
+    try:
+        row = con.execute(
+            f"SELECT COUNT(DISTINCT NULLIF(TRIM(COALESCE(run_id,'')),'')) "
+            f"FROM execution_traces WHERE trace_id IN ({placeholders})",
+            distinct,
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return len(distinct)
+    return int(row[0] or 0)
+
+
 def reflection_verify_patterns(*, db_path: str | None = None) -> int:
-    """Approve emergent patterns that meet evidence and strength floors.
+    """Approve emergent patterns that meet INDEPENDENT-evidence and strength floors.
 
     Judge-gate (extract→distill→verify): transition emergent_patterns rows from
-    status='proposed' → 'approved' when they clear the evidence/strength floor
-    (strength_score >= MO_EMERGENT_VERIFY_MIN_STRENGTH AND member-evidence count
-    >= MO_EMERGENT_VERIFY_MIN_EVIDENCE). Only approved rows are eligible to be
-    read into routing/context — the guard against memory confabulation (Dixit
-    2026). Opt-out MO_EMERGENT_VERIFY=0. Cold-safe: no-op on missing/empty
-    table. Prints and returns the count of newly-approved rows.
+    status='proposed' → 'approved' when they clear both
+    ``strength_score >= MO_EMERGENT_VERIFY_MIN_STRENGTH`` AND the evidence
+    resolves to at least ``MO_EMERGENT_VERIFY_MIN_EVIDENCE`` DISTINCT runs. Only
+    approved rows are eligible to be read into routing/context — the guard
+    against memory confabulation (Dixit 2026).
+
+    The independence floor is clamped UP, never down: ``max(floor, env)``, so an
+    environment variable can raise the bar but never restore the forgeable one.
+    A safety floor is not a setting.
+
+    Opt-out MO_EMERGENT_VERIFY=0. Cold-safe: no-op on missing/empty table. Prints
+    and returns the count of newly-approved rows.
     """
     if os.environ.get("MO_EMERGENT_VERIFY", "1") != "1":
         print(0)
         return 0
     min_strength = float(os.environ.get("MO_EMERGENT_VERIFY_MIN_STRENGTH", "3"))
-    min_evidence = int(os.environ.get("MO_EMERGENT_VERIFY_MIN_EVIDENCE", "1"))
+    try:
+        min_evidence = max(
+            _INDEPENDENT_EVIDENCE_FLOOR,
+            int(os.environ.get("MO_EMERGENT_VERIFY_MIN_EVIDENCE",
+                               _INDEPENDENT_EVIDENCE_FLOOR)))
+    except (TypeError, ValueError):
+        min_evidence = _INDEPENDENT_EVIDENCE_FLOOR
     db_path = _resolve_db(db_path)
     con = _connect(db_path)
     try:
@@ -816,15 +891,12 @@ def reflection_verify_patterns(*, db_path: str | None = None) -> int:
         now = int(time.time())
         approved = 0
         for pid, members_json, strength in rows:
-            try:
-                n_evidence = len(json.loads(members_json)) if members_json else 0
-            except (json.JSONDecodeError, TypeError):
-                n_evidence = 0
+            n_runs = _independent_evidence_count(con, _member_trace_ids(members_json))
             try:
                 s = float(strength)
             except (TypeError, ValueError):
                 s = 0.0
-            if s >= min_strength and n_evidence >= min_evidence:
+            if s >= min_strength and n_runs >= min_evidence:
                 con.execute(
                     "UPDATE emergent_patterns SET status='approved', resolved_at=? "
                     "WHERE pattern_id=? AND status='proposed'",
