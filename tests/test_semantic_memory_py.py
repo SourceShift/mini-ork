@@ -35,6 +35,14 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 MIGRATIONS_DIR = REPO_ROOT / "db" / "migrations"
 MIGRATION_PATH = MIGRATIONS_DIR / "0046_semantic_memory.sql"
 UTILITY_MIGRATION_PATH = MIGRATIONS_DIR / "0055_semantic_memory_utility.sql"
+ATTRIBUTION_MIGRATION_PATH = (
+    MIGRATIONS_DIR / "0058_semantic_memory_attribution.sql"
+)
+
+# The ledger contract as of 0046 + 0055, before attribution (0058) widened it.
+_LEDGER_COLUMNS_AT_0055 = {
+    "id", "memory_id", "scope", "run_id", "task_class", "retrieved_at", "outcome",
+}
 
 
 @pytest.fixture
@@ -273,12 +281,71 @@ def test_migration_idempotent(tmp_path, db_path):
         ledger_cols = {
             row[1] for row in conn.execute("PRAGMA table_info(semantic_memory_uses)")
         }
-        assert ledger_cols == {
-            "id", "memory_id", "scope", "run_id", "task_class",
-            "retrieved_at", "outcome",
-        }, f"unexpected ledger columns: {ledger_cols}"
+        assert ledger_cols == _LEDGER_COLUMNS_AT_0055, (
+            f"unexpected ledger columns: {ledger_cols}"
+        )
     finally:
         conn.close()
+
+
+def test_attribution_migration_is_additive_and_idempotent(tmp_path, db_path):
+    """0058 gives each retrieval event the identity of the decision that
+    caused it. Two things must hold: the ledger widens by exactly the two
+    accounting columns, and re-applying the file is a no-op rather than a
+    "duplicate column" crash.
+
+    The guard is the load-bearing part. 0058 is a *second* migration touching
+    a table 0055 already widened, so a fresh apply and a re-apply hit
+    different code paths — the fresh one adds the columns, the re-apply must
+    find them and skip. Only the guarded `.read "|sh -c …"` idiom does both.
+    """
+    sql = ATTRIBUTION_MIGRATION_PATH.read_text(encoding="utf-8")
+    # Assert on statements, not on prose — the header comment legitimately
+    # contains the words "dropped" and "altered" while promising the opposite.
+    code = "\n".join(
+        line for line in sql.splitlines() if not line.lstrip().startswith("--")
+    )
+    assert "semantic_memory_uses" in code, "0058 must target the retrieval ledger"
+    assert "DROP" not in code.upper(), "0058 must not drop anything"
+    assert "ALTER TABLE semantic_memory " not in code, (
+        "0058 must not touch the memory table; only the ledger"
+    )
+
+    migrations = tmp_path / "migrations"
+    migrations.mkdir()
+    for path in (MIGRATION_PATH, UTILITY_MIGRATION_PATH, ATTRIBUTION_MIGRATION_PATH):
+        shutil.copy(path, migrations / path.name)
+
+    rc, out = migrate_apply(str(migrations), db=str(db_path))
+    assert rc == 0, f"first apply failed (rc={rc}): {out}"
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute("DELETE FROM schema_migrations")
+        conn.commit()
+    finally:
+        conn.close()
+
+    rc, out = migrate_apply(str(migrations), db=str(db_path))
+    assert rc == 0, f"re-apply failed (rc={rc}): {out}"
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        ledger_cols = {
+            row[1] for row in conn.execute("PRAGMA table_info(semantic_memory_uses)")
+        }
+        idx_names = {
+            row[1] for row in conn.execute("PRAGMA index_list(semantic_memory_uses)")
+        }
+    finally:
+        conn.close()
+
+    assert ledger_cols == _LEDGER_COLUMNS_AT_0055 | {"lane", "node_id"}, (
+        f"0058 must add exactly lane + node_id; got {ledger_cols}"
+    )
+    assert "idx_semantic_memory_uses_lane" in idx_names, (
+        f"lane index missing; got {idx_names}"
+    )
 
 
 # ── SimUtil-UCB: the retrieval policy (RetroAgent 2603.08561) ─────────────
@@ -622,6 +689,150 @@ def test_connect_upgrades_a_table_that_predates_the_utility_columns(db_path):
         conn.close()
     assert {"uses", "wins"} <= cols, f"columns not upgraded: {cols}"
     assert "semantic_memory_uses" in tables, "ledger not bootstrapped"
+
+
+def test_connect_upgrades_a_ledger_that_predates_the_attribution_columns(db_path):
+    """The ledger has two upgrade points now: 0055 created it, 0058 widened it.
+    A DB that reached 0055 and stopped must be brought to the current shape by
+    the module's own bootstrap, because the migration loader is not the only
+    path a live DB takes — ``_connect`` runs on every call.
+
+    This is the second half of a contract that has to hold on both sides: the
+    migration adds the columns to a DB that goes through the loader, and
+    ``_ADDED_COLUMNS`` adds them to one that does not. If only one carried
+    them, a migrated DB and a bootstrapped DB would disagree about whether
+    attribution can be written at all.
+    """
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.executescript("""
+            CREATE TABLE semantic_memory_uses (
+              id           INTEGER PRIMARY KEY AUTOINCREMENT,
+              memory_id    INTEGER NOT NULL,
+              scope        TEXT    NOT NULL,
+              run_id       TEXT    NOT NULL DEFAULT '',
+              task_class   TEXT    NOT NULL DEFAULT '',
+              retrieved_at REAL    NOT NULL,
+              outcome      TEXT    NOT NULL DEFAULT 'pending'
+            );
+            CREATE INDEX idx_semantic_memory_uses_scope
+              ON semantic_memory_uses(scope);
+        """)
+        conn.commit()
+        have = {r[1] for r in conn.execute("PRAGMA table_info(semantic_memory_uses)")}
+        assert "lane" not in have, "premise: the pre-0058 ledger lacks attribution"
+    finally:
+        conn.close()
+
+    # search() alone must bring the ledger up to the current shape.
+    emb = _FixedEmbedder({"q": [1.0, 0.0]})
+    assert search("q", scope="s", db_path=db_path, embedder=emb) == []
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(semantic_memory_uses)")}
+    finally:
+        conn.close()
+    assert {"lane", "node_id"} <= cols, f"ledger columns not upgraded: {cols}"
+
+
+# ── attribution: which decision caused the retrieval (LIMBO 2609.14138) ─────
+
+
+def test_record_retrievals_attributes_the_decision_that_caused_it(db_path):
+    """A retrieval event carries the routed lane and the node whose prompt was
+    injected. Without it, memory spend cannot be held to the decision that
+    incurred it — a lane could retrieve heavily, fail, and show up in the
+    aggregate as if it had been frugal."""
+    emb = _FixedEmbedder({"q": [1.0, 0.0], "m": [1.0, 0.0]})
+    add("m", scope="s", infer=False, db_path=db_path, embedder=emb)
+    mid = _by_text(db_path, "s")["m"][0]
+
+    assert record_retrievals(
+        [mid], scope="s", run_id="run-1", task_class="code-fix",
+        lane="frontier", node_id="implementer-2", db_path=db_path,
+    ) == 1
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        row = conn.execute(
+            "SELECT run_id, task_class, lane, node_id, outcome "
+            "FROM semantic_memory_uses",
+        ).fetchone()
+    finally:
+        conn.close()
+    assert row == ("run-1", "code-fix", "frontier", "implementer-2", "pending")
+
+    # Attribution is part of the event, not of its resolution: closing the
+    # ledger row must not lose who opened it.
+    record_outcome("run-1", True, db_path=db_path)
+    conn = sqlite3.connect(str(db_path))
+    try:
+        row = conn.execute(
+            "SELECT lane, node_id, outcome FROM semantic_memory_uses",
+        ).fetchone()
+    finally:
+        conn.close()
+    assert row == ("frontier", "implementer-2", "win")
+
+
+def test_attribution_defaults_to_unknown_for_existing_callers(db_path):
+    """``lane``/``node_id`` are optional, so every caller written before this
+    tranche keeps working untouched. An unattributed retrieval is recorded as
+    unknown rather than guessed at — the same fails-closed posture as an
+    unresolved outcome: a retrieval whose decision is not known cannot be
+    credited to one."""
+    emb = _FixedEmbedder({"q": [1.0, 0.0], "m": [1.0, 0.0]})
+    add("m", scope="s", infer=False, db_path=db_path, embedder=emb)
+    mid = _by_text(db_path, "s")["m"][0]
+
+    # The pre-0058 call shape, verbatim: no lane, no node_id.
+    assert record_retrievals(
+        [mid], scope="s", run_id="run-1", task_class="code-fix", db_path=db_path,
+    ) == 1
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        lane, node_id = conn.execute(
+            "SELECT lane, node_id FROM semantic_memory_uses",
+        ).fetchone()
+    finally:
+        conn.close()
+    assert (lane, node_id) == ("", ""), "unknown must not be invented"
+
+
+def test_attribution_is_accounting_and_does_not_move_the_ranking(db_path):
+    """The columns exist to make spend attributable, not to influence
+    retrieval. Two memories with identical similarity and identical counters
+    must rank identically whatever lane retrieved them — if attribution leaked
+    into the score, a lane could launder rank by choosing its own bookkeeping."""
+    lane_a = _seed(db_path, "s", "a", [1.0, 0.0])
+    lane_b = _seed(db_path, "s", "b", [1.0, 0.0])
+    for i in range(3):
+        record_retrievals(
+            [lane_a], scope="s", run_id=f"a{i}", lane="cheap",
+            node_id="n", db_path=db_path,
+        )
+        record_retrievals(
+            [lane_b], scope="s", run_id=f"b{i}", lane="frontier",
+            node_id="n", db_path=db_path,
+        )
+        record_outcome(f"a{i}", True, db_path=db_path)
+        record_outcome(f"b{i}", True, db_path=db_path)
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        rows = dict(conn.execute(
+            "SELECT lane, COUNT(*) FROM semantic_memory_uses GROUP BY lane",
+        ).fetchall())
+    finally:
+        conn.close()
+    assert rows == {"cheap": 3, "frontier": 3}, "spend is attributable per lane"
+
+    emb = _FixedEmbedder({"q": [1.0, 0.0]})
+    out = search("q", scope="s", top_k=2, db_path=db_path, embedder=emb)
+    assert len(out) == 2
+    assert out[0]["utility"] == out[1]["utility"] == pytest.approx(4 / 5)
 
 
 # ── upsert(): mirror-a-source-table identity ─────────────────────────────────
