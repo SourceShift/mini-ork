@@ -173,3 +173,16 @@ un-mergeable.
    tempfile/chmod/unlink, nothing on disk). See the UPDATE note in Synthesis.
 3. **Egress/proxy:** if a container needs `HTTP(S)_PROXY`/`NO_PROXY`, add those
    names to the allowlist explicitly (deliberately not forwarded today).
+4. **The run contract is an exception to this allowlist (2026-09-18).** Cloud-swarm
+   S1 (`docs/architecture/cloud-swarm.md`) routes the recursive child through the
+   `Workspace` axis: `cli/spawn.py` filters the AMBIENT env and then injects the
+   child's identity (`MINI_ORK_HOME`/`_DB`/`_RUN_ID`/`_PARENT_RUN_ID`/
+   `_ALLOW_CHILD_SPAWN`). Because a backend's `spawn` filters the env it is handed
+   *again*, that second pass stripped all five and the child came up anonymous —
+   proved live on docker (every `MINI_ORK_*` key `<unset>`; the child would then
+   resolve a fresh `MINI_ORK_HOME` off its cwd and lose the run lineage).
+   `_RUN_CONTRACT_KEYS` re-admits exactly those five NAMES, so filtering an
+   already-assembled env is idempotent. Deliberately NOT a `MINI_ORK_` prefix: the
+   namespace stays closed (`MINI_ORK_ROOT`, host `MINI_ORK_HOME`, `MINI_ORK_SECRETS`
+   still cannot ride), so a forgotten override keeps failing LOUD in the child
+   instead of silently aiming at a host path absent from the sandbox.

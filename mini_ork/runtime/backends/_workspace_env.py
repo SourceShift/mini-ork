@@ -24,13 +24,29 @@ microVM ``exec(env=)`` — both MERGE onto the sandbox's own env rather than
 replacing it), which is why dropping ``PATH``/``HOME`` here is safe: the sandbox
 keeps its own.
 
+The RUN CONTRACT (``_RUN_CONTRACT_KEYS``) is the one deliberate exception. Those
+keys are not ambient host state — they are the identity the caller *sets* for the
+child — and the filter runs twice on that path: once in the caller (which
+assembles the contract AFTER filtering the ambient env) and once here, at the
+transport boundary. Without the exception the second pass strips the child's own
+identity and it launches as an anonymous process. Proved live: a recursive child
+under ``MO_SANDBOX_BACKEND=docker`` came up with every ``MINI_ORK_*`` key
+``<unset>``, so it would resolve a fresh ``MINI_ORK_HOME`` off its cwd and lose
+the whole run lineage.
+
 Decision: docs/decisions/20260804-docker-spawn-env-injection.md
 """
 from __future__ import annotations
 
 from typing import Mapping
 
-__all__ = ["container_env", "_container_env", "_AGENT_ENV_PREFIXES", "_AGENT_ENV_SUFFIXES"]
+__all__ = [
+    "container_env",
+    "_container_env",
+    "_AGENT_ENV_PREFIXES",
+    "_AGENT_ENV_SUFFIXES",
+    "_RUN_CONTRACT_KEYS",
+]
 
 _AGENT_ENV_PREFIXES = (
     "MO_",
@@ -58,17 +74,42 @@ _AGENT_ENV_PREFIXES = (
 )
 _AGENT_ENV_SUFFIXES = ("_API_KEY",)
 
+# The child's own identity + lineage, set BY the caller (``cli/spawn.py`` builds
+# these into the env it hands the transport). Deliberately an exact-name set and
+# NOT a ``MINI_ORK_`` prefix: an ambient host path (``MINI_ORK_ROOT``, host
+# ``MINI_ORK_HOME``) is exactly what must not ride across, and keeping the
+# namespace closed means a caller that forgets to set one of these still fails
+# LOUD in the child rather than silently pointing it at a host path that does not
+# exist inside the sandbox.
+_RUN_CONTRACT_KEYS = frozenset(
+    {
+        "MINI_ORK_HOME",
+        "MINI_ORK_DB",
+        "MINI_ORK_RUN_ID",
+        "MINI_ORK_PARENT_RUN_ID",
+        "MINI_ORK_ALLOW_CHILD_SPAWN",
+    }
+)
+
 
 def container_env(env: Mapping[str, str]) -> dict[str, str]:
     """Filter a host env down to the keys a scope=agent CLI may carry across an
     isolation boundary (allowlist — see the module note). Case-insensitive on the
     key name; values pass through unchanged. Pure + daemon-free so the boundary
     policy is unit-tested once (``tests/unit/test_workspace_env.py``) and shared
-    verbatim by every backend."""
+    verbatim by every backend.
+
+    Members of :data:`_RUN_CONTRACT_KEYS` always pass, so filtering an env the
+    caller already assembled (ambient allowlist + run contract) is idempotent —
+    the contract cannot be stripped by the transport-boundary second pass."""
     out: dict[str, str] = {}
     for key, val in env.items():
         upper = key.upper()
-        if upper.startswith(_AGENT_ENV_PREFIXES) or upper.endswith(_AGENT_ENV_SUFFIXES):
+        if (
+            upper.startswith(_AGENT_ENV_PREFIXES)
+            or upper.endswith(_AGENT_ENV_SUFFIXES)
+            or upper in _RUN_CONTRACT_KEYS
+        ):
             out[key] = val
     return out
 

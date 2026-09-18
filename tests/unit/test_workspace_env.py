@@ -86,3 +86,55 @@ def test_both_backends_share_one_policy_object():
     # other. This is the whole reason the helper was extracted (Builder lens).
     assert docker_backend._container_env is container_env
     assert microvm_backend._container_env is container_env
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# The run contract (idempotence across the transport boundary)
+# ─────────────────────────────────────────────────────────────────────────────
+def test_run_contract_keys_survive_a_second_filter_pass():
+    # THE regression this exception exists for. ``cli/spawn.py`` filters the
+    # ambient env and THEN adds the child's identity, so by the time the backend's
+    # ``spawn`` filters again the contract is already in the dict. Filtering must
+    # therefore be idempotent on it, or the child launches anonymous — verified
+    # live on docker: every MINI_ORK_* key arrived <unset>.
+    contract = {
+        "MINI_ORK_HOME": "/workspace",
+        "MINI_ORK_DB": "/workspace/py.db",
+        "MINI_ORK_RUN_ID": "c-iso",
+        "MINI_ORK_PARENT_RUN_ID": "p-iso",
+        "MINI_ORK_ALLOW_CHILD_SPAWN": "0",
+    }
+    assert _container_env(contract) == contract  # pass 1 (the caller's)
+    assert _container_env(_container_env(contract)) == contract  # pass 2 (backend's)
+
+
+def test_run_contract_keys_survive_alongside_ambient_keys():
+    env = {
+        "PATH": "/Users/admin/.pyenv/bin",  # host shell identity → dropped
+        "S1_HOST_SECRET": "hunter2",  # non-allowlisted → dropped
+        "ANTHROPIC_API_KEY": "sk-ant",  # allowlisted → kept
+        "MINI_ORK_HOME": "/workspace",
+        "MINI_ORK_RUN_ID": "c",
+    }
+    assert _container_env(env) == {
+        "ANTHROPIC_API_KEY": "sk-ant",
+        "MINI_ORK_HOME": "/workspace",
+        "MINI_ORK_RUN_ID": "c",
+    }
+
+
+def test_run_contract_exception_is_exact_name_not_the_whole_namespace():
+    # The namespace stays CLOSED. MINI_ORK_ROOT is a host path and MINI_ORK_SECRETS
+    # a host file; neither is part of the contract, and admitting the prefix would
+    # hand the sandbox a path that does not exist there. The exact-name set keeps
+    # a forgotten override failing loud instead of silently aiming at the host.
+    env = {
+        "MINI_ORK_ROOT": "/Volumes/docker-ssd/ps/mini-ork",
+        "MINI_ORK_SECRETS": "/Users/admin/.config/mini-ork/secrets.sh",
+        "MINI_ORK_WORKTREES_DIR": "/Volumes/docker-ssd/ps/mini-ork-worktrees",
+    }
+    assert _container_env(env) == {}
+
+
+def test_run_contract_match_is_case_insensitive():
+    assert _container_env({"mini_ork_run_id": "c"}) == {"mini_ork_run_id": "c"}
