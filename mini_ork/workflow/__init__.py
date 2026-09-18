@@ -15,6 +15,14 @@ from .compiler import (
     WorkflowNode,
     compile_workflow,
 )
+from .store import (
+    ArtifactStore,
+    ArtifactStoreError,
+    LocalArtifactStore,
+    make_artifact_store,
+    register_artifact_backend,
+    resolve_run_root,
+)
 
 __all__ = [
     "ArtifactBinding",
@@ -23,9 +31,15 @@ __all__ = [
     "ArtifactLedger",
     "ArtifactOutput",
     "ArtifactRef",
+    "ArtifactStore",
+    "ArtifactStoreError",
     "CompiledWorkflow",
+    "LocalArtifactStore",
     "PreparedInputs",
     "WorkflowCompileError",
     "WorkflowNode",
     "compile_workflow",
+    "make_artifact_store",
+    "register_artifact_backend",
+    "resolve_run_root",
 ]
