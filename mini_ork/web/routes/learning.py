@@ -298,6 +298,62 @@ def memory(db: StateDB = Depends(get_db), limit: int = 100) -> dict[str, Any]:
     return {"tasks": tasks, "agents": agents}
 
 
+# ── semantic memory — the lessons injected back, and whether they paid ──────
+
+
+@router.get("/semantic-memory")
+def semantic_memory(db: StateDB = Depends(get_db), limit: int = 100) -> dict[str, Any]:
+    """The retrievable lessons, plus the ledger of every retrieval.
+
+    `semantic_memory` is what the loop can recall — a lesson with a running
+    uses/wins tally. `semantic_memory_uses` is the per-retrieval audit trail:
+    which run pulled it, and whether that run then won.
+
+    The tally alone cannot separate a lesson that WORKS from one that is merely
+    fetched — uses climbing while wins stays flat is ballast, and on a poisoned
+    row it is the injection path doing its damage. `by_outcome` is that ratio in
+    one place, which is why the ledger is served next to the memory rather than
+    as a count.
+
+    `embedding` is deliberately NOT selected — a BLOB the panel never renders.
+    """
+    memories: list[dict[str, Any]] = []
+    uses: list[dict[str, Any]] = []
+    by_outcome: list[dict[str, Any]] = []
+
+    if db.has_table("semantic_memory"):
+        memories = db.rows(
+            """
+            SELECT id, scope, text, uses, wins, created_at, meta
+            FROM semantic_memory
+            ORDER BY wins DESC, uses DESC, created_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        )
+
+    if db.has_table("semantic_memory_uses"):
+        uses = db.rows(
+            """
+            SELECT id, memory_id, scope, run_id, task_class, retrieved_at, outcome
+            FROM semantic_memory_uses
+            ORDER BY retrieved_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        )
+        by_outcome = db.rows(
+            """
+            SELECT scope, outcome, COUNT(*) AS count
+            FROM semantic_memory_uses
+            GROUP BY scope, outcome
+            ORDER BY count DESC
+            """
+        )
+
+    return {"memories": memories, "uses": uses, "by_outcome": by_outcome}
+
+
 # ── gates — what may veto a run, and what it actually vetoed ─────────────────
 
 
@@ -610,6 +666,8 @@ def summary(db: StateDB = Depends(get_db)) -> dict[str, Any]:
         "promoted": promoted,
         "prompt_versions_scored": count("prompt_win_rates"),
         "failures": count("failure_memory"),
+        "semantic_memories": count("semantic_memory"),
+        "semantic_memory_uses": count("semantic_memory_uses"),
         "patterns": count("emergent_patterns"),
         "topologies": count("topology_win_rates"),
         "open_circuit_breakers": open_breakers,
