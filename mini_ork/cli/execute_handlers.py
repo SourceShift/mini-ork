@@ -1210,6 +1210,30 @@ def _warn_if_jury_not_decorrelated(jury_lanes) -> None:
         pass
 
 
+def _refute_artifacts(run_dir: str) -> tuple[str, str]:
+    """Locate this run's refute-or-promote campaign artifacts, if it held one.
+
+    The oracle needs BOTH sides of the experiment: the findings the validator
+    produced, and the manifest of plants it was measured against. Env overrides
+    win; the run-dir conventions are the fallback. Either side missing returns
+    ``("", "")``, which makes the oracle report ``indeterminate`` and the reward
+    is left alone — a run that never held a campaign is untouched by this.
+    """
+    findings = os.environ.get("MO_REFUTE_FINDINGS", "")
+    fabrications = os.environ.get("MO_REFUTE_FABRICATIONS", "")
+    if not findings:
+        for name in ("refute-findings.json", "refute-findings.txt"):
+            cand = os.path.join(run_dir, name)
+            if os.path.isfile(cand):
+                findings = cand
+                break
+    if not fabrications:
+        cand = os.path.join(run_dir, "fabrications.json")
+        if os.path.isfile(cand):
+            fabrications = cand
+    return findings, fabrications
+
+
 def _handle_eval(ctx: NodeDispatch):
     """Advisory per-run graded eval (roadmap Step-3). Dispatches a
     trajectory-aware LLM judge, aggregates its per-axis sub-scores, and persists
@@ -1370,6 +1394,36 @@ def _handle_eval(ctx: NodeDispatch):
         process_meta["decomposed_from"] = score
         score, verdict = decomposed, ej.verdict_from_score(decomposed)
 
+    # Layer 3b — refutation survival. The oracle plants findings it fabricated and
+    # counts how many the validator reported anyway; a validator surviving more of
+    # them than the ceiling is not refuting them, so a success built on its
+    # findings is not a success. VETO ONLY, and it runs LAST so no later stage can
+    # overwrite it: the veto is the outermost layer over the execution backbone.
+    # A run that never held a refute campaign has no artifacts → indeterminate →
+    # score untouched, which is why this costs nothing for every other recipe.
+    refute_meta: dict = {"refute": "absent"}
+    try:
+        from mini_ork.gates import refute_or_promote_gate as rpg  # noqa: PLC0415
+        findings_path, fabrications_path = _refute_artifacts(run_dir)
+        survival, _ = rpg.check_fabrication_survival(
+            findings_path, fabrications_path, report_dir=run_dir)
+        pre_refute = score
+        score, refute_meta = ej.refute_veto(score, survival)
+        if refute_meta.get("refute") == "REFUTE_FAILED":
+            refute_meta.update(gated_from=pre_refute, gated_to=score)
+            verdict = "needs_revision"
+            try:
+                pct = f"{float(refute_meta['fp_rate']):.0%}"
+                ceil = f"{float(refute_meta['fp_ceiling']):.0%}"
+            except (TypeError, ValueError):
+                pct = ceil = "?"
+            print(f"  [eval] REFUTE_FAILED — validator survived {pct} of fabricated "
+                  f"plants (> {ceil} ceiling) → gate {pre_refute:.2f}→{score:.2f} "
+                  f"verdict=needs_revision", file=sys.stderr)
+    except Exception as exc:  # noqa: BLE001 — advisory; never sink the run
+        refute_meta = {"refute": "unavailable", "error": str(exc)}
+    process_meta["refute"] = refute_meta
+
     # Persist the envelope for offline graders + the data flywheel.
     try:
         with open(os.path.join(run_dir, "eval.json"), "w", encoding="utf-8") as fh:
@@ -1392,6 +1446,10 @@ def _handle_eval(ctx: NodeDispatch):
     if sub_score is not None:
         reward_vector["subproblem_reward"] = sub_score
     reward_vector["decomposed"] = decomposed
+    # Measured plant-survival rate, so the GRPO group sees the oracle's signal as
+    # a number rather than only as the veto it already applied to `score`.
+    if isinstance(refute_meta.get("fp_rate"), (int, float)):
+        reward_vector["refute_survival"] = refute_meta["fp_rate"]
 
     # Write the graded reward onto the wired-but-empty 0042 reward columns.
     try:

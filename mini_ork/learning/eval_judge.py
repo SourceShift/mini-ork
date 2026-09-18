@@ -353,6 +353,43 @@ def jury_veto(reward: float, envelopes: list,
     return judge_veto(reward, consensus), meta
 
 
+# ── Layer 3b: refutation-survival veto ───────────────────────────────────────
+# The refute-or-promote oracle (gates/refute_or_promote_gate.py) plants findings
+# it knows are fabricated and counts how many the validator reports anyway. A
+# validator that survives more than a ceiling share of plants is not refuting
+# them — it is generating findings. A claimed success resting on that validator's
+# findings is therefore not a success, which is the same class of defect as an
+# incoherent success (test theater) and gets the same severity: 0.0 = block.
+DEFAULT_REFUTE_PENALTY = 0.0
+
+
+def refute_veto(reward: float, survival: dict | None,
+                penalty: float = DEFAULT_REFUTE_PENALTY) -> tuple[float, dict]:
+    """One-way downgrade of the reward by the refutation-survival oracle.
+
+    Multiply-only and one-way, exactly like ``judge_veto``: it can pull the
+    execution reward DOWN, never above it. Only a MEASURED ``REFUTE_FAILED``
+    engages. Every indeterminate state — missing artifacts, an unreadable
+    manifest, python unavailable — leaves the reward untouched, which is the
+    fail-open posture the eval node takes for all of its advisory signals and
+    which keeps a run that never held a refute campaign exactly as it was.
+
+    The distinction that matters: ``indeterminate`` means the oracle did not
+    measure, so it has no grounds to veto. It is not permission, and it is not
+    evidence of grounding either — it is silence, and silence changes nothing.
+    """
+    if not isinstance(survival, dict):
+        return clamp01(reward), {"refute": "absent"}
+    meta = {"refute": survival.get("verdict") or "malformed",
+            "reason": survival.get("reason"),
+            "fp_rate": survival.get("fp_rate"),
+            "fp_ceiling": survival.get("fp_ceiling")}
+    if meta["refute"] != "REFUTE_FAILED":
+        return clamp01(reward), meta
+    meta["applied"] = True
+    return clamp01(reward * clamp01(penalty)), meta
+
+
 # ── Layer 2 + reward decomposition (R1–R6) ───────────────────────────────────
 # The 2026 verifiable/process-reward cluster (VPRM 2601.17223, SEVA 2606.29713,
 # AgentV-RL 2604.16004, SCRL 2605.22074) says: extend the anti-Goodhart rule
