@@ -373,30 +373,57 @@ def failure_modes_md(task_class: str, limit: int = 5, db: str | None = None) -> 
 def _approved_emergent_rows(dbp: str) -> list[tuple]:
     """Approved (judge-gated) emergent patterns, strongest first.
 
+    Returns 5-tuples ``(pattern_id, cluster_label, feature_set_json,
+    strength_score, lesson_text)``.
+
     Cold-safe: a missing table, or one predating any of these columns, is an
-    empty list and not an error — this runs on the prompt-injection path.
+    empty list and not an error — this runs on the prompt-injection path. The
+    ``lesson_text`` column is probed rather than assumed: it arrives with
+    migration 0056, and a database that predates it must lose only the lessons
+    (which it does not have) and keep the whole block it has today.
     """
     con = sqlite3.connect(dbp)
     con.execute("PRAGMA busy_timeout=5000")
+    base = (
+        "SELECT pattern_id, cluster_label, feature_set_json, strength_score{extra} "
+        "FROM emergent_patterns WHERE status='approved' "
+        "ORDER BY strength_score DESC, detected_at DESC"
+    )
     try:
-        return con.execute("""
-            SELECT pattern_id, cluster_label, feature_set_json, strength_score
-            FROM emergent_patterns
-            WHERE status='approved'
-            ORDER BY strength_score DESC, detected_at DESC
-        """).fetchall()
+        return con.execute(base.format(extra=", lesson_text")).fetchall()
     except sqlite3.OperationalError:
-        return []
+        try:
+            return [
+                (pid, label, feats, strength, None)
+                for pid, label, feats, strength in con.execute(
+                    base.format(extra="")
+                ).fetchall()
+            ]
+        except sqlite3.OperationalError:
+            return []
     finally:
         con.close()
 
 
-def _emergent_text(feature_set_json: str | None, cluster_label: str | None) -> str:
-    """The one-line form of a pattern — `[feat] label`.
+def _emergent_text(
+    feature_set_json: str | None,
+    cluster_label: str | None,
+    lesson_text: str | None = None,
+) -> str:
+    """The one-line form of a pattern.
 
-    Shared by the static block and the semantic mirror so a memory reads
-    exactly as the pattern it came from.
+    An authored ``lesson_text`` wins when present; otherwise the pattern reads
+    as `[feat] label`. Shared by the static block and the semantic mirror so a
+    memory reads exactly as the pattern it came from.
+
+    The label is the cluster key the deterministic miner rendered as prose — a
+    frequency count, not guidance. It is kept only as the fallback for the
+    patterns no model has read yet, which on any database predating the
+    induction stage is all of them.
     """
+    lesson = (lesson_text or "").strip()
+    if lesson:
+        return lesson
     try:
         feats = json.loads(feature_set_json) if feature_set_json else []
     except Exception:
@@ -414,7 +441,8 @@ def _static_emergent_block(dbp: str, limit: int) -> str:
         return ""
     lines = ["--- Verified emergent patterns (cross-run, judge-gate approved) ---"]
     lines.extend(
-        f"- {_emergent_text(feats, label)}" for _pid, label, feats, _strength in rows
+        f"- {_emergent_text(feats, label, lesson)}"
+        for _pid, label, feats, _strength, lesson in rows
     )
     lines.append("--- /verified emergent patterns ---")
     return "\n".join(lines)
@@ -461,9 +489,9 @@ def semantic_lessons_md(task_class: str, limit: int = 5, db: str | None = None) 
         semantic.resolve_finished_runs(db_path=dbp)
 
         candidates = []
-        for pattern_id, label, feats, strength in rows:
+        for pattern_id, label, feats, strength, lesson in rows:
             memory_id = semantic.upsert(
-                _emergent_text(feats, label),
+                _emergent_text(feats, label, lesson),
                 scope=scope,
                 key=str(pattern_id),
                 db_path=dbp,
