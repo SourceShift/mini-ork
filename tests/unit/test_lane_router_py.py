@@ -24,6 +24,7 @@ import pytest
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
 from mini_ork import lane_router, trace_store  # noqa: E402
+from mini_ork.learning.advantage_store import AdvantageStore  # noqa: E402
 
 DETERM = {"MO_LEARNING_HALFLIFE_DAYS": "0"}
 
@@ -437,3 +438,177 @@ def test_lr_ref_recency(tmp_path):
     flat = one(0)
     assert rec is not None and flat is not None
     assert rec > flat, f"recency h14={rec} !> h0={flat}"
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# EquiRouter (2602.03478) — cross-slice Borda ranking.
+#
+# The claim under test: a lane's ordering against its alternatives is the
+# right object to learn, and a scale-free count is not dominated by whichever
+# lane carries the largest single magnitude. The fixture below is built so the
+# two answers DIFFER — laneX holds the biggest single advantage anywhere, and
+# laneY is preferred in two of three slices. Borda must return laneY.
+# ───────────────────────────────────────────────────────────────────────────
+
+_TC = "code-fix"
+_NT = "implementer"
+_OD = "code-delivery"
+
+
+def _adv_db(tmp_path) -> str:
+    """A db with lane_region_advantage seeded directly.
+
+    Rows are written rather than derived from traces so the test pins the
+    RANKING, not the advantage estimator (whose own behaviour is covered by
+    the recompute tests above). Three lanes across three regions:
+
+        r1: laneX +9.0  laneY +0.2  laneZ +0.1   → X largest by magnitude
+        r2: laneY +0.6  laneZ +0.5  laneX +0.1   → Y preferred
+        r3: laneY +0.6  laneZ +0.5  laneX +0.1   → Y preferred
+
+    Borda awards ``size - position`` (3/2/1 here): Y=8, X=5, Z=5 → laneY.
+    X and Z tie on points and the mean-advantage tiebreak orders X above Z.
+    A scalar selector reading r1 alone sees laneX as the clear winner; the
+    cross-slice ranking does not.
+    """
+    db = str(tmp_path / "state.db")
+    store = AdvantageStore(db).open()
+    store.ensure_advantage_tables()
+    rows = [
+        ("laneX", "r1", 9.0, 9.0), ("laneY", "r1", 0.2, 0.2), ("laneZ", "r1", 0.1, 0.1),
+        ("laneY", "r2", 0.6, 0.6), ("laneZ", "r2", 0.5, 0.5), ("laneX", "r2", 0.1, 0.1),
+        ("laneY", "r3", 0.6, 0.6), ("laneZ", "r3", 0.5, 0.5), ("laneX", "r3", 0.1, 0.1),
+    ]
+    for lane, region, adv, z in rows:
+        store.con.execute(
+            "INSERT OR REPLACE INTO lane_region_advantage "
+            "(agent_version_id, task_class, node_type, objective_domain, code_region, "
+            " relative_advantage, runs_count, success_count, z_score_advantage) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
+            (lane, _TC, _NT, _OD, region, adv, 5, 5, z))
+    store.commit()
+    store.close()
+    return db
+
+
+def _router_env(monkeypatch, **overrides):
+    """Deterministic router knobs; MO_EQUIROUTER unset unless overridden."""
+    base = {**DETERM, "MO_LEARNING_MIN_SAMPLES": "1"}
+    monkeypatch.delenv("MO_EQUIROUTER", raising=False)
+    for k, v in {**base, **overrides}.items():
+        monkeypatch.setenv(k, str(v))
+
+
+def test_rank_lanes_aggregates_across_slices(tmp_path, monkeypatch):
+    """Borda is scale-free: the lane preferred by most slices outranks the
+    lane holding the single largest advantage."""
+    _router_env(monkeypatch)
+    db = _adv_db(tmp_path)
+
+    ranking = lane_router.rank_lanes(_NT, _TC, _OD, db=db)
+
+    lanes = [lane for lane, _ in ranking]
+    assert lanes == ["laneY", "laneX", "laneZ"], lanes
+    scores = dict(ranking)
+    assert scores["laneY"] == 8.0
+    # laneX's +9.0 magnitude buys it no extra points — only its ordinal
+    # position counts, and it places last in two of three slices.
+    assert scores["laneX"] == 5.0
+
+
+def test_rank_lanes_needs_two_slices(tmp_path, monkeypatch):
+    """One slice carries no cross-slice preference, so nothing is ranked.
+
+    The pool is the set of (objective_domain, code_region) slices, and
+    ``code_region`` is deliberately not a filter on it — the region axis IS the
+    aggregation dimension. So a single-slice pool has to be built, not
+    requested: passing code_region="r1" against the 3-region db would still
+    rank across all three.
+    """
+    _router_env(monkeypatch)
+    db = str(tmp_path / "one.db")
+    store = AdvantageStore(db).open()
+    store.ensure_advantage_tables()
+    for lane, adv in (("laneX", 9.0), ("laneY", 0.2)):
+        store.con.execute(
+            "INSERT OR REPLACE INTO lane_region_advantage "
+            "(agent_version_id, task_class, node_type, objective_domain, code_region, "
+            " relative_advantage, runs_count, success_count, z_score_advantage) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
+            (lane, _TC, _NT, _OD, "r1", adv, 5, 5, adv))
+    store.commit()
+    store.close()
+
+    assert lane_router.rank_lanes(_NT, _TC, _OD, db=db) == []
+
+
+def test_rank_lanes_isolates_objective_domains(tmp_path, monkeypatch):
+    """Lanes observed under another objective domain must not vote here."""
+    _router_env(monkeypatch)
+    db = _adv_db(tmp_path)
+    store = AdvantageStore(db).open()
+    # laneW dominates a slice in a DIFFERENT objective domain.
+    store.con.execute(
+        "INSERT OR REPLACE INTO lane_region_advantage "
+        "(agent_version_id, task_class, node_type, objective_domain, code_region, "
+        " relative_advantage, runs_count, success_count, z_score_advantage) "
+        "VALUES (?,?,?,?,?,?,?,?,?)",
+        ("laneW", _TC, _NT, "book-gen", "r1", 99.0, 9, 9, 99.0))
+    store.con.execute(
+        "INSERT OR REPLACE INTO lane_region_advantage "
+        "(agent_version_id, task_class, node_type, objective_domain, code_region, "
+        " relative_advantage, runs_count, success_count, z_score_advantage) "
+        "VALUES (?,?,?,?,?,?,?,?,?)",
+        ("laneV", _TC, _NT, "book-gen", "r1", 1.0, 9, 9, 1.0))
+    store.commit()
+    store.close()
+
+    ranking = lane_router.rank_lanes(_NT, _TC, _OD, db=db)
+
+    assert [lane for lane, _ in ranking] == ["laneY", "laneX", "laneZ"]
+
+
+def test_preferred_lane_equirouter_overrides_scalar_dominance(tmp_path, monkeypatch):
+    """Default ON: the cross-slice ranking picks laneY in r1, where the scalar
+    selector would have taken laneX on its +9.0."""
+    _router_env(monkeypatch)
+    db = _adv_db(tmp_path)
+
+    pick = lane_router.preferred_lane(_TC, _NT, _OD, "r1", db=db)
+
+    assert pick.split("|")[0] == "laneY", pick
+
+
+def test_preferred_lane_equirouter_opt_out_restores_legacy(tmp_path, monkeypatch):
+    """MO_EQUIROUTER=0 restores the pre-EquiRouter pick verbatim."""
+    _router_env(monkeypatch, MO_EQUIROUTER="0")
+    db = _adv_db(tmp_path)
+
+    pick = lane_router.preferred_lane(_TC, _NT, _OD, "r1", db=db)
+
+    assert pick.split("|")[0] == "laneX", pick
+    # The opt-out must also restore the legacy UCB ordering exactly.
+    assert pick == lane_router._select_best_lane(
+        lane_router.AdvantageStore(db).open().fetch_region_candidates(
+            _TC, _OD, "r1", _NT, 1), True, 0.5, 0, _TC, _NT, _OD, "r1")
+
+
+def test_equirouter_never_invents_a_lane(tmp_path, monkeypatch):
+    """A lane ranked first by Borda but with no qualifying evidence in the
+    requested slice is skipped, not routed to."""
+    _router_env(monkeypatch)
+    db = _adv_db(tmp_path)
+    store = AdvantageStore(db).open()
+    # laneY ranks first overall but is below the floor in r1.
+    store.con.execute(
+        "UPDATE lane_region_advantage SET runs_count=0 "
+        "WHERE code_region='r1' AND agent_version_id='laneY'")
+    store.commit()
+    store.close()
+
+    pick = lane_router.preferred_lane(_TC, _NT, _OD, "r1", db=db)
+
+    assert pick.split("|")[0] != "laneY", pick
+    # laneX and laneZ tie on Borda points (2 each); mean advantage breaks it
+    # in laneZ's favour inside the ranked set, and both clear the floor.
+    assert pick.split("|")[0] in ("laneX", "laneZ"), pick
