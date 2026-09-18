@@ -25,6 +25,13 @@ looking. The measurement is real — no promote happens without one — but a me
 is evidence, not a guarantee. A probe set is only as strong as its probes, and the loop
 cannot know what it never tested.
 
+This is **recursive self-improvement**, not a metaphor for it. The human approval gate
+that earlier versions had was deliberately removed, and it was removed *because* the
+measurement gate is what does the work: there is no code path that promotes without a
+real held-out measurement, and there is no flag that restores the human branch. What
+protects you from a bad promote is the probe set, the per-task no-regression rule, and
+your version control — not a person in the loop.
+
 **If that is not what you want, the safe configuration is:**
 
 - Leave `MO_APPLY_ENABLED` and `MO_AUTO_APPLY` unset. Both default to off, and the
@@ -32,8 +39,10 @@ cannot know what it never tested.
 - Run it on a throwaway worktree, never on a checkout you care about.
 - Know your caps: `MO_APPLY_PROBE_BUDGET_USD` and `MO_APPLY_PROBE_MAX_TASKS` bound what
   a single apply run can spend.
-- Keep the target repository under version control. **Your VCS is the backstop** —
-  review the promoted diffs the way you would review a junior engineer's commit.
+- Keep the target repository under version control. `mini-ork rollback agent <target>`
+  restores the pre-promotion file and `mini-ork rollback workflow <name>` the workflow,
+  but **your VCS is the ultimate backstop** — review the promoted diffs the way you
+  would review a junior engineer's commit.
 
 This is a research-grade, self-improving system under active development. A promotion
 is a change that has already landed, not a proposal waiting for you. See

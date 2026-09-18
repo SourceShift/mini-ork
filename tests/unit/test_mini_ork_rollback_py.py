@@ -120,27 +120,30 @@ def _sql_query(db: str, sql: str, params: tuple = ()) -> list[dict]:
 
 def _seed_two_stables(db: str, kind: str, name: str,
                       v1_id: str, v2_id: str,
-                      t1: int = 100, t2: int = 200) -> None:
+                      t1: int = 100, t2: int = 200,
+                      contents: tuple = (None, None)) -> None:
     """Seed ``v1`` as the original stable (no previous) and ``v2`` as
-    the current stable with ``previous_stable_version = v1``."""
+    the current stable with ``previous_stable_version = v1``.
+
+    ``contents=(c1, c2)`` stores pre/post-mutation file text in each payload,
+    which is what a rollback needs to rewrite the target file. The default
+    ``(None, None)`` reproduces a legacy row that carries no content.
+    """
     con = sqlite3.connect(db)
     try:
-        con.execute(
-            "INSERT INTO version_registry "
-            "(version_id, kind, name, status, payload, "
-            " previous_stable_version, utility_score, promoted_at, created_at) "
-            "VALUES (?,?,?,?,?,?,?,?,?)",
-            (v1_id, kind, name, "stable", json.dumps({"name": name}),
-             None, 0.5, t1, t1),
-        )
-        con.execute(
-            "INSERT INTO version_registry "
-            "(version_id, kind, name, status, payload, "
-            " previous_stable_version, utility_score, promoted_at, created_at) "
-            "VALUES (?,?,?,?,?,?,?,?,?)",
-            (v2_id, kind, name, "stable", json.dumps({"name": name}),
-             v1_id, 0.5, t2, t2),
-        )
+        for vid, prev, t, content in ((v1_id, None, t1, contents[0]),
+                                      (v2_id, v1_id, t2, contents[1])):
+            payload = {"name": name}
+            if content is not None:
+                payload.update({"target_path": name, "content": content})
+            con.execute(
+                "INSERT INTO version_registry "
+                "(version_id, kind, name, status, payload, "
+                " previous_stable_version, utility_score, promoted_at, created_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?)",
+                (vid, kind, name, "stable", json.dumps(payload),
+                 prev, 0.5, t, t),
+            )
         con.commit()
     finally:
         con.close()
@@ -213,24 +216,40 @@ def test_three_args(temp_db):
 # ─────────────────────────────────────────────────────────────────────────────
 # (7) happy path — seeded with two stables, JSON stdout + DB state
 # ─────────────────────────────────────────────────────────────────────────────
-def test_happy_path_rollback(temp_db):
-    """Seed ``v1`` (stable, no prev) + ``v2`` (stable, prev=v1). After the
-    rollback:
+def test_happy_path_rollback(temp_db, monkeypatch):
+    """Seed ``v1`` (stable, no prev) + ``v2`` (stable, prev=v1), both carrying
+    the file text they were promoted with. After the rollback:
       * v2.status == 'retired'
       * v1.status == 'stable' (still, after promotion)
       * v1.promoted_at ~= now (int seconds, updated by the rollback SQL)
+      * the target file holds v1's content again, not v2's
       * stdout is the promoted version's JSON row
+      * stderr carries exactly the restore notice — the file write is
+        announced, so "reverted" can be read as "bytes restored"
     """
-    kind, name = "workflow", "svc"
-    v1, v2 = "v-wor-rb001", "v-wor-rb002"
-    _seed_two_stables(temp_db["db"], kind, name, v1, v2)
+    kind = "agent"
+    # The row's ``name`` IS the target path for an applied mutation, so the
+    # test uses a real file: that is the shape the live registry holds.
+    target = temp_db["tmp_path"] / "svc.md"
+    target.write_text("CHANGED\n", encoding="utf-8")
+    name = str(target)
+    v1, v2 = "v-age-rb001", "v-age-rb002"
+    monkeypatch.setenv("MINI_ORK_ROOT", str(temp_db["tmp_path"]))
+    _seed_two_stables(temp_db["db"], kind, name, v1, v2,
+                      contents=("ORIGINAL\n", "CHANGED\n"))
 
     before = _now()
     rc_py, out_py, err_py = _py_main([kind, name], db=temp_db["db"])
     after = _now()
 
     assert rc_py == 0, f"py happy-path failed: rc={rc_py} stderr={err_py!r}"
-    assert err_py == "", f"py stderr leaked: {err_py!r}"
+    # realpath: pytest's tmp dir is under /private/var on macOS.
+    assert err_py == (
+        f"version_rollback: restored {os.path.realpath(target)} from {v1}\n"
+    ), f"py stderr drifted: {err_py!r}"
+
+    # The status columns are not the rollback: the file must be restored.
+    assert target.read_text(encoding="utf-8") == "ORIGINAL\n"
 
     # stdout JSON is the promoted (previous stable) version row
     doc = json.loads(out_py)
@@ -250,6 +269,27 @@ def test_happy_path_rollback(temp_db):
     pa = by_id[v1]["promoted_at"]
     assert before - 1 <= pa <= after + 1, (
         f"v1.promoted_at={pa} not within [{before-1},{after+1}]"
+    )
+
+
+def test_happy_path_pre_content_row_reports_the_db_only_rollback(temp_db):
+    """A legacy row has no stored content, and the rollback says so.
+
+    Pre-content rows can only move DB state. Silence here would let the caller
+    read "reverted" as "the file was restored" — so the notice is asserted
+    rather than tolerated as noise.
+    """
+    kind, name = "workflow", "svc"
+    v1, v2 = "v-wor-rb101", "v-wor-rb102"
+    _seed_two_stables(temp_db["db"], kind, name, v1, v2)  # contents=(None,None)
+
+    rc_py, out_py, err_py = _py_main([kind, name], db=temp_db["db"])
+
+    assert rc_py == 0
+    assert json.loads(out_py)["version_id"] == v1
+    assert err_py == (
+        f"version_rollback: {v1} has no stored content (pre-content row); "
+        f"DB state rolled back, target file left as is\n"
     )
 
 

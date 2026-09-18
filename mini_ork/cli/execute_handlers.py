@@ -839,6 +839,24 @@ def _rollback_strategy(workflow_path: str) -> str:
         return ""
 
 
+def _run_changed_files(run_dir: str) -> list[str]:
+    """The implementer's recorded ``files_changed`` for this run ([] if none).
+
+    Shared by the two rollback paths: working-tree compensation reverts these
+    paths in git, and the version-registry rollback uses them to find which
+    promoted rows this run is responsible for.
+    """
+    summary_path = os.path.join(run_dir, "implementer-summary.json") if run_dir else ""
+    if summary_path and os.path.isfile(summary_path):
+        try:
+            data = json.load(open(summary_path, encoding="utf-8"))
+            if isinstance(data, dict) and isinstance(data.get("files_changed"), list):
+                return [e for e in data["files_changed"] if isinstance(e, str) and e]
+        except Exception:
+            return []
+    return []
+
+
 def _revert_working_tree(root: str, run_dir: str) -> bool:
     """``revert_branch`` compensation (roadmap Step 1 / fix-tracker M3).
 
@@ -853,15 +871,7 @@ def _revert_working_tree(root: str, run_dir: str) -> bool:
     def log(msg):
         print(msg, file=sys.stderr, flush=True)
 
-    summary_path = os.path.join(run_dir, "implementer-summary.json") if run_dir else ""
-    files: list[str] = []
-    if summary_path and os.path.isfile(summary_path):
-        try:
-            data = json.load(open(summary_path, encoding="utf-8"))
-            if isinstance(data, dict) and isinstance(data.get("files_changed"), list):
-                files = [e for e in data["files_changed"] if isinstance(e, str) and e]
-        except Exception:
-            files = []
+    files: list[str] = _run_changed_files(run_dir)
     if not files:
         log("  [rollback] revert_branch: no files_changed recorded — working tree untouched")
         return True
@@ -921,14 +931,34 @@ def _handle_rollback(ctx: NodeDispatch):
     # set_status('rolled_back') + return 1 (a no-op that also mis-set status and
     # double-counted the failure). The upstream failure already failed the run.
     from mini_ork.registries import version_registry as _vr
+    # Resolve the rows this run actually promoted instead of rolling back a
+    # hardcoded name. The old pair here was ("workflow", ctx.recipe) and
+    # ("agent", "default"); no live row is named "default" — applied prompt
+    # mutations are named by their absolute target path — so the agent rollback
+    # was a guaranteed no-op that still set reverted=True and printed success.
     reverted = False
-    for kind, name in (("workflow", ctx.recipe or "default"), ("agent", "default")):
+    run_dir = ctx.run_dir_eff or ctx.run_dir
+    changed = _run_changed_files(run_dir)
+    try:
+        rows = _vr.targets_for_paths(changed, db=ctx.db)
+    except Exception as e:
+        rows = []
+        print(f"  [warn] rollback: registry lookup failed: {e}", file=sys.stderr)
+    for row in rows:
         try:
-            _vr.rollback(kind, name, db=ctx.db)
+            _vr.rollback("agent", row["name"], db=ctx.db)
             reverted = True
-            break
+        except Exception as e:
+            print(f"  [warn] rollback: {row.get('name')}: {e}", file=sys.stderr)
+    if not reverted:
+        # Workflow-side fallback, unchanged: an applied workflow version is
+        # named by its recipe, and nothing in the run record maps a changed
+        # file back to one, so this stays a best-effort by-name attempt.
+        try:
+            _vr.rollback("workflow", ctx.recipe or "default", db=ctx.db)
+            reverted = True
         except Exception:
-            continue
+            pass
     if not reverted:
         print("  [ok] rollback: nothing to revert (no prior promoted version)", file=sys.stderr)
     # Working-tree compensation: honor the workflow's declared strategy
