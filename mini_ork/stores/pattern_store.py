@@ -96,6 +96,8 @@ __all__ = [
     "query",
     "mine_from_traces",
     "on_new_register",
+    "ensure_lesson_columns",
+    "add_lesson_column",
     "_db_path",
     "_ensure_table",
     "_ON_NEW_HOOKS",
@@ -145,6 +147,54 @@ def _db_path(db_path: str | None = None) -> str:
     )
 
 
+_LESSON_TABLES = ("pattern_records", "emergent_patterns")
+
+
+def add_lesson_column(con: sqlite3.Connection, table: str) -> None:
+    """Guarded ALTER adding ``lesson_text``, mirroring db/migrations/0056.
+
+    A database only sees 0056 if it goes through the migration runner, and the
+    live one does not: its ``schema_migrations`` table records view names from
+    ``db/views/*.sql`` rather than ``v_*.sql`` filenames, so the runner believes
+    nothing has been applied and replays from 0001. Code that reads or writes
+    ``lesson_text`` therefore has to heal a pre-0056 database itself — exactly
+    as ``memory.semantic._ensure_columns`` does for the 0055 utility columns.
+    """
+    try:
+        if not con.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?",
+            (table,),
+        ).fetchone()[0]:
+            return
+        have = con.execute(
+            "SELECT COUNT(*) FROM pragma_table_info(?) WHERE name='lesson_text'",
+            (table,),
+        ).fetchone()[0]
+    except sqlite3.OperationalError:
+        return
+    if have:
+        return
+    try:
+        # Table name is a module constant, never caller input — the ALTER
+        # grammar does not accept a bound parameter here.
+        con.execute(f"ALTER TABLE {table} ADD COLUMN lesson_text TEXT")
+        con.commit()
+    except sqlite3.OperationalError:
+        # Already added by a concurrent writer between the check and the ALTER.
+        pass
+
+
+def ensure_lesson_columns(db_path: str) -> None:
+    """Ensure ``lesson_text`` exists on both lesson-carrying tables."""
+    con = sqlite3.connect(db_path)
+    try:
+        con.execute("PRAGMA busy_timeout=5000")
+        for table in _LESSON_TABLES:
+            add_lesson_column(con, table)
+    finally:
+        con.close()
+
+
 def _ensure_table(db_path: str) -> None:
     """Mirror bash ``_pattern_ensure_table`` — DDL guard for pattern_records.
 
@@ -181,6 +231,7 @@ def _ensure_table(db_path: str) -> None:
             )
             """
         )
+        add_lesson_column(con, "pattern_records")
         con.commit()
     finally:
         con.close()
