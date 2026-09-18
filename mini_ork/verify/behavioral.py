@@ -549,23 +549,34 @@ def _eval_metamorphic(relation: str, primary: HttpResult, secondary: HttpResult)
     return Check(relation, None, f"{relation} not evaluable in P0")
 
 
-def _propose_relations(module: str, function: str, fn: Callable) -> list:
-    """Ask the configured model to select vetted relations for ``fn``.
+def _propose_relations(module: str, function: str, fn: Callable) -> dict | None:
+    """Ask the configured model to propose relations and seed inputs for ``fn``.
 
-    This path is runtime-only and opt-in. The proposer returns data, and the
-    relation library resolves that data to audited predicates; model-authored
-    code is never evaluated.
+    Returns the canonical spec ``metamorphic_proposer.to_spec`` shapes — target,
+    seed inputs, and relation names, all of them data — or ``None`` when the
+    proposer is unavailable or proposed nothing usable. This path is
+    runtime-only and opt-in.
+
+    Returning the whole spec rather than a bare list of names is the point: a
+    relation is only worth proposing if something can be run through it. The
+    seeds are what the metamorphic engine transforms, so a proposal that named
+    relations but carried no anchor would resolve to checks that cannot execute
+    — relations on paper, and an UNVERIFIED verdict. The caller adopts the seeds
+    when the recipe declared none of its own.
+
+    The safety boundary is unchanged and lives in ``parse_proposal``: relation
+    names are filtered against the vetted ``RELATION_LIBRARY`` and seeds are
+    accepted only as plain JSON, so nothing model-authored is ever evaluated.
     """
     import inspect
 
     import mini_ork.dispatch as mo_dispatch
-    from mini_ork.learning import metamorphic as mm
     from mini_ork.learning import metamorphic_proposer
 
     try:
         source = inspect.getsource(fn)
     except (OSError, TypeError):
-        return []
+        return None
     prompt = metamorphic_proposer.build_proposer_prompt(
         f"{module}.{function}", source
     )
@@ -577,11 +588,13 @@ def _propose_relations(module: str, function: str, fn: Callable) -> list:
             mo_dispatch.DispatchRequest(model=model, prompt=prompt)
         )
     except Exception:  # noqa: BLE001 - an unavailable optional lane means abstain
-        return []
+        return None
     if not result.ok:
-        return []
+        return None
     proposal = metamorphic_proposer.parse_proposal(result.text)
-    return mm.resolve_relations(proposal["relations"])
+    if not proposal["relations"]:
+        return None
+    return metamorphic_proposer.to_spec(module, function, proposal)
 
 
 def run_function_check(obs: Observable) -> BehavioralVerdict:
@@ -624,21 +637,23 @@ def run_function_check(obs: Observable) -> BehavioralVerdict:
             target=target,
         )
 
+    proposed_spec = None
     if obs.relations:
         relations = mm.resolve_relations(obs.relations)
     elif os.environ.get("MO_BEHAV_FN_PROPOSE") == "1":
-        proposed = _propose_relations(obs.module, obs.function, fn)
-        proposed_names = [
-            item if isinstance(item, str) else getattr(item, "name", "")
-            for item in proposed
-        ]
-        relations = mm.resolve_relations(proposed_names)
+        proposed_spec = _propose_relations(obs.module, obs.function, fn)
+        relations = mm.resolve_relations((proposed_spec or {}).get("relations", []))
     else:
         relations = mm.resolve_relations(
             relation.name for relation in mm.UNIVERSAL_RELATIONS
         )
 
-    if not obs.seed_inputs:
+    # A declared seed wins; a proposed one is the fallback. Without an anchor the
+    # relations cannot be exercised at all, so adopting the proposer's seeds is
+    # what lets an opt-in propose run reach a real measurement instead of
+    # resolving to an abstention it could never get past.
+    seed_inputs = obs.seed_inputs or (proposed_spec or {}).get("seed_inputs") or []
+    if not seed_inputs:
         checks = [Check("seed_inputs", None, "no seed inputs - cannot anchor")]
         return BehavioralVerdict(
             UNVERIFIED,
@@ -659,7 +674,7 @@ def run_function_check(obs: Observable) -> BehavioralVerdict:
 
     result = mm.check(
         fn,
-        copy.deepcopy(obs.seed_inputs),
+        copy.deepcopy(seed_inputs),
         relations,
         check_immutability=True,
     )
@@ -667,6 +682,7 @@ def run_function_check(obs: Observable) -> BehavioralVerdict:
         checks = [Check("relations_exercised", None, "no metamorphic relation ran")]
     else:
         checks = []
+
         for name, slot in result.per_relation.items():
             violations = int(slot.get("violations", 0))
             relation_counterexamples = [
@@ -693,6 +709,15 @@ def run_function_check(obs: Observable) -> BehavioralVerdict:
                 Check("relations_exercised", None, "all metamorphic relations were skipped")
             )
 
+    if proposed_spec is not None and not obs.seed_inputs:
+        # True, so it cannot move the verdict — `_resolve` only reads False and
+        # None. It is here because a verdict anchored on seeds the model chose
+        # has to say so where the verdict is read, on every path that reaches it.
+        checks.append(Check(
+            "seed_source", True,
+            f"{len(seed_inputs)} seed input(s) proposed by the model "
+            f"({os.environ.get('MO_BEHAV_FN_MODEL') or 'default lane'}), "
+            f"not declared by the recipe"))
     status = _resolve(checks)
     return BehavioralVerdict(
         status,
