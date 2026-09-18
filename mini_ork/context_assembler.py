@@ -302,10 +302,73 @@ def context_assemble(task_brief_path: str, workflow_node: str,
 
 # ── prompt-block emitters ────────────────────────────────────────────────────
 
-def failure_modes_md(task_class: str, limit: int = 5, db: str | None = None) -> str:
+# ── LIMBO: the retrieval count as a per-node parameter (arXiv 2609.14138) ────
+#
+# Retrieval injects memories into a prompt, and until now the count was a
+# constant: every node in every run of every recipe got the same top-N of the
+# same two learned-memory blocks. That is a spending decision made once and
+# applied everywhere — the technique's exact complaint — and it is the wrong
+# shape for a loop whose nodes differ enormously in what they have to do.
+#
+# What is implemented here is the ADDITIVE half only, and the omission is
+# deliberate. LIMBO's reported win (~53% cost reduction) comes from trimming
+# the cheap nodes; withheld memory is a chain on the agent, and the survey's
+# own caution is that a budget which trims retrieval "will silently drop" the
+# one memory a class of run depends on, invisibly in the average
+# (rsi-techniques/47-limbo.md). So the count may only go UP, and only for the
+# nodes whose output is a judgment rather than a mechanical transform.
+#
+# node_type, not lane, is the signal: a lane is a model binding and its cost is
+# not a stable property across providers, while "this node has to judge the
+# work against everything the loop has recorded" is exactly what node_type
+# names. The lane is recorded on the ledger instead (see semantic.py's
+# record_retrievals), which is what makes the spend attributable to a routing
+# decision without budgeting against lane cost.
+
+#: Nodes whose job is to judge or plan against the loop's accumulated record.
+#: They are the ones that must not repeat a failure already written down, so
+#: they get the deeper cut of the learned-memory blocks.
+_JUDGMENT_NODE_TYPES = frozenset({"reviewer", "planner", "synthesizer"})
+
+#: Memories a judgment node sees beyond the caller's limit.
+_LIMBO_JUDGMENT_EXTRA = 4
+
+
+def _limbo_enabled() -> bool:
+    """LIMBO is ON by default; ``MO_LIMBO_BUDGET=0`` restores the flat limit
+    verbatim. Opt-out, never opt-in — the same shape as this repo's other
+    default-on capabilities."""
+    return os.environ.get("MO_LIMBO_BUDGET", "1").strip().lower() not in (
+        "0", "false", "no", "")
+
+
+def _limbo_limit(node_type: str, base: int) -> int:
+    """Retrieval count for one node: ``base``, raised for judgment nodes.
+
+    Never returns less than ``base``, so no node is starved relative to the
+    behaviour this replaced and a caller that needs its own limit honoured
+    keeps it. ``base <= 0`` is passed through untouched — "no memories" is a
+    caller decision, not one to inflate.
+    """
+    if base <= 0 or not _limbo_enabled():
+        return base
+    if (node_type or "").strip().lower() in _JUDGMENT_NODE_TYPES:
+        return base + _LIMBO_JUDGMENT_EXTRA
+    return base
+
+
+def failure_modes_md(task_class: str, limit: int = 5, db: str | None = None,
+                     *, node_type: str = "", lane: str = "",
+                     node_id: str = "") -> str:
     """The "Learned failure modes" block; '' when no learnings. Includes the
     project-scope filter: framework-internal targets are stripped when
-    MO_TARGET_CWD is set and differs from MINI_ORK_ROOT."""
+    MO_TARGET_CWD is set and differs from MINI_ORK_ROOT.
+
+    `node_type` sets the LIMBO retrieval count (see ``_limbo_limit``); `lane`
+    and `node_id` are recorded on the retrieval ledger so the memory spend this
+    block costs is attributable. All three default to today's flat behaviour.
+    """
+    limit = _limbo_limit(node_type, limit)
     dbp = _db_path(db)
     if not os.path.isfile(dbp):
         return ""
@@ -354,12 +417,14 @@ def failure_modes_md(task_class: str, limit: int = 5, db: str | None = None) -> 
             emg_limit = int(os.environ.get("MO_EMERGENT_INJECT_LIMIT", "3"))
         except ValueError:
             emg_limit = 3
+        emg_limit = _limbo_limit(node_type, emg_limit)
         # The semantic channel owns this block when it can serve it: it ranks
         # the same approved patterns by earned utility rather than the static
         # strength_score, and closes the retrieval loop while it is there. An
         # unavailable or opted-out channel degrades to the static ordering —
         # never to nothing, because the lessons are still evidence.
-        block = semantic_lessons_md(task_class, emg_limit, db=dbp)
+        block = semantic_lessons_md(task_class, emg_limit, db=dbp,
+                                    lane=lane, node_id=node_id)
         if not block:
             block = _static_emergent_block(dbp, emg_limit)
         if block:
@@ -448,7 +513,8 @@ def _static_emergent_block(dbp: str, limit: int) -> str:
     return "\n".join(lines)
 
 
-def semantic_lessons_md(task_class: str, limit: int = 5, db: str | None = None) -> str:
+def semantic_lessons_md(task_class: str, limit: int = 5, db: str | None = None,
+                        *, lane: str = "", node_id: str = "") -> str:
     """The emergent-pattern block, ranked by earned utility (SimUtil-UCB).
 
     Same rows, same shape as `_static_emergent_block` — different order. The
@@ -465,6 +531,10 @@ def semantic_lessons_md(task_class: str, limit: int = 5, db: str | None = None) 
     static block exactly, so this is a non-regressive default; from then on
     the block also samples eligible patterns nobody has tried, which is the
     only way they ever get evidence.
+
+    `lane` and `node_id` are passed through to the retrieval ledger so the
+    spend this call incurs is attributable to the decision that caused it
+    (LIMBO, arXiv 2609.14138). They do not affect which memories are chosen.
 
     Returns '' when the channel is opted out, unavailable, or has nothing to
     say — the caller decides what to fall back to.
@@ -512,6 +582,8 @@ def semantic_lessons_md(task_class: str, limit: int = 5, db: str | None = None) 
                 scope=scope,
                 run_id=run_id,
                 task_class=task_class or "",
+                lane=lane,
+                node_id=node_id,
                 db_path=dbp,
             )
 

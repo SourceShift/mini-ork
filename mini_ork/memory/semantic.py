@@ -214,10 +214,11 @@ def _resolve_db_path(db_path: str | os.PathLike[str] | None) -> str:
 
 
 # Idempotent migration SQL — a slim copy of the canonical
-# db/migrations/0046_semantic_memory.sql plus 0055_semantic_memory_utility.sql,
-# so the module bootstraps a tmp DB without requiring the migration loader to
-# have run. Kept in lock-step with the .sql files by hand. Re-running this
-# block on an existing DB is a no-op (IF NOT EXISTS).
+# db/migrations/0046_semantic_memory.sql, 0055_semantic_memory_utility.sql and
+# 0058_semantic_memory_attribution.sql, so the module bootstraps a tmp DB
+# without requiring the migration loader to have run. Kept in lock-step with
+# the .sql files by hand. Re-running this block on an existing DB is a no-op
+# (IF NOT EXISTS).
 _BOOTSTRAP_SQL = """
 CREATE TABLE IF NOT EXISTS semantic_memory (
   id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -237,6 +238,8 @@ CREATE TABLE IF NOT EXISTS semantic_memory_uses (
   scope        TEXT    NOT NULL,
   run_id       TEXT    NOT NULL DEFAULT '',
   task_class   TEXT    NOT NULL DEFAULT '',
+  lane         TEXT    NOT NULL DEFAULT '',
+  node_id      TEXT    NOT NULL DEFAULT '',
   retrieved_at REAL    NOT NULL,
   outcome      TEXT    NOT NULL DEFAULT 'pending'
                CHECK (outcome IN ('pending','win','loss'))
@@ -247,22 +250,39 @@ CREATE INDEX IF NOT EXISTS idx_semantic_memory_uses_memory
   ON semantic_memory_uses(memory_id);
 """
 
-# Columns added after 0046 shipped. A DB created at 0046 — or by an earlier
-# version of this module's bootstrap — has the table without them, and
-# `CREATE TABLE IF NOT EXISTS` will not add them, so the presence of the table
-# is not evidence the columns are there. Guarded ALTER, same shape as
-# mini_ork/stores/migrate.py::_ensure_column.
-_ADDED_COLUMNS = (
-    ("uses", "INTEGER NOT NULL DEFAULT 0"),
-    ("wins", "INTEGER NOT NULL DEFAULT 0"),
-)
+# Columns added after their table's CREATE shipped, keyed by table. A DB created
+# at an earlier version — or by an earlier version of this module's bootstrap —
+# has the table without them, and `CREATE TABLE IF NOT EXISTS` will not add
+# them, so the presence of the table is not evidence the columns are there.
+# Guarded ALTER, same shape as mini_ork/stores/migrate.py::_ensure_column.
+#
+# The ledger's ``lane`` / ``node_id`` are LIMBO's accounting half (arXiv
+# 2609.14138): a retrieval injects tokens into a prompt, and until the decision
+# that caused it is recorded, that spend cannot be attributed to a lane or
+# weighed against what the memories bought. The table names here are module
+# constants, never caller input.
+_ADDED_COLUMNS: dict[str, tuple[tuple[str, str], ...]] = {
+    "semantic_memory": (
+        ("uses", "INTEGER NOT NULL DEFAULT 0"),
+        ("wins", "INTEGER NOT NULL DEFAULT 0"),
+    ),
+    "semantic_memory_uses": (
+        ("lane", "TEXT NOT NULL DEFAULT ''"),
+        ("node_id", "TEXT NOT NULL DEFAULT ''"),
+    ),
+}
 
 
 def _ensure_columns(conn: sqlite3.Connection) -> None:
-    have = {r[1] for r in conn.execute("PRAGMA table_info('semantic_memory')")}
-    for name, ddl in _ADDED_COLUMNS:
-        if name not in have:
-            conn.execute(f"ALTER TABLE semantic_memory ADD COLUMN {name} {ddl}")
+    for table, columns in _ADDED_COLUMNS.items():
+        have = {r[1] for r in conn.execute(f"PRAGMA table_info('{table}')")}
+        if not have:
+            # Table absent entirely: _BOOTSTRAP_SQL creates it with every
+            # column already, so there is nothing to upgrade.
+            continue
+        for name, ddl in columns:
+            if name not in have:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
 
 
 def _connect(db_path: str) -> sqlite3.Connection:
@@ -793,6 +813,8 @@ def record_retrievals(
     scope: str,
     run_id: str = "",
     task_class: str = "",
+    lane: str = "",
+    node_id: str = "",
     db_path: str | os.PathLike[str] | None = None,
 ) -> int:
     """Log that these memories were injected into a prompt for ``run_id``.
@@ -806,6 +828,14 @@ def record_retrievals(
     look worse, never better. That is deliberate: the failure mode worth
     guarding is a memory silently earning credit it never proved, and failing
     closed is the only way to make an unattributed retrieval harmless.
+
+    ``lane`` and ``node_id`` name the decision that caused the injection. They
+    are accounting, not ranking: nothing in ``search()`` or
+    ``rank_with_prior()`` reads them. With them recorded, the retrieval spend a
+    run incurred can be attributed to the lane and node that chose it
+    (LIMBO, arXiv 2609.14138) instead of being invisible; without them the
+    ledger says a memory was used but never by whom, so no lane can be held to
+    its retrieval cost. Default ``''`` keeps every existing caller unchanged.
 
     Only ids that actually exist in ``scope`` are recorded — the ledger is the
     authoritative audit trail and should never assert a retrieval of something
@@ -835,9 +865,11 @@ def record_retrievals(
             return 0
         conn.executemany(
             "INSERT INTO semantic_memory_uses"
-            "(memory_id, scope, run_id, task_class, retrieved_at, outcome) "
-            "VALUES (?, ?, ?, ?, ?, 'pending')",
-            [(mid, scope, run_id, task_class, now) for mid in present],
+            "(memory_id, scope, run_id, task_class, lane, node_id, "
+            " retrieved_at, outcome) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')",
+            [(mid, scope, run_id, task_class, lane, node_id, now)
+             for mid in present],
         )
         conn.executemany(
             "UPDATE semantic_memory SET uses = uses + 1 WHERE id = ?",
