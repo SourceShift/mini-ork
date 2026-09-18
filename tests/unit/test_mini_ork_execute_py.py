@@ -677,6 +677,44 @@ def test_publisher_preserves_heterogeneous_run_local_artifacts(tmp_path, monkeyp
     assert statuses == ["published"]
 
 
+def test_publisher_bare_relative_output_stays_run_local_not_repo_root(tmp_path, monkeypatch):
+    """A BARE relative output (goal-loop's panel-verdict.json) is a run-local
+    artifact — it must be preserved in run_dir, never copied + committed to the
+    mini-ork repo root. Regression for the stray `audit(goal-loop): publish
+    synthesis from <run>` commit that landed on the repo root every wave."""
+    root = _git_repo(tmp_path / "engine")
+    base_head = subprocess.check_output(
+        ["git", "-C", str(root), "rev-parse", "HEAD"], text=True
+    ).strip()
+    recipe_dir = root / "recipes" / "goal-loop-t"
+    recipe_dir.mkdir(parents=True)
+    run_dir = root / ".mini-ork" / "runs" / "run-goalcheck"
+    run_dir.mkdir(parents=True)
+    verdict = run_dir / "panel-verdict.json"
+    verdict.write_text('{"verdict": "fail", "failing_units": ["1"], "total_units": 10}\n')
+    (recipe_dir / "artifact_contract.yaml").write_text(
+        "source_artifact: panel-verdict.json\noutputs:\n  - panel-verdict.json\n"
+    )
+    monkeypatch.setenv("MINI_ORK_RUN_DIR", str(run_dir))
+    statuses = []
+    monkeypatch.setattr(ex, "set_status", lambda _db, _rid, status: statuses.append(status))
+
+    rc, reason = ex.publisher_node(
+        str(root), str(run_dir), "", "run-goalcheck", "goal-loop-t", "goal_loop"
+    )
+
+    assert (rc, reason) == (0, "done")
+    # The bug: a bare relative output was joined to `root` and committed there.
+    assert not (root / "panel-verdict.json").exists(), "verdict leaked to repo root"
+    head = subprocess.check_output(
+        ["git", "-C", str(root), "rev-parse", "HEAD"], text=True
+    ).strip()
+    assert head == base_head, "publisher made a stray commit on the repo root"
+    # The artifact stays in its canonical run-local place, byte-for-byte.
+    assert json.loads(verdict.read_text())["verdict"] == "fail"
+    assert statuses == ["published"]
+
+
 def test_publisher_commit_stages_only_reviewed_files(tmp_path):
     repo = _git_repo(tmp_path / "publish-repo")
     reviewed = repo / "app.py"

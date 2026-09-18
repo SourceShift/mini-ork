@@ -227,7 +227,18 @@ def publisher_node(root, run_dir, db, run_id, recipe, task_class, review_file=""
     run_root = os.path.realpath(run_dir)
     for out in outputs:
         out = _envsubst(out)
-        dst = os.path.join(root, out)
+        # A BARE relative filename (no directory component) is a run-local
+        # artifact the producer wrote into run_dir — e.g. goal-loop's
+        # panel-verdict.json. It must resolve against run_dir, NOT `root`:
+        # joining a bare name to `root` dumps it at the mini-ork repo root and
+        # commits it there (the stray `audit(<recipe>): publish synthesis`
+        # pollution that lands on every wave). Relative paths WITH a directory
+        # component (docs/refactor/foo.md) stay repo-relative publish targets;
+        # absolute ${MINI_ORK_RUN_DIR}/foo paths are already run-local.
+        if not os.path.isabs(out) and os.path.dirname(out) == "":
+            dst = os.path.join(run_dir, out)
+        else:
+            dst = os.path.join(root, out)
         dst_real = os.path.realpath(dst)
         run_local = dst_real == run_root or dst_real.startswith(run_root + os.sep)
 
