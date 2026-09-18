@@ -67,6 +67,7 @@ from mini_ork.learning.writeback import (  # noqa: F401
 )
 from mini_ork.dispatch.routing import (  # noqa: F401
     dispatch_chain,
+    last_route_provenance,
     learning_governed_lane,
     learning_static_lane,
     policy_route_lane,
@@ -1851,10 +1852,11 @@ def _make_trace_fn(task_class, db, run_id):
     writes a row with a reward stamp (reward_from_status) + code_region so
     lane_router_recompute_advantages has real signal to learn from.
     Signature matches dispatch_node's `trace(node_id, status, node_type, output_file,
-    verdict, finish_reason, lane)`."""
+    verdict, finish_reason, lane, route_source, route_explore, route_score)`."""
     from mini_ork import trace_store  # noqa: PLC0415
 
-    def _tf(node_id, status, node_type, output_file="", verdict="", finish_reason="", lane=""):
+    def _tf(node_id, status, node_type, output_file="", verdict="", finish_reason="",
+            lane="", route_source="", route_explore=False, route_score=None):
         extra = {
             "trace_id": f"tr-{node_type}-{node_id}-{uuid.uuid4().hex[:8]}",
             "run_id": run_id,
@@ -1870,6 +1872,16 @@ def _make_trace_fn(task_class, db, run_id):
         # so lane_router_recompute_advantages can't group rows by lane.
         if lane:
             extra["agent_version_id"] = lane
+        # Route provenance (migration 0054). Persisting WHY this lane was chosen is
+        # what makes a lane's win attributable: without it a learned route, an
+        # epsilon-greedy explore swap, and a recipe pin collapse into one
+        # indistinguishable "agent_version_id", and no outcome can be credited to
+        # the decision that produced it.
+        if route_source:
+            extra["route_source"] = route_source
+            extra["route_explore"] = bool(route_explore)
+            if route_score is not None:
+                extra["route_score"] = float(route_score)
         # Implementer code_region must reflect the TARGET repo's edited source,
         # not the .mini-ork run-log path. Seed files_written from git-visible
         # target-repo changes FIRST so infer_trace_code_region resolves the

@@ -276,6 +276,21 @@ def recursion_hint() -> dict:
     }
 
 
+def _learned_score(learned: str) -> float | None:
+    """Advantage component of ``preferred_lane``'s ``lane|adv|runs`` string.
+
+    None when the string is absent or malformed — the score is provenance, so a
+    missing one must never make the decision itself fail.
+    """
+    parts = (learned or "").split("|")
+    if len(parts) < 2:
+        return None
+    try:
+        return float(parts[1])
+    except (TypeError, ValueError):
+        return None
+
+
 def decide(node_type: str, task_class: str, objective_domain: str = "",
            segment: str = "default", db: str | None = None) -> dict:
     """The stateless decision surface. Same JSON contract as bash decide."""
@@ -287,6 +302,15 @@ def decide(node_type: str, task_class: str, objective_domain: str = "",
     learned_route = learned.split("|")[0] if learned else ""
     route = learned_route or default_lane(node_type)
 
+    # Provenance of the route itself, persisted to execution_traces.route_*.
+    # Without it a lane's win is unattributable after the fact: a learned route,
+    # an epsilon-greedy exploration swap, and an agents.yaml default are
+    # indistinguishable, so no outcome can be credited to (or debited from) the
+    # decision that produced it. That is the signal EquiRouter ranks on.
+    route_source = "learned" if learned_route else "default"
+    route_score = _learned_score(learned)
+    explore = False
+
     if learned_route:
         epsilon_s = os.environ.get("EPSILON",
                                    os.environ.get("MO_LEARNING_EPSILON", "0.10"))
@@ -295,12 +319,21 @@ def decide(node_type: str, task_class: str, objective_domain: str = "",
         except (TypeError, ValueError):
             epsilon = 0.10
         seed = os.environ.get("SEED", os.environ.get("MO_LEARNING_SEED", ""))
-        route = _explore_route(route, epsilon, seed, resolve_agents_yaml())
+        explored = _explore_route(route, epsilon, seed, resolve_agents_yaml())
+        # _explore_route returns the exploit route unchanged when the draw loses,
+        # so an inequality is the only reliable signal that exploration fired.
+        if explored != route:
+            route = explored
+            route_source = "explore"
+            explore = True
 
     ok = coalition_ok(objective_domain, task_class, node_type, dbp)
     mean, sample = reward_summary(objective_domain, task_class, node_type, dbp)
     return {
         "route": route,
+        "route_source": route_source,
+        "route_explore": explore,
+        "route_score": route_score,
         "coalition_ok": ok,
         "reward_estimate": mean,
         "recursion_hint": recursion_hint(),

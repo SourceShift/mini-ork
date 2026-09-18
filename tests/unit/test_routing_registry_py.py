@@ -36,3 +36,37 @@ def test_register_policy_extends_routing(monkeypatch):
 def test_dry_run_preserves_lane(monkeypatch):
     monkeypatch.setenv("MO_ROUTING_POLICY", "frontier_only")
     assert routing.policy_route_lane("reviewer", "kimi_lens", dry_run=True) == "kimi_lens"
+
+
+def test_policy_route_lane_records_provenance(monkeypatch):
+    """Every routed lane carries an origin, so an outcome can be attributed to the
+    decision that produced it. Before this the policy returned a bare lane string
+    and the reason it chose that lane was lost."""
+    # A recipe pin is author intent, not a router decision — and it must survive.
+    assert _route("researcher", "glm_lens", monkeypatch, "learning_governed") == "glm_lens"
+    assert routing.last_route_provenance() == {
+        "route_source": "pinned", "route_explore": False,
+        "route_policy": "learning_governed",
+    }
+
+    # A rule-based policy that never consults the brain still names itself.
+    _route("reviewer", "reviewer", monkeypatch, "frontier_only")
+    prov = routing.last_route_provenance()
+    assert prov["route_source"] == "policy"
+    assert prov["route_policy"] == "frontier_only"
+    assert prov["route_explore"] is False
+
+    # provenance must not leak from the previous node into this one
+    _route("researcher", "researcher", monkeypatch, "workflow_default")
+    assert routing.last_route_provenance()["route_policy"] == "workflow_default"
+
+
+def test_route_provenance_absent_on_dry_run(monkeypatch):
+    """Dry-run is a workflow-shape preview, not a policy preview: it must record
+    no decision, and must not leave the previous node's decision standing."""
+    monkeypatch.setenv("MO_ROUTING_POLICY", "frontier_only")
+    _route("reviewer", "reviewer", monkeypatch, "frontier_only")
+    assert routing.last_route_provenance()  # a real decision was recorded
+
+    assert routing.policy_route_lane("reviewer", "kimi_lens", dry_run=True) == "kimi_lens"
+    assert routing.last_route_provenance() == {}
