@@ -1,0 +1,60 @@
+version: "0.1.0"
+task_class: goal_loop
+description: >
+  One wave of a long-horizon goal loop. Reads per-unit goal state from the
+  target repo (MO_GOAL_TARGET_CWD + MO_GOAL_UNITS_CMD + MO_GOAL_PREDICATE_CMD),
+  plans up to MO_GOAL_MAX_CHILDREN_PER_WAVE fix children, re-checks every
+  unit, and writes panel-verdict.json. An outer driver re-runs waves until
+  the verdict is `pass` or a stop condition fires.
+
+nodes:
+  - name: planner
+    type: planner
+    model_lane: planner
+    prompt_ref: prompts/planner.md
+    dispatch_mode: serial
+
+  - name: goal_state
+    type: transform
+    transform: goal_state_eval
+    dispatch_mode: serial
+    outputs:
+      - { name: goal_state, path: goal-state.json, kind: file, visibility: consumer }
+
+  - name: sweep_dispatcher
+    type: transform
+    transform: goal_sweep_plan
+    dispatch_mode: serial
+    outputs:
+      - { name: sweep_plan, path: sweep-plan.json, kind: file, visibility: consumer }
+
+  - name: goal_check
+    type: verifier
+    prompt_ref: null
+    verifier_ref: verifiers/goal_check.py
+    dispatch_mode: serial
+    outputs:
+      - { name: panel_verdict, path: panel-verdict.json, kind: file, visibility: consumer }
+
+  - name: publisher
+    type: publisher
+    prompt_ref: prompts/publisher.md
+    dispatch_mode: serial
+
+edges:
+  - { from: planner,          to: goal_state,        edge_type: depends_on }
+  - { from: goal_state,       to: sweep_dispatcher,  edge_type: depends_on }
+  - { from: sweep_dispatcher, to: goal_check,        edge_type: depends_on }
+  - { from: goal_check,       to: publisher,         edge_type: depends_on }
+
+recursion:
+  max_iterations: 30
+  convergence_check: all_goal_units_pass
+  budget_cap_per_iter_usd: 10.00
+  budget_cap_total_usd: 150.00
+  divergence_kill: |
+    Wave N+1 produces the same failing-unit set as wave N. Detected by hashing
+    the sorted list of failing unit ids from panel-verdict.json. Two identical
+    hashes in a row -> escalate to operator instead of looping forever.
+
+source_artifact: panel-verdict.json

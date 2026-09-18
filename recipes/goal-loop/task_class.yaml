@@ -1,0 +1,26 @@
+name: goal_loop
+description: >
+  Goal-agnostic long-horizon loop recipe: one wave reads per-unit goal state
+  (watch), picks failing units (hunt), plans bounded fix children (fix), and
+  re-checks touched units to record merge decisions (verify). The wave emits
+  `panel-verdict.json` with `verdict: pass` iff EVERY unit satisfies the goal
+  predicate; an outer driver (built separately) re-runs waves until pass/stop.
+  Goal-specific knobs (target repo, unit lister, predicate command, child
+  recipe, max children per wave) are CONFIG read from MO_GOAL_* env vars.
+
+artifact_contract_ref: artifact_contract.yaml
+default_workflow: workflow.yaml
+
+matches:
+  keywords:
+    - goal-loop
+    - goal loop
+    - watch-hunt-fix-verify
+    - panel-verdict
+    - long-horizon
+    - per-unit gate
+    - book goal loop
+  regex:
+    - "goal[ -]loop"
+    - "watch.*hunt.*fix.*verify"
+    - "(unit|chapter|module)[ -](gate|check|status)"
