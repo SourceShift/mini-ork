@@ -200,20 +200,53 @@ def test_claude_env_for_empty_without_key(monkeypatch):
     assert "ANTHROPIC_AUTH_TOKEN" not in env
 
 
-def test_resolve_gateway_lane_uses_json_envelope():
-    spec = resolve_provider("glm")
-    assert spec.command[0] == "claude"
-    assert spec.command[-1] == "json"
-    assert spec.parse_text is claude_result_text
-    assert spec.parse_usage is parse_claude_usage
+def _repo_lane(lane: str, tmp_path, monkeypatch):
+    # Pin the home to an empty scratch registry so the loader consults the REPO
+    # config: a live home (CWD-relative .mini-ork or MINI_ORK_HOME) shadows the
+    # repo registry, and the lane's `gateway:` key is exactly what is under test.
+    monkeypatch.delenv("MINI_ORK_PROVIDERS", raising=False)
+    monkeypatch.setenv("MINI_ORK_HOME", str(tmp_path / ".mini-ork"))
+    return resolve_provider(lane)
 
 
-def test_resolve_all_anthropic_compatible_gateways_as_json_envelopes():
-    for lane in ("deepseek", "glm", "kimi", "minimax"):
-        spec = resolve_provider(lane)
-        assert spec.command[-1] == "json", lane
+# The lanes the B0 probe measured relaying `content_block_delta` at token
+# granularity (2026-09-18). Streaming is opt-in per lane precisely so a gateway
+# that buffers can stay on the json envelope rather than emitting the same
+# events in one lump at exit — so this set is a measurement, not a default.
+_STREAMS = ("deepseek", "glm", "minimax")
+
+
+def test_gateway_lanes_opt_into_stream_json_only_where_the_probe_measured_it(tmp_path, monkeypatch):
+    for lane in _STREAMS:
+        cmd = _repo_lane(lane, tmp_path, monkeypatch).command
+        assert cmd[:5] == (
+            "claude",
+            "--print",
+            "--permission-mode",
+            "bypassPermissions",
+            "--output-format",
+        ), lane
+        # --include-partial-messages makes it token-level rather than
+        # whole-message; --verbose is mandatory when --print meets stream-json.
+        assert cmd[5:] == ("stream-json", "--verbose", "--include-partial-messages"), lane
+
+
+def test_every_anthropic_compat_lane_parses_identically_whatever_the_format(tmp_path, monkeypatch):
+    """The format is a transport detail; the four parsers are the contract. A
+    lane that streams while keeping a json-only parser would report zero cost
+    and resume nothing — the silent failure this migration risks."""
+    for lane in (*_STREAMS, "kimi"):
+        spec = _repo_lane(lane, tmp_path, monkeypatch)
+        assert spec.command[0] == "claude", lane
         assert spec.parse_text is claude_result_text, lane
         assert spec.parse_usage is parse_claude_usage, lane
+
+
+def test_lanes_outside_the_measured_set_keep_the_json_envelope_byte_for_byte(tmp_path, monkeypatch):
+    """A lane added to providers.yaml without deciding its format must fail
+    here rather than silently streaming an unmeasured gateway."""
+    for lane in ("kimi",):
+        assert _repo_lane(lane, tmp_path, monkeypatch).command[-1] == "json", lane
 
 
 def test_resolve_native_claude_lane_uses_json_envelope(tmp_path, monkeypatch):
