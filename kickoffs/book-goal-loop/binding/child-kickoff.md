@@ -24,10 +24,25 @@ also written to `{{evidence_path}}`.)
 ## How to think about this
 
 Read the evidence and form your OWN root-cause hypothesis. The evidence may
-include a "why this likely re-rolls forever" section — treat that as a LEAD to
-confirm in source, not as gospel.
+include a "why this likely re-rolls forever" section — that LEAD applies ONLY to
+the drift shapes (1 and 2) below; it is meaningless for a hard crash. Confirm in
+source, never treat as gospel.
 
-Two failure shapes are common here; the evidence tells you which one you have:
+**Classify the failure FIRST from the untruncated `last_error` in the evidence —
+the shapes need different fixes and picking the wrong one wastes the whole wave:**
+
+0. **Hard crash — the node's in-sandbox production THREW.** If `last_error` reads
+   `chapterInternalDagDispatch: segment node '<node>' did not complete` with
+   `verified-artifact exit_code=1 (node_key=<node>)`, the node did NOT drift — its
+   mini-ork subprocess exited non-zero. This is NOT a prompt or presence-policy
+   problem; re-wording headings does nothing. The exit is emitted by
+   `server/services/bookGeneration/verifiedArtifactClient.ts`; the subprocess it
+   spawns runs `server/compose/verifiedArtifact/verifiedArtifactProduction.ts` and
+   `verifiedArtifactDagRuntime.ts` — **both were changed by the most recent compose
+   commit, so a regression there is the prime suspect** (`git log -p -2 -- server/compose/verifiedArtifact/`).
+   The DB `last_error` is truncated to ~220 chars (`"stack":"VerifiedArtif…`), so
+   **reproduce the failing node to capture the real stderr** rather than guessing
+   at the throw. Only once the crash is gone do shapes 1–2 apply.
 
 1. **The lane drifts and is never corrected.** The node's prompt already asks
    for the required headings, but the lane emits different ones, and the
@@ -48,6 +63,12 @@ hit sibling nodes.
 
 ## Where to trace (leads to confirm, not a checklist to follow blindly)
 
+- **Crash shape (0) first:** `server/services/bookGeneration/verifiedArtifactClient.ts`
+  — the `verified-artifact exit_code=1 (node_key=…)` throw site; find how it spawns
+  the node subprocess and where its stderr/tmpdir is (preserved on failure) so you
+  can read the REAL traceback. Then `git log -p -2 -- server/compose/verifiedArtifact/`
+  and diff `verifiedArtifactProduction.ts` / `verifiedArtifactDagRuntime.ts` against
+  the throw — a recent hunk that can throw on this node is the root cause.
 - The lens spec named in the evidence: the produced `node_type`'s
   `requiredSections` + `sectionPolicy`. Note whether the policy is presence
   (unset) or `exact_h2`.
