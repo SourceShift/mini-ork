@@ -844,6 +844,44 @@ def test_reviewer_input_assembly_preserves_summary_verifiers_and_diff(tmp_path):
     assert "app.py" in (run_dir / "review-diff.patch").read_text()
 
 
+def test_reviewer_blocks_a_no_op_before_dispatching(tmp_path, monkeypatch):
+    """A declared-but-absent change must not reach the model.
+
+    Dispatching here is precisely how a no-op run earned a "pass": the reviewer
+    read ambient worktree state as if it were this run's output. The gate is
+    deterministic and pre-spend, so the fake dispatch must never be called.
+    """
+    db = _seed_db(tmp_path, "noop"); _seed_task_run(db)
+    rd = tmp_path / "run"; rd.mkdir()
+    repo = _git_repo(tmp_path / "noop-repo")
+    monkeypatch.setenv("MO_TARGET_CWD", str(repo))
+    monkeypatch.delenv("MINI_ORK_RUN_DIR", raising=False)
+
+    # Baseline captured, implementer declares a file it never wrote.
+    ex._capture_pre_impl_baseline(str(rd))
+    (rd / "implementer-summary.json").write_text(json.dumps({
+        "status": "implemented",
+        "worktree_path": str(repo),
+        "files_changed": [str(repo / "never-touched.py")],
+    }))
+
+    calls = []
+
+    def _counting(task_class, node_type, prompt):
+        calls.append(prompt)
+        return 0, '{"verdict": "pass"}'
+
+    rc, fr = ex.dispatch_node(
+        _fields("rev-noop", "reviewer", "opus"),
+        root=str(REPO), run_dir=str(rd), plan_path=_plan(tmp_path),
+        task_class="code_fix", db=db, run_id="r1", dispatch_fn=_counting,
+    )
+
+    assert (rc, fr) == (1, "no_op")
+    assert calls == [], "the model must not be asked to grade a no-op"
+    assert (rd / "review-diff-noop.json").is_file()
+
+
 def test_resolve_target_cwd_prefers_explicit_worktree_over_external_kickoff(tmp_path, monkeypatch):
     repo = _git_repo(tmp_path / "target")
     run_dir = tmp_path / "run"
