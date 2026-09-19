@@ -302,6 +302,54 @@ def test_default_run_wave_exports_quarantine_to_recipe(tmp_path, monkeypatch):
     assert payload["quarantined"] == ["1", "10", "2"]
 
 
+def test_default_run_wave_records_real_cost_delta(tmp_path, monkeypatch):
+    """A wave's cost_usd must be the 24h-meter delta across the wave subprocess,
+    NOT panel-verdict.json's panel-node cost (~$0). A $0 reading blinds the
+    autoraise predictor: len(funded) never reaches patience, so it keeps raising
+    the rail forever instead of stopping on funded-but-flat progress."""
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    monkeypatch.setenv("MINI_ORK_RUN_DIR", str(run_dir))
+    monkeypatch.setenv("MO_GOAL_WAVE_KICKOFF", str(tmp_path / "wave.md"))
+    monkeypatch.setenv("MINI_ORK_ROOT", str(tmp_path))
+    # panel-verdict.json carries only the panel node's own (wrong) cost.
+    (run_dir / "panel-verdict.json").write_text(
+        '{"verdict": "fail", "failing_units": ["1"], "cost_usd": 0.0}',
+        encoding="utf-8",
+    )
+    readings = iter([100.0, 108.0])  # before, after → a real $8 funded wave
+    monkeypatch.setattr(_DRIVE, "_default_cost_fn", lambda: next(readings))
+    monkeypatch.setattr(
+        _DRIVE.subprocess, "run",
+        lambda cmd, **kw: SimpleNamespace(returncode=0, stdout="", stderr=""),
+    )
+
+    payload = _default_run_wave_fn(1, set())
+
+    assert payload["cost_usd"] == 8.0  # the measured delta, not the panel's 0.0
+
+
+def test_default_run_wave_cost_delta_clamps_nonpositive(tmp_path, monkeypatch):
+    """A non-positive meter delta (starved wave, or the 24h window sliding faster
+    than the wave spent) records as $0 — 'not funded' — never a negative that
+    would corrupt the budget projection or falsely fund the predictor."""
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    monkeypatch.setenv("MINI_ORK_RUN_DIR", str(run_dir))
+    monkeypatch.setenv("MO_GOAL_WAVE_KICKOFF", str(tmp_path / "wave.md"))
+    monkeypatch.setenv("MINI_ORK_ROOT", str(tmp_path))
+    readings = iter([50.0, 49.5])  # window slid; raw delta is negative
+    monkeypatch.setattr(_DRIVE, "_default_cost_fn", lambda: next(readings))
+    monkeypatch.setattr(
+        _DRIVE.subprocess, "run",
+        lambda cmd, **kw: SimpleNamespace(returncode=0, stdout="", stderr=""),
+    )
+
+    payload = _default_run_wave_fn(1, set())
+
+    assert payload["cost_usd"] == 0.0
+
+
 # ── 7-9. U4c per-unit kickoff templating ────────────────────────────────
 
 
