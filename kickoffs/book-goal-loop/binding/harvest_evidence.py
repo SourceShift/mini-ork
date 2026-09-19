@@ -115,6 +115,197 @@ def _tier_db(chapter: str, book: str) -> str | None:
     return lasterr or None
 
 
+# ── Tier 1b: why the COMMIT gate refuses ─────────────────────────────────────
+
+def _tier_commit_gate(chapter: str, book: str) -> None:
+    """Why ``markTaskCompleted`` refuses the commit, in the gate's own terms.
+
+    The scalar columns of ``book_chapter_lifecycle`` ARE the WHERE of the guarded
+    ``committed_complete = true`` UPDATE in ``chapterLifecycleService``
+    (``markTaskCompleted``). When that UPDATE matches zero rows the service falls
+    through to a "zero rows updated, all gates passed" handler and returns the
+    MISLEADING ``reason: 'structural_errors'`` — every JS-level gate did pass, so
+    the label blames structure even when the real refusal is the always-on
+    ``committedCompleteHumanizationClause`` appended to that WHERE. The chapter
+    then re-dispatches, ``runOneChapter`` sees content present, SKIPS
+    regeneration, and re-runs the identical refusal forever.
+
+    That clause is an ``EXISTS`` over ``book_rubric_results`` demanding a
+    chapter-scope native G-Eval row whose ``humanization_receipt`` binds
+    ``content_hash`` — status/profile/skill/prompt/validator/protection fields
+    pinned, ``output_content_hash = content_hash``, ``judge_geval_passed`` TRUE.
+    With ZERO such rows the EXISTS can never be satisfied and no amount of
+    re-generation reaches the commit. Counting them is the knock-out; evaluating
+    the row's own predicates tells the child whether anything ELSE also fails.
+    """
+    _emit("## 1b. Why the commit gate refuses (book_chapter_lifecycle predicates)")
+    _emit()
+    # The gate's always-on EXISTS pins `rubric.job_id` to the JOB THE LIFECYCLE
+    # ROW RESOLVES TO (`c10CompletionGate.resolvedLifecycleJobId`: latest writing
+    # contract, else latest generation run behind the generated-book alias). A
+    # chapter can therefore carry HUNDREDS of G-Eval rows and still have the gate
+    # match none of them — every row belongs to a different job. So count rows
+    # under the RESOLVED job specifically, and count the rows that bind the
+    # chapter's CURRENT bytes, rather than counting rows in the table at large.
+    sql = (
+        "WITH lc AS (SELECT * FROM book_chapter_lifecycle "
+        f"WHERE book_uuid='{book}' AND chapter_number={chapter}), "
+        "pin AS (SELECT COALESCE("
+        "  (SELECT wc.job_id FROM book_chapter_writing_contracts wc "
+        "    WHERE wc.book_uuid=lc.book_uuid AND wc.chapter_number=lc.chapter_number "
+        "    ORDER BY wc.built_at DESC, wc.iteration DESC LIMIT 1), "
+        "  (SELECT run.job_id FROM book_identity_aliases a "
+        "     JOIN book_generation_runs run ON run.book_id=a.book_id "
+        "    WHERE a.alias_kind='generated_book_uuid' "
+        "      AND a.alias_value=lc.book_uuid::text "
+        "    ORDER BY run.started_at DESC NULLS LAST, "
+        "             run.updated_at DESC NULLS LAST LIMIT 1)"
+        ") AS job_id FROM lc) "
+        "SELECT "
+        "(lc.permanently_failed IS NOT TRUE), "
+        "(lc.content_hash IS NOT NULL), "
+        "COALESCE((lc.content_hash = (SELECT md5(COALESCE("
+        "  anchor.properties->>'markdown_content','')) FROM blocks anchor "
+        "  WHERE anchor.uuid=lc.chapter_anchor_uuid "
+        "    AND anchor.source_type='book_chapter_anchor' "
+        "    AND NOT anchor.is_deleted))::text,'null'), "
+        "(lc.decomposition_status='pass'), "
+        "(lc.decomposition_error_count=0), "
+        "(lc.decomposition_tree_hash IS NOT NULL), "
+        "(lc.decomposition_parser_version IS NOT NULL), "
+        "(lc.receipt_projection_revision = lc.projection_revision), "
+        "(lc.decomposition_child_count = (SELECT COUNT(*)::integer FROM blocks child "
+        "  WHERE child.source_type='book_chapter' "
+        "    AND child.source_id=lc.chapter_uuid::text "
+        "    AND NOT child.is_deleted)), "
+        "coalesce(lc.rubric_status,''), "
+        "coalesce(lc.publication_contract_version,-1), "
+        "coalesce(lc.projection_revision,-1), "
+        "coalesce(lc.receipt_projection_revision,-1), "
+        "COALESCE((SELECT pin.job_id::text FROM pin),'(none)'), "
+        "(SELECT COUNT(*)::integer FROM book_rubric_results r "
+        "  WHERE r.scope='chapter' AND r.chapter_number=lc.chapter_number "
+        "    AND r.judge_prompt_version='j3-geval-v3' "
+        "    AND r.job_id=(SELECT pin.job_id FROM pin)), "
+        "(SELECT COUNT(*)::integer FROM book_rubric_results r "
+        "  WHERE r.scope='chapter' AND r.chapter_number=lc.chapter_number "
+        "    AND r.judge_prompt_version='j3-geval-v3'), "
+        "(SELECT COUNT(*)::integer FROM book_rubric_results r "
+        "  WHERE r.scope='chapter' AND r.chapter_number=lc.chapter_number "
+        "    AND r.judge_prompt_version='j3-geval-v3' "
+        "    AND r.humanization_receipt IS NOT NULL "
+        "    AND r.judge_geval_passed IS TRUE "
+        "    AND r.evaluated_content_hash = lc.content_hash), "
+        "(SELECT COUNT(*)::integer FROM book_rubric_results r "
+        "  WHERE r.scope='chapter' AND r.chapter_number=lc.chapter_number "
+        "    AND r.judge_prompt_version='j3-geval-v3' "
+        "    AND r.humanization_receipt IS NOT NULL), "
+        "coalesce(lc.properties_snapshot->>'operator_retry_requested_at',''), "
+        "coalesce(lc.markdown_length,-1) "
+        "FROM lc;"
+    )
+    proc = _psql(sql)
+    if proc.returncode != 0:
+        _emit(f"NOTE: commit-gate query failed rc={proc.returncode}: "
+              f"{proc.stderr.strip()[:200]}")
+        _emit()
+        return
+    rows = proc.stdout.strip().splitlines()
+    if not rows:
+        _emit(f"NOTE: no lifecycle row for chapter {chapter}.")
+        _emit()
+        return
+    (permfail, has_ch, anchor_ok, dec_pass, dec_errs, has_tree, has_pv,
+     receipt_ok, kids_ok, rubric, pcv, proj_rev, recv_rev, pinned_job,
+     rows_pinned, rows_any, binding_now, humanized_any, retry_marker,
+     mdlen) = ((rows[0].split("|") + [""] * 20)[:20])
+
+    _emit("Predicates of the guarded `committed_complete = true` UPDATE "
+          "(`chapterLifecycleService.markTaskCompleted`). `f` on any row means "
+          "the UPDATE matched ZERO rows, and the reported reason is the "
+          "MISLEADING `structural_errors` fallback, not that predicate:")
+    _emit()
+    _emit("```")
+    _emit(f"permanently_failed IS NOT TRUE        = {permfail}")
+    _emit(f"content_hash IS NOT NULL              = {has_ch}")
+    _emit(f"content_hash = md5(anchor markdown)   = {anchor_ok}")
+    _emit(f"decomposition_status = 'pass'         = {dec_pass}")
+    _emit(f"decomposition_error_count = 0         = {dec_errs}")
+    _emit(f"decomposition_tree_hash IS NOT NULL   = {has_tree}")
+    _emit(f"decomposition_parser_version NOT NULL = {has_pv}")
+    _emit(f"receipt_projection_revision = proj_rev= {receipt_ok}")
+    _emit(f"decomposition_child_count = live kids = {kids_ok}")
+    _emit(f"publication_contract_version          = {pcv}")
+    _emit(f"projection_revision                   = {proj_rev}")
+    _emit(f"receipt_projection_revision           = {recv_rev}")
+    _emit(f"markdown_length                       = {mdlen}")
+    _emit(f"rubric_status                         = {rubric or '(none)'}")
+    _emit("```")
+    _emit()
+
+    _emit("The counts that decide the always-on clauses appended to that WHERE "
+          "(`committedCompleteGevalHashClause` + `committedCompleteHumanization"
+          "Clause`, both ALWAYS-ON — not flag-gated, unlike the rubric clause). "
+          "The humanization `EXISTS` pins `rubric.job_id` to the job this "
+          "lifecycle row RESOLVES to (`resolvedLifecycleJobId`), so rows under "
+          "ANY OTHER job are invisible to the gate:")
+    _emit()
+    _emit("```")
+    _emit(f"job the gate pins to (writing contract → run) = {pinned_job}")
+    _emit(f"G-Eval rows under THAT job                    = {rows_pinned}")
+    _emit(f"G-Eval rows under ANY job                     = {rows_any}")
+    _emit(f"humanized rows binding THIS content_hash       = {binding_now}")
+    _emit(f"humanized rows (any bytes, any job)           = {humanized_any}")
+    _emit(f"operator_retry_requested_at                   = "
+          f"{retry_marker or '(unset)'}")
+    _emit("```")
+    _emit()
+    if rows_pinned == "0":
+        _emit("### KNOCK-OUT: no G-Eval rows under the job the commit gate pins")
+        _emit()
+        _emit(
+            "The humanization `EXISTS` appended to the commit UPDATE filters "
+            "`rubric.job_id = <the job this chapter resolves to>` — the latest "
+            f"writing contract's job (`{pinned_job}`). This chapter has "
+            f"{rows_any} G-Eval rows, but ZERO under that job, so the `EXISTS` "
+            "can NEVER be satisfied and the UPDATE matches zero rows forever — "
+            "no retry, re-dispatch, or draft edit changes that. The chapter's "
+            "retained content was written BEFORE the humanization stage existed, "
+            "so no humanization receipt can bind it. Dropping or rewriting the "
+            "rubric rows is NOT the fix (that is the publication invariant). "
+            "The chapter must be driven THROUGH the humanization stage again: "
+            "`chapterRunner.runOneChapter` sees content present and takes the "
+            "'skipping regeneration (commit pending)' branch straight to "
+            "`markTaskCompleted`, so the stage that would write the receipt is "
+            "never re-entered. Find that branch and make it re-enter the "
+            "humanize→G-Eval stage when the gate's receipt is missing for the "
+            "CURRENT bytes (the `operatorRetryRequested` / `v2ReceiptInvalid` "
+            "escape hatches at its top are the existing precedent)."
+        )
+        _emit()
+    elif binding_now == "0":
+        _emit("### KNOCK-OUT: humanized receipts exist, but bind OTHER bytes")
+        _emit()
+        _emit(
+            f"{humanized_any} humanized G-Eval row(s) exist for this chapter, "
+            "but NONE satisfies `evaluated_content_hash = content_hash` — the "
+            "receipts prove older/different bytes, not the bytes now retained. "
+            "The gate demands proof for the CURRENT content, so the chapter must "
+            "be re-humanized (or regenerated) rather than re-committed."
+        )
+        _emit()
+    elif rubric not in ("pass", "waived"):
+        _emit(f"### GATE HELD: rubric_status={rubric!r} is not 'pass'/'waived'")
+        _emit()
+        _emit(
+            "The commit UPDATE requires a passing rubric verdict, and a "
+            "humanized row under the pinned job DOES bind the current bytes — "
+            "so the judge has run on these bytes and its verdict is what holds "
+            "the commit. Read the verdict ladder below for the failing axis."
+        )
+        _emit()
+
+
 # ── Tier 2: quality-gate verdict ladder ──────────────────────────────────────
 
 def _chapter_uuid(chapter: str, book: str) -> str | None:
@@ -532,6 +723,18 @@ def main(argv: list[str]) -> int:
             _emit()
     except Exception as exc:  # noqa: BLE001 — advisory; never crash the wave
         _emit(f"NOTE: DB tier crashed: {exc}")
+        _emit()
+
+    try:
+        if chapter and re.fullmatch(r"[0-9a-fA-F-]{36}", book):
+            _tier_commit_gate(chapter, book)
+        else:
+            _emit("## 1b. Why the commit gate refuses")
+            _emit()
+            _emit("NOTE: chapter/BOOK_UUID unresolved — skipping the commit-gate tier.")
+            _emit()
+    except Exception as exc:  # noqa: BLE001 — advisory; never crash the wave
+        _emit(f"NOTE: commit-gate tier crashed: {exc}")
         _emit()
 
     try:
