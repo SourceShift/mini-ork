@@ -385,6 +385,79 @@ def test_default_spawn_fn_templating_for_inline_body(tmp_path, monkeypatch):
     assert "{{" not in body
 
 
+def test_default_spawn_fn_templating_substitutes_evidence(tmp_path, monkeypatch):
+    """{{evidence}} + {{evidence_path}} inline the deep signal from the sweep plan.
+
+    This is the payload the evidence seam exists to deliver: the fix child sees
+    the produced-vs-required delta instead of an 80-char opaque last_error.
+    """
+    template = tmp_path / "template.md"
+    template.write_text(
+        "# Fix {{unit_id}}\n\nreason: {{reason}}\n\n"
+        "## Evidence\n{{evidence}}\n\nfull dump: {{evidence_path}}\n",
+        encoding="utf-8",
+    )
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    monkeypatch.setenv("MINI_ORK_RUN_DIR", str(run_dir))
+    monkeypatch.setenv("MO_GOAL_CHILD_KICKOFF", str(template))
+    monkeypatch.setenv("MINI_ORK_ALLOW_CHILD_SPAWN", "1")
+
+    captured = _capture_spawn(monkeypatch)
+    default = _DRIVE._default_spawn_fn  # noqa: SLF001 — test seam
+
+    deep = "produced ## Section scaffold vs required ## H2 outline / ## Per-section intent"
+    result = default({
+        "unit_id": "3",
+        "child_recipe": "code-fix",
+        "kickoff_hint": {
+            "unit_id": "3",
+            "reason": "ch3 FAIL status=failed err=...guard...",
+            "evidence": deep,
+            "evidence_path": "/tmp/run/evidence/3.md",
+        },
+    })
+
+    assert result["status"] == "spawned"
+    body = Path(captured["kickoff"]).read_text(encoding="utf-8")
+    assert deep in body
+    assert "/tmp/run/evidence/3.md" in body
+    assert "{{" not in body
+
+
+def test_default_spawn_fn_evidence_falls_back_to_reason(tmp_path, monkeypatch):
+    """A kickoff that references {{evidence}} renders the reason when none harvested.
+
+    Guarantees an unarmed loop (no MO_GOAL_EVIDENCE_CMD ⇒ empty hint.evidence)
+    still produces an actionable kickoff rather than a hollow ``## Evidence``
+    heading followed by nothing.
+    """
+    template = tmp_path / "template.md"
+    template.write_text(
+        "# Fix {{unit_id}}\n\n## Evidence\n{{evidence}}\n", encoding="utf-8",
+    )
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    monkeypatch.setenv("MINI_ORK_RUN_DIR", str(run_dir))
+    monkeypatch.setenv("MO_GOAL_CHILD_KICKOFF", str(template))
+    monkeypatch.setenv("MINI_ORK_ALLOW_CHILD_SPAWN", "1")
+
+    captured = _capture_spawn(monkeypatch)
+    default = _DRIVE._default_spawn_fn  # noqa: SLF001 — test seam
+
+    result = default({
+        "unit_id": "4",
+        "child_recipe": "code-fix",
+        # No 'evidence' key at all — the unarmed path.
+        "kickoff_hint": {"unit_id": "4", "reason": "ch4 FAIL status=degraded"},
+    })
+
+    assert result["status"] == "spawned"
+    body = Path(captured["kickoff"]).read_text(encoding="utf-8")
+    assert "ch4 FAIL status=degraded" in body  # reason filled the {{evidence}} slot
+    assert "{{evidence}}" not in body
+
+
 # ── 10-12. U4d wave-kickoff env resolution ────────────────────────────────
 
 
