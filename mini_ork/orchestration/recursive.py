@@ -245,13 +245,16 @@ def mo_recursive_approve_spawn(
                     f"spawn blocked: parent task_run not found: {parent_run_id}"
                 )
 
-            parent_child_count = con.execute(
-                "SELECT COUNT(*) FROM run_spawns WHERE parent_run_id=?",
+            # Count only non-terminal children: spent ones release their slot, else a
+            # converging multi-wave driver exhausts the cap and wedges (descendants cap is the lifetime ceiling).
+            outstanding_children = con.execute(
+                "SELECT COUNT(*) FROM run_spawns WHERE parent_run_id=? "
+                "AND status NOT IN ('completed','failed','merged','rejected')",
                 (parent_run_id,),
             ).fetchone()[0]
-            if parent_child_count >= int(policy["max_children_per_run"]):
+            if outstanding_children >= int(policy["max_children_per_run"]):
                 raise ValueError(
-                    f"spawn blocked: parent has {parent_child_count} children; "
+                    f"spawn blocked: parent has {outstanding_children} outstanding children; "
                     f"max_children_per_run is {policy['max_children_per_run']}"
                 )
 

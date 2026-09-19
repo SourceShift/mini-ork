@@ -96,7 +96,9 @@ def _seed_parent(db: str, parent_id: str) -> None:
         con.close()
 
 
-def _seed_spawn(db: str, spawn_id: str, parent: str, child: str) -> None:
+def _seed_spawn(
+    db: str, spawn_id: str, parent: str, child: str, status: str = "approved"
+) -> None:
     spawn_seed = {
         "spawn_id": spawn_id,
         "parent_run_id": parent,
@@ -108,7 +110,7 @@ def _seed_spawn(db: str, spawn_id: str, parent: str, child: str) -> None:
         "child_workspace": "/tmp/ws",
         "authority_level": 0.3,
         "allow_child_spawn": 0,
-        "status": "approved",
+        "status": status,
         "policy_snapshot_json": "{}",
         "created_at": 0,
         "updated_at": 0,
@@ -281,6 +283,51 @@ def test_approve_spawn_blocked_by_depth(temp_db):
 
     py_trs = {r["id"] for r in _row_dicts(temp_db, "task_runs")}
     assert "child-e" not in py_trs
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# (e2) per-run child budget counts only NON-TERMINAL children
+# ─────────────────────────────────────────────────────────────────────────────
+def test_approve_spawn_terminal_children_release_budget(temp_db, monkeypatch):
+    """Regression: spent (terminal) children release their per-run slot.
+
+    A long-lived convergence driver (goal-loop, one repair child per wave) was
+    permanently wedged when 4 ``failed`` code-fix children hit the lifetime cap.
+    Terminal children (failed/completed/merged/rejected) must NOT count.
+    """
+    monkeypatch.setenv("MINI_ORK_RECURSIVE_MAX_CHILDREN", "2")
+    parent_id = "parent-term"
+    _seed_parent(temp_db, parent_id)
+    _seed_spawn(temp_db, "sp-t1", parent_id, "child-t1", status="failed")
+    _seed_spawn(temp_db, "sp-t2", parent_id, "child-t2", status="completed")
+
+    # Third spawn must SUCCEED — the two spent children released their slots.
+    py.mo_recursive_approve_spawn(
+        parent_id, "child-t3", "code-fix", "/tmp/k.md", "/tmp/ws", 1, 0.3, 0,
+    )
+    sp = next(
+        r for r in _row_dicts(temp_db, "run_spawns") if r["child_run_id"] == "child-t3"
+    )
+    assert sp["status"] == "approved"
+
+
+def test_approve_spawn_blocked_by_outstanding_children(temp_db, monkeypatch):
+    """Non-terminal (approved/running) children DO consume the budget: once
+    ``max_children_per_run`` are outstanding, a further spawn is blocked. Keeps
+    the anti-runaway guarantee intact."""
+    monkeypatch.setenv("MINI_ORK_RECURSIVE_MAX_CHILDREN", "2")
+    parent_id = "parent-out"
+    _seed_parent(temp_db, parent_id)
+    _seed_spawn(temp_db, "sp-o1", parent_id, "child-o1", status="approved")
+    _seed_spawn(temp_db, "sp-o2", parent_id, "child-o2", status="running")
+
+    with pytest.raises(ValueError, match="max_children_per_run"):
+        py.mo_recursive_approve_spawn(
+            parent_id, "child-o3", "code-fix", "/tmp/k.md", "/tmp/ws", 1, 0.3, 0,
+        )
+    assert not any(
+        r["child_run_id"] == "child-o3" for r in _row_dicts(temp_db, "run_spawns")
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
