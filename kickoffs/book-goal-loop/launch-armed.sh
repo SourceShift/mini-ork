@@ -120,6 +120,22 @@ export MO_GOAL_DEPLOY_TIMEOUT_SECONDS="${MO_GOAL_DEPLOY_TIMEOUT_SECONDS:-900}"
 # (TERMINAL_CMD defaults to PREDICATE_CMD = wait-for-pass), polling each minute.
 export MO_GOAL_APPLY_AWAIT_SECONDS="${MO_GOAL_APPLY_AWAIT_SECONDS:-5400}"
 export MO_GOAL_APPLY_POLL_SECONDS="${MO_GOAL_APPLY_POLL_SECONDS:-60}"
+# FAIL-FAST: the await is otherwise blind to failure — it waits the full window
+# even when the regen has terminally failed, so one bad deploy costs 90min before
+# the loop can react. This detector returns 0 the instant the chapter is
+# permanently_failed (always) OR — opt-in via the stall knobs below — orphaned in
+# 'generating' with a fresh last_error AND no verified-artifact run-dir activity
+# for MO_GOAL_STALL_SECONDS. Run-dir freshness (not lifecycle.updated_at, which
+# stays frozen at the last milestone during a HEALTHY long generation) is the
+# only reliable "a node is still running" signal, so the stall check keys on it.
+export MO_GOAL_TERMINAL_FAIL_CMD="${MO_GOAL_TERMINAL_FAIL_CMD:-python3 $BIND/chapter_terminal_fail.py}"
+# Vendored per-worktree runs dir the book-gen worker writes each node's
+# verified-artifact run into — the freshness source for the stall check.
+export MO_GOAL_RUNS_DIR="${MO_GOAL_RUNS_DIR:-$WT/.mini-ork/runs}"
+# 0 disables stall detection (permanently_failed still fires). 1200s = 20min with
+# no node activity while 'generating'+errored ⇒ orphaned. Node cadence is ~1-2min,
+# so 20min is a wide safety margin against killing a merely-slow node.
+export MO_GOAL_STALL_SECONDS="${MO_GOAL_STALL_SECONDS:-1200}"
 
 PY="${MINI_ORK_ROOT}/.venv/bin/python"
 [ -x "$PY" ] || PY=python3.11
