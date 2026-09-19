@@ -1326,10 +1326,38 @@ class SidecarTelemetryEngine(HarnessEngine):
     def dispatch(self, request: DispatchRequest, spec: ProviderSpec) -> DispatchResult:
         import tempfile
 
-        fd_u, usage_path = tempfile.mkstemp(suffix='.tokens')
-        os.close(fd_u)
-        fd_c, cost_path = tempfile.mkstemp(suffix='.cost')
-        os.close(fd_c)
+        from ..context import context_env
+
+        # The codex/opencode transports tee their native JSON stream to
+        # ``${MO_USAGE_FILE%.tokens}.stream.jsonl`` AS THE HARNESS RUNS — the
+        # only real-time artifact the Python lanes produce (the B0 probe covers
+        # the claude lanes' equivalent). Where that path points therefore decides
+        # whether the stream is observable or thrown away: the old code
+        # mkstemp'd the usage file in a temp dir and unlinked the derived
+        # stream in `finally`, so a live, per-line, already-written file was
+        # deleted at every node exit. Name the sidecars conventionally under the
+        # run dir instead — the same ``agent-<node>.stream.jsonl`` that
+        # ``dispatch/__main__`` registers as a run_artifact, that ``retention``
+        # gzips, and that ``run_detail`` serves. One name, three consumers.
+        run_dir = context_env("MINI_ORK_RUN_DIR", "")
+        node_id = context_env("MO_NODE_ID", "")
+        keep_stream = False
+        if run_dir and node_id:
+            # A run dir that does not exist is a broken bootstrap, not a reason
+            # to silently lose the stream — repair it and keep going.
+            os.makedirs(run_dir, exist_ok=True)
+            safe_node = "".join(
+                c if c.isalnum() or c in "._-" else "_" for c in node_id
+            )
+            usage_path = os.path.join(run_dir, f"agent-{safe_node}.tokens")
+            cost_path = os.path.join(run_dir, f"agent-{safe_node}.cost")
+            keep_stream = True
+        else:
+            fd_u, usage_path = tempfile.mkstemp(suffix='.tokens')
+            os.close(fd_u)
+            fd_c, cost_path = tempfile.mkstemp(suffix='.cost')
+            os.close(fd_c)
+        stream_path = f"{usage_path[:-7]}.stream.jsonl"
         try:
             env = {**request.env, 'MO_USAGE_FILE': usage_path, 'MO_COST_FILE': cost_path}
             req = DispatchRequest(
@@ -1348,7 +1376,13 @@ class SidecarTelemetryEngine(HarnessEngine):
                 result.cost_usd = cost
             return result
         finally:
-            for path in (usage_path, cost_path, f"{usage_path[:-7]}.stream.jsonl"):
+            # The usage/cost sidecars are this engine's own scratch — written by
+            # the transport, read above, and nobody else's business. The stream
+            # is different: it is a run artifact with a consumer, so it is kept
+            # whenever it has a run dir to live in, and unlinked only when it
+            # landed in a temp dir where nothing would ever find it.
+            doomed = [usage_path, cost_path] + ([] if keep_stream else [stream_path])
+            for path in doomed:
                 try:
                     os.unlink(path)
                 except OSError:
