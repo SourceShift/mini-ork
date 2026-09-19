@@ -350,6 +350,85 @@ def _env_float(name: str, default: float) -> float:
         raise ValueError(f"{name} must be a number, got {raw!r}") from exc
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    """Read a boolean flag from the environment (``1/true/yes/on`` → True)."""
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _daily_budget_now() -> float:
+    """The GLOBAL 24h cost-circuit budget the wave's child will enforce.
+
+    Mirrors ``mini_ork.dispatch.llm_dispatch.cost_circuit_open``'s knob
+    (``MO_DAILY_BUDGET_USD``, default 50) — a rolling-24h spend ceiling checked
+    on every LLM call INSIDE the wave/child process. This is SEPARATE from the
+    driver's own cumulative ``budget_total_usd`` cap: the driver can be nowhere
+    near its $300 total yet still have every child starved by a $50 daily rail.
+    """
+    return _env_float("MO_DAILY_BUDGET_USD", 50.0)
+
+
+def _raise_predicted_helpful(state: dict[str, Any], patience: int) -> bool:
+    """Predict whether lifting the daily budget will actually move the goal.
+
+    Reuses the loop's own progress fingerprint (per-wave ``signature``) — but on
+    FUNDED evidence only. A circuit-starved wave spends ~$0 and re-emits the same
+    signature (empty diff → unchanged failure), which naively reads as
+    stagnation and would wrongly veto the raise. Counting only waves that spent
+    >= ``MO_GOAL_FUNDED_WAVE_MIN_USD`` means flat fingerprints from starved waves
+    cannot masquerade as "stuck": we simply have not tried with budget yet, so
+    the raise deserves a chance. Once ``patience`` FUNDED waves all share one
+    signature, the fixer HAD money and still did not move the failure → more
+    budget will not help → predict unhelpful (the caller then stops).
+    """
+    min_funded = _env_float("MO_GOAL_FUNDED_WAVE_MIN_USD", 1.0)
+    funded = [
+        w for w in state.get("waves", [])
+        if float(w.get("cost_usd", 0.0) or 0.0) >= min_funded
+    ]
+    if len(funded) < max(2, patience):
+        return True  # not enough FUNDED evidence to call it genuinely stuck
+    sigs = [w.get("signature") for w in funded[-patience:]]
+    # Progress = the fingerprint moved at least once across the funded window.
+    return not (sigs[0] is not None and all(s == sigs[0] for s in sigs))
+
+
+def _budget_autoraise_decision(
+    state: dict[str, Any],
+    spent: float,
+    patience: int,
+    budget_total_usd: float,
+) -> tuple[str, float | str]:
+    """Decide the daily-budget action BEFORE spending on the next wave.
+
+    Returns exactly one of:
+      ``("noop", cur)``      the circuit will not starve the next wave — leave it.
+      ``("raise", target)``  lift ``MO_DAILY_BUDGET_USD`` to ``target`` (progress predicted).
+      ``("stop", reason)``   a raise is needed but predicted NOT to help → stop.
+
+    The cap defaults to the driver's own ``budget_total_usd`` so the daily
+    circuit is never lifted above the sanctioned cumulative budget; the loop's
+    existing cumulative/projection budget stop stays the hard ceiling above this.
+    """
+    cur = _daily_budget_now()
+    projected = _projected_wave_cost(state)  # 0.0 when < 2 waves recorded
+    need = spent + (projected if projected > 0 else 0.0)
+    # Will the NEXT wave trip the circuit? (already-over spend alone is enough.)
+    if need < cur and spent < cur:
+        return ("noop", cur)
+    cap = _env_float("MO_GOAL_BUDGET_AUTORAISE_CAP", budget_total_usd)
+    headroom = _env_float("MO_GOAL_BUDGET_AUTORAISE_HEADROOM", 5.0)
+    target = min(cap, need + headroom)
+    if not _raise_predicted_helpful(state, patience):
+        return ("stop", "no_predicted_progress")
+    if target <= cur:
+        # Want to continue, but the cap is the wall — honor the ceiling, stop.
+        return ("stop", f"cap_reached:{cap:.2f}")
+    return ("raise", target)
+
+
 def drive(
     goal_id: str,
     target_cwd: str,
@@ -389,6 +468,12 @@ def drive(
     # move a stuck unit before the loop declares divergence / quarantines it.
     divergence_patience = max(2, _env_int("MO_GOAL_DIVERGENCE_PATIENCE", 2))
     quarantine_patience = max(2, _env_int("MO_GOAL_QUARANTINE_PATIENCE", 2))
+    # How many FUNDED waves the autoraise predictor waits on before calling a
+    # unit un-raisable (defaults to the divergence window). Decoupled so the
+    # budget "raise won't help → stop" gate can fire on funded-flat evidence
+    # even when divergence is set loose — and so the two stops don't collide on
+    # one shared window (divergence, checked post-wave, would always pre-empt it).
+    autoraise_patience = max(2, _env_int("MO_GOAL_AUTORAISE_PATIENCE", divergence_patience))
 
     resolved_state_dir = Path(state_dir) if state_dir is not None else Path(_default_state_dir(goal_id))
     resolved_run_wave = run_wave_fn or _default_run_wave_fn
@@ -407,6 +492,36 @@ def drive(
             tail = history[-quarantine_patience:]
             if len(tail) >= quarantine_patience and len(set(tail)) == 1:
                 quarantined.add(unit_id)
+
+        # RSI daily-budget autoraise (opt-in MO_GOAL_BUDGET_AUTORAISE): the
+        # wave's code-fix child enforces the GLOBAL 24h cost circuit
+        # (MO_DAILY_BUDGET_USD), SEPARATE from this driver's cumulative
+        # budget_total_usd. Lift it when the circuit would otherwise starve the
+        # next wave — but only when progress is predicted. If a raise is
+        # predicted NOT to help (a fixer that HAD budget and still could not move
+        # the failure across the patience window), STOP rather than burn money.
+        # Runs BEFORE the wave dispatch so the raised value is in os.environ when
+        # _default_run_wave_fn snapshots wave_env for the child subprocess.
+        if _env_bool("MO_GOAL_BUDGET_AUTORAISE"):
+            spent_now = float(resolved_cost())
+            action, value = _budget_autoraise_decision(
+                state, spent_now, autoraise_patience, budget_total_usd
+            )
+            if action == "stop":
+                failing_now = state["waves"][-1]["failing_after"] if state["waves"] else []
+                payload = {
+                    "stop": "budget_autoraise",
+                    "reason": value,
+                    "waves": len(state["waves"]),
+                    "failing_units": failing_now,
+                    "quarantined_units": sorted(quarantined),
+                    "spent_usd": spent_now,
+                    "daily_budget_usd": _daily_budget_now(),
+                }
+                _write_final_verdict(resolved_state_dir, payload)
+                return payload
+            if action == "raise":
+                os.environ["MO_DAILY_BUDGET_USD"] = f"{float(value):.2f}"
 
         # Cheap projection-based budget stop BEFORE we spend on a new wave.
         projected = _projected_wave_cost(state)

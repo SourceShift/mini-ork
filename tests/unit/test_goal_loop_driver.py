@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import sys
 
 import pytest
@@ -842,3 +843,171 @@ def test_pending_units_dont_trip_all_quarantined(tmp_path, monkeypatch):
     )
     assert verdict["stop"] == "max_waves_reached", verdict
     assert verdict["quarantined_units"] == ["1"]  # ONLY the attempted, stuck unit
+
+
+# ── 13-17. RSI prediction-gated daily-budget autoraise ─────────────────────
+#
+# The wave's code-fix child enforces the GLOBAL 24h cost circuit
+# (MO_DAILY_BUDGET_USD), which is SEPARATE from the driver's cumulative
+# budget_total_usd. When the circuit would starve the next wave, the opt-in
+# autoraise (MO_GOAL_BUDGET_AUTORAISE) lifts the daily rail — but only if
+# progress is predicted. A prediction that a raise WON'T help stops the loop
+# instead of burning money. The predictor counts only FUNDED waves so that a
+# run of circuit-starved ($0) flat waves reads as "not tried yet" (→ raise),
+# never as "stuck" (→ stop). All fakes deterministic; zero LLM/DB/subprocess.
+
+
+def test_autoraise_lifts_daily_budget_when_progress_predicted(tmp_path, monkeypatch):
+    """Circuit would starve the next wave AND the fixer is making progress ⇒
+    the daily rail is lifted above its starting value before the wave runs."""
+    monkeypatch.setenv("MO_GOAL_BUDGET_AUTORAISE", "1")
+    monkeypatch.setenv("MO_DAILY_BUDGET_USD", "10")
+    monkeypatch.setenv("MO_GOAL_BUDGET_AUTORAISE_CAP", "100")
+    monkeypatch.setenv("MO_GOAL_DIVERGENCE_PATIENCE", "2")
+    monkeypatch.setenv("MO_GOAL_QUARANTINE_PATIENCE", "9")
+
+    seen_budget: list[float] = []
+    # A moved failure (u1→u2) is real progress; then it converges.
+    seq = [(["u1"], "fail"), (["u2"], "fail"), ([], "pass")]
+
+    def run_wave(wave_no, quarantined):
+        seen_budget.append(float(os.environ["MO_DAILY_BUDGET_USD"]))
+        failing, verdict = seq[wave_no - 1]
+        return {"verdict": verdict, "failing_before": [], "failing_after": failing,
+                "cost_usd": 6.0, "run_id": f"r{wave_no}"}
+
+    verdict = drive(
+        goal_id="graise", target_cwd="/tmp", units_cmd="echo u",
+        predicate_cmd="echo ok", child_recipe="code-fix",
+        max_waves=10, budget_total_usd=1000.0,
+        run_wave_fn=run_wave, cost_fn=lambda: 12.0, state_dir=tmp_path / "s",
+    )
+
+    assert verdict["stop"] == "goal_met", verdict
+    # spent ($12) already over the $10 rail ⇒ the FIRST wave lifted it.
+    assert seen_budget[0] > 10.0, seen_budget
+    # the live rail carries the raise; it is never dropped back to the start.
+    assert float(os.environ["MO_DAILY_BUDGET_USD"]) > 10.0
+
+
+def test_autoraise_stops_when_funded_waves_flat(tmp_path, monkeypatch):
+    """The fixer HAD budget (funded waves) and never moved the failure across the
+    autoraise window ⇒ a further raise is predicted NOT to help ⇒ STOP, don't
+    burn money. Divergence is set loose so the stop is the autoraise gate itself,
+    not the generic no-progress detector."""
+    monkeypatch.setenv("MO_GOAL_BUDGET_AUTORAISE", "1")
+    monkeypatch.setenv("MO_DAILY_BUDGET_USD", "10")
+    monkeypatch.setenv("MO_GOAL_BUDGET_AUTORAISE_CAP", "100")
+    monkeypatch.setenv("MO_GOAL_AUTORAISE_PATIENCE", "2")
+    monkeypatch.setenv("MO_GOAL_DIVERGENCE_PATIENCE", "99")   # don't pre-empt
+    monkeypatch.setenv("MO_GOAL_QUARANTINE_PATIENCE", "99")
+
+    def run_wave(wave_no, quarantined):
+        # SAME failure every wave, each FUNDED ($6 ≥ MO_GOAL_FUNDED_WAVE_MIN_USD).
+        return {"verdict": "fail", "failing_before": [], "failing_after": ["u1"],
+                "cost_usd": 6.0, "run_id": f"r{wave_no}"}
+
+    verdict = drive(
+        goal_id="gstop", target_cwd="/tmp", units_cmd="echo u",
+        predicate_cmd="echo ok", child_recipe="code-fix",
+        max_waves=10, budget_total_usd=1000.0,
+        run_wave_fn=run_wave, cost_fn=lambda: 12.0, state_dir=tmp_path / "s",
+    )
+
+    assert verdict["stop"] == "budget_autoraise", verdict
+    assert verdict["reason"] == "no_predicted_progress"
+    assert verdict["failing_units"] == ["u1"]
+    final = json.loads((tmp_path / "s" / "final-verdict.json").read_text())
+    assert final["stop"] == "budget_autoraise"
+
+
+def test_autoraise_starvation_aware_does_not_stop_on_unfunded_flat(tmp_path, monkeypatch):
+    """The core subtlety: circuit-starved waves spend $0 and re-emit one flat
+    signature, which a naive read calls "stuck". Because the predictor counts
+    only FUNDED waves, a run of $0 flat waves is "not tried yet" — it keeps
+    RAISING the rail (giving the fixer money), never stopping on
+    no_predicted_progress. The 24h circuit keeps climbing past each raise so the
+    hook re-engages every wave and we can watch the rail strictly increase."""
+    monkeypatch.setenv("MO_GOAL_BUDGET_AUTORAISE", "1")
+    monkeypatch.setenv("MO_DAILY_BUDGET_USD", "10")
+    monkeypatch.setenv("MO_GOAL_BUDGET_AUTORAISE_CAP", "1000")
+    monkeypatch.setenv("MO_GOAL_AUTORAISE_PATIENCE", "2")
+    monkeypatch.setenv("MO_GOAL_DIVERGENCE_PATIENCE", "99")
+    monkeypatch.setenv("MO_GOAL_QUARANTINE_PATIENCE", "99")
+    monkeypatch.setenv("MO_GOAL_FUNDED_WAVE_MIN_USD", "1.0")
+
+    seen: list[float] = []
+    spend = {"v": 20.0}
+
+    def cost_fn():
+        return spend["v"]
+
+    def run_wave(wave_no, quarantined):
+        seen.append(float(os.environ["MO_DAILY_BUDGET_USD"]))
+        spend["v"] += 20.0  # 24h circuit climbs past the last raise
+        # STARVED: identical failure, $0 spent (the circuit halted the child).
+        return {"verdict": "fail", "failing_before": [], "failing_after": ["u1"],
+                "cost_usd": 0.0, "run_id": f"r{wave_no}"}
+
+    verdict = drive(
+        goal_id="gstarve", target_cwd="/tmp", units_cmd="echo u",
+        predicate_cmd="echo ok", child_recipe="code-fix",
+        max_waves=4, budget_total_usd=100000.0,
+        run_wave_fn=run_wave, cost_fn=cost_fn, state_dir=tmp_path / "s",
+    )
+
+    # It must NOT stop on the prediction: starved-flat is not "stuck".
+    assert verdict["stop"] == "max_waves_reached", verdict
+    # every engaged wave lifted the rail, strictly increasing — proof the $0
+    # flat waves were never counted as evidence-of-stuck.
+    assert seen == sorted(seen) and len(set(seen)) == len(seen), seen
+    assert all(b > 10.0 for b in seen), seen
+
+
+def test_autoraise_flag_off_leaves_daily_budget_untouched(tmp_path, monkeypatch):
+    """With the opt-in flag OFF, the hook is inert: the daily rail is never
+    touched and the loop stops on its ordinary divergence detector."""
+    monkeypatch.delenv("MO_GOAL_BUDGET_AUTORAISE", raising=False)
+    monkeypatch.setenv("MO_DAILY_BUDGET_USD", "10")
+    monkeypatch.setenv("MO_GOAL_DIVERGENCE_PATIENCE", "2")
+
+    def run_wave(wave_no, quarantined):
+        # Would-starve + flat: flag ON would raise/stop; OFF ⇒ neither.
+        return {"verdict": "fail", "failing_before": [], "failing_after": ["u1"],
+                "cost_usd": 6.0, "run_id": f"r{wave_no}"}
+
+    verdict = drive(
+        goal_id="goff", target_cwd="/tmp", units_cmd="echo u",
+        predicate_cmd="echo ok", child_recipe="code-fix",
+        max_waves=10, budget_total_usd=1000.0,
+        run_wave_fn=run_wave, cost_fn=lambda: 12.0, state_dir=tmp_path / "s",
+    )
+
+    assert verdict["stop"] == "diverged", verdict
+    assert os.environ["MO_DAILY_BUDGET_USD"] == "10"
+
+
+def test_autoraise_stops_at_cap_even_when_progress_predicted(tmp_path, monkeypatch):
+    """The cap is the ceiling: even with progress predicted, once a needed raise
+    would exceed MO_GOAL_BUDGET_AUTORAISE_CAP the loop stops (cap_reached) rather
+    than lifting the daily rail past the sanctioned bound."""
+    monkeypatch.setenv("MO_GOAL_BUDGET_AUTORAISE", "1")
+    monkeypatch.setenv("MO_DAILY_BUDGET_USD", "10")
+    monkeypatch.setenv("MO_GOAL_BUDGET_AUTORAISE_CAP", "10")  # == current ⇒ no room
+    monkeypatch.setenv("MO_GOAL_AUTORAISE_PATIENCE", "9")     # progress predicted
+    monkeypatch.setenv("MO_GOAL_DIVERGENCE_PATIENCE", "99")
+
+    def run_wave(wave_no, quarantined):
+        return {"verdict": "fail", "failing_before": [], "failing_after": [f"u{wave_no}"],
+                "cost_usd": 6.0, "run_id": f"r{wave_no}"}
+
+    verdict = drive(
+        goal_id="gcap", target_cwd="/tmp", units_cmd="echo u",
+        predicate_cmd="echo ok", child_recipe="code-fix",
+        max_waves=10, budget_total_usd=1000.0,
+        run_wave_fn=run_wave, cost_fn=lambda: 12.0, state_dir=tmp_path / "s",
+    )
+
+    assert verdict["stop"] == "budget_autoraise", verdict
+    assert verdict["reason"].startswith("cap_reached:"), verdict
+    assert os.environ["MO_DAILY_BUDGET_USD"] == "10"  # never lifted past the cap
