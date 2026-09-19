@@ -136,6 +136,19 @@ export MO_GOAL_RUNS_DIR="${MO_GOAL_RUNS_DIR:-$WT/.mini-ork/runs}"
 # no node activity while 'generating'+errored ⇒ orphaned. Node cadence is ~1-2min,
 # so 20min is a wide safety margin against killing a merely-slow node.
 export MO_GOAL_STALL_SECONDS="${MO_GOAL_STALL_SECONDS:-1200}"
+# CROSS-WAVE PATIENCE: this loop attempts ONE chapter per wave (a single code-fix
+# child on the shared researcher bug) against 10 units. The failing SET therefore
+# cannot shrink until a whole chapter lands, so the historical 2-wave give-up
+# window (divergence on an unchanged failing set; GRAO quarantine on 2 identical
+# fix-hashes) killed the campaign at wave 2 while 9 chapters sat untouched. The
+# driver now folds each unit's failure FINGERPRINT (status + failing node, from
+# goal-state.json) into the wave signature and scopes quarantine to the units a
+# wave actually attempted (sweep fan-out), so a fix that MOVES a chapter's failure
+# reads as progress. These windows give the code-fix child several waves to land a
+# real researcher fix before the loop declares a unit hopeless. Default 2 (the
+# framework's all-units-per-wave contract) is too eager for the book loop.
+export MO_GOAL_DIVERGENCE_PATIENCE="${MO_GOAL_DIVERGENCE_PATIENCE:-6}"
+export MO_GOAL_QUARANTINE_PATIENCE="${MO_GOAL_QUARANTINE_PATIENCE:-6}"
 
 PY="${MINI_ORK_ROOT}/.venv/bin/python"
 [ -x "$PY" ] || PY=python3.11
