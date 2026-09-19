@@ -620,7 +620,9 @@ def test_start_pins_colocated_home_into_worker_env(mod, monkeypatch, tmp_path):
     """The self-healed co-located home flows into the spawned worker's env as
     MINI_ORK_HOME_DIR — home == worktree, so the first chapter clears BOTH the
     missing-binary AND the overlay-EEXIST guards without a human farming it."""
-    wd = _fake_worktree(tmp_path)  # worktree with scripts/watchdog + node_modules/tsx + server/.env
+    # Side-effect only: plants the worktree (scripts/watchdog + node_modules/tsx
+    # + server/.env) *at* tmp_path, which is the workdir passed to the spawner.
+    _fake_worktree(tmp_path)
     primary_root = tmp_path / "primary"
     _make_primary_home(primary_root)
     monkeypatch.setenv("MO_RESEARCHER_DIR", str(primary_root))
