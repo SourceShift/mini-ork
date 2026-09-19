@@ -125,6 +125,7 @@ import subprocess
 import sys
 import time
 import urllib.request
+from pathlib import Path
 
 _DEFAULT_ROLE = "book-generation"
 _DEFAULT_HEALTH = "http://localhost:7823/api/health/hatchet"
@@ -144,6 +145,8 @@ _RUNNER_PROBE_TIMEOUT = 6
 _DEFAULT_RESEARCHER_DIR = "/Volumes/docker-ssd/Migration/Development/researcher"
 _MINI_ORK_HOME_REL = ".mini-ork"
 _MINI_ORK_BIN_REL = os.path.join("bin", "mini-ork")
+# This binding ships at <engine>/kickoffs/book-goal-loop/binding/restart_worker.py.
+_ENGINE_ROOT_DEPTH = 3
 # Terminal markers in the child log: stop waiting, the start failed.
 _FAIL_MARKERS = (
     "Failed to start",
@@ -405,6 +408,25 @@ def _mini_ork_home(worktree: str) -> tuple[str | None, str]:
     return None, f"no vendored mini-ork found (worktree or {primary_home}); left MINI_ORK_HOME_DIR unset ({why_colo})"
 
 
+def _is_engine_root(path: str) -> bool:
+    return bool(path) and os.path.isdir(os.path.join(path, "mini_ork"))
+
+
+def _resolve_engine_root() -> str | None:
+    """The engine the worker's children must run: normally the loop's own, inherited
+    from this process. Pin it explicitly rather than let it be dropped, because the
+    vendored launcher's fallbacks are worse than they look — MINI_ORK_HOME/engine in a
+    sanctioned worktree points at the PRIMARY researcher home, an older vendored copy
+    that predates the reviewer-diff fixes, so an absent pin silently re-arms the
+    empty-diff false pass. Falls back to the checkout this binding ships in."""
+    for variable in ("MINI_ORK_ENGINE_ROOT", "MINI_ORK_ROOT"):
+        candidate = os.environ.get(variable, "").strip()
+        if _is_engine_root(candidate):
+            return candidate
+    root = Path(__file__).resolve().parents[_ENGINE_ROOT_DEPTH]
+    return str(root) if _is_engine_root(str(root)) else None
+
+
 def _env_overlay(worktree: str, log_path: str, extra: dict[str, str] | None = None) -> dict[str, str]:
     """Inherit ambient env, then pin the worktree's log target + namespace keys
     from its shared server/.env so the fixed worker + watchdog probe are
@@ -441,11 +463,10 @@ def _env_overlay(worktree: str, log_path: str, extra: dict[str, str] | None = No
         "MO_DISPATCH_CHAIN", "MO_NODE_ID",
     ):
         env.pop(_run_scoped, None)
-    # Deliberately KEPT (not scrubbed): MINI_ORK_ENGINE_ROOT/MINI_ORK_ROOT so the
-    # worker's children run THIS loop's engine (main, carrying the reviewer-diff and
-    # verifier-short-circuit fixes) rather than the researcher home's older vendored
-    # copy — and MINI_ORK_DB so the goal-loop's cost circuit keeps reading the spend
-    # it caused. Moving either would blind the budget rail, not fix a leak.
+    # Deliberately KEPT (not scrubbed): MINI_ORK_DB, so the goal-loop's cost circuit
+    # keeps reading the spend it caused. Repointing it would blind the budget rail,
+    # not fix a leak. (The engine pair is kept too, but as an explicit re-pin — see
+    # _start_replacement, which refuses to rely on inheritance.)
     # The home pair must travel with the replacement pin or not at all. The
     # launcher resolves project_home as PROJECT_HOME || HOME || cwd/.mini-ork
     # (bin/mini-ork), so a goal-loop parent's MINI_ORK_PROJECT_HOME outranks the
@@ -457,6 +478,11 @@ def _env_overlay(worktree: str, log_path: str, extra: dict[str, str] | None = No
     if (extra or {}).get("MINI_ORK_HOME_DIR"):
         for _home_scoped in ("MINI_ORK_HOME", "MINI_ORK_PROJECT_HOME"):
             env.pop(_home_scoped, None)
+    # Same rule for the engine pair: the replacement pin must be the only value
+    # standing, or the launcher can resolve an engine other than the one under test.
+    if (extra or {}).get("MINI_ORK_ENGINE_ROOT"):
+        for _engine_scoped in ("MINI_ORK_ENGINE_ROOT", "MINI_ORK_ROOT"):
+            env.pop(_engine_scoped, None)
     env["WORKER_LOG"] = log_path
     env.setdefault("LOKI_ENABLED", "false")  # bounded proof: don't ship to Loki
     env.update(_read_dotenv(os.path.join(worktree, "server", ".env"), _NAMESPACE_KEYS))
@@ -491,6 +517,14 @@ def _start_replacement(worktree: str, role: str, log_path: str) -> tuple[bool, s
         # pin it as well rather than leave one foreign home reference in the env.
         extra["MINI_ORK_PROJECT_HOME"] = home
         extra["MINI_ORK_HOME"] = home
+    # Pin the engine the children run, independent of the home pin: a worktree's
+    # `.mini-ork/engine` pointer names the researcher PRIMARY home, whose vendored
+    # copy predates the reviewer-diff fixes. Relying on inheritance here means a
+    # hand-run restart silently downgrades every child's engine.
+    engine = _resolve_engine_root()
+    if engine:
+        extra["MINI_ORK_ENGINE_ROOT"] = engine
+        extra["MINI_ORK_ROOT"] = engine
     logf = open(log_path, "ab", buffering=0)
     proc = subprocess.Popen(
         ["bash", watchdog, role],
