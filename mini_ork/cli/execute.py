@@ -340,6 +340,18 @@ def _max_parallel() -> int:
         return 4
 
 
+def _recipe_root(root: str) -> str:
+    """Base dir for recipe assets (register.py, workflow, artifact_contract).
+
+    main.py threads MINI_ORK_RECIPE_ROOT when it resolves a recipe against the
+    MINI_ORK_HOME overlay (a consumer symlinks a private recipe there while
+    MINI_ORK_ROOT points at the primary checkout). Honor it so every recipe-
+    asset read in this module matches where the recipe was found; absent (dev
+    checkouts), fall back to root unchanged.
+    """
+    return os.environ.get("MINI_ORK_RECIPE_ROOT") or root
+
+
 def _bootstrap_recipe_register(root, recipe: str) -> None:
     """Fire a recipe's optional ``register.py`` side effects in THIS process.
 
@@ -359,12 +371,13 @@ def _bootstrap_recipe_register(root, recipe: str) -> None:
     absent and is idempotent per process. A load error propagates as
     ``RecipeRegisterError``.
     """
-    if recipe and os.path.isdir(os.path.join(root, "recipes", recipe)):
+    rbase = _recipe_root(root)
+    if recipe and os.path.isdir(os.path.join(rbase, "recipes", recipe)):
         from pathlib import Path as _Path
 
         from mini_ork.cli.recipe_register import load_recipe_register
 
-        load_recipe_register(_Path(os.path.join(root, "recipes", recipe)))
+        load_recipe_register(_Path(os.path.join(rbase, "recipes", recipe)))
 
 
 def _isolated_dispatch_worker(payload):
@@ -655,7 +668,8 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
 
     workflow = os.environ.get("MINI_ORK_WORKFLOW", "")
     if not workflow and os.environ.get("MINI_ORK_RECIPE"):
-        workflow = os.path.join(root, "recipes", os.environ["MINI_ORK_RECIPE"], "workflow.yaml")
+        workflow = os.path.join(_recipe_root(root), "recipes",
+                                os.environ["MINI_ORK_RECIPE"], "workflow.yaml")
     run_dir = (os.path.dirname(plan_path) if plan_path
                else (context_env("MINI_ORK_RUN_DIR") or "."))
 
@@ -1348,7 +1362,8 @@ def _synth_artifact_name(root, recipe):
     diagnosable at its source instead of surfacing as "N node(s) failed".
     """
     default = "synthesis.md"
-    contract = os.path.join(root, "recipes", recipe, "artifact_contract.yaml") if recipe else ""
+    contract = (os.path.join(_recipe_root(root), "recipes", recipe, "artifact_contract.yaml")
+                if recipe else "")
     if not contract or not os.path.isfile(contract):
         return default
     try:

@@ -138,10 +138,38 @@ def resolve_recipe(root: str, task_class: str) -> str:
     return ""
 
 
-def gen_profile(kickoff_path, root, recipe, task_class, profile_path, agents_path) -> dict:
+def _resolve_recipe_base(root: str, recipe: str):
+    """Locate a recipe across the MINI_ORK_HOME overlay and the root checkout.
+
+    An embedding consumer (the researcher) overlays private recipes by
+    symlinking them into ``$MINI_ORK_HOME/recipes/`` while ``MINI_ORK_ROOT``
+    still points at the primary mini-ork checkout — so ``verified-artifact``
+    lives under home but not under root. Resolution historically consulted only
+    ``root/recipes``, so the overlay was invisible ("no recipe: …") and every
+    chapter that reached the verified-artifact gate failed with exit_code=2.
+    Search home first (the overlay is an intentional override), then root; try
+    the given name and its ``_``→``-`` spelling. Returns ``(base, name)`` or
+    ``("", recipe)`` when found nowhere. Dev checkouts (no ``home/recipes``)
+    fall through to root and reproduce the historical resolution byte-for-byte.
+    """
+    bases = []
+    home = os.environ.get("MINI_ORK_HOME", "")
+    if home and os.path.realpath(home) != os.path.realpath(root):
+        bases.append(home)
+    bases.append(root)
+    for base in bases:
+        for name in (recipe, recipe.replace("_", "-")):
+            if os.path.isdir(os.path.join(base, "recipes", name)):
+                return base, name
+    return "", recipe
+
+
+def gen_profile(kickoff_path, root, recipe, task_class, profile_path, agents_path,
+                recipe_base=None) -> dict:
     """Verbatim transcription of the run-profile embedded python. Writes the
     profile.json and returns the same dict (caller prints the key=value lines)."""
     root = Path(root)
+    rbase = Path(recipe_base) if recipe_base else root
     kickoff = Path(kickoff_path)
     profile = Path(profile_path)
     text = kickoff.read_text(encoding="utf-8", errors="replace")
@@ -223,8 +251,8 @@ def gen_profile(kickoff_path, root, recipe, task_class, profile_path, agents_pat
         if _c and _c not in commands:
             commands.append(_c)
 
-    task_yaml = load_yaml(root / "recipes" / recipe / "task_class.yaml")
-    artifact_yaml = load_yaml(root / "recipes" / recipe / "artifact_contract.yaml")
+    task_yaml = load_yaml(rbase / "recipes" / recipe / "task_class.yaml")
+    artifact_yaml = load_yaml(rbase / "recipes" / recipe / "artifact_contract.yaml")
     agents_yaml = load_yaml(agents_path)
 
     outputs = artifact_yaml.get("outputs") or []
@@ -385,14 +413,17 @@ def _run_lifecycle_impl(argv, root, sink) -> int:
         if not rest:
             sys.stderr.write("kickoff.md path required\n"); return 2
         kickoff = rest.pop(0)
-        if (not os.path.isdir(os.path.join(root, "recipes", recipe))
-                and os.path.isdir(os.path.join(root, "recipes", recipe.replace("_", "-")))):
-            recipe = recipe.replace("_", "-")
 
-    if not os.path.isdir(os.path.join(root, "recipes", recipe)):
-        sys.stderr.write(f"no recipe: {recipe} (ls {root}/recipes/)\n"); return 2
+    rbase, recipe = _resolve_recipe_base(root, recipe)
+    if not rbase:
+        home = os.environ.get("MINI_ORK_HOME", "")
+        where = (f"{home}/recipes/ or {root}/recipes/"
+                 if home and os.path.realpath(home) != os.path.realpath(root)
+                 else f"{root}/recipes/")
+        sys.stderr.write(f"no recipe: {recipe} (ls {where})\n"); return 2
     os.environ["MINI_ORK_RECIPE"] = recipe
-    os.environ["MINI_ORK_WORKFLOW"] = os.path.join(root, "recipes", recipe, "workflow.yaml")
+    os.environ["MINI_ORK_RECIPE_ROOT"] = rbase
+    os.environ["MINI_ORK_WORKFLOW"] = os.path.join(rbase, "recipes", recipe, "workflow.yaml")
     if not os.path.isfile(kickoff):
         sys.stderr.write(f"kickoff not found: {kickoff}\n"); return 2
     run_id = os.environ.setdefault("MINI_ORK_RUN_ID", f"run-{int(time.time())}-{os.getpid()}")
@@ -400,7 +431,7 @@ def _run_lifecycle_impl(argv, root, sink) -> int:
 
     # derived task_class from recipe's task_class.yaml::name
     derived = ""
-    tc_yaml = os.path.join(root, "recipes", recipe, "task_class.yaml")
+    tc_yaml = os.path.join(rbase, "recipes", recipe, "task_class.yaml")
     if os.path.isfile(tc_yaml):
         try:
             import yaml
@@ -434,6 +465,11 @@ def _run_lifecycle_impl(argv, root, sink) -> int:
     home = os.environ.setdefault("MINI_ORK_HOME", os.path.join(os.getcwd(), ".mini-ork"))
     run_dir = os.path.join(home, "runs", run_id)
     os.makedirs(run_dir, exist_ok=True)
+    # Pin the canonical run dir so a stale ambient MINI_ORK_RUN_DIR (e.g. leaked
+    # from a long-lived parent worker) can't split the run — classify/plan wrote
+    # here, and execute's node artifacts must land here too, or the caller reads
+    # runs/<id>/verified-artifact.json from a dir the artifacts never reached.
+    publish_env({"MINI_ORK_RUN_DIR": run_dir})
     try:
         config_resolve.snapshot_run_config(run_dir)
     except Exception:
@@ -458,7 +494,8 @@ def _run_lifecycle_impl(argv, root, sink) -> int:
 
     # ── profile ──
     agents_path = os.path.join(home, "config", "agents.yaml")
-    data = gen_profile(kickoff, root, recipe, task_class, profile_path, agents_path)
+    data = gen_profile(kickoff, root, recipe, task_class, profile_path, agents_path,
+                       recipe_base=rbase)
     sys.stdout.write(f"profile_path={profile_path}\n")
     sys.stdout.write(f"profile_status={data['profile_status']}\n")
     sys.stdout.write(f"profile_confidence={data['confidence']:.2f}\n")
