@@ -64,12 +64,15 @@ def _default_spawn_fn(plan_entry: dict[str, Any]) -> dict[str, Any]:
     the spawn API raise ``ValueError`` (caller marks ``deferred``).
 
     Per-unit kickoff templating (U4c): when ``kickoff_text`` is a file path
-    AND contains no ``{{unit_id}}``/``{{reason}}`` placeholders, the original
-    path is passed through unchanged. Otherwise the body is materialized
-    per-unit into ``<run_dir>/_inline_kickoff_<slug>.md`` where ``slug`` is a
-    filesystem-safe rendering of the unit id (unit ids are usually relative
-    FILE PATHS containing ``/`` — the previous f-string filename silently broke
-    on them).
+    AND contains no ``{{unit_id}}``/``{{reason}}``/``{{evidence}}``/
+    ``{{evidence_path}}`` placeholders, the original path is passed through
+    unchanged. Otherwise the body is materialized per-unit into
+    ``<run_dir>/_inline_kickoff_<slug>.md`` where ``slug`` is a filesystem-safe
+    rendering of the unit id (unit ids are usually relative FILE PATHS
+    containing ``/`` — the previous f-string filename silently broke on them).
+    ``{{evidence}}`` inlines the deep failure signal harvested by
+    ``MO_GOAL_EVIDENCE_CMD`` (falling back to the one-line reason); the child can
+    also re-read the full, uncapped evidence at ``{{evidence_path}}``.
     """
     if os.environ.get("MO_GOAL_SPAWN_DRY", "").strip() == "1":
         return {
@@ -98,10 +101,20 @@ def _default_spawn_fn(plan_entry: dict[str, Any]) -> dict[str, Any]:
     else:
         body = kickoff_text
 
+    hint = plan_entry.get("kickoff_hint") or {}
     unit = str(plan_entry.get("unit_id", "") or "")
-    reason = str((plan_entry.get("kickoff_hint") or {}).get("reason", "") or "")
+    reason = str(hint.get("reason", "") or "")
+    evidence_path = str(hint.get("evidence_path", "") or "")
+    # {{evidence}} carries the deep, per-unit failure signal harvested by
+    # MO_GOAL_EVIDENCE_CMD (produced-vs-required diff, failing node, log tail).
+    # It falls back to the one-line reason when no evidence was harvested, so a
+    # kickoff that references {{evidence}} always renders something actionable.
+    evidence = str(hint.get("evidence", "") or "") or reason
     materialized = (
-        body.replace("{{unit_id}}", unit).replace("{{reason}}", reason)
+        body.replace("{{unit_id}}", unit)
+        .replace("{{reason}}", reason)
+        .replace("{{evidence_path}}", evidence_path)
+        .replace("{{evidence}}", evidence)
     )
 
     if is_file_source and materialized == body:
