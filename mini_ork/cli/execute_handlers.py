@@ -86,6 +86,18 @@ policy_route_lane = _execute_delegate("policy_route_lane")
 publisher_node = _execute_delegate("publisher_node")
 
 
+def _recipe_root(root: str) -> str:
+    """Base dir for recipe assets (prompts, verifiers, workflow).
+
+    main.py resolves the recipe against the MINI_ORK_HOME overlay when a
+    consumer symlinks a private recipe there (MINI_ORK_ROOT still points at the
+    primary checkout) and threads the winning base via MINI_ORK_RECIPE_ROOT.
+    Honor it so prompt/verifier resolution matches where the recipe was found;
+    absent (dev checkouts), fall back to root unchanged.
+    """
+    return os.environ.get("MINI_ORK_RECIPE_ROOT") or root
+
+
 def resolve_prompt_file(root, recipe, prompt_ref, node_type) -> str:
     """Resolve a node prompt, preferring a flat per-run override directory."""
     override_dir = os.environ.get("MINI_ORK_PROMPT_OVERRIDE_DIR", "").strip()
@@ -94,7 +106,7 @@ def resolve_prompt_file(root, recipe, prompt_ref, node_type) -> str:
         if os.path.isfile(override_file):
             return override_file
 
-    recipe_dir = os.path.join(root, "recipes", recipe) if recipe else ""
+    recipe_dir = os.path.join(_recipe_root(root), "recipes", recipe) if recipe else ""
     if (
         prompt_ref
         and recipe_dir
@@ -303,7 +315,7 @@ def dispatch_node(fields, *, root, run_dir, plan_path, task_class, db, run_id,
                   file=sys.stderr)
             return 1, "timeout"
 
-    recipe_dir = os.path.join(root, "recipes", recipe) if recipe else ""
+    recipe_dir = os.path.join(_recipe_root(root), "recipes", recipe) if recipe else ""
     prompt_file = resolve_prompt_file(root, recipe, prompt_ref, node_type)
     override_dir = os.environ.get("MINI_ORK_PROMPT_OVERRIDE_DIR", "").strip()
     override_name = os.path.basename(prompt_ref) if prompt_ref else ""
@@ -571,7 +583,7 @@ def _handle_implementer(ctx: NodeDispatch):
         impl_rel, script_rel = submode
         fallback_sub_log = os.path.join(ctx.run_dir, impl_rel)
         sub_log = ctx.declared_output_path(fallback_sub_log)
-        script = os.path.join(ctx.root, "recipes", script_rel)
+        script = os.path.join(_recipe_root(ctx.root), "recipes", script_rel)
         if not os.path.isfile(script):
             print(f"dispatcher script missing: {script}", file=sys.stderr)
             ctx.trace(ctx.node_id, "failure", "implementer", sub_log, "", "error")

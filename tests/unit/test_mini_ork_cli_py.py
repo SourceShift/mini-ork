@@ -127,6 +127,60 @@ def test_deadline_validation_golden_contract(capsys):
     assert captured.err == "--deadline requires <seconds>\n"
 
 
+def test_fresh_run_pins_run_dir_over_leaked_ambient(monkeypatch, tmp_path):
+    """A stale MINI_ORK_RUN_DIR inherited from a long-lived parent (e.g. a
+    book-generation worker whose env leaked it) must not hijack a fresh run:
+    classify/plan write to home/runs/<id>, so execute's node artifacts must land
+    there too — else the caller reads runs/<id>/verified-artifact.json from a dir
+    nothing ever wrote (the live W9_scaffold_sections ENOENT)."""
+    from mini_ork.context import context_env
+
+    stale = tmp_path / "leaked-run-dir"
+    stale.mkdir()
+    home = tmp_path / "home"
+    monkeypatch.setenv("MINI_ORK_HOME", str(home))
+    monkeypatch.setenv("MINI_ORK_RUN_DIR", str(stale))  # leaked from the parent
+    monkeypatch.setenv("MINI_ORK_RUN_ID", "run-pin-regression")
+    monkeypatch.delenv("MINI_ORK_DRY_RUN", raising=False)
+
+    kickoff = tmp_path / "kickoff.md"
+    kickoff.write_text("# kickoff\n", encoding="utf-8")
+
+    real_run = cli.subprocess.run
+
+    def fake_run(argv, **kwargs):
+        if "mini_ork.cli.classify" in list(argv):
+            return SimpleNamespace(
+                returncode=0, stdout="task_class=code_fix\n", stderr=""
+            )
+        return real_run(argv, **kwargs)
+
+    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+
+    # gen_profile runs immediately after the run-dir pin and still inside the
+    # run_context_scope: capture what the run resolves there, then stop the
+    # lifecycle before it needs a provider.
+    seen: dict[str, str] = {}
+
+    class _Stop(Exception):
+        pass
+
+    def fake_profile(*_args, **_kwargs):
+        seen["run_dir"] = context_env("MINI_ORK_RUN_DIR", "")
+        raise _Stop()
+
+    monkeypatch.setattr(cli, "gen_profile", fake_profile)
+
+    try:
+        cli.main(["run", "code-fix", str(kickoff)], root=str(REPO))
+    except _Stop:
+        pass
+
+    expected = str(home / "runs" / "run-pin-regression")
+    assert seen.get("run_dir") == expected  # pinned to the canonical run dir
+    assert seen["run_dir"] != str(stale)  # leaked ambient value overridden
+
+
 def test_closed_commands_route_to_native_modules_and_execute_stays_live(monkeypatch):
     calls: list[tuple[list[str], dict[str, str] | None]] = []
     execute_calls: list[tuple[list[str], str]] = []
@@ -180,6 +234,137 @@ def _recipes(tmp_path: Path, mapping: dict[str, str | None]) -> Path:
         if task_class is not None:
             (recipe / "task_class.yaml").write_text(f"name: {task_class}\n", encoding="utf-8")
     return root
+
+
+def _overlay_home(tmp_path: Path, recipe: str, files: dict[str, str] | None = None) -> Path:
+    """A MINI_ORK_HOME whose recipes/<recipe>/ exists — the researcher symlinks a
+    private overlay recipe there while MINI_ORK_ROOT still points at a checkout
+    that lacks it (the live verified-artifact env-shadow that failed W9)."""
+    home = tmp_path / "home"
+    rdir = home / "recipes" / recipe
+    rdir.mkdir(parents=True)
+    for name, body in (files or {}).items():
+        (rdir / name).write_text(body, encoding="utf-8")
+    return home
+
+
+def test_resolve_recipe_base_prefers_home_overlay(tmp_path, monkeypatch):
+    # root has code-fix but NOT verified-artifact; the home overlay supplies it.
+    root = _recipes(tmp_path, {"code-fix": "code_fix"})
+    home = _overlay_home(tmp_path, "verified-artifact")
+    monkeypatch.setenv("MINI_ORK_HOME", str(home))
+    assert cli._resolve_recipe_base(str(root), "verified-artifact") == (
+        str(home), "verified-artifact")
+    # a recipe present in root still resolves from root (home lacks it).
+    assert cli._resolve_recipe_base(str(root), "code-fix") == (str(root), "code-fix")
+
+
+def test_resolve_recipe_base_root_fallback_and_swap(tmp_path, monkeypatch):
+    # Dev checkout: MINI_ORK_HOME has no recipes/ → root wins (historical byte-
+    # for-byte behavior), and the '_'→'-' spelling still resolves.
+    root = _recipes(tmp_path, {"db-migration": "db_migration"})
+    devhome = tmp_path / "home"
+    devhome.mkdir()
+    monkeypatch.setenv("MINI_ORK_HOME", str(devhome))
+    assert cli._resolve_recipe_base(str(root), "db_migration") == (
+        str(root), "db-migration")
+    # unset home behaves the same as a home without recipes/.
+    monkeypatch.delenv("MINI_ORK_HOME", raising=False)
+    assert cli._resolve_recipe_base(str(root), "db-migration") == (
+        str(root), "db-migration")
+
+
+def test_resolve_recipe_base_not_found_and_home_equals_root(tmp_path, monkeypatch):
+    root = _recipes(tmp_path, {"code-fix": "code_fix"})
+    monkeypatch.delenv("MINI_ORK_HOME", raising=False)
+    assert cli._resolve_recipe_base(str(root), "nope") == ("", "nope")
+    # MINI_ORK_HOME == root must not double-count; root still wins cleanly.
+    monkeypatch.setenv("MINI_ORK_HOME", str(root))
+    assert cli._resolve_recipe_base(str(root), "code-fix") == (str(root), "code-fix")
+
+
+def test_gen_profile_reads_assets_from_recipe_base(tmp_path, monkeypatch):
+    # gen_profile must read task_class.yaml + artifact_contract.yaml from the
+    # overlay base, not root — else the verified-artifact output filename is lost.
+    root = tmp_path / "root"
+    (root / "recipes").mkdir(parents=True)  # deliberately NO verified-artifact
+    home = _overlay_home(tmp_path, "verified-artifact", {
+        "task_class.yaml": "name: verified_artifact\n",
+        "artifact_contract.yaml": "outputs:\n  - out/verified.json\n",
+    })
+    agents = root / "agents.yaml"
+    agents.write_text("lanes:\n  implementer: codex\n", encoding="utf-8")
+    kickoff = tmp_path / "k.md"
+    kickoff.write_text("# Verify\n\n## Success\n- ok\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    data = cli.gen_profile(
+        kickoff, str(root), "verified-artifact", "verified_artifact",
+        tmp_path / "profile.json", agents, recipe_base=str(home),
+    )
+    assert data["artifact_destination"] == ["out/verified.json"]
+
+
+def test_recipe_root_helpers_honor_recipe_root_env(monkeypatch):
+    from mini_ork.cli import execute as ex
+    from mini_ork.cli import execute_handlers as eh
+    monkeypatch.setenv("MINI_ORK_RECIPE_ROOT", "/overlay/home")
+    assert ex._recipe_root("/root") == "/overlay/home"
+    assert eh._recipe_root("/root") == "/overlay/home"
+    monkeypatch.delenv("MINI_ORK_RECIPE_ROOT", raising=False)
+    assert ex._recipe_root("/root") == "/root"
+    assert eh._recipe_root("/root") == "/root"
+
+
+def test_run_threads_recipe_root_from_home_overlay(tmp_path, monkeypatch):
+    """W9 regression: `run verified-artifact` resolves the recipe from the
+    MINI_ORK_HOME overlay even though root=MINI_ORK_ROOT lacks it, and threads
+    the winning base via MINI_ORK_RECIPE_ROOT + MINI_ORK_WORKFLOW so prompts and
+    verifiers follow the recipe to where it actually lives."""
+    root = tmp_path / "root"
+    (root / "recipes").mkdir(parents=True)  # no verified-artifact under root
+    home = _overlay_home(tmp_path, "verified-artifact", {
+        "workflow.yaml": "nodes: []\n",
+        "task_class.yaml": "name: verified_artifact\n",
+    })
+    monkeypatch.setenv("MINI_ORK_HOME", str(home))
+    monkeypatch.delenv("MINI_ORK_RECIPE_ROOT", raising=False)
+    monkeypatch.delenv("MINI_ORK_RUN_DIR", raising=False)
+    monkeypatch.delenv("MINI_ORK_DRY_RUN", raising=False)
+    monkeypatch.setenv("MINI_ORK_RUN_ID", "run-recipe-base")
+
+    kickoff = tmp_path / "k.md"
+    kickoff.write_text("# Verify\n", encoding="utf-8")
+
+    real_run = cli.subprocess.run
+
+    def fake_run(argv, **kwargs):
+        if "mini_ork.cli.classify" in list(argv):
+            return SimpleNamespace(
+                returncode=0, stdout="task_class=verified_artifact\n", stderr="")
+        return real_run(argv, **kwargs)
+
+    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+
+    seen: dict[str, str] = {}
+
+    class _Stop(Exception):
+        pass
+
+    def fake_profile(*_args, **_kwargs):
+        seen["recipe_root"] = os.environ.get("MINI_ORK_RECIPE_ROOT", "")
+        seen["workflow"] = os.environ.get("MINI_ORK_WORKFLOW", "")
+        raise _Stop()
+
+    monkeypatch.setattr(cli, "gen_profile", fake_profile)
+
+    try:
+        cli.main(["run", "verified-artifact", str(kickoff)], root=str(root))
+    except _Stop:
+        pass
+
+    assert seen.get("recipe_root") == str(home)
+    assert seen.get("workflow") == str(
+        home / "recipes" / "verified-artifact" / "workflow.yaml")
 
 
 def test_resolve_recipe_golden_values(tmp_path):
