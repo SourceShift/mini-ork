@@ -48,6 +48,7 @@ save_state = _loop_state_module.save_state
 record_wave = _loop_state_module.record_wave
 should_quarantine = _loop_state_module.should_quarantine
 divergence = _loop_state_module.divergence
+evidence_informativeness = _loop_state_module.evidence_informativeness
 
 FINAL_VERDICT_FILENAME = "final-verdict.json"
 
@@ -86,6 +87,25 @@ def _child_diagnostics(child_run_dir: str) -> dict[str, Any]:
             pass
     if os.path.isfile(os.path.join(child_run_dir, "review-diff-noop.json")):
         out["child_no_op"] = True
+    return out
+
+
+def _wave_history(state: dict[str, Any], limit: int = 4) -> list[dict[str, Any]]:
+    """Compact per-wave digest handed to the next wave's evidence harvest."""
+    out: list[dict[str, Any]] = []
+    for w in state.get("waves", [])[-limit:]:
+        cd = w.get("child_diagnostics") or {}
+        out.append({
+            "wave": w.get("wave"),
+            "attempted": w.get("attempted", []),
+            "failing_after": w.get("failing_after", []),
+            "headroom_closed": w.get("headroom_closed"),
+            "predicate_moved": w.get("predicate_moved"),
+            "child_verdict": sorted({str((v or {}).get("child_verdict")) for v in cd.values()}),
+            "review_diff_bytes": sorted(
+                {str((v or {}).get("review_diff_bytes")) for v in cd.values()}
+            ),
+        })
     return out
 
 
@@ -274,6 +294,12 @@ def _default_run_wave_fn(wave_no: int, quarantined: set[str]) -> dict[str, Any]:
     # delimited; empty (no quarantine yet) leaves selection at historical.
     wave_env = dict(os.environ)
     wave_env["MO_GOAL_QUARANTINED_UNITS"] = "\n".join(sorted(quarantined))
+    # Meta^n conditioning at depth 1: tell the child what its predecessors
+    # already tried so it does not re-issue the same patch. Bounded to the last
+    # 4 waves; rendered in transforms._harvest_selected_evidence.
+    hist = os.environ.get("MO_GOAL_WAVE_HISTORY")
+    if hist:
+        wave_env["MO_GOAL_WAVE_HISTORY"] = hist
     # Real per-wave spend = the 24h-rolling cost meter's delta across the wave
     # subprocess. panel-verdict.json carries only the panel node's own cost (~$0),
     # NOT the fix child's dispatch spend, so folding it in as cost_usd left every
@@ -330,7 +356,36 @@ def _default_run_wave_fn(wave_no: int, quarantined: set[str]) -> dict[str, Any]:
             ]
             if attempted:
                 payload["attempted"] = attempted
+            diag = {
+                str(u.get("unit_id")): {
+                    k: u.get(k)
+                    for k in ("child_verdict", "review_diff_bytes", "child_no_op",
+                              "child_failed_nodes", "child_run_id")
+                    if u.get(k) is not None
+                }
+                for u in sw.get("units", [])
+                if isinstance(u, dict) and u.get("unit_id") is not None
+            }
+            diag = {k: v for k, v in diag.items() if v}
+            if diag:
+                payload["child_diagnostics"] = diag
         except json.JSONDecodeError:
+            pass
+
+    # Evidence fingerprints — the bundle this wave's children were handed.
+    # Joined to the next wave's predicate delta, this is the loop's r_disc.
+    sp_path = os.path.join(run_dir, "sweep-plan.json")
+    if os.path.isfile(sp_path):
+        try:
+            sp = json.loads(Path(sp_path).read_text(encoding="utf-8"))
+            ev = {
+                str(e.get("unit_id")): str(e.get("evidence_sha", ""))
+                for e in sp
+                if isinstance(e, dict) and e.get("unit_id") is not None and e.get("evidence_sha")
+            }
+            if ev:
+                payload["evidence"] = ev
+        except (json.JSONDecodeError, OSError):
             pass
 
     # Override any panel-sourced cost with the measured spend delta. Clamp at 0:
@@ -587,6 +642,19 @@ def drive(
             _write_final_verdict(resolved_state_dir, payload)
             return payload
 
+        # Re-target, don't just stop: when the evidence we keep feeding is not
+        # moving the predicate, tell the next wave's harvest to lead with the
+        # wave history instead of re-issuing the same bundle.
+        if _env_bool("MO_GOAL_RDISC", True):
+            uninformative = evidence_informativeness(state, divergence_patience)
+            if uninformative:
+                os.environ["MO_GOAL_EVIDENCE_UNINFORMATIVE"] = "1"
+            else:
+                os.environ.pop("MO_GOAL_EVIDENCE_UNINFORMATIVE", None)
+            os.environ["MO_GOAL_WAVE_HISTORY"] = json.dumps(
+                _wave_history(state, limit=4), sort_keys=True,
+            )
+
         verdict = resolved_run_wave(wave_no, quarantined)
         verdict_dict = verdict if isinstance(verdict, dict) else {}
         # Accept either the kickoff's panel-verdict.json key
@@ -621,6 +689,14 @@ def drive(
             if isinstance(raw_attempted, list)
             else None
         )
+        raw_evidence = verdict_dict.get("evidence")
+        raw_child = verdict_dict.get("child_diagnostics")
+        diagnostics = None
+        if isinstance(raw_evidence, dict) or isinstance(raw_child, dict):
+            diagnostics = {
+                "evidence": raw_evidence if isinstance(raw_evidence, dict) else {},
+                "child_diagnostics": raw_child if isinstance(raw_child, dict) else {},
+            }
 
         record_wave(
             state,
@@ -631,6 +707,7 @@ def drive(
             cost_usd=cost_usd,
             reasons=unit_reasons,
             attempted=attempted,
+            diagnostics=diagnostics,
         )
 
         # 1. goal_met — wave verdict == "pass".
@@ -673,7 +750,7 @@ def drive(
             return payload
 
         # 3. diverged — UCCI divergence-kill (signature repeat or regressing).
-        div = divergence(state, patience=divergence_patience)
+        div = divergence(state, patience=divergence_patience, rdisc=_env_bool("MO_GOAL_RDISC", True))
         if div is not None:
             payload = {
                 "stop": "diverged",

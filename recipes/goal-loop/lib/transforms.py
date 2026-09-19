@@ -25,6 +25,7 @@ subprocess I/O reproducible and inspectable from the receipt layer.
 from __future__ import annotations
 
 import importlib.util
+import hashlib
 import json
 import os
 import re
@@ -63,6 +64,13 @@ harvest_evidence = _goal_state_module.harvest_evidence
 def _slug(unit_id: str) -> str:
     """Filesystem-safe rendering of a unit id (unit ids are often file paths)."""
     return re.sub(r"[^A-Za-z0-9._-]", "_", unit_id)[:80] or "x"
+
+
+def _evidence_sha(text: str) -> str:
+    """Stable fingerprint of the exact evidence bundle a child was handed."""
+    if not text:
+        return ""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 @register_transform("goal_state_eval")
@@ -196,6 +204,7 @@ def goal_sweep_plan(workflow: CompiledWorkflow, ledger: ArtifactLedger, node_id:
                 "evidence": evidence_map.get(unit_id, {}).get("text", ""),
                 "evidence_path": evidence_map.get(unit_id, {}).get("path", ""),
             },
+            "evidence_sha": _evidence_sha(evidence_map.get(unit_id, {}).get("text", "")),
         }
         for unit_id in selected
     ]
@@ -229,9 +238,13 @@ def _harvest_selected_evidence(
     if ev_dir is not None:
         ev_dir.mkdir(parents=True, exist_ok=True)
 
+    history_block = _render_wave_history_block(os.environ.get("MO_GOAL_WAVE_HISTORY", ""))
+
     out: dict[str, dict[str, str]] = {}
     for uid in selected:
         text = raw.get(uid, "") or goal_state.get(uid, {}).get("reason", "")
+        if history_block:
+            text = text + "\n" + history_block
         path_str = ""
         if ev_dir is not None:
             ev_path = ev_dir / f"{_slug(uid)}.md"
@@ -242,6 +255,50 @@ def _harvest_selected_evidence(
                 path_str = ""
         out[uid] = {"text": text, "path": path_str}
     return out
+
+
+def _render_wave_history_block(raw: str) -> str:
+    """Render MO_GOAL_WAVE_HISTORY as a 'do NOT repeat these' section.
+
+    Empty on absent/unparseable input, so an unset env var yields a
+    byte-identical evidence file to today.
+    """
+    raw = (raw or "").strip()
+    if not raw:
+        return ""
+    try:
+        waves = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return ""
+    if not isinstance(waves, list) or not waves:
+        return ""
+    lines = ["### Prior waves — do NOT repeat these", ""]
+    if (os.environ.get("MO_GOAL_EVIDENCE_UNINFORMATIVE") or "").strip() == "1":
+        lines += [
+            f"The evidence above has been handed to the last {len(waves)} waves "
+            "UNCHANGED and the predicate did not move. The cause is upstream of "
+            "what those children patched — re-diagnose before editing the same "
+            "surface again.",
+            "",
+        ]
+    lines += ["| wave | attempted | child said | diff bytes | headroom | moved |",
+              "|---|---|---|---|---|---|"]
+    for w in waves:
+        if not isinstance(w, dict):
+            continue
+        lines.append(
+            f"| {w.get('wave')} | {','.join(map(str, w.get('attempted') or [])) or '-'} "
+            f"| {','.join(map(str, w.get('child_verdict') or [])) or '-'} "
+            f"| {','.join(map(str, w.get('review_diff_bytes') or [])) or '-'} "
+            f"| {w.get('headroom_closed')} | {w.get('predicate_moved')} |"
+        )
+    lines += [
+        "",
+        "If a row above shows `child said=pass` with `moved=False`, that wave's "
+        "patch was a self-approved non-fix. Do not reproduce it.",
+        "",
+    ]
+    return "\n".join(lines)
 
 
 # ─────────────────────────────────────────────────────────────────────────
