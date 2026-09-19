@@ -253,6 +253,9 @@ def test_resolve_recipe_base_prefers_home_overlay(tmp_path, monkeypatch):
     root = _recipes(tmp_path, {"code-fix": "code_fix"})
     home = _overlay_home(tmp_path, "verified-artifact")
     monkeypatch.setenv("MINI_ORK_HOME", str(home))
+    # Pin cwd to a dir with no recipes/ so the cwd probe stays neutral (else the
+    # real repo checkout pytest runs from would leak its own recipes/).
+    monkeypatch.chdir(tmp_path)
     assert cli._resolve_recipe_base(str(root), "verified-artifact") == (
         str(home), "verified-artifact")
     # a recipe present in root still resolves from root (home lacks it).
@@ -266,6 +269,7 @@ def test_resolve_recipe_base_root_fallback_and_swap(tmp_path, monkeypatch):
     devhome = tmp_path / "home"
     devhome.mkdir()
     monkeypatch.setenv("MINI_ORK_HOME", str(devhome))
+    monkeypatch.chdir(tmp_path)  # neutral cwd (no recipes/) for the cwd probe
     assert cli._resolve_recipe_base(str(root), "db_migration") == (
         str(root), "db-migration")
     # unset home behaves the same as a home without recipes/.
@@ -277,10 +281,28 @@ def test_resolve_recipe_base_root_fallback_and_swap(tmp_path, monkeypatch):
 def test_resolve_recipe_base_not_found_and_home_equals_root(tmp_path, monkeypatch):
     root = _recipes(tmp_path, {"code-fix": "code_fix"})
     monkeypatch.delenv("MINI_ORK_HOME", raising=False)
+    monkeypatch.chdir(tmp_path)  # neutral cwd (no recipes/) for the cwd probe
     assert cli._resolve_recipe_base(str(root), "nope") == ("", "nope")
     # MINI_ORK_HOME == root must not double-count; root still wins cleanly.
     monkeypatch.setenv("MINI_ORK_HOME", str(root))
     assert cli._resolve_recipe_base(str(root), "code-fix") == (str(root), "code-fix")
+
+
+def test_resolve_recipe_base_cwd_signal_when_home_clobbered(tmp_path, monkeypatch):
+    # The live env-shadow: the launcher's _configure_paths prefers an inherited
+    # MINI_ORK_PROJECT_HOME and overwrites MINI_ORK_HOME with it, so home points
+    # back at a checkout that LACKS the overlay recipe. The invocation cwd (the
+    # overlay home the consumer spawned into) is the un-clobberable signal that
+    # still resolves verified-artifact. Without this, W9 fails "no recipe".
+    root = _recipes(tmp_path, {"code-fix": "code_fix"})  # no verified-artifact
+    clobbered = tmp_path / "clobbered-home"              # home minus the overlay
+    (clobbered / "recipes").mkdir(parents=True)
+    overlay = _overlay_home(tmp_path, "verified-artifact")
+    monkeypatch.setenv("MINI_ORK_HOME", str(clobbered))
+    monkeypatch.chdir(overlay)
+    base, name = cli._resolve_recipe_base(str(root), "verified-artifact")
+    assert name == "verified-artifact"
+    assert os.path.realpath(base) == os.path.realpath(overlay)
 
 
 def test_gen_profile_reads_assets_from_recipe_base(tmp_path, monkeypatch):
@@ -331,6 +353,7 @@ def test_run_threads_recipe_root_from_home_overlay(tmp_path, monkeypatch):
     monkeypatch.delenv("MINI_ORK_RUN_DIR", raising=False)
     monkeypatch.delenv("MINI_ORK_DRY_RUN", raising=False)
     monkeypatch.setenv("MINI_ORK_RUN_ID", "run-recipe-base")
+    monkeypatch.chdir(tmp_path)  # neutral cwd; the home overlay must win regardless
 
     kickoff = tmp_path / "k.md"
     kickoff.write_text("# Verify\n", encoding="utf-8")

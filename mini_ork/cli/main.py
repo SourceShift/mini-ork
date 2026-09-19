@@ -147,16 +147,41 @@ def _resolve_recipe_base(root: str, recipe: str):
     lives under home but not under root. Resolution historically consulted only
     ``root/recipes``, so the overlay was invisible ("no recipe: …") and every
     chapter that reached the verified-artifact gate failed with exit_code=2.
-    Search home first (the overlay is an intentional override), then root; try
-    the given name and its ``_``→``-`` spelling. Returns ``(base, name)`` or
-    ``("", recipe)`` when found nowhere. Dev checkouts (no ``home/recipes``)
-    fall through to root and reproduce the historical resolution byte-for-byte.
+
+    ``MINI_ORK_HOME`` alone is not trustworthy across a spawn boundary: the
+    launcher's ``_configure_paths`` prefers an inherited ``MINI_ORK_PROJECT_HOME``
+    and *overwrites* ``MINI_ORK_HOME`` with it, so a consumer that spawns with
+    ``cwd=<overlay-home>`` and a stale engine ``MINI_ORK_PROJECT_HOME`` in its
+    environment gets ``MINI_ORK_HOME`` clobbered back to the engine checkout
+    before this runs. The invocation cwd is the un-clobberable signal in that
+    case (parents spawn with ``cwd=<overlay-home>``; nothing here chdirs), so it
+    is consulted too. Search order: home, cwd, root — the given name and its
+    ``_``→``-`` spelling — deduped by realpath. Returns ``(base, name)`` or
+    ``("", recipe)`` when found nowhere. Dev checkouts (home unset / == cwd ==
+    root) collapse to a single ``root`` probe and reproduce the historical
+    resolution byte-for-byte.
     """
-    bases = []
-    home = os.environ.get("MINI_ORK_HOME", "")
-    if home and os.path.realpath(home) != os.path.realpath(root):
-        bases.append(home)
-    bases.append(root)
+    bases: list[str] = []
+    seen: set[str] = set()
+
+    def _add(candidate: str) -> None:
+        if not candidate:
+            return
+        try:
+            real = os.path.realpath(candidate)
+        except OSError:
+            return
+        if real in seen:
+            return
+        seen.add(real)
+        bases.append(candidate)
+
+    _add(os.environ.get("MINI_ORK_HOME", ""))
+    try:
+        _add(os.getcwd())
+    except OSError:
+        pass
+    _add(root)
     for base in bases:
         for name in (recipe, recipe.replace("_", "-")):
             if os.path.isdir(os.path.join(base, "recipes", name)):
@@ -416,11 +441,15 @@ def _run_lifecycle_impl(argv, root, sink) -> int:
 
     rbase, recipe = _resolve_recipe_base(root, recipe)
     if not rbase:
-        home = os.environ.get("MINI_ORK_HOME", "")
-        where = (f"{home}/recipes/ or {root}/recipes/"
-                 if home and os.path.realpath(home) != os.path.realpath(root)
-                 else f"{root}/recipes/")
-        sys.stderr.write(f"no recipe: {recipe} (ls {where})\n"); return 2
+        probed, seen = [], set()
+        for cand in (os.environ.get("MINI_ORK_HOME", ""), os.getcwd(), root):
+            if not cand:
+                continue
+            real = os.path.realpath(cand)
+            if real not in seen:
+                seen.add(real)
+                probed.append(f"{cand}/recipes/")
+        sys.stderr.write(f"no recipe: {recipe} (ls {' or '.join(probed)})\n"); return 2
     os.environ["MINI_ORK_RECIPE"] = recipe
     os.environ["MINI_ORK_RECIPE_ROOT"] = rbase
     os.environ["MINI_ORK_WORKFLOW"] = os.path.join(rbase, "recipes", recipe, "workflow.yaml")
