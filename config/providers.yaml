@@ -55,6 +55,11 @@ providers:
     model: GLM-5.3
     base_url: https://api.z.ai/api/anthropic
     api_key_env: GLM_API_KEY
+    # B0 probe (2026-09-18): this gateway relays content_block_delta at
+    # token granularity, so stream-json buys a genuinely live view. Set
+    # only after re-running the probe — a buffering gateway would emit
+    # the same events in one lump at exit.
+    gateway: false
     extra_env:
       CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
   kimi:
@@ -71,6 +76,11 @@ providers:
     model: MiniMax-M3
     base_url: https://api.minimax.io/anthropic
     api_key_env: MINIMAX_API_KEY
+    # B0 probe (2026-09-18): this gateway relays content_block_delta at
+    # token granularity, so stream-json buys a genuinely live view. Set
+    # only after re-running the probe — a buffering gateway would emit
+    # the same events in one lump at exit.
+    gateway: false
     extra_env:
       CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
   deepseek:
@@ -79,6 +89,11 @@ providers:
     model: "deepseek-v4-pro[1m]"
     base_url: https://api.deepseek.com/anthropic
     api_key_env: DEEPSEEK_API_KEY
+    # B0 probe (2026-09-18): this gateway relays content_block_delta at
+    # token granularity, so stream-json buys a genuinely live view. Set
+    # only after re-running the probe — a buffering gateway would emit
+    # the same events in one lump at exit.
+    gateway: false
     extra_env:
       ANTHROPIC_DEFAULT_HAIKU_MODEL: deepseek-v4-flash
       CLAUDE_CODE_SUBAGENT_MODEL: deepseek-v4-flash
