@@ -104,6 +104,30 @@ def codex_cost(_stdout: str, usage: TokenUsage) -> float:
 
 
 def _claude_envelope(stdout: str) -> dict:
+    """The result object from a claude invocation, in EITHER output format.
+
+    ``--output-format json`` emits one object; ``stream-json`` emits one object
+    per line and puts the fields the parsers need — ``result``, ``session_id``,
+    ``usage``, ``total_cost_usd`` — into a ``type=="result"`` event that is
+    shape-identical to the json-mode object. So preferring that event is what
+    lets all four parsers (usage, cost, text, session) survive the format switch
+    unchanged, instead of each growing a stream-shaped branch that can drift
+    from the others.
+
+    A ``result`` event wins whenever one is present. Absent one — a run killed
+    before it finished, or the whole-document case — the previous whole-document
+    parse still applies, so this is a strict superset of the old behavior.
+    """
+    for line in reversed(stdout.splitlines()):
+        s = line.strip()
+        if not s.startswith("{"):
+            continue
+        try:
+            evt = json.loads(s)
+        except ValueError:
+            continue
+        if isinstance(evt, dict) and evt.get("type") == "result":
+            return evt
     try:
         obj = json.loads(stdout)
         return obj if isinstance(obj, dict) else {}
@@ -152,13 +176,34 @@ def claude_cost(stdout: str, _usage: TokenUsage) -> float:
 
 
 def claude_session_id(stdout: str) -> str:
-    """Extract the conversation id from claude's JSON envelope (.session_id).
+    """Extract the conversation id claude assigns to a run.
 
-    `claude --print --output-format json` emits a stable ``session_id`` that
-    keys the on-disk transcript under ``~/.claude/projects/<hash>/<id>.jsonl``.
-    Capturing it is what makes turn-resume (``--resume <id>``) possible for a
-    node that stopped mid-conversation (durable-dag E4). "" when absent."""
-    return str(_claude_envelope(stdout).get("session_id") or "")
+    ``claude --print`` emits a stable ``session_id`` that keys the on-disk
+    transcript under ``~/.claude/projects/<hash>/<id>.jsonl``. Capturing it is
+    what makes turn-resume (``--resume <id>``) possible for a node that stopped
+    mid-conversation (durable-dag E4). "" when absent.
+
+    The result envelope is preferred, but it is not the only event carrying the
+    id: in ``stream-json`` the ``system``/init event on line one has it too. So a
+    run killed before it could emit a result — a timeout SIGKILL, a crash
+    mid-generation, exactly the runs E4 exists to resume — still yields its id
+    here, where json mode had nothing at all to parse. Scanning in reverse keeps
+    the most recent id when a resumed run carries several.
+    """
+    sid = _claude_envelope(stdout).get("session_id")
+    if sid:
+        return str(sid)
+    for line in reversed(stdout.splitlines()):
+        s = line.strip()
+        if not s.startswith("{"):
+            continue
+        try:
+            evt = json.loads(s)
+        except ValueError:
+            continue
+        if isinstance(evt, dict) and evt.get("session_id"):
+            return str(evt["session_id"])
+    return ""
 
 
 def apply_resume(command: Sequence[str], session_id: str) -> tuple[str, ...]:
@@ -407,17 +452,37 @@ def _claude_spec(
     env: Mapping[str, str],
     *,
     unset_env: frozenset[str] = frozenset(),
+    stream_json: bool = False,
 ) -> ProviderSpec:
+    """The claude CLI argv for one lane.
+
+    ``stream_json`` switches the output format from a single object at exit to
+    newline-delimited events as they are produced. That is the whole difference
+    between a node whose output appears at completion and one whose output the
+    live sidecar (``dispatch/live_stream.py``) can tail while it runs, and it is
+    per-lane because it depends on the gateway: the config documents
+    ``gateway: false`` as opt-in for "endpoints that stream native Anthropic
+    stream-json correctly", and a gateway that buffers would deliver the same
+    events in one lump at exit (B0 measured all three lanes we ship as
+    relaying). ``--include-partial-messages`` is required for token-level
+    deltas — without it the events are whole messages, which is a stream in
+    name only for a long generation. ``--verbose`` is required by the CLI
+    whenever ``--print`` and ``stream-json`` are combined.
+    """
+    command: list[str] = [
+        "claude",
+        "--print",
+        "--permission-mode",
+        "bypassPermissions",
+        "--output-format",
+    ]
+    if stream_json:
+        command += ["stream-json", "--verbose", "--include-partial-messages"]
+    else:
+        command += ["json"]
     return ProviderSpec(
         model=name,
-        command=(
-            "claude",
-            "--print",
-            "--permission-mode",
-            "bypassPermissions",
-            "--output-format",
-            "json",
-        ),
+        command=tuple(command),
         parse_usage=parse_claude_usage,
         parse_cost=claude_cost,
         parse_text=claude_result_text,
@@ -427,11 +492,28 @@ def _claude_spec(
     )
 
 
+def _wants_stream_json(entry: Mapping[str, object]) -> bool:
+    """``gateway: false`` opts a lane into stream-json.
+
+    Identity comparison against ``False``, not falsiness: the documented default
+    is json output, so only an entry that says ``false`` explicitly moves. An
+    unset, missing or misspelled value keeps the format every existing lane and
+    test expects — the safe direction, since the failure mode of guessing wrong
+    is a dispatch whose output nothing can parse.
+    """
+    return entry.get("gateway") is False
+
+
 def _build_anthropic_native(name, entry, root, extra_env, model_id) -> ProviderSpec:
-    del entry, root
+    del root
     env: dict[str, str] = {}
     env.update(extra_env)
-    return _claude_spec(name, env, unset_env=ANTHROPIC_GATEWAY_ENV)
+    return _claude_spec(
+        name,
+        env,
+        unset_env=ANTHROPIC_GATEWAY_ENV,
+        stream_json=_wants_stream_json(entry),
+    )
 
 
 def _build_anthropic_compat(name, entry, root, extra_env, model_id) -> ProviderSpec:
@@ -459,7 +541,7 @@ def _build_anthropic_compat(name, entry, root, extra_env, model_id) -> ProviderS
             }
         )
     env.update(extra_env)
-    return _claude_spec(name, env)
+    return _claude_spec(name, env, stream_json=_wants_stream_json(entry))
 
 
 def _build_openai_compat(name, entry, root, extra_env, model_id) -> ProviderSpec:
