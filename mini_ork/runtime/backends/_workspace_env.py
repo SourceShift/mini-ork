@@ -81,6 +81,14 @@ _AGENT_ENV_SUFFIXES = ("_API_KEY",)
 # namespace closed means a caller that forgets to set one of these still fails
 # LOUD in the child rather than silently pointing it at a host path that does not
 # exist inside the sandbox.
+#
+# The set holds caller-set CHILD POLICY alongside identity — ``ALLOW_CHILD_SPAWN``
+# and ``ROLLBACK_KEEP_WORKTREE`` are both decisions the caller makes *about* the
+# child, not ambient host state, and are worthless if the transport-boundary pass
+# drops them. A policy flag that silently reverts to the child's default is worse
+# than an absent one: ``MINI_ORK_ROLLBACK_KEEP_WORKTREE`` stripped here means the
+# in-sandbox rollback resumes reverting the very edit an outer loop owns, which is
+# the bug the goal-loop driver sets it to prevent.
 _RUN_CONTRACT_KEYS = frozenset(
     {
         "MINI_ORK_HOME",
@@ -88,6 +96,7 @@ _RUN_CONTRACT_KEYS = frozenset(
         "MINI_ORK_RUN_ID",
         "MINI_ORK_PARENT_RUN_ID",
         "MINI_ORK_ALLOW_CHILD_SPAWN",
+        "MINI_ORK_ROLLBACK_KEEP_WORKTREE",
     }
 )
 

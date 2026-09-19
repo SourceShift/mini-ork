@@ -138,3 +138,33 @@ def test_run_contract_exception_is_exact_name_not_the_whole_namespace():
 
 def test_run_contract_match_is_case_insensitive():
     assert _container_env({"mini_ork_run_id": "c"}) == {"mini_ork_run_id": "c"}
+
+
+def test_rollback_keep_worktree_survives_the_transport_boundary():
+    # The goal-loop driver exports MINI_ORK_ROLLBACK_KEEP_WORKTREE so its code-fix
+    # child keeps an edit an OUTER loop owns verifying. It is a caller-set policy
+    # flag, not ambient host state, so it must cross — but it matches neither an
+    # _AGENT_ENV_PREFIXES prefix nor an _API_KEY suffix, so before it joined the
+    # contract set the second (transport-boundary) pass dropped it and the child
+    # silently reverted to the default: revert the edit. Proved by reading the
+    # allow-rule; the flag's whole purpose inverts when it is stripped.
+    env = {"MINI_ORK_ROLLBACK_KEEP_WORKTREE": "1"}
+    assert _container_env(env) == env  # pass 1 (the caller's)
+    assert _container_env(_container_env(env)) == env  # pass 2 (the backend's)
+
+
+def test_rollback_keep_worktree_crosses_alongside_a_real_child_env():
+    # The flag rides with identity + allowlisted credentials, and the host-path
+    # exclusions still hold — joining the set did not open the namespace.
+    env = {
+        "MINI_ORK_ROLLBACK_KEEP_WORKTREE": "1",
+        "MINI_ORK_HOME": "/workspace",
+        "ANTHROPIC_API_KEY": "sk-ant",
+        "MINI_ORK_ROOT": "/Volumes/docker-ssd/ps/mini-ork",  # host path → dropped
+        "S1_HOST_SECRET": "hunter2",  # non-allowlisted → dropped
+    }
+    assert _container_env(env) == {
+        "MINI_ORK_ROLLBACK_KEEP_WORKTREE": "1",
+        "MINI_ORK_HOME": "/workspace",
+        "ANTHROPIC_API_KEY": "sk-ant",
+    }
