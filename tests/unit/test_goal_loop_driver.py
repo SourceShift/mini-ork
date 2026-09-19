@@ -49,6 +49,7 @@ should_quarantine = _LOOP_STATE.should_quarantine
 divergence = _LOOP_STATE.divergence
 wave_signature = _LOOP_STATE.wave_signature
 _reason_fingerprint = _LOOP_STATE._reason_fingerprint  # noqa: SLF001 — test seam
+_default_run_wave_fn = _DRIVE._default_run_wave_fn  # noqa: SLF001 — test seam
 
 
 # ── 1. goal_met on wave 2 ──────────────────────────────────────────────────
@@ -269,6 +270,35 @@ def test_sweep_run_deferred_on_value_error(tmp_path, monkeypatch):
     result = json.loads((run_dir / "sweep-result.json").read_text())
     assert result["units"][0]["status"] == "deferred"
     assert "cap hit" in result["units"][0]["reason"]
+
+
+def test_default_run_wave_exports_quarantine_to_recipe(tmp_path, monkeypatch):
+    """The driver must hand its GRAO quarantine set to the wave recipe via
+    MO_GOAL_QUARANTINED_UNITS (newline-sorted) so goal_sweep_plan can rotate
+    the freed child slot off the stuck unit. Without this the single-child
+    loop re-selects the same failing unit every wave."""
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    monkeypatch.setenv("MINI_ORK_RUN_DIR", str(run_dir))
+    monkeypatch.setenv("MO_GOAL_WAVE_KICKOFF", str(tmp_path / "wave.md"))
+    monkeypatch.setenv("MINI_ORK_ROOT", str(tmp_path))
+
+    captured: dict[str, object] = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["env"] = kwargs.get("env")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(_DRIVE.subprocess, "run", fake_run)
+
+    payload = _default_run_wave_fn(3, {"2", "1", "10"})
+
+    env = captured["env"]
+    assert isinstance(env, dict)
+    # sorted, newline-delimited — the exact contract goal_sweep_plan parses.
+    assert env["MO_GOAL_QUARANTINED_UNITS"] == "1\n10\n2"
+    # and the wave payload still reports the same set for the driver's records.
+    assert payload["quarantined"] == ["1", "10", "2"]
 
 
 # ── 7-9. U4c per-unit kickoff templating ────────────────────────────────
