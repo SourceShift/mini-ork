@@ -424,6 +424,70 @@ def _units_to_apply(run_dir: str) -> list[str]:
     return out
 
 
+# ── instrument guard: the fix child may not edit what scores it ──────────────
+#
+# The goal predicate is only as trustworthy as the code that writes its inputs.
+# ``committed_complete`` and ``rubric_status`` are columns written by researcher
+# code that lives INSIDE the fix child's own editable tree, and ``scope_gate``
+# does NOT filter paths — it checks a task_class allowlist
+# (mini_ork/gates/gate_registry.py::_evaluate_scope). So a child that cannot
+# make a chapter pass can instead make the chapter's PASS MEANING cheaper, and
+# this stage would faithfully deploy that edit to the running worker. The guard
+# closes the loop from the other end: before anything is shipped, ask git
+# whether the child touched a path the operator declared part of the
+# instrument, and refuse to deploy if it did. Generation code stays fixable —
+# only the scoring decision is frozen.
+
+
+def _protected_globs() -> list[str]:
+    """Globs from ``MO_GOAL_PROTECTED_PATHS``, newline/comma separated.
+
+    ``#`` starts a comment. Unset/empty ⇒ the guard is inert (the historical
+    behavior): arming it is an explicit operator act, and only then does a
+    probe failure count as a violation.
+    """
+    raw = os.environ.get("MO_GOAL_PROTECTED_PATHS", "").replace(",", "\n")
+    return [
+        glob
+        for glob in (chunk.strip() for chunk in raw.splitlines())
+        if glob and not glob.startswith("#")
+    ]
+
+
+def _protected_mode() -> str:
+    """``refuse`` (default, fail-closed) or ``warn`` (record the hit, ship anyway)."""
+    return os.environ.get("MO_GOAL_PROTECTED_MODE", "refuse").strip().lower() or "refuse"
+
+
+def _git_touched(cwd: str, glob: str) -> list[str] | None:
+    """Paths under ``glob`` that differ from HEAD (staged, unstaged, untracked).
+
+    Git does the matching, so a rename, a quoted path, or a nested directory
+    cannot slip past a hand-rolled parser. ``None`` means the probe itself
+    failed (not a repo, git missing) — the caller treats that as a violation,
+    because a guard that cannot see the tree must not wave the deploy through.
+    """
+    res = _run(
+        ["git", "-C", cwd, "status", "--porcelain", "-uall", "--", glob],
+        cwd=None, shell=False,
+    )
+    if res["rc"] != 0:
+        return None
+    return [line for line in res["stdout"].splitlines() if line.strip()]
+
+
+def _protected_violations(target_cwd: str) -> list[dict[str, Any]]:
+    """``[{glob, paths}]`` for every instrument glob the fix child has touched."""
+    found: list[dict[str, Any]] = []
+    for glob in _protected_globs():
+        touched = _git_touched(target_cwd, glob)
+        if touched is None:
+            found.append({"glob": glob, "paths": [], "error": "git-status-failed"})
+        elif touched:
+            found.append({"glob": glob, "paths": touched[:20]})
+    return found
+
+
 def _await_deploy() -> dict[str, Any]:
     """Block until the pushed fix is live on the target system.
 
@@ -512,16 +576,36 @@ def _run_apply(run_dir: str) -> dict[str, Any]:
 
     units = _units_to_apply(run_dir)
 
+    # Diagnostics-first: computed before the dry-run return so a rehearsal
+    # reports the same verdict the live run would reach. Note this runs even
+    # when ``units`` is empty — the deploy command fires unconditionally below,
+    # so an empty sweep is not a reason to skip the check.
+    violations = _protected_violations(target_cwd)
+
     if os.environ.get("MO_GOAL_APPLY_DRY", "").strip() == "1":
         return {
             "status": "dry_run",
             "target_cwd": target_cwd,
             "deploy_cmd": apply_cmd,
             "redispatch_cmd": redispatch_cmd,
+            "protected_violations": violations,
             "units": [
                 {"unit_id": u, "would": ["deploy", "await_deploy", "redispatch", "await_regen"]}
                 for u in units
             ],
+        }
+
+    if violations and _protected_mode() != "warn":
+        return {
+            "status": "refused_instrument_edit",
+            "target_cwd": target_cwd,
+            "units": [],
+            "violations": violations,
+            "hint": (
+                "the fix child edited a path the operator declared part of the "
+                "instrument that scores it; NOTHING was deployed. Revert those "
+                "paths, or set MO_GOAL_PROTECTED_MODE=warn to ship anyway."
+            ),
         }
 
     # ── live: DEPLOY -> await-deploy -> REDISPATCH -> await-regen ──
@@ -542,6 +626,7 @@ def _run_apply(run_dir: str) -> dict[str, Any]:
         "status": "applied",
         "deploy": deploy,
         "await_deploy": await_deploy,
+        "protected_violations": violations,
         "units": unit_results,
     }
 
