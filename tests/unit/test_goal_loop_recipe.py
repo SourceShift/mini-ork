@@ -85,6 +85,22 @@ sys.modules.setdefault(_tfspec.name, _tfmod)
 _tfspec.loader.exec_module(_tfmod)
 
 
+def _load_binding(name: str):
+    """Load a binding script by file path (kickoffs/ is not a package)."""
+    path = _BIND_DIR / name
+    spec = importlib.util.spec_from_file_location(name.removesuffix(".py"), path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"could not load binding from {path}")
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules.setdefault(spec.name, mod)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+_predmod = _load_binding("chapter_predicate.py")
+_qualmod = _load_binding("chapter_quality.py")
+
+
 # ── Module-state fixtures ──────────────────────────────────────────────────
 # register.py mutates both _IMPLEMENTER_SUBMODES (execute_handlers) and
 # _TRANSFORMS (workflow/transforms). The fixture pattern from
@@ -460,6 +476,10 @@ def _arm_apply_env(monkeypatch, target_cwd: Path) -> None:
     monkeypatch.setenv("MO_GOAL_DEPLOY_SETTLE_SECONDS", "0")
     monkeypatch.setenv("MO_GOAL_APPLY_POLL_SECONDS", "0")
     monkeypatch.setenv("MO_GOAL_APPLY_AWAIT_SECONDS", "0")
+    # The instrument guard reads ambient env; an inherited value (e.g. when the
+    # suite runs inside a goal-loop wave) would make these tests repo-dependent.
+    monkeypatch.delenv("MO_GOAL_PROTECTED_PATHS", raising=False)
+    monkeypatch.delenv("MO_GOAL_PROTECTED_MODE", raising=False)
 
 
 def test_apply_disabled_is_noop_passthrough(tmp_path, monkeypatch):
@@ -632,6 +652,135 @@ def test_apply_live_terminal_pass_beats_fail(tmp_path, monkeypatch):
     assert regen["reason"] == "goal_met"
 
 
+# ── 5b. instrument guard: the fix child may not edit what scores it ────────
+# The predicate's inputs are written by code inside the child's editable tree,
+# so before anything ships, git is asked whether the child touched a path the
+# operator declared part of the instrument. Refusal is fail-closed: an armed
+# guard that cannot read the tree must not wave the deploy through either.
+
+
+def _git_repo(path: Path, files: dict[str, str]) -> None:
+    """A real repo with one commit, so ``git status`` has a HEAD to diff from."""
+    subprocess.run(["git", "init", "-q"], cwd=path, check=True)
+    subprocess.run(["git", "config", "user.email", "t@t"], cwd=path, check=True)
+    subprocess.run(["git", "config", "user.name", "t"], cwd=path, check=True)
+    for rel, body in files.items():
+        target = path / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(body, encoding="utf-8")
+    subprocess.run(["git", "add", "-A"], cwd=path, check=True)
+    subprocess.run(["git", "commit", "-qm", "base"], cwd=path, check=True)
+
+
+def _armed_repo(tmp_path, monkeypatch, instrument_glob: str) -> tuple[Path, Path]:
+    """A repo with one instrument file + a separate generation file; returns
+    (run_dir, deploy_marker) with the guard armed for ``instrument_glob``."""
+    _git_repo(tmp_path, {
+        "server/scoring.ts": "export const bar = 1;\n",
+        "server/generation.ts": "export const draft = 1;\n",
+    })
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    _write_sweep_result(run_dir, [{"unit_id": "1", "status": "spawned"}])
+    _arm_apply_env(monkeypatch, tmp_path)
+    monkeypatch.setenv("MO_GOAL_PROTECTED_PATHS", instrument_glob)
+    marker = tmp_path / "deployed"
+    monkeypatch.setenv("MO_GOAL_APPLY_CMD", f"touch {marker}")
+    monkeypatch.setenv("MO_GOAL_REDISPATCH_CMD", "true")
+    monkeypatch.setenv("MO_GOAL_TERMINAL_CMD", "true")
+    return run_dir, marker
+
+
+def test_apply_guard_unset_is_inert(tmp_path, monkeypatch):
+    # No MO_GOAL_PROTECTED_PATHS ⇒ historical behavior, whatever the tree says.
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    _write_sweep_result(run_dir, [{"unit_id": "1", "status": "spawned"}])
+    _arm_apply_env(monkeypatch, tmp_path)
+    monkeypatch.setenv("MO_GOAL_APPLY_CMD", "true")
+    monkeypatch.setenv("MO_GOAL_REDISPATCH_CMD", "true")
+    monkeypatch.setenv("MO_GOAL_TERMINAL_CMD", "true")
+    payload = run_apply(str(run_dir))
+    assert payload["status"] == "applied"
+    assert payload["protected_violations"] == []
+
+
+def test_apply_guard_refuses_when_instrument_file_edited(tmp_path, monkeypatch):
+    run_dir, marker = _armed_repo(tmp_path, monkeypatch, "server/scoring.ts")
+    (tmp_path / "server" / "scoring.ts").write_text("export const bar = 999;\n")
+
+    payload = run_apply(str(run_dir))
+    assert payload["status"] == "refused_instrument_edit"
+    assert payload["units"] == []
+    assert [v["glob"] for v in payload["violations"]] == ["server/scoring.ts"]
+    assert not marker.exists()  # the deploy never ran
+
+
+def test_apply_guard_refuses_on_untracked_instrument_file(tmp_path, monkeypatch):
+    # -uall matters: a NEW file at a protected path is still an instrument edit.
+    run_dir, marker = _armed_repo(tmp_path, monkeypatch, "server/scoring.ts")
+    (tmp_path / "server" / "scoring.ts").unlink()
+    (tmp_path / "server" / "scoring.ts").write_text("export const bar = 2;\n")
+
+    payload = run_apply(str(run_dir))
+    assert payload["status"] == "refused_instrument_edit"
+    assert not marker.exists()
+
+
+def test_apply_guard_allows_edits_outside_the_instrument(tmp_path, monkeypatch):
+    # The whole point: generation stays fixable. This is the W15 class of edit.
+    run_dir, marker = _armed_repo(tmp_path, monkeypatch, "server/scoring.ts")
+    (tmp_path / "server" / "generation.ts").write_text("export const draft = 42;\n")
+
+    payload = run_apply(str(run_dir))
+    assert payload["status"] == "applied"
+    assert payload["protected_violations"] == []
+    assert marker.exists()
+
+
+def test_apply_guard_warn_mode_ships_but_records(tmp_path, monkeypatch):
+    run_dir, marker = _armed_repo(tmp_path, monkeypatch, "server/scoring.ts")
+    monkeypatch.setenv("MO_GOAL_PROTECTED_MODE", "warn")
+    (tmp_path / "server" / "scoring.ts").write_text("export const bar = 999;\n")
+
+    payload = run_apply(str(run_dir))
+    assert payload["status"] == "applied"
+    assert [v["glob"] for v in payload["protected_violations"]] == ["server/scoring.ts"]
+    assert marker.exists()
+
+
+def test_apply_guard_dry_run_reports_without_refusing(tmp_path, monkeypatch):
+    # A rehearsal must not change the plan, but should surface what the live run
+    # would decide — otherwise the guard is discovered only at the go/no-go.
+    run_dir, marker = _armed_repo(tmp_path, monkeypatch, "server/scoring.ts")
+    monkeypatch.setenv("MO_GOAL_APPLY_DRY", "1")
+    (tmp_path / "server" / "scoring.ts").write_text("export const bar = 999;\n")
+
+    payload = run_apply(str(run_dir))
+    assert payload["status"] == "dry_run"
+    assert [v["glob"] for v in payload["protected_violations"]] == ["server/scoring.ts"]
+    assert not marker.exists()
+
+
+def test_apply_guard_fails_closed_when_git_cannot_read(tmp_path, monkeypatch):
+    # Armed but the target is not a repo: the guard cannot prove the tree is
+    # clean, so it refuses rather than shipping blind.
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    _write_sweep_result(run_dir, [{"unit_id": "1", "status": "spawned"}])
+    _arm_apply_env(monkeypatch, tmp_path)
+    monkeypatch.setenv("MO_GOAL_PROTECTED_PATHS", "server/scoring.ts")
+    marker = tmp_path / "deployed"
+    monkeypatch.setenv("MO_GOAL_APPLY_CMD", f"touch {marker}")
+    monkeypatch.setenv("MO_GOAL_REDISPATCH_CMD", "true")
+    monkeypatch.setenv("MO_GOAL_TERMINAL_CMD", "true")
+
+    payload = run_apply(str(run_dir))
+    assert payload["status"] == "refused_instrument_edit"
+    assert payload["violations"][0]["error"] == "git-status-failed"
+    assert not marker.exists()
+
+
 # ── 5c. chapter_terminal_fail binding: guard rails + stall helper ──────────
 # Hermetic — exercises only the paths BEFORE the psql call (argv/BOOK_UUID
 # validation) plus the pure run-dir freshness helper. No DB required.
@@ -724,6 +873,112 @@ def test_terminal_fail_permfail_always_terminal(monkeypatch):
     monkeypatch.delenv("MO_GOAL_RUNS_DIR", raising=False)
     monkeypatch.delenv("MO_GOAL_STALL_SECONDS", raising=False)
     assert _tfmod.main(["1"]) == 0
+
+
+# ── 5d. objective quality anchor (chapter_quality + the predicate hook) ────
+# Both halves of the goal predicate are the researcher's own self-report. The
+# anchor is the one signal authored OUTSIDE the judged system, so these tests
+# pin its pure verdict logic (no DB) and the predicate's use of it.
+
+
+def _sec(idx: int, slug: str, length: int, sha: str = "a" * 64, doc: int = 1):
+    return (idx, slug, length, sha, doc)
+
+
+def _clean_rows(n: int = 4, length: int = 5000) -> list:
+    return [_sec(i + 1, f"section-{i + 1}", length) for i in range(n)]
+
+
+def test_quality_floor_passes_a_real_chapter(monkeypatch):
+    for var in ("MO_GOAL_QUALITY_MIN_SECTIONS", "MO_GOAL_QUALITY_MIN_SECTION_CHARS",
+                "MO_GOAL_QUALITY_MIN_TOTAL_CHARS"):
+        monkeypatch.delenv(var, raising=False)
+    bad, facts = _qualmod._failures(_clean_rows(), "# S1\n" + "body " * 500)
+    assert bad == []
+    assert facts["sections"] == 4 and facts["doc_version"] == 1
+
+
+def test_quality_floor_flags_each_vacuity_shape(monkeypatch):
+    monkeypatch.delenv("MO_GOAL_QUALITY_MIN_SECTIONS", raising=False)
+    # Too few sections AND too thin overall.
+    bad, _ = _qualmod._failures([_sec(1, "only", 100)], "short")
+    assert any(b.startswith("sections=") for b in bad)
+    assert any(b.startswith("total=") for b in bad)
+    assert any(b.startswith("short-section") for b in bad)
+    # A section the commit path never hashed.
+    bad, _ = _qualmod._failures([_sec(1, "s", 5000, sha="")], "x" * 5000)
+    assert any(b.startswith("unhashed-section") for b in bad)
+    # Parts of one commit disagreeing on doc_version is an assembly bug.
+    bad, _ = _qualmod._failures(_clean_rows(3) + [_sec(4, "s4", 5000, doc=2)], "")
+    assert any(b.startswith("mixed-doc-version") for b in bad)
+    # The same H2 emitted twice.
+    bad, _ = _qualmod._failures(
+        [_sec(1, "dup", 5000), _sec(2, "dup", 5000), _sec(3, "x", 5000)], "",
+    )
+    assert any(b.startswith("dup-h2") for b in bad)
+
+
+def test_quality_floor_flags_placeholders():
+    # A chapter that is well-formed on every structural axis but still hollow.
+    bad, _ = _qualmod._failures(_clean_rows(), "TODO: write this\n" + "body " * 500)
+    assert any(b.startswith("placeholder:todo") for b in bad)
+    bad, _ = _qualmod._failures(_clean_rows(), "{{ citation_needed }}\n" + "body " * 500)
+    assert any(b.startswith("placeholder:unresolved-template") for b in bad)
+
+
+def test_quality_floor_no_sections_is_a_failure():
+    bad, facts = _qualmod._failures([], "")
+    assert bad == ["no-sections"]
+    assert facts["sections"] == 0
+
+
+def test_quality_floor_does_not_false_trip_a_clean_chapter():
+    # Calibrated against the one known-good committed chapter's shape: 4 sections,
+    # 4,473-8,019 chars, single doc_version, all hashed, no placeholder markers.
+    rows = [_sec(1, "a", 4942), _sec(2, "b", 4473), _sec(3, "c", 5656), _sec(4, "d", 8019)]
+    bad, facts = _qualmod._failures(rows, "# a\n# b\n# c\n# d\n" + "prose " * 5000)
+    assert bad == []
+    assert facts["total_chars"] == 23090
+
+
+def test_quality_probe_absent_cmd_is_not_consulted(monkeypatch):
+    monkeypatch.delenv("MO_GOAL_QUALITY_CMD", raising=False)
+    assert _predmod._quality_cmd() == ""
+
+
+def test_quality_probe_reports_ok_and_failure(tmp_path, monkeypatch):
+    marker = tmp_path / "args.txt"
+    script = tmp_path / "probe.sh"
+    script.write_text(
+        f'#!/usr/bin/env bash\necho "$1" > {marker}\n'
+        'case "$1" in 1) echo PASS-LINE; exit 0;; *) echo FAIL-LINE; exit 1;; esac\n',
+        encoding="utf-8",
+    )
+    script.chmod(0o755)
+    monkeypatch.setenv("MO_GOAL_QUALITY_CMD", str(script))
+    monkeypatch.setenv("MO_GOAL_TARGET_CWD", str(tmp_path))
+
+    ok, detail = _predmod._quality_probe("1")
+    assert (ok, detail) == (True, "PASS-LINE")
+    assert marker.read_text().strip() == "1"  # unit id, never shell-interpolated
+    ok, detail = _predmod._quality_probe("2")
+    assert (ok, detail) == (False, "FAIL-LINE")
+
+
+def test_quality_probe_missing_binary_is_a_failure(monkeypatch):
+    # An armed anchor that cannot run must not silently abstain: abstaining is
+    # exactly the self-report hole it exists to close.
+    monkeypatch.setenv("MO_GOAL_QUALITY_CMD", "definitely-not-a-real-binary-xyz")
+    ok, detail = _predmod._quality_probe("1")
+    assert ok is False
+    assert detail.startswith("probe-error")
+
+
+def test_quality_mode_defaults_to_enforce_and_warn_opt_in(monkeypatch):
+    monkeypatch.delenv("MO_GOAL_QUALITY_MODE", raising=False)
+    assert _predmod._quality_enforcing() is True
+    monkeypatch.setenv("MO_GOAL_QUALITY_MODE", "warn")
+    assert _predmod._quality_enforcing() is False
 
 
 # ── 6. _harvest_selected_evidence: sweep-plan enrichment + on-disk file ───

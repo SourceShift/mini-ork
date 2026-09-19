@@ -80,14 +80,69 @@ export MO_GOAL_NO_EXECUTE="${MO_GOAL_NO_EXECUTE:-0}"
 # let the OUTER loop (regen + GRAO quarantine + divergence-kill) be the gate.
 export MINI_ORK_ROLLBACK_KEEP_WORKTREE="${MINI_ORK_ROLLBACK_KEEP_WORKTREE:-1}"
 
-# ── grandchild verifiers scoped OFF the 17k-file researcher build ──
-export MINI_ORK_TYPECHECK_CMD='echo scoped-typecheck-skipped-bounded-goal-loop-demo'
-export MINI_ORK_TEST_CMD='echo scoped-test-skipped-bounded-goal-loop-demo'
+# ── grandchild verifiers: REAL, scoped to the child's own diff ──
+# These used to be `echo` stubs, which made both of the child's mechanical
+# gates pass by construction and left the LLM reviewer as the only in-sandbox
+# check on a patch. Pointing them straight at the project's tsc/jest is the
+# opposite failure: the researcher tree is ~17k files across three tsconfigs
+# with pre-existing diagnostics, so a whole-repo run would redden every wave
+# for reasons the child did not cause. binding/scoped_gate.py takes the middle
+# path — typecheck the changed files through a tsconfig that EXTENDS the
+# matching project config (aliases and strictness intact, scope narrowed), and
+# run only the jest tests related to the changed files. Both are no-ops when
+# the diff has no in-scope TypeScript, and a jest-guard load refusal
+# (rc=77) is a skip, not a red.
+export MINI_ORK_TYPECHECK_CMD="python3 $BIND/scoped_gate.py typecheck"
+export MINI_ORK_TEST_CMD="python3 $BIND/scoped_gate.py test"
+# Committed work counts as in-scope too (the child may commit before the gate).
+export MO_GOAL_SCOPED_BASE="${MO_GOAL_SCOPED_BASE:-origin/main}"
 
 # ── APPLY / DEPLOY / RE-DISPATCH stage (goal_apply node) ──
 export MO_GOAL_APPLY=1
 # SAFE default: dry. Flip to 0 at the go/no-go to run the real prod push + spend.
 export MO_GOAL_APPLY_DRY="${MO_GOAL_APPLY_DRY:-1}"
+# INSTRUMENT GUARD (goal_apply_deploy): the fix child edits the researcher tree,
+# which is ALSO where the goal predicate's inputs are written — `committed_complete`
+# and `rubric_status` are columns produced by server/services/bookGeneration/**, and
+# the child's scope_gate is a task_class allowlist, not a path filter. So without
+# this, a child that cannot make a chapter pass can make the chapter's PASS MEANING
+# cheaper instead, and the deploy stage would ship that edit to the live worker.
+# Git is asked, per glob, whether the worktree differs from HEAD at any of these
+# paths; if so the deploy is REFUSED (nothing shipped) and the wave report carries
+# the offending paths. Set MO_GOAL_PROTECTED_MODE=warn to record without refusing.
+# Note the DAG runtime the real fix touches (server/compose/verifiedArtifact/
+# verifiedArtifactDagRuntime.ts) is deliberately NOT listed: generation stays
+# fixable, only the scoring decision is frozen. The list is the WRITERS of the
+# predicate's own inputs plus the definition of the bar, nothing wider — a
+# refusal is meant as a receipt on a genuine edge case (the loop decides it must
+# change the gate to make a chapter pass), not a blanket ban. When a wave really
+# does need one of them, look at the named path, then widen this list or set
+# MO_GOAL_PROTECTED_MODE=warn for that run.
+export MO_GOAL_PROTECTED_PATHS="${MO_GOAL_PROTECTED_PATHS:-
+server/services/bookGeneration/bookRubricResultsService.ts
+server/services/bookGeneration/c10CompletionGate.ts
+server/services/bookGeneration/chapterRecheckService.ts
+server/services/bookGeneration/committedCompleteReconciler.ts
+server/services/bookGeneration/rubricBackstopWorker.ts
+server/services/book-generation/bookPersistence.ts
+server/services/bookGeneration/postGen.ts
+server/services/bookGeneration/bookRubric.ts
+server/services/bookGeneration/chapterRubric.ts
+server/database/migrations/*geval*
+server/database/migrations/*rubric*
+}"
+export MO_GOAL_PROTECTED_MODE="${MO_GOAL_PROTECTED_MODE:-refuse}"
+# INDEPENDENT QUALITY ANCHOR (chapter predicate): rubric_status='pass' is the
+# researcher's OWN G-Eval judge flag, written by code inside the child's editable
+# tree — a self-report with nothing outside the judged system contradicting it.
+# This adds one: chapter_quality.py is a deterministic vacuity floor over the
+# bytes the commit path actually persisted (no sections / too few / too short /
+# unhashed / mixed doc_version / duplicated H2 / unresolved placeholder markers).
+# It lives in mini-ork's binding dir, so the fix child cannot reach it. Pass
+# requires committed AND rubric AND this. MO_GOAL_QUALITY_MODE=warn records the
+# verdict in the predicate's reason without letting it flip the result.
+export MO_GOAL_QUALITY_CMD="${MO_GOAL_QUALITY_CMD:-python3 $BIND/chapter_quality.py}"
+export MO_GOAL_QUALITY_MODE="${MO_GOAL_QUALITY_MODE:-enforce}"
 # Deploy MODE — how the verified fix becomes LIVE to the running worker. The
 # loop OWNS the worker lifecycle: "restart the worker if needed" is this stage.
 #   local-worker (DEFAULT — reversible, dev-scoped, NO prod push): restart the
