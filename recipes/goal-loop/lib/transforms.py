@@ -27,6 +27,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -56,6 +57,12 @@ sys.modules.setdefault(_goal_state_spec.name, _goal_state_module)
 _goal_state_spec.loader.exec_module(_goal_state_module)
 evaluate_units = _goal_state_module.evaluate_units
 list_units = _goal_state_module.list_units
+harvest_evidence = _goal_state_module.harvest_evidence
+
+
+def _slug(unit_id: str) -> str:
+    """Filesystem-safe rendering of a unit id (unit ids are often file paths)."""
+    return re.sub(r"[^A-Za-z0-9._-]", "_", unit_id)[:80] or "x"
 
 
 @register_transform("goal_state_eval")
@@ -120,6 +127,14 @@ def goal_sweep_plan(workflow: CompiledWorkflow, ledger: ArtifactLedger, node_id:
     )
     selected = failing[:max_children]
 
+    # Deep-evidence harvest (optional): for ONLY the units we're about to
+    # dispatch, run MO_GOAL_EVIDENCE_CMD to gather the rich failure signal the
+    # one-line predicate reason can't carry. The full text is persisted to
+    # <run_dir>/evidence/<slug>.md (so the fix child can re-read it whole) and a
+    # copy is threaded into the plan so the spawn templater can inline it as
+    # {{evidence}}. Unset MO_GOAL_EVIDENCE_CMD → the child falls back to reason.
+    evidence_map = _harvest_selected_evidence(selected, goal_state)
+
     node = workflow.nodes[node_id]
     if "sweep_plan" not in node.outputs:
         raise ArtifactContractError("goal_sweep_plan requires a sweep_plan output")
@@ -132,12 +147,55 @@ def goal_sweep_plan(workflow: CompiledWorkflow, ledger: ArtifactLedger, node_id:
             "kickoff_hint": {
                 "unit_id": unit_id,
                 "reason": goal_state[unit_id].get("reason", ""),
+                "evidence": evidence_map.get(unit_id, {}).get("text", ""),
+                "evidence_path": evidence_map.get(unit_id, {}).get("path", ""),
             },
         }
         for unit_id in selected
     ]
     out_path.write_text(json.dumps(plan, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return out_path
+
+
+def _harvest_selected_evidence(
+    selected: list[str],
+    goal_state: dict[str, Any],
+) -> dict[str, dict[str, str]]:
+    """Harvest MO_GOAL_EVIDENCE_CMD output for the selected units.
+
+    Returns ``{unit_id: {"text": <inline evidence>, "path": <evidence file>}}``.
+    Best-effort: a missing command, blank target cwd, or a harvest crash yields
+    the predicate reason as a graceful fallback so the wave never blocks on the
+    evidence stage. The full text is also written to
+    ``<run_dir>/evidence/<slug>.md`` for the child to read in full.
+    """
+    evidence_cmd = (os.environ.get("MO_GOAL_EVIDENCE_CMD") or "").strip()
+    if not evidence_cmd or not selected:
+        return {}
+    target_cwd = os.environ.get("MO_GOAL_TARGET_CWD") or os.getcwd()
+    try:
+        raw = harvest_evidence(target_cwd, evidence_cmd, selected)
+    except Exception as exc:  # noqa: BLE001 — evidence is advisory, never fatal
+        raw = {uid: f"[evidence harvest failed: {exc}]" for uid in selected}
+
+    run_dir = os.environ.get("MINI_ORK_RUN_DIR")
+    ev_dir = Path(run_dir) / "evidence" if run_dir else None
+    if ev_dir is not None:
+        ev_dir.mkdir(parents=True, exist_ok=True)
+
+    out: dict[str, dict[str, str]] = {}
+    for uid in selected:
+        text = raw.get(uid, "") or goal_state.get(uid, {}).get("reason", "")
+        path_str = ""
+        if ev_dir is not None:
+            ev_path = ev_dir / f"{_slug(uid)}.md"
+            try:
+                ev_path.write_text(text + "\n", encoding="utf-8")
+                path_str = str(ev_path)
+            except OSError:
+                path_str = ""
+        out[uid] = {"text": text, "path": path_str}
+    return out
 
 
 # ─────────────────────────────────────────────────────────────────────────

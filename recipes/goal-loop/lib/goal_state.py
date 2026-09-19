@@ -80,3 +80,47 @@ def evaluate_units(
             "reason": reason_text,
         }
     return results
+
+
+def harvest_evidence(
+    target_cwd: str,
+    evidence_cmd: str,
+    units: Iterable[str],
+    *,
+    max_chars: int = 12000,
+) -> dict[str, str]:
+    """Run ``evidence_cmd <unit_id>`` per unit and capture its FULL output.
+
+    This is the deep-evidence counterpart to :func:`evaluate_units`. The
+    predicate is deliberately cheap (one-line reason, exit code) because it runs
+    on every poll of every wave; it therefore hands the fix child a thin,
+    often-truncated signal. When a goal-loop is armed with
+    ``MO_GOAL_EVIDENCE_CMD``, this runs ONCE per wave for only the units actually
+    being dispatched, and captures the whole diagnostic payload (e.g. the
+    produced-vs-required artifact diff, the failing node, the relevant log tail)
+    so the child can diagnose the real root cause instead of guessing from an
+    opaque status string.
+
+    argv, not shell — the unit id is always the final argument, never
+    interpolated into a command string. A non-zero exit is tolerated: partial
+    evidence still helps, so stdout (then stderr) is captured regardless of rc
+    and clamped to ``max_chars`` to keep the child's kickoff bounded.
+    """
+    units_list = list(units)
+    if not units_list:
+        return {}
+    argv = shlex.split(evidence_cmd)
+    out: dict[str, str] = {}
+    for unit in units_list:
+        proc = subprocess.run(
+            [*argv, unit],
+            cwd=target_cwd,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        text = proc.stdout or ""
+        if proc.stderr:
+            text = f"{text}\n[stderr]\n{proc.stderr}" if text else proc.stderr
+        out[unit] = text.strip()[:max_chars]
+    return out

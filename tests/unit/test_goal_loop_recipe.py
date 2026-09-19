@@ -49,6 +49,7 @@ sys.modules.setdefault(_spec.name, _mod)
 _spec.loader.exec_module(_mod)
 evaluate_units = _mod.evaluate_units
 list_units = _mod.list_units
+harvest_evidence = _mod.harvest_evidence
 
 # Same file-path load for the transforms module, to bind the ledger-free
 # ``_run_apply`` core of goal_apply_deploy for direct unit tests. The
@@ -63,6 +64,8 @@ _tmod = importlib.util.module_from_spec(_tspec)
 sys.modules.setdefault(_tspec.name, _tmod)
 _tspec.loader.exec_module(_tmod)
 run_apply = _tmod._run_apply
+harvest_selected_evidence = _tmod._harvest_selected_evidence
+evidence_slug = _tmod._slug
 
 
 # ── Module-state fixtures ──────────────────────────────────────────────────
@@ -215,6 +218,69 @@ def test_evaluate_units_classifies_pass_and_fail(tmp_path, monkeypatch):
     assert states["bad"]["reason"] == "reason: missing"
     assert states["ugly"]["pass"] is False
     assert states["ugly"]["reason"] == "flaky"
+
+
+# ── 3b. harvest_evidence: the deep-evidence counterpart of evaluate_units ─
+# evaluate_units keeps only reason_lines[0]; harvest_evidence keeps the FULL
+# per-unit output. These pin the three properties the evidence seam depends on:
+# argv (not shell), whole-output capture, and rc-tolerance.
+
+
+def _evidence_script(tmp_path, body: str):
+    script = tmp_path / "evidence.sh"
+    script.write_text("#!/usr/bin/env bash\n" + body, encoding="utf-8")
+    script.chmod(0o755)
+    return script
+
+
+def test_harvest_evidence_captures_full_multiline_output(tmp_path):
+    """Unlike the predicate (first line only), the harvester keeps every line."""
+    script = _evidence_script(
+        tmp_path,
+        'echo "LINE1 for $1"\necho "LINE2 detail"\necho "LINE3 tail"\n',
+    )
+    out = harvest_evidence(str(tmp_path), str(script), ["ch1"])
+    assert set(out) == {"ch1"}
+    assert out["ch1"] == "LINE1 for ch1\nLINE2 detail\nLINE3 tail"
+
+
+def test_harvest_evidence_passes_unit_as_argv_not_shell(tmp_path):
+    """A unit id with shell metacharacters is a single argv slot, not injected."""
+    script = _evidence_script(tmp_path, 'echo "arg=[$1]"\n')
+    hostile = "ch1; touch PWNED"
+    out = harvest_evidence(str(tmp_path), str(script), [hostile])
+    assert out[hostile] == f"arg=[{hostile}]"
+    assert not (tmp_path / "PWNED").exists()  # never shell-evaluated
+
+
+def test_harvest_evidence_tolerates_nonzero_exit(tmp_path):
+    """A non-zero exit still yields whatever partial evidence was printed."""
+    script = _evidence_script(tmp_path, 'echo "partial evidence"\nexit 3\n')
+    out = harvest_evidence(str(tmp_path), str(script), ["ch1"])
+    assert out["ch1"] == "partial evidence"
+
+
+def test_harvest_evidence_appends_stderr(tmp_path):
+    """stderr is folded in under a marker so diagnostics on stderr aren't lost."""
+    script = _evidence_script(
+        tmp_path, 'echo "stdout body"\necho "stderr body" >&2\n',
+    )
+    out = harvest_evidence(str(tmp_path), str(script), ["ch1"])
+    assert "stdout body" in out["ch1"]
+    assert "[stderr]" in out["ch1"]
+    assert "stderr body" in out["ch1"]
+
+
+def test_harvest_evidence_clamps_to_max_chars(tmp_path):
+    """Output is clamped so an oversized dump can't blow up the child kickoff."""
+    script = _evidence_script(tmp_path, "printf 'x%.0s' {1..500}\n")
+    out = harvest_evidence(str(tmp_path), str(script), ["ch1"], max_chars=100)
+    assert len(out["ch1"]) == 100
+
+
+def test_harvest_evidence_empty_units_is_empty_dict(tmp_path):
+    script = _evidence_script(tmp_path, 'echo "unused"\n')
+    assert harvest_evidence(str(tmp_path), str(script), []) == {}
 
 
 # ── 4. verifiers/goal_check.py: panel-verdict.json shape ─────────────────
@@ -425,3 +491,76 @@ def test_apply_live_failed_status_still_deploys_and_await_gives_up(tmp_path, mon
     assert payload["status"] == "applied"
     assert payload["units"][0]["unit_id"] == "1"
     assert payload["units"][0]["await_regen"]["settled"] is False
+
+
+# ── 6. _harvest_selected_evidence: sweep-plan enrichment + on-disk file ───
+# The seam goal_sweep_plan calls to fill kickoff_hint.evidence / evidence_path.
+# It must be OFF by default (no MO_GOAL_EVIDENCE_CMD → empty, so unarmed loops
+# are unchanged), persist the full text under <run_dir>/evidence/<slug>.md, and
+# degrade to the predicate reason when the harvest yields nothing.
+
+
+def _arm_evidence(monkeypatch, tmp_path, body: str) -> None:
+    script = _evidence_script(tmp_path, body)
+    monkeypatch.setenv("MO_GOAL_EVIDENCE_CMD", str(script))
+    monkeypatch.setenv("MO_GOAL_TARGET_CWD", str(tmp_path))
+
+
+def test_harvest_selected_evidence_unset_cmd_is_empty(monkeypatch):
+    """No MO_GOAL_EVIDENCE_CMD ⇒ {} ⇒ unarmed loops behave exactly as before."""
+    monkeypatch.delenv("MO_GOAL_EVIDENCE_CMD", raising=False)
+    goal_state = {"1": {"pass": False, "reason": "ch1 FAIL"}}
+    assert harvest_selected_evidence(["1"], goal_state) == {}
+
+
+def test_harvest_selected_evidence_writes_file_and_returns_text(tmp_path, monkeypatch):
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    monkeypatch.setenv("MINI_ORK_RUN_DIR", str(run_dir))
+    _arm_evidence(monkeypatch, tmp_path, 'echo "deep evidence for $1"\n')
+
+    goal_state = {"1": {"pass": False, "reason": "ch1 FAIL status=failed"}}
+    out = harvest_selected_evidence(["1"], goal_state)
+
+    assert out["1"]["text"] == "deep evidence for 1"
+    ev_file = run_dir / "evidence" / "1.md"
+    assert out["1"]["path"] == str(ev_file)
+    assert ev_file.read_text(encoding="utf-8").strip() == "deep evidence for 1"
+
+
+def test_harvest_selected_evidence_falls_back_to_reason_when_blank(tmp_path, monkeypatch):
+    """A harvester that prints nothing ⇒ the child still gets the predicate reason."""
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    monkeypatch.setenv("MINI_ORK_RUN_DIR", str(run_dir))
+    _arm_evidence(monkeypatch, tmp_path, "exit 0\n")  # no stdout
+
+    goal_state = {"7": {"pass": False, "reason": "ch7 FAIL status=degraded"}}
+    out = harvest_selected_evidence(["7"], goal_state)
+    assert out["7"]["text"] == "ch7 FAIL status=degraded"
+
+
+def test_harvest_selected_evidence_slug_sanitizes_pathlike_unit(tmp_path, monkeypatch):
+    """A unit id with a slash yields a flat, slash-free evidence filename."""
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    monkeypatch.setenv("MINI_ORK_RUN_DIR", str(run_dir))
+    _arm_evidence(monkeypatch, tmp_path, 'echo "ev"\n')
+
+    goal_state = {"docs/ch-01.md": {"pass": False, "reason": "r"}}
+    out = harvest_selected_evidence(["docs/ch-01.md"], goal_state)
+    ev_path = Path(out["docs/ch-01.md"]["path"])
+    assert "/" not in ev_path.name
+    assert ev_path.name == f"{evidence_slug('docs/ch-01.md')}.md"
+    assert ev_path.is_file()
+
+
+def test_harvest_selected_evidence_no_run_dir_has_text_empty_path(tmp_path, monkeypatch):
+    """Without MINI_ORK_RUN_DIR the text is still returned; only the path is blank."""
+    monkeypatch.delenv("MINI_ORK_RUN_DIR", raising=False)
+    _arm_evidence(monkeypatch, tmp_path, 'echo "inline only for $1"\n')
+
+    goal_state = {"2": {"pass": False, "reason": "ch2 FAIL"}}
+    out = harvest_selected_evidence(["2"], goal_state)
+    assert out["2"]["text"] == "inline only for 2"
+    assert out["2"]["path"] == ""
