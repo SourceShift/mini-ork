@@ -619,6 +619,62 @@ def test_terminal_fail_newest_run_age(tmp_path):
     assert _tfmod._newest_run_age_seconds(str(runs)) < 60.0
 
 
+def _fake_q(status: str, committed: str, permfail: str, lasterr: str):
+    """Build a psql-wrapper stand-in returning one row in the binding's 4-col
+    ``status|committed_complete|permanently_failed|left(last_error,80)`` shape."""
+    import subprocess as _sp
+
+    row = f"{status}|{committed}|{permfail}|{lasterr}\n"
+    return lambda _sql: _sp.CompletedProcess(args=[], returncode=0, stdout=row, stderr="")
+
+
+def _mk_run(runs: Path, name: str, age_s: float) -> None:
+    import time as _t
+
+    d = runs / name
+    d.mkdir(parents=True, exist_ok=True)
+    when = _t.time() - age_s
+    os.utime(d, (when, when))
+
+
+def test_terminal_fail_worker_exhausted_idle_is_terminal(tmp_path, monkeypatch):
+    # The dominant observed mode: worker burned its retry budget, left ch1
+    # 'failed' (NOT permanently_failed), and went idle. status='failed' alone is
+    # NOT terminal — but 'failed' + an IDLE run-dir (worker stopped) is, because
+    # only a redispatch can advance it and the await must not sit out the window.
+    runs = tmp_path / "runs"
+    _mk_run(runs, "run-old", age_s=4000)  # worker idle 4000s
+    monkeypatch.setattr(_tfmod, "_q", _fake_q("failed", "f", "f", "W9 boom"))
+    monkeypatch.setenv("BOOK_UUID", "d0df3cdb-8164-450e-b841-2c9354ea0423")
+    monkeypatch.setenv("MO_GOAL_RUNS_DIR", str(runs))
+    monkeypatch.setenv("MO_GOAL_STALL_SECONDS", "1200")
+    monkeypatch.delenv("MO_GOAL_FAIL_ON_STATUS_FAILED", raising=False)
+    assert _tfmod.main(["1"]) == 0
+
+
+def test_terminal_fail_failed_but_still_churning_is_not_terminal(tmp_path, monkeypatch):
+    # The safety case that makes broadening to 'failed' non-abandoning: a chapter
+    # racily 'failed' BETWEEN retries still has a churning worker (fresh run-*),
+    # so it must NOT be declared terminal — the redispatch would waste a wave.
+    runs = tmp_path / "runs"
+    _mk_run(runs, "run-fresh", age_s=5)  # worker churned 5s ago
+    monkeypatch.setattr(_tfmod, "_q", _fake_q("failed", "f", "f", "W9 boom"))
+    monkeypatch.setenv("BOOK_UUID", "d0df3cdb-8164-450e-b841-2c9354ea0423")
+    monkeypatch.setenv("MO_GOAL_RUNS_DIR", str(runs))
+    monkeypatch.setenv("MO_GOAL_STALL_SECONDS", "1200")
+    monkeypatch.delenv("MO_GOAL_FAIL_ON_STATUS_FAILED", raising=False)
+    assert _tfmod.main(["1"]) == 1
+
+
+def test_terminal_fail_permfail_always_terminal(monkeypatch):
+    # permanently_failed=t fires regardless of run-dir freshness or stall knobs.
+    monkeypatch.setattr(_tfmod, "_q", _fake_q("failed", "f", "t", "gave up"))
+    monkeypatch.setenv("BOOK_UUID", "d0df3cdb-8164-450e-b841-2c9354ea0423")
+    monkeypatch.delenv("MO_GOAL_RUNS_DIR", raising=False)
+    monkeypatch.delenv("MO_GOAL_STALL_SECONDS", raising=False)
+    assert _tfmod.main(["1"]) == 0
+
+
 # ── 6. _harvest_selected_evidence: sweep-plan enrichment + on-disk file ───
 # The seam goal_sweep_plan calls to fill kickoff_hint.evidence / evidence_path.
 # It must be OFF by default (no MO_GOAL_EVIDENCE_CMD → empty, so unarmed loops

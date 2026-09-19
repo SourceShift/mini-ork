@@ -20,17 +20,25 @@ Terminal signals (any ⇒ exit 0):
     because researcher can move a chapter to ``failed`` transiently before a
     retry, so treating ``failed`` as terminal by default would abandon a
     recoverable chapter.
-  * STALL: ``status='generating'`` AND ``last_error`` present AND no
-    verified-artifact run dir under ``MO_GOAL_RUNS_DIR`` has been touched within
-    ``MO_GOAL_STALL_SECONDS`` — the chapter is orphaned mid-generation (worker
-    crash / lost book-gen singleton lock) and will never advance. Opt-in
-    (requires both env vars set), because the chapter-lifecycle ``updated_at``
-    does NOT track per-node progress: a HEALTHY long generation keeps
-    ``updated_at`` frozen at its last milestone while the internal DAG marches
-    W9 -> W10 -> W11 -> ..., so run-dir freshness is the ONLY reliable "is a
-    node actually running right now" signal. book-gen is a serial singleton
-    (one chapter at a time), so book-global run-dir freshness == the active
-    chapter's freshness.
+  * STALL: ``status`` in ``{generating, failed, error}`` AND ``last_error``
+    present AND no verified-artifact run dir under ``MO_GOAL_RUNS_DIR`` has been
+    touched within ``MO_GOAL_STALL_SECONDS`` — the worker has stopped and only a
+    redispatch will advance the chapter. Two sub-cases: orphaned mid-generation
+    (``generating``, e.g. worker crash / lost book-gen singleton lock) and —
+    the dominant observed mode — a worker that EXHAUSTED its per-dispatch retry
+    budget and left the chapter ``failed``/``error`` without ever setting
+    ``permanently_failed``. Opt-in (requires both env vars). The run-dir
+    freshness gate is what makes broadening to ``failed`` safe: a chapter that
+    is racily ``failed`` BETWEEN retries still has a churning worker (fresh
+    ``run-*``), so age < stall ⇒ NOT terminal; only a genuinely idle worker
+    trips it. This is strictly safer than ``MO_GOAL_FAIL_ON_STATUS_FAILED``,
+    which fires on ``failed`` immediately and would abandon a recoverable
+    chapter mid-retry. Note the chapter-lifecycle ``updated_at`` does NOT track
+    per-node progress: a HEALTHY long generation keeps ``updated_at`` frozen at
+    its last milestone while the internal DAG marches W9 -> W10 -> W11 -> ...,
+    so run-dir freshness is the ONLY reliable "is a node actually running right
+    now" signal. book-gen is a serial singleton (one chapter at a time), so
+    book-global run-dir freshness == the active chapter's freshness.
 
 Connection comes from libpq env vars; no secret lives here.
 """
@@ -44,6 +52,13 @@ import time
 from pathlib import Path
 
 _FAILED_STATUSES = {"failed", "error", "permanently_failed", "aborted"}
+# States where an IDLE run-dir means "the worker has stopped and only a
+# redispatch will advance this chapter". Covers both an orphaned mid-generation
+# (``generating``) and — the dominant observed mode — a worker that exhausted
+# its per-dispatch retry budget and left the chapter ``failed``/``error`` before
+# any ``permanently_failed`` flag was set. ``permanently_failed``/``aborted`` are
+# handled earlier (permfail) or deliberately excluded (ambiguous cancel).
+_STALL_STATUSES = {"generating", "failed", "error"}
 
 
 def _q(sql: str) -> subprocess.CompletedProcess[str]:
@@ -147,15 +162,21 @@ def main(argv: list[str]) -> int:
 
     runs_dir = os.environ.get("MO_GOAL_RUNS_DIR", "").strip()
     stall_s = _int_env("MO_GOAL_STALL_SECONDS", 0)
-    if runs_dir and stall_s > 0 and status_l == "generating" and lasterr:
+    if runs_dir and stall_s > 0 and status_l in _STALL_STATUSES and lasterr:
+        # Idle run-dir is the safe discriminator: a chapter that is racily
+        # ``failed`` BETWEEN retries still has a churning worker (fresh run-*),
+        # so age < stall_s ⇒ NOT terminal. Only a worker that has actually
+        # stopped (age >= stall_s) is terminal — this catches the exhausted-idle
+        # case without the transient-``failed`` abandonment that a bare
+        # status-check (MO_GOAL_FAIL_ON_STATUS_FAILED) would cause.
         age = _newest_run_age_seconds(runs_dir)
         if age is not None and age >= stall_s:
-            print(f"ch{chapter} TERMINAL: stalled — status=generating, last_error set, "
-                  f"newest run dir idle {int(age)}s >= {stall_s}s err={lasterr}")
+            print(f"ch{chapter} TERMINAL: stalled — status={status}, last_error set, "
+                  f"worker idle: newest run dir {int(age)}s >= {stall_s}s err={lasterr}")
             return 0
         age_str = "none" if age is None else f"{int(age)}s"
-        print(f"ch{chapter} not terminal: generating, run-dir age={age_str} "
-              f"(< {stall_s}s ⇒ still churning)")
+        print(f"ch{chapter} not terminal: status={status}, run-dir age={age_str} "
+              f"(< {stall_s}s ⇒ worker still churning)")
         return 1
 
     print(f"ch{chapter} not terminal: status={status} permfail={permfail}")
