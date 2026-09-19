@@ -263,6 +263,108 @@ def test_env_overlay_scrubs_run_scoped_identity(mod, monkeypatch, tmp_path):
     assert env["WORKER_LOG"] == "/run/w.log"  # scrub is surgical, log pin still lands
 
 
+def test_env_overlay_scrubs_the_rest_of_the_goal_loop_run_identity(mod, monkeypatch, tmp_path):
+    """The RUN_DIR/RUN_ID pair was only the first two of the goal-loop's run-scoped
+    vars. The rest leak just as silently: MINI_ORK_WORKFLOW/MINI_ORK_PLAN_PATH would
+    point a per-chapter child at the goal-loop's own plan, and MINI_ORK_TEST_CMD /
+    MINI_ORK_TYPECHECK_CMD are pinned to `echo` upstream — inheriting those would
+    neuter every gate the worker's children run."""
+    _fake_worktree(tmp_path)
+    leaked = {
+        "MINI_ORK_RECIPE": "goal-loop",
+        "MINI_ORK_RECIPE_ROOT": "/Volumes/docker-ssd/ps/mini-ork",
+        "MINI_ORK_WORKFLOW": "/Volumes/docker-ssd/ps/mini-ork/recipes/goal-loop/workflow.yaml",
+        "MINI_ORK_TASK_CLASS": "goal_loop",
+        "MINI_ORK_PLAN_PATH": "/goalloop/plan.json",
+        "MINI_ORK_PROFILE_PATH": "/goalloop/run_profile.json",
+        "MINI_ORK_PROFILE_GATE": "0",
+        "MINI_ORK_NODE_INPUT_DIR": "/goalloop/inputs/goal_apply",
+        "MINI_ORK_NODE_INPUT_MANIFEST": "/goalloop/inputs.json",
+        "MINI_ORK_TEST_CMD": "echo",
+        "MINI_ORK_TYPECHECK_CMD": "echo",
+        # The loop's own dispatch pin (read straight through as `--model`) and the
+        # node that spawned this binding — both are per-run identity, not the
+        # worker's.
+        "MO_DISPATCH_CHAIN": "transform",
+        "MO_NODE_ID": "goal_apply",
+    }
+    for key, value in leaked.items():
+        monkeypatch.setenv(key, value)
+    env = mod._env_overlay(str(tmp_path), "/run/w.log")
+    assert [k for k in leaked if k in env] == []
+
+
+def test_env_overlay_keeps_the_engine_and_db_pins(mod, monkeypatch, tmp_path):
+    """Two leaks are deliberate and must NOT be scrubbed: ENGINE_ROOT/ROOT so the
+    worker's children run THIS loop's (fixed) engine instead of the researcher
+    home's older vendored copy, and DB so the goal-loop's cost circuit keeps seeing
+    the spend it caused. A future reader must not 'finish the job' and blind the
+    budget rail."""
+    _fake_worktree(tmp_path)
+    kept = {
+        "MINI_ORK_ENGINE_ROOT": "/engine",
+        "MINI_ORK_ROOT": "/engine",
+        "MINI_ORK_DB": "/engine/.mini-ork/state.db",
+    }
+    for key, value in kept.items():
+        monkeypatch.setenv(key, value)
+    env = mod._env_overlay(str(tmp_path), "/run/w.log")
+    assert {k: env[k] for k in kept} == kept
+
+
+def test_env_overlay_drops_the_ambient_home_pair_when_a_home_is_pinned(mod, monkeypatch, tmp_path):
+    """The live W9 failure: the goal-loop's MINI_ORK_PROJECT_HOME outranks the
+    caller's MINI_ORK_HOME_DIR in the launcher, so the child wrote runs/<id>/
+    verified-artifact.json into the GOAL-LOOP's .mini-ork while the caller read the
+    worktree's and reported "verifier did not run" for a run that verified cleanly.
+    Both ambient values must go, and PROJECT_HOME must come back pinned to the one
+    home the caller also reads."""
+    _fake_worktree(tmp_path)
+    monkeypatch.setenv("MINI_ORK_PROJECT_HOME", "/Volumes/docker-ssd/ps/mini-ork/.mini-ork")
+    monkeypatch.setenv("MINI_ORK_HOME", "/Volumes/docker-ssd/ps/mini-ork/.mini-ork")
+    home = str(tmp_path / ".mini-ork")
+    env = mod._env_overlay(
+        str(tmp_path),
+        "/run/w.log",
+        {"MINI_ORK_HOME_DIR": home, "MINI_ORK_PROJECT_HOME": home, "MINI_ORK_HOME": home},
+    )
+    # Every home name the launcher consults must name the ONE resolved home; a
+    # single surviving foreign value is enough to split runs/<id>/ from the reader.
+    assert env["MINI_ORK_HOME_DIR"] == home
+    assert env["MINI_ORK_PROJECT_HOME"] == home
+    assert env["MINI_ORK_HOME"] == home
+
+
+def test_env_overlay_keeps_the_ambient_home_when_nothing_replaces_it(mod, monkeypatch, tmp_path):
+    """Drop the pair only alongside a replacement. With no home resolved there is
+    nothing to pin, and popping would strand the launcher on its cwd/.mini-ork
+    fallback — a worse answer than the inherited one."""
+    _fake_worktree(tmp_path)
+    monkeypatch.setenv("MINI_ORK_PROJECT_HOME", "/inherited/.mini-ork")
+    env = mod._env_overlay(str(tmp_path), "/run/w.log")
+    assert env["MINI_ORK_PROJECT_HOME"] == "/inherited/.mini-ork"
+
+
+def test_start_pins_project_home_alongside_home_dir(mod, monkeypatch, tmp_path):
+    """PROJECT_HOME is the variable the launcher actually consults first, so the
+    start path must pin it — pinning only HOME_DIR leaves the bug live."""
+    seen: dict[str, str] = {}
+
+    def _capture(worktree, log_path, extra=None):
+        seen.update(extra or {})
+        return {}
+
+    monkeypatch.setattr(mod, "_env_overlay", _capture)
+    monkeypatch.setattr(mod, "_runner_model", lambda wt: (None, "no runner"))
+    monkeypatch.setattr(mod, "_mini_ork_home", lambda wt: ("/pinned/.mini-ork", "pinned"))
+    monkeypatch.setattr(mod.subprocess, "Popen", lambda *a, **k: type("P", (), {"pid": 1})())
+    _fake_worktree(tmp_path)
+    ok, _ = mod._start_replacement(str(tmp_path), "book-generation", str(tmp_path / "w.log"))
+    assert ok is True
+    assert seen["MINI_ORK_HOME_DIR"] == "/pinned/.mini-ork"
+    assert seen["MINI_ORK_PROJECT_HOME"] == "/pinned/.mini-ork"
+
+
 class _FakeReadyz:
     """A context-manager stand-in for urlopen's response."""
 

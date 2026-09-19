@@ -421,8 +421,42 @@ def _env_overlay(worktree: str, log_path: str, extra: dict[str, str] | None = No
     # /tmp dir while the caller read runs/<id>/verified-artifact.json (ENOENT). Core
     # mini-ork now self-defends (main.py pins run_dir), so this is defense-in-depth:
     # stop the leak at the spawn source too.
-    for _run_scoped in ("MINI_ORK_RUN_DIR", "MINI_ORK_RUN_ID"):
+    for _run_scoped in (
+        "MINI_ORK_RUN_DIR", "MINI_ORK_RUN_ID",
+        # The rest of THIS run's identity. Inheriting is never right for a
+        # long-lived worker: it re-mints a recipe per chapter, and a leaked
+        # MINI_ORK_WORKFLOW/MINI_ORK_PLAN_PATH would point its children at the
+        # goal-loop's own plan. MINI_ORK_TEST_CMD/MINI_ORK_TYPECHECK_CMD are
+        # pinned to `echo` upstream — inheriting those would silently neuter
+        # every gate the worker's children run.
+        "MINI_ORK_RECIPE", "MINI_ORK_RECIPE_ROOT", "MINI_ORK_WORKFLOW", "MINI_ORK_TASK_CLASS",
+        "MINI_ORK_PLAN_PATH", "MINI_ORK_PROFILE_PATH", "MINI_ORK_PROFILE_GATE",
+        "MINI_ORK_NODE_INPUT_DIR", "MINI_ORK_NODE_INPUT_MANIFEST",
+        "MINI_ORK_TEST_CMD", "MINI_ORK_TYPECHECK_CMD",
+        # MO_DISPATCH_CHAIN is this run's per-node lane pin — the dispatcher passes
+        # it straight through as `--model` (execute.py _default_llm_dispatch), so an
+        # inherited goal-loop chain would mis-bind the lane of every child node that
+        # does not set its own. MO_NODE_ID names the node that spawned THIS binding
+        # (goal_apply), never anything a fresh child run is doing.
+        "MO_DISPATCH_CHAIN", "MO_NODE_ID",
+    ):
         env.pop(_run_scoped, None)
+    # Deliberately KEPT (not scrubbed): MINI_ORK_ENGINE_ROOT/MINI_ORK_ROOT so the
+    # worker's children run THIS loop's engine (main, carrying the reviewer-diff and
+    # verifier-short-circuit fixes) rather than the researcher home's older vendored
+    # copy — and MINI_ORK_DB so the goal-loop's cost circuit keeps reading the spend
+    # it caused. Moving either would blind the budget rail, not fix a leak.
+    # The home pair must travel with the replacement pin or not at all. The
+    # launcher resolves project_home as PROJECT_HOME || HOME || cwd/.mini-ork
+    # (bin/mini-ork), so a goal-loop parent's MINI_ORK_PROJECT_HOME outranks the
+    # MINI_ORK_HOME_DIR the caller pinned — the child then writes runs/<id>/
+    # verified-artifact.json into the GOAL-LOOP's .mini-ork while the caller reads
+    # the worktree's, and reports "verifier did not run" for a run that verified
+    # cleanly (observed: W9_scaffold_sections, 7 attempts, mdlen=0). Drop both
+    # ambient values; `extra` re-pins them to the one resolved home.
+    if (extra or {}).get("MINI_ORK_HOME_DIR"):
+        for _home_scoped in ("MINI_ORK_HOME", "MINI_ORK_PROJECT_HOME"):
+            env.pop(_home_scoped, None)
     env["WORKER_LOG"] = log_path
     env.setdefault("LOKI_ENABLED", "false")  # bounded proof: don't ship to Loki
     env.update(_read_dotenv(os.path.join(worktree, "server", ".env"), _NAMESPACE_KEYS))
@@ -450,6 +484,13 @@ def _start_replacement(worktree: str, role: str, log_path: str) -> tuple[bool, s
         extra["CHAPTER_PRIMARY_MODEL"] = model
     if home:
         extra["MINI_ORK_HOME_DIR"] = home
+        # PROJECT_HOME outranks HOME_DIR in the launcher, so pin it too — this is
+        # the variable that actually decides where runs/<id>/ lands, and it must
+        # be the same home the caller reads back. MINI_ORK_HOME is the launcher's
+        # second fallback for both project_home and the engine-pointer lookup, so
+        # pin it as well rather than leave one foreign home reference in the env.
+        extra["MINI_ORK_PROJECT_HOME"] = home
+        extra["MINI_ORK_HOME"] = home
     logf = open(log_path, "ab", buffering=0)
     proc = subprocess.Popen(
         ["bash", watchdog, role],
