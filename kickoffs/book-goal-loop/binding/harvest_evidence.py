@@ -13,14 +13,20 @@ The point: a caller-schema-guard rejection lands in the DB as an opaque
 to 80 chars by the predicate. That gives the fix child STRICTLY LESS signal
 than the failing lane itself had — so the child guesses (usually at the prompt,
 which is often already correct) and the loop never converges. This script
-reconstructs the real picture from three best-effort tiers:
+reconstructs the real picture from four best-effort tiers:
 
   1. DB      — the full ``book_chapter_lifecycle`` row + UNTRUNCATED last_error.
-  2. Sandbox — the newest preserved mini-ork ``verified-artifact`` sandboxes:
+  2. Quality — the chapter's own gate receipts (``bg_compose_stage_artifact``):
+               every final G-Eval verdict with its score + failing axes, so the
+               child sees the ATTEMPT LADDER rather than only the last exception,
+               plus the tell when a judge-PASSED draft never reached
+               ``chapter_commit`` (a later gate blocked it after the judge was
+               satisfied — an ordering defect the last_error cannot express).
+  3. Sandbox — the newest preserved mini-ork ``verified-artifact`` sandboxes:
                the node that ran, the artifact the lane actually produced (its
                ``##``/``###`` headings + title), and — the smoking gun — whether
                mini-ork's IN-SANDBOX verify PASSED while the host guard rejected.
-  3. Source  — for the produced node, the caller-contract requirement from the
+  4. Source  — for the produced node, the caller-contract requirement from the
                researcher source (``requiredSections`` + ``sectionPolicy``), the
                produced-vs-required heading DELTA, and a pointer to the
                in-sandbox repair-signal code so the child can trace WHY the lane
@@ -109,7 +115,152 @@ def _tier_db(chapter: str, book: str) -> str | None:
     return lasterr or None
 
 
-# ── Tier 2: preserved sandboxes ──────────────────────────────────────────────
+# ── Tier 2: quality-gate verdict ladder ──────────────────────────────────────
+
+def _chapter_uuid(chapter: str, book: str) -> str | None:
+    """The chapter's uuid, for joining the receipt table."""
+    proc = _psql(
+        "SELECT chapter_uuid::text FROM book_chapter_lifecycle "
+        f"WHERE book_uuid='{book}' AND chapter_number={chapter};"
+    )
+    if proc.returncode != 0:
+        return None
+    return proc.stdout.strip() or None
+
+
+def _tier_quality(chapter: str, book: str) -> None:
+    """The chapter's own gate receipts: the final-G-Eval attempt ladder and the
+    failing axes behind it.
+
+    Why this tier exists: every signal the other tiers carry is derived from
+    ``book_chapter_lifecycle.last_error`` — which is OVERWRITTEN on each attempt
+    and names only the last exception thrown. The judge's actual verdicts
+    (score, axis, message, and the fact that a PASS was later blocked) live only
+    in ``bg_compose_stage_artifact``. Without them the fix child patches the
+    exception it was handed and never sees the trend: a draft the judge scored
+    1.0 with zero violations can be blocked by a downstream gate, re-rolled, and
+    come back worse — indistinguishable, to a last_error-only reader, from a
+    plain quality failure.
+    """
+    _emit("## 2. Quality-gate verdict ladder (bg_compose_stage_artifact)")
+    _emit()
+    chapter_uuid = _chapter_uuid(chapter, book)
+    if not chapter_uuid:
+        _emit("NOTE: could not resolve chapter_uuid — skipping the receipt tier.")
+        _emit()
+        return
+
+    ladder = _psql(
+        "SELECT stage_key, verdict, "
+        "to_char(created_at,'YYYY-MM-DD HH24:MI:SS'), "
+        "coalesce(round(nullif(verdict_detail->>'overall_score','')::numeric, 3)::text,'-'), "
+        "coalesce(jsonb_array_length(verdict_detail->'violations'),0) "
+        "FROM bg_compose_stage_artifact "
+        f"WHERE chapter_uuid='{chapter_uuid}' "
+        "ORDER BY created_at DESC LIMIT 60;"
+    )
+    if ladder.returncode != 0:
+        _emit(f"NOTE: receipt query failed rc={ladder.returncode}: "
+              f"{ladder.stderr.strip()[:200]}")
+        _emit()
+        return
+    rows = [r for r in ladder.stdout.strip().splitlines() if r]
+    if not rows:
+        _emit("NOTE: no compose-stage receipts recorded for this chapter yet.")
+        _emit()
+        return
+
+    _emit("Newest 60 gate receipts, newest first. `nviol` is the count of "
+          "FAILING AXES — the publication gates key on that count, NOT on the "
+          "score (a 0.96 draft has failed; a 0.85 does not imply a pass):")
+    _emit()
+    cols = [r.split("|") for r in rows]
+    _emit("```")
+    for stage, verdict, at, score, nviol in ((c + [""] * 5)[:5] for c in cols):
+        _emit(f"{at}  {stage:28} {verdict:6} score={score:>6} nviol={nviol}")
+    _emit("```")
+    _emit()
+
+    # The ordering tell: a judge PASS with no chapter_commit at or after it.
+    # Rows are newest-first, so a SMALLER index is NEWER.
+    pass_idx = next(
+        (i for i, c in enumerate(cols)
+         if c[0] == "W27_final_geval" and c[1] == "pass"),
+        None,
+    )
+    commit_idx = next((i for i, c in enumerate(cols) if c[0] == "chapter_commit"), None)
+    if pass_idx is not None and (commit_idx is None or pass_idx < commit_idx):
+        _emit("### TELL: the judge PASSED a draft that never reached chapter_commit")
+        _emit()
+        _emit(
+            "The final G-Eval was satisfied but no `chapter_commit` receipt "
+            "followed, so a LATER gate (chapter commit runs after the judge — "
+            "e.g. the citation publish gate) blocked the chapter. Re-generating "
+            "the draft does not address that: the same bytes would be blocked "
+            "again. Trace the gates that run AFTER final G-Eval and fix the one "
+            "that refuses."
+        )
+        _emit()
+
+    # The final-G-Eval ladder, OLDEST→NEWEST so the trend is readable. The full
+    # list above is newest-first and interleaves every stage; this isolates the
+    # one series that decides the chapter and shows whether repair is converging
+    # or thrashing. A rising nviol means each re-roll is LOSING ground.
+    geval = [c for c in cols if c[0] == "W27_final_geval"]
+    if geval:
+        _emit("### Final G-Eval ladder (the trend — oldest first)")
+        _emit()
+        _emit("```")
+        for i, (_, verdict, at, score, nviol) in enumerate(reversed(geval), start=1):
+            _emit(f"attempt {i:>2}  {at}  {verdict:6} score={score:>6} nviol={nviol}")
+        _emit("```")
+        _emit()
+        scores = [(n, c[4]) for n, c in enumerate(reversed(geval), start=1)]
+        worst = max(scores, key=lambda t: int(t[1] or 0)) if scores else None
+        if worst and int(worst[1] or 0) > 0:
+            best = min(scores, key=lambda t: int(t[1] or 0))
+            _emit(
+                f"Read it left→right: {len(geval)} judged attempts. The fewest "
+                f"failing axes was {best[1]} (attempt {best[0]}); the most is "
+                f"{worst[1]} (attempt {worst[0]}). If the count is not falling, "
+                "the repair path is not converging — the edits it makes are not "
+                "touching the axes that fail."
+            )
+            _emit()
+
+    # Failing axes, newest-first, so recurring axes are visible at a glance.
+    viol = _psql(
+        "SELECT a.stage_key, to_char(a.created_at,'HH24:MI:SS'), "
+        "coalesce(v->>'axis','?'), coalesce(v->>'severity',''), "
+        "regexp_replace(coalesce(v->>'message',''), '\\s+', ' ', 'g') "
+        "FROM bg_compose_stage_artifact a, "
+        "jsonb_array_elements(coalesce(a.verdict_detail->'violations','[]'::jsonb)) v "
+        f"WHERE a.chapter_uuid='{chapter_uuid}' AND a.verdict='fail' "
+        "ORDER BY a.created_at DESC LIMIT 15;"
+    )
+    if viol.returncode == 0:
+        vrows = [r.split("|") for r in viol.stdout.strip().splitlines() if r]
+        if vrows:
+            _emit("Failing axes, newest first (fix the AXIS, not the score):")
+            _emit()
+            _emit("```")
+            axes: dict[str, int] = {}
+            for stage, at, axis, severity, message in ((v + [""] * 5)[:5] for v in vrows):
+                axes[axis] = axes.get(axis, 0) + 1
+                _emit(f"{at} {stage:24} [{axis}] {severity:8} {message[:160]}")
+            _emit("```")
+            _emit()
+            ranked = sorted(axes.items(), key=lambda kv: kv[1], reverse=True)
+            _emit("Axis frequency across recent failures: "
+                  + ", ".join(f"{a}x{n}" for a, n in ranked))
+            _emit()
+    else:
+        _emit(f"NOTE: violation query failed rc={viol.returncode}: "
+              f"{viol.stderr.strip()[:200]}")
+        _emit()
+
+
+# ── Tier 3: preserved sandboxes ──────────────────────────────────────────────
 
 def _sandbox_roots() -> list[Path]:
     """Candidate ``.mini-ork/runs`` roots, most-authoritative first."""
@@ -192,7 +343,7 @@ def _verify_note(run_dir: Path) -> str:
 
 def _tier_sandbox(lasterr: str | None) -> dict | None:
     """Report the newest produced artifacts. Returns the primary node's dict."""
-    _emit("## 2. What the lane actually produced (preserved mini-ork sandboxes)")
+    _emit("## 3. What the lane actually produced (preserved mini-ork sandboxes)")
     _emit()
     arts = _recent_artifacts()
     if not arts:
@@ -240,7 +391,7 @@ def _tier_sandbox(lasterr: str | None) -> dict | None:
     return primary
 
 
-# ── Tier 3: source contract requirement + repair-signal pointer ──────────────
+# ── Tier 4: source contract requirement + repair-signal pointer ──────────────
 
 def _find_lens_spec(node_type: str) -> tuple[list[str], str | None, Path | None]:
     """Parse the researcher lens source for ``<node_type>``'s requiredSections
@@ -289,7 +440,7 @@ def _find_lens_spec(node_type: str) -> tuple[list[str], str | None, Path | None]
 
 
 def _tier_source(primary: dict | None) -> None:
-    _emit("## 3. Caller-contract requirement vs. produced (from researcher source)")
+    _emit("## 4. Caller-contract requirement vs. produced (from researcher source)")
     _emit()
     if not primary:
         _emit("NOTE: no produced node resolved in Tier 2 — cannot diff against the contract.")
@@ -381,6 +532,18 @@ def main(argv: list[str]) -> int:
             _emit()
     except Exception as exc:  # noqa: BLE001 — advisory; never crash the wave
         _emit(f"NOTE: DB tier crashed: {exc}")
+        _emit()
+
+    try:
+        if chapter and re.fullmatch(r"[0-9a-fA-F-]{36}", book):
+            _tier_quality(chapter, book)
+        else:
+            _emit("## 2. Quality-gate verdict ladder")
+            _emit()
+            _emit("NOTE: chapter/BOOK_UUID unresolved — skipping the receipt tier.")
+            _emit()
+    except Exception as exc:  # noqa: BLE001
+        _emit(f"NOTE: quality tier crashed: {exc}")
         _emit()
 
     primary = None
