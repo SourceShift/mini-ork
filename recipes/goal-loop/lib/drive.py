@@ -240,10 +240,17 @@ def _default_run_wave_fn(wave_no: int, quarantined: set[str]) -> dict[str, Any]:
     # delimited; empty (no quarantine yet) leaves selection at historical.
     wave_env = dict(os.environ)
     wave_env["MO_GOAL_QUARANTINED_UNITS"] = "\n".join(sorted(quarantined))
+    # Real per-wave spend = the 24h-rolling cost meter's delta across the wave
+    # subprocess. panel-verdict.json carries only the panel node's own cost (~$0),
+    # NOT the fix child's dispatch spend, so folding it in as cost_usd left every
+    # wave reading $0 — which blinds the autoraise predictor (never sees a FUNDED
+    # wave → never stops) and _projected_wave_cost. Snapshot before/after instead.
+    cost_before = _default_cost_fn()
     proc = subprocess.run(
         [cli, "run", "goal-loop", kickoff],
         check=False, capture_output=True, text=True, env=wave_env,
     )
+    cost_after = _default_cost_fn()
     panel_path = os.path.join(run_dir, "panel-verdict.json")
     payload: dict[str, Any] = {
         "wave": wave_no,
@@ -292,6 +299,12 @@ def _default_run_wave_fn(wave_no: int, quarantined: set[str]) -> dict[str, Any]:
         except json.JSONDecodeError:
             pass
 
+    # Override any panel-sourced cost with the measured spend delta. Clamp at 0:
+    # a non-positive delta means the wave spent nothing measurable (circuit-
+    # starved) or the 24h window slid — either way "not funded", which is what
+    # the predictor must read. A funded wave's delta is unambiguously positive.
+    wave_cost = cost_after - cost_before
+    payload["cost_usd"] = wave_cost if wave_cost > 0 else 0.0
     payload["exit_code"] = proc.returncode
     payload["quarantined"] = sorted(quarantined)
     return payload
