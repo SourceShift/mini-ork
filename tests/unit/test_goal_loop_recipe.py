@@ -66,6 +66,8 @@ _tspec.loader.exec_module(_tmod)
 run_apply = _tmod._run_apply
 harvest_selected_evidence = _tmod._harvest_selected_evidence
 evidence_slug = _tmod._slug
+select_units = _tmod._select_units
+unit_sort_key = _tmod._unit_sort_key
 
 # The book-goal-loop terminal-FAILURE binding (companion to chapter_predicate).
 # Loaded by file path — it lives under kickoffs/, not a Python package. We test
@@ -294,6 +296,53 @@ def test_harvest_evidence_clamps_to_max_chars(tmp_path):
 def test_harvest_evidence_empty_units_is_empty_dict(tmp_path):
     script = _evidence_script(tmp_path, 'echo "unused"\n')
     assert harvest_evidence(str(tmp_path), str(script), []) == {}
+
+
+# ── 3b. _select_units: numeric-aware order + quarantine exclusion ─────────
+# The wave-selection core. A single-child-per-wave book loop over ch1..ch10
+# must (a) rotate ch1→ch2→ch3 in NATURAL order (not string 1,10,2,…) and
+# (b) drop units the driver has quarantined so the freed slot reaches the
+# other failing chapters instead of re-hammering the stuck one forever.
+
+
+def _gs(*failing_and_passing):
+    """Build a goal_state map: ('1', False), ('2', True) → {'1':{pass:False},…}."""
+    return {uid: {"pass": ok} for uid, ok in failing_and_passing}
+
+
+def test_unit_sort_key_orders_numeric_before_string_and_naturally():
+    ids = ["10", "2", "1", "beta", "alpha", "9"]
+    assert sorted(ids, key=unit_sort_key) == ["1", "2", "9", "10", "alpha", "beta"]
+
+
+def test_select_units_picks_first_failing_natural_order():
+    # ch1..ch10 all failing, one child slot → the ONE broken chapter, ch1.
+    gs = _gs(*[(str(n), False) for n in range(1, 11)])
+    assert select_units(gs, 1) == ["1"]
+    # widen the slot and the next picks follow natural order (2 before 10).
+    assert select_units(gs, 3) == ["1", "2", "3"]
+
+
+def test_select_units_excludes_quarantined_and_rotates_slot():
+    # ch1 quarantined (stuck) → the single slot rotates onto ch2, not ch1.
+    gs = _gs(*[(str(n), False) for n in range(1, 11)])
+    assert select_units(gs, 1, quarantined={"1"}) == ["2"]
+    # quarantine ch1+ch2 → slot rotates to ch3.
+    assert select_units(gs, 1, quarantined={"1", "2"}) == ["3"]
+
+
+def test_select_units_starvation_guard_keeps_dispatching():
+    # EVERY failing unit quarantined → exclusion dropped so the wave still
+    # dispatches (driver's all_quarantined stop ends the loop, not a silent
+    # empty plan).
+    gs = _gs(("1", False), ("2", False))
+    assert select_units(gs, 1, quarantined={"1", "2"}) == ["1"]
+
+
+def test_select_units_skips_passing_units():
+    # ch1 PASSED, ch2..ch4 failing → ch1 never selected; ch2 leads.
+    gs = _gs(("1", True), ("2", False), ("3", False), ("4", False))
+    assert select_units(gs, 1) == ["2"]
 
 
 # ── 4. verifiers/goal_check.py: panel-verdict.json shape ─────────────────
