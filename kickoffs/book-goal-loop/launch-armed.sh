@@ -72,6 +72,13 @@ export MINI_ORK_RECURSIVE_MAX_PARALLEL=1
 export MINI_ORK_ALLOW_CHILD_SPAWN=1
 # 0 = spawn a REAL fix child (LLM spend); 1 = scaffold-only (~$0 wiring proof).
 export MO_GOAL_NO_EXECUTE="${MO_GOAL_NO_EXECUTE:-0}"
+# CLOSED-LOOP verification ownership: the code-fix child's in-sandbox reviewer is
+# redundant AND evidence-starved here (verifiers are scoped to echo-stubs below,
+# and the real gate is downstream: deploy -> regen -> DB flip). Without this, a
+# needs_revision reviewer escalates to rollback's revert_branch and DESTROYS the
+# child's verified edit before goal_apply can deploy it. Keep the worktree edit;
+# let the OUTER loop (regen + GRAO quarantine + divergence-kill) be the gate.
+export MINI_ORK_ROLLBACK_KEEP_WORKTREE="${MINI_ORK_ROLLBACK_KEEP_WORKTREE:-1}"
 
 # ── grandchild verifiers scoped OFF the 17k-file researcher build ──
 export MINI_ORK_TYPECHECK_CMD='echo scoped-typecheck-skipped-bounded-goal-loop-demo'

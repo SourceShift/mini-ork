@@ -111,6 +111,40 @@ def test_rollback_handler_invokes_revert_branch(tmp_path, monkeypatch):
     assert (repo / "tracked.py").read_text() == "original\n"
 
 
+def test_rollback_handler_keeps_worktree_when_outer_loop_owns_verify(
+        tmp_path, monkeypatch):
+    """MINI_ORK_ROLLBACK_KEEP_WORKTREE=1 preserves the implementer's edit.
+
+    In a closed RSI loop (goal-loop) the authoritative gate is downstream —
+    deploy -> regen -> DB flip — so an in-sandbox revert_branch would destroy a
+    verified-correct edit before the real gate ever tests it. The flag keeps
+    FILE state; rc is unchanged (the rollback node still never re-fails the run,
+    and the DB/version-registry rollback above it still runs).
+    """
+    repo = _mk_repo(tmp_path)
+    (repo / "tracked.py").write_text("fix by implementer\n")
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    _summary(run_dir, ["tracked.py"])
+    wf = tmp_path / "workflow.yaml"
+    wf.write_text("rollback_strategy: revert_branch\n")
+    monkeypatch.setenv("MO_TARGET_CWD", str(repo))
+    monkeypatch.setenv("MINI_ORK_ROLLBACK_KEEP_WORKTREE", "1")
+    monkeypatch.delenv("MINI_ORK_RUN_DIR", raising=False)
+    plan = tmp_path / "plan.json"
+    plan.write_text(json.dumps({"objective": "o"}))
+
+    rc, fr = ex.dispatch_node(
+        ("rb1", "rollback", "undo", "", "serial", "", "rollback", ""),
+        root=str(tmp_path), run_dir=str(run_dir), plan_path=str(plan),
+        task_class="code_fix", db="", run_id="r",
+        dispatch_fn=lambda *a: (0, ""), recipe="code-fix",
+        workflow=str(wf))
+
+    assert (rc, fr) == (0, "done")  # rollback still never re-fails the run
+    assert (repo / "tracked.py").read_text() == "fix by implementer\n"  # kept
+
+
 def test_rollback_handler_default_workflow_skips_revert(tmp_path, monkeypatch):
     """No rollback_strategy declared → historical registry-only behavior."""
     repo = _mk_repo(tmp_path)

@@ -993,7 +993,18 @@ def _handle_rollback(ctx: NodeDispatch):
     # revert_branch handles FILE state. rc contract unchanged: the rollback
     # node always succeeds and reports, it never re-fails the run.
     if _rollback_strategy(ctx.workflow) == "revert_branch":
-        _revert_working_tree(ctx.root, ctx.run_dir_eff or ctx.run_dir)
+        # Outer-loop verification override: when an OUTER driver owns the
+        # authoritative gate (goal-loop: deploy -> regen -> DB flip), the
+        # in-sandbox reviewer is both redundant and evidence-starved, so a
+        # revert_branch here would DESTROY the implementer's verified edit
+        # before the real gate ever tests it. The driver sets this flag to
+        # keep FILE state (the version-registry/DB rollback above still runs).
+        if context_env("MINI_ORK_ROLLBACK_KEEP_WORKTREE", "").strip().lower() in ("1", "true", "yes"):
+            print("  [ok] rollback: MINI_ORK_ROLLBACK_KEEP_WORKTREE set — preserving working-tree "
+                  "edit (an outer loop owns verification; an in-sandbox revert would destroy the fix)",
+                  file=sys.stderr, flush=True)
+        else:
+            _revert_working_tree(ctx.root, ctx.run_dir_eff or ctx.run_dir)
     print("  [ok] rollback complete")
     # NOTE: bash traces NO rollback node (:3205-3223 has no _trace_write_node_rich).
     # Tracing it with status=success would write a spurious +1-reward execution_traces
