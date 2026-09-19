@@ -27,10 +27,13 @@ from __future__ import annotations
 import os
 import signal
 import subprocess
+import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
+from typing import TextIO
 
 from ..context import context_env_snapshot
+from .live_stream import LiveWriter, open_live_writer
 from .models import DispatchRequest, DispatchResult, TokenUsage
 
 # Parser callables turn a provider's stdout into structured telemetry. They are
@@ -75,11 +78,17 @@ def spawn_local(
     severs the controlling terminal so no ``/dev/tty`` prompt can block a
     headless run and the harness becomes one reapable process group; a timeout
     SIGKILLs that whole group and yields the conventional ``rc=124``; a failed
-    ``execve`` yields ``rc=127``. The prompt rides on stdin (``input=``), never
-    argv/env, so it is structurally E2BIG-proof. The separated-stream, stdin-fed
-    shape is exactly what ``dispatch`` needs and what ``Workspace.exec`` (merged
-    output, no stdin) deliberately cannot provide — which is why isolation of the
-    CLI spawn needs this verb, not ``exec``.
+    ``execve`` yields ``rc=127``. The prompt rides on stdin, never argv/env, so
+    it is structurally E2BIG-proof. The separated-stream, stdin-fed shape is
+    exactly what ``dispatch`` needs and what ``Workspace.exec`` (merged output,
+    no stdin) deliberately cannot provide — which is why isolation of the CLI
+    spawn needs this verb, not ``exec``.
+
+    The pipes are drained by reader threads rather than ``communicate()`` so each
+    line can be teed to the live sidecar (``MO_LIVE_FILE``) AS IT ARRIVES. The
+    rc contract is unchanged and non-negotiable: a timeout still SIGKILLs the
+    group and returns ``124``, and the captured stdout/stderr still reach the
+    parsers whole, so switching the drain mechanism is invisible to callers.
     """
     try:
         proc = subprocess.Popen(
@@ -87,7 +96,12 @@ def spawn_local(
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True,
+            # Explicit utf-8 + replace, not locale-dependent text=True: a harness
+            # that emits a truncated multibyte sequence (a killed run's last
+            # write is a common one) must not crash the drain thread and lose
+            # the whole node's output to a UnicodeDecodeError.
+            encoding="utf-8",
+            errors="replace",
             env=dict(env),
             cwd=cwd,  # None = inherit; pinned by the caller's cwd guard
             start_new_session=True,
@@ -95,17 +109,97 @@ def spawn_local(
     except OSError as exc:
         return 127, "", f"spawn failed: {exc}"
 
+    with open_live_writer() as live:
+        stdout_parts: list[str] = []
+        stderr_parts: list[str] = []
+        readers = [
+            threading.Thread(
+                target=_drain_stream,
+                args=(proc.stdout, live, "stdout", stdout_parts),
+                daemon=True,
+            ),
+            threading.Thread(
+                target=_drain_stream,
+                args=(proc.stderr, live, "stderr", stderr_parts),
+                daemon=True,
+            ),
+        ]
+        for reader in readers:
+            reader.start()
+        # Third thread, not a bare write: see _feed_stdin for why the prompt
+        # cannot be written from the thread that owns the timeout.
+        threading.Thread(target=_feed_stdin, args=(proc, stdin), daemon=True).start()
+
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            # A hung harness is the single biggest reliability failure. Reap its
+            # whole detached group, then let the readers drain to EOF — killing
+            # the group closes the inherited pipes, which is what unblocks them
+            # and reaps the zombie. Then surface the distinct rc=124 so
+            # dispatch_with_fallback abandons this lane.
+            _terminate_process_group(proc)
+            proc.wait()
+            for reader in readers:
+                reader.join(timeout=10)
+            return 124, "", f"timeout after {timeout}s"
+
+        # Joining without a deadline matches communicate()'s drain semantics: the
+        # child is reaped, so this returns as soon as the pipes close.
+        for reader in readers:
+            reader.join()
+
+    return proc.returncode, "".join(stdout_parts), "".join(stderr_parts)
+
+
+def _drain_stream(
+    stream: TextIO | None,
+    live: LiveWriter,
+    name: str,
+    sink: list[str],
+) -> None:
+    """Drain one pipe line by line, teeing each line to the live sink.
+
+    Iterating the stream (rather than ``read(n)``) is what keeps the tee
+    record-aligned: text iteration yields only at a newline or EOF, so a sink
+    record never carries half a JSON line unless the harness genuinely died
+    mid-write — and that trailing fragment is flagged rather than dropped,
+    because it is usually the last thing a killed run said.
+    """
+    if stream is None:
+        return
     try:
-        # Prompt over stdin (input=): structurally E2BIG-proof — never on argv/env.
-        stdout, stderr = proc.communicate(input=stdin, timeout=timeout)
-    except subprocess.TimeoutExpired:
-        # A hung harness is the single biggest reliability failure. Reap its
-        # whole detached group, drain the pipes to reap the zombie, then surface
-        # the distinct rc=124 so dispatch_with_fallback abandons this lane.
-        _terminate_process_group(proc)
-        proc.communicate()
-        return 124, "", f"timeout after {timeout}s"
-    return proc.returncode, stdout or "", stderr or ""
+        for line in stream:
+            sink.append(line)
+            live.write_line(line, name, partial=not line.endswith("\n"))
+    except (OSError, ValueError):
+        # The group was killed under us. What was already drained is still a
+        # faithful record of the output; the rc from the caller is the real
+        # signal, so this must not turn a clean abandon into a crash.
+        pass
+    finally:
+        try:
+            stream.close()
+        except OSError:
+            pass
+
+
+def _feed_stdin(proc: "subprocess.Popen[str]", stdin: str) -> None:
+    """Write the prompt, then close the pipe so the child sees EOF.
+
+    On its own thread because a prompt larger than the pipe buffer (~64 KiB)
+    blocks the writer until the child reads. Writing it inline would put the
+    thread that owns ``proc.wait(timeout=…)`` inside a write that a
+    stdin-ignoring child never unblocks — the timeout would lose its authority
+    precisely on the hung-lane case it exists for.
+    """
+    try:
+        if proc.stdin is not None:
+            proc.stdin.write(stdin)
+            proc.stdin.close()
+    except (BrokenPipeError, OSError, ValueError):
+        # Child exited before reading its prompt; rc already says so.
+        pass
 
 
 def _spawn_in_workspace(
