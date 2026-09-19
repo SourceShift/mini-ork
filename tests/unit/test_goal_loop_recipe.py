@@ -67,6 +67,19 @@ run_apply = _tmod._run_apply
 harvest_selected_evidence = _tmod._harvest_selected_evidence
 evidence_slug = _tmod._slug
 
+# The book-goal-loop terminal-FAILURE binding (companion to chapter_predicate).
+# Loaded by file path — it lives under kickoffs/, not a Python package. We test
+# its pure guard rails (argv/env validation) + the stall helper hermetically,
+# without a live psql/DB.
+_BIND_DIR = REPO / "kickoffs" / "book-goal-loop" / "binding"
+_TFAIL_PATH = _BIND_DIR / "chapter_terminal_fail.py"
+_tfspec = importlib.util.spec_from_file_location("chapter_terminal_fail", _TFAIL_PATH)
+if _tfspec is None or _tfspec.loader is None:
+    raise ImportError(f"could not load terminal-fail binding from {_TFAIL_PATH}")
+_tfmod = importlib.util.module_from_spec(_tfspec)
+sys.modules.setdefault(_tfspec.name, _tfmod)
+_tfspec.loader.exec_module(_tfmod)
+
 
 # ── Module-state fixtures ──────────────────────────────────────────────────
 # register.py mutates both _IMPLEMENTER_SUBMODES (execute_handlers) and
@@ -491,6 +504,119 @@ def test_apply_live_failed_status_still_deploys_and_await_gives_up(tmp_path, mon
     assert payload["status"] == "applied"
     assert payload["units"][0]["unit_id"] == "1"
     assert payload["units"][0]["await_regen"]["settled"] is False
+
+
+# ── 5b. Fail-fast terminal detection (MO_GOAL_TERMINAL_FAIL_CMD) ───────────
+# The await used to only stop on SUCCESS, burning the whole
+# MO_GOAL_APPLY_AWAIT_SECONDS window (90 min live) even on a deploy proven
+# dead. The optional fail-cmd lets the loop give up within one poll. These
+# lock the three branches of _poll_until_settled as reached THROUGH run_apply.
+
+
+def _mk_probe(path: Path, rc: int) -> Path:
+    path.write_text(f"#!/usr/bin/env bash\nexit {rc}\n", encoding="utf-8")
+    path.chmod(0o755)
+    return path
+
+
+def test_apply_live_terminal_fail_cmd_gives_up_fast(tmp_path, monkeypatch):
+    # Pass probe never fires (exit 1); the fail probe fires (exit 0). The await
+    # must settle terminal_failure immediately — NOT wait for the pass window.
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    _write_sweep_result(run_dir, [{"unit_id": "1", "status": "spawned"}])
+    never_pass = _mk_probe(tmp_path / "pass.sh", 1)
+    fail_now = _mk_probe(tmp_path / "fail.sh", 0)
+
+    _arm_apply_env(monkeypatch, tmp_path)
+    monkeypatch.setenv("MO_GOAL_APPLY_CMD", "true")
+    monkeypatch.setenv("MO_GOAL_REDISPATCH_CMD", "true")
+    monkeypatch.setenv("MO_GOAL_TERMINAL_CMD", str(never_pass))
+    monkeypatch.setenv("MO_GOAL_TERMINAL_FAIL_CMD", str(fail_now))
+
+    regen = run_apply(str(run_dir))["units"][0]["await_regen"]
+    assert regen["settled"] is False
+    assert regen["terminal"] is True
+    assert regen["reason"] == "terminal_failure"
+
+
+def test_apply_live_terminal_fail_cmd_unset_is_backward_compatible(tmp_path, monkeypatch):
+    # No fail-cmd ⇒ a never-passing unit must exhaust the window and report a
+    # plain timeout (terminal False) — the historical wait-for-pass behavior,
+    # distinct from a terminal_failure. Proves the seam is strictly opt-in.
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    _write_sweep_result(run_dir, [{"unit_id": "1", "status": "spawned"}])
+    never_pass = _mk_probe(tmp_path / "pass.sh", 1)
+
+    _arm_apply_env(monkeypatch, tmp_path)
+    monkeypatch.delenv("MO_GOAL_TERMINAL_FAIL_CMD", raising=False)
+    monkeypatch.setenv("MO_GOAL_APPLY_CMD", "true")
+    monkeypatch.setenv("MO_GOAL_REDISPATCH_CMD", "true")
+    monkeypatch.setenv("MO_GOAL_TERMINAL_CMD", str(never_pass))
+
+    regen = run_apply(str(run_dir))["units"][0]["await_regen"]
+    assert regen["settled"] is False
+    assert regen["terminal"] is False
+    assert regen["reason"] == "timeout"
+
+
+def test_apply_live_terminal_pass_beats_fail(tmp_path, monkeypatch):
+    # Success is probed FIRST each cycle: a unit that both passed and (racily)
+    # trips the fail probe must be reported as PASSED, never abandoned.
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    _write_sweep_result(run_dir, [{"unit_id": "1", "status": "spawned"}])
+    pass_now = _mk_probe(tmp_path / "pass.sh", 0)
+    fail_now = _mk_probe(tmp_path / "fail.sh", 0)
+
+    _arm_apply_env(monkeypatch, tmp_path)
+    monkeypatch.setenv("MO_GOAL_APPLY_CMD", "true")
+    monkeypatch.setenv("MO_GOAL_REDISPATCH_CMD", "true")
+    monkeypatch.setenv("MO_GOAL_TERMINAL_CMD", str(pass_now))
+    monkeypatch.setenv("MO_GOAL_TERMINAL_FAIL_CMD", str(fail_now))
+
+    regen = run_apply(str(run_dir))["units"][0]["await_regen"]
+    assert regen["settled"] is True
+    assert regen["reason"] == "goal_met"
+
+
+# ── 5c. chapter_terminal_fail binding: guard rails + stall helper ──────────
+# Hermetic — exercises only the paths BEFORE the psql call (argv/BOOK_UUID
+# validation) plus the pure run-dir freshness helper. No DB required.
+
+
+def test_terminal_fail_guards_reject_bad_invocation(monkeypatch):
+    monkeypatch.delenv("BOOK_UUID", raising=False)
+    # No chapter id at all.
+    assert _tfmod.main([]) == 2
+    # Non-numeric chapter id.
+    monkeypatch.setenv("BOOK_UUID", "00000000-0000-0000-0000-000000000000")
+    assert _tfmod.main(["not-a-number"]) == 2
+    # Valid chapter but missing/short BOOK_UUID never reaches psql.
+    monkeypatch.setenv("BOOK_UUID", "too-short")
+    assert _tfmod.main(["1"]) == 2
+
+
+def test_terminal_fail_newest_run_age(tmp_path):
+    import time as _t
+
+    # Empty / missing dir ⇒ None (no run has ever churned).
+    assert _tfmod._newest_run_age_seconds(str(tmp_path / "nope")) is None
+    runs = tmp_path / "runs"
+    runs.mkdir()
+    assert _tfmod._newest_run_age_seconds(str(runs)) is None
+    # A fresh run-* dir ⇒ a small, non-negative age (churning, not stalled).
+    (runs / "run-123").mkdir()
+    age = _tfmod._newest_run_age_seconds(str(runs))
+    assert age is not None and 0.0 <= age < 60.0
+    # An OLD run-* dir ⇒ a large age (the stall detector's trip condition).
+    old = runs / "run-000"
+    old.mkdir()
+    stale = _t.time() - 4000
+    os.utime(old, (stale, stale))
+    # Newest wins: run-123 is fresh, so the reported age stays small.
+    assert _tfmod._newest_run_age_seconds(str(runs)) < 60.0
 
 
 # ── 6. _harvest_selected_evidence: sweep-plan enrichment + on-disk file ───
