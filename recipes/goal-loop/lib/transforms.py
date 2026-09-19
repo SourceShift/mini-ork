@@ -261,6 +261,45 @@ def _poll_until_zero(
         waited += step
 
 
+def _poll_until_settled(
+    *,
+    success_fn: Callable[[], int],
+    fail_fn: Callable[[], int] | None,
+    timeout_s: int,
+    poll_s: int,
+) -> dict[str, Any]:
+    """Poll a success probe, and an optional terminal-failure probe, until one
+    settles or ``timeout_s`` elapses.
+
+    ``success_fn() == 0`` ⇒ the goal was reached (``settled: True``).
+    ``fail_fn() == 0`` ⇒ the unit reached a TERMINAL failure/stall — stop
+    awaiting immediately (``settled: False, terminal: True``) instead of
+    burning the whole window on a regen that will never pass. When ``fail_fn``
+    is ``None`` this collapses to the historical wait-for-success-only loop.
+
+    The success probe is checked FIRST every cycle: a unit that both passed and
+    (racily) trips the failure probe is reported as passed. ``poll_s == 0``
+    (test seam) collapses to at most two probes, mirroring ``_poll_until_zero``.
+    """
+    step = poll_s if poll_s > 0 else (timeout_s + 1)
+    waited = 0
+    last: int | None = None
+    while True:
+        last = success_fn()
+        if last == 0:
+            return {"settled": True, "terminal": True, "reason": "goal_met",
+                    "waited_s": waited, "last_rc": last}
+        if fail_fn is not None and fail_fn() == 0:
+            return {"settled": False, "terminal": True, "reason": "terminal_failure",
+                    "waited_s": waited, "last_rc": last}
+        if waited >= timeout_s:
+            return {"settled": False, "terminal": False, "reason": "timeout",
+                    "waited_s": waited, "last_rc": last}
+        if poll_s > 0:
+            time.sleep(poll_s)
+        waited += step
+
+
 def _units_to_apply(run_dir: str) -> list[str]:
     """Read ``sweep-result.json`` and return the swept unit ids worth deploying."""
     sweep_path = Path(run_dir) / "sweep-result.json"
@@ -307,8 +346,18 @@ def _await_deploy() -> dict[str, Any]:
 def _await_terminal(unit_id: str, cwd: str) -> dict[str, Any]:
     """Block until ``unit_id`` reaches a terminal state after re-dispatch.
 
-    Polls ``MO_GOAL_TERMINAL_CMD`` (argv prefix + unit_id) when set, else falls
-    back to ``MO_GOAL_PREDICATE_CMD`` (terminal == the goal predicate passes).
+    SUCCESS is the goal predicate passing: polls ``MO_GOAL_TERMINAL_CMD``
+    (argv prefix + unit_id) when set, else ``MO_GOAL_PREDICATE_CMD``.
+
+    FAILURE is optional and fast: when ``MO_GOAL_TERMINAL_FAIL_CMD`` is set and
+    returns 0, the unit has terminally failed or stalled (e.g. a chapter left
+    orphaned in ``generating`` with a fresh ``last_error``, or ``status=failed``
+    / ``permanently_failed``). Without it the await is blind to failure and
+    burns the entire ``MO_GOAL_APPLY_AWAIT_SECONDS`` window on a regen that will
+    never pass — so a bad deploy costs 90 min before the loop can react. With
+    it, the loop learns its deploy failed within one poll and the outer driver
+    can quarantine / re-plan / stop. Unset ⇒ historical wait-for-pass behavior.
+
     The unit id is always the final argv slot — never shell-interpolated.
     """
     terminal_cmd = os.environ.get("MO_GOAL_TERMINAL_CMD") or os.environ.get(
@@ -316,14 +365,19 @@ def _await_terminal(unit_id: str, cwd: str) -> dict[str, Any]:
     )
     if not terminal_cmd:
         return {"settled": False, "reason": "no MO_GOAL_TERMINAL_CMD/PREDICATE_CMD"}
-    argv = shlex.split(terminal_cmd) + [unit_id]
+    pass_argv = shlex.split(terminal_cmd) + [unit_id]
+    fail_cmd = os.environ.get("MO_GOAL_TERMINAL_FAIL_CMD")
+    fail_argv = shlex.split(fail_cmd) + [unit_id] if fail_cmd else None
     timeout_s = _int_env("MO_GOAL_APPLY_AWAIT_SECONDS", 5400)
     poll_s = _int_env("MO_GOAL_APPLY_POLL_SECONDS", 60)
-    result = _poll_until_zero(
-        lambda: _run(argv, cwd=cwd, shell=False)["rc"],
+    result = _poll_until_settled(
+        success_fn=lambda: _run(pass_argv, cwd=cwd, shell=False)["rc"],
+        fail_fn=(lambda: _run(fail_argv, cwd=cwd, shell=False)["rc"])
+        if fail_argv is not None
+        else None,
         timeout_s=timeout_s, poll_s=poll_s,
     )
-    return {"settled": result["ok"], "unit_id": unit_id, **result}
+    return {"unit_id": unit_id, **result}
 
 
 def _run_apply(run_dir: str) -> dict[str, Any]:
