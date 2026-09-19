@@ -364,6 +364,123 @@ def test_agent_server_form_schemas_and_profiles_are_json() -> None:
     assert isinstance(list_agent_profiles(), list)
 
 
+def test_profiles_are_the_real_lanes_and_gate_on_credential_presence(
+    tmp_path, monkeypatch
+) -> None:
+    """`/api/profiles` lists mini-ork's provider registry, not a placeholder.
+
+    The composer's enabled state hinges on this: `useLlmConfigured` (local mode)
+    finds the `active_profile` row and reads its `api_key_set`, so an empty list
+    disables the chat input and the canvas goes inert. Pinned to a temp registry
+    so the assertion is about the projection, not about whatever lanes the
+    developer running the suite happens to have keys for."""
+    from fastapi.testclient import TestClient
+
+    from mini_ork.web.app import create_app
+
+    registry = tmp_path / "providers.yaml"
+    registry.write_text(
+        "providers:\n"
+        "  funded:\n"
+        "    kind: anthropic-compat\n"
+        "    model: test-model\n"
+        "    base_url: https://example.invalid/anthropic\n"
+        "    api_key_env: MO_TEST_LANE_KEY\n"
+        "  broke:\n"
+        "    kind: anthropic-compat\n"
+        "    model: other-model\n"
+        "    api_key_env: MO_TEST_LANE_KEY_UNSET\n"
+    )
+    monkeypatch.setenv("MINI_ORK_PROVIDERS", str(registry))
+    monkeypatch.setenv("MO_TEST_LANE_KEY", "present")
+    monkeypatch.delenv("MO_TEST_LANE_KEY_UNSET", raising=False)
+
+    with TestClient(create_app(dev_cors=False)) as client:
+        body = client.get("/api/profiles").json()
+
+    assert [p["name"] for p in body["profiles"]] == ["funded", "broke"]
+    # A lane with no credential is still listed, flagged false — dropping it
+    # would hide a lane the operator may be about to fix.
+    assert [p["api_key_set"] for p in body["profiles"]] == [True, False]
+    assert body["profiles"][0]["model"] == "test-model"
+    # The active row must be a *usable* one; naming an unusable lane here is
+    # exactly how the composer gets disabled with profiles present.
+    assert body["active_profile"] == "funded"
+
+
+def test_active_profile_follows_the_lane_policy_over_registry_order(
+    tmp_path, monkeypatch
+) -> None:
+    """The named lane must be one the policy actually dispatches.
+
+    Registry order is alphabetical, so "first healthy lane" lands on whatever
+    ambient lane sorts first — a lane the operator may have taken out of scope.
+    The canvas renders this name to the user as *the* LLM, so describing the
+    deployment matters. Unit-level because the fallback chain (policy -> mode ->
+    None) has three branches and no HTTP surface is involved."""
+    from mini_ork.web.routes.agent_server import _policy_lane
+
+    home = tmp_path / "home"
+    (home / "config").mkdir(parents=True)
+    (home / "config" / "agents.yaml").write_text(
+        "lanes:\n"
+        "  implementer: minimax\n"
+        "  worker: minimax\n"
+        "  planner: deepseek\n"
+        "  codex_lens: dead_lane\n"
+    )
+    # clear the run-dir branch so the home config is what resolves
+    monkeypatch.delenv("MINI_ORK_RUN_DIR", raising=False)
+    monkeypatch.setenv("MINI_ORK_HOME", str(home))
+
+    # The mode wins over first-in-list, and a policy lane with no credential is
+    # not eligible — otherwise the active row could be unusable and re-disable
+    # the composer that this list exists to enable.
+    assert _policy_lane(["deepseek", "minimax"]) == "minimax"
+    assert _policy_lane(["deepseek"]) == "deepseek"
+    assert _policy_lane([]) is None
+
+    (home / "config" / "agents.yaml").write_text("lanes: {}\n")
+    assert _policy_lane(["deepseek", "minimax"]) is None
+
+
+def test_agent_server_serves_the_paths_the_canvas_polls() -> None:
+    """Profiles, workspaces and telemetry consent all resolve — not 404/405.
+
+    Each of these is called on ordinary navigation, so an unanswered one is not
+    a one-off failure the user sees once; it is a 404 in a poll loop, and the
+    consent POST specifically made onboarding's modal re-appear on every single
+    page load. Asserted through the real client so the test exercises routing
+    (the SPA catch-all serves HTML-with-200 for anything unrouted, which a direct
+    function call would not catch)."""
+    from fastapi.testclient import TestClient
+
+    from mini_ork.web.app import create_app
+
+    with TestClient(create_app(dev_cors=False)) as client:
+        # Envelopes, not bare arrays: the callers dereference `.profiles` /
+        # `.workspaces`, so `[]` would crash the page instead of emptying it.
+        assert client.get("/api/workspaces").json() == {
+            "workspaces": [],
+            "workspaceParents": [],
+        }
+
+        granted = client.post(
+            "/api/automation/v1/telemetry/consent",
+            json={"consent_granted": True, "frontend_distinct_id": "ph-fe"},
+        )
+        assert granted.status_code == 200
+        assert granted.json() == {"consent_granted": True}
+
+        # The flag is echoed, not hardcoded: a user who declines must read back
+        # as declined, or the canvas would keep re-asking someone who said no.
+        denied = client.post(
+            "/api/automation/v1/telemetry/consent",
+            json={"consent_granted": False, "frontend_distinct_id": "ph-fe"},
+        )
+        assert denied.json() == {"consent_granted": False}
+
+
 def _fake_launch_run_factory(calls: list[dict]):
     """Stand-in for control.launch_run that records calls and always succeeds.
 
@@ -2286,3 +2403,688 @@ def test_agent_server_conversation_batch_get_is_positional_with_nulls(
     assert out[1] is None
     assert out[2] is None
     assert get_conversations(home=tmp_path, ids=None) == []
+
+
+# ── Canvas event WebSocket (SE-3 UI fork) ─────────────────────────────────────
+#
+# The canvas opens one socket per conversation and, when it cannot reach OPEN,
+# degrades to REST polling — which is what the "Disconnected" chip reports. The
+# tests below pin the three properties that degradation cannot supply: the
+# history replay ordered oldest-first, the terminal execution_status signal,
+# and a push for events written *after* connect. The last one is the assertion
+# that distinguishes this route from `routes/stream.py`, whose MAX(id) cursor is
+# new-only and cannot replay the backlog a reconnect needs.
+
+
+def _ws_home(tmp_path: Path) -> Path:
+    """A home the socket route will actually resolve to.
+
+    `get_home` 404s unless `<home>/state.db` exists (that check is what stops a
+    stale workspace from silently reading another project's runs), and the
+    socket route falls back to the DEFAULT home on a miss. So without this the
+    tests would quietly connect to the developer's real .mini-ork. A bare empty
+    file is enough: a non-launched conversation never opens the DB.
+    """
+    (tmp_path / "state.db").touch()
+    return tmp_path
+
+
+def _ws_url(tmp_path: Path, cid: str, **params: str) -> str:
+    query = "".join(f"&{k}={v}" for k, v in params.items())
+    return f"/sockets/events/{cid}?home={tmp_path}{query}"
+
+
+def _recv_json(ws: object, timeout: float = 10.0) -> object:
+    """`ws.receive_json()` with a deadline.
+
+    starlette's test session blocks on the receive queue forever when the
+    server sends nothing, so a regression here would hang CI instead of failing
+    it. The pool is abandoned rather than joined on timeout — the enclosing
+    `with` block tears the socket down either way.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    pool = ThreadPoolExecutor(max_workers=1)
+    try:
+        return pool.submit(ws.receive_json).result(timeout=timeout)  # type: ignore[attr-defined]
+    finally:
+        pool.shutdown(wait=False)
+
+
+def test_socket_replays_history_then_holds_open(tmp_path: Path) -> None:
+    """Handshake first, then the backlog oldest-first, then no close.
+
+    The full_state frame leads because the client renders its status chip off
+    it — replaying events *before* it would leave the chip guessing until the
+    first event landed. The socket must also NOT close when the backlog ends:
+    the canvas opens it for every conversation the user clicks, including ones
+    finished days ago, so a close-on-drain rule would paint "Disconnected" over
+    the whole history.
+    """
+    from fastapi.testclient import TestClient
+
+    from mini_ork.web.app import create_app
+
+    home = _ws_home(tmp_path)
+    _seed_conversation(home, "conv-ws", "2026-09-03T00:00:00Z")
+
+    with TestClient(create_app(dev_cors=False)) as client:
+        with client.websocket_connect(_ws_url(home, "conv-ws")) as ws:
+            handshake = _recv_json(ws)
+            assert handshake["kind"] == "ConversationStateUpdateEvent"
+            assert handshake["key"] == "full_state"
+            assert handshake["source"] == "environment"
+            assert handshake["value"] == {"execution_status": "idle"}
+
+            event = _recv_json(ws)
+            assert event["id"] == "conv-ws-user-0"
+            assert event["source"] == "user"
+            assert event["llm_message"]["role"] == "user"
+            assert event["llm_message"]["content"][0]["text"] == "hello from conv-ws"
+
+
+def test_socket_since_replays_only_what_the_client_lacks(tmp_path: Path) -> None:
+    """`resend_mode=since` is the reconnect path, and it is a STRICT comparison.
+
+    The client subscribes with the timestamp of the newest event it already
+    holds, so anything at-or-before it must not be resent (at: already held;
+    after: the client would never see it). This is the branch `stream.py`
+    cannot serve at all — its cursor is seeded at MAX(id) and drops history.
+    """
+    from fastapi.testclient import TestClient
+
+    from mini_ork.web.app import create_app
+
+    home = _ws_home(tmp_path)
+    _seed_conversation(home, "conv-since", "2026-09-03T00:00:00Z")
+
+    with TestClient(create_app(dev_cors=False)) as client:
+        # after_timestamp == the seeded message's own stamp → nothing replayed.
+        url = _ws_url(
+            home,
+            "conv-since",
+            resend_mode="since",
+            after_timestamp="2026-09-03T00:00:00Z",
+        )
+        with client.websocket_connect(url) as ws:
+            assert _recv_json(ws)["key"] == "full_state"
+
+        # A cursor older than the message → the backlog comes back.
+        url = _ws_url(
+            home,
+            "conv-since",
+            resend_mode="since",
+            after_timestamp="2026-09-02T00:00:00Z",
+        )
+        with client.websocket_connect(url) as ws:
+            assert _recv_json(ws)["key"] == "full_state"
+            assert _recv_json(ws)["id"] == "conv-since-user-0"
+
+
+def test_socket_announces_a_terminal_status_then_stays_open(tmp_path: Path) -> None:
+    """A run that is already over still gets its execution_status signal.
+
+    `finished`/`error` are what `_TERMINAL_STATUS_MAP` folds a recipe status
+    into, and the client needs one of them to stop its "running" spinner.
+    """
+    from fastapi.testclient import TestClient
+
+    from mini_ork.web.app import create_app
+    from mini_ork.web.routes.agent_server import _save_conversation
+
+    home = _ws_home(tmp_path)
+    _save_conversation(
+        home,
+        {
+            "id": "conv-done",
+            "title": "done",
+            "created_at": "2026-09-01T00:00:00Z",
+            "updated_at": "2026-09-03T00:00:00Z",
+            "execution_status": "finished",
+            # run_launched is False so nothing reaches for state.db: the status
+            # is the sidecar's own, which is exactly the canvas-only home case.
+            "run_launched": False,
+            "messages": [],
+        },
+    )
+
+    with TestClient(create_app(dev_cors=False)) as client:
+        with client.websocket_connect(_ws_url(home, "conv-done")) as ws:
+            assert _recv_json(ws)["key"] == "full_state"
+            terminal = _recv_json(ws)
+            assert terminal["kind"] == "ConversationStateUpdateEvent"
+            assert terminal["key"] == "execution_status"
+            assert terminal["value"] == "finished"
+
+
+def test_socket_pushes_an_event_written_after_connect(tmp_path: Path) -> None:
+    """THE live assertion — and the one that catches a stale-record poll.
+
+    The record is captured at handshake time, but the sidecar is not a
+    snapshot: `POST /events` appends to `record["messages"]` while the socket
+    is open. A poll loop that re-projects the captured object would relay
+    run_events (read fresh from sqlite) while silently dropping every message
+    the user types in the session — invisible to every test that stops at the
+    replay.
+    """
+    from fastapi.testclient import TestClient
+
+    from mini_ork.web.app import create_app
+    from mini_ork.web.routes.agent_server import _load_conversation, _save_conversation
+
+    home = _ws_home(tmp_path)
+    _seed_conversation(home, "conv-live", "2026-09-03T00:00:00Z")
+
+    with TestClient(create_app(dev_cors=False)) as client:
+        with client.websocket_connect(_ws_url(home, "conv-live")) as ws:
+            assert _recv_json(ws)["key"] == "full_state"
+            assert _recv_json(ws)["id"] == "conv-live-user-0"
+
+            record = _load_conversation(home, "conv-live")
+            assert record is not None
+            record["messages"].append(
+                {"text": "typed while connected", "ts": "2026-09-03T00:00:05Z"}
+            )
+            _save_conversation(home, record)
+
+            live = _recv_json(ws)
+            assert live["id"] == "conv-live-user-1"
+            assert live["source"] == "user"
+            assert live["llm_message"]["content"][0]["text"] == "typed while connected"
+
+
+def test_socket_routes_inbound_messages_to_the_rest_handler(tmp_path: Path) -> None:
+    """`sendMessage` over the socket must not diverge from `POST /events`.
+
+    The canvas only calls REST when the socket is NOT open, so the moment this
+    route started answering, every send took the WebSocket branch. If the
+    receive loop did not hand the frame on, the run would never launch and the
+    user would see nothing — so the forwards are asserted directly rather than
+    through a real launch.
+    """
+    from fastapi.testclient import TestClient
+
+    from mini_ork.web import routes
+    from mini_ork.web.app import create_app
+
+    home = _ws_home(tmp_path)
+    _seed_conversation(home, "conv-fwd", "2026-09-03T00:00:00Z")
+
+    seen: list[object] = []
+    original = routes.sockets.send_conversation_event
+    routes.sockets.send_conversation_event = lambda *args: seen.append(args)
+    try:
+        with TestClient(create_app(dev_cors=False)) as client:
+            with client.websocket_connect(_ws_url(home, "conv-fwd")) as ws:
+                assert _recv_json(ws)["key"] == "full_state"
+                # The canvas's auth handshake is a CONTROL frame, not a
+                # message: forwarding it would 400 and banner the user on
+                # every single connect.
+                ws.send_json({"type": "auth", "session_api_key": "k"})
+                ws.send_json(
+                    {"role": "user", "content": [{"type": "text", "text": "go"}], "run": True}
+                )
+                ws.send_text("not json at all")
+
+                # No ack is emitted for a successful send, so the proof is that
+                # the socket is still healthy afterwards plus the forward count
+                # below — a control frame or a malformed frame would instead
+                # have produced an error frame by now.
+                ws.send_json(
+                    {"role": "user", "content": [{"type": "text", "text": "again"}], "run": True}
+                )
+    finally:
+        routes.sockets.send_conversation_event = original
+
+    assert len(seen) == 2, seen
+    assert [a[1] for a in seen] == ["conv-fwd", "conv-fwd"]
+    assert seen[0][2] == home  # the resolved home, not the query string
+    assert seen[0][0]["content"][0]["text"] == "go"
+
+
+def test_socket_surfaces_an_inbound_failure_as_an_error_frame(tmp_path: Path) -> None:
+    """A refused send must reach the user, not vanish.
+
+    `sendMessage` over the socket is fire-and-forget, so the only channel left
+    is a ConversationErrorEvent — the frame the canvas renders as a banner.
+    Silently dropping it is the "no data looks like success" failure this shim
+    refuses everywhere else.
+    """
+    from fastapi import HTTPException
+    from fastapi.testclient import TestClient
+
+    from mini_ork.web import routes
+    from mini_ork.web.app import create_app
+
+    home = _ws_home(tmp_path)
+    _seed_conversation(home, "conv-fail", "2026-09-03T00:00:00Z")
+
+    def _boom(*args: object) -> None:
+        raise HTTPException(status_code=409, detail="run already finished")
+
+    original = routes.sockets.send_conversation_event
+    routes.sockets.send_conversation_event = _boom
+    try:
+        with TestClient(create_app(dev_cors=False)) as client:
+            with client.websocket_connect(_ws_url(home, "conv-fail")) as ws:
+                assert _recv_json(ws)["key"] == "full_state"
+                assert _recv_json(ws)["id"] == "conv-fail-user-0"  # drain the replay
+                ws.send_json({"role": "user", "content": "hi", "run": True})
+                error = _recv_json(ws)
+    finally:
+        routes.sockets.send_conversation_event = original
+
+    assert error["kind"] == "ConversationErrorEvent"
+    assert error["source"] == "environment"
+    assert error["code"] == "409"
+    assert error["detail"] == "run already finished"
+
+
+def test_socket_unknown_conversation_closes_normally(tmp_path: Path) -> None:
+    """An unknown id closes 1000 so the canvas shows its empty state instead of
+    reconnecting forever against something that will never exist."""
+    import pytest as _pytest
+    from fastapi.testclient import TestClient
+    from starlette.websockets import WebSocketDisconnect
+
+    from mini_ork.web.app import create_app
+
+    home = _ws_home(tmp_path)
+    with TestClient(create_app(dev_cors=False)) as client:
+        with _pytest.raises(WebSocketDisconnect) as excinfo:
+            with client.websocket_connect(_ws_url(home, "conv-absent")) as ws:
+                ws.receive_json()
+    assert excinfo.value.code == 1000
+
+
+def test_bash_events_socket_accepts_and_stays_inert(tmp_path: Path) -> None:
+    """The terminal pairs this with a bash POST the shim does not serve.
+
+    Holding it open keeps the terminal's connection chip honest ("connected, no
+    output") instead of showing an error the user cannot resolve."""
+    from fastapi.testclient import TestClient
+
+    from mini_ork.web.app import create_app
+
+    with TestClient(create_app(dev_cors=False)) as client:
+        with client.websocket_connect("/sockets/bash-events") as ws:
+            # Accepted; an auth frame is drained, and nothing is echoed back.
+            ws.send_json({"type": "auth", "session_api_key": "k"})
+
+
+def _static_home(tmp_path: Path) -> Path:
+    """A stand-in for the built SPA dir (`mini_ork/web/static`).
+
+    It carries the two shapes that matter: `index.html`, which is the catch-all's
+    answer, and a real root-level asset beside it. The locale file is the one the
+    i18n loader actually fetches (`/locales/{{lng}}/{{ns}}.json`, ns=openhands).
+    """
+    static = tmp_path / "static"
+    (static / "locales" / "en").mkdir(parents=True)
+    # `create_app` mounts /assets unconditionally once index.html exists, and
+    # StaticFiles raises at mount time if the directory is missing.
+    (static / "assets").mkdir()
+    (static / "index.html").write_text("<!DOCTYPE html><title>spa</title>")
+    (static / "locales" / "en" / "openhands.json").write_text('{"HELLO": "hello"}')
+    return static
+
+
+def test_spa_fallback_serves_root_level_assets_as_files(tmp_path: Path, monkeypatch) -> None:
+    """A shipped asset must beat the index.html fallback.
+
+    Vite serves `ui/public/` at the dev root; served from here, only `/assets` was
+    mounted, so `/locales/en/openhands.json` came back as index.html with status
+    200. The i18n loader parses that as JSON, fails, and every string in the UI
+    renders as its raw key — while every request still reports success. This is
+    the exact silent-false-success shape the `_NON_SPA_PREFIXES` 404 refuses, so
+    it gets a test rather than a comment."""
+    import json
+
+    from fastapi.testclient import TestClient
+
+    from mini_ork.web import app as app_module
+
+    monkeypatch.setattr(app_module, "STATIC_DIR", _static_home(tmp_path))
+    with TestClient(app_module.create_app(dev_cors=False)) as client:
+        resp = client.get("/locales/en/openhands.json")
+        assert resp.status_code == 200
+        # The assertion that distinguishes asset from fallback: it must parse.
+        assert json.loads(resp.text) == {"HELLO": "hello"}
+
+        # …and a client-side route still gets the SPA shell.
+        fallback = client.get("/conversations/abc-123")
+        assert fallback.status_code == 200
+        assert fallback.text == "<!DOCTYPE html><title>spa</title>"
+
+
+def test_spa_fallback_refuses_to_escape_the_static_dir(tmp_path: Path, monkeypatch) -> None:
+    """`resolve()` before the containment check is load-bearing, not decoration.
+
+    `full_path` is attacker-controlled; without the `is_relative_to` guard a
+    traversal reads any file the server user can read. The percent-encoded form
+    is used because a literal `..` is normalised away client-side before it ever
+    reaches the route."""
+    from fastapi.testclient import TestClient
+
+    from mini_ork.web import app as app_module
+
+    static = _static_home(tmp_path)
+    (tmp_path / "secret.txt").write_text("do-not-serve")
+    monkeypatch.setattr(app_module, "STATIC_DIR", static)
+
+    with TestClient(app_module.create_app(dev_cors=False)) as client:
+        resp = client.get("/%2e%2e%2fsecret.txt")
+        assert "do-not-serve" not in resp.text
+        assert resp.text == "<!DOCTYPE html><title>spa</title>"
+
+
+def _ws_tree(tmp_path: Path, monkeypatch) -> Path:
+    """A throwaway workspace root, pinned via the env lever the routes read.
+
+    `MO_TARGET_CWD` is resolved at call time (not import), which is what makes it
+    patchable here — and is also the honest production reading, since the lever
+    is how an operator says "this is the tree the run writes to".
+    """
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    (tree / "a.txt").write_text("hi\n")
+    monkeypatch.setenv("MO_TARGET_CWD", str(tree))
+    return tree
+
+
+def test_workspace_root_never_widens_to_home(tmp_path: Path, monkeypatch) -> None:
+    """Without the lever the root is the server's CWD, never `Path.home()`.
+
+    Falling back to home would silently expose the operator's whole home
+    directory to the file/git/bash tabs; the CWD is the honest reading of "the
+    tree this server is operating on"."""
+    from mini_ork.web.routes import workspace
+
+    monkeypatch.delenv("MO_TARGET_CWD", raising=False)
+    assert workspace._workspace_root() == Path.cwd().resolve()
+
+
+def test_workspace_paths_are_confined_to_the_root(tmp_path: Path, monkeypatch) -> None:
+    """`resolve()` before the containment check is what makes traversal fail.
+
+    Pattern-matching `..` would be a guess; resolving first is a fact."""
+    from fastapi import HTTPException
+
+    from mini_ork.web.routes import workspace
+
+    root = _ws_tree(tmp_path, monkeypatch).resolve()
+    assert workspace._resolve_within(root, "a.txt") == root / "a.txt"
+    # A path the canvas derived from a real OpenHands sandbox does not exist
+    # here; answering about the root beats 404ing a repo that has changes.
+    assert workspace._resolve_within(root, "workspace/project") == root
+    with pytest.raises(HTTPException) as exc:
+        workspace._resolve_within(root, "../../etc/passwd")
+    assert exc.value.status_code == 400
+
+
+def test_workspace_static_routes_answer_the_canvas_vocabulary(tmp_path: Path, monkeypatch) -> None:
+    """The four non-git routes, pinned on their shapes rather than their truth.
+
+    `sdk_version` deliberately reports the protocol we speak rather than a
+    padded value the shim could not honour; `base_url` is empty because mini-ork
+    serves no fileserver, and a plausible-looking prefix would 404 one hop later."""
+    from fastapi.testclient import TestClient
+
+    from mini_ork.web.app import create_app
+    from mini_ork.web.routes.agent_server import AGENT_SERVER_PROTOCOL_VERSION
+
+    tree = _ws_tree(tmp_path, monkeypatch).resolve()
+    with TestClient(create_app(dev_cors=False)) as client:
+        assert client.get("/api/file/home").json() == {
+            "home": str(tree),
+            "favorites": [],
+            "locations": [],
+        }
+        subdirs = client.get("/api/file/search_subdirs").json()
+        assert subdirs["path"] == "." and subdirs["next_page_id"] is None
+        assert client.post("/api/skills").json() == {"skills": []}
+        sdk = client.get("/api/automation/sdk-version").json()
+        assert sdk["sdk_version"] == AGENT_SERVER_PROTOCOL_VERSION
+
+        session = client.post("/api/auth/workspace-session").json()
+        assert session["served"] is False and session["base_url"] == ""
+        # 204, not 200: the caller awaits the teardown and there is no body.
+        assert client.delete("/api/auth/workspace-session").status_code == 204
+
+
+def test_bash_route_runs_a_command_and_bounds_its_cwd(tmp_path: Path, monkeypatch) -> None:
+    """`execute_bash_command` is the Files tab's file-listing primitive.
+
+    It is deliberately NOT sandboxed — the operator can already run anything via
+    `POST /api/conversations` — but the `cwd` IS confined, and a nonzero exit is
+    a normal result rather than an HTTP error (the canvas renders stderr inline)."""
+    from fastapi.testclient import TestClient
+
+    from mini_ork.web.app import create_app
+
+    _ws_tree(tmp_path, monkeypatch)
+    with TestClient(create_app(dev_cors=False)) as client:
+        ok = client.post(
+            "/api/bash/execute_bash_command", json={"command": "ls"}
+        ).json()
+        assert ok == {"exit_code": 0, "stdout": "a.txt\n", "stderr": ""}
+
+        nonzero = client.post(
+            "/api/bash/execute_bash_command", json={"command": "ls /nope-xyz"}
+        ).json()
+        assert nonzero["exit_code"] != 0 and nonzero["stderr"]
+
+        # An escaping cwd is refused before the shell ever runs.
+        escape = client.post(
+            "/api/bash/execute_bash_command",
+            json={"command": "ls", "cwd": "../../"},
+        )
+        assert escape.status_code == 400
+
+        # A timeout is reported as exit 124 with whatever output arrived, not
+        # as a raised error that would discard the partial output.
+        slow = client.post(
+            "/api/bash/execute_bash_command",
+            json={"command": "sleep 5", "timeout": 1},
+        ).json()
+        assert slow["exit_code"] == 124
+
+        assert client.post("/api/bash/execute_bash_command", json={}).status_code == 400
+
+
+def test_git_routes_project_the_canvas_status_vocabulary(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The git tabs, over a real repository.
+
+    The status values are the agent-server's `UPDATED`/`ADDED`/`DELETED`, not
+    git's letters — the client maps server→client status, so passing git's own
+    letters through would land them in `mapAnyGitStatusToClientStatus` unknown."""
+    import subprocess
+
+    from fastapi.testclient import TestClient
+
+    from mini_ork.web.app import create_app
+
+    tree = _ws_tree(tmp_path, monkeypatch).resolve()
+    env = {
+        "GIT_AUTHOR_NAME": "t",
+        "GIT_AUTHOR_EMAIL": "t@e",
+        "GIT_COMMITTER_NAME": "t",
+        "GIT_COMMITTER_EMAIL": "t@e",
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_CONFIG_SYSTEM": "/dev/null",
+    }
+    run = lambda *a: subprocess.run(  # noqa: E731
+        ["git", "-C", str(tree), *a], check=True, capture_output=True, env={**__import__("os").environ, **env}
+    )
+    run("init", "-q")
+    (tree / "tracked.txt").write_text("one\n")
+    # a.txt comes with the scaffold; commit it too so it is clean and the change
+    # list asserted below is exactly the two states this test is about.
+    run("add", "a.txt", "tracked.txt")
+    run("commit", "-qm", "first")
+    (tree / "tracked.txt").write_text("two\n")
+    (tree / "fresh.txt").write_text("new\n")
+
+    with TestClient(create_app(dev_cors=False)) as client:
+        changes = {c["path"]: c["status"] for c in client.get("/api/git/changes").json()}
+        assert changes == {"tracked.txt": "UPDATED", "fresh.txt": "ADDED"}
+
+        diff = client.get(
+            "/api/git/diff", params={"path": "tracked.txt"}
+        ).json()
+        assert diff["original"] == "one\n" and diff["modified"] == "two\n"
+
+        # A file git has never seen has no HEAD side; empty is the correct
+        # before-image for "this did not exist".
+        assert client.get("/api/git/diff", params={"path": "fresh.txt"}).json()["original"] == ""
+
+        commits = client.get("/api/git/commits").json()
+        assert commits["has_more"] is False
+        assert commits["commits"][0]["subject"] == "first"
+        assert commits["commits"][0]["short_sha"] in commits["commits"][0]["sha"]
+
+        # Snapshot a real commit and keep the wall-clock date out of the assert
+        # (--date=iso-strict is pinned, the value is not).
+        assert commits["commits"][0]["timestamp"].startswith("20")
+
+
+def test_unmatched_write_is_a_404_not_a_405(tmp_path: Path, monkeypatch) -> None:
+    """The canvas reads 404 as "endpoint absent, hide the panel" and 405 as a
+    hard failure it toasts. A GET-only catch-all made every *unimplemented*
+    write the loud one — the exact inversion of what the canvas wants. So an
+    unmatched POST/PUT/DELETE must answer 404 JSON, and a real GET route must
+    still get the SPA shell."""
+    from fastapi.testclient import TestClient
+
+    from mini_ork.web import app as app_module
+
+    monkeypatch.setattr(app_module, "STATIC_DIR", _static_home(tmp_path))
+    with TestClient(app_module.create_app(dev_cors=False)) as client:
+        for method in ("post", "put", "patch", "delete"):
+            resp = client.request(method.upper(), "/api/nothing-here", json={})
+            assert resp.status_code == 404, method
+            assert resp.json() == {"detail": "Not Found"}
+
+        # A non-/api path still falls through to the shell…
+        assert client.get("/some/spa/route").text == "<!DOCTYPE html><title>spa</title>"
+        # …but an unmatched GET under /api/ stays a JSON 404.
+        assert client.get("/api/nothing-here").status_code == 404
+
+
+def test_fileserver_serves_a_file_body_and_404s_a_missing_one(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The Files tab preview reads a file from this route and nothing else.
+
+    `RemoteWorkspace.startWorkspaceSession` discards the session POST's body and
+    builds the URL client-side as `${host}/api/conversations/{id}/workspace/`,
+    so the session route cannot suppress the fetch — serving the path is the
+    only fix. The 404 below is the *missing-file* case, which must stay a 404:
+    falling back to the root's listing would render a folder where a document
+    was asked for."""
+    from fastapi.testclient import TestClient
+
+    from mini_ork.web import app as app_module
+
+    tree = _ws_tree(tmp_path, monkeypatch).resolve()
+    (tree / "sub").mkdir()
+    (tree / "sub" / "note.md").write_text("# hi\n")
+
+    with TestClient(app_module.create_app(dev_cors=False)) as client:
+        body = client.get("/api/conversations/any-id/workspace/a.txt")
+        assert body.status_code == 200 and body.text == "hi\n"
+
+        # A conversation that was never registered reads the same tree — the
+        # workspace is one tree, not a per-conversation sandbox.
+        nested = client.get("/api/conversations/other-id/workspace/sub/note.md")
+        assert nested.status_code == 200
+        assert nested.text == "# hi\n"
+        assert nested.headers["content-type"].startswith("text/markdown")
+
+        # No path at all is the documented "fall back to the server" case.
+        listing = client.get("/api/conversations/any-id/workspace/")
+        assert listing.status_code == 200 and "note.md" not in listing.text
+        assert listing.headers["content-type"].startswith("text/html")
+
+        assert client.get("/api/conversations/any-id/workspace/nope.txt").status_code == 404
+
+        # Confinement applies to the values `_resolve_within` cannot normalise
+        # away for free — the encoded traversal is refused, not served.
+        escape = client.get("/api/conversations/any-id/workspace/%2e%2e%2f%2e%2e%2fetc%2fpasswd")
+        assert escape.status_code in (400, 404)
+        assert "root:" not in escape.text
+
+
+def test_sandbox_working_dir_prefix_is_stripped_for_repo_relative_paths(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The canvas asks for `workspace/project/<rel>`, not `<rel>`.
+
+    `getGitPath` returns the conversation's working dir (`workspace/project` by
+    default) and the diff tab prepends it to a repo-relative path. mini-ork's
+    root *is* the repo, so that prefix is virtual — without stripping it every
+    diff request 400s ('not a file in the workspace') and the panel expands to
+    an empty box."""
+    from fastapi.testclient import TestClient
+
+    from mini_ork.web import app as app_module
+
+    tree = _ws_tree(tmp_path, monkeypatch).resolve()
+    (tree / "pkg").mkdir()
+    (tree / "pkg" / "mod.py").write_text("a\n")
+
+    with TestClient(app_module.create_app(dev_cors=False)) as client:
+        # The prefixed form resolves to the same file as the bare one.
+        assert (
+            client.get("/api/git/diff", params={"path": "workspace/project/pkg/mod.py"}).status_code
+            == 200
+        )
+        assert client.get(
+            "/api/git/diff", params={"path": "workspace/project/pkg/mod.py"}
+        ).json()["modified"] == "a\n"
+
+        # A *real* `workspace/project/` in the tree still wins over the strip.
+        (tree / "workspace" / "project").mkdir(parents=True)
+        (tree / "workspace" / "project" / "real.py").write_text("real\n")
+        assert client.get(
+            "/api/git/diff", params={"path": "workspace/project/real.py"}
+        ).json()["modified"] == "real\n"
+
+        # …and a prefixed path that exists neither way is still a 404, not a
+        # silent fallback to the root.
+        assert client.get(
+            "/api/git/diff", params={"path": "workspace/project/nope.py"}
+        ).status_code == 400
+
+
+def test_api_index_reports_the_real_surface_not_zero(tmp_path: Path, monkeypatch):
+    """`/api` must never answer a well-formed 200 that under-reports the server.
+
+    It enumerated `app.routes`, which FastAPI 0.139 broke: `include_router`
+    appends a lazy `_IncludedRouter` whose `.path` is None, so every mounted
+    router was skipped and the index advertised `endpoint_count: 0` while the
+    server served 100 paths. That is the wrong-200 failure the 404-vs-405
+    catch-all note guards against — a client parses it happily and concludes
+    nothing is implemented. The fix derives the list from the resolved OpenAPI
+    schema; this test pins the property, not the mechanism.
+    """
+    from fastapi.testclient import TestClient
+
+    from mini_ork.web import app as app_module
+
+    monkeypatch.setenv("MO_TARGET_CWD", str(tmp_path))
+    with TestClient(app_module.create_app(dev_cors=False)) as client:
+        body = client.get("/api").json()
+        assert body["endpoint_count"] > 0
+        # The two families are disjoint and together cover the /api surface.
+        assert all(p.startswith("/api/v1/") for p in body["endpoints"])
+        assert body["agent_server_endpoint_count"] > 0
+        assert all(
+            p.startswith("/api/") and not p.startswith("/api/v1")
+            for p in body["agent_server_endpoints"]
+        )
+        # The workspace routes this session added are actually advertised —
+        # the index is only useful if it names what the canvas depends on.
+        assert "/api/bash/execute_bash_command" in body["agent_server_endpoints"]

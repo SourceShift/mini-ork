@@ -256,6 +256,130 @@ def list_agent_profiles() -> list[dict[str, Any]]:
     return []
 
 
+@router.get("/api/profiles")
+def list_profiles() -> dict[str, Any]:
+    """mini-ork's dispatch lanes, projected as LLM profiles.
+
+    Distinct from ``/api/agent-profiles`` above (a different client, and the one
+    the canvas polls during onboarding): this is what ``useLlmConfigured``
+    reads, and in local mode that hook gates the composer on
+    ``profiles.find(p => p.name === active_profile)?.api_key_set``
+    (``ui/src/hooks/use-llm-configured.ts``). An empty list is therefore not a
+    neutral placeholder — it reads as "no LLM configured" and *disables the chat
+    input*, which makes the whole canvas inert.
+
+    So the list is the real thing: one row per lane in mini-ork's provider
+    registry (``providers.yaml``, the authoritative lane config), with
+    ``api_key_set`` from :func:`lane_health` — the framework's own pre-dispatch
+    check, which is precisely a credential-*presence* test ("$X is not set —
+    lane would die silently"). That matches what ``api_key_set`` means on the
+    wire (a key is configured), not a claim that the key still authenticates.
+
+    ``active_profile`` names the lane the operator's agent policy routes to
+    most (``agents.yaml`` ``lanes:``), falling back to the first healthy
+    registry lane when there is no policy. It is display-only — mini-ork picks
+    the lane per recipe *node*, so there is no single active model to switch —
+    but registry order is alphabetical, and naming a lane the policy never
+    dispatches (an ambient lane the operator has taken out of scope) would
+    misdescribe the deployment. A lane with no credential is still listed, with
+    ``api_key_set: false``, because hiding it would be the more misleading
+    option.
+
+    The shape is ``ProfileListResponse``, NOT a bare array. Returning ``[]``
+    reads as *more* complete than the 404 it replaces while being worse: the
+    caller does ``response.profiles.find(...)``, and on an array ``.profiles``
+    is undefined, so the page dies with "Cannot read properties of undefined
+    (reading 'find')" — an empty list that crashes the app. A 404 degrades; a
+    wrong 200 detonates. Get the envelope right or stay silent.
+    """
+    from mini_ork.dispatch.providers import (  # local: keeps app import cheap
+        _load_providers_registry,
+        lane_health,
+    )
+
+    try:
+        registry = _load_providers_registry()
+    except (ValueError, OSError):
+        # A malformed registry is mini-ork's problem, not the canvas's: report
+        # an empty profile list rather than 500 the whole sidebar.
+        return {"profiles": [], "active_profile": None}
+
+    profiles: list[dict[str, Any]] = []
+    healthy_lanes: list[str] = []
+    for name, entry in registry.items():
+        if not isinstance(entry, dict):
+            continue
+        healthy = lane_health(name).ok
+        model = entry.get("model")
+        base_url = entry.get("base_url")
+        profiles.append(
+            {
+                "name": name,
+                "model": model if isinstance(model, str) else None,
+                "base_url": base_url if isinstance(base_url, str) else None,
+                "api_key_set": healthy,
+            }
+        )
+        if healthy:
+            healthy_lanes.append(name)
+
+    return {
+        "profiles": profiles,
+        "active_profile": _policy_lane(healthy_lanes) or (healthy_lanes or [None])[0],
+    }
+
+
+def _policy_lane(healthy_lanes: list[str]) -> str | None:
+    """The healthy lane ``agents.yaml`` routes to most, or None.
+
+    "Most" rather than "first": roles share lanes (four code roles -> minimax),
+    so the mode of the policy is the better proxy for what a run will actually
+    dispatch. Best-effort by design — a missing or unparseable policy is a
+    normal state (there is a committed default), not an error worth failing the
+    profile list over.
+    """
+    if not healthy_lanes:
+        return None
+    try:
+        from mini_ork.steering.decision_service import _load_lanes, resolve_agents_yaml
+
+        lanes = _load_lanes(resolve_agents_yaml())
+    except Exception:  # noqa: BLE001 — policy is advisory here
+        return None
+    counts: dict[str, int] = {}
+    for lane in lanes.values():
+        if lane in healthy_lanes:
+            counts[lane] = counts.get(lane, 0) + 1
+    if not counts:
+        return None
+    return max(counts, key=lambda lane: counts[lane])
+
+
+@router.get("/api/workspaces")
+def list_workspaces() -> dict[str, Any]:
+    """Workspace list. mini-ork runs against ``MO_TARGET_CWD``; there is no
+    per-conversation workspace registry to enumerate, so the canvas gets an
+    empty list rather than a 404 it re-polls on every navigation.
+
+    ``WorkspacesListResponse`` is an object with both keys — see the shape
+    note on ``list_profiles`` for why a bare ``[]`` is not a safe shorthand.
+    """
+    return {"workspaces": [], "workspaceParents": []}
+
+
+@router.post("/api/automation/v1/telemetry/consent")
+def set_telemetry_consent(payload: dict[str, Any]) -> dict[str, Any]:
+    """Record whether the user consented to anonymous usage data.
+
+    The onboarding modal POSTs ``{consent_granted, frontend_distinct_id}`` here
+    and, without a handler, got a 405 from the SPA catch-all — so the preference
+    was never accepted and the modal re-appeared on every page load. We echo the
+    flag straight back: mini-ork sends no telemetry, so the only thing worth
+    doing here is accepting the choice and letting the canvas stop asking.
+    """
+    return {"consent_granted": bool(payload.get("consent_granted"))}
+
+
 # ── Conversation lifecycle (Slice 2 keystone) ─────────────────────────────────
 #
 # The fork's LOCAL backend creates conversations through the SDK's
