@@ -46,6 +46,9 @@ record_wave = _LOOP_STATE.record_wave
 load_state = _LOOP_STATE.load_state
 save_state = _LOOP_STATE.save_state
 should_quarantine = _LOOP_STATE.should_quarantine
+divergence = _LOOP_STATE.divergence
+wave_signature = _LOOP_STATE.wave_signature
+_reason_fingerprint = _LOOP_STATE._reason_fingerprint  # noqa: SLF001 — test seam
 
 
 # ── 1. goal_met on wave 2 ──────────────────────────────────────────────────
@@ -672,3 +675,140 @@ def test_cli_max_waves_flag_reaches_the_driver():
         "--child-recipe", "code-fix", "--max-waves", "0",
     ])
     assert rc == 2
+
+
+# ── 10. per-unit fingerprint progress detection (single-child book loop) ────
+#
+# A loop that attempts ONE unit per wave over N failing units cannot shrink the
+# failing SET until a whole unit lands, so the historical set-only signature
+# read "no progress" the instant the set stopped shrinking and killed the
+# campaign at wave 2. These tests pin the fix: the signature folds each unit's
+# stable failure fingerprint, and both give-up detectors take a patience window.
+
+_W9 = ("ch{n} FAIL status=failed rubric=pending committed=f permfail=f "
+       "degraded=f attempts={a} mdlen=0 err=chapterInternalDagDispatch: "
+       "segment node 'W9_scaffold_sections' did not complete")
+_W15 = ("ch{n} FAIL status=failed rubric=pending committed=f permfail=f "
+        "degraded=f attempts={a} mdlen=0 err=chapterInternalDagDispatch: "
+        "segment node 'W15_fragment_authoring' did not complete")
+_PENDING = ("ch{n} FAIL status=pending rubric=pending committed=f permfail=f "
+            "degraded=f attempts=0 mdlen={m}")
+
+
+def test_reason_fingerprint_strips_volatile_counters():
+    """attempts/mdlen churn is NOT progress; status + failing node IS."""
+    a = _reason_fingerprint(_W9.format(n=1, a=2))
+    b = _reason_fingerprint(_W9.format(n=1, a=6))  # attempts moved 2→6
+    assert a == b == "failed|node:W9_scaffold_sections"
+    # failing node moves → fingerprint changes (real progress).
+    assert _reason_fingerprint(_W15.format(n=1, a=2)) != a
+    # a pending unit fingerprints on status alone, mdlen is dropped.
+    assert (_reason_fingerprint(_PENDING.format(n=2, m=16590))
+            == _reason_fingerprint(_PENDING.format(n=2, m=16591))
+            == "pending|")
+
+
+def test_wave_signature_reasons_distinguish_moved_failure():
+    """Same failing SET but a moved per-unit failure ⇒ different signature."""
+    units = ["1"]
+    at_w9 = {"1": _W9.format(n=1, a=2)}
+    at_w15 = {"1": _W15.format(n=1, a=3)}
+    assert wave_signature(units, at_w9) != wave_signature(units, at_w15)
+    # …and a bare retry-counter tick does NOT change the signature.
+    assert wave_signature(units, at_w9) == wave_signature(units, {"1": _W9.format(n=1, a=9)})
+    # reasons=None reproduces the historical set-only signature byte-for-byte.
+    assert wave_signature(units) == wave_signature(units, None)
+
+
+def test_divergence_patience_window():
+    """no_progress needs ``patience`` identical signatures, not just 2."""
+    state = {"waves": [{"signature": "s", "failing_after": ["1"]} for _ in range(2)]}
+    assert divergence(state, patience=3) is None      # 2 repeats, window is 3
+    state["waves"].append({"signature": "s", "failing_after": ["1"]})
+    assert divergence(state, patience=3) == "no_progress:s"  # 3rd repeat trips
+    # A single change inside the window resets it.
+    state["waves"][-1]["signature"] = "t"
+    assert divergence(state, patience=3) is None
+
+
+def test_record_wave_scopes_hash_to_attempted():
+    """Only the units the wave ATTEMPTED accrue a fix-hash sighting."""
+    state = {"goal_id": "g", "waves": [], "failed_fixes": {}}
+    reasons = {"1": _W9.format(n=1, a=2), "2": _PENDING.format(n=2, m=16590)}
+    for _ in range(2):
+        record_wave(state, wave=1, run_id="r", failing_before=[],
+                    failing_after=["1", "2"], cost_usd=0.0,
+                    reasons=reasons, attempted=["1"])
+    # ch1 attempted twice → 2 hashes; ch2 never attempted → no key at all.
+    assert len(state["failed_fixes"]["1"]) == 2
+    assert "2" not in state["failed_fixes"]
+
+
+def _book_wave_fn(seq):
+    """Build a run_wave_fn that replays a list of (failing_after, reasons, attempted)."""
+    def run_wave(wave_no, quarantined):
+        failing_after, reasons, attempted = seq[wave_no - 1]
+        verdict = "pass" if not failing_after else "fail"
+        return {"verdict": verdict, "failing_after": failing_after,
+                "failing_before": [], "unit_reasons": reasons,
+                "attempted": attempted, "cost_usd": 0.0, "run_id": f"r{wave_no}"}
+    return run_wave
+
+
+def test_book_loop_does_not_diverge_at_wave_two(tmp_path, monkeypatch):
+    """The regression guard: ch1 stuck at W9 for 2 waves must NOT kill the loop
+    when patience is 3 — it used to diverge at wave 2 on the set-only signature."""
+    monkeypatch.setenv("MO_GOAL_DIVERGENCE_PATIENCE", "3")
+    monkeypatch.setenv("MO_GOAL_QUARANTINE_PATIENCE", "3")
+    # 4 waves: ch1 stuck at W9 (attempts churn), then wave 4 lands (pass).
+    seq = [
+        (["1"], {"1": _W9.format(n=1, a=2)}, ["1"]),
+        (["1"], {"1": _W9.format(n=1, a=6)}, ["1"]),  # attempts moved, node same
+        (["1"], {"1": _W15.format(n=1, a=2)}, ["1"]),  # W9→W15: real progress
+        ([], {}, ["1"]),                               # committed → goal_met
+    ]
+    verdict = drive(
+        goal_id="gbook", target_cwd="/tmp", units_cmd="echo u",
+        predicate_cmd="echo ok", child_recipe="code-fix",
+        max_waves=10, budget_total_usd=1000.0,
+        run_wave_fn=_book_wave_fn(seq), cost_fn=lambda: 0.0, state_dir=tmp_path / "s",
+    )
+    assert verdict["stop"] == "goal_met", verdict
+    assert verdict["waves"] == 4
+
+
+def test_book_loop_diverges_when_truly_stuck(tmp_path, monkeypatch):
+    """If the attempted unit NEVER moves off W9, the loop still gives up — after
+    the patience window, not before."""
+    monkeypatch.setenv("MO_GOAL_DIVERGENCE_PATIENCE", "3")
+    monkeypatch.setenv("MO_GOAL_QUARANTINE_PATIENCE", "9")  # keep divergence the trigger
+    seq = [(["1"], {"1": _W9.format(n=1, a=a)}, ["1"]) for a in (2, 6, 2, 6)]
+    verdict = drive(
+        goal_id="gstuck", target_cwd="/tmp", units_cmd="echo u",
+        predicate_cmd="echo ok", child_recipe="code-fix",
+        max_waves=10, budget_total_usd=1000.0,
+        run_wave_fn=_book_wave_fn(seq), cost_fn=lambda: 0.0, state_dir=tmp_path / "s",
+    )
+    assert verdict["stop"] == "diverged", verdict
+    assert verdict["waves"] == 3  # fires at the 3rd identical-fingerprint wave
+    assert verdict["signature"].startswith("no_progress:")
+
+
+def test_pending_units_dont_trip_all_quarantined(tmp_path, monkeypatch):
+    """Chapters that are failing only because the single-child loop never reached
+    them must NOT be quarantined, so ``all_quarantined`` cannot fire on them."""
+    monkeypatch.setenv("MO_GOAL_DIVERGENCE_PATIENCE", "99")  # don't preempt
+    monkeypatch.setenv("MO_GOAL_QUARANTINE_PATIENCE", "2")
+    # ch1 attempted + stuck (→ quarantined), ch2/ch3 pending + never attempted.
+    reasons = {"1": _W9.format(n=1, a=2),
+               "2": _PENDING.format(n=2, m=16590),
+               "3": _PENDING.format(n=3, m=12000)}
+    seq = [(["1", "2", "3"], reasons, ["1"]) for _ in range(4)]
+    verdict = drive(
+        goal_id="gpend", target_cwd="/tmp", units_cmd="echo u",
+        predicate_cmd="echo ok", child_recipe="code-fix",
+        max_waves=4, budget_total_usd=1000.0,
+        run_wave_fn=_book_wave_fn(seq), cost_fn=lambda: 0.0, state_dir=tmp_path / "s",
+    )
+    assert verdict["stop"] == "max_waves_reached", verdict
+    assert verdict["quarantined_units"] == ["1"]  # ONLY the attempted, stuck unit
