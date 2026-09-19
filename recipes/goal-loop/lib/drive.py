@@ -250,6 +250,41 @@ def _default_run_wave_fn(wave_no: int, quarantined: set[str]) -> dict[str, Any]:
             payload.update(json.loads(Path(panel_path).read_text(encoding="utf-8")))
         except json.JSONDecodeError:
             pass
+
+    # Per-unit failure fingerprints (progress signal) from goal-state.json:
+    # a ``unit_id -> reason`` map the driver folds into the wave signature so
+    # a fix that moves a unit's failure counts as progress even before the
+    # failing SET shrinks.
+    gs_path = os.path.join(run_dir, "goal-state.json")
+    if os.path.isfile(gs_path):
+        try:
+            gs = json.loads(Path(gs_path).read_text(encoding="utf-8"))
+            if isinstance(gs, dict):
+                payload["unit_reasons"] = {
+                    str(uid): str(v.get("reason", ""))
+                    for uid, v in gs.items()
+                    if isinstance(v, dict)
+                }
+        except json.JSONDecodeError:
+            pass
+
+    # Which units this wave actually dispatched a fix for (sweep fan-out) —
+    # scopes GRAO quarantine so a still-pending unit the loop never reached
+    # does not accrue identical hashes and trip ``all_quarantined``.
+    sw_path = os.path.join(run_dir, "sweep-result.json")
+    if os.path.isfile(sw_path):
+        try:
+            sw = json.loads(Path(sw_path).read_text(encoding="utf-8"))
+            attempted = [
+                str(u.get("unit_id"))
+                for u in sw.get("units", [])
+                if isinstance(u, dict) and u.get("unit_id") is not None
+            ]
+            if attempted:
+                payload["attempted"] = attempted
+        except json.JSONDecodeError:
+            pass
+
     payload["exit_code"] = proc.returncode
     payload["quarantined"] = sorted(quarantined)
     return payload
@@ -340,6 +375,14 @@ def drive(
     if max_waves <= 0:
         raise ValueError("max_waves must be > 0")
 
+    # Patience windows for the two give-up detectors. Both default to 2 (a
+    # single repeat is terminal — correct for a loop that attempts every
+    # failing unit each wave). A per-unit loop over N units with one fix
+    # attempt per wave sets these higher so the fixer gets several waves to
+    # move a stuck unit before the loop declares divergence / quarantines it.
+    divergence_patience = max(2, _env_int("MO_GOAL_DIVERGENCE_PATIENCE", 2))
+    quarantine_patience = max(2, _env_int("MO_GOAL_QUARANTINE_PATIENCE", 2))
+
     resolved_state_dir = Path(state_dir) if state_dir is not None else Path(_default_state_dir(goal_id))
     resolved_run_wave = run_wave_fn or _default_run_wave_fn
     resolved_cost = cost_fn or _default_cost_fn
@@ -349,10 +392,13 @@ def drive(
     while len(state.get("waves", [])) < max_waves:
         wave_no = len(state.get("waves", [])) + 1
 
-        # GRAO quarantine: skip units whose last 2 fix-hashes are identical.
+        # GRAO quarantine: skip units whose last ``quarantine_patience``
+        # fix-hashes are all identical (fixer produced the same-fingerprint
+        # result that many attempts running).
         quarantined: set[str] = set()
         for unit_id, history in state.get("failed_fixes", {}).items():
-            if len(history) >= 2 and history[-1] == history[-2]:
+            tail = history[-quarantine_patience:]
+            if len(tail) >= quarantine_patience and len(set(tail)) == 1:
                 quarantined.add(unit_id)
 
         # Cheap projection-based budget stop BEFORE we spend on a new wave.
@@ -391,6 +437,22 @@ def drive(
         cost_usd = float(verdict_dict.get("cost_usd", 0.0) or 0.0)
         run_id = str(verdict_dict.get("run_id", "") or "")
 
+        # Per-unit failure fingerprints (goal-state.json) + the units the wave
+        # actually attempted (sweep fan-out) sharpen the give-up detectors so a
+        # single-child-per-wave loop reads real progress, not set churn.
+        raw_reasons = verdict_dict.get("unit_reasons")
+        unit_reasons = (
+            {str(k): str(v) for k, v in raw_reasons.items()}
+            if isinstance(raw_reasons, dict)
+            else None
+        )
+        raw_attempted = verdict_dict.get("attempted")
+        attempted = (
+            [str(u) for u in raw_attempted]
+            if isinstance(raw_attempted, list)
+            else None
+        )
+
         record_wave(
             state,
             wave=wave_no,
@@ -398,6 +460,8 @@ def drive(
             failing_before=failing_before,
             failing_after=failing_after,
             cost_usd=cost_usd,
+            reasons=unit_reasons,
+            attempted=attempted,
         )
 
         # 1. goal_met — wave verdict == "pass".
@@ -440,7 +504,7 @@ def drive(
             return payload
 
         # 3. diverged — UCCI divergence-kill (signature repeat or regressing).
-        div = divergence(state)
+        div = divergence(state, patience=divergence_patience)
         if div is not None:
             payload = {
                 "stop": "diverged",
@@ -476,7 +540,8 @@ def drive(
         "failing_units": final_failing,
         "quarantined_units": sorted(
             u for u, h in state.get("failed_fixes", {}).items()
-            if len(h) >= 2 and h[-1] == h[-2]
+            if len(h[-quarantine_patience:]) >= quarantine_patience
+            and len(set(h[-quarantine_patience:])) == 1
         ),
     }
     save_state(state, resolved_state_dir)

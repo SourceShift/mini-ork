@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -87,16 +88,55 @@ def fix_hash(unit_id: str, failing_reasons: list[str] | None = None) -> str:
     return h.hexdigest()
 
 
-def wave_signature(failing_units: list[str]) -> str:
+def _reason_fingerprint(reason: str) -> str:
+    """Stable per-unit failure fingerprint for progress detection.
+
+    A wave makes no progress on a unit when this fingerprint is unchanged.
+    It KEEPS the signal fields — ``status`` and the failing node / error head —
+    and DROPS the volatile counters (``attempts=``, ``mdlen=``) that churn on
+    every wave without reflecting real movement. So a fix that shifts the
+    failure from ``W9`` to ``W15`` (or clears it) changes the fingerprint =
+    progress, while a bare retry-counter tick does not. Empty/None reason →
+    empty string (an un-detailed unit fingerprints deterministically as "").
+    """
+    if not reason:
+        return ""
+    status = ""
+    m = re.search(r"status=(\S+)", reason)
+    if m:
+        status = m.group(1)
+    err = ""
+    m = re.search(r"err=(.*)$", reason)
+    if m:
+        tail = m.group(1)
+        node = re.search(r"segment node '([^']+)'", tail)
+        err = f"node:{node.group(1)}" if node else tail[:80]
+    return f"{status}|{err}"
+
+
+def wave_signature(
+    failing_units: list[str],
+    reasons: dict[str, str] | None = None,
+) -> str:
     """sha256 of the sorted failing-unit list for the wave.
 
     Identical signatures across consecutive waves means the outer driver
-    fixed nothing; that is the UCCI divergence-kill trigger.
+    fixed nothing; that is the UCCI divergence-kill trigger. When ``reasons``
+    is supplied (a ``unit_id -> reason`` map), each unit's stable failure
+    fingerprint is folded in, so the signature reflects WHETHER EACH UNIT'S
+    FAILURE MOVED, not merely whether the failing SET changed size. This is
+    what keeps a per-unit loop (one attempt per wave over N units) from
+    reading "no progress" the instant the set stops shrinking — the set can
+    only shrink when a whole unit lands, but a fingerprint shift is progress.
+    ``reasons=None`` preserves the historical set-only signature byte-for-byte.
     """
     h = hashlib.sha256()
     for unit in sorted(failing_units):
         h.update(unit.encode("utf-8"))
         h.update(b"\x00")
+        if reasons is not None:
+            h.update(_reason_fingerprint(reasons.get(unit, "")).encode("utf-8"))
+            h.update(b"\x00")
     return h.hexdigest()
 
 
@@ -108,18 +148,28 @@ def record_wave(
     failing_before: list[str],
     failing_after: list[str],
     cost_usd: float,
+    reasons: dict[str, str] | None = None,
+    attempted: list[str] | None = None,
 ) -> State:
-    """Append a wave record + update ``failed_fixes`` for each still-failing unit.
+    """Append a wave record + update ``failed_fixes`` for each attempted unit.
 
     ``failing_before`` is the unit set the wave STARTED trying to fix (i.e. the
     units the wave's hunt selected — quarantined units are excluded).
     ``failing_after`` is what is STILL failing at the end of the wave (the
-    goal_state_eval output). ``failed_fixes[unit_id]`` records the hash for
-    every unit that survived a wave; the same hash appearing on two waves
-    means the same fix attempt was tried twice, which is the GRAO quarantine
-    signal.
+    goal_state_eval output). ``reasons`` is a ``unit_id -> reason`` map
+    (goal-state.json) folded into both the wave signature and each unit's
+    fix-hash so the GRAO/UCCI detectors see per-unit failure fingerprints, not
+    bare unit ids. ``attempted`` names the units the wave actually dispatched a
+    fix for (sweep fan-out); ONLY those accrue a fix-hash sighting, so a unit
+    that is failing merely because it has not been reached yet (e.g. a pending
+    chapter the single-child-per-wave loop never got to) does not accrue
+    identical hashes and cannot spuriously trip ``all_quarantined``.
+
+    Backward-compatible: ``reasons=None`` yields the historical set-only
+    signature and id-only fix-hash; ``attempted=None`` falls back to hashing
+    every still-failing unit (the original test-suite-loop contract).
     """
-    sig = wave_signature(failing_after)
+    sig = wave_signature(failing_after, reasons)
     wave_record = {
         "wave": wave,
         "run_id": run_id,
@@ -128,20 +178,24 @@ def record_wave(
         "cost_usd": float(cost_usd),
         "signature": sig,
     }
+    if attempted is not None:
+        wave_record["attempted"] = sorted(attempted)
     state.setdefault("waves", []).append(wave_record)
 
     failed_fixes: dict[str, list[str]] = state.setdefault("failed_fixes", {})
-    for unit_id in sorted(failing_after):
-        # Hash is keyed on the unit id only — two consecutive waves where
-        # the SAME unit remains in failing_after yields the SAME hash, which
-        # is the GRAO quarantine trigger ("hash already appears twice"). The
-        # kickoff §Goal ¶1 mentions ``sorted failing reasons`` as the second
-        # hash input, but panel-verdict.json (the wave's contract output)
-        # only carries unit ids, not per-unit reasons — the reasons live in
-        # ``goal-state.json`` which the wave does not surface. Unit-id-keyed
-        # hashing is the deterministic stand-in that keeps the quarantine
-        # logic testable without a side channel for reasons.
-        h = fix_hash(unit_id)
+    # A unit accrues a fix-hash sighting only if the wave ATTEMPTED it; when
+    # the caller declares no attempted set we fall back to every still-failing
+    # unit (historical behavior). The hash folds in the unit's failure
+    # fingerprint, so two identical hashes now means "attempted twice, and the
+    # failure did not move" — the true GRAO quarantine signal — rather than
+    # merely "still in the failing set".
+    if attempted is not None:
+        hash_units = sorted(set(attempted) & set(failing_after))
+    else:
+        hash_units = sorted(failing_after)
+    for unit_id in hash_units:
+        fp = _reason_fingerprint(reasons.get(unit_id, "")) if reasons else None
+        h = fix_hash(unit_id, [fp] if fp else None)
         failed_fixes.setdefault(unit_id, []).append(h)
 
     return state
@@ -162,7 +216,7 @@ def should_quarantine(unit_id: str, current_hash: str, state: State) -> bool:
     return same_count >= 2
 
 
-def divergence(state: State) -> str | None:
+def divergence(state: State, patience: int = 2) -> str | None:
     """UCCI divergence-kill trigger.
 
     Returns ``None`` when no divergence has been detected, or a short string
@@ -170,31 +224,38 @@ def divergence(state: State) -> str | None:
     written into ``final-verdict.json`` verbatim for operator debuggability.
 
     Two trigger conditions (per kickoff §Goal ¶1):
-      1. Same failure signature on two consecutive waves → "no_progress".
-      2. ``failing_after > failing_before`` on two consecutive waves →
-         "regressing".
+      1. Same failure signature on ``patience`` consecutive waves →
+         "no_progress".
+      2. Strictly-growing failing count across ``patience`` consecutive waves
+         → "regressing".
+
+    ``patience`` is the number of consecutive waves that must show the pattern
+    before the driver gives up. The historical default of 2 makes a single
+    repeat terminal, which is correct for a loop that attempts every failing
+    unit per wave. A per-unit loop (one fix attempt per wave over many units)
+    needs a larger window so the fixer has room to land a multi-wave fix before
+    the loop declares stagnation; the driver sets it from
+    ``MO_GOAL_DIVERGENCE_PATIENCE``. Values < 2 are clamped to 2.
     """
+    if patience < 2:
+        patience = 2
     waves: list[dict[str, Any]] = state.get("waves", [])
-    if len(waves) < 2:
+    if len(waves) < patience:
         return None
 
-    last_two = waves[-2:]
+    recent = waves[-patience:]
 
-    sigs = [w.get("signature") for w in last_two]
-    if len(sigs) == 2 and sigs[0] == sigs[1] and sigs[0] is not None:
+    sigs = [w.get("signature") for w in recent]
+    if sigs[0] is not None and all(s == sigs[0] for s in sigs):
         return f"no_progress:{sigs[0]}"
 
     def _failing_count(w: dict[str, Any]) -> int:
         return len(w.get("failing_after", []))
 
-    counts = [_failing_count(w) for w in last_two]
-    if len(counts) == 2 and counts[1] > counts[0]:
-        # Two waves in a row of growing failure counts. The kickoff says
-        # "regressing two waves running" — both waves must show growth vs the
-        # previous one. We only have two waves here, so we check whether the
-        # second is larger than the first; if a third wave also grows the
-        # next call (with three waves) will fire again. The kickoff's two-wave
-        # rule applies once we have >= 2 waves to compare.
-        return f"regressing:{counts[0]}->{counts[1]}"
+    counts = [_failing_count(w) for w in recent]
+    # Every step in the window must grow — a strictly-increasing failing count
+    # sustained across ``patience`` waves is the "regressing" signal.
+    if all(counts[i] < counts[i + 1] for i in range(len(counts) - 1)):
+        return f"regressing:{counts[0]}->{counts[-1]}"
 
     return None
