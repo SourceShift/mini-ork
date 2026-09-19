@@ -1642,6 +1642,76 @@ def _write_implementer_summary(run_dir, target, impl_log):
         handle.write("\n")
 
 
+def _review_pathspecs(worktree, files):
+    """Turn declared ``files_changed`` into git pathspecs relative to the repo root.
+
+    ``files_changed`` is recorded ABSOLUTE (the publisher's commit gate and
+    ``_revert_branch`` both consume that shape), but git accepts a pathspec only
+    relative to the repo root — a bare absolute path matches NOTHING and still
+    exits 0. That silent miss produced a 0-byte ``review-diff.patch``, so the
+    reviewer was handed "(no diff)" and passed a run whose edit it never saw.
+    Entries resolving outside the repo (a generated or symlinked directory such as
+    ``baml_client`` pointing at a neighbouring checkout) are dropped: they cannot
+    name a path inside this tree.
+    """
+    if not worktree or not files:
+        return []
+    try:
+        top = subprocess.run(
+            ["git", "-C", worktree, "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True, timeout=15)
+    except Exception:
+        return []
+    if top.returncode != 0 or not top.stdout.strip():
+        return []
+    root = os.path.realpath(top.stdout.strip())
+    specs: list[str] = []
+    for entry in files:
+        raw = str(entry).strip()
+        if not raw or raw.startswith(":"):  # ':' is pathspec magic, not a path
+            continue
+        try:
+            absolute = raw if os.path.isabs(raw) else os.path.join(worktree, raw)
+            # Resolve the PARENT only, never the leaf: a symlinked entry whose own
+            # path is inside the tree stays in the pathspec even though its target
+            # is elsewhere, while an entry that already points outside is dropped.
+            parent = os.path.realpath(os.path.dirname(absolute))
+            candidate = os.path.join(parent, os.path.basename(absolute))
+        except Exception:
+            continue
+        if candidate != root and not candidate.startswith(root + os.sep):
+            continue
+        rel = os.path.relpath(candidate, root)
+        if rel and rel != "." and not rel.startswith(os.pardir) and rel not in specs:
+            specs.append(rel)
+    return specs
+
+
+def _tree_has_no_change(worktree, baseline, specs):
+    """True when git sees neither a tracked delta nor an untracked file.
+
+    Mirrors how ``_write_implementer_summary`` builds ``files_changed`` (tracked
+    diff + untracked list), so a declared change that neither surface can see is a
+    genuine no-op rather than a capture failure. An unreadable git state returns
+    False — never assert a no-op that cannot be proven.
+    """
+    selector = ["--", *specs] if specs else []
+    for argv in (["diff", "--name-only"], ["ls-files", "--others", "--exclude-standard"]):
+        args = ["git", "-C", worktree, *argv]
+        if argv[0] == "diff" and baseline:
+            args.append(baseline)
+        args += selector
+        try:
+            proc = subprocess.run(args, capture_output=True, text=True, timeout=15)
+        except Exception:
+            return False
+        if proc.returncode != 0:
+            return False
+        if any(line.strip() for line in proc.stdout.splitlines()):
+            return False
+    return True
+
+
 def _assemble_reviewer_inputs(run_dir):
     """F2-B (bash _mo_assemble_reviewer_inputs:182-275). Build the reviewer input block:
     implementer-summary.json + verifier_{typecheck,test}.json + a generated
@@ -1665,6 +1735,7 @@ def _assemble_reviewer_inputs(run_dir):
             pass
     if not worktree or not os.path.isdir(worktree):
         worktree = context_env("MO_TARGET_CWD") or os.getcwd()
+    specs = _review_pathspecs(worktree, files)
     diff_path = os.path.join(run_dir, "review-diff.patch")
     # Diff against the pre-implementer baseline (captured at run start by
     # _capture_pre_impl_baseline) so the reviewer sees ONLY the implementer's
@@ -1685,14 +1756,42 @@ def _assemble_reviewer_inputs(run_dir):
             args = ["git", "-C", worktree, "diff", "--no-color"]
             if baseline:
                 args.append(baseline)
-            if files:
-                args += ["--", *files]
+            # Never narrow the delta to nothing: when every declared path resolved
+            # outside the tree there is no pathspec to scope by, and capturing the
+            # whole delta is strictly wider than reporting a silent 0 bytes.
+            if specs:
+                args += ["--", *specs]
             with open(diff_path, "w") as fh:
                 subprocess.run(args, stdout=fh, stderr=subprocess.DEVNULL)
         if not (os.path.isfile(diff_path) and os.path.getsize(diff_path) > 0):
             open(diff_path, "w").close()
     except Exception:
         open(diff_path, "w").close()
+
+    # A declared change the reviewer cannot see is a no-op, not an abstention.
+    # Left alone the reviewer falls through to the ambient worktree state and
+    # passes on work this run never did — observed live: a code-fix child reported
+    # pass while the tree stayed at its pre-run commit. Recorded as a run-local
+    # marker so the reviewer node can block deterministically, before any spend,
+    # instead of asking the model to notice an absence.
+    no_op = False
+    if files and not (os.path.isfile(diff_path) and os.path.getsize(diff_path) > 0):
+        no_op = _tree_has_no_change(worktree, baseline, specs)
+    try:
+        if no_op:
+            with open(os.path.join(run_dir, "review-diff-noop.json"), "w",
+                      encoding="utf-8") as handle:
+                json.dump({
+                    "status": "no_op",
+                    "worktree": worktree,
+                    "declared_files": files,
+                    "pathspecs": specs,
+                    "reason": ("implementer declared files_changed but the tree "
+                               "differs from the pre-implementer baseline in none of them"),
+                }, handle, indent=2)
+                handle.write("\n")
+    except OSError:
+        pass
 
     def _sec(title, path):
         if os.path.isfile(path) and os.path.getsize(path) > 0:
@@ -1734,13 +1833,19 @@ def _assemble_reviewer_inputs(run_dir):
         from mini_ork.context_assembler import cap_block
         block += (f"\n# review-diff.patch\n"
                   f"{cap_block(open(diff_path, encoding='utf-8', errors='replace').read(), label='review-diff.patch')}\n")
+    elif no_op:
+        block += ("\n# review-diff.patch\n(no diff — the implementer declared changes but the "
+                  "tree differs from the pre-implementer baseline in none of them; see "
+                  "review-diff-noop.json)\n")
     else:
         block += "\n# review-diff.patch\n(no diff)\n"
     block += ("\n--- End reviewer inputs ---\n\n"
               "REVIEWER NOTE: The assembled inputs above are required for a real verdict. If any "
               "input is marked '(not available)' or '(no diff)', review what IS present. Only "
               "hard-abstain (verdict=needs_revision with reason 'inputs missing') when BOTH the "
-              "diff and the summary are absent — that is the only genuine no-op case. A missing "
+              "diff and the summary are absent — that is the only genuine no-op case. An empty "
+              "diff against declared files_changed is NOT that case: the implementer claimed work "
+              "the tree does not contain, which is a real failure, never a pass. A missing "
               "verifier verdict is a real failure signal, not an abstention excuse.\n")
     return block
 

@@ -706,6 +706,15 @@ def _handle_reviewer(ctx: NodeDispatch):
                   f"Write your synthesis to: {review_file}")
     else:
         reviewer_inputs = _assemble_reviewer_inputs(ctx.run_dir_eff)
+        # Deterministic no-op rejection. The implementer declared changes and the
+        # tree contains none; dispatching the model here is exactly how a no-op run
+        # earned a "pass" (the reviewer read ambient worktree state as if it were
+        # this run's output). Block before the spend, not after the verdict.
+        if os.path.isfile(os.path.join(ctx.run_dir_eff or "", "review-diff-noop.json")):
+            print("  [fail] reviewer: implementer declared changes but produced no diff "
+                  "(review-diff-noop.json)", file=sys.stderr)
+            ctx.trace(ctx.node_id, "failure", "reviewer", "", "no_op", "no_op")
+            return 1, "no_op"
         prompt = (f"{ctx.prepend()}Review the implementation for: {ctx.node_desc}{ctx.learned}\n\n"
                   f"Plan:\n{ctx.plan_content}{ctx.artifact_context}{ctx.scope_guard()}\n\n{reviewer_inputs}\n"
                   'Respond with JSON: {"verdict": "pass|fail|needs_revision", "notes": []}')
@@ -807,7 +816,13 @@ def _handle_verifier(ctx: NodeDispatch):
         artifact = outs[0] if outs else ""
     except Exception:
         artifact = ""
-    if not artifact:
+    if not artifact and not (ctx.verifier_ref and ctx.recipe_dir):
+        # A declared verifier_ref (e.g. verifiers/schema.sh) is a deterministic
+        # gate that resolves its own paths from MINI_ORK_RUN_DIR and produces the
+        # run-local artifact itself; it MUST run even when artifact_contract
+        # .outputs is [] (recipes like verified-artifact leave outputs empty and
+        # let the script emit verified-artifact.json). Only short-circuit to
+        # vacuous success when there is ALSO no verifier script to run.
         # NEW-1: bash (:2899-2902) warns + sets error finish_reason but does NOT
         # return 1 — a verifier node with no artifact_contract outputs does not
         # fail the run. Return rc 0 to match.

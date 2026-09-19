@@ -423,14 +423,24 @@ class SpawnResult:
         exit_code: 0 on success, 2 on validation failure, child exit code otherwise.
         spawn_id: Generated spawn id from mo_recursive_approve_spawn.
         child_exit_code: Set when the execute step ran; None for --no-execute.
+        child_run_id: The child's run id — the key that locates every child
+            artifact. Callers that only read ``lines`` had to re-parse it out of
+            stdout, and one (the goal-loop driver) never did, so each sweep entry
+            recorded ``child_run_id=None`` and a failed child left nothing the
+            outer loop could read.
+        child_run_dir: ``<home>/runs/<child_run_id>`` — where the child's
+            verdict.json / review-diff.patch / spawn-child.log land.
     """
 
     def __init__(self, lines: list[str], exit_code: int, spawn_id: str = "",
-                 child_exit_code: int | None = None) -> None:
+                 child_exit_code: int | None = None, child_run_id: str = "",
+                 child_run_dir: str = "") -> None:
         self.lines = lines
         self.exit_code = exit_code
         self.spawn_id = spawn_id
         self.child_exit_code = child_exit_code
+        self.child_run_id = child_run_id
+        self.child_run_dir = child_run_dir
 
 
 def _persist_child_log(home: str, child_run_id: str,
@@ -554,7 +564,9 @@ def spawn(
 
     if int(no_execute):
         lines.append("spawn_status=approved")
-        return SpawnResult(lines=lines, exit_code=0, spawn_id=spawn_id)
+        return SpawnResult(lines=lines, exit_code=0, spawn_id=spawn_id,
+                           child_run_id=child_run_id,
+                           child_run_dir=os.path.join(resolved_home, "runs", child_run_id))
 
     ro.mo_recursive_mark_spawn(child_run_id, "running")
     ro.mo_recursive_emit_event(
@@ -620,7 +632,8 @@ def spawn(
         lines.append("spawn_status=failed")
 
     return SpawnResult(lines=lines, exit_code=child_exit, spawn_id=spawn_id,
-                       child_exit_code=child_exit)
+                       child_exit_code=child_exit, child_run_id=child_run_id,
+                       child_run_dir=os.path.join(resolved_home, "runs", child_run_id))
 
 
 def main(argv: list[str] | None = None) -> int:
