@@ -150,6 +150,7 @@ def record_wave(
     cost_usd: float,
     reasons: dict[str, str] | None = None,
     attempted: list[str] | None = None,
+    diagnostics: dict[str, Any] | None = None,
 ) -> State:
     """Append a wave record + update ``failed_fixes`` for each attempted unit.
 
@@ -168,6 +169,8 @@ def record_wave(
     Backward-compatible: ``reasons=None`` yields the historical set-only
     signature and id-only fix-hash; ``attempted=None`` falls back to hashing
     every still-failing unit (the original test-suite-loop contract).
+    ``diagnostics`` carries the wave's evidence fingerprints and the child's
+    self-verdict; callers without them omit it.
     """
     sig = wave_signature(failing_after, reasons)
     wave_record = {
@@ -180,6 +183,19 @@ def record_wave(
     }
     if attempted is not None:
         wave_record["attempted"] = sorted(attempted)
+    if diagnostics is not None:
+        prev_waves = state.get("waves", [])
+        prev_sig = prev_waves[-1].get("signature") if prev_waves else None
+        wave_record["headroom_closed"] = len(failing_before) - len(failing_after)
+        wave_record["predicate_moved"] = None if prev_sig is None else (sig != prev_sig)
+        evidence = diagnostics.get("evidence")
+        if evidence:
+            wave_record["evidence"] = {str(k): str(v) for k, v in sorted(evidence.items())}
+        child_diagnostics = diagnostics.get("child_diagnostics")
+        if child_diagnostics:
+            wave_record["child_diagnostics"] = {
+                str(k): dict(v) for k, v in sorted(child_diagnostics.items())
+            }
     state.setdefault("waves", []).append(wave_record)
 
     failed_fixes: dict[str, list[str]] = state.setdefault("failed_fixes", {})
@@ -216,7 +232,7 @@ def should_quarantine(unit_id: str, current_hash: str, state: State) -> bool:
     return same_count >= 2
 
 
-def divergence(state: State, patience: int = 2) -> str | None:
+def divergence(state: State, patience: int = 2, rdisc: bool = True) -> str | None:
     """UCCI divergence-kill trigger.
 
     Returns ``None`` when no divergence has been detected, or a short string
@@ -228,6 +244,11 @@ def divergence(state: State, patience: int = 2) -> str | None:
          "no_progress".
       2. Strictly-growing failing count across ``patience`` consecutive waves
          → "regressing".
+
+    With ``rdisc=True`` (default) the two reward-discrimination detectors run
+    first and may short-circuit with an ``uninformative_evidence:<sha8>`` or
+    ``mirage:<unit>:<bytes>`` reason; ``rdisc=False`` reproduces the historical
+    behavior byte-for-byte.
 
     ``patience`` is the number of consecutive waves that must show the pattern
     before the driver gives up. The historical default of 2 makes a single
@@ -242,6 +263,12 @@ def divergence(state: State, patience: int = 2) -> str | None:
     waves: list[dict[str, Any]] = state.get("waves", [])
     if len(waves) < patience:
         return None
+
+    if rdisc:
+        for detector in (self_verdict_mirage, evidence_informativeness):
+            hit = detector(state, patience)
+            if hit is not None:
+                return hit
 
     recent = waves[-patience:]
 
@@ -259,3 +286,68 @@ def divergence(state: State, patience: int = 2) -> str | None:
         return f"regressing:{counts[0]}->{counts[-1]}"
 
     return None
+
+
+def evidence_informativeness(state: State, patience: int = 2) -> str | None:
+    """r_disc: did the evidence this loop fed actually move the predicate?
+
+    Fires ``uninformative_evidence:<sha8>`` when ``patience`` consecutive waves
+    were handed the IDENTICAL per-unit evidence bundle AND the wave signature
+    never moved across them. That pair means the evidence is not touching the
+    cause — the loop must change what it LOOKS AT, not what the child patches.
+    """
+    waves = state.get("waves", [])
+    if len(waves) < patience:
+        return None
+    recent = waves[-patience:]
+    bundles = [w.get("evidence") or {} for w in recent]
+    if any(not b for b in bundles):
+        return None
+    if any(b != bundles[0] for b in bundles):
+        return None
+    sigs = [w.get("signature") for w in recent]
+    if len(set(sigs)) != 1:
+        return None
+    first = sorted(bundles[0].values())[0]
+    return f"uninformative_evidence:{first[:8]}"
+
+
+def self_verdict_mirage(state: State, patience: int = 2) -> str | None:
+    """The child's own "pass" while the predicate stands still.
+
+    Fires ``mirage:<unit>:<bytes>`` when ``patience`` consecutive waves all
+    report ``child_verdict == "pass"``, the signature never moved, and the
+    patch is the same size every time (or was a no-op). A self-verdict gate
+    that accepts the identical non-fix forever is the accept-all degeneration.
+    """
+    waves = state.get("waves", [])
+    if len(waves) < patience:
+        return None
+    recent = waves[-patience:]
+    sigs = [w.get("signature") for w in recent]
+    if len(set(sigs)) != 1:
+        return None
+    for w in recent:
+        cd = w.get("child_diagnostics") or {}
+        if not cd:
+            return None
+        if {(v or {}).get("child_verdict") for v in cd.values()} != {"pass"}:
+            return None
+    last = recent[-1].get("child_diagnostics") or {}
+    unit = sorted(last)[0]
+    entry = last.get(unit) or {}
+    no_op = any(
+        (v or {}).get("child_no_op")
+        for w in recent
+        for v in (w.get("child_diagnostics") or {}).values()
+    )
+    sizes = [
+        tuple(sorted(
+            str((v or {}).get("review_diff_bytes"))
+            for v in (w.get("child_diagnostics") or {}).values()
+        ))
+        for w in recent
+    ]
+    if not no_op and len(set(sizes)) != 1:
+        return None
+    return f"mirage:{unit}:{entry.get('review_diff_bytes')}"

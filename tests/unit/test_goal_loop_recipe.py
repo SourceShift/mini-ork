@@ -66,6 +66,8 @@ _tspec.loader.exec_module(_tmod)
 run_apply = _tmod._run_apply
 harvest_selected_evidence = _tmod._harvest_selected_evidence
 evidence_slug = _tmod._slug
+evidence_sha = _tmod._evidence_sha
+render_wave_history_block = _tmod._render_wave_history_block
 select_units = _tmod._select_units
 unit_sort_key = _tmod._unit_sort_key
 
@@ -735,6 +737,10 @@ def _arm_evidence(monkeypatch, tmp_path, body: str) -> None:
     script = _evidence_script(tmp_path, body)
     monkeypatch.setenv("MO_GOAL_EVIDENCE_CMD", str(script))
     monkeypatch.setenv("MO_GOAL_TARGET_CWD", str(tmp_path))
+    # The driver leaks MO_GOAL_WAVE_HISTORY into the process env on every wave;
+    # clear the meta^n channel so an armed harvest test reads a clean env.
+    monkeypatch.delenv("MO_GOAL_WAVE_HISTORY", raising=False)
+    monkeypatch.delenv("MO_GOAL_EVIDENCE_UNINFORMATIVE", raising=False)
 
 
 def test_harvest_selected_evidence_unset_cmd_is_empty(monkeypatch):
@@ -795,3 +801,65 @@ def test_harvest_selected_evidence_no_run_dir_has_text_empty_path(tmp_path, monk
     out = harvest_selected_evidence(["2"], goal_state)
     assert out["2"]["text"] == "inline only for 2"
     assert out["2"]["path"] == ""
+
+
+# ── 7. diagnostic policy: evidence_sha + prior-waves history block ────────
+# goal_sweep_plan delegates to two ledger-free seams pinned directly here:
+# _evidence_sha (the per-entry sweep-plan fingerprint) and the MO_GOAL_WAVE_HISTORY
+# block _harvest_selected_evidence appends to the evidence text BEFORE it is
+# fingerprinted. The @register_transform wrapper itself is exercised end-to-end
+# by test_workflow_compiles_with_six_edge_chain above.
+
+
+def test_evidence_sha_is_stable_and_empty_for_blank():
+    assert evidence_sha("") == ""
+    digest = evidence_sha("deep evidence for ch1")
+    assert len(digest) == 64  # sha256 hex
+    assert digest == evidence_sha("deep evidence for ch1")  # deterministic
+    assert digest != evidence_sha("deep evidence for ch2")
+
+
+def test_render_wave_history_block_empty_on_absent_or_garbage(monkeypatch):
+    monkeypatch.delenv("MO_GOAL_WAVE_HISTORY", raising=False)
+    assert render_wave_history_block("") == ""
+    assert render_wave_history_block("not json") == ""
+    assert render_wave_history_block("[]") == ""      # empty list → no block
+    assert render_wave_history_block('{"a": 1}') == ""  # not a list → no block
+
+
+def test_harvest_selected_evidence_appends_history_block_when_set(tmp_path, monkeypatch):
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    monkeypatch.setenv("MINI_ORK_RUN_DIR", str(run_dir))
+    _arm_evidence(monkeypatch, tmp_path, 'echo "deep evidence for $1"\n')
+    monkeypatch.setenv("MO_GOAL_WAVE_HISTORY", json.dumps([
+        {"wave": 1, "attempted": ["1"], "child_verdict": ["pass"],
+         "review_diff_bytes": [8313], "headroom_closed": 0, "predicate_moved": False},
+    ]))
+
+    goal_state = {"1": {"pass": False, "reason": "ch1 FAIL status=failed"}}
+    out = harvest_selected_evidence(["1"], goal_state)
+
+    assert "### Prior waves" in out["1"]["text"]
+    assert "do NOT repeat these" in out["1"]["text"]
+    # the appended block changes the fingerprint goal_sweep_plan will emit.
+    assert evidence_sha(out["1"]["text"]) != evidence_sha("deep evidence for 1")
+    ev_file = run_dir / "evidence" / "1.md"
+    assert ev_file.read_text(encoding="utf-8").strip() == out["1"]["text"].strip()
+
+
+def test_harvest_selected_evidence_unset_history_is_byte_identical(tmp_path, monkeypatch):
+    """MO_GOAL_WAVE_HISTORY unset ⇒ the evidence file is byte-identical to today."""
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    monkeypatch.setenv("MINI_ORK_RUN_DIR", str(run_dir))
+    _arm_evidence(monkeypatch, tmp_path, 'echo "deep evidence for $1"\n')
+    monkeypatch.delenv("MO_GOAL_WAVE_HISTORY", raising=False)
+    monkeypatch.delenv("MO_GOAL_EVIDENCE_UNINFORMATIVE", raising=False)
+
+    goal_state = {"1": {"pass": False, "reason": "ch1 FAIL status=failed"}}
+    out = harvest_selected_evidence(["1"], goal_state)
+
+    assert out["1"]["text"] == "deep evidence for 1"
+    assert "### Prior waves" not in out["1"]["text"]
+    assert evidence_sha(out["1"]["text"]) == evidence_sha("deep evidence for 1")

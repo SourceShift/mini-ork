@@ -49,6 +49,8 @@ save_state = _LOOP_STATE.save_state
 should_quarantine = _LOOP_STATE.should_quarantine
 divergence = _LOOP_STATE.divergence
 wave_signature = _LOOP_STATE.wave_signature
+evidence_informativeness = _LOOP_STATE.evidence_informativeness
+self_verdict_mirage = _LOOP_STATE.self_verdict_mirage
 _reason_fingerprint = _LOOP_STATE._reason_fingerprint  # noqa: SLF001 — test seam
 _default_run_wave_fn = _DRIVE._default_run_wave_fn  # noqa: SLF001 — test seam
 
@@ -1133,3 +1135,116 @@ def test_autoraise_stops_at_cap_even_when_progress_predicted(tmp_path, monkeypat
     assert verdict["stop"] == "budget_autoraise", verdict
     assert verdict["reason"].startswith("cap_reached:"), verdict
     assert os.environ["MO_DAILY_BUDGET_USD"] == "10"  # never lifted past the cap
+
+
+# ── 18. diagnostic policy: record what the wave looked at (S1–S4) ──────────
+# The loop used to throw away the child's self-verdict and the evidence bundle
+# it handed each wave, so a self-approved no-change wave was indistinguishable
+# from real work. These tests pin the additive record_wave contract, the two new
+# reward-discrimination detectors, and the through-driver mirage stop.
+
+
+def test_record_wave_without_diagnostics_keeps_todays_key_set():
+    """diagnostics=None must yield a record byte-identical to today's."""
+    state = {"goal_id": "g", "waves": [], "failed_fixes": {}}
+    record_wave(state, wave=1, run_id="r", failing_before=["1"], failing_after=["1"],
+                cost_usd=0.0, attempted=["1"])
+    keys = set(state["waves"][0].keys())
+    assert keys == {"wave", "run_id", "failing_before", "failing_after",
+                    "cost_usd", "signature", "attempted"}, keys
+
+
+def test_record_wave_with_diagnostics_records_new_keys():
+    """diagnostics= records evidence, child_diagnostics, headroom_closed,
+    predicate_moved — and never mutates the signature."""
+    state = {"goal_id": "g", "waves": [], "failed_fixes": {}}
+    record_wave(state, wave=1, run_id="r", failing_before=["1", "2"],
+                failing_after=["1"], cost_usd=0.0, attempted=["1"],
+                diagnostics={
+                    "evidence": {"1": "evidence-bundle"},
+                    "child_diagnostics": {"1": {"child_verdict": "pass",
+                                                "review_diff_bytes": 8313,
+                                                "child_no_op": True}},
+                })
+    w = state["waves"][0]
+    assert w["evidence"] == {"1": "evidence-bundle"}
+    assert w["child_diagnostics"] == {"1": {"child_verdict": "pass",
+                                            "review_diff_bytes": 8313,
+                                            "child_no_op": True}}
+    assert w["headroom_closed"] == 1  # 2 before - 1 after
+    assert w["predicate_moved"] is None  # no prior wave to compare against
+
+
+def test_evidence_informativeness_fires_on_identical_stale_bundle():
+    state = {"waves": [
+        {"signature": "s", "evidence": {"1": "deadbeef1234"}},
+        {"signature": "s", "evidence": {"1": "deadbeef1234"}},
+    ]}
+    assert evidence_informativeness(state, patience=2) == "uninformative_evidence:deadbeef"
+
+
+def test_self_verdict_mirage_fires_on_pass_with_stale_signature():
+    state = {"waves": [
+        {"signature": "s", "child_diagnostics": {"1": {"child_verdict": "pass",
+                                                       "review_diff_bytes": 8313}}},
+        {"signature": "s", "child_diagnostics": {"1": {"child_verdict": "pass",
+                                                       "review_diff_bytes": 8313}}},
+    ]}
+    assert self_verdict_mirage(state, patience=2) == "mirage:1:8313"
+
+
+def test_moved_signature_suppresses_both_detectors():
+    state = {"waves": [
+        {"signature": "s1", "evidence": {"1": "aaaa"},
+         "child_diagnostics": {"1": {"child_verdict": "pass", "review_diff_bytes": 10}}},
+        {"signature": "s2", "evidence": {"1": "aaaa"},
+         "child_diagnostics": {"1": {"child_verdict": "pass", "review_diff_bytes": 10}}},
+    ]}
+    assert evidence_informativeness(state, patience=2) is None
+    assert self_verdict_mirage(state, patience=2) is None
+
+
+def test_divergence_rdisc_false_ignores_new_detectors():
+    """rdisc=False must reproduce the historical no_progress result — the new
+    detectors are consulted only when rdisc is True."""
+    state = {"waves": [
+        {"signature": "s", "evidence": {"1": "aaaa"},
+         "child_diagnostics": {"1": {"child_verdict": "pass", "review_diff_bytes": 10}}},
+        {"signature": "s", "evidence": {"1": "aaaa"},
+         "child_diagnostics": {"1": {"child_verdict": "pass", "review_diff_bytes": 10}}},
+    ]}
+    assert divergence(state, patience=2, rdisc=True) == "mirage:1:10"
+    assert divergence(state, patience=2, rdisc=False) == "no_progress:s"
+
+
+def test_driver_diverges_on_mirage_signature(tmp_path, monkeypatch):
+    """A run_wave_fn returning the same evidence + a child self-verdict of
+    'pass' twice drives final-verdict.json to stop == diverged with the mirage
+    signature string."""
+    monkeypatch.setenv("MO_GOAL_DIVERGENCE_PATIENCE", "2")
+    monkeypatch.setenv("MO_GOAL_QUARANTINE_PATIENCE", "99")
+
+    def run_wave(wave_no, quarantined):
+        return {
+            "verdict": "fail",
+            "failing_before": ["1"],
+            "failing_after": ["1"],
+            "cost_usd": 0.0,
+            "run_id": f"r{wave_no}",
+            "evidence": {"1": "stale-evidence"},
+            "child_diagnostics": {"1": {"child_verdict": "pass",
+                                        "review_diff_bytes": 8313}},
+        }
+
+    verdict = drive(
+        goal_id="gmirage", target_cwd="/tmp", units_cmd="echo u",
+        predicate_cmd="echo ok", child_recipe="code-fix",
+        max_waves=10, budget_total_usd=1000.0,
+        run_wave_fn=run_wave, cost_fn=lambda: 0.0, state_dir=tmp_path / "s",
+    )
+
+    assert verdict["stop"] == "diverged", verdict
+    assert verdict["signature"].startswith("mirage:"), verdict
+    final = json.loads((tmp_path / "s" / "final-verdict.json").read_text())
+    assert final["stop"] == "diverged"
+    assert final["signature"].startswith("mirage:")
