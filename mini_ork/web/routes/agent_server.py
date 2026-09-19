@@ -22,10 +22,18 @@ form schemas, and lists agent profiles. Those are implemented here too.
 Conversations ARE wired to real mini-ork runs — create, event history,
 sendMessage — but the live WebSocket (`/ws`) is NOT implemented: the canvas
 degrades to REST (history via `/events/search`, sends via POST `/events`,
-its documented fallback when the socket is not OPEN). Endpoints here are
-unauthenticated on purpose: the canvas runs in local
-mode (`isAuthRequired()` false) where any session key is accepted, matching the
-real agent-server's local posture.
+its documented fallback when the socket is not OPEN).
+
+These routes are deliberately TOKENLESS: the canvas runs in local mode
+(`isAuthRequired()` false) where any session key is accepted, matching the real
+agent-server's local posture — and the bearer-token substrate
+(`web/auth.py::require_token`) is fail-closed, so applying it here would 401
+every canvas call on a home with no `auth-tokens.txt`. The boundary is drawn by
+:func:`require_local_caller` instead, which is what actually distinguishes the
+local case: the routes are reachable from this machine only, on the loopback
+bind, and a *browser page from anywhere else* is refused before the
+side-effecting handler runs. See that function for why Origin beats a token
+against the threat that exists here.
 
 Onboarding write-path (all against the configured host, via the SDK):
 
@@ -44,14 +52,16 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 import uuid
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi.responses import JSONResponse
 
-from ..deps import get_home
+from ..deps import get_home, get_home_lenient
 
 # The agent-server wire version this fork was cut against
 # (ui/config/defaults.json → versions.agentServer). Must stay a 3-part semver
@@ -90,6 +100,46 @@ _EMPTY_SETTINGS_SCHEMA: dict[str, Any] = {
 
 def _uptime_seconds() -> float:
     return round(time.monotonic() - _START_MONOTONIC, 3)
+
+
+#: Opt-out for a deliberately-exposed deployment (`mini-ork serve --host 0.0.0.0`).
+#: Set to 1/true/yes to drop the cross-origin refusal below.
+ALLOW_REMOTE_ENV = "MO_AGENT_SERVER_ALLOW_REMOTE"
+
+#: An Origin a browser served FROM THIS MACHINE would send. Deliberately does not
+#: include the literal "null": CORS tolerates it for Electron `file://` renderers,
+#: but any sandboxed iframe or `data:` URL also manufactures it, so it cannot be
+#: evidence of trustworthiness on a route that launches a billable run.
+_LOCAL_ORIGIN_RE = re.compile(r"^https?://(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$")
+
+
+def require_local_caller(request: Request) -> None:
+    """Refuse a browser request whose page was not served from this machine.
+
+    The shim is tokenless by design (see the module note), so the live threat on
+    these routes is not a remote client — it is the browser the operator already
+    has open. A page on any site can POST here, and a cross-origin ``text/plain``
+    POST is a CORS *simple request*: the preflight is skipped, so the side effect
+    LANDS even though the attacker cannot read the response. Since
+    ``POST /api/conversations`` launches a real, billable mini-ork run, a
+    CSRF-shaped lever on it is worth closing.
+
+    Origin is the correct control here rather than a token. Browsers send it on
+    every cross-origin POST (including ``no-cors``), so a foreign page cannot
+    suppress it, while a non-browser caller — the SDK, curl, a test's TestClient —
+    sends none and is admitted unhindered. A token would buy nothing against this
+    threat class anyway: the attacker is the operator's own browser, and any
+    process on this machine could read the token file.
+
+    Explicitly NOT covered: a hostile *local* process. Defending that needs OS
+    isolation, not an HTTP header; the loopback default bind (``cli/serve.py``)
+    is what keeps that population small.
+    """
+    if os.environ.get(ALLOW_REMOTE_ENV, "").strip().lower() in ("1", "true", "yes"):
+        return
+    origin = request.headers.get("origin")
+    if origin and not _LOCAL_ORIGIN_RE.match(origin):
+        raise HTTPException(status_code=403, detail="cross-origin request refused")
 
 
 def _deep_merge(base: dict[str, Any], diff: dict[str, Any]) -> dict[str, Any]:
@@ -263,6 +313,29 @@ def _save_conversation(home: Path, record: dict[str, Any]) -> None:
         json.dump(record, fh, indent=2)
 
 
+def _conversation_records(home: Path) -> list[dict[str, Any]]:
+    """Every registry record under ``<home>/conversations``.
+
+    Unreadable or malformed sidecars are SKIPPED rather than raising: this backs
+    the canvas's sidebar, and one truncated file (a kill mid-write) must not take
+    the whole list down with it. A record without an ``id`` is unusable as a
+    ConversationInfo, so it does not count either.
+    """
+    directory = _conversations_dir(home)
+    if not directory.is_dir():
+        return []
+    records: list[dict[str, Any]] = []
+    for path in sorted(directory.glob("*.json")):
+        try:
+            with open(path, encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (OSError, ValueError):
+            continue
+        if isinstance(data, dict) and data.get("id"):
+            records.append(data)
+    return records
+
+
 def _flatten_message(message: Any) -> str:
     """Flatten the SDK's message shape ({role, content[]}) to plain text.
 
@@ -316,7 +389,7 @@ def _conversation_info(record: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-@router.post("/api/conversations")
+@router.post("/api/conversations", dependencies=[Depends(require_local_caller)])
 def create_conversation(
     payload: dict[str, Any], home=Depends(get_home)
 ) -> dict[str, Any]:
@@ -379,6 +452,104 @@ def create_conversation(
 
     _save_conversation(home, record)
     return _conversation_info(record)
+
+
+# ── Conversation list / batch-get (Slice 4) ───────────────────────────────────
+#
+# The canvas's sidebar hydrates from three calls (SDK ConversationClient):
+#
+#     GET /api/conversations/search?limit&page_id&sort_order  → {items, next_page_id}
+#     GET /api/conversations/count                            → int
+#     GET /api/conversations?ids=a&ids=b                      → [ConversationInfo|null]
+#
+# REGISTRATION ORDER IS LOAD-BEARING: `/search` and `/count` are literal
+# segments that also match the `/api/conversations/{conversation_id}` pattern
+# below, and FastAPI resolves in registration order — so both are declared
+# BEFORE it. Registered after, `/search` would be read as conversation id
+# "search", miss the registry, and 404 the sidebar with a misleading
+# "conversation not found". `test_agent_server_conversation_list_routes_precede_id_route`
+# pins the order.
+#
+# Only UPDATED_AT_DESC / CREATED_AT_DESC exist in the SDK's ConversationSortOrder
+# enum, but the sort key is derived generically (field from the name, direction
+# from the suffix) so a client asking for ASC gets ASC rather than a silent
+# reversal.
+
+_MAX_CONVERSATION_PAGE = 100
+
+
+def _sorted_conversation_records(
+    home: Path, sort_order: str
+) -> list[dict[str, Any]]:
+    """Registry records, refreshed against live run state, in `sort_order`."""
+    records = _conversation_records(home)
+    for record in records:
+        _refresh_execution_status(home, record)
+    field = "created_at" if "CREATED_AT" in sort_order else "updated_at"
+    # id is the tiebreak so equal-second timestamps keep a stable order across
+    # polls — the canvas paginates by id and would otherwise re-serve or skip.
+    records.sort(
+        key=lambda r: (str(r.get(field) or ""), str(r["id"])),
+        reverse=not sort_order.endswith("_ASC"),
+    )
+    return records
+
+
+@router.get("/api/conversations/search")
+def search_conversations(
+    home=Depends(get_home),
+    limit: int = 20,
+    page_id: str | None = None,
+    sort_order: str = "UPDATED_AT_DESC",
+) -> dict[str, Any]:
+    """Conversation page (`ConversationClient.searchConversations`)."""
+    records = _sorted_conversation_records(home, sort_order)
+
+    if page_id:
+        # Continue-after-id cursor. An unknown cursor (pruned/filtered) restarts
+        # the page rather than erroring — a sidebar that dead-ends is worse than
+        # one that repeats a row the client already dedupes by id.
+        for idx, record in enumerate(records):
+            if str(record["id"]) == page_id:
+                records = records[idx + 1 :]
+                break
+
+    page_limit = max(1, min(limit, _MAX_CONVERSATION_PAGE))
+    truncated = len(records) > page_limit
+    page = records[:page_limit]
+    return {
+        "items": [_conversation_info(record) for record in page],
+        "next_page_id": str(page[-1]["id"]) if truncated and page else None,
+    }
+
+
+@router.get("/api/conversations/count")
+def count_conversations(home=Depends(get_home)) -> int:
+    """Conversation total (`ConversationClient.countConversations`)."""
+    return len(_conversation_records(home))
+
+
+@router.get("/api/conversations")
+def get_conversations(
+    home=Depends(get_home), ids: list[str] | None = Query(default=None)
+) -> list[dict[str, Any] | None]:
+    """Batch get by id (`ConversationClient.getConversations`).
+
+    Positional, and ``null`` for any id that is unknown or unsafe — the SDK's
+    ``requireDirectConversationItems`` needs an array aligned with the request,
+    and the batch path is explicitly tolerant of misses (it is how the canvas
+    re-hydrates rows whose sidecar was pruned). Raising per-id would fail the
+    whole batch over one stale row.
+    """
+    if not ids:
+        return []
+    return [
+        _conversation_info(record) if record is not None else None
+        for record in (
+            _load_conversation(home, cid) if _safe_conversation_id(cid) else None
+            for cid in ids
+        )
+    ]
 
 
 @router.get("/api/conversations/{conversation_id}")
@@ -655,7 +826,10 @@ def get_conversation_event(
     raise HTTPException(status_code=404, detail="event not found")
 
 
-@router.post("/api/conversations/{conversation_id}/events")
+@router.post(
+    "/api/conversations/{conversation_id}/events",
+    dependencies=[Depends(require_local_caller)],
+)
 def send_conversation_event(
     payload: dict[str, Any], conversation_id: str, home=Depends(get_home)
 ) -> dict[str, Any]:
@@ -727,19 +901,63 @@ def send_conversation_event(
     return {"ok": True}
 
 
+# ── Liveness / health / readiness (Slice 4) ───────────────────────────────────
+#
+# Three distinct questions, previously all answered "ok" unconditionally — which
+# made the canvas unable to tell "mini-ork is down" from "mini-ork is up but has
+# no workspace", the two failures that need different operator responses:
+#
+#   /alive   process is running            → no dependency, never 503
+#   /health  process + state, as DATA      → 200 always, `status` degrades
+#   /ready   can this serve a run?         → 503 when there is no state.db
+#
+# All three resolve the home via `get_home_lenient`. A health probe that 404s on
+# a bad/missing workspace cannot REPORT the problem it exists to report — and
+# `get_home` raises exactly that 404. The body names the home actually probed,
+# so a caller pointed at a dead workspace sees the fallback rather than a
+# misleading "healthy".
+
+
+def _db_present(home: Path) -> bool:
+    return (Path(home) / "state.db").is_file()
+
+
 @router.get("/alive")
 def alive() -> dict[str, Any]:
-    """Liveness (`ServerClient.getAlive`)."""
+    """Liveness (`ServerClient.getAlive`). Dependency-free on purpose: this is
+    the "is the process up at all" probe, so it must not fail for a reason a
+    different endpoint already reports."""
     return {"status": "ok"}
 
 
 @router.get("/health")
-def health() -> dict[str, Any]:
-    """Health (`ServerClient.getHealth`)."""
-    return {"status": "ok", "uptime": _uptime_seconds()}
+def health(home=Depends(get_home_lenient)) -> dict[str, Any]:
+    """Health (`ServerClient.getHealth`). Always 200 — the degradation is in the
+    body, so a monitor can scrape it without treating it as transport failure."""
+    db_ok = _db_present(home)
+    return {
+        "status": "ok" if db_ok else "degraded",
+        "uptime": _uptime_seconds(),
+        "home": str(home),
+        "db_present": db_ok,
+    }
 
 
 @router.get("/ready")
-def ready() -> dict[str, Any]:
-    """Readiness (`ServerClient.getReady`; the SDK accepts 200 or 503)."""
-    return {"status": "ready"}
+def ready(home=Depends(get_home_lenient)) -> JSONResponse:
+    """Readiness (`ServerClient.getReady`; the SDK accepts 200 or 503).
+
+    503 without a ``state.db``: launching a run and reading its events both go
+    through it, so a home without one cannot serve the canvas. Answering 200 here
+    would be the silent-empty failure mode this shim refuses elsewhere.
+    """
+    if _db_present(home):
+        return JSONResponse({"status": "ready", "home": str(home)}, status_code=200)
+    return JSONResponse(
+        {
+            "status": "not_ready",
+            "reason": f"no state.db under {home}",
+            "home": str(home),
+        },
+        status_code=503,
+    )
