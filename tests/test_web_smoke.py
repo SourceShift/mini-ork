@@ -2035,3 +2035,254 @@ def test_auth_require_token_accepts_valid_token(tmp_path: Path, monkeypatch) -> 
         headers = {"authorization": "Bearer abc123"}
 
     assert require_token(_StubReq()) == "amir"  # type: ignore[arg-type]
+
+
+# ── Phase A: canvas seam (origin guard, conversation list, health) ────────────
+#
+# A1: the agent-server shim is tokenless by design (the canvas sends no bearer,
+# and require_token is fail-closed), so the boundary against the one live threat
+# — a browser page from any other origin POSTing to a billable route, which a
+# CORS "simple request" lets through unread but not unexecuted — is an Origin
+# check. `require_local_caller` is asserted both as a pure predicate and as
+# ACTUALLY WIRED to the routes; a guard that exists but is attached to nothing
+# is the failure mode worth a test of its own.
+
+
+class _OriginReq:
+    """Minimal Request stand-in: the guard reads only `headers.get`."""
+
+    def __init__(self, origin: str | None = None):
+        self.headers = {} if origin is None else {"origin": origin}
+
+
+def test_agent_server_origin_guard_refuses_a_foreign_page(monkeypatch) -> None:
+    """A page on any origin other than this machine must not reach the handler.
+
+    This is the whole point of the guard: `POST /api/conversations` starts a real
+    billable run, and a cross-origin `text/plain` POST skips the CORS preflight,
+    so without this check the run launches even though the attacker never sees a
+    response.
+    """
+    from fastapi import HTTPException
+
+    from mini_ork.web.routes.agent_server import require_local_caller
+
+    monkeypatch.delenv("MO_AGENT_SERVER_ALLOW_REMOTE", raising=False)
+    for origin in ("https://evil.com", "http://evil.com:7090", "https://127.0.0.1.evil.com"):
+        with pytest.raises(HTTPException) as exc:
+            require_local_caller(_OriginReq(origin))  # type: ignore[arg-type]
+        assert exc.value.status_code == 403, origin
+
+
+def test_agent_server_origin_guard_admits_local_and_non_browser_callers(
+    monkeypatch,
+) -> None:
+    """Both legitimate callers pass: the canvas (served from loopback, any port)
+    and any non-browser client — the SDK, curl, a test — which sends no Origin
+    header at all. Admitting the header-less case is deliberate: it is what lets
+    the local SDK work tokenless, and a local process could read any token file
+    anyway, so the guard is not pretending to defend against it."""
+    from mini_ork.web.routes.agent_server import require_local_caller
+
+    monkeypatch.delenv("MO_AGENT_SERVER_ALLOW_REMOTE", raising=False)
+    for origin in ("http://localhost:7070", "http://127.0.0.1:7090", "http://localhost"):
+        assert require_local_caller(_OriginReq(origin)) is None  # type: ignore[arg-type]
+    # No Origin header at all → the non-browser path.
+    assert require_local_caller(_OriginReq(None)) is None  # type: ignore[arg-type]
+
+
+def test_agent_server_origin_guard_refuses_the_null_origin(monkeypatch) -> None:
+    """`Origin: null` is NOT treated as local.
+
+    CORS tolerates the literal "null" for Electron `file://` renderers (see
+    app.py's CORSMiddleware note), but a sandboxed iframe or a `data:` URL also
+    manufactures it, so it is not evidence of anything. On a route whose side
+    effect is a billable launch, it must not be admitted on the strength of a
+    string any attacker can produce.
+    """
+    from fastapi import HTTPException
+
+    from mini_ork.web.routes.agent_server import require_local_caller
+
+    monkeypatch.delenv("MO_AGENT_SERVER_ALLOW_REMOTE", raising=False)
+    with pytest.raises(HTTPException) as exc:
+        require_local_caller(_OriginReq("null"))  # type: ignore[arg-type]
+    assert exc.value.status_code == 403
+
+
+def test_agent_server_origin_guard_opt_out_for_exposed_deployments(monkeypatch) -> None:
+    """`mini-ork serve --host 0.0.0.0` is a documented flag, so the guard needs a
+    deliberate escape hatch rather than silently breaking that deployment."""
+    from mini_ork.web.routes.agent_server import require_local_caller
+
+    monkeypatch.setenv("MO_AGENT_SERVER_ALLOW_REMOTE", "1")
+    assert require_local_caller(_OriginReq("https://evil.com")) is None  # type: ignore[arg-type]
+
+
+def test_agent_server_mutating_routes_are_actually_guarded() -> None:
+    """The guard must be ATTACHED, not merely defined.
+
+    Unit-testing `require_local_caller` proves the predicate; this proves the two
+    billable routes depend on it. Driven through a real TestClient so it exercises
+    FastAPI's dependency resolution rather than my reading of it. Both requests
+    are origin-less at the transport level and distinguished only by the header,
+    so a 403→idle-200 flip is attributable to the guard alone.
+    """
+    from fastapi.testclient import TestClient
+
+    from mini_ork.web.app import create_app
+
+    client = TestClient(create_app(dev_cors=False))
+
+    # A foreign page: refused before the handler, so no conversation is created.
+    blocked = client.post(
+        "/api/conversations",
+        json={"conversation_id": "conv-csrf-probe", "title": "csrf"},
+        headers={"origin": "https://evil.com"},
+    )
+    assert blocked.status_code == 403, blocked.text
+
+    # The canvas (loopback origin): admitted. No initial_message, so this stays
+    # idle and launches nothing — the assertion is only that the guard let it in.
+    allowed = client.post(
+        "/api/conversations",
+        json={"conversation_id": "conv-csrf-probe", "title": "ok"},
+        headers={"origin": "http://localhost:7070"},
+    )
+    assert allowed.status_code == 200, allowed.text
+
+
+def test_agent_server_ready_reports_missing_state_db_as_503(tmp_path: Path) -> None:
+    """A2: the canvas must be able to tell "mini-ork is down" (transport failure)
+    from "mini-ork is up with no workspace" (503). Answering 200 here is the
+    silent-empty failure this shim refuses elsewhere: the sidebar would render
+    fine and every launch would then fail."""
+    from mini_ork.web.routes.agent_server import ready
+
+    out = ready(home=tmp_path)
+    assert out.status_code == 503
+    body = json.loads(out.body)
+    assert body["status"] == "not_ready"
+    assert str(tmp_path) in body["reason"]
+
+
+def test_agent_server_ready_and_health_agree_when_a_db_exists(tmp_path: Path) -> None:
+    """With a state.db present both endpoints flip — ready to 200, and health's
+    `status` from "degraded" to "ok" — so a monitor scraping either sees the same
+    verdict. Only presence is required: readiness is about the file the run
+    lifecycle needs, not about its contents."""
+    from mini_ork.web.routes.agent_server import health, ready
+
+    (tmp_path / "state.db").touch()
+
+    assert ready(home=tmp_path).status_code == 200
+    out = health(home=tmp_path)
+    assert out["status"] == "ok"
+    assert out["db_present"] is True
+    assert out["home"] == str(tmp_path)
+
+
+def test_agent_server_alive_has_no_dependencies() -> None:
+    """`/alive` answers "is the process up" and nothing else — it must not fail
+    for a reason /health already reports, or the canvas cannot separate a dead
+    server from an empty one."""
+    from mini_ork.web.routes.agent_server import alive
+
+    assert alive() == {"status": "ok"}
+
+
+def test_agent_server_conversation_list_routes_precede_id_route() -> None:
+    """A3: registration order is load-bearing.
+
+    `/api/conversations/search` and `/count` also match the
+    `/api/conversations/{conversation_id}` pattern, and FastAPI resolves in
+    registration order. Declared after it, `/search` is read as conversation id
+    "search", misses the registry, and 404s the sidebar with a misleading
+    "conversation not found". Asserted on the OpenAPI path order because it is
+    the same source of truth the app-factory test already uses and it survives
+    FastAPI's router-mounting shape changes.
+    """
+    from mini_ork.web.app import create_app
+
+    paths = list(create_app(dev_cors=False).openapi()["paths"])
+    id_route = paths.index("/api/conversations/{conversation_id}")
+    assert paths.index("/api/conversations/search") < id_route
+    assert paths.index("/api/conversations/count") < id_route
+
+
+def _seed_conversation(home: Path, cid: str, updated_at: str, started: bool = False) -> None:
+    """Write a registry sidecar directly — the shape `_save_conversation` emits."""
+    from mini_ork.web.routes.agent_server import _save_conversation
+
+    _save_conversation(
+        home,
+        {
+            "id": cid,
+            "title": f"title {cid}",
+            "created_at": "2026-09-01T00:00:00Z",
+            "updated_at": updated_at,
+            "execution_status": "running" if started else "idle",
+            "recipe": "code-fix",
+            "run_launched": started,
+            "messages": [{"text": f"hello from {cid}", "ts": updated_at}],
+        },
+    )
+
+
+def test_agent_server_conversation_search_pages_newest_updated_first(
+    tmp_path: Path,
+) -> None:
+    """The sidebar's first call. Ordering is UPDATED_AT_DESC (the SDK's
+    ConversationSortOrder) and `next_page_id` is set ONLY when the page was
+    actually truncated — returning it unconditionally makes `hasMore` heuristics
+    loop forever fetching an empty tail."""
+    from mini_ork.web.routes.agent_server import search_conversations
+
+    _seed_conversation(tmp_path, "conv-old", "2026-09-01T00:00:00Z")
+    _seed_conversation(tmp_path, "conv-mid", "2026-09-02T00:00:00Z")
+    _seed_conversation(tmp_path, "conv-new", "2026-09-03T00:00:00Z")
+
+    page = search_conversations(home=tmp_path, limit=2)
+    assert [i["id"] for i in page["items"]] == ["conv-new", "conv-mid"]
+    assert page["next_page_id"] == "conv-mid"
+
+    tail = search_conversations(home=tmp_path, limit=2, page_id=page["next_page_id"])
+    assert [i["id"] for i in tail["items"]] == ["conv-old"]
+    assert tail["next_page_id"] is None  # last page → no cursor
+
+    # A truncated page must also carry the fields the canvas types require.
+    item = page["items"][0]
+    assert item["id"] and item["created_at"] and item["updated_at"]
+    assert item["agent"]["llm"]["model"]
+
+
+def test_agent_server_conversation_search_empty_home_is_an_empty_page(
+    tmp_path: Path,
+) -> None:
+    """A home with no `conversations/` dir is the normal first-run state — it must
+    be an empty page, not an error, or the canvas shows a failed sidebar before
+    the user has done anything."""
+    from mini_ork.web.routes.agent_server import count_conversations, search_conversations
+
+    assert search_conversations(home=tmp_path) == {"items": [], "next_page_id": None}
+    assert count_conversations(home=tmp_path) == 0
+
+
+def test_agent_server_conversation_batch_get_is_positional_with_nulls(
+    tmp_path: Path,
+) -> None:
+    """`getConversations(ids)` needs an array ALIGNED with the request, with null
+    for misses: the batch path exists to re-hydrate rows whose sidecar was pruned,
+    so raising on one stale id would fail the whole batch. Unsafe ids (path
+    traversal) are a miss, not a 400 — same reasoning, and they never touch disk."""
+    from mini_ork.web.routes.agent_server import get_conversations
+
+    _seed_conversation(tmp_path, "conv-known", "2026-09-03T00:00:00Z")
+
+    out = get_conversations(
+        home=tmp_path, ids=["conv-known", "conv-missing", "../escape"]
+    )
+    assert out[0] is not None and out[0]["id"] == "conv-known"
+    assert out[1] is None
+    assert out[2] is None
+    assert get_conversations(home=tmp_path, ids=None) == []
