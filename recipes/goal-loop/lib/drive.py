@@ -233,9 +233,16 @@ def _default_run_wave_fn(wave_no: int, quarantined: set[str]) -> dict[str, Any]:
     cli = os.path.join(
         os.environ.get("MINI_ORK_ROOT", "."), "bin", "mini-ork",
     )
+    # Propagate the GRAO quarantine set into the wave recipe so goal_sweep_plan
+    # EXCLUDES units the loop has given up on. Without this a single-child-per-
+    # wave loop re-selects the same stuck unit every wave (sorted-first) and
+    # never rotates the freed slot onto the other failing units. Newline-
+    # delimited; empty (no quarantine yet) leaves selection at historical.
+    wave_env = dict(os.environ)
+    wave_env["MO_GOAL_QUARANTINED_UNITS"] = "\n".join(sorted(quarantined))
     proc = subprocess.run(
         [cli, "run", "goal-loop", kickoff],
-        check=False, capture_output=True, text=True,
+        check=False, capture_output=True, text=True, env=wave_env,
     )
     panel_path = os.path.join(run_dir, "panel-verdict.json")
     payload: dict[str, Any] = {

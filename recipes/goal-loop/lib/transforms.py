@@ -97,16 +97,65 @@ def goal_state_eval(workflow: CompiledWorkflow, ledger: ArtifactLedger, node_id:
     return out_path
 
 
+def _unit_sort_key(unit_id: str) -> tuple[int, int, str]:
+    """Order numeric unit ids numerically (``2`` before ``10``), non-numeric ids
+    lexicographically after them. Chapter units are ``"1".."10"`` — plain
+    ``sorted()`` string-orders them ``1,10,2,3,…`` so the freed child slot would
+    rotate ch1→ch10; numeric ordering keeps rotation in natural ch1→ch2→ch3 order.
+    """
+    return (0, int(unit_id), "") if unit_id.isdigit() else (1, 0, unit_id)
+
+
+def _quarantined_from_env() -> set[str]:
+    """GRAO quarantine set the outer driver exports (newline-delimited).
+
+    ``_default_run_wave_fn`` writes ``MO_GOAL_QUARANTINED_UNITS`` before shelling
+    the wave recipe so this in-recipe selector can EXCLUDE units the loop has
+    already given up on. Unset/blank → empty set (historical behavior).
+    """
+    return {
+        u.strip()
+        for u in (os.environ.get("MO_GOAL_QUARANTINED_UNITS") or "").splitlines()
+        if u.strip()
+    }
+
+
+def _select_units(
+    goal_state: dict[str, Any],
+    max_children: int,
+    quarantined: set[str] | None = None,
+) -> list[str]:
+    """Pure wave-selection core (ledger-free, unit-testable).
+
+    Picks the failing units (``pass`` is falsy) in numeric-aware order and caps
+    at ``max_children``. Units the driver has GRAO-quarantined are EXCLUDED, so a
+    single-child-per-wave loop that would otherwise re-select the same stuck unit
+    forever rotates its freed slot onto the next failing unit. Starvation guard:
+    if EVERY failing unit is quarantined the exclusion is dropped, so the wave
+    still dispatches and the driver's ``all_quarantined`` stop ends the loop
+    cleanly rather than the selector silently returning nothing.
+    """
+    failing = sorted(
+        (uid for uid, state in goal_state.items() if not state.get("pass", False)),
+        key=_unit_sort_key,
+    )
+    if quarantined:
+        remaining = [uid for uid in failing if uid not in quarantined]
+        if remaining:
+            failing = remaining
+    return failing[:max_children]
+
+
 @register_transform("goal_sweep_plan")
 def goal_sweep_plan(workflow: CompiledWorkflow, ledger: ArtifactLedger, node_id: str) -> Path:
     """Select failing units for the wave's fix children.
 
     Reads the upstream ``goal_state`` artifact written by ``goal_state_eval``,
-    picks the failing units in deterministic order (sorted by unit_id), and
-    caps the selection at ``MO_GOAL_MAX_CHILDREN_PER_WAVE`` (default 3).
-    The output ``sweep-plan.json`` lists ``{unit_id, child_recipe, kickoff_hint}``
-    entries — the outer U4b driver consumes this and dispatches the fix
-    children. U4a only materializes the plan.
+    picks the failing units in numeric-aware order (``_select_units``) MINUS the
+    driver's GRAO-quarantine set, and caps at ``MO_GOAL_MAX_CHILDREN_PER_WAVE``
+    (default 3). The output ``sweep-plan.json`` lists
+    ``{unit_id, child_recipe, kickoff_hint}`` entries — the outer U4b driver
+    consumes this and dispatches the fix children. U4a only materializes the plan.
     """
     try:
         max_children = int(os.environ.get("MO_GOAL_MAX_CHILDREN_PER_WAVE", "3"))
@@ -122,10 +171,7 @@ def goal_sweep_plan(workflow: CompiledWorkflow, ledger: ArtifactLedger, node_id:
         raise ArtifactContractError("goal_sweep_plan requires goal_state input")
     goal_state = json.loads(goal_state_paths[0].read_text(encoding="utf-8"))
 
-    failing = sorted(
-        unit_id for unit_id, state in goal_state.items() if not state.get("pass", False)
-    )
-    selected = failing[:max_children]
+    selected = _select_units(goal_state, max_children, _quarantined_from_env())
 
     # Deep-evidence harvest (optional): for ONLY the units we're about to
     # dispatch, run MO_GOAL_EVIDENCE_CMD to gather the rich failure signal the
