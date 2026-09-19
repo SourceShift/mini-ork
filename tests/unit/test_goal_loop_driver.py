@@ -436,6 +436,80 @@ def test_default_spawn_fn_passthrough_for_template_without_placeholders(tmp_path
     assert list(run_dir.glob("_inline_kickoff_*")) == []
 
 
+def test_sweep_entry_carries_child_run_id_and_diagnostics(tmp_path, monkeypatch):
+    """The sweep entry is the only child→driver channel; it must name the child.
+
+    It used to hardcode ``child_run_id=None`` and drop every diagnostic, so a wave
+    that spawned, changed nothing and was approved was indistinguishable from one
+    that did real work — the outer loop had nothing to read.
+    """
+    template = tmp_path / "template.md"
+    template.write_text("# Static kickoff\n", encoding="utf-8")
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    child_dir = tmp_path / "home" / "runs" / "child-123"
+    child_dir.mkdir(parents=True)
+    (child_dir / "verdict.json").write_text(
+        json.dumps({"verdict": "fail", "failed_nodes": 3})
+    )
+    (child_dir / "review-diff.patch").write_text("--- a/B.txt\n+++ b/B.txt\n")
+    monkeypatch.setenv("MINI_ORK_RUN_DIR", str(run_dir))
+    monkeypatch.setenv("MO_GOAL_CHILD_KICKOFF", str(template))
+    monkeypatch.setenv("MINI_ORK_ALLOW_CHILD_SPAWN", "1")
+
+    def fake_spawn(*args, **kwargs):
+        return SimpleNamespace(exit_code=0, spawn_id="fake-id",
+                               child_run_id="child-123", child_run_dir=str(child_dir))
+
+    import mini_ork.cli.spawn as spawn_mod
+    monkeypatch.setattr(spawn_mod, "spawn", fake_spawn)
+
+    result = _DRIVE._default_spawn_fn({  # noqa: SLF001 — test seam
+        "unit_id": "docs/ch-03.md",
+        "child_recipe": "code-fix",
+        "kickoff_hint": {"reason": "chapter 3 failed"},
+    })
+
+    assert result["child_run_id"] == "child-123"
+    assert result["child_verdict"] == "fail"
+    assert result["child_failed_nodes"] == 3
+    assert result["review_diff_bytes"] == len("--- a/B.txt\n+++ b/B.txt\n")
+
+
+def test_sweep_entry_marks_a_child_no_op(tmp_path, monkeypatch):
+    template = tmp_path / "template.md"
+    template.write_text("# Static kickoff\n", encoding="utf-8")
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    child_dir = tmp_path / "home" / "runs" / "child-456"
+    child_dir.mkdir(parents=True)
+    (child_dir / "review-diff-noop.json").write_text('{"status": "no_op"}\n')
+    monkeypatch.setenv("MINI_ORK_RUN_DIR", str(run_dir))
+    monkeypatch.setenv("MO_GOAL_CHILD_KICKOFF", str(template))
+    monkeypatch.setenv("MINI_ORK_ALLOW_CHILD_SPAWN", "1")
+
+    def fake_spawn(*args, **kwargs):
+        return SimpleNamespace(exit_code=0, spawn_id="fake-id",
+                               child_run_id="child-456", child_run_dir=str(child_dir))
+
+    import mini_ork.cli.spawn as spawn_mod
+    monkeypatch.setattr(spawn_mod, "spawn", fake_spawn)
+
+    result = _DRIVE._default_spawn_fn({  # noqa: SLF001 — test seam
+        "unit_id": "docs/ch-04.md",
+        "child_recipe": "code-fix",
+        "kickoff_hint": {"reason": "chapter 4 failed"},
+    })
+
+    assert result["child_run_id"] == "child-456"
+    assert result["child_no_op"] is True
+
+
+def test_child_diagnostics_on_an_absent_dir_is_empty(tmp_path):
+    assert _DRIVE._child_diagnostics(str(tmp_path / "nope")) == {}  # noqa: SLF001
+    assert _DRIVE._child_diagnostics("") == {}  # noqa: SLF001
+
+
 def test_default_spawn_fn_templating_for_inline_body(tmp_path, monkeypatch):
     """Inline (non-file) MO_GOAL_CHILD_KICKOFF body with placeholders → file written."""
     run_dir = tmp_path / "run"

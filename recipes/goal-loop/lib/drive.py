@@ -57,6 +57,38 @@ FINAL_VERDICT_FILENAME = "final-verdict.json"
 # ─────────────────────────────────────────────────────────────────────────
 
 
+def _child_diagnostics(child_run_dir: str) -> dict[str, Any]:
+    """Summarize a finished child's run dir for the outer loop.
+
+    The sweep entry is the only channel from child to driver, and it carried an
+    exit code and nothing else — so a wave that spawned, changed nothing and was
+    approved read exactly like one that did real work. These fields are what
+    ``MO_GOAL_EVIDENCE_CMD`` templates into the next kickoff, so the next child
+    can see whether its predecessor produced a diff at all.
+    """
+    out: dict[str, Any] = {}
+    if not child_run_dir or not os.path.isdir(child_run_dir):
+        return out
+    verdict_path = os.path.join(child_run_dir, "verdict.json")
+    if os.path.isfile(verdict_path):
+        try:
+            data = json.loads(Path(verdict_path).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            data = None
+        if isinstance(data, dict):
+            out["child_verdict"] = data.get("verdict", "")
+            out["child_failed_nodes"] = data.get("failed_nodes")
+    diff_path = os.path.join(child_run_dir, "review-diff.patch")
+    if os.path.isfile(diff_path):
+        try:
+            out["review_diff_bytes"] = os.path.getsize(diff_path)
+        except OSError:
+            pass
+    if os.path.isfile(os.path.join(child_run_dir, "review-diff-noop.json")):
+        out["child_no_op"] = True
+    return out
+
+
 def _default_spawn_fn(plan_entry: dict[str, Any]) -> dict[str, Any]:
     """Production spawn — invokes ``mini_ork.cli.spawn.spawn``.
 
@@ -134,14 +166,16 @@ def _default_spawn_fn(plan_entry: dict[str, Any]) -> dict[str, Any]:
         allow_child_spawn=int(os.environ.get("MINI_ORK_ALLOW_CHILD_SPAWN", "0")),
         no_execute=int(os.environ.get("MO_GOAL_NO_EXECUTE", "0")),
     )
-    return {
+    entry = {
         "status": "spawned" if result.exit_code == 0 else "failed",
         "unit_id": plan_entry.get("unit_id"),
         "child_recipe": child_recipe,
         "spawn_id": result.spawn_id,
-        "child_run_id": None,
+        "child_run_id": result.child_run_id or None,
         "exit_code": result.exit_code,
     }
+    entry.update(_child_diagnostics(getattr(result, "child_run_dir", "")))
+    return entry
 
 
 def sweep_run(
