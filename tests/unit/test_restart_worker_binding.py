@@ -294,6 +294,68 @@ def test_env_overlay_scrubs_the_rest_of_the_goal_loop_run_identity(mod, monkeypa
     assert [k for k in leaked if k in env] == []
 
 
+def test_env_overlay_drops_the_ambient_engine_pair_when_replaced(mod, monkeypatch, tmp_path):
+    """Symmetric with the home pair: the engine travels with its replacement pin or
+    not at all, so the launcher cannot resolve an engine other than the one pinned."""
+    _fake_worktree(tmp_path)
+    monkeypatch.setenv("MINI_ORK_ENGINE_ROOT", "/stale/engine")
+    monkeypatch.setenv("MINI_ORK_ROOT", "/stale/engine")
+    env = mod._env_overlay(
+        str(tmp_path), "/run/w.log", {"MINI_ORK_ENGINE_ROOT": "/fresh", "MINI_ORK_ROOT": "/fresh"}
+    )
+    assert env["MINI_ORK_ENGINE_ROOT"] == "/fresh"
+    assert env["MINI_ORK_ROOT"] == "/fresh"
+
+
+def test_env_overlay_keeps_the_ambient_engine_when_nothing_replaces_it(mod, monkeypatch, tmp_path):
+    _fake_worktree(tmp_path)
+    monkeypatch.setenv("MINI_ORK_ENGINE_ROOT", "/inherited/engine")
+    env = mod._env_overlay(str(tmp_path), "/run/w.log")
+    assert env["MINI_ORK_ENGINE_ROOT"] == "/inherited/engine"
+
+
+def test_resolve_engine_root_prefers_a_real_ambient_engine(mod, monkeypatch, tmp_path):
+    engine = tmp_path / "engine"
+    (engine / "mini_ork").mkdir(parents=True)
+    monkeypatch.setenv("MINI_ORK_ENGINE_ROOT", str(engine))
+    assert mod._resolve_engine_root() == str(engine)
+
+
+def test_resolve_engine_root_ignores_an_ambient_path_that_is_not_an_engine(mod, monkeypatch, tmp_path):
+    """A stale/foreign value must not win: the pin is only useful if it names a
+    checkout that actually carries mini_ork/."""
+    monkeypatch.setenv("MINI_ORK_ENGINE_ROOT", str(tmp_path / "not-an-engine"))
+    assert mod._resolve_engine_root() == str(Path(mod.__file__).resolve().parents[3])
+
+
+def test_resolve_engine_root_falls_back_to_this_bindings_own_checkout(mod, monkeypatch):
+    monkeypatch.delenv("MINI_ORK_ENGINE_ROOT", raising=False)
+    monkeypatch.delenv("MINI_ORK_ROOT", raising=False)
+    root = mod._resolve_engine_root()
+    assert root is not None and (Path(root) / "mini_ork").is_dir()
+
+
+def test_start_pins_the_engine_alongside_the_home(mod, monkeypatch, tmp_path):
+    """A hand-run restart must not silently downgrade the children's engine to the
+    worktree's `engine` pointer target."""
+    seen: dict[str, str] = {}
+
+    def _capture(worktree, log_path, extra=None):
+        seen.update(extra or {})
+        return {}
+
+    monkeypatch.setattr(mod, "_env_overlay", _capture)
+    monkeypatch.setattr(mod, "_runner_model", lambda wt: (None, "no runner"))
+    monkeypatch.setattr(mod, "_mini_ork_home", lambda wt: (None, "unset"))
+    monkeypatch.setattr(mod, "_resolve_engine_root", lambda: "/pinned/engine")
+    monkeypatch.setattr(mod.subprocess, "Popen", lambda *a, **k: type("P", (), {"pid": 1})())
+    _fake_worktree(tmp_path)
+    ok, _ = mod._start_replacement(str(tmp_path), "book-generation", str(tmp_path / "w.log"))
+    assert ok is True
+    assert seen["MINI_ORK_ENGINE_ROOT"] == "/pinned/engine"
+    assert seen["MINI_ORK_ROOT"] == "/pinned/engine"
+
+
 def test_env_overlay_keeps_the_engine_and_db_pins(mod, monkeypatch, tmp_path):
     """Two leaks are deliberate and must NOT be scrubbed: ENGINE_ROOT/ROOT so the
     worker's children run THIS loop's (fixed) engine instead of the researcher
