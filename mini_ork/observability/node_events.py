@@ -168,6 +168,8 @@ def mo_node_emit(
     node_type: str,
     event_type: str,
     extra_json: str = _DEFAULT_EXTRA_JSON,
+    *,
+    db: str | None = None,
 ) -> int:
     """Mirror lib/mo_node_events.sh::mo_node_emit (lines 45-103).
 
@@ -177,6 +179,11 @@ def mo_node_emit(
     `last_heartbeat_at` columns only when present in `run_events`. The
     `last_heartbeat_at` write is further gated to `event_type in
     ('node_start', 'node_heartbeat')` per migration 0023 semantics.
+
+    ``db`` is keyword-only: when supplied (non-None) it takes precedence over
+    the env-derived ``_resolve_db()`` path — ``dispatch_node`` already holds
+    the run's db handle and passes it down, because ``os.environ`` is not a
+    reliable carrier mid-run under env isolation.
     """
     if not run_id:
         print("mo_node_emit: run_id required", file=__import__("sys").stderr)
@@ -188,8 +195,8 @@ def mo_node_emit(
         print("mo_node_emit: event_type required", file=__import__("sys").stderr)
         return 0
 
-    db = _resolve_db()
-    if not db or not os.path.isfile(db):
+    resolved_db = db if db is not None else _resolve_db()
+    if not resolved_db or not os.path.isfile(resolved_db):
         return 0  # silent no-op if state.db missing (e.g. uninitialized test)
 
     # Mirror bash lines 67-78: parse extra_json, coerce non-dict, recover
@@ -211,7 +218,7 @@ def mo_node_emit(
     now_s = int(time.time())
     heartbeat_ms = _now_ms()
 
-    con = sqlite3.connect(db, timeout=2.0)
+    con = sqlite3.connect(resolved_db, timeout=2.0)
     try:
         con.execute("PRAGMA busy_timeout = 2000")
         cols = _table_columns(con, "run_events")
@@ -246,16 +253,19 @@ def mo_node_start(
     node_id: str,
     node_type: str,
     model_lane: str = "",
+    *,
+    db: str | None = None,
 ) -> int:
     """Mirror lib/mo_node_events.sh::mo_node_start (lines 107-114).
 
     Builds `extra = {"model_lane": <lane>}` when non-empty; otherwise passes
     the default `'{}'`. Delegates to `mo_node_emit` with `event_type='node_start'`.
+    ``db`` is keyword-only and wins over ``_resolve_db()`` when supplied.
     """
     extra = _default_extra_json()
     if model_lane:
         extra = json.dumps({"model_lane": model_lane})
-    return mo_node_emit(run_id, node_id, node_type, "node_start", extra)
+    return mo_node_emit(run_id, node_id, node_type, "node_start", extra, db=db)
 
 
 def mo_node_end(
@@ -266,15 +276,18 @@ def mo_node_end(
     verdict: str = "",
     artifact_path: str = "",
     finish_reason: str = "",
+    *,
+    db: str | None = None,
 ) -> int:
     """Mirror lib/mo_node_events.sh::mo_node_end (lines 157-172).
 
     Builds the extra JSON via the same logic as the bash in-here python
     (`duration_ms` always; verdict/artifact_path/finish_reason only when
     truthy), then delegates to `mo_node_emit` with `event_type='node_end'`.
+    ``db`` is keyword-only and wins over ``_resolve_db()`` when supplied.
     """
     extra = _build_extra_json(duration_ms, verdict, artifact_path, finish_reason)
-    return mo_node_emit(run_id, node_id, node_type, "node_end", extra)
+    return mo_node_emit(run_id, node_id, node_type, "node_end", extra, db=db)
 
 
 def mo_emit_node_heartbeat(node_id: str, run_id: str) -> int:
