@@ -981,6 +981,103 @@ def test_quality_mode_defaults_to_enforce_and_warn_opt_in(monkeypatch):
     assert _predmod._quality_enforcing() is False
 
 
+# ── 5e. the figure ledger: the one RELATIONAL term in the floor ────────────
+# Every other term is a lower bound over the committed text, so by construction
+# it cannot see content LOSS — a chapter that kept its prose and lost its
+# figures trips nothing. The figure term compares the viz_image blocks the
+# chapter was GIVEN against the ones still live, which is the only way a
+# cascade soft-delete becomes visible to the predicate.
+
+
+def _figs(attached: int, live: int, cascade: int = 0, attempts: int = 0) -> dict:
+    return {"attached": attached, "live": live, "cascade": cascade, "attempts": attempts}
+
+
+def test_quality_floor_flags_figure_loss(monkeypatch):
+    monkeypatch.delenv("MO_GOAL_QUALITY_FIGURES", raising=False)
+    bad, _ = _qualmod._failures(
+        _clean_rows(), "# S1\n" + "body " * 500, _figs(8, 0, cascade=8),
+    )
+    assert any(b.startswith("figure-loss") for b in bad)
+    assert any("attached=8" in b and "live=0" in b and "cascade=8" in b for b in bad)
+
+
+def test_quality_floor_figure_term_passes_when_every_figure_is_live(monkeypatch):
+    monkeypatch.delenv("MO_GOAL_QUALITY_FIGURES", raising=False)
+    bad, _ = _qualmod._failures(
+        _clean_rows(), "# S1\n" + "body " * 500, _figs(3, 3),
+    )
+    assert bad == []
+    # A chapter that never had figures is not a loss either.
+    bad, _ = _qualmod._failures(_clean_rows(), "# S1\n" + "body " * 500, _figs(0, 0))
+    assert bad == []
+
+
+def test_quality_floor_figure_term_is_inert_when_unprobed():
+    # The pure verdict logic stays independently testable: no probe argument
+    # means the term is not consulted at all, not that it failed.
+    bad, facts = _qualmod._failures(_clean_rows(), "# S1\n" + "body " * 500)
+    assert bad == []
+    assert facts["figures"] is None
+
+
+def test_quality_floor_figure_probe_error_fails_closed(monkeypatch):
+    # An armed term that cannot read its ledger must not abstain silently —
+    # abstaining is the self-report hole the anchor exists to close.
+    monkeypatch.delenv("MO_GOAL_QUALITY_FIGURES", raising=False)
+    bad, _ = _qualmod._failures(
+        _clean_rows(), "# S1\n" + "body " * 500, None,
+    )
+    assert "figure-probe-error" in bad
+
+
+def test_quality_floor_figure_warn_mode_records_without_failing(monkeypatch):
+    monkeypatch.setenv("MO_GOAL_QUALITY_FIGURES", "warn")
+    bad, facts = _qualmod._failures(
+        _clean_rows(), "# S1\n" + "body " * 500, _figs(8, 0, cascade=8),
+    )
+    assert bad == []
+    assert facts["figure_warn"].startswith("figure-loss")
+
+
+def test_quality_floor_figure_warn_mode_does_not_mask_real_failures(monkeypatch):
+    # Downgrading the figure term must not downgrade any other term with it.
+    monkeypatch.setenv("MO_GOAL_QUALITY_FIGURES", "warn")
+    bad, _ = _qualmod._failures(
+        _clean_rows(), "TODO: write this\n" + "body " * 500, _figs(8, 0, cascade=8),
+    )
+    assert any(b.startswith("placeholder:todo") for b in bad)
+
+
+def test_figures_parses_the_ledger_row(monkeypatch):
+    import subprocess as _sp
+    monkeypatch.setattr(
+        _qualmod, "_q",
+        lambda sql: _sp.CompletedProcess([], 0, "8|0|8|2\n"),
+    )
+    assert _qualmod._figures("b" * 36, "1") == _figs(8, 0, cascade=8, attempts=2)
+
+
+def test_figures_no_lifecycle_row_is_zero_not_an_error(monkeypatch):
+    # A chapter with no lifecycle row yields no row from the CTE. That is "no
+    # figures", not a probe error — the chapter already fails `no-sections`.
+    import subprocess as _sp
+    monkeypatch.setattr(_qualmod, "_q", lambda sql: _sp.CompletedProcess([], 0, "\n"))
+    assert _qualmod._figures("b" * 36, "99") == _figs(0, 0)
+
+
+def test_figures_probe_error_returns_none(monkeypatch):
+    import subprocess as _sp
+    monkeypatch.setattr(_qualmod, "_q", lambda sql: _sp.CompletedProcess([], 1, ""))
+    assert _qualmod._figures("b" * 36, "1") is None
+
+
+def test_figures_unparseable_row_returns_none(monkeypatch):
+    import subprocess as _sp
+    monkeypatch.setattr(_qualmod, "_q", lambda sql: _sp.CompletedProcess([], 0, "garbage\n"))
+    assert _qualmod._figures("b" * 36, "1") is None
+
+
 # ── 6. _harvest_selected_evidence: sweep-plan enrichment + on-disk file ───
 # The seam goal_sweep_plan calls to fill kickoff_hint.evidence / evidence_path.
 # It must be OFF by default (no MO_GOAL_EVIDENCE_CMD → empty, so unarmed loops
