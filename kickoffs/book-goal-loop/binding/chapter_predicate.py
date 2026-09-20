@@ -26,12 +26,26 @@ accepts it and projects it back onto the column. The gate is byte-exact, so it
 cannot manufacture a pass for content the judge never saw, and a chapter that
 never passed has no such row and still FAILs.
 
+Independent quality anchor (MO_GOAL_QUALITY_CMD, optional). Both halves of the
+bar above are the researcher's own self-report — ``committed_complete`` is its
+"I finished" flag and ``rubric_status`` its own G-Eval judge. Nothing OUTSIDE
+the judged system contradicts them, so "highest quality" would otherwise rest
+on a label the judged code itself writes. When MO_GOAL_QUALITY_CMD is set it is
+invoked as ``<cmd> <chapter>`` and must ALSO exit 0 for a PASS; the command is
+resolved from the operator's env (a binding script in mini-ork's own tree, not
+the target repo), so the fix child cannot reach or edit it. It is a
+deterministic vacuity floor over the committed section bytes — see
+``chapter_quality.py`` — not a second judge. Unset ⇒ inert (historical
+behavior). ``MO_GOAL_QUALITY_MODE=warn`` records the verdict in the reason
+without letting it flip the result.
+
 Connection comes from libpq env vars; no secret lives here.
 """
 from __future__ import annotations
 
 import os
 import re
+import shlex
 import subprocess
 import sys
 
@@ -100,6 +114,40 @@ def _heal_rubric_status(book: str, chapter: str) -> bool:
     return proc.returncode == 0 and proc.stdout.strip() != ""
 
 
+def _quality_cmd() -> str:
+    """The operator's outside-the-judge check; empty ⇒ no anchor armed."""
+    return os.environ.get("MO_GOAL_QUALITY_CMD", "").strip()
+
+
+def _quality_enforcing() -> bool:
+    """``enforce`` (default) lets the anchor flip a PASS; ``warn`` records only."""
+    return os.environ.get("MO_GOAL_QUALITY_MODE", "enforce").strip().lower() != "warn"
+
+
+def _quality_probe(chapter: str) -> tuple[bool, str]:
+    """Run the quality anchor for ``chapter``. Returns ``(ok, reason)``.
+
+    The unit id is the final argv slot — never shell-interpolated. A probe that
+    cannot run (bad command, missing binary) is a FAIL, not a pass: an armed
+    anchor that silently abstains is exactly the self-report hole it exists to
+    close. Fail-soft applies only when the anchor is UNSET, in which case this
+    is never called.
+    """
+    argv_cmd = shlex.split(_quality_cmd())
+    if not argv_cmd:
+        return True, "unset"
+    cwd = os.environ.get("MO_GOAL_TARGET_CWD") or None
+    try:
+        proc = subprocess.run(
+            argv_cmd + [chapter], cwd=cwd, capture_output=True, text=True,
+        )
+    except OSError as exc:
+        return False, f"probe-error {exc!r}"
+    first = (proc.stdout or "").strip().splitlines()
+    detail = first[0].strip() if first else (proc.stderr or "").strip()[:120]
+    return proc.returncode == 0, detail or f"rc={proc.returncode}"
+
+
 def main(argv: list[str]) -> int:
     if not argv:
         print("usage: chapter_predicate.py <chapter_number>", file=sys.stderr)
@@ -155,7 +203,25 @@ def main(argv: list[str]) -> int:
 
     if committed_ok and rubric_ok:
         note = " rubric-healed=true" if healed else ""
-        print(f"ch{chapter} PASS status={status} rubric={rubric} mdlen={mdlen}{note}")
+        # Both halves of the bar are the researcher's own self-report. The
+        # anchor is the only part of this predicate that the judged system does
+        # not author, so it is consulted only once the self-report says PASS —
+        # an already-failing chapter keeps its own (more informative) reason.
+        quality = "unset"
+        if _quality_cmd():
+            ok, detail = _quality_probe(chapter)
+            quality = detail if ok else f"{'fail' if _quality_enforcing() else 'warn'}:{detail}"
+            if not ok and _quality_enforcing():
+                print(
+                    f"ch{chapter} FAIL status={status} rubric={rubric} "
+                    f"committed={committed} attempts={attempts} mdlen={mdlen} "
+                    f"quality={quality}{note}",
+                )
+                return 1
+        print(
+            f"ch{chapter} PASS status={status} rubric={rubric} mdlen={mdlen} "
+            f"quality={quality}{note}",
+        )
         return 0
 
     reason = (

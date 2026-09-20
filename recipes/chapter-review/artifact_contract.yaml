@@ -10,12 +10,15 @@ rollback_policy: >
   individually consumable and can be re-synthesized without re-running
   lenses.
 
-# v0.2-pt9 (D-037): source_artifact names the input files staged into
-# $MINI_ORK_RUN_DIR by the dispatcher. outputs[] lists the canonical
-# artifact the publisher writes + git-commits.
-source_artifact:
-  - chapter.md
-  - context.json
-  - style_blueprint.md   # optional; dispatcher omits if absent
-outputs:
-  - chapter-review.json
+# source_artifact MUST be the SINGLE file the synthesizer writes into
+# $MINI_ORK_RUN_DIR. The reviewer/synth branch joins it onto a path
+# (_classify_review_node → _synth_artifact_name), so a LIST value throws
+# TypeError deep in posixpath inside the ProcessPool child — surfacing only as
+# "N node(s) failed". The stale D-037 "input staging" semantics never applied:
+# inputs are staged by the host runner (chapterReviewClient), not from this key.
+source_artifact: chapter-review.json
+# Empty: the host runner reads runs/<id>/chapter-review.json directly from the
+# run dir, so the publisher has nothing to copy. A non-empty outputs makes the
+# publisher cp into MINI_ORK_ROOT and risk a non-zero exit → the whole run
+# fails the exit_code!==0 gate even though the synthesis succeeded.
+outputs: []

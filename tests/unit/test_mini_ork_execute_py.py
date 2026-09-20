@@ -491,6 +491,43 @@ def test_synth_artifact_name_list_raises_clear_error_not_typeerror(tmp_path):
         ex._synth_artifact_name(str(tmp_path), "bad")
 
 
+def test_engine_chapter_review_contract_is_single_string_source_artifact():
+    # The engine checkout's copy was the stale D-037 list form while the
+    # consumer overlay carried the fix. Keep them aligned: a list-valued
+    # source_artifact is unrecoverable in the publisher's ProcessPool child, so
+    # a standalone run (no MINI_ORK_RECIPE_ROOT overlay) must not be a landmine.
+    d = yaml.safe_load(
+        (REPO / "recipes" / "chapter-review" / "artifact_contract.yaml").read_text()
+    )
+    assert isinstance(d["source_artifact"], str)
+    assert d["outputs"] == []
+
+
+def test_publisher_contract_honors_recipe_root_overlay(tmp_path, monkeypatch):
+    # Live regression (2026-09-20): publisher_node joined `root` (the engine
+    # checkout) directly, so it read the STALE contract even though main.py had
+    # resolved the recipe against the consumer overlay and threaded that base
+    # via MINI_ORK_RECIPE_ROOT. The stale list-valued source_artifact then died
+    # in _envsubst (TypeError inside the ProcessPool child) and the whole run
+    # failed its exit_code!==0 gate — while the synthesis and both verifiers
+    # passed, so the passing rubric was discarded and rubric_status never flipped.
+    engine = tmp_path / "engine"
+    _write_contract(engine, "chapter-review",
+                    "source_artifact:\n  - chapter.md\n  - context.json\n"
+                    "outputs:\n  - chapter-review.json\n")
+    overlay = tmp_path / "overlay"
+    _write_contract(overlay, "chapter-review",
+                    "source_artifact: chapter-review.json\noutputs: []\n")
+    rd = tmp_path / "run"; rd.mkdir()
+    monkeypatch.setenv("MINI_ORK_RECIPE_ROOT", str(overlay))
+    monkeypatch.setenv("MO_ORACLE_GATES_AUTO", "0")
+    db = _seed_db(tmp_path, "pub"); _seed_task_run(db)
+    rc, fr = ex.publisher_node(
+        str(engine), str(rd), db, "r1", "chapter-review", "chapter_review",
+        review_file="", verdict_env="")
+    assert (rc, fr) == (0, "done")
+
+
 def test_live_implementer_applies_diff(tmp_path, monkeypatch):
     db = _seed_db(tmp_path, "i"); _seed_task_run(db)
     rd = tmp_path / "run"; rd.mkdir()
