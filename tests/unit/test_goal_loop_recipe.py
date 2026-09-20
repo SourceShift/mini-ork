@@ -70,6 +70,8 @@ evidence_sha = _tmod._evidence_sha
 render_wave_history_block = _tmod._render_wave_history_block
 select_units = _tmod._select_units
 unit_sort_key = _tmod._unit_sort_key
+classify_failure = _tmod.classify_failure
+operator_for = _tmod._operator_for
 
 # The book-goal-loop terminal-FAILURE binding (companion to chapter_predicate).
 # Loaded by file path — it lives under kickoffs/, not a Python package. We test
@@ -1118,3 +1120,89 @@ def test_harvest_selected_evidence_unset_history_is_byte_identical(tmp_path, mon
     assert out["1"]["text"] == "deep evidence for 1"
     assert "### Prior waves" not in out["1"]["text"]
     assert evidence_sha(out["1"]["text"]) == evidence_sha("deep evidence for 1")
+
+# ── 8. operator typing (S5, SHADOW) ────────────────────────────────────────
+#
+# The loop's action set has size one: every wave spawns MO_GOAL_CHILD_RECIPE
+# (code-fix) for the selected unit. That is a constant, not a policy. The
+# classifier names the class of action a failure actually calls for, so the
+# loop can RECORD what a typed action set would have chosen. Dispatch is
+# untouched: `child_recipe` is still what spawns.
+
+# Live reasons, copied verbatim from goal-state.json on the running book loop.
+_CH4_NEVER_RAN = (
+    "ch4 FAIL status=pending rubric=pending committed=f permfail=f "
+    "degraded=f attempts=0 mdlen=43368"
+)
+_CH1_HARNESS_CONFLICT = (
+    "ch1 FAIL status=generating rubric=pass committed=f attempts=2 mdlen=0 "
+    "err=chapterGevalRepair: 0 of 10 edits anchored"
+)
+
+
+def test_classify_failure_defaults_to_code_fix():
+    operator, rationale = classify_failure(
+        "ch2 FAIL status=failed rubric=fail committed=t attempts=1 mdlen=9000")
+    assert operator == "code-fix"
+    assert "historical default" in rationale
+
+
+def test_classify_failure_names_dispatch_repair_for_a_unit_that_never_ran():
+    """status=pending + attempts=0 ⇒ the dispatcher never started it.
+
+    This is the class the live ch4 sits in: no code-fix child can reach it,
+    which is why the loop re-paid an identical patch every wave."""
+    operator, rationale = classify_failure(_CH4_NEVER_RAN)
+    assert operator == "dispatch-repair"
+    assert "never ran" in rationale
+
+
+def test_classify_failure_names_framework_edit_for_a_harness_stage_conflict():
+    """A repair/gate stage rejecting the citation form an earlier stage emitted."""
+    operator, rationale = classify_failure(_CH1_HARNESS_CONFLICT)
+    assert operator == "framework-edit"
+    assert "stage-order conflict" in rationale
+
+
+def test_classify_failure_does_not_escalate_on_a_bare_stage_mention():
+    """The stage name alone is not a signature — both halves must match."""
+    operator, _ = classify_failure(
+        "ch9 FAIL status=failed err=chapterGevalRepair: retry budget exhausted")
+    assert operator == "code-fix"
+
+
+def test_classify_failure_treats_a_running_unit_as_code_fix():
+    """attempts>0 means it DID run, so a child can reach the failure."""
+    operator, _ = classify_failure(
+        "ch5 FAIL status=generating rubric=pending committed=f attempts=3 mdlen=12000")
+    assert operator == "code-fix"
+
+
+def test_classify_failure_never_raises_and_defaults_on_empty():
+    for reason in ("", None, "garbage", "status=pending"):
+        operator, rationale = classify_failure(reason)  # type: ignore[arg-type]
+        assert operator == "code-fix"
+        assert rationale
+
+
+def test_operator_for_honors_the_disable_switch(monkeypatch):
+    goal_state = {"4": {"reason": _CH4_NEVER_RAN}}
+    monkeypatch.setenv("MO_GOAL_OPERATOR_TYPING", "0")
+    operator, rationale = operator_for("4", goal_state)
+    assert operator == "code-fix"
+    assert rationale == "operator typing disabled"
+
+    monkeypatch.setenv("MO_GOAL_OPERATOR_TYPING", "1")
+    assert operator_for("4", goal_state)[0] == "dispatch-repair"
+
+
+def test_operator_for_reads_each_units_own_reason(monkeypatch):
+    monkeypatch.delenv("MO_GOAL_OPERATOR_TYPING", raising=False)
+    goal_state = {
+        "1": {"reason": _CH1_HARNESS_CONFLICT},
+        "4": {"reason": _CH4_NEVER_RAN},
+        "7": {"reason": "ch7 PASS"},
+    }
+    assert operator_for("1", goal_state)[0] == "framework-edit"
+    assert operator_for("4", goal_state)[0] == "dispatch-repair"
+    assert operator_for("7", goal_state)[0] == "code-fix"

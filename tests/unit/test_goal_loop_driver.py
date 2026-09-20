@@ -1175,6 +1175,22 @@ def test_record_wave_with_diagnostics_records_new_keys():
     assert w["predicate_moved"] is None  # no prior wave to compare against
 
 
+def test_record_wave_records_the_operator_class_only_when_supplied():
+    """The typed-operator key is additive: it appears exactly when a wave
+    reports one, and its absence leaves the record's key set untouched."""
+    without = {"goal_id": "g", "waves": [], "failed_fixes": {}}
+    record_wave(without, wave=1, run_id="r", failing_before=["1"], failing_after=["1"],
+                cost_usd=0.0, attempted=["1"],
+                diagnostics={"child_diagnostics": {"1": {"child_verdict": "pass"}}})
+    assert "operators" not in without["waves"][0]
+
+    with_op = {"goal_id": "g", "waves": [], "failed_fixes": {}}
+    record_wave(with_op, wave=1, run_id="r", failing_before=["4"], failing_after=["4"],
+                cost_usd=0.0, attempted=["4"],
+                diagnostics={"operators": {"4": "dispatch-repair"}})
+    assert with_op["waves"][0]["operators"] == {"4": "dispatch-repair"}
+
+
 def test_evidence_informativeness_fires_on_identical_stale_bundle():
     state = {"waves": [
         {"signature": "s", "evidence": {"1": "deadbeef1234"}},
@@ -1413,6 +1429,7 @@ def test_drive_writes_a_decision_record_for_every_wave(tmp_path):
             return {"verdict": "fail", "failing_before": ["1"], "failing_after": ["1"],
                     "cost_usd": 1.0, "run_id": "r1", "attempted": ["1"],
                     "evidence": {"1": "ev-a"},
+                    "operators": {"1": "dispatch-repair"},
                     "child_diagnostics": {"1": {"child_verdict": "pass",
                                                 "review_diff_bytes": 111}}}
         return {"verdict": "pass", "failing_before": [], "failing_after": [],
@@ -1438,6 +1455,10 @@ def test_drive_writes_a_decision_record_for_every_wave(tmp_path):
     assert first["outcome"]["child_diagnostics"]["1"]["review_diff_bytes"] == 111
     assert first["context"]["evidence_sha"] == {"1": "ev-a"}
     assert "shield" in first
+    # SHADOW: `child_recipe` is what spawned; `operators` is what a typed action
+    # set would have chosen. Both ride the same record so the two can be graded.
+    assert first["action"]["operators"] == {"1": "dispatch-repair"}
+    assert rows[1]["action"]["operators"] == {}
 
 
 def test_drive_shield_is_shadow_by_default_and_still_runs_every_wave(tmp_path, monkeypatch):

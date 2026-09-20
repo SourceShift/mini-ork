@@ -169,8 +169,9 @@ def record_wave(
     Backward-compatible: ``reasons=None`` yields the historical set-only
     signature and id-only fix-hash; ``attempted=None`` falls back to hashing
     every still-failing unit (the original test-suite-loop contract).
-    ``diagnostics`` carries the wave's evidence fingerprints and the child's
-    self-verdict; callers without them omit it.
+    ``diagnostics`` carries the wave's evidence fingerprints, the child's
+    self-verdict, and the operator class each unit's failure called for; callers
+    without them omit it, and each key is attached only when non-empty.
     """
     sig = wave_signature(failing_after, reasons)
     wave_record = {
@@ -196,6 +197,13 @@ def record_wave(
             wave_record["child_diagnostics"] = {
                 str(k): dict(v) for k, v in sorted(child_diagnostics.items())
             }
+        # The operator CLASS each unit's failure called for — recorded, never
+        # dispatched (SHADOW). It rides the same additive contract as `evidence`:
+        # absent ⇒ no key, so a caller without operators yields a byte-identical
+        # wave record to before this field existed.
+        operators = diagnostics.get("operators")
+        if operators:
+            wave_record["operators"] = {str(k): str(v) for k, v in sorted(operators.items())}
     state.setdefault("waves", []).append(wave_record)
 
     failed_fixes: dict[str, list[str]] = state.setdefault("failed_fixes", {})
