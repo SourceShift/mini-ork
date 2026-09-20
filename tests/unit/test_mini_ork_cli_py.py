@@ -326,6 +326,50 @@ def test_gen_profile_reads_assets_from_recipe_base(tmp_path, monkeypatch):
     assert data["artifact_destination"] == ["out/verified.json"]
 
 
+def test_gen_profile_target_repo_prefers_mo_target_cwd(tmp_path, monkeypatch):
+    """A spawned child runs with cwd = an EMPTY scratch workspace, so
+    ``Path.cwd()`` is not the repo under repair. ``MO_TARGET_CWD`` is the
+    documented lever for where dispatched agents write, and the profile is what
+    the implementer reads to find its target — the two must agree.
+
+    Live receipt (book d0df3cdb ch2): every goal-loop child read
+    ``target_repo=<empty runs/.../children/<id>/worktree>``, reported "no source
+    visibility", and no-op'd, so the outer loop saw a 0-byte diff it could never
+    move."""
+    root = tmp_path / "root"
+    root.mkdir()
+    agents = root / "agents.yaml"
+    agents.write_text("lanes:\n  implementer: codex\n", encoding="utf-8")
+    kickoff = tmp_path / "k.md"
+    kickoff.write_text("# Fix\n\n## Scope\n- server/\n", encoding="utf-8")
+    scratch = tmp_path / "scratch"  # the empty spawn workspace (== cwd)
+    scratch.mkdir()
+    real = tmp_path / "real-target"  # the repo actually under repair
+    real.mkdir()
+    monkeypatch.chdir(scratch)
+
+    # Unset -> the cwd fallback (unchanged host behaviour).
+    monkeypatch.delenv("MO_TARGET_CWD", raising=False)
+    data = cli.gen_profile(
+        kickoff, str(root), "code-fix", "code_fix", tmp_path / "p1.json", agents,
+    )
+    assert data["target_repo"] == str(scratch.resolve())
+
+    # Set -> the explicit lever wins over the scratch cwd.
+    monkeypatch.setenv("MO_TARGET_CWD", str(real))
+    data = cli.gen_profile(
+        kickoff, str(root), "code-fix", "code_fix", tmp_path / "p2.json", agents,
+    )
+    assert data["target_repo"] == str(real)
+
+    # A stale lever (dir gone) must not poison the profile - fall back to cwd.
+    monkeypatch.setenv("MO_TARGET_CWD", str(tmp_path / "gone"))
+    data = cli.gen_profile(
+        kickoff, str(root), "code-fix", "code_fix", tmp_path / "p3.json", agents,
+    )
+    assert data["target_repo"] == str(scratch.resolve())
+
+
 def test_recipe_root_helpers_honor_recipe_root_env(monkeypatch):
     from mini_ork.cli import execute as ex
     from mini_ork.cli import execute_handlers as eh

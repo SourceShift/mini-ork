@@ -318,10 +318,20 @@ def gen_profile(kickoff_path, root, recipe, task_class, profile_path, agents_pat
     if questions:
         status = "blocked_profile" if high_risk else "needs_answers"
 
+    # The implementer reads this file to learn WHICH repo it is fixing, so it must
+    # agree with the edit surface `_resolve_target_cwd` pins. `Path.cwd()` did not:
+    # a spawned child runs with cwd = an empty scratch workspace while
+    # MO_TARGET_CWD — the documented lever for where dispatched agents write —
+    # carries the real target repo. Live receipt: every goal-loop child read
+    # `target_repo=<empty runs/.../children/<id>/worktree>`, reported "no source
+    # visibility", and no-op'd, so the outer loop saw a 0-byte diff it could never
+    # move. Prefer the explicit lever; leave the cwd fallback for host runs.
+    _explicit_target = context_env("MO_TARGET_CWD", "") or ""
     data = {
         "schema_version": "1.0",
         "kickoff_path": str(kickoff.resolve()),
-        "target_repo": str(Path.cwd().resolve()),
+        "target_repo": _explicit_target if os.path.isdir(_explicit_target)
+        else str(Path.cwd().resolve()),
         "recipe": recipe,
         "task_class": task_class,
         "user_goal": first_heading(),
