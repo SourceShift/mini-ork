@@ -21,6 +21,18 @@ def set_status(db, run_id, new_status):  # late binding — avoids the execute<-
     from mini_ork.cli.execute import set_status as _impl  # noqa: PLC0415
     return _impl(db, run_id, new_status)
 
+def _recipe_root(root):
+    """Base dir for recipe assets. ``main.py`` resolves a recipe against the
+    consumer's ``MINI_ORK_HOME`` overlay and threads the winning base via
+    ``MINI_ORK_RECIPE_ROOT``; honor it so the artifact contract read here is the
+    SAME copy the workflow and verifier scripts were loaded from. Without this
+    the engine checkout's copy wins, so a consumer overlay that fixes its
+    contract (this recipe's stale list-valued ``source_artifact`` → TypeError in
+    ``_envsubst``, i.e. the whole run failing its ``exit_code !== 0`` gate while
+    the synthesis and both verifiers pass) never takes effect."""
+    return os.environ.get("MINI_ORK_RECIPE_ROOT") or root
+
+
 def _envsubst(s):
     """B2-C: envsubst-equivalent — expand $VAR / ${VAR} from the environment, BLANKING
     unset vars (os.path.expandvars leaves them literal, which commits garbage
@@ -169,7 +181,8 @@ def publisher_node(root, run_dir, db, run_id, recipe, task_class, review_file=""
             print("  [BLOCK] publisher: panel verdict is not approved — publish refused", file=sys.stderr)
             return 1, "verdict_fail"
     # ── artifact contract
-    contract = os.path.join(root, "recipes", recipe, "artifact_contract.yaml") if recipe else ""
+    contract = (os.path.join(_recipe_root(root), "recipes", recipe, "artifact_contract.yaml")
+                if recipe else "")
     if not contract or not os.path.isfile(contract):
         print(f"  [warn] publisher: no artifact_contract.yaml at {contract} — skipping", file=sys.stderr)
         return 0, "done"
