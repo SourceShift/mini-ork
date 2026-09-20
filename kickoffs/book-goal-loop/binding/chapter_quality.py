@@ -23,6 +23,14 @@ doc_version, sections the commit path never hashed). That is the honest ceiling
 of a gold-free signal, and it is exactly the gap a self-reported judge flag
 leaves: the judge says "pass", this says "there is something there".
 
+Most of the floor is a LOWER BOUND over the committed text, which by construction
+cannot see content LOSS: a chapter that kept every word and lost every figure
+trips nothing. So one term is relational instead — the figure ledger, comparing
+the ``viz_image`` blocks the chapter was given against the ones still live. The
+two halves disagree when a cascade soft-delete (``is_deleted`` set, ``deleted_at``
+still NULL — the parent-driven trigger walking ``parent_uuid``) strips a
+chapter's figures while its prose and its judge flag are untouched.
+
 A committed chapter with NO section rows fails by design: a commit whose parts
 cannot be located cannot be verified as non-vacuous. Operators who would rather
 observe than enforce set ``MO_GOAL_QUALITY_MODE=warn`` on the predicate side.
@@ -39,6 +47,12 @@ import sys
 # Placeholder / vacuity markers. Calibrated against the one known-good committed
 # chapter (book d0df3cdb ch1, judge-passed, 23,090 chars): zero hits across all
 # patterns, so a real chapter does not trip them.
+#
+# The unresolved-template term carries a negative lookbehind for `$`. A chapter
+# documenting CI legitimately quotes GitHub Actions expressions such as
+# ``${{ secrets.PACT_BROKER_URL }}``; that is content, not generator residue, and
+# a bare ``{{ ... }}`` still trips. Without this a chapter can never clear the
+# floor on text it is correct to have written.
 _PLACEHOLDERS: tuple[tuple[str, str], ...] = (
     ("todo", r"\bTODO\b"),
     ("tbd", r"\bTBD\b"),
@@ -46,7 +60,7 @@ _PLACEHOLDERS: tuple[tuple[str, str], ...] = (
     ("xxx", r"\bXXX+\b"),
     ("lorem-ipsum", r"lorem ipsum"),
     ("fill-me", r"\[(insert|fill|add|todo|tbd)\b"),
-    ("unresolved-template", r"\{\{[^}]{1,60}\}\}"),
+    ("unresolved-template", r"(?<!\$)\{\{[^}]{1,60}\}\}"),
     ("placeholder", r"\bplaceholder\b"),
     ("as-an-ai", r"as an AI language model"),
     ("empty-heading", r"^#{1,6}\s*\.\.\.\s*$"),
@@ -54,6 +68,28 @@ _PLACEHOLDERS: tuple[tuple[str, str], ...] = (
 _HEADING = re.compile(r"^#{1,6}\s+\S", re.M)
 
 _LATEST = "book_uuid='{book}' AND chapter_number={chapter} AND is_latest"
+
+# Figures live in ``blocks`` (``node_type='viz_image'`` bound to the chapter via
+# ``source_type='book_chapter'`` + ``source_id=<chapter_uuid>``), NOT in the
+# section markdown this script otherwise reads. So every floor above is blind to
+# a chapter that kept its prose and lost its figures.
+_FIGURES = (
+    "WITH ch AS ("
+    "  SELECT chapter_uuid FROM book_chapter_lifecycle"
+    "   WHERE book_uuid='{book}' AND chapter_number={chapter} LIMIT 1"
+    ") SELECT"
+    "  (SELECT count(*) FROM blocks b WHERE b.node_type='viz_image'"
+    "     AND b.source_type='book_chapter' AND b.source_id=ch.chapter_uuid::text),"
+    "  (SELECT count(*) FROM blocks b WHERE b.node_type='viz_image'"
+    "     AND b.source_type='book_chapter' AND b.source_id=ch.chapter_uuid::text"
+    "     AND b.is_deleted IS NOT TRUE AND b.deleted_at IS NULL),"
+    "  (SELECT count(*) FROM blocks b WHERE b.node_type='viz_image'"
+    "     AND b.source_type='book_chapter' AND b.source_id=ch.chapter_uuid::text"
+    "     AND b.is_deleted IS TRUE AND b.deleted_at IS NULL),"
+    "  (SELECT count(*) FROM bg_source_figure_attempt a"
+    "     WHERE a.chapter_uuid=ch.chapter_uuid AND a.figure_block_uuid IS NOT NULL)"
+    " FROM ch;"
+)
 
 
 def _q(sql: str) -> subprocess.CompletedProcess[str]:
@@ -108,6 +144,43 @@ def _meta(book: str, chapter: str) -> list[tuple[int, str, int, str, int]] | Non
     return out
 
 
+def _figures(book: str, chapter: str) -> dict[str, int] | None:
+    """Figure liveness for one chapter, from the two tables that disagree.
+
+    ``attached`` = viz_image blocks the generation path bound to this chapter;
+    ``live`` = how many are still reader-visible; ``cascade`` = the subset
+    soft-deleted with a NULL ``deleted_at``. That last signature is the whole
+    point: a parent-driven cascade fires a row-level trigger that walks
+    ``parent_uuid``, so a statement-level ``node_type <> 'viz_image'`` carve-out
+    does not stop it, and every figure a chapter owns can disappear while the
+    chapter still reads committed + rubric-pass. ``attempts`` is the figure
+    pipeline's own attachment count, carried so a reason can distinguish
+    "harvested then wiped" from "never had figures".
+
+    One row, four small columns — the same single-line ``split('|')`` parse
+    discipline as ``_meta``. ``None`` on a probe error, never conflated with
+    "no figures".
+    """
+    proc = _q(_FIGURES.format(book=book, chapter=chapter))
+    if proc.returncode != 0:
+        return None
+    line = proc.stdout.strip()
+    if not line:
+        # No lifecycle row for this chapter — nothing was ever given figures.
+        # Not a probe error: a chapter that cannot be located already fails
+        # `no-sections` above, and conflating the two would make this term
+        # fail-closed on a chapter no term can describe.
+        return {"attached": 0, "live": 0, "cascade": 0, "attempts": 0}
+    parts = line.split("|")
+    if len(parts) < 4:
+        return None
+    try:
+        attached, live, cascade, attempts = (int(p) for p in parts[:4])
+    except ValueError:
+        return None
+    return {"attached": attached, "live": live, "cascade": cascade, "attempts": attempts}
+
+
 def _blob(book: str, chapter: str) -> str:
     """The concatenated committed markdown. One column, one row — newlines in
     the payload are harmless because the whole stdout is the value."""
@@ -119,10 +192,19 @@ def _blob(book: str, chapter: str) -> str:
     return proc.stdout if proc.returncode == 0 else ""
 
 
+_UNPROBED = object()
+
+
 def _failures(
     rows: list[tuple[int, str, int, str, int]], blob: str,
+    figures: object = _UNPROBED,
 ) -> tuple[list[str], dict[str, object]]:
-    """The floor's verdict. Returns ``(failures, facts)``; empty failures == pass."""
+    """The floor's verdict. Returns ``(failures, facts)``; empty failures == pass.
+
+    ``figures`` is ``_UNPROBED`` when the caller did not ask (the term is then
+    inert, so the pure verdict logic stays independently testable), a dict from
+    ``_figures``, or ``None`` for a probe error — which fails closed.
+    """
     min_sections = _int_env("MO_GOAL_QUALITY_MIN_SECTIONS", 3)
     min_section_chars = _int_env("MO_GOAL_QUALITY_MIN_SECTION_CHARS", 400)
     min_total_chars = _int_env("MO_GOAL_QUALITY_MIN_TOTAL_CHARS", 4000)
@@ -136,6 +218,7 @@ def _failures(
         "min_section_chars": min(lengths) if lengths else 0,
         "headings": len(_HEADING.findall(blob)),
         "doc_version": doc_versions[0] if len(doc_versions) == 1 else doc_versions,
+        "figures": figures,
     }
 
     if not rows:
@@ -163,6 +246,28 @@ def _failures(
         hits = len(re.findall(pattern, blob, flags=re.I | re.M))
         if hits:
             bad.append(f"placeholder:{name}x{hits}")
+
+    # Figure ledger. The relational term the text floors cannot express: every
+    # figure the chapter was GIVEN must still be live. A chapter whose figure
+    # count dropped is not the chapter the judge passed, however good its prose.
+    # `MO_GOAL_QUALITY_FIGURES=warn` records the counts without failing, for the
+    # case where a drop is a deliberate regeneration rather than a cascade loss.
+    figures_enforcing = (
+        os.environ.get("MO_GOAL_QUALITY_FIGURES", "enforce").strip().lower() != "warn"
+    )
+    if figures is _UNPROBED:
+        facts["figures"] = None
+    elif figures is None:
+        bad.append("figure-probe-error")
+    elif isinstance(figures, dict) and figures["attached"] and figures["live"] < figures["attached"]:
+        detail = (
+            f"figure-loss attached={figures['attached']} live={figures['live']}"
+            f" cascade={figures['cascade']} attempts={figures['attempts']}"
+        )
+        if figures_enforcing:
+            bad.append(detail)
+        else:
+            facts["figure_warn"] = detail
     return bad, facts
 
 
@@ -184,12 +289,17 @@ def main(argv: list[str]) -> int:
         print(f"ch{chapter} QUALITY-FAIL db-error")
         return 3
 
-    bad, facts = _failures(rows, _blob(book, chapter))
+    figures = _figures(book, chapter)
+    bad, facts = _failures(rows, _blob(book, chapter), figures)
     summary = (
         f"sections={facts['sections']} total={facts['total_chars']} "
         f"min_section={facts['min_section_chars']} "
         f"headings={facts['headings']} doc_version={facts['doc_version']}"
     )
+    if figures:
+        summary += f" figures={figures['live']}/{figures['attached']}"
+    if facts.get("figure_warn"):
+        summary += f" [{facts['figure_warn']}]"
     if bad:
         print(f"ch{chapter} QUALITY-FAIL {summary} :: {'; '.join(bad)}")
         return 1
