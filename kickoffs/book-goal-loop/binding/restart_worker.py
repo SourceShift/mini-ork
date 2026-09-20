@@ -112,6 +112,23 @@ Env
     MO_WORKER_STOP_TIMEOUT_SECONDS  wait for the supervised unit to exit (default 120)
     MINI_ORK_RUN_DIR               where the replacement's log is written
     MO_GOAL_WORKER_RESTART_DRY     =1 -> resolve + print the plan, touch nothing
+    MO_GOAL_SYNC_UPSTREAM          =0 -> skip the pre-spawn upstream merge (default 1)
+
+Why we RESYNC the deploy target with the product branch first
+------------------------------------------------------------
+The deploy target is a long-lived branch that the loop's children commit their
+fixes onto, so it drifts behind the product branch as main advances — and a fix
+merged to main is INVISIBLE to the worker here until the branch it actually runs
+contains it. Measured 2026-09-20: the jina figure-preservation fix (ba57a71e4)
+was merged to main, but the deploy target was 14 commits behind, so every chapter
+kept losing its figures while the fix was reported as shipped. A restart is
+already the "make the code live" edge, so it is the right place to close that
+gap: before spawning, merge the product branch in.
+
+A merge never drops a commit, and a failure here must NEVER block the restart —
+a conflict, a dirty tree or an unreachable remote aborts the merge and warns,
+leaving the worktree exactly as it was. Resolving a conflict automatically (e.g.
+-X ours/theirs) would be a fabricated fix, so we refuse to guess and say so.
 
 Exit 0 == the fixed worker is up (or DRY plan printed); non-zero == restart failed.
 """
@@ -154,6 +171,67 @@ _FAIL_MARKERS = (
     "giving up",  # watchdog exhausted its restart budget
     "check-dev-toolchain",  # worktree toolchain gate refused
 )
+
+
+# Product branches the deploy target tracks, most-preferred first. The loop's
+# branch carries its own fix commits, so it falls behind as main advances — and a
+# fix merged to main never reaches the running worker until the branch it runs
+# contains it (see 'Why we RESYNC the deploy target').
+_SYNC_REFS = ("origin/main", "main")
+
+
+def _git(worktree: str, *args: str, timeout: int = 120) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", "-C", worktree, *args],
+        capture_output=True, text=True, timeout=timeout,
+    )
+
+
+def _sync_upstream(worktree: str) -> str:
+    """Merge the product branch into the deploy target. Returns a one-line why.
+
+    Best-effort by construction: every failure path aborts the merge and returns
+    a description, so the restart that follows is never blocked and the worktree
+    is never left mid-merge.
+    """
+    if os.environ.get("MO_GOAL_SYNC_UPSTREAM", "").strip() == "0":
+        return "disabled (MO_GOAL_SYNC_UPSTREAM=0)"
+
+    ref = next(
+        (
+            candidate
+            for candidate in _SYNC_REFS
+            if _git(worktree, "rev-parse", "--verify", "--quiet", f"{candidate}^{{commit}}").returncode == 0
+        ),
+        None,
+    )
+    if ref is None:
+        return "no upstream ref (origin/main, main) — skipped"
+
+    # Best-effort refresh; an unreachable remote must not fail a deploy.
+    _git(worktree, "fetch", "--no-tags", "origin", "main", timeout=90)
+
+    if _git(worktree, "merge-base", "--is-ancestor", ref, "HEAD").returncode == 0:
+        return f"already contains {ref}"
+
+    merged = _git(worktree, "merge", "--no-edit", ref)
+    if merged.returncode == 0:
+        head = _git(worktree, "rev-parse", "--short", "HEAD").stdout.strip()
+        return f"merged {ref} into the deploy target (HEAD {head})"
+
+    # Never guess: leave the tree byte-identical to how we found it and name the
+    # paths so an operator (or the next wave's evidence) can see what to resolve.
+    conflicted = _git(worktree, "diff", "--name-only", "--diff-filter=U").stdout.split()
+    _git(worktree, "merge", "--abort")
+    detail = ", ".join(conflicted[:8]) if conflicted else (
+        (merged.stderr.strip().splitlines() or ["(unknown)"])[-1]
+    )
+    print(
+        f"worker-restart WARN: could not merge {ref} into the deploy target — left the tree "
+        f"untouched; resolve by hand. Conflicted: {detail}",
+        file=sys.stderr,
+    )
+    return f"merge conflict against {ref} ({detail})"
 
 
 def _pgrep(pattern: str) -> list[int]:
@@ -591,6 +669,11 @@ def main(argv: list[str]) -> int:
     print(f"worker-restart stop: {why_stop}")
     if not stopped:
         return 1
+    # Deploy the fixed code AND the product branch it must keep pace with: a fix
+    # merged to main is invisible to this worker until the branch it runs
+    # contains it. After the incumbent is down (no live worker racing the file
+    # writes) and before the replacement starts (it must load the merged tree).
+    print(f"worker-restart sync: {_sync_upstream(worktree)}")
     started, why_start = _start_replacement(worktree, role, log_path)
     print(f"worker-restart start: {why_start}")
     if not started:
