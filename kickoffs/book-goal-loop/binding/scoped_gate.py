@@ -83,6 +83,38 @@ def _run(argv: list[str], cwd: str, timeout_s: int) -> tuple[int, str]:
     return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
 
 
+def _scoped_base() -> str:
+    """The child's own START POINT — never a long-lived branch ref.
+
+    ``MO_GOAL_SCOPED_BASE`` defaults to ``origin/main``, which is the wrong
+    base by construction: ``git diff origin/main...HEAD`` in the target worktree
+    is the WHOLE feature branch's divergence, not this child's change. A child
+    that edited nothing then gets typechecked against dozens of unrelated files
+    and reddens on pre-existing diagnostics — the exact phantom-red this gate
+    exists to avoid. Observed live: a zero-change child reported "scoped
+    typecheck failed for 44 changed file(s)".
+
+    The child's run dir carries ``pre-implementer-ref`` — its HEAD (or a
+    ``git stash create`` snapshot of the tree) captured BEFORE the first
+    implementer edit. That is the only base that makes the diff the child's own,
+    and it still counts committed work: ``base...HEAD`` picks up any commit the
+    child made on top of it. ``MO_GOAL_SCOPED_BASE`` remains the fallback for
+    callers with no run dir (bare ``scoped_gate.py`` invocations).
+    """
+    home = os.environ.get("MINI_ORK_HOME", "").strip()
+    run_id = os.environ.get("MINI_ORK_RUN_ID", "").strip()
+    if home and run_id:
+        try:
+            ref = Path(home, "runs", run_id, "pre-implementer-ref").read_text(
+                encoding="utf-8"
+            ).strip()
+        except OSError:
+            ref = ""
+        if re.fullmatch(r"[0-9a-fA-F]{7,40}", ref):
+            return ref
+    return os.environ.get("MO_GOAL_SCOPED_BASE", "").strip()
+
+
 def _changed(root: str, base: str) -> list[str]:
     """Repo-relative paths the child has touched: working tree, untracked, and
     (when ``base`` resolves) everything committed on top of it."""
@@ -195,7 +227,7 @@ def main(argv: list[str]) -> int:
     # resolves the config through its own realpath, so a symlinked target (a
     # macOS mktemp dir, say) would render every error path as "../../..".
     root = os.path.realpath(os.environ.get("MO_GOAL_TARGET_CWD") or os.getcwd())
-    files = _changed(root, os.environ.get("MO_GOAL_SCOPED_BASE", "").strip())
+    files = _changed(root, _scoped_base())
     if mode == "typecheck":
         files = [f for f in files if not TEST_RE.search(f)]
     if not files:
