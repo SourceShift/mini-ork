@@ -40,7 +40,10 @@ Env contract (identical to bash):
     MO_APPLY_REGRESSION_TOLERANCE default 0 (strict per-task no-regression)
     MO_APPLY_PERTASK_JSON         optional {"before":[...],"after":[...]}
     MO_APPLY_MIN_EXAMPLES         default 1
-    MO_APPLY_SCORER               probe (default) | mock | gepa. mock/gepa are
+    MO_APPLY_SCORER               probe (default) | code | mock | gepa. `code`
+                                  scores a PATCH against the framework tree
+                                  (MO_APPLY_CODE_PATCH) instead of a directive.
+                                  mock/gepa are
                                   TEST-ONLY: they fabricate utility and can
                                   never promote, regardless of env
     MO_APPLY_MOCK_BASELINE        mock baseline (score: 0.5; gate: 0.0)
@@ -801,13 +804,21 @@ def apply_run(task_class: str, target_kind: str, target_name: str,
     probe_unmeasured = False
     probe_dead_arms = False
     utility_after = ""
-    if scorer == "probe":
+    if scorer in ("probe", "code"):
         from mini_ork.learning import probe_scorer as _ps  # deferred: cycle-safe
         try:
-            probe_result = _ps.probe_score(
-                task_class, target_file, suggested_change,
-                source_ref=f"{source_kind}:{source_id}" if source_id else "",
-                context=parsed.get("signal", ""))
+            if scorer == "code":
+                # A code candidate is a PATCH against the framework tree, not a
+                # directive appended to a prompt: the directive args do not
+                # apply and are deliberately not passed. Both scorers share the
+                # same result shape, so the gate below is unchanged.
+                probe_result = _ps.probe_score_code(
+                    task_class, os.environ.get("MO_APPLY_CODE_PATCH", ""))
+            else:
+                probe_result = _ps.probe_score(
+                    task_class, target_file, suggested_change,
+                    source_ref=f"{source_kind}:{source_id}" if source_id else "",
+                    context=parsed.get("signal", ""))
         except RuntimeError as exc:
             sys.stderr.write(f"[probe-scorer] {exc}\n")
             probe_result = None

@@ -777,14 +777,18 @@ def test_launch_run_scrubs_run_scoped_env(tmp_path, monkeypatch, envscrub):
 
     class FakeProc:
         returncode = 0
-        stdout = 'mini_ork_result={"run_id": "run-1-1"}\n'
-        stderr = ""
 
-    def fake_run(_cmd, **kw):
-        captured.update(kw)
-        return FakeProc()
+        def __init__(self, _cmd, **kw):
+            captured.update(kw)
+            self.pid = 4242
 
-    monkeypatch.setattr(ps.subprocess, "run", fake_run)
+        def poll(self):
+            return 0  # the arm's process is already gone
+
+        def communicate(self, timeout=None):
+            return ('mini_ork_result={"run_id": "run-1-1"}\n', "")
+
+    monkeypatch.setattr(ps.subprocess, "Popen", FakeProc)
     monkeypatch.setattr(ps, "_ROOT", str(tmp_path))
     for var, val in (("MINI_ORK_RUN_ID", "run-parent-99"),
                      ("MINI_ORK_TASK_RUN_ID", "run-parent-99"),
