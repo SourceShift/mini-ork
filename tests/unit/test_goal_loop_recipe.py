@@ -69,6 +69,8 @@ evidence_sha = _tmod._evidence_sha
 render_wave_history_block = _tmod._render_wave_history_block
 select_units = _tmod._select_units
 unit_sort_key = _tmod._unit_sort_key
+classify_failure = _tmod.classify_failure
+operator_for = _tmod._operator_for
 
 
 # ── Module-state fixtures ──────────────────────────────────────────────────
@@ -888,3 +890,91 @@ def test_harvest_selected_evidence_unset_history_is_byte_identical(tmp_path, mon
     assert out["1"]["text"] == "deep evidence for 1"
     assert "### Prior waves" not in out["1"]["text"]
     assert evidence_sha(out["1"]["text"]) == evidence_sha("deep evidence for 1")
+
+
+# ── 8. diagnostic policy: operator typing (SHADOW) ────────────────────────
+# The loop's historical action set is a single constant — spawn
+# MO_GOAL_CHILD_RECIPE for the selected unit — so a failure class the child
+# cannot reach is re-paid every wave. classify_failure NAMES the class; it
+# never changes dispatch. These pin the classifier's conservatism (the
+# property that makes recording it safe) and the disable switch.
+
+_CH4_NEVER_RAN = (
+    "ch4 FAIL status=pending rubric=pending committed=f permfail=f "
+    "degraded=f attempts=0 mdlen=43368"
+)
+_CH1_HARNESS_CONFLICT = (
+    "ch1 FAIL status=generating rubric=pass committed=f attempts=2 mdlen=0 "
+    "err=chapterGevalRepair: 0 of 10 edits anchored"
+)
+
+
+def test_classify_failure_defaults_to_code_fix():
+    operator, rationale = classify_failure("ch9 FAIL status=failed mdlen=100")
+    assert operator == "code-fix"
+    assert "historical default" in rationale
+
+
+def test_classify_failure_names_dispatch_repair_for_a_unit_that_never_ran():
+    """status=pending + attempts=0 ⇒ no child can reach the cause: it never ran."""
+    operator, rationale = classify_failure(_CH4_NEVER_RAN)
+    assert operator == "dispatch-repair"
+    assert "never ran" in rationale
+
+
+def test_classify_failure_names_framework_edit_for_a_harness_stage_conflict():
+    operator, rationale = classify_failure(_CH1_HARNESS_CONFLICT)
+    assert operator == "framework-edit"
+    assert "stage-order" in rationale
+
+
+def test_classify_failure_does_not_escalate_on_a_bare_stage_mention():
+    """A stage name alone is not a signature — prose ABOUT GevalRepair is code-fix.
+
+    Conservatism is the load-bearing property: over-escalating would mislabel a
+    genuine prose bug as a harness bug, which is worse than not classifying.
+    """
+    operator, _ = classify_failure(
+        "ch3 FAIL status=failed err=chapterGevalRepair threw on malformed prose"
+    )
+    assert operator == "code-fix"
+
+
+def test_classify_failure_treats_a_running_unit_as_code_fix():
+    """attempts>0 means it DID run — the never-ran signature must not fire."""
+    operator, _ = classify_failure(
+        "ch7 FAIL status=generating rubric=fail committed=f attempts=3 mdlen=900"
+    )
+    assert operator == "code-fix"
+
+
+def test_classify_failure_never_raises_and_defaults_on_empty():
+    for reason in ("", None):
+        operator, rationale = classify_failure(reason)  # type: ignore[arg-type]
+        assert operator == "code-fix"
+        assert rationale
+
+
+def test_operator_for_honors_the_disable_switch(monkeypatch):
+    """MO_GOAL_OPERATOR_TYPING=0 pins every unit to code-fix (today's behavior)."""
+    goal_state = {"4": {"pass": False, "reason": _CH4_NEVER_RAN}}
+
+    monkeypatch.delenv("MO_GOAL_OPERATOR_TYPING", raising=False)
+    assert operator_for("4", goal_state)[0] == "dispatch-repair"
+
+    monkeypatch.setenv("MO_GOAL_OPERATOR_TYPING", "0")
+    operator, rationale = operator_for("4", goal_state)
+    assert operator == "code-fix"
+    assert "disabled" in rationale
+
+
+def test_operator_for_reads_each_units_own_reason(monkeypatch):
+    """The operator is per-unit: one reason must not classify its neighbours."""
+    monkeypatch.delenv("MO_GOAL_OPERATOR_TYPING", raising=False)
+    goal_state = {
+        "1": {"pass": True, "reason": "ch1 PASS status=completed"},
+        "4": {"pass": False, "reason": _CH4_NEVER_RAN},
+        "5": {"pass": False, "reason": "ch5 FAIL status=failed"},
+    }
+    assert operator_for("4", goal_state)[0] == "dispatch-repair"
+    assert operator_for("5", goal_state)[0] == "code-fix"

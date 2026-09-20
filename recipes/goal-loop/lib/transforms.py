@@ -128,6 +128,72 @@ def _quarantined_from_env() -> set[str]:
     }
 
 
+# Operator taxonomy — the CLASS of action a failure calls for. The loop's
+# historical action set has size one: every wave spawns MO_GOAL_CHILD_RECIPE
+# (code-fix) for the selected unit. That is a constant, not a policy, and it is
+# why a failure the child cannot reach gets re-paid every wave with an
+# identical patch: the loop can only fix DOWNSTREAM of its own configuration.
+# Vocabulary: "code-fix" (default), "framework-edit", "dispatch-repair".
+_DEFAULT_OPERATOR = "code-fix"
+
+# A unit still `status=pending` with `attempts=0` never RAN. Nothing a child can
+# patch inside the chapter-writing tree changes that — the cause is upstream, in
+# the dispatcher that never started it. Observed live: ch4 held a stranded
+# dispatch claim for 29 minutes while the loop spawned code-fix children against
+# its prose, whose committed text was already 43KB.
+_NEVER_DISPATCHED = re.compile(r"\bstatus=pending\b.*\battempts=0\b")
+
+# Harness-shaped: a repair stage rejected the token/citation FORM an earlier
+# stage emitted. Both stages are configured in the harness, so this is a
+# stage-order conflict — patching the prose cannot fix a gate that rejects the
+# form the pipeline was told to produce. Signature: a named repair/gate stage
+# AND a citation-anchor complaint (the ch1 case, "0 of 10 edits anchored").
+_HARNESS_STAGE = re.compile(r"GevalRepair|FinalReaderGevalGate", re.IGNORECASE)
+_CITATION_FORM = re.compile(r"anchored|citation|\bcite\b", re.IGNORECASE)
+
+
+def classify_failure(
+    reason: str, history: list[dict[str, Any]] | None = None,
+) -> tuple[str, str]:
+    """Name the operator class a unit's failure reason calls for.
+
+    Returns ``(operator, rationale)``. Conservative by construction: an
+    unambiguous signature, or the historical default ``code-fix``. Never raises
+    — an unrecognized reason is ``code-fix``, which is today's behavior, so this
+    can only ever ADD a diagnosis, never remove one.
+
+    ``history`` is the unit's prior attempts. It is unused today and reserved so
+    a repeated identical reason can escalate later without changing the contract.
+    """
+    text = reason or ""
+    if _NEVER_DISPATCHED.search(text):
+        return (
+            "dispatch-repair",
+            "status=pending with attempts=0 — the unit never ran, so the cause is "
+            "upstream of anything a fix child can patch",
+        )
+    if _HARNESS_STAGE.search(text) and _CITATION_FORM.search(text):
+        return (
+            "framework-edit",
+            "a repair/gate stage rejected the citation form an earlier stage "
+            "emitted — a stage-order conflict in the harness, not the prose",
+        )
+    return _DEFAULT_OPERATOR, "no non-code signature; historical default"
+
+
+def _operator_for(unit_id: str, goal_state: dict[str, Any]) -> tuple[str, str]:
+    """``classify_failure`` for one unit, honoring ``MO_GOAL_OPERATOR_TYPING=0``.
+
+    SHADOW: the result is RECORDED on the plan entry and in the loop's decision
+    ledger. ``child_recipe`` — what actually spawns — is untouched, so a wave's
+    behavior is byte-identical to today until the recorded operators have been
+    graded against real outcomes.
+    """
+    if os.environ.get("MO_GOAL_OPERATOR_TYPING", "1").strip() == "0":
+        return _DEFAULT_OPERATOR, "operator typing disabled"
+    return classify_failure(str(goal_state.get(unit_id, {}).get("reason", "")))
+
+
 def _select_units(
     goal_state: dict[str, Any],
     max_children: int,
@@ -194,10 +260,15 @@ def goal_sweep_plan(workflow: CompiledWorkflow, ledger: ArtifactLedger, node_id:
         raise ArtifactContractError("goal_sweep_plan requires a sweep_plan output")
     out_path = ledger.output_path(workflow, node_id, "sweep_plan")
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    # The operator CLASS this unit's reason calls for, recorded (not dispatched).
+    operators = {unit_id: _operator_for(unit_id, goal_state) for unit_id in selected}
+
     plan = [
         {
             "unit_id": unit_id,
             "child_recipe": child_recipe,
+            "operator": operators[unit_id][0],
+            "operator_rationale": operators[unit_id][1],
             "kickoff_hint": {
                 "unit_id": unit_id,
                 "reason": goal_state[unit_id].get("reason", ""),

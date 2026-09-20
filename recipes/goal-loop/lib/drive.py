@@ -427,6 +427,17 @@ def _default_run_wave_fn(wave_no: int, quarantined: set[str]) -> dict[str, Any]:
             }
             if ev:
                 payload["evidence"] = ev
+            # The operator CLASS each unit's failure called for. SHADOW: the
+            # sweep still spawned `child_recipe`; this records what a typed
+            # action set WOULD have chosen, so its choices can be graded against
+            # the predicate delta before it is ever permitted to dispatch.
+            op = {
+                str(e.get("unit_id")): str(e.get("operator", ""))
+                for e in sp
+                if isinstance(e, dict) and e.get("unit_id") is not None and e.get("operator")
+            }
+            if op:
+                payload["operators"] = op
         except (json.JSONDecodeError, OSError):
             pass
 
@@ -764,11 +775,17 @@ def drive(
         )
         raw_evidence = verdict_dict.get("evidence")
         raw_child = verdict_dict.get("child_diagnostics")
+        raw_operators = verdict_dict.get("operators")
         diagnostics = None
-        if isinstance(raw_evidence, dict) or isinstance(raw_child, dict):
+        if (
+            isinstance(raw_evidence, dict)
+            or isinstance(raw_child, dict)
+            or isinstance(raw_operators, dict)
+        ):
             diagnostics = {
                 "evidence": raw_evidence if isinstance(raw_evidence, dict) else {},
                 "child_diagnostics": raw_child if isinstance(raw_child, dict) else {},
+                "operators": raw_operators if isinstance(raw_operators, dict) else {},
             }
 
         record_wave(
@@ -799,6 +816,14 @@ def drive(
             str(k): str(v) for k, v in (prev_wave.get("evidence") or {}).items()
         }
         decision_context["predicate_moved"] = bool(last_wave.get("predicate_moved"))
+        # The operator CLASS the loop recorded per unit. SHADOW: `child_recipe`
+        # above is what actually spawned; this is what a typed action set WOULD
+        # have chosen. Recording both is the point — the ledger can then answer
+        # "did the class we were forced to use match the class the failure called
+        # for, and what did that cost?" without a second data source.
+        decision_action["operators"] = {
+            str(k): str(v) for k, v in (last_wave.get("operators") or {}).items()
+        }
         shield_verdict = (
             {"allow": True, "guard": None, "reason": "shield off"}
             if shield_mode == "off"
