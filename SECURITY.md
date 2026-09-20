@@ -11,7 +11,7 @@
 
 Do not open a public GitHub issue for security vulnerabilities.
 
-Email the maintainers at: **security@ork-ai.dev** (placeholder — replace with real address before publishing).
+Email the maintainers at: **security@sourceshift.io**.
 
 Include:
 - Description of the vulnerability and potential impact

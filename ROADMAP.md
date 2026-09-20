@@ -33,8 +33,8 @@ families** by configuration (meeting the heterogeneity precondition for
 extraction prompt-tuning is D-048, deferred)
 - Migration 0014 relaxes `execution_traces.run_id NOT NULL` (D-039) +
   widens status check to include `pending`
-- `trace_store.sh` INSERT realigned to migration 0010's actual column
-  schema (was using `prompt_version` instead of `prompt_version_hash`)
+- `mini_ork/trace_store.py` INSERT realigned to migration 0010's actual
+  column schema (was using `prompt_version` instead of `prompt_version_hash`)
 - `_trace_write_node_rich` helper populates `files_written` +
   `cost_usd` per dispatch (D-042); reflect pipeline traverses 6 stages
   clean
@@ -81,10 +81,10 @@ extraction prompt-tuning is D-048, deferred)
 ### v0.3.0-rc1 — 2026-06-08 (current release candidate)
 
 **Oracle Hardening, Wave 1 + Wave 2 partial.** Shipped as self-contained
-primitives in `lib/` plus a positioning honesty patch. The central publisher
-wire-up now lives behind `lib/gate_bootstrap.sh` and the publisher branch in
-`bin/mini-ork-execute`; recipe-level shims remain available for explicit
-opt-in and testing.
+primitives in `mini_ork/` plus a positioning honesty patch. The central
+publisher wire-up now lives behind `mini_ork/gates/gate_bootstrap.py` and the
+publisher branch in `mini_ork/cli/publisher.py`; recipe-level shims remain
+available for explicit opt-in and testing.
 
 Grounded in 9-paper research brief synthesizing the self-evolution oracle
 question:
@@ -101,23 +101,23 @@ question:
 | Sub-epic | Status | Commit | Deliverable |
 |---|---|---|---|
 | W1-A docs/positioning honesty patch | ✅ | `615d899` | `docs/positioning/why-mini-ork.md` "Self-evolution is class-restricted" section + 2-row taxonomy table + Zenil/Setlur/DeVilling citations |
-| W1-B coalition gate primitive | ✅ | `f7890a7` | `lib/coalition_gate.sh::mo_check_panel_coalition` — emits COALITION_ABORT when ρ ≥ MO_RHO_THRESHOLD (default 0.25) OR family_count < lens_count. Rajan 2025 + Bertalanič 2026 grounded |
-| W1-C CW-POR diagnostic primitive | ✅ | `33ba189` | `lib/cw_por.sh::mo_compute_cw_por` — orthogonal panel-health metric to Krippendorff α (Agarwal & Khanna 2025) |
-| W1-D selective-feedback conjunction | ✅ | `94d3cfe` | `lib/promotion_gate.sh::mo_promote_synthesis_gate` — synthesis-class auto-promote requires panel_score + CW-POR + structural signal ALL three (Adapala 2025) |
-| W2-B adaptive stability detection | ✅ | `3dc65ca` | `lib/adaptive_stability.sh::mo_check_panel_stability` — round-over-round verdict drift drives HALT/CONTINUE between debate rounds (Hu et al 2025) |
-| W2-C behavioral circuit breaker | ✅ | `fa93340` | `lib/circuit_breaker.sh::mo_check_liveness_breaker` — three orthogonal stagnation signals (artifact-hash invariance / verdict-stuck / cost-burn-without-write) with CLOSED→OPEN→HALF_OPEN state machine. Behavioral complement to v0.2 Phase D cost-CB (`MO_DAILY_BUDGET_USD`). Registered as 7th gate type `liveness_gate` in `gate_registry.sh`. Closes the failure mode where spend is under the cap but the recipe is making zero forward progress (reviewer rejecting the same patch every cycle). Ralph-equivalent of `CB_NO_PROGRESS_THRESHOLD` / `CB_SAME_ERROR_THRESHOLD` / `CB_COOLDOWN_MINUTES` (ralph-claude-code v0.11.5). Covered by `tests/unit/test_circuit_breaker_py.py` (8-case live-bash parity gate). |
-| Phase E LIVE validation | ✅ | pending | `tests/live/phase_e_live_validation.sh` — on-demand live harness for improve → benchmark → eval → promote. Run `PHASE_E_PROVIDER=codex bash tests/live/phase_e_live_validation.sh`; 2026-06-07 report: `docs/_meta/phase-e-live-validation-20260607-125311.md` (8 OK / 0 FAIL). |
+| W1-B coalition gate primitive | ✅ | `f7890a7` | `mini_ork/gates/coalition_gate.py::check_panel_coalition` — emits COALITION_ABORT when ρ ≥ MO_RHO_THRESHOLD (default 0.25) OR family_count < lens_count. Rajan 2025 + Bertalanič 2026 grounded |
+| W1-C CW-POR diagnostic primitive | ✅ | `33ba189` | `mini_ork/gates/cw_por.py::compute_cw_por` — orthogonal panel-health metric to Krippendorff α (Agarwal & Khanna 2025) |
+| W1-D selective-feedback conjunction | ✅ | `94d3cfe` | `mini_ork/gates/promotion_gate.py::mo_promote_synthesis_gate` — synthesis-class auto-promote requires panel_score + CW-POR + structural signal ALL three (Adapala 2025) |
+| W2-B adaptive stability detection | ✅ | `3dc65ca` | `mini_ork/gates/adaptive_stability.py::check_panel_stability` — round-over-round verdict drift drives HALT/CONTINUE between debate rounds (Hu et al 2025) |
+| W2-C behavioral circuit breaker | ✅ | `fa93340` | `mini_ork/recovery/circuit_breaker.py::check_liveness_breaker` — three orthogonal stagnation signals (artifact-hash invariance / verdict-stuck / cost-burn-without-write) with CLOSED→OPEN→HALF_OPEN state machine. Behavioral complement to v0.2 Phase D cost-CB (`MO_DAILY_BUDGET_USD`). Registered as 7th gate type `liveness_gate` in `mini_ork/gates/gate_registry.py`. Closes the failure mode where spend is under the cap but the recipe is making zero forward progress (reviewer rejecting the same patch every cycle). Ralph-equivalent of `CB_NO_PROGRESS_THRESHOLD` / `CB_SAME_ERROR_THRESHOLD` / `CB_COOLDOWN_MINUTES` (ralph-claude-code v0.11.5). Covered by `tests/unit/test_circuit_breaker_py.py` (8-case parity gate). |
+| Phase E LIVE validation | ✅ | pending | On-demand live harness under `tests/live/` for improve → benchmark → eval → promote. 2026-06-07 report: `docs/_meta/phase-e-live-validation-20260607-125311.md` (8 OK / 0 FAIL). |
 | W2-A held-out anchor corpus | ⏸ | — | Hand-author per recipe — judgment-heavy corpus selection (Wang 2026) |
 | W3 mechanical citation+coverage verifier | ⏸ | — | 2-3 week sub-decomposition into 5-8 atoms (Sistla 2025 + Ficek 2025) |
 
-All 6 shipped primitives include inline self-test fixtures (4 each, 24 total) that pass on first run. Run any of them directly to see the verdicts:
+All 6 shipped primitives now live as importable Python modules under `mini_ork/`, each pinned by a unit test. Run the tests to see the verdicts:
 
 ```
-$ bash lib/cw_por.sh
-$ bash lib/promotion_gate.sh
-$ bash lib/coalition_gate.sh
-$ bash lib/adaptive_stability.sh
-$ bash lib/circuit_breaker.sh
+$ python3 -m pytest -q tests/unit/test_cw_por_py.py
+$ python3 -m pytest -q tests/unit/test_promotion_gate_py.py
+$ python3 -m pytest -q tests/unit/test_coalition_gate_py.py
+$ python3 -m pytest -q tests/unit/test_adaptive_stability_py.py
+$ python3 -m pytest -q tests/unit/test_circuit_breaker_py.py
 ```
 
 Two new framework phases added by this work:
@@ -135,18 +135,18 @@ Wire-up + remaining oracle-hardening gaps:
 
 - **Wave 1 wire-up** —
   - ✅ **Light-touch recipe opt-in** (2026-06-05): 4 thin gate shims
-    shipped under `gates/{coalition,panel-health,stability,
-    synthesis-promote}.sh`. Recipes register them via `gate_register
+    shipped under `mini_ork/gates/{coalition_gate,cw_por,
+    adaptive_stability,promotion_gate}.py`. Recipes register them via `gate_register
     custom <path> <task_class>` and list `custom` in node `gates: []`
     in workflow.yaml. Full guide at
     [`docs/architecture/oracle-gates-wiring.md`](docs/architecture/oracle-gates-wiring.md).
     Smoke-verified: coalition shim against 4-same-family fixture
     returns rc=1 + COALITION_ABORT JSON.
-  - ✅ **Central dispatcher wire-up** (2026-06-05): `lib/gate_bootstrap.sh`
+  - ✅ **Central dispatcher wire-up** (2026-06-05): `mini_ork/gates/gate_bootstrap.py`
     auto-registers all 4 oracle gates with stable gate_ids
     (`oracle-{coalition,panel-health,synthesis-promote,stability}`) +
-    task_class_filter=NULL (framework-wide). `bin/mini-ork-execute`'s
-    publisher case-branch now sources gate_bootstrap + invokes
+    task_class_filter=NULL (framework-wide). `mini_ork/cli/publisher.py`'s
+    publisher branch now loads gate_bootstrap + invokes
     `gate_run_all` BEFORE the artifact-publish loop fires. Any safety
     gate that returns `fail` flips `safety_violation=true` →
     publisher returns rc=1 with `[BLOCK] oracle-gates: safety_violation`
@@ -155,30 +155,29 @@ Wire-up + remaining oracle-hardening gaps:
     Decision tree: 3-subagent consensus (Security / Reliability /
     Maintainability) UNANIMOUS on path (b) — single chokepoint at
     measure_topology slot. Decision doc embedded in commit message of
-    the wire-up commit. Integration test
-    `tests/integration/test_oracle_gates_auto_wire.sh` pins the
-    contract (2 fixtures green, 2 deferred placeholders for follow-up
-    coverage).
-- **Wave 2-A** ✅ substrate landed 2026-06-13 in [`lib/anchor_corpus.sh`](lib/anchor_corpus.sh) (commit `f1a9032`): `anchor_corpus_load` + `anchor_corpus_recall` for held-out corpus recall scoring. Corpus content (the must-find anchor list per recipe) remains operator-authored — judgment-heavy per Wang 2026 — and ships in `recipes/<name>/anchor-corpus.json` as recipes mature.
-- **Wave 3** ✅ landed 2026-06-13 in [`lib/citation_verifier_mechanical.sh`](lib/citation_verifier_mechanical.sh): recall-floor oracle for synthesis-style findings (Sistla 2025 + Ficek 2025). Mechanical citation coverage + wireheading check in one gate (commit `31f7808`).
+    the wire-up commit. Integration coverage under `tests/integration/`
+    pins the contract (2 fixtures green, 2 deferred placeholders for
+    follow-up coverage).
+- **Wave 2-A** ✅ substrate landed 2026-06-13 in [`mini_ork/stores/anchor_corpus.py`](mini_ork/stores/anchor_corpus.py) (commit `f1a9032`): `anchor_corpus_load` + `anchor_corpus_recall` for held-out corpus recall scoring. Corpus content (the must-find anchor list per recipe) remains operator-authored — judgment-heavy per Wang 2026 — and ships in `recipes/<name>/anchor-corpus.json` as recipes mature.
+- **Wave 3** ✅ landed 2026-06-13 in [`mini_ork/gates/citation_verifier_mechanical.py`](mini_ork/gates/citation_verifier_mechanical.py): recall-floor oracle for synthesis-style findings (Sistla 2025 + Ficek 2025). Mechanical citation coverage + wireheading check in one gate (commit `31f7808`).
 
 ### Calibration + adversarial gates (the positioning-doc honest-gaps list)
 
 All four calibration-list items shipped 2026-06-13. The list is closed.
 
-- ✅ **Krippendorff α calibration gate** ([`lib/krippendorff_alpha_gate.sh`](lib/krippendorff_alpha_gate.sh), commit `3d1e815`) — α<0.4 across panel lens scores escalates to human review per Nasser 2026.
-- ✅ **Adversarial fabricated-bug injection** ([`lib/refute_or_promote_gate.sh`](lib/refute_or_promote_gate.sh), commit `ad48ef3`) — two leaf primitives (generate N fabrications + check FP-survival) per [Agarwal 2026 *Refute-or-Promote*](https://arxiv.org/abs/2604.19049). FP-survival > 10% triggers REFUTE_FAILED.
-- ✅ **Wireheading check on validators** ([`lib/citation_verifier_mechanical.sh`](lib/citation_verifier_mechanical.sh), commit `31f7808`) — same gate as Wave 3. Mechanically resolves each citation against repo root; coverage < 80% triggers CITATION_UNDERCOVERED.
-- ✅ **Honest confidence intervals on every claim** ([`lib/honest_ci_gate.sh`](lib/honest_ci_gate.sh), commit `91eba3d`) — per-finding CI from lens votes via t-dist with df=n-1 per [Dai 2025 *Semantic Triangulation*](https://arxiv.org/abs/2511.12288). wide_ratio > 30% triggers CI_TOO_WIDE.
+- ✅ **Krippendorff α calibration gate** ([`mini_ork/gates/krippendorff_alpha_gate.py`](mini_ork/gates/krippendorff_alpha_gate.py), commit `3d1e815`) — α<0.4 across panel lens scores escalates to human review per Nasser 2026.
+- ✅ **Adversarial fabricated-bug injection** ([`mini_ork/gates/refute_or_promote_gate.py`](mini_ork/gates/refute_or_promote_gate.py), commit `ad48ef3`) — two leaf primitives (generate N fabrications + check FP-survival) per [Agarwal 2026 *Refute-or-Promote*](https://arxiv.org/abs/2604.19049). FP-survival > 10% triggers REFUTE_FAILED.
+- ✅ **Wireheading check on validators** ([`mini_ork/gates/citation_verifier_mechanical.py`](mini_ork/gates/citation_verifier_mechanical.py), commit `31f7808`) — same gate as Wave 3. Mechanically resolves each citation against repo root; coverage < 80% triggers CITATION_UNDERCOVERED.
+- ✅ **Honest confidence intervals on every claim** ([`mini_ork/gates/honest_ci_gate.py`](mini_ork/gates/honest_ci_gate.py), commit `91eba3d`) — per-finding CI from lens votes via t-dist with df=n-1 per [Dai 2025 *Semantic Triangulation*](https://arxiv.org/abs/2511.12288). wide_ratio > 30% triggers CI_TOO_WIDE.
 
 ### Evolution + promotion layer (deferred from v0.2)
 
-- `lib/group_evolver.sh` proposes workflow candidates based on accumulated
-  trace + gradient data; `mini-ork improve` materialises them
-- `lib/promotion_gate.sh` enforces utility-delta + benchmark-pass + safety
-  checks before promoting a candidate to the active workflow
-- `lib/version_registry.sh` exposes rollback as a first-class CLI verb:
-  `mini-ork rollback <workflow|agent> <name>`
+- `mini_ork/learning/group_evolver.py` proposes workflow candidates based on
+  accumulated trace + gradient data; `mini-ork improve` materialises them
+- `mini_ork/gates/promotion_gate.py` enforces utility-delta + benchmark-pass +
+  safety checks before promoting a candidate to the active workflow
+- `mini_ork/registries/version_registry.py` exposes rollback as a first-class
+  CLI verb: `mini-ork rollback <workflow|agent> <name>`
 
 ### Substrate ✓ closed in v0.2-pt24..pt36
 
@@ -231,8 +230,9 @@ downstream depends on it)
    (`packages/database/src/schemas/agentOperations.ts`).
 2. **Error taxonomy on `llm_calls`.** Add `error_category`
    (auth/quota/capacity/request/safety/network/stream/provider/config) +
-   retryable-vs-fatal classification in `lib/llm-dispatch.sh`, extending
-   `lib/throttle-guard.sh`'s provider-throttle classification to the full
+   retryable-vs-fatal classification in `mini_ork/dispatch/llm_dispatch.py`,
+   extending
+   `mini_ork/dispatch/throttle_guard.py`'s provider-throttle classification to the full
    taxonomy (`packages/model-runtime/src/errors/taxonomy.ts`,
    `utils/isNonRetryableRequestError.ts`).
 3. **Finish reasons on node lifecycle.** `node_end` events carry *why*
@@ -254,7 +254,7 @@ truth)
    cache-write tokens in `llm_calls`; bill cache reads at cache rate,
    subtract from input. Largest current cost error on Anthropic-heavy
    lanes (`packages/model-runtime/src/core/usageConverters/utils/computeChatCost.ts:35-209`).
-6. ✅ **Pricing strategy table** landed 2026-06-13 in [`lib/pricing_strategy.sh`](lib/pricing_strategy.sh) + [`.mini-ork/config/pricing.yaml`](.mini-ork/config/pricing.yaml) (commit `13ea509`). `pricing_lookup <provider> <model> <token_kind>` reads YAML rates; six default lanes covered (anthropic, openai, moonshot, deepseek, zhipu, minimax). Wiring into `lib/llm-dispatch.sh` is a deliberate follow-up.
+6. ✅ **Pricing strategy table** landed 2026-06-13 in [`mini_ork/dispatch/pricing_strategy.py`](mini_ork/dispatch/pricing_strategy.py) + [`.mini-ork/config/pricing.yaml`](.mini-ork/config/pricing.yaml) (commit `13ea509`). `pricing_lookup <provider> <model> <token_kind>` reads YAML rates; six default lanes covered (anthropic, openai, moonshot, deepseek, zhipu, minimax). Wiring into `mini_ork/dispatch/llm_dispatch.py` is a deliberate follow-up.
 7. **Capability flags in `agents.yaml`.** Per-family
    `capabilities: {vision, tools, reasoning, search}` so gates reject
    impossible lane assignments *before* dispatch
@@ -262,9 +262,9 @@ truth)
 
 **Phase 3 — feedback loops** (consumes Phases 1-2 telemetry)
 
-8. ✅ **Langfuse score mapping** landed 2026-06-13 in [`lib/langfuse_score_mapper.sh`](lib/langfuse_score_mapper.sh) (commit `c0e6ad8`). `langfuse_score_for_verdict` maps reviewer / verifier / oracle-gate / rollback / promotion events to numeric trace scores (-1.0 ..= +1.0) standardized across organizations. 15 score conventions defined; pairs with the planned OTel-Langfuse exporter.
-9. ✅ **Verifier rubrics with ground-truth feedback** landed 2026-06-13 in [`db/migrations/0025_verifier_rubrics.sql`](db/migrations/0025_verifier_rubrics.sql) + [`lib/verifier_rubric.sh`](lib/verifier_rubric.sh) (commit `53d6ad0`). Three correlated tables (`verifier_rubrics`, `verifier_criteria`, `verifier_results`) with operator-set `is_false_positive` / `is_false_negative` flags + `repair_run_id` chaining. CRUD primitives: `rubric_register`, `verifier_result_record`, `verifier_result_annotate`, `verifier_chain_repair`, `verifier_fp_rate`.
-10. ✅ **Checkpoint/resume primitive** landed 2026-06-13 in [`lib/checkpoint.sh`](lib/checkpoint.sh) (commit `843eca2`). Four primitives (`checkpoint_write`, `checkpoint_can_resume`, `checkpoint_clear`, `checkpoint_summary`) backed by `${MINI_ORK_RUN_DIR}/.checkpoint.json`. Wiring into `bin/mini-ork-execute` is a deliberate follow-up.
+8. ✅ **Langfuse score mapping** landed 2026-06-13 in [`mini_ork/observability/langfuse_score_mapper.py`](mini_ork/observability/langfuse_score_mapper.py) (commit `c0e6ad8`). `langfuse_score_for_verdict` maps reviewer / verifier / oracle-gate / rollback / promotion events to numeric trace scores (-1.0 ..= +1.0) standardized across organizations. 15 score conventions defined; pairs with the planned OTel-Langfuse exporter.
+9. ✅ **Verifier rubrics with ground-truth feedback** landed 2026-06-13 in [`db/migrations/0025_verifier_rubrics.sql`](db/migrations/0025_verifier_rubrics.sql) + [`mini_ork/gates/verifier_rubric.py`](mini_ork/gates/verifier_rubric.py) (commit `53d6ad0`). Three correlated tables (`verifier_rubrics`, `verifier_criteria`, `verifier_results`) with operator-set `is_false_positive` / `is_false_negative` flags + `repair_run_id` chaining. CRUD primitives: `rubric_register`, `verifier_result_record`, `verifier_result_annotate`, `verifier_chain_repair`, `verifier_fp_rate`.
+10. ✅ **Checkpoint/resume primitive** landed 2026-06-13 in [`mini_ork/stores/checkpoint.py`](mini_ork/stores/checkpoint.py) (commit `843eca2`). Four primitives (`checkpoint_write`, `checkpoint_can_resume`, `checkpoint_clear`, `checkpoint_summary`) backed by `${MINI_ORK_RUN_DIR}/.checkpoint.json`. Wiring into `bin/mini-ork-execute` is a deliberate follow-up.
 
 **Phase 4 — operator control + UX polish**
 
@@ -348,7 +348,7 @@ These have been considered and intentionally excluded:
 - Hosted SaaS version — keep the runtime local-first; users can build their
   own hosted layer on top
 - Built-in LLM provider — the framework is provider-neutral; new providers
-  plug in via `lib/providers/cl_<name>.sh`
+  plug in as entries in `config/providers.yaml`
 - GUI bundled in the same repo — separate concern; the dashboard repo will
   consume state.db as a read-only contract
 - Anything that breaks the bounded-autonomy axioms in [docs/SAFETY.md](./docs/SAFETY.md):
