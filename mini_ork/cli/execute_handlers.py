@@ -587,18 +587,23 @@ def _first_json_object(text: str, required_key: str | None = None) -> dict | Non
 
 
 def _materialize_lens_json(run_dir: str, node_id: str, text: str) -> None:
-    """Honour the lens contract's ``lens-<family>.json`` when the agent only printed it.
+    """Honour the lens contract's ``lens-<family>.json`` when the agent never wrote it.
 
-    The lens prompt asks each agent to do two things: emit the object on stdout
-    (which the researcher handler captures to ``lens-<family>.md``) and write
+    The lens prompt asks each agent to do two things: emit the object (the
+    researcher handler captures stdout to ``lens-<family>.md``) and write
     ``$MINI_ORK_RUN_DIR/lens-<family>.json`` with a tool. Only the first is
-    enforced by the harness, so the second is a model-side coin flip — kimi and
-    opus have printed the object and written nothing, while glm wrote the file
-    and printed prose. ``recipes/chapter-review/verifiers/panel-completeness.py``
-    then reads a ``.json`` that is not there, the synthesizer never emits
-    ``chapter-review.json``, and the whole chapter-review is discarded as
-    ``failed_nodes=4`` with the rubric verdict never flipping. Recover the file
-    from the stdout we already hold.
+    enforced by the harness, so the second is a model-side coin flip, and it
+    fails in *both* directions:
+
+      * the agent prints the object and writes nothing — the bytes are in stdout;
+      * the agent writes the object to the declared ``lens-<family>.md`` with its
+        file tool and prints only prose (``Lens emitted. C3=6 …`` plus a summary)
+        — the bytes are in the sibling, and stdout has no ``{`` at all.
+
+    Either way ``recipes/chapter-review/verifiers/panel-completeness.py`` reads a
+    ``.json`` that is not there, the synthesizer never emits ``chapter-review.json``,
+    and the whole chapter-review is discarded as ``failed_nodes=4`` with the rubric
+    verdict never flipping. Recover the file from whichever source holds the object.
 
     Fail-soft by design: an existing non-empty sibling wins, and any failure
     degrades to today's behaviour (verifier red) rather than crashing the node.
@@ -611,10 +616,17 @@ def _materialize_lens_json(run_dir: str, node_id: str, text: str) -> None:
             return
         obj = _first_json_object(text, required_key="lens")
         if obj is None:
+            # The declared output file is the other place the object can land;
+            # it is prose when the agent printed the object instead.
+            declared = f"{path[:-len('.json')]}.md"
+            if os.path.isfile(declared):
+                with open(declared, encoding="utf-8") as handle:
+                    obj = _first_json_object(handle.read(), required_key="lens")
+        if obj is None:
             return
         with open(path, "w", encoding="utf-8") as handle:
             json.dump(obj, handle, indent=2)
-        print(f"  [ok] lens artifact recovered from stdout: {os.path.basename(path)}",
+        print(f"  [ok] lens artifact recovered from agent output: {os.path.basename(path)}",
               file=sys.stderr)
     except Exception:
         pass

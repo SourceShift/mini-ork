@@ -507,6 +507,32 @@ def test_lens_prose_only_is_fail_soft(tmp_path, monkeypatch):
     assert not (rd / "lens-opus.json").exists()
 
 
+def test_lens_object_in_declared_md_recovers_when_stdout_is_prose(tmp_path, monkeypatch):
+    # The mirror image of the stdout-only case: the agent uses its file tool to
+    # write the object into the DECLARED output (lens-<family>.md) and prints only
+    # prose. Live in run-1789887625-76705: lens-kimi.md was pure JSON while
+    # lens-kimi.md.stdout.md was "Lens emitted. C3=6 …" with no brace at all.
+    db = _seed_db(tmp_path, "lens4"); _seed_task_run(db)
+    rd = tmp_path / "run"; rd.mkdir()
+    monkeypatch.delenv("MINI_ORK_RUN_DIR", raising=False)
+    obj = json.dumps({"lens": "opus", "axes": {"C9_originality_insight": {"score": 6}}})
+
+    def _tool_then_prose(_task_class, _lane, _prompt):
+        # the agent Writes the object mid-dispatch, then prints only a summary;
+        # write_preserving_agent keeps the .md (mtime > marker) and stashes the
+        # stdout beside it as .stdout.md — the observed live shape.
+        (rd / "lens-opus.md").write_text(obj)
+        return 0, "Lens emitted. C9=6. No object on stdout."
+
+    rc, fr = ex.dispatch_node(_fields("opus_lens", "researcher", "opus_lens"),
+                              root=str(REPO), run_dir=str(rd), plan_path=_plan(tmp_path),
+                              task_class="code_fix", db=db, run_id="r1",
+                              dispatch_fn=_tool_then_prose)
+    assert rc == 0 and fr == "done"
+    assert (rd / "lens-opus.md.stdout.md").exists(), "prose must go to the .stdout.md sibling"
+    assert json.loads((rd / "lens-opus.json").read_text())["lens"] == "opus"
+
+
 def test_first_json_object_skips_unkeyed_and_respects_strings():
     text = '{"note": "hi"} then {"lens": "opus", "q": "a } b { c"}'
     assert exh._first_json_object(text, required_key="lens")["q"] == "a } b { c"
