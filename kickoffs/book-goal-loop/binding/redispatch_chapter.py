@@ -22,6 +22,31 @@ token via ``enqueueBookGeneration``. We drive it through the existing operator C
 ``server/scripts/forceResumeChaptersMinimax.ts`` (same service the /force-resume
 route uses; re-resolves the chapter provider FRESH).
 
+Breaking a stale ``generating`` wedge
+-------------------------------------
+A blanket "``generating`` ⇒ no-op" starves a run whose FSM is stale. book-gen is a
+serial singleton, so when the worker moves on to another book the abandoned run
+keeps ``generating`` while nothing dispatches its chapters — and Hatchet, still
+believing the job is live, never re-enqueues it.
+
+The common wedge, though, is NOT a bad FSM — it is a **stranded dispatch claim**.
+Observed live (2026-09-20) on book d0df3cdb ch2: the worker logged ``advanceBook:
+dispatch claim skipped chapters (already claimed, or backing off)`` every 60s while
+the chapter sat ``pending`` with ``committed_complete=f``. The claim came from a
+dispatch that then failed within seconds (``runOneChapter`` → content-present skip →
+``markTaskCompleted`` commit-reject), and ``forceResumeJob`` clears the FSM but not
+the claim — so the chapter stayed unclaimable until the 135-min ``_CLAIM_LEASE_SEC``
+lapsed: roughly one dispatch attempt per 135 minutes, each failing in 9s. We
+therefore free a stranded claim (``_clear_stranded_claims``) before deciding, then
+honour the no-op only when a liveness probe still proves a dispatcher on the run.
+``MO_GOAL_REDISPATCH_BREAK_GENERATING=0`` restores the blanket no-op;
+``MO_GOAL_REDISPATCH_CLEAR_CLAIMS=0`` disables the claim free.
+
+Note both signals are BOOK-SCOPED, unlike run-dir freshness. Run dirs
+(``MO_GOAL_RUNS_DIR``) are book-GLOBAL — the singleton worker writes its current
+book's nodes there — so a fresh run dir from another book reads as false progress.
+That is precisely the signal that masked this wedge for six hours.
+
 Per-wave idempotency
 --------------------
 ``forceResumeJob`` resumes the WHOLE job, so only the FIRST failing chapter in a
@@ -66,6 +91,10 @@ Env
                             the preferred source of the runner URL/token (falls back
                             to MO_RESEARCHER_DIR — both point at the same runner)
     MO_GOAL_REDISPATCH_DRY  =1 -> resolve + decide + print the plan, do NOT resume
+    MO_GOAL_REDISPATCH_CLEAR_CLAIMS
+                            =0 -> never free a stranded dispatch claim (default 1)
+    MO_GOAL_REDISPATCH_BREAK_GENERATING
+                            =0 -> restore the blanket fsm=generating no-op (default 1)
     PG* libpq vars          DB connection (no secret lives in this file)
 
 Connection comes from libpq env vars; no secret lives here.
@@ -80,9 +109,22 @@ import sys
 import urllib.request
 
 _DEFAULT_RESEARCHER_DIR = "/Volumes/docker-ssd/Migration/Development/researcher"
-# A run in any of these FSM states is already progressing (or done): re-dispatch
-# is a no-op. We resume ONLY out of a terminal-failed state.
+# A run in any of these FSM states is unambiguously resumable.
 _FAILED_STATES = frozenset({"failed"})
+# ``generating`` is the AMBIGUOUS state, and the one that wedges the loop. The
+# FSM says "in flight", but book-gen is a serial singleton: once the worker moves
+# on to another book (or its dispatcher dies), a run can sit at ``generating``
+# with NOTHING advancing it — indefinitely, because Hatchet still believes the
+# job is running and so never re-enqueues it. A blanket no-op there starves the
+# run forever. So verify liveness (a live chapter dispatch claim) and break the
+# wedge when no dispatcher is actually on it.
+# DISPATCH_CLAIM_LEASE_SEC in eventDrivenDispatch.ts is 8100s (135 min).
+_CLAIM_LEASE_SEC = 8100
+# A claim older than this, on a chapter that is not mid-generation, is stranded:
+# the dispatch it belonged to has long since failed, leaving the claim (and the
+# chapter) unclaimable until the full 135-min lease lapses. Observed live on ch2:
+# dispatch -> commit-reject in 9s -> claim wedged for the remaining 134 min.
+_CLAIM_STALE_SEC = 300
 # Chapter microVM runner probe: read these from server/.env to ask the runner's
 # /readyz which model it serves, then align both model channels to match.
 _RUNNER_KEYS = ("CHAPTER_MICROVM_RUNNER_URL", "CHAPTER_MICROVM_RUNNER_TOKEN")
@@ -129,6 +171,77 @@ def _resolve_job(book: str) -> tuple[str | None, str | None, str | None]:
         return None, None, None
     cols = (rows[0].split("|") + ["", "", ""])[:3]
     return cols[0] or None, cols[1] or None, cols[2] or None
+
+
+def _has_live_claim(book: str) -> bool:
+    """True when some not-yet-committed chapter of this book still holds a live
+    dispatch claim.
+
+    ``dispatch_claimed_at`` (set by ``claimChaptersForDispatch``, aged out after
+    ``_CLAIM_LEASE_SEC``) is the system's own "a dispatcher is working this run"
+    marker. Unlike a run-dir mtime it is BOOK-SCOPED, so a singleton worker busy
+    with a DIFFERENT book cannot masquerade as progress on this one — which is
+    exactly the trap that keeps a stale ``generating`` run wedged.
+
+    Conservative on ambiguity: a DB error, or an unparsable read, is reported as
+    "live" so an unclear probe never triggers a resume.
+    """
+    sql = (
+        "SELECT count(*) FROM book_chapter_lifecycle "
+        f"WHERE book_uuid = '{book}' "
+        "AND committed_complete IS NOT TRUE "
+        "AND COALESCE(permanently_failed, FALSE) = FALSE "
+        "AND dispatch_claimed_at IS NOT NULL "
+        f"AND dispatch_claimed_at > now() - INTERVAL '{_CLAIM_LEASE_SEC} seconds';"
+    )
+    proc = _q(sql)
+    if proc.returncode != 0:
+        print(
+            f"claim-probe db-error (assuming live): {proc.stderr.strip()[:120]}",
+            file=sys.stderr,
+        )
+        return True
+    row = proc.stdout.strip()
+    if not row:
+        return True
+    return row.split("|")[0].strip() != "0"
+
+
+def _clear_stranded_claims(book: str, chapter: str) -> tuple[int, str]:
+    """Free a ``dispatch_claimed_at`` that no live runner is behind.
+
+    Observed live (2026-09-20) on book d0df3cdb ch2: the worker logged
+    ``advanceBook: dispatch claim skipped chapters (already claimed, or backing
+    off)`` every 60s while the chapter sat ``pending`` with ``committed_complete=f``
+    and nothing advanced it. The claim came from a dispatch that then failed within
+    seconds (content-present -> commit-reject); ``forceResumeJob`` clears the FSM,
+    not the claim, so the chapter stayed unclaimable until the 135-min
+    ``_CLAIM_LEASE_SEC`` lapsed — roughly one dispatch attempt per 135 minutes.
+    Clearing the claim lets the worker re-claim and re-dispatch on its next tick.
+
+    Safety: the renewing per-chapter runner lock (``acquireChapterRunnerLock``), NOT
+    the claim, is the double-write guard, so a wrongly-freed claim costs at worst a
+    redundant dispatch the lock defers. We stay conservative anyway — only claims
+    older than ``_CLAIM_STALE_SEC`` and only on chapters NOT mid-generation, so a
+    chapter actively being written (``in_progress``/``generating``) keeps its claim.
+    """
+    sql = (
+        "UPDATE book_chapter_lifecycle "
+        "SET recovery_cycles = COALESCE(recovery_cycles, 0) + 1, "
+        "dispatch_claimed_at = NULL, next_dispatch_after = NULL, updated_at = NOW() "
+        f"WHERE book_uuid = '{book}' AND chapter_number = {int(chapter)} "
+        "AND committed_complete IS NOT TRUE "
+        "AND COALESCE(permanently_failed, FALSE) = FALSE "
+        "AND dispatch_claimed_at IS NOT NULL "
+        f"AND dispatch_claimed_at < now() - INTERVAL '{_CLAIM_STALE_SEC} seconds' "
+        "AND COALESCE(status, '') NOT IN ('in_progress', 'generating') "
+        "RETURNING chapter_number;"
+    )
+    proc = _q(sql)
+    if proc.returncode != 0:
+        return 0, f"clear-claims db-error: {proc.stderr.strip()[:120]}"
+    n = len([ln for ln in proc.stdout.splitlines() if ln.strip()])
+    return n, (f"cleared {n} stranded claim(s)" if n else "no stranded claim to clear")
 
 
 def _read_dotenv(path: str, keys: tuple[str, ...]) -> dict[str, str]:
@@ -290,9 +403,45 @@ def main(argv: list[str]) -> int:
         print(f"ch{chapter} redispatch: no run/job for book {book}")
         return 3
 
+    dry = os.environ.get("MO_GOAL_REDISPATCH_DRY", "").strip() == "1"
+    break_generating = os.environ.get("MO_GOAL_REDISPATCH_BREAK_GENERATING", "1").strip() != "0"
+    clear_claims = os.environ.get("MO_GOAL_REDISPATCH_CLEAR_CLAIMS", "1").strip() != "0"
+
     if fsm not in _FAILED_STATES:
-        print(f"ch{chapter} redispatch noop: run {job_id} fsm={fsm} (already progressing)")
-        return 0
+        if fsm != "generating" or not break_generating:
+            print(f"ch{chapter} redispatch noop: run {job_id} fsm={fsm} (already progressing)")
+            return 0
+        # fsm == generating is the ambiguous state. The cheap, common wedge is a
+        # STRANDED DISPATCH CLAIM, not a bad FSM: the worker keeps skipping the
+        # chapter every tick until the 135-min lease lapses. Free it first, then
+        # decide — after clearing, a surviving live claim means a runner really is
+        # on it (or a chapter is mid-generation) and we defer to the worker.
+        cleared = 0
+        if clear_claims:
+            if dry:
+                print(f"ch{chapter} redispatch DRY: would clear any stranded dispatch claim")
+            else:
+                cleared, msg = _clear_stranded_claims(book, chapter)
+                print(f"ch{chapter} redispatch claims: {msg}")
+        if cleared:
+            # Freeing the claim IS the break: the worker re-claims and re-dispatches
+            # on its next tick. Do not also resume — that would double-drive the run.
+            print(
+                f"ch{chapter} redispatch: run {job_id} fsm=generating — freed {cleared} "
+                f"stranded claim(s); worker will re-dispatch on its next tick"
+            )
+            return 0
+        if not _has_live_claim(book):
+            print(
+                f"ch{chapter} redispatch: run {job_id} fsm=generating with NO live "
+                f"chapter claim (worker moved on / dispatcher gone) — resuming",
+            )
+        else:
+            print(
+                f"ch{chapter} redispatch: run {job_id} fsm=generating — a claim is still "
+                f"live (or the chapter is mid-generation); deferring to the worker's next tick"
+            )
+            return 0
 
     # Reconcile the chapter model to the live runner BEFORE resuming — a resumed job
     # dispatches from provenance, so runner drift would re-fail the exact-model
@@ -303,7 +452,6 @@ def main(argv: list[str]) -> int:
     model, why_model = _runner_model([worktree, researcher_dir])
     print(f"ch{chapter} redispatch runner-model: {why_model}")
 
-    dry = os.environ.get("MO_GOAL_REDISPATCH_DRY", "").strip() == "1"
     if dry:
         plan = f"would force-resume {job_id} (run {run_uuid}, fsm={fsm})"
         if model:
