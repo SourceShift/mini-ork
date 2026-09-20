@@ -60,6 +60,7 @@ _REVIEW_REVISE = _ExecuteMembership("_REVIEW_REVISE")
 _assemble_reviewer_inputs = _execute_delegate("_assemble_reviewer_inputs")
 _assert_lane_capability = _execute_delegate("_assert_lane_capability")
 _capture_pre_impl_baseline = _execute_delegate("_capture_pre_impl_baseline")
+_capture_pre_impl_fixture = _execute_delegate("_capture_pre_impl_fixture")
 _extract_verdict = _execute_delegate("_extract_verdict")
 _harvest_self_migrate_artifacts = _execute_delegate("_harvest_self_migrate_artifacts")
 _intervention_gate_check = _execute_delegate("_intervention_gate_check")
@@ -741,6 +742,7 @@ def _handle_implementer(ctx: NodeDispatch):
         )
     else:
         _write_implementer_summary(ctx.run_dir_eff, target, impl_log)
+        _capture_pre_impl_fixture(ctx.run_dir_eff, target)
     if not ctx.publish_declared_outputs():
         ctx.trace(ctx.node_id, "failure", "implementer", impl_log, "", "artifact_contract")
         return 1, "artifact_contract"
