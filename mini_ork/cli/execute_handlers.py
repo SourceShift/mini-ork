@@ -545,6 +545,81 @@ EARLY_NODE_HANDLERS: dict[str, Callable] = {
 }
 
 
+def _first_json_object(text: str, required_key: str | None = None) -> dict | None:
+    """First brace-balanced ``{...}`` in ``text`` that parses to a dict.
+
+    Mirrors the scanner in ``mini_ork/gates/rubric_scoring.py`` (depth counter
+    that respects string literals and backslash escapes), minus the keyed start
+    pattern: a lens prints the object itself, so any ``{`` may begin it. When
+    ``required_key`` is given, a candidate lacking that key is skipped rather
+    than accepted, so recovery stays anchored to the artifact's own shape.
+    """
+    for start in range(len(text)):
+        if text[start] != "{":
+            continue
+        depth, in_str, esc = 0, False, False
+        for i in range(start, len(text)):
+            c = text[i]
+            if esc:
+                esc = False
+                continue
+            if c == "\\":
+                esc = True
+                continue
+            if c == '"':
+                in_str = not in_str
+                continue
+            if in_str:
+                continue
+            if c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth == 0:
+                    try:
+                        obj = json.loads(text[start:i + 1])
+                    except Exception:
+                        break
+                    if isinstance(obj, dict) and (required_key is None or required_key in obj):
+                        return obj
+                    break
+    return None
+
+
+def _materialize_lens_json(run_dir: str, node_id: str, text: str) -> None:
+    """Honour the lens contract's ``lens-<family>.json`` when the agent only printed it.
+
+    The lens prompt asks each agent to do two things: emit the object on stdout
+    (which the researcher handler captures to ``lens-<family>.md``) and write
+    ``$MINI_ORK_RUN_DIR/lens-<family>.json`` with a tool. Only the first is
+    enforced by the harness, so the second is a model-side coin flip — kimi and
+    opus have printed the object and written nothing, while glm wrote the file
+    and printed prose. ``recipes/chapter-review/verifiers/panel-completeness.py``
+    then reads a ``.json`` that is not there, the synthesizer never emits
+    ``chapter-review.json``, and the whole chapter-review is discarded as
+    ``failed_nodes=4`` with the rubric verdict never flipping. Recover the file
+    from the stdout we already hold.
+
+    Fail-soft by design: an existing non-empty sibling wins, and any failure
+    degrades to today's behaviour (verifier red) rather than crashing the node.
+    """
+    if not node_id.endswith(("_lens", "-lens")):
+        return
+    path = os.path.join(run_dir, f"lens-{node_id[:-5]}.json")
+    try:
+        if os.path.isfile(path) and os.path.getsize(path) > 0:
+            return
+        obj = _first_json_object(text, required_key="lens")
+        if obj is None:
+            return
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(obj, handle, indent=2)
+        print(f"  [ok] lens artifact recovered from stdout: {os.path.basename(path)}",
+              file=sys.stderr)
+    except Exception:
+        pass
+
+
 def _handle_researcher(ctx: NodeDispatch):
     out_file = ctx.declared_output_path(
         _researcher_output_file(ctx.run_dir, ctx.recipe_eff, ctx.node_id)
@@ -561,6 +636,7 @@ def _handle_researcher(ctx: NodeDispatch):
         ctx.trace(ctx.node_id, "failure", "researcher", out_file, "", fr)
         return 1, fr
     ctx.write_preserving_agent(out_file, marker, result)
+    _materialize_lens_json(ctx.run_dir, ctx.node_id, result)
     try:
         os.remove(marker)
     except OSError:

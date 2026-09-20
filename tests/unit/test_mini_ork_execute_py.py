@@ -18,6 +18,7 @@ import pytest
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
 from mini_ork.cli import execute as ex
+from mini_ork.cli import execute_handlers as exh
 
 
 @pytest.fixture(autouse=True)
@@ -446,6 +447,71 @@ def test_live_researcher_writes_context(tmp_path, monkeypatch):
     assert (rd / "lens-res1.md").read_text() == "finding: X is slow"
     # cost charged
     assert float(_sql(db, "SELECT cost_usd FROM task_runs WHERE id='r1';").stdout) > 0
+
+
+# ── lens artifact recovery ──
+# The lens prompt asks the agent BOTH to print its object (captured to
+# lens-<family>.md) and to write lens-<family>.json with a tool. Only the print
+# is guaranteed. panel-completeness.py reads the .json unconditionally, so a
+# missing sibling fails the verifier, the synthesizer never emits
+# chapter-review.json, and the chapter-review is discarded as failed_nodes=4.
+
+_LENS_JSON = json.dumps({
+    "lens": "kimi",
+    "axes": {"C3_style_voice": {"score": 7, "rationale": "r", "confidence": 0.8}},
+    "fragment_suggestions": [],
+    "overall_assessment": "ok",
+})
+
+
+def test_lens_stdout_only_materializes_json_sibling(tmp_path, monkeypatch):
+    db = _seed_db(tmp_path, "lens"); _seed_task_run(db)
+    rd = tmp_path / "run"; rd.mkdir()
+    monkeypatch.delenv("MINI_ORK_RUN_DIR", raising=False)
+
+    rc, fr = ex.dispatch_node(_fields("kimi_lens", "researcher", "kimi_lens"),
+                              root=str(REPO), run_dir=str(rd), plan_path=_plan(tmp_path),
+                              task_class="code_fix", db=db, run_id="r1",
+                              dispatch_fn=_fake(_LENS_JSON))
+    assert rc == 0 and fr == "done"
+    assert (rd / "lens-kimi.md").read_text() == _LENS_JSON
+    assert json.loads((rd / "lens-kimi.json").read_text())["lens"] == "kimi"
+
+
+def test_lens_written_json_wins_over_stdout(tmp_path, monkeypatch):
+    # glm's real shape: it WROTE the file and printed prose. Never clobber it.
+    db = _seed_db(tmp_path, "lens2"); _seed_task_run(db)
+    rd = tmp_path / "run"; rd.mkdir()
+    monkeypatch.delenv("MINI_ORK_RUN_DIR", raising=False)
+    (rd / "lens-glm.json").write_text('{"lens": "glm", "sentinel": true}')
+
+    rc, fr = ex.dispatch_node(_fields("glm_lens", "researcher", "glm_lens"),
+                              root=str(REPO), run_dir=str(rd), plan_path=_plan(tmp_path),
+                              task_class="code_fix", db=db, run_id="r1",
+                              dispatch_fn=_fake(_LENS_JSON))
+    assert rc == 0 and fr == "done"
+    assert json.loads((rd / "lens-glm.json").read_text()).get("sentinel") is True
+
+
+def test_lens_prose_only_is_fail_soft(tmp_path, monkeypatch):
+    # No recoverable object → do NOT fabricate a file, do NOT fail the node.
+    db = _seed_db(tmp_path, "lens3"); _seed_task_run(db)
+    rd = tmp_path / "run"; rd.mkdir()
+    monkeypatch.delenv("MINI_ORK_RUN_DIR", raising=False)
+
+    rc, fr = ex.dispatch_node(_fields("opus_lens", "researcher", "opus_lens"),
+                              root=str(REPO), run_dir=str(rd), plan_path=_plan(tmp_path),
+                              task_class="code_fix", db=db, run_id="r1",
+                              dispatch_fn=_fake("prose only, no object here"))
+    assert rc == 0 and fr == "done"
+    assert not (rd / "lens-opus.json").exists()
+
+
+def test_first_json_object_skips_unkeyed_and_respects_strings():
+    text = '{"note": "hi"} then {"lens": "opus", "q": "a } b { c"}'
+    assert exh._first_json_object(text, required_key="lens")["q"] == "a } b { c"
+    assert exh._first_json_object(text)["note"] == "hi"
+    assert exh._first_json_object("no braces at all") is None
 
 
 def test_self_migrate_researcher_artifact_names(tmp_path):
