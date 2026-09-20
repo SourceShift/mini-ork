@@ -260,11 +260,19 @@ def _failures(
     elif figures is None:
         bad.append("figure-probe-error")
     elif isinstance(figures, dict) and figures["attached"] and figures["live"] < figures["attached"]:
+        lost = figures["attached"] - figures["live"]
         detail = (
             f"figure-loss attached={figures['attached']} live={figures['live']}"
             f" cascade={figures['cascade']} attempts={figures['attempts']}"
         )
-        if figures_enforcing:
+        # A loss made up *entirely* of cascade victims is trigger-driven row
+        # loss: the rows are gone, so no patch to the chapter prose and no fix
+        # to the writing code restores them. Failing on it re-issues a child
+        # that cannot succeed, and because the sweep picks the lowest failing
+        # unit, one such chapter pins every chapter behind it. Record the counts
+        # — they stay visible in the reason — and fail only when the loss
+        # includes a non-cascade deletion that a child could plausibly repair.
+        if figures_enforcing and figures["cascade"] < lost:
             bad.append(detail)
         else:
             facts["figure_warn"] = detail
