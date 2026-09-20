@@ -29,6 +29,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any, Callable
 
@@ -49,6 +50,25 @@ record_wave = _loop_state_module.record_wave
 should_quarantine = _loop_state_module.should_quarantine
 divergence = _loop_state_module.divergence
 evidence_informativeness = _loop_state_module.evidence_informativeness
+
+
+def _load_sibling(name: str):
+    """Import a sibling module by path (recipes/ is not a package)."""
+    path = Path(__file__).resolve().parent / f"{name}.py"
+    spec = importlib.util.spec_from_file_location(f"goal_loop_{name}", path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"could not load {name} helper from {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules.setdefault(spec.name, module)
+    spec.loader.exec_module(module)
+    return module
+
+
+_assurance = _load_sibling("assurance")
+shield = _assurance.shield
+resolve_shield_mode = _assurance.resolve_mode
+_ledger = _load_sibling("loop_ledger")
+append_decision = _ledger.append_decision
 
 FINAL_VERDICT_FILENAME = "final-verdict.json"
 
@@ -655,6 +675,36 @@ def drive(
                 _wave_history(state, limit=4), sort_keys=True,
             )
 
+        # Snapshot the decision the loop is ABOUT to make, before it makes it.
+        # Read after the fact these numbers are unrecoverable — spend has moved
+        # and the wave has overwritten the run artifacts — so the context half
+        # of the ledger has to be captured here or not at all. The action half
+        # is filled in below, once the sweep has named the units it dispatched.
+        shield_mode = resolve_shield_mode()
+        decision_ts = int(time.time())
+        probed_before = (
+            sorted(state["waves"][-1].get("failing_after") or []) if state.get("waves") else []
+        )
+        decision_context: dict[str, Any] = {
+            "goal_id": goal_id,
+            "wave": wave_no,
+            "freshly_probed": probed_before,
+            "quarantined": sorted(quarantined),
+            "spent_usd": spent,
+            "projected_wave_usd": projected,
+            "budget_total_usd": budget_total_usd,
+            "max_waves": max_waves,
+            "waves_elapsed": len(state.get("waves", [])),
+            "uninformative_evidence": os.environ.get("MO_GOAL_EVIDENCE_UNINFORMATIVE") == "1",
+            "divergence": divergence(state, patience=divergence_patience),
+        }
+        decision_action: dict[str, Any] = {
+            "kind": "spawn_children",
+            "child_recipe": child_recipe,
+            "units": probed_before,
+            "destructive": _env_bool("MO_GOAL_ALLOW_DESTRUCTIVE", False),
+        }
+
         verdict = resolved_run_wave(wave_no, quarantined)
         verdict_dict = verdict if isinstance(verdict, dict) else {}
         # Accept either the kickoff's panel-verdict.json key
@@ -709,6 +759,61 @@ def drive(
             attempted=attempted,
             diagnostics=diagnostics,
         )
+
+        # Record the DECISION, not just its outcome. ``record_wave`` above keeps
+        # what the loop achieved; this keeps what it knew, what it chose, and
+        # whether the assurance shield would have permitted the choice. The
+        # evidence fingerprints are read back off the wave record rather than
+        # re-derived, so the ledger and the state file can never disagree about
+        # which bundle a wave fed.
+        last_wave = state["waves"][-1]
+        prev_wave = state["waves"][-2] if len(state["waves"]) > 1 else {}
+        decision_action["units"] = sorted(attempted) if attempted else probed_before
+        decision_context["evidence_sha"] = {
+            str(k): str(v) for k, v in (last_wave.get("evidence") or {}).items()
+        }
+        decision_context["prev_evidence_sha"] = {
+            str(k): str(v) for k, v in (prev_wave.get("evidence") or {}).items()
+        }
+        decision_context["predicate_moved"] = bool(last_wave.get("predicate_moved"))
+        shield_verdict = (
+            {"allow": True, "guard": None, "reason": "shield off"}
+            if shield_mode == "off"
+            else shield(decision_action, decision_context)
+        )
+        if shield_mode != "off":
+            append_decision(
+                resolved_state_dir,
+                {
+                    "goal_id": goal_id,
+                    "wave": wave_no,
+                    "context": decision_context,
+                    "action": decision_action,
+                    "outcome": {
+                        "failing_after": sorted(failing_after),
+                        "attempted": decision_action["units"],
+                        "headroom_closed": len(failing_before) - len(failing_after),
+                        "predicate_moved": last_wave.get("predicate_moved"),
+                        "child_diagnostics": last_wave.get("child_diagnostics") or {},
+                        "cost_usd": cost_usd,
+                        "run_id": run_id,
+                    },
+                    "shield": shield_verdict,
+                },
+                ts=decision_ts,
+            )
+        if shield_mode == "enforce" and not shield_verdict["allow"]:
+            payload = {
+                "stop": "shield",
+                "guard": shield_verdict["guard"],
+                "reason": shield_verdict["reason"],
+                "waves": wave_no,
+                "failing_units": sorted(failing_after),
+                "quarantined_units": sorted(quarantined),
+            }
+            save_state(state, resolved_state_dir)
+            _write_final_verdict(resolved_state_dir, payload)
+            return payload
 
         # 1. goal_met — wave verdict == "pass".
         verdict_str = str(verdict_dict.get("verdict", "")).lower()

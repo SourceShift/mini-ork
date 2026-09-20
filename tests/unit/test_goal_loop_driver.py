@@ -1248,3 +1248,311 @@ def test_driver_diverges_on_mirage_signature(tmp_path, monkeypatch):
     final = json.loads((tmp_path / "s" / "final-verdict.json").read_text())
     assert final["stop"] == "diverged"
     assert final["signature"].startswith("mirage:")
+
+
+# ── S1: the run-time assurance shield (pure) ───────────────────────────────
+
+
+_ASSURANCE = _load("goal_loop_assurance", RECIPE_DIR / "lib" / "assurance.py")
+shield = _ASSURANCE.shield
+resolve_shield_mode = _ASSURANCE.resolve_mode
+
+_LEDGER = _load("goal_loop_loop_ledger", RECIPE_DIR / "lib" / "loop_ledger.py")
+append_decision = _LEDGER.append_decision
+read_decisions = _LEDGER.read_decisions
+ledger_path = _LEDGER.ledger_path
+
+
+def test_shield_allows_a_clean_action():
+    verdict = shield(
+        {"kind": "spawn_children", "units": ["1"], "destructive": False},
+        {"budget_total_usd": 100.0, "spent_usd": 1.0, "projected_wave_usd": 2.0},
+    )
+    assert verdict == {"allow": True, "guard": None, "reason": ""}
+
+
+def test_shield_refuses_when_already_over_budget():
+    verdict = shield({}, {"budget_total_usd": 100.0, "spent_usd": 100.0})
+    assert verdict["allow"] is False
+    assert verdict["guard"] == "budget"
+
+
+def test_shield_refuses_when_the_projection_crosses_the_budget():
+    verdict = shield({}, {"budget_total_usd": 100.0, "spent_usd": 95.0,
+                          "projected_wave_usd": 6.0})
+    assert verdict["allow"] is False
+    assert verdict["guard"] == "budget"
+
+
+def test_shield_refuses_a_destructive_action_by_default():
+    verdict = shield({"kind": "regenerate", "units": ["4"], "destructive": True}, {})
+    assert verdict["allow"] is False
+    assert verdict["guard"] == "destructive"
+
+
+def test_shield_permits_a_destructive_action_the_context_authorized():
+    verdict = shield(
+        {"kind": "regenerate", "units": ["4"], "destructive": True},
+        {"destructive_authorized": True},
+    )
+    assert verdict["allow"] is True
+
+
+def test_shield_refuses_a_repeated_evidence_bundle_when_the_predicate_held():
+    verdict = shield(
+        {"kind": "spawn_children", "units": ["1"]},
+        {
+            "evidence_sha": {"1": "abc"},
+            "prev_evidence_sha": {"1": "abc"},
+            "predicate_moved": False,
+        },
+    )
+    assert verdict["allow"] is False
+    assert verdict["guard"] == "stale-evidence"
+
+
+def test_shield_allows_the_repeated_bundle_once_the_predicate_moves():
+    verdict = shield(
+        {"kind": "spawn_children", "units": ["1"]},
+        {
+            "evidence_sha": {"1": "abc"},
+            "prev_evidence_sha": {"1": "abc"},
+            "predicate_moved": True,
+        },
+    )
+    assert verdict["allow"] is True
+
+
+def test_shield_allows_a_changed_bundle_even_when_the_predicate_held():
+    verdict = shield(
+        {"kind": "spawn_children", "units": ["1"]},
+        {
+            "evidence_sha": {"1": "def"},
+            "prev_evidence_sha": {"1": "abc"},
+            "predicate_moved": False,
+        },
+    )
+    assert verdict["allow"] is True
+
+
+def test_shield_budget_outranks_stale_evidence():
+    verdict = shield(
+        {"kind": "spawn_children", "units": ["1"]},
+        {
+            "budget_total_usd": 10.0, "spent_usd": 10.0,
+            "evidence_sha": {"1": "abc"}, "prev_evidence_sha": {"1": "abc"},
+            "predicate_moved": False,
+        },
+    )
+    assert verdict["guard"] == "budget"
+
+
+def test_shield_refuses_when_a_guard_raises(monkeypatch):
+    def _boom(_action, _context):
+        raise RuntimeError("guard is broken")
+
+    monkeypatch.setattr(_ASSURANCE, "_GUARDS", (("boom", _boom),))
+    verdict = shield({}, {})
+    assert verdict["allow"] is False
+    assert verdict["guard"] == "boom"
+    assert "broken" in verdict["reason"]
+
+
+def test_resolve_shield_mode_defaults_to_shadow():
+    assert resolve_shield_mode("") == "shadow"
+    assert resolve_shield_mode("typo") == "shadow"
+    assert resolve_shield_mode(None) == "shadow"
+
+
+def test_resolve_shield_mode_passes_through_the_known_modes():
+    assert resolve_shield_mode("off") == "off"
+    assert resolve_shield_mode("shadow") == "shadow"
+    assert resolve_shield_mode("enforce") == "enforce"
+    assert resolve_shield_mode(" ENFORCE ") == "enforce"
+
+
+# ── S1: the append-only decision ledger (pure) ─────────────────────────────
+
+
+def test_ledger_round_trips_a_record(tmp_path):
+    append_decision(tmp_path, {"wave": 1, "action": {"kind": "spawn_children"}}, ts=7)
+    rows = read_decisions(tmp_path)
+    assert len(rows) == 1
+    assert rows[0]["ts"] == 7
+    assert rows[0]["wave"] == 1
+    assert rows[0]["action"]["kind"] == "spawn_children"
+
+
+def test_ledger_appends_and_never_rewrites(tmp_path):
+    for wave in (1, 2, 3):
+        append_decision(tmp_path, {"wave": wave})
+    assert [r["wave"] for r in read_decisions(tmp_path)] == [1, 2, 3]
+
+
+def test_ledger_missing_file_reads_as_empty_history(tmp_path):
+    assert read_decisions(tmp_path / "never-written") == []
+    assert not ledger_path(tmp_path / "never-written").is_file()
+
+
+def test_ledger_skips_a_truncated_trailing_line(tmp_path):
+    append_decision(tmp_path, {"wave": 1})
+    with open(ledger_path(tmp_path), "a", encoding="utf-8") as handle:
+        handle.write('{"wave": 2, "trunc')
+    rows = read_decisions(tmp_path)
+    assert [r["wave"] for r in rows] == [1]
+
+
+# ── S1: the driver records the decision it made ────────────────────────────
+
+
+def test_drive_writes_a_decision_record_for_every_wave(tmp_path):
+    state_dir = tmp_path / "state"
+
+    def run_wave(wave_no, quarantined):
+        if wave_no == 1:
+            return {"verdict": "fail", "failing_before": ["1"], "failing_after": ["1"],
+                    "cost_usd": 1.0, "run_id": "r1", "attempted": ["1"],
+                    "evidence": {"1": "ev-a"},
+                    "child_diagnostics": {"1": {"child_verdict": "pass",
+                                                "review_diff_bytes": 111}}}
+        return {"verdict": "pass", "failing_before": [], "failing_after": [],
+                "cost_usd": 1.0, "run_id": "r2"}
+
+    drive(
+        goal_id="gled", target_cwd="/tmp", units_cmd="echo u",
+        predicate_cmd="echo ok", child_recipe="code-fix",
+        max_waves=10, budget_total_usd=1000.0,
+        run_wave_fn=run_wave, cost_fn=lambda: 0.0, state_dir=state_dir,
+    )
+
+    rows = read_decisions(state_dir)
+    assert len(rows) == 2, rows
+    first = rows[0]
+    assert first["wave"] == 1
+    assert first["context"]["budget_total_usd"] == 1000.0
+    assert first["context"]["waves_elapsed"] == 0
+    assert first["action"]["kind"] == "spawn_children"
+    assert first["action"]["child_recipe"] == "code-fix"
+    assert first["action"]["units"] == ["1"]
+    assert first["outcome"]["headroom_closed"] == 0
+    assert first["outcome"]["child_diagnostics"]["1"]["review_diff_bytes"] == 111
+    assert first["context"]["evidence_sha"] == {"1": "ev-a"}
+    assert "shield" in first
+
+
+def test_drive_shield_is_shadow_by_default_and_still_runs_every_wave(tmp_path, monkeypatch):
+    monkeypatch.delenv("MO_GOAL_SHIELD", raising=False)
+    state_dir = tmp_path / "state"
+    waves_run: list[int] = []
+
+    def run_wave(wave_no, quarantined):
+        waves_run.append(wave_no)
+        # Same failing set + same evidence every wave: the stale-evidence guard
+        # WOULD refuse. In shadow mode that refusal must be recorded, never acted
+        # on — so the stop the loop takes is the pre-existing detector's, not the
+        # shield's.
+        return {"verdict": "fail", "failing_before": ["1"], "failing_after": ["1"],
+                "cost_usd": 0.0, "run_id": f"r{wave_no}", "attempted": ["1"],
+                "evidence": {"1": "same-every-wave"}}
+
+    verdict = drive(
+        goal_id="gshadow", target_cwd="/tmp", units_cmd="echo u",
+        predicate_cmd="echo ok", child_recipe="code-fix",
+        max_waves=10, budget_total_usd=1000.0,
+        run_wave_fn=run_wave, cost_fn=lambda: 0.0, state_dir=state_dir,
+    )
+
+    assert verdict["stop"] == "diverged", verdict
+    assert waves_run == [1, 2]
+    rows = read_decisions(state_dir)
+    assert [r["wave"] for r in rows] == [1, 2]
+    # Wave 2 repeated wave 1's bundle with no movement → recorded, not enforced.
+    assert rows[1]["shield"]["allow"] is False
+    assert rows[1]["shield"]["guard"] == "stale-evidence"
+
+
+def test_drive_shield_off_writes_no_ledger(tmp_path, monkeypatch):
+    monkeypatch.setenv("MO_GOAL_SHIELD", "off")
+    state_dir = tmp_path / "state"
+
+    def run_wave(wave_no, quarantined):
+        return {"verdict": "pass", "failing_before": [], "failing_after": [],
+                "cost_usd": 0.0, "run_id": "r1"}
+
+    drive(
+        goal_id="goff", target_cwd="/tmp", units_cmd="echo u",
+        predicate_cmd="echo ok", child_recipe="code-fix",
+        max_waves=10, budget_total_usd=1000.0,
+        run_wave_fn=run_wave, cost_fn=lambda: 0.0, state_dir=state_dir,
+    )
+
+    assert read_decisions(state_dir) == []
+
+
+def test_drive_shield_enforce_stops_on_a_stale_bundle(tmp_path, monkeypatch):
+    monkeypatch.setenv("MO_GOAL_SHIELD", "enforce")
+    state_dir = tmp_path / "state"
+    waves_run: list[int] = []
+
+    def run_wave(wave_no, quarantined):
+        waves_run.append(wave_no)
+        return {"verdict": "fail", "failing_before": ["1"], "failing_after": ["1"],
+                "cost_usd": 0.0, "run_id": f"r{wave_no}", "attempted": ["1"],
+                "evidence": {"1": "same-every-wave"}}
+
+    verdict = drive(
+        goal_id="genforce", target_cwd="/tmp", units_cmd="echo u",
+        predicate_cmd="echo ok", child_recipe="code-fix",
+        max_waves=10, budget_total_usd=1000.0,
+        run_wave_fn=run_wave, cost_fn=lambda: 0.0, state_dir=state_dir,
+    )
+
+    assert verdict["stop"] == "shield", verdict
+    assert verdict["guard"] == "stale-evidence"
+    # Wave 1 has no predecessor to be stale against; the stop lands on wave 2.
+    assert waves_run == [1, 2]
+    final = json.loads((state_dir / "final-verdict.json").read_text())
+    assert final["stop"] == "shield"
+
+
+def test_drive_shield_enforce_does_not_stop_a_moving_loop(tmp_path, monkeypatch):
+    monkeypatch.setenv("MO_GOAL_SHIELD", "enforce")
+    state_dir = tmp_path / "state"
+
+    def run_wave(wave_no, quarantined):
+        if wave_no == 1:
+            return {"verdict": "fail", "failing_before": ["1", "2"],
+                    "failing_after": ["2"], "cost_usd": 0.0, "run_id": "r1",
+                    "attempted": ["1"], "evidence": {"1": "ev-a"}}
+        return {"verdict": "pass", "failing_before": [], "failing_after": [],
+                "cost_usd": 0.0, "run_id": "r2"}
+
+    verdict = drive(
+        goal_id="gmoving", target_cwd="/tmp", units_cmd="echo u",
+        predicate_cmd="echo ok", child_recipe="code-fix",
+        max_waves=10, budget_total_usd=1000.0,
+        run_wave_fn=run_wave, cost_fn=lambda: 0.0, state_dir=state_dir,
+    )
+
+    assert verdict["stop"] == "goal_met", verdict
+
+
+def test_shield_shadow_default_leaves_the_wave_record_untouched(tmp_path, monkeypatch):
+    """The additive contract: shadow mode changes no persisted wave field."""
+    monkeypatch.delenv("MO_GOAL_SHIELD", raising=False)
+    state_dir = tmp_path / "state"
+
+    def run_wave(wave_no, quarantined):
+        return {"verdict": "pass", "failing_before": [], "failing_after": [],
+                "cost_usd": 0.0, "run_id": "r1"}
+
+    drive(
+        goal_id="gwave", target_cwd="/tmp", units_cmd="echo u",
+        predicate_cmd="echo ok", child_recipe="code-fix",
+        max_waves=10, budget_total_usd=1000.0,
+        run_wave_fn=run_wave, cost_fn=lambda: 0.0, state_dir=state_dir,
+    )
+
+    wave = load_state(state_dir, "gwave")["waves"][0]
+    assert set(wave) == {"wave", "run_id", "failing_before", "failing_after",
+                         "cost_usd", "signature"}, wave
