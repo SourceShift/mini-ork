@@ -28,6 +28,15 @@ from .semantic import (
     search,
     upsert,
 )
+from .retirement import (
+    RETIRE_ENTER_UTILITY,
+    RETIRE_EXIT_UTILITY,
+    RETIRE_MIN_USES,
+    candidates,
+    reactivate,
+    retire,
+    retirement_state,
+)
 
 __all__ = [
     "add",
@@ -37,6 +46,13 @@ __all__ = [
     "record_retrievals",
     "record_outcome",
     "resolve_finished_runs",
+    "retire",
+    "reactivate",
+    "retirement_state",
+    "candidates",
+    "RETIRE_ENTER_UTILITY",
+    "RETIRE_EXIT_UTILITY",
+    "RETIRE_MIN_USES",
     "Embedder",
     "HashEmbedder",
 ]
