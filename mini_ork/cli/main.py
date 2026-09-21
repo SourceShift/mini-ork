@@ -64,6 +64,7 @@ _NATIVE_MODULE_SUBS = {
     "usage-report": "mini_ork.observability.usage_report",
     "watchdog": "mini_ork.orchestration.watchdog",
     "acp": "mini_ork.cli.acp_cmd",
+    "calibrate": "mini_ork.cli.calibrate",
 }
 
 _HELP = """mini-ork — task operating system for agents (v0.1)

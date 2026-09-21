@@ -2084,12 +2084,12 @@ def _make_trace_fn(task_class, db, run_id):
     lane_router_recompute_advantages has real signal to learn from.
     Signature matches dispatch_node's `trace(node_id, status, node_type, output_file,
     verdict, finish_reason, lane, route_source, route_explore, route_score,
-    route_margin)`."""
+    route_margin, predicted_error)`."""
     from mini_ork import trace_store  # noqa: PLC0415
 
     def _tf(node_id, status, node_type, output_file="", verdict="", finish_reason="",
             lane="", route_source="", route_explore=False, route_score=None,
-            route_margin=None):
+            route_margin=None, predicted_error=None):
         extra = {
             "trace_id": f"tr-{node_type}-{node_id}-{uuid.uuid4().hex[:8]}",
             "run_id": run_id,
@@ -2120,6 +2120,11 @@ def _make_trace_fn(task_class, db, run_id):
             # missing margin just means "uncalibratable row", not a broken write.
             if route_margin is not None:
                 extra["route_margin"] = float(route_margin)
+            # The calibrated error probability behind an escalation decision.
+            # Persisted so the backtest can check the map against the outcome;
+            # a missing prediction means "uncalibratable row", not a broken write.
+            if predicted_error is not None:
+                extra["predicted_error"] = float(predicted_error)
         # Implementer code_region must reflect the TARGET repo's edited source,
         # not the .mini-ork run-log path. Seed files_written from git-visible
         # target-repo changes FIRST so infer_trace_code_region resolves the

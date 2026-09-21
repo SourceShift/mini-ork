@@ -107,6 +107,7 @@ def learning_governed_lane(
                 route_explore=bool(decision.get("route_explore")),
                 route_score=decision.get("route_score"),
                 route_margin=decision.get("route_margin"),
+                predicted_error=decision.get("predicted_error"),
             )
         return route or current_lane
     except Exception:
