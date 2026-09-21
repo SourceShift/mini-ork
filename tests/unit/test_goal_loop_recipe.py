@@ -943,6 +943,94 @@ def test_quality_floor_does_not_false_trip_a_clean_chapter():
     assert facts["total_chars"] == 23090
 
 
+# ── the floor the PLAN declared (bg_chapter_plan_spec.budgets.min_words) ──
+# A uniform env floor cannot express "this chapter was planned to carry eight
+# sections, so 3,000 chars is thin". These pin the declared floor's two jobs:
+# raise the bar above the operator's when the plan commits to more, and never
+# lower it when the plan commits to less (or to nothing at all).
+
+
+def test_quality_floor_takes_the_plans_declared_bar(monkeypatch):
+    monkeypatch.delenv("MO_GOAL_QUALITY_MIN_TOTAL_CHARS", raising=False)
+    bad, facts = _qualmod._failures(
+        _clean_rows(3, 1700), "body " * 500, planned_floor=6500,
+    )
+    assert bad == ["total=5100<6500:planned"]
+    assert facts["floor"] == 6500 and facts["floor_source"] == "planned"
+
+
+def test_quality_floor_never_lowers_below_the_operator_bar(monkeypatch):
+    # A plan declaring LESS than the operator floor must not lower it: the env
+    # number is a floor, not a default to override. Same verdict as no plan.
+    monkeypatch.setenv("MO_GOAL_QUALITY_MIN_TOTAL_CHARS", "4000")
+    bad, facts = _qualmod._failures(_clean_rows(3, 1000), "prose " * 600, planned_floor=600)
+    assert bad == ["total=3000<4000"]
+    assert facts["floor_source"] == "env"
+
+
+def test_quality_floor_absent_plan_is_the_status_quo(monkeypatch):
+    # None == no spec row / null min_words / unreadable row. Not a failure, and
+    # visibly not the plan's number.
+    monkeypatch.setenv("MO_GOAL_QUALITY_MIN_TOTAL_CHARS", "4000")
+    bad, facts = _qualmod._failures(_clean_rows(3, 1000), "prose " * 600, planned_floor=None)
+    assert bad == ["total=3000<4000"]
+    assert facts["floor"] == 4000 and facts["floor_source"] == "env"
+
+
+def test_quality_floor_a_plan_bar_cleared_is_not_a_failure(monkeypatch):
+    monkeypatch.delenv("MO_GOAL_QUALITY_MIN_TOTAL_CHARS", raising=False)
+    bad, facts = _qualmod._failures(
+        _clean_rows(3, 2500), "body " * 500, planned_floor=6500,
+    )
+    assert bad == []
+    assert facts["floor_source"] == "planned" and facts["total_chars"] == 7500
+
+
+def test_planned_floor_sql_targets_the_spec_budget():
+    # Contract guard: the probe must read the adoption gate's field off the spec
+    # row, resolved through books (the spec keys on book_id, the loop only has
+    # document_uuid) and ordered by the table's own W6 read axis — a re-planned
+    # book must resolve to its newest spec, never a stale one.
+    assert "bg_chapter_plan_spec" in _qualmod._PLANNED_FLOOR
+    assert "budgets->>'min_words'" in _qualmod._PLANNED_FLOOR
+    assert "b.document_uuid=" in _qualmod._PLANNED_FLOOR
+    assert "ORDER BY s.created_at DESC" in _qualmod._PLANNED_FLOOR
+
+
+def _floor_proc(stdout: str, rc: int = 0):
+    import subprocess as _sp
+
+    return lambda _sql: _sp.CompletedProcess(args=[], returncode=rc, stdout=stdout, stderr="")
+
+
+def test_planned_floor_reads_words_and_converts_to_chars(monkeypatch):
+    monkeypatch.delenv("MO_GOAL_QUALITY_CHARS_PER_WORD", raising=False)
+    monkeypatch.setattr(_qualmod, "_q", _floor_proc("1417\n"))
+    assert _qualmod._planned_floor("d0df3cdb-8164-450e-b841-2c9354ea0423", "3") == 1417 * 6
+
+
+def test_planned_floor_unit_matches_the_gate_it_reads(monkeypatch):
+    # One divisor for both directions: the gate derived min_words with this
+    # number, so this check must convert back with the same one.
+    monkeypatch.setenv("MO_GOAL_QUALITY_CHARS_PER_WORD", "5")
+    monkeypatch.setattr(_qualmod, "_q", _floor_proc("1417\n"))
+    assert _qualmod._planned_floor("b", "1") == 1417 * 5
+
+
+def test_planned_floor_absent_or_unreadable_is_none(monkeypatch):
+    monkeypatch.delenv("MO_GOAL_QUALITY_CHARS_PER_WORD", raising=False)
+    # No spec row for the book: psql succeeds with an empty result.
+    monkeypatch.setattr(_qualmod, "_q", _floor_proc("\n"))
+    assert _qualmod._planned_floor("b", "1") is None
+    # A probe error is the same answer, deliberately: this term is additive
+    # strictness, so an unreachable row leaves the operator floor in place.
+    monkeypatch.setattr(_qualmod, "_q", _floor_proc("", rc=2))
+    assert _qualmod._planned_floor("b", "1") is None
+    # A non-numeric payload never raises into the caller.
+    monkeypatch.setattr(_qualmod, "_q", _floor_proc("null\n"))
+    assert _qualmod._planned_floor("b", "1") is None
+
+
 def test_quality_probe_absent_cmd_is_not_consulted(monkeypatch):
     monkeypatch.delenv("MO_GOAL_QUALITY_CMD", raising=False)
     assert _predmod._quality_cmd() == ""

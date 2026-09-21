@@ -35,6 +35,19 @@ A committed chapter with NO section rows fails by design: a commit whose parts
 cannot be located cannot be verified as non-vacuous. Operators who would rather
 observe than enforce set ``MO_GOAL_QUALITY_MODE=warn`` on the predicate side.
 
+THE FLOOR CAN BE DECLARED BY THE PLAN
+``MO_GOAL_QUALITY_MIN_TOTAL_CHARS`` is one number for every chapter of every
+book. The plan itself already commits to a per-chapter floor — the adoption gate
+derives it from how many sections the chapter was planned to carry and persists
+it as ``bg_chapter_plan_spec.budgets.min_words`` — so a thin chapter can be
+failed against the number ITS OWN PLAN declared rather than a uniform constant.
+That declared floor is read here and applied as ``max(declared, env)``: it can
+raise the bar, never lower it, so an absent or unreadable plan is exactly the
+status quo (the operator floor still holds). This is additive strictness, which
+is why a probe that cannot reach the row falls back silently instead of failing
+closed — unlike ``_figures``, there is no state being conflated, only a
+stricter floor not being applied.
+
 Connection comes from libpq env vars; no secret lives here.
 """
 from __future__ import annotations
@@ -89,6 +102,20 @@ _FIGURES = (
     "  (SELECT count(*) FROM bg_source_figure_attempt a"
     "     WHERE a.chapter_uuid=ch.chapter_uuid AND a.figure_block_uuid IS NOT NULL)"
     " FROM ch;"
+)
+
+# The floor the PLAN declared for this chapter, in WORDS (bg_chapter_plan_spec.
+# budgets.min_words, written by the adoption gate from the chapter's section
+# count). Joined through `books` because the spec keys on `book_id` while the
+# loop's handle is `books.document_uuid`; `ORDER BY` matches the table's own W6
+# read axis (idx_bg_chapter_plan_spec_book_chapter_created) so a re-planned book
+# resolves to its newest spec, never a stale one.
+_PLANNED_FLOOR = (
+    "SELECT coalesce(s.budgets->>'min_words','')"
+    " FROM bg_chapter_plan_spec s"
+    " JOIN books b ON b.id = s.book_id"
+    " WHERE b.document_uuid='{book}' AND s.chapter_number={chapter}"
+    " ORDER BY s.created_at DESC, s.plan_hash DESC LIMIT 1;"
 )
 
 
@@ -181,6 +208,35 @@ def _figures(book: str, chapter: str) -> dict[str, int] | None:
     return {"attached": attached, "live": live, "cascade": cascade, "attempts": attempts}
 
 
+def _planned_floor(book: str, chapter: str) -> int | None:
+    """The plan-declared minimum for this chapter, in CHARS, or ``None``.
+
+    ``None`` means "no declared floor to apply" and deliberately covers both
+    absence (no spec row for this book, or ``min_words`` null — the norm for
+    every book adopted before the gate started deriving one) and a probe error.
+    Unlike ``_figures`` there is no distinct state being conflated: this term is
+    additive strictness, so an unreachable row leaves the operator floor exactly
+    as it is today rather than reddening a chapter on a transient.
+
+    Words are converted at ``MO_GOAL_QUALITY_CHARS_PER_WORD`` (default 6), the
+    same divisor the adoption gate used to derive ``min_words`` — one unit for
+    both directions, so a plan floor and this check can never disagree.
+    """
+    proc = _q(_PLANNED_FLOOR.format(book=book, chapter=chapter))
+    if proc.returncode != 0:
+        return None
+    value = proc.stdout.strip()
+    if not value:
+        return None
+    try:
+        words = int(value)
+    except ValueError:
+        return None
+    if words <= 0:
+        return None
+    return words * _int_env("MO_GOAL_QUALITY_CHARS_PER_WORD", 6)
+
+
 def _blob(book: str, chapter: str) -> str:
     """The concatenated committed markdown. One column, one row — newlines in
     the payload are harmless because the whole stdout is the value."""
@@ -198,16 +254,27 @@ _UNPROBED = object()
 def _failures(
     rows: list[tuple[int, str, int, str, int]], blob: str,
     figures: object = _UNPROBED,
+    planned_floor: object = _UNPROBED,
 ) -> tuple[list[str], dict[str, object]]:
     """The floor's verdict. Returns ``(failures, facts)``; empty failures == pass.
 
     ``figures`` is ``_UNPROBED`` when the caller did not ask (the term is then
     inert, so the pure verdict logic stays independently testable), a dict from
     ``_figures``, or ``None`` for a probe error — which fails closed.
+
+    ``planned_floor`` is ``_UNPROBED`` when not asked, else the int from
+    ``_planned_floor`` or ``None``. It can only RAISE the total-chars bar:
+    ``max(declared, env)``. Declaring less than the operator's floor must never
+    lower it — the env number is a floor, not a default to be overridden.
     """
     min_sections = _int_env("MO_GOAL_QUALITY_MIN_SECTIONS", 3)
     min_section_chars = _int_env("MO_GOAL_QUALITY_MIN_SECTION_CHARS", 400)
     min_total_chars = _int_env("MO_GOAL_QUALITY_MIN_TOTAL_CHARS", 4000)
+    floor = min_total_chars
+    floor_source = "env"
+    if isinstance(planned_floor, int) and planned_floor > floor:
+        floor = planned_floor
+        floor_source = "planned"
 
     lengths = [r[2] for r in rows]
     total = sum(lengths)
@@ -219,6 +286,8 @@ def _failures(
         "headings": len(_HEADING.findall(blob)),
         "doc_version": doc_versions[0] if len(doc_versions) == 1 else doc_versions,
         "figures": figures,
+        "floor": floor,
+        "floor_source": floor_source,
     }
 
     if not rows:
@@ -227,8 +296,11 @@ def _failures(
     bad: list[str] = []
     if len(rows) < min_sections:
         bad.append(f"sections={len(rows)}<{min_sections}")
-    if total < min_total_chars:
-        bad.append(f"total={total}<{min_total_chars}")
+    if total < floor:
+        # `:planned` marks the number as the chapter's OWN plan commitment; the
+        # bare form stays byte-identical so existing reason readers are unmoved.
+        suffix = ":planned" if floor_source == "planned" else ""
+        bad.append(f"total={total}<{floor}{suffix}")
     short = [(r[0], r[2]) for r in rows if r[2] < min_section_chars]
     if short:
         bad.append("short-section " + ",".join(f"{i}:{n}" for i, n in short[:5]))
@@ -298,7 +370,7 @@ def main(argv: list[str]) -> int:
         return 3
 
     figures = _figures(book, chapter)
-    bad, facts = _failures(rows, _blob(book, chapter), figures)
+    bad, facts = _failures(rows, _blob(book, chapter), figures, _planned_floor(book, chapter))
     summary = (
         f"sections={facts['sections']} total={facts['total_chars']} "
         f"min_section={facts['min_section_chars']} "
@@ -308,6 +380,12 @@ def main(argv: list[str]) -> int:
         summary += f" figures={figures['live']}/{figures['attached']}"
     if facts.get("figure_warn"):
         summary += f" [{facts['figure_warn']}]"
+    # Bracketed, like figure_warn: the predicate's axis parser cuts at
+    # `quality=` and reads the `[...]` suffix as annotation, so a plan-declared
+    # floor shows up in the reason without inventing an axis the vacuity check
+    # would read as discriminating.
+    if facts["floor_source"] == "planned":
+        summary += f" [floor={facts['floor']} planned]"
     if bad:
         print(f"ch{chapter} QUALITY-FAIL {summary} :: {'; '.join(bad)}")
         return 1
