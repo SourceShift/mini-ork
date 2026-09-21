@@ -62,6 +62,14 @@ export MO_GOAL_PREDICATE_CMD="python3 $BIND/chapter_predicate.py"
 # The goal-loop persists it to <run_dir>/evidence/<slug>.md and templates it into
 # the child kickoff as {{evidence}} / {{evidence_path}}. Unset to fall back to reason.
 export MO_GOAL_EVIDENCE_CMD="${MO_GOAL_EVIDENCE_CMD:-python3 $BIND/harvest_evidence.py}"
+# AXIS-GAP sensor (optional, on by default here): runs ONLY on the pass path,
+# once per goal_met, asking a question the give-up detectors cannot — "did the
+# loop look at enough to know?". The predicate decides on committed_complete +
+# rubric_status and cannot express "this book's chapters are supposed to carry
+# figures"; this sensor declares that duty and lets a green be reported beside
+# it. Purely diagnostic: it attaches `diagnostics.obligation_gap` to the verdict
+# and never rewrites `stop`. Unset to disable.
+export MO_GOAL_OBLIGATION_CMD="${MO_GOAL_OBLIGATION_CMD:-bash $BIND/obligations.sh}"
 export MO_GOAL_CHILD_RECIPE=code-fix
 export MO_GOAL_MAX_CHILDREN_PER_WAVE="${MO_GOAL_MAX_CHILDREN_PER_WAVE:-1}"
 

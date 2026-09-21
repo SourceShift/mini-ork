@@ -117,6 +117,127 @@ def _tier_db(chapter: str, book: str) -> str | None:
 
 # ── Tier 1b: why the COMMIT gate refuses ─────────────────────────────────────
 
+# probeId → the module that RAISES it. A chapter blocked on its decomposition
+# receipt is usually blocked by a VALIDATOR, not by its prose, and the child
+# dispatched to "fix the chapter" will rewrite prose instead of the probe. Naming
+# the file is what turns that into a harness fix.
+#
+# ch6 (2026-09-20) is the exemplar: `decomposition_error_count=1` from
+# `undefined_shared_symbol` fired on `"user@example.com"` inside a JSON sample —
+# an email read as an `@example.` decorator by the C4 fence-hygiene probe. Every
+# regeneration reproduced it, so the chapter could never commit until the probe
+# itself was patched (validateFenceHygiene, 16a9c932f).
+_DECOMPOSITION_PROBE_SOURCES = {
+    "undefined_shared_symbol":
+        "server/services/bookGeneration/chapterWritingContract/validateFenceHygiene.ts",
+    "mislabeled_fence_language":
+        "server/services/bookGeneration/chapterWritingContract/validateFenceHygiene.ts",
+    "forbidden_fence_opener":
+        "server/services/bookGeneration/chapterWritingContract/validateFenceHygiene.ts",
+    "ascii_art_diagram":
+        "server/services/bookGeneration/chapterWritingContract/validateFenceHygiene.ts",
+    "orphan_list_after_fragment":
+        "server/services/blockAudit/probes.ts",
+}
+
+
+def _tier_decomposition_findings(chapter: str, book: str) -> None:
+    """The error-severity findings inside ``decomposition_diagnostics``.
+
+    ``decomposition_error_count`` is a scalar that says a chapter is blocked but
+    not by what. The diagnostics JSONB holds the findings themselves — probeId,
+    message, sha8 of the offending line, blockUuid — which is enough to tell a
+    PROSE defect (the chapter's own text) from a HARNESS defect (a probe whose
+    predicate is wrong). Emitting them, with the probe's source module, is what
+    lets the loop stop patching prose for a probe's false positive.
+    """
+    sql = (
+        "WITH lc AS (SELECT decomposition_diagnostics AS d, "
+        "  decomposition_error_count AS errs, "
+        "  decomposition_warning_count AS warns, "
+        "  coalesce(decomposition_parser_version,'(none)') AS pv, "
+        "  coalesce(decomposition_status,'(none)') AS st, "
+        "  decomposition_verified_at AS at "
+        f"FROM book_chapter_lifecycle WHERE book_uuid='{book}' "
+        f"AND chapter_number={chapter}), "
+        "findings AS ("
+        "  SELECT 'block' AS src, f FROM lc, "
+        "    jsonb_array_elements(COALESCE(lc.d->'block_findings','[]'::jsonb)) f "
+        "  UNION ALL "
+        "  SELECT 'grammar' AS src, f FROM lc, "
+        "    jsonb_array_elements(COALESCE(lc.d->'grammar_findings','[]'::jsonb)) f) "
+        "SELECT COALESCE(lc.st,'(none)'), COALESCE(lc.errs,-1)::text, "
+        "  COALESCE(lc.warns,-1)::text, lc.pv, "
+        "  COALESCE(to_char(lc.at,'YYYY-MM-DD HH24:MI:SS'),''), "
+        "  COALESCE(f.src,''), COALESCE(f.f->>'severity',''), "
+        "  COALESCE(f.f->>'probeId',''), "
+        "  COALESCE(f.f->'evidence'->>'line',''), "
+        "  COALESCE(f.f->>'blockUuid',''), "
+        "  replace(replace(COALESCE(f.f->>'message',''),'|','/'), E'\\n',' ') "
+        "FROM lc LEFT JOIN findings f ON TRUE "
+        "ORDER BY (f.f->>'severity' = 'error') DESC NULLS LAST, f.src "
+        "LIMIT 30;"
+    )
+    _emit("### Decomposition receipt findings (book_chapter_lifecycle."
+          "decomposition_diagnostics)")
+    _emit()
+    proc = _psql(sql)
+    if proc.returncode != 0:
+        _emit(f"NOTE: diagnostics query failed rc={proc.returncode}: "
+              f"{proc.stderr.strip()[:200]}")
+        _emit()
+        return
+    rows = [r for r in proc.stdout.strip().splitlines() if r]
+    if not rows:
+        _emit("NOTE: no lifecycle row for this chapter.")
+        _emit()
+        return
+    head = (rows[0].split("|") + [""] * 5)[:5]
+    status, errs, warns, pv, verified_at = head
+    _emit("```")
+    _emit(f"decomposition_status         = {status}")
+    _emit(f"decomposition_error_count    = {errs}")
+    _emit(f"decomposition_warning_count  = {warns}")
+    _emit(f"decomposition_parser_version = {pv}")
+    _emit(f"decomposition_verified_at    = {verified_at or '(never)'}")
+    _emit("```")
+    _emit()
+    seen: set[tuple[str, str]] = set()
+    errors: list[tuple[str, str, str, str, str, str]] = []
+    for row in rows:
+        cols = (row.split("|") + [""] * 11)[:11]
+        _, _, _, _, _, src, severity, probe, line, block_uuid, message = cols
+        if not probe:
+            continue
+        key = (probe, line)
+        if key in seen:
+            continue
+        seen.add(key)
+        if severity == "error":
+            errors.append((src, probe, line, block_uuid, message,
+                           _DECOMPOSITION_PROBE_SOURCES.get(
+                               probe,
+                               "server/services/bookGeneration/chapterWritingContract/ "
+                               "(grep the probeId)")))
+    if not errors:
+        _emit("No ERROR-severity findings — the receipt's failures are warnings "
+              "only, so the decomposition gate is NOT what refuses this commit. "
+              "Read Tier 1b's humanization counts below.")
+        _emit()
+        return
+    _emit(f"**{len(errors)} distinct ERROR-severity finding(s). Each one is "
+          "emitted by a VALIDATOR, not by the chapter's prose — check the "
+          "probe's predicate against the offending line before regenerating "
+          "the chapter:**")
+    _emit()
+    for src, probe, line, block_uuid, message, module in errors:
+        _emit(f"- `{probe}` (severity error) at {line or 'line n/a'}"
+              + (f", block {block_uuid}" if block_uuid else ""))
+        _emit(f"  - {message or '(no message)'}")
+        _emit(f"  - raised by: `{module}`")
+    _emit()
+
+
 def _tier_commit_gate(chapter: str, book: str) -> None:
     """Why ``markTaskCompleted`` refuses the commit, in the gate's own terms.
 
@@ -242,6 +363,12 @@ def _tier_commit_gate(chapter: str, book: str) -> None:
     _emit(f"rubric_status                         = {rubric or '(none)'}")
     _emit("```")
     _emit()
+
+    # Lead with the receipt's own findings when it HAS errors: `struct`/`humanized`
+    # predicates below are downstream of them, and a child that reads only the
+    # scalars will regenerate prose against a probe that will fail it again.
+    if dec_errs == "f":
+        _tier_decomposition_findings(chapter, book)
 
     _emit("The counts that decide the always-on clauses appended to that WHERE "
           "(`committedCompleteGevalHashClause` + `committedCompleteHumanization"
