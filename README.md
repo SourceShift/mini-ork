@@ -241,10 +241,128 @@ mini-ork run code-fix ./kickoff.md
 | A documentation change | **docs** |
 | A multi-perspective codebase audit | **refactor-audit** or **bug-audit-cmgk** |
 | A literature or research brief | **research-synthesis** |
+| Self-improvement of this repository | **recursive-self-improve** (see below) |
 | A new workflow shape | Copy a recipe and follow the extension guide |
 
 Recipes live in [recipes/](recipes/). To create one, define a task class, workflow,
 artifact contract, prompts, and verifiers; see the [extension guide](docs/EXTENSION.md).
+
+## Recursive self-improvement: two loops
+
+mini-ork improves itself through two loops that are easy to conflate, yet their blast
+radii are nothing alike. The [warning](#warning-this-system-modifies-itself-unattended)
+at the top of this file is about the second one. Know which one you are starting.
+
+### The self-improvement loop — bounded, branch-isolated, dry-runnable
+
+`mini-ork self-improve` (`bin/mini-ork-self-improve`) is a wall-clock-budgeted outer
+loop that runs the [`recursive-self-improve`](recipes/recursive-self-improve/) recipe
+against the mini-ork checkout. One iteration scans the repo, the run database, and
+benchmark deltas for bottlenecks, runs three heterogeneous-family research lenses plus
+an arXiv research lane (MiniMax / Kimi / Codex — low-correlation voters, not three
+prompts on one model), asks Opus to synthesize a *ranked* patch plan, has a cheaper lane
+implement the top patch, and gates the result.
+
+The gate is four layers, not one: three deterministic verifiers — `bottlenecks-found`,
+`self-tests-pass` (runs mini-ork's own pytest suite in a hermetic sandbox, so the verdict
+reflects the patch and not the machine around it), and `no-regression` — plus an Opus
+patch critic, so a diff that passes pytest but is off-plan, gamed, or a no-op is still
+caught. The **runner**, not the implementer, is the only thing that calls `git commit`,
+and only once the gates pass. Every iteration lands on its own
+`self-improve/iter-<N>-<ts>` branch in a fresh worktree under `$MINI_ORK_HOME/worktrees/`.
+Nothing reaches the branch you are on unless you pass `--auto-merge`.
+
+```bash
+# Prove the wiring with no model calls. Start here.
+bin/mini-ork-self-improve --dry-run --max-iters 1
+
+# A real session: 3h soft cap, 5h hard cap; branches left for you to review.
+bin/mini-ork-self-improve --soft-cap-hours 3 --hard-cap-hours 5
+
+# Resume after Ctrl-C — picks the last iteration back out of MINI_ORK_DB.
+bin/mini-ork-self-improve --resume --soft-cap-hours 3 --hard-cap-hours 5
+```
+
+`--soft-cap-hours` finishes the iteration in flight then stops; `--hard-cap-hours` kills
+mid-iteration. Caps are also enforced in dollars (`MO_DAILY_BUDGET_USD`, plus per-iter
+and per-epic budgets in `config/agents.recursive-self-improve.yaml`), and a pre-iteration
+cost check (`MINI_ORK_PRE_ITER_COST_CHECK=1`, the default) refuses to start a new
+iteration once the daily cap is hit. Override lanes by copying
+`config/agents.recursive-self-improve.yaml` to `$MINI_ORK_HOME/config/agents.yaml`.
+
+### The apply loop — unattended, and the one to be careful with
+
+`mini-ork apply` closes learn → apply for *prompt and workflow* changes: it picks the
+highest-confidence proposed change, materializes it as a workflow candidate, scores it on
+a **frozen held-out probe set**, applies a per-task non-regression gate, and then either
+rewrites the target file or quarantines it with a reason. Quarantine is the gate doing its
+job, not an error — the command exits `0` either way.
+
+Only the `probe` scorer can promote. `mock` and `gepa` are deterministic placeholders
+that fabricate a utility and never promote; they exist for tests. With no measurement
+there is no promote.
+
+Probe sets live at `recipes/<recipe>/probes/*.md` — `code-fix` and `obs-smoke` ship them
+today, so those are the task classes you can build on. You also need an initialized
+project (`pattern_records` is created by `mini-ork init`), because a run against a bare
+home has nothing to pick from.
+
+```bash
+mini-ork init                      # once, in the project you are improving
+mini-ork apply --task-class code-fix \
+  --target recipes/code-fix/prompts/implementer.md --dry-run
+```
+
+Both flags that make this dangerous are off by default:
+
+- `MO_APPLY_ENABLED=1` — the master gate. Without it a candidate is prepared but the
+  file write and version registration are skipped. `apply --enable` sets it for one call.
+- `MO_AUTO_APPLY=1` — the unattended sweep *inside a run*. The sweep fires only when
+  **both** this and `MO_APPLY_ENABLED` are `1`; there is no code path that promotes on
+  one alone.
+- `MO_APPLY_DRY_RUN=1` — score and decide, write nothing.
+- `MO_APPLY_PROBE_MAX_TASKS` (default 2) and `MO_APPLY_PROBE_BUDGET_USD` (default 2.0) —
+  the spend ceiling for a single probe evaluation.
+
+Because that sweep has **no approval prompt**, the rollbacks are yours to know:
+`mini-ork rollback agent <name>` restores the pre-promotion prompt file and
+`mini-ork rollback workflow <name>` the workflow; your VCS is the backstop. Both read
+the version registry straight out of `MINI_ORK_DB`, which nothing sets for you — export it
+first, or the command exits on `MINI_ORK_DB unset`:
+
+```bash
+export MINI_ORK_DB="$MINI_ORK_HOME/state.db"
+mini-ork rollback agent <name>
+```
+
+See [docs/SAFETY.md](docs/SAFETY.md) for quarantine semantics.
+
+### The manual loop that surrounds both
+
+Between the two, the same primitives are drivable by hand — propose, score, decide:
+
+```bash
+mini-ork improve --dry-run                     # show what it would propose, spend nothing
+mini-ork improve --task-class code-fix --limit 3
+mini-ork eval    --candidate <id>              # run the benchmark suite against a candidate
+mini-ork promote --candidate <id> --dry-run    # compute the gate decision, write nothing
+```
+
+### Where the state lives
+
+Everything above writes to `$MINI_ORK_DB` (default `$MINI_ORK_HOME/state.db`):
+
+```bash
+sqlite3 .mini-ork/state.db "SELECT iter, outcome, notes FROM self_improve_runs ORDER BY iter;"
+sqlite3 .mini-ork/state.db "SELECT iter, rank, category, title, outcome, severity, confidence FROM learning_record ORDER BY iter, rank;"
+sqlite3 .mini-ork/state.db "SELECT decision, COUNT(*) FROM apply_attempts GROUP BY decision;"
+```
+
+`learning_record` carries the per-bottleneck trail — a bottleneck is written `open` when
+the scanner finds it, `resolved` when an iteration commits a fix for it, and `superseded`
+once a later successful iteration lands over a `deferred` one. `apply_attempts` records
+every apply decision, including each quarantine and the reason, so a directive that failed
+a gate is never re-proposed.
 
 ## Honesty by design
 

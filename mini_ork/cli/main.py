@@ -91,6 +91,12 @@ Recipe runner:
                                    classify → plan → execute → verify
   run <recipe-name> <kickoff.md> Force a recipe, then walk the same lifecycle
 
+Self-improvement:
+  self-improve                   Recursive self-improvement of this checkout in a
+                                   worktree + branch per iteration (--dry-run,
+                                   --soft-cap-hours, --hard-cap-hours, --auto-merge,
+                                   --resume). Gated; never commits without verifiers.
+
 Lifecycle:
   init                           Bootstrap project (creates .mini-ork/)
   install                        Install or repair the per-user mini-ork command

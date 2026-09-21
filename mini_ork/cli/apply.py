@@ -148,7 +148,7 @@ _APPLY_ATTEMPTS_DDL = """
         target_name             TEXT NOT NULL,
         source_kind             TEXT NOT NULL CHECK (source_kind IN
                                             ('pattern_records','emergent_patterns',
-                                             'gradient_records','synthesis_gate_verdict')),
+                                             'gradient_records','synthesis_gate_verdict','none')),
         source_id               TEXT,
         candidate_id            TEXT REFERENCES workflow_candidates(candidate_id) ON DELETE SET NULL,
         promotion_id            TEXT REFERENCES promotion_records(promotion_id) ON DELETE SET NULL,
@@ -282,6 +282,15 @@ def pick_candidate(task_class: str, target_kind: str, target_name: str,
             })
 
         # Nothing picked.
+        return ""
+    except sqlite3.OperationalError as exc:
+        # A home that was never `mini-ork init`'d carries none of the source
+        # tables, so the first query raises "no such table: pattern_records".
+        # That is "nothing qualifies" — the caller's no_candidate path — not a
+        # crash out of a command documented to exit 0. Any OTHER OperationalError
+        # is a real schema or program fault and must still surface.
+        if "no such table" not in str(exc):
+            raise
         return ""
     finally:
         con.close()
