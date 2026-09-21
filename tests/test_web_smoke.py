@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import sqlite3
 import json
+import time
 from pathlib import Path
 
 import pytest
@@ -2633,6 +2634,16 @@ def test_socket_routes_inbound_messages_to_the_rest_handler(tmp_path: Path) -> N
                 ws.send_json(
                     {"role": "user", "content": [{"type": "text", "text": "again"}], "run": True}
                 )
+
+                # The drain hands each frame to the REST handler on a worker
+                # thread, so the second forward can still be in flight when
+                # this block exits — and the close then cancels it, leaving
+                # one forward instead of two. That race is invisible on a dev
+                # box and fires on a loaded CI runner, so wait for both here,
+                # while the socket is still open.
+                deadline = time.monotonic() + 5.0
+                while len(seen) < 2 and time.monotonic() < deadline:
+                    time.sleep(0.01)
     finally:
         routes.sockets.send_conversation_event = original
 
