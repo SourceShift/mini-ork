@@ -371,13 +371,18 @@ def self_verdict_mirage(state: State, patience: int = 2) -> str | None:
 # figure blind spot, and no amount of retrying the wave can reveal it.
 
 # A predicate reason is space-separated ``key=value`` pairs (chapter_predicate.py):
-# ``ch1 PASS status=completed rubric=pass mdlen=912 quality=unset``. The terminal
-# ``err=`` field is free-form prose that may contain spaces, so scanning stops
-# there rather than tokenising the error text into phantom axes. The lookbehind
-# rejects a ``-`` prefix so the ``rubric-healed=true`` suffix is not read as an
-# axis named ``healed``.
+# ``ch1 PASS status=completed rubric=pass mdlen=912 quality=unset``. Scanning
+# stops at the first nested annotation or terminal field, because everything
+# past either is a SUB-annotation whose keys are not predicate axes: a PASS may
+# carry ``... quality=<probe detail> [figure-loss attached=8 live=0 ...]``, and
+# ``live=0`` is a fact about one chapter's figures, not an axis the predicate
+# read. Without the cut a uniform ``live=0`` across every unit would be
+# reported as the axis the green was vacuous with respect to — which is both
+# the wrong name and the wrong mechanism. The lookbehind rejects a ``-`` prefix
+# so the ``rubric-healed=true`` suffix is not read as an axis named ``healed``,
+# and ``\b`` keeps ``stderr=``/``lasterr=`` from matching.
 _AXIS_KEY = re.compile(r"(?<![A-Za-z0-9_/-])([A-Za-z_][A-Za-z0-9_]*)=")
-_TERMINAL_FIELD = "err="
+_AXIS_CUT = re.compile(r"\[|\berr=")
 
 # A value with no discriminating power: absent, a sentinel, or zero. ``quality``
 # resolves to ``unset`` for EVERY unit whenever ``MO_GOAL_QUALITY_CMD`` is unset,
@@ -388,16 +393,26 @@ _DEGENERATE = frozenset({"", "-", "n/a", "na", "none", "null", "unset", "0", "fa
 def _reason_axes(reason: str) -> dict[str, str]:
     """Parse a predicate reason line into its ``axis -> value`` map.
 
+    Scanning stops at ``quality=``, the last axis the predicate itself emits.
+    Everything after it is the quality probe's own detail — ``sections=4
+    total=23090 headings=4`` — a nested string that is not part of the
+    predicate's grammar. Reading its keys as axes let a probe key that happens
+    to be uniform and zero (``live=0`` off a ``[figure-loss ...]`` bracket)
+    present itself as the axis the green was vacuous with respect to.
+
     An unparseable reason yields ``{}`` — the caller must treat "no axes" as
     "cannot diagnose", never as "no problem".
     """
     if not reason:
         return {}
-    head = reason.split(_TERMINAL_FIELD, 1)[0]
+    head = _AXIS_CUT.split(reason, 1)[0]
     axes: dict[str, str] = {}
     for match in _AXIS_KEY.finditer(head):
         rest = head[match.end():]
-        axes[match.group(1)] = rest.split(None, 1)[0] if rest else ""
+        key = match.group(1)
+        axes[key] = rest.split(None, 1)[0] if rest else ""
+        if key == "quality":
+            break
     return axes
 
 

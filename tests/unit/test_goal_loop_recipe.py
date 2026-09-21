@@ -1259,6 +1259,24 @@ def test_reason_axes_skips_hyphenated_suffix_flags():
     assert "healed" not in axes
 
 
+def test_reason_axes_ignores_nested_annotations():
+    """The ``[...]`` suffix is a sub-annotation, not part of the axis grammar.
+
+    Live PASS reasons carry a quality probe detail that ends in
+    ``[figure-loss attached=8 live=0 cascade=8 attempts=0]``. Those keys belong
+    to one chapter's figure history; reading them as axes made a uniform
+    ``live=0`` masquerade as the axis the green was vacuous with respect to.
+    """
+    reason = (
+        "ch1 PASS status=completed rubric=pass mdlen=24101 "
+        "quality=ch1 QUALITY-OK sections=4 total=23090 headings=4 "
+        "[figure-loss attached=8 live=0 cascade=8 attempts=0]"
+    )
+    axes = _reason_axes(reason)
+    assert axes == {"status": "completed", "rubric": "pass", "mdlen": "24101",
+                    "quality": "ch1"}
+
+
 def test_reason_axes_on_garbage_is_empty():
     assert _reason_axes("") == {}
     assert _reason_axes("no axes at all here") == {}
