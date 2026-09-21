@@ -386,6 +386,11 @@ def _default_run_wave_fn(wave_no: int, quarantined: set[str]) -> dict[str, Any]:
                     for uid, v in gs.items()
                     if isinstance(v, dict)
                 }
+                payload["unit_reproduced"] = {
+                    str(uid): bool(v.get("reproduced", True))
+                    for uid, v in gs.items()
+                    if isinstance(v, dict)
+                }
         except json.JSONDecodeError:
             pass
 
@@ -812,6 +817,11 @@ def drive(
             if isinstance(raw_reasons, dict)
             else None
         )
+        raw_reproduced = verdict_dict.get("unit_reproduced")
+        unit_reproduced = (
+            {str(k): bool(v) for k, v in raw_reproduced.items()}
+            if isinstance(raw_reproduced, dict) else None
+        )
         raw_attempted = verdict_dict.get("attempted")
         attempted = (
             [str(u) for u in raw_attempted]
@@ -931,6 +941,24 @@ def drive(
                         )
                     except OSError:
                         pass
+            save_state(state, resolved_state_dir)
+            _write_final_verdict(resolved_state_dir, payload)
+            return payload
+
+        # 1b. nothing_to_fix — every still-failing unit is a confirmed-fail we
+        # could NOT reproduce. There is no defect to patch, so no wave can move
+        # this. `unit_reproduced.get(u, True)` defaults to True so a unit with
+        # no recorded flag (legacy artifact) can never trigger the stop — it is
+        # conservative in the direction that preserves today's behaviour.
+        if failing_after and unit_reproduced is not None and all(
+            not unit_reproduced.get(u, True) for u in failing_after
+        ):
+            payload = {
+                "stop": "nothing_to_fix",
+                "waves": wave_no,
+                "failing_units": failing_after,
+                "quarantined_units": sorted(quarantined),
+            }
             save_state(state, resolved_state_dir)
             _write_final_verdict(resolved_state_dir, payload)
             return payload

@@ -81,9 +81,11 @@ def goal_state_eval(workflow: CompiledWorkflow, ledger: ArtifactLedger, node_id:
         ``MO_GOAL_TARGET_CWD`` — absolute path to the target repo.
         ``MO_GOAL_UNITS_CMD``  — command run inside target cwd, one unit id per line.
         ``MO_GOAL_PREDICATE_CMD`` — argv-prefix; ``<unit_id>`` appended per call.
+        ``MO_GOAL_CONFIRM_RUNS`` — red-confirmation attempts (default "1").
 
     Output:
-        ``<run_dir>/goal-state.json`` mapping ``unit_id -> {"pass": bool, "reason": str}``.
+        ``<run_dir>/goal-state.json`` mapping
+        ``unit_id -> {"pass": bool, "reason": str, "reproduced": bool, "attempts": int}``.
     """
     target_cwd = os.environ.get("MO_GOAL_TARGET_CWD")
     units_cmd = os.environ.get("MO_GOAL_UNITS_CMD")
@@ -94,8 +96,12 @@ def goal_state_eval(workflow: CompiledWorkflow, ledger: ArtifactLedger, node_id:
             "and MO_GOAL_PREDICATE_CMD env vars",
         )
 
+    try:
+        confirm_runs = int(os.environ.get("MO_GOAL_CONFIRM_RUNS", "1"))
+    except ValueError:
+        confirm_runs = 1
     units = list_units(target_cwd, units_cmd)
-    states = evaluate_units(target_cwd, predicate_cmd, units)
+    states = evaluate_units(target_cwd, predicate_cmd, units, confirm_runs=confirm_runs)
     node = workflow.nodes[node_id]
     if "goal_state" not in node.outputs:
         raise ArtifactContractError("goal_state_eval requires a goal_state output")
@@ -202,15 +208,28 @@ def _select_units(
     """Pure wave-selection core (ledger-free, unit-testable).
 
     Picks the failing units (``pass`` is falsy) in numeric-aware order and caps
-    at ``max_children``. Units the driver has GRAO-quarantined are EXCLUDED, so a
-    single-child-per-wave loop that would otherwise re-select the same stuck unit
-    forever rotates its freed slot onto the next failing unit. Starvation guard:
-    if EVERY failing unit is quarantined the exclusion is dropped, so the wave
-    still dispatches and the driver's ``all_quarantined`` stop ends the loop
-    cleanly rather than the selector silently returning nothing.
+    at ``max_children``. Two exclusions apply:
+
+    * GRAO quarantine — units the driver has already given up on are EXCLUDED,
+      so a single-child-per-wave loop that would otherwise re-select the same
+      stuck unit forever rotates its freed slot onto the next failing unit.
+      This exclusion has a STARVATION GUARD: if EVERY failing unit is
+      quarantined the exclusion is dropped, so the wave still dispatches and
+      the driver's ``all_quarantined`` stop ends the loop cleanly rather than
+      the selector silently returning nothing.
+
+    * Null verdict (``reproduced`` is falsy) — a red the confirmation pass
+      could NOT reproduce is EXCLUDED. This exclusion has DELIBERATELY NO
+      starvation guard: if every remaining red is not reproducible,
+      ``_select_units`` returns ``[]`` and an empty selection IS the honest
+      verdict — there is nothing to fix, and dispatching a child anyway is the
+      behaviour this cycle exists to remove. A legacy goal-state dict without a
+      ``reproduced`` key defaults to ``True`` so pre-change artifacts select
+      exactly as they do today.
     """
     failing = sorted(
-        (uid for uid, state in goal_state.items() if not state.get("pass", False)),
+        (uid for uid, state in goal_state.items()
+         if not state.get("pass", False) and state.get("reproduced", True)),
         key=_unit_sort_key,
     )
     if quarantined:
