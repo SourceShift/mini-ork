@@ -29,8 +29,8 @@ def test_all_former_exec_subs_registered_natively():
         "epics", "bugs", "inject", "review", "traceotter", "metrics",
         "rollback", "resume", "recover", "serve", "bug-collector", "conductor",
         "coord", "lifetime", "self-improve", "topology", "usage-report", "watchdog",
-        "acp", "calibrate", "gate-fuzz", "memory-lifecycle", "harness-contrast",
-        "oversight",
+        "acp", "calibrate", "collapse-check", "gate-fuzz", "memory-lifecycle",
+        "harness-contrast", "oversight",
     }
     assert expected == set(_NATIVE_MODULE_SUBS)
     for sub in expected:
