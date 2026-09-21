@@ -124,3 +124,34 @@ def harvest_evidence(
             text = f"{text}\n[stderr]\n{proc.stderr}" if text else proc.stderr
         out[unit] = text.strip()[:max_chars]
     return out
+
+
+def read_obligations(target_cwd: str, obligations_cmd: str) -> tuple[str, str]:
+    """Run the obligation sensor. Returns ``(stdout, error)``.
+
+    The sensor lists obligations the TARGET declares but the loop's predicate
+    cannot express — the axis gap that lets a book with no figures pass a
+    predicate that never looks at one. It is optional (unset ⇒ no obligations).
+
+    But a CONFIGURED sensor that fails must not read as "no obligations": that is
+    precisely the silent green the sensor exists to catch. So a non-zero exit or
+    an exec failure returns the reason as ``error`` and the caller records it,
+    rather than reporting a clean run.
+    """
+    try:
+        proc = subprocess.run(
+            obligations_cmd,
+            cwd=target_cwd,
+            shell=True,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError as exc:
+        return "", f"obligation sensor could not run: {exc}"
+    if proc.returncode != 0:
+        return "", (
+            f"obligation sensor failed (rc={proc.returncode}): "
+            f"{proc.stderr.strip()[:120]}"
+        )
+    return proc.stdout or "", ""

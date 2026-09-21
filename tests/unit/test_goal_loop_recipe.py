@@ -978,3 +978,139 @@ def test_operator_for_reads_each_units_own_reason(monkeypatch):
     }
     assert operator_for("4", goal_state)[0] == "dispatch-repair"
     assert operator_for("5", goal_state)[0] == "code-fix"
+
+# ── goal-level diagnostics (pure) ──────────────────────────────────────────
+#
+# ``loop_state`` is loaded here by file path too; the driver tests exercise it
+# through ``drive()``, these pin the grammar and the ordering directly.
+
+_LOOP_STATE_PATH = RECIPE_DIR / "lib" / "loop_state.py"
+_ls_spec = importlib.util.spec_from_file_location(
+    "goal_loop_loop_state_recipe_tests", _LOOP_STATE_PATH,
+)
+if _ls_spec is None or _ls_spec.loader is None:
+    raise ImportError(f"could not load loop_state helper from {_LOOP_STATE_PATH}")
+_ls = importlib.util.module_from_spec(_ls_spec)
+sys.modules.setdefault(_ls_spec.name, _ls)
+_ls_spec.loader.exec_module(_ls)
+
+_reason_axes = _ls._reason_axes  # noqa: SLF001 — test seam
+goal_vacuity = _ls.goal_vacuity
+parse_obligations = _ls.parse_obligations
+obligation_gap = _ls.obligation_gap
+read_obligations = _mod.read_obligations
+
+
+def test_reason_axes_parses_the_pass_grammar():
+    axes = _reason_axes("ch7 PASS status=committed rubric=pass mdlen=1200 quality=unset")
+    assert axes == {
+        "status": "committed", "rubric": "pass",
+        "mdlen": "1200", "quality": "unset",
+    }
+
+
+def test_reason_axes_parses_the_fail_grammar_and_drops_the_terminal_err():
+    """``err=`` is free text and may hold spaces — it must not become an axis."""
+    reason = (
+        "ch4 FAIL status=failed rubric=none committed=f permfail=false "
+        "degraded=0 attempts=7 mdlen=0 err=contract build failed: H2 too long"
+    )
+    axes = _reason_axes(reason)
+    assert axes["permfail"] == "false"
+    assert axes["degraded"] == "0"
+    assert axes["attempts"] == "7"
+    assert "err" not in axes
+    # The trailing sentence is swallowed with the err field, not read as axes.
+    assert "too" not in axes
+
+
+def test_reason_axes_skips_hyphenated_suffix_flags():
+    """``rubric-healed=true`` is a flag, not an ``axis=value`` pair."""
+    axes = _reason_axes("ch7 PASS status=committed quality=pass rubric-healed=true")
+    assert "rubric-healed" not in axes
+    assert "healed" not in axes
+
+
+def test_reason_axes_on_garbage_is_empty():
+    assert _reason_axes("") == {}
+    assert _reason_axes("no axes at all here") == {}
+
+
+def test_goal_vacuity_names_the_dead_axis():
+    state = {"waves": [{"failing_after": []}]}
+    reasons = {"7": "ch7 PASS status=committed rubric=pass mdlen=0 quality=unset"}
+    assert goal_vacuity(state, reasons) == "vacuous_goal_met:mdlen+quality"
+
+
+def test_goal_vacuity_is_silent_when_every_axis_moved():
+    state = {"waves": [{"failing_after": []}]}
+    reasons = {"7": "ch7 PASS status=committed rubric=pass mdlen=1200 quality=pass"}
+    assert goal_vacuity(state, reasons) is None
+
+
+def test_goal_vacuity_ignores_a_still_failing_wave():
+    """Vacuity is a statement about a PASS; a failing wave is not one."""
+    state = {"waves": [{"failing_after": ["7"]}]}
+    reasons = {"7": "ch7 PASS status=committed quality=unset"}
+    assert goal_vacuity(state, reasons) is None
+
+
+def test_goal_vacuity_without_reasons_cannot_diagnose():
+    assert goal_vacuity({"waves": [{"failing_after": []}]}, None) is None
+    assert goal_vacuity({"waves": [{"failing_after": []}]}, {}) is None
+
+
+def test_goal_vacuity_refuses_to_guess_from_an_unparseable_reason():
+    """No axes parsed ⇒ cannot diagnose, which is not the same as 'no problem'."""
+    state = {"waves": [{"failing_after": []}]}
+    assert goal_vacuity(state, {"7": "something went sideways"}) is None
+
+
+def test_parse_obligations_reads_rows_and_drops_malformed_ones():
+    text = (
+        "# a comment\n"
+        "\n"
+        "figure_requirement|10|0|chapters with a live viz_image forest\n"
+        "rubric_axis_coverage|16|0|axes the predicate never reads\n"
+        "garbage-with-no-pipes\n"
+        "no_counts|many|few|not integers\n"
+    )
+    rows = parse_obligations(text)
+    assert [r["name"] for r in rows] == ["figure_requirement", "rubric_axis_coverage"]
+    assert rows[0]["declared"] == 10 and rows[0]["satisfied"] == 0
+    assert rows[0]["detail"].startswith("chapters with a live")
+
+
+def test_obligation_gap_follows_declaration_order_not_gap_size():
+    """Counts are incommensurable; the operator's ordering is the priority."""
+    rows = parse_obligations(
+        "figure_requirement|10|0|first\n"
+        "rubric_axis_coverage|16|0|second and numerically wider\n"
+    )
+    assert obligation_gap(rows) == "obligation_gap:figure_requirement:0/10"
+
+
+def test_obligation_gap_skips_satisfied_rows():
+    rows = parse_obligations(
+        "figure_requirement|10|10|met\n"
+        "rubric_axis_coverage|16|2|owed\n"
+    )
+    assert obligation_gap(rows) == "obligation_gap:rubric_axis_coverage:2/16"
+
+
+def test_obligation_gap_is_none_when_nothing_is_owed():
+    assert obligation_gap(None) is None
+    assert obligation_gap(parse_obligations("figure_requirement|10|10|met")) is None
+
+
+def test_read_obligations_returns_stdout_on_success(tmp_path):
+    out, err = read_obligations(str(tmp_path), "echo 'figure_requirement|10|0|d'")
+    assert err == ""
+    assert "figure_requirement|10|0|d" in out
+
+
+def test_read_obligations_reports_a_failing_sensor_as_an_error(tmp_path):
+    """A configured sensor that breaks must never read as 'no obligations'."""
+    out, err = read_obligations(str(tmp_path), "exit 3")
+    assert out == ""
+    assert "obligation sensor failed" in err and "rc=3" in err
