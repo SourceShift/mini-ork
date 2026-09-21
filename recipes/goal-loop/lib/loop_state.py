@@ -359,3 +359,137 @@ def self_verdict_mirage(state: State, patience: int = 2) -> str | None:
     if not no_op and len(set(sizes)) != 1:
         return None
     return f"mirage:{unit}:{entry.get('review_diff_bytes')}"
+
+
+# ── Goal-level diagnostics: what the green did NOT look at ───────────────────
+#
+# Everything above answers "did the loop stall?". These answer a different
+# question: "did the loop look at enough to know?". They run on the PASS path,
+# where ``divergence()`` is unreachable — the driver returns ``goal_met`` before
+# it. A goal can be met against every axis the predicate reads while the target
+# still violates an obligation no axis of the predicate can express; that is the
+# figure blind spot, and no amount of retrying the wave can reveal it.
+
+# A predicate reason is space-separated ``key=value`` pairs (chapter_predicate.py):
+# ``ch1 PASS status=completed rubric=pass mdlen=912 quality=unset``. The terminal
+# ``err=`` field is free-form prose that may contain spaces, so scanning stops
+# there rather than tokenising the error text into phantom axes. The lookbehind
+# rejects a ``-`` prefix so the ``rubric-healed=true`` suffix is not read as an
+# axis named ``healed``.
+_AXIS_KEY = re.compile(r"(?<![A-Za-z0-9_/-])([A-Za-z_][A-Za-z0-9_]*)=")
+_TERMINAL_FIELD = "err="
+
+# A value with no discriminating power: absent, a sentinel, or zero. ``quality``
+# resolves to ``unset`` for EVERY unit whenever ``MO_GOAL_QUALITY_CMD`` is unset,
+# which is the live case — a goal that names quality and measures none.
+_DEGENERATE = frozenset({"", "-", "n/a", "na", "none", "null", "unset", "0", "false"})
+
+
+def _reason_axes(reason: str) -> dict[str, str]:
+    """Parse a predicate reason line into its ``axis -> value`` map.
+
+    An unparseable reason yields ``{}`` — the caller must treat "no axes" as
+    "cannot diagnose", never as "no problem".
+    """
+    if not reason:
+        return {}
+    head = reason.split(_TERMINAL_FIELD, 1)[0]
+    axes: dict[str, str] = {}
+    for match in _AXIS_KEY.finditer(head):
+        rest = head[match.end():]
+        axes[match.group(1)] = rest.split(None, 1)[0] if rest else ""
+    return axes
+
+
+def goal_vacuity(
+    state: State,
+    reasons: dict[str, str] | None = None,
+) -> str | None:
+    """Did the goal pass without any axis of the predicate ever discriminating?
+
+    Fires ``vacuous_goal_met:<axis>+<axis>`` when the last wave cleared every
+    unit while at least one axis it reported is degenerate for ALL of them —
+    absent, a sentinel, or zero. Returns ``None`` when the goal is still failing,
+    when no reasons were supplied, or when a reason cannot be parsed.
+
+    The reason is not "the loop is broken": it is that the green rests on axes
+    that were never in a position to say otherwise. On the live book every
+    chapter passes with ``quality=unset``, so the loop is certifying a quality
+    goal having measured no quality at all.
+    """
+    waves = state.get("waves", [])
+    if not waves or not reasons:
+        return None
+    if waves[-1].get("failing_after"):
+        return None
+
+    per_axis: dict[str, set[str]] = {}
+    parsed = 0
+    for reason in reasons.values():
+        axes = _reason_axes(reason)
+        if not axes:
+            return None
+        parsed += 1
+        for key, value in axes.items():
+            per_axis.setdefault(key, set()).add(value)
+    if not parsed:
+        return None
+
+    # Uniform AND degenerate. A uniform-but-meaningful axis (``rubric=pass`` on a
+    # pass) is what a met goal is SUPPOSED to look like and must not fire.
+    dead = sorted(
+        key for key, values in per_axis.items()
+        if len(values) == 1 and next(iter(values)).lower() in _DEGENERATE
+    )
+    if not dead:
+        return None
+    return f"vacuous_goal_met:{'+'.join(dead)}"
+
+
+def parse_obligations(text: str) -> list[dict[str, Any]]:
+    """Parse ``<name>|<declared>|<satisfied>|<detail>`` rows from the sensor.
+
+    The obligation sensor is DATA the operator declares (``MO_GOAL_OBLIGATION_CMD``),
+    never logic in here: each row names an obligation the target's contract
+    imposes, how many instances exist, and how many are satisfied. A malformed
+    row is dropped rather than guessed at — a sensor that invented obligations
+    would fire on nothing and be ignored.
+    """
+    rows: list[dict[str, Any]] = []
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split("|")
+        if len(parts) < 3:
+            continue
+        name, declared, satisfied = (p.strip() for p in parts[:3])
+        if not name or not declared.isdigit() or not satisfied.isdigit():
+            continue
+        rows.append({
+            "name": name,
+            "declared": int(declared),
+            "satisfied": int(satisfied),
+            "detail": parts[3].strip() if len(parts) > 3 else "",
+        })
+    return rows
+
+
+def obligation_gap(obligations: list[dict[str, Any]] | None) -> str | None:
+    """Name the FIRST declared obligation the target has left unsatisfied.
+
+    Returns ``obligation_gap:<name>:<satisfied>/<declared>``, or ``None`` when
+    every declared obligation is met (or none was declared). Only a genuinely
+    declared obligation counts: an obligation nobody declared is invisible here
+    by construction, and saying so is the honest limit of a sensor.
+
+    Declaration order decides, not gap size. The counts are incommensurable —
+    "10 chapters need a figure" and "16 rubric axes go unread" are not comparable
+    magnitudes, so ranking by difference would let a wide-but-minor row bury the
+    one the operator put first. The sensor is ordered most-important-first by
+    whoever seeded it; that ordering is the priority.
+    """
+    for row in obligations or ():
+        if row["declared"] - row["satisfied"] > 0:
+            return f"obligation_gap:{row['name']}:{row['satisfied']}/{row['declared']}"
+    return None

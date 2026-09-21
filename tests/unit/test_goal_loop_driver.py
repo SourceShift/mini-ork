@@ -1577,3 +1577,198 @@ def test_shield_shadow_default_leaves_the_wave_record_untouched(tmp_path, monkey
     wave = load_state(state_dir, "gwave")["waves"][0]
     assert set(wave) == {"wave", "run_id", "failing_before", "failing_after",
                          "cost_usd", "signature"}, wave
+
+# ── goal-level diagnostics: what the green did NOT look at ─────────────────
+#
+# These fire ONLY on the pass path, where ``divergence()`` is unreachable — the
+# driver returns ``goal_met`` first. The contract under test is additive: the
+# ``stop`` value never changes, findings ride ``diagnostics``, and the opt-out
+# restores the pre-change verdict byte-for-byte.
+
+_PASS_REASON_UNSET = (
+    "ch7 PASS status=committed rubric=pass mdlen=1200 quality=unset"
+)
+_PASS_REASON_ARMED = (
+    "ch7 PASS status=committed rubric=pass mdlen=1200 quality=pass"
+)
+
+
+def _pass_wave(reason: str | None):
+    """A run_wave_fn that clears the goal on wave 1 with an optional reason."""
+    def run_wave(wave_no, quarantined):
+        verdict: dict = {
+            "verdict": "pass", "failing_before": [], "failing_after": [],
+            "cost_usd": 0.0, "run_id": f"r{wave_no}",
+        }
+        if reason is not None:
+            verdict["unit_reasons"] = {"7": reason}
+        return verdict
+    return run_wave
+
+
+def test_pass_with_a_degenerate_axis_reports_vacuity(tmp_path, monkeypatch):
+    """quality=unset on every unit → the pass is named as vacuous, stop intact."""
+    monkeypatch.delenv("MO_GOAL_OBLIGATION_CMD", raising=False)
+    state_dir = tmp_path / "state"
+
+    verdict = drive(
+        goal_id="gvac", target_cwd=str(tmp_path), units_cmd="echo 7",
+        predicate_cmd="echo ok", child_recipe="code-fix",
+        max_waves=10, budget_total_usd=100.0,
+        run_wave_fn=_pass_wave(_PASS_REASON_UNSET),
+        cost_fn=lambda: 0.0, state_dir=state_dir,
+    )
+
+    assert verdict["stop"] == "goal_met"
+    assert verdict["diagnostics"]["vacuity"] == "vacuous_goal_met:quality"
+    # Persisted, not just returned: the verdict file is what an operator reads.
+    final = json.loads((state_dir / "final-verdict.json").read_text())
+    assert final["diagnostics"]["vacuity"] == "vacuous_goal_met:quality"
+
+
+def test_pass_with_a_moving_axis_is_not_vacuous(tmp_path, monkeypatch):
+    """The false-positive guard: a real value on every axis must not fire."""
+    monkeypatch.delenv("MO_GOAL_OBLIGATION_CMD", raising=False)
+    state_dir = tmp_path / "state"
+
+    verdict = drive(
+        goal_id="grealm", target_cwd=str(tmp_path), units_cmd="echo 7",
+        predicate_cmd="echo ok", child_recipe="code-fix",
+        max_waves=10, budget_total_usd=100.0,
+        run_wave_fn=_pass_wave(_PASS_REASON_ARMED),
+        cost_fn=lambda: 0.0, state_dir=state_dir,
+    )
+
+    assert verdict["stop"] == "goal_met"
+    assert "vacuity" not in verdict.get("diagnostics", {})
+
+
+def test_vacuity_opt_out_leaves_the_verdict_byte_identical(tmp_path, monkeypatch):
+    """MO_GOAL_VACUITY=0 restores exactly today's payload — no new keys."""
+    monkeypatch.setenv("MO_GOAL_VACUITY", "0")
+    monkeypatch.setenv("MO_GOAL_OBLIGATION_CMD", "echo 'figure_requirement|10|0|d'")
+    state_dir = tmp_path / "state"
+
+    verdict = drive(
+        goal_id="gopt", target_cwd=str(tmp_path), units_cmd="echo 7",
+        predicate_cmd="echo ok", child_recipe="code-fix",
+        max_waves=10, budget_total_usd=100.0,
+        run_wave_fn=_pass_wave(_PASS_REASON_UNSET),
+        cost_fn=lambda: 0.0, state_dir=state_dir,
+    )
+
+    assert verdict == {
+        "stop": "goal_met", "waves": 1,
+        "failing_units": [], "quarantined_units": [],
+    }
+    # The ledger carries other (always-on) rows; the opt-out must add none.
+    ledger = state_dir / "decisions.jsonl"
+    rows = [
+        json.loads(line) for line in ledger.read_text().splitlines()
+    ] if ledger.exists() else []
+    assert not [r for r in rows if r.get("kind") == "goal_met_diagnostic"]
+
+
+def test_declared_obligation_rides_the_pass_as_a_gap(tmp_path, monkeypatch):
+    """The figure case: a green reported beside the duty it did not meet."""
+    monkeypatch.delenv("MO_GOAL_VACUITY", raising=False)
+    monkeypatch.setenv(
+        "MO_GOAL_OBLIGATION_CMD", "echo 'figure_requirement|10|0|no figures'",
+    )
+    state_dir = tmp_path / "state"
+
+    verdict = drive(
+        goal_id="gobl", target_cwd=str(tmp_path), units_cmd="echo 7",
+        predicate_cmd="echo ok", child_recipe="code-fix",
+        max_waves=10, budget_total_usd=100.0,
+        run_wave_fn=_pass_wave(_PASS_REASON_ARMED),
+        cost_fn=lambda: 0.0, state_dir=state_dir,
+    )
+
+    assert verdict["stop"] == "goal_met"
+    diag = verdict["diagnostics"]
+    assert diag["obligation_gap"] == "obligation_gap:figure_requirement:0/10"
+    assert diag["obligations"][0]["declared"] == 10
+
+
+def test_a_met_obligation_does_not_report_a_gap(tmp_path, monkeypatch):
+    monkeypatch.delenv("MO_GOAL_VACUITY", raising=False)
+    monkeypatch.setenv(
+        "MO_GOAL_OBLIGATION_CMD", "echo 'figure_requirement|10|10|all present'",
+    )
+    state_dir = tmp_path / "state"
+
+    verdict = drive(
+        goal_id="gmet", target_cwd=str(tmp_path), units_cmd="echo 7",
+        predicate_cmd="echo ok", child_recipe="code-fix",
+        max_waves=10, budget_total_usd=100.0,
+        run_wave_fn=_pass_wave(_PASS_REASON_ARMED),
+        cost_fn=lambda: 0.0, state_dir=state_dir,
+    )
+
+    # The sensor was read and every row recorded, but nothing is owed.
+    assert "obligation_gap" not in verdict["diagnostics"]
+    assert verdict["diagnostics"]["obligations"][0]["satisfied"] == 10
+
+
+def test_a_failing_sensor_is_recorded_never_read_as_no_obligations(
+    tmp_path, monkeypatch,
+):
+    """A configured sensor that breaks must not read as a clean run."""
+    monkeypatch.delenv("MO_GOAL_VACUITY", raising=False)
+    monkeypatch.setenv("MO_GOAL_OBLIGATION_CMD", "exit 3")
+    state_dir = tmp_path / "state"
+
+    verdict = drive(
+        goal_id="gbad", target_cwd=str(tmp_path), units_cmd="echo 7",
+        predicate_cmd="echo ok", child_recipe="code-fix",
+        max_waves=10, budget_total_usd=100.0,
+        run_wave_fn=_pass_wave(_PASS_REASON_ARMED),
+        cost_fn=lambda: 0.0, state_dir=state_dir,
+    )
+
+    assert verdict["stop"] == "goal_met"
+    assert "obligation_error" in verdict["diagnostics"]
+    assert "obligation_gap" not in verdict["diagnostics"]
+
+
+def test_a_pass_with_no_receipts_does_not_crash(tmp_path, monkeypatch):
+    """Fail-soft, like the missing-sweep-result read: absent input, no finding."""
+    monkeypatch.delenv("MO_GOAL_OBLIGATION_CMD", raising=False)
+    state_dir = tmp_path / "state"
+
+    verdict = drive(
+        goal_id="gquiet", target_cwd=str(tmp_path), units_cmd="echo 7",
+        predicate_cmd="echo ok", child_recipe="code-fix",
+        max_waves=10, budget_total_usd=100.0,
+        run_wave_fn=_pass_wave(None),
+        cost_fn=lambda: 0.0, state_dir=state_dir,
+    )
+
+    assert verdict["stop"] == "goal_met"
+    assert "diagnostics" not in verdict
+
+
+def test_the_diagnostic_is_ledgered_as_a_terminal_row(tmp_path, monkeypatch):
+    monkeypatch.delenv("MO_GOAL_VACUITY", raising=False)
+    monkeypatch.setenv(
+        "MO_GOAL_OBLIGATION_CMD", "echo 'figure_requirement|10|0|no figures'",
+    )
+    state_dir = tmp_path / "state"
+
+    drive(
+        goal_id="gled", target_cwd=str(tmp_path), units_cmd="echo 7",
+        predicate_cmd="echo ok", child_recipe="code-fix",
+        max_waves=10, budget_total_usd=100.0,
+        run_wave_fn=_pass_wave(_PASS_REASON_UNSET),
+        cost_fn=lambda: 0.0, state_dir=state_dir,
+    )
+
+    rows = [
+        json.loads(line)
+        for line in (state_dir / "decisions.jsonl").read_text().splitlines()
+    ]
+    diag_rows = [r for r in rows if r.get("kind") == "goal_met_diagnostic"]
+    assert len(diag_rows) == 1
+    assert diag_rows[0]["vacuity"] == "vacuous_goal_met:quality"
+    assert diag_rows[0]["obligation_gap"] == "obligation_gap:figure_requirement:0/10"

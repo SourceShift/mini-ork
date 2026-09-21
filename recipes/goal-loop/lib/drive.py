@@ -50,6 +50,9 @@ record_wave = _loop_state_module.record_wave
 should_quarantine = _loop_state_module.should_quarantine
 divergence = _loop_state_module.divergence
 evidence_informativeness = _loop_state_module.evidence_informativeness
+goal_vacuity = _loop_state_module.goal_vacuity
+parse_obligations = _loop_state_module.parse_obligations
+obligation_gap = _loop_state_module.obligation_gap
 
 
 def _load_sibling(name: str):
@@ -69,6 +72,8 @@ shield = _assurance.shield
 resolve_shield_mode = _assurance.resolve_mode
 _ledger = _load_sibling("loop_ledger")
 append_decision = _ledger.append_decision
+_goal_state = _load_sibling("goal_state")
+read_obligations = _goal_state.read_obligations
 
 FINAL_VERDICT_FILENAME = "final-verdict.json"
 
@@ -454,6 +459,46 @@ def _write_final_verdict(state_dir: str | Path, payload: dict[str, Any]) -> Path
     out = Path(state_dir) / FINAL_VERDICT_FILENAME
     out.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return out
+
+
+def _goal_diagnostics(
+    state: dict[str, Any],
+    reasons: dict[str, str] | None,
+    target_cwd: str,
+) -> dict[str, Any]:
+    """What the goal's green banner did NOT establish.
+
+    Runs ONLY on the pass path, where ``divergence()`` is unreachable — the
+    driver returns ``goal_met`` first. Answers a different question than the
+    give-up detectors: not "did the loop stall?" but "did the loop look at
+    enough to know?". Two independent probes:
+
+      * vacuity — did any axis the predicate reports ever discriminate? A book
+        whose every axis reads ``unset``/``0`` was passed against nothing.
+      * obligations — does the target declare a duty the predicate has no axis
+        for? The sensor is operator-seeded (``MO_GOAL_OBLIGATION_CMD``); when
+        configured and it fails, the failure is recorded, never read as "none".
+
+    Purely diagnostic — each finding is a sub-key, attached only when present,
+    mirroring ``record_wave``'s optional-key contract. It never changes ``stop``.
+    """
+    diag: dict[str, Any] = {}
+    vacuity = goal_vacuity(state, reasons)
+    if vacuity:
+        diag["vacuity"] = vacuity
+
+    obligations_cmd = os.environ.get("MO_GOAL_OBLIGATION_CMD", "").strip()
+    if obligations_cmd:
+        text, err = read_obligations(target_cwd, obligations_cmd)
+        if err:
+            diag["obligation_error"] = err
+        rows = parse_obligations(text)
+        if rows:
+            diag["obligations"] = rows
+            gap = obligation_gap(rows)
+            if gap:
+                diag["obligation_gap"] = gap
+    return diag
 
 
 def _env_int(name: str, default: int) -> int:
@@ -849,6 +894,20 @@ def drive(
                 "failing_units": [],
                 "quarantined_units": sorted(quarantined),
             }
+            # Additive diagnostics: the green stands, but we record what it did
+            # NOT establish (degenerate axes, declared-but-unsatisfied
+            # obligations). Never rewrites ``stop`` — downstream switches on it.
+            if _env_bool("MO_GOAL_VACUITY", True):
+                diag = _goal_diagnostics(state, unit_reasons, target_cwd)
+                if diag:
+                    payload["diagnostics"] = diag
+                    try:
+                        append_decision(
+                            resolved_state_dir,
+                            {"kind": "goal_met_diagnostic", **diag},
+                        )
+                    except OSError:
+                        pass
             save_state(state, resolved_state_dir)
             _write_final_verdict(resolved_state_dir, payload)
             return payload
