@@ -1,0 +1,82 @@
+[
+  {
+    "id": "no-verifiers-accepts-garbage",
+    "expect": "fail",
+    "artifact": {"name": "out.json", "content": "not json at all"},
+    "contract": {
+      "task_class": "probe",
+      "expected_artifact": "data",
+      "success_verifiers": []
+    }
+  },
+  {
+    "id": "weak-verifier-file-exists",
+    "expect": "fail",
+    "artifact": {"name": "out.json", "content": "{}"},
+    "contract": {
+      "task_class": "probe",
+      "expected_artifact": "data",
+      "success_verifiers": ["test -e"]
+    }
+  },
+  {
+    "id": "weak-verifier-nonempty",
+    "expect": "fail",
+    "artifact": {"name": "out.json", "content": " "},
+    "contract": {
+      "task_class": "probe",
+      "expected_artifact": "data",
+      "success_verifiers": ["test -s"]
+    }
+  },
+  {
+    "id": "strong-verifier-rejects-wrong-content",
+    "expect": "fail",
+    "artifact": {"name": "out.json", "content": "{\"ok\": false}"},
+    "contract": {
+      "task_class": "probe",
+      "expected_artifact": "data",
+      "success_verifiers": ["grep -q '\"ok\": true'"]
+    }
+  },
+  {
+    "id": "strong-verifier-admits-good-content",
+    "expect": "pass",
+    "artifact": {"name": "out.json", "content": "{\"ok\": true}"},
+    "contract": {
+      "task_class": "probe",
+      "expected_artifact": "data",
+      "success_verifiers": ["grep -q '\"ok\": true'"]
+    }
+  },
+  {
+    "id": "extension-mismatch",
+    "expect": "fail",
+    "artifact": {"name": "notes.md", "content": "# notes"},
+    "contract": {
+      "task_class": "probe",
+      "expected_artifact": "patch",
+      "success_verifiers": []
+    }
+  },
+  {
+    "id": "missing-artifact",
+    "expect": "fail",
+    "artifact": {"name": "out.json", "content": null},
+    "contract": {
+      "task_class": "probe",
+      "expected_artifact": "data",
+      "success_verifiers": []
+    }
+  },
+  {
+    "id": "apostrophe-path-overblock",
+    "expect": "pass",
+    "artifact": {"name": "o'ut.json", "content": "{\"ok\": true}"},
+    "contract": {
+      "task_class": "probe",
+      "expected_artifact": "data",
+      "success_verifiers": ["grep -q '\"ok\": true'"]
+    }
+  }
+]

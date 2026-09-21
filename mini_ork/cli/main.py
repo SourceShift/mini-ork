@@ -65,6 +65,7 @@ _NATIVE_MODULE_SUBS = {
     "watchdog": "mini_ork.orchestration.watchdog",
     "acp": "mini_ork.cli.acp_cmd",
     "calibrate": "mini_ork.cli.calibrate",
+    "gate-fuzz": "mini_ork.cli.gate_fuzz",
 }
 
 _HELP = """mini-ork — task operating system for agents (v0.1)
