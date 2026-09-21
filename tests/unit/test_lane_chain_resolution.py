@@ -39,6 +39,20 @@ def test_missing_agents_yaml_fails_open(tmp_path, monkeypatch):
     assert resolve_lane_family("codex_lens") == "codex_lens"
 
 
+def test_empty_home_never_resolves_against_cwd(tmp_path, monkeypatch):
+    # RATCHET: an empty home/root used to yield the bare "config/agents.yaml",
+    # which os.path.isfile resolved against the CWD. With the repo checked out
+    # there, that silently adopted the REPO-DEFAULT policy instead of the run's
+    # (or none) — so an alias resolved to a family the run never pinned.
+    cwd = tmp_path / "cwd"
+    (cwd / "config").mkdir(parents=True)
+    (cwd / "config" / "agents.yaml").write_text("lanes:\n  codex_lens: codex\n")
+    monkeypatch.chdir(cwd)
+    monkeypatch.setenv("MINI_ORK_HOME", "")
+    monkeypatch.setenv("MINI_ORK_ROOT", "")
+    assert resolve_lane_family("codex_lens") == "codex_lens"
+
+
 def test_chain_lead_is_family_not_alias(tmp_path, monkeypatch):
     # RATCHET: the exact bug — codex_lens must lead the chain with codex,
     # BEFORE the MO_FALLBACK_CODING head (minimax).
