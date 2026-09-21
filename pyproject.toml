@@ -41,6 +41,9 @@ runtime = ["verifiers>=0.2.0,<0.3"]
 # it; only the framework-composing adapters require it. Attribution: THIRD_PARTY.md
 optimize = ["gepa>=0.1.4,<0.2"]
 web = ["fastapi>=0.110", "uvicorn[standard]>=0.29"]
+# ACP (Agent Client Protocol) stdio agent — `mini-ork acp`. Bounded to the
+# 0.12 line because the ACP wire schema shifts between minor releases.
+acp = ["agent-client-protocol>=0.12,<0.13"]
 # The supported installation profile: core CLI plus the local web sidecar,
 # Crucible runtime, and GEPA optimization. Provider CLIs remain external because
 # they need user auth.
