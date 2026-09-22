@@ -1,0 +1,15 @@
+{
+  "source": "arxiv",
+  "date_from": "2026-01-01",
+  "required_source_count": 30,
+  "results_per_query": 40,
+  "max_workers": 4,
+  "ranking_policy": "Smoke test of the libwit collector for the mini-ork domain; rank 2026 papers by topical coverage, relevance, citation signals, and recency.",
+  "queries": [
+    {"topic": "model routing", "query": "LLM model routing cascade heterogeneous model selection cost quality"},
+    {"topic": "runtime verification", "query": "LLM output verification self-verification verifier runtime correctness"},
+    {"topic": "verifiable rewards", "query": "reinforcement learning verifiable rewards GRPO reward model reasoning"},
+    {"topic": "coding agents", "query": "code agents planning verification automated program repair SWE benchmark"},
+    {"topic": "distillation", "query": "knowledge distillation small language models routing traffic distillation"}
+  ]
+}
