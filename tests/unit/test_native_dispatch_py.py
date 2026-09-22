@@ -29,7 +29,8 @@ def test_all_former_exec_subs_registered_natively():
         "epics", "bugs", "inject", "review", "traceotter", "metrics",
         "rollback", "resume", "recover", "serve", "bug-collector", "conductor",
         "coord", "lifetime", "self-improve", "topology", "usage-report", "watchdog",
-        "acp", "calibrate", "collapse-check", "gate-fuzz", "memory-lifecycle",
+        "acp", "calibrate", "collapse-check", "collapse-precursor", "gate-fuzz",
+        "memory-lifecycle",
         "harness-contrast", "harness-edit", "harness-audit", "hack-probe",
         "oversight",
     }

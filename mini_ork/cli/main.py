@@ -66,6 +66,7 @@ _NATIVE_MODULE_SUBS = {
     "acp": "mini_ork.cli.acp_cmd",
     "calibrate": "mini_ork.cli.calibrate",
     "collapse-check": "mini_ork.cli.collapse",
+    "collapse-precursor": "mini_ork.cli.collapse_precursor",
     "gate-fuzz": "mini_ork.cli.gate_fuzz",
     "memory-lifecycle": "mini_ork.cli.memory_lifecycle",
     "harness-contrast": "mini_ork.cli.harness_contrast",
