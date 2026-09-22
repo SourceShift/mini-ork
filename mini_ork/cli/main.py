@@ -75,6 +75,7 @@ _NATIVE_MODULE_SUBS = {
     "harness-audit": "mini_ork.cli.harness_audit",
     "hack-probe": "mini_ork.cli.hack_probe",
     "oversight": "mini_ork.cli.oversight",
+    "active-eval": "mini_ork.cli.active_eval",
 }
 
 _HELP = """mini-ork — task operating system for agents (v0.1)
