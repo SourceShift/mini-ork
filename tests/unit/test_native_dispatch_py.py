@@ -30,7 +30,8 @@ def test_all_former_exec_subs_registered_natively():
         "rollback", "resume", "recover", "serve", "bug-collector", "conductor",
         "coord", "lifetime", "self-improve", "topology", "usage-report", "watchdog",
         "acp", "calibrate", "collapse-check", "gate-fuzz", "memory-lifecycle",
-        "harness-contrast", "harness-edit", "hack-probe", "oversight",
+        "harness-contrast", "harness-edit", "harness-audit", "hack-probe",
+        "oversight",
     }
     assert expected == set(_NATIVE_MODULE_SUBS)
     for sub in expected:

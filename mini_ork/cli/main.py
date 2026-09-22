@@ -70,6 +70,7 @@ _NATIVE_MODULE_SUBS = {
     "memory-lifecycle": "mini_ork.cli.memory_lifecycle",
     "harness-contrast": "mini_ork.cli.harness_contrast",
     "harness-edit": "mini_ork.cli.harness_edit",
+    "harness-audit": "mini_ork.cli.harness_audit",
     "hack-probe": "mini_ork.cli.hack_probe",
     "oversight": "mini_ork.cli.oversight",
 }
