@@ -386,14 +386,21 @@ def assemble(summary_paths: list[Path], techniques_path: Path, output_path: Path
 
 def verify(aggregation_path: Path) -> None:
     text = aggregation_path.read_text(encoding="utf-8")
-    paper_count = text.count("\n### ")
-    prompt_count = text.count("How to write a proper prompt:")
+    if "## Deduplicated Prompt-Writing Guidance" not in text:
+        raise PipelineError("aggregation has no deduplicated guidance section")
+    marker = "\n## Per-Source Summaries\n"
+    if marker not in text:
+        raise PipelineError("aggregation has no per-source summaries section")
+    # Count only the papers region: the guidance section embeds
+    # unified-techniques.md, whose own `### ` technique headings are not paper
+    # sections (measured: 2122 vs 2000 on the first 2000-source run).
+    papers = text.split(marker, 1)[1]
+    paper_count = papers.count("\n### ")
+    prompt_count = papers.count("How to write a proper prompt:")
     if paper_count < _min_sources() or prompt_count != paper_count:
         raise PipelineError(
             f"aggregation completeness failed: {paper_count} source sections and {prompt_count} prompt sections"
         )
-    if "## Deduplicated Prompt-Writing Guidance" not in text:
-        raise PipelineError("aggregation has no deduplicated guidance section")
 
 
 def main() -> int:
