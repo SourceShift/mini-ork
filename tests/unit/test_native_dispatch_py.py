@@ -32,7 +32,7 @@ def test_all_former_exec_subs_registered_natively():
         "acp", "calibrate", "collapse-check", "collapse-precursor", "gate-fuzz",
         "memory-lifecycle",
         "harness-contrast", "harness-edit", "harness-audit", "hack-probe",
-        "oversight",
+        "oversight", "metric-anchor",
     }
     assert expected == set(_NATIVE_MODULE_SUBS)
     for sub in expected:

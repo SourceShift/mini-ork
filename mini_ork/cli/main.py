@@ -51,6 +51,7 @@ _NATIVE_MODULE_SUBS = {
     "review": "mini_ork.pre_push_review",
     "traceotter": "mini_ork.cli.traceotter",
     "metrics": "mini_ork.cli.metrics",
+    "metric-anchor": "mini_ork.cli.metric_anchor",
     "rollback": "mini_ork.cli.rollback",
     "resume": "mini_ork.cli.resume",
     "recover": "mini_ork.recovery.planner",
