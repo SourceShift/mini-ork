@@ -9,10 +9,11 @@ import sys
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 RECIPE_DIR = os.path.dirname(SCRIPT_DIR)
 RUN_DIR = os.environ["MINI_ORK_RUN_DIR"]
+PLAN = os.environ.get("MINI_ORK_COLLECTION_PLAN") or os.path.join(RECIPE_DIR, "collection-plan.json")
 
 rc = subprocess.run(
     [sys.executable, os.path.join(RECIPE_DIR, "lib", "research_pipeline.py"), "collect",
-     "--plan", os.path.join(RECIPE_DIR, "collection-plan.json"),
+     "--plan", PLAN,
      "--output", os.path.join(RUN_DIR, "source-corpus.json")],
     check=False,
 )

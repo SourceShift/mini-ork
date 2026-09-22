@@ -19,7 +19,9 @@ if os.path.isdir(summaries_dir):
         if os.path.isfile(path) and name.endswith(".json"):
             summaries += ["--summary", path]
 
-if len(summaries) // 2 != 20:
+# Ten ["--summary", path] pairs; the retired bash original compared the raw
+# array length (20), which the port kept while also halving — impossible gate.
+if len(summaries) // 2 != 10:
     sys.stderr.write("expected ten summary JSON artifacts\n")
     sys.exit(1)
 

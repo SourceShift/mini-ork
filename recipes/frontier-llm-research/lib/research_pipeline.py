@@ -24,6 +24,10 @@ class PipelineError(RuntimeError):
     """Raised when an artifact cannot meet the recipe's evidence contract."""
 
 
+def _min_sources() -> int:
+    return int(os.environ.get("MINI_ORK_RESEARCH_MIN_SOURCES", "200"))
+
+
 def _read_json(path: Path) -> dict[str, Any]:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
@@ -127,23 +131,33 @@ def collect(plan_path: Path, output_path: Path) -> None:
     ]
     if any(not item["query"] for item in requests):
         raise PipelineError("every collection query needs text")
-    request = Request(
-        f"{api_base}/search/batch",
-        data=json.dumps({"queries": requests, "max_workers": int(plan.get("max_workers") or 4)}).encode("utf-8"),
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-            "User-Agent": "mini-ork/0.1 (+https://github.com/adelin-d/mini-ork)",
-        },
-        method="POST",
-    )
-    try:
-        with urlopen(request, timeout=timeout_seconds) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-    except HTTPError as exc:
-        raise PipelineError(f"LibWit API rejected collection request: HTTP {exc.code}") from exc
-    except (URLError, TimeoutError, json.JSONDecodeError) as exc:
-        raise PipelineError(f"LibWit API collection request failed: {exc}") from exc
+    max_workers = int(plan.get("max_workers") or 4)
+    batch_limit = int(os.environ.get("MINI_ORK_LIBWIT_BATCH_LIMIT", "32"))
+    merged_groups: list[Any] = []
+    for start in range(0, len(requests), batch_limit):
+        chunk = requests[start : start + batch_limit]
+        request = Request(
+            f"{api_base}/search/batch",
+            data=json.dumps({"queries": chunk, "max_workers": max_workers}).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+                "User-Agent": "mini-ork/0.1 (+https://github.com/adelin-d/mini-ork)",
+            },
+            method="POST",
+        )
+        try:
+            with urlopen(request, timeout=timeout_seconds) as response:
+                chunk_payload = json.loads(response.read().decode("utf-8"))
+        except HTTPError as exc:
+            raise PipelineError(f"LibWit API rejected collection request: HTTP {exc.code}") from exc
+        except (URLError, TimeoutError, json.JSONDecodeError) as exc:
+            raise PipelineError(f"LibWit API collection request failed: {exc}") from exc
+        groups = chunk_payload.get("results") or chunk_payload.get("data") or chunk_payload.get("items")
+        if not isinstance(groups, list):
+            raise PipelineError("LibWit search response has no results list")
+        merged_groups.extend(groups)
+    payload = {"results": merged_groups}
 
     retrieved_at = datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
     cutoff = _published_day(plan.get("date_from"))
@@ -284,8 +298,8 @@ def rollup(input_paths: list[Path], output_path: Path) -> None:
         all_summaries.extend(summaries)
         shards.append({"shard_id": shard_id, "source_ids": source_ids, "techniques": techniques})
     all_summaries.sort(key=lambda item: (int(item.get("rank") or 999999), str(item["source_id"])))
-    if len(all_summaries) < 200:
-        raise PipelineError(f"summary rollup contains {len(all_summaries)} papers; need at least 200")
+    if len(all_summaries) < _min_sources():
+        raise PipelineError(f"summary rollup contains {len(all_summaries)} papers; need at least {_min_sources()}")
     _write_json(
         output_path,
         {
@@ -322,7 +336,7 @@ def assemble(summary_paths: list[Path], techniques_path: Path, output_path: Path
                 raise PipelineError(f"aggregation would duplicate {source_id}")
             seen_ids.add(source_id)
             all_summaries.append(summary)
-    if len(all_summaries) < 200:
+    if len(all_summaries) < _min_sources():
         raise PipelineError(f"aggregation would contain only {len(all_summaries)} source summaries")
     techniques = techniques_path.read_text(encoding="utf-8").strip()
     if not techniques:
@@ -374,7 +388,7 @@ def verify(aggregation_path: Path) -> None:
     text = aggregation_path.read_text(encoding="utf-8")
     paper_count = text.count("\n### ")
     prompt_count = text.count("How to write a proper prompt:")
-    if paper_count < 200 or prompt_count != paper_count:
+    if paper_count < _min_sources() or prompt_count != paper_count:
         raise PipelineError(
             f"aggregation completeness failed: {paper_count} source sections and {prompt_count} prompt sections"
         )
