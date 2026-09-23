@@ -168,11 +168,13 @@ def main(argv: list[str]) -> int:
     with open(shim, "w", encoding="utf-8") as fh:
         fh.write(_SHIM)
 
-    # The FSM keys on the run uuid (createJobFsmState uses row.id) but the
-    # routes address jobs by the text id — try both forms rather than encode
-    # a guess about getJobFsmStateView's resolution order.
+    # resolveOwnedRun (server/compose/fsm/service.ts) looks up
+    # book_generation_runs by the TEXT job_id + owner — the run-uuid form 404s
+    # ("Job not found"). Measured live 2026-09-23: three waves burned on that
+    # 404 because only "not initialized" was treated as an id-form miss. Text
+    # id first; both miss shapes retry the other form.
     last = None
-    for job_ref in (uuid, text_job.strip()):
+    for job_ref in (text_job.strip(), uuid):
         if not job_ref:
             continue
         last = subprocess.run(
@@ -184,7 +186,8 @@ def main(argv: list[str]) -> int:
         if last.returncode == 0:
             print(f"{uuid[:8]} action {action} applied via job ref {job_ref[:24]}")
             return 0
-        if "not initialized" not in (last.stdout + last.stderr):
+        miss = last.stdout + last.stderr
+        if "not initialized" not in miss and "Job not found" not in miss:
             break  # a real transition error, not an id-form miss
     sys.stderr.write((last.stderr if last else "no attempt ran")[:2000] + "\n")
     print(f"{uuid[:8]} action {action} FAILED (see stderr)", file=sys.stderr)
