@@ -25,7 +25,8 @@ SRP split (SOLID refactor): the pure parsing/scoring helpers live in
 + lane dispatch + ``RubricPrescreenConfig`` and RE-EXPORTS every moved
 public name so existing importers and bash-parity tests are untouched
 (behavior is byte-identical — the bash line-reference comments moved
-with the code).
+with the code). Exception: ``artifact_summary`` diverged after the
+split, so its bash line reference below is historical only.
 
 Pipeline map (bash → Python; bash line ranges from
 ``lib/rubric-prescreen.sh`` and ``lib/cache.sh``):

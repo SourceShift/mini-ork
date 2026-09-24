@@ -9,9 +9,11 @@ Seven cases:
                                  {{KICKOFF_BODY}} / {{DIFF_SUMMARY}};
                                  diff_summary and the result are
                                  rstripped of trailing newlines.
-  (c) artifact_summary         — per-file ``### name (size bytes)`` headers
-                                 + first-25-line heads; dotfiles skipped;
-                                 sorted order.
+  (c) artifact_summary         — per-file ``### name (size bytes)`` headers,
+                                 dotfiles skipped, sorted order; the text
+                                 budget is split across files in proportion
+                                 to size, and every cut is labelled with
+                                 exact line/byte counts.
   (d) mo_append_rubric_to_feedback — appends the advisory section listing
                                      only non-PASS items when .pass != true;
                                      pass-through on missing / passing rubric.
@@ -24,6 +26,7 @@ Seven cases:
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import sys
 from pathlib import Path
@@ -149,6 +152,73 @@ def test_artifact_summary(tmp_path):
 
 def test_artifact_summary_missing_dir_returns_empty(tmp_path):
     assert rp.artifact_summary(str(tmp_path / "nope")) == ""
+
+
+def test_artifact_summary_does_not_cut_a_file_that_fits(tmp_path):
+    """Regression: a 43-line artifact used to be clipped to 25 lines with no
+    label, so a complete document appeared to end mid-section and the grader
+    failed it on the "no truncation" checklist item."""
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    body = ["# Synthesis", ""]
+    for i in range(1, 7):
+        body += [f"## D-{i}", "", "rationale", ""]
+    body += ["## Verdict", "", "THE CONCLUSION"]
+    (run_dir / "synthesis.md").write_text("\n".join(body) + "\n", encoding="utf-8")
+
+    out = rp.artifact_summary(str(run_dir))
+
+    assert "THE CONCLUSION" in out
+    assert "lines," not in out  # nothing was cut, so no label
+
+
+def test_artifact_summary_budget_goes_to_the_biggest_artifact(tmp_path):
+    """The headline artifact is normally the largest, and must not be starved
+    by a crowd of small companions."""
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    synthesis = "\n".join(f"section {i}\n" + "filler line\n" * 30 for i in range(40))
+    (run_dir / "synthesis.md").write_text(synthesis + "\nVERDICT\n", encoding="utf-8")
+    for name in ("rubric.json", "panel-verdict.json", "run.log", "notes.txt"):
+        (run_dir / name).write_text('{"small": true}\n', encoding="utf-8")
+
+    out = rp.artifact_summary(str(run_dir))
+
+    assert len(out) <= 12000
+    # Every small file is shown whole; the big one takes the rest and is
+    # labelled rather than silently clipped.
+    assert out.count('{"small": true}') == 4
+    assert "bytes shown]" in out
+    body = out.split("### synthesis.md", 1)[1]
+    assert len(body) > 9000
+
+
+def test_artifact_summary_truncation_label_is_exact(tmp_path):
+    """The label is the grader's only signal that it is looking at a sample,
+    so its counts must match the file — not approximate it."""
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    path = run_dir / "synthesis.md"
+    text = "\n".join(f"line {i}" for i in range(4000)) + "\n"
+    path.write_text(text, encoding="utf-8")
+
+    out = rp.artifact_summary(str(run_dir))
+    assert len(out) <= 12000
+
+    shown_lines, total_lines, shown_bytes, total_bytes = map(
+        int,
+        re.search(
+            r"… \[(\d+) of (\d+) lines, (\d+) of (\d+) bytes shown\]", out
+        ).groups(),
+    )
+    after_header = out.split("### synthesis.md", 1)[1].split("\n", 1)[1]
+    content = after_header.rsplit("\n… [", 1)[0]
+
+    assert total_lines == len(text.splitlines())
+    assert total_bytes == path.stat().st_size
+    assert shown_lines == len(content.splitlines())
+    assert shown_bytes == len(content.rstrip())
+    assert out.rstrip().endswith("bytes shown]")
 
 
 # ─────────────────────────────────────────────────────────────────────────────

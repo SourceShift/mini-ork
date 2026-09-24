@@ -25,6 +25,11 @@ Notes on parity:
 - The heredoc-lifted helpers were already Python source lifted into
   bash heredocs; the port reproduces them with only the minimum
   required type hints (byte-equivalent by construction).
+- ``artifact_summary`` has since DIVERGED deliberately, so it is no
+  longer byte-comparable to the retired bash twin (which no longer
+  exists to compare against). The bash version clipped every text file
+  to its first 25 lines with no marker, which hid long work products —
+  see the function docstring.
 """
 from __future__ import annotations
 
@@ -121,20 +126,48 @@ def substitute_template(template: str, kickoff_body: str, diff_summary: str) -> 
     return body.rstrip("\n")
 
 
-def artifact_summary(run_dir: str, max_chars: int = 12000) -> str:
-    """Mirror bash heredoc at lines 247-267.
+_TEXT_SUFFIXES = (".md", ".json", ".txt", ".yaml", ".log")
 
-    Bounded work-product summary: list files in ``run_dir`` (skipping
-    dotfiles), print ``### <filename> (<size> bytes)`` header, then the
-    first 25 lines (capped at 2000 chars) for text files (.md / .json /
-    .txt / .yaml / .log) that are non-empty. Output is capped at
-    ``max_chars`` total (default 12000 — matches bash).
+# Hard ceiling on how much of one artifact is read into memory. Larger
+# files are reported by size instead of being sampled — a partial read
+# cannot honestly state how many lines the file has.
+_MAX_READ_CHARS = 5_000_000
+
+# Guaranteed per-file share of the budget, so a run dir whose headline
+# artifact dwarfs its companions still lists the companions' contents.
+_MIN_FILE_CHARS = 512
+
+
+def artifact_summary(run_dir: str, max_chars: int = 12000) -> str:
+    """Bounded work-product summary handed to the rubric grader.
+
+    Lists the files in ``run_dir`` (skipping dotfiles), emitting a
+    ``### <filename> (<size> bytes)`` header for each and a text sample
+    for non-empty ``.md`` / ``.json`` / ``.txt`` / ``.yaml`` / ``.log``
+    files. The whole return value is bounded by ``max_chars``.
+
+    Budgeting. Headers are reserved first, so a starved budget still
+    tells the grader which artifacts exist. Each text file then gets a
+    foothold (``_MIN_FILE_CHARS``, or its whole content when smaller),
+    and the surplus above the footholds is shared in proportion to the
+    remaining size. Any slack left by files that fit in full is handed
+    to the largest still-cut files. A run dir's headline artifact — the
+    one carrying the actual work product — is normally also the
+    biggest, so it receives most of the budget instead of whichever
+    file happens to sort first, without starving its companions.
+
+    Truncation is always labelled: a cut sample ends with
+    ``… [<shown> of <total> lines, <shown> of <size> bytes shown]`` so
+    the grader can distinguish a short artifact from a clipped view of
+    a long one. Silently clipping made a complete document look like it
+    ended mid-section, which the grader then failed on "no truncation".
     """
-    lines: list[str] = []
     try:
         names = sorted(os.listdir(run_dir))
     except FileNotFoundError:
         return ""
+
+    entries: list[tuple[str, int, bool]] = []
     for name in names:
         path = os.path.join(run_dir, name)
         if not os.path.isfile(path) or name.startswith("."):
@@ -143,19 +176,90 @@ def artifact_summary(run_dir: str, max_chars: int = 12000) -> str:
             size = os.path.getsize(path)
         except OSError:
             continue
+        is_text = name.endswith(_TEXT_SUFFIXES) and size > 0
+        entries.append((name, size, is_text))
+    if not entries:
+        return ""
+
+    header_cost = sum(len(f"### {n} ({s} bytes)") + 1 for n, s, _ in entries)
+    budget = max(max_chars - header_cost, 0)
+
+    text = [(n, s) for n, s, t in entries if t]
+    quota: dict[str, int] = {}
+    if text:
+        # Every text file gets a foothold — its whole content when it is small —
+        # so one dominant artifact cannot squeeze its companions out of the
+        # listing entirely. Only the surplus above that foothold is shared out.
+        base = {n: min(s, _MIN_FILE_CHARS) for n, s in text}
+        base_total = sum(base.values())
+        if base_total > budget:
+            base = {n: v * budget // base_total for n, v in base.items()}
+        quota = dict(base)
+        need = {n: s - base[n] for n, s in text}
+        need_total = sum(need.values())
+        rest = budget - sum(quota.values())
+        if rest > 0 and need_total > 0:
+            for n in need:
+                quota[n] += min(need[n], rest * need[n] // need_total)
+    # Give back what the small files cannot use, to the largest files that
+    # are still cut. Bounded by the file count; each pass either frees
+    # slack or stops.
+    for _ in range(len(text)):
+        slack = int(sum(max(0, quota[n] - s) for n, s in text))
+        cut = sorted((e for e in text if quota[e[0]] < e[1]), key=lambda e: -e[1])
+        if slack < 1 or not cut:
+            break
+        for entry in cut:
+            quota[entry[0]] += slack // len(cut)
+        for n, s in text:
+            quota[n] = min(quota[n], s)
+
+    lines: list[str] = []
+    for name, size, is_text in entries:
         lines.append(f"### {name} ({size} bytes)")
-        if name.endswith((".md", ".json", ".txt", ".yaml", ".log")) and size > 0:
-            try:
-                with open(path, errors="replace") as f:
-                    head = "".join(f.readlines()[:25])
-                lines.append(head[:2000].rstrip())
-            except Exception:
-                pass
+        if is_text:
+            path = os.path.join(run_dir, name)
+            if size > _MAX_READ_CHARS:
+                lines.append(f"… [not sampled: {size} bytes exceeds the read cap]")
+            else:
+                try:
+                    with open(path, errors="replace") as f:
+                        full = f.read()
+                except Exception:
+                    full = ""
+                if full:
+                    all_lines = full.splitlines(keepends=True)
+                    limit = quota[name]
+                    kept, used = [], 0
+                    for ln in all_lines:
+                        if used + len(ln) > limit:
+                            break
+                        kept.append(ln)
+                        used += len(ln)
+                    if len(kept) == len(all_lines):
+                        body = "".join(kept).rstrip()
+                    else:
+                        # The label must fit inside this file's share too, or the
+                        # global cap clips it and the sample ends mid-sentence with
+                        # nothing saying it was cut. Drop lines until it fits.
+                        body = ""
+                        while True:
+                            kept_text = "".join(kept).rstrip()
+                            tail = (
+                                f"… [{len(kept)} of {len(all_lines)} lines, "
+                                f"{len(kept_text)} of {size} bytes shown]"
+                            )
+                            if len(kept_text) + len(tail) + (
+                                1 if kept_text else 0
+                            ) <= limit:
+                                body = f"{kept_text}\n{tail}" if kept_text else tail
+                                break
+                            if not kept:
+                                break
+                            kept.pop()
+                    if body:
+                        lines.append(body)
         lines.append("")
-    # Bash callers use ``$(python3 ...)`` which strips trailing
-    # newlines from the heredoc's print output. Match that semantic
-    # by rstripping the joined string so the parity test sees the
-    # same effective string on both sides.
     return "\n".join(lines)[:max_chars].rstrip("\n")
 
 
