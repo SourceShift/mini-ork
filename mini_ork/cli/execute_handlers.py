@@ -63,6 +63,9 @@ _assert_lane_capability = _execute_delegate("_assert_lane_capability")
 _capture_pre_impl_baseline = _execute_delegate("_capture_pre_impl_baseline")
 _capture_pre_impl_fixture = _execute_delegate("_capture_pre_impl_fixture")
 _extract_verdict = _execute_delegate("_extract_verdict")
+_harvest_framework_edit_ground_truth = _execute_delegate(
+    "_harvest_framework_edit_ground_truth"
+)
 _harvest_self_migrate_artifacts = _execute_delegate("_harvest_self_migrate_artifacts")
 _intervention_gate_check = _execute_delegate("_intervention_gate_check")
 _learned_block = _execute_delegate("_learned_block")
@@ -779,6 +782,11 @@ def _handle_implementer(ctx: NodeDispatch):
         return 1, fr
     open(impl_log, "w").write(result)
     apply_impl_output(impl_log, target)   # ported "capture coin-flip" applier
+    if ctx.recipe_eff == "framework-edit":
+        ok, fr = _harvest_framework_edit_ground_truth(ctx.run_dir_eff, target)
+        if not ok:
+            ctx.trace(ctx.node_id, "failure", "implementer", impl_log, "", fr)
+            return 1, fr
     if ctx.recipe_eff == "self-migrate":
         harvested = _harvest_self_migrate_artifacts(ctx.run_dir_eff, target)
         _write_self_migrate_implementer_summary(
