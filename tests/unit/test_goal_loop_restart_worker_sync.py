@@ -51,6 +51,25 @@ def _commit(repo: Path, message: str) -> None:
     _git(repo, "commit", "-q", "-m", message)
 
 
+def _strip_git_identity(monkeypatch) -> None:
+    """Make the ambient environment look like a fresh runner: no usable identity.
+
+    This file's own commits pass ``GIT_*`` env, but the binding's git calls
+    inherit the process env. A developer machine supplies an identity from
+    ``~/.gitconfig`` or, on macOS, from the login record, so the bug below is
+    invisible locally and appears only in CI — which is how the deploy resync
+    stayed broken. Emptying the four variables and pointing both config files at
+    the null device leaves git with no name to write into the merge commit,
+    which is the state the runner is in.
+    """
+    for var in ("GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL",
+                "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL"):
+        monkeypatch.setenv(var, "")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
+    monkeypatch.setenv("GIT_CONFIG_SYSTEM", os.devnull)
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+
+
 @pytest.fixture()
 def deploy_target(tmp_path: Path) -> Path:
     """A repo whose `deploy` branch has diverged from `main` by one commit."""
@@ -113,3 +132,21 @@ def test_opt_out_is_a_no_op(binding, deploy_target, monkeypatch):
 
     assert binding._sync_upstream(str(deploy_target)) == "disabled (MO_GOAL_SYNC_UPSTREAM=0)"
     assert _git(deploy_target, "log", "--format=%s", "main..HEAD") == "the loop's own fix"
+
+
+def test_merges_in_an_environment_with_no_git_identity(
+        binding, deploy_target, monkeypatch):
+    """A merge writes a commit, so an identity-less environment kills it with
+    'empty ident name ... not allowed'. The binding used to report that as
+    ``merge conflict against main``, so the deploy target silently stopped
+    carrying the product branch forward — the regression this file exists to
+    catch. It has to supply its own fallback identity instead.
+    """
+    _strip_git_identity(monkeypatch)
+
+    why = binding._sync_upstream(str(deploy_target))
+
+    assert why.startswith("merged main"), why
+    # The fallback is the project-wide one, matching vcs/rebase_guard.py and
+    # vcs/auto_merge.py rather than an ad-hoc name.
+    assert _git(deploy_target, "log", "-1", "--format=%an") == "mini-ork"

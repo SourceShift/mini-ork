@@ -180,10 +180,44 @@ _FAIL_MARKERS = (
 _SYNC_REFS = ("origin/main", "main")
 
 
-def _git(worktree: str, *args: str, timeout: int = 120) -> subprocess.CompletedProcess[str]:
+_FALLBACK_IDENTITY = {
+    "GIT_AUTHOR_NAME": "mini-ork",
+    "GIT_AUTHOR_EMAIL": "mini-ork@localhost",
+    "GIT_COMMITTER_NAME": "mini-ork",
+    "GIT_COMMITTER_EMAIL": "mini-ork@localhost",
+}
+
+
+def _identity_env(worktree: str) -> dict:
+    """Ambient env plus a fallback git identity for commands that write a commit.
+
+    ``git merge`` creates a commit, so an environment with no identity kills it
+    with ``empty ident name ... not allowed`` — the state every CI runner,
+    container and fresh sandbox starts in. Because ``_sync_upstream`` reports a
+    failed merge as a conflict, that made the deploy target silently stop
+    carrying the product branch forward, which is the regression this binding
+    exists to prevent. A configured identity is left alone, so a human's own
+    settings still win; the fallback is the same one ``vcs/rebase_guard.py`` and
+    ``vcs/auto_merge.py`` use.
+    """
+    env = dict(os.environ)
+    configured = subprocess.run(
+        ["git", "-C", worktree, "config", "user.email"],
+        capture_output=True, text=True,
+    ).stdout.strip()
+    if configured:
+        return env
+    for var, value in _FALLBACK_IDENTITY.items():
+        if not env.get(var):
+            env[var] = value
+    return env
+
+
+def _git(worktree: str, *args: str, timeout: int = 120,
+         env: dict | None = None) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         ["git", "-C", worktree, *args],
-        capture_output=True, text=True, timeout=timeout,
+        capture_output=True, text=True, timeout=timeout, env=env,
     )
 
 
@@ -214,7 +248,7 @@ def _sync_upstream(worktree: str) -> str:
     if _git(worktree, "merge-base", "--is-ancestor", ref, "HEAD").returncode == 0:
         return f"already contains {ref}"
 
-    merged = _git(worktree, "merge", "--no-edit", ref)
+    merged = _git(worktree, "merge", "--no-edit", ref, env=_identity_env(worktree))
     if merged.returncode == 0:
         head = _git(worktree, "rev-parse", "--short", "HEAD").stdout.strip()
         return f"merged {ref} into the deploy target (HEAD {head})"
