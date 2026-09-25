@@ -8,13 +8,23 @@ win: `execute.log` was written only `if not isfile`, and `verdict.json` — once
 it carried `source == "execute@run-level"` from the rehearsal — made the live
 emit return early. The run dir then recorded a rehearsal of the docs recipe as
 if it were the live run's outcome.
+
+`plan.json` was the same defect one stage earlier and is covered at the bottom
+of this file: the rehearsal's `_DRY_RUN_PLACEHOLDER` landed on the live run's
+own plan, so the implementer was handed `objective: '<dry-run: not generated>'`
+with an empty decomposition.
 """
 
 import json
 import os
+import subprocess
+from pathlib import Path
 
 from mini_ork.cli import execute
 from mini_ork.cli import main as cli_main
+from mini_ork.cli import plan
+
+_REPO = Path(__file__).resolve().parents[2]
 
 
 def _read(path):
@@ -83,3 +93,116 @@ def test_rehearsal_and_live_logs_are_distinct_files(tmp_path, monkeypatch):
     assert rehearsal != live
     assert rehearsal.endswith("execute.dryrun.log")
     assert live.endswith("execute.log")
+
+
+# ── plan.json — the same defect one stage earlier ────────────────────────────
+
+_RUN_ID = "run-shadow-1"
+_VALID_PLAN = {
+    "objective": "Ship the widget",
+    "assumptions": ["a"],
+    "decomposition": [{"id": "s1", "description": "do it",
+                       "node_type": "implementer", "depends_on": []}],
+    "dependencies": [], "risk_notes": [],
+    "artifact_contract": {"outputs": ["x"], "success_verifiers": ["v"]},
+    "verifier_contract": {"checks": [{"id": "c1", "description": "check it"}]},
+}
+
+
+def test_plan_file_name_follows_the_dry_run_flag():
+    assert plan._plan_file_name(True) == "plan.dryrun.json"
+    assert plan._plan_file_name(False) == "plan.json"
+
+
+def _plan_env(home, db, dry_run, given=""):
+    env = {
+        "MINI_ORK_ROOT": str(_REPO),
+        "MINI_ORK_HOME": home,
+        "MINI_ORK_DB": db,
+        "MINI_ORK_RUN_ID": _RUN_ID,
+        "MINI_ORK_TASK_CLASS": "code_fix",
+        "MINI_ORK_DRY_RUN": dry_run,
+        "MO_INJECT_LEARNINGS": "0",
+        "MINI_ORK_PROFILE_GATE": "0",
+        "MINI_ORK_PROFILE_PATH": "",
+        "MINI_ORK_NONINTERACTIVE": "1",
+        "MO_AUTO_ANSWER_PROFILE": "0",
+        "PATH": os.environ.get("PATH", ""),
+    }
+    if given:
+        env["MO_GIVEN_PLAN"] = given
+    return env
+
+
+def _plan_home(tmp_path, name):
+    home = tmp_path / name / ".mini-ork"
+    home.mkdir(parents=True, exist_ok=True)
+    db = str(home / "state.db")
+    subprocess.run(["bash", str(_REPO / "db" / "init.sh")],
+                   env={**os.environ, "MINI_ORK_HOME": str(home), "MINI_ORK_DB": db},
+                   capture_output=True, text=True, check=True)
+    return str(home), db
+
+
+def _run_plan(tmp_path, name, dry_run, given="", capsys=None):
+    """Run the plan CLI with NO --out, so the default run-dir path is chosen."""
+    home, db = _plan_home(tmp_path, name)
+    kickoff = tmp_path / f"{name}.md"
+    kickoff.write_text("# Do the thing\n\n## Success\n- works\n")
+    saved = dict(os.environ)
+    os.environ.clear()
+    os.environ.update(_plan_env(home, db, dry_run, given))
+    try:
+        rc = plan.main([str(kickoff)], root=str(_REPO))
+    finally:
+        os.environ.clear()
+        os.environ.update(saved)
+    if capsys is not None:
+        capsys.readouterr()
+    assert rc == 0, f"plan.main returned {rc}"
+    return Path(home) / "runs" / _RUN_ID
+
+
+def test_rehearsal_plan_lands_beside_not_on_plan_json(tmp_path, capsys):
+    run_dir = _run_plan(tmp_path, "solo", "1", capsys=capsys)
+
+    assert (run_dir / "plan.dryrun.json").is_file()
+    assert not (run_dir / "plan.json").exists()
+    assert _read(run_dir / "plan.dryrun.json")["objective"] == "<dry-run: not generated>"
+
+
+def test_live_plan_survives_a_prior_rehearsal(tmp_path, capsys):
+    """The child-1790350588-96925 corruption: rehearsal first, live second."""
+    given = tmp_path / "given.json"
+    given.write_text(json.dumps(_VALID_PLAN), encoding="utf-8")
+
+    _run_plan(tmp_path, "both", "1", capsys=capsys)
+    run_dir = _run_plan(tmp_path, "both", "0", given=str(given), capsys=capsys)
+
+    live = _read(run_dir / "plan.json")
+    assert live["objective"] == "Ship the widget"
+    assert live["decomposition"], "live plan must carry a real decomposition"
+    assert _read(run_dir / "plan.dryrun.json")["objective"] == "<dry-run: not generated>"
+
+
+def test_explicit_out_is_honoured_verbatim(tmp_path, capsys):
+    """A caller that names the file keeps it — the rehearsal/live split is theirs."""
+    home, db = _plan_home(tmp_path, "explicit")
+    kickoff = tmp_path / "explicit.md"
+    kickoff.write_text("# Do the thing\n", encoding="utf-8")
+    out = tmp_path / "named-by-caller.json"
+
+    saved = dict(os.environ)
+    os.environ.clear()
+    os.environ.update(_plan_env(home, db, "1"))
+    try:
+        rc = plan.main([str(kickoff), "--out", str(out)], root=str(_REPO))
+    finally:
+        os.environ.clear()
+        os.environ.update(saved)
+    capsys.readouterr()
+
+    assert rc == 0
+    assert out.is_file()
+    assert not (tmp_path / "explicit" / ".mini-ork" / "runs" / _RUN_ID /
+                "plan.dryrun.json").exists()

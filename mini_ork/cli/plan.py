@@ -68,6 +68,23 @@ _DRY_RUN_PLACEHOLDER = """{
 }
 """
 
+
+def _plan_file_name(dry_run: bool) -> str:
+    """The live run is the only author of its own ``plan.json``.
+
+    A rehearsal (``MINI_ORK_DRY_RUN=1``, e.g. a nested lifecycle that inherited the
+    run id) writes ``_DRY_RUN_PLACEHOLDER``. Under the live name it overwrote the
+    real plan the implementer was about to be handed, so every node downstream was
+    planned against ``objective: '<dry-run: not generated>'`` with an empty
+    decomposition. Rehearsals get their own filename, mirroring
+    ``mini_ork.cli.main._execute_log_name``.
+
+    An explicit ``--out`` is not routed through here: the caller named that file,
+    so the rehearsal/live distinction is theirs to draw.
+    """
+    return "plan.dryrun.json" if dry_run else "plan.json"
+
+
 _USAGE = """Usage: mini-ork plan <kickoff.md> [--task-class <name>] [--out <plan.json>] [--dry-run]
 
 Generate a structured plan JSON from a kickoff file.
@@ -549,7 +566,7 @@ def main(argv=None, *, root=None, dispatch=None) -> int:
     if not out_file:
         run_dir = os.path.join(home, "runs", run_id)
         os.makedirs(run_dir, exist_ok=True)
-        out_file = os.path.join(run_dir, "plan.json")
+        out_file = os.path.join(run_dir, _plan_file_name(dry_run))
     run_dir = os.path.dirname(out_file)
     trace_id = "" if dry_run else f"tr-plan-{int(time.time())}-{os.getpid()}"
     _trace_plan(trace_id, task_class, "running", db)
