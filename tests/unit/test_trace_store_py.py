@@ -331,3 +331,103 @@ def test_route_margin_roundtrip(tmp_path):
     }, db=db)
     row = trace_store.trace_get("tr-margin-zero", db=db)
     assert row["route_margin"] == pytest.approx(0.0)
+
+
+# ── schema drift: a lagging table must degrade, not kill the write ──────────
+# Incident 2026-09-25: migration 0059 (predicted_error) was never applied to the
+# live DB while trace_write named that column unconditionally, so EVERY trace
+# write raised OperationalError and was swallowed by execute.py's best-effort
+# except — the ledger froze silently for two days. The writer now drops columns
+# the table lacks. These tests hold the live table one migration behind and
+# assert the write still lands the columns it CAN.
+
+def _drop_column(db: str, column: str) -> None:
+    """Drop a column the way an un-applied migration leaves it. SQLite refuses to
+    drop a column an index references, so drop those indexes first — migration
+    0059 ships one (`idx_et_predicted_error_v59`)."""
+    con = sqlite3.connect(db)
+    idx = con.execute(
+        "SELECT name, sql FROM sqlite_master WHERE type='index' AND tbl_name='execution_traces'"
+    ).fetchall()
+    for name, sql in idx:
+        if sql and column in sql:
+            con.execute(f'DROP INDEX IF EXISTS "{name}"')
+    con.execute(f"ALTER TABLE execution_traces DROP COLUMN {column}")
+    con.commit()
+    con.close()
+
+
+def _has_column(db: str, column: str) -> bool:
+    con = sqlite3.connect(db)
+    try:
+        cols = {r[1] for r in con.execute("PRAGMA table_info(execution_traces)")}
+    finally:
+        con.close()
+    return column in cols
+
+
+def test_write_survives_missing_predicted_error(tmp_path):
+    """The 0057-present / 0059-absent state — the live DB's actual shape."""
+    db = _init_db(tmp_path / "drift-59")
+    _drop_column(db, "predicted_error")
+    assert not _has_column(db, "predicted_error")
+
+    tid = trace_store.trace_write({
+        "trace_id": "drift-59", "task_class": "goal_loop", "status": "success",
+        "route_source": "learned", "route_explore": False,
+        "route_score": 0.42, "route_margin": 0.0093,
+        "predicted_error": 0.31,
+    }, db=db)
+    assert tid == "drift-59"
+    row = trace_store.trace_get("drift-59", db=db)
+    assert row is not None, "the write must land, not silently vanish"
+    # The columns that DO exist still carry their values.
+    assert row["route_margin"] == pytest.approx(0.0093)
+    assert row["route_source"] == "learned"
+    assert row["status"] == "success"
+
+
+def test_write_survives_table_missing_all_route_columns(tmp_path):
+    """A pre-0057 table: every router column gone, including the four COALESCE
+    ones. The write must still insert the baseline row."""
+    db = _init_db(tmp_path / "drift-57")
+    for col in ("predicted_error", "route_margin", "route_score",
+                "route_explore", "route_source"):
+        _drop_column(db, col)
+
+    trace_store.trace_write({
+        "trace_id": "drift-57", "task_class": "code-fix", "status": "success",
+        "reward_value": 1.0, "reward_anchor": 0.5, "reward_direction": "higher_is_better",
+        "route_margin": 0.5,
+    }, db=db)
+    row = trace_store.trace_get("drift-57", db=db)
+    assert row is not None
+    assert row["status"] == "success"
+    assert abs(float(row["reward_g"]) - 1.0) < 1e-9
+
+
+def test_upsert_still_updates_with_narrowed_table(tmp_path):
+    """On a lagging table the UPSERT must still update — the conflict clause is
+    built from the surviving columns, not hardcoded to a full column set."""
+    db = _init_db(tmp_path / "drift-upsert")
+    _drop_column(db, "predicted_error")
+
+    trace_store.trace_write({"trace_id": "drift-up", "task_class": "code-fix",
+                             "status": "running"}, db=db)
+    trace_store.trace_write({
+        "trace_id": "drift-up", "status": "success",
+        "route_source": "learned", "route_explore": True, "route_margin": 0.25,
+    }, db=db)
+    row = trace_store.trace_get("drift-up", db=db)
+    assert row["status"] == "success"
+    assert row["route_margin"] == pytest.approx(0.25)
+    assert row["route_explore"] == 1
+
+
+def test_missing_table_still_raises(tmp_path):
+    """Fail-open is for missing COLUMNS, not a missing TABLE: a wrong DB path is
+    a real error and must not be mistaken for a schema-lagging one."""
+    dbp = str(tmp_path / "empty.db")
+    sqlite3.connect(dbp).close()  # file exists, no execution_traces table
+    with pytest.raises(sqlite3.OperationalError):
+        trace_store.trace_write({"trace_id": "x", "task_class": "y"}, db=dbp)

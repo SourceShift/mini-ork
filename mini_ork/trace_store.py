@@ -66,9 +66,130 @@ def _normalise_verifier_output(v) -> dict:
     return {}
 
 
+# Every execution_traces column this writer knows about, in INSERT order, each
+# paired with how the ON CONFLICT clause treats it:
+#   "skip"     — write on insert, never overwrite on conflict
+#   "set"      — overwrite on conflict
+#   "coalesce" — overwrite only when the incoming value is non-NULL
+# A column the live table lacks is dropped from both lists rather than raising:
+# the router columns (route_*, predicted_error) arrive under later migrations, and
+# a trace write must never be the thing that fails when the schema is behind.
+_TRACE_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("trace_id", "skip"),
+    ("run_id", "coalesce"),
+    ("task_class", "skip"),
+    ("prompt_version_hash", "skip"),
+    ("context_bundle_hash", "skip"),
+    ("tool_calls", "skip"),
+    ("files_read", "skip"),
+    ("files_written", "skip"),
+    ("verifier_output", "set"),
+    ("reviewer_verdict", "set"),
+    ("cost_usd", "set"),
+    ("duration_ms", "set"),
+    ("final_artifact_ref", "set"),
+    ("status", "set"),
+    ("workflow_version_id", "skip"),
+    ("agent_version_id", "skip"),
+    ("objective_domain", "set"),
+    ("segment", "set"),
+    ("reward_primary_metric", "set"),
+    ("reward_direction", "set"),
+    ("reward_value", "set"),
+    ("reward_anchor", "set"),
+    ("reward_g", "set"),
+    ("reward_vector_json", "set"),
+    ("reward_source", "set"),
+    ("validity", "set"),
+    ("route_source", "coalesce"),
+    ("route_explore", "coalesce"),
+    ("route_score", "coalesce"),
+    ("route_margin", "coalesce"),
+    ("predicted_error", "coalesce"),
+)
+
+
+def _trace_values(
+    p: dict, verifier_output_obj: dict, reward_vector_json: str | None,
+    reward_direction: str, reward_value, reward_anchor, reward_g,
+    trace_id: str, run_id, workflow_version_id, prompt_version,
+) -> dict[str, object]:
+    """Map a payload onto execution_traces columns, reproducing the historical
+    coercion exactly (json-encode the list/dict columns, float the numerics,
+    bool→int for route_explore)."""
+    return {
+        "trace_id": trace_id,
+        "run_id": run_id,
+        "task_class": p.get("task_class", ""),
+        "prompt_version_hash": prompt_version,
+        "context_bundle_hash": p.get("context_bundle_hash", "") or "",
+        "tool_calls": json.dumps(p.get("tool_calls", [])),
+        "files_read": json.dumps(p.get("files_read", [])),
+        "files_written": json.dumps(p.get("files_written", [])),
+        "verifier_output": json.dumps(verifier_output_obj),
+        "reviewer_verdict": p.get("reviewer_verdict"),
+        "cost_usd": float(p.get("cost_usd", 0.0)),
+        "duration_ms": int(p.get("duration_ms", 0)),
+        "final_artifact_ref": p.get("final_artifact_ref"),
+        "status": p.get("status", "success"),
+        "workflow_version_id": workflow_version_id,
+        "agent_version_id": p.get("agent_version_id", "") or "",
+        "objective_domain": p.get("objective_domain") or "code-delivery",
+        "segment": p.get("segment") or p.get("task_class") or None,
+        "reward_primary_metric": p.get("reward_primary_metric"),
+        "reward_direction": reward_direction,
+        "reward_value": float(reward_value) if reward_value is not None else None,
+        "reward_anchor": float(reward_anchor) if reward_anchor is not None else None,
+        "reward_g": float(reward_g) if reward_g is not None else None,
+        "reward_vector_json": reward_vector_json,
+        "reward_source": p.get("reward_source") or "verifier@v1",
+        "validity": p.get("validity") or "valid",
+        "route_source": p.get("route_source"),
+        "route_explore": (
+            int(bool(p["route_explore"])) if p.get("route_explore") is not None else None
+        ),
+        "route_score": (
+            float(p["route_score"]) if p.get("route_score") is not None else None
+        ),
+        "route_margin": (
+            float(p["route_margin"]) if p.get("route_margin") is not None else None
+        ),
+        "predicted_error": (
+            float(p["predicted_error"]) if p.get("predicted_error") is not None else None
+        ),
+    }
+
+
+def _trace_upsert(con: sqlite3.Connection, values: dict[str, object]) -> None:
+    """INSERT/UPDATE only the columns the live table actually has.
+
+    Fail-open on schema drift: the write path must degrade to a narrower write,
+    never raise. calibration.load_margin_rows reads a missing column as "no data
+    yet"; the writer treats it the same way rather than killing the row.
+    """
+    present = {row[1] for row in con.execute("PRAGMA table_info(execution_traces)")}
+    if not present:
+        raise sqlite3.OperationalError("no such table: execution_traces")
+    cols = [c for c, _ in _TRACE_COLUMNS if c in present]
+    conflict = ", ".join(
+        f"{c}=excluded.{c}" if mode == "set" else f"{c}=COALESCE(excluded.{c}, {c})"
+        for c, mode in _TRACE_COLUMNS
+        if mode in ("set", "coalesce") and c in present
+    )
+    sql = (
+        f"INSERT INTO execution_traces ({', '.join(cols)}) "
+        f"VALUES ({', '.join('?' * len(cols))}) "
+        + (f"ON CONFLICT(trace_id) DO UPDATE SET {conflict}" if conflict
+           else "ON CONFLICT(trace_id) DO NOTHING")
+    )
+    con.execute(sql, [values[c] for c in cols])
+
+
 def trace_write(payload: dict | str, db: str | None = None) -> str:
     """Write/UPSERT an execution trace. Returns trace_id. Faithful to
-    lib/trace_store.sh::trace_write (same columns, ON CONFLICT set, env fallbacks)."""
+    lib/trace_store.sh::trace_write (same columns, ON CONFLICT set, env fallbacks),
+    except that columns the live table lacks are dropped instead of raising — see
+    ``_trace_upsert``."""
     p = json.loads(payload) if isinstance(payload, str) else dict(payload)
     trace_id = p.get("trace_id") or f"tr-{uuid.uuid4().hex[:16]}"
     run_id = (p.get("run_id") or os.environ.get("MINI_ORK_TASK_RUN_ID")
@@ -94,55 +215,12 @@ def trace_write(payload: dict | str, db: str | None = None) -> str:
 
     con = sqlite3.connect(_db_path(db))
     con.execute("PRAGMA busy_timeout=5000")
-    con.execute(
-        """INSERT INTO execution_traces (
-            trace_id, run_id, task_class, prompt_version_hash, context_bundle_hash,
-            tool_calls, files_read, files_written, verifier_output,
-            reviewer_verdict, cost_usd, duration_ms, final_artifact_ref,
-            status, workflow_version_id, agent_version_id,
-            objective_domain, segment, reward_primary_metric, reward_direction,
-            reward_value, reward_anchor, reward_g, reward_vector_json,
-            reward_source, validity,
-            route_source, route_explore, route_score, route_margin, predicted_error
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-        ON CONFLICT(trace_id) DO UPDATE SET
-            status=excluded.status, run_id=COALESCE(excluded.run_id, run_id),
-            verifier_output=excluded.verifier_output,
-            reviewer_verdict=excluded.reviewer_verdict, cost_usd=excluded.cost_usd,
-            duration_ms=excluded.duration_ms, final_artifact_ref=excluded.final_artifact_ref,
-            objective_domain=excluded.objective_domain, segment=excluded.segment,
-            reward_primary_metric=excluded.reward_primary_metric,
-            reward_direction=excluded.reward_direction, reward_value=excluded.reward_value,
-            reward_anchor=excluded.reward_anchor, reward_g=excluded.reward_g,
-            reward_vector_json=excluded.reward_vector_json,
-            reward_source=excluded.reward_source, validity=excluded.validity,
-            route_source=COALESCE(excluded.route_source, route_source),
-            route_explore=COALESCE(excluded.route_explore, route_explore),
-            route_score=COALESCE(excluded.route_score, route_score),
-            route_margin=COALESCE(excluded.route_margin, route_margin),
-            predicted_error=COALESCE(excluded.predicted_error, predicted_error)""",
-        (
-            trace_id, run_id, p.get("task_class", ""), prompt_version,
-            p.get("context_bundle_hash", "") or "",
-            json.dumps(p.get("tool_calls", [])), json.dumps(p.get("files_read", [])),
-            json.dumps(p.get("files_written", [])), json.dumps(verifier_output_obj),
-            p.get("reviewer_verdict"), float(p.get("cost_usd", 0.0)),
-            int(p.get("duration_ms", 0)), p.get("final_artifact_ref"),
-            p.get("status", "success"), workflow_version_id,
-            p.get("agent_version_id", "") or "",
-            p.get("objective_domain") or "code-delivery",
-            p.get("segment") or p.get("task_class") or None,
-            p.get("reward_primary_metric"), reward_direction,
-            float(reward_value) if reward_value is not None else None,
-            float(reward_anchor) if reward_anchor is not None else None,
-            float(reward_g) if reward_g is not None else None,
-            reward_vector_json, p.get("reward_source") or "verifier@v1",
-            p.get("validity") or "valid",
-            p.get("route_source"),
-            (int(bool(p["route_explore"])) if p.get("route_explore") is not None else None),
-            (float(p["route_score"]) if p.get("route_score") is not None else None),
-            (float(p["route_margin"]) if p.get("route_margin") is not None else None),
-            (float(p["predicted_error"]) if p.get("predicted_error") is not None else None),
+    _trace_upsert(
+        con,
+        _trace_values(
+            p, verifier_output_obj, reward_vector_json, reward_direction,
+            reward_value, reward_anchor, reward_g, trace_id, run_id,
+            workflow_version_id, prompt_version,
         ),
     )
     con.commit()
