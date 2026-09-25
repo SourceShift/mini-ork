@@ -5,7 +5,7 @@ target repo. Goal-specific knobs arrive via environment variables
 (`MO_GOAL_TARGET_CWD`, `MO_GOAL_UNITS_CMD`, `MO_GOAL_PREDICATE_CMD`,
 `MO_GOAL_CHILD_RECIPE`, `MO_GOAL_MAX_CHILDREN_PER_WAVE`).
 
-Emit `${MINI_ORK_RUN_DIR}/plan.json` with this exact shape:
+Reply with a single JSON object of this exact shape:
 
 ```json
 {
@@ -30,7 +30,11 @@ Emit `${MINI_ORK_RUN_DIR}/plan.json` with this exact shape:
 
 If any field is unknown, emit explicit `null` rather than guessing. Do NOT
 fabricate a units_cmd or predicate_cmd — those are CONFIG, owned by the
-operator, not the planner. Write the file and nothing else.
+operator, not the planner.
+
+Emit the JSON object as your ENTIRE final message — no prose before or after it,
+and no commentary about having written a file. Do NOT write any file yourself:
+the harness parses your reply and writes plan.json from it.
 
 ## Kickoff content
 
