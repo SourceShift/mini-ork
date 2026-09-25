@@ -1107,6 +1107,80 @@ def _revert_working_tree(root: str, run_dir: str) -> bool:
     return True
 
 
+def _revert_inplace_diff(run_dir: str, root: str) -> bool:
+    """``keep_run_artifacts_discard_worktree`` compensation for the in-place
+    implementer: the agent edits MO_TARGET_CWD directly (and often stages), so a
+    failed run leaves the harvested diff sitting in the target tree — the next
+    serial epic would start from a dirty base (run-1788363267-21773-se1 left 4
+    staged paths behind). Reverse-apply the run's own framework-edit.diff; when
+    the tree drifted from the exact applied state, restore each diff path
+    individually. Run artifacts (diff, verdicts, logs) are kept per the strategy
+    name. Never touches paths outside the diff.
+    """
+    def log(msg):
+        print(msg, file=sys.stderr, flush=True)
+
+    diff = os.path.join(run_dir, "framework-edit.diff") if run_dir else ""
+    if not (diff and os.path.isfile(diff) and os.path.getsize(diff) > 0):
+        log("  [rollback] discard_worktree: no framework-edit.diff — nothing to revert")
+        return True
+    target_repo = context_env("MO_TARGET_CWD", "")
+    if not target_repo:
+        try:
+            target_repo = subprocess.check_output(
+                ["git", "-C", root or ".", "rev-parse", "--show-toplevel"],
+                stderr=subprocess.DEVNULL).decode().strip()
+        except Exception:
+            target_repo = root or "."
+    real_root = os.path.realpath(target_repo)
+    numstat = subprocess.run(
+        ["git", "-C", real_root, "apply", "--numstat", diff],
+        capture_output=True, text=True)
+    paths = []
+    for line in (numstat.stdout or "").splitlines():
+        parts = line.split("\t") if "\t" in line else line.split()
+        if len(parts) >= 3 and parts[2]:
+            paths.append(parts[2])
+    if not paths:
+        log("  [rollback] discard_worktree: diff names no paths — nothing to revert")
+        return True
+    # Per-path restore is state-agnostic: the agent may have left any mix of
+    # staged/unstaged/partial states (git apply -R alone reverts worktree
+    # CONTENT but leaves the agent's staged index entries behind — a preflight
+    # against run-1788363267-21773-se1 left 3 index corpses). checkout HEAD
+    # resets index AND worktree for paths in HEAD; created paths get unstaged
+    # and unlinked.
+    for rel in paths:
+        real = os.path.realpath(os.path.join(real_root, rel))
+        if real != real_root and not real.startswith(real_root + os.sep):
+            log(f"  [rollback] reject-revert: path escapes target repo: {rel}")
+            continue
+        in_head = subprocess.run(
+            ["git", "-C", real_root, "cat-file", "-e", f"HEAD:{rel}"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+        if in_head:
+            subprocess.run(["git", "-C", real_root, "checkout", "HEAD", "--", rel],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        else:
+            subprocess.run(
+                ["git", "-C", real_root, "rm", "-f", "-q", "--cached", "--", rel],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            try:
+                if os.path.isfile(real):
+                    os.remove(real)
+            except OSError:
+                log(f"  [rollback] could not remove created file: {rel}")
+    log(f"  [rollback] discard_worktree: per-path restore over {len(paths)} path(s)")
+    leftover = subprocess.run(
+        ["git", "-C", real_root, "status", "--porcelain", "--", *paths],
+        capture_output=True, text=True).stdout.strip()
+    if leftover:
+        log(f"  [warn] rollback: leftover changes after discard_worktree revert:\n{leftover}")
+        return False
+    log(f"  [rollback] discard_worktree: target tree clean of the run's {len(paths)} path(s)")
+    return True
+
+
 def _handle_rollback(ctx: NodeDispatch):
     # F4: bash (:3205-3223) does a best-effort version_rollback (workflow then
     # agent), succeeds regardless of whether a prior version exists, sets
@@ -1149,19 +1223,33 @@ def _handle_rollback(ctx: NodeDispatch):
     # nowhere — fix-tracker M3). Version-registry rollback handles DB state;
     # revert_branch handles FILE state. rc contract unchanged: the rollback
     # node always succeeds and reports, it never re-fails the run.
-    if _rollback_strategy(ctx.workflow) == "revert_branch":
-        # Outer-loop verification override: when an OUTER driver owns the
-        # authoritative gate (goal-loop: deploy -> regen -> DB flip), the
-        # in-sandbox reviewer is both redundant and evidence-starved, so a
-        # revert_branch here would DESTROY the implementer's verified edit
-        # before the real gate ever tests it. The driver sets this flag to
-        # keep FILE state (the version-registry/DB rollback above still runs).
-        if context_env("MINI_ORK_ROLLBACK_KEEP_WORKTREE", "").strip().lower() in ("1", "true", "yes"):
+    # Outer-loop verification override: when an OUTER driver owns the
+    # authoritative gate (goal-loop: deploy -> regen -> DB flip), the
+    # in-sandbox reviewer is both redundant and evidence-starved, so a worktree
+    # revert here would DESTROY the implementer's verified edit before the real
+    # gate ever tests it. The driver sets this flag to keep FILE state (the
+    # version-registry/DB rollback above still runs).
+    strategy = _rollback_strategy(ctx.workflow)
+    keep_worktree = context_env(
+        "MINI_ORK_ROLLBACK_KEEP_WORKTREE", "").strip().lower() in ("1", "true", "yes")
+    if strategy == "revert_branch":
+        if keep_worktree:
             print("  [ok] rollback: MINI_ORK_ROLLBACK_KEEP_WORKTREE set — preserving working-tree "
                   "edit (an outer loop owns verification; an in-sandbox revert would destroy the fix)",
                   file=sys.stderr, flush=True)
         else:
             _revert_working_tree(ctx.root, ctx.run_dir_eff or ctx.run_dir)
+    elif strategy == "keep_run_artifacts_discard_worktree":
+        # Declared by recipes/framework-edit/workflow.yaml and
+        # recipes/self-migrate/workflow.yaml, implemented nowhere before this:
+        # the in-place implementer's diff was left in the target tree on a
+        # failed run, so the next serial epic started from a dirty base.
+        if keep_worktree:
+            print("  [ok] rollback: MINI_ORK_ROLLBACK_KEEP_WORKTREE set — preserving working-tree "
+                  "edit (an outer loop owns verification; an in-sandbox revert would destroy the fix)",
+                  file=sys.stderr, flush=True)
+        else:
+            _revert_inplace_diff(ctx.run_dir_eff or ctx.run_dir, ctx.root)
     print("  [ok] rollback complete")
     # NOTE: bash traces NO rollback node (:3205-3223 has no _trace_write_node_rich).
     # Tracing it with status=success would write a spurious +1-reward execution_traces
