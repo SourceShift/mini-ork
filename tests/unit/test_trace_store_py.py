@@ -431,3 +431,89 @@ def test_missing_table_still_raises(tmp_path):
     sqlite3.connect(dbp).close()  # file exists, no execution_traces table
     with pytest.raises(sqlite3.OperationalError):
         trace_store.trace_write({"trace_id": "x", "task_class": "y"}, db=dbp)
+
+
+# ── node-scoped sidecar attribution ─────────────────────────────────────────
+# The .last-llm-* sidecars are overwritten per dispatch, never consumed, so a
+# node that dispatched nothing would read the PREVIOUS node's cost back as its
+# own. Measured in the 2026-09-25 smoke runs: four traces per run carried the
+# same $0.177876 while three of the four were `transform` nodes that never
+# dispatched. The `.last-llm-node` stamp closes that window.
+
+def _sidecar_run_dir(tmp_path, **files):
+    rd = tmp_path / "rd"
+    rd.mkdir(exist_ok=True)
+    for name, value in files.items():
+        (rd / name).write_text(value)
+    return rd
+
+
+def test_sidecar_read_scoped_to_dispatching_node(tmp_path, monkeypatch):
+    """A node reads a sidecar only when it is the node that wrote it."""
+    rd = _sidecar_run_dir(tmp_path, **{
+        ".last-llm-node": "sweep",
+        ".last-llm-cost": "0.177876",
+    })
+    monkeypatch.setenv("MINI_ORK_RUN_DIR", str(rd))
+    monkeypatch.delenv("MO_DISPATCH_TIMEOUT", raising=False)
+
+    # The dispatching node sees its own cost.
+    monkeypatch.setenv("MO_NODE_ID", "sweep")
+    assert trace_store._read_fresh_sidecar(".last-llm-cost") == "0.177876"
+    assert trace_store.trace_write_node("code-fix")["cost_usd"] == pytest.approx(0.177876)
+
+    # A node that dispatched nothing does not inherit it.
+    monkeypatch.setenv("MO_NODE_ID", "goal_check")
+    assert trace_store._read_fresh_sidecar(".last-llm-cost") is None
+    assert trace_store.trace_write_node("code-fix")["cost_usd"] == 0.0
+
+
+def test_sidecar_without_marker_stays_freshness_only(tmp_path, monkeypatch):
+    """A writer that stamps no node (an older dispatcher, a test fixture) is
+    trusted on freshness alone — the gate narrows attribution, it cannot blank
+    it out."""
+    rd = _sidecar_run_dir(tmp_path, **{".last-llm-lane": "GLM-5.3"})
+    monkeypatch.setenv("MINI_ORK_RUN_DIR", str(rd))
+    monkeypatch.setenv("MO_NODE_ID", "planner")
+    monkeypatch.delenv("MO_DISPATCH_TIMEOUT", raising=False)
+
+    assert trace_store._read_fresh_sidecar(".last-llm-lane") == "GLM-5.3"
+
+
+def test_trace_write_overlays_served_lane_member(tmp_path, monkeypatch):
+    """`glm,minimax` is a retry FAMILY, not a lane. The row must carry the member
+    that actually served — the family string competed with its own members
+    (`glm`, `minimax`) as peers in lane_domain_advantage."""
+    db = _init_db(tmp_path / "lane-overlay")
+    rd = _sidecar_run_dir(tmp_path, **{
+        ".last-llm-node": "planner",
+        ".last-llm-lane": "glm",
+    })
+    monkeypatch.setenv("MINI_ORK_RUN_DIR", str(rd))
+    monkeypatch.setenv("MO_NODE_ID", "planner")
+    monkeypatch.delenv("MO_DISPATCH_TIMEOUT", raising=False)
+
+    trace_store.trace_write({
+        "trace_id": "lane-overlay", "task_class": "framework_edit",
+        "status": "success", "agent_version_id": "glm,minimax",
+    }, db=db)
+    assert trace_store.trace_get("lane-overlay", db=db)["agent_version_id"] == "glm"
+
+
+def test_trace_write_ignores_lane_from_another_node(tmp_path, monkeypatch):
+    """The overlay is node-gated too: a node that dispatched nothing keeps the
+    lane its own payload named rather than the previous node's served member."""
+    db = _init_db(tmp_path / "lane-overlay-gated")
+    rd = _sidecar_run_dir(tmp_path, **{
+        ".last-llm-node": "sweep",
+        ".last-llm-lane": "glm",
+    })
+    monkeypatch.setenv("MINI_ORK_RUN_DIR", str(rd))
+    monkeypatch.setenv("MO_NODE_ID", "goal_check")
+    monkeypatch.delenv("MO_DISPATCH_TIMEOUT", raising=False)
+
+    trace_store.trace_write({
+        "trace_id": "lane-gated", "task_class": "goal_loop",
+        "status": "success", "agent_version_id": "deepseek-v4-flash",
+    }, db=db)
+    assert trace_store.trace_get("lane-gated", db=db)["agent_version_id"] == "deepseek-v4-flash"

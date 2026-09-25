@@ -250,13 +250,16 @@ def test_direct_main_once_dry_run_uses_same_contract(cli_world: dict[str, str]) 
 
 
 def test_budget_cap_returns_two(cli_world: dict[str, str]) -> None:
+    """The cap is enforced against the per-dispatch ledger (llm_calls), the
+    meter that sees every provider call — node or stage."""
     db = cli_world["db"]
     _seed(db, "e1", priority=5)
     con = sqlite3.connect(db)
     con.execute(
-        "INSERT INTO task_runs "
-        "(id,task_class,recipe,workflow_version,kickoff_path,status,cost_usd,created_at,updated_at) "
-        "VALUES ('r1','x',NULL,'latest','k','classified',99.0,strftime('%s','now'),strftime('%s','now'))"
+        "INSERT INTO llm_calls "
+        "(provider,model_id,tier,feature_name,cost_usd,status,ts) "
+        "VALUES ('deepseek','deepseek-v4-flash','default','mini-ork:gradient-extract',"
+        "99.0,'success',strftime('%Y-%m-%dT%H:%M:%SZ','now'))"
     )
     con.commit()
     con.close()
@@ -316,3 +319,66 @@ def test_help_and_invalid_flag_contract() -> None:
     assert "unknown flag bogus" in bad_result.stderr
     assert missing_value.returncode == 2
     assert "requires a value" in missing_value.stderr
+
+
+# ── the daily budget meter ──────────────────────────────────────────────────
+# today_cost_usd() is what MO_DAILY_BUDGET_USD is enforced against. It summed
+# task_runs.cost_usd, which only carries what a node handler explicitly
+# charged — stage spend (reflect/gradient-extract, the jury, the lens panel)
+# never reaches a charge call. Measured 2026-09-25: $3.1302 of real dispatch
+# spend in 24h read as $0.00, so the circuit could not fire.
+
+def _insert_llm_call(db: str, cost: float, ts: str) -> None:
+    con = sqlite3.connect(db)
+    con.execute(
+        "INSERT INTO llm_calls (provider,model_id,tier,feature_name,cost_usd,status,ts) "
+        "VALUES ('deepseek','deepseek-v4-flash','default','mini-ork:gradient-extract',?,"
+        "'success',?)",
+        (cost, ts),
+    )
+    con.commit()
+    con.close()
+
+
+def _insert_task_run(db: str, cost: float, created_at: int) -> None:
+    con = sqlite3.connect(db)
+    con.execute(
+        "INSERT INTO task_runs (id,task_class,kickoff_path,cost_usd,created_at,updated_at) "
+        "VALUES (?,'code-fix','k.md',?,?,?)",
+        (f"tr-{created_at}-{cost}", cost, created_at, created_at),
+    )
+    con.commit()
+    con.close()
+
+
+def test_today_cost_usd_sums_llm_calls(tmp_path: Path) -> None:
+    """The meter reads the per-dispatch ledger every provider call writes.
+    Timestamps are now-offset, never absolute — a rolling-window test seeded
+    with a literal date reds out once that date ages past 24h."""
+    db = _init_db(tmp_path / "meter")
+    now = time.time()
+
+    def fmt(secs: float) -> str:
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(secs))
+
+    _insert_llm_call(db, 0.177876, fmt(now - 600))
+    _insert_llm_call(db, 0.174592, fmt(now - 3600))
+    assert scheduler.today_cost_usd(db) == pytest.approx(0.352468)
+
+    # A row older than the rolling 24h window is excluded.
+    _insert_llm_call(db, 99.0, fmt(now - 30 * 3600))
+    assert scheduler.today_cost_usd(db) == pytest.approx(0.352468)
+
+
+def test_today_cost_usd_falls_back_to_task_runs(tmp_path: Path) -> None:
+    """A DB behind the migrator (no llm_calls) degrades to the old estimate
+    rather than to a blind zero."""
+    db = _init_db(tmp_path / "meter-fallback")
+    now = int(time.time())
+    _insert_task_run(db, 1.25, now - 3600)
+    con = sqlite3.connect(db)
+    con.execute("DROP TABLE llm_calls")
+    con.commit()
+    con.close()
+
+    assert scheduler.today_cost_usd(db) == pytest.approx(1.25)

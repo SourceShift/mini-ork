@@ -192,6 +192,17 @@ def trace_write(payload: dict | str, db: str | None = None) -> str:
     ``_trace_upsert``."""
     p = json.loads(payload) if isinstance(payload, str) else dict(payload)
     trace_id = p.get("trace_id") or f"tr-{uuid.uuid4().hex[:16]}"
+    # agent_version_id arrives as the lane the router was ASKED for, which may be
+    # an agents.yaml alias or a two-element retry family — `glm,minimax` is a
+    # legitimate value there. Only the member that actually served can be
+    # credited with the outcome, and the dispatcher stamps it into
+    # .last-llm-lane. Stamped as the family, `glm,minimax` held an advantage row
+    # of its own and competed with its own members (`glm`, `minimax`) for the
+    # same slice. The node gate in _read_fresh_sidecar keeps this from reaching
+    # a node that dispatched nothing.
+    served_lane = _read_fresh_sidecar(".last-llm-lane")
+    if served_lane:
+        p["agent_version_id"] = served_lane
     run_id = (p.get("run_id") or os.environ.get("MINI_ORK_TASK_RUN_ID")
               or context_env("MINI_ORK_RUN_ID") or None)
     workflow_version_id = (p.get("workflow_version_id")
@@ -228,10 +239,37 @@ def trace_write(payload: dict | str, db: str | None = None) -> str:
     return trace_id
 
 
+def _read_sidecar_text(run_dir: str, name: str, freshness_s: float) -> str | None:
+    path = os.path.join(run_dir, name)
+    try:
+        if time.time() - os.stat(path).st_mtime > freshness_s:
+            return None
+    except OSError:
+        return None
+    try:
+        with open(path) as fh:
+            return fh.read().strip()
+    except OSError:
+        return None
+
+
 def _read_fresh_sidecar(name: str) -> str | None:
-    """Freshness-gated sidecar read from $MINI_ORK_RUN_DIR. A sidecar older than
-    5x MO_DISPATCH_TIMEOUT is treated as absent so a stale lane/cost from an
-    earlier dispatch can never be attributed to the current trace."""
+    """Freshness- AND node-gated sidecar read from $MINI_ORK_RUN_DIR.
+
+    The dispatch sidecars are overwritten, never consumed, so two gates are
+    needed to keep one dispatch's numbers off another node's trace:
+
+      * freshness (5x MO_DISPATCH_TIMEOUT) drops a lane/cost left by an earlier
+        node in the same run;
+      * the node stamp (.last-llm-node) drops one left by a node that DID
+        dispatch while the current node did not.
+
+    The second gate is why a deterministic node — a transform, a scaffold
+    implementer that early-returns — no longer inherits the previous dispatch's
+    cost: every such node carried the same ~$0.17 line, over-counting a single
+    call several times over. A writer that stamps no node (an older dispatcher,
+    a test fixture) is trusted on freshness alone, so the gate narrows
+    attribution without being able to blank it out."""
     run_dir = context_env("MINI_ORK_RUN_DIR", "")
     if not run_dir:
         return None
@@ -240,18 +278,11 @@ def _read_fresh_sidecar(name: str) -> str | None:
     except ValueError:
         timeout = 1500
     freshness_s = 5 * timeout
-    path = os.path.join(run_dir, name)
-    try:
-        st = os.stat(path)
-    except OSError:
+    owner = _read_sidecar_text(run_dir, ".last-llm-node", freshness_s)
+    node = os.environ.get("MO_NODE_ID", "")
+    if owner and node and owner != node:
         return None
-    if time.time() - st.st_mtime > freshness_s:
-        return None
-    try:
-        with open(path) as fh:
-            return fh.read().strip()
-    except OSError:
-        return None
+    return _read_sidecar_text(run_dir, name, freshness_s)
 
 
 def enrich_stage_trace(payload: dict, *, node_type: str, verdict: str = "") -> dict:

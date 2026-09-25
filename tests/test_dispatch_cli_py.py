@@ -114,6 +114,30 @@ def test_cli_dispatch_writes_text_persists_and_exits_ok(tmp_path, monkeypatch):
     assert row[5] == pytest.approx(0.00018)
 
 
+def test_cli_stamps_node_and_resolved_lane_sidecars(tmp_path, monkeypatch):
+    """The sidecars are overwritten per dispatch, never consumed, so each one
+    carries the stamp that says which node may claim it and the lane that
+    actually served. Without the node stamp a node that dispatched nothing reads
+    the previous dispatch's cost back as its own; without the lane, a trace
+    falls back to the retry family the router was asked for."""
+    root = _fixture_root(tmp_path, monkeypatch)
+    db = _db(tmp_path)
+    out = tmp_path / "out.txt"
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    monkeypatch.setenv("MINI_ORK_ROOT", str(root))
+    monkeypatch.setenv("MINI_ORK_DB", str(db))
+    monkeypatch.setenv("MINI_ORK_RUN_DIR", str(run_dir))
+    monkeypatch.setenv("MO_NODE_ID", "implementer_1")
+    monkeypatch.setattr("sys.stdin", io.StringIO("hello world"))
+
+    assert main(["codex", "--out", str(out)]) == 0
+
+    assert (run_dir / ".last-llm-node").read_text() == "implementer_1"
+    assert (run_dir / ".last-llm-lane").read_text() == "codex"
+    assert float((run_dir / ".last-llm-cost").read_text()) == pytest.approx(0.00018)
+
+
 def test_cli_propagates_nonzero_exit_code(tmp_path, monkeypatch):
     root = _fixture_root(tmp_path, monkeypatch)
     monkeypatch.setenv("MINI_ORK_ROOT", str(root))

@@ -573,12 +573,34 @@ def _write_duration_ms(ms):
 
 
 def _write_lane_sidecar(lane):
-    """Persist the RESOLVED lane so stage-trace writers can attribute the call —
-    without it the model that actually served a planner/verifier dispatch dies
-    inside this process and the stage trace lands lane-less (invisible to both
-    advantage writebacks). Freshness-gated on read in trace_store."""
+    """Open this node's sidecar window: stamp the node, drop the previous node's
+    sidecar values, then persist the RESOLVED lane.
+
+    The lane is what lets a stage-trace writer attribute the call — without it
+    the model that actually served a planner/verifier dispatch dies inside this
+    process and the stage trace lands lane-less (invisible to both advantage
+    writebacks). The stamp is what closes the window again: the sidecars are
+    overwritten, never consumed, so a node that dispatches nothing would
+    otherwise read the previous dispatch's cost back as its own.
+
+    Clearing happens BEFORE the cost write below, so a dispatch that fails and
+    writes no cost leaves nothing to inherit, while one that succeeds leaves
+    only its own numbers. Freshness- and node-gated on read in trace_store."""
     rd = context_env("MINI_ORK_RUN_DIR")
-    if not rd or not lane:
+    if not rd:
+        return
+    node = os.environ.get("MO_NODE_ID", "")
+    if node:
+        try:
+            open(os.path.join(rd, ".last-llm-node"), "w").write(node)
+        except OSError:
+            pass
+    for stale in (".last-llm-cost", ".last-llm-duration-ms", ".last-llm-lane"):
+        try:
+            os.remove(os.path.join(rd, stale))
+        except OSError:
+            pass
+    if not lane:
         return
     try:
         open(os.path.join(rd, ".last-llm-lane"), "w").write(str(lane))

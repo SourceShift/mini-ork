@@ -86,6 +86,26 @@ def main(argv: list[str] | None = None) -> int:
             sys.stderr.write(f"[mini_ork.dispatch] transcript write failed: {exc}\n")
     if run_dir and os.path.isdir(run_dir):
         try:
+            # Stamp which node these numbers belong to. The executor reads the
+            # sidecars back per node, and they are overwritten rather than
+            # consumed, so without the stamp a node that dispatched nothing
+            # inherits the previous dispatch's cost.
+            node_id = os.environ.get("MO_NODE_ID", "")
+            if node_id:
+                with open(os.path.join(run_dir, ".last-llm-node"), "w", encoding="utf-8") as fh:
+                    fh.write(node_id)
+            # result.model is the lane that actually served — the fallback walk
+            # stamps the winner into it — and the node stamp above makes it this
+            # node's to claim. Written for the same reason llm_dispatch writes
+            # it: without a resolved lane a trace falls back to the retry family
+            # the router was asked for, and without overwriting, a stale lane
+            # from an earlier node stays readable under the new node's stamp.
+            lane_path = os.path.join(run_dir, ".last-llm-lane")
+            if result.model:
+                with open(lane_path, "w", encoding="utf-8") as fh:
+                    fh.write(result.model)
+            elif os.path.exists(lane_path):
+                os.remove(lane_path)
             with open(os.path.join(run_dir, ".last-llm-cost"), "w", encoding="utf-8") as fh:
                 fh.write(f"{result.cost_usd:.6f}")
             with open(os.path.join(run_dir, ".last-llm-duration-ms"), "w", encoding="utf-8") as fh:
