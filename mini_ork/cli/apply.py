@@ -40,7 +40,10 @@ Env contract (identical to bash):
     MO_APPLY_REGRESSION_TOLERANCE default 0 (strict per-task no-regression)
     MO_APPLY_PERTASK_JSON         optional {"before":[...],"after":[...]}
     MO_APPLY_MIN_EXAMPLES         default 1
-    MO_APPLY_SCORER               probe (default) | mock | gepa. mock/gepa are
+    MO_APPLY_SCORER               probe (default) | code | mock | gepa. `code`
+                                  scores a PATCH against the framework tree
+                                  (MO_APPLY_CODE_PATCH) instead of a directive.
+                                  mock/gepa are
                                   TEST-ONLY: they fabricate utility and can
                                   never promote, regardless of env
     MO_APPLY_MOCK_BASELINE        mock baseline (score: 0.5; gate: 0.0)
@@ -145,7 +148,7 @@ _APPLY_ATTEMPTS_DDL = """
         target_name             TEXT NOT NULL,
         source_kind             TEXT NOT NULL CHECK (source_kind IN
                                             ('pattern_records','emergent_patterns',
-                                             'gradient_records','synthesis_gate_verdict')),
+                                             'gradient_records','synthesis_gate_verdict','none')),
         source_id               TEXT,
         candidate_id            TEXT REFERENCES workflow_candidates(candidate_id) ON DELETE SET NULL,
         promotion_id            TEXT REFERENCES promotion_records(promotion_id) ON DELETE SET NULL,
@@ -279,6 +282,15 @@ def pick_candidate(task_class: str, target_kind: str, target_name: str,
             })
 
         # Nothing picked.
+        return ""
+    except sqlite3.OperationalError as exc:
+        # A home that was never `mini-ork init`'d carries none of the source
+        # tables, so the first query raises "no such table: pattern_records".
+        # That is "nothing qualifies" — the caller's no_candidate path — not a
+        # crash out of a command documented to exit 0. Any OTHER OperationalError
+        # is a real schema or program fault and must still surface.
+        if "no such table" not in str(exc):
+            raise
         return ""
     finally:
         con.close()
@@ -801,13 +813,21 @@ def apply_run(task_class: str, target_kind: str, target_name: str,
     probe_unmeasured = False
     probe_dead_arms = False
     utility_after = ""
-    if scorer == "probe":
+    if scorer in ("probe", "code"):
         from mini_ork.learning import probe_scorer as _ps  # deferred: cycle-safe
         try:
-            probe_result = _ps.probe_score(
-                task_class, target_file, suggested_change,
-                source_ref=f"{source_kind}:{source_id}" if source_id else "",
-                context=parsed.get("signal", ""))
+            if scorer == "code":
+                # A code candidate is a PATCH against the framework tree, not a
+                # directive appended to a prompt: the directive args do not
+                # apply and are deliberately not passed. Both scorers share the
+                # same result shape, so the gate below is unchanged.
+                probe_result = _ps.probe_score_code(
+                    task_class, os.environ.get("MO_APPLY_CODE_PATCH", ""))
+            else:
+                probe_result = _ps.probe_score(
+                    task_class, target_file, suggested_change,
+                    source_ref=f"{source_kind}:{source_id}" if source_id else "",
+                    context=parsed.get("signal", ""))
         except RuntimeError as exc:
             sys.stderr.write(f"[probe-scorer] {exc}\n")
             probe_result = None

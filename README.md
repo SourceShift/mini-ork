@@ -1,6 +1,20 @@
-# mini-ork
+<p align="center">
+  <img src="assets/mini-ork-icon.svg" alt="mini-ork" width="112" height="112">
+</p>
 
-**A task operating system for AI agents — one that makes them prove their work.**
+<h1 align="center">mini-ork</h1>
+
+<p align="center">
+  <strong>A task operating system for AI agents — one that makes them prove their work.</strong>
+</p>
+
+<p align="center">
+  <a href="LICENSE"><img alt="License: Apache-2.0" src="https://img.shields.io/badge/license-Apache--2.0-blue.svg"></a>
+  <a href="https://github.com/SourceShift/mini-ork/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/SourceShift/mini-ork/actions/workflows/ci.yml/badge.svg"></a>
+  <a href="https://github.com/SourceShift/mini-ork/actions/workflows/codeql.yml"><img alt="CodeQL" src="https://github.com/SourceShift/mini-ork/actions/workflows/codeql.yml/badge.svg"></a>
+  <img alt="Python 3.11 | 3.12" src="https://img.shields.io/badge/python-3.11%20%7C%203.12-blue.svg">
+  <img alt="Status: early, research-grade" src="https://img.shields.io/badge/status-early%20%C2%B7%20research--grade-orange.svg">
+</p>
 
 mini-ork turns a goal into a planned, executed, and *verified* run across a fleet of
 different models: **classify → plan → execute → verify → reflect → improve**. The
@@ -11,14 +25,19 @@ own output.
 It is for teams who want an agent to do real work without treating fluent output, a
 green-looking diff, or a panel of agreeing models as proof.
 
+<p align="center">
+  <img src="assets/mini-ork-hero.jpg" alt="An ork operator on a starship bridge overseeing many isolated workstreams, each a self-contained environment running its own crew." width="860">
+</p>
+
 ## Warning: this system modifies itself, unattended
 
-mini-ork's apply loop can rewrite its own recipe prompts, agent prompts, and workflow
-nodes and edges — and **promote those changes without a human approving each one**. It
-runs the candidate change over a held-out probe set, compares the publish rate before
-and after, and promotes only on a measured improvement that does not regress a
-previously-passing task. There is no "review this first" gate in that loop, and no
-environment variable that puts one back.
+> [!WARNING]
+> mini-ork's apply loop can rewrite its own recipe prompts, agent prompts, and workflow
+> nodes and edges — and **promote those changes without a human approving each one**. It
+> runs the candidate change over a held-out probe set, compares the publish rate before
+> and after, and promotes only on a measured improvement that does not regress a
+> previously-passing task. There is no "review this first" gate in that loop, and no
+> environment variable that puts one back.
 
 Read that as what it is: the machine is allowed to rewrite itself while you are not
 looking. The measurement is real — no promote happens without one — but a measurement
@@ -32,14 +51,14 @@ real held-out measurement, and there is no flag that restores the human branch. 
 protects you from a bad promote is the probe set, the per-task no-regression rule, and
 your version control — not a person in the loop.
 
-**If that is not what you want, the safe configuration is:**
+**🛡️ If that is not what you want, the safe configuration is:**
 
-- Leave `MO_APPLY_ENABLED` and `MO_AUTO_APPLY` unset. Both default to off, and the
+- 🔒 Leave `MO_APPLY_ENABLED` and `MO_AUTO_APPLY` unset. Both default to off, and the
   unattended sweep requires *both* to be `1`.
-- Run it on a throwaway worktree, never on a checkout you care about.
-- Know your caps: `MO_APPLY_PROBE_BUDGET_USD` and `MO_APPLY_PROBE_MAX_TASKS` bound what
+- 🧪 Run it on a throwaway worktree, never on a checkout you care about.
+- 🧮 Know your caps: `MO_APPLY_PROBE_BUDGET_USD` and `MO_APPLY_PROBE_MAX_TASKS` bound what
   a single apply run can spend.
-- Keep the target repository under version control. `mini-ork rollback agent <target>`
+- 🌿 Keep the target repository under version control. `mini-ork rollback agent <target>`
   restores the pre-promotion file and `mini-ork rollback workflow <name>` the workflow,
   but **your VCS is the ultimate backstop** — review the promoted diffs the way you
   would review a junior engineer's commit.
@@ -48,7 +67,7 @@ This is a research-grade, self-improving system under active development. A prom
 is a change that has already landed, not a proposal waiting for you. See
 [docs/SAFETY.md](docs/SAFETY.md) for the full posture and the gates that do hold.
 
-## Why this exists
+## 🎯 Why this exists
 
 AI agents now write code faster than any team can review it. The bottleneck moved from
 *generation* to *validation*. An agent that writes its own tests and then grades itself
@@ -62,23 +81,23 @@ you run it.
 
 **Why now:**
 
-- **Reliability is the new bottleneck.** 81% of enterprise technology leaders report an
+- 📈 **Reliability is the new bottleneck.** 81% of enterprise technology leaders report an
   *increase* in production issues linked to AI-generated code (CloudBees,
   [*2026 State of Code Abundance Report*](https://www.theregister.com/ai-ml/2026/05/20/ai-code-boom-drives-production-failures-higher-spending/)).
-- **Cost routing is a real lever.** Routing between a strong and a weak model can cut cost
+- 💸 **Cost routing is a real lever.** Routing between a strong and a weak model can cut cost
   **more than 2×** without compromising quality
   ([RouteLLM, arXiv:2406.18665](https://arxiv.org/abs/2406.18665)) — the lever mini-ork
   automates, but conditioned on a verification bar rather than a guess.
-- **Pilots stall on the same three things.** Most agent pilots don't reach production, and
+- 🚧 **Pilots stall on the same three things.** Most agent pilots don't reach production, and
   the blockers are consistently evaluation, reliability, and governance — the three layers
   mini-ork treats as runtime primitives instead of afterthoughts.
 
-## Three things an orchestration framework won't do for you
+## 🧱 Three things an orchestration framework won't do for you
 
 Wiring agents into a graph is now commodity (LangGraph, CrewAI, AutoGen). mini-ork adds
 the three layers that decide whether agent work is actually *shippable*.
 
-### 1. It verifies correctness — it doesn't just orchestrate
+### 1. ✅ It verifies correctness — it doesn't just orchestrate
 
 The source of truth for a change is its **execution outcome**, captured in an isolated
 runtime (mini-ork's `Crucible`, over Prime Intellect's MIT-licensed `verifiers`):
@@ -95,7 +114,7 @@ runtime (mini-ork's `Crucible`, over Prime Intellect's MIT-licensed `verifiers`)
   `mini_ork/cli/apply.py`).
 - **A run with no meaningful check is reported as *vacuous*,** not silently successful.
 
-### 2. It governs cost across a pool of models
+### 2. 💰 It governs cost across a pool of models
 
 You don't pay frontier prices for work a cheaper model can pass:
 
@@ -108,7 +127,7 @@ You don't pay frontier prices for work a cheaper model can pass:
   an operator must approve, and a wall-clock deadline budget — so an autonomous run can't
   quietly burn your account.
 
-### 3. It learns from what actually verified
+### 3. 🔁 It learns from what actually verified
 
 Every run leaves a trail of *verified* outcomes, and the system feeds that signal back:
 
@@ -120,7 +139,7 @@ Every run leaves a trail of *verified* outcomes, and the system feeds that signa
   signal is clean rather than noise. A closed **learn → apply** loop materializes,
   scores, and non-regression-gates each proposed improvement before it lands.
 
-## Where it fits
+## 🧭 Where it fits
 
 mini-ork isn't a prettier agent graph or a cheaper autonomous coder. Orchestration
 frameworks wire agents together; coding products write and ship; eval tools score after
@@ -137,22 +156,22 @@ untestable work — where mini-ork is built to surface the uncertainty and refus
 promote rather than manufacture confidence. (Refusing does not mean asking you: the
 self-improvement loop has no approval prompt. See the [warning](#warning-this-system-modifies-itself-unattended) above.)
 
-## What is in the box
+## 📦 What is in the box
 
 **119 shipped capabilities across seven pillars** (full code-anchored list in the
 [feature inventory](docs/reference/FEATURE-INVENTORY.md)):
 
 | Pillar | What you get |
 |---|---|
-| **Orchestration core** | Full `run` lifecycle, keyword task classifier, planner with repair-on-bad-JSON, recovery DAG, a multi-epic scheduler, and a meta-policy conductor. |
-| **Heterogeneous model dispatch** | BYO provider registry (5 kinds), 6 routing policies, role-aware fallback chains, per-provider throttle guards, and an owner-only secrets store. |
-| **Runtime reliability** | Durable-DAG resume (resurrect a failed run at the step or turn), single-writer leases + fencing, idempotent tool receipts, and cost/deadline circuit breakers. |
-| **Verification & gates** | An extensible gate registry (deterministic verifiers, reviewer/human/budget/scope gates), evidence-cited grounded rejections, and promotion gated on measurable evidence. |
-| **Self-improvement & learning** | Anti-Goodhart reward contract, cost-free bandit router, GRPO writeback, reflection pipeline, semantic long-term memory, and a closed apply loop. |
-| **Observability surface** | A FastAPI app (127.0.0.1:7090) with an SSE live event stream, run detail + DAG overlay, a "why did this fail" aggregator, learning dashboards, and OTel/Langfuse export. |
-| **Operator & dev ergonomics** | A stable CLI — `init`, `run`, `validate`, `doctor`, `providers`, `garden`, `serve`, `recover` — plus worktree-aware, file-surface-leased workflows for safe concurrent agents. |
+| 🧩 **Orchestration core** | Full `run` lifecycle, keyword task classifier, planner with repair-on-bad-JSON, recovery DAG, a multi-epic scheduler, and a meta-policy conductor. |
+| 🔀 **Heterogeneous model dispatch** | BYO provider registry (5 kinds), 6 routing policies, role-aware fallback chains, per-provider throttle guards, and an owner-only secrets store. |
+| 🛡️ **Runtime reliability** | Durable-DAG resume (resurrect a failed run at the step or turn), single-writer leases + fencing, idempotent tool receipts, and cost/deadline circuit breakers. |
+| ✅ **Verification & gates** | An extensible gate registry (deterministic verifiers, reviewer/human/budget/scope gates), evidence-cited grounded rejections, and promotion gated on measurable evidence. |
+| 🔁 **Self-improvement & learning** | Anti-Goodhart reward contract, cost-free bandit router, GRPO writeback, reflection pipeline, semantic long-term memory, and a closed apply loop. |
+| 📊 **Observability surface** | A FastAPI app (127.0.0.1:7090) with an SSE live event stream, run detail + DAG overlay, a "why did this fail" aggregator, learning dashboards, and OTel/Langfuse export. |
+| ⌨️ **Operator & dev ergonomics** | A stable CLI — `init`, `run`, `validate`, `doctor`, `providers`, `garden`, `serve`, `recover` — plus worktree-aware, file-surface-leased workflows for safe concurrent agents. |
 
-## Start here
+## 🚀 Start here
 
 `make install` installs the supported local runtime: required OS tools, a checkout-local
 `.venv`, the `.[full]` Python profile (CLI, local web sidecar, and Crucible), and the
@@ -184,7 +203,7 @@ editable package, repairs the managed command, and verifies the OS tools. Use
 **mini-ork install --help** to see **--bin-dir**, **--no-path**, **--force**, and
 **--dry-run** for the command-only installer.
 
-### Your first verifier-backed workflow
+### 🧪 Your first verifier-backed workflow
 
 Start in a real Git repository. Keeping the mini-ork checkout path lets you copy its
 example into the project you want to work on.
@@ -217,43 +236,43 @@ the CLI or configure the providers it names, then run the same command without
 mini-ork run code-fix ./kickoff.md
 ~~~
 
-## Use mini-ork well
+## 🛠️ Use mini-ork well
 
-1. **Write a verifiable kickoff.** State the target repository, allowed files, intended
+1. ✍️ **Write a verifiable kickoff.** State the target repository, allowed files, intended
    artifact, and the command or rule that proves success.
-2. **Dry-run every new recipe or environment first.** It checks the lifecycle and
+2. 🧪 **Dry-run every new recipe or environment first.** It checks the lifecycle and
    artifact paths without model calls; it does not prove the eventual change is correct.
-3. **Give an agent an oracle when you can.** Prefer an existing test, typecheck, schema,
+3. 🎯 **Give an agent an oracle when you can.** Prefer an existing test, typecheck, schema,
    fixture, or observable acceptance criterion over an LLM-only score.
-4. **Use multiple lenses deliberately.** Heterogeneous review is useful for discovery and
+4. 🔍 **Use multiple lenses deliberately.** Heterogeneous review is useful for discovery and
    diagnosis; it does not replace deterministic verification.
-5. **Read the evidence before promotion.** mini-ork retains traces and can learn from
+5. 👀 **Read the evidence before promotion.** mini-ork retains traces and can learn from
    runs, but automatic promotion is intentionally restricted to classes with measurable
    external evidence. Note that this is the *only* thing standing between a learned
    directive and your recipe files — there is no human approval step to catch a bad
    promote.
 
-### Pick a starting recipe
+### 🧰 Pick a starting recipe
 
 | Need | Start with |
 |---|---|
-| A focused patch with checks | **code-fix** |
-| A documentation change | **docs** |
-| A multi-perspective codebase audit | **refactor-audit** or **bug-audit-cmgk** |
-| A literature or research brief | **research-synthesis** |
-| Self-improvement of this repository | **recursive-self-improve** (see below) |
-| A new workflow shape | Copy a recipe and follow the extension guide |
+| 🩹 A focused patch with checks | **code-fix** |
+| 📝 A documentation change | **docs** |
+| 🔎 A multi-perspective codebase audit | **refactor-audit** or **bug-audit-cmgk** |
+| 🔬 A literature or research brief | **research-synthesis** |
+| ♻️ Self-improvement of this repository | **recursive-self-improve** (see below) |
+| 🧩 A new workflow shape | Copy a recipe and follow the extension guide |
 
 Recipes live in [recipes/](recipes/). To create one, define a task class, workflow,
 artifact contract, prompts, and verifiers; see the [extension guide](docs/EXTENSION.md).
 
-## Recursive self-improvement: two loops
+## ♻️ Recursive self-improvement: two loops
 
 mini-ork improves itself through two loops that are easy to conflate, yet their blast
 radii are nothing alike. The [warning](#warning-this-system-modifies-itself-unattended)
 at the top of this file is about the second one. Know which one you are starting.
 
-### The self-improvement loop — bounded, branch-isolated, dry-runnable
+### 🔬 The self-improvement loop — bounded, branch-isolated, dry-runnable
 
 `mini-ork self-improve` (`bin/mini-ork-self-improve`) is a wall-clock-budgeted outer
 loop that runs the [`recursive-self-improve`](recipes/recursive-self-improve/) recipe
@@ -290,7 +309,7 @@ cost check (`MINI_ORK_PRE_ITER_COST_CHECK=1`, the default) refuses to start a ne
 iteration once the daily cap is hit. Override lanes by copying
 `config/agents.recursive-self-improve.yaml` to `$MINI_ORK_HOME/config/agents.yaml`.
 
-### The apply loop — unattended, and the one to be careful with
+### ⚙️ The apply loop — unattended, and the one to be careful with
 
 `mini-ork apply` closes learn → apply for *prompt and workflow* changes: it picks the
 highest-confidence proposed change, materializes it as a workflow candidate, scores it on
@@ -337,7 +356,7 @@ mini-ork rollback agent <name>
 
 See [docs/SAFETY.md](docs/SAFETY.md) for quarantine semantics.
 
-### The manual loop that surrounds both
+### ✍️ The manual loop that surrounds both
 
 Between the two, the same primitives are drivable by hand — propose, score, decide:
 
@@ -348,7 +367,7 @@ mini-ork eval    --candidate <id>              # run the benchmark suite against
 mini-ork promote --candidate <id> --dry-run    # compute the gate decision, write nothing
 ```
 
-### Where the state lives
+### 🗄️ Where the state lives
 
 Everything above writes to `$MINI_ORK_DB` (default `$MINI_ORK_HOME/state.db`):
 
@@ -364,21 +383,21 @@ once a later successful iteration lands over a `deferred` one. `apply_attempts` 
 every apply decision, including each quarantine and the reason, so a directive that failed
 a gate is never re-proposed.
 
-## Honesty by design
+## ⚖️ Honesty by design
 
 mini-ork does **not** claim a universal oracle. Where there is no trustworthy external
 check — a subjective product decision, untestable code — it surfaces the uncertainty
 rather than manufacturing confidence. That discipline is wired in, not aspirational:
 
-- A run whose verification is absent or meaningless is reported as **vacuous**.
-- The dispatch and learning surfaces refuse to invent a number below their evidence
+- 🫥 A run whose verification is absent or meaningless is reported as **vacuous**.
+- 📉 The dispatch and learning surfaces refuse to invent a number below their evidence
   threshold (Wilson-CI honesty: `<5` samples returns `evidence: "none"`).
-- Every gate rejection cites the evidence trace it was based on, so a "no" is auditable.
-- The promotion gate has no human branch. "Not promotable" is a recorded verdict with a
+- 🧾 Every gate rejection cites the evidence trace it was based on, so a "no" is auditable.
+- 🚫 The promotion gate has no human branch. "Not promotable" is a recorded verdict with a
   reason attached, never a request sent to a person — the loop has nobody to ask, and it
   does not pretend otherwise.
 
-## Learn more
+## 📚 Learn more
 
 Embedding mini-ork in your own app? The [Python SDK](docs/PYTHON-SDK.md) covers both
 the importable primitives (verification, dispatch, memory, routing) and the `MiniOrk`
@@ -388,7 +407,7 @@ Read the [architecture](docs/ARCHITECTURE.md), [operator guide](docs/operator),
 [safety model](docs/SAFETY.md), and [feature inventory](docs/reference/FEATURE-INVENTORY.md)
 when you need the detailed contracts.
 
-## Roadmap
+## 🗺️ Roadmap
 
 The near-term work is operational trust: truthful dispatch telemetry, error and
 finish-reason taxonomy, heartbeat/failure handling, capability-aware routing, cost
@@ -400,7 +419,7 @@ tool call, more planning, a stronger model, or a user interruption — with the 
 signal being *verified progress* at decision checkpoints, balanced against compute,
 latency, and the user's interruption budget. (A proposal, not yet a shipped capability.)
 
-## Contributing and status
+## 🤝 Contributing and status
 
 mini-ork is **Apache-2.0** licensed and early. Use a dedicated worktree for framework
 changes, keep a verifier with every behavior claim, and run the focused checks for the

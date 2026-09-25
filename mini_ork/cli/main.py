@@ -51,6 +51,7 @@ _NATIVE_MODULE_SUBS = {
     "review": "mini_ork.pre_push_review",
     "traceotter": "mini_ork.cli.traceotter",
     "metrics": "mini_ork.cli.metrics",
+    "metric-anchor": "mini_ork.cli.metric_anchor",
     "rollback": "mini_ork.cli.rollback",
     "resume": "mini_ork.cli.resume",
     "recover": "mini_ork.recovery.planner",
@@ -63,6 +64,18 @@ _NATIVE_MODULE_SUBS = {
     "topology": "mini_ork.cli.topology",
     "usage-report": "mini_ork.observability.usage_report",
     "watchdog": "mini_ork.orchestration.watchdog",
+    "acp": "mini_ork.cli.acp_cmd",
+    "calibrate": "mini_ork.cli.calibrate",
+    "collapse-check": "mini_ork.cli.collapse",
+    "collapse-precursor": "mini_ork.cli.collapse_precursor",
+    "gate-fuzz": "mini_ork.cli.gate_fuzz",
+    "memory-lifecycle": "mini_ork.cli.memory_lifecycle",
+    "harness-contrast": "mini_ork.cli.harness_contrast",
+    "harness-edit": "mini_ork.cli.harness_edit",
+    "harness-audit": "mini_ork.cli.harness_audit",
+    "hack-probe": "mini_ork.cli.hack_probe",
+    "oversight": "mini_ork.cli.oversight",
+    "active-eval": "mini_ork.cli.active_eval",
 }
 
 _HELP = """mini-ork — task operating system for agents (v0.1)
@@ -85,6 +98,12 @@ Recipe runner:
   run <kickoff.md>               Classify kickoff, resolve recipe, then walk
                                    classify → plan → execute → verify
   run <recipe-name> <kickoff.md> Force a recipe, then walk the same lifecycle
+
+Self-improvement:
+  self-improve                   Recursive self-improvement of this checkout in a
+                                   worktree + branch per iteration (--dry-run,
+                                   --soft-cap-hours, --hard-cap-hours, --auto-merge,
+                                   --resume). Gated; never commits without verifiers.
 
 Lifecycle:
   init                           Bootstrap project (creates .mini-ork/)

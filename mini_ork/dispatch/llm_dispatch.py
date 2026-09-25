@@ -187,15 +187,22 @@ def resolve_lane_family(lane: str, root: str = "", home: str = "") -> str:
     NOT providers.yaml keys, so an unresolved alias used as the fallback-chain
     lead fails preflight and the MO_FALLBACK_* tail silently decides who serves
     (the codex_lens->minimax bug). Resolving here makes the alias lead with its
-    real family model, keeping the tail as a genuine fallback."""
+    real family model, keeping the tail as a genuine fallback.
+
+    An empty ``home``/``root`` is a clean miss, never a CWD lookup: joining ""
+    yields the bare ``config/agents.yaml``, which resolves against the process
+    CWD — i.e. the repo's default policy rather than the run's. That misread
+    is invisible (the default file exists, so the alias *does* resolve) and it
+    routes to whatever the default names instead. Read no policy rather than
+    read the wrong one."""
     if not lane:
         return lane
     root = root or context_env("MINI_ORK_ROOT")
     home = home or context_env("MINI_ORK_HOME")
-    agents = os.path.join(home, "config", "agents.yaml")
-    if not os.path.isfile(agents):
-        agents = os.path.join(root, "config", "agents.yaml")
-    if not os.path.isfile(agents):
+    agents = os.path.join(home, "config", "agents.yaml") if home else ""
+    if not (agents and os.path.isfile(agents)):
+        agents = os.path.join(root, "config", "agents.yaml") if root else ""
+    if not (agents and os.path.isfile(agents)):
         return lane
     try:
         import yaml

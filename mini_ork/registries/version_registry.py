@@ -54,9 +54,16 @@ def _db_path(db: str | None) -> str:
     if db:
         return db
     env = os.environ.get("MINI_ORK_DB")
-    if not env:
-        raise RuntimeError("MINI_ORK_DB unset")
-    return env
+    if env:
+        return env
+    # MINI_ORK_HOME points AT the .mini-ork dir itself (not its parent), so the
+    # state db is a direct child — the same derivation self_improve.py uses.
+    # Without this, `mini-ork rollback` dies on "MINI_ORK_DB unset" in any
+    # project that was merely `mini-ork init`'d, which is the normal case.
+    home = os.environ.get("MINI_ORK_HOME")
+    if home:
+        return os.path.join(home, "state.db")
+    raise RuntimeError("MINI_ORK_DB unset")
 
 
 def ensure_table(db: str | None = None) -> None:

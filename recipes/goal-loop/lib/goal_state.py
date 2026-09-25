@@ -48,6 +48,8 @@ def evaluate_units(
     target_cwd: str,
     predicate_cmd: str,
     units: Iterable[str],
+    *,
+    confirm_runs: int = 1,
 ) -> dict[str, UnitState]:
     """Run `predicate_cmd <unit_id>` for every unit. argv, not shell.
 
@@ -55,10 +57,25 @@ def evaluate_units(
     we capture the reason text alongside the exit code. A non-zero exit
     classifies the unit as failing; the predicate is the source of truth
     for "what counts as a goal failure" so we don't second-guess its rc.
+
+    ``confirm_runs`` adds a confirmation pass for REDS ONLY. A failing first
+    run is re-run (up to ``confirm_runs`` total attempts) to test whether the
+    red is reproducible. A red that evaporates on re-run is
+    ``reproduced=False`` — a null verdict ("nothing to fix") the selector
+    excludes and the driver reports as a ``nothing_to_fix`` stop. ``pass`` and
+    ``reason`` (apart from the flaky prefix below) reflect the FIRST run, so
+    ``confirm_runs <= 1`` (the default) is byte-identical to the historical
+    implementation apart from the two additive keys ``reproduced`` and
+    ``attempts``, which are always present. A bad ``confirm_runs`` value clamps
+    to 1 rather than raising out of the hunt.
     """
     units_list = list(units)
     if not units_list:
         return {}
+    try:
+        confirm_runs = max(1, int(confirm_runs))
+    except (TypeError, ValueError):
+        confirm_runs = 1
     argv = shlex.split(predicate_cmd)
     results: dict[str, UnitState] = {}
     for unit in units_list:
@@ -75,9 +92,31 @@ def evaluate_units(
             if reason_lines
             else (proc.stderr.strip() or f"rc={proc.returncode}")
         )
+        attempts = 1
+        reproduced = True
+        passed = proc.returncode == 0
+        if not passed and confirm_runs > 1:
+            while attempts < confirm_runs:
+                attempts += 1
+                proc = subprocess.run(
+                    [*argv, unit],
+                    cwd=target_cwd,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                if proc.returncode == 0:
+                    reproduced = False
+                    reason_text = (
+                        f"flake: did not reproduce ({attempts} attempts): "
+                        f"{reason_text}"
+                    )
+                    break
         results[unit] = {
-            "pass": proc.returncode == 0,
+            "pass": passed,
             "reason": reason_text,
+            "reproduced": reproduced,
+            "attempts": attempts,
         }
     return results
 

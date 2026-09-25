@@ -228,7 +228,10 @@ CREATE TABLE IF NOT EXISTS semantic_memory (
   created_at REAL    NOT NULL,
   meta       TEXT,
   uses       INTEGER NOT NULL DEFAULT 0,
-  wins       INTEGER NOT NULL DEFAULT 0
+  wins       INTEGER NOT NULL DEFAULT 0,
+  retired_at      REAL    NOT NULL DEFAULT 0,
+  retire_reason   TEXT    NOT NULL DEFAULT '',
+  retire_evidence TEXT    NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_semantic_memory_scope
   ON semantic_memory(scope);
@@ -265,6 +268,9 @@ _ADDED_COLUMNS: dict[str, tuple[tuple[str, str], ...]] = {
     "semantic_memory": (
         ("uses", "INTEGER NOT NULL DEFAULT 0"),
         ("wins", "INTEGER NOT NULL DEFAULT 0"),
+        ("retired_at", "REAL NOT NULL DEFAULT 0"),
+        ("retire_reason", "TEXT NOT NULL DEFAULT ''"),
+        ("retire_evidence", "TEXT NOT NULL DEFAULT ''"),
     ),
     "semantic_memory_uses": (
         ("lane", "TEXT NOT NULL DEFAULT ''"),
@@ -341,7 +347,8 @@ def _search_in_scope(
     conn = _connect(db_path)
     try:
         rows = conn.execute(
-            "SELECT id, text, embedding FROM semantic_memory WHERE scope = ?",
+            "SELECT id, text, embedding FROM semantic_memory "
+            "WHERE scope = ? AND retired_at = 0",
             (scope,),
         ).fetchall()
     finally:
@@ -656,7 +663,7 @@ def search(
     try:
         rows = conn.execute(
             "SELECT id, text, embedding, uses, wins "
-            "FROM semantic_memory WHERE scope = ?",
+            "FROM semantic_memory WHERE scope = ? AND retired_at = 0",
             (scope,),
         ).fetchall()
         # The N in UCB1's ln(N) is the scope's total retrieval count, not the
@@ -761,11 +768,12 @@ def rank_with_prior(
         placeholders = ",".join("?" * len(wanted))
         rows = conn.execute(
             f"SELECT id, text, uses, wins FROM semantic_memory "
-            f"WHERE scope = ? AND id IN ({placeholders})",
+            f"WHERE scope = ? AND id IN ({placeholders}) AND retired_at = 0",
             (scope, *wanted),
         ).fetchall()
         n_total = int(conn.execute(
-            "SELECT COALESCE(SUM(uses), 0) FROM semantic_memory WHERE scope = ?",
+            "SELECT COALESCE(SUM(uses), 0) FROM semantic_memory "
+            "WHERE scope = ? AND retired_at = 0",
             (scope,),
         ).fetchone()[0] or 0)
     finally:

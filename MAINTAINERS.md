@@ -7,7 +7,7 @@ This file lists current and former maintainers of mini-ork. See
 
 | Name | GitHub | Role | Areas of focus |
 |------|--------|------|----------------|
-| _Project lead_ | _replace-with-github-handle_ | Lead maintainer | Architecture, releases, framework primitives |
+| Amir Khakshour | [@amirkhakshour](https://github.com/amirkhakshour) | Lead maintainer | Architecture, releases, framework primitives |
 
 ## Reviewers
 
@@ -22,8 +22,9 @@ _None yet._
 
 ## Contact
 
-For maintenance-related questions, open a [GitHub Discussion](#) (link will
-appear once Discussions is enabled on the repository) or file a
-[`question` issue](.github/ISSUE_TEMPLATE/).
-
-For security issues, see [SECURITY.md](./SECURITY.md).
+- **Questions and proposals** — open a
+  [GitHub Discussion](https://github.com/SourceShift/mini-ork/discussions).
+- **Bugs and feature requests** — file an issue from
+  [`.github/ISSUE_TEMPLATE/`](.github/ISSUE_TEMPLATE/).
+- **Security issues** — do **not** open a public issue; see
+  [SECURITY.md](./SECURITY.md).

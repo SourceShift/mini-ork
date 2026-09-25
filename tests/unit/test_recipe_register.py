@@ -1,8 +1,6 @@
 """Contracts for ``mini_ork.cli.recipe_register.load_recipe_register``.
 
-Mirrors the loader precedent at ``bin/mini-ork:_bootstrap_install`` and the
-five Definition-of-Done cases from
-``kickoffs/book-goal-loop/u1-recipe-register-loader.md``.
+Mirrors the loader precedent at ``bin/mini-ork:_bootstrap_install``.
 """
 from __future__ import annotations
 

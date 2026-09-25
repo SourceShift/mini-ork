@@ -27,6 +27,7 @@ from mini_ork.context import (
     publish_env,
     run_context_scope,
 )
+from mini_ork.observability.node_events import _now_ms, mo_node_end, mo_node_start
 from mini_ork.workflow.store import make_artifact_store
 
 
@@ -60,6 +61,7 @@ _REVIEW_REVISE = _ExecuteMembership("_REVIEW_REVISE")
 _assemble_reviewer_inputs = _execute_delegate("_assemble_reviewer_inputs")
 _assert_lane_capability = _execute_delegate("_assert_lane_capability")
 _capture_pre_impl_baseline = _execute_delegate("_capture_pre_impl_baseline")
+_capture_pre_impl_fixture = _execute_delegate("_capture_pre_impl_fixture")
 _extract_verdict = _execute_delegate("_extract_verdict")
 _harvest_self_migrate_artifacts = _execute_delegate("_harvest_self_migrate_artifacts")
 _intervention_gate_check = _execute_delegate("_intervention_gate_check")
@@ -174,6 +176,13 @@ def dispatch_node(fields, *, root, run_dir, plan_path, task_class, db, run_id,
     # after the fact.
     _route_prov = last_route_provenance()
 
+    # Node lifecycle (restored feed): one node_start before dispatch and one
+    # node_end at the trace() completion seam. The start map is LOCAL to this
+    # dispatch so a pool child that re-enters the path (via
+    # _bootstrap_recipe_register) still emits exactly one pair per node, never
+    # one per process.
+    node_start_ms: dict[str, int] = {}
+
     # Bind the resolved lane into every trace() call so agent_version_id is stamped
     # (bash passes the shell var dispatch_lane into _trace_write_node_rich's payload).
     def trace(node_id, status, node_type, output_file="", verdict="", finish_reason=""):
@@ -182,11 +191,21 @@ def dispatch_node(fields, *, root, run_dir, plan_path, task_class, db, run_id,
                     route_source=_route_prov.get("route_source", ""),
                     route_explore=bool(_route_prov.get("route_explore")),
                     route_score=_route_prov.get("route_score"),
-                    route_margin=_route_prov.get("route_margin"))
+                    route_margin=_route_prov.get("route_margin"),
+                    predicted_error=_route_prov.get("predicted_error"))
         # F4: publish the durable checkpoint at the SAME single seam as the
         # trace write. The wrapper unifies node-completion side effects so
         # E2's recovery code can rely on every success also having a row.
         _base_checkpoint(node_id, status, node_type, output_file)
+        # Node-end at the same seam: duration from the recorded start, else 0
+        # when no start was recorded (early-return path) — a node_end without a
+        # node_start is the reader's "done/failed" signal and beats silence.
+        duration_ms = 0
+        if node_id in node_start_ms:
+            duration_ms = max(0, _now_ms() - node_start_ms.pop(node_id))
+        mo_node_end(run_id, node_id, node_type, duration_ms,
+                    verdict=verdict, artifact_path=output_file,
+                    finish_reason=finish_reason, db=db)
     # Resolve this run's artifact root from its STABLE identity (run_id) via the
     # artifact store — NOT from an ambient MINI_ORK_RUN_DIR. A long-lived worker
     # can leak that env var and split one run across two directories (producer
@@ -382,7 +401,21 @@ def dispatch_node(fields, *, root, run_dir, plan_path, task_class, db, run_id,
     handler = NODE_HANDLER_REGISTRY.get(node_type)
     if handler is None:
         return 0, "done"
-    return handler(ctx)
+    # Emit node_start immediately before the handler runs, reusing the already
+    # resolved ``lane`` (never re-resolve), and record the start time so the
+    # matching node_end can carry a duration.
+    mo_node_start(run_id, node_id, node_type, model_lane=lane, db=db)
+    node_start_ms[node_id] = _now_ms()
+    rc, finish_reason = handler(ctx)
+    # Handlers that never call trace() (verifier/publisher/rollback/eval) must
+    # still close their node — an orphaned node_start renders the node
+    # permanently "running" in the DAG. trace() pops the start-map entry, so
+    # this fires only for the handlers that bypassed the trace seam.
+    if node_id in node_start_ms:
+        node_start_ms.pop(node_id, None)
+        mo_node_end(run_id, node_id, node_type, 0,
+                    finish_reason=finish_reason, db=db)
+    return rc, finish_reason
 
 
 # ── Node-type handlers (SOLID M3, OCP) ───────────────────────────────────────
@@ -753,6 +786,7 @@ def _handle_implementer(ctx: NodeDispatch):
         )
     else:
         _write_implementer_summary(ctx.run_dir_eff, target, impl_log)
+        _capture_pre_impl_fixture(ctx.run_dir_eff, target)
     if not ctx.publish_declared_outputs():
         ctx.trace(ctx.node_id, "failure", "implementer", impl_log, "", "artifact_contract")
         return 1, "artifact_contract"

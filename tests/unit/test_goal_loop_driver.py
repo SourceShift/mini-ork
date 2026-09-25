@@ -352,6 +352,140 @@ def test_default_run_wave_cost_delta_clamps_nonpositive(tmp_path, monkeypatch):
     assert payload["cost_usd"] == 0.0
 
 
+# ── 6b. wave timeout — a hung wave must not stall the driver forever ──────
+
+
+def _wave_env(tmp_path, monkeypatch):
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    monkeypatch.setenv("MINI_ORK_RUN_DIR", str(run_dir))
+    monkeypatch.setenv("MO_GOAL_WAVE_KICKOFF", str(tmp_path / "wave.md"))
+    monkeypatch.setenv("MINI_ORK_ROOT", str(tmp_path))
+    return run_dir
+
+
+def test_default_run_wave_timeout_records_a_failed_wave(tmp_path, monkeypatch):
+    """A wave that never returns must be reaped and folded as a FAILED wave,
+    not propagate a TimeoutExpired out of the driver. Live stall 2026-09-20: the
+    wave wrote its outputs and then blocked forever on a lock inside a generator,
+    so ``subprocess.run`` sat on its pipes with no bound and the whole loop
+    stopped until the child was killed by hand."""
+    _wave_env(tmp_path, monkeypatch)
+
+    def fake_run(cmd, **kwargs):
+        raise _DRIVE.subprocess.TimeoutExpired(cmd=cmd, timeout=kwargs.get("timeout"))
+
+    monkeypatch.setattr(_DRIVE.subprocess, "run", fake_run)
+
+    payload = _default_run_wave_fn(4, set())  # must NOT raise
+
+    assert payload["timed_out"] is True
+    assert payload["exit_code"] == -1
+    assert payload["verdict"] == "fail"
+    assert payload["wave"] == 4
+
+
+def test_default_run_wave_honors_timeout_env_override(tmp_path, monkeypatch):
+    """``MO_GOAL_WAVE_TIMEOUT_SECONDS`` sets the bound handed to subprocess.run."""
+    _wave_env(tmp_path, monkeypatch)
+    monkeypatch.setenv("MO_GOAL_WAVE_TIMEOUT_SECONDS", "7")
+    captured: dict[str, object] = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["timeout"] = kwargs.get("timeout")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(_DRIVE.subprocess, "run", fake_run)
+
+    payload = _default_run_wave_fn(1, set())
+
+    assert captured["timeout"] == 7.0
+    assert payload["timed_out"] is False
+
+
+def test_default_run_wave_defaults_to_a_5400s_ceiling(tmp_path, monkeypatch):
+    """Unset env → the 90-minute ceiling, matching the hatchet executionTimeout."""
+    _wave_env(tmp_path, monkeypatch)
+    monkeypatch.delenv("MO_GOAL_WAVE_TIMEOUT_SECONDS", raising=False)
+    captured: dict[str, object] = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["timeout"] = kwargs.get("timeout")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(_DRIVE.subprocess, "run", fake_run)
+
+    _default_run_wave_fn(1, set())
+
+    assert captured["timeout"] == 5400.0
+
+
+def test_default_run_wave_normal_exit_is_not_timed_out(tmp_path, monkeypatch):
+    """A wave that exits normally keeps its real exit code and timed_out=False."""
+    _wave_env(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        _DRIVE.subprocess, "run",
+        lambda cmd, **kw: SimpleNamespace(returncode=3, stdout="", stderr=""),
+    )
+
+    payload = _default_run_wave_fn(1, set())
+
+    assert payload["timed_out"] is False
+    assert payload["exit_code"] == 3
+
+
+def test_default_run_wave_timeout_marker_survives_a_panel_verdict(tmp_path, monkeypatch):
+    """panel-verdict.json is merged with ``payload.update`` — it must not be able
+    to clobber the timeout marker the driver needs to see. A stale panel file
+    carrying ``timed_out: false`` cannot mask a wave that actually timed out."""
+    run_dir = _wave_env(tmp_path, monkeypatch)
+    (run_dir / "panel-verdict.json").write_text(
+        '{"verdict": "fail", "timed_out": false, "exit_code": 0}', encoding="utf-8",
+    )
+
+    def fake_run(cmd, **kwargs):
+        raise _DRIVE.subprocess.TimeoutExpired(cmd=cmd, timeout=kwargs.get("timeout"))
+
+    monkeypatch.setattr(_DRIVE.subprocess, "run", fake_run)
+
+    payload = _default_run_wave_fn(2, set())
+
+    assert payload["timed_out"] is True
+    assert payload["exit_code"] == -1
+
+
+def test_driver_advances_past_a_timed_out_wave(tmp_path, monkeypatch):
+    """End-to-end: wave 1 times out, the loop still runs wave 2. This is the
+    regression the timeout exists to prevent — before it, the driver blocked on
+    the hung wave's pipes and no later wave ever ran."""
+    _wave_env(tmp_path, monkeypatch)
+    waves: list[int] = []
+
+    def fake_run(cmd, **kwargs):
+        waves.append(len(waves) + 1)
+        if len(waves) == 1:
+            raise _DRIVE.subprocess.TimeoutExpired(cmd=cmd, timeout=kwargs.get("timeout"))
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(_DRIVE.subprocess, "run", fake_run)
+
+    verdict = drive(
+        goal_id="g1",
+        target_cwd=str(tmp_path),
+        units_cmd="echo u1",
+        predicate_cmd="echo ok",
+        child_recipe="code-fix",
+        max_waves=2,
+        budget_total_usd=100.0,
+        run_wave_fn=_default_run_wave_fn,
+        cost_fn=lambda: 0.0,
+        state_dir=tmp_path / "state",
+    )
+
+    assert len(waves) == 2  # wave 2 ran despite wave 1's timeout
+    assert verdict["waves"] == 2
+
+
 # ── 7-9. U4c per-unit kickoff templating ────────────────────────────────
 
 

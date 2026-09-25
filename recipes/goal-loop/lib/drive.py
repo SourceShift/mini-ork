@@ -331,10 +331,31 @@ def _default_run_wave_fn(wave_no: int, quarantined: set[str]) -> dict[str, Any]:
     # wave reading $0 — which blinds the autoraise predictor (never sees a FUNDED
     # wave → never stops) and _projected_wave_cost. Snapshot before/after instead.
     cost_before = _default_cost_fn()
-    proc = subprocess.run(
-        [cli, "run", "goal-loop", kickoff],
-        check=False, capture_output=True, text=True, env=wave_env,
-    )
+    # The wave is a long-lived subprocess with no other bound, and it can finish
+    # its work and then hang in teardown: observed 2026-09-20, a wave wrote
+    # sweep-result.json and then blocked forever acquiring a lock inside a
+    # generator, so ``subprocess.run`` sat on its pipes and the driver never
+    # advanced to another wave — the whole loop stalled ~47 min until the child
+    # was killed by hand. Bound it so a hung wave is reaped and folded as a
+    # FAILED wave, letting the loop keep going. On POSIX ``subprocess.run``'s
+    # timeout SIGKILLs and ``waitpid``s the direct child (no pipe drain, so a
+    # grandchild holding the write end cannot re-block the driver here) — but
+    # it does NOT reap the wave's own descendants, which may outlive the wave.
+    wave_timeout = float(os.environ.get("MO_GOAL_WAVE_TIMEOUT_SECONDS") or 5400)
+    try:
+        proc = subprocess.run(
+            [cli, "run", "goal-loop", kickoff],
+            check=False, capture_output=True, text=True, env=wave_env,
+            timeout=wave_timeout,
+        )
+        wave_exit = proc.returncode
+        wave_timed_out = False
+    except subprocess.TimeoutExpired:
+        # The child is already killed and reaped by ``subprocess.run``, so the
+        # run-local outputs read below are whatever the wave managed to write
+        # before it hung — a partial wave, scored as a failed one.
+        wave_exit = -1
+        wave_timed_out = True
     cost_after = _default_cost_fn()
     panel_path = os.path.join(run_dir, "panel-verdict.json")
     payload: dict[str, Any] = {
@@ -342,7 +363,8 @@ def _default_run_wave_fn(wave_no: int, quarantined: set[str]) -> dict[str, Any]:
         "verdict": "fail",
         "failing_units": [],
         "total_units": 0,
-        "exit_code": proc.returncode,
+        "exit_code": wave_exit,
+        "timed_out": wave_timed_out,
     }
     if os.path.isfile(panel_path):
         try:
@@ -361,6 +383,11 @@ def _default_run_wave_fn(wave_no: int, quarantined: set[str]) -> dict[str, Any]:
             if isinstance(gs, dict):
                 payload["unit_reasons"] = {
                     str(uid): str(v.get("reason", ""))
+                    for uid, v in gs.items()
+                    if isinstance(v, dict)
+                }
+                payload["unit_reproduced"] = {
+                    str(uid): bool(v.get("reproduced", True))
                     for uid, v in gs.items()
                     if isinstance(v, dict)
                 }
@@ -430,7 +457,8 @@ def _default_run_wave_fn(wave_no: int, quarantined: set[str]) -> dict[str, Any]:
     # the predictor must read. A funded wave's delta is unambiguously positive.
     wave_cost = cost_after - cost_before
     payload["cost_usd"] = wave_cost if wave_cost > 0 else 0.0
-    payload["exit_code"] = proc.returncode
+    payload["exit_code"] = wave_exit
+    payload["timed_out"] = wave_timed_out
     payload["quarantined"] = sorted(quarantined)
     return payload
 
@@ -789,6 +817,11 @@ def drive(
             if isinstance(raw_reasons, dict)
             else None
         )
+        raw_reproduced = verdict_dict.get("unit_reproduced")
+        unit_reproduced = (
+            {str(k): bool(v) for k, v in raw_reproduced.items()}
+            if isinstance(raw_reproduced, dict) else None
+        )
         raw_attempted = verdict_dict.get("attempted")
         attempted = (
             [str(u) for u in raw_attempted]
@@ -908,6 +941,24 @@ def drive(
                         )
                     except OSError:
                         pass
+            save_state(state, resolved_state_dir)
+            _write_final_verdict(resolved_state_dir, payload)
+            return payload
+
+        # 1b. nothing_to_fix — every still-failing unit is a confirmed-fail we
+        # could NOT reproduce. There is no defect to patch, so no wave can move
+        # this. `unit_reproduced.get(u, True)` defaults to True so a unit with
+        # no recorded flag (legacy artifact) can never trigger the stop — it is
+        # conservative in the direction that preserves today's behaviour.
+        if failing_after and unit_reproduced is not None and all(
+            not unit_reproduced.get(u, True) for u in failing_after
+        ):
+            payload = {
+                "stop": "nothing_to_fix",
+                "waves": wave_no,
+                "failing_units": failing_after,
+                "quarantined_units": sorted(quarantined),
+            }
             save_state(state, resolved_state_dir)
             _write_final_verdict(resolved_state_dir, payload)
             return payload

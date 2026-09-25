@@ -1447,6 +1447,8 @@ _TIER4_LENS_FILES = {
     "tier4_glm": "tier4-glm.md", "tier4_kimi": "tier4-kimi.md",
     "tier4_codex": "tier4-codex.md", "tier4_minimax": "tier4-minimax.md",
 }
+_PRE_IMPL_FIXTURE_DIR = "pre-impl-fixture"
+_PRE_IMPL_MANIFEST = "MANIFEST.json"
 
 
 def _researcher_output_file(run_dir, recipe, node_id):
@@ -1510,6 +1512,11 @@ def _capture_pre_impl_baseline(run_dir):
             os.makedirs(run_dir, exist_ok=True)
             with open(ref_path, "w") as fh:
                 fh.write(ref + "\n")
+            run_id = os.path.basename(run_dir.rstrip(os.sep))
+            subprocess.run(
+                ["git", "-C", cwd, "update-ref", f"refs/mo/pre-impl/{run_id}", ref],
+                capture_output=True,
+            )
     except Exception:
         pass
 
@@ -1639,6 +1646,100 @@ def _write_implementer_summary(run_dir, target, impl_log):
     }
     with open(os.path.join(run_dir, "implementer-summary.json"), "w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2)
+        handle.write("\n")
+
+
+def _capture_pre_impl_fixture(run_dir, target):
+    """Snapshot a minimal, git-sourced fixture of the implementer's pre-edit
+    state so a later probe harvest can vendor a small, self-contained
+    reproduction (the shape ``recipes/code-fix/probes/fixtures/<stem>/``
+    expects). Nothing produces that shape today.
+
+    Every byte in the fixture comes from git (``git show <baseline>:<relpath>``)
+    or from an existing file under run_dir — never model output. A
+    model-authored fixture is a model-authored test, the exact failure this
+    capture exists to prevent. Idempotent: the first capture wins (a revision
+    loop can call this more than once per run).
+    """
+    if not run_dir or not target:
+        return
+    manifest_path = os.path.join(run_dir, _PRE_IMPL_FIXTURE_DIR, _PRE_IMPL_MANIFEST)
+    if os.path.isfile(manifest_path):
+        return
+    ref_path = os.path.join(run_dir, "pre-implementer-ref")
+    if not os.path.isfile(ref_path):
+        return
+    try:
+        baseline = open(ref_path, encoding="utf-8").read().strip()
+    except OSError:
+        baseline = ""
+    if not baseline:
+        return
+
+    args = ["git", "-C", target, "diff", "--name-only"]
+    if baseline:
+        args.append(baseline)
+    rels: list[str] = []
+    try:
+        for argv in (args, ["git", "-C", target, "ls-files", "--others", "--exclude-standard"]):
+            proc = subprocess.run(argv, capture_output=True, text=True, timeout=15)
+            if proc.returncode == 0:
+                rels.extend(line.strip() for line in proc.stdout.splitlines() if line.strip())
+    except Exception:
+        rels = []
+    changed: list[str] = []
+    seen: set[str] = set()
+    for rel in rels:
+        if rel not in seen:
+            seen.add(rel)
+            changed.append(rel)
+
+    profile_path = os.path.join(run_dir, "run_profile.json")
+    task_class = ""
+    verification_command: list = []
+    kickoff_path = ""
+    if os.path.isfile(profile_path):
+        try:
+            with open(profile_path, encoding="utf-8") as handle:
+                profile = json.load(handle)
+            if isinstance(profile, dict):
+                task_class = profile.get("task_class") or ""
+                vc = profile.get("verification_command")
+                if isinstance(vc, list):
+                    verification_command = vc
+                kickoff_path = profile.get("kickoff_path") or ""
+        except Exception:
+            pass
+
+    files_dir = os.path.join(run_dir, _PRE_IMPL_FIXTURE_DIR, "files")
+    created_by_run: list[str] = []
+    for rel in changed:
+        proc = subprocess.run(
+            ["git", "-C", target, "show", f"{baseline}:{rel}"],
+            capture_output=True,
+        )
+        if proc.returncode == 0:
+            dst = os.path.join(files_dir, rel)
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            with open(dst, "wb") as handle:
+                handle.write(proc.stdout)
+        else:
+            created_by_run.append(rel)
+
+    manifest = {
+        "run_id": os.path.basename(run_dir.rstrip(os.sep)),
+        "task_class": task_class,
+        "target_repo": target,
+        "baseline_ref": baseline,
+        "changed_files": changed,
+        "verification_command": verification_command,
+        "kickoff_path": kickoff_path,
+        "created_by_run": created_by_run,
+        "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    os.makedirs(os.path.dirname(manifest_path), exist_ok=True)
+    with open(manifest_path, "w", encoding="utf-8") as handle:
+        json.dump(manifest, handle, indent=2)
         handle.write("\n")
 
 
@@ -1983,12 +2084,12 @@ def _make_trace_fn(task_class, db, run_id):
     lane_router_recompute_advantages has real signal to learn from.
     Signature matches dispatch_node's `trace(node_id, status, node_type, output_file,
     verdict, finish_reason, lane, route_source, route_explore, route_score,
-    route_margin)`."""
+    route_margin, predicted_error)`."""
     from mini_ork import trace_store  # noqa: PLC0415
 
     def _tf(node_id, status, node_type, output_file="", verdict="", finish_reason="",
             lane="", route_source="", route_explore=False, route_score=None,
-            route_margin=None):
+            route_margin=None, predicted_error=None):
         extra = {
             "trace_id": f"tr-{node_type}-{node_id}-{uuid.uuid4().hex[:8]}",
             "run_id": run_id,
@@ -2019,6 +2120,11 @@ def _make_trace_fn(task_class, db, run_id):
             # missing margin just means "uncalibratable row", not a broken write.
             if route_margin is not None:
                 extra["route_margin"] = float(route_margin)
+            # The calibrated error probability behind an escalation decision.
+            # Persisted so the backtest can check the map against the outcome;
+            # a missing prediction means "uncalibratable row", not a broken write.
+            if predicted_error is not None:
+                extra["predicted_error"] = float(predicted_error)
         # Implementer code_region must reflect the TARGET repo's edited source,
         # not the .mini-ork run-log path. Seed files_written from git-visible
         # target-repo changes FIRST so infer_trace_code_region resolves the

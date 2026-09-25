@@ -80,7 +80,10 @@ jobs:
       - name: Install package + test deps
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[yaml]"
+          # `acp` carries the Agent Client Protocol wire types that
+          # tests/unit/test_acp_agent_py.py imports at module scope; without
+          # the extra the whole shard dies at collection, not on an assertion.
+          pip install -e ".[yaml,acp]"
           pip install pytest fastapi uvicorn httpx2
 
       # The web smoke suite points the FastAPI route handlers at a real
