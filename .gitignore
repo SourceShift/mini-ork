@@ -38,6 +38,13 @@ node_modules/
 # Local kickoffs are user-authored, session-specific, and may name internal
 # projects or customers. Keep them out of the OSS tree.
 .mini-ork/kickoffs/
+# The book goal-loop trees are the same kind of material — planning notes,
+# launch wrenches, per-wave kickoffs — and origin/main carries neither. Their
+# binding/ dirs stay tracked because the unit tests load those scripts by path.
+/kickoffs/book-goal-loop/*
+!/kickoffs/book-goal-loop/binding
+/kickoffs/book-perf-goal-loop/*
+!/kickoffs/book-perf-goal-loop/binding
 
 # Local build / cache artifacts
 .pnpm-store/
