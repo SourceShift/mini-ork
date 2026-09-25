@@ -260,7 +260,12 @@ def _check_agents_yaml(root: str, home: str, findings: Findings) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 def _check_provider_secrets(home: str, findings: Findings) -> None:
     import yaml
-    providers_yaml = os.path.join(home, "config", "providers.yaml")
+    # Honour the override the dispatcher already supports (dispatch/providers.py),
+    # or this check reports on a different file than the one lanes resolve from.
+    providers_yaml = (
+        os.environ.get("MINI_ORK_PROVIDERS")
+        or os.path.join(home, "config", "providers.yaml")
+    )
     if not os.path.isfile(providers_yaml):
         return
     try:

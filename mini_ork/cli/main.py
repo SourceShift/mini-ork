@@ -125,6 +125,8 @@ Provider credentials:
 Environment:
   MINI_ORK_HOME   project home dir  (default: .mini-ork/)
   MINI_ORK_DB     sqlite3 state db  (default: $MINI_ORK_HOME/state.db)
+  MINI_ORK_PROVIDERS  path to providers.yaml, overriding $MINI_ORK_HOME/config/
+  MINI_ORK_AGENTS     path to agents.yaml,    overriding $MINI_ORK_HOME/config/
   MINI_ORK_DRY_RUN  set to 1 for dry-run mode on all subcommands
 """
 
@@ -551,7 +553,11 @@ def _run_lifecycle_impl(argv, root, sink) -> int:
         return 0
 
     # ── profile ──
-    agents_path = os.path.join(home, "config", "agents.yaml")
+    # MINI_ORK_AGENTS mirrors MINI_ORK_PROVIDERS (dispatch/providers.py): a path
+    # to the consumer's own lane policy, so a vendored checkout need not be
+    # edited — and therefore reverted on every re-vendor — to be configured.
+    agents_path = os.environ.get("MINI_ORK_AGENTS") or os.path.join(
+        home, "config", "agents.yaml")
     data = gen_profile(kickoff, root, recipe, task_class, profile_path, agents_path,
                        recipe_base=rbase)
     sys.stdout.write(f"profile_path={profile_path}\n")
