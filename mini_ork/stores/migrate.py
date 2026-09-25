@@ -46,11 +46,107 @@ def checksum(path: str | os.PathLike) -> str:
     return h.hexdigest()
 
 
+def _canonical_sql(text: str) -> str:
+    """Comment-insensitive, literal-preserving canonical form.
+
+    Strips ``--`` line comments and ``/* ... */`` block comments ONLY outside
+    single-quoted string literals (SQL ``''`` escape respected, so a semantic
+    edit inside a string can never be hidden as a comment). Outside string
+    literals, whitespace runs collapse to a single space between tokens;
+    inside a single-quoted literal, every byte — including whitespace — flows
+    through verbatim, so a payload like ``VALUES ('a  b')`` produces a
+    different canonical form from ``VALUES ('a b')``.
+
+    Dot-command lines (any line starting with ``.`` followed by a word char —
+    ``.read``, ``.once``, ``.shell``, …) reach the canonical form by the
+    same walk: their single-quoted payloads survive verbatim because the
+    in-walk rule already preserves literal contents.
+    """
+    out: list[str] = []
+    i, n = 0, len(text)
+    in_string = False
+    # True iff we have just consumed an outside-string whitespace run and
+    # have not yet emitted the separator that bridges it to the next
+    # outside-string token. Reset on every non-whitespace outside-string
+    # emit (the separator — if needed — is emitted right before the token).
+    need_separator = False
+    while i < n:
+        c = text[i]
+        if in_string:
+            out.append(c)
+            if c == "'":
+                # SQL '' escape: skip the second quote, stay in string.
+                if i + 1 < n and text[i + 1] == "'":
+                    out.append("'")
+                    i += 2
+                    continue
+                in_string = False
+            i += 1
+            continue
+        if c == "'":
+            if need_separator:
+                out.append(" ")
+            out.append(c)
+            in_string = True
+            need_separator = False
+            i += 1
+            continue
+        # -- line comment: skip to (and consume) the newline.
+        if c == "-" and i + 1 < n and text[i + 1] == "-":
+            j = text.find("\n", i)
+            if j == -1:
+                break
+            i = j  # newline is whitespace; the next iteration skips it.
+            need_separator = True
+            continue
+        # /* block comment */
+        if c == "/" and i + 1 < n and text[i + 1] == "*":
+            j = text.find("*/", i + 2)
+            if j == -1:
+                break
+            i = j + 2
+            need_separator = True
+            continue
+        # Whitespace outside string: collapse the run to nothing; the next
+        # outside-string token will insert a single space separator.
+        if c.isspace():
+            need_separator = True
+            i += 1
+            continue
+        # Non-whitespace outside string: emit, with a single leading space
+        # iff a whitespace run preceded us in the original text.
+        if need_separator:
+            out.append(" ")
+        out.append(c)
+        need_separator = False
+        i += 1
+    return "".join(out)
+
+
+def canonical_checksum(path: str | os.PathLike) -> str:
+    """sha256 hex of the comment-insensitive canonical form of a migration."""
+    return hashlib.sha256(_canonical_sql(Path(path).read_text(encoding="utf-8"))
+                          .encode("utf-8")).hexdigest()
+
+
 def is_legacy_checksum(s: str) -> bool:
     """True when s is NOT a real sha256 (non-hex char, empty, or wrong length)."""
     if not s or re.search(r"[^0-9a-f]", s):
         return True
     return len(s) != 64
+
+
+def _checksum_clean(stored: str, raw_sum: str, canon_sum: str) -> bool:
+    """True when ``stored`` matches the file under EITHER checksum scheme.
+
+    The migration guard compares two versions of an applied file; this helper
+    is the single source of truth used by ``migrate_apply``,
+    ``migrate_verify``, and ``migrate_status`` so the three stay in lockstep.
+    A stored row counts as clean when it equals the canonical (new-scheme)
+    checksum OR the raw (legacy) sha256 — legacy placeholders are handled by
+    the separate ``is_legacy_checksum`` rehash branch.
+    """
+    return stored == canon_sum or stored == raw_sum
 
 
 def _db(db: str | None) -> str:
@@ -285,26 +381,46 @@ def migrate_apply(migrations_dir: str, dry_run: bool = False, db: str | None = N
     for f in sorted(Path(migrations_dir).glob("*.sql")):
         filename = f.name
         sum_hex = checksum(f)
+        canon_sum = canonical_checksum(f)
         row = con.execute(
             "SELECT COALESCE(checksum,'') FROM schema_migrations WHERE filename=?",
             (filename,)).fetchone()
         applied = row is not None
         if applied:
             applied_sum = row[0]
-            if applied_sum == sum_hex:
+            if _checksum_clean(applied_sum, sum_hex, canon_sum):
+                # Clean — but if the stored row still uses the raw scheme,
+                # re-encode it to canonical so future comment-only rewords
+                # don't have to clear the same bar twice.
+                if applied_sum != canon_sum and not dry_run:
+                    con.execute(
+                        "UPDATE schema_migrations SET checksum=?, "
+                        "mini_ork_version=COALESCE(mini_ork_version,?) WHERE filename=?",
+                        (canon_sum, ver, filename))
+                    con.commit()
                 continue
-            elif is_legacy_checksum(applied_sum):
+            if is_legacy_checksum(applied_sum):
                 if not dry_run:
                     con.execute(
                         "UPDATE schema_migrations SET checksum=?, "
                         "mini_ork_version=COALESCE(mini_ork_version,?) WHERE filename=?",
-                        (sum_hex, ver, filename))
+                        (canon_sum, ver, filename))
                     con.commit()
-                out.append(f"  [rehash]  {filename} (legacy checksum → real sha256)")
+                out.append(f"  [rehash]  {filename} (legacy checksum → canonical sha256)")
             elif os.environ.get("MO_MIGRATE_ALLOW_DRIFT", "0") == "1":
+                if not dry_run:
+                    # One-time re-baseline: rewrite the drifted row to the
+                    # canonical checksum so the next run no longer needs
+                    # MO_MIGRATE_ALLOW_DRIFT.
+                    con.execute(
+                        "UPDATE schema_migrations SET checksum=?, "
+                        "mini_ork_version=COALESCE(mini_ork_version,?) WHERE filename=?",
+                        (canon_sum, ver, filename))
+                    con.commit()
                 if err_out is not None:
                     err_out.append(f"  [warn]    {filename} checksum drift"
-                                   " (allowed by MO_MIGRATE_ALLOW_DRIFT)")
+                                   " (allowed by MO_MIGRATE_ALLOW_DRIFT; checksum"
+                                   " re-recorded to canonical)")
             else:
                 if err_out is not None:
                     err_out.append(f"  [FAIL]    {filename} was edited after being"
@@ -318,7 +434,7 @@ def migrate_apply(migrations_dir: str, dry_run: bool = False, db: str | None = N
             out.append(f"  [pending] {filename}")
             continue
         out.append(f"  [apply]   {filename}")
-        if _apply_one(db, str(f), filename, sum_hex, ver, root=root):
+        if _apply_one(db, str(f), filename, canon_sum, ver, root=root):
             out.append(f"  [ok]      {filename}")
         else:
             if err_out is not None:
@@ -343,7 +459,12 @@ def migrate_status(migrations_dir: str, db: str | None = None) -> tuple[int, int
         if row is None:
             pending += 1
         else:
-            if row[0] != checksum(f) and not is_legacy_checksum(row[0]):
+            applied_sum = row[0]
+            if is_legacy_checksum(applied_sum):
+                continue
+            sum_hex = checksum(f)
+            canon_sum = canonical_checksum(f)
+            if not _checksum_clean(applied_sum, sum_hex, canon_sum):
                 drifted += 1
     con.close()
     return total - pending, pending, drifted, total
@@ -360,7 +481,12 @@ def migrate_verify(migrations_dir: str, db: str | None = None) -> int:
             (f.name,)).fetchone()
         if row is None:
             continue
-        if row[0] != checksum(f) and not is_legacy_checksum(row[0]):
+        applied_sum = row[0]
+        if is_legacy_checksum(applied_sum):
+            continue
+        sum_hex = checksum(f)
+        canon_sum = canonical_checksum(f)
+        if not _checksum_clean(applied_sum, sum_hex, canon_sum):
             rc = 1
     con.close()
     return rc
