@@ -114,7 +114,7 @@ def _eval_coalition(
         # native port lives in observability/topology_metrics.py.
         rho = topology_metrics.measure_rho(db_path, panel_run_id)
         root = mini_ork_root or os.environ.get("MINI_ORK_ROOT", "")
-        agents_yaml = (
+        agents_yaml = os.environ.get("MINI_ORK_AGENTS") or (
             os.path.join(root, "config", "agents.yaml") if root else None
         )
         payload, _rc = coalition_gate.check_panel_coalition(

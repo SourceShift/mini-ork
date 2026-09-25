@@ -191,6 +191,31 @@ def _write_workflow_yaml(path: Path, *, nodes: list[dict], edges: list[dict]) ->
 
 # ─── scenario 1: linear A→B→C, D failed ─────────────────────────────────────
 
+def _scratch_target_repo(tmp_path: Path) -> Path:
+    """A real git repo to act as the implementer's edit surface.
+
+    A ``framework-edit`` implementer that changes nothing is a *failure*
+    (``impl_no_changes``, the ground-truth harvest in
+    ``execute._harvest_framework_edit_ground_truth``), so a test that runs
+    one to completion must give it a tree it can legitimately change — and
+    must point ``MO_TARGET_CWD`` at it, or the harvest falls back to
+    whatever repo the test happens to run from.
+    """
+    repo = tmp_path / "target"
+    repo.mkdir()
+    for argv in (("init", "-q"),
+                 ("config", "user.email", "t@t"),
+                 ("config", "user.name", "t")):
+        subprocess.run(["git", "-C", str(repo), *argv],
+                       capture_output=True, check=True)
+    (repo / "seed.txt").write_text("seed\n")
+    subprocess.run(["git", "-C", str(repo), "add", "seed.txt"],
+                   capture_output=True, check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "base"],
+                   capture_output=True, check=True)
+    return repo
+
+
 def _linear_workflow(workflow_path: Path) -> None:
     # All nodes use implementer type so the dispatch path doesn't
     # gate on a missing verdict.json / reviewer-specific output.
@@ -494,6 +519,11 @@ def test_execute_loop_dispatches_only_closure(
     # researcher / implementer / reviewer paths all funnel through
     # this; assert that ONLY D is observed.
     seen: list[str] = []
+    target = _scratch_target_repo(tmp_path)
+    # monkeypatch, not os.environ: the other test-local vars below are set
+    # raw, but a leaked MO_TARGET_CWD would silently retarget some later
+    # test's ground-truth harvest at this repo.
+    monkeypatch.setenv("MO_TARGET_CWD", str(target))
 
     def fake_dispatch(task_class, node_type, prompt):
         # The LLM seam receives the prompt; we recover node_id from
@@ -501,8 +531,15 @@ def test_execute_loop_dispatches_only_closure(
         # the closure filter is the property under test, not the
         # prompt shape.
         del task_class, node_type, prompt
-        seen.append(os.environ.get("MO_NODE_ID", "?"))
-        return 0, f"fake-output-for-{os.environ.get('MO_NODE_ID', '?')}"
+        node = os.environ.get("MO_NODE_ID", "?")
+        seen.append(node)
+        # D is a framework-edit implementer, so it must actually edit the
+        # target tree — an in-place implementer writes to MO_TARGET_CWD
+        # directly, and the ground-truth harvest hard-fails the node if the
+        # tree is untouched. Node identity still comes from MO_NODE_ID, so
+        # the closure filter this test is about is unaffected.
+        (target / f"{node}-edit.txt").write_text(f"edit by {node}\n")
+        return 0, f"fake-output-for-{node}"
 
     # The planner + verifier (researcher / reviewer / etc) write to
     # disk; fake_dispatch returns text only. The execute loop's

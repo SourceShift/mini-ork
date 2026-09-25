@@ -1517,8 +1517,148 @@ def _capture_pre_impl_baseline(run_dir):
                 ["git", "-C", cwd, "update-ref", f"refs/mo/pre-impl/{run_id}", ref],
                 capture_output=True,
             )
+        # `git stash create` snapshots TRACKED state only. Record the untracked
+        # inventory too, so the ground-truth harvest can tell implementer-created
+        # files apart from pre-existing untracked dirt (a node_modules symlink,
+        # another session's scratch files).
+        unt = subprocess.run(["git", "-C", cwd, "ls-files", "--others",
+                              "--exclude-standard"],
+                             capture_output=True, text=True)
+        if unt.returncode == 0:
+            with open(os.path.join(run_dir, "pre-implementer-untracked"), "w") as fh:
+                fh.write(unt.stdout)
     except Exception:
         pass
+
+
+def _harvest_framework_edit_ground_truth(run_dir, target):
+    """framework-edit's implementer self-writes framework-edit.diff, and nothing
+    validated that artifact against reality. A hallucinating agent
+    (run-1788369968-8009-se2) emitted a corrupt diff — garbage hunk context,
+    already-landed files re-declared as new creations — AND fabricated its
+    verification claims ("git apply --check → EXIT=0"), burning the whole
+    verifier+reviewer wave before the lie surfaced.
+
+    The working tree is the only witness that cannot lie. After
+    apply_impl_output, re-harvest the REAL delta (tracked diff vs the
+    pre-implementer baseline + implementer-created untracked files) and REWRITE
+    framework-edit.diff from it: the artifact then always applies, the static
+    gate's reverse-check is trivially true, and dispatcher landing is exact.
+    If the tree is untouched, a diff-only agent is still legitimate — try
+    applying its artifact ONCE; if that also fails, fail the implementer node
+    immediately instead of five nodes later.
+
+    Returns (ok, finish_reason). ok=True with "" when the harvest succeeded or
+    the guard is inapplicable (no run_dir / not a git repo / infra error —
+    verifiers remain the downstream net for the legacy artifact in that case).
+    """
+    if not run_dir or not target:
+        return True, ""
+    try:
+        if subprocess.run(["git", "-C", target, "rev-parse", "--git-dir"],
+                          capture_output=True).returncode != 0:
+            return True, ""
+    except Exception:
+        return True, ""
+
+    baseline = ""
+    ref_path = os.path.join(run_dir, "pre-implementer-ref")
+    if os.path.isfile(ref_path):
+        try:
+            baseline = open(ref_path).read().strip()
+        except OSError:
+            baseline = ""
+    baseline_untracked = set()
+    unt_path = os.path.join(run_dir, "pre-implementer-untracked")
+    if os.path.isfile(unt_path):
+        try:
+            baseline_untracked = {
+                line for line in open(unt_path).read().splitlines() if line
+            }
+        except OSError:
+            baseline_untracked = set()
+
+    def _delta():
+        # Diff against a COMMIT-ish, never the index: agents sometimes
+        # `git add` inside the target, which would blank a plain `git diff`.
+        tracked = subprocess.run(
+            ["git", "-C", target, "diff", "--no-color", "--full-index",
+             "--binary", baseline or "HEAD"],
+            capture_output=True, text=True, timeout=300)
+        if tracked.returncode != 0:
+            return None
+        parts = [tracked.stdout] if tracked.stdout.strip() else []
+        now = subprocess.run(
+            ["git", "-C", target, "ls-files", "--others", "--exclude-standard"],
+            capture_output=True, text=True, timeout=60)
+        for rel in (now.stdout or "").splitlines():
+            rel = rel.strip()
+            if not rel or rel in baseline_untracked:
+                continue
+            if rel.startswith(".mini-ork/"):
+                continue  # run-mirror evidence, never product changes
+            if not os.path.isfile(os.path.join(target, rel)):
+                continue
+            new = subprocess.run(
+                ["git", "-C", target, "diff", "--no-color", "--binary",
+                 "--no-index", "--", "/dev/null", rel],
+                capture_output=True, text=True, timeout=60)
+            # --no-index exits 1 when files differ — that IS the new-file diff.
+            if new.returncode in (0, 1) and new.stdout.strip():
+                parts.append(new.stdout)
+        return "".join(parts)
+
+    diff_path = os.path.join(run_dir, "framework-edit.diff")
+    try:
+        delta = _delta()
+    except Exception as exc:
+        print(f"  [ground-truth] harvest error ({exc}); keeping agent artifact",
+              file=sys.stderr)
+        return True, ""
+    if delta is None:
+        print("  [ground-truth] git diff failed; keeping agent artifact",
+              file=sys.stderr)
+        return True, ""
+
+    if not delta.strip():
+        if os.path.isfile(diff_path) and os.path.getsize(diff_path) > 0:
+            applied = subprocess.run(
+                ["git", "-C", target, "apply", "--whitespace=nowarn", diff_path],
+                capture_output=True, text=True, timeout=120)
+            if applied.returncode != 0:
+                err = "; ".join((applied.stderr or "").strip().splitlines()[:4])
+                print("  [ground-truth] FAIL: tree untouched and the agent's "
+                      f"framework-edit.diff does not apply: {err}",
+                      file=sys.stderr)
+                return False, "impl_diff_unusable"
+            print("  [ground-truth] tree untouched; agent diff applied cleanly")
+            try:
+                delta = _delta() or ""
+            except Exception:
+                delta = ""
+        if not delta or not delta.strip():
+            print("  [ground-truth] FAIL: implementer produced no tree changes",
+                  file=sys.stderr)
+            return False, "impl_no_changes"
+
+    agent_diff = ""
+    if os.path.isfile(diff_path):
+        try:
+            agent_diff = open(diff_path).read()
+        except OSError:
+            agent_diff = ""
+    if agent_diff and agent_diff != delta:
+        try:
+            with open(diff_path + ".agent", "w") as fh:
+                fh.write(agent_diff)
+        except OSError:
+            pass
+    with open(diff_path, "w") as fh:
+        fh.write(delta)
+    n_files = len(re.findall(r"^diff --git ", delta, flags=re.M))
+    print(f"  [ground-truth] framework-edit.diff rewritten from tree delta "
+          f"({n_files} files)")
+    return True, ""
 
 
 def _harvest_self_migrate_artifacts(run_dir, target):
