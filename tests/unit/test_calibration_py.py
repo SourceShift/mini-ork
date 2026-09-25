@@ -112,6 +112,35 @@ def test_min_samples_env_can_only_raise(monkeypatch):
     assert cal.min_samples() == cal.DEFAULT_MIN_SAMPLES
 
 
+def test_recency_bounds_env_can_only_tighten(monkeypatch):
+    """Both recency bounds can only be tightened from the environment.
+
+    Widening either one re-admits rows from before a lane's model or prompt
+    changed, which is the drift the bounds exist to exclude. So the env can
+    shorten the window and lower the cap, and raising either is refused — the
+    same one-directional clamp ``target_error`` and ``min_samples`` use.
+    """
+    monkeypatch.delenv("MO_UCCI_WINDOW_DAYS", raising=False)
+    monkeypatch.delenv("MO_UCCI_MAX_ROWS", raising=False)
+    assert cal.window_days() == pytest.approx(cal.DEFAULT_WINDOW_DAYS)
+    assert cal.max_rows() == cal.DEFAULT_MAX_ROWS
+
+    monkeypatch.setenv("MO_UCCI_WINDOW_DAYS", "3")
+    monkeypatch.setenv("MO_UCCI_MAX_ROWS", "50")
+    assert cal.window_days() == pytest.approx(3.0)
+    assert cal.max_rows() == 50
+
+    monkeypatch.setenv("MO_UCCI_WINDOW_DAYS", "3650")
+    monkeypatch.setenv("MO_UCCI_MAX_ROWS", "1000000")
+    assert cal.window_days() == pytest.approx(cal.DEFAULT_WINDOW_DAYS)
+    assert cal.max_rows() == cal.DEFAULT_MAX_ROWS
+
+    monkeypatch.setenv("MO_UCCI_WINDOW_DAYS", "garbage")
+    monkeypatch.setenv("MO_UCCI_MAX_ROWS", "garbage")
+    assert cal.window_days() == pytest.approx(cal.DEFAULT_WINDOW_DAYS)
+    assert cal.max_rows() == cal.DEFAULT_MAX_ROWS
+
+
 # ── the escalation decision (DB-backed) ──────────────────────────────────────
 
 def _init_db(home: Path) -> str:
@@ -139,6 +168,101 @@ def db(tmp_path, monkeypatch):
     monkeypatch.delenv("MO_UCCI_TARGET_ERROR", raising=False)
     cal.clear_cache()
     return _init_db(tmp_path / "home")
+
+
+def _seed_at(db: str, lane: str, margin: float, status: str, days_ago: float) -> str:
+    """Seed one margin row whose created_at sits ``days_ago`` behind now.
+
+    Offsets are relative on purpose. A test that wrote an absolute date would
+    keep passing until the clock crossed it and then start failing in CI with
+    no code change behind it.
+    """
+    tid = trace_store.trace_write({
+        "task_class": "code-fix", "status": status, "agent_version_id": lane,
+        "objective_domain": "code-delivery", "verifier_output": {"node_type": "implementer"},
+        "route_source": "learned", "route_margin": margin,
+    }, db=db)
+    con = sqlite3.connect(db)
+    con.execute(
+        "UPDATE execution_traces SET created_at = "
+        "strftime('%Y-%m-%dT%H:%M:%fZ','now',?) WHERE trace_id = ?",
+        (f"-{days_ago} days", tid))
+    con.commit()
+    con.close()
+    return tid
+
+
+def test_rows_outside_the_window_do_not_calibrate(db, monkeypatch):
+    """Rows from before the window describe a lane that may no longer exist.
+
+    The stale rows alone would clear ``min_samples``, so excluding them has to
+    collapse the fit to an abstention rather than merely thin it — that is the
+    whole point of the window, and a fit that quietly keeps answering would
+    look identical from the outside.
+    """
+    monkeypatch.setenv("MO_UCCI_WINDOW_DAYS", "7")
+    for _ in range(cal.min_samples()):
+        _seed_at(db, "lensW", 0.5, "failure", days_ago=30)
+    assert cal.load_margin_rows(db, "code-fix", lane="lensW") == []
+    assert cal.should_escalate(db, "code-fix", 0.5, lane="lensW") == (False, None)
+
+    # A single fresh row is inside the window but far under the sample floor.
+    _seed_at(db, "lensW", 0.5, "failure", days_ago=1)
+    assert len(cal.load_margin_rows(db, "code-fix", lane="lensW")) == 1
+    assert cal.should_escalate(db, "code-fix", 0.5, lane="lensW") == (False, None)
+
+
+def test_the_cap_keeps_the_newest_rows_not_an_arbitrary_slice(db, monkeypatch):
+    """The cap must drop the oldest rows, because those are furthest from the
+    lane's current model. Which rows survive is the whole contract."""
+    monkeypatch.setenv("MO_UCCI_MAX_ROWS", "2")
+    _seed_at(db, "lensC", 0.1, "failure", days_ago=5)
+    _seed_at(db, "lensC", 0.2, "failure", days_ago=4)
+    _seed_at(db, "lensC", 0.3, "failure", days_ago=3)
+    _seed_at(db, "lensC", 0.8, "success", days_ago=2)
+    _seed_at(db, "lensC", 0.9, "success", days_ago=1)
+    rows = cal.load_margin_rows(db, "code-fix", lane="lensC")
+    assert [m for m, _ in rows] == [0.9, 0.8]
+
+
+def test_the_window_applies_to_the_pooled_slice_too(db, monkeypatch):
+    """The pooled fallback reads the same table, so a stale-only slice must not
+    calibrate through the back door when the per-lane fit abstains."""
+    monkeypatch.setenv("MO_UCCI_WINDOW_DAYS", "7")
+    for _ in range(cal.min_samples()):
+        _seed_at(db, "lensPool", 0.5, "failure", days_ago=90)
+    assert cal.calibrated_error(db, "code-fix", 0.5, lane="lensPool") is None
+
+
+def test_recent_cutoff_compares_against_a_real_created_at(db, monkeypatch):
+    """The bound must carry ``created_at``'s format or it compares wrong.
+
+    ``created_at`` is an ISO string with a ``T`` separator. SQLite's own
+    ``datetime('now','-N days')`` emits a space separator instead, which sorts
+    strictly below every T-formatted row on the same day and would admit an
+    extra day of stale rows. So the bound is built in the column's format, and
+    the boundary is pinned against real rows rather than assumed.
+    """
+    monkeypatch.setenv("MO_UCCI_WINDOW_DAYS", "1")
+    cutoff = cal.recent_cutoff()
+    assert "T" in cutoff and " " not in cutoff
+    # The same instant in the space-separated form is NOT an equivalent bound.
+    # This is the trap the format exists to avoid, stated as an assertion.
+    assert cutoff.replace("T", " ") < cutoff
+
+    con = sqlite3.connect(db)
+    con.execute(
+        "INSERT INTO execution_traces "
+        "(trace_id, task_class, status, created_at, route_margin, agent_version_id) "
+        "VALUES (?,?,?,?,?,?)",
+        ("t-onBoundary", "code-fix", "success", cutoff + ".000Z", 0.5, "onBoundary"))
+    con.commit()
+    con.close()
+
+    # Exactly on the boundary is inside: the comparison is >=, not >.
+    assert len(cal.load_margin_rows(db, "code-fix", lane="onBoundary")) == 1
+    _seed_at(db, "ancient", 0.5, "success", days_ago=400)
+    assert cal.load_margin_rows(db, "code-fix", lane="ancient") == []
 
 
 def test_load_margin_rows_requires_a_margin(db):

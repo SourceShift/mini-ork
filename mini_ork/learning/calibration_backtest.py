@@ -39,6 +39,12 @@ def load_prediction_rows(db: str, task_class: str = "") -> list[tuple[float, boo
     Empty list on a missing file, a missing table, or a missing column (a
     database that predates migration 0059) — fail open, exactly as
     ``load_margin_rows`` fails open on a database without ``route_margin``.
+
+    Deliberately NOT windowed the way ``load_margin_rows`` is. The fit must be
+    recent, because rows from before a lane's model changed describe a lane that
+    no longer exists; this is the check ON that fit, so reading the whole
+    history is what lets drift surface as a rising ECE rather than being trimmed
+    away before anyone sees it.
     """
     if not db or not os.path.isfile(db):
         return []

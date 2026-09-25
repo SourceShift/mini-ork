@@ -12,7 +12,9 @@ persisted on ``execution_traces.route_margin`` (migration 0057). It is a proxy
 for the logit margin the paper uses, because mini-ork's lanes return text over
 different transports and most expose no token logprobs. The fit is therefore
 only as good as that stand-in, and it decays when a lane's model or prompt
-changes, so it is refit from recent rows rather than fitted once.
+changes, so it is refit from recent rows rather than fitted once: a recency
+window and a per-slice row cap keep a lane's pre-change history out of the map.
+Both bounds can only be tightened from the environment.
 
 No numpy: PAV is twenty lines of list arithmetic and the runtime is pure Python.
 
@@ -25,6 +27,7 @@ import bisect
 import os
 import sqlite3
 import time
+from datetime import datetime, timedelta, timezone
 
 # The escalation threshold: escalate when the calibrated error probability
 # exceeds this. It is the cost constraint's solution expressed as a target
@@ -35,6 +38,12 @@ DEFAULT_MIN_SAMPLES = 12
 # Refitting on every dispatch would open a connection per node for no benefit;
 # the map moves only as rows accumulate.
 DEFAULT_CACHE_TTL = 60.0
+# A lane's rows from before its model or prompt changed describe a lane that no
+# longer exists, so only rows inside this window may calibrate it.
+DEFAULT_WINDOW_DAYS = 30.0
+# The window bounds staleness by date; this bounds volume, so one busy lane
+# cannot swamp a slice with rows the window would otherwise admit.
+DEFAULT_MAX_ROWS = 500
 
 _CACHE: dict = {}
 
@@ -70,6 +79,42 @@ def min_samples() -> int:
     """
     return max(DEFAULT_MIN_SAMPLES, int(_env_float("MO_UCCI_MIN_SAMPLES",
                                                    DEFAULT_MIN_SAMPLES)))
+
+
+def window_days() -> float:
+    """Recency window in days, clamped so the env may only TIGHTEN it.
+
+    A longer window re-admits rows written before a lane's model or prompt
+    changed, which is the drift the window exists to exclude, so the
+    environment cannot reach it. ``0`` admits no row at all and so abstains
+    always; that is the behaviour ``MO_UCCI=0`` already gives and it is
+    reachable only on purpose.
+    """
+    return min(DEFAULT_WINDOW_DAYS,
+               max(0.0, _env_float("MO_UCCI_WINDOW_DAYS", DEFAULT_WINDOW_DAYS)))
+
+
+def max_rows() -> int:
+    """Per-slice row cap, clamped so the env may only LOWER it.
+
+    More rows is not more evidence when the extra ones are stale: the cap is
+    the same decay the window bounds by date, expressed as a bound on volume
+    for a slice that is simply busy.
+    """
+    return min(DEFAULT_MAX_ROWS,
+               max(1, int(_env_float("MO_UCCI_MAX_ROWS", DEFAULT_MAX_ROWS))))
+
+
+def recent_cutoff() -> str:
+    """Lower bound on ``created_at`` for the recency window.
+
+    Formatted the way ``execution_traces.created_at`` is written
+    (``%Y-%m-%dT%H:%M:%fZ``), so the comparison is a plain lexicographic one
+    and needs no date parsing. A row in the cutoff second still compares
+    greater, because the written value carries a fractional part.
+    """
+    return (datetime.now(timezone.utc) - timedelta(days=window_days())
+            ).strftime("%Y-%m-%dT%H:%M:%S")
 
 
 # ── isotonic regression (pool-adjacent-violators) ────────────────────────────
@@ -156,18 +201,27 @@ def load_margin_rows(db: str, task_class: str, lane: str = "") -> list:
     Node type is deliberately not a filter: it lives inside ``verifier_output``
     JSON rather than a column, and lane is the unit the map is a property of.
 
+    Only rows inside the recency window are read, and at most ``max_rows()`` of
+    them, newest first. The map describes the lane's *current* model and prompt,
+    so rows from before a change pull the fit toward an error rate the lane no
+    longer has. The paper calibrates on a static batch and names continual
+    recalibration as the open piece; the window plus cap is the cheap stand-in
+    for it, not a solution to it.
+
     An older database without the column returns ``[]`` (fail open), so a
     migration lag degrades routing to today's behaviour instead of raising.
     """
     if not db or not os.path.isfile(db):
         return []
-    where = ["task_class = ?", "route_margin IS NOT NULL"]
-    args: list = [task_class]
+    where = ["task_class = ?", "route_margin IS NOT NULL", "created_at >= ?"]
+    args: list = [task_class, recent_cutoff()]
     if lane:
         where.append("agent_version_id = ?")
         args.append(lane)
+    args.append(max_rows())
     sql = (f"SELECT route_margin, status FROM execution_traces "
-           f"WHERE {' AND '.join(where)}")
+           f"WHERE {' AND '.join(where)} "
+           f"ORDER BY created_at DESC LIMIT ?")
     con = sqlite3.connect(db)
     con.execute("PRAGMA busy_timeout=5000")
     try:
