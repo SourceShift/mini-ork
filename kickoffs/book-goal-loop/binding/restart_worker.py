@@ -193,10 +193,10 @@ def _identity_env(worktree: str) -> dict:
 
     ``git merge`` creates a commit, so an environment with no identity kills it
     with ``empty ident name ... not allowed`` — the state every CI runner,
-    container and fresh sandbox starts in. Because ``_sync_upstream`` reports a
-    failed merge as a conflict, that made the deploy target silently stop
-    carrying the product branch forward, which is the regression this binding
-    exists to prevent. A configured identity is left alone, so a human's own
+    container and fresh sandbox starts in. Because ``_sync_upstream`` used to
+    report any failed merge as a conflict, that made the deploy target silently
+    stop carrying the product branch forward, which is the regression this
+    binding exists to prevent. A configured identity is left alone, so a human's own
     settings still win; the fallback is the same one ``vcs/rebase_guard.py`` and
     ``vcs/auto_merge.py`` use.
     """
@@ -257,15 +257,29 @@ def _sync_upstream(worktree: str) -> str:
     # paths so an operator (or the next wave's evidence) can see what to resolve.
     conflicted = _git(worktree, "diff", "--name-only", "--diff-filter=U").stdout.split()
     _git(worktree, "merge", "--abort")
-    detail = ", ".join(conflicted[:8]) if conflicted else (
-        (merged.stderr.strip().splitlines() or ["(unknown)"])[-1]
-    )
+    if conflicted:
+        detail = ", ".join(conflicted[:8])
+        print(
+            f"worker-restart WARN: merge of {ref} into the deploy target hit a conflict — "
+            f"left the tree untouched; resolve by hand. Conflicted: {detail}",
+            file=sys.stderr,
+        )
+        return f"merge conflict against {ref} ({detail})"
+
+    # No conflicted paths means the merge stopped before it touched content, so
+    # this is NOT a conflict and there is nothing to resolve. git's own reason —
+    # no identity, a held lock, a refusing hook, local changes it would overwrite
+    # — is the whole diagnostic. Labelling it "merge conflict" is what let a
+    # missing identity go unnoticed while the deploy target quietly stopped
+    # carrying main forward.
+    reason = (merged.stderr.strip().splitlines() or ["(unknown)"])[-1]
     print(
-        f"worker-restart WARN: could not merge {ref} into the deploy target — left the tree "
-        f"untouched; resolve by hand. Conflicted: {detail}",
+        f"worker-restart WARN: merge of {ref} into the deploy target failed with no "
+        f"conflicted paths — left the tree untouched; this is not a content conflict, so "
+        f"there is nothing to resolve. Git said: {reason}",
         file=sys.stderr,
     )
-    return f"merge conflict against {ref} ({detail})"
+    return f"merge failed against {ref} (no conflicted paths: {reason})"
 
 
 def _pgrep(pattern: str) -> list[int]:

@@ -127,6 +127,35 @@ def test_a_conflict_leaves_the_tree_untouched(binding, deploy_target, capsys):
     assert "resolve by hand" in capsys.readouterr().err
 
 
+def test_a_merge_refused_before_it_starts_is_not_called_a_conflict(
+        binding, deploy_target, capsys):
+    """Only a merge that stops on content is a conflict. This one never starts:
+    uncommitted local changes the merge would overwrite make git refuse outright,
+    leaving no conflicted paths. That shape used to be reported as ``merge
+    conflict against main`` too, which is how a missing git identity (see the
+    test below) stayed invisible while the deploy target kept falling behind.
+    """
+    (deploy_target / "shared.ts").write_text("deploy side\n")
+    _commit(deploy_target, "deploy edits shared")
+    _git(deploy_target, "checkout", "-q", "main")
+    (deploy_target / "shared.ts").write_text("main side\n")
+    _commit(deploy_target, "main edits shared")
+    _git(deploy_target, "checkout", "-q", "deploy")
+    # Uncommitted, and on the file the merge would have to rewrite.
+    (deploy_target / "shared.ts").write_text("uncommitted local edit\n")
+    head_before = _git(deploy_target, "rev-parse", "HEAD")
+
+    why = binding._sync_upstream(str(deploy_target))
+
+    assert why.startswith("merge failed against main"), why
+    assert "conflict against" not in why
+    assert not (deploy_target / ".git" / "MERGE_HEAD").exists()
+    assert _git(deploy_target, "rev-parse", "HEAD") == head_before
+    # The uncommitted work is left exactly as it was, not clobbered by the abort.
+    assert (deploy_target / "shared.ts").read_text() == "uncommitted local edit\n"
+    assert "not a content conflict" in capsys.readouterr().err
+
+
 def test_opt_out_is_a_no_op(binding, deploy_target, monkeypatch):
     monkeypatch.setenv("MO_GOAL_SYNC_UPSTREAM", "0")
 
