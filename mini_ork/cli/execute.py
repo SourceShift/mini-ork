@@ -305,13 +305,18 @@ def _resolve_dispatch_mode(override, wf_path) -> str:
     return "serial"
 
 
-def _emit_run_verdict(run_dir, fail_count, dispatched):
+def _emit_run_verdict(run_dir, fail_count, dispatched, *, dry_run=False):
+    # A rehearsal must not occupy the run's own record. A nested lifecycle that
+    # inherits MINI_ORK_RUN_ID shares the run dir; when the rehearsal wrote
+    # verdict.json first, this guard skipped the live run and the run dir kept a
+    # rehearsal of a different workflow as its outcome.
     if not (run_dir and os.path.isdir(run_dir)):
         return
-    if os.path.isfile(os.path.join(run_dir, "panel-verdict.json")):
+    if not dry_run and os.path.isfile(os.path.join(run_dir, "panel-verdict.json")):
         return
     verdict = "fail" if fail_count > 0 else "pass"
-    verdict_path = os.path.join(run_dir, "verdict.json")
+    verdict_path = os.path.join(
+        run_dir, "verdict.dryrun.json" if dry_run else "verdict.json")
     if os.path.isfile(verdict_path):
         try:
             existing = json.load(open(verdict_path, encoding="utf-8"))
@@ -319,9 +324,10 @@ def _emit_run_verdict(run_dir, fail_count, dispatched):
             existing = {}
         if isinstance(existing, dict) and existing.get("source") == "execute@run-level":
             return
-        # A recipe may own verdict.json as a detailed deliverable. Keep that
-        # evidence intact and put executor bookkeeping beside it.
-        verdict_path = os.path.join(run_dir, "run-verdict.json")
+        if not dry_run:
+            # A recipe may own verdict.json as a detailed deliverable. Keep that
+            # evidence intact and put executor bookkeeping beside it.
+            verdict_path = os.path.join(run_dir, "run-verdict.json")
     try:
         open(verdict_path, "w").write(
             '{"verdict":"%s","failed_nodes":%d,"dispatched":%d,"source":"execute@run-level"}\n'
@@ -731,7 +737,7 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
         for line in out:
             print(line)
         dispatched = sum(1 for line in out if line.startswith("[dry-run] would dispatch"))
-        _emit_run_verdict(run_dir, fail_count, dispatched)
+        _emit_run_verdict(run_dir, fail_count, dispatched, dry_run=True)
         print("")
         print("execute: all nodes complete")
         return 0

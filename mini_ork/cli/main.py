@@ -395,6 +395,18 @@ def _deadline(root, *args) -> int:
     raise ValueError(f"unsupported deadline function: {fn}")
 
 
+def _execute_log_name() -> str:
+    """The live run is the only author of its own ``execute.log``.
+
+    A rehearsal (``MINI_ORK_DRY_RUN=1``, e.g. a nested lifecycle sharing the run
+    id) used to win the old ``not os.path.isfile`` race, leaving the run dir with
+    a record of a different workflow. Rehearsals get their own filename.
+    """
+    return ("execute.dryrun.log"
+            if os.environ.get("MINI_ORK_DRY_RUN", "0") == "1"
+            else "execute.log")
+
+
 def _run_lifecycle(argv, root) -> int:
     """Strip the machine-readable ``--json`` flag (accepted anywhere in argv),
     run the lifecycle, and — when requested — emit one stable
@@ -611,10 +623,9 @@ def _run_lifecycle_impl(argv, root, sink) -> int:
     _run_dir = context_env("MINI_ORK_RUN_DIR", "")
     if not _run_dir and plan_path:
         _run_dir = os.path.dirname(plan_path)
-    if _run_dir and _run_dir != "." and os.path.isdir(_run_dir) \
-            and not os.path.isfile(os.path.join(_run_dir, "execute.log")):
+    if _run_dir and _run_dir != "." and os.path.isdir(_run_dir):
         try:
-            open(os.path.join(_run_dir, "execute.log"), "w").write(execute_out)
+            open(os.path.join(_run_dir, _execute_log_name()), "w").write(execute_out)
         except OSError:
             pass
 
