@@ -1,4 +1,4 @@
-# Wave: close one measured defect in mini-ork's own migration layer
+# Wave: close one measured defect in mini-ork itself
 
 One wave of the long-horizon goal loop pointed at mini-ork ITSELF. The unit is
 a specific, reproducible defect in this repository, and the predicate that
@@ -34,16 +34,18 @@ This wave itself edits NO files — it is config-driven orchestration. The goal
 knobs are CONFIG in the `MO_GOAL_*` environment (target cwd, units command,
 predicate command, child recipe, max children per wave); copy them verbatim
 into `plan.json`, do not invent them. The fix CHILDREN it dispatches are scoped
-to the mini-ork target worktree (`MO_GOAL_TARGET_CWD`) — `mini_ork/stores/` and
-`db/migrations/`.
+to the mini-ork target worktree (`MO_GOAL_TARGET_CWD`) — its `mini_ork/` tree
+and `db/migrations/`. Each unit's section in `binding/child-kickoff.md` says
+which of those its fix touches.
 
 ## The bar is FROZEN
 
 `binding/list_units.py`, `binding/unit_predicate.py` and this directory are
 DECLARED PART OF THE INSTRUMENT that scores the work, and are listed in
 `MO_GOAL_PROTECTED_PATHS` so a deploy or a child cannot rewrite them. Each
-predicate runs a probe that MUST go green and a second that MUST STAY RED, so
-"make the check pass without fixing anything" fails the second probe and leaves
+predicate runs at least one probe that MUST go green AND at least one control
+that MUST STAY RED — the control feeds the guard the thing it exists to refuse,
+so "make the check pass without fixing anything" fails the control and leaves
 the unit open. Lowering the bar from inside the tree under test is the one
 shortcut this loop is built to refuse.
 

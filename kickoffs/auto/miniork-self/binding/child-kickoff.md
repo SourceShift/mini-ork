@@ -1,4 +1,4 @@
-# Kickoff: close one measured defect in mini-ork's own migration layer
+# Kickoff: close one measured defect in mini-ork itself
 
 ## What `{{unit_id}}` is
 
@@ -7,14 +7,16 @@ against the tree you are editing. You are fixing the CODE that causes it. The
 probe is re-run after you finish; it decides pass/fail, and it is not
 negotiable.
 
-There are two units and their fixes are unrelated — do only the one named
-above.
+Five units are listed below and their fixes are unrelated — do only the one
+named above. Read its section, not the others.
 
 ## Goal
 
-Make `{{unit_id}}`'s probe exit 0, honestly. The probe for each unit below runs
-TWO checks: one that must go green, and one that must NOT change. Satisfying
-the first by weakening the guard fails the second, and the unit stays open.
+Make `{{unit_id}}`'s probe exit 0, honestly. Each unit's probe runs SEVERAL
+checks: one or more that must go green, and at least one that must NOT change —
+a control that feeds the guard the thing it exists to refuse. Satisfying the
+green checks by weakening or removing the control fails it, and the unit stays
+open.
 
 ## Evidence
 
@@ -50,6 +52,16 @@ since. One root cause, five symptoms.
   being switched off wholesale, and a third check requires the upgrade path to
   come up drift-clean WITHOUT the escape hatch — i.e. the fix must carry the
   one-time repair itself.
+- **Trap: collapse all whitespace to compare.** The obvious canonical form —
+  strip comments, then `re.sub(r"\s+", " ", s)` over the whole file — also
+  collapses whitespace INSIDE string literals, so `VALUES ('a  b')` and
+  `VALUES ('a b')` compare equal and a real data edit is re-baselined in
+  silence. A fourth probe writes exactly that pair and requires the edit to be
+  REFUSED. Normalize whitespace in the SQL *syntax* only; the bytes inside
+  quotes are data.
+- **Trap: normalize so hard that a real edit passes.** The same fourth probe's
+  twin requires a genuine SQL change to still be detected. Any normalization you
+  add needs a control showing what it must still reject.
 - Read `mini_ork/stores/migrate.py::migrate_apply` and `ensure_table` before
   designing. Note `ensure_table`'s comment: the `schema_migrations` CREATE text
   is byte-parity-checked against `lib/migrate.sh`, so adding a column to that
@@ -88,19 +100,101 @@ DESTROYS them: 6401 rows, including the only two carrying a `route_margin`, and
   0057 is recorded as applied so it will not run again to recreate it. The
   replacement needs that index back.
 
+### `migration-order-is-reported`
+
+`migrate_apply` walks `sorted(dir.glob("*.sql"))`. A file absent from
+`schema_migrations` is simply "pending", so applying a migration that sorts
+BEFORE one already applied is indistinguishable from a normal apply. On the live
+db that already happened: `0057` and `0059` are applied, `0054` is not, and
+running `mini-ork update` rebuilds `execution_traces` from a column list written
+when `route_margin` did not exist — dropping the columns the later migrations
+added, with nothing reported beforehand.
+
+- **Trap: make the out-of-order apply FAIL.** Refusing it is the wrong answer
+  here, and it breaks a second unit: the live-path probe for
+  `migration-0054-drops-columns` requires the pending `0054` to apply
+  successfully (rc 0) on an upgrading db. The requirement is a WARNING — the
+  fact must reach the operator — with the apply still succeeding.
+- **Trap: print the warning to stdout.** The migration-verdict path in the probe
+  captures ONLY the err channel; the runner's routine `  [apply] <file>` stdout
+  is not read. A warning on stdout satisfies nothing.
+- **Trap: warn whenever a migration is pending.** A fresh install has every
+  migration pending and applies them in order — that is normal, not drift. One
+  probe runs a fresh db and requires the message NOT to name `0054`; a warning
+  keyed on "is pending" fails it.
+- **Trap: compare against the max applied filename.** View files (`v_*.sql`)
+  sort AFTER `0*.sql`, so a db whose newest applied row is a view file has a
+  "max applied" that no numbered migration precedes. The invariant that actually
+  holds is: the pending set must be a SUFFIX of the sorted list. Anything
+  pending that sorts before an applied file is the signal.
+- Keep `migrate_verify` / `migrate_status` consistent — they share the walk.
+
+### `reflect-step-is-bounded`
+
+`mini_ork/cli/main.py` spawns the reflect child with NO `timeout=`, and
+`mini_ork/cli/execute_handlers.py::_handle_reflector_early` does the same with
+its own hand-built environment. Reflect runs AFTER the verdict is already final
+and takes seconds, so a lane that never returns holds `mini-ork run` open
+forever with nothing left to decide. The campaign launcher already carries a
+shell watchdog that kills reflect processes past six minutes — that is a fix
+living in a shell script instead of in the code that spawns the child.
+
+- **Trap: bound only the site the message names.** Both spawn sites are checked,
+  in both files. The message names the ones that were red when the probe was
+  written; a patch that fixes one and leaves the other still fails.
+- **Trap: pass `timeout=None`, or a negative/zero value.** Not a bound. The
+  probe requires a positive numeric literal.
+- **Trap: delete the reflect step, or flip `MO_AUTO_REFLECT`'s default.** A
+  second probe requires reflection to still be ON by default — bounding the step
+  by removing it, or by turning it off for everyone, satisfies nothing.
+- **Trap: bound it in the launcher instead.** The shell watchdog already exists;
+  a bound that lives only there is exactly the defect.
+- Reflect is best-effort: a timeout must not turn a finished run into a failed
+  one. Let the step be killed and the run continue to its already-decided
+  verdict.
+
+### `module-child-engine-pin`
+
+A `python -m mini_ork.cli.*` child puts its WORKING DIRECTORY at `sys.path[0]`,
+ahead of the `PYTHONPATH` that names the engine. The goal-loop runs children with
+cwd set to the repo under repair (`MO_GOAL_TARGET_CWD`), so a repo that contains
+a `mini_ork/` tree silently shadows the engine: the child executes the target's
+stale copy. This already cost a run — the plan child wrote a rehearsal
+placeholder over the live run's own `plan.json`, so every child was planned
+against `"<dry-run: not generated>"` and a fix merged to `main` stayed inert
+inside the running loop.
+
+- **Trap: patch only the spawn the probe names.** The probe scans EVERY spawn of
+  a `mini_ork.cli.*` module across `mini_ork/`. Several of them already route
+  through one shared environment helper; fix that helper and they are all
+  covered, which is the point — a per-site patch leaves the next site to
+  reintroduce the hole.
+- **Trap: append PYTHONPATH, or reorder it.** The cwd entry is ahead of
+  `PYTHONPATH` by definition for `-m`/`-c`, so no PYTHONPATH ordering fixes it.
+  Drop the implicit cwd entry (Python 3.11+ `PYTHONSAFEPATH`, or an equivalent
+  that achieves the same), so the declared path resolves.
+- **Trap: stop the child importing `mini_ork`.** The probe's control requires
+  the SAME child, under the SAME env minus the pin, to STILL load a decoy
+  package planted in the cwd. Removing the import does not satisfy that control;
+  it fails it.
+- **Trap: change the child's cwd.** The cwd must stay the target tree — that is
+  the contract, because the child edits the target.
+- Whatever you change must be applied to the env-building helper the other
+  module children already share, so the policy cannot drift between sites.
+
 ## Scope
 
-Edit only `mini_ork/stores/` and `db/migrations/` in the target worktree. Do
-NOT touch the binding directory (`kickoffs/auto/miniork-self/**`), tests, or
-anything else — the binding is the instrument scoring you and is protected.
-Keep the diff minimal.
+Edit only the target worktree's `mini_ork/` tree and `db/migrations/`. Do NOT
+touch the binding directory (`kickoffs/auto/miniork-self/**`), tests, or anything
+else — the binding is the instrument scoring you and is protected. Keep the
+diff minimal.
 
 ## Success criteria
 
 - The predicate for `{{unit_id}}` exits 0, and every one of its other probes is
-  still satisfied.
-- The fix holds on BOTH paths where that is meaningful: a database upgrading
-  from an older release, and a fresh install from empty.
+  still satisfied — including the control that must stay red.
+- The fix holds on every path the probe exercises: where a defect is specific to
+  an upgrading database or a fresh install, both must hold.
 - Minimal, reviewable diff.
 
 ## Model preference
