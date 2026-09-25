@@ -60,8 +60,15 @@ def test_no_run_resolved_is_exit_3(mod, monkeypatch):
 
 
 def test_fsm_not_failed_is_idempotent_noop(mod, monkeypatch, capsys):
-    """The per-wave idempotency path: a run already progressing -> exit 0, no resume."""
+    """The per-wave idempotency path: a run already progressing -> exit 0, no resume.
+
+    ``generating`` is no longer a blanket no-op — it first tries to free a
+    stranded dispatch claim — so the blanket path is pinned behind its own
+    switch. Without it the probe would reach psql, which this suite is
+    deliberately free of.
+    """
     monkeypatch.setenv("BOOK_UUID", _GOOD_BOOK)
+    monkeypatch.setenv("MO_GOAL_REDISPATCH_BREAK_GENERATING", "0")
     monkeypatch.setattr(mod, "_resolve_job", lambda book: ("job_x", "run-uuid", "generating"))
     called = {"resume": False}
     monkeypatch.setattr(
