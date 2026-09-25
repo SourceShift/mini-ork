@@ -149,6 +149,19 @@ def _checksum_clean(stored: str, raw_sum: str, canon_sum: str) -> bool:
     return stored == canon_sum or stored == raw_sum
 
 
+def _is_out_of_order(filename: str, applied_names: set[str]) -> bool:
+    """True when ``filename`` sorts before an already-applied entry in the ledger.
+
+    Single source of truth for the 'pending set is a suffix of the sorted
+    list' invariant checked by ``migrate_apply`` (and reusable by
+    ``migrate_status`` / ``migrate_verify``) so the three cannot drift apart.
+    Plain string comparison matches the lex walk order, so view files
+    (``v_*.sql``, which always sort after numeric prefixes) participate
+    correctly without numeric-prefix parsing or an applied_at comparison.
+    """
+    return any(name > filename for name in applied_names)
+
+
 def _db(db: str | None) -> str:
     if db:
         return db
@@ -378,6 +391,8 @@ def migrate_apply(migrations_dir: str, dry_run: bool = False, db: str | None = N
     ensure_table(db)
     ver = _version(root)
     con = sqlite3.connect(db)
+    applied_names = {row[0] for row in con.execute(
+        "SELECT filename FROM schema_migrations")}
     for f in sorted(Path(migrations_dir).glob("*.sql")):
         filename = f.name
         sum_hex = checksum(f)
@@ -430,6 +445,10 @@ def migrate_apply(migrations_dir: str, dry_run: bool = False, db: str | None = N
                 con.close()
                 return 1, out
             continue
+        if _is_out_of_order(filename, applied_names) and err_out is not None:
+            err_out.append(
+                f"  [warn]    {filename} sorts before already-applied migrations"
+                " - applying out of order")
         if dry_run:
             out.append(f"  [pending] {filename}")
             continue
