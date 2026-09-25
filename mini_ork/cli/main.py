@@ -132,8 +132,19 @@ Environment:
 
 
 def _module_env(root):
+    """Env for a ``python -m mini_ork.cli.*`` child that must import THIS engine.
+
+    ``PYTHONPATH`` alone does not decide that. For ``-m`` and ``-c`` the
+    interpreter puts the working directory at ``sys.path[0]``, AHEAD of
+    ``PYTHONPATH``, so a child spawned with the cwd inside another checkout that
+    happens to contain a ``mini_ork/`` tree imports that tree instead of the
+    engine we named. The goal-loop does exactly this: its children run with the
+    cwd set to the repo under repair. ``PYTHONSAFEPATH`` drops the implicit cwd
+    entry so the explicit ``PYTHONPATH`` is the one that resolves.
+    """
     env = context_env_snapshot()
     env["PYTHONPATH"] = root + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+    env["PYTHONSAFEPATH"] = "1"
     return env
 
 
@@ -586,9 +597,7 @@ def _run_lifecycle_impl(argv, root, sink) -> int:
         return 0
 
     # ── plan ──
-    plan_env = dict(os.environ)
-    plan_env["PYTHONPATH"] = root + (os.pathsep + plan_env["PYTHONPATH"]
-                                      if plan_env.get("PYTHONPATH") else "")
+    plan_env = _module_env(root)
     pl = subprocess.run(
         [sys.executable, "-m", "mini_ork.cli.plan", kickoff],
         capture_output=True, text=True, env=plan_env,

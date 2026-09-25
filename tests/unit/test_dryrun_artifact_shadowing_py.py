@@ -18,6 +18,7 @@ with an empty decomposition.
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 from mini_ork.cli import execute
@@ -206,3 +207,55 @@ def test_explicit_out_is_honoured_verbatim(tmp_path, capsys):
     assert out.is_file()
     assert not (tmp_path / "explicit" / ".mini-ork" / "runs" / _RUN_ID /
                 "plan.dryrun.json").exists()
+
+
+# ── the engine a module child imports ────────────────────────────────
+#
+# Same family as above, one layer down. Naming the engine in ``PYTHONPATH`` is
+# not enough for a ``python -m`` child: the interpreter puts the WORKING
+# DIRECTORY at ``sys.path[0]``, ahead of ``PYTHONPATH``. The goal-loop sets a
+# child's cwd to the repo under repair, so any such repo that contains a
+# ``mini_ork/`` tree shadowed the engine — the fix landed on disk and the
+# running child still executed the old code.
+
+
+def _decoy_tree(tmp_path):
+    """A cwd that would win the import race if nothing stops it."""
+    root = tmp_path / "decoy"
+    (root / "mini_ork" / "cli").mkdir(parents=True)
+    (root / "mini_ork" / "__init__.py").write_text("DECOY = True\n", encoding="utf-8")
+    (root / "mini_ork" / "cli" / "__init__.py").write_text("", encoding="utf-8")
+    (root / "mini_ork" / "cli" / "plan.py").write_text(
+        "print('DECOY-PLAN-LOADED')\nraise SystemExit(0)\n", encoding="utf-8")
+    return root
+
+
+def test_engine_module_child_ignores_a_decoy_package_in_cwd(tmp_path):
+    """``python -m mini_ork.cli.plan`` from a repo that shadows the engine must
+    still import the engine the env names — otherwise a fix on disk is inert."""
+    decoy = _decoy_tree(tmp_path)
+    env = cli_main._module_env(str(_REPO))
+
+    def spawn(child_env):
+        return subprocess.run(
+            [sys.executable, "-m", "mini_ork.cli.plan"],
+            cwd=str(decoy), capture_output=True, text=True, env=child_env,
+        )
+
+    unguarded = dict(env)
+    unguarded.pop("PYTHONSAFEPATH", None)
+    assert "DECOY-PLAN-LOADED" in spawn(unguarded).stdout, (
+        "decoy did not win, so this test cannot detect the shadowing it guards")
+
+    assert "DECOY-PLAN-LOADED" not in spawn(env).stdout, (
+        "the engine env let the cwd's mini_ork tree shadow the engine")
+
+
+def test_module_env_pins_the_engine_everywhere_it_is_built():
+    """One policy, every ``-m mini_ork.*`` child: whatever calls it gets it."""
+    assert cli_main._module_env(str(_REPO))["PYTHONSAFEPATH"] == "1"
+    plan_block = (Path(cli_main.__file__).read_text(encoding="utf-8")
+                  .split("# ── plan ──", 1)[1].split("# ── execute ──", 1)[0])
+    assert "_module_env(root)" in plan_block, (
+        "the plan child is spawned with a hand-built env, so it can drift from "
+        "the engine-pinning policy every other module child gets")
