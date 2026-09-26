@@ -151,6 +151,7 @@ def record_wave(
     reasons: dict[str, str] | None = None,
     attempted: list[str] | None = None,
     diagnostics: dict[str, Any] | None = None,
+    verdict_known: bool = True,
 ) -> State:
     """Append a wave record + update ``failed_fixes`` for each attempted unit.
 
@@ -166,14 +167,23 @@ def record_wave(
     chapter the single-child-per-wave loop never got to) does not accrue
     identical hashes and cannot spuriously trip ``all_quarantined``.
 
+    ``verdict_known=False`` marks a wave whose failing set was never MEASURED
+    (the wave timed out, crashed, or its verifier emitted no unit list). Its
+    ``failing_after`` is empty because nothing was observed, so the record
+    carries no signature and accrues no fix-hash: an unobserved wave must not
+    look like a satisfied goal, and a timeout must not look like "attempted
+    twice, same failure" to the quarantine detector.
+
     Backward-compatible: ``reasons=None`` yields the historical set-only
     signature and id-only fix-hash; ``attempted=None`` falls back to hashing
     every still-failing unit (the original test-suite-loop contract).
     ``diagnostics`` carries the wave's evidence fingerprints, the child's
     self-verdict, and the operator class each unit's failure called for; callers
     without them omit it, and each key is attached only when non-empty.
+    ``verdict_known=True`` (the default) emits no extra key, so a caller that
+    does not know about the flag writes a byte-identical record to before.
     """
-    sig = wave_signature(failing_after, reasons)
+    sig = wave_signature(failing_after, reasons) if verdict_known else None
     wave_record = {
         "wave": wave,
         "run_id": run_id,
@@ -182,13 +192,21 @@ def record_wave(
         "cost_usd": float(cost_usd),
         "signature": sig,
     }
+    if not verdict_known:
+        # No signature: the hash of the empty set is exactly what a satisfied
+        # goal's signature looks like, and this wave did not observe that.
+        wave_record["verdict_known"] = False
     if attempted is not None:
         wave_record["attempted"] = sorted(attempted)
     if diagnostics is not None:
         prev_waves = state.get("waves", [])
         prev_sig = prev_waves[-1].get("signature") if prev_waves else None
-        wave_record["headroom_closed"] = len(failing_before) - len(failing_after)
-        wave_record["predicate_moved"] = None if prev_sig is None else (sig != prev_sig)
+        wave_record["headroom_closed"] = (
+            len(failing_before) - len(failing_after) if verdict_known else None
+        )
+        wave_record["predicate_moved"] = (
+            None if (prev_sig is None or not verdict_known) else (sig != prev_sig)
+        )
         evidence = diagnostics.get("evidence")
         if evidence:
             wave_record["evidence"] = {str(k): str(v) for k, v in sorted(evidence.items())}
@@ -213,7 +231,12 @@ def record_wave(
     # fingerprint, so two identical hashes now means "attempted twice, and the
     # failure did not move" — the true GRAO quarantine signal — rather than
     # merely "still in the failing set".
-    if attempted is not None:
+    if not verdict_known:
+        # An unobserved wave cannot say whether a fix worked, so it accrues no
+        # sighting: a timeout must not read as "attempted twice, same failure"
+        # and quarantine a unit that was never scored.
+        hash_units: list[str] = []
+    elif attempted is not None:
         hash_units = sorted(set(attempted) & set(failing_after))
     else:
         hash_units = sorted(failing_after)
@@ -238,6 +261,30 @@ def should_quarantine(unit_id: str, current_hash: str, state: State) -> bool:
     history = state.get("failed_fixes", {}).get(unit_id, [])
     same_count = sum(1 for h in history if h == current_hash)
     return same_count >= 2
+
+
+def measured_tail(waves: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The maximal trailing run of waves that actually MEASURED a failing set.
+
+    A wave whose verdict never arrived records ``verdict_known: False`` — it
+    timed out, crashed, or its verifier emitted an ``error`` panel, so its
+    failing set is UNOBSERVED rather than empty. Scanning back to the first
+    measured wave keeps such a wave out of every detector that reasons about the
+    failing set. Without the cut, a wave folded as "zero failing" makes the next
+    wave's real count look like a regression from zero, and the loop kills a
+    campaign that is working.
+
+    The cut is a BREAK, not a filter: a divergence pattern is ``patience``
+    *consecutive* waves, so an unobserved wave between two measured ones means
+    the pattern was not sustained across the window.
+    """
+    tail: list[dict[str, Any]] = []
+    for wave in reversed(waves):
+        if not wave.get("verdict_known", True):
+            break
+        tail.append(wave)
+    tail.reverse()
+    return tail
 
 
 def divergence(state: State, patience: int = 2, rdisc: bool = True) -> str | None:
@@ -269,7 +316,11 @@ def divergence(state: State, patience: int = 2, rdisc: bool = True) -> str | Non
     if patience < 2:
         patience = 2
     waves: list[dict[str, Any]] = state.get("waves", [])
-    if len(waves) < patience:
+    measured = measured_tail(waves)
+    if len(measured) < patience:
+        # Fewer measured waves than the window. An unobserved wave breaks the
+        # run, so no pattern can be asserted across it — silence here is the
+        # absence of evidence, not evidence of progress.
         return None
 
     if rdisc:
@@ -278,7 +329,7 @@ def divergence(state: State, patience: int = 2, rdisc: bool = True) -> str | Non
             if hit is not None:
                 return hit
 
-    recent = waves[-patience:]
+    recent = measured[-patience:]
 
     sigs = [w.get("signature") for w in recent]
     if sigs[0] is not None and all(s == sigs[0] for s in sigs):
@@ -305,9 +356,9 @@ def evidence_informativeness(state: State, patience: int = 2) -> str | None:
     cause — the loop must change what it LOOKS AT, not what the child patches.
     """
     waves = state.get("waves", [])
-    if len(waves) < patience:
+    recent = measured_tail(waves)[-patience:]
+    if len(recent) < patience:
         return None
-    recent = waves[-patience:]
     bundles = [w.get("evidence") or {} for w in recent]
     if any(not b for b in bundles):
         return None
@@ -329,9 +380,9 @@ def self_verdict_mirage(state: State, patience: int = 2) -> str | None:
     that accepts the identical non-fix forever is the accept-all degeneration.
     """
     waves = state.get("waves", [])
-    if len(waves) < patience:
+    recent = measured_tail(waves)[-patience:]
+    if len(recent) < patience:
         return None
-    recent = waves[-patience:]
     sigs = [w.get("signature") for w in recent]
     if len(set(sigs)) != 1:
         return None
@@ -435,7 +486,11 @@ def goal_vacuity(
     waves = state.get("waves", [])
     if not waves or not reasons:
         return None
-    if waves[-1].get("failing_after"):
+    # The green must be one the loop actually OBSERVED. A trailing unobserved
+    # wave is not a green one, and reading its empty failing set as "all clear"
+    # would hang a vacuity finding on a measurement that never happened.
+    measured = measured_tail(waves)
+    if not measured or measured[-1].get("failing_after"):
         return None
 
     per_axis: dict[str, set[str]] = {}

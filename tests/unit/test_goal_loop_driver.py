@@ -1906,3 +1906,123 @@ def test_the_diagnostic_is_ledgered_as_a_terminal_row(tmp_path, monkeypatch):
     assert len(diag_rows) == 1
     assert diag_rows[0]["vacuity"] == "vacuous_goal_met:quality"
     assert diag_rows[0]["obligation_gap"] == "obligation_gap:figure_requirement:0/10"
+
+
+# ── the unmeasured wave: a verdict that never arrived is not a green one ────
+#
+# The live regression (mini-ork-self campaign): wave 1 timed out before its
+# ``panel-verdict.json`` was written. The driver folded the absent failing set
+# as ``[]`` — the exact shape of a satisfied goal — so wave 2's honest count of
+# 3 read as a REGRESSION FROM ZERO. ``divergence`` returned ``regressing:0->3``
+# and the campaign stopped two waves in, with most of its budget unspent.
+#
+# The contract under test is additive: a wave that MEASURED its units carries no
+# new key, so a healthy verdict stays byte-identical. Only a wave that observed
+# nothing records ``verdict_known: False``.
+
+
+def test_a_timed_out_wave_does_not_read_as_zero_failing(tmp_path, monkeypatch):
+    """Wave 1 measured nothing, wave 2 measured three. That is not a regression."""
+    monkeypatch.setenv("MO_GOAL_DIVERGENCE_PATIENCE", "2")
+    monkeypatch.setenv("MO_GOAL_QUARANTINE_PATIENCE", "99")
+    state_dir = tmp_path / "state"
+    waves_run: list[int] = []
+
+    def run_wave(wave_no, quarantined):
+        waves_run.append(wave_no)
+        if wave_no == 1:
+            # No failing key at all: the wave died before a panel was written.
+            return {"verdict": "fail", "cost_usd": 1.0,
+                    "run_id": "r1", "timed_out": True}
+        return {"verdict": "fail", "failing_units": ["a", "b", "c"],
+                "cost_usd": 1.0, "run_id": "r2"}
+
+    verdict = drive(
+        goal_id="gunknown", target_cwd="/tmp", units_cmd="echo u",
+        predicate_cmd="echo ok", child_recipe="code-fix",
+        max_waves=2, budget_total_usd=100.0,
+        run_wave_fn=run_wave, cost_fn=lambda: 0.0, state_dir=state_dir,
+    )
+
+    # The old fold gave stop="diverged" / signature="regressing:0->3".
+    assert verdict["stop"] == "max_waves_reached", verdict
+    assert waves_run == [1, 2]
+    # The report names what the loop last OBSERVED, never the unobserved empty set.
+    assert verdict["failing_units"] == ["a", "b", "c"]
+    assert verdict["unmeasured_waves"] == [1]
+
+
+def test_an_error_panel_is_an_unmeasured_wave(tmp_path, monkeypatch):
+    """``goal_check.py`` emits ``{"verdict": "error", "reason": ...}`` with no
+    unit list when its predicate blows up. That path is real production, and it
+    establishes nothing — it must read as unknown, not as a clean wave."""
+    monkeypatch.setenv("MO_GOAL_DIVERGENCE_PATIENCE", "2")
+    monkeypatch.setenv("MO_GOAL_QUARANTINE_PATIENCE", "99")
+    state_dir = tmp_path / "state"
+
+    def run_wave(wave_no, quarantined):
+        if wave_no == 1:
+            return {"verdict": "error", "reason": "predicate rc=2",
+                    "cost_usd": 0.5, "run_id": "r1"}
+        return {"verdict": "fail", "failing_units": ["a", "b"],
+                "cost_usd": 0.5, "run_id": "r2"}
+
+    verdict = drive(
+        goal_id="gerror", target_cwd="/tmp", units_cmd="echo u",
+        predicate_cmd="echo ok", child_recipe="code-fix",
+        max_waves=2, budget_total_usd=100.0,
+        run_wave_fn=run_wave, cost_fn=lambda: 0.0, state_dir=state_dir,
+    )
+
+    assert verdict["stop"] == "max_waves_reached", verdict
+    assert verdict["failing_units"] == ["a", "b"]
+    assert verdict["unmeasured_waves"] == [1]
+    persisted = load_state(state_dir, "gerror")
+    assert persisted["waves"][0]["verdict_known"] is False
+    assert persisted["waves"][0]["signature"] is None
+
+
+def test_unmeasured_waves_is_omitted_when_every_wave_reported(tmp_path, monkeypatch):
+    """Additive: a loop that measured every wave writes no extra key, so a
+    healthy verdict keeps the shape it had before this change."""
+    monkeypatch.setenv("MO_GOAL_QUARANTINE_PATIENCE", "99")
+    state_dir = tmp_path / "state"
+
+    def run_wave(wave_no, quarantined):
+        return {"verdict": "fail", "failing_units": [f"u{wave_no}"],
+                "cost_usd": 0.0, "run_id": f"r{wave_no}"}
+
+    verdict = drive(
+        goal_id="gknown", target_cwd="/tmp", units_cmd="echo u",
+        predicate_cmd="echo ok", child_recipe="code-fix",
+        max_waves=1, budget_total_usd=100.0,
+        run_wave_fn=run_wave, cost_fn=lambda: 0.0, state_dir=state_dir,
+    )
+
+    assert verdict["stop"] == "max_waves_reached", verdict
+    assert "unmeasured_waves" not in verdict
+    assert verdict["failing_units"] == ["u1"]
+
+
+def test_a_measured_pass_still_reads_as_goal_met(tmp_path, monkeypatch):
+    """A real panel writes ``failing_units: []`` for a pass — a genuine
+    measurement of ZERO. The unknown flag must not swallow it: the empty set
+    that was MEASURED still carries the signature of the empty set."""
+    state_dir = tmp_path / "state"
+
+    def run_wave(wave_no, quarantined):
+        return {"verdict": "pass", "failing_units": [],
+                "cost_usd": 1.0, "run_id": f"r{wave_no}"}
+
+    verdict = drive(
+        goal_id="gpass", target_cwd="/tmp", units_cmd="echo u",
+        predicate_cmd="echo ok", child_recipe="code-fix",
+        max_waves=5, budget_total_usd=100.0,
+        run_wave_fn=run_wave, cost_fn=lambda: 0.0, state_dir=state_dir,
+    )
+
+    assert verdict["stop"] == "goal_met", verdict
+    assert verdict["failing_units"] == []
+    assert "unmeasured_waves" not in verdict
+    persisted = load_state(state_dir, "gpass")
+    assert persisted["waves"][0]["signature"] is not None

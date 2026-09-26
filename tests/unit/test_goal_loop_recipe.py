@@ -1448,3 +1448,91 @@ def test_read_obligations_reports_a_failing_sensor_as_an_error(tmp_path):
     out, err = read_obligations(str(tmp_path), "exit 3")
     assert out == ""
     assert "obligation sensor failed" in err and "rc=3" in err
+
+
+# ── the unmeasured wave (pure) ─────────────────────────────────────────────
+#
+# A wave whose verdict never arrived records ``verdict_known: False``: it timed
+# out, crashed, or its verifier emitted an ``error`` panel. Its failing set is
+# UNOBSERVED, which is not the same as empty — and only this module can tell the
+# two apart, because by the time the driver folds a wave both look like ``[]``.
+
+_measured_tail = _ls.measured_tail  # noqa: SLF001 — test seam
+_record_wave = _ls.record_wave
+_divergence = _ls.divergence
+_should_quarantine = _ls.should_quarantine
+
+
+def test_measured_tail_breaks_at_an_unobserved_wave():
+    """[known, unknown, known] — only the last measured wave survives. The cut
+    is a BREAK, not a filter: divergence is ``patience`` CONSECUTIVE waves, so
+    an unobserved wave between two measured ones means the pattern was never
+    sustained across the window."""
+    waves = [
+        {"wave": 1, "verdict_known": True, "failing_after": ["a"]},
+        {"wave": 2, "verdict_known": False, "failing_after": []},
+        {"wave": 3, "verdict_known": True, "failing_after": ["a"]},
+    ]
+    assert [w["wave"] for w in _measured_tail(waves)] == [3]
+
+
+def test_measured_tail_keeps_a_trailing_run_of_measured_waves():
+    waves = [
+        {"wave": 1, "verdict_known": False, "failing_after": []},
+        {"wave": 2, "verdict_known": True, "failing_after": ["a"]},
+        {"wave": 3, "verdict_known": True, "failing_after": ["a"]},
+    ]
+    assert [w["wave"] for w in _measured_tail(waves)] == [2, 3]
+
+
+def test_measured_tail_defaults_an_absent_flag_to_known():
+    """Every wave written before this change has no flag. Absent must read as
+    measured, or a resumed state file would silently stop diverging."""
+    waves = [{"wave": 1, "failing_after": ["a"]}, {"wave": 2, "failing_after": ["a"]}]
+    assert len(_measured_tail(waves)) == 2
+
+
+def test_divergence_is_silent_across_an_unobserved_wave():
+    """Two identical measured waves separated by a dead one must NOT report
+    ``no_progress`` — the loop cannot say the stall is real."""
+    known = {"wave": 1, "verdict_known": True, "failing_after": ["a"], "signature": "s"}
+    dead = {"wave": 2, "verdict_known": False, "failing_after": [], "signature": None}
+    later = {"wave": 3, "verdict_known": True, "failing_after": ["a"], "signature": "s"}
+    assert _divergence({"waves": [known, dead, later]}, patience=2) is None
+    # Nothing between them, and the same two waves really do diverge.
+    assert _divergence({"waves": [known, later]}, patience=2) == "no_progress:s"
+
+
+def test_record_wave_of_an_unmeasured_wave_records_no_signature():
+    """``sha256([])`` is exactly what a measured all-green wave hashes to. A
+    wave that observed nothing must not wear that signature — nor report
+    headroom it never saw move."""
+    state = {"goal_id": "g", "waves": [], "failed_fixes": {}}
+    _record_wave(state, wave=1, run_id="r", failing_before=["u"], failing_after=[],
+                 cost_usd=0.0, attempted=["u"],
+                 diagnostics={"evidence": {"u": "deadbeef"}}, verdict_known=False)
+    w = state["waves"][0]
+    assert w["signature"] is None
+    assert w["verdict_known"] is False
+    assert w["headroom_closed"] is None
+    assert w["predicate_moved"] is None
+
+
+def test_record_wave_of_an_unmeasured_wave_accrues_no_fix_hash():
+    """A timeout is not 'attempted twice, same failure'. Quarantining a unit the
+    loop never scored would retire it on a wave that produced no evidence."""
+    state = {"goal_id": "g", "waves": [], "failed_fixes": {}}
+    for wave in (1, 2):
+        _record_wave(state, wave=wave, run_id="r", failing_before=["u"],
+                     failing_after=["u"], cost_usd=0.0, attempted=["u"],
+                     verdict_known=False)
+    assert state["failed_fixes"] == {}
+    assert _should_quarantine("u", _ls.fix_hash("u", None), state) is False
+
+
+def test_an_unmeasured_wave_is_not_a_green_for_vacuity():
+    """The vacuity diagnostic looks for a green whose axes never moved. A dead
+    wave is not a green, so it must not be read as one."""
+    state = {"waves": [{"wave": 1, "verdict_known": False,
+                        "failing_after": [], "signature": None}]}
+    assert goal_vacuity(state) is None

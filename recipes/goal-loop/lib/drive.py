@@ -115,6 +115,41 @@ def _child_diagnostics(child_run_dir: str) -> dict[str, Any]:
     return out
 
 
+def _last_measured_failing(state: dict[str, Any]) -> list[str]:
+    """The failing set from the newest wave that actually MEASURED one.
+
+    A wave whose verdict never arrived records ``verdict_known: False``: its
+    failing set is unobserved, not empty. Reading it as empty would both report
+    a green the loop never saw and hand the next wave nothing to dispatch — the
+    two ways a dead wave propagates into the campaign's decisions.
+    """
+    for wave in reversed(state.get("waves", [])):
+        if wave.get("verdict_known", True):
+            return sorted(wave.get("failing_after") or [])
+    return []
+
+
+def _unmeasured_waves(state: dict[str, Any]) -> list[int]:
+    """Wave numbers whose verdict never arrived — the waves the loop could not read."""
+    return [
+        int(w["wave"])
+        for w in state.get("waves", [])
+        if w.get("wave") is not None and not w.get("verdict_known", True)
+    ]
+
+
+def _unknown_fragment(state: dict[str, Any]) -> dict[str, Any]:
+    """Final-verdict fragment naming the waves that produced no measurement.
+
+    Additive and omitted when empty, so a campaign whose every wave reported
+    writes the byte-identical verdict it wrote before. When present it is the
+    operator's cue that ``failing_units`` is the last OBSERVED set, not this
+    wave's — the loop stopped on a number it did not measure.
+    """
+    unmeasured = _unmeasured_waves(state)
+    return {"unmeasured_waves": unmeasured} if unmeasured else {}
+
+
 def _wave_history(state: dict[str, Any], limit: int = 4) -> list[dict[str, Any]]:
     """Compact per-wave digest handed to the next wave's evidence harvest."""
     out: list[dict[str, Any]] = []
@@ -331,6 +366,17 @@ def _default_run_wave_fn(wave_no: int, quarantined: set[str]) -> dict[str, Any]:
     # wave reading $0 — which blinds the autoraise predictor (never sees a FUNDED
     # wave → never stops) and _projected_wave_cost. Snapshot before/after instead.
     cost_before = _default_cost_fn()
+    # panel-verdict.json lives in the RUN dir, which every wave of a campaign
+    # shares. A wave that dies before writing one would otherwise be scored on
+    # whatever the PREVIOUS wave left there — a stale verdict read as this wave's
+    # measurement. Clear it first, so the file the wave is scored on can only
+    # have been written by the wave itself, and so its absence is a real
+    # no-verdict rather than a leftover.
+    panel_path = os.path.join(run_dir, "panel-verdict.json")
+    try:
+        os.remove(panel_path)
+    except OSError:
+        pass
     # The wave is a long-lived subprocess with no other bound, and it can finish
     # its work and then hang in teardown: observed 2026-09-20, a wave wrote
     # sweep-result.json and then blocked forever acquiring a lock inside a
@@ -357,11 +403,16 @@ def _default_run_wave_fn(wave_no: int, quarantined: set[str]) -> dict[str, Any]:
         wave_exit = -1
         wave_timed_out = True
     cost_after = _default_cost_fn()
-    panel_path = os.path.join(run_dir, "panel-verdict.json")
+    # ``failing_units`` is deliberately ABSENT from the defaults. A wave that
+    # writes no panel has not measured its units, and defaulting the key to []
+    # made "never measured" indistinguishable from a measured "nothing failing":
+    # the folded zero then read as a satisfied goal, and the NEXT wave's real
+    # count read as a regression from it. ``verdict: fail`` says the wave failed
+    # as a wave; the missing key says we cannot say what it left behind, which
+    # ``drive`` folds into ``verdict_known: False``.
     payload: dict[str, Any] = {
         "wave": wave_no,
         "verdict": "fail",
-        "failing_units": [],
         "total_units": 0,
         "exit_code": wave_exit,
         "timed_out": wave_timed_out,
@@ -593,6 +644,10 @@ def _raise_predicted_helpful(state: dict[str, Any], patience: int) -> bool:
     funded = [
         w for w in state.get("waves", [])
         if float(w.get("cost_usd", 0.0) or 0.0) >= min_funded
+        # A wave that never reported has no signature to compare — counting it
+        # would read as a moved fingerprint (None != sha) and buy a raise on a
+        # measurement that does not exist.
+        and w.get("verdict_known", True)
     ]
     if len(funded) < max(2, patience):
         return True  # not enough FUNDED evidence to call it genuinely stuck
@@ -714,7 +769,7 @@ def drive(
                 state, spent_now, autoraise_patience, budget_total_usd
             )
             if action == "stop":
-                failing_now = state["waves"][-1]["failing_after"] if state["waves"] else []
+                failing_now = _last_measured_failing(state)
                 payload = {
                     "stop": "budget_autoraise",
                     "reason": value,
@@ -733,7 +788,7 @@ def drive(
         projected = _projected_wave_cost(state)
         spent = float(resolved_cost())
         if projected > 0 and (spent + projected) > budget_total_usd:
-            failing_now = state["waves"][-1]["failing_after"] if state["waves"] else []
+            failing_now = _last_measured_failing(state)
             payload = {
                 "stop": "budget",
                 "waves": len(state["waves"]),
@@ -766,9 +821,7 @@ def drive(
         # is filled in below, once the sweep has named the units it dispatched.
         shield_mode = resolve_shield_mode()
         decision_ts = int(time.time())
-        probed_before = (
-            sorted(state["waves"][-1].get("failing_after") or []) if state.get("waves") else []
-        )
+        probed_before = _last_measured_failing(state)
         decision_context: dict[str, Any] = {
             "goal_id": goal_id,
             "wave": wave_no,
@@ -795,12 +848,25 @@ def drive(
         # (``failing_units``) or a richer test-synthesized key
         # (``failing_after``). ``failing_before`` defaults to the prior
         # wave's failing_after (the units the hunt tried to fix).
+        #
+        # A wave's failing set is KNOWN only when the verdict NAMED it. No key
+        # means no measurement was taken: the wave timed out, crashed, or its
+        # verifier emitted an ``error`` panel (goal_check writes no unit list on
+        # that path). Folding the absence as an empty set is how a dead wave got
+        # read as a green one — and how the next wave's real count got read as a
+        # regression from zero, which killed the campaign.
+        verdict_known = "failing_after" in verdict_dict or "failing_units" in verdict_dict
         if "failing_after" in verdict_dict:
             failing_after = sorted(verdict_dict.get("failing_after", []) or [])
-        else:
+        elif "failing_units" in verdict_dict:
             failing_after = sorted(verdict_dict.get("failing_units", []) or [])
-        prev_waves = state.get("waves", [])
-        prev_after = prev_waves[-1]["failing_after"] if prev_waves else []
+        else:
+            failing_after = []
+        # What the loop last actually OBSERVED: this wave's own set when it
+        # measured one, otherwise the newest wave that did. A stop report must
+        # never present an unobserved empty set as the loop's failing units.
+        failing_now = failing_after if verdict_known else _last_measured_failing(state)
+        prev_after = _last_measured_failing(state)
         if "failing_before" in verdict_dict:
             failing_before = sorted(verdict_dict.get("failing_before", []) or [])
         else:
@@ -853,6 +919,7 @@ def drive(
             reasons=unit_reasons,
             attempted=attempted,
             diagnostics=diagnostics,
+            verdict_known=verdict_known,
         )
 
         # Record the DECISION, not just its outcome. ``record_wave`` above keeps
@@ -893,9 +960,13 @@ def drive(
                     "context": decision_context,
                     "action": decision_action,
                     "outcome": {
-                        "failing_after": sorted(failing_after),
+                        "failing_after": failing_now,
+                        "verdict_known": verdict_known,
                         "attempted": decision_action["units"],
-                        "headroom_closed": len(failing_before) - len(failing_after),
+                        "headroom_closed": (
+                            len(failing_before) - len(failing_after)
+                            if verdict_known else None
+                        ),
                         "predicate_moved": last_wave.get("predicate_moved"),
                         "child_diagnostics": last_wave.get("child_diagnostics") or {},
                         "cost_usd": cost_usd,
@@ -911,7 +982,7 @@ def drive(
                 "guard": shield_verdict["guard"],
                 "reason": shield_verdict["reason"],
                 "waves": wave_no,
-                "failing_units": sorted(failing_after),
+                "failing_units": failing_now,
                 "quarantined_units": sorted(quarantined),
             }
             save_state(state, resolved_state_dir)
@@ -956,7 +1027,7 @@ def drive(
             payload = {
                 "stop": "nothing_to_fix",
                 "waves": wave_no,
-                "failing_units": failing_after,
+                "failing_units": failing_now,
                 "quarantined_units": sorted(quarantined),
             }
             save_state(state, resolved_state_dir)
@@ -979,11 +1050,12 @@ def drive(
             payload = {
                 "stop": "budget",
                 "waves": wave_no,
-                "failing_units": failing_after,
+                "failing_units": failing_now,
                 "quarantined_units": sorted(quarantined),
                 "spent_usd": spent,
                 "projected_next_cost": projected,
                 "budget_total_usd": budget_total_usd,
+                **_unknown_fragment(state),
             }
             save_state(state, resolved_state_dir)
             _write_final_verdict(resolved_state_dir, payload)
@@ -996,8 +1068,9 @@ def drive(
                 "stop": "diverged",
                 "signature": div,
                 "waves": wave_no,
-                "failing_units": failing_after,
+                "failing_units": failing_now,
                 "quarantined_units": sorted(quarantined),
+                **_unknown_fragment(state),
             }
             save_state(state, resolved_state_dir)
             _write_final_verdict(resolved_state_dir, payload)
@@ -1008,7 +1081,7 @@ def drive(
             payload = {
                 "stop": "all_quarantined",
                 "waves": wave_no,
-                "failing_units": failing_after,
+                "failing_units": failing_now,
                 "quarantined_units": sorted(quarantined),
             }
             save_state(state, resolved_state_dir)
@@ -1019,7 +1092,7 @@ def drive(
         save_state(state, resolved_state_dir)
 
     # max_waves reached — soft "exhaustion" stop (safety case).
-    final_failing = state["waves"][-1]["failing_after"] if state["waves"] else []
+    final_failing = _last_measured_failing(state)
     payload = {
         "stop": "max_waves_reached",
         "waves": len(state["waves"]),
@@ -1029,6 +1102,7 @@ def drive(
             if len(h[-quarantine_patience:]) >= quarantine_patience
             and len(set(h[-quarantine_patience:])) == 1
         ),
+        **_unknown_fragment(state),
     }
     save_state(state, resolved_state_dir)
     _write_final_verdict(resolved_state_dir, payload)
