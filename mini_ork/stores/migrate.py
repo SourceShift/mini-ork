@@ -162,6 +162,15 @@ def _is_out_of_order(filename: str, applied_names: set[str]) -> bool:
     return any(name > filename for name in applied_names)
 
 
+# Cutover for the canonical-checksum scheme (shipped 2026-09-26, commit 6d36c1e5).
+# Rows whose applied_at is BEFORE this moment predate the canonical runner and
+# carry unverifiable provenance (62 recovery-seeded + 5 hand-applied rows in the
+# 2026-09-25 live ledger); treat them as amnestied rather than drift evidence.
+# ISO-8601 string comparison sorts epoch-numeric strings ('178…') before any
+# '2026-…' value, which matches the intended semantics.
+_CANON_CUTOVER = "2026-09-26T00:00:00Z"
+
+
 def _db(db: str | None) -> str:
     if db:
         return db
@@ -398,11 +407,13 @@ def migrate_apply(migrations_dir: str, dry_run: bool = False, db: str | None = N
         sum_hex = checksum(f)
         canon_sum = canonical_checksum(f)
         row = con.execute(
-            "SELECT COALESCE(checksum,'') FROM schema_migrations WHERE filename=?",
+            "SELECT COALESCE(checksum,''), COALESCE(applied_at,'') "
+            "FROM schema_migrations WHERE filename=?",
             (filename,)).fetchone()
         applied = row is not None
         if applied:
             applied_sum = row[0]
+            applied_at = row[1]
             if _checksum_clean(applied_sum, sum_hex, canon_sum):
                 # Clean — but if the stored row still uses the raw scheme,
                 # re-encode it to canonical so future comment-only rewords
@@ -414,7 +425,7 @@ def migrate_apply(migrations_dir: str, dry_run: bool = False, db: str | None = N
                         (canon_sum, ver, filename))
                     con.commit()
                 continue
-            if is_legacy_checksum(applied_sum):
+            if is_legacy_checksum(applied_sum) or applied_at < _CANON_CUTOVER:
                 if not dry_run:
                     con.execute(
                         "UPDATE schema_migrations SET checksum=?, "
@@ -473,17 +484,20 @@ def migrate_status(migrations_dir: str, db: str | None = None) -> tuple[int, int
     con = sqlite3.connect(db)
     for f in files:
         row = con.execute(
-            "SELECT COALESCE(checksum,'') FROM schema_migrations WHERE filename=?",
+            "SELECT COALESCE(checksum,''), COALESCE(applied_at,'') "
+            "FROM schema_migrations WHERE filename=?",
             (f.name,)).fetchone()
         if row is None:
             pending += 1
         else:
             applied_sum = row[0]
+            applied_at = row[1]
             if is_legacy_checksum(applied_sum):
                 continue
             sum_hex = checksum(f)
             canon_sum = canonical_checksum(f)
-            if not _checksum_clean(applied_sum, sum_hex, canon_sum):
+            if not _checksum_clean(applied_sum, sum_hex, canon_sum) \
+                    and applied_at >= _CANON_CUTOVER:
                 drifted += 1
     con.close()
     return total - pending, pending, drifted, total
@@ -496,16 +510,19 @@ def migrate_verify(migrations_dir: str, db: str | None = None) -> int:
     con = sqlite3.connect(db)
     for f in sorted(Path(migrations_dir).glob("*.sql")):
         row = con.execute(
-            "SELECT COALESCE(checksum,'') FROM schema_migrations WHERE filename=?",
+            "SELECT COALESCE(checksum,''), COALESCE(applied_at,'') "
+            "FROM schema_migrations WHERE filename=?",
             (f.name,)).fetchone()
         if row is None:
             continue
         applied_sum = row[0]
+        applied_at = row[1]
         if is_legacy_checksum(applied_sum):
             continue
         sum_hex = checksum(f)
         canon_sum = canonical_checksum(f)
-        if not _checksum_clean(applied_sum, sum_hex, canon_sum):
+        if not _checksum_clean(applied_sum, sum_hex, canon_sum) \
+                and applied_at >= _CANON_CUTOVER:
             rc = 1
     con.close()
     return rc
