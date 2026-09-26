@@ -573,8 +573,17 @@ def _expr_is_pinned(expr: ast.AST | None, tree: ast.AST, helpers: set[str],
     if expr is None:
         return False
     if isinstance(expr, ast.Dict):
-        return any(isinstance(k, ast.Constant) and k.value == "PYTHONSAFEPATH"
-                   for k in expr.keys)
+        for key, value in zip(expr.keys, expr.values):
+            if key is None:
+                # ``{**base}`` / ``{**base, "K": v}`` — the pin rides in on the
+                # unpacked mapping. Reading only literal keys would reject the
+                # very "one policy, applied everywhere" shape this probe's
+                # docstring asks for: a shared env builder spread into a dict.
+                if _expr_is_pinned(value, tree, helpers, seen):
+                    return True
+            elif isinstance(key, ast.Constant) and key.value == "PYTHONSAFEPATH":
+                return True
+        return False
     if isinstance(expr, ast.Call):
         func = expr.func
         name = getattr(func, "attr", None) or getattr(func, "id", None)

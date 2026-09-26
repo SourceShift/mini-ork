@@ -33,6 +33,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from mini_ork.cli.main import _module_env
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Help text — verbatim copy of bash's `cat <<'EOF' … EOF` block in _usage().
 # ─────────────────────────────────────────────────────────────────────────────
@@ -82,10 +84,7 @@ class Findings:
 def _infer_recipe(kickoff: str, root: str) -> str:
     if not os.path.isfile(kickoff):
         return ""
-    env = dict(os.environ)
-    env["MINI_ORK_DRY_RUN"] = "1"
-    env["PYTHONPATH"] = root + (os.pathsep + env["PYTHONPATH"]
-                                if env.get("PYTHONPATH") else "")
+    env = {**_module_env(root), "MINI_ORK_DRY_RUN": "1"}
     result = subprocess.run(
         [sys.executable, "-m", "mini_ork.cli.classify", kickoff],
         capture_output=True,  # bash: 2>/dev/null, stdout piped to grep

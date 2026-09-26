@@ -27,6 +27,7 @@ from mini_ork.context import (
     publish_env,
     run_context_scope,
 )
+from mini_ork.cli.main import _module_env, _reflect_timeout_seconds
 from mini_ork.observability.node_events import _now_ms, mo_node_end, mo_node_start
 from mini_ork.workflow.store import make_artifact_store
 
@@ -564,13 +565,10 @@ def _handle_reflector_early(root):
         subprocess.run(
             [sys.executable, "-m", "mini_ork.cli.reflect"],
             capture_output=True,
-            env={
-                **os.environ,
-                "MINI_ORK_ROOT": root,
-                "PYTHONPATH": root + os.pathsep + os.environ.get("PYTHONPATH", ""),
-            },
+            timeout=_reflect_timeout_seconds(),
+            env={**_module_env(root), "MINI_ORK_ROOT": root},
         )
-    except OSError:
+    except (OSError, subprocess.TimeoutExpired):
         pass
     return 0, "done"
 
@@ -986,10 +984,7 @@ def _handle_verifier(ctx: NodeDispatch):
             except OSError:
                 pass
         return _publish_success() if rc == 0 else (1, "error")
-    module_env = dict(os.environ)
-    module_env["PYTHONPATH"] = ctx.root + (
-        os.pathsep + module_env["PYTHONPATH"] if module_env.get("PYTHONPATH") else ""
-    )
+    module_env = _module_env(ctx.root)
     rc = subprocess.run([
         sys.executable, "-m", "mini_ork.cli.verify", "--plan", ctx.plan_path,
         "--task-class", ctx.task_class, artifact,

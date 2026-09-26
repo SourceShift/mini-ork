@@ -148,6 +148,21 @@ def _module_env(root):
     return env
 
 
+def _reflect_timeout_seconds() -> int:
+    """The wall-clock bound on the post-verdict reflect child.
+
+    Reflect runs after the verdict is already final, so it can never change the
+    outcome — only hold the process open. A lane that never returns used to
+    wedge `mini-ork run` forever; the campaign launcher worked around it with a
+    six-minute shell watchdog. That bound belongs in the code that spawns the
+    child, not in the script that calls it.
+    """
+    try:
+        return max(1, int(os.environ.get("MO_REFLECT_TIMEOUT_SECONDS", "360")))
+    except ValueError:
+        return 360
+
+
 def resolve_recipe(root: str, task_class: str) -> str:
     """Verbatim transcription of the user-first recipe-resolution python."""
     import yaml
@@ -681,14 +696,18 @@ def _run_lifecycle_impl(argv, root, sink) -> int:
     # ── reflect (best-effort, Python-sole entrypoint) ──
     if os.environ.get("MO_AUTO_REFLECT", "1") == "1":
         sys.stdout.write("── reflect (auto, since run start) ──\n")
-        subprocess.run(
-            [sys.executable, "-m", "mini_ork.cli.reflect", "--since", str(t0)],
-            capture_output=True,
-            env={
-                **_module_env(root),
-                "MO_REFLECTION_BATCH": os.environ.get("MO_REFLECTION_BATCH", "25"),
-            },
-        )
+        try:
+            subprocess.run(
+                [sys.executable, "-m", "mini_ork.cli.reflect", "--since", str(t0)],
+                capture_output=True,
+                timeout=_reflect_timeout_seconds(),
+                env={
+                    **_module_env(root),
+                    "MO_REFLECTION_BATCH": os.environ.get("MO_REFLECTION_BATCH", "25"),
+                },
+            )
+        except subprocess.TimeoutExpired:
+            sys.stdout.write("── reflect (timed out; skipped) ──\n")
 
     # ── trajectory retention (roadmap Step 2 / A2): best-effort TTL prune of
     # turn_jsonl artifacts. MO_TRAJECTORY_TTL_DAYS=0 disables; never gates.
