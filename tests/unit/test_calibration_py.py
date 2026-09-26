@@ -12,6 +12,9 @@ mode of a calibration layer is not a wrong number, it is an invented one.
 """
 from __future__ import annotations
 
+import hashlib
+import json
+import math
 import sqlite3
 import sys
 from pathlib import Path
@@ -363,3 +366,111 @@ def test_pre_0057_database_fails_open(tmp_path, monkeypatch):
     con.close()
     assert cal.load_margin_rows(dbp, "code-fix", lane="lensA") == []
     assert cal.should_escalate(dbp, "code-fix", 0.5, lane="lensA") == (False, None)
+
+
+# ── vendored reference vectors (varunkotte6/ucci @ 4e61fd73) ─────────────────
+#
+# The tests above are hand-written: they assert the properties mini-ork needs.
+# These assert *agreement with the reference implementation* — the one claim the
+# module docstring makes and cannot check by itself. "PAV is twenty lines of
+# list arithmetic" is only reassuring if those twenty lines are the paper's
+# twenty lines, and a monotone smoother can satisfy every property above while
+# still disagreeing with the reference about where the blocks fall.
+#
+# The fixture is vendored unmodified; see NOTICE for the licence and provenance.
+
+GOLDEN = REPO / "tests" / "fixtures" / "ucci-calibration.json"
+# sha256 of the vendored bytes. Re-vendoring from upstream is a deliberate act:
+# update this constant in the same commit, so the diff says the vectors moved.
+GOLDEN_SHA256 = "f60df2ed94b083735ec3784356400b941d18250abd1560d54360e6878b274838"
+GOLDEN_TOLERANCE = 1e-12
+# The ``pav`` cases mini-ork's signature can express: equal weight, no error.
+GOLDEN_PAV_IDS = {
+    "pav_known", "pav_decreasing", "pav_constant", "pav_single",
+    "pav_late_violator", "pav_random_300", "pav_binary_500",
+}
+
+
+def _golden() -> dict:
+    return json.loads(GOLDEN.read_text(encoding="utf-8"))
+
+
+def _equal_weight_pav_cases() -> list:
+    return [c for c in _golden()["cases"]
+            if c["fn"] == "pav" and c["input"].get("w") is None and "error" not in c]
+
+
+def test_the_vendored_vectors_are_the_pinned_file():
+    """The fixture is pinned, not floating: bytes, schema, and case corpus.
+
+    If this fails on the hash alone, either upstream vectors were re-vendored
+    (update GOLDEN_SHA256 in the same commit) or something normalised the file
+    on checkout (there is no .gitattributes today, so that would be new).
+    """
+    assert GOLDEN.is_file(), f"vendored fixture missing: {GOLDEN}"
+    assert hashlib.sha256(GOLDEN.read_bytes()).hexdigest() == GOLDEN_SHA256
+    doc = _golden()
+    assert doc["schema"] == "ucci-golden/1"
+    assert doc["tolerance"] == GOLDEN_TOLERANCE
+    assert {c["id"] for c in _equal_weight_pav_cases()} == GOLDEN_PAV_IDS
+
+
+def test_pav_matches_the_reference_on_equal_weight_cases():
+    """Every equal-weight reference vector, to the file's own 1e-12 tolerance."""
+    cases = _equal_weight_pav_cases()
+    assert cases, "no equal-weight pav cases selected — the filter is wrong"
+    for case in cases:
+        got = cal.pav(list(case["input"]["y"]))
+        want = case["expected"]["fit"]
+        assert got == pytest.approx(want, abs=GOLDEN_TOLERANCE), case["id"]
+
+
+def test_the_equal_weight_corpus_actually_exercises_ties():
+    """Ties are the point of the exercise, so assert the corpus contains them.
+
+    Without this, a later edit could narrow the selection to ``pav_single`` and
+    leave the conformance test passing over a corpus that tests nothing.
+    """
+    cases = {c["id"]: c for c in _equal_weight_pav_cases()}
+    # pav_constant: every input equal — the degenerate tie.
+    assert cases["pav_constant"]["input"]["y"] == [0.3] * 5
+    # pav_known: [1,3,2,4] pools the middle pair onto a shared 2.5.
+    assert cases["pav_known"]["expected"]["fit"] == [1.0, 2.5, 2.5, 4.0]
+    # pav_binary_500: 0/1 inputs, so the fit is long runs of equal values.
+    fit = cases["pav_binary_500"]["expected"]["fit"]
+    run = longest = 1
+    for a, b in zip(fit, fit[1:]):
+        run = run + 1 if a == b else 1
+        longest = max(longest, run)
+    assert longest > 10, longest
+
+
+def test_the_reference_validates_where_mini_ork_does_not():
+    """Six of the reference's fifteen ``pav`` cases assert errors mini-ork's port
+    cannot produce — two on values (empty, NaN), four on the weight argument it
+    does not take. Recording the gap here keeps the vendored file honest.
+
+    The gap is safe because neither invalid *value* is reachable from mini-ork's
+    own call path, and the assertions below are what makes that a fact rather
+    than a hope.
+    """
+    errors = {c["id"]: c["error"] for c in _golden()["cases"]
+              if c["fn"] == "pav" and c["input"].get("w") is None and "error" in c}
+    assert set(errors) == {"pav_error_empty", "pav_error_nan"}
+    assert all(e["type"] == "ValueError" for e in errors.values())
+
+    # mini-ork returns instead of raising.
+    assert cal.pav([]) == []
+    poisoned = cal.pav([1.0, float("nan")])
+    assert len(poisoned) == 2 and all(math.isnan(v) for v in poisoned)
+
+    # Unreachable #1: fit_error_map short-circuits an empty slice before PAV.
+    assert cal.fit_error_map([]) == ([], [])
+
+    # Unreachable #2: a NaN margin cannot survive the query. SQLite has no NaN
+    # in REAL — it stores one as NULL, which `route_margin IS NOT NULL` drops.
+    con = sqlite3.connect(":memory:")
+    con.execute("CREATE TABLE t (m REAL)")
+    con.execute("INSERT INTO t VALUES (?)", (float("nan"),))
+    assert con.execute("SELECT m FROM t").fetchone()[0] is None
+    con.close()
