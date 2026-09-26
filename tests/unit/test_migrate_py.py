@@ -112,10 +112,12 @@ def test_rehash_legacy(tmp_path, migdir):
     rc_p, out_p = mig.migrate_apply(migdir, db=db_p)
     assert rc_p == 0
     assert any("[rehash]" in l for l in out_p)
-    # re-hashed to the real sha256
+    # re-hashed to the sha256 of the canonical form — the ledger scheme since
+    # 6d36c1e5, which survives a comment-only reword of the file
+    src = str(Path(migdir) / "001_foo.sql")
     rows = dict((r[0], r[1]) for r in _sm_rows(db_p))
-    assert rows["001_foo.sql"] == mig.checksum(
-        str(Path(migdir) / "001_foo.sql"))
+    assert rows["001_foo.sql"] == mig.canonical_checksum(src)
+    assert rows["001_foo.sql"] != mig.checksum(src)  # not the raw-bytes hash
 
 
 def test_drift_fails(tmp_path, migdir):
