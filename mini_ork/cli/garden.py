@@ -6,7 +6,10 @@ orphaned worktrees, output-path collisions, missing env-var docs, and
 oversize recipe prompts. Every finding ships a remediation command.
 
 This is a parity port: stdout/stderr text, finding order, exit codes, and
-even one bash quirk (see ``_orphan_stashes``) match the bash source.
+even one bash quirk (see ``_orphan_stashes``) match the bash source. One
+check has no bash counterpart — ``_check_inert_mechanisms`` reads
+``state.db`` rather than the filesystem (see its comment) and runs after the
+ported five, so their output order and text are untouched.
 
     main(argv=None) -> int
 
@@ -265,6 +268,100 @@ def _check_env_docs(root: str, findings: Findings) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Check 6 — installed-but-inert mechanisms. Extension beyond the bash source:
+# the only check here that reads ``state.db`` rather than the filesystem.
+#
+# A mechanism can be wired in, switched on, and still never fire. UCCI
+# escalation abstains until its calibration slice clears a sample floor, so a
+# tree with a live router and five margin rows looks healthy while the
+# escalation path is structurally unreachable — and no filesystem check can
+# tell that from a mechanism that is working.
+#
+# Three trace columns are the chain, each written by a different migration:
+#
+#   route_margin IS NOT NULL              the calibration input exists (0057)
+#   predicted_error IS NOT NULL           the map produced a prediction (0059)
+#   route_source = 'calibrated_escalation'  the pick was overridden (0054)
+#
+# Severity is deliberately ``info``, never ``warning``: a fresh database has no
+# rows and a mechanism switched off has no firings, and neither is drift. A
+# correctly dormant mechanism must never turn --strict red.
+# ─────────────────────────────────────────────────────────────────────────────
+def _check_inert_mechanisms(home: str, findings: Findings) -> None:
+    import sqlite3
+
+    db = os.environ.get("MINI_ORK_DB") or os.path.join(home, "state.db")
+    if not os.path.isfile(db):
+        return
+    from mini_ork.dispatch import calibration
+
+    if not calibration.enabled():
+        findings.info(
+            "UCCI escalation disabled (MO_UCCI=0)",
+            "unset MO_UCCI to restore calibrated escalation",
+        )
+        return
+
+    floor = calibration.min_samples()
+    try:
+        con = sqlite3.connect(db)
+        con.execute("PRAGMA busy_timeout=5000")
+        try:
+            # Grouped, so the result set is bounded by #task_class x #lane
+            # rather than by the trace count.
+            groups = con.execute(
+                "SELECT task_class, agent_version_id, COUNT(*), "
+                "       SUM(CASE WHEN predicted_error IS NOT NULL THEN 1 ELSE 0 END) "
+                "FROM execution_traces "
+                "WHERE route_margin IS NOT NULL AND created_at >= ? "
+                "GROUP BY task_class, agent_version_id",
+                (calibration.recent_cutoff(),)).fetchall()
+            fired, last = con.execute(
+                "SELECT COUNT(*), MAX(created_at) FROM execution_traces "
+                "WHERE route_source = 'calibrated_escalation'").fetchone()
+        finally:
+            con.close()
+    except sqlite3.Error:
+        # Locked, foreign, or pre-migration database — fail open. Reporting
+        # "0 firings" from a DB that cannot answer would be a false alarm, and
+        # the columns read above only exist from migration 0057 onward.
+        return
+
+    # ``_fit`` tries the lane's own slice first, then the task_class pooled
+    # across lanes, so a slice counts as fitted if either grouping clears the
+    # floor. Anything less means the map abstains — for every lane in it.
+    pooled: dict[str, int] = {}
+    for task_class, _lane, n, _pred in groups:
+        pooled[task_class] = pooled.get(task_class, 0) + n
+    lane_sizes = [n for _tc, _lane, n, _pred in groups]
+    best = max(lane_sizes + list(pooled.values()), default=0)
+    rows = sum(lane_sizes)
+    predictions = sum(p for _tc, _lane, _n, p in groups)
+
+    if fired:
+        # All-time on purpose, and without the windowed counts: a mechanism that
+        # fired before the recency window is not dead, and mixing the two clocks
+        # in one line would read as "0 predictions, 3 escalations".
+        findings.info(
+            f"UCCI escalation fired: {fired} escalation(s), last {last}",
+            "no action; the map is consulted and overriding picks",
+        )
+    elif best < floor:
+        findings.info(
+            f"UCCI escalation installed but inert: {rows} margin row(s), largest slice "
+            f"{best} < floor {floor}; the map abstains on every call",
+            f"feed one slice {floor - best} more margin row(s), or lower "
+            "MO_UCCI_MIN_SAMPLES to smoke the path",
+        )
+    else:
+        findings.info(
+            f"UCCI escalation fitted but never fired: largest slice {best} >= floor "
+            f"{floor}, {predictions} prediction(s), 0 escalation(s)",
+            "inspect the margin distribution against MO_UCCI_TARGET_ERROR",
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Path resolution — the Python-side replacement for sourcing lib/paths.sh.
 # ─────────────────────────────────────────────────────────────────────────────
 def _resolve_paths() -> tuple[str, str, str]:
@@ -306,6 +403,7 @@ def main(argv: list[str] | None = None) -> int:
     _check_stale_runs(home, findings)
     _check_orphan_stashes(target_repo, findings)
     _check_env_docs(root, findings)
+    _check_inert_mechanisms(home, findings)  # no bash counterpart; DB-backed
 
     # ── summary (order mirrors bash) ──
     e, w, i = findings.errors, findings.warnings, findings.infos

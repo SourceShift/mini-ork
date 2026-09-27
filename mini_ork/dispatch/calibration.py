@@ -53,6 +53,16 @@ def _enabled() -> bool:
     return os.environ.get("MO_UCCI", "1").strip().lower() not in ("0", "false", "no", "")
 
 
+def enabled() -> bool:
+    """Public form of ``_enabled``.
+
+    A caller that *reports on* the mechanism rather than making a routing
+    decision needs this to tell "switched off" apart from "switched on and never
+    fired". Those look identical in the trace columns, and only one is drift.
+    """
+    return _enabled()
+
+
 def _env_float(name: str, default: float) -> float:
     try:
         return float(os.environ.get(name, str(default)))

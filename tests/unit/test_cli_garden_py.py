@@ -11,9 +11,11 @@ from __future__ import annotations
 
 import os
 import shutil
+import sqlite3
 import subprocess
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -37,6 +39,9 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setenv("MINI_ORK_ROOT", str(root))
     monkeypatch.setenv("MINI_ORK_HOME", str(home))
     monkeypatch.setenv("MINI_ORK_TARGET_REPO", str(target))
+    # The inert-mechanism check resolves MINI_ORK_DB before $home/state.db, so an
+    # ambient value would point the fixture at a real database.
+    monkeypatch.delenv("MINI_ORK_DB", raising=False)
     return root, home, target
 
 
@@ -44,6 +49,30 @@ def _contract(recipe_dir: Path, outputs: list[str]) -> None:
     recipe_dir.mkdir(parents=True, exist_ok=True)
     (recipe_dir / "artifact_contract.yaml").write_text(
         "outputs:\n" + "".join(f"  - {o}\n" for o in outputs), encoding="utf-8")
+
+
+def _ts() -> str:
+    """A ``created_at`` inside the recency window, in the DB's own format."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+
+def _db(home: Path, rows: list[tuple]) -> None:
+    """``home/state.db`` with the ``execution_traces`` columns garden reads.
+
+    Each row is ``(task_class, lane, margin, predicted_error, route_source,
+    created_at)`` — ``None`` where the column is unset, which is how the real
+    trace writer leaves a route the router never calibrated.
+    """
+    con = sqlite3.connect(home / "state.db")
+    con.execute(
+        "CREATE TABLE execution_traces (task_class TEXT, agent_version_id TEXT, "
+        "route_margin REAL, predicted_error REAL, route_source TEXT, "
+        "created_at TEXT, status TEXT)")
+    for task_class, lane, margin, pred, source, created in rows:
+        con.execute("INSERT INTO execution_traces VALUES (?,?,?,?,?,?,?)",
+                    (task_class, lane, margin, pred, source, created, "success"))
+    con.commit()
+    con.close()
 
 
 # ── usage / arg parsing ───────────────────────────────────────────────────────
@@ -227,6 +256,90 @@ def test_orphan_stash_prints_but_does_not_count(env, capsys, tmp_path):
 
     assert garden.main(["--strict"]) == 0
     assert capsys.readouterr().out == "garden: clean\n"
+
+
+# ── check 6: installed-but-inert mechanisms (DB-backed) ───────────────────────
+
+def test_absent_db_is_silent(env, capsys):
+    """No state.db: the check reports nothing. Every other check is
+    filesystem-only, so an empty home must still be a clean tree."""
+    assert garden.main([]) == 0
+    captured = capsys.readouterr()
+    assert captured.out == "garden: clean\n"
+    assert captured.err == ""
+
+
+def test_ucci_inert_below_floor_is_info_not_warning(env, capsys, monkeypatch):
+    _root, home, _target = env
+    monkeypatch.setenv("MO_UCCI", "1")
+    monkeypatch.delenv("MO_UCCI_MIN_SAMPLES", raising=False)
+    _db(home, [("code-fix", "glm", 0.40, None, None, _ts())] * 5)
+
+    assert garden.main([]) == 0
+    captured = capsys.readouterr()
+    assert ("[info]    UCCI escalation installed but inert: 5 margin row(s), "
+            "largest slice 5 < floor 12; the map abstains on every call\n") in captured.err
+    assert ("          Fix: feed one slice 7 more margin row(s), or lower "
+            "MO_UCCI_MIN_SAMPLES to smoke the path\n") in captured.err
+    assert captured.err.endswith("garden: 0 error(s), 0 warning(s), 1 info\n")
+
+    # A dormant mechanism is not drift: --strict must stay green.
+    assert garden.main(["--strict"]) == 0
+    assert capsys.readouterr().err.endswith("garden: 0 error(s), 0 warning(s), 1 info\n")
+
+
+def test_ucci_lanes_pooled_across_a_task_class_clear_the_floor(env, capsys, monkeypatch):
+    """``calibration._fit`` falls back to the task_class pooled across lanes, so
+    two lanes that each miss the floor are not inert together."""
+    _root, home, _target = env
+    monkeypatch.setenv("MO_UCCI", "1")
+    monkeypatch.delenv("MO_UCCI_MIN_SAMPLES", raising=False)
+    _db(home, [("code-fix", "glm", 0.4, None, None, _ts())] * 5
+             + [("code-fix", "minimax", 0.4, None, None, _ts())] * 7)
+
+    assert garden.main([]) == 0
+    assert ("UCCI escalation fitted but never fired: largest slice 12 >= floor 12, "
+            "0 prediction(s), 0 escalation(s)") in capsys.readouterr().err
+
+
+def test_ucci_firing_is_reported(env, capsys, monkeypatch):
+    _root, home, _target = env
+    monkeypatch.setenv("MO_UCCI", "1")
+    when = _ts()
+    _db(home, [("code-fix", "glm", 0.4, 0.9, "calibrated_escalation", when)] * 12)
+
+    assert garden.main([]) == 0
+    err = capsys.readouterr().err
+    assert f"UCCI escalation fired: 12 escalation(s), last {when}" in err
+    assert "inert" not in err
+
+
+def test_ucci_disabled_is_reported_as_disabled(env, capsys, monkeypatch):
+    """MO_UCCI=0 and "never fired" look identical in the trace columns; only one
+    is drift, so the disabled case gets its own line."""
+    _root, home, _target = env
+    monkeypatch.setenv("MO_UCCI", "0")
+    _db(home, [])
+
+    assert garden.main([]) == 0
+    err = capsys.readouterr().err
+    assert "UCCI escalation disabled (MO_UCCI=0)" in err
+    assert "inert" not in err
+
+
+def test_foreign_db_without_traces_table_fails_open(env, capsys, monkeypatch):
+    """A locked, foreign, or pre-migration DB must not be read as "0 firings"."""
+    _root, home, _target = env
+    monkeypatch.setenv("MO_UCCI", "1")
+    con = sqlite3.connect(home / "state.db")
+    con.execute("CREATE TABLE unrelated (x INTEGER)")
+    con.commit()
+    con.close()
+
+    assert garden.main([]) == 0
+    captured = capsys.readouterr()
+    assert captured.out == "garden: clean\n"
+    assert captured.err == ""
 
 
 # ── native integration ────────────────────────────────────────────────────────
