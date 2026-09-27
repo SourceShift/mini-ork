@@ -123,7 +123,7 @@ independently surfaced the feature.
 
 ## Operator & dev ergonomics (24 features)
 - **`install` (cross-platform launcher)** — managed-marker launcher into `~/.local/bin` / `%LOCALAPPDATA%`; idempotent PATH update — `mini_ork/cli/install_command.py:13` (`main`). [CONSENSUS: 3/4] [shipped]
-- **`garden` (drift detection)** — stale runs, orphan worktrees, output collisions, oversize prompts (`MAX_PROMPT_KB=32`) — `mini_ork/cli/garden.py:46`. [CONSENSUS: 3/4] [shipped]
+- **`garden` (drift detection)** — stale runs, orphan worktrees, output collisions, oversize prompts (`MAX_PROMPT_KB=32`), plus a DB-backed installed-but-inert check over the trace firing chain (info-only; fails open on a pre-migration db) — `mini_ork/cli/garden.py:46`, `mini_ork/cli/garden.py:290` (`_check_inert_mechanisms`). [CONSENSUS: 3/4] [shipped]
 - **`inject` (operator steering CLI)** — `--run-id/--role/--message/--severity/--confidence/--ttl-secs` → `operator_steering_messages` — `mini_ork/cli/inject.py:71` (`build_parser`). [CONSENSUS: 3/4] [shipped]
 - **`recover` (durable-DAG planner CLI)** — auto-resume from STEP/TURN; pure read status — `mini_ork/recovery/planner.py:1`, `mini_ork/cli/recover.py`. [CONSENSUS: 3/4] [shipped]
 - **`help`/`version`/`doctor`** — doctor preflights sqlite3/git/curl/claude/codex/python3 + provider env vars — `mini_ork/cli/main.py:597` (`_doctor_handler`), `mini_ork/cli/main.py:637`. [CONSENSUS: 2/4] [shipped]
