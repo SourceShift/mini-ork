@@ -291,7 +291,10 @@ def dispatch_node(fields, *, root, run_dir, plan_path, task_class, db, run_id,
     # Snapshot the tree BEFORE any implementer node edits it, so the reviewer
     # diff captures only the implementer's delta (not pre-existing dirt from a
     # concurrent session sharing this in-place working tree). Non-destructive.
-    _capture_pre_impl_baseline(run_dir_eff)
+    # Never from a rollback node: by then the tree already holds the run's
+    # edit, and the in-place rollback restores TO this snapshot.
+    if node_type != "rollback":
+        _capture_pre_impl_baseline(run_dir_eff)
     cost_sidecar = os.path.join(run_dir_eff, ".last-llm-cost")
 
     def _charge():
@@ -1107,13 +1110,23 @@ def _revert_inplace_diff(run_dir: str, root: str) -> bool:
     implementer: the agent edits MO_TARGET_CWD directly (and often stages), so a
     failed run leaves the harvested diff sitting in the target tree — the next
     serial epic would start from a dirty base (run-1788363267-21773-se1 left 4
-    staged paths behind). Reverse-apply the run's own framework-edit.diff; when
-    the tree drifted from the exact applied state, restore each diff path
-    individually. Run artifacts (diff, verdicts, logs) are kept per the strategy
-    name. Never touches paths outside the diff.
+    staged paths behind). Restore each path the run's framework-edit.diff names
+    to its PRE-IMPLEMENTER state. Run artifacts (diff, verdicts, logs) are kept
+    per the strategy name. Never touches paths outside the diff.
+
+    "Pre-implementer" is the ``pre-implementer-ref`` snapshot, not HEAD: a path
+    a concurrent session had already dirtied is restored to that dirty content,
+    so the rollback removes only this run's edit. Known limit: an edit another
+    session makes to the SAME path WHILE the implementer runs is
+    indistinguishable from the implementer's and is discarded with it.
     """
     def log(msg):
         print(msg, file=sys.stderr, flush=True)
+
+    def git_ok(*args):
+        return subprocess.run(["git", "-C", real_root, *args],
+                              stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL).returncode == 0
 
     diff = os.path.join(run_dir, "framework-edit.diff") if run_dir else ""
     if not (diff and os.path.isfile(diff) and os.path.getsize(diff) > 0):
@@ -1128,6 +1141,18 @@ def _revert_inplace_diff(run_dir: str, root: str) -> bool:
         except Exception:
             target_repo = root or "."
     real_root = os.path.realpath(target_repo)
+
+    baseline = "HEAD"
+    ref_path = os.path.join(run_dir, "pre-implementer-ref")
+    if os.path.isfile(ref_path):
+        with open(ref_path) as fh:
+            ref = fh.read().strip()
+        if ref and git_ok("cat-file", "-e", f"{ref}^{{commit}}"):
+            baseline = ref
+        elif ref:
+            log(f"  [warn] rollback: pre-implementer-ref {ref[:12]} not found in "
+                f"{real_root}; restoring to HEAD")
+
     numstat = subprocess.run(
         ["git", "-C", real_root, "apply", "--numstat", diff],
         capture_output=True, text=True)
@@ -1136,43 +1161,62 @@ def _revert_inplace_diff(run_dir: str, root: str) -> bool:
         parts = line.split("\t") if "\t" in line else line.split()
         if len(parts) >= 3 and parts[2]:
             paths.append(parts[2])
+    # --numstat lists only the NEW side of a rename; the old side must be
+    # restored too, or a reverted move leaves the source file deleted. (The
+    # ground-truth harvest diffs with --no-renames; an agent-written diff may not.)
+    with open(diff, errors="surrogateescape") as fh:
+        for line in fh:
+            if line.startswith("rename from "):
+                src = line[len("rename from "):].rstrip("\n")
+                if src and src not in paths:
+                    paths.append(src)
     if not paths:
         log("  [rollback] discard_worktree: diff names no paths — nothing to revert")
         return True
     # Per-path restore is state-agnostic: the agent may have left any mix of
     # staged/unstaged/partial states (git apply -R alone reverts worktree
     # CONTENT but leaves the agent's staged index entries behind — a preflight
-    # against run-1788363267-21773-se1 left 3 index corpses). checkout HEAD
-    # resets index AND worktree for paths in HEAD; created paths get unstaged
-    # and unlinked.
+    # against run-1788363267-21773-se1 left 3 index corpses).
+    pre_dirty = []
     for rel in paths:
         real = os.path.realpath(os.path.join(real_root, rel))
         if real != real_root and not real.startswith(real_root + os.sep):
             log(f"  [rollback] reject-revert: path escapes target repo: {rel}")
             continue
-        in_head = subprocess.run(
-            ["git", "-C", real_root, "cat-file", "-e", f"HEAD:{rel}"],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
-        if in_head:
-            subprocess.run(["git", "-C", real_root, "checkout", "HEAD", "--", rel],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if baseline != "HEAD" and not git_ok("diff", "--quiet", "HEAD", baseline,
+                                             "--", rel):
+            # Dirty before the run (another session's work): restore the
+            # snapshot content, then drop the agent's staging back to HEAD.
+            pre_dirty.append(rel)
+            if git_ok("cat-file", "-e", f"{baseline}:{rel}"):
+                git_ok("checkout", baseline, "--", rel)
+            elif os.path.isfile(real):
+                os.remove(real)
+            git_ok("reset", "-q", "HEAD", "--", rel)
+        elif git_ok("cat-file", "-e", f"HEAD:{rel}"):
+            # checkout HEAD resets index AND worktree.
+            git_ok("checkout", "HEAD", "--", rel)
         else:
-            subprocess.run(
-                ["git", "-C", real_root, "rm", "-f", "-q", "--cached", "--", rel],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            # Created by the run: unstage and unlink.
+            git_ok("rm", "-f", "-q", "--cached", "--", rel)
             try:
                 if os.path.isfile(real):
                     os.remove(real)
             except OSError:
                 log(f"  [rollback] could not remove created file: {rel}")
-    log(f"  [rollback] discard_worktree: per-path restore over {len(paths)} path(s)")
+    log(f"  [rollback] discard_worktree: per-path restore over {len(paths)} path(s)"
+        + (f", {len(pre_dirty)} restored to pre-run dirty state" if pre_dirty else ""))
+    clean = [p for p in paths if p not in pre_dirty]
     leftover = subprocess.run(
-        ["git", "-C", real_root, "status", "--porcelain", "--", *paths],
-        capture_output=True, text=True).stdout.strip()
-    if leftover:
-        log(f"  [warn] rollback: leftover changes after discard_worktree revert:\n{leftover}")
+        ["git", "-C", real_root, "status", "--porcelain", "--", *clean],
+        capture_output=True, text=True).stdout.strip() if clean else ""
+    drifted = [p for p in pre_dirty if not git_ok("diff", "--quiet", baseline, "--", p)]
+    if leftover or drifted:
+        log("  [warn] rollback: leftover changes after discard_worktree revert:\n"
+            + "\n".join(filter(None, [leftover, *drifted])))
         return False
-    log(f"  [rollback] discard_worktree: target tree clean of the run's {len(paths)} path(s)")
+    log(f"  [rollback] discard_worktree: target tree back to its pre-run state "
+        f"for the run's {len(paths)} path(s)")
     return True
 
 
