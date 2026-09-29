@@ -13,6 +13,10 @@ Python file exposing:
   - SEED_INPUTS: an iterable of seed inputs
   - RELATIONS:   a list of mini_ork.learning.metamorphic.MetamorphicRelation
 
+With neither variable set, ``${MINI_ORK_RUN_DIR}/metamorphic-spec.json`` is read
+when present, so any node in the run (a proposer, a kickoff step) can supply the
+data-only spec without touching the environment.
+
 No spec → a clean ``vacuous`` verdict (Layer 0 excludes it; it never inflates or
 deflates the reward). This keeps the verifier a safe no-op until a task provides
 relations. LLM-proposed relations (arXiv 2603.24774) are the richer follow-on:
@@ -59,6 +63,9 @@ def main() -> int:
     from mini_ork.learning import metamorphic as mm
     json_spec = os.environ.get("MO_METAMORPHIC_SPEC_JSON", "").strip()
     spec_path = os.environ.get("MO_METAMORPHIC_SPEC", "").strip()
+    run_dir = os.environ.get("MINI_ORK_RUN_DIR", "").strip()
+    if not json_spec and not spec_path and run_dir:
+        json_spec = os.path.join(run_dir, "metamorphic-spec.json")
 
     if json_spec and os.path.isfile(json_spec):
         try:

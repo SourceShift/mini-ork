@@ -4,6 +4,10 @@ expected_artifact: patch
 success_verifiers:
   - verifiers/typecheck.py
   - verifiers/test.py
+  # Layer 2, gold-free: fires whenever a metamorphic spec exists (MO_METAMORPHIC_SPEC,
+  # MO_METAMORPHIC_SPEC_JSON, or ${MINI_ORK_RUN_DIR}/metamorphic-spec.json). With no
+  # spec it reports vacuous, which verify records as unmeasured, never as a pass.
+  - verifiers/metamorphic.py
 
 failure_policy: request_changes
 

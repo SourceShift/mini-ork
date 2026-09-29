@@ -148,6 +148,33 @@ def _find_verifier_command(raw, plan_path):
     return ""
 
 
+def _declared_unmeasured(evidence) -> str:
+    """The note a verifier gave when it declared that it measured nothing, or ``""``.
+
+    Exit 0 with evidence is a pass, except when that evidence is the verifier
+    saying it did not check anything: a ``{"verdict": "vacuous"}`` envelope (the
+    metamorphic verifier with no spec) or an explicit ``"pass": null``. Counting
+    that as a pass is the vacuous pass the zero-byte guard exists to stop, just
+    with a few bytes of JSON in front of it. stderr is merged into the evidence,
+    so the envelope is found as the last line that parses as a JSON object.
+    """
+    text = evidence.decode("utf-8", "replace") if isinstance(evidence, bytes) else str(evidence or "")
+    for line in reversed(text.splitlines()):
+        line = line.strip()
+        if not (line.startswith("{") and line.endswith("}")):
+            continue
+        try:
+            env = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(env, dict):
+            continue
+        if env.get("verdict") == "vacuous" or ("pass" in env and env["pass"] is None):
+            return str(env.get("note") or env.get("detail") or "verifier declared vacuous")
+        return ""
+    return ""
+
+
 def _safe_trace_write(payload: dict, db: str) -> None:
     """Persist verifier telemetry without making observability a failure mode."""
     try:
@@ -317,7 +344,14 @@ def main(argv: list[str] | None = None, *, db: str | None = None, root: str | No
             if ok and os.path.getsize(ev) == 0:  # vacuous: exit 0 but no evidence → fail
                 ok = False
             rc, out_tail = r.returncode, _evidence_tail(r.stdout)
-        if ok:
+        unmeasured_note = _declared_unmeasured(Path(ev).read_bytes()) if ok else ""
+        if unmeasured_note:
+            # Neither pass nor fail: recorded so "did not run" stays visible,
+            # and kept out of both counts so it cannot lift the verdict.
+            results.append(json.dumps({"verifier": name, "pass": None,
+                                       "detail": f"unmeasured: {unmeasured_note}",
+                                       "evidence_path": ev}))
+        elif ok:
             results.append(f'{{"verifier":"{name}","pass":true,"evidence_path":"{ev}"}}'); pass_count += 1
         else:
             detail = json.dumps(out_tail or (f"exit {rc} with no output" if rc else "vacuous pass suppressed: exit 0 with empty evidence"))
