@@ -142,6 +142,48 @@ def test_a_diff_cannot_reach_outside_the_target_repo(tmp_path, monkeypatch):
     assert outside.read_text() == "do not touch\n"
 
 
+def _snapshot(run_dir: Path, repo: Path, monkeypatch) -> None:
+    """The pre-implementer snapshot the run writes before the first edit."""
+    monkeypatch.setenv("MO_TARGET_CWD", str(repo))
+    run_dir.mkdir(parents=True, exist_ok=True)
+    ex._capture_pre_impl_baseline(str(run_dir))
+
+
+def test_another_sessions_dirt_on_a_touched_path_survives(tmp_path, monkeypatch):
+    """A path already dirty before the run (another session's uncommitted
+    edit) is restored to THAT content, not reset to HEAD: rollback must remove
+    only this run's edit. Pre-fix, ``checkout HEAD`` destroyed the other work."""
+    repo = _mk_repo(tmp_path)
+    (repo / "tracked.py").write_text("original\nother session\n")
+    run_dir = tmp_path / "run"
+    _snapshot(run_dir, repo, monkeypatch)
+    (repo / "tracked.py").write_text("original\nother session\nimplementer\n")
+    _git(repo, "add", "tracked.py")
+    base = (run_dir / "pre-implementer-ref").read_text().strip()
+    (run_dir / "framework-edit.diff").write_text(_git(repo, "diff", base).stdout)
+
+    assert exh._revert_inplace_diff(str(run_dir), str(tmp_path)) is True
+    assert (repo / "tracked.py").read_text() == "original\nother session\n"
+    assert _git(repo, "diff", "--cached", "--name-only").stdout == ""  # agent's staging dropped
+
+
+def test_a_move_is_reverted_on_both_sides(tmp_path, monkeypatch):
+    """``git apply --numstat`` names only the destination of a rename; the
+    source must come back too, or the rollback leaves it deleted."""
+    repo = _mk_repo(tmp_path)
+    run_dir = tmp_path / "run"
+    _snapshot(run_dir, repo, monkeypatch)
+    _git(repo, "mv", "tracked.py", "moved.py")
+    (run_dir / "framework-edit.diff").write_text(
+        _git(repo, "diff", "-M", "--cached", "HEAD").stdout)
+    assert "rename from" in (run_dir / "framework-edit.diff").read_text()
+
+    assert exh._revert_inplace_diff(str(run_dir), str(tmp_path)) is True
+    assert (repo / "tracked.py").read_text() == "original\n"
+    assert not (repo / "moved.py").exists()
+    assert _dirty(repo) == ""
+
+
 # ── no-ops and reporting ────────────────────────────────────────────────────
 
 

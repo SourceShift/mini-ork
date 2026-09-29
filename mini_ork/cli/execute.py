@@ -1527,12 +1527,15 @@ def _capture_pre_impl_baseline(run_dir):
         # inventory too, so the ground-truth harvest can tell implementer-created
         # files apart from pre-existing untracked dirt (a node_modules symlink,
         # another session's scratch files).
-        unt = subprocess.run(["git", "-C", cwd, "ls-files", "--others",
+        unt = subprocess.run(["git", "-C", cwd, "ls-files", "-z", "--others",
                               "--exclude-standard"],
-                             capture_output=True, text=True)
+                             capture_output=True, text=True,
+                             errors="surrogateescape")
         if unt.returncode == 0:
-            with open(os.path.join(run_dir, "pre-implementer-untracked"), "w") as fh:
-                fh.write(unt.stdout)
+            # -z: unquoted names, so non-ASCII paths match the harvest's list.
+            with open(os.path.join(run_dir, "pre-implementer-untracked"), "w",
+                      errors="surrogateescape") as fh:
+                fh.write("".join(p + "\n" for p in unt.stdout.split("\0") if p))
     except Exception:
         pass
 
@@ -1578,27 +1581,40 @@ def _harvest_framework_edit_ground_truth(run_dir, target):
     unt_path = os.path.join(run_dir, "pre-implementer-untracked")
     if os.path.isfile(unt_path):
         try:
-            baseline_untracked = {
-                line for line in open(unt_path).read().splitlines() if line
-            }
+            with open(unt_path, errors="surrogateescape") as fh:
+                baseline_untracked = {line for line in fh.read().splitlines() if line}
         except OSError:
             baseline_untracked = set()
+
+    if baseline and subprocess.run(
+            ["git", "-C", target, "cat-file", "-e", f"{baseline}^{{commit}}"],
+            capture_output=True).returncode != 0:
+        # The baseline was captured in a different tree than the one being
+        # harvested, so diffing against it is meaningless. Say so loudly.
+        print(f"  [ground-truth] baseline {baseline[:12]} is not a commit in "
+              f"{target}; keeping agent artifact", file=sys.stderr)
+        return True, ""
+
+    # surrogateescape: a non-UTF-8 byte in the tree must round-trip into the
+    # diff file unchanged, not raise and silently fall back to the agent's diff.
+    _txt = {"capture_output": True, "text": True, "errors": "surrogateescape"}
 
     def _delta():
         # Diff against a COMMIT-ish, never the index: agents sometimes
         # `git add` inside the target, which would blank a plain `git diff`.
+        # --no-renames: a move appears as its own delete + create, so the
+        # in-place rollback can name (and restore) both sides of it.
         tracked = subprocess.run(
-            ["git", "-C", target, "diff", "--no-color", "--full-index",
-             "--binary", baseline or "HEAD"],
-            capture_output=True, text=True, timeout=300)
+            ["git", "-C", target, "diff", "--no-color", "--no-renames",
+             "--full-index", "--binary", baseline or "HEAD"],
+            timeout=300, **_txt)
         if tracked.returncode != 0:
             return None
         parts = [tracked.stdout] if tracked.stdout.strip() else []
         now = subprocess.run(
-            ["git", "-C", target, "ls-files", "--others", "--exclude-standard"],
-            capture_output=True, text=True, timeout=60)
-        for rel in (now.stdout or "").splitlines():
-            rel = rel.strip()
+            ["git", "-C", target, "ls-files", "-z", "--others", "--exclude-standard"],
+            timeout=60, **_txt)
+        for rel in (now.stdout or "").split("\0"):
             if not rel or rel in baseline_untracked:
                 continue
             if rel.startswith(".mini-ork/"):
@@ -1608,7 +1624,7 @@ def _harvest_framework_edit_ground_truth(run_dir, target):
             new = subprocess.run(
                 ["git", "-C", target, "diff", "--no-color", "--binary",
                  "--no-index", "--", "/dev/null", rel],
-                capture_output=True, text=True, timeout=60)
+                timeout=60, **_txt)
             # --no-index exits 1 when files differ — that IS the new-file diff.
             if new.returncode in (0, 1) and new.stdout.strip():
                 parts.append(new.stdout)
@@ -1650,16 +1666,17 @@ def _harvest_framework_edit_ground_truth(run_dir, target):
     agent_diff = ""
     if os.path.isfile(diff_path):
         try:
-            agent_diff = open(diff_path).read()
+            with open(diff_path, errors="surrogateescape") as fh:
+                agent_diff = fh.read()
         except OSError:
             agent_diff = ""
     if agent_diff and agent_diff != delta:
         try:
-            with open(diff_path + ".agent", "w") as fh:
+            with open(diff_path + ".agent", "w", errors="surrogateescape") as fh:
                 fh.write(agent_diff)
         except OSError:
             pass
-    with open(diff_path, "w") as fh:
+    with open(diff_path, "w", errors="surrogateescape") as fh:
         fh.write(delta)
     n_files = len(re.findall(r"^diff --git ", delta, flags=re.M))
     print(f"  [ground-truth] framework-edit.diff rewritten from tree delta "

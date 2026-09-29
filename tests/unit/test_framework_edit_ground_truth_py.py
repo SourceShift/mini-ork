@@ -213,3 +213,66 @@ def test_delegate_forwards_so_monkeypatches_stay_observable(monkeypatch):
 
     assert exh._harvest_framework_edit_ground_truth("r", "t") == (True, "")
     assert seen["args"] == ("r", "t")
+
+
+def test_non_ascii_created_file_is_harvested(tmp_path, monkeypatch):
+    """Without ``ls-files -z`` git quotes a non-ASCII name (``"caf\\303\\251.py"``),
+    the isfile check misses it, and the created file silently drops out."""
+    repo = _mk_repo(tmp_path)
+    run_dir = tmp_path / "run"
+    _baseline(run_dir, repo, monkeypatch)
+    (repo / "café.py").write_text("x = 1\n")
+
+    ok, _ = ex._harvest_framework_edit_ground_truth(str(run_dir), str(repo))
+
+    assert ok
+    # git C-quotes the name inside the diff header; the file is there either way.
+    assert "caf" in (run_dir / "framework-edit.diff").read_text()
+
+
+def test_non_utf8_content_is_harvested_not_skipped(tmp_path, monkeypatch, capsys):
+    """A latin-1 byte must round-trip into the diff; decoding it strictly
+    raised, and the harvest fell back to trusting the agent's artifact."""
+    repo = _mk_repo(tmp_path)
+    run_dir = tmp_path / "run"
+    _baseline(run_dir, repo, monkeypatch)
+    (repo / "a.txt").write_bytes(b"one\ncaf\xe9\n")
+
+    ok, _ = ex._harvest_framework_edit_ground_truth(str(run_dir), str(repo))
+
+    assert ok
+    assert "keeping agent artifact" not in capsys.readouterr().err
+    assert b"caf\xe9" in (run_dir / "framework-edit.diff").read_bytes()
+    _git(repo, "checkout", "--", "a.txt")
+    assert _git(repo, "apply", "--check",
+                str(run_dir / "framework-edit.diff")).returncode == 0
+
+
+def test_a_move_is_harvested_as_delete_plus_create(tmp_path, monkeypatch):
+    """``git diff`` detects renames by default, and ``git apply --numstat``
+    names only the new side, so rollback could never restore the source."""
+    repo = _mk_repo(tmp_path)
+    run_dir = tmp_path / "run"
+    _baseline(run_dir, repo, monkeypatch)
+    _git(repo, "mv", "a.txt", "b.txt")
+
+    ok, _ = ex._harvest_framework_edit_ground_truth(str(run_dir), str(repo))
+
+    assert ok
+    diff = (run_dir / "framework-edit.diff").read_text()
+    assert "rename from" not in diff
+    assert "deleted file mode" in diff and "new file mode" in diff
+
+
+def test_foreign_baseline_is_reported_not_silently_diffed(tmp_path, monkeypatch, capsys):
+    """A baseline captured in another tree is not a commit here — say so."""
+    repo = _mk_repo(tmp_path)
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "pre-implementer-ref").write_text("0" * 40 + "\n")
+    (repo / "a.txt").write_text("changed\n")
+
+    ok, _ = ex._harvest_framework_edit_ground_truth(str(run_dir), str(repo))
+
+    assert ok
+    assert "is not a commit in" in capsys.readouterr().err
