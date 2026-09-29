@@ -496,6 +496,8 @@ def test_default_solver_runs_from_the_engine_root_not_the_scratch(tmp_path, monk
 
     assert Path(seen["cwd"]) == r.REPO
     assert seen["env"]["MO_TARGET_CWD"] == str(scratch)
+    # The runner grades afterwards, so mini-ork must not roll the edit back.
+    assert seen["env"]["MINI_ORK_ROLLBACK_KEEP_WORKTREE"] == "1"
 
 
 def test_summary_counts_resolved_not_attempted(tmp_path, capsys):

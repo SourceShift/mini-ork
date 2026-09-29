@@ -150,6 +150,10 @@ def _run_default_solver(
         "MO_TARGET_CWD": str(scratch),
         "MO_ALLOW_FRAMEWORK_CWD": "1",
         "MINI_ORK_RUN_ID": run_id,
+        # This runner is the OUTER grader. Without this, a run whose internal
+        # verifier doubts the fix rolls the edit back before we grade, and the
+        # task is scored on the untouched base (pilot: mo-9a0cf68ccf).
+        "MINI_ORK_ROLLBACK_KEEP_WORKTREE": "1",
     }
     # cwd is the ENGINE root, never the scratch: the scratch is itself a
     # mini-ork checkout at an older commit, and `python -m` puts cwd first on
