@@ -129,3 +129,14 @@ def test_priority_zeroes_already_shipped_and_halves_extends():
     assert lib.priority([{**base, "novelty_vs_shipped": "new"}]) == 12.0
     assert lib.priority([{**base, "novelty_vs_shipped": "extends"}]) == 6.0
     assert lib.priority([{**base, "novelty_vs_shipped": "already-shipped"}] * 2) == 0.0
+
+
+def test_verify_accepts_versioned_corpus_ids(tmp_path: Path):
+    lib = _lib()
+    corpus = _write(tmp_path / "c.json", {"sources": [{"source_id": "arxiv:2604.05112v1", "url": "u"}]})
+    merged = _write(tmp_path / "m.json", {"ranked": [{"id": "G01-T01"}]})
+    groups = "".join(f"### G{i:02d} — g\n" for i in range(1, 11))
+    final = tmp_path / "f.md"
+    final.write_text("## Executive Summary\nG01-T01 (arxiv:2604.05112v1, arxiv:2604.05112)\n## Implement Now\n"
+                     "## Appendix A\n## Appendix B\n" + groups)
+    lib.verify(final, merged, corpus)

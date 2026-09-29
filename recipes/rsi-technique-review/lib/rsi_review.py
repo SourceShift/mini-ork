@@ -26,7 +26,13 @@ GROUP_COUNT = 10
 VERDICTS = ("implement-now", "next", "watch", "skip")
 NOVELTY = ("new", "extends", "already-shipped")
 EFFORT_WEIGHT = {"S": 1.0, "M": 1.5, "L": 2.5}
-ARXIV_ID = re.compile(r"arxiv:\d{4}\.\d{4,5}")
+ARXIV_ID = re.compile(r"arxiv:\d{4}\.\d{4,5}(?:v\d+)?")
+
+
+def _unversioned(source_id: str) -> str:
+    """LibWit occasionally keeps a version suffix (arxiv:2604.05112v1) on a
+    corpus source_id; compare citations with the suffix stripped on both sides."""
+    return re.sub(r"v\d+$", "", source_id)
 
 
 class ReviewError(RuntimeError):
@@ -429,8 +435,8 @@ def verify(final_path: Path, merged_path: Path, corpus_path: Path) -> None:
     groups = re.findall(r"^### G\d{2} — ", text, flags=re.M)
     if len(groups) != GROUP_COUNT:
         raise ReviewError(f"final review lists {len(groups)} groups, expected {GROUP_COUNT}")
-    cited = set(ARXIV_ID.findall(text))
-    unknown = sorted(cited - set(corpus))
+    cited = {_unversioned(i) for i in ARXIV_ID.findall(text)}
+    unknown = sorted(cited - {_unversioned(i) for i in corpus})
     if unknown:
         raise ReviewError(f"final review cites {len(unknown)} ids absent from the corpus: {', '.join(unknown[:10])}")
     known_ids = {r["id"] for r in merged["ranked"]}
