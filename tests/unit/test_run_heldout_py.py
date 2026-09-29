@@ -510,3 +510,19 @@ def test_summary_counts_resolved_not_attempted(tmp_path, capsys):
             "--timeout", "120", "--solver-cmd", _noop_solver_str()])
 
     assert "resolved 0 / attempted" in capsys.readouterr().err
+
+
+def test_a_blocked_solver_stops_the_eval_without_recording_a_fail(tmp_path, capsys):
+    """rc 75 means `mini-ork run` refused to start (budget spent): not an
+    attempt. Recording it as passed=False would deflate the score silently."""
+    h = _mk_history(tmp_path)
+    manifest_path, first_task = _mk_minimal_manifest(tmp_path, h)
+    out = tmp_path / "results.json"
+    blocked = " ".join(shlex.quote(t) for t in [sys.executable, "-c", "import sys; sys.exit(75)"])
+
+    rc = r.main(["--manifest", str(manifest_path), "--repo", h["repo"], "--out", str(out),
+                 "--python", sys.executable, "--timeout", "120", "--solver-cmd", blocked])
+
+    assert rc == 0
+    assert not out.exists() or first_task["id"] not in json.loads(out.read_text())
+    assert "refused to start" in capsys.readouterr().err

@@ -32,6 +32,9 @@ REPO = Path(__file__).resolve().parents[1]
 DEFAULT_MANIFEST = REPO / "evals" / "heldout" / "mined" / "manifest.json"
 DEFAULT_RECIPE = "code-fix"
 DEFAULT_TIMEOUT = 3600
+# `mini-ork run` exits 75 (EX_TEMPFAIL) when it refused to start, e.g. the
+# daily budget is spent. That is not an attempt; it must not score as a fail.
+RC_BLOCKED = 75
 
 # Make ``mine_heldout_tasks.run_tests`` importable as ``grade``'s grader.
 sys.path.insert(0, str(REPO / "scripts"))
@@ -392,6 +395,14 @@ def main(argv: list[str] | None = None) -> int:
                 "solver_rc": -1,
                 "seconds": float(a.timeout),
             }
+        if row.get("solver_rc") == RC_BLOCKED:
+            # Stop the whole eval: every later task would be blocked too, and
+            # recording them as failures would silently deflate the score.
+            # The task stays unrecorded, so a resume re-attempts it.
+            print(f"[heldout-runner] {tid}: solver refused to start (rc={RC_BLOCKED}, "
+                  "e.g. daily budget spent) — stopping; re-run to resume.",
+                  file=sys.stderr)
+            break
         results[tid] = row
         _write_results(a.out, results)
         attempted += 1
