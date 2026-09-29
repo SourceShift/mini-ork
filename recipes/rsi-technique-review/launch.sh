@@ -10,7 +10,8 @@ cd "$(dirname "$0")/../.."
 
 RUN_ID="${1:-rsi-review-$(date +%Y%m%d-%H%M%S)}"
 # Recover mode: MO_RSI_RECOVER_FROM=<node> reruns that node + its dependents in
-# an existing run (reusing every other checkpoint) under the same lane policy.
+# an existing run (every other node's artifacts stay as they are) under the
+# same lane policy. MO_RSI_RECOVER_ARGS=--dry-run previews the closure.
 RECOVER_FROM="${MO_RSI_RECOVER_FROM:-}"
 HOME_DIR="${MINI_ORK_HOME:-$PWD/.mini-ork}"
 RUN_DIR="$HOME_DIR/runs/$RUN_ID"
@@ -74,6 +75,10 @@ export MO_ALLOW_FRAMEWORK_CWD=1            # target is the mini-ork repo itself
 
 echo "run: $RUN_ID  dir: $RUN_DIR"
 if [ -n "$RECOVER_FROM" ]; then
-  exec bin/mini-ork recover "$RUN_ID" --from-node "$RECOVER_FROM"
+  # `mini-ork recover` only prints the closure from the CLI (its executor
+  # hand-off is in-process); execute --from-node dispatches the same closure.
+  export MINI_ORK_RUN_DIR="$RUN_DIR"
+  export MINI_ORK_WORKFLOW="$PWD/recipes/rsi-technique-review/workflow.yaml"
+  exec bin/mini-ork execute "$RUN_DIR/plan.json" --from-node "$RECOVER_FROM" ${MO_RSI_RECOVER_ARGS:-}
 fi
 exec bin/mini-ork run rsi-technique-review recipes/rsi-technique-review/kickoff.md
