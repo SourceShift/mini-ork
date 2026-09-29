@@ -68,6 +68,12 @@ caching):
     MO_MIN_FINDING_CARDINALITY       → min finding cardinality (default 5)
     MO_DETERMINISTIC_TASK_CLASSES    → space-separated bypass list
                                         (default "code_fix db_migration")
+    MO_PROMOTION_VERIFIER_AUDIT      → cross-detector trustworthiness audit
+                                        (G03-T08): default ON ("1"); opt-out
+                                        with "0". A flagged audit downgrades
+                                        a would-be promote to "quarantined"
+                                        with reason ``verifier-audit:<flags>``;
+                                        never turns a reject into a promote.
     MINI_ORK_ROOT                    → legacy: where to find ``lib/cw_por.sh``
                                         (WS4: CW-POR is computed natively via
                                         ``mini_ork.gates.cw_por``; the env var
@@ -173,6 +179,36 @@ def _evidence_run_ids(con, candidate_id: str) -> list[str]:
     return [str(r[0]) for r in rows]
 
 
+def _candidate_task_class(con, candidate_id: str) -> str | None:
+    """Derive a single task_class for a candidate from its benchmark rows.
+
+    ``workflow_candidates`` has no ``task_class`` column
+    (``db/migrations/0010_benchmarks.sql:80-96``), so the canonical source
+    is ``benchmark_tasks.task_class`` (line 45). The candidate's class is
+    reached through ``benchmark_results.benchmark_id`` (line 65).
+
+    Returns ``None`` in two cases (kickoff rule #3 — fall back to None only
+    when the class is genuinely unavailable):
+
+      * the candidate has zero benchmark rows (the reject branch never
+        reaches the audit, so this is defensive);
+      * the candidate's benchmarks span more than one task_class (we
+        don't pick one arbitrarily — an audit over a class the candidate
+        doesn't actually represent would be misleading).
+
+    The composite index ``idx_br_candidate_id`` (line 75) keeps the SELECT
+    cheap.
+    """
+    rows = con.execute(
+        "SELECT DISTINCT bt.task_class "
+        "FROM benchmark_results br "
+        "JOIN benchmark_tasks bt ON bt.benchmark_id = br.benchmark_id "
+        "WHERE br.candidate_id = ?",
+        (candidate_id,),
+    ).fetchall()
+    return rows[0][0] if len(rows) == 1 else None
+
+
 def promotion_evaluate(
     db_path: str,
     candidate_id: str,
@@ -269,6 +305,13 @@ def promotion_evaluate(
 
         utility_delta = utility_after - utility_before
 
+        # The audit result is initialised BEFORE the decision tree so the
+        # final ``result`` dict can reference it on every branch — including
+        # the early-reject branches where the audit never runs. A reject
+        # branch stays a reject; ``verifier_audit=None`` is the signal that
+        # the audit did not act.
+        audit_result: dict[str, Any] | None = None
+
         # ── Decision logic (mirrors bash lines 123-140) ──
         if brun is None:
             # Zero benchmark_results rows: nothing was measured. The old
@@ -305,12 +348,61 @@ def promotion_evaluate(
                 f"after={utility_after:.4f}, delta={utility_delta:.4f}"
             )
         else:
-            decision = "promoted"
-            rationale = (
-                f"Utility improved by {utility_delta:.4f} "
-                f"({utility_before:.4f} → {utility_after:.4f}); "
-                f"all benchmark tasks passed."
-            )
+            # ── Verifier-audit precondition (G03-T08) ─────────────────
+            # A would-be promote is downgraded to "quarantined" when the
+            # cross-detector trustworthiness audit (hack_probe, metric_anchor,
+            # gate_fuzzer) flags the grader. A rejected decision is never
+            # flipped upward; the audit only acts on the promote branch.
+            # Opt-out via MO_PROMOTION_VERIFIER_AUDIT=0.
+            try:
+                audit_enabled = os.environ.get(
+                    "MO_PROMOTION_VERIFIER_AUDIT", "1") != "0"
+            except Exception:
+                audit_enabled = True
+            if audit_enabled:
+                try:
+                    from mini_ork.learning import verifier_audit
+                    # Derive the candidate's task_class from the same
+                    # benchmark rows the decision rests on. workflow_candidates
+                    # has no task_class column (db/migrations/0010_benchmarks.sql:80-96),
+                    # so the JOIN routes through benchmark_tasks.task_class.
+                    # Returns None when the candidate has 0 benchmark rows
+                    # (reject branch never reaches the audit) or spans >1 class
+                    # (we don't pick one arbitrarily — per kickoff rule #3,
+                    # fall back to None only when the class is genuinely
+                    # unavailable).
+                    candidate_task_class = _candidate_task_class(
+                        con, candidate_id,
+                    )
+                    audit_result = verifier_audit.audit(
+                        candidate_task_class, db_path,
+                    )
+                except Exception as exc:  # noqa: BLE001 — fail-open
+                    # An audit that could not even import must not break
+                    # a legitimate promote path. Log and continue as if
+                    # the audit had been disabled.
+                    print(
+                        f"promotion_evaluate: verifier_audit import/run "
+                        f"failed: {exc}",
+                        file=sys.stderr,
+                    )
+                    audit_result = None
+            if audit_result is not None and not audit_result.get("ok", True):
+                flags = audit_result.get("flags", [])
+                decision = "quarantined"
+                rationale = (
+                    f"Utility improved by {utility_delta:.4f} "
+                    f"({utility_before:.4f} → {utility_after:.4f}); "
+                    f"all benchmark tasks passed; "
+                    f"verifier-audit:{','.join(flags)}"
+                )
+            else:
+                decision = "promoted"
+                rationale = (
+                    f"Utility improved by {utility_delta:.4f} "
+                    f"({utility_before:.4f} → {utility_after:.4f}); "
+                    f"all benchmark tasks passed."
+                )
 
         # The evidence pointer: which runs the decision actually rested on.
         # Before this the row stored a bare NULL, so the audit trail could not
@@ -332,6 +424,7 @@ def promotion_evaluate(
             "n_runs": n_runs,
             "all_pass": all_pass,
             "safety_violations": safety_violations,
+            "verifier_audit": audit_result,
         }
 
         # ── INSERT into promotion_records (mirrors bash lines 152-183) ──
