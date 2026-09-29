@@ -1038,6 +1038,28 @@ def _run_changed_files(run_dir: str) -> list[str]:
     return []
 
 
+ROLLED_BACK_FILE = "rolled-back.json"
+
+
+def _record_rolled_back(run_dir: str, real_root: str, rels: list[str]) -> None:
+    """Persist which paths rollback reverted, as absolute realpaths.
+
+    The post-run ``verify`` runs AFTER rollback and re-checks the plan's
+    required artifacts; without this record it reports a file rollback itself
+    deleted as "missing or empty" — blaming the implementer for the rollback.
+    Non-blocking: a write failure only loses that attribution.
+    """
+    if not run_dir or not rels:
+        return
+    paths = sorted(os.path.realpath(os.path.join(real_root, r)) for r in rels)
+    try:
+        with open(os.path.join(run_dir, ROLLED_BACK_FILE), "w", encoding="utf-8") as fh:
+            json.dump({"paths": paths}, fh, indent=2)
+    except OSError as exc:
+        print(f"  [warn] rollback: could not record reverted paths: {exc}",
+              file=sys.stderr, flush=True)
+
+
 def _revert_working_tree(root: str, run_dir: str) -> bool:
     """``revert_branch`` compensation (roadmap Step 1 / fix-tracker M3).
 
@@ -1095,6 +1117,7 @@ def _revert_working_tree(root: str, run_dir: str) -> bool:
                 rejected.append(raw)
     log(f"  [rollback] revert_branch: restored {len(restored)} tracked file(s), "
         f"removed {len(removed)} created file(s), rejected {len(rejected)}")
+    _record_rolled_back(run_dir, real_root, restored + removed)
     # Leftover report: any of the recorded paths still dirty?
     leftover = subprocess.run(
         ["git", "-C", real_root, "status", "--porcelain", "--", *files],
