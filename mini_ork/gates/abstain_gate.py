@@ -14,17 +14,18 @@ the OCP seam (``gate_registry.register_gate_evaluator``) — no edit to
   2. Loads the verifier's labelled history from ``verifier_results``
      (the table added by migration 0025; verdict + confidence +
      ``is_false_positive`` / ``is_false_negative`` columns).
-  3. Computes a split-conformal non-conformity score per row
-     (``1 - confidence`` for a correct pass, ``1.0`` for a wrong one —
-     a wrong prediction is maximally non-conforming regardless of how
-     confident the verifier was), then takes the ``(1 - alpha)``
-     quantile as the threshold.
-  4. With fewer than ``MO_ABSTAIN_MIN_CALIB`` rows the verdict passes
-     through unchanged: no calibration, no abstention claim
-     (kickoff rule #3 — "no calibration → no abstention claims").
-  5. With enough history, a ``pass`` whose confidence falls below the
-     calibrated bar returns ``defer`` AND enqueues an oversight item.
-     A ``fail`` from the verifier is **never** lifted to ``pass``
+  3. Computes a Learn-Then-Test (LTT) risk-controlling confidence
+     threshold (Bates et al. 2021) over labelled pass rows: the
+     smallest confidence bar ``t`` such that, among rows with
+     confidence ≥ ``t``, the ``(k+1)/(n+1)`` upper bound on the
+     empirical false-positive rate is ≤ alpha. A pass with confidence
+     ≥ ``t`` passes; below it defers + enqueues. If no ``t`` satisfies
+     the bound, the verifier is uncertifiable at alpha → every pass
+     defers with reason ``verifier-uncertifiable-at-alpha``.
+  4. With fewer than ``MO_ABSTAIN_MIN_CALIB`` labelled pass rows the
+     verdict passes through unchanged: no calibration, no abstention
+     claim (kickoff rule #3 — "no calibration → no abstention claims").
+  5. A ``fail`` from the verifier is **never** lifted to ``pass``
      (kickoff rule #4 — load-bearing invariant).
 
 Env knobs (one-way clamps, mirroring ``dispatch/calibration.py`` so
@@ -109,6 +110,14 @@ def _conformal_threshold(scores: list[float], risk: float) -> float:
     An empty score list returns ``1.0`` (no non-conformity observed
     means the most permissive threshold; the caller short-circuits on
     ``len(scores) < min_calib`` before this matters).
+
+    NB: retained for back-compat (tests ``test_5`` / ``test_5b``
+    import this helper directly to exercise the split-conformal
+    quantile on a synthetic uniform). The live ``_eval_abstain``
+    body now uses the LTT risk-controlling threshold
+    (``_ltt_min_confidence``) instead — split-conformal saturates at
+    ``1.0`` whenever any labelled row scores ``1.0`` (a wrong row),
+    which is precisely when the verifier is least trustworthy.
     """
     if not scores:
         return 1.0
@@ -121,6 +130,76 @@ def _conformal_threshold(scores: list[float], risk: float) -> float:
     if q >= n:
         q = n - 1
     return float(sorted_scores[q])
+
+
+def _ltt_min_confidence(
+    labelled: list[tuple[float, bool]],
+    risk: float,
+) -> tuple[float, bool, int, int, float]:
+    """Learn-Then-Test (LTT) risk-controlling confidence threshold.
+
+    Given labelled pass rows as ``(confidence, is_wrong)`` pairs, find
+    the smallest confidence threshold ``t`` such that, among rows
+    with confidence ≥ ``t``, the ``(k+1)/(n+1)`` upper bound on the
+    empirical false-positive rate is ≤ ``risk``.
+
+    This is the Bates-et-al.-2021 ``(k+1)/(n+1)`` rule (a one-sided
+    Clopper-Pearson-style bound valid without ``scipy`` — the project
+    standard for exact binomial statistics; see
+    ``mini_ork/learning/hack_probe.py:24-77``).
+
+    Returns ``(min_confidence, uncertifiable, accepted_n,
+    accepted_wrong, bound)``:
+
+      * ``min_confidence`` — smallest ``t`` satisfying the bound
+        (0.0 if uncertifiable or empty).
+      * ``uncertifiable`` — ``True`` iff NO candidate threshold has
+        bound ≤ ``risk``; the caller then defers every pass.
+      * ``accepted_n`` / ``accepted_wrong`` — counts at the chosen
+        ``t`` (or at the full set if uncertifiable, for evidence).
+      * ``bound`` — ``(k+1)/(n+1)`` at the chosen ``t`` (or at the
+        full set if uncertifiable).
+
+    An empty ``labelled`` list returns the permissive fallback
+    ``(0.0, False, 0, 0, 0.0)``; the caller short-circuits on
+    ``len(labelled) < min_required`` before this matters.
+    """
+    if not labelled:
+        return (0.0, False, 0, 0, 0.0)
+
+    n_total = len(labelled)
+    k_total = sum(1 for _, w in labelled if w)
+
+    # Unique confidence values in the labelled set, sorted descending
+    # (most-restrictive threshold first). For each candidate ``t``
+    # compute (k+1)/(n+1) over rows with confidence ≥ ``t``.
+    unique_t = sorted({c for c, _ in labelled}, reverse=True)
+
+    best_t: Optional[float] = None
+    best_n = 0
+    best_k = 0
+    best_bound = 1.0
+    for t in unique_t:
+        n_sub = sum(1 for c, _ in labelled if c >= t)
+        k_sub = sum(1 for c, w in labelled if c >= t and w)
+        bound = (k_sub + 1) / (n_sub + 1)
+        if bound <= risk:
+            # Smallest ``t`` wins — keep iterating to find a smaller
+            # candidate that still satisfies the bound.
+            if best_t is None or t < best_t:
+                best_t = t
+                best_n = n_sub
+                best_k = k_sub
+                best_bound = bound
+
+    if best_t is None:
+        # No candidate threshold satisfies the bound → the verifier
+        # is too unreliable at every confidence bar. The caller must
+        # defer every pass and surface the full-set bound as evidence.
+        total_bound = (k_total + 1) / (n_total + 1)
+        return (0.0, True, n_total, k_total, total_bound)
+
+    return (best_t, False, best_n, best_k, best_bound)
 
 
 def _load_scores(db_path: Optional[str], verifier_name: str) -> list[float]:
@@ -190,6 +269,62 @@ def _load_scores(db_path: Optional[str], verifier_name: str) -> list[float]:
         c = max(0.0, min(1.0, c))
         scores.append(1.0 - c)
     return scores
+
+
+def _load_labelled_passes(
+    db_path: Optional[str], verifier_name: str
+) -> list[tuple[float, bool]]:
+    """Labelled pass rows as ``(confidence, is_wrong)`` pairs.
+
+    The LTT helper needs per-row confidence and a wrong/right flag —
+    not the aggregated non-conformity score that ``_load_scores``
+    returns. We restrict to ``verdict='pass'`` because the gate's
+    decision is whether to trust a *pass*: a correct ``fail`` is a
+    true negative, not part of the false-positive rate.
+
+    Reads up to ``max_rows()`` rows, newest first. Missing or
+    unparseable confidence defaults to ``0.0`` (most conservative —
+    the LTT algorithm still bounds the FPR over them, treating them
+    as low-confidence). Older DBs without ``verifier_results`` return
+    ``[]`` (fail open) so the gate falls through to the pass-through
+    branch rather than crashing.
+    """
+    if not db_path or not os.path.isfile(db_path):
+        return []
+    cap = max_rows()
+    try:
+        con = sqlite3.connect(db_path)
+        con.execute("PRAGMA busy_timeout=5000")
+        try:
+            rows = con.execute(
+                "SELECT confidence, is_false_positive "
+                "FROM verifier_results "
+                "WHERE verifier_name = ? AND verdict = 'pass' "
+                "ORDER BY created_at DESC LIMIT ?",
+                (verifier_name, cap),
+            ).fetchall()
+        except sqlite3.OperationalError:
+            # Missing table or columns — old DB. Fail open.
+            con.close()
+            return []
+        con.close()
+    except Exception:
+        return []
+
+    labelled: list[tuple[float, bool]] = []
+    for confidence, is_fp in rows:
+        is_wrong = bool(is_fp)
+        if confidence is None:
+            c = 0.0
+        else:
+            try:
+                c = float(confidence)
+            except (TypeError, ValueError):
+                c = 0.0
+        # Clamp into [0, 1]; the schema is TEXT in some installs.
+        c = max(0.0, min(1.0, c))
+        labelled.append((c, is_wrong))
+    return labelled
 
 
 def _calibrated_error_from_margin(
@@ -302,13 +437,52 @@ def _eval_abstain(
     if confidence < 0.0 or confidence > 1.0 or math.isnan(confidence):
         return "defer"
 
-    # 7. Compute threshold and decide.
-    threshold = _conformal_threshold(scores, risk)
-    # ``threshold`` is in non-conformity units (0 = most confident,
-    # 1 = least confident). The matching confidence bar is therefore
-    # ``1 - threshold``: a verifier with confidence BELOW this bar
-    # falls into the alpha-tail and should defer.
-    min_confidence = max(0.0, min(1.0, 1.0 - threshold))
+    # 7. Compute LTT risk-controlling threshold and decide.
+    # We need labelled pass rows (confidence + wrong flag), not the
+    # aggregated non-conformity scores — those lose the per-row
+    # confidence the (k+1)/(n+1) bound operates over.
+    labelled = _load_labelled_passes(db_path, verifier_name)
+    min_confidence, uncertifiable, accepted_n, accepted_wrong, bound = (
+        _ltt_min_confidence(labelled, risk)
+    )
+
+    # 7a. Uncertifiable branch: no confidence bar satisfies the bound
+    # → the verifier is too unreliable at every confidence. Every
+    # pass defers; the evidence carries the full-set bound and the
+    # ``reason`` marker downstream tooling keys off.
+    if uncertifiable:
+        evidence = {
+            "verifier_verdict": verifier_verdict,
+            "verifier_name": verifier_name,
+            "confidence": confidence,
+            "min_confidence": min_confidence,
+            "threshold": bound,  # back-compat: was conformal threshold
+            "alpha": risk,
+            "n_calib": len(labelled),
+            "accepted_n": accepted_n,
+            "accepted_wrong": accepted_wrong,
+            "bound": bound,
+            "alpha_bound_met": False,
+            "reason": "verifier-uncertifiable-at-alpha",
+            "task_class": ctx.get("task_class", ""),
+            "run_id": ctx.get("run_id", ""),
+            "lane": ctx.get("lane", ""),
+        }
+        try:
+            enqueue(
+                gate_id="abstain_gate",
+                feature=verifier_name or condition or "abstain",
+                phase="gate",
+                context=evidence,
+                blocks_dispatch_for=str(ctx.get("recipe", "") or ""),
+                db_path=db_path,
+            )
+        except Exception:
+            # Oversight-channel failure must not turn a defer into a fail.
+            pass
+        return "defer"
+
+    # 7b. Normal LTT branch: accept iff confidence ≥ min_confidence.
     if confidence >= min_confidence:
         return verifier_verdict  # high-confidence pass → pass
 
@@ -321,9 +495,13 @@ def _eval_abstain(
         "verifier_name": verifier_name,
         "confidence": confidence,
         "min_confidence": min_confidence,
-        "threshold": threshold,
+        "threshold": bound,  # back-compat: was conformal threshold
         "alpha": risk,
-        "n_calib": len(scores),
+        "n_calib": len(labelled),
+        "accepted_n": accepted_n,
+        "accepted_wrong": accepted_wrong,
+        "bound": bound,
+        "alpha_bound_met": True,
         "task_class": ctx.get("task_class", ""),
         "run_id": ctx.get("run_id", ""),
         "lane": ctx.get("lane", ""),

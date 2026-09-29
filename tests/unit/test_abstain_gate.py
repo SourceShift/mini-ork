@@ -54,6 +54,7 @@ from mini_ork.gates.abstain_gate import (  # noqa: E402
     DEFAULT_MAX_ROWS,
     DEFAULT_MIN_CALIB,
     _conformal_threshold,
+    _ltt_min_confidence,
 )
 from mini_ork.gates.oversight_inbox import pending  # noqa: E402
 from mini_ork.stores import migrate as mig  # noqa: E402
@@ -127,6 +128,48 @@ def _seed_calibration_rows(
                     float(conf),
                     1 if is_false_positive else 0,
                     1 if is_false_negative else 0,
+                    f"-{idx} seconds",
+                ),
+            )
+        con.commit()
+    finally:
+        con.close()
+
+
+def _seed_mixed_calibration(
+    db_path: str,
+    verifier_name: str,
+    rows: list[tuple[float, bool]],
+) -> None:
+    """Seed labelled pass rows where each tuple is ``(confidence, is_wrong)``.
+
+    The LTT test scenarios need a mix of correct + wrong rows with
+    distinct confidences; ``_seed_calibration_rows`` only flips one
+    flag for an entire batch. This helper inserts each row directly
+    so per-row ``is_false_positive`` matches the tuple — and
+    ``result_id`` collisions (which happen if the batch helper is
+    called twice with the same verifier_name) are avoided by
+    indexing into a single shared ``idx`` counter.
+    """
+    import sqlite3
+    con = sqlite3.connect(db_path)
+    try:
+        con.execute("PRAGMA busy_timeout=5000")
+        for idx, (conf, is_wrong) in enumerate(rows):
+            con.execute(
+                "INSERT INTO verifier_results "
+                "(result_id, run_id, verifier_name, verdict, "
+                " confidence, is_false_positive, is_false_negative, "
+                " created_at) "
+                "VALUES (?, ?, ?, 'pass', ?, ?, ?, "
+                "  strftime('%s', 'now', ?))",
+                (
+                    f"seed-{verifier_name}-{idx:04d}",
+                    f"run-seed-{verifier_name}-{idx:04d}",
+                    verifier_name,
+                    float(conf),
+                    1 if is_wrong else 0,
+                    0,
                     f"-{idx} seconds",
                 ),
             )
@@ -451,3 +494,189 @@ def test_ocp_seam_registers_abstain_gate():
     assert DEFAULT_ALPHA == 0.05
     assert DEFAULT_MIN_CALIB == 30
     assert DEFAULT_MAX_ROWS >= DEFAULT_MIN_CALIB
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# (8) LTT — 40 rows, 1 wrong at low confidence → low defers, high passes
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_8_ltt_low_wrong_low_defers_high_passes(db):
+    """LTT scenario A: 40 labelled pass rows, 1 wrong at LOW confidence
+    (the verifier got it wrong but wasn't confident).
+
+    The (k+1)/(n+1) bound is ≤ alpha when the low-confidence wrong row
+    is included alongside 39 correct rows. A new low-confidence pass
+    (below the wrong row's confidence) defers; a new high-confidence
+    pass passes.
+    """
+    rows: list[tuple[float, bool]] = (
+        [(0.95, False)] * 39 + [(0.05, True)]
+    )
+    _seed_mixed_calibration(db, "test_verifier", rows)
+    gid = _register_abstain_gate(db)
+
+    # Low-confidence pass: below the wrong row's confidence → defer.
+    pre_count = len(pending(db_path=db))
+    verdict_low = gr.gate_evaluate(
+        db, gid, _ctx(confidence=0.01), mini_ork_root=str(REPO)
+    )
+    assert verdict_low == "defer", (
+        f"expected defer for low-confidence pass under LTT, "
+        f"got {verdict_low!r}"
+    )
+    inbox = pending(db_path=db)
+    assert len(inbox) == pre_count + 1
+    row = inbox[-1]
+    ctx = row["context"]
+    assert ctx["verifier_verdict"] == "pass"
+    assert ctx["confidence"] == 0.01
+    # Evidence carries the LTT internals (no "reason" key on this
+    # branch — only the uncertifiable branch sets it).
+    assert ctx["alpha_bound_met"] is True
+    assert ctx["accepted_n"] >= DEFAULT_MIN_CALIB
+    assert ctx["accepted_wrong"] == 1
+    assert 0.0 <= ctx["bound"] <= DEFAULT_ALPHA
+
+    # High-confidence pass: above the bar → pass, no inbox row.
+    pre_count = len(pending(db_path=db))
+    verdict_high = gr.gate_evaluate(
+        db, gid, _ctx(confidence=0.99), mini_ork_root=str(REPO)
+    )
+    assert verdict_high == "pass", (
+        f"expected pass for high-confidence pass under LTT, "
+        f"got {verdict_high!r}"
+    )
+    assert len(pending(db_path=db)) == pre_count, (
+        "high-confidence pass must NOT enqueue"
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# (9) LTT — 40 rows, 4 wrong spread across confidences (10% > alpha) → all
+#     pass verdicts defer with reason ``verifier-uncertifiable-at-alpha``
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_9_ltt_uncertifiable_at_alpha(db):
+    """LTT scenario B: 40 labelled pass rows, 4 wrong (10% > alpha=0.05)
+    spread across confidences.
+
+    Because wrong rows are present at every confidence bar the
+    ``(k+1)/(n+1)`` bound exceeds alpha at every candidate threshold
+    — the verifier is uncertifiable. Even a 0.99-confidence pass
+    defers, and the inbox row carries ``reason:
+    verifier-uncertifiable-at-alpha``. This is the regression that
+    the kickoff calls out — the old conformal-quantile rule would
+    have let a 0.05-confidence pass through under the same data.
+    """
+    rows: list[tuple[float, bool]] = (
+        [(0.9, False)] * 36
+        + [(0.5, True), (0.7, True), (0.85, True), (0.95, True)]
+    )
+    _seed_mixed_calibration(db, "test_verifier", rows)
+    gid = _register_abstain_gate(db)
+
+    # Even a 0.99-confidence pass defers.
+    pre_count = len(pending(db_path=db))
+    verdict = gr.gate_evaluate(
+        db, gid, _ctx(confidence=0.99), mini_ork_root=str(REPO)
+    )
+    assert verdict == "defer", (
+        f"verifier uncertifiable at alpha; expected defer for "
+        f"0.99-confidence pass, got {verdict!r}"
+    )
+
+    inbox = pending(db_path=db)
+    assert len(inbox) == pre_count + 1
+    row = inbox[-1]
+    ctx = row["context"]
+    assert ctx["reason"] == "verifier-uncertifiable-at-alpha", (
+        f"expected verifier-uncertifiable-at-alpha reason, "
+        f"got {ctx.get('reason')!r}"
+    )
+    assert ctx["alpha_bound_met"] is False
+    assert ctx["accepted_n"] == 40
+    assert ctx["accepted_wrong"] == 4
+    # Bound at the full set = (4+1)/(40+1) ≈ 0.122 > alpha 0.05.
+    assert ctx["bound"] > DEFAULT_ALPHA, (
+        f"uncertifiable branch must report bound > alpha, "
+        f"got {ctx['bound']}"
+    )
+
+    # And a low-confidence pass also defers — same reason.
+    pre_count = len(pending(db_path=db))
+    verdict_low = gr.gate_evaluate(
+        db, gid, _ctx(confidence=0.1), mini_ork_root=str(REPO)
+    )
+    assert verdict_low == "defer"
+    row = pending(db_path=db)[-1]
+    assert row["context"]["reason"] == "verifier-uncertifiable-at-alpha"
+    assert len(pending(db_path=db)) == pre_count + 1
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# (10) LTT — synthetic property: empirical FPR among accepted passes ≤ alpha
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_10_ltt_empirical_fpr_within_alpha():
+    """LTT scenario C: on a synthetic held-out set drawn from the
+    same distribution as the calibration, the empirical FPR among
+    accepted rows is ≤ alpha + tolerance.
+
+    The (k+1)/(n+1) bound is a high-confidence upper bound on the
+    true FPR — with enough held-out trials the empirical FPR should
+    stay within alpha of the true FPR. We seed calibration as 95%
+    correct at high confidence + 5% wrong at low confidence; the LTT
+    algorithm picks the smallest confidence bar such that
+    ``(k+1)/(n+1) ≤ alpha`` over accepted rows, which gives an
+    accepted set whose empirical FPR is bounded by alpha.
+    """
+    rng = random.Random(42)
+    alpha_val = 0.10
+    tolerance = 4e-2  # generous for held-out noise (sqrt(0.05*0.95/10000)≈2e-3)
+
+    # Calibration: 190 correct at conf uniform in [0.6, 1.0], 10 wrong
+    # at conf uniform in [0.05, 0.25]. Wrong rows are well below the
+    # bulk of correct rows, so the LTT threshold sits near the wrong
+    # rows' confidence — wrong rows are accepted at the smallest t
+    # that still satisfies the bound.
+    correct = [(rng.uniform(0.6, 1.0), False) for _ in range(190)]
+    wrong = [(rng.uniform(0.05, 0.25), True) for _ in range(10)]
+    lab = correct + wrong
+
+    min_conf, uncert, accepted_n, accepted_wrong, bound = _ltt_min_confidence(
+        lab, alpha_val
+    )
+
+    assert not uncert, "calibration should be certifiable at alpha=0.10"
+    assert bound <= alpha_val, (
+        f"LTT bound {bound} > alpha {alpha_val} (algorithm violation)"
+    )
+    # Accepted set covers every row at the smallest t (since including
+    # wrong rows keeps the bound at (k+1)/(n+1) ≤ alpha).
+    assert accepted_n == len(lab), (
+        f"smallest t should accept the full set; got accepted_n="
+        f"{accepted_n} of {len(lab)}"
+    )
+    assert accepted_wrong == len(wrong), (
+        f"smallest t should accept all wrong rows when bound ≤ alpha; "
+        f"got accepted_wrong={accepted_wrong}"
+    )
+
+    # Held-out: same distribution. With 10 000 trials the empirical
+    # FPR is well within a few percent of the true FPR (≈ 5%).
+    rng_h = random.Random(43)
+    held_correct = [(rng_h.uniform(0.6, 1.0), False) for _ in range(9500)]
+    held_wrong = [(rng_h.uniform(0.05, 0.25), True) for _ in range(500)]
+    held = held_correct + held_wrong
+
+    accepted = [(c, w) for c, w in held if c >= min_conf]
+    assert accepted, "held-out set should produce accepted rows"
+    empirical_fpr = sum(1 for _, w in accepted if w) / len(accepted)
+
+    assert empirical_fpr <= alpha_val + tolerance, (
+        f"empirical FPR {empirical_fpr:.4f} exceeds alpha + tolerance "
+        f"({alpha_val} + {tolerance}); LTT threshold did not bound"
+    )
