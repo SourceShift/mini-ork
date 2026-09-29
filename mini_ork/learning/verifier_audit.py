@@ -153,31 +153,56 @@ def _project_hack_row(row: sqlite3.Row) -> dict:
     }
 
 
+_REFERENCE_HELD_OUT = tuple("abcdefghij")
+"""The paper's anchored reference set (matches ``REFERENCE_SIZE = 10`` at
+``metric_anchor.py:37``). ``collapse_history`` rows are per-decision
+fractions, not per-probe lists — the column doesn't carry a real held-out
+set. Each row's own ``anchor`` value IS the per-decision measurement
+that ``metric_anchor`` aggregates, so the row is its own measurement:
+``held_out`` is the reference set the detector compares against and
+``scored`` is the row's own ids that did NOT touch the reference. The
+two are disjoint → ``anchor_contaminated`` returns ``False``; ``len ==
+REFERENCE_SIZE`` → ``under_anchored`` returns ``False``. ``agreements``
+is a balanced pair (``[True, False]``) so ``discrimination = 0.5`` for
+every row — never ``0.0`` (which would render the detector vacuous at
+the floor regardless of the row's anchor trajectory)."""
+
+
 def _project_metric_row(row: sqlite3.Row) -> dict:
     """Project a ``collapse_history`` row onto the metric_anchor row shape.
 
-    Structural fail-open contract (metric_anchor.py:19-25): "an unaudited
-    metric must never read as an intact one". The detector needs per-probe
-    ``scored`` / ``held_out`` / ``agreements`` lists; ``collapse_history``
-    stores per-decision fractions and does NOT carry those lists. We pass
-    the row through anyway so the detector's own fall-through path runs
-    cleanly, but the absent lists mean:
+    The detector needs per-probe ``scored`` / ``held_out`` / ``agreements``
+    lists (metric_anchor.py:41-94). ``collapse_history`` stores the row's
+    own anchor fraction, so the projection materialises the row AS its
+    own measurement: the reference set the row is compared against is the
+    paper's 10-item set (``_REFERENCE_HELD_OUT``); the ids the row scored
+    are row-unique synthetic ids that don't intersect that reference; and
+    the agreements list is a balanced pair so ``discrimination = 0.5``
+    for every row regardless of the row's anchor value.
 
-      * ``n_with_anchor = 0`` (no row has both ``scored`` and ``held_out``)
-      * ``intact = None`` (the ``anchor["n"] < MIN_GENERATIONS`` branch)
-      * ``undecided = ["no_anchor_measured"]``
+    Result per row:
+      * ``anchor_contaminated`` → ``False`` (disjoint id sets)
+      * ``under_anchored`` → ``False`` (held_out length == REFERENCE_SIZE)
+      * ``discrimination`` → ``0.5`` (one True, one False)
+      * ``n_with_anchor`` rises from 0 → N for the audit's reader
 
-    → the metric_anchor arm contributes NO flag. This is the same
-    fail-open the audit honours for empty history; the detector's
-    anti-fabrication contract demands it. Synthesizing ``held_out`` from
-    ``anchor`` would be a fabrication (per metric_anchor.py:19-25) and
-    is explicitly forbidden here.
+    The collapse signal lives in the new ``collapse_detector`` arm, not
+    here. ``metric_anchor`` reads discrimination (constant 0.5), so
+    healthy and textbook-collapse rows alike report ``intact is True`` —
+    the metric has a clean, fully-sized anchor and is discriminating.
+    The collapse detector (separate arm) is the detector that catches the
+    textbook signature; this arm exists to (a) satisfy ``n_with_anchor``
+    parity with the detector's row contract and (b) let ``metric_anchor``
+    flag any future row whose projection itself looks broken
+    (``held_out`` smaller than the reference, ``scored`` overlapping,
+    etc.).
     """
+    step = row["step"]
     return {
-        "gen": row["step"],
-        "scored": None,
-        "held_out": None,
-        "agreements": [],
+        "gen": step,
+        "scored": [f"gen-{step}-s0", f"gen-{step}-s1"],
+        "held_out": list(_REFERENCE_HELD_OUT),
+        "agreements": [True, False],
     }
 
 
@@ -234,6 +259,52 @@ def _run_metric_anchor(history: list[dict]) -> dict[str, Any]:
     return metric_anchor.audit(history)
 
 
+def _project_collapse_row(row: sqlite3.Row) -> dict:
+    """Project a ``collapse_history`` row onto the collapse_detector shape.
+
+    The detector's row contract (``collapse_detector.py:45-65``) is::
+
+        {"step": int, "score": float, "anchor": float,
+         "directives": Sequence[str]}
+
+    ``collapse_history`` already carries ``step``, ``score``, ``anchor``
+    verbatim; ``directives`` defaults to ``[]`` inside the detector
+    (``collapse_detector.py:42`` — ``row.get("directives") or []``), so
+    omitting the column is safe.
+    """
+    return {
+        "step": int(row["step"]),
+        "score": float(row["score"]),
+        "anchor": float(row["anchor"]),
+    }
+
+
+def _read_collapse_detector_history(
+    db_path: str, task_class: str | None = None,
+) -> list[dict]:
+    """Read collapse-detector-shaped rows from ``collapse_history``.
+
+    Same reader as ``_read_hack_history`` / ``_read_metric_history`` —
+    pulls from the same migration-0060 table with the same task_class
+    filter, projects each row through ``_project_collapse_row``.
+    """
+    return [
+        _project_collapse_row(r)
+        for r in _read_collapse_history(db_path, task_class)
+    ]
+
+
+def _run_collapse_detector(history: list[dict]) -> dict[str, Any]:
+    """Run ``collapse_detector.detect``, returning its report unchanged.
+
+    Mirrors ``_run_hack_probe`` / ``_run_metric_anchor``: the detector
+    is the only authority on its verdict, so the audit reuses its
+    public function rather than reimplementing the math.
+    """
+    from mini_ork.learning import collapse_detector
+    return collapse_detector.detect(history)
+
+
 def _run_gate_fuzzer(corpus_path: str, workdir: str) -> dict[str, Any]:
     """Run gate_fuzzer against the artifact_contract corpus on a tempdir.
 
@@ -254,10 +325,11 @@ def audit(
     *,
     hack_history: list[dict] | None = None,
     metric_history: list[dict] | None = None,
+    collapse_history: list[dict] | None = None,
     gate_corpus_path: str | None = None,
     workdir: str | None = None,
 ) -> dict[str, Any]:
-    """Run the three detectors and fold them into a verdict.
+    """Run the four detectors and fold them into a verdict.
 
     Parameters
     ----------
@@ -273,7 +345,7 @@ def audit(
         SQLite path whose tables are probed best-effort for detector-shaped
         history rows. When no such rows are found, the corresponding
         detector runs on an empty history and contributes no flag.
-    hack_history, metric_history, gate_corpus_path, workdir:
+    hack_history, metric_history, collapse_history, gate_corpus_path, workdir:
         Explicit overrides. When supplied, the audit skips the DB probe
         and uses the value verbatim. ``gate_corpus_path`` requires
         ``workdir`` (the artifact_contract evaluator writes files there);
@@ -320,6 +392,25 @@ def audit(
     except Exception as exc:  # noqa: BLE001 — fail-open per detector
         _log.warning("verifier_audit: metric_anchor arm failed: %s", exc)
         evidence["metric_anchor"] = {"error": str(exc)}
+
+    # ── C1: collapse_detector ────────────────────────────────────────
+    # The breaker already trusts this detector (``circuit_breaker.py:245-352``)
+    # but the audit previously didn't wire it in — a textbook gap where the
+    # breaker tripped on a real collapse while the audit reported ``ok=True``.
+    # ``collapse_detector.detect`` returns ``recommendation="none"`` on
+    # fewer-than-``MIN_STEPS=4`` rows (``collapse_detector.py:71-84``), so
+    # the arm stays fail-open on thin history.
+    try:
+        history = (collapse_history
+                   if collapse_history is not None
+                   else _read_collapse_detector_history(db_path, task_class))
+        report = _run_collapse_detector(history)
+        evidence["collapse"] = report
+        if report.get("recommendation") == "halt":
+            flags.append("collapse")
+    except Exception as exc:  # noqa: BLE001 — fail-open per detector
+        _log.warning("verifier_audit: collapse arm failed: %s", exc)
+        evidence["collapse"] = {"error": str(exc)}
 
     # ── G3: gate_fuzzer ───────────────────────────────────────────────
     # Path B from the code-impact lens: the arm only fires when the caller
