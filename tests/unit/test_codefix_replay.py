@@ -1,0 +1,424 @@
+"""Unit tests for the code-fix verifier's delta-gate replay check.
+
+Each test stands up a throwaway git repo in `tmp_path` with a function + a
+test, runs `recipes/code-fix/verifiers/test.py` against it, and asserts both
+the JSON verdict and that the candidate working tree is byte-identical
+before and after.
+
+The verifier auto-detects a pytest command via `MINI_ORK_TEST_CMD` (we
+pass it explicitly to keep the test hermetic against the worker's PATH).
+We disable pytest's on-disk cache (`-p no:cacheprovider`) so the replay
+does not leave `.pytest_cache/` behind in the candidate working tree —
+the "byte-identical" invariant covers only source files anyway, but a
+cleaner diff is easier to read when a regression breaks it.
+"""
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+VERIFIER = REPO_ROOT / "recipes" / "code-fix" / "verifiers" / "test.py"
+
+# `-p no:cacheprovider` keeps `.pytest_cache/` out of the candidate
+# working tree; otherwise the verifier leaves pytest's cache behind and
+# the "byte-identical" check on test 4 has to special-case it.
+# We deliberately do NOT pass `-q`: pytest resolves conflicting verbosity
+# flags by taking the LAST one, so a trailing `-q` would silence the
+# per-test lines the replay helper needs to parse.
+TEST_CMD = "python3 -m pytest -p no:cacheprovider"
+
+
+def _git(cwd: Path, *args: str) -> None:
+    subprocess.check_call(
+        ["git", *args], cwd=cwd,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+
+
+def _git_text(cwd: Path, *args: str) -> str:
+    return subprocess.check_output(["git", *args], cwd=cwd, text=True)
+
+
+def _make_repo(
+    parent: Path,
+    *,
+    mod_src: str,
+    test_src: str,
+) -> Path:
+    """Stand up a throwaway git repo with the given module + test (initial commit)."""
+    repo = parent / "r"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    _git(repo, "config", "user.email", "t@t")
+    _git(repo, "config", "user.name", "t")
+    _git(repo, "config", "core.autocrlf", "false")
+    (repo / "mod.py").write_text(mod_src)
+    (repo / "test_mod.py").write_text(test_src)
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "init")
+    return repo
+
+
+def _run_verifier(repo: Path, tmp_path: Path, *, replay: str, run_id: str) -> dict:
+    """Invoke the verifier on `repo`. Returns the parsed JSON envelope (last stdout line)."""
+    mini_home = tmp_path / "mo-home"
+    mini_home.mkdir(exist_ok=True)
+    env = os.environ.copy()
+    env["MINI_ORK_HOME"] = str(mini_home)
+    env["MINI_ORK_RUN_ID"] = run_id
+    env["MO_CODEFIX_REPLAY"] = replay
+    env["MINI_ORK_TEST_CMD"] = TEST_CMD
+    # The verifier late-imports `mini_ork.certify`; that import needs the
+    # worktree root on sys.path because the verifier is run as a script
+    # (`python3 verifier/test.py`) not as `python3 -m`.
+    env["PYTHONPATH"] = str(REPO_ROOT)
+    # pytest otherwise writes `__pycache__/*.pyc` into the candidate
+    # working tree, which violates the "byte-identical before and after"
+    # invariant on test 4. The cleaner shape would be to special-case
+    # `__pycache__` in the snapshot, but this is a one-line fix that
+    # also keeps the source tree cleaner for human inspection.
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    proc = subprocess.run(
+        [sys.executable, str(VERIFIER)], cwd=repo, env=env,
+        capture_output=True, text=True, timeout=120,
+    )
+    last = proc.stdout.strip().splitlines()
+    assert last, (
+        f"verifier produced no JSON: rc={proc.returncode} "
+        f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
+    )
+    return json.loads(last[-1])
+
+
+def _snap_worktree(repo: Path) -> tuple[dict, str]:
+    """Snapshot (relative-path -> bytes) for files OUTSIDE .git, plus the porcelain status.
+
+    `.git/` is excluded because the verifier creates a `git worktree add
+    --detach HEAD <tmp>` whose metadata lands in `<repo>/.git/worktrees/`.
+    That is git's internal storage, not the candidate working tree, so
+    it does not count as a "mutation" of what we are protecting.
+    """
+    files = {
+        p.relative_to(repo): p.read_bytes()
+        for p in repo.rglob("*")
+        if p.is_file() and not str(p.relative_to(repo)).startswith(".git")
+    }
+    status = _git_text(repo, "status", "--porcelain")
+    return files, status
+
+
+# ── 1. real fix + regression test → pass (overlap) ─────────────────────────
+def test_replay_passes_for_real_fix(tmp_path):
+    """Base = buggy. Candidate = fixed + regression test that fails on base."""
+    repo = _make_repo(
+        tmp_path,
+        mod_src="def add(a, b):\n    return a - b\n",
+        test_src="from mod import add\n\ndef test_add():\n    assert add(2, 3) == 5\n",
+    )
+    # The fix lives in the working tree (uncommitted) — HEAD stays buggy.
+    (repo / "mod.py").write_text("def add(a, b):\n    return a + b\n")
+
+    before_files, before_status = _snap_worktree(repo)
+
+    out = _run_verifier(repo, tmp_path, replay="1", run_id="replay-pass")
+
+    assert out["verifier"] == "test"
+    assert out["pass"] is True, out
+    assert "exercise" in out["error_summary"]
+    assert "replay" in out, out
+    overlap = out["replay"]["overlap"]
+    assert any("test_add" in tid for tid in overlap), overlap
+
+    after_files, after_status = _snap_worktree(repo)
+    assert before_files == after_files, "file set or contents changed"
+    assert before_status == after_status, (
+        f"git status changed\nbefore={before_status!r}\nafter={after_status!r}"
+    )
+
+
+# ── 2. test passes on base too → fail (tests-do-not-exercise-change) ───────
+def test_replay_fails_when_test_passes_on_base(tmp_path):
+    """The "patch" is a no-op add of a test that ALSO passes on the base."""
+    repo = _make_repo(
+        tmp_path,
+        # Code is already correct at HEAD; the "patch" adds a redundant test.
+        mod_src="def add(a, b):\n    return a + b\n",
+        test_src="from mod import add\n\ndef test_add():\n    assert add(2, 3) == 5\n",
+    )
+    (repo / "test_extra.py").write_text(
+        "from mod import add\n\ndef test_extra():\n    assert add(0, 0) == 0\n"
+    )
+
+    out = _run_verifier(repo, tmp_path, replay="1", run_id="replay-fail")
+
+    assert out["verifier"] == "test"
+    assert out["pass"] is False, out
+    assert "tests-do-not-exercise-change" in out["error_summary"]
+    assert "replay" in out
+    assert out["replay"]["overlap"] == [], out["replay"]
+
+
+# ── 3. MO_CODEFIX_REPLAY=0 → replay skipped, legacy semantics ─────────────
+def test_replay_skipped_when_opt_out(tmp_path):
+    repo = _make_repo(
+        tmp_path,
+        mod_src="def add(a, b):\n    return a - b\n",
+        test_src="from mod import add\n\ndef test_add():\n    assert add(2, 3) == 5\n",
+    )
+    (repo / "mod.py").write_text("def add(a, b):\n    return a + b\n")
+
+    out = _run_verifier(repo, tmp_path, replay="0", run_id="replay-skip")
+
+    assert out["verifier"] == "test"
+    assert out["pass"] is True, out
+    assert "opt-out" in out["error_summary"] or "MO_CODEFIX_REPLAY=0" in out["error_summary"]
+    # Opt-out path emits no `replay` payload — the verifier has not done
+    # any extra work to report.
+    assert "replay" not in out
+
+
+# ── 4. target working tree byte-identical before and after ─────────────────
+def test_working_tree_untouched(tmp_path):
+    repo = _make_repo(
+        tmp_path,
+        mod_src="def add(a, b):\n    return a - b\n",
+        test_src="from mod import add\n\ndef test_add():\n    assert add(2, 3) == 5\n",
+    )
+    (repo / "mod.py").write_text("def add(a, b):\n    return a + b\n")
+
+    before_files, before_status = _snap_worktree(repo)
+
+    out = _run_verifier(repo, tmp_path, replay="1", run_id="wt-untouched")
+    # Sanity: replay actually ran (the test exercises the worktree path).
+    assert "replay" in out, f"replay did not run: {out}"
+
+    after_files, after_status = _snap_worktree(repo)
+    assert before_files == after_files, (
+        f"file set or contents changed\nbefore={sorted(before_files)}\n"
+        f"after={sorted(after_files)}"
+    )
+    assert before_status == after_status, (
+        f"git status changed\nbefore={before_status!r}\nafter={after_status!r}"
+    )
+
+
+# ── 5. replay helper unit tests (no verifier subprocess) ───────────────────
+# These exercise `mini_ork.certify.replay_check` directly. They keep the
+# helper honest under hermetic conditions (no pytest collection error,
+# no missing dependency) and let a regression in the regex or the
+# unverified branches fail loudly even when the verifier path is happy.
+
+from mini_ork.certify import replay_check
+
+
+def _base_worktree(repo: Path, tmp_path: Path) -> Path:
+    """Materialise a worktree at HEAD (the pre-change state) for the helper to consume."""
+    wt = tmp_path / "base-wt"
+    _git(repo, "worktree", "add", "-q", "--detach", str(wt), "HEAD")
+    return wt
+
+
+def _cleanup_worktree(repo: Path, wt: Path) -> None:
+    _git(repo, "worktree", "remove", "--force", str(wt))
+
+
+def test_replay_helper_passes_with_real_fix(tmp_path):
+    repo = _make_repo(
+        tmp_path,
+        mod_src="def add(a, b):\n    return a - b\n",
+        test_src="from mod import add\n\ndef test_add():\n    assert add(2, 3) == 5\n",
+    )
+    (repo / "mod.py").write_text("def add(a, b):\n    return a + b\n")
+    wt = _base_worktree(repo, tmp_path)
+    try:
+        result = replay_check(TEST_CMD, base_cwd=str(wt), candidate_cwd=str(repo))
+    finally:
+        _cleanup_worktree(repo, wt)
+    assert result["passed"] is True, result
+    assert result["unverified"] is False
+    assert any("test_add" in tid for tid in result["replay"]["overlap"])
+
+
+def test_replay_helper_fails_with_passing_on_base(tmp_path):
+    repo = _make_repo(
+        tmp_path,
+        mod_src="def add(a, b):\n    return a + b\n",
+        test_src="from mod import add\n\ndef test_add():\n    assert add(2, 3) == 5\n",
+    )
+    (repo / "test_extra.py").write_text(
+        "from mod import add\n\ndef test_extra():\n    assert add(0, 0) == 0\n"
+    )
+    wt = _base_worktree(repo, tmp_path)
+    try:
+        result = replay_check(TEST_CMD, base_cwd=str(wt), candidate_cwd=str(repo))
+    finally:
+        _cleanup_worktree(repo, wt)
+    assert result["passed"] is False, result
+    assert "tests-do-not-exercise-change" in result["reason"]
+    assert result["replay"]["overlap"] == []
+
+
+def test_replay_helper_unverified_for_non_pytest():
+    result = replay_check("cargo test", base_cwd="/tmp", candidate_cwd="/tmp")
+    assert result["unverified"] is True
+    assert "pytest" in result["reason"]
+
+
+def test_replay_helper_unverified_for_missing_base(tmp_path):
+    result = replay_check(TEST_CMD, base_cwd=str(tmp_path / "does-not-exist"),
+                          candidate_cwd=str(tmp_path))
+    assert result["unverified"] is True
+
+
+# ── 6. test-file overlay onto the base worktree (rsi-i3-bsg-va-wiring-repair) ──
+# The previous WIP pass (767c4037) added the replay infrastructure but left
+# the base worktree empty of the candidate's test files. A "fix + new
+# regression test" patch has nothing to fail on the base, so the verifier
+# rejected every correct fix with `tests-do-not-exercise-change`. The overlay
+# carries the candidate's test files (matched by `_is_test_path`) onto the
+# base so the replay delta is honest. These four tests pin the contract.
+
+def test_overlay_carries_new_untracked_test_for_real_fix(tmp_path):
+    """Buggy HEAD. Candidate fixes mod.py + adds a NEW UNTRACKED regression test
+    that fails on the buggy code. Verifier must PASS and stamp the new test
+    file in `replay.overlaid_tests`. This is the case the previous WIP got wrong."""
+    repo = _make_repo(
+        tmp_path,
+        mod_src="def add(a, b):\n    return a - b\n",
+        # Trivial test that passes on both buggy and fixed code; does NOT exercise
+        # the bug. Committed at HEAD so it is present on the base too.
+        test_src="from mod import add\n\ndef test_add_trivial():\n    assert add(0, 0) == 0\n",
+    )
+    # Candidate fixes the bug.
+    (repo / "mod.py").write_text("def add(a, b):\n    return a + b\n")
+    # Candidate ADDS a NEW UNTRACKED regression test that fails on buggy code.
+    # Path uses a `tests/` segment to exercise the segment-match branch of
+    # `_is_test_path`.
+    tests_dir = repo / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_bug_regression.py").write_text(
+        "from mod import add\n\ndef test_bug_fixed():\n    assert add(2, 3) == 5\n"
+    )
+    # Sanity: the new test file is untracked (overlay must carry it; HEAD does not).
+    # `-uall` so git reports files inside the untracked `tests/` directory
+    # rather than collapsing to a single `?? tests/` entry.
+    porcelain = _git_text(repo, "status", "--porcelain", "-uall")
+    assert any("test_bug_regression.py" in ln for ln in porcelain.splitlines()), porcelain
+
+    before_files, before_status = _snap_worktree(repo)
+
+    out = _run_verifier(repo, tmp_path, replay="1", run_id="overlay-untracked-pass")
+
+    assert out["verifier"] == "test"
+    assert out["pass"] is True, out
+    assert "exercise" in out["error_summary"]
+    assert "replay" in out, out
+    # The overlay audit trail must name the new test file.
+    assert out["replay"]["overlaid_tests"] == ["tests/test_bug_regression.py"], out["replay"]
+    # And that test must be in the overlap (passed on candidate, failed on base).
+    assert any("test_bug_fixed" in tid for tid in out["replay"]["overlap"]), out["replay"]
+
+    # Candidate tree unchanged.
+    after_files, after_status = _snap_worktree(repo)
+    assert before_files == after_files, "file set or contents changed"
+    assert before_status == after_status, (
+        f"git status changed\nbefore={before_status!r}\nafter={after_status!r}"
+    )
+
+
+def test_overlay_carries_untracked_test_passing_on_base(tmp_path):
+    """Candidate adds a NEW UNTRACKED test that ALSO passes on buggy code.
+    Verifier must FAIL with `tests-do-not-exercise-change`; overlay still
+    stamps the file (audit trail is independent of pass/fail)."""
+    repo = _make_repo(
+        tmp_path,
+        # Code is already correct at HEAD; the "patch" only adds a redundant test.
+        mod_src="def add(a, b):\n    return a + b\n",
+        test_src="from mod import add\n\ndef test_add():\n    assert add(2, 3) == 5\n",
+    )
+    # New UNTRACKED test in a `tests/` segment that passes on the correct code.
+    tests_dir = repo / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_extra.py").write_text(
+        "from mod import add\n\ndef test_extra():\n    assert add(0, 0) == 0\n"
+    )
+
+    out = _run_verifier(repo, tmp_path, replay="1", run_id="overlay-untracked-fail")
+
+    assert out["verifier"] == "test"
+    assert out["pass"] is False, out
+    assert "tests-do-not-exercise-change" in out["error_summary"]
+    # Overlay still records the file (it DID cross to the base).
+    assert out["replay"]["overlaid_tests"] == ["tests/test_extra.py"], out["replay"]
+    # No overlap because the new test passed on both sides.
+    assert out["replay"]["overlap"] == [], out["replay"]
+
+
+def test_overlay_skips_non_test_source_changes(tmp_path):
+    """A non-test source file changed in the candidate is NOT carried onto the base.
+    The overlay is selective — only test paths cross over."""
+    repo = _make_repo(
+        tmp_path,
+        mod_src="def add(a, b):\n    return a - b\n",
+        # Tracked regression test that fails on buggy code, passes on fixed code.
+        test_src="from mod import add\n\ndef test_add():\n    assert add(2, 3) == 5\n",
+    )
+    # Only modify a non-test source file — no test changes.
+    (repo / "mod.py").write_text("def add(a, b):\n    return a + b\n")
+
+    before_files, before_status = _snap_worktree(repo)
+
+    out = _run_verifier(repo, tmp_path, replay="1", run_id="overlay-non-test")
+
+    assert out["verifier"] == "test"
+    assert out["pass"] is True, out  # the tracked test exercises the fix
+    assert "exercise" in out["error_summary"]
+    # Non-test source change → overlay must be empty.
+    assert out["replay"]["overlaid_tests"] == [], out["replay"]
+    # And the existing tracked test must be in the overlap.
+    assert any("test_add" in tid for tid in out["replay"]["overlap"]), out["replay"]
+
+    after_files, after_status = _snap_worktree(repo)
+    assert before_files == after_files, "file set or contents changed"
+    assert before_status == after_status, (
+        f"git status changed\nbefore={before_status!r}\nafter={after_status!r}"
+    )
+
+
+def test_overlay_preserves_candidate_tree_byte_identical(tmp_path):
+    """The overlay writes into the BASE worktree, never the candidate. The
+    candidate working tree must be byte-identical before and after a verifier
+    run that exercises the overlay path."""
+    repo = _make_repo(
+        tmp_path,
+        mod_src="def add(a, b):\n    return a - b\n",
+        test_src="from mod import add\n\ndef test_add():\n    assert add(0, 0) == 0\n",
+    )
+    (repo / "mod.py").write_text("def add(a, b):\n    return a + b\n")
+    # Add an untracked test file so the overlay has something to copy.
+    tests_dir = repo / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_bug.py").write_text(
+        "from mod import add\n\ndef test_bug():\n    assert add(2, 3) == 5\n"
+    )
+
+    before_files, before_status = _snap_worktree(repo)
+
+    out = _run_verifier(repo, tmp_path, replay="1", run_id="overlay-tree-clean")
+
+    # Sanity: the overlay path actually ran.
+    assert "replay" in out, out
+    assert out["replay"]["overlaid_tests"] == ["tests/test_bug.py"], out["replay"]
+
+    after_files, after_status = _snap_worktree(repo)
+    assert before_files == after_files, (
+        f"file set or contents changed\nbefore={sorted(before_files)}\n"
+        f"after={sorted(after_files)}"
+    )
+    assert before_status == after_status, (
+        f"git status changed\nbefore={before_status!r}\nafter={after_status!r}"
+    )

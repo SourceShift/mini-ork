@@ -26,10 +26,19 @@ buggy code for the RIGHT REASON; an invariant is evidence only if it is about th
 Skip that and you are not measuring the patch — you are measuring your test generator.
 
 Verdicts: PROVEN | REFUTED | UNVERIFIED   (never a bare "pass")
+
+This module also exposes `replay_check` — the verifier-side twin of the oracle's private
+delta gate. Same shape on purpose, so a downstream consumer that already understands
+"abstain" for the LLM path reads zero new code for the shell-test path. The caller
+owns the base worktree; the helper only consumes the path it's given.
 """
 from __future__ import annotations
 
+import os
+import re
+import subprocess
 from collections.abc import Callable
+from pathlib import Path
 
 from mini_ork.certify import invariants as mr
 from mini_ork.certify import probe as poc_plus
@@ -60,6 +69,158 @@ def _default_dispatch() -> DispatchFn:
     return default_dispatch
 
 
+# ── Delta-gate replay helper (verifier-side twin of the oracle's delta gate) ──
+# Pytest -v output looks like:
+#   tests/test_mod.py::test_add PASSED                              [ 50%]
+#   ERROR tests/test_mod.py - ImportError: ...                     [100%]
+# Match both shapes so a collection error on the base still counts as a
+# failure for the overlap test (rather than vanishing into "no overlap").
+_TEST_RESULT_RE = re.compile(
+    r"(?P<id>(?:\S+::\S+|\S+\.py))\s+(?P<status>PASSED|FAILED|ERROR|SKIPPED)\b"
+)
+
+
+def _ensure_pytest_verbose(cmd: str) -> str:
+    """Insert `-v --tb=no` into a pytest command that lacks verbose flags.
+
+    Non-pytest commands are returned unchanged; the caller is responsible
+    for skipping the replay when the test runner cannot produce per-test
+    output. We auto-augment so most callers don't have to think about it.
+    """
+    if "pytest" not in cmd:
+        return cmd
+    if re.search(r"(?:^|\s)(?:-v\b|--verbose\b)", cmd):
+        return cmd
+    return re.sub(r"\bpytest\b", "pytest -v --tb=no", cmd, count=1)
+
+
+def replay_check(
+    cmd: str,
+    *,
+    base_cwd: str,
+    candidate_cwd: str | None = None,
+    candidate_log: str | None = None,
+    base_log: str | None = None,
+) -> dict:
+    """Replay `cmd` on a clean base and demand overlap with the candidate.
+
+    Returns a dict::
+
+        {
+          "passed":     bool,   # True iff at least one test passed on candidate
+                                # AND failed on base
+          "reason":     str,    # human-readable
+          "unverified": bool,   # True if base state could not be evaluated;
+                                # the caller should abstain rather than
+                                # pass/fail
+          "replay":     dict | None,
+        }
+
+    Where ``replay`` carries ``{candidate_passed, base_failed, overlap}``
+    as sorted lists — the audit trail a downstream consumer needs to
+    decide whether to override the verdict.
+
+    Outcomes (mapped to the kickoff):
+
+      base-fails / candidate-passes (overlap non-empty)
+            → ``passed=True, reason="tests exercise the change (delta-gate overlap)"``
+
+      candidate-passes / nothing-fails-on-base
+            → ``passed=False, reason="tests-do-not-exercise-change"``
+
+      base state cannot be evaluated (rc==-1, base uncollectable, no tests
+      collected anywhere, or `pytest` not in `cmd`)
+            → ``unverified=True`` (the caller abstains, not passes/fails)
+
+    CALLER OWNS THE BASE WORKTREE — this helper only consumes the path it
+    is given. Constructing the base (typically `git worktree add --detach
+    HEAD <tmp>`) is the caller's responsibility because the caller's repo
+    state, branch, and stash hygiene are not ours to manage.
+    """
+    if not cmd or not cmd.strip():
+        return {"passed": False, "reason": "no command", "unverified": True, "replay": None}
+    if "pytest" not in cmd:
+        # We can only parse per-test results from pytest -v output. Other
+        # runners (npm, cargo, go) have their own conventions; abstaining
+        # here is the honest answer until a sibling helper exists.
+        return {"passed": False, "reason": "replay supports pytest commands only",
+                "unverified": True, "replay": None}
+    if not base_cwd or not os.path.isdir(base_cwd):
+        return {"passed": False, "reason": f"base cwd not a directory: {base_cwd!r}",
+                "unverified": True, "replay": None}
+
+    augmented = _ensure_pytest_verbose(cmd)
+    cand_cwd = candidate_cwd or os.getcwd()
+    cand_log = candidate_log or os.path.join(base_cwd, ".replay_candidate.log")
+    b_log = base_log or os.path.join(base_cwd, ".replay_base.log")
+
+    def _run(cwd: str, log: str) -> tuple[int, set[str], set[str]]:
+        passed: set[str] = set()
+        failed: set[str] = set()
+        try:
+            with open(log, "wb") as fh:
+                rc = subprocess.run(
+                    augmented, shell=True, cwd=cwd, stdout=fh, stderr=subprocess.STDOUT,
+                ).returncode
+        except OSError:
+            return -1, passed, failed
+        try:
+            text = Path(log).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return rc, passed, failed
+        for m in _TEST_RESULT_RE.finditer(text):
+            tid = m.group("id")
+            st = m.group("status")
+            if st == "PASSED":
+                passed.add(tid)
+            elif st in ("FAILED", "ERROR"):
+                failed.add(tid)
+        return rc, passed, failed
+
+    _, cand_pass, _ = _run(cand_cwd, cand_log)
+    base_rc, base_pass, base_fail = _run(base_cwd, b_log)
+
+    if base_rc == -1:
+        return {"passed": False, "reason": "base state could not be evaluated",
+                "unverified": True, "replay": None}
+    if base_rc != 0 and not (base_pass or base_fail):
+        # rc!=0 AND no per-test lines parsed → pytest could not collect or
+        # run. We cannot claim the base "passes" or "fails" by test, so we
+        # abstain rather than silently fail or pass.
+        return {
+            "passed": False,
+            "reason": f"base could not run (rc={base_rc}); cannot establish delta",
+            "unverified": True,
+            "replay": None,
+        }
+    total = len(cand_pass) + len(base_pass) + len(base_fail)
+    if total == 0:
+        return {"passed": False, "reason": "no tests collected; cannot establish delta",
+                "unverified": True, "replay": None}
+
+    overlap = cand_pass & base_fail
+    info = {
+        "candidate_passed": sorted(cand_pass),
+        "base_failed": sorted(base_fail),
+        "overlap": sorted(overlap),
+    }
+
+    if overlap:
+        return {
+            "passed": True,
+            "reason": "tests exercise the change (delta-gate overlap)",
+            "unverified": False,
+            "replay": info,
+        }
+    return {
+        "passed": False,
+        "reason": "tests-do-not-exercise-change",
+        "unverified": False,
+        "replay": info,
+    }
+
+
+# ── Oracle judge ─────────────────────────────────────────────────────────────
 def judge(
     issue: str,
     patch: str,
@@ -160,4 +321,4 @@ def judge(
                    detail={"invariants": kept, "dropped": dropped})
 
 
-__all__ = ["judge"]
+__all__ = ["judge", "replay_check"]
