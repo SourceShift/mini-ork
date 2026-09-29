@@ -82,15 +82,15 @@ def test_recompute_advantage(seeded):
     # laneB (all rewards 0.0) a negative one.
     assert rows[("laneA", "code-fix")][2] > 0
     assert rows[("laneB", "code-fix")][2] < 0
-    # Counts: one GRPO group of 3 traces per lane.
-    assert rows[("laneA", "code-fix")][3] == 1
-    assert rows[("laneB", "code-fix")][3] == 1
+    # runs_count counts RUNS (3 traces per lane), not GRPO groups (1).
+    assert rows[("laneA", "code-fix")][3] == 3
+    assert rows[("laneB", "code-fix")][3] == 3
 
 
 def test_preferred_lane(seeded):
-    # min_samples=1: with one group per lane, runs_count=1 must still clear the
-    # floor so we exercise the actual pick (not the below-floor empty path).
-    env = {**DETERM, "MO_LEARNING_MIN_SAMPLES": "1"}
+    # 3 runs per lane clear the default floor of 3, so this exercises the
+    # actual pick (not the below-floor empty path).
+    env = {**DETERM, "MO_LEARNING_MIN_SAMPLES": "3"}
     os.environ.update(env)
     try:
         lane_router.recompute_advantages(db=seeded)

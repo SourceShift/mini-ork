@@ -173,13 +173,17 @@ def recompute_advantages(since: int = 0, db: str | None = None) -> int:
             {"lane": r["agent_version_id"], "score": float(r["reward_g"]),
              "task_class": r["task_class"], "cost": cost, "weight": w})
 
-    acc = defaultdict(lambda: {"shr_sum": 0.0, "groups": 0, "wins": 0,
+    # "groups" divides the advantage average (one vote per group); "runs" is the
+    # evidence count persisted as runs_count — the MO_LEARNING_MIN_SAMPLES floor
+    # and the UCB bonus's n. Persisting "groups" there instead counted code
+    # regions, so a region row could never exceed 1 and never cleared the floor.
+    acc = defaultdict(lambda: {"shr_sum": 0.0, "groups": 0, "runs": 0, "wins": 0,
                                "node_types": defaultdict(int),
                                "objective_domains": defaultdict(int)})
-    acc_domain = defaultdict(lambda: {"shr_sum": 0.0, "groups": 0, "wins": 0,
+    acc_domain = defaultdict(lambda: {"shr_sum": 0.0, "groups": 0, "runs": 0, "wins": 0,
                                       "var_sum": 0.0, "n_for_var": 0,
                                       "slice_mean": 0.0, "slice_std": 0.0})
-    acc_region = defaultdict(lambda: {"shr_sum": 0.0, "groups": 0, "wins": 0,
+    acc_region = defaultdict(lambda: {"shr_sum": 0.0, "groups": 0, "runs": 0, "wins": 0,
                                       "var_sum": 0.0, "n_for_var": 0,
                                       "slice_mean": 0.0, "slice_std": 0.0})
     # "w" is the summed run weight the moments divide by; "n" counts groups and
@@ -249,12 +253,14 @@ def recompute_advantages(since: int = 0, db: str | None = None) -> int:
             a = acc[(lane, _tc)]
             a["shr_sum"] += shrunken
             a["groups"] += 1
+            a["runs"] += n_in_group
             a["wins"] += wins
             a["node_types"][_nt] += 1
             a["objective_domains"][_od] += 1
             d = acc_domain[(lane, _tc, _nt, _od)]
             d["shr_sum"] += shrunken
             d["groups"] += 1
+            d["runs"] += n_in_group
             d["wins"] += wins
             d["var_sum"] += var
             d["n_for_var"] += 1
@@ -262,6 +268,7 @@ def recompute_advantages(since: int = 0, db: str | None = None) -> int:
                 rr = acc_region[(lane, _tc, _nt, _od, _cr)]
                 rr["shr_sum"] += shrunken
                 rr["groups"] += 1
+                rr["runs"] += n_in_group
                 rr["wins"] += wins
                 rr["var_sum"] += var
                 rr["n_for_var"] += 1
@@ -337,7 +344,7 @@ def recompute_advantages(since: int = 0, db: str | None = None) -> int:
         top_node = (max(stats["node_types"].items(), key=lambda kv: kv[1])[0]
                     if stats["node_types"] else None)
         store.upsert_agent_performance(lane, top_node or lane, lane, tc,
-                                       stats["groups"], stats["wins"],
+                                       stats["runs"], stats["wins"],
                                        round(new_rel_adv, 4))
         upserted += 1
 
@@ -353,7 +360,7 @@ def recompute_advantages(since: int = 0, db: str | None = None) -> int:
         else:
             adv_var, adv_std, new_z = 0.0, 0.0, 0.0
         store.upsert_domain_advantage(lane, tc, nt or "", od or "",
-                                      round(new_rel_adv, 4), stats["groups"],
+                                      round(new_rel_adv, 4), stats["runs"],
                                       stats["wins"], round(adv_var, 6),
                                       round(adv_std, 6), round(new_z, 4))
 
@@ -375,7 +382,7 @@ def recompute_advantages(since: int = 0, db: str | None = None) -> int:
         else:
             adv_var, adv_std, new_z = 0.0, 0.0, 0.0
         store.upsert_region_advantage(lane, tc, nt or "", od or "", cr or "",
-                                      round(new_rel_adv, 4), stats["groups"],
+                                      round(new_rel_adv, 4), stats["runs"],
                                       stats["wins"], round(adv_var, 6),
                                       round(adv_std, 6), round(new_z, 4))
 

@@ -97,3 +97,54 @@ def test_near_constant_slice_keeps_z_on_the_ucb_scale(tmp_path, monkeypatch):
 
     assert abs(_z(db, "proven")) < 1.0 and abs(_z(db, "fresh")) < 1.0
 
+
+
+# ── runs_count counts runs, not groups ─────────────────────────────────────
+
+
+def _ins_region(db, lane, reward, region):
+    con = sqlite3.connect(db)
+    con.execute(
+        "INSERT INTO execution_traces (trace_id, agent_version_id, task_class, "
+        "objective_domain, code_region, verifier_output, reward_g, cost_usd, "
+        "status, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+        (f"t-{lane}-{next(_SEQ)}", lane, "tc", "code-delivery", region,
+         '{"node_type":"implementer"}', reward, 1.0, "success", _NOW))
+    con.commit()
+    con.close()
+
+
+def test_region_rows_count_runs_and_clear_the_sample_floor(tmp_path, monkeypatch):
+    """Each code region is exactly one group, so persisting the group count
+    pinned every lane_region_advantage row at runs_count=1 — below the default
+    floor of 3, which made the region routing level unreachable."""
+    db = _init_db(tmp_path)
+    for lane, r in (("a", 1.0),) * 3 + (("b", 0.0),) * 3:
+        _ins_region(db, lane, r, "mini_ork/cli")
+    _recompute(db, monkeypatch)
+    monkeypatch.setenv("MO_LEARNING_MIN_SAMPLES", "3")
+
+    con = sqlite3.connect(db)
+    counts = dict(con.execute(
+        "SELECT agent_version_id, runs_count FROM lane_region_advantage").fetchall())
+    con.close()
+    assert counts == {"a": 3, "b": 3}
+    detail = lane_router.preferred_lane_detail(
+        "tc", "implementer", "code-delivery", "mini_ork/cli", db=db)
+    assert (detail["lane"], detail["source"]) == ("a", "region")
+
+
+def test_exploration_can_still_pick_the_less_tried_lane(tmp_path, monkeypatch):
+    """A 0.01 score gap on 3 runs vs 1 run is noise; the UCB bonus must be able
+    to send the next pick to the lane with less evidence. Before the z-score
+    fix the z gap dwarfed the bonus, and before the runs_count fix both lanes
+    had n=1 so the bonus could not tell them apart."""
+    db = _init_db(tmp_path)
+    for r in (2.95, 2.95, 2.95):
+        _ins(db, "proven", r)
+    _ins(db, "fresh", 2.94)
+    _recompute(db, monkeypatch)
+
+    pick = lane_router.preferred_lane("tc", "implementer", "code-delivery", db=db)
+
+    assert pick.split("|")[0] == "fresh"
