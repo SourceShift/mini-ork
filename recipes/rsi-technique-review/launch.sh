@@ -59,6 +59,10 @@ export MO_FALLBACK_REVIEW=glm,minimax
 export MINI_ORK_DRY_RUN=0
 export MO_DAILY_BUDGET_USD="${MO_DAILY_BUDGET_USD:-150}"
 export MO_NODE_TIMEOUT_S="${MO_NODE_TIMEOUT_S:-5400}"   # 200-paper shards outlive the 1500s default
+# The pre-dispatch watchdog fails every queued LLM node when ANY in-flight node's
+# heartbeat is older than this (default 300s); one long 200-paper turn killed
+# shards 05-10 on the first full run. Keep it above MO_NODE_TIMEOUT_S.
+export MO_HEARTBEAT_TIMEOUT_S="${MO_HEARTBEAT_TIMEOUT_S:-6000}"
 export MO_NODE_MAX_TURNS="${MO_NODE_MAX_TURNS:-150}"
 export MO_ALLOW_FRAMEWORK_CWD=1            # target is the mini-ork repo itself
 
