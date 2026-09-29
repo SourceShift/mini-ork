@@ -67,8 +67,48 @@ def _recipe_dir(task_class: str) -> str | None:
     return None
 
 
-def _frozen_probes(task_class: str) -> list[str]:
-    """Sorted, capped probe kickoff paths for the recipe. [] when none."""
+def _parse_probe_frontmatter(path: str) -> dict:
+    """YAML frontmatter at the top of a probe kickoff, or ``{}`` when absent.
+
+    Anchor probes carry ``anchor: true`` in their frontmatter so the apply loop
+    can split the frozen probe set into (a) the metric the gate compares and
+    (b) the metric the loop is NOT allowed to optimize. The frontmatter is
+    optional: a probe without one is a gate probe (kickoff rule #1 — anchor is
+    opt-in, never the default).
+    """
+    try:
+        with open(path, encoding="utf-8") as fh:
+            head = fh.read(4096)
+    except OSError:
+        return {}
+    if not head.startswith("---\n"):
+        return {}
+    # Frontmatter is the FIRST ``---``-delimited block at the top of the file.
+    end = head.find("\n---\n", 4)
+    if end < 0:
+        return {}
+    body = head[4:end]
+    try:
+        import yaml  # deferred: keeps module import cheap
+        parsed = yaml.safe_load(body) or {}
+    except Exception:
+        # Malformed frontmatter (typo, missing colon, indented block) falls
+        # back to a gate probe — anchor is opt-in, never inferred.
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _load_probes(task_class: str) -> list[tuple[str, bool]]:
+    """Sorted, capped probe list as ``(path, is_anchor)`` pairs.
+
+    The split is what makes the anchor signal meaningful: the gate's
+    before/after vectors cover ONLY non-anchor probes, so a candidate that
+    only gains on an anchor probe cannot game its way past the gate. Anchors
+    are still run for both arms (control + candidate) like any probe; their
+    outcome is reported as ``anchor_solved_frac`` for the candidate arm
+    (kickoff rule #1). Cap is applied to the combined list so a probe set
+    dominated by anchors does not crowd out gate probes silently.
+    """
     recipe = _recipe_dir(task_class)
     if not recipe:
         return []
@@ -79,11 +119,16 @@ def _frozen_probes(task_class: str) -> list[str]:
         names = sorted(n for n in os.listdir(probes_dir) if n.endswith(".md"))
     except OSError:
         return []
+    pairs: list[tuple[str, bool]] = []
+    for name in names:
+        path = os.path.join(probes_dir, name)
+        is_anchor = bool(_parse_probe_frontmatter(path).get("anchor"))
+        pairs.append((path, is_anchor))
     try:
         cap = max(1, int(os.environ.get("MO_APPLY_PROBE_MAX_TASKS", "2")))
     except ValueError:
         cap = 2
-    return [os.path.join(probes_dir, n) for n in names[:cap]]
+    return pairs[:cap]
 
 
 def _probe_fixture(probe_path: str) -> str | None:
@@ -458,15 +503,27 @@ def probe_score(task_class: str, target_file: str | None,
     append semantics to ``apply_mutation``, marker included, so what the probe
     measures is exactly what a promote would land).
 
+    Anchor split (kickoff rule #1): probes with ``anchor: true`` in their YAML
+    frontmatter are run for both arms like any probe, but their outcomes do
+    NOT enter the gate's ``before``/``after`` vectors. The candidate arm's
+    mean outcome on anchor probes is reported as ``anchor_solved_frac``; with
+    no anchor probes that field is ``None`` so the apply loop knows to skip
+    the ``collapse_history`` write.
+
     Returns a probe-result dict:
-        before / after / n     — scalar utilities + probe count
+        before / after / n     — scalar utilities + probe count (GATE probes
+                                 only — anchors never enter this average)
         pertask_json           — JSON with before/after/ids vectors for the
-                                 gate's per-task no-regression rule
+                                 gate's per-task no-regression rule (GATE only)
+        anchor_solved_frac     — mean candidate outcome on anchor probes, or
+                                 None when no anchor probes exist
+        directives             — count (1 for ``probe_score``, the candidate
+                                 is one ``suggested_change``)
         runs                   — [{probe, arm, run_id, outcome, cost_usd}]
         cost_usd               — total spend across every launch
     or None when the recipe has no frozen probe set (caller must NOT promote).
     """
-    probes = _frozen_probes(task_class)
+    probes = _load_probes(task_class)
     if not probes:
         return None
     if not target_file or not directive:
@@ -495,6 +552,7 @@ def probe_score(task_class: str, target_file: str | None,
     runs: list[dict] = []
     before_v: list[float] = []
     after_v: list[float] = []
+    anchor_after_v: list[float] = []  # candidate arm outcomes on anchor probes
     ids: list[str] = []
     control_solved_per_probe: list[int] = []
     spent = 0.0
@@ -507,7 +565,7 @@ def probe_score(task_class: str, target_file: str | None,
             # Candidate arm could not land the directive → nothing to measure.
             return None
         stop_sweep = False
-        for probe in probes:
+        for probe, is_anchor in probes:
             if spent >= budget or stop_sweep:
                 break  # n truncates to probes completed in BOTH arms below
             # ── Control arm: N retries on the unmutated baseline ────────────
@@ -560,11 +618,6 @@ def probe_score(task_class: str, target_file: str | None,
             # and n truncates to the probes finished in BOTH arms.
             if not control_outcomes:
                 break
-            # max(binary outcomes) == 1.0 if any retry solved it, else 0.0.
-            before_v.append(max(control_outcomes))
-            ids.append(os.path.basename(probe))
-            control_solved_per_probe.append(
-                1 if max(control_outcomes) >= 1.0 else 0)
             # ── Candidate arm: single run, as today ─────────────────────────
             if spent >= budget or stop_sweep:
                 break
@@ -589,8 +642,21 @@ def probe_score(task_class: str, target_file: str | None,
             outcome = _run_outcome(run_id)
             runs.append({"probe": os.path.basename(probe), "arm": "candidate",
                          "run_id": run_id, "outcome": outcome,
-                         "cost_usd": cost})
-            after_v.append(outcome)
+                         "cost_usd": cost,
+                         "is_anchor": is_anchor})
+            # Anchor split (rule #1): anchor probes never enter the gate's
+            # before/after vectors — they exist to feed the collapse
+            # detector's anchor column, NOT to be optimized by the apply
+            # gate. Gate probes preserve the strict-superset semantics
+            # the gate already implements (G06-T03).
+            if is_anchor:
+                anchor_after_v.append(outcome)
+            else:
+                before_v.append(max(control_outcomes))
+                ids.append(os.path.basename(probe))
+                control_solved_per_probe.append(
+                    1 if max(control_outcomes) >= 1.0 else 0)
+                after_v.append(outcome)
     finally:
         root = _root()
         for name in temp_dirs:
@@ -603,11 +669,18 @@ def probe_score(task_class: str, target_file: str | None,
     n = min(len(before_v), len(after_v))
     before_v, after_v, ids = before_v[:n], after_v[:n], ids[:n]
     control_solved_per_probe = control_solved_per_probe[:n]
+    # anchor_solved_frac == None when no anchor probes exist (kickoff rule
+    # #1: "With no anchor probes, anchor_solved_frac is None"). The apply
+    # loop uses that as the cue to skip the collapse_history write entirely.
+    anchor_solved_frac = (sum(anchor_after_v) / len(anchor_after_v)
+                         if anchor_after_v else None)
     if n == 0:
         return {"before": 0.0, "after": 0.0, "n": 0, "pertask_json": "",
                 "runs": runs, "cost_usd": round(spent, 4),
                 "truncated_by_budget": True,
-                "control_n": control_n, "control_solved": []}
+                "control_n": control_n, "control_solved": [],
+                "anchor_solved_frac": anchor_solved_frac,
+                "directives": 1}
     pertask = json.dumps({
         "before": [int(v) for v in before_v],
         "after": [int(v) for v in after_v],
@@ -622,6 +695,8 @@ def probe_score(task_class: str, target_file: str | None,
         "cost_usd": round(spent, 4),
         "control_n": control_n,
         "control_solved": control_solved_per_probe,
+        "anchor_solved_frac": anchor_solved_frac,
+        "directives": 1,
     }
 
 
@@ -743,10 +818,16 @@ def probe_score_code(task_class: str, patch_path: str | None, *,
     non-zero delta means the instrument is measuring noise rather than the
     change. An instrument that fails that is fixed before it is trusted.
 
+    The anchor split mirrors ``probe_score``: probes with ``anchor: true`` in
+    their YAML frontmatter are excluded from the gate's before/after vectors,
+    and the candidate arm's mean outcome on those probes is reported as
+    ``anchor_solved_frac``. Code-arm candidates have ``directives == 0``
+    (the candidate is a patch, not a directive).
+
     Returns the same shape as ``probe_score``, or None when the recipe has no
     frozen probe set or the patch cannot apply — the caller must not promote.
     """
-    probes = _frozen_probes(task_class)
+    probes = _load_probes(task_class)
     recipe = _recipe_dir(task_class)
     if not probes or recipe is None:
         return None
@@ -765,6 +846,7 @@ def probe_score_code(task_class: str, patch_path: str | None, *,
     runs: list[dict] = []
     before_v: list[float] = []
     after_v: list[float] = []
+    anchor_after_v: list[float] = []  # candidate arm outcomes on anchor probes
     ids: list[str] = []
     control_solved_per_probe: list[int] = []
     spent = 0.0
@@ -785,7 +867,7 @@ def probe_score_code(task_class: str, patch_path: str | None, *,
         base_tree = arms[0][2]
         cand_tree = arms[1][2]
         stop_sweep = False
-        for probe in probes:
+        for probe, is_anchor in probes:
             if spent >= budget or stop_sweep:
                 break  # n truncates to probes completed in BOTH arms below
             # ── Control arm: N retries on the baseline worktree ────────────
@@ -833,10 +915,6 @@ def probe_score_code(task_class: str, patch_path: str | None, *,
             # and n truncates to the probes finished in BOTH arms.
             if not control_outcomes:
                 break
-            before_v.append(max(control_outcomes))
-            ids.append(os.path.basename(probe))
-            control_solved_per_probe.append(
-                1 if max(control_outcomes) >= 1.0 else 0)
             # ── Candidate arm: single run on the candidate worktree ────────
             if spent >= budget or stop_sweep:
                 break
@@ -861,8 +939,19 @@ def probe_score_code(task_class: str, patch_path: str | None, *,
             outcome = _run_outcome(run_id, db=_arm_db(cand_tree))
             runs.append({"probe": os.path.basename(probe), "arm": "candidate",
                          "run_id": run_id, "outcome": outcome,
-                         "cost_usd": cost})
-            after_v.append(outcome)
+                         "cost_usd": cost,
+                         "is_anchor": is_anchor})
+            # Anchor split: same semantics as ``probe_score``. Code-arm
+            # candidates still write ``anchor_solved_frac`` to collapse_history
+            # so the detector sees anchor drift across code mutations too.
+            if is_anchor:
+                anchor_after_v.append(outcome)
+            else:
+                before_v.append(max(control_outcomes))
+                ids.append(os.path.basename(probe))
+                control_solved_per_probe.append(
+                    1 if max(control_outcomes) >= 1.0 else 0)
+                after_v.append(outcome)
     finally:
         for _arm, tmp, tree in arms:
             _remove_arm(tmp, tree)
@@ -872,11 +961,15 @@ def probe_score_code(task_class: str, patch_path: str | None, *,
     n = min(len(before_v), len(after_v))
     before_v, after_v, ids = before_v[:n], after_v[:n], ids[:n]
     control_solved_per_probe = control_solved_per_probe[:n]
+    anchor_solved_frac = (sum(anchor_after_v) / len(anchor_after_v)
+                         if anchor_after_v else None)
     if n == 0:
         result = {"before": 0.0, "after": 0.0, "n": 0, "pertask_json": "",
                   "runs": runs, "cost_usd": round(spent, 4),
                   "truncated_by_budget": True,
-                  "control_n": control_n, "control_solved": []}
+                  "control_n": control_n, "control_solved": [],
+                  "anchor_solved_frac": anchor_solved_frac,
+                  "directives": 0}
     else:
         result = {
             "before": sum(before_v) / n,
@@ -891,6 +984,8 @@ def probe_score_code(task_class: str, patch_path: str | None, *,
             "cost_usd": round(spent, 4),
             "control_n": control_n,
             "control_solved": control_solved_per_probe,
+            "anchor_solved_frac": anchor_solved_frac,
+            "directives": 0,
         }
     _write_null_calibration(patch_path, result)
     return result

@@ -724,6 +724,78 @@ def attempt_record(task_class: str, target_kind: str, target_name: str,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# collapse_history writer (kickoff auto/rsi-i4b-collapse-writer.md, rule #2)
+# ─────────────────────────────────────────────────────────────────────────────
+def _write_collapse_history_row(task_class: str, score: float, anchor,
+                                directives: int, run_id: str,
+                                db: str | None = None) -> None:
+    """Append one row to ``collapse_history`` after a scored apply decision.
+
+    The circuit breaker's collapse signal reads ``collapse_history`` directly
+    (mini_ork/recovery/circuit_breaker.py:_eval_collapse_signal); the apply
+    loop is the only writer (kickoff rule #2). Failures MUST NOT propagate:
+    the gate decision was already made, and a write error here would corrupt
+    the audit trail by retrying an unrelated decision path. We swallow every
+    exception and let the caller carry on.
+
+    Schema source of truth: db/migrations/0060_collapse_history.sql.
+
+    Step arithmetic (kickoff rule #2): the FIRST row for a task_class is
+    ``step = 0`` (0-based start), and each subsequent row is
+    ``(max existing step) + 1``. Detectors read by ascending ``step`` so the
+    history stays in measurement order across promoted and quarantined
+    decisions alike.
+
+    When the table is missing (older DBs that ran mini-ork before migration
+    0060), the write is a silent no-op — the breaker's production read path
+    is fail-open on the same condition, so an absent table is a coherent
+    state, not an error.
+    """
+    if anchor is None:
+        return  # no anchor probes → no row (kickoff rule #3)
+    try:
+        con = sqlite3.connect(_db_path(db))
+    except sqlite3.Error:
+        return  # DB unreadable → skip, never crash the gate
+    try:
+        try:
+            row = con.execute(
+                "SELECT COALESCE(MAX(step), -1) FROM collapse_history "
+                "WHERE task_class=?",
+                (task_class,),
+            ).fetchone()
+            next_step = (int(row[0]) + 1) if row and row[0] is not None else 0
+        except sqlite3.OperationalError:
+            # No collapse_history table yet — older DBs, exactly the fail-open
+            # case the breaker also honours.
+            return
+        con.execute(
+            """
+            INSERT INTO collapse_history
+                (task_class, step, score, anchor, directives, run_id, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                task_class,
+                next_step,
+                float(score),
+                float(anchor),
+                int(directives),
+                run_id or None,
+                int(time.time()),
+            ),
+        )
+        con.commit()
+    except (sqlite3.Error, ValueError, TypeError):
+        # Write failure: swallow. The gate's decision is already finalized
+        # above this call; the audit row in ``apply_attempts`` will reflect
+        # the real outcome regardless.
+        pass
+    finally:
+        con.close()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # apply_record_promotion
 # ─────────────────────────────────────────────────────────────────────────────
 def record_promotion(candidate_id: str, utility_before, utility_after,
@@ -966,6 +1038,37 @@ def apply_run(task_class: str, target_kind: str, target_name: str,
     promotion_id = record_promotion(
         candidate_id, utility_before, utility_after,
         gate_decision, gate_rationale, db=db)
+
+    # 5b. collapse_history write (kickoff rule #2). The breaker's collapse
+    #     signal reads collapse_history directly; without this write the halt
+    #     can never fire (G01-T04 part a). The write runs even on quarantine
+    #     — the detector tracks score vs anchor over iterations regardless of
+    #     the gate's verdict. ``probe_result`` is None or n==0 when nothing
+    #     was measured, in which case ``anchor_solved_frac`` is unset and the
+    #     helper is a no-op (kickoff rule #3). The helper itself is fail-open
+    #     on every error path so a missing table or a transient write failure
+    #     cannot rewrite the gate's decision (kickoff rule: "Never let a write
+    #     failure change the gate decision"). Defensive outer try/except
+    #     guards against a helper monkeypatched to raise (test seam): a
+    #     write-side fault MUST stay below the gate's decision line.
+    if probe_result is not None:
+        anchor_solved_frac = probe_result.get("anchor_solved_frac")
+        if anchor_solved_frac is not None:
+            try:
+                _write_collapse_history_row(
+                    task_class,
+                    score=float(utility_after or 0.0),
+                    anchor=anchor_solved_frac,
+                    directives=int(probe_result.get("directives", 0)),
+                    run_id=os.environ.get("MINI_ORK_RUN_ID", "") or "",
+                    db=db,
+                )
+            except Exception:
+                # The gate's decision is already finalized above this call;
+                # the audit row in ``apply_attempts`` will reflect the real
+                # outcome regardless. The collapse_history write is a
+                # downstream signal — its failure cannot unwind the verdict.
+                pass
 
     # 6. Apply (only on PROMOTED + apply_enabled + !dry_run + target_file set).
     version_id = ""
