@@ -5,9 +5,17 @@ from mini_ork.gates import gate_registry as gr
 
 
 def test_builtin_gate_types_registered():
+    # Asserting the exact set (rather than a superset) keeps a silent
+    # removal of any name caught. The OCP seam (``register_gate_evaluator``
+    # in ``gate_registry.py``) intentionally forces a maintainer to update
+    # this test when adding a built-in; transient OCP registrations are
+    # covered by ``test_register_gate_evaluator_activates_new_type``.
     assert set(gr.GATE_EVALUATORS) == {
         "budget_gate", "human_gate", "scope_gate", "liveness_gate",
-        "deployment_gate", "reviewer_gate", "deterministic_verifier", "custom"}
+        "deployment_gate", "reviewer_gate", "deterministic_verifier",
+        "custom",
+        "abstain_gate",
+    }
 
 
 def test_unregistered_type_defers_and_refuses_registration(tmp_path):

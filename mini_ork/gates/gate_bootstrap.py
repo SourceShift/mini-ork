@@ -34,7 +34,16 @@ import time
 import uuid
 
 
+# Importing ``abstain_gate`` registers the ``abstain_gate`` evaluator at
+# framework boot via the OCP seam (side effect of the module's
+# module-level ``register_gate_evaluator`` call). No DB write or recipe
+# change — opt-in per recipe (kickoff rule #5).
 from mini_ork.gates.native_gates import native_condition
+from mini_ork.gates import abstain_gate  # noqa: F401
+# Reference the module so static analysers that don't honour ``# noqa``
+# see the import as used. The side effect (``register_gate_evaluator``)
+# is what we actually want; the explicit access is for the linter.
+_ = abstain_gate  # noqa: F841
 
 _DDL = """
     CREATE TABLE IF NOT EXISTS gate_registry (
