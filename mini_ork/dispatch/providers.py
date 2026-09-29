@@ -7,10 +7,14 @@ configuration; providers never source ``lib/providers/cl_*.sh``.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
 import sys
+import time
+import urllib.error
+import urllib.request
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -768,6 +772,85 @@ def required_secret_envs(
     return ()
 
 
+# ── live probe ───────────────────────────────────────────────────────────────
+# A key that is SET can still be dead: deepseek answered HTTP 402 "Insufficient
+# Balance" from ~2026-09-20 while lane_health kept reporting it healthy, so
+# framework-edit's implementer lane failed every run without anyone noticing.
+# One cached 1-token request per lane per _PROBE_TTL_S turns that into a
+# fail-fast "lane preflight failed" naming the real cause.
+_PROBE_TTL_S = 600
+_PROBE_DEAD = {
+    401: "API key rejected (HTTP 401)",
+    402: "out of credit (HTTP 402)",
+    403: "access denied (HTTP 403)",
+}
+
+
+def _probe_enabled(runtime: Mapping[str, str]) -> bool:
+    if runtime.get("MO_LANE_PROBE") == "0" or runtime.get("MINI_ORK_DRY_RUN") == "1":
+        return False
+    # Unit tests configure fake gateways; never touch the network from them
+    # unless a test opts in explicitly.
+    if "PYTEST_CURRENT_TEST" in os.environ and runtime.get("MO_LANE_PROBE") != "1":
+        return False
+    return True
+
+
+def _http_post_status(url: str, key: str, model: str) -> int | None:
+    """HTTP status of a 1-token Messages request; None when no HTTP answer
+    arrived (DNS, refused, timeout) — that is 'unknown', not 'dead'."""
+    body = json.dumps({"model": model or "probe", "max_tokens": 1,
+                       "messages": [{"role": "user", "content": "ping"}]}).encode()
+    req = urllib.request.Request(url, data=body, method="POST", headers={
+        "x-api-key": key, "authorization": f"Bearer {key}",
+        "anthropic-version": "2023-06-01", "content-type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            return int(resp.status)
+    except urllib.error.HTTPError as exc:
+        return int(exc.code)
+    except (urllib.error.URLError, OSError, ValueError):
+        return None
+
+
+def _live_probe(model: str, entry: Mapping, key: str,
+                runtime: Mapping[str, str]) -> str | None:
+    """Reason string when the gateway definitively refuses this key, else None.
+
+    Only 401/402/403 count as dead. Any other HTTP answer (2xx, a 400 about the
+    request shape, 429, 5xx) proves the key is accepted or the outage is
+    transient, and no HTTP answer at all is unknown — neither blocks a run.
+    """
+    url = str(entry.get("base_url") or "").rstrip("/") + "/v1/messages"
+    cache_path = Path(runtime.get("MINI_ORK_HOME") or ".mini-ork") / "lane-probe-cache.json"
+    try:
+        cache = json.loads(cache_path.read_text(encoding="utf-8"))
+        if not isinstance(cache, dict):
+            cache = {}
+    except (OSError, ValueError):
+        cache = {}
+    fingerprint = hashlib.sha256(f"{url}|{key}".encode()).hexdigest()[:16]
+    now = time.time()
+    hit = cache.get(model)
+    if (isinstance(hit, dict) and hit.get("fp") == fingerprint
+            and now - float(hit.get("at", 0)) < _PROBE_TTL_S):
+        dead = hit.get("dead")
+    else:
+        status = _http_post_status(url, key, str(entry.get("model") or ""))
+        if status is None:
+            return None  # unknown: do not cache, do not block
+        dead = _PROBE_DEAD.get(status)
+        cache[model] = {"fp": fingerprint, "at": now, "dead": dead}
+        try:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = cache_path.with_name(cache_path.name + f".{os.getpid()}.tmp")
+            tmp.write_text(json.dumps(cache), encoding="utf-8")
+            os.replace(tmp, cache_path)
+        except OSError:
+            pass
+    return f"{model}: {dead} at {url}" if dead else None
+
+
 def lane_health(
     model: str,
     root: str | os.PathLike[str] | None = None,
@@ -795,6 +878,10 @@ def lane_health(
                 False,
                 f"{model}: ${api_key_env} is not set — lane would die silently",
             )
+        if entry.get("kind") == "anthropic-compat" and _probe_enabled(runtime):
+            reason = _live_probe(model, entry, str(runtime[str(api_key_env)]), runtime)
+            if reason:
+                return LaneHealth(False, f"{reason} — every dispatch on this lane would fail")
     return LaneHealth(True, "ok")
 
 
