@@ -91,11 +91,18 @@ def _ema_blend(prior, batch, alpha: float):
     return alpha * batch + (1.0 - alpha) * p
 
 
-def _zscore(value: float, mean: float, var: float) -> float:
-    """z = (value - mean) / max(std, 1e-3)."""
+def _zscore(advantage: float, var: float, std_floor: float) -> float:
+    """z = advantage / max(slice score std, std_floor).
+
+    ``advantage`` is already group-relative (lane mean minus group mean), so it
+    is centred at 0 and must NOT have the slice's raw-score mean subtracted
+    again. The floor keeps a near-constant slice from blowing a tiny advantage
+    gap up past the UCB bonus: with std=0.003 and a 1e-3 floor, a 0.06 gap
+    became 20 z-units, no bonus (<~1.1) could reorder lanes, and exploration
+    silently stopped.
+    """
     std = math.sqrt(max(var, 0.0))
-    denom = std if std > 1e-3 else 1e-3
-    return (value - mean) / denom
+    return advantage / max(std, std_floor, 1e-9)
 
 
 def recompute_advantages(since: int = 0, db: str | None = None) -> int:
@@ -113,6 +120,9 @@ def recompute_advantages(since: int = 0, db: str | None = None) -> int:
     # Setting all three to 0 reproduces the legacy within-group-mean router
     # byte-for-byte (verifier regression gate).
     UCB_C = float(os.environ.get("MO_ROUTER_UCB_C", "0.5"))
+    # Minimum score spread used to normalise an advantage into a z-score. Keeps
+    # z on the same scale as the UCB bonus in slices whose scores barely vary.
+    Z_STD_FLOOR = float(os.environ.get("MO_ROUTER_Z_STD_FLOOR", "0.1"))
     SINGLE_SAMPLE = int(os.environ.get("MO_ROUTER_SINGLE_SAMPLE", "1"))
     BANDIT_ON = UCB_C > 0.0
 
@@ -172,8 +182,10 @@ def recompute_advantages(since: int = 0, db: str | None = None) -> int:
     acc_region = defaultdict(lambda: {"shr_sum": 0.0, "groups": 0, "wins": 0,
                                       "var_sum": 0.0, "n_for_var": 0,
                                       "slice_mean": 0.0, "slice_std": 0.0})
+    # "w" is the summed run weight the moments divide by; "n" counts groups and
+    # is only what lane_slice_baseline.runs_count reports.
     acc_baseline = defaultdict(lambda: {"sum_score": 0.0, "sum_score_sq": 0.0,
-                                        "n": 0, "mean": 0.0, "var": 0.0})
+                                        "w": 0.0, "n": 0, "mean": 0.0, "var": 0.0})
     for (_od, _tc, _nt, _cr), members in groups.items():
         # D2 single-sample fallback (MO_ROUTER_SINGLE_SAMPLE=1). With only
         # one lane in the slice we cannot compute relative advantage (no
@@ -187,6 +199,7 @@ def recompute_advantages(since: int = 0, db: str | None = None) -> int:
                 b = acc_baseline[(_od, _tc, _nt, _cr)]
                 b["sum_score"] += _m["weight"] * _m["score"]
                 b["sum_score_sq"] += _m["weight"] * _m["score"] * _m["score"]
+                b["w"] += _m["weight"]
                 b["n"] += 1
             continue
         sum_w = sum(m["weight"] for m in members)
@@ -202,6 +215,7 @@ def recompute_advantages(since: int = 0, db: str | None = None) -> int:
         sb = acc_baseline[(_od, _tc, _nt, _cr)]
         sb["sum_score"] += sum(m["weight"] * m["score"] for m in members)
         sb["sum_score_sq"] += _slice_wss
+        sb["w"] += _slice_wsum
         sb["n"] += 1
         lane_bonus = {}
         scores = [m["score"] for m in members]
@@ -284,10 +298,13 @@ def recompute_advantages(since: int = 0, db: str | None = None) -> int:
     # advantage will be compared against.
     for key, stats in acc_baseline.items():
         _od, _tc, _nt, _cr = key
-        if stats["n"] <= 0:
+        if stats["n"] <= 0 or stats["w"] <= 0:
             continue
-        batch_mean = stats["sum_score"] / stats["n"]
-        ex2 = stats["sum_score_sq"] / stats["n"]
+        # Weighted moments over every RUN in the slice. Dividing by the group
+        # count instead turned the mean into a sum and the variance into
+        # sum(x^2) - sum(x)^2, which is negative and clamped to 0.
+        batch_mean = stats["sum_score"] / stats["w"]
+        ex2 = stats["sum_score_sq"] / stats["w"]
         batch_var = max(ex2 - batch_mean * batch_mean, 0.0)
         prior_t = prior_baseline.get(key)
         if prior_t is None:
@@ -303,14 +320,14 @@ def recompute_advantages(since: int = 0, db: str | None = None) -> int:
         stats["mean"], stats["var"] = new_mean, new_var
 
     def _z_score(lane_adv: float, key) -> float:
-        """D3 z-score = (lane_adv - slice_baseline_mean) /
-        max(slice_baseline_std, 1e-3). Pure read of the freshly-updated
-        acc_baseline cache; falls back to lane_adv itself when the slice
-        is cold (no baseline row AND no current accumulators)."""
+        """D3 z-score = lane_adv / max(slice_baseline_std, Z_STD_FLOOR).
+        Pure read of the freshly-updated acc_baseline cache; falls back to
+        lane_adv itself when the slice is cold (no baseline row AND no current
+        accumulators)."""
         baseline = acc_baseline.get(key)
         if not baseline or baseline.get("n", 0) == 0:
             return lane_adv
-        return _zscore(lane_adv, baseline.get("mean", 0.0), baseline.get("var", 0.0))
+        return _zscore(lane_adv, baseline.get("var", 0.0), Z_STD_FLOOR)
 
     upserted = 0
     for (lane, tc), stats in acc.items():
