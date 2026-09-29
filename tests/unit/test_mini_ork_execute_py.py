@@ -210,6 +210,25 @@ def test_learning_static_lane_honours_agents_yaml_role(tmp_path, monkeypatch):
     assert ex.learning_static_lane("reviewer", "custom_lane") == "custom_lane"
 
 
+
+def test_learning_static_lane_env_knob_outranks_agents_yaml(tmp_path, monkeypatch):
+    # The shipped agents.yaml maps every role. If the mapping outranked an
+    # explicit MO_FRONTIER_LANE / MO_CHEAP_LANE, static_hybrid would collapse
+    # to workflow_default and both knobs would be silently dead.
+    home = tmp_path / ".mini-ork"
+    (home / "config").mkdir(parents=True)
+    (home / "config" / "agents.yaml").write_text(
+        "lanes:\n  reviewer: glm53_lens\n  implementer: minimax\n  researcher: sonnet\n")
+    monkeypatch.setenv("MINI_ORK_HOME", str(home))
+    monkeypatch.delenv("MINI_ORK_ROOT", raising=False)
+    monkeypatch.setenv("MO_FRONTIER_LANE", "opus_lens")
+    monkeypatch.setenv("MO_CHEAP_LANE", "deepseek")
+    assert ex.learning_static_lane("reviewer", "reviewer") == "opus_lens"
+    assert ex.learning_static_lane("implementer", "implementer") == "deepseek"
+    assert ex.learning_static_lane("researcher", "researcher") == "deepseek"
+    # A recipe pin still wins over the knob.
+    assert ex.learning_static_lane("reviewer", "custom_lane") == "custom_lane"
+
 def test_finish_reason_parity():
     cases = [((124, ""), "timeout"), ((43, ""), "error"),
              ((1, "lane_fuse_open here"), "error"),
