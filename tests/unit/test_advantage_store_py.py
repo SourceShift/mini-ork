@@ -241,5 +241,5 @@ def test_pure_math_helpers() -> None:
     assert lane_router._ema_blend(0.2, 0.5, 0.0) == 0.2
     assert lane_router._ema_blend(0.2, 0.5, 0.3) == pytest.approx(0.3 * 0.5 + 0.7 * 0.2)
     assert lane_router._ema_blend("junk", 0.5, 0.3) == 0.5
-    assert lane_router._zscore(1.0, 0.5, 0.25) == pytest.approx(1.0)
-    assert lane_router._zscore(1.0, 0.5, 0.0) == pytest.approx(500.0)  # 1e-3 floor
+    assert lane_router._zscore(0.5, 0.25, 0.1) == pytest.approx(1.0)
+    assert lane_router._zscore(0.05, 0.0, 0.1) == pytest.approx(0.5)  # std floor
