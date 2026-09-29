@@ -63,6 +63,14 @@ def learning_static_lane(node_type: str, current_lane: str) -> str:
     # + the learning loop's exploration arm — keep it.
     if current_lane != node_type:
         return current_lane
+    # An operator who mapped this role in agents.yaml (``lanes.reviewer: …``)
+    # has already chosen its lane — often precisely to steer AWAY from the
+    # frontier default (e.g. a capped gateway key behind it). Keep the role
+    # name so dispatch resolves it through that mapping; the frontier/cheap
+    # substitutions below only fill roles the operator left unmapped.
+    from .llm_dispatch import resolve_lane_family
+    if resolve_lane_family(node_type) != node_type:
+        return current_lane
     if node_type == "reviewer":
         return frontier
     if node_type in ("researcher", "implementer"):
