@@ -462,6 +462,58 @@ def _run_lifecycle(argv, root) -> int:
     return rc
 
 
+RC_BLOCKED = 75  # EX_TEMPFAIL: the run never started; retry once the cause clears
+
+
+def _spent_last_24h(db: str) -> float | None:
+    """Display-only mirror of the spend cost_circuit_open compares (task_runs,
+    rolling 24h). The DECISION always comes from cost_circuit_open itself."""
+    try:
+        import sqlite3
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        try:
+            row = con.execute("SELECT COALESCE(SUM(cost_usd),0) FROM task_runs "
+                              "WHERE created_at >= ?", (int(time.time()) - 86400,)).fetchone()
+        finally:
+            con.close()
+        return float(row[0] or 0)
+    except Exception:
+        return None
+
+
+def _budget_preflight(sink) -> int | None:
+    """Refuse to start when the rolling-24h budget is already spent.
+
+    The cost circuit used to trip per LLM call, inside the run: every node
+    then failed in seconds with finish_reason cost_limit, and the run ended
+    as an ordinary verdict=fail with files_changed 0 — indistinguishable from
+    a model that tried and failed. Say so once, before anything is dispatched.
+    """
+    if os.environ.get("MINI_ORK_DRY_RUN", "0") == "1":
+        return None
+    from mini_ork.dispatch.llm_dispatch import cost_circuit_open
+    from mini_ork.learning.advantage_store import resolve_db_path
+    raw = os.environ.get("MO_DAILY_BUDGET_USD", "50")
+    try:
+        budget = float(raw)
+    except ValueError:
+        return None  # the dispatcher reports a malformed budget itself
+    db = resolve_db_path(context_env("MINI_ORK_DB") or None)
+    if not cost_circuit_open(db, budget):
+        return None
+    spent = _spent_last_24h(db)
+    shown = f"${spent:.2f}" if spent is not None else "the budget"
+    sys.stderr.write(
+        f"mini-ork: daily budget exhausted — {shown} spent in the last 24h against "
+        f"MO_DAILY_BUDGET_USD=${budget:.2f}. Nothing was dispatched.\n"
+        "  Raise MO_DAILY_BUDGET_USD for this run, or wait for the window to roll.\n")
+    sink.update({"verdict": "blocked", "blocked_reason": "cost_limit",
+                 "budget_usd": budget})
+    if spent is not None:
+        sink["spent_24h_usd"] = round(spent, 2)
+    return RC_BLOCKED
+
+
 def _run_lifecycle_impl(argv, root, sink) -> int:
     t0 = int(time.time())
     # ── flag pre-parse: pull --deadline out ──
@@ -527,6 +579,8 @@ def _run_lifecycle_impl(argv, root, sink) -> int:
         sys.stderr.write(f"kickoff not found: {kickoff}\n"); return 2
     run_id = os.environ.setdefault("MINI_ORK_RUN_ID", f"run-{int(time.time())}-{os.getpid()}")
     sink["run_id"] = run_id
+    if (blocked := _budget_preflight(sink)) is not None:
+        return blocked
 
     # derived task_class from recipe's task_class.yaml::name
     derived = ""
