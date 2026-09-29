@@ -18,6 +18,7 @@ from mini_ork.certify import (
     judge,
 )
 from mini_ork.certify import invariants as inv
+from mini_ork.certify.context import CodeContext
 from mini_ork.runtime import ExecOutcome
 
 
@@ -282,3 +283,114 @@ def test_runner_down_is_unverified():
     assert v.verdict == UNVERIFIED
     assert "runner" in v.reason
     assert runner.calls == []
+
+
+# ── CodeContext / import guard ──────────────────────────────────────────────
+# C3 add: the oracle now optionally receives a `context` (BASE source +
+# importable module names). Prompts surface the BASE source; a structural
+# guard rejects candidates that don't import the code under test — a probe
+# of a re-implementation proves nothing about the repository.
+
+# Probe that defines its own `median` inline (no `from stats import median`).
+# Valid pytest (has `def test_*`) but does NOT import the repo module.
+POC_DEFINES_OWN_MEDIAN = (
+    "def test_foo_returns_42():\n"
+    "    def median(xs):\n"
+    "        return sorted(xs)[len(xs) // 2]\n"
+    "    assert median([1, 2, 3]) == 2\n"
+)
+
+# Probe that imports `stats` and calls `median` — the structurally-correct shape.
+POC_IMPORTS_STATS = (
+    "from stats import median\n"
+    "def test_foo_returns_42():\n"
+    "    assert median([1, 2, 3]) == 2\n"
+)
+
+
+def test_context_guard_rejects_probe_that_reimplements_code_under_test():
+    """With modules=("stats",), a probe that defines its own median is
+    rejected BEFORE `run(poc)` is ever called; every try is rejected, so
+    judge returns UNVERIFIED with the rejection reason."""
+    ctx = CodeContext(text="# file: stats/median.py\n```python\n... buggy ...\n```\n",
+                      modules=("stats",), files=("stats/median.py",))
+    runner = FakeRunner([])   # no outcomes — runner must NOT be called
+    v = judge(ISSUE_TEXT, "patch text", runner=runner,
+              dispatch=make_dispatch(poc=POC_DEFINES_OWN_MEDIAN),
+              context=ctx)
+    assert v.verdict == UNVERIFIED, v
+    assert "does not import the code under test" in v.reason
+    assert "stats" in v.reason
+    # Load-bearing: the runner was NEVER called — a guarded candidate must
+    # never reach `run(poc)`. This is the whole point of the structural
+    # guard (prompts alone are not enough).
+    assert runner.calls == []
+
+
+def test_context_guard_allows_probe_that_imports_code_under_test():
+    """Same context, but the probe imports `stats`. The guard passes; the
+    oracle then consumes the scripted outcomes and judges the patch."""
+    ctx = CodeContext(text="# file: stats/median.py\n```python\n... buggy ...\n```\n",
+                      modules=("stats",), files=("stats/median.py",))
+    # probe build (1 call: base AssertionError) + delta gate (1 call: passed)
+    # + 1 invariant's base-validation + 1 invariant's on-patch run = 4 scripted.
+    outcomes = _probe_green() + [
+        ExecOutcome(status="failed"),  # mr build: candidate fails on base
+        ExecOutcome(status="passed"),  # mr score: candidate passes on patch
+    ]
+    runner = FakeRunner(outcomes)
+    v = judge(ISSUE_TEXT, "patch text", runner=runner,
+              dispatch=make_dispatch(poc=POC_IMPORTS_STATS, mr_n=1),
+              context=ctx)
+    # With the probe correctly importing `stats` and the scripted outcomes,
+    # the oracle proceeds past the guard and through the invariants loop.
+    # 1/1 invariant passes -> UNVERIFIED (below supermajority bar 2/3 for n=1).
+    assert v.verdict == UNVERIFIED, v
+    assert "runner" not in v.reason
+    assert "does not import" not in v.reason
+
+
+def test_context_surfaces_base_source_in_poc_prompt():
+    """The probe prompt the dispatch receives contains the context text when
+    given, and does not when context=None."""
+    seen_prompts: list[str] = []
+    base_src = "# file: stats/median.py\n```python\ndef median(xs): return xs[len(xs)//2]\n```\n"
+
+    def capturing_dispatch(prompt: str) -> str:
+        if "Write ONE pytest test" in prompt:
+            seen_prompts.append(prompt)
+            return _fence(POC_IMPORTS_STATS)
+        if "states_expected_behaviour" in prompt:
+            return GROUND_JSON
+        return ""
+
+    ctx_with = CodeContext(text=base_src, modules=("stats",), files=("stats/median.py",))
+
+    # With context — prompt carries the BASE source + the import instruction.
+    runner = FakeRunner(_probe_build_pass())  # one call (probe base reproduction)
+    judge(ISSUE_TEXT, "patch text", runner=runner,
+          dispatch=capturing_dispatch, context=ctx_with)
+    assert seen_prompts, "dispatch was never called for the probe prompt"
+    assert base_src in seen_prompts[0]
+    assert "import the code under test" in seen_prompts[0]
+
+    # Without context — prompt carries neither.
+    seen_prompts.clear()
+    runner = FakeRunner(_probe_build_pass())
+    judge(ISSUE_TEXT, "patch text", runner=runner, dispatch=capturing_dispatch)
+    assert seen_prompts
+    assert base_src not in seen_prompts[0]
+    assert "import the code under test" not in seen_prompts[0]
+
+
+def test_judge_default_context_none_is_unchanged():
+    """SWE-bench-style callers omit `context`; the engine behaves exactly
+    as before — same verdict, same call count, same reason text."""
+    outcomes = _probe_green() + [ExecOutcome(status="failed"), ExecOutcome(status="passed")]
+    runner = FakeRunner(outcomes)
+    v = judge(ISSUE_TEXT, "patch text", runner=runner,
+              dispatch=make_dispatch(poc=POC_DEFINES_OWN_MEDIAN, mr_n=1))
+    # Without context, the guard is skipped — the probe that defines its own
+    # median runs. 1/1 invariant passes -> UNVERIFIED.
+    assert v.verdict == UNVERIFIED
+    assert "does not import" not in v.reason

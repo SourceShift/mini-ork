@@ -26,6 +26,7 @@ from mini_ork.certify import (
     Verdict,
 )
 from mini_ork.certify import image as cert_image
+from mini_ork.certify.context import CodeContext
 import mini_ork.cli.certify as cli_certify
 
 
@@ -425,6 +426,58 @@ def test_is_installable_needs_pyproject_or_setup(tmp_path):
     assert not cert_image.is_installable(tmp_path)
     (tmp_path / "setup.py").write_text("")
     assert cert_image.is_installable(tmp_path)
+
+
+# ── 12. C3: `judge` receives a context built from the patch; certificate
+#         method.context_files lists the repo-relative changed .py files. ───
+
+
+def test_cli_passes_context_to_judge_and_records_context_files(tmp_path, monkeypatch):
+    repo = _init_py_repo(tmp_path / "repo")
+    captured: dict = {}
+
+    def _judge(issue, patch, **kw):
+        # `context` is the new C3 kwarg; assert it is a CodeContext carrying
+        # the importable module of the changed file.
+        captured["context"] = kw.get("context")
+        return Verdict(PROVEN, "ok", mr_n=4, mr_pass_rate=1.0, detail={"invariants": []})
+
+    # The CLI imports `code_context` from mini_ork.certify.context at module
+    # top — stub it on the CLI module so the test is hermetic (no real git).
+    monkeypatch.setattr(cli_certify, "judge", _judge)
+    monkeypatch.setattr(cli_certify, "code_context",
+                        lambda r, b, p: CodeContext(
+                            text="(stubbed)", modules=("pkg.m",), files=("pkg/m.py",)))
+    monkeypatch.setattr(cli_certify.cert_llm, "spent", lambda: {"usd": 0.0, "calls": 0})
+    monkeypatch.setattr(cli_certify.cert_llm, "reset_spend", lambda: None)
+    monkeypatch.setattr(cli_certify.cert_image, "is_python_project", lambda r: True)
+    monkeypatch.setattr(cli_certify.cert_image, "build_image", lambda *a, **kw: "img:tag")
+
+    class _C:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        up = True
+    monkeypatch.setattr(cli_certify, "Crucible", lambda spec: _C())
+
+    out = tmp_path / "cert.json"
+    cli_certify.main([
+        "--repo", str(repo), "--issue", "x", "--out", str(out),
+    ])
+    cert = json.loads(out.read_text())
+
+    # judge received the context the CLI built.
+    assert isinstance(captured["context"], CodeContext)
+    assert "pkg.m" in captured["context"].modules
+
+    # The certificate's `method` carries the file list — the audit trail can
+    # confirm which files the oracle saw. The top-level key set is unchanged.
+    assert cert["method"]["context_files"] == ["pkg/m.py"]
+    expected_keys = {
+        "schema", "id", "issued_at", "verdict", "reason",
+        "repo", "change", "claim", "method", "evidence",
+        "cost", "duration_s", "digest",
+    }
+    assert set(cert) == expected_keys
 
 
 # ── 11. a crash inside judge still writes an UNVERIFIED certificate ───────

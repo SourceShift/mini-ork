@@ -281,6 +281,8 @@ class Crucible:
     # a ValueError raised deep in the library's own setup, it never reached its assertion —
     # it is red, but it is not a reproduction.
     _EXC = re.compile(r"\b([A-Z][A-Za-z0-9_]*(?:Error|Exception|Warning))\b(?=\s*:)")
+    # pytest's traceback location line: `<file>.py:<line>: <ExceptionName>`.
+    _LOC_EXC = re.compile(r"^\S+\.py:\d+: ([A-Z][A-Za-z0-9_]*(?:Error|Exception|Warning)|Failed)\s*$", re.M)
 
     @staticmethod
     def _exc_of(out: str) -> str:
@@ -296,6 +298,13 @@ class Crucible:
         if m:
             name = m.group(1).rsplit(".", 1)[-1]
             return "AssertionError" if name == "assert" else name
+        # pytest drops the " - <message>" tail from that summary line when it would
+        # overflow the terminal (80 columns in a TTY-less container), which a long test
+        # name does. The traceback's location line — `probe.py:5: AssertionError` — is
+        # printed regardless of width, so read the exception from it instead.
+        loc = Crucible._LOC_EXC.findall(out)
+        if loc:
+            return loc[-1]
         hits = Crucible._EXC.findall(out)
         return hits[-1] if hits else ""
 

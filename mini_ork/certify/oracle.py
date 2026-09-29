@@ -33,6 +33,7 @@ from collections.abc import Callable
 
 from mini_ork.certify import invariants as mr
 from mini_ork.certify import probe as poc_plus
+from mini_ork.certify.context import CodeContext
 from mini_ork.certify.verdict import (
     REFUTED,
     UNVERIFIED,
@@ -68,6 +69,7 @@ def judge(
     gold: str | None = None,
     poc: str | None = None,
     dispatch: DispatchFn | None = None,
+    context: CodeContext | None = None,
 ) -> Verdict:
     """Judge `patch`. Nothing here reads `gold` — it is used only to LABEL the invariants
     for measurement, never to decide. Pass gold=None in production.
@@ -81,6 +83,12 @@ def judge(
     `runner` is duck-typed (`.up`, `.run_test`). It is owned by the caller — the oracle
     never constructs one. `dispatch` is duck-typed too (prompt -> text). Both are
     injectable so tests can run hermetically.
+
+    `context` (optional) carries the BASE source of the changed .py files plus the
+    importable module names of those files. When supplied, probe.build and invariants.build
+    prompt the model with the BASE source AND structurally reject any candidate that does
+    not import the code under test. SWE-bench-style callers omit `context` and the engine
+    behaves exactly as before.
     """
     d_fn = dispatch or _default_dispatch()
 
@@ -97,7 +105,10 @@ def judge(
     # ── Term 1: a PoC+ that reproduces the REPORTED failure ─────────────────
     poc_src = poc
     if poc_src is None:
-        poc_src, why = poc_plus.build(issue, lambda s: runner.run_test(s), dispatch=d_fn)
+        poc_src, why = poc_plus.build(
+            issue, lambda s: runner.run_test(s),
+            dispatch=d_fn, context=context,
+        )
         if not poc_src:
             return Verdict(UNVERIFIED, f"no trustworthy reproduction test: {why}")
 
@@ -123,6 +134,7 @@ def judge(
         poc_src, issue, patch=patch, n=mr_n,
         base_runner=lambda s: runner.run_test(s),
         dispatch=d_fn,
+        context=context,
     )
     if not cands:
         return Verdict(UNVERIFIED,

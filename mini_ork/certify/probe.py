@@ -60,6 +60,7 @@ import json
 import re
 from collections.abc import Callable
 
+from mini_ork.certify.context import CodeContext, imports_code_under_test
 from mini_ork.runtime import ExecOutcome
 
 # Callable[[str], str]  — prompt -> text. Default = default_dispatch (lazy import to
@@ -162,10 +163,37 @@ Hard requirements:
 
 Output ONLY the test in a ```python``` block. No prose."""
 
+# Appended to POC_PROMPT when a CodeContext surfaces the code under test.
+# The structural guard (imports_code_under_test) is the load-bearing fix; this
+# block is the prompt half that primes the model before it generates.
+POC_CONTEXT_SUFFIX = """
 
-def write(issue: str, g: dict, dispatch: DispatchFn | None = None) -> str | None:
+THE CODE UNDER TEST (the buggy version, before any fix):
+{context_text}
+
+Your test MUST import the code under test from the repository (e.g. `from {module_example} import <name>`)
+and call it. NEVER copy, re-implement, or redefine the code under test in the test file —
+a test of a copy proves nothing about the repository."""
+
+
+def _example_module(modules: tuple[str, ...]) -> str:
+    """Pick a representative module for the prompt example — first entry, parent preferred."""
+    if not modules:
+        return "<module>"
+    first = modules[0]
+    return first.split(".")[0] if "." in first else first
+
+
+def write(issue: str, g: dict, dispatch: DispatchFn | None = None,
+          context: CodeContext | None = None) -> str | None:
     d_fn = dispatch or _default_dispatch()
-    code = _block(d_fn(POC_PROMPT.format(issue=issue[:3500], quote=g["quote"][:1200])))
+    suffix = ""
+    if context is not None and context.text:
+        suffix = POC_CONTEXT_SUFFIX.format(
+            context_text=context.text,
+            module_example=_example_module(context.modules),
+        )
+    code = _block(d_fn(POC_PROMPT.format(issue=issue[:3500], quote=g["quote"][:1200]) + suffix))
     return code if "def test" in code else None
 
 
@@ -234,6 +262,7 @@ def build(
     dispatch: DispatchFn | None = None,
     max_repairs: int = 1,
     tries: int = 2,
+    context: CodeContext | None = None,
 ) -> tuple[str | None, str]:
     """Return (poc_plus, reason). `run(src) -> ExecOutcome` executes on the BUGGY code.
 
@@ -244,6 +273,13 @@ def build(
     generations, not honest abstentions, and giving up after one shot throws away real
     recall. So we retry the whole ground->write->reproduce loop before abstaining.
 
+    When `context` carries `modules`, a candidate probe that fails the
+    `imports_code_under_test` guard is rejected BEFORE it is run (a probe
+    that re-implements the code under test proves nothing about the
+    repository). The rejection counts as a used try; if every try is
+    rejected, build returns None with the rejection reason so `judge`
+    surfaces UNVERIFIED.
+
     We do NOT retry when the issue itself states no expected behaviour: that abstention is
     correct and no amount of retrying changes it.
     """
@@ -253,9 +289,14 @@ def build(
 
     last = "could not write a probe"
     for _ in range(tries):
-        poc = write(issue, g, dispatch=dispatch)
+        poc = write(issue, g, dispatch=dispatch, context=context)
         if not poc:
             last = "could not write a probe"
+            continue
+        # Structural guard: reject probes that re-implement the code under test.
+        # The guard runs BEFORE `run(poc)` so a guarded candidate never executes.
+        if context is not None and context.modules and not imports_code_under_test(poc, context.modules):
+            last = f"probe does not import the code under test ({list(context.modules)})"
             continue
         # inner loop repairs a probe that is broken as CODE (test_defect)
         for attempt in range(max_repairs + 1):

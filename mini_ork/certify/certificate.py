@@ -73,14 +73,31 @@ def build_certificate(
     cost_usd: float | None,
     llm_calls: int,
     duration_s: float,
+    context_files: list | None = None,
 ) -> dict:
     """Assemble the certificate dict. Caller writes it to ``--out``.
 
     The digest is recomputed by hashing the canonical JSON of every key
     EXCEPT ``digest`` itself, in the exact schema order. Adding or removing
     a key silently changes the digest — that's the point.
+
+    ``context_files`` (optional): repo-relative paths of the .py files whose
+    BASE source was shown to the oracle's probe / invariant generators. When
+    supplied, it lands inside ``method.context_files`` so the audit trail can
+    confirm which files the oracle saw. Default ``None`` omits the key —
+    callers that don't pass a CodeContext (legacy / SWE-bench-style) keep the
+    prior certificate shape byte-for-byte (modulo the absent key).
     """
     files = _parse_patch_files(patch_text)
+    method: dict = {
+        "oracle": oracle_method,
+        "mr_n": mr_n,
+        "proven_bar": proven_bar,
+        "model": model,
+        "image": image,
+    }
+    if context_files is not None:
+        method["context_files"] = list(context_files)
     base: dict = {
         "schema": "mini-ork.certificate/v1",
         "id": str(uuid.uuid4()),
@@ -102,13 +119,7 @@ def build_certificate(
             "sha256": _sha256_hex(issue_text),
             "summary": issue_text[:200],
         },
-        "method": {
-            "oracle": oracle_method,
-            "mr_n": mr_n,
-            "proven_bar": proven_bar,
-            "model": model,
-            "image": image,
-        },
+        "method": method,
         "evidence": {
             "probe": poc_plus,
             "mr_pass_rate": mr_pass_rate,

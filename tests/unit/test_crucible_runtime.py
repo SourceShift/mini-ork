@@ -102,6 +102,29 @@ def test_a_bare_assert_is_reported_as_an_AssertionError():
     assert o.exc == "AssertionError"
 
 
+def test_a_bare_assert_with_a_long_test_name_is_still_an_AssertionError():
+    """In an 80-column, TTY-less container pytest drops the ` - assert …` tail from the
+    FAILED summary line when a long test name would overflow it. Captured live: a correct
+    import-based probe was read as exc="" and discarded as "not a reproduction". The
+    traceback's `file.py:N: AssertionError` line survives any width.
+    """
+    out = (
+        "    def test_median_even_length_returns_average_of_middle_two():\n"
+        ">       assert median([1, 2, 3, 4]) == 2.5\n"
+        "E       assert 3 == 2.5\n"
+        "E        +  where 3 = median([1, 2, 3, 4])\n"
+        "\n"
+        "crucible_probe.py:5: AssertionError\n"
+        "=========================== short test summary info ============================\n"
+        "FAILED crucible_probe.py::test_median_even_length_returns_average_of_middle_two\n"
+        "1 failed in 0.01s\n"
+        "CRUCIBLE_RC=1"
+    )
+    o = Crucible._classify(out)
+    assert o.status == "failed"
+    assert o.exc == "AssertionError"
+
+
 def test_the_exception_that_caused_the_failure_is_reported():
     """`status` alone cannot answer the question that matters: did the test fail for the
     reason it was WRITTEN for? A probe asserting an expected value should fail with an

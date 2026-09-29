@@ -38,6 +38,7 @@ from mini_ork.certify import (
 from mini_ork.certify import image as cert_image
 from mini_ork.certify import llm as cert_llm
 from mini_ork.certify.certificate import build_certificate
+from mini_ork.certify.context import code_context
 from mini_ork.runtime import Crucible, RuntimeSpec
 
 
@@ -231,6 +232,12 @@ def main(argv: list[str] | None = None, *, stdout=None, stderr=None) -> int:
 
     patch_text = _read_patch(repo, base_sha, head_sha, args.diff)
 
+    # Repo-context surface for the oracle: BASE source of changed .py files +
+    # the importable module names. Cheap when patch_text is empty (no files
+    # to look up). Always computed so every certificate (including the empty
+    # / unsupported-project short-circuits) carries the same method shape.
+    ctx = code_context(repo, base_sha, patch_text)
+
     def certificate(verdict: str, reason: str, *, image: str = "", v: Verdict | None = None,
                     spent: dict | None = None, duration_s: float = 0.0) -> dict:
         return build_certificate(
@@ -253,6 +260,7 @@ def main(argv: list[str] | None = None, *, stdout=None, stderr=None) -> int:
             cost_usd=spent["usd"] if spent else None,
             llm_calls=spent["calls"] if spent else 0,
             duration_s=duration_s,
+            context_files=list(ctx.files),
         )
 
     # ── empty patch short-circuit (BEFORE we touch the runtime) ───────────
@@ -270,7 +278,7 @@ def main(argv: list[str] | None = None, *, stdout=None, stderr=None) -> int:
     t0 = time.monotonic()
     try:
         with Crucible(RuntimeSpec(image=image_tag, workdir=args.workdir)) as c:
-            v: Verdict = judge(issue_text, patch_text, runner=c, mr_n=args.mr_n)
+            v: Verdict = judge(issue_text, patch_text, runner=c, mr_n=args.mr_n, context=ctx)
     except Exception as e:                                       # noqa: BLE001
         # A harness crash is not a verdict on the patch — abstain, and say why.
         return _emit(certificate(UNVERIFIED, f"certify failed during judge: {e}",

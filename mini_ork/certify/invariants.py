@@ -55,6 +55,7 @@ from __future__ import annotations
 import re
 from collections.abc import Callable
 
+from mini_ork.certify.context import CodeContext, imports_code_under_test
 from mini_ork.runtime import ExecOutcome
 
 # Callable[[str], str]  — prompt -> text. Default = default_dispatch (lazy import to
@@ -124,6 +125,27 @@ Also: IMPORT EVERY NAME YOU USE. No network — the sandbox is OFFLINE.
 Output ONLY python in a ```python``` block: {n} functions named test_mr_1 .. test_mr_{n},
 with all imports at the top."""
 
+# Appended to MR_PROMPT when a CodeContext surfaces the code under test.
+# Mirrors the probe-side block: prompt the model with the BASE source so each
+# invariant imports from the repo instead of redefining the function under test.
+MR_CONTEXT_SUFFIX = """
+
+THE CODE UNDER TEST (the buggy version, before any fix):
+{context_text}
+
+Every test below MUST import the code under test from the repository (e.g. `from {module_example} import <name>`)
+and call it. NEVER copy, re-implement, or redefine the code under test in the test file —
+a test of a copy proves nothing about the repository. The structural guard rejects
+candidates that do not import the code under test, so they will be discarded."""
+
+
+def _example_module(modules: tuple[str, ...]) -> str:
+    """Pick a representative module for the prompt example — first entry, parent preferred."""
+    if not modules:
+        return "<module>"
+    first = modules[0]
+    return first.split(".")[0] if "." in first else first
+
 
 def build(
     poc: str,
@@ -135,6 +157,7 @@ def build(
     base_runner: Callable[[str], ExecOutcome] | None = None,
     dispatch: DispatchFn | None = None,
     want: int = 2,
+    context: CodeContext | None = None,
 ) -> list[tuple[str, str]]:
     """Generate invariants and return the INFORMATIVE ones — [(name, standalone_source), ...].
 
@@ -151,16 +174,31 @@ def build(
         DROP those and regenerate with feedback until we have `want` that truly fail on base,
         so the correct patch gets a real informative set -> PROVEN (no recall regression).
 
+    When `context` carries `modules`, candidates that fail `imports_code_under_test`
+    are dropped BEFORE base validation (a candidate that re-implements the function
+    under test proves nothing about the repo and would otherwise be silently filtered
+    here only because it happens to fail on base).
+
     Falls back to un-validated generation if no base_runner is given (keeps old callers working).
     """
     d_fn = dispatch or _default_dispatch()
     kept: list[tuple[str, str]] = []
     feedback = ""
+    suffix = ""
+    if context is not None and context.text:
+        suffix = MR_CONTEXT_SUFFIX.format(
+            context_text=context.text,
+            module_example=_example_module(context.modules),
+        )
     for _ in range(tries):
         prompt = MR_PROMPT.format(poc=poc[:1400], issue=issue[:1800],
-                                  patch=(patch or "(not provided)")[:2500], n=n) + feedback
+                                  patch=(patch or "(not provided)")[:2500], n=n) + suffix + feedback
         src = _code(d_fn(prompt))
         cands = split(src) if src.count("def test") >= 2 else []
+        # Drop candidates that re-implement the code under test — they prove nothing.
+        if context is not None and context.modules:
+            cands = [(name, s) for name, s in cands
+                     if imports_code_under_test(s, context.modules)]
         if base_runner is None:
             if cands:
                 return cands           # legacy path: no validation available
