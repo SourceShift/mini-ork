@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import sys
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
@@ -110,6 +111,40 @@ def _unresolved(value: str | Path, root: Path) -> Path:
     return Path(os.path.normpath(path))
 
 
+MIN_PYTHON = (3, 11)  # pyproject.toml requires-python
+
+
+def _main_checkout_equivalent(root: Path) -> Path | None:
+    """``root``'s counterpart in the MAIN checkout when it sits in a linked
+    git worktree, else None.
+
+    A worktree has no gitignored ``.venv`` / runtime pointer of its own, so
+    without this the launcher fell through to the first ``python3`` on PATH
+    (3.9 here) and ran the engine on an unsupported interpreter without a word.
+    Walks up from ``root`` to the worktree top (a ``.git`` FILE naming
+    ``<main>/.git/worktrees/<name>``) and maps the same relative path into
+    ``<main>`` — so a consumer's ``<wt>/.mini-ork`` maps to ``<main>/.mini-ork``.
+    """
+    for top in (root, *root.parents):
+        dotgit = top / ".git"
+        if dotgit.is_dir():
+            return None  # main checkout (or plain repo): nothing to map
+        if not dotgit.is_file():
+            continue
+        try:
+            line = dotgit.read_text(encoding="utf-8").strip()
+        except OSError:
+            return None
+        if not line.startswith("gitdir:"):
+            return None
+        gitdir = _unresolved(line[len("gitdir:"):].strip(), top)
+        if gitdir.parent.name != "worktrees" or gitdir.parent.parent.name != ".git":
+            return None
+        main = gitdir.parent.parent.parent
+        return main / root.relative_to(top)
+    return None
+
+
 def _venv_python(root: Path) -> Path:
     """Return the checkout runtime Python, optionally overridden for operators.
 
@@ -131,7 +166,47 @@ def _venv_python(root: Path) -> Path:
         except OSError:
             pass
     venv = root / ".venv"
-    return venv / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    python = venv / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    if not python.is_file() and not os.environ.get("MINI_ORK_VENV"):
+        main = _main_checkout_equivalent(root)
+        if main is not None:
+            shared = _venv_python_at(main)
+            if shared is not None:
+                return shared
+    return python
+
+
+def _venv_python_at(root: Path) -> Path | None:
+    """The runtime pointer or ``.venv`` python under ``root``, if either exists."""
+    pointer = root / ".mini-ork" / "runtime-python"
+    if pointer.is_file():
+        try:
+            configured = pointer.read_text(encoding="utf-8").splitlines()
+            if configured and configured[0].strip():
+                return _unresolved(configured[0].strip(), root)
+        except OSError:
+            pass
+    python = root / ".venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    return python if python.is_file() else None
+
+
+def _require_supported_python(root: Path) -> None:
+    """Refuse to run on an interpreter older than pyproject's requires-python.
+
+    On 3.9 the engine half-works: PEP 604 annotations crash recipe verifiers
+    at import, and PYTHONSAFEPATH (3.11+) is silently ignored, so ``python -m``
+    children import whatever ``mini_ork`` sits in their cwd. Every one of
+    those looked like an ordinary failed run. Fail loudly instead.
+    """
+    if sys.version_info >= MIN_PYTHON:
+        return
+    want = ".".join(map(str, MIN_PYTHON))
+    sys.stderr.write(
+        f"mini-ork: Python {want}+ is required, but this is "
+        f"{sys.version.split()[0]} ({sys.executable}).\n"
+        f"  No project venv found for {root}.\n"
+        f"  Fix: run `make install` there, or set MINI_ORK_VENV=<venv dir>.\n")
+    sys.exit(2)
 
 
 def _reexec_in_project_venv(root: Path) -> None:
@@ -148,6 +223,7 @@ def _reexec_in_project_venv(root: Path) -> None:
 
 _configure_windows_git_bash()
 _reexec_in_project_venv(ENGINE_ROOT)
+_require_supported_python(ENGINE_ROOT)
 
 from mini_ork.cli.main import main  # noqa: E402
 

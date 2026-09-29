@@ -170,3 +170,68 @@ def test_launcher_reexecs_the_persisted_runtime_pointer(tmp_path):
     assert run.returncode == 0, run.stderr
     assert run.stdout == f"mini-ork {VERSION} (universal task loop runtime)\n"
     assert marker.read_text(encoding="utf-8") == str(python)
+
+
+def _launcher_functions(*names: str) -> dict:
+    """Exec only the named top-level defs/assigns from the launcher (its module
+    body re-execs and imports the engine, so it cannot be imported directly)."""
+    import ast
+    tree = ast.parse(BIN.read_text(encoding="utf-8"))
+    keep = [n for n in tree.body
+            if (isinstance(n, ast.FunctionDef) and n.name in names)
+            or (isinstance(n, ast.Assign) and any(getattr(t, "id", "") in names for t in n.targets))]
+    ns: dict = {"os": os, "sys": sys, "Path": Path}
+    exec(compile(ast.Module(body=keep, type_ignores=[]), str(BIN), "exec"), ns)
+    return ns
+
+
+def test_launcher_refuses_an_interpreter_older_than_requires_python(monkeypatch, capsys):
+    """On 3.9 the engine half-worked (verifiers crashed on PEP 604 syntax,
+    PYTHONSAFEPATH was ignored) and every symptom read as a normal failed run."""
+    ns = _launcher_functions("MIN_PYTHON", "_require_supported_python")
+    monkeypatch.setattr(sys, "version_info", (3, 9, 6, "final", 0))
+    try:
+        ns["_require_supported_python"](Path("/x"))
+    except SystemExit as exc:
+        assert exc.code == 2
+    else:
+        raise AssertionError("an unsupported interpreter must exit")
+    assert "Python 3.11+ is required" in capsys.readouterr().err
+
+
+def test_launcher_min_python_matches_pyproject():
+    ns = _launcher_functions("MIN_PYTHON")
+    spec = tomllib.loads((REPO / "pyproject.toml").read_text(encoding="utf-8"))["project"]["requires-python"]
+    assert spec == ">=" + ".".join(map(str, ns["MIN_PYTHON"]))
+
+
+def test_launcher_in_a_worktree_without_a_venv_uses_the_main_checkouts(tmp_path):
+    """A linked worktree has no gitignored .venv; the launcher used to fall
+    through to the first python3 on PATH instead of the main checkout's venv."""
+    if os.name == "nt":
+        return
+    main = tmp_path / "main"
+    (main / "bin").mkdir(parents=True)
+    shutil.copy2(BIN, main / "bin" / "mini-ork")
+    (main / "mini_ork").symlink_to(REPO / "mini_ork", target_is_directory=True)
+    (main / "pyproject.toml").write_text((REPO / "pyproject.toml").read_text(encoding="utf-8"))
+    git = ["git", "-C", str(main)]
+    for args in (["init", "-q"], ["config", "user.email", "t@t"], ["config", "user.name", "t"],
+                 ["add", "-A"], ["commit", "-qm", "base"]):
+        subprocess.run(git + args, check=True, capture_output=True)
+    wt = tmp_path / "wt"
+    subprocess.run(git + ["worktree", "add", "-q", "--detach", str(wt)], check=True, capture_output=True)
+    python = main / ".venv" / "bin" / "python"
+    marker = tmp_path / "shared-venv.txt"
+    python.parent.mkdir(parents=True)
+    python.write_text(f"#!/bin/sh\nprintf '%s' \"$0\" > {marker}\nexec {sys.executable} \"$@\"\n",
+                      encoding="utf-8")
+    python.chmod(python.stat().st_mode | stat.S_IXUSR)
+    environment = {**os.environ, "MINI_ORK_ROOT": str(wt), "MINI_ORK_ENGINE_ROOT": str(wt),
+                   "MINI_ORK_VENV": "", "MINI_ORK_VENV_ACTIVE": "", "MINI_ORK_USE_VENV": "1"}
+
+    run = subprocess.run([str(wt / "bin" / "mini-ork"), "version"], capture_output=True,
+                         text=True, env=environment, check=False)
+
+    assert run.returncode == 0, run.stderr
+    assert marker.read_text(encoding="utf-8") == str(python)
