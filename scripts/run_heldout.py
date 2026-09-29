@@ -151,9 +151,13 @@ def _run_default_solver(
         "MO_ALLOW_FRAMEWORK_CWD": "1",
         "MINI_ORK_RUN_ID": run_id,
     }
+    # cwd is the ENGINE root, never the scratch: the scratch is itself a
+    # mini-ork checkout at an older commit, and `python -m` puts cwd first on
+    # sys.path, so the engine imported the TASK's old mini_ork and crashed
+    # before planning. MO_TARGET_CWD is what points the lanes at the scratch.
     proc = subprocess.run(
         [str(REPO / "bin" / "mini-ork"), "run", "--json", recipe, str(kickoff_path)],
-        cwd=scratch,
+        cwd=REPO,
         env=inner_env,
         capture_output=True,
         text=True,
@@ -355,7 +359,7 @@ def main(argv: list[str] | None = None) -> int:
         solver_cmd = shlex.split(a.solver_cmd)
 
     results = _load_results(a.out)
-    attempted = 0
+    attempted = resolved = 0
     total_cost = 0.0
     # Ensure --out exists on a successful run, even when zero tasks were
     # selected — the next invocation can then resume against it without
@@ -387,10 +391,11 @@ def main(argv: list[str] | None = None) -> int:
         results[tid] = row
         _write_results(a.out, results)
         attempted += 1
+        resolved += bool(row.get("passed"))
         total_cost += float(row.get("cost_usd", 0.0) or 0.0)
 
     print(
-        f"[heldout-runner] resolved {attempted} / attempted {attempted} "
+        f"[heldout-runner] resolved {resolved} / attempted {attempted} "
         f"(selected={len(selected)})  total_cost=${total_cost:.4f}",
         file=sys.stderr,
     )

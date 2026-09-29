@@ -473,3 +473,38 @@ def test_run_cost_is_read_from_the_ledger(tmp_path, monkeypatch):
 
     assert r._run_cost_usd("heldout-t1-1") == 1.75
     assert r._run_cost_usd("missing") == 0.0
+
+
+def test_default_solver_runs_from_the_engine_root_not_the_scratch(tmp_path, monkeypatch):
+    """The scratch is an older mini-ork checkout; with cwd=scratch, `python -m`
+    imported the TASK's mini_ork and the engine crashed before planning."""
+    seen = {}
+
+    class _P:
+        returncode, stdout = 0, ""
+
+    def fake_run(cmd, **kw):
+        seen.update(kw)
+        return _P()
+
+    monkeypatch.setattr(r.subprocess, "run", fake_run)
+    monkeypatch.setattr(r, "_run_cost_usd", lambda run_id: 0.0)
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+
+    r._run_default_solver(scratch, tmp_path / "k.md", "t1", timeout=5, recipe="code-fix")
+
+    assert Path(seen["cwd"]) == r.REPO
+    assert seen["env"]["MO_TARGET_CWD"] == str(scratch)
+
+
+def test_summary_counts_resolved_not_attempted(tmp_path, capsys):
+    """A run where every task failed printed 'resolved 2 / attempted 2'."""
+    h = _mk_history(tmp_path)
+    manifest_path, _ = _mk_minimal_manifest(tmp_path, h)
+
+    r.main(["--manifest", str(manifest_path), "--repo", h["repo"],
+            "--out", str(tmp_path / "results.json"), "--python", sys.executable,
+            "--timeout", "120", "--solver-cmd", _noop_solver_str()])
+
+    assert "resolved 0 / attempted" in capsys.readouterr().err
