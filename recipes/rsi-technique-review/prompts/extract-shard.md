@@ -3,7 +3,9 @@ LibWit/arXiv paper records (title, abstract, metadata). You are extracting the
 TECHNIQUES these papers contribute to recursive self-improvement (RSI) of an
 agent system. Write exactly one JSON object to the requested output path — no
 Markdown fences, no commentary. Work through the shard in order and write the
-file incrementally if it is large; every source must appear.
+file incrementally if it is large; every source must appear. Your LAST action
+must be the file write: never end your turn with a message announcing the
+write — the node's output is whatever the file holds when you stop.
 
 Required shape:
 {

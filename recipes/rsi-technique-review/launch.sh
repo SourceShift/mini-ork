@@ -9,9 +9,13 @@ set -euo pipefail
 cd "$(dirname "$0")/../.."
 
 RUN_ID="${1:-rsi-review-$(date +%Y%m%d-%H%M%S)}"
+# Recover mode: MO_RSI_RECOVER_FROM=<node> reruns that node + its dependents in
+# an existing run (reusing every other checkpoint) under the same lane policy.
+RECOVER_FROM="${MO_RSI_RECOVER_FROM:-}"
 HOME_DIR="${MINI_ORK_HOME:-$PWD/.mini-ork}"
 RUN_DIR="$HOME_DIR/runs/$RUN_ID"
 mkdir -p "$RUN_DIR/config"
+if [ -z "$RECOVER_FROM" ]; then
 
 python3 - "$HOME_DIR/config" "$RUN_DIR/config" <<'PY'
 import sys, yaml
@@ -32,6 +36,7 @@ for name in list(table):
 yaml.safe_dump(providers, open(f"{dst}/providers.yaml", "w"), sort_keys=False)
 print("lanes:", sorted(set(",".join(agents["lanes"].values()).split(","))), "providers:", sorted(table))
 PY
+fi
 
 # LibWit token: env wins; else lift the Bearer from a local arxiv-libwit MCP config.
 if [ -z "${ARXIV_API_TOKEN:-}" ]; then
@@ -45,6 +50,7 @@ fi
 export ARXIV_API_TOKEN
 
 export MINI_ORK_RUN_ID="$RUN_ID"
+export MINI_ORK_RECIPE=rsi-technique-review   # recover resolves checkpoints by recipe
 export MINI_ORK_PROVIDERS="$RUN_DIR/config/providers.yaml"
 export MINI_ORK_COLLECTION_PLAN="${MINI_ORK_COLLECTION_PLAN:-$PWD/recipes/rsi-technique-review/collection-plan.json}"
 # LibWit hybrid batch search is slow; 32-query batches timed out at the 45s default.
@@ -67,4 +73,7 @@ export MO_NODE_MAX_TURNS="${MO_NODE_MAX_TURNS:-150}"
 export MO_ALLOW_FRAMEWORK_CWD=1            # target is the mini-ork repo itself
 
 echo "run: $RUN_ID  dir: $RUN_DIR"
+if [ -n "$RECOVER_FROM" ]; then
+  exec bin/mini-ork recover "$RUN_ID" --from-node "$RECOVER_FROM"
+fi
 exec bin/mini-ork run rsi-technique-review recipes/rsi-technique-review/kickoff.md
