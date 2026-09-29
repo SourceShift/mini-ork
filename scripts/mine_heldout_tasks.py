@@ -197,11 +197,18 @@ def classify_difficulty(task: dict) -> str:
       len(task["pass_to_pass"])   tests that must stay green
       task["problem_statement"]   how much the commit message explains
 
-    TODO(you): decide what "hard" means for mini-ork. This label is how the eval
-    report gets sliced ("the new recipe wins on easy, loses on hard"), so it
-    should track what actually makes a fix hard for an agent here.
+    This label is how eval reports get sliced ("wins on easy, loses on hard").
+    Files touched leads: a multi-module fix means the agent must first LOCATE
+    the bug, which is where agents fail most. Thresholds sit near the mined
+    set's quartiles (files p75=2; lines p50=46, p75=103) so no bucket is tiny.
     """
-    return "unrated"
+    n_files = len(task["src_files"])
+    lines = task["src_lines_changed"]
+    if n_files >= 3 or lines > 150:
+        return "hard"
+    if n_files == 1 and lines <= 50:
+        return "easy"
+    return "medium"
 
 
 def write_manifest(tasks: list[dict], out: Path) -> str:
@@ -283,6 +290,10 @@ def main(argv: list[str] | None = None) -> int:
     # a changed classify_difficulty must still reach tasks mined earlier.
     for t in tasks:
         t["difficulty"] = classify_difficulty(t)
+        # No pass_to_pass = the WHOLE test file was red on the base (usually it
+        # imports a symbol the fix adds), so the test itself hints at the
+        # interface to build. Valid, but reports should be able to exclude it.
+        t["weak_signal"] = not t["pass_to_pass"]
     digest = write_manifest(tasks, a.out)
     n_test = sum(t["split"] == "test" for t in tasks)
     print(f"[miner] {len(tasks)} tasks ({n_test} test / {len(tasks) - n_test} dev) "

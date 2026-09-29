@@ -1,0 +1,10 @@
+{"fix_sha": "7700583e19778507f6a062a780ba66ca34b4c2b4", "subject": "fix(dispatch): two env bugs that killed the parallel migration batch 10/10", "reason": "no fail_to_pass test: the tests pass on the buggy base too"}
+{"fix_sha": "25cb93cb97820b9f2429b2fd287ef5718f1c7841", "subject": "fix(ci): test isolation (env leak) + README entrypoint count + tighten secret parity (#139)", "reason": "no fail_to_pass test: the tests pass on the buggy base too"}
+{"fix_sha": "1535d59a1aa81537812f286e71715e9e45bd99d3", "subject": "fix(runtime): plan.py CLI wires a default LLM dispatch (P0 \u2014 python-default runs hard-failed) (#158)", "reason": "fix: 3 test(s) not passing on the fix itself"}
+{"fix_sha": "6d2bc216e96f4e628b946e468f2e6919f95e3d01", "subject": "fix(trace): implementer code_region from target-repo diff, not .mini-ork (#166)", "reason": "fix: pytest timed out or produced no report"}
+{"fix_sha": "3b0995677a07715b945723b7d294048de7a3bb82", "subject": "fix(ci): respect MINI_ORK_ROOT input alias; revert accidental task_class count drift", "reason": "no fail_to_pass test: the tests pass on the buggy base too"}
+{"fix_sha": "00f07431e9e7d83ae4f261d4e0a047d4385421e0", "subject": "fix(execute): drop informational error finish_reason on successful verifier nodes", "reason": "base: pytest timed out or produced no report"}
+{"fix_sha": "a7d3d1b68ef69541ac9eec9aa75818e9ffee6b2a", "subject": "fix(ci): green the unit-a + ui typecheck jobs", "reason": "no fail_to_pass test: the tests pass on the buggy base too"}
+{"fix_sha": "386bc91e1a366ca09054aa9ef40eb3d412bf2801", "subject": "fix(recipe-resolution): use os.getcwd() as un-clobberable overlay-home signal", "reason": "no fail_to_pass test: the tests pass on the buggy base too"}
+{"fix_sha": "5ea8746c1910e797f6d20476bb51138a796d3a86", "subject": "fix(goal-loop): pin the engine the worker's children run", "reason": "fix: 1 test(s) not passing on the fix itself"}
+{"fix_sha": "553489eaa6958e66c580370d1e9bdb37aaa45c9f", "subject": "fix(ci): install the acp extra, and restore the classify fixture's schema", "reason": "no fail_to_pass test: the tests pass on the buggy base too"}
