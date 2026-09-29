@@ -279,6 +279,10 @@ def main(argv: list[str] | None = None) -> int:
         _git(a.repo, "worktree", "remove", "--force", str(scratch), check=False)
 
     tasks = sorted(kept.values(), key=lambda t: t["committed_at"])
+    # Relabel every task, not only new keeps: resumed runs skip validation, and
+    # a changed classify_difficulty must still reach tasks mined earlier.
+    for t in tasks:
+        t["difficulty"] = classify_difficulty(t)
     digest = write_manifest(tasks, a.out)
     n_test = sum(t["split"] == "test" for t in tasks)
     print(f"[miner] {len(tasks)} tasks ({n_test} test / {len(tasks) - n_test} dev) "
