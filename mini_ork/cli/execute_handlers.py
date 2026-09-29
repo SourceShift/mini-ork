@@ -698,6 +698,12 @@ def _handle_researcher(ctx: NodeDispatch):
     return 0, "done"
 
 
+# Recipes whose implementer exists to edit the target tree. framework-edit
+# enforces this in its own ground-truth harvest; recipes whose implementer
+# nodes synthesize or research (and legitimately touch no files) stay out.
+_RECIPES_REQUIRING_TREE_CHANGES = frozenset({"code-fix"})
+
+
 def _handle_implementer(ctx: NodeDispatch):
     impl_log = ctx.declared_output_path(
         os.path.join(ctx.run_dir, f"impl-{ctx.node_id}.log")
@@ -794,7 +800,15 @@ def _handle_implementer(ctx: NodeDispatch):
             ctx.run_dir_eff, target, impl_log, harvested
         )
     else:
-        _write_implementer_summary(ctx.run_dir_eff, target, impl_log)
+        changed = _write_implementer_summary(ctx.run_dir_eff, target, impl_log)
+        if ctx.recipe_eff in _RECIPES_REQUIRING_TREE_CHANGES and changed == []:
+            # The model reported success but git sees no change: pilot task
+            # mo-9a0cf68ccf ran every downstream node on an untouched tree and
+            # still read as "implemented". Fail here, where the cause is known.
+            print("  [ground-truth] FAIL: implementer produced no tree changes",
+                  file=sys.stderr)
+            ctx.trace(ctx.node_id, "failure", "implementer", impl_log, "", "impl_no_changes")
+            return 1, "impl_no_changes"
         _capture_pre_impl_fixture(ctx.run_dir_eff, target)
     if not ctx.publish_declared_outputs():
         ctx.trace(ctx.node_id, "failure", "implementer", impl_log, "", "artifact_contract")

@@ -1771,9 +1771,13 @@ def _write_implementer_summary(run_dir, target, impl_log):
     included because a newly created file is exactly the kind of change the commit
     must carry; anything under run_dir is excluded so run sidecars (which may live
     inside an in-place target tree) can never be committed.
+
+    Returns the derived file list, or None when it could not be derived (no
+    run_dir/target, or a git command failed) — callers must not read None as
+    "the implementer changed nothing".
     """
     if not run_dir or not target:
-        return
+        return None
     baseline = ""
     ref_path = os.path.join(run_dir, "pre-implementer-ref")
     if os.path.isfile(ref_path):
@@ -1783,6 +1787,7 @@ def _write_implementer_summary(run_dir, target, impl_log):
             baseline = ""
     under_run_dir = os.path.realpath(run_dir)
     files: list[str] = []
+    derived = True
     try:
         args = ["git", "-C", target, "diff", "--name-only"]
         if baseline:
@@ -1792,6 +1797,8 @@ def _write_implementer_summary(run_dir, target, impl_log):
             proc = subprocess.run(argv, capture_output=True, text=True, timeout=15)
             if proc.returncode == 0:
                 rels.extend(line.strip() for line in proc.stdout.splitlines() if line.strip())
+            else:
+                derived = False
         for rel in rels:
             full = os.path.join(target, rel)
             real = os.path.realpath(full)
@@ -1801,8 +1808,9 @@ def _write_implementer_summary(run_dir, target, impl_log):
                 files.append(real)
     except Exception:
         files = []
+        derived = False
     payload = {
-        "status": "implemented",
+        "status": "implemented" if (files or not derived) else "no_changes",
         "worktree_path": target,
         "files_changed": files,
         "implementation_log": impl_log,
@@ -1810,6 +1818,7 @@ def _write_implementer_summary(run_dir, target, impl_log):
     with open(os.path.join(run_dir, "implementer-summary.json"), "w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2)
         handle.write("\n")
+    return files if derived else None
 
 
 def _capture_pre_impl_fixture(run_dir, target):
