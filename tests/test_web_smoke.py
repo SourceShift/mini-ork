@@ -3083,8 +3083,20 @@ def test_api_index_reports_the_real_surface_not_zero(tmp_path: Path, monkeypatch
     """
     from fastapi.testclient import TestClient
 
+    from mini_ork.stores.migrate import init_db
     from mini_ork.web import app as app_module
+    from mini_ork.web import deps
 
+    # Hermetic home. Without it the app booted against whatever default home
+    # an EARLIER test left in deps._default_home — or <checkout>/.mini-ork,
+    # which a fresh worktree does not have — so this failed only in some
+    # orders and every time on a clean checkout (FileNotFoundError: state.db).
+    home = tmp_path / ".mini-ork"
+    home.mkdir()
+    rc, out, err = init_db(db=str(home / "state.db"), root=str(ROOT))
+    assert rc == 0, f"init_db failed rc={rc}\nstdout={out}\nstderr={err}"
+    monkeypatch.setattr(deps, "_default_home", home.resolve())
+    monkeypatch.setenv("MINI_ORK_HOME", str(home))
     monkeypatch.setenv("MO_TARGET_CWD", str(tmp_path))
     with TestClient(app_module.create_app(dev_cors=False)) as client:
         body = client.get("/api").json()
