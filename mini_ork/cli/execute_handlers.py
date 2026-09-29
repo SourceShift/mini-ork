@@ -1201,11 +1201,13 @@ def _revert_inplace_diff(run_dir: str, root: str) -> bool:
     # CONTENT but leaves the agent's staged index entries behind — a preflight
     # against run-1788363267-21773-se1 left 3 index corpses).
     pre_dirty = []
+    reverted = []
     for rel in paths:
         real = os.path.realpath(os.path.join(real_root, rel))
         if real != real_root and not real.startswith(real_root + os.sep):
             log(f"  [rollback] reject-revert: path escapes target repo: {rel}")
             continue
+        reverted.append(rel)
         if baseline != "HEAD" and not git_ok("diff", "--quiet", "HEAD", baseline,
                                              "--", rel):
             # Dirty before the run (another session's work): restore the
@@ -1229,6 +1231,9 @@ def _revert_inplace_diff(run_dir: str, root: str) -> bool:
                 log(f"  [rollback] could not remove created file: {rel}")
     log(f"  [rollback] discard_worktree: per-path restore over {len(paths)} path(s)"
         + (f", {len(pre_dirty)} restored to pre-run dirty state" if pre_dirty else ""))
+    # Same attribution record as revert_branch: the post-run verify must report
+    # an artifact this rollback removed as rolled back, not as never produced.
+    _record_rolled_back(run_dir, real_root, reverted)
     clean = [p for p in paths if p not in pre_dirty]
     leftover = subprocess.run(
         ["git", "-C", real_root, "status", "--porcelain", "--", *clean],

@@ -63,19 +63,26 @@ def learning_static_lane(node_type: str, current_lane: str) -> str:
     # + the learning loop's exploration arm — keep it.
     if current_lane != node_type:
         return current_lane
-    # An operator who mapped this role in agents.yaml (``lanes.reviewer: …``)
-    # has already chosen its lane — often precisely to steer AWAY from the
-    # frontier default (e.g. a capped gateway key behind it). Keep the role
-    # name so dispatch resolves it through that mapping; the frontier/cheap
-    # substitutions below only fill roles the operator left unmapped.
+    # Precedence for an unpinned role: an EXPLICIT MO_FRONTIER_LANE /
+    # MO_CHEAP_LANE (the operator's steer for this policy) > the role's
+    # agents.yaml mapping > the built-in frontier/cheap defaults.
+    #
+    # The mapping outranks the defaults because an operator who mapped
+    # ``lanes.reviewer`` often did so precisely to steer AWAY from the frontier
+    # default (e.g. a capped gateway key behind it). It must NOT outrank the
+    # env knobs: the shipped agents.yaml maps every role, so letting it win
+    # would make static_hybrid identical to workflow_default and leave both
+    # knobs silently dead.
+    knob = {"reviewer": "MO_FRONTIER_LANE", "researcher": "MO_CHEAP_LANE",
+            "implementer": "MO_CHEAP_LANE"}.get(node_type)
+    if knob is None:
+        return current_lane
+    if os.environ.get(knob):
+        return os.environ[knob]
     from .llm_dispatch import resolve_lane_family
     if resolve_lane_family(node_type) != node_type:
         return current_lane
-    if node_type == "reviewer":
-        return frontier
-    if node_type in ("researcher", "implementer"):
-        return cheap
-    return current_lane
+    return frontier if knob == "MO_FRONTIER_LANE" else cheap
 
 
 def learning_governed_lane(
