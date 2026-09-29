@@ -526,3 +526,24 @@ def test_a_blocked_solver_stops_the_eval_without_recording_a_fail(tmp_path, caps
     assert rc == 0
     assert not out.exists() or first_task["id"] not in json.loads(out.read_text())
     assert "refused to start" in capsys.readouterr().err
+
+
+def test_every_solve_keeps_its_patch_even_when_graded_false(tmp_path):
+    """The run's review-diff.patch exists only if its reviewer ran, so the
+    solves a verifier rejected left no candidate to replay. The runner keeps
+    each one itself — before the hidden tests are restored into the tree."""
+    h = _mk_history(tmp_path)
+    manifest_path, first_task = _mk_minimal_manifest(tmp_path, h)
+    out = tmp_path / "results.json"
+    code = ("import os;s=os.environ['SCRATCH'];"
+            "open(os.path.join(s,'calc.py'),'a').write('# touched\\n');"
+            "open(os.path.join(s,'brand_new.py'),'w').write('X = 1\\n')")
+    solver = " ".join(shlex.quote(t) for t in [sys.executable, "-c", code])
+
+    r.main(["--manifest", str(manifest_path), "--repo", h["repo"], "--out", str(out),
+            "--python", sys.executable, "--timeout", "120", "--solver-cmd", solver])
+
+    assert json.loads(out.read_text())[first_task["id"]]["passed"] is False
+    patch = (tmp_path / "results.patches" / f"{first_task['id']}.patch").read_text()
+    assert "+# touched" in patch and "brand_new.py" in patch
+    assert "test_add" not in patch  # hidden tests were NOT in the tree yet
