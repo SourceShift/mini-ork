@@ -83,7 +83,14 @@ def main() -> int:
                 "refs/heads/main",
                 "refs/heads/master",
             ):
-                if _old == ZERO and new != ZERO:
+                # pack-refs (run by every auto-gc) also reports old=ZERO for
+                # refs it merely moves into packed-refs. A branch that already
+                # resolves to `new` is being packed, not created.
+                existing = subprocess.run(
+                    ["git", "rev-parse", "--verify", "-q", ref],
+                    capture_output=True, text=True,
+                ).stdout.strip()
+                if _old == ZERO and new != ZERO and existing != new:
                     name = ref[len("refs/heads/"):]
                     print(
                         "[worktree-guard] REJECT direct feature-branch "

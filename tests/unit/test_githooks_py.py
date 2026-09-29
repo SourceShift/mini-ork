@@ -142,6 +142,25 @@ def test_ref_tx_blocks_direct_feature_branch_creation(tx_repo: Path):
     assert "ALLOW_WORKTREE_BRANCH_CREATE=1" in r.stderr
 
 
+def test_ref_tx_allows_packing_an_existing_branch(tx_repo: Path):
+    """pack-refs reports old=ZERO for a branch it only MOVES into packed-refs.
+    Treating that as a creation aborted every auto-gc in a repo with any
+    wt/* branch (one REJECT line per branch, then 'failed to run pack-refs')."""
+    sha = _git(tx_repo, "rev-parse", "HEAD").stdout.strip()
+    _git(tx_repo, "update-ref", "refs/heads/wt/existing", sha)
+    r = _run_hook(REF_TX, ["prepared"], f"{ZERO} {sha} refs/heads/wt/existing\n", tx_repo)
+    assert r.returncode == 0, r.stderr
+
+
+def test_ref_tx_git_pack_refs_succeeds_with_hook_installed(tx_repo: Path):
+    sha = _git(tx_repo, "rev-parse", "HEAD").stdout.strip()
+    _git(tx_repo, "update-ref", "refs/heads/wt/existing", sha)
+    _git(tx_repo, "config", "core.hooksPath", str(HOOKS))
+    r = _git(tx_repo, "pack-refs", "--all")
+    assert r.returncode == 0, r.stderr
+    assert "REJECT" not in r.stderr
+
+
 def test_ref_tx_allows_branch_create_with_escape_env(tx_repo: Path):
     sha = _git(tx_repo, "rev-parse", "HEAD").stdout.strip()
     r = _run_hook(
