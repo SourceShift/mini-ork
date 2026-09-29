@@ -27,9 +27,19 @@ No DB, no file I/O, no network, no lane, no model: the caller assembles the
 receipts and (optionally) the paired outcome rows; this module reads them.
 ``classify`` is delegated to ``failure_classifier`` and the delta arithmetic to
 ``harness_contrast.attribute`` — neither is re-derived here.
+
+**apply-loop adapter** (kickoff rsi-i5-harness-sweep G02-T01):
+``materialize_mutation`` is the proposal → mutation bridge for the apply
+loop's harness target surface. It is a pure function with no DB I/O: it reads
+the live recipe prompt file and emits an idempotent directive block keyed by
+a stable ``source_ref`` (so ``apply_mutation``'s idempotency check skips
+re-applies). Non-prompt surfaces (``stage_order``, ``verifier``, ``routing``,
+``recovery``) have no prompt file to edit and raise ``ValueError`` — the
+caller (``auto_sweep``) is expected to skip them at the gradient-SQL level.
 """
 from __future__ import annotations
 
+import os
 from collections.abc import Iterable, Mapping
 
 from mini_ork.learning import failure_classifier, harness_contrast
@@ -185,3 +195,65 @@ def summarize(receipts, *, rows=None, min_support=MIN_SUPPORT) -> dict:
         "proposals": proposals,
         "scores": scores,
     }
+
+
+def materialize_mutation(proposal: Mapping, recipe_dir: str,
+                         *, node: str) -> tuple[str, str]:
+    """Bridge a ``propose()`` proposal into a ``materialize_candidate``-shaped
+    pair: ``(suggested_change, source_ref)``.
+
+    The suggested change is a one-paragraph directive carrying the failure
+    class, the supporting run ids, and a concrete edit instruction. The
+    ``source_ref`` is stable per ``(signature, node)`` so ``apply_mutation``'s
+    idempotency check (apply.py:627) skips a re-apply of the same proposal
+    on the same node.
+
+    Only ``prompt`` / ``prompt_edit`` proposals are realised — the other
+    surfaces (``stage_order``, ``verifier``, ``routing``, ``recovery``) have
+    no recipe prompt file to edit and raise ``ValueError``. ``auto_sweep`` is
+    expected to skip those at the gradient-SQL level; this is the
+    defensive guard for direct callers.
+
+    Pure function: reads the prompt file (if any) to surface a `current`
+    excerpt in the directive body, but writes nothing. The probe scorer's
+    temp-copy path (``_materialize_arm``) is what writes the directive to disk,
+    so this adapter can be called during scoring without touching the live
+    recipe prompt file.
+    """
+    target = proposal.get("target")
+    kind = proposal.get("kind")
+    if target != "prompt" or kind != "prompt_edit":
+        raise ValueError(
+            f"materialize_mutation only handles prompt/prompt_edit proposals; "
+            f"got target={target!r} kind={kind!r}"
+        )
+    # ``recipe_dir`` is part of the canonical adapter signature
+    # (proposal, recipe, node) — validate it exists so a caller passing a
+    # bogus path fails loudly rather than producing a directive that lands
+    # on no recipe at all.
+    if not recipe_dir or not os.path.isdir(recipe_dir):
+        raise ValueError(
+            f"materialize_mutation: recipe_dir {recipe_dir!r} does not exist"
+        )
+    signature = str(proposal.get("signature") or "unknown")
+    support = int(proposal.get("support", 0))
+    evidence = list(proposal.get("evidence") or [])
+    rationale = str(proposal.get("rationale") or "").strip()
+
+    # Stable, idempotent source_ref — keyed on the proposal's signature (which
+    # is stable per failure batch) and the recipe node. apply_mutation's
+    # idempotency check (apply.py:627) uses this to skip a re-apply.
+    source_ref = f"harness_operator:{signature}:{node}"
+
+    # Surface a one-paragraph directive carrying the rationale + concrete
+    # edit instruction. The exact text is informational; what matters is
+    # that the probe scorer appends it as a directive block to the TEMP
+    # recipe copy, not the live recipe (probe_scorer._materialize_arm).
+    evidence_str = ", ".join(str(e) for e in evidence[:5])
+    suggested = (
+        f"harness edit on {node!r}: {rationale} "
+        f"(support={support}; evidence=[{evidence_str}]). "
+        "Tighten the prompt to remove the failure mode without breaking the "
+        "happy-path directive."
+    )
+    return suggested, source_ref

@@ -52,6 +52,13 @@ Env contract (identical to bash):
     MO_APPLY_PROBE_BUDGET_USD     probe scorer: spend ceiling (default 2.0)
     MO_APPLY_PROBE_TIMEOUT_S      probe scorer: per-launch timeout (default 600)
     MO_APPLY_FORCE_REGRESSION=1   test seam: forces a regression score
+    MO_APPLY_HARNESS_TARGETS=1    opt-in: include harness.<recipe>.<node>
+                                  targets in auto_sweep (default OFF, kickoff
+                                  rsi-i5-harness-sweep G02-T01). Score and
+                                  gate path is unchanged; the live recipe
+                                  prompt is materialised via the probe
+                                  scorer's temp-copy path so scoring never
+                                  writes the live file.
 
 Exit code mapping (mirrors bash exactly):
     0  success (promote, quarantine, and no_candidate all exit 0 — a
@@ -1019,6 +1026,103 @@ def apply_run(task_class: str, target_kind: str, target_name: str,
                               f"control_n={probe_result.get('control_n', 1)} "
                               f"cost=${probe_result.get('cost_usd', 0.0):.2f}; "
                               f"{gate_rationale}")
+            # Cost-per-solved-task is an AUDIT term for harness candidates
+            # (kickoff rsi-i5-harness-sweep G02-T01 + repair kickoff
+            # rsi-i5-harness-sweep-repair). The block keeps the legacy
+            # aggregate-cost audit line below (preserves grep-compat with
+            # prior audits and the `before=$/after=$` test assertions) and
+            # adds the per-arm split that actually drives the gate decision
+            # for harness.* targets (mechanism step 3). n_solved is derived
+            # from per-task vectors when present, falling back to
+            # round(before_avg * n) / round(after_avg * n) — the same shape
+            # evaluate_gate reads.
+            n = probe_result.get("n", 0)
+            before_avg = float(probe_result.get("before", 0.0))
+            after_avg = float(probe_result.get("after", 0.0))
+            try:
+                pt = json.loads(probe_result.get("pertask_json") or "{}")
+                before_bin = [int(v) for v in (pt.get("before") or [])]
+                after_bin = [int(v) for v in (pt.get("after") or [])]
+                n_solved_before = sum(before_bin) if before_bin else int(round(before_avg * n))
+                n_solved_after = sum(after_bin) if after_bin else int(round(after_avg * n))
+            except (ValueError, TypeError):
+                n_solved_before = int(round(before_avg * n))
+                n_solved_after = int(round(after_avg * n))
+            # Legacy aggregate audit line. The two cps numbers share one
+            # `cost` by construction — they are kept only so existing audits
+            # that grep for "before=$" / "after=$" continue to find the
+            # record; the per-arm split below is what the gate keys on.
+            cost = float(probe_result.get("cost_usd", 0.0))
+            cps_before = cost / max(1, n_solved_before)
+            cps_after = cost / max(1, n_solved_after)
+            gate_rationale += (f" | cost_per_solved_task: "
+                               f"before=${cps_before:.4f} after=${cps_after:.4f} "
+                               f"(n_solved_before={n_solved_before} "
+                               f"n_solved_after={n_solved_after})")
+            # Per-arm cost split (mechanism step 2). probe_scorer returns
+            # `runs = [{probe, arm, run_id, outcome, cost_usd}]` with
+            # arm ∈ {"baseline", "candidate"} (probe_scorer.py:522). Slice
+            # per arm; the baseline arm is retried `control_n` times per
+            # probe, so divide its raw sum by control_n to normalise to a
+            # single attempt (kickoff rsi-i5-harness-sweep G06-T03).
+            try:
+                runs_list = list(probe_result.get("runs") or [])
+            except (TypeError, ValueError):
+                runs_list = []
+            try:
+                control_n_int = max(1, int(probe_result.get("control_n", 1) or 1))
+            except (TypeError, ValueError):
+                control_n_int = 1
+
+            def _arm_cost(arm_name: str) -> float:
+                total = 0.0
+                for r in runs_list:
+                    if not isinstance(r, dict):
+                        continue
+                    if r.get("arm") != arm_name:
+                        continue
+                    try:
+                        total += float(r.get("cost_usd") or 0.0)
+                    except (TypeError, ValueError):
+                        continue
+                return total
+
+            baseline_cost_raw = _arm_cost("baseline")
+            candidate_cost = _arm_cost("candidate")
+            baseline_cost = baseline_cost_raw / max(1, control_n_int)
+            cps_baseline = baseline_cost / max(1, n_solved_before)
+            cps_candidate = candidate_cost / max(1, n_solved_after)
+            gate_rationale += (f" | cost_per_solved_task_per_arm: "
+                               f"baseline=${cps_baseline:.4f} "
+                               f"candidate=${cps_candidate:.4f} "
+                               f"(baseline_cost=${baseline_cost:.4f} "
+                               f"candidate_cost=${candidate_cost:.4f} "
+                               f"n_solved_baseline={n_solved_before} "
+                               f"n_solved_candidate={n_solved_after} "
+                               f"control_n={control_n_int})")
+            # Harness-cost gate (mechanism step 3). For harness.* targets
+            # ONLY: a candidate that would promote but costs more
+            # per-solved-task than the baseline gets quarantined with
+            # reason "harness-cost-regression". Non-harness targets (agent.*)
+            # log the per-arm audit but the decision is unchanged.
+            # Mechanism step 4: missing per-arm costs (both zero) → log
+            # unmeasured and skip the gate flip; the audit line above
+            # already records the absence.
+            if (target_name.startswith("harness.")
+                    and gate_decision == "promoted"
+                    and cps_candidate > cps_baseline
+                    and (baseline_cost > 0 or candidate_cost > 0)):
+                gate_decision = "quarantined"
+                gate_rationale += (
+                    f" | harness-cost-regression: "
+                    f"cps_baseline=${cps_baseline:.4f} "
+                    f"cps_candidate=${cps_candidate:.4f}"
+                )
+            elif baseline_cost == 0 and candidate_cost == 0:
+                gate_rationale += (
+                    " | cost_per_solved_task: unmeasured "
+                    "(per-arm costs missing)"
+                )
 
     # 4b. Evaluator honesty. The mock scorer and the gepa placeholder fabricate
     #     utility numbers (mock centers after≈0.55 against a 0.0 baseline → the
@@ -1117,7 +1221,9 @@ def _prompt_file_for(recipe_dir: str, target: str) -> str:
 
     ``agent.<role>.prompt`` (reflect's agent-targeted form) maps to
     ``prompts/<role>.md`` with ``_``/``-`` interchange; a ``prompts/<name>``
-    target is already a recipe-relative path. No match → '' (target skipped,
+    target is already a recipe-relative path; ``harness.<recipe>.<node>``
+    (kickoff rsi-i5-harness-sweep G02-T01) maps to the node's ``prompt_ref``
+    in ``recipes/<recipe>/workflow.yaml``. No match → '' (target skipped,
     never guessed)."""
     if not recipe_dir:
         return ""
@@ -1131,7 +1237,74 @@ def _prompt_file_for(recipe_dir: str, target: str) -> str:
     if target.startswith("prompts/"):
         path = os.path.join(recipe_dir, target)
         return path if os.path.isfile(path) else ""
+    if target.startswith("harness."):
+        return _harness_target_file_for(recipe_dir, target)
     return ""
+
+
+def _harness_target_file_for(recipe_dir: str, target: str) -> str:
+    """Resolve ``harness.<recipe>.<node>`` → ``<recipe_dir>/<workflow_prompt_ref>``.
+
+    Recipe and node are split off the ``harness.`` prefix (3-dot form). The
+    recipe name is matched against the on-disk recipe directory with the same
+    ``_``/``-`` interchange as ``_recipe_dir_for``; the node name is matched
+    against ``workflow.yaml``'s ``nodes[].name`` with the same interchange. The
+    node's ``prompt_ref`` (when non-null and points to an existing file) is
+    returned as an absolute path; any other case yields ``''`` so auto_sweep
+    skips the target rather than guessing.
+
+    The resolver is deliberately API-only: it does not touch ``apply_attempts``
+    DDL or the ``_VALID_TARGET_KINDS`` enum. Harness edits ride the existing
+    ``prompt_file`` target_kind with ``target_name = harness.<recipe>.<node>``,
+    so the SQL CHECK stays valid (kickoff scope: no migration file).
+    """
+    if not recipe_dir:
+        return ""
+    # Strip the leading "harness." prefix and split into recipe, node.
+    rest = target[len("harness."):]
+    parts = rest.split(".", 1)
+    if len(parts) != 2 or not parts[0] or not parts[1]:
+        return ""
+    recipe_name, node_name = parts
+
+    # Confirm the recipe dir actually matches; an auto_sweep call passes its
+    # own recipe_dir, but be defensive against a target whose recipe disagrees.
+    base = os.path.basename(os.path.normpath(recipe_dir))
+    if base not in {recipe_name, recipe_name.replace("_", "-"),
+                    recipe_name.replace("-", "_")}:
+        return ""
+
+    wf_path = os.path.join(recipe_dir, "workflow.yaml")
+    if not os.path.isfile(wf_path):
+        return ""
+    try:
+        import yaml  # local import — keep this resolver off the cold-import path
+    except ImportError:
+        return ""
+    try:
+        with open(wf_path, encoding="utf-8") as fh:
+            wf = yaml.safe_load(fh)
+    except (OSError, yaml.YAMLError):
+        return ""
+    nodes = (wf or {}).get("nodes") or []
+    if not isinstance(nodes, list):
+        return ""
+    node_aliases = {node_name, node_name.replace("-", "_"),
+                    node_name.replace("_", "-")}
+    prompt_ref = None
+    for entry in nodes:
+        if not isinstance(entry, dict):
+            continue
+        if str(entry.get("name", "")) in node_aliases:
+            prompt_ref = entry.get("prompt_ref")
+            break
+    if not prompt_ref or not isinstance(prompt_ref, str):
+        return ""
+    # prompt_ref is recipe-relative (e.g. "prompts/implementer.md"); resolve
+    # against recipe_dir and only return when the file actually exists — same
+    # "no guess" policy as the agent.* branch.
+    cand = os.path.join(recipe_dir, prompt_ref)
+    return cand if os.path.isfile(cand) else ""
 
 
 def auto_sweep(task_class: str, db: str | None = None,
@@ -1139,20 +1312,41 @@ def auto_sweep(task_class: str, db: str | None = None,
     """Bounded post-run apply sweep: top-1 gradient per agent-prompt target,
     every candidate still passes through the SAME gated apply_run — nothing
     promotes without the gate (dev-set filter, AutoSaddler's core rule).
-    Returns per-target result dicts for the caller's log."""
+    Returns per-target result dicts for the caller's log.
+
+    Harness targets (``harness.<recipe>.<node>``) are excluded by default; set
+    ``MO_APPLY_HARNESS_TARGETS=1`` to opt in. Score and gate path is
+    unchanged — the live recipe prompt is materialised via the probe scorer's
+    temp-copy path, so scoring never writes the live file (kickoff
+    rsi-i5-harness-sweep G02-T01)."""
     if max_targets is None:
         try:
             max_targets = max(1, int(os.environ.get("MO_AUTO_APPLY_MAX_TARGETS", "1")))
         except ValueError:
             max_targets = 1
+    harness_on = os.environ.get("MO_APPLY_HARNESS_TARGETS", "0") == "1"
+    # Single LIKE-pattern string keeps the SQL simple and lets the harness
+    # branch be added by widening the prefix set when opted in.
+    target_like = "agent.%" if not harness_on else "agent.%|harness.%"
+
     con = None
     try:
         con = sqlite3.connect(_db_path(db))
-        rows = con.execute(
-            "SELECT target, suggested_change FROM gradient_records "
-            "WHERE task_class=? AND target LIKE 'agent.%' "
-            "AND target NOT LIKE 'cross_class:%' "
-            "ORDER BY confidence DESC", (task_class,)).fetchall()
+        if harness_on:
+            rows = con.execute(
+                "SELECT target, suggested_change FROM gradient_records "
+                "WHERE task_class=? AND (target LIKE 'agent.%' "
+                "OR target LIKE 'harness.%') "
+                "AND target NOT LIKE 'cross_class:%' "
+                "ORDER BY confidence DESC", (task_class,)).fetchall()
+        else:
+            rows = con.execute(
+                "SELECT target, suggested_change FROM gradient_records "
+                "WHERE task_class=? AND target LIKE 'agent.%' "
+                "AND target NOT LIKE 'cross_class:%' "
+                "ORDER BY confidence DESC", (task_class,)).fetchall()
+        # Silence the unused-variable warning when harness_on is False.
+        del target_like
     except sqlite3.Error:
         return []
     finally:
