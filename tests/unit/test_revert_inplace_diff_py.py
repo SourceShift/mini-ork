@@ -242,3 +242,21 @@ def test_rollback_handler_keeps_the_inplace_edit_when_an_outer_loop_owns_verify(
 
     assert (rc, fr) == (0, "done")
     assert (repo / "tracked.py").read_text() == "fix by implementer\n"
+
+
+def test_inplace_revert_records_rolled_back_paths(tmp_path, monkeypatch):
+    """keep_run_artifacts_discard_worktree must leave the same attribution
+    record as revert_branch, or the post-run verify reports the artifact this
+    rollback removed as "missing or empty" and blames the implementer."""
+    repo = _mk_repo(tmp_path)
+    (repo / "tracked.py").write_text("broken\n")
+    (repo / "made.py").write_text("new\n")
+    _git(repo, "add", "made.py")
+    run_dir = _run_with_diff(tmp_path, repo)
+    monkeypatch.setenv("MO_TARGET_CWD", str(repo))
+
+    assert exh._revert_inplace_diff(str(run_dir), str(tmp_path)) is True
+
+    doc = json.loads((run_dir / "rolled-back.json").read_text())
+    real = repo.resolve()
+    assert doc == {"paths": sorted([str(real / "made.py"), str(real / "tracked.py")])}

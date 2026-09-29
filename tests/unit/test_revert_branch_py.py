@@ -165,3 +165,20 @@ def test_rollback_handler_default_workflow_skips_revert(tmp_path, monkeypatch):
 
     assert (rc, fr) == (0, "done")
     assert (repo / "tracked.py").read_text() == "broken\n"  # untouched
+
+
+def test_revert_records_rolled_back_paths(tmp_path, monkeypatch):
+    # The post-run verify reads this record to tell "reverted by rollback"
+    # apart from "never produced".
+    repo = _mk_repo(tmp_path)
+    (repo / "tracked.py").write_text("broken by implementer\n")
+    (repo / "created.py").write_text("new file by implementer\n")
+    run_dir = tmp_path / "run"
+    _summary(run_dir, ["tracked.py", "created.py"])
+    monkeypatch.setenv("MO_TARGET_CWD", str(repo))
+
+    ex._revert_working_tree(str(tmp_path), str(run_dir))
+
+    doc = json.loads((run_dir / "rolled-back.json").read_text())
+    real = repo.resolve()
+    assert doc == {"paths": sorted([str(real / "created.py"), str(real / "tracked.py")])}
