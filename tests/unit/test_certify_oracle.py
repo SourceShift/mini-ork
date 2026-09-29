@@ -394,3 +394,29 @@ def test_judge_default_context_none_is_unchanged():
     # median runs. 1/1 invariant passes -> UNVERIFIED.
     assert v.verdict == UNVERIFIED
     assert "does not import" not in v.reason
+
+# ── the model lane never runs in the caller's cwd ────────────────────────────
+def test_default_dispatch_runs_the_lane_in_a_throwaway_dir(tmp_path, monkeypatch):
+    """Agentic lanes write files where they run. certify runs inside the user's repo,
+    so the lane must get a scratch MO_TARGET_CWD that is removed afterwards."""
+    import os
+
+    from mini_ork.certify import llm
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("MO_TARGET_CWD", raising=False)
+    seen = {}
+
+    def fake(model, prompt, out_file):
+        cwd = os.environ["MO_TARGET_CWD"]
+        seen["cwd"] = cwd
+        open(os.path.join(cwd, "stray.py"), "w").write("x = 1\n")  # a lane scribbling
+        open(out_file, "w").write("ok")
+        return 0
+
+    monkeypatch.setattr(llm, "mo_llm_dispatch", fake)
+    assert llm.default_dispatch("hi") == "ok"
+    assert seen["cwd"] != str(tmp_path)
+    assert not os.path.exists(seen["cwd"])          # scratch removed
+    assert list(tmp_path.iterdir()) == []           # caller's cwd untouched
+    assert "MO_TARGET_CWD" not in os.environ        # override did not leak

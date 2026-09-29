@@ -13,8 +13,10 @@ what the verdict cost from `spent()`, never from a table this path never wrote.
 from __future__ import annotations
 
 import os
+import shutil
 import tempfile
 
+from mini_ork.context import scoped_environ
 from mini_ork.dispatch.llm_dispatch import mo_llm_dispatch
 
 # The code-writing lane: probes and invariants are pytest code, so the default is a
@@ -42,9 +44,15 @@ def default_dispatch(prompt: str) -> str:
     """
     model = os.environ.get("MO_CERTIFY_MODEL", DEFAULT_MODEL)
     fd, out_file = tempfile.mkstemp(prefix="certify-oracle-", suffix=".out")
+    # Agentic lanes have file tools and run in MO_TARGET_CWD (else the process cwd).
+    # Measured: while writing a probe, a lane recreated the package under test in the
+    # caller's cwd to try its test. `certify` runs inside the user's own repo, so every
+    # call gets a throwaway directory — the model can scribble; the repo stays untouched.
+    scratch = tempfile.mkdtemp(prefix="certify-lane-")
     try:
         os.close(fd)
-        rc = mo_llm_dispatch(model, prompt, out_file)
+        with scoped_environ({"MO_TARGET_CWD": scratch}):
+            rc = mo_llm_dispatch(model, prompt, out_file)
         _spend["calls"] += 1
         try:
             with open(out_file + ".cost", encoding="utf-8") as f:
@@ -61,6 +69,7 @@ def default_dispatch(prompt: str) -> str:
     except Exception:
         return ""
     finally:
+        shutil.rmtree(scratch, ignore_errors=True)
         for suffix in ("", ".cost", ".model", ".tokens", ".err.log"):
             try:
                 os.remove(out_file + suffix)
