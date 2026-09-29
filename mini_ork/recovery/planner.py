@@ -79,6 +79,7 @@ Module layout (SOLID SRP split — behavior byte-identical parity port):
 """
 from __future__ import annotations
 
+import json
 import os
 import sys
 
@@ -176,10 +177,23 @@ def _resolve_default_paths(
     db = context_env("MINI_ORK_DB") or os.path.join(home, "state.db")
     workflow = os.environ.get("MINI_ORK_WORKFLOW") or ""
     recipe = os.environ.get("MINI_ORK_RECIPE") or ""
+    if not recipe:
+        # A CLI recover has no MINI_ORK_RECIPE; without the run's recipe every
+        # checkpoint hashes as recipe="unknown" and reads as hash_mismatch.
+        recipe = _recipe_from_run_profile(run_dir)
     if not workflow and recipe:
         root = os.environ.get("MINI_ORK_ROOT") or os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
         workflow = os.path.join(root, "recipes", recipe, "workflow.yaml")
     return run_dir, db, workflow, recipe
+
+
+def _recipe_from_run_profile(run_dir: str) -> str:
+    """The recipe the run was started with, from ``<run_dir>/run_profile.json``."""
+    try:
+        with open(os.path.join(run_dir, "run_profile.json"), encoding="utf-8") as fh:
+            return str(json.load(fh).get("recipe") or "").strip()
+    except (OSError, ValueError, AttributeError):
+        return ""
 
 
 def _emit_recovery_env(plan: RecoveryPlan) -> None:
@@ -225,11 +239,16 @@ def _task_class_for_recipe(recipe: str) -> str:
     return recipe.replace("-", "_")
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv: list[str] | None = None, *, handoff: dict | None = None) -> int:
     """CLI entrypoint mirroring ``mini_ork_resume.main``.
 
     Args:
       argv — the full argv (positional run_id + flags). None → sys.argv[1:].
+
+      handoff — optional dict; on the dispatch path it is filled with what
+        an executor needs (run_id, run_dir, workflow, db_path, recipe,
+        request_id, lease_token). ``cli_main`` uses it; in-process callers
+        that read the env hand-off can ignore it.
 
     Returns:
       rc — 0 success, 1 plan/runtime error, 2 usage error, 3 paused.
@@ -403,6 +422,8 @@ def main(argv: list[str] | None = None) -> int:
     # MINI_ORK_LEASE_TOKEN so execute's checkpoint publish is fenced against a
     # stale worker. Gated on lease_tables_present so a pre-0052 (legacy) DB
     # recovers fence-free exactly as E2 did.
+    _token = None
+    _req = None
     if _lease is not None and _lease.lease_tables_present(db_path):
         _from = plan.first_node or (from_node or "")
         _req = _lease.request_recovery(db_path, run_id, _from, strategy)
@@ -428,8 +449,56 @@ def main(argv: list[str] | None = None) -> int:
         f"[mini-ork-recover] dispatching closure from node={plan.first_node} "
         f"({len(plan.closure)} node{'s' if len(plan.closure) != 1 else ''} to rerun)\n"
     )
+    if handoff is not None:
+        handoff.update({
+            "run_id": run_id, "run_dir": run_dir, "workflow": workflow,
+            "db_path": db_path, "recipe": recipe,
+            "request_id": _req[0] if _req else "", "lease_token": _token or "",
+        })
     return 0
 
 
+def cli_main(argv: list[str] | None = None, *, execute_fn=None) -> int:
+    """``mini-ork recover`` entry. The subcommand spawns this module in its own
+    process, so ``main``'s env hand-off has no in-process executor to read it:
+    the CLI used to print "dispatching closure" and exit without running a
+    node. Dispatch the closure here, then close the request and release the
+    lease so a later recover is not refused for the lease TTL."""
+    for key in ("MINI_ORK_RECOVERY_RUN_ID", "MINI_ORK_RECOVERY_SKU", "MINI_ORK_RECOVERY_CLOSURE",
+                "MINI_ORK_RECOVERY_STRATEGY", "MINI_ORK_RECOVERY_FROM"):
+        os.environ.pop(key, None)  # only this call's plan may drive the executor
+    handoff: dict = {}
+    rc = main(argv, handoff=handoff)
+    if rc != 0 or not handoff:
+        return rc
+    apply_env_overrides({
+        "MINI_ORK_RUN_ID": handoff["run_id"],
+        "MINI_ORK_RUN_DIR": handoff["run_dir"],
+        "MINI_ORK_WORKFLOW": handoff["workflow"],
+        "MINI_ORK_RECIPE": handoff["recipe"] or None,
+    })
+    exec_argv = ["--recovery"]
+    plan_json = os.path.join(handoff["run_dir"], "plan.json")
+    if os.path.isfile(plan_json):
+        exec_argv.insert(0, plan_json)
+    if execute_fn is None:
+        from mini_ork.cli import execute as _execute  # noqa: PLC0415
+        root = os.environ.get("MINI_ORK_ROOT") or os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+
+        def execute_fn(a):
+            return _execute.main(a, root=root)
+    exec_rc = 1
+    try:
+        exec_rc = execute_fn(exec_argv)
+        return exec_rc
+    finally:
+        if _lease is not None:
+            if handoff["request_id"]:
+                _lease.close_recovery(handoff["db_path"], handoff["request_id"],
+                                      status="completed" if exec_rc == 0 else "failed")
+            if handoff["lease_token"]:
+                _lease.release_lease(handoff["db_path"], handoff["run_id"], handoff["lease_token"])
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(cli_main())
