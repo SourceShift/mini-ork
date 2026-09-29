@@ -37,20 +37,6 @@ Options:
 """
 
 
-def _rolled_back_paths(run_dir: str) -> set[str]:
-    """Realpaths the run's rollback node reverted (``rolled-back.json``, written
-    by ``execute_handlers._record_rolled_back``). Empty when rollback did not
-    run or recorded nothing."""
-    if not run_dir:
-        return set()
-    try:
-        doc = json.load(open(os.path.join(run_dir, "rolled-back.json"), encoding="utf-8"))
-    except (OSError, ValueError):
-        return set()
-    paths = doc.get("paths") if isinstance(doc, dict) else None
-    return {os.path.realpath(str(p)) for p in paths or []}
-
-
 def _resolve_home_db(db):
     home = os.environ.get("MINI_ORK_HOME") or os.path.join(os.getcwd(), ".mini-ork")
     db = db or os.environ.get("MINI_ORK_DB") or os.path.join(home, "state.db")
@@ -337,7 +323,6 @@ def main(argv: list[str] | None = None, *, db: str | None = None, root: str | No
             ac_req = {}
         if isinstance(ac_req, dict):
             seen: set[str] = set()
-            rolled_back = _rolled_back_paths(context_env("MINI_ORK_RUN_DIR", ""))
             for key in ("required_artifacts", "outputs"):
                 for raw in ac_req.get(key, []) or []:
                     p = os.path.expandvars(str(raw))
@@ -347,14 +332,6 @@ def main(argv: list[str] | None = None, *, db: str | None = None, root: str | No
                     if os.path.isfile(p) and os.path.getsize(p) > 0:
                         results.append(f'{{"verifier":"__artifact__","pass":true,"evidence_path":"{p}"}}')
                         pass_count += 1
-                    elif os.path.realpath(p) in rolled_back:
-                        # Still a fail — a reverted run must not verify as pass — but
-                        # attributed to the rollback that deleted it, not reported as
-                        # an artifact the implementer never produced.
-                        sys.stderr.write(f"  [fail] required artifact reverted by rollback: {p}\n")
-                        results.append(f'{{"verifier":"__artifact__","pass":false,"detail":"rolled_back","evidence_path":"{p}"}}')
-                        fail_count += 1
-                        artifact_fail = True
                     else:
                         sys.stderr.write(f"  [fail] required artifact missing or empty: {p}\n")
                         results.append(f'{{"verifier":"__artifact__","pass":false,"evidence_path":"{p}"}}')

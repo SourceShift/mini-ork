@@ -166,32 +166,3 @@ def test_relative_output_is_exempt(tmp_path):
     sp, rp = _verify(home, db, "art.txt", "--plan", str(plan))
     assert json.loads(sp)["verdict"] == "pass"
     assert rp == 0
-
-
-def test_rolled_back_artifact_is_attributed_to_rollback(tmp_path):
-    # Post-run verify runs AFTER rollback. A required artifact the rollback
-    # node itself deleted still fails the run (a reverted run must not verify
-    # as pass) but is labelled rolled_back — not "missing or empty", which
-    # blamed the implementer for the rollback's deletion.
-    import io
-    from contextlib import redirect_stdout, redirect_stderr
-    home, db, _ = _scenario(tmp_path, [])
-    reverted = tmp_path / "created.css"           # implementer wrote it; rollback removed it
-    plan = _req_plan(home, reverted)
-    run_dir = tmp_path / "run"; run_dir.mkdir()
-    (run_dir / "rolled-back.json").write_text(json.dumps({"paths": [str(reverted)]}))
-    o, e = io.StringIO(), io.StringIO()
-    old = dict(os.environ)
-    os.environ.update({"MINI_ORK_HOME": str(home), "MINI_ORK_RUN_DIR": str(run_dir)})
-    try:
-        with redirect_stdout(o), redirect_stderr(e):
-            rc = ver.main([str(reverted), "--plan", plan], db=db, root=str(REPO))
-    finally:
-        os.environ.clear(); os.environ.update(old)
-    doc = json.loads(o.getvalue()[o.getvalue().index("{"):])
-    art = [r for r in doc["results"] if r["verifier"] == "__artifact__"]
-    assert doc["verdict"] == "fail" and rc == 1
-    assert art == [{"verifier": "__artifact__", "pass": False, "detail": "rolled_back",
-                    "evidence_path": str(reverted)}]
-    assert "reverted by rollback" in e.getvalue()
-    assert "missing or empty" not in e.getvalue()

@@ -343,6 +343,10 @@ def test_timed_out_arm_keeps_the_probes_already_measured(
     measurement — an arm failure destroying a whole sweep's evidence, which is
     the opposite of what a no-regression gate can tolerate.
     """
+    # Legacy launch-count assertion: p1 baseline + p1 candidate + p2 baseline
+    # before the timeout = 3 launches. Default MO_APPLY_PROBE_CONTROL_N=3 would
+    # give 3 + 1 + 1 = 5 launches (kickoff line 47).
+    monkeypatch.setenv("MO_APPLY_PROBE_CONTROL_N", "1")
     launched: list[str] = []
 
     def fake_launch(recipe, kickoff, target_cwd=None, root=None):

@@ -633,6 +633,9 @@ def test_probe_scorer_missing_directive_or_target_returns_none(tmp_path, monkeyp
 
 def test_probe_scorer_two_arms_vectors_and_cleanup(tmp_path, monkeypatch):
     ps, recipe = _probe_fixture(tmp_path, monkeypatch)
+    # Legacy arm-count assertion: 2 probes × 2 arms == 4 launches. Default
+    # MO_APPLY_PROBE_CONTROL_N=3 would give 2 × (1 + 3) == 8 (kickoff line 47).
+    monkeypatch.setenv("MO_APPLY_PROBE_CONTROL_N", "1")
     launches = []
     outcomes = {}
 
@@ -716,6 +719,9 @@ def test_probe_scorer_gives_each_arm_a_fresh_target_copy(tmp_path, monkeypatch):
     next launch.
     """
     ps, recipe = _probe_fixture(tmp_path, monkeypatch)
+    # Legacy arm-count assertion: 2 probes × 2 arms == 4 targets. Default
+    # MO_APPLY_PROBE_CONTROL_N=3 would give 2 × (1 + 3) == 6 (kickoff line 47).
+    monkeypatch.setenv("MO_APPLY_PROBE_CONTROL_N", "1")
     # Give both probes a fixture: probes/fixtures/<stem>/
     for i in (1, 2, 3):
         fx = recipe / "probes" / "fixtures" / f"probe-{i}"

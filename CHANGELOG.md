@@ -9,23 +9,7 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-### Fixed
-
-- **Failed-lane error attribution**: when a harness CLI exits non-zero in JSON
-  mode, the recorded error (`DispatchResult.error`, `llm_calls.error_message`)
-  now leads with the stdout result envelope's API error
-  (`[api_error 403] … Key limit exceeded`) instead of stderr alone, which could
-  hold only an unrelated advisory banner.
-- **Static routing honours `agents.yaml` role lanes**: with no state DB,
-  `learning_static_lane` no longer forces every unpinned `reviewer` to
-  `MO_FRONTIER_LANE` (and researcher/implementer to `MO_CHEAP_LANE`) when the
-  operator mapped that role under `lanes:`; the frontier/cheap defaults now fill
-  only unmapped roles.
-- **Rolled-back artifacts are attributed to rollback**: `revert_branch` records
-  the paths it reverted in `<run_dir>/rolled-back.json`, and the post-run
-  `verify` reports such a required artifact as `detail: rolled_back`
-  ("reverted by rollback") rather than "missing or empty". The verdict is
-  unchanged — a reverted run still fails.
+No unreleased changes yet.
 
 ---
 

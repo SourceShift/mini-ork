@@ -475,6 +475,15 @@ def probe_score(task_class: str, target_file: str | None,
         budget = float(os.environ.get("MO_APPLY_PROBE_BUDGET_USD", "2.0"))
     except ValueError:
         budget = 2.0
+    # MO_APPLY_PROBE_CONTROL_N: how many times to run the unmutated baseline arm
+    # per probe task before scoring the candidate. The per-probe baseline outcome
+    # becomes the BEST of N retries, so run-to-run noise in the unmutated recipe
+    # can no longer be credited to the candidate (G06-T03). Default 3; minimum
+    # 1 reproduces the pre-change behaviour byte-identically (max([x]) == x).
+    try:
+        control_n = max(1, int(os.environ.get("MO_APPLY_PROBE_CONTROL_N", "3")))
+    except ValueError:
+        control_n = 3
 
     # Deferred import: apply imports this module at call time only, and the
     # directive-block builder lives in apply — importing here avoids the cycle.
@@ -487,6 +496,7 @@ def probe_score(task_class: str, target_file: str | None,
     before_v: list[float] = []
     after_v: list[float] = []
     ids: list[str] = []
+    control_solved_per_probe: list[int] = []
     spent = 0.0
     try:
         base_name, _ = _materialize_arm(task_class, None, None, 0)
@@ -500,34 +510,87 @@ def probe_score(task_class: str, target_file: str | None,
         for probe in probes:
             if spent >= budget or stop_sweep:
                 break  # n truncates to probes completed in BOTH arms below
-            for arm, recipe_name in (("baseline", base_name), ("candidate", cand_name)):
-                if spent >= budget or stop_sweep:
+            # ── Control arm: N retries on the unmutated baseline ────────────
+            # The per-probe control outcome is the BEST of N retries: a task
+            # is solved by control if ANY retry solved it. The candidate gets
+            # credit for that task only if it solves one the control did not.
+            control_outcomes: list[float] = []
+            control_unscored = False
+            last_cost = 0.0  # pre-flight estimate for the upcoming retry
+            for retry in range(control_n):
+                if spent + last_cost > budget or stop_sweep:
+                    # Budget cap binds across all arms including the N control
+                    # retries. Pre-flight BEFORE spending: refuse the launch
+                    # when the previous retry's cost would already exceed the
+                    # budget, instead of overspending first. Stop and return
+                    # None rather than score against an incomplete control set
+                    # (kickoff step 1).
+                    control_unscored = True
                     break
                 target = _materialize_target(probe)
                 if target:
                     temp_targets.append(target)
                 try:
-                    _stdout, run_id, cost = _launch_run(recipe_name, probe, target_cwd=target)
+                    _stdout, run_id, cost = _launch_run(
+                        base_name, probe, target_cwd=target)
                 except ProbeArmTimeout as exc:
-                    # No usable outcome for this arm. Record why and stop the
-                    # sweep: n truncates to the probes finished in BOTH arms,
-                    # so the probes already measured are kept rather than
-                    # thrown away with the run that blew the timeout.
-                    runs.append({"probe": os.path.basename(probe), "arm": arm,
+                    # Mirror the candidate arm: a timeout stops the sweep but
+                    # the probes already measured (in BOTH arms) are preserved
+                    # — n truncates to min(len(before_v), len(after_v)). An arm
+                    # timeout must NOT throw away a whole sweep's evidence.
+                    runs.append({"probe": os.path.basename(probe),
+                                 "arm": "baseline", "retry": retry,
                                  "run_id": "", "outcome": None,
                                  "cost_usd": 0.0, "timed_out": True,
                                  "error": str(exc)})
                     stop_sweep = True
-                    break
+                    break  # NOT control_unscored — partial results survive
                 spent += cost
+                last_cost = cost
                 outcome = _run_outcome(run_id)
-                runs.append({"probe": os.path.basename(probe), "arm": arm,
-                             "run_id": run_id, "outcome": outcome, "cost_usd": cost})
-                if arm == "baseline":
-                    before_v.append(outcome)
-                    ids.append(os.path.basename(probe))
-                else:
-                    after_v.append(outcome)
+                runs.append({"probe": os.path.basename(probe),
+                             "arm": "baseline", "retry": retry,
+                             "run_id": run_id, "outcome": outcome,
+                             "cost_usd": cost})
+                control_outcomes.append(outcome)
+            if control_unscored:
+                return None
+            # A timeout on retry 0 leaves control_outcomes empty: skip the
+            # probe — the outer probe loop sees stop_sweep=True and breaks,
+            # and n truncates to the probes finished in BOTH arms.
+            if not control_outcomes:
+                break
+            # max(binary outcomes) == 1.0 if any retry solved it, else 0.0.
+            before_v.append(max(control_outcomes))
+            ids.append(os.path.basename(probe))
+            control_solved_per_probe.append(
+                1 if max(control_outcomes) >= 1.0 else 0)
+            # ── Candidate arm: single run, as today ─────────────────────────
+            if spent >= budget or stop_sweep:
+                break
+            target = _materialize_target(probe)
+            if target:
+                temp_targets.append(target)
+            try:
+                _stdout, run_id, cost = _launch_run(
+                    cand_name, probe, target_cwd=target)
+            except ProbeArmTimeout as exc:
+                # No usable outcome for this arm. Record why and stop the
+                # sweep: n truncates to the probes finished in BOTH arms,
+                # so the probes already measured are kept rather than
+                # thrown away with the run that blew the timeout.
+                runs.append({"probe": os.path.basename(probe),
+                             "arm": "candidate", "run_id": "",
+                             "outcome": None, "cost_usd": 0.0,
+                             "timed_out": True, "error": str(exc)})
+                stop_sweep = True
+                break
+            spent += cost
+            outcome = _run_outcome(run_id)
+            runs.append({"probe": os.path.basename(probe), "arm": "candidate",
+                         "run_id": run_id, "outcome": outcome,
+                         "cost_usd": cost})
+            after_v.append(outcome)
     finally:
         root = _root()
         for name in temp_dirs:
@@ -539,10 +602,12 @@ def probe_score(task_class: str, target_file: str | None,
 
     n = min(len(before_v), len(after_v))
     before_v, after_v, ids = before_v[:n], after_v[:n], ids[:n]
+    control_solved_per_probe = control_solved_per_probe[:n]
     if n == 0:
         return {"before": 0.0, "after": 0.0, "n": 0, "pertask_json": "",
                 "runs": runs, "cost_usd": round(spent, 4),
-                "truncated_by_budget": True}
+                "truncated_by_budget": True,
+                "control_n": control_n, "control_solved": []}
     pertask = json.dumps({
         "before": [int(v) for v in before_v],
         "after": [int(v) for v in after_v],
@@ -555,6 +620,8 @@ def probe_score(task_class: str, target_file: str | None,
         "pertask_json": pertask,
         "runs": runs,
         "cost_usd": round(spent, 4),
+        "control_n": control_n,
+        "control_solved": control_solved_per_probe,
     }
 
 
@@ -687,6 +754,10 @@ def probe_score_code(task_class: str, patch_path: str | None, *,
         budget = float(os.environ.get("MO_APPLY_PROBE_BUDGET_USD", "2.0"))
     except ValueError:
         budget = 2.0
+    try:
+        control_n = max(1, int(os.environ.get("MO_APPLY_PROBE_CONTROL_N", "3")))
+    except ValueError:
+        control_n = 3
     recipe_name = os.path.basename(recipe)
 
     arms: list[tuple[str, str, str]] = []  # (arm, tmpdir, tree)
@@ -695,6 +766,7 @@ def probe_score_code(task_class: str, patch_path: str | None, *,
     before_v: list[float] = []
     after_v: list[float] = []
     ids: list[str] = []
+    control_solved_per_probe: list[int] = []
     spent = 0.0
     try:
         base = _code_arm_tree(task_class, base_ref, None)
@@ -710,39 +782,87 @@ def probe_score_code(task_class: str, patch_path: str | None, *,
             _seed_arm_home(tree)
             _bootstrap_arm_db(tree)
 
+        base_tree = arms[0][2]
+        cand_tree = arms[1][2]
         stop_sweep = False
         for probe in probes:
             if spent >= budget or stop_sweep:
                 break  # n truncates to probes completed in BOTH arms below
-            for arm, _tmp, tree in arms:
-                if spent >= budget or stop_sweep:
+            # ── Control arm: N retries on the baseline worktree ────────────
+            control_outcomes: list[float] = []
+            control_unscored = False
+            last_cost = 0.0  # pre-flight estimate for the upcoming retry
+            for retry in range(control_n):
+                if spent + last_cost > budget or stop_sweep:
+                    # Budget pre-flight: refuse the launch BEFORE spending when
+                    # the previous retry's cost would already exceed the
+                    # budget. Stop and return None rather than score against
+                    # an incomplete control set (kickoff step 1).
+                    control_unscored = True
                     break
                 target = _materialize_target(probe)
                 if target:
                     temp_targets.append(target)
                 try:
                     _stdout, run_id, cost = _launch_run(
-                        recipe_name, probe, target_cwd=target, root=tree)
+                        recipe_name, probe, target_cwd=target, root=base_tree)
                 except ProbeArmTimeout as exc:
-                    # No usable outcome for this arm. Record why and stop the
-                    # sweep: n truncates to the probes finished in BOTH arms,
-                    # so the probes already measured are kept rather than
-                    # thrown away with the run that blew the timeout.
-                    runs.append({"probe": os.path.basename(probe), "arm": arm,
+                    # Mirror the candidate arm: a timeout stops the sweep but
+                    # the probes already measured (in BOTH arms) are preserved
+                    # — n truncates to min(len(before_v), len(after_v)). An arm
+                    # timeout must NOT throw away a whole sweep's evidence.
+                    runs.append({"probe": os.path.basename(probe),
+                                 "arm": "baseline", "retry": retry,
                                  "run_id": "", "outcome": None,
                                  "cost_usd": 0.0, "timed_out": True,
                                  "error": str(exc)})
                     stop_sweep = True
-                    break
+                    break  # NOT control_unscored — partial results survive
                 spent += cost
-                outcome = _run_outcome(run_id, db=_arm_db(tree))
-                runs.append({"probe": os.path.basename(probe), "arm": arm,
-                             "run_id": run_id, "outcome": outcome, "cost_usd": cost})
-                if arm == "baseline":
-                    before_v.append(outcome)
-                    ids.append(os.path.basename(probe))
-                else:
-                    after_v.append(outcome)
+                last_cost = cost
+                outcome = _run_outcome(run_id, db=_arm_db(base_tree))
+                runs.append({"probe": os.path.basename(probe),
+                             "arm": "baseline", "retry": retry,
+                             "run_id": run_id, "outcome": outcome,
+                             "cost_usd": cost})
+                control_outcomes.append(outcome)
+            if control_unscored:
+                return None
+            # A timeout on retry 0 leaves control_outcomes empty: skip the
+            # probe — the outer probe loop sees stop_sweep=True and breaks,
+            # and n truncates to the probes finished in BOTH arms.
+            if not control_outcomes:
+                break
+            before_v.append(max(control_outcomes))
+            ids.append(os.path.basename(probe))
+            control_solved_per_probe.append(
+                1 if max(control_outcomes) >= 1.0 else 0)
+            # ── Candidate arm: single run on the candidate worktree ────────
+            if spent >= budget or stop_sweep:
+                break
+            target = _materialize_target(probe)
+            if target:
+                temp_targets.append(target)
+            try:
+                _stdout, run_id, cost = _launch_run(
+                    recipe_name, probe, target_cwd=target, root=cand_tree)
+            except ProbeArmTimeout as exc:
+                # No usable outcome for this arm. Record why and stop the
+                # sweep: n truncates to the probes finished in BOTH arms,
+                # so the probes already measured are kept rather than
+                # thrown away with the run that blew the timeout.
+                runs.append({"probe": os.path.basename(probe),
+                             "arm": "candidate", "run_id": "",
+                             "outcome": None, "cost_usd": 0.0,
+                             "timed_out": True, "error": str(exc)})
+                stop_sweep = True
+                break
+            spent += cost
+            outcome = _run_outcome(run_id, db=_arm_db(cand_tree))
+            runs.append({"probe": os.path.basename(probe), "arm": "candidate",
+                         "run_id": run_id, "outcome": outcome,
+                         "cost_usd": cost})
+            after_v.append(outcome)
     finally:
         for _arm, tmp, tree in arms:
             _remove_arm(tmp, tree)
@@ -751,10 +871,12 @@ def probe_score_code(task_class: str, patch_path: str | None, *,
 
     n = min(len(before_v), len(after_v))
     before_v, after_v, ids = before_v[:n], after_v[:n], ids[:n]
+    control_solved_per_probe = control_solved_per_probe[:n]
     if n == 0:
         result = {"before": 0.0, "after": 0.0, "n": 0, "pertask_json": "",
                   "runs": runs, "cost_usd": round(spent, 4),
-                  "truncated_by_budget": True}
+                  "truncated_by_budget": True,
+                  "control_n": control_n, "control_solved": []}
     else:
         result = {
             "before": sum(before_v) / n,
@@ -767,6 +889,8 @@ def probe_score_code(task_class: str, patch_path: str | None, *,
             }),
             "runs": runs,
             "cost_usd": round(spent, 4),
+            "control_n": control_n,
+            "control_solved": control_solved_per_probe,
         }
     _write_null_calibration(patch_path, result)
     return result

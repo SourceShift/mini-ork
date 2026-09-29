@@ -342,7 +342,8 @@ def score_candidate(candidate_id: str, scorer: str | None = None) -> str:
 # apply_evaluate_gate
 # ─────────────────────────────────────────────────────────────────────────────
 def evaluate_gate(candidate_id: str, utility_before: float,
-                  utility_after: float, pertask_json: str = "") -> str:
+                  utility_after: float, pertask_json: str = "",
+                  control_n: int = 1) -> str:
     """Apply the non-regression gate to a candidate with two utility numbers.
 
     Returns a JSON line: {"decision":"promoted"|"quarantined"|"rejected",
@@ -362,6 +363,17 @@ def evaluate_gate(candidate_id: str, utility_before: float,
     exactly the threshold means the candidate is indistinguishable from the
     baseline, and equality is not evidence. The scalar-only path (no vectors)
     keeps the historical ``delta >= dt`` rule.
+
+    ``control_n`` (default 1) records how many unmutated baseline retries were
+    used to build the per-task ``before`` vector: the probe scorer ran the
+    baseline arm that many times per probe task and took the best-of-N as the
+    control outcome. The decision rule requires a STRICT SUPERSET gain over
+    the control — the candidate must solve at least one held-out task the
+    control did not — so credit for solving a probe the control also solved on
+    any retry cannot inflate a promote (G06-T03, arXiv 2607.26117 / 2607.17136).
+    When ``control_n == 1`` the strict-superset check is algebraically
+    equivalent to the existing ``delta > dt`` rule for binary outcomes, so
+    pre-change callers stay byte-identical.
     """
     del candidate_id  # bash accepted it positionally but never used it
     ub = float(utility_before)
@@ -377,11 +389,13 @@ def evaluate_gate(candidate_id: str, utility_before: float,
     # the scalar aggregate rule (byte-identical to the legacy behavior).
     regressed = -1
     regressed_ids = []
+    before: list[int] = []
+    after: list[int] = []
     if pertask_json:
         try:
             pt = json.loads(pertask_json)
-            before = pt.get("before", []) or []
-            after = pt.get("after", []) or []
+            before = [int(v) for v in (pt.get("before", []) or [])]
+            after = [int(v) for v in (pt.get("after", []) or [])]
             ids = pt.get("ids", list(range(min(len(before), len(after)))))
             regressed = 0
             for i in range(min(len(before), len(after))):
@@ -404,6 +418,21 @@ def evaluate_gate(candidate_id: str, utility_before: float,
     # (regressed < 0, no per-task data) keeps its historical delta >= dt rule.
     improved = delta > dt if measured else delta >= dt
 
+    # Strict-superset gain over the CONTROL (G06-T03). The probe scorer's
+    # ``before`` vector IS the control's per-task solved set (max of N control
+    # retries). A candidate is only eligible to promote when it solves a held-
+    # out task the control could not, even with N retries — so run-to-run noise
+    # in the unmutated recipe cannot be credited to the candidate. For
+    # ``control_n == 1`` this is equivalent to the existing ``delta > dt`` rule
+    # on binary outcomes, so pre-change behaviour is preserved exactly.
+    # The check fires ONLY when control_n > 1: with N=1 the rule reduces
+    # algebraically to the legacy delta > dt path and pre-change callers stay
+    # byte-identical (kickoff step 1; G06-T03).
+    control_extends = False
+    if control_n > 1 and measured and len(before) == len(after):
+        control_extends = any(
+            after[i] and not before[i] for i in range(len(before)))
+
     # ── decision rule ───────────────────────────────────────────────────────
     if has_pertask_regression:
         # No-regression gate FIRES: block even when the aggregate improved.
@@ -414,12 +443,29 @@ def evaluate_gate(candidate_id: str, utility_before: float,
                      f"{delta:+.4f} but the candidate regresses solved work{_ids} "
                      f"(2607.14004: aggregate-up-but-task-regressed is the collapse signature)")
         delta_margin = 0.0
+    elif control_n > 1 and measured and not control_extends:
+        # Strict-superset quarantine. Fires even at delta == 0: that is exactly
+        # the failure mode the control arm exists to detect (the candidate's
+        # solved set equals the control's, so there is no real gain — the
+        # "improvement" is run-to-run noise in the unmutated recipe). Skipped
+        # for control_n == 1 so the legacy delta > dt path stays byte-identical
+        # (G06-T03).
+        decision = "quarantined"
+        rationale = (f"no strict-superset gain over the control arm "
+                     f"(control_n={control_n}): candidate's solved set equals or is a "
+                     f"subset of the control's — every held-out task the candidate "
+                     f"solved, the control also solved on at least one of "
+                     f"{control_n} baseline retries, so no measurement evidence "
+                     f"of a real gain (G06-T03)")
+        delta_margin = 0.0
     elif improved:
         decision = "promoted"
         rationale = (f"non-regression cleared: utility_after={ua:.4f} >= "
                      f"utility_before={ub:.4f} (delta={delta:+.4f} >= threshold={dt:+.4f})")
         if regressed == 0:
             rationale += "; 0 per-task regressions"
+        if control_n > 1 and measured:
+            rationale += f"; strict-superset gain over control (control_n={control_n})"
         delta_margin = 0.0
     elif measured:
         # A real held-out measurement ran and it found no gain. Quarantined: there
@@ -458,6 +504,7 @@ def evaluate_gate(candidate_id: str, utility_before: float,
         "min_examples": me,
         "regressed_tasks": regressed,          # -1 = no per-task data (scalar-only path)
         "regression_tolerance": regress_tol,
+        "control_n": int(control_n),
     }
     return json.dumps(result)
 
@@ -887,7 +934,8 @@ def apply_run(task_class: str, target_kind: str, target_name: str,
     else:
         gate_json = evaluate_gate(
             candidate_id, float(utility_before), float(utility_after),
-            pertask_json)
+            pertask_json,
+            control_n=probe_result.get("control_n", 1) if probe_result else 1)
         gate = json.loads(gate_json)
         gate_decision = gate["decision"]
         gate_rationale = gate["rationale"]
@@ -896,6 +944,7 @@ def apply_run(task_class: str, target_kind: str, target_name: str,
             gate_rationale = (f"probe: n={probe_result['n']} "
                               f"before={probe_result['before']:.2f} "
                               f"after={probe_result['after']:.2f} "
+                              f"control_n={probe_result.get('control_n', 1)} "
                               f"cost=${probe_result.get('cost_usd', 0.0):.2f}; "
                               f"{gate_rationale}")
 

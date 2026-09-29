@@ -24,7 +24,6 @@ breaking. Two structural guarantees the bash version could not make:
 
 from __future__ import annotations
 
-import json
 import os
 import signal
 import subprocess
@@ -43,43 +42,6 @@ from .models import DispatchRequest, DispatchResult, TokenUsage
 UsageParser = Callable[[str], TokenUsage]
 CostParser = Callable[[str, TokenUsage], float]
 TextParser = Callable[[str], str]
-
-# Cap on the recorded error text (llm_calls.error_message / DispatchResult.error).
-_ERROR_CAP = 2000
-
-
-def _failure_detail(stdout: str, stderr: str) -> str:
-    """The error to record for a non-zero lane exit.
-
-    A harness CLI in JSON mode (the Claude CLI's ``--output-format json``)
-    reports an API failure in its stdout result envelope —
-    ``{"is_error": true, "api_error_status": 403, "result": "API Error: 403 …"}``
-    — while stderr may carry only an unrelated advisory banner. Recording
-    stderr alone buried the real cause (a capped gateway key) behind that
-    banner. Lead with the envelope's message when there is one; keep the
-    stderr tail after it as supporting context.
-    """
-    envelope = ""
-    try:
-        doc = json.loads(stdout.strip() or "null")
-    except ValueError:
-        doc = None
-    if isinstance(doc, dict) and doc.get("is_error"):
-        message = str(doc.get("result") or doc.get("error") or "").strip()
-        status = doc.get("api_error_status")
-        reason = doc.get("terminal_reason")
-        tag = " ".join(str(x) for x in (reason, status) if x)
-        if message:
-            envelope = f"[{tag}] {message}" if tag else message
-    tail = (stderr or "").strip()
-    if not envelope:
-        return tail[-_ERROR_CAP:]
-    envelope = envelope[:_ERROR_CAP // 2]
-    if not tail:
-        return envelope
-    sep = "\n--- stderr ---\n"
-    room = _ERROR_CAP - len(envelope) - len(sep)
-    return envelope + sep + tail[-room:]
 
 
 def _terminate_process_group(proc: "subprocess.Popen[str]") -> None:
@@ -329,7 +291,7 @@ def dispatch(
             ok=False,
             rc=rc,
             text=stdout,
-            error=_failure_detail(stdout, stderr or ""),
+            error=(stderr or "")[-2000:],
             model=request.model,
             duration_ms=duration_ms,
             session_id=parse_session(stdout) if parse_session else "",
