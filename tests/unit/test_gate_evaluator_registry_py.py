@@ -2,6 +2,10 @@
 import pytest
 
 from mini_ork.gates import gate_registry as gr
+# The exact set is the post-boot registry: gate_bootstrap imports the OCP
+# evaluators (abstain_gate). Without this import the set depends on which other
+# test in the shard happened to import them first (green locally, red in CI).
+from mini_ork.gates import gate_bootstrap  # noqa: F401
 
 
 def test_builtin_gate_types_registered():
