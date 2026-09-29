@@ -663,3 +663,22 @@ def test_code_arm_candidate_writes_collapse_history_row(db, tmp_path, capsys, mo
     assert row["score"] == pytest.approx(1.0)
     assert row["anchor"] == pytest.approx(0.4)
     assert row["directives"] == 0   # code arm — directives count = 0
+
+def test_probe_cap_never_drops_anchor_probes(monkeypatch, tmp_path):
+    """MO_APPLY_PROBE_MAX_TASKS caps gate probes only: an anchor that sorts
+    after the capped gate probes must still be loaded (2026-09-29 live smoke:
+    probe-3 anchor was dropped under the default cap of 2)."""
+    from mini_ork.learning import probe_scorer as ps
+
+    probes = tmp_path / "probes"
+    probes.mkdir()
+    (probes / "probe-1.md").write_text("# p1\n")
+    (probes / "probe-2.md").write_text("# p2\n")
+    (probes / "probe-3.md").write_text("---\nanchor: true\n---\n# p3\n")
+    monkeypatch.setattr(ps, "_recipe_dir", lambda task_class: str(tmp_path))
+    monkeypatch.setenv("MO_APPLY_PROBE_MAX_TASKS", "2")
+    got = [(p.rsplit("/", 1)[-1], a) for p, a in ps._load_probes("code_fix")]
+    assert got == [("probe-1.md", False), ("probe-2.md", False), ("probe-3.md", True)]
+    monkeypatch.setenv("MO_APPLY_PROBE_MAX_TASKS", "1")
+    got = [(p.rsplit("/", 1)[-1], a) for p, a in ps._load_probes("code_fix")]
+    assert got == [("probe-1.md", False), ("probe-3.md", True)]

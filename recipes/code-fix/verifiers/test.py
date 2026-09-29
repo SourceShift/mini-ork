@@ -35,6 +35,7 @@
 #   MO_TEST_BASELINE     set to 0 to disable baseline (revert to absolute gating)
 #   MO_CODEFIX_REPLAY    set to 0 to disable the delta-gate replay (default ON)
 
+from __future__ import annotations
 import json
 import os
 import re

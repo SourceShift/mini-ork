@@ -732,3 +732,20 @@ def test_materialize_mutation_source_ref_stable_across_calls(tmp_path):
     _, ref2 = ho.materialize_mutation(proposal, str(recipe_dir),
                                       node="implementer")
     assert ref1 == ref2
+
+
+def test_cli_resolves_harness_target_to_prompt_file(monkeypatch, tmp_path):
+    """`mini-ork apply --target harness.<recipe>.<node>` must hand apply_run the
+    node's prompt FILE, not the dotted target string (the live smoke on
+    2026-09-29 found the CLI passed the raw string, so the probe scorer
+    measured nothing)."""
+    from mini_ork.cli import apply as ap
+
+    seen = {}
+    monkeypatch.setattr(ap, "apply_run",
+                        lambda tc, kind, name, tfile, db=None: seen.update(name=name, tfile=tfile) or 0)
+    monkeypatch.setenv("MINI_ORK_HOME", str(tmp_path))
+    rc = ap.main(["--task-class", "code_fix", "--target", "harness.code-fix.implementer", "--dry-run"])
+    assert rc == 0
+    assert seen["name"] == "harness.code-fix.implementer"
+    assert seen["tfile"].endswith("recipes/code-fix/prompts/implementer.md")

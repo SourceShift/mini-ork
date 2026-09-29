@@ -106,8 +106,11 @@ def _load_probes(task_class: str) -> list[tuple[str, bool]]:
     only gains on an anchor probe cannot game its way past the gate. Anchors
     are still run for both arms (control + candidate) like any probe; their
     outcome is reported as ``anchor_solved_frac`` for the candidate arm
-    (kickoff rule #1). Cap is applied to the combined list so a probe set
-    dominated by anchors does not crowd out gate probes silently.
+    (kickoff rule #1). ``MO_APPLY_PROBE_MAX_TASKS`` caps the GATE probes
+    only; every anchor probe is always kept. Capping the combined, name-sorted
+    list silently dropped the anchor (probe-3 sorts after probe-1/2 under the
+    default cap of 2), so ``anchor_solved_frac`` was never measured and
+    ``collapse_history`` never written — found by the 2026-09-29 live smoke.
     """
     recipe = _recipe_dir(task_class)
     if not recipe:
@@ -128,7 +131,9 @@ def _load_probes(task_class: str) -> list[tuple[str, bool]]:
         cap = max(1, int(os.environ.get("MO_APPLY_PROBE_MAX_TASKS", "2")))
     except ValueError:
         cap = 2
-    return pairs[:cap]
+    gate = [pr for pr in pairs if not pr[1]][:cap]
+    anchors = [pr for pr in pairs if pr[1]]
+    return gate + anchors
 
 
 def _probe_fixture(probe_path: str) -> str | None:

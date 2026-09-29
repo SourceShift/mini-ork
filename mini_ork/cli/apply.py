@@ -1498,7 +1498,16 @@ def main(argv: list[str] | None = None) -> int:
     sys.stdout.write(f"    dry_run:    {os.environ.get('MO_APPLY_DRY_RUN', '0')}\n")
     sys.stdout.write("\n")
 
-    return apply_run(task_class, target_kind, target_name, target, db=db)
+    target_file = target
+    if target_name.startswith("harness."):
+        # A harness target names a recipe node, not a file: resolve it to the
+        # node's prompt exactly as auto_sweep does, or the probe scorer gets an
+        # unresolvable path and measures nothing (quarantine by default).
+        target_file = _prompt_file_for(_recipe_dir_for(task_class), target_name)
+        if not target_file:
+            sys.stderr.write(f"apply: {target_name}: no prompt file in recipe\n")
+            return 2
+    return apply_run(task_class, target_kind, target_name, target_file, db=db)
 
 
 if __name__ == "__main__":
