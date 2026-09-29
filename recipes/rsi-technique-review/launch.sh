@@ -47,6 +47,9 @@ export ARXIV_API_TOKEN
 export MINI_ORK_RUN_ID="$RUN_ID"
 export MINI_ORK_PROVIDERS="$RUN_DIR/config/providers.yaml"
 export MINI_ORK_COLLECTION_PLAN="${MINI_ORK_COLLECTION_PLAN:-$PWD/recipes/rsi-technique-review/collection-plan.json}"
+# LibWit hybrid batch search is slow; 32-query batches timed out at the 45s default.
+export MINI_ORK_LIBWIT_REQUEST_TIMEOUT_SEC="${MINI_ORK_LIBWIT_REQUEST_TIMEOUT_SEC:-900}"
+export MINI_ORK_LIBWIT_BATCH_LIMIT="${MINI_ORK_LIBWIT_BATCH_LIMIT:-8}"
 export MINI_ORK_RESEARCH_MIN_SOURCES="${MINI_ORK_RESEARCH_MIN_SOURCES:-1900}"
 export MO_ROUTING_POLICY=static_hybrid     # every researcher node is recipe-pinned
 export MO_CHEAP_LANE=minimax_lens
