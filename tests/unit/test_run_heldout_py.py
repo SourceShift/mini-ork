@@ -547,3 +547,22 @@ def test_every_solve_keeps_its_patch_even_when_graded_false(tmp_path):
     patch = (tmp_path / "results.patches" / f"{first_task['id']}.patch").read_text()
     assert "+# touched" in patch and "brand_new.py" in patch
     assert "test_add" not in patch  # hidden tests were NOT in the tree yet
+
+
+def test_a_committed_fix_is_still_captured(tmp_path):
+    """mini-ork's publisher commits an approved fix in the scratch; a diff
+    against HEAD was then empty and the replay set lost every shipped solve."""
+    h = _mk_history(tmp_path)
+    manifest_path, first_task = _mk_minimal_manifest(tmp_path, h)
+    out = tmp_path / "results.json"
+    code = ("import os,subprocess;s=os.environ['SCRATCH'];"
+            "open(os.path.join(s,'calc.py'),'a').write('# committed fix\\n');"
+            "g=lambda *a: subprocess.run(['git','-C',s,*a],check=True,capture_output=True);"
+            "g('-c','user.email=t@t','-c','user.name=t','commit','-qam','publish')")
+    solver = " ".join(shlex.quote(t) for t in [sys.executable, "-c", code])
+
+    r.main(["--manifest", str(manifest_path), "--repo", h["repo"], "--out", str(out),
+            "--python", sys.executable, "--timeout", "120", "--solver-cmd", solver])
+
+    patch = (tmp_path / "results.patches" / f"{first_task['id']}.patch").read_text()
+    assert "+# committed fix" in patch

@@ -228,11 +228,16 @@ def grade(scratch: Path, task: dict, python: str, timeout: int) -> dict[str, Any
 # ── per-task orchestration ──────────────────────────────────────────────────
 
 
-def _solver_patch(scratch: Path) -> str:
-    """Everything the solver changed relative to the base (HEAD), including
-    new files. Captured BEFORE grading restores the hidden tests."""
+def _solver_patch(scratch: Path, base_sha: str) -> str:
+    """Everything the solver changed relative to the task's BASE commit,
+    including new files. Captured BEFORE grading restores the hidden tests.
+
+    Diffing against HEAD lost every fix mini-ork approved: its publisher
+    COMMITS the change in the scratch, so HEAD moves and `diff HEAD` is empty
+    (all 26 approved solves of the 2026-09-29 baseline).
+    """
     _git(scratch, "add", "-A", "-N", check=False)  # intent-to-add: untracked show in diff
-    return _git(scratch, "diff", "--binary", "--no-renames", "HEAD", check=False)
+    return _git(scratch, "diff", "--binary", "--no-renames", base_sha, check=False)
 
 
 def _run_task(
@@ -274,7 +279,8 @@ def _run_task(
         # scripts/verifier_replay.py replays these for $0.
         if patches_dir is not None:
             patches_dir.mkdir(parents=True, exist_ok=True)
-            (patches_dir / f"{task['id']}.patch").write_text(_solver_patch(scratch))
+            (patches_dir / f"{task['id']}.patch").write_text(
+                _solver_patch(scratch, task["base_sha"]))
 
         row = grade(scratch, task, python, timeout)
         row["cost_usd"] = cost
