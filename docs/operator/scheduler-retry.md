@@ -40,12 +40,12 @@ mini-ork epics show <id>                       # now lists every attempt
 Roadmaps can carry the settings under an epic's heading; `epics ingest` applies them:
 
 ```markdown
-## Shop listing sync (id: shop-s1)
-- recipe: libwit-shop-rsi
+## Data import (id: import-1)
+- recipe: my-rsi
 - max attempts: 3
 
-## Checkout (id: shop-s8)
-- depends on: shop-s1
+## Reporting (id: report-1)
+- depends on: import-1
 ```
 
 ## Example: an RSI campaign over many epics
@@ -63,7 +63,7 @@ mini-ork scheduler            # run under tmux/launchd, not inside an agent turn
 
 ```bash
 #!/usr/bin/env bash
-curl -sf localhost:7825/api/health >/dev/null || { echo "BE down"; exit 75; }
+curl -sf "$APP_HEALTH_URL" >/dev/null || { echo "app down"; exit 75; }
 git -C "$TARGET" fetch -q origin main && git -C "$TARGET" rebase -q origin/main \
   || { echo "rebase conflict"; exit 1; }
 ```

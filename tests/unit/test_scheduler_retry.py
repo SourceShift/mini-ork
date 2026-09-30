@@ -262,9 +262,9 @@ def test_retry_refuses_active_epics(world):
 
 def test_roadmap_settings_are_ingested(world, tmp_path):
     roadmap = tmp_path / "roadmap.md"
-    roadmap.write_text("## Shop listing sync (id: shop-s1)\n- recipe: libwit-shop-rsi\n- max attempts: 3\n"
-                       "\n## Checkout (id: shop-s8)\n- depends on: shop-s1\n", encoding="utf-8")
+    roadmap.write_text("## Data import (id: import-1)\n- recipe: my-rsi\n- max attempts: 3\n"
+                       "\n## Reporting (id: report-1)\n- depends on: import-1\n", encoding="utf-8")
     assert epics.main(["ingest", str(roadmap)], db=world["db"]) == 0
-    s1 = _row(world["db"], "shop-s1")
-    assert (s1["recipe"], s1["max_attempts"]) == ("libwit-shop-rsi", 3)
-    assert _row(world["db"], "shop-s8")["recipe"] is None
+    s1 = _row(world["db"], "import-1")
+    assert (s1["recipe"], s1["max_attempts"]) == ("my-rsi", 3)
+    assert _row(world["db"], "report-1")["recipe"] is None
