@@ -40,7 +40,10 @@ _USAGE = """Usage: mini-ork epics <subcommand> [args]
                                (overrides MO_SCHED_MAX_ATTEMPTS).
   retry <epic_id> [--reset-attempts]
                                Put an escalated or held ('blocked' with a
-                               held_reason) epic back in the queue.
+                               held_reason) epic back in the queue. Without
+                               --reset-attempts it gets one attempt past its
+                               cap; with it, a fresh cycle of max_attempts.
+                               Attempt history is kept either way.
 
 Roadmap per-epic settings (under an epic's heading, applied by ingest):
   - recipe: <name>
@@ -133,8 +136,12 @@ def ingest(roadmap: str, db: str) -> int:
         for line in e["body"]:
             for key, rgx in _SETTING_RES.items():
                 m = rgx.match(line)
-                if m:
-                    settings[key] = m.group(1)
+                if not m:
+                    continue
+                if key == "max_attempts" and int(m.group(1)) < 1:
+                    sys.stderr.write(f"WARNING: ingest: \"{e['id']}\": max attempts must be >= 1; ignored\n")
+                    continue
+                settings[key] = m.group(1)
         if settings:
             _apply_settings(con, e["id"], settings)
         for line in e["body"]:
@@ -184,15 +191,18 @@ def _apply_settings(con, epic_id: str, settings: dict) -> None:
         con.execute("UPDATE epics SET max_attempts=? WHERE id=?", (int(settings["max_attempts"]), epic_id))
 
 
-def _set(epic_id: str, rest: list[str], db: str) -> int:
+def _set(epic_id: str, rest: list[str], db: str, root: str) -> int:
     settings = {}
     i = 0
     while i < len(rest):
         flag = rest[i]
         if flag in ("--recipe", "--max-attempts") and i + 1 < len(rest):
             key = "recipe" if flag == "--recipe" else "max_attempts"
-            if key == "max_attempts" and not rest[i + 1].isdigit():
+            if key == "max_attempts" and not (rest[i + 1].isdigit() and int(rest[i + 1]) >= 1):
                 sys.stderr.write("--max-attempts needs a positive integer\n"); return 2
+            if key == "recipe" and not os.path.isdir(os.path.join(root, "recipes", rest[i + 1])):
+                sys.stderr.write(f"WARNING: recipe '{rest[i + 1]}' not found under {root}/recipes — "
+                                 "the scheduler's attempts at this epic fail until it exists\n")
             settings[key] = rest[i + 1]; i += 2
         else:
             sys.stderr.write(f"set: unknown or incomplete flag {flag}\n"); return 2
@@ -212,6 +222,10 @@ def _set(epic_id: str, rest: list[str], db: str) -> int:
 
 
 def _retry(epic_id: str, rest: list[str], db: str) -> int:
+    unknown = [a for a in rest if a != "--reset-attempts"]
+    if unknown:
+        sys.stderr.write(f"retry: unknown argument(s) {' '.join(unknown)} (only --reset-attempts)\n")
+        return 2
     _ensure_retry_schema(db)
     con = sqlite3.connect(db)
     try:
@@ -367,7 +381,7 @@ def main(argv: list[str] | None = None, *, db: str | None = None, root: str | No
             sys.stderr.write("epic_id required\n"); return 2
         return _priority(rest[0], rest[1] if len(rest) > 1 else None, db)
     if sub == "set":
-        return _set(rest[0], rest[1:], db) if rest else (sys.stderr.write("epic_id required\n") or 2)
+        return _set(rest[0], rest[1:], db, root) if rest else (sys.stderr.write("epic_id required\n") or 2)
     if sub == "retry":
         return _retry(rest[0], rest[1:], db) if rest else (sys.stderr.write("epic_id required\n") or 2)
     if sub in ("help", "--help", "-h"):
