@@ -29,7 +29,7 @@ from mini_ork.context import (
     publish_env,
     run_context_scope,
 )
-from mini_ork.dispatch import config_resolve, deadline_budget
+from mini_ork.dispatch import agents_config, config_resolve, deadline_budget
 from mini_ork.vcs import repo_integrity_guard
 from mini_ork.gates import rubric_prescreen
 
@@ -127,7 +127,7 @@ Environment:
   MINI_ORK_HOME   project home dir  (default: .mini-ork/)
   MINI_ORK_DB     sqlite3 state db  (default: $MINI_ORK_HOME/state.db)
   MINI_ORK_PROVIDERS  path to providers.yaml, overriding $MINI_ORK_HOME/config/
-  MINI_ORK_AGENTS     path to agents.yaml,    overriding $MINI_ORK_HOME/config/
+  MINI_ORK_AGENTS     personal lane overlay merged over $MINI_ORK_HOME/config/agents.yaml (default: config/agents.local.yaml)
   MINI_ORK_DRY_RUN  set to 1 for dry-run mode on all subcommands
 """
 
@@ -646,11 +646,13 @@ def _run_lifecycle_impl(argv, root, sink) -> int:
         return 0
 
     # ── profile ──
-    # MINI_ORK_AGENTS mirrors MINI_ORK_PROVIDERS (dispatch/providers.py): a path
-    # to the consumer's own lane policy, so a vendored checkout need not be
-    # edited — and therefore reverted on every re-vendor — to be configured.
-    agents_path = os.environ.get("MINI_ORK_AGENTS") or os.path.join(
-        home, "config", "agents.yaml")
+    # MINI_ORK_AGENTS now feeds the overlay resolver
+    # (dispatch/agents_config.effective_path): the env var still points at
+    # the user's overlay file; the resolver merges it over the team template
+    # and materialises the effective policy. With no overlay present the
+    # resolved path is byte-equivalent to the prior "home/config/agents.yaml".
+    agents_path = agents_config.overlay_or(
+        os.path.join(home, "config", "agents.yaml"), home=home)
     data = gen_profile(kickoff, root, recipe, task_class, profile_path, agents_path,
                        recipe_base=rbase)
     sys.stdout.write(f"profile_path={profile_path}\n")

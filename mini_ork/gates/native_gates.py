@@ -51,6 +51,8 @@ import json
 import os
 from typing import Callable, Optional
 
+from mini_ork.dispatch import agents_config
+
 __all__ = [
     "NATIVE_GATE_EVALUATORS",
     "NATIVE_SENTINEL_PREFIX",
@@ -113,10 +115,17 @@ def _eval_coalition(
         # bash measures ρ via lib/topology_metrics.sh::measure_rho; the
         # native port lives in observability/topology_metrics.py.
         rho = topology_metrics.measure_rho(db_path, panel_run_id)
+        # ``MINI_ORK_AGENTS`` is now consumed by the overlay resolver
+        # (``agents_config.effective_path``) so the env var keeps its
+        # historical role as "point at my overlay file"; with no overlay
+        # the resolver falls back to the tracked template byte-equivalent
+        # to the prior ``os.environ.get('MINI_ORK_AGENTS') or <root>`` branch.
+        # mini_ork_root is the ENGINE root, not the user's home: the personal
+        # overlay always comes from $MINI_ORK_HOME.
         root = mini_ork_root or os.environ.get("MINI_ORK_ROOT", "")
-        agents_yaml = os.environ.get("MINI_ORK_AGENTS") or (
-            os.path.join(root, "config", "agents.yaml") if root else None
-        )
+        agents_yaml = agents_config.overlay_or(
+            os.path.join(root, "config", "agents.yaml") if root else None,
+            root=root or None)
         payload, _rc = coalition_gate.check_panel_coalition(
             panel_run_id, recipe, rho=rho, db=db_path, agents_yaml=agents_yaml
         )

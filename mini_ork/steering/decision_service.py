@@ -27,7 +27,7 @@ import sqlite3
 
 from mini_ork import lane_router
 from mini_ork.context import context_env
-from mini_ork.dispatch import calibration
+from mini_ork.dispatch import agents_config, calibration
 
 LANE_TO_FAMILY = {
     "sonnet": "anthropic", "opus": "anthropic",
@@ -51,20 +51,21 @@ def _db_path(db: str | None) -> str:
 
 
 def resolve_agents_yaml() -> str:
-    """Run-dir-first agents.yaml path (T1.0 precedence), mirrors
-    mo_resolve_agents_yaml: $MINI_ORK_RUN_DIR/config -> $MINI_ORK_HOME/config
-    -> $MINI_ORK_ROOT/config. Always returns a path."""
+    """Run-dir-first agents.yaml path (T1.0 precedence) merged with the user's
+    personal overlay via ``agents_config.effective_path()``.
+
+    Mirrors the bash twin: ``$MINI_ORK_RUN_DIR/config/agents.yaml`` wins when
+    present (a re-entrant run reads its FROZEN launch-time policy); else the
+    merged template+overlay at ``<home>/config/.agents.effective.yaml`` —
+    or, with no overlay, the tracked template path byte-equivalent to the
+    prior HOME/ROOT fallback. Always returns a path.
+    """
     run_dir = context_env("MINI_ORK_RUN_DIR", "")
     if run_dir:
         cand = os.path.join(run_dir, "config", "agents.yaml")
         if os.path.isfile(cand):
             return cand
-    cand = os.path.join(os.environ.get("MINI_ORK_HOME") or ".mini-ork",
-                        "config", "agents.yaml")
-    if not os.path.isfile(cand):
-        cand = os.path.join(os.environ.get("MINI_ORK_ROOT") or ".",
-                            "config", "agents.yaml")
-    return cand
+    return agents_config.effective_path()
 
 
 def _load_lanes(agents_yaml: str) -> dict[str, str]:

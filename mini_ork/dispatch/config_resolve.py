@@ -25,15 +25,20 @@ from __future__ import annotations
 
 import os
 import shutil
+import sys
 from pathlib import Path
+
+from mini_ork.dispatch import agents_config
 
 
 def resolve_agents_yaml() -> None:
     """Echo the EFFECTIVE agents.yaml path, run-dir first.
 
     Precedence: ``$MINI_ORK_RUN_DIR/config/agents.yaml`` →
-    ``$MINI_ORK_HOME/config/agents.yaml`` (default ``.mini-ork``) →
-    ``$MINI_ORK_ROOT/config/agents.yaml`` (default ``.``).
+    ``agents_config.effective_path()`` (the merged template + personal
+    overlay at ``<home>/config/.agents.effective.yaml`` when an overlay
+    exists, otherwise the tracked template path). With NO overlay the
+    effective path is byte-equivalent to the prior HOME/ROOT fallback.
 
     Always echoes a non-empty path. Callers ``[ -f ]``-guard the
     "not configured" case. Prints ``path + "\\n"`` to stdout, mirroring
@@ -51,23 +56,19 @@ def resolve_agents_yaml() -> None:
             print(candidate)
             return
 
-    home = os.environ.get("MINI_ORK_HOME") or ".mini-ork"
-    candidate = os.path.join(home, "config", "agents.yaml")
-    if not Path(candidate).is_file():
-        root = os.environ.get("MINI_ORK_ROOT") or "."
-        candidate = os.path.join(root, "config", "agents.yaml")
-
-    print(candidate)
+    print(agents_config.effective_path())
 
 
 def snapshot_run_config(run_dir: str | None = None) -> bool:
-    """Freeze the effective global agents.yaml into ``run_dir/config/``.
+    """Freeze the EFFECTIVE agents.yaml (merged template + overlay) into
+    ``run_dir/config/``.
 
     Idempotent: never overwrites an existing snapshot, so a re-entrant
     execute keeps the launch-time policy. Best-effort: any failure
     returns ``True`` (the resolvers fall back to the global file) so
-    it can never break a run. Source is the global home-or-root file,
-    NEVER a run-dir (to avoid a snapshot freezing itself on re-entry).
+    it can never break a run. Source is the merged effective file
+    produced by ``agents_config`` — NOT the raw template — so a run
+    freezes the USER's merged policy, not the team's default.
     """
     rd = run_dir if run_dir is not None else os.environ.get("MINI_ORK_RUN_DIR", "")
     if not rd:
@@ -77,11 +78,13 @@ def snapshot_run_config(run_dir: str | None = None) -> bool:
     if Path(dest).is_file():
         return True  # already frozen — keep launch-time policy
 
-    home = os.environ.get("MINI_ORK_HOME") or ".mini-ork"
-    src = os.path.join(home, "config", "agents.yaml")
-    if not Path(src).is_file():
-        root = os.environ.get("MINI_ORK_ROOT") or "."
-        src = os.path.join(root, "config", "agents.yaml")
+    try:
+        src = agents_config.effective_path()
+    except ValueError as exc:
+        # Never break the run from here, but never hide the user's own
+        # mistake either: the dispatch-time resolvers raise the same error.
+        print(f"mini-ork: lane config: {exc}", file=sys.stderr)
+        return True
     if not Path(src).is_file():
         return True  # nothing to snapshot
 

@@ -16,6 +16,8 @@ try:
 except ImportError:  # PyYAML is an optional dep; degrade gracefully
     yaml = None  # type: ignore[assignment]
 
+from mini_ork.dispatch import agents_config
+
 
 def mini_ork_root() -> Path:
     env = os.environ.get("MINI_ORK_ROOT")
@@ -47,15 +49,20 @@ def load_recipe(name: str) -> dict[str, Any]:
 def load_lanes(home: Path | None = None) -> dict[str, str]:
     """lane_name → family (e.g. opus_lens → opus, planner → deepseek).
 
-    Mirrors lib/llm-dispatch.sh resolution: the workspace's own
-    $MINI_ORK_HOME/config/agents.yaml wins wholesale when present
-    (per-project lane overrides), else the repo's config/agents.yaml.
+    Routes through ``agents_config.effective_path(home)`` so the per-user
+    overlay (``$MINI_ORK_AGENTS`` or ``<home>/config/agents.local.yaml``)
+    is recursively merged over the team template before lane extraction.
+    With no overlay present the resolved path is byte-equivalent to the
+    pre-overlay wholesale-replace behaviour.
     """
-    cfg_path = mini_ork_root() / "config" / "agents.yaml"
-    if home is not None:
-        override = Path(home) / "config" / "agents.yaml"
-        if override.exists():
-            cfg_path = override
+    home_str = str(home) if home is not None else None
+    try:
+        cfg_path = Path(agents_config.effective_path(home=home_str))
+    except ValueError:
+        # Malformed overlay — fall back to the tracked template so the UI
+        # never crashes on a user typo. The dispatch path will still raise
+        # so the user sees their mistake.
+        cfg_path = Path(agents_config.template_path(home=home_str))
     cfg = _safe_load(cfg_path)
     lanes = (cfg.get("lanes") or {}) if isinstance(cfg, dict) else {}
     return {str(k): str(v) for k, v in lanes.items()}

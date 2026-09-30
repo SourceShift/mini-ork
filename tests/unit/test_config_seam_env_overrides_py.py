@@ -80,7 +80,15 @@ def test_coalition_gate_reads_the_agents_override(tmp_path, monkeypatch):
         return {"verdict": "panel_diverse"}, 0
 
     monkeypatch.setattr(coalition_gate, "check_panel_coalition", fake_check)
-    monkeypatch.setenv("MINI_ORK_AGENTS", "/vendor/agents.yaml")
+    # MINI_ORK_AGENTS is a personal OVERLAY merged over the template (it used
+    # to replace the whole file); the gate reads the merged effective file.
+    home = tmp_path / "home"
+    (home / "config").mkdir(parents=True)
+    overlay = tmp_path / "vendor" / "agents.yaml"
+    overlay.parent.mkdir()
+    overlay.write_text("lanes:\n  reviewer: kimi\n", encoding="utf-8")
+    monkeypatch.setenv("MINI_ORK_HOME", str(home))
+    monkeypatch.setenv("MINI_ORK_AGENTS", str(overlay))
 
     verdict = ng._eval_coalition(
         "native:coalition",
@@ -90,7 +98,8 @@ def test_coalition_gate_reads_the_agents_override(tmp_path, monkeypatch):
     )
 
     assert verdict == "pass"
-    assert seen["agents_yaml"] == "/vendor/agents.yaml"
+    assert seen["agents_yaml"] == str(home / "config" / ".agents.effective.yaml")
+    assert "reviewer: kimi" in open(seen["agents_yaml"], encoding="utf-8").read()
 
 
 def test_coalition_gate_defaults_to_the_root_config(tmp_path, monkeypatch):
@@ -158,10 +167,17 @@ def _profile_agents_path(monkeypatch, tmp_path) -> str:
 
 
 def test_profile_reads_the_agents_override(monkeypatch, tmp_path):
+    """MINI_ORK_AGENTS is a personal overlay: the profile step reads the
+    merged effective file, which carries the overlay's lanes."""
     override = tmp_path / "vendor" / "agents.yaml"
+    override.parent.mkdir()
+    override.write_text("lanes:\n  implementer: kimi\n", encoding="utf-8")
     monkeypatch.setenv("MINI_ORK_AGENTS", str(override))
 
-    assert _profile_agents_path(monkeypatch, tmp_path) == str(override)
+    path = _profile_agents_path(monkeypatch, tmp_path)
+
+    assert path == str(tmp_path / "home" / "config" / ".agents.effective.yaml")
+    assert "implementer: kimi" in open(path, encoding="utf-8").read()
 
 
 def test_profile_defaults_to_the_home_config(monkeypatch, tmp_path):
