@@ -34,7 +34,26 @@ _USAGE = """Usage: mini-ork epics <subcommand> [args]
                                scheduler computes effective priority at
                                dispatch time as the max of self + blocked
                                waiters (priority inheritance, Track B5).
+  set <epic_id> [--recipe R] [--max-attempts N]
+                               Per-epic scheduler settings: the recipe to run
+                               (overrides MO_SCHED_RECIPE) and the retry cap
+                               (overrides MO_SCHED_MAX_ATTEMPTS).
+  retry <epic_id> [--reset-attempts]
+                               Put an escalated or held ('blocked' with a
+                               held_reason) epic back in the queue. Without
+                               --reset-attempts it gets one attempt past its
+                               cap; with it, a fresh cycle of max_attempts.
+                               Attempt history is kept either way.
+
+Roadmap per-epic settings (under an epic's heading, applied by ingest):
+  - recipe: <name>
+  - max attempts: <N>
 """
+
+_SETTING_RES = {
+    "recipe": re.compile(r"^\s*(?:-\s+)?recipe\s*:\s*`?([\w.-]+)`?\s*$", re.I),
+    "max_attempts": re.compile(r"^\s*(?:-\s+)?max[ _-]attempts\s*:\s*(\d+)\s*$", re.I),
+}
 
 _EPIC_RE = re.compile(r"^##\s+(.+?)\s*(?:\(id:\s*([\w.-]+)\))?\s*(?:\((no-epic|context|ignore)\))?\s*$", re.I)
 _DEP_RES = {
@@ -87,6 +106,7 @@ def ingest(roadmap: str, db: str) -> int:
     epics = _parse_epics(Path(roadmap).read_text(encoding="utf-8", errors="replace"))
     if not epics:
         sys.stderr.write("ingest: no '## <title>' headings found\n"); return 1
+    _ensure_retry_schema(db)  # before `con` opens its write transaction
     con = sqlite3.connect(db); con.execute("PRAGMA busy_timeout=5000")
     parsed_epic_ids = {e["id"] for e in epics}
     existing_epic_ids = {row[0] for row in con.execute("SELECT id FROM epics").fetchall()}
@@ -112,6 +132,18 @@ def ingest(roadmap: str, db: str) -> int:
             con.execute("INSERT INTO epics(id, title, status) VALUES(?,?,'not started')",
                         (e["id"], e["title"][:200]))
             inserted += 1
+        settings = {}
+        for line in e["body"]:
+            for key, rgx in _SETTING_RES.items():
+                m = rgx.match(line)
+                if not m:
+                    continue
+                if key == "max_attempts" and int(m.group(1)) < 1:
+                    sys.stderr.write(f"WARNING: ingest: \"{e['id']}\": max attempts must be >= 1; ignored\n")
+                    continue
+                settings[key] = m.group(1)
+        if settings:
+            _apply_settings(con, e["id"], settings)
         for line in e["body"]:
             for kind, rgx in _DEP_RES.items():
                 m = rgx.match(line)
@@ -142,6 +174,75 @@ def ingest(roadmap: str, db: str) -> int:
     con.commit(); con.close()
     sys.stdout.write(
         f"ingest: {inserted} new epic(s), {dep_count} dep edge(s) processed, {skipped} dep(s) skipped (unresolved)\n")
+    return 0
+
+
+def _ensure_retry_schema(db: str) -> None:
+    from mini_ork import scheduler  # local import: scheduler owns the retry schema
+    scheduler.ensure_retry_schema(db)
+
+
+def _apply_settings(con, epic_id: str, settings: dict) -> None:
+    """Callers ensure the retry schema BEFORE opening `con`: altering the table
+    from a second connection while `con` holds a write transaction deadlocks."""
+    if "recipe" in settings:
+        con.execute("UPDATE epics SET recipe=? WHERE id=?", (settings["recipe"], epic_id))
+    if "max_attempts" in settings:
+        con.execute("UPDATE epics SET max_attempts=? WHERE id=?", (int(settings["max_attempts"]), epic_id))
+
+
+def _set(epic_id: str, rest: list[str], db: str, root: str) -> int:
+    settings = {}
+    i = 0
+    while i < len(rest):
+        flag = rest[i]
+        if flag in ("--recipe", "--max-attempts") and i + 1 < len(rest):
+            key = "recipe" if flag == "--recipe" else "max_attempts"
+            if key == "max_attempts" and not (rest[i + 1].isdigit() and int(rest[i + 1]) >= 1):
+                sys.stderr.write("--max-attempts needs a positive integer\n"); return 2
+            if key == "recipe" and not os.path.isdir(os.path.join(root, "recipes", rest[i + 1])):
+                sys.stderr.write(f"WARNING: recipe '{rest[i + 1]}' not found under {root}/recipes — "
+                                 "the scheduler's attempts at this epic fail until it exists\n")
+            settings[key] = rest[i + 1]; i += 2
+        else:
+            sys.stderr.write(f"set: unknown or incomplete flag {flag}\n"); return 2
+    if not settings:
+        sys.stderr.write("set: nothing to set (use --recipe and/or --max-attempts)\n"); return 2
+    _ensure_retry_schema(db)
+    con = sqlite3.connect(db)
+    try:
+        if not con.execute("SELECT 1 FROM epics WHERE id=?", (epic_id,)).fetchone():
+            sys.stderr.write(f"unknown epic: {epic_id}\n"); return 1
+        _apply_settings(con, epic_id, settings)
+        con.commit()
+    finally:
+        con.close()
+    sys.stdout.write(f"{epic_id}: " + ", ".join(f"{k}={v}" for k, v in settings.items()) + "\n")
+    return 0
+
+
+def _retry(epic_id: str, rest: list[str], db: str) -> int:
+    unknown = [a for a in rest if a != "--reset-attempts"]
+    if unknown:
+        sys.stderr.write(f"retry: unknown argument(s) {' '.join(unknown)} (only --reset-attempts)\n")
+        return 2
+    _ensure_retry_schema(db)
+    con = sqlite3.connect(db)
+    try:
+        row = con.execute("SELECT status, held_reason FROM epics WHERE id=?", (epic_id,)).fetchone()
+        if not row:
+            sys.stderr.write(f"unknown epic: {epic_id}\n"); return 1
+        status, held = row
+        if status not in ("escalated", "blocked") or (status == "blocked" and not held):
+            sys.stderr.write(f"{epic_id} is '{status}' — only escalated or held epics can be retried\n")
+            return 1
+        reset = "--reset-attempts" in rest
+        con.execute("UPDATE epics SET status='not started', held_reason=NULL"
+                    + (", attempts=0" if reset else "") + " WHERE id=?", (epic_id,))
+        con.commit()
+    finally:
+        con.close()
+    sys.stdout.write(f"{epic_id}: back in the queue" + (" (attempts reset)" if reset else "") + "\n")
     return 0
 
 
@@ -279,6 +380,10 @@ def main(argv: list[str] | None = None, *, db: str | None = None, root: str | No
         if not rest:
             sys.stderr.write("epic_id required\n"); return 2
         return _priority(rest[0], rest[1] if len(rest) > 1 else None, db)
+    if sub == "set":
+        return _set(rest[0], rest[1:], db, root) if rest else (sys.stderr.write("epic_id required\n") or 2)
+    if sub == "retry":
+        return _retry(rest[0], rest[1:], db) if rest else (sys.stderr.write("epic_id required\n") or 2)
     if sub in ("help", "--help", "-h"):
         sys.stdout.write(_USAGE); return 0
     sys.stderr.write(f"Unknown subcommand: {sub}\n"); sys.stdout.write(_USAGE); return 2
@@ -296,7 +401,24 @@ def _show(epic_id: str, db: str) -> int:
                            "WHERE to_epic_id=? ORDER BY kind", (epic_id,)).fetchall()
     outgoing = con.execute("SELECT to_epic_id, kind, resolved_at FROM epic_dependencies "
                            "WHERE from_epic_id=? ORDER BY kind", (epic_id,)).fetchall()
+    attempts = []
+    try:
+        extra = con.execute("SELECT recipe, max_attempts, attempts, held_reason FROM epics WHERE id=?",
+                            (epic_id,)).fetchone()
+        if extra:
+            for k, v in zip(("recipe", "max_attempts", "attempts", "held_reason"), extra):
+                if v not in (None, ""):
+                    sys.stdout.write(f"{k} = {v}\n")
+        attempts = con.execute("SELECT attempt, outcome, verdict, run_id, reason FROM epic_attempts "
+                               "WHERE epic_id=? ORDER BY attempt", (epic_id,)).fetchall()
+    except sqlite3.OperationalError:
+        pass  # retry schema not created yet: nothing to show
     con.close()
+    if attempts:
+        sys.stdout.write("\n=== attempts ===\n")
+        for n, outcome, verdict, run_id, reason in attempts:
+            sys.stdout.write(f"#{n:<3} {outcome or '?':<8} verdict={verdict or '?':<8} run={run_id or '-'}"
+                             + (f"  {reason}" if reason else "") + "\n")
     sys.stdout.write("\n=== deps (incoming — must be 'done' for this epic to run) ===\n")
     for fid, kind, res in incoming:
         sys.stdout.write(f"{fid:<22} | {kind:<15} | {'UNRESOLVED' if res is None else 'resolved'}\n")

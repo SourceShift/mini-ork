@@ -3,7 +3,9 @@
 Faithful semantics: hard deps block, soft/informational don't; ready-set is
 status='not started' AND no unresolved hard dep, oldest-first; on_done resolves
 outgoing edges then flips fully-unblocked downstream 'blocked' epics to
-'not started'. This is the module the concurrent scheduler pools over.
+'not started' — except epics the scheduler HOLDS for a human ('blocked' with a
+held_reason), which only `epics retry` releases. This is the module the
+concurrent scheduler pools over.
 """
 from __future__ import annotations
 
@@ -25,6 +27,14 @@ def _conn(db: str | None) -> sqlite3.Connection:
     con = sqlite3.connect(_db_path(db))
     con.execute("PRAGMA busy_timeout=5000")
     return con
+
+
+def _not_held(con: sqlite3.Connection) -> str:
+    """SQL guard for the scheduler's hold. A 'blocked' epic with a held_reason
+    waits for a human, not for a dependency, so no cascade may release it. The
+    column exists only once scheduler.ensure_retry_schema has run."""
+    cols = {r[1] for r in con.execute("PRAGMA table_info(epics)").fetchall()}
+    return " AND held_reason IS NULL" if "held_reason" in cols else ""
 
 
 def add_dep(from_id: str, to_id: str, kind: str = "hard",
@@ -80,7 +90,7 @@ def mark_ready(epic_id: str, db: str | None = None) -> None:
     con = _conn(db)
     try:
         con.execute("UPDATE epics SET status='not started' "
-                    "WHERE id=? AND status='blocked'", (epic_id,))
+                    "WHERE id=? AND status='blocked'" + _not_held(con), (epic_id,))
         con.commit()
     finally:
         con.close()
@@ -98,6 +108,7 @@ def on_done(done_id: str, db: str | None = None) -> None:
         downstream = [r[0] for r in con.execute(
             "SELECT DISTINCT to_epic_id FROM epic_dependencies WHERE from_epic_id=?",
             (done_id,)).fetchall()]
+        not_held = _not_held(con)
         for ep in downstream:
             unmet = con.execute(
                 "SELECT COUNT(*) FROM epic_dependencies "
@@ -105,7 +116,7 @@ def on_done(done_id: str, db: str | None = None) -> None:
                 (ep,)).fetchone()[0]
             if unmet == 0:
                 con.execute("UPDATE epics SET status='not started' "
-                            "WHERE id=? AND status='blocked'", (ep,))
+                            "WHERE id=? AND status='blocked'" + not_held, (ep,))
         con.commit()
     finally:
         con.close()
