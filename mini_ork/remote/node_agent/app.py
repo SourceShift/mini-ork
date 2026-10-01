@@ -314,7 +314,18 @@ def create_app(
         return Response(content=body, media_type="application/x-tar")
 
     @app.post("/v1/sessions/{run_id}/files/manifest")
-    def files_manifest(run_id: str, root: str, _: None = Depends(bearer)) -> dict:
+    async def files_manifest(run_id: str, request: Request, root: str | None = None,
+                             _: None = Depends(bearer)) -> dict:
+        # ``root`` as a query parameter or in a JSON body — the run-dir mirror
+        # client sends a body; requiring the query form answered it with a 422.
+        if root is None:
+            try:
+                body = await request.json()
+            except ValueError:
+                body = {}
+            root = body.get("root") if isinstance(body, dict) else None
+        if not root:
+            raise HTTPException(400, "root required (query parameter or JSON body)")
         try:
             target = _resolve_root(state_dir, run_id, root)
         except ValueError as exc:

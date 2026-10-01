@@ -62,6 +62,25 @@ _DEFAULT_BACKOFF_S = 0.2  # jittered; 5 * ~0.6s = ~3s before raising
 _PUT_ROOT = "run"  # node-agent's _resolve_root allowlist: run | home | mo-home
 
 
+def _env_int_mb(name: str, default_mb: int) -> int:
+    """Read ``name`` (megabytes) from env; clamp invalid to ``default_mb``.
+
+    Mirrors the kickoff §"Size caps" table: ``MO_REMOTE_MIRROR_MAX_FILE_MB``
+    (default 50) and ``MO_REMOTE_MIRROR_MAX_TOTAL_MB`` (default 500).
+    Invalid values fall back to the default so a typo never widens a cap.
+    """
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default_mb * 1024 * 1024
+    try:
+        n = int(raw)
+    except ValueError:
+        return default_mb * 1024 * 1024
+    if n <= 0:
+        return default_mb * 1024 * 1024
+    return n * 1024 * 1024
+
+
 class RemoteUnavailableError(RuntimeError):
     """Raised when the node-agent is unreachable after bounded retries.
 
@@ -110,6 +129,7 @@ class RemoteWorkspace:
         token_env: str | None = None,
         on_chunk: Any = None,
         target_root: str | None = None,
+        run_dir: str | None = None,
     ) -> None:
         # No isinstance guard on `node` — the typed signature already constrains
         # callers to ``_NodeRef`` (the factory coerces ``Node`` to ``_NodeRef``),
@@ -142,11 +162,26 @@ class RemoteWorkspace:
         # (kickoff §2). All sync operations are serialized by the lock
         # so a parallel-pool pair of spawns cannot race.
         self._last_synced: tuple[str, str] | None = None  # (commit, tree)
-        self._sync_lock = threading.Lock()
-        # Constructor-injected target_root (test path); production code
-        # resolves via ``_resolve_target_root`` from ``MINI_ORK_TARGET_ROOT``
-        # / ``MINI_ORK_ROOT``.
+        # One re-entrant lock for every session-state change: tree sync (07)
+        # and the run-dir mirror (08) must never interleave, and the mirror
+        # helpers take it themselves, possibly inside a sync block.
+        self._sync_lock = threading.RLock()
+        self._session_lock = self._sync_lock
+        # Constructor-injected target_root (tests); production resolves the
+        # run's pinned roots in ``_resolve_target_root``.
         self._target_root: str | None = target_root
+        # Run-dir mirror state (kickoff 08). The lock is shared with the
+        # future tree-sync path (epic 07) so a mirror push/pull never
+        # interleaves with a tree bundle upload on the same session.
+        self._mo_home_uploaded: bool = False
+        # Captured at mirror_push() time; consulted at mirror_pull() time to
+        # detect local-vs-remote conflicts (the control plane wins).
+        self._mirror_push_snap: dict[str, str] = {}
+        # The local run dir. When unset (existing tests, the conformance
+        # suite) the mirror hooks short-circuit; the production path passes
+        # it explicitly via the resolver/factory so the agents that read
+        # ${MINI_ORK_RUN_DIR} see the same files locally and remotely.
+        self._run_dir: str | None = run_dir or os.environ.get("MINI_ORK_RUN_DIR")
 
     # ------------------------------------------------------------------ helpers
 
@@ -261,12 +296,11 @@ class RemoteWorkspace:
             )
             self._sid = sess.get("sid", self._run_id)
             self._owns_session = True
-        # 3) Epic 07: initial sync-up. ``force=True`` skips the
-        # last-synced gate (we have no ``_last_synced`` yet). Raises
-        # ``SyncTooLargeError`` per kickoff §4 so an operator can
-        # size-up ``MO_REMOTE_BUNDLE_MAX_MB`` or trim the target tree.
+        # 3) Initial tree sync-up (epic 07) and the one-shot mo-home upload
+        # (epic 08). Both are idempotent on a repeated up().
         with self._sync_lock:
             self._sync_up(force=True)
+        self._upload_mo_home()
         return None
 
     def _current_engine_sha(self, subprocess_mod: Any) -> str:
@@ -462,23 +496,29 @@ class RemoteWorkspace:
     def exec(self, cmd: str, *, cwd: str, timeout: int) -> tuple[int, str]:
         if self._sid is None:
             raise RuntimeError("RemoteWorkspace.exec called before up()")
-        # Epic 07 §2: pre-sync only — verifiers and tool exec do not
-        # write the truth (epic 11), so we skip sync-down.
+        # Pre: tree sync-up (epic 07) + run-dir push (epic 08). Post: run-dir
+        # pull only — a check never syncs the tree back (it is not the truth).
         with self._sync_lock:
             self._sync_up(force=False)
-        # Use /v1/sessions/{run_id}/exec — argv=[sh,-c,cmd] so the server-side
-        # argv-only contract is preserved (no shell interpolation by the
-        # node-agent). The endpoint merges streams (its rc/output shape).
-        result = self._json(
-            "POST",
-            f"/v1/sessions/{self._run_id}/exec",
-            {
-                "argv": ["sh", "-c", cmd],
-                "cwd": cwd or self._mount_path,
-                "timeout_s": timeout,
-            },
-        )
-        return int(result.get("rc", _SPAWN_FAILED_RC)), str(result.get("output", ""))
+        self.mirror_push()
+        try:
+            # Use /v1/sessions/{run_id}/exec — argv=[sh,-c,cmd] so the server-side
+            # argv-only contract is preserved (no shell interpolation by the
+            # node-agent). The endpoint merges streams (its rc/output shape).
+            result = self._json(
+                "POST",
+                f"/v1/sessions/{self._run_id}/exec",
+                {
+                    "argv": ["sh", "-c", cmd],
+                    "cwd": cwd or self._mount_path,
+                    "timeout_s": timeout,
+                },
+            )
+            rc = int(result.get("rc", _SPAWN_FAILED_RC))
+            out = str(result.get("output", ""))
+        finally:
+            self.mirror_pull()
+        return rc, out
 
     def spawn(
         self,
@@ -494,9 +534,11 @@ class RemoteWorkspace:
         argv_list = [str(a) for a in argv]
         if not argv_list:
             raise ValueError("spawn requires a non-empty argv")
-        # Epic 07 §2: pre-sync + run + post-sync (always after spawn).
+        # Pre: tree sync-up (epic 07) + run-dir push (epic 08).
         with self._sync_lock:
             self._sync_up(force=False)
+        self.mirror_push()
+        try:
             # 1) POST /v1/sessions/{run_id}/procs — sends stdin ONCE in the body
             # (the node-agent forwards it as a single write then closes the
             # pipe); env_keys are the allowlisted key NAMES (values resolved at
@@ -519,9 +561,13 @@ class RemoteWorkspace:
             # separate {"stream":"out"/"err","data":"..."} and a final
             # {"stream":"exit","rc":...,"state":...}. We aggregate the two
             # streams separately (the dispatch contract requires it).
-            result = self._drain_stream(pid, timeout)
+            rc, out, err = self._drain_stream(pid, timeout)
+            # The agent's tree edits come back as uncommitted changes (epic 07);
+            # a SyncConflictError propagates after the run dir is still pulled.
             self._sync_down()
-            return result
+        finally:
+            self.mirror_pull()
+        return rc, out, err
 
     def _drain_stream(self, pid: int, timeout: float) -> tuple[int, str, str]:
         """Drain the proc stream endpoint until exit line; return (rc, out, err).
@@ -635,6 +681,213 @@ class RemoteWorkspace:
             data.size = len(content)
             tf.addfile(data, io.BytesIO(content))
         return buf.getvalue()
+
+    # ------------------------------------------------------------------ mirror
+
+    def _upload_mo_home(self) -> None:
+        """One-shot ``/workspace/mo-home`` upload (kickoff 08 req 2).
+
+        Idempotent: a second call short-circuits at ``_mo_home_uploaded``.
+        The deny-list is enforced by :mod:`mini_ork.remote.run_mirror` on
+        the LOCAL path before the tar is built; the node-agent's tar
+        guard then re-checks every member for path containment. ``MO_RECIPE``
+        env names the recipe whose ``recipes/<name>/`` tree is included.
+        """
+        if self._mo_home_uploaded:
+            return
+        from mini_ork.remote import run_mirror  # lazy: keep top-level import-free
+        home = os.environ.get("MINI_ORK_HOME", "").strip()
+        if not home:
+            self._mo_home_uploaded = True
+            return
+        recipe_name = os.environ.get("MO_RECIPE", "").strip() or None
+        files = run_mirror.mo_home_files(home, recipe_name=recipe_name)
+        if not files:
+            self._mo_home_uploaded = True
+            return
+        tar_bytes = run_mirror.build_mo_home_tar(home, files)
+        self._request(
+            "PUT",
+            f"/v1/sessions/{self._run_id}/files",
+            body=tar_bytes,
+            content_type="application/x-tar",
+            query={"root": "mo-home"},
+        )
+        self._mo_home_uploaded = True
+        self._emit_mirror_event(
+            "remote.mirror.mo_home",
+            files=len(files),
+            bytes=len(tar_bytes),
+        )
+        return None
+
+    def mirror_push(self) -> dict:
+        """Push the local run dir to ``/workspace/run`` (kickoff 08 req 1+3).
+
+        No-op when ``run_dir`` is unset (tests + the conformance suite).
+        Otherwise: build the local manifest, ask the remote for its
+        current manifest, diff, tar the changed set, and ``PUT`` the
+        body. Per-file + per-sync size caps enforced before any read.
+        Captures a snapshot for the upcoming ``mirror_pull`` conflict check.
+        """
+        if self._sid is None:
+            raise RuntimeError("RemoteWorkspace.mirror_push called before up()")
+        if not self._run_dir:
+            return {"files": 0, "bytes": 0, "skipped": 0}
+        with self._session_lock:
+            from mini_ork.remote import run_mirror
+            local_root = self._run_dir  # str; run_mirror.pathlib-converts internally
+            local_manifest = run_mirror.manifest(
+                local_root, excludes=run_mirror.DEFAULT_EXCLUDES
+            )
+            # The node-agent manifest endpoint requires a root query; pass
+            # it explicitly so we don't depend on server-defaults semantics.
+            remote_resp = self._json(
+                "POST",
+                f"/v1/sessions/{self._run_id}/files/manifest",
+                {"root": _PUT_ROOT},
+            )
+            remote_manifest = (
+                remote_resp.get("manifest", {}) if isinstance(remote_resp, dict) else {}
+            )
+            remote_sha = {rp: str(s) for rp, s in remote_manifest.items()}
+            local_sha = {rp: t[0] for rp, t in local_manifest.items()}
+            changed = run_mirror.diff_manifests(remote_sha, local_sha)
+            max_file = _env_int_mb(
+                "MO_REMOTE_MIRROR_MAX_FILE_MB", run_mirror.DEFAULT_MAX_FILE_MB
+            )
+            max_total = _env_int_mb(
+                "MO_REMOTE_MIRROR_MAX_TOTAL_MB", run_mirror.DEFAULT_MAX_TOTAL_MB
+            )
+            skipped: list[tuple[str, int]] = []
+            members_for_tar = {
+                rp: local_manifest[rp] for rp in changed if rp in local_manifest
+            }
+            tar_bytes, stats = run_mirror.build_push_tar(
+                local_root, members_for_tar,
+                max_file_bytes=max_file, max_total_bytes=max_total,
+                on_skip=lambda rp, sz: skipped.append((rp, sz)),
+            )
+            if tar_bytes:
+                self._request(
+                    "PUT",
+                    f"/v1/sessions/{self._run_id}/files",
+                    body=tar_bytes,
+                    content_type="application/x-tar",
+                    query={"root": _PUT_ROOT},
+                )
+            # Capture snapshot for pull-time conflict detection.
+            self._mirror_push_snap = dict(local_sha)
+            try:
+                run_mirror.write_sidecar(local_root, local_sha)
+            except OSError:
+                pass  # sidecar is best-effort; resume still works in-memory
+            self._emit_mirror_event(
+                "remote.mirror.push",
+                files=stats["files"],
+                bytes=stats["bytes"],
+                ms=stats["ms"],
+            )
+            for rp, sz in skipped:
+                self._emit_mirror_event(
+                    "remote.mirror.skipped",
+                    file=rp,
+                    size=sz,
+                )
+            return {
+                "files": stats["files"],
+                "bytes": stats["bytes"],
+                "skipped": stats["skipped"],
+            }
+
+    def mirror_pull(self) -> dict:
+        """Pull remote ``/workspace/run`` changes back to the local run dir.
+
+        Detects conflicts by comparing the current local sha to the
+        push-time snapshot: if they differ, the local copy wins (control
+        plane never silently clobbers a process that ran during the
+        spawn). Atomic temp+rename for non-conflicts; the freshly-written
+        file's mtime is set to NOW so the executor's "agent wins by
+        mtime" reader (``cli/execute_handlers.py:499-504``) keeps its
+        meaning. An unchanged remote file is NOT rewritten (the reader
+        falls back to stdout exactly as it does locally).
+        """
+        if self._sid is None:
+            raise RuntimeError("RemoteWorkspace.mirror_pull called before up()")
+        if not self._run_dir:
+            return {"files": 0, "bytes": 0, "conflicts": 0}
+        with self._session_lock:
+            from mini_ork.remote import run_mirror
+            local_root = self._run_dir
+            local_at_push = dict(self._mirror_push_snap)
+            if not local_at_push:
+                # Resume path: read the on-disk sidecar so a control-plane
+                # restart still has the push-time baseline.
+                local_at_push = run_mirror.read_sidecar(local_root)
+            local_now = run_mirror.manifest(
+                local_root, excludes=run_mirror.DEFAULT_EXCLUDES
+            )
+            local_now_sha = {rp: t[0] for rp, t in local_now.items()}
+            remote_resp = self._json(
+                "POST",
+                f"/v1/sessions/{self._run_id}/files/manifest",
+                {"root": _PUT_ROOT},
+            )
+            remote_manifest = (
+                remote_resp.get("manifest", {}) if isinstance(remote_resp, dict) else {}
+            )
+            remote_sha = {rp: str(s) for rp, s in remote_manifest.items()}
+            changed = run_mirror.diff_manifests(local_at_push, remote_sha)
+            if not changed:
+                return {"files": 0, "bytes": 0, "conflicts": 0}
+            start = time.time()
+            tar_bytes = self._request(
+                "GET",
+                f"/v1/sessions/{self._run_id}/files",
+                query={"root": _PUT_ROOT},
+            )
+            ms = int((time.time() - start) * 1000)
+            conflicts, written, bytes_written = run_mirror.apply_pull_tar(
+                local_root, tar_bytes, changed, local_at_push, local_now_sha,
+                on_conflict=lambda rp: self._emit_mirror_event(
+                    "remote.mirror.conflict",
+                    file=rp,
+                ),
+            )
+            self._emit_mirror_event(
+                "remote.mirror.pull",
+                files=written,
+                bytes=bytes_written,
+                ms=ms,
+            )
+            return {
+                "files": written,
+                "bytes": bytes_written,
+                "conflicts": len(conflicts),
+            }
+
+    def _emit_mirror_event(self, event_type: str, **fields: Any) -> None:
+        """Best-effort run_event emission; never raised.
+
+        The mirror never breaks a run because observability is unhappy;
+        :func:`mo_node_emit` itself is silent-no-op when ``state.db`` is
+        missing (the unit-test path) or when an exception escapes the
+        schema-aware insert. We still wrap in try/except because the
+        emitter is a side-effecting import (``mo_node_emit`` lives in
+        :mod:`mini_ork.observability.node_events`).
+        """
+        try:
+            from mini_ork.observability.node_events import mo_node_emit
+            mo_node_emit(
+                run_id=self._run_id,
+                node_id="remote-workspace",
+                node_type="mirror",
+                event_type=event_type,
+                extra_json=json.dumps(fields, sort_keys=True),
+            )
+        except Exception:
+            pass
+        return None
 
     def down(self) -> None:
         # Cattle + idempotent: a missing session is a no-op (matches Docker

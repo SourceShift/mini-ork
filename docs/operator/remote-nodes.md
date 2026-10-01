@@ -273,3 +273,102 @@ Every diff is computed by git (`mini_ork/remote/tree_sync.py`).
   sync-up carries them over.
 - **Not supported yet:** submodules travel as gitlinks and Git LFS files as
   pointers.
+
+## Run dir on the remote side
+
+Whatever a remote agent reads from or writes to the run dir works the same
+as locally. The mirror is **boundary-time sync**: it runs BEFORE every
+remote `spawn`/`exec` (push) and AFTER every one of them (pull). It is
+NOT a live tee of in-progress output — epic 09 owns that.
+
+### What the mirror does
+
+- **Push (local → `/workspace/run`)** before each remote call:
+  - Walks the local run dir, builds a `{relpath: (sha256, size, mtime)}`
+    manifest, asks the node-agent for its current manifest (one call
+    with an explicit `{"root": "run"}` body), diffs the two, tars the
+    changed set, and `PUT`s the body to
+    `PUT /v1/sessions/{run_id}/files?root=run`.
+  - Captures a push-time snapshot in memory AND writes it to
+    `<run_dir>/.mo-run-mirror.json` so a control-plane restart can
+    resume the pull phase correctly.
+- **Pull (remote → local)** after each remote call:
+  - Asks the node-agent for its CURRENT manifest, diffs against the
+    push-time snapshot, fetches the tar body via
+    `GET /v1/sessions/{run_id}/files?root=run`, and extracts member by
+    member.
+  - For each changed file: if the local sha still equals the push-time
+    sha, atomic temp+rename into place with a CURRENT mtime so the
+    executor's "agent wins by mtime" reader at
+    `cli/execute_handlers.py:499-504` keeps its meaning. If the local
+    sha differs, the local copy wins and a `remote.mirror.conflict`
+    event names the file.
+  - Unchanged remote files are NOT rewritten (so the executor falls
+    back to stdout exactly as it does locally).
+
+### What never crosses the wire
+
+| Excluded | Why |
+|---|---|
+| `execute.log` | executor-owned; huge |
+| `*.pid` | executor-owned |
+| `.stop-requested` | control-plane IPC |
+| `.workspace-session.json` | session bookkeeping |
+| `state.db*` | the only DB writer is the control plane (D5) |
+| `agent-*.live.jsonl` | epic 09 owns the live tee |
+
+These live in `mini_ork/remote/run_mirror.py:DEFAULT_EXCLUDES`; the set
+is matched on basename only so a subdir cannot bypass.
+
+### mo-home subset
+
+`/workspace/mo-home` is the read-only mount of a curated subset of
+`$MINI_ORK_HOME`. The mirror uploads it ONCE per session, inside
+`up()`:
+
+- `config/*.yaml` (providers, agents, pricing, lane policy)
+- `recipes/<MO_RECIPE>/**` when `MO_RECIPE` is set (the active recipe)
+
+NEVER uploaded (basename glob, deny-list enforced client-side before
+the tar is built):
+
+- `state.db*`
+- `secrets*`
+- `auth-tokens.txt`
+- `*.env`
+
+The deny-list lives in `mini_ork/remote/run_mirror.py:DENY_LIST` and is
+imported by the unit test for direct assertion — the contract is the
+import surface, not a private field.
+
+### Size caps
+
+| Env var | Default | What it caps |
+|---|---|---|
+| `MO_REMOTE_MIRROR_MAX_FILE_MB` | `50` | Per-file size |
+| `MO_REMOTE_MIRROR_MAX_TOTAL_MB` | `500` | Per-sync total |
+
+An over-cap file is **skipped with an event** — `remote.mirror.skipped`
+naming the file — never truncated. Over-cap files are measured via
+`os.stat()` before any read, so a 50 GB log cannot poison the walk.
+
+### Events
+
+| Event | Payload | Emitted when |
+|---|---|---|
+| `remote.mirror.push` | `{files, bytes, ms}` | end of a push |
+| `remote.mirror.pull` | `{files, bytes, ms}` | end of a pull |
+| `remote.mirror.conflict` | `{file}` | per file where local+remote both moved |
+| `remote.mirror.skipped` | `{file, size}` | per over-cap file |
+| `remote.mirror.mo_home` | `{files, bytes}` | once per session, in `up()` |
+
+Emitted via `mini_ork.observability.node_events.mo_node_emit`, so the
+emitter is a silent no-op when `state.db` is missing (the unit-test
+path) and never breaks a run on an observability failure.
+
+### Locking
+
+The mirror takes `RemoteWorkspace._session_lock` around every push and
+pull. The same lock is shared with the future tree-sync path (epic 07)
+so a mirror push/pull never interleaves with a tree-bundle upload on
+the same session.
