@@ -176,6 +176,9 @@ def test_engine_sha_mismatch_uploads_exactly_one_bundle(monkeypatch, tmp_path):
     Uses a fake ``_current_engine_sha`` so the test does not depend on the
     surrounding git tree. ``PUT /v1/engines/{sha}`` is recorded.
     """
+    # Tree sync is covered by test_tree_sync / test_remote_tree_sync_e2e; this
+    # test is about the engine upload, so up() skips the target sync here.
+    monkeypatch.setattr(RemoteWorkspace, "_sync_up", lambda self, force=False: None)
     monkeypatch.setattr(RemoteWorkspace, "_DEFAULT_BACKOFF_S", 0.0, raising=False)
     monkeypatch.setenv("MO_REMOTE_ALLOW_DIRTY_ENGINE", "1")
     uploads: list[str] = []
@@ -249,6 +252,9 @@ def test_dirty_engine_tree_allowed_with_env(monkeypatch, tmp_path):
     subprocess.run(["git", "-C", str(repo), "add", "f"], check=True)
     subprocess.run(["git", "-C", str(repo), "commit", "-m", "i", "--quiet"], check=True)
     (repo / "f").write_text("dirty")
+    # Tree sync is covered by test_tree_sync / test_remote_tree_sync_e2e; this
+    # test is about the engine upload, so up() skips the target sync here.
+    monkeypatch.setattr(RemoteWorkspace, "_sync_up", lambda self, force=False: None)
     monkeypatch.setenv("MO_REMOTE_ALLOW_DIRTY_ENGINE", "1")
     monkeypatch.setattr(RemoteWorkspace, "_DEFAULT_BACKOFF_S", 0.0, raising=False)
 
@@ -393,6 +399,7 @@ def test_real_socket_transport_round_trip(tmp_path, monkeypatch):
         node=_NodeRef(name="real", url=f"http://127.0.0.1:{port}", token=token, max_sessions=1),
         run_id="real-socket-run", image="alpine:latest", drive_root=str(tmp_path),
         engine_root=os.environ.get("MINI_ORK_ROOT") or os.getcwd(),
+        target_root=_tiny_target(tmp_path),
         token_env="MO_NODE_TOKEN", retries=1,
     )
     try:
@@ -407,3 +414,17 @@ def test_real_socket_transport_round_trip(tmp_path, monkeypatch):
         ws.down()
         server.should_exit = True
         thread.join(timeout=10)
+
+
+def _tiny_target(base) -> str:
+    """A throwaway git checkout for the session to sync (a remote session needs
+    the run's target; never the engine repo)."""
+    import subprocess
+    repo = base / "target-repo"
+    repo.mkdir()
+    for args in (["init", "-q"], ["config", "user.email", "t@t"], ["config", "user.name", "t"]):
+        subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True)
+    (repo / "README.md").write_text("target\n")
+    subprocess.run(["git", "add", "-A"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=repo, check=True, capture_output=True)
+    return str(repo)

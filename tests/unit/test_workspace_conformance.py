@@ -104,6 +104,7 @@ def remote_workspace(tmp_path, monkeypatch):
         # a git repo). ``MO_REMOTE_ALLOW_DIRTY_ENGINE=1`` (set above) bypasses
         # the dirty-tree refuse rule; rev-parse works on dirty trees too.
         engine_root=os.environ.get("MINI_ORK_ROOT") or os.getcwd(),
+        target_root=_tiny_target(tmp_path),
         token_env="MO_NODE_TOKEN",
         retries=2,
     )
@@ -354,3 +355,17 @@ def test_spawn_env_is_allowlist_plus_run_contract(workspace, tmp_path):
         assert "ZZ_AMBIENT_SENTINEL" not in child_env, (
             f"{backend_name}: ambient sentinel leaked into the child"
         )
+
+
+def _tiny_target(base) -> str:
+    """A throwaway git checkout for the session to sync (a remote session needs
+    the run's target; never the engine repo)."""
+    import subprocess
+    repo = base / "target-repo"
+    repo.mkdir()
+    for args in (["init", "-q"], ["config", "user.email", "t@t"], ["config", "user.name", "t"]):
+        subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True)
+    (repo / "README.md").write_text("target\n")
+    subprocess.run(["git", "add", "-A"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=repo, check=True, capture_output=True)
+    return str(repo)

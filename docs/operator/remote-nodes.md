@@ -237,3 +237,39 @@ python3.11 -m pytest -q \
     tests/unit/test_remote_workspace.py \
     tests/unit/test_sandbox_protocol.py
 ```
+
+## What gets synced
+
+Your local checkout stays the source of truth. The node-agent holds a replica
+at `runs/<run>/target`, and the two are synced with git at dispatch boundaries.
+Every diff is computed by git (`mini_ork/remote/tree_sync.py`).
+
+- **Which checkout:** the run's pinned target (`run_profile.json` `roots`, set
+  at run start), or an explicit `MO_TARGET_CWD`. A session with neither refuses
+  to start; mini-ork's own engine checkout is never used as a fallback.
+- **What goes over:** the exact worktree: tracked files, uncommitted changes,
+  and untracked files that `.gitignore` does not exclude.
+- **Secret-named files are left out:** `.env`, `.env.*`, `*.pem`, `*.key`,
+  `id_rsa*`, `id_ed25519*`, `*.tfvars`, `secrets.local.sh` and
+  `.mini-ork/state.db*`. Add patterns with `MO_REMOTE_SYNC_EXCLUDE=a,b`. An
+  untracked secret never leaves the laptop. A tracked one goes over at its
+  committed version, never your local edits. The names left out are reported
+  in a `remote.sync.excluded` event (names only, never contents).
+- **First upload:** a git bundle, trying `full` (all history), then `branch`,
+  then `squashed` (one commit, no history). It uses the first one under
+  `MO_REMOTE_BUNDLE_MAX_MB` (default 100), and fails with the sizes if even
+  `squashed` is too big. The replica checks out your HEAD, so `git status`
+  there shows the same uncommitted changes as yours.
+- **Before every remote spawn or check:** if your worktree changed since the
+  last sync, an incremental bundle goes up.
+- **After every remote agent spawn:** the replica's changes come back as
+  uncommitted changes in your checkout. Your HEAD, index and stash are never
+  touched. If the agent committed, you get the same content, uncommitted, plus
+  a `remote.head_moved` event. Checks (verifiers) never sync back.
+- **Conflict:** if you edit the checkout while a remote spawn is running, the
+  sync-back refuses with `SyncConflictError`, listing the paths, and your edit
+  is kept. The remote result stays fetchable at `refs/mo/remote/<run>/latest`
+  for a manual merge. Edits made between spawns are not conflicts; the next
+  sync-up carries them over.
+- **Not supported yet:** submodules travel as gitlinks and Git LFS files as
+  pointers.

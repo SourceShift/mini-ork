@@ -321,23 +321,74 @@ def create_app(
             raise HTTPException(400, str(exc)) from exc
         return {"root": root, "manifest": manifest_for(target)}
 
-    # ---- tree (no-op-safe transport for epic 07) ----------------------
+    # ---- tree (epic 07: git-snapshot sync via mini_ork.remote.tree_sync) ----
+    #
+    # The replica is runs/<run>/target. Uploaded bundles are staged OUTSIDE it
+    # (runs/<run>/.sync/) — inside, the next `git add -A` snapshot would carry
+    # the bundle file back as an "agent edit".
+    def _target_dir(run_id: str) -> Path:
+        return state_dir / "runs" / run_id / "target"
+
+    def _sync_dir(run_id: str) -> Path:
+        d = state_dir / "runs" / run_id / ".sync"
+        d.mkdir(parents=True, exist_ok=True)
+        return d
 
     @app.post("/v1/sessions/{run_id}/tree/bundle")
-    async def put_tree_bundle(run_id: str, request: Request,
-                              _: None = Depends(bearer)) -> dict:
+    async def post_tree_bundle(run_id: str, request: Request,
+                               _: None = Depends(bearer)) -> dict:
         body = await request.body()
-        target = state_dir / "runs" / run_id / "target" / ".mo-tree.bundle"
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(body)
-        return {"path": str(target), "bytes": len(body)}
+        if not body:
+            raise HTTPException(400, "empty bundle")
+        (_sync_dir(run_id) / "upload.bundle").write_bytes(body)
+        return {"bytes": len(body)}
 
-    @app.get("/v1/sessions/{run_id}/tree/snapshot")
-    def get_tree_snapshot(run_id: str, _: None = Depends(bearer)) -> Response:
-        target = state_dir / "runs" / run_id / "target" / ".mo-tree.bundle"
-        if not target.is_file():
-            return Response(status_code=404)
-        return Response(content=target.read_bytes(), media_type="application/x-git-bundle")
+    @app.post("/v1/sessions/{run_id}/tree/materialize")
+    def post_tree_materialize(run_id: str, payload: dict,
+                              _: None = Depends(bearer)) -> dict:
+        from mini_ork.remote import tree_sync as ts
+
+        bundle = _sync_dir(run_id) / "upload.bundle"
+        if not bundle.is_file():
+            raise HTTPException(400, "no staged bundle; POST .../tree/bundle first")
+        s = payload.get("snap") or {}
+        if not s.get("commit") or not s.get("tree"):
+            raise HTTPException(400, "snap.commit and snap.tree required")
+        snap = ts.Snap(commit=s["commit"], tree=s["tree"], excluded=tuple(s.get("excluded") or ()))
+        try:
+            tree = ts.materialize(str(_target_dir(run_id)), bundle, snap, payload.get("head") or "")
+        except ts.SyncIntegrityError as exc:
+            raise HTTPException(409, f"materialize failed: {exc}") from exc
+        finally:
+            bundle.unlink(missing_ok=True)
+        return {"tree": tree}
+
+    @app.post("/v1/sessions/{run_id}/tree/snapshot")
+    def post_tree_snapshot(run_id: str, payload: dict,
+                           _: None = Depends(bearer)) -> dict:
+        """Snapshot the replica; return it with a bundle of everything new since
+        ``base`` so the control plane can fetch the objects and apply the delta."""
+        import base64
+
+        from mini_ork.remote import tree_sync as ts
+
+        base = payload.get("base")
+        if not base:
+            raise HTTPException(400, "base required")
+        target = str(_target_dir(run_id))
+        try:
+            snap = ts.snapshot(target, parent="HEAD")
+            bundle = ts.incremental_bundle(target, new=snap.commit, base=base)
+        except ts.SyncIntegrityError as exc:
+            raise HTTPException(409, f"snapshot failed: {exc}") from exc
+        data = b""
+        if bundle is not None:   # None: nothing new since base
+            try:
+                data = bundle.read_bytes()
+            finally:
+                bundle.unlink(missing_ok=True)
+        return {"commit": snap.commit, "tree": snap.tree, "excluded": list(snap.excluded),
+                "bundle_b64": base64.b64encode(data).decode("ascii")}
 
     # ---- engines ------------------------------------------------------
 

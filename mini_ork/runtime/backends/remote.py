@@ -38,9 +38,11 @@ import os
 import random
 import tarfile
 import tempfile
+import threading
 import time
 import uuid
 from collections.abc import Mapping, Sequence
+from pathlib import Path
 from typing import Any, NamedTuple
 from urllib import error as urllib_error
 from urllib import request as urllib_request
@@ -107,6 +109,7 @@ class RemoteWorkspace:
         retries: int | None = None,
         token_env: str | None = None,
         on_chunk: Any = None,
+        target_root: str | None = None,
     ) -> None:
         # No isinstance guard on `node` — the typed signature already constrains
         # callers to ``_NodeRef`` (the factory coerces ``Node`` to ``_NodeRef``),
@@ -135,6 +138,15 @@ class RemoteWorkspace:
         self._sid: str | None = None  # populated from POST /v1/sessions response
         self._uploaded_shas: set[str] = set()  # idempotent engine upload
         self._owns_session: bool = False  # False until up() succeeds
+        # Epic 07: one ``last_synced`` per session, not per spawn
+        # (kickoff §2). All sync operations are serialized by the lock
+        # so a parallel-pool pair of spawns cannot race.
+        self._last_synced: tuple[str, str] | None = None  # (commit, tree)
+        self._sync_lock = threading.Lock()
+        # Constructor-injected target_root (test path); production code
+        # resolves via ``_resolve_target_root`` from ``MINI_ORK_TARGET_ROOT``
+        # / ``MINI_ORK_ROOT``.
+        self._target_root: str | None = target_root
 
     # ------------------------------------------------------------------ helpers
 
@@ -249,6 +261,12 @@ class RemoteWorkspace:
             )
             self._sid = sess.get("sid", self._run_id)
             self._owns_session = True
+        # 3) Epic 07: initial sync-up. ``force=True`` skips the
+        # last-synced gate (we have no ``_last_synced`` yet). Raises
+        # ``SyncTooLargeError`` per kickoff §4 so an operator can
+        # size-up ``MO_REMOTE_BUNDLE_MAX_MB`` or trim the target tree.
+        with self._sync_lock:
+            self._sync_up(force=True)
         return None
 
     def _current_engine_sha(self, subprocess_mod: Any) -> str:
@@ -304,9 +322,150 @@ class RemoteWorkspace:
             except OSError:
                 pass
 
+    # ------------------------------------------------------------------ epic 07: tree sync
+    #
+    # The kickoff (remote-nodes-07 §2) splits the sync lifecycle into
+    # three hooks:
+    #   up()    -> force=True initial sync-up (always).
+    #   spawn() -> sync_up if local tree differs from _last_synced,
+    #              then run the proc, then sync_down (always).
+    #   exec()  -> sync_up only. NEVER sync-down after exec (verifiers
+    #              and tool exec do not write the truth; epic 11).
+    #
+    # A single ``_last_synced: (commit, tree)`` per session (NOT per
+    # spawn) is what makes parallel-pool correct: peer A's sync-down
+    # updates ``_last_synced``; peer B's sync-up then sees a delta
+    # only, not a fresh full upload.
+    #
+    # ``tree_sync`` is imported lazily to preserve the default-path
+    # property (``MO_SANDBOX_BACKEND`` unset never imports this module
+    # — verified by ``test_remote_module_not_imported_when_backend_unset``).
+
+    def _resolve_target_root(self) -> str:
+        """The local target checkout: the run's pinned roots (remote-nodes-01),
+        else an explicit ``MO_TARGET_CWD``. Never the engine checkout — syncing
+        mini-ork's own tree as the target is exactly the mistake to rule out."""
+        if self._target_root is not None:
+            return self._target_root
+        root = ""
+        run_dir = (os.environ.get("MINI_ORK_RUN_DIR") or "").strip()
+        if run_dir:
+            from mini_ork.runtime.run_roots import load_run_roots
+
+            roots = load_run_roots(run_dir)
+            root = roots.target if roots else ""
+        root = root or (os.environ.get("MO_TARGET_CWD") or "").strip()
+        if not root or not (Path(root) / ".git").exists():
+            raise RemoteUnavailableError(
+                f"no git target to sync (pinned roots / MO_TARGET_CWD gave {root!r}); "
+                "a remote session needs the run's target checkout"
+            )
+        self._target_root = root
+        return root
+
+    def _current_target_tree(self, ts: Any) -> str:
+        return ts.worktree_tree(self._resolve_target_root())
+
+    def _sync_up(self, *, force: bool = False) -> None:
+        """Bring the replica to the local worktree. First time: an initial
+        bundle (full -> branch -> squashed). Afterwards: only what is new since
+        ``_last_synced``, and only when the local tree actually changed."""
+        from mini_ork.remote import tree_sync as _ts  # lazy (default-path rule)
+
+        target = self._resolve_target_root()
+        if (not force and self._last_synced is not None
+                and self._current_target_tree(_ts) == self._last_synced[1]):
+            return
+        snap = _ts.snapshot(target, parent="HEAD")
+        if self._last_synced is not None and snap.tree == self._last_synced[1]:
+            return   # the replica already holds this exact tree (e.g. a repeated up())
+        if self._last_synced is None:
+            bundle_path, mode = _ts.initial_bundle(target, snap)
+        else:
+            bundle_path, mode = (_ts.incremental_bundle(target, new=snap.commit,
+                                                        base=self._last_synced[0]), "incremental")
+            if bundle_path is None:
+                return
+        tip = _ts.bundle_tip(target)   # == snap.commit, or the orphan when squashed
+        # The replica detaches at the local HEAD so its `git status` matches ours;
+        # a squashed upload carries no history, so it detaches at the orphan.
+        head = tip if mode == "squashed" else _ts._out(_ts._git(target, "rev-parse", "HEAD"))
+        try:
+            size = bundle_path.stat().st_size
+            self._request("POST", f"/v1/sessions/{self._run_id}/tree/bundle",
+                          body=bundle_path.read_bytes(), content_type="application/x-git-bundle")
+            self._json("POST", f"/v1/sessions/{self._run_id}/tree/materialize",
+                       payload={"snap": {"commit": tip, "tree": snap.tree,
+                                         "excluded": list(snap.excluded)},
+                                "head": head})
+        finally:
+            bundle_path.unlink(missing_ok=True)
+        self._last_synced = (tip, snap.tree)
+        if snap.excluded:
+            self._emit_sync_event("remote.sync.excluded", names=list(snap.excluded))
+        self._emit_sync_event("remote.sync.up", bytes=size, tree=snap.tree, mode=mode)
+
+    def _sync_down(self) -> None:
+        """Pull the replica's edits into the local checkout as uncommitted changes.
+
+        ``SyncConflictError`` (the local checkout changed meanwhile) propagates;
+        the remote snapshot stays fetchable at ``refs/mo/remote/<run>/latest``."""
+        import base64
+
+        from mini_ork.remote import tree_sync as _ts  # lazy
+
+        if self._last_synced is None:
+            raise RemoteUnavailableError("sync_down before sync_up: nothing to diff against")
+        target = self._resolve_target_root()
+        body = self._json("POST", f"/v1/sessions/{self._run_id}/tree/snapshot",
+                          payload={"base": self._last_synced[0]})
+        new_snap = _ts.Snap(commit=body["commit"], tree=body["tree"],
+                            excluded=tuple(body.get("excluded") or ()))
+        base_snap = _ts.Snap(commit=self._last_synced[0], tree=self._last_synced[1])
+        data = base64.b64decode(body.get("bundle_b64") or "")
+        ref = f"refs/mo/remote/{self._run_id}/latest"
+        if data:   # empty: nothing new remotely, the objects are already here
+            fd, tmp = tempfile.mkstemp(prefix="mo-sync-down-", suffix=".bundle")
+            try:
+                with os.fdopen(fd, "wb") as fh:
+                    fh.write(data)
+                _ts.fetch_bundle(target, tmp, ref)
+            finally:
+                os.unlink(tmp)
+        head_moved = _ts.apply_delta(target, base_snap, new_snap, ref=ref)
+        self._last_synced = (new_snap.commit, new_snap.tree)
+        if head_moved:
+            self._emit_sync_event("remote.head_moved", tree=new_snap.tree)
+        self._emit_sync_event("remote.sync.down", bytes=len(data), tree=new_snap.tree)
+
+    def _emit_sync_event(self, event_type: str, **fields: Any) -> None:
+        """Fire a ``remote.sync.*`` event through the run-event emitter.
+
+        Silent if the emitter is unavailable (no DB in scope). The
+        payload is what the kickoff §5 demands: ``bytes``,
+        ``files_changed``, ``ms``, ``tree``. ``files_changed`` and
+        ``ms`` are best-effort — we don't compute them here, callers
+        may override via ``fields``.
+        """
+        run_id = os.environ.get("MINI_ORK_RUN_ID", self._run_id)
+        try:
+            from mini_ork.observability.node_events import mo_node_emit
+            mo_node_emit(
+                run_id, node_id="remote-workspace", node_type="workspace",
+                event_type=event_type, extra_json=json.dumps(fields),
+            )
+        except Exception:  # emitter must never break the sync
+            pass
+
+    # ------------------------------------------------------------------ workspace
+
     def exec(self, cmd: str, *, cwd: str, timeout: int) -> tuple[int, str]:
         if self._sid is None:
             raise RuntimeError("RemoteWorkspace.exec called before up()")
+        # Epic 07 §2: pre-sync only — verifiers and tool exec do not
+        # write the truth (epic 11), so we skip sync-down.
+        with self._sync_lock:
+            self._sync_up(force=False)
         # Use /v1/sessions/{run_id}/exec — argv=[sh,-c,cmd] so the server-side
         # argv-only contract is preserved (no shell interpolation by the
         # node-agent). The endpoint merges streams (its rc/output shape).
@@ -335,29 +494,34 @@ class RemoteWorkspace:
         argv_list = [str(a) for a in argv]
         if not argv_list:
             raise ValueError("spawn requires a non-empty argv")
-        # 1) POST /v1/sessions/{run_id}/procs — sends stdin ONCE in the body
-        # (the node-agent forwards it as a single write then closes the
-        # pipe); env_keys are the allowlisted key NAMES (values resolved at
-        # exec time from os.environ, NOT embedded in argv — the kickoff's
-        # "/proc/<pid>/environ is owner+root-only" analogue).
-        proc = self._json(
-            "POST",
-            f"/v1/sessions/{self._run_id}/procs",
-            {
-                "argv": argv_list,
-                "cwd": cwd or self._mount_path,
-                "env": dict(env),
-                "env_keys": sorted(env.keys()),
-                "stdin": stdin,
-                "timeout_s": timeout,
-            },
-        )
-        pid = int(proc["pid"])
-        # 2) Drain /v1/sessions/{run_id}/procs/{pid}/stream — JSON-lines with
-        # separate {"stream":"out"/"err","data":"..."} and a final
-        # {"stream":"exit","rc":...,"state":...}. We aggregate the two
-        # streams separately (the dispatch contract requires it).
-        return self._drain_stream(pid, timeout)
+        # Epic 07 §2: pre-sync + run + post-sync (always after spawn).
+        with self._sync_lock:
+            self._sync_up(force=False)
+            # 1) POST /v1/sessions/{run_id}/procs — sends stdin ONCE in the body
+            # (the node-agent forwards it as a single write then closes the
+            # pipe); env_keys are the allowlisted key NAMES (values resolved at
+            # exec time from os.environ, NOT embedded in argv — the kickoff's
+            # "/proc/<pid>/environ is owner+root-only" analogue).
+            proc = self._json(
+                "POST",
+                f"/v1/sessions/{self._run_id}/procs",
+                {
+                    "argv": argv_list,
+                    "cwd": cwd or self._mount_path,
+                    "env": dict(env),
+                    "env_keys": sorted(env.keys()),
+                    "stdin": stdin,
+                    "timeout_s": timeout,
+                },
+            )
+            pid = int(proc["pid"])
+            # 2) Drain /v1/sessions/{run_id}/procs/{pid}/stream — JSON-lines with
+            # separate {"stream":"out"/"err","data":"..."} and a final
+            # {"stream":"exit","rc":...,"state":...}. We aggregate the two
+            # streams separately (the dispatch contract requires it).
+            result = self._drain_stream(pid, timeout)
+            self._sync_down()
+            return result
 
     def _drain_stream(self, pid: int, timeout: float) -> tuple[int, str, str]:
         """Drain the proc stream endpoint until exit line; return (rc, out, err).
