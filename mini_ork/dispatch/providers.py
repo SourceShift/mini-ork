@@ -30,6 +30,7 @@ from .models import (
     TokenUsage,
     envelope_from_env,
 )
+from .pricing_strategy import lookup
 from .secrets import SecretStoreError, read_secret_exports, secret_store_path
 
 # Lanes with a non-Claude CLI. Codex + opencode use native Python transports;
@@ -171,12 +172,140 @@ def parse_claude_usage(stdout: str) -> TokenUsage:
 
 
 def claude_cost(stdout: str, _usage: TokenUsage) -> float:
-    """Claude reports real billed cost in the envelope — trust it over an
-    estimate."""
+    """Bill each ``modelUsage`` entry at its real list price, not the CLI's
+    default (which prices unknown models at Anthropic rates and overstates
+    anthropic-compat spend by 3-13x).
+
+    Per-model rule:
+    - Anthropic-prefixed names (case-insensitive, ``[...]`` suffix stripped)
+      keep the CLI's ``costUSD`` — Anthropic's own price is correct.
+    - Every other name is resolved against ``pricing.yaml``: input /
+      output / cache_read / cache_write are looked up per
+      ``pricing[provider][model][kind]`` (provider-key match wins, case
+      insensitive). Sum is
+      ``(in*M_in + out*M_out + cr*M_cr + cw*M_cw) / 1e6``.
+    - A model name absent from the table falls back to ``mu["costUSD"]``
+      (today's behaviour — never guess).
+
+    Pricing-table resolution matches ``codex_transport._pricing_rate``:
+    ``MO_PRICING_YAML`` env → ``$MINI_ORK_HOME/config/pricing.yaml`` →
+    ``.mini-ork/config/pricing.yaml``. The parsed table is cached per path
+    keyed by ``st_mtime_ns`` (nanosecond — same-second edits must not
+    serve stale data). Missing / malformed / unreadable file is treated as
+    an empty table (per spec step 2), so the sum-of-``costUSD`` fallback
+    still applies to each unknown model.
+
+    Any unexpected exception during load or accumulation falls back to
+    ``total_cost_usd`` — the meter must never crash a dispatch.
+    """
+    env = _claude_envelope(stdout)
     try:
-        return float(_claude_envelope(stdout).get("total_cost_usd") or 0.0)
+        total_cost_usd = float(env.get("total_cost_usd") or 0.0)
     except (ValueError, TypeError):
-        return 0.0
+        total_cost_usd = 0.0
+    model_usage = env.get("modelUsage")
+    if not isinstance(model_usage, dict) or not model_usage:
+        # Step 1 — no per-model breakdown → trust the bundled total.
+        return total_cost_usd
+    try:
+        data = _load_pricing_table()
+        return float(_sum_model_usage(model_usage, data))
+    except Exception:
+        # Step 4 — the meter must never crash a dispatch.
+        return total_cost_usd
+
+
+# Per-(path, mtime_ns) cache of parsed pricing.yaml tables. Private to
+# this module — never reaches across to other dispatch helpers.
+_PRICING_TABLE_CACHE: dict[str, tuple[int, dict | None]] = {}
+
+
+def _load_pricing_table() -> dict:
+    """Read ``pricing.yaml`` with the env precedence inherited from
+    ``codex_transport._pricing_rate``. Missing / malformed files return
+    an empty dict (per spec step 2) so step 3 still runs and emits a
+    sum-of-``costUSD`` figure rather than a hard fallback.
+    """
+    path = os.environ.get("MO_PRICING_YAML") or os.path.join(
+        os.environ.get("MINI_ORK_HOME") or ".mini-ork", "config", "pricing.yaml"
+    )
+    try:
+        mtime_ns = os.stat(path).st_mtime_ns
+    except OSError:
+        # Missing file → empty table, no cache (mtime-stamping a missing
+        # path would let a later file appear under a stale key).
+        return {}
+    cached = _PRICING_TABLE_CACHE.get(path)
+    if cached is not None and cached[0] == mtime_ns:
+        return cached[1] if isinstance(cached[1], dict) else {}
+    try:
+        with open(path, encoding="utf-8") as fh:
+            parsed = yaml.safe_load(fh)
+    except Exception:
+        parsed = None
+    if not isinstance(parsed, dict):
+        parsed = None
+    _PRICING_TABLE_CACHE[path] = (mtime_ns, parsed)
+    return parsed if parsed is not None else {}
+
+
+def _sum_model_usage(model_usage: dict, data: dict) -> float:
+    """Step 3 — accumulate one cost figure per ``modelUsage`` entry."""
+    total = 0.0
+    pricing = data.get("pricing") if isinstance(data, dict) else None
+    if not isinstance(pricing, dict):
+        pricing = {}
+    for raw_model, mu in model_usage.items():
+        if not isinstance(mu, dict):
+            continue
+        mu_cost = float(mu.get("costUSD") or 0.0)
+        normalized = re.sub(r"\[.*\]$", "", str(raw_model)).strip().lower()
+        if normalized.startswith("claude"):
+            # Anthropic model — CLI's billed figure is the contract price.
+            total += mu_cost
+            continue
+        # Find the (provider, model_key) for this model_name. Provider
+        # iteration order is insertion order; first hit wins, deterministic.
+        hit = _find_pricing_hit(pricing, normalized)
+        if hit is None:
+            # Unknown model — fall back to CLI billed figure (never guess).
+            total += mu_cost
+            continue
+        matched_provider, matched_key = hit
+        # pricing_strategy.lookup returns str ("0" on miss); float() it.
+        # Miss path (absent cache_read / cache_write) is the documented
+        # 0-rate default, not an error.
+        in_rate = float(lookup(data, matched_provider, matched_key, "input"))
+        out_rate = float(lookup(data, matched_provider, matched_key, "output"))
+        cr_rate = float(lookup(data, matched_provider, matched_key, "cache_read"))
+        cw_rate = float(lookup(data, matched_provider, matched_key, "cache_write"))
+        in_tok = float(mu.get("inputTokens") or 0)
+        out_tok = float(mu.get("outputTokens") or 0)
+        cr_tok = float(mu.get("cacheReadInputTokens") or 0)
+        cw_tok = float(mu.get("cacheCreationInputTokens") or 0)
+        total += (in_tok * in_rate + out_tok * out_rate
+                  + cr_tok * cr_rate + cw_tok * cw_rate) / 1e6
+    return total
+
+
+def _find_pricing_hit(pricing: object, normalized: str) -> tuple[str, str] | None:
+    """Walk the pricing table for a case-insensitive model match.
+
+    Returns ``(provider_name, yaml_model_key)`` on hit, ``None`` on miss.
+    Provider iteration order is insertion order; first hit wins so the
+    result is deterministic across runs.
+    """
+    if not isinstance(pricing, Mapping):
+        return None
+    for provider_name, provider_block in pricing.items():
+        if not isinstance(provider_block, Mapping):
+            continue
+        for model_key, model_block in provider_block.items():
+            if not isinstance(model_block, Mapping):
+                continue
+            if model_key.lower() == normalized:
+                return (str(provider_name), str(model_key))
+    return None
 
 
 def claude_session_id(stdout: str) -> str:
