@@ -1,7 +1,7 @@
 """Policy evaluation engine.
 
-Stateful, contextual policy decisions per the panel-revised plan at
-``docs/research/omnigent-vs-mini-ork-panel-synthesis.md``. Policies are
+Stateful, contextual policy decisions per the panel-revised plan.
+Policies are
 Python callables registered with ``register_policy()`` and evaluated
 in registration order until one returns a non-None response. The
 first non-None response wins; if all abstain, the default ALLOW

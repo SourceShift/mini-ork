@@ -129,3 +129,21 @@ claude_code_zai_env.sh
 tests/ui/snapshots/*.png
 tests/ui/test-results/
 *.apply-rollback-*
+
+# ---------------------------------------------------------------------------
+# Confidential strategy / competitive / investor material — never publish.
+# 2026-09-30 OSS scrub: these paths were tracked; they are removed from HEAD.
+# They remain reachable in history (a deliberate, costed decision), so these
+# guards exist to stop NEW copies re-entering the public tree. Nothing here
+# reveals more than the history already does.
+# ---------------------------------------------------------------------------
+docs/architecture/coevolve-ecosystem.md
+docs/product/options-latest.md
+docs/migration/self-migrate-feature-manifest.md
+docs/research/omnigent-*.md
+docs/research/mo-vs-omnigent-*.md
+docs/_meta/handoffs/audit-judge-panel-synthesis-*.md
+kickoffs/roadmap-tier4-ecosystem-launch.md
+kickoffs/roadmap-rlm-*.md
+recipes/mo-vs-omnigent/
+scripts/comparative-opinions.sh

@@ -8,5 +8,4 @@ rollback_policy: >
   Discard synthesis if verification fails.
 
 source_artifact: synthesis.md
-outputs:
-  - docs/_meta/handoffs/audit-judge-panel-synthesis-latest.md
+outputs: []

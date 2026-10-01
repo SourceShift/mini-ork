@@ -1,7 +1,6 @@
 """Token-based auth middleware for write endpoints (Epic E6).
 
-Implements the auth substrate per the panel-revised plan at
-``docs/research/omnigent-vs-mini-ork-panel-synthesis.md``. The panel
+Implements the auth substrate per the panel-revised plan. The panel
 dropped live collaboration entirely, but kept the HTTP API surface as
 substrate for third-party SDK clients (Python SDK, mobile, etc).
 

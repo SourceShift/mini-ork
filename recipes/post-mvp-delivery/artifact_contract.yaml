@@ -12,5 +12,4 @@ rollback_policy: >
   option package is incomplete.
 
 source_artifact: options.md
-outputs:
-  - docs/product/options-latest.md
+outputs: []
