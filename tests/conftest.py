@@ -23,6 +23,12 @@ import pytest
 @pytest.fixture(autouse=True)
 def _isolate_process_state():
     env_snapshot = dict(os.environ)
+    # Never let a test resolve the real credential store. secret_store_path()
+    # prefers MINI_ORK_SECRETS over MINI_ORK_HOME, so a test that points
+    # MINI_ORK_HOME at tmp_path and then writes secrets would overwrite the
+    # caller's real file whenever the suite runs under a mini-ork run that
+    # exported MINI_ORK_SECRETS (held-out tasks, framework-edit verifiers).
+    os.environ.pop("MINI_ORK_SECRETS", None)
     try:
         cwd_snapshot = os.getcwd()
     except OSError:
