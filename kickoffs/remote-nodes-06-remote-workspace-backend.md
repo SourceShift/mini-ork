@@ -74,7 +74,15 @@ boundary.
    - `put`/`get` round-trip
    - `up`/`down` are idempotent
    - repeated `spawn` on one `up` works (epic 02)
-   - the child env equals the allowlist plus the run contract exactly
+   - env: for the ISOLATED backends (`docker`, `remote`) a sentinel ambient key
+     that the allowlist does not admit (e.g. `MO_TEST_SECRET_SENTINEL` is admitted
+     by `MO_*` — use a non-matching name such as `ZZ_AMBIENT_SENTINEL`) must NOT
+     reach the child, while every run-contract key (`MINI_ORK_RUN_ID`, …) the
+     caller sets must arrive. Assert membership, not exact equality: the
+     node-agent legitimately adds `PATH` so it can find `docker`. `local` is
+     exempt by design — it is the host-parity backend and passes the full env
+     (attempts 1–2 failed precisely on an exact-equality rule that `local` cannot
+     satisfy; that rule was a kickoff error, now corrected)
 5. Docs: append "Selecting the remote backend" to
    `docs/operator/remote-nodes.md`.
 
