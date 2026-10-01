@@ -281,12 +281,23 @@ def _spawn_in_workspace(
     applied_env: Mapping[str, str] = env
     applied_cwd: str | None = cwd
     applied_stdin: str = stdin
+    if path_map is None and backend == "remote":
+        # Without the run's pinned roots there is nothing to translate host
+        # paths with, and a remote sandbox cannot see a single one of them.
+        raise ValueError(
+            "remote workspace needs the run's pinned roots (run_profile.json "
+            "'roots'); none were found for this dispatch"
+        )
     if path_map is not None:
+        from mini_ork.runtime.backends._workspace_env import isolated_env
         from mini_ork.runtime.path_map import PathMap
 
         if isinstance(path_map, PathMap):
             applied_argv = path_map.argv(list(argv))
-            applied_env = path_map.env(dict(env))
+            # The full sandbox env contract — allowlist, translated values,
+            # MINI_ORK_HOME=/workspace/mo-home, no MINI_ORK_DB, MO_REMOTE_NODE=1,
+            # no child spawn — not just translated values.
+            applied_env = isolated_env(env, path_map)
             if cwd is not None:
                 applied_cwd = path_map.path(cwd)
             if isinstance(stdin, str) and stdin:

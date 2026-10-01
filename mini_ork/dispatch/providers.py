@@ -1195,7 +1195,12 @@ def dispatch_model(
                 ),
                 model=request.model,
             )
+    # Isolation (D4): pick the workspace and attach the run's path map BEFORE
+    # the command is built — the sandbox MCP config and the portable transport
+    # argv both key off ``request.path_map``.
+    request = _attach_isolation(request, {**effective_env, **request.env})
     command = engine.build_command(spec.command, request=request, env=effective_env)
+    command = _portable_transport_command(command, request=request, env=effective_env)
     if command != spec.command:
         spec = replace(spec, command=command)
     # Merge lane env after removing stale gateway variables. Explicit request
@@ -1479,11 +1484,13 @@ def _write_node_mcp_config(
             for name, cfg in scoped.items():
                 cmd = cfg.get("command") if isinstance(cfg, dict) else None
                 cmd_str = str(cmd) if cmd is not None else ""
-                cmd_path = Path(cmd_str)
+                # Judge the command as the sandbox will see it: an engine
+                # server configured by its host path lives at /opt/mini-ork.
+                cmd_sandbox = path_map.path(cmd_str) if cmd_str else ""
                 keep = (
                     cmd_str in allow
-                    or str(cmd_path) in allow
-                    or cmd_str.startswith("/opt/mini-ork/")
+                    or cmd_sandbox in allow
+                    or cmd_sandbox.startswith("/opt/mini-ork/")
                     or cmd_str == "echo"
                 )
                 if keep:
@@ -1500,9 +1507,12 @@ def _write_node_mcp_config(
                         "args": [f"no-op: {name} dropped under sandbox"],
                     }
             sandbox_path = out_dir / ".mcp-config.sandbox.json"
+            # Kept servers may still carry host paths in args/env; translate
+            # every string so the sandbox copy is self-consistent.
+            sandbox_doc = json.loads(path_map.text(json.dumps({"mcpServers": sandbox_scoped})))
             try:
                 with open(sandbox_path, "w", encoding="utf-8") as fh:
-                    json.dump({"mcpServers": sandbox_scoped}, fh, indent=2)
+                    json.dump(sandbox_doc, fh, indent=2)
             except OSError:
                 pass
 
@@ -1554,12 +1564,16 @@ def apply_tool_grants(
         path_map = getattr(request, "path_map", None) if request is not None else None
         cfg_path = _write_node_mcp_config(mcp_csv, rd, env=env, path_map=path_map)
         if cfg_path:
-            # Under a path_map, translate the cfg_path through the same map so
-            # the in-sandbox child sees the sandbox-local copy of the file.
+            # Under a path_map the child must read the SANDBOX copy (dropped
+            # host binaries, translated paths), addressed by its sandbox path.
+            # The host .mcp-config.json still names host commands.
             if path_map is not None:
                 from mini_ork.runtime.path_map import PathMap
 
                 if isinstance(path_map, PathMap):
+                    sandbox_cfg = os.path.join(os.path.dirname(cfg_path), ".mcp-config.sandbox.json")
+                    if os.path.isfile(sandbox_cfg):
+                        cfg_path = sandbox_cfg
                     cfg_path = path_map.path(cfg_path)
             tool_flags += ["--mcp-config", cfg_path]
     # Insertion point: right before --output-format (or end), matching bash's
@@ -1648,6 +1662,29 @@ def _claude_command_builder(
     return command
 
 
+def _run_path_map(env: Mapping[str, str]) -> "object | None":
+    """The run's ``PathMap`` built from its pinned roots (remote-nodes-01),
+    or None when the dispatch has no run dir or the run never pinned roots."""
+    run_dir = (env.get("MINI_ORK_RUN_DIR") or "").strip()
+    if not run_dir:
+        return None
+    from mini_ork.runtime.path_map import PathMap
+    from mini_ork.runtime.run_roots import load_run_roots
+
+    roots = load_run_roots(run_dir)
+    return PathMap.from_roots(roots) if roots is not None else None
+
+
+def _attach_isolation(request: DispatchRequest, env: Mapping[str, str]) -> DispatchRequest:
+    """Resolve the request's workspace and, when it is isolated, attach the
+    run's path map. Host dispatches come back unchanged (byte parity), and an
+    explicit caller-supplied ``path_map`` is never replaced."""
+    workspace = _select_workspace(request.workspace, env)
+    if workspace == "host" or getattr(request, "path_map", None) is not None:
+        return request
+    return replace(request, workspace=workspace, path_map=_run_path_map(env))
+
+
 def _portable_transport_command(
     command: tuple[str, ...],
     *,
@@ -1692,19 +1729,6 @@ def _portable_transport_command(
 
     return command
 
-
-def _portable_transport_command_builder(
-    command: tuple[str, ...],
-    *,
-    request: DispatchRequest,
-    env: Mapping[str, str],
-) -> tuple[str, ...]:
-    """Thin wrapper so the SidecarTelemetryEngine engines can register
-    :func:`_portable_transport_command` via ``register_engine_command_builder``,
-    which expects a ``Callable[..., tuple[str, ...]]``. Keeps the type signature
-    explicit at the registration site.
-    """
-    return _portable_transport_command(command, request=request, env=env)
 
 
 def _dispatch_standard(request: DispatchRequest, spec: ProviderSpec) -> DispatchResult:
@@ -1917,8 +1941,9 @@ def register_engine_command_builder(
 # (``python3 -m mini_ork.dispatch.<mod>``) so the in-sandbox child
 # resolves the engine module at /opt/mini-ork. On host (no path_map),
 # the builder is a no-op pass-through so the argv stays byte-identical.
-for _engine_name in ('codex', 'opencode'):
-    register_engine_command_builder(_engine_name, _portable_transport_command_builder)
+# The portable rewrite is applied once in dispatch_model for every engine
+# (openai-chat runs through the claude engine's builder, so a per-engine
+# registration missed it).
 
 # ── Per-model dispatch backends (SOLID M6, OCP) ─────────────────────────────
 # Backend signature: (effective: DispatchRequest, spec: ProviderSpec)

@@ -107,8 +107,8 @@ def test_path_maps_under_each_root(tmp_path):
     real_target = os.path.realpath(_Roots.target)
     assert pm.path(f"{real_target}/foo") == "/workspace/target/foo"
     assert pm.path(f"{os.path.realpath(_Roots.run_dir)}/r1") == "/workspace/run/r1"
-    assert pm.path(f"{os.path.realpath(_Roots.home)}/py.db") == "/workspace/home/py.db"
-    assert pm.path(f"{os.path.realpath(_Roots.engine)}/bin") == "/workspace/mo-home/bin"
+    assert pm.path(f"{os.path.realpath(_Roots.home)}/py.db") == "/workspace/mo-home/py.db"
+    assert pm.path(f"{os.path.realpath(_Roots.engine)}/bin") == "/opt/mini-ork/bin"
 
 
 def test_path_root_itself_maps_to_sandbox_root(roots_map):
@@ -133,7 +133,7 @@ def test_env_translates_values_only(roots_map):
     out = roots_map.env(
         {"MINI_ORK_HOME": f"{real_home}/x", "PLAIN": "y", "PATH": "/usr/bin"}
     )
-    assert out["MINI_ORK_HOME"] == "/workspace/home/x"
+    assert out["MINI_ORK_HOME"] == "/workspace/mo-home/x"
     assert out["PLAIN"] == "y"
     assert out["PATH"] == "/usr/bin"
 
@@ -150,7 +150,7 @@ def test_text_rewrites_longest_prefix_first(tmp_path):
     # Nested case: the home root contains a Users-shaped directory. Without
     # longest-prefix-first, /Users inside $HOME would be mis-translated.
     s = f"{real_home}/Users/inner"
-    assert pm.text(s) == "/workspace/home/Users/inner"
+    assert pm.text(s) == "/workspace/mo-home/Users/inner"
 
 
 def test_text_is_idempotent(roots_map):
@@ -180,7 +180,7 @@ def test_json_file_round_trip(roots_map, tmp_path):
     pm_returned = roots_map.json_file(src, dst)
     assert pm_returned == dst
     payload = json.loads(dst.read_text())
-    assert payload["mcpServers"]["git"]["args"][2] == "/workspace/home/y"
+    assert payload["mcpServers"]["git"]["args"][2] == "/workspace/mo-home/y"
     # Non-string scalars survive the recursion untouched.
     assert payload["mcpServers"]["git"]["command"] == "python"
 

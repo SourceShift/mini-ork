@@ -141,13 +141,10 @@ def isolated_env(env: Mapping[str, str], path_map: "object") -> dict[str, str]:
       * adds ``MO_REMOTE_NODE=1`` (so agent-side helpers that open state.db
         refuse loudly) and ``MINI_ORK_ALLOW_CHILD_SPAWN=0`` (a sandboxed
         child must not spawn another),
-      * asserts no host path survives (forbidden = the map's host roots +
-        :data:`DEFAULT_FORBIDDEN`).
-
-    Pure + daemon-free; the only side effect is the assertion raising
-    ``UnmappedHostPathError`` when translation missed a leak.
+    Pure + daemon-free. Leak checking is the caller's job, because the policy
+    differs per backend (raise under ``remote``, warn under docker/local).
     """
-    from mini_ork.runtime.path_map import PathMap, UnmappedHostPathError
+    from mini_ork.runtime.path_map import PathMap
 
     if path_map is None:
         raise ValueError("isolated_env requires a non-None path_map")
@@ -161,12 +158,8 @@ def isolated_env(env: Mapping[str, str], path_map: "object") -> dict[str, str]:
     translated["MO_REMOTE_NODE"] = "1"
     translated["MINI_ORK_ALLOW_CHILD_SPAWN"] = "0"
 
-    # Sanity check: nothing that survived translation should still carry a
-    # host prefix. Raises UnmappedHostPathError on the first leak.
-    try:
-        path_map.assert_no_host_paths(env=translated)
-    except UnmappedHostPathError:
-        raise
+    # No assertion here: the caller (core._spawn_in_workspace) applies the
+    # per-backend leak policy — raise under ``remote``, warn elsewhere.
     return translated
 
 

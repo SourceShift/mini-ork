@@ -101,15 +101,19 @@ class PathMap:
 
             target → /workspace/target
             run    → /workspace/run
-            home   → /workspace/home
-            engine → /workspace/mo-home
+            home   → /workspace/mo-home   (MINI_ORK_HOME config subset)
+            engine → /opt/mini-ork        (MINI_ORK_ROOT, mounted read-only)
+
+        ``/workspace/home`` is the agent's own home (CLI config, transcripts),
+        not ``MINI_ORK_HOME``. Equal-length prefixes keep this order, so when
+        the target IS the engine root (a mini-ork self-edit) the target wins.
         """
         raw_pairs: list[tuple[str, str]] = []
         for host, sandbox in (
             (getattr(roots, "target", ""), "/workspace/target"),
             (getattr(roots, "run_dir", ""), "/workspace/run"),
-            (getattr(roots, "home", ""), "/workspace/home"),
-            (getattr(roots, "engine", ""), "/workspace/mo-home"),
+            (getattr(roots, "home", ""), "/workspace/mo-home"),
+            (getattr(roots, "engine", ""), "/opt/mini-ork"),
         ):
             norm = _normalize_prefix(host)
             if norm:
