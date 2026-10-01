@@ -332,14 +332,32 @@ def _spawn_in_workspace(
     # ``MINI_ORK_RUN_ID`` is the canonical signal that we are inside a run; an
     # empty run id falls through to the legacy one-shot lifecycle so ad-hoc
     # dispatch + tests keep today's exact behavior.
-    run_id = applied_env.get("MINI_ORK_RUN_ID", "") if isinstance(applied_env, Mapping) else env.get("MINI_ORK_RUN_ID", "")
+    # Session identity, the session marker and the live sidecar are HOST-side
+    # concerns: read them from the untranslated env. (The translated env maps
+    # MINI_ORK_RUN_DIR / MO_LIVE_FILE to sandbox paths that do not exist here —
+    # the marker kill_run depends on was being written to /workspace/run.)
+    host_env: Mapping[str, str] = env if isinstance(env, Mapping) else {}
+    run_id = host_env.get("MINI_ORK_RUN_ID", "")
+    live_file_path = host_env.get("MO_LIVE_FILE", "")
+    if isinstance(applied_env, dict):
+        applied_env.pop("MO_LIVE_FILE", None)   # the child never writes the sidecar
+    # Only the remote backend tees a live sidecar; docker/local/microvm spawn()
+    # do not take the kwarg (passing it broke them with a TypeError).
+    live_kwargs = {"live_file_path": live_file_path} if backend == "remote" else {}
     if run_id:
-        ws = get_run_session(run_id, backend, env=applied_env)
-        return ws.spawn(list(applied_argv), stdin=applied_stdin, timeout=timeout, env=applied_env, cwd=applied_cwd)
+        ws = get_run_session(run_id, backend, env=host_env)
+        # ``live_file_path`` is an OPTIONAL backend kwarg (remote-nodes-09):
+        # RemoteWorkspace uses it to tee per-chunk lines to the node's live
+        # sidecar; LocalWorkspace ignores it (host path already tees via
+        # ``spawn_local``). The Workspace Protocol deliberately doesn't declare
+        # the kwarg so 30+ existing callers stay unchanged.
+        return ws.spawn(list(applied_argv), stdin=applied_stdin, timeout=timeout,
+                        env=applied_env, cwd=applied_cwd, **live_kwargs)
     ws = resolve_spawn_workspace(backend, env=applied_env, cwd=applied_cwd)
     ws.up()
     try:
-        return ws.spawn(list(applied_argv), stdin=applied_stdin, timeout=timeout, env=applied_env, cwd=applied_cwd)
+        return ws.spawn(list(applied_argv), stdin=applied_stdin, timeout=timeout,
+                        env=applied_env, cwd=applied_cwd, **live_kwargs)
     finally:
         ws.down()
 

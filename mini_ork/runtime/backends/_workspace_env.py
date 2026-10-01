@@ -155,6 +155,10 @@ def isolated_env(env: Mapping[str, str], path_map: "object") -> dict[str, str]:
     translated = path_map.env(base)
     translated["MINI_ORK_HOME"] = "/workspace/mo-home"
     translated.pop("MINI_ORK_DB", None)
+    # The node-agent's bearer token authenticates the CONTROL plane to the node;
+    # the agent inside the sandbox must never hold it (MO_* is allowlisted).
+    for key in [k for k in translated if k.startswith("MO_NODE_TOKEN")]:
+        translated.pop(key, None)
     translated["MO_REMOTE_NODE"] = "1"
     translated["MINI_ORK_ALLOW_CHILD_SPAWN"] = "0"
 

@@ -142,6 +142,12 @@ class PathMap:
         """
         if not isinstance(p, str) or not p:
             return p
+        if not p.startswith("/"):
+            # Only absolute strings are paths. realpath() resolves "-c",
+            # "--print" or an env value like "1" against the CWD, so whenever
+            # the process runs inside a mapped root (the executor usually runs
+            # in the target repo) plain arguments became "/workspace/target/-c".
+            return p
         norm = _try_realpath(p)
         for host_prefix, sandbox_prefix in self.pairs:
             if not host_prefix:

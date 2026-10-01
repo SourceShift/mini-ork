@@ -122,6 +122,17 @@ def _resolve_backend_workspace(
     return resolve_spawn_workspace(backend, env=env, cwd=cwd)
 
 
+def _node_locator(workspace: Workspace) -> dict[str, Any]:
+    """Where a remote session lives, for an out-of-process ``kill_run``: the
+    node's name + URL and the NAME of the env var holding its token — never the
+    token itself (the marker is a file on disk)."""
+    node = getattr(workspace, "_node", None)
+    if node is None or not getattr(node, "url", ""):
+        return {}
+    return {"node": {"name": getattr(node, "name", ""), "url": node.url},
+            "token_env": getattr(workspace, "_token_env", "MO_NODE_TOKEN")}
+
+
 def _extract_session_id(workspace: Workspace, backend: str) -> str:
     """Pull the backend's session id from its private state.
 
@@ -136,6 +147,10 @@ def _extract_session_id(workspace: Workspace, backend: str) -> str:
         cid = getattr(workspace, "_cid", None)
         if cid:
             return str(cid)
+    if backend == "remote":
+        sid = getattr(workspace, "_sid", None)
+        if sid:
+            return str(sid)
     name = getattr(workspace, "_name", None)
     if name:
         return str(name)
@@ -216,6 +231,7 @@ def get_run_session(
                         "%Y-%m-%dT%H:%M:%SZ"
                     ),
                     "run_id": run_id,
+                    **_node_locator(ws),
                 },
             )
         except OSError:

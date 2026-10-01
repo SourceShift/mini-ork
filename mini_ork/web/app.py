@@ -19,6 +19,7 @@ from .routes import (
     fleet,
     idea_tree as idea_tree_routes,
     learning,
+    node_live as node_live_routes,
     projects,
     pty as pty_routes,
     recovery as recovery_routes,
@@ -112,6 +113,11 @@ def create_app(home: Path | None = None, dev_cors: bool = True) -> FastAPI:
     # without — the "Disconnected" chip. `sockets` is already reserved in
     # _NON_SPA_PREFIXES, so the upgrade never reaches the index.html fallback.
     app.include_router(sockets_routes.router)
+    # remote-nodes-09: GET /api/v1/runs/{run_id}/nodes/{node}/live — the
+    # byte-offset read surface for the live sidecar the dispatch path writes
+    # under ``<run_dir>/agent-<node>.live.jsonl``. Mounted before the SPA
+    # catch-all so a polling client never hits the index.html fallback.
+    app.include_router(node_live_routes.router)
 
     @app.get("/api")
     def api_index() -> JSONResponse:

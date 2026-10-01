@@ -47,6 +47,8 @@ from typing import Any, NamedTuple
 from urllib import error as urllib_error
 from urllib import request as urllib_request
 
+from mini_ork.dispatch.live_stream import LiveWriter
+from mini_ork.dispatch.live_stream import live_file_path as _resolve_live_file_path
 from mini_ork.runtime.sandbox import register_workspace_backend
 
 __all__ = [
@@ -60,6 +62,18 @@ _SPAWN_FAILED_RC = 127  # mirror mini_ork.remote.node_agent.procs._RC_SPAWN_FAIL
 _DEFAULT_RETRIES = 5
 _DEFAULT_BACKOFF_S = 0.2  # jittered; 5 * ~0.6s = ~3s before raising
 _PUT_ROOT = "run"  # node-agent's _resolve_root allowlist: run | home | mo-home
+
+# remote-nodes-09: per-spawn pid journal ``<run_dir>/.remote-pids.jsonl``. Read by
+# the web control plane's ``kill_run`` to fan a single user kill into per-pid
+# ``POST /kill`` calls without a list-procs endpoint on the node-agent.
+_PID_JOURNAL_NAME = ".remote-pids.jsonl"
+_PID_JOURNAL_LOCK_NAME = ".remote-pids.lock"
+
+# remote-nodes-09: client-side buffer the client tolerates beyond ``timeout_s``
+# before posting ``kill`` and returning ``rc=124``. Distinct from the node-agent's
+# own server-side timeout enforcement (kickoff §4).
+_REMOTE_KILL_GRACE_ENV = "MO_REMOTE_KILL_GRACE_S"
+_DEFAULT_KILL_GRACE_S = 30.0
 
 
 def _env_int_mb(name: str, default_mb: int) -> int:
@@ -182,6 +196,11 @@ class RemoteWorkspace:
         # it explicitly via the resolver/factory so the agents that read
         # ${MINI_ORK_RUN_DIR} see the same files locally and remotely.
         self._run_dir: str | None = run_dir or os.environ.get("MINI_ORK_RUN_DIR")
+        # remote-nodes-09: per-spawn pid journal location. Resolved lazily
+        # so a workspace constructed before ``MINI_ORK_RUN_DIR`` is set
+        # (e.g. an ad-hoc dispatch from the CLI) doesn't crash on import.
+        self._pid_journal: Path | None = None
+        self._pid_journal_lock = threading.Lock()
 
     # ------------------------------------------------------------------ helpers
 
@@ -528,58 +547,94 @@ class RemoteWorkspace:
         timeout: float,
         env: Mapping[str, str],
         cwd: str | None,
+        live_file_path: str = "",
     ) -> tuple[int, str, str]:
         if self._sid is None:
             raise RuntimeError("RemoteWorkspace.spawn called before up()")
         argv_list = [str(a) for a in argv]
         if not argv_list:
             raise ValueError("spawn requires a non-empty argv")
-        # Pre: tree sync-up (epic 07) + run-dir push (epic 08).
-        with self._sync_lock:
-            self._sync_up(force=False)
-        self.mirror_push()
+        # remote-nodes-09: tee to the per-node live sidecar while the proc runs.
+        # The dispatch layer passes the host path; MO_LIVE_FILE is the fallback.
+        live_path = live_file_path or _resolve_live_file_path()
+        live = LiveWriter(live_path) if live_path else None
+        node_id = (env.get("MO_NODE_ID", "") if isinstance(env, Mapping) else "").strip()
+        self._emit_proc_event("remote.proc.start", node=node_id, proc_id="pending",
+                              node_host=self._node.name)
+        start_ms = int(time.time() * 1000)
+        rc = _SPAWN_FAILED_RC
         try:
-            # 1) POST /v1/sessions/{run_id}/procs — sends stdin ONCE in the body
-            # (the node-agent forwards it as a single write then closes the
-            # pipe); env_keys are the allowlisted key NAMES (values resolved at
-            # exec time from os.environ, NOT embedded in argv — the kickoff's
-            # "/proc/<pid>/environ is owner+root-only" analogue).
-            proc = self._json(
-                "POST",
-                f"/v1/sessions/{self._run_id}/procs",
-                {
-                    "argv": argv_list,
-                    "cwd": cwd or self._mount_path,
-                    "env": dict(env),
-                    "env_keys": sorted(env.keys()),
-                    "stdin": stdin,
-                    "timeout_s": timeout,
-                },
-            )
-            pid = int(proc["pid"])
-            # 2) Drain /v1/sessions/{run_id}/procs/{pid}/stream — JSON-lines with
-            # separate {"stream":"out"/"err","data":"..."} and a final
-            # {"stream":"exit","rc":...,"state":...}. We aggregate the two
-            # streams separately (the dispatch contract requires it).
-            rc, out, err = self._drain_stream(pid, timeout)
-            # The agent's tree edits come back as uncommitted changes (epic 07);
-            # a SyncConflictError propagates after the run dir is still pulled.
-            self._sync_down()
+            # Pre: tree sync-up (epic 07) + run-dir push (epic 08). Only the sync
+            # steps hold the session lock, so parallel spawns on one session still
+            # run concurrently.
+            with self._sync_lock:
+                self._sync_up(force=False)
+            self.mirror_push()
+            try:
+                # 1) POST .../procs — stdin goes once in the body; env values ride
+                # the request (never argv) and the node-agent persists keys only.
+                proc = self._json(
+                    "POST",
+                    f"/v1/sessions/{self._run_id}/procs",
+                    {
+                        "argv": argv_list,
+                        "cwd": cwd or self._mount_path,
+                        "env": dict(env),
+                        "env_keys": sorted(env.keys()),
+                        "stdin": stdin,
+                        "timeout_s": timeout,
+                    },
+                )
+                pid = int(proc["pid"])
+                # The pid journal lets kill_run fan a kill out per pid (the
+                # node-agent has no list-procs endpoint).
+                self._record_pid(pid, node_id=node_id, argv0=argv_list[0] if argv_list else "")
+                # 2) Drain the JSON-lines stream (out/err kept separate), teeing live.
+                rc, out, err = self._drain_stream(pid, timeout, live_writer=live)
+                # Post: the agent's tree edits come back as uncommitted changes.
+                with self._sync_lock:
+                    self._sync_down()
+            finally:
+                self.mirror_pull()   # the run dir comes back even on a sync conflict
+            return rc, out, err
         finally:
-            self.mirror_pull()
-        return rc, out, err
+            self._emit_proc_event("remote.proc.exit", node=node_id, rc=rc,
+                                  ms=int(time.time() * 1000) - start_ms, killed=False)
+            if live is not None:
+                live.close()
 
-    def _drain_stream(self, pid: int, timeout: float) -> tuple[int, str, str]:
+    def _drain_stream(
+        self,
+        pid: int,
+        timeout: float,
+        *,
+        live_writer: LiveWriter | None = None,
+    ) -> tuple[int, str, str]:
         """Drain the proc stream endpoint until exit line; return (rc, out, err).
 
         Streams are kept separate (the spawn contract requires it; merging
         would corrupt the provider's JSON envelope on stdout). The node-agent
         also reports ``state="timeout"`` on its own timeout — we mirror that
         as the conventional ``rc=124`` with an empty stdout + stderr message.
+
+        ``live_writer`` (remote-nodes-09): when provided, every out/err chunk
+        is teed through ``LiveWriter.write_line`` so a tailer polling the
+        live sidecar sees each line as it arrives, not at exit.
         """
         out = io.StringIO()
         err = io.StringIO()
-        deadline = time.time() + timeout + 5
+        # remote-nodes-09 §4: client-side deadline is ``timeout_s`` PLUS
+        # ``MO_REMOTE_KILL_GRACE_S`` (default 30). On expiry we post ``kill``
+        # and return rc=124, so the client never waits unbounded on a remote
+        # process — the kickoff's hard constraint.
+        grace_s = _DEFAULT_KILL_GRACE_S
+        raw_grace = os.environ.get(_REMOTE_KILL_GRACE_ENV, "").strip()
+        if raw_grace:
+            try:
+                grace_s = max(0.0, float(raw_grace))
+            except ValueError:
+                grace_s = _DEFAULT_KILL_GRACE_S
+        deadline = time.time() + timeout + grace_s
         last_rc: int = 0
         last_state: str = ""
         while True:
@@ -607,10 +662,15 @@ class RemoteWorkspace:
                 except json.JSONDecodeError:
                     continue
                 stream = msg.get("stream")
+                data = msg.get("data", "")
                 if stream == "out":
-                    out.write(msg.get("data", ""))
+                    out.write(data)
+                    if live_writer is not None and data:
+                        live_writer.write_line(data, "stdout", partial=not data.endswith("\n"))
                 elif stream == "err":
-                    err.write(msg.get("data", ""))
+                    err.write(data)
+                    if live_writer is not None and data:
+                        live_writer.write_line(data, "stderr", partial=not data.endswith("\n"))
                 elif stream == "exit":
                     last_rc = int(msg.get("rc", _SPAWN_FAILED_RC))
                     last_state = str(msg.get("state", ""))
@@ -620,7 +680,11 @@ class RemoteWorkspace:
                         last_rc = _SPAWN_FAILED_RC
                     return last_rc, out.getvalue(), err.getvalue()
             if time.time() > deadline:
-                # Self-imposed deadline — kill the proc and report timeout.
+                # Client-side deadline (timeout + grace) — kill the proc and
+                # report timeout. The node-agent also enforces timeout_s
+                # server-side; the client grace is the additional buffer the
+                # caller is willing to wait for the server's own kill to take
+                # effect.
                 try:
                     self._request(
                         "POST",
@@ -632,6 +696,129 @@ class RemoteWorkspace:
                     err.getvalue() + f"\ntimeout after {timeout}s"
                 ).lstrip()
             time.sleep(0.05)
+
+    # ------------------------------------------------------------------ epic 09: live + kill
+
+    def _resolve_pid_journal(self) -> Path | None:
+        """Resolve the per-run pid journal path, or None when no run_dir.
+
+        The journal lives under the run dir (``<run_dir>/.remote-pids.jsonl``)
+        so the web control plane — which reads ``<home>/runs/<run_id>/...`` —
+        can find the same pids without needing shared process memory. Lazy
+        because a workspace constructed before ``MINI_ORK_RUN_DIR`` is set
+        (e.g. an ad-hoc dispatch from the CLI) does not have a run_dir.
+        """
+        if self._pid_journal is not None:
+            return self._pid_journal
+        # The constructor's run_dir first: an out-of-process kill_run (the serve
+        # process) has no MINI_ORK_RUN_DIR but knows the run dir it is killing.
+        run_dir = (self._run_dir or os.environ.get("MINI_ORK_RUN_DIR") or "").strip()
+        if not run_dir:
+            return None
+        self._pid_journal = Path(run_dir) / _PID_JOURNAL_NAME
+        return self._pid_journal
+
+    def _record_pid(self, pid: int, *, node_id: str, argv0: str) -> None:
+        """Append ``{pid, node_id, argv0, ts}`` to the per-run journal.
+
+        Best-effort: a missing run_dir (ad-hoc dispatch) means no journal,
+        which means ``kill_all`` cannot target pids later — but ad-hoc
+        dispatches also don't outlive the CLI invocation, so the lack of a
+        cross-process kill path is not a regression. The lock guards against
+        parallel-pool spawns racing on the file.
+        """
+        path = self._resolve_pid_journal()
+        if path is None:
+            return
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with self._pid_journal_lock:
+                with path.open("a", encoding="utf-8") as fh:
+                    fh.write(json.dumps(
+                        {
+                            "pid": int(pid),
+                            "node_id": node_id,
+                            "argv0": argv0,
+                            "ts": int(time.time() * 1000),
+                        }
+                    ) + "\n")
+        except OSError:
+            # Journal write is best-effort; the in-flight spawn is unaffected.
+            pass
+
+    def _emit_proc_event(self, event_type: str, **fields: Any) -> None:
+        """Fire a ``remote.proc.start`` / ``remote.proc.exit`` event.
+
+        Mirrors ``_emit_sync_event``: silent if the run-event emitter is
+        unavailable (no DB in scope); the audit shape is what kickoff §5
+        demands — ``{node, proc_id, node_host}`` for start,
+        ``{rc, ms, killed}`` for exit. ``proc_id`` is the node-agent's pid
+        stringified so a downstream consumer can correlate with the journal.
+        """
+        run_id = os.environ.get("MINI_ORK_RUN_ID", self._run_id)
+        try:
+            from mini_ork.observability.node_events import mo_node_emit
+            mo_node_emit(
+                run_id, node_id="remote-workspace", node_type="workspace",
+                event_type=event_type, extra_json=json.dumps(fields),
+            )
+        except Exception:  # emitter must never break the dispatch
+            pass
+
+    def kill_all(self, *, budget_s: float = 10.0) -> bool:
+        """Kill every spawned proc of this session within ``budget_s`` seconds.
+
+        Reads the per-run pid journal and posts ``POST /kill`` per pid. The
+        node-agent exposes no list-procs endpoint today, so the journal is
+        the authoritative cross-process kill surface that the web control
+        plane (``control.kill_run``) can reach without going through the
+        dispatch process. Bounded: a missing journal, a transport error on
+        the first kill, or a slow first kill does not blow the budget —
+        every step is best-effort and the function never raises (the kill
+        path's "best-effort" semantic mirrors ``Workspace.down()``).
+
+        Returns True iff at least one pid was targeted. Returns False when
+        no journal exists or no pids were recorded — both expected when
+        the session has been idle (no spawns yet) or the run has no run_dir.
+        """
+        path = self._resolve_pid_journal()
+        if path is None or not path.exists():
+            return False
+        deadline = time.monotonic() + max(0.0, budget_s)
+        # Read once under the lock so a concurrent spawn's append does not
+        # race the iteration; missing pids on the node-agent side are
+        # absorbed as HTTPError → ignored (best-effort).
+        with self._pid_journal_lock:
+            try:
+                raw = path.read_text(encoding="utf-8")
+            except OSError:
+                return False
+        targeted = 0
+        for raw_line in raw.splitlines():
+            if time.monotonic() > deadline:
+                break
+            raw_line = raw_line.strip()
+            if not raw_line:
+                continue
+            try:
+                entry = json.loads(raw_line)
+                pid = int(entry.get("pid", 0))
+            except (ValueError, json.JSONDecodeError):
+                continue
+            if pid <= 0:
+                continue
+            try:
+                self._request(
+                    "POST",
+                    f"/v1/sessions/{self._run_id}/procs/{pid}/kill",
+                )
+                targeted += 1
+            except RemoteUnavailableError:
+                # Transport dead — nothing more we can do within budget.
+                # The TTL reaper (``sandbox_reaper.reap_sandboxes``) is the
+                # safety net for crashed runs that bypass teardown.
+                continue
+        return targeted > 0
 
     def put(self, content: str) -> str:
         if self._sid is None:

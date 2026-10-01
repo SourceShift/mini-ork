@@ -238,6 +238,53 @@ def kill_run(home: Path, db: StateDB, task_run_id: str) -> dict[str, Any]:
                     timeout=10,
                     check=False,
                 )
+            elif backend == "remote" and cid:
+                # remote-nodes-09: kill every spawned proc of the session
+                # under a 10 s total budget, then DELETE the session — mirrors
+                # the docker branch's "shorten the leak window" semantics.
+                # The remote backend has no list-procs endpoint, so the
+                # journal at <run_dir>/.remote-pids.jsonl is the authoritative
+                # source. Bounded + best-effort: a missing journal, a dead
+                # node-agent, or a slow first kill MUST never raise out of
+                # kill_run — the in-memory pid journal is advisory, the TTL
+                # reaper (``sandbox_reaper.reap_sandboxes``) is the safety
+                # net for anything that bypasses this branch.
+                try:
+                    from mini_ork.runtime.backends.remote import (
+                        RemoteWorkspace,
+                        _NodeRef,
+                    )
+                    # The marker says where the session lives (written at up());
+                    # this serve process need not share the executor's env.
+                    node_info = info.get("node") or {}
+                    token_env = info.get("token_env") or "MO_NODE_TOKEN"
+                    remote_ws = RemoteWorkspace(
+                        node=_NodeRef(name=node_info.get("name") or "kill_run",
+                                      url=node_info.get("url") or os.environ.get("MO_NODE_URL", ""),
+                                      token=os.environ.get(token_env, ""),
+                                      max_sessions=1),
+                        token_env=token_env,
+                        run_id=task_run_id,
+                        image=os.environ.get("MO_SANDBOX_IMAGE", "alpine:latest"),
+                        drive_root=os.environ.get("MO_SHARED_DRIVE_ROOT") or os.getcwd(),
+                        engine_root=os.environ.get("MINI_ORK_ROOT") or os.getcwd(),
+                        retries=1,
+                        target_root=None,
+                        run_dir=str(run_dir),   # where the pid journal lives
+                    )
+                    # The session already exists (marker proves it); skip up()
+                    # by replaying the sid — up() is idempotent on the
+                    # node-agent (POST /v1/sessions on a known run_id returns
+                    # the existing sid).
+                    remote_ws._sid = cid  # type: ignore[attr-defined]
+                    try:
+                        remote_ws.kill_all(budget_s=10.0)
+                    finally:
+                        remote_ws.down()
+                except (OSError, ValueError, subprocess.TimeoutExpired, ImportError):
+                    # ImportError kills RemoteWorkspace import-time (e.g. no
+                    # node-agent server reachable) — best-effort.
+                    pass
             marker.unlink(missing_ok=True)
             _marker_reaped = True
         except (OSError, ValueError, subprocess.TimeoutExpired):

@@ -305,3 +305,22 @@ def test_assert_no_host_paths_finds_an_under_root_leak(roots_map):
     with pytest.raises(UnmappedHostPathError) as ei:
         roots_map.assert_no_host_paths(env={"PATH": f"{real_target}/bin"})
     assert ei.value.channel.startswith("env[")
+
+
+def test_relative_tokens_are_never_mapped_even_from_inside_a_root(tmp_path, monkeypatch):
+    """Regression: running from inside a mapped root turned '-c' into
+    '/workspace/target/-c' (realpath resolves relative strings against the CWD)."""
+    target = tmp_path / "target"
+    target.mkdir()
+
+    class _Roots:
+        pass
+
+    r = _Roots()
+    r.target, r.run_dir, r.home, r.engine = str(target), str(tmp_path / "run"), "", ""
+    pm = PathMap.from_roots(r)
+    monkeypatch.chdir(target)
+    assert pm.argv(["/bin/sh", "-c", "--print", "rel/file.txt", "1"]) == \
+        ["/bin/sh", "-c", "--print", "rel/file.txt", "1"]
+    assert pm.env({"MO_REMOTE_NODE": "1", "LANE": "glm"}) == {"MO_REMOTE_NODE": "1", "LANE": "glm"}
+    assert pm.path(str(target / "a.py")) == "/workspace/target/a.py"

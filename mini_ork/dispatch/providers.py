@@ -1682,7 +1682,15 @@ def _attach_isolation(request: DispatchRequest, env: Mapping[str, str]) -> Dispa
     workspace = _select_workspace(request.workspace, env)
     if workspace == "host" or getattr(request, "path_map", None) is not None:
         return request
-    return replace(request, workspace=workspace, path_map=_run_path_map(env))
+    extra_env: dict[str, str] = {}
+    run_dir = (env.get("MINI_ORK_RUN_DIR") or "").strip()
+    node_id = (env.get("MO_NODE_ID") or "").strip()
+    if run_dir and node_id and not env.get("MO_LIVE_FILE"):
+        # remote-nodes-09: an isolated node's output is teed live to the host
+        # sidecar the UI's /live route reads; the host Popen path never needed it.
+        extra_env["MO_LIVE_FILE"] = os.path.join(run_dir, f"agent-{node_id}.live.jsonl")
+    return replace(request, workspace=workspace, path_map=_run_path_map(env),
+                   env={**dict(request.env or {}), **extra_env})
 
 
 def _portable_transport_command(
