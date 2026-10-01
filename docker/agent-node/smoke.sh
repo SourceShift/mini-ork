@@ -69,11 +69,11 @@ fi
 # check "<label>" <container_exec_argv...>
 check() {
     local label="$1"; shift
-    if docker exec "$@" "${CONTAINER_NAME}" >/dev/null 2>&1; then
+    if docker exec "${CONTAINER_NAME}" "$@" >/dev/null 2>&1; then
         printf '  ok  %s\n' "${label}"
     else
         echo "smoke: ${label}: FAILED" >&2
-        docker exec "$@" "${CONTAINER_NAME}" 2>&1 | sed 's/^/    | /' >&2 || true
+        docker exec "${CONTAINER_NAME}" "$@" 2>&1 | sed 's/^/    | /' >&2 || true
         exit 1
     fi
 }

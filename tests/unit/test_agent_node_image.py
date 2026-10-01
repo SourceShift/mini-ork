@@ -129,12 +129,14 @@ def bind_drive_root(tmp_path):
     if not _image_ready(TEST_IMAGE):
         pytest.skip(f"test image {TEST_IMAGE} unavailable/unpullable")
     chosen: str | None = None
-    for base in (str(tmp_path), os.path.expanduser("~")):
+    # colima shares only selected host volumes (often neither TMPDIR nor $HOME),
+    # so also try the repo itself — a checkout on a shared volume is visible.
+    for base in (str(tmp_path), os.path.expanduser("~"), str(REPO_ROOT)):
         chosen = _bind_visible_dir(base)
         if chosen:
             break
     if not chosen:
-        pytest.skip("no docker-bind-visible directory (colima shares neither tmp nor $HOME)")
+        pytest.skip("no docker-bind-visible directory (tried tmp, $HOME and the repo)")
     try:
         yield chosen
     finally:
@@ -325,8 +327,15 @@ def test_dockerfile_installs_real_base_packages():
 
 def test_dockerfile_installs_pyproject_base_dependencies():
     text = _read_dockerfile()
-    assert "PyYAML" in text, "Dockerfile must install PyYAML (pyproject.toml base dep)"
-    assert "jsonschema" in text, "Dockerfile must install jsonschema (pyproject.toml base dep)"
+    # The deps are read from pyproject.toml at build time, not hand-copied, and
+    # installed past Debian's PEP 668 externally-managed guard.
+    assert "COPY pyproject.toml" in text
+    assert "tomllib" in text and "['project']['dependencies']" in text, (
+        "Dockerfile must derive the deps from pyproject.toml [project].dependencies"
+    )
+    assert "--break-system-packages" in text, (
+        "bookworm's system python is EXTERNALLY-MANAGED; a bare pip install aborts the build"
+    )
     # Cross-check: pyproject.toml actually lists these as base deps (not in
     # some optional [full] extra), so the assertion is grounded.
     pyproject_text = PYPROJECT.read_text(encoding="utf-8")
@@ -393,10 +402,11 @@ def test_build_and_smoke_single_arch(bind_drive_root):
     (staging / "pyproject.toml").write_text(
         PYPROJECT.read_text(encoding="utf-8"), encoding="utf-8"
     )
-    # Symlink the docker/agent-node tree into the staging dir.
-    agent_node_link = staging / "docker"
-    if not agent_node_link.exists():
-        os.symlink(REPO_ROOT / "docker", agent_node_link)
+    # The smoke step imports mini_ork from the mounted engine, so the engine dir
+    # needs the real package — a symlink out of the bind-visible dir would not
+    # resolve inside the container.
+    shutil.copytree(REPO_ROOT / "mini_ork", staging / "mini_ork",
+                    ignore=shutil.ignore_patterns("__pycache__"), dirs_exist_ok=True)
 
     # Build (host platform; do not push; --load into the local daemon).
     r = subprocess.run(

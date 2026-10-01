@@ -147,3 +147,6 @@ kickoffs/roadmap-tier4-ecosystem-launch.md
 kickoffs/roadmap-rlm-*.md
 recipes/mo-vs-omnigent/
 scripts/comparative-opinions.sh
+
+# docker bind-visibility probes left by an interrupted test run
+.mo-bindprobe-*/

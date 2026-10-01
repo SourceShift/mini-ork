@@ -76,9 +76,16 @@ if [ "${MULTIARCH}" -eq 1 ]; then
     PLATFORM="linux/amd64,linux/arm64"
     BUILDX_CMD=(docker buildx build --builder "${BUILDER_NAME}")
 else
-    PLATFORM="$(docker version --format '{{.ServerVersion}}' >/dev/null 2>&1 && uname -m | sed 's/x86_64/linux\/amd64/; s/aarch64/linux\/arm64/')"
+    # The image runs on the DAEMON's architecture, not the client's: on a Mac
+    # `uname -m` says arm64 (no `linux/` prefix, and not aarch64), while the
+    # colima/Docker Desktop VM reports its own arch here.
+    PLATFORM="linux/$(docker version --format '{{.Server.Arch}}')"
     BUILDX_CMD=(docker buildx build)
 fi
+
+# The context is the repo root (the Dockerfile COPYs pyproject.toml); the
+# sibling Dockerfile.dockerignore narrows it to that one file.
+BUILDX_CMD+=("-f" "${REPO_ROOT}/docker/agent-node/Dockerfile")
 
 TAG_FLAGS=(
     "-t" "mini-ork/agent-node:${SHORT_SHA}"

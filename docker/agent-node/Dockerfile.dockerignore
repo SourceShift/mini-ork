@@ -1,0 +1,3 @@
+# BuildKit per-Dockerfile ignore: the only file the build needs is pyproject.toml.
+*
+!pyproject.toml

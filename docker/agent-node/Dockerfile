@@ -94,10 +94,15 @@ RUN npm install -g \
 # Non-editable on purpose: the engine mount is read-only. An editable install
 # would point at /opt/mini-ork and break the first time the engine tree is
 # replaced with a new sha.
+# Read [project].dependencies from pyproject.toml so the image tracks the
+# engine's declared deps instead of a hand-copied list. Debian bookworm marks
+# its system python EXTERNALLY-MANAGED (PEP 668), so a bare `pip install`
+# aborts the build; this image IS the environment, hence --break-system-packages.
 COPY pyproject.toml /tmp/mini-ork-pyproject/pyproject.toml
-RUN pip install --no-cache-dir \
-        "PyYAML>=6.0" \
-        "jsonschema>=4.0"
+RUN python3 -c "import tomllib; print('\n'.join(tomllib.load(open('/tmp/mini-ork-pyproject/pyproject.toml', 'rb'))['project']['dependencies']))" \
+        > /tmp/mini-ork-pyproject/requirements.txt \
+ && pip install --no-cache-dir --break-system-packages -r /tmp/mini-ork-pyproject/requirements.txt \
+ && rm -rf /tmp/mini-ork-pyproject
 
 # --- non-root user ----------------------------------------------------------
 # Claude Code refuses `bypassPermissions` when run as root, and dispatch sets it
