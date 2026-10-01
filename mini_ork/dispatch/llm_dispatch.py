@@ -162,26 +162,58 @@ def glm_fair_usage_retryable(model, message, attempt=1, max_attempts=1) -> bool:
 
 # ── lane resolution + cost circuit + fuse ──
 
-def resolve_lane_model(node_type, root, home) -> str:
-    """agents.yaml lanes.<node_type> → lanes.worker → worker_default → sonnet."""
-    agents = os.path.join(home, "config", "agents.yaml")
-    if not os.path.isfile(agents):
-        agents = os.path.join(root, "config", "agents.yaml")
-    if not os.path.isfile(agents):
-        return "sonnet"
+def _effective_lanes(root: str, home: str) -> dict | None:
+    """``lanes`` of the policy a resolver should read, or None when there is none.
+
+    Template: ``<home>/config/agents.yaml``, else ``<root>/config/agents.yaml``;
+    an empty home/root is a clean miss, never a CWD lookup. The per-user overlay
+    (``$MINI_ORK_AGENTS`` or ``<home>/config/agents.local.yaml``) is merged on
+    top in memory with ``agents_config.merge`` — the same policy
+    ``agents_config.effective_path`` materialises for every other reader, but
+    with no file written per call. Reading the template alone ignored the
+    overlay, so a user's lane choice never reached the dispatch chain.
+
+    An unreadable template stays fail-open (None, as before). A broken overlay
+    raises ``ValueError`` naming the file: it is the user's own lane choice, and
+    skipping it would route their nodes to the team default without a trace.
+    """
+    from mini_ork.dispatch import agents_config
+
+    tmpl = os.path.join(home, "config", "agents.yaml") if home else ""
+    if not (tmpl and os.path.isfile(tmpl)):
+        tmpl = os.path.join(root, "config", "agents.yaml") if root else ""
+    if not (tmpl and os.path.isfile(tmpl)):
+        tmpl = ""
+    over_p = agents_config.personal_path(home=home) if home else None
+    if not tmpl and over_p is None:
+        return None
     try:
-        import yaml
-        d = yaml.safe_load(open(agents)) or {}
-        lanes = d.get("lanes", {})
-        return lanes.get(node_type) or lanes.get("worker") or lanes.get("worker_default") or "sonnet"
+        base = agents_config._load_yaml(tmpl, "agents.yaml template") if tmpl else {}
     except Exception:
+        if over_p is None:
+            return None
+        base = {}
+    if over_p is not None:
+        base = agents_config.merge(base, agents_config._load_yaml(over_p))
+    lanes = base.get("lanes")
+    return lanes if isinstance(lanes, dict) else {}
+
+
+def resolve_lane_model(node_type, root, home) -> str:
+    """agents.yaml lanes.<node_type> → lanes.worker → worker_default → sonnet,
+    read from the effective policy (template + per-user overlay)."""
+    lanes = _effective_lanes(root, home)
+    if lanes is None:
         return "sonnet"
+    return lanes.get(node_type) or lanes.get("worker") or lanes.get("worker_default") or "sonnet"
 
 
 def resolve_lane_family(lane: str, root: str = "", home: str = "") -> str:
     """Resolve an agents.yaml lane ALIAS (e.g. 'codex_lens', 'decomposer') to its
     family model via lanes.<alias>. A plain model name or unknown alias passes
-    through unchanged. Fail-open: any error returns the input lane verbatim.
+    through unchanged. Fail-open on a missing or unreadable template (the input
+    lane comes back verbatim); the per-user overlay is honoured and a broken one
+    raises (see ``_effective_lanes``).
 
     Dispatch preflight keys on providers.yaml model names; '*_lens' aliases are
     NOT providers.yaml keys, so an unresolved alias used as the fallback-chain
@@ -199,18 +231,8 @@ def resolve_lane_family(lane: str, root: str = "", home: str = "") -> str:
         return lane
     root = root or context_env("MINI_ORK_ROOT")
     home = home or context_env("MINI_ORK_HOME")
-    agents = os.path.join(home, "config", "agents.yaml") if home else ""
-    if not (agents and os.path.isfile(agents)):
-        agents = os.path.join(root, "config", "agents.yaml") if root else ""
-    if not (agents and os.path.isfile(agents)):
-        return lane
-    try:
-        import yaml
-        d = yaml.safe_load(open(agents)) or {}
-        lanes = d.get("lanes", {}) or {}
-        return lanes.get(lane) or lane
-    except Exception:
-        return lane
+    lanes = _effective_lanes(root, home)
+    return (lanes or {}).get(lane) or lane
 
 
 def cost_circuit_open(db, budget) -> bool:
