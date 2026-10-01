@@ -27,6 +27,7 @@ from mini_ork.context import (
     publish_env,
     run_context_scope,
 )
+from mini_ork.runtime.run_roots import load_run_roots
 from mini_ork.cli.main import _module_env, _reflect_timeout_seconds
 from mini_ork.observability.node_events import _now_ms, mo_node_end, mo_node_start
 from mini_ork.workflow.store import make_artifact_store
@@ -742,7 +743,13 @@ def _handle_implementer(ctx: NodeDispatch):
     # toplevel), not os.getcwd(). Without this the implementer diff/writes land
     # in mini-ork's own tree when cwd != target — the CWT-A corruption hazard
     # (bash _dispatch_node:2626-2642). Export so cl_codex.sh reads it.
-    target = _resolve_target_cwd(ctx.run_dir_eff)
+    #
+    # Prefer the persisted roots record when present (run_profile.json["roots"]);
+    # fall back to today's lazy resolution when the record is absent (legacy run
+    # dirs created before epic 01 landed). The drive redirect still applies on
+    # top of the resolved target — see req #4 of remote-nodes-01.
+    roots = load_run_roots(ctx.run_dir_eff or ctx.run_dir)
+    target = roots.target if roots else _resolve_target_cwd(ctx.run_dir_eff)
     # P1b: opt-in shared-drive routing. No-op unless MO_SHARED_DRIVE_BACKEND is
     # set, so the default host-tree cwd is unchanged; when set, every node in the
     # run shares one virtual drive (lazy import keeps the seam side-effect-free).
@@ -988,7 +995,10 @@ def _handle_verifier(ctx: NodeDispatch):
         ev_dir = os.path.join(context_env("MINI_ORK_RUN_DIR", ctx.run_dir), "evidence")
         os.makedirs(ev_dir, exist_ok=True)
         ev = os.path.join(ev_dir, os.path.basename(ctx.verifier_ref).replace(".sh", "").replace(".py", "") + ".log")
-        rc = _run_verifier_ref(script, ev, plan_path=ctx.plan_path, artifact_path=artifact)
+        rc = _run_verifier_ref(
+            script, ev, plan_path=ctx.plan_path, artifact_path=artifact,
+            run_dir=ctx.run_dir_eff or ctx.run_dir,
+        )
         # F2-B: persist evidence to verifier_<stem>.json (bash :2886-2888) so the
         # reviewer input assembly can read the typecheck/test verdicts. Before the
         # rc return so failures are visible too (a missing verifier is real signal).

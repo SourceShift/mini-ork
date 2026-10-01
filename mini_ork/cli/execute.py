@@ -77,6 +77,12 @@ from mini_ork.cli.publisher import (  # noqa: F401
     _publisher_try_commit_files,
     publisher_node,
 )
+from mini_ork.runtime.run_roots import (  # noqa: F401
+    RunRoots,
+    load_run_roots,
+    persist_run_roots,
+    resolve_run_roots,
+)
 
 _SEP = "\x1f"
 _NODE_TYPE_ORDER = ("planner", "researcher", "transform", "implementer", "reviewer", "verifier",
@@ -1272,10 +1278,14 @@ def _verifier_argv(script):
     return ["bash", script]
 
 
-def _run_verifier_ref(script, evidence_path, *, plan_path="", artifact_path="", cwd=None):
+def _run_verifier_ref(script, evidence_path, *, plan_path="", artifact_path="", cwd=None, run_dir=""):
     """Port of _run_verifier_ref (minus the mo_runtime_exec seam): run the
     verifier script, capture evidence, and treat {"pass": true} as success."""
-    cwd = cwd or context_env("MO_TARGET_CWD") or os.getcwd()
+    if not cwd:
+        # Prefer the pinned target from run_profile.json["roots"]; fall back
+        # to MO_TARGET_CWD for legacy run dirs created without the record.
+        roots = load_run_roots(run_dir) if run_dir else None
+        cwd = (roots.target if roots else (context_env("MO_TARGET_CWD") or os.getcwd()))
     verifier_env = {**os.environ,
                     "MINI_ORK_PLAN_PATH": plan_path,
                     "ARTIFACT_PATH": artifact_path}
@@ -1408,38 +1418,12 @@ def _synth_artifact_name(root, recipe):
 def _resolve_target_cwd(run_dir_eff):
     """Port of bash _dispatch_node:2633-2641. Derive the implementer edit-surface cwd
     from an explicit valid $MO_TARGET_CWD, otherwise the run kickoff's git-toplevel.
-    This is
-    the CWT-A corruption fix — pins codex to the TARGET repo, not MINI_ORK_ROOT."""
-    explicit = context_env("MO_TARGET_CWD") or ""
-    if explicit and os.path.isdir(explicit):
-        try:
-            r = subprocess.run(["git", "-C", explicit, "rev-parse", "--show-toplevel"],
-                               capture_output=True, text=True)
-            if r.returncode == 0 and r.stdout.strip():
-                return r.stdout.strip()
-        except Exception:
-            pass
-    kickoff = ""
-    prof = os.path.join(run_dir_eff, "run_profile.json") if run_dir_eff else ""
-    if prof and os.path.isfile(prof):
-        try:
-            kickoff = json.load(open(prof)).get("kickoff_path", "") or ""
-        except Exception:
-            kickoff = ""
-    if kickoff and os.path.isfile(kickoff):
-        kdir = os.path.dirname(kickoff)
-        try:
-            r = subprocess.run(["git", "rev-parse", "--show-toplevel"],
-                               cwd=kdir, capture_output=True, text=True)
-            if r.returncode == 0 and r.stdout.strip():
-                return r.stdout.strip()
-        except Exception:
-            pass
-        # NEW-2: bash's `$(cd dirname && git … || pwd)` returns dirname(kickoff) on
-        # git failure (the subshell already cd'd) — NOT the executor cwd. Returning
-        # os.getcwd() would re-open the CWT-A corruption path this fix exists to close.
-        return kdir
-    return explicit or os.getcwd()
+    This is the CWT-A corruption fix — pins codex to the TARGET repo, not MINI_ORK_ROOT.
+
+    Thin wrapper over :func:`mini_ork.runtime.run_roots.resolve_run_roots`. The
+    precedence ladder lives there so it can be reused, persisted, and parity-tested.
+    """
+    return resolve_run_roots(run_dir_eff).target
 
 
 def _assert_lane_capability(root, lane, required):
@@ -1517,7 +1501,13 @@ def _capture_pre_impl_baseline(run_dir):
     ref_path = os.path.join(run_dir, "pre-implementer-ref")
     if os.path.isfile(ref_path):
         return
-    cwd = context_env("MO_TARGET_CWD") or os.getcwd()
+    # Pin the run's four roots (target, run_dir, home, engine) into
+    # run_profile.json["roots"] at the earliest run_dir-using boundary, BEFORE
+    # the cwd snapshot below. Idempotent: a resumed run keeps its original
+    # roots even when MO_TARGET_CWD has since changed.
+    persist_run_roots(run_dir)
+    roots = load_run_roots(run_dir)
+    cwd = (roots.target if roots else (context_env("MO_TARGET_CWD") or os.getcwd()))
     try:
         if subprocess.run(["git", "-C", cwd, "rev-parse", "--git-dir"],
                           capture_output=True).returncode != 0:
@@ -2022,7 +2012,10 @@ def _assemble_reviewer_inputs(run_dir):
         except Exception:
             pass
     if not worktree or not os.path.isdir(worktree):
-        worktree = context_env("MO_TARGET_CWD") or os.getcwd()
+        # Prefer the pinned target from run_profile.json["roots"]; fall back
+        # to MO_TARGET_CWD for legacy run dirs without the record.
+        roots = load_run_roots(run_dir) if run_dir else None
+        worktree = (roots.target if roots else (context_env("MO_TARGET_CWD") or os.getcwd()))
     specs = _review_pathspecs(worktree, files)
     diff_path = os.path.join(run_dir, "review-diff.patch")
     # Diff against the pre-implementer baseline (captured at run start by

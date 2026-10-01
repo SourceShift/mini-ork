@@ -15,6 +15,7 @@ import subprocess
 import sys
 
 from mini_ork.context import context_env, publish_env
+from mini_ork.runtime.run_roots import load_run_roots
 
 
 def set_status(db, run_id, new_status):  # late binding — avoids the execute<->publisher cycle
@@ -201,7 +202,10 @@ def publisher_node(root, run_dir, db, run_id, recipe, task_class, review_file=""
         pass
     if not outputs:
         # M1 empty-outputs: commit the implementer's in-place edits (code-fix recipes)
-        target_repo = context_env("MO_TARGET_CWD", "")
+        # Prefer the pinned target from run_profile.json["roots"] when present;
+        # fall back to MO_TARGET_CWD for legacy run dirs without the record.
+        roots = load_run_roots(run_dir) if run_dir else None
+        target_repo = (roots.target if roots else context_env("MO_TARGET_CWD", ""))
         if not target_repo:
             try:
                 target_repo = subprocess.check_output(
