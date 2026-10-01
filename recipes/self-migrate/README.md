@@ -5,8 +5,7 @@ complete unit*, so no half-migrated seam is ever left behind. Propose-not-commit
 emits a reviewable diff + a static-feature ledger + a verdict; never applies to
 main or retires an entrypoint on the real checkout.
 
-Full design + the integration-point map + the feature manifest:
-[`docs/migration/self-migrate-feature-manifest.md`](../../docs/migration/self-migrate-feature-manifest.md).
+Full design + the integration-point map: see `docs/migration/`.
 
 ## Why forks, not libs
 Bottom-up leaf migration *splits* integration points — it makes a Python module

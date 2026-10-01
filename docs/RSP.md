@@ -324,9 +324,8 @@ applies** pending reconciliation.
 ## § 9. Known gaps in current implementation
 
 The following safeguards are committed but not yet fully implemented
-as of v0.5.0. Tracked for shipping in
-kickoffs/roadmap-tier4-ecosystem-launch.md:1 and the Tier 2
-implementable list:
+as of v0.5.0. Tracked for shipping in the Tier 2 implementable
+list:
 
 | Safeguard | Status |
 |---|---|

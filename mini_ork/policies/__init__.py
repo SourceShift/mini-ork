@@ -1,8 +1,7 @@
 """Stateful policy engine for mini-ork dispatch decisions.
 
 Adopts the TypedDict contract shape from Omnigent's
-``omnigent/policies/schema.py`` per the panel synthesis at
-``docs/research/omnigent-vs-mini-ork-panel-synthesis.md``. The
+``omnigent/policies/schema.py`` (Apache-2.0). The
 engine is Python (not bash) because three panel lenses independently
 flagged shell as the wrong substrate for stateful guardrails.
 """

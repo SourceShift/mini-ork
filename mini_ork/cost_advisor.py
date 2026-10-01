@@ -1,7 +1,6 @@
 """Per-turn cost advisor — proactive model selection by turn difficulty.
 
-NEW phase added per the panel synthesis at
-``docs/research/omnigent-vs-mini-ork-panel-synthesis.md``. Two lenses
+NEW phase added per a four-lens design panel. Two lenses
 (kimi-2, minimax-1) flagged this as a substantive omission in the
 original plan: Omnigent ships ``omnigent/runner/cost_advisor.py`` +
 ``cost_plan.py`` (~30 KB of docstring + code) that uses an LLM judge
