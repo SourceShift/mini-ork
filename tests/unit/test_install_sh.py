@@ -57,7 +57,7 @@ GIT_SHIM = (
     "    done\n"
     "    mkdir -p \"$dest/scripts\"\n"
     "    printf '#!/bin/sh\\nexit 0\\n' > \"$dest/scripts/full_install.py\"\n"
-    "    printf '#!/bin/sh\\ntouch \\\"%s/.deps-marker\\\"\\n' \"$dest\" "
+    "    printf '#!/bin/sh\\ntouch \"%s/.deps-marker\"\\n' \"$dest\" "
     "> \"$dest/scripts/install-system-deps.sh\"\n"
     "    chmod +x \"$dest/scripts/full_install.py\" \"$dest/scripts/install-system-deps.sh\"\n"
     "    ;;\n"
