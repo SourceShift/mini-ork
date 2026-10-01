@@ -187,13 +187,18 @@ def claude_cost(stdout: str, _usage: TokenUsage) -> float:
     - A model name absent from the table falls back to ``mu["costUSD"]``
       (today's behaviour — never guess).
 
-    Pricing-table resolution matches ``codex_transport._pricing_rate``:
-    ``MO_PRICING_YAML`` env → ``$MINI_ORK_HOME/config/pricing.yaml`` →
-    ``.mini-ork/config/pricing.yaml``. The parsed table is cached per path
+    Pricing-table resolution walks four candidates top-down and uses the
+    first existing file:
+    ``MO_PRICING_YAML`` (if set, used even when missing so an operator
+    typo is not silently replaced) → ``$MINI_ORK_HOME/config/pricing.yaml``
+    (only if ``MINI_ORK_HOME`` is set) → ``.mini-ork/config/pricing.yaml``
+    relative to the cwd → the engine-shipped
+    ``<repo>/.mini-ork/config/pricing.yaml`` (where ``<repo>`` is
+    ``providers.py``'s ``parents[2]``). The parsed table is cached per path
     keyed by ``st_mtime_ns`` (nanosecond — same-second edits must not
-    serve stale data). Missing / malformed / unreadable file is treated as
-    an empty table (per spec step 2), so the sum-of-``costUSD`` fallback
-    still applies to each unknown model.
+    serve stale data); a missing path is never cached. No candidate
+    resolves to an existing file → empty table, so the sum-of-``costUSD``
+    fallback still applies to each unknown model.
 
     Any unexpected exception during load or accumulation falls back to
     ``total_cost_usd`` — the meter must never crash a dispatch.
@@ -221,32 +226,61 @@ _PRICING_TABLE_CACHE: dict[str, tuple[int, dict | None]] = {}
 
 
 def _load_pricing_table() -> dict:
-    """Read ``pricing.yaml`` with the env precedence inherited from
-    ``codex_transport._pricing_rate``. Missing / malformed files return
-    an empty dict (per spec step 2) so step 3 still runs and emits a
-    sum-of-``costUSD`` figure rather than a hard fallback.
+    """Read ``pricing.yaml`` from the first candidate path that exists.
+
+    Candidate order (four-step resolution — see ``claude_cost`` docstring):
+    1. ``MO_PRICING_YAML`` — if set, used even when missing so an operator
+       typo is not silently replaced (missing → empty table, no fall-through).
+    2. ``$MINI_ORK_HOME/config/pricing.yaml`` — only when ``MINI_ORK_HOME``
+       is set in the environment.
+    3. ``.mini-ork/config/pricing.yaml`` relative to the cwd.
+    4. Engine-shipped table at
+       ``<repo>/.mini-ork/config/pricing.yaml`` where ``<repo>`` is
+       ``providers.py``'s ``parents[2]`` (intentionally NOT routed through
+       ``mini_ork_root()`` so the ``MINI_ORK_ROOT`` override does not
+       silently redirect the shipped fallback).
+
+    No candidate resolves to an existing file → empty table (today's
+    fallback). Each winning path is cached by its ``st_mtime_ns`` so
+    later calls skip the read; a missing path is never cached so a file
+    appearing later is read with a fresh mtime key.
     """
-    path = os.environ.get("MO_PRICING_YAML") or os.path.join(
-        os.environ.get("MINI_ORK_HOME") or ".mini-ork", "config", "pricing.yaml"
+    candidates: list[Path] = []
+    mo_pricing = os.environ.get("MO_PRICING_YAML")
+    if mo_pricing is not None:
+        candidates.append(Path(mo_pricing))
+    if "MINI_ORK_HOME" in os.environ:
+        candidates.append(Path(os.environ["MINI_ORK_HOME"]) / "config" / "pricing.yaml")
+    candidates.append(Path.cwd() / ".mini-ork" / "config" / "pricing.yaml")
+    candidates.append(
+        Path(__file__).resolve().parents[2] / ".mini-ork" / "config" / "pricing.yaml"
     )
-    try:
-        mtime_ns = os.stat(path).st_mtime_ns
-    except OSError:
-        # Missing file → empty table, no cache (mtime-stamping a missing
-        # path would let a later file appear under a stale key).
-        return {}
-    cached = _PRICING_TABLE_CACHE.get(path)
-    if cached is not None and cached[0] == mtime_ns:
-        return cached[1] if isinstance(cached[1], dict) else {}
-    try:
-        with open(path, encoding="utf-8") as fh:
-            parsed = yaml.safe_load(fh)
-    except Exception:
-        parsed = None
-    if not isinstance(parsed, dict):
-        parsed = None
-    _PRICING_TABLE_CACHE[path] = (mtime_ns, parsed)
-    return parsed if parsed is not None else {}
+
+    for path in candidates:
+        try:
+            mtime_ns = os.stat(path).st_mtime_ns
+        except OSError:
+            # Missing path. For MO_PRICING_YAML (the operator typed it
+            # explicitly) a missing entry is an operator typo: emit an
+            # empty table rather than silently replacing it with HOME /
+            # cwd / engine. For every other candidate, fall through.
+            if mo_pricing is not None and path == Path(mo_pricing):
+                return {}
+            continue
+        key = str(path)
+        cached = _PRICING_TABLE_CACHE.get(key)
+        if cached is not None and cached[0] == mtime_ns:
+            return cached[1] if isinstance(cached[1], dict) else {}
+        try:
+            with open(path, encoding="utf-8") as fh:
+                parsed = yaml.safe_load(fh)
+        except Exception:
+            parsed = None
+        if not isinstance(parsed, dict):
+            parsed = None
+        _PRICING_TABLE_CACHE[key] = (mtime_ns, parsed)
+        return parsed if parsed is not None else {}
+    return {}
 
 
 def _sum_model_usage(model_usage: dict, data: dict) -> float:

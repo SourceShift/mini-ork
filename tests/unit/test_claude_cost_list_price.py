@@ -182,6 +182,76 @@ def test_claude_cost_stream_json_envelope(tmp_path, monkeypatch):
     assert claude_cost(stream, TokenUsage()) == pytest.approx(expected)
 
 
+def test_claude_cost_engine_shipped_pricing_table_is_fallback(tmp_path, monkeypatch):
+    """No env, empty ``MINI_ORK_HOME``, empty cwd → engine-shipped table wins.
+
+    ``MO_PRICING_YAML`` unset, ``MINI_ORK_HOME`` pointing at an empty temp
+    directory, and cwd pointing at a different empty temp directory forces
+    resolution to walk all the way to candidate 4 (engine-shipped
+    ``<repo>/.mini-ork/config/pricing.yaml``). The GLM-5.3 envelope must be
+    priced from that table at input 1.40 / cache_read 0.26 / output 4.40,
+    NOT from the CLI's ``costUSD`` (which would price non-Anthropic at
+    Anthropic rates).
+    """
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("MINI_ORK_HOME", str(home))
+    monkeypatch.delenv("MO_PRICING_YAML", raising=False)
+    empty_cwd = tmp_path / "empty_cwd"
+    empty_cwd.mkdir()
+    monkeypatch.chdir(empty_cwd)
+    expected = (40442 * 1.40 + 168960 * 0.26 + 15103 * 4.40) / 1e6
+    assert claude_cost(_envelope(_GLM_USAGE), TokenUsage()) == pytest.approx(expected)
+
+
+def test_claude_cost_mini_ork_home_pricing_table_overrides_engine(tmp_path, monkeypatch):
+    """``MINI_ORK_HOME`` with its own ``pricing.yaml`` wins over the engine table.
+
+    HOME carries a mutated GLM-5.3 rate (input/output/cache_read all 9.99)
+    that no other candidate writes. The CLI's ``costUSD`` is 0.664 for the
+    GLM-5.3 envelope, and the engine table would price it at the shipped
+    ~0.22 figure; the HOME table must win at the 9.99 rate.
+    """
+    home = tmp_path / "home"
+    (home / "config").mkdir(parents=True)
+    (home / "config" / "pricing.yaml").write_text(
+        "pricing:\n"
+        "  zhipu:\n"
+        "    GLM-5.3:\n"
+        "      input:       9.99\n"
+        "      output:      9.99\n"
+        "      cache_read:  9.99\n"
+    )
+    monkeypatch.setenv("MINI_ORK_HOME", str(home))
+    monkeypatch.delenv("MO_PRICING_YAML", raising=False)
+    empty_cwd = tmp_path / "empty_cwd"
+    empty_cwd.mkdir()
+    monkeypatch.chdir(empty_cwd)
+    expected = (40442 * 9.99 + 168960 * 9.99 + 15103 * 9.99) / 1e6
+    assert claude_cost(_envelope(_GLM_USAGE), TokenUsage()) == pytest.approx(expected)
+
+
+def test_claude_cost_missing_mo_pricing_yaml_does_not_fall_through(tmp_path, monkeypatch):
+    """``MO_PRICING_YAML`` set-but-missing → empty table; HOME / cwd / engine
+    are NOT consulted (operator-typo rule).
+
+    Even with ``MINI_ORK_HOME`` pointing at a directory that DOES carry a
+    valid ``pricing.yaml`` (so candidate 2 would normally win), a missing
+    ``MO_PRICING_YAML`` short-circuits to empty table. The GLM-5.3 envelope
+    then falls through to the per-model ``costUSD`` (0.664) — proving the
+    operator typo is not silently replaced.
+    """
+    home = tmp_path / "home"
+    (home / "config").mkdir(parents=True)
+    (home / "config" / "pricing.yaml").write_text(_PRICING_YAML)
+    monkeypatch.setenv("MO_PRICING_YAML", str(tmp_path / "no-such-file.yaml"))
+    monkeypatch.setenv("MINI_ORK_HOME", str(home))
+    # GLM-5.3 is unknown (empty table) → falls back to mu["costUSD"] == 0.664.
+    # If the operator-typo rule were broken, the HOME table would price the
+    # envelope at the shipped ~0.22 figure and this assertion would fail.
+    assert claude_cost(_envelope(_GLM_USAGE), TokenUsage()) == pytest.approx(0.664)
+
+
 def test_shipped_pricing_yaml_has_non_anthropic_rows_with_sane_input():
     """The shipped ``.mini-ork/config/pricing.yaml`` carries the four provider
     additions and none of them is at Anthropic rates (guards against a
