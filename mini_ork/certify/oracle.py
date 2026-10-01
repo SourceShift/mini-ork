@@ -94,6 +94,15 @@ def _ensure_pytest_verbose(cmd: str) -> str:
     return re.sub(r"\bpytest\b", "pytest -v --tb=no", cmd, count=1)
 
 
+def _tail(text: str, n: int) -> str:
+    """Return the last `n` characters of `text`; `""` for non-strings.
+
+    Used to surface the most-specific failure text on a kept invariant
+    without bloating the certificate with full pytest tracebacks.
+    """
+    return text[-n:] if isinstance(text, str) else ""
+
+
 def replay_check(
     cmd: str,
     *,
@@ -306,7 +315,13 @@ def judge(
     for name, src in cands:                               # already validated informative
         res = runner.run_test(src, patch=patch)
         hit = res.status == "passed"
-        rec = {"mr": name, "on_patch": res.status, "holds": hit}
+        rec = {"mr": name, "on_patch": res.status, "holds": hit, "src": src}
+        if not hit:
+            # exc names the exception; output carries the assertion text an auditor needs.
+            exc = res.exc if isinstance(getattr(res, "exc", ""), str) else ""
+            out = getattr(res, "output", "")
+            out = out if isinstance(out, str) else ""
+            rec["detail"] = _tail(f"{exc}\n{out}".strip(), 600)
         if gold is not None:                              # MEASUREMENT ONLY — never a decision
             g = runner.run_test(src, patch=gold)
             v_ok, v_why = mr.valid(g)

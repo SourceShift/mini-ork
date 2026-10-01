@@ -420,3 +420,50 @@ def test_default_dispatch_runs_the_lane_in_a_throwaway_dir(tmp_path, monkeypatch
     assert not os.path.exists(seen["cwd"])          # scratch removed
     assert list(tmp_path.iterdir()) == []           # caller's cwd untouched
     assert "MO_TARGET_CWD" not in os.environ        # override did not leak
+
+
+# ── 9. kept invariants carry src + conditional detail (certify C5 evidence) ──
+def test_kept_invariants_carry_src_and_failure_detail():
+    """A run with one passing and one failing invariant must attach `src` to
+    BOTH kept records, attach `detail` ONLY to the failing one, and the
+    `detail` must end with the runner's failure text and stay ≤ 600 chars."""
+    n_invs = 2
+    fail_text = "AssertionError: expected 42, got -1"
+    outcomes = _probe_green() \
+        + [ExecOutcome(status="failed") for _ in range(n_invs)] \
+        + [ExecOutcome(status="failed", exc=fail_text),
+           ExecOutcome(status="passed")]
+    runner = FakeRunner(outcomes)
+    v = judge(ISSUE_TEXT, "patch text", runner=runner, mr_n=n_invs,
+              dispatch=make_dispatch(mr_n=n_invs))
+    records = v.detail["invariants"]
+    assert len(records) == n_invs
+
+    # Both records carry the invariant source the dispatch emitted for `cands[i]`.
+    expected_srcs = [c[0] for c in runner.calls[-n_invs:]]
+    for rec, src in zip(records, expected_srcs):
+        assert rec["src"] == src
+
+    # The passing record carries no failure detail; the failing record does.
+    failing = next(r for r in records if not r["holds"])
+    passing = next(r for r in records if r["holds"])
+    assert "detail" not in passing
+    assert failing["detail"].endswith(fail_text)
+    assert len(failing["detail"]) <= 600
+
+
+def test_kept_invariants_failure_detail_truncated_to_tail():
+    """A 2000-char failure text on a kept invariant must be tail-truncated to
+    exactly its last 600 characters."""
+    n_invs = 2  # the oracle needs more than one invariant to reach scoring
+    long_exc = "x" * 2000
+    outcomes = _probe_green() \
+        + [ExecOutcome(status="failed") for _ in range(n_invs)] \
+        + [ExecOutcome(status="failed", exc=long_exc),
+           ExecOutcome(status="passed")]
+    runner = FakeRunner(outcomes)
+    v = judge(ISSUE_TEXT, "patch text", runner=runner, mr_n=n_invs,
+              dispatch=make_dispatch(mr_n=n_invs))
+    rec = next(r for r in v.detail["invariants"] if not r["holds"])
+    assert rec["detail"] == "x" * 600
+    assert len(rec["detail"]) == 600
