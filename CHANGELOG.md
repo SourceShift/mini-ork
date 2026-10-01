@@ -9,8 +9,66 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+---
+
+## [0.9.0] - 2026-10-01
+
+Headline: **`mini-ork certify`** — judge whether a change really fixes the bug it claims
+to fix, by running code against the repository. Measured results, sample sizes and the
+misses are in [docs/RESULTS.md](docs/RESULTS.md).
+
+### Added
+
+- **`mini-ork certify`**: point it at a base/head (or a patch) and the bug report;
+  get PROVEN / REFUTED / UNVERIFIED (exit 0 / 1 / 2) and a `mini-ork.certificate/v1`
+  JSON. Builds a Docker image of a Python repo at the base commit. The reproduction
+  probe sees the base source and must import the repository's own module (a probe that
+  re-implements or redefines the code under test is rejected); invariants are generated
+  against what the patch may special-case and must fail on the base to count; a failed
+  invariant counts against the patch only if the patch fails it the same way the base
+  did, otherwise it is inconclusive and the verdict abstains. Certificates carry each
+  invariant's source and failure output.
+- **One-line install**: `curl -fsSL https://raw.githubusercontent.com/SourceShift/mini-ork/main/install.sh | sh`
+  (clones into `~/.local/share/mini-ork`; `MINI_ORK_INSTALL_DIR`, `MINI_ORK_REF`).
+- **Held-out evaluation from the repo's own history**: a miner for SWE-bench-style
+  tasks from `fix:` commits (92 tasks, dev/test split), a runner that solves them with
+  `code-fix` and grades with hidden tests, and $0 replay of stored solves through any
+  verifier.
+- **Opt-in learning signals**: `MO_IMPL_REWARD=run_verified` rewards the implementer for
+  the run passing its own checks minus a cost penalty (`MO_ROUTER_COST_LAMBDA`);
+  `MO_APPLY_SIG_ALPHA` gates apply-loop promotions on an exact McNemar test (the p-value
+  is recorded on every measured decision either way).
+- **RSI guardrails**: matched-attempt control arm for probe scoring, collapse history and
+  an independent collapse halt, a calibrated abstain gate, a verifier audit that
+  quarantines promotions its own audits flag, harness-tampering and reward-hacking
+  monitors, and base replay in `code-fix` (a fix must make a test go from failing to
+  passing).
+- **`mini-ork acp`**: a stdio Agent Client Protocol agent (one session = one run) for
+  editors such as Zed.
+- **Remote-node execution groundwork**: run-scoped workspace sessions, pinned run roots,
+  path maps and portable transport argv.
+- `examples/certify-demo/demo.sh`, `docs/RESULTS.md`, and a Simplified Chinese README.
+
+### Changed
+
+- **Cost is metered at list price**: each non-Anthropic model on a claude-CLI lane is
+  priced from `pricing.yaml` (the CLI had priced unknown models at Anthropic rates —
+  7x over on the held-out baseline). Falls back to the engine's shipped table.
+- Metamorphic verification runs by default; a run whose verifiers measured nothing is
+  reported as unmeasured.
+- Per-user lane overlay: the tracked `agents.yaml` is a template; local lane choices live
+  in an overlay the resolvers honour.
+- README leads with certify and measured numbers; routing and cost claims now match the
+  code (the shipped `code-fix` recipe pins its implementer lane).
+
 ### Fixed
 
+- ACP / web launch started runs on the first `python3` on PATH (3.9 on macOS) and the
+  ACP turn then waited forever; runs now start on the current interpreter and a dead
+  launch ends the turn with the launch log.
+- The router's z-score scale and `runs_count` (it had routed toward the worst lane).
+- Refuse to start a run when the daily budget is already spent; fail an implementer that
+  changed nothing; never run the engine on Python < 3.11 silently.
 - **Failed-lane error attribution**: when a harness CLI exits non-zero in JSON
   mode, the recorded error (`DispatchResult.error`, `llm_calls.error_message`)
   now leads with the stdout result envelope's API error
@@ -26,6 +84,14 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `verify` reports such a required artifact as `detail: rolled_back`
   ("reverted by rollback") rather than "missing or empty". The verdict is
   unchanged — a reverted run still fails.
+
+### Security
+
+- Verifiers no longer pass provider API keys, `MINI_ORK_SECRETS` or mini-ork's state
+  paths into a target repository's test suite (certify base replay, framework-edit).
+- Tests can no longer write to the caller's real credential store: a unit test had
+  overwritten a real API key whenever the suite ran under a process that exported
+  `MINI_ORK_SECRETS`.
 
 ---
 

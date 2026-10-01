@@ -164,7 +164,7 @@ class MiniOrkAcpAgent:
         del protocol_version, client_capabilities, client_info, kwargs
         return InitializeResponse(
             protocol_version=PROTOCOL_VERSION,
-            agent_info=Implementation(name="mini-ork-acp", version="0.8.0"),
+            agent_info=Implementation(name="mini-ork-acp", version="0.9.0"),
         )
 
     async def new_session(
