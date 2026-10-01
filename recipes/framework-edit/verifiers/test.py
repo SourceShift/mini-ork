@@ -23,6 +23,22 @@ import tarfile
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _verdict_merge import write_verdict  # noqa: E402
 
+# Lazy import with local fallback — the verifier may be copied into a
+# fixture without the rest of the mini_ork package on PYTHONPATH.
+try:                                                    # pragma: no cover — verifier copied without mini_ork
+    from mini_ork.verify.test_env import scrubbed_test_env
+except Exception:                                       # pragma: no cover — verifier copied without mini_ork
+    def scrubbed_test_env(environ=None):
+        import os as _os
+        env = dict(_os.environ if environ is None else environ)
+        for k in list(env):
+            if (k in {"MINI_ORK_SECRETS", "MINI_ORK_DB", "MINI_ORK_HOME", "MINI_ORK_PROJECT_HOME",
+                      "MINI_ORK_RUN_ID", "MINI_ORK_RUN_DIR", "MINI_ORK_PLAN_PATH", "MINI_ORK_AGENTS"}
+                    or k.endswith(("_API_KEY", "_AUTH_TOKEN", "_ACCESS_TOKEN", "_SECRET", "_SECRET_KEY"))
+                    or k.startswith("ANTHROPIC_") or k in {"OPENAI_API_BASE", "OPENAI_BASE_URL"}):
+                env.pop(k)
+        return env
+
 RUN_DIR = os.environ["MINI_ORK_RUN_DIR"]
 REPO_ROOT = os.environ.get("MINI_ORK_ROOT") or os.getcwd()
 NAME = "test"
@@ -182,8 +198,7 @@ def _web_smoke():
     if not (os.path.getsize(os.path.join(WORK_PARENT, "diff-applied.sha256")) > 0
             and os.path.getsize(os.path.join(WORK_PARENT, "diff-applied.post.sha256")) > 0):
         return False
-    env = {k: v for k, v in os.environ.items()
-           if k not in ("OPENAI_API_KEY", "ANTHROPIC_API_KEY", "OPENROUTER_API_KEY", "GEMINI_API_KEY")}
+    env = scrubbed_test_env()
     env["PYTHONPATH"] = "."
     return _run([sys.executable, "-m", "pytest", "tests/test_web_smoke.py", "-q"],
                 cwd=WORKTREE, env=env)

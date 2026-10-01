@@ -50,6 +50,7 @@ from mini_ork.certify.verdict import (
     Verdict,
 )
 from mini_ork.runtime import ExecOutcome
+from mini_ork.verify.test_env import scrubbed_test_env
 
 
 # A `runner` exposes the same seam mini_ork.runtime.Crucible does: `.up: bool` and
@@ -191,7 +192,8 @@ def replay_check(
         try:
             with open(log, "wb") as fh:
                 rc = subprocess.run(
-                    augmented, shell=True, cwd=cwd, stdout=fh, stderr=subprocess.STDOUT,
+                    augmented, shell=True, cwd=cwd, env=scrubbed_test_env(),
+                    stdout=fh, stderr=subprocess.STDOUT,
                 ).returncode
         except OSError:
             return -1, passed, failed
