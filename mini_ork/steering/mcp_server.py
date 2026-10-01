@@ -59,7 +59,16 @@ def get_operator_steering(run_id: str, role: str) -> list[dict]:
 
     Missing DB → logs to stderr and returns ``[]`` (bin behavior; lib's bash
     is silent, but the plan specifies verbatim port of the bin).
+
+    Under sandbox isolation (D4 / remote-nodes-03 req 5) the steering DB
+    lives outside the sandbox — a child that opens it would point at a host
+    path that does not exist there. Refuse BEFORE any DB I/O so an
+    in-sandbox child fails with a clear message, not a missing-file error
+    inside ``sqlite3.connect``.
     """
+    if os.environ.get("MO_REMOTE_NODE") == "1":
+        _log("refusing: MO_REMOTE_NODE=1, steering state lives outside the sandbox")
+        return []
     db = _resolve_db()
     if not os.path.exists(db):
         _log(f"db not found: {db}")

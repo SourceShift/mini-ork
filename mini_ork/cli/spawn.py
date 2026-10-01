@@ -314,17 +314,29 @@ def _host_to_container(path: str, *, drive_root: str, mount_path: str) -> str:
     Only what the drive exports is reachable from a sandbox, so a path that
     escapes the drive root is a hard configuration error: raising here beats
     launching a child whose kickoff or cwd silently does not exist in there.
+
+    Delegates to ``PathMap.from_single_root`` (D4 / remote-nodes-03) so the
+    recursive-spawn path and the dispatch path share one translator. The
+    "outside the drive root" error message is preserved verbatim because the
+    isolation tests at ``tests/unit/test_spawn_workspace_isolation_py.py``
+    assert on it.
     """
-    rel = os.path.relpath(os.path.abspath(path), os.path.abspath(drive_root))
-    if rel == os.curdir:
-        return mount_path
-    if rel == os.pardir or rel.startswith(os.pardir + os.sep):
-        raise ValueError(
-            f"{path!r} is outside the shared drive root {drive_root!r}, so an "
-            f"isolated child could not reach it; point MINI_ORK_HOME or "
-            f"MO_SHARED_DRIVE_ROOT at a directory containing the run tree"
-        )
-    return os.path.join(mount_path, rel)
+    from mini_ork.runtime.path_map import PathMap
+
+    pm = PathMap.from_single_root(drive_root, mount_path)
+    mapped = pm.path(path)
+    if mapped == path:
+        # ``PathMap.path`` returns the input unchanged when no prefix matches.
+        # Re-check against ``drive_root`` to keep the legacy strict contract:
+        # a path that escapes the drive is still a loud error.
+        rel = os.path.relpath(os.path.abspath(path), os.path.abspath(drive_root))
+        if rel == os.pardir or rel.startswith(os.pardir + os.sep):
+            raise ValueError(
+                f"{path!r} is outside the shared drive root {drive_root!r}, so an "
+                f"isolated child could not reach it; point MINI_ORK_HOME or "
+                f"MO_SHARED_DRIVE_ROOT at a directory containing the run tree"
+            )
+    return mapped
 
 
 class _ChildTransport(NamedTuple):

@@ -1217,6 +1217,7 @@ def dispatch_model(
         env=merged_env,
         cwd=target_cwd,
         workspace=_select_workspace(request.workspace, merged_env),
+        path_map=getattr(request, "path_map", None),
     )
     # Per-model dispatch backend registry (OCP): a model with a bespoke transport
     # (e.g. codex/opencode sidecar protocol) registers a backend.
@@ -1393,7 +1394,11 @@ def _build_allowed_tools_arg(native_csv: str, mcp_csv: str) -> str:
 
 
 def _write_node_mcp_config(
-    mcp_csv: str, run_dir: str, *, env: Mapping[str, str] | None = None
+    mcp_csv: str,
+    run_dir: str,
+    *,
+    env: Mapping[str, str] | None = None,
+    path_map: "object | None" = None,
 ) -> str | None:
     """Write a node-scoped .mcp-config.json containing only the granted MCP
     servers. Sources the operator's MCP server definitions from
@@ -1401,7 +1406,15 @@ def _write_node_mcp_config(
     ${MINI_ORK_ROOT}/.claude/mcp_servers.json (repo fallback), filters to the
     granted subset, writes to ${run_dir}/.mcp-config.json. Granted servers not
     in the operator config get a no-op stub so --strict-mcp-config keeps the
-    dispatch hermetic."""
+    dispatch hermetic.
+
+    Under a ``path_map`` (sandbox isolation), an additional translated copy is
+    written as ``.mcp-config.sandbox.json`` and the returned path is the
+    host ``.mcp-config.json`` (which the caller then translates via the same
+    map). Servers whose ``command`` lives outside ``/opt/mini-ork`` AND is not
+    listed in ``MO_SANDBOX_MCP_ALLOW`` are dropped with a WARN stub so the
+    in-sandbox child never tries to exec a host binary.
+    """
     if not run_dir:
         return None
     granted = [s.strip() for s in (mcp_csv or "").split(",") if s.strip()]
@@ -1446,6 +1459,53 @@ def _write_node_mcp_config(
             json.dump({"mcpServers": scoped}, fh, indent=2)
     except OSError:
         return None
+
+    # Under isolation, also write a translated sandbox copy at
+    # .mcp-config.sandbox.json and drop any server whose command does not
+    # exist under the engine mount (/opt/mini-ork) nor in the operator
+    # allowlist (MO_SANDBOX_MCP_ALLOW). The caller passes the host path
+    # through the same map for the in-sandbox child.
+    if path_map is not None:
+        from mini_ork.runtime.path_map import PathMap
+
+        if isinstance(path_map, PathMap):
+            allow = {
+                tok.strip()
+                for tok in (e.get("MO_SANDBOX_MCP_ALLOW", "") or "").split(",")
+                if tok.strip()
+            }
+            allow.add("/opt/mini-ork")
+            sandbox_scoped: dict[str, object] = {}
+            for name, cfg in scoped.items():
+                cmd = cfg.get("command") if isinstance(cfg, dict) else None
+                cmd_str = str(cmd) if cmd is not None else ""
+                cmd_path = Path(cmd_str)
+                keep = (
+                    cmd_str in allow
+                    or str(cmd_path) in allow
+                    or cmd_str.startswith("/opt/mini-ork/")
+                    or cmd_str == "echo"
+                )
+                if keep:
+                    sandbox_scoped[name] = cfg
+                else:
+                    import logging as _logging
+
+                    _logging.getLogger("mini_ork.dispatch").warning(
+                        "dropping MCP server %r (command %r not in MO_SANDBOX_MCP_ALLOW)",
+                        name, cmd_str,
+                    )
+                    sandbox_scoped[name] = {
+                        "command": "echo",
+                        "args": [f"no-op: {name} dropped under sandbox"],
+                    }
+            sandbox_path = out_dir / ".mcp-config.sandbox.json"
+            try:
+                with open(sandbox_path, "w", encoding="utf-8") as fh:
+                    json.dump({"mcpServers": sandbox_scoped}, fh, indent=2)
+            except OSError:
+                pass
+
     return str(out_path)
 
 
@@ -1454,6 +1514,7 @@ def apply_tool_grants(
     *,
     env: Mapping[str, str],
     run_dir: str | None = None,
+    request: DispatchRequest | None = None,
 ) -> tuple[str, ...]:
     """Insert --allowedTools, --strict-mcp-config (always), and --mcp-config
     (when MCP grants present + run_dir given) into a claude argv. Inserts at
@@ -1490,8 +1551,16 @@ def apply_tool_grants(
     tool_flags = ["--allowedTools", allowed, "--strict-mcp-config"]
     rd = run_dir or env.get("MINI_ORK_RUN_DIR", "")
     if rd and mcp_csv.strip():
-        cfg_path = _write_node_mcp_config(mcp_csv, rd, env=env)
+        path_map = getattr(request, "path_map", None) if request is not None else None
+        cfg_path = _write_node_mcp_config(mcp_csv, rd, env=env, path_map=path_map)
         if cfg_path:
+            # Under a path_map, translate the cfg_path through the same map so
+            # the in-sandbox child sees the sandbox-local copy of the file.
+            if path_map is not None:
+                from mini_ork.runtime.path_map import PathMap
+
+                if isinstance(path_map, PathMap):
+                    cfg_path = path_map.path(cfg_path)
             tool_flags += ["--mcp-config", cfg_path]
     # Insertion point: right before --output-format (or end), matching bash's
     # argv layout (--permission-mode <then tool-flags> --output-format). When
@@ -1572,11 +1641,70 @@ def _claude_command_builder(
     bearing guarantee is that no builder is registered for executable engines."""
     if env.get('MO_TOOL_GRANTS_DISABLED', '0') != '1':
         run_dir = env.get('MINI_ORK_RUN_DIR', '') or None
-        command = apply_tool_grants(command, env=env, run_dir=run_dir)
+        command = apply_tool_grants(command, env=env, run_dir=run_dir, request=request)
     resume_id = env.get('MO_RESUME_SESSION_ID', '').strip()
     if resume_id:
         command = apply_resume(command, resume_id)
     return command
+
+
+def _portable_transport_command(
+    command: tuple[str, ...],
+    *,
+    request: DispatchRequest,
+    env: Mapping[str, str],
+) -> tuple[str, ...]:
+    """Rewrite a transport argv to portable form under isolation (D4).
+
+    Replaces ``sys.executable`` with ``"python3"`` for codex/opencode
+    transports (which already use ``-m mini_ork.dispatch.<mod>``), and
+    swaps ``sys.executable`` + a host script path for
+    ``"python3" -m mini_ork.dispatch.<module>`` for openai-chat / uhp.
+    On host (no path_map), returns the command byte-identical.
+
+    Set ``PYTHONPATH=/opt/mini-ork`` so the in-sandbox python finds the
+    engine module at the fixed mount path.
+    """
+    path_map = getattr(request, "path_map", None)
+    if path_map is None:
+        return command
+
+    if not command:
+        return command
+
+    first = command[0]
+    # codex/opencode transports already use -m; just swap interpreter.
+    if len(command) >= 3 and command[1] == "-m":
+        module = command[2]
+        if module.startswith("mini_ork.dispatch."):
+            return ("python3", *command[1:])
+        return command
+
+    # openai-chat / uhp: (sys.executable, <host_script>, --print, ...)
+    if first == sys.executable and len(command) >= 2:
+        script_path = Path(command[1])
+        script_name = script_path.name
+        module = f"mini_ork.dispatch.{script_path.stem}"
+        # Only rewrite for known modules; let unknown scripts through.
+        if script_name in {"openai_chat_transport.py", "uhp.py"}:
+            return ("python3", "-m", module, *command[2:])
+        return command
+
+    return command
+
+
+def _portable_transport_command_builder(
+    command: tuple[str, ...],
+    *,
+    request: DispatchRequest,
+    env: Mapping[str, str],
+) -> tuple[str, ...]:
+    """Thin wrapper so the SidecarTelemetryEngine engines can register
+    :func:`_portable_transport_command` via ``register_engine_command_builder``,
+    which expects a ``Callable[..., tuple[str, ...]]``. Keeps the type signature
+    explicit at the registration site.
+    """
+    return _portable_transport_command(command, request=request, env=env)
 
 
 def _dispatch_standard(request: DispatchRequest, spec: ProviderSpec) -> DispatchResult:
@@ -1692,6 +1820,18 @@ class SidecarTelemetryEngine(HarnessEngine):
         stream_path = f"{usage_path[:-7]}.stream.jsonl"
         try:
             env = {**request.env, 'MO_USAGE_FILE': usage_path, 'MO_COST_FILE': cost_path}
+            # Under isolation (D4), translate the sidecar paths via the same
+            # path_map so the in-sandbox child writes into its sandbox view
+            # of the run dir. Also surface PYTHONPATH=/opt/mini-ork so the
+            # portable transport argv (``python3 -m mini_ork.dispatch.X``)
+            # resolves the engine module at the fixed mount path.
+            req_path_map = getattr(request, "path_map", None)
+            if req_path_map is not None:
+                from mini_ork.runtime.path_map import PathMap
+
+                if isinstance(req_path_map, PathMap):
+                    env = req_path_map.env(env)
+                    env["PYTHONPATH"] = "/opt/mini-ork"
             req = DispatchRequest(
                 model=request.model,
                 prompt=request.prompt,
@@ -1700,6 +1840,7 @@ class SidecarTelemetryEngine(HarnessEngine):
                 env=env,
                 cwd=request.cwd,  # preserve the guarded target cwd through this path
                 workspace=request.workspace,
+                path_map=req_path_map,
             )
             result = dispatch(req, spec.command)
             if result.ok:
@@ -1770,6 +1911,15 @@ def register_engine_command_builder(
     ENGINES[engine]._set_command_builder(builder)
     ENGINE_COMMAND_BUILDERS[engine] = builder
 
+
+# D4 / remote-nodes-03: under isolation, every transport command (codex,
+# opencode, openai-chat, uhp) must be in portable form
+# (``python3 -m mini_ork.dispatch.<mod>``) so the in-sandbox child
+# resolves the engine module at /opt/mini-ork. On host (no path_map),
+# the builder is a no-op pass-through so the argv stays byte-identical.
+for _engine_name in ('codex', 'opencode'):
+    register_engine_command_builder(_engine_name, _portable_transport_command_builder)
+
 # ── Per-model dispatch backends (SOLID M6, OCP) ─────────────────────────────
 # Backend signature: (effective: DispatchRequest, spec: ProviderSpec)
 #   -> DispatchResult. Default: the standard core.dispatch transport.
@@ -1839,6 +1989,8 @@ def dispatch_with_fallback(
             max_turns=request.max_turns,
             env=dict(request.env),
             cwd=request.cwd,
+            workspace=request.workspace,
+            path_map=getattr(request, "path_map", None),
         )
         result = dispatch_model(req, root)
         tried.append(lane)

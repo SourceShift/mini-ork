@@ -248,6 +248,7 @@ def _spawn_in_workspace(
     timeout: float,
     env: Mapping[str, str],
     cwd: str | None,
+    path_map: "object | None" = None,
 ) -> tuple[int, str, str]:
     """Delegate a scope=agent CLI spawn to an isolation backend's
     ``Workspace.spawn`` (SE-3 hybrid: this engine owns the spawn CONTRACT; the
@@ -263,23 +264,71 @@ def _spawn_in_workspace(
     resolve / ``up`` / ``spawn`` (e.g. a backend whose spawn is not yet
     implemented) propagates loudly — an unbuilt or misconfigured isolation
     backend is a setup error, not a retryable lane failure to mask as ok=False.
+
+    ``path_map`` (D4 / remote-nodes-03): when supplied, translate argv, env
+    values, cwd, and stdin via the map BEFORE handing to ``ws.spawn``, then
+    assert no host prefixes survive. Under the ``remote`` backend a leak
+    raises (``UnmappedHostPathError``); under ``docker``/``local``/
+    ``microvm`` a leak logs a WARN per value so existing docker users stay
+    unbroken. The map applies here, and ONLY here, so the on-disk record in
+    ``runs/<id>/agent-<node>.prompt.json`` stays host-readable.
     """
     from mini_ork.runtime.agent_workspace import resolve_spawn_workspace
+    from mini_ork.runtime.path_map import UnmappedHostPathError
     from mini_ork.runtime.workspace_session import get_run_session
+
+    applied_argv: Sequence[str] = argv
+    applied_env: Mapping[str, str] = env
+    applied_cwd: str | None = cwd
+    applied_stdin: str = stdin
+    if path_map is not None:
+        from mini_ork.runtime.path_map import PathMap
+
+        if isinstance(path_map, PathMap):
+            applied_argv = path_map.argv(list(argv))
+            applied_env = path_map.env(dict(env))
+            if cwd is not None:
+                applied_cwd = path_map.path(cwd)
+            if isinstance(stdin, str) and stdin:
+                applied_stdin = path_map.text(stdin)
+
+            if backend == "remote":
+                # A real remote sandbox is expected to have every path
+                # translated; a leak means a host prefix slipped through and
+                # the child would point at a file that does not exist there.
+                path_map.assert_no_host_paths(
+                    argv=applied_argv, env=applied_env, text=applied_stdin
+                )
+            else:
+                # docker/local/microvm — log + continue so existing users
+                # aren't silently broken by the new check. A WARN per leaked
+                # value is loud enough to be visible in run logs without
+                # aborting the run.
+                try:
+                    path_map.assert_no_host_paths(
+                        argv=applied_argv, env=applied_env, text=applied_stdin
+                    )
+                except UnmappedHostPathError as exc:
+                    import logging
+
+                    logging.getLogger("mini_ork.dispatch").warning(
+                        "host path in %s survives translation to %s backend: %r",
+                        exc.channel, backend, exc.value,
+                    )
 
     # Run-scoped workspace session (D2 / remote-nodes-02): one Workspace per
     # (run_id, backend) for the entire run, torn down at run end by the executor.
     # ``MINI_ORK_RUN_ID`` is the canonical signal that we are inside a run; an
     # empty run id falls through to the legacy one-shot lifecycle so ad-hoc
     # dispatch + tests keep today's exact behavior.
-    run_id = env.get("MINI_ORK_RUN_ID", "")
+    run_id = applied_env.get("MINI_ORK_RUN_ID", "") if isinstance(applied_env, Mapping) else env.get("MINI_ORK_RUN_ID", "")
     if run_id:
-        ws = get_run_session(run_id, backend, env=env)
-        return ws.spawn(list(argv), stdin=stdin, timeout=timeout, env=env, cwd=cwd)
-    ws = resolve_spawn_workspace(backend, env=env, cwd=cwd)
+        ws = get_run_session(run_id, backend, env=applied_env)
+        return ws.spawn(list(applied_argv), stdin=applied_stdin, timeout=timeout, env=applied_env, cwd=applied_cwd)
+    ws = resolve_spawn_workspace(backend, env=applied_env, cwd=applied_cwd)
     ws.up()
     try:
-        return ws.spawn(list(argv), stdin=stdin, timeout=timeout, env=env, cwd=cwd)
+        return ws.spawn(list(applied_argv), stdin=applied_stdin, timeout=timeout, env=applied_env, cwd=applied_cwd)
     finally:
         ws.down()
 
@@ -327,6 +376,7 @@ def dispatch(
             timeout=request.timeout_s,
             env=proc_env,
             cwd=request.cwd,
+            path_map=getattr(request, "path_map", None),
         )
 
     duration_ms = int((time.monotonic() - start) * 1000)

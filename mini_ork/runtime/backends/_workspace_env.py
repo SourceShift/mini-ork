@@ -43,6 +43,7 @@ from typing import Mapping
 __all__ = [
     "container_env",
     "_container_env",
+    "isolated_env",
     "_AGENT_ENV_PREFIXES",
     "_AGENT_ENV_SUFFIXES",
     "_RUN_CONTRACT_KEYS",
@@ -97,6 +98,8 @@ _RUN_CONTRACT_KEYS = frozenset(
         "MINI_ORK_PARENT_RUN_ID",
         "MINI_ORK_ALLOW_CHILD_SPAWN",
         "MINI_ORK_ROLLBACK_KEEP_WORKTREE",
+        "MINI_ORK_RUN_DIR",
+        "MO_REMOTE_NODE",
     }
 )
 
@@ -121,6 +124,50 @@ def container_env(env: Mapping[str, str]) -> dict[str, str]:
         ):
             out[key] = val
     return out
+
+
+def isolated_env(env: Mapping[str, str], path_map: "object") -> dict[str, str]:
+    """Sandbox-side env contract for an isolated CLI spawn (remote-nodes-03).
+
+    Runs :func:`container_env` first (the same allowlist both docker and
+    microvm import) so existing allowlist coverage is preserved, then:
+
+      * translates every surviving VALUE through ``path_map.env(...)`` so
+        ``MINI_ORK_HOME=/Users/admin/.mini-ork`` becomes
+        ``MINI_ORK_HOME=/workspace/home``,
+      * sets ``MINI_ORK_HOME=/workspace/mo-home`` LAST so a host value that
+        slipped in cannot survive into the sandbox,
+      * deletes ``MINI_ORK_DB`` (no shared state.db in the sandbox),
+      * adds ``MO_REMOTE_NODE=1`` (so agent-side helpers that open state.db
+        refuse loudly) and ``MINI_ORK_ALLOW_CHILD_SPAWN=0`` (a sandboxed
+        child must not spawn another),
+      * asserts no host path survives (forbidden = the map's host roots +
+        :data:`DEFAULT_FORBIDDEN`).
+
+    Pure + daemon-free; the only side effect is the assertion raising
+    ``UnmappedHostPathError`` when translation missed a leak.
+    """
+    from mini_ork.runtime.path_map import PathMap, UnmappedHostPathError
+
+    if path_map is None:
+        raise ValueError("isolated_env requires a non-None path_map")
+    if not isinstance(path_map, PathMap):
+        raise TypeError(f"isolated_env path_map must be PathMap, got {type(path_map).__name__}")
+
+    base = container_env(env)
+    translated = path_map.env(base)
+    translated["MINI_ORK_HOME"] = "/workspace/mo-home"
+    translated.pop("MINI_ORK_DB", None)
+    translated["MO_REMOTE_NODE"] = "1"
+    translated["MINI_ORK_ALLOW_CHILD_SPAWN"] = "0"
+
+    # Sanity check: nothing that survived translation should still carry a
+    # host prefix. Raises UnmappedHostPathError on the first leak.
+    try:
+        path_map.assert_no_host_paths(env=translated)
+    except UnmappedHostPathError:
+        raise
+    return translated
 
 
 # Backends + the Increment-2 test import the underscore name; keep it as the

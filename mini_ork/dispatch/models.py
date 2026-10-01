@@ -47,6 +47,12 @@ class DispatchRequest:
     # from MO_SANDBOX_BACKEND. Frozen with a default so every existing caller
     # keeps host behavior untouched.
     workspace: str = "host"
+    # PathMap (D4 / remote-nodes-03) applied inside ``_spawn_in_workspace``
+    # ONLY when ``workspace`` is not "host". The executor sets it from the
+    # run's ``RunRoots``; on host it stays ``None`` so every existing caller
+    # keeps byte-parity. Type hint is lazy (``"PathMap | None"``) so the
+    # dispatch core stays free of the runtime import at module load.
+    path_map: "object | None" = None
 
 
 # SE-3 Phase B2: a dispatch refused because the resolved engine cannot honor
