@@ -135,3 +135,19 @@ daemon.
 - A bind of `0.0.0.0` without TLS refuses to start.
 - Daemon-gated live test: a real container session runs `sh -c 'echo hi;
   sleep 1; echo bye'` and the stream yields both lines.
+
+## Review bar (added after epics 02–04 were reviewed)
+
+Each earlier epic passed its gate and still failed review for the same reason:
+the acceptance tests that drive the REAL seam were never written, so unwired or
+broken code looked green. This epic is rejected unless:
+
+- every Acceptance bullet above has its own test, and that test exercises the
+  production path (the executor / dispatch / CLI entrypoint), not only the new
+  module in isolation;
+- every new public function or class has at least one production caller
+  (`git grep` for it outside its own module and tests);
+- nothing is gated only by a skip: a daemon- or network-gated test must run in
+  this environment (Docker is available via colima; only `/Volumes/docker-ssd`
+  is bind-visible), or the epic says why it cannot;
+- the default path (feature env unset) is proven byte-identical by a test.
