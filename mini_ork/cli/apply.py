@@ -71,6 +71,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import sqlite3
 import sys
@@ -348,6 +349,26 @@ def score_candidate(candidate_id: str, scorer: str | None = None) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 # apply_evaluate_gate
 # ─────────────────────────────────────────────────────────────────────────────
+def mcnemar_exact_p(gains: int, losses: int) -> float:
+    """One-sided exact binomial p-value for a 2x2 discordant-pair test.
+
+    Under the null that the candidate is no better than the baseline on a
+    held-out set, the number of tasks that flip fail->pass vs pass->fail is
+    fair coin flips. The chance of seeing ``gains`` (or more) successes in
+    ``n = gains + losses`` fair flips is the upper binomial tail
+    ``sum(comb(n, k) for k in range(gains, n + 1)) / 2**n``. Returns
+    ``1.0`` when there are no discordant pairs (no evidence either way;
+    the degenerate edge that lets tiny probe sets degrade gracefully).
+
+    Pure helper: no env, no DB, no random. Uses ``math.comb`` — no scipy.
+    """
+    n = gains + losses
+    if n == 0:
+        return 1.0
+    successes = sum(math.comb(n, k) for k in range(gains, n + 1))
+    return successes / (2 ** n)
+
+
 def evaluate_gate(candidate_id: str, utility_before: float,
                   utility_after: float, pertask_json: str = "",
                   control_n: int = 1) -> str:
@@ -389,6 +410,25 @@ def evaluate_gate(candidate_id: str, utility_before: float,
     me = int(os.environ.get("MO_APPLY_MIN_EXAMPLES", "1"))
     regress_tol = int(os.environ.get("MO_APPLY_REGRESSION_TOLERANCE", "0"))
 
+    # Significance gate (opt-in). Unset / empty -> every decision is
+    # byte-identical to today apart from the additive sig_* keys in the
+    # result dict (rationale gains the McNemar suffix on the measured-
+    # promoted path, where the suffix is informational). Invalid value
+    # -> behaves as unset but records the raw offender on
+    # ``sig_alpha_error`` so the operator sees the typo.
+    sig_alpha_raw = os.environ.get("MO_APPLY_SIG_ALPHA") or ""
+    sig_alpha: float | None = None
+    sig_alpha_error: str | None = None
+    if sig_alpha_raw:
+        try:
+            parsed = float(sig_alpha_raw)
+            if 0.0 < parsed <= 1.0:
+                sig_alpha = parsed
+            else:
+                sig_alpha_error = sig_alpha_raw
+        except ValueError:
+            sig_alpha_error = sig_alpha_raw
+
     delta = ua - ub
 
     # ── in-loop no-regression gate (RELAI-VCL / arXiv 2607.14004) ──────────
@@ -415,6 +455,19 @@ def evaluate_gate(candidate_id: str, utility_before: float,
 
     has_pertask_regression = regressed > regress_tol
     measured = regressed >= 0  # per-task vectors present == a real held-out run happened
+
+    # Significance inputs (always initialised; populated only when the
+    # measured path has equal-length per-task vectors, which is the
+    # exact-spec predicate for McNemar from the kickoff).
+    sig_gains: int | None = None
+    sig_losses: int | None = None
+    sig_p_value: float | None = None
+    if measured and len(before) == len(after):
+        sig_gains = sum(1 for i in range(len(before))
+                        if after[i] and not before[i])
+        sig_losses = sum(1 for i in range(len(before))
+                         if before[i] and not after[i])
+        sig_p_value = round(mcnemar_exact_p(sig_gains, sig_losses), 6)
 
     # For a MEASURED candidate, equality is not evidence. delta == dt means the
     # candidate's publish rate over the probe set is indistinguishable from the
@@ -473,6 +526,24 @@ def evaluate_gate(candidate_id: str, utility_before: float,
             rationale += "; 0 per-task regressions"
         if control_n > 1 and measured:
             rationale += f"; strict-superset gain over control (control_n={control_n})"
+        # Significance check on what would otherwise promote. Measured path
+        # only — the scalar path has no per-task vectors to test, and
+        # kickoff step 4 says the check "promotions on the scalar path …
+        # are not touched". When ``MO_APPLY_SIG_ALPHA`` is set, a measured
+        # promote whose one-sided exact McNemar p exceeds alpha is
+        # quarantined for "insufficient evidence". Otherwise the suffix is
+        # appended for the audit trail (kickoff step 5) and the decision is
+        # byte-identical to today apart from the additive result keys.
+        if measured and sig_p_value is not None:
+            if sig_alpha is not None and sig_p_value > sig_alpha:
+                n_tasks = len(before)
+                decision = "quarantined"
+                rationale = (f"insufficient evidence: {sig_gains} gain(s) vs "
+                             f"{sig_losses} loss(es) over {n_tasks} held-out "
+                             f"task(s), one-sided exact McNemar p="
+                             f"{sig_p_value:.4f} > alpha={sig_alpha}")
+            else:
+                rationale += f"; McNemar p={sig_p_value:.4f}"
         delta_margin = 0.0
     elif measured:
         # A real held-out measurement ran and it found no gain. Quarantined: there
@@ -513,6 +584,19 @@ def evaluate_gate(candidate_id: str, utility_before: float,
         "regression_tolerance": regress_tol,
         "control_n": int(control_n),
     }
+    # Significance keys — additive. ``sig_p`` is always present so the
+    # audit trail records the measured-vs-baseline evidence on every decision;
+    # ``sig_gains``/``sig_losses`` are only emitted on the measured path
+    # (kickoff step 2). Enforcement keys land only when relevant.
+    result["sig_p"] = sig_p_value
+    if sig_gains is not None:
+        result["sig_gains"] = sig_gains
+    if sig_losses is not None:
+        result["sig_losses"] = sig_losses
+    if sig_alpha is not None:
+        result["sig_alpha"] = sig_alpha
+    if sig_alpha_error is not None:
+        result["sig_alpha_error"] = sig_alpha_error
     return json.dumps(result)
 
 
