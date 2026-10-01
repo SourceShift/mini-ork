@@ -112,6 +112,10 @@ class DockerWorkspace:
 
     # --- Workspace protocol ---------------------------------------------
     def up(self) -> None:
+        # Idempotent (Workspace contract): a second up() on a live container is a
+        # no-op. Re-running `docker run --name <same>` would fail on a name clash.
+        if self._cid is not None:
+            return
         self._require_daemon()
         os.makedirs(self._drive_root, exist_ok=True)
         args = [

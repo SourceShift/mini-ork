@@ -357,3 +357,53 @@ def test_resolve_agent_workspace_routes_remote(monkeypatch):
     )
     assert isinstance(ws, RemoteWorkspace), ws
     assert cwd == "/workspace", cwd
+
+def test_real_socket_transport_round_trip(tmp_path, monkeypatch):
+    """RemoteWorkspace over a REAL uvicorn socket — no ``_request`` stub.
+
+    The conformance suite swaps the transport for a TestClient; this is the one
+    test that drives the production urllib path (auth header, retries, the
+    JSON-lines stream parse) end to end against a live node-agent.
+    """
+    import socket
+    import threading
+    import time
+
+    import uvicorn
+
+    from mini_ork.remote.node_agent.app import create_app
+    from mini_ork.runtime.backends.remote import RemoteWorkspace, _NodeRef
+
+    token = "real-socket-token"
+    monkeypatch.setenv("MO_NODE_TOKEN", token)
+    monkeypatch.setenv("MO_REMOTE_ALLOW_DIRTY_ENGINE", "1")
+    with socket.socket() as sk:
+        sk.bind(("127.0.0.1", 0))
+        port = sk.getsockname()[1]
+    server = uvicorn.Server(uvicorn.Config(
+        create_app(state_dir=tmp_path / "agent", token_env="MO_NODE_TOKEN", runtime="host"),
+        host="127.0.0.1", port=port, log_level="error"))
+    thread = threading.Thread(target=server.run, daemon=True)
+    thread.start()
+    deadline = time.time() + 20
+    while not server.started and time.time() < deadline:
+        time.sleep(0.05)
+    assert server.started, "node-agent did not start"
+    ws = RemoteWorkspace(
+        node=_NodeRef(name="real", url=f"http://127.0.0.1:{port}", token=token, max_sessions=1),
+        run_id="real-socket-run", image="alpine:latest", drive_root=str(tmp_path),
+        engine_root=os.environ.get("MINI_ORK_ROOT") or os.getcwd(),
+        token_env="MO_NODE_TOKEN", retries=1,
+    )
+    try:
+        ws.up()
+        rc, out, err = ws.spawn(["/bin/sh", "-c", "echo out-line; echo err-line 1>&2; exit 3"],
+                                stdin="", timeout=30, env={"PATH": os.environ.get("PATH", "")},
+                                cwd=str(tmp_path))
+        assert (rc, out.strip(), err.strip()) == (3, "out-line", "err-line")
+        rc, merged = ws.exec("echo via-exec", cwd=str(tmp_path), timeout=30)
+        assert rc == 0 and "via-exec" in merged
+    finally:
+        ws.down()
+        server.should_exit = True
+        thread.join(timeout=10)

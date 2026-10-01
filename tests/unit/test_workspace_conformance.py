@@ -157,13 +157,44 @@ def remote_workspace(tmp_path, monkeypatch):
         ws.down()
 
 
+@pytest.fixture
+def docker_workspace():
+    """A real ``docker`` Workspace (daemon-gated). The drive root sits inside the
+    repo because colima bind-mounts only selected host volumes (not TMPDIR or
+    $HOME); a checkout on such a volume is visible to the daemon."""
+    import shutil
+    import subprocess
+    import tempfile
+    from pathlib import Path
+
+    if shutil.which("docker") is None or subprocess.run(
+            ["docker", "info"], capture_output=True).returncode != 0:
+        pytest.skip("docker daemon not available")
+    import mini_ork.runtime.backends.docker  # noqa: F401  (registers "docker")
+
+    repo = Path(__file__).resolve().parents[2]
+    drive = tempfile.mkdtemp(prefix=".mo-bindprobe-", dir=str(repo))
+    ws = get_workspace("docker", image="alpine:latest", drive_root=drive, mount_path="/workspace")
+    ws.up()
+    try:
+        yield ws
+    finally:
+        ws.down()
+        shutil.rmtree(drive, ignore_errors=True)
+
+
+def _cwd(ws, tmp_path) -> str:
+    """The working dir a case should use: a container path for docker (host
+    paths do not exist inside it — translation is the dispatch layer's job),
+    the host tmp dir for local and the host-runtime node-agent."""
+    return "/workspace" if type(ws).__name__ == "DockerWorkspace" else str(tmp_path)
+
+
 # --- parametrization -------------------------------------------------------------
 
-# docker is daemon-gated (the kickoff accepts that) — only the backends whose
-# protocol-shape we are validating run here. A docker case would be a
-# duplicate of the existing tests/unit/test_docker_workspace.py, and adding
-# it here without a daemon just hides the real cost.
-BACKENDS = ["local", "remote"]
+# One suite, every backend (cloud-swarm P6). docker runs whenever a daemon is
+# reachable — it is the backend the node-agent itself drives in production.
+BACKENDS = ["local", "docker", "remote"]
 
 
 @pytest.fixture(params=BACKENDS)
@@ -178,6 +209,8 @@ def workspace(request):
     """
     if request.param == "local":
         return request.getfixturevalue("local_workspace")
+    if request.param == "docker":
+        return request.getfixturevalue("docker_workspace")
     return request.getfixturevalue("remote_workspace")
 
 
@@ -185,7 +218,7 @@ def workspace(request):
 
 
 def test_exec_round_trip(workspace, tmp_path):
-    rc, out = workspace.exec("echo hi-from-exec", cwd=str(tmp_path), timeout=30)
+    rc, out = workspace.exec("echo hi-from-exec", cwd=_cwd(workspace, tmp_path), timeout=30)
     assert rc == 0
     assert "hi-from-exec" in out
 
@@ -194,7 +227,7 @@ def test_spawn_rc_zero(workspace, tmp_path):
     rc, stdout, stderr = workspace.spawn(
         ["/bin/sh", "-c", "echo on-stdout; echo on-stderr 1>&2; exit 0"],
         stdin="", timeout=30, env={"PATH": os.environ.get("PATH", "")},
-        cwd=str(tmp_path),
+        cwd=_cwd(workspace, tmp_path),
     )
     assert rc == 0
     assert "on-stdout" in stdout
@@ -205,7 +238,7 @@ def test_spawn_nonzero_rc_propagates(workspace, tmp_path):
     rc, _so, _se = workspace.spawn(  # type: ignore[unused-ignore]  # noqa: ARG001
         ["/bin/sh", "-c", "exit 7"],
         stdin="", timeout=30, env={"PATH": os.environ.get("PATH", "")},
-        cwd=str(tmp_path),
+        cwd=_cwd(workspace, tmp_path),
     )
     assert rc == 7
     assert _so == "" or _so is not None  # silence pyright unused-variable
@@ -215,7 +248,7 @@ def test_spawn_bad_argv_zero_returns_127(workspace, tmp_path):
     rc, _so, _se = workspace.spawn(  # type: ignore[unused-ignore]  # noqa: ARG001
         ["definitely-not-a-real-binary-xyzzy"],
         stdin="", timeout=30, env={"PATH": os.environ.get("PATH", "")},
-        cwd=str(tmp_path),
+        cwd=_cwd(workspace, tmp_path),
     )
     assert rc == 127
     assert _so == "" or _so is not None
@@ -243,7 +276,7 @@ def test_repeated_spawn_on_one_up(workspace, tmp_path):
         rc, out, _e = workspace.spawn(  # type: ignore[unused-ignore]  # noqa: ARG001
             ["/bin/sh", "-c", f"echo iter-{i}"],
             stdin="", timeout=30, env={"PATH": os.environ.get("PATH", "")},
-            cwd=str(tmp_path),
+            cwd=_cwd(workspace, tmp_path),
         )
         assert rc == 0
         assert f"iter-{i}" in out
@@ -287,7 +320,7 @@ def test_spawn_env_is_allowlist_plus_run_contract(workspace, tmp_path):
     # 2) Spawn a child that prints its own env as KEY=VALUE lines.
     rc, stdout, _se = workspace.spawn(  # type: ignore[unused-ignore]  # noqa: ARG001
         ["/bin/sh", "-c", "env | sort"],
-        stdin="", timeout=30, env=merged_env, cwd=str(tmp_path),
+        stdin="", timeout=30, env=merged_env, cwd=_cwd(workspace, tmp_path),
     )
     assert _se is None or isinstance(_se, str)
     assert rc == 0
