@@ -783,6 +783,50 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
     set_status(db, run_id, "executing")
     selected = [f for f in fields_list if not filter_node_type or f[1] == filter_node_type]
 
+    # Remote-nodes-02 (D2): install SIGTERM/SIGINT handler so the run-scoped
+    # workspace session is torn down on Ctrl-C / external SIGTERM. Signal
+    # handlers can ONLY be installed from the main thread of the main
+    # interpreter — and this is the executor's main-thread entrypoint (parallel
+    # pool workers are process-isolated, each running its own interpreter).
+    # The handler closes the session, then re-arms ``SIG_DFL`` so a SECOND
+    # SIGTERM terminates — matching the kickoff's "exactly once" teardown
+    # semantic. We swallow exceptions and log to stderr so a failing teardown
+    # never masks the original signal.
+    def _install_sigterm_handler():
+        import signal as _sig
+
+        def _handler(signum, _frame):
+            try:
+                from mini_ork.runtime.workspace_session import close_run_session
+
+                close_run_session(run_id)
+            except Exception as exc:  # noqa: BLE001
+                print(
+                    f"[warn] signal handler close_run_session failed: {exc}",
+                    file=sys.stderr,
+                )
+            try:
+                _sig.signal(signum, _sig.SIG_DFL)
+            except (OSError, ValueError):
+                pass
+            # Re-raise default action so a SECOND SIGTERM terminates the process.
+            # Python's default SIGTERM handler raises KeyboardExit on SIGINT,
+            # exits cleanly on SIGTERM — the exact behavior we want.
+
+        for sig_name in ("SIGTERM", "SIGINT"):
+            sig = getattr(_sig, sig_name, None)
+            if sig is None:
+                continue
+            try:
+                _sig.signal(sig, _handler)
+            except (OSError, ValueError):
+                # Not in main thread (pytest fixtures, dry-run path); skip
+                # silently — the run-level finally still covers normal exits.
+                pass
+
+    if not dry_run:
+        _install_sigterm_handler()
+
     def _dispatch_serial(field):
         # D1: bash keeps FAIL_COUNT as a shell var visible to _mo_policy_route_lane's
         # trace_governed branch (:2014). Publish it so the port's policy_route_lane sees
@@ -910,57 +954,77 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
         field[4] == "speculative" for field in work_fields
     )
 
-    if speculative_requested:
-        # The schema's historical wording promised first-winner replicas, but
-        # this executor has no replica identity or loser cancellation. Running
-        # an arbitrary graph in this mode could report success after every node
-        # failed, so reject it until replica semantics are explicit.
-        print("  [config] speculative dispatch requires explicit replica semantics", file=sys.stderr)
-        fail_count += 1
-    elif dependency_aware:
-        _dispatch_dependency_graph()
-    elif dispatch_mode == "parallel":
-        fail_count += _count_failures(_parallel(work_fields))
-    elif dispatch_mode == "partitioned":
-        for node_type in _NODE_TYPE_ORDER:
-            if node_type == "rollback":
-                continue
-            group = [field for field in work_fields if field[1] == node_type]
-            fail_count += _count_failures(_parallel(group))
-    else:
-        pending = []
+    # Remote-nodes-02 (D2): wrap the per-node dispatch in a finally that closes
+    # the run-scoped workspace session exactly once. SIGTERM triggers the
+    # handler above (which closes too) AND a default second-SIGTERM exit; a
+    # KeyboardInterrupt from a worker thread falls through here.
+    try:
+        if speculative_requested:
+            # The schema's historical wording promised first-winner replicas, but
+            # this executor has no replica identity or loser cancellation. Running
+            # an arbitrary graph in this mode could report success after every node
+            # failed, so reject it until replica semantics are explicit.
+            print("  [config] speculative dispatch requires explicit replica semantics", file=sys.stderr)
+            fail_count += 1
+        elif dependency_aware:
+            _dispatch_dependency_graph()
+        elif dispatch_mode == "parallel":
+            fail_count += _count_failures(_parallel(work_fields))
+        elif dispatch_mode == "partitioned":
+            for node_type in _NODE_TYPE_ORDER:
+                if node_type == "rollback":
+                    continue
+                group = [field for field in work_fields if field[1] == node_type]
+                fail_count += _count_failures(_parallel(group))
+        else:
+            pending = []
 
-        def _flush_pending():
-            nonlocal fail_count, pending
-            if pending:
-                fail_count += _count_failures(_parallel(pending))
-                pending = []
+            def _flush_pending():
+                nonlocal fail_count, pending
+                if pending:
+                    fail_count += _count_failures(_parallel(pending))
+                    pending = []
 
-        for field in work_fields:
-            if field[4] == "parallel" and dispatch_fn is None:
-                pending.append(field)
-                if len(pending) >= _max_parallel():
-                    _flush_pending()
-                continue
+            for field in work_fields:
+                if field[4] == "parallel" and dispatch_fn is None:
+                    pending.append(field)
+                    if len(pending) >= _max_parallel():
+                        _flush_pending()
+                    continue
+                _flush_pending()
+                rc, _fr = _dispatch_serial(field)
+                if rc != 0:
+                    fail_count += 1
             _flush_pending()
-            rc, _fr = _dispatch_serial(field)
-            if rc != 0:
-                fail_count += 1
-        _flush_pending()
 
-    if rollback_fields and fail_count > 0:
-        for field in rollback_fields:
-            _dispatch_serial(field)
-    elif rollback_fields:
-        print("  [skip] rollback — no failures (escalates_to edge not triggered)")
-    _emit_run_verdict(live_run_dir, fail_count, len(fields_list))
-    _post_run_learning(db, live_run_dir, run_id, task_class, fail_count=fail_count)
-    if fail_count > 0:
-        set_status(db, run_id, "failed")
-        sys.stderr.write(f"execute: {fail_count} node(s) failed\n")
-        return 1
-    print("\nexecute: all nodes complete")
-    return 0
+        if rollback_fields and fail_count > 0:
+            for field in rollback_fields:
+                _dispatch_serial(field)
+        elif rollback_fields:
+            print("  [skip] rollback — no failures (escalates_to edge not triggered)")
+        _emit_run_verdict(live_run_dir, fail_count, len(fields_list))
+        _post_run_learning(db, live_run_dir, run_id, task_class, fail_count=fail_count)
+        if fail_count > 0:
+            set_status(db, run_id, "failed")
+            sys.stderr.write(f"execute: {fail_count} node(s) failed\n")
+            return 1
+        print("\nexecute: all nodes complete")
+        return 0
+    finally:
+        # Remote-nodes-02: tear down the run-scoped workspace session here so
+        # a SIGTERM, a worker-thread KeyboardInterrupt, or a normal exit all
+        # converge on the same single ``down()`` per run. ``close_run_session``
+        # is idempotent and never raises — see workspace_session.py.
+        if not dry_run and run_id:
+            try:
+                from mini_ork.runtime.workspace_session import close_run_session
+
+                close_run_session(run_id)
+            except Exception as exc:  # noqa: BLE001
+                print(
+                    f"[warn] run-level close_run_session failed: {exc}",
+                    file=sys.stderr,
+                )
 
 
 # ── post-run learning side-channels ──

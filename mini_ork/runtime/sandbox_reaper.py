@@ -18,17 +18,20 @@ call — it only defines pure functions.
 """
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
 import time
 from datetime import datetime
+from pathlib import Path
 
 __all__ = [
     "DEFAULT_MAX_AGE_S",
     "reap_docker",
     "reap_microvm",
     "reap_sandboxes",
+    "reap_by_marker",
 ]
 
 # Generous default so a long-running node is never reaped mid-flight; a leaked
@@ -203,3 +206,54 @@ def reap_sandboxes(
             f"unknown backend {backend!r}: expected 'all', 'docker', or 'microvm'"
         )
     return out
+
+
+def reap_by_marker(
+    run_dir: str | os.PathLike,
+    *,
+    dry_run: bool = False,
+) -> list[str]:
+    """Reap whatever ``<run_dir>/.workspace-session.json`` records; idempotent.
+
+    Remote-nodes-02 (D2): shortens the leak window for a killed run from the
+    6 h TTL to immediate. Best-effort, never raises — a missing marker, an
+    unreadable file, an unknown backend, or a missing docker CLI returns
+    ``[]`` and leaves the marker in place when ``dry_run=True``.
+
+    The marker schema (``{backend, session_id, created_at, run_id}``) is
+    written by :mod:`mini_ork.runtime.workspace_session`; this function is
+    the read-side counterpart consumed by ``control.kill_run`` and the run-
+    end sweep. The TTL reaper stays as the safety net for crashes that never
+    wrote the marker.
+    """
+    marker = Path(run_dir) / ".workspace-session.json"
+    if not marker.is_file():
+        return []
+    try:
+        info = json.loads(marker.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    backend = (info.get("backend") or "").strip()
+    cid = (info.get("session_id") or "").strip()
+    if backend != "docker" or not cid:
+        # Nothing to reap for non-docker backends today (no shared API yet);
+        # remove the marker so subsequent sweeps don't keep reading it.
+        if not dry_run:
+            try:
+                marker.unlink()
+            except OSError:
+                pass
+        return []
+    if not shutil.which(_DOCKER_BIN):
+        return []
+    if dry_run:
+        return [cid]
+    try:
+        result = _run([_DOCKER_BIN, "rm", "-f", cid])
+    except (FileNotFoundError, OSError):
+        return []
+    try:
+        marker.unlink()
+    except OSError:
+        pass
+    return [cid] if result.returncode == 0 else []

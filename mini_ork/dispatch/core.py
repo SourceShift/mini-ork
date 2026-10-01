@@ -265,7 +265,17 @@ def _spawn_in_workspace(
     backend is a setup error, not a retryable lane failure to mask as ok=False.
     """
     from mini_ork.runtime.agent_workspace import resolve_spawn_workspace
+    from mini_ork.runtime.workspace_session import get_run_session
 
+    # Run-scoped workspace session (D2 / remote-nodes-02): one Workspace per
+    # (run_id, backend) for the entire run, torn down at run end by the executor.
+    # ``MINI_ORK_RUN_ID`` is the canonical signal that we are inside a run; an
+    # empty run id falls through to the legacy one-shot lifecycle so ad-hoc
+    # dispatch + tests keep today's exact behavior.
+    run_id = env.get("MINI_ORK_RUN_ID", "")
+    if run_id:
+        ws = get_run_session(run_id, backend, env=env)
+        return ws.spawn(list(argv), stdin=stdin, timeout=timeout, env=env, cwd=cwd)
     ws = resolve_spawn_workspace(backend, env=env, cwd=cwd)
     ws.up()
     try:

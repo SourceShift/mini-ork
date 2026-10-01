@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import os
 import signal
+import subprocess
 import sys
 import time
 from datetime import datetime, timezone
@@ -181,8 +182,6 @@ def kill_run(home: Path, db: StateDB, task_run_id: str) -> dict[str, Any]:
     # task_run_id. Useful when the .pid file is missing or stale.
     if not pids:
         try:
-            import subprocess
-
             out = subprocess.run(
                 ["pgrep", "-f", task_run_id],
                 capture_output=True,
@@ -219,6 +218,32 @@ def kill_run(home: Path, db: StateDB, task_run_id: str) -> dict[str, Any]:
             except PermissionError:
                 survived.append(pid)
 
+    # Remote-nodes-02 (D2): marker-driven reap. SIGKILL bypasses the executor's
+    # Python ``finally`` (which would call ``Workspace.down()``), so the
+    # run-scoped container survives until the 6 h TTL reaper runs. Synchronously
+    # ``docker rm -f`` the cid the marker records — shortens the leak window
+    # from 6 h to immediate. Best-effort: a missing marker, an absent docker
+    # CLI, or a dead daemon must never raise out of kill_run.
+    _marker_reaped = False
+    marker = run_dir / ".workspace-session.json"
+    if marker.exists():
+        try:
+            info = json.loads(marker.read_text(encoding="utf-8"))
+            backend = info.get("backend")
+            cid = info.get("session_id")
+            if backend == "docker" and cid:
+                subprocess.run(
+                    ["docker", "rm", "-f", str(cid)],
+                    capture_output=True,
+                    timeout=10,
+                    check=False,
+                )
+            marker.unlink(missing_ok=True)
+            _marker_reaped = True
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            # Fallback: the TTL reaper sweeps on its next tick.
+            pass
+
     # Writeback to task_runs — mark failed regardless of whether pids were
     # found. The user clicked Kill; the row should reflect that intent.
     _writeback_terminal(db, task_run_id, status="failed", notes="killed-by-user", verdict="CRASH")
@@ -254,6 +279,7 @@ def kill_run(home: Path, db: StateDB, task_run_id: str) -> dict[str, Any]:
         "pids_signaled": killed,
         "pids_survived_permission_denied": survived,
         "session_halted": session_halted,
+        "session_marker_reaped": _marker_reaped,
         "note": (
             "no pids found — marked status=failed anyway; dispatcher may have already exited"
             if not pids
