@@ -227,7 +227,7 @@ def get_run_session(
         return ws
 
 
-def close_run_session(run_id: str) -> None:
+def close_run_session(run_id: str, *, lock_timeout: float | None = None) -> None:
     """Tear down every session registered for ``run_id``; never raises.
 
     Iterates over a snapshot of ``_SESSION_REGISTRY`` so a backend whose
@@ -237,16 +237,33 @@ def close_run_session(run_id: str) -> None:
     the session marker. Errors are caught and logged at WARN — the
     :func:`mini_ork.runtime.sandbox_reaper.reap_sandboxes` TTL reaper is the
     safety net for crashed runs that never reach here.
+
+    ``lock_timeout`` is for the signal path. A handler runs on the main thread
+    between bytecodes, possibly while that same thread holds the
+    (non-reentrant) registry lock inside :func:`get_run_session`; a blocking
+    acquire there would hang the process on SIGTERM. With a timeout, a busy
+    lock leaves the teardown to the run-level ``finally`` / TTL reaper instead.
     """
     if not run_id:
         return
-    with _SESSION_LOCK:
+    if lock_timeout is None:
+        _SESSION_LOCK.acquire()
+    elif not _SESSION_LOCK.acquire(timeout=lock_timeout):
+        print(
+            f"[warn] close_run_session: registry busy for run={run_id}; "
+            "leaving teardown to the TTL reaper",
+            file=sys.stderr,
+        )
+        return
+    try:
         sessions = [
             session for key, session in _SESSION_REGISTRY.items() if key[0] == run_id
         ]
         for key in list(_SESSION_REGISTRY):
             if key[0] == run_id:
                 _SESSION_REGISTRY.pop(key, None)
+    finally:
+        _SESSION_LOCK.release()
     for session in sessions:
         if session.closed:
             continue
@@ -262,6 +279,40 @@ def close_run_session(run_id: str) -> None:
         try:
             session_marker_path(session.run_dir).unlink(missing_ok=True)
         except OSError:
+            pass
+
+
+def install_teardown_signal_handlers(run_id: str) -> None:
+    """Close ``run_id``'s sessions on SIGTERM / SIGINT, then pass the signal on.
+
+    Each handler chains to the one installed before it, so the process reacts
+    exactly as it would without a session: SIGTERM is re-delivered under
+    ``SIG_DFL`` and terminates, Ctrl-C reaches Python's ``default_int_handler``
+    and raises ``KeyboardInterrupt``, and a caller's own handler still runs.
+    Only the main thread may install handlers; anywhere else this is a no-op
+    and the run-level ``finally`` stays the teardown path.
+    """
+    import signal
+
+    def _chained(prev):
+        def _handler(signum, frame):
+            close_run_session(run_id, lock_timeout=1.0)
+            if callable(prev):
+                prev(signum, frame)
+            elif prev == signal.SIG_IGN:
+                return
+            else:  # SIG_DFL, or None (a handler installed outside Python)
+                signal.signal(signum, signal.SIG_DFL)
+                os.kill(os.getpid(), signum)
+        return _handler
+
+    for name in ("SIGTERM", "SIGINT"):
+        sig = getattr(signal, name, None)
+        if sig is None:
+            continue
+        try:
+            signal.signal(sig, _chained(signal.getsignal(sig)))
+        except (OSError, ValueError):
             pass
 
 

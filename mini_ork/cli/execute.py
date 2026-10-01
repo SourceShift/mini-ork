@@ -783,49 +783,15 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
     set_status(db, run_id, "executing")
     selected = [f for f in fields_list if not filter_node_type or f[1] == filter_node_type]
 
-    # Remote-nodes-02 (D2): install SIGTERM/SIGINT handler so the run-scoped
-    # workspace session is torn down on Ctrl-C / external SIGTERM. Signal
-    # handlers can ONLY be installed from the main thread of the main
-    # interpreter — and this is the executor's main-thread entrypoint (parallel
-    # pool workers are process-isolated, each running its own interpreter).
-    # The handler closes the session, then re-arms ``SIG_DFL`` so a SECOND
-    # SIGTERM terminates — matching the kickoff's "exactly once" teardown
-    # semantic. We swallow exceptions and log to stderr so a failing teardown
-    # never masks the original signal.
-    def _install_sigterm_handler():
-        import signal as _sig
+    # Remote-nodes-02 (D2): tear the run-scoped workspace session down on
+    # SIGTERM / Ctrl-C too, not only via the run-level ``finally`` below. The
+    # handlers chain to whatever was installed before, so a single SIGTERM still
+    # terminates and Ctrl-C still raises KeyboardInterrupt — exactly as without
+    # a session.
+    if not dry_run and run_id:
+        from mini_ork.runtime.workspace_session import install_teardown_signal_handlers
 
-        def _handler(signum, _frame):
-            try:
-                from mini_ork.runtime.workspace_session import close_run_session
-
-                close_run_session(run_id)
-            except Exception as exc:  # noqa: BLE001
-                print(
-                    f"[warn] signal handler close_run_session failed: {exc}",
-                    file=sys.stderr,
-                )
-            try:
-                _sig.signal(signum, _sig.SIG_DFL)
-            except (OSError, ValueError):
-                pass
-            # Re-raise default action so a SECOND SIGTERM terminates the process.
-            # Python's default SIGTERM handler raises KeyboardExit on SIGINT,
-            # exits cleanly on SIGTERM — the exact behavior we want.
-
-        for sig_name in ("SIGTERM", "SIGINT"):
-            sig = getattr(_sig, sig_name, None)
-            if sig is None:
-                continue
-            try:
-                _sig.signal(sig, _handler)
-            except (OSError, ValueError):
-                # Not in main thread (pytest fixtures, dry-run path); skip
-                # silently — the run-level finally still covers normal exits.
-                pass
-
-    if not dry_run:
-        _install_sigterm_handler()
+        install_teardown_signal_handlers(run_id)
 
     def _dispatch_serial(field):
         # D1: bash keeps FAIL_COUNT as a shell var visible to _mo_policy_route_lane's

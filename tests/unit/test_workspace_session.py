@@ -484,3 +484,58 @@ def test_marker_write_is_atomic_under_concurrent_first_call(
     # No leftover .tmp from a crashed atomic write
     leftovers = list(run_dir.glob(".workspace-session.json.tmp"))
     assert leftovers == []
+
+# --- Signal teardown (acceptance bullet 2) ----------------------------------
+
+_SIGNAL_CHILD = r'''
+import os, signal, sys, time
+from mini_ork.runtime import workspace_session as ws
+
+DOWN = sys.argv[1]
+
+class B:
+    def up(self): pass
+    def down(self): open(DOWN, "w").write("down")
+    def spawn(self, *a, **k): return 0, "", ""
+
+ws._resolve_backend_workspace = lambda name, *, env, cwd: B()
+ws.get_run_session("r1", "fakebox", env={"MINI_ORK_RUN_DIR": os.path.dirname(DOWN)})
+ws.install_teardown_signal_handlers("r1")
+try:
+    os.kill(os.getpid(), getattr(signal, sys.argv[2]))
+    time.sleep(5)
+    print("SURVIVED")
+except KeyboardInterrupt:
+    print("KBI")
+'''
+
+
+def _signal_child(tmp_path, sig_name):
+    down = tmp_path / "down.txt"
+    r = subprocess.run([sys.executable, "-c", _SIGNAL_CHILD, str(down), sig_name],
+                       capture_output=True, text=True, timeout=30)
+    return r, down
+
+
+def test_sigterm_closes_the_session_and_still_terminates(tmp_path):
+    import signal
+    r, down = _signal_child(tmp_path, "SIGTERM")
+    assert down.read_text() == "down"
+    assert "SURVIVED" not in r.stdout, "first SIGTERM must still terminate the executor"
+    assert r.returncode == -signal.SIGTERM
+
+
+def test_sigint_closes_the_session_and_still_raises_keyboardinterrupt(tmp_path):
+    r, down = _signal_child(tmp_path, "SIGINT")
+    assert down.read_text() == "down"
+    assert "KBI" in r.stdout and "SURVIVED" not in r.stdout
+
+
+def test_signal_path_close_does_not_block_on_a_held_registry_lock(counting_backend):
+    name, backend = counting_backend
+    ws_module.get_run_session("r-busy", name, env={})
+    with ws_module._SESSION_LOCK:
+        ws_module.close_run_session("r-busy", lock_timeout=0.05)  # must return
+    assert backend.down_calls == 0
+    ws_module.close_run_session("r-busy")
+    assert backend.down_calls == 1
