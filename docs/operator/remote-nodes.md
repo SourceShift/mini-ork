@@ -100,3 +100,33 @@ Per-run dirs under `/srv/mini-ork/runs/<run_id>/` are mounted at
 `/workspace/{target,run,home,mo-home}` per D4 in
 `docs/architecture/remote-nodes.md`. Mount modes: target/run/home are rw,
 mo-home is ro.
+## Running a node-agent
+
+The node-agent is the data-plane service on the remote VM. It holds one
+session (container + `/srv/mini-ork/runs/<run_id>/…` dirs) per run and runs
+each agent spawn as a detached process whose output is buffered to disk, so a
+dropped connection re-attaches from a byte offset.
+
+```bash
+export MO_NODE_TOKEN="$(openssl rand -hex 32)"     # the control plane needs the same value
+mini-ork node-agent --bind 100.x.y.z --port 7091   # tailnet address; loopback is the default
+curl -s http://100.x.y.z:7091/v1/health            # the only route that needs no token
+```
+
+- **Auth:** every route except `/v1/health` requires
+  `Authorization: Bearer $MO_NODE_TOKEN` (`--token-env` names a different
+  variable).
+- **Bind policy:** loopback and tailnet (`100.64.0.0/10`) binds start as-is.
+  Any other address requires `--tls-cert` and `--tls-key`, or the launcher
+  refuses to start.
+- **Runtimes:** `--runtime docker` (default) runs each session in a container
+  from the agent image (see "Agent image" above). `--runtime host` runs procs
+  directly on the VM. That mode has no isolation and exists for tests and
+  trusted single-tenant boxes.
+- **State and retention:** session dirs live under `/srv/mini-ork` (falling
+  back to `/tmp/mo-node-agent-state` when that path is not writable). A
+  deleted session keeps its dirs for `--retain-hours` (default 24) before the
+  background reaper removes them and any leftover `mo.sandbox=1` container.
+- **Env and secrets:** a spawn request carries env values. They reach the
+  process through `docker exec -e KEY` and the CLI's own environment, so they
+  never appear in argv. Only the keys are written to `.procs/<pid>.json`.
