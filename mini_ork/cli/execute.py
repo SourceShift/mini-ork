@@ -948,7 +948,7 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
     elif rollback_fields:
         print("  [skip] rollback — no failures (escalates_to edge not triggered)")
     _emit_run_verdict(live_run_dir, fail_count, len(fields_list))
-    _post_run_learning(db, live_run_dir, run_id, task_class)
+    _post_run_learning(db, live_run_dir, run_id, task_class, fail_count=fail_count)
     if fail_count > 0:
         set_status(db, run_id, "failed")
         sys.stderr.write(f"execute: {fail_count} node(s) failed\n")
@@ -960,9 +960,16 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
 # ── post-run learning side-channels ──
 
 
-def _post_run_learning(db, run_dir, run_id, task_class=""):
+def _post_run_learning(db, run_dir, run_id, task_class="", fail_count=None):
     """Post-run learning side-channels (each best-effort; never fail the run):
 
+    0. implementer run-verified stamp (opt-in via MO_IMPL_REWARD=run_verified).
+       Overwrites the per-row reward on the run's implementer rows with
+       ``run_verified@v1`` = (1.0 if fail_count==0 else 0.0) - lam*cost/ref.
+       Runs BEFORE step 1 so the rubric fill-ONLY gate doesn't clobber it
+       and step 3's advantage recompute sees the stamped values in the same
+       run. If ``fail_count`` is None the stamp is skipped (the call site
+       was made before the dispatch loop finished counting).
     1. rubric grading — fill-ONLY: a per-node reward already on the row
        (status-anchored stamp or eval@v1) encodes within-run lane
        differentiation a uniform rubric value would erase.
@@ -978,6 +985,14 @@ def _post_run_learning(db, run_dir, run_id, task_class=""):
        Opt-in twice (MO_AUTO_APPLY=1 AND MO_APPLY_ENABLED=1): a sweep without
        the master gate would audit but never write, which is pure noise.
     """
+    if (os.environ.get("MO_IMPL_REWARD", "") == "run_verified"
+            and fail_count is not None):
+        try:
+            from mini_ork.learning import writeback as _wb_impl_reward  # noqa: PLC0415
+            _wb_impl_reward.stamp_impl_run_verified(
+                db, run_id, verified=(fail_count == 0))
+        except Exception:
+            pass
     if os.environ.get("MO_GRADE_RUN_REWARD", "1") == "1":
         try:
             from mini_ork import trace_store  # noqa: PLC0415

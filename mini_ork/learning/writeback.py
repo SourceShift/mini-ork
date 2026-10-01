@@ -398,3 +398,108 @@ def write_grpo_advantages(db) -> int:
     return written
 
 
+def stamp_impl_run_verified(db, run_id: str, verified: bool) -> int:
+    """Stamp the implementer rows of a run with run_verified@v1.
+
+    Opt-in via ``MO_IMPL_REWARD=run_verified``; called as step 0 of
+    ``_post_run_learning`` BEFORE the rubric fill so the GRPO advantage
+    recompute (step 3) sees the post-stamp values in the same run.
+
+    Reward shape:
+      v = (1.0 if verified else 0.0) - lam * cost / ref
+      clamped to [-1.0, 1.0]; reward_anchor=0.5; reward_g = (v - 0.5) / 0.5;
+      reward_source='run_verified@v1'.
+
+    Infra-failed runs (any non-empty ``validity`` other than 'valid' on the
+    run's rows) get ``validity='infra_failed'`` on their implementer rows
+    and the function returns 0 — ``_row_is_valid`` then drops them from the
+    GRPO group aggregate. Older DBs without the ``validity`` column fall
+    through to the reward stamp path; columns that don't exist on the live
+    table are silently skipped via a single ``PRAGMA table_info`` probe.
+
+    Returns the number of implementer rows stamped (0 when none / infra).
+    """
+    if not (db and os.path.isfile(db)):
+        return 0
+    con = sqlite3.connect(db, timeout=5.0)
+    con.execute("PRAGMA busy_timeout=5000")
+    con.row_factory = sqlite3.Row
+    cols = {r[1] for r in con.execute("PRAGMA table_info(execution_traces)").fetchall()}
+    try:
+        # ── infra mask: any non-'valid' validity on the run masks implementers
+        has_validity = "validity" in cols
+        infra_failed = False
+        if has_validity:
+            for row in con.execute(
+                "SELECT validity FROM execution_traces WHERE run_id=?",
+                (run_id,),
+            ).fetchall():
+                v = row["validity"]
+                if v is None:
+                    continue
+                s = str(v).strip()
+                if s and s.lower() != "valid":
+                    infra_failed = True
+                    break
+        if infra_failed and has_validity:
+            con.execute(
+                "UPDATE execution_traces SET validity='infra_failed' "
+                "WHERE run_id=? AND json_extract(verifier_output, '$.node_type') = 'implementer'",
+                (run_id,),
+            )
+            con.commit()
+            return 0
+
+        # ── pull implementer rows ──────────────────────────────────────────
+        try:
+            rows = con.execute(
+                "SELECT trace_id, cost_usd FROM execution_traces "
+                "WHERE run_id=? AND json_extract(verifier_output, '$.node_type') = 'implementer'",
+                (run_id,),
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return 0
+        if not rows:
+            return 0
+
+        # ── reward arithmetic (spec) ───────────────────────────────────────
+        try:
+            lam = float(os.environ.get("MO_ROUTER_COST_LAMBDA", "0"))
+        except ValueError:
+            lam = 0.0
+        try:
+            ref = float(os.environ.get("MO_ROUTER_COST_REF", "0.20"))
+        except ValueError:
+            ref = 0.20
+        if ref <= 0:
+            ref = 0.20
+        anchor = 1.0 if verified else 0.0
+        # Build per-row column list up front; older DBs lack some columns.
+        reward_cols = [c for c in ("reward_value", "reward_anchor", "reward_g", "reward_source") if c in cols]
+        if "reward_value" not in reward_cols:
+            return 0
+
+        for row in rows:
+            try:
+                cost = float(row["cost_usd"] or 0.0)
+            except (TypeError, ValueError):
+                cost = 0.0
+            v = anchor - lam * cost / ref
+            v = max(-1.0, min(1.0, v))
+            reward_g = (v - 0.5) / 0.5
+            values = {"reward_value": float(v), "reward_anchor": 0.5,
+                      "reward_g": float(reward_g), "reward_source": "run_verified@v1"}
+            sets = ", ".join(f"{c}=?" for c in reward_cols)
+            params = [values[c] for c in reward_cols] + [row["trace_id"]]
+            con.execute(
+                f"UPDATE execution_traces SET {sets} WHERE trace_id=?",
+                params,
+            )
+        con.commit()
+        return len(rows)
+    except sqlite3.OperationalError:
+        return 0
+    finally:
+        con.close()
+
+
