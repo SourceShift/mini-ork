@@ -316,10 +316,6 @@ A world where "multi-agent" means low-correlation evidence and executable checks
 
 For engineering teams running agentic work who need results they can trust, mini-ork is a task operating system that dispatches specialized agents across *distinct model families*, gates output through deterministic verifiers, and remembers every run. Unlike single-vendor agent frameworks, review independence is a structural property, not a hopeful prompt.
 
-### Positioning statement
-
-mini-ork is the operating system you build on top of Claude Code (or any single-vendor agent framework) when you want to pass the detection-fingerprint test — not just draw an agent graph.
-
 ### Primary message
 
 **Stop letting one model family grade its own homework.**
@@ -333,12 +329,6 @@ mini-ork is the operating system you build on top of Claude Code (or any single-
 | Persistent trajectory memory | Runs that compound | `state.db` persists runs, gradients, lineage, cost; the planner sees the last N same-class runs |
 | Cost governance | Predictable spend | Budget gates halt the queue; cost is a first-class column, not an afterthought |
 | Honest about limits | Buyer trust | A published "what it isn't yet" section tied to the roadmap |
-
-### Elevator pitches
-
-- **10-second:** "mini-ork is a task OS for agents — it runs your work across different model families and verifies the output with real tests, not another AI's opinion."
-- **30-second:** Add the problem: single-vendor agent frameworks let one model family review its own work, so you get consensus theater. mini-ork enforces family diversity, gates every artifact through executable verifiers, and remembers every run so the next one is smarter and cheaper.
-- **60-second:** Add the receipts — Rajan 2025's ρ=0.05–0.25, the coalition gate, `state.db` trajectory metrics, and the class-restricted self-evolution honesty.
 
 ---
 
