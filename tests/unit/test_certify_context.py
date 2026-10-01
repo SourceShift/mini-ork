@@ -221,3 +221,60 @@ def test_imports_code_under_test_matches_parent_package():
 def test_imports_code_under_test_false_for_sibling_module():
     """`from other_pkg import foo` does NOT satisfy `stats`."""
     assert imports_code_under_test("from other_pkg import foo\n", ("stats",)) is False
+
+
+# ── 5. imports_code_under_test — redefinition rejection (C4) ────────────────
+# A probe that imports the code under test and then REDEFINES the imported
+# name (anywhere — module scope, function body, class body, for / with /
+# walrus / parameter) tests its own copy, not the repository's. The guard
+# must reject every shape. `assert` is the unifying verb: the test names
+# describe the failure mode, the body is one line.
+
+
+@pytest.mark.parametrize("src", [
+    "from stats import median\ndef median(xs): return 0\n",
+    "from stats import median\nmedian = lambda xs: 0\n",
+    "from stats import median as m\ndef m(xs): return 0\n",
+    "import stats\nstats.median = lambda xs: 0\n",
+    "import stats as s\nsetattr(s, \"median\", lambda xs: 0)\n",
+    "from stats import median\ndef test_x():\n    def median(xs): return 0\n    assert median([1]) == 0\n",
+    "from stats import median\nclass median: pass\n",
+])
+def test_imports_code_under_test_false_when_imported_name_redefined(src):
+    """Import + rebind (any shape) → False. The probe tests a copy, not the repo."""
+    assert imports_code_under_test(src, ("stats",)) is False
+
+
+@pytest.mark.parametrize("src", [
+    "from stats import median\ndef test_x():\n    assert median([1, 2, 3]) == 2\n",
+    "import stats\nresult = stats.median([1, 2])\n",
+    "from stats import median\nimport pytest\n"
+    "@pytest.mark.parametrize(\"xs\", [[1]])\n"
+    "def test_x(xs):\n    assert median(xs) == 1\n",
+])
+def test_imports_code_under_test_true_when_import_used_unmodified(src):
+    """Import + USE (call, attribute read, decorate, parameterise) without
+    rebinding → True. The probe exercises the repository's definition."""
+    assert imports_code_under_test(src, ("stats",)) is True
+
+
+def test_imports_code_under_test_true_when_syntax_error_with_qualifying_import():
+    """A probe with a SyntaxError that still contains `from stats import median`
+    falls through to the regex path and passes (must not crash on parse fail).
+
+    Constructed at runtime — the test source stays parseable so the file
+    imports cleanly.
+    """
+    src = "from stats import median\n" + "def !!@#\n"
+    assert imports_code_under_test(src, ("stats",)) is True
+
+
+def test_imports_code_under_test_skips_relative_imports():
+    """`from .stats import median` is a relative import — it refers to code
+    in the SAME package the probe lives in, not external code under test.
+    Even with a redefinition, the probe is rejected on the absence-of-import
+    axis, not the redefinition axis.
+    """
+    assert imports_code_under_test(
+        "from .stats import median\ndef median(xs): return 0\n", ("stats",)
+    ) is False
