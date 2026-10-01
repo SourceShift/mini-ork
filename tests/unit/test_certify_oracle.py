@@ -174,10 +174,13 @@ def test_three_of_three_invariants_hold_is_proven():
 # ── 4b. 1/4 invariants hold → REFUTED ───────────────────────────────────────
 def test_one_of_four_invariants_hold_is_refuted():
     n_invs = 4
+    # certify C6: 3 patch failures now consume one extra base re-run each
+    # (signature None → conservative broken). Holds unchanged.
     outcomes = _probe_green() \
         + [ExecOutcome(status="failed") for _ in range(n_invs)] \
         + [ExecOutcome(status="passed")] \
-        + [ExecOutcome(status="failed") for _ in range(n_invs - 1)]
+        + [ExecOutcome(status="failed") for _ in range(n_invs - 1)] \
+        + [ExecOutcome(status="failed") for _ in range(n_invs - 1)]   # 3 base re-runs
     runner = FakeRunner(outcomes)
     v = judge(ISSUE_TEXT, "patch text", runner=runner, mr_n=n_invs,
               dispatch=make_dispatch(mr_n=n_invs))
@@ -188,10 +191,15 @@ def test_one_of_four_invariants_hold_is_refuted():
 # ── 4c. 2/4 invariants hold → UNVERIFIED ─────────────────────────────────────
 def test_two_of_four_invariants_hold_is_unverified():
     n_invs = 4
+    # certify C6: 2 patch failures now consume one extra base re-run each.
+    # Outcomes with no `E ` line in the output produce None signatures,
+    # counted as broken (conservative). 2 holds + 2 broken, n=4, n_eff=4,
+    # holds/n_eff=0.5 → not REFUTED, holds/n=0.5 < 2/3 → not PROVEN → UNVERIFIED.
     outcomes = _probe_green() \
         + [ExecOutcome(status="failed") for _ in range(n_invs)] \
         + [ExecOutcome(status="passed"), ExecOutcome(status="passed"),
-           ExecOutcome(status="failed"), ExecOutcome(status="failed")]
+           ExecOutcome(status="failed"), ExecOutcome(status="failed")] \
+        + [ExecOutcome(status="failed"), ExecOutcome(status="failed")]   # 2 base re-runs
     runner = FakeRunner(outcomes)
     v = judge(ISSUE_TEXT, "patch text", runner=runner, mr_n=n_invs,
               dispatch=make_dispatch(mr_n=n_invs))
@@ -217,11 +225,15 @@ def test_gold_does_not_change_verdict():
     # Two scripts: one for gold=None, one for gold="gold patch". The runner
     # scripts outcomes regardless of which patch is passed — gold is
     # MEASUREMENT-ONLY and must not enter the decision branch.
+    # certify C6: each failed on-patch run now also consumes a base re-run
+    # outcome (signature None → conservative broken); gold runs follow that.
     def script(gold):
         out = _probe_green() + [ExecOutcome(status="failed") for _ in range(n_invs)]
         on_patch = ["passed", "passed", "failed", "failed"]
-        for st in on_patch:                     # judge interleaves: patch run, then gold run
+        for st in on_patch:                     # judge interleaves: patch, base re-run if failed, gold run
             out.append(ExecOutcome(status=st))
+            if st == "failed":
+                out.append(ExecOutcome(status="failed"))    # base re-run, no E line → broken
             if gold is not None:
                 out.append(ExecOutcome(status="passed"))
         return out
@@ -426,13 +438,16 @@ def test_default_dispatch_runs_the_lane_in_a_throwaway_dir(tmp_path, monkeypatch
 def test_kept_invariants_carry_src_and_failure_detail():
     """A run with one passing and one failing invariant must attach `src` to
     BOTH kept records, attach `detail` ONLY to the failing one, and the
-    `detail` must end with the runner's failure text and stay ≤ 600 chars."""
+    `detail` must end with the runner's failure text and stay ≤ 600 chars.
+    certify C6: the failing invariant also gets a `base_detail` from its
+    base re-run (no E line here → signature None → outcome="broken")."""
     n_invs = 2
     fail_text = "AssertionError: expected 42, got -1"
     outcomes = _probe_green() \
         + [ExecOutcome(status="failed") for _ in range(n_invs)] \
-        + [ExecOutcome(status="failed", exc=fail_text),
-           ExecOutcome(status="passed")]
+        + [ExecOutcome(status="failed", exc=fail_text),    # patch fail
+           ExecOutcome(status="failed"),                    # C6 base re-run (sig None → broken)
+           ExecOutcome(status="passed")]                    # patch pass
     runner = FakeRunner(outcomes)
     v = judge(ISSUE_TEXT, "patch text", runner=runner, mr_n=n_invs,
               dispatch=make_dispatch(mr_n=n_invs))
@@ -450,20 +465,202 @@ def test_kept_invariants_carry_src_and_failure_detail():
     assert "detail" not in passing
     assert failing["detail"].endswith(fail_text)
     assert len(failing["detail"]) <= 600
+    # C6: passing outcome = "holds"; failing outcome classified by base re-run.
+    assert passing["outcome"] == "holds"
+    assert failing["outcome"] == "broken"
 
 
 def test_kept_invariants_failure_detail_truncated_to_tail():
     """A 2000-char failure text on a kept invariant must be tail-truncated to
-    exactly its last 600 characters."""
+    exactly its last 600 characters. certify C6: the failing invariant also
+    runs a base re-run; the truncated `detail` here is the patch-side one."""
     n_invs = 2  # the oracle needs more than one invariant to reach scoring
     long_exc = "x" * 2000
     outcomes = _probe_green() \
         + [ExecOutcome(status="failed") for _ in range(n_invs)] \
-        + [ExecOutcome(status="failed", exc=long_exc),
-           ExecOutcome(status="passed")]
+        + [ExecOutcome(status="failed", exc=long_exc),     # patch fail
+           ExecOutcome(status="failed"),                    # C6 base re-run (no output → empty base_detail)
+           ExecOutcome(status="passed")]                    # patch pass
     runner = FakeRunner(outcomes)
     v = judge(ISSUE_TEXT, "patch text", runner=runner, mr_n=n_invs,
               dispatch=make_dispatch(mr_n=n_invs))
     rec = next(r for r in v.detail["invariants"] if not r["holds"])
     assert rec["detail"] == "x" * 600
     assert len(rec["detail"]) == 600
+
+
+# ── certify C6: an invariant failure counts against the patch only if the patch
+#    left the failure unchanged. ──────────────────────────────────────────────
+# Three signatures used across the C6 fixtures:
+#   SIG_CHEAT — patch AND base return this → "broken" (cheat shape).
+#   SIG_PATCH — only patch side returns it (base returns SIG_BASE_DIFF).
+#   SIG_BASE_DIFF — base side for the inconclusive case.
+SIG_CHEAT = "E   assert 4 == 3.5"
+SIG_PATCH = "E   assert [] == [['x']]"
+SIG_BASE_DIFF = "E   assert [['y']] == [['x']]"
+
+
+def _script_outcomes(n: int, holds: int, broken: int, inconclusive: int) -> list[ExecOutcome]:
+    """Build a scripted outcome list yielding exactly (holds, broken, inconclusive).
+
+    mr_base validations: n failures. Then per kept candidate (in order):
+    on-patch run, then base re-run if it failed. The base re-run is consumed
+    IMMEDIATELY after the patch run, NOT appended at the tail — the
+    FakeRunner is a FIFO, so the order must match the per-candidate call
+    sequence inside judge.
+
+    Same-signature on patch and base → broken; different signature →
+    inconclusive.
+    """
+    if holds + broken + inconclusive != n:
+        raise ValueError("counts must sum to n")
+    out: list[ExecOutcome] = _probe_green() \
+        + [ExecOutcome(status="failed") for _ in range(n)]
+    # Holds — passed on patch, no base re-run.
+    out += [ExecOutcome(status="passed") for _ in range(holds)]
+    # Broken — patch fails with SIG_CHEAT, base re-run returns same SIG_CHEAT.
+    for _ in range(broken):
+        out.append(ExecOutcome(status="failed", output=SIG_CHEAT))
+        out.append(ExecOutcome(status="failed", output=SIG_CHEAT))
+    # Inconclusive — patch fails with SIG_PATCH, base returns SIG_BASE_DIFF.
+    for _ in range(inconclusive):
+        out.append(ExecOutcome(status="failed", output=SIG_PATCH))
+        out.append(ExecOutcome(status="failed", output=SIG_BASE_DIFF))
+    return out
+
+
+def test_failure_signature_unit():
+    """Direct unit test on `_failure_signature`."""
+    from mini_ork.certify.oracle import _failure_signature
+
+    # First E line is selected, internal whitespace collapsed.
+    assert _failure_signature("x\nE       assert 4 == 3.5\ny") == "assert 4 == 3.5"
+    assert _failure_signature("E   assert    a   ==   b") == "assert a == b"
+    # Subsequent E lines are ignored once the first is selected.
+    assert _failure_signature("E   assert a == b\nE   assert c == d") == "assert a == b"
+    # No `E ` line → None.
+    assert _failure_signature("no E line here") is None
+    assert _failure_signature("") is None
+    # Bare `E` (no trailing space) is not a pytest E line.
+    assert _failure_signature("Edge\nE\nfoo") is None
+    # Non-str input returns None (defensive).
+    assert _failure_signature(None) is None
+
+
+def test_cheat_shape_refuted():
+    """4 invariants, all fail on patch with the same E line as base → REFUTED,
+    every record outcome='broken'."""
+    n_invs = 4
+    runner = FakeRunner(_script_outcomes(n_invs, holds=0, broken=4, inconclusive=0))
+    v = judge(ISSUE_TEXT, "patch text", runner=runner, mr_n=n_invs,
+              dispatch=make_dispatch(mr_n=n_invs))
+    assert v.verdict == REFUTED, v
+    assert v.mr_pass_rate == pytest.approx(0.0)
+    assert v.detail["n_effective"] == 4
+    assert v.detail["inconclusive"] == 0
+    records = v.detail["invariants"]
+    assert all(r["outcome"] == "broken" for r in records)
+
+
+def test_invalid_invariant_shape_unverified():
+    """1 holds, 3 fail on patch with a different signature than base → UNVERIFIED,
+    reason mentions 'cannot judge', detail['inconclusive'] == 3."""
+    n_invs = 4
+    runner = FakeRunner(_script_outcomes(n_invs, holds=1, broken=0, inconclusive=3))
+    v = judge(ISSUE_TEXT, "patch text", runner=runner, mr_n=n_invs,
+              dispatch=make_dispatch(mr_n=n_invs))
+    assert v.verdict == UNVERIFIED, v
+    assert "cannot judge" in v.reason
+    assert v.detail["inconclusive"] == 3
+    assert v.detail["n_effective"] == 1   # 1 hold only; inconclusive excluded
+    records = v.detail["invariants"]
+    holds = [r for r in records if r["outcome"] == "holds"]
+    inconcl = [r for r in records if r["outcome"] == "inconclusive"]
+    assert len(holds) == 1 and len(inconcl) == 3
+
+
+def test_mixed_three_holds_one_inconclusive_is_proven():
+    """3 holds, 1 inconclusive → PROVEN (3/4 ≥ 2/3, same as today's rule)."""
+    n_invs = 4
+    runner = FakeRunner(_script_outcomes(n_invs, holds=3, broken=0, inconclusive=1))
+    v = judge(ISSUE_TEXT, "patch text", runner=runner, mr_n=n_invs,
+              dispatch=make_dispatch(mr_n=n_invs))
+    assert v.verdict == PROVEN, v
+    assert v.mr_pass_rate == pytest.approx(0.75)
+    assert v.detail["n_effective"] == 3
+    assert v.detail["inconclusive"] == 1
+
+
+def test_precision_guard_two_holds_one_broken_one_inconclusive_is_unverified():
+    """2 holds, 1 broken, 1 inconclusive → not PROVEN (2/4 < 2/3) and
+    not REFUTED (n_eff=3, holds/n_eff=2/3 ≥ 0.5) → UNVERIFIED with the C6
+    'cannot judge' reason (inconclusive > 0)."""
+    n_invs = 4
+    runner = FakeRunner(_script_outcomes(n_invs, holds=2, broken=1, inconclusive=1))
+    v = judge(ISSUE_TEXT, "patch text", runner=runner, mr_n=n_invs,
+              dispatch=make_dispatch(mr_n=n_invs))
+    assert v.verdict == UNVERIFIED, v
+    assert v.mr_pass_rate == pytest.approx(0.5)
+    assert "cannot judge" in v.reason
+    assert v.detail["n_effective"] == 3
+    assert v.detail["inconclusive"] == 1
+
+
+def test_refute_with_exclusion_reason_mentions_excluded_count():
+    """0 holds, 3 broken, 1 inconclusive → REFUTED, reason ends with the
+    ' (1 inconclusive invariant(s) excluded)' suffix."""
+    n_invs = 4
+    runner = FakeRunner(_script_outcomes(n_invs, holds=0, broken=3, inconclusive=1))
+    v = judge(ISSUE_TEXT, "patch text", runner=runner, mr_n=n_invs,
+              dispatch=make_dispatch(mr_n=n_invs))
+    assert v.verdict == REFUTED, v
+    assert v.reason.endswith("(1 inconclusive invariant(s) excluded)")
+    assert v.detail["n_effective"] == 3
+    assert v.detail["inconclusive"] == 1
+
+
+def test_missing_signature_counts_as_broken_conservative():
+    """No `E ` line in either output → signature None → 'broken' (conservative).
+    Two failing invariants → REFUTED."""
+    n_invs = 2
+    # mr_base: 2 fails (no output). Then 2 invariants, both fail on patch (no
+    # output) AND on base re-run (no output) — signatures are None on both
+    # sides → broken (conservative).
+    outcomes = _probe_green() \
+        + [ExecOutcome(status="failed") for _ in range(n_invs)] \
+        + [ExecOutcome(status="failed"), ExecOutcome(status="failed"),
+           ExecOutcome(status="failed"), ExecOutcome(status="failed")]   # 2 patches + 2 base re-runs, interleaved
+    runner = FakeRunner(outcomes)
+    v = judge(ISSUE_TEXT, "patch text", runner=runner, mr_n=n_invs,
+              dispatch=make_dispatch(mr_n=n_invs))
+    assert v.verdict == REFUTED, v
+    records = v.detail["invariants"]
+    assert all(r["outcome"] == "broken" for r in records)
+
+
+# Property test: across every (holds, broken, inconclusive) tuple with total
+# 2..6, the new verdict is PROVEN iff today's rule (mr.score(holds/n, n)) is
+# PROVEN. This is the safety argument: PROVEN cannot move. mr.build needs n
+# >= 2 to emit enough candidates to validate, so we skip n=1.
+CASES = []
+for _n in range(2, 7):
+    for _h in range(_n + 1):
+        for _b in range(_n + 1 - _h):
+            _i = _n - _h - _b
+            if _i < 0:
+                continue
+            CASES.append((_h, _b, _i))
+
+
+@pytest.mark.parametrize("holds,broken,inc", CASES)
+def test_proven_iff_mr_score_property(holds, broken, inc):
+    n = holds + broken + inc
+    runner = FakeRunner(_script_outcomes(n, holds, broken, inc))
+    v = judge(ISSUE_TEXT, "patch text", runner=runner, mr_n=n,
+              dispatch=make_dispatch(mr_n=n))
+    expected_proven = (inv.score(holds / n, n)[0] == PROVEN)
+    actual_proven = (v.verdict == PROVEN)
+    assert actual_proven == expected_proven, (
+        f"holds={holds} broken={broken} inc={inc}: "
+        f"new={v.verdict}, mr.score PROVEN? {expected_proven}"
+    )

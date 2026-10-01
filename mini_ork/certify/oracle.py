@@ -44,6 +44,7 @@ from mini_ork.certify import invariants as mr
 from mini_ork.certify import probe as poc_plus
 from mini_ork.certify.context import CodeContext
 from mini_ork.certify.verdict import (
+    PROVEN,
     REFUTED,
     UNVERIFIED,
     Verdict,
@@ -101,6 +102,27 @@ def _tail(text: str, n: int) -> str:
     without bloating the certificate with full pytest tracebacks.
     """
     return text[-n:] if isinstance(text, str) else ""
+
+
+def _failure_signature(output: str) -> str | None:
+    """First pytest `E ` line of `output`, normalised.
+
+    Returns the body of the first line that starts with literal ``E ``
+    (E plus a single space — pytest's assertion/exception marker), with the
+    leading ``E`` and surrounding whitespace stripped and internal runs of
+    whitespace collapsed to a single space. ``None`` when ``output`` has no
+    such line — the caller treats a missing signature as "cannot tell" and
+    falls back to the conservative broken count.
+    """
+    if not isinstance(output, str):
+        return None
+    for line in output.splitlines():
+        if not line.startswith("E "):
+            continue
+        body = line[2:]
+        collapsed = re.sub(r"\s+", " ", body).strip()
+        return collapsed or None
+    return None
 
 
 def replay_check(
@@ -311,29 +333,87 @@ def judge(
                        "the probe passes, but no invariant that reproduces the bug could be built "
                        "-> cannot rule out a special-cased patch", poc_plus=poc_src)
 
-    kept, dropped, passed = [], [], 0
+    kept, dropped, holds, broken, inconclusive = [], [], 0, 0, 0
     for name, src in cands:                               # already validated informative
         res = runner.run_test(src, patch=patch)
         hit = res.status == "passed"
         rec = {"mr": name, "on_patch": res.status, "holds": hit, "src": src}
-        if not hit:
+        if hit:
+            # Passing invariants do not need a base re-run: they hold on the
+            # patch and would also hold on base (otherwise mr.build dropped them).
+            rec["outcome"] = "holds"
+            holds += 1
+        else:
             # exc names the exception; output carries the assertion text an auditor needs.
             exc = res.exc if isinstance(getattr(res, "exc", ""), str) else ""
             out = getattr(res, "output", "")
             out = out if isinstance(out, str) else ""
             rec["detail"] = _tail(f"{exc}\n{out}".strip(), 600)
+            # Cost note: one extra sandbox test run per failed invariant (the
+            # base re-run on the un-patched source to compare signatures).
+            # No extra model calls — the signature is a string compare.
+            base = runner.run_test(src)                   # no patch — re-run on base
+            sig_patch = _failure_signature(out)
+            base_out = getattr(base, "output", "")
+            base_out_str = base_out if isinstance(base_out, str) else ""
+            sig_base = _failure_signature(base_out_str)
+            base_exc = base.exc if isinstance(getattr(base, "exc", ""), str) else ""
+            # Classify per certify C6: a failing invariant is "broken" only when
+            # the patch did not change the failing behaviour (same signature on
+            # patch and base — the cheat shape). Otherwise the patch changed the
+            # behaviour the invariant tests, so the invariant is "inconclusive":
+            # it cannot rule out a correct fix.
+            if (base.status == "failed" and res.status == "failed"
+                    and sig_patch is not None and sig_patch == sig_base):
+                rec["outcome"] = "broken"
+                broken += 1
+            elif sig_patch is None or sig_base is None:
+                # Cannot tell — conservative fallback matches today's behaviour
+                # (counts as broken; cannot rule out a cheat).
+                rec["outcome"] = "broken"
+                broken += 1
+            else:
+                rec["outcome"] = "inconclusive"
+                inconclusive += 1
+            rec["base_detail"] = _tail(f"{base_exc}\n{base_out_str}".strip(), 600)
         if gold is not None:                              # MEASUREMENT ONLY — never a decision
             g = runner.run_test(src, patch=gold)
             v_ok, v_why = mr.valid(g)
             rec["valid_on_gold"], rec["gold_says"] = v_ok, v_why
         kept.append(rec)
-        passed += hit
 
     n = len(kept)
-    rate = (passed / n) if n else 0.0
+    n_eff = holds + broken
+    rate = (holds / n) if n else 0.0
     verdict, reason = mr.score(rate, n)
-    return Verdict(verdict, reason, poc_plus=poc_src, mr_pass_rate=(rate if n else None), mr_n=n,
-                   detail={"invariants": kept, "dropped": dropped})
+
+    # Asymmetric verdict (certify C6). PROVEN is byte-identical to today's
+    # mr.score on (rate, n) — precision cannot move; the change can only turn
+    # a REFUTED into an UNVERIFIED (false reject becomes abstention).
+    if verdict != PROVEN:
+        if n_eff >= 2 and (holds / n_eff) < 0.5:
+            # Conclusive evidence says the bug survives; re-format the reason
+            # on the conclusive rate and conditionally append the exclusion
+            # suffix so the audit trail names the excluded invariants.
+            _, ref_reason = mr.score(holds / n_eff, n_eff)
+            reason = ref_reason
+            if inconclusive > 0:
+                reason += f" ({inconclusive} inconclusive invariant(s) excluded)"
+            verdict = REFUTED
+        elif inconclusive > 0:
+            # The patch changed the behaviour the inconclusive invariants
+            # test; they cannot judge it. Surface that explicitly so the
+            # auditor can rerun them with a corrected expectation.
+            reason = (f"{inconclusive} of {n} invariants failed in a way the "
+                      f"buggy code did not — the patch changed the behaviour "
+                      f"they test, so they cannot judge it; {holds} of {n} hold")
+            verdict = UNVERIFIED
+        # else: keep mr.score's UNVERIFIED reason verbatim.
+
+    return Verdict(verdict, reason, poc_plus=poc_src,
+                   mr_pass_rate=(rate if n else None), mr_n=n,
+                   detail={"invariants": kept, "dropped": dropped,
+                           "n_effective": n_eff, "inconclusive": inconclusive})
 
 
 __all__ = ["judge", "replay_check"]
