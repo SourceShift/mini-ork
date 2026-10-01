@@ -12,6 +12,20 @@ experience so the next run starts smarter than the last.
 
 ---
 
+## 0. Certify a change — proof that a fix fixes the bug
+
+> One command judges whether a change really fixes the bug it claims to fix, by running
+> code against the repository instead of reading the diff.
+
+| Feature | Where | What it gives you |
+|---|---|---|
+| `mini-ork certify` | `mini_ork/cli/certify.py` | Point it at a base and head commit (or a patch file) plus the bug report. Exits `0` PROVEN, `1` REFUTED, `2` UNVERIFIED, so CI can gate on it. |
+| Reproduction probe grounded in the repo | `mini_ork/certify/probe.py`, `mini_ork/certify/context.py` | The model sees the base source of the changed files and must import the repository's own module; a probe that tests its own copy of the code is rejected before it runs. |
+| Adversarial invariants | `mini_ork/certify/invariants.py` | Extra tests generated to vary whatever the patch may have special-cased; each one counts only if it fails on the unpatched code. PROVEN needs two thirds of them to hold. |
+| Isolated runtime image | `mini_ork/certify/image.py` | Builds a Docker image of the repo at the base commit (Python projects auto-detected; anything else via `--image`). |
+| Certificate v1 | `mini_ork/certify/certificate.py` | JSON with verdict, reason, probe, per-invariant results, hashes of the change and the claim, model, cost, and a digest. |
+| Runnable demo | `examples/certify-demo/demo.sh` | A correct fix and a special-cased cheat for the same bug: PROVEN vs REFUTED. Measured results: [RESULTS.md](RESULTS.md). |
+
 ## 1. Heterogeneous multi-family orchestration
 
 The load-bearing design choice: review panels span vendors, so no model
@@ -39,7 +53,7 @@ is structural:
 |---|---|---|
 | Cheap-lane routing | `.mini-ork/config/agents.yaml` | Tactical checks run on budget families (GLM, DeepSeek); frontier models (Opus) are reserved for synthesis and architecture review. Price/role fit is configuration, not luck. |
 | Per-call LLM ledger | `llm_calls` table (`db/migrations/0018_llm_calls_session_id.sql`) | Every dispatch logs model, tokens, cost, duration, session. Answer "where did the money go?" with SQL. |
-| Authoritative usage totals | `lib/llm-dispatch.sh` | Token totals come from the billed result envelope, not stub per-turn values — costs you see are costs you paid. |
+| List-price cost meter | `mini_ork/dispatch/providers.py` (`claude_cost`) + `.mini-ork/config/pricing.yaml` | Token totals come from the result envelope; each non-Anthropic model is priced at its provider's list price (input, cache read, cache write, output), so the ledger and the daily cap reflect real spend. |
 | Budget caps | `config/agents.yaml` (`budget:`) + `lib/llm-dispatch.sh` | Declared defaults: $5/epic, $0.50/run, $50/day. The daily cap is enforced inside the dispatcher (`MO_DAILY_BUDGET_USD`); per-lane budgets are surfaced to every dispatch as flags. |
 | Daily cost circuit breaker | `MO_DAILY_BUDGET_USD` + pre-iter cost check in `bin/mini-ork-self-improve` | Long-running loops halt *before* creating the next worktree once 24h spend exceeds the cap. |
 | Behavioral circuit breaker | `lib/circuit_breaker.sh` | Detects cost-burn-without-write, artifact-hash stagnation, and stuck verdicts — kills spinning runs instead of letting them bill. |

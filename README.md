@@ -13,8 +13,9 @@
   <a href="https://github.com/SourceShift/mini-ork/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/SourceShift/mini-ork/actions/workflows/ci.yml/badge.svg"></a>
   <a href="https://github.com/SourceShift/mini-ork/actions/workflows/codeql.yml"><img alt="CodeQL" src="https://github.com/SourceShift/mini-ork/actions/workflows/codeql.yml/badge.svg"></a>
   <img alt="Python 3.11 | 3.12" src="https://img.shields.io/badge/python-3.11%20%7C%203.12-blue.svg">
-  <img alt="Status: early, research-grade" src="https://img.shields.io/badge/status-early%20%C2%B7%20research--grade-orange.svg">
 </p>
+
+<p align="center">English | <a href="README.zh-CN.md">简体中文</a></p>
 
 mini-ork turns a goal into a planned, executed, and *verified* run across a fleet of
 different models: **classify → plan → execute → verify → reflect → improve**. The
@@ -25,47 +26,61 @@ own output.
 It is for teams who want an agent to do real work without treating fluent output, a
 green-looking diff, or a panel of agreeing models as proof.
 
+## ✅ Prove a fix in one command
+
+Point `mini-ork certify` at a change and the bug it claims to fix. It reproduces the bug
+against your repository's own code, generates extra inputs the change was not written
+for, runs everything in a Docker sandbox, and returns a verdict with the evidence
+attached:
+
+~~~text
+$ bash examples/certify-demo/demo.sh          # paths shortened
+$ mini-ork certify --base base --head fix-correct --issue "median([1, 2, 3, 4]) returns 3, …should return 2.5."
+PROVEN  the fix holds across 100% of 4 perturbed inputs (supermajority)
+  change  1 file · sha256 506d0947   claim  "median([1, 2, 3, 4]) returns 3, but the median of an even…"
+  proof   .mini-ork/certificates/88f4ff0d-….json   cost $0.03 · 129s
+exit code: 0
+
+$ mini-ork certify --base base --head fix-cheat --issue "median([1, 2, 3, 4]) returns 3, …should return 2.5."
+REFUTED  the fix does not generalise — only 0% of 4 invariants hold, which is the signature of a patch that special-cases the reported input
+  change  1 file · sha256 aeaffdf3   claim  "median([1, 2, 3, 4]) returns 3, but the median of an even…"
+  proof   .mini-ork/certificates/c575f369-….json   cost $0.03 · 89s
+exit code: 1
+~~~
+
+Both changes make the example in the bug report pass. The second one only special-cases
+`[1, 2, 3, 4]`: a plain reproduction test passes on it, and every generated invariant
+fails. Exit codes are `0` PROVEN, `1` REFUTED, `2` UNVERIFIED — it abstains rather than
+guess — so CI can gate on it. Every run writes a `mini-ork.certificate/v1` JSON with the
+probe, the invariants, hashes of the change and the claim, and a digest.
+
+Try it: `bash examples/certify-demo/demo.sh` (needs Docker and one model lane).
+
+## 📊 Measured, not claimed
+
+- **Real repositories.** Three external Python libraries (marshmallow, pyparsing, toolz),
+  each with its upstream fix and a plausible wrong fix: **5 of 6 verdicts correct, 1
+  abstention, 0 wrong.** The abstention is pyparsing's correct fix, where the generated
+  tests assumed a library behaviour that is not true; the oracle now says UNVERIFIED
+  there instead of guessing. An earlier version got that repository wrong both ways.
+- **Adversarial SWE-bench corpus.** 21 of 21 PROVEN verdicts were correct fixes, with 0
+  false completions. The first version let one special-cased patch through (28 of 29);
+  that miss is what the current invariant generator was built to stop.
+- **Held-out tasks from this repository's own history.** 22 of 40 solved (55%), graded
+  by hidden tests the solver never saw, at **$0.42 per task** in real API spend with
+  open-weight models (MiniMax-M3 implementer, GLM-5.3 reviewer).
+- **One certificate** costs about **$0.03** at list price and takes 1–3 minutes.
+
+Methods, sample sizes, and what each number does *not* show: [docs/RESULTS.md](docs/RESULTS.md).
+
+> [!IMPORTANT]
+> mini-ork also contains a loop that can rewrite its own prompts and workflows and
+> promote the change without a human review. It is **off by default**. Read the
+> [warning](#warning-this-system-modifies-itself-unattended) before you turn it on.
+
 <p align="center">
   <img src="assets/mini-ork-hero.jpg" alt="An ork operator on a starship bridge overseeing many isolated workstreams, each a self-contained environment running its own crew." width="860">
 </p>
-
-## Warning: this system modifies itself, unattended
-
-> [!WARNING]
-> mini-ork's apply loop can rewrite its own recipe prompts, agent prompts, and workflow
-> nodes and edges — and **promote those changes without a human approving each one**. It
-> runs the candidate change over a held-out probe set, compares the publish rate before
-> and after, and promotes only on a measured improvement that does not regress a
-> previously-passing task. There is no "review this first" gate in that loop, and no
-> environment variable that puts one back.
-
-Read that as what it is: the machine is allowed to rewrite itself while you are not
-looking. The measurement is real — no promote happens without one — but a measurement
-is evidence, not a guarantee. A probe set is only as strong as its probes, and the loop
-cannot know what it never tested.
-
-This is **recursive self-improvement**, not a metaphor for it. The human approval gate
-that earlier versions had was deliberately removed, and it was removed *because* the
-measurement gate is what does the work: there is no code path that promotes without a
-real held-out measurement, and there is no flag that restores the human branch. What
-protects you from a bad promote is the probe set, the per-task no-regression rule, and
-your version control — not a person in the loop.
-
-**🛡️ If that is not what you want, the safe configuration is:**
-
-- 🔒 Leave `MO_APPLY_ENABLED` and `MO_AUTO_APPLY` unset. Both default to off, and the
-  unattended sweep requires *both* to be `1`.
-- 🧪 Run it on a throwaway worktree, never on a checkout you care about.
-- 🧮 Know your caps: `MO_APPLY_PROBE_BUDGET_USD` and `MO_APPLY_PROBE_MAX_TASKS` bound what
-  a single apply run can spend.
-- 🌿 Keep the target repository under version control. `mini-ork rollback agent <target>`
-  restores the pre-promotion file and `mini-ork rollback workflow <name>` the workflow,
-  but **your VCS is the ultimate backstop** — review the promoted diffs the way you
-  would review a junior engineer's commit.
-
-This is a research-grade, self-improving system under active development. A promotion
-is a change that has already landed, not a proposal waiting for you. See
-[docs/SAFETY.md](docs/SAFETY.md) for the full posture and the gates that do hold.
 
 ## 🎯 Why this exists
 
@@ -120,9 +135,12 @@ You don't pay frontier prices for work a cheaper model can pass:
 
 - **Heterogeneous dispatch.** Bring your own providers (OpenAI/Codex, MiniMax, Kimi, GLM,
   Anthropic, or any OpenAI-compatible endpoint) and route each node to a lane by role.
-- **Cost-optimizing routing policies.** Selectable strategies from `frontier_only` to
-  `cheap_only` to `learning_governed` — route to the cheapest lane that still clears the
-  verification bar (`MO_ROUTING_POLICY`).
+- **Routing policies.** Selectable strategies from `frontier_only` to `cheap_only` to
+  `learning_governed` (`MO_ROUTING_POLICY`). Recipes can pin a lane per node; the shipped
+  `code-fix` recipe pins its implementer, so learned routing applies to the roles a
+  recipe leaves open.
+- **Real prices.** Spend is metered per model at the provider's list price
+  (`.mini-ork/config/pricing.yaml`), not at whatever rate a wrapper CLI assumes.
 - **Hard cost controls.** A daily-spend circuit breaker, a periodic cost-pause sentinel
   an operator must approve, and a wall-clock deadline budget — so an autonomous run can't
   quietly burn your account.
@@ -131,8 +149,10 @@ You don't pay frontier prices for work a cheaper model can pass:
 
 Every run leaves a trail of *verified* outcomes, and the system feeds that signal back:
 
-- **Cost-free contextual-bandit routing** adjusts which lane gets each role next time,
-  from real advantage — no extra model calls (`mini_ork/lane_router.py`).
+- **Contextual-bandit routing** adjusts which lane gets each unpinned role next time,
+  from recorded advantage — no extra model calls (`mini_ork/lane_router.py`). Whether
+  that lowers cost at the same verified correctness is being measured, not claimed;
+  see [docs/RESULTS.md](docs/RESULTS.md).
 - **GRPO group-relative writeback** and **textual-gradient** prompt evolution improve the
   planner / implementer / reviewer prompts across runs.
 - **Verified-outcome memory** persists *only what passed the gates*, so the learned
@@ -144,8 +164,8 @@ Every run leaves a trail of *verified* outcomes, and the system feeds that signa
 mini-ork isn't a prettier agent graph or a cheaper autonomous coder. Orchestration
 frameworks wire agents together; coding products write and ship; eval tools score after
 the fact. mini-ork is the open-source runtime where **correctness is the primitive**:
-every run yields a verified outcome, that outcome routes the next run to a cheaper model,
-and the signal compounds on *your* repository.
+every run yields a verified outcome, that outcome is recorded against the model and
+the prompt that produced it, and the next run can route and prompt from it.
 
 That combination — correctness-conditional, cost-optimizing, compounding, and
 open-source — is what the framework is built around.
@@ -154,7 +174,7 @@ Honest about the edges: the execution oracle is only as strong as what you can *
 its guarantees are richest on code with real tests and thinnest on subjective or
 untestable work — where mini-ork is built to surface the uncertainty and refuse the
 promote rather than manufacture confidence. (Refusing does not mean asking you: the
-self-improvement loop has no approval prompt. See the [warning](#warning-this-system-modifies-itself-unattended) above.)
+self-improvement loop has no approval prompt. See the [warning](#warning-this-system-modifies-itself-unattended) below.)
 
 ## 📦 What is in the box
 
@@ -177,6 +197,15 @@ self-improvement loop has no approval prompt. See the [warning](#warning-this-sy
 `.venv`, the `.[full]` Python profile (CLI, local web sidecar, and Crucible), and the
 per-user `mini-ork` command. Dry runs do not call a model provider. Real runs
 additionally need the provider CLIs or provider configuration selected by your lanes.
+
+One line (macOS, Linux, or WSL):
+
+~~~bash
+curl -fsSL https://raw.githubusercontent.com/SourceShift/mini-ork/main/install.sh | sh
+~~~
+
+It clones into `~/.local/share/mini-ork` (set `MINI_ORK_INSTALL_DIR` to change that) and
+runs the same full install as `make install`. Or from a checkout:
 
 ~~~bash
 # Get mini-ork and install the full runtime (macOS, Linux, or WSL).
@@ -266,11 +295,49 @@ mini-ork run code-fix ./kickoff.md
 Recipes live in [recipes/](recipes/). To create one, define a task class, workflow,
 artifact contract, prompts, and verifiers; see the [extension guide](docs/EXTENSION.md).
 
+## Warning: this system modifies itself, unattended
+
+> [!WARNING]
+> mini-ork's apply loop can rewrite its own recipe prompts, agent prompts, and workflow
+> nodes and edges — and **promote those changes without a human approving each one**. It
+> runs the candidate change over a held-out probe set, compares the publish rate before
+> and after, and promotes only on a measured improvement that does not regress a
+> previously-passing task. There is no "review this first" gate in that loop, and no
+> environment variable that puts one back.
+
+Read that as what it is: the machine is allowed to rewrite itself while you are not
+looking. The measurement is real — no promote happens without one — but a measurement
+is evidence, not a guarantee. A probe set is only as strong as its probes, and the loop
+cannot know what it never tested.
+
+This is **recursive self-improvement**, not a metaphor for it. The human approval gate
+that earlier versions had was deliberately removed, and it was removed *because* the
+measurement gate is what does the work: there is no code path that promotes without a
+real held-out measurement, and there is no flag that restores the human branch. What
+protects you from a bad promote is the probe set, the per-task no-regression rule, and
+your version control — not a person in the loop.
+
+**🛡️ If that is not what you want, the safe configuration is:**
+
+- 🔒 Leave `MO_APPLY_ENABLED` and `MO_AUTO_APPLY` unset. Both default to off, and the
+  unattended sweep requires *both* to be `1`.
+- 🧪 Run it on a throwaway worktree, never on a checkout you care about.
+- 🧮 Know your caps: `MO_APPLY_PROBE_BUDGET_USD` and `MO_APPLY_PROBE_MAX_TASKS` bound what
+  a single apply run can spend.
+- 🌿 Keep the target repository under version control. `mini-ork rollback agent <target>`
+  restores the pre-promotion file and `mini-ork rollback workflow <name>` the workflow,
+  but **your VCS is the ultimate backstop** — review the promoted diffs the way you
+  would review a junior engineer's commit.
+
+This is a research-grade, self-improving system under active development. A promotion
+is a change that has already landed, not a proposal waiting for you. See
+[docs/SAFETY.md](docs/SAFETY.md) for the full posture and the gates that do hold.
+
 ## ♻️ Recursive self-improvement: two loops
 
 mini-ork improves itself through two loops that are easy to conflate, yet their blast
 radii are nothing alike. The [warning](#warning-this-system-modifies-itself-unattended)
-at the top of this file is about the second one. Know which one you are starting.
+just above is about the second one. Know which one you are starting.
 
 ### 🔬 The self-improvement loop — bounded, branch-isolated, dry-runnable
 
@@ -421,7 +488,7 @@ latency, and the user's interruption budget. (A proposal, not yet a shipped capa
 
 ## 🤝 Contributing and status
 
-mini-ork is **Apache-2.0** licensed and early. Use a dedicated worktree for framework
+mini-ork is **Apache-2.0** licensed, early, and research-grade. Use a dedicated worktree for framework
 changes, keep a verifier with every behavior claim, and run the focused checks for the
 surface you change. The contribution workflow and quality gates are in
 [AGENTS.md](AGENTS.md); project direction lives in [GOVERNANCE.md](GOVERNANCE.md).

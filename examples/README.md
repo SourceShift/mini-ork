@@ -10,10 +10,13 @@ examples should be added to this index only when their directories exist.
 | # | Name | Description | Expected Cost | Expected Runtime | Features |
 |---|---|---|---|---|---|
 | 01 | [hello-world](./01-hello-world/) | Add a CHANGELOG entry under `[Unreleased]` | ~$0.004 | < 60 s | single epic, minimal kickoff, fast install check |
+| — | [certify-demo](./certify-demo/) | A correct fix and a special-cased cheat for the same bug: `mini-ork certify` returns PROVEN vs REFUTED | a few cents per certificate at list price | 1–3 min per certificate | Docker sandbox, adversarial invariants, certificate JSON |
 
 ---
 
 ## Choosing an Example
+
+**See verification work** → `certify-demo` (`bash examples/certify-demo/demo.sh`). Needs Docker and one model lane.
 
 **Verify install only** → `01-hello-world`. Needs any git repo with a
 `CHANGELOG.md`. Single LLM call, exits in under a minute.
