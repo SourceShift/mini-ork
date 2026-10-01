@@ -147,8 +147,8 @@ the fact. mini-ork is the open-source runtime where **correctness is the primiti
 every run yields a verified outcome, that outcome routes the next run to a cheaper model,
 and the signal compounds on *your* repository.
 
-That specific combination — correctness-conditional, cost-optimizing, compounding, and
-open-source — is the wedge, and it doesn't exist together anywhere else today.
+That combination — correctness-conditional, cost-optimizing, compounding, and
+open-source — is what the framework is built around.
 
 Honest about the edges: the execution oracle is only as strong as what you can *run*, so
 its guarantees are richest on code with real tests and thinnest on subjective or

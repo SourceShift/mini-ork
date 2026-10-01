@@ -7,9 +7,8 @@ coalitions are a common way to lose that independence. mini-ork therefore uses
 model-family diversity as an enforceable proxy, then relies on deterministic
 verifiers where the task allows it.
 
-This document captures the competitive position and the specific shapes
-that make mini-ork compose, not compete, with Claude Code, OpenAI Agents
-SDK, LangGraph, and the new dynamic-workflow agents.
+This document records the design shapes behind that prior and the research
+they rest on.
 
 ## Research signals behind the design
 
@@ -32,7 +31,7 @@ If you read one, read Nasser. The harshness table is the receipts.
 
 This is the test we built mini-ork to pass.
 
-## How mini-ork wins over Claude Code dynamic workflows
+## What mini-ork adds on top of a per-session agent framework
 
 Claude Code's new dynamic-workflow agents are a remarkable engineering
 achievement at the per-session level: a model that decomposes its own task,
@@ -92,7 +91,7 @@ mini-ork metrics --recipe refactor-audit | head
 ```
 
 `state.db` is the substrate. The framework can answer: "what did the audit
-cycle from 3 days ago find that today's didn't?" — Claude Code cannot.
+cycle from 3 days ago find that today's didn't?" — a per-session framework cannot.
 
 ### 3. Executable specification gate
 
@@ -214,9 +213,8 @@ into a robust process.
 
 ## The one-line summary
 
-mini-ork is what you build on top of Claude Code (or any single-vendor agent
-framework) when you've read Nasser 2026 and want to actually pass the
-detection-fingerprint test.
+mini-ork treats low-correlation evidence and executable verification as
+structural requirements rather than conventions.
 
 ---
 
