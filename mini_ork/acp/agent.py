@@ -56,6 +56,10 @@ TERMINAL_STATUSES = frozenset({"published", "rolled_back", "failed"})
 # Poll cadence while a detached run is awaited, and the stop→kill grace window.
 _POLL_INTERVAL_S = float(os.environ.get("MO_ACP_POLL_SECONDS", "2.0"))
 _CANCEL_ESCALATE_S = float(os.environ.get("MO_ACP_CANCEL_GRACE", "3.0"))
+# Hard ceiling for "how long may the launcher take before we call the run
+# refused". Without it, a launcher that exits before publishing a task_run row
+# (bad interpreter, missing venv, ...) leaves _await_terminal polling forever.
+_START_TIMEOUT_S = float(os.environ.get("MO_ACP_START_TIMEOUT_S", "300"))
 
 # Reported context-window size ("size" in UsageUpdate). mini-ork has no per-call
 # context column in llm_calls, so the projection reports a fixed window.
@@ -75,6 +79,17 @@ def _extract_prompt_text(prompt: list[Any]) -> str:
         if isinstance(text, str) and text.strip():
             chunks.append(text)
     return "\n".join(chunks)
+
+
+def _tail_log(path: str | None, n: int = 20) -> str:
+    """Last ``n`` lines of ``path`` for refusal-text bodies; never raises."""
+    if not path:
+        return "(no launch log)"
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            return "".join(f.readlines()[-n:]).rstrip("\n") or "(launch log empty)"
+    except OSError:
+        return "(launch log unreadable)"
 
 
 class MiniOrkAcpAgent:
@@ -100,6 +115,7 @@ class MiniOrkAcpAgent:
         recipe: str | None = None,
         poll_interval: float | None = None,
         cancel_grace: float | None = None,
+        start_timeout: float | None = None,
     ) -> None:
         # launcher: callable(run_id, kickoff_text) -> dict; reader: callable(run_id)
         # -> {"status", "events", "llm_calls"}; stopper/killer: callable(run_id) -> dict.
@@ -111,6 +127,7 @@ class MiniOrkAcpAgent:
         self._recipe = recipe or os.environ.get("MO_ACP_RECIPE") or DEFAULT_RECIPE
         self._poll_interval = _POLL_INTERVAL_S if poll_interval is None else float(poll_interval)
         self._cancel_grace = _CANCEL_ESCALATE_S if cancel_grace is None else float(cancel_grace)
+        self._start_timeout_s = _START_TIMEOUT_S if start_timeout is None else float(start_timeout)
         # The AgentSideConnection handed to on_connect; session_update pushes
         # projected read-model updates back to the ACP client.
         self._conn: Any | None = None
@@ -120,6 +137,11 @@ class MiniOrkAcpAgent:
         self._recipes: dict[str, str] = {}
         # session id → set of already-emitted node transitions (D1: emit once).
         self._emitted: dict[str, set[str]] = {}
+        # session id → launcher result dict (carries pid / log_path so
+        # _await_terminal can probe whether the launcher is still alive and
+        # tail its log on refusal). Injected launchers may omit keys; missing
+        # keys degrade to "unknown" rather than crash.
+        self._launches: dict[str, dict[str, Any]] = {}
         self._cancelled: set[str] = set()
         self._launch_count = 0
 
@@ -176,6 +198,10 @@ class MiniOrkAcpAgent:
         self._launch_count += 1
         launcher = self._launcher or self._launch
         result = launcher(session_id, _extract_prompt_text(prompt))
+        # Stash whatever the launcher returned so _await_terminal can detect a
+        # dead launcher (pid reaped) and tail its log on refusal. Injected
+        # launchers in tests may omit pid / log_path; treat as "unknown".
+        self._launches[session_id] = result if isinstance(result, dict) else {}
         if isinstance(result, dict) and result.get("ok") is False:
             return PromptResponse(stop_reason="refusal")
         # The ACP turn ends only when the detached run reaches a terminal
@@ -273,6 +299,31 @@ class MiniOrkAcpAgent:
             content=TextContentBlock(type="text", text=f"mini-ork run finished: {status}"),
         )
 
+    def _build_refusal_message(self, text: str) -> AgentMessageChunk:
+        """Same shape as ``_build_terminal_message``; emitted when the turn
+        ends in ``refusal`` (launcher died or start timeout exceeded).
+        """
+        return AgentMessageChunk(
+            session_update="agent_message_chunk",
+            content=TextContentBlock(type="text", text=text),
+        )
+
+    def _is_pid_gone(self, pid: int) -> bool:
+        """True when ``pid`` is no longer running.
+
+        Mirrors mini_ork/web/routes/pty.py:195-206: a non-(0,0) waitpid return
+        means the child was reaped; a ChildProcessError means it isn't ours (or
+        already gone). Any other OSError is treated as "still running" so a flaky
+        probe doesn't tip the agent into a false refusal.
+        """
+        try:
+            result = os.waitpid(pid, os.WNOHANG)
+        except ChildProcessError:
+            return True
+        except OSError:
+            return False
+        return result != (0, 0)
+
     async def _emit(self, session_id: str, update: Any) -> None:
         if self._conn is not None:
             await self._conn.session_update(session_id, update)
@@ -296,11 +347,45 @@ class MiniOrkAcpAgent:
 
     async def _await_terminal(self, session_id: str) -> StopReason:
         reader = self._reader or self._read_snapshot
+        # Start-timeout clock runs once per turn (kicks off at the first poll).
+        start_deadline = time.monotonic() + self._start_timeout_s
+        pid_gone_observed = False
         while True:
             if session_id in self._cancelled:
                 return "cancelled"
             snapshot = reader(session_id) or {"status": None, "events": [], "llm_calls": []}
             await self._project_snapshot(session_id, snapshot)
+            if snapshot.get("status") is None:
+                # The run hasn't produced a task_runs row yet; look for an
+                # early death of the launcher (shebang interpreter bug, missing
+                # venv, ...) and for a hard start-timeout.
+                launch_info = self._launches.get(session_id) or {}
+                pid = launch_info.get("pid")
+                log_path = launch_info.get("log_path")
+                # 1. Probe the detached launcher process. A quick exit means the
+                #    run never produced a row; one extra read confirms.
+                if pid is not None and not pid_gone_observed and self._is_pid_gone(pid):
+                    pid_gone_observed = True
+                    confirm = reader(session_id) or {"status": None, "events": [], "llm_calls": []}
+                    await self._project_snapshot(session_id, confirm)
+                    if confirm.get("status") is None:
+                        await self._emit(
+                            session_id,
+                            self._build_refusal_message(
+                                "mini-ork run failed to start:\n" + _tail_log(log_path, 20)
+                            ),
+                        )
+                        return "refusal"
+                # 2. Start-timeout fallback (independent of pid probe).
+                if not pid_gone_observed and time.monotonic() >= start_deadline:
+                    await self._emit(
+                        session_id,
+                        self._build_refusal_message(
+                            f"mini-ork run did not start within {self._start_timeout_s:g}s\n"
+                            + _tail_log(log_path, 20)
+                        ),
+                    )
+                    return "refusal"
             if snapshot.get("status") in TERMINAL_STATUSES:
                 return "end_turn"
             await asyncio.sleep(self._poll_interval)

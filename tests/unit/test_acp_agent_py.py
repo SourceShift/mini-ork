@@ -23,12 +23,14 @@ import json
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 REPO = Path(__file__).resolve().parents[2]
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
 from acp.schema import (  # noqa: E402
+    AgentMessageChunk,
     TextContentBlock,
     ToolCallProgress,
     ToolCallStart,
@@ -248,3 +250,106 @@ def test_acp_cmd_import_prints_nothing_to_stdout():
         cwd=str(REPO),
     )
     assert out.stdout == ""
+
+
+# ── start-detection (dead-launcher probe + start-timeout) ──────────────────
+
+
+def _capturing_conn() -> tuple[list, Any]:
+    """Build a fake ACP connection that records every session_update push."""
+
+    class _FakeConn:
+        async def session_update(self, _sid: str, update) -> None:
+            captured.append(update)
+
+    captured: list = []
+    return captured, _FakeConn()
+
+
+def test_prompt_refuses_when_launcher_exits_before_publishing(tmp_path):
+    # A child that exits immediately so waitpid returns (pid, status).
+    dead = subprocess.Popen([sys.executable, "-c", "pass"])
+    dead.wait()
+
+    log_path = tmp_path / "launch.log"
+    log_path.write_text("alpha line\nbravo line\ncharlie line\n", encoding="utf-8")
+
+    def fake_launcher(run_id: str, text: str) -> dict:
+        del text
+        return {"ok": True, "run_id": run_id, "pid": dead.pid, "log_path": str(log_path)}
+
+    def always_none(_run_id: str) -> dict:
+        return {"status": None, "events": [], "llm_calls": []}
+
+    captured, conn = _capturing_conn()
+    agent = MiniOrkAcpAgent(
+        launcher=fake_launcher,
+        reader=always_none,
+        poll_interval=0,
+    )
+    agent.on_connect(conn)
+    resp = asyncio.run(agent.prompt("run-dead-1", [_text_block("do it")]))
+
+    assert resp.stop_reason == "refusal", resp
+    chunks = [u for u in captured if isinstance(u, AgentMessageChunk)]
+    assert chunks, f"expected an agent_message_chunk emission, got {captured!r}"
+    text = chunks[0].content.text
+    assert "failed to start" in text, text
+    assert "alpha line" in text and "bravo line" in text and "charlie line" in text, text
+
+
+def test_prompt_refuses_on_start_timeout_when_launcher_lingers():
+    # No pid in the launcher result → dead-launcher probe is skipped; the
+    # start-timeout is the only safety net.
+    def fake_launcher(run_id: str, text: str) -> dict:
+        del text
+        return {"ok": True, "run_id": run_id}
+
+    def always_none(_run_id: str) -> dict:
+        return {"status": None, "events": [], "llm_calls": []}
+
+    captured, conn = _capturing_conn()
+    agent = MiniOrkAcpAgent(
+        launcher=fake_launcher,
+        reader=always_none,
+        poll_interval=0.01,
+        start_timeout=0.2,
+    )
+    agent.on_connect(conn)
+    resp = asyncio.run(agent.prompt("run-slow-1", [_text_block("do it")]))
+
+    assert resp.stop_reason == "refusal", resp
+    chunks = [u for u in captured if isinstance(u, AgentMessageChunk)]
+    assert chunks, f"expected an agent_message_chunk emission, got {captured!r}"
+    assert "did not start within" in chunks[0].content.text, chunks[0].content.text
+
+
+def test_prompt_end_turn_with_live_launcher_pid():
+    live = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(5)"])
+    try:
+        def fake_launcher(run_id: str, text: str) -> dict:
+            del text
+            return {"ok": True, "run_id": run_id, "pid": live.pid}
+
+        states = iter(["executing", "published"])
+
+        def fake_reader(_run_id: str) -> dict:
+            try:
+                return {"status": next(states), "events": [], "llm_calls": []}
+            except StopIteration:
+                return {"status": "published", "events": [], "llm_calls": []}
+
+        agent = MiniOrkAcpAgent(
+            launcher=fake_launcher,
+            reader=fake_reader,
+            poll_interval=0.01,
+        )
+        resp = asyncio.run(agent.prompt("run-live-1", [_text_block("do it")]))
+        assert resp.stop_reason == "end_turn", resp
+    finally:
+        live.terminate()
+        try:
+            live.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            live.kill()
+            live.wait()

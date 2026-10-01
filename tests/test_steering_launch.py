@@ -106,11 +106,17 @@ def test_launch_run_rejects_bad_input(db: StateDB, home: Path) -> None:
 
 def test_launch_run_spawns_and_stages_kickoff(home: Path, tmp_path: Path, monkeypatch) -> None:  # noqa: ARG001
     # Fake repo root with a no-op bin/mini-ork so the spawn path runs without
-    # launching a real recipe.
+    # launching a real recipe. The script MUST be a valid Python source: the
+    # current launch_run spawns `[sys.executable, "bin/mini-ork", "run", ...]`,
+    # so the kernel execs sys.executable (Python) and Python runs this file as
+    # its script — a `#!/bin/sh` shebang would be parsed as a Python
+    # comment-then-SyntaxError on the `exit` keyword.
     fake_root = tmp_path / "fake-root"
     (fake_root / "bin").mkdir(parents=True)
     bin_mo = fake_root / "bin" / "mini-ork"
-    bin_mo.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    bin_mo.write_text(
+        "#!/usr/bin/env python3\nimport sys; sys.exit(0)\n", encoding="utf-8"
+    )
     bin_mo.chmod(bin_mo.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
     monkeypatch.setenv("MINI_ORK_ROOT", str(fake_root))
 

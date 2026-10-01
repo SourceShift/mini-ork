@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import os
 import signal
+import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -606,13 +607,22 @@ def launch_run(
     env["MINI_ORK_RUN_ID"] = rid
     env["MINI_ORK_HOME"] = str(home)
     env["MINI_ORK_ROOT"] = str(root)
+    # Drop the parent's re-exec marker. If it leaked, bin/mini-ork's
+    # _reexec_in_project_venv would skip the child's own venv re-exec and run on
+    # whatever interpreter started it. The child sets the flag again itself when
+    # it re-execs.
+    env.pop("MINI_ORK_VENV_ACTIVE", None)
     if extra_env:
         env.update({str(k): str(v) for k, v in extra_env.items()})
 
     try:
         log_fh = open(log_path, "ab")  # noqa: SIM115 — handed to the child; closed in parent below
+        # Spawn under the current interpreter, not the shebang's `env python3` —
+        # the latter is whatever `python3` is first on PATH and on macOS is 3.9,
+        # which trips bin/mini-ork's version check (mini_ork/web/control.py → ACP
+        # agent dead-poll). sys.executable is the venv python in production.
         proc = subprocess.Popen(
-            [str(bin_path), "run", rcp, str(kickoff_path)],
+            [sys.executable, str(bin_path), "run", rcp, str(kickoff_path)],
             cwd=str(root),
             env=env,
             stdout=log_fh,
