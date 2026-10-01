@@ -130,3 +130,110 @@ curl -s http://100.x.y.z:7091/v1/health            # the only route that needs n
 - **Env and secrets:** a spawn request carries env values. They reach the
   process through `docker exec -e KEY` and the CLI's own environment, so they
   never appear in argv. Only the keys are written to `.procs/<pid>.json`.
+
+## Selecting the remote backend
+
+The `Workspace` backend resolver (`mini_ork.runtime.agent_workspace`) learns
+a fourth selector, `remote`, alongside the existing `local`, `docker`, and
+`microvm`. With `MO_SANDBOX_BACKEND=remote` (or `resolve_spawn_workspace("remote", …)`),
+mini-ork drives the node-agent over HTTP instead of forking a local subprocess or
+launching a container on the control-plane host. Picking it is a config change;
+no caller has to branch on the backend.
+
+### What you set
+
+The runtime needs three things to pick a node:
+
+1. **The node URL and bearer token.** Two equivalent shapes:
+   - One-off, bypass the registry entirely:
+
+       ```bash
+       export MO_NODE_URL="http://100.64.0.5:7091"
+       export MO_NODE_TOKEN="$(pass show node-agent/staging-a)"
+       ```
+   - Named, looked up in the registry:
+
+       ```bash
+       # config/nodes.yaml (template at $MINI_ORK_ROOT, live at $MINI_ORK_HOME):
+       nodes:
+         staging-a:
+           url: http://100.64.0.5:7091
+           token_env: MO_NODE_TOKEN_STAGING_A    # name only — value lives in env
+           max_sessions: 4
+         # …export MO_NODE_TOKEN_STAGING_A="$(pass show node-agent/staging-a)"
+         export MO_NODE=staging-a
+       ```
+
+   The live file at `$MINI_ORK_HOME/config/nodes.yaml` MERGES PER NODE over the
+   template (a live entry with the same name keeps the template's URL and only
+   overrides the fields it sets; a live entry with a NEW name is appended).
+   This avoids the "tabs of providers.yaml drops lanes" trap — the committed
+   template's defaults keep flowing through.
+
+2. **The session image.** Required by `POST /v1/sessions`. Either pass
+   `image=` to the resolver / factory, or set `MO_SANDBOX_IMAGE`. Same env var
+   the docker backend already reads.
+
+3. **A run id.** Either `MINI_ORK_RUN_ID` (the harness already sets it) or the
+   resolver generates one.
+
+A working `config/nodes.yaml.example` ships under `$MINI_ORK_ROOT/config/` —
+copy it to `$MINI_ORK_HOME/config/nodes.yaml` and edit. Tokens live in env only.
+
+### What you observe
+
+- One `RemoteWorkspace.up()` per run — `POST /v1/sessions` is idempotent on
+  `run_id`, so a re-used session is returned, not recreated.
+- An engine sha mismatch triggers a one-shot `PUT /v1/engines/{sha}` (a git
+  bundle of `$MINI_ORK_ROOT` HEAD). A second `up()` on the same sha uploads
+  nothing. A dirty engine tree refuses unless `MO_REMOTE_ALLOW_DIRTY_ENGINE=1`
+  — a sha must name an exact tree.
+- Each `Workspace.exec` / `spawn` maps onto the run-scoped URL scheme the
+  node-agent actually ships: `POST /v1/sessions/{run_id}/procs`,
+  `GET /v1/sessions/{run_id}/procs/{pid}/stream`, `POST /v1/sessions/{run_id}/exec`,
+  `PUT/GET /v1/sessions/{run_id}/files?root=run`,
+  `DELETE /v1/sessions/{sid}`.
+- `put` / `get` round-trip through the node-agent's tar files API. `put`
+  returns an in-workspace path (`run/put-<hex>.txt`) so a follow-up `get` reads
+  it back through the same root.
+- `RemoteWorkspace.spawn` keeps stdout and stderr SEPARATE (matches the host
+  `spawn_local` contract and the docker backend's behaviour). It returns
+  `(rc, stdout, stderr)` with the conventional rc=124 on timeout and rc=127 on
+  a missing argv[0].
+
+### What you don't get
+
+- **No silent host fallback.** When the node-agent is unreachable after
+  `MO_REMOTE_HTTP_RETRIES` attempts (default 5), `RemoteWorkspace.up()` raises
+  `RemoteUnavailableError`. The dispatch layer maps that exception to
+  `failure_class=remote_unavailable`. There is no codepath where a transport
+  failure degrades into a host subprocess. A dirty engine tree is the only
+  other raise path; `MO_REMOTE_ALLOW_DIRTY_ENGINE=1` is the explicit bypass for
+  test setups.
+- **No automatic node selection.** If neither `MO_NODE_URL`+`MO_NODE_TOKEN`
+  nor `MO_NODE` resolves to a registry entry, `select_node` raises loudly. This
+  is by design — auto-picking a node would let a config typo route every
+  dispatcher's run to the wrong host.
+- **No env leakage.** `spawn(env=...)` filters through the same `_container_env`
+  allowlist the docker and microvm backends share (`mini_ork.runtime.backends._workspace_env`).
+  A non-allowlisted ambient key (e.g. `ZZ_AMBIENT_SENTINEL`) does not reach the
+  child; every `_RUN_CONTRACT_KEYS` member the caller sets DOES arrive. The
+  `local` backend is exempt from this filter — it is the host-parity backend
+  and passes the full env.
+
+### Verifying
+
+The conformance suite under `tests/unit/test_workspace_conformance.py`
+parameterises the same six cases across `local` and `remote` (the docker case
+is daemon-gated; the in-process node-agent test uses `--runtime host` so no
+daemon is required). The unit suite at `tests/unit/test_remote_workspace.py`
+covers the retry policy, idempotent engine upload, dirty-tree refusal, and
+default-path byte-identical proof (`MO_SANDBOX_BACKEND` unset never loads
+`mini_ork.runtime.backends.remote`).
+
+```bash
+python3.11 -m pytest -q \
+    tests/unit/test_workspace_conformance.py \
+    tests/unit/test_remote_workspace.py \
+    tests/unit/test_sandbox_protocol.py
+```

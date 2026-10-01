@@ -1,0 +1,46 @@
+# config/nodes.yaml.example — remote-node registry (remote-nodes-06, §2)
+#
+# COPY to config/nodes.yaml under $MINI_ORK_HOME (operator-edited live file)
+# and fill in the URLs. The committed TEMPLATE under $MINI_ORK_ROOT can
+# ship a `default_node` + one or more entries so a fresh install is one
+# bind-mount + one env var away from working.
+#
+# Tokens are NEVER stored here. Each entry's `token_env` is just the NAME
+# of the env var that holds the bearer token (e.g. `MO_NODE_TOKEN`); the
+# value is read from the operator's shell / secret store at call time.
+#
+# Shadow-merge semantics: the LIVE file at $MINI_ORK_HOME/config/nodes.yaml
+# merges PER NODE over this TEMPLATE. A live entry with the same name as a
+# template entry overrides only the fields it sets (so the template's URL
+# survives a live `max_sessions: 4` override). A live entry with a NEW
+# name is appended.
+
+default_node: staging-a   # used when $MO_NODE is unset
+
+nodes:
+  # Every named node-agent. `url` is the base the remote backend hits
+  # (loopback / tailnet / public-IP, with optional port); `max_sessions`
+  # is the per-node cap (the runtime reaper enforces it).
+  staging-a:
+    url: http://100.64.0.5:7091
+    token_env: MO_NODE_TOKEN_STAGING_A
+    max_sessions: 4
+  staging-b:
+    url: http://100.64.0.6:7091
+    token_env: MO_NODE_TOKEN_STAGING_B
+    max_sessions: 4
+  prod-1:
+    url: https://node-1.example.internal:7091
+    token_env: MO_NODE_TOKEN_PROD_1
+    max_sessions: 16
+
+# One-off override (no entry needed): set BOTH
+#   MO_NODE_URL=http://100.64.0.99:7091
+#   MO_NODE_TOKEN=<bearer>
+# to bypass the registry for a single run. Useful for ad-hoc boxes that
+# should not be named in the operator's committed template.
+
+# Engine upload gate: when the remote node does NOT have the control plane's
+# engine sha, `RemoteWorkspace.up()` uploads it as a git bundle once per sha.
+# A second `up()` on the same sha uploads nothing (idempotent, in-process).
+# A dirty engine tree is refused unless `MO_REMOTE_ALLOW_DIRTY_ENGINE=1`.

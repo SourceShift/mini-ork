@@ -25,6 +25,12 @@ Contract (opt-in, loud on error):
     server is available. ``exec_cwd`` is the in-container mount path, not the
     host path. Both backend modules are imported *here, lazily*, so the default
     path never imports either.
+  * ``remote`` → a per-run :class:`RemoteWorkspace` driving a node-agent over
+    HTTP (remote-nodes-06, kickoff §1). Selected through
+    ``$MO_NODE``/``$MO_NODE_URL``+``$MO_NODE_TOKEN`` and the
+    ``config/nodes.yaml`` registry. ``exec_cwd`` is the in-container mount
+    path; transport errors retry with bounded backoff and raise
+    :class:`RemoteUnavailableError` — never a silent host fallback.
   * unknown backend → ``ValueError`` from :func:`get_workspace` — never a silent
     host fallback.
 
@@ -91,20 +97,34 @@ def resolve_agent_workspace(
     if backend == "local":
         # Parity: LocalWorkspace.exec delegates straight to mo_runtime_exec.
         return get_workspace("local", root=node_cwd), node_cwd
-    if backend in ("microvm", "docker"):
-        # Lazy import: the container/microVM backend is only pulled in when
-        # opted into, keeping the default path free of any SDK/CLI dependency.
-        # microvm is the default-preferred isolation; docker is the fallback.
+    if backend in ("microvm", "docker", "remote"):
+        # Lazy import: the container/microVM/remote backend is only pulled in
+        # when opted into, keeping the default path free of any SDK/CLI/HTTP
+        # dependency. microvm is the default-preferred isolation; docker the
+        # fallback; remote the data-plane backend (kickoff §1).
         if backend == "microvm":
-            import mini_ork.runtime.backends.microvm  # noqa: F401  (registers "microvm")
+            import mini_ork.runtime.backends.microvm as _microvm_backend  # noqa: F401
+        elif backend == "docker":
+            import mini_ork.runtime.backends.docker as _docker_backend  # noqa: F401
         else:
-            import mini_ork.runtime.backends.docker  # noqa: F401  (registers "docker")
+            # remote — imported lazily so the default path never imports it
+            # (verified by tests/unit/test_remote_workspace.py).
+            import mini_ork.runtime.backends.remote as _remote_backend  # noqa: F401
 
         root = drive_root or (src.get(ENV_DRIVE_ROOT) or "").strip() or node_cwd
         image = (src.get(ENV_IMAGE) or "").strip()
-        ws = get_workspace(
-            backend, image=image, drive_root=root, mount_path=MOUNT_PATH
-        )
+        # ``remote`` factory needs the resolver's scoped env to honor
+        # ``MO_NODE_URL`` etc. without requiring the caller to set ``os.environ``.
+        # docker/microvm read env directly, so we don't forward it for them.
+        if backend == "remote":
+            ws = get_workspace(
+                backend, image=image, drive_root=root, mount_path=MOUNT_PATH,
+                env=dict(src),
+            )
+        else:
+            ws = get_workspace(
+                backend, image=image, drive_root=root, mount_path=MOUNT_PATH,
+            )
         return ws, MOUNT_PATH
     # Unknown backend → loud ValueError (never a silent host fallback).
     return get_workspace(backend, root=node_cwd), node_cwd
@@ -139,17 +159,25 @@ def resolve_spawn_workspace(
     if backend == "local":
         # Parity: LocalWorkspace.spawn delegates straight to core.spawn_local.
         return get_workspace("local", root=cwd or os.getcwd())
-    if backend in ("microvm", "docker"):
-        # Lazy import so the default path never pulls the CLI/SDK dependency;
-        # microvm is the default-preferred isolation, docker the fallback.
+    if backend in ("microvm", "docker", "remote"):
+        # Lazy import so the default path never pulls the CLI/SDK/HTTP
+        # dependency; microvm is the default-preferred isolation, docker the
+        # fallback, remote the kickoff §1 backend.
         if backend == "microvm":
-            import mini_ork.runtime.backends.microvm  # noqa: F401  (registers "microvm")
+            import mini_ork.runtime.backends.microvm as _microvm_backend  # noqa: F401
+        elif backend == "docker":
+            import mini_ork.runtime.backends.docker as _docker_backend  # noqa: F401
         else:
-            import mini_ork.runtime.backends.docker  # noqa: F401  (registers "docker")
+            import mini_ork.runtime.backends.remote as _remote_backend  # noqa: F401
         root = (src.get(ENV_DRIVE_ROOT) or "").strip() or cwd or os.getcwd()
         image = (src.get(ENV_IMAGE) or "").strip()
+        if backend == "remote":
+            return get_workspace(
+                backend, image=image, drive_root=root, mount_path=MOUNT_PATH,
+                env=dict(src),
+            )
         return get_workspace(
-            backend, image=image, drive_root=root, mount_path=MOUNT_PATH
+            backend, image=image, drive_root=root, mount_path=MOUNT_PATH,
         )
     # Unknown backend → loud ValueError (never a silent host fallback).
     return get_workspace(backend, root=cwd or os.getcwd())
