@@ -49,6 +49,10 @@ _RUN_LABEL = "mo.sandbox=1"
 # ----- types ---------------------------------------------------------------
 
 
+_READ_CHUNK = 65536  # per read; 4 KiB per 50 ms poll capped throughput at ~80 KiB/s
+_DRAIN_DEADLINE_S = 5.0  # max time to drain pipes after the child exits
+
+
 @dataclass
 class ProcSpec:
     """What the caller asked us to run."""
@@ -360,12 +364,16 @@ class ProcRegistry:
                     rlist, _, _ = select.select([fd], [], [], 0.05)
                     if not rlist:
                         continue
-                    chunk = os.read(fd, 4096)
+                    chunk = os.read(fd, _READ_CHUNK)
                     if chunk:
                         sink.write(chunk)
                 ps.out_offset = out_path.stat().st_size
                 ps.err_offset = err_path.stat().st_size
                 if exited:
+                    # The pipes can still hold far more than one read's worth
+                    # (an agent CLI prints its whole JSON result as it exits);
+                    # drain to EOF or the tail is silently lost.
+                    self._drain_to_eof(proc, out_f, err_f)
                     break
                 if deadline is not None and time.time() >= deadline:
                     # A SIGKILL'd child returns a negative rc (-9). Per the
@@ -403,6 +411,28 @@ class ProcRegistry:
             ps.out_offset = out_path.stat().st_size
             ps.err_offset = err_path.stat().st_size
             self._persist(ps)
+
+    @staticmethod
+    def _drain_to_eof(proc: subprocess.Popen, out_f, err_f) -> None:
+        """Copy whatever is left in both pipes after exit, until EOF.
+
+        Bounded by ``_DRAIN_DEADLINE_S``: a grandchild that inherited the pipe
+        and outlives the child would otherwise keep it open forever.
+        """
+        open_streams = [(s, sink) for s, sink in ((proc.stdout, out_f), (proc.stderr, err_f))
+                        if s is not None]
+        deadline = time.time() + _DRAIN_DEADLINE_S
+        while open_streams and time.time() < deadline:
+            for pair in list(open_streams):
+                stream, sink = pair
+                rlist, _, _ = select.select([stream.fileno()], [], [], 0.05)
+                if not rlist:
+                    continue
+                chunk = os.read(stream.fileno(), _READ_CHUNK)
+                if chunk:
+                    sink.write(chunk)
+                else:
+                    open_streams.remove(pair)  # EOF
 
     @staticmethod
     def _kill_group(proc: subprocess.Popen, ps: _ProcState) -> None:

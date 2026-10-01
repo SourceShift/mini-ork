@@ -529,3 +529,22 @@ def test_delete_session_accepts_the_run_id(client):
     s = _create_session(client)
     r = client.delete(f"/v1/sessions/{s['run_id']}", headers={"Authorization": AUTH})
     assert r.status_code == 200, r.text
+
+
+def test_large_output_at_exit_is_not_truncated(tmp_path):
+    """A child that prints far more than one pipe read and exits at once must
+    land every byte on disk. The watcher used to do ONE 4 KiB read after exit
+    and drop the rest — an agent CLI's final JSON result is exactly that shape."""
+    from mini_ork.remote.node_agent.procs import ProcRegistry, ProcSpec
+
+    reg = ProcRegistry(tmp_path, "big", runtime="host")
+    size = 300_000
+    ps = reg.spawn(ProcSpec(argv=[sys.executable, "-c", f"import sys; sys.stdout.write('x' * {size})"],
+                            env_keys=[], cwd=None, stdin="", timeout_s=30,
+                            env={"PATH": os.environ.get("PATH", "")}))
+    deadline = time.time() + 30
+    while reg._procs[ps.pid].state == "running" and time.time() < deadline:
+        time.sleep(0.05)
+    out = tmp_path / "runs" / "big" / ".procs" / f"{ps.pid}.out"
+    assert reg._procs[ps.pid].state == "exited"
+    assert out.stat().st_size == size
