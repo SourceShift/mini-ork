@@ -1229,7 +1229,10 @@ def _revert_working_tree(root: str, run_dir: str) -> bool:
             else:
                 rejected.append(raw)
         else:
-            # Implementer-created file (absent from HEAD): delete it.
+            # Implementer-created file (absent from HEAD): keep a copy in the
+            # run dir (the only record of new work a harvested diff may omit),
+            # then delete it.
+            _preserve_created(run_dir, rel, real, log)
             try:
                 if os.path.isfile(real):
                     os.remove(real)

@@ -52,6 +52,23 @@ def test_revert_restores_tracked_removes_created(tmp_path, monkeypatch):
     assert not (repo / "created.py").exists()
 
 
+def test_revert_preserves_created_file_in_run_dir(tmp_path, monkeypatch):
+    """revert_branch (code-fix's rollback) must keep a copy of every file the
+    implementer created before deleting it — the review diff covers tracked
+    paths only, so the copy can be the only record of the run's new work."""
+    repo = _mk_repo(tmp_path)
+    (repo / "pkg").mkdir()
+    (repo / "pkg" / "created.rs").write_text("pub fn brand_new() {}\n")
+    run_dir = tmp_path / "run"
+    _summary(run_dir, ["pkg/created.rs"])
+    monkeypatch.setenv("MO_TARGET_CWD", str(repo))
+
+    assert ex._revert_working_tree(str(tmp_path), str(run_dir)) is True
+    assert not (repo / "pkg" / "created.rs").exists()
+    kept = run_dir / "rolled-back-created" / "pkg" / "created.rs"
+    assert kept.read_text() == "pub fn brand_new() {}\n"
+
+
 def test_revert_rejects_escapes(tmp_path, monkeypatch, capsys):
     repo = _mk_repo(tmp_path)
     outside = tmp_path / "evil.txt"
