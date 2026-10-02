@@ -1134,6 +1134,32 @@ def _run_changed_files(run_dir: str) -> list[str]:
 
 
 ROLLED_BACK_FILE = "rolled-back.json"
+# Run-created files land here before rollback unlinks them. A harvested diff
+# can omit untracked files (code-fix's review diff covers tracked paths only),
+# so without this copy a rolled-back run destroys the only record of its new
+# work — observed on a ContextNest run whose three new modules had to be
+# rebuilt by replaying the implementer transcript.
+ROLLED_BACK_CREATED_DIR = "rolled-back-created"
+
+
+def _preserve_created(run_dir: str, rel: str, real: str, log) -> None:
+    """Copy a run-created file under ``<run_dir>/rolled-back-created/<rel>``.
+
+    Non-blocking: a failed copy is logged and rollback proceeds. ``rel`` has
+    already been validated as a strict child of the target repo.
+    """
+    if not run_dir or not os.path.isfile(real):
+        return
+    base = os.path.realpath(os.path.join(run_dir, ROLLED_BACK_CREATED_DIR))
+    dst = os.path.realpath(os.path.join(base, rel))
+    if not dst.startswith(base + os.sep):
+        log(f"  [rollback] not preserving {rel}: path escapes the preserve dir")
+        return
+    try:
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        shutil.copy2(real, dst)
+    except OSError as exc:
+        log(f"  [warn] rollback: could not preserve created file {rel}: {exc}")
 
 
 def _record_rolled_back(run_dir: str, real_root: str, rels: list[str]) -> None:
@@ -1317,7 +1343,9 @@ def _revert_inplace_diff(run_dir: str, root: str) -> bool:
             # checkout HEAD resets index AND worktree.
             git_ok("checkout", "HEAD", "--", rel)
         else:
-            # Created by the run: unstage and unlink.
+            # Created by the run: keep a copy in the run dir, then unstage
+            # and unlink.
+            _preserve_created(run_dir, rel, real, log)
             git_ok("rm", "-f", "-q", "--cached", "--", rel)
             try:
                 if os.path.isfile(real):

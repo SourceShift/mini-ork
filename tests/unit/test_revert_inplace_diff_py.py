@@ -107,6 +107,22 @@ def test_created_file_is_removed_and_unstaged(tmp_path, monkeypatch):
     assert _dirty(repo) == ""
 
 
+def test_created_file_is_preserved_in_the_run_dir_before_unlink(tmp_path, monkeypatch):
+    """Rollback must not destroy the only copy of a run-created file: the
+    harvested diff can omit untracked files, so the run dir keeps one."""
+    repo = _mk_repo(tmp_path)
+    (repo / "pkg").mkdir()
+    (repo / "pkg" / "made.py").write_text("brand new module\n")
+    _git(repo, "add", "pkg/made.py")
+    run_dir = _run_with_diff(tmp_path, repo)
+    monkeypatch.setenv("MO_TARGET_CWD", str(repo))
+
+    assert exh._revert_inplace_diff(str(run_dir), str(tmp_path)) is True
+    assert not (repo / "pkg" / "made.py").exists()
+    kept = run_dir / exh.ROLLED_BACK_CREATED_DIR / "pkg" / "made.py"
+    assert kept.read_text() == "brand new module\n"
+
+
 def test_paths_outside_the_diff_are_never_touched(tmp_path, monkeypatch):
     """A concurrent session's dirty file is not this run's to revert."""
     repo = _mk_repo(tmp_path)
