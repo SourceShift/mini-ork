@@ -15,6 +15,7 @@ from __future__ import annotations
 import hashlib
 import os
 import subprocess
+import shutil
 import tarfile
 import tempfile
 from dataclasses import dataclass
@@ -22,6 +23,32 @@ from pathlib import Path
 from typing import Callable
 
 from .procs import _run as default_run
+
+
+def _safe_extract(tf: tarfile.TarFile, target: Path) -> None:
+    """``extractall`` with the "data" filter where the interpreter has it
+    (3.11.4+); older ones — the agent image's Debian 3.11.2 — get the same
+    guarantee checked by hand: no absolute paths, no escaping the target."""
+    try:
+        tf.extractall(path=target, filter="data")
+        return
+    except TypeError:
+        pass
+    root = target.resolve()
+
+    def inside(path: Path) -> bool:
+        return path == root or root in path.parents
+
+    for member in tf.getmembers():
+        here = (root / member.name).resolve()
+        ok = not member.name.startswith("/") and inside(here)
+        if ok and (member.issym() or member.islnk()):
+            link = Path(member.linkname)
+            base = here.parent if member.issym() else root
+            ok = not link.is_absolute() and inside((base / link).resolve())
+        if not ok:
+            raise RuntimeError(f"refusing engine archive member {member.name!r}")
+    tf.extractall(path=target)
 
 
 @dataclass
@@ -82,26 +109,38 @@ class EngineManager:
         with tempfile.NamedTemporaryFile(suffix=".bundle", delete=False) as tf:
             tf.write(bundle_bytes)
             bundle_path = Path(tf.name)
+        # A scratch bare repo is the context every git step runs in. Without
+        # one, `git bundle verify` fails ("need a repository") on any real
+        # node, and `git archive <sha>` read whatever repo the node-agent's
+        # cwd happened to be in — never the uploaded bundle.
+        scratch = Path(tempfile.mkdtemp(prefix=".engine-stage-", dir=self.state_dir))
         try:
-            verify = self._run(["git", "bundle", "verify", str(bundle_path)])
-            if verify.returncode != 0:
-                raise RuntimeError(
-                    f"git bundle verify failed: {verify.stderr.strip() or verify.stdout.strip()}"
-                )
+            steps = (
+                ["git", "init", "-q", "--bare", str(scratch)],
+                ["git", "-C", str(scratch), "bundle", "verify", str(bundle_path)],
+                ["git", "-C", str(scratch), "fetch", "-q", str(bundle_path), "+HEAD:refs/mo/engine"],
+            )
+            for argv in steps:
+                done = self._run(argv)
+                if done.returncode != 0:
+                    raise RuntimeError(f"`{' '.join(argv)}` failed: "
+                                       f"{done.stderr.strip() or done.stdout.strip()}")
             target = self.engines_dir / sha
             target.mkdir(parents=True, exist_ok=True)
             archive = self._run(
-                ["git", "archive", "--format=tar", sha, "-o", str(target / "_src.tar")]
+                ["git", "-C", str(scratch), "archive", "--format=tar", sha,
+                 "-o", str(target / "_src.tar")]
             )
             if archive.returncode != 0:
                 raise RuntimeError(
                     f"git archive failed: {archive.stderr.strip() or archive.stdout.strip()}"
                 )
             with tarfile.open(target / "_src.tar", "r:") as tf:
-                tf.extractall(path=target, filter="data")
+                _safe_extract(tf, target)
             (target / "_src.tar").unlink()
         finally:
             bundle_path.unlink(missing_ok=True)
+            shutil.rmtree(scratch, ignore_errors=True)
         importable = self._smoke(target)
         state = EngineState(sha=sha, staged=True, importable=importable)
         self._engines[sha] = state

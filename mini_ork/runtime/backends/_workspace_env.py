@@ -126,6 +126,12 @@ def container_env(env: Mapping[str, str]) -> dict[str, str]:
     return out
 
 
+_PARENT_SESSION_KEYS = frozenset({
+    "CLAUDE_PID", "CLAUDE_CODE_SESSION_ID", "CLAUDE_CODE_MESSAGING_SOCKET",
+    "CLAUDE_CODE_SESSION_ATTENDED", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SSE_PORT",
+})
+
+
 def isolated_env(env: Mapping[str, str], path_map: "object") -> dict[str, str]:
     """Sandbox-side env contract for an isolated CLI spawn (remote-nodes-03).
 
@@ -158,6 +164,11 @@ def isolated_env(env: Mapping[str, str], path_map: "object") -> dict[str, str]:
     # The node-agent's bearer token authenticates the CONTROL plane to the node;
     # the agent inside the sandbox must never hold it (MO_* is allowlisted).
     for key in [k for k in translated if k.startswith("MO_NODE_TOKEN")]:
+        translated.pop(key, None)
+    # The operator's own Claude Code session (when mini-ork runs inside one):
+    # its pid, id and messaging socket describe THIS machine and would make a
+    # sandboxed claude believe it is attached to that parent session.
+    for key in _PARENT_SESSION_KEYS:
         translated.pop(key, None)
     translated["MO_REMOTE_NODE"] = "1"
     translated["MINI_ORK_ALLOW_CHILD_SPAWN"] = "0"

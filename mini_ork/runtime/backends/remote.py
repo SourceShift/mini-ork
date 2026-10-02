@@ -532,6 +532,7 @@ class RemoteWorkspace:
         t_up = time.monotonic()
         # 1) Engine sha stage (idempotent).
         sha = self._current_engine_sha(subprocess)
+        self._engine_sha = sha
         creating = self._sid is None
         health: dict = {}
         if sha not in self._uploaded_shas or creating:
@@ -557,6 +558,7 @@ class RemoteWorkspace:
                 "POST", "/v1/sessions", self._session_payload()))
             self._sid = sess.get("sid", self._run_id)
             self._owns_session = True
+            self._load_sync_state()
         # 3) Initial tree sync-up (epic 07) and the one-shot mo-home upload
         # (epic 08). Both are idempotent on a repeated up().
         with self._sync_lock:
@@ -568,6 +570,40 @@ class RemoteWorkspace:
         return None
 
     # ------------------------------------------------------------------ provisioning
+
+    # Every dispatch and check of a run runs in its own process, each with its
+    # own workspace object. The replica's sync base lives in the run dir so a
+    # new process syncs incrementally (usually: nothing) instead of shipping
+    # the whole tree again — valid only while the node holds the SAME session.
+    _SYNC_STATE = ".remote-sync-state.json"
+
+    def _sync_state_path(self) -> Path | None:
+        return Path(self._run_dir) / self._SYNC_STATE if self._run_dir else None
+
+    def _load_sync_state(self) -> None:
+        path = self._sync_state_path()
+        if path is None or self._last_synced is not None or not path.is_file():
+            return
+        try:
+            state = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        if state.get("run_id") == self._run_id and state.get("sid") == self._sid \
+                and state.get("commit") and state.get("tree"):
+            self._last_synced = (str(state["commit"]), str(state["tree"]))
+
+    def _save_sync_state(self) -> None:
+        path = self._sync_state_path()
+        if path is None or self._last_synced is None:
+            return
+        try:
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(json.dumps({"run_id": self._run_id, "sid": self._sid,
+                                       "commit": self._last_synced[0],
+                                       "tree": self._last_synced[1]}), encoding="utf-8")
+            tmp.replace(path)
+        except OSError:
+            pass
 
     def _setup_step(self, step: str, fn: Any, *, detail: str = "") -> Any:
         """Run one provisioning step between ``remote.setup.step`` start/ok|fail
@@ -644,6 +680,8 @@ class RemoteWorkspace:
 
     def _session_payload(self) -> dict:
         payload: dict[str, Any] = {"run_id": self._run_id, "image": self._image}
+        if getattr(self, "_engine_sha", ""):
+            payload["engine_sha"] = self._engine_sha   # D8: mount THIS engine at /opt/mini-ork
         prof = self._profile
         if prof is not None:
             if getattr(prof, "resources", None):
@@ -796,6 +834,7 @@ class RemoteWorkspace:
         finally:
             bundle_path.unlink(missing_ok=True)
         self._last_synced = (tip, snap.tree)
+        self._save_sync_state()
         if snap.excluded:
             self._emit_sync_event("remote.sync.excluded", names=list(snap.excluded))
         self._emit_sync_event("remote.sync.up", bytes=size, tree=snap.tree, mode=mode)
@@ -829,6 +868,7 @@ class RemoteWorkspace:
                 os.unlink(tmp)
         head_moved = _ts.apply_delta(target, base_snap, new_snap, ref=ref)
         self._last_synced = (new_snap.commit, new_snap.tree)
+        self._save_sync_state()
         if head_moved:
             self._emit_sync_event("remote.head_moved", tree=new_snap.tree)
         self._emit_sync_event("remote.sync.down", bytes=len(data), tree=new_snap.tree)

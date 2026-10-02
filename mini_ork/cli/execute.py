@@ -794,6 +794,13 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
         from mini_ork.runtime.workspace_session import install_teardown_signal_handlers
 
         install_teardown_signal_handlers(run_id)
+        # The dispatcher pid kill_run signals (web/control.py reads it; nothing
+        # had written it since the bash runtime was removed).
+        try:
+            with open(os.path.join(live_run_dir, ".pid"), "w", encoding="utf-8") as fh:
+                fh.write(f"{os.getpid()}\n")
+        except OSError:
+            pass
 
     def _dispatch_serial(field):
         # D1: bash keeps FAIL_COUNT as a shell var visible to _mo_policy_route_lane's
@@ -989,9 +996,15 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
         # is idempotent and never raises — see workspace_session.py.
         if not dry_run and run_id:
             try:
+                os.unlink(os.path.join(live_run_dir, ".pid"))
+            except OSError:
+                pass
+            try:
                 from mini_ork.runtime.workspace_session import close_run_session
 
-                close_run_session(run_id)
+                # Under `mini-ork run` the lifecycle owns a remote session (its
+                # later steps check on the node) and releases it at the end.
+                close_run_session(run_id, keep_remote=context_env("MO_REMOTE_SESSION_SCOPE") == "lifecycle")
             except Exception as exc:  # noqa: BLE001
                 print(
                     f"[warn] run-level close_run_session failed: {exc}",

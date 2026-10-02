@@ -471,3 +471,72 @@ def test_remote_branch_translates_cwd_argv_and_env(monkeypatch, tmp_path):
     assert "MO_NODE_TOKEN" not in seen["env"]
     host = str(tmp_path.resolve())
     assert host not in seen["cmd"] and not any(host in v for v in seen["env"].values())
+
+
+# ── 8. remote.check event: emitted on remote branch only ───────────────────
+
+
+def test_remote_check_event_emitted_on_remote_branch(monkeypatch, tmp_path):
+    """remote-nodes-15 §5: ``run_check`` emits a ``remote.check`` event with
+    ``{name, rc, ms}`` on the remote branch. The integration
+    test asserts on this event from the run_events feed, so the contract
+    here is "the helper writes the event" — the DB row write is the
+    ``mo_node_emit`` side, already covered by ``test_mo_node_events_py``.
+
+    Stub the DB so the emit is observable without a real state.db.
+    """
+    captured = []
+
+    def fake_emit(run_id, node_id, node_type, event_type, extra_json, *, db=None):
+        captured.append((run_id, node_id, node_type, event_type, extra_json))
+        return 0
+
+    # The import is deferred inside ``run_check``; target the symbol at its
+    # source so the deferred ``from … import`` resolves to our stub.
+    monkeypatch.setattr("mini_ork.observability.node_events.mo_node_emit", fake_emit)
+
+    class _Remote:
+        def exec(self, _cmd, *, cwd, timeout):
+            return 0, "ok"
+
+        def restore_replica(self):
+            pass
+
+    monkeypatch.setattr("mini_ork.runtime.contract._resolve_remote_session",
+                        lambda _r, _e: _Remote())
+    monkeypatch.setattr("mini_ork.context.context_env",
+                        lambda k, d="": "run-r15" if k == "MINI_ORK_RUN_ID" else d)
+    monkeypatch.setattr("mini_ork.context.context_env_snapshot", lambda: {})
+    rc, _ = run_check(["echo", "hi"], cwd="/workspace/target", env=None, evidence_path="")
+    assert rc == 0
+    # Exactly one remote.check event, with the verifier name from the argv[0]
+    # and an int ms >= 0.
+    events = [c for c in captured if c[3] == "remote.check"]
+    assert len(events) == 1, events
+    payload = json.loads(events[0][4])
+    assert payload["name"] == "echo"
+    assert payload["rc"] == 0
+    assert isinstance(payload["ms"], int) and payload["ms"] >= 0
+
+
+def test_remote_check_event_not_emitted_on_local_branch(monkeypatch, tmp_path):
+    """Local branch must stay byte-identical to a direct ``subprocess.run``
+    — no ``mo_node_emit`` call, no stderr warning, no event row. Attempt 1
+    of the run_check reroute leaked ``mo_node_emit: run_id required`` into
+    a verifier's evidence stream because the local branch tried to emit;
+    this test pins the local branch's silence."""
+    captured = []
+
+    def fake_emit(*a, **k):
+        captured.append((a, k))
+        return 0
+
+    monkeypatch.setattr("mini_ork.observability.node_events.mo_node_emit", fake_emit)
+    monkeypatch.delenv("MINI_ORK_RUN_ID", raising=False)
+    # No run_id → resolver returns None → local branch.
+    script = tmp_path / "noop.py"
+    script.write_text("print('ok')\n")
+    rc, _ = run_check([sys.executable, str(script)], cwd=str(tmp_path), env=None,
+                      evidence_path="")
+    assert rc == 0
+    assert captured == [], f"local branch leaked a node_event: {captured}"

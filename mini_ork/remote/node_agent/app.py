@@ -57,9 +57,9 @@ def _state_dir_default() -> Path:
 def create_app(
     *,
     state_dir: Path | None = None,
-    token_env: str = "MO_NODE_TOKEN",
-    runtime: str = "docker",
-    retain_hours: float = 24.0,
+    token_env: str | None = None,
+    runtime: str | None = None,
+    retain_hours: float | None = None,
     engine_root: Path | None = None,
     version: str = "0.1.0",
     _run_fn: Callable | None = None,
@@ -78,6 +78,12 @@ def create_app(
     """
     state_dir = Path(state_dir) if state_dir is not None else _state_dir_default()
     state_dir.mkdir(parents=True, exist_ok=True)
+    # `mini-ork node-agent` hands its flags to this uvicorn factory through
+    # the environment (the factory takes no arguments); explicit kwargs win.
+    token_env = token_env or os.environ.get("MO_NODE_AGENT_TOKEN_ENV") or "MO_NODE_TOKEN"
+    runtime = runtime or os.environ.get("MO_NODE_AGENT_RUNTIME") or "docker"
+    if retain_hours is None:
+        retain_hours = float(os.environ.get("MO_NODE_AGENT_RETAIN_HOURS") or 24.0)
 
     bearer = make_bearer_dependency(token_env)
 
@@ -147,6 +153,7 @@ def create_app(
                 profile=payload.get("profile"),
                 network=payload.get("network") or "full",
                 allow_domains=payload.get("allow_domains") or (),
+                engine_sha=payload.get("engine_sha") or None,
             )
         except RuntimeError as exc:
             raise HTTPException(500, str(exc)) from exc
@@ -299,7 +306,10 @@ def create_app(
         if not isinstance(argv, list) or not argv:
             raise HTTPException(400, "argv must be a non-empty list")
         cwd = payload.get("cwd")
-        timeout_s = float(payload.get("timeout_s", 60))
+        # 0 / absent = no limit (run_check's convention); a literal 0 used to
+        # kill every remote check the instant it started (rc 124).
+        raw_timeout = payload.get("timeout_s")
+        timeout_s = float(raw_timeout) if raw_timeout and float(raw_timeout) > 0 else None
         reg = _registry(run_id)
         env = payload.get("env") or {}
         if not isinstance(env, dict):
@@ -310,12 +320,12 @@ def create_app(
         ps = reg.spawn(spec)
         # Wait synchronously for exit — the registry owns the lifecycle,
         # we just block the request thread until the proc reports done.
-        deadline = time.time() + timeout_s + 5
+        deadline = None if timeout_s is None else time.time() + timeout_s + 5
         while True:
             cur = reg.get(ps.pid)
             if cur and cur.state in ("exited", "killed", "timeout", "spawn_failed", "orphaned"):
                 break
-            if time.time() > deadline:
+            if deadline is not None and time.time() > deadline:
                 reg.kill(ps.pid)
                 break
             time.sleep(0.05)

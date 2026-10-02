@@ -548,3 +548,345 @@ def test_large_output_at_exit_is_not_truncated(tmp_path):
     out = tmp_path / "runs" / "big" / ".procs" / f"{ps.pid}.out"
     assert reg._procs[ps.pid].state == "exited"
     assert out.stat().st_size == size
+
+
+# ---------------------------------------------------------------------------
+# remote-nodes-15 §3 (host-runtime engine gap) + §4 (audit.jsonl)
+# ---------------------------------------------------------------------------
+
+
+def test_host_runtime_translates_opt_mini_ork_onto_staged_engine(tmp_path):
+    """Host-runtime argv containing ``/opt/mini-ork[/...]`` must rewrite onto
+    the most-recently-staged engine checkout under ``<state>/engines/<sha>``.
+
+    Without this the fake agent (and every transport) the node-agent
+    spawns is ``/opt/mini-ork/tests/fixtures/bin/mo-fake-agent`` —
+    rc=127. The docker runtime already gets this right (its container
+    mounts the engine); only the host runtime needs the rewrite.
+    """
+    from mini_ork.remote.node_agent.procs import ProcRegistry
+
+    engines = tmp_path / "engines"
+    sha = "deadbeef"
+    checkout = engines / sha
+    checkout.mkdir(parents=True)
+    (checkout / "tests" / "fixtures" / "bin").mkdir(parents=True)
+    (checkout / "tests" / "fixtures" / "bin" / "mo-fake-agent").write_text("#!/bin/sh\nexit 0\n")
+    (checkout / "tests" / "fixtures" / "bin" / "mo-fake-agent").chmod(0o755)
+    # Touch another checkout AFTER to confirm "most recently staged wins".
+    other = engines / "f00dface"
+    other.mkdir()
+    (other / "tests" / "fixtures" / "bin").mkdir(parents=True)
+    (other / "tests" / "fixtures" / "bin" / "mo-fake-agent").write_text("#!/bin/sh\nexit 99\n")
+    # Newer mtime on `other` to flip the "most recent" choice.
+    import os as _os
+    future = _os.stat(other).st_mtime + 60
+    _os.utime(other, (future, future))
+
+    reg = ProcRegistry(tmp_path, "r3", runtime="host",
+                       engines_dir=engines, image="mini-ork/agent-node:latest")
+    argv = ["/opt/mini-ork/tests/fixtures/bin/mo-fake-agent", "--print"]
+    out = reg._host_path(argv[0])
+    assert out == str(other / "tests" / "fixtures" / "bin" / "mo-fake-agent"), out
+
+    # And the full argv translates element-wise (the actual call site).
+    from mini_ork.remote.node_agent.procs import ProcSpec
+    spec = ProcSpec(
+        argv=argv, env_keys=[], cwd=None, stdin="", timeout_s=5,
+        env={"PATH": os.environ.get("PATH", "")},
+    )
+    translated = reg._build_host_argv(spec)
+    assert translated[0] == str(other / "tests" / "fixtures" / "bin" / "mo-fake-agent")
+
+
+def test_host_runtime_opt_mini_ork_passthrough_when_no_engine_staged(tmp_path):
+    """No engine staged yet → pass the path through unchanged so the shell
+    surfaces a real ``no such file`` (rc 127) instead of a silent rewrite
+    onto a missing tree."""
+    from mini_ork.remote.node_agent.procs import ProcRegistry
+
+    reg = ProcRegistry(tmp_path, "r4", runtime="host", engines_dir=tmp_path / "engines")
+    assert reg._host_path("/opt/mini-ork/tests/fixtures/bin/mo-fake-agent") == (
+        "/opt/mini-ork/tests/fixtures/bin/mo-fake-agent"
+    )
+
+
+def test_docker_runtime_does_not_translate_opt_mini_ork(tmp_path):
+    """The docker runtime mounts the engine into the container — argv
+    inside the container is already the sandbox path. The host-side
+    ``_build_host_argv`` keeps the original sandbox argv because
+    ``docker exec -i <cid> setsid <argv>`` hands the path to the cid
+    verbatim, where the container's own mount at ``/opt/mini-ork`` is
+    what resolves it. Verifying via ``_build_host_argv`` (the actual
+    integration point) rather than ``_host_path`` directly — the
+    mapping helper is pure; the runtime gate is in the caller."""
+    from mini_ork.remote.node_agent.procs import ProcRegistry, ProcSpec
+
+    engines = tmp_path / "engines"
+    (engines / "abc").mkdir(parents=True)
+    reg = ProcRegistry(tmp_path, "r5", runtime="docker", session_cid="cidxyz",
+                       engines_dir=engines)
+    spec = ProcSpec(
+        argv=["/opt/mini-ork/tests/fixtures/bin/mo-fake-agent", "--print"],
+        env_keys=[], cwd="/workspace/target", stdin="", timeout_s=5,
+        env={"PATH": os.environ.get("PATH", "")},
+    )
+    argv = reg._build_host_argv(spec)
+    assert "/opt/mini-ork/tests/fixtures/bin/mo-fake-agent" in argv, argv
+
+
+def test_audit_log_appends_one_jsonl_per_proc_with_keys_only(tmp_path):
+    """Kickoff §4: every spawn appends one JSON line to ``<state>/audit.jsonl``.
+    Env KEYS land on disk; env VALUES never do (D6 + the kickoff's redaction
+    rule). The argv is the host-side argv the child actually ran, so the
+    leakage assertion in ``tests/integration/test_remote_nodes_e2e.py`` can
+    grep it for forbidden prefixes without racing the watcher's redactor."""
+    from mini_ork.remote.node_agent.procs import ProcRegistry, ProcSpec
+
+    reg = ProcRegistry(tmp_path, "r6", runtime="host",
+                       engines_dir=tmp_path / "engines", image="img:1")
+    spec = ProcSpec(
+        argv=["sh", "-c", "echo hi"],
+        env_keys=["MO_PROBE"],
+        cwd=None,
+        stdin="",
+        timeout_s=5,
+        env={"MO_PROBE": "probe-secret-value", "PATH": os.environ.get("PATH", "")},
+    )
+    reg.spawn(spec)
+    # Drain so the watcher thread has time to write + the audit append
+    # has landed.
+    deadline = time.time() + 10
+    while reg._procs[1].state == "running" and time.time() < deadline:
+        time.sleep(0.05)
+    audit = tmp_path / "audit.jsonl"
+    assert audit.is_file(), f"audit log not written: {audit}"
+    lines = [json.loads(l) for l in audit.read_text().splitlines() if l]
+    assert len(lines) == 1
+    entry = lines[0]
+    assert entry["session"] == "r6"
+    assert entry["image"] == "img:1"
+    assert entry["argv"] == ["sh", "-c", "echo hi"]
+    assert "MO_PROBE" in entry["env_keys"]
+    # D6 + kickoff §4: VALUES are never written, including by a different
+    # thread or a different json field. ``json.dumps`` round-trips the
+    # whole dict — a single false positive is a one-line fix that is hard
+    # to ship silently.
+    raw = audit.read_text()
+    assert "probe-secret-value" not in raw
+    assert "probe-secret" not in raw
+    # cwd is None for host runtime with no cwd (we did not pass one).
+    assert entry["cwd"] is None
+
+
+def test_audit_log_records_spawn_failures_too(tmp_path):
+    """A spawn that never made it past ``Popen`` still gets an audit line.
+    The e2e leak check needs to see ALL attempts — including the ones that
+    127'd because a host-path leaked."""
+    from mini_ork.remote.node_agent.procs import ProcRegistry, ProcSpec
+
+    reg = ProcRegistry(tmp_path, "r7", runtime="host",
+                       engines_dir=tmp_path / "engines", image="img:1")
+    spec = ProcSpec(
+        argv=["/nonexistent/argv/element/that/does/not/exist/anywhere"],
+        env_keys=[], cwd=None, stdin="", timeout_s=5,
+        env={"PATH": os.environ.get("PATH", "")},
+    )
+    reg.spawn(spec)
+    audit = tmp_path / "audit.jsonl"
+    assert audit.is_file(), "spawn-failed proc did not append to audit.jsonl"
+    entry = json.loads(audit.read_text().strip().splitlines()[-1])
+    assert entry["state"] == "spawn_failed"
+    assert "/nonexistent" in entry["argv"][0]
+
+
+# ---------------------------------------------------------------------------
+# remote-nodes-15: defects the simulated-remote E2E found on a real node host
+# ---------------------------------------------------------------------------
+
+
+def _bundle_of_tiny_repo(base: Path) -> tuple[bytes, str]:
+    repo = base / "engine-src"
+    repo.mkdir()
+    for args in (["init", "-q"], ["config", "user.email", "t@t"], ["config", "user.name", "t"]):
+        subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True)
+    (repo / "mini_ork").mkdir()
+    (repo / "mini_ork" / "__init__.py").write_text("ENGINE = 'from-bundle'\n")
+    (repo / "AGENTS.md").write_text("a\n")
+    os.symlink("AGENTS.md", repo / "CLAUDE.md")                 # an in-tree symlink, as in mini-ork
+    subprocess.run(["git", "add", "-A"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-q", "-m", "e"], cwd=repo, check=True, capture_output=True)
+    sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True,
+                         check=True).stdout.strip()
+    subprocess.run(["git", "bundle", "create", str(base / "e.bundle"), "HEAD"], cwd=repo,
+                   check=True, capture_output=True)
+    return (base / "e.bundle").read_bytes(), sha
+
+
+def test_engine_bundle_stages_without_a_surrounding_repo(tmp_path, monkeypatch):
+    """A node's cwd is not a git repo. `git bundle verify` used to fail there
+    ("need a repository") and `git archive` read the cwd's repo, not the bundle."""
+    from mini_ork.remote.node_agent.engines import EngineManager
+
+    bundle, sha = _bundle_of_tiny_repo(tmp_path)
+    elsewhere = tmp_path / "not-a-repo"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+    em = EngineManager(tmp_path / "state", "0.1.0")
+    em.stage_bundle(sha, bundle)
+    tree = tmp_path / "state" / "engines" / sha
+    assert (tree / "mini_ork" / "__init__.py").read_text() == "ENGINE = 'from-bundle'\n"
+    assert os.readlink(tree / "CLAUDE.md") == "AGENTS.md"
+    assert not list((tmp_path / "state").glob(".engine-stage-*"))      # scratch repo cleaned up
+
+
+def test_engine_extraction_without_the_tar_data_filter(tmp_path, monkeypatch):
+    """The agent image's Python 3.11.2 has no extractall(filter=...); the
+    fallback keeps the same rules: in-tree links pass, escapes are refused."""
+    from mini_ork.remote.node_agent import engines
+
+    real = tarfile.TarFile.extractall
+
+    def no_filter(self, path=".", members=None, *, numeric_owner=False, **kw):
+        if "filter" in kw:
+            raise TypeError("extractall() got an unexpected keyword argument 'filter'")
+        return real(self, path, members, numeric_owner=numeric_owner)
+
+    monkeypatch.setattr(tarfile.TarFile, "extractall", no_filter)
+
+    def archive(members):
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w") as tf:
+            for name, link in members:
+                info = tarfile.TarInfo(name)
+                if link:
+                    info.type, info.linkname = tarfile.SYMTYPE, link
+                    tf.addfile(info)
+                else:
+                    info.size = 1
+                    tf.addfile(info, io.BytesIO(b"x"))
+        buf.seek(0)
+        return tarfile.open(fileobj=buf)
+
+    ok = tmp_path / "ok"
+    engines._safe_extract(archive([("a.md", ""), ("b.md", "a.md")]), ok)
+    assert os.readlink(ok / "b.md") == "a.md"
+    for bad in ([("../evil", "")], [("x", "/etc/passwd")], [("d/x", "../../out")]):
+        with pytest.raises(RuntimeError, match="refusing"):
+            engines._safe_extract(archive(bad), tmp_path / uuid.uuid4().hex)
+
+
+def test_spawned_agent_gets_eof_on_stdin_and_the_prompt_is_not_persisted(tmp_path):
+    """An agent CLI reads its prompt to EOF; the pipe used to stay open, so
+    every remote agent blocked forever. The prompt is not kept on disk."""
+    from mini_ork.remote.node_agent.procs import ProcRegistry, ProcSpec
+
+    reg = ProcRegistry(tmp_path, "eof", runtime="host")
+    ps = reg.spawn(ProcSpec(argv=["cat"], env_keys=[], cwd=None, stdin="the prompt\n", timeout_s=20,
+                            env={"PATH": os.environ.get("PATH", "")}))
+    deadline = time.time() + 20
+    while reg._procs[ps.pid].state == "running" and time.time() < deadline:
+        time.sleep(0.05)
+    procs = tmp_path / "runs" / "eof" / ".procs"
+    assert reg._procs[ps.pid].state == "exited"
+    assert (procs / f"{ps.pid}.out").read_text() == "the prompt\n"
+    record = json.loads((procs / f"{ps.pid}.json").read_text())
+    assert "stdin" not in record and record["stdin_bytes"] == len("the prompt\n")
+
+
+def test_session_engine_is_the_control_planes_sha(tmp_path):
+    """D8: a session mounts (docker) / maps (host) engines/<sha> for the sha the
+    control plane sent — not whichever engine was staged last."""
+    from mini_ork.remote.node_agent.procs import ProcRegistry
+    from mini_ork.remote.node_agent.sessions import SessionManager
+
+    engines_dir = tmp_path / "engines"
+    (engines_dir / "aaa").mkdir(parents=True)
+    time.sleep(0.01)
+    (engines_dir / "bbb").mkdir()                                  # staged later
+    reg = ProcRegistry(tmp_path, "r", runtime="host", engines_dir=engines_dir, engine_sha="aaa")
+    assert reg._host_path("/opt/mini-ork/x.py") == str(engines_dir / "aaa" / "x.py")
+    calls: list[list[str]] = []
+
+    def run(argv):
+        calls.append(list(argv))
+        return subprocess.CompletedProcess(argv, 0, "cid", "")
+
+    SessionManager(tmp_path, runtime="docker", _run_fn=run).create(
+        run_id="r2", image="img", engine_sha="aaa")
+    docker_run = " ".join(next(c for c in calls if c[:2] == ["docker", "run"]))
+    assert f"{engines_dir / 'aaa'}:/opt/mini-ork:ro" in docker_run
+
+
+def test_node_agent_flags_reach_the_app_factory(tmp_path, monkeypatch):
+    """`--runtime/--token-env/--retain-hours` were parsed, printed and dropped:
+    the uvicorn factory takes no arguments, so they travel in the env."""
+    from mini_ork.cli import node_agent as cli
+
+    for key in ("MO_NODE_AGENT_RUNTIME", "MO_NODE_AGENT_TOKEN_ENV", "MO_NODE_AGENT_RETAIN_HOURS"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("MO_NODE_AGENT_STATE_DIR", str(tmp_path / "s"))
+    assert cli.main(["--runtime", "host", "--token-env", "MY_NODE_TOKEN", "--retain-hours", "2"],
+                    _exec=False) == 0
+    assert (os.environ["MO_NODE_AGENT_RUNTIME"], os.environ["MO_NODE_AGENT_TOKEN_ENV"]) == \
+        ("host", "MY_NODE_TOKEN")
+    monkeypatch.setenv("MY_NODE_TOKEN", "t-123")
+    with TestClient(create_app(state_dir=tmp_path / "s")) as c:
+        assert c.get("/v1/sessions/none", headers={"Authorization": "Bearer t-123"}).status_code == 404
+        created = c.post("/v1/sessions", json={"run_id": "r", "image": "i"},
+                         headers={"Authorization": "Bearer t-123"})
+        assert created.status_code == 200 and created.json()["cid"].startswith("host:")
+
+
+def test_host_runtime_maps_sandbox_paths_inside_shell_scripts(tmp_path):
+    """Checks arrive as ``sh -c "<script>"``: one argv string, many paths. The
+    host runtime rewrites every sandbox path token, not just whole arguments."""
+    from mini_ork.remote.node_agent.procs import ProcRegistry
+
+    (tmp_path / "engines" / "abc").mkdir(parents=True)
+    reg = ProcRegistry(tmp_path, "r", runtime="host", engines_dir=tmp_path / "engines",
+                       engine_sha="abc")
+    run = tmp_path / "runs" / "r"
+    engine = tmp_path / "engines" / "abc"
+    assert reg._host_text("python3 /opt/mini-ork/v/test.py --dir '/workspace/target'") == \
+        f"python3 {engine}/v/test.py --dir '{run}/target'"
+    assert reg._host_text("/opt/mini-ork:/x") == f"{engine}:/x"
+    for untouched in ("/workspaces/x", "a/opt/mini-ork/b", "/opt/mini-orkish"):
+        assert reg._host_text(untouched) == untouched
+
+
+def test_exec_with_timeout_zero_means_no_limit(client):
+    """run_check sends timeout 0 for "no limit"; the node used to read it as
+    zero seconds and kill every remote check at once (rc 124)."""
+    headers = {"Authorization": f"Bearer {TOKEN_VALUE}"}
+    assert client.post("/v1/sessions", json={"run_id": "t0", "image": "i"}, headers=headers).status_code == 200
+    r = client.post("/v1/sessions/t0/exec", headers=headers,
+                    json={"argv": ["sh", "-c", "sleep 0.3; echo done"], "timeout_s": 0})
+    assert r.status_code == 200 and r.json()["rc"] == 0 and "done" in r.json()["output"]
+
+
+def test_deleting_a_host_session_kills_its_procs(client, state_dir):
+    """Host runtime: no container, so DELETE must kill the session's procs
+    itself (kill_run left a sleeping agent running on the node)."""
+    headers = {"Authorization": f"Bearer {TOKEN_VALUE}"}
+    assert client.post("/v1/sessions", json={"run_id": "kd", "image": "i"}, headers=headers).status_code == 200
+    spawned = client.post("/v1/sessions/kd/procs", headers=headers,
+                          json={"argv": ["sleep", "300"], "env": {"PATH": os.environ.get("PATH", "")}})
+    assert spawned.status_code == 200, spawned.text
+    record = json.loads((Path(state_dir) / "runs" / "kd" / ".procs"
+                         / f"{spawned.json()['pid']}.json").read_text())
+    os_pid = record["os_pid"]
+    os.kill(os_pid, 0)                                   # alive before the delete
+    assert client.delete("/v1/sessions/kd", headers=headers).status_code == 200
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        try:
+            os.kill(os_pid, 0)
+        except ProcessLookupError:
+            break
+        if subprocess.run(["ps", "-o", "stat=", "-p", str(os_pid)], capture_output=True,
+                          text=True).stdout.strip().startswith("Z"):
+            break                                        # killed, awaiting reap
+        time.sleep(0.1)
+    else:
+        raise AssertionError(f"session proc {os_pid} survived DELETE")

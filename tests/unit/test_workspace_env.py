@@ -168,3 +168,19 @@ def test_rollback_keep_worktree_crosses_alongside_a_real_child_env():
         "MINI_ORK_HOME": "/workspace",
         "ANTHROPIC_API_KEY": "sk-ant",
     }
+
+
+def test_isolated_env_drops_the_operators_claude_session(tmp_path):
+    """remote-nodes-15: run inside Claude Code, the parent session's pid, id and
+    messaging socket (a path on THIS machine) must not reach a sandbox."""
+    from mini_ork.runtime.backends._workspace_env import isolated_env
+    from mini_ork.runtime.path_map import PathMap
+    from mini_ork.runtime.run_roots import RunRoots
+
+    roots = RunRoots(target=str(tmp_path), run_dir=str(tmp_path / "run"),
+                     home=str(tmp_path / "home"), engine=str(tmp_path / "engine"))
+    env = isolated_env({"CLAUDE_PID": "123", "CLAUDE_CODE_SESSION_ID": "s",
+                        "CLAUDE_CODE_MESSAGING_SOCKET": "/var/folders/x/sock",
+                        "CLAUDE_CODE_MAX_OUTPUT_TOKENS": "8000"}, PathMap.from_roots(roots))
+    assert "CLAUDE_CODE_MAX_OUTPUT_TOKENS" in env                    # configuration still passes
+    assert not {"CLAUDE_PID", "CLAUDE_CODE_SESSION_ID", "CLAUDE_CODE_MESSAGING_SOCKET"} & set(env)

@@ -270,7 +270,33 @@ def _register(run_id: str, backend: str, ws: Workspace, env: Mapping[str, str]) 
     _SESSION_REGISTRY[key] = session
 
 
-def close_run_session(run_id: str, *, lock_timeout: float | None = None) -> None:
+def release_remote_session(run_id: str, run_dir: str, *, env: Mapping[str, str]) -> None:
+    """End a remote run's session on the node, whichever process created it.
+
+    Every dispatch / check of a run is its own process with its own workspace;
+    they share ONE node session (the node keys sessions by run id). This
+    closes this process's handle, then deletes the node session by run id and
+    drops the run dir's session marker + sync state. Best-effort."""
+    close_run_session(run_id)
+    from mini_ork.runtime.backends.remote import _factory
+
+    ws = _factory(env={**env, "MINI_ORK_RUN_ID": run_id, "MINI_ORK_RUN_DIR": run_dir})
+    ws._sid = run_id          # the node accepts the run id in DELETE /v1/sessions/{id}
+    ws.down()
+    if run_dir:
+        for name in (".remote-sync-state.json",):
+            try:
+                os.unlink(os.path.join(run_dir, name))
+            except OSError:
+                pass
+        try:
+            session_marker_path(run_dir).unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def close_run_session(run_id: str, *, lock_timeout: float | None = None,
+                      keep_remote: bool = False) -> None:
     """Tear down every session registered for ``run_id``; never raises.
 
     Iterates over a snapshot of ``_SESSION_REGISTRY`` so a backend whose
@@ -311,6 +337,11 @@ def close_run_session(run_id: str, *, lock_timeout: float | None = None) -> None
         if session.closed:
             continue
         session.closed = True
+        if keep_remote and session.backend == "remote":
+            # The run lifecycle still needs the node session (rubric/verify run
+            # checks there) and releases it at the end: drop only this handle,
+            # keep the marker so later processes and kill_run can find it.
+            continue
         try:
             session.workspace.down()
         except Exception as exc:  # noqa: BLE001 — teardown is best-effort

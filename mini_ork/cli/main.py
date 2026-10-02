@@ -467,13 +467,34 @@ def _run_lifecycle(argv, root) -> int:
     # (SDK, tests) must not inherit a finished run's bindings. The os.environ
     # write keeps its historical leak-forever semantics.
     with run_context_scope({}):
-        rc = _run_lifecycle_impl(inner, root, sink)
+        try:
+            rc = _run_lifecycle_impl(inner, root, sink)
+        finally:
+            _release_remote_session()
     if emit_json:
         sink["returncode"] = rc
         sys.stdout.write(
             "mini_ork_result=" + json.dumps(sink, separators=(",", ":")) + "\n"
         )
     return rc
+
+
+def _release_remote_session() -> None:
+    """remote-nodes-15: a ``--placement remote`` run ends with no session left
+    on the node. execute closes its own, but every later step that ran a
+    check (rubric, verify) is a separate process whose session nobody closed."""
+    if context_env("MO_PLACEMENT", "").strip().lower() != "remote":
+        return
+    run_id = context_env("MINI_ORK_RUN_ID", "")
+    if not run_id:
+        return
+    try:
+        from mini_ork.runtime.workspace_session import release_remote_session
+
+        release_remote_session(run_id, context_env("MINI_ORK_RUN_DIR", ""),
+                               env=context_env_snapshot())
+    except Exception as exc:  # noqa: BLE001 — teardown is best-effort; the node TTLs it
+        sys.stderr.write(f"[warn] remote session release failed: {exc}\n")
 
 
 RC_BLOCKED = 75  # EX_TEMPFAIL: the run never started; retry once the cause clears
@@ -599,6 +620,10 @@ def _run_lifecycle_impl(argv, root, sink) -> int:
             return 2
     if placement or node_env:
         publish_env({k: v for k, v in (("MO_PLACEMENT", placement), ("MO_NODE_ENV", node_env)) if v})
+    if placement == "remote":
+        # One node session for the whole run: execute keeps it for the later
+        # steps; _release_remote_session ends it when the lifecycle returns.
+        publish_env({"MO_REMOTE_SESSION_SCOPE": "lifecycle"})
 
     if not rest:
         sys.stderr.write("recipe name or kickoff.md path required\n"); return 2

@@ -514,6 +514,7 @@ def test_profile_setup_runs_image_prepare_and_the_session_uses_its_tag(tmp_path,
     assert (prep["base_image"], prep["setup"]) == ("base:1", "apt-get install -y jq")
     sess = next(b for _m, p, b in calls if p == "/v1/sessions")
     domains = sess.pop("allow_domains")
+    assert sess.pop("engine_sha") == "abc"   # D8: the node mounts this engine (epic 15)
     assert sess == {"run_id": "r-img", "image": "mo-prep:k1", "resources": {"cpus": 2},
                     "network": "allowlist"}
     assert domains[0] == "pypi.org"          # the profile's own, then the lanes' endpoints (epic 13)

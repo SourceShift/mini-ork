@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import select
 import signal
 import subprocess
@@ -132,14 +133,22 @@ def _default_spawn(argv: list[str], *, stdin: str, env: Mapping[str, str],
         cwd=cwd,
         start_new_session=True,
     )
-    if stdin:
+    # Write the prompt, then CLOSE stdin: an agent CLI (`claude --print`)
+    # reads its prompt to EOF, and an open pipe left every remote agent
+    # blocked forever on that read.
+    stdin_pipe = proc.stdin
+    if stdin_pipe is not None:
         try:
-            stdin_pipe = proc.stdin
-            if stdin_pipe is not None:
+            if stdin:
                 stdin_pipe.write(stdin)
                 stdin_pipe.flush()
         except (BrokenPipeError, OSError):
             pass
+        finally:
+            try:
+                stdin_pipe.close()
+            except (BrokenPipeError, OSError):
+                pass
     return proc
 
 
@@ -175,14 +184,31 @@ class ProcRegistry:
         *,
         runtime: str = "docker",
         session_cid: str | None = None,
+        image: str | None = None,
+        engines_dir: Path | None = None,
+        engine_sha: str | None = None,
         _run_fn: Callable[[list[str]], subprocess.CompletedProcess] | None = None,
         _spawn_fn: Callable[..., subprocess.Popen] | None = None,
     ) -> None:
-        self.state_dir = Path(state_dir) / "runs" / run_id / _PROCS_DIR
+        # remote-nodes-15 §1: ``state_dir`` is the per-host root; the per-run
+        # procs dir sits underneath. Pass the parent (``<state>``) for the
+        # audit-log path so one log spans every run on this node host.
+        root_state = Path(state_dir)
+        self.state_dir = root_state / "runs" / run_id / _PROCS_DIR
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self.run_id = run_id
         self.runtime = runtime
         self.session_cid = session_cid
+        self.image = image or ""
+        # remote-nodes-15 §3 (host-runtime engine gap): ``engines_dir`` is the
+        # parent of per-sha engine checkouts written by
+        # ``EngineManager.stage_bundle`` (``<state>/engines/<sha>/``). The
+        # docker runtime mounts the most recently staged one at
+        # ``/opt/mini-ork``; the host runtime needs the same mapping because
+        # nothing else surfaces the engine tree. ``None`` means "no engine
+        # is staged yet" — the path passes through unchanged.
+        self.engines_dir = Path(engines_dir) if engines_dir is not None else None
+        self.engine_sha = engine_sha
         self._run = _run_fn or _run
         self._spawn = _spawn_fn or _default_spawn
         self._procs: dict[int, _ProcState] = {}
@@ -269,7 +295,9 @@ class ProcRegistry:
             "env_keys": sorted(set(ps.spec.env_keys) | set(ps.spec.env)),
             "os_pid": ps.os_pid,
             "cwd": ps.spec.cwd,
-            "stdin": ps.spec.stdin,
+            # Not the prompt itself: it is delivered once at spawn and has no
+            # business sitting on the node's disk.
+            "stdin_bytes": len((ps.spec.stdin or "").encode("utf-8", "replace")),
             "timeout_s": ps.spec.timeout_s,
             "idempotency_key": ps.spec.idempotency_key,
             "state": ps.state,
@@ -305,7 +333,7 @@ class ProcRegistry:
         if self.runtime == "host":
             # No container mounts /workspace here: map sandbox paths in argv
             # onto this run's dirs, as the docker runtime's mounts would.
-            return [self._host_path(a) for a in spec.argv]
+            return [self._host_text(a) for a in spec.argv]
         # docker runtime — the host-side Popen runs `docker exec -i` so the
         # in-container process group is a fresh pgid (setsid inside the
         # container keeps the discipline). The `-i` keeps stdin open.
@@ -331,11 +359,100 @@ class ProcRegistry:
         return self._host_path(cwd)
 
     def _host_path(self, value: str) -> str:
-        """Host runtime: a ``/workspace[/...]`` path → this run's dir on disk."""
+        """Host runtime: a ``/workspace[/...]`` path → this run's dir on disk.
+
+        remote-nodes-15 §3: also maps ``/opt/mini-ork[/...]`` onto the
+        engine checkout the docker runtime mounts read-only. Without this
+        every host-runtime spawn that targets the engine (``/opt/mini-ork/
+        tests/fixtures/bin/mo-fake-agent``, transports, etc.) fails with
+        rc=127. The mapping is best-effort: if no engine is staged yet,
+        the path passes through unchanged so the spawn surfaces a real
+        "no such file" error from the shell instead of being silently
+        rewritten onto a missing tree.
+        """
         if value == "/workspace" or value.startswith("/workspace/"):
             rel = value[len("/workspace"):].lstrip("/")
             return str(self.state_dir.parent / rel) if rel else str(self.state_dir.parent)
+        if value == "/opt/mini-ork" or value.startswith("/opt/mini-ork/"):
+            engine_root = self._active_engine_root()
+            if engine_root is None:
+                return value
+            rel = value[len("/opt/mini-ork"):].lstrip("/")
+            return str(engine_root / rel) if rel else str(engine_root)
         return value
+
+    _SANDBOX_PATH = re.compile(r"(?<![\w./-])(/opt/mini-ork|/workspace)(?=[/\s'\":;]|$)")
+
+    def _host_text(self, value: str) -> str:
+        """Host runtime: every sandbox path TOKEN in ``value`` → its dir on
+        disk — including those inside an ``sh -c`` script, which is how
+        checks arrive (one argv string, many paths)."""
+        return self._SANDBOX_PATH.sub(lambda m: self._host_path(m.group(1)), value)
+
+    def _active_engine_root(self) -> Path | None:
+        """Pick the engine checkout the docker runtime mounts at ``/opt/mini-ork``.
+
+        remote-nodes-15 §3 (host-runtime gap): ``EngineManager`` writes one
+        tree per staged sha into ``<state>/engines/<sha>/``; the docker
+        runtime mounts the most recent one at ``/opt/mini-ork``. The host
+        runtime has no mount — the spawn needs to point its argv at the
+        same on-disk tree so the fake agent and transports do not
+        404 with rc=127. We pick the most recently modified subdir, which
+        is the same "last staged wins" rule the docker runtime applies
+        when it inherits ``engine_root`` from the launcher. Returns
+        ``None`` if no engine is staged yet — the caller falls back to
+        passing the path through unchanged.
+        """
+        if self.engines_dir is None or not self.engines_dir.exists():
+            return None
+        if self.engine_sha and (self.engines_dir / self.engine_sha).is_dir():
+            return self.engines_dir / self.engine_sha
+        candidates = [p for p in self.engines_dir.iterdir() if p.is_dir()]
+        if not candidates:
+            return None
+        return max(candidates, key=lambda p: p.stat().st_mtime)
+
+    def _audit_path(self) -> Path:
+        """One audit.jsonl per node host, not per run, so a single grep finds
+        every spawn the host ever made.
+
+        The path sits at ``<state>/audit.jsonl`` (kickoff §4) so an
+        operator can ``tail -F`` a live node for host-path leaks the same
+        way they already tail ``sessions.json``.
+        """
+        # ``self.state_dir`` is ``<state>/runs/<run>/.procs`` — the
+        # audit log lives at the per-host root.
+        return self.state_dir.parents[2] / "audit.jsonl"
+
+    def _append_audit(self, ps: _ProcState, *, host_argv: list[str]) -> None:
+        """Append one JSON line per proc to ``<state>/audit.jsonl``.
+
+        Kickoff §4. Keys on disk, never values (D6): argv is rewritten to
+        the host-side argv the child actually ran (post-``_host_path``),
+        env_keys come from the spec keys + spec.env keys, cwd is the
+        host-side Popen cwd (or ``None`` for docker), image is the
+        session's image, session is the run id. A bad write here MUST
+        NOT crash the spawn — observability is best-effort, the same
+        discipline ``mo_node_emit`` already applies to node_events.
+        """
+        env_keys = sorted(set(ps.spec.env_keys) | set(ps.spec.env))
+        entry = {
+            "ts": time.time(),
+            "session": ps.run_id,
+            "pid": ps.pid,
+            "argv": list(host_argv),
+            "cwd": self._host_cwd(ps.spec.cwd),
+            "env_keys": env_keys,
+            "image": self.image,
+            "state": ps.state,
+        }
+        try:
+            path = self._audit_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(entry) + "\n")
+        except OSError:
+            pass
 
     def spawn(self, spec: ProcSpec) -> _ProcState:
         # remote-nodes-10: idempotency dedup. A re-dispatch of the same
@@ -356,7 +473,9 @@ class ProcRegistry:
 
         env = {"PATH": os.environ.get("PATH", ""), **spec.env}
         if self.runtime == "host":
-            env = {k: self._host_path(v) for k, v in env.items()}
+            # The agent image sets PYTHONPATH=/opt/mini-ork for every session
+            # proc (the engine); the host runtime mirrors that default.
+            env = {k: self._host_text(v) for k, v in {"PYTHONPATH": "/opt/mini-ork", **env}.items()}
         argv = self._build_host_argv(spec)
 
         try:
@@ -369,6 +488,10 @@ class ProcRegistry:
             if spec.idempotency_key:
                 self._procs_by_key[spec.idempotency_key] = ps
             self._persist(ps)
+            # Audit-log even spawn failures (kickoff §4: one line per
+            # proc, including the ones that never ran). Same discipline
+            # as the success path — observability always lands.
+            self._append_audit(ps, host_argv=argv)
             return ps
         ps.proc = proc
         ps.os_pid = getattr(proc, "pid", None)
@@ -377,6 +500,12 @@ class ProcRegistry:
         if spec.idempotency_key:
             self._procs_by_key[spec.idempotency_key] = ps
         self._persist(ps)
+        # remote-nodes-15 §4: append the audit line AFTER persistence so a
+        # failed append can never claim a proc that did not land in
+        # ``.procs/<pid>.json``. The argv is the post-``_host_path`` host
+        # argv, so the audit reflects what landed on the wire (or would
+        # have, for docker runtime).
+        self._append_audit(ps, host_argv=argv)
         # Drain stdout/stderr in background threads, append to disk, and
         # watch for timeout + exit. On exit we mark ``exited`` (or
         # ``killed``) and persist.
@@ -514,6 +643,16 @@ class ProcRegistry:
             return False
         self._kill_group(ps.proc, ps)
         return True
+
+    def kill_all(self) -> int:
+        """Kill every proc of this session that is still running; return how
+        many. Session teardown: on the host runtime there is no container
+        whose removal would take the procs with it."""
+        killed = 0
+        for pid, ps in list(self._procs.items()):
+            if ps.proc is not None and ps.proc.poll() is None:
+                killed += int(self.kill(pid))
+        return killed
 
     # ---- read ----------------------------------------------------------
 

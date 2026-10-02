@@ -464,3 +464,95 @@ syncs that tree.
   exposure (every key going to every node), not deliberate exfiltration by a
   process that runs `env | curl`. A credential proxy that keeps keys out of
   the sandbox entirely is the hardening follow-up.
+
+## Run nodes on a cheap cloud VM
+
+This runs a real node host on a Hetzner Cloud VM that your laptop reaches
+over Tailscale, then a run against it, then tears it down.
+
+### Cost
+
+- **Hetzner CX33** (x86, 4 vCPU, 8 GB): EUR 0.0136/h excl. VAT after the
+  2026-06-15 price increase. `up` creates the VM IPv6-only by default, which
+  avoids the IPv4 charge; you reach it over the tailnet. Set `HCLOUD_IPV4=1`
+  to keep a public IPv4, for example if Docker Hub pulls fail over IPv6 while
+  building the agent image.
+- **Oracle Cloud Always Free** (A1, arm64, 2 OCPU, 12 GB): $0. It is the
+  same setup by hand: the cloud-init file works as user-data, then follow the
+  steps `up` performs.
+- Neither offers nested virtualization, so the node isolates runs with Docker
+  containers, not microVMs.
+
+### Prerequisites
+
+- `hcloud`, `tailscale`, `ssh`, `git`, `openssl` and `curl` on your machine,
+  and your machine on the tailnet.
+- `HCLOUD_TOKEN`: a Hetzner Cloud project API token.
+- `TS_AUTHKEY`: a Tailscale auth key (one-off or ephemeral).
+- `HCLOUD_SSH_KEY`: the name of an SSH key already uploaded to the Hetzner
+  project.
+- A clean checkout: the node gets mini-ork as a git bundle of HEAD.
+
+### Bring a node up, check it, run, tear down
+
+```bash
+scripts/remote_node_hetzner.sh up
+```
+
+`up` performs these steps, then prints the config snippets and the token:
+
+1. Creates the VM (`cx33`, `ubuntu-24.04`, `fsn1`, label `mo-node=1`) with a
+   cloud-init that installs docker, git, a Python venv and Tailscale.
+2. Waits for the VM to join the tailnet and for cloud-init to finish.
+3. Ships mini-ork as a git bundle of HEAD and installs it in a venv.
+4. Builds the `mini-ork/agent-node` image on the VM.
+5. Generates a node token into `/etc/mini-ork/node-agent.env` (root, 0600).
+6. Starts the `mini-ork-node-agent` systemd unit, bound to the tailnet
+   address, and checks `/v1/health`.
+
+Paste the printed `nodes.yaml` and `environments/hetzner.yaml` snippets, and
+export the printed `MO_NODE_TOKEN_<NAME>` in your shell. Then:
+
+```bash
+mini-ork nodes doctor --env hetzner --no-llm         # nine checks; exit 0 = ready
+mini-ork nodes doctor --env hetzner --recipe code-fix   # adds the per-lane auth smoke
+
+# the E2E fixture, then a real kickoff:
+cp -R tests/fixtures/remote_e2e_repo /tmp/e2e && cd /tmp/e2e \
+  && git init -q && git add -A && git commit -qm fixture
+mini-ork run code-fix <mini-ork>/tests/fixtures/remote_e2e_kickoff.md --placement remote --env hetzner
+mini-ork run code-fix path/to/kickoff.md --placement remote --env hetzner
+
+scripts/remote_node_hetzner.sh status
+scripts/remote_node_hetzner.sh down        # asks first; --yes skips the prompt
+```
+
+For a real run, list each lane's `api_key_env` under the profile's
+`secrets:`. Keys are resolved on your machine and sent per process; they are
+never stored on the node.
+
+### The simulated node (no cloud account)
+
+`tests/integration/test_remote_nodes_e2e.py` builds a node-host container
+from the agent image and runs `mini-ork node-agent --runtime host` over TLS,
+with no volume mounts. It then runs the same `code-fix` command against it,
+with every lane pointed at the deterministic `tests/fixtures/bin/mo-fake-agent`
+(no LLM spend). It checks that:
+
+- the run is published and the only change in the local checkout is the fix;
+- `remote.setup.step` events come before the first node, the implementer ran
+  `placement=remote`, `remote.sync.*` events are present, and the test
+  verifier ran on the node (`remote.check` rc=0);
+- the node's `/srv/mini-ork/audit.jsonl` (one line per process: argv, cwd,
+  env keys, never values) names no path on this machine;
+- `kill_run` leaves no agent process and no session on the node.
+
+It needs Docker and `bash docker/agent-node/build.sh`. Set `MO_REMOTE_LIVE=1
+MO_E2E_LANE=<lane> MO_E2E_SECRET=<its api_key_env>` to swap the fake for a
+real lane (this costs money; it reports the cost).
+
+### Reference run
+
+Pending: the transcript of the first `up` → `nodes doctor --env hetzner` →
+fixture run → `down` belongs here, with its wall time and cost. It needs a
+Hetzner account, so it was not part of the automated verification.

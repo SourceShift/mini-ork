@@ -148,6 +148,11 @@ def main(argv: list[str] | None = None, *, root: str | None = None,
         fallback.mkdir(parents=True, exist_ok=True)
         state_dir = fallback
     os.environ["MO_NODE_AGENT_STATE_DIR"] = str(state_dir)
+    # The uvicorn factory takes no arguments: every flag it needs travels in
+    # the environment (these three were parsed, printed and then dropped).
+    os.environ["MO_NODE_AGENT_RUNTIME"] = args.runtime
+    os.environ["MO_NODE_AGENT_TOKEN_ENV"] = args.token_env
+    os.environ["MO_NODE_AGENT_RETAIN_HOURS"] = str(args.retain_hours)
     if args.runtime == "host":
         logging.warning(
             "mini-ork node-agent: --runtime host gives NO isolation; "

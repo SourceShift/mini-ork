@@ -1,0 +1,32 @@
+#cloud-config
+# mini-ork node host (remote-nodes-15) — first boot of a cloud VM.
+#
+# Rendered by `scripts/remote_node_hetzner.sh up`, which replaces
+# __TS_AUTHKEY__ and __NODE_NAME__ before handing the file to the provider.
+# Never commit a rendered copy: it contains the Tailscale auth key.
+#
+# Installs docker (session containers), git, a Python venv toolchain and
+# Tailscale, creates the unprivileged `mini-ork` user and the /srv/mini-ork
+# state dir. mini-ork itself, the agent image and the node-agent token are
+# installed afterwards by the script, over the tailnet.
+
+package_update: true
+packages:
+  - ca-certificates
+  - curl
+  - git
+  - jq
+  - docker.io
+  - python3-venv
+  - python3-pip
+
+runcmd:
+  - systemctl enable --now docker
+  # The `docker` group exists only once docker.io is installed, so the user
+  # is created here rather than in a `users:` block.
+  - id mini-ork >/dev/null 2>&1 || useradd --system --home-dir /srv/mini-ork --shell /usr/sbin/nologin --groups docker mini-ork
+  - install -d -o mini-ork -g mini-ork -m 0750 /srv/mini-ork
+  - install -d -m 0700 /etc/mini-ork
+  - curl -fsSL https://tailscale.com/install.sh | sh
+  - tailscale up --authkey=__TS_AUTHKEY__ --hostname=__NODE_NAME__
+  - touch /var/lib/mini-ork-node-ready

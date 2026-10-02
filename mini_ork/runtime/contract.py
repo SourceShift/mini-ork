@@ -31,6 +31,7 @@ import os
 import signal
 import subprocess
 import sys
+import json
 import time
 from typing import Mapping, Sequence, Union
 
@@ -174,6 +175,18 @@ def _resolve_remote_session(run_id: str, env):
         return None
 
 
+def _node_interpreter(argv: list[str]) -> list[str]:
+    """A check launched with THIS machine's Python (``sys.executable``, e.g. a
+    venv under the laptop's checkout) runs under the node's ``python3``: the
+    local path does not exist there, and the agent image puts the engine on
+    that interpreter's PYTHONPATH."""
+    if argv and os.path.isabs(argv[0]) and (
+            argv[0] == sys.executable
+            or os.path.realpath(argv[0]) == os.path.realpath(sys.executable)):
+        return ["python3", *argv[1:]]
+    return argv
+
+
 def _placement_is_remote(env: Mapping[str, str]) -> bool:
     """Checks go remote exactly when the run's agent spawns do: ``MO_PLACEMENT=
     remote``, or the isolation selector (scope=agent + backend=remote). Without
@@ -293,12 +306,29 @@ def run_check(
                 remote_env.pop(key)
         if isinstance(argv_or_cmd, (list, tuple)):
             import shlex
-            parts = path_map.argv([str(a) for a in argv_or_cmd]) if path_map else list(argv_or_cmd)
+            argv = _node_interpreter([str(a) for a in argv_or_cmd])
+            parts = path_map.argv(argv) if path_map else argv
             cmd_str = " ".join(shlex.quote(str(a)) for a in parts)
         else:
-            cmd_str = path_map.text(str(argv_or_cmd)) if path_map else str(argv_or_cmd)
+            cmd = str(argv_or_cmd)
+            if cmd.startswith(sys.executable + " "):
+                cmd = "python3" + cmd[len(sys.executable):]
+            cmd_str = path_map.text(cmd) if path_map else cmd
         exec_kwargs = {"env": remote_env} if remote_env is not None else {}
+        check_started = time.monotonic()
         rc, out = remote.exec(cmd_str, cwd=remote_cwd, timeout=int(timeout or 0), **exec_kwargs)
+        # remote-nodes-15: one `remote.check` event per remote check — the
+        # run-events proof that a verifier ran on the node, and its rc.
+        try:
+            from mini_ork.observability.node_events import mo_node_emit
+
+            words = cmd_str.split()
+            script = next((w for w in words if w.endswith((".py", ".sh"))), words[0] if words else "")
+            mo_node_emit(run_id, "verifier", "verifier", "remote.check", json.dumps(
+                {"name": os.path.basename(script), "rc": rc,
+                 "ms": int((time.monotonic() - check_started) * 1000)}))
+        except Exception:  # noqa: BLE001 — the event is advisory
+            pass
         # Replica hygiene (kickoff §4): restore from last_synced after
         # every check so verifier droppings / mutation residue cannot be
         # mistaken for agent edits on the next sync-down. ``restore_replica``

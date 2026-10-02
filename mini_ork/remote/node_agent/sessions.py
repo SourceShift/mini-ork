@@ -53,6 +53,9 @@ class _SessionInfo:
     allow_domains: tuple[str, ...] = ()
     proxy_cid: str | None = None
     network_name: str | None = None
+    # D8: the engine sha the control plane runs — mounted (docker) / mapped
+    # (host) at /opt/mini-ork. None = the most recently staged engine.
+    engine_sha: str | None = None
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -83,6 +86,7 @@ class Session:
         allow_domains: tuple[str, ...] | list[str] = (),
         proxy_cid: str | None = None,
         network_name: str | None = None,
+        engine_sha: str | None = None,
     ) -> None:
         self.info = _SessionInfo(
             sid=sid,
@@ -96,6 +100,7 @@ class Session:
             allow_domains=tuple(allow_domains),
             proxy_cid=proxy_cid,
             network_name=network_name,
+            engine_sha=engine_sha,
         )
         self.proc_registry = proc_registry
         self.runtime = runtime
@@ -159,6 +164,9 @@ def _build_docker_argv(
         *sum((["--label", l] for l in labels), []),
         *sum((["-v", f"{src}:{dst}{':ro' if ro else ''}"] for src, dst, ro in mounts), []),
         "-w", "/workspace/target",
+        # Run as the node-agent's own uid: it created (and owns) the mounted
+        # run dirs, which the image's fixed `agent` user could not write.
+        "--user", f"{os.getuid()}:{os.getgid()}",
     ]
     if resources:
         # Profiles say ``cpus`` (docs/architecture/remote-nodes.md); ``cpu`` kept.
@@ -258,10 +266,14 @@ class SessionManager:
                 allow_domains=tuple(s.get("allow_domains") or ()),
                 proxy_cid=s.get("proxy_cid"),
                 network_name=s.get("network_name"),
+                engine_sha=s.get("engine_sha"),
             )
             sess.proc_registry = ProcRegistry(
                 self.state_dir, sess.run_id,
                 runtime=self.runtime, session_cid=sess.cid,
+                image=sess.info.image,
+                engines_dir=self.state_dir / "engines",
+                engine_sha=sess.info.engine_sha,
                 _run_fn=self._run,
             )
             self._sessions[sid] = sess
@@ -278,6 +290,7 @@ class SessionManager:
         profile: str | None = None,
         network: str = "full",
         allow_domains: tuple[str, ...] | list[str] | None = None,
+        engine_sha: str | None = None,
     ) -> Session:
         existing_sid = self._by_run_id.get(run_id)
         if existing_sid is not None:
@@ -296,6 +309,7 @@ class SessionManager:
             network=network,
             allow_domains=tuple(allow_domains or ()),
             network_name=network_name,
+            engine_sha=engine_sha,
         )
         # The proxy must be RUNNING and connected to the internal network
         # BEFORE the session container is launched — otherwise the
@@ -318,11 +332,15 @@ class SessionManager:
             resources=resources,
             network_name=network_name,
             proxy_env=proxy_env,
+            engine_sha=engine_sha,
         )
         session.info.cid = cid
         session.proc_registry = ProcRegistry(
             self.state_dir, run_id,
             runtime=self.runtime, session_cid=cid,
+            image=image,
+            engines_dir=self.state_dir / "engines",
+            engine_sha=engine_sha,
             _run_fn=self._run,
         )
         self._sessions[sid] = session
@@ -342,7 +360,9 @@ class SessionManager:
         if session is None:
             return False
         self._by_run_id.pop(session.run_id, None)
-        if session.cid:
+        if session.proc_registry is not None:
+            session.proc_registry.kill_all()     # host runtime: nothing else stops them
+        if session.cid and not session.cid.startswith("host:"):
             try:
                 self._run(["docker", "rm", "-f", session.cid])
             except (FileNotFoundError, OSError):
@@ -389,6 +409,7 @@ class SessionManager:
         resources: dict | None,
         network_name: str | None = None,
         proxy_env: dict[str, str] | None = None,
+        engine_sha: str | None = None,
     ) -> str:
         mounts: list[tuple[str, str, bool]] = []
         if self.runtime == "host":
@@ -401,8 +422,9 @@ class SessionManager:
         # mounted read-only. We mount from a sibling ``engines/<sha>``
         # directory when present; else we mount the entire ``state_dir``
         # so a freshly built agent can still find engines.
-        if self.engine_root is not None and self.engine_root.exists():
-            mounts.append((str(self.engine_root), "/opt/mini-ork", True))
+        engine = self._engine_tree(engine_sha)
+        if engine is not None:
+            mounts.append((str(engine), "/opt/mini-ork", True))
         for name, dst in (("target", "/workspace/target"), ("run", "/workspace/run"),
                           ("home", "/workspace/home"), ("mo-home", "/workspace/mo-home")):
             mounts.append((str(run_dirs[name]), dst, name == "mo-home"))
@@ -421,6 +443,18 @@ class SessionManager:
                 f"docker run failed ({r.returncode}): {r.stderr.strip() or r.stdout.strip()}"
             )
         return (r.stdout or "").strip()
+
+    def _engine_tree(self, engine_sha: str | None) -> Path | None:
+        """The engine checkout a session mounts at /opt/mini-ork (D8): the
+        staged ``engines/<sha>`` the control plane asked for, else an
+        explicit ``engine_root``, else the most recently staged engine."""
+        staged = self.state_dir / "engines"
+        if engine_sha and (staged / engine_sha).is_dir():
+            return staged / engine_sha
+        if self.engine_root is not None and self.engine_root.exists():
+            return self.engine_root
+        trees = [p for p in staged.iterdir() if p.is_dir()] if staged.is_dir() else []
+        return max(trees, key=lambda p: p.stat().st_mtime) if trees else None
 
     def _start_egress_proxy(
         self,

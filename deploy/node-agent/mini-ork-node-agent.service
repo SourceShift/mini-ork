@@ -1,0 +1,39 @@
+# mini-ork node-agent (remote-nodes-15), installed by
+# `scripts/remote_node_hetzner.sh up`.
+#
+# Listens on the node's Tailscale address only (MO_NODE_BIND). The tailnet is
+# the encrypted, authenticated channel, so no TLS is needed there; the
+# node-agent refuses any other non-loopback bind without --tls-cert/--tls-key.
+# /etc/mini-ork/node-agent.env (root, 0600) holds MO_NODE_TOKEN and
+# MO_NODE_BIND; systemd reads it before dropping to the mini-ork user.
+#
+# Sessions use the docker runtime: each run gets its own container from the
+# mini-ork/agent-node image.
+
+[Unit]
+Description=mini-ork node-agent
+After=network-online.target docker.service tailscaled.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+User=mini-ork
+Group=mini-ork
+SupplementaryGroups=docker
+EnvironmentFile=/etc/mini-ork/node-agent.env
+ExecStart=/opt/mini-ork-node/venv/bin/python -m mini_ork.cli.node_agent \
+    --runtime docker \
+    --bind ${MO_NODE_BIND} \
+    --port 7091 \
+    --state-dir /srv/mini-ork \
+    --token-env MO_NODE_TOKEN
+WorkingDirectory=/srv/mini-ork
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=true
+ProtectSystem=full
+ReadWritePaths=/srv/mini-ork
+
+[Install]
+WantedBy=multi-user.target

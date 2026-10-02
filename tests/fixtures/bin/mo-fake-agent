@@ -1,0 +1,47 @@
+#!/usr/bin/env python3
+"""Deterministic stand-in for the agent CLI in the remote-nodes E2E plumbing
+tier (no LLM spend). Every lane of the test run points here; the node's role
+(MO_NODE_ROLE, published per node by the executor) picks the answer:
+
+* implementer — applies the fixture's one-line fix in the cwd (the target
+  checkout) and reports it;
+* reviewer — passes;
+* anything else — a short acknowledgement.
+
+MO_FAKE_AGENT_SLEEP=<s> makes it hang first (the kill_run test).
+The prompt arrives on stdin and is read and ignored.
+"""
+import json
+import os
+import sys
+import time
+from pathlib import Path
+
+BUG = "return sum(range(1, n))"
+FIX = "return sum(range(1, n + 1))"
+
+
+def main() -> int:
+    try:
+        sys.stdin.read()
+    except (OSError, ValueError):
+        pass
+    if os.environ.get("MO_FAKE_AGENT_SLEEP"):
+        time.sleep(float(os.environ["MO_FAKE_AGENT_SLEEP"]))
+    role = os.environ.get("MO_NODE_ROLE", "")
+    if role == "implementer":
+        target = Path.cwd() / "calc_pkg" / "calc.py"
+        if not target.is_file():
+            print(f"mo-fake-agent: no calc_pkg/calc.py under {Path.cwd()}", file=sys.stderr)
+            return 1
+        target.write_text(target.read_text().replace(BUG, FIX))
+        print("Fixed the off-by-one in calc_pkg/calc.py: range(1, n) -> range(1, n + 1).")
+    elif role == "reviewer":
+        print(json.dumps({"verdict": "pass", "summary": "one-line fix; test covers it"}))
+    else:
+        print(json.dumps({"verdict": "pass", "summary": f"ok ({role or 'unknown role'})"}))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
