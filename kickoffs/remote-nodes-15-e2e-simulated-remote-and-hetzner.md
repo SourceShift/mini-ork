@@ -105,6 +105,58 @@ filesystem proves D1/D4 hold.
 - `scripts/remote_node_hetzner.sh` (new)
 - `docs/operator/remote-nodes.md` (append runbook)
 
+- `mini_ork/runtime/contract.py` — emit the `remote.check` event only (see
+  the notes below)
+- `mini_ork/remote/node_agent/procs.py` — `_host_path` only, for the engine
+  mapping (see the notes below)
+
+## Notes from epics 10–14 (read before implementing)
+
+These seams exist on main. Use them; do not rebuild them.
+
+- **Running remote:** `mini-ork run code-fix <kickoff> --placement remote --env
+  e2e` already provisions the session at run start (`remote.setup.step`
+  events before the first `node_start`), tags each `node_start` with
+  `placement`/`node_host`/`session_id`, and emits `remote.run.summary` at
+  teardown. Assert on those events.
+- **Preflight:** run `mini-ork nodes doctor --env e2e --no-llm` against the
+  node host before the run and assert exit 0. It checks engine upload,
+  session, toolchain and network on the real node.
+- **Profile secrets:** the profile's `secrets:` must list every lane secret
+  (the spawn key or the lane's `api_key_env`), or the dispatch is refused with
+  `SecretNotPermittedError`. The fake-agent lane needs none. The live tier
+  lists its lane's `api_key_env`.
+- **Path translation:** every argv path must sit under a run root (target,
+  run dir, engine, mo-home), or the remote branch raises
+  `UnmappedHostPathError`. `tests/fixtures/bin/mo-fake-agent` lives in the
+  engine root, so it reaches the node as `/opt/mini-ork/tests/fixtures/bin/
+  mo-fake-agent`. The engine travels as a git bundle of HEAD, so the fake
+  agent must be committed; a dirty engine is refused unless
+  `MO_REMOTE_ALLOW_DIRTY_ENGINE=1`.
+- **Host-runtime gap:** `--runtime host` maps `/workspace/...` in argv, env and
+  cwd onto the run's dirs (epic 13), but NOT `/opt/mini-ork`. Inside the
+  node-host container nobody mounts the engine there. Extend
+  `ProcRegistry._host_path` in `procs.py` to map `/opt/mini-ork[/...]` onto
+  the uploaded engine checkout, the same tree the docker runtime mounts
+  read-only. Without this the fake agent and every transport are "not found"
+  (rc 127).
+- **TLS:** `mini-ork node-agent` takes `--tls-cert/--tls-key` (required for
+  non-loopback binds). The client uses urllib, so point `SSL_CERT_FILE` at the
+  test CA for the run.
+- **`remote.check`:** nothing emits a `remote.check` event today. Epic 11's
+  remote checks run through `RemoteWorkspace.exec` in
+  `runtime/contract.run_check` silently. Emit `remote.check` with `{check,
+  rc, ms}` there, via the same `mo_node_emit` the `remote.sync.*` events use,
+  and assert on it.
+- **Tokens:** a `nodes.yaml` node's token is read from its own `token_env`.
+- **Docker on this machine:** colima bind-mounts only `/Volumes/docker-ssd`
+  and `/Volumes/ssd-2`; TMPDIR and `$HOME` are invisible inside containers.
+  The node host runs without `-v`, but any test that does mount must use a
+  bind-visible dir. Never stop colima (it hosts live services).
+- **Producer check:** epics 02, 03, 05, 09, 10, 11, 13 and 14 each shipped code
+  that READ a value nothing in production WROTE. For every value the new code
+  reads, name its production producer in the commit message.
+
 ## Out of scope
 
 - Managed-sandbox backends (E2B, Modal, Daytona). Each is a later epic behind
