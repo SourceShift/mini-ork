@@ -15,6 +15,7 @@ import json
 import os
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -445,3 +446,105 @@ def render_graph_path_md(payload: str, limit: int = 3) -> str:
            f"- {chain} ({hops} hops, w={total_weight:.2f}, {algorithm})",
            "--- /graph path ---"]
     return "\n".join(out) + "\n"
+
+
+# ── Concord P0 coord helpers (raise-based; the opposite of the fail-soft helpers above) ──
+#
+# The fail-soft helpers above return {} / "" when ContextNest is down so
+# mini-ork never blocks on CN. The `mini-ork concord` CLI needs the opposite:
+# it maps a connection error to exit code 3 and an HTTP 4xx/5xx to exit code 4,
+# so these helpers raise instead of falling back. They deliberately do NOT
+# consult `available()` (concord run must fail open and keep retrying the
+# upsert on each heartbeat even when the ping cache says "down") and do NOT
+# route through `_fire` (which would swallow the very errors the CLI needs).
+
+
+class CoordUnavailable(RuntimeError):
+    """ContextNest is unreachable (connection refused, DNS, or a timeout)."""
+
+
+class CoordHTTPError(RuntimeError):
+    """ContextNest answered with a 4xx/5xx status."""
+
+    def __init__(self, status: int, body: str) -> None:
+        super().__init__(f"ContextNest returned {status}")
+        self.status = status
+        self.body = body
+
+
+def _coord_timeout() -> float:
+    return float(os.environ.get("CN_COORD_TIMEOUT_SEC", "3"))
+
+
+def _coord_request(method: str, path: str, body: dict | None = None) -> dict:
+    """One raise-based send path for the coord helpers.
+
+    Unlike ``_get``/``_post_json`` this raises instead of returning a fallback,
+    so the CLI can map failures to exit codes. Returns the parsed JSON body
+    (``{}`` on an empty or undecodable body).
+    """
+    data = None
+    headers: dict = {}
+    if body is not None:
+        data = json.dumps(body).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(_base() + path, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=_coord_timeout()) as r:
+            raw = r.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as exc:
+        try:
+            err_body = exc.read().decode("utf-8", "replace")
+        except Exception:
+            err_body = ""
+        raise CoordHTTPError(exc.code, err_body) from exc
+    except (urllib.error.URLError, OSError, TimeoutError) as exc:
+        raise CoordUnavailable(str(exc)) from exc
+    try:
+        return json.loads(raw) if raw.strip() else {}
+    except Exception:
+        return {}
+
+
+def coord_upsert_principal(principal_id: str, fields: dict) -> dict:
+    """PUT /api/v1/coord/principals/{id} — register (and heartbeat) a principal."""
+    return _coord_request("PUT", f"/api/v1/coord/principals/{_enc(principal_id)}", fields)
+
+
+def coord_list_principals(status: str = "active") -> dict:
+    """GET /api/v1/coord/principals?status=active|all — newest last_seen first."""
+    return _coord_request("GET", f"/api/v1/coord/principals?status={_enc(status)}")
+
+
+def coord_get_principal(principal_id: str) -> dict:
+    """GET /api/v1/coord/principals/{id} — a single principal."""
+    return _coord_request("GET", f"/api/v1/coord/principals/{_enc(principal_id)}")
+
+
+def coord_end_principal(principal_id: str) -> dict:
+    """DELETE /api/v1/coord/principals/{id} — mark the principal ended."""
+    return _coord_request("DELETE", f"/api/v1/coord/principals/{_enc(principal_id)}")
+
+
+def coord_send(principal_id: str, sender: str, body: str) -> dict:
+    """POST /api/v1/coord/principals/{id}/messages — send a message to a principal."""
+    return _coord_request(
+        "POST", f"/api/v1/coord/principals/{_enc(principal_id)}/messages",
+        {"from": sender, "body": body},
+    )
+
+
+def coord_inbox(principal_id: str, unacked: bool = True) -> dict:
+    """GET /api/v1/coord/principals/{id}/messages?unacked=true — unacked messages."""
+    flag = "true" if unacked else "false"
+    return _coord_request(
+        "GET", f"/api/v1/coord/principals/{_enc(principal_id)}/messages?unacked={flag}",
+    )
+
+
+def coord_ack(principal_id: str, msg_id: str, by: str) -> dict:
+    """POST /api/v1/coord/principals/{id}/messages/{msg_id}/ack — acknowledge."""
+    return _coord_request(
+        "POST", f"/api/v1/coord/principals/{_enc(principal_id)}/messages/{_enc(msg_id)}/ack",
+        {"by": by},
+    )

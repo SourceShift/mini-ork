@@ -59,6 +59,7 @@ _NATIVE_MODULE_SUBS = {
     "bug-collector": "mini_ork.observability.bug_collector",
     "conductor": "mini_ork.orchestration.conductor",
     "coord": "mini_ork.orchestration.coord",
+    "concord": "mini_ork.orchestration.concord",
     "lifetime": "mini_ork.orchestration.lifetime",
     "self-improve": "mini_ork.cli.self_improve",
     "topology": "mini_ork.cli.topology",
@@ -118,6 +119,9 @@ Lifecycle:
   garden                         Drift detection (collisions, orphans, stale runs)
   recipe-eval                    Static evaluation of recipe definitions
   version
+
+Coordination:
+  concord <sub>                  Cross-agent coordination client (run/ps/stop/send/inbox/ack)
 
 Provider credentials:
   providers status <lane>                    Safely show configured or missing credentials
