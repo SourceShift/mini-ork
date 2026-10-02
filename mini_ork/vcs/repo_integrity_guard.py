@@ -49,7 +49,11 @@ def check_and_heal(cwd: str | None = None, now_iso: str | None = None) -> int:
     if os.path.exists(lkg_file) and os.path.getsize(lkg_file) > 0:
         with open(lkg_file) as f:
             baseline = f.read().strip()
-    if not baseline:
+    if not baseline and branch == "main":
+        # origin/main is a baseline only FOR main. A feature/worktree branch is
+        # expected to trail or diverge from it; comparing against it flagged
+        # every fresh worktree branch as "clobbered" once another session
+        # pushed, and the heal fast-forwarded the ref under a live index.
         om, rc = _git(repo_root, "rev-parse", "--verify", "-q", "origin/main")
         if rc == 0:
             baseline = om
@@ -70,6 +74,16 @@ def check_and_heal(cwd: str | None = None, now_iso: str | None = None) -> int:
         _record(cur_tip)
         return 0
     if cur_tip == baseline:
+        _record(cur_tip)
+        return 0
+
+    # ── behind is not clobbered ─────────────────────────────────────────────
+    # A tip that is an ancestor of the baseline was overtaken or deliberately
+    # moved back along its own line — never a foreign-history clobber. A bare
+    # update-ref here would move HEAD without the index and stage a phantom
+    # reverse diff of every commit in between (observed 2026-10-02).
+    _, behind_rc = _git(repo_root, "merge-base", "--is-ancestor", cur_tip, baseline)
+    if behind_rc == 0:
         _record(cur_tip)
         return 0
 

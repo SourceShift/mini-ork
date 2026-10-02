@@ -102,6 +102,31 @@ def test_legit_advance_records(tmp_path):
     assert _log_no_ts(rp) is None
 
 
+def test_feature_branch_behind_origin_main_is_not_healed(tmp_path):
+    """A fresh worktree-style branch sitting at an older main commit must not be
+    fast-forwarded to origin/main when another session pushes — origin/main is
+    not a baseline for non-main branches, and behind is not clobbered."""
+    rp, a, b, _ = _scenario(tmp_path, "clean")
+    _g(rp, "update-ref", "refs/remotes/origin/main", b)   # upstream advanced to B
+    _g(rp, "checkout", "-q", "-b", "wt/feature", a)        # branch still at A (older)
+    rig.check_and_heal(cwd=str(rp))
+    assert _g(rp, "rev-parse", "refs/heads/wt/feature") == a
+    assert _g(rp, "status", "--porcelain", "--untracked-files=no") == ""  # no phantom staged diff
+    assert _log_no_ts(rp) is None
+
+
+def test_main_moved_back_along_its_own_line_is_not_healed(tmp_path):
+    """LKG at B, tip reset to its ancestor A: an overtaken/rewound tip, not a
+    foreign-history clobber — record it, never update-ref under the index."""
+    rp, a, b, _ = _scenario(tmp_path, "clean")
+    _write_lkg(rp, b)
+    _g(rp, "reset", "--hard", "-q", a)
+    rig.check_and_heal(cwd=str(rp))
+    assert _g(rp, "rev-parse", "refs/heads/main") == a
+    assert _lkg(rp) == a
+    assert _log_no_ts(rp) is None
+
+
 def test_escape_hatch_noop(tmp_path):
     rp, a, b, c = _scenario(tmp_path, "clobber")
     _write_lkg(rp, b)
