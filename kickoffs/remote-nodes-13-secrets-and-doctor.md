@@ -98,6 +98,34 @@ epic 12 (profiles list the allowed secret names).
 - `mini_ork/cli/nodes.py` (new) + `mini_ork/cli/main.py` (`_NATIVE_MODULE_SUBS` entry)
 - `tests/unit/test_native_dispatch_py.py` (exact-set guard), `tests/unit/test_secrets_scope.py` (new), `tests/unit/test_nodes_doctor.py` (new)
 
+- `mini_ork/runtime/backends/remote.py` — `RemoteWorkspace._session_payload` only
+  (requirement 3: the lane hosts join `allow_domains` there)
+
+## Notes from epics 10 and 14 (read before implementing)
+
+These seams already exist on main. Reuse them; do not re-implement them.
+
+- `RemoteWorkspace.up()` already emits `remote.setup.step` for `health`,
+  `engine`, `image_prepare`, `session_up`, `initial_sync` and `post_sync`, and
+  it enforces `max_sessions`. Doctor steps 1–5 and 9 drive the real workspace
+  (`mini_ork.runtime.backends.remote._factory(env=...)`, then `up()` and
+  `down()`) and report from those step events. Do not hand-roll the HTTP
+  calls.
+- `--env <profile>` binds node, image, resources and network in `_factory`
+  (`MO_NODE_ENV` → `environments.load_profile`). `doctor --env` reuses that
+  path.
+- A registry node's token is read from its own `token_env` (`Node.token_env`,
+  passed to the workspace). Never assume `MO_NODE_TOKEN`.
+- Lane kind: `providers._lane_kind(model)` reads the registry. The lane alias
+  resolves via `llm_dispatch.resolve_lane_family`.
+- `dispatch_node` publishes `MO_NODE_ID`, `MO_NODE_ROLE`, `MO_NODE_ATTEMPT` and
+  `MO_INPUT_HASH` per node. These are not secrets, and the remote env assembly
+  must keep them, because the reattach key and the placement roles depend on
+  them. `MO_NODE_TOKEN*` must stay stripped (`isolated_env`).
+- Producer check: epics 02, 03, 05, 09, 10, 11 and 14 each shipped code that
+  READ a value nothing in production WROTE. For every env var, kwarg or field
+  the new code reads, name its production producer in the commit message.
+
 ## Out of scope
 
 - A credential *proxy*, where keys never enter the sandbox at all. That is a
