@@ -31,6 +31,12 @@ agents["lanes"]["glm_lens"] = "glm,minimax,deepseek"
 agents["lanes"]["minimax_lens"] = "minimax,glm,deepseek"
 agents["lanes"]["deepseek_lens"] = "deepseek,minimax,glm"
 yaml.safe_dump(agents, open(f"{dst}/agents.yaml", "w"), sort_keys=False)
+# Lane-alias resolution (resolve_lane_family) reads the home agents.yaml plus
+# the $MINI_ORK_AGENTS overlay, never the run snapshot above — an alias that
+# exists only there falls through to the MO_FALLBACK tail. Ship the lens
+# aliases as a run-scoped overlay instead.
+overlay = {"lanes": {"glm_lens": "glm", "minimax_lens": "minimax", "deepseek_lens": "deepseek"}}
+yaml.safe_dump(overlay, open(f"{dst}/agents.overlay.yaml", "w"), sort_keys=False)
 providers = yaml.safe_load(open(f"{src}/providers.yaml"))
 table = providers.get("providers", providers)
 for name in list(table):
@@ -57,6 +63,7 @@ export ARXIV_API_TOKEN
 export MINI_ORK_RUN_ID="$RUN_ID"
 export MINI_ORK_RECIPE=coord-technique-review   # recover resolves checkpoints by recipe
 export MINI_ORK_PROVIDERS="$RUN_DIR/config/providers.yaml"
+export MINI_ORK_AGENTS="$RUN_DIR/config/agents.overlay.yaml"
 export MINI_ORK_COLLECTION_PLAN="${MINI_ORK_COLLECTION_PLAN:-$PWD/recipes/coord-technique-review/collection-plan.json}"
 # LibWit hybrid batch search is slow; 32-query batches timed out at the 45s default.
 export MINI_ORK_LIBWIT_REQUEST_TIMEOUT_SEC="${MINI_ORK_LIBWIT_REQUEST_TIMEOUT_SEC:-900}"
