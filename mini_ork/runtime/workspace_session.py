@@ -213,7 +213,17 @@ def get_run_session(
 
         # First call for this (run_id, backend): construct, up(), record marker.
         ws = _resolve_backend_workspace(backend, env=env, cwd=None)
-        ws.up()
+        try:
+            ws.up()
+        except BaseException:
+            # A half-provisioned session (e.g. created, then the initial sync
+            # failed) is never registered, so nothing else would tear it down —
+            # and on a remote node it holds a max_sessions slot until the TTL.
+            try:
+                ws.down()
+            except Exception:  # noqa: BLE001 — the up() error is the one to report
+                pass
+            raise
         run_dir = _resolve_run_dir(env, run_id)
         session = WorkspaceSession(
             workspace=ws,

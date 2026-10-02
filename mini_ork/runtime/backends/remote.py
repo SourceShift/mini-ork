@@ -328,6 +328,8 @@ class RemoteWorkspace:
         on_chunk: Any = None,
         target_root: str | None = None,
         run_dir: str | None = None,
+        profile: Any = None,
+        queue_wait_s: float | None = None,
     ) -> None:
         # No isinstance guard on `node` — the typed signature already constrains
         # callers to ``_NodeRef`` (the factory coerces ``Node`` to ``_NodeRef``),
@@ -340,6 +342,15 @@ class RemoteWorkspace:
         self._node = node
         self._run_id = run_id
         self._image = image
+        # remote-nodes-14: the environment profile (epic 12) binds the session's
+        # prepared image, resources and network; None keeps today's payload.
+        self._profile = profile
+        self._base_image = image   # _image becomes the prepared tag after image_prepare
+        self._queue_wait_s = float(600.0 if queue_wait_s is None else queue_wait_s)
+        self._sync_up_bytes = 0
+        self._sync_down_bytes = 0
+        self._setup_s: float | None = None
+        self._up_at: float | None = None
         self._drive_root = drive_root
         self._mount_path = mount_path
         # engine_root defaults to $MINI_ORK_ROOT (the control plane checkout);
@@ -410,8 +421,9 @@ class RemoteWorkspace:
         ).hexdigest()
 
     def _token(self) -> str:
-        """Read the bearer token at call time (never at import)."""
-        return os.environ.get(self._token_env, "")
+        """Read the bearer token at call time (never at import); fall back to
+        the token ``select_node`` resolved from the node's ``token_env``."""
+        return os.environ.get(self._token_env, "") or self._node.token
 
     def _request(
         self,
@@ -421,6 +433,8 @@ class RemoteWorkspace:
         body: bytes | None = None,
         content_type: str | None = None,
         query: Mapping[str, str] | None = None,
+        timeout: float = 30.0,
+        retries: int | None = None,
     ) -> bytes:
         """Issue an authenticated HTTP request with bounded retries + jitter.
 
@@ -436,19 +450,20 @@ class RemoteWorkspace:
 
             url += "?" + urlencode(query)
         last_exc: Exception | None = None
-        for attempt in range(self._retries):
+        n_tries = max(1, int(retries if retries is not None else self._retries))
+        for attempt in range(n_tries):
             req = urllib_request.Request(url, data=body, method=method)
             if self._token():
                 req.add_header("Authorization", f"Bearer {self._token()}")
             if content_type:
                 req.add_header("Content-Type", content_type)
             try:
-                with urllib_request.urlopen(req, timeout=30) as resp:
+                with urllib_request.urlopen(req, timeout=timeout) as resp:
                     return resp.read()
             except urllib_error.HTTPError as exc:
                 # 5xx: transient, retry. 4xx: caller error (token, payload),
                 # fail loud NOW.
-                if 500 <= exc.code < 600 and attempt + 1 < self._retries:
+                if 500 <= exc.code < 600 and attempt + 1 < n_tries:
                     last_exc = exc
                     time.sleep(_DEFAULT_BACKOFF_S * (1 + random.random()))
                     continue
@@ -459,21 +474,23 @@ class RemoteWorkspace:
             except (urllib_error.URLError, OSError) as exc:
                 # Connection refused / DNS / timeout — retry with jittered backoff.
                 last_exc = exc
-                if attempt + 1 < self._retries:
+                if attempt + 1 < n_tries:
                     time.sleep(_DEFAULT_BACKOFF_S * (1 + random.random()))
                     continue
                 raise RemoteUnavailableError(
                     f"node-agent {method} {path} unreachable after "
-                    f"{self._retries} attempts: {exc}"
+                    f"{n_tries} attempts: {exc}"
                 ) from exc
         # Loop fell off without raising — defensive.
         raise RemoteUnavailableError(
             f"node-agent {method} {path} failed: {last_exc}"
         )
 
-    def _json(self, method: str, path: str, payload: Mapping[str, Any] | None = None) -> dict:
+    def _json(self, method: str, path: str, payload: Mapping[str, Any] | None = None,
+              **request_kw: Any) -> dict:
         body = json.dumps(payload).encode("utf-8") if payload is not None else None
-        raw = self._request(method, path, body=body, content_type="application/json")
+        raw = self._request(method, path, body=body, content_type="application/json",
+                            **request_kw)
         if not raw:
             return {}
         return json.loads(raw.decode("utf-8"))
@@ -496,36 +513,121 @@ class RemoteWorkspace:
         # without forking). The git binary itself is found on demand.
         import subprocess
 
+        t_up = time.monotonic()
         # 1) Engine sha stage (idempotent).
         sha = self._current_engine_sha(subprocess)
+        creating = self._sid is None
+        health: dict = {}
+        if sha not in self._uploaded_shas or creating:
+            # Health doubles as the capacity gate (remote-nodes-14 §5), checked
+            # only while this run holds no session on the node.
+            health = self._setup_step(
+                "health", self._await_capacity if creating else (lambda: self._json("GET", "/v1/health")))
         if sha not in self._uploaded_shas:
-            health = self._json("GET", "/v1/health")
-            remote_shas = {entry["sha"] for entry in health.get("engine_shas", [])}
-            if sha not in remote_shas:
-                bundle = self._bundle_engine(subprocess)
-                self._request(
-                    "PUT",
-                    f"/v1/engines/{sha}",
-                    body=bundle,
-                    content_type="application/x-git-bundle",
-                )
+            def _stage_engine() -> None:
+                remote_shas = {entry["sha"] for entry in health.get("engine_shas", [])}
+                if sha not in remote_shas:
+                    self._request("PUT", f"/v1/engines/{sha}", body=self._bundle_engine(subprocess),
+                                  content_type="application/x-git-bundle")
+            self._setup_step("engine", _stage_engine, detail=sha[:12])
             self._uploaded_shas.add(sha)
 
-        # 2) Session create (idempotent on run_id at the server).
-        if self._sid is None:
-            sess = self._json(
-                "POST",
-                "/v1/sessions",
-                {"run_id": self._run_id, "image": self._image},
-            )
+        # 2) Session create (idempotent on run_id at the server), on the
+        # profile's prepared image when the profile declares a setup script.
+        if creating:
+            if self._profile is not None and (getattr(self._profile, "setup", "") or "").strip():
+                self._image = self._setup_step("image_prepare", self._prepare_image)
+            sess = self._setup_step("session_up", lambda: self._json(
+                "POST", "/v1/sessions", self._session_payload()))
             self._sid = sess.get("sid", self._run_id)
             self._owns_session = True
         # 3) Initial tree sync-up (epic 07) and the one-shot mo-home upload
         # (epic 08). Both are idempotent on a repeated up().
         with self._sync_lock:
-            self._sync_up(force=True)
-        self._upload_mo_home()
+            self._setup_step("initial_sync", lambda: self._sync_up(force=True))
+        self._setup_step("post_sync", self._upload_mo_home)
+        if creating:
+            self._up_at = time.monotonic()
+            self._setup_s = self._up_at - t_up
         return None
+
+    # ------------------------------------------------------------------ provisioning
+
+    def _setup_step(self, step: str, fn: Any, *, detail: str = "") -> Any:
+        """Run one provisioning step between ``remote.setup.step`` start/ok|fail
+        events (epic 12 §4) — the data for a live "setting up" checklist."""
+        self._emit_sync_event("remote.setup.step", step=step, status="start")
+        t0 = time.monotonic()
+        try:
+            out = fn()
+        except Exception as exc:
+            self._emit_sync_event("remote.setup.step", step=step, status="fail",
+                                  ms=int((time.monotonic() - t0) * 1000), detail=str(exc)[:500])
+            raise
+        self._emit_sync_event("remote.setup.step", step=step, status="ok",
+                              ms=int((time.monotonic() - t0) * 1000), detail=detail)
+        return out
+
+    def _await_capacity(self) -> dict:
+        """Wait for a free session slot on the node; return its health.
+
+        A node runs at most ``max_sessions`` sessions (``nodes.yaml``). When it
+        is full, poll with backoff for up to ``MO_REMOTE_QUEUE_WAIT_S``
+        (emitting ``remote.queue.wait``), then fail ``remote_unavailable``. A
+        run that already holds a session there (a control-plane restart) is
+        never queued behind itself."""
+        cap = max(1, int(getattr(self._node, "max_sessions", 1) or 1))
+        deadline = time.monotonic() + self._queue_wait_s
+        backoff = 1.0
+        while True:
+            health = self._json("GET", "/v1/health")
+            live = int(health.get("sessions") or 0)
+            if live < cap or self._session_exists():
+                return health
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RemoteUnavailableError(
+                    f"remote_unavailable: node {self._node.name or self._node.url!r} is at capacity "
+                    f"({live}/{cap} sessions); waited {self._queue_wait_s:.0f}s "
+                    "(MO_REMOTE_QUEUE_WAIT_S)")
+            pause = min(backoff, remaining)
+            self._emit_sync_event("remote.queue.wait", node=self._node.name, live=live, cap=cap,
+                                  wait_s=round(pause, 2))
+            time.sleep(pause)
+            backoff = min(backoff * 2, 15.0)
+
+    def _session_exists(self) -> bool:
+        try:
+            self._json("GET", f"/v1/sessions/{self._run_id}", retries=1)
+            return True
+        except RemoteUnavailableError:
+            return False
+
+    def _prepare_image(self) -> str:
+        """Build (or hit the cache for) the profile's setup image on the node."""
+        prof = self._profile
+        timeout_s = float(getattr(prof, "setup_timeout_s", 900.0) or 900.0)
+        body = self._json("POST", "/v1/images/prepare",
+                          {"base_image": self._base_image, "setup": prof.setup,
+                           "timeout_s": timeout_s, "run_id": self._run_id},
+                          timeout=timeout_s + 60, retries=1)   # a failed setup is not transient
+        tag = str(body.get("tag") or "")
+        if not tag:
+            raise RemoteUnavailableError(
+                f"image prepare for profile {getattr(prof, 'name', '')!r} returned no tag: "
+                f"{str(body.get('log_tail') or '')[-500:]}")
+        return tag
+
+    def _session_payload(self) -> dict:
+        payload: dict[str, Any] = {"run_id": self._run_id, "image": self._image}
+        prof = self._profile
+        if prof is not None:
+            if getattr(prof, "resources", None):
+                payload["resources"] = dict(prof.resources)
+            payload["network"] = getattr(prof, "network", "") or "full"
+            if getattr(prof, "allow_domains", None):
+                payload["allow_domains"] = list(prof.allow_domains)
+        return payload
 
     def _current_engine_sha(self, subprocess_mod: Any) -> str:
         """Return ``git rev-parse HEAD`` for ``engine_root``; refuse dirty trees.
@@ -606,7 +708,7 @@ class RemoteWorkspace:
         if self._target_root is not None:
             return self._target_root
         root = ""
-        run_dir = (os.environ.get("MINI_ORK_RUN_DIR") or "").strip()
+        run_dir = (self._run_dir or os.environ.get("MINI_ORK_RUN_DIR") or "").strip()
         if run_dir:
             from mini_ork.runtime.run_roots import load_run_roots
 
@@ -728,6 +830,10 @@ class RemoteWorkspace:
         ``ms`` are best-effort — we don't compute them here, callers
         may override via ``fields``.
         """
+        if event_type == "remote.sync.up":
+            self._sync_up_bytes += int(fields.get("bytes") or 0)
+        elif event_type == "remote.sync.down":
+            self._sync_down_bytes += int(fields.get("bytes") or 0)
         run_id = os.environ.get("MINI_ORK_RUN_ID", self._run_id)
         try:
             from mini_ork.observability.node_events import mo_node_emit
@@ -1478,6 +1584,13 @@ class RemoteWorkspace:
         # the node until its reaper TTL — the dispatch layer owns the timer.
         if self._sid is None:
             return None
+        if self._up_at is not None:
+            self._emit_sync_event(
+                "remote.run.summary", node_host=self._node.name or self._node.url,
+                sync_up_bytes=self._sync_up_bytes, sync_down_bytes=self._sync_down_bytes,
+                remote_wall_s=round(time.monotonic() - self._up_at, 3),
+                setup_s=round(self._setup_s or 0.0, 3))
+            self._up_at = None
         try:
             self._request("DELETE", f"/v1/sessions/{self._sid}")
         except RemoteUnavailableError:
@@ -1503,11 +1616,23 @@ def _factory(**kwargs: Any) -> RemoteWorkspace:
     """
     scoped_env = kwargs.pop("env", None)
     src = scoped_env if scoped_env is not None else os.environ
+    # remote-nodes-14 §3: --env <profile> (MO_NODE_ENV) binds the session to
+    # the profile's node, image (prepared on the node), resources and network.
+    profile = kwargs.pop("profile", None)
+    env_name = (src.get("MO_NODE_ENV") or "").strip()
+    if profile is None and env_name:
+        from mini_ork.remote.environments import load_profile
+
+        profile = load_profile(env_name, env=src)
     node = kwargs.pop("node", None)
     if node is None:
         from mini_ork.remote.nodes import select_node
 
-        node = select_node(env=src)
+        node_src = src
+        if profile is not None and getattr(profile, "node", None):
+            node_src = {**src, "MO_NODE": profile.node}
+        node = select_node(env=node_src)
+    node_full = node
     if not isinstance(node, _NodeRef):
         # Accept a mini_ork.remote.nodes.Node by coercing its first 4 fields.
         node = _NodeRef(
@@ -1526,7 +1651,8 @@ def _factory(**kwargs: Any) -> RemoteWorkspace:
         or src.get("MINI_ORK_RUN_ID")
         or uuid.uuid4().hex[:12]
     )
-    image = kwargs.pop("image", None) or src.get("MO_SANDBOX_IMAGE")
+    image = (kwargs.pop("image", None) or (getattr(profile, "image", None) if profile else None)
+             or src.get("MO_SANDBOX_IMAGE"))
     if not image:
         raise RuntimeError(
             "remote workspace requires an image: pass image= or set "
@@ -1535,11 +1661,20 @@ def _factory(**kwargs: Any) -> RemoteWorkspace:
     drive_root = kwargs.pop("drive_root", None) or src.get("MO_SHARED_DRIVE_ROOT")
     if not drive_root:
         drive_root = os.getcwd()
+    if getattr(node_full, "token_env", ""):
+        # A registry node's token lives in ITS token_env (e.g. MO_NODE_TOKEN_
+        # STAGING_A), not the MO_NODE_TOKEN default the workspace would re-read.
+        kwargs.setdefault("token_env", node_full.token_env)
+    if src.get("MINI_ORK_RUN_DIR"):
+        kwargs.setdefault("run_dir", src.get("MINI_ORK_RUN_DIR"))
+    if src.get("MO_REMOTE_QUEUE_WAIT_S"):
+        kwargs.setdefault("queue_wait_s", float(src["MO_REMOTE_QUEUE_WAIT_S"]))
     return RemoteWorkspace(
         node=node,
         run_id=run_id,
         image=image,
         drive_root=drive_root,
+        profile=profile,
         **kwargs,
     )
 

@@ -53,6 +53,7 @@ from mini_ork.context import (  # noqa: F401 -- compatibility re-exports
     RunContext,
     apply_env_overrides,
     context_env,
+    context_env_snapshot,
     node_env_overrides,
     publish_env,
     run_context_scope,
@@ -926,6 +927,10 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
     # handler above (which closes too) AND a default second-SIGTERM exit; a
     # KeyboardInterrupt from a worker thread falls through here.
     try:
+        if not dry_run and run_id and context_env("MO_PLACEMENT", "").strip().lower() == "remote" \
+                and not _provision_remote_session(run_id, live_run_dir, db):
+            set_status(db, run_id, "failed")
+            return 1
         if speculative_requested:
             # The schema's historical wording promised first-winner replicas, but
             # this executor has no replica identity or loser cancellation. Running
@@ -992,6 +997,31 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
                     f"[warn] run-level close_run_session failed: {exc}",
                     file=sys.stderr,
                 )
+
+
+def _provision_remote_session(run_id: str, run_dir: str, db) -> bool:
+    """remote-nodes-14 §3: bring a ``--placement remote`` run's session up
+    BEFORE the first node, so a full node, a failed setup or a failed sync
+    surfaces before any LLM spend and the ``remote.setup.step`` checklist
+    precedes every ``node_start``. The dispatch path later reuses the same
+    registered session. False (after reporting why) fails the run
+    ``remote_unavailable``."""
+    from mini_ork.runtime.workspace_session import get_run_session
+
+    env = {**context_env_snapshot(), "MINI_ORK_RUN_ID": run_id, "MINI_ORK_RUN_DIR": run_dir}
+    try:
+        get_run_session(run_id, "remote", env=env)
+    except Exception as exc:  # noqa: BLE001 — any provisioning failure ends the run here
+        print(f"execute: remote_unavailable: {exc}", file=sys.stderr)
+        try:
+            from mini_ork.observability.node_events import mo_node_emit
+            mo_node_emit(run_id, "remote-workspace", "workspace", "remote.run.failed",
+                         json.dumps({"failure_class": "remote_unavailable",
+                                     "error": str(exc)[:500]}), db=db)
+        except Exception:  # noqa: BLE001 — the event is advisory
+            pass
+        return False
+    return True
 
 
 # ── post-run learning side-channels ──

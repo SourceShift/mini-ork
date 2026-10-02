@@ -255,16 +255,32 @@ def mo_node_start(
     model_lane: str = "",
     *,
     db: str | None = None,
+    placement: str = "",
+    node_host: str = "",
+    session_id: str = "",
 ) -> int:
     """Mirror lib/mo_node_events.sh::mo_node_start (lines 107-114).
 
     Builds `extra = {"model_lane": <lane>}` when non-empty; otherwise passes
     the default `'{}'`. Delegates to `mo_node_emit` with `event_type='node_start'`.
     ``db`` is keyword-only and wins over ``_resolve_db()`` when supplied.
+
+    remote-nodes-14 §4: ``placement`` / ``node_host`` / ``session_id`` are
+    optional extras that ride on the node_start payload so the run-events
+    feed (and the UI's DAG status panel) can render a placement chip without
+    a separate lookup. All keyword-only and empty-string-no-op so legacy
+    callers stay byte-identical.
     """
-    extra = _default_extra_json()
+    extras: dict[str, str] = {}
     if model_lane:
-        extra = json.dumps({"model_lane": model_lane})
+        extras["model_lane"] = model_lane
+    if placement:
+        extras["placement"] = placement
+    if node_host:
+        extras["node_host"] = node_host
+    if session_id:
+        extras["session_id"] = session_id
+    extra = json.dumps(extras) if extras else _default_extra_json()
     return mo_node_emit(run_id, node_id, node_type, "node_start", extra, db=db)
 
 

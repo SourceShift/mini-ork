@@ -50,6 +50,9 @@ class Node(NamedTuple):
     url: str
     token: str
     max_sessions: int = 1
+    # The NAME of the env var the token came from — the workspace re-reads it
+    # at call time and records it in the session marker for kill_run.
+    token_env: str = "MO_NODE_TOKEN"
 
 
 def _config_paths(env: Mapping[str, str]) -> tuple[Path, Path]:
@@ -164,4 +167,5 @@ def select_node(*, env: Mapping[str, str] | None = None) -> Node:
             "tokens are never stored in nodes.yaml"
         )
     max_sessions = int(entry.get("max_sessions") or 1)
-    return Node(name=chosen, url=url, token=token, max_sessions=max_sessions)
+    return Node(name=chosen, url=url, token=token, max_sessions=max_sessions,
+                token_env=token_env_name)

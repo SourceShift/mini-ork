@@ -303,6 +303,17 @@ def _to_environment(name: str, merged: dict) -> Environment:
     )
 
 
+def list_profiles(*, env: Mapping[str, str] | None = None) -> list[str]:
+    """Names of the environment profiles visible to this run (template + live
+    dirs; ``*.yaml.example`` files are not profiles)."""
+    src = os.environ if env is None else env
+    names: set[str] = set()
+    for d in _config_paths(src):
+        if d.is_dir():
+            names.update(p.stem for p in d.glob("*.yaml") if p.is_file())
+    return sorted(names)
+
+
 def load_profile(
     name: str,
     *,

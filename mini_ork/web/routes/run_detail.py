@@ -30,6 +30,7 @@ RUN_STALE_SECONDS = int(os.environ.get("MINI_ORK_RUN_STALE_SECONDS", "1800"))
 def get_task_run(
     task_run_id: str = PathParam(..., description="task_runs.id"),
     db: StateDB = Depends(get_db),
+    home=Depends(get_home),
 ) -> dict[str, Any]:
     repo = RunDetailRepository(db)
     tr = repo.fetch_task_run_row(task_run_id)
@@ -45,7 +46,56 @@ def get_task_run(
             last_ts = max(last_ts, int(last_event_ts))
         tr["last_activity_at"] = last_ts
         tr["stale"] = (time.time() - last_ts) > RUN_STALE_SECONDS
+    # remote-nodes-14 §4: surface the placement, environment and node_host so
+    # the UI can render a placement chip without a separate lookup. The
+    # run_profile is the same file the executor reads (single source of
+    # truth); the session marker is the same file kill_run tears down
+    # (single source of truth for "where the run actually ran"). Missing
+    # files are non-fatal — the field defaults preserve the prior shape.
+    placement, environment, node_host = _placement_overlay(home, task_run_id, db)
+    if placement:
+        tr["placement"] = placement
+    if environment:
+        tr["environment"] = environment
+    if node_host:
+        tr["node_host"] = node_host
     return tr
+
+
+def _placement_overlay(home, task_run_id: str, db: StateDB) -> tuple[str, str, str]:
+    """``(placement, environment, node_host)`` for the run detail payload
+    (remote-nodes-14 §4). Placement + environment come from ``run_profile.json``;
+    the node host from the live session marker, or — once the run has torn its
+    session down and the marker is gone — from its ``remote.run.summary``
+    event. Empty strings on a default run, so the payload keeps its shape."""
+    from mini_ork.runtime.workspace_session import session_marker_path
+
+    placement = environment = node_host = ""
+    run_dir = Path(home) / "runs" / task_run_id
+    try:
+        data = json.loads((run_dir / "run_profile.json").read_text(encoding="utf-8") or "{}")
+        if isinstance(data, dict):
+            placement = str(data.get("placement") or "").strip()
+            environment = str(data.get("environment") or "").strip()
+    except (OSError, ValueError):
+        pass
+    if placement != "remote":
+        return placement, environment, ""
+    try:
+        data = json.loads(session_marker_path(run_dir).read_text(encoding="utf-8") or "{}")
+        locator = data.get("node") if isinstance(data, dict) else None
+        if isinstance(locator, dict):
+            node_host = str(locator.get("name") or locator.get("url") or "")
+    except (OSError, ValueError):
+        pass
+    if not node_host:
+        row = db.row("SELECT payload_json FROM run_events WHERE run_id = ? AND event_type = "
+                     "'remote.run.summary' ORDER BY created_at DESC LIMIT 1", (task_run_id,))
+        try:
+            node_host = str(json.loads((row or {}).get("payload_json") or "{}").get("node_host") or "")
+        except (ValueError, AttributeError):
+            pass
+    return placement, environment, node_host
 
 
 @router.get("/{task_run_id}/agents")

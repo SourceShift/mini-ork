@@ -152,6 +152,15 @@ def create_app(
             raise HTTPException(500, str(exc)) from exc
         return sess.to_dict()
 
+    @app.get("/v1/sessions/{run_id}")
+    def get_session(run_id: str, _: None = Depends(bearer)) -> dict:
+        # The client's capacity gate asks "does my run already hold a session
+        # here?" so a control-plane restart never queues behind itself.
+        sess = sessions.by_run(run_id) or sessions.get(run_id)
+        if sess is None:
+            raise HTTPException(404, f"no session for {run_id!r}")
+        return sess.to_dict()
+
     @app.delete("/v1/sessions/{sid}")
     def delete_session(sid: str, _: None = Depends(bearer)) -> dict:
         # Every other session route is addressed by run_id; accept it here too.

@@ -341,6 +341,15 @@ class ImageCache:
 # ----- router ---------------------------------------------------------------
 
 
+def _native_platform() -> str:
+    """The node's own docker platform — the default for a prepare that names
+    none (a hard-coded linux/amd64 meant qemu emulation on an arm64 node)."""
+    import platform as _platform
+
+    machine = _platform.machine().lower()
+    return "linux/arm64" if machine in ("arm64", "aarch64") else "linux/amd64"
+
+
 def _emit_setup_event(run_id: str, fields: dict) -> None:
     """Best-effort emit of a ``remote.setup.step`` event.
 
@@ -401,7 +410,7 @@ def make_router(
         setup = payload.get("setup") or ""
         if not isinstance(setup, str):
             raise HTTPException(400, "setup must be a string")
-        platform = payload.get("platform") or "linux/amd64"
+        platform = payload.get("platform") or _native_platform()
         if not isinstance(platform, str):
             raise HTTPException(400, "platform must be a string")
         timeout_s = payload.get("timeout_s")

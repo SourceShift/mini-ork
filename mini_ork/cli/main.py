@@ -400,6 +400,14 @@ def gen_profile(kickoff_path, root, recipe, task_class, profile_path, agents_pat
         "confidence": round(confidence, 2),
         "profile_status": status,
     }
+    # remote-nodes-14 §1: the run's resolved placement + environment, so the
+    # API/UI can badge a remote run. Absent on a default run (unchanged profile).
+    placement = context_env("MO_PLACEMENT", "").strip()
+    node_env = context_env("MO_NODE_ENV", "").strip()
+    if placement:
+        data["placement"] = placement
+    if node_env:
+        data["environment"] = node_env
     profile.parent.mkdir(parents=True, exist_ok=True)
     profile.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return data
@@ -517,8 +525,10 @@ def _budget_preflight(sink) -> int | None:
 
 def _run_lifecycle_impl(argv, root, sink) -> int:
     t0 = int(time.time())
-    # ── flag pre-parse: pull --deadline out ──
+    # ── flag pre-parse: pull --deadline / --placement / --env out ──
     deadline = ""
+    placement = ""
+    node_env = ""
     rest = []
     i = 0
     while i < len(argv):
@@ -535,8 +545,55 @@ def _run_lifecycle_impl(argv, root, sink) -> int:
             if not v.isdigit():
                 sys.stderr.write(f"--deadline: seconds must be a positive integer (got '{v}')\n"); return 2
             deadline = v; i += 1
+        elif a == "--placement":
+            if i + 1 >= len(argv):
+                sys.stderr.write("--placement requires local|remote\n"); return 2
+            v = argv[i + 1]
+            if v not in ("local", "remote"):
+                sys.stderr.write(f"--placement: expected local|remote (got '{v}')\n"); return 2
+            placement = v; i += 2
+        elif a.startswith("--placement="):
+            v = a.split("=", 1)[1]
+            if v not in ("local", "remote"):
+                sys.stderr.write(f"--placement: expected local|remote (got '{v}')\n"); return 2
+            placement = v; i += 1
+        elif a == "--env":
+            if i + 1 >= len(argv):
+                sys.stderr.write("--env requires <name>\n"); return 2
+            node_env = argv[i + 1]; i += 2
+        elif a.startswith("--env="):
+            node_env = a.split("=", 1)[1]; i += 1
         else:
             rest.append(a); i += 1
+
+    # remote-nodes-14 §1: the flag wins over MO_PLACEMENT / MO_NODE_ENV; the
+    # resolved values are published so dispatch, the session factory and
+    # gen_profile all read one answer. Unset → nothing published → today's run.
+    placement = placement or context_env("MO_PLACEMENT", "").strip()
+    node_env = node_env or context_env("MO_NODE_ENV", "").strip()
+    if placement not in ("", "local", "remote"):
+        sys.stderr.write(f"MO_PLACEMENT: expected local|remote (got '{placement}')\n"); return 2
+    if placement == "remote":
+        from mini_ork.remote.environments import list_profiles, load_profile
+        env_now = context_env_snapshot()
+        problem = ""
+        if not node_env:
+            problem = "--placement remote requires --env <name> (or MO_NODE_ENV)"
+        else:
+            try:
+                load_profile(node_env, env=env_now)
+            except FileNotFoundError:
+                problem = f"--env: environment profile '{node_env}' not found"
+            except ValueError as exc:   # schema violation or a secret-looking env key
+                problem = f"--env: environment profile '{node_env}' is invalid: {exc}"
+        if problem:
+            names = list_profiles(env=env_now)
+            avail = ", ".join(names) if names else (
+                "none (add config/environments/<name>.yaml; see default.yaml.example)")
+            sys.stderr.write(f"{problem}. Available profiles: {avail}\n")
+            return 2
+    if placement or node_env:
+        publish_env({k: v for k, v in (("MO_PLACEMENT", placement), ("MO_NODE_ENV", node_env)) if v})
 
     if not rest:
         sys.stderr.write("recipe name or kickoff.md path required\n"); return 2

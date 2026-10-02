@@ -1101,24 +1101,90 @@ def cwd_guard(
     )
 
 
-def _select_workspace(requested: str, env: Mapping[str, str]) -> str:
-    """Resolve the isolation selector for a dispatch (SE-3 SC3).
+# Lane kinds that are tool-less HTTP (no target-tree access). Under
+# placement=remote they stay local — shipping a remote run for a pure-API
+# lane would burn a session slot without any tree-bound work. Sourced from
+# the same literal the registry uses to declare them
+# (``required_secret_envs`` / ``lane_health``).
+_LOCAL_ONLY_LANE_KINDS = frozenset({"openai-chat", "uhp"})
+
+
+def _placement_is_remote(env: Mapping[str, str]) -> bool:
+    """True when the run asked for ``--placement remote`` (``MO_PLACEMENT``).
+
+    Deliberately narrower than ``runtime.contract._placement_is_remote``: the
+    legacy ``MO_SANDBOX_SCOPE=agent + MO_SANDBOX_BACKEND=remote`` dual already
+    routes every spawn remote through the scope rule, and applying the D5
+    local-only exceptions to it would change a configuration that exists
+    today — placement unset must stay byte-identical."""
+    return (env.get("MO_PLACEMENT") or "").strip().lower() == "remote"
+
+
+def _lane_kind(model: str, root: str | os.PathLike[str] | None = None) -> str:
+    """The ``kind:`` a lane declares in ``providers.yaml`` (``""`` if unknown).
+
+    ``ProviderSpec.kind`` is only populated for ``uhp``; the registry entry is
+    the one place every lane's transport kind is declared."""
+    try:
+        entry = _load_providers_registry(root).get(model)
+    except Exception:  # noqa: BLE001 — placement must never break a dispatch
+        return ""
+    if isinstance(entry, Mapping):
+        return str(entry.get("kind") or "").strip()
+    return ""
+
+
+def _classify_lane_for_placement(lane_kind: str, env: Mapping[str, str]) -> str:
+    """Where a dispatch should run under the run's placement (D5).
+
+    Returns ``"host"`` (defer to the legacy scope/backend rule), ``"local"``
+    (placement is remote but this lane must stay on the laptop) or
+    ``"remote"``. Outside ``placement=remote`` it is always ``"host"``.
+
+    Stays local under remote: tool-less HTTP lane kinds (``openai-chat``,
+    ``uhp`` — no tree access, a session slot buys nothing) and the roles listed
+    in ``MO_PLACEMENT_LOCAL_ROLES`` (matched against ``MO_NODE_ROLE``, the node
+    type ``dispatch_node`` publishes per node — not ``MO_NODE_TYPE``, whose
+    publication would also flip the type-aware tool-grant defaults). The role
+    opt-out is a trade-off: a planner on an ``anthropic-compat`` lane then
+    reads the LOCAL tree.
+    """
+    if not _placement_is_remote(env):
+        return "host"
+    if lane_kind in _LOCAL_ONLY_LANE_KINDS:
+        return "local"
+    local_roles = {r.strip() for r in (env.get("MO_PLACEMENT_LOCAL_ROLES") or "").split(",")
+                   if r.strip()}
+    if local_roles and (env.get("MO_NODE_ROLE") or "").strip() in local_roles:
+        return "local"
+    return "remote"
+
+
+def _select_workspace(requested: str, env: Mapping[str, str], *, lane_kind: str = "") -> str:
+    """Resolve the isolation selector for a dispatch (SE-3 SC3 + remote-nodes-14).
 
     Precedence:
       1. an explicit non-``"host"`` ``requested`` (a programmatic caller that
          already chose a backend) wins outright;
-      2. else ``MO_SANDBOX_SCOPE=agent`` routes the harness CLI into the
+      2. ``placement=remote`` (``MO_PLACEMENT``) → ``"remote"``, except a
+         local-only ``lane_kind`` (``openai-chat``, ``uhp``) or a role in
+         ``MO_PLACEMENT_LOCAL_ROLES``, which stay ``"host"``;
+      3. else ``MO_SANDBOX_SCOPE=agent`` routes the harness CLI into the
          configured ``MO_SANDBOX_BACKEND``;
-      3. else ``"host"`` — scope=tool/unset, or scope=agent with no backend
+      4. else ``"host"`` — scope=tool/unset, or scope=agent with no backend
          configured (nothing to isolate into → stay on the host, no surprise).
 
-    ``core.dispatch`` reads the result to pick ``spawn_local`` (host) vs a
-    ``Workspace.spawn`` backend. Extracted as a pure function so the precedence
-    is unit-testable without the full dispatch machinery."""
+    ``lane_kind`` comes from the lane's ``providers.yaml`` entry
+    (:func:`_lane_kind`). With placement unset the result is exactly the
+    pre-placement rule. Pure function so the precedence is unit-testable
+    without the full dispatch machinery."""
     from ..runtime.agent_workspace import sandbox_backend, sandbox_scope
 
     if requested != "host":
         return requested
+    placement = _classify_lane_for_placement(lane_kind, env)
+    if placement != "host":
+        return "remote" if placement == "remote" else "host"
     if sandbox_scope(env) == "agent":
         return sandbox_backend(env) or "host"
     return "host"
@@ -1198,7 +1264,8 @@ def dispatch_model(
     # Isolation (D4): pick the workspace and attach the run's path map BEFORE
     # the command is built — the sandbox MCP config and the portable transport
     # argv both key off ``request.path_map``.
-    request = _attach_isolation(request, {**effective_env, **request.env})
+    lane_kind = _lane_kind(request.model, root)
+    request = _attach_isolation(request, {**effective_env, **request.env}, lane_kind=lane_kind)
     command = engine.build_command(spec.command, request=request, env=effective_env)
     command = _portable_transport_command(command, request=request, env=effective_env)
     if command != spec.command:
@@ -1221,7 +1288,7 @@ def dispatch_model(
         max_turns=request.max_turns,
         env=merged_env,
         cwd=target_cwd,
-        workspace=_select_workspace(request.workspace, merged_env),
+        workspace=_select_workspace(request.workspace, merged_env, lane_kind=lane_kind),
         path_map=getattr(request, "path_map", None),
     )
     # Per-model dispatch backend registry (OCP): a model with a bespoke transport
@@ -1675,11 +1742,12 @@ def _run_path_map(env: Mapping[str, str]) -> "object | None":
     return PathMap.from_roots(roots) if roots is not None else None
 
 
-def _attach_isolation(request: DispatchRequest, env: Mapping[str, str]) -> DispatchRequest:
+def _attach_isolation(request: DispatchRequest, env: Mapping[str, str], *,
+                      lane_kind: str = "") -> DispatchRequest:
     """Resolve the request's workspace and, when it is isolated, attach the
     run's path map. Host dispatches come back unchanged (byte parity), and an
     explicit caller-supplied ``path_map`` is never replaced."""
-    workspace = _select_workspace(request.workspace, env)
+    workspace = _select_workspace(request.workspace, env, lane_kind=lane_kind)
     if workspace == "host" or getattr(request, "path_map", None) is not None:
         return request
     extra_env: dict[str, str] = {}

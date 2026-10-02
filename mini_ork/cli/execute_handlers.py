@@ -80,6 +80,52 @@ _synth_artifact_name = _execute_delegate("_synth_artifact_name")
 _verifier_runs_before_implementer = _execute_delegate("_verifier_runs_before_implementer")
 _watchdog_stale_heartbeat = _execute_delegate("_watchdog_stale_heartbeat")
 _write_implementer_summary = _execute_delegate("_write_implementer_summary")
+
+
+# D5: node types that never leave the control plane under --placement remote
+# (in-process logic, and the local-tree steps that run after sync-down).
+_LOCAL_PLACEMENT_NODE_TYPES = frozenset(
+    {"classify", "transform", "eval", "publisher", "rollback", "baseline", "harvest"})
+
+
+def _node_placement(node_type: str, lane: str, run_dir: str) -> tuple[str, str, str]:
+    """``(placement, node_host, session_id)`` for a node's ``node_start`` event.
+
+    remote-nodes-14 §4. ``placement`` is where THIS node's work runs under the
+    run's placement (D5), decided by the same rule the dispatch path uses
+    (:func:`providers._classify_lane_for_placement`), so the event agrees with
+    the spawn. Empty when ``MO_PLACEMENT`` is unset — the default payload stays
+    byte-identical. ``node_host``/``session_id`` come from the run's session
+    marker (written at run-start provisioning) and are set only for remote.
+    """
+    from mini_ork.context import context_env
+    from mini_ork.dispatch.providers import _classify_lane_for_placement, _lane_kind
+
+    run_placement = context_env("MO_PLACEMENT", "").strip().lower()
+    if not run_placement:
+        return "", "", ""
+    if run_placement != "remote" or node_type in _LOCAL_PLACEMENT_NODE_TYPES:
+        return "local", "", ""
+    if node_type != "verifier":   # verifier checks always run on the node (epic 11)
+        env = {"MO_PLACEMENT": "remote", "MO_NODE_ROLE": node_type,
+               "MO_PLACEMENT_LOCAL_ROLES": context_env("MO_PLACEMENT_LOCAL_ROLES", "")}
+        from mini_ork.dispatch.llm_dispatch import resolve_lane_family
+        model = resolve_lane_family(lane) if lane else ""   # alias -> providers.yaml key
+        if _classify_lane_for_placement(_lane_kind(model) if model else "", env) != "remote":
+            return "local", "", ""
+    node_host = session_id = ""
+    try:
+        from mini_ork.runtime.workspace_session import session_marker_path
+        data = json.loads(session_marker_path(run_dir).read_text(encoding="utf-8") or "{}")
+        if isinstance(data, dict):
+            session_id = str(data.get("session_id") or "")
+            locator = data.get("node") if isinstance(data.get("node"), dict) else {}
+            node_host = str(locator.get("name") or locator.get("url") or "")
+    except (OSError, ValueError):
+        pass
+    return "remote", node_host, session_id
+
+
 _write_self_migrate_implementer_summary = _execute_delegate(
     "_write_self_migrate_implementer_summary"
 )
@@ -389,7 +435,8 @@ def dispatch_node(fields, *, root, run_dir, plan_path, task_class, db, run_id,
     publish_env(node_env_overrides(
         node_id=node_id, run_dir=run_dir_eff, resume_session_id=None,
         attempt=str(_node_attempt_no(db, run_id, node_id)),
-        input_hash=hashlib.sha256(f"{run_id}|{node_id}|{recipe}".encode()).hexdigest()))
+        input_hash=hashlib.sha256(f"{run_id}|{node_id}|{recipe}".encode()).hexdigest(),
+        node_role=node_type))
 
     # (E4 turn-resume) During an active recovery, restore this node's persisted
     # transcript and export MO_RESUME_SESSION_ID so a claude lane continues the
@@ -432,8 +479,11 @@ def dispatch_node(fields, *, root, run_dir, plan_path, task_class, db, run_id,
         return 0, "done"
     # Emit node_start immediately before the handler runs, reusing the already
     # resolved ``lane`` (never re-resolve), and record the start time so the
-    # matching node_end can carry a duration.
-    mo_node_start(run_id, node_id, node_type, model_lane=lane, db=db)
+    # matching node_end can carry a duration. remote-nodes-14 §4: under a
+    # placement the payload also says where the node runs.
+    placement, node_host, session_id = _node_placement(node_type, lane, run_dir_eff)
+    mo_node_start(run_id, node_id, node_type, model_lane=lane, db=db,
+                  placement=placement, node_host=node_host, session_id=session_id)
     node_start_ms[node_id] = _now_ms()
     rc, finish_reason = handler(ctx)
     # Handlers that never call trace() (verifier/publisher/rollback/eval) must
