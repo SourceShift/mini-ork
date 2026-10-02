@@ -65,6 +65,12 @@ class ProcSpec:
     # Values the client sent for this proc (lane secrets, the run contract).
     # In memory only: persistence records the KEYS (D6), never these values.
     env: dict[str, str] = field(default_factory=dict)
+    # remote-nodes-10: client-supplied idempotency dedup key. A re-dispatch
+    # of the same (run_id, node_id, attempt, input_hash) returns the
+    # existing proc — even when it has already exited — instead of
+    # spawning a second child. Persisted in <pid>.json so a node-agent
+    # restart still resolves a re-dispatch to the prior proc.
+    idempotency_key: str = ""
 
 
 @dataclass
@@ -176,6 +182,10 @@ class ProcRegistry:
         self._run = _run_fn or _run
         self._spawn = _spawn_fn or _default_spawn
         self._procs: dict[int, _ProcState] = {}
+        # remote-nodes-10: secondary index keyed by ``ProcSpec.idempotency_key``
+        # so the dedup path is O(1) on re-dispatch. Populated by
+        # ``_rebuild_from_disk`` and ``spawn``.
+        self._procs_by_key: dict[str, _ProcState] = {}
         self._lock = threading.Lock()
         self._pid_seq = self._scan_pids_on_disk()
         self._rebuild_from_disk()
@@ -218,6 +228,7 @@ class ProcRegistry:
                 cwd=data.get("cwd"),
                 stdin=data.get("stdin", ""),
                 timeout_s=data.get("timeout_s"),
+                idempotency_key=data.get("idempotency_key", ""),
             )
             ps = _ProcState(
                 pid=pid,
@@ -232,6 +243,8 @@ class ProcRegistry:
                 os_pid=os_pid,
             )
             self._procs[pid] = ps
+            if ps.spec.idempotency_key:
+                self._procs_by_key[ps.spec.idempotency_key] = ps
 
     def _pid_alive(self, pid: int) -> bool:
         try:
@@ -254,6 +267,7 @@ class ProcRegistry:
             "cwd": ps.spec.cwd,
             "stdin": ps.spec.stdin,
             "timeout_s": ps.spec.timeout_s,
+            "idempotency_key": ps.spec.idempotency_key,
             "state": ps.state,
             "rc": ps.rc,
             "started_at": ps.started_at,
@@ -270,6 +284,17 @@ class ProcRegistry:
     def _next_pid(self) -> int:
         self._pid_seq += 1
         return self._pid_seq
+
+    def find_by_idempotency_key(self, key: str) -> _ProcState | None:
+        """Return the proc registered under ``key``, or None if unseen.
+
+        Used by the dedup path: a re-dispatch of the same attempt (same
+        idempotency_key) re-attaches by construction rather than spawning
+        a second child. The lookup is O(1) and survives a node-agent
+        restart because the index is rebuilt from ``<pid>.json``."""
+        if not key:
+            return None
+        return self._procs_by_key.get(key)
 
     def _build_host_argv(self, spec: ProcSpec) -> list[str]:
         """Compose the argv that lands the child in the right process group."""
@@ -303,6 +328,16 @@ class ProcRegistry:
         return cwd
 
     def spawn(self, spec: ProcSpec) -> _ProcState:
+        # remote-nodes-10: idempotency dedup. A re-dispatch of the same
+        # attempt (same idempotency_key) returns the existing proc in ANY
+        # state — ``running`` (re-attach via stream), ``exited`` (harvest
+        # the output), ``detached`` (still alive, no live drain), etc.
+        # The caller is responsible for streaming from the persisted
+        # offsets; we do NOT re-spawn the child here.
+        if spec.idempotency_key:
+            existing = self._procs_by_key.get(spec.idempotency_key)
+            if existing is not None:
+                return existing
         pid = self._next_pid()
         ps = _ProcState(pid=pid, run_id=self.run_id, spec=spec)
         _, out_path, err_path = self._proc_files(pid)
@@ -319,12 +354,16 @@ class ProcRegistry:
             ps.rc = _RC_SPAWN_FAILED
             ps.ended_at = time.time()
             self._procs[pid] = ps
+            if spec.idempotency_key:
+                self._procs_by_key[spec.idempotency_key] = ps
             self._persist(ps)
             return ps
         ps.proc = proc
         ps.os_pid = getattr(proc, "pid", None)
         ps.state = "running"
         self._procs[pid] = ps
+        if spec.idempotency_key:
+            self._procs_by_key[spec.idempotency_key] = ps
         self._persist(ps)
         # Drain stdout/stderr in background threads, append to disk, and
         # watch for timeout + exit. On exit we mark ``exited`` (or

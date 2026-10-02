@@ -382,6 +382,27 @@ Per-call LLM telemetry for cost tracking and OTel export.
 
 ---
 
+## Remote Nodes
+
+### `remote_procs`
+Control-plane mirror of the node-agent's per-session proc registry (epic 10, kickoff `remote-nodes-10-disconnect-reattach-resume.md`). One row per (run, node, attempt); the `idempotency_key` UNIQUE index is the dedup handle the client uses so a re-dispatch of the same attempt re-attaches instead of spawning a second VM proc. `state` mirrors `ProcRegistry._persist` plus the new `detached` value the client emits when the stream is interrupted; offset columns are checkpointed at least every 5 s while streaming so the reconnect loop can resume from any byte offset. `recovery --strategy reattach` reads `state` + `out_offset`/`err_offset` to decide between "re-attach to the still-running proc", "harvest the exited proc's output", and "fall back to retry".
+
+| Column | Type | Notes |
+|---|---|---|
+| `run_id` / `node_id` / `attempt` | — | Composite PK; one row per (run, node, attempt). |
+| `node_host` | TEXT | `mini_ork.remote.nodes.Node.name` of the VM the proc is pinned to. |
+| `session_id` | TEXT | node-agent session id (or run_id fallback). |
+| `proc_id` | INTEGER | node-agent's per-session pid sequence. |
+| `idempotency_key` | TEXT UNIQUE | sha256 of `run_id\|node_id\|attempt\|input_hash`. |
+| `state` | TEXT | `starting`/`running`/`exited`/`killed`/`orphaned`/`spawn_failed`/`timeout`/`detached`. |
+| `rc` | INTEGER | Process exit code (NULL while in flight). |
+| `out_offset` / `err_offset` | INTEGER | Byte offset of last persisted chunk per stream. |
+| `started_at` / `ended_at` | INTEGER | Unix epoch seconds (`ended_at` NULL while in flight). |
+
+**Indexes:** UNIQUE `idx_remote_procs_idempotency(idempotency_key)` (dedup on re-dispatch); `idx_remote_procs_run_node(run_id, node_id)` (recovery probe — "is there an unconsumed row for the first-incomplete node?").
+
+---
+
 ## Tickets + Gauntlet
 
 ### `tickets`

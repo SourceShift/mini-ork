@@ -136,6 +136,8 @@ def node_env_overrides(
     dispatch_chain: str = "",
     target_cwd: str | None = None,
     resume_session_id: str | None = None,
+    attempt: str | None = None,
+    input_hash: str | None = None,
 ) -> dict[str, str | None]:
     """The per-node variables the executor publishes before dispatching a node.
 
@@ -155,6 +157,12 @@ def node_env_overrides(
         overrides[ENV_DISPATCH_CHAIN] = dispatch_chain
     if target_cwd is not None:
         overrides[ENV_TARGET_CWD] = target_cwd
+    # remote-nodes-10: the identity a remote proc is deduplicated by, so a
+    # recovery re-dispatch of the same attempt re-attaches instead of re-running.
+    if attempt is not None:
+        overrides["MO_NODE_ATTEMPT"] = attempt
+    if input_hash is not None:
+        overrides["MO_INPUT_HASH"] = input_hash
     return overrides
 
 

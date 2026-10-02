@@ -32,10 +32,12 @@ imports this module. Verified by ``test_remote_module_not_imported_when_backend_
 """
 from __future__ import annotations
 
+import http.client
 import io
 import json
 import os
 import random
+import sqlite3
 import tarfile
 import tempfile
 import threading
@@ -76,6 +78,35 @@ _PID_JOURNAL_LOCK_NAME = ".remote-pids.lock"
 _REMOTE_KILL_GRACE_ENV = "MO_REMOTE_KILL_GRACE_S"
 _DEFAULT_KILL_GRACE_S = 30.0
 
+# remote-nodes-10: reconnect window for the drain loop (kickoff §3).
+# Default 21600 s = 6 h, long enough for a laptop sleep. The window is
+# distinct from ``MO_REMOTE_KILL_GRACE_S``: the grace period is what the
+# client tolerates past ``timeout_s`` while the node-agent enforces its
+# own kill; the reconnect window is what the client tolerates with the
+# node-agent transport gone (laptop sleep, VM up, agent down).
+_REMOTE_RECONNECT_MAX_ENV = "MO_REMOTE_RECONNECT_MAX_S"
+_DEFAULT_RECONNECT_MAX_S = 21600
+
+# remote-nodes-10: capped jittered-exponential backoff for reconnect
+# attempts. ``base * 2**attempt`` clamped to ``_RECONNECT_BACKOFF_CAP_S``
+# (30 s) so a 6 h reconnect window makes on the order of log2(21600/0.5)
+# ≈ 15 probes before giving up.
+_RECONNECT_BACKOFF_BASE_S = 0.2
+_RECONNECT_BACKOFF_CAP_S = 30.0
+
+# remote-nodes-10: cadence for the offset-checkpoint write to the
+# control-plane ``remote_procs`` table (kickoff §3).
+_REMOTE_OFFSET_CHECKPOINT_S = 5.0
+
+# remote-nodes-10: per-spawn sandbox env so the child claude CLI keeps its
+# transcript on the run volume. ``/workspace/home/.claude`` is the
+# node-agent's session-home mount; passing ``CLAUDE_CONFIG_DIR`` into the
+# dispatch env (kickoff §5) makes the persisted transcript survive a
+# laptop sleep — the dispatch env the agent reads becomes the run
+# volume's home, not the node-agent's ephemeral ``~/.claude``.
+_CLAUDE_CONFIG_DIR_KEY = "CLAUDE_CONFIG_DIR"
+_CLAUDE_CONFIG_DIR_VALUE = "/workspace/home/.claude"
+
 
 def _env_int_mb(name: str, default_mb: int) -> int:
     """Read ``name`` (megabytes) from env; clamp invalid to ``default_mb``.
@@ -103,6 +134,158 @@ class RemoteUnavailableError(RuntimeError):
     (kickoff §1). It is NEVER caught and converted to a host fallback —
     that is the entire point of the type.
     """
+
+
+class _RemoteProcJournal:
+    """Lazy control-plane mirror of the node-agent proc state (epic 10, §2).
+
+    The ``remote_procs`` table is the durable state ``mini-ork recover
+    --strategy reattach`` reads to decide between re-attaching to a
+    still-running VM proc, harvesting an exited one, and falling back to
+    ``retry``. Writes happen at three points:
+
+      * ``upsert_start`` on the post-spawn POST → initial row + state.
+      * ``upsert_offsets`` every 5 s while streaming (the reconnect loop
+        checkpoints out_offset / err_offset so a hard restart still has a
+        useful resume point).
+      * ``upsert_end`` on terminal state (exited / timeout / spawn_failed /
+        detached).
+
+    The DB path follows the standard ``MINI_ORK_DB`` → ``$HOME/state.db``
+    precedence; a missing DB is a no-op (ad-hoc dispatch path) so the
+    journal never blocks a live spawn.
+    """
+
+    def __init__(self, run_dir: str | None = None, *, db_path: str | None = None) -> None:
+        self._db_path = (
+            db_path
+            or os.environ.get("MINI_ORK_DB", "").strip()
+            or _default_state_db_path(run_dir)
+        )
+
+    def _connect(self) -> sqlite3.Connection | None:
+        if not self._db_path:
+            return None
+        try:
+            con = sqlite3.connect(self._db_path, timeout=5.0)
+            con.execute("PRAGMA busy_timeout=5000")
+            return con
+        except sqlite3.Error:
+            return None
+
+    def upsert_start(self, *, run_id: str, idempotency_key: str, node_id: str,
+                     attempt: int, node_host: str, session_id: str, proc_id: int,
+                     state: str, started_at: int) -> None:
+        """INSERT OR REPLACE the row keyed by ``idempotency_key``."""
+        con = self._connect()
+        if con is None:
+            return
+        try:
+            con.execute(
+                "INSERT OR REPLACE INTO remote_procs"
+                " (run_id, node_id, attempt, node_host, session_id, proc_id,"
+                "  idempotency_key, state, rc, out_offset, err_offset,"
+                "  started_at, ended_at)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (run_id, node_id, attempt, node_host, session_id,
+                 proc_id, idempotency_key, state, None, 0, 0,
+                 started_at, None),
+            )
+            con.commit()
+        except sqlite3.Error:
+            pass  # journal is best-effort
+        finally:
+            try:
+                con.close()
+            except sqlite3.Error:
+                pass
+
+    def upsert_offsets(self, idempotency_key: str, out_offset: int,
+                       err_offset: int) -> None:
+        """Update the byte-offset checkpoint for an in-flight proc."""
+        con = self._connect()
+        if con is None:
+            return
+        try:
+            con.execute(
+                "UPDATE remote_procs SET out_offset=?, err_offset=?"
+                " WHERE idempotency_key=?",
+                (int(out_offset), int(err_offset), idempotency_key),
+            )
+            con.commit()
+        except sqlite3.Error:
+            pass
+        finally:
+            try:
+                con.close()
+            except sqlite3.Error:
+                pass
+
+    def upsert_end(self, *, idempotency_key: str, state: str, rc: int | None,
+                   ended_at: int) -> None:
+        """Stamp the terminal state + rc + ended_at for a finished proc."""
+        con = self._connect()
+        if con is None:
+            return
+        try:
+            con.execute(
+                "UPDATE remote_procs SET state=?, rc=?, ended_at=?"
+                " WHERE idempotency_key=?",
+                (state, rc, ended_at, idempotency_key),
+            )
+            con.commit()
+        except sqlite3.Error:
+            pass
+        finally:
+            try:
+                con.close()
+            except sqlite3.Error:
+                pass
+
+    @staticmethod
+    def find_running(db_path: str, run_id: str, node_id: str) -> dict | None:
+        """Return the most-recent unconsumed row for (run_id, node_id) or None.
+
+        Used by ``mini_ork recover --strategy reattach`` to probe whether
+        the proc is still alive on the VM. Pure read; no writes."""
+        if not db_path or not os.path.isfile(db_path):
+            return None
+        try:
+            con = sqlite3.connect(db_path, timeout=5.0)
+            con.execute("PRAGMA busy_timeout=5000")
+            try:
+                row = con.execute(
+                    "SELECT node_id, attempt, node_host, session_id, proc_id,"
+                    " idempotency_key, state, rc, out_offset, err_offset,"
+                    " started_at, ended_at"
+                    " FROM remote_procs"
+                    " WHERE run_id=? AND node_id=?"
+                    " ORDER BY attempt DESC LIMIT 1",
+                    (run_id, node_id),
+                ).fetchone()
+            finally:
+                con.close()
+        except sqlite3.Error:
+            return None
+        if row is None:
+            return None
+        return {
+            "node_id": row[0], "attempt": row[1], "node_host": row[2],
+            "session_id": row[3], "proc_id": row[4], "idempotency_key": row[5],
+            "state": row[6], "rc": row[7], "out_offset": row[8],
+            "err_offset": row[9], "started_at": row[10], "ended_at": row[11],
+        }
+
+
+def _default_state_db_path(run_dir: str | None) -> str:
+    """Resolve the standard ``state.db`` path under ``$MINI_ORK_HOME``."""
+    home = os.environ.get("MINI_ORK_HOME", "").strip()
+    if not home and run_dir:
+        # The run dir is ``<home>/runs/<run_id>``; climb two to get home.
+        home = str(Path(run_dir).parent.parent)
+    if not home:
+        return ""
+    return os.path.join(home, "state.db")
 
 
 class _NodeRef(NamedTuple):
@@ -204,6 +387,27 @@ class RemoteWorkspace:
         self._pid_journal_lock = threading.Lock()
 
     # ------------------------------------------------------------------ helpers
+
+    def _idempotency_key(self, env: Mapping[str, str]) -> str:
+        """Compute the dedup key the node-agent uses to re-attach by construction.
+
+        ``sha256(run_id|node_id|attempt|input_hash)`` mirrors the durable-DAG
+        input hash (``mini_ork/stores/checkpoints.py``) so a re-dispatch of
+        the same attempt — same argv, same upstream inputs — resolves to the
+        existing proc instead of paying for a second VM spawn. The two env
+        contracts (``MO_NODE_ATTEMPT``, ``MO_INPUT_HASH``) are populated by
+        the dispatch layer; when absent, the key is empty and the node-agent
+        falls back to its legacy pid-sequenced spawn (no behavior change).
+        """
+        node_id = (env.get("MO_NODE_ID", "") if isinstance(env, Mapping) else "").strip()
+        attempt = (env.get("MO_NODE_ATTEMPT", "") if isinstance(env, Mapping) else "").strip()
+        input_hash = (env.get("MO_INPUT_HASH", "") if isinstance(env, Mapping) else "").strip()
+        if not node_id or not attempt or not input_hash:
+            return ""
+        import hashlib as _hashlib
+        return _hashlib.sha256(
+            f"{self._run_id}|{node_id}|{attempt}|{input_hash}".encode()
+        ).hexdigest()
 
     def _token(self) -> str:
         """Read the bearer token at call time (never at import)."""
@@ -587,10 +791,27 @@ class RemoteWorkspace:
         live_path = live_file_path or _resolve_live_file_path()
         live = LiveWriter(live_path) if live_path else None
         node_id = (env.get("MO_NODE_ID", "") if isinstance(env, Mapping) else "").strip()
+        # remote-nodes-10: idempotency dedup + transcript persistence. The
+        # dispatch layer sets MO_NODE_ATTEMPT + MO_INPUT_HASH from the
+        # durable-DAG checkpoint; together with MO_NODE_ID they identify
+        # the (run, node, attempt, inputs) tuple. The node-agent keys on
+        # the same hash so a re-dispatch re-attaches to the existing proc.
+        idem_key = self._idempotency_key(env)
+        # remote-nodes-10: pin the child's claude config dir to the run
+        # volume so the transcript persists across laptop sleep. Inherits
+        # any caller-provided value (test override) before applying the
+        # default; the env-keys set is unioned so the node-agent persists
+        # the new key.
+        spawn_env = dict(env)
+        if self._run_dir and not spawn_env.get(_CLAUDE_CONFIG_DIR_KEY):
+            spawn_env[_CLAUDE_CONFIG_DIR_KEY] = _CLAUDE_CONFIG_DIR_VALUE
+        env_keys = sorted(set(env.keys()) | set(spawn_env.keys()))
         self._emit_proc_event("remote.proc.start", node=node_id, proc_id="pending",
                               node_host=self._node.name)
         start_ms = int(time.time() * 1000)
         rc = _SPAWN_FAILED_RC
+        journal = _RemoteProcJournal(self._run_dir) if idem_key else None \
+            # only journal when we have a stable identity
         try:
             # Pre: tree sync-up (epic 07) + run-dir push (epic 08). Only the sync
             # steps hold the session lock, so parallel spawns on one session still
@@ -601,29 +822,65 @@ class RemoteWorkspace:
             try:
                 # 1) POST .../procs — stdin goes once in the body; env values ride
                 # the request (never argv) and the node-agent persists keys only.
+                payload = {
+                    "argv": argv_list,
+                    "cwd": cwd or self._mount_path,
+                    "env": spawn_env,
+                    "env_keys": env_keys,
+                    "stdin": stdin,
+                    "timeout_s": timeout,
+                }
+                if idem_key:
+                    payload["idempotency_key"] = idem_key
                 proc = self._json(
                     "POST",
                     f"/v1/sessions/{self._run_id}/procs",
-                    {
-                        "argv": argv_list,
-                        "cwd": cwd or self._mount_path,
-                        "env": dict(env),
-                        "env_keys": sorted(env.keys()),
-                        "stdin": stdin,
-                        "timeout_s": timeout,
-                    },
+                    payload,
                 )
                 pid = int(proc["pid"])
                 # The pid journal lets kill_run fan a kill out per pid (the
                 # node-agent has no list-procs endpoint).
                 self._record_pid(pid, node_id=node_id, argv0=argv_list[0] if argv_list else "")
+                # remote-nodes-10: write the initial remote_procs row so the
+                # control plane knows the proc is alive (recovery uses this
+                # to default to strategy=reattach).
+                if journal is not None and idem_key:
+                    attempt_str = (env.get("MO_NODE_ATTEMPT", "") if isinstance(env, Mapping) else "").strip() or "1"
+                    try:
+                        attempt_int = int(attempt_str)
+                    except ValueError:
+                        attempt_int = 1
+                    journal.upsert_start(
+                        run_id=self._run_id,
+                        idempotency_key=idem_key,
+                        node_id=node_id,
+                        attempt=attempt_int,
+                        node_host=self._node.name,
+                        session_id=self._sid or self._run_id,
+                        proc_id=pid,
+                        state=str(proc.get("state", "running")),
+                        started_at=int(time.time()),
+                    )
                 # 2) Drain the JSON-lines stream (out/err kept separate), teeing live.
-                rc, out, err = self._drain_stream(pid, timeout, live_writer=live)
+                # The reconnect loop is bounded by ``MO_REMOTE_RECONNECT_MAX_S``
+                # (default 6 h) so a laptop sleep does not surface as a failed
+                # node — the client re-attaches from the persisted byte offsets.
+                rc, out, err = self._drain_stream(
+                    pid, timeout, live_writer=live, journal=journal,
+                    idempotency_key=idem_key, node_id=node_id,
+                )
                 # Post: the agent's tree edits come back as uncommitted changes.
                 with self._sync_lock:
                     self._sync_down()
             finally:
                 self.mirror_pull()   # the run dir comes back even on a sync conflict
+                if journal is not None and idem_key:
+                    journal.upsert_end(
+                        idempotency_key=idem_key,
+                        state=self._state_for_rc(rc),
+                        rc=rc,
+                        ended_at=int(time.time()),
+                    )
             return rc, out, err
         finally:
             self._emit_proc_event("remote.proc.exit", node=node_id, rc=rc,
@@ -631,12 +888,24 @@ class RemoteWorkspace:
             if live is not None:
                 live.close()
 
+    @staticmethod
+    def _state_for_rc(rc: int) -> str:
+        """Map a return code to a ``remote_procs`` state string."""
+        if rc == _TIMEOUT_RC:
+            return "timeout"
+        if rc == _SPAWN_FAILED_RC:
+            return "spawn_failed"
+        return "exited"
+
     def _drain_stream(
         self,
         pid: int,
         timeout: float,
         *,
         live_writer: LiveWriter | None = None,
+        journal: "_RemoteProcJournal | None" = None,
+        idempotency_key: str = "",
+        node_id: str = "",
     ) -> tuple[int, str, str]:
         """Drain the proc stream endpoint until exit line; return (rc, out, err).
 
@@ -648,9 +917,23 @@ class RemoteWorkspace:
         ``live_writer`` (remote-nodes-09): when provided, every out/err chunk
         is teed through ``LiveWriter.write_line`` so a tailer polling the
         live sidecar sees each line as it arrives, not at exit.
-        """
+
+        Reconnect loop (remote-nodes-10): when the node-agent transport
+        goes away mid-drain — laptop sleep, control plane down — the
+        client emits ``remote.proc.detached``, polls ``GET /procs/{pid}``
+        for state + offsets, and re-enters the stream with
+        ``?out=<o>&err=<e>`` so no byte is duplicated or lost. After
+        ``MO_REMOTE_RECONNECT_MAX_S`` (default 6 h) the client gives up,
+        posts ``kill``, and returns ``rc=124`` with ``infra_interruption``
+        surfaced through ``remote.proc.lost``. The cap-jittered-exp
+        backoff stays well below the deadline so a long sleep still
+        makes progress. ``journal`` writes offsets every 5 s while
+        streaming so the control plane can pick up where we left off
+        even on a hard restart."""
         out = io.StringIO()
         err = io.StringIO()
+        out_off = 0  # byte offset of next expected stdout chunk (utf-8 encoded)
+        err_off = 0  # byte offset of next expected stderr chunk
         # remote-nodes-09 §4: client-side deadline is ``timeout_s`` PLUS
         # ``MO_REMOTE_KILL_GRACE_S`` (default 30). On expiry we post ``kill``
         # and return rc=124, so the client never waits unbounded on a remote
@@ -662,25 +945,88 @@ class RemoteWorkspace:
                 grace_s = max(0.0, float(raw_grace))
             except ValueError:
                 grace_s = _DEFAULT_KILL_GRACE_S
-        deadline = time.time() + timeout + grace_s
+        timeout_deadline = time.time() + timeout + grace_s
+        # remote-nodes-10: separate reconnect window. Default 6 h, long enough
+        # for a laptop sleep; tunable via ``MO_REMOTE_RECONNECT_MAX_S``.
+        raw_max = os.environ.get(_REMOTE_RECONNECT_MAX_ENV, "").strip()
+        try:
+            reconnect_max_s = float(raw_max) if raw_max else float(_DEFAULT_RECONNECT_MAX_S)
+        except ValueError:
+            reconnect_max_s = float(_DEFAULT_RECONNECT_MAX_S)
+        reconnect_deadline = time.time() + max(0.0, reconnect_max_s)
+        backoff_s = _RECONNECT_BACKOFF_BASE_S
+        last_offset_checkpoint = time.time()
         last_rc: int = 0
         last_state: str = ""
+        was_detached = False  # emit detached at most once per drop, reattached on resume
         while True:
             try:
                 chunk = self._request(
                     "GET",
                     f"/v1/sessions/{self._run_id}/procs/{pid}/stream",
+                    query={"out": str(out_off), "err": str(err_off)},
                 )
-            except RemoteUnavailableError:
-                # Transport died mid-drain — treat as a timeout (we cannot
-                # tell the difference from the caller's side; either way the
-                # caller should retry from scratch).
-                if time.time() > deadline:
+            except (RemoteUnavailableError, OSError, http.client.HTTPException):
+                # Transport died mid-drain (a drop mid-response surfaces as
+                # URLError / ConnectionResetError / IncompleteRead, not only as
+                # RemoteUnavailableError). Past the reconnect window → fail loud.
+                if time.time() >= reconnect_deadline:
+                    self._kill_proc(pid)
+                    self._emit_proc_event(
+                        "remote.proc.lost",
+                        node=node_id, proc_id=str(pid),
+                        failure_class="infra_interruption",
+                    )
+                    if journal is not None and idempotency_key:
+                        journal.upsert_end(
+                            idempotency_key=idempotency_key,
+                            state="detached", rc=_TIMEOUT_RC, ended_at=int(time.time()),
+                        )
                     return _TIMEOUT_RC, out.getvalue(), (
-                        err.getvalue() + f"\ntimeout after {timeout}s"
+                        err.getvalue() + "\ninfra_interruption: reconnect window exceeded"
                     ).lstrip()
-                time.sleep(0.05)
+                if not was_detached:
+                    self._emit_proc_event(
+                        "remote.proc.detached", node=node_id, proc_id=str(pid),
+                    )
+                    was_detached = True
+                # Probe the node-agent to learn state + advance offsets. If the
+                # probe itself fails we just sleep and retry on the next loop.
+                try:
+                    info = self._json(
+                        "GET", f"/v1/sessions/{self._run_id}/procs/{pid}",
+                    )
+                except (RemoteUnavailableError, OSError, http.client.HTTPException):
+                    pass
+                else:
+                    # Do NOT advance out_off/err_off to the server's file sizes:
+                    # the client resumes from what it actually RECEIVED, or the
+                    # output written during the outage is silently skipped.
+                    # A finished proc is NOT a reason to return here: what it wrote
+                    # during the outage is still on the node. Retry the stream from
+                    # the offsets we actually received; it delivers the tail and a
+                    # settled exit record. (The probe only tells us the node is back.)
+                    if str(info.get("state", "")) in ("exited", "killed", "timeout",
+                                                      "spawn_failed", "orphaned"):
+                        backoff_s = _RECONNECT_BACKOFF_BASE_S
+                        continue
+                # Capped jittered exponential backoff; bounded by the window.
+                sleep_s = min(backoff_s, max(0.05, reconnect_deadline - time.time()))
+                sleep_s *= (1.0 + random.random()) / 2.0   # half-jitter
+                time.sleep(max(0.05, sleep_s))
+                backoff_s = min(backoff_s * 2.0, _RECONNECT_BACKOFF_CAP_S)
                 continue
+
+            # We got a fresh chunk from the stream. Reset backoff + emit reattach.
+            if was_detached:
+                self._emit_proc_event(
+                    "remote.proc.reattached", node=node_id, proc_id=str(pid),
+                    out_offset=out_off, err_offset=err_off,
+                )
+                was_detached = False
+            backoff_s = _RECONNECT_BACKOFF_BASE_S
+
+            got_data = False
             for line in chunk.decode("utf-8", "replace").splitlines():
                 line = line.strip()
                 if not line:
@@ -693,12 +1039,16 @@ class RemoteWorkspace:
                 data = msg.get("data", "")
                 if stream == "out":
                     out.write(data)
+                    out_off += len(data.encode("utf-8", "replace"))
                     if live_writer is not None and data:
                         live_writer.write_line(data, "stdout", partial=not data.endswith("\n"))
+                    got_data = True
                 elif stream == "err":
                     err.write(data)
+                    err_off += len(data.encode("utf-8", "replace"))
                     if live_writer is not None and data:
                         live_writer.write_line(data, "stderr", partial=not data.endswith("\n"))
+                    got_data = True
                 elif stream == "exit":
                     last_state = str(msg.get("state", ""))
                     raw_rc = msg.get("rc")
@@ -713,23 +1063,35 @@ class RemoteWorkspace:
                     if last_state == "spawn_failed":
                         last_rc = _SPAWN_FAILED_RC
                     return last_rc, out.getvalue(), err.getvalue()
-            if time.time() > deadline:
+
+            # Checkpoint offsets every N seconds so a hard restart still has a
+            # useful resume point for the next reconnect probe.
+            if (journal is not None and idempotency_key
+                    and (got_data or time.time() - last_offset_checkpoint >= _REMOTE_OFFSET_CHECKPOINT_S)):
+                journal.upsert_offsets(idempotency_key, out_off, err_off)
+                last_offset_checkpoint = time.time()
+
+            if time.time() > timeout_deadline:
                 # Client-side deadline (timeout + grace) — kill the proc and
                 # report timeout. The node-agent also enforces timeout_s
                 # server-side; the client grace is the additional buffer the
                 # caller is willing to wait for the server's own kill to take
                 # effect.
-                try:
-                    self._request(
-                        "POST",
-                        f"/v1/sessions/{self._run_id}/procs/{pid}/kill",
-                    )
-                except RemoteUnavailableError:
-                    pass
+                self._kill_proc(pid)
                 return _TIMEOUT_RC, out.getvalue(), (
                     err.getvalue() + f"\ntimeout after {timeout}s"
                 ).lstrip()
             time.sleep(0.05)
+
+    def _kill_proc(self, pid: int) -> None:
+        """Best-effort POST /kill; never raises. Used by the reconnect-timeout path."""
+        try:
+            self._request(
+                "POST",
+                f"/v1/sessions/{self._run_id}/procs/{pid}/kill",
+            )
+        except RemoteUnavailableError:
+            pass
 
     # ------------------------------------------------------------------ epic 09: live + kill
 

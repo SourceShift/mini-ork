@@ -140,11 +140,18 @@ Options:
   --from-node <id>             Override entry node (operator wants a
                                  wider rerun; closure is recomputed
                                  rooted at this node).
-  --strategy NAME              resume | retry | repair | pause
+  --strategy NAME              resume | retry | repair | pause | reattach
                                  resume (default): start at closure root
                                  retry:           start at closure root
                                  repair:          + bounded cost ceiling
                                  pause:           compute, do NOT dispatch
+                                 reattach:        re-attach to a still-running
+                                                   remote proc (remote-nodes-10);
+                                                   the planner picks this as
+                                                   the default when an
+                                                   unconsumed remote_procs row
+                                                   exists for the first-incomplete
+                                                   node.
   --status                     Print reuse/rerun split + cost boundary
                                  without dispatching any node.
   --workflow <path>            Override workflow.yaml location.

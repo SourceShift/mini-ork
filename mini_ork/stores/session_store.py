@@ -71,25 +71,35 @@ def find_session_jsonl(
 ) -> Optional[Path]:
     """Locate the live transcript for ``session_id``.
 
-    Checks the cwd-derived project dir first (the common case), then globs
-    every project dir (covers a resume whose cwd differs from where the
-    session was born). Returns None if no transcript file exists."""
+    Looks up by ``session_id`` first across every project dir (the
+    provider-session-id keying — covers a remote proc whose cwd slug
+    differs from the local cwd, kickoff remote-nodes-10 §5). Falls back
+    to the cwd-derived project dir only when no global hit exists, so
+    the local cwd path remains a usable target for ``restore_session``.
+
+    Returns None if no transcript file exists."""
     if not session_id:
         return None
     base = projects_dir or claude_projects_dir()
     if not base.is_dir():
         return None
-    # 1. the cwd-derived project dir
-    direct = base / project_slug(cwd) / f"{session_id}.jsonl"
-    if direct.is_file():
-        return direct
-    # 2. glob every project dir (cwd may differ from session origin)
+    # 1. provider-session-id lookup: globs every project dir so a remote
+    # transcript (whose slug differs from the local cwd) is found in
+    # one round-trip. Single-file match: the first hit wins.
     try:
         for hit in base.glob(f"*/{session_id}.jsonl"):
             if hit.is_file():
                 return hit
     except OSError as e:
         _log(f"glob failed under {base}: {e}")
+    # 2. cwd-derived project dir (legacy fallback). The glob above already
+    # covers this path on most filesystems; this branch survives a base
+    # directory where the per-slug dir is not yet populated (e.g. the
+    # mirror hasn't run yet but ``restore_session`` is racing the next
+    # spawn).
+    direct = base / project_slug(cwd) / f"{session_id}.jsonl"
+    if direct.is_file():
+        return direct
     return None
 
 

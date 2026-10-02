@@ -61,7 +61,16 @@ __all__ = [
 ]
 
 # Strategy enum — strings, not Enum, so JSON serialization stays trivial.
-RECOVERY_STRATEGIES = ("resume", "retry", "repair", "pause")
+# ``reattach`` (remote-nodes-10): re-attach to a still-running remote proc
+# whose ``remote_procs`` row is unconsumed. The default-selection rule
+# lives in ``compute_recovery`` (probes the table for the first-incomplete
+# node); the strategy dispatch itself is out of scope for E2 — the
+# execute-loop executor branch that honors ``strategy="reattach"`` is a
+# separate concern (the dispatch-side execution of reattach), so a
+# ``--strategy reattach`` plan currently produces the same closure as
+# ``resume`` until the executor learns to short-circuit dispatch when the
+# proc is already running on the VM.
+RECOVERY_STRATEGIES = ("resume", "retry", "repair", "pause", "reattach")
 
 
 @dataclasses.dataclass
@@ -229,6 +238,47 @@ def _sku(run_id: str, recipe: str, task_class: str) -> str:
     ).hexdigest()[:12]
 
 
+def _probe_reattach_default(
+    db_path: str, run_id: str, first_node: str | None
+) -> bool:
+    """Return True when the first-incomplete node has an unconsumed
+    ``remote_procs`` row that the ``reattach`` strategy should pick up.
+
+    epic 10 (kickoff §4): the default-selection rule lives here so the
+    CLI never has to guess. Pure read against the table the spawn-side
+    journal writes; ``state`` in {``running``, ``detached``, ``starting``}
+    means the VM still has the child alive and a re-attach is safe.
+    An ``exited`` row is still useful (the proc finished while the
+    control plane was away; harvest its output) — counted as reattach
+    too because the harvest path is the same code branch.
+
+    Returns False when ``first_node`` is None (the closure is empty —
+    nothing to reattach), the DB is missing, or no row exists. False
+    never overrides an explicit ``strategy="reattach"`` the caller
+    already chose; it's a defaulting helper, not an enforcement point.
+    """
+    if not first_node:
+        return False
+    if not db_path or not os.path.isfile(db_path):
+        return False
+    try:
+        con = sqlite3.connect(db_path, timeout=5.0)
+        con.execute("PRAGMA busy_timeout=5000")
+        try:
+            row = con.execute(
+                "SELECT 1 FROM remote_procs"
+                " WHERE run_id=? AND node_id=?"
+                " AND state IN ('starting','running','detached','exited')"
+                " LIMIT 1",
+                (run_id, first_node),
+            ).fetchone()
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return False
+    return row is not None
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Closure computation
 # ─────────────────────────────────────────────────────────────────────────────
@@ -325,7 +375,12 @@ def compute_recovery(
         failed_node=failed_node,
         first_node=first_node,
         from_node=from_node,
-        strategy="resume",  # default; plan_recovery overrides
+        # remote-nodes-10: default to ``reattach`` when the first-incomplete
+        # node has an unconsumed ``remote_procs`` row (epic 10 kickoff §4).
+        # The CLI never has to guess — the probe lives in the planner so a
+        # bare ``mini-ork recover <run>`` Just Works for laptop-sleep cases.
+        strategy=("reattach" if _probe_reattach_default(db_path, run_id, first_node)
+                  else "resume"),
         cost_boundary={"paused": False, "node": None},
         reason=reason_view,
         sku=_sku(run_id, recipe_eff, tc_eff),
@@ -361,6 +416,13 @@ def plan_recovery(
                      Return rc=0 with the closure set as JSON on stdout
                      so an external operator (human or script) can
                      invoke ``recover resume`` after reviewing.
+      * ``reattach`` (remote-nodes-10) — same closure as ``resume``, but
+                     the executor should short-circuit dispatch when the
+                     first-incomplete node already has an unconsumed
+                     ``remote_procs`` row (the VM still has the proc
+                     alive or its output). Falls back to ``retry`` when
+                     the row exists with ``state`` in {``spawn_failed``,
+                     ``orphaned``} (kickoff §4 last bullet).
     """
     if strategy not in RECOVERY_STRATEGIES:
         raise ValueError(

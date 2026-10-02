@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import contextlib
 import functools
+import hashlib
 import io
 import json
 import os
@@ -145,6 +146,24 @@ def _node_publish_boundary(fn):
         with run_context_scope({}):
             return fn(*args, **kwargs)
     return wrapper
+
+
+def _node_attempt_no(db, run_id: str, node_id: str) -> int:
+    """1 + the node's recorded attempts. An interrupted remote attempt records
+    none, so a recovery re-dispatch gets the SAME number — and therefore the same
+    idempotency key, which re-attaches to the still-running remote proc."""
+    try:
+        if not (isinstance(db, str) and db and os.path.isfile(db)):
+            return 1
+        con = sqlite3.connect(db, timeout=5.0)
+        try:
+            row = con.execute("SELECT COUNT(*) FROM node_attempts WHERE run_id=? AND node_id=?",
+                              (run_id, node_id)).fetchone()
+        finally:
+            con.close()
+        return int(row[0] or 0) + 1
+    except sqlite3.Error:
+        return 1
 
 
 @_node_publish_boundary
@@ -368,7 +387,9 @@ def dispatch_node(fields, *, root, run_dir, plan_path, task_class, db, run_id,
     # Publish the per-node identity + clear any stale resume session in one
     # canonical step (None removes the variable).
     publish_env(node_env_overrides(
-        node_id=node_id, run_dir=run_dir_eff, resume_session_id=None))
+        node_id=node_id, run_dir=run_dir_eff, resume_session_id=None,
+        attempt=str(_node_attempt_no(db, run_id, node_id)),
+        input_hash=hashlib.sha256(f"{run_id}|{node_id}|{recipe}".encode()).hexdigest()))
 
     # (E4 turn-resume) During an active recovery, restore this node's persisted
     # transcript and export MO_RESUME_SESSION_ID so a claude lane continues the

@@ -188,12 +188,17 @@ def create_app(
             cwd=payload.get("cwd"),
             stdin=str(payload.get("stdin", "")),
             timeout_s=payload.get("timeout_s"),
+            idempotency_key=str(payload.get("idempotency_key", "") or ""),
         )
         ps = _registry(run_id).spawn(spec)
         return {
             "pid": ps.pid,
             "state": ps.state,
             "rc": ps.rc,
+            "out_offset": ps.out_offset,
+            "err_offset": ps.err_offset,
+            "started_at": ps.started_at,
+            "ended_at": ps.ended_at,
         }
 
     @app.get("/v1/sessions/{run_id}/procs/{pid}")
