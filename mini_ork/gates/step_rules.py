@@ -36,7 +36,6 @@ from __future__ import annotations
 import json
 import os
 import re
-import subprocess
 from typing import Optional
 
 __all__ = [
@@ -67,16 +66,47 @@ _REDIRECT = re.compile(r"\d?>\s*[\w./-]+")
 
 
 def _git(workspace: str, args: list[str], *, timeout: int = 30):
-    """Run git in ``workspace``; ``None`` when git cannot run at all."""
+    """Run git in ``workspace``; ``None`` when git cannot run at all.
+
+    Routed via ``mini_ork.runtime.contract.run_check`` so a remote placement
+    runs the step_rules git invocations on the replica instead of the host's
+    ``MO_TARGET_CWD`` (kickoff ``remote-nodes-11`` §2 — ``step_rules`` is
+    one of the listed call sites). The local branch stays byte-identical
+    to the previous ``subprocess.run(..., stdout=PIPE, stderr=STDOUT)``
+    shape so ``rule_patch_applies_cleanly`` and friends keep their
+    ``run.stdout``/``run.returncode`` reads.
+    """
     try:
-        return subprocess.run(
+        from mini_ork.runtime.contract import run_check
+        rc, out = run_check(
             ["git", "-C", workspace, *args],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
+            cwd=workspace,
+            env=None,
+            evidence_path="",
             timeout=timeout,
         )
     except Exception:
         return None
+    # ``run_check`` returns ``str | bytes``; ``subprocess.run`` returned
+    # ``bytes``. Normalize to ``bytes`` for the call sites'
+    # ``proc.stdout``/``proc.returncode`` reads.
+    if isinstance(out, str):
+        out = out.encode("utf-8", "replace")
+    return _CompletedProcess(rc=rc, stdout=out or b"")
+
+
+class _CompletedProcess:
+    """``subprocess.CompletedProcess``-shaped object so call sites' ``rc.stdout`` /
+    ``rc.returncode`` reads keep working after the ``run_check`` reroute."""
+
+    __slots__ = ("rc", "stdout", "stderr", "returncode")
+
+    def __init__(self, *, rc: int, stdout: bytes,
+                 stderr: bytes = b"", returncode: int | None = None) -> None:
+        self.rc = rc
+        self.stdout = stdout
+        self.stderr = stderr
+        self.returncode = returncode if returncode is not None else rc
 
 
 def _is_git_workspace(workspace: str) -> bool:

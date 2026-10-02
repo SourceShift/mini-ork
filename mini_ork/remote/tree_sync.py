@@ -271,3 +271,47 @@ def apply_delta(local_repo: str, base: Snap, new: Snap, *, ref: str | None = Non
     if after != new.tree:
         raise SyncIntegrityError(f"apply_delta: local tree {after} != remote tree {new.tree}")
     return head_moved
+
+
+# ── replica hygiene (kickoff remote-nodes-11 §4) ─────────────────────────────
+#
+# After every check exec (verifier / post-run verify / step_rules git /
+# mutation test-cmd) the node-agent restores the replica from the
+# session's ``last_synced`` snapshot and removes untracked junk. This is
+# the verb ``RemoteWorkspace.restore_replica()`` calls into.
+
+
+def restore_to(repo: str, base_commit: str) -> str:
+    """Reset every tracked path to ``base_commit``; leave untracked + ignored
+    files alone. Returns the resulting worktree-tree hash.
+
+    ``git read-tree -u --reset base_commit`` is the lightest reset that
+    also updates the worktree (``-u``), so the on-disk files match the
+    committed tree — exactly what the kickoff means by "restore from the
+    snapshot tree". HEAD is not moved (we want the replica to keep
+    whichever HEAD the agent left) so a follow-up ``sync_down`` can still
+    reason about agent commits.
+    """
+    if not _commit_exists(repo, base_commit):
+        raise SyncIntegrityError(f"restore_to: {base_commit} is not in {repo}")
+    _git(repo, "read-tree", "-u", "--reset", base_commit)
+    return _write_worktree_tree(repo, "HEAD", _excludes())
+
+
+def git_clean_unignored(repo: str) -> None:
+    """``git clean -fd`` (no ``-x``): remove untracked + ignored-but-listed
+    files EXCEPT for the project-standard ignore list (``_excludes()``),
+    so caches like ``.venv``, ``node_modules``, and ``.pytest_cache``
+    survive for speed.
+
+    The kickoff is explicit about why the ``-x`` flag is wrong here:
+    an ignored cache is part of the project's runtime surface and
+    rebuilding it every restore costs a sync cycle nobody paid for.
+    """
+    patterns = _excludes()
+    pathspecs = _exclude_pathspecs(patterns)
+    # ``git clean -fd -- <pathspec>...`` only removes files matching the
+    # pathspecs; ``-d`` prunes empty untracked directories so a verifier
+    # that created ``foo/`` and only ``foo/`` does not leave an empty
+    # dir that survives into the next sync-down.
+    _git(repo, "clean", "-fd", "--", *pathspecs)

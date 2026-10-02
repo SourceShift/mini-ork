@@ -241,6 +241,14 @@ def create_app(
                 # said "killed, rc=null" for what was a timeout (rc 124).
                 if cur.state in ("exited", "killed", "timeout", "spawn_failed", "orphaned") and (
                         cur.rc is not None or cur.state == "orphaned"):
+                    # The watcher may have written the last bytes between the reads
+                    # above and this check; drain once more (the files are final
+                    # now) so the exit record never overtakes the tail.
+                    for name, off in (("out", o), ("err", e)):
+                        tail = reg.read_chunk(pid, stream=name, offset=off) or b""
+                        if tail:
+                            yield json.dumps({"stream": name, "offset": off + len(tail),
+                                              "data": tail.decode("utf-8", "replace")}) + "\n"
                     yield json.dumps(
                         {"stream": "exit", "rc": cur.rc, "state": cur.state}
                     ) + "\n"
@@ -404,6 +412,34 @@ def create_app(
                 bundle.unlink(missing_ok=True)
         return {"commit": snap.commit, "tree": snap.tree, "excluded": list(snap.excluded),
                 "bundle_b64": base64.b64encode(data).decode("ascii")}
+
+    @app.post("/v1/sessions/{run_id}/tree/restore")
+    def post_tree_restore(run_id: str, payload: dict,
+                          _: None = Depends(bearer)) -> dict:
+        """Restore the replica to ``base_commit`` (kickoff §4).
+
+        Used by ``RemoteWorkspace.restore_replica()`` after every check
+        exec, so verifier droppings and mutation residue cannot be
+        mistaken for agent edits on the next sync-down. Restores the
+        tree from the snapshot, then ``git clean -fd`` (NO ``-x``) so
+        ignored caches like ``.venv``, ``node_modules``, and
+        ``.pytest_cache`` survive for speed.
+
+        The auth/error contract mirrors the other ``tree/*`` routes:
+        bearer dep + ``SyncIntegrityError`` → 409.
+        """
+        from mini_ork.remote import tree_sync as ts
+
+        base_commit = payload.get("base_commit")
+        if not base_commit:
+            raise HTTPException(400, "base_commit required")
+        target = str(_target_dir(run_id))
+        try:
+            ts.restore_to(target, base_commit)
+            ts.git_clean_unignored(target)
+        except ts.SyncIntegrityError as exc:
+            raise HTTPException(409, f"restore failed: {exc}") from exc
+        return {"restored": True, "base": base_commit}
 
     # ---- engines ------------------------------------------------------
 

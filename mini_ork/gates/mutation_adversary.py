@@ -531,6 +531,24 @@ def _as_argv(test_cmd: "str | Sequence[str]") -> List[str]:
     return [str(a) for a in test_cmd]
 
 
+class _CompletedProc:
+    """``subprocess.CompletedProcess``-shaped object so the mutation loop's
+    ``tr.returncode`` / ``tr.stdout`` reads keep working after the reroute
+    through ``run_check``. ``run_check`` returns ``(rc, str | bytes)`` so
+    we adapt the second slot to whatever form the loop expects."""
+
+    __slots__ = ("returncode", "stdout", "stderr", "rc")
+
+    def __init__(self, *, rc: int, stdout: bytes | str = b"",
+                 stderr: bytes | str = b"") -> None:
+        self.returncode = int(rc)
+        self.rc = int(rc)
+        # Preserve the legacy text=True shape so the ``ar.stderr or ''``
+        # reads in the apply branch keep type-stable.
+        self.stdout = stdout if isinstance(stdout, (bytes, str)) else b""
+        self.stderr = stderr if isinstance(stderr, (bytes, str)) else b""
+
+
 def run_adversary(
     mutations_json: dict,
     workspace: str,
@@ -595,6 +613,9 @@ def run_adversary(
         applied = caught = False
         try:
             try:
+                # ``git apply`` is a git-on-target-tree operation — stays on
+                # local git (kickoff §5 of the wiring explicitly lists the
+                # mutation test-cmd loop as the routed site, NOT the apply).
                 ar = subprocess.run(
                     ["git", "-C", workspace, "apply", "--whitespace=nowarn", patch],
                     capture_output=True, text=True, timeout=apply_timeout_s,
@@ -609,10 +630,18 @@ def run_adversary(
 
             if applied:
                 try:
-                    tr = subprocess.run(
-                        argv, cwd=workspace, capture_output=True, text=True,
+                    # Kickoff §2 — route the test-cmd through ``run_check``
+                    # so a remote placement runs the test command against
+                    # the replica. ``run_check`` preserves the legacy
+                    # ``subprocess.run(capture_output=True, text=True,
+                    # timeout=...)`` shape on the local branch.
+                    from mini_ork.runtime.contract import run_check
+                    rc, _tr_text = run_check(
+                        argv, cwd=workspace, env=None, evidence_path="",
                         timeout=test_timeout_s,
                     )
+                    tr_rc = rc
+                    tr = _CompletedProc(rc=tr_rc, stdout=_tr_text or b"")
                     caught = tr.returncode != 0
                     reason = ("tests failed with the mutation applied"
                               if caught else "tests still pass — coverage gap")

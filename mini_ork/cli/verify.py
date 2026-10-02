@@ -15,7 +15,6 @@ from __future__ import annotations
 import json
 import os
 import re
-import subprocess
 import sys
 import time
 from pathlib import Path
@@ -24,6 +23,7 @@ from mini_ork import trace_store
 from mini_ork.context import context_env
 
 from mini_ork.gates import gate_registry
+from mini_ork.runtime.contract import run_check  # routing helper (kickoff §2)
 
 _USAGE = """Usage: mini-ork verify <artifact-path> [--plan <plan.json>] [--task-class <name>] [--dry-run]
 
@@ -282,6 +282,21 @@ def main(argv: list[str] | None = None, *, db: str | None = None, root: str | No
                     else os.path.join(home, "runs", "evidence"))
     os.makedirs(evidence_dir, exist_ok=True)
 
+    # Kickoff §3 — pin both post-run branches to the run's pinned target root
+    # so a verifier that ``cd``'s into ``cwd`` lands on the actual project,
+    # not on whatever cwd ``mini-ork run`` was launched from. Resolved BEFORE
+    # any branch that depends on ``cwd`` so the legacy ``cwd=None`` fallback
+    # only fires for run dirs that were never pinned.
+    pinned_target = ""
+    if run_dir:
+        try:
+            from mini_ork.runtime.run_roots import load_run_roots
+            _roots = load_run_roots(run_dir)
+            if _roots and getattr(_roots, "target", ""):
+                pinned_target = _roots.target
+        except Exception:
+            pinned_target = ""
+
     verifier_names: list[str] = []
     if plan_path and os.path.isfile(plan_path):
         try:
@@ -321,29 +336,41 @@ def main(argv: list[str] | None = None, *, db: str | None = None, root: str | No
                 results.append(f'{{"verifier":"{name}","pass":false,"evidence_path":"script_not_found"}}')
                 fail_count += 1
                 continue
-            run = subprocess.run(
+            # Kickoff §3 — pass pinned target as ``cwd`` so a remote
+            # placement finds it via the run's PathMap and the local branch
+            # runs in the project even when launched from another cwd.
+            rc, evidence = run_check(
                 ["bash", "-lc", command],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
+                cwd=pinned_target or "",
+                env=None,
+                evidence_path=ev,
+                timeout=0,
             )
-            evidence = run.stdout or b""
-            if run.returncode == 0 and not evidence:
+            if isinstance(evidence, str):
+                evidence = evidence.encode("utf-8", "replace")
+            if rc == 0 and not evidence:
                 evidence = f"verifier command exited 0: {command}\n".encode()
             Path(ev).write_bytes(evidence)
-            ok = run.returncode == 0
-            rc, out_tail = run.returncode, _evidence_tail(evidence)
+            ok = rc == 0
+            rc, out_tail = rc, _evidence_tail(evidence)
         else:
-            r = subprocess.run(
+            # Kickoff §3 — pass pinned target on the script branch too.
+            # ARTIFACT_PATH is forwarded via env so recipe verifiers find
+            # their namespace; ``run_check`` preserves the legacy
+            # ``subprocess.run(stdout=PIPE, stderr=STDOUT)`` shape on the
+            # local branch byte-for-byte.
+            rc, out = run_check(
                 _verifier_argv(script),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
+                cwd=pinned_target,
                 env={**os.environ, "ARTIFACT_PATH": artifact_path},
+                evidence_path=ev,
+                timeout=0,
             )
-            Path(ev).write_bytes(r.stdout or b"")
-            ok = r.returncode == 0
+            r_stdout = out if isinstance(out, bytes) else (out.encode("utf-8", "replace") if out else b"")
+            ok = rc == 0
             if ok and os.path.getsize(ev) == 0:  # vacuous: exit 0 but no evidence → fail
                 ok = False
-            rc, out_tail = r.returncode, _evidence_tail(r.stdout)
+            rc, out_tail = rc, _evidence_tail(r_stdout)
         unmeasured_note = _declared_unmeasured(Path(ev).read_bytes()) if ok else ""
         if unmeasured_note:
             # Neither pass nor fail: recorded so "did not run" stays visible,

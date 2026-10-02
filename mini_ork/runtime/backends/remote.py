@@ -492,6 +492,29 @@ class RemoteWorkspace:
             self._emit_sync_event("remote.head_moved", tree=new_snap.tree)
         self._emit_sync_event("remote.sync.down", bytes=len(data), tree=new_snap.tree)
 
+    def restore_replica(self) -> None:
+        """Restore the replica's non-ignored paths to ``_last_synced`` (kickoff §4).
+
+        Called by every ``run_check`` exec so verifier droppings and mutation
+        residue can never be mistaken for agent edits on the next sync-down.
+        The remote node-agent restores the tree from the session's
+        ``last_synced`` snapshot, then ``git clean -fd`` (NO ``-x``) so
+        ignored caches like ``.venv``, ``node_modules``, and
+        ``.pytest_cache`` survive for speed.
+
+        No-op when ``_last_synced`` is unset (legacy / un-preceded session):
+        there is nothing to restore against. Errors propagate as
+        ``RemoteUnavailableError`` so the caller can decide whether to
+        mask them (the contract: best-effort hygiene; truth is the check).
+        """
+        if self._last_synced is None:
+            return
+        self._json(
+            "POST",
+            f"/v1/sessions/{self._run_id}/tree/restore",
+            {"base_commit": self._last_synced[0]},
+        )
+
     def _emit_sync_event(self, event_type: str, **fields: Any) -> None:
         """Fire a ``remote.sync.*`` event through the run-event emitter.
 
@@ -513,7 +536,8 @@ class RemoteWorkspace:
 
     # ------------------------------------------------------------------ workspace
 
-    def exec(self, cmd: str, *, cwd: str, timeout: int) -> tuple[int, str]:
+    def exec(self, cmd: str, *, cwd: str, timeout: int,
+             env: Mapping[str, str] | None = None) -> tuple[int, str]:
         if self._sid is None:
             raise RuntimeError("RemoteWorkspace.exec called before up()")
         # Pre: tree sync-up (epic 07) + run-dir push (epic 08). Post: run-dir
@@ -532,6 +556,9 @@ class RemoteWorkspace:
                     "argv": ["sh", "-c", cmd],
                     "cwd": cwd or self._mount_path,
                     "timeout_s": timeout,
+                    # A check's env (plan/artifact/run-dir paths) — values ride
+                    # the request; the node-agent persists keys only.
+                    **({"env": dict(env)} if env else {}),
                 },
             )
             rc = int(result.get("rc", _SPAWN_FAILED_RC))

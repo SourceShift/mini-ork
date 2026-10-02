@@ -83,6 +83,7 @@ from mini_ork.runtime.run_roots import (  # noqa: F401
     persist_run_roots,
     resolve_run_roots,
 )
+from mini_ork.runtime.contract import run_check  # noqa: F401 -- routing helper
 
 _SEP = "\x1f"
 _NODE_TYPE_ORDER = ("planner", "researcher", "transform", "implementer", "reviewer", "verifier",
@@ -1309,8 +1310,16 @@ def _verifier_argv(script):
 
 
 def _run_verifier_ref(script, evidence_path, *, plan_path="", artifact_path="", cwd=None, run_dir=""):
-    """Port of _run_verifier_ref (minus the mo_runtime_exec seam): run the
-    verifier script, capture evidence, and treat {"pass": true} as success."""
+    """Run the verifier script, capture it, and treat {"pass": true} as success.
+
+    Routes the subprocess through ``mini_ork.runtime.contract.run_check``
+    so the same call site serves both the local placement (legacy
+    ``subprocess.run`` byte-identical) and remote placement (epic
+    remote-nodes-11): under remote placement the verifier runs against
+    the replica, the cwd + env + argv reach the run's PathMap, the
+    evidence lands in the run-dir and arrives through the pull (the
+    fallback path writes it directly when the pull missed it).
+    """
     if not cwd:
         # Prefer the pinned target from run_profile.json["roots"]; fall back
         # to MO_TARGET_CWD for legacy run dirs created without the record.
@@ -1326,9 +1335,13 @@ def _run_verifier_ref(script, evidence_path, *, plan_path="", artifact_path="", 
     # the executor-to-verifier boundary explicit instead of relying on an
     # outer CLI process to have populated it.
     verifier_env.setdefault("MINI_ORK_RUN_DIR", os.path.dirname(evidence_path))
-    with open(evidence_path, "wb") as fh:
-        rc = subprocess.run(_verifier_argv(script), cwd=cwd, stdout=fh, stderr=subprocess.STDOUT,
-                            env=verifier_env).returncode
+    # ``run_check`` handles the local-vs-remote routing; the legacy
+    # ``subprocess.run(..., stdout=fh, stderr=STDOUT)`` shape is preserved
+    # on the local branch. Under remote placement, the helper writes the
+    # merged output to ``evidence_path`` from the run-dir pull's content
+    # (falling back to the exec'd ``output`` string when the pull missed).
+    rc, _ = run_check(_verifier_argv(script), cwd=cwd, env=verifier_env,
+                      evidence_path=evidence_path)
     if not os.path.getsize(evidence_path):
         open(evidence_path, "w").write(f"vacuous pass: verifier exited {rc} but wrote no evidence")
         return 1
