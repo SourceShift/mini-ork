@@ -107,7 +107,7 @@ def catalog(extraction_paths: list[Path], corpus_path: Path, catalog_out: Path, 
                 "published_at": src.get("published_at") or paper.get("published_at"),
                 "rank": src.get("rank") or paper.get("rank"),
                 "summary": str(paper.get("summary") or "").strip(),
-                "rsi_relevance": paper.get("rsi_relevance") or "unknown",
+                "rsi_relevance": paper.get("rsi_relevance") or paper.get("relevance") or "unknown",
                 "techniques": [
                     {k: t.get(k) for k in ("name", "mechanism", "result")}
                     for t in (paper.get("techniques") or [])
@@ -388,7 +388,7 @@ def assemble(report_path: Path, merged_path: Path, corpus_path: Path, out: Path)
         "",
         f"Reviewers: {', '.join(merged['reviewers'])}. Priority = mean impact × mean evidence confidence / effort weight "
         "(S=1, M=1.5, L=2.5); ×0.5 when a reviewer marks it as extending shipped work, 0 when all mark it shipped. "
-        "Verdict is the more conservative of the two reviewers. ⚠ = reviewers disagree by ≥2 impact points or ≥2 verdict levels.",
+        "Verdict is the most conservative reviewer's. ⚠ = reviewers disagree by ≥2 impact points or ≥2 verdict levels.",
         "",
         "| Rank | ID | Technique | Group | Priority | Impact | Verdict | Evidence |",
         "|---:|---|---|---|---:|---:|---|---|",
@@ -419,8 +419,8 @@ def assemble(report_path: Path, merged_path: Path, corpus_path: Path, out: Path)
         "## Evidence Limits",
         "",
         "Per-paper extraction read LibWit titles, abstracts, and metadata only; reported numbers are as stated in abstracts, "
-        "not reproduced. Impact scores are the judgment of two non-Anthropic model reviewers (glm, minimax) against a "
-        "hand-written snapshot of mini-ork's shipped RSI mechanisms.",
+        f"not reproduced. Impact scores are the judgment of {len(merged['reviewers'])} non-Anthropic model reviewers "
+        f"({', '.join(merged['reviewers'])}) against a hand-written snapshot of mini-ork's shipped mechanisms.",
     ]
     _write_text(out, "\n".join(lines))
 

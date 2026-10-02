@@ -1,0 +1,32 @@
+source_artifact: coord-technique-review.md
+task_class: coord_technique_review
+expected_artifact: composite
+
+success_verifiers:
+  - verifiers/verify.py
+
+failure_policy: escalate
+rollback_policy: keep_all_source_and_summary_artifacts
+
+outputs:
+  - path: "${MINI_ORK_RUN_DIR}/source-corpus.json"
+    mime: application/json
+    description: LibWit source manifest of the top 2026 coordination papers with retrieval metadata.
+  - path: "${MINI_ORK_RUN_DIR}/paper-digest.md"
+    mime: text/markdown
+    description: Per-paper summaries and techniques, grouped by relevance.
+  - path: "${MINI_ORK_RUN_DIR}/technique-catalog.json"
+    mime: application/json
+    description: Validated canonical techniques with corpus-checked source ids and coverage accounting.
+  - path: "${MINI_ORK_RUN_DIR}/clusters.json"
+    mime: application/json
+    description: Ten technique groups covering the catalog.
+  - path: "${MINI_ORK_RUN_DIR}/review-pack.json"
+    mime: application/json
+    description: Per-group implementable techniques plus the mini-ork coordination state snapshot.
+  - path: "${MINI_ORK_RUN_DIR}/merged-review.json"
+    mime: application/json
+    description: Three-reviewer impact scores merged into a ranked list with disagreement flags.
+  - path: "${MINI_ORK_RUN_DIR}/coord-technique-review.md"
+    mime: text/markdown
+    description: Final ranked review with implement-now plan and full appendices.

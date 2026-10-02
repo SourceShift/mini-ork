@@ -1,0 +1,32 @@
+name: coord_technique_review
+version: "0.1.0"
+description: >
+  Literature-driven design input for a cross-agent overlap protocol: collect the
+  top 2026 papers on coordinating concurrent agents, cluster their techniques
+  into families, distill each family into implementable techniques, and rank
+  them against what mini-ork and ContextNest already ship, using three
+  independent reviewer lanes.
+
+matches:
+  keywords:
+    - coordination technique review
+    - cross-agent overlap review
+    - cluster coordination techniques
+  regex: []
+
+artifact_contract_ref: artifact_contract.yaml
+default_workflow: workflow.yaml
+
+default_gates:
+  - budget_gate
+
+risk_class: low
+
+cost_model:
+  min_usd: 5
+  max_usd: 40
+  per_lens_usd: 1.5
+
+runtime_model:
+  min_minutes: 45
+  max_minutes: 240
