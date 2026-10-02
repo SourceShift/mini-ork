@@ -1,0 +1,57 @@
+# config/environments/default.yaml.example — environment profile (remote-nodes-12)
+#
+# COPY to config/environments/default.yaml under $MINI_ORK_HOME (operator-edited
+# LIVE file) to override any field, and ship the committed default under
+# $MINI_ORK_ROOT/config/environments/default.yaml. The two merge so the live
+# entry keeps any template-only value it doesn't override (per
+# mini_ork.remote.environments._merge_envs; mirrors mini_ork/remote/nodes.py
+# shadow-merge semantics so the documented "shallow file replaces template" bug
+# can't happen).
+#
+# A profile selects where and how a run's nodes execute: image, setup cache key,
+# non-secret env, secrets NAMES (epic 13 resolves values), network policy,
+# resources. See kickoff remote-nodes-12-environment-profiles-attempt-2.md and
+# schemas/environment.schema.json for the canonical field shape.
+
+# --- image + setup -----------------------------------------------------------
+
+image: python:3.11
+
+# Cached as an image layer (sha256(base_image_digest + setup + platform)).
+# `post_sync` runs every session, never cached; that's where
+# `pip install -e /workspace/target` lives (kickoff line 78-79).
+setup: |
+  set -euo pipefail
+  apt-get update -qq
+  apt-get install -y -qq git curl
+  pip install --quiet --upgrade pip
+
+# setup_timeout_s — default 900; raise for cold Python builds.
+
+# --- env (non-secret) --------------------------------------------------------
+# A non-secret value the run may use. Secret-shaped keys (matching *_KEY,
+# *_TOKEN, *_SECRET, *PASSWORD*) are rejected with a "put it in secrets"
+# message — see mini_ork/remote/environments.py::LookalikeSecretError.
+env:
+  PYTHONUNBUFFERED: "1"
+
+# --- secrets (resolved in epic 13) -------------------------------------------
+# A list of NAMES the run may use. Values come from the operator's secret
+# store in epic 13; this epic only validates NAMES.
+secrets: []
+
+# --- network policy ---------------------------------------------------------
+# "full" (default) uses the default Docker bridge.
+# "allowlist" creates an internal network with no egress + a tinyproxy
+# container attached to both the internal network and the bridge. The
+# session container's HTTP_PROXY/HTTPS_PROXY env vars route through the
+# proxy; allow_domains names the only hosts the proxy lets through.
+network: full
+allow_domains: []
+
+# --- resources --------------------------------------------------------------
+# Maps onto `docker run --cpus/--memory`. The numbers here are illustrative;
+# a small overlay set overrides.
+resources:
+  cpus: 2
+  memory: 4g

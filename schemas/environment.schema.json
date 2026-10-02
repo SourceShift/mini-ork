@@ -1,0 +1,75 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mini-ork/schemas/environment.schema.json",
+  "title": "EnvironmentProfile",
+  "description": "A named, saved description of where and how a run's nodes execute (remote-nodes-12). Loaded by mini_ork/remote/environments.py::load_profile and merged over the template via $MINI_ORK_HOME/config/environments/<name>.yaml (live) over $MINI_ORK_ROOT/config/environments/<name>.yaml (template). See kickoff remote-nodes-12-environment-profiles-attempt-2.md.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "node": {
+      "type": "string",
+      "description": "A node name from config/nodes.yaml (epic 06). Resolved via select_node; out of scope to enforce here."
+    },
+    "image": {
+      "type": "string",
+      "description": "Base image (e.g. python:3.11). May be a content-addressed digest; if a tag, the cache key uses the resolved digest.",
+      "minLength": 1
+    },
+    "setup": {
+      "type": "string",
+      "description": "Shell script that runs once on session start (cached as an image layer).",
+      "default": ""
+    },
+    "setup_timeout_s": {
+      "type": "number",
+      "description": "Timeout for the setup script in seconds; default 900 (kickoff requirement 1).",
+      "minimum": 1,
+      "default": 900
+    },
+    "env": {
+      "type": "object",
+      "description": "Non-secret env vars to set. Keys matching *_KEY / *_TOKEN / *_SECRET / *PASSWORD* are rejected at load time (see environments.py::LookalikeSecretError); put those in `secrets` instead.",
+      "additionalProperties": { "type": "string" },
+      "default": {}
+    },
+    "secrets": {
+      "type": "array",
+      "description": "Names of secrets the run may use. Values come from the operator's secret store in epic 13; this epic only validates NAMES.",
+      "items": { "type": "string" },
+      "default": []
+    },
+    "network": {
+      "type": "string",
+      "enum": ["full", "allowlist"],
+      "description": "Network level: 'full' uses the default bridge; 'allowlist' creates an internal Docker network and an egress-proxy container that filters to allow_domains.",
+      "default": "full"
+    },
+    "allow_domains": {
+      "type": "array",
+      "description": "Domains the EGRESS proxy allows when network='allowlist'. Ignored otherwise.",
+      "items": { "type": "string" },
+      "default": []
+    },
+    "resources": {
+      "type": "object",
+      "description": "Resource limits mapped onto docker run --cpus/--memory (kickoff requirement 5).",
+      "additionalProperties": false,
+      "properties": {
+        "cpus": {
+          "type": ["number", "string"],
+          "description": "CPUs (e.g. 2 or '2.5'). Maps to --cpus.",
+          "minimum": 0
+        },
+        "cpu": {
+          "type": ["number", "string"],
+          "description": "Alias of cpus.",
+          "minimum": 0
+        },
+        "memory": {
+          "type": ["number", "string"],
+          "description": "Memory limit (e.g. '4g' or 2147483648). Maps to --memory."
+        }
+      }
+    }
+  }
+}

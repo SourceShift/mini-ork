@@ -29,6 +29,7 @@ from fastapi.responses import Response, StreamingResponse
 from .auth import make_bearer_dependency
 from .engines import EngineManager, manifest_for
 from .files import UnsafeTarMember, _resolve_root, extract_tar, make_tar
+from .images import make_router as make_images_router
 from .procs import (
     ProcRegistry,
     ProcSpec,
@@ -125,6 +126,16 @@ def create_app(
 
     @app.post("/v1/sessions")
     def post_session(payload: dict, _: None = Depends(bearer)) -> dict:
+        # Overlay environment-profile defaults BEFORE validating the
+        # required fields so a profile that supplies ``image`` satisfies
+        # the ``image required`` check. The overlay lives in ``images.py``
+        # so the loader (which it calls) and the consumer (the session
+        # manager) share one symbol (Review bar #2).
+        from .images import apply_environment_to_session_payload
+        try:
+            payload = apply_environment_to_session_payload(payload)
+        except HTTPException:
+            raise
         run_id = payload.get("run_id")
         image = payload.get("image")
         if not run_id or not image:
@@ -134,6 +145,8 @@ def create_app(
                 run_id=run_id, image=image,
                 resources=payload.get("resources"),
                 profile=payload.get("profile"),
+                network=payload.get("network") or "full",
+                allow_domains=payload.get("allow_domains") or (),
             )
         except RuntimeError as exc:
             raise HTTPException(500, str(exc)) from exc
@@ -452,6 +465,21 @@ def create_app(
         except RuntimeError as exc:
             raise HTTPException(400, str(exc)) from exc
         return state.to_dict()
+
+    # ---- images (remote-nodes-12, requirement 2) -----------------------
+    #
+    # The image cache lives in ``mini_ork.remote.node_agent.images`` and
+    # exposes ``POST /v1/images/prepare`` + ``GET /v1/images/{key}``. The
+    # factory mirrors ``SessionManager`` / ``EngineManager``: it accepts
+    # the bearer dep + an injectable ``_run_fn`` so tests can drive the
+    # whole route without a real daemon. Mounted at the END of ``create``
+    # so the existing routes retain their byte-identical paths and the
+    # router addition is purely additive.
+    app.include_router(
+        make_images_router(
+            state_dir, bearer=bearer, _run_fn=_run_fn,
+        )
+    )
 
     return app
 
