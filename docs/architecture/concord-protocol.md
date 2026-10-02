@@ -123,12 +123,52 @@ fails open), `4` refused (for example, `stop` safety checks).
 Base URL: `CN_BASE_URL` (default `http://127.0.0.1:28080`), the same variable
 `mini_ork/cn_client.py` already uses.
 
-## Roadmap after P0
+## P0b — the per-turn hook (shipped)
+
+ContextNest's ingest hooks run their curl in the background, so their responses
+never reach Claude. Concord adds a **synchronous** hook on SessionStart and
+UserPromptSubmit: `POST /api/v1/coord/turn`, with a 2 s client timeout and
+`|| true`. It always returns 200.
+
+| Step | What happens |
+|---|---|
+| Resolve | Use `X-Concord-Principal` (`$CONCORD_PRINCIPAL`). Otherwise use the **lineage** `session:p<pane>@<repo>`, where `%94` becomes `p94` and `<repo>` is the basename of the nearest `.git` ancestor; then `session:tty-<tty>@<repo>`; then `session:<session_id>`. |
+| Bind | Upsert and heartbeat the principal, then bind `worker_id = session_id` to it. |
+| Deliver | Claim the principal's undelivered messages **at most once** (per-row compare-and-swap) and return them as `hookSpecificOutput.additionalContext`. Acks stay explicit. |
+
+The lease plane's pretool gate uses the bound principal as the lease
+`agent_id`, so a restarted worker in the same lineage still owns its leases.
+
+Every `mini-ork run` registers itself as `run:<run_id>` and exports
+`CONCORD_PRINCIPAL`, so the node workers it spawns are attributed to the run. An
+outer principal, such as a loop wrapped by `concord run`, becomes `labels.parent`.
+
+## P1 — the pre-action stale-premise check
+
+Evidence first. The P0.5 replay (`scripts/concord_replay.py`) ran over 14 days of
+transcripts: 60.7k file events and 1,157 candidate overlaps. Three raters
+(κ ≥ 0.93) labelled a 40-incident sample:
+
+| Signal | Precision |
+|---|---|
+| Raw rules (concurrent write, stale read, logical overlap) | 30% |
+| The same, after same-principal and Edit-protected-index filters | 43% |
+| **An agent is about to edit a file that another principal changed since this agent last read it** | **100% (7/7)** |
+
+So P1 interrupts **only** on that last signal, at the moment of action. This
+follows CoAgent (arXiv:2606.15376): notify, don't lock or abort; the agent judges
+whether the change breaks its plan. Everything weaker goes to a batched digest.
+
+| Endpoint | Hook | Behaviour |
+|---|---|---|
+| `POST /api/v1/coord/footprints` | PostToolUse (async) on Read/Edit/Write/MultiEdit/NotebookEdit | Records `(principal, worker, op, path, mtime_ns, size, seq)`; the server stats the file |
+| `POST /api/v1/coord/precheck` | PreToolUse (sync) on Edit/Write/MultiEdit/NotebookEdit | Warns if a write to the path exists from a principal outside P's lineage after P's latest footprint on it. It is advisory (`permissionDecision: "allow"`) and never denies in P1 |
+
 
 | Phase | Adds |
 |---|---|
-| P0.5 | Offline replay over ContextNest history to measure overlap-detector precision and recall before enabling anything |
-| P1 | Intents (declared scope plus assumptions), per-tool-call footprints, a `changes_since` cursor feed, and a per-turn digest |
+| P0.5 | ✅ Offline replay + labelled precision (see above) |
+| P1 | Footprints + pre-action stale-premise check (above); then intents (declared scope plus assumptions) and a per-turn `changes_since` digest for weaker signals |
 | P2 | Strict leases for the hot set (shared config, secrets, `main` ref, DB schema, ports); `--owns` enforced per turn; publish-gate validation |
 | P3 | Topic overlap through live intents; ack, escalate and freeze arbitration |
 | P4 | Alone-versus-combined test validation at merge |
