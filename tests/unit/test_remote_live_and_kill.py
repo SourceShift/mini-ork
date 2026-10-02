@@ -439,7 +439,9 @@ def test_remote_kill_all_targets_pids_in_journal(
         journal = run_dir / ".remote-pids.jsonl"
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
-            if journal.exists() and "python3" in journal.read_text():
+            # Any recorded entry: argv0 is sys.executable, which is ".../bin/python"
+            # on CI runners (no "python3" in it).
+            if journal.exists() and '"pid"' in journal.read_text():
                 break
             time.sleep(0.05)
         else:
@@ -716,9 +718,12 @@ def test_kill_run_reaches_the_remote_proc_through_the_marker(tmp_path, monkeypat
     outcome = {}
 
     def _run():
-        outcome["res"] = dispatch(DispatchRequest(model="test", prompt="", workspace="remote",
-                                                  cwd=str(target), env=env, path_map=pm, timeout_s=60),
-                                  ["/bin/sh", "-c", "sleep 30"], parse_text=lambda out: out)
+        try:
+            outcome["res"] = dispatch(DispatchRequest(model="test", prompt="", workspace="remote",
+                                                      cwd=str(target), env=env, path_map=pm, timeout_s=60),
+                                      ["/bin/sh", "-c", "sleep 30"], parse_text=lambda out: out)
+        except Exception as exc:  # surfaced by the assertion below
+            outcome["error"] = exc
 
     t = threading.Thread(target=_run, daemon=True)
     t.start()
@@ -755,8 +760,25 @@ def test_kill_run_reaches_the_remote_proc_through_the_marker(tmp_path, monkeypat
         t.join(timeout=15)
         assert not t.is_alive(), "the remote sleep 30 was not killed"
         assert time.time() - started < 15
+        assert "res" in outcome, f"dispatch thread died: {outcome.get('error')!r}"
         assert outcome["res"].ok is False
     finally:
         close_run_session("kill-run")
         server.should_exit = True
         thread.join(timeout=10)
+
+
+
+def test_killed_exit_record_without_rc_maps_to_137():
+    """The node-agent can send {"stream":"exit","state":"killed","rc":null} before
+    its watcher stores the OS code; the client crashed on int(None) — which
+    killed the dispatch thread instead of reporting a killed node."""
+    from mini_ork.runtime.backends.remote import RemoteWorkspace, _NodeRef
+
+    ws = RemoteWorkspace(node=_NodeRef(name="t", url="http://127.0.0.1:1", token="t", max_sessions=1),
+                         run_id="r", image="alpine:latest", drive_root="/tmp", retries=1)
+    body = "\n".join([json.dumps({"stream": "out", "data": "partial\n"}),
+                       json.dumps({"stream": "exit", "state": "killed", "rc": None})]).encode()
+    ws._request = lambda *a, **k: body  # type: ignore[method-assign]
+    rc, out, err = ws._drain_stream(7, 30)
+    assert rc == 137 and "partial" in out

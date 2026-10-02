@@ -236,7 +236,11 @@ def create_app(
                     yield json.dumps(
                         {"stream": "err", "offset": e, "data": err_chunk.decode("utf-8", "replace")}
                     ) + "\n"
-                if cur.state in ("exited", "killed", "timeout", "spawn_failed", "orphaned"):
+                # Terminal AND settled: a kill/timeout flips the state before the
+                # watcher stores the final state + OS code, so an early exit record
+                # said "killed, rc=null" for what was a timeout (rc 124).
+                if cur.state in ("exited", "killed", "timeout", "spawn_failed", "orphaned") and (
+                        cur.rc is not None or cur.state == "orphaned"):
                     yield json.dumps(
                         {"stream": "exit", "rc": cur.rc, "state": cur.state}
                     ) + "\n"

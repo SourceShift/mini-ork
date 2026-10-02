@@ -59,6 +59,7 @@ __all__ = [
 
 _TIMEOUT_RC = 124  # mirror mini_ork.remote.node_agent.procs._RC_TIMEOUT
 _SPAWN_FAILED_RC = 127  # mirror mini_ork.remote.node_agent.procs._RC_SPAWN_FAILED
+_KILLED_RC = 137  # 128 + SIGKILL: a proc killed before its exit code was recorded
 _DEFAULT_RETRIES = 5
 _DEFAULT_BACKOFF_S = 0.2  # jittered; 5 * ~0.6s = ~3s before raising
 _PUT_ROOT = "run"  # node-agent's _resolve_root allowlist: run | home | mo-home
@@ -672,8 +673,14 @@ class RemoteWorkspace:
                     if live_writer is not None and data:
                         live_writer.write_line(data, "stderr", partial=not data.endswith("\n"))
                 elif stream == "exit":
-                    last_rc = int(msg.get("rc", _SPAWN_FAILED_RC))
                     last_state = str(msg.get("state", ""))
+                    raw_rc = msg.get("rc")
+                    # A killed proc can report its exit record before the
+                    # node-agent's watcher has stored the OS code (rc=null).
+                    if raw_rc is None:
+                        last_rc = _KILLED_RC if last_state == "killed" else _SPAWN_FAILED_RC
+                    else:
+                        last_rc = int(raw_rc)
                     if last_state == "timeout":
                         last_rc = _TIMEOUT_RC
                     if last_state == "spawn_failed":
