@@ -1291,6 +1291,17 @@ def dispatch_model(
         workspace=_select_workspace(request.workspace, merged_env, lane_kind=lane_kind),
         path_map=getattr(request, "path_map", None),
     )
+    # remote-nodes-13 (D6): a remote spawn carries exactly THIS lane's secrets,
+    # gated by the environment profile, decided here where the lane is known —
+    # and refused before any network call.
+    if effective.workspace == "remote":
+        lane_secrets = _remote_lane_secrets(request.model, spec, merged_env, root)
+        if isinstance(lane_secrets, DispatchResult):
+            return lane_secrets
+        from ..remote.secrets_scope import LANE_SECRET_KEYS_ENV
+
+        effective = replace(effective, env={**merged_env, **lane_secrets,
+                                            LANE_SECRET_KEYS_ENV: ",".join(sorted(lane_secrets))})
     # Per-model dispatch backend registry (OCP): a model with a bespoke transport
     # (e.g. codex/opencode sidecar protocol) registers a backend.
     backend = MODEL_DISPATCH_BACKENDS.get(request.model, engine.dispatch)
@@ -1740,6 +1751,41 @@ def _run_path_map(env: Mapping[str, str]) -> "object | None":
 
     roots = load_run_roots(run_dir)
     return PathMap.from_roots(roots) if roots is not None else None
+
+
+def _remote_lane_secrets(model: str, spec: ProviderSpec, env: Mapping[str, str],
+                         root: str | os.PathLike[str] | None) -> dict[str, str] | DispatchResult:
+    """This lane's secrets for a remote spawn, or a refusal (remote-nodes-13).
+
+    The profile named by ``MO_NODE_ENV`` must list each one (by its spawn key
+    or by the lane's ``api_key_env``); an unlisted one is a setup error
+    returned as a failed :class:`DispatchResult` before anything is sent."""
+    from ..remote.secrets_scope import SecretNotPermittedError, scoped_env
+
+    entry = _load_providers_registry(root).get(model)
+    entry = entry if isinstance(entry, Mapping) else {}
+    profile, profile_path = None, ""
+    profile_name = (env.get("MO_NODE_ENV") or "").strip()
+    if profile_name:
+        from ..remote.environments import load_profile
+
+        profile_path = f"config/environments/{profile_name}.yaml"
+        try:
+            profile = load_profile(profile_name, env=env)
+        except (FileNotFoundError, ValueError) as exc:
+            return DispatchResult(ok=False, rc=2, model=model,
+                                  error=f"environment profile {profile_name!r}: {exc}")
+    try:
+        store = read_secret_exports(secret_store_path(env))
+    except Exception:  # noqa: BLE001 — an unreadable store means no stored values
+        store = {}
+    try:
+        return scoped_env(spec.env, profile, store=store, lane=model,
+                          kind=str(entry.get("kind") or ""),
+                          api_key_env=str(entry.get("api_key_env") or ""),
+                          runtime=env, profile_path=profile_path)
+    except SecretNotPermittedError as exc:
+        return DispatchResult(ok=False, rc=2, error=str(exc), model=model)
 
 
 def _attach_isolation(request: DispatchRequest, env: Mapping[str, str], *,

@@ -51,6 +51,10 @@ _RUN_LABEL = "mo.sandbox=1"
 
 _READ_CHUNK = 65536  # per read; 4 KiB per 50 ms poll capped throughput at ~80 KiB/s
 _DRAIN_DEADLINE_S = 5.0  # max time to drain pipes after the child exits
+# remote-nodes-13 §2: shorter values are too likely to false-positive in
+# arbitrary output (a hex digit, a UUID prefix); the redaction helper
+# ignores anything below this floor.
+_REDACT_MIN_LEN = 8
 
 
 @dataclass
@@ -299,7 +303,9 @@ class ProcRegistry:
     def _build_host_argv(self, spec: ProcSpec) -> list[str]:
         """Compose the argv that lands the child in the right process group."""
         if self.runtime == "host":
-            return list(spec.argv)
+            # No container mounts /workspace here: map sandbox paths in argv
+            # onto this run's dirs, as the docker runtime's mounts would.
+            return [self._host_path(a) for a in spec.argv]
         # docker runtime — the host-side Popen runs `docker exec -i` so the
         # in-container process group is a fresh pgid (setsid inside the
         # container keeps the discipline). The `-i` keeps stdin open.
@@ -322,10 +328,14 @@ class ProcRegistry:
         applies). Host runtime: /workspace/<x> maps onto this run's <x> dir."""
         if self.runtime != "host" or not cwd:
             return None
-        if cwd == "/workspace" or cwd.startswith("/workspace/"):
-            rel = cwd[len("/workspace"):].lstrip("/")
+        return self._host_path(cwd)
+
+    def _host_path(self, value: str) -> str:
+        """Host runtime: a ``/workspace[/...]`` path → this run's dir on disk."""
+        if value == "/workspace" or value.startswith("/workspace/"):
+            rel = value[len("/workspace"):].lstrip("/")
             return str(self.state_dir.parent / rel) if rel else str(self.state_dir.parent)
-        return cwd
+        return value
 
     def spawn(self, spec: ProcSpec) -> _ProcState:
         # remote-nodes-10: idempotency dedup. A re-dispatch of the same
@@ -345,6 +355,8 @@ class ProcRegistry:
         err_path.touch()
 
         env = {"PATH": os.environ.get("PATH", ""), **spec.env}
+        if self.runtime == "host":
+            env = {k: self._host_path(v) for k, v in env.items()}
         argv = self._build_host_argv(spec)
 
         try:
@@ -390,6 +402,13 @@ class ProcRegistry:
         # Read in binary mode to avoid the text-mode ``read()`` blocking
         # indefinitely when the child produces no output (the sleep case
         # in the timeout tests). We pull bytes and decode on append.
+        # remote-nodes-13 §2: the value of every secret-NAMED key in the
+        # in-memory ``spec.env`` (never from disk — D6) is redacted from
+        # stdout/stderr before it lands on disk or streams. Only secrets:
+        # masking every env value turned paths and ids into ``***``. Values
+        # under ``_REDACT_MIN_LEN`` are ignored (false-positive risk).
+        from ..secrets_scope import make_redactor, secret_values
+        redactor = make_redactor(secret_values(ps.spec.env), min_length=_REDACT_MIN_LEN)
         timed_out = False
         try:
             while True:
@@ -405,14 +424,14 @@ class ProcRegistry:
                         continue
                     chunk = os.read(fd, _READ_CHUNK)
                     if chunk:
-                        sink.write(chunk)
+                        sink.write(redactor.redact(chunk))
                 ps.out_offset = out_path.stat().st_size
                 ps.err_offset = err_path.stat().st_size
                 if exited:
                     # The pipes can still hold far more than one read's worth
                     # (an agent CLI prints its whole JSON result as it exits);
                     # drain to EOF or the tail is silently lost.
-                    self._drain_to_eof(proc, out_f, err_f)
+                    self._drain_to_eof(proc, out_f, err_f, redactor)
                     break
                 if deadline is not None and time.time() >= deadline:
                     # A SIGKILL'd child returns a negative rc (-9). Per the
@@ -452,11 +471,14 @@ class ProcRegistry:
             self._persist(ps)
 
     @staticmethod
-    def _drain_to_eof(proc: subprocess.Popen, out_f, err_f) -> None:
+    def _drain_to_eof(proc: subprocess.Popen, out_f, err_f, redactor=None) -> None:
         """Copy whatever is left in both pipes after exit, until EOF.
 
         Bounded by ``_DRAIN_DEADLINE_S``: a grandchild that inherited the pipe
         and outlives the child would otherwise keep it open forever.
+        ``redactor`` is the same streaming redactor the watcher uses; if
+        ``None`` (the historical default), drain passes chunks through
+        unredacted — kept as a kwarg so unrelated tests do not regress.
         """
         open_streams = [(s, sink) for s, sink in ((proc.stdout, out_f), (proc.stderr, err_f))
                         if s is not None]
@@ -469,7 +491,7 @@ class ProcRegistry:
                     continue
                 chunk = os.read(stream.fileno(), _READ_CHUNK)
                 if chunk:
-                    sink.write(chunk)
+                    sink.write(redactor.redact(chunk) if redactor is not None else chunk)
                 else:
                     open_streams.remove(pair)  # EOF
 

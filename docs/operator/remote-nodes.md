@@ -372,3 +372,95 @@ The mirror takes `RemoteWorkspace._session_lock` around every push and
 pull. The same lock is shared with the future tree-sync path (epic 07)
 so a mirror push/pull never interleaves with a tree-bundle upload on
 the same session.
+
+## Credentials for remote nodes
+
+A remote node never receives the control plane's ambient credentials. Each
+remote spawn carries exactly the secrets of the ONE lane being dispatched
+(D6 in `docs/architecture/remote-nodes.md`).
+
+### What ships to a remote spawn
+
+- `providers.dispatch_model` knows the lane. For a remote dispatch it works
+  out that lane's secrets: the secret-named keys its `providers.yaml` builder
+  put into the spawn env, plus `CLAUDE_CODE_OAUTH_TOKEN` / `ANTHROPIC_API_KEY`
+  for an `anthropic-native` lane. Values come from the local secret store
+  (`secrets.local.sh`), with an exported shell variable taking precedence.
+- With `--env <profile>`, every one of those secrets must be listed under the
+  profile's `secrets:`. You can list either the key the spawn carries or the
+  lane's `api_key_env`. An unlisted secret fails the dispatch with
+  `SecretNotPermittedError`, naming the profile file, before anything is sent.
+- The spawn layer then forwards only those named secrets. Every other
+  secret-named key (`*_KEY`, `*_TOKEN`, `*_SECRET`, `*PASSWORD*`) is dropped.
+- Without a profile (a one-off `MO_NODE_URL` run), the lane's own secrets still
+  pass and nothing else does.
+
+Example: a `glm` lane with `kind: anthropic-compat` and `api_key_env:
+GLM_API_KEY` ships `ANTHROPIC_AUTH_TOKEN` (the GLM key's value) and
+`ANTHROPIC_BASE_URL`, and nothing else. The control plane's `OPENAI_API_KEY`,
+`ANTHROPIC_API_KEY` and `GLM_API_KEY` itself stay local. The profile says:
+
+```yaml
+secrets: [GLM_API_KEY]
+```
+
+Git and GitHub credentials are never sent: sync and push stay local (D1).
+
+### Claude on a node
+
+The macOS Claude Code login lives in the Keychain and cannot be copied to a
+node. Run `claude setup-token`, put the result in `secrets.local.sh` as
+`CLAUDE_CODE_OAUTH_TOKEN`, and list that name in the profile's `secrets:`.
+`anthropic-compat` lanes (GLM, MiniMax and other gateways) need only their
+`api_key_env`.
+
+### Egress under `network: allowlist`
+
+The session proxy admits the profile's `allow_domains` plus the hosts of the
+configured lanes' `base_url`s, and the provider defaults for lanes without one
+(`api.anthropic.com` for `anthropic-native`, `api.openai.com` for
+`codex-native`). Lane calls are therefore not blocked by default.
+
+### Checking a node: `mini-ork nodes doctor`
+
+```bash
+mini-ork nodes ls                                    # registered nodes
+mini-ork nodes ping hetzner-1                        # one health probe
+mini-ork nodes doctor --env default --recipe code-fix
+mini-ork nodes doctor --env default --lane glm --no-llm
+```
+
+`doctor` runs nine ordered checks and stops at the first failure, with a fix
+hint:
+
+1. node reachable
+2. token accepted
+3. engine present or uploaded
+4. image prepared
+5. session up (including the initial tree sync)
+6. the lanes' CLIs and `import mini_ork` inside the session
+7. a per-lane auth smoke
+8. the network level the node applied
+9. session down (verified on the node)
+
+Step 7 sends one short prompt through the real dispatch for each lane that
+`--recipe` resolves to (or each `--lane`). It uses a 30 s ceiling, so a bad
+key shows up as `auth: no response in 30 s — check the key` instead of a hang.
+`--no-llm` skips step 7. The exit code is 0 only when every check passed. Run
+`doctor` from inside the target checkout, or set `MO_TARGET_CWD`: step 5
+syncs that tree.
+
+### Keys at rest, and the limits
+
+- The node-agent keeps spawn env values in memory only. `.procs/<pid>.json`
+  records keys, never values.
+- stdout and stderr are redacted on the node before they are written or
+  streamed: every value of 8 or more characters of a secret-named key becomes
+  `***`. The control plane masks the live file again. Other env values (paths,
+  ids) are left alone.
+- Redaction is per chunk. A secret that straddles a chunk boundary, or that
+  the process prints transformed (base64, split), is not masked.
+- A malicious agent process can still read its own env. Scoping limits blind
+  exposure (every key going to every node), not deliberate exfiltration by a
+  process that runs `env | curl`. A credential proxy that keeps keys out of
+  the sandbox entirely is the hardening follow-up.

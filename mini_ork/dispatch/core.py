@@ -304,6 +304,21 @@ def _spawn_in_workspace(
                 applied_stdin = path_map.text(stdin)
 
             if backend == "remote":
+                # remote-nodes-13 (D6): only the secrets the dispatch layer
+                # scoped to THIS lane (named in MO_LANE_SECRET_KEYS) cross to
+                # the node; every other secret-named key is dropped, so an
+                # ambient OPENAI_API_KEY / ANTHROPIC_API_KEY never leaves.
+                # A spawn that bypassed dispatch_model carries no names and
+                # therefore no secrets (fail closed).
+                from mini_ork.remote.secrets_scope import LANE_SECRET_KEYS_ENV, is_secret_name
+
+                keep = {k for k in str(env.get(LANE_SECRET_KEYS_ENV) or "").split(",") if k}
+                scoped_env = {k: v for k, v in dict(applied_env).items()
+                              if k != LANE_SECRET_KEYS_ENV and (k in keep or not is_secret_name(k))}
+                for key in keep:
+                    if key not in scoped_env and env.get(key):
+                        scoped_env[key] = env[key]
+                applied_env = scoped_env
                 # A real remote sandbox is expected to have every path
                 # translated; a leak means a host prefix slipped through and
                 # the child would point at a file that does not exist there.

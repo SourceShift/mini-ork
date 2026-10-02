@@ -288,6 +288,20 @@ def _default_state_db_path(run_dir: str | None) -> str:
     return os.path.join(home, "state.db")
 
 
+class _RedactingLiveWriter:
+    """A :class:`LiveWriter` whose lines are secret-masked before they land."""
+
+    def __init__(self, inner: LiveWriter, redactor: Any) -> None:
+        self._inner = inner
+        self._redactor = redactor
+
+    def write_line(self, data: str, stream: str, *args: Any, **kwargs: Any) -> Any:
+        return self._inner.write_line(self._redactor.redact_text(data), stream, *args, **kwargs)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+
 class _NodeRef(NamedTuple):
     """The minimal slice of :class:`mini_ork.remote.nodes.Node` this module needs.
 
@@ -351,6 +365,8 @@ class RemoteWorkspace:
         self._sync_down_bytes = 0
         self._setup_s: float | None = None
         self._up_at: float | None = None
+        # Optional observer of every remote.setup.step record (``nodes doctor``).
+        self.on_setup_step: Any = None
         self._drive_root = drive_root
         self._mount_path = mount_path
         # engine_root defaults to $MINI_ORK_ROOT (the control plane checkout);
@@ -556,17 +572,25 @@ class RemoteWorkspace:
     def _setup_step(self, step: str, fn: Any, *, detail: str = "") -> Any:
         """Run one provisioning step between ``remote.setup.step`` start/ok|fail
         events (epic 12 §4) — the data for a live "setting up" checklist."""
-        self._emit_sync_event("remote.setup.step", step=step, status="start")
+        self._setup_event(step=step, status="start")
         t0 = time.monotonic()
         try:
             out = fn()
         except Exception as exc:
-            self._emit_sync_event("remote.setup.step", step=step, status="fail",
-                                  ms=int((time.monotonic() - t0) * 1000), detail=str(exc)[:500])
+            self._setup_event(step=step, status="fail", ms=int((time.monotonic() - t0) * 1000),
+                              detail=str(exc)[:500])
             raise
-        self._emit_sync_event("remote.setup.step", step=step, status="ok",
-                              ms=int((time.monotonic() - t0) * 1000), detail=detail)
+        self._setup_event(step=step, status="ok", ms=int((time.monotonic() - t0) * 1000),
+                          detail=detail)
         return out
+
+    def _setup_event(self, **fields: Any) -> None:
+        self._emit_sync_event("remote.setup.step", **fields)
+        if self.on_setup_step is not None:
+            try:
+                self.on_setup_step(dict(fields))
+            except Exception:  # noqa: BLE001 — an observer never breaks provisioning
+                pass
 
     def _await_capacity(self) -> dict:
         """Wait for a free session slot on the node; return its health.
@@ -627,6 +651,17 @@ class RemoteWorkspace:
             payload["network"] = getattr(prof, "network", "") or "full"
             if getattr(prof, "allow_domains", None):
                 payload["allow_domains"] = list(prof.allow_domains)
+            if payload["network"] == "allowlist":
+                # remote-nodes-13 §3: the proxy must admit the lanes' own
+                # endpoints (base_url hosts, else provider defaults), or every
+                # LLM call of an allowlist session is blocked.
+                from mini_ork.dispatch.providers import _load_providers_registry
+                from mini_ork.remote.secrets_scope import lane_egress_hosts
+
+                domains = list(payload.get("allow_domains") or [])
+                domains += [h for h in lane_egress_hosts(_load_providers_registry(self._engine_root))
+                            if h not in domains]
+                payload["allow_domains"] = domains
         return payload
 
     def _current_engine_sha(self, subprocess_mod: Any) -> str:
@@ -896,6 +931,12 @@ class RemoteWorkspace:
         # The dispatch layer passes the host path; MO_LIVE_FILE is the fallback.
         live_path = live_file_path or _resolve_live_file_path()
         live = LiveWriter(live_path) if live_path else None
+        if live is not None and isinstance(env, Mapping):
+            # remote-nodes-13 §2, defense in depth: the node-agent already
+            # redacts, and the host-side live file is masked again.
+            from mini_ork.remote.secrets_scope import make_redactor, secret_values
+
+            live = _RedactingLiveWriter(live, make_redactor(secret_values(env)))
         node_id = (env.get("MO_NODE_ID", "") if isinstance(env, Mapping) else "").strip()
         # remote-nodes-10: idempotency dedup + transcript persistence. The
         # dispatch layer sets MO_NODE_ATTEMPT + MO_INPUT_HASH from the

@@ -513,8 +513,10 @@ def test_profile_setup_runs_image_prepare_and_the_session_uses_its_tag(tmp_path,
     prep = next(b for _m, p, b in calls if p == "/v1/images/prepare")
     assert (prep["base_image"], prep["setup"]) == ("base:1", "apt-get install -y jq")
     sess = next(b for _m, p, b in calls if p == "/v1/sessions")
+    domains = sess.pop("allow_domains")
     assert sess == {"run_id": "r-img", "image": "mo-prep:k1", "resources": {"cpus": 2},
-                    "network": "allowlist", "allow_domains": ["pypi.org"]}
+                    "network": "allowlist"}
+    assert domains[0] == "pypi.org"          # the profile's own, then the lanes' endpoints (epic 13)
     assert ("image_prepare", "ok") in steps
 
     ws, calls, steps = workspace(RemoteUnavailableError("HTTP 500: image_prepare_failed"))

@@ -78,6 +78,7 @@ _NATIVE_MODULE_SUBS = {
     "active-eval": "mini_ork.cli.active_eval",
     "certify": "mini_ork.cli.certify",
     "node-agent": "mini_ork.cli.node_agent",
+    "nodes": "mini_ork.cli.nodes",
 }
 
 _HELP = """mini-ork — task operating system for agents (v0.1)

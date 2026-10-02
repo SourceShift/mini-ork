@@ -224,33 +224,50 @@ def get_run_session(
             except Exception:  # noqa: BLE001 — the up() error is the one to report
                 pass
             raise
-        run_dir = _resolve_run_dir(env, run_id)
-        session = WorkspaceSession(
-            workspace=ws,
-            backend=backend,
-            session_id=_extract_session_id(ws, backend),
-            run_dir=run_dir,
-        )
-        try:
-            _write_marker(
-                run_dir,
-                {
-                    "backend": backend,
-                    "session_id": session.session_id,
-                    "created_at": datetime.now(timezone.utc).strftime(
-                        "%Y-%m-%dT%H:%M:%SZ"
-                    ),
-                    "run_id": run_id,
-                    **_node_locator(ws),
-                },
-            )
-        except OSError:
-            # Marker write is best-effort — the in-memory registry still owns
-            # the workspace for the rest of the run. ``kill_run`` will lose
-            # its targeted reap (falls back to TTL), but the run itself works.
-            pass
-        _SESSION_REGISTRY[key] = session
+        _register(run_id, backend, ws, env)
         return ws
+
+
+def register_run_session(run_id: str, backend: str, ws: Workspace, *,
+                         env: Mapping[str, str]) -> None:
+    """Adopt an ALREADY-UP workspace as ``run_id``'s session, so dispatches for
+    that run reuse it and :func:`close_run_session` tears it down. For callers
+    that must watch provisioning themselves (``mini-ork nodes doctor``)."""
+    with _SESSION_LOCK:
+        if (run_id, backend) in _SESSION_REGISTRY:
+            raise RuntimeError(f"run {run_id!r} already has a {backend} session")
+        _register(run_id, backend, ws, env)
+
+
+def _register(run_id: str, backend: str, ws: Workspace, env: Mapping[str, str]) -> None:
+    """Record ``ws`` + its marker (caller holds ``_SESSION_LOCK``)."""
+    key = (run_id, backend)
+    run_dir = _resolve_run_dir(env, run_id)
+    session = WorkspaceSession(
+        workspace=ws,
+        backend=backend,
+        session_id=_extract_session_id(ws, backend),
+        run_dir=run_dir,
+    )
+    try:
+        _write_marker(
+            run_dir,
+            {
+                "backend": backend,
+                "session_id": session.session_id,
+                "created_at": datetime.now(timezone.utc).strftime(
+                    "%Y-%m-%dT%H:%M:%SZ"
+                ),
+                "run_id": run_id,
+                **_node_locator(ws),
+            },
+        )
+    except OSError:
+        # Marker write is best-effort — the in-memory registry still owns
+        # the workspace for the rest of the run. ``kill_run`` will lose
+        # its targeted reap (falls back to TTL), but the run itself works.
+        pass
+    _SESSION_REGISTRY[key] = session
 
 
 def close_run_session(run_id: str, *, lock_timeout: float | None = None) -> None:
