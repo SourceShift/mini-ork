@@ -32,6 +32,7 @@ from mini_ork.context import (
 from mini_ork.dispatch import agents_config, config_resolve, deadline_budget
 from mini_ork.vcs import repo_integrity_guard
 from mini_ork.gates import rubric_prescreen
+from mini_ork.orchestration import concord_run
 
 _NATIVE_SUBS = {"apply", "classify", "plan", "verify", "reflect", "garden", "validate"}
 
@@ -470,7 +471,12 @@ def _run_lifecycle(argv, root) -> int:
         try:
             rc = _run_lifecycle_impl(inner, root, sink)
         finally:
-            _release_remote_session()
+            try:
+                _release_remote_session()
+            finally:
+                # End the run principal on every return path and on exceptions,
+                # and pop the handle so --json never emits the object.
+                concord_run.stop(sink.pop("_concord", None))
     if emit_json:
         sink["returncode"] = rc
         sys.stdout.write(
@@ -669,6 +675,15 @@ def _run_lifecycle_impl(argv, root, sink) -> int:
     sink["run_id"] = run_id
     if (blocked := _budget_preflight(sink)) is not None:
         return blocked
+
+    # Every run is a Concord principal: register it (fail-open) so the node
+    # workers this run spawns inherit CONCORD_PRINCIPAL. Concord must never
+    # fail or delay a run, so any error here only logs and drops the handle.
+    try:
+        sink["_concord"] = concord_run.start(run_id, recipe, kickoff)
+    except Exception as exc:
+        sys.stderr.write(f"[concord] run principal not started: {exc}\n")
+        sink["_concord"] = None
 
     # derived task_class from recipe's task_class.yaml::name
     derived = ""
