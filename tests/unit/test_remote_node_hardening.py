@@ -128,3 +128,37 @@ def test_execute_records_the_dispatcher_pid_kill_run_reads(tmp_path, monkeypatch
     ex.main([], root=str(repo), dispatch_fn=llm)
     assert seen["pid"] == str(os.getpid())
     assert not (rd / ".pid").exists()          # removed when the run ends
+
+
+def test_engine_from_a_shallow_clone_stages_on_a_bare_node(tmp_path, monkeypatch):
+    """CI checks out shallow; a bundle of HEAD there names the missing parent as
+    a prerequisite, which a node with no repo cannot satisfy. The engine bundle
+    is one parentless commit of HEAD's tree, so it always stages."""
+    import subprocess as sp
+
+    from mini_ork.remote.node_agent.engines import EngineManager
+
+    origin = tmp_path / "origin"
+    origin.mkdir()
+    for args in (["init", "-q"], ["config", "user.email", "t@t"], ["config", "user.name", "t"]):
+        sp.run(["git", *args], cwd=origin, check=True, capture_output=True)
+    for i in range(2):
+        (origin / "mini_ork.py").write_text(f"V = {i}\n")
+        sp.run(["git", "add", "-A"], cwd=origin, check=True, capture_output=True)
+        sp.run(["git", "commit", "-q", "-m", f"c{i}"], cwd=origin, check=True, capture_output=True)
+    shallow = tmp_path / "shallow"
+    sp.run(["git", "clone", "-q", "--depth", "1", f"file://{origin}", str(shallow)], check=True,
+           capture_output=True)
+    head = sp.run(["git", "-C", str(shallow), "rev-parse", "HEAD"], capture_output=True, text=True,
+                  check=True).stdout.strip()
+    ws = RemoteWorkspace(node=_NodeRef(name="n", url="http://n", token="t"), run_id="r-eng", image="i",
+                         drive_root=str(tmp_path), engine_root=str(shallow))
+    bundle = ws._bundle_engine(sp)
+    elsewhere = tmp_path / "node"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)                       # no repo around the node-agent
+    EngineManager(tmp_path / "state", "0.1.0").stage_bundle(head, bundle)
+    assert (tmp_path / "state" / "engines" / head / "mini_ork.py").read_text() == "V = 1\n"
+    refs = sp.run(["git", "-C", str(shallow), "for-each-ref", "refs/mo/"], capture_output=True,
+                  text=True).stdout
+    assert refs == ""                                  # the temp bundle ref is cleaned up

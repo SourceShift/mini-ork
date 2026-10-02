@@ -734,22 +734,38 @@ class RemoteWorkspace:
         return sha
 
     def _bundle_engine(self, subprocess_mod: Any) -> bytes:
-        """Produce a git bundle of the engine tree at HEAD; return its bytes."""
-        with tempfile.NamedTemporaryFile(suffix=".bundle", delete=False) as tmp:
-            tmp_path = tmp.name
-        try:
-            r = subprocess_mod.run(
-                ["git", "-C", self._engine_root, "bundle", "create", tmp_path, "HEAD"],
-                capture_output=True, text=True, check=False, timeout=300,
-            )
+        """A self-contained git bundle of the engine tree at HEAD.
+
+        One parentless commit of HEAD's tree under ``refs/mo/engine``: no
+        history to ship, and no prerequisite commits — a bundle of HEAD from a
+        shallow clone (CI) names the missing parent as a prerequisite, which
+        a node with no copy of the repo cannot satisfy."""
+        root = self._engine_root
+        env = {**os.environ, "GIT_AUTHOR_NAME": "mini-ork", "GIT_AUTHOR_EMAIL": "engine@mini-ork",
+               "GIT_COMMITTER_NAME": "mini-ork", "GIT_COMMITTER_EMAIL": "engine@mini-ork"}
+
+        def git(*args: str) -> str:
+            r = subprocess_mod.run(["git", "-C", root, *args], capture_output=True, text=True,
+                                   check=False, timeout=300, env=env)
             if r.returncode != 0:
                 raise RemoteUnavailableError(
-                    f"git bundle create failed for {self._engine_root!r}: "
-                    f"{r.stderr.strip() or r.stdout.strip()}"
-                )
+                    f"engine bundle: git {' '.join(args)} failed in {root!r}: "
+                    f"{r.stderr.strip() or r.stdout.strip()}")
+            return r.stdout.strip()
+
+        with tempfile.NamedTemporaryFile(suffix=".bundle", delete=False) as tmp:
+            tmp_path = tmp.name
+        ref = f"refs/mo/engine-bundle-{os.getpid()}"
+        try:
+            commit = git("commit-tree", git("rev-parse", "HEAD^{tree}"),
+                         "-m", f"mini-ork engine {git('rev-parse', 'HEAD')}")
+            git("update-ref", ref, commit)
+            git("bundle", "create", tmp_path, ref)
             with open(tmp_path, "rb") as fh:
                 return fh.read()
         finally:
+            subprocess_mod.run(["git", "-C", root, "update-ref", "-d", ref],
+                               capture_output=True, check=False, timeout=60)
             try:
                 os.unlink(tmp_path)
             except OSError:

@@ -115,20 +115,29 @@ class EngineManager:
         # cwd happened to be in — never the uploaded bundle.
         scratch = Path(tempfile.mkdtemp(prefix=".engine-stage-", dir=self.state_dir))
         try:
-            steps = (
-                ["git", "init", "-q", "--bare", str(scratch)],
-                ["git", "-C", str(scratch), "bundle", "verify", str(bundle_path)],
-                ["git", "-C", str(scratch), "fetch", "-q", str(bundle_path), "+HEAD:refs/mo/engine"],
-            )
-            for argv in steps:
-                done = self._run(argv)
+            def git(*argv: str) -> str:
+                done = self._run(list(argv))
                 if done.returncode != 0:
                     raise RuntimeError(f"`{' '.join(argv)}` failed: "
                                        f"{done.stderr.strip() or done.stdout.strip()}")
+                return done.stdout or ""
+
+            git("git", "init", "-q", "--bare", str(scratch))
+            git("git", "-C", str(scratch), "bundle", "verify", str(bundle_path))
+            # The bundle's first ref is the engine (the client sends one
+            # parentless commit under refs/mo/engine-bundle-*; an older client
+            # sends HEAD). `sha` names the engine; the content is that commit.
+            heads = [line.split()[1] for line in git(
+                "git", "-C", str(scratch), "bundle", "list-heads", str(bundle_path)).splitlines()
+                if len(line.split()) == 2]
+            if not heads:
+                raise RuntimeError("engine bundle carries no ref")
+            git("git", "-C", str(scratch), "fetch", "-q", str(bundle_path),
+                f"+{heads[0]}:refs/mo/engine")
             target = self.engines_dir / sha
             target.mkdir(parents=True, exist_ok=True)
             archive = self._run(
-                ["git", "-C", str(scratch), "archive", "--format=tar", sha,
+                ["git", "-C", str(scratch), "archive", "--format=tar", "refs/mo/engine",
                  "-o", str(target / "_src.tar")]
             )
             if archive.returncode != 0:
