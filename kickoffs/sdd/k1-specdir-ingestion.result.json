@@ -1,0 +1,25 @@
+task_class=recursive_validate_impl
+workflow_version=latest
+kickoff=/Users/admin/ps/mini-ork-sdd-wt/kickoffs/sdd/k1-specdir-ingestion.md
+run_id=run-sdd-k1-specdir-ingestion-202610032343
+profile_path=/Volumes/docker-ssd/ps/mini-ork-sdd-wt/.mini-ork/runs/run-sdd-k1-specdir-ingestion-202610032343/run_profile.json
+profile_status=ready
+profile_confidence=0.95
+plan_path=/Volumes/docker-ssd/ps/mini-ork-sdd-wt/.mini-ork/runs/run-sdd-k1-specdir-ingestion-202610032343/plan.json
+task_class=recursive_validate_impl
+    nodes:    15 (from workflow.yaml)
+  [skip] planner node handled by the Python plan runtime
+  [skip] planner node handled by the Python plan runtime
+  [ok] rollback complete
+  [verdict] run-level verdict.json: fail (failed_nodes=11)
+── rubric (advisory pre-screen) ──
+{
+  "verdict": "partial",
+  "artifact_path": "",
+  "task_class": "recursive_validate_impl",
+  "pass_count": 1,
+  "fail_count": 2,
+  "results": [{"verifier":"verifiers/tier1-compile-typecheck.py","pass":false,"rc":1,"detail":"{\"verifier\": \"tier1-compile-typecheck\", \"pass\": false, \"evidence_path\": \"/Volumes/docker-ssd/ps/mini-ork-sdd-wt/.mini-ork/runs/run-sdd-k1-specdir-ingestion-202610032343/tier1-evidence.log\", \"reason\": ","evidence_path":"/Volumes/docker-ssd/ps/mini-ork-sdd-wt/.mini-ork/runs/run-sdd-k1-specdir-ingestion-202610032343/evidence/tier1-compile-typecheck-1791065501.log"},{"verifier":"verifiers/tier2-scoped-unit.py","pass":false,"rc":1,"detail":"{\"verifier\": \"tier2-scoped-unit\", \"pass\": false, \"evidence_path\": \"/Volumes/docker-ssd/ps/mini-ork-sdd-wt/.mini-ork/runs/run-sdd-k1-specdir-ingestion-202610032343/tier2-evidence.log\", \"reason\": \"no im","evidence_path":"/Volumes/docker-ssd/ps/mini-ork-sdd-wt/.mini-ork/runs/run-sdd-k1-specdir-ingestion-202610032343/evidence/tier2-scoped-unit-1791065501.log"},{"verifier":"verifiers/tier3-property-mutation.py","pass":true,"evidence_path":"/Volumes/docker-ssd/ps/mini-ork-sdd-wt/.mini-ork/runs/run-sdd-k1-specdir-ingestion-202610032343/evidence/tier3-property-mutation-1791065501.log"},{"verifier":"__gates__","pass":true,"evidence_path":"gate_registry"}]
+}
+── reflect (auto, since run start) ──
+mini_ork_result={"run_id":"run-sdd-k1-specdir-ingestion-202610032343","task_class":"recursive_validate_impl","profile_status":"ready","profile_confidence":0.95,"plan_path":"/Volumes/docker-ssd/ps/mini-ork-sdd-wt/.mini-ork/runs/run-sdd-k1-specdir-ingestion-202610032343/plan.json","verdict":"partial","cost_usd":1.016357,"returncode":1}
