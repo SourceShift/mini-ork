@@ -11,6 +11,7 @@ export MO_ALLOW_FRAMEWORK_CWD=1
 export MO_TIER4_QUORUM=2          # minimax lens dead (token plan exhausted 2026-10-03)
 export MINI_ORK_PROFILE_GATE=0    # kickoffs carry ## Verification command; skip Q&A gate
 export MINI_ORK_VENV=/Users/admin/ps/mini-ork/.venv   # worktree has no gitignored .venv
+export MO_NODE_TIMEOUT_S=3600            # default 1500s reaped K2 implementer mid-probe
 PY="$MINI_ORK_VENV/bin/python"
 cd "$WT" || exit 1                # dispatch from repo root, never inside .mini-ork/
 

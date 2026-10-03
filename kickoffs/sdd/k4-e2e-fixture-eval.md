@@ -58,6 +58,10 @@ python3 -m pytest -q tests/test_specdir_ingest.py tests/test_sdd_verifiers.py te
 
 ## Hard rules
 
+- NEVER run the repo-wide `python3 -m pytest -q` (full suite) as a probe or
+  check — it is flaky under concurrent campaigns on this machine and takes
+  19+ minutes. Only the scoped suites named in this kickoff.
+
 - The integration test must not invoke any LLM lane — deterministic spine
   only (ingest → lint → ratification → test-validity → smoke → aggregate →
   ledger).

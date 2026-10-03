@@ -83,6 +83,10 @@ python3 -m pytest -q tests/test_specdir_ingest.py tests/test_sdd_verifiers.py
 
 ## Hard rules
 
+- NEVER run the repo-wide `python3 -m pytest -q` (full suite) as a probe or
+  check — it is flaky under concurrent campaigns on this machine and takes
+  19+ minutes. Only the scoped suites named in this kickoff.
+
 - Verifiers are deterministic: no LLM calls, no network beyond what a smoke
   probe command itself does.
 - A verifier never trusts an LLM node's self-report — recompute from child
