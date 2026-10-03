@@ -1,0 +1,48 @@
+name: spec_driven_delivery
+task_class: spec_driven_delivery
+version: "0.1.0"
+description: >
+  Deliver every feature described by a directory of markdown spec files with
+  the spec as the sole source of truth: compile each spec into a SpecCard,
+  derive executable acceptance gates before implementation, dispatch each
+  atomic deliverable through recursive-validate-impl, and verify with live
+  smoke, an optional UI-craft gate, and a traceability ledger.
+
+artifact_contract_ref: artifact_contract.yaml
+default_workflow: workflow.yaml
+
+matches:
+  keywords:
+    - spec driven
+    - spec-driven delivery
+    - spec directory
+  regex:
+    - "Spec dir:"
+    - "spec-index"
+  path_globs:
+    - "recipes/spec-driven-delivery/**"
+
+default_gates:
+  - budget_gate
+  - scope_gate
+
+risk_class: high
+max_parallel_runs: 1
+budget_cap_usd: 100
+tags:
+  - recursive
+  - spec-driven
+  - test-first
+  - implementation
+
+heterogeneity:
+  authorship_separation:
+    # Lanes that write SpecCards and gates (contract_compiler, test_author).
+    contract_and_test_lanes:
+      - planner
+      - reviewer
+    # Lanes that write code: per_spec_dispatcher here plus the child
+    # recursive-validate-impl implementer node (model_lane: worker).
+    implementer_lanes:
+      - implementer
+      - worker

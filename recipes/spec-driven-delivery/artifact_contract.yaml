@@ -1,0 +1,45 @@
+task_class: spec_driven_delivery
+expected_artifact: composite
+
+success_verifiers:
+  - verifiers/specdir-ingest.py
+  - verifiers/ratification-check.py
+  - verifiers/spec-lint.py
+  - verifiers/test-validity.py
+  - verifiers/dispatch-aggregator.py
+  - verifiers/smoke-live.py
+  - verifiers/ui-craft-gate.py
+  - verifiers/ledger-writer.py
+
+failure_policy: escalate
+rollback_policy: >
+  Keep failure evidence: the spec index, SpecCards, gate files, ledger,
+  aggregate verdict, and reflector/replan artifacts stay in the run dir for
+  operator review. Discard only unsafe child patches produced by failed
+  recursive-validate-impl runs. The next iteration replans by a
+  contract_revision of the affected SpecCard (citing gate evidence) or
+  escalates to an operator; it never patches failed code in place.
+
+source_artifact: spec-index.json
+outputs:
+  - path: "${MINI_ORK_RUN_DIR}/spec-index.json"
+    mime: application/json
+    description: "Spec directory inventory from `mini-ork specs ingest`, validated against schemas/spec-index.schema.json."
+  - path: "${MINI_ORK_RUN_DIR}/spec-cards/<spec_id>.json"
+    mime: application/json
+    description: "One compiled SpecCard per spec, validated against schemas/spec-card.schema.json; uncovered source requirements go to ratification/<spec_id>.json."
+  - path: "${MINI_ORK_RUN_DIR}/gates/<spec_id>.json"
+    mime: application/json
+    description: "test_author probes per acceptance gate, written before implementation and checked by test-validity."
+  - path: "${MINI_ORK_RUN_DIR}/ledger.jsonl"
+    mime: application/x-ndjson
+    description: "Traceability rows: clause -> deliverable -> run_id -> commit -> gate verdicts, including WAIVED and veto events."
+  - path: "${MINI_ORK_RUN_DIR}/aggregate-verdict.json"
+    mime: application/json
+    description: "Aggregate child verdicts with shape {total, delivered, failed, blocked, pending, pass_rate, deliverables[]}."
+  - path: "${MINI_ORK_RUN_DIR}/reflector.json"
+    mime: application/json
+    description: "Strict JSON failure pattern over failed deliverables for the next loop iteration."
+  - path: "${MINI_ORK_RUN_DIR}/replan.json"
+    mime: application/json
+    description: "contract_revision entries against SpecCards, each citing gate evidence."

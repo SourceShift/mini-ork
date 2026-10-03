@@ -13,6 +13,16 @@
       "pattern": "^[a-z][a-z0-9_-]*$",
       "minLength": 2
     },
+    "task_class": {
+      "type": "string",
+      "description": "Alias of name kept by recipe-local task_class.yaml files; must equal name when present.",
+      "pattern": "^[a-z][a-z0-9_-]*$"
+    },
+    "version": {
+      "type": "string",
+      "description": "Recipe version string, e.g. '0.1.0'.",
+      "pattern": "^[a-zA-Z0-9._-]+$"
+    },
     "description": {
       "type": "string",
       "description": "Human-readable explanation of what kinds of tasks belong to this class.",
@@ -80,6 +90,10 @@
       "type": "array",
       "items": { "type": "string" },
       "default": []
+    },
+    "heterogeneity": {
+      "type": "object",
+      "description": "Lane-diversity declarations for this class (e.g. which lanes form a heterogeneous panel, or which lanes must stay separate for authorship). Advisory metadata; workflow.yaml model_lane fields are what the executor routes on."
     }
   }
 }

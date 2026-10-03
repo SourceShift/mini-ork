@@ -50,6 +50,31 @@
       "minimum": 0,
       "default": 30
     },
+    "source_artifact": {
+      "type": ["string", "null"],
+      "description": "Run-dir-relative name of the primary artifact handed to publishing/review steps (read by cli/publisher.py and cli/execute.py)."
+    },
+    "outputs": {
+      "type": "array",
+      "description": "Declared run outputs, checked by validate/garden and published by the executor. Each entry is a bare path string or a {path, mime, description, required} object; paths may use ${MINI_ORK_RUN_DIR}.",
+      "items": {
+        "anyOf": [
+          { "type": "string", "minLength": 1 },
+          {
+            "type": "object",
+            "required": ["path"],
+            "additionalProperties": false,
+            "properties": {
+              "path": { "type": "string", "minLength": 1 },
+              "mime": { "type": "string" },
+              "description": { "type": "string" },
+              "required": { "type": "boolean" }
+            }
+          }
+        ]
+      },
+      "default": []
+    },
     "description": {
       "type": "string",
       "description": "Human-readable summary of what this contract enforces."

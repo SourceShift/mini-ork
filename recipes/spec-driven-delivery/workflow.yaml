@@ -1,0 +1,63 @@
+version: "0.1.0"
+task_class: spec_driven_delivery
+description: >
+  Outer spec-driven-delivery loop. Ingests a directory of markdown specs,
+  compiles each spec into a SpecCard contract, derives executable acceptance
+  gates test-first on a lane separate from the implementer, dispatches every
+  atomic deliverable through recursive-validate-impl, then verifies with live
+  smoke, an optional UI-craft gate, and a traceability ledger. Failed gates
+  reflect and replan against the SpecCard only. Hard-caps at convergence, max
+  iterations, or total budget.
+
+nodes:
+  - { name: specdir_ingest, type: verifier, verifier_ref: verifiers/specdir-ingest.py, dispatch_mode: serial }
+  - { name: contract_compiler, type: researcher, model_lane: planner, prompt_ref: prompts/contract-compiler.md, dispatch_mode: serial, gates: [budget_gate] }
+  - { name: ratification_check, type: verifier, verifier_ref: verifiers/ratification-check.py, dispatch_mode: serial }
+  - { name: spec_lint, type: verifier, verifier_ref: verifiers/spec-lint.py, dispatch_mode: serial }
+  - { name: test_author, type: researcher, model_lane: reviewer, prompt_ref: prompts/test-author.md, dispatch_mode: serial, gates: [budget_gate] }
+  - { name: test_validity, type: verifier, verifier_ref: verifiers/test-validity.py, dispatch_mode: serial }
+  - { name: per_spec_dispatcher, type: implementer, model_lane: implementer, prompt_ref: prompts/per-spec-dispatcher.md, dispatch_mode: serial, gates: [budget_gate, scope_gate] }
+  - { name: dispatch_aggregator, type: verifier, verifier_ref: verifiers/dispatch-aggregator.py, dispatch_mode: serial }
+  - { name: smoke_live, type: verifier, verifier_ref: verifiers/smoke-live.py, dispatch_mode: serial }
+  - { name: ui_craft_gate, type: verifier, verifier_ref: verifiers/ui-craft-gate.py, dispatch_mode: serial }
+  - { name: ledger_writer, type: verifier, verifier_ref: verifiers/ledger-writer.py, dispatch_mode: serial }
+  - { name: reflector, type: reflector, model_lane: reflector, prompt_ref: prompts/reflector.md, dispatch_mode: serial, gates: [budget_gate] }
+  - { name: replanner, type: planner, model_lane: planner, prompt_ref: prompts/replanner.md, dispatch_mode: serial, gates: [budget_gate] }
+  - { name: publisher, type: publisher, prompt_ref: null, dispatch_mode: serial, gates: [scope_gate] }
+  - { name: rollback, type: rollback, prompt_ref: null, dispatch_mode: serial }
+
+edges:
+  - { from: specdir_ingest, to: contract_compiler, edge_type: depends_on, condition: pass }
+  - { from: specdir_ingest, to: reflector, edge_type: escalates_to, condition: fail }
+  - { from: contract_compiler, to: ratification_check, edge_type: verifies }
+  - { from: ratification_check, to: spec_lint, edge_type: depends_on, condition: pass }
+  - { from: ratification_check, to: reflector, edge_type: escalates_to, condition: fail }
+  - { from: spec_lint, to: test_author, edge_type: depends_on, condition: pass }
+  - { from: spec_lint, to: reflector, edge_type: escalates_to, condition: fail }
+  - { from: test_author, to: test_validity, edge_type: verifies }
+  - { from: test_validity, to: per_spec_dispatcher, edge_type: depends_on, condition: pass }
+  - { from: test_validity, to: reflector, edge_type: escalates_to, condition: fail }
+  - { from: per_spec_dispatcher, to: dispatch_aggregator, edge_type: verifies }
+  - { from: dispatch_aggregator, to: smoke_live, edge_type: depends_on, condition: pass }
+  - { from: dispatch_aggregator, to: reflector, edge_type: escalates_to, condition: fail }
+  - { from: smoke_live, to: ui_craft_gate, edge_type: depends_on, condition: pass }
+  - { from: smoke_live, to: reflector, edge_type: escalates_to, condition: fail }
+  - { from: ui_craft_gate, to: ledger_writer, edge_type: depends_on, condition: pass }
+  - { from: ui_craft_gate, to: reflector, edge_type: escalates_to, condition: fail }
+  - { from: ledger_writer, to: publisher, edge_type: depends_on, condition: pass }
+  - { from: ledger_writer, to: reflector, edge_type: escalates_to, condition: fail }
+  - { from: reflector, to: replanner, edge_type: depends_on }
+  - { from: replanner, to: contract_compiler, edge_type: depends_on, recursive: true }
+
+recursion:
+  max_iterations: 6
+  convergence_check: all_deliverables_delivered
+  budget_cap_per_iter_usd: 15.00
+  budget_cap_total_usd: 100.00
+  divergence_kill: |
+    If iteration N's failed-deliverables set is a superset of iteration N-1's
+    set, escalate to an operator. Detect by hashing sorted failed
+    "<spec_id>/<deliverable_id>" IDs and stopping when the hash repeats for
+    two consecutive iterations.
+
+rollback_strategy: keep_partial_pass_discard_failed_iter
