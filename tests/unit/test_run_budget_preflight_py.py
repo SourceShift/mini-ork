@@ -12,7 +12,6 @@ import os
 import sqlite3
 import subprocess
 import sys
-import time
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
@@ -28,8 +27,10 @@ def _home_with_spend(tmp_path: Path, spent: float) -> Path:
                    env={**os.environ, "MINI_ORK_HOME": str(home), "MINI_ORK_DB": str(db)},
                    capture_output=True, text=True, check=True)
     con = sqlite3.connect(db)
-    con.execute("INSERT INTO task_runs (id, task_class, kickoff_path, cost_usd, created_at, updated_at) "
-                "VALUES (?,?,?,?,?,?)", ("run-old", "code_fix", "k.md", spent, int(time.time()) - 60, int(time.time()) - 60))
+    # The budget reads the llm_calls ledger (every provider call, node or
+    # stage), not task_runs.cost_usd — seed the spend where it is metered.
+    con.execute("INSERT INTO llm_calls (provider, model_id, tier, feature_name, cost_usd, status, run_id) "
+                "VALUES (?,?,?,?,?,?,?)", ("anthropic", "sonnet", "default", "mini-ork:worker", spent, "success", "run-old"))
     con.commit()
     con.close()
     return home

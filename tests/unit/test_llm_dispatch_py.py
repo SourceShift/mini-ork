@@ -127,9 +127,10 @@ def _sql(db, s):
 
 def test_cost_circuit(tmp_path):
     hp, db_p = _seed(tmp_path, "cp")
-    _sql(db_p, "INSERT INTO task_runs (id,task_class,workflow_version,kickoff_path,status,"
-               "cost_usd,created_at,updated_at) VALUES ('r1','x','v1','k.md','published',100.0,"
-               "strftime('%s','now'),strftime('%s','now'));")
+    # The circuit reads the llm_calls ledger (every provider call, node or
+    # stage), not task_runs.cost_usd — seed the spend where it is metered.
+    _sql(db_p, "INSERT INTO llm_calls (provider,model_id,tier,feature_name,cost_usd,status) "
+               "VALUES ('anthropic','sonnet','default','mini-ork:worker',100.0,'success');")
     old = dict(os.environ)
     os.environ.update({"MINI_ORK_ROOT": str(REPO), "MINI_ORK_HOME": hp, "MINI_ORK_DB": db_p,
                        "MO_DAILY_BUDGET_USD": "50"})
