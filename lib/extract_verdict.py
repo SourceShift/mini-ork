@@ -52,7 +52,12 @@ def _balanced_objects(s: str):
                     i = j + 1
                     break
         else:
-            return
+            # This '{' never balanced: a brace in prose or a code span, or a stray
+            # '"' that flipped in_str. Skip it and keep scanning. Returning here
+            # ended the whole scan before the verdict object, which usually comes
+            # last, so a reviewer that wrote a valid {"verdict": "pass"} after such
+            # a brace read as "unknown" and a passing run was failed.
+            i = start + 1
 
 
 def extract_review(text: str) -> dict | None:
