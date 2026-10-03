@@ -29,6 +29,8 @@ import time
 from typing import Sequence
 
 from mini_ork import cn_client
+from mini_ork.learning.advantage_store import resolve_db_path
+from mini_ork.orchestration import concord_admission
 
 __all__ = ["main"]
 
@@ -73,6 +75,13 @@ def _build_parser() -> argparse.ArgumentParser:
     ack = sub.add_parser("ack", help="acknowledge a message")
     ack.add_argument("principal")
     ack.add_argument("msg_id")
+
+    admit = sub.add_parser(
+        "admit",
+        help="admit/defer an epic whose scope overlaps one already in progress",
+    )
+    admit.add_argument("--db", default=None,
+                       help="state DB path (default: resolve_db_path)")
 
     sub.add_parser("help", help="show this help")
     return parser
@@ -386,6 +395,32 @@ def _cmd_ack(args: argparse.Namespace) -> int:
     return rc
 
 
+# ── admit ─────────────────────────────────────────────────────────────────
+
+
+def _cmd_admit(args: argparse.Namespace) -> int:
+    """Admit/defer the epic named by the scheduler hook env.
+
+    Exit contract: 0 admit, 75 defer, nothing else — any other code is a failed
+    attempt. Every internal error warns on stderr and fails open to 0.
+    """
+    try:
+        epic_id = os.environ.get("MO_EPIC_ID", "")
+        kickoff = os.environ.get("MO_EPIC_KICKOFF", "")
+        if not epic_id or not kickoff:
+            print("warning: MO_EPIC_ID/MO_EPIC_KICKOFF not set; admitting",
+                  file=sys.stderr)
+            return 0
+        ok, reason = concord_admission.admit(resolve_db_path(args.db), epic_id, kickoff)
+        if not ok:
+            print(reason)  # ONE line on stdout: the defer reason
+            return 75
+        return 0
+    except Exception as exc:  # noqa: BLE001 — admission must never fail the scheduler
+        print(f"warning: concord admit failed open: {exc}", file=sys.stderr)
+        return 0
+
+
 # ── main ───────────────────────────────────────────────────────────────────
 
 
@@ -406,6 +441,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _cmd_inbox(args)
     if args.action == "ack":
         return _cmd_ack(args)
+    if args.action == "admit":
+        return _cmd_admit(args)
     if args.action == "help":
         _build_parser().print_help()
         return 0
