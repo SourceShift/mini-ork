@@ -64,25 +64,57 @@ def _terminal_reader(_run_id: str) -> dict:
 # ── contract assertion 1 ────────────────────────────────────────────────────
 
 
-def test_new_session_mints_safe_run_id_and_binds_meta_and_cwd():
-    agent = MiniOrkAcpAgent()
-    resp = asyncio.run(agent.new_session(cwd="/tmp/proj"))
+def test_new_session_mints_thread_session_when_no_run_id_added():
+    # Z9c-1: ``new_session`` without a client-minted run_id mints a thread
+    # session (orch-<epoch>-<6 hex>). The session id is NOT a run id; the
+    # thread carries config (mode / model / recipe) and starts as a member
+    # of ``_thread_sessions``. The previous ``run-`` prefix assertion is
+    # now split across this test (thread sessions) and the next one
+    # (run sessions, via the client _meta.run_id override).
+    from unittest.mock import patch
+
+    fake_lanes = [{"id": "opus", "name": "Opus"}, {"id": "sonnet", "name": "Sonnet"}]
+    fake_recipes = ["bug-audit-cmgk", "code-fix", "framework-edit"]
+    with patch(
+        "mini_ork.acp_orchestrator.config.orchestrator_lanes",
+        return_value=fake_lanes,
+    ), patch(
+        "mini_ork.web.recipes.list_recipes",
+        return_value=fake_recipes,
+    ):
+        agent = MiniOrkAcpAgent()
+        resp = asyncio.run(agent.new_session(cwd="/tmp/proj"))
     sid = resp.session_id
-    assert sid.startswith("run-")
+    assert sid.startswith("orch-")
     assert _is_safe_token(sid)
-    # The _meta.run_id override records the run id the session is bound to.
-    assert resp.field_meta == {"run_id": sid}
-    # session -> cwd binding.
+    assert resp.field_meta == {"kind": "thread"}
     assert agent._sessions[sid] == "/tmp/proj"
+    assert sid in agent._thread_sessions
+    assert agent._thread_config[sid]["mode"] == "orchestrate"
+    # The picker list carries three Zed-rendered options in the mandated order.
+    assert resp.config_options is not None
+    assert [opt.id for opt in resp.config_options] == ["mode", "model", "recipe"]
+    assert resp.config_options[0].category == "mode"
+    assert resp.config_options[1].category == "model"
+    assert resp.modes is not None
+    assert resp.modes.current_mode_id == "orchestrate"
+    assert {m.id for m in resp.modes.available_modes} == {"orchestrate", "direct"}
 
 
 def test_new_session_honours_client_meta_run_id_override():
+    # Run-session path is unchanged: a client-minted _meta.run_id mints a
+    # ``run-<id>`` session bound to the given cwd + recipe. The session id
+    # IS the run id (slice 0 contract).
     agent = MiniOrkAcpAgent()
     resp = asyncio.run(agent.new_session(cwd="/tmp/proj", run_id="run-client-abc123"))
     assert resp.session_id == "run-client-abc123"
     assert _is_safe_token(resp.session_id)
     assert resp.field_meta == {"run_id": "run-client-abc123"}
     assert agent._sessions["run-client-abc123"] == "/tmp/proj"
+    assert "run-client-abc123" not in agent._thread_sessions
+    # Run sessions do not advertise config pickers.
+    assert resp.config_options is None
+    assert resp.modes is None
 
 
 def test_new_session_honours_client_meta_recipe():
@@ -722,7 +754,12 @@ def test_running_session_drains_new_live_lines_each_poll(tmp_path):
     progress_with_text = [u for u in text_progress if u.content]
 
     assert len(progress_with_text) == 2, [str(u) for u in conn.captured]
-    texts = [u.content[0].content.text for u in progress_with_text]
+    texts: list[str] = []
+    for u in progress_with_text:
+        if u.content is None:
+            continue
+        block = u.content[0]
+        texts.append(block.content.text)
     assert texts == ["first chunk", "second chunk"]
 
     # Thought: must be the AgentMessageChunk-shaped AgentThoughtChunk that
@@ -800,6 +837,658 @@ def test_load_session_replays_at_most_50_live_events_per_node(tmp_path):
     )
     # The cap is "last 50 normalized events" — the replayed texts are the
     # last 50 ("chunk-030" through "chunk-079"), oldest 30 dropped.
-    texts = [u.content[0].content.text for u in text_chunks]
+    texts: list[str] = []
+    for u in text_chunks:
+        if u.content is None:
+            continue
+        texts.append(u.content[0].content.text)
     assert texts[0] == "chunk-030"
     assert texts[-1] == "chunk-079"
+
+
+# ── thread-session shape (Z9c-1) ──────────────────────────────────────────
+
+
+class _CapturingConn:
+    """Minimal ACP connection: capture every ``session_update`` push."""
+
+    def __init__(self) -> None:
+        self.captured: list = []
+
+    async def session_update(self, _sid: str, update) -> None:
+        self.captured.append(update)
+
+
+def _make_thread_agent(tmp_path, *, monkeypatch=None, **ctor_kwargs):
+    """Build an agent pre-populated with a thread session.
+
+    Patches ``orchestrator_lanes`` + ``list_recipes`` so the picker is
+    deterministic, then mints one thread session for ``tmp_path / proj``.
+    Returns ``(agent, conn, thread_id)``.
+    """
+    from unittest.mock import patch
+
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    fake_lanes = [{"id": "opus", "name": "Opus"}, {"id": "sonnet", "name": "Sonnet"}]
+    fake_recipes = ["code-fix", "framework-edit"]
+    with patch(
+        "mini_ork.acp_orchestrator.config.orchestrator_lanes",
+        return_value=fake_lanes,
+    ), patch(
+        "mini_ork.web.recipes.list_recipes",
+        return_value=fake_recipes,
+    ):
+        agent = MiniOrkAcpAgent(**ctor_kwargs)
+        resp = asyncio.run(agent.new_session(cwd=str(proj)))
+    conn = _CapturingConn()
+    agent.on_connect(conn)
+    return agent, conn, resp.session_id
+
+
+def test_set_config_option_stores_and_returns_full_list(tmp_path):
+    from unittest.mock import patch
+    from acp.schema import ConfigOptionUpdate
+
+    agent, conn, sid = _make_thread_agent(tmp_path)
+    with patch(
+        "mini_ork.acp_orchestrator.config.orchestrator_lanes",
+        return_value=[{"id": "opus", "name": "Opus"}, {"id": "sonnet", "name": "Sonnet"}],
+    ), patch(
+        "mini_ork.web.recipes.list_recipes",
+        return_value=["code-fix", "framework-edit"],
+    ):
+        resp = asyncio.run(agent.set_config_option("model", sid, "sonnet"))
+    assert resp.config_options is not None
+    assert [opt.id for opt in resp.config_options] == ["mode", "model", "recipe"]
+    assert resp.config_options[1].current_value == "sonnet"
+    assert agent._thread_config[sid]["model"] == "sonnet"
+    # The emission lands on the wire.
+    updates = [
+        u for u in conn.captured
+        if isinstance(u, ConfigOptionUpdate) and u.session_update == "config_option_update"
+    ]
+    assert len(updates) == 1
+    assert updates[0].config_options[1].current_value == "sonnet"
+
+
+def test_set_config_option_rejects_unknown_id(tmp_path):
+    agent, _conn, sid = _make_thread_agent(tmp_path)
+    try:
+        asyncio.run(agent.set_config_option("bogus", sid, "x"))
+    except Exception as exc:
+        assert getattr(exc, "code", None) == -32602
+    else:
+        raise AssertionError("expected invalid_params")
+
+
+def test_set_config_option_rejects_unknown_value(tmp_path):
+    agent, _conn, sid = _make_thread_agent(tmp_path)
+    try:
+        asyncio.run(agent.set_config_option("mode", sid, "hyperdrive"))
+    except Exception as exc:
+        assert getattr(exc, "code", None) == -32602
+        assert "unknown mode" in str(getattr(exc, "data", None))
+    else:
+        raise AssertionError("expected invalid_params")
+
+
+def test_set_config_option_rejects_non_thread_session(tmp_path):
+    # A run-id is not a thread session; set_config_option must refuse it.
+    agent = MiniOrkAcpAgent()
+    try:
+        asyncio.run(agent.set_config_option("mode", "run-1-abc", "orchestrate"))
+    except Exception as exc:
+        assert getattr(exc, "code", None) == -32602
+    else:
+        raise AssertionError("expected invalid_params on non-thread session")
+
+
+def test_set_session_mode_routes_to_set_config_option(tmp_path):
+    from unittest.mock import patch
+
+    agent, _conn, sid = _make_thread_agent(tmp_path)
+    with patch(
+        "mini_ork.acp_orchestrator.config.orchestrator_lanes",
+        return_value=[{"id": "opus", "name": "Opus"}],
+    ), patch(
+        "mini_ork.web.recipes.list_recipes",
+        return_value=["code-fix"],
+    ):
+        asyncio.run(agent.set_session_mode("direct", sid))
+    assert agent._thread_config[sid]["mode"] == "direct"
+
+
+def test_orchestrate_prompt_streams_events_and_stores_resume(tmp_path):
+    from unittest.mock import patch
+    from acp.schema import AgentMessageChunk, AgentThoughtChunk
+
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    fake_lanes = [{"id": "opus", "name": "Opus"}]
+    fake_recipes = ["code-fix"]
+
+    # The fake orchestrator_turn pushes two envelopes before returning.
+    envelopes = [
+        {"type": "assistant", "message": {"content": [{"type": "thinking", "thinking": "hmm"}]}},
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "answer"}]}},
+    ]
+
+    class _TurnResult:
+        session_id = "claude-sess-001"
+        rc = 0
+        text = "answer"
+        cost_usd = 0.0
+        error = ""
+
+    seen: dict[str, Any] = {"lane": None, "resume": None, "on_event": None}
+
+    def fake_turn(lane, prompt, cwd, home, resume, on_event):
+        seen["lane"] = lane
+        seen["resume"] = resume
+        seen["on_event"] = on_event
+
+        async def _run() -> Any:
+            for env in envelopes:
+                await on_event(env)
+            return _TurnResult()
+
+        return _run()
+
+    with patch(
+        "mini_ork.acp_orchestrator.config.orchestrator_lanes",
+        return_value=fake_lanes,
+    ), patch(
+        "mini_ork.web.recipes.list_recipes",
+        return_value=fake_recipes,
+    ):
+        agent = MiniOrkAcpAgent(orchestrator_turn=fake_turn)
+        resp = asyncio.run(agent.new_session(cwd=str(proj)))
+
+    conn = _CapturingConn()
+    agent.on_connect(conn)
+    turn_resp = asyncio.run(agent.prompt(resp.session_id, [_text_block("hi")]))
+
+    assert turn_resp.stop_reason == "end_turn"
+    # The chosen lane + the resumed session id both made it to the seam.
+    assert seen["lane"] == "opus"
+    assert seen["resume"] is None  # first turn — no resume yet
+    # The persisted resume id is now ready for the next turn.
+    assert agent._thread_config[resp.session_id]["claude_session_id"] == "claude-sess-001"
+    # The two envelopes produced one thought + one message.
+    thoughts = [u for u in conn.captured if isinstance(u, AgentThoughtChunk)]
+    messages = [u for u in conn.captured if isinstance(u, AgentMessageChunk)]
+    assert len(thoughts) == 1 and thoughts[0].content.text == "hmm"
+    assert any(m.content.text == "answer" for m in messages)
+
+
+def test_orchestrate_prompt_resumes_with_persisted_session_id(tmp_path):
+    """Second turn passes the persisted claude session id as ``resume``."""
+    from unittest.mock import patch
+
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    fake_lanes = [{"id": "opus", "name": "Opus"}]
+    fake_recipes = ["code-fix"]
+
+    class _TurnResult:
+        def __init__(self, sess: str) -> None:
+            self.session_id = sess
+            self.rc = 0
+            self.text = ""
+            self.cost_usd = 0.0
+            self.error = ""
+
+    seen: list[Any] = []
+
+    def fake_turn(lane, prompt, cwd, home, resume, on_event):
+        async def _run() -> Any:
+            seen.append(resume)
+            return _TurnResult("claude-sess-002")
+
+        return _run()
+
+    with patch(
+        "mini_ork.acp_orchestrator.config.orchestrator_lanes",
+        return_value=fake_lanes,
+    ), patch(
+        "mini_ork.web.recipes.list_recipes",
+        return_value=fake_recipes,
+    ):
+        agent = MiniOrkAcpAgent(orchestrator_turn=fake_turn)
+        resp = asyncio.run(agent.new_session(cwd=str(proj)))
+
+    asyncio.run(agent.prompt(resp.session_id, [_text_block("first")]))
+    # First turn observed no resume; the agent now stores the returned id.
+    assert seen[-1] is None
+    asyncio.run(agent.prompt(resp.session_id, [_text_block("second")]))
+    # Second turn passes the persisted id.
+    assert seen[-1] == "claude-sess-002"
+
+
+def test_orchestrate_prompt_uses_chosen_lane(tmp_path):
+    from unittest.mock import patch
+
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    fake_lanes = [
+        {"id": "opus", "name": "Opus"},
+        {"id": "sonnet", "name": "Sonnet"},
+        {"id": "minimax", "name": "MiniMax-M3"},
+    ]
+    fake_recipes = ["code-fix"]
+
+    class _TurnResult:
+        session_id = "sess-1"
+        rc = 0
+        text = ""
+        cost_usd = 0.0
+        error = ""
+
+    seen: list[str] = []
+
+    def fake_turn(lane, prompt, cwd, home, resume, on_event):
+        async def _run() -> Any:
+            seen.append(lane)
+            return _TurnResult()
+
+        return _run()
+
+    with patch(
+        "mini_ork.acp_orchestrator.config.orchestrator_lanes",
+        return_value=fake_lanes,
+    ), patch(
+        "mini_ork.web.recipes.list_recipes",
+        return_value=fake_recipes,
+    ):
+        agent = MiniOrkAcpAgent(orchestrator_turn=fake_turn)
+        resp = asyncio.run(agent.new_session(cwd=str(proj)))
+
+    # Switch the model via set_config_option and observe the seam picks it up.
+    with patch(
+        "mini_ork.acp_orchestrator.config.orchestrator_lanes",
+        return_value=fake_lanes,
+    ), patch(
+        "mini_ork.web.recipes.list_recipes",
+        return_value=fake_recipes,
+    ):
+        asyncio.run(agent.set_config_option("model", resp.session_id, "sonnet"))
+    asyncio.run(agent.prompt(resp.session_id, [_text_block("hi")]))
+    assert seen == ["sonnet"]
+
+
+def test_start_run_tool_result_makes_thread_follow_child_run(tmp_path):
+    """An orchestrator turn whose tool_result answers ``start_run`` spawns a
+    follower for the child run under prefixed tool ids."""
+    from unittest.mock import patch
+
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    fake_lanes = [{"id": "opus", "name": "Opus"}]
+    fake_recipes = ["code-fix"]
+
+    child_run_id = "run-child-001"
+
+    # Two readers so the child follow sees terminal after a couple polls.
+    call = {"n": 0}
+
+    def fake_reader(rid: str) -> dict:
+        if rid == child_run_id:
+            call["n"] += 1
+            if call["n"] >= 2:
+                return {
+                    "status": "published",
+                    "events": [
+                        {
+                            "event_type": "node_start",
+                            "payload_json": json.dumps(
+                                {"node_id": "n1", "node_type": "planner"}
+                            ),
+                        }
+                    ],
+                    "llm_calls": [],
+                }
+            return {"status": "executing", "events": [], "llm_calls": []}
+        return {"status": None, "events": [], "llm_calls": []}
+
+    class _TurnResult:
+        session_id = "sess-1"
+        rc = 0
+        text = ""
+        cost_usd = 0.0
+        error = ""
+
+    def fake_turn(lane, prompt, cwd, home, resume, on_event):
+        async def _run() -> Any:
+            # Assistant tool_use for the start_run tool...
+            await on_event({
+                "type": "assistant",
+                "message": {"content": [
+                    {
+                        "type": "tool_use",
+                        "id": "tool-1",
+                        "name": "mcp__mini-ork__start_run",
+                        "input": {"recipe": "code-fix"},
+                    }
+                ]},
+            })
+            # ...answered by a tool_result with a JSON run_id.
+            await on_event({
+                "type": "user",
+                "message": {"content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "tool-1",
+                    "is_error": False,
+                    "content": [{"type": "text", "text": json.dumps(
+                        {"run_id": child_run_id}
+                    )}],
+                }]},
+            })
+            return _TurnResult()
+
+        return _run()
+
+    with patch(
+        "mini_ork.acp_orchestrator.config.orchestrator_lanes",
+        return_value=fake_lanes,
+    ), patch(
+        "mini_ork.web.recipes.list_recipes",
+        return_value=fake_recipes,
+    ):
+        agent = MiniOrkAcpAgent(
+            orchestrator_turn=fake_turn,
+            reader=fake_reader,
+            poll_interval=0,
+        )
+        resp = asyncio.run(agent.new_session(cwd=str(proj)))
+
+    conn = _CapturingConn()
+    agent.on_connect(conn)
+    turn_resp = asyncio.run(agent.prompt(resp.session_id, [_text_block("launch a run")]))
+    assert turn_resp.stop_reason == "end_turn"
+
+    # The child follower's parent marker landed on the wire with a prefixed id.
+    parent_markers = [
+        u for u in conn.captured
+        if isinstance(u, ToolCallStart) and u.tool_call_id == f"{child_run_id}:parent"
+    ]
+    assert len(parent_markers) == 1
+    assert "code-fix" in parent_markers[0].title
+
+
+def test_only_start_run_results_start_a_child_run(tmp_path):
+    """run_status / wait_for_run / run_detail results also carry a run_id; they
+    must not make the thread follow that run. A start_run result must, with the
+    recipe the orchestrator chose in the marker title."""
+    from unittest.mock import patch
+
+    proj = tmp_path / "proj"
+    proj.mkdir()
+
+    class _TurnResult:
+        session_id = "sess-1"
+        rc = 0
+        text = ""
+        cost_usd = 0.0
+        error = ""
+
+    def _pair(tool_id, name, inp, run_id):
+        return [
+            {"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": tool_id, "name": name, "input": inp}]}},
+            {"type": "user", "message": {"content": [{
+                "type": "tool_result", "tool_use_id": tool_id, "is_error": False,
+                "content": [{"type": "text", "text": json.dumps({"run_id": run_id})}]}]}},
+        ]
+
+    def fake_turn(lane, prompt, cwd, home, resume, on_event):
+        async def _run():
+            events = (_pair("t1", "mcp__mini-ork__run_status", {"run_id": "run-old-001"}, "run-old-001")
+                      + _pair("t2", "mcp__mini-ork__wait_for_run", {"run_id": "run-old-001"}, "run-old-001")
+                      + _pair("t3", "mcp__mini-ork__start_run", {"recipe": "docs"}, "run-new-001"))
+            for ev in events:
+                await on_event(ev)
+            return _TurnResult()
+        return _run()
+
+    def fake_reader(rid):
+        return {"status": "published", "events": [], "llm_calls": []}
+
+    with patch("mini_ork.acp_orchestrator.config.orchestrator_lanes",
+               return_value=[{"id": "opus", "name": "Opus"}]), \
+         patch("mini_ork.web.recipes.list_recipes", return_value=["code-fix", "docs"]):
+        agent = MiniOrkAcpAgent(orchestrator_turn=fake_turn, reader=fake_reader, poll_interval=0)
+        resp = asyncio.run(agent.new_session(cwd=str(proj)))
+    conn = _CapturingConn()
+    agent.on_connect(conn)
+    asyncio.run(agent.prompt(resp.session_id, [_text_block("go")]))
+    markers = [u for u in conn.captured
+               if isinstance(u, ToolCallStart) and str(u.tool_call_id).endswith(":parent")]
+    assert [m.tool_call_id for m in markers] == ["run-new-001:parent"]
+    assert "docs" in markers[0].title
+
+
+def test_direct_mode_launches_with_selected_recipe(tmp_path):
+    from unittest.mock import patch
+
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    fake_lanes = [{"id": "opus", "name": "Opus"}]
+    fake_recipes = ["code-fix", "framework-edit"]
+
+    launched: list[tuple[str, str, str]] = []  # (run_id, kickoff, recipe)
+
+    def fake_reader(rid: str) -> dict:
+        # Only the fresh run sees a row; the thread session id is not in the db.
+        if not rid.startswith("run-"):
+            return {"status": None, "events": [], "llm_calls": []}
+        return {"status": "published", "events": [], "llm_calls": []}
+
+    def fake_turn(lane, prompt, cwd, home, resume, on_event):
+        raise AssertionError("orchestrator_turn must not run in direct mode")
+
+    agent = MiniOrkAcpAgent(
+        orchestrator_turn=fake_turn,
+        reader=fake_reader,
+        poll_interval=0,
+    )
+
+    with patch(
+        "mini_ork.acp_orchestrator.config.orchestrator_lanes",
+        return_value=fake_lanes,
+    ), patch(
+        "mini_ork.web.recipes.list_recipes",
+        return_value=fake_recipes,
+    ):
+        resp = asyncio.run(agent.new_session(cwd=str(proj)))
+        sid = resp.session_id
+        # Switch to direct mode with the framework-edit recipe.
+        asyncio.run(agent.set_config_option("mode", sid, "direct"))
+        asyncio.run(agent.set_config_option("recipe", sid, "framework-edit"))
+
+    # Patch the bound _launch to capture (run_id, kickoff, recipe) — _launch
+    # reads from ``_sessions`` / ``_recipes`` so we can detect the right one.
+    original_launch = MiniOrkAcpAgent._launch
+
+    def captured_launch(self, run_id, kickoff_text):
+        launched.append((run_id, kickoff_text, self._recipes.get(run_id) or ""))
+        return {"ok": True, "run_id": run_id}
+
+    MiniOrkAcpAgent._launch = captured_launch  # type: ignore[method-assign]
+    try:
+        turn_resp = asyncio.run(agent.prompt(sid, [_text_block("do it")]))
+    finally:
+        MiniOrkAcpAgent._launch = original_launch  # type: ignore[method-assign]
+
+    assert turn_resp.stop_reason == "end_turn"
+    assert len(launched) == 1
+    assert launched[0][2] == "framework-edit"
+    assert launched[0][0].startswith("run-")
+
+
+def test_slash_run_in_orchestrate_mode_launches_directly(tmp_path):
+    from unittest.mock import patch
+
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    fake_lanes = [{"id": "opus", "name": "Opus"}]
+    fake_recipes = ["code-fix"]
+
+    seen_turn = {"called": False}
+
+    def fake_turn(lane, prompt, cwd, home, resume, on_event):
+        async def _run() -> Any:
+            seen_turn["called"] = True
+            return _TurnResult()  # noqa: F821 — defined below
+
+        return _run()
+
+    class _TurnResult:
+        session_id = "sess-1"
+        rc = 0
+        text = ""
+        cost_usd = 0.0
+        error = ""
+
+    launched: list[tuple[str, str]] = []
+
+    agent = MiniOrkAcpAgent(
+        orchestrator_turn=fake_turn,
+        reader=lambda _: {"status": "published", "events": [], "llm_calls": []},
+        poll_interval=0,
+    )
+
+    with patch(
+        "mini_ork.acp_orchestrator.config.orchestrator_lanes",
+        return_value=fake_lanes,
+    ), patch(
+        "mini_ork.web.recipes.list_recipes",
+        return_value=fake_recipes,
+    ):
+        resp = asyncio.run(agent.new_session(cwd=str(proj)))
+        sid = resp.session_id
+
+    original_launch = MiniOrkAcpAgent._launch
+
+    def captured_launch(self, run_id, kickoff_text):
+        launched.append((run_id, kickoff_text))
+        return {"ok": True, "run_id": run_id}
+
+    MiniOrkAcpAgent._launch = captured_launch  # type: ignore[method-assign]
+    try:
+        turn_resp = asyncio.run(agent.prompt(sid, [_text_block("/run fix x")]))
+    finally:
+        MiniOrkAcpAgent._launch = original_launch  # type: ignore[method-assign]
+
+    assert turn_resp.stop_reason == "end_turn"
+    # The orchestrator was NOT invoked (slash command short-circuits).
+    assert seen_turn["called"] is False
+    # Direct mode launched one run with the slash payload.
+    assert launched == [(launched[0][0], "fix x")]
+
+
+def test_cancel_thread_session_cancels_orchestrator_task(tmp_path):
+    """A ``cancel`` on a thread session cancels the in-flight orchestrator turn."""
+    from unittest.mock import patch
+
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    fake_lanes = [{"id": "opus", "name": "Opus"}]
+    fake_recipes = ["code-fix"]
+
+    started = asyncio.Event()
+    finished = {"ok": False}
+
+    def fake_turn(lane, prompt, cwd, home, resume, on_event):
+        async def _run() -> Any:
+            started.set()
+            try:
+                await asyncio.sleep(2.0)
+            except asyncio.CancelledError:
+                finished["ok"] = True
+                raise
+            return _TurnResult()  # noqa: F821
+
+        return _run()
+
+    class _TurnResult:
+        session_id = "sess-1"
+        rc = 0
+        text = ""
+        cost_usd = 0.0
+        error = ""
+
+    with patch(
+        "mini_ork.acp_orchestrator.config.orchestrator_lanes",
+        return_value=fake_lanes,
+    ), patch(
+        "mini_ork.web.recipes.list_recipes",
+        return_value=fake_recipes,
+    ):
+        agent = MiniOrkAcpAgent(orchestrator_turn=fake_turn)
+        resp = asyncio.run(agent.new_session(cwd=str(proj)))
+        sid = resp.session_id
+
+    conn = _CapturingConn()
+    agent.on_connect(conn)
+
+    async def _drive():
+        prompt_task = asyncio.create_task(agent.prompt(sid, [_text_block("hi")]))
+        await started.wait()
+        await agent.cancel(sid)
+        return await prompt_task
+
+    turn_resp = asyncio.run(_drive())
+    assert turn_resp.stop_reason == "cancelled"
+    assert finished["ok"] is True
+
+
+def test_thread_session_keeps_run_session_path_unchanged(tmp_path):
+    """A run-id session id (not a thread id) still goes through the launcher."""
+    from unittest.mock import patch
+
+    fake_lanes = [{"id": "opus", "name": "Opus"}]
+    fake_recipes = ["code-fix"]
+
+    with patch(
+        "mini_ork.acp_orchestrator.config.orchestrator_lanes",
+        return_value=fake_lanes,
+    ), patch(
+        "mini_ork.web.recipes.list_recipes",
+        return_value=fake_recipes,
+    ):
+        # Pre-populate a session that is NOT a thread session.
+        agent = MiniOrkAcpAgent(
+            launcher=lambda rid, _t: {"ok": True, "run_id": rid},
+            reader=lambda _: {"status": "published", "events": [], "llm_calls": []},
+        )
+        # Manually mark a session as a run session (NOT in _thread_sessions).
+        agent._sessions["run-1-abc"] = "/tmp/proj"
+        agent._recipes["run-1-abc"] = "code-fix"
+        # A prompt on this run id should still hit the run-session path.
+        resp = asyncio.run(agent.prompt("run-1-abc", [_text_block("hi")]))
+    assert resp.stop_reason == "end_turn"
+    assert "run-1-abc" not in agent._thread_sessions
+
+
+def test_model_picker_reads_the_session_homes_registry(tmp_path, monkeypatch):
+    # No mock on ``orchestrator_lanes``: the picker must resolve the real
+    # registry. The project's home shadows the engine's providers.yaml, so the
+    # picker lists exactly the home's claude lanes (regression: the home was
+    # passed as the ENGINE root, the lookup missed, and only "opus" showed).
+    engine = tmp_path / "engine"
+    (engine / "config").mkdir(parents=True)
+    (engine / "config" / "providers.yaml").write_text("providers: {}\n")
+    home = tmp_path / "proj" / ".mini-ork"
+    (home / "config").mkdir(parents=True)
+    (home / "config" / "providers.yaml").write_text(
+        "providers:\n"
+        "  opus: {kind: anthropic-native, family: anthropic}\n"
+        "  sonnet: {kind: anthropic-native, family: anthropic}\n"
+    )
+    monkeypatch.setenv("MINI_ORK_ROOT", str(engine))
+    monkeypatch.delenv("MINI_ORK_HOME", raising=False)
+    monkeypatch.delenv("MINI_ORK_PROVIDERS", raising=False)
+    rows = MiniOrkAcpAgent()._list_orchestrator_lanes(home)
+    assert [r.value for r in rows] == ["opus", "sonnet"]
+    assert rows[1].name == "Sonnet (Claude subscription)"

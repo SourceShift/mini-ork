@@ -1,4 +1,5 @@
-"""ACP agent binding one session id to one run id via the launch seam.
+"""ACP agent binding one session id to one run id via the launch seam
+OR a thread session to an orchestrator conversation.
 
 Slice 0 of the Zed engineer surface (2026-09-20): Zed registers mini-ork as a
 custom ACP agent (``mini-ork acp``) and opens one session per run. Because
@@ -15,6 +16,16 @@ the ACP wire via the stored connection. Each node transition is projected
 exactly once (D1). ``session/cancel`` soft-stops the run and escalates to a hard
 kill after a grace window. stdout is the ACP wire — this module never prints to
 it.
+
+Slice Z9c-1 (2026-10-03) layers thread sessions on top: ``session/new`` with
+no client-minted ``run_id`` mints an ``orch-<epoch>-<hex>`` id and configures
+the session with three Zed-rendered pickers (mode, model, recipe). ``prompt``
+on a thread session routes to ``acp_orchestrator.harness.run_turn`` in
+``orchestrate`` mode (the default) or launches a run + follows it in
+``direct`` mode, with child runs from ``start_run`` tool_results projected
+under prefixed tool ids so they never collide with the orchestrator's own.
+The run-session path above is unchanged — run ids are still safe tokens and
+the launcher / reader / stopper / killer seams still apply.
 """
 from __future__ import annotations
 
@@ -24,13 +35,14 @@ import os
 import secrets
 import time
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Awaitable, Callable, cast
 
 from acp import RequestError
 from acp.schema import (
     AgentCapabilities,
     AgentMessageChunk,
     AgentThoughtChunk,
+    ConfigOptionUpdate,
     ContentToolCallContent,
     Cost,
     Implementation,
@@ -40,8 +52,14 @@ from acp.schema import (
     NewSessionResponse,
     PromptResponse,
     SessionCapabilities,
+    SessionConfigOptionSelect,
+    SessionConfigSelectOption,
     SessionInfo,
     SessionListCapabilities,
+    SessionMode,
+    SessionModeState,
+    SetSessionConfigOptionResponse,
+    SetSessionModeResponse,
     StopReason,
     TextContentBlock,
     ToolCallProgress,
@@ -51,6 +69,7 @@ from acp.schema import (
 )
 
 from mini_ork.acp import history
+from mini_ork.acp import orchestration as _orchestration
 from mini_ork.acp.live import LiveTail, normalize
 from mini_ork.web.control import _is_safe_token
 
@@ -102,6 +121,32 @@ def mint_run_id() -> str:
     return f"run-{int(time.time())}-{secrets.token_hex(3)}"
 
 
+def _mint_thread_id() -> str:
+    """Mint an ``orch-…`` session id for a thread (orchestrator) session.
+
+    Same epoch+hex shape as :func:`mint_run_id` so ``_is_safe_token`` accepts
+    it unchanged. The ``orch-`` prefix is the loader-vs-thread discriminator
+    the agent keys on in ``prompt`` / ``cancel``.
+    """
+    return f"orch-{int(time.time())}-{secrets.token_hex(3)}"
+
+
+# Per-session config a thread session carries alongside its cwd binding.
+# Populated by ``new_session`` + ``set_config_option`` and consumed by
+# ``prompt`` when routing the orchestrator vs direct paths.
+_THREAD_CONFIG_KEYS = ("mode", "model", "recipe")
+
+# Mode ids the kickoff mandates. Anything else is rejected by
+# ``set_config_option`` as ``invalid_params``.
+_MODE_ORCHESTRATE = "orchestrate"
+_MODE_DIRECT = "direct"
+
+# Slash command that triggers direct-mode behaviour for a single prompt
+# regardless of the session's stored mode. The text after the prefix is
+# the kickoff body passed to the launcher.
+_SLASH_RUN_PREFIX = "/run "
+
+
 def _extract_prompt_text(prompt: list[Any]) -> str:
     """Flatten the text content blocks of an ACP prompt into one string."""
     chunks: list[str] = []
@@ -124,15 +169,23 @@ def _tail_log(path: str | None, n: int = 20) -> str:
 
 
 class MiniOrkAcpAgent:
-    """Stdio ACP agent: one session == one run id.
+    """Stdio ACP agent: thread sessions OR one-session-per-run.
 
-    ``session/new`` mints or accepts a run id and binds it to the session ``cwd``
-    and recipe; ``session/prompt`` launches that run detached via
-    ``control.launch_run`` and awaits its terminal status while projecting
-    read-model state onto the wire; ``session/cancel`` stops the run (escalating
-    to a kill). Every side-effecting seam (launcher, reader, stopper, killer) is
-    injectable so hermetic tests never spawn ``bin/mini-ork`` or touch a real
-    state.db.
+    Thread sessions (Z9c-1): ``session/new`` with no client-minted ``run_id``
+    mints an ``orch-<epoch>-<hex>`` id, binds it to the session ``cwd``, and
+    configures three Zed-rendered pickers (mode, model, recipe). ``prompt``
+    on a thread session runs the orchestrator (default ``orchestrate`` mode)
+    or launches a run + follows it (``direct`` mode). Child runs spawned by
+    ``start_run`` tool_results are projected under ``"<run_id>:"``-prefixed
+    tool ids so two projections never collide.
+
+    Run sessions (slice 0, unchanged): ``session/new`` honours a client-minted
+    ``_meta.run_id`` (or mints one); ``session/prompt`` launches the run
+    detached via ``control.launch_run`` and awaits its terminal status while
+    projecting read-model state onto the wire; ``session/cancel`` stops the
+    run (escalating to a kill). Every side-effecting seam (launcher, reader,
+    stopper, killer, orchestrator_turn) is injectable so hermetic tests never
+    spawn ``bin/mini-ork`` or touch a real state.db.
     """
 
     def __init__(
@@ -147,9 +200,16 @@ class MiniOrkAcpAgent:
         poll_interval: float | None = None,
         cancel_grace: float | None = None,
         start_timeout: float | None = None,
+        orchestrator_turn: Callable[..., Awaitable[Any]] | None = None,
+        default_mode: str | None = None,
+        default_model: str | None = None,
+        default_recipe: str | None = None,
     ) -> None:
         # launcher: callable(run_id, kickoff_text) -> dict; reader: callable(run_id)
         # -> {"status", "events", "llm_calls"}; stopper/killer: callable(run_id) -> dict.
+        # orchestrator_turn: callable(lane, prompt, cwd, home, resume, on_event)
+        # -> TurnResult; defaults to acp_orchestrator.harness.run_turn so the
+        # CLI process spawns a real claude subprocess. Tests inject a fake.
         self._home = str(home) if home else None
         self._launcher = launcher
         self._reader = reader
@@ -159,6 +219,25 @@ class MiniOrkAcpAgent:
         self._poll_interval = _POLL_INTERVAL_S if poll_interval is None else float(poll_interval)
         self._cancel_grace = _CANCEL_ESCALATE_S if cancel_grace is None else float(cancel_grace)
         self._start_timeout_s = _START_TIMEOUT_S if start_timeout is None else float(start_timeout)
+        # orchestrator_turn seam (Z9c-1). Defaults to a thin wrapper around
+        # ``acp_orchestrator.harness.run_turn``; hermetic tests inject a fake
+        # that calls ``on_event`` with canned stream-json blocks.
+        self._orchestrator_turn = orchestrator_turn
+        # Default thread-session config (env → ctor arg fallback). Per-session
+        # overrides flow through ``set_config_option`` → ``_thread_config``.
+        self._default_mode = (
+            default_mode
+            or os.environ.get("MO_ACP_DEFAULT_MODE")
+            or _MODE_ORCHESTRATE
+        )
+        self._default_model = (
+            default_model or os.environ.get("MO_ACP_DEFAULT_MODEL") or None
+        )
+        self._default_recipe = (
+            default_recipe
+            or os.environ.get("MO_ACP_RECIPE")
+            or self._recipe
+        )
         # The AgentSideConnection handed to on_connect; session_update pushes
         # projected read-model updates back to the ACP client.
         self._conn: Any | None = None
@@ -179,6 +258,17 @@ class MiniOrkAcpAgent:
         self._followers: dict[str, asyncio.Task] = {}
         # session ids opened via session/load (never launched by prompt).
         self._loaded: set[str] = set()
+        # Thread (orchestrator) session ids (Z9c-1). The prompt path
+        # branches on membership: thread sessions route to orchestrate/direct;
+        # everything else is a run session.
+        self._thread_sessions: set[str] = set()
+        # thread session id → {mode, model, recipe, claude_session_id}. The
+        # first three are surfaced via config options; claude_session_id is
+        # the resume token persisted across orchestrator turns.
+        self._thread_config: dict[str, dict[str, str]] = {}
+        # thread session id → running orchestrator turn task (Z9c-1 cancel
+        # support); one per thread session. Cleared on turn end.
+        self._orchestrator_tasks: dict[str, asyncio.Task] = {}
         # (session, node) pairs whose agent already streamed text — a final
         # ``result`` event is shown only for nodes that streamed nothing.
         self._text_seen: set[tuple[str, str]] = set()
@@ -224,13 +314,307 @@ class MiniOrkAcpAgent:
         # The ACP router merges the request's _meta dict into kwargs, so a
         # client-minted run_id / recipe arrive here as plain keyword arguments.
         # Honour a client-minted run_id only when it is a safe token; otherwise
-        # mint one in launch_run's shape. The session id IS the run id.
+        # mint a thread (orchestrator) session — Z9c-1's primary new flow.
         requested = str(kwargs.get("run_id") or "").strip()
-        run_id = requested if requested and _is_safe_token(requested) else mint_run_id()
-        recipe = str(kwargs.get("recipe") or "").strip() or self._recipe
-        self._sessions[run_id] = cwd
-        self._recipes[run_id] = recipe
-        return NewSessionResponse(session_id=run_id, field_meta={"run_id": run_id})
+        if requested and _is_safe_token(requested):
+            run_id = requested
+            recipe = str(kwargs.get("recipe") or "").strip() or self._recipe
+            self._sessions[run_id] = cwd
+            self._recipes[run_id] = recipe
+            return NewSessionResponse(session_id=run_id, field_meta={"run_id": run_id})
+        # Thread session (Z9c-1). The session id is NOT a run id; it carries
+        # the thread config (mode / model / recipe) plus the persisted claude
+        # session id (set on first orchestrator turn). The three pickers are
+        # Zed-rendered via ``category="model" | "mode"``.
+        thread_id = _mint_thread_id()
+        self._sessions[thread_id] = cwd
+        self._thread_sessions.add(thread_id)
+        self._thread_config[thread_id] = self._initial_thread_config(cwd)
+        home = self._home_for(thread_id)
+        config_options = self._build_config_options(thread_id, home)
+        modes = self._build_session_modes(thread_id)
+        return NewSessionResponse(
+            session_id=thread_id,
+            modes=modes,
+            config_options=cast(Any, config_options),
+            field_meta={"kind": "thread"},
+        )
+
+    # ── thread-session helpers (Z9c-1) ────────────────────────────────────────
+
+    def _initial_thread_config(self, cwd: str) -> dict[str, str]:
+        """Per-session defaults populated at ``new_session`` time.
+
+        ``recipe`` falls back to the agent's default recipe; ``mode`` falls
+        back to ``_default_mode``; ``model`` falls back to ``_default_model``
+        (or the orchestrator's lane-map default for this session's home).
+        """
+        home = self._home_for_for_cwd(cwd)
+        model = self._default_model or self._default_orchestrator_lane(home)
+        return {
+            "mode": self._default_mode,
+            "model": model,
+            "recipe": self._default_recipe,
+            "claude_session_id": "",
+        }
+
+    def _home_for_for_cwd(self, cwd: str) -> Path:
+        """Resolve ``.mini-ork`` for a raw cwd (without a session id)."""
+        candidate = Path(cwd) / ".mini-ork"
+        if candidate.is_dir():
+            return candidate
+        return self._resolve_home()
+
+    def _default_orchestrator_lane(self, home: Path) -> str:
+        """Pick the default lane for a thread session at ``home``.
+
+        Tries ``acp_orchestrator.config.default_lane(home)`` first, then
+        falls back to ``"opus"`` if the orchestrator package is unavailable
+        (e.g. when the agent is constructed in a thin test harness that
+        omits the orchestrator dependencies). The fallback keeps the picker
+        functional — never raises.
+        """
+        try:
+            from mini_ork.acp_orchestrator.config import default_lane
+        except Exception:  # noqa: BLE001 — picker must never crash new_session
+            return "opus"
+        try:
+            return default_lane(home)
+        except Exception:  # noqa: BLE001 — picker must never crash new_session
+            return "opus"
+
+    def _build_config_options(
+        self, session_id: str, home: Path
+    ) -> list[SessionConfigOptionSelect]:
+        """Materialise the three Zed-rendered pickers in kickoff order.
+
+        Order: mode (category="mode"), model (category="model"), recipe (no
+        category). Each option carries the current stored value as
+        ``current_value``. Picker sources: ``acp_orchestrator.config`` for
+        model lanes; ``web.recipes.list_recipes`` for recipes; the literal
+        ``{"orchestrate", "direct"}`` for mode.
+        """
+        cfg = self._thread_config.get(session_id) or {}
+        return [
+            SessionConfigOptionSelect(
+                type="select",
+                id="mode",
+                name="Mode",
+                description="How each prompt in this thread is interpreted.",
+                category="mode",
+                current_value=str(cfg.get("mode") or _MODE_ORCHESTRATE),
+                options=[
+                    SessionConfigSelectOption(
+                        value=_MODE_ORCHESTRATE,
+                        name="Orchestrate",
+                        description="Talk to the mini-ork orchestrator",
+                    ),
+                    SessionConfigSelectOption(
+                        value=_MODE_DIRECT,
+                        name="Direct run",
+                        description="Each prompt is a run kickoff",
+                    ),
+                ],
+            ),
+            self._build_model_config_option(session_id, home),
+            self._build_recipe_config_option(session_id),
+        ]
+
+    def _build_model_config_option(
+        self, session_id: str, home: Path
+    ) -> SessionConfigOptionSelect:
+        cfg = self._thread_config.get(session_id) or {}
+        lanes = self._list_orchestrator_lanes(home)
+        current = str(cfg.get("model") or "")
+        if current and not any(opt.value == current for opt in lanes):
+            current = lanes[0].value if lanes else ""
+        if not current and lanes:
+            current = lanes[0].value
+        return SessionConfigOptionSelect(
+            type="select",
+            id="model",
+            name="Model",
+            description="Lane the orchestrator drives this thread on.",
+            category="model",
+            current_value=current,
+            options=lanes,
+        )
+
+    def _list_orchestrator_lanes(
+        self, home: Path
+    ) -> list[SessionConfigSelectOption]:
+        """List ``acp_orchestrator.config.orchestrator_lanes()`` as picker rows.
+
+        Defensive against missing orchestrator package or registry errors —
+        a thread session must always be configurable, so any exception
+        degrades to the single-opus fallback.
+        """
+        try:
+            from mini_ork.acp_orchestrator.config import orchestrator_lanes
+        except Exception:  # noqa: BLE001 — picker must never crash new_session
+            return [SessionConfigSelectOption(value="opus", name="opus")]
+        try:
+            # ``orchestrator_lanes`` takes the ENGINE root; the project's home
+            # (whose providers.yaml may shadow the engine's) rides the run
+            # context, which the registry loader reads.
+            from mini_ork.context import run_context_scope
+
+            with run_context_scope({"MINI_ORK_HOME": str(home)}):
+                rows = orchestrator_lanes()
+        except Exception:  # noqa: BLE001 — picker must never crash new_session
+            return [SessionConfigSelectOption(value="opus", name="opus")]
+        out: list[SessionConfigSelectOption] = []
+        for row in rows or []:
+            if not isinstance(row, dict):
+                continue
+            lane_id = str(row.get("id") or "").strip()
+            if not lane_id:
+                continue
+            lane_name = str(row.get("name") or lane_id)
+            out.append(SessionConfigSelectOption(value=lane_id, name=lane_name))
+        if not out:
+            out = [SessionConfigSelectOption(value="opus", name="opus")]
+        return out
+
+    def _build_recipe_config_option(
+        self, session_id: str
+    ) -> SessionConfigOptionSelect:
+        cfg = self._thread_config.get(session_id) or {}
+        recipes = self._list_recipes()
+        current = str(cfg.get("recipe") or "")
+        if current and current not in recipes:
+            current = recipes[0] if recipes else ""
+        if not current and recipes:
+            current = recipes[0]
+        return SessionConfigOptionSelect(
+            type="select",
+            id="recipe",
+            name="Recipe",
+            description="Recipe used by direct-mode prompts.",
+            current_value=current,
+            options=[
+                SessionConfigSelectOption(value=name, name=name)
+                for name in recipes
+            ],
+        )
+
+    def _list_recipes(self) -> list[str]:
+        """Recipe ids from ``web.recipes.list_recipes``, sorted.
+
+        Defensive against a missing recipes dir or yaml loader failure — the
+        picker falls back to the agent's default recipe so it always has at
+        least one option.
+        """
+        try:
+            from mini_ork.web.recipes import list_recipes
+        except Exception:  # noqa: BLE001 — picker must never crash new_session
+            return [self._recipe]
+        try:
+            names = list_recipes()
+        except Exception:  # noqa: BLE001 — picker must never crash new_session
+            return [self._recipe]
+        out = [str(n) for n in names if isinstance(n, str)]
+        if not out:
+            out = [self._recipe]
+        return sorted(out)
+
+    def _build_session_modes(self, session_id: str) -> SessionModeState:
+        cfg = self._thread_config.get(session_id) or {}
+        return SessionModeState(
+            current_mode_id=str(cfg.get("mode") or _MODE_ORCHESTRATE),
+            available_modes=[
+                SessionMode(
+                    id=_MODE_ORCHESTRATE,
+                    name="Orchestrate",
+                    description="Talk to the mini-ork orchestrator",
+                ),
+                SessionMode(
+                    id=_MODE_DIRECT,
+                    name="Direct run",
+                    description="Each prompt is a run kickoff",
+                ),
+            ],
+        )
+
+    def _current_config_options(self, session_id: str) -> list[SessionConfigOptionSelect]:
+        cfg = self._thread_config.get(session_id) or {}
+        home = self._home_for(session_id)
+        # Refresh the recipe / model picker against current ``_list_*`` so a
+        # recipe dir change between sessions is reflected on every config
+        # round-trip.
+        options = self._build_config_options(session_id, home)
+        # Pin current_value to the just-stored field in case the helper fell
+        # back to a different value when the stored one was invalid.
+        for opt in options:
+            opt.current_value = str(cfg.get(opt.id) or opt.current_value or "")
+        return options
+
+    # ── config option protocol (Z9c-1) ────────────────────────────────────────
+
+    async def set_config_option(
+        self,
+        config_id: str,
+        session_id: str,
+        value: str,
+        **kwargs: Any,
+    ) -> SetSessionConfigOptionResponse:
+        """Validate + store + emit + return the full picker list.
+
+        Invalid ``config_id`` or ``value`` raises ``RequestError.invalid_params``
+        (acp SDK convention). The same call emits a ``ConfigOptionUpdate`` so
+        clients pick up the change live, then returns the full refreshed list
+        wrapped in ``SetSessionConfigOptionResponse``.
+        """
+        del kwargs
+        if session_id not in self._thread_sessions:
+            raise RequestError.invalid_params(
+                {"message": f"set_config_option on a non-thread session: {session_id!r}"}
+            )
+        cfg = self._thread_config.setdefault(session_id, {})
+        if config_id not in _THREAD_CONFIG_KEYS:
+            raise RequestError.invalid_params(
+                {"message": f"unknown config option: {config_id!r}"}
+            )
+        # Validate against the picker source. Unknown modes / lanes / recipes
+        # are rejected — the agent's picker is authoritative.
+        if config_id == "mode" and value not in (_MODE_ORCHESTRATE, _MODE_DIRECT):
+            raise RequestError.invalid_params({"message": f"unknown mode: {value!r}"})
+        if config_id == "model":
+            lanes = self._list_orchestrator_lanes(self._home_for(session_id))
+            valid_ids = {opt.value for opt in lanes}
+            if value not in valid_ids:
+                raise RequestError.invalid_params(
+                    {"message": f"unknown model lane: {value!r}"}
+                )
+        if config_id == "recipe":
+            recipes = self._list_recipes()
+            if value not in recipes:
+                raise RequestError.invalid_params(
+                    {"message": f"unknown recipe: {value!r}"}
+                )
+        cfg[config_id] = value
+        options = self._current_config_options(session_id)
+        options_cast = cast(Any, options)
+        await self._emit(
+            session_id,
+            ConfigOptionUpdate(
+                session_update="config_option_update", config_options=options_cast
+            ),
+        )
+        return SetSessionConfigOptionResponse(config_options=options_cast)
+
+    async def set_session_mode(
+        self, mode_id: str, session_id: str, **kwargs: Any
+    ) -> SetSessionModeResponse:
+        """Legacy ``session/set_mode`` shim → routes to ``set_config_option``.
+
+        The kickoff keeps ``modes`` in sync with the ``mode`` config option so
+        older clients that call ``set_session_mode`` still work; new clients
+        go through ``set_config_option`` directly.
+        """
+        del kwargs
+        await self.set_config_option("mode", session_id, mode_id)
+        return SetSessionModeResponse()
 
     async def list_sessions(
         self, cwd: str | None = None, cursor: str | None = None, **kwargs: Any
@@ -349,6 +733,9 @@ class MiniOrkAcpAgent:
                     ),
                 )
             return PromptResponse(stop_reason="end_turn")
+        # Thread (orchestrator) session: route to orchestrate/direct path.
+        if session_id in self._thread_sessions:
+            return await self._prompt_thread(session_id, prompt)
         self._launch_count += 1
         launcher = self._launcher or self._launch
         result = launcher(session_id, _extract_prompt_text(prompt))
@@ -362,12 +749,337 @@ class MiniOrkAcpAgent:
         # status; a mid-run cancel (concurrent notification) returns 'cancelled'.
         return PromptResponse(stop_reason=await self._await_terminal(session_id))
 
+    # ── thread-session prompt paths (Z9c-1) ───────────────────────────────────
+
+    async def _prompt_thread(
+        self, session_id: str, prompt: list[Any]
+    ) -> PromptResponse:
+        """Route a thread-session prompt to orchestrate or direct mode.
+
+        The ``/run <task>`` slash command short-circuits to direct mode for
+        that one prompt regardless of the stored mode. Otherwise the stored
+        ``mode`` config selects the path. The orchestrator turn is awaited
+        inline so cancel can interrupt it; the direct-mode path reuses the
+        existing ``_await_terminal`` loop against the fresh run id.
+        """
+        text = _extract_prompt_text(prompt)
+        slash_text = self._strip_slash_run(text)
+        if slash_text is not None:
+            return await self._prompt_thread_direct(session_id, slash_text)
+        cfg = self._thread_config.get(session_id) or {}
+        mode = str(cfg.get("mode") or _MODE_ORCHESTRATE)
+        if mode == _MODE_DIRECT:
+            return await self._prompt_thread_direct(session_id, text)
+        return await self._prompt_thread_orchestrate(session_id, text)
+
+    @staticmethod
+    def _strip_slash_run(text: str) -> str | None:
+        """Return the kickoff text after ``/run ``, or ``None`` if not present."""
+        if not text:
+            return None
+        if not text.startswith(_SLASH_RUN_PREFIX):
+            return None
+        return text[len(_SLASH_RUN_PREFIX):].strip()
+
+    async def _prompt_thread_direct(
+        self, session_id: str, text: str
+    ) -> PromptResponse:
+        """Direct-mode path: launch a fresh run + await its terminal status.
+
+        Mirrors the run-session path (``launcher + _await_terminal``) but
+        with the thread session's stored recipe. The new run id is a fresh
+        mint; the thread session id is NOT a run id and is never passed to
+        ``_reader`` / ``_stopper`` / ``_killer``.
+        """
+        if not text:
+            return PromptResponse(stop_reason="refusal")
+        cfg = self._thread_config.get(session_id) or {}
+        recipe = str(cfg.get("recipe") or self._recipe)
+        new_run_id = mint_run_id()
+        self._sessions[new_run_id] = self._sessions.get(session_id, os.getcwd())
+        self._recipes[new_run_id] = recipe
+        self._launch_count += 1
+        launcher = self._launcher or self._launch
+        result = launcher(new_run_id, text)
+        self._launches[new_run_id] = result if isinstance(result, dict) else {}
+        if isinstance(result, dict) and result.get("ok") is False:
+            return PromptResponse(stop_reason="refusal")
+        return PromptResponse(stop_reason=await self._await_terminal(new_run_id))
+
+    async def _prompt_thread_orchestrate(
+        self, session_id: str, text: str
+    ) -> PromptResponse:
+        """Orchestrate-mode path: one orchestrator turn against the stored lane.
+
+        The ``on_event`` callback maps each stream-json block through
+        ``orchestration.map_event`` and emits the resulting updates on the
+        agent's connection. The returned ``claude_session_id`` is persisted
+        for the next turn's ``--resume``. A non-zero return code yields an
+        agent message with the error tail and ``stop_reason="end_turn"``.
+        Cancel cancels the orchestrator task; the harness kills its process.
+        """
+        if not text:
+            return PromptResponse(stop_reason="refusal")
+        cfg = self._thread_config.get(session_id) or {}
+        lane = str(cfg.get("model") or "opus")
+        resume = str(cfg.get("claude_session_id") or "") or None
+        cwd = self._sessions.get(session_id) or os.getcwd()
+        home = self._home_for(session_id)
+        turn = self._orchestrator_turn or self._default_orchestrator_turn
+        session_ref = {"turn_result": None}
+
+        # tool_use id -> recipe for this turn's start_run calls. Only results
+        # answering one of these start a child run: run_status / wait_for_run /
+        # run_detail results also carry a run_id but must not.
+        start_run_calls: dict[str, str] = {}
+
+        async def on_event(event: dict[str, Any]) -> None:
+            for update in _orchestration.map_event(event):
+                await self._emit(session_id, update)
+            if event.get("type") == "assistant":
+                for block in (event.get("message") or {}).get("content") or []:
+                    if (isinstance(block, dict) and block.get("type") == "tool_use"
+                            and str(block.get("name") or "").split("__")[-1]
+                            == _orchestration.CHILD_RUN_TOOL):
+                        inp = block.get("input") if isinstance(block.get("input"), dict) else {}
+                        start_run_calls[str(block.get("id") or "")] = str(inp.get("recipe") or "")
+            child = self._extract_child_run_from_event(event, start_run_calls)
+            if child:
+                await self._start_child_follow(session_id, child[0], recipe=child[1])
+
+        async def _run() -> Any:
+            return await turn(
+                lane=lane,
+                prompt=text,
+                cwd=Path(cwd),
+                home=home,
+                resume=resume,
+                on_event=on_event,
+            )
+
+        task = asyncio.create_task(_run())
+        self._orchestrator_tasks[session_id] = task
+        try:
+            result = await task
+        except asyncio.CancelledError:
+            return PromptResponse(stop_reason="cancelled")
+        finally:
+            self._orchestrator_tasks.pop(session_id, None)
+        session_ref["turn_result"] = result
+        if result is None:
+            return PromptResponse(stop_reason="cancelled")
+        rc = getattr(result, "rc", 0)
+        new_session_id = getattr(result, "session_id", None)
+        if isinstance(new_session_id, str) and new_session_id:
+            cfg["claude_session_id"] = new_session_id
+        if rc != 0:
+            error_tail = str(getattr(result, "error", "") or "")
+            text_tail = str(getattr(result, "text", "") or "")
+            await self._emit(
+                session_id,
+                self._build_refusal_message(
+                    f"Orchestrator turn failed (rc={rc}): {error_tail or text_tail}"
+                ),
+            )
+            return PromptResponse(stop_reason="end_turn")
+        return PromptResponse(stop_reason="end_turn")
+
+    def _extract_child_run_from_event(
+        self, event: dict[str, Any], start_run_calls: dict[str, str]
+    ) -> tuple[str, str] | None:
+        """Pull ``(tool_name, tool_result_text)`` out of a user tool_result.
+
+        Returns the extracted ``run_id`` when the tool is the canonical
+        ``start_run`` MCP tool and its first text block parses as JSON with a
+        safe-token ``run_id`` field. Otherwise ``None`` — the orchestrator
+        turn continues unchanged.
+        """
+        if not isinstance(event, dict) or event.get("type") != "user":
+            return None
+        message = event.get("message")
+        if not isinstance(message, dict):
+            return None
+        blocks = message.get("content")
+        if not isinstance(blocks, list):
+            return None
+        # Walk in reverse to land on the most recent tool_result; the
+        # orchestrator's stream-json events always pair one user envelope
+        # with one tool_result, so order is not load-bearing.
+        for block in blocks:
+            if not isinstance(block, dict) or block.get("type") != "tool_result":
+                continue
+            tool_use_id = str(block.get("tool_use_id") or "")
+            # The mapper stripped the MCP prefix in ``_tool_title``; the
+            # tool_use name for ``mcp__mini-ork__start_run`` is unknown here,
+            # so we accept any tool_use_id and let the orchestrator seam
+            # route on the raw name. We rely on the implementation of
+            # ``orchestration.extract_child_run`` to check the tool name
+            # via the title we projected on the ToolCallStart — but here
+            # we don't have that title. Fall back to checking the
+            # well-known tool name string: only "start_run" (after the MCP
+            # prefix) is treated as a child-run trigger.
+            inner = block.get("content")
+            if not isinstance(inner, list):
+                continue
+            text_parts: list[str] = []
+            for c in inner:
+                if isinstance(c, dict):
+                    t = c.get("text")
+                    if isinstance(t, str) and t:
+                        text_parts.append(t)
+                        break
+            text = "".join(text_parts)
+            if not text:
+                continue
+            if tool_use_id not in start_run_calls:
+                continue
+            run_id = _orchestration.extract_child_run(_orchestration.CHILD_RUN_TOOL, text)
+            if run_id:
+                return run_id, start_run_calls[tool_use_id]
+        return None
+
+    async def _start_child_follow(
+        self, parent_session_id: str, child_run_id: str, recipe: str = ""
+    ) -> None:
+        """Spawn a child-run follower under prefixed tool ids.
+
+        Emits a ``ToolCallStart`` parent marker titled ``run <run_id> (<recipe>)``
+        and creates an asyncio task that mirrors ``_follow`` against the child
+        run. The follower is stored under the parent session id so ``cancel``
+        can find it. Multiple concurrent child runs are independent.
+        """
+        if not _is_safe_token(child_run_id):
+            return
+        existing = self._followers.get(child_run_id)
+        if existing is not None and not existing.done():
+            return  # already following
+        cfg = self._thread_config.get(parent_session_id) or {}
+        recipe = recipe or str(cfg.get("recipe") or self._recipe)
+        await self._emit(
+            parent_session_id,
+            ToolCallStart(
+                session_update="tool_call",
+                tool_call_id=f"{child_run_id}:parent",
+                title=f"run {child_run_id} ({recipe})",
+                status="in_progress",
+                kind="other",
+            ),
+        )
+        self._followers[child_run_id] = asyncio.create_task(
+            self._follow_child(parent_session_id, child_run_id)
+        )
+
+    async def _follow_child(
+        self, parent_session_id: str, child_run_id: str
+    ) -> None:
+        """Poll a child run's read model until it reaches a terminal status.
+
+        Mirrors ``_follow`` minus the cancel gate: child runs keep streaming
+        after the orchestrator's turn ends until they go terminal or the
+        parent session is cancelled. Node lifecycle events project under the
+        prefixed tool id ``f"<child_run_id>:<node_id>"`` so they never collide
+        with the orchestrator's own ids.
+        """
+        reader = self._reader or self._read_snapshot
+        prefix = f"{child_run_id}:"
+        while parent_session_id not in self._cancelled:
+            snapshot = reader(child_run_id) or {
+                "status": None,
+                "events": [],
+                "llm_calls": [],
+            }
+            # Project lifecycle events under the prefixed tool id so they
+            # land on the right parent marker.
+            emitted = self._emitted.setdefault(child_run_id, set())
+            for ev in snapshot.get("events") or []:
+                payload = ev.get("payload_json") or {}
+                if isinstance(payload, str):
+                    try:
+                        payload = json.loads(payload)
+                    except (json.JSONDecodeError, TypeError):
+                        payload = {}
+                node_id = str((payload or {}).get("node_id") or "node")
+                event_type = str(ev.get("event_type") or "")
+                if event_type == "node_start":
+                    key = f"{node_id}:start"
+                    if key in emitted:
+                        continue
+                    emitted.add(key)
+                    await self._emit(
+                        parent_session_id,
+                        ToolCallStart(
+                            session_update="tool_call",
+                            tool_call_id=f"{prefix}{node_id}",
+                            title=str((payload or {}).get("node_type") or node_id),
+                            status="in_progress",
+                        ),
+                    )
+                elif event_type == "node_end":
+                    key = f"{node_id}:end"
+                    if key in emitted:
+                        continue
+                    emitted.add(key)
+                    await self._emit(
+                        parent_session_id,
+                        ToolCallProgress(
+                            session_update="tool_call_update",
+                            tool_call_id=f"{prefix}{node_id}",
+                            status="completed",
+                        ),
+                    )
+            if snapshot.get("status") in TERMINAL_STATUSES:
+                break
+            await asyncio.sleep(self._poll_interval)
+        self._followers.pop(child_run_id, None)
+
+    async def _default_orchestrator_turn(
+        self,
+        *,
+        lane: str,
+        prompt: str,
+        cwd: Path,
+        home: Path,
+        resume: str | None,
+        on_event: Callable[[dict[str, Any]], Awaitable[None]],
+    ) -> Any:
+        """Default ``orchestrator_turn`` — delegates to the orchestrator harness.
+
+        Deferred so the orchestrator package's heavy imports (dispatch layer,
+        provider registry) only land when an orchestrator turn actually runs,
+        not at agent construction time. The CLI process spawns a real
+        ``claude`` subprocess here; tests inject a fake.
+        """
+        from mini_ork.acp_orchestrator.harness import run_turn
+
+        return await run_turn(
+            lane=lane,
+            prompt=prompt,
+            cwd=cwd,
+            home=home,
+            resume=resume,
+            on_event=on_event,
+        )
+
     async def cancel(self, session_id: str, **kwargs: Any) -> None:
         del kwargs
         self._cancelled.add(session_id)
         follower = self._followers.get(session_id)
         if follower is not None and not follower.done():
             follower.cancel()
+        if session_id in self._thread_sessions:
+            # Thread session: cancel the orchestrator turn (the harness
+            # terminates the claude subprocess) and stop any child-run
+            # followers spawned by start_run tool_results. The child runs
+            # themselves keep running (kickoff: child runs are stopped via
+            # ``/stop`` later, not on orchestrator cancel).
+            task = self._orchestrator_tasks.get(session_id)
+            if task is not None and not task.done():
+                task.cancel()
+            for child_run_id, child_task in list(self._followers.items()):
+                if child_task is not None and not child_task.done():
+                    child_task.cancel()
+                self._followers.pop(child_run_id, None)
+            return
         if session_id in self._loaded:
             # Attached session: soft-stop only when the run is still running;
             # a finished run is a no-op (there is nothing to cancel).
