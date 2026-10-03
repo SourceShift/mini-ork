@@ -249,16 +249,18 @@ def test_lanes_outside_the_measured_set_keep_the_json_envelope_byte_for_byte(tmp
         assert _repo_lane(lane, tmp_path, monkeypatch).command[-1] == "json", lane
 
 
-def test_resolve_native_claude_lane_uses_json_envelope(tmp_path, monkeypatch):
+def test_native_claude_lanes_stream_with_the_claude_parsers(tmp_path, monkeypatch):
     # Pin the home to an empty scratch registry so the loader consults the
     # REPO config: a live home (CWD-relative .mini-ork or MINI_ORK_HOME) that
     # predates the `sonnet` lane shadows the repo registry and this resolves
     # as "unknown lane" instead of the anthropic transport under test.
+    # opus/sonnet opt into stream-json (gateway: false): Anthropic's own
+    # endpoint relays deltas natively, and the live sidecar shows them.
     monkeypatch.delenv("MINI_ORK_PROVIDERS", raising=False)
     monkeypatch.setenv("MINI_ORK_HOME", str(tmp_path / ".mini-ork"))
     for lane in ("sonnet", "opus"):
         spec = resolve_provider(lane)
-        assert spec.command[-1] == "json", lane
+        assert spec.command[-3:] == ("stream-json", "--verbose", "--include-partial-messages"), lane
         assert spec.parse_text is claude_result_text, lane
         assert spec.parse_usage is parse_claude_usage, lane
 

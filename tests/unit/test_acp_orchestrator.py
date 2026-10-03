@@ -317,8 +317,7 @@ def _fake_miniork_shim(tmp_path: Path) -> Path:
     return shim_dir
 
 
-@pytest.mark.asyncio
-async def test_run_turn_streams_events_and_parses_result(tmp_path, monkeypatch):
+def test_run_turn_streams_events_and_parses_result(tmp_path, monkeypatch):
     """Three stream-json lines → on_event fires for each, TurnResult is parsed."""
     shim_dir = _claude_shim(
         tmp_path,
@@ -343,7 +342,7 @@ async def test_run_turn_streams_events_and_parses_result(tmp_path, monkeypatch):
     async def collect(obj: dict) -> None:
         events.append(obj)
 
-    result = await run_turn(
+    result = asyncio.run(run_turn(
         lane="opus",
         prompt="hello",
         cwd=tmp_path,
@@ -351,7 +350,7 @@ async def test_run_turn_streams_events_and_parses_result(tmp_path, monkeypatch):
         resume=None,
         on_event=collect,
         timeout_s=10,
-    )
+    ))
 
     assert result.rc == 0
     assert result.session_id == "sess-xyz"
@@ -360,8 +359,7 @@ async def test_run_turn_streams_events_and_parses_result(tmp_path, monkeypatch):
     assert [e.get("type") for e in events] == ["assistant", "tool_use", "result"]
 
 
-@pytest.mark.asyncio
-async def test_run_turn_skips_non_json_lines_and_cleans_mcp(tmp_path, monkeypatch):
+def test_run_turn_skips_non_json_lines_and_cleans_mcp(tmp_path, monkeypatch):
     """Non-JSON stdout is silently skipped; the temp MCP config is unlinked."""
     shim_dir = _claude_shim(
         tmp_path,
@@ -385,7 +383,7 @@ async def test_run_turn_skips_non_json_lines_and_cleans_mcp(tmp_path, monkeypatc
 
     monkeypatch.setattr(Path, "unlink", track_unlink)
 
-    result = await run_turn(
+    result = asyncio.run(run_turn(
         lane="opus",
         prompt="x",
         cwd=tmp_path,
@@ -393,7 +391,7 @@ async def test_run_turn_skips_non_json_lines_and_cleans_mcp(tmp_path, monkeypatc
         resume=None,
         on_event=lambda _: asyncio.sleep(0),
         timeout_s=10,
-    )
+    ))
 
     assert result.rc == 0
     assert result.session_id == "s1"
@@ -401,15 +399,14 @@ async def test_run_turn_skips_non_json_lines_and_cleans_mcp(tmp_path, monkeypatc
     assert not Path(mcp_path_sentinel["path"]).exists()
 
 
-@pytest.mark.asyncio
-async def test_run_turn_timeout_yields_rc_124(tmp_path, monkeypatch):
+def test_run_turn_timeout_yields_rc_124(tmp_path, monkeypatch):
     """A fake ``claude`` that sleeps past the timeout → rc=124, error=timeout."""
     shim_dir = _claude_shim(tmp_path, body_lines=[], sleep_s=5.0)
     miniork_dir = _fake_miniork_shim(tmp_path)
     monkeypatch.setenv("PATH", f"{shim_dir}:{miniork_dir}:{os.environ.get('PATH', '')}")
     monkeypatch.delenv("MINI_ORK_VENV_ACTIVE", raising=False)
 
-    result = await run_turn(
+    result = asyncio.run(run_turn(
         lane="opus",
         prompt="x",
         cwd=tmp_path,
@@ -417,14 +414,13 @@ async def test_run_turn_timeout_yields_rc_124(tmp_path, monkeypatch):
         resume=None,
         on_event=lambda _: asyncio.sleep(0),
         timeout_s=0.2,
-    )
+    ))
 
     assert result.rc == 124
     assert "timeout" in result.error
 
 
-@pytest.mark.asyncio
-async def test_run_turn_missing_binary_yields_rc_127(tmp_path, monkeypatch):
+def test_run_turn_missing_binary_yields_rc_127(tmp_path, monkeypatch):
     """No ``claude`` on PATH → rc=127."""
     # Create an empty PATH directory so the spawn cannot find a real
     # ``claude`` binary (one might exist on the host PATH and would otherwise
@@ -436,7 +432,7 @@ async def test_run_turn_missing_binary_yields_rc_127(tmp_path, monkeypatch):
     monkeypatch.setenv("PATH", f"{empty_dir}:{miniork_dir}")
     monkeypatch.delenv("MINI_ORK_VENV_ACTIVE", raising=False)
 
-    result = await run_turn(
+    result = asyncio.run(run_turn(
         lane="opus",
         prompt="x",
         cwd=tmp_path,
@@ -444,7 +440,7 @@ async def test_run_turn_missing_binary_yields_rc_127(tmp_path, monkeypatch):
         resume=None,
         on_event=lambda _: asyncio.sleep(0),
         timeout_s=5,
-    )
+    ))
 
     assert result.rc == 127
     assert "spawn failed" in result.error or "No such file" in result.error
