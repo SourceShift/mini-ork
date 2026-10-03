@@ -1143,11 +1143,9 @@ def _classify_lane_for_placement(lane_kind: str, env: Mapping[str, str]) -> str:
 
     Stays local under remote: tool-less HTTP lane kinds (``openai-chat``,
     ``uhp`` — no tree access, a session slot buys nothing) and the roles listed
-    in ``MO_PLACEMENT_LOCAL_ROLES`` (matched against ``MO_NODE_ROLE``, the node
-    type ``dispatch_node`` publishes per node — not ``MO_NODE_TYPE``, whose
-    publication would also flip the type-aware tool-grant defaults). The role
-    opt-out is a trade-off: a planner on an ``anthropic-compat`` lane then
-    reads the LOCAL tree.
+    in ``MO_PLACEMENT_LOCAL_ROLES`` (matched against ``MO_NODE_TYPE``, which
+    ``dispatch_node`` publishes per node). The role opt-out is a trade-off: a
+    planner on an ``anthropic-compat`` lane then reads the LOCAL tree.
     """
     if not _placement_is_remote(env):
         return "host"
@@ -1155,7 +1153,7 @@ def _classify_lane_for_placement(lane_kind: str, env: Mapping[str, str]) -> str:
         return "local"
     local_roles = {r.strip() for r in (env.get("MO_PLACEMENT_LOCAL_ROLES") or "").split(",")
                    if r.strip()}
-    if local_roles and (env.get("MO_NODE_ROLE") or "").strip() in local_roles:
+    if local_roles and (env.get("MO_NODE_TYPE") or "").strip() in local_roles:
         return "local"
     return "remote"
 

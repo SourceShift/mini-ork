@@ -169,3 +169,46 @@ def test_providers_source_references_all_grant_flags():
     assert src.count("--allowedTools") >= 1
     assert src.count("--strict-mcp-config") >= 1
     assert src.count("--mcp-config") >= 1
+
+
+def test_dispatched_undeclared_implementer_gets_its_type_aware_tools(tmp_path, monkeypatch):
+    """dispatch_node publishes MO_NODE_TYPE. Nothing did, so every node without
+    a `tools:` block got the "unknown" default (Read,Bash) — an undeclared
+    implementer could not edit a file."""
+    import json
+    import subprocess
+
+    import mini_ork.cli.execute as ex
+    from mini_ork.context import context_env_snapshot
+    from mini_ork.dispatch.providers import _resolve_node_tools
+
+    repo = Path(__file__).resolve().parents[2]
+    home = tmp_path / "home"
+    home.mkdir()
+    db = str(home / "state.db")
+    subprocess.run(["bash", str(repo / "db" / "init.sh")],
+                   env={**os.environ, "MINI_ORK_HOME": str(home), "MINI_ORK_DB": db},
+                   capture_output=True, text=True, check=True)
+    rd = tmp_path / "run"
+    rd.mkdir()
+    (rd / "workflow.yaml").write_text("nodes:\n  - {name: impl, type: implementer}\n"
+                                      "  - {name: rev, type: reviewer}\n")
+    plan = tmp_path / "plan.json"
+    plan.write_text(json.dumps({"objective": "o"}))
+    for key in ("MO_NODE_TYPE", "MO_WORKFLOW_YAML", "MO_RESOLVED_NODE_TOOLS"):
+        monkeypatch.delenv(key, raising=False)
+    grants: dict = {}
+
+    def handler(ctx):
+        env = context_env_snapshot()
+        grants[ctx.node_type] = (env.get("MO_NODE_TYPE"), _resolve_node_tools(env))
+        return 0, "done"
+
+    for node_type in ("implementer", "reviewer"):
+        monkeypatch.setitem(ex.NODE_HANDLER_REGISTRY, node_type, handler)
+    for node_id, node_type in (("impl", "implementer"), ("rev", "reviewer")):
+        ex.dispatch_node((node_id, node_type, "d", "", "serial", "", node_type, ""), root=str(repo),
+                         run_dir=str(rd), plan_path=str(plan), task_class="code_fix", db=db,
+                         run_id="run-tt", dispatch_fn=lambda *a: (0, "{}"))
+    assert grants["implementer"] == ("implementer", "Read,Write,Edit,Bash|")
+    assert grants["reviewer"] == ("reviewer", "Read,Bash|")

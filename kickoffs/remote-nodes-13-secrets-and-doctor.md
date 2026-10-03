@@ -118,7 +118,7 @@ These seams already exist on main. Reuse them; do not re-implement them.
   passed to the workspace). Never assume `MO_NODE_TOKEN`.
 - Lane kind: `providers._lane_kind(model)` reads the registry. The lane alias
   resolves via `llm_dispatch.resolve_lane_family`.
-- `dispatch_node` publishes `MO_NODE_ID`, `MO_NODE_ROLE`, `MO_NODE_ATTEMPT` and
+- `dispatch_node` publishes `MO_NODE_ID`, `MO_NODE_TYPE`, `MO_NODE_ATTEMPT` and
   `MO_INPUT_HASH` per node. These are not secrets, and the remote env assembly
   must keep them, because the reattach key and the placement roles depend on
   them. `MO_NODE_TOKEN*` must stay stripped (`isolated_env`).

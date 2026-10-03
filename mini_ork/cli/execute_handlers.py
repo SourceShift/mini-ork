@@ -107,7 +107,7 @@ def _node_placement(node_type: str, lane: str, run_dir: str) -> tuple[str, str, 
     if run_placement != "remote" or node_type in _LOCAL_PLACEMENT_NODE_TYPES:
         return "local", "", ""
     if node_type != "verifier":   # verifier checks always run on the node (epic 11)
-        env = {"MO_PLACEMENT": "remote", "MO_NODE_ROLE": node_type,
+        env = {"MO_PLACEMENT": "remote", "MO_NODE_TYPE": node_type,
                "MO_PLACEMENT_LOCAL_ROLES": context_env("MO_PLACEMENT_LOCAL_ROLES", "")}
         from mini_ork.dispatch.llm_dispatch import resolve_lane_family
         model = resolve_lane_family(lane) if lane else ""   # alias -> providers.yaml key
@@ -436,7 +436,7 @@ def dispatch_node(fields, *, root, run_dir, plan_path, task_class, db, run_id,
         node_id=node_id, run_dir=run_dir_eff, resume_session_id=None,
         attempt=str(_node_attempt_no(db, run_id, node_id)),
         input_hash=hashlib.sha256(f"{run_id}|{node_id}|{recipe}".encode()).hexdigest(),
-        node_role=node_type))
+        node_type=node_type))
 
     # (E4 turn-resume) During an active recovery, restore this node's persisted
     # transcript and export MO_RESUME_SESSION_ID so a claude lane continues the

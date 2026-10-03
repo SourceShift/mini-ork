@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Deterministic stand-in for the agent CLI in the remote-nodes E2E plumbing
 tier (no LLM spend). Every lane of the test run points here; the node's role
-(MO_NODE_ROLE, published per node by the executor) picks the answer:
+(MO_NODE_TYPE, published per node by the executor) picks the answer:
 
 * implementer — applies the fixture's one-line fix in the cwd (the target
   checkout) and reports it;
@@ -28,7 +28,7 @@ def main() -> int:
         pass
     if os.environ.get("MO_FAKE_AGENT_SLEEP"):
         time.sleep(float(os.environ["MO_FAKE_AGENT_SLEEP"]))
-    role = os.environ.get("MO_NODE_ROLE", "")
+    role = os.environ.get("MO_NODE_TYPE", "")
     if role == "implementer":
         target = Path.cwd() / "calc_pkg" / "calc.py"
         if not target.is_file():

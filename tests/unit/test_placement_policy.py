@@ -50,7 +50,7 @@ providers:
     model: m
 """
 
-_PLACEMENT_KEYS = ("MO_PLACEMENT", "MO_NODE_ENV", "MO_PLACEMENT_LOCAL_ROLES", "MO_NODE_ROLE",
+_PLACEMENT_KEYS = ("MO_PLACEMENT", "MO_NODE_ENV", "MO_PLACEMENT_LOCAL_ROLES", "MO_NODE_TYPE",
                    "MO_SANDBOX_SCOPE", "MO_SANDBOX_BACKEND", "MINI_ORK_RUN_DIR", "MO_NODE_ID")
 
 
@@ -94,8 +94,8 @@ def test_dispatch_routing_truth_table(route):
     assert route("t_chat", **remote) == "host"              # openai-chat stays local
     assert route("t_compat", workspace="docker", **remote) == "docker"   # explicit request wins
     roles = {**remote, "MO_PLACEMENT_LOCAL_ROLES": "planner,reviewer"}
-    assert route("t_compat", MO_NODE_ROLE="planner", **roles) == "host"
-    assert route("t_compat", MO_NODE_ROLE="implementer", **roles) == "remote"
+    assert route("t_compat", MO_NODE_TYPE="planner", **roles) == "host"
+    assert route("t_compat", MO_NODE_TYPE="implementer", **roles) == "remote"
     assert route("t_compat", MO_PLACEMENT="local") == "host"
 
 
