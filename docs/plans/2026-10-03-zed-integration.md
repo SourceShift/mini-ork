@@ -37,6 +37,7 @@ the thread, and the turn ends with the run's verdict.
 | The run's DAG as a live checklist | `plan` updates (entries = nodes) | Z6 |
 | Learnings / run data for other agents in Zed | MCP server `mini-ork-mcp-context` (Zed forwards MCP) | Z7 |
 | One-click install + setup | ACP Registry entry, `mini-ork zed setup`, docs/ZED.md | Z8 |
+| First-run check: project, orchestrator login, lane keys | ACP terminal auth → `mini-ork acp --setup` | Z10 |
 | DAG graph, dashboards | `mini-ork serve` (web UI), linked by `/serve` | Z5 |
 | Talk to an orchestrator that drives mini-ork (like a coding assistant in a terminal) | thread = orchestrator conversation; mode/model pickers via session config options | Z9a–c |
 | Orchestrator threads in history, reopened with the conversation resumed | `session/list` + `session/load` of `orch-` threads | Z9c-2 |
@@ -68,8 +69,12 @@ the thread, and the turn ends with the run's verdict.
 - **Z9c-2 — thread persistence.** `<home>/acp-threads/<id>.jsonl`; list, replay,
   resume.
 
-Status (2026-10-03): Z1–Z3, Z7, Z8, Z9a–c merged; Z4 in progress; Z5 and Z6
-next (Z6's recipe picker shipped as the Recipe config option in Z9c-1).
+- **Z10 — first-run setup.** `mini-ork acp --setup`, advertised as an ACP terminal
+  auth method; a thread whose orchestrator cannot run asks for it.
+
+Status (2026-10-03): every slice above is merged (Z6's recipe picker shipped as the
+Recipe config option in Z9c-1). Left: the ACP Registry listing, which needs a PyPI
+release.
 
 Fixed along the way: a docs-recipe run with nothing to do ended "published"
 (observed from Zed with the prompt "hi"); it now ends without a publish (ed17ffee).

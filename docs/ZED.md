@@ -36,6 +36,13 @@ Restart nothing. Zed reloads `settings.json` automatically. Open the project
 in Zed, hit **Agent Panel** → **New Thread** → **mini-ork** and you are
 in.
 
+On the first thread, if something is missing — no `.mini-ork` in the project,
+no `claude` CLI or login for the orchestrator, no key for a worker lane — Zed
+offers **Set up mini-ork**, which opens `mini-ork acp --setup` in a terminal: it
+checks each of those, says what is wrong, and offers to fix it (`mini-ork init`,
+`claude auth login`, `mini-ork providers configure <lane>`). You can run it
+yourself any time.
+
 ```bash
 # See what is wired up:
 mini-ork zed status
@@ -95,6 +102,20 @@ reads.
 Stopping a turn stops the conversation turn; runs it already started keep
 going — ask the orchestrator to stop one. Stopping a Direct run stops the run.
 
+### What the run changed, its plan, and slash commands
+
+- **Diffs.** When a run's implementer finishes, every changed file appears as a
+  diff in the thread and in Zed's **Review Changes**. Opening an old run shows
+  the diff recorded when it ran, not today's files.
+- **Live plan.** The run's workflow shows as a checklist above the thread —
+  each node pending, in progress, completed. In a thread with several runs it
+  follows the latest one.
+- **Slash commands.** Type `/` for `/runs`, `/status`, `/learnings`, `/cost`,
+  `/lanes`, `/stop`, `/kill`, `/resume`, `/recover`, `/certify <bug report>`,
+  `/serve`, `/help` and `/run <task>`. Commands answer in the thread and never
+  start a run (except `/run`); those that act on a run use the thread's latest
+  run unless you name one.
+
 ### History
 
 Thread History → **Import Threads** lists your orchestrator threads (titled by
@@ -116,19 +137,16 @@ adds `list_recipes`, `start_run`, `run_status`, `wait_for_run`, `stop_run` and
 
 ## 3. Coming next
 
-Tracked in [`docs/plans/2026-10-03-zed-integration.md`](plans/2026-10-03-zed-integration.md):
-
-- **Z4 — diffs in Review Changes.** When an implementer node ends, every
-  changed file shows up under Zed's **Review Changes** panel.
-- **Z5 — slash commands.** `/runs`, `/status`, `/learnings`, `/cost`,
-  `/lanes`, `/stop`, `/certify`, `/serve`, `/help`.
-- **Z6 — live plan.** The run's DAG as a live checklist in the thread.
+- **One-click install from Zed's agent list (ACP Registry).** Needs mini-ork on
+  PyPI first; the registry installs Python agents with `uvx`.
 
 ---
 
 ## 4. Troubleshooting
 
-- **Run `mini-ork zed status` first.** It prints the settings path, whether
+- **Run `mini-ork acp --setup` in the project first.** It checks the
+  project, the orchestrator's Claude login and the worker lanes' keys.
+- **Run `mini-ork zed status`.** It prints the settings path, whether
   both entries exist, whether the embedded command path exists and is
   executable, whether the `acp` extra is importable, and whether the
   current directory has a `.mini-ork/` (it must).
