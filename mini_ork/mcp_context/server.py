@@ -1,11 +1,11 @@
-"""Read-only stdio MCP server exposing ``mini-ork`` observability data.
+"""Stdio MCP server exposing ``mini-ork`` observability + control data.
 
 JSON-RPC 2.0 over stdin/stdout, one JSON object per line. ``stdout`` is the
 protocol channel — every diagnostic this module emits goes to ``stderr``;
 importing the module prints nothing.
 
-Tools (all read-only; the ``StateDB`` is opened with ``mode=ro`` +
-``PRAGMA query_only`` at :class:`mini_ork.web.db.StateDB`):
+Default mode exposes the read-only observability tools and opens the
+``StateDB`` with ``mode=ro`` + ``PRAGMA query_only``:
 
 * :func:`list_runs` — newest-first ``task_runs`` rows with a derived
   ``title`` (first non-empty ``#``-prefixed kickoff line, ≤80 chars).
@@ -18,6 +18,12 @@ Tools (all read-only; the ``StateDB`` is opened with ``mode=ro`` +
 * :func:`lanes` — the ``lane_name → family`` map from
   :func:`mini_ork.web.recipes.load_lanes`.
 
+When the server is started with ``--control`` (or env ``MO_MCP_CONTROL=1``)
+six more tools are added: ``list_recipes``, ``start_run``, ``run_status``,
+``wait_for_run``, ``stop_run``, ``certify``. These delegate to
+:mod:`mini_ork.web.control` and the certify subprocess seam — they never
+write through the server's read-only ``StateDB`` handle.
+
 Resolution: ``MINI_ORK_HOME`` else ``<cwd>/.mini-ork`` (via
 :func:`mini_ork.web.db.resolve_home`). A missing home OR missing
 ``state.db`` is reported as a per-tool ``{"error": ...}`` object — never
@@ -28,7 +34,10 @@ from __future__ import annotations
 
 import datetime as _dt
 import json
+import os
+import subprocess
 import sys
+import time
 from importlib import metadata as _imeta
 from pathlib import Path
 from typing import Any
@@ -351,6 +360,320 @@ def _lanes(home: Path, args: dict[str, Any]) -> dict[str, Any]:
         return {"lanes": {}}
 
 
+# ── control tool: list_recipes ─────────────────────────────────────────────
+
+
+def _list_recipes(home: Path, args: dict[str, Any]) -> dict[str, Any]:
+    """Scan ``<engine_root>/recipes/<name>/`` for ``workflow.yaml`` +
+    ``task_class.yaml`` and emit ``{"id", "description"}``.
+
+    The engine root resolver is pinned to ``control._mini_ork_root()`` so
+    a future divergence with ``recipes.mini_ork_root()`` cannot silently
+    shift the list the orchestrator sees. ``home`` is bound for handler
+    signature symmetry; recipe discovery is engine-root bound, not
+    home-bound.
+    """
+    del args
+    _ = home  # handler-signature symmetry; engine root drives discovery
+    from mini_ork.web.control import _mini_ork_root
+
+    try:
+        root = _mini_ork_root()
+        recipes_dir = root / "recipes"
+    except Exception as exc:
+        return {"error": f"could not resolve engine root: {exc}"}
+
+    if not recipes_dir.is_dir():
+        return {"recipes": []}
+
+    out: list[dict[str, Any]] = []
+    try:
+        entries = sorted(p for p in recipes_dir.iterdir() if p.is_dir())
+    except OSError as exc:
+        return {"error": f"could not list recipes: {exc}"}
+
+    for p in entries:
+        if not (p / "workflow.yaml").exists():
+            continue
+        if not (p / "task_class.yaml").exists():
+            continue
+        description = ""
+        try:
+            import yaml  # local import — yaml is a soft dep of recipe authoring
+            with (p / "task_class.yaml").open("r", encoding="utf-8") as f:
+                tc = yaml.safe_load(f) or {}
+        except Exception:
+            tc = {}
+        if isinstance(tc, dict):
+            raw = tc.get("description")
+            if isinstance(raw, str):
+                description = raw.strip().splitlines()[0][:120] if raw.strip() else ""
+        out.append({"id": p.name, "description": description})
+
+    return {"recipes": out}
+
+
+# ── control tool: start_run ────────────────────────────────────────────────
+
+
+def _start_run(home: Path, args: dict[str, Any]) -> dict[str, Any]:
+    recipe = args.get("recipe")
+    kickoff_markdown = args.get("kickoff_markdown")
+    if not isinstance(recipe, str) or not recipe.strip():
+        return {"error": "recipe is required"}
+    if not isinstance(kickoff_markdown, str) or not kickoff_markdown.strip():
+        return {"error": "kickoff_markdown is required"}
+
+    # Project root = the directory that OWNS .mini-ork/. Honor
+    # MINI_ORK_PROJECT_HOME so tests + orchestrators can override without
+    # binding to <home>.parent when the operator pinned a different root
+    # (e.g. a worktree overlay under tests/).
+    project_root_env = os.environ.get("MINI_ORK_PROJECT_HOME")
+    project_root = Path(project_root_env).resolve() if project_root_env else home.parent
+    extra_env = {"MO_TARGET_CWD": str(project_root)}
+
+    from mini_ork.web.control import launch_run
+
+    result = launch_run(home, recipe.strip(), kickoff_markdown, extra_env=extra_env)
+    if not isinstance(result, dict):
+        return {"error": f"launch_run returned non-dict: {result!r}"}
+    if not result.get("ok"):
+        err = result.get("error") or "launch_run failed"
+        return {"error": err, "launch_result": result}
+    return result
+
+
+# ── control tool: run_status ───────────────────────────────────────────────
+
+
+_TERMINAL_STATUSES = frozenset({"published", "rolled_back", "failed"})
+
+
+def _run_status(home: Path, args: dict[str, Any]) -> dict[str, Any]:
+    run_id = args.get("run_id")
+    if not isinstance(run_id, str) or not run_id.strip():
+        return {"error": "run_id is required"}
+    run_id = run_id.strip()
+
+    db = _open_db(home)
+    if db is None:
+        return _missing_home_error(home)
+    if not db.has_table("task_runs"):
+        return {"error": f"run not found: {run_id}"}
+
+    from mini_ork.web.repositories import RunDetailRepository
+
+    repo = RunDetailRepository(db)
+    row = repo.fetch_task_run_row(run_id)
+    if row is None:
+        return {"error": f"run not found: {run_id}"}
+
+    # Reduce node lifecycle events into per-node_id state.
+    # node_end → done; node_start only → running; otherwise pending.
+    nodes: dict[str, str] = {}
+    events = repo.fetch_node_lifecycle_events(run_id)
+    for ev in events:
+        payload = ev.get("payload_json") or "{}"
+        try:
+            pj = json.loads(payload) if isinstance(payload, str) else (payload or {})
+        except json.JSONDecodeError:
+            pj = {}
+        if not isinstance(pj, dict):
+            pj = {}
+        node_id = pj.get("node_id")
+        if not isinstance(node_id, str) or not node_id:
+            continue
+        et = ev.get("event_type")
+        if et == "node_end":
+            nodes[node_id] = "done"
+        elif et == "node_start":
+            nodes.setdefault(node_id, "running")
+
+    nodes_list = [{"node_id": nid, "state": state} for nid, state in sorted(nodes.items())]
+    try:
+        cost_usd = float(row.get("cost_usd") or 0.0)
+    except (TypeError, ValueError):
+        cost_usd = 0.0
+
+    return {
+        "run_id": run_id,
+        "status": row.get("status"),
+        "recipe": row.get("recipe"),
+        "cost_usd": cost_usd,
+        "nodes": nodes_list,
+    }
+
+
+# ── control tool: wait_for_run ─────────────────────────────────────────────
+
+
+def _wait_for_run(home: Path, args: dict[str, Any]) -> dict[str, Any]:
+    run_id = args.get("run_id")
+    if not isinstance(run_id, str) or not run_id.strip():
+        return {"error": "run_id is required"}
+    run_id = run_id.strip()
+
+    try:
+        timeout_s = int(args.get("timeout_s") or 600)
+    except (TypeError, ValueError):
+        timeout_s = 600
+    timeout_s = max(30, min(timeout_s, 1800))
+
+    try:
+        poll_s = int(os.environ.get("MO_MCP_POLL_S") or 5)
+    except (TypeError, ValueError):
+        poll_s = 5
+    if poll_s < 1:
+        poll_s = 1
+
+    deadline = time.monotonic() + timeout_s
+    started = time.monotonic()
+    last: dict[str, Any] | None = None
+    terminal = False
+    while time.monotonic() < deadline:
+        last = _run_status(home, {"run_id": run_id})
+        if not isinstance(last, dict) or last.get("error"):
+            return last if isinstance(last, dict) else {"error": "run_status non-dict"}
+        status = last.get("status")
+        if isinstance(status, str) and status in _TERMINAL_STATUSES:
+            terminal = True
+            break
+        time.sleep(poll_s)
+
+    if last is None:
+        last = {"run_id": run_id, "status": None, "recipe": None, "cost_usd": 0.0, "nodes": []}
+
+    waited = int(time.monotonic() - started)
+    out: dict[str, Any] = {**last, "terminal": terminal, "waited_s": waited}
+
+    if terminal:
+        # Surface verdict.json + last 30 lines of the launch log so the
+        # orchestrator has a compact, parseable terminal snapshot.
+        verdict_path = home / "runs" / run_id / "verdict.json"
+        if verdict_path.is_file():
+            try:
+                with verdict_path.open("r", encoding="utf-8") as f:
+                    out["verdict"] = json.load(f)
+            except (OSError, json.JSONDecodeError):
+                out["verdict"] = None
+        log_path = home / "runs-inbox" / f"{run_id}.launch.log"
+        if log_path.is_file():
+            try:
+                with log_path.open("r", encoding="utf-8", errors="replace") as f:
+                    lines = f.readlines()
+                out["launch_log_tail"] = "".join(lines[-30:])
+            except OSError:
+                out["launch_log_tail"] = None
+
+    return out
+
+
+# ── control tool: stop_run ─────────────────────────────────────────────────
+
+
+def _stop_run(home: Path, args: dict[str, Any]) -> dict[str, Any]:
+    run_id = args.get("run_id")
+    if not isinstance(run_id, str) or not run_id.strip():
+        return {"error": "run_id is required"}
+    run_id = run_id.strip()
+    hard = bool(args.get("hard"))
+
+    db = _open_db(home)
+    if db is None:
+        return _missing_home_error(home)
+
+    from mini_ork.web.control import stop_run as _ctl_stop, kill_run as _ctl_kill
+
+    fn = _ctl_kill if hard else _ctl_stop
+    try:
+        result = fn(home, db, run_id)
+    except Exception as exc:
+        return {"error": f"stop_run failed: {exc}"}
+    if not isinstance(result, dict):
+        return {"error": f"stop_run returned non-dict: {result!r}"}
+    return result
+
+
+# ── control tool: certify ──────────────────────────────────────────────────
+
+
+def _certify(home: Path, args: dict[str, Any]) -> dict[str, Any]:
+    issue = args.get("issue")
+    if not isinstance(issue, str) or not issue.strip():
+        return {"error": "issue is required"}
+    issue = issue.strip()
+    base = args.get("base") or "HEAD~1"
+    head = args.get("head") or "HEAD"
+    if not isinstance(base, str) or not isinstance(head, str):
+        return {"error": "base and head must be strings"}
+
+    try:
+        timeout_s = int(os.environ.get("MO_MCP_CERTIFY_TIMEOUT_S") or 900)
+    except (TypeError, ValueError):
+        timeout_s = 900
+    if timeout_s < 30:
+        timeout_s = 30
+
+    from mini_ork.verify.test_env import scrubbed_test_env
+    from mini_ork.web.control import _mini_ork_root
+
+    try:
+        root = _mini_ork_root()
+    except Exception as exc:
+        return {"error": f"could not resolve engine root: {exc}"}
+
+    bin_path = root / "bin" / "mini-ork"
+    if not bin_path.is_file():
+        return {"error": f"bin/mini-ork not found under {root}"}
+
+    # Strip operator credentials + live-run pointers from the subprocess
+    # env so the cert cannot leak or rebind against the operator's state.
+    env = scrubbed_test_env()
+    env.pop("MINI_ORK_VENV_ACTIVE", None)  # mirror launch_run: drop the re-exec marker
+    env["MINI_ORK_ROOT"] = str(root)
+    env["MINI_ORK_HOME"] = str(home)
+
+    cmd = [
+        sys.executable, str(bin_path), "certify",
+        "--repo", str(home.parent),
+        "--base", base,
+        "--head", head,
+        "--issue", issue,
+        "--json",
+    ]
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=str(root),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=timeout_s,
+        )
+    except subprocess.TimeoutExpired:
+        return {"error": f"certify timed out after {timeout_s}s", "exit_code": None}
+    except OSError as exc:
+        return {"error": f"certify spawn failed: {exc}", "exit_code": None}
+
+    out: dict[str, Any] = {"exit_code": proc.returncode}
+    stdout = proc.stdout or ""
+    stderr = proc.stderr or ""
+    parsed: Any = None
+    try:
+        parsed = json.loads(stdout)
+    except json.JSONDecodeError:
+        parsed = None
+    if isinstance(parsed, (dict, list)):
+        out["certificate"] = parsed
+    else:
+        out["certificate"] = None
+        # Non-JSON stdout/stderr tails (≤2 KiB each) so callers can see
+        # what the cert subprocess actually produced.
+        out["stdout_tail"] = stdout[-2048:]
+        out["stderr_tail"] = stderr[-2048:]
+    return out
+
+
 # ── tool dispatch ─────────────────────────────────────────────────────────
 
 
@@ -423,7 +746,117 @@ TOOL_DEFS: list[dict[str, Any]] = [
 ]
 
 
-def _call_tool(home: Path, name: str, args: dict[str, Any]) -> dict[str, Any]:
+_CONTROL_TOOL_DEFS: list[dict[str, Any]] = [
+    {
+        "name": "list_recipes",
+        "description": (
+            "List the engine's recipes (directories under <engine_root>/recipes "
+            "with both workflow.yaml and task_class.yaml). Returns "
+            "{id, description} per recipe."
+        ),
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "start_run",
+        "description": (
+            "Launch a new mini-ork run via `bin/mini-ork run <recipe> <kickoff>`. "
+            "Sets MO_TARGET_CWD to the project root so the spawned run operates "
+            "on the user's checkout. Returns {ok, run_id, recipe, pid, "
+            "kickoff_path, log_path} on success or {error} on failure."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "recipe": {"type": "string"},
+                "kickoff_markdown": {"type": "string"},
+            },
+            "required": ["recipe", "kickoff_markdown"],
+        },
+    },
+    {
+        "name": "run_status",
+        "description": (
+            "Snapshot of a single run: status, recipe, cost_usd, and "
+            "per-node state derived from node_start/node_end lifecycle events."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {"run_id": {"type": "string"}},
+            "required": ["run_id"],
+        },
+    },
+    {
+        "name": "wait_for_run",
+        "description": (
+            "Poll run_status until the run reaches a terminal state "
+            "(published, rolled_back, failed) or timeout_s passes. "
+            "timeout_s is clamped to [30, 1800] (default 600). Returns the "
+            "last status plus {terminal, waited_s}; when terminal, includes "
+            "verdict.json and the last 30 lines of the launch log."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "run_id": {"type": "string"},
+                "timeout_s": {"type": "integer", "minimum": 30, "maximum": 1800},
+            },
+            "required": ["run_id"],
+        },
+    },
+    {
+        "name": "stop_run",
+        "description": (
+            "Stop a running task. soft (hard=false) writes a stop-requested "
+            "flag the dispatcher honours before the next node; hard "
+            "(hard=true) SIGTERMs then SIGKILLs the dispatcher pid."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "run_id": {"type": "string"},
+                "hard": {"type": "boolean"},
+            },
+            "required": ["run_id"],
+        },
+    },
+    {
+        "name": "certify",
+        "description": (
+            "Spawn `bin/mini-ork certify --json` against base..head in the "
+            "project root (timeout MO_MCP_CERTIFY_TIMEOUT_S, default 900). "
+            "Returns the parsed certificate plus exit_code on JSON output; "
+            "stdout/stderr tails on non-JSON output."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "issue": {"type": "string"},
+                "base": {"type": "string"},
+                "head": {"type": "string"},
+            },
+            "required": ["issue"],
+        },
+    },
+]
+
+
+def _all_tool_defs(control: bool) -> list[dict[str, Any]]:
+    """Tool list for ``tools/list``. Additive: read-only 5 + control 6 when
+    ``control=True``; the read-only 5 only by default — default mode MUST
+    stay byte-identical to the pre-`--control` schema.
+    """
+    if control:
+        return list(TOOL_DEFS) + list(_CONTROL_TOOL_DEFS)
+    return list(TOOL_DEFS)
+
+
+def _call_tool(
+    home: Path,
+    name: str,
+    args: dict[str, Any],
+    *,
+    control: bool = False,
+) -> dict[str, Any]:
     """Invoke ``name`` with ``args``. Returns a result dict.
 
     Two failure shapes:
@@ -431,6 +864,11 @@ def _call_tool(home: Path, name: str, args: dict[str, Any]) -> dict[str, Any]:
     * Raised exception or unknown tool → ``{"error": ...}`` so the JSON-RPC
       envelope can flip ``isError: true`` and the client sees a string
       message rather than an opaque internal exception.
+
+    When ``control=False`` (default) the six control tools are not just
+    rejected at dispatch — calling one returns ``{"error": "unknown tool"}``
+    so a misconfigured client sees the same shape as any other missing
+    tool, never a 401-style privilege error.
     """
     gate = _tool_home(home)
     if gate:
@@ -446,20 +884,37 @@ def _call_tool(home: Path, name: str, args: dict[str, Any]) -> dict[str, Any]:
             return _cost(home, args)
         if name == "lanes":
             return _lanes(home, args)
+        if control:
+            if name == "list_recipes":
+                return _list_recipes(home, args)
+            if name == "start_run":
+                return _start_run(home, args)
+            if name == "run_status":
+                return _run_status(home, args)
+            if name == "wait_for_run":
+                return _wait_for_run(home, args)
+            if name == "stop_run":
+                return _stop_run(home, args)
+            if name == "certify":
+                return _certify(home, args)
     except Exception as exc:  # defensive — kickoff says no exception ever
         _log(f"tool {name} raised: {exc}")
         return {"error": f"{name}: {exc}"}
     return {"error": f"unknown tool: {name}"}
 
 
-def dispatch(req: dict[str, Any]) -> dict[str, Any] | None:
+def dispatch(req: dict[str, Any], *, control: bool = False) -> dict[str, Any] | None:
     """Run ONE JSON-RPC request through the server and return its response.
 
     Returns ``None`` for notifications (no response). ``None`` for
     malformed/empty input. Always returns a dict for everything else.
 
     Exposed as a public function so tests can drive the loop
-    in-process without spawning a subprocess or touching stdio.
+    in-process without spawning a subprocess or touching stdio. The
+    ``control`` flag is the single source of truth — the server does
+    NOT re-read ``MO_MCP_CONTROL`` from the environment, so a default
+    ``control=False`` keeps the read-only 5-tool list even when a
+    parent shell leaked the env var.
     """
     if not isinstance(req, dict):
         return None
@@ -488,7 +943,7 @@ def dispatch(req: dict[str, Any]) -> dict[str, Any] | None:
         return {
             "jsonrpc": "2.0",
             "id": req_id,
-            "result": {"tools": TOOL_DEFS},
+            "result": {"tools": _all_tool_defs(control)},
         }
 
     if method == "tools/call":
@@ -498,7 +953,7 @@ def dispatch(req: dict[str, Any]) -> dict[str, Any] | None:
         args = params.get("arguments") or {}
         if not isinstance(args, dict):
             args = {}
-        result = _call_tool(_resolve_home(), str(tool or ""), args)
+        result = _call_tool(_resolve_home(), str(tool or ""), args, control=control)
         is_error = bool(result.get("error")) if isinstance(result, dict) else False
         return {
             "jsonrpc": "2.0",
@@ -525,18 +980,20 @@ def _error_envelope(req_id: Any, code: int, message: str) -> dict[str, Any]:
     }
 
 
-def serve(stdin=None, stdout=None) -> int:
+def serve(stdin=None, stdout=None, *, control: bool = False) -> int:
     """Run the JSON-RPC loop on the given streams (defaults: real stdio).
 
     Returns 0 on clean EOF. Malformed JSON lines are skipped (logged to
     stderr). Handler exceptions are converted to a `-32603` JSON-RPC
-    error so a tool bug never kills the loop.
+    error so a tool bug never kills the loop. The ``control`` keyword
+    enables the six write-capable tools — pass it from the CLI which
+    is the only place that should ever resolve the flag.
     """
     if stdin is None:
         stdin = sys.stdin
     if stdout is None:
         stdout = sys.stdout
-    _log(f"started v{VERSION} home={_resolve_home()}")
+    _log(f"started v{VERSION} home={_resolve_home()} control={control}")
     for raw in stdin:
         raw = raw.strip()
         if not raw:
@@ -547,7 +1004,7 @@ def serve(stdin=None, stdout=None) -> int:
             _log(f"bad json: {exc}")
             continue
         try:
-            resp = dispatch(req)
+            resp = dispatch(req, control=control)
         except Exception as exc:
             _log(f"handler error: {exc}")
             resp = _error_envelope(

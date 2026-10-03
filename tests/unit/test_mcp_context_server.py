@@ -1,13 +1,14 @@
 """Unit tests for ``mini_ork.mcp_context.server``.
 
-The test file covers the read-only stdio MCP server end-to-end:
+The test file covers the stdio MCP server end-to-end:
 
 * ``dispatch`` is driven with request dicts (no subprocess, no real
-  stdio) — verifies the JSON-RPC framing, the five tools, and the
-  per-tool error shapes (missing home, unknown tool, malformed input).
-* One subprocess end-to-end pass to prove ``mini-ork mcp-context``
-  talks JSON-RPC on real stdio and stdout carries nothing but
-  protocol lines.
+  stdio) — verifies the JSON-RPC framing, the five read-only tools,
+  the per-tool error shapes (missing home, unknown tool, malformed
+  input), and the control-mode gating behaviour.
+* Subprocess end-to-end passes prove ``mini-ork mcp-context``
+  talks JSON-RPC on real stdio in both read-only and control modes
+  and stdout carries nothing but protocol lines.
 
 DB fixture convention follows ``tests/README.md`` (``init_db`` on a
 fresh ``tmp_path``). The autouse ``_isolate_process_state`` fixture
@@ -363,3 +364,439 @@ def test_subprocess_round_trip(server_home):
     assert names == ["cost", "lanes", "learnings", "list_runs", "run_detail"]
     body = json.loads(lines[2]["result"]["content"][0]["text"])
     assert len(body["runs"]) >= 1
+
+
+def test_subprocess_round_trip_with_control(server_home):
+    """Spawn ``bin/mini-ork mcp-context --control`` and assert the 11-tool list."""
+    bin_path = REPO / "bin" / "mini-ork"
+    if not bin_path.exists():
+        pytest.skip("bin/mini-ork missing — subprocess test needs the launcher")
+
+    request_lines = "\n".join([
+        json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize"}),
+        json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
+        json.dumps({
+            "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+            "params": {"name": "start_run", "arguments": {}},
+        }),
+    ]) + "\n"
+    proc = subprocess.run(
+        [sys.executable, str(bin_path), "mcp-context", "--control"],
+        input=request_lines,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env={
+            **os.environ,
+            "MINI_ORK_PROJECT_HOME": str(server_home),
+            "MINI_ORK_HOME": str(server_home),
+        },
+    )
+    assert proc.returncode == 0, (
+        f"rc={proc.returncode}\nstdout={proc.stdout!r}\nstderr={proc.stderr!r}"
+    )
+    lines = [json.loads(l) for l in proc.stdout.splitlines() if l.strip()]
+    assert len(lines) == 3
+    names = sorted(t["name"] for t in lines[1]["result"]["tools"])
+    expected = [
+        "certify", "cost", "lanes", "learnings", "list_recipes", "list_runs",
+        "run_detail", "run_status", "start_run", "stop_run", "wait_for_run",
+    ]
+    assert names == expected
+    # `start_run` with empty args → error object (recipe required).
+    body = json.loads(lines[2]["result"]["content"][0]["text"])
+    assert "error" in body
+
+
+def test_subprocess_control_via_env(server_home):
+    """`MO_MCP_CONTROL=1` enables control tools without the CLI flag."""
+    bin_path = REPO / "bin" / "mini-ork"
+    if not bin_path.exists():
+        pytest.skip("bin/mini-ork missing — subprocess test needs the launcher")
+
+    request_lines = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}) + "\n"
+    proc = subprocess.run(
+        [sys.executable, str(bin_path), "mcp-context"],
+        input=request_lines,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env={
+            **os.environ,
+            "MO_MCP_CONTROL": "1",
+            "MINI_ORK_PROJECT_HOME": str(server_home),
+            "MINI_ORK_HOME": str(server_home),
+        },
+    )
+    assert proc.returncode == 0, (
+        f"rc={proc.returncode}\nstdout={proc.stdout!r}\nstderr={proc.stderr!r}"
+    )
+    lines = [json.loads(l) for l in proc.stdout.splitlines() if l.strip()]
+    names = sorted(t["name"] for t in lines[0]["result"]["tools"])
+    assert "start_run" in names
+    assert "certify" in names
+
+
+# ── control-mode gating (in-process) ─────────────────────────────────────
+
+
+def _call_control(name: str, args: dict | None = None) -> dict:
+    """Drive ``dispatch`` with the control flag enabled."""
+    from mini_ork.mcp_context.server import dispatch
+
+    return dispatch(
+        {"jsonrpc": "2.0", "id": 1, "method": name, "params": args or {}},
+        control=True,
+    )
+
+
+def _call_args_control(args: dict | None = None) -> dict:
+    return _call_control("tools/call", args or {})
+
+
+def test_default_mode_rejects_control_tools(server_home):
+    """Without --control, calling `start_run` returns the unknown-tool envelope."""
+    resp = _call_args({"name": "start_run", "arguments": {"recipe": "x", "kickoff_markdown": "y"}})
+    body = json.loads(resp["result"]["content"][0]["text"])
+    assert resp["result"]["isError"] is True
+    assert "unknown tool" in body["error"]
+
+
+def test_control_mode_lists_eleven_tools(server_home):
+    """With control=True, tools/list returns 5 + 6 = 11 names."""
+    resp = _call_control("tools/list")
+    names = sorted(t["name"] for t in resp["result"]["tools"])
+    assert len(names) == 11
+    assert names == sorted([
+        "certify", "cost", "lanes", "learnings", "list_recipes", "list_runs",
+        "run_detail", "run_status", "start_run", "stop_run", "wait_for_run",
+    ])
+
+
+# ── list_recipes ────────────────────────────────────────────────────────
+
+
+def test_list_recipes_scans_engine_root(server_home, monkeypatch, tmp_path):
+    """`list_recipes` reads the engine root via the control resolver."""
+    recipes_dir = tmp_path / "recipes"
+    recipes_dir.mkdir()
+    for name, desc in [("alpha", "Alpha recipe"), ("beta", "Beta recipe")]:
+        d = recipes_dir / name
+        d.mkdir()
+        (d / "workflow.yaml").write_text("name: x\n", encoding="utf-8")
+        (d / "task_class.yaml").write_text(
+            f"description: {desc}\nmore: ignored\n", encoding="utf-8"
+        )
+    # Half-baked recipe — missing task_class.yaml — must be skipped.
+    half = recipes_dir / "half"
+    half.mkdir()
+    (half / "workflow.yaml").write_text("name: x\n", encoding="utf-8")
+
+    monkeypatch.setattr("mini_ork.web.control._mini_ork_root", lambda: tmp_path)
+
+    resp = _call_args_control({"name": "list_recipes", "arguments": {}})
+    body = json.loads(resp["result"]["content"][0]["text"])
+    assert resp["result"]["isError"] is False
+    by_id = {r["id"]: r["description"] for r in body["recipes"]}
+    assert by_id["alpha"] == "Alpha recipe"
+    assert by_id["beta"] == "Beta recipe"
+    assert "half" not in by_id
+
+
+# ── start_run ───────────────────────────────────────────────────────────
+
+
+def test_start_run_passes_to_launch_run(server_home, monkeypatch):
+    """`start_run` calls control.launch_run with recipe + kickoff + MO_TARGET_CWD."""
+    # Parent shell may leak MINI_ORK_PROJECT_HOME; the kickoff clause of
+    # `home.parent` only applies without the env override.
+    monkeypatch.delenv("MINI_ORK_PROJECT_HOME", raising=False)
+    captured: dict = {}
+
+    def fake_launch(home, recipe, kickoff, run_id=None, extra_env=None):
+        captured["home"] = home
+        captured["recipe"] = recipe
+        captured["kickoff"] = kickoff
+        captured["extra_env"] = extra_env
+        return {
+            "ok": True,
+            "run_id": "run-test",
+            "recipe": recipe,
+            "pid": 99999,
+            "kickoff_path": str(home / "runs-inbox" / "run-test.md"),
+            "log_path": str(home / "runs-inbox" / "run-test.launch.log"),
+        }
+
+    monkeypatch.setattr("mini_ork.web.control.launch_run", fake_launch)
+
+    kickoff = "# hello\nbody\n"
+    resp = _call_args_control({
+        "name": "start_run",
+        "arguments": {"recipe": "framework-edit", "kickoff_markdown": kickoff},
+    })
+    body = json.loads(resp["result"]["content"][0]["text"])
+    assert resp["result"]["isError"] is False
+    assert body["ok"] is True
+    assert body["run_id"] == "run-test"
+    assert captured["recipe"] == "framework-edit"
+    assert captured["kickoff"] == kickoff
+    # MO_TARGET_CWD must point at the project root (home.parent), not the home itself.
+    assert captured["extra_env"] == {"MO_TARGET_CWD": str(server_home.parent)}
+
+
+def test_start_run_passes_project_home_when_set(server_home, monkeypatch):
+    """MINI_ORK_PROJECT_HOME wins over home.parent for MO_TARGET_CWD."""
+    captured: dict = {}
+
+    def fake_launch(home, recipe, kickoff, run_id=None, extra_env=None):
+        captured["extra_env"] = extra_env
+        return {
+            "ok": True,
+            "run_id": "rid",
+            "recipe": recipe,
+            "pid": 1,
+            "kickoff_path": "x",
+            "log_path": "y",
+        }
+
+    monkeypatch.setattr("mini_ork.web.control.launch_run", fake_launch)
+    monkeypatch.setenv("MINI_ORK_PROJECT_HOME", "/custom/project")
+
+    resp = _call_args_control({
+        "name": "start_run",
+        "arguments": {"recipe": "code-fix", "kickoff_markdown": "body"},
+    })
+    body = json.loads(resp["result"]["content"][0]["text"])
+    assert body["ok"] is True
+    assert captured["extra_env"] == {"MO_TARGET_CWD": "/custom/project"}
+
+
+def test_start_run_returns_error_object_on_failure(server_home, monkeypatch):
+    def fake_launch(home, recipe, kickoff, run_id=None, extra_env=None):
+        return {"ok": False, "error": "invalid recipe"}
+
+    monkeypatch.setattr("mini_ork.web.control.launch_run", fake_launch)
+    resp = _call_args_control({
+        "name": "start_run",
+        "arguments": {"recipe": "../bad", "kickoff_markdown": "x"},
+    })
+    body = json.loads(resp["result"]["content"][0]["text"])
+    assert resp["result"]["isError"] is True
+    assert "invalid recipe" in body["error"]
+
+
+def test_start_run_requires_recipe(server_home):
+    resp = _call_args_control({
+        "name": "start_run",
+        "arguments": {"kickoff_markdown": "x"},
+    })
+    body = json.loads(resp["result"]["content"][0]["text"])
+    assert resp["result"]["isError"] is True
+    assert "recipe is required" in body["error"]
+
+
+# ── run_status ──────────────────────────────────────────────────────────
+
+
+def test_run_status_maps_node_lifecycle(server_home):
+    """node_end → done, node_start only → running, otherwise pending."""
+    now = int(time.time())
+    con = sqlite3.connect(str(server_home / "state.db"))
+    try:
+        # run-z-2 already exists with status='published'; add node events.
+        con.execute(
+            "INSERT INTO run_events(event_id, run_id, event_type, payload_json, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("ev-1", "run-z-2", "node_start",
+             json.dumps({"node_id": "planner", "node_type": "planner"}), now - 100),
+        )
+        con.execute(
+            "INSERT INTO run_events(event_id, run_id, event_type, payload_json, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("ev-2", "run-z-2", "node_end",
+             json.dumps({"node_id": "planner", "node_type": "planner"}), now - 90),
+        )
+        con.execute(
+            "INSERT INTO run_events(event_id, run_id, event_type, payload_json, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("ev-3", "run-z-2", "node_start",
+             json.dumps({"node_id": "implementer", "node_type": "implementer"}), now - 50),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+    resp = _call_args_control({"name": "run_status", "arguments": {"run_id": "run-z-2"}})
+    body = json.loads(resp["result"]["content"][0]["text"])
+    assert resp["result"]["isError"] is False
+    assert body["status"] == "published"
+    assert body["recipe"] == "framework-edit"
+    assert isinstance(body["cost_usd"], (int, float))
+    by_node = {n["node_id"]: n["state"] for n in body["nodes"]}
+    assert by_node["planner"] == "done"
+    assert by_node["implementer"] == "running"
+
+
+def test_run_status_unknown_run_is_error(server_home):
+    resp = _call_args_control({"name": "run_status", "arguments": {"run_id": "nope"}})
+    body = json.loads(resp["result"]["content"][0]["text"])
+    assert resp["result"]["isError"] is True
+    assert "not found" in body["error"]
+
+
+# ── wait_for_run ────────────────────────────────────────────────────────
+
+
+def test_wait_for_run_returns_terminal_immediately(server_home, monkeypatch):
+    """When the run is already terminal, return immediately with verdict + log tail."""
+    monkeypatch.setenv("MO_MCP_POLL_S", "1")
+    # run-z-2 is 'published' in the fixture — already terminal.
+    resp = _call_args_control({
+        "name": "wait_for_run",
+        "arguments": {"run_id": "run-z-2", "timeout_s": 30},
+    })
+    body = json.loads(resp["result"]["content"][0]["text"])
+    assert resp["result"]["isError"] is False
+    assert body["terminal"] is True
+    assert body["status"] == "published"
+    assert body["waited_s"] >= 0
+    # verdict + launch_log_tail may be absent if the log file wasn't created,
+    # but verdict.json is written by the fixture.
+    if "verdict" in body:
+        assert body["verdict"]["verdict"] == "APPROVE"
+
+
+def test_wait_for_run_times_out_for_running_run(server_home, monkeypatch):
+    """For a non-terminal run, return with terminal=False after timeout."""
+    monkeypatch.setenv("MO_MCP_POLL_S", "1")
+    # run-z-1 has status='failed' (terminal). Use a non-terminal fake
+    # by monkeypatching _run_status to always return 'running'.
+    calls = {"n": 0}
+
+    def fake_status(home, args):
+        calls["n"] += 1
+        return {"status": "running", "recipe": "x", "cost_usd": 0.0, "nodes": []}
+
+    monkeypatch.setattr("mini_ork.mcp_context.server._run_status", fake_status)
+    resp = _call_args_control({
+        "name": "wait_for_run",
+        "arguments": {"run_id": "run-z-1", "timeout_s": 30},
+    })
+    body = json.loads(resp["result"]["content"][0]["text"])
+    assert resp["result"]["isError"] is False
+    assert body["terminal"] is False
+    assert body["status"] == "running"
+    assert calls["n"] >= 1
+
+
+# ── stop_run ────────────────────────────────────────────────────────────
+
+
+def test_stop_run_soft_calls_stop_run(server_home, monkeypatch):
+    captured: dict = {}
+
+    def fake_stop(home, db, run_id):
+        captured["fn"] = "stop"
+        captured["run_id"] = run_id
+        return {"ok": True, "action": "stop", "task_run_id": run_id}
+
+    monkeypatch.setattr("mini_ork.web.control.stop_run", fake_stop)
+
+    resp = _call_args_control({
+        "name": "stop_run",
+        "arguments": {"run_id": "run-z-1", "hard": False},
+    })
+    body = json.loads(resp["result"]["content"][0]["text"])
+    assert resp["result"]["isError"] is False
+    assert body["ok"] is True
+    assert captured["fn"] == "stop"
+
+
+def test_stop_run_hard_calls_kill_run(server_home, monkeypatch):
+    captured: dict = {}
+
+    def fake_kill(home, db, run_id):
+        captured["fn"] = "kill"
+        captured["run_id"] = run_id
+        return {"ok": True, "action": "kill", "task_run_id": run_id}
+
+    monkeypatch.setattr("mini_ork.web.control.kill_run", fake_kill)
+
+    resp = _call_args_control({
+        "name": "stop_run",
+        "arguments": {"run_id": "run-z-1", "hard": True},
+    })
+    body = json.loads(resp["result"]["content"][0]["text"])
+    assert resp["result"]["isError"] is False
+    assert body["ok"] is True
+    assert captured["fn"] == "kill"
+
+
+# ── certify ─────────────────────────────────────────────────────────────
+
+
+def test_certify_parses_json_output(server_home, monkeypatch):
+    cert = {"ok": True, "verdict": "PASS", "issue": "min-ork-zed"}
+    fake_proc = type("P", (), {
+        "returncode": 0,
+        "stdout": json.dumps(cert),
+        "stderr": "",
+    })()
+
+    def fake_run(cmd, cwd=None, env=None, capture_output=None, text=None, timeout=None):
+        captured["cmd"] = cmd
+        captured["env_keys"] = sorted((env or {}).keys())
+        return fake_proc
+
+    captured: dict = {}
+    monkeypatch.setattr("mini_ork.mcp_context.server.subprocess.run", fake_run)
+
+    resp = _call_args_control({
+        "name": "certify",
+        "arguments": {"issue": "min-ork-zed", "base": "HEAD~1", "head": "HEAD"},
+    })
+    body = json.loads(resp["result"]["content"][0]["text"])
+    assert resp["result"]["isError"] is False
+    assert body["exit_code"] == 0
+    assert body["certificate"] == cert
+    assert "stderr_tail" not in body
+    # Command shape must match the kickoff spec.
+    assert captured["cmd"][:2] == [sys.executable, str(REPO / "bin" / "mini-ork")]
+    assert "certify" in captured["cmd"]
+    assert "--json" in captured["cmd"]
+    # Scrubbed env: NO provider keys leaked.
+    for k in captured["env_keys"]:
+        assert "API_KEY" not in k
+        assert "ANTHROPIC_" not in k
+        assert k != "MINI_ORK_SECRETS"
+
+
+def test_certify_handles_non_json_output(server_home, monkeypatch):
+    fake_proc = type("P", (), {
+        "returncode": 2,
+        "stdout": "not json at all",
+        "stderr": "boom",
+    })()
+
+    def fake_run(*args, **kw):
+        return fake_proc
+
+    monkeypatch.setattr("mini_ork.mcp_context.server.subprocess.run", fake_run)
+
+    resp = _call_args_control({
+        "name": "certify",
+        "arguments": {"issue": "min-ork-zed"},
+    })
+    body = json.loads(resp["result"]["content"][0]["text"])
+    assert resp["result"]["isError"] is False
+    assert body["exit_code"] == 2
+    assert body["certificate"] is None
+    assert body["stdout_tail"] == "not json at all"
+    assert body["stderr_tail"] == "boom"
+
+
+def test_certify_requires_issue(server_home):
+    resp = _call_args_control({"name": "certify", "arguments": {}})
+    body = json.loads(resp["result"]["content"][0]["text"])
+    assert resp["result"]["isError"] is True
+    assert "issue is required" in body["error"]
