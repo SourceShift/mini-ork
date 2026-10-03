@@ -38,6 +38,8 @@ the thread, and the turn ends with the run's verdict.
 | Learnings / run data for other agents in Zed | MCP server `mini-ork-mcp-context` (Zed forwards MCP) | Z7 |
 | One-click install + setup | ACP Registry entry, `mini-ork zed setup`, docs/ZED.md | Z8 |
 | DAG graph, dashboards | `mini-ork serve` (web UI), linked by `/serve` | Z5 |
+| Talk to an orchestrator that drives mini-ork (like a coding assistant in a terminal) | thread = orchestrator conversation; mode/model pickers via session config options | Z9a–c |
+| Orchestrator threads in history, reopened with the conversation resumed | `session/list` + `session/load` of `orch-` threads | Z9c-2 |
 
 ## Slices (serial: each one edits `mini_ork/acp/agent.py`)
 
@@ -56,6 +58,18 @@ the thread, and the turn ends with the run's verdict.
 - **Z6 — recipe modes + live plan.** Recipes as session modes; plan entries per node.
 - **Z7 — MCP context server.**
 - **Z8 — packaging and docs.**
+- **Z9a — MCP control tools.** `mcp-context --control`: list_recipes, start_run,
+  run_status, wait_for_run, stop_run, certify.
+- **Z9b — orchestrator harness.** `mini_ork/acp_orchestrator/`: one claude-CLI turn
+  on a chosen lane with the control tools; default lane opus, configurable.
+- **Z9c-1 — the thread is the orchestrator.** Mode/model/recipe config options;
+  runs started in a thread stream into it under `<run_id>:` tool ids; one
+  thread cost.
+- **Z9c-2 — thread persistence.** `<home>/acp-threads/<id>.jsonl`; list, replay,
+  resume.
 
-Also tracked: a docs-recipe run with nothing to do currently ends "published"
-(observed from Zed with the prompt "hi"); it should end without a publish.
+Status (2026-10-03): Z1–Z3, Z7, Z8, Z9a–c merged; Z4 in progress; Z5 and Z6
+next (Z6's recipe picker shipped as the Recipe config option in Z9c-1).
+
+Fixed along the way: a docs-recipe run with nothing to do ended "published"
+(observed from Zed with the prompt "hi"); it now ends without a publish (ed17ffee).

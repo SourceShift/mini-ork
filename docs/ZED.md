@@ -2,7 +2,8 @@
 
 Zed runs agents through the Agent Client Protocol (ACP) and forwards MCP
 servers to every agent in the editor. mini-ork ships both an ACP agent
-(`mini-ork acp`) and a read-only MCP context server (`mini-ork mcp-context`);
+(`mini-ork acp`) — a conversation with the mini-ork orchestrator — and an MCP
+context server (`mini-ork mcp-context`);
 this guide is the one-command wiring for the two, plus what you can do with
 it today and where the web UI (`mini-ork serve`) still earns its keep.
 
@@ -52,21 +53,64 @@ prints the two blocks to merge by hand — return code 2, file unchanged.
 
 ## 2. What you get today
 
-Once Zed is wired:
+### Talk to the orchestrator
 
-- **Start a run from a prompt.** Agent Panel → New Thread → mini-ork → type
-  the kickoff in plain language. Each workflow node becomes a live tool
-  call inside the thread, with cost and duration visible in real time.
-- **Run history, including CLI-started runs.** Thread History → **Import
-  Threads** lists every run of the project (whether you started it from
-  inside Zed or via `mini-ork run` on the CLI). Opening one replays it.
-- **Attach to a still-running run.** Opening a run that is currently in
-  flight attaches and follows it: the thread shows live node tool calls
-  as they happen.
-- **Same data, every agent in Zed.** `mini-ork mcp-context` exposes runs,
-  run detail, learnings, cost and lane map as MCP tools. The built-in
-  Zed agent, Claude, Codex and any other MCP-aware agent in the editor
-  see the same surface.
+Agent Panel → **New Thread** → **mini-ork**, then say what you want in plain
+language — the way you would ask a colleague. The thread talks to the mini-ork
+**orchestrator**, an agent that:
+
+- reads the project (Read, Grep, Glob only — it never edits files itself);
+- checks past runs and learnings before doing anything;
+- picks a recipe, writes the kickoff, starts the run, waits for it, and tells
+  you in plain words what changed, whether verification passed, and what it cost;
+- can stop a run or certify a change when you ask.
+
+Every change goes through a mini-ork run, so it is verified and rolled back on
+failure exactly as from the CLI. The conversation continues across prompts.
+
+### The pickers
+
+The thread header has three pickers, like other Zed agents:
+
+| Picker | Values | Default |
+|---|---|---|
+| **Mode** | *Orchestrate* (talk to the orchestrator) or *Direct run* (each prompt is a run kickoff) | `MO_ACP_DEFAULT_MODE`, else Orchestrate |
+| **Model** | the lane the orchestrator runs on: Opus and Sonnet through your Claude subscription, plus every other `claude`-CLI lane in `providers.yaml` (GLM-5.3, MiniMax-M3, deepseek, …) | `MO_ORCHESTRATOR_LANE`, else the `orchestrator` role in `.mini-ork/config/agents.yaml`, else Opus |
+| **Recipe** | every recipe (`code-fix`, `docs`, audits, research, …) — used by Direct run and `/run` | `MO_ACP_RECIPE`, else `code-fix` |
+
+`/run <task>` skips the conversation for one prompt and starts the selected
+recipe directly.
+
+### Runs stream into the thread
+
+A run the orchestrator starts (or you start with Direct run or `/run`) appears
+in the thread as a tool call `run <id> (<recipe>)`. Under it, each workflow node
+is its own tool call with the agent's live output — commands, file reads and
+edits, its text — as it works. The run's call closes as completed when it
+publishes and as failed otherwise, with a one-line result. The thread
+shows one running cost: the orchestrator's turns plus every run it started,
+including stage spend (judges, learning) — the same ledger the budget guard
+reads.
+
+Stopping a turn stops the conversation turn; runs it already started keep
+going — ask the orchestrator to stop one. Stopping a Direct run stops the run.
+
+### History
+
+Thread History → **Import Threads** lists your orchestrator threads (titled by
+their first prompt) and every run of the project, including runs started from
+the CLI. Opening a thread replays it — your prompts, the orchestrator's
+answers and tool calls, and each run with its nodes and agent output — and the
+next prompt continues the same conversation. Opening a run replays it, and
+follows it live if it is still going.
+
+### Same data for every agent in Zed
+
+`mini-ork mcp-context` gives every MCP-aware agent in the editor (Zed's own
+agent, Claude, Codex, …) read-only tools: `list_runs`, `run_detail`,
+`learnings`, `cost`, `lanes`. The orchestrator runs it with `--control`, which
+adds `list_recipes`, `start_run`, `run_status`, `wait_for_run`, `stop_run` and
+`certify`; the default server stays read-only.
 
 ---
 
@@ -74,14 +118,11 @@ Once Zed is wired:
 
 Tracked in [`docs/plans/2026-10-03-zed-integration.md`](plans/2026-10-03-zed-integration.md):
 
-- **Z3 — live agent output.** Per-node text, thinking and shell commands
-  stream into the thread as the agent works.
 - **Z4 — diffs in Review Changes.** When an implementer node ends, every
   changed file shows up under Zed's **Review Changes** panel.
 - **Z5 — slash commands.** `/runs`, `/status`, `/learnings`, `/cost`,
-  `/lanes`, `/stop`, `/resume`, `/recover`, `/certify`, `/serve`.
-- **Z6 — recipe picker + live plan.** Pick the recipe (code-fix, docs,
-  audit, …) from the thread; the run's DAG becomes a live checklist.
+  `/lanes`, `/stop`, `/certify`, `/serve`, `/help`.
+- **Z6 — live plan.** The run's DAG as a live checklist in the thread.
 
 ---
 
@@ -91,9 +132,10 @@ Tracked in [`docs/plans/2026-10-03-zed-integration.md`](plans/2026-10-03-zed-int
   both entries exist, whether the embedded command path exists and is
   executable, whether the `acp` extra is importable, and whether the
   current directory has a `.mini-ork/` (it must).
-- **Open the ACP logs.** Command Palette → **dev: open acp logs**. The
-  agent writes `agent-<node>.live.jsonl` per workflow node; this is where
-  to look when a run stalls.
+- **Open the ACP logs.** Command Palette → **dev: open acp logs**. Each run
+  writes `.mini-ork/runs/<run id>/agent-<node>.live.jsonl` per workflow node;
+  orchestrator threads are kept in `.mini-ork/acp-threads/`. This is where to
+  look when a run stalls.
 - **The project must contain `.mini-ork/`.** `mini-ork zed setup` writes
   settings, but each run needs its own home — run `mini-ork init` in the
   project root if you have not.
@@ -105,6 +147,14 @@ Tracked in [`docs/plans/2026-10-03-zed-integration.md`](plans/2026-10-03-zed-int
   ```bash
   pip install 'mini-ork[acp]'
   ```
+- **"Orchestrator turn failed (rc=…)".** The orchestrator runs the `claude`
+  CLI on the chosen lane. For Opus/Sonnet, check that `claude` is logged in
+  to your subscription (`claude` → `/login`); for other lanes, that their key
+  is in your secrets file. Switch the Model picker to test another lane.
+- **The orchestrator follows your own Claude Code setup.** It is a `claude`
+  process, so your `~/.claude` settings, hooks and `CLAUDE.md` apply to it.
+  Instructions there (for example, "always end with a status block") show
+  up in its answers.
 - **macOS GUI cannot find `mini-ork`.** The launcher path is always
   absolute in the settings file; if you moved the binary, run
   `mini-ork zed setup` again to rewire.
