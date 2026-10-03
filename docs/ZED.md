@@ -151,10 +151,11 @@ Tracked in [`docs/plans/2026-10-03-zed-integration.md`](plans/2026-10-03-zed-int
   CLI on the chosen lane. For Opus/Sonnet, check that `claude` is logged in
   to your subscription (`claude` → `/login`); for other lanes, that their key
   is in your secrets file. Switch the Model picker to test another lane.
-- **The orchestrator follows your own Claude Code setup.** It is a `claude`
-  process, so your `~/.claude` settings, hooks and `CLAUDE.md` apply to it.
-  Instructions there (for example, "always end with a status block") show
-  up in its answers.
+- **What Claude settings the orchestrator uses.** It is a `claude` process
+  run with `--setting-sources project,local`: the project's `.claude/`
+  settings and `CLAUDE.md` apply, your personal `~/.claude` ones (hooks,
+  global instructions) do not. Set `MO_ORCHESTRATOR_SETTING_SOURCES` to
+  change that (empty = everything, like plain `claude`).
 - **macOS GUI cannot find `mini-ork`.** The launcher path is always
   absolute in the settings file; if you moved the binary, run
   `mini-ork zed setup` again to rewire.

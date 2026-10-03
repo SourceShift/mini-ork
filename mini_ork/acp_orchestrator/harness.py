@@ -131,6 +131,16 @@ def build_command(
         "--append-system-prompt-file",
         str(prompt_path),
     ]
+    # The orchestrator maps whole messages; token-level partials are noise.
+    argv = [a for a in argv if a != "--include-partial-messages"]
+    # The project's Claude settings and CLAUDE.md apply; the user's personal
+    # ones (~/.claude: hooks, global instructions) do not — they are written
+    # for the user's own sessions and leak into the thread (e.g. a "always end
+    # with a status block" rule). MO_ORCHESTRATOR_SETTING_SOURCES overrides;
+    # set it empty to load everything, as plain `claude` does.
+    sources = os.environ.get("MO_ORCHESTRATOR_SETTING_SOURCES", "project,local").strip()
+    if sources:
+        argv += ["--setting-sources", sources]
     # Subscription lanes pin no model (they run the user's Claude Code default);
     # the orchestrator lane the user picked by name must actually run that model.
     if lane in _SUBSCRIPTION_MODEL_ALIASES and "--model" not in argv and not env.get("ANTHROPIC_MODEL"):

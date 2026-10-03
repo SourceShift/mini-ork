@@ -455,3 +455,31 @@ def test_subscription_lane_pins_its_model_by_name(tmp_path):
     cmd, _env = build_command("opus", resume=None, mcp_config_path=tmp_path / "m.json",
                               prompt_path=tmp_path / "p.md")
     assert cmd[cmd.index("--model") + 1] == "opus"
+
+
+def test_build_command_loads_project_settings_not_the_users(tmp_path, monkeypatch):
+    """~/.claude (personal hooks and CLAUDE.md) stays out of the orchestrator;
+    the project's settings apply. The env var overrides; empty loads all. A lane
+    that already streams (opus/sonnet since Z3) keeps one --output-format and
+    drops token-level partials."""
+    prompt, mcp = _prompt_and_mcp(tmp_path)
+    streaming = _fake_spec(
+        command=["claude", "--print", "--permission-mode", "bypassPermissions",
+                 "--output-format", "stream-json", "--verbose", "--include-partial-messages"],
+        env={},
+    )
+
+    def argv_for(sources=None):
+        monkeypatch.delenv("MO_ORCHESTRATOR_SETTING_SOURCES", raising=False)
+        if sources is not None:
+            monkeypatch.setenv("MO_ORCHESTRATOR_SETTING_SOURCES", sources)
+        with patch("mini_ork.acp_orchestrator.harness.resolve_provider", return_value=streaming):
+            return build_command("opus", resume=None, mcp_config_path=mcp, prompt_path=prompt)[0]
+
+    argv = argv_for()
+    assert argv[argv.index("--setting-sources") + 1] == "project,local"
+    assert "--include-partial-messages" not in argv
+    assert argv.count("--output-format") == 1
+    argv = argv_for("user,project,local")
+    assert argv[argv.index("--setting-sources") + 1] == "user,project,local"
+    assert "--setting-sources" not in argv_for("")
