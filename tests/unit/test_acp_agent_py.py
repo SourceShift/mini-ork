@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
 import subprocess
 import sys
 from pathlib import Path
@@ -37,6 +38,7 @@ from acp.schema import (  # noqa: E402
 )
 
 from mini_ork.acp.agent import MiniOrkAcpAgent, mint_run_id  # noqa: E402
+from mini_ork.stores import migrate as mig  # noqa: E402
 from mini_ork.web.control import _is_safe_token  # noqa: E402
 
 
@@ -353,3 +355,255 @@ def test_prompt_end_turn_with_live_launcher_pid():
         except subprocess.TimeoutExpired:
             live.kill()
             live.wait()
+
+
+# ── session/list + session/load (Zed Z1+Z2) ─────────────────────────────────
+
+
+def _migrate_home(tmp_path, name: str = "proj") -> tuple[Path, Path]:
+    """Build a project with ``.mini-ork/state.db`` migrated; return (proj, home)."""
+    proj = tmp_path / name
+    home = proj / ".mini-ork"
+    home.mkdir(parents=True)
+    rc, out, err = mig.init_db(db=str(home / "state.db"), root=str(REPO))
+    assert rc == 0, f"init_db failed:\n{out}\n{err}"
+    return proj, home
+
+
+def _seed_run(
+    home: Path,
+    run_id: str,
+    *,
+    status: str = "published",
+    created_at: int = 1000,
+    kickoff_text: str | None = None,
+) -> Path:
+    inbox = home / "runs-inbox"
+    inbox.mkdir(parents=True, exist_ok=True)
+    kickoff_path = inbox / f"{run_id}.md"
+    if kickoff_text is not None:
+        kickoff_path.write_text(kickoff_text, encoding="utf-8")
+    con = sqlite3.connect(str(home / "state.db"))
+    try:
+        con.execute(
+            """
+            INSERT INTO task_runs
+              (id, task_class, recipe, kickoff_path, status, cost_usd, created_at, updated_at)
+            VALUES (?, 'code_fix', 'code-fix', ?, ?, 0.5, ?, ?)
+            """,
+            (run_id, str(kickoff_path), status, created_at, created_at + 100),
+        )
+        con.commit()
+    finally:
+        con.close()
+    return kickoff_path
+
+
+def _seed_node_event(home: Path, run_id: str, node_id: str) -> None:
+    con = sqlite3.connect(str(home / "state.db"))
+    try:
+        con.execute(
+            """
+            INSERT INTO run_events (event_id, run_id, event_type, payload_json, created_at)
+            VALUES (?, ?, 'node_start', ?, 1500)
+            """,
+            (f"{run_id}-{node_id}", run_id, json.dumps({"node_id": node_id, "node_type": "planner"})),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
+def test_initialize_advertises_load_session_and_session_list():
+    agent = MiniOrkAcpAgent()
+    resp = asyncio.run(agent.initialize(protocol_version=1))
+    caps = resp.agent_capabilities
+    assert caps is not None
+    assert caps.load_session is True
+    assert caps.session_capabilities is not None
+    assert caps.session_capabilities.list is not None
+
+
+def test_list_sessions_resolves_project_home_and_maps_rows(tmp_path):
+    proj, home = _migrate_home(tmp_path)
+    _seed_run(home, "run-1", kickoff_text="# A past run\nbody")
+
+    agent = MiniOrkAcpAgent()
+    resp = asyncio.run(agent.list_sessions(cwd=str(proj)))
+
+    assert len(resp.sessions) == 1
+    info = resp.sessions[0]
+    assert info.session_id == "run-1"
+    assert info.cwd == str(proj.resolve())
+    assert info.title == "A past run"
+    assert info.updated_at is not None
+    assert info.field_meta == {"status": "published", "recipe": "code-fix", "cost_usd": 0.5}
+    assert resp.next_cursor is None
+
+
+def test_list_sessions_cursor_round_trips(tmp_path):
+    proj, home = _migrate_home(tmp_path)
+    con = sqlite3.connect(str(home / "state.db"))
+    try:
+        for i in range(51):
+            con.execute(
+                """
+                INSERT INTO task_runs
+                  (id, task_class, recipe, kickoff_path, status, cost_usd, created_at, updated_at)
+                VALUES (?, 'code_fix', 'code-fix', ?, 'published', 0.5, ?, ?)
+                """,
+                (f"run-{i}", f"run-{i}.md", 1000 + i, 2000 + i),
+            )
+        con.commit()
+    finally:
+        con.close()
+
+    agent = MiniOrkAcpAgent()
+    page1 = asyncio.run(agent.list_sessions(cwd=str(proj)))
+    assert len(page1.sessions) == 50
+    assert page1.next_cursor == "50"
+    page2 = asyncio.run(agent.list_sessions(cwd=str(proj), cursor="50"))
+    assert len(page2.sessions) == 1
+    assert page2.sessions[0].session_id == "run-0"
+    assert page2.next_cursor is None
+
+
+def test_list_sessions_invalid_cursor_treated_as_zero(tmp_path):
+    proj, home = _migrate_home(tmp_path)
+    _seed_run(home, "run-1")
+    agent = MiniOrkAcpAgent()
+    resp = asyncio.run(agent.list_sessions(cwd=str(proj), cursor="not-a-number"))
+    assert len(resp.sessions) == 1
+
+
+def test_list_sessions_missing_home_returns_empty(tmp_path):
+    agent = MiniOrkAcpAgent()
+    resp = asyncio.run(agent.list_sessions(cwd=str(tmp_path / "no-such-proj")))
+    assert resp.sessions == []
+
+
+def test_load_session_finished_run_emits_kickoff_events_and_terminal(tmp_path):
+    proj, home = _migrate_home(tmp_path)
+    _seed_run(home, "run-1", status="published", kickoff_text="# My kickoff\nbody")
+    _seed_node_event(home, "run-1", "n1")
+
+    captured, conn = _capturing_conn()
+    agent = MiniOrkAcpAgent()
+    agent.on_connect(conn)
+    resp = asyncio.run(agent.load_session(cwd=str(proj), session_id="run-1"))
+
+    assert resp is not None
+    kinds = [u.session_update for u in captured]
+    assert kinds[0] == "user_message_chunk"
+    assert captured[0].content.text.startswith("# My kickoff")
+    assert "tool_call" in kinds  # ToolCallStart for the node_start event
+    assert "usage_update" in kinds
+    assert "agent_message_chunk" in kinds  # terminal message
+    terminal = [u for u in captured if isinstance(u, AgentMessageChunk)][0]
+    assert "published" in terminal.content.text
+    assert "run-1" not in agent._followers  # finished → no follower
+
+
+def test_load_session_running_run_starts_follower_until_terminal(tmp_path):
+    proj, home = _migrate_home(tmp_path)
+    _seed_run(home, "run-1", status="executing", kickoff_text="# Running\n")
+    _seed_node_event(home, "run-1", "n1")
+
+    captured, conn = _capturing_conn()
+    states = iter(["executing", "published"])
+
+    def fake_reader(_run_id: str) -> dict:
+        status = next(states, "published")
+        events = (
+            [
+                {
+                    "event_type": "node_end",
+                    "payload_json": json.dumps({"node_id": "n1", "node_type": "planner"}),
+                }
+            ]
+            if status == "published"
+            else []
+        )
+        return {"status": status, "events": events, "llm_calls": []}
+
+    agent = MiniOrkAcpAgent(reader=fake_reader, poll_interval=0)
+    agent.on_connect(conn)
+
+    async def _drive() -> None:
+        resp = await agent.load_session(cwd=str(proj), session_id="run-1")
+        assert resp is not None
+        assert "run-1" in agent._followers
+        await agent._followers["run-1"]
+
+    asyncio.run(_drive())
+
+    kinds = [u.session_update for u in captured]
+    assert "tool_call_update" in kinds  # node_end projected by the follower
+    terminal = [u for u in captured if isinstance(u, AgentMessageChunk)]
+    assert any("published" in u.content.text for u in terminal)
+
+
+def test_load_session_rejects_unsafe_session_id(tmp_path):
+    proj, _ = _migrate_home(tmp_path)
+    agent = MiniOrkAcpAgent()
+    try:
+        asyncio.run(agent.load_session(cwd=str(proj), session_id="../etc"))
+    except Exception as exc:  # acp.RequestError is a plain Exception
+        assert getattr(exc, "code", None) == -32602
+    else:
+        raise AssertionError("load_session must reject an unsafe session id")
+
+
+def test_load_session_unknown_run_raises_invalid_params(tmp_path):
+    proj, _ = _migrate_home(tmp_path)
+    agent = MiniOrkAcpAgent()
+    try:
+        asyncio.run(agent.load_session(cwd=str(proj), session_id="run-nope"))
+    except Exception as exc:
+        assert getattr(exc, "code", None) == -32602
+        assert "no mini-ork run" in str(getattr(exc, "data", None))
+    else:
+        raise AssertionError("load_session must reject a run with no task_runs row")
+
+
+def test_prompt_on_loaded_session_never_launches(tmp_path):
+    proj, home = _migrate_home(tmp_path)
+    _seed_run(home, "run-1", status="published", kickoff_text="# Done\n")
+
+    def should_not_launch(_run_id: str, _text: str) -> dict:
+        raise AssertionError("launcher must not be called for a loaded session")
+
+    agent = MiniOrkAcpAgent(launcher=should_not_launch)
+    asyncio.run(agent.load_session(cwd=str(proj), session_id="run-1"))
+    assert agent.launch_count == 0
+
+    captured, conn = _capturing_conn()
+    agent.on_connect(conn)
+    resp = asyncio.run(agent.prompt("run-1", [_text_block("do it")]))
+    assert resp.stop_reason == "end_turn"
+    assert agent.launch_count == 0
+    chunks = [u for u in captured if isinstance(u, AgentMessageChunk)]
+    assert any("finished run" in u.content.text for u in chunks)
+
+
+def test_home_for_session_cwd_wins(tmp_path):
+    proj, home = _migrate_home(tmp_path)
+    agent = MiniOrkAcpAgent(home=str(tmp_path / "other-home"))
+    agent._sessions["run-1"] = str(proj)
+    assert agent._home_for("run-1") == home
+
+
+def test_home_for_falls_back_to_constructor_home(tmp_path, monkeypatch):
+    monkeypatch.delenv("MINI_ORK_HOME", raising=False)
+    other = tmp_path / "other-home"
+    agent = MiniOrkAcpAgent(home=str(other))
+    # A session cwd with no .mini-ork dir falls through to the constructor home.
+    agent._sessions["run-1"] = str(tmp_path / "no-home")
+    assert agent._home_for("run-1") == Path(other)
+
+
+def test_home_for_env_precedence(tmp_path, monkeypatch):
+    env_home = tmp_path / "env-home"
+    monkeypatch.setenv("MINI_ORK_HOME", str(env_home))
+    agent = MiniOrkAcpAgent()
+    assert agent._home_for(None) == Path(env_home)

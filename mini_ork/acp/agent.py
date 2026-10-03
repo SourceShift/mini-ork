@@ -26,20 +26,29 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
+from acp import RequestError
 from acp.schema import (
+    AgentCapabilities,
     AgentMessageChunk,
     Cost,
     Implementation,
     InitializeResponse,
+    ListSessionsResponse,
+    LoadSessionResponse,
     NewSessionResponse,
     PromptResponse,
+    SessionCapabilities,
+    SessionInfo,
+    SessionListCapabilities,
     StopReason,
     TextContentBlock,
     ToolCallProgress,
     ToolCallStart,
     UsageUpdate,
+    UserMessageChunk,
 )
 
+from mini_ork.acp import history
 from mini_ork.web.control import _is_safe_token
 
 PROTOCOL_VERSION = 1
@@ -143,6 +152,11 @@ class MiniOrkAcpAgent:
         # keys degrade to "unknown" rather than crash.
         self._launches: dict[str, dict[str, Any]] = {}
         self._cancelled: set[str] = set()
+        # session id → follow task for an attached (loaded) run that has not
+        # reached a terminal status yet (Z2 live follow).
+        self._followers: dict[str, asyncio.Task] = {}
+        # session ids opened via session/load (never launched by prompt).
+        self._loaded: set[str] = set()
         self._launch_count = 0
 
     @property
@@ -165,6 +179,10 @@ class MiniOrkAcpAgent:
         return InitializeResponse(
             protocol_version=PROTOCOL_VERSION,
             agent_info=Implementation(name="mini-ork-acp", version="0.9.0"),
+            agent_capabilities=AgentCapabilities(
+                load_session=True,
+                session_capabilities=SessionCapabilities(list=SessionListCapabilities()),
+            ),
         )
 
     async def new_session(
@@ -186,6 +204,77 @@ class MiniOrkAcpAgent:
         self._recipes[run_id] = recipe
         return NewSessionResponse(session_id=run_id, field_meta={"run_id": run_id})
 
+    async def list_sessions(
+        self, cwd: str | None = None, cursor: str | None = None, **kwargs: Any
+    ) -> ListSessionsResponse:
+        del kwargs
+        home = self._resolve_home()
+        if cwd:
+            candidate = Path(cwd) / ".mini-ork"
+            if candidate.is_dir():
+                home = candidate
+        if not home.exists():
+            return ListSessionsResponse(sessions=[])
+        try:
+            offset = int(cursor) if cursor else 0
+        except (TypeError, ValueError):
+            offset = 0
+        if offset < 0:
+            offset = 0
+        rows, next_offset = history.list_runs(home, limit=50, offset=offset)
+        sessions = [
+            SessionInfo(
+                session_id=row["run_id"],
+                cwd=str(home.resolve().parent),
+                title=row.get("title"),
+                updated_at=row.get("updated_at"),
+                field_meta={
+                    "status": row.get("status"),
+                    "recipe": row.get("recipe"),
+                    "cost_usd": row.get("cost_usd"),
+                },
+            )
+            for row in rows
+        ]
+        return ListSessionsResponse(
+            sessions=sessions,
+            next_cursor=str(next_offset) if next_offset is not None else None,
+        )
+
+    async def load_session(
+        self,
+        cwd: str,
+        session_id: str,
+        mcp_servers: list[Any] | None = None,
+        additional_directories: list[str] | None = None,
+        **kwargs: Any,
+    ) -> LoadSessionResponse | None:
+        del mcp_servers, additional_directories, kwargs
+        if not _is_safe_token(session_id):
+            raise RequestError.invalid_params({"message": f"unsafe session id: {session_id!r}"})
+        # Bind the session to its project cwd (the session id IS the run id);
+        # reset emitted transitions so replay starts clean.
+        self._sessions[session_id] = cwd
+        self._emitted.pop(session_id, None)
+        home = self._home_for(session_id)
+        snapshot = history.read_snapshot(home, session_id)
+        if snapshot.get("status") is None:
+            raise RequestError.invalid_params({"message": f"no mini-ork run {session_id}"})
+        self._loaded.add(session_id)
+        kickoff = history.kickoff_text(home, session_id)
+        if kickoff:
+            await self._emit(
+                session_id,
+                UserMessageChunk(
+                    session_update="user_message_chunk",
+                    content=TextContentBlock(type="text", text=kickoff),
+                ),
+            )
+        await self._project_snapshot(session_id, snapshot)
+        if snapshot.get("status") not in TERMINAL_STATUSES:
+            self._followers[session_id] = asyncio.create_task(self._follow(session_id))
+        return LoadSessionResponse()
+
     async def prompt(
         self,
         session_id: str,
@@ -195,6 +284,32 @@ class MiniOrkAcpAgent:
         del kwargs
         if not _is_safe_token(session_id):
             return PromptResponse(stop_reason="refusal")
+        if session_id in self._loaded:
+            # Loaded (attached) sessions never launch: the run already exists.
+            # Stream status context and end the turn immediately.
+            snapshot = (self._reader or self._read_snapshot)(session_id) or {
+                "status": None,
+                "events": [],
+                "llm_calls": [],
+            }
+            status = snapshot.get("status")
+            if status in TERMINAL_STATUSES:
+                await self._emit(
+                    session_id,
+                    self._build_refusal_message(
+                        f"This thread shows a finished run ({status}). "
+                        "Start a new thread to run again."
+                    ),
+                )
+            else:
+                await self._emit(
+                    session_id,
+                    self._build_refusal_message(
+                        f"Attached to running mini-ork run {session_id}; "
+                        "updates stream here. Start a new thread to launch another run."
+                    ),
+                )
+            return PromptResponse(stop_reason="end_turn")
         self._launch_count += 1
         launcher = self._launcher or self._launch
         result = launcher(session_id, _extract_prompt_text(prompt))
@@ -211,6 +326,22 @@ class MiniOrkAcpAgent:
     async def cancel(self, session_id: str, **kwargs: Any) -> None:
         del kwargs
         self._cancelled.add(session_id)
+        follower = self._followers.get(session_id)
+        if follower is not None and not follower.done():
+            follower.cancel()
+        if session_id in self._loaded:
+            # Attached session: soft-stop only when the run is still running;
+            # a finished run is a no-op (there is nothing to cancel).
+            snapshot = (self._reader or self._read_snapshot)(session_id) or {
+                "status": None,
+                "events": [],
+                "llm_calls": [],
+            }
+            status = snapshot.get("status")
+            if status is not None and status not in TERMINAL_STATUSES:
+                stopper = self._stopper or self._stop
+                stopper(session_id)
+            return
         stopper = self._stopper or self._stop
         stopper(session_id)  # soft stop first (dispatcher bails before next node)
         if self._cancel_grace and self._cancel_grace > 0:
@@ -390,6 +521,23 @@ class MiniOrkAcpAgent:
                 return "end_turn"
             await asyncio.sleep(self._poll_interval)
 
+    async def _follow(self, session_id: str) -> None:
+        """Poll an attached (loaded) run and project its read-model state.
+
+        Mirrors ``_await_terminal`` minus the launcher probe and start-timeout
+        refusal: there is no launch to wait for, so a missing row just keeps
+        polling until the run reaches a terminal status or the session is
+        cancelled. The loop ends without emitting a terminal message on
+        cancel — ``_project_snapshot`` already emitted everything new.
+        """
+        reader = self._reader or self._read_snapshot
+        while session_id not in self._cancelled:
+            snapshot = reader(session_id) or {"status": None, "events": [], "llm_calls": []}
+            await self._project_snapshot(session_id, snapshot)
+            if snapshot.get("status") in TERMINAL_STATUSES:
+                break
+            await asyncio.sleep(self._poll_interval)
+
     # ── launch/read/stop seams (deferred imports keep the module light) ──────
 
     def _resolve_home(self) -> Path:
@@ -399,6 +547,21 @@ class MiniOrkAcpAgent:
             or os.path.join(os.getcwd(), ".mini-ork")
         )
 
+    def _home_for(self, session_id: str | None) -> Path:
+        """Resolve the ``.mini-ork`` home for a session id.
+
+        Step 1 — the session's bound cwd wins when ``<cwd>/.mini-ork`` is a
+        directory (a CLI-started run in a different project resolves to the
+        right home). Steps 2–4 are the no-session fallback: constructor home →
+        ``MINI_ORK_HOME`` → ``<process cwd>/.mini-ork`` (``_resolve_home``).
+        """
+        cwd = self._sessions.get(session_id) if session_id is not None else None
+        if cwd:
+            candidate = Path(cwd) / ".mini-ork"
+            if candidate.is_dir():
+                return candidate
+        return self._resolve_home()
+
     def _launch(self, run_id: str, kickoff_text: str) -> dict[str, Any]:
         """Detached launch via the existing seam; the run id is the session id."""
         from mini_ork.web.control import launch_run
@@ -407,7 +570,7 @@ class MiniOrkAcpAgent:
         recipe = self._recipes.get(run_id) or self._recipe
         extra_env = {"MO_TARGET_CWD": cwd} if cwd else None
         return launch_run(
-            self._resolve_home(),
+            self._home_for(run_id),
             recipe,
             kickoff_text,
             run_id=run_id,
@@ -416,42 +579,18 @@ class MiniOrkAcpAgent:
 
     def _read_snapshot(self, run_id: str) -> dict[str, Any]:
         """Read task_run status + node events + llm_calls from the read model."""
-        from mini_ork.web.deps import db_for
-        from mini_ork.web.repositories import RunDetailRepository
-
-        repo = RunDetailRepository(db_for(self._resolve_home()))
-        tr = repo.fetch_task_run_row(run_id)
-        if not tr:
-            return {"status": None, "events": [], "llm_calls": []}
-        events = repo.fetch_node_lifecycle_events(run_id)
-        llm_calls: list[dict[str, Any]] = []
-        window = repo.fetch_trace_window(run_id)
-        if window and window.get("trace_id"):
-            llm_calls = repo.fetch_llm_calls_by_trace_id(window["trace_id"])
-        if window and window.get("created_at"):
-            upper = window.get("ended_at") or int(time.time())
-            llm_calls.extend(
-                repo.fetch_llm_calls_in_window(int(window["created_at"]), int(upper))
-            )
-        # The trace_id and time-window bridges can overlap; dedupe by row id.
-        seen: set[Any] = set()
-        deduped: list[dict[str, Any]] = []
-        for row in llm_calls:
-            rid = row.get("id")
-            if rid in seen:
-                continue
-            seen.add(rid)
-            deduped.append(row)
-        return {"status": tr.get("status"), "events": events, "llm_calls": deduped}
+        return history.read_snapshot(self._home_for(run_id), run_id)
 
     def _stop(self, run_id: str) -> dict[str, Any]:
         from mini_ork.web.control import stop_run
         from mini_ork.web.deps import db_for
 
-        return stop_run(self._resolve_home(), db_for(self._resolve_home()), run_id)
+        home = self._home_for(run_id)
+        return stop_run(home, db_for(home), run_id)
 
     def _kill(self, run_id: str) -> dict[str, Any]:
         from mini_ork.web.control import kill_run
         from mini_ork.web.deps import db_for
 
-        return kill_run(self._resolve_home(), db_for(self._resolve_home()), run_id)
+        home = self._home_for(run_id)
+        return kill_run(home, db_for(home), run_id)
