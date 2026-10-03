@@ -512,17 +512,16 @@ RC_BLOCKED = 75  # EX_TEMPFAIL: the run never started; retry once the cause clea
 
 
 def _spent_last_24h(db: str) -> float | None:
-    """Display-only mirror of the spend cost_circuit_open compares (task_runs,
-    rolling 24h). The DECISION always comes from cost_circuit_open itself."""
+    """Display-only mirror of the spend cost_circuit_open compares.
+
+    Reads the same ``cost_ledger.spent_last_24h`` ledger the circuit uses (so
+    the printed total matches the gate decision), but returns ``None`` on
+    exception rather than ``0.0`` so the budget-preflight can distinguish
+    "no spend recorded" from "could not read the ledger". The DECISION
+    always comes from cost_circuit_open itself."""
     try:
-        import sqlite3
-        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
-        try:
-            row = con.execute("SELECT COALESCE(SUM(cost_usd),0) FROM task_runs "
-                              "WHERE created_at >= ?", (int(time.time()) - 86400,)).fetchone()
-        finally:
-            con.close()
-        return float(row[0] or 0)
+        from mini_ork import cost_ledger
+        return cost_ledger.spent_last_24h(db)
     except Exception:
         return None
 

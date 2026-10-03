@@ -103,14 +103,18 @@ def read_snapshot(home: Path, run_id: str) -> dict[str, Any]:
         return {"status": None, "events": [], "llm_calls": []}
     events = repo.fetch_node_lifecycle_events(run_id)
     llm_calls: list[dict[str, Any]] = []
-    window = repo.fetch_trace_window(run_id)
-    if window and window.get("trace_id"):
-        llm_calls = repo.fetch_llm_calls_by_trace_id(window["trace_id"])
-    if window and window.get("created_at"):
-        upper = window.get("ended_at") or int(time.time())
-        llm_calls.extend(
-            repo.fetch_llm_calls_in_window(int(window["created_at"]), int(upper))
-        )
+    # Prefer llm_calls stamped with the run's id; trace-id and time-window
+    # bridges pick up every concurrent run's calls in the same window.
+    llm_calls = repo.fetch_llm_calls_by_run_id(run_id)
+    if not llm_calls:
+        window = repo.fetch_trace_window(run_id)
+        if window and window.get("trace_id"):
+            llm_calls = repo.fetch_llm_calls_by_trace_id(window["trace_id"])
+        if window and window.get("created_at"):
+            upper = window.get("ended_at") or int(time.time())
+            llm_calls.extend(
+                repo.fetch_llm_calls_in_window(int(window["created_at"]), int(upper))
+            )
     # The trace_id and time-window bridges can overlap; dedupe by row id.
     seen: set[Any] = set()
     deduped: list[dict[str, Any]] = []

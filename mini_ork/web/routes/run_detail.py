@@ -605,13 +605,21 @@ def get_llm_calls(
         row["bridge"] = bridge
         out.append(row)
 
-    # 1. trace_id match (strict)
+    # 1. run_id match (strict) — llm_calls rows stamped with the run's id are
+    # the run's calls. Falls back to the legacy bridges when no rows are
+    # stamped (state.db files predating the run_id migration).
+    for r in repo.fetch_llm_calls_by_run_id(task_run_id):
+        _add(r, "run_id")
+    if out:
+        return out
+
+    # 2. trace_id match (legacy fallback)
     trace_id = tr.get("trace_id")
     if trace_id:
         for r in repo.fetch_llm_calls_by_trace_id(trace_id):
             _add(r, "trace_id")
 
-    # 2. time-window fallback
+    # 3. time-window fallback
     if tr.get("created_at"):
         upper = tr.get("ended_at") or int(__import__("time").time())
         for r in repo.fetch_llm_calls_in_window(int(tr["created_at"]), int(upper)):

@@ -22,16 +22,11 @@ from mini_ork.orchestration import epic_graph
 
 
 def _today_cost(db):
-    # bash: `sqlite3 … 2>/dev/null || echo 0` — tolerate a missing task_runs table /
-    # empty or absent db (a fresh .mini-ork), returning 0 instead of crashing the loop.
-    try:
-        c = sqlite3.connect(db)
-        r = c.execute("SELECT COALESCE(SUM(cost_usd),0) FROM task_runs "
-                      "WHERE created_at >= strftime('%s','now','-24 hours')").fetchone()
-        c.close()
-        return float(r[0] or 0)
-    except sqlite3.Error:
-        return 0.0
+    # Tolerate a missing task_runs table / empty or absent db (a fresh
+    # .mini-ork) — the ledger reader returns 0.0 in those cases instead of
+    # crashing the loop.
+    from mini_ork import cost_ledger
+    return cost_ledger.spent_last_24h(db)
 
 
 def _adaptive_lane_gain(con, base=0.3):

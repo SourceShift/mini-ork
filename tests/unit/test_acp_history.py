@@ -238,3 +238,49 @@ def test_read_snapshot_missing_run_returns_none_status(home):
 def test_read_snapshot_missing_db_returns_none_status(tmp_path):
     snap = history.read_snapshot(tmp_path / "no-such-home", "run-1")
     assert snap == {"status": None, "events": [], "llm_calls": []}
+
+
+def test_read_snapshot_isolates_run_id_from_concurrent_runs(home):
+    """A snapshot for run A must not include concurrent run B's llm_calls,
+    even when both share a time window. The run-id bridge short-circuits the
+    trace-id + time-window fallback when A's rows carry run_id stamps."""
+    _seed_task_run(home, "run-a", status="published", trace_id="trace-a")
+    _seed_task_run(home, "run-b", status="published", trace_id="trace-b")
+
+    con = sqlite3.connect(str(home / "state.db"))
+    try:
+        # run-a has its own rows, stamped with its run_id.
+        con.execute(
+            "INSERT INTO llm_calls (provider, model_id, tier, feature_name,"
+            " cost_usd, status, traceparent, run_id)"
+            " VALUES ('p', 'm', 't', 'f', 1.0, 'success', '00-a-0', 'run-a')"
+        )
+        # run-b's rows are concurrent (same window) — must NOT appear in A.
+        con.execute(
+            "INSERT INTO llm_calls (provider, model_id, tier, feature_name,"
+            " cost_usd, status, traceparent, run_id)"
+            " VALUES ('p', 'm', 't', 'f', 9.0, 'success', '00-b-0', 'run-b')"
+        )
+        con.commit()
+    finally:
+        con.close()
+
+    snap_a = history.read_snapshot(home, "run-a")
+    snap_b = history.read_snapshot(home, "run-b")
+
+    # The bridge returns llm_calls rows; cost_usd is what the SELECT projects.
+    # Sum is what proves isolation: A sees 1.0 (its own), B sees 9.0 (its own),
+    # not the time-window sum (10.0) the legacy bridge would have produced.
+    assert sum(c["cost_usd"] for c in snap_a["llm_calls"]) == 1.0
+    assert sum(c["cost_usd"] for c in snap_b["llm_calls"]) == 9.0
+
+
+def test_read_snapshot_legacy_bridge_when_no_run_id_rows(home):
+    """When no llm_calls rows are stamped with run_id, the legacy trace-id
+    + time-window bridge still applies (so old state.db files keep working)."""
+    _seed_task_run(home, "run-a", status="published", trace_id="trace-legacy")
+    _seed_llm_call(home, "00-trace-legacy-0000000000000000-01", cost_usd=2.5)
+
+    snap = history.read_snapshot(home, "run-a")
+    assert len(snap["llm_calls"]) == 1
+    assert snap["llm_calls"][0]["cost_usd"] == 2.5

@@ -238,16 +238,8 @@ def resolve_lane_family(lane: str, root: str = "", home: str = "") -> str:
 def cost_circuit_open(db, budget) -> bool:
     if not (db and os.path.isfile(db)):
         return False
-    try:
-        con = sqlite3.connect(db)
-        con.execute("PRAGMA busy_timeout=5000")
-        cutoff = int(time.time()) - 86400
-        row = con.execute("SELECT COALESCE(SUM(cost_usd),0) FROM task_runs WHERE created_at >= ?",
-                          (cutoff,)).fetchone()
-        con.close()
-        return float(row[0] or 0) >= float(budget)
-    except sqlite3.OperationalError:
-        return False
+    from mini_ork import cost_ledger
+    return cost_ledger.spent_last_24h(db) >= float(budget)
 
 
 def check_lane_fuse(db, lane, category) -> bool:
@@ -431,14 +423,8 @@ def llm_dispatch(argv=None, *, root=None, dispatch_fn=None) -> int:
 
     # cost circuit breaker
     if cost_circuit_open(db, os.environ.get("MO_DAILY_BUDGET_USD", "50")):
-        spent = 0.0
-        try:
-            con = sqlite3.connect(db)
-            spent = con.execute("SELECT COALESCE(SUM(cost_usd),0) FROM task_runs "
-                                "WHERE created_at >= ?", (int(time.time()) - 86400,)).fetchone()[0]
-            con.close()
-        except Exception:
-            pass
+        from mini_ork import cost_ledger
+        spent = cost_ledger.spent_last_24h(db)
         sys.stderr.write(f"[cost_circuit_open] spent_today=${spent} "
                          f"budget=${os.environ.get('MO_DAILY_BUDGET_USD', '50')} — halting dispatch\n")
         return 42

@@ -11,6 +11,7 @@ structures, never a 500, exactly as the inline probes did.
 """
 from __future__ import annotations
 
+import sqlite3
 from typing import Any, Sequence
 
 from .db import StateDB
@@ -361,6 +362,28 @@ class RunDetailRepository:
             """,
             (f"%{trace_id}%",),
         )
+
+    def fetch_llm_calls_by_run_id(self, run_id: str) -> list[dict[str, Any]]:
+        """Strict run-id bridge for the llm-calls endpoint.
+
+        llm_calls rows stamped with the run's id are the run's calls; trace_id
+        and time-window bridges can pick up sibling runs in the same window.
+        Returns ``[]`` when the table or the ``run_id`` column is missing so
+        the legacy bridge still applies for state.db files predating the
+        migration that added ``run_id``."""
+        if not self._db.has_table("llm_calls"):
+            return []
+        try:
+            return self._db.rows(
+                self._llm_calls_select()
+                + """
+                WHERE run_id = ?
+                ORDER BY ts ASC
+                """,
+                (run_id,),
+            )
+        except sqlite3.OperationalError:
+            return []
 
     def fetch_llm_calls_in_window(self, start: int, upper: int) -> list[dict[str, Any]]:
         """Best-effort time-window bridge for the llm-calls endpoint."""

@@ -216,31 +216,12 @@ def pick_ready(db: str | None = None) -> list[str]:
 def today_cost_usd(db: str | None = None) -> float:
     """Rolling-24h spend, in dollars, as the daily budget guard sees it.
 
-    Sums ``llm_calls`` — the per-dispatch ledger every provider call writes,
-    node or stage — rather than ``task_runs.cost_usd``. task_runs only carries
-    what a node handler explicitly charged, so stage spend (reflect /
-    gradient-extract, the jury, the lens panel) and any child that never
-    reached a charge call were invisible to the meter: it read $0.00 against
-    $3.13 of real dispatch spend, and a budget circuit that cannot see spend
-    cannot stop it.
+    Delegates to ``mini_ork.cost_ledger.spent_last_24h`` — the single shared
+    reader of the per-dispatch ledger. See its docstring for the fallback
+    ladder (llm_calls → task_runs → 0.0) and the missing/None db semantics."""
+    from mini_ork import cost_ledger  # local import: cost_ledger is leaf, scheduler is heavy
 
-    Falls back to the task_runs sum when llm_calls is missing, so a DB behind
-    the migrator degrades to the old estimate rather than to a blind zero."""
-    con = _conn(db)
-    try:
-        try:
-            row = con.execute(
-                "SELECT COALESCE(SUM(cost_usd), 0) FROM llm_calls "
-                "WHERE ts >= strftime('%Y-%m-%dT%H:%M:%S','now','-24 hours')"
-            ).fetchone()
-            return float(row[0] or 0)
-        except sqlite3.OperationalError:
-            row = con.execute(
-                "SELECT COALESCE(SUM(cost_usd), 0) FROM task_runs "
-                "WHERE created_at >= strftime('%s','now','-24 hours')").fetchone()
-            return float(row[0] or 0)
-    finally:
-        con.close()
+    return cost_ledger.spent_last_24h(_db_path(db))
 
 
 def cost_pause_active(home: str | None = None) -> bool:

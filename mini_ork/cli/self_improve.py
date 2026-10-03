@@ -278,15 +278,8 @@ def pre_iter_cost_check(db, budget) -> bool:
     """True → halt (over budget). Mirrors the SQL SUM vs MO_DAILY_BUDGET_USD."""
     if os.environ.get("MINI_ORK_PRE_ITER_COST_CHECK", "1") != "1" or not os.path.isfile(db):
         return False
-    con = sqlite3.connect(db)
-    try:
-        spent = con.execute("SELECT COALESCE(SUM(cost_usd),0) FROM task_runs "
-                            "WHERE created_at >= strftime('%s','now','-1 day')").fetchone()[0]
-    except Exception:
-        spent = 0
-    finally:
-        con.close()
-    return float(spent or 0) >= float(budget)
+    from mini_ork import cost_ledger
+    return cost_ledger.spent_last_24h(db) >= float(budget)
 
 
 def _parse_args(argv):
