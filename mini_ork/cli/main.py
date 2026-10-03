@@ -67,6 +67,7 @@ _NATIVE_MODULE_SUBS = {
     "usage-report": "mini_ork.observability.usage_report",
     "watchdog": "mini_ork.orchestration.watchdog",
     "acp": "mini_ork.cli.acp_cmd",
+    "mcp-context": "mini_ork.cli.mcp_context_cmd",
     "calibrate": "mini_ork.cli.calibrate",
     "collapse-check": "mini_ork.cli.collapse",
     "collapse-precursor": "mini_ork.cli.collapse_precursor",
@@ -123,6 +124,8 @@ Lifecycle:
 
 Coordination:
   concord <sub>                  Cross-agent coordination client (run/ps/stop/send/inbox/ack)
+  mcp-context                    Read-only stdio MCP server exposing runs, learnings,
+                                   cost, and lanes (for agents in Zed etc.)
 
 Provider credentials:
   providers status <lane>                    Safely show configured or missing credentials

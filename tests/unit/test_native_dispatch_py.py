@@ -33,7 +33,7 @@ def test_all_former_exec_subs_registered_natively():
         "memory-lifecycle",
         "harness-contrast", "harness-edit", "harness-audit", "hack-probe",
         "oversight", "metric-anchor", "active-eval", "certify", "node-agent",
-        "nodes",
+        "nodes", "mcp-context",
     }
     assert expected == set(_NATIVE_MODULE_SUBS)
     for sub in expected:
