@@ -86,6 +86,10 @@ def _build_parser() -> argparse.ArgumentParser:
     claims = sub.add_parser("claims", help="list live claims on hot shared files")
     claims.add_argument("--json", action="store_true", help="emit raw JSON")
 
+    viol = sub.add_parser("violations", help="list recorded --owns scope violations")
+    viol.add_argument("--since", type=int, default=0, help="only rows after this seq")
+    viol.add_argument("--json", action="store_true", help="emit raw JSON")
+
     sub.add_parser("help", help="show this help")
     return parser
 
@@ -409,6 +413,25 @@ def _cmd_claims(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_violations(args: argparse.Namespace) -> int:
+    """Recorded edits outside a worktree's --owns claim (Concord P2d)."""
+    rc, data = _call(cn_client.coord_owns_violations, args.since)
+    if rc:
+        return rc
+    if args.json:
+        print(json.dumps(data))
+        return 0
+    rows = (data or {}).get("violations") or []
+    if not rows:
+        print("(no --owns violations recorded)")
+        return 0
+    print("SEQ\tWORKTREE\tPATH\tCALLER\tTS")
+    for v in rows:
+        print(f"{v.get('seq', '')}\t{v.get('worktree_principal', '')}\t{v.get('path', '')}\t"
+              f"{v.get('caller_principal') or ''}\t{v.get('ts', '')}")
+    return 0
+
+
 def _cmd_ack(args: argparse.Namespace) -> int:
     pid = args.principal
     if _reject_id(pid):
@@ -465,6 +488,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _cmd_ack(args)
     if args.action == "claims":
         return _cmd_claims(args)
+    if args.action == "violations":
+        return _cmd_violations(args)
     if args.action == "admit":
         return _cmd_admit(args)
     if args.action == "help":

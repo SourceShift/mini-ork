@@ -547,6 +547,11 @@ def coord_hot_claims() -> dict:
     return _coord_request("GET", "/api/v1/coord/hot-claims")
 
 
+def coord_owns_violations(since: int = 0) -> dict:
+    """GET /api/v1/coord/owns-violations?since=<seq> — recorded --owns scope violations."""
+    return _coord_request("GET", f"/api/v1/coord/owns-violations?since={int(since)}")
+
+
 def coord_ack(principal_id: str, msg_id: str, by: str) -> dict:
     """POST /api/v1/coord/principals/{id}/messages/{msg_id}/ack — acknowledge."""
     return _coord_request(

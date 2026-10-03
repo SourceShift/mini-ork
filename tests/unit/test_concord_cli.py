@@ -169,6 +169,10 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             self._inbox(parts[4], query.get("unacked", ["true"])[0] == "true")
         elif parts[2:4] == ["coord", "hot-claims"]:
             self._json(200, {"claims": getattr(self.server, "claims", [])})
+        elif parts[2:4] == ["coord", "owns-violations"]:
+            since = int(query.get("since", ["0"])[0])
+            rows = [v for v in getattr(self.server, "violations", []) if v["seq"] > since]
+            self._json(200, {"violations": rows, "next_seq": max([since] + [v["seq"] for v in rows])})
         else:
             self._json(404, {"error": "not found"})
 
@@ -396,3 +400,27 @@ def test_claims_lists_live_hot_claims_and_exits_3_when_down(monkeypatch, capsys)
     monkeypatch.setenv("CN_BASE_URL", "http://127.0.0.1:9")
     monkeypatch.setenv("CN_COORD_TIMEOUT_SEC", "1")
     assert concord.main(["claims"]) == 3
+
+
+def test_violations_lists_rows_after_since(monkeypatch, capsys):
+    srv, base = _server()
+    srv.violations = [
+        {"seq": 1, "worktree_principal": "agent:wt-a", "path": "lib/x.py",
+         "caller_principal": "session:p94@mini-ork", "ts": "2026-10-03T09:00:00Z"},
+        {"seq": 2, "worktree_principal": "agent:wt-a", "path": "lib/y.py",
+         "caller_principal": None, "ts": "2026-10-03T09:01:00Z"},
+    ]
+    monkeypatch.setenv("CN_BASE_URL", base)
+    monkeypatch.setenv("CN_COORD_TIMEOUT_SEC", "5")
+    try:
+        assert concord.main(["violations"]) == 0
+        out = capsys.readouterr().out
+        assert "agent:wt-a\tlib/x.py\tsession:p94@mini-ork" in out and "lib/y.py" in out
+        assert concord.main(["violations", "--since", "1"]) == 0
+        out = capsys.readouterr().out
+        assert "lib/x.py" not in out and "lib/y.py" in out
+        srv.violations = []
+        assert concord.main(["violations"]) == 0
+        assert "(no --owns violations recorded)" in capsys.readouterr().out
+    finally:
+        srv.shutdown()
