@@ -5,7 +5,9 @@ protocol channel — every diagnostic this module emits goes to ``stderr``;
 importing the module prints nothing.
 
 Default mode exposes the read-only observability tools and opens the
-``StateDB`` with ``mode=ro`` + ``PRAGMA query_only``:
+``StateDB`` via :func:`mini_ork.sqlite_read.connect_readonly` (which
+prefers ``mode=ro`` + ``PRAGMA query_only`` and survives an idle WAL
+database):
 
 * :func:`list_runs` — newest-first ``task_runs`` rows with a derived
   ``title`` (first non-empty ``#``-prefixed kickoff line, ≤80 chars).

@@ -29,6 +29,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator, Sequence
 
+from mini_ork.sqlite_read import connect_readonly
+
 
 class StateDB:
     def __init__(self, db_path: Path):
@@ -47,13 +49,13 @@ class StateDB:
         con = getattr(self._local, "conn", None)
         if con is not None:
             return con
-        uri = f"file:{self.db_path}?mode=ro"
-        con = sqlite3.connect(
-            uri,
-            uri=True,
-            isolation_level=None,
-            timeout=5.0,
-        )
+        # ``connect_readonly`` survives an idle WAL db (no sidecars); the
+        # prior ``mode=ro`` URI raised OperationalError on every query in
+        # that state (web UI, ACP history, MCP tools). We keep
+        # ``isolation_level=None`` (autocommit), row_factory, and the
+        # pragmas — they're orthogonal to how the connection was opened.
+        con = connect_readonly(self.db_path, timeout=5.0)
+        con.isolation_level = None
         con.row_factory = sqlite3.Row
         con.execute("PRAGMA query_only = ON")
         con.execute("PRAGMA busy_timeout = 2000")

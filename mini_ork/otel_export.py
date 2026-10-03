@@ -28,6 +28,8 @@ import sys
 import urllib.request
 from datetime import datetime, timezone
 
+from mini_ork.sqlite_read import connect_readonly
+
 DEFAULT_ENDPOINT = "https://cloud.langfuse.com/api/public/otel/v1/traces"
 
 OK, ERROR = 1, 2  # OTLP status codes
@@ -81,7 +83,7 @@ def _llm_call_spans(db_path, task_run_id, trace_id, agent_by_node, root_id):
     """llm_call spans for a run, parented onto agent spans by node name."""
     spans = []
     try:
-        con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        con = connect_readonly(db_path)
         con.row_factory = sqlite3.Row
         calls = con.execute(
             "SELECT * FROM llm_calls WHERE run_id = ? ORDER BY id", (task_run_id,)
@@ -211,7 +213,7 @@ def build_payload_from_jsonl(jsonl_path: str, db_path: str | None = None) -> dic
 
 def build_payload(db_path: str, task_run_id: str) -> dict:
     """Build an OTLP/JSON ExportTraceServiceRequest for one task_run."""
-    con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    con = connect_readonly(db_path)
     con.row_factory = sqlite3.Row
     try:
         run = con.execute(

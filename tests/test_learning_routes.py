@@ -181,7 +181,9 @@ def test_no_populated_table_is_dark(tmp_path: Path) -> None:
     if not real_db.exists():
         pytest.skip("no local state.db — nothing to audit")
 
-    con = sqlite3.connect(f"file:{real_db}?mode=ro", uri=True)
+    from mini_ork.sqlite_read import connect_readonly
+
+    con = connect_readonly(real_db)  # mode=ro alone fails on an idle WAL db
     tables = [
         r[0]
         for r in con.execute(

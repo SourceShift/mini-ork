@@ -40,6 +40,12 @@ RC_BLOCKED = 75
 sys.path.insert(0, str(REPO / "scripts"))
 import mine_heldout_tasks as mht  # noqa: E402
 
+# Make the ``mini_ork`` package importable for ``connect_readonly``. The
+# script is normally run as ``python scripts/run_heldout.py`` from the
+# repo root, which puts ``scripts/`` on sys.path — not the repo root.
+sys.path.insert(0, str(REPO))
+from mini_ork.sqlite_read import connect_readonly  # noqa: E402
+
 
 # ── git helper ───────────────────────────────────────────────────────────────
 
@@ -104,11 +110,14 @@ def _run_cost_usd(run_id: str) -> float:
 
     ``mini_ork_result=`` carries no cost field, so the ledger is the only
     place the solve's spend is recorded. 0.0 when the db is unreadable.
+    ``connect_readonly`` survives an idle WAL db (no -shm/-wal sidecars);
+    the prior ``mode=ro`` URI raised ``OperationalError`` there and was
+    caught as "free inner run" by this function.
     """
     db = os.environ.get("MINI_ORK_DB") or os.path.join(
         os.environ.get("MINI_ORK_HOME") or str(REPO / ".mini-ork"), "state.db")
     try:
-        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        con = connect_readonly(db)
         try:
             row = con.execute("SELECT COALESCE(SUM(cost_usd), 0) FROM execution_traces "
                               "WHERE run_id = ?", (run_id,)).fetchone()

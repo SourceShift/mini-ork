@@ -35,6 +35,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional
 
+from mini_ork.sqlite_read import connect_readonly
 from mini_ork.stores.migrate import init_db
 
 
@@ -119,11 +120,14 @@ def _schema_has_migration(filename: str, db_path: Path) -> bool:
     Native sqlite query (read-only URI, like bash's mode=ro). Any error —
     missing schema_migrations table, unreadable DB — maps to False, matching
     bash's `2>/dev/null | grep -qx 1` swallowing the sqlite3 error output.
+    ``connect_readonly`` survives an idle WAL db (no -shm/-wal sidecars);
+    the prior ``mode=ro`` URI raised ``OperationalError`` in that state,
+    so the update listing showed applied migrations as pending.
     """
     if not db_path.is_file():
         return False
     try:
-        con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        con = connect_readonly(db_path)
         try:
             row = con.execute(
                 "SELECT COUNT(*) FROM schema_migrations WHERE filename=?",

@@ -34,6 +34,8 @@ import sqlite3
 import subprocess
 import sys
 
+from mini_ork.sqlite_read import connect_readonly
+
 __all__ = ["parse_scope", "normalize", "overlaps", "admit"]
 
 #: Default value for ``MINI_ORK_WORKTREES_DIR`` (worktrees are one dir per slug).
@@ -238,9 +240,14 @@ def admit(db: str, epic_id: str, kickoff_path: str,
 
     con: sqlite3.Connection | None = None
     try:
-        # Read-only URI: a plain connect() on a missing path would CREATE an
-        # empty state DB there — admission must never write anything.
-        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        # Read-only: ``connect_readonly`` first tries ``mode=ro`` and falls
+        # back to a sidecar-creating plain connection with
+        # ``PRAGMA query_only = ON``. Either way admission cannot write
+        # anything — the plain ``sqlite3.connect`` on a missing path would
+        # CREATE an empty state DB there, so ``connect_readonly`` raises
+        # ``FileNotFoundError`` instead (also caught by the
+        # ``OSError`` arm below).
+        con = connect_readonly(db)
         con.row_factory = sqlite3.Row
         rows = con.execute(
             "SELECT id, kickoff_path FROM epics "
