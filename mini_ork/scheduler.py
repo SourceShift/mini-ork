@@ -483,6 +483,26 @@ def build_carry_over_kickoff(epic_id: str, base_kickoff: str, attempt: int,
     return path
 
 
+def _retry_target_env(base_kickoff: str, kickoff: str) -> dict[str, str] | None:
+    """The run env for a retry: pin ``MO_TARGET_CWD`` to the epic's repo.
+
+    A carry-over kickoff lives under ``<home>/runs/scheduler/kickoffs``, and a
+    run with no explicit target resolves it from the KICKOFF's directory — so
+    with the home outside the repo, every retry edited the wrong tree. The
+    repo is the one the base kickoff lives in (what attempt 1 resolved). An
+    operator-set ``MO_TARGET_CWD`` always wins; attempt 1 runs unchanged."""
+    if kickoff == base_kickoff or os.environ.get("MO_TARGET_CWD"):
+        return None
+    try:
+        r = subprocess.run(["git", "-C", os.path.dirname(os.path.abspath(base_kickoff)),
+                            "rev-parse", "--show-toplevel"], capture_output=True, text=True,
+                           timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    target = r.stdout.strip() if r.returncode == 0 else ""
+    return {**os.environ, "MO_TARGET_CWD": target} if target else None
+
+
 def _hook_timeout() -> float:
     raw = os.environ.get("MO_SCHED_HOOK_TIMEOUT_S", "").strip() or "600"
     try:
@@ -640,8 +660,10 @@ def dispatch_epic(epic_id: str, root: str, home: str, recipe: str,
         return "not_claimed", 0
     started_at = _now()
 
+    base_kickoff = kickoff
     if os.environ.get("MO_SCHED_CARRY_OVER", "1") != "0":
         kickoff = build_carry_over_kickoff(epic_id, kickoff, attempt, home, db)
+    run_env = _retry_target_env(base_kickoff, kickoff)
 
     hook_env = {"MO_EPIC_ID": epic_id, "MO_EPIC_ATTEMPT": attempt,
                 "MO_EPIC_KICKOFF": kickoff, "MO_EPIC_RECIPE": recipe}
@@ -661,7 +683,7 @@ def dispatch_epic(epic_id: str, root: str, home: str, recipe: str,
     cmd = runner_cmd or [os.path.join(root, "bin", "mini-ork"), "run", recipe, kickoff]
     with open(log_path, "w", encoding="utf-8") as log:
         rc = subprocess.run(cmd + ([kickoff] if runner_cmd else []),
-                            stdout=log, stderr=subprocess.STDOUT).returncode
+                            stdout=log, stderr=subprocess.STDOUT, env=run_env).returncode
 
     verdict = _verdict_from_log(log_path, home)
     run_id = _run_id_from_log(log_path)

@@ -424,3 +424,46 @@ def test_cli_rejects_a_zero_cap_and_unknown_retry_flags(world):
                             runner_cmd=_runner(world, [{"verdict": "fail"}]))
     assert epics.main(["retry", "A", "--reset-attempt"], db=world["db"]) == 2   # typo
     assert _row(world["db"], "A")["status"] == "escalated"
+
+
+def test_retry_targets_the_epics_repo_even_with_the_home_outside_it(tmp_path, monkeypatch):
+    """A carry-over kickoff lives under the mini-ork home. With the home outside
+    the epic's repo, the retry resolved its target from the home and edited the
+    wrong tree; it now runs with MO_TARGET_CWD = the base kickoff's repo."""
+    import subprocess as sp
+
+    for var in ("MO_TARGET_CWD", "MO_SCHED_CARRY_OVER", "MO_SCHED_PRE_DISPATCH_HOOK",
+                "MO_SCHED_POST_VERDICT_HOOK", "MO_SCHED_REQUIRED_VERIFIERS"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("MO_SCHED_MAX_ATTEMPTS", "3")
+    repo = tmp_path / "repo"
+    (repo / "kickoffs").mkdir(parents=True)
+    (repo / "kickoffs" / "A.md").write_text("# epic A\n\nDo the thing.\n", encoding="utf-8")
+    sp.run(["git", "init", "-q"], cwd=repo, check=True)
+    home = tmp_path / "elsewhere" / "home"
+    (home / "runs").mkdir(parents=True)
+    db = _init_db(home)
+    _seed(db, "A")
+    con = sqlite3.connect(db)
+    con.execute("UPDATE epics SET kickoff_path=? WHERE id='A'", (str(repo / "kickoffs" / "A.md"),))
+    con.commit()
+    con.close()
+    seen = tmp_path / "targets.txt"
+    stub = tmp_path / "runner.py"
+    stub.write_text(f"""#!/usr/bin/env python3
+import json, os, sys, time
+run_id = "run-" + str(time.time_ns())
+d = os.path.join({str(home)!r}, "runs", run_id); os.makedirs(d)
+n = len(open({str(seen)!r}).read().splitlines()) if os.path.exists({str(seen)!r}) else 0
+json.dump({{"verdict": "fail" if n == 0 else "success"}}, open(os.path.join(d, "verdict.json"), "w"))
+open({str(seen)!r}, "a").write(os.environ.get("MO_TARGET_CWD", "<unset>") + "|" + sys.argv[-1] + "\\n")
+print("run_id=" + run_id)
+""", encoding="utf-8")
+    stub.chmod(stub.stat().st_mode | stat.S_IEXEC)
+    for _ in range(2):
+        scheduler.dispatch_epic("A", str(repo), str(home), "epic-runner", db=db, runner_cmd=[str(stub)])
+    first, second = seen.read_text().splitlines()
+    assert first.split("|")[0] == "<unset>"                       # attempt 1 unchanged
+    target, kickoff = second.split("|")
+    assert kickoff.startswith(str(home))                          # the retry is a carry-over…
+    assert Path(target).resolve() == repo.resolve()               # …aimed at the epic's repo
