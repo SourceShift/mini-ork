@@ -216,3 +216,44 @@ def test_concord_unreachable_never_blocks_create_or_clean(repo: dict) -> None:
     created = run_wt(repo, "create", "eta", "--owns", "lib/y.sh", extra_env=env)
     assert created.returncode == 0, created.stderr
     assert run_wt(repo, "clean", "eta", extra_env=env).returncode == 0
+
+
+_CONSISTENCY_GATE = '[ ! -f expected.txt ] || [ "$(cat value.txt)" = "$(cat expected.txt)" ]'
+
+
+def _seed_value(repo: dict, value: str) -> None:
+    (repo["clone"] / "value.txt").write_text(value)
+    git("add", "value.txt", cwd=repo["clone"])
+    git("commit", "-m", f"value={value}", cwd=repo["clone"])
+    git("push", "origin", "HEAD:main", cwd=repo["clone"])
+
+
+def test_merge_names_a_semantic_conflict_when_branch_passes_alone(repo: dict) -> None:
+    """Passes alone, fails together: the branch pins value=1, upstream changed
+    it to 2 meanwhile; git merges cleanly, the combined gate is red, and the
+    differential re-run on the pre-rebase commit proves the branch was green."""
+    _seed_value(repo, "1")
+    assert run_wt(repo, "create", "theta").returncode == 0
+    wt = repo["worktrees"] / "theta"
+    (wt / "expected.txt").write_text("1")
+    git("add", "expected.txt", cwd=wt)
+    git("commit", "-m", "pin expected value", cwd=wt)
+    _seed_value(repo, "2")   # concurrent upstream change
+    res = run_wt(repo, "merge", "theta", extra_env={"MINI_ORK_TEST_CMD": _CONSISTENCY_GATE})
+    assert res.returncode != 0
+    assert "SEMANTIC CONFLICT" in res.stderr and "value=2" in res.stderr
+    assert git("log", "--oneline", "origin/main", cwd=repo["clone"]).stdout.count("pin expected") == 0
+    assert not any(p.name.startswith(".differential-") for p in repo["worktrees"].iterdir())
+
+
+def test_merge_says_fails_alone_when_the_branch_is_red_by_itself(repo: dict) -> None:
+    _seed_value(repo, "1")
+    assert run_wt(repo, "create", "iota").returncode == 0
+    wt = repo["worktrees"] / "iota"
+    (wt / "expected.txt").write_text("9")   # wrong on its own
+    git("add", "expected.txt", cwd=wt)
+    git("commit", "-m", "bad pin", cwd=wt)
+    _seed_value(repo, "2")
+    res = run_wt(repo, "merge", "iota", extra_env={"MINI_ORK_TEST_CMD": _CONSISTENCY_GATE})
+    assert res.returncode != 0
+    assert "also fails alone" in res.stderr and "SEMANTIC CONFLICT" not in res.stderr

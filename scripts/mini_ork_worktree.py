@@ -279,16 +279,55 @@ def merge_worktree(args: list[str]) -> None:
     branch = git("-C", wt, "rev-parse", "--abbrev-ref", "HEAD", capture=True).stdout.strip()
 
     git("-C", wt, "fetch", "origin", "main")
+    pre_rebase = git("-C", wt, "rev-parse", "HEAD", capture=True).stdout.strip()
+    base_before = git("-C", wt, "merge-base", "HEAD", "origin/main", capture=True).stdout.strip()
     git("-C", wt, "rebase", "origin/main")
     # Green gate: never push a red branch to main. Override the command per-task
     # with MINI_ORK_TEST_CMD (e.g. a scoped pytest path for a fast, focused gate).
     test_cmd = os.environ.get("MINI_ORK_TEST_CMD", DEFAULT_TEST_CMD)
     rc = subprocess.run(test_cmd, cwd=wt, shell=True, check=False).returncode
     if rc != 0:
-        die(f"green gate failed ({test_cmd}) in {wt}; fix before merging")
+        die(f"green gate failed ({test_cmd}) in {wt}; "
+            f"{_differential_verdict(wt, test_cmd, pre_rebase, base_before)}")
     git("-C", wt, "push", "origin", "HEAD:main")
     print(f"[mo-worktree] merged {branch} -> origin/main. "
           f"Tear down with: scripts/mini_ork_worktree.py clean {slug}")
+
+
+def _differential_verdict(wt: str, test_cmd: str, pre_rebase: str, base_before: str) -> str:
+    """Classify a red green gate (Concord P4, "passes alone, fails together").
+
+    The gate ran on the rebased tree, i.e. this branch COMBINED with whatever
+    landed on main meanwhile. When main moved, re-run the same command on the
+    pre-rebase commit in a throwaway detached worktree: if it passes there, the
+    branch is green alone and the failure comes from combining it with the
+    named upstream commits — a semantic conflict that git merged cleanly.
+    MO_MERGE_DIFFERENTIAL=0 skips the extra run.
+    """
+    new_base = git("-C", wt, "rev-parse", "origin/main", capture=True,
+                   check=False).stdout.strip()
+    if os.environ.get("MO_MERGE_DIFFERENTIAL", "1") == "0" or not base_before \
+            or new_base == base_before:
+        return "fix before merging"
+    upstream = git("-C", wt, "log", "--format=%h %s", f"{base_before}..{new_base}",
+                   capture=True, check=False).stdout.strip().splitlines()
+    tmp = os.path.join(WORKTREES_DIR, f".differential-{os.getpid()}")
+    alone_rc = None
+    try:
+        if git("-C", ROOT, "worktree", "add", "--detach", tmp, pre_rebase,
+               check=False, capture=True).returncode == 0:
+            alone_rc = subprocess.run(test_cmd, cwd=tmp, shell=True, check=False,
+                                      capture_output=True).returncode
+    finally:
+        git("-C", ROOT, "worktree", "remove", "--force", tmp, check=False, capture=True)
+    shown = "; ".join(upstream[:5]) + (f" (+{len(upstream) - 5} more)" if len(upstream) > 5 else "")
+    if alone_rc == 0:
+        return (f"SEMANTIC CONFLICT: the branch passes alone (pre-rebase {pre_rebase[:8]}) "
+                f"but fails combined with {len(upstream)} upstream commit(s): {shown}. "
+                "Reconcile with that work before merging.")
+    if alone_rc is None:
+        return "fix before merging (differential re-run could not create its worktree)"
+    return f"the branch also fails alone (pre-rebase {pre_rebase[:8]}); fix before merging"
 
 
 def clean_worktree(slug_arg: str) -> None:
