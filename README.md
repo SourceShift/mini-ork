@@ -289,6 +289,7 @@ mini-ork run code-fix ./kickoff.md
 | 📝 A documentation change | **docs** |
 | 🔎 A multi-perspective codebase audit | **refactor-audit** or **bug-audit-cmgk** |
 | 🔬 A literature or research brief | **research-synthesis** |
+| 📐 A directory of feature specs → verified features | **spec-driven-delivery** |
 | ♻️ Self-improvement of this repository | **recursive-self-improve** (see below) |
 | 🧩 A new workflow shape | Copy a recipe and follow the extension guide |
 

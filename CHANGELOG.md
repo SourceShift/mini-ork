@@ -9,6 +9,16 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- feat(recipes): spec-driven-delivery — spec-dir → verified features with live smoke + UI-craft gates.
+  Each spec in a `## Spec dir:` directory becomes a SpecCard whose acceptance gates are
+  written before implementation and must fail on the untouched tree. Every deliverable
+  goes through its own `recursive-validate-impl` child run; per-gate verdicts land in a
+  traceability ledger. `mini-ork specs ingest|lint` checks a spec dir without a run, and
+  `tests/test_sdd_e2e_dryrun.py` runs the deterministic spine on a fixture repo with no
+  LLM lane.
+
 ---
 
 ## [0.9.0] - 2026-10-01

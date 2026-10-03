@@ -1,0 +1,33 @@
+{
+  "spec_id": "multiply-feature",
+  "source_path": "/fixture/sdd_e2e/specs/multiply-feature.md",
+  "source_hash": "sha256:055282baec89e19b1a1dd5d7aa80b8a585c17331f161f481937b0cd9949b7176",
+  "title": "Multiply two numbers",
+  "clauses": {
+    "functional": [
+      {"id": "F1", "text": "multiply(a, b) returns the product a * b"},
+      {"id": "F2", "text": "zero, negative and float operands follow arithmetic rules"}
+    ],
+    "quality": [],
+    "constitutional": [
+      {"id": "C1", "text": "add(a, b) keeps passing its existing test"}
+    ],
+    "architectural": []
+  },
+  "acceptance": [
+    {"id": "AC1", "clause_refs": ["F1"], "text": "integer products pass",
+     "gate": {"kind": "cmd", "probe": "python3 -m pytest -q tests/test_multiply.py::test_multiply_integers",
+              "expect": "^1 passed"}},
+    {"id": "AC2", "clause_refs": ["F2"], "text": "edge-case products pass",
+     "gate": {"kind": "cmd", "probe": "python3 -m pytest -q tests/test_multiply.py::test_multiply_edge_cases",
+              "expect": "^1 passed"}},
+    {"id": "AC3", "clause_refs": ["C1"], "text": "add() still passes (precondition)",
+     "gate": {"kind": "cmd", "probe": "python3 -m pytest -q tests/test_add.py", "expect": "^1 passed"}}
+  ],
+  "deliverables": [
+    {"id": "D1", "title": "implement calc.multiply", "acceptance_refs": ["AC1", "AC2", "AC3"],
+     "depends_on": []}
+  ],
+  "ui_craft": {"required": false, "design_sources": []},
+  "status": "ratified"
+}
