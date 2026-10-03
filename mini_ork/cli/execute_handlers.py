@@ -773,7 +773,11 @@ def _handle_researcher(ctx: NodeDispatch):
 # Recipes whose implementer exists to edit the target tree. framework-edit
 # enforces this in its own ground-truth harvest; recipes whose implementer
 # nodes synthesize or research (and legitimately touch no files) stay out.
-_RECIPES_REQUIRING_TREE_CHANGES = frozenset({"code-fix"})
+# `docs` (`doc_editor`) edits documentation in the target tree; its
+# grep_assert + link_verifier verifiers pass vacuously on an untouched tree,
+# so the same no-change guard that `code-fix` enforces applies (pilot
+# mo-9a0cf68ccf).
+_RECIPES_REQUIRING_TREE_CHANGES = frozenset({"code-fix", "docs"})
 
 
 def _handle_implementer(ctx: NodeDispatch):

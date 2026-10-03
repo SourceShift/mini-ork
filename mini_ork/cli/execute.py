@@ -1877,6 +1877,19 @@ def _write_implementer_summary(run_dir, target, impl_log):
         except OSError:
             baseline = ""
     under_run_dir = os.path.realpath(run_dir)
+    # Untracked files that already existed before the implementer ran are not its
+    # changes unless it touched them after the snapshot: a docs run whose prompt
+    # was "hi" otherwise reported the project's pre-existing .gitignore as changed.
+    pre_untracked: set[str] = set()
+    snap_mtime = None
+    snap_path = os.path.join(run_dir, "pre-implementer-untracked")
+    if os.path.isfile(snap_path):
+        try:
+            with open(snap_path, encoding="utf-8") as fh:
+                pre_untracked = {line.strip() for line in fh if line.strip()}
+            snap_mtime = os.path.getmtime(snap_path)
+        except OSError:
+            pre_untracked, snap_mtime = set(), None
     files: list[str] = []
     derived = True
     try:
@@ -1884,10 +1897,21 @@ def _write_implementer_summary(run_dir, target, impl_log):
         if baseline:
             args.append(baseline)
         rels: list[str] = []
-        for argv in (args, ["git", "-C", target, "ls-files", "--others", "--exclude-standard"]):
+        untracked_argv = ["git", "-C", target, "ls-files", "--others", "--exclude-standard"]
+        for argv in (args, untracked_argv):
             proc = subprocess.run(argv, capture_output=True, text=True, timeout=15)
             if proc.returncode == 0:
-                rels.extend(line.strip() for line in proc.stdout.splitlines() if line.strip())
+                for line in proc.stdout.splitlines():
+                    rel = line.strip()
+                    if not rel:
+                        continue
+                    if argv is untracked_argv and rel in pre_untracked and snap_mtime is not None:
+                        try:
+                            if os.path.getmtime(os.path.join(target, rel)) <= snap_mtime:
+                                continue
+                        except OSError:
+                            continue
+                    rels.append(rel)
             else:
                 derived = False
         for rel in rels:

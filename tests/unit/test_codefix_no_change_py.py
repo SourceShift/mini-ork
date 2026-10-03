@@ -67,6 +67,48 @@ def test_summary_returns_none_when_git_cannot_answer(tmp_path):
     assert ex._write_implementer_summary(str(_run_dir(tmp_path)), str(plain), "impl.log") is None
 
 
+def _snapshot_untracked(repo: Path, run_dir: Path) -> None:
+    """Write pre-implementer-untracked the way the executor does, then age it a bit
+    so a later write is unambiguously newer than the snapshot."""
+    out = subprocess.run(["git", "-C", str(repo), "ls-files", "--others", "--exclude-standard"],
+                         capture_output=True, text=True, check=True).stdout
+    snap = run_dir / "pre-implementer-untracked"
+    snap.write_text(out, encoding="utf-8")
+    import os
+    import time
+    past = time.time() - 5
+    os.utime(snap, (past, past))
+    for rel in out.split():
+        os.utime(repo / rel, (past - 5, past - 5))
+
+
+def test_pre_existing_untracked_file_is_not_a_change(tmp_path):
+    repo, run_dir = _repo(tmp_path), _run_dir(tmp_path)
+    (repo / ".gitignore").write_text("x\n", encoding="utf-8")   # existed before the implementer
+    _snapshot_untracked(repo, run_dir)
+    files = ex._write_implementer_summary(str(run_dir), str(repo), "impl.log")
+    assert files == []
+    summary = json.loads((run_dir / "implementer-summary.json").read_text(encoding="utf-8"))
+    assert summary["status"] == "no_changes"
+
+
+def test_pre_existing_untracked_file_edited_by_the_implementer_is_a_change(tmp_path):
+    repo, run_dir = _repo(tmp_path), _run_dir(tmp_path)
+    (repo / "notes.md").write_text("old\n", encoding="utf-8")
+    _snapshot_untracked(repo, run_dir)
+    (repo / "notes.md").write_text("new\n", encoding="utf-8")   # touched after the snapshot
+    files = ex._write_implementer_summary(str(run_dir), str(repo), "impl.log")
+    assert files == [str((repo / "notes.md").resolve())]
+
+
+def test_new_untracked_file_is_a_change(tmp_path):
+    repo, run_dir = _repo(tmp_path), _run_dir(tmp_path)
+    _snapshot_untracked(repo, run_dir)
+    (repo / "added.md").write_text("hi\n", encoding="utf-8")
+    files = ex._write_implementer_summary(str(run_dir), str(repo), "impl.log")
+    assert files == [str((repo / "added.md").resolve())]
+
+
 def _dispatch_implementer(tmp_path, repo, monkeypatch, *, recipe, edit):
     monkeypatch.setenv("MO_TARGET_CWD", str(repo))
     plan = tmp_path / "plan.json"
@@ -96,6 +138,24 @@ def test_code_fix_implementer_that_edits_still_succeeds(tmp_path, monkeypatch):
     repo = _repo(tmp_path)
 
     rc, _ = _dispatch_implementer(tmp_path, repo, monkeypatch, recipe="code-fix", edit=True)
+
+    assert rc == 0
+
+
+def test_docs_implementer_with_no_changes_fails_the_node(tmp_path, monkeypatch):
+    """docs recipe's grep_assert/link verifiers pass vacuously on an untouched
+    tree; the no-change guard must fail the node instead."""
+    repo = _repo(tmp_path)
+
+    rc, reason = _dispatch_implementer(tmp_path, repo, monkeypatch, recipe="docs", edit=False)
+
+    assert (rc, reason) == (1, "impl_no_changes")
+
+
+def test_docs_implementer_that_edits_still_succeeds(tmp_path, monkeypatch):
+    repo = _repo(tmp_path)
+
+    rc, _ = _dispatch_implementer(tmp_path, repo, monkeypatch, recipe="docs", edit=True)
 
     assert rc == 0
 
