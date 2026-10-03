@@ -1,0 +1,663 @@
+"""Hermetic tests for the ACP slash-command table (``mini_ork.acp.commands``).
+
+Every test runs against an in-memory agent constructed with a tmp dir as the
+``.mini-ork`` home. A migrated ``state.db`` + seeded rows cover the data
+shapes each handler reads. Subprocess / network seams (``_spawn``, ``run``,
+``_probe``) are monkeypatched so no real ``bin/mini-ork``, ``curl``, or socket
+ever runs. ``asyncio.run`` drives the coroutines; the module has no
+pytest-asyncio dependency.
+
+Contract:
+  * each handler returns markdown; failures are one-line strings, never raises;
+  * ``/runs`` caps at 50 and defaults to 10;
+  * thread sessions with no run yet reply "No run in this thread yet ...";
+  * the ``_current_run_id`` resolver honours an explicit run id over the
+    thread's most-recent run.
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import shutil
+import sqlite3
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+import pytest
+
+REPO = Path(__file__).resolve().parents[2]
+if str(REPO) not in sys.path:
+    sys.path.insert(0, str(REPO))
+
+from acp.schema import AvailableCommand  # noqa: E402
+
+from mini_ork.acp import commands as cmds  # noqa: E402
+from mini_ork.acp.agent import MiniOrkAcpAgent  # noqa: E402
+from mini_ork.stores import migrate as mig  # noqa: E402
+
+
+@pytest.fixture(scope="module")
+def _migrated_db(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """Migrate once per module (a full migration takes seconds); tests copy it."""
+    db_path = tmp_path_factory.mktemp("template") / "state.db"
+    rc, out, err = mig.init_db(db=str(db_path), root=str(REPO))
+    assert rc == 0, f"init_db failed:\n{out}\n{err}"
+    con = sqlite3.connect(db_path)
+    con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    con.close()
+    return db_path
+
+
+@pytest.fixture
+def home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _migrated_db: Path) -> Path:
+    """A migrated ``.mini-ork`` home; seeded rows come via ``seed()``."""
+    h = tmp_path / ".mini-ork"
+    h.mkdir()
+    (h / "runs-inbox").mkdir()
+    shutil.copyfile(_migrated_db, h / "state.db")
+    monkeypatch.setenv("MINI_ORK_HOME", str(h))
+    monkeypatch.setenv("MO_DAILY_BUDGET_USD", "50")
+    monkeypatch.setenv("MO_SERVE_PORT", "7090")
+    monkeypatch.setenv("MO_ACP_CERTIFY_TIMEOUT_S", "30")
+    return h
+
+
+def seed_run(
+    home: Path,
+    *,
+    run_id: str,
+    recipe: str = "code-fix",
+    task_class: str = "framework_edit",
+    status: str = "published",
+    cost_usd: float = 0.25,
+    age_seconds: int = 60,
+    recipe_pretty: str = "code-fix",
+) -> None:
+    """Insert one task_runs row + a kickoff file so list_runs finds it."""
+    kickoff_path = str(home / "runs-inbox" / f"{run_id}.md")
+    (home / "runs-inbox" / f"{run_id}.md").write_text(
+        f"# {recipe_pretty} run {run_id}\n", encoding="utf-8"
+    )
+    now = int(time.time())
+    con = sqlite3.connect(home / "state.db")
+    con.execute(
+        """
+        INSERT INTO task_runs
+            (id, recipe, status, cost_usd, created_at, updated_at,
+             task_class, kickoff_path, workflow_version)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            run_id,
+            recipe,
+            status,
+            cost_usd,
+            now - age_seconds,
+            now - age_seconds,
+            task_class,
+            kickoff_path,
+            "latest",
+        ),
+    )
+    con.commit()
+    con.close()
+
+
+def seed_llm_call(home: Path, *, run_id: str, cost_usd: float = 0.5) -> None:
+    """One llm_call the keep running spend gauge."""
+
+    con = sqlite3.connect(home / "state.db")
+    # llm_calls schema: id, provider, model, ts, total_tokens, prompt_tokens,
+    # completion_tokens, cost_usd, task_run_id (column names vary by migration).
+    cols = [r[1] for r in con.execute("PRAGMA table_info(llm_calls)").fetchall()]
+    if "task_run_id" not in cols:
+        return
+    con.execute(
+        "INSERT INTO llm_calls (provider, model, ts, total_tokens, cost_usd, task_run_id) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        ("test", "test-model", time.strftime("%Y-%m-%dT%H:%M:%S"), 100, cost_usd, run_id),
+    )
+    con.commit()
+    con.close()
+
+
+def seed_gradient(home: Path, *, task_class: str, target: str, signal: str) -> None:
+    """A gradient row the keep running ``/learnings`` failure-mode feed."""
+    con = sqlite3.connect(home / "state.db")
+    if "gradient_records" not in [
+        r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+    ]:
+        return
+    con.execute(
+        "INSERT INTO gradient_records (gradient_id, task_class, target, signal, "
+        "suggested_change, evidence, confidence, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            f"gr-{task_class}-{target}",
+            task_class,
+            target,
+            signal,
+            "no-op",
+            json.dumps(["seed"]),
+            0.95,
+            int(time.time()),
+        ),
+    )
+    con.commit()
+    con.close()
+
+
+def seed_learning_record(home: Path, *, run_id: str, title: str) -> None:
+    """A learning_record row the keep running ``/learnings`` records feed."""
+    con = sqlite3.connect(home / "state.db")
+    if "learning_record" not in [
+        r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+    ]:
+        return
+    now = int(time.time())
+    con.execute(
+        "INSERT INTO learning_record (run_id, iter, rank, category, title, "
+        "evidence_paths, arxiv_refs, outcome, severity, confidence, "
+        "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            run_id,
+            1,
+            1,
+            "meta",
+            title,
+            "[]",
+            "[]",
+            "open",
+            "medium",
+            0.5,
+            now,
+            now,
+        ),
+    )
+    con.commit()
+    con.close()
+
+
+def _agent(home: Path) -> MiniOrkAcpAgent:
+    """A bare agent bound to the tmp home so ``agent._home_for`` resolves."""
+    a = MiniOrkAcpAgent(home=str(home))
+    # Bind a fake session id whose cwd parent resolves to ``home``.
+    a._sessions["run-1-abc"] = str(home.parent)
+    return a
+
+
+# ── /help ────────────────────────────────────────────────────────────────────
+
+
+def test_help_lists_every_announced_command():
+    agent = _agent(Path.cwd())  # home only needs to resolve
+    out = asyncio.run(cmds.handle_help(agent, "run-1-abc", ""))
+    assert "Available slash commands" in out
+    for name in ("help", "runs", "status", "learnings", "cost", "lanes",
+                 "stop", "kill", "resume", "recover", "certify", "serve"):
+        assert f"`/{name}`" in out
+
+
+# ── COMMANDS table ───────────────────────────────────────────────────────────
+
+
+def test_commands_table_matches_handlers():
+    """Every handler key (except ``run``) is announced."""
+    announced = {c.name for c in cmds.COMMANDS}
+    expected = set(cmds.HANDLERS) | {"run"}  # ``/run`` is announced but not dispatched here
+    assert announced == expected
+    # Each command carries the right SDK shape.
+    for c in cmds.COMMANDS:
+        assert isinstance(c, AvailableCommand)
+        assert c.name and c.description
+
+
+# ── /runs ────────────────────────────────────────────────────────────────────
+
+
+def test_runs_returns_markdown_table(home: Path):
+    seed_run(home, run_id="run-aaa-001", recipe="code-fix", recipe_pretty="Fix bug")
+    seed_run(home, run_id="run-aaa-002", recipe="framework-edit", recipe_pretty="Edit scope")
+    agent = _agent(home)
+    out = asyncio.run(cmds.handle_runs(agent, "run-1-abc", ""))
+    assert "run id" in out  # header row (space, not underscore)
+    assert "run-aaa-002" in out or "run-aaa-001" in out
+    assert "Open any of these from Thread History" in out
+
+
+def test_runs_caps_count(home: Path):
+    """/runs N — N clamped to [1, 50], default 10."""
+    for i in range(20):
+        seed_run(home, run_id=f"run-many-{i:03d}")
+    agent = _agent(home)
+    out = asyncio.run(cmds.handle_runs(agent, "run-1-abc", "5"))
+    # Only 5 task_run rows requested → 5 body rows + 2 header rows.
+    body_rows = [ln for ln in out.splitlines() if ln.startswith("| run-")]
+    assert len(body_rows) == 5
+
+
+def test_runs_rejects_invalid_count(home: Path):
+    seed_run(home, run_id="run-bad-001")
+    agent = _agent(home)
+    out = asyncio.run(cmds.handle_runs(agent, "run-1-abc", "not-a-number"))
+    # Falls back to default 10; the row is shown.
+    assert "run-bad-001" in out
+
+
+def test_runs_empty(home: Path):
+    agent = _agent(home)
+    out = asyncio.run(cmds.handle_runs(agent, "run-1-abc", ""))
+    assert "No runs recorded yet" in out
+
+
+# ── /status ──────────────────────────────────────────────────────────────────
+
+
+def test_status_run_session(home: Path):
+    seed_run(home, run_id="run-st-001", recipe="code-fix")
+    agent = _agent(home)
+    out = asyncio.run(cmds.handle_status(agent, "run-st-001", ""))
+    assert "status" in out
+    assert "run-st-001" in out
+
+
+def test_status_thread_with_run(home: Path):
+    seed_run(home, run_id="run-thr-001", recipe="framework-edit")
+    agent = _agent(home)
+    agent._thread_sessions.add("orch-test-001")
+    agent._sessions["orch-test-001"] = str(home.parent)
+    agent._thread_runs["orch-test-001"] = ["run-thr-001"]
+    out = asyncio.run(cmds.handle_status(agent, "orch-test-001", ""))
+    assert "run-thr-001" in out
+
+
+def test_status_thread_without_run():
+    agent = _agent(Path.cwd())
+    agent._thread_sessions.add("orch-empty-001")
+    agent._sessions["orch-empty-001"] = str(Path.cwd())
+    out = asyncio.run(cmds.handle_status(agent, "orch-empty-001", ""))
+    assert "No run in this thread yet" in out
+
+
+def test_status_accepts_explicit_run_id(home: Path):
+    seed_run(home, run_id="run-aaa-001")
+    seed_run(home, run_id="run-aaa-002")
+    agent = _agent(home)
+    agent._thread_sessions.add("orch-test-001")
+    agent._sessions["orch-test-001"] = str(home.parent)
+    agent._thread_runs["orch-test-001"] = ["run-aaa-001"]
+    out = asyncio.run(cmds.handle_status(agent, "orch-test-001", "run-aaa-002"))
+    # Explicit run id wins — the named run appears in the reply.
+    assert "run-aaa-002" in out
+    # The thread's most-recent (run-aaa-001) is NOT reported because the
+    # explicit id won.
+    assert "run-aaa-001" not in out
+
+
+# ── /learnings ───────────────────────────────────────────────────────────────
+
+
+def test_learnings_sections_present(home: Path):
+    seed_run(home, run_id="run-lr-001", task_class="framework_edit")
+    seed_gradient(home, task_class="framework_edit", target="dispatch", signal="simulate")
+    seed_learning_record(home, run_id="run-lr-001", title="remember to plan")
+    agent = _agent(home)
+    out = asyncio.run(cmds.handle_learnings(agent, "run-lr-001", ""))
+    assert "Failure-mode gradients" in out
+    assert "Learning records" in out
+    assert "Emergent patterns" in out
+
+
+def test_learnings_filter_caps_results(home: Path):
+    seed_run(home, run_id="run-lr-002", task_class="framework_edit")
+    seed_gradient(home, task_class="framework_edit", target="dispatch",
+                  signal="a really specific signal the filter should pick up")
+    seed_gradient(home, task_class="framework_edit", target="other",
+                  signal="completely unrelated payload the filter ignores")
+    agent = _agent(home)
+    out = asyncio.run(cmds.handle_learnings(agent, "run-lr-002", "specific"))
+    assert "specific" in out.lower()
+    # The non-matching gradient is filtered out.
+    assert "completely unrelated payload" not in out
+
+
+def test_learnings_empty_sections_say_so(home: Path):
+    seed_run(home, run_id="run-lr-003")
+    agent = _agent(home)
+    out = asyncio.run(cmds.handle_learnings(agent, "run-lr-003", ""))
+    assert "none recorded yet" in out
+
+
+# ── /cost ────────────────────────────────────────────────────────────────────
+
+
+def test_cost_shows_window_and_budget(home: Path):
+    seed_run(home, run_id="run-cost-001", cost_usd=1.50)
+    seed_llm_call(home, run_id="run-cost-001", cost_usd=0.5)
+    agent = _agent(home)
+    out = asyncio.run(cmds.handle_cost(agent, "run-cost-001", "1"))
+    assert "Cost (last 1 day)" in out
+    assert "rolling 24h" in out
+    assert "$50.00" in out
+
+
+def test_cost_days_default_and_caps(home: Path):
+    seed_run(home, run_id="run-cost-002", cost_usd=0.0)
+    agent = _agent(home)
+    out = asyncio.run(cmds.handle_cost(agent, "run-cost-002", ""))
+    # Default 1 day.
+    assert "Cost (last 1 day)" in out
+    # Garbage arg falls back to 1 day.
+    out2 = asyncio.run(cmds.handle_cost(agent, "run-cost-002", "garbage"))
+    assert "Cost (last 1 day)" in out2
+
+
+# ── /lanes ───────────────────────────────────────────────────────────────────
+
+
+def test_lanes_returns_role_table(home: Path):
+    agent = _agent(home)
+    out = asyncio.run(cmds.handle_lanes(agent, "run-1-abc", ""))
+    # Either a populated table or the empty marker — both are valid.
+    assert out.startswith("## Lanes") or "No lanes configured" in out
+
+
+# ── /stop / /kill / /resume ──────────────────────────────────────────────────
+
+
+def test_stop_calls_control_stop_run(home: Path, monkeypatch: pytest.MonkeyPatch):
+    seed_run(home, run_id="run-stop-001", status="executing")
+    captured: dict[str, object] = {}
+
+    def fake_stop(home, db, task_run_id):
+        captured["home"] = home
+        captured["task_run_id"] = task_run_id
+        return {"ok": True, "task_run_id": task_run_id, "note": "soft"}
+
+    monkeypatch.setattr("mini_ork.web.control.stop_run", fake_stop)
+    agent = _agent(home)
+    out = asyncio.run(cmds.handle_stop(agent, "run-stop-001", ""))
+    assert captured.get("task_run_id") == "run-stop-001"
+    assert "ok" in out
+
+
+def test_kill_calls_control_kill_run(home: Path, monkeypatch: pytest.MonkeyPatch):
+    seed_run(home, run_id="run-kill-001", status="executing")
+    captured: dict[str, object] = {}
+
+    def fake_kill(home, db, task_run_id):
+        captured["task_run_id"] = task_run_id
+        return {"ok": True, "task_run_id": task_run_id}
+
+    monkeypatch.setattr("mini_ork.web.control.kill_run", fake_kill)
+    agent = _agent(home)
+    out = asyncio.run(cmds.handle_kill(agent, "run-kill-001", ""))
+    assert captured.get("task_run_id") == "run-kill-001"
+    assert "ok" in out
+
+
+def test_resume_reports_no_pause_when_ok_false(home: Path, monkeypatch: pytest.MonkeyPatch):
+    seed_run(home, run_id="run-res-001")
+    monkeypatch.setattr(
+        "mini_ork.web.control.resume_cost_run",
+        lambda home, run_id, approver: {"ok": False, "error": "no sentinel"},
+    )
+    agent = _agent(home)
+    out = asyncio.run(cmds.handle_resume(agent, "run-res-001", ""))
+    assert "no cost pause" in out
+
+
+def test_stop_in_thread_picks_thread_run(home: Path, monkeypatch: pytest.MonkeyPatch):
+    seed_run(home, run_id="run-thr-stop", status="executing")
+    captured: list[str] = []
+
+    def fake_stop(home, db, task_run_id):
+        captured.append(task_run_id)
+        return {"ok": True, "task_run_id": task_run_id}
+
+    monkeypatch.setattr("mini_ork.web.control.stop_run", fake_stop)
+    agent = _agent(home)
+    agent._thread_sessions.add("orch-stop")
+    agent._sessions["orch-stop"] = str(home.parent)
+    agent._thread_runs["orch-stop"] = ["run-thr-stop"]
+    asyncio.run(cmds.handle_stop(agent, "orch-stop", ""))
+    assert captured == ["run-thr-stop"]
+
+
+# ── /recover ────────────────────────────────────────────────────────────────
+
+
+def test_recover_spawns_detached_subprocess(home: Path, monkeypatch: pytest.MonkeyPatch):
+    seed_run(home, run_id="run-rec-001")
+    captured: dict[str, object] = {}
+
+    class FakePopen:
+        pid = 4242
+
+        def __init__(self, *args, **kwargs):
+            captured["args"] = args
+            captured["kwargs"] = kwargs
+
+    monkeypatch.setattr(cmds, "_spawn", lambda *a, **kw: FakePopen(*a, **kw))
+    agent = _agent(home)
+    out = asyncio.run(cmds.handle_recover(agent, "run-rec-001", ""))
+    assert "started" in out
+    assert "4242" in out  # pid
+    # The ``recover`` argv includes the run id; cwd is the engine root; the
+    # MINI_ORK_VENV_ACTIVE marker is dropped (the spawn env copy).
+    spawn_args = captured["args"]
+    assert "recover" in spawn_args[0]
+    assert "run-rec-001" in spawn_args[0]
+    env = captured["kwargs"]["env"]
+    assert "MINI_ORK_VENV_ACTIVE" not in env
+
+
+def test_recover_parses_from_node(home: Path, monkeypatch: pytest.MonkeyPatch):
+    seed_run(home, run_id="run-rec-002")
+    captured: dict[str, object] = {}
+
+    class FakePopen:
+        pid = 99
+
+        def __init__(self, *args, **kwargs):
+            captured["args"] = args
+
+    monkeypatch.setattr(cmds, "_spawn", lambda *a, **kw: FakePopen(*a, **kw))
+    agent = _agent(home)
+    asyncio.run(cmds.handle_recover(agent, "run-rec-002", "--from-node planner"))
+    assert "--from-node" in captured["args"][0]
+    assert "planner" in captured["args"][0]
+
+
+def test_recover_thread_no_run_returns_placeholder(home: Path):
+    agent = _agent(home)
+    agent._thread_sessions.add("orch-empty-rec")
+    agent._sessions["orch-empty-rec"] = str(home.parent)
+    out = asyncio.run(cmds.handle_recover(agent, "orch-empty-rec", ""))
+    assert "No run" in out
+
+
+# ── /certify ─────────────────────────────────────────────────────────────────
+
+
+def test_certify_missing_text_shows_usage():
+    agent = _agent(Path.cwd())
+    out = asyncio.run(cmds.handle_certify(agent, "run-1", ""))
+    assert "Usage" in out
+
+
+def test_certify_proven_verdict(home: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(
+        cmds,
+        "_run",
+        lambda argv, *, timeout: subprocess.CompletedProcess(
+            argv, 0, stdout="ok\nPROVEN\n", stderr=""
+        ),
+    )
+    agent = _agent(home)
+    out = asyncio.run(cmds.handle_certify(agent, "run-1", "bug X"))
+    assert "PROVEN" in out
+
+
+def test_certify_refuted_verdict(home: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(
+        cmds,
+        "_run",
+        lambda argv, *, timeout: subprocess.CompletedProcess(
+            argv, 1, stdout="bad\nREFUTED\n", stderr=""
+        ),
+    )
+    agent = _agent(home)
+    out = asyncio.run(cmds.handle_certify(agent, "run-1", "bug X"))
+    assert "REFUTED" in out
+
+
+def test_certify_unverified_verdict(home: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(
+        cmds,
+        "_run",
+        lambda argv, *, timeout: subprocess.CompletedProcess(
+            argv, 2, stdout="UNVERIFIED", stderr=""
+        ),
+    )
+    agent = _agent(home)
+    out = asyncio.run(cmds.handle_certify(agent, "run-1", "bug X"))
+    assert "UNVERIFIED" in out
+
+
+def test_certify_other_rc_reports_error(home: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(
+        cmds,
+        "_run",
+        lambda argv, *, timeout: subprocess.CompletedProcess(
+            argv, 7, stdout="partial", stderr="traceback\noh no\n"
+        ),
+    )
+    agent = _agent(home)
+    out = asyncio.run(cmds.handle_certify(agent, "run-1", "bug X"))
+    assert "errored" in out
+    assert "oh no" in out
+
+
+def test_certify_timeout(home: Path, monkeypatch: pytest.MonkeyPatch):
+    """The handler survives a timeout: rc=124 sentinel + stderr tail."""
+    def fake_run(argv, *, timeout):
+        return subprocess.CompletedProcess(
+            argv, 124, stdout="", stderr="timeout after 30s"
+        )
+
+    monkeypatch.setattr(cmds, "_run", fake_run)
+    agent = _agent(home)
+    out = asyncio.run(cmds.handle_certify(agent, "run-1", "bug X"))
+    assert "errored" in out or "timeout" in out.lower()
+
+
+# ── /serve ───────────────────────────────────────────────────────────────────
+
+
+def test_serve_down_returns_command():
+    agent = _agent(Path.cwd())
+    # Default: probe fails (no serve actually running).
+    out = asyncio.run(cmds.handle_serve(agent, "run-1", ""))
+    assert "Run `mini-ork serve`" in out
+
+
+def test_serve_up_returns_url(home: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(cmds, "_probe", lambda url, *, timeout=1.0: True)
+    seed_run(home, run_id="run-srv-001")
+    agent = _agent(home)
+    out = asyncio.run(cmds.handle_serve(agent, "run-srv-001", ""))
+    assert "mini-ork serve is up" in out
+    assert "/runs/run-srv-001" in out
+
+
+# ── handler error contract ───────────────────────────────────────────────────
+
+
+def test_handler_error_returns_one_line(home: Path, monkeypatch: pytest.MonkeyPatch):
+    """A handler that raises must NOT propagate — the dispatcher swallows it."""
+    async def boom(*args, **kwargs):
+        raise RuntimeError("kaboom")
+
+    monkeypatch.setitem(cmds.HANDLERS, "lanes", boom)
+    agent = _agent(home)
+    out = asyncio.run(cmds.handle(agent, "run-1", "lanes", ""))
+    assert "kaboom" in out
+    assert "`/lanes` failed" in out
+
+
+def test_unknown_command_via_handle_returns_one_line():
+    """``cmds.handle`` is only called for known commands by the dispatcher;
+    direct calls with an unknown name still degrade gracefully."""
+    agent = _agent(Path.cwd())
+    out = asyncio.run(cmds.handle(agent, "run-1", "nope", ""))
+    assert "Unknown command" in out or "/nope" in out
+
+# ── review regressions ───────────────────────────────────────────────────────
+
+
+def _seed_events(home: Path, run_id: str, events: list[tuple[str, str]]) -> None:
+    con = sqlite3.connect(home / "state.db")
+    for i, (kind, node) in enumerate(events):
+        con.execute(
+            "INSERT INTO run_events (event_id, run_id, event_type, payload_json, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (f"{run_id}-{node}-{kind}", run_id, kind, json.dumps({"node_id": node}), 1000 + i),
+        )
+    con.commit()
+    con.close()
+
+
+def test_status_counts_a_finished_node_as_done_not_running(home: Path):
+    seed_run(home, run_id="run-nodes-001", status="executing")
+    _seed_events(home, "run-nodes-001", [("node_start", "n1"), ("node_end", "n1"), ("node_start", "n2")])
+    out = asyncio.run(cmds.handle_status(_agent(home), "run-nodes-001", ""))
+    assert "1 done · 1 running · 0 failed" in out
+
+
+def test_cost_window_is_days_not_rows(home: Path):
+    seed_run(home, run_id="run-today-a", recipe="docs", cost_usd=1.0)
+    seed_run(home, run_id="run-today-b", recipe="code-fix", cost_usd=2.0)
+    seed_run(home, run_id="run-old-001", recipe="docs", cost_usd=4.0, age_seconds=5 * 86400)
+    agent = _agent(home)
+    one_day = asyncio.run(cmds.handle_cost(agent, "run-today-a", "1"))
+    assert "**total**: $3.00" in one_day          # both recipes of today, not the old day
+    week = asyncio.run(cmds.handle_cost(agent, "run-today-a", "7"))
+    assert "**total**: $7.00" in week
+
+
+def test_certify_does_not_block_the_agent_and_announces_itself(home: Path, monkeypatch):
+    """While certify runs, the agent's event loop must keep serving other work.
+    The fake certify waits for a signal only a running loop can send; a call
+    that blocks the loop never gets it (deterministic, no timing thresholds)."""
+    import threading
+
+    loop_ran = threading.Event()
+
+    def certify_waiting_for_the_loop(argv, *, timeout):
+        verdict = "PROVEN" if loop_ran.wait(5) else "LOOP-BLOCKED"
+        return subprocess.CompletedProcess(argv, 0, stdout=f"{verdict}: fix holds\n", stderr="")
+
+    monkeypatch.setattr(cmds, "_run", certify_waiting_for_the_loop)
+    agent = _agent(home)
+    agent._sessions["run-cert-001"] = str(home.parent)
+    sent: list[str] = []
+
+    async def capture(session_id, update):
+        sent.append(getattr(getattr(update, "content", None), "text", ""))
+
+    monkeypatch.setattr(agent, "_emit", capture)
+
+    async def other_work():
+        await asyncio.sleep(0.01)
+        loop_ran.set()
+
+    async def scenario():
+        result, _ = await asyncio.gather(
+            cmds.handle_certify(agent, "run-cert-001", "the parser drops tabs"), other_work())
+        return result
+
+    out = asyncio.run(scenario())
+    assert "LOOP-BLOCKED" not in out and "PROVEN" in out
+    assert sent and "Certifying HEAD~1..HEAD" in sent[0]

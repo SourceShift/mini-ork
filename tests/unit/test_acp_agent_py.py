@@ -39,6 +39,7 @@ from acp.schema import (  # noqa: E402
     ToolCallProgress,
     ToolCallStart,
     UsageUpdate,
+    UserMessageChunk,
 )
 
 from mini_ork.acp.agent import MiniOrkAcpAgent, mint_run_id  # noqa: E402
@@ -2645,3 +2646,256 @@ def test_load_without_cache_does_not_create_one(tmp_path: Path) -> None:
     agent.on_connect(_capturing_conn()[1])
     asyncio.run(agent.load_session(cwd=str(proj), session_id=run_id))
     assert not (home / "runs" / run_id / "acp-diffs.json").exists()
+
+
+# ── Z5: announcement + slash-command routing ────────────────────────────────
+
+
+from acp.schema import AvailableCommandsUpdate  # noqa: E402
+
+
+def _commands_updates(captured: list) -> list:
+    return [u for u in captured if isinstance(u, AvailableCommandsUpdate)]
+
+
+def test_z5_new_session_run_emits_commands_update(tmp_path: Path) -> None:
+    """``session/new`` for a run session pushes ``available_commands_update``."""
+    proj, _home = _migrate_home(tmp_path)
+    captured, conn = _capturing_conn()
+    agent = MiniOrkAcpAgent()
+    agent.on_connect(conn)
+    asyncio.run(
+        agent.new_session(cwd=str(proj), run_id="run-z5-001", recipe="code-fix")
+    )
+    updates = _commands_updates(captured)
+    assert updates, f"expected an AvailableCommandsUpdate, got {captured!r}"
+    announced = {c.name for c in updates[0].available_commands}
+    assert {"help", "status", "runs", "stop", "kill", "serve"} <= announced
+
+
+def test_z5_new_session_thread_emits_commands_update(tmp_path: Path) -> None:
+    """``session/new`` for a thread session also pushes ``available_commands_update``."""
+    proj, _home = _migrate_home(tmp_path)
+    captured, conn = _capturing_conn()
+    agent = MiniOrkAcpAgent()
+    agent.on_connect(conn)
+    resp = asyncio.run(agent.new_session(cwd=str(proj)))
+    assert resp.session_id.startswith("orch-")
+    assert _commands_updates(captured), (
+        f"expected an AvailableCommandsUpdate for a thread session, got {captured!r}"
+    )
+
+
+def test_z5_load_session_run_emits_commands_update(tmp_path: Path) -> None:
+    """``session/load`` re-announces the command list (run session)."""
+    proj, home = _migrate_home(tmp_path)
+    run_id = "run-z5-load-001"
+    _seed_run(home, run_id, status="published", kickoff_text="# Z5 load\n")
+    captured, conn = _capturing_conn()
+    agent = MiniOrkAcpAgent()
+    agent.on_connect(conn)
+    asyncio.run(agent.load_session(cwd=str(proj), session_id=run_id))
+    assert _commands_updates(captured), "load_session did not emit commands"
+
+
+def test_z5_prompt_slash_status_run_returns_end_turn(tmp_path: Path) -> None:
+    """A leading ``/status`` in a run session returns ``end_turn`` and never launches."""
+    proj, home = _migrate_home(tmp_path)
+    run_id = "run-z5-status-001"
+    _seed_run(home, run_id, status="published", kickoff_text="# Z5 status\n")
+    captured, conn = _capturing_conn()
+    launches: list[str] = []
+
+    def fake_launcher(rid: str, text: str) -> dict:
+        launches.append(rid)
+        return {"ok": True, "run_id": rid}
+
+    agent = MiniOrkAcpAgent(launcher=fake_launcher)
+    agent.on_connect(conn)
+    resp = asyncio.run(
+        agent.prompt(run_id, [_text_block("/status")])
+    )
+    assert resp.stop_reason == "end_turn"
+    assert launches == [], f"launcher should NOT run for a slash command, got {launches}"
+    # The handler emitted one ``agent_message_chunk`` carrying the status body.
+    chunks = [u for u in captured if isinstance(u, AgentMessageChunk)]
+    assert chunks, f"expected a chunk, got {captured!r}"
+
+
+def test_z5_prompt_unknown_slash_answers_without_launch(tmp_path: Path) -> None:
+    """An unknown ``/foo`` returns the fixed one-liner and never launches."""
+    proj, _home = _migrate_home(tmp_path)
+    captured, conn = _capturing_conn()
+    launches: list[str] = []
+
+    def fake_launcher(rid: str, text: str) -> dict:
+        launches.append(rid)
+        return {"ok": True, "run_id": rid}
+
+    agent = MiniOrkAcpAgent(launcher=fake_launcher)
+    agent.on_connect(conn)
+    resp = asyncio.run(
+        agent.new_session(cwd=str(proj), run_id="run-z5-foo")
+    )
+    sid = resp.session_id
+    captured.clear()
+    resp2 = asyncio.run(agent.prompt(sid, [_text_block("/foo")]))
+    assert resp2.stop_reason == "end_turn"
+    assert launches == [], "unknown /foo must not launch"
+    chunks = [u for u in captured if isinstance(u, AgentMessageChunk)]
+    assert chunks
+    assert "/help lists commands" in chunks[0].content.text
+
+
+def test_z5_prompt_normal_text_still_launches(tmp_path: Path) -> None:
+    """A normal (non-slash) prompt in a run session still goes to the launcher."""
+    proj, _home = _migrate_home(tmp_path)
+    launches: list[tuple[str, str]] = []
+
+    def fake_launcher(rid: str, text: str) -> dict:
+        launches.append((rid, text))
+        return {"ok": True, "run_id": rid}
+
+    def fake_reader(rid: str) -> dict:
+        return {"status": "published", "events": [], "llm_calls": []}
+
+    agent = MiniOrkAcpAgent(launcher=fake_launcher, reader=fake_reader)
+    resp = asyncio.run(
+        agent.prompt("run-z5-norm", [_text_block("fix the bug")])
+    )
+    assert resp.stop_reason == "end_turn"
+    assert launches == [("run-z5-norm", "fix the bug")]
+
+
+def test_z5_prompt_slash_run_still_launches(tmp_path: Path) -> None:
+    """``/run fix x`` in a THREAD session falls through ``_strip_slash_run``.
+
+    The carve-out is thread-only (run sessions launch any leading ``/`` text as
+    the kickoff body). Verify the thread branch still strips ``/run `` and
+    passes the remainder to the launcher.
+    """
+    proj, _home = _migrate_home(tmp_path)
+    launches: list[tuple[str, str]] = []
+
+    def fake_launcher(rid: str, text: str) -> dict:
+        launches.append((rid, text))
+        return {"ok": True, "run_id": rid}
+
+    def fake_reader(rid: str) -> dict:
+        return {"status": "published", "events": [], "llm_calls": []}
+
+    agent = MiniOrkAcpAgent(launcher=fake_launcher, reader=fake_reader)
+    new = asyncio.run(agent.new_session(cwd=str(proj)))
+    thread_id = new.session_id
+    resp = asyncio.run(
+        agent.prompt(thread_id, [_text_block("/run fix x")])
+    )
+    assert resp.stop_reason == "end_turn"
+    assert launches, "launcher must run for /run in a thread"
+    assert launches[0][1] == "fix x", (
+        f"expected kickoff body 'fix x', got {launches[0][1]!r}"
+    )
+
+
+def test_z5_loaded_session_slash_status_returns_end_turn(tmp_path: Path) -> None:
+    """A loaded (attached) run session must respond to ``/status`` (kickoff §3)."""
+    proj, home = _migrate_home(tmp_path)
+    run_id = "run-z5-loaded"
+    _seed_run(home, run_id, status="executing", kickoff_text="# Z5 loaded\n")
+    agent = MiniOrkAcpAgent()
+    agent.on_connect(_capturing_conn()[1])
+    asyncio.run(agent.load_session(cwd=str(proj), session_id=run_id))
+    captured, conn = _capturing_conn()
+    agent2 = MiniOrkAcpAgent()
+    agent2.on_connect(conn)
+    # The second agent shares the same dispatch flow; ``load_session`` already
+    # marked ``run_id`` as loaded — a follow-up prompt must short-circuit to
+    # the slash handler before the refusal text.
+    agent2._loaded.add(run_id)
+    agent2._sessions[run_id] = str(proj)
+    resp = asyncio.run(
+        agent2.prompt(run_id, [_text_block("/status")])
+    )
+    assert resp.stop_reason == "end_turn"
+    assert any(
+        "Unknown command" not in (getattr(u, "content", None).text if getattr(u, "content", None) else "")
+        for u in captured
+        if isinstance(u, AgentMessageChunk)
+    )
+
+
+def test_z5_thread_slash_status_uses_thread_runs(tmp_path: Path) -> None:
+    """A ``/status`` in a thread with a recent run reports that run."""
+    proj, home = _migrate_home(tmp_path)
+    run_id = "run-z5-thr-001"
+    _seed_run(home, run_id, status="published", kickoff_text="# Z5 thread\n")
+    agent = MiniOrkAcpAgent()
+    agent.on_connect(_capturing_conn()[1])
+    new = asyncio.run(agent.new_session(cwd=str(proj)))
+    thread_id = new.session_id
+    agent._thread_runs.setdefault(thread_id, []).append(run_id)
+    captured, conn = _capturing_conn()
+    agent.on_connect(conn)
+    resp = asyncio.run(agent.prompt(thread_id, [_text_block("/status")]))
+    assert resp.stop_reason == "end_turn"
+    chunks = [u for u in captured if isinstance(u, AgentMessageChunk)]
+    assert chunks
+    assert run_id in chunks[0].content.text
+
+
+def test_z5_thread_no_run_says_so(tmp_path: Path) -> None:
+    """A thread with no run yet says so on ``/status``."""
+    proj, _home = _migrate_home(tmp_path)
+    agent = MiniOrkAcpAgent()
+    agent.on_connect(_capturing_conn()[1])
+    new = asyncio.run(agent.new_session(cwd=str(proj)))
+    thread_id = new.session_id
+    captured, conn = _capturing_conn()
+    agent.on_connect(conn)
+    resp = asyncio.run(agent.prompt(thread_id, [_text_block("/status")]))
+    assert resp.stop_reason == "end_turn"
+    chunks = [u for u in captured if isinstance(u, AgentMessageChunk)]
+    assert chunks
+    assert "No run in this thread yet" in chunks[0].content.text
+
+
+def test_z5_thread_slash_does_not_record_prompt(tmp_path: Path) -> None:
+    """A slash command must NOT land in the thread's user-prompt replay."""
+    proj, _home = _migrate_home(tmp_path)
+    agent = MiniOrkAcpAgent()
+    agent.on_connect(_capturing_conn()[1])
+    new = asyncio.run(agent.new_session(cwd=str(proj)))
+    thread_id = new.session_id
+    captured, conn = _capturing_conn()
+    agent.on_connect(conn)
+    asyncio.run(agent.prompt(thread_id, [_text_block("/status")]))
+    # No UserMessageChunk should have been emitted for the slash prompt —
+    # commands are read-only by contract and don't pollute replay.
+    user_chunks = [
+        u for u in captured
+        if isinstance(u, UserMessageChunk)
+        and "user_message_chunk" == getattr(u, "session_update", "")
+    ]
+    # The new_session path itself may emit one; the slash prompt must NOT add
+    # another user_message_chunk with ``/status`` text.
+    status_text = [u for u in user_chunks if "/status" in (u.content.text or "")]
+    assert status_text == [], (
+        f"slash prompt leaked into user replay: {status_text}"
+    )
+
+
+def test_a_thread_command_is_recorded_with_its_reply(tmp_path):
+    """Reopening a thread replays '/runs' and its answer together, not an
+    answer to nothing."""
+    from mini_ork.acp.threads import ThreadStore
+
+    proj = tmp_path / "proj"
+    (proj / ".mini-ork").mkdir(parents=True)
+    agent, thread = _thread_agent(proj)
+    agent.on_connect(_SidConn())
+    asyncio.run(agent.prompt(thread, [_text_block("/lanes")]))
+    records = ThreadStore(proj / ".mini-ork").read(thread)
+    kinds = [(r["type"], r.get("text") or r.get("update", {}).get("sessionUpdate")) for r in records
+             if r["type"] in ("user", "update")]
+    i = kinds.index(("user", "/lanes"))
+    assert ("update", "agent_message_chunk") in kinds[i + 1:]

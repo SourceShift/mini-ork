@@ -42,6 +42,7 @@ from acp.schema import (
     AgentCapabilities,
     AgentMessageChunk,
     AgentThoughtChunk,
+    AvailableCommandsUpdate,
     ConfigOptionUpdate,
     ContentToolCallContent,
     Cost,
@@ -71,6 +72,7 @@ from acp.schema import (
     UserMessageChunk,
 )
 
+from mini_ork.acp import commands as _commands
 from mini_ork.acp import diffs as _diffs
 from mini_ork.acp import history
 from mini_ork.acp import orchestration as _orchestration
@@ -283,6 +285,13 @@ class MiniOrkAcpAgent:
         # thread session id → {"orchestrator" | run id: cost USD}; the thread
         # reports one cumulative cost instead of the latest run's.
         self._thread_costs: dict[str, dict[str, float]] = {}
+        # thread session id → ordered list of run ids this thread has followed
+        # (Z5). Append sites: ``_start_child_follow`` and ``_prompt_thread_direct``.
+        # Rebuild site: ``_load_thread_session`` scans the replayed
+        # ``ToolCallStart`` updates whose ``tool_call_id`` ends with ``:parent``.
+        # Commands that act on a run resolve the "current run" to ``runs[-1]``
+        # unless the user typed an explicit run id.
+        self._thread_runs: dict[str, list[str]] = {}
         # thread session id → last cost total sent (each poll re-reports usage).
         self._usage_sent: dict[str, float] = {}
         # thread session ids that have already received their first user
@@ -356,6 +365,7 @@ class MiniOrkAcpAgent:
             recipe = str(kwargs.get("recipe") or "").strip() or self._recipe
             self._sessions[run_id] = cwd
             self._recipes[run_id] = recipe
+            await self._emit_available_commands(run_id)
             return NewSessionResponse(session_id=run_id, field_meta={"run_id": run_id})
         # Thread session (Z9c-1). The session id is NOT a run id; it carries
         # the thread config (mode / model / recipe) plus the persisted claude
@@ -384,6 +394,7 @@ class MiniOrkAcpAgent:
                 "recipe": self._thread_config[thread_id]["recipe"],
             },
         )
+        await self._emit_available_commands(thread_id)
         return NewSessionResponse(
             session_id=thread_id,
             modes=modes,
@@ -789,6 +800,7 @@ class MiniOrkAcpAgent:
         await self._emit_diff_update_for_loaded_run(session_id, snapshot)
         if snapshot.get("status") not in TERMINAL_STATUSES:
             self._followers[session_id] = asyncio.create_task(self._follow(session_id))
+        await self._emit_available_commands(session_id)
         return LoadSessionResponse()
 
     async def prompt(
@@ -800,6 +812,15 @@ class MiniOrkAcpAgent:
         del kwargs
         if not _is_safe_token(session_id):
             return PromptResponse(stop_reason="refusal")
+        # Z5: slash-command short-circuit. This MUST land before the
+        # ``_loaded`` early-return below so commands work in attached
+        # sessions too (kickoff: "applies to new and loaded sessions alike").
+        # ``/run`` keeps flowing through ``_strip_slash_run`` further down.
+        text = _extract_prompt_text(prompt)
+        if text and text.startswith("/"):
+            cmd_resp = await self._dispatch_slash(session_id, text)
+            if cmd_resp is not None:
+                return cmd_resp
         if session_id in self._loaded:
             # Loaded (attached) sessions never launch: the run already exists.
             # Stream status context and end the turn immediately.
@@ -924,6 +945,11 @@ class MiniOrkAcpAgent:
             # end_turn, not refusal: the thread goes on (Zed rewinds a refused prompt).
             return PromptResponse(stop_reason="end_turn")
         self._routes[new_run_id] = (session_id, f"{new_run_id}:")
+        # Z5: track this run under the thread BEFORE the marker is emitted so
+        # a re-load that re-emits the same marker finds the run already
+        # recorded (``_load_thread_session`` rebuilds from the marker and
+        # would dedupe-by-id).
+        self._thread_runs.setdefault(session_id, []).append(new_run_id)
         await self._open_run_marker(session_id, new_run_id, recipe)
         self._direct_runs[session_id] = new_run_id
         try:
@@ -1087,6 +1113,12 @@ class MiniOrkAcpAgent:
             child_run_id, self._sessions.get(parent_session_id) or os.getcwd()
         )
         self._routes[child_run_id] = (parent_session_id, f"{child_run_id}:")
+        # Z5: track the child run under its parent thread so a later
+        # ``/status`` (no run-id) returns the most-recent orchestrator child.
+        # Mirrors the append in ``_prompt_thread_direct``.
+        runs = self._thread_runs.setdefault(parent_session_id, [])
+        if child_run_id not in runs:
+            runs.append(child_run_id)
         await self._open_run_marker(parent_session_id, child_run_id, recipe)
         self._followers[child_run_id] = asyncio.create_task(
             self._follow_child(parent_session_id, child_run_id)
@@ -1800,6 +1832,79 @@ class MiniOrkAcpAgent:
             or os.path.join(os.getcwd(), ".mini-ork")
         )
 
+    # ── slash-command wiring (Z5) ─────────────────────────────────────────────
+
+    async def _emit_available_commands(self, session_id: str) -> None:
+        """Announce the slash-command table to the client for ``session_id``.
+
+        Called after ``session/new`` and after ``session/load`` (run + thread).
+        Errors are swallowed: a missing ACP SDK or a connection that has not
+        been bound yet must not break session creation / load.
+        """
+        try:
+            await self._emit(
+                session_id,
+                AvailableCommandsUpdate(
+                    session_update="available_commands_update",
+                    available_commands=_commands.COMMANDS,
+                ),
+            )
+        except Exception:  # noqa: BLE001 — announcement is best-effort
+            pass
+
+    async def _dispatch_slash(
+        self, session_id: str, text: str
+    ) -> PromptResponse | None:
+        """Route a leading-``/`` prompt to a slash handler.
+
+        Returns ``None`` when the prompt is not a slash command (so the
+        caller falls through to the normal session-type routing). Returns
+        ``PromptResponse(stop_reason="end_turn")`` after dispatching a
+        known non-``run`` command or replying to an unknown one. ``/run``
+        is intentionally NOT handled here — it stays in the existing
+        ``_strip_slash_run`` flow so the recipe picker stays canonical.
+        """
+        stripped = text.strip()
+        if not stripped.startswith("/"):
+            return None
+        # ``/word arg1 arg2`` — split on the first whitespace after ``/``.
+        body = stripped[1:]
+        if not body:
+            return None
+        parts = body.split(None, 1)
+        name = parts[0]
+        arg = parts[1] if len(parts) > 1 else ""
+        # ``/run`` is preserved by the existing carve-out (threads) and by
+        # the run-session launcher (the run id IS the session id); the
+        # command table advertises it but it is never dispatched here.
+        if name == "run":
+            return None
+        if session_id in self._thread_sessions:
+            # Keep the command with its reply in the thread's log, so a
+            # reopened thread replays both (the reply is recorded by _emit).
+            self._record(session_id, {"type": "user", "text": stripped})
+        if name not in _commands.HANDLERS:
+            await self._emit(
+                session_id,
+                AgentMessageChunk(
+                    session_update="agent_message_chunk",
+                    content=TextContentBlock(
+                        type="text",
+                        text=f"Unknown command /{name} — /help lists commands.",
+                    ),
+                ),
+            )
+            return PromptResponse(stop_reason="end_turn")
+        markdown = await _commands.handle(self, session_id, name, arg)
+        await self._emit(
+            session_id,
+            AgentMessageChunk(
+                session_update="agent_message_chunk",
+                content=TextContentBlock(type="text", text=markdown),
+            ),
+        )
+        return PromptResponse(stop_reason="end_turn")
+
     # ── thread-store helpers (Z9c-2) ─────────────────────────────────────────
 
     def _thread_store(self, thread_id: str) -> ThreadStore:
@@ -1935,6 +2040,16 @@ class MiniOrkAcpAgent:
                 tool_call_id = str(getattr(update, "tool_call_id", "") or "")
                 if isinstance(update, ToolCallStart) and tool_call_id.endswith(":parent"):
                     run_id = tool_call_id[: -len(":parent")]
+                    # Z5: rebuild ``_thread_runs`` from the replayed markers
+                    # in order so a re-loaded thread sees the same
+                    # most-recent run as the live session that wrote them.
+                    # Dedup: append only the first time we see a run id —
+                    # the load's marker replay and any subsequent replay
+                    # of the same marker would otherwise duplicate.
+                    if _is_safe_token(run_id):
+                        runs = self._thread_runs.setdefault(session_id, [])
+                        if run_id not in runs:
+                            runs.append(run_id)
                     if _is_safe_token(run_id) and not await self._replay_run_in_thread(
                         session_id, run_id, cwd
                     ):
@@ -1948,6 +2063,7 @@ class MiniOrkAcpAgent:
                 self._followers[run_id] = asyncio.create_task(
                     self._follow_child(session_id, run_id)
                 )
+        await self._emit_available_commands(session_id)
         return LoadSessionResponse(
             config_options=cast(Any, self._current_config_options(session_id)),
             modes=self._build_session_modes(session_id),
