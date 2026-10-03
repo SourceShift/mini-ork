@@ -48,6 +48,10 @@ def repo(tmp_path: Path) -> dict:
         "MINI_ORK_OWNERSHIP_FILE": str(worktrees / ".ownership"),
         # Never register throwaway test worktrees with a live ContextNest.
         "MO_CONCORD": "0",
+        # `merge` rebases onto a moved origin/main, which writes commits. CI runners have no
+        # git identity (empty passwd name), so the script's own git calls need one.
+        "GIT_AUTHOR_NAME": "mo-test", "GIT_AUTHOR_EMAIL": "mo-test@example.invalid",
+        "GIT_COMMITTER_NAME": "mo-test", "GIT_COMMITTER_EMAIL": "mo-test@example.invalid",
     }
     return {"origin": origin, "clone": clone, "worktrees": worktrees, "env": env}
 
