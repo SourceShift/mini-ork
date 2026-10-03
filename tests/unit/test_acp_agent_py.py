@@ -42,6 +42,7 @@ from acp.schema import (  # noqa: E402
     UsageUpdate,
     UserMessageChunk,
 )
+from acp import RequestError  # noqa: E402
 
 from mini_ork.acp.agent import MiniOrkAcpAgent, mint_run_id  # noqa: E402
 
@@ -3183,3 +3184,141 @@ def test_missing_plan_json_in_run_emits_no_plan_update(tmp_path: Path) -> None:
     asyncio.run(agent._project_snapshot(run_id, snapshot))
 
     assert _plan_updates(captured) == [], [u for u in captured]
+
+
+# ── Z10: terminal-auth setup (kickoff §agent.py) ─────────────────────────────
+
+
+@pytest.fixture(autouse=True)
+def _skip_setup_check(monkeypatch):
+    """Existing tests would otherwise hit the real ``claude auth status``
+    call from the new ``new_session`` thread branch; the kickoff calls this
+    out as opt-out via the env var.
+    """
+    monkeypatch.setenv("MO_ACP_SKIP_SETUP_CHECK", "1")
+    yield
+
+
+def test_initialize_advertises_terminal_auth_method():
+    """``initialize`` advertises one TerminalAuthMethod (args=['acp','--setup'])."""
+    agent = MiniOrkAcpAgent()
+    resp = asyncio.run(agent.initialize(protocol_version=1))
+    methods = list(getattr(resp, "auth_methods", []) or [])
+    assert len(methods) == 1
+    method = methods[0]
+    # Pydantic models expose ``type`` discriminator; the canonical id is
+    # ``mini-ork-setup`` and the args literally route to ``acp --setup``.
+    assert getattr(method, "id", None) == "mini-ork-setup"
+    assert list(getattr(method, "args", []) or []) == ["acp", "--setup"]
+
+
+def test_authenticate_succeeds_when_readiness_passes(tmp_path, monkeypatch):
+    """``authenticate('mini-ork-setup')`` returns AuthenticateResponse on pass."""
+    from acp.schema import AuthenticateResponse as _AuthResp
+
+    from mini_ork.acp import agent as agent_mod
+    from mini_ork.acp import setup as acp_setup
+
+    monkeypatch.setattr(agent_mod, "_SETUP_PASS_CACHE", {})
+    monkeypatch.setattr(acp_setup, "_run", lambda *a, **k: _FakeProc(0, stdout='{"loggedIn": true}'))
+    monkeypatch.setattr(acp_setup.shutil, "which", lambda name: "/usr/bin/claude")
+    monkeypatch.setenv("MO_ACP_SKIP_SETUP_CHECK", "1")
+
+    agent = MiniOrkAcpAgent()
+    resp = asyncio.run(agent.authenticate("mini-ork-setup"))
+    assert isinstance(resp, _AuthResp)
+
+
+def test_authenticate_raises_auth_required_when_readiness_fails(tmp_path, monkeypatch):
+    """Failing orchestrator check raises ``RequestError.auth_required``."""
+    from mini_ork.acp import agent as agent_mod
+    from mini_ork.acp import setup as acp_setup
+
+    monkeypatch.setattr(agent_mod, "_SETUP_PASS_CACHE", {})
+    monkeypatch.setattr(acp_setup.shutil, "which", lambda name: None)
+    monkeypatch.setenv("MO_ACP_SKIP_SETUP_CHECK", "1")
+
+    agent = MiniOrkAcpAgent()
+    with pytest.raises(RequestError) as excinfo:
+        asyncio.run(agent.authenticate("mini-ork-setup"))
+    # The kickoff contract: failure surfaces as ``auth_required`` so the
+    # editor offers the terminal-auth setup.
+    assert excinfo.value.code == RequestError.auth_required({}).code
+
+
+def test_authenticate_rejects_unknown_method_id():
+    agent = MiniOrkAcpAgent()
+    with pytest.raises(RequestError):
+        asyncio.run(agent.authenticate("not-a-real-method"))
+
+
+def test_thread_new_session_raises_when_orchestrator_check_fails(monkeypatch):
+    """Gate fires when ``MO_ACP_SKIP_SETUP_CHECK`` is unset and orchestrator fails."""
+    from mini_ork.acp import agent as agent_mod
+    from mini_ork.acp import setup as acp_setup
+
+    monkeypatch.delenv("MO_ACP_SKIP_SETUP_CHECK", raising=False)
+    monkeypatch.setattr(agent_mod, "_SETUP_PASS_CACHE", {})
+    monkeypatch.setattr(acp_setup.shutil, "which", lambda name: None)
+
+    agent = MiniOrkAcpAgent()
+    with pytest.raises(RequestError):
+        # Thread session (no client-minted run_id) — must trip the gate.
+        asyncio.run(agent.new_session(cwd="/tmp/proj"))
+
+
+def test_thread_new_session_skips_gate_when_env_opt_out(monkeypatch):
+    """``MO_ACP_SKIP_SETUP_CHECK=1`` disables the gate; thread session proceeds."""
+    monkeypatch.setenv("MO_ACP_SKIP_SETUP_CHECK", "1")
+    from unittest.mock import patch
+
+    fake_lanes = [{"id": "opus", "name": "Opus"}]
+    fake_recipes = ["code-fix"]
+    with patch(
+        "mini_ork.acp_orchestrator.config.orchestrator_lanes",
+        return_value=fake_lanes,
+    ), patch(
+        "mini_ork.web.recipes.list_recipes",
+        return_value=fake_recipes,
+    ):
+        agent = MiniOrkAcpAgent()
+        resp = asyncio.run(agent.new_session(cwd="/tmp/proj"))
+    assert resp.session_id.startswith("orch-")
+
+
+# ── helpers for the new tests ───────────────────────────────────────────────
+
+
+class _FakeProc:
+    def __init__(self, returncode: int = 0, stdout: str = "", stderr: str = ""):
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+def test_thread_new_session_passes_and_caches_the_setup_check(tmp_path, monkeypatch):
+    """A passing orchestrator check opens the thread and is reused: the second
+    thread in the same project does not run `claude auth status` again."""
+    from unittest.mock import patch
+
+    from mini_ork.acp import agent as agent_mod
+    from mini_ork.acp.setup import Check
+
+    monkeypatch.delenv("MO_ACP_SKIP_SETUP_CHECK", raising=False)
+    monkeypatch.setattr(agent_mod, "_SETUP_PASS_CACHE", {})
+    calls: list[str] = []
+
+    def readiness(cwd):
+        calls.append(cwd)
+        return [Check("project", True, "ok"), Check("orchestrator", True, "ok"), Check("lanes", True, "ok")]
+
+    monkeypatch.setattr(agent_mod, "_setup_readiness_for_thread", readiness)
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    with patch("mini_ork.acp_orchestrator.config.orchestrator_lanes", return_value=[{"id": "opus", "name": "Opus"}]), \
+         patch("mini_ork.web.recipes.list_recipes", return_value=["docs"]):
+        agent = MiniOrkAcpAgent()
+        first = asyncio.run(agent.new_session(cwd=str(proj)))
+        second = asyncio.run(agent.new_session(cwd=str(proj)))
+    assert first.session_id.startswith("orch-") and second.session_id.startswith("orch-")
+    assert len(calls) == 1

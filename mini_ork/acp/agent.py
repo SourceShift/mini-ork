@@ -43,6 +43,7 @@ from acp.schema import (
     AgentMessageChunk,
     AgentPlanUpdate,
     AgentThoughtChunk,
+    AuthenticateResponse,
     AvailableCommandsUpdate,
     ConfigOptionUpdate,
     ContentToolCallContent,
@@ -67,6 +68,7 @@ from acp.schema import (
     SetSessionConfigOptionResponse,
     SetSessionModeResponse,
     StopReason,
+    TerminalAuthMethod,
     TextContentBlock,
     ToolCallProgress,
     ToolCallStart,
@@ -101,6 +103,39 @@ _CANCEL_ESCALATE_S = float(os.environ.get("MO_ACP_CANCEL_GRACE", "3.0"))
 # refused". Without it, a launcher that exits before publishing a task_run row
 # (bad interpreter, missing venv, ...) leaves _await_terminal polling forever.
 _START_TIMEOUT_S = float(os.environ.get("MO_ACP_START_TIMEOUT_S", "300"))
+# Opt-out for the new_session thread-branch setup gate. Read at call time
+# (not at import time) so tests can flip the env var via an autouse fixture
+# and existing module tests do not hit the real ``claude auth status --json``
+# call. Default: gate enabled. Set ``MO_ACP_SKIP_SETUP_CHECK=1`` to disable.
+# Per-cwd cache of the last orchestrator-check pass timestamp (epoch seconds).
+# A passing result is cached for ``_SETUP_PASS_TTL_S`` so we don't pay the
+# ``claude auth status`` call on every thread start.
+_SETUP_PASS_TTL_S = 600
+_SETUP_PASS_CACHE: dict[str, float] = {}
+
+# ACP terminal-auth method id and args (kickoff §agent.py). The Registry
+# greps for this literal id; do not rename without touching the registry.
+_SETUP_METHOD_ID = "mini-ork-setup"
+_SETUP_METHOD_ARGS = ["acp", "--setup"]
+
+
+def _setup_readiness_for_thread(cwd: str):
+    """Return the readiness checks for ``Path(cwd)`` (thread-branch helper).
+
+    Module-level so ``asyncio.to_thread`` can call it without binding to the
+    instance. Importing the setup module here is fine — it has no dependency
+    on this file.
+    """
+    from mini_ork.acp.setup import readiness
+
+    return readiness(Path(cwd))
+
+
+def _setup_readiness(cwd: Path):
+    """Return readiness for ``Path`` (authenticate helper, unit-test seam)."""
+    from mini_ork.acp.setup import readiness
+
+    return readiness(cwd)
 
 # Reported context-window size ("size" in UsageUpdate). mini-ork has no per-call
 # context column in llm_calls, so the projection reports a fixed window.
@@ -354,7 +389,41 @@ class MiniOrkAcpAgent:
                 load_session=True,
                 session_capabilities=SessionCapabilities(list=SessionListCapabilities()),
             ),
+            auth_methods=[
+                TerminalAuthMethod(
+                    type="terminal",
+                    id=_SETUP_METHOD_ID,
+                    name="Set up mini-ork",
+                    description=(
+                        "Check the project, the orchestrator's Claude login and "
+                        "the worker lanes' keys, and fix what is missing."
+                    ),
+                    args=_SETUP_METHOD_ARGS,
+                    env={},
+                ),
+            ],
         )
+
+    async def authenticate(self, method_id: str, **kwargs: Any) -> AuthenticateResponse:
+        """Resolve the ``auth_methods`` advertised by ``initialize``.
+
+        Unknown ``method_id`` → invalid params. Known method → run readiness in
+        a background thread; on success return an empty ``AuthenticateResponse``
+        (Zed proceeds to ``session/new``), on failure raise
+        ``RequestError.auth_required`` so Zed offers the setup terminal.
+        """
+        del kwargs
+        if method_id != _SETUP_METHOD_ID:
+            raise RequestError.invalid_params(
+                {"message": f"unknown auth method: {method_id!r}"}
+            )
+        cwd = Path(self._resolve_home()).parent
+        checks = await asyncio.to_thread(_setup_readiness, cwd)
+        failing = [c for c in checks if not c.ok]
+        if not failing:
+            return AuthenticateResponse()
+        lines = [f"✗ {c.name} — {c.detail}" for c in failing]
+        raise RequestError.auth_required({"message": "\n".join(lines)})
 
     async def new_session(
         self,
@@ -380,6 +449,14 @@ class MiniOrkAcpAgent:
         # the thread config (mode / model / recipe) plus the persisted claude
         # session id (set on first orchestrator turn). The three pickers are
         # Zed-rendered via ``category="model" | "mode"``.
+        # Z10: when the orchestrator's Claude login is absent, raise
+        # ``auth_required`` so Zed offers the ``mini-ork acp --setup`` terminal.
+        # Project / lanes checks do NOT block a thread — direct-mode runs
+        # report their own errors. Cache a passing result per cwd for
+        # ``_SETUP_PASS_TTL_S`` so the ``claude auth status`` call is amortised.
+        # Opt-out: set ``MO_ACP_SKIP_SETUP_CHECK=1`` (default for unit tests).
+        if os.environ.get("MO_ACP_SKIP_SETUP_CHECK") != "1":
+            await self._enforce_thread_setup(cwd)
         thread_id = _mint_thread_id()
         self._sessions[thread_id] = cwd
         self._thread_sessions.add(thread_id)
@@ -453,6 +530,35 @@ class MiniOrkAcpAgent:
             return default_lane(home)
         except Exception:  # noqa: BLE001 — picker must never crash new_session
             return "opus"
+
+    async def _enforce_thread_setup(self, cwd: str) -> None:
+        """Run ``setup.readiness`` for ``cwd``'s orchestrator check, gated.
+
+        Only the ``orchestrator`` check blocks a thread (direct-mode runs
+        report their own errors). A passing result is cached per cwd for
+        ``_SETUP_PASS_TTL_S`` so the ``claude auth status`` call is amortised.
+        Failure raises ``RequestError.auth_required`` so the editor offers the
+        terminal-auth setup. The cache key is the raw cwd string (the
+        orchestrator's notion of home — ``<cwd>/.mini-ork`` — is what
+        ``setup.readiness`` resolves to anyway).
+        """
+        now = time.monotonic()
+        last = _SETUP_PASS_CACHE.get(cwd)
+        if last is not None and (now - last) < _SETUP_PASS_TTL_S:
+            return
+        checks = await asyncio.to_thread(_setup_readiness_for_thread, cwd)
+        for c in checks:
+            if c.name == "orchestrator" and not c.ok:
+                raise RequestError.auth_required(
+                    {
+                        "message": (
+                            f"✗ orchestrator — {c.detail}\n  fix: {c.fix}"
+                            if c.fix
+                            else f"✗ orchestrator — {c.detail}"
+                        )
+                    }
+                )
+        _SETUP_PASS_CACHE[cwd] = now
 
     def _build_config_options(
         self, session_id: str, home: Path
