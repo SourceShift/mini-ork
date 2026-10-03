@@ -68,6 +68,7 @@ _NATIVE_MODULE_SUBS = {
     "watchdog": "mini_ork.orchestration.watchdog",
     "acp": "mini_ork.cli.acp_cmd",
     "mcp-context": "mini_ork.cli.mcp_context_cmd",
+    "zed": "mini_ork.cli.zed_cmd",
     "calibrate": "mini_ork.cli.calibrate",
     "collapse-check": "mini_ork.cli.collapse",
     "collapse-precursor": "mini_ork.cli.collapse_precursor",
@@ -126,6 +127,7 @@ Coordination:
   concord <sub>                  Cross-agent coordination client (run/ps/stop/send/inbox/ack)
   mcp-context                    Read-only stdio MCP server exposing runs, learnings,
                                    cost, and lanes (for agents in Zed etc.)
+  zed setup|status|uninstall     Wire (or unwire) mini-ork inside Zed's settings.json
 
 Provider credentials:
   providers status <lane>                    Safely show configured or missing credentials
