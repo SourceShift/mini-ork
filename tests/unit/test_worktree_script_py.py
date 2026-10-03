@@ -46,6 +46,8 @@ def repo(tmp_path: Path) -> dict:
         "MINI_ORK_ROOT": str(clone),
         "MINI_ORK_WORKTREES_DIR": str(worktrees),
         "MINI_ORK_OWNERSHIP_FILE": str(worktrees / ".ownership"),
+        # Never register throwaway test worktrees with a live ContextNest.
+        "MO_CONCORD": "0",
     }
     return {"origin": origin, "clone": clone, "worktrees": worktrees, "env": env}
 
@@ -159,3 +161,58 @@ def test_readme_claim_check_exits_zero_on_real_repo() -> None:
     )
     assert result.returncode == 0, result.stdout + result.stderr
     assert "CLEAN" in result.stdout
+
+
+class _ConcordStub:
+    """Records the coord principal calls the worktree script makes."""
+
+    def __init__(self) -> None:
+        import http.server
+        import json as _json
+        import threading
+        calls = self.calls = []
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def _rec(self):
+                n = int(self.headers.get("Content-Length") or 0)
+                body = _json.loads(self.rfile.read(n)) if n else None
+                calls.append((self.command, self.path, body))
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b"{}")
+
+            do_PUT = do_DELETE = _rec
+
+            def log_message(self, *a):
+                pass
+
+        self.srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+        self.url = f"http://127.0.0.1:{self.srv.server_address[1]}"
+
+
+def test_create_and_clean_register_the_worktree_principal_with_its_claims(repo: dict) -> None:
+    stub = _ConcordStub()
+    try:
+        env = {"MO_CONCORD": "1", "CN_BASE_URL": stub.url}
+        assert run_wt(repo, "create", "zeta", "--owns", "lib/x.sh", "--owns", "docs/",
+                      extra_env=env).returncode == 0
+        assert run_wt(repo, "clean", "zeta", extra_env=env).returncode == 0
+    finally:
+        stub.srv.shutdown()
+    puts = [c for c in stub.calls if c[0] == "PUT"]
+    dels = [c for c in stub.calls if c[0] == "DELETE"]
+    assert len(puts) == 1 and puts[0][1] == "/api/v1/coord/principals/agent%3Awt-zeta"
+    body = puts[0][2]
+    assert body["harness"] == "worktree" and body["worktree"].endswith("zeta")
+    assert body["labels"]["kind"] == "worktree"
+    assert body["labels"]["owns"] == ["lib/x.sh", "docs"]
+    assert [d[1] for d in dels] == ["/api/v1/coord/principals/agent%3Awt-zeta"]
+
+
+def test_concord_unreachable_never_blocks_create_or_clean(repo: dict) -> None:
+    env = {"MO_CONCORD": "1", "CN_BASE_URL": "http://127.0.0.1:9", "CN_COORD_TIMEOUT_SEC": "1"}
+    created = run_wt(repo, "create", "eta", "--owns", "lib/y.sh", extra_env=env)
+    assert created.returncode == 0, created.stderr
+    assert run_wt(repo, "clean", "eta", extra_env=env).returncode == 0

@@ -182,6 +182,34 @@ def list_owners(json_mode: bool) -> None:
         print("(no active claims)")
 
 
+# ── Concord registration (best-effort, fail-open) ─────────────────────────
+# A worktree is registered with ContextNest as principal agent:wt-<slug>, with
+# its --owns claims as labels, so the per-turn precheck can flag edits inside
+# the worktree that fall outside its claimed surface (Concord P2d, audit mode).
+# Inline urllib on purpose: this script stays standalone (no mini_ork import,
+# runs under the system python3 that `make` resolves).
+
+def _concord(method: str, principal: str, body: dict | None = None) -> None:
+    if os.environ.get("MO_CONCORD", "1") == "0":
+        return
+    import urllib.parse
+    import urllib.request
+    base = os.environ.get("CN_BASE_URL", "http://127.0.0.1:28080").rstrip("/")
+    url = f"{base}/api/v1/coord/principals/{urllib.parse.quote(principal, safe='')}"
+    data = json.dumps(body).encode() if body is not None else None
+    headers = {"Content-Type": "application/json"} if data is not None else {}
+    req = urllib.request.Request(url, data=data, method=method, headers=headers)
+    try:
+        timeout = float(os.environ.get("CN_COORD_TIMEOUT_SEC", "2"))
+        urllib.request.urlopen(req, timeout=timeout).read()
+    except Exception:
+        pass  # Concord must never block worktree create/clean
+
+
+def _worktree_principal(slug: str) -> str:
+    return f"agent:wt-{slug}"[:134]
+
+
 # ── commands ───────────────────────────────────────────────────────────────
 
 def create_worktree(slug: str, opts: list[str]) -> None:
@@ -226,6 +254,11 @@ def create_worktree(slug: str, opts: list[str]) -> None:
     if owns:
         register_ownership(safe_slug, owns)
         print(f"[mo-worktree] claimed: {' '.join(owns)}", file=sys.stderr)
+    _concord("PUT", _worktree_principal(safe_slug), {
+        "harness": "worktree", "cwd": wt, "worktree": wt,
+        "labels": {"kind": "worktree", "branch": branch,
+                   "owns": [normalize_path(c) for c in owns]},
+    })
     print(f"[mo-worktree] ready: {wt}  (branch {branch})")
 
 
@@ -272,6 +305,7 @@ def clean_worktree(slug_arg: str) -> None:
             git("-C", ROOT, "branch", "-d", branch, check=False,
                 capture=True)
     release_ownership(slug)
+    _concord("DELETE", _worktree_principal(slug))
     print(f"[mo-worktree] cleaned {slug}")
 
 
