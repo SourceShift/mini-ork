@@ -1723,3 +1723,588 @@ def test_thread_usage_is_sent_only_when_the_total_changes(tmp_path):
     asyncio.run(agent.prompt(thread, [_text_block("/run x")]))
     costs = [u.cost.amount for _, u in conn.sent if isinstance(u, UsageUpdate)]
     assert costs == [pytest.approx(0.1), pytest.approx(0.3)]
+
+
+# ── thread-session persistence (Z9c-2) ───────────────────────────────────
+
+
+def _thread_store_path(proj: Path, thread_id: str) -> Path:
+    return proj / ".mini-ork" / "acp-threads" / f"{thread_id}.jsonl"
+
+
+def _read_thread_records(proj: Path, thread_id: str) -> list[dict]:
+    """Load the persisted JSONL for ``thread_id`` as a list of records."""
+    import json as _json
+    path = _thread_store_path(proj, thread_id)
+    if not path.is_file():
+        return []
+    out = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            out.append(_json.loads(line))
+        except _json.JSONDecodeError:
+            continue
+    return out
+
+
+def test_thread_prompt_records_meta_config_user_claude_session_costs(tmp_path):
+    """One orchestrate turn with a start_run child writes the full record
+    sequence: meta, config (new_session), user, update, claude_session, costs.
+
+    The child run's internal updates are NOT recorded against the thread —
+    the routed ``_emit`` remap lands on a non-thread session id and the
+    outer guard in ``_record_thread_update`` filters them out.
+    """
+
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    (proj / ".mini-ork").mkdir()
+    child = "run-child-rec"
+
+    class _TurnResult:
+        session_id = "claude-rec-1"
+        rc = 0
+        text = "answer"
+        cost_usd = 0.1
+        error = ""
+
+    def turn(lane, prompt, cwd, home, resume, on_event):
+        async def _run():
+            for ev in _start_run_events(child):
+                await on_event(ev)
+            return _TurnResult()
+        return _run()
+
+    def reader(rid: str) -> dict:
+        if rid == child:
+            return {"status": "executing", "events": [], "llm_calls": []}
+        return {"status": None, "events": [], "llm_calls": []}
+
+    agent, thread = _thread_agent(proj, orchestrator_turn=turn, reader=reader)
+    agent.on_connect(_SidConn())
+    asyncio.run(agent.prompt(thread, [_text_block("kick off")]))
+    recs = _read_thread_records(proj, thread)
+    types = [r.get("type") for r in recs]
+    # meta + config written by new_session; user + update + claude_session + costs by the prompt.
+    assert types.count("meta") == 1
+    assert types.count("config") == 1
+    assert types.count("user") == 1
+    assert types.count("update") >= 1
+    assert types.count("claude_session") == 1
+    assert types.count("costs") >= 1
+    # The first prompt pushes a SessionInfoUpdate; it is NOT recorded (filter).
+    update_kinds = [
+        r["update"].get("sessionUpdate") for r in recs if r.get("type") == "update"
+    ]
+    assert "session_info_update" not in update_kinds
+    # ToolCallStart(:parent) IS recorded (it is emitted directly to the thread).
+    assert "tool_call" in update_kinds
+
+
+def test_first_prompt_emits_session_info_update_once(tmp_path):
+    """The first prompt of a thread pushes a SessionInfoUpdate; the second does not."""
+    from acp.schema import SessionInfoUpdate
+
+    proj = tmp_path / "proj"
+
+    class _TurnResult:
+        session_id = "sess-x"
+        rc = 0
+        text = ""
+        cost_usd = 0.0
+        error = ""
+
+    def turn(lane, prompt, cwd, home, resume, on_event):
+        async def _run():
+            return _TurnResult()
+        return _run()
+
+    agent, thread = _thread_agent(proj, orchestrator_turn=turn)
+    conn = _SidConn()
+    agent.on_connect(conn)
+    asyncio.run(agent.prompt(thread, [_text_block("first prompt")]))
+    asyncio.run(agent.prompt(thread, [_text_block("second prompt")]))
+    updates = [
+        u for _, u in conn.sent if isinstance(u, SessionInfoUpdate)
+    ]
+    assert len(updates) == 1
+    assert updates[0].title.startswith("first prompt")
+    # Loaded threads arrive with the flag already set, so a reload must
+    # not re-emit the title update.
+    sid = thread
+    agent._first_prompt_sent.add(sid)  # simulate load
+    conn.sent.clear()
+    asyncio.run(agent.prompt(thread, [_text_block("third")]))
+    assert not [u for _, u in conn.sent if isinstance(u, SessionInfoUpdate)]
+
+
+def test_set_config_option_records_full_config_on_change(tmp_path):
+    """Every accepted ``set_config_option`` writes one config record."""
+    from unittest.mock import patch
+
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    (proj / ".mini-ork").mkdir()
+    agent, thread = _thread_agent(proj)
+
+    with patch(
+        "mini_ork.acp_orchestrator.config.orchestrator_lanes",
+        return_value=[{"id": "opus", "name": "Opus"}],
+    ), patch(
+        "mini_ork.web.recipes.list_recipes", return_value=["code-fix"]
+    ):
+        asyncio.run(agent.set_config_option("model", thread, "opus"))
+        asyncio.run(agent.set_config_option("recipe", thread, "code-fix"))
+
+    recs = _read_thread_records(proj, thread)
+    configs = [r for r in recs if r.get("type") == "config"]
+    # new_session writes 1; two set_config_option calls add 2 more.
+    assert len(configs) == 3
+    # The most recent reflects both changes.
+    last = configs[-1]
+    assert last["mode"] == "orchestrate"
+    assert last["model"] == "opus"
+    assert last["recipe"] == "code-fix"
+
+
+def test_set_config_option_does_not_record_on_rejection(tmp_path):
+    """An invalid value never persists AND never writes a config record."""
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    (proj / ".mini-ork").mkdir()
+    agent, thread = _thread_agent(proj)
+    before = len(_read_thread_records(proj, thread))
+    try:
+        asyncio.run(agent.set_config_option("mode", thread, "hyperdrive"))
+    except Exception:
+        pass
+    after = len(_read_thread_records(proj, thread))
+    assert after == before
+
+
+def test_claude_session_record_only_written_when_id_changes(tmp_path):
+    """Two turns returning the SAME claude session id do NOT double-write."""
+
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    (proj / ".mini-ork").mkdir()
+
+    class _TurnResult:
+        session_id = "sess-stable"
+        rc = 0
+        text = ""
+        cost_usd = 0.0
+        error = ""
+
+    def turn(lane, prompt, cwd, home, resume, on_event):
+        async def _run():
+            return _TurnResult()
+        return _run()
+
+    agent, thread = _thread_agent(proj, orchestrator_turn=turn)
+    agent.on_connect(_SidConn())
+    asyncio.run(agent.prompt(thread, [_text_block("a")]))
+    asyncio.run(agent.prompt(thread, [_text_block("b")]))
+    recs = _read_thread_records(proj, thread)
+    cs = [r for r in recs if r.get("type") == "claude_session"]
+    assert len(cs) == 1
+    assert cs[0]["id"] == "sess-stable"
+
+
+def test_list_sessions_first_page_includes_threads_and_runs_sorted(tmp_path):
+    """First page = threads + runs sorted by ``updated_at`` desc; second
+    page = runs only (cursor stays bound to the run offset)."""
+
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    # Pre-populate the thread store with one thread so list_sessions sees it.
+    from mini_ork.acp.threads import ThreadStore
+    ThreadStore(proj / ".mini-ork").append(
+        "orch-1700000000-list",
+        {"type": "meta", "thread_id": "orch-1700000000-list", "cwd": str(proj)},
+    )
+    ThreadStore(proj / ".mini-ork").append(
+        "orch-1700000000-list",
+        {"type": "user", "text": "thread title"},
+    )
+
+    # Set up a run row by standing up a minimal state.db with a fake task_run.
+    from mini_ork.stores import migrate as mig
+    db_path = proj / ".mini-ork" / "state.db"
+    mig.init_db(str(db_path))
+    import sqlite3
+    con = sqlite3.connect(db_path)
+    con.execute(
+        "INSERT INTO task_runs(id, task_class, recipe, status, kickoff_path, "
+        "cost_usd, created_at, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            "run-list-1",
+            "code_fix",
+            "code-fix",
+            "published",
+            str(proj / ".mini-ork" / "runs-inbox" / "run-list-1.md"),
+            0.0,
+            1_700_000_100,
+            1_700_000_110,
+        ),
+    )
+    con.commit()
+    con.close()
+
+    agent = MiniOrkAcpAgent()
+    resp = asyncio.run(agent.list_sessions(cwd=str(proj)))
+    sids = [s.session_id for s in resp.sessions]
+    field_kinds = [s.field_meta.get("kind") for s in resp.sessions]
+    assert "orch-1700000000-list" in sids
+    assert "run-list-1" in sids
+    # First page has both kinds.
+    assert "thread" in field_kinds
+    # Newest first: thread has a fresh file mtime > the run's updated_at.
+    assert sids.index("orch-1700000000-list") < sids.index("run-list-1")
+    # Second page (cursor) is runs-only — threads are NOT prepended again.
+    resp2 = asyncio.run(agent.list_sessions(cwd=str(proj), cursor="50"))
+    sids2 = [s.session_id for s in resp2.sessions]
+    assert "orch-1700000000-list" not in sids2
+
+
+def test_load_session_replays_and_resumes_with_stored_id(tmp_path):
+    """A NEW agent instance can ``load_session`` the persisted thread:
+    replays user + message + tool_call + run marker + child lifecycle,
+    returns config options with the stored model, and the next prompt
+    passes the persisted claude session id as ``resume``."""
+    from unittest.mock import patch
+
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    (proj / ".mini-ork").mkdir()
+    child = "run-child-load"
+
+    class _TurnResult:
+        def __init__(self, session_id: str = "sess-load-1") -> None:
+            self.session_id = session_id
+            self.rc = 0
+            self.text = ""
+            self.cost_usd = 0.5
+            self.error = ""
+
+    seen: list[Any] = []
+
+    def turn_first(lane, prompt, cwd, home, resume, on_event):
+        async def _run():
+            for ev in _start_run_events(child):
+                await on_event(ev)
+            return _TurnResult()
+        return _run()
+
+    def reader(rid: str) -> dict:
+        if rid == child:
+            return {"status": "published", "events": [], "llm_calls": []}
+        return {"status": None, "events": [], "llm_calls": []}
+
+    with patch("mini_ork.acp_orchestrator.config.orchestrator_lanes",
+               return_value=[{"id": "opus", "name": "Opus"}]), \
+         patch("mini_ork.web.recipes.list_recipes", return_value=["code-fix"]):
+        # First agent: persist a turn.
+        agent1, thread = _thread_agent(proj, orchestrator_turn=turn_first, reader=reader)
+        agent1.on_connect(_SidConn())
+        asyncio.run(agent1.prompt(thread, [_text_block("hello")]))
+
+        # Force a terminal child snapshot so the replay can finish cleanly.
+        def reader2(rid: str) -> dict:
+            if rid == child:
+                return {"status": "published", "events": [], "llm_calls": []}
+            return {"status": None, "events": [], "llm_calls": []}
+
+        # Second agent: same home, fresh state. ``load_session`` replays.
+        agent2 = MiniOrkAcpAgent()
+        agent2.on_connect(_SidConn())
+        resp = asyncio.run(agent2.load_session(cwd=str(proj), session_id=thread))
+        assert resp.config_options is not None
+        model_opt = next(o for o in resp.config_options if o.id == "model")
+        assert model_opt.current_value == "opus"
+    # Re-run the load with a capturing conn to verify the replayed sequence.
+    with patch("mini_ork.acp_orchestrator.config.orchestrator_lanes",
+               return_value=[{"id": "opus", "name": "Opus"}]), \
+         patch("mini_ork.web.recipes.list_recipes", return_value=["code-fix"]):
+        agent3 = MiniOrkAcpAgent()
+        conn3 = _SidConn()
+        agent3.on_connect(conn3)
+        asyncio.run(agent3.load_session(cwd=str(proj), session_id=thread))
+        sent_sids = {sid for sid, _ in conn3.sent}
+        assert sent_sids == {thread}
+        types = [
+            type(u).__name__ for _, u in conn3.sent
+        ]
+        # user → message → tool_call(marker) → child lifecycle → usage
+        assert "UserMessageChunk" in types
+        assert "ToolCallStart" in types
+        assert "UsageUpdate" in types
+        # No SessionInfoUpdate (loaded thread marks first prompt).
+        assert "SessionInfoUpdate" not in types
+
+        # The next prompt passes the stored claude session id as ``resume``.
+        def turn_after(lane, prompt, cwd, home, resume, on_event):
+            async def _run():
+                seen.append(resume)
+                # Return a new id so the prompt round-trips; the agent
+                # should record a fresh claude_session because the id differs.
+                return _TurnResult(session_id="sess-load-2")
+            return _run()
+
+        with patch("mini_ork.acp_orchestrator.config.orchestrator_lanes",
+                   return_value=[{"id": "opus", "name": "Opus"}]), \
+             patch("mini_ork.web.recipes.list_recipes", return_value=["code-fix"]):
+            agent3._orchestrator_turn = turn_after
+            asyncio.run(agent3.prompt(thread, [_text_block("again")]))
+        assert seen[-1] == "sess-load-1"
+
+
+def test_load_session_starts_follower_for_running_child(tmp_path):
+    """Loading a thread whose child run is still running spawns a follower.
+
+    The follower registration is observable: ``_routes[child]`` is set
+    (the replay walk registers the route for ``<run_id>:parent`` updates)
+    AND a follower task is created when the child snapshot is non-terminal.
+    The task itself polls until the run ends or the test fixture cancels it.
+    """
+    from unittest.mock import patch
+
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    (proj / ".mini-ork").mkdir()
+    child = "run-still-going"
+
+    class _TurnResult:
+        session_id = "sess-running"
+        rc = 0
+        text = ""
+        cost_usd = 0.0
+        error = ""
+
+    def turn(lane, prompt, cwd, home, resume, on_event):
+        async def _run():
+            for ev in _start_run_events(child):
+                await on_event(ev)
+            return _TurnResult()
+        return _run()
+
+    def reader(rid: str) -> dict:
+        if rid == child:
+            return {"status": "executing", "events": [], "llm_calls": []}
+        return {"status": None, "events": [], "llm_calls": []}
+
+    with patch("mini_ork.acp_orchestrator.config.orchestrator_lanes",
+               return_value=[{"id": "opus", "name": "Opus"}]), \
+         patch("mini_ork.web.recipes.list_recipes", return_value=["code-fix"]):
+        agent, thread = _thread_agent(proj, orchestrator_turn=turn, reader=reader)
+        agent.on_connect(_SidConn())
+        asyncio.run(agent.prompt(thread, [_text_block("go")]))
+
+        # Now load in a fresh agent — child is still executing.
+        agent2 = MiniOrkAcpAgent()
+        agent2.on_connect(_SidConn())
+
+        # The follower is observable WHILE the load coroutine runs (the
+        # task is created in load_session and polled by the event loop
+        # alongside the load). Reach for ``_routes`` (which is set before
+        # the task starts) AND observe the running tasks count from
+        # inside the same ``asyncio.run`` boundary.
+        observed = {"routes": {}, "followers": {}}
+
+        async def _load_and_observe():
+            await agent2.load_session(cwd=str(proj), session_id=thread)
+            observed["routes"] = dict(agent2._routes)
+            observed["followers"] = {
+                rid: task for rid, task in agent2._followers.items()
+                if not task.done()
+            }
+
+        asyncio.run(_load_and_observe())
+        assert child in observed["routes"]
+        assert observed["routes"][child][0] == thread
+        assert child in observed["followers"]
+        # Cleanup: cancel so the test exits cleanly.
+        for task in list(observed["followers"].values()):
+            task.cancel()
+
+
+def test_load_session_unknown_orch_id_is_invalid_params(tmp_path):
+    """An unknown ``orch-…`` id raises ``invalid_params`` (code -32602)."""
+    agent = MiniOrkAcpAgent()
+    try:
+        asyncio.run(agent.load_session(cwd="/tmp", session_id="orch-1700000000-nope"))
+    except Exception as exc:
+        assert getattr(exc, "code", None) == -32602
+        assert "unknown thread" in str(getattr(exc, "data", None) or "")
+    else:
+        raise AssertionError("expected invalid_params")
+
+
+def test_load_session_run_session_still_works(tmp_path):
+    """Run-session load path is unchanged: a non-orch session id hits the
+    existing ``history.read_snapshot`` path and raises if the run is missing."""
+
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    (proj / ".mini-ork").mkdir()
+    agent = MiniOrkAcpAgent()
+    # A run id with no task_runs row → invalid_params (existing behaviour).
+    try:
+        asyncio.run(agent.load_session(cwd=str(proj), session_id="run-nope-1"))
+    except Exception as exc:
+        assert getattr(exc, "code", None) == -32602
+    else:
+        raise AssertionError("expected invalid_params for missing run")
+
+
+# ── thread persistence: review regressions ──────────────────────────────────
+
+
+def _child_world(proj: Path, child: str, *, final_status: str = "published"):
+    """A turn that starts ``child`` and a reader that runs it to ``final_status``
+    with one node and one live line."""
+    live = proj / ".mini-ork" / "runs" / child / "agent-n1.live.jsonl"
+    live.parent.mkdir(parents=True, exist_ok=True)
+    _write_live_lines(live, [json.dumps({
+        "type": "assistant", "message": {"content": [{"type": "text", "text": "child says hi"}]}})])
+    start = {"event_type": "node_start", "payload_json": json.dumps({"node_id": "n1", "node_type": "implementer"})}
+    end = {"event_type": "node_end", "payload_json": json.dumps({"node_id": "n1"})}
+
+    def reader(rid: str) -> dict:
+        assert rid == child
+        if final_status in TERMINAL:
+            return {"status": final_status, "events": [start, end], "llm_calls": [{"cost_usd": 0.25}]}
+        return {"status": final_status, "events": [start], "llm_calls": [{"cost_usd": 0.25}]}
+
+    def turn(lane, prompt, cwd, home, resume, on_event):
+        async def _run():
+            for ev in _start_run_events(child):
+                await on_event(ev)
+            return _Turn(cost_usd=0.5)
+        return _run()
+
+    return reader, turn
+
+
+TERMINAL = {"published", "rolled_back", "failed"}
+
+
+def _recorded(proj: Path, thread: str) -> list[dict]:
+    from mini_ork.acp.threads import ThreadStore
+    return ThreadStore(proj / ".mini-ork").read(thread)
+
+
+def test_child_run_internals_are_not_recorded_in_the_thread(tmp_path):
+    proj = tmp_path / "proj"
+    child = "run-child-rec"
+    reader, turn = _child_world(proj, child)
+    agent, thread = _thread_agent(proj, orchestrator_turn=turn, reader=reader)
+    agent.on_connect(_SidConn())
+
+    async def scenario():
+        await agent.prompt(thread, [_text_block("go")])
+        if agent._followers.get(child):
+            await agent._followers[child]
+
+    asyncio.run(scenario())
+    ids = [str(r["update"].get("toolCallId", "")) for r in _recorded(proj, thread) if r["type"] == "update"]
+    assert f"{child}:parent" in ids
+    assert not [i for i in ids if i.startswith(f"{child}:") and i != f"{child}:parent"], ids
+    texts = json.dumps(_recorded(proj, thread))
+    assert "child says hi" not in texts
+
+
+def test_reopened_thread_replays_marker_then_child_history_once(tmp_path):
+    """Same process re-open (Zed does it): child history replays after its
+    marker, live output once, and the recorded costs are refreshed, not stale."""
+    proj = tmp_path / "proj"
+    child = "run-child-reopen"
+    reader, turn = _child_world(proj, child)
+    agent, thread = _thread_agent(proj, orchestrator_turn=turn, reader=reader)
+    agent.on_connect(_SidConn())
+
+    async def live_then_reopen():
+        await agent.prompt(thread, [_text_block("go")])
+        if agent._followers.get(child):
+            await agent._followers[child]
+        conn = _SidConn()
+        agent.on_connect(conn)
+        await agent.load_session(cwd=str(proj), session_id=thread)
+        return conn
+
+    conn = asyncio.run(live_then_reopen())
+    updates = [u for _, u in conn.sent]
+    ids = [getattr(u, "tool_call_id", None) for u in updates]
+    assert ids.index(f"{child}:parent") < ids.index(f"{child}:n1")
+    live = [c.content.text for u in updates if isinstance(u, ToolCallProgress)
+            for c in (u.content or []) if getattr(c.content, "text", None) == "child says hi"]
+    assert live == ["child says hi"]
+    costs = [u.cost.amount for u in updates if isinstance(u, UsageUpdate)]
+    assert costs[-1] == pytest.approx(0.75)
+
+
+def test_loading_a_thread_with_a_running_child_streams_its_backlog_once(tmp_path):
+    proj = tmp_path / "proj"
+    child = "run-child-running"
+    reader, turn = _child_world(proj, child, final_status="executing")
+    agent, thread = _thread_agent(proj, orchestrator_turn=turn, reader=reader)
+    agent.on_connect(_SidConn())
+
+    async def first_life():
+        await agent.prompt(thread, [_text_block("go")])
+        for task in list(agent._followers.values()):
+            task.cancel()
+
+    asyncio.run(first_life())
+    fresh = MiniOrkAcpAgent(reader=reader, poll_interval=0)
+    conn = _SidConn()
+    fresh.on_connect(conn)
+
+    async def reopen():
+        await fresh.load_session(cwd=str(proj), session_id=thread)
+        for _ in range(5):
+            await asyncio.sleep(0)
+        for task in list(fresh._followers.values()):
+            task.cancel()
+
+    asyncio.run(reopen())
+    live = [u for _, u in conn.sent if isinstance(u, ToolCallProgress)
+            and any(getattr(c.content, "text", None) == "child says hi" for c in (u.content or []))]
+    assert len(live) == 1
+
+
+def test_loading_an_unknown_thread_leaves_no_phantom_thread(tmp_path):
+    proj = tmp_path / "proj"
+    (proj / ".mini-ork").mkdir(parents=True)
+    agent = MiniOrkAcpAgent()
+    with pytest.raises(Exception):
+        asyncio.run(agent.load_session(cwd=str(proj), session_id="orch-1-nothere"))
+    assert "orch-1-nothere" not in agent._thread_sessions
+    assert "orch-1-nothere" not in agent._sessions
+
+
+def test_fresh_process_load_puts_each_run_after_its_marker(tmp_path):
+    proj = tmp_path / "proj"
+    child = "run-child-order"
+    reader, turn = _child_world(proj, child)
+    agent, thread = _thread_agent(proj, orchestrator_turn=turn, reader=reader)
+    agent.on_connect(_SidConn())
+
+    async def first_life():
+        await agent.prompt(thread, [_text_block("go")])
+        if agent._followers.get(child):
+            await agent._followers[child]
+
+    asyncio.run(first_life())
+    fresh = MiniOrkAcpAgent(reader=reader, poll_interval=0)
+    conn = _SidConn()
+    fresh.on_connect(conn)
+    resp = asyncio.run(fresh.load_session(cwd=str(proj), session_id=thread))
+    ids = [getattr(u, "tool_call_id", None) for _, u in conn.sent]
+    assert ids.index(f"{child}:parent") < ids.index(f"{child}:n1")
+    assert {sid for sid, _ in conn.sent} == {thread}
+    assert [o.id for o in resp.config_options] == ["mode", "model", "recipe"]

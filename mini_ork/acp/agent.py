@@ -55,9 +55,11 @@ from acp.schema import (
     SessionConfigOptionSelect,
     SessionConfigSelectOption,
     SessionInfo,
+    SessionInfoUpdate,
     SessionListCapabilities,
     SessionMode,
     SessionModeState,
+    SessionNotification,
     SetSessionConfigOptionResponse,
     SetSessionModeResponse,
     StopReason,
@@ -71,6 +73,7 @@ from acp.schema import (
 from mini_ork.acp import history
 from mini_ork.acp import orchestration as _orchestration
 from mini_ork.acp.live import LiveTail, normalize
+from mini_ork.acp.threads import ThreadStore, title_from_text
 from mini_ork.web.control import _is_safe_token
 
 PROTOCOL_VERSION = 1
@@ -280,6 +283,16 @@ class MiniOrkAcpAgent:
         self._thread_costs: dict[str, dict[str, float]] = {}
         # thread session id → last cost total sent (each poll re-reports usage).
         self._usage_sent: dict[str, float] = {}
+        # thread session ids that have already received their first user
+        # prompt (the ``SessionInfoUpdate`` title-push lives on this flag —
+        # a loaded thread arrives with the flag already set so replay does
+        # not re-emit the title update).
+        self._first_prompt_sent: set[str] = set()
+        # session ids currently being loaded from a persisted thread. A
+        # replayed update must NOT be re-recorded (kickoff §"load_session"):
+        # the simplest guard is a per-load set checked at the top of
+        # ``_emit``.
+        self._replaying: set[str] = set()
         # thread session id → the direct-mode run its current prompt awaits.
         self._direct_runs: dict[str, str] = {}
         # (session, node) pairs whose agent already streamed text — a final
@@ -346,6 +359,22 @@ class MiniOrkAcpAgent:
         home = self._home_for(thread_id)
         config_options = self._build_config_options(thread_id, home)
         modes = self._build_session_modes(thread_id)
+        # Z9c-2: persist the thread meta + initial config. The store
+        # swallows I/O errors (a read-only home logs to stderr) so the
+        # new_session response is unaffected.
+        self._record(
+            thread_id,
+            {"type": "meta", "thread_id": thread_id, "cwd": cwd},
+        )
+        self._record(
+            thread_id,
+            {
+                "type": "config",
+                "mode": self._thread_config[thread_id]["mode"],
+                "model": self._thread_config[thread_id]["model"],
+                "recipe": self._thread_config[thread_id]["recipe"],
+            },
+        )
         return NewSessionResponse(
             session_id=thread_id,
             modes=modes,
@@ -606,6 +635,18 @@ class MiniOrkAcpAgent:
                     {"message": f"unknown recipe: {value!r}"}
                 )
         cfg[config_id] = value
+        # Z9c-2: persist the full current config snapshot so a later
+        # ``load_session`` can rebuild the picker. Only after the value is
+        # accepted — a rejected value never reaches here.
+        self._record(
+            session_id,
+            {
+                "type": "config",
+                "mode": cfg.get("mode", ""),
+                "model": cfg.get("model", ""),
+                "recipe": cfg.get("recipe", ""),
+            },
+        )
         options = self._current_config_options(session_id)
         options_cast = cast(Any, options)
         await self._emit(
@@ -665,6 +706,20 @@ class MiniOrkAcpAgent:
             )
             for row in rows
         ]
+        # The first page also carries the project's orchestrator threads; later
+        # pages are runs only (the cursor is the run offset).
+        if offset == 0:
+            threads = [
+                SessionInfo(
+                    session_id=row["thread_id"],
+                    cwd=row.get("cwd") or str(home.resolve().parent),
+                    title=row.get("title"),
+                    updated_at=row.get("updated_at"),
+                    field_meta={"kind": "thread"},
+                )
+                for row in ThreadStore(home).list_threads(limit=100)
+            ]
+            sessions = self._sort_sessions_by_updated(threads + sessions)
         return ListSessionsResponse(
             sessions=sessions,
             next_cursor=str(next_offset) if next_offset is not None else None,
@@ -681,6 +736,11 @@ class MiniOrkAcpAgent:
         del mcp_servers, additional_directories, kwargs
         if not _is_safe_token(session_id):
             raise RequestError.invalid_params({"message": f"unsafe session id: {session_id!r}"})
+        # Z9c-2: thread (orchestrator) sessions replay from
+        # ``<home>/acp-threads/<id>.jsonl`` — they are NOT run ids and must
+        # not hit ``history.read_snapshot`` (which expects a task_runs row).
+        if session_id.startswith("orch-"):
+            return await self._load_thread_session(cwd, session_id)
         # Bind the session to its project cwd (the session id IS the run id);
         # reset emitted transitions so replay starts clean.
         self._sessions[session_id] = cwd
@@ -778,6 +838,23 @@ class MiniOrkAcpAgent:
         # A cancel ends one turn, not the thread.
         self._cancelled.discard(session_id)
         text = _extract_prompt_text(prompt)
+        # Z9c-2: persist the user prompt and (only on the first prompt of
+        # this thread) push a SessionInfoUpdate carrying the title derived
+        # from the prompt text. The flag is set BEFORE the routing call so
+        # a loaded thread that re-prompted arrives with the flag already on
+        # (``_load_thread_session`` seeds it during restore) and never
+        # re-emits the title update.
+        self._record(session_id, {"type": "user", "text": text})
+        if session_id not in self._first_prompt_sent:
+            self._first_prompt_sent.add(session_id)
+            title = title_from_text(text)
+            await self._emit(
+                session_id,
+                SessionInfoUpdate(
+                    session_update="session_info_update",
+                    title=title,
+                ),
+            )
         slash_text = self._strip_slash_run(text)
         if slash_text is not None:
             return await self._prompt_thread_direct(session_id, slash_text)
@@ -900,6 +977,11 @@ class MiniOrkAcpAgent:
         rc = getattr(result, "rc", 0)
         new_session_id = getattr(result, "session_id", None)
         if isinstance(new_session_id, str) and new_session_id:
+            # Z9c-2: record the resume id ONLY when it changes (kickoff:
+            # "when the stored id changes"). The first turn is also a change
+            # because the prior value was empty.
+            if cfg.get("claude_session_id") != new_session_id:
+                self._record(session_id, {"type": "claude_session", "id": new_session_id})
             cfg["claude_session_id"] = new_session_id
         costs = self._thread_costs.setdefault(session_id, {})
         costs["orchestrator"] = costs.get("orchestrator", 0.0) + float(
@@ -1416,6 +1498,7 @@ class MiniOrkAcpAgent:
         return result != (0, 0)
 
     async def _emit(self, session_id: str, update: Any) -> None:
+        origin = session_id
         route = self._routes.get(session_id)
         if route is not None:
             # A run followed inside a thread: address the thread, keep the
@@ -1433,6 +1516,15 @@ class MiniOrkAcpAgent:
                     update={"tool_call_id": f"{prefix}{update.tool_call_id}"}
                 )
             session_id = thread_id
+        # Z9c-2: persist what the thread itself said. A routed run's internals
+        # are not recorded (load re-projects them from the run's own data);
+        # its usage is, as the thread's cost snapshot. Replays never record.
+        if (
+            session_id in self._thread_sessions
+            and session_id not in self._replaying
+            and (origin == session_id or isinstance(update, UsageUpdate))
+        ):
+            self._record_thread_update(session_id, update)
         if self._conn is not None:
             await self._conn.session_update(session_id, update)
 
@@ -1534,6 +1626,181 @@ class MiniOrkAcpAgent:
             or os.environ.get("MINI_ORK_HOME")
             or os.path.join(os.getcwd(), ".mini-ork")
         )
+
+    # ── thread-store helpers (Z9c-2) ─────────────────────────────────────────
+
+    def _thread_store(self, thread_id: str) -> ThreadStore:
+        """The store under the thread's bound home (built per call: no I/O)."""
+        return ThreadStore(self._home_for(thread_id))
+
+    def _record(self, thread_id: str, record: dict[str, Any]) -> None:
+        """Append ``record`` to ``thread_id``'s JSONL; swallows I/O errors."""
+        try:
+            self._thread_store(thread_id).append(thread_id, record)
+        except (OSError, ValueError):
+            # ``ThreadStore.append`` already swallows I/O errors; this is
+            # a defence-in-depth catch so a misbehaving subclass can never
+            # break a live thread.
+            pass
+
+    def _record_thread_update(self, thread_id: str, update: Any) -> None:
+        """Persist one ACP update as a ``{"type": "update", ...}`` record.
+
+        ``UsageUpdate`` is recorded as a ``costs`` snapshot (the thread's
+        cumulative cost map), never as an ``update`` — the wire format
+        ``cost.amount`` is per-update and would not round-trip cleanly.
+        ``SessionInfoUpdate`` is never recorded (it's an artefact of the
+        first-prompt title push; the recorded ``meta``/``config``/``user``
+        already carry the same information). When a child run's tool call
+        lands via ``_emit`` the original id is a routed run id
+        (``run-...``), NOT in ``_thread_sessions``, so the outer
+        ``_thread_sessions`` guard already skips recording routed updates.
+        """
+        if isinstance(update, UsageUpdate):
+            costs = self._thread_costs.get(thread_id, {})
+            self._record(
+                thread_id,
+                {"type": "costs", "costs": {str(k): float(v) for k, v in costs.items()}},
+            )
+            return
+        if isinstance(update, SessionInfoUpdate):
+            return
+        try:
+            payload = update.model_dump(
+                mode="json", by_alias=True, exclude_none=True
+            )
+        except Exception:  # noqa: BLE001 — non-pydantic objects skip persistence
+            return
+        if not isinstance(payload, dict):
+            return
+        self._record(thread_id, {"type": "update", "update": payload})
+
+    @staticmethod
+    def _sort_sessions_by_updated(
+        sessions: list[SessionInfo],
+    ) -> list[SessionInfo]:
+        """Sort ``sessions`` by ``updated_at`` desc, missing values last.
+
+        Stable: a row with no ``updated_at`` lands after every row that
+        has one. Tie-breaks preserve input order (the caller's natural
+        merge order — threads first, runs after). ISO-8601 timestamps
+        sort lexically the same as chronologically, so ``reverse=True``
+        on the (group, ts) tuple gives newest-first.
+        """
+
+        def _key(s: SessionInfo) -> tuple[int, str]:
+            ts = s.updated_at
+            if ts:
+                return (0, str(ts))
+            return (1, "")
+
+        return sorted(sessions, key=_key, reverse=True)
+
+    async def _load_thread_session(
+        self, cwd: str, session_id: str
+    ) -> LoadSessionResponse:
+        """Replay a persisted thread (``orch-…``) and make it live again.
+
+        Restores the thread's config, resume id and costs; replays its records
+        in file order; right after each run marker, re-projects that run from
+        its own data (lifecycle, last live output of a finished run, terminal
+        message) under the run's prefix; follows runs that are still going.
+        Works for a thread this process already holds (Zed re-opens threads):
+        replay state is reset first, so nothing is suppressed as already sent.
+        """
+        store = ThreadStore(Path(cwd) / ".mini-ork")
+        if not store.exists(session_id):
+            # The thread was recorded under the agent's fallback home.
+            store = ThreadStore(self._resolve_home())
+        if not store.exists(session_id):
+            raise RequestError.invalid_params(
+                {"message": f"unknown thread: {session_id!r}"}
+            )
+        records = store.read(session_id)
+        self._sessions[session_id] = cwd
+        self._thread_sessions.add(session_id)
+        self._first_prompt_sent.add(session_id)  # no new title on the next prompt
+        cfg = self._thread_config.setdefault(
+            session_id, self._initial_thread_config(cwd)
+        )
+        for rec in records:
+            if rec.get("type") == "config":
+                for key in ("mode", "model", "recipe"):
+                    if rec.get(key):
+                        cfg[key] = str(rec[key])
+            elif rec.get("type") == "claude_session" and rec.get("id"):
+                cfg["claude_session_id"] = str(rec["id"])
+            elif rec.get("type") == "costs" and isinstance(rec.get("costs"), dict):
+                # Before the replay: re-projected runs refresh their own entries.
+                self._thread_costs[session_id] = {
+                    str(k): float(v) for k, v in rec["costs"].items()
+                }
+        self._usage_sent.pop(session_id, None)
+        running: list[str] = []
+        self._replaying.add(session_id)
+        try:
+            for rec in records:
+                rtype = rec.get("type")
+                if rtype == "user" and isinstance(rec.get("text"), str):
+                    await self._emit(
+                        session_id,
+                        UserMessageChunk(
+                            session_update="user_message_chunk",
+                            content=TextContentBlock(type="text", text=rec["text"]),
+                        ),
+                    )
+                    continue
+                if rtype != "update" or not isinstance(rec.get("update"), dict):
+                    continue
+                try:
+                    update = SessionNotification.model_validate(
+                        {"sessionId": session_id, "update": rec["update"]}
+                    ).update
+                except Exception:  # noqa: BLE001 — skip an unreadable record
+                    continue
+                await self._emit(session_id, update)
+                tool_call_id = str(getattr(update, "tool_call_id", "") or "")
+                if isinstance(update, ToolCallStart) and tool_call_id.endswith(":parent"):
+                    run_id = tool_call_id[: -len(":parent")]
+                    if _is_safe_token(run_id) and not await self._replay_run_in_thread(
+                        session_id, run_id, cwd
+                    ):
+                        running.append(run_id)
+            await self._emit(session_id, self._thread_usage_update(session_id))
+        finally:
+            self._replaying.discard(session_id)
+        for run_id in running:
+            follower = self._followers.get(run_id)
+            if follower is None or follower.done():
+                self._followers[run_id] = asyncio.create_task(
+                    self._follow_child(session_id, run_id)
+                )
+        return LoadSessionResponse(
+            config_options=cast(Any, self._current_config_options(session_id)),
+            modes=self._build_session_modes(session_id),
+        )
+
+    async def _replay_run_in_thread(self, thread_id: str, run_id: str, cwd: str) -> bool:
+        """Re-project one of a thread's runs into it; True when the run has ended."""
+        self._routes[run_id] = (thread_id, f"{run_id}:")
+        self._sessions.setdefault(run_id, cwd)
+        # A clean replay: forget what this process already sent for the run.
+        self._emitted.pop(run_id, None)
+        self._tails.pop(run_id, None)
+        self._text_seen = {key for key in self._text_seen if key[0] != run_id}
+        snapshot = (self._reader or self._read_snapshot)(run_id) or {
+            "status": None,
+            "events": [],
+            "llm_calls": [],
+        }
+        await self._project_snapshot(run_id, snapshot, live=False)
+        if snapshot.get("status") not in TERMINAL_STATUSES:
+            # The follower drains the live output from the start.
+            return False
+        started = self._started_node_ids(snapshot)
+        if started:
+            await self._replay_live_for(run_id, sorted(started))
+        return True
 
     def _home_for(self, session_id: str | None) -> Path:
         """Resolve the ``.mini-ork`` home for a session id.
