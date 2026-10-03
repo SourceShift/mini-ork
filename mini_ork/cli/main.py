@@ -47,6 +47,7 @@ _NATIVE_MODULE_SUBS = {
     "spawn": "mini_ork.cli.spawn",
     "scheduler": "mini_ork.scheduler",
     "epics": "mini_ork.cli.epics",
+    "specs": "mini_ork.cli.specs",
     "bugs": "mini_ork.cli.bugs",
     "inject": "mini_ork.cli.inject",
     "review": "mini_ork.pre_push_review",

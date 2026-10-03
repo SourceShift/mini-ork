@@ -1,0 +1,151 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mini-ork/schemas/spec-card.schema.json",
+  "title": "SpecCard",
+  "description": "Compiled contract for one spec file in spec-driven-delivery (docs/plans/2026-10-03-spec-driven-delivery.md). The .md at source_path is the source of truth; the card is void when source_hash no longer matches the file bytes. Field-for-field mirror of the design doc's SpecCard YAML block.",
+  "type": "object",
+  "required": [
+    "spec_id",
+    "source_path",
+    "source_hash",
+    "title",
+    "clauses",
+    "acceptance",
+    "deliverables",
+    "ui_craft",
+    "status"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "spec_id": {
+      "$ref": "#/$defs/spec_id",
+      "description": "Slug, unique within one spec-index.json."
+    },
+    "source_path": {
+      "$ref": "#/$defs/abs_path",
+      "description": "Absolute path of the spec .md file."
+    },
+    "source_hash": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "description": "sha256 of the source file's raw bytes, prefixed 'sha256:'."
+    },
+    "title": {
+      "type": "string",
+      "minLength": 1
+    },
+    "clauses": {
+      "type": "object",
+      "description": "SGRM four-component split of the spec's requirements.",
+      "required": ["functional", "quality", "constitutional", "architectural"],
+      "additionalProperties": false,
+      "properties": {
+        "functional": {"type": "array", "items": {"$ref": "#/$defs/clause"}},
+        "quality": {"type": "array", "items": {"$ref": "#/$defs/clause"}},
+        "constitutional": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/clause"},
+          "description": "Hard rules / never-do."
+        },
+        "architectural": {"type": "array", "items": {"$ref": "#/$defs/clause"}}
+      }
+    },
+    "acceptance": {
+      "type": "array",
+      "description": "Every acceptance criterion maps to exactly one executable gate.",
+      "items": {"$ref": "#/$defs/acceptance"}
+    },
+    "deliverables": {
+      "type": "array",
+      "description": "Atomic, dependency-ordered units; one inner kickoff each.",
+      "items": {"$ref": "#/$defs/deliverable"}
+    },
+    "ui_craft": {
+      "type": "object",
+      "required": ["required", "design_sources"],
+      "additionalProperties": false,
+      "properties": {
+        "required": {"type": "boolean"},
+        "design_sources": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1},
+          "uniqueItems": true
+        }
+      }
+    },
+    "status": {
+      "enum": ["draft", "ratified", "dispatched", "delivered", "failed", "blocked"]
+    }
+  },
+  "$defs": {
+    "spec_id": {
+      "type": "string",
+      "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$"
+    },
+    "abs_path": {
+      "type": "string",
+      "pattern": "^(/|[A-Za-z]:[\\\\/])"
+    },
+    "local_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$"
+    },
+    "id_list": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/local_id"},
+      "uniqueItems": true
+    },
+    "clause": {
+      "type": "object",
+      "required": ["id", "text"],
+      "additionalProperties": false,
+      "properties": {
+        "id": {"$ref": "#/$defs/local_id"},
+        "text": {"type": "string", "minLength": 1}
+      }
+    },
+    "gate": {
+      "type": "object",
+      "required": ["kind", "probe", "expect"],
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "enum": ["cmd", "ui", "contract"],
+          "description": "cmd: shell probe; ui: UI probe; contract: assertion."
+        },
+        "probe": {"type": "string", "minLength": 1},
+        "expect": {"type": "string", "minLength": 1}
+      }
+    },
+    "acceptance": {
+      "type": "object",
+      "required": ["id", "clause_refs", "text", "gate"],
+      "additionalProperties": false,
+      "properties": {
+        "id": {"$ref": "#/$defs/local_id"},
+        "clause_refs": {"$ref": "#/$defs/id_list"},
+        "text": {"type": "string", "minLength": 1},
+        "gate": {"$ref": "#/$defs/gate"}
+      }
+    },
+    "deliverable": {
+      "type": "object",
+      "required": ["id", "title", "acceptance_refs", "depends_on"],
+      "additionalProperties": false,
+      "properties": {
+        "id": {"$ref": "#/$defs/local_id"},
+        "title": {"type": "string", "minLength": 1},
+        "acceptance_refs": {"$ref": "#/$defs/id_list"},
+        "depends_on": {
+          "type": "array",
+          "description": "Deliverable ids in this card, or '<spec_id>/<id>' for a cross-spec edge.",
+          "items": {
+            "type": "string",
+            "pattern": "^([a-z0-9]+(-[a-z0-9]+)*/)?[A-Za-z0-9][A-Za-z0-9_.-]*$"
+          },
+          "uniqueItems": true
+        }
+      }
+    }
+  }
+}

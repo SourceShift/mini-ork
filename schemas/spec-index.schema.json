@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mini-ork/schemas/spec-index.schema.json",
+  "title": "SpecIndex",
+  "description": "Inventory of one spec directory written by `mini-ork specs ingest` (mini_ork.specdir.index). Entries are keyed by spec_id; every path is absolute. Duplicate spec_ids and dependency cycles are hard errors, so a valid index never contains either.",
+  "type": "object",
+  "required": ["schema_version", "generated_at", "root", "specs"],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {"const": "1.0"},
+    "generated_at": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?Z$",
+      "description": "ISO-8601 UTC timestamp of the ingest."
+    },
+    "root": {
+      "$ref": "#/$defs/abs_path",
+      "description": "Absolute path of the scanned spec directory."
+    },
+    "specs": {
+      "type": "object",
+      "propertyNames": {"pattern": "^[a-z0-9]+(-[a-z0-9]+)*$"},
+      "additionalProperties": {"$ref": "#/$defs/entry"}
+    }
+  },
+  "$defs": {
+    "abs_path": {
+      "type": "string",
+      "pattern": "^(/|[A-Za-z]:[\\\\/])"
+    },
+    "entry": {
+      "type": "object",
+      "required": ["source_path", "source_hash", "title", "status"],
+      "additionalProperties": false,
+      "properties": {
+        "source_path": {"$ref": "#/$defs/abs_path"},
+        "source_hash": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+        "title": {"type": "string", "minLength": 1},
+        "status": {
+          "enum": ["draft", "ratified", "dispatched", "delivered", "failed", "blocked"]
+        },
+        "depends_on": {
+          "type": "array",
+          "items": {"type": "string", "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$"},
+          "uniqueItems": true
+        }
+      }
+    }
+  }
+}
