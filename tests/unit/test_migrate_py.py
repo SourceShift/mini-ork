@@ -339,3 +339,53 @@ def test_init_db_checksum_drift_refusal(tmp_path):
             os.environ["MINI_ORK_DB"] = old
     assert rc_p == 1
     assert "checksum drift" in err_p
+
+
+# --- concurrent migrations (fixed /tmp scratch paths) -------------------------
+
+
+def test_migrations_never_touch_a_shared_tmp_path(tmp_path, monkeypatch):
+    """0039 names a fixed /tmp file for its generated SQL. Two DBs migrating at
+    once (parallel tests, concurrent runs) raced on it — one deleted or
+    overwrote the other's file mid-migration and 0039 rolled back. Every
+    migration's scratch file now lives in a private per-apply directory."""
+    import builtins
+    from pathlib import Path as _P
+
+    touched: list[str] = []
+    real_open, real_write = builtins.open, _P.write_text
+
+    def spy_open(file, *a, **kw):
+        touched.append(str(file))
+        return real_open(file, *a, **kw)
+
+    def spy_write(self, *a, **kw):
+        touched.append(str(self))
+        return real_write(self, *a, **kw)
+
+    monkeypatch.setattr(builtins, "open", spy_open)
+    monkeypatch.setattr(_P, "write_text", spy_write)
+    rc, _out, err = mig.init_db(db=str(tmp_path / "s.db"), root=str(REPO))
+    monkeypatch.undo()
+    assert rc == 0, err
+    assert not [p for p in touched if p.startswith("/tmp/mini-ork-")], touched
+
+
+def test_parallel_fresh_dbs_all_migrate(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+
+    def one(i):
+        return mig.init_db(db=str(tmp_path / f"p{i}.db"), root=str(REPO))
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(one, range(16)))
+    assert all(rc == 0 for rc, _o, _e in results), [e for rc, _o, e in results if rc]
+
+
+def test_a_rolled_back_migration_says_why(tmp_path):
+    root = tmp_path / "root"
+    (root / "db" / "migrations").mkdir(parents=True)
+    (root / "db" / "migrations" / "0001_bad.sql").write_text("CREATE TABLE t (a);\nINSERT INTO nope VALUES (1);\n")
+    rc, _out, err = mig.init_db(db=str(tmp_path / "b.db"), root=str(root))
+    assert rc != 0
+    assert "0001_bad.sql" in err and "no such table: nope" in err

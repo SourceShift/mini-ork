@@ -279,7 +279,8 @@ def _dot_env(db: str, root: str | None) -> dict:
 
 
 def _exec_statements(con: sqlite3.Connection, text: str, env: dict,
-                     once_target: str | None = None, depth: int = 0) -> str | None:
+                     once_target: str | None = None, depth: int = 0,
+                     scratch: str | None = None) -> str | None:
     """Execute a sqlite3-CLI-style script statement-by-statement.
 
     Plain SQL runs through ``con`` (raising on the first error, mirroring
@@ -294,7 +295,18 @@ def _exec_statements(con: sqlite3.Connection, text: str, env: dict,
 
     Anything else raises, failing the migration — same as ``-bail`` aborting
     on an unknown command. Returns the unconsumed once_target, if any.
+
+    ``scratch`` is this apply's private directory: a fixed ``/tmp/<name>`` a
+    migration names (0039's generated-SQL file) is redirected into it, so two
+    DBs migrating at once — parallel tests, concurrent runs — never share,
+    overwrite or delete each other's file mid-migration.
     """
+
+    def private(path: str) -> str:
+        if scratch and path.startswith("/tmp/"):
+            return os.path.join(scratch, os.path.basename(path))
+        return path
+
     if depth > _MAX_READ_DEPTH:
         raise sqlite3.Error(".read recursion too deep")
     buf = ""
@@ -323,18 +335,21 @@ def _exec_statements(con: sqlite3.Connection, text: str, env: dict,
                             f".read pipeline exited {proc.returncode}: {arg[1:]}"
                             f" — stderr: {proc.stderr.strip()[:200]}")
                     once_target = _exec_statements(
-                        con, proc.stdout, env, once_target, depth + 1)
+                        con, proc.stdout, env, once_target, depth + 1, scratch)
                 else:
+                    arg = private(arg)
                     try:
                         content = Path(arg).read_text()
                     except OSError as exc:
                         raise sqlite3.Error(f".read cannot open {arg}: {exc}") from exc
                     once_target = _exec_statements(
-                        con, content, env, once_target, depth + 1)
+                        con, content, env, once_target, depth + 1, scratch)
             elif cmd == "once":
+                arg = private(arg)
                 Path(arg).write_text("")  # truncate, like sqlite3 .once
                 once_target = arg
             elif cmd == "shell":
+                arg = re.sub(r"/tmp/[\w.\-]+", lambda m: private(m.group(0)), arg)
                 subprocess.run(["sh", "-c", arg], env=env, capture_output=True)
             else:
                 raise sqlite3.Error(f"unsupported sqlite3 dot-command: .{cmd}")
@@ -356,28 +371,37 @@ def _exec_statements(con: sqlite3.Connection, text: str, env: dict,
 
 
 def _apply_one(db: str, file: str, filename: str, checksum_hex: str, ver: str,
-               root: str | None = None) -> bool:
+               root: str | None = None) -> str | None:
+    """Apply one migration atomically. Returns None on success, else the
+    reason it was rolled back."""
+    import shutil
+    import tempfile
+
     sql = Path(file).read_text()
     record = _RECORD.format(fn=filename, sum=checksum_hex, ver=ver)
     env = _dot_env(db, root)
+    scratch = tempfile.mkdtemp(prefix="mo-migrate-")
     con = sqlite3.connect(db)
     con.isolation_level = None  # manual transaction control, mirroring sqlite3 -bail
     try:
         if _BEGIN_RE.search(sql):
             # migration manages its own transaction; run as-is then record
-            _exec_statements(con, sql, env)
+            _exec_statements(con, sql, env, scratch=scratch)
             con.execute(record)
         else:
-            _exec_statements(con, "BEGIN;\n" + sql + "\n" + record + "\nCOMMIT;\n", env)
+            _exec_statements(con, "BEGIN;\n" + sql + "\n" + record + "\nCOMMIT;\n", env,
+                             scratch=scratch)
         con.close()
-        return True
-    except (sqlite3.Error, OSError, subprocess.SubprocessError):
+        return None
+    except (sqlite3.Error, OSError, subprocess.SubprocessError) as exc:
         try:
             con.execute("ROLLBACK")
         except sqlite3.Error:
             pass
         con.close()
-        return False
+        return f"{type(exc).__name__}: {exc}"
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
 
 
 def migrate_apply(migrations_dir: str, dry_run: bool = False, db: str | None = None,
@@ -464,11 +488,12 @@ def migrate_apply(migrations_dir: str, dry_run: bool = False, db: str | None = N
             out.append(f"  [pending] {filename}")
             continue
         out.append(f"  [apply]   {filename}")
-        if _apply_one(db, str(f), filename, canon_sum, ver, root=root):
+        failure = _apply_one(db, str(f), filename, canon_sum, ver, root=root)
+        if failure is None:
             out.append(f"  [ok]      {filename}")
         else:
             if err_out is not None:
-                err_out.append(f"  [FAIL]    {filename} — rolled back, DB unchanged")
+                err_out.append(f"  [FAIL]    {filename} — rolled back, DB unchanged ({failure})")
             con.close()
             return 1, out
     con.close()
