@@ -269,6 +269,19 @@ class MiniOrkAcpAgent:
         # thread session id → running orchestrator turn task (Z9c-1 cancel
         # support); one per thread session. Cleared on turn end.
         self._orchestrator_tasks: dict[str, asyncio.Task] = {}
+        # run id → (thread session id, tool-call id prefix). A run followed
+        # inside a thread (orchestrator child run, direct mode, ``/run``) goes
+        # through the normal run projection; ``_emit`` re-addresses it.
+        self._routes: dict[str, tuple[str, str]] = {}
+        # run id → last status the projection saw (closes the run's marker).
+        self._run_status: dict[str, str] = {}
+        # thread session id → {"orchestrator" | run id: cost USD}; the thread
+        # reports one cumulative cost instead of the latest run's.
+        self._thread_costs: dict[str, dict[str, float]] = {}
+        # thread session id → last cost total sent (each poll re-reports usage).
+        self._usage_sent: dict[str, float] = {}
+        # thread session id → the direct-mode run its current prompt awaits.
+        self._direct_runs: dict[str, str] = {}
         # (session, node) pairs whose agent already streamed text — a final
         # ``result`` event is shown only for nodes that streamed nothing.
         self._text_seen: set[tuple[str, str]] = set()
@@ -762,6 +775,8 @@ class MiniOrkAcpAgent:
         inline so cancel can interrupt it; the direct-mode path reuses the
         existing ``_await_terminal`` loop against the fresh run id.
         """
+        # A cancel ends one turn, not the thread.
+        self._cancelled.discard(session_id)
         text = _extract_prompt_text(prompt)
         slash_text = self._strip_slash_run(text)
         if slash_text is not None:
@@ -803,8 +818,22 @@ class MiniOrkAcpAgent:
         result = launcher(new_run_id, text)
         self._launches[new_run_id] = result if isinstance(result, dict) else {}
         if isinstance(result, dict) and result.get("ok") is False:
-            return PromptResponse(stop_reason="refusal")
-        return PromptResponse(stop_reason=await self._await_terminal(new_run_id))
+            await self._emit(
+                session_id,
+                self._build_refusal_message(
+                    f"mini-ork run failed to launch: {result.get('error') or 'unknown error'}"
+                ),
+            )
+            # end_turn, not refusal: the thread goes on (Zed rewinds a refused prompt).
+            return PromptResponse(stop_reason="end_turn")
+        self._routes[new_run_id] = (session_id, f"{new_run_id}:")
+        await self._open_run_marker(session_id, new_run_id, recipe)
+        self._direct_runs[session_id] = new_run_id
+        try:
+            stop = await self._follow_in_thread(session_id, new_run_id)
+        finally:
+            self._direct_runs.pop(session_id, None)
+        return PromptResponse(stop_reason="end_turn" if stop == "refusal" else stop)
 
     async def _prompt_thread_orchestrate(
         self, session_id: str, text: str
@@ -872,6 +901,11 @@ class MiniOrkAcpAgent:
         new_session_id = getattr(result, "session_id", None)
         if isinstance(new_session_id, str) and new_session_id:
             cfg["claude_session_id"] = new_session_id
+        costs = self._thread_costs.setdefault(session_id, {})
+        costs["orchestrator"] = costs.get("orchestrator", 0.0) + float(
+            getattr(result, "cost_usd", 0.0) or 0.0
+        )
+        await self._emit(session_id, self._thread_usage_update(session_id))
         if rc != 0:
             error_tail = str(getattr(result, "error", "") or "")
             text_tail = str(getattr(result, "text", "") or "")
@@ -909,15 +943,6 @@ class MiniOrkAcpAgent:
             if not isinstance(block, dict) or block.get("type") != "tool_result":
                 continue
             tool_use_id = str(block.get("tool_use_id") or "")
-            # The mapper stripped the MCP prefix in ``_tool_title``; the
-            # tool_use name for ``mcp__mini-ork__start_run`` is unknown here,
-            # so we accept any tool_use_id and let the orchestrator seam
-            # route on the raw name. We rely on the implementation of
-            # ``orchestration.extract_child_run`` to check the tool name
-            # via the title we projected on the ToolCallStart — but here
-            # we don't have that title. Fall back to checking the
-            # well-known tool name string: only "start_run" (after the MCP
-            # prefix) is treated as a child-run trigger.
             inner = block.get("content")
             if not isinstance(inner, list):
                 continue
@@ -941,12 +966,12 @@ class MiniOrkAcpAgent:
     async def _start_child_follow(
         self, parent_session_id: str, child_run_id: str, recipe: str = ""
     ) -> None:
-        """Spawn a child-run follower under prefixed tool ids.
+        """Follow a run the orchestrator launched, inside the thread.
 
-        Emits a ``ToolCallStart`` parent marker titled ``run <run_id> (<recipe>)``
-        and creates an asyncio task that mirrors ``_follow`` against the child
-        run. The follower is stored under the parent session id so ``cancel``
-        can find it. Multiple concurrent child runs are independent.
+        Emits a ``run <run_id> (<recipe>)`` marker, then projects the run like
+        any other (lifecycle, live agent output, terminal message) with tool
+        call ids prefixed ``"<run_id>:"``. The follower outlives the turn
+        until the run ends or the thread is cancelled.
         """
         if not _is_safe_token(child_run_id):
             return
@@ -955,82 +980,53 @@ class MiniOrkAcpAgent:
             return  # already following
         cfg = self._thread_config.get(parent_session_id) or {}
         recipe = recipe or str(cfg.get("recipe") or self._recipe)
-        await self._emit(
-            parent_session_id,
-            ToolCallStart(
-                session_update="tool_call",
-                tool_call_id=f"{child_run_id}:parent",
-                title=f"run {child_run_id} ({recipe})",
-                status="in_progress",
-                kind="other",
-            ),
+        # Same project as the thread, so the run's home (db, live files) resolves.
+        self._sessions.setdefault(
+            child_run_id, self._sessions.get(parent_session_id) or os.getcwd()
         )
+        self._routes[child_run_id] = (parent_session_id, f"{child_run_id}:")
+        await self._open_run_marker(parent_session_id, child_run_id, recipe)
         self._followers[child_run_id] = asyncio.create_task(
             self._follow_child(parent_session_id, child_run_id)
         )
 
-    async def _follow_child(
-        self, parent_session_id: str, child_run_id: str
-    ) -> None:
-        """Poll a child run's read model until it reaches a terminal status.
+    async def _follow_child(self, parent_session_id: str, child_run_id: str) -> None:
+        try:
+            await self._follow_in_thread(parent_session_id, child_run_id)
+        finally:
+            self._followers.pop(child_run_id, None)
 
-        Mirrors ``_follow`` minus the cancel gate: child runs keep streaming
-        after the orchestrator's turn ends until they go terminal or the
-        parent session is cancelled. Node lifecycle events project under the
-        prefixed tool id ``f"<child_run_id>:<node_id>"`` so they never collide
-        with the orchestrator's own ids.
+    async def _open_run_marker(self, thread_id: str, run_id: str, recipe: str) -> None:
+        await self._emit(
+            thread_id,
+            ToolCallStart(
+                session_update="tool_call",
+                tool_call_id=f"{run_id}:parent",
+                title=f"run {run_id} ({recipe})",
+                status="in_progress",
+                kind="other",
+            ),
+        )
+
+    async def _follow_in_thread(self, thread_id: str, run_id: str) -> StopReason:
+        """Project routed ``run_id`` until it ends, then close its marker.
+
+        A child run's launcher pid belongs to the MCP server, not to us, so
+        ``_launches`` holds none for it and only the start timeout applies.
         """
-        reader = self._reader or self._read_snapshot
-        prefix = f"{child_run_id}:"
-        while parent_session_id not in self._cancelled:
-            snapshot = reader(child_run_id) or {
-                "status": None,
-                "events": [],
-                "llm_calls": [],
-            }
-            # Project lifecycle events under the prefixed tool id so they
-            # land on the right parent marker.
-            emitted = self._emitted.setdefault(child_run_id, set())
-            for ev in snapshot.get("events") or []:
-                payload = ev.get("payload_json") or {}
-                if isinstance(payload, str):
-                    try:
-                        payload = json.loads(payload)
-                    except (json.JSONDecodeError, TypeError):
-                        payload = {}
-                node_id = str((payload or {}).get("node_id") or "node")
-                event_type = str(ev.get("event_type") or "")
-                if event_type == "node_start":
-                    key = f"{node_id}:start"
-                    if key in emitted:
-                        continue
-                    emitted.add(key)
-                    await self._emit(
-                        parent_session_id,
-                        ToolCallStart(
-                            session_update="tool_call",
-                            tool_call_id=f"{prefix}{node_id}",
-                            title=str((payload or {}).get("node_type") or node_id),
-                            status="in_progress",
-                        ),
-                    )
-                elif event_type == "node_end":
-                    key = f"{node_id}:end"
-                    if key in emitted:
-                        continue
-                    emitted.add(key)
-                    await self._emit(
-                        parent_session_id,
-                        ToolCallProgress(
-                            session_update="tool_call_update",
-                            tool_call_id=f"{prefix}{node_id}",
-                            status="completed",
-                        ),
-                    )
-            if snapshot.get("status") in TERMINAL_STATUSES:
-                break
-            await asyncio.sleep(self._poll_interval)
-        self._followers.pop(child_run_id, None)
+        stop = await self._await_terminal(run_id)
+        if stop == "cancelled":
+            return stop  # the run may still be going; leave its marker open
+        ok = stop == "end_turn" and self._run_status.get(run_id) == "published"
+        await self._emit(
+            thread_id,
+            ToolCallProgress(
+                session_update="tool_call_update",
+                tool_call_id=f"{run_id}:parent",
+                status="completed" if ok else "failed",
+            ),
+        )
+        return stop
 
     async def _default_orchestrator_turn(
         self,
@@ -1075,10 +1071,16 @@ class MiniOrkAcpAgent:
             task = self._orchestrator_tasks.get(session_id)
             if task is not None and not task.done():
                 task.cancel()
-            for child_run_id, child_task in list(self._followers.items()):
+            direct = self._direct_runs.get(session_id)
+            if direct:
+                # A direct run IS the turn: stop it like a run session.
+                await self.cancel(direct)
+            for run_id, (thread_id, _prefix) in list(self._routes.items()):
+                if thread_id != session_id or run_id == direct:
+                    continue
+                child_task = self._followers.pop(run_id, None)
                 if child_task is not None and not child_task.done():
                     child_task.cancel()
-                self._followers.pop(child_run_id, None)
             return
         if session_id in self._loaded:
             # Attached session: soft-stop only when the run is still running;
@@ -1175,10 +1177,23 @@ class MiniOrkAcpAgent:
             cost=Cost(amount=cost, currency="USD"),
         )
 
-    def _build_terminal_message(self, status: str) -> AgentMessageChunk:
+    def _build_terminal_message(
+        self, status: str, run_id: str | None = None
+    ) -> AgentMessageChunk:
+        run = f"run {run_id}" if run_id else "run"
         return AgentMessageChunk(
             session_update="agent_message_chunk",
-            content=TextContentBlock(type="text", text=f"mini-ork run finished: {status}"),
+            content=TextContentBlock(type="text", text=f"mini-ork {run} finished: {status}"),
+        )
+
+    def _thread_usage_update(self, thread_id: str) -> UsageUpdate:
+        """The thread's cumulative cost: orchestrator turns + every run it followed."""
+        total = sum(self._thread_costs.get(thread_id, {}).values())
+        return UsageUpdate(
+            session_update="usage_update",
+            used=0,
+            size=DEFAULT_CONTEXT_SIZE,
+            cost=Cost(amount=total, currency="USD"),
         )
 
     def _build_refusal_message(self, text: str) -> AgentMessageChunk:
@@ -1401,6 +1416,23 @@ class MiniOrkAcpAgent:
         return result != (0, 0)
 
     async def _emit(self, session_id: str, update: Any) -> None:
+        route = self._routes.get(session_id)
+        if route is not None:
+            # A run followed inside a thread: address the thread, keep the
+            # run's tool calls apart from the orchestrator's, fold its cost in.
+            thread_id, prefix = route
+            if isinstance(update, UsageUpdate):
+                amount = float(update.cost.amount) if update.cost else 0.0
+                self._thread_costs.setdefault(thread_id, {})[session_id] = amount
+                update = self._thread_usage_update(thread_id)
+                if self._usage_sent.get(thread_id) == update.cost.amount:
+                    return
+                self._usage_sent[thread_id] = update.cost.amount
+            elif getattr(update, "tool_call_id", None):
+                update = update.model_copy(
+                    update={"tool_call_id": f"{prefix}{update.tool_call_id}"}
+                )
+            session_id = thread_id
         if self._conn is not None:
             await self._conn.session_update(session_id, update)
 
@@ -1424,8 +1456,11 @@ class MiniOrkAcpAgent:
         updates = self._build_event_updates(new_events)
         updates.append(self._build_usage_update(snapshot.get("llm_calls")))
         status = snapshot.get("status")
+        if status is not None:
+            self._run_status[session_id] = str(status)
         if status in TERMINAL_STATUSES:
-            updates.append(self._build_terminal_message(status))
+            routed = session_id if session_id in self._routes else None
+            updates.append(self._build_terminal_message(status, run_id=routed))
         for update in updates:
             await self._emit(session_id, update)
 

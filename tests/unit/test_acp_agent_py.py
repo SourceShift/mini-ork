@@ -37,6 +37,7 @@ from acp.schema import (  # noqa: E402
     TextContentBlock,
     ToolCallProgress,
     ToolCallStart,
+    UsageUpdate,
 )
 
 from mini_ork.acp.agent import MiniOrkAcpAgent, mint_run_id  # noqa: E402
@@ -1492,3 +1493,233 @@ def test_model_picker_reads_the_session_homes_registry(tmp_path, monkeypatch):
     rows = MiniOrkAcpAgent()._list_orchestrator_lanes(home)
     assert [r.value for r in rows] == ["opus", "sonnet"]
     assert rows[1].name == "Sonnet (Claude subscription)"
+
+
+# ── runs followed inside a thread (routing) ─────────────────────────────────
+
+
+class _SidConn:
+    """ACP connection that records which session each update was sent to."""
+
+    def __init__(self) -> None:
+        self.sent: list[tuple[str, Any]] = []
+
+    async def session_update(self, session_id: str, update) -> None:
+        self.sent.append((session_id, update))
+
+
+class _Turn:
+    def __init__(self, cost_usd: float = 0.0) -> None:
+        self.session_id = "sess-1"
+        self.rc = 0
+        self.text = ""
+        self.cost_usd = cost_usd
+        self.error = ""
+
+
+def _start_run_events(run_id: str, recipe: str = "docs") -> list[dict]:
+    return [
+        {"type": "assistant", "message": {"content": [{
+            "type": "tool_use", "id": f"t-{run_id}", "name": "mcp__mini-ork__start_run",
+            "input": {"recipe": recipe}}]}},
+        {"type": "user", "message": {"content": [{
+            "type": "tool_result", "tool_use_id": f"t-{run_id}", "is_error": False,
+            "content": [{"type": "text", "text": json.dumps({"run_id": run_id})}]}]}},
+    ]
+
+
+def _thread_agent(proj: Path, **kwargs) -> tuple[MiniOrkAcpAgent, str]:
+    from unittest.mock import patch
+
+    with patch("mini_ork.acp_orchestrator.config.orchestrator_lanes",
+               return_value=[{"id": "opus", "name": "Opus"}]), \
+         patch("mini_ork.web.recipes.list_recipes", return_value=["code-fix", "docs"]):
+        agent = MiniOrkAcpAgent(poll_interval=0, **kwargs)
+        resp = asyncio.run(agent.new_session(cwd=str(proj)))
+    return agent, resp.session_id
+
+
+def test_child_run_streams_agent_output_into_the_thread(tmp_path):
+    """A run the orchestrator starts shows its agents' live output, closes its
+    marker when it ends, names itself in the terminal message, and the
+    thread's cost is orchestrator + run."""
+    proj = tmp_path / "proj"
+    child = "run-child-live"
+    live_path = proj / ".mini-ork" / "runs" / child / "agent-doc_editor.live.jsonl"
+    live_path.parent.mkdir(parents=True)
+    polls = {"n": 0}
+
+    def reader(rid: str) -> dict:
+        assert rid == child, "only the child run is ever read"
+        polls["n"] += 1
+        start = {"event_type": "node_start",
+                 "payload_json": json.dumps({"node_id": "doc_editor", "node_type": "implementer"})}
+        if polls["n"] == 1:
+            return {"status": "executing", "events": [start], "llm_calls": []}
+        if polls["n"] == 2:
+            _write_live_lines(live_path, [json.dumps({
+                "type": "assistant",
+                "message": {"content": [{"type": "text", "text": "editing CHANGELOG"}]}})])
+            return {"status": "executing", "events": [start], "llm_calls": []}
+        end = {"event_type": "node_end", "payload_json": json.dumps({"node_id": "doc_editor"})}
+        return {"status": "published", "events": [start, end],
+                "llm_calls": [{"cost_usd": 0.25, "total_tokens": 900}]}
+
+    def turn(lane, prompt, cwd, home, resume, on_event):
+        async def _run():
+            for ev in _start_run_events(child):
+                await on_event(ev)
+            return _Turn(cost_usd=0.5)
+        return _run()
+
+    agent, thread = _thread_agent(proj, orchestrator_turn=turn, reader=reader)
+    conn = _SidConn()
+    agent.on_connect(conn)
+
+    async def scenario():
+        await agent.prompt(thread, [_text_block("add a changelog line")])
+        follower = agent._followers.get(child)
+        if follower is not None:
+            await follower
+
+    asyncio.run(scenario())
+    assert {sid for sid, _ in conn.sent} == {thread}, "every update must address the thread"
+    updates = [u for _, u in conn.sent]
+    ids = [u.tool_call_id for u in updates if isinstance(u, (ToolCallStart, ToolCallProgress))]
+    assert f"{child}:doc_editor" in ids and "doc_editor" not in ids
+    texts = [c.content.text for u in updates if isinstance(u, ToolCallProgress)
+             for c in (u.content or [])]
+    assert "editing CHANGELOG" in texts
+    closes = [u for u in updates if isinstance(u, ToolCallProgress)
+              and u.tool_call_id == f"{child}:parent"]
+    assert [u.status for u in closes] == ["completed"]
+    messages = [u.content.text for u in updates if isinstance(u, AgentMessageChunk)]
+    assert f"mini-ork run {child} finished: published" in messages
+    costs = [u.cost.amount for u in updates if isinstance(u, UsageUpdate)]
+    assert costs[-1] == pytest.approx(0.75)
+
+
+def test_direct_mode_run_streams_into_the_thread_not_a_run_session(tmp_path):
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    launched: list[str] = []
+
+    def launcher(rid: str, kickoff: str) -> dict:
+        launched.append(rid)
+        return {"ok": True}
+
+    def reader(rid: str) -> dict:
+        return {"status": "rolled_back", "events": [
+            {"event_type": "node_start", "payload_json": json.dumps({"node_id": "n1"})},
+            {"event_type": "node_end", "payload_json": json.dumps({"node_id": "n1"})}],
+            "llm_calls": []}
+
+    agent, thread = _thread_agent(proj, launcher=launcher, reader=reader)
+    conn = _SidConn()
+    agent.on_connect(conn)
+    resp = asyncio.run(agent.prompt(thread, [_text_block("/run fix the typo")]))
+    assert resp.stop_reason == "end_turn"
+    (rid,) = launched
+    assert {sid for sid, _ in conn.sent} == {thread}
+    ids = [u.tool_call_id for _, u in conn.sent if isinstance(u, (ToolCallStart, ToolCallProgress))]
+    assert ids[0] == f"{rid}:parent" and f"{rid}:n1" in ids
+    close = [u for _, u in conn.sent if isinstance(u, ToolCallProgress)
+             and u.tool_call_id == f"{rid}:parent"]
+    assert [u.status for u in close] == ["failed"]  # rolled_back is not a success
+
+
+def test_direct_mode_launch_failure_explains_and_keeps_the_thread(tmp_path):
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    agent, thread = _thread_agent(
+        proj, launcher=lambda rid, kickoff: {"ok": False, "error": "recipe not found"})
+    conn = _SidConn()
+    agent.on_connect(conn)
+    resp = asyncio.run(agent.prompt(thread, [_text_block("/run x")]))
+    assert resp.stop_reason == "end_turn"
+    texts = [u.content.text for _, u in conn.sent if isinstance(u, AgentMessageChunk)]
+    assert any("recipe not found" in t for t in texts)
+
+
+def test_cancel_stops_only_this_threads_followers_and_not_the_next_turn(tmp_path):
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    runs = iter(["run-a-1", "run-b-1", "run-a-2"])
+
+    def turn(lane, prompt, cwd, home, resume, on_event):
+        async def _run():
+            for ev in _start_run_events(next(runs)):
+                await on_event(ev)
+            return _Turn()
+        return _run()
+
+    def reader(rid: str) -> dict:
+        return {"status": "executing", "events": [], "llm_calls": []}
+
+    agent, thread_a = _thread_agent(proj, orchestrator_turn=turn, reader=reader)
+    from unittest.mock import patch
+    with patch("mini_ork.acp_orchestrator.config.orchestrator_lanes",
+               return_value=[{"id": "opus", "name": "Opus"}]), \
+         patch("mini_ork.web.recipes.list_recipes", return_value=["docs"]):
+        thread_b = asyncio.run(agent.new_session(cwd=str(proj))).session_id
+    agent.on_connect(_SidConn())
+
+    async def scenario():
+        await agent.prompt(thread_a, [_text_block("start a")])
+        await agent.prompt(thread_b, [_text_block("start b")])
+        await agent.cancel(thread_a)
+        await asyncio.sleep(0)
+        assert "run-a-1" not in agent._followers
+        assert not agent._followers["run-b-1"].done(), "thread B's run must keep streaming"
+        # The next turn in the cancelled thread follows its new run again.
+        await agent.prompt(thread_a, [_text_block("start another")])
+        await asyncio.sleep(0)
+        assert not agent._followers["run-a-2"].done()
+        for task in list(agent._followers.values()):
+            task.cancel()
+
+    asyncio.run(scenario())
+
+
+def test_cancel_during_direct_mode_stops_the_run(tmp_path):
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    stopped: list[str] = []
+
+    def reader(rid: str) -> dict:
+        return {"status": "executing", "events": [], "llm_calls": []}
+
+    agent, thread = _thread_agent(
+        proj, launcher=lambda rid, kickoff: {"ok": True}, reader=reader,
+        stopper=lambda rid: stopped.append(rid) or {"ok": True}, cancel_grace=0)
+    agent.on_connect(_SidConn())
+
+    async def scenario():
+        turn = asyncio.create_task(agent.prompt(thread, [_text_block("/run slow job")]))
+        for _ in range(5):
+            await asyncio.sleep(0)
+        await agent.cancel(thread)
+        return await turn
+
+    resp = asyncio.run(scenario())
+    assert resp.stop_reason == "cancelled"
+    assert len(stopped) == 1 and stopped[0].startswith("run-")
+
+
+def test_thread_usage_is_sent_only_when_the_total_changes(tmp_path):
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    polls = {"n": 0}
+
+    def reader(rid: str) -> dict:
+        polls["n"] += 1
+        calls = [{"cost_usd": 0.1}] if polls["n"] < 4 else [{"cost_usd": 0.1}, {"cost_usd": 0.2}]
+        return {"status": "published" if polls["n"] >= 5 else "executing",
+                "events": [], "llm_calls": calls}
+
+    agent, thread = _thread_agent(proj, launcher=lambda rid, kickoff: {"ok": True}, reader=reader)
+    conn = _SidConn()
+    agent.on_connect(conn)
+    asyncio.run(agent.prompt(thread, [_text_block("/run x")]))
+    costs = [u.cost.amount for _, u in conn.sent if isinstance(u, UsageUpdate)]
+    assert costs == [pytest.approx(0.1), pytest.approx(0.3)]
