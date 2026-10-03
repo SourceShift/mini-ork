@@ -482,6 +482,14 @@ def _run_lifecycle(argv, root) -> int:
                 # End the run principal on every return path and on exceptions,
                 # and pop the handle so --json never emits the object.
                 concord_run.stop(sink.pop("_concord", None))
+            # Raise task_runs.cost_usd to the ledger total so every reporter
+            # (web UI, MCP list_runs / run_status / wait_for_run, ACP history,
+            # the ``mini_ork_result`` line) shows the same number. Best-effort:
+            # reconcile errors MUST NOT change the run's return code.
+            try:
+                _reconcile_run_cost(sink)
+            except Exception as exc:  # noqa: BLE001 — teardown is best-effort
+                sys.stderr.write(f"[warn] cost reconcile failed: {exc}\n")
     if emit_json:
         sink["returncode"] = rc
         sys.stdout.write(
@@ -506,6 +514,28 @@ def _release_remote_session() -> None:
                                env=context_env_snapshot())
     except Exception as exc:  # noqa: BLE001 — teardown is best-effort; the node TTLs it
         sys.stderr.write(f"[warn] remote session release failed: {exc}\n")
+
+
+def _reconcile_run_cost(sink: dict) -> None:
+    """Mirror ``cost_ledger.reconcile_run_cost`` into the lifecycle's ``sink``.
+
+    Skips on dry-run (no task_runs row to update) and when the lifecycle has
+    not stamped a ``run_id`` into the sink. Resolves the db the way the
+    lifecycle already does (``MINI_ORK_DB`` → ``<MINI_ORK_HOME>/state.db``).
+    Never raises — the caller wraps it in ``try/except`` as belt-and-braces.
+    """
+    if os.environ.get("MINI_ORK_DRY_RUN", "0") == "1":
+        return
+    run_id = sink.get("run_id") or context_env("MINI_ORK_RUN_ID", "")
+    if not run_id:
+        return
+    from mini_ork import cost_ledger
+    from mini_ork.learning.advantage_store import resolve_db_path
+
+    db = resolve_db_path(context_env("MINI_ORK_DB") or None)
+    cost = cost_ledger.reconcile_run_cost(db, run_id)
+    if cost is not None:
+        sink["cost_usd"] = round(cost, 6)
 
 
 RC_BLOCKED = 75  # EX_TEMPFAIL: the run never started; retry once the cause clears

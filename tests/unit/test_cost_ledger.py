@@ -10,6 +10,7 @@ that date ages past 24h.
 """
 from __future__ import annotations
 
+import json
 import sqlite3
 import sys
 import time
@@ -42,7 +43,8 @@ def _init_db(path: Path, *, with_llm_calls: bool = True, with_task_runs: bool = 
                 "CREATE TABLE task_runs("
                 "id TEXT,"
                 "cost_usd REAL,"
-                "created_at INTEGER"
+                "created_at INTEGER,"
+                "updated_at INTEGER"
                 ")"
             )
         con.commit()
@@ -228,3 +230,290 @@ def test_idle_wal_db_without_sidecar_files_is_still_read(tmp_path: Path) -> None
             os.remove(side)
 
     assert cost_ledger.spent_last_24h(db) == pytest.approx(3.5)
+
+
+# ── run_cost / reconcile_run_cost (run-cost-1791018816) ─────────────────────
+
+
+def test_run_cost_sums_only_the_runs_rows(tmp_path: Path) -> None:
+    db = _init_db(tmp_path / "run-cost")
+    now = time.time()
+    _insert_llm_call(db, run_id="r1", cost=0.50, ts=_iso(now - 600))
+    _insert_llm_call(db, run_id="r1", cost=0.25, ts=_iso(now - 1200))
+    _insert_llm_call(db, run_id="r2", cost=99.0, ts=_iso(now - 600))
+
+    assert cost_ledger.run_cost(db, "r1") == pytest.approx(0.75)
+    assert cost_ledger.run_cost(db, "r2") == pytest.approx(99.0)
+
+
+def test_run_cost_returns_none_when_run_has_no_rows(tmp_path: Path) -> None:
+    db = _init_db(tmp_path / "run-cost-empty")
+    _insert_llm_call(db, run_id="r1", cost=0.5, ts=_iso(time.time() - 600))
+
+    assert cost_ledger.run_cost(db, "nope") is None
+
+
+def test_run_cost_returns_none_when_llm_calls_table_missing(tmp_path: Path) -> None:
+    db = _init_db(tmp_path / "run-cost-no-table", with_llm_calls=False)
+
+    assert cost_ledger.run_cost(db, "r1") is None
+
+
+def test_run_cost_returns_none_for_missing_db(tmp_path: Path) -> None:
+    assert cost_ledger.run_cost(None, "r1") is None
+    assert cost_ledger.run_cost("", "r1") is None
+    assert cost_ledger.run_cost(tmp_path / "does-not-exist.db", "r1") is None
+
+
+def test_run_cost_returns_none_for_empty_run_id(tmp_path: Path) -> None:
+    db = _init_db(tmp_path / "run-cost-empty-id")
+    _insert_llm_call(db, run_id="r1", cost=0.5, ts=_iso(time.time() - 600))
+
+    assert cost_ledger.run_cost(db, "") is None
+
+
+def test_run_cost_survives_wal_db_without_sidecar_files(tmp_path: Path) -> None:
+    """Idle WAL with no -shm/-wal: same trap spent_last_24h avoids."""
+    import os
+
+    db = tmp_path / "state.db"
+    con = sqlite3.connect(db)
+    con.execute("PRAGMA journal_mode=wal")
+    con.execute("CREATE TABLE llm_calls(id INTEGER PRIMARY KEY, run_id TEXT, cost_usd REAL, ts TEXT)")
+    con.execute("INSERT INTO llm_calls(run_id, cost_usd, ts) VALUES ('r1', 2.5, ?)", (_iso(time.time() - 60),))
+    con.commit()
+    con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    con.close()
+    for suffix in ("-shm", "-wal"):
+        side = tmp_path / f"state.db{suffix}"
+        if side.exists():
+            os.remove(side)
+
+    assert cost_ledger.run_cost(db, "r1") == pytest.approx(2.5)
+
+
+def test_reconcile_run_cost_raises_stored_to_ledger_total(tmp_path: Path) -> None:
+    db = _init_db(tmp_path / "reconcile-raise")
+    now = time.time()
+    _insert_llm_call(db, run_id="run-raise", cost=0.40, ts=_iso(now - 600))
+    _insert_llm_call(db, run_id="run-raise", cost=0.30, ts=_iso(now - 1200))
+    con = sqlite3.connect(db)
+    try:
+        con.execute(
+            "INSERT INTO task_runs (id, cost_usd, created_at) VALUES (?, ?, ?)",
+            ("run-raise", 0.20, int(now - 600)),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+    assert cost_ledger.reconcile_run_cost(db, "run-raise") == pytest.approx(0.70)
+    # Persisted to the task_runs row.
+    con = sqlite3.connect(db)
+    try:
+        row = con.execute(
+            "SELECT cost_usd FROM task_runs WHERE id = ?", ("run-raise",),
+        ).fetchone()
+    finally:
+        con.close()
+    assert row[0] == pytest.approx(0.70)
+    # Second call is a no-op (stored already equals ledger).
+    assert cost_ledger.reconcile_run_cost(db, "run-raise") == pytest.approx(0.70)
+
+
+def test_reconcile_run_cost_never_lowers_stored(tmp_path: Path) -> None:
+    db = _init_db(tmp_path / "reconcile-no-lower")
+    now = time.time()
+    # Ledger says $0.10; node handler already wrote $5.00 — must stay $5.00.
+    _insert_llm_call(db, run_id="r1", cost=0.10, ts=_iso(now - 600))
+    con = sqlite3.connect(db)
+    try:
+        con.execute(
+            "INSERT INTO task_runs (id, cost_usd, created_at) VALUES (?, ?, ?)",
+            ("run-big", 5.00, int(now - 600)),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+    assert cost_ledger.reconcile_run_cost(db, "run-big") == pytest.approx(5.00)
+    # Persisted value must be the larger stored number, not the ledger sum.
+    assert cost_ledger.run_cost(db, "r1") == pytest.approx(0.10)
+
+
+def test_reconcile_run_cost_unknown_run_returns_none(tmp_path: Path) -> None:
+    db = _init_db(tmp_path / "reconcile-unknown")
+    _insert_llm_call(db, run_id="r1", cost=0.40, ts=_iso(time.time() - 600))
+    con = sqlite3.connect(db)
+    try:
+        con.execute(
+            "INSERT INTO task_runs (id, cost_usd, created_at) VALUES (?, ?, ?)",
+            ("run-keep", 0.20, int(time.time()) - 600),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+    assert cost_ledger.reconcile_run_cost(db, "no-such-run") is None
+
+
+def test_reconcile_run_cost_returns_none_for_missing_db(tmp_path: Path) -> None:
+    assert cost_ledger.reconcile_run_cost(None, "r1") is None
+    assert cost_ledger.reconcile_run_cost(tmp_path / "nope.db", "r1") is None
+
+
+def test_reconcile_run_cost_bumps_updated_at(tmp_path: Path) -> None:
+    db = _init_db(tmp_path / "reconcile-bump")
+    now = int(time.time())
+    before = now - 600
+    con = sqlite3.connect(db)
+    try:
+        con.execute(
+            "INSERT INTO task_runs (id, cost_usd, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?)",
+            ("r-old", 0.10, before, before),
+        )
+        con.execute(
+            "INSERT INTO llm_calls (run_id, cost_usd, ts) VALUES (?, ?, ?)",
+            ("r-old", 0.99, _iso(now - 60)),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+    after = cost_ledger.reconcile_run_cost(db, "r-old")
+    assert after == pytest.approx(0.99)
+
+    con = sqlite3.connect(db)
+    try:
+        row = con.execute(
+            "SELECT cost_usd, updated_at FROM task_runs WHERE id = ?", ("r-old",),
+        ).fetchone()
+    finally:
+        con.close()
+    assert row[0] == pytest.approx(0.99)
+    assert row[1] > before
+
+
+def test_lifecycle_reconcile_publishes_cost_usd_to_sink(tmp_path, monkeypatch):
+    """`_run_lifecycle` calls reconcile at the end; mini_ork_result carries cost_usd."""
+    from mini_ork.cli import main as cli_main
+
+    home = tmp_path / "home"
+    home.mkdir()
+    db = home / "state.db"
+    # Migrate the db so _open_db / StateDB find a real schema.
+    from mini_ork.stores.migrate import init_db
+
+    rc, out, err = init_db(db=str(db), root=str(REPO))
+    assert rc == 0, f"init_db rc={rc}\nstdout={out}\nstderr={err}"
+
+    # Production llm_calls.run_id is INTEGER; pick a numeric run_id so the
+    # reconcile can match the rows.
+    run_id = 42
+    import sqlite3 as _sq
+    con = _sq.connect(str(db))
+    try:
+        con.execute(
+            "INSERT INTO task_runs (id, task_class, recipe, kickoff_path, status, "
+            "cost_usd, created_at, updated_at) VALUES (?, 'x', 'r', 'k', 'published', "
+            "0.10, strftime('%s','now'), strftime('%s','now'))",
+            (str(run_id),),
+        )
+        con.execute(
+            "INSERT INTO llm_calls (provider, model_id, tier, feature_name, "
+            "status, run_id, cost_usd, ts) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            ("anthropic", "test", "default", "test", "success",
+             run_id, 0.74, time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(time.time() - 60))),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+    monkeypatch.setenv("MINI_ORK_HOME", str(home))
+    monkeypatch.setenv("MINI_ORK_DB", str(db))
+    monkeypatch.setenv("MINI_ORK_DRY_RUN", "0")
+
+    # Capture --json output via stdout.
+    import io as _io
+
+    captured: dict = {}
+
+    def fake_impl(argv, root, sink):
+        del argv, root
+        sink["run_id"] = run_id
+        sink["verdict"] = "pass"
+        return 0
+
+    monkeypatch.setattr(cli_main, "_run_lifecycle_impl", fake_impl)
+
+    real_stdout = sys.stdout
+    buf = _io.StringIO()
+    sys.stdout = buf
+    try:
+        rc = cli_main._run_lifecycle(["--json"], str(REPO))
+    finally:
+        sys.stdout = real_stdout
+    assert rc == 0
+    line = buf.getvalue().strip().splitlines()[-1]
+    assert line.startswith("mini_ork_result=")
+    captured["sink"] = json.loads(line[len("mini_ork_result="):])
+    assert captured["sink"]["cost_usd"] == pytest.approx(0.74)
+
+
+def test_lifecycle_reconcile_dry_run_does_not_reconcile(monkeypatch):
+    """MINI_ORK_DRY_RUN=1 skips the reconcile call — sink stays without cost_usd."""
+    from mini_ork.cli import main as cli_main
+
+    monkeypatch.setenv("MINI_ORK_DRY_RUN", "1")
+    import io as _io
+
+    def fake_impl(argv, root, sink):
+        del argv, root
+        sink["run_id"] = "run-dry"
+        sink["verdict"] = "pass"
+        return 0
+
+    monkeypatch.setattr(cli_main, "_run_lifecycle_impl", fake_impl)
+
+    real_stdout = sys.stdout
+    buf = _io.StringIO()
+    sys.stdout = buf
+    try:
+        rc = cli_main._run_lifecycle(["--json"], str(REPO))
+    finally:
+        sys.stdout = real_stdout
+    assert rc == 0
+    sink = json.loads(buf.getvalue().strip().splitlines()[-1][len("mini_ork_result="):])
+    assert "cost_usd" not in sink
+
+
+def test_lifecycle_reconcile_error_does_not_change_rc(tmp_path, monkeypatch):
+    """If reconcile raises, the lifecycle still returns the original rc."""
+    from mini_ork.cli import main as cli_main
+
+    monkeypatch.setenv("MINI_ORK_HOME", str(tmp_path))
+    monkeypatch.setenv("MINI_ORK_DB", str(tmp_path / "state.db"))
+    monkeypatch.setenv("MINI_ORK_DRY_RUN", "0")
+
+    def boom(sink):
+        del sink
+        raise RuntimeError("simulated db corruption")
+
+    monkeypatch.setattr(cli_main, "_reconcile_run_cost", boom)
+
+    def fake_impl(argv, root, sink):
+        del argv, root
+        sink["run_id"] = "run-boom"
+        return 7
+
+    monkeypatch.setattr(cli_main, "_run_lifecycle_impl", fake_impl)
+    import io as _io
+
+    real_stdout = sys.stdout
+    sys.stdout = _io.StringIO()
+    try:
+        rc = cli_main._run_lifecycle(["--json"], str(REPO))
+    finally:
+        sys.stdout = real_stdout
+    assert rc == 7

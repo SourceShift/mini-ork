@@ -213,6 +213,56 @@ def test_list_runs_caps_limit(server_home):
     assert len(body["runs"]) == 1
 
 
+def test_list_runs_reports_total(server_home):
+    resp = _call_args({"name": "list_runs", "arguments": {}})
+    body = json.loads(resp["result"]["content"][0]["text"])
+    # The fixture seeds exactly two runs.
+    assert body["total"] == 2
+    assert len(body["runs"]) == 2
+
+
+def test_list_runs_total_exceeds_page_when_more_than_limit(server_home):
+    """The orchestrator answered '10 runs' from a default page of 10 — the
+    ``total`` field is the count of matching runs, not the page length."""
+    import sqlite3 as _sq
+
+    db_path = server_home / "state.db"
+    con = _sq.connect(str(db_path))
+    try:
+        now = int(time.time())
+        # Add 12 more rows (status=published) so the fixture has 14 total and
+        # the default page (limit=20) actually fits them all; then ask for a
+        # smaller limit so total > len(rows).
+        for i in range(12):
+            run_id = f"run-extra-{i}"
+            con.execute(
+                "INSERT INTO task_runs (id, task_class, recipe, kickoff_path, "
+                "status, cost_usd, created_at, updated_at) "
+                "VALUES (?, 'x', 'r', 'k', 'published', 0, ?, ?)",
+                (run_id, now - i, now - i),
+            )
+        con.commit()
+    finally:
+        con.close()
+
+    resp = _call_args({"name": "list_runs", "arguments": {"limit": 5}})
+    body = json.loads(resp["result"]["content"][0]["text"])
+    assert body["total"] == 14
+    assert len(body["runs"]) == 5
+    assert body["total"] > len(body["runs"])
+
+
+def test_list_runs_total_respects_status_filter(server_home):
+    """``total`` reflects the same filter as ``runs``."""
+    resp = _call_args(
+        {"name": "list_runs", "arguments": {"status": "failed"}}
+    )
+    body = json.loads(resp["result"]["content"][0]["text"])
+    assert body["total"] == 1
+    assert len(body["runs"]) == 1
+    assert body["runs"][0]["id"] == "run-z-1"
+
+
 # ── run_detail ────────────────────────────────────────────────────────────
 
 

@@ -172,7 +172,14 @@ def _list_runs(home: Path, args: dict[str, Any]) -> dict[str, Any]:
             "created_at": r.get("created_at"),
             "title": title,
         })
-    return {"runs": runs}
+    count_sql = "SELECT COUNT(*) FROM task_runs"
+    count_params: tuple[Any, ...] = ()
+    if isinstance(status, str) and status.strip():
+        count_sql += " WHERE status = ?"
+        count_params = (status.strip(),)
+    count_rows = db.rows(count_sql, count_params)
+    total = int(count_rows[0].get("COUNT(*)", 0)) if count_rows else 0
+    return {"runs": runs, "total": total}
 
 
 # ── tool: run_detail ────────────────────────────────────────────────────────
@@ -695,7 +702,8 @@ TOOL_DEFS: list[dict[str, Any]] = [
         "name": "list_runs",
         "description": (
             "List mini-ork runs newest-first (id, status, recipe, cost, "
-            "created_at, derived title). Read-only."
+            "created_at, derived title). Read-only. ``total`` is the number "
+            "of matching runs; ``runs`` holds at most ``limit`` (default 20)."
         ),
         "inputSchema": {
             "type": "object",
