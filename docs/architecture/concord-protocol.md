@@ -164,6 +164,26 @@ whether the change breaks its plan. Everything weaker goes to a batched digest.
 | `POST /api/v1/coord/footprints` | PostToolUse (async) on Read/Edit/Write/MultiEdit/NotebookEdit | Records `(principal, worker, op, path, mtime_ns, size, seq)`; the server stats the file |
 | `POST /api/v1/coord/precheck` | PreToolUse (sync) on Edit/Write/MultiEdit/NotebookEdit | Warns if a write to the path exists from a principal outside P's lineage after P's latest footprint on it. It is advisory **context only** and never sets `permissionDecision`. In Claude Code, `"allow"` would skip the user's permission prompt, so it must never be returned |
 
+**P1b — disk truth.** Some writers leave no footprint: shell redirects, `sed -i`,
+scripts, editors, formatters, `git checkout`, humans. When P1 finds no recorded
+foreign writer, the precheck compares the newest footprint on the path (its
+`mtime_ns`/`size`) with the file on disk. If they differ, it adds one paragraph:
+"changed on disk after the last change any agent recorded … Re-read it before
+editing" ("was deleted on disk" when the file is gone). A 2 s grace window
+absorbs the lag of the caller's own async footprint. Configuration:
+`CONTEXTNEST_CONCORD_DISK_CHECK=0` turns the check off;
+`CONTEXTNEST_CONCORD_DISK_GRACE_MS` sets the grace window. The metric is
+`coord_precheck_unrecorded_total`.
+
+**How this layers with Claude Code's own guard.** Claude Code validates an Edit
+against its own read state *before* PreToolUse hooks run. If `old_string` no longer
+matches, or the file is "modified since read", the Edit is refused, and Concord
+never sees that attempt. If `old_string` still matches, the stale Edit **applies**,
+with only a note after the fact. That is the case Concord's precheck flags, and it
+names the writer. Harnesses without a read-state guard (codex, opencode, mini-ork
+lanes, scripts) depend on Concord's precheck alone. They call the same HTTP
+contract.
+
 
 ## P2 — hot set, claimed scope, admission, digest (shipped)
 
@@ -183,15 +203,84 @@ When modes compose, the strictest wins (deny > ask > notice). Operator views:
 `mini-ork concord ps` (who is running), `concord claims` (who holds hot files), and
 `concord violations` (out-of-scope edits).
 
+## P3 — topic overlap (shipped, off by default)
+
+File checks miss two agents **working on the same thing** before their files
+collide. That was the original incident: two RSI loops improving the same surface.
+
+- On each UserPromptSubmit, ContextNest embeds the prompt as the principal's
+  current **intent**. This runs off the hook's critical path.
+- The caller's stored intent is compared with other live intents. Live means: not
+  ended, not in the caller's lineage, and updated within
+  `CONTEXTNEST_CONCORD_TOPIC_WINDOW_SECS`.
+- With `CONTEXTNEST_CONCORD_TOPIC=1` and cosine ≥ `…_TOPIC_THRESHOLD` (0.85), the
+  next turn gets one line, at most once per pair per `…_TOPIC_DEDUP_SECS`:
+  `[concord] ↔ <other> may be working on the same thing: "…" (similarity 0.87)`.
+
+Semantic intent matching is low-precision in the literature: 27.9% in
+arXiv:2604.16339. So notices are opt-in. Calibrate first: `GET
+/api/v1/coord/topic-pairs?min=0.5` lists live pairs and their similarity whether
+notices are on or off. `GET /api/v1/coord/intents` shows the captured text. Both
+return raw prompt text (up to 500 chars); keep the substrate on localhost or the
+tailnet.
+
+## P4 — alone versus combined at merge (shipped)
+
+When the green gate fails after `make worktree-merge` rebased onto a moved
+`origin/main`, the merge reruns the same test command on the branch's pre-rebase
+commit, in a throwaway worktree. The verdict is one of:
+- `SEMANTIC CONFLICT: the branch passes alone … fails combined with N upstream
+  commit(s)` (it names them);
+- `the branch also fails alone`.
+
+`MO_MERGE_DIFFERENTIAL=0` skips the rerun.
+
+## Live smoke
+
+`scripts/concord_live_smoke.py --cn-bin <contextnest>` drives an isolated
+substrate (its own port, data dir and throwaway HOME) with real `claude -p`
+sessions, the `mini-ork concord` CLI, worktrees and runs. Every scenario asserts on
+server state: principals, deliveries, footprints, claims, violations, metrics, and
+file contents. `--only 2,2b` reruns a subset. Run it after changing a Concord
+endpoint or the installed hooks.
+
+| Scenario | Proves |
+|---|---|
+| S0 | `ingest claude-code --install-hooks --project-path` writes the turn, precheck and footprint hooks to the project only |
+| S1 | A message sent to `loop:<name>` reaches the **next** short-lived worker the loop spawns (the handover incident) |
+| S2a/S2b | Stale premise: Claude Code (the precheck flags the stale Edit, or Claude refuses it) and a guard-less harness over HTTP (warns, names the writer, clears after re-read) |
+| S2c/S2d | A writer Concord never sees (a shell append), over HTTP and live: P1b flags it |
+| S3 | The per-turn digest lists a file another agent changed |
+| S4 | Hot-file claim plus warn |
+| S5, S6 | `--owns` audit; after a restart, claims persist and deny mode blocks a hot edit and an out-of-scope write, but allows an in-scope new file |
+| S7, S8 | A `mini-ork run` registers `run:<id>` for its children; `concord admit` defers an overlapping epic |
+| S9 | Hook round trip p95 < 50 ms |
+| S11 | Topic overlap: two loops with the same task are told about each other, and an unrelated loop is not |
+| S10 | With the substrate down, the wrapper and Claude sessions fail open |
+
+Last full run: **18/18** against ContextNest `1c09ee3` (2026-10-03). Hook round
+trip p95 was 5 ms. With the production embedder (Qwen3-Embedding-0.6B), S11
+scored the same-task loops 0.997 and the unrelated loop 0.71 against both. The
+default local embedder scores *any* two English prompts 0.73–0.97, so topic
+notices must never be turned on without a real embedder. One open P3 weakness:
+an intent is the principal's **latest** prompt (≥ 20 chars). That works for loop
+workers, whose prompt is the task, but in an interactive session a status
+question replaces the work topic.
+
+The smoke surfaced three Claude Code behaviours a harness must design around:
+- Edit validation precedes PreToolUse.
+- `--permission-mode acceptEdits` lets a model fall back to shell writes, which leave no footprint (P1b exists because of this).
+- Models put long `sleep`s in the background, so ordering uses file barriers instead of timing.
+
 ## Roadmap
 
 | Phase | Adds |
 |---|---|
 | P0.5 | ✅ Offline replay + labelled precision (see above) |
-| P1 | Footprints + pre-action stale-premise check (above); then intents (declared scope plus assumptions) and a per-turn `changes_since` digest for weaker signals |
+| P1 | ✅ Footprints + pre-action stale-premise check; ✅ P1b disk truth for writers Concord never sees |
 | P2 | ✅ Hot-set claims, `--owns` enforcement, per-turn digest, epic admission (see above). Still open: publish-gate validation of the `main` ref |
-| P3 | Topic overlap through live intents; ack, escalate and freeze arbitration |
-| P4 | Alone-versus-combined test validation at merge |
+| P3 | ✅ Topic overlap through live intents (opt-in, calibrate first). Still open: ack, escalate and freeze arbitration; attributing Bash writes to a principal |
+| P4 | ✅ Alone-versus-combined test validation at merge |
 
 Design rationale and literature: see the Concord design note (2026-10-02 coordination
 technique review, 1000 papers, three independent reviewers).
