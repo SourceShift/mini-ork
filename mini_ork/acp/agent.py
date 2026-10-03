@@ -45,6 +45,7 @@ from acp.schema import (
     ConfigOptionUpdate,
     ContentToolCallContent,
     Cost,
+    FileEditToolCallContent,
     Implementation,
     InitializeResponse,
     ListSessionsResponse,
@@ -70,6 +71,7 @@ from acp.schema import (
     UserMessageChunk,
 )
 
+from mini_ork.acp import diffs as _diffs
 from mini_ork.acp import history
 from mini_ork.acp import orchestration as _orchestration
 from mini_ork.acp.live import LiveTail, normalize
@@ -298,6 +300,13 @@ class MiniOrkAcpAgent:
         # (session, node) pairs whose agent already streamed text — a final
         # ``result`` event is shown only for nodes that streamed nothing.
         self._text_seen: set[tuple[str, str]] = set()
+        # (session, node) pairs whose diffs were already emitted for an
+        # implementer ``node_end``. Z4 dedup: a live poll cycle that re-runs
+        # the same snapshot must not re-emit the diff update. Mirrors the
+        # ``_emitted`` lifecycle set but is keyed independently — a load that
+        # resets ``_emitted`` must also reset this set so the first emit of
+        # the load fires.
+        self._diff_emitted: set[tuple[str, str]] = set()
         # session id → node_id → LiveTail (Z3 live projection). Constructed
         # lazily on first node_start; held until session end.
         self._tails: dict[str, dict[str, LiveTail]] = {}
@@ -745,6 +754,12 @@ class MiniOrkAcpAgent:
         # reset emitted transitions so replay starts clean.
         self._sessions[session_id] = cwd
         self._emitted.pop(session_id, None)
+        # Z4: the live diff hook also tracks "did we already emit diffs for
+        # this (run, node)" — reset on load so a 2nd load fires again. Mirrors
+        # the ``_emitted.pop`` reset above.
+        self._diff_emitted = {
+            key for key in self._diff_emitted if key[0] != session_id
+        }
         home = self._home_for(session_id)
         snapshot = history.read_snapshot(home, session_id)
         if snapshot.get("status") is None:
@@ -767,6 +782,11 @@ class MiniOrkAcpAgent:
             started = self._started_node_ids(snapshot)
             if started:
                 await self._replay_live_for(session_id, sorted(started))
+        # Z4: surface the implementer's file edits under the implementer node
+        # id resolved from the lifecycle events. Cache replay when present,
+        # recompute + cache when absent (and prefix a "may have changed"
+        # note). Rolled-back runs get the dedicated message instead.
+        await self._emit_diff_update_for_loaded_run(session_id, snapshot)
         if snapshot.get("status") not in TERMINAL_STATUSES:
             self._followers[session_id] = asyncio.create_task(self._follow(session_id))
         return LoadSessionResponse()
@@ -1287,6 +1307,135 @@ class MiniOrkAcpAgent:
             content=TextContentBlock(type="text", text=text),
         )
 
+    # ── implementer diff projection (Z4) ──────────────────────────────────────
+
+    @staticmethod
+    def _implementer_node_id(snapshot: dict[str, Any]) -> str:
+        """Return the implementer node id from lifecycle events, or the literal
+        ``"implementer"`` when the snapshot has none.
+
+        The recipe convention is one ``implementer`` per recipe run, so the
+        literal fallback matches the kickoff's "falling back to
+        ``implementer``" contract — even an empty snapshot (status set, no
+        events yet) still produces a usable id.
+        """
+        for ev in snapshot.get("events") or []:
+            if ev.get("event_type") not in ("node_start", "node_end"):
+                continue
+            payload = ev.get("payload_json") or {}
+            if isinstance(payload, str):
+                try:
+                    payload = json.loads(payload)
+                except (json.JSONDecodeError, TypeError):
+                    payload = {}
+            node_type = str(payload.get("node_type") or ev.get("node_type") or "")
+            if node_type == "implementer":
+                return str(payload.get("node_id") or ev.get("node_id") or "implementer")
+        return "implementer"
+
+    @staticmethod
+    def _build_diff_progress(
+        node_id: str, diffs_list: list[dict[str, Any]]
+    ) -> ToolCallProgress:
+        """Wrap ``diffs_list`` as the content of one ``ToolCallProgress``.
+
+        Empty input still yields a valid ``ToolCallProgress`` with an empty
+        content list — the caller checks ``diffs_list`` before deciding
+        whether to emit it (an empty update on the wire is wasted bandwidth
+        and confusing to clients).
+        """
+        content: list[Any] = [
+            FileEditToolCallContent(
+                type="diff",
+                path=str(entry["path"]),
+                old_text=entry.get("old_text"),
+                new_text=str(entry.get("new_text", "")),
+            )
+            for entry in diffs_list
+        ]
+        return ToolCallProgress(
+            session_update="tool_call_update",
+            tool_call_id=node_id,
+            status="completed",
+            content=cast(Any, content),
+        )
+
+    async def _emit_diff_update_for_run(
+        self, session_id: str, node_id: str
+    ) -> None:
+        """Live path — fire one diff update the first time an implementer
+        ``node_end`` for ``(session_id, node_id)`` is seen.
+
+        Reads the run dir, computes diffs (which also writes the cache), and
+        emits one ``ToolCallProgress`` through ``_emit`` — that means a run
+        followed inside a thread gets the ``"<run_id>:"`` prefix automatically.
+        A subsequent poll that re-projects the same ``node_end`` is a no-op
+        via ``_diff_emitted``.
+        """
+        if (session_id, node_id) in self._diff_emitted:
+            return
+        run_dir = self._home_for(session_id) / "runs" / session_id
+        if not run_dir.is_dir():
+            return
+        diffs_list = _diffs.run_diffs(run_dir)
+        if not diffs_list:
+            return
+        self._diff_emitted.add((session_id, node_id))
+        await self._emit(session_id, self._build_diff_progress(node_id, diffs_list))
+
+    async def _emit_diff_update_for_loaded_run(
+        self, session_id: str, snapshot: dict[str, Any]
+    ) -> None:
+        """Load path — fire one diff update (cache or computed) after replay.
+
+        When the run's status is ``rolled_back``, emit a single agent
+        message instead. When the cache is absent, prefix a "showing the
+        files as they are now — they may have changed since the run" note
+        so a future editor is not silently misled. The diffs attach to the
+        implementer node id resolved from the lifecycle events
+        (fallback ``"implementer"``). Dedup keyed on ``(session_id,
+        node_id)`` mirrors the live path.
+        """
+        status = snapshot.get("status")
+        node_id = self._implementer_node_id(snapshot)
+        if (session_id, node_id) in self._diff_emitted:
+            return
+        if status == "rolled_back":
+            self._diff_emitted.add((session_id, node_id))
+            await self._emit(
+                session_id,
+                AgentMessageChunk(
+                    session_update="agent_message_chunk",
+                    content=TextContentBlock(
+                        type="text",
+                        text=f"Run {session_id}: its changes were rolled back; nothing to review.",
+                    ),
+                ),
+            )
+            return
+        run_dir = self._home_for(session_id) / "runs" / session_id
+        if not run_dir.is_dir():
+            return
+        diffs_list, from_cache = _diffs.cached_or_computed(run_dir)
+        if not diffs_list:
+            return
+        self._diff_emitted.add((session_id, node_id))
+        if not from_cache:
+            await self._emit(
+                session_id,
+                AgentMessageChunk(
+                    session_update="agent_message_chunk",
+                    content=TextContentBlock(
+                        type="text",
+                        text=(
+                            f"Run {session_id}: showing the files as they are now — "
+                            "they may have changed since the run."
+                        ),
+                    ),
+                ),
+            )
+        await self._emit(session_id, self._build_diff_progress(node_id, diffs_list))
+
     # ── live sidecar projection (Z3) ─────────────────────────────────────────
 
     @staticmethod
@@ -1555,6 +1704,30 @@ class MiniOrkAcpAgent:
             updates.append(self._build_terminal_message(status, run_id=routed))
         for update in updates:
             await self._emit(session_id, update)
+        if not live:
+            # A replay (load) shows the run's recorded diff — see
+            # _emit_diff_update_for_loaded_run; recomputing here would diff
+            # today's files and overwrite the cache with them.
+            return
+        # Z4: surface the implementer's file edits under the implementer's
+        # tool call so Zed's Review Changes picks them up. Fires once per
+        # (run, node) on the implementer's ``node_end``; subsequent polls
+        # of the same snapshot are deduped by ``_diff_emitted``. The diff
+        # computation also writes the cache, so a later ``load_session``
+        # replays from disk without re-invoking git.
+        for ev in new_events:
+            if ev.get("event_type") != "node_end":
+                continue
+            payload = ev.get("payload_json") or {}
+            if isinstance(payload, str):
+                try:
+                    payload = json.loads(payload)
+                except (json.JSONDecodeError, TypeError):
+                    payload = {}
+            node_type = str(payload.get("node_type") or ev.get("node_type") or "")
+            node_id = str(payload.get("node_id") or ev.get("node_id") or "implementer")
+            if node_type == "implementer" or node_id == "implementer":
+                await self._emit_diff_update_for_run(session_id, node_id)
 
     async def _await_terminal(self, session_id: str) -> StopReason:
         reader = self._reader or self._read_snapshot
@@ -1787,6 +1960,9 @@ class MiniOrkAcpAgent:
         # A clean replay: forget what this process already sent for the run.
         self._emitted.pop(run_id, None)
         self._tails.pop(run_id, None)
+        # Z4: mirror the ``_emitted.pop`` reset for the diff dedup set so a
+        # 2nd thread load fires the diff update again.
+        self._diff_emitted = {key for key in self._diff_emitted if key[0] != run_id}
         self._text_seen = {key for key in self._text_seen if key[0] != run_id}
         snapshot = (self._reader or self._read_snapshot)(run_id) or {
             "status": None,
@@ -1800,6 +1976,12 @@ class MiniOrkAcpAgent:
         started = self._started_node_ids(snapshot)
         if started:
             await self._replay_live_for(run_id, sorted(started))
+        # Z4: surface the run's file edits under the run's implementer node id
+        # (resolved from lifecycle). Routes through ``_emit`` so the thread
+        # prefix lands automatically. The status check inside
+        # ``_emit_diff_update_for_loaded_run`` skips the diffs for rolled-back
+        # runs and emits the dedicated message instead.
+        await self._emit_diff_update_for_loaded_run(run_id, snapshot)
         return True
 
     def _home_for(self, session_id: str | None) -> Path:

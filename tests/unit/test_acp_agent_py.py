@@ -34,6 +34,7 @@ if str(REPO) not in sys.path:
 
 from acp.schema import (  # noqa: E402
     AgentMessageChunk,
+    FileEditToolCallContent,
     TextContentBlock,
     ToolCallProgress,
     ToolCallStart,
@@ -2308,3 +2309,339 @@ def test_fresh_process_load_puts_each_run_after_its_marker(tmp_path):
     assert ids.index(f"{child}:parent") < ids.index(f"{child}:n1")
     assert {sid for sid, _ in conn.sent} == {thread}
     assert [o.id for o in resp.config_options] == ["mode", "model", "recipe"]
+
+
+# ── Z4 implementer diff surface ──────────────────────────────────────────────
+
+
+def _seed_diff_artifacts(
+    home: Path, run_id: str, worktree: Path, file_rel: str = "tracked.txt"
+) -> None:
+    """Write the artifacts ``diffs.run_diffs`` reads.
+
+    ``worktree`` is a tmp dir the test controls; ``file_rel`` is the
+    worktree-relative path the summary points at. The fixture is omitted —
+    the diff hook reaches ``git show`` (which fails) and falls through to
+    ``new_text`` from disk only.
+    """
+    run_dir = home / "runs" / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    # Synthetic tracked file in the worktree: new_text comes from disk.
+    (worktree / file_rel).parent.mkdir(parents=True, exist_ok=True)
+    (worktree / file_rel).write_text("after\n", encoding="utf-8")
+    payload = {
+        "status": "implemented",
+        "worktree_path": str(worktree),
+        "files_changed": [str(worktree / file_rel)],
+        "implementation_log": "",
+    }
+    (run_dir / "implementer-summary.json").write_text(
+        json.dumps(payload), encoding="utf-8"
+    )
+    (run_dir / "pre-implementer-ref").write_text("\n", encoding="utf-8")
+
+
+def test_implementer_node_end_emits_diff_update_with_expected_paths(
+    tmp_path: Path,
+) -> None:
+    proj, home = _migrate_home(tmp_path)
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+    run_id = "run-z4-1"
+    _seed_diff_artifacts(home, run_id, worktree)
+    events = [
+        {
+            "event_type": "node_end",
+            "payload_json": json.dumps(
+                {"node_id": "implementer", "node_type": "implementer"}
+            ),
+        }
+    ]
+
+    def fake_reader(_rid: str) -> dict:
+        return {"status": "published", "events": events, "llm_calls": []}
+
+    captured, conn = _capturing_conn()
+    agent = MiniOrkAcpAgent(home=home, reader=fake_reader, poll_interval=0)
+    agent.on_connect(conn)
+    asyncio.run(agent._project_snapshot(run_id, fake_reader(run_id)))
+
+    diff_updates = [
+        u for u in captured
+        if isinstance(u, ToolCallProgress)
+        and any(isinstance(c, FileEditToolCallContent) for c in (u.content or []))
+    ]
+    assert len(diff_updates) == 1
+    assert diff_updates[0].tool_call_id == "implementer"
+    files = [c for c in diff_updates[0].content if isinstance(c, FileEditToolCallContent)]
+    assert len(files) == 1
+    assert files[0].path == str(worktree / "tracked.txt")
+    assert files[0].new_text == "after\n"
+    assert files[0].old_text is None  # no baseline → treated as new
+
+
+def test_second_poll_does_not_re_emit_diff(tmp_path: Path) -> None:
+    proj, home = _migrate_home(tmp_path)
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+    run_id = "run-z4-2"
+    _seed_diff_artifacts(home, run_id, worktree)
+    events = [
+        {
+            "event_type": "node_end",
+            "payload_json": json.dumps(
+                {"node_id": "implementer", "node_type": "implementer"}
+            ),
+        }
+    ]
+
+    def fake_reader(_rid: str) -> dict:
+        return {"status": "published", "events": events, "llm_calls": []}
+
+    captured, conn = _capturing_conn()
+    agent = MiniOrkAcpAgent(home=home, reader=fake_reader, poll_interval=0)
+    agent.on_connect(conn)
+    snapshot = fake_reader(run_id)
+    asyncio.run(agent._project_snapshot(run_id, snapshot))
+    asyncio.run(agent._project_snapshot(run_id, snapshot))
+
+    diff_updates = [
+        u for u in captured
+        if isinstance(u, ToolCallProgress)
+        and any(isinstance(c, FileEditToolCallContent) for c in (u.content or []))
+    ]
+    assert len(diff_updates) == 1
+
+
+def test_child_run_diff_in_thread_lands_under_prefix(
+    tmp_path: Path,
+) -> None:
+    """A child run followed inside a thread session gets the diff update
+    under ``"<run_id>:<node>"`` — the same prefix the rest of the routed
+    updates carry (matches the kickoff §"Tests" bullet 2)."""
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    home = proj / ".mini-ork"
+    home.mkdir()
+    rc, out, err = mig.init_db(db=str(home / "state.db"), root=str(REPO))
+    assert rc == 0, f"init_db failed:\n{out}\n{err}"
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+
+    launched: list[str] = []
+
+    def fake_launcher(rid: str, _t: str) -> dict:
+        # Seed the run_dir under whatever id the thread minted so the
+        # implementer ``node_end`` projection can find the artifacts.
+        launched.append(rid)
+        _seed_diff_artifacts(home, rid, worktree)
+        return {"ok": True, "run_id": rid}
+
+    states = iter(["executing", "published"])
+    events = [
+        {
+            "event_type": "node_end",
+            "payload_json": json.dumps(
+                {"node_id": "implementer", "node_type": "implementer"}
+            ),
+        }
+    ]
+
+    def fake_reader(rid: str) -> dict:
+        if rid in launched:
+            return {"status": next(states, "published"), "events": events, "llm_calls": []}
+        return {"status": "published", "events": [], "llm_calls": []}
+
+    fake_lanes = [{"id": "opus", "name": "Opus"}]
+    fake_recipes = ["code-fix"]
+    from unittest.mock import patch
+    with patch(
+        "mini_ork.acp_orchestrator.config.orchestrator_lanes",
+        return_value=fake_lanes,
+    ), patch(
+        "mini_ork.web.recipes.list_recipes",
+        return_value=fake_recipes,
+    ):
+        agent = MiniOrkAcpAgent(
+            home=home,
+            launcher=fake_launcher,
+            reader=fake_reader,
+            poll_interval=0,
+            default_mode="direct",
+            default_recipe="code-fix",
+        )
+        new = asyncio.run(agent.new_session(cwd=str(proj)))
+        thread = new.session_id
+        conn = _SidConn()
+        agent.on_connect(conn)
+
+        async def run_then_follow() -> None:
+            await agent.prompt(thread, [_text_block("/run go")])
+            if agent._followers.get(launched[0]) if launched else False:
+                await agent._followers[launched[0]]
+
+        asyncio.run(run_then_follow())
+
+    (child,) = launched
+    diff_updates = [
+        (sid, u) for sid, u in conn.sent
+        if isinstance(u, ToolCallProgress)
+        and any(isinstance(c, FileEditToolCallContent) for c in (u.content or []))
+    ]
+    assert diff_updates, "expected one diff update on the thread session"
+    sid, u = diff_updates[0]
+    assert sid == thread
+    assert u.tool_call_id == f"{child}:implementer"
+
+
+def test_load_of_published_run_replays_cache_without_may_have_changed_note(
+    tmp_path: Path,
+) -> None:
+    proj, home = _migrate_home(tmp_path)
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+    run_id = "run-z4-pub"
+    _seed_diff_artifacts(home, run_id, worktree)
+    run_dir = home / "runs" / run_id
+    # Pre-seed the cache so the load replays it (no "may have changed" note).
+    (run_dir / "acp-diffs.json").write_text(
+        json.dumps(
+            [
+                {
+                    "path": str(worktree / "tracked.txt"),
+                    "old_text": "before\n",
+                    "new_text": "after\n",
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    _seed_run(home, run_id, status="published", kickoff_text="# Cached\n")
+
+    captured, conn = _capturing_conn()
+    agent = MiniOrkAcpAgent()
+    agent.on_connect(conn)
+    asyncio.run(agent.load_session(cwd=str(proj), session_id=run_id))
+
+    notes = [
+        u.content.text for u in captured
+        if isinstance(u, AgentMessageChunk)
+        and "may have changed" in u.content.text
+    ]
+    assert notes == []
+    diffs = [
+        u for u in captured
+        if isinstance(u, ToolCallProgress)
+        and any(isinstance(c, FileEditToolCallContent) for c in (u.content or []))
+    ]
+    assert diffs and diffs[0].tool_call_id == "implementer"
+
+
+def test_load_without_cache_prefixes_may_have_changed_note(tmp_path: Path) -> None:
+    proj, home = _migrate_home(tmp_path)
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+    run_id = "run-z4-fresh"
+    _seed_diff_artifacts(home, run_id, worktree)
+    _seed_run(home, run_id, status="published", kickoff_text="# Fresh\n")
+
+    captured, conn = _capturing_conn()
+    agent = MiniOrkAcpAgent()
+    agent.on_connect(conn)
+    asyncio.run(agent.load_session(cwd=str(proj), session_id=run_id))
+
+    note_idx = next(
+        i for i, u in enumerate(captured)
+        if isinstance(u, AgentMessageChunk) and "may have changed" in u.content.text
+    )
+    diffs = [
+        u for u in captured
+        if isinstance(u, ToolCallProgress)
+        and any(isinstance(c, FileEditToolCallContent) for c in (u.content or []))
+    ]
+    assert diffs
+    diff_idx = captured.index(diffs[0])
+    assert note_idx < diff_idx
+
+
+def test_load_of_rolled_back_run_emits_message_and_no_diffs(tmp_path: Path) -> None:
+    proj, home = _migrate_home(tmp_path)
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+    run_id = "run-z4-rb"
+    _seed_diff_artifacts(home, run_id, worktree)
+    _seed_run(home, run_id, status="rolled_back", kickoff_text="# RB\n")
+
+    captured, conn = _capturing_conn()
+    agent = MiniOrkAcpAgent()
+    agent.on_connect(conn)
+    asyncio.run(agent.load_session(cwd=str(proj), session_id=run_id))
+
+    messages = [
+        u.content.text for u in captured if isinstance(u, AgentMessageChunk)
+    ]
+    assert any("rolled back" in m for m in messages)
+    diffs = [
+        u for u in captured
+        if isinstance(u, ToolCallProgress)
+        and any(isinstance(c, FileEditToolCallContent) for c in (u.content or []))
+    ]
+    assert diffs == []
+
+
+def _seed_impl_lifecycle(home: Path, run_id: str, node_id: str = "doc_editor") -> None:
+    con = sqlite3.connect(str(home / "state.db"))
+    try:
+        for i, kind in enumerate(("node_start", "node_end")):
+            con.execute(
+                "INSERT INTO run_events (event_id, run_id, event_type, payload_json, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (f"{run_id}-{node_id}-{kind}", run_id, kind,
+                 json.dumps({"node_id": node_id, "node_type": "implementer"}), 1500 + i),
+            )
+        con.commit()
+    finally:
+        con.close()
+
+
+def test_load_shows_the_recorded_diff_not_todays_files_and_keeps_the_cache(tmp_path: Path) -> None:
+    """Opening an old run replays what the run changed. The file has changed
+    since (it now reads "after\\n"); the cache from the run must win, stay
+    byte-identical, and no "may have changed" note is shown."""
+    proj, home = _migrate_home(tmp_path)
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+    run_id = "run-z4-recorded"
+    _seed_diff_artifacts(home, run_id, worktree)
+    cache = home / "runs" / run_id / "acp-diffs.json"
+    recorded = json.dumps([{"path": str(worktree / "tracked.txt"),
+                            "old_text": "v1\n", "new_text": "v2 by the run\n"}])
+    cache.write_text(recorded, encoding="utf-8")
+    _seed_run(home, run_id, status="published", kickoff_text="# Recorded\n")
+    _seed_impl_lifecycle(home, run_id)
+
+    captured, conn = _capturing_conn()
+    agent = MiniOrkAcpAgent()
+    agent.on_connect(conn)
+    asyncio.run(agent.load_session(cwd=str(proj), session_id=run_id))
+
+    diffs = [c for u in captured if isinstance(u, ToolCallProgress)
+             for c in (u.content or []) if isinstance(c, FileEditToolCallContent)]
+    assert [(d.old_text, d.new_text) for d in diffs] == [("v1\n", "v2 by the run\n")]
+    assert cache.read_text(encoding="utf-8") == recorded
+    assert not [u for u in captured if isinstance(u, AgentMessageChunk)
+                and "may have changed" in u.content.text]
+
+
+def test_load_without_cache_does_not_create_one(tmp_path: Path) -> None:
+    proj, home = _migrate_home(tmp_path)
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+    run_id = "run-z4-nocache"
+    _seed_diff_artifacts(home, run_id, worktree)
+    _seed_run(home, run_id, status="published", kickoff_text="# No cache\n")
+    _seed_impl_lifecycle(home, run_id)
+    agent = MiniOrkAcpAgent()
+    agent.on_connect(_capturing_conn()[1])
+    asyncio.run(agent.load_session(cwd=str(proj), session_id=run_id))
+    assert not (home / "runs" / run_id / "acp-diffs.json").exists()
