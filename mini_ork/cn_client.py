@@ -542,6 +542,11 @@ def coord_inbox(principal_id: str, unacked: bool = True) -> dict:
     )
 
 
+def coord_hot_claims() -> dict:
+    """GET /api/v1/coord/hot-claims — live activity-derived claims on hot files."""
+    return _coord_request("GET", "/api/v1/coord/hot-claims")
+
+
 def coord_ack(principal_id: str, msg_id: str, by: str) -> dict:
     """POST /api/v1/coord/principals/{id}/messages/{msg_id}/ack — acknowledge."""
     return _coord_request(

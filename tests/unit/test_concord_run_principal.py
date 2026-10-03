@@ -204,3 +204,24 @@ def test_run_id_sanitized_to_valid_principal(monkeypatch):
         for h in handles:
             concord_run.stop(h)
         srv.shutdown()
+
+
+def test_404_from_a_pre_concord_substrate_says_restart(monkeypatch, capsys):
+    """Up but pre-Concord (404) must say what fixes it, not 'unavailable'."""
+    from mini_ork import cn_client
+    from mini_ork.orchestration import concord_run
+
+    def _404(*_a, **_k):
+        raise cn_client.CoordHTTPError(404, "not found")
+
+    monkeypatch.setattr(cn_client, "coord_upsert_principal", _404)
+    monkeypatch.setattr(cn_client, "coord_end_principal", lambda *_a, **_k: {})
+    monkeypatch.delenv("MO_CONCORD", raising=False)
+    monkeypatch.delenv("CONCORD_PRINCIPAL", raising=False)
+    handle = concord_run.start("run-404", "code-fix", "k.md")
+    try:
+        err = capsys.readouterr().err
+        assert "no Concord endpoints" in err and "restart" in err
+        assert handle is not None and handle.thread is None
+    finally:
+        concord_run.stop(handle)

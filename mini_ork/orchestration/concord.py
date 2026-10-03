@@ -83,6 +83,9 @@ def _build_parser() -> argparse.ArgumentParser:
     admit.add_argument("--db", default=None,
                        help="state DB path (default: resolve_db_path)")
 
+    claims = sub.add_parser("claims", help="list live claims on hot shared files")
+    claims.add_argument("--json", action="store_true", help="emit raw JSON")
+
     sub.add_parser("help", help="show this help")
     return parser
 
@@ -387,6 +390,25 @@ def _cmd_inbox(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_claims(args: argparse.Namespace) -> int:
+    """Live activity-derived claims on hot shared files (Concord P2a)."""
+    rc, data = _call(cn_client.coord_hot_claims)
+    if rc:
+        return rc
+    if args.json:
+        print(json.dumps(data))
+        return 0
+    claims = (data or {}).get("claims") or []
+    if not claims:
+        print("(no live hot-file claims)")
+        return 0
+    print("PATH\tHOLDER\tEXPIRES\tLAST_WRITE_SEQ")
+    for c in claims:
+        print(f"{c.get('path', '')}\t{c.get('principal_id', '')}\t"
+              f"{c.get('expires_at', '')}\t{c.get('last_write_seq', '')}")
+    return 0
+
+
 def _cmd_ack(args: argparse.Namespace) -> int:
     pid = args.principal
     if _reject_id(pid):
@@ -441,6 +463,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _cmd_inbox(args)
     if args.action == "ack":
         return _cmd_ack(args)
+    if args.action == "claims":
+        return _cmd_claims(args)
     if args.action == "admit":
         return _cmd_admit(args)
     if args.action == "help":

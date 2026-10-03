@@ -96,7 +96,13 @@ def start(run_id: str, recipe: str, kickoff: str) -> RunPrincipal | None:
     handle = RunPrincipal(principal_id, parent, fields, threading.Event())
     try:
         cn_client.coord_upsert_principal(principal_id, fields)
-    except (cn_client.CoordUnavailable, cn_client.CoordHTTPError):
+    except cn_client.CoordHTTPError as exc:
+        # A 404 means the substrate is up but predates Concord: say what fixes it.
+        hint = ("ContextNest has no Concord endpoints — restart it on a Concord build"
+                if exc.status == 404 else f"ContextNest returned {exc.status}")
+        sys.stderr.write(f"[concord] {hint} — run not registered\n")
+        return handle  # env stays set; no heartbeat
+    except cn_client.CoordUnavailable:
         sys.stderr.write("[concord] ContextNest unavailable — run not registered\n")
         return handle  # env stays set; no heartbeat
     handle.thread = threading.Thread(target=_heartbeat, args=(handle,), daemon=True)

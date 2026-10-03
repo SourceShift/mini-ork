@@ -167,6 +167,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             self._get_principal(parts[4])
         elif len(parts) == 6 and parts[2:4] == ["coord", "principals"] and parts[5] == "messages":
             self._inbox(parts[4], query.get("unacked", ["true"])[0] == "true")
+        elif parts[2:4] == ["coord", "hot-claims"]:
+            self._json(200, {"claims": getattr(self.server, "claims", [])})
         else:
             self._json(404, {"error": "not found"})
 
@@ -374,3 +376,23 @@ def test_invalid_principal_id_exits_2(monkeypatch):
     monkeypatch.setenv("CN_BASE_URL", "http://127.0.0.1:1")
     for bad in ("foo", "loop:", "bad kind:x"):
         assert concord.main(["stop", bad, "--yes"]) == 2, bad
+
+
+def test_claims_lists_live_hot_claims_and_exits_3_when_down(monkeypatch, capsys):
+    srv, base = _server()
+    srv.claims = [{"path": "/r/.mini-ork/config/agents.yaml", "principal_id": "loop:a",
+                   "expires_at": "2026-10-03T08:00:00Z", "last_write_seq": 41}]
+    monkeypatch.setenv("CN_BASE_URL", base)
+    monkeypatch.setenv("CN_COORD_TIMEOUT_SEC", "5")
+    try:
+        assert concord.main(["claims"]) == 0
+        out = capsys.readouterr().out
+        assert "/r/.mini-ork/config/agents.yaml\tloop:a" in out
+        srv.claims = []
+        assert concord.main(["claims"]) == 0
+        assert "(no live hot-file claims)" in capsys.readouterr().out
+    finally:
+        srv.shutdown()
+    monkeypatch.setenv("CN_BASE_URL", "http://127.0.0.1:9")
+    monkeypatch.setenv("CN_COORD_TIMEOUT_SEC", "1")
+    assert concord.main(["claims"]) == 3
