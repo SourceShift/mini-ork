@@ -34,6 +34,7 @@ if str(REPO) not in sys.path:
 
 from acp.schema import (  # noqa: E402
     AgentMessageChunk,
+    AgentPlanUpdate,
     FileEditToolCallContent,
     TextContentBlock,
     ToolCallProgress,
@@ -2899,3 +2900,286 @@ def test_a_thread_command_is_recorded_with_its_reply(tmp_path):
              if r["type"] in ("user", "update")]
     i = kinds.index(("user", "/lanes"))
     assert ("update", "agent_message_chunk") in kinds[i + 1:]
+
+
+# ── Z6 plan emit (AgentPlanUpdate) ──────────────────────────────────────────
+
+
+def _seed_plan(
+    home: Path,
+    run_id: str,
+    decomposition: list[dict[str, Any]],
+    *,
+    recipe: str = "docs",
+    created_at: int = 1000,
+) -> None:
+    """Seed the run row, a node_start event, AND a ``plan.json`` so
+    ``_project_snapshot`` can render a non-empty plan. The decomposition
+    matches the docs shape the lens uses as a canonical example."""
+    _seed_run(home, run_id, status="executing", created_at=created_at)
+    _seed_node_event(home, run_id, "planner")
+    run_dir = home / "runs" / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "plan.json").write_text(
+        json.dumps({"decomposition": decomposition}),
+        encoding="utf-8",
+    )
+
+
+def _plan_updates(captured: list) -> list:
+    """Filter ``captured`` to just the ``AgentPlanUpdate`` pushes."""
+    return [u for u in captured if isinstance(u, AgentPlanUpdate)]
+
+
+def test_run_session_emits_plan_on_each_status_change_and_none_on_unchanged_poll(
+    tmp_path: Path,
+) -> None:
+    """D1-style dedup: the same snapshot projected twice emits one plan."""
+    proj, home = _migrate_home(tmp_path)
+    decomposition = [
+        {"id": "planner", "description": "p", "node_type": "planner", "depends_on": []},
+        {"id": "doc_editor", "description": "d", "node_type": "implementer", "depends_on": ["planner"]},
+    ]
+    run_id = "run-z6-1"
+    _seed_plan(home, run_id, decomposition)
+
+    captured, conn = _capturing_conn()
+    agent = MiniOrkAcpAgent(home=home, poll_interval=0)
+    agent.on_connect(conn)
+    # Use a stable snapshot for the unchanged poll: the third projection
+    # re-projectes the SAME snapshot the first projection saw → no new emit.
+    snapshot_start_only = {
+        "status": "executing",
+        "events": [
+            {
+                "event_type": "node_start",
+                "payload_json": {"node_id": "doc_editor", "node_type": "implementer"},
+            }
+        ],
+        "llm_calls": [],
+    }
+    snapshot_with_end = {
+        "status": "executing",
+        "events": snapshot_start_only["events"]
+        + [
+            {
+                "event_type": "node_end",
+                "payload_json": {"node_id": "doc_editor", "node_type": "implementer"},
+            }
+        ],
+        "llm_calls": [],
+    }
+
+    asyncio.run(agent._project_snapshot(run_id, snapshot_start_only))
+    asyncio.run(agent._project_snapshot(run_id, snapshot_start_only))  # unchanged → no new emit
+    asyncio.run(agent._project_snapshot(run_id, snapshot_with_end))  # status flipped
+
+    plans = _plan_updates(captured)
+    assert len(plans) == 2, [u.entries for u in plans]
+    # First emit: planner completed (skipped because dependent fired),
+    # doc_editor in_progress.
+    first = plans[0].entries
+    by_id = {e.content: e for e in first}
+    assert by_id["planner (planner)"].status == "completed"
+    assert by_id["doc_editor (implementer)"].status == "in_progress"
+    # Second emit: doc_editor completed.
+    second = plans[1].entries
+    assert next(e for e in second if e.content == "doc_editor (implementer)").status == "completed"
+
+
+def test_load_session_finished_run_replays_final_plan(tmp_path: Path) -> None:
+    """Loading a finished run must show its final plan; the load-reset on
+    ``_plan_emitted`` ensures the plan actually emits rather than deduping."""
+    proj, home = _migrate_home(tmp_path)
+    decomposition = [
+        {"id": "planner", "description": "p", "node_type": "planner", "depends_on": []},
+        {"id": "implementer", "description": "i", "node_type": "implementer", "depends_on": ["planner"]},
+    ]
+    run_id = "run-z6-2"
+    _seed_run(home, run_id, status="published")
+    run_dir = home / "runs" / run_id
+    run_dir.mkdir(parents=True)
+    (run_dir / "plan.json").write_text(
+        json.dumps({"decomposition": decomposition}),
+        encoding="utf-8",
+    )
+
+    captured, conn = _capturing_conn()
+    agent = MiniOrkAcpAgent(home=home)
+    agent.on_connect(conn)
+    resp = asyncio.run(agent.load_session(cwd=str(proj), session_id=run_id))
+    assert resp is not None
+
+    plans = [u for u in captured if isinstance(u, AgentPlanUpdate)]
+    assert plans, "load_session did not replay the run's final plan"
+    statuses = [e.status for e in plans[-1].entries]
+    assert statuses == ["pending", "pending"], plans[-1].entries
+
+
+def test_routed_child_run_plan_addressed_to_thread_session(
+    tmp_path: Path,
+) -> None:
+    """A child run followed inside a thread sees its plan re-addressed by
+    ``_emit`` (the destination session is the thread, not the child run id)."""
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    home = proj / ".mini-ork"
+    home.mkdir()
+    rc, out, err = mig.init_db(db=str(home / "state.db"), root=str(REPO))
+    assert rc == 0, f"init_db failed:\n{out}\n{err}"
+
+    child = "run-z6-thread-1"
+    decomposition = [
+        {"id": "n1", "description": "n", "node_type": "implementer", "depends_on": []},
+    ]
+    # Pre-create the run_dir + plan.json so the projection pass can read it.
+    run_dir = home / "runs" / child
+    run_dir.mkdir(parents=True)
+    (run_dir / "plan.json").write_text(
+        json.dumps({"decomposition": decomposition}),
+        encoding="utf-8",
+    )
+
+    def fake_launcher(rid: str, _t: str) -> dict:
+        return {"ok": True, "run_id": rid}
+
+    def fake_reader(rid: str) -> dict:
+        del rid
+        return {
+            "status": "executing",
+            "events": [
+                {
+                    "event_type": "node_start",
+                    "payload_json": {"node_id": "n1", "node_type": "implementer"},
+                }
+            ],
+            "llm_calls": [],
+        }
+
+    agent, thread = _thread_agent(
+        proj, launcher=fake_launcher, reader=fake_reader
+    )
+    conn = _SidConn()
+    agent.on_connect(conn)
+
+    # Wire a routed child directly (mirrors _start_child_follow's contract).
+    agent._routes[child] = (thread, f"{child}:")
+    agent._thread_runs.setdefault(thread, []).append(child)
+    agent._sessions[child] = str(proj)
+
+    asyncio.run(agent._project_snapshot(child, fake_reader(child)))
+
+    plans = [(sid, update) for sid, update in conn.sent if isinstance(update, AgentPlanUpdate)]
+    assert plans, "routed run produced no plan update"
+    sid, update = plans[0]
+    assert sid == thread, f"plan update addressed to {sid!r}, expected thread {thread!r}"
+    # The projection's session_id argument IS the run; only the wire
+    # destination is the thread.
+    assert update.entries[0].content == "n1 (implementer)"
+
+
+def test_thread_with_two_runs_only_latest_run_plan_emits(tmp_path: Path) -> None:
+    """Older routed runs being followed must NOT overwrite the thread's plan.
+
+    The gate is ``_thread_runs[thread][-1] != session_id`` — the older run's
+    projection computes the same entries (it has the same decomposition +
+    lifecycle), but the gate blocks the emit before the dedup set is touched.
+    """
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    home = proj / ".mini-ork"
+    home.mkdir()
+    rc, out, err = mig.init_db(db=str(home / "state.db"), root=str(REPO))
+    assert rc == 0, f"init_db failed:\n{out}\n{err}"
+
+    older = "run-z6-old"
+    newer = "run-z6-new"
+    decomposition = [
+        {"id": "n1", "description": "n", "node_type": "implementer", "depends_on": []},
+    ]
+    for rid in (older, newer):
+        run_dir = home / "runs" / rid
+        run_dir.mkdir(parents=True)
+        (run_dir / "plan.json").write_text(
+            json.dumps({"decomposition": decomposition}),
+            encoding="utf-8",
+        )
+
+    agent, thread = _thread_agent(proj)
+    conn = _SidConn()
+    agent.on_connect(conn)
+
+    agent._routes[older] = (thread, f"{older}:")
+    agent._routes[newer] = (thread, f"{newer}:")
+    agent._thread_runs[thread] = [older, newer]
+    agent._sessions[older] = str(proj)
+    agent._sessions[newer] = str(proj)
+
+    snapshot = {
+        "status": "executing",
+        "events": [
+            {
+                "event_type": "node_start",
+                "payload_json": {"node_id": "n1", "node_type": "implementer"},
+            }
+        ],
+        "llm_calls": [],
+    }
+
+    # Older run is NOT the latest → no plan push from this projection.
+    asyncio.run(agent._project_snapshot(older, snapshot))
+    plans_so_far = [
+        (sid, u) for sid, u in conn.sent if isinstance(u, AgentPlanUpdate)
+    ]
+    assert plans_so_far == [], plans_so_far
+
+    # Newer run IS the latest → plan pushes to the thread.
+    asyncio.run(agent._project_snapshot(newer, snapshot))
+    plans_now = [
+        (sid, u) for sid, u in conn.sent if isinstance(u, AgentPlanUpdate)
+    ]
+    assert len(plans_now) == 1
+    sid, update = plans_now[0]
+    assert sid == thread
+    assert update.entries[0].status == "in_progress"
+
+
+def test_missing_plan_json_in_run_emits_no_plan_update(tmp_path: Path) -> None:
+    """A run without a ``plan.json`` produces no ``AgentPlanUpdate``.
+
+    ``plan_entries`` returns ``[]`` for the miss, the snapshot projection
+    short-circuits — kickoff §``agent.py``: "Empty entries → nothing"."""
+    proj, home = _migrate_home(tmp_path)
+    run_id = "run-z6-empty"
+    _seed_run(home, run_id, status="executing")
+    # Intentionally NO plan.json under home/runs/run-z6-empty/.
+    (home / "runs" / run_id).mkdir(parents=True)
+
+    def fake_reader(_rid: str) -> dict:
+        return {
+            "status": "executing",
+            "events": [
+                {
+                    "event_type": "node_start",
+                    "payload_json": {"node_id": "n1", "node_type": "implementer"},
+                }
+            ],
+            "llm_calls": [],
+        }
+
+    captured, conn = _capturing_conn()
+    agent = MiniOrkAcpAgent(home=home, poll_interval=0)
+    agent.on_connect(conn)
+    snapshot = {
+        "status": "executing",
+        "events": [
+            {
+                "event_type": "node_start",
+                "payload_json": {"node_id": "n1", "node_type": "implementer"},
+            }
+        ],
+        "llm_calls": [],
+    }
+    asyncio.run(agent._project_snapshot(run_id, snapshot))
+
+    assert _plan_updates(captured) == [], [u for u in captured]

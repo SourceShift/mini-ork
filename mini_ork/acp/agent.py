@@ -41,6 +41,7 @@ from acp import RequestError
 from acp.schema import (
     AgentCapabilities,
     AgentMessageChunk,
+    AgentPlanUpdate,
     AgentThoughtChunk,
     AvailableCommandsUpdate,
     ConfigOptionUpdate,
@@ -52,6 +53,7 @@ from acp.schema import (
     ListSessionsResponse,
     LoadSessionResponse,
     NewSessionResponse,
+    PlanEntry,
     PromptResponse,
     SessionCapabilities,
     SessionConfigOptionSelect,
@@ -76,6 +78,7 @@ from mini_ork.acp import commands as _commands
 from mini_ork.acp import diffs as _diffs
 from mini_ork.acp import history
 from mini_ork.acp import orchestration as _orchestration
+from mini_ork.acp import plan as _plan
 from mini_ork.acp.live import LiveTail, normalize
 from mini_ork.acp.threads import ThreadStore, title_from_text
 from mini_ork.web.control import _is_safe_token
@@ -316,6 +319,12 @@ class MiniOrkAcpAgent:
         # resets ``_emitted`` must also reset this set so the first emit of
         # the load fires.
         self._diff_emitted: set[tuple[str, str]] = set()
+        # destination session id → last canonicalised tuple of plan entries
+        # sent (Z6 dedup). A projection pass that recomputes the same entries
+        # is a no-op emit. Keyed by the post-``_emit`` destination so a
+        # thread with multiple child runs sees one plan; a load that resets
+        # ``_emitted`` must also reset the matching entry so replay fires.
+        self._plan_emitted: dict[str, tuple[tuple[str, str, str], ...]] = {}
         # session id → node_id → LiveTail (Z3 live projection). Constructed
         # lazily on first node_start; held until session end.
         self._tails: dict[str, dict[str, LiveTail]] = {}
@@ -771,6 +780,13 @@ class MiniOrkAcpAgent:
         self._diff_emitted = {
             key for key in self._diff_emitted if key[0] != session_id
         }
+        # Z6: the live plan hook dedupes by destination session. For a
+        # standalone run the destination IS the run id, so pop it; for a
+        # thread-routed run the destination will already have been cleared
+        # by the thread's own load (or by ``_replay_run_in_thread``). The
+        # standalone-pop keeps a finished run's final plan visible on
+        # replay (kickoff §"agent.py").
+        self._plan_emitted.pop(session_id, None)
         home = self._home_for(session_id)
         snapshot = history.read_snapshot(home, session_id)
         if snapshot.get("status") is None:
@@ -1736,6 +1752,10 @@ class MiniOrkAcpAgent:
             updates.append(self._build_terminal_message(status, run_id=routed))
         for update in updates:
             await self._emit(session_id, update)
+        # Z6: render the run's DAG as a checklist above the thread. One
+        # ``AgentPlanUpdate`` per destination per content change; an older
+        # routed run does not overwrite the thread's latest plan.
+        await self._emit_plan_update(session_id, snapshot)
         if not live:
             # A replay (load) shows the run's recorded diff — see
             # _emit_diff_update_for_loaded_run; recomputing here would diff
@@ -1760,6 +1780,56 @@ class MiniOrkAcpAgent:
             node_id = str(payload.get("node_id") or ev.get("node_id") or "implementer")
             if node_type == "implementer" or node_id == "implementer":
                 await self._emit_diff_update_for_run(session_id, node_id)
+
+    async def _emit_plan_update(
+        self, session_id: str, snapshot: dict[str, Any]
+    ) -> None:
+        """Project the run's DAG into an ``AgentPlanUpdate`` and emit (Z6).
+
+        Three gates before an emit fires:
+
+        1. ``plan_entries`` returned a non-empty list (a missing or unparseable
+           ``plan.json`` is the dominant miss — kickoff §``plan.py``).
+        2. The run is either standalone or the thread's **latest** run
+           (``self._thread_runs[thread][-1]``). An older routed run still
+           being followed must NOT overwrite the thread's plan (Z5).
+        3. The canonicalised tuple of ``(content, status, priority)`` for
+           the destination differs from the last value stored in
+           ``_plan_emitted[dest]``.
+
+        The emit flows through ``_emit`` so the routing redirect plus the
+        per-thread ``AgentPlanUpdate`` JSONL record`` land on the same wire as
+        every other update family.
+        """
+        run_dir = self._home_for(session_id) / "runs" / session_id
+        entries = _plan.plan_entries(run_dir, snapshot.get("events") or [])
+        if not entries:
+            return
+        route = self._routes.get(session_id)
+        if route is not None:
+            thread_id = route[0]
+            latest = self._thread_runs.get(thread_id)
+            if latest and latest[-1] != session_id:
+                # Older run still being followed: leave the thread's plan
+                # to the latest run.
+                return
+            dest = thread_id
+        else:
+            dest = session_id
+        canonical: tuple[tuple[str, str, str], ...] = tuple(
+            (str(e["content"]), str(e["status"]), str(e["priority"]))
+            for e in entries
+        )
+        if self._plan_emitted.get(dest) == canonical:
+            return
+        self._plan_emitted[dest] = canonical
+        await self._emit(
+            session_id,
+            AgentPlanUpdate(
+                session_update="plan",
+                entries=[PlanEntry(**e) for e in entries],
+            ),
+        )
 
     async def _await_terminal(self, session_id: str) -> StopReason:
         reader = self._reader or self._read_snapshot
@@ -2080,6 +2150,11 @@ class MiniOrkAcpAgent:
         # 2nd thread load fires the diff update again.
         self._diff_emitted = {key for key in self._diff_emitted if key[0] != run_id}
         self._text_seen = {key for key in self._text_seen if key[0] != run_id}
+        # Z6: the plan dedup lives on the destination (the thread) so reset
+        # it here too — without this the thread would see no plan after a
+        # replay because the canonical tuple still matches what an earlier
+        # projection pass already emitted.
+        self._plan_emitted.pop(thread_id, None)
         snapshot = (self._reader or self._read_snapshot)(run_id) or {
             "status": None,
             "events": [],
