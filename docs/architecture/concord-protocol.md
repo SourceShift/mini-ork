@@ -162,14 +162,34 @@ whether the change breaks its plan. Everything weaker goes to a batched digest.
 | Endpoint | Hook | Behaviour |
 |---|---|---|
 | `POST /api/v1/coord/footprints` | PostToolUse (async) on Read/Edit/Write/MultiEdit/NotebookEdit | Records `(principal, worker, op, path, mtime_ns, size, seq)`; the server stats the file |
-| `POST /api/v1/coord/precheck` | PreToolUse (sync) on Edit/Write/MultiEdit/NotebookEdit | Warns if a write to the path exists from a principal outside P's lineage after P's latest footprint on it. It is advisory (`permissionDecision: "allow"`) and never denies in P1 |
+| `POST /api/v1/coord/precheck` | PreToolUse (sync) on Edit/Write/MultiEdit/NotebookEdit | Warns if a write to the path exists from a principal outside P's lineage after P's latest footprint on it. It is advisory **context only** and never sets `permissionDecision`. In Claude Code, `"allow"` would skip the user's permission prompt, so it must never be returned |
 
+
+## P2 — hot set, claimed scope, admission, digest (shipped)
+
+P2 adds control where the evidence says it pays. Each check ships **advisory-first**,
+because deterministic gates measurably cost task completion and tokens
+(arXiv:2602.11416). The stricter modes are operator switches. No Concord hook ever
+answers `permissionDecision: "allow"`.
+
+| Piece | Where | What it does | Modes |
+|---|---|---|---|
+| **Hot-set claims** | ContextNest precheck + footprints | A write to shared live config (`.mini-ork/config/**`, `secrets*.sh`, `providers.yaml`, `agents.yaml`, `.claude/settings*.json`, `.env*`, `db/migrations/**`) claims it for the writer for 600 s, renewed by its lineage. Another principal about to edit it gets a 🔒 notice | `CONTEXTNEST_CONCORD_HOT_MODE` = `warn` (default) \| `ask` \| `deny` |
+| **`--owns` enforcement** | ContextNest precheck | `make worktree` registers `agent:wt-<slug>` with its claimed paths. An edit inside a worktree but outside its claim gets a ✋ notice and is recorded | `CONTEXTNEST_CONCORD_OWNS_MODE` = `audit` (default) \| `ask` \| `deny` |
+| **Per-turn digest** | ContextNest turn hook (UserPromptSubmit) | Lists, at most once each and capped at 5 lines, files other agents changed since your last turn that you had touched. It never interrupts | `CONTEXTNEST_CONCORD_DIGEST=0` silences it |
+| **Epic admission** | mini-ork scheduler pre-dispatch hook | `mini-ork concord admit` defers (exit 75) an epic whose kickoff's **Files in scope** overlap an epic already in progress. It is read-only and fails open | opt in: `MO_SCHED_PRE_DISPATCH_HOOK="mini-ork concord admit"` |
+
+When modes compose, the strictest wins (deny > ask > notice). Operator views:
+`mini-ork concord ps` (who is running), `concord claims` (who holds hot files), and
+`concord violations` (out-of-scope edits).
+
+## Roadmap
 
 | Phase | Adds |
 |---|---|
 | P0.5 | ✅ Offline replay + labelled precision (see above) |
 | P1 | Footprints + pre-action stale-premise check (above); then intents (declared scope plus assumptions) and a per-turn `changes_since` digest for weaker signals |
-| P2 | Strict leases for the hot set (shared config, secrets, `main` ref, DB schema, ports); `--owns` enforced per turn; publish-gate validation |
+| P2 | ✅ Hot-set claims, `--owns` enforcement, per-turn digest, epic admission (see above). Still open: publish-gate validation of the `main` ref |
 | P3 | Topic overlap through live intents; ack, escalate and freeze arbitration |
 | P4 | Alone-versus-combined test validation at merge |
 
