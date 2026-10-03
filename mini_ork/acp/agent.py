@@ -30,6 +30,8 @@ from acp import RequestError
 from acp.schema import (
     AgentCapabilities,
     AgentMessageChunk,
+    AgentThoughtChunk,
+    ContentToolCallContent,
     Cost,
     Implementation,
     InitializeResponse,
@@ -49,6 +51,7 @@ from acp.schema import (
 )
 
 from mini_ork.acp import history
+from mini_ork.acp.live import LiveTail, normalize
 from mini_ork.web.control import _is_safe_token
 
 PROTOCOL_VERSION = 1
@@ -73,6 +76,25 @@ _START_TIMEOUT_S = float(os.environ.get("MO_ACP_START_TIMEOUT_S", "300"))
 # Reported context-window size ("size" in UsageUpdate). mini-ork has no per-call
 # context column in llm_calls, so the projection reports a fixed window.
 DEFAULT_CONTEXT_SIZE = 200_000
+
+# Live sidecar replay cap (kickoff §3): ``session/load`` of a finished run
+# replays at most the last N normalized events per node, so a long-lived
+# node that produced thousands of chunks cannot blow up the load replay.
+_LIVE_REPLAY_LIMIT = 50
+
+# Live sidecar poll cap (kickoff §3): per-poll output is bounded so a chatty
+# node cannot saturate the ACP wire in a single tick. The cap is a per-tick
+# buffer bound — the byte offset always advances, so subsequent polls catch
+# up rather than back-pressure forever.
+_LIVE_POLL_LIMIT = 100
+
+# Filename sanitization for the per-node live sidecar — matches the writer
+# side in ``mini_ork.dispatch.providers._attach_isolation``. Slashes (a node
+# id like ``planner/code-impact``) become underscores so the path stays under
+# ``<run_dir>/agent-<safe>.live.jsonl``.
+_LIVE_NODE_SAFE_CHARS = frozenset("abcdefghijklmnopqrstuvwxyz"
+                                  "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                                  "0123456789._-")
 
 
 def mint_run_id() -> str:
@@ -157,6 +179,12 @@ class MiniOrkAcpAgent:
         self._followers: dict[str, asyncio.Task] = {}
         # session ids opened via session/load (never launched by prompt).
         self._loaded: set[str] = set()
+        # (session, node) pairs whose agent already streamed text — a final
+        # ``result`` event is shown only for nodes that streamed nothing.
+        self._text_seen: set[tuple[str, str]] = set()
+        # session id → node_id → LiveTail (Z3 live projection). Constructed
+        # lazily on first node_start; held until session end.
+        self._tails: dict[str, dict[str, LiveTail]] = {}
         self._launch_count = 0
 
     @property
@@ -208,11 +236,15 @@ class MiniOrkAcpAgent:
         self, cwd: str | None = None, cursor: str | None = None, **kwargs: Any
     ) -> ListSessionsResponse:
         del kwargs
-        home = self._resolve_home()
+        # A cwd names a project: list that project's runs or nothing. Falling back
+        # to the agent's default home would show another project's runs for a
+        # project that has no .mini-ork.
         if cwd:
-            candidate = Path(cwd) / ".mini-ork"
-            if candidate.is_dir():
-                home = candidate
+            home = Path(cwd) / ".mini-ork"
+            if not home.is_dir():
+                return ListSessionsResponse(sessions=[])
+        else:
+            home = self._resolve_home()
         if not home.exists():
             return ListSessionsResponse(sessions=[])
         try:
@@ -270,7 +302,14 @@ class MiniOrkAcpAgent:
                     content=TextContentBlock(type="text", text=kickoff),
                 ),
             )
-        await self._project_snapshot(session_id, snapshot)
+        await self._project_snapshot(session_id, snapshot, live=False)
+        # Z3 live replay (kickoff §3): for finished runs, replay the last
+        # ``_LIVE_REPLAY_LIMIT`` normalized events per node. Running runs
+        # delegate to ``_follow`` which drains per poll with a clean offset.
+        if snapshot.get("status") in TERMINAL_STATUSES:
+            started = self._started_node_ids(snapshot)
+            if started:
+                await self._replay_live_for(session_id, sorted(started))
         if snapshot.get("status") not in TERMINAL_STATUSES:
             self._followers[session_id] = asyncio.create_task(self._follow(session_id))
         return LoadSessionResponse()
@@ -439,6 +478,200 @@ class MiniOrkAcpAgent:
             content=TextContentBlock(type="text", text=text),
         )
 
+    # ── live sidecar projection (Z3) ─────────────────────────────────────────
+
+    @staticmethod
+    def _safe_node_id(node_id: str) -> str:
+        """Filenames-safe form of ``node_id`` (slashes and odd chars → ``_``).
+
+        Matches the writer-side sanitization in
+        ``mini_ork.dispatch.providers._attach_isolation`` so the writer and
+        the tailer agree on the path. A node id like ``planner/code-impact``
+        resolves to ``agent-planner_code-impact.live.jsonl``.
+        """
+        return "".join(c if c in _LIVE_NODE_SAFE_CHARS else "_" for c in node_id)
+
+    def _ensure_tail(self, session_id: str, node_id: str) -> LiveTail:
+        """Lazily build the ``LiveTail`` for ``(session_id, node_id)``.
+
+        The path resolves to ``<home>/runs/<session_id>/agent-<safe>.live.jsonl``
+        — the same path the dispatch writer appends to
+        (see ``_attach_isolation`` and ``web/routes/node_live.LIVE_FILE_NAME``).
+        The tail is cached for the session's lifetime so the byte offset
+        accumulates across polls and a chatty node does not re-read the
+        file from offset 0 on every poll.
+        """
+        bucket = self._tails.setdefault(session_id, {})
+        tail = bucket.get(node_id)
+        if tail is None:
+            run_dir = self._home_for(session_id) / "runs" / session_id
+            tail = LiveTail(run_dir / f"agent-{self._safe_node_id(node_id)}.live.jsonl")
+            bucket[node_id] = tail
+        return tail
+
+    def _started_nodes(self, session_id: str) -> set[str]:
+        """Node ids whose ``node_start`` has already been emitted (D1 marker).
+
+        ``_emitted[session_id]`` stores lifecycle keys of the form
+        ``"<node_id>:start"``; peeling the suffix yields the set of nodes the
+        client has been opened for. Live chunks for nodes that haven't yet
+        been ToolCallStarted would land on the wire before the corresponding
+        ToolCallStart — silent protocol breakage. ``_drain_live_for`` only
+        touches nodes returned here.
+        """
+        out: set[str] = set()
+        for key in self._emitted.get(session_id, set()):
+            if key.endswith(":start"):
+                out.add(key[: -len(":start")])
+        return out
+
+    @staticmethod
+    def _started_node_ids(snapshot: dict[str, Any]) -> set[str]:
+        """Node ids whose ``node_start`` appears in ``snapshot["events"]``.
+
+        Used by ``load_session`` to seed the live replay for finished runs:
+        we replay one batch per started node, capped at ``_LIVE_REPLAY_LIMIT``
+        events each. Parses ``payload_json`` defensively (string or dict).
+        """
+        out: set[str] = set()
+        for ev in snapshot.get("events") or []:
+            if ev.get("event_type") != "node_start":
+                continue
+            payload = ev.get("payload_json")
+            if isinstance(payload, str):
+                try:
+                    payload = json.loads(payload)
+                except (json.JSONDecodeError, TypeError):
+                    payload = {}
+            if not isinstance(payload, dict):
+                payload = {}
+            node_id = str(payload.get("node_id") or ev.get("node_id") or "node")
+            out.add(node_id)
+        return out
+
+    async def _drain_live_for(
+        self, session_id: str, *, limit: int = _LIVE_POLL_LIMIT
+    ) -> None:
+        """Read new live records for every started node and emit each chunk.
+
+        Per poll, each node contributes at most ``limit`` events (kickoff §3).
+        The byte offset advances regardless of the cap, so a chatty node
+        drains across subsequent polls instead of back-pressuring the loop.
+
+        The four ``LiveEvent.kind`` values map to two ACP update types:
+
+        * ``thought`` → ``AgentThoughtChunk`` (agent's own reasoning);
+        * ``text`` / ``tool`` / ``tool_output`` → ``ToolCallProgress`` chunks
+          with a single ``TextContentBlock`` carrying the text.
+
+        Each chunk is appended to the existing ``ToolCallProgress`` stream
+        for the same ``tool_call_id`` — the SDK accumulates, never replaces.
+        """
+        started = self._started_nodes(session_id)
+        if not started:
+            return
+        for node_id in started:
+            tail = self._ensure_tail(session_id, node_id)
+            records = tail.read_new()
+            if not records:
+                continue
+            events: list[Any] = []
+            for rec in records:
+                for ev in self._final_answer_once(session_id, node_id, normalize(rec)):
+                    if ev.kind == "thought":
+                        events.append(
+                            AgentThoughtChunk(
+                                session_update="agent_thought_chunk",
+                                content=TextContentBlock(
+                                    type="text",
+                                    text=f"[{node_id}] {ev.text}",
+                                ),
+                            )
+                        )
+                    else:
+                        events.append(
+                            ToolCallProgress(
+                                session_update="tool_call_update",
+                                tool_call_id=node_id,
+                                content=[
+                                    ContentToolCallContent(
+                                        type="content",
+                                        content=TextContentBlock(
+                                            type="text", text=ev.text
+                                        ),
+                                    )
+                                ],
+                            )
+                        )
+            # Per-poll cap (kickoff §3): the byte offset already advanced
+            # past these records, so subsequent polls keep making progress.
+            for update in events[:limit]:
+                await self._emit(session_id, update)
+
+    def _final_answer_once(self, session_id: str, node_id: str, events: list[Any]) -> list[Any]:
+        """Pass live events through, keeping a node's final ``result`` only when
+        that node streamed no text (a non-streaming lane writes nothing but the
+        final object; a streaming lane would otherwise show its answer twice)."""
+        key = (session_id, node_id)
+        out: list[Any] = []
+        for ev in events:
+            if ev.kind == "text":
+                self._text_seen.add(key)
+            elif ev.kind == "result":
+                if key in self._text_seen:
+                    continue
+                self._text_seen.add(key)
+            out.append(ev)
+        return out
+
+    async def _replay_live_for(self, session_id: str, node_ids: list[str]) -> None:
+        """Replay the last ``_LIVE_REPLAY_LIMIT`` normalized events per node.
+
+        Called from ``load_session`` for FINISHED runs (kickoff §3): the
+        operator attaches to a past run and gets a final burst of what each
+        agent actually said, capped so a long-lived node cannot blow up the
+        load replay. Each tail is opened from offset 0 and discarded at the
+        end so a later ``_follow`` starts with a clean offset — there is no
+        double-emission.
+        """
+        for node_id in node_ids:
+            tail = self._ensure_tail(session_id, node_id)
+            records = tail.read_new()  # offset 0 on first use
+            if not records:
+                continue
+            events: list[Any] = []
+            for rec in records:
+                for ev in self._final_answer_once(session_id, node_id, normalize(rec)):
+                    if ev.kind == "thought":
+                        events.append(
+                            AgentThoughtChunk(
+                                session_update="agent_thought_chunk",
+                                content=TextContentBlock(
+                                    type="text",
+                                    text=f"[{node_id}] {ev.text}",
+                                ),
+                            )
+                        )
+                    else:
+                        events.append(
+                            ToolCallProgress(
+                                session_update="tool_call_update",
+                                tool_call_id=node_id,
+                                content=[
+                                    ContentToolCallContent(
+                                        type="content",
+                                        content=TextContentBlock(
+                                            type="text", text=ev.text
+                                        ),
+                                    )
+                                ],
+                            )
+                        )
+            tail.offset = 0  # future polls start at offset 0, not replay
+            # Tail is the last ``_LIVE_REPLAY_LIMIT`` events.
+            for update in events[-_LIVE_REPLAY_LIMIT:]:
+                await self._emit(session_id, update)
+
     def _is_pid_gone(self, pid: int) -> bool:
         """True when ``pid`` is no longer running.
 
@@ -459,7 +692,9 @@ class MiniOrkAcpAgent:
         if self._conn is not None:
             await self._conn.session_update(session_id, update)
 
-    async def _project_snapshot(self, session_id: str, snapshot: dict[str, Any]) -> None:
+    async def _project_snapshot(
+        self, session_id: str, snapshot: dict[str, Any], *, live: bool = True
+    ) -> None:
         emitted = self._emitted.setdefault(session_id, set())
         new_events: list[dict[str, Any]] = []
         for ev in snapshot.get("events") or []:
@@ -468,6 +703,12 @@ class MiniOrkAcpAgent:
                 continue
             emitted.add(key)
             new_events.append(ev)
+        # Live drain (Z3): any node whose node_start has already been emitted
+        # is followed here. Drain happens BEFORE the lifecycle events so a
+        # text chunk follows its tool call, and BEFORE the terminal message
+        # so nothing written at the very end is lost (kickoff §3).
+        if live:
+            await self._drain_live_for(session_id)
         updates = self._build_event_updates(new_events)
         updates.append(self._build_usage_update(snapshot.get("llm_calls")))
         status = snapshot.get("status")

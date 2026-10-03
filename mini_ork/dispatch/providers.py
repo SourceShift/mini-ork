@@ -1788,21 +1788,57 @@ def _remote_lane_secrets(model: str, spec: ProviderSpec, env: Mapping[str, str],
 
 def _attach_isolation(request: DispatchRequest, env: Mapping[str, str], *,
                       lane_kind: str = "") -> DispatchRequest:
-    """Resolve the request's workspace and, when it is isolated, attach the
-    run's path map. Host dispatches come back unchanged (byte parity), and an
-    explicit caller-supplied ``path_map`` is never replaced."""
+    """Resolve the request's workspace and attach a per-node live sidecar.
+
+    For every dispatch inside a run — ``MINI_ORK_RUN_DIR`` and ``MO_NODE_ID``
+    both set and no caller-supplied ``MO_LIVE_FILE`` — the request's env gains
+    ``MO_LIVE_FILE=<run_dir>/agent-<safe_node>.live.jsonl``. The dispatch core
+    pops that key from the child env at ``mini_ork/dispatch/core.py:358`` so
+    the parent owns the writer; the ACP ``LiveTail`` (and the web /live route)
+    read the same file the parent is appending to. This applies to the host
+    path too: the previously-isolated-only branch now arms on every in-a-run
+    dispatch, so the live tap is universal.
+
+    Isolated dispatches additionally pick up the run's ``path_map`` so the
+    sandbox can resolve project paths. Host dispatches with a caller-supplied
+    ``path_map`` are passed through untouched.
+
+    Ad-hoc CLI calls (``MO_NODE_ID`` or ``MINI_ORK_RUN_DIR`` empty) come back
+    unchanged (byte parity): no env mutation, no file written, even though the
+    function is reached — the guard ``run_dir and node_id`` short-circuits the
+    extra-env branch before the request is replaced.
+    """
     workspace = _select_workspace(request.workspace, env, lane_kind=lane_kind)
-    if workspace == "host" or getattr(request, "path_map", None) is not None:
-        return request
     extra_env: dict[str, str] = {}
     run_dir = (env.get("MINI_ORK_RUN_DIR") or "").strip()
     node_id = (env.get("MO_NODE_ID") or "").strip()
     if run_dir and node_id and not env.get("MO_LIVE_FILE"):
-        # remote-nodes-09: an isolated node's output is teed live to the host
-        # sidecar the UI's /live route reads; the host Popen path never needed it.
-        extra_env["MO_LIVE_FILE"] = os.path.join(run_dir, f"agent-{node_id}.live.jsonl")
-    return replace(request, workspace=workspace, path_map=_run_path_map(env),
-                   env={**dict(request.env or {}), **extra_env})
+        # zed-z3 / remote-nodes-09: every in-a-run dispatch (host too) writes
+        # the per-node sidecar the UI /live route and the ACP LiveTail read.
+        # The dispatch core pops MO_LIVE_FILE from the child env, so the
+        # parent owns the writer — the child never touches the file.
+        safe_node = "".join(
+            c if c.isalnum() or c in "._-" else "_" for c in node_id
+        )
+        extra_env["MO_LIVE_FILE"] = os.path.join(
+            run_dir, f"agent-{safe_node}.live.jsonl"
+        )
+    if workspace == "host" or getattr(request, "path_map", None) is not None:
+        # Host: pass through byte-identical when the new branch had nothing to
+        # set (ad-hoc dispatch). When extra_env carries the live sidecar,
+        # merge it onto request.env without altering workspace or path_map.
+        if not extra_env:
+            return request
+        return replace(
+            request,
+            env={**dict(request.env or {}), **extra_env},
+        )
+    return replace(
+        request,
+        workspace=workspace,
+        path_map=_run_path_map(env),
+        env={**dict(request.env or {}), **extra_env},
+    )
 
 
 def _portable_transport_command(

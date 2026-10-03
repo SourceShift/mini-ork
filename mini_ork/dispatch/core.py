@@ -128,6 +128,11 @@ def spawn_local(
     group and returns ``124``, and the captured stdout/stderr still reach the
     parsers whole, so switching the drain mechanism is invisible to callers.
     """
+    # The per-node live sidecar arrives on the REQUEST env (providers sets it for
+    # every in-a-run dispatch); the parent owns the writer and the child never
+    # sees the variable. Fall back to the process env for direct callers.
+    child_env = dict(env)
+    live_path = child_env.pop("MO_LIVE_FILE", "") or None
     try:
         proc = subprocess.Popen(
             list(argv),
@@ -140,14 +145,14 @@ def spawn_local(
             # the whole node's output to a UnicodeDecodeError.
             encoding="utf-8",
             errors="replace",
-            env=dict(env),
+            env=child_env,
             cwd=cwd,  # None = inherit; pinned by the caller's cwd guard
             start_new_session=True,
         )
     except OSError as exc:
         return 127, "", f"spawn failed: {exc}"
 
-    with open_live_writer() as live:
+    with open_live_writer(live_path) as live:
         stdout_parts: list[str] = []
         stderr_parts: list[str] = []
         readers = [

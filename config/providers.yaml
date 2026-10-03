@@ -105,9 +105,15 @@ providers:
   opus:
     kind: anthropic-native
     family: anthropic
+    # Anthropic's own endpoint relays stream-json natively, so these lanes
+    # stream (live agent output in the UI / Zed); see _wants_stream_json.
+    gateway: false
   sonnet:
     kind: anthropic-native
     family: anthropic
+    # Anthropic's own endpoint relays stream-json natively, so these lanes
+    # stream (live agent output in the UI / Zed); see _wants_stream_json.
+    gateway: false
 
   # Ambient Codex CLI login. Use openai_api below for a direct BYO API key.
   codex:

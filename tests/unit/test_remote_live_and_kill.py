@@ -681,8 +681,49 @@ def test_attach_isolation_names_the_per_node_live_sidecar(tmp_path):
            "MINI_ORK_RUN_DIR": rd, "MO_NODE_ID": "implementer"}
     req = providers._attach_isolation(DispatchRequest(model="m", prompt="p"), env)
     assert req.env["MO_LIVE_FILE"] == os.path.join(rd, "agent-implementer.live.jsonl")
-    host = DispatchRequest(model="m", prompt="p")
-    assert providers._attach_isolation(host, {"MINI_ORK_RUN_DIR": rd, "MO_NODE_ID": "x"}) is host
+    # Z3 / zed-z3: the host branch now also arms MO_LIVE_FILE when both
+    # MINI_ORK_RUN_DIR and MO_NODE_ID are set. ``replace`` produces a new
+    # DispatchRequest — same shape, MO_LIVE_FILE populated, workspace still
+    # "host", path_map still None. The dispatch core pops MO_LIVE_FILE from
+    # the child env (mini_ork/dispatch/core.py:358) so the parent owns the
+    # sidecar.
+    host = providers._attach_isolation(
+        DispatchRequest(model="m", prompt="p"),
+        {"MINI_ORK_RUN_DIR": rd, "MO_NODE_ID": "x"},
+    )
+    assert host.workspace == "host"
+    assert host.path_map is None
+    assert host.env["MO_LIVE_FILE"] == os.path.join(rd, "agent-x.live.jsonl")
+    # Node id sanitization matches the LiveWriter side: a slash becomes
+    # underscore so the path stays under <run_dir>/.
+    sanitized = providers._attach_isolation(
+        DispatchRequest(model="m", prompt="p"),
+        {"MINI_ORK_RUN_DIR": rd, "MO_NODE_ID": "planner/code-impact"},
+    )
+    assert sanitized.env["MO_LIVE_FILE"] == os.path.join(
+        rd, "agent-planner_code-impact.live.jsonl"
+    )
+    # Ad-hoc dispatch (no MO_NODE_ID) is still byte-identical — the gate
+    # ``run_dir and node_id`` short-circuits before replace() is called.
+    adhoc = providers._attach_isolation(
+        DispatchRequest(model="m", prompt="p"),
+        {"MINI_ORK_RUN_DIR": rd},
+    )
+    assert adhoc.env == {}
+    # An explicit caller-supplied MO_LIVE_FILE in the INPUT env is NOT
+    # overwritten by the new branch (kickoff §1: explicit MO_LIVE_FILE wins).
+    # The host branch passes the request through; the explicit value stays
+    # on the caller side via merged_env at ``providers.py:1274`` — only the
+    # new auto-arm branch is guarded by ``not env.get("MO_LIVE_FILE")``.
+    pinned = os.path.join(rd, "pinned.live.jsonl")
+    pinned_req = providers._attach_isolation(
+        DispatchRequest(model="m", prompt="p"),
+        {"MINI_ORK_RUN_DIR": rd, "MO_NODE_ID": "x", "MO_LIVE_FILE": pinned},
+    )
+    assert pinned_req.env == {}, (
+        "host branch should NOT rewrite request.env when an explicit "
+        "MO_LIVE_FILE is already set in the input env"
+    )
 
 
 def test_isolated_dispatch_tees_live_and_leaves_a_killable_marker(tmp_path, monkeypatch):

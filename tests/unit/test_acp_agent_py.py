@@ -19,6 +19,8 @@ The seven contract assertions (mirrored by the verifier):
 from __future__ import annotations
 
 import asyncio
+
+import pytest
 import json
 import sqlite3
 import subprocess
@@ -38,6 +40,15 @@ from acp.schema import (  # noqa: E402
 )
 
 from mini_ork.acp.agent import MiniOrkAcpAgent, mint_run_id  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _never_launch_a_real_run(monkeypatch):
+    """A test that forgets to inject ``launcher=`` would spawn a real, detached
+    ``mini-ork run`` (real model calls, editing the engine checkout). Fail it."""
+    def _refuse(self, run_id, kickoff_text):
+        raise AssertionError(f"unit test tried to launch a real mini-ork run ({run_id})")
+    monkeypatch.setattr(MiniOrkAcpAgent, "_launch", _refuse)
 from mini_ork.stores import migrate as mig  # noqa: E402
 from mini_ork.web.control import _is_safe_token  # noqa: E402
 
@@ -607,3 +618,188 @@ def test_home_for_env_precedence(tmp_path, monkeypatch):
     monkeypatch.setenv("MINI_ORK_HOME", str(env_home))
     agent = MiniOrkAcpAgent()
     assert agent._home_for(None) == Path(env_home)
+
+
+# ── Z3 live sidecar projection ─────────────────────────────────────────────
+
+
+class _FakeLiveConn:
+    """Capturing ACP connection for live projection tests."""
+
+    def __init__(self) -> None:
+        self.captured: list = []
+
+    async def session_update(self, session_id: str, update) -> None:
+        del session_id
+        self.captured.append(update)
+
+
+def _write_live_lines(path: Path, lines: list[str]) -> None:
+    """Append one ``LiveWriter``-shaped envelope per ``lines`` entry."""
+    from mini_ork.dispatch.live_stream import LiveWriter
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with LiveWriter(str(path)) as writer:
+        for i, line in enumerate(lines):
+            writer.write_line(line, "stdout", partial=False)
+
+
+def test_running_session_drains_new_live_lines_each_poll(tmp_path):
+    """A running session whose run dir gains lines in
+    ``agent-<node>.live.jsonl`` between polls emits ``ToolCallProgress`` with
+    exactly the new text (and an ``AgentThoughtChunk`` for a thinking block);
+    nothing is re-sent on the next poll.
+
+    Drives the agent through the real ``_await_terminal`` loop with a
+    counter-driven fake reader that writes fresh live content between calls
+    (the writer runs INSIDE the reader, so ``_project_snapshot``'s drain
+    sees the just-written bytes — the same timing a real dispatch produces).
+    """
+    home = tmp_path / ".mini-ork"
+    run_id = "run-live-001"
+    run_dir = home / "runs" / run_id
+    run_dir.mkdir(parents=True)
+    live_path = run_dir / "agent-implementer.live.jsonl"
+
+    call = {"n": 0}
+
+    def fake_reader(_run_id: str) -> dict:
+        call["n"] += 1
+        # Poll 1: emit node_start for implementer + write first live chunk.
+        # Poll 2: write second batch (text + thinking) and stay running.
+        # Poll 3: stay running, no new live content (D1 reuse assertion).
+        # Poll 4: terminal — last drain still picks up nothing new.
+        if call["n"] == 1:
+            _write_live_lines(live_path, [json.dumps({
+                "type": "assistant",
+                "message": {"content": [{"type": "text", "text": "first chunk"}]},
+            })])
+            return {
+                "status": "executing",
+                "events": [
+                    {"event_type": "node_start",
+                     "payload_json": json.dumps(
+                         {"node_id": "implementer", "node_type": "implementer"}
+                     )},
+                ],
+                "llm_calls": [],
+            }
+        if call["n"] == 2:
+            _write_live_lines(live_path, [json.dumps({
+                "type": "assistant",
+                "message": {"content": [
+                    {"type": "thinking", "thinking": "pondering"},
+                    {"type": "text", "text": "second chunk"},
+                ]},
+            })])
+            return {"status": "executing", "events": [], "llm_calls": []}
+        if call["n"] == 3:
+            # No new live lines; status still executing → drain emits nothing.
+            return {"status": "executing", "events": [], "llm_calls": []}
+        # Poll 4: terminal.
+        return {"status": "published", "events": [], "llm_calls": []}
+
+    conn = _FakeLiveConn()
+    agent = MiniOrkAcpAgent(home=home, reader=fake_reader, poll_interval=0,
+                            launcher=lambda _rid, _kick: {"ok": True})
+    agent.on_connect(conn)
+    resp = asyncio.run(agent.prompt(run_id, [_text_block("go")]))
+    assert resp.stop_reason == "end_turn"
+
+    # Lifecycle: one ToolCallStart + one ToolCallProgress(terminal) + usage +
+    # terminal message.
+    starts = [u for u in conn.captured if isinstance(u, ToolCallStart)]
+    assert len(starts) == 1
+    assert starts[0].tool_call_id == "implementer"
+
+    # Live chunks: poll 1 emits 1 text chunk; poll 2 emits 1 thought + 1 text.
+    thoughts = [u for u in conn.captured if isinstance(u, AgentMessageChunk)]
+    text_progress = [
+        u for u in conn.captured
+        if isinstance(u, ToolCallProgress) and u.content is not None
+    ]
+    # The terminal ToolCallProgress has content=None — exclude it.
+    progress_with_text = [u for u in text_progress if u.content]
+
+    assert len(progress_with_text) == 2, [str(u) for u in conn.captured]
+    texts = [u.content[0].content.text for u in progress_with_text]
+    assert texts == ["first chunk", "second chunk"]
+
+    # Thought: must be the AgentMessageChunk-shaped AgentThoughtChunk that
+    # carries the "[implementer] pondering" prefix.
+    assert len(thoughts) == 1, [str(u) for u in conn.captured]
+    # The agent_message_chunk is the terminal; the thought is a separate update.
+    # Filter AgentMessageChunk that carries the terminal text vs. the thought.
+    terminal_chunks = [
+        u for u in thoughts
+        if isinstance(u, AgentMessageChunk)
+        and "mini-ork run finished" in (u.content.text or "")
+    ]
+    assert len(terminal_chunks) == 1
+    # The AgentThoughtChunk for the live thought chunk uses a different type.
+    from acp.schema import AgentThoughtChunk
+    live_thoughts = [u for u in conn.captured if isinstance(u, AgentThoughtChunk)]
+    assert len(live_thoughts) == 1
+    assert live_thoughts[0].content.text == "[implementer] pondering"
+
+    # D1 for live events: tail.read_new() advances offset across polls, so a
+    # poll with no new content emits zero new ToolCallProgress chunks beyond
+    # the terminal one. Verify by counting the per-node live emissions:
+    # exactly 2 text chunks + 1 thought, no duplicates.
+    assert len(progress_with_text) == 2
+    assert len(live_thoughts) == 1
+
+
+def test_load_session_replays_at_most_50_live_events_per_node(tmp_path):
+    """``session/load`` of a finished run replays at most the last 50
+    normalized events per node (kickoff §3).
+
+    Writes 80 records to a node's live sidecar, seeds a published task_run
+    row + a ``node_start`` event, and asserts the load emits ≤50
+    ``ToolCallProgress`` chunks for the node (text + tool_output + tool all
+    count as normalized events).
+    """
+    proj, home = _migrate_home(tmp_path)
+    run_id = "run-replay-001"
+    _seed_run(home, run_id, status="published", kickoff_text="# Replay")
+    _seed_node_event(home, run_id, "implementer")
+
+    run_dir = home / "runs" / run_id
+    run_dir.mkdir(parents=True)
+    live_path = run_dir / "agent-implementer.live.jsonl"
+
+    from mini_ork.acp.agent import _LIVE_REPLAY_LIMIT
+    from mini_ork.dispatch.live_stream import LiveWriter
+
+    with LiveWriter(str(live_path)) as writer:
+        for i in range(80):
+            writer.write_line(
+                json.dumps({
+                    "type": "assistant",
+                    "message": {"content": [
+                        {"type": "text", "text": f"chunk-{i:03d}"},
+                    ]},
+                }),
+                "stdout",
+            )
+
+    conn = _FakeLiveConn()
+    agent = MiniOrkAcpAgent(home=home, poll_interval=0)
+    agent.on_connect(conn)
+    asyncio.run(agent.load_session(str(proj), run_id))
+
+    # Count normalized-event TextProgress chunks for "implementer".
+    text_chunks = [
+        u for u in conn.captured
+        if isinstance(u, ToolCallProgress)
+        and u.content is not None
+        and u.tool_call_id == "implementer"
+    ]
+    assert len(text_chunks) == _LIVE_REPLAY_LIMIT, (
+        f"expected at most {_LIVE_REPLAY_LIMIT} replays, got {len(text_chunks)}"
+    )
+    # The cap is "last 50 normalized events" — the replayed texts are the
+    # last 50 ("chunk-030" through "chunk-079"), oldest 30 dropped.
+    texts = [u.content[0].content.text for u in text_chunks]
+    assert texts[0] == "chunk-030"
+    assert texts[-1] == "chunk-079"

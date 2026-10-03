@@ -168,11 +168,13 @@ class LiveWriter:
         self.close()
 
 
-def open_live_writer() -> LiveWriter:
-    """Writer for the node named by ``MO_LIVE_FILE``, or an inert one.
+def open_live_writer(path: str | None = None) -> LiveWriter:
+    """Writer for ``path`` (the dispatch request's ``MO_LIVE_FILE``) or, when
+    ``path`` is None, for the process-level ``MO_LIVE_FILE``; inert when both
+    are empty.
 
     Returning an inert writer rather than ``None`` keeps the drain loop free of
     a null check: streaming is a capability the environment grants, and its
     absence must not fork the transport's control flow.
     """
-    return LiveWriter(live_file_path())
+    return LiveWriter(live_file_path() if path is None else path.strip())

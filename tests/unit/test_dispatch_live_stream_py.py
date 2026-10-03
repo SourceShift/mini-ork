@@ -16,6 +16,7 @@ under test, not the provider.
 from __future__ import annotations
 
 import json
+import os
 import sys
 import threading
 import time
@@ -267,3 +268,21 @@ def test_concurrent_writers_do_not_interleave_within_a_record(tmp_path, stream):
     recs = _read_records(live)
     assert len(recs) == 800
     assert sorted(r["seq"] for r in recs) == list(range(800))
+
+
+def test_spawn_local_writes_the_request_env_live_file_and_hides_it_from_the_child(tmp_path, monkeypatch):
+    """The per-node sidecar comes on the request env (providers sets it for every
+    in-a-run dispatch). spawn_local must tee stdout to it while the child runs,
+    and the child must not see MO_LIVE_FILE."""
+    from mini_ork.dispatch import core
+
+    monkeypatch.delenv("MO_LIVE_FILE", raising=False)
+    live = tmp_path / "agent-implementer.live.jsonl"
+    script = ("import os, sys; print('{\"seen\": %s}' % "
+              "('true' if 'MO_LIVE_FILE' in os.environ else 'false')); sys.stdout.flush()")
+    env = {**os.environ, "MO_LIVE_FILE": str(live)}
+    rc, out, _err = core.spawn_local([sys.executable, "-c", script], stdin="", timeout=30, env=env, cwd=None)
+    assert rc == 0
+    assert '"seen": false' in out
+    rows = [json.loads(line) for line in live.read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert any(r.get("stream") == "stdout" and '"seen": false' in r.get("line", "") for r in rows)
