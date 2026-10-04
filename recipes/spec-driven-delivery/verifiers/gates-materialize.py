@@ -57,7 +57,7 @@ _MARKER_RE = re.compile(r"^\s*#\s*(AC\d+(?:\s*[+,]\s*AC\d+)*)\b.*$", re.M)
 _AC_ID_RE = re.compile(r"AC\d+")
 _TESTID_RE = re.compile(r'data-testid="([^"]+)"')
 _ROUTE_RE = re.compile(
-    r'(?:\$SDD_FE_BASE|\$\{SDD_FE_BASE\}|https?://[^\s"\'`/]+)(/[^\s"\'`)\]]*)|(?<![\w/])(/en/[^\s"\'`)\]]*)')
+    r'(?:\$SDD_FE_BASE|\$\{SDD_FE_BASE\}|https?://[^\s"\'`/]+)(/en/[^\s"\'`)\]]*)|(?<![\w/])(/en/[^\s"\'`)\]]*)')
 _SUCCESS_LIT_RE = re.compile(r"""(?:print\(|echo\s+)["']([^"']*pass[^"']*)["']""", re.I)
 
 
@@ -117,21 +117,22 @@ def _materialize(card: dict, spec_text: str) -> tuple[dict, list[str]]:
             tags.append("precondition")
         probe = labeled.get(aid)
         expect = None
-        if probe is None and kind == "ui":
-            # author's own browser probes first; a literal-token template only
-            # when the spec has no browser fence at all
-            ui_fences = [f for f in unlabeled if "agent-browser" in f]
-            if ui_fences:
-                probe = "\n".join(ui_fences)
-            else:
+        if probe is None:
+            # Whole-spec script for ANY unlabeled AC: all fences joined under
+            # set -euo pipefail. Fences share state (resolver vars defined in
+            # one fence, used in another) and a plain join reports only the
+            # LAST fence's exit code — both failed dispatch triage on the
+            # first live campaign (run-sdd10x-202610040931 ASKs).
+            whole = "\n".join(_fences(spec_text)).strip("\n")
+            if whole:
+                probe = whole if whole.lstrip().startswith("set -e") \
+                    else "set -euo pipefail\n" + whole
+            elif kind == "ui":
+                # literal-token template ONLY for a fence-less spec, and only
+                # onto an FE route — never a BE /api path
                 tpl = _ui_template(text, spec_text)
                 if tpl:
                     probe, expect = tpl
-        if probe is None and kind in ("cmd", "contract"):
-            # unlabeled fences = the spec-level verify script; a partially
-            # labeled spec falls back to ALL fences joined — the whole script
-            # asserts the whole feature, which is faithful for leftover ACs
-            probe = spec_script or ("\n".join(_fences(spec_text)).strip("\n") or None)
         if probe is None:
             reason = "UI_TOKENS_MISSING" if kind == "ui" else "NO_EXECUTABLE_FENCE"
             unprobeable.append({"acceptance_ref": aid, "reason": reason})

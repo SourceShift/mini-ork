@@ -97,7 +97,7 @@ def test_unlabeled_fence_serves_every_cmd_ac(tmp_path):
     assert code == 0 and out["pass"], out
     g = gates_of(run, "s-unlab")
     assert len(g["probes"]) == 2
-    assert all(p["probe"] == './verify.sh && echo "all pass"' for p in g["probes"])
+    assert all(p["probe"] == 'set -euo pipefail\n./verify.sh && echo "all pass"' for p in g["probes"])
     assert all("all" in p["expect"] for p in g["probes"])
 
 
@@ -108,13 +108,13 @@ def test_ui_ac_uses_agent_browser_fence(tmp_path):
     assert code == 0 and out["pass"], out
     g = gates_of(run, "s-uifence")
     assert "agent-browser open" in g["probes"][0]["probe"]
+    assert g["probes"][0]["probe"].startswith("set -euo pipefail")
 
 
 def test_ui_template_from_author_literals(tmp_path):
-    text = '# S\n\nThe page at `/en/audience` renders it.\n\n```bash\necho cmd-only\n```\n'
+    text = '# S\n\nThe page at `/en/audience` renders it.\n'
     run = make_spec(tmp_path, "s-uitpl", text,
-                    [ac("AC1", kind="cmd"),
-                     ac("AC2", kind="ui", text='renders data-testid="audience-share-card"')])
+                    [ac("AC2", kind="ui", text='renders data-testid="audience-share-card"')])
     code, out = run_materialize(run, tmp_path)
     assert code == 0 and out["pass"], out
     g = gates_of(run, "s-uitpl")
@@ -124,7 +124,7 @@ def test_ui_template_from_author_literals(tmp_path):
 
 
 def test_ui_without_tokens_is_unprobeable(tmp_path):
-    text = "# S\n\n```bash\necho cmd-only\n```\n"
+    text = "# S\n\nNothing executable here.\n"
     run = make_spec(tmp_path, "s-uibad", text, [ac("AC1", kind="ui", text="looks nice")])
     code, out = run_materialize(run, tmp_path)
     assert code == 1 and not out["pass"], out
