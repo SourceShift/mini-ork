@@ -85,9 +85,44 @@ curl $BASE/count && echo "AC2 pass"
     g = gates_of(run, "s-lab")
     by = {p["acceptance_ref"]: p for p in g["probes"]}
     assert "curl $BASE/list" in by["AC1"]["probe"] and "curl $BASE/count" not in by["AC1"]["probe"]
-    assert by["AC1"]["probe"].startswith("BASE=http://x")  # prelude prepended
+    assert by["AC1"]["probe"].startswith("set -euo pipefail")  # fail-fast header first
+    assert "BASE=http://x" in by["AC1"]["probe"]              # then the prelude
     assert by["AC1"]["expect"] == "AC1\\ pass" or "AC1" in by["AC1"]["expect"]
     assert g["unprobeable"] == []
+
+
+def test_labeled_segment_is_failfast(tmp_path):
+    """A mid-segment failure must not fall through to the trailing pass echo.
+
+    Regression for the live 2026-10-04 s11-lead-outcome-marks-api defect: the
+    labeled-segment path carried no `set -e`, so a PATCH that 404'd (route not
+    yet implemented) did not stop the segment — AC1's undo assertion
+    (`not booked_at`) is satisfied by the 404 body, the trailing
+    `echo "AC1 pass"` fired, and the gate reported PASS against a route that
+    did not exist. Any gate green on vacuous evidence silences the whole
+    campaign's verification, so this is asserted behaviourally, not
+    structurally.
+    """
+    text = """# S
+
+## Acceptance criteria
+
+- AC1: patches
+
+```bash
+# AC1
+false
+echo "AC1 pass"
+```
+"""
+    run = make_spec(tmp_path, "s-vac", text, [ac("AC1")])
+    code, out = run_materialize(run, tmp_path)
+    assert code == 0 and out["pass"], out
+    probe = gates_of(run, "s-vac")["probes"][0]["probe"]
+    assert probe.startswith("set -euo pipefail")
+    r = subprocess.run(["bash", "-c", probe], capture_output=True, text=True)
+    assert r.returncode != 0, r.stdout
+    assert "AC1 pass" not in r.stdout
 
 
 def test_unlabeled_fence_serves_every_cmd_ac(tmp_path):

@@ -12,7 +12,10 @@ truth. Zero LLM calls here.
 Resolution, per SpecCard acceptance id:
   cmd/contract kinds —
     1. a fence segment labeled for the AC (a ``# AC3`` / ``# AC1+AC2:`` marker
-       line inside a fence; the fence's pre-marker prelude is prepended);
+       line inside a fence; the fence's pre-marker prelude is prepended, after
+       a ``set -euo pipefail`` header — a labeled segment must fail fast, or a
+       swallowed mid-segment failure falls through to the segment's trailing
+       ``echo "ACn pass"`` and the expect-literal matches on a vacuous pass);
     2. else the spec's unlabeled fences joined (the spec-level verify script;
        the same probe may legitimately serve several ACs — the 1-probe-per-AC
        contract counts rows, and a spec-level script asserts all its ACs);
@@ -66,7 +69,16 @@ def _fences(text: str) -> list[str]:
 
 
 def _split_labeled(fence: str) -> tuple[dict[str, str], bool]:
-    """AC id → labeled segment (prelude prepended). Second value: fence had markers."""
+    """AC id → labeled segment (prelude prepended). Second value: fence had markers.
+
+    Every body gets the same ``set -euo pipefail`` header the whole-script
+    fallback already carries. Without it a multi-command segment does NOT stop
+    at a failing command: the failure is swallowed and the segment's trailing
+    ``echo "ACn pass"`` fires anyway, satisfying the expect-literal regex on a
+    VACUOUS pass. Found live 2026-10-04 on s11-lead-outcome-marks-api, where
+    AC1-AC3 reported pass against a route that did not exist — AC1's undo
+    assertion (``not booked_at``) is even satisfied by the 404 body.
+    """
     markers = list(_MARKER_RE.finditer(fence))
     if not markers:
         return {}, False
@@ -76,6 +88,8 @@ def _split_labeled(fence: str) -> tuple[dict[str, str], bool]:
         end = markers[i + 1].start() if i + 1 < len(markers) else len(fence)
         segment = fence[m.start():end].rstrip("\n")
         body = (prelude + "\n" + segment).strip("\n") if prelude.strip() else segment
+        if not body.lstrip().startswith("set -e"):
+            body = "set -euo pipefail\n" + body
         for ac in _AC_ID_RE.findall(m.group(1)):
             out[ac] = body
     return out, True
