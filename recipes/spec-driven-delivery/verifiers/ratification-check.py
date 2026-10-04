@@ -158,6 +158,45 @@ def covering_clause(excerpt, card: dict) -> str | None:
     return None
 
 
+_AC_LABEL_RE = re.compile(r"^(?:-\s*)?(AC\d+)\s*[:—–-]\s*", re.I)
+_AC_TOKEN_RE = re.compile(r"\bAC\d+\b")
+
+
+def covering_acceptance(excerpt, card: dict) -> str | None:
+    """Id of the acceptance entry that covers the excerpt, or None.
+
+    Three deterministic forms, same one-way whole-word matching discipline as
+    covering_clause (the compiler drops clause mappings nondeterministically;
+    an excerpt the card's OWN acceptance already carries is compiler noise,
+    not a coverage gap — observed run-sdd10x-202610040703 on a verbatim AC3):
+      1. label prefix: an ``AC3: <text>`` excerpt whose <text> is contained in
+         (or contains) that acceptance's normalized text;
+      2. containment: the excerpt occurs inside any acceptance text;
+      3. reference: the excerpt names one or more ACn tokens and every one
+         resolves in the card (the requirement line itself declares which
+         acceptance entries enforce it).
+    """
+    if not isinstance(excerpt, str):
+        return None
+    acc = {a["id"]: _normalize(a.get("text", "")) for a in card.get("acceptance", [])}
+    m = _AC_LABEL_RE.match(excerpt.strip())
+    if m:
+        aid = m.group(1).upper()
+        rest = _normalize(excerpt.strip()[m.end():])
+        hay = acc.get(aid)
+        if hay and len(rest) >= MIN_EXCERPT_CHARS and (rest in hay or hay in rest):
+            return aid
+    needle = _normalize(excerpt)
+    if len(needle) >= MIN_EXCERPT_CHARS and len(needle.split()) >= MIN_EXCERPT_WORDS:
+        for aid, hay in acc.items():
+            if hay and needle in hay:
+                return aid
+    refs = {r.upper() for r in _AC_TOKEN_RE.findall(excerpt)}
+    if refs and refs <= set(acc):
+        return sorted(refs)[0]
+    return None
+
+
 def check_ratification(rd: Path, card: dict) -> tuple[list[str], list[dict]]:
     """(violations, reclassified_covered) for the card's ratification record."""
     sid = card["spec_id"]
@@ -178,8 +217,11 @@ def check_ratification(rd: Path, card: dict) -> tuple[list[str], list[dict]]:
         # A flagged conflict is a real problem, never compiler noise.
         eligible = isinstance(item, dict) and "conflict" not in str(item.get("reason", "")).casefold()
         clause_id = covering_clause(excerpt, card) if eligible else None
+        acceptance_id = covering_acceptance(excerpt, card) if eligible and clause_id is None else None
         if clause_id is not None:
             reclassified.append({"index": i, "source_excerpt": excerpt, "clause_id": clause_id})
+        elif acceptance_id is not None:
+            reclassified.append({"index": i, "source_excerpt": excerpt, "acceptance_id": acceptance_id})
         else:
             out.append(f"unacknowledged uncovered requirement [{i}]: {str(excerpt)[:120]!r}")
     return out, reclassified

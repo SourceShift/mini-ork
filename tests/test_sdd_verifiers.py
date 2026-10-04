@@ -619,3 +619,42 @@ def test_specdir_ingest_env_kickoff_and_lint_error(project, tmp_path):
     # the ingest still wrote an index; spec-lint pins the error-severity finding
     code, out, _ = project.verify("spec-lint")
     assert code == 1 and out["error_codes"] == ["NO_ACCEPTANCE"], out
+
+
+# ── ratification: acceptance-coverage reclassification (2026-10-04) ──────
+
+
+def test_ratification_ac_label_prefix_reclassified(project):
+    """An 'AC1: <the AC's own text>' entry is compiler noise, not a gap."""
+    project.index()
+    card = project.card()
+    ac1 = card["acceptance"][0]["text"]
+    project.ratification([{"source_excerpt": f"AC1: {ac1}.", "reason": "listed by compiler"}])
+    code, out, _ = run_verifier("ratification-check", project.run, project.target)
+    assert code == 0 and out["pass"], out
+    assert out["reclassified_covered_count"] == 1, out
+    entry = out["specs"][project.SPEC_ID]["reclassified_covered"][0]
+    assert entry["acceptance_id"] == "AC1", entry
+
+
+def test_ratification_ac_reference_tokens_reclassified(project):
+    """An entry that names which ACs enforce it (all resolving) is covered."""
+    project.index()
+    project.card()
+    project.ratification([{"source_excerpt":
+                           "FE test asserting the flip (AC1) and the exclusivity rule (AC2).",
+                           "reason": "outputs line"}])
+    code, out, _ = run_verifier("ratification-check", project.run, project.target)
+    assert code == 0 and out["pass"], out
+    assert out["reclassified_covered_count"] == 1, out
+
+
+def test_ratification_conflict_never_reclassified_by_acceptance(project):
+    """A conflicts_with entry fails even when its text IS a card AC."""
+    project.index()
+    card = project.card()
+    ac1 = card["acceptance"][0]["text"]
+    project.ratification([{"source_excerpt": f"AC1: {ac1}.",
+                           "reason": "conflicts_with:C1 — contradictory condition"}])
+    code, out, _ = run_verifier("ratification-check", project.run, project.target)
+    assert code == 1 and not out["pass"], out
