@@ -5,6 +5,7 @@ success_verifiers:
   - verifiers/specdir-ingest.py
   - verifiers/ratification-check.py
   - verifiers/spec-lint.py
+  - verifiers/gates-materialize.py
   - verifiers/test-validity.py
   - verifiers/dispatch-aggregator.py
   - verifiers/smoke-live.py

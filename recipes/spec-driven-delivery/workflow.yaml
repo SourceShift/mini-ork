@@ -14,7 +14,7 @@ nodes:
   - { name: contract_compiler, type: researcher, model_lane: planner, prompt_ref: prompts/contract-compiler.md, dispatch_mode: serial, gates: [budget_gate] }
   - { name: ratification_check, type: verifier, verifier_ref: verifiers/ratification-check.py, dispatch_mode: serial }
   - { name: spec_lint, type: verifier, verifier_ref: verifiers/spec-lint.py, dispatch_mode: serial }
-  - { name: test_author, type: researcher, model_lane: reviewer, prompt_ref: prompts/test-author.md, dispatch_mode: serial, gates: [budget_gate] }
+  - { name: gates_materialize, type: verifier, verifier_ref: verifiers/gates-materialize.py, dispatch_mode: serial }
   - { name: test_validity, type: verifier, verifier_ref: verifiers/test-validity.py, dispatch_mode: serial }
   - { name: per_spec_dispatcher, type: implementer, model_lane: implementer, prompt_ref: prompts/per-spec-dispatcher.md, dispatch_mode: serial, gates: [budget_gate, scope_gate] }
   - { name: dispatch_aggregator, type: verifier, verifier_ref: verifiers/dispatch-aggregator.py, dispatch_mode: serial }
@@ -32,9 +32,10 @@ edges:
   - { from: contract_compiler, to: ratification_check, edge_type: verifies }
   - { from: ratification_check, to: spec_lint, edge_type: depends_on, condition: pass }
   - { from: ratification_check, to: reflector, edge_type: escalates_to, condition: fail }
-  - { from: spec_lint, to: test_author, edge_type: depends_on, condition: pass }
+  - { from: spec_lint, to: gates_materialize, edge_type: depends_on, condition: pass }
   - { from: spec_lint, to: reflector, edge_type: escalates_to, condition: fail }
-  - { from: test_author, to: test_validity, edge_type: verifies }
+  - { from: gates_materialize, to: test_validity, edge_type: depends_on, condition: pass }
+  - { from: gates_materialize, to: reflector, edge_type: escalates_to, condition: fail }
   - { from: test_validity, to: per_spec_dispatcher, edge_type: depends_on, condition: pass }
   - { from: test_validity, to: reflector, edge_type: escalates_to, condition: fail }
   - { from: per_spec_dispatcher, to: dispatch_aggregator, edge_type: verifies }
