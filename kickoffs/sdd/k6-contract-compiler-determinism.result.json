@@ -1,0 +1,31 @@
+task_class=recursive_validate_impl
+workflow_version=latest
+kickoff=/Users/admin/ps/mini-ork-sdd-wt/kickoffs/sdd/k6-contract-compiler-determinism.md
+run_id=run-sdd-k6-contract-compiler-determinism-202610040438
+profile_path=/Volumes/docker-ssd/ps/mini-ork-sdd-wt/.mini-ork/runs/run-sdd-k6-contract-compiler-determinism-202610040438/run_profile.json
+profile_status=ready
+profile_confidence=0.95
+plan_path=/Volumes/docker-ssd/ps/mini-ork-sdd-wt/.mini-ork/runs/run-sdd-k6-contract-compiler-determinism-202610040438/plan.json
+task_class=recursive_validate_impl
+    nodes:    15 (from workflow.yaml)
+  [skip] planner node handled by the Python plan runtime
+  [info] reviewer verdict=APPROVE → /Volumes/docker-ssd/ps/mini-ork-sdd-wt/.mini-ork/runs/run-sdd-k6-contract-compiler-determinism-202610040438/panel-verdict.json
+  [skip] planner node handled by the Python plan runtime
+  [ok] oracle-gates: pre-publish pass
+  [ok] publisher: preserved run-local artifact /Volumes/docker-ssd/ps/mini-ork-sdd-wt/.mini-ork/runs/run-sdd-k6-contract-compiler-determinism-202610040438/implementer-summary.json
+  [ok] publisher: preserved run-local artifact /Volumes/docker-ssd/ps/mini-ork-sdd-wt/.mini-ork/runs/run-sdd-k6-contract-compiler-determinism-202610040438/tier1-evidence.log
+  [ok] publisher: preserved run-local artifact /Volumes/docker-ssd/ps/mini-ork-sdd-wt/.mini-ork/runs/run-sdd-k6-contract-compiler-determinism-202610040438/tier2-evidence.log
+  [ok] publisher: preserved run-local artifact /Volumes/docker-ssd/ps/mini-ork-sdd-wt/.mini-ork/runs/run-sdd-k6-contract-compiler-determinism-202610040438/tier3-evidence.log
+  [ok] publisher: preserved run-local artifact /Volumes/docker-ssd/ps/mini-ork-sdd-wt/.mini-ork/runs/run-sdd-k6-contract-compiler-determinism-202610040438/panel-verdict.json
+  [ok] rollback complete
+── rubric (advisory pre-screen) ──
+{
+  "verdict": "pass",
+  "artifact_path": "",
+  "task_class": "recursive_validate_impl",
+  "pass_count": 3,
+  "fail_count": 0,
+  "results": [{"verifier":"verifiers/tier1-compile-typecheck.py","pass":true,"evidence_path":"/Volumes/docker-ssd/ps/mini-ork-sdd-wt/.mini-ork/runs/run-sdd-k6-contract-compiler-determinism-202610040438/evidence/tier1-compile-typecheck-1791082575.log"},{"verifier":"verifiers/tier2-scoped-unit.py","pass":true,"evidence_path":"/Volumes/docker-ssd/ps/mini-ork-sdd-wt/.mini-ork/runs/run-sdd-k6-contract-compiler-determinism-202610040438/evidence/tier2-scoped-unit-1791082575.log"},{"verifier":"verifiers/tier3-property-mutation.py","pass":true,"evidence_path":"/Volumes/docker-ssd/ps/mini-ork-sdd-wt/.mini-ork/runs/run-sdd-k6-contract-compiler-determinism-202610040438/evidence/tier3-property-mutation-1791082575.log"},{"verifier":"__gates__","pass":true,"evidence_path":"gate_registry"},{"verifier": "__gates_unmeasured__", "pass": null, "detail": "gate(s) did not run: mutation-adversary-gate, oracle-coalition, oracle-panel-health, oracle-synthesis-promote", "evidence_path": "gate_registry:defer"}]
+}
+── reflect (auto, since run start) ──
+mini_ork_result={"run_id":"run-sdd-k6-contract-compiler-determinism-202610040438","task_class":"recursive_validate_impl","profile_status":"ready","profile_confidence":0.95,"plan_path":"/Volumes/docker-ssd/ps/mini-ork-sdd-wt/.mini-ork/runs/run-sdd-k6-contract-compiler-determinism-202610040438/plan.json","verdict":"pass","cost_usd":12.385713,"returncode":1}

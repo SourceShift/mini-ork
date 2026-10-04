@@ -35,6 +35,8 @@ for K in ${SDD_KICKOFFS:-k2-recipe-scaffold k3-verifiers k4-e2e-fixture-eval}; d
     k2-recipe-scaffold)   "$PY" -c "import yaml,pathlib; yaml.safe_load(pathlib.Path('recipes/spec-driven-delivery/workflow.yaml').read_text())" >> "$LOG" 2>&1 || { echo "!!! $K evidence gate failed" | tee -a "$LOG"; exit 65; } ;;
     k3-verifiers)         "$PY" -m pytest -q tests/test_sdd_verifiers.py >> "$LOG" 2>&1 || { echo "!!! $K evidence gate failed" | tee -a "$LOG"; exit 65; } ;;
     k4-e2e-fixture-eval)  "$PY" -m pytest -q tests/test_sdd_e2e_dryrun.py >> "$LOG" 2>&1 || { echo "!!! $K evidence gate failed" | tee -a "$LOG"; exit 65; } ;;
+    k5-llm-node-artifact-completion) "$PY" -m pytest -q tests/test_node_artifact_completion.py >> "$LOG" 2>&1 || { echo "!!! $K evidence gate failed" | tee -a "$LOG"; exit 65; } ;;
+    k6-contract-compiler-determinism) "$PY" -m pytest -q tests/test_sdd_verifiers.py tests/test_sdd_e2e_dryrun.py >> "$LOG" 2>&1 || { echo "!!! $K evidence gate failed" | tee -a "$LOG"; exit 65; } ;;
   esac
   echo "--- $K evidence gate PASSED" | tee -a "$LOG"
 done
