@@ -24,11 +24,28 @@ deliverable; deliverable depends_on edges resolve (cross-spec
 ratification record's spec_id and source_hash must match the card. A missing
 spec-index.json or an empty spec-cards/ exits 2; a missing or unreadable
 card-side file is a per-spec violation. Cards are never rewritten here.
+
+Coverage backstop (compiler noise): before an unacknowledged entry fails, its
+`source_excerpt` is matched against the same card's clause texts. When the
+normalized excerpt (NFKC, casefold, backticks removed, whitespace collapsed,
+trailing .;:! trimmed) occurs whole-word inside one normalized clause text,
+the entry is a requirement the compiler already mapped. It is reported under
+`specs[<spec_id>].reclassified_covered` (index, excerpt, clause_id; the key
+is present only when non-empty) and counted in the top-level
+`reclassified_covered_count`, and it does not fail the gate.
+Matching is one-way (excerpt within clause, never clause within excerpt) and
+exact after normalization: no fuzzy, semantic or model-based matching. It
+never applies to an excerpt shorter than MIN_EXCERPT_CHARS characters or
+MIN_EXCERPT_WORDS words (the empty string is a substring of everything), to
+a non-dict entry, or to an entry whose reason mentions a conflict. The
+`acknowledged` flag is never set and the record file is never rewritten.
 """
 from __future__ import annotations
 
 import os
+import re
 import sys
+import unicodedata
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -40,6 +57,11 @@ from _sdd_common import (  # noqa: E402
     specdir_module,
     try_load_json,
 )
+
+CLAUSE_BUCKETS = ("functional", "quality", "constitutional", "architectural")
+MIN_EXCERPT_CHARS = 8
+MIN_EXCERPT_WORDS = 2
+_TRAILING_PUNCT = ".;:!"
 
 
 def _dups(ids: list[str]) -> list[str]:
@@ -109,23 +131,58 @@ def check_depends_on(cards: dict[str, dict]) -> dict[str, list[str]]:
     return out
 
 
-def check_ratification(rd: Path, card: dict) -> list[str]:
+def _normalize(text: str) -> str:
+    """NFKC + casefold, backticks removed, whitespace collapsed, ends trimmed
+    of whitespace and trailing sentence punctuation. Nothing else."""
+    norm = unicodedata.normalize("NFKC", text).casefold().replace("`", "")
+    return " ".join(norm.split()).rstrip(_TRAILING_PUNCT).rstrip()
+
+
+def covering_clause(excerpt, card: dict) -> str | None:
+    """Id of the first clause (bucket order, then source order) whose
+    normalized text contains the normalized excerpt as a whole-word run, or
+    None. Empty, non-string and too-short excerpts never match."""
+    if not isinstance(excerpt, str):
+        return None
+    needle = _normalize(excerpt)
+    if len(needle) < MIN_EXCERPT_CHARS or len(needle.split()) < MIN_EXCERPT_WORDS:
+        return None
+    # Never split a word: 'dir exist' must not match inside 'specs dir exists'.
+    head = r"(?<!\w)" if re.match(r"\w", needle[0]) else ""
+    tail = r"(?!\w)" if re.match(r"\w", needle[-1]) else ""
+    pattern = re.compile(head + re.escape(needle) + tail)
+    for bucket in CLAUSE_BUCKETS:
+        for clause in card["clauses"].get(bucket, []):
+            if pattern.search(_normalize(clause["text"])):
+                return clause["id"]
+    return None
+
+
+def check_ratification(rd: Path, card: dict) -> tuple[list[str], list[dict]]:
+    """(violations, reclassified_covered) for the card's ratification record."""
     sid = card["spec_id"]
     record, problem = try_load_json(rd / "ratification" / f"{sid}.json")
     if problem:
-        return [f"ratification record: {problem}"]
+        return [f"ratification record: {problem}"], []
     if not isinstance(record, dict) or not isinstance(record.get("ratification"), list):
-        return ["ratification record: expected an object with a 'ratification' list"]
-    out = []
+        return ["ratification record: expected an object with a 'ratification' list"], []
+    out, reclassified = [], []
     if record.get("spec_id") != sid:
         out.append("ratification record: spec_id does not match the card")
     if record.get("source_hash") != card["source_hash"]:
         out.append("ratification record: source_hash does not match the card")
     for i, item in enumerate(record["ratification"]):
-        if not isinstance(item, dict) or item.get("acknowledged") is not True:
-            excerpt = item.get("source_excerpt", "") if isinstance(item, dict) else ""
+        if isinstance(item, dict) and item.get("acknowledged") is True:
+            continue
+        excerpt = item.get("source_excerpt", "") if isinstance(item, dict) else ""
+        # A flagged conflict is a real problem, never compiler noise.
+        eligible = isinstance(item, dict) and "conflict" not in str(item.get("reason", "")).casefold()
+        clause_id = covering_clause(excerpt, card) if eligible else None
+        if clause_id is not None:
+            reclassified.append({"index": i, "source_excerpt": excerpt, "clause_id": clause_id})
+        else:
             out.append(f"unacknowledged uncovered requirement [{i}]: {str(excerpt)[:120]!r}")
-    return out
+    return out, reclassified
 
 
 def body():
@@ -144,6 +201,7 @@ def body():
     validate_card = specdir_module().validate_card
 
     violations: dict[str, list[str]] = {}
+    reclassified: dict[str, list[dict]] = {}
     valid: dict[str, dict] = {}
     for path in files:
         card, problem = try_load_json(path)
@@ -159,7 +217,8 @@ def body():
             violations.setdefault(sid, []).append(f"duplicate card for spec_id (also {path.name})")
             continue
         valid[sid] = card
-        found = check_card(card, path.stem, index_specs.get(sid)) + check_ratification(rd, card)
+        rat_found, reclassified[sid] = check_ratification(rd, card)
+        found = check_card(card, path.stem, index_specs.get(sid)) + rat_found
         violations.setdefault(sid, []).extend(found)
     for sid, found in check_depends_on(valid).items():
         violations.setdefault(sid, []).extend(found)
@@ -167,9 +226,13 @@ def body():
         violations.setdefault(sid, []).append("indexed spec has no valid SpecCard")
 
     specs = {sid: {"ok": not v, "violations": v} for sid, v in sorted(violations.items())}
+    for sid, entries in reclassified.items():
+        if entries:  # key absent when the backstop did not fire: payload unchanged
+            specs[sid]["reclassified_covered"] = entries
     failing = [sid for sid, s in specs.items() if not s["ok"]]
     detail = {"card_count": len(files), "specs": specs,
-              "violation_count": sum(len(s["violations"]) for s in specs.values())}
+              "violation_count": sum(len(s["violations"]) for s in specs.values()),
+              "reclassified_covered_count": sum(len(r) for r in reclassified.values())}
     if failing:
         first = specs[failing[0]]["violations"][0]
         return False, f"{len(failing)} spec(s) not ratifiable; {failing[0]}: {first}", detail
