@@ -340,7 +340,7 @@ def test_duplicate_spec_ids_are_a_hard_error(tmp_path):
 def test_lint_codes_and_severities():
     assert set(lint_mod.CODES) == {
         "NO_ACCEPTANCE", "NO_VERIFY_CMD", "VAGUE_CRITERIA", "OVERSIZE", "MISSING_SECTIONS",
-        "DUP_ID", "DEP_CYCLE",
+        "DUP_ID", "DEP_CYCLE", "UI_PROBE_UNREACHABLE",
     }
     errors = {c for c, s in lint_mod.SEVERITY.items() if s == "error"}
     assert errors == {"DEP_CYCLE", "DUP_ID", "NO_ACCEPTANCE"}
@@ -536,3 +536,31 @@ def test_cli_missing_dir_exits_two(tmp_path):
     proc = _cli("ingest", str(tmp_path / "missing"))
     assert proc.returncode == 2
     assert "not a directory" in proc.stderr
+
+
+def test_ui_probe_unreachable_warns_without_browser_fence_or_literals():
+    text = (
+        "# S\n\n## Inputs\n\n- x\n\n## Acceptance criteria\n\n"
+        "- AC1: the page renders the badge element\n\n```bash\necho cmd-only\n```\n"
+    )
+    codes = [f.code for f in lint_mod.lint_text("s", text)]
+    assert "UI_PROBE_UNREACHABLE" in codes
+
+
+def test_ui_probe_reachable_via_browser_fence_is_clean():
+    text = (
+        "# S\n\n## Inputs\n\n- x\n\n## Acceptance criteria\n\n"
+        '- AC1: renders data-testid="a-b-c"\n\n'
+        "```bash\nagent-browser open \"$SDD_FE_BASE/en/x\" && agent-browser snapshot -i | grep -q a-b-c\n```\n"
+    )
+    codes = [f.code for f in lint_mod.lint_text("s", text)]
+    assert "UI_PROBE_UNREACHABLE" not in codes
+
+
+def test_ui_probe_reachable_via_literals_is_clean():
+    text = (
+        "# S\n\nPage `/en/audience` shows it.\n\n## Inputs\n\n- x\n\n## Acceptance criteria\n\n"
+        '- AC1: renders data-testid="a-b-c"\n\n```bash\necho ok\n```\n'
+    )
+    codes = [f.code for f in lint_mod.lint_text("s", text)]
+    assert "UI_PROBE_UNREACHABLE" not in codes

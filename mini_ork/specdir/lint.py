@@ -4,6 +4,11 @@ Per-spec codes (from :func:`lint_text`):
 
 * ``NO_ACCEPTANCE`` (error) — no heading like "Acceptance criteria",
   "Definition of Done", "Success criteria", or "Done when".
+* ``UI_PROBE_UNREACHABLE`` (warning) — an acceptance line names a UI surface
+  (``data-testid`` / renders / element wording) but the spec has neither an
+  ``agent-browser`` fence nor both a ``data-testid="…"`` literal and a route
+  literal, so the deterministic gate materializer will mark it unprobeable
+  after dispatch instead of before (sdd-10x hit this on 4/118 ACs).
 * ``NO_VERIFY_CMD`` (warning) — no non-empty shell code fence (``bash``,
   ``sh``, ``shell``, ``console``, ``zsh``, or no language) and no inline code
   span that looks like a command (contains whitespace, or starts with ``./``
@@ -45,6 +50,7 @@ SEVERITY = {
     "DUP_ID": ERROR,
     "NO_ACCEPTANCE": ERROR,
     "NO_VERIFY_CMD": WARNING,
+    "UI_PROBE_UNREACHABLE": WARNING,
     "VAGUE_CRITERIA": WARNING,
     "OVERSIZE": WARNING,
     "MISSING_SECTIONS": WARNING,
@@ -54,6 +60,9 @@ DEFAULT_VAGUE_TERMS = ("should work", "properly", "correctly", "as expected", "r
 DEFAULT_MAX_BYTES = 262144
 
 _ACCEPTANCE_RE = re.compile(r"acceptance|definition of done|success criteria|done when", re.I)
+_UI_SHAPED_RE = re.compile(r'data-testid|\brenders?\b|\belement\b', re.I)
+_TESTID_LIT_RE = re.compile(r'data-testid="[^"]+"')
+_ROUTE_LIT_RE = re.compile(r'(?:\$SDD_FE_BASE|\$\{SDD_FE_BASE\}|https?://[^\s"\'`/]+)/|(?<![\w/])/en/')
 _SECTIONS_RE = re.compile(
     r"\b(?:inputs?|outputs?|errors?|error handling|edge[- ]cases?|examples?)\b", re.I)
 _SHELL_LANGS = frozenset({"", "bash", "sh", "shell", "console", "zsh"})
@@ -150,6 +159,18 @@ def lint_text(spec_id: str, text: str, size_bytes: int | None = None, *,
     if not any(_SECTIONS_RE.search(h.text) for h in doc.headings):
         out.append(_finding(spec_id, "MISSING_SECTIONS",
                             "no Inputs/Outputs/Errors/Edge-cases/Examples-style heading"))
+
+    ui_lines = sorted(n for n, line in lines.items() if _UI_SHAPED_RE.search(line))
+    if ui_lines and "agent-browser" not in text:
+        has_testid = _TESTID_LIT_RE.search(text) is not None
+        has_route = _ROUTE_LIT_RE.search(text) is not None
+        if not (has_testid and has_route):
+            missing = [w for ok, w in ((has_testid, "data-testid literal"),
+                                       (has_route, "route literal")) if not ok]
+            out.append(_finding(spec_id, "UI_PROBE_UNREACHABLE",
+                                f"UI-shaped acceptance line(s) {', '.join(map(str, ui_lines))} but no "
+                                f"agent-browser fence and no {' or '.join(missing)} — the gate "
+                                "materializer will mark these unprobeable after dispatch"))
     return _sorted(out)
 
 
