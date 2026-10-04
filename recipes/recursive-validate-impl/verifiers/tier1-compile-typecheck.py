@@ -75,8 +75,19 @@ else:
 
 if SOURCE_FILES and any(os.path.isfile(f) for f in
                         (".eslintrc", ".eslintrc.json", "eslint.config.js", "eslint.config.mjs")):
-    lint_rc = subprocess.run(["npx", "eslint"] + SOURCE_FILES,
-                             stdout=ev, stderr=subprocess.STDOUT).returncode
+    lint_cmd = os.environ.get("MO_TIER1_LINT_CMD", "").strip()
+    if lint_cmd == "skip":
+        ev.write("lint skipped via MO_TIER1_LINT_CMD=skip (consumer repo gates lint "
+                 "elsewhere, e.g. pre-commit hooks; eslint may structurally exclude "
+                 "the touched tree)\n")
+    elif lint_cmd:
+        import shlex
+        lint_rc = subprocess.run(shlex.split(lint_cmd) + SOURCE_FILES,
+                                 stdout=ev, stderr=subprocess.STDOUT, timeout=600).returncode
+        ev.write(f"lint via MO_TIER1_LINT_CMD rc={lint_rc}\n")
+    else:
+        lint_rc = subprocess.run(["npx", "eslint"] + SOURCE_FILES,
+                                 stdout=ev, stderr=subprocess.STDOUT).returncode
 else:
     ev.write("no source files for eslint or no eslint config found\n")
     ev.flush()
