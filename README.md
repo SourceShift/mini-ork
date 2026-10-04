@@ -101,8 +101,9 @@ you run it.
   [*2026 State of Code Abundance Report*](https://www.theregister.com/ai-ml/2026/05/20/ai-code-boom-drives-production-failures-higher-spending/)).
 - 💸 **Cost routing is a real lever.** Routing between a strong and a weak model can cut cost
   **more than 2×** without compromising quality
-  ([RouteLLM, arXiv:2406.18665](https://arxiv.org/abs/2406.18665)) — the lever mini-ork
-  automates, but conditioned on a verification bar rather than a guess.
+  ([RouteLLM, arXiv:2406.18665](https://arxiv.org/abs/2406.18665)) — the lever mini-ork's
+  router aims at, conditioned on a verification bar rather than a guess. Our first
+  measurement shows the bar is the hard part (see below).
 - 🚧 **Pilots stall on the same three things.** Most agent pilots don't reach production, and
   the blockers are consistently evaluation, reliability, and governance — the three layers
   mini-ork treats as runtime primitives instead of afterthoughts.
@@ -150,9 +151,11 @@ You don't pay frontier prices for work a cheaper model can pass:
 Every run leaves a trail of *verified* outcomes, and the system feeds that signal back:
 
 - **Contextual-bandit routing** adjusts which lane gets each unpinned role next time,
-  from recorded advantage — no extra model calls (`mini_ork/lane_router.py`). Whether
-  that lowers cost at the same verified correctness is being measured, not claimed;
-  see [docs/RESULTS.md](docs/RESULTS.md).
+  from recorded advantage — no extra model calls (`mini_ork/lane_router.py`). First
+  measurement: on 15 held-out tasks it spent 44% less than a fixed strong lane but solved
+  5 instead of 8, because the run's own verdict it learns from disagreed with the hidden
+  tests on 40% of runs. Lower cost at equal correctness is **not** shown yet; see
+  [docs/RESULTS.md §5](docs/RESULTS.md).
 - **GRPO group-relative writeback** and **textual-gradient** prompt evolution improve the
   planner / implementer / reviewer prompts across runs.
 - **Verified-outcome memory** persists *only what passed the gates*, so the learned

@@ -153,18 +153,53 @@ Reproduce:
 python3 scripts/run_heldout.py --split dev --out results.json   # needs working model lanes
 ```
 
-## 5. Not yet measured: does learned routing lower cost?
+## 5. Does learned routing lower cost? Not yet — the reward it learns from is too noisy
 
-The claim we want to test is that, as verified outcomes accumulate, the router moves work
-to cheaper models where they verify just as well. It has **not** been shown yet, and as
-shipped it could not be:
+The claim: as verified outcomes accumulate, the router moves work to cheaper models where
+they verify just as well. We tested it on the held-out tasks of §4 (October 2026), with the
+implementer's learning reward set to "the run passed its own checks, minus a cost penalty"
+(`MO_IMPL_REWARD=run_verified`, `MO_ROUTER_COST_LAMBDA=0.1`) and spend at list prices from
+`llm_calls`.
 
-- the shipped `code-fix` recipe pins its implementer to one lane, so the router never
-  chooses it;
-- the implementer's learning reward was "produced a diff", not "the run verified";
-- cost entered routing only as a tie-break between exactly equal rewards.
+Arms: two fixed implementer lanes — **S-ds** (deepseek-v4-pro) and **S-mm** (MiniMax-M3) —
+on the dev split D1 (14 tasks); then the learner **L** (`learning_governed`, ε = 0.10),
+seeded with the implementer traces of both fixed arms on D1, against S-ds on a second
+split D2 (15 tasks). Every arm ran the same engine commit and the same recipe; "solved"
+means the task's hidden tests pass on the run's patch.
 
-An opt-in reward now exists for the experiment (`MO_IMPL_REWARD=run_verified`: the run
-passed its own checks, minus a cost penalty `MO_ROUTER_COST_LAMBDA`). The experiment —
-static cheap lane vs static expensive lane vs the learner, on the held-out dev split, at
-list prices — is set up and will be reported here, including if it shows nothing.
+| arm | split | solved | spend | $ per solved | implementer lanes |
+|---|---|---|---|---|---|
+| S-ds | D1 | 8 / 14 | $8.68 | $1.09 | deepseek 14 |
+| S-mm | D1 | 3 / 14 | $1.54 | $0.51 | MiniMax 8 (6 runs stopped before the implementer) |
+| S-ds | D2 | 8 / 15 | $11.60 | $1.45 | deepseek 15 |
+| L | D2 | 5 / 15 | $6.54 | $1.31 | MiniMax 13 (learned), deepseek 2 (exploration) |
+
+**Result.** On D2 the learner spent 44% less than S-ds and solved 3 fewer tasks. Paired by
+task, it solved a strict subset of S-ds's tasks (5 both, 3 only S-ds, 0 only L; exact
+McNemar p = 0.25 at n = 15 — the direction is consistent, the sample is small). Lower cost
+at the *same* correctness — the claim — is not shown.
+
+**Why.** The router learned that MiniMax was the better implementer (relative advantage
+0.025 over 8 runs vs deepseek's 0.020 over 14), the opposite of what the hidden tests say.
+Its reward is the run's own verdict, and that verdict disagreed with the hidden tests on
+40% of the 52 runs that executed:
+
+| run's own verdict | hidden tests pass | hidden tests fail |
+|---|---|---|
+| passed | 16 | 13 |
+| failed | 8 | 15 |
+
+On D1, five of S-ds's eight correct fixes were failed by the run's LLM reviewer node (four
+"revise", one "fail"); on D2, seven S-ds runs passed their own checks with a patch the
+hidden tests reject. A learner fed that signal follows it. The six S-mm runs that stopped
+early were blocked by the run-profile gate ("what command should prove this run
+succeeded?") before any implementer ran, so S-mm's D1 row understates the MiniMax
+implementer (3 solved of the 8 runs that reached it).
+
+**What this means.** The routing mechanics work — the learner did move nearly all work to
+the lane its reward preferred, at roughly half the cost — but the in-run verdict is not a
+good enough label to learn correctness from. Before learned routing can claim "cheaper at
+equal quality", its reward has to be grounded in test outcomes rather than the reviewer's
+judgement, or the reviewer has to be calibrated against hidden-test truth. The raw outputs
+(results JSON, patches, state databases) are kept with the experiment scripts outside the
+repository.
