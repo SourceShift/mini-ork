@@ -21,6 +21,33 @@ every parent succeeds and publishes its declared outputs. A failed parent blocks
 its descendants, including publishers. Recipes without these fields stay on the
 legacy node-order path, so the migration can be incremental.
 
+### Artifact-based completion
+
+For researcher and implementer nodes, "succeeds" is decided from the declared
+outputs, not from the agent's self-report. If dispatch exits non-zero (for
+example a watchdog `rc=124` after the files landed), the node still completes
+when **every** declared output is fresh (written after this dispatch started),
+non-empty, and parses as JSON when it ends in `.json`. The executor logs
+`[ok] node completed via artifact check (self-report missing/invalid)` and
+records a `node.artifact_completion` run event. Missing, empty, invalid, or
+stale outputs keep the original failure reason (`timeout`, `error`,
+`cost_limit`). An implementer that completes this way never applies its
+(possibly truncated) stdout diff.
+
+The declared outputs are the node's `outputs` when present. Otherwise a
+researcher falls back to its conventional output file, and a
+`recursive-validate-impl` implementer falls back to `implementer-summary.json`.
+Any other implementer with no `outputs` gets no artifact completion. Set
+`strict_handshake: true` on a node whose self-report is itself the deliverable
+to turn this off. Verifier, publisher, rollback, reviewer, eval, and transform
+nodes are unaffected.
+
+The engine's `implementer-summary.json` writer merges into the summary the
+agent wrote instead of overwriting it. It also normalizes the result to the
+tier-verifier shape: `touched_files` falls back to `files_changed`, and
+`ready_for_tier1` is inferred from a non-empty file list unless the agent set
+it explicitly.
+
 ```mermaid
 flowchart LR
   A[Harness producer] -->|publish hash manifest| L[Artifact ledger]

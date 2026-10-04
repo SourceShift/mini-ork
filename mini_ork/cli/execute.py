@@ -85,6 +85,7 @@ from mini_ork.runtime.run_roots import (  # noqa: F401
     resolve_run_roots,
 )
 from mini_ork.runtime.contract import run_check  # noqa: F401 -- routing helper
+from mini_ork.execute_compat import normalize_implementer_summary, write_json_atomic
 
 _SEP = "\x1f"
 _NODE_TYPE_ORDER = ("planner", "researcher", "transform", "implementer", "reviewer", "verifier",
@@ -1849,7 +1850,7 @@ def _write_self_migrate_implementer_summary(run_dir, target, impl_log, harvested
         handle.write("\n")
 
 
-def _write_implementer_summary(run_dir, target, impl_log):
+def _write_implementer_summary(run_dir, target, impl_log, *, since_mtime=None):
     """Materialize the implementer-summary.json the publisher's commit gate reads.
 
     Only self-migrate had a writer, so every other recipe (code-fix included) left
@@ -1862,6 +1863,10 @@ def _write_implementer_summary(run_dir, target, impl_log):
     included because a newly created file is exactly the kind of change the commit
     must carry; anything under run_dir is excluded so run sidecars (which may live
     inside an in-place target tree) can never be committed.
+
+    An agent-written summary already at that path is merged, not overwritten
+    (see the merge below); ``since_mtime`` is the dispatch-start time, and an
+    older file is treated as absent.
 
     Returns the derived file list, or None when it could not be derived (no
     run_dir/target, or a git command failed) — callers must not read None as
@@ -1930,10 +1935,31 @@ def _write_implementer_summary(run_dir, target, impl_log):
         "files_changed": files,
         "implementation_log": impl_log,
     }
-    with open(os.path.join(run_dir, "implementer-summary.json"), "w", encoding="utf-8") as handle:
-        json.dump(payload, handle, indent=2)
-        handle.write("\n")
+    summary_path = os.path.join(run_dir, "implementer-summary.json")
+    # Merge into the summary the agent wrote instead of clobbering it: the
+    # recursive-validate-impl prompt asks for {ready_for_tier1, touched_files},
+    # and overwriting that with this payload is what left tier1 reading
+    # ready_for_tier1=False / touched_files=[] (SDD K2-K4). Engine keys stay
+    # git-derived; the agent's other keys survive; normalization fills the
+    # canonical tier keys. since_mtime drops a summary left by an earlier
+    # recursion iteration so its touched_files cannot outlive the change.
+    merged = _fresh_agent_summary(summary_path, since_mtime)
+    merged.update(payload)
+    write_json_atomic(summary_path, normalize_implementer_summary(merged))
     return files if derived else None
+
+
+def _fresh_agent_summary(path, since_mtime):
+    """The JSON object at ``path`` when it is valid and (if ``since_mtime`` is
+    given) written at or after it; otherwise an empty dict."""
+    try:
+        if since_mtime is not None and os.path.getmtime(path) < since_mtime:
+            return {}
+        with open(path, encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
 
 
 def _capture_pre_impl_fixture(run_dir, target):

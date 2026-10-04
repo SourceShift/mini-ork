@@ -291,6 +291,64 @@ def test_ratification_coverage_and_missing_record(project):
     assert any("ratification record: missing" in v for v in violations)
 
 
+def test_ratification_noise_covered_by_clause_is_reclassified(project):
+    ratified(project)
+    project.ratification([{"source_excerpt": "Specs  dir exists.", "reason": "untestable",
+                           "acknowledged": False}])
+    code, out, _ = project.verify("ratification-check")
+    assert code == 0, out
+    spec = out["specs"]["feature-export"]
+    assert spec["ok"] and spec["violations"] == [], out
+    assert spec["reclassified_covered"] == [
+        {"index": 0, "source_excerpt": "Specs  dir exists.", "clause_id": "C1"}]
+    assert out["reclassified_covered_count"] == 1 and "stderr_tail" not in out
+    record = json.loads((project.run / "ratification" / "feature-export.json").read_text())
+    assert record["ratification"][0]["acknowledged"] is False  # never written back
+
+
+def test_ratification_genuine_gap_still_fails(project):
+    ratified(project)
+    project.ratification([{"source_excerpt": "Exports finish within two seconds.",
+                           "reason": "untestable", "acknowledged": False}])
+    code, out, _ = project.verify("ratification-check")
+    assert code == 1, out
+    assert "unacknowledged uncovered requirement" in out["reason"]
+    assert out["reclassified_covered_count"] == 0
+
+
+@pytest.mark.parametrize("entry", [
+    {"source_excerpt": "", "reason": "ambiguous", "acknowledged": False},
+    {"source_excerpt": "specs", "reason": "ambiguous", "acknowledged": False},
+    {"source_excerpt": "dir exist", "reason": "ambiguous", "acknowledged": False},
+    {"source_excerpt": "specs dir exists and is writable", "reason": "ambiguous", "acknowledged": False},
+    {"source_excerpt": "specs dir exists", "reason": "conflicts_with:C1 — C1 says otherwise",
+     "acknowledged": False},
+    "specs dir exists",
+], ids=["empty", "too-short", "split-word", "clause-inside-excerpt", "conflict", "non-dict"])
+def test_ratification_backstop_guards_still_fail(project, entry):
+    ratified(project)
+    project.ratification([entry])
+    code, out, _ = project.verify("ratification-check")
+    assert code == 1 and "unacknowledged uncovered requirement" in out["reason"], out
+    assert "reclassified_covered" not in out["specs"]["feature-export"]
+    assert out["reclassified_covered_count"] == 0
+
+
+def test_ratification_mixed_record_fails_only_on_the_gap(project):
+    ratified(project)
+    project.ratification([
+        {"source_excerpt": "`prints feature ready`", "reason": "untestable", "acknowledged": False},
+        {"source_excerpt": "Exports finish within two seconds.", "reason": "untestable",
+         "acknowledged": False},
+    ])
+    code, out, _ = project.verify("ratification-check")
+    spec = out["specs"]["feature-export"]
+    assert code == 1, out
+    assert spec["violations"] == [
+        "unacknowledged uncovered requirement [1]: 'Exports finish within two seconds.'"]
+    assert [(r["index"], r["clause_id"]) for r in spec["reclassified_covered"]] == [(0, "F1")]
+
+
 # ── 4. vacuous probes ────────────────────────────────────────────────────
 
 
