@@ -30,7 +30,12 @@ from mini_ork.context import (
 )
 from mini_ork.runtime.run_roots import load_run_roots
 from mini_ork.cli.main import _module_env, _reflect_timeout_seconds
-from mini_ork.observability.node_events import _now_ms, mo_node_end, mo_node_start
+from mini_ork.observability.node_events import _now_ms, mo_node_emit, mo_node_end, mo_node_start
+from mini_ork.execute_compat import (
+    ARTIFACT_COMPLETION_LOG,
+    declared_artifacts_ok,
+    node_strict_handshake,
+)
 from mini_ork.workflow.store import make_artifact_store
 
 
@@ -741,6 +746,68 @@ def _materialize_lens_json(run_dir: str, node_id: str, text: str) -> None:
         pass
 
 
+def _declared_node_output_paths(ctx: NodeDispatch) -> list[str]:
+    """Absolute paths of the node's per-node workflow ``outputs`` ([] if none)."""
+    if ctx.artifact_ledger is None or ctx.compiled_workflow is None:
+        return []
+    try:
+        outputs = ctx.compiled_workflow.nodes[ctx.node_id].outputs
+        return [str(ctx.artifact_ledger.output_path(ctx.compiled_workflow, ctx.node_id, name))
+                for name in outputs]
+    except Exception:
+        return []
+
+
+def _dispatch_started_at(marker: str) -> float | None:
+    try:
+        return os.path.getmtime(marker)
+    except OSError:
+        return None
+
+
+def _stamp_dispatch_marker(marker: str) -> float | None:
+    """Touch the dispatch-start marker and return its mtime. Fail-soft: None
+    disables artifact completion (fail-closed), never the dispatch itself."""
+    try:
+        os.makedirs(os.path.dirname(marker) or ".", exist_ok=True)
+        open(marker, "w").close()
+    except OSError:
+        return None
+    return _dispatch_started_at(marker)
+
+
+def _completed_via_artifacts(ctx: NodeDispatch, paths: list[str],
+                             since_mtime: float | None, rc: int, finish_reason: str) -> bool:
+    """Whether a failed dispatch (rc != 0) still delivered the node.
+
+    The (rc, text) handshake is the agent's self-report; the declared artifacts
+    are the deliverable. Completion requires ALL of them to be fresh (written
+    after ``since_mtime``, the dispatch-start marker), non-empty, and parseable,
+    and the node must not opt out with ``strict_handshake``. Anything else keeps
+    the original failure. The distinct ``node.artifact_completion`` run_event
+    lets the learning loop tell these apart from a clean handshake (the payload
+    carries no ``finish_reason`` key: run_events copies that into a column that
+    consumers read as the node's outcome).
+    """
+    if not paths or since_mtime is None:
+        return False
+    if node_strict_handshake(ctx.compiled_workflow, ctx.workflow, ctx.node_id):
+        return False
+    ok, why = declared_artifacts_ok(paths, since_mtime=since_mtime)
+    if not ok:
+        print(f"  [artifact-check] node_id={ctx.node_id}: not complete — {why}", file=sys.stderr)
+        return False
+    print(f"  {ARTIFACT_COMPLETION_LOG}: node_id={ctx.node_id} rc={rc} "
+          f"suppressed_finish_reason={finish_reason}", file=sys.stderr)
+    try:
+        mo_node_emit(ctx.run_id, ctx.node_id, ctx.node_type, "node.artifact_completion",
+                     json.dumps({"rc": rc, "suppressed_finish_reason": finish_reason,
+                                 "artifacts": paths}), db=ctx.db)
+    except Exception:
+        pass
+    return True
+
+
 def _handle_researcher(ctx: NodeDispatch):
     out_file = ctx.declared_output_path(
         _researcher_output_file(ctx.run_dir, ctx.recipe_eff, ctx.node_id)
@@ -754,9 +821,14 @@ def _handle_researcher(ctx: NodeDispatch):
     rc, result = ctx.dispatch(prompt)
     if rc != 0:
         fr = finish_reason_for_failure(rc, result)
-        ctx.trace(ctx.node_id, "failure", "researcher", out_file, "", fr)
-        return 1, fr
-    ctx.write_preserving_agent(out_file, marker, result)
+        declared = _declared_node_output_paths(ctx) or [out_file]
+        if not _completed_via_artifacts(ctx, declared, _dispatch_started_at(marker), rc, fr):
+            ctx.trace(ctx.node_id, "failure", "researcher", out_file, "", fr)
+            return 1, fr
+        # The agent's own files are the deliverable; partial stdout from an
+        # aborted dispatch must not overwrite them.
+    else:
+        ctx.write_preserving_agent(out_file, marker, result)
     _materialize_lens_json(ctx.run_dir, ctx.node_id, result)
     try:
         os.remove(marker)
@@ -778,6 +850,15 @@ def _handle_researcher(ctx: NodeDispatch):
 # so the same no-change guard that `code-fix` enforces applies (pilot
 # mo-9a0cf68ccf).
 _RECIPES_REQUIRING_TREE_CHANGES = frozenset({"code-fix", "docs"})
+
+# Run-dir-relative deliverables of a recipe's implementer when its workflow node
+# declares no ``outputs``. recursive-validate-impl's tier1-3 verifiers read
+# implementer-summary.json, so an implementer that wrote it fresh has delivered
+# even when dispatch exited non-zero (watchdog rc=124 after the edits landed).
+# Recipes not listed here get no artifact completion: a failed dispatch fails.
+_IMPLEMENTER_COMPLETION_ARTIFACTS: dict[str, tuple[str, ...]] = {
+    "recursive-validate-impl": ("implementer-summary.json",),
+}
 
 
 def _handle_implementer(ctx: NodeDispatch):
@@ -864,13 +945,28 @@ def _handle_implementer(ctx: NodeDispatch):
         ctx.trace(ctx.node_id, "failure", "implementer", impl_log, "", "error")
         return 1, "error"
 
+    run_root = ctx.run_dir_eff or ctx.run_dir
+    marker = os.path.join(run_root, f".dispatch-marker-{ctx.node_id}")
+    dispatch_started = _stamp_dispatch_marker(marker)
     rc, result = ctx.dispatch(prompt)
+    try:
+        os.remove(marker)
+    except OSError:
+        pass
     if rc != 0:
         fr = finish_reason_for_failure(rc, result)
-        ctx.trace(ctx.node_id, "failure", "implementer", impl_log, "", fr)
-        return 1, fr
+        declared = _declared_node_output_paths(ctx) or [
+            os.path.join(run_root, rel)
+            for rel in _IMPLEMENTER_COMPLETION_ARTIFACTS.get(ctx.recipe_eff, ())
+        ]
+        if not _completed_via_artifacts(ctx, declared, dispatch_started, rc, fr):
+            ctx.trace(ctx.node_id, "failure", "implementer", impl_log, "", fr)
+            return 1, fr
     open(impl_log, "w").write(result)
-    apply_impl_output(impl_log, target)   # ported "capture coin-flip" applier
+    if rc == 0:
+        # A truncated diff from an aborted dispatch must never be applied; the
+        # artifact-completed path keeps only the edits the agent already made.
+        apply_impl_output(impl_log, target)   # ported "capture coin-flip" applier
     if ctx.recipe_eff == "framework-edit":
         ok, fr = _harvest_framework_edit_ground_truth(ctx.run_dir_eff, target)
         if not ok:
@@ -882,7 +978,8 @@ def _handle_implementer(ctx: NodeDispatch):
             ctx.run_dir_eff, target, impl_log, harvested
         )
     else:
-        changed = _write_implementer_summary(ctx.run_dir_eff, target, impl_log)
+        changed = _write_implementer_summary(ctx.run_dir_eff, target, impl_log,
+                                             since_mtime=dispatch_started)
         if ctx.recipe_eff in _RECIPES_REQUIRING_TREE_CHANGES and changed == []:
             # The model reported success but git sees no change: pilot task
             # mo-9a0cf68ccf ran every downstream node on an untouched tree and

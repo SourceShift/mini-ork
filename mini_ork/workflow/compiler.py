@@ -51,6 +51,10 @@ class WorkflowNode:
     inputs: dict[str, ArtifactInput] = field(default_factory=dict)
     outputs: dict[str, ArtifactOutput] = field(default_factory=dict)
     transform: str = ""
+    # Opt out of artifact-based completion: the agent's self-report IS the
+    # deliverable, so a failed dispatch fails the node even when the declared
+    # artifacts exist (see mini_ork.execute_compat).
+    strict_handshake: bool = False
 
     def dispatch_fields(self, separator: str) -> str:
         requires = ",".join(self.requires_capabilities)
@@ -189,6 +193,9 @@ def _node_from_yaml(raw: Any) -> WorkflowNode:
         raise WorkflowCompileError(
             f"node {name} type {node_type!r} cannot declare outputs because its handler does not publish artifacts"
         )
+    strict_handshake = details.get("strict_handshake", False)
+    if not isinstance(strict_handshake, bool):
+        raise WorkflowCompileError(f"node {name} strict_handshake must be a boolean")
     return WorkflowNode(
         name=name,
         type=node_type,
@@ -204,6 +211,7 @@ def _node_from_yaml(raw: Any) -> WorkflowNode:
         inputs=inputs,
         outputs=outputs,
         transform=transform,
+        strict_handshake=strict_handshake,
     )
 
 

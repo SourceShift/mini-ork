@@ -169,6 +169,11 @@
           "type": "string",
           "description": "Registered deterministic transform identifier; required for transform nodes."
         },
+        "strict_handshake": {
+          "type": "boolean",
+          "default": false,
+          "description": "Disable artifact-based completion; the agent self-report is the deliverable. When false (default), a researcher/implementer node whose declared output artifacts are fresh, non-empty and parse completes even if dispatch returned non-zero."
+        },
         "inputs": {
           "type": "object",
           "description": "Typed artifact input ports keyed by input name.",
