@@ -89,7 +89,7 @@ def _ui_template(ac_text: str, spec_text: str) -> tuple[str, str] | None:
         return None
     route = route_m.group(1) or route_m.group(2)
     probe = (f'agent-browser open "${{SDD_FE_BASE}}{route}" && '
-             f"agent-browser snapshot -i | grep -q '{testid.group(1)}'")
+             f'agent-browser wait \'[data-testid="{testid.group(1)}"]\'')
     return probe, "exit 0"
 
 

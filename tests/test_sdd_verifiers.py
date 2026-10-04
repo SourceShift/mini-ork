@@ -658,3 +658,24 @@ def test_ratification_conflict_never_reclassified_by_acceptance(project):
                            "reason": "conflicts_with:C1 — contradictory condition"}])
     code, out, _ = run_verifier("ratification-check", project.run, project.target)
     assert code == 1 and not out["pass"], out
+
+
+def test_validity_delivered_spec_passing_probe_is_ok(project, monkeypatch):
+    """A delivered spec's passing probe is DELIVERED_OK, not vacuous."""
+    project.index()
+    project.card()
+    project.implement()  # make the AC1 probe pass on the "untouched" tree
+    project.gates()
+    code, out = run_verifier("test-validity", project.run, project.target,
+                             MO_SDD_DELIVERED_SPECS=project.SPEC_ID)[:2]
+    assert code == 0 and out["pass"], out
+
+
+def test_validity_undelivered_passing_probe_still_vacuous(project):
+    project.index()
+    project.card()
+    project.implement()
+    project.gates()
+    code, out = run_verifier("test-validity", project.run, project.target)[:2]
+    assert code == 1 and not out["pass"], out
+    assert "vacuous" in out["reason"], out

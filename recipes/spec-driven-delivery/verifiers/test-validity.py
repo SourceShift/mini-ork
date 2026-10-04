@@ -23,7 +23,9 @@ precondition fails. Also per spec: the gates file's spec_id and source_hash
 match the card, `unprobeable` is empty, each probe's kind matches its card
 gate's kind, and no probe names an unknown acceptance id. An expect that any
 output satisfies is vacuous. Statically vacuous probes are never executed.
-Zero cards exits 2; zero probes fails.
+Zero cards exits 2; zero probes fails. Specs named in MO_SDD_DELIVERED_SPECS
+(comma list) are already-delivered: their passing probes are DELIVERED_OK,
+not vacuous — recompile cycles after partial delivery need this.
 """
 from __future__ import annotations
 
@@ -113,6 +115,10 @@ def _execute(row: dict, probe: dict, *, timeout: float, env: dict) -> list[str]:
         row["status"] = "PRECONDITION_OK" if passed else "PRECONDITION_FAILED"
         row["reason"] = res["reason"]
         return [] if passed else [f"precondition probe does not pass now ({res['reason']})"]
+    delivered = {s.strip() for s in os.environ.get("MO_SDD_DELIVERED_SPECS", "").split(",") if s.strip()}
+    if passed and row["spec_id"] in delivered:
+        row["status"], row["reason"] = "DELIVERED_OK", "spec already delivered (MO_SDD_DELIVERED_SPECS); passing now is the expected state"
+        return []
     row["status"] = "VACUOUS" if passed else "FAILS_TODAY"
     row["reason"] = res["reason"] if not passed else "passes on the untouched tree"
     return ["probe already passes on the untouched tree (vacuous)"] if passed else []
