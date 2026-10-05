@@ -581,3 +581,16 @@ def test_schema_has_new_properties():
             },
         }
     )
+
+
+def test_key_set_mismatch_pinpoints_the_key():
+    """Live smoke (2026-10-05): an undeclared `db_path` in /api/v1/health was
+    reported at `$` with both whole objects; the diff must name `$.db_path`."""
+    obs = {"ok": True, "db_path": "/x/state.db"}
+    for spec in ("exact", {"operator": "tolerant", "rules": {"abs_tol": 0.1}}):
+        r = eq.compare(obs, {"ok": True}, eq.EquivalenceSpec.from_raw(spec))
+        assert r.equal is False
+        assert r.path == "$.db_path"
+        assert "observed '/x/state.db' != expected <missing>" in r.detail
+    r = eq.compare({"ok": True}, {"ok": True, "n": 1}, eq.EquivalenceSpec.from_raw("exact"))
+    assert r.path == "$.n" and "observed <missing> != expected 1" in r.detail

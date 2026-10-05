@@ -208,7 +208,11 @@ def _diff(obs: Any, exp: Any, path: str) -> tuple[str, str, str] | None:
     """Return ``(path, obs_repr, exp_repr)`` for the first difference, or None."""
     if isinstance(obs, dict) and isinstance(exp, dict):
         if set(obs) != set(exp):
-            return (path, _trunc(repr(obs)), _trunc(repr(exp)))
+            # Pinpoint the first extra/missing key (`$.db_path`), not the parent object.
+            key = sorted(set(obs) ^ set(exp), key=str)[0]
+            return (f"{path}.{key}",
+                    _trunc(repr(obs[key])) if key in obs else "<missing>",
+                    _trunc(repr(exp[key])) if key in exp else "<missing>")
         for key in sorted(set(obs)):
             found = _diff(obs[key], exp[key], f"{path}.{key}")
             if found is not None:
@@ -306,7 +310,11 @@ def _tolerant_diff(
 ) -> tuple[str, str, str] | None:
     if isinstance(obs, dict) and isinstance(exp, dict):
         if set(obs) != set(exp):
-            return (path, _trunc(repr(obs)), _trunc(repr(exp)))
+            # Pinpoint the first extra/missing key (`$.db_path`), not the parent object.
+            key = sorted(set(obs) ^ set(exp), key=str)[0]
+            return (f"{path}.{key}",
+                    _trunc(repr(obs[key])) if key in obs else "<missing>",
+                    _trunc(repr(exp[key])) if key in exp else "<missing>")
         for key in sorted(set(obs)):
             found = _tolerant_diff(obs[key], exp[key], f"{path}.{key}", rel_tol, abs_tol)
             if found is not None:

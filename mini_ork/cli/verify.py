@@ -17,6 +17,7 @@ import os
 import re
 import sys
 import time
+import uuid
 from pathlib import Path
 
 from mini_ork import trace_store
@@ -325,7 +326,13 @@ def main(argv: list[str] | None = None, *, db: str | None = None, root: str | No
         if not name:
             continue
         script = _find_verifier_script(name, root, home)
-        ev = os.path.join(evidence_dir, f"{_evidence_stem(name)}-{int(time.time())}.log")
+        # Second-resolution names collided: two `mini-ork verify` calls in the same
+        # second shared one log, so the earlier result's evidence_path pointed at the
+        # later run's verdict. Keep the `<stem>-<epoch>` prefix, add a unique suffix.
+        ev = os.path.join(
+            evidence_dir,
+            f"{_evidence_stem(name)}-{int(time.time())}-{os.getpid()}-{uuid.uuid4().hex[:8]}.log",
+        )
         if dry_run == 1:
             sys.stdout.write(f"[dry-run] verifier: {name} → {script or 'NOT_FOUND'}\n")
             results.append(f'{{"verifier":"{name}","pass":null,"evidence_path":"dry-run"}}')
