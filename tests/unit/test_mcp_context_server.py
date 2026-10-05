@@ -547,10 +547,100 @@ def test_list_recipes_scans_engine_root(server_home, monkeypatch, tmp_path):
     resp = _call_args_control({"name": "list_recipes", "arguments": {}})
     body = json.loads(resp["result"]["content"][0]["text"])
     assert resp["result"]["isError"] is False
-    by_id = {r["id"]: r["description"] for r in body["recipes"]}
-    assert by_id["alpha"] == "Alpha recipe"
-    assert by_id["beta"] == "Beta recipe"
+    by_id = {r["id"]: r for r in body["recipes"]}
+    # Kickoff: each entry is {id, description, source, nodes} for engine
+    # recipes (no ``overrides_engine`` flag when nothing is shadowed).
+    assert by_id["alpha"]["description"] == "Alpha recipe"
+    assert by_id["alpha"]["source"] == "engine"
+    assert by_id["alpha"]["nodes"] == 0
+    assert by_id["alpha"].get("overrides_engine") is None
+    assert by_id["beta"]["description"] == "Beta recipe"
+    assert by_id["beta"]["source"] == "engine"
     assert "half" not in by_id
+
+
+def test_list_recipes_includes_project_recipe(server_home, monkeypatch, tmp_path):
+    """`list_recipes` exposes project recipes under <home>/recipes and
+    marks a shadowing project entry with ``overrides_engine: true``."""
+    # Engine root: an empty dir; we only care about the project entry.
+    engine = tmp_path / "engine"
+    engine.mkdir()
+    monkeypatch.setattr("mini_ork.web.control._mini_ork_root", lambda: engine)
+
+    # Project recipe: <home>/recipes/my-audit/
+    proj = server_home / "recipes" / "my-audit"
+    proj.mkdir(parents=True)
+    (proj / "workflow.yaml").write_text("name: my-audit\n", encoding="utf-8")
+    (proj / "task_class.yaml").write_text(
+        "name: my_audit\ndescription: My audit recipe\n",
+        encoding="utf-8",
+    )
+
+    resp = _call_args_control({"name": "list_recipes", "arguments": {}})
+    body = json.loads(resp["result"]["content"][0]["text"])
+    assert resp["result"]["isError"] is False
+    by_id = {r["id"]: r for r in body["recipes"]}
+    assert "my-audit" in by_id
+    entry = by_id["my-audit"]
+    assert entry["source"] == "project"
+    assert entry["description"] == "My audit recipe"
+    # No engine recipe with the same id, so ``overrides_engine`` is absent.
+    assert entry.get("overrides_engine") is None
+
+
+def test_list_recipes_marks_shadowing_project_entry(server_home, monkeypatch, tmp_path):
+    """A project recipe whose id collides with an engine recipe wins and
+    carries ``overrides_engine: true``; the engine entry is omitted."""
+    # Engine: code-fix
+    engine_recipes = tmp_path / "engine" / "recipes"
+    engine_recipes.mkdir(parents=True)
+    code_fix = engine_recipes / "code-fix"
+    code_fix.mkdir()
+    (code_fix / "workflow.yaml").write_text("name: x\n", encoding="utf-8")
+    (code_fix / "task_class.yaml").write_text(
+        "name: code_fix\ndescription: Engine code-fix\n",
+        encoding="utf-8",
+    )
+    # And one engine-only entry that should still surface.
+    only_engine = engine_recipes / "only-engine"
+    only_engine.mkdir()
+    (only_engine / "workflow.yaml").write_text("name: x\n", encoding="utf-8")
+    (only_engine / "task_class.yaml").write_text(
+        "name: only_engine\ndescription: Engine only\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(
+        "mini_ork.web.control._mini_ork_root", lambda: tmp_path / "engine"
+    )
+
+    # Project: code-fix (shadows) + my-add (project-only)
+    proj_recipes = server_home / "recipes"
+    proj_code_fix = proj_recipes / "code-fix"
+    proj_code_fix.mkdir(parents=True)
+    (proj_code_fix / "workflow.yaml").write_text("name: x\n", encoding="utf-8")
+    (proj_code_fix / "task_class.yaml").write_text(
+        "name: code_fix\ndescription: Project code-fix\n",
+        encoding="utf-8",
+    )
+    proj_add = proj_recipes / "my-add"
+    proj_add.mkdir(parents=True)
+    (proj_add / "workflow.yaml").write_text("name: x\n", encoding="utf-8")
+    (proj_add / "task_class.yaml").write_text(
+        "name: my_add\ndescription: Project add\n", encoding="utf-8"
+    )
+
+    resp = _call_args_control({"name": "list_recipes", "arguments": {}})
+    body = json.loads(resp["result"]["content"][0]["text"])
+    by_id = {r["id"]: r for r in body["recipes"]}
+    # Single code-fix entry, source=project, overrides_engine=True.
+    assert by_id["code-fix"]["source"] == "project"
+    assert by_id["code-fix"]["overrides_engine"] is True
+    assert by_id["code-fix"]["description"] == "Project code-fix"
+    # Engine-only entry still surfaces, source=engine.
+    assert by_id["only-engine"]["source"] == "engine"
+    assert by_id["only-engine"].get("overrides_engine") is None
+    # Project-only entry surfaces, source=project.
+    assert by_id["my-add"]["source"] == "project"
+    assert by_id["my-add"].get("overrides_engine") is None
 
 
 # ── start_run ───────────────────────────────────────────────────────────

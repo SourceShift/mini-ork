@@ -45,6 +45,25 @@ from acp.schema import (  # noqa: E402
 from acp import RequestError  # noqa: E402
 
 from mini_ork.acp.agent import MiniOrkAcpAgent, mint_run_id  # noqa: E402
+from mini_ork.recipes_catalog import RecipeInfo  # noqa: E402
+
+
+def _recipe(name: str) -> RecipeInfo:
+    """Build a minimal engine ``RecipeInfo`` for picker mocks.
+
+    The picker / ``_list_recipes`` only reads ``.id``; the other fields
+    are populated with safe defaults so a test that ignores them still
+    gets a valid frozen dataclass instance.
+    """
+    return RecipeInfo(
+        id=name,
+        source="engine",
+        path=Path("/_recipe_catalog_test"),
+        description="",
+        task_class="",
+        node_count=0,
+        shadows_engine=False,
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -84,8 +103,8 @@ def test_new_session_mints_thread_session_when_no_run_id_added():
         "mini_ork.acp_orchestrator.config.orchestrator_lanes",
         return_value=fake_lanes,
     ), patch(
-        "mini_ork.web.recipes.list_recipes",
-        return_value=fake_recipes,
+        "mini_ork.recipes_catalog.list_recipes",
+        return_value=[_recipe(n) for n in fake_recipes],
     ):
         agent = MiniOrkAcpAgent()
         resp = asyncio.run(agent.new_session(cwd="/tmp/proj"))
@@ -258,6 +277,111 @@ def test_initialize_returns_protocol_version():
     assert resp.protocol_version == 1
     assert resp.agent_info is not None
     assert resp.agent_info.name == "mini-ork-acp"
+
+
+def test_initialize_stores_capabilities_and_logs_one_stderr_line(
+    monkeypatch, tmp_path, capsys
+):
+    """S0 (zed-integration): ``initialize`` keeps the client capabilities
+    object so ``client_supports`` can answer later, and writes ONE
+    stderr line summarising them. The exact line format is the kickoff
+    contract — a future reader relies on it for diagnostics.
+    """
+
+    from acp.schema import (
+        ClientCapabilities,
+        ElicitationCapabilities,
+        ElicitationFormCapabilities,
+        FileSystemCapabilities,
+    )
+
+    caps = ClientCapabilities(
+        fs=FileSystemCapabilities(read_text_file=True, write_text_file=False),
+        terminal=True,
+        elicitation=ElicitationCapabilities(
+            form=ElicitationFormCapabilities(), url=None
+        ),
+    )
+    # Point the agent at an empty engine root so a stray recipe on the
+    # test machine never lands in the stderr line.
+    engine = tmp_path / "engine"
+    engine.mkdir()
+    monkeypatch.setattr("mini_ork.web.control._mini_ork_root", lambda: engine)
+
+    agent = MiniOrkAcpAgent()
+    resp = asyncio.run(agent.initialize(protocol_version=1, client_capabilities=caps))
+    assert resp.protocol_version == 1
+    # The capabilities object is stored verbatim on the agent.
+    assert agent._client_capabilities is caps
+    # ``client_supports`` reads it back.
+    assert agent.client_supports("fs.read") is True
+    assert agent.client_supports("fs.write") is False
+    assert agent.client_supports("terminal") is True
+    assert agent.client_supports("elicitation.form") is True
+    assert agent.client_supports("unknown.feature") is False
+    # ONE stderr line, exact format from the kickoff.
+    captured = capsys.readouterr()
+    out = captured.err.splitlines()
+    summary_lines = [ln for ln in out if ln.startswith("[mini-ork acp] client capabilities:")]
+    assert len(summary_lines) == 1, f"expected exactly one summary line, got: {out}"
+    line = summary_lines[0]
+    assert line == (
+        "[mini-ork acp] client capabilities: "
+        "fs.read=True fs.write=False terminal=True elicitation=form"
+    )
+
+
+def test_initialize_with_no_capabilities_yields_all_false():
+    """When the client does not send ``client_capabilities`` (or sends
+    ``None``), every feature is False and nothing raises."""
+    agent = MiniOrkAcpAgent()
+    asyncio.run(agent.initialize(protocol_version=1))
+    assert agent._client_capabilities is None
+    for feature in ("fs.read", "fs.write", "terminal", "elicitation.form", "nope"):
+        assert agent.client_supports(feature) is False
+
+
+def test_recipe_picker_includes_project_recipe(monkeypatch, tmp_path):
+    """A thread session whose project has ``.mini-ork/recipes/my-audit/``
+    lists ``my-audit`` in the recipe picker. The engine root is patched
+    to an empty dir so the test never depends on the real engine
+    checkout.
+    """
+
+    # Project home = ``<tmp>/proj/.mini-ork/recipes/my-audit/...``.
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    proj_home = proj / ".mini-ork"
+    proj_recipes = proj_home / "recipes" / "my-audit"
+    proj_recipes.mkdir(parents=True)
+    (proj_recipes / "task_class.yaml").write_text(
+        "name: my_audit\ndescription: My audit recipe\n",
+        encoding="utf-8",
+    )
+    (proj_recipes / "workflow.yaml").write_text(
+        "name: my-audit\nnodes:\n  - id: a\n    type: verifier\n",
+        encoding="utf-8",
+    )
+    # Engine root is empty so only the project recipe surfaces.
+    engine = tmp_path / "engine"
+    engine.mkdir()
+    monkeypatch.setattr("mini_ork.web.control._mini_ork_root", lambda: engine)
+    # Orchestrator lane list — keep the lane picker functional.
+    monkeypatch.setattr(
+        "mini_ork.acp_orchestrator.config.orchestrator_lanes",
+        lambda: [{"id": "opus", "name": "Opus"}],
+    )
+
+    agent = MiniOrkAcpAgent()
+    resp = asyncio.run(agent.new_session(cwd=str(proj)))
+    assert resp.config_options is not None
+    recipe_opt = next(o for o in resp.config_options if o.id == "recipe")
+    assert recipe_opt is not None
+    recipe_ids = {o.value for o in recipe_opt.options}
+    assert "my-audit" in recipe_ids
+    # And the description for the project entry follows the kickoff rule.
+    proj_entry = next(o for o in recipe_opt.options if o.value == "my-audit")
+    assert proj_entry.description == "project recipe"
 
 
 def test_prompt_refuses_unsafe_session_id():
@@ -881,8 +1005,8 @@ def _make_thread_agent(tmp_path, *, monkeypatch=None, **ctor_kwargs):
         "mini_ork.acp_orchestrator.config.orchestrator_lanes",
         return_value=fake_lanes,
     ), patch(
-        "mini_ork.web.recipes.list_recipes",
-        return_value=fake_recipes,
+        "mini_ork.recipes_catalog.list_recipes",
+        return_value=[_recipe(n) for n in fake_recipes],
     ):
         agent = MiniOrkAcpAgent(**ctor_kwargs)
         resp = asyncio.run(agent.new_session(cwd=str(proj)))
@@ -900,8 +1024,8 @@ def test_set_config_option_stores_and_returns_full_list(tmp_path):
         "mini_ork.acp_orchestrator.config.orchestrator_lanes",
         return_value=[{"id": "opus", "name": "Opus"}, {"id": "sonnet", "name": "Sonnet"}],
     ), patch(
-        "mini_ork.web.recipes.list_recipes",
-        return_value=["code-fix", "framework-edit"],
+        "mini_ork.recipes_catalog.list_recipes",
+        return_value=[_recipe("code-fix"), _recipe("framework-edit")],
     ):
         resp = asyncio.run(agent.set_config_option("model", sid, "sonnet"))
     assert resp.config_options is not None
@@ -957,8 +1081,8 @@ def test_set_session_mode_routes_to_set_config_option(tmp_path):
         "mini_ork.acp_orchestrator.config.orchestrator_lanes",
         return_value=[{"id": "opus", "name": "Opus"}],
     ), patch(
-        "mini_ork.web.recipes.list_recipes",
-        return_value=["code-fix"],
+        "mini_ork.recipes_catalog.list_recipes",
+        return_value=[_recipe("code-fix")],
     ):
         asyncio.run(agent.set_session_mode("direct", sid))
     assert agent._thread_config[sid]["mode"] == "direct"
@@ -1004,8 +1128,8 @@ def test_orchestrate_prompt_streams_events_and_stores_resume(tmp_path):
         "mini_ork.acp_orchestrator.config.orchestrator_lanes",
         return_value=fake_lanes,
     ), patch(
-        "mini_ork.web.recipes.list_recipes",
-        return_value=fake_recipes,
+        "mini_ork.recipes_catalog.list_recipes",
+        return_value=[_recipe(n) for n in fake_recipes],
     ):
         agent = MiniOrkAcpAgent(orchestrator_turn=fake_turn)
         resp = asyncio.run(agent.new_session(cwd=str(proj)))
@@ -1057,8 +1181,8 @@ def test_orchestrate_prompt_resumes_with_persisted_session_id(tmp_path):
         "mini_ork.acp_orchestrator.config.orchestrator_lanes",
         return_value=fake_lanes,
     ), patch(
-        "mini_ork.web.recipes.list_recipes",
-        return_value=fake_recipes,
+        "mini_ork.recipes_catalog.list_recipes",
+        return_value=[_recipe(n) for n in fake_recipes],
     ):
         agent = MiniOrkAcpAgent(orchestrator_turn=fake_turn)
         resp = asyncio.run(agent.new_session(cwd=str(proj)))
@@ -1103,8 +1227,8 @@ def test_orchestrate_prompt_uses_chosen_lane(tmp_path):
         "mini_ork.acp_orchestrator.config.orchestrator_lanes",
         return_value=fake_lanes,
     ), patch(
-        "mini_ork.web.recipes.list_recipes",
-        return_value=fake_recipes,
+        "mini_ork.recipes_catalog.list_recipes",
+        return_value=[_recipe(n) for n in fake_recipes],
     ):
         agent = MiniOrkAcpAgent(orchestrator_turn=fake_turn)
         resp = asyncio.run(agent.new_session(cwd=str(proj)))
@@ -1114,8 +1238,8 @@ def test_orchestrate_prompt_uses_chosen_lane(tmp_path):
         "mini_ork.acp_orchestrator.config.orchestrator_lanes",
         return_value=fake_lanes,
     ), patch(
-        "mini_ork.web.recipes.list_recipes",
-        return_value=fake_recipes,
+        "mini_ork.recipes_catalog.list_recipes",
+        return_value=[_recipe(n) for n in fake_recipes],
     ):
         asyncio.run(agent.set_config_option("model", resp.session_id, "sonnet"))
     asyncio.run(agent.prompt(resp.session_id, [_text_block("hi")]))
@@ -1197,8 +1321,8 @@ def test_start_run_tool_result_makes_thread_follow_child_run(tmp_path):
         "mini_ork.acp_orchestrator.config.orchestrator_lanes",
         return_value=fake_lanes,
     ), patch(
-        "mini_ork.web.recipes.list_recipes",
-        return_value=fake_recipes,
+        "mini_ork.recipes_catalog.list_recipes",
+        return_value=[_recipe(n) for n in fake_recipes],
     ):
         agent = MiniOrkAcpAgent(
             orchestrator_turn=fake_turn,
@@ -1261,7 +1385,7 @@ def test_only_start_run_results_start_a_child_run(tmp_path):
 
     with patch("mini_ork.acp_orchestrator.config.orchestrator_lanes",
                return_value=[{"id": "opus", "name": "Opus"}]), \
-         patch("mini_ork.web.recipes.list_recipes", return_value=["code-fix", "docs"]):
+         patch("mini_ork.recipes_catalog.list_recipes", return_value=[_recipe("code-fix"), _recipe("docs")]):
         agent = MiniOrkAcpAgent(orchestrator_turn=fake_turn, reader=fake_reader, poll_interval=0)
         resp = asyncio.run(agent.new_session(cwd=str(proj)))
     conn = _CapturingConn()
@@ -1302,8 +1426,8 @@ def test_direct_mode_launches_with_selected_recipe(tmp_path):
         "mini_ork.acp_orchestrator.config.orchestrator_lanes",
         return_value=fake_lanes,
     ), patch(
-        "mini_ork.web.recipes.list_recipes",
-        return_value=fake_recipes,
+        "mini_ork.recipes_catalog.list_recipes",
+        return_value=[_recipe(n) for n in fake_recipes],
     ):
         resp = asyncio.run(agent.new_session(cwd=str(proj)))
         sid = resp.session_id
@@ -1367,8 +1491,8 @@ def test_slash_run_in_orchestrate_mode_launches_directly(tmp_path):
         "mini_ork.acp_orchestrator.config.orchestrator_lanes",
         return_value=fake_lanes,
     ), patch(
-        "mini_ork.web.recipes.list_recipes",
-        return_value=fake_recipes,
+        "mini_ork.recipes_catalog.list_recipes",
+        return_value=[_recipe(n) for n in fake_recipes],
     ):
         resp = asyncio.run(agent.new_session(cwd=str(proj)))
         sid = resp.session_id
@@ -1427,8 +1551,8 @@ def test_cancel_thread_session_cancels_orchestrator_task(tmp_path):
         "mini_ork.acp_orchestrator.config.orchestrator_lanes",
         return_value=fake_lanes,
     ), patch(
-        "mini_ork.web.recipes.list_recipes",
-        return_value=fake_recipes,
+        "mini_ork.recipes_catalog.list_recipes",
+        return_value=[_recipe(n) for n in fake_recipes],
     ):
         agent = MiniOrkAcpAgent(orchestrator_turn=fake_turn)
         resp = asyncio.run(agent.new_session(cwd=str(proj)))
@@ -1459,8 +1583,8 @@ def test_thread_session_keeps_run_session_path_unchanged(tmp_path):
         "mini_ork.acp_orchestrator.config.orchestrator_lanes",
         return_value=fake_lanes,
     ), patch(
-        "mini_ork.web.recipes.list_recipes",
-        return_value=fake_recipes,
+        "mini_ork.recipes_catalog.list_recipes",
+        return_value=[_recipe(n) for n in fake_recipes],
     ):
         # Pre-populate a session that is NOT a thread session.
         agent = MiniOrkAcpAgent(
@@ -1537,7 +1661,7 @@ def _thread_agent(proj: Path, **kwargs) -> tuple[MiniOrkAcpAgent, str]:
 
     with patch("mini_ork.acp_orchestrator.config.orchestrator_lanes",
                return_value=[{"id": "opus", "name": "Opus"}]), \
-         patch("mini_ork.web.recipes.list_recipes", return_value=["code-fix", "docs"]):
+         patch("mini_ork.recipes_catalog.list_recipes", return_value=[_recipe("code-fix"), _recipe("docs")]):
         agent = MiniOrkAcpAgent(poll_interval=0, **kwargs)
         resp = asyncio.run(agent.new_session(cwd=str(proj)))
     return agent, resp.session_id
@@ -1664,7 +1788,7 @@ def test_cancel_stops_only_this_threads_followers_and_not_the_next_turn(tmp_path
     from unittest.mock import patch
     with patch("mini_ork.acp_orchestrator.config.orchestrator_lanes",
                return_value=[{"id": "opus", "name": "Opus"}]), \
-         patch("mini_ork.web.recipes.list_recipes", return_value=["docs"]):
+         patch("mini_ork.recipes_catalog.list_recipes", return_value=[_recipe("docs")]):
         thread_b = asyncio.run(agent.new_session(cwd=str(proj))).session_id
     agent.on_connect(_SidConn())
 
@@ -1858,7 +1982,7 @@ def test_set_config_option_records_full_config_on_change(tmp_path):
         "mini_ork.acp_orchestrator.config.orchestrator_lanes",
         return_value=[{"id": "opus", "name": "Opus"}],
     ), patch(
-        "mini_ork.web.recipes.list_recipes", return_value=["code-fix"]
+        "mini_ork.recipes_catalog.list_recipes", return_value=[_recipe("code-fix")]
     ):
         asyncio.run(agent.set_config_option("model", thread, "opus"))
         asyncio.run(agent.set_config_option("recipe", thread, "code-fix"))
@@ -2011,7 +2135,7 @@ def test_load_session_replays_and_resumes_with_stored_id(tmp_path):
 
     with patch("mini_ork.acp_orchestrator.config.orchestrator_lanes",
                return_value=[{"id": "opus", "name": "Opus"}]), \
-         patch("mini_ork.web.recipes.list_recipes", return_value=["code-fix"]):
+         patch("mini_ork.recipes_catalog.list_recipes", return_value=[_recipe("code-fix")]):
         # First agent: persist a turn.
         agent1, thread = _thread_agent(proj, orchestrator_turn=turn_first, reader=reader)
         agent1.on_connect(_SidConn())
@@ -2033,7 +2157,7 @@ def test_load_session_replays_and_resumes_with_stored_id(tmp_path):
     # Re-run the load with a capturing conn to verify the replayed sequence.
     with patch("mini_ork.acp_orchestrator.config.orchestrator_lanes",
                return_value=[{"id": "opus", "name": "Opus"}]), \
-         patch("mini_ork.web.recipes.list_recipes", return_value=["code-fix"]):
+         patch("mini_ork.recipes_catalog.list_recipes", return_value=[_recipe("code-fix")]):
         agent3 = MiniOrkAcpAgent()
         conn3 = _SidConn()
         agent3.on_connect(conn3)
@@ -2061,7 +2185,7 @@ def test_load_session_replays_and_resumes_with_stored_id(tmp_path):
 
         with patch("mini_ork.acp_orchestrator.config.orchestrator_lanes",
                    return_value=[{"id": "opus", "name": "Opus"}]), \
-             patch("mini_ork.web.recipes.list_recipes", return_value=["code-fix"]):
+             patch("mini_ork.recipes_catalog.list_recipes", return_value=[_recipe("code-fix")]):
             agent3._orchestrator_turn = turn_after
             asyncio.run(agent3.prompt(thread, [_text_block("again")]))
         assert seen[-1] == "sess-load-1"
@@ -2103,7 +2227,7 @@ def test_load_session_starts_follower_for_running_child(tmp_path):
 
     with patch("mini_ork.acp_orchestrator.config.orchestrator_lanes",
                return_value=[{"id": "opus", "name": "Opus"}]), \
-         patch("mini_ork.web.recipes.list_recipes", return_value=["code-fix"]):
+         patch("mini_ork.recipes_catalog.list_recipes", return_value=[_recipe("code-fix")]):
         agent, thread = _thread_agent(proj, orchestrator_turn=turn, reader=reader)
         agent.on_connect(_SidConn())
         asyncio.run(agent.prompt(thread, [_text_block("go")]))
@@ -2462,8 +2586,8 @@ def test_child_run_diff_in_thread_lands_under_prefix(
         "mini_ork.acp_orchestrator.config.orchestrator_lanes",
         return_value=fake_lanes,
     ), patch(
-        "mini_ork.web.recipes.list_recipes",
-        return_value=fake_recipes,
+        "mini_ork.recipes_catalog.list_recipes",
+        return_value=[_recipe(n) for n in fake_recipes],
     ):
         agent = MiniOrkAcpAgent(
             home=home,
@@ -3278,8 +3402,8 @@ def test_thread_new_session_skips_gate_when_env_opt_out(monkeypatch):
         "mini_ork.acp_orchestrator.config.orchestrator_lanes",
         return_value=fake_lanes,
     ), patch(
-        "mini_ork.web.recipes.list_recipes",
-        return_value=fake_recipes,
+        "mini_ork.recipes_catalog.list_recipes",
+        return_value=[_recipe(n) for n in fake_recipes],
     ):
         agent = MiniOrkAcpAgent()
         resp = asyncio.run(agent.new_session(cwd="/tmp/proj"))
@@ -3316,7 +3440,7 @@ def test_thread_new_session_passes_and_caches_the_setup_check(tmp_path, monkeypa
     proj = tmp_path / "proj"
     proj.mkdir()
     with patch("mini_ork.acp_orchestrator.config.orchestrator_lanes", return_value=[{"id": "opus", "name": "Opus"}]), \
-         patch("mini_ork.web.recipes.list_recipes", return_value=["docs"]):
+         patch("mini_ork.recipes_catalog.list_recipes", return_value=[_recipe("docs")]):
         agent = MiniOrkAcpAgent()
         first = asyncio.run(agent.new_session(cwd=str(proj)))
         second = asyncio.run(agent.new_session(cwd=str(proj)))

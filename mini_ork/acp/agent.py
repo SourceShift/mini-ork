@@ -33,6 +33,7 @@ import asyncio
 import json
 import os
 import secrets
+import sys
 import time
 from pathlib import Path
 from typing import Any, Awaitable, Callable, cast
@@ -364,6 +365,12 @@ class MiniOrkAcpAgent:
         # lazily on first node_start; held until session end.
         self._tails: dict[str, dict[str, LiveTail]] = {}
         self._launch_count = 0
+        # ACP client capabilities captured at ``initialize`` time (S0). The
+        # client sends the SDK object in the initialize handshake; we keep
+        # the raw value so ``client_supports`` can answer later requests
+        # (e.g. an orchestrator turn needs to know whether form-mode
+        # elicitation is on). None until initialize runs.
+        self._client_capabilities: Any | None = None
 
     @property
     def launch_count(self) -> int:
@@ -381,7 +388,20 @@ class MiniOrkAcpAgent:
         client_info: Any = None,
         **kwargs: Any,
     ) -> InitializeResponse:
-        del protocol_version, client_capabilities, client_info, kwargs
+        # S0 (zed-integration): keep the capabilities object the client sent
+        # in the initialize handshake so ``client_supports`` can answer
+        # later. Write ONE stderr line summarising what the editor
+        # advertised — later slices key off this so a form-mode elicitation
+        # fallback can detect "the editor doesn't support it" without
+        # replaying the handshake. ``sys.stdout`` is the ACP wire, so
+        # diagnostics must go to ``sys.stderr``.
+        del protocol_version, client_info, kwargs
+        self._client_capabilities = client_capabilities
+        print(
+            f"[mini-ork acp] client capabilities: {self._capabilities_summary()}",
+            file=sys.stderr,
+            flush=True,
+        )
         return InitializeResponse(
             protocol_version=PROTOCOL_VERSION,
             agent_info=Implementation(name="mini-ork-acp", version="0.9.0"),
@@ -403,6 +423,72 @@ class MiniOrkAcpAgent:
                 ),
             ],
         )
+
+    def _capabilities_summary(self) -> str:
+        """Render the right-hand side of the capabilities stderr summary.
+
+        Introspects ``acp.schema.ClientCapabilities``'s Python attribute
+        names (``fs.read_text_file``, ``fs.write_text_file``,
+        ``terminal``, ``elicitation.{form,url}``) so a future schema
+        field is auto-detected. Any missing / None / malformed field
+        degrades to ``False`` (booleans) or omitted from the elicitation
+        list — the stderr line always renders, never raises.
+        """
+        caps = self._client_capabilities
+        fs_read = False
+        fs_write = False
+        terminal = False
+        elicitation: list[str] = []
+        if caps is not None:
+            try:
+                fs = getattr(caps, "fs", None)
+                if fs is not None:
+                    fs_read = bool(getattr(fs, "read_text_file", False))
+                    fs_write = bool(getattr(fs, "write_text_file", False))
+            except Exception:
+                pass
+            try:
+                terminal = bool(getattr(caps, "terminal", False))
+            except Exception:
+                terminal = False
+            try:
+                elic = getattr(caps, "elicitation", None)
+                if elic is not None:
+                    for mode in ("form", "url"):
+                        if getattr(elic, mode, None) is not None:
+                            elicitation.append(mode)
+            except Exception:
+                elicitation = []
+        summary = ",".join(elicitation) if elicitation else "none"
+        return f"fs.read={fs_read} fs.write={fs_write} terminal={terminal} elicitation={summary}"
+
+    def client_supports(self, feature: str) -> bool:
+        """Return True when the ACP client advertised ``feature``.
+
+        Recognised feature keys: ``"fs.read"``, ``"fs.write"``,
+        ``"terminal"``, ``"elicitation.form"``. Anything else returns
+        False. A client that never sent ``client_capabilities`` answers
+        False for every feature.
+        """
+        caps = self._client_capabilities
+        if caps is None:
+            return False
+        if feature == "fs.read":
+            return bool(
+                getattr(getattr(caps, "fs", None), "read_text_file", False)
+            )
+        if feature == "fs.write":
+            return bool(
+                getattr(getattr(caps, "fs", None), "write_text_file", False)
+            )
+        if feature == "terminal":
+            return bool(getattr(caps, "terminal", False))
+        if feature == "elicitation.form":
+            return (
+                getattr(getattr(caps, "elicitation", None), "form", None)
+                is not None
+            )
+        return False
 
     async def authenticate(self, method_id: str, **kwargs: Any) -> AuthenticateResponse:
         """Resolve the ``auth_methods`` advertised by ``initialize``.
@@ -594,7 +680,7 @@ class MiniOrkAcpAgent:
                 ],
             ),
             self._build_model_config_option(session_id, home),
-            self._build_recipe_config_option(session_id),
+            self._build_recipe_config_option(session_id, home),
         ]
 
     def _build_model_config_option(
@@ -654,46 +740,54 @@ class MiniOrkAcpAgent:
         return out
 
     def _build_recipe_config_option(
-        self, session_id: str
+        self, session_id: str, home: Path
     ) -> SessionConfigOptionSelect:
         cfg = self._thread_config.get(session_id) or {}
-        recipes = self._list_recipes()
+        entries = self._recipe_entries(home)  # one catalog scan per picker build
+        recipes = sorted(e.id for e in entries) or [self._recipe]
         current = str(cfg.get("recipe") or "")
         if current and current not in recipes:
-            current = recipes[0] if recipes else ""
-        if not current and recipes:
             current = recipes[0]
+        if not current:
+            current = recipes[0]
+        by_id = {e.id: e for e in entries}
+        options: list[SessionConfigSelectOption] = []
+        for rid in recipes:
+            entry = by_id.get(rid)
+            if entry is not None and entry.source == "project":
+                desc = (
+                    "project recipe (overrides the engine's)"
+                    if entry.shadows_engine
+                    else "project recipe"
+                )
+            else:
+                desc = entry.description if entry is not None else ""
+            options.append(
+                SessionConfigSelectOption(value=rid, name=rid, description=desc)
+            )
         return SessionConfigOptionSelect(
             type="select",
             id="recipe",
             name="Recipe",
             description="Recipe used by direct-mode prompts.",
             current_value=current,
-            options=[
-                SessionConfigSelectOption(value=name, name=name)
-                for name in recipes
-            ],
+            options=options,
         )
 
-    def _list_recipes(self) -> list[str]:
-        """Recipe ids from ``web.recipes.list_recipes``, sorted.
+    def _recipe_entries(self, home: Path | None) -> list[Any]:
+        """The project + engine recipe catalog; [] on any failure (the picker
+        must never crash new_session)."""
+        try:
+            from mini_ork import recipes_catalog
 
-        Defensive against a missing recipes dir or yaml loader failure — the
-        picker falls back to the agent's default recipe so it always has at
-        least one option.
-        """
-        try:
-            from mini_ork.web.recipes import list_recipes
-        except Exception:  # noqa: BLE001 — picker must never crash new_session
-            return [self._recipe]
-        try:
-            names = list_recipes()
-        except Exception:  # noqa: BLE001 — picker must never crash new_session
-            return [self._recipe]
-        out = [str(n) for n in names if isinstance(n, str)]
-        if not out:
-            out = [self._recipe]
-        return sorted(out)
+            return [e for e in recipes_catalog.list_recipes(home) if getattr(e, "id", None)]
+        except Exception:  # noqa: BLE001
+            return []
+
+    def _list_recipes(self, home: Path | None) -> list[str]:
+        """Recipe ids from the catalog, sorted; the agent's default recipe when
+        the catalog yields nothing, so the picker always has an option."""
+        return sorted(e.id for e in self._recipe_entries(home)) or [self._recipe]
 
     def _build_session_modes(self, session_id: str) -> SessionModeState:
         cfg = self._thread_config.get(session_id) or {}
@@ -764,7 +858,7 @@ class MiniOrkAcpAgent:
                     {"message": f"unknown model lane: {value!r}"}
                 )
         if config_id == "recipe":
-            recipes = self._list_recipes()
+            recipes = self._list_recipes(self._home_for(session_id))
             if value not in recipes:
                 raise RequestError.invalid_params(
                     {"message": f"unknown recipe: {value!r}"}

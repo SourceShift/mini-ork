@@ -373,52 +373,36 @@ def _lanes(home: Path, args: dict[str, Any]) -> dict[str, Any]:
 
 
 def _list_recipes(home: Path, args: dict[str, Any]) -> dict[str, Any]:
-    """Scan ``<engine_root>/recipes/<name>/`` for ``workflow.yaml`` +
-    ``task_class.yaml`` and emit ``{"id", "description"}``.
+    """List project + engine recipes via ``mini_ork.recipes_catalog``.
 
-    The engine root resolver is pinned to ``control._mini_ork_root()`` so
-    a future divergence with ``recipes.mini_ork_root()`` cannot silently
-    shift the list the orchestrator sees. ``home`` is bound for handler
-    signature symmetry; recipe discovery is engine-root bound, not
-    home-bound.
+    The catalog is the single source of truth (S0 zed-integration): a
+    project recipe under ``<home>/recipes/`` shadows the engine's with
+    the same id. Engine root is still resolved through
+    ``control._mini_ork_root()`` so a future divergence with
+    ``recipes.mini_ork_root()`` cannot silently shift the list the
+    orchestrator sees. The catalog never raises; a missing home / engine
+    / recipes dir degrades to the entries that can be read.
     """
     del args
-    _ = home  # handler-signature symmetry; engine root drives discovery
-    from mini_ork.web.control import _mini_ork_root
-
     try:
-        root = _mini_ork_root()
-        recipes_dir = root / "recipes"
+        from mini_ork import recipes_catalog
     except Exception as exc:
-        return {"error": f"could not resolve engine root: {exc}"}
-
-    if not recipes_dir.is_dir():
-        return {"recipes": []}
-
-    out: list[dict[str, Any]] = []
+        return {"error": f"could not import recipes catalog: {exc}"}
     try:
-        entries = sorted(p for p in recipes_dir.iterdir() if p.is_dir())
-    except OSError as exc:
+        entries = recipes_catalog.list_recipes(home)
+    except Exception as exc:
         return {"error": f"could not list recipes: {exc}"}
-
-    for p in entries:
-        if not (p / "workflow.yaml").exists():
-            continue
-        if not (p / "task_class.yaml").exists():
-            continue
-        description = ""
-        try:
-            import yaml  # local import — yaml is a soft dep of recipe authoring
-            with (p / "task_class.yaml").open("r", encoding="utf-8") as f:
-                tc = yaml.safe_load(f) or {}
-        except Exception:
-            tc = {}
-        if isinstance(tc, dict):
-            raw = tc.get("description")
-            if isinstance(raw, str):
-                description = raw.strip().splitlines()[0][:120] if raw.strip() else ""
-        out.append({"id": p.name, "description": description})
-
+    out: list[dict[str, Any]] = []
+    for entry in entries:
+        item: dict[str, Any] = {
+            "id": entry.id,
+            "description": entry.description,
+            "source": entry.source,
+            "nodes": entry.node_count,
+        }
+        if entry.shadows_engine:
+            item["overrides_engine"] = True
+        out.append(item)
     return {"recipes": out}
 
 
@@ -760,9 +744,12 @@ _CONTROL_TOOL_DEFS: list[dict[str, Any]] = [
     {
         "name": "list_recipes",
         "description": (
-            "List the engine's recipes (directories under <engine_root>/recipes "
-            "with both workflow.yaml and task_class.yaml). Returns "
-            "{id, description} per recipe."
+            "List recipes visible to the current project. Each entry covers "
+            "either an engine recipe (under <engine_root>/recipes/) or a "
+            "project recipe (under <home>/recipes/); a project recipe with "
+            "the same id as an engine recipe wins on the name clash and the "
+            "engine one is omitted. Returns "
+            "{id, description, source, nodes, overrides_engine?} per recipe."
         ),
         "inputSchema": {"type": "object", "properties": {}},
     },
