@@ -196,7 +196,8 @@ def test_help_lists_every_announced_command():
     assert "Available slash commands" in out
     for name in ("help", "runs", "status", "learnings", "cost", "lanes",
                  "recipes", "recipe",
-                 "stop", "kill", "resume", "recover", "certify", "serve"):
+                 "stop", "kill", "resume", "recover", "certify", "serve",
+                 "workspaces", "merge", "discard"):
         assert f"`/{name}`" in out
 
 
@@ -885,3 +886,126 @@ def test_recipe_new_and_edit_are_announced(home):
     assert "recipe edit" in names
     assert "recipe new" in cmds.HANDLERS
     assert "recipe edit" in cmds.HANDLERS
+
+
+# ── /workspaces / /merge / /discard (Zed S5) ──────────────────────────────────
+
+
+def _make_workspace(tmp_path, home, *, run_id: str, commit_in_worktree: bool = True):
+    """Create a temp project at ``tmp_path/proj`` + workspace under ``home``.
+
+    ``home`` is the test fixture's ``.mini-ork`` (the same home the agent
+    resolves via ``_home_for(session_id)``). Real git; mirrors
+    ``tests/unit/test_workspaces.py``. Returns ``(project, home, ws)``.
+    """
+    import subprocess
+    from mini_ork import workspaces as ws_mod
+
+    project = tmp_path / "proj"
+    project.mkdir()
+    subprocess.run(
+        ["git", "init", "-b", "main"], cwd=project, check=True,
+        capture_output=True, text=True,
+    )
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=project, check=True,
+                    capture_output=True, text=True)
+    subprocess.run(["git", "config", "user.email", "t@example.com"],
+                    cwd=project, check=True, capture_output=True, text=True)
+    (project / "README.md").write_text("hi\n", encoding="utf-8")
+    subprocess.run(["git", "add", "README.md"], cwd=project, check=True,
+                    capture_output=True, text=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=project, check=True,
+                    capture_output=True, text=True)
+    ws = ws_mod.create(project, home, run_id)
+    if commit_in_worktree:
+        (ws.path / "new.txt").write_text("x\n", encoding="utf-8")
+        subprocess.run(["git", "add", "new.txt"], cwd=ws.path, check=True,
+                        capture_output=True, text=True)
+        subprocess.run(["git", "commit", "-m", "feat"], cwd=ws.path, check=True,
+                        capture_output=True, text=True)
+    return project, home, ws
+
+
+def test_workspaces_empty_home(home):
+    """No workspaces on disk → ``No open task workspaces.``"""
+    agent = _agent(home)
+    out = asyncio.run(cmds.handle_workspaces(agent, "run-1-abc", ""))
+    assert out == "No open task workspaces."
+
+
+def test_workspaces_lists_one_row(tmp_path, home):
+    """One workspace with one new file → one body row + footer hint."""
+    _make_workspace(tmp_path, home, run_id="run-ws-001")
+    agent = _agent(home)
+    out = asyncio.run(cmds.handle_workspaces(agent, "run-1-abc", ""))
+    assert "Open task workspaces" in out
+    assert "`run-ws-001`" in out
+    assert "mini-ork/run-ws-001" in out
+    assert "/merge <run>" in out and "/discard <run>" in out
+
+
+def test_merge_resolves_explicit_run_id_and_merges(tmp_path, home):
+    """``/merge run-ws-001`` → ``Merged into main (fast-forward <sha>).``"""
+    _, _, ws = _make_workspace(tmp_path, home, run_id="run-mg-001")
+    agent = _agent(home)
+    out = asyncio.run(cmds.handle_merge(agent, "run-mg-001", "run-mg-001"))
+    assert "Merged into main" in out
+    assert "fast-forward" in out
+    # Workspace is gone after merge.
+    from mini_ork import workspaces as ws_mod
+    assert ws_mod.load(home, "run-mg-001") is None
+
+
+def test_merge_thread_run_picks_thread_run_id(tmp_path, home):
+    """In a thread session, ``/merge`` with no arg resolves to the thread's
+    latest followed run."""
+    _, _, _ = _make_workspace(tmp_path, home, run_id="run-mg-thread")
+    agent = _agent(home)
+    agent._thread_sessions.add("orch-mg")
+    agent._sessions["orch-mg"] = str(home.parent)
+    agent._thread_runs["orch-mg"] = ["run-mg-thread"]
+    out = asyncio.run(cmds.handle_merge(agent, "orch-mg", ""))
+    assert "Merged into main" in out
+
+
+def test_merge_no_workspace_message(tmp_path, home):
+    """A run id with no workspace record → ``Run <id> has no open workspace.``"""
+    agent = _agent(home)
+    out = asyncio.run(cmds.handle_merge(agent, "run-nope-001", "run-nope-001"))
+    assert "no open workspace" in out
+
+
+def test_merge_thread_no_run_message(tmp_path, home):
+    """A thread with no runs yet → placeholder."""
+    agent = _agent(home)
+    agent._thread_sessions.add("orch-mg-empty")
+    agent._sessions["orch-mg-empty"] = str(home.parent)
+    out = asyncio.run(cmds.handle_merge(agent, "orch-mg-empty", ""))
+    assert "No run" in out
+
+
+def test_discard_resolves_explicit_run_id_and_removes(tmp_path, home):
+    """``/discard run-d-001`` → ``Discarded <id> — its worktree and branch are gone.``"""
+    _, _, _ = _make_workspace(tmp_path, home, run_id="run-d-001")
+    agent = _agent(home)
+    out = asyncio.run(cmds.handle_discard(agent, "run-d-001", "run-d-001"))
+    assert "Discarded run-d-001" in out
+    assert "worktree and branch are gone" in out
+    from mini_ork import workspaces as ws_mod
+    assert ws_mod.load(home, "run-d-001") is None
+
+
+def test_discard_thread_run_picks_thread_run_id(tmp_path, home):
+    _, _, _ = _make_workspace(tmp_path, home, run_id="run-d-thread")
+    agent = _agent(home)
+    agent._thread_sessions.add("orch-d")
+    agent._sessions["orch-d"] = str(home.parent)
+    agent._thread_runs["orch-d"] = ["run-d-thread"]
+    out = asyncio.run(cmds.handle_discard(agent, "orch-d", ""))
+    assert "Discarded run-d-thread" in out
+
+
+def test_discard_no_workspace_message(tmp_path, home):
+    agent = _agent(home)
+    out = asyncio.run(cmds.handle_discard(agent, "run-nope-002", "run-nope-002"))
+    assert "no open workspace" in out

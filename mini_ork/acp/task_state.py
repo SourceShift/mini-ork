@@ -220,7 +220,51 @@ def task_state(run_dir: Path, snapshot: dict[str, Any]) -> TaskState:
                     removed=0,
                 )
 
-    # Rule 3: published → done.
+    # Rule 3: terminal run with an open workspace record that still has
+    # commits ahead or uncommitted changes → "ready to review". The
+    # user must decide to merge or discard (Zed S5). Sits BEFORE the
+    # published→done rule so the ✋ mark wins over ✓ when a run ends
+    # with both a publish and a worktree to clean up.
+    if status in ("published", "failed", "rolled_back"):
+        ws_status = _workspace_status_for_terminal_run(path)
+        if ws_status is not None:
+            branch = ws_status["branch"]
+            added = ws_status["added"]
+            removed = ws_status["removed"]
+            if status == "published":
+                return TaskState(
+                    state="needs_you",
+                    detail=(
+                        f"Ready to review: +{added} −{removed} on {branch} — "
+                        "merge or discard it."
+                    ),
+                    step=_current_step(events),
+                    added=added,
+                    removed=removed,
+                )
+            # failed / rolled_back: stays failed; the kept-worktree note
+            # is appended so the user knows /discard removes it.
+            failing = _failing_node(events)
+            if failing is not None:
+                node_id, reason = failing
+                base = (
+                    FAILED_AT_PREFIX
+                    + node_id
+                    + FAILED_AT_SUFFIX_OPEN
+                    + reason
+                    + FAILED_AT_SUFFIX_CLOSE
+                )
+            else:
+                base = FAILED_FALLBACK
+            return TaskState(
+                state="failed",
+                detail=base + f" Its worktree is kept: /discard {path.name} removes it.",
+                step=_current_step(events),
+                added=0,
+                removed=0,
+            )
+
+    # Rule 4: published → done.
     if status == "published":
         added, removed = (0, 0)
         if path is not None:
@@ -233,7 +277,7 @@ def task_state(run_dir: Path, snapshot: dict[str, Any]) -> TaskState:
             removed=removed,
         )
 
-    # Rule 4: failed / rolled_back → failed (with the failing node if any).
+    # Rule 5: failed / rolled_back → failed (with the failing node if any).
     if status in ("failed", "rolled_back"):
         failing = _failing_node(events)
         if failing is not None:
@@ -255,7 +299,7 @@ def task_state(run_dir: Path, snapshot: dict[str, Any]) -> TaskState:
             removed=0,
         )
 
-    # Rule 5: anything else (None, classified, planned, executing, ...)
+    # Rule 6: anything else (None, classified, planned, executing, ...)
     # is working; the detail is the current step or "Starting".
     step = _current_step(events)
     detail = WORKING_PREFIX + step if step else STARTING_DETAIL
@@ -268,13 +312,55 @@ def task_state(run_dir: Path, snapshot: dict[str, Any]) -> TaskState:
     )
 
 
+def _workspace_status_for_terminal_run(run_dir: Path | None) -> dict[str, Any] | None:
+    """Workspace ``status(ws)``-shaped dict for a terminal run with an open
+    workspace record whose branch still has commits ahead or uncommitted edits.
+
+    ``None`` when the run dir has no parent home, no workspace record, or
+    the worktree is already clean — those fall through to the published →
+    done or failed rules. Defers the ``mini_ork.workspaces`` import to keep
+    this module's import graph free of the runtime sandbox.
+    """
+    if run_dir is None:
+        return None
+    # run_dir = <home>/runs/<run_id> → home is parent.parent.
+    home = run_dir.parent.parent
+    run_id = run_dir.name
+    try:
+        from mini_ork import workspaces
+    except Exception:  # noqa: BLE001 — best-effort, fall through
+        return None
+    try:
+        ws = workspaces.load(home, run_id)
+    except Exception:  # noqa: BLE001
+        return None
+    if ws is None:
+        return None
+    try:
+        snap = workspaces.status(ws)
+    except Exception:  # noqa: BLE001
+        return None
+    if not isinstance(snap, dict) or snap.get("exists") is not True:
+        return None
+    commits_ahead = int(snap.get("commits_ahead") or 0)
+    uncommitted = snap.get("uncommitted") or []
+    if commits_ahead <= 0 and not uncommitted:
+        return None
+    return {
+        "branch": ws.branch,
+        "added": int(snap.get("added") or 0),
+        "removed": int(snap.get("removed") or 0),
+    }
+
+
 def run_mark(status: str | None, run_dir: Path | None) -> str:
     """Cheap mark glyph for ``list_sessions`` rows — no event or diff reads.
 
     A ``.cost-pause`` sentinel flips any non-terminal status to the
-    "needs you" mark; published → done; failed / rolled_back → failed;
-    anything else → working. The mark is the prefix Zed's thread list
-    shows next to the run's title.
+    "needs you" mark; a terminal run with an open workspace record
+    whose branch still has changes also flips to ✋ (S5); published →
+    done; failed / rolled_back → failed; anything else → working. The
+    mark is the prefix Zed's thread list shows next to the run's title.
     """
     path = Path(run_dir) if run_dir is not None else None
     if path is not None and (path / ".cost-pause").exists() and status not in (
@@ -283,6 +369,10 @@ def run_mark(status: str | None, run_dir: Path | None) -> str:
         "failed",
     ):
         return MARKS["needs_you"]
+    if status in ("published", "failed", "rolled_back") and path is not None:
+        home = path.parent.parent
+        if (home / "worktrees" / f"{path.name}.json").is_file():
+            return MARKS["needs_you"]
     if status == "published":
         return MARKS["done"]
     if status in ("failed", "rolled_back"):
@@ -293,18 +383,32 @@ def run_mark(status: str | None, run_dir: Path | None) -> str:
 def title_with_state(base: str, ts: TaskState | None) -> str:
     """``base`` alone when no state; ``"<mark> <base>"`` otherwise.
 
-    The diff suffix ``" +<added> −<removed>"`` (U+2212, NOT the
-    ASCII ``-``) appends only when the state is ``done`` and at least
-    one of ``added``/``removed`` is non-zero. ``base`` is the
-    kickoff-derived title (or the thread's first-prompt title); the
-    function never alters the text content, only prepends the mark.
+    Two diff suffixes:
+
+    * ``done`` → ``" +<added> −<removed>"`` (U+2212, NOT ASCII ``-``).
+    * ``needs_you`` from a ready-to-review branch → ``" — ready to
+      review +<added> −<removed>"`` (S5).
+
+    ``base`` is the kickoff-derived title (or the thread's first-prompt
+    title); the function never alters the text content, only prepends
+    the mark and appends the suffix.
     """
     if ts is None:
         return base
     out = f"{MARKS[ts.state]} {base}"
     if ts.state == "done" and (ts.added or ts.removed):
         out += f" +{ts.added} −{ts.removed}"
+    elif ts.state == "needs_you" and (ts.added or ts.removed) and ts.detail.startswith(
+        "Ready to review:"
+    ):
+        out += f" — ready to review +{ts.added} −{ts.removed}"
     return out
 
 
-__all__ = ["MARKS", "TaskState", "task_state", "run_mark", "title_with_state"]
+__all__ = [
+    "MARKS",
+    "TaskState",
+    "task_state",
+    "run_mark",
+    "title_with_state",
+]

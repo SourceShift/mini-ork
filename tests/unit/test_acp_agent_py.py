@@ -4274,3 +4274,370 @@ def test_workspace_round_trips_through_load_session(tmp_path):
     cwd = list(agent._sessions.values())[0]
     asyncio.run(agent2.load_session(cwd, sid))
     assert agent2._thread_config[sid]["workspace"] == "in-place"
+
+
+# ── Zed S5 — review buttons (Merge / Discard / Keep) ──────────────────────────
+
+
+def _init_repo_with_worktree(tmp_path: Path, *, run_id: str, home: Path | None = None):
+    """A real temp git repo with one workspace commit on a worktree branch.
+
+    Returns ``(project, home, ws)``. Mirrors the helper in
+    ``tests/unit/test_workspaces.py`` but inlines the imports to keep
+    the test file standalone. If ``home`` is provided it is used as the
+    workspace home (so the agent's ``_home_for(session_id)`` resolves to
+    the right place); otherwise we default to ``<proj>/.mini-ork``.
+    """
+    import subprocess
+    from mini_ork import workspaces as ws_mod
+
+    project = tmp_path / "proj"
+    project.mkdir()
+    subprocess.run(
+        ["git", "init", "-b", "main"], cwd=project, check=True,
+        capture_output=True, text=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Test"], cwd=project, check=True,
+        capture_output=True, text=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.email", "t@example.com"],
+        cwd=project, check=True, capture_output=True, text=True,
+    )
+    (project / "README.md").write_text("hi\n", encoding="utf-8")
+    subprocess.run(["git", "add", "README.md"], cwd=project, check=True,
+                    capture_output=True, text=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=project, check=True,
+                    capture_output=True, text=True)
+    if home is None:
+        home = project / ".mini-ork"
+        home.mkdir(parents=True, exist_ok=True)
+    ws = ws_mod.create(project, home, run_id)
+    (ws.path / "new.txt").write_text("x\n", encoding="utf-8")
+    subprocess.run(["git", "add", "new.txt"], cwd=ws.path, check=True,
+                    capture_output=True, text=True)
+    subprocess.run(["git", "commit", "-m", "feat"], cwd=ws.path, check=True,
+                    capture_output=True, text=True)
+    return project, home, ws
+
+
+class _ReviewConn(_SidConn):
+    """S5 review-button fake: records request_permission calls and returns
+    a single scripted outcome option id. Distinct from ``_PermConn`` above
+    because the S5 surface uses raw ACP option objects with
+    ``.option_id`` / ``.kind`` rather than the legacy ``.name`` shape."""
+
+    def __init__(self, outcome_id: str | None = "merge") -> None:
+        super().__init__()
+        self.outcome_id = outcome_id
+        self.calls: list[dict[str, Any]] = []
+
+    async def request_permission(
+        self,
+        *,
+        session_id: str,
+        tool_call: Any,
+        options: list[Any],
+    ) -> Any:
+        from acp.schema import AllowedOutcome, RequestPermissionResponse
+
+        self.calls.append(
+            {
+                "session_id": session_id,
+                "tool_call_id": tool_call.tool_call_id,
+                "title": tool_call.title,
+                "option_ids": [o.option_id for o in options],
+                "kinds": [o.kind for o in options],
+            }
+        )
+        if self.outcome_id is None:
+            return None
+        return RequestPermissionResponse(
+            outcome=AllowedOutcome(outcome="selected", option_id=self.outcome_id)
+        )
+
+
+async def _drive_prompt_to_terminal(agent: MiniOrkAcpAgent, run_id: str, sid: str) -> None:
+    """Run a prompt that ends up terminal (status=published); returns when done."""
+    await agent.prompt(run_id, [_text_block("do it")])
+
+
+def test_direct_mode_ready_to_review_offers_buttons_on_run_id_parent(
+    tmp_path, monkeypatch
+):
+    """A direct-mode ``/run`` that lands ready-to-review gets Merge / Discard /
+    Keep buttons on the run's own ``<run_id>:parent`` tool card."""
+    from unittest.mock import patch
+
+    run_id = "run-s5-001"
+    project, home, _ = _init_repo_with_worktree(tmp_path, run_id=run_id)
+    fake_lanes = [{"id": "opus", "name": "Opus"}]
+    fake_recipes = ["code-fix"]
+
+    # ``mint_run_id`` mints fresh ids on each call; pin to the run id we
+    # pre-created the workspace for so the path matches.
+    monkeypatch.setattr(
+        "mini_ork.acp.agent.mint_run_id", lambda: run_id
+    )
+    # ``_prompt_thread_direct`` requires ``<home>/runs/<run_id>`` to exist
+    # for ``task_state`` to resolve the run_dir.
+    (home / "runs" / run_id).mkdir(parents=True, exist_ok=True)
+    # Reader returns published immediately so the first poll terminates.
+    def reader(rid: str) -> dict:
+        return {"status": "published", "events": [], "llm_calls": []}
+
+    with patch(
+        "mini_ork.acp_orchestrator.config.orchestrator_lanes",
+        return_value=fake_lanes,
+    ), patch(
+        "mini_ork.recipes_catalog.list_recipes",
+        return_value=[_recipe(n) for n in fake_recipes],
+    ):
+        agent = MiniOrkAcpAgent(
+            reader=reader,
+            poll_interval=0,
+            launcher=lambda rid, _kick: {"ok": True, "run_id": rid},
+        )
+        resp = asyncio.run(agent.new_session(cwd=str(project)))
+    sid = resp.session_id
+
+    conn = _ReviewConn(outcome_id="keep")
+    agent.on_connect(conn)
+    asyncio.run(agent.prompt(sid, [_text_block("/run do it")]))
+
+    # Exactly one permission call, on the run's marker, with three options.
+    assert len(conn.calls) == 1
+    call = conn.calls[0]
+    assert call["tool_call_id"] == f"{run_id}:parent"
+    assert call["session_id"] == sid
+    assert call["option_ids"] == ["merge", "discard", "keep"]
+    assert call["kinds"] == ["allow_once", "reject_always", "reject_once"]
+    # Keep → worktree stays.
+    from mini_ork import workspaces as ws_mod
+    assert ws_mod.load(home, run_id) is not None
+
+
+def test_direct_mode_discard_choice_removes_worktree(tmp_path, monkeypatch):
+    from unittest.mock import patch
+
+    run_id = "run-s5-002"
+    project, home, _ = _init_repo_with_worktree(tmp_path, run_id=run_id)
+    monkeypatch.setattr("mini_ork.acp.agent.mint_run_id", lambda: run_id)
+    (home / "runs" / run_id).mkdir(parents=True, exist_ok=True)
+    fake_lanes = [{"id": "opus", "name": "Opus"}]
+    fake_recipes = ["code-fix"]
+
+    with patch(
+        "mini_ork.acp_orchestrator.config.orchestrator_lanes",
+        return_value=fake_lanes,
+    ), patch(
+        "mini_ork.recipes_catalog.list_recipes",
+        return_value=[_recipe(n) for n in fake_recipes],
+    ):
+        agent = MiniOrkAcpAgent(
+            reader=lambda _r: {"status": "published", "events": [], "llm_calls": []},
+            poll_interval=0,
+            launcher=lambda rid, _kick: {"ok": True, "run_id": rid},
+        )
+        resp = asyncio.run(agent.new_session(cwd=str(project)))
+
+    conn = _ReviewConn(outcome_id="discard")
+    agent.on_connect(conn)
+    asyncio.run(agent.prompt(resp.session_id, [_text_block("/run do it")]))
+
+    from mini_ork import workspaces as ws_mod
+    assert ws_mod.load(home, run_id) is None
+
+
+def test_direct_mode_merge_choice_fast_forwards_into_project(tmp_path, monkeypatch):
+    from unittest.mock import patch
+
+    run_id = "run-s5-003"
+    project, home, _ = _init_repo_with_worktree(tmp_path, run_id=run_id)
+    monkeypatch.setattr("mini_ork.acp.agent.mint_run_id", lambda: run_id)
+    (home / "runs" / run_id).mkdir(parents=True, exist_ok=True)
+    fake_lanes = [{"id": "opus", "name": "Opus"}]
+    fake_recipes = ["code-fix"]
+
+    with patch(
+        "mini_ork.acp_orchestrator.config.orchestrator_lanes",
+        return_value=fake_lanes,
+    ), patch(
+        "mini_ork.recipes_catalog.list_recipes",
+        return_value=[_recipe(n) for n in fake_recipes],
+    ):
+        agent = MiniOrkAcpAgent(
+            reader=lambda _r: {"status": "published", "events": [], "llm_calls": []},
+            poll_interval=0,
+            launcher=lambda rid, _kick: {"ok": True, "run_id": rid},
+        )
+        resp = asyncio.run(agent.new_session(cwd=str(project)))
+
+    conn = _ReviewConn(outcome_id="merge")
+    agent.on_connect(conn)
+    asyncio.run(agent.prompt(resp.session_id, [_text_block("/run do it")]))
+
+    # The file from the worktree is now on the project branch.
+    assert (project / "new.txt").is_file()
+    from mini_ork import workspaces as ws_mod
+    assert ws_mod.load(home, run_id) is None
+
+
+def test_direct_mode_merge_refused_reports_and_keeps_worktree(
+    tmp_path, monkeypatch
+):
+    """A merge refused because the project has a dirty overlapping path is
+    surfaced to the user; the worktree stays."""
+    import subprocess
+    from unittest.mock import patch
+
+    run_id = "run-s5-004"
+    project, home, _ = _init_repo_with_worktree(tmp_path, run_id=run_id)
+    # Make the project dirty on the SAME file the worktree touched.
+    (project / "new.txt").write_text("local edit\n", encoding="utf-8")
+    subprocess.run(["git", "add", "new.txt"], cwd=project, check=True,
+                    capture_output=True, text=True)
+
+    monkeypatch.setattr("mini_ork.acp.agent.mint_run_id", lambda: run_id)
+    (home / "runs" / run_id).mkdir(parents=True, exist_ok=True)
+    fake_lanes = [{"id": "opus", "name": "Opus"}]
+    fake_recipes = ["code-fix"]
+
+    with patch(
+        "mini_ork.acp_orchestrator.config.orchestrator_lanes",
+        return_value=fake_lanes,
+    ), patch(
+        "mini_ork.recipes_catalog.list_recipes",
+        return_value=[_recipe(n) for n in fake_recipes],
+    ):
+        agent = MiniOrkAcpAgent(
+            reader=lambda _r: {"status": "published", "events": [], "llm_calls": []},
+            poll_interval=0,
+            launcher=lambda rid, _kick: {"ok": True, "run_id": rid},
+        )
+        resp = asyncio.run(agent.new_session(cwd=str(project)))
+
+    conn = _ReviewConn(outcome_id="merge")
+    agent.on_connect(conn)
+    asyncio.run(agent.prompt(resp.session_id, [_text_block("/run do it")]))
+
+    from mini_ork import workspaces as ws_mod
+    # The workspace stays; the user can fix and /merge again.
+    assert ws_mod.load(home, run_id) is not None
+    # Cleanup so subsequent tests are not affected.
+    subprocess.run(["git", "reset", "--hard", "HEAD"], cwd=project, check=True,
+                    capture_output=True, text=True)
+
+
+def test_child_run_ending_after_turn_emits_one_time_message_only(
+    tmp_path, monkeypatch
+):
+    """An orchestrator child that finishes AFTER the orchestrator's turn
+    ended gets the one-time slash-command hint and NO request_permission."""
+    from unittest.mock import patch
+
+    project = tmp_path / "proj"
+    project.mkdir()
+    fake_lanes = [{"id": "opus", "name": "Opus"}]
+    fake_recipes = ["code-fix"]
+
+    child_run_id = "run-s5-child"
+
+    # First reader call: orchestrator's tool_result for start_run → create workspace.
+    # Then a few polls returning "executing", then "published" with a workspace.
+    call = {"n": 0}
+
+    def fake_reader(rid: str) -> dict:
+        if rid == child_run_id:
+            call["n"] += 1
+            return {"status": "published", "events": [], "llm_calls": []}
+        return {"status": None, "events": [], "llm_calls": []}
+
+    class _TurnResult:
+        session_id = "sess-1"
+        rc = 0
+        text = ""
+        cost_usd = 0.0
+        error = ""
+
+    def fake_turn(lane, prompt, cwd, home, resume, on_event):
+        async def _run() -> Any:
+            await on_event({
+                "type": "assistant",
+                "message": {"content": [
+                    {"type": "tool_use", "id": "tool-1",
+                     "name": "mcp__mini-ork__start_run", "input": {"recipe": "code-fix"}}
+                ]},
+            })
+            await on_event({
+                "type": "user",
+                "message": {"content": [{
+                    "type": "tool_result", "tool_use_id": "tool-1",
+                    "is_error": False,
+                    "content": [{"type": "text", "text": json.dumps({"run_id": child_run_id})}],
+                }]},
+            })
+            # Turn ends BEFORE the child finishes (the orchestrator returned).
+            return _TurnResult()
+
+        return _run()
+
+    # Build a real workspace BEFORE the prompt so the child run lands on
+    # the ready-to-review path; the orchestrator's start_run normally would
+    # create it, but the test bypasses that.
+    import subprocess
+    from mini_ork import workspaces as ws_mod
+
+    home_dir = project / ".mini-ork"
+    home_dir.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["git", "init", "-b", "main"], cwd=project, check=True,
+        capture_output=True, text=True,
+    )
+    subprocess.run(["git", "config", "user.name", "T"], cwd=project, check=True,
+                    capture_output=True, text=True)
+    subprocess.run(["git", "config", "user.email", "t@e"], cwd=project, check=True,
+                    capture_output=True, text=True)
+    (project / "README.md").write_text("hi\n", encoding="utf-8")
+    subprocess.run(["git", "add", "README.md"], cwd=project, check=True,
+                    capture_output=True, text=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=project, check=True,
+                    capture_output=True, text=True)
+    ws = ws_mod.create(project, home_dir, child_run_id)
+    (ws.path / "new.txt").write_text("x\n", encoding="utf-8")
+    subprocess.run(["git", "add", "new.txt"], cwd=ws.path, check=True,
+                    capture_output=True, text=True)
+    subprocess.run(["git", "commit", "-m", "feat"], cwd=ws.path, check=True,
+                    capture_output=True, text=True)
+
+    with patch(
+        "mini_ork.acp_orchestrator.config.orchestrator_lanes",
+        return_value=fake_lanes,
+    ), patch(
+        "mini_ork.recipes_catalog.list_recipes",
+        return_value=[_recipe(n) for n in fake_recipes],
+    ):
+        agent = MiniOrkAcpAgent(
+            orchestrator_turn=fake_turn,
+            reader=fake_reader,
+            poll_interval=0,
+        )
+        resp = asyncio.run(agent.new_session(cwd=str(project)))
+    conn = _ReviewConn(outcome_id="merge")  # would fail the test if called
+    agent.on_connect(conn)
+
+    async def _drive():
+        await agent.prompt(resp.session_id, [_text_block("launch")])
+        # Drain the child follower so it sees the terminal status.
+        follower = agent._followers.get(child_run_id)
+        if follower is not None:
+            await follower
+
+    asyncio.run(_drive())
+
+    # request_permission was NEVER called — the orchestrator's turn ended
+    # before the child, so the buttons don't fit in an active turn.
+    assert conn.calls == []
+    # The workspace is still open (the message did not mutate it).
+    assert ws_mod.load(home_dir, child_run_id) is not None

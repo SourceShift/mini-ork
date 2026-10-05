@@ -375,3 +375,163 @@ def test_title_with_state_needs_you_prefixes_mark():
     """``needs_you`` → ``✋ <base>``, no diff suffix."""
     ts = TaskState("needs_you", COST_PAUSE_DETAIL, "implementer", 0, 0)
     assert title_with_state("Fix login loop", ts) == "✋ Fix login loop"
+
+
+# ── ready-to-review (Zed S5; real git) ────────────────────────────────────────
+
+
+def _init_repo(tmp_path: Path, *, name: str = "proj") -> Path:
+    """Make a fresh temp git repo with one commit, return its path.
+
+    Mirrors ``tests/unit/test_workspaces.py:_init_repo`` so the same
+    helper is reused; the prefix is intentionally NOT ``test_ws_``
+    (that's the workspaces module's reserved set, line 7-8 of that
+    file).
+    """
+    import subprocess
+
+    project = tmp_path / name
+    project.mkdir()
+    subprocess.run(
+        ["git", "init", "-b", "main"], cwd=project, check=True,
+        capture_output=True, text=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Test"], cwd=project, check=True,
+        capture_output=True, text=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.com"],
+        cwd=project, check=True, capture_output=True, text=True,
+    )
+    (project / "README.md").write_text("hi\n", encoding="utf-8")
+    subprocess.run(["git", "add", "README.md"], cwd=project, check=True,
+                    capture_output=True, text=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=project, check=True,
+                    capture_output=True, text=True)
+    return project
+
+
+def _init_home(tmp_path: Path) -> Path:
+    home = tmp_path / "home"
+    home.mkdir()
+    return home
+
+
+def test_published_run_with_workspace_yields_ready_to_review(tmp_path):
+    """A published run whose worktree branch has commits ahead → needs_you
+    with the ``Ready to review:`` detail."""
+    import subprocess
+    from mini_ork import workspaces as ws_mod
+
+    project = _init_repo(tmp_path)
+    home = _init_home(tmp_path)
+    run_id = "run-rtr-001"
+    ws = ws_mod.create(project, home, run_id)
+    # Land a commit on the worktree branch.
+    (ws.path / "feature.txt").write_text("f\n", encoding="utf-8")
+    subprocess.run(["git", "add", "feature.txt"], cwd=ws.path, check=True,
+                    capture_output=True, text=True)
+    subprocess.run(["git", "commit", "-m", "feat"], cwd=ws.path, check=True,
+                    capture_output=True, text=True)
+    run_dir = home / "runs" / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    snap = _snapshot(status="published")
+    ts = task_state(run_dir, snap)
+    assert ts.state == "needs_you"
+    assert ts.detail.startswith("Ready to review: +")
+    assert "mini-ork/" + run_id in ts.detail
+    # U+2212 minus glyph, kickoff pins it.
+    assert " −" in ts.detail
+    assert ts.added >= 1
+    assert ts.removed == 0
+
+
+def test_published_run_no_workspace_falls_through_to_done(tmp_path):
+    """No workspace record → published still maps to done (unchanged)."""
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    _write_diff_cache(
+        run_dir,
+        [{"path": "f.py", "old_text": "a\n", "new_text": "a\nb\n"}],
+    )
+    snap = _snapshot(status="published")
+    ts = task_state(run_dir, snap)
+    assert ts.state == "done"
+    assert ts.detail == PUBLISHED_DETAIL
+
+
+def test_failed_run_with_workspace_appends_kept_note(tmp_path):
+    """A failed run with a kept worktree stays failed; the kept note is
+    appended so /discard is discoverable."""
+    import subprocess
+    from mini_ork import workspaces as ws_mod
+
+    project = _init_repo(tmp_path)
+    home = _init_home(tmp_path)
+    run_id = "run-rtr-failed"
+    ws = ws_mod.create(project, home, run_id)
+    (ws.path / "f.txt").write_text("f\n", encoding="utf-8")
+    subprocess.run(["git", "add", "f.txt"], cwd=ws.path, check=True,
+                    capture_output=True, text=True)
+    subprocess.run(["git", "commit", "-m", "f"], cwd=ws.path, check=True,
+                    capture_output=True, text=True)
+    run_dir = home / "runs" / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    snap = _snapshot(
+        status="failed",
+        events=[
+            {
+                "event_type": "node_end",
+                "payload_json": json.dumps({"node_id": "implementer", "finish_reason": "error"}),
+            }
+        ],
+    )
+    ts = task_state(run_dir, snap)
+    assert ts.state == "failed"
+    assert "Failed at implementer (error)" in ts.detail
+    assert f"/discard {run_dir.name}" in ts.detail
+
+
+def test_run_mark_uses_workspace_record_for_published(tmp_path):
+    """``run_mark`` flips a published run to ✋ when its workspace record
+    file exists on disk (cheap path: no git)."""
+    import subprocess
+    from mini_ork import workspaces as ws_mod
+
+    project = _init_repo(tmp_path)
+    home = _init_home(tmp_path)
+    run_id = "run-rtr-mark"
+    ws = ws_mod.create(project, home, run_id)
+    (ws.path / "x.txt").write_text("x\n", encoding="utf-8")
+    subprocess.run(["git", "add", "x.txt"], cwd=ws.path, check=True,
+                    capture_output=True, text=True)
+    subprocess.run(["git", "commit", "-m", "x"], cwd=ws.path, check=True,
+                    capture_output=True, text=True)
+    run_dir = home / "runs" / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    assert run_mark("published", run_dir) == MARKS["needs_you"]
+
+
+def test_run_mark_published_without_workspace_still_done(tmp_path):
+    """No workspace record → published still shows ✓ (no false positives)."""
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    assert run_mark("published", run_dir) == MARKS["done"]
+
+
+def test_title_with_state_ready_to_review_appends_suffix():
+    """Ready-to-review ``needs_you`` → ``✋ <base> — ready to review +a −r``."""
+    ts = TaskState(
+        "needs_you",
+        "Ready to review: +3 −1 on mini-ork/run-rtr — merge or discard it.",
+        "implementer", 3, 1,
+    )
+    out = title_with_state("Fix login loop", ts)
+    assert out == "✋ Fix login loop — ready to review +3 −1"  # noqa: RUF001
+
+
+def test_title_with_state_cost_pause_needs_you_stays_simple():
+    """Cost-pause ``needs_you`` is NOT ready-to-review → no suffix."""
+    ts = TaskState("needs_you", COST_PAUSE_DETAIL, "implementer", 0, 0)
+    assert title_with_state("Fix login loop", ts) == "✋ Fix login loop"

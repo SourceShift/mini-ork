@@ -86,6 +86,7 @@ from mini_ork.acp import history
 from mini_ork.acp import orchestration as _orchestration
 from mini_ork.acp import plan as _plan
 from mini_ork.acp import task_state as _task_state
+from mini_ork.acp.task_state import TaskState as _TaskState
 from mini_ork.acp.live import LiveTail, normalize
 from mini_ork.acp.threads import ThreadStore, title_from_text
 from mini_ork.web.control import _is_safe_token
@@ -440,6 +441,12 @@ class MiniOrkAcpAgent:
         # run session id → its base title (from the kickoff). Used by
         # ``list_sessions`` to render the run row's prefixed title.
         self._run_base_titles: dict[str, str] = {}
+        # run id → True once we have offered the review buttons / emitted
+        # the one-time "ready to review" message. A child run that ends
+        # after the orchestrator's own turn is the most common case; the
+        # flag prevents the message from re-firing on every poll. A
+        # successful merge / discard clears the entry (no second offer).
+        self._ready_to_review_emitted: set[str] = set()
         self._launch_count = 0
         # ACP client capabilities captured at ``initialize`` time (S0). The
         # client sends the SDK object in the initialize handshake; we keep
@@ -1472,6 +1479,14 @@ class MiniOrkAcpAgent:
                 session_id, turn_draft["draft_id"],
                 tool_call_id=turn_draft["tool_call_id"], exists=turn_draft["exists"],
             )
+        # Zed S5: surface review buttons for any run that became
+        # ready-to-review during this turn, newest first. The orchestrator
+        # task is already popped (we are about to return ``end_turn``) so
+        # the active-turn guard inside ``_offer_run_review`` would normally
+        # fall through to the one-time message — the explicit
+        # ``force=True`` here re-asserts the active-turn semantics for
+        # this final pass.
+        await self._offer_thread_review(session_id)
         return PromptResponse(stop_reason="end_turn")
 
     # ── recipe-draft approval (Z9c-2 / S3b-2) ─────────────────────────────────
@@ -1782,20 +1797,266 @@ class MiniOrkAcpAgent:
 
         A child run's launcher pid belongs to the MCP server, not to us, so
         ``_launches`` holds none for it and only the start timeout applies.
+
+        Zed S5: after the run reaches a terminal status inside an active
+        turn (direct mode / ``/run`` / orchestrator child), inspect the new
+        task state. A "ready to review" state means the run ended on a
+        workspace branch with commits ahead — offer Merge / Discard /
+        Keep buttons on the run's own ``<run_id>:parent`` tool card. The
+        marker stays ``in_progress`` until the user picks; ``merge`` /
+        ``discard`` flips it to ``completed`` and re-emits the title from
+        the new state.
         """
         stop = await self._await_terminal(run_id)
         if stop == "cancelled":
             return stop  # the run may still be going; leave its marker open
         ok = stop == "end_turn" and self._run_status.get(run_id) == "published"
+        ws_ready = await self._offer_run_review(thread_id, run_id)
+        if not ws_ready:
+            await self._emit(
+                thread_id,
+                ToolCallProgress(
+                    session_update="tool_call_update",
+                    tool_call_id=f"{run_id}:parent",
+                    status="completed" if ok else "failed",
+                ),
+            )
+        return stop
+
+    async def _offer_run_review(self, thread_id: str, run_id: str, *, force: bool = False) -> bool:
+        """Offer Merge / Discard / Keep buttons on the run's marker when the
+        run ended on a workspace with commits ahead.
+
+        Returns ``True`` when the buttons were offered OR the one-time
+        message fired (the marker stays ``in_progress`` until the user
+        picks or runs ``/merge`` / ``/discard``); ``False`` when the run
+        ended cleanly with no worktree to clean up — the caller closes
+        the marker immediately.
+
+        An "active turn" means either a direct-mode prompt whose caller
+        is still awaiting (recorded in ``_direct_runs``) or an orchestrator
+        turn that has not yet finished (recorded in ``_orchestrator_tasks``).
+        Inactive → no buttons, just the one-time message. ``force=True``
+        overrides the active-turn check; it is used by the orchestrator
+        turn-end pass (``_offer_thread_review``) to surface buttons for
+        runs that became ready-to-review during the turn.
+        """
+        if run_id in self._ready_to_review_emitted:
+            return True
+        run_dir = self._home_for(run_id) / "runs" / run_id
+        if not run_dir.is_dir():
+            return False
+        snap = (self._reader or self._read_snapshot)(run_id) or {}
+        ts = _task_state.task_state(run_dir, snap)
+        if ts.state != "needs_you" or not ts.detail.startswith("Ready to review:"):
+            return False
+        active_turn = force or (
+            self._direct_runs.get(thread_id) == run_id
+            or self._orchestrator_tasks.get(thread_id) is not None
+        )
+        if not active_turn or self._conn is None:
+            self._ready_to_review_emitted.add(run_id)
+            await self._emit_ready_to_review_once(thread_id, run_id, ts)
+            return True
+        from mini_ork import workspaces as _workspaces
+
+        ws = _workspaces.load(self._home_for(run_id), run_id)
+        base_branch = ws.base_branch if ws is not None else ""
+        try:
+            response = await self._conn.request_permission(
+                session_id=thread_id,
+                tool_call=ToolCallUpdate(
+                    tool_call_id=f"{run_id}:parent",
+                    kind="edit",
+                    title=f"Review run {run_id} (+{ts.added} −{ts.removed})",
+                    status="pending",
+                ),
+                options=[
+                    PermissionOption(
+                        option_id="merge",
+                        name=f"Merge into {base_branch}" if base_branch else "Merge",
+                        kind="allow_once",
+                    ),
+                    PermissionOption(option_id="discard", name="Discard changes", kind="reject_always"),
+                    PermissionOption(option_id="keep", name="Keep for later", kind="reject_once"),
+                ],
+            )
+        except Exception:  # noqa: BLE001 — UI is best-effort, marker stays open
+            return True
+        outcome = getattr(response, "outcome", None)
+        option_id = getattr(outcome, "option_id", None) if outcome is not None else None
+        self._ready_to_review_emitted.add(run_id)
+        await self._handle_review_decision(thread_id, run_id, option_id, ts)
+        return True
+
+    async def _handle_review_decision(
+        self,
+        thread_id: str,
+        run_id: str,
+        option_id: str | None,
+        ts: _TaskState,
+    ) -> None:
+        """Apply the user's pick: merge → fast-forward into the project;
+        discard → remove the worktree + branch; keep / dismissed → marker
+        stays ``in_progress`` so the user can decide later."""
+        from mini_ork import workspaces as _workspaces
+
+        home = self._home_for(run_id)
+        ws = _workspaces.load(home, run_id)
+        if option_id == "merge" and ws is not None:
+            # The task's own title is what the user wants in git history.
+            base = self._thread_titles.get(thread_id) or self._run_base_titles.get(run_id) or ""
+            message = f"{base} (mini-ork {run_id})" if base else f"mini-ork run {run_id}"
+            try:
+                result = _workspaces.merge(ws, message=message)
+            except Exception as exc:  # noqa: BLE001
+                result = {"ok": False, "error": str(exc)}
+            if result.get("ok"):
+                merged_sha = result.get("merged") or ""
+                short = (str(merged_sha)[:7]) if merged_sha else ""
+                mode = result.get("mode") or "merge"
+                wording = (
+                    "fast-forward" if mode == "fast-forward" else "merge commit"
+                )
+                await self._emit(
+                    thread_id,
+                    self._build_refusal_message(
+                        f"Merged into {ws.base_branch} ({wording} {short})."
+                    ),
+                )
+                self._ready_to_review_emitted.discard(run_id)
+                await self._close_run_marker_completed(thread_id, run_id)
+                await self._reemit_title_after_review(run_id)
+                return
+            err = (result.get("error") if isinstance(result, dict) else None) or "unknown error"
+            await self._emit(
+                thread_id,
+                self._build_refusal_message(
+                    f"Merge refused: {err}. The worktree is kept — fix it, then /merge {run_id}."
+                ),
+            )
+            return
+        if option_id == "discard" and ws is not None:
+            try:
+                _workspaces.discard(ws)
+            except Exception as exc:  # noqa: BLE001
+                await self._emit(
+                    thread_id,
+                    self._build_refusal_message(
+                        f"Discard failed: {exc}. The worktree is kept — /discard {run_id} to retry."
+                    ),
+                )
+                return
+            await self._emit(
+                thread_id,
+                self._build_refusal_message(
+                    f"Discarded {run_id} — its worktree and branch are gone."
+                ),
+            )
+            self._ready_to_review_emitted.discard(run_id)
+            await self._close_run_marker_completed(thread_id, run_id)
+            await self._reemit_title_after_review(run_id)
+            return
+        # keep / dismissed / no workspace: marker stays in_progress; one-line message.
+        branch = (
+            ts.detail.split(" on ", 1)[-1].split(" — ", 1)[0] if " on " in ts.detail else ""
+        )
+        where = f" on {branch}" if branch else ""
+        await self._emit(
+            thread_id,
+            self._build_refusal_message(
+                f"Kept{where} — /merge {run_id} or /discard {run_id} when you're ready."
+            ),
+        )
+
+    async def _offer_thread_review(self, thread_id: str) -> None:
+        """Orchestrator turn-end pass: walk the runs this thread followed
+        during the turn, newest-first, and offer buttons for any that are
+        ready-to-review (S5).
+
+        The ``_offer_run_review`` call uses ``force=True`` so the
+        active-turn guard does not flip into the one-time-message path;
+        the orchestrator task is already popped by this point, but the
+        user's prompt turn is still open until we return ``end_turn``.
+        """
+        runs = self._thread_runs.get(thread_id) or []
+        for run_id in reversed(runs):
+            await self._offer_run_review(thread_id, run_id, force=True)
+
+    async def _emit_ready_to_review_once(
+        self, thread_id: str, run_id: str, ts: _TaskState | None = None
+    ) -> None:
+        """One-time message for a child run that ended after the orchestrator's
+        turn ended (no active UI to host the buttons). The title already shows
+        ✋ via the cheap ``run_mark`` extension; the message tells the user how
+        to resolve it via slash commands.
+        """
+        if run_id in self._ready_to_review_emitted:
+            return
+        if ts is None:
+            run_dir = self._home_for(run_id) / "runs" / run_id
+            ts = _task_state.task_state(
+                run_dir,
+                (self._reader or self._read_snapshot)(run_id) or {},
+            )
+        branch = ""
+        if " on " in ts.detail:
+            branch = ts.detail.split(" on ", 1)[-1].split(" — ", 1)[0]
+        where = f" on {branch}" if branch else ""
+        self._ready_to_review_emitted.add(run_id)
+        await self._emit(
+            thread_id,
+            self._build_refusal_message(
+                f"Run {run_id} is ready to review (+{ts.added} −{ts.removed}{where}): "
+                f"/merge {run_id} or /discard {run_id}."
+            ),
+        )
+
+    async def _close_run_marker_completed(self, thread_id: str, run_id: str) -> None:
         await self._emit(
             thread_id,
             ToolCallProgress(
                 session_update="tool_call_update",
                 tool_call_id=f"{run_id}:parent",
-                status="completed" if ok else "failed",
+                status="completed",
             ),
         )
-        return stop
+
+    async def _reemit_title_after_review(self, run_id: str) -> None:
+        """Re-emit the title from the post-decision task state.
+
+        A merge / discard removes the workspace record, so the next
+        ``task_state`` projection lands back on the plain ``done`` /
+        ``failed`` branch — the user sees ``✓`` / ``✗`` instead of ``✋``.
+        The dedup key in ``_last_title_sent[dest]`` is the same string
+        the projection wrote before, so the new title is different and
+        fires; the entry is rewritten here.
+        """
+        run_dir = self._home_for(run_id) / "runs" / run_id
+        snap = (self._reader or self._read_snapshot)(run_id) or {}
+        new_ts = _task_state.task_state(run_dir, snap)
+        route = self._routes.get(run_id)
+        dest = route[0] if route is not None else run_id
+        if dest.startswith("orch-"):
+            base = self._thread_titles.get(dest) or "mini-ork thread"
+        else:
+            base = self._run_base_titles.get(dest) or dest
+        new_title = _task_state.title_with_state(base, new_ts)
+        if self._last_title_sent.get(dest) == new_title:
+            return
+        self._last_title_sent[dest] = new_title
+        await self._emit(
+            run_id,
+            SessionInfoUpdate(
+                session_update="session_info_update",
+                title=new_title,
+            ),
+        )
+        if dest.startswith("orch-"):
+            self._record(
+                dest,
+                {"type": "title", "title": new_title},
+            )
 
     async def _default_orchestrator_turn(
         self,

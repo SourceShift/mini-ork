@@ -167,6 +167,21 @@ COMMANDS: list[AvailableCommand] = [
         "Edit an existing engine recipe (copies to project, then drafts).",
         "recipe id",
     ),
+    _cmd(
+        "workspaces",
+        "List every open task workspace (run, branch, base, change, commits, age).",
+        None,
+    ),
+    _cmd(
+        "merge",
+        "Merge a task workspace into its base branch.",
+        "optional run id",
+    ),
+    _cmd(
+        "discard",
+        "Discard a task workspace (worktree + branch + record).",
+        "optional run id",
+    ),
 ]
 
 
@@ -771,6 +786,111 @@ async def handle_recipe_edit(agent: Any, session_id: str, arg: str) -> str | _Re
     return _RewriteToOrchestrate(intent_text=intent, recipe_id=recipe_id)
 
 
+# ── /workspaces / /merge / /discard (Zed S5) ──────────────────────────────────
+
+
+def _resolve_review_run_id(agent: Any, session_id: str, arg: str) -> str | None:
+    """Same resolution as ``_current_run_id`` for the S5 slash commands.
+
+    Returns ``None`` when no run applies. Thread sessions resolve to
+    their latest followed run unless the user typed an explicit run id;
+    run sessions resolve to the session id.
+    """
+    return _current_run_id(agent, session_id, arg)
+
+
+def _format_merge_message(base_branch: str, result: dict[str, Any]) -> str:
+    """``Merged into <branch> (<fast-forward|merge commit> <short sha>).``
+
+    The wording picks ``fast-forward`` vs ``merge commit`` from
+    ``result["mode"]`` (literal set the kickoff pins:
+    ``{"fast-forward", "merge"}``, :workspaces.py:283,289). Missing sha
+    collapses to ``—`` so a nothing-to-merge merge still reads cleanly.
+    """
+    merged = result.get("merged") or ""
+    short = str(merged)[:7] if merged else ""
+    mode = str(result.get("mode") or "merge")
+    wording = "fast-forward" if mode == "fast-forward" else "merge commit"
+    sha = short or "—"
+    return f"Merged into {base_branch} ({wording} {sha})."
+
+
+async def handle_workspaces(agent: Any, session_id: str, arg: str) -> str:
+    """``/workspaces`` — table of every open task workspace.
+
+    Reads ``workspaces.list_open(home)`` and surfaces each row's
+    branch / base / change / commits / age. Empty → "No open task
+    workspaces." Footer hints at ``/merge`` / ``/discard``.
+    """
+    del arg
+    from mini_ork import workspaces as _workspaces
+
+    home = agent._home_for(session_id)
+    items = _workspaces.list_open(home)
+    if not items:
+        return "No open task workspaces."
+    rows: list[str] = []
+    for ws in items:
+        try:
+            snap = _workspaces.status(ws)
+        except Exception:  # noqa: BLE001 — a per-row failure must not kill the table
+            snap = {}
+        commits = int(snap.get("commits_ahead") or 0)
+        added = int(snap.get("added") or 0)
+        removed = int(snap.get("removed") or 0)
+        rows.append(
+            f"| `{ws.run_id}` | `{ws.branch}` | `{ws.base_branch}` | "
+            f"+{added} −{removed} | {commits} | - |"
+        )
+    header = "| run | branch | base | change | commits | age |"
+    sep = "|---|---|---|---|---|---|"
+    body = "\n".join([header, sep, *rows])
+    return f"Open task workspaces:\n\n{body}\n\n`/merge <run>` or `/discard <run>` to resolve."
+
+
+async def handle_merge(agent: Any, session_id: str, arg: str) -> str:
+    """``/merge [run]`` — fast-forward the run's workspace branch into its base."""
+    from mini_ork import workspaces as _workspaces
+
+    run_id = _resolve_review_run_id(agent, session_id, arg)
+    if not run_id:
+        return "No run in this thread yet — `/runs` lists the project's runs."
+    home = agent._home_for(run_id)
+    ws = _workspaces.load(home, run_id)
+    if ws is None:
+        return f"Run {run_id} has no open workspace."
+    message = f"merge run {run_id}"
+    try:
+        result = _workspaces.merge(ws, message=message)
+    except Exception as exc:  # noqa: BLE001
+        return f"`/merge` failed: {exc}"
+    if not isinstance(result, dict) or not result.get("ok"):
+        err = (result.get("error") if isinstance(result, dict) else None) or "unknown error"
+        return f"`/merge` failed: {err}. The worktree is kept — fix it, then /merge {run_id}."
+    return _format_merge_message(ws.base_branch, result)
+
+
+async def handle_discard(agent: Any, session_id: str, arg: str) -> str:
+    """``/discard [run]`` — remove the run's worktree + branch + record."""
+    from mini_ork import workspaces as _workspaces
+
+    run_id = _resolve_review_run_id(agent, session_id, arg)
+    if not run_id:
+        return "No run in this thread yet — `/runs` lists the project's runs."
+    home = agent._home_for(run_id)
+    ws = _workspaces.load(home, run_id)
+    if ws is None:
+        return f"Run {run_id} has no open workspace."
+    try:
+        result = _workspaces.discard(ws)
+    except Exception as exc:  # noqa: BLE001
+        return f"`/discard` failed: {exc}"
+    if not isinstance(result, dict) or not result.get("ok"):
+        err = (result.get("error") if isinstance(result, dict) else None) or "unknown error"
+        return f"`/discard` failed: {err}"
+    return f"Discarded {run_id} — its worktree and branch are gone."
+
+
 # ── dispatch table ───────────────────────────────────────────────────────────
 # Maps the bare command name to its handler. ``/run`` is intentionally absent:
 # ``MiniOrkAcpAgent`` routes ``/run <task>`` through ``_strip_slash_run``
@@ -793,6 +913,9 @@ HANDLERS: dict[str, Handler] = {
     "serve": handle_serve,
     "recipe new": handle_recipe_new,
     "recipe edit": handle_recipe_edit,
+    "workspaces": handle_workspaces,
+    "merge": handle_merge,
+    "discard": handle_discard,
 }
 
 
