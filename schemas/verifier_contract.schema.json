@@ -156,6 +156,25 @@
           },
           "default": []
         },
+        "expect_body": {
+          "description": "For surface=api: a declared expected value compared against the observed response body using the declared equivalence operator. Accepts any JSON value. The body check runs only when this key is present.",
+          "default": null
+        },
+        "equivalence": {
+          "description": "Declared equivalence relation used to compare an observed body against a declared expect_body and to compare idempotent_repeat probes. A string names a registered operator; a mapping carries an operator plus operator-specific rules.",
+          "oneOf": [
+            { "type": "string" },
+            {
+              "type": "object",
+              "required": ["operator"],
+              "additionalProperties": false,
+              "properties": {
+                "operator": { "type": "string" },
+                "rules": { "type": "object" }
+              }
+            }
+          ]
+        },
         "budget": {
           "type": "object",
           "description": "Hard cost ceiling so a runaway agent cannot burn unbounded tokens/turns (naive computer-use verification = 2.6-7.4M tokens/instance, WebTestBench).",

@@ -46,6 +46,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
+from mini_ork.verify.equivalence import EquivalenceSpec, compare, spec_error
+
 __all__ = [
     "PROVEN",
     "REFUTED",
@@ -137,6 +139,7 @@ class Check:
     name: str
     ok: Optional[bool]
     detail: str = ""
+    operator: str = ""
 
 
 @dataclass
@@ -177,6 +180,9 @@ class Observable:
     function: str = ""
     seed_inputs: list = field(default_factory=list)
     relations: list[str] = field(default_factory=list)
+    equivalence: EquivalenceSpec = field(default_factory=EquivalenceSpec)
+    expect_body: Any = None
+    expect_body_set: bool = False
 
     @classmethod
     def from_mapping(cls, data: Any) -> "Observable":
@@ -251,6 +257,14 @@ class Observable:
         if not isinstance(steps_raw, list):
             raise ObservableError("observable.steps must be a list")
         steps = [cls.from_mapping(item) for item in steps_raw]
+        try:
+            equivalence = EquivalenceSpec.from_raw(data.get("equivalence"))
+        except ValueError as e:
+            raise ObservableError(f"observable.equivalence: {e}") from e
+        expect_body_set = "expect_body" in data
+        expect_body = data.get("expect_body")
+        if expect_body_set and not _is_json_data(expect_body):
+            raise ObservableError("observable.expect_body must contain only plain JSON data")
         return cls(
             surface=surface,
             target=target,
@@ -273,6 +287,9 @@ class Observable:
             function=str(data.get("function") or ""),
             seed_inputs=seed_inputs,
             relations=relations,
+            equivalence=equivalence,
+            expect_body=expect_body,
+            expect_body_set=expect_body_set,
         )
 
 
@@ -285,6 +302,7 @@ class BehavioralVerdict:
     checks: list[Check] = field(default_factory=list)
     evidence: str = ""
     target: str = ""
+    operator: str = "exact"
 
     def to_json(self) -> str:
         return json.dumps(
@@ -294,8 +312,15 @@ class BehavioralVerdict:
                 "target": self.target,
                 "status": self.status,
                 "pass": self.status == PROVEN,
+                "operator": self.operator,
                 "checks": [
-                    {"name": c.name, "ok": c.ok, "detail": c.detail} for c in self.checks
+                    {
+                        "name": c.name,
+                        "ok": c.ok,
+                        "detail": c.detail,
+                        **({"operator": c.operator} if c.operator else {}),
+                    }
+                    for c in self.checks
                 ],
                 "evidence": self.evidence,
             },
@@ -470,14 +495,27 @@ def _amplify(
         if not all(p.ok_transport for p in probes):
             bad = next(p for p in probes if not p.ok_transport)
             return Check(relation, None, f"unreachable probe: {bad.error}")
+        op = obs.equivalence.operator
+        results = [compare(p.body, probes[0].body, obs.equivalence) for p in probes[1:]]
+        if any(r.equal is None for r in results):
+            first = next(r for r in results if r.equal is None)
+            return Check(relation, None, first.detail, operator=op)
         canonicals = {_canonical(p.body) for p in probes}
-        if len(canonicals) == 1:
-            return Check(relation, True, f"{capped} probes identical{cap_note}")
-        return Check(
-            relation,
-            False,
-            f"{capped} probes diverged across {len(canonicals)} distinct bodies{cap_note}",
+        if any(r.equal is False for r in results):
+            first = next(r for r in results if r.equal is False)
+            return Check(
+                relation,
+                False,
+                f"{capped} probes diverged across {len(canonicals)} distinct bodies"
+                f"{cap_note}; {first.detail} [operator={op}]",
+                operator=op,
+            )
+        detail = (
+            f"{capped} probes identical{cap_note}"
+            if op == "exact"
+            else f"{capped} probes equivalent under operator={op}{cap_note}"
         )
+        return Check(relation, True, detail, operator=op)
 
     if relation == "order_invariant":
         a = requester(method, url)
@@ -521,7 +559,9 @@ def _eval_metamorphic(relation: str, primary: HttpResult, secondary: HttpResult)
 
     Kept so any external caller pinning to the P0 signature still works; the
     live verifier path goes through :func:`run_api_check`, which calls
-    :func:`_amplify` directly for richer probing and budget-aware n.
+    :func:`_amplify` directly for richer probing and budget-aware n. It
+    intentionally compares via ``_canonical``, not the declared equivalence
+    operator — do not unify it; the operator seam lives in ``_amplify`` only.
     """
     if not secondary.ok_transport:
         return Check(relation, None, f"second probe unreachable: {secondary.error}")
@@ -734,6 +774,22 @@ def run_api_check(obs: Observable, *, requester: Requester | None = None) -> Beh
     base = os.path.expandvars(obs.staging_url)
     path = os.path.expandvars(obs.target)
     url = base + path if base else path
+
+    # Same guard as run(): an unknown/invalid operator abstains loudly rather
+    # than silently falling back to exact. Callers invoke run_api_check directly,
+    # so the guard must live here independently.
+    eq_err = spec_error(obs.equivalence)
+    if eq_err:
+        check = Check("equivalence", None, eq_err, operator=obs.equivalence.operator)
+        return BehavioralVerdict(
+            UNVERIFIED,
+            "api",
+            [check],
+            evidence=_summarize(UNVERIFIED, url, [check]),
+            target=url,
+            operator=obs.equivalence.operator,
+        )
+
     if not url:
         return BehavioralVerdict(
             UNVERIFIED,
@@ -741,6 +797,7 @@ def run_api_check(obs: Observable, *, requester: Requester | None = None) -> Beh
             [Check("declared", None, "no staging_url/target declared")],
             evidence="UNVERIFIED: nothing to probe — declare observable.staging_url/target",
             target=url,
+            operator=obs.equivalence.operator,
         )
 
     primary = req(obs.method, url)
@@ -751,6 +808,7 @@ def run_api_check(obs: Observable, *, requester: Requester | None = None) -> Beh
             [Check("reachable", None, primary.error)],
             evidence=f"UNVERIFIED: surface unreachable at {url} ({primary.error})",
             target=url,
+            operator=obs.equivalence.operator,
         )
 
     checks: list[Check] = []
@@ -768,6 +826,17 @@ def run_api_check(obs: Observable, *, requester: Requester | None = None) -> Beh
             Check("json_shape", sc.ok, sc.reason or "body matches declared schema")
         )
 
+    if obs.expect_body_set:
+        op = obs.equivalence.operator
+        observed = primary.body if primary.body is not None else primary.text
+        r = compare(observed, obs.expect_body, obs.equivalence)
+        detail = (
+            f"body equivalent under operator={op}"
+            if r.equal
+            else f"{r.detail} [operator={op}]"
+        )
+        checks.append(Check("expect_body", r.equal, detail, operator=op))
+
     if obs.metamorphic:
         for relation in obs.metamorphic:
             checks.append(_amplify(relation, obs.method, url, req, obs, n=3))
@@ -779,6 +848,7 @@ def run_api_check(obs: Observable, *, requester: Requester | None = None) -> Beh
         checks,
         evidence=_summarize(status, url, checks),
         target=url,
+        operator=obs.equivalence.operator,
     )
 
 
@@ -928,6 +998,9 @@ def _run_journey_step(
         filter=step.filter,
         steps=list(step.steps),
         extract=dict(step.extract),
+        equivalence=step.equivalence,
+        expect_body=step.expect_body,
+        expect_body_set=step.expect_body_set,
     )
     verdict = run(substituted, requester=requester, driver=driver)
     body: Any = None
@@ -1080,6 +1153,18 @@ def run(
     """Dispatch an observable to its registered surface handler."""
     import inspect
 
+    eq_err = spec_error(obs.equivalence)
+    if eq_err:
+        check = Check("equivalence", None, eq_err, operator=obs.equivalence.operator)
+        return BehavioralVerdict(
+            UNVERIFIED,
+            obs.surface,
+            [check],
+            evidence=_summarize(UNVERIFIED, obs.target, [check]),
+            target=obs.target,
+            operator=obs.equivalence.operator,
+        )
+
     handler = get_surface_handler(obs.surface)
     parameters = inspect.signature(handler).parameters
     kwargs: dict[str, Any] = {}
@@ -1087,7 +1172,9 @@ def run(
         kwargs["requester"] = requester
     if "driver" in parameters:
         kwargs["driver"] = driver
-    return handler(obs, **kwargs)
+    verdict = handler(obs, **kwargs)
+    verdict.operator = obs.equivalence.operator
+    return verdict
 
 
 # --------------------------------------------------------------------------- #
@@ -1135,22 +1222,40 @@ def observable_from_env(env: Mapping[str, str] | None = None) -> Observable | No
     surface = source.get("MO_BEHAV_SURFACE")
     if not surface:
         return None
-    return Observable.from_mapping(
-        {
-            "surface": surface,
-            "staging_url": source.get("MO_BEHAV_STAGING_URL", ""),
-            "target": source.get("MO_BEHAV_TARGET", ""),
-            "method": source.get("MO_BEHAV_METHOD", "GET"),
-            "expect_status": _int_list(source.get("MO_BEHAV_EXPECT_STATUS", "200")),
-            "metamorphic": _csv(source.get("MO_BEHAV_METAMORPHIC", "")),
-            "module": source.get("MO_BEHAV_MODULE", ""),
-            "function": source.get("MO_BEHAV_FUNCTION", ""),
-            "seed_inputs": _json_seed_inputs(
-                source.get("MO_BEHAV_SEED_INPUTS", "[]")
-            ),
-            "relations": _csv(source.get("MO_BEHAV_RELATIONS", "")),
-        }
-    )
+    mapping: dict[str, Any] = {
+        "surface": surface,
+        "staging_url": source.get("MO_BEHAV_STAGING_URL", ""),
+        "target": source.get("MO_BEHAV_TARGET", ""),
+        "method": source.get("MO_BEHAV_METHOD", "GET"),
+        "expect_status": _int_list(source.get("MO_BEHAV_EXPECT_STATUS", "200")),
+        "metamorphic": _csv(source.get("MO_BEHAV_METAMORPHIC", "")),
+        "module": source.get("MO_BEHAV_MODULE", ""),
+        "function": source.get("MO_BEHAV_FUNCTION", ""),
+        "seed_inputs": _json_seed_inputs(
+            source.get("MO_BEHAV_SEED_INPUTS", "[]")
+        ),
+        "relations": _csv(source.get("MO_BEHAV_RELATIONS", "")),
+    }
+    equivalence_raw = source.get("MO_BEHAV_EQUIVALENCE", "")
+    if equivalence_raw:
+        if equivalence_raw.startswith("{"):
+            try:
+                mapping["equivalence"] = json.loads(equivalence_raw)
+            except json.JSONDecodeError as exc:
+                raise ObservableError(
+                    f"MO_BEHAV_EQUIVALENCE must be valid JSON: {exc.msg}"
+                ) from exc
+        else:
+            mapping["equivalence"] = equivalence_raw
+    expect_body_raw = source.get("MO_BEHAV_EXPECT_BODY", "")
+    if expect_body_raw:
+        try:
+            mapping["expect_body"] = json.loads(expect_body_raw)
+        except json.JSONDecodeError as exc:
+            raise ObservableError(
+                f"MO_BEHAV_EXPECT_BODY must be valid JSON: {exc.msg}"
+            ) from exc
+    return Observable.from_mapping(mapping)
 
 
 def _exit_code(status: str, abstain_exit: int) -> int:
