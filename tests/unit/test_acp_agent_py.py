@@ -27,6 +27,7 @@ import subprocess
 import sys
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 REPO = Path(__file__).resolve().parents[2]
 if str(REPO) not in sys.path:
@@ -5003,3 +5004,456 @@ def test_automation_new_reaches_the_orchestrator_with_the_bridge(tmp_path, monke
     chunks = [u for _, u in conn.sent if isinstance(u, AgentMessageChunk)]
     assert any("When it has a proposal" in getattr(c.content, "text", "") for c in chunks)
     assert any("buttons to create it" in getattr(c.content, "text", "") for c in chunks)
+
+
+# ── /race (Zed S7a) ──────────────────────────────────────────────────────────
+
+
+class _RaceProbeWorkspace:
+    """Minimal stand-in for ``workspaces.Workspace`` for race tests.
+
+    Race flow reads ``ws.branch`` (marker suffix) and calls
+    ``workspaces.status(ws)`` (per-row change counts) and
+    ``workspaces.merge``/``workspaces.discard`` (decisions). Tests that
+    exercise a partial surface only set the attributes they read.
+    """
+
+
+class _RaceWorkspaces:
+    """In-memory ``mini_ork.workspaces`` shim for race-turn tests. Records calls."""
+
+    def __init__(self, *, git_ok: bool = True) -> None:
+        self.git_ok = git_ok
+        self.created: list[str] = []
+        self.discarded: list[str] = []
+        self.merged: list[tuple[str, str]] = []
+        self.status_calls: list[str] = []
+        self.loaded: dict[str, _RaceProbeWorkspace] = {}
+
+    def create(self, cwd, home, rid):  # noqa: ARG002 — race probe signature
+        if not self.git_ok:
+            raise RuntimeError("not a git repository")
+        self.created.append(rid)
+        ws = _RaceProbeWorkspace()
+        ws.branch = f"wt/{rid}"
+        ws.run_id = rid
+        ws.path = Path(home) / "runs" / rid
+        ws.added = 5
+        ws.removed = 1
+        self.loaded[rid] = ws
+        return ws
+
+    def load(self, home, rid):  # noqa: ARG002
+        return self.loaded.get(rid)
+
+    def discard(self, ws):
+        self.discarded.append(ws.run_id)
+
+    def status(self, ws):
+        self.status_calls.append(ws.run_id)
+        return {"added": getattr(ws, "added", 0), "removed": getattr(ws, "removed", 0)}
+
+    def merge(self, ws, message=""):
+        self.merged.append((ws.run_id, message))
+
+
+def _race_home(tmp_path, *, git_ok: bool = True, monkeypatch=None) -> tuple[Path, _RaceWorkspaces]:
+    """Build a project + a thread agent + a function-level shim of
+    ``mini_ork.workspaces`` patched onto the real module.
+
+    ``git_ok=True`` makes ``workspaces.create`` succeed and remember the
+    run id; tests that want to verify a non-git refusal pass
+    ``git_ok=False``. ``monkeypatch`` is the pytest fixture; when
+    supplied the shim is installed via ``monkeypatch.setattr`` so the
+    autouse teardown restores the real ``create``/``load``/etc. without
+    leaking into the next test.
+    """
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    shim = _RaceWorkspaces(git_ok=git_ok)
+
+    # Seed a providers.yaml so ``known_lanes`` lists sonnet / glm / minimax
+    # and ``parse_race_arg`` falls through to ``DEFAULT_LANES`` rather than
+    # returning the "needs at least two lanes" error.
+    home = proj / ".mini-ork"
+    (home / "config").mkdir(parents=True)
+    (home / "config" / "providers.yaml").write_text(
+        "providers:\n"
+        "  sonnet: {kind: anthropic-native}\n"
+        "  glm: {kind: openai-compat}\n"
+        "  minimax: {kind: anthropic-native}\n"
+        "  codex: {kind: openai-chat}\n",
+        encoding="utf-8",
+    )
+
+    from mini_ork import workspaces as _real_ws
+    if monkeypatch is not None:
+        for attr in ("create", "load", "discard", "status", "merge"):
+            monkeypatch.setattr(_real_ws, attr, getattr(shim, attr))
+        monkeypatch.setattr(_real_ws, "Workspace", _RaceProbeWorkspace)
+        monkeypatch.setattr(_real_ws, "_is_git_repo", lambda _p: git_ok)
+    else:
+        # No fixture: caller is responsible for restoring. Used by the
+        # standalone /tmp/race_debug.py scripts.
+        import mini_ork.workspaces as _ws_mod
+        for attr in ("create", "load", "discard", "status", "merge"):
+            setattr(_ws_mod, attr, getattr(shim, attr))
+        _ws_mod.Workspace = _RaceProbeWorkspace
+        _ws_mod._is_git_repo = lambda _p: git_ok
+
+    return proj, shim
+
+
+def test_race_in_run_session_returns_refusal(tmp_path, monkeypatch):
+    """``/race`` is thread-only; a run-id session returns the kickoff's exact refusal."""
+    proj, _ = _race_home(tmp_path, monkeypatch=monkeypatch)
+    agent, thread = _thread_agent(proj)
+    conn = _CapturingConn()
+    agent.on_connect(conn)
+    # Mint a run session id directly so the prompt path treats it as a run, not a thread.
+    rid = "run-not-thread"
+    agent._sessions[rid] = str(proj)
+    agent._recipes[rid] = "code-fix"
+    resp = asyncio.run(agent.prompt(rid, [_text_block("/race fix the bug")]))
+    assert resp.stop_reason == "end_turn"
+    chunks = [u for u in conn.captured if isinstance(u, AgentMessageChunk)]
+    assert any("Races start in a mini-ork thread" in getattr(c.content, "text", "")
+               for c in chunks)
+
+
+def test_race_unknown_lane_renders_parser_error(tmp_path, monkeypatch):
+    """``/race bogus,sonnet x`` → race_parser error string rendered verbatim."""
+    proj, _ = _race_home(tmp_path, monkeypatch=monkeypatch)
+    agent, thread = _thread_agent(proj)
+    conn = _CapturingConn()
+    agent.on_connect(conn)
+    asyncio.run(agent.prompt(thread, [_text_block("/race bogus,sonnet fix x")]))
+    chunks = [u for u in conn.captured if isinstance(u, AgentMessageChunk)]
+    assert any("Unknown lane" in getattr(c.content, "text", "") for c in chunks)
+
+
+def test_race_non_git_project_returns_kickoff_refusal(tmp_path, monkeypatch):
+    """A non-git project triggers the race's probe branch with the kickoff's exact wording."""
+    proj, _ = _race_home(tmp_path, git_ok=False, monkeypatch=monkeypatch)
+    agent, thread = _thread_agent(proj)
+    conn = _CapturingConn()
+    agent.on_connect(conn)
+    resp = asyncio.run(agent.prompt(thread, [_text_block("/race fix x")]))
+    assert resp.stop_reason == "end_turn"
+    chunks = [u for u in conn.captured if isinstance(u, AgentMessageChunk)]
+    assert any("Racing needs a git project" in getattr(c.content, "text", "")
+               for c in chunks)
+
+
+def test_race_default_lanes_fan_out_three_markers_and_seeds(tmp_path, monkeypatch):
+    """``/race <task>`` (no explicit lanes) fans out to DEFAULT_LANES and:
+
+    * opens one ``ToolCallStart`` per lane with the ``race i/N · <lane>`` title;
+    * calls ``seed_run_config`` once per lane with the matching lane;
+    * leaves the worktrees intact when no candidate keeps it.
+    """
+    import mini_ork.acp.race as race_mod
+
+    proj, shim = _race_home(tmp_path, monkeypatch=monkeypatch)
+    monkeypatch.setenv("MINI_ORK_HOME", str(proj / ".mini-ork"))
+    monkeypatch.setenv("MINI_ORK_ROOT", str(tmp_path))
+    monkeypatch.delenv("MO_RACE_LANES", raising=False)
+
+    seeded: list[tuple[str, str]] = []  # (recipe, lane)
+    real_seed = race_mod.seed_run_config
+
+    def spy_seed(home, rid, recipe, lane):
+        seeded.append((recipe, lane))
+        return real_seed(home, rid, recipe, lane)
+
+    # Injected launcher — bypasses ``_launch`` so the per-run env overlay
+    # is not consulted (we cover that contract in the skip_review test).
+    def fake_launcher(rid, text):
+        return {"ok": True, "run_id": rid}
+
+    with patch.object(race_mod, "seed_run_config", spy_seed):
+        agent, thread = _thread_agent(proj, launcher=fake_launcher,
+                                      reader=lambda _r: {
+                                          "status": "published",
+                                          "events": [], "llm_calls": []})
+        conn = _CapturingConn()
+        agent.on_connect(conn)
+        asyncio.run(agent.prompt(thread, [_text_block("/race fix the bug")]))
+
+    # 1. Three race markers, in declared order. The race emits the initial
+    #    ``ToolCallStart`` (race i/N · <lane> — …) before the workspace
+    #    create, then re-emits the same ``tool_call_id`` with the worktree
+    #    suffix once the workspace is open. We dedup by id and use the
+    #    FIRST emission (the canonical title per the kickoff).
+    starts = [u for u in conn.captured if isinstance(u, ToolCallStart)]
+    by_id: dict[str, ToolCallStart] = {}
+    for s in starts:
+        by_id.setdefault(s.tool_call_id, s)
+    race_titles = [s.title for s in by_id.values() if s.title.startswith("race ")]
+    assert len(race_titles) == 3
+    assert "sonnet" in race_titles[0]
+    assert "glm" in race_titles[1]
+    assert "minimax" in race_titles[2]
+    assert "1/3" in race_titles[0] and "2/3" in race_titles[1] and "3/3" in race_titles[2]
+
+    # 2. seed_run_config called once per lane with the matching lane.
+    assert [lane for _recipe, lane in seeded] == ["sonnet", "glm", "minimax"]
+
+    # 3. One worktree per lane. With no connection to ask, the decision is
+    #    "later": nothing merged, nothing discarded.
+    assert len(shim.created) == 3
+    assert shim.merged == []
+    assert shim.discarded == []
+
+
+def test_race_run_env_overlay_is_set_before_launch(tmp_path, monkeypatch):
+    """``_run_env[rid]`` carries ``MO_ROUTING_POLICY=workflow_default`` so
+    ``_launch`` can pass it to the subprocess env.
+
+    The launcher is the only place that can observe the env overlay, so
+    capture it at launch time (race cleanup clears the entry once the
+    parent permission card resolves).
+    """
+    proj, _shim = _race_home(tmp_path, monkeypatch=monkeypatch)
+    monkeypatch.setenv("MINI_ORK_HOME", str(proj / ".mini-ork"))
+    monkeypatch.setenv("MINI_ORK_ROOT", str(tmp_path))
+    monkeypatch.delenv("MO_RACE_LANES", raising=False)
+
+    captured_env: list[dict | None] = []
+
+    def spy_launch(self, rid, text):
+        # Mirror ``_launch``'s body: merge ``_run_env`` overlay into the
+        # extra_env that would go to the subprocess.
+        cwd = self._sessions.get(rid)
+        extra_env: dict[str, str] = {}
+        if cwd:
+            extra_env["MO_TARGET_CWD"] = cwd
+        overlay = self._run_env.get(rid) or {}
+        if overlay:
+            extra_env.update(overlay)
+        captured_env.append(extra_env or None)
+        return {"ok": True, "run_id": rid}
+
+    monkeypatch.setattr(MiniOrkAcpAgent, "_launch", spy_launch)
+
+    agent, thread = _thread_agent(proj, reader=lambda _r: {
+        "status": "published", "events": [], "llm_calls": []})
+    asyncio.run(agent.prompt(thread, [_text_block("/race sonnet,glm fix x")]))
+
+    assert len(captured_env) == 2
+    for env in captured_env:
+        assert env is not None
+        assert env["MO_ROUTING_POLICY"] == "workflow_default"
+
+
+def test_race_runs_are_added_to_skip_review_during_launch(tmp_path, monkeypatch):
+    """Race runs land in ``_skip_review`` during the launch, so no per-run
+    S5 button fires; cleanup clears them at the end of the turn.
+
+    The kickoff pins this so the parent permission card owns the keep /
+    later / discard decision — the per-run "ready to review" message
+    would re-ask the same question.
+    """
+    import mini_ork.acp.race as race_mod
+
+    proj, _shim = _race_home(tmp_path, monkeypatch=monkeypatch)
+    monkeypatch.setenv("MINI_ORK_HOME", str(proj / ".mini-ork"))
+    monkeypatch.setenv("MINI_ORK_ROOT", str(tmp_path))
+    monkeypatch.delenv("MO_RACE_LANES", raising=False)
+    monkeypatch.setattr(race_mod, "seed_run_config",
+                        lambda *a, **k: Path("/dev/null"))
+
+    captured_during_launch: list[tuple[str, bool]] = []
+
+    def fake_launcher(rid, text):
+        # Mirror the agent instance via ``agent._skip_review`` — the
+        # closure captures ``agent`` below.
+        captured_during_launch.append((rid, rid in agent._skip_review))
+        return {"ok": True, "run_id": rid}
+
+    agent, thread = _thread_agent(
+        proj,
+        launcher=fake_launcher,
+        reader=lambda _r: {"status": "published", "events": [], "llm_calls": []},
+    )
+    asyncio.run(agent.prompt(thread, [_text_block("/race sonnet,glm fix x")]))
+
+    assert len(captured_during_launch) == 2
+    # Both runs were in _skip_review AT LAUNCH TIME; the per-run S5 path
+    # would skip the "ready to review" message for them.
+    assert all(present for _rid, present in captured_during_launch)
+
+
+# ── Zed S7a — race decisions on a real git project ───────────────────────────
+
+
+def _race_git_project(tmp_path, monkeypatch):
+    """A real temp git repo whose home lists sonnet / glm / minimax."""
+    import subprocess
+
+    proj = tmp_path / "proj"
+    proj.mkdir(parents=True)
+    for cmd in (["git", "init", "-b", "main"], ["git", "config", "user.name", "T"],
+                ["git", "config", "user.email", "t@example.com"]):
+        subprocess.run(cmd, cwd=proj, check=True, capture_output=True)
+    (proj / "README.md").write_text("hi\n", encoding="utf-8")
+    (proj / ".git" / "info" / "exclude").write_text(".mini-ork/\n", encoding="utf-8")
+    subprocess.run(["git", "add", "README.md"], cwd=proj, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=proj, check=True, capture_output=True)
+    home = proj / ".mini-ork"
+    (home / "config").mkdir(parents=True)
+    (home / "config" / "providers.yaml").write_text(
+        "providers:\n  sonnet: {kind: anthropic-native}\n  glm: {kind: openai-compat}\n"
+        "  minimax: {kind: anthropic-native}\n", encoding="utf-8")
+    (home / "config" / "agents.yaml").write_text("lanes:\n  worker: sonnet\n", encoding="utf-8")
+    monkeypatch.setenv("MINI_ORK_HOME", str(home))
+    monkeypatch.delenv("MO_RACE_LANES", raising=False)
+    return proj, home
+
+
+class _PickConn(_SidConn):
+    """Answers the race question with the first option whose id starts with
+    ``prefix`` (``None`` → dismissed); records every question."""
+
+    def __init__(self, prefix: str | None) -> None:
+        super().__init__()
+        self.prefix = prefix
+        self.asked: list[tuple[str, list[str], list[str]]] = []
+
+    async def request_permission(self, session_id, tool_call, options, **kw):
+        from acp.schema import AllowedOutcome, DeniedOutcome, RequestPermissionResponse
+
+        ids = [o.option_id for o in options]
+        self.asked.append((tool_call.tool_call_id, ids, [o.name for o in options]))
+        pick = next((i for i in ids if self.prefix and i.startswith(self.prefix)), None)
+        outcome = (DeniedOutcome(outcome="cancelled") if pick is None
+                   else AllowedOutcome(outcome="selected", option_id=pick))
+        return RequestPermissionResponse(outcome=outcome)
+
+
+def _race_agent(proj, *, outcomes: list[str], fail_launch: set[int] = frozenset()):
+    """A thread agent whose launcher writes ``change.txt`` (= the run id) into
+    each worktree and whose reader ends the i-th launched run with
+    ``outcomes[i]``. Launch ``i`` in ``fail_launch`` fails."""
+    state: dict[str, Any] = {"order": [], "agent": None}
+
+    def launcher(rid, _kickoff):
+        i = len(state["order"])
+        state["order"].append(rid)
+        if i in fail_launch:
+            return {"ok": False, "error": "lane key missing"}
+        wt = Path(state["agent"]._sessions[rid])
+        (wt / "change.txt").write_text(rid + "\n", encoding="utf-8")
+        return {"ok": True, "run_id": rid}
+
+    def reader(rid):
+        i = state["order"].index(rid)
+        return {"status": outcomes[i], "events": [], "llm_calls": []}
+
+    agent, thread = _thread_agent(proj, launcher=launcher, reader=reader)
+    state["agent"] = agent
+    return agent, thread, state
+
+
+def _race_messages(conn) -> str:
+    return "\n".join(
+        getattr(getattr(u, "content", None), "text", "") or ""
+        for _sid, u in conn.sent
+    )
+
+
+def test_race_keep_merges_one_change_and_discards_every_other_worktree(tmp_path, monkeypatch):
+    from mini_ork import workspaces as ws_mod
+
+    proj, home = _race_git_project(tmp_path, monkeypatch)
+    agent, thread, state = _race_agent(proj, outcomes=["published", "published", "failed"])
+    conn = _PickConn("keep:")
+    agent.on_connect(conn)
+    asyncio.run(agent.prompt(thread, [_text_block("/race add a changelog entry")]))
+    (tool_id, ids, names) = conn.asked[-1]
+    assert tool_id.startswith("race:")
+    assert [i for i in ids if i.startswith("keep:")] == [f"keep:{r}" for r in state["order"][:2]]
+    assert ids[-2:] == ["later", "discard_all"]
+    assert names[0].startswith("Keep sonnet (+1 −0")
+    # The first verified change is on main; every other worktree — the other
+    # verified one AND the failed one — is gone.
+    assert (proj / "change.txt").read_text() == state["order"][0] + "\n"
+    assert ws_mod.list_open(home) == []
+    text = _race_messages(conn)
+    assert "| ✓ | sonnet | verified |" in text and "| ✗ | minimax | failed |" in text
+    assert "Merged sonnet's change into main" in text and "Discarded the other 2." in text
+
+
+def test_race_later_keeps_all_and_discard_all_removes_them(tmp_path, monkeypatch):
+    from mini_ork import workspaces as ws_mod
+
+    proj, home = _race_git_project(tmp_path, monkeypatch)
+    agent, thread, _ = _race_agent(proj, outcomes=["published", "published", "failed"])
+    agent.on_connect(_PickConn("later"))
+    asyncio.run(agent.prompt(thread, [_text_block("/race add a changelog entry")]))
+    assert len(ws_mod.list_open(home)) == 3
+    assert not (proj / "change.txt").exists()
+
+    proj2, home2 = _race_git_project(tmp_path / "b", monkeypatch)
+    agent2, thread2, _ = _race_agent(proj2, outcomes=["published", "published", "failed"])
+    agent2.on_connect(_PickConn("discard_all"))
+    asyncio.run(agent2.prompt(thread2, [_text_block("/race add a changelog entry")]))
+    assert ws_mod.list_open(home2) == []
+
+
+def test_race_without_a_verified_change_asks_nothing_and_keeps_worktrees(tmp_path, monkeypatch):
+    from mini_ork import workspaces as ws_mod
+
+    proj, home = _race_git_project(tmp_path, monkeypatch)
+    agent, thread, _ = _race_agent(proj, outcomes=["failed", "failed", "failed"])
+    conn = _PickConn("keep:")
+    agent.on_connect(conn)
+    asyncio.run(agent.prompt(thread, [_text_block("/race add a changelog entry")]))
+    assert conn.asked == []
+    assert "No model produced a verified change" in _race_messages(conn)
+    assert len(ws_mod.list_open(home)) == 3
+
+
+def test_race_goes_on_when_one_lane_fails_to_launch(tmp_path, monkeypatch):
+    from mini_ork import workspaces as ws_mod
+
+    proj, home = _race_git_project(tmp_path, monkeypatch)
+    agent, thread, state = _race_agent(proj, outcomes=["published", "published", "published"],
+                                       fail_launch={1})
+    conn = _PickConn("later")
+    agent.on_connect(conn)
+    asyncio.run(agent.prompt(thread, [_text_block("/race add a changelog entry")]))
+    keep_ids = [i for i in conn.asked[-1][1] if i.startswith("keep:")]
+    assert keep_ids == [f"keep:{state['order'][0]}", f"keep:{state['order'][2]}"]
+    assert {w.run_id for w in ws_mod.list_open(home)} == {state["order"][0], state["order"][2]}
+    assert "launch failed: lane key missing" in _race_messages(conn)
+
+
+def test_cancelling_a_race_stops_every_contestant(tmp_path, monkeypatch):
+    proj, _home = _race_git_project(tmp_path, monkeypatch)
+    stopped: list[str] = []
+    state: dict[str, Any] = {"order": [], "agent": None}
+
+    def launcher(rid, _kickoff):
+        state["order"].append(rid)
+        return {"ok": True, "run_id": rid}
+
+    agent, thread = _thread_agent(
+        proj, launcher=launcher,
+        reader=lambda _rid: {"status": "executing", "events": [], "llm_calls": []},
+        stopper=lambda rid: stopped.append(rid) or {"ok": True},
+        killer=lambda rid: {"ok": True})
+    agent.on_connect(_PickConn(None))
+
+    async def scenario():
+        turn = asyncio.create_task(agent.prompt(thread, [_text_block("/race add an entry")]))
+        for _ in range(200):
+            await asyncio.sleep(0.01)
+            if len(state["order"]) == 3:
+                break
+        await agent.cancel(thread)
+        return await asyncio.wait_for(turn, timeout=5)
+
+    resp = asyncio.run(scenario())
+    assert resp.stop_reason == "cancelled"
+    assert sorted(stopped) == sorted(state["order"])

@@ -196,6 +196,11 @@ COMMANDS: list[AvailableCommand] = [
         None,
     ),
     _cmd(
+        "race",
+        "Race the selected recipe on 2-3 models, each in its own worktree; keep the best verified change.",
+        "[lane,lane] task — default sonnet,glm,minimax",
+    ),
+    _cmd(
         "automation",
         "Automation card, or run|pause|resume|delete <id>, scheduler on|off.",
         "<id> | run <id> | resume <id> | scheduler on|off",

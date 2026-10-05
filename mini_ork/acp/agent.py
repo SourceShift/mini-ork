@@ -86,6 +86,7 @@ from mini_ork.acp import diffs as _diffs
 from mini_ork.acp import history
 from mini_ork.acp import orchestration as _orchestration
 from mini_ork.acp import plan as _plan
+from mini_ork.acp import race as _race
 from mini_ork.acp import task_state as _task_state
 from mini_ork.acp.task_state import TaskState as _TaskState
 from mini_ork.acp.live import LiveTail, normalize
@@ -205,6 +206,12 @@ _WORKSPACE_VALUES = (_WORKSPACE_WORKTREE, _WORKSPACE_IN_PLACE)
 # regardless of the session's stored mode. The text after the prefix is
 # the kickoff body passed to the launcher.
 _SLASH_RUN_PREFIX = "/run "
+
+# ``/race <task>`` mirrors ``/run`` but fans out across lanes. The text
+# after the prefix is the same kickoff body; the race turn launches one
+# run per lane, each in its own git worktree, and decides which one to
+# keep via a follow-up permission prompt.
+_SLASH_RACE_PREFIX = "/race "
 
 
 def _extract_prompt_text(prompt: list[Any]) -> str:
@@ -497,6 +504,19 @@ class MiniOrkAcpAgent:
         # flag prevents the message from re-firing on every poll. A
         # successful merge / discard clears the entry (no second offer).
         self._ready_to_review_emitted: set[str] = set()
+        # Per-run env overlay merged into ``_launch``'s ``extra_env``.
+        # Zed S7a: the race turn seeds each run's entry so
+        # ``MO_ROUTING_POLICY=workflow_default`` survives the spawn.
+        # Cleared on merge / discard / completion so it doesn't leak.
+        self._run_env: dict[str, dict[str, str]] = {}
+        # Run ids whose review buttons the agent should NOT offer (Zed
+        # S7a race turns). The race's parent permission owns the keep /
+        # later / discard decision; per-run S5 buttons would re-ask the
+        # same question on a separate marker.
+        self._skip_review: set[str] = set()
+        # Zed S7a: thread id → the run ids of its race in progress, so
+        # cancelling the turn stops every contestant.
+        self._race_runs: dict[str, list[str]] = {}
         self._launch_count = 0
         # ACP client capabilities captured at ``initialize`` time (S0). The
         # client sends the SDK object in the initialize handshake; we keep
@@ -1323,6 +1343,9 @@ class MiniOrkAcpAgent:
         slash_text = self._strip_slash_run(text)
         if slash_text is not None:
             return await self._prompt_thread_direct(session_id, slash_text)
+        race_text = self._strip_slash_race(text)
+        if race_text is not None:
+            return await self._prompt_thread_race(session_id, race_text)
         cfg = self._thread_config.get(session_id) or {}
         mode = str(cfg.get("mode") or _MODE_ORCHESTRATE)
         if mode == _MODE_DIRECT:
@@ -1337,6 +1360,19 @@ class MiniOrkAcpAgent:
         if not text.startswith(_SLASH_RUN_PREFIX):
             return None
         return text[len(_SLASH_RUN_PREFIX):].strip()
+
+    @staticmethod
+    def _strip_slash_race(text: str) -> str | None:
+        """Return the kickoff text after ``/race ``, or ``None`` if not present.
+
+        Mirror of :meth:`_strip_slash_run` — the race turn is the direct-mode
+        fan-out, the run turn is the direct-mode singleton.
+        """
+        if not text:
+            return None
+        if not text.startswith(_SLASH_RACE_PREFIX):
+            return None
+        return text[len(_SLASH_RACE_PREFIX):].strip()
 
     async def _prompt_thread_direct(
         self, session_id: str, text: str, *, recipe: str | None = None
@@ -1410,6 +1446,545 @@ class MiniOrkAcpAgent:
         finally:
             self._direct_runs.pop(session_id, None)
         return PromptResponse(stop_reason="end_turn" if stop == "refusal" else stop)
+
+    async def _prompt_thread_race(
+        self, session_id: str, race_text: str
+    ) -> PromptResponse:
+        """``/race <task>`` turn: fan the thread's recipe across lanes.
+
+        Thread-only (mirrors ``/run``'s gate); a run session returns
+        ``"Races start in a mini-ork thread."``. Parses ``race_text`` via
+        ``mini_ork.acp.race.parse_race_arg``; an error string is rendered
+        verbatim and the turn ends. Otherwise: one workspace + one
+        seeded run snapshot per lane, the runs launch with
+        ``MO_ROUTING_POLICY=workflow_default`` so the race's lane pin
+        survives a learning-governed router, follow concurrently, render
+        the table, then ask the user to keep / later / discard.
+        """
+        if session_id not in self._thread_sessions:
+            await self._emit(
+                session_id,
+                self._build_refusal_message("Races start in a mini-ork thread."),
+            )
+            return PromptResponse(stop_reason="end_turn")
+        cfg = self._thread_config.get(session_id) or {}
+        recipe = str(cfg.get("recipe") or self._recipe)
+        home = self._home_for(session_id)
+        thread_cwd = self._sessions.get(session_id) or os.getcwd()
+        parsed = _race.parse_race_arg(race_text, home)
+        if isinstance(parsed, str):
+            await self._emit(session_id, self._build_refusal_message(parsed))
+            return PromptResponse(stop_reason="end_turn")
+        lanes, task = parsed
+        if not task:
+            await self._emit(
+                session_id,
+                self._build_refusal_message("What should they do? /race <task>"),
+            )
+            return PromptResponse(stop_reason="end_turn")
+        from mini_ork import workspaces as _workspaces
+
+        if not _workspaces._is_git_repo(Path(thread_cwd)):
+            await self._emit(
+                session_id,
+                self._build_refusal_message(
+                    "Racing needs a git project — each model works in its own worktree."
+                ),
+            )
+            return PromptResponse(stop_reason="end_turn")
+
+        n = len(lanes)
+        first_message = (
+            f"Racing {n} models on {recipe}: {', '.join(lanes)}. "
+            "Each works in its own worktree; you keep one change. "
+            f"It costs about {n}× one run."
+        )
+        await self._emit(
+            session_id,
+            AgentMessageChunk(
+                session_update="agent_message_chunk",
+                content=TextContentBlock(type="text", text=first_message),
+            ),
+        )
+
+        # Per-lane launch state — one tuple per lane in declared order.
+        # ``ws`` is None when the create/seeding step failed; ``run_id``
+        # is the minted id (we keep it so the follow loop knows what to
+        # drop from ``_skip_review`` / ``_run_env`` / ``_routes``).
+        specs: list[tuple[str, str, _workspaces.Workspace | None, dict[str, Any] | None]] = []
+        for i, lane in enumerate(lanes):
+            rid = mint_run_id()
+            title = f"race {i + 1}/{n} · {lane} — run {rid} ({recipe})"
+            # Emit the marker before workspace create so a race whose
+            # create raises still has a visible card to mark "failed".
+            await self._emit(
+                session_id,
+                ToolCallStart(
+                    session_update="tool_call",
+                    tool_call_id=f"{rid}:parent",
+                    title=title,
+                    status="in_progress",
+                    kind="other",
+                ),
+            )
+            ws: _workspaces.Workspace | None = None
+            try:
+                ws = _workspaces.create(Path(thread_cwd), home, rid)
+            except RuntimeError as exc:
+                await self._emit(
+                    session_id,
+                    ToolCallProgress(
+                        session_update="tool_call_update",
+                        tool_call_id=f"{rid}:parent",
+                        status="failed",
+                    ),
+                )
+                await self._emit(
+                    session_id,
+                    AgentMessageChunk(
+                        session_update="agent_message_chunk",
+                        content=TextContentBlock(type="text", text=f"worktree create failed: {exc}"),
+                    ),
+                )
+                specs.append((lane, rid, None, None))
+                continue
+            try:
+                overlay = _race.seed_run_config(home, rid, recipe, lane)
+            except Exception as exc:  # noqa: BLE001 — surface as a failed launch
+                await self._emit(
+                    session_id,
+                    ToolCallProgress(
+                        session_update="tool_call_update",
+                        tool_call_id=f"{rid}:parent",
+                        status="failed",
+                    ),
+                )
+                await self._emit(
+                    session_id,
+                    AgentMessageChunk(
+                        session_update="agent_message_chunk",
+                        content=TextContentBlock(type="text", text=f"seed_run_config failed: {exc}"),
+                    ),
+                )
+                if ws is not None:
+                    try:
+                        _workspaces.discard(ws)
+                    except Exception:
+                        pass
+                specs.append((lane, rid, None, None))
+                continue
+            self._sessions[rid] = str(ws.path)
+            self._recipes[rid] = recipe
+            self._skip_review.add(rid)
+            # Race's pin survives learning-governed routing: workflow_default
+            # does NOT remap unpinned nodes, so the seeded implementer lane
+            # is the one the run dispatches on.
+            self._run_env[rid] = {"MO_ROUTING_POLICY": "workflow_default",
+                                  "MINI_ORK_AGENTS": str(overlay)}
+            self._launch_count += 1
+            launcher = self._launcher or self._launch
+            try:
+                result = launcher(rid, task)
+            except Exception as exc:  # noqa: BLE001 — the seam itself blew up
+                result = {"ok": False, "error": str(exc)}
+            self._launches[rid] = result if isinstance(result, dict) else {}
+            if not isinstance(result, dict) or result.get("ok") is False:
+                err = (result.get("error") if isinstance(result, dict) else None) or "unknown error"
+                await self._emit(
+                    session_id,
+                    ToolCallProgress(
+                        session_update="tool_call_update",
+                        tool_call_id=f"{rid}:parent",
+                        status="failed",
+                    ),
+                )
+                await self._emit(
+                    session_id,
+                    AgentMessageChunk(
+                        session_update="agent_message_chunk",
+                        content=TextContentBlock(type="text", text=f"launch failed: {err}"),
+                    ),
+                )
+                if ws is not None:
+                    try:
+                        _workspaces.discard(ws)
+                    except Exception:
+                        pass
+                self._run_env.pop(rid, None)
+                self._skip_review.discard(rid)
+                specs.append((lane, rid, None, None))
+                continue
+            self._routes[rid] = (session_id, f"{rid}:")
+            self._thread_runs.setdefault(session_id, []).append(rid)
+            # Update the marker title with the branch suffix; the first
+            # emission lacked it because ``ws`` was created inside this
+            # loop. ``_open_run_marker``'s pattern is reused.
+            await self._emit(
+                session_id,
+                ToolCallStart(
+                    session_update="tool_call",
+                    tool_call_id=f"{rid}:parent",
+                    title=f"{title} · worktree {ws.branch}",
+                    status="in_progress",
+                    kind="other",
+                ),
+            )
+            specs.append((lane, rid, ws, result))
+
+        # Concurrent follow over the runs that actually launched.
+        launchable = [s for s in specs if s[2] is not None and s[3] is not None]
+        self._race_runs[session_id] = [s[1] for s in launchable]
+        try:
+            if launchable:
+                await asyncio.gather(
+                    *(self._await_terminal(s[1]) for s in launchable),
+                    return_exceptions=False,
+                )
+        finally:
+            self._race_runs.pop(session_id, None)
+        if session_id in self._cancelled:
+            # The user stopped the turn; cancel() already stopped every run.
+            self._race_cleanup(specs)
+            return PromptResponse(stop_reason="cancelled")
+
+        # Close markers per spec — completed / failed, no per-run S5
+        # buttons (handled via ``_skip_review`` already).
+        for lane, rid, ws, result in launchable:
+            ok = self._run_status.get(rid) == "published"
+            await self._emit(
+                session_id,
+                ToolCallProgress(
+                    session_update="tool_call_update",
+                    tool_call_id=f"{rid}:parent",
+                    status="completed" if ok else "failed",
+                ),
+            )
+
+        # Build rows for the table — cost / change / time per run.
+        rows = self._collect_race_rows(specs)
+        table_text = _race.render_race_table(rows)
+        await self._emit(
+            session_id,
+            AgentMessageChunk(
+                session_update="agent_message_chunk",
+                content=TextContentBlock(type="text", text=table_text),
+            ),
+        )
+
+        # Decision: candidates = published + worktree + change > 0.
+        candidates = self._race_candidates(specs)
+        if not candidates:
+            await self._emit(
+                session_id,
+                self._build_refusal_message(
+                    "No model produced a verified change. Their worktrees are kept for "
+                    "a look: /workspaces lists them, /discard <run> removes one."
+                ),
+            )
+            self._race_cleanup(specs)
+            return PromptResponse(stop_reason="end_turn")
+
+        # Surface the keep / later / discard_all permission card. The
+        # tool_call_id must NOT collide with any per-run ``<rid>:parent``
+        # marker; ``race:<first_rid>`` is unique per race.
+        first_rid = candidates[0][1]
+        options = [
+            PermissionOption(
+                option_id=f"keep:{rid}",
+                name=self._race_keep_label(lane, rid),
+                kind="allow_once",
+            )
+            for lane, rid, _ws in candidates
+        ]
+        options.append(
+            PermissionOption(option_id="later", name="Decide later", kind="reject_once")
+        )
+        options.append(
+            PermissionOption(option_id="discard_all", name="Discard all", kind="reject_always")
+        )
+        if self._conn is not None:
+            try:
+                response = await self._conn.request_permission(
+                    session_id=session_id,
+                    tool_call=ToolCallUpdate(
+                        tool_call_id=f"race:{first_rid}",
+                        kind="edit",
+                        title="Pick the change to keep",
+                        status="pending",
+                    ),
+                    options=options,
+                )
+                outcome = getattr(response, "outcome", None)
+                option_id = getattr(outcome, "option_id", None) if outcome is not None else None
+            except Exception:  # noqa: BLE001 — UI is best-effort
+                option_id = None
+        else:
+            option_id = None
+        await self._handle_race_decision(session_id, specs, candidates, option_id)
+        return PromptResponse(stop_reason="end_turn")
+
+    def _collect_race_rows(
+        self,
+        specs: list[tuple[str, str, Any, dict[str, Any] | None]],
+    ) -> list[dict[str, Any]]:
+        """One row per lane with the table fields populated.
+
+        Cost = ``llm_calls.cost_usd`` summed in the run's snapshot.
+        Time = first-event ``ts`` minus last-event ``ts`` (the
+        snapshot's events list carries ts). Change = ``workspaces.status``
+        (added/removed). Status = published/failed/rolled_back/``running``.
+        """
+        from mini_ork import workspaces as _workspaces
+
+        reader = self._reader or self._read_snapshot
+        out: list[dict[str, Any]] = []
+        for lane, rid, ws, _result in specs:
+            snap = reader(rid) if ws is not None else None
+            if ws is None:
+                out.append({
+                    "lane": lane,
+                    "run_id": rid,
+                    "status": "failed",
+                    "added": 0,
+                    "removed": 0,
+                    "cost_usd": 0.0,
+                    "seconds": 0,
+                })
+                continue
+            status = _race.result_word((snap or {}).get("status"))
+            cost = self._race_cost(rid)
+            events = (snap or {}).get("events") or []
+            seconds = 0
+            if events:
+                try:
+                    first_ts = int(events[0].get("ts") or events[0].get("created_at") or 0)
+                    last_ts = int(events[-1].get("ts") or events[-1].get("created_at") or 0)
+                    seconds = max(0, last_ts - first_ts)
+                except (TypeError, ValueError):
+                    seconds = 0
+            try:
+                ws_status = _workspaces.status(ws)
+                added = int(ws_status.get("added") or 0)
+                removed = int(ws_status.get("removed") or 0)
+            except Exception:
+                added, removed = 0, 0
+            out.append({
+                "lane": lane,
+                "run_id": rid,
+                "status": status,
+                "added": added,
+                "removed": removed,
+                "cost_usd": cost,
+                "seconds": seconds,
+            })
+        return out
+
+    def _race_candidates(
+        self, specs: list[tuple[str, str, Any, dict[str, Any] | None]]
+    ) -> list[tuple[str, str, Any]]:
+        """Runs whose task state is ready to review (published + changes).
+
+        Mirrors :func:`_offer_run_review`'s filter — the same condition
+        that would otherwise raise the per-run S5 buttons. The race's
+        parent permission owns the decision; no per-run buttons fire
+        (``_skip_review``).
+        """
+        from mini_ork import workspaces as _workspaces
+
+        candidates: list[tuple[str, str, Any]] = []
+        for lane, rid, ws, _result in specs:
+            if ws is None:
+                continue
+            if self._run_status.get(rid) != "published":
+                continue
+            run_dir = self._home_for(rid) / "runs" / rid
+            if not run_dir.is_dir():
+                continue
+            snap = (self._reader or self._read_snapshot)(rid) or {}
+            ts = _task_state.task_state(run_dir, snap)
+            if ts.state != "needs_you" or not ts.detail.startswith("Ready to review:"):
+                continue
+            try:
+                ws_status = _workspaces.status(ws)
+            except Exception:
+                ws_status = {}
+            if int(ws_status.get("added") or 0) + int(ws_status.get("removed") or 0) == 0:
+                continue
+            candidates.append((lane, rid, ws))
+        return candidates
+
+    def _race_keep_label(self, lane: str, rid: str) -> str:
+        """``Keep <lane> (+a −r, $cost)`` — the per-candidate button name.
+
+        Reads the workspace status to fill the +/- change gauge; the
+        cost gauge needs the task_runs row (the same source ``/status``
+        reads). Returns a sane default when either probe fails so the
+        permission card is never a blank string.
+        """
+        from mini_ork import workspaces as _workspaces
+
+        home = self._home_for(rid)
+        ws_obj = _workspaces.load(home, rid)
+        added = removed = 0
+        if ws_obj is not None:
+            try:
+                ws_status = _workspaces.status(ws_obj)
+                added = int(ws_status.get("added") or 0)
+                removed = int(ws_status.get("removed") or 0)
+            except Exception:
+                pass
+        cost = self._race_cost(rid)
+        change = f"+{added} −{removed}" if (added or removed) else "—"
+        cost_str = f"${cost:.2f}" if cost > 0 else "—"
+        return f"Keep {lane} ({change}, {cost_str})"
+
+    def _race_cost(self, run_id: str) -> float:
+        """The run's spend as ``/status`` computes it (sum of llm_calls)."""
+        try:
+            from mini_ork.web.deps import db_for
+            from mini_ork.web.repositories import RunDetailRepository
+
+            row = RunDetailRepository(db_for(self._home_for(run_id))).fetch_task_run_row(run_id)
+            if row is not None:
+                return float(row.get("cost_usd") or 0.0)
+        except Exception:
+            pass
+        try:
+            snap = (self._reader or self._read_snapshot)(run_id) or {}
+            return sum(float(c.get("cost_usd") or 0.0) for c in (snap.get("llm_calls") or []))
+        except Exception:
+            return 0.0
+
+    async def _handle_race_decision(
+        self,
+        session_id: str,
+        specs: list[tuple[str, str, Any, dict[str, Any] | None]],
+        candidates: list[tuple[str, str, Any]],
+        option_id: str | None,
+    ) -> None:
+        """Apply the user's pick: keep → merge + discard the rest; later /
+        discard_all → the kickoff's verbatim messages."""
+        from mini_ork import workspaces as _workspaces
+
+        if option_id and option_id.startswith("keep:"):
+            target_rid = option_id[len("keep:"):]
+            keep_lane = ""
+            keep_ws = None
+            for lane, rid, ws in candidates:
+                if rid == target_rid:
+                    keep_lane, keep_ws = lane, ws
+                    break
+            if keep_ws is None:
+                await self._emit(
+                    session_id,
+                    self._build_refusal_message(
+                        "Nothing was discarded."
+                    ),
+                )
+                self._race_cleanup(specs)
+                return
+            base = (
+                self._thread_titles.get(session_id)
+                or self._run_base_titles.get(target_rid)
+                or ""
+            )
+            title = f"{base} (mini-ork race, {keep_lane})" if base else f"mini-ork race, {keep_lane}"
+            try:
+                result = _workspaces.merge(keep_ws, message=title)
+            except Exception as exc:  # noqa: BLE001
+                await self._emit(
+                    session_id,
+                    self._build_refusal_message(
+                        f"Merge refused: {exc}. Nothing was discarded."
+                    ),
+                )
+                self._race_cleanup(specs)
+                return
+            if not result.get("ok"):
+                err = (result.get("error") if isinstance(result, dict) else None) or "unknown error"
+                await self._emit(
+                    session_id,
+                    self._build_refusal_message(
+                        f"Merge refused: {err}. Nothing was discarded."
+                    ),
+                )
+                self._race_cleanup(specs)
+                return
+            merged_sha = str(result.get("merged") or "")[:7]
+            mode = str(result.get("mode") or "merge")
+            wording = "fast-forward" if mode == "fast-forward" else "merge commit"
+            sha = merged_sha or "—"
+            others = [
+                (lane, rid, ws) for lane, rid, ws, _result in specs
+                if ws is not None and rid != target_rid
+            ]
+            for _lane, _rid, ws in others:
+                try:
+                    _workspaces.discard(ws)
+                except Exception:
+                    pass
+            await self._emit(
+                session_id,
+                self._build_refusal_message(
+                    f"Merged {keep_lane}'s change into {keep_ws.base_branch} "
+                    f"({wording} {sha}). Discarded the other {len(others)}."
+                ),
+            )
+            self._race_cleanup(specs)
+            return
+        if option_id == "later":
+            n = sum(1 for s in specs if s[2] is not None)
+            await self._emit(
+                session_id,
+                self._build_refusal_message(
+                    f"All {n} kept: /merge <run> keeps one, /discard <run> drops one."
+                ),
+            )
+            self._race_cleanup(specs)
+            return
+        if option_id == "discard_all":
+            for _lane, _rid, ws, _result in specs:
+                if ws is None:
+                    continue
+                try:
+                    _workspaces.discard(ws)
+                except Exception:
+                    pass
+            n = sum(1 for s in specs if s[2] is not None)
+            await self._emit(
+                session_id,
+                self._build_refusal_message(f"Discarded all {n}."),
+            )
+            self._race_cleanup(specs)
+            return
+        # Dismissed / unknown → behave like ``later``.
+        n = sum(1 for s in specs if s[2] is not None)
+        await self._emit(
+            session_id,
+            self._build_refusal_message(
+                f"All {n} kept: /merge <run> keeps one, /discard <run> drops one."
+            ),
+        )
+        self._race_cleanup(specs)
+        return
+
+    def _race_cleanup(
+        self, specs: list[tuple[str, str, Any, dict[str, Any] | None]]
+    ) -> None:
+        """Drop the per-run state the race injected (``_run_env``,
+        ``_skip_review``, ``_thread_runs`` entries for race-only runs)."""
+        keep = set()
+        for _lane, rid, ws, _result in specs:
+            if ws is None:
+                # Even failed launches had a row in _thread_runs? They
+                # don't — failed launches skip the _routes + _thread_runs
+                # append, so this is just a guard.
+                self._run_env.pop(rid, None)
+                self._skip_review.discard(rid)
+                continue
+            keep.add(rid)
+            self._run_env.pop(rid, None)
+            self._skip_review.discard(rid)
 
     async def _prompt_thread_orchestrate(
         self, session_id: str, text: str
@@ -2235,6 +2810,11 @@ class MiniOrkAcpAgent:
         """
         if run_id in self._ready_to_review_emitted:
             return True
+        # Zed S7a: race runs surface their decision on the parent
+        # permission card, not on a per-run S5 marker. Skipping here lets
+        # ``_follow_in_thread`` close the marker cleanly.
+        if run_id in self._skip_review:
+            return False
         run_dir = self._home_for(run_id) / "runs" / run_id
         if not run_dir.is_dir():
             return False
@@ -2507,6 +3087,11 @@ class MiniOrkAcpAgent:
             if direct:
                 # A direct run IS the turn: stop it like a run session.
                 await self.cancel(direct)
+            race_runs = self._race_runs.get(session_id) or []
+            if race_runs:
+                # A race's runs are the turn too: stop every contestant, at
+                # once (each waits out its own grace before a hard kill).
+                await asyncio.gather(*(self.cancel(r) for r in race_runs))
             for run_id, (thread_id, _prefix) in list(self._routes.items()):
                 if thread_id != session_id or run_id == direct:
                     continue
@@ -3339,6 +3924,25 @@ class MiniOrkAcpAgent:
         # command table advertises it but it is never dispatched here.
         if name == "run":
             return None
+        if name == "race":
+            # ``/race`` is handled by ``_prompt_thread_race`` further down
+            # the thread prompt path — but a non-thread session must be
+            # refused inline (mirrors the thread-only gate on ``_race``);
+            # returning None here would let the launcher see ``/race …``
+            # as a kickoff body. Fall through ONLY for thread sessions.
+            if session_id not in self._thread_sessions:
+                await self._emit(
+                    session_id,
+                    AgentMessageChunk(
+                        session_update="agent_message_chunk",
+                        content=TextContentBlock(
+                            type="text",
+                            text="Races start in a mini-ork thread.",
+                        ),
+                    ),
+                )
+                return PromptResponse(stop_reason="end_turn")
+            return None
         if session_id in self._thread_sessions:
             # Keep the command with its reply in the thread's log, so a
             # reopened thread replays both (the reply is recorded by _emit).
@@ -3712,18 +4316,30 @@ class MiniOrkAcpAgent:
         return self._resolve_home()
 
     def _launch(self, run_id: str, kickoff_text: str) -> dict[str, Any]:
-        """Detached launch via the existing seam; the run id is the session id."""
+        """Detached launch via the existing seam; the run id is the session id.
+
+        Zed S7a: ``self._run_env[run_id]`` is merged into ``extra_env`` so
+        per-run env (e.g. ``MO_ROUTING_POLICY=workflow_default`` on a race
+        run) reaches the child process via ``launch_run``'s subprocess env.
+        Anything stashed in ``_run_env`` survives for the run's whole life;
+        callers are responsible for clearing it when the run ends.
+        """
         from mini_ork.web.control import launch_run
 
         cwd = self._sessions.get(run_id)
         recipe = self._recipes.get(run_id) or self._recipe
-        extra_env = {"MO_TARGET_CWD": cwd} if cwd else None
+        extra_env: dict[str, str] = {}
+        if cwd:
+            extra_env["MO_TARGET_CWD"] = cwd
+        overlay = self._run_env.get(run_id) or {}
+        if overlay:
+            extra_env.update(overlay)
         return launch_run(
             self._home_for(run_id),
             recipe,
             kickoff_text,
             run_id=run_id,
-            extra_env=extra_env,
+            extra_env=extra_env or None,
         )
 
     def _read_snapshot(self, run_id: str) -> dict[str, Any]:

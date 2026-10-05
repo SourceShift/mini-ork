@@ -199,7 +199,7 @@ def test_help_lists_every_announced_command():
                  "recipes", "recipe",
                  "stop", "kill", "resume", "recover", "certify", "serve",
                  "workspaces", "merge", "discard",
-                 "automations", "automation"):
+                 "automations", "automation", "race"):
         assert f"`/{name}`" in out
 
 
