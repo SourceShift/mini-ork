@@ -121,6 +121,26 @@ def test_list_threads_title_rule_newest_first_limit(tmp_path):
     assert titles[no_user] == "mini-ork thread"
 
 
+def test_list_threads_latest_title_record_wins(tmp_path):
+    """The most recent ``title`` record's text is the thread's title (Zed S1).
+
+    A thread whose first-prompt title was ``"first prompt"`` and
+    which has since received a task-state title ``"✓ first prompt +1 −0"``
+    shows the latter in ``list_threads`` — the latest ``title`` record
+    wins, regardless of order with the user record. The first-prompt
+    title is still the fallback when no ``title`` record is present.
+    """
+    store = ThreadStore(tmp_path)
+    sid = "orch-1700000001-title"
+    store.append(sid, {"type": "meta", "thread_id": sid, "cwd": "/p"})
+    store.append(sid, {"type": "user", "text": "first prompt\nbody"})
+    store.append(sid, {"type": "title", "title": "● first prompt"})
+    store.append(sid, {"type": "title", "title": "✓ first prompt +1 −0"})
+    rows = store.list_threads(limit=10)
+    assert len(rows) == 1
+    assert rows[0]["title"] == "✓ first prompt +1 −0"
+
+
 def test_list_threads_updated_at_is_iso_utc_z(tmp_path):
     """``updated_at`` is the file mtime as ISO-8601 UTC with ``Z``."""
     store = ThreadStore(tmp_path)
@@ -161,3 +181,9 @@ def test_exists_true_false_for_known_unknown(tmp_path):
 def test_home_attribute_exposes_project_root(tmp_path):
     store = ThreadStore(tmp_path)
     assert store.home == tmp_path
+
+def test_title_drops_a_leading_run_command():
+    from mini_ork.acp.threads import title_from_text
+
+    assert title_from_text("/run Fix the login loop") == "Fix the login loop"
+    assert title_from_text("Fix the login loop") == "Fix the login loop"

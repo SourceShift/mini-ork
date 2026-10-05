@@ -36,6 +36,7 @@ from acp.schema import (  # noqa: E402
     AgentMessageChunk,
     AgentPlanUpdate,
     FileEditToolCallContent,
+    SessionInfoUpdate,
     TextContentBlock,
     ToolCallProgress,
     ToolCallStart,
@@ -607,7 +608,8 @@ def test_list_sessions_resolves_project_home_and_maps_rows(tmp_path):
     info = resp.sessions[0]
     assert info.session_id == "run-1"
     assert info.cwd == str(proj.resolve())
-    assert info.title == "A past run"
+    # Zed S1: published run rows carry the done-mark prefix.
+    assert info.title == "✓ A past run"
     assert info.updated_at is not None
     assert info.field_meta == {"status": "published", "recipe": "code-fix", "cost_usd": 0.5}
     assert resp.next_cursor is None
@@ -2171,8 +2173,14 @@ def test_load_session_replays_and_resumes_with_stored_id(tmp_path):
         assert "UserMessageChunk" in types
         assert "ToolCallStart" in types
         assert "UsageUpdate" in types
-        # No SessionInfoUpdate (loaded thread marks first prompt).
-        assert "SessionInfoUpdate" not in types
+        # Zed S1: a load replays the task-state title as a single
+        # ``SessionInfoUpdate`` (the thread's latest persisted title).
+        # The first-prompt title push is suppressed by
+        # ``_first_prompt_sent``; the task-state path emits exactly
+        # once per load (the title records already carry every prior
+        # state, so the projection dedups further cycles).
+        siu = [u for _, u in conn3.sent if isinstance(u, SessionInfoUpdate)]
+        assert len(siu) == 1
 
         # The next prompt passes the stored claude session id as ``resume``.
         def turn_after(lane, prompt, cwd, home, resume, on_event):
@@ -3446,3 +3454,317 @@ def test_thread_new_session_passes_and_caches_the_setup_check(tmp_path, monkeypa
         second = asyncio.run(agent.new_session(cwd=str(proj)))
     assert first.session_id.startswith("orch-") and second.session_id.startswith("orch-")
     assert len(calls) == 1
+
+
+# ── task-state title push (Zed S1) ──────────────────────────────────────────
+
+
+def _stage_diff_cache(home: Path, run_id: str, diffs: list[dict]) -> None:
+    """Stage ``<home>/runs/<run_id>/acp-diffs.json`` so ``cached_or_computed`` hits the cache.
+
+    Mirrors ``mini_ork.acp.task_state._diff_counts``'s read path —
+    the cache is a JSON list of ``{path, old_text, new_text}`` triples.
+    """
+    import json as _json
+    run_dir = home / "runs" / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "acp-diffs.json").write_text(_json.dumps(diffs), encoding="utf-8")
+
+
+def test_thread_run_executing_then_published_emits_two_titles_once_each(tmp_path):
+    """A child run that flips executing → published emits ``● base`` then
+    ``✓ base +a −b`` (each exactly once) and records both as ``title`` rows.
+
+    The run dir hosts an empty diff cache so the ``+1 −1`` count comes
+    from the cache (the test only verifies the rule fires; the diff
+    count itself is covered by ``test_acp_task_state``).
+    """
+    from acp.schema import SessionInfoUpdate
+
+    from mini_ork.acp import task_state as _ts
+
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    (proj / ".mini-ork").mkdir()
+    child = "run-child-ts"
+    home = proj / ".mini-ork"
+
+    def reader(rid: str) -> dict:
+        assert rid == child
+        return {
+            "status": "executing",
+            "events": [
+                {
+                    "event_type": "node_start",
+                    "payload_json": json.dumps({"node_id": "implementer"}),
+                }
+            ],
+            "llm_calls": [],
+        }
+
+    agent, thread = _thread_agent(proj, reader=reader)
+    agent._routes[child] = (thread, f"{child}:")
+    agent._thread_runs[thread] = [child]
+    # Bind the child to the project cwd so ``_home_for`` resolves to
+    # the staged run dir (where the diff cache lives).
+    agent._sessions[child] = str(proj)
+    # Seed the thread's base title (normally set on first prompt).
+    agent._thread_titles[thread] = "Fix login"
+    # Stage a 1-line diff cache so the published title shows +1 −0.
+    _stage_diff_cache(
+        home,
+        child,
+        [{"path": "f.py", "old_text": "a\n", "new_text": "a\nb\n"}],
+    )
+
+    conn = _SidConn()
+    agent.on_connect(conn)
+
+    async def _drive() -> None:
+        # 1st projection: executing → "● Fix login"
+        snap_exec = await asyncio.to_thread(reader, child)
+        await agent._project_snapshot(child, snap_exec)
+        # 2nd projection: published → "✓ Fix login +1 −0"
+        def _published(_: str) -> dict:
+            return {
+                "status": "published",
+                "events": [
+                    {
+                        "event_type": "node_start",
+                        "payload_json": json.dumps({"node_id": "implementer"}),
+                    },
+                    {
+                        "event_type": "node_end",
+                        "payload_json": json.dumps(
+                            {"node_id": "implementer", "finish_reason": "done"}
+                        ),
+                    },
+                ],
+                "llm_calls": [],
+            }
+        snap_done = await asyncio.to_thread(_published, child)
+        await agent._project_snapshot(child, snap_done)
+
+    asyncio.run(_drive())
+
+    titles = [
+        u.title for _, u in conn.sent if isinstance(u, SessionInfoUpdate)
+    ]
+    # Two distinct titles, in order, no duplicates.
+    assert titles == [
+        f"{_ts.MARKS['working']} Fix login",
+        f"{_ts.MARKS['done']} Fix login +1 −0",
+    ]
+    # The title was persisted as a record on the thread JSONL.
+    recs = _read_thread_records(proj, thread)
+    title_records = [r for r in recs if r.get("type") == "title"]
+    assert [r["title"] for r in title_records] == titles
+
+
+def test_thread_newer_run_drives_title_and_older_does_not(tmp_path):
+    """An older routed run that is no longer the thread's latest does NOT
+    overwrite the latest's title; the latest's projection still drives it.
+    """
+    from acp.schema import SessionInfoUpdate
+
+    from mini_ork.acp import task_state as _ts
+
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    (proj / ".mini-ork").mkdir()
+    older = "run-older"
+    newer = "run-newer"
+    home = proj / ".mini-ork"
+    _stage_diff_cache(home, older, [])
+    _stage_diff_cache(
+        home,
+        newer,
+        [{"path": "f.py", "old_text": "a\n", "new_text": "a\nb\n"}],
+    )
+
+    agent, thread = _thread_agent(proj, reader=lambda _: {"status": None, "events": [], "llm_calls": []})
+    agent._thread_titles[thread] = "Fix login"
+    agent._thread_runs[thread] = [older, newer]
+    agent._routes[older] = (thread, f"{older}:")
+    agent._routes[newer] = (thread, f"{newer}:")
+    # Bind both children to the project cwd so ``_home_for`` resolves
+    # to the staged run dirs.
+    agent._sessions[older] = str(proj)
+    agent._sessions[newer] = str(proj)
+
+    conn = _SidConn()
+    agent.on_connect(conn)
+
+    async def _drive() -> None:
+        # Project the NEWER first (as the live cycle would).
+        def _newer_snap(_: str) -> dict:
+            return {
+                "status": "published",
+                "events": [
+                    {
+                        "event_type": "node_start",
+                        "payload_json": json.dumps({"node_id": "implementer"}),
+                    },
+                    {
+                        "event_type": "node_end",
+                        "payload_json": json.dumps(
+                            {"node_id": "implementer", "finish_reason": "done"}
+                        ),
+                    },
+                ],
+                "llm_calls": [],
+            }
+        await agent._project_snapshot(newer, _newer_snap(newer))
+        # Now project the OLDER — its state would otherwise be working,
+        # but the latest-run gate suppresses the title emit.
+        def _older_snap(_: str) -> dict:
+            return {
+                "status": "executing",
+                "events": [
+                    {
+                        "event_type": "node_start",
+                        "payload_json": json.dumps({"node_id": "planner"}),
+                    }
+                ],
+                "llm_calls": [],
+            }
+        await agent._project_snapshot(older, _older_snap(older))
+
+    asyncio.run(_drive())
+    titles = [
+        u.title for _, u in conn.sent if isinstance(u, SessionInfoUpdate)
+    ]
+    # Only the newer run drove a title; the older run is gated out.
+    assert titles == [f"{_ts.MARKS['done']} Fix login +1 −0"]
+
+
+def test_thread_run_cost_paused_emits_needs_you_explanation_once(tmp_path):
+    """A ``.cost-pause`` sentinel emits ``✋ <base>`` plus ONE agent
+    message with the detail. A second projection of the same state is
+    a no-op (the dedup key holds).
+    """
+    from acp.schema import AgentMessageChunk, SessionInfoUpdate
+
+    from mini_ork.acp import task_state as _ts
+    from mini_ork.acp.task_state import COST_PAUSE_DETAIL
+
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    (proj / ".mini-ork").mkdir()
+    child = "run-paused"
+    home = proj / ".mini-ork"
+    (home / "runs" / child).mkdir(parents=True)
+    (home / "runs" / child / ".cost-pause").write_text("", encoding="utf-8")
+
+    agent, thread = _thread_agent(proj, reader=lambda _: {"status": None, "events": [], "llm_calls": []})
+    agent._thread_titles[thread] = "Fix login"
+    agent._thread_runs[thread] = [child]
+    agent._routes[child] = (thread, f"{child}:")
+    # Bind the child to the project cwd so ``_home_for`` resolves to
+    # the staged run dir (where the ``.cost-pause`` sentinel lives).
+    agent._sessions[child] = str(proj)
+
+    conn = _SidConn()
+    agent.on_connect(conn)
+
+    def _snap(_: str) -> dict:
+        return {
+            "status": "executing",
+            "events": [
+                {
+                    "event_type": "node_start",
+                    "payload_json": json.dumps({"node_id": "implementer"}),
+                }
+            ],
+            "llm_calls": [],
+        }
+
+    async def _drive() -> None:
+        await agent._project_snapshot(child, _snap(child))
+        # Second projection of the same state: dedup means no extra emits.
+        await agent._project_snapshot(child, _snap(child))
+
+    asyncio.run(_drive())
+    title_emits = [
+        u.title for _, u in conn.sent if isinstance(u, SessionInfoUpdate)
+    ]
+    detail_emits = [
+        blk.text
+        for _, u in conn.sent
+        if isinstance(u, AgentMessageChunk)
+        for blk in (u.content,)
+        if isinstance(blk, TextContentBlock) and blk.text == COST_PAUSE_DETAIL
+    ]
+    assert title_emits == [f"{_ts.MARKS['needs_you']} Fix login"]
+    # One detail message total (the 2nd projection is deduped).
+    assert len(detail_emits) == 1
+
+
+def test_list_sessions_marks_run_rows_with_run_mark(tmp_path):
+    """Run rows in ``list_sessions`` carry the ``run_mark`` prefix.
+
+    A published run gets the done mark; a thread row carries the
+    latest ``title`` record's text (when present) so a load replays
+    the same string the live session last sent.
+    """
+    from mini_ork.acp.threads import ThreadStore
+
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    (proj / ".mini-ork").mkdir()
+
+    # Thread row with a ``title`` record (Zed S1: latest wins).
+    ThreadStore(proj / ".mini-ork").append(
+        "orch-1700000050-list",
+        {"type": "meta", "thread_id": "orch-1700000050-list", "cwd": str(proj)},
+    )
+    ThreadStore(proj / ".mini-ork").append(
+        "orch-1700000050-list",
+        {"type": "user", "text": "thread title"},
+    )
+    ThreadStore(proj / ".mini-ork").append(
+        "orch-1700000050-list",
+        {"type": "title", "title": "✓ thread title +3 −1"},
+    )
+
+    # Run row — published, with a diff cache that adds 3, removes 1.
+    from mini_ork.stores import migrate as mig
+    db_path = proj / ".mini-ork" / "state.db"
+    mig.init_db(str(db_path))
+    con = sqlite3.connect(db_path)
+    con.execute(
+        "INSERT INTO task_runs(id, task_class, recipe, status, kickoff_path, "
+        "cost_usd, created_at, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            "run-list-2",
+            "code_fix",
+            "code-fix",
+            "published",
+            str(proj / ".mini-ork" / "runs-inbox" / "run-list-2.md"),
+            0.0,
+            1_700_000_200,
+            1_700_000_210,
+        ),
+    )
+    con.commit()
+    con.close()
+    _stage_diff_cache(
+        proj / ".mini-ork",
+        "run-list-2",
+        [
+            {"path": "a.py", "old_text": "x\ny\nz\nw\n", "new_text": "x\ny\nZ\nw\nN\nM\n"},
+        ],
+    )
+
+    agent = MiniOrkAcpAgent()
+    resp = asyncio.run(agent.list_sessions(cwd=str(proj)))
+    by_id = {s.session_id: s for s in resp.sessions}
+    # Thread row carries the latest ``title`` record, not the first prompt.
+    assert by_id["orch-1700000050-list"].title == "✓ thread title +3 −1"
+    # Run row is prefixed with the done mark (published → ✓).
+    assert by_id["run-list-2"].title.startswith("✓ ")
+    assert "run-list-2" in by_id["run-list-2"].title or "code-fix" in by_id["run-list-2"].title
+    # The run row's title is NOT just the bare kickoff line — the mark
+    # glyph must be present.
+    assert "✓" in by_id["run-list-2"].title

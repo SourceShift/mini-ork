@@ -83,6 +83,8 @@ def title_from_text(text: str) -> str:
         stripped = line.strip()
         if stripped:
             out = stripped.lstrip("#").strip()
+            if out.startswith("/run "):  # "/run fix x" names the task "fix x"
+                out = out[len("/run "):].strip()
             if out:
                 return out[:_TITLE_CAP]
     return _DEFAULT_TITLE
@@ -104,6 +106,10 @@ class ThreadStore:
     * ``claude_session`` — ``{"id"}``; the orchestrator's resume id changes.
     * ``costs`` — ``{"costs": {key: usd}}``; the thread's cost map whenever
       its usage is sent (i.e. mirror of ``self._thread_costs``).
+    * ``title`` — ``{"title": "<text>"}``; the latest task-state title
+      emitted by the agent (Zed S1). ``list_threads`` shows the most
+      recent such record; threads with none fall back to the first
+      user prompt's text.
     """
 
     def __init__(self, home: Path | str) -> None:
@@ -236,13 +242,20 @@ class ThreadStore:
         return rows[: max(0, int(limit))]
 
     def _meta_and_title(self, thread_id: str) -> tuple[dict[str, Any], str]:
-        """The ``meta`` record and the title, in one pass that stops early.
+        """The ``meta`` record and the title, in a single scan of the file.
 
-        Both sit at the top of the file (meta first, the first prompt soon
-        after); a long thread is never read to the end just to be listed.
+        The title is the last ``title`` record (Zed S1: the live
+        task-state title the agent persisted) when present; otherwise
+        it falls back to the first user prompt's text — the original
+        behaviour. Both ``meta`` and the first-prompt text are usually
+        near the top, but a ``title`` record is written later, so the
+        scan can no longer early-exit on the first prompt. A single
+        pass over the lines keeps memory bounded to the running
+        accumulators (three strings + one dict).
         """
         meta: dict[str, Any] = {}
-        title: str | None = None
+        first_user: str | None = None
+        last_title: str | None = None
         try:
             with open(self._path_for(thread_id), "r", encoding="utf-8", errors="replace") as fh:
                 for line in fh:
@@ -252,17 +265,20 @@ class ThreadStore:
                         continue
                     if not isinstance(rec, dict):
                         continue
-                    if rec.get("type") == "meta" and not meta:
+                    rtype = rec.get("type")
+                    if rtype == "meta" and not meta:
                         meta = rec
-                    elif rec.get("type") == "user" and title is None:
+                    elif rtype == "user" and first_user is None:
                         text = rec.get("text")
                         if isinstance(text, str):
-                            title = title_from_text(text)
-                    if meta and title is not None:
-                        break
+                            first_user = title_from_text(text)
+                    elif rtype == "title":
+                        text = rec.get("title")
+                        if isinstance(text, str) and text:
+                            last_title = text
         except (OSError, ValueError):
             pass
-        return meta, title or _DEFAULT_TITLE
+        return meta, last_title or first_user or _DEFAULT_TITLE
 
 
 __all__ = ["ThreadStore", "title_from_text"]

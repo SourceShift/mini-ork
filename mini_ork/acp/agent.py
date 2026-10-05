@@ -82,6 +82,7 @@ from mini_ork.acp import diffs as _diffs
 from mini_ork.acp import history
 from mini_ork.acp import orchestration as _orchestration
 from mini_ork.acp import plan as _plan
+from mini_ork.acp import task_state as _task_state
 from mini_ork.acp.live import LiveTail, normalize
 from mini_ork.acp.threads import ThreadStore, title_from_text
 from mini_ork.web.control import _is_safe_token
@@ -364,6 +365,26 @@ class MiniOrkAcpAgent:
         # session id → node_id → LiveTail (Z3 live projection). Constructed
         # lazily on first node_start; held until session end.
         self._tails: dict[str, dict[str, LiveTail]] = {}
+        # destination session id → last task_state title sent (Zed S1).
+        # Keyed on the post-``_emit`` destination so a thread sees one
+        # title per child-run state change. Mirrors ``_plan_emitted``'s
+        # dedup shape. Reset by ``load_session`` and
+        # ``_replay_run_in_thread`` so a 2nd load fires again.
+        self._last_title_sent: dict[str, str] = {}
+        # destination session id → last ``needs_you`` detail sent. A run
+        # may toggle working → needs_you → working → needs_you across
+        # /resume calls, so dedup is per-state-epoch (not forever): the
+        # entry is cleared whenever the state flips OUT of needs_you.
+        self._last_needs_you_sent: dict[str, str] = {}
+        # thread session id → its base (first-prompt) title (Zed S1).
+        # The task-state title push prefixes the mark; the base is the
+        # kickoff-derived or first-prompt text. Set when the first
+        # ``SessionInfoUpdate`` lands; restored on thread load from the
+        # last ``title`` record (when present) or the first user prompt.
+        self._thread_titles: dict[str, str] = {}
+        # run session id → its base title (from the kickoff). Used by
+        # ``list_sessions`` to render the run row's prefixed title.
+        self._run_base_titles: dict[str, str] = {}
         self._launch_count = 0
         # ACP client capabilities captured at ``initialize`` time (S0). The
         # client sends the SDK object in the initialize handshake; we keep
@@ -921,11 +942,15 @@ class MiniOrkAcpAgent:
         if offset < 0:
             offset = 0
         rows, next_offset = history.list_runs(home, limit=50, offset=offset)
+        run_dir_root = home / "runs"
         sessions = [
             SessionInfo(
                 session_id=row["run_id"],
                 cwd=str(home.resolve().parent),
-                title=row.get("title"),
+                title=(
+                    f"{_task_state.run_mark(row.get('status'), run_dir_root / row['run_id'])} "
+                    f"{row.get('title') or ''}"
+                ),
                 updated_at=row.get("updated_at"),
                 field_meta={
                     "status": row.get("status"),
@@ -987,12 +1012,22 @@ class MiniOrkAcpAgent:
         # standalone-pop keeps a finished run's final plan visible on
         # replay (kickoff §"agent.py").
         self._plan_emitted.pop(session_id, None)
+        # Zed S1: the title-state dedup lives on the destination (the run
+        # id for a standalone load); clear it so a 2nd load re-emits the
+        # mark.
+        self._last_title_sent.pop(session_id, None)
+        self._last_needs_you_sent.pop(session_id, None)
         home = self._home_for(session_id)
         snapshot = history.read_snapshot(home, session_id)
         if snapshot.get("status") is None:
             raise RequestError.invalid_params({"message": f"no mini-ork run {session_id}"})
         self._loaded.add(session_id)
         kickoff = history.kickoff_text(home, session_id)
+        # Zed S1: cache the run's base title (kickoff-derived) so the
+        # task-state projection can prefix the mark. A loaded run has
+        # no client prompt text of its own — the kickoff IS the title.
+        if kickoff:
+            self._run_base_titles[session_id] = title_from_text(kickoff)
         if kickoff:
             await self._emit(
                 session_id,
@@ -1068,7 +1103,11 @@ class MiniOrkAcpAgent:
             return await self._prompt_thread(session_id, prompt)
         self._launch_count += 1
         launcher = self._launcher or self._launch
-        result = launcher(session_id, _extract_prompt_text(prompt))
+        prompt_text = _extract_prompt_text(prompt)
+        # Zed S1: cache the run's base title (first-prompt derived) so
+        # the task-state projection can prefix the mark on every cycle.
+        self._run_base_titles[session_id] = title_from_text(prompt_text)
+        result = launcher(session_id, prompt_text)
         # Stash whatever the launcher returned so _await_terminal can detect a
         # dead launcher (pid reaped) and tail its log on refusal. Injected
         # launchers in tests may omit pid / log_path; treat as "unknown".
@@ -1105,6 +1144,7 @@ class MiniOrkAcpAgent:
         if session_id not in self._first_prompt_sent:
             self._first_prompt_sent.add(session_id)
             title = title_from_text(text)
+            self._thread_titles[session_id] = title
             await self._emit(
                 session_id,
                 SessionInfoUpdate(
@@ -1956,6 +1996,11 @@ class MiniOrkAcpAgent:
         # ``AgentPlanUpdate`` per destination per content change; an older
         # routed run does not overwrite the thread's latest plan.
         await self._emit_plan_update(session_id, snapshot)
+        # Zed S1: render the run's task state as a thread-list title
+        # (working / needs_you / done / failed). Deduped per destination
+        # and gated on the latest-run rule so a thread with two children
+        # only shows the latest's mark.
+        await self._emit_title_state_update(session_id, snapshot)
         if not live:
             # A replay (load) shows the run's recorded diff — see
             # _emit_diff_update_for_loaded_run; recomputing here would diff
@@ -2030,6 +2075,91 @@ class MiniOrkAcpAgent:
                 entries=[PlanEntry(**e) for e in entries],
             ),
         )
+
+    async def _emit_title_state_update(
+        self, session_id: str, snapshot: dict[str, Any]
+    ) -> None:
+        """Project the run's task state into a ``SessionInfoUpdate`` title (Zed S1).
+
+        Three gates before an emit fires:
+
+        1. Not currently replaying — ``_load_thread_session`` re-projects
+           every record and would record a title per state change if not
+           guarded.
+        2. The run is either standalone (a non-routed run session gets
+           the title on its own session) or the thread's **latest** run
+           (an older routed run must NOT overwrite the latest's title).
+        3. The new title differs from the last one sent for the
+           destination, so a 2nd poll that lands the same state is a
+           no-op emit.
+
+        A ``needs_you`` transition also emits ONE agent message with
+        the detail (cost-pause explanation, blocked question), and
+        records a ``{"type": "title", ...}`` record so a later
+        ``load_session`` replays the same title.
+        """
+        if session_id in self._replaying:
+            return
+        run_dir = self._home_for(session_id) / "runs" / session_id
+        route = self._routes.get(session_id)
+        if route is not None:
+            thread_id = route[0]
+            # A thread-load replay sets ``_replaying[thread_id]``; suppress
+            # the title emit so a re-opened thread does not re-emit a title
+            # on every snapshot it walks (the persisted title records are
+            # already the source of truth, surfaced via ``list_threads``).
+            if thread_id in self._replaying:
+                return
+            latest = self._thread_runs.get(thread_id)
+            if latest and latest[-1] != session_id:
+                return
+            dest = thread_id
+        else:
+            dest = session_id
+        # The base title for a thread is its first-prompt title (set
+        # when ``_prompt_thread`` first emits); for a run session, the
+        # kickoff-derived title from ``list_runs`` (set lazily here).
+        if dest.startswith("orch-"):
+            base = self._thread_titles.get(dest) or "mini-ork thread"
+        else:
+            base = self._run_base_titles.get(dest) or dest  # no kickoff title: the run id
+        ts = _task_state.task_state(run_dir, snapshot)
+        new_title = _task_state.title_with_state(base, ts)
+        if self._last_title_sent.get(dest) == new_title:
+            return
+        self._last_title_sent[dest] = new_title
+        await self._emit(
+            session_id,
+            SessionInfoUpdate(
+                session_update="session_info_update",
+                title=new_title,
+            ),
+        )
+        # Persist the title record directly: ``_record_thread_update``
+        # skips ``SessionInfoUpdate`` (line 2214).
+        if dest.startswith("orch-"):
+            self._record(
+                dest,
+                {"type": "title", "title": new_title},
+            )
+        # ``needs_you`` detail fires once per (destination, detail) —
+        # a state flip back to working clears the entry so a later
+        # flip into needs_you emits again.
+        if ts.state == "needs_you":
+            if self._last_needs_you_sent.get(dest) != ts.detail:
+                self._last_needs_you_sent[dest] = ts.detail
+                await self._emit(
+                    session_id,
+                    AgentMessageChunk(
+                        session_update="agent_message_chunk",
+                        content=TextContentBlock(
+                            type="text",
+                            text=ts.detail,
+                        ),
+                    ),
+                )
+        else:
+            self._last_needs_you_sent.pop(dest, None)
 
     async def _await_terminal(self, session_id: str) -> StopReason:
         reader = self._reader or self._read_snapshot
@@ -2284,6 +2414,30 @@ class MiniOrkAcpAgent:
                     str(k): float(v) for k, v in rec["costs"].items()
                 }
         self._usage_sent.pop(session_id, None)
+        # Zed S1: restore the thread's base title from the first user
+        # prompt's text (the live ``_prompt_thread`` does the same when
+        # it first emits). The ``title`` records are the source of
+        # truth for ``list_threads`` but are NOT the base — they
+        # already include the live state mark (``● base``, ``✓ base``)
+        # and prepending another mark would double-prefix.
+        first_user_text: str | None = None
+        last_title_text: str | None = None
+        for rec in records:
+            rtype = rec.get("type")
+            if rtype == "user" and isinstance(rec.get("text"), str) and first_user_text is None:
+                first_user_text = rec["text"]
+            elif rtype == "title" and isinstance(rec.get("title"), str):
+                last_title_text = rec["title"]
+        if first_user_text:
+            self._thread_titles[session_id] = title_from_text(first_user_text)
+        # Seed the title-state dedup with the last persisted title so
+        # a re-projection that lands the same state is a no-op emit.
+        if last_title_text is not None:
+            self._last_title_sent[session_id] = last_title_text
+        # Reset the needs-you dedup so a fresh state transition fires
+        # its message (the persisted title record is the title, not
+        # the agent-message detail).
+        self._last_needs_you_sent.pop(session_id, None)
         running: list[str] = []
         self._replaying.add(session_id)
         try:
@@ -2355,6 +2509,10 @@ class MiniOrkAcpAgent:
         # replay because the canonical tuple still matches what an earlier
         # projection pass already emitted.
         self._plan_emitted.pop(thread_id, None)
+        # Zed S1: the title-state dedup lives on the destination (the
+        # thread) so a 2nd thread load re-emits the title.
+        self._last_title_sent.pop(thread_id, None)
+        self._last_needs_you_sent.pop(thread_id, None)
         snapshot = (self._reader or self._read_snapshot)(run_id) or {
             "status": None,
             "events": [],
