@@ -1255,3 +1255,41 @@ def monkeypatch_scheduler(monkeypatch: pytest.MonkeyPatch, home: Path, *, instal
         "last_tick": last_tick,
     }
     monkeypatch.setattr(_auto, "scheduler_status", lambda _h: payload)
+
+
+# ── /automation new (Zed S6b-2) ─────────────────────────────────────────────
+
+
+def test_automation_new_in_thread_returns_rewrite_sentinel_with_bridge():
+    """``/automation new [what]`` in a thread session returns the
+    :class:`_RewriteToOrchestrate` sentinel with the scheduling-intent
+    text and the automation bridge line."""
+    agent = _agent(Path.cwd())
+    agent._thread_sessions.add("run-1-abc")
+    try:
+        out = asyncio.run(cmds.handle_automation_new(
+            agent, "run-1-abc", "nightly changelog"))
+        assert isinstance(out, cmds._RewriteToOrchestrate)
+        assert "nightly changelog" in out.intent_text
+        assert "Follow your scheduling steps" in out.intent_text
+        assert out.bridge is not None
+        assert "When it has a proposal" in out.bridge
+        assert "buttons to create it" in out.bridge
+        # The bare ``/automation new`` (no arg) still asks.
+        out_empty = asyncio.run(cmds.handle_automation_new(
+            agent, "run-1-abc", ""))
+        assert isinstance(out_empty, cmds._RewriteToOrchestrate)
+        assert "Ask what should run and when" in out_empty.intent_text
+    finally:
+        agent._thread_sessions.discard("run-1-abc")
+
+
+def test_automation_new_in_run_session_returns_string():
+    """``/automation new`` in a run session (NOT a thread) returns a plain
+    string the dispatcher emits directly."""
+    agent = _agent(Path.cwd())
+    out = asyncio.run(cmds.handle_automation_new(
+        agent, "run-1-abc", "anything"))
+    assert isinstance(out, str)
+    assert "Automations are set up in a mini-ork thread" in out
+    assert "start one from New Thread" in out

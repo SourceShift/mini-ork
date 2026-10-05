@@ -72,10 +72,18 @@ class _RewriteToOrchestrate:
     turn). This is how ``/recipe new`` and ``/recipe edit`` steer a
     thread-session turn toward the recipe-authoring prompt section without
     launching a run.
+
+    ``bridge`` is the one-line message the dispatcher renders in the
+    thread before the orchestrator turn runs. Recipe flows leave it
+    ``None`` and fall back to the canonical "draft you'll see as diffs"
+    text; ``/automation new`` sets it to a separate bridge so the user
+    knows the buttons under a proposal will be Create automation rather
+    than Create recipe.
     """
 
     intent_text: str
     recipe_id: str | None = None
+    bridge: str | None = None
 
 
 # ── announcement table ─────────────────────────────────────────────────────────
@@ -191,6 +199,11 @@ COMMANDS: list[AvailableCommand] = [
         "automation",
         "Automation card, or run|pause|resume|delete <id>, scheduler on|off.",
         "<id> | run <id> | resume <id> | scheduler on|off",
+    ),
+    _cmd(
+        "automation new",
+        "Schedule a recipe: describe what should run and when.",
+        "describe what should run and when",
     ),
 ]
 
@@ -757,6 +770,40 @@ async def handle_recipe_new(agent: Any, session_id: str, arg: str) -> _RewriteTo
     return _RewriteToOrchestrate(intent_text=intent, recipe_id=None)
 
 
+async def handle_automation_new(
+    agent: Any, session_id: str, arg: str
+) -> _RewriteToOrchestrate | str:
+    """``/automation new [what]`` — schedule a recipe on a cadence.
+
+    In a run session: return the plain string the dispatcher emits
+    directly (the run-session carve-out — automations are set up in a
+    mini-ork thread, not from a run).
+    In a thread session: rewrite to orchestrator with the
+    scheduling-intent text; the orchestrator interviews (recipe, when,
+    per-run task) and calls ``propose_automation``. The agent shows the
+    resulting proposal as a card with Create / Change / Discard buttons;
+    ``create`` may then offer to install the OS scheduler.
+    """
+    if session_id not in getattr(agent, "_thread_sessions", set()):
+        return (
+            "Automations are set up in a mini-ork thread — start one "
+            "from New Thread."
+        )
+    what = arg.strip() or "Ask what should run and when."
+    intent = (
+        f"The user wants to run a recipe on a schedule. {what} "
+        "Follow your scheduling steps."
+    )
+    return _RewriteToOrchestrate(
+        intent_text=intent,
+        recipe_id=None,
+        bridge=(
+            "Handing this to the orchestrator. When it has a proposal "
+            "you'll see it here with the buttons to create it."
+        ),
+    )
+
+
 async def handle_recipe_edit(agent: Any, session_id: str, arg: str) -> str | _RewriteToOrchestrate:
     """Thread-side: rewrite to orchestrator to edit an existing recipe.
 
@@ -1191,6 +1238,7 @@ HANDLERS: dict[str, Handler] = {
     "discard": handle_discard,
     "automations": handle_automations,
     "automation": handle_automation,
+    "automation new": handle_automation_new,
     "automation run": handle_automation_run,
     "automation pause": handle_automation_pause,
     "automation resume": handle_automation_resume,
@@ -1230,6 +1278,7 @@ __all__ = [
     "handle",
     "handle_recipe_new",
     "handle_recipe_edit",
+    "handle_automation_new",
     "_spawn",
     "_run",
     "_probe",

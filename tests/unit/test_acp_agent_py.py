@@ -35,6 +35,7 @@ if str(REPO) not in sys.path:
 from acp.schema import (  # noqa: E402
     AgentMessageChunk,
     AgentPlanUpdate,
+    ContentToolCallContent,
     FileEditToolCallContent,
     ResourceContentBlock,
     SessionInfoUpdate,
@@ -4641,3 +4642,364 @@ def test_child_run_ending_after_turn_emits_one_time_message_only(
     assert conn.calls == []
     # The workspace is still open (the message did not mutate it).
     assert ws_mod.load(home_dir, child_run_id) is not None
+
+
+# ── S6b-2: automation proposal card + scheduler offer ────────────────────────
+
+
+_PROPOSAL_SPEC = {
+    "id": "nightly-changelog",
+    "name": "Nightly changelog",
+    "recipe": "docs",
+    "kickoff_markdown": (
+        "# Nightly changelog entry\n\n"
+        "## Files in scope\n\n"
+        "- CHANGELOG.md\n"
+    ),
+    "schedule": "0 9 * * 1-5",
+    "workspace": "worktree",
+}
+
+
+def _proposing_turn(home, seen_prompts, *, spec=None, ok=True, error="nope"):
+    """A fake orchestrator turn: optionally calls the real ``propose``
+    (as the MCP server would) and streams its tool_use + tool_result."""
+    from mini_ork import automations as _auto
+
+    payload = dict(spec or _PROPOSAL_SPEC)
+
+    def turn(lane, prompt, cwd, home_arg, resume, on_event):
+        async def _run():
+            seen_prompts.append(prompt)
+            if ok:
+                result = _auto.propose(
+                    home,
+                    id=payload["id"],
+                    name=payload["name"],
+                    recipe=payload["recipe"],
+                    kickoff=payload["kickoff_markdown"],
+                    schedule=payload["schedule"],
+                    workspace=payload.get("workspace", "worktree"),
+                )
+                tool_payload = json.dumps(result)
+            else:
+                tool_payload = json.dumps({"ok": False, "error": error})
+            tool_input = {
+                "id": payload["id"],
+                "name": payload["name"],
+                "recipe": payload["recipe"],
+                "schedule": payload["schedule"],
+                "kickoff_markdown": payload["kickoff_markdown"],
+                "workspace": payload.get("workspace", "worktree"),
+            }
+            await on_event({"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": "toolu_p1",
+                 "name": "mcp__mini-ork__propose_automation",
+                 "input": tool_input}]}})
+            await on_event({"type": "user", "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "toolu_p1",
+                 "content": [{"type": "text", "text": tool_payload}]}]}})
+            return _Turn()
+        return _run()
+    return lambda lane, prompt, cwd, home, resume, on_event: turn(
+        lane, prompt, cwd, home, resume, on_event)
+
+
+def test_a_proposal_renders_as_a_card_with_name_recipe_when_next_and_kickoff(tmp_path, monkeypatch):
+    """Card body has the name, recipe, ``when``, cron, workspace, three next
+    fires, and the first 40 lines of the kickoff in a fenced markdown block."""
+    proj, home = _authoring_project(tmp_path, monkeypatch)
+    prompts: list[str] = []
+    agent, thread = _thread_agent(proj, orchestrator_turn=_proposing_turn(home, prompts))
+    conn = _PermConn([])  # no decision — just observe the card
+    agent.on_connect(conn)
+    asyncio.run(agent.prompt(thread, [_text_block("/automation new nightly changelog")]))
+    # ``map_event`` surfaces the raw tool_result text first; our card
+    # emits a SECOND ``ToolCallProgress`` whose content is a
+    # ``ContentToolCallContent`` list. Look for the card body across all
+    # updates on the proposal's tool_call id.
+    cards = [
+        u for _, u in conn.sent
+        if isinstance(u, ToolCallProgress)
+        and u.tool_call_id == "toolu_p1"
+        and u.content
+        and any(isinstance(c, ContentToolCallContent) for c in u.content)
+    ]
+    assert cards, "no proposal card body emitted"
+    text_parts: list[str] = []
+    for u in cards:
+        for c in u.content:
+            if isinstance(c, ContentToolCallContent):
+                body = getattr(c, "content", None)
+                if body is not None and isinstance(getattr(body, "text", None), str):
+                    text_parts.append(body.text)
+    text = "\n".join(text_parts)
+    assert "Nightly changelog" in text
+    assert "`docs`" in text
+    assert "0 9 * * 1-5" in text  # the cron
+    assert "in a new worktree" in text
+    assert "Next:" in text
+    # The kickoff is fenced and includes the section header.
+    assert "```markdown" in text
+    assert "Nightly changelog entry" in text
+    assert "## Files in scope" in text
+    # The orchestrator received the rewritten scheduling intent.
+    assert prompts and "on a schedule" in prompts[0]
+    assert "nightly changelog" in prompts[0]
+
+
+def test_proposal_create_writes_automation_and_offers_scheduler_when_off(tmp_path, monkeypatch):
+    """``create`` writes ``automations.json``, says ``Scheduled``, and offers
+    the scheduler when it is off."""
+    from mini_ork import automations as _auto
+
+    proj, home = _authoring_project(tmp_path, monkeypatch)
+    prompts: list[str] = []
+    agent, thread = _thread_agent(proj, orchestrator_turn=_proposing_turn(home, prompts))
+    conn = _PermConn(["create", "on"])
+    monkeypatch.setattr(_auto, "scheduler_status",
+                        lambda _h: {"installed": False, "platform": "macos",
+                                    "command": "/bin/echo", "log_path": "/tmp/log"})
+    monkeypatch.setattr(_auto, "install_scheduler",
+                        lambda _h: {"ok": True, "platform": "macos"})
+    agent.on_connect(conn)
+    asyncio.run(agent.prompt(thread, [_text_block("schedule it")]))
+    # First dialog: Create / Change / Discard on the proposal's tool_call id.
+    assert conn.asked[0][0] == "toolu_p1"
+    assert conn.asked[0][1] == ["Create automation", "Change something", "Discard"]
+    # Second dialog: on / later, on its OWN tool_call id (the scheduler id,
+    # NOT the proposal id) — reuse would overwrite the in-flight approval.
+    assert conn.asked[1][0].startswith("automation-scheduler:")
+    assert conn.asked[1][0] != "toolu_p1"
+    assert conn.asked[1][1] == ["Turn on the scheduler", "Not now"]
+    # The store now has the automation; the proposal file is gone.
+    items = _auto.load(home)
+    assert any(a.get("id") == "nightly-changelog" for a in items)
+    assert not _auto._proposal_path(home, "nightly-changelog").exists()
+    # The "Scheduled …" line was emitted.
+    texts = [getattr(u.content, "text", "") for _, u in conn.sent
+             if isinstance(u, AgentMessageChunk) and isinstance(u.content, TextContentBlock)]
+    assert any("Scheduled Nightly changelog" in t for t in texts)
+    assert any("Next run" in t for t in texts)
+
+
+def test_proposal_create_then_scheduler_on_calls_install(tmp_path, monkeypatch):
+    """``on`` → ``install_scheduler`` is invoked and the ``Scheduler on`` line
+    is emitted."""
+    from mini_ork import automations as _auto
+
+    proj, home = _authoring_project(tmp_path, monkeypatch)
+    prompts: list[str] = []
+    agent, thread = _thread_agent(proj, orchestrator_turn=_proposing_turn(home, prompts))
+    conn = _PermConn(["create", "on"])
+    called: dict[str, Any] = {}
+    monkeypatch.setattr(_auto, "scheduler_status", lambda _h: {"installed": False})
+    def fake_install(_h):
+        called["n"] = called.get("n", 0) + 1
+        return {"ok": True, "platform": "macos"}
+    monkeypatch.setattr(_auto, "install_scheduler", fake_install)
+    agent.on_connect(conn)
+    asyncio.run(agent.prompt(thread, [_text_block("schedule it")]))
+    assert called.get("n") == 1
+    texts = [getattr(u.content, "text", "") for _, u in conn.sent
+             if isinstance(u, AgentMessageChunk) and isinstance(u.content, TextContentBlock)]
+    assert any("Scheduler on" in t for t in texts)
+
+
+def test_proposal_create_then_scheduler_later_message(tmp_path, monkeypatch):
+    """``later`` → ``Saved, but it will not fire until the scheduler is on: …``;
+    ``install_scheduler`` is NOT called."""
+    from mini_ork import automations as _auto
+
+    proj, home = _authoring_project(tmp_path, monkeypatch)
+    prompts: list[str] = []
+    agent, thread = _thread_agent(proj, orchestrator_turn=_proposing_turn(home, prompts))
+    conn = _PermConn(["create", "later"])
+    called: dict[str, Any] = {}
+    monkeypatch.setattr(_auto, "scheduler_status", lambda _h: {"installed": False})
+    def fake_install(_h):
+        called["n"] = called.get("n", 0) + 1
+        return {"ok": True}
+    monkeypatch.setattr(_auto, "install_scheduler", fake_install)
+    agent.on_connect(conn)
+    asyncio.run(agent.prompt(thread, [_text_block("schedule it")]))
+    assert called.get("n", 0) == 0
+    texts = [getattr(u.content, "text", "") for _, u in conn.sent
+             if isinstance(u, AgentMessageChunk) and isinstance(u.content, TextContentBlock)]
+    assert any("will not fire" in t for t in texts)
+    assert any("/automation scheduler on" in t for t in texts)
+
+
+def test_proposal_create_skips_scheduler_when_already_on(tmp_path, monkeypatch):
+    """Scheduler already installed → only one ``request_permission`` (create)."""
+    from mini_ork import automations as _auto
+
+    proj, home = _authoring_project(tmp_path, monkeypatch)
+    prompts: list[str] = []
+    agent, thread = _thread_agent(proj, orchestrator_turn=_proposing_turn(home, prompts))
+    conn = _PermConn(["create"])  # only one answer is needed
+    monkeypatch.setattr(_auto, "scheduler_status", lambda _h: {"installed": True})
+    agent.on_connect(conn)
+    asyncio.run(agent.prompt(thread, [_text_block("schedule it")]))
+    assert len(conn.asked) == 1
+    assert conn.asked[0][0] == "toolu_p1"
+
+
+def test_proposal_change_keeps_it(tmp_path, monkeypatch):
+    """``change`` → ``Tell me what to change.`` + proposal file still present."""
+    from mini_ork import automations as _auto
+
+    proj, home = _authoring_project(tmp_path, monkeypatch)
+    prompts: list[str] = []
+    agent, thread = _thread_agent(proj, orchestrator_turn=_proposing_turn(home, prompts))
+    conn = _PermConn(["change"])
+    agent.on_connect(conn)
+    asyncio.run(agent.prompt(thread, [_text_block("schedule it")]))
+    assert _auto._proposal_path(home, "nightly-changelog").is_file()
+    texts = [getattr(u.content, "text", "") for _, u in conn.sent
+             if isinstance(u, AgentMessageChunk) and isinstance(u.content, TextContentBlock)]
+    assert any("Tell me what to change" in t for t in texts)
+
+
+def test_proposal_discard_deletes_it(tmp_path, monkeypatch):
+    """``discard`` → ``Proposal discarded.`` + proposal file is gone."""
+    from mini_ork import automations as _auto
+
+    proj, home = _authoring_project(tmp_path, monkeypatch)
+    prompts: list[str] = []
+    agent, thread = _thread_agent(proj, orchestrator_turn=_proposing_turn(home, prompts))
+    conn = _PermConn(["discard"])
+    agent.on_connect(conn)
+    asyncio.run(agent.prompt(thread, [_text_block("schedule it")]))
+    assert not _auto._proposal_path(home, "nightly-changelog").exists()
+    texts = [getattr(u.content, "text", "") for _, u in conn.sent
+             if isinstance(u, AgentMessageChunk) and isinstance(u.content, TextContentBlock)]
+    assert any("Proposal discarded" in t for t in texts)
+
+
+def test_dismissing_the_proposal_dialog_keeps_it(tmp_path, monkeypatch):
+    """Dismissed → ``Proposal kept — ask me to create it when you're ready.``;
+    proposal file still present."""
+    from mini_ork import automations as _auto
+
+    proj, home = _authoring_project(tmp_path, monkeypatch)
+    prompts: list[str] = []
+    agent, thread = _thread_agent(proj, orchestrator_turn=_proposing_turn(home, prompts))
+    conn = _PermConn([None])  # dismissed
+    agent.on_connect(conn)
+    asyncio.run(agent.prompt(thread, [_text_block("schedule it")]))
+    assert _auto._proposal_path(home, "nightly-changelog").is_file()
+    texts = [getattr(u.content, "text", "") for _, u in conn.sent
+             if isinstance(u, AgentMessageChunk) and isinstance(u.content, TextContentBlock)]
+    assert any("Proposal kept" in t for t in texts)
+
+
+def test_proposal_ok_false_offers_no_questions(tmp_path, monkeypatch):
+    """``ok=false`` → ``turn_proposal`` stays empty → no approval dialog."""
+    proj, home = _authoring_project(tmp_path, monkeypatch)
+    prompts: list[str] = []
+    agent, thread = _thread_agent(proj, orchestrator_turn=_proposing_turn(home, prompts, ok=False))
+    conn = _PermConn([])
+    agent.on_connect(conn)
+    asyncio.run(agent.prompt(thread, [_text_block("schedule it")]))
+    assert conn.asked == []
+
+
+def test_proposal_for_existing_id_says_update_automation(tmp_path, monkeypatch):
+    """When the proposal id already exists, the verb is ``Update`` (not Create)."""
+    from mini_ork import automations as _auto
+
+    proj, home = _authoring_project(tmp_path, monkeypatch)
+    _auto.add(home, id="nightly-changelog", name="Existing",
+              recipe="docs", kickoff="# k", schedule="0 9 * * 1-5")
+    prompts: list[str] = []
+    agent, thread = _thread_agent(proj, orchestrator_turn=_proposing_turn(home, prompts))
+    conn = _PermConn([])
+    agent.on_connect(conn)
+    asyncio.run(agent.prompt(thread, [_text_block("schedule it")]))
+    assert conn.asked[0][0] == "toolu_p1"
+    assert conn.asked[0][1] == ["Update automation", "Change something", "Discard"]
+
+
+def test_recipe_draft_is_offered_before_the_proposal_in_the_same_turn(tmp_path, monkeypatch):
+    """Both ``draft_recipe`` and ``propose_automation`` fire in one turn → the
+    recipe draft is offered first (the automation may run it), then the
+    proposal; both can be created in the same turn."""
+    from mini_ork import automations as _auto
+    from mini_ork import recipe_author
+
+    proj, home = _authoring_project(tmp_path, monkeypatch)
+    # Commit a project recipe so ``propose`` can target it.
+    recipe_author.draft(home, _AUDIT_SPEC)
+    recipe_author.commit_draft(home, "migration-audit")
+    seen_prompts: list[str] = []
+
+    def combined_turn(lane, prompt, cwd, home_arg, resume, on_event):
+        async def _run():
+            seen_prompts.append(prompt)
+            draft_result = recipe_author.draft(home, _AUDIT_SPEC)
+            await on_event({"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": "toolu_d1",
+                 "name": "mcp__mini-ork__draft_recipe",
+                 "input": {"spec": _AUDIT_SPEC}}]}})
+            await on_event({"type": "user", "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "toolu_d1",
+                 "content": [{"type": "text", "text": json.dumps(draft_result)}]}]}})
+            proposal_result = _auto.propose(
+                home, id="nightly-changelog", name="Nightly",
+                recipe="docs", kickoff="# k", schedule="0 9 * * 1-5",
+            )
+            await on_event({"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": "toolu_p1",
+                 "name": "mcp__mini-ork__propose_automation",
+                 "input": {"id": "nightly-changelog", "name": "Nightly",
+                           "recipe": "docs", "schedule": "0 9 * * 1-5",
+                           "kickoff_markdown": "# k",
+                           "workspace": "worktree"}}]}})
+            await on_event({"type": "user", "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "toolu_p1",
+                 "content": [{"type": "text", "text": json.dumps(proposal_result)}]}]}})
+            return _Turn()
+        return _run()
+    turn_fn = lambda lane, prompt, cwd, home, resume, on_event: combined_turn(
+        lane, prompt, cwd, home, resume, on_event)
+    monkeypatch.setattr(_auto, "scheduler_status", lambda _h: {"installed": True})
+    agent, thread = _thread_agent(proj, orchestrator_turn=turn_fn)
+    # draft: create → "test it?": later → proposal: create (scheduler already on)
+    conn = _PermConn(["create", "later", "create"])
+    agent.on_connect(conn)
+    asyncio.run(agent.prompt(thread, [_text_block("draft and schedule")]))
+    asked_ids = [tid for tid, _ in conn.asked]
+    assert asked_ids[0] == "toolu_d1"
+    assert ("Create recipe" in conn.asked[0][1] or "Update recipe" in conn.asked[0][1])
+    assert asked_ids[-1] == "toolu_p1"  # after the recipe's questions
+    assert "automation-scheduler:" not in str(asked_ids)
+    assert [a["id"] for a in _auto.load(home)] == ["nightly-changelog"]
+    assert not _auto._proposal_path(home, "nightly-changelog").is_file()
+
+
+def test_automation_new_reaches_the_orchestrator_with_the_bridge(tmp_path, monkeypatch):
+    """``/automation new nightly changelog`` rewrites to the orchestrator
+    with the scheduling intent AND the dispatcher emits the automation
+    bridge line."""
+    proj, home = _authoring_project(tmp_path, monkeypatch)
+    prompts: list[str] = []
+
+    def recorder(lane, prompt, cwd, home_arg, resume, on_event):
+        async def _run():
+            prompts.append(prompt)
+            return _Turn()
+        return _run()
+    turn_fn = lambda lane, prompt, cwd, home, resume, on_event: recorder(
+        lane, prompt, cwd, home, resume, on_event)
+    agent, thread = _thread_agent(proj, orchestrator_turn=turn_fn)
+    conn = _PermConn([])
+    agent.on_connect(conn)
+    asyncio.run(agent.prompt(thread, [_text_block("/automation new nightly changelog")]))
+    assert prompts and "on a schedule" in prompts[0]
+    assert "nightly changelog" in prompts[0]
+    # The automation bridge line is the agent_message_chunk emitted BEFORE
+    # the orchestrator runs.
+    chunks = [u for _, u in conn.sent if isinstance(u, AgentMessageChunk)]
+    assert any("When it has a proposal" in getattr(c.content, "text", "") for c in chunks)
+    assert any("buttons to create it" in getattr(c.content, "text", "") for c in chunks)

@@ -30,6 +30,7 @@ the launcher / reader / stopper / killer seams still apply.
 from __future__ import annotations
 
 import asyncio
+import datetime as _dt
 import json
 import os
 import secrets
@@ -250,6 +251,55 @@ def _draft_result(event: dict[str, Any], draft_calls: set[str]) -> dict[str, Any
             return {"draft_id": str(data["draft_id"]), "tool_call_id": tool_call_id,
                     "exists": bool(data.get("exists")), "grade": data.get("grade") or {},
                     "warnings": data.get("warnings") or []}
+    return None
+
+
+def _proposal_result(event: dict[str, Any], propose_calls: set[str]) -> dict[str, Any] | None:
+    """A successful ``propose_automation`` tool result in ``event`` (a stream-json
+    user message answering one of ``propose_calls``), as ``{proposal_id,
+    tool_call_id, exists, name, recipe, schedule, when, kickoff, next_fires,
+    workspace}``; ``None`` otherwise.
+
+    Mirrors :func:`_draft_result` so a hermetic test can swap the live MCP
+    call for a fake orchestrator turn that emits the same JSON shape (see
+    the kickoff's "real ``automations.propose`` in a temp home" guidance).
+    The shape mirrors :func:`mini_ork.automations.propose`'s success
+    payload (``ok, proposal, exists, when, next_fires``). The proposal
+    payload itself carries ``name, recipe, kickoff, schedule, workspace``.
+    """
+    if event.get("type") != "user" or not propose_calls:
+        return None
+    for block in (event.get("message") or {}).get("content") or []:
+        if not (isinstance(block, dict) and block.get("type") == "tool_result"):
+            continue
+        tool_call_id = str(block.get("tool_use_id") or "")
+        if tool_call_id not in propose_calls:
+            continue
+        raw = block.get("content")
+        if isinstance(raw, list):
+            raw = "".join(c.get("text", "") for c in raw if isinstance(c, dict))
+        try:
+            data = json.loads(raw) if isinstance(raw, str) else None
+        except json.JSONDecodeError:
+            data = None
+        if not (isinstance(data, dict) and data.get("ok")):
+            return None
+        proposal = data.get("proposal") if isinstance(data.get("proposal"), dict) else {}
+        proposal_id = str(proposal.get("id") or "")
+        if not proposal_id:
+            return None
+        return {
+            "proposal_id": proposal_id,
+            "tool_call_id": tool_call_id,
+            "exists": bool(data.get("exists")),
+            "name": str(proposal.get("name") or proposal_id),
+            "recipe": str(proposal.get("recipe") or ""),
+            "schedule": str(proposal.get("schedule") or ""),
+            "when": str(data.get("when") or ""),
+            "kickoff": str(proposal.get("kickoff") or ""),
+            "next_fires": list(data.get("next_fires") or []),
+            "workspace": str(proposal.get("workspace") or "worktree"),
+        }
     return None
 
 
@@ -1391,6 +1441,12 @@ class MiniOrkAcpAgent:
         # (approval buttons are offered only for a draft that exists).
         draft_calls: set[str] = set()
         turn_draft: dict[str, Any] = {}
+        # Zed S6b-2: this turn's propose_automation calls, and the last
+        # successful proposal. Mirror of ``draft_calls`` / ``turn_draft`` for
+        # the scheduling flow; the approval buttons fire only when a
+        # proposal exists (same shape as recipe drafts).
+        propose_calls: set[str] = set()
+        turn_proposal: dict[str, Any] = {}
 
         async def on_event(event: dict[str, Any]) -> None:
             for update in _orchestration.map_event(event):
@@ -1405,6 +1461,8 @@ class MiniOrkAcpAgent:
                         start_run_calls[str(block.get("id") or "")] = str(inp.get("recipe") or "")
                     elif tool == "draft_recipe":
                         draft_calls.add(str(block.get("id") or ""))
+                    elif tool == "propose_automation":
+                        propose_calls.add(str(block.get("id") or ""))
             child = self._extract_child_run_from_event(event, start_run_calls)
             if child:
                 await self._start_child_follow(session_id, child[0], recipe=child[1])
@@ -1413,6 +1471,11 @@ class MiniOrkAcpAgent:
                 turn_draft.clear()
                 turn_draft.update(draft)
                 await self._emit_draft_preview(session_id, home, draft)
+            proposal = _proposal_result(event, propose_calls)
+            if proposal:
+                turn_proposal.clear()
+                turn_proposal.update(proposal)
+                await self._emit_proposal_card(session_id, proposal)
 
         async def _run() -> Any:
             kwargs: dict[str, Any] = {}
@@ -1467,17 +1530,25 @@ class MiniOrkAcpAgent:
                 ),
             )
             return PromptResponse(stop_reason="end_turn")
-            return PromptResponse(stop_reason="end_turn")
         # S3b-2: if this thread is mid-drafting, surface the approval
         # buttons BEFORE we end the turn. The user's Create / Change /
         # Discard choice is awaited inline (ACP ``request_permission``) so
         # the turn does not return until the user has decided. Failed
         # orchestrator turns (``rc != 0``) skip the approval — we want the
         # error text to be the last thing rendered, not a Create dialog.
+        # Zed S6b-2: a recipe draft is offered before an automation proposal
+        # from the same turn — the automation may run that very recipe, which
+        # must exist before the automation can be created.
         if turn_draft:
             await self._offer_recipe_draft_approval(
                 session_id, turn_draft["draft_id"],
                 tool_call_id=turn_draft["tool_call_id"], exists=turn_draft["exists"],
+            )
+        if turn_proposal:
+            await self._offer_automation_proposal_approval(
+                session_id, turn_proposal["proposal_id"],
+                tool_call_id=turn_proposal["tool_call_id"],
+                exists=turn_proposal["exists"],
             )
         # Zed S5: surface review buttons for any run that became
         # ready-to-review during this turn, newest first. The orchestrator
@@ -1564,6 +1635,327 @@ class MiniOrkAcpAgent:
         await self._emit(session_id, ToolCallProgress(
             session_update="tool_call_update", tool_call_id=draft["tool_call_id"],
             content=cast(Any, content)))
+
+    # ── automation-proposal approval (Zed S6b-2) ─────────────────────────────
+
+    async def _emit_proposal_card(
+        self, session_id: str, proposal: dict[str, Any]
+    ) -> None:
+        """Show a proposal on its tool card — three short lines + the kickoff.
+
+        Card body (kickoff §Proposal card, verbatim):
+
+            **<name>** runs `<recipe>` <when> (`<cron>`), <workspace>.
+            Next: <three next_fires formatted like /automations>
+            ```markdown
+            <first 40 lines of kickoff, ``…`` when longer>
+            ```
+        """
+        from mini_ork.acp import automation_view as _av
+        now = _dt.datetime.now()
+        next_lines: list[str] = []
+        for raw in (proposal.get("next_fires") or [])[:3]:
+            try:
+                when = _dt.datetime.fromisoformat(str(raw))
+            except (TypeError, ValueError):
+                continue
+            next_lines.append(_av._format_next_fire(when, now))
+        next_text = ", ".join(next_lines) if next_lines else "(no future fire)"
+        workspace_text = (
+            "in a new worktree"
+            if proposal.get("workspace", "worktree") == "worktree"
+            else "in place"
+        )
+        cron = str(proposal.get("schedule") or "")
+        when_text = str(proposal.get("when") or "") or cron
+        lines = [
+            f"**{proposal.get('name', proposal.get('proposal_id', ''))}** "
+            f"runs `{proposal.get('recipe', '')}` {when_text} (`{cron}`), "
+            f"{workspace_text}.",
+            f"Next: {next_text}",
+        ]
+        kickoff_lines = str(proposal.get("kickoff") or "").splitlines()[:40]
+        kickoff_block = "\n".join(kickoff_lines)
+        if len(str(proposal.get("kickoff") or "").splitlines()) > 40:
+            kickoff_block += "\n…"
+        lines.append("```markdown\n" + kickoff_block + "\n```")
+        await self._emit(session_id, ToolCallProgress(
+            session_update="tool_call_update",
+            tool_call_id=proposal["tool_call_id"],
+            content=[ContentToolCallContent(
+                type="content",
+                content=TextContentBlock(type="text", text="\n\n".join(lines)),
+            )],
+        ))
+
+    async def _offer_automation_proposal_approval(
+        self, session_id: str, proposal_id: str, *, tool_call_id: str, exists: bool
+    ) -> None:
+        """Ask the user, on the proposal's own tool card, what to do with it:
+        Create (or Update) automation / Change something / Discard. Awaited
+        inside the turn. Dismissing keeps the proposal.
+
+        On ``create``, after :func:`mini_ork.automations.commit_proposal`
+        succeeds, when the OS scheduler is OFF we emit a SECOND
+        ``request_permission`` on a fresh tool_call id
+        (``automation-scheduler:<home hash>``) so an automation that
+        never fires is not the worst outcome.
+        """
+        if self._conn is None:
+            return
+        verb = "Update" if exists else "Create"
+        try:
+            response = await self._conn.request_permission(
+                session_id=session_id,
+                tool_call=ToolCallUpdate(
+                    tool_call_id=tool_call_id,
+                    kind="edit",
+                    title=f"{verb} automation {proposal_id}",
+                    status="pending",
+                ),
+                options=[
+                    PermissionOption(option_id="create", name=f"{verb} automation", kind="allow_once"),
+                    PermissionOption(option_id="change", name="Change something", kind="reject_once"),
+                    PermissionOption(option_id="discard", name="Discard", kind="reject_always"),
+                ],
+            )
+        except Exception:  # noqa: BLE001 — UI is best-effort, the proposal survives
+            return
+        outcome = getattr(response, "outcome", None)
+        option_id = getattr(outcome, "option_id", None) if outcome is not None else None
+        if option_id == "create":
+            await self._handle_automation_proposal_create(
+                session_id, proposal_id, tool_call_id=tool_call_id
+            )
+        elif option_id == "change":
+            await self._handle_automation_proposal_change(session_id, proposal_id)
+            await self._emit(session_id, ToolCallProgress(
+                session_update="tool_call_update",
+                tool_call_id=tool_call_id,
+                status="failed",
+            ))
+        elif option_id == "discard":
+            await self._handle_automation_proposal_discard(session_id, proposal_id)
+            await self._emit(session_id, ToolCallProgress(
+                session_update="tool_call_update",
+                tool_call_id=tool_call_id,
+                status="failed",
+            ))
+        else:  # dismissed
+            await self._emit(session_id, self._build_refusal_message(
+                "Proposal kept — ask me to create it when you're ready."))
+            await self._emit(session_id, ToolCallProgress(
+                session_update="tool_call_update",
+                tool_call_id=tool_call_id,
+                status="failed",
+            ))
+
+    async def _handle_automation_proposal_create(
+        self, session_id: str, proposal_id: str, *, tool_call_id: str
+    ) -> None:
+        """Commit the staged proposal. On success: mark the tool call
+        completed and (when the OS scheduler is OFF) ask the user to
+        install it. On failure: emit the error and leave the proposal
+        alive on disk.
+        """
+        from mini_ork import automations as _auto
+
+        home = self._home_for(session_id)
+        try:
+            result = _auto.commit_proposal(home, proposal_id)
+        except Exception as exc:  # noqa: BLE001
+            result = {"ok": False, "error": str(exc)}
+        ok = bool(result.get("ok")) if isinstance(result, dict) else False
+        if not ok:
+            err = (
+                (result.get("error") if isinstance(result, dict) else None)
+                or "unknown error"
+            )
+            await self._emit(
+                session_id,
+                self._build_refusal_message(
+                    f"Could not create {proposal_id}: {err} The proposal is kept."
+                ),
+            )
+            await self._emit(session_id, ToolCallProgress(
+                session_update="tool_call_update",
+                tool_call_id=tool_call_id,
+                status="failed",
+            ))
+            return
+        record = result.get("automation") if isinstance(result, dict) else None
+        name = (
+            (record or {}).get("name")
+            if isinstance(record, dict)
+            else None
+        ) or proposal_id
+        schedule = (
+            (record or {}).get("schedule")
+            if isinstance(record, dict)
+            else None
+        ) or ""
+        # ``commit_proposal`` returns ``created=True`` for fresh adds,
+        # ``created=False`` when the proposal updates an existing
+        # automation.
+        verb = "Updated" if not result.get("created") else "Scheduled"
+        # Next-run text: re-read the proposal's next_fires for a fresh line
+        # (the live store has been updated with the proposal's schedule).
+        next_text = ""
+        try:
+            items = _auto.load(home)
+            live = next((a for a in items if a.get("id") == proposal_id), None)
+            if live:
+                from mini_ork.acp import automation_view as _av
+                now = _dt.datetime.now()
+                fires = _auto.next_fires(str(live.get("schedule") or ""), n=1, after=now)
+                if fires:
+                    next_text = _av._format_next_fire(fires[0], now)
+        except Exception:  # noqa: BLE001 — non-essential follow-up
+            next_text = ""
+        when_text = _auto.describe(schedule) if schedule else ""
+        when_part = f": {when_text}" if when_text else ""
+        next_part = f" Next run {next_text}." if next_text else ""
+        await self._emit(
+            session_id,
+            self._build_refusal_message(f"{verb} {name}{when_part}.{next_part}"),
+        )
+        await self._emit(session_id, ToolCallProgress(
+            session_update="tool_call_update",
+            tool_call_id=tool_call_id,
+            status="completed",
+        ))
+        # Offer to install the scheduler when it is OFF. A separate
+        # ``request_permission`` on a fresh tool_call id, NOT the proposal
+        # id — reusing the proposal id would overwrite the in-flight card.
+        try:
+            status = _auto.scheduler_status(home)
+        except Exception:  # noqa: BLE001
+            status = {"installed": True}  # safest default: don't ask
+        if not bool(status.get("installed")):
+            await self._offer_automation_scheduler_on(
+                session_id, home, proposal_name=name
+            )
+
+    async def _handle_automation_proposal_change(
+        self, session_id: str, proposal_id: str
+    ) -> None:
+        """Keep the proposal; the user's next message (what to change) goes to
+        the orchestrator as typed — its conversation already holds it."""
+        del proposal_id
+        await self._emit(session_id, self._build_refusal_message(
+            "Tell me what to change."
+        ))
+
+    async def _handle_automation_proposal_discard(
+        self, session_id: str, proposal_id: str
+    ) -> None:
+        """User picked Discard: drop the staged proposal and report."""
+        from mini_ork import automations as _auto
+
+        home = self._home_for(session_id)
+        try:
+            result = _auto.discard_proposal(home, proposal_id)
+        except Exception as exc:  # noqa: BLE001
+            result = {"ok": False, "error": str(exc)}
+        if isinstance(result, dict) and result.get("ok"):
+            await self._emit(
+                session_id,
+                self._build_refusal_message("Proposal discarded."),
+            )
+        else:
+            err = (
+                (result.get("error") if isinstance(result, dict) else None)
+                or "unknown error"
+            )
+            await self._emit(
+                session_id,
+                self._build_refusal_message(
+                    f"`discard` failed for `{proposal_id}`: {err}"
+                ),
+            )
+
+    async def _offer_automation_scheduler_on(
+        self, session_id: str, home: Path, *, proposal_name: str
+    ) -> None:
+        """Second question after ``create`` succeeds: turn the OS scheduler
+        ON so the automation actually fires when the editor is closed.
+
+        Uses a fresh tool_call id (``automation-scheduler:<home hash>``)
+        so the in-flight proposal card is not overwritten. ``on`` calls
+        :func:`mini_ork.automations.install_scheduler`; ``later`` /
+        dismissed explain that the automation is saved but inert.
+        """
+        from mini_ork import automations as _auto
+
+        del proposal_name
+        if self._conn is None:
+            return
+        tool_call_id = f"automation-scheduler:{_auto._home_hash(home)}"
+        await self._emit(
+            session_id,
+            self._build_refusal_message(
+                "Automations fire from a small background job that checks "
+                "every minute — a LaunchAgent on macOS, a crontab line on "
+                "Linux — even when Zed is closed. It is off in this project."
+            ),
+        )
+        await self._emit(session_id, ToolCallStart(
+            session_update="tool_call", tool_call_id=tool_call_id,
+            kind="execute", status="pending", title="Turn on the scheduler",
+        ))
+        option_id = None
+        try:
+            response = await self._conn.request_permission(
+                session_id=session_id,
+                tool_call=ToolCallUpdate(tool_call_id=tool_call_id, status="pending"),
+                options=[
+                    PermissionOption(option_id="on", name="Turn on the scheduler", kind="allow_once"),
+                    PermissionOption(option_id="later", name="Not now", kind="reject_once"),
+                ],
+            )
+            outcome = getattr(response, "outcome", None)
+            option_id = getattr(outcome, "option_id", None) if outcome is not None else None
+        except Exception:  # noqa: BLE001 — non-essential second question
+            option_id = None
+        if option_id == "on":
+            try:
+                result = _auto.install_scheduler(home)
+            except Exception as exc:  # noqa: BLE001
+                result = {"ok": False, "error": str(exc)}
+            if isinstance(result, dict) and result.get("ok"):
+                await self._emit(
+                    session_id,
+                    self._build_refusal_message(
+                        "Scheduler on — /automation scheduler off removes it."
+                    ),
+                )
+            else:
+                err = (
+                    (result.get("error") if isinstance(result, dict) else None)
+                    or "unknown error"
+                )
+                await self._emit(
+                    session_id,
+                    self._build_refusal_message(
+                        f"Could not turn the scheduler on: {err}"
+                    ),
+                )
+            await self._emit(session_id, ToolCallProgress(
+                session_update="tool_call_update",
+                tool_call_id=tool_call_id,
+                status="completed",
+            ))
+            return
+        # ``later`` or dismissed — automation saved but inert.
+        await self._emit(session_id, self._build_refusal_message(
+            "Saved, but it will not fire until the scheduler is on: "
+            "/automation scheduler on."
+        ))
+        await self._emit(session_id, ToolCallProgress(
+            session_update="tool_call_update",
+            tool_call_id=tool_call_id,
+            status="failed",
+        ))
 
     async def _handle_recipe_create(
         self, session_id: str, recipe_id: str
@@ -2974,18 +3366,21 @@ class MiniOrkAcpAgent:
             return PromptResponse(stop_reason="end_turn")
         if isinstance(reply, _commands._RewriteToOrchestrate):
             self._thread_rewrites[session_id] = reply.intent_text
+            # ``bridge`` is the per-flow one-liner that previews what the
+            # user is about to see (``create`` buttons + proposal card vs.
+            # diffs + draft card). Defaults to the recipe-flow text when
+            # the handler did not set one, so existing recipe flows keep
+            # their wording (S3b-2).
+            bridge_text = reply.bridge or (
+                "Handing this to the orchestrator. When it has a "
+                "draft you'll see its files as diffs and the "
+                "buttons to create it."
+            )
             await self._emit(
                 session_id,
                 AgentMessageChunk(
                     session_update="agent_message_chunk",
-                    content=TextContentBlock(
-                        type="text",
-                        text=(
-                            "Handing this to the orchestrator. When it has a "
-                            "draft you'll see its files as diffs and the "
-                            "buttons to create it."
-                        ),
-                    ),
+                    content=TextContentBlock(type="text", text=bridge_text),
                 ),
             )
             return None
