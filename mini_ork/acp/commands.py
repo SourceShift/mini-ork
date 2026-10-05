@@ -52,6 +52,32 @@ class CommandReply:
     text: str
     links: list[Path]
 
+
+@dataclass(frozen=True)
+class _OfferCopy:
+    """Sentinel: ask the user to copy an engine recipe into the project (the
+    agent shows Copy / Cancel buttons and does the copy)."""
+
+    recipe_id: str
+
+
+@dataclass(frozen=True)
+class _RewriteToOrchestrate:
+    """Sentinel: a handler wants the dispatcher to skip emitting text.
+
+    ``_dispatch_slash`` detects this type, stores the rewritten prompt on
+    the thread session, emits a one-line bridge message, and returns
+    ``None`` so the caller falls through to ``_prompt_thread`` (where the
+    rewritten text replaces the original user text for the orchestrator
+    turn). This is how ``/recipe new`` and ``/recipe edit`` steer a
+    thread-session turn toward the recipe-authoring prompt section without
+    launching a run.
+    """
+
+    intent_text: str
+    recipe_id: str | None = None
+
+
 # ── announcement table ─────────────────────────────────────────────────────────
 # ``COMMANDS`` is the same list the agent pushes to clients via
 # ``available_commands_update``. ``input=`` is the SDK's wrapper for an
@@ -129,6 +155,16 @@ COMMANDS: list[AvailableCommand] = [
     _cmd(
         "recipe",
         "Recipe card: description, steps, flow, contract, grade, track record.",
+        "recipe id",
+    ),
+    _cmd(
+        "recipe new",
+        "Start a recipe authoring flow in this thread.",
+        "describe what the recipe should do",
+    ),
+    _cmd(
+        "recipe edit",
+        "Edit an existing engine recipe (copies to project, then drafts).",
         "recipe id",
     ),
 ]
@@ -679,6 +715,62 @@ async def handle_serve(agent: Any, session_id: str, arg: str) -> str:
     return "Run `mini-ork serve` to start the web UI (not running)."
 
 
+async def handle_recipe_new(agent: Any, session_id: str, arg: str) -> _RewriteToOrchestrate:
+    """Thread-side: rewrite to orchestrator to draft a new recipe.
+
+    The orchestrator reads the rewritten intent, interviews the user if
+    needed, and drives ``mcp__mini-ork__draft_recipe`` end-to-end. The
+    handler itself never starts a run; the sentinel tells the dispatcher
+    to fall through to ``_prompt_thread`` with the rewritten text.
+    """
+    what = arg.strip() or "Ask what it should do."
+    intent = (
+        f"The user wants to create a new recipe. {what}\n"
+        "Follow your recipe-creation steps. When the spec is ready, call draft_recipe; "
+        "the user approves the draft with buttons under it."
+    )
+    return _RewriteToOrchestrate(intent_text=intent, recipe_id=None)
+
+
+async def handle_recipe_edit(agent: Any, session_id: str, arg: str) -> str | _RewriteToOrchestrate:
+    """Thread-side: rewrite to orchestrator to edit an existing recipe.
+
+    Resolves ``arg`` against the recipe catalog. Unknown ids return a
+    plain string (the dispatcher emits it directly). For known engine
+    recipes we ask the orchestrator to copy-to-project first, then draft.
+    For project recipes we go straight to draft.
+    """
+    from mini_ork.recipes_catalog import find_recipe
+
+    recipe_id = arg.strip()
+    if not recipe_id:
+        return "Usage: `/recipe edit <id>` — recipe id required."
+    home = agent._home_for(session_id)
+    try:
+        entry = find_recipe(recipe_id, home)
+    except Exception as exc:  # noqa: BLE001
+        return f"`/recipe edit` failed: {exc}"
+    if entry is None:
+        return f"No recipe {recipe_id!r}. `/recipes` lists them."
+
+    if entry.source == "engine":
+        return _OfferCopy(recipe_id=recipe_id)
+    if not (entry.path / "recipe.spec.json").is_file():
+        # Not authored from a spec: edit its files directly.
+        files = sorted(p for p in entry.path.rglob("*") if p.is_file() and p.suffix in (".yaml", ".md", ".py", ".sh"))
+        return CommandReply(
+            text=f"`{recipe_id}` wasn't created from a spec, so edit its files directly — "
+                 "the links below open them.",
+            links=files,
+        )
+    intent = (
+        f"The user wants to change recipe `{recipe_id}`. Call get_recipe_spec, ask what to "
+        f"change, then call draft_recipe with base=\"{recipe_id}\"; the user approves the "
+        "draft with buttons under it."
+    )
+    return _RewriteToOrchestrate(intent_text=intent, recipe_id=recipe_id)
+
+
 # ── dispatch table ───────────────────────────────────────────────────────────
 # Maps the bare command name to its handler. ``/run`` is intentionally absent:
 # ``MiniOrkAcpAgent`` routes ``/run <task>`` through ``_strip_slash_run``
@@ -699,6 +791,8 @@ HANDLERS: dict[str, Handler] = {
     "recover": handle_recover,
     "certify": handle_certify,
     "serve": handle_serve,
+    "recipe new": handle_recipe_new,
+    "recipe edit": handle_recipe_edit,
 }
 
 
@@ -725,8 +819,11 @@ async def handle(agent: Any, session_id: str, name: str, arg: str) -> str | Comm
 __all__ = [
     "COMMANDS",
     "CommandReply",
+    "_RewriteToOrchestrate",
     "HANDLERS",
     "handle",
+    "handle_recipe_new",
+    "handle_recipe_edit",
     "_spawn",
     "_run",
     "_probe",

@@ -605,3 +605,127 @@ def test_draft_grade_with_a_relative_home(tmp_path, monkeypatch):
     out = draft(Path(".mini-ork"), spec)
     assert out["ok"], out
     assert out["grade"]["score"] >= 90, out["grade"]
+
+
+
+# ── copy_to_project (S3b-2) ──────────────────────────────────────────────────
+
+
+def test_copy_to_project_happy_path(home, fake_engine_root):
+    """Copy an engine recipe into the project's recipes dir; returns path + files."""
+    from mini_ork.recipe_author import copy_to_project
+
+    # Seed an engine recipe: minimal ``task_class.yaml`` + ``workflow.yaml``.
+    engine_recipe = fake_engine_root / "recipes" / "engine-recipe-x"
+    engine_recipe.mkdir(parents=True)
+    (engine_recipe / "task_class.yaml").write_text(
+        "id: engine-recipe-x\n",
+        encoding="utf-8",
+    )
+    (engine_recipe / "workflow.yaml").write_text(
+        "steps:\n  - id: only\n    type: verifier\n    check: true\n",
+        encoding="utf-8",
+    )
+    # Patch ``find_recipe`` to resolve through ``fake_engine_root``.
+    from mini_ork import recipes_catalog
+
+    original_find = recipes_catalog.find_recipe
+
+    def fake_find(recipe_id, _home):
+        if recipe_id == "engine-recipe-x":
+            return recipes_catalog.RecipeInfo(
+                id="engine-recipe-x",
+                path=engine_recipe,  # RecipeInfo.path is the recipe directory
+                source="engine",
+                description="",
+                task_class="",
+                node_count=1,
+                shadows_engine=False,
+            )
+        return original_find(recipe_id, _home)
+
+    recipes_catalog.find_recipe = fake_find
+    try:
+        result = copy_to_project(home, "engine-recipe-x")
+    finally:
+        recipes_catalog.find_recipe = original_find
+
+    assert result["ok"] is True, result
+    target = Path(result["path"])
+    assert target == home / "recipes" / "engine-recipe-x"
+    assert target.exists()
+    assert (target / "task_class.yaml").read_text(encoding="utf-8") == "id: engine-recipe-x\n"
+    assert (target / "workflow.yaml").exists()
+    # Files list is sorted + relative.
+    assert "task_class.yaml" in result["files"]
+    assert "workflow.yaml" in result["files"]
+
+
+def test_copy_to_project_already_project_recipe_is_error(home):
+    """If the catalog reports source='project' the function refuses (no clobber)."""
+    from mini_ork.recipe_author import copy_to_project
+    from mini_ork import recipes_catalog
+
+    project_dir = home / "recipes" / "my-recipe"
+    project_dir.mkdir(parents=True)
+    (project_dir / "task_class.yaml").write_text(
+        "id: my-recipe\n", encoding="utf-8",
+    )
+    original_find = recipes_catalog.find_recipe
+
+    def fake_find(recipe_id, _home):
+        if recipe_id == "my-recipe":
+            return recipes_catalog.RecipeInfo(
+                id="my-recipe",
+                path=project_dir / "task_class.yaml",
+                source="project",
+                description="",
+                task_class="my-recipe",
+                node_count=0,
+                shadows_engine=False,
+            )
+        return original_find(recipe_id, _home)
+
+    recipes_catalog.find_recipe = fake_find
+    try:
+        result = copy_to_project(home, "my-recipe")
+    finally:
+        recipes_catalog.find_recipe = original_find
+
+    assert result["ok"] is False, result
+    assert "already a project recipe" in result["error"]
+    # Original content untouched.
+    assert (project_dir / "task_class.yaml").read_text(encoding="utf-8") == "id: my-recipe\n"
+
+
+def test_copy_to_project_unknown_id_is_error(home):
+    """Unknown recipe id → ok:False with a clear error (no traceback)."""
+    from mini_ork.recipe_author import copy_to_project
+
+    result = copy_to_project(home, "does-not-exist-anywhere")
+    assert result["ok"] is False
+    assert "does-not-exist-anywhere" in result["error"]
+    assert "unknown" in result["error"].lower()
+
+
+
+def test_copy_to_project_copies_only_that_recipe(tmp_path, monkeypatch):
+    """Regression: the whole engine recipes/ directory was copied, nested
+    under the target (recipes/docs/docs/..., recipes/docs/code-fix/...)."""
+    from mini_ork.recipe_author import copy_to_project
+
+    engine = tmp_path / "engine"
+    for rid in ("docs", "code-fix"):
+        d = engine / "recipes" / rid / "prompts"
+        d.mkdir(parents=True)
+        (d.parent / "workflow.yaml").write_text(f"task_class: {rid}\nnodes: []\nedges: []\n")
+        (d.parent / "task_class.yaml").write_text(f"name: {rid}\n")
+        (d / "p.md").write_text("x\n")
+    monkeypatch.setattr("mini_ork.web.control._mini_ork_root", lambda: engine)
+    home = tmp_path / "proj" / ".mini-ork"
+    home.mkdir(parents=True)
+    out = copy_to_project(home, "docs")
+    assert out["ok"], out
+    assert sorted(out["files"]) == ["prompts/p.md", "task_class.yaml", "workflow.yaml"]
+    assert (home / "recipes" / "docs" / "workflow.yaml").is_file()
+    assert not (home / "recipes" / "docs" / "code-fix").exists()

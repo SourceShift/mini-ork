@@ -825,3 +825,63 @@ def test_certify_does_not_block_the_agent_and_announces_itself(home: Path, monke
     out = asyncio.run(scenario())
     assert "LOOP-BLOCKED" not in out and "PROVEN" in out
     assert sent and "Certifying HEAD~1..HEAD" in sent[0]
+
+
+
+# ── /recipe new + /recipe edit (S3b-2) ───────────────────────────────────────
+
+
+def test_recipe_new_returns_rewrite_sentinel_with_intent(home):
+    """/recipe new always returns a _RewriteToOrchestrate sentinel."""
+    from mini_ork.acp.commands import _RewriteToOrchestrate
+
+    agent = _agent(home)
+    out = asyncio.run(cmds.handle_recipe_new(agent, "orch-1", "audit SQL migrations"))
+    assert isinstance(out, _RewriteToOrchestrate)
+    assert out.recipe_id is None
+    # Intent text mentions draft_recipe + the user's intent.
+    assert "audit SQL migrations" in out.intent_text
+    assert "draft_recipe" in out.intent_text
+
+
+def test_recipe_new_empty_arg_uses_default_intent(home):
+    """/recipe new with no arg → default intent (still a rewrite)."""
+    from mini_ork.acp.commands import _RewriteToOrchestrate
+
+    agent = _agent(home)
+    out = asyncio.run(cmds.handle_recipe_new(agent, "orch-1", ""))
+    assert isinstance(out, _RewriteToOrchestrate)
+    assert out.recipe_id is None
+    # Default intent calls out the recipe_author MCP tools.
+    assert "draft_recipe" in out.intent_text
+
+
+
+
+
+
+def test_recipe_edit_unknown_id_returns_one_line(home):
+    """/recipe edit <bogus> → plain string (NOT a sentinel)."""
+    agent = _agent(home)
+    out = asyncio.run(cmds.handle_recipe_edit(agent, "orch-1", "does-not-exist"))
+    assert isinstance(out, str)
+    assert "does-not-exist" in out
+    assert "No recipe" in out
+
+
+def test_recipe_edit_empty_arg_returns_usage(home):
+    """/recipe edit with no id → usage hint string."""
+    agent = _agent(home)
+    out = asyncio.run(cmds.handle_recipe_edit(agent, "orch-1", ""))
+    assert isinstance(out, str)
+    assert "Usage" in out
+    assert "recipe edit" in out
+
+
+def test_recipe_new_and_edit_are_announced(home):
+    """The COMMANDS table includes recipe new and recipe edit."""
+    names = {c.name for c in cmds.COMMANDS}
+    assert "recipe new" in names
+    assert "recipe edit" in names
+    assert "recipe new" in cmds.HANDLERS
+    assert "recipe edit" in cmds.HANDLERS

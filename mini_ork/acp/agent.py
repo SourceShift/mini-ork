@@ -55,9 +55,11 @@ from acp.schema import (
     ListSessionsResponse,
     LoadSessionResponse,
     NewSessionResponse,
+    PermissionOption,
     PlanEntry,
     PromptResponse,
     ResourceContentBlock,
+    ToolCallUpdate,
     SessionCapabilities,
     SessionConfigOptionSelect,
     SessionConfigSelectOption,
@@ -216,6 +218,32 @@ def _tail_log(path: str | None, n: int = 20) -> str:
         return "(launch log unreadable)"
 
 
+def _draft_result(event: dict[str, Any], draft_calls: set[str]) -> dict[str, Any] | None:
+    """A successful ``draft_recipe`` tool result in ``event`` (a stream-json user
+    message answering one of ``draft_calls``), as ``{draft_id, tool_call_id,
+    exists, grade, warnings}``; None otherwise."""
+    if event.get("type") != "user" or not draft_calls:
+        return None
+    for block in (event.get("message") or {}).get("content") or []:
+        if not (isinstance(block, dict) and block.get("type") == "tool_result"):
+            continue
+        tool_call_id = str(block.get("tool_use_id") or "")
+        if tool_call_id not in draft_calls:
+            continue
+        raw = block.get("content")
+        if isinstance(raw, list):
+            raw = "".join(c.get("text", "") for c in raw if isinstance(c, dict))
+        try:
+            data = json.loads(raw) if isinstance(raw, str) else None
+        except json.JSONDecodeError:
+            data = None
+        if isinstance(data, dict) and data.get("ok") and data.get("draft_id"):
+            return {"draft_id": str(data["draft_id"]), "tool_call_id": tool_call_id,
+                    "exists": bool(data.get("exists")), "grade": data.get("grade") or {},
+                    "warnings": data.get("warnings") or []}
+    return None
+
+
 class MiniOrkAcpAgent:
     """Stdio ACP agent: thread sessions OR one-session-per-run.
 
@@ -340,6 +368,12 @@ class MiniOrkAcpAgent:
         # a loaded thread arrives with the flag already set so replay does
         # not re-emit the title update).
         self._first_prompt_sent: set[str] = set()
+        # thread session id → rewrite intent text injected on the next
+        # ``_prompt_thread`` call (S3b-2). ``/recipe new`` and ``/recipe edit``
+        # stash the orchestrator-facing text via ``_commands._RewriteToOrchestrate``;
+        # ``_dispatch_slash`` stores the intent here, then returns None so the
+        # caller falls through to ``_prompt_thread`` which picks it up.
+        self._thread_rewrites: dict[str, str] = {}
         # session ids currently being loaded from a persisted thread. A
         # replayed update must NOT be re-recorded (kickoff §"load_session"):
         # the simplest guard is a per-load set checked at the top of
@@ -1135,16 +1169,28 @@ class MiniOrkAcpAgent:
         # A cancel ends one turn, not the thread.
         self._cancelled.discard(session_id)
         text = _extract_prompt_text(prompt)
+        # S3b-2: a ``/recipe new`` or ``/recipe edit`` handler may have
+        # stashed a rewrite intent via ``_commands._RewriteToOrchestrate``.
+        # Apply it BEFORE ``_record`` so the thread log stores the rewritten
+        # user text (what the orchestrator actually sees) instead of the
+        # literal ``/recipe new`` slash command.
+        rewrite = self._thread_rewrites.pop(session_id, None)
+        typed = text
+        if rewrite:
+            text = rewrite
         # Z9c-2: persist the user prompt and (only on the first prompt of
         # this thread) push a SessionInfoUpdate carrying the title derived
         # from the prompt text. The flag is set BEFORE the routing call so
         # a loaded thread that re-prompted arrives with the flag already on
         # (``_load_thread_session`` seeds it during restore) and never
         # re-emits the title update.
-        self._record(session_id, {"type": "user", "text": text})
+        if not rewrite:  # a rewritten command was already recorded as typed
+            self._record(session_id, {"type": "user", "text": text})
         if session_id not in self._first_prompt_sent:
             self._first_prompt_sent.add(session_id)
-            title = title_from_text(text)
+            title = title_from_text(typed)
+            if typed.startswith("/recipe new"):
+                title = "New recipe: " + (typed[len("/recipe new"):].strip() or "untitled")
             self._thread_titles[session_id] = title
             await self._emit(
                 session_id,
@@ -1172,7 +1218,7 @@ class MiniOrkAcpAgent:
         return text[len(_SLASH_RUN_PREFIX):].strip()
 
     async def _prompt_thread_direct(
-        self, session_id: str, text: str
+        self, session_id: str, text: str, *, recipe: str | None = None
     ) -> PromptResponse:
         """Direct-mode path: launch a fresh run + await its terminal status.
 
@@ -1184,7 +1230,7 @@ class MiniOrkAcpAgent:
         if not text:
             return PromptResponse(stop_reason="refusal")
         cfg = self._thread_config.get(session_id) or {}
-        recipe = str(cfg.get("recipe") or self._recipe)
+        recipe = recipe or str(cfg.get("recipe") or self._recipe)
         new_run_id = mint_run_id()
         self._sessions[new_run_id] = self._sessions.get(session_id, os.getcwd())
         self._recipes[new_run_id] = recipe
@@ -1241,20 +1287,32 @@ class MiniOrkAcpAgent:
         # answering one of these start a child run: run_status / wait_for_run /
         # run_detail results also carry a run_id but must not.
         start_run_calls: dict[str, str] = {}
+        # S3b-2: this turn's draft_recipe calls, and the last successful draft
+        # (approval buttons are offered only for a draft that exists).
+        draft_calls: set[str] = set()
+        turn_draft: dict[str, Any] = {}
 
         async def on_event(event: dict[str, Any]) -> None:
             for update in _orchestration.map_event(event):
                 await self._emit(session_id, update)
             if event.get("type") == "assistant":
                 for block in (event.get("message") or {}).get("content") or []:
-                    if (isinstance(block, dict) and block.get("type") == "tool_use"
-                            and str(block.get("name") or "").split("__")[-1]
-                            == _orchestration.CHILD_RUN_TOOL):
+                    if not (isinstance(block, dict) and block.get("type") == "tool_use"):
+                        continue
+                    tool = str(block.get("name") or "").split("__")[-1]
+                    if tool == _orchestration.CHILD_RUN_TOOL:
                         inp = block.get("input") if isinstance(block.get("input"), dict) else {}
                         start_run_calls[str(block.get("id") or "")] = str(inp.get("recipe") or "")
+                    elif tool == "draft_recipe":
+                        draft_calls.add(str(block.get("id") or ""))
             child = self._extract_child_run_from_event(event, start_run_calls)
             if child:
                 await self._start_child_follow(session_id, child[0], recipe=child[1])
+            draft = _draft_result(event, draft_calls)
+            if draft:
+                turn_draft.clear()
+                turn_draft.update(draft)
+                await self._emit_draft_preview(session_id, home, draft)
 
         async def _run() -> Any:
             return await turn(
@@ -1301,7 +1359,216 @@ class MiniOrkAcpAgent:
                 ),
             )
             return PromptResponse(stop_reason="end_turn")
+            return PromptResponse(stop_reason="end_turn")
+        # S3b-2: if this thread is mid-drafting, surface the approval
+        # buttons BEFORE we end the turn. The user's Create / Change /
+        # Discard choice is awaited inline (ACP ``request_permission``) so
+        # the turn does not return until the user has decided. Failed
+        # orchestrator turns (``rc != 0``) skip the approval — we want the
+        # error text to be the last thing rendered, not a Create dialog.
+        if turn_draft:
+            await self._offer_recipe_draft_approval(
+                session_id, turn_draft["draft_id"],
+                tool_call_id=turn_draft["tool_call_id"], exists=turn_draft["exists"],
+            )
         return PromptResponse(stop_reason="end_turn")
+
+    # ── recipe-draft approval (Z9c-2 / S3b-2) ─────────────────────────────────
+
+    async def _offer_recipe_draft_approval(
+        self, session_id: str, recipe_id: str, *, tool_call_id: str, exists: bool
+    ) -> None:
+        """Ask the user, on the draft's own tool card, what to do with it:
+        Create (or Update) recipe / Change something / Discard draft. Awaited
+        inside the turn. Dismissing keeps the draft."""
+        if self._conn is None:
+            return
+        verb = "Update" if exists else "Create"
+        try:
+            response = await self._conn.request_permission(
+                session_id=session_id,
+                tool_call=ToolCallUpdate(
+                    tool_call_id=tool_call_id,
+                    kind="edit",
+                    title=f"{verb} recipe {recipe_id}",
+                    status="pending",
+                ),
+                options=[
+                    PermissionOption(option_id="create", name=f"{verb} recipe", kind="allow_once"),
+                    PermissionOption(option_id="change", name="Change something", kind="reject_once"),
+                    PermissionOption(option_id="discard", name="Discard draft", kind="reject_always"),
+                ],
+            )
+        except Exception:  # noqa: BLE001 — UI is best-effort, the draft survives
+            return
+        outcome = getattr(response, "outcome", None)
+        option_id = getattr(outcome, "option_id", None) if outcome is not None else None
+        if option_id == "create":
+            await self._handle_recipe_create(session_id, recipe_id)
+        elif option_id == "change":
+            await self._handle_recipe_change(session_id, recipe_id)
+        elif option_id == "discard":
+            await self._handle_recipe_discard(session_id, recipe_id)
+        else:  # dismissed
+            await self._emit(session_id, self._build_refusal_message(
+                "Draft kept — ask me to create it when you're ready."))
+
+    async def _emit_draft_preview(self, session_id: str, home: Path, draft: dict[str, Any]) -> None:
+        """Show a draft on its tool card: every file as a diff against what is
+        in the project now (new files have no old text), then its grade.
+        Files are read from the draft directory, not from the tool result."""
+        rid = draft["draft_id"]
+        draft_dir = home / "recipe-drafts" / rid
+        target = home / "recipes" / rid
+        content: list[Any] = []
+        for path in sorted(p for p in draft_dir.rglob("*") if p.is_file()):
+            rel = path.relative_to(draft_dir).as_posix()
+            if rel in ("draft.json", "recipe.spec.json"):
+                continue
+            try:
+                new_text = path.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                continue
+            old_path = target / rel
+            old_text = None
+            if old_path.is_file():
+                try:
+                    old_text = old_path.read_text(encoding="utf-8")
+                except (OSError, UnicodeDecodeError):
+                    old_text = None
+            content.append(FileEditToolCallContent(
+                type="diff", path=str(old_path.resolve()), old_text=old_text, new_text=new_text))
+        grade = draft.get("grade") or {}
+        lines = [f"Grade {grade.get('letter', '?')} ({grade.get('score', '?')}/100)"]
+        for w in (draft.get("warnings") or []) + (grade.get("findings") or []):
+            if isinstance(w, dict) and w.get("msg"):
+                lines.append(f"- {w['msg']}" + (f" — {w['fix']}" if w.get("fix") else ""))
+        content.append(ContentToolCallContent(
+            type="content", content=TextContentBlock(type="text", text="\n".join(lines))))
+        await self._emit(session_id, ToolCallProgress(
+            session_update="tool_call_update", tool_call_id=draft["tool_call_id"],
+            content=cast(Any, content)))
+
+    async def _handle_recipe_create(
+        self, session_id: str, recipe_id: str
+    ) -> None:
+        """Commit the staged draft and surface a Create / Discard / Run test
+        ``request_permission`` to the client. ``commit_draft`` writes the
+        recipe tree to ``.mini-ork/recipes/<id>/``; on failure we report
+        the error and leave the draft alone (no rollback).
+        """
+        from mini_ork.recipe_author import commit_draft
+
+        home = self._home_for(session_id)
+        try:
+            result = commit_draft(home, recipe_id)
+        except Exception as exc:  # noqa: BLE001
+            result = {"ok": False, "error": str(exc)}
+        ok = bool(result.get("ok")) if isinstance(result, dict) else False
+        if not ok:
+            err = (
+                (result.get("error") if isinstance(result, dict) else None)
+                or "unknown error"
+            )
+            await self._emit(
+                session_id,
+                self._build_refusal_message(
+                    f"`create` failed for `{recipe_id}`: {err}"
+                ),
+            )
+            return
+        target = home / "recipes" / recipe_id
+        backup = result.get("backup") if isinstance(result, dict) else None
+        msg = (
+            f"{'Updated' if backup else 'Created'} `.mini-ork/recipes/{recipe_id}` — "
+            "it is in the Recipe picker now."
+            + (f" The previous version is in `{backup}`." if backup else "")
+        )
+        await self._emit(session_id, self._build_refusal_message(msg))
+        await self._emit_file_links(session_id, sorted(
+            p for p in target.rglob("*")
+            if p.is_file() and p.name != "recipe.spec.json"
+        ))
+        await self._offer_recipe_test_run(session_id, recipe_id)
+
+    async def _handle_recipe_change(self, session_id: str, recipe_id: str) -> None:
+        """Keep the draft; the user's next message (what to change) goes to the
+        orchestrator as typed — its conversation already holds the draft."""
+        del recipe_id
+        await self._emit(session_id, self._build_refusal_message("Tell me what to change."))
+
+    async def _handle_recipe_discard(
+        self, session_id: str, recipe_id: str
+    ) -> None:
+        """User picked Drop the draft via ``discard_draft`` and report."""
+        from mini_ork.recipe_author import discard_draft
+
+        home = self._home_for(session_id)
+        try:
+            result = discard_draft(home, recipe_id)
+        except Exception as exc:  # noqa: BLE001
+            result = {"ok": False, "error": str(exc)}
+        ok = bool(result.get("ok")) if isinstance(result, dict) else False
+        if ok:
+            await self._emit(
+                session_id,
+                self._build_refusal_message(
+                    f"Recipe `{recipe_id}` draft discarded."
+                ),
+            )
+        else:
+            err = (
+                (result.get("error") if isinstance(result, dict) else None)
+                or "unknown error"
+            )
+            await self._emit(
+                session_id,
+                self._build_refusal_message(
+                    f"`discard` failed for `{recipe_id}`: {err}"
+                ),
+            )
+
+    async def _offer_recipe_test_run(self, session_id: str, recipe_id: str) -> None:
+        """After creating a recipe: offer to run it now on its example kickoff."""
+        if self._conn is None:
+            return
+        tool_call_id = f"recipe-test:{recipe_id}"
+        await self._emit(session_id, ToolCallStart(
+            session_update="tool_call", tool_call_id=tool_call_id, kind="execute",
+            status="pending", title=f"Test {recipe_id} on its example kickoff"))
+        try:
+            response = await self._conn.request_permission(
+                session_id=session_id,
+                tool_call=ToolCallUpdate(tool_call_id=tool_call_id, status="pending"),
+                options=[
+                    PermissionOption(option_id="test", name="Test it now", kind="allow_once"),
+                    PermissionOption(option_id="later", name="Not now", kind="reject_once"),
+                ],
+            )
+            outcome = getattr(response, "outcome", None)
+            option_id = getattr(outcome, "option_id", None) if outcome is not None else None
+        except Exception:  # noqa: BLE001
+            option_id = None
+        if option_id != "test":
+            await self._emit(session_id, ToolCallProgress(
+                session_update="tool_call_update", tool_call_id=tool_call_id, status="completed"))
+            return
+        await self._emit(session_id, ToolCallProgress(
+            session_update="tool_call_update", tool_call_id=tool_call_id, status="completed"))
+        await self._launch_recipe_test_run(session_id, recipe_id)
+
+    async def _launch_recipe_test_run(self, session_id: str, recipe_id: str) -> None:
+        """Run the new recipe on its example kickoff, followed in this thread
+        exactly like a direct-mode run (marker, live output, plan, diffs)."""
+        rdir = self._home_for(session_id) / "recipes" / recipe_id
+        examples = sorted(rdir.glob("examples/*/kickoff.md")) + [rdir / "example-kickoff.md"]
+        kickoff = next((e for e in examples if e.is_file()), None)
+        if kickoff is None:
+            await self._emit(session_id, self._build_refusal_message(
+                f"{recipe_id} has no example kickoff to test with — `/run <task>` with Recipe = {recipe_id}."))
+            return
+        await self._prompt_thread_direct(
+            session_id, kickoff.read_text(encoding="utf-8"), recipe=recipe_id)
 
     def _extract_child_run_from_event(
         self, event: dict[str, Any], start_run_calls: dict[str, str]
@@ -2272,9 +2539,27 @@ class MiniOrkAcpAgent:
         body = stripped[1:]
         if not body:
             return None
-        parts = body.split(None, 1)
-        name = parts[0]
-        arg = parts[1] if len(parts) > 1 else ""
+        # S3b-2: match the LONGEST handler key whose token boundary aligns
+        # with the body prefix, so ``/recipe new foo`` lands on the
+        # ``recipe new`` handler with ``arg="foo"`` instead of falling through
+        # to ``/recipe foo``. The bare ``/recipe <id>`` case still works
+        # because ``recipe`` is the shortest matching key.
+        name = ""
+        arg = ""
+        for key in sorted(_commands.HANDLERS, key=len, reverse=True):
+            if body == key:
+                name = key
+                arg = ""
+                break
+            if body.startswith(key + " "):
+                name = key
+                arg = body[len(key) + 1 :].strip()
+                break
+        if not name:
+            # Fallback: first whitespace-delimited word + the rest as arg.
+            parts = body.split(None, 1)
+            name = parts[0]
+            arg = parts[1] if len(parts) > 1 else ""
         # ``/run`` is preserved by the existing carve-out (threads) and by
         # the run-session launcher (the run id IS the session id); the
         # command table advertises it but it is never dispatched here.
@@ -2297,6 +2582,31 @@ class MiniOrkAcpAgent:
             )
             return PromptResponse(stop_reason="end_turn")
         reply = await _commands.handle(self, session_id, name, arg)
+        # S3b-2: ``_RewriteToOrchestrate`` hands this command to the
+        # orchestrator in this same turn: stash the instruction, say so in
+        # one line, and return None so ``prompt`` falls through to
+        # ``_prompt_thread``, which runs the orchestrator with it. The
+        # approval buttons appear only once a draft actually exists.
+        if isinstance(reply, _commands._OfferCopy):
+            await self._offer_recipe_copy(session_id, reply.recipe_id)
+            return PromptResponse(stop_reason="end_turn")
+        if isinstance(reply, _commands._RewriteToOrchestrate):
+            self._thread_rewrites[session_id] = reply.intent_text
+            await self._emit(
+                session_id,
+                AgentMessageChunk(
+                    session_update="agent_message_chunk",
+                    content=TextContentBlock(
+                        type="text",
+                        text=(
+                            "Handing this to the orchestrator. When it has a "
+                            "draft you'll see its files as diffs and the "
+                            "buttons to create it."
+                        ),
+                    ),
+                ),
+            )
+            return None
         # ``reply`` is either ``str`` (text-only handler) or ``CommandReply``
         # (markdown + file paths). Walk the envelope and emit one text chunk
         # first, then one ``ResourceContentBlock(type="resource_link")`` per
@@ -2316,30 +2626,70 @@ class MiniOrkAcpAgent:
                 content=TextContentBlock(type="text", text=markdown),
             ),
         )
-        for path in links:
+        await self._emit_file_links(session_id, links)
+        return PromptResponse(stop_reason="end_turn")
+
+    async def _emit_file_links(self, session_id: str, paths: list[Path]) -> None:
+        """One clickable file mention per path (ResourceLink); inside a recipe
+        the name is the path within it (prompts/editor.md)."""
+        for path in paths:
             try:
                 resolved = Path(path).resolve()
                 uri = resolved.as_uri()
-                # Inside a recipe: the path within it (prompts/editor.md).
-                parts = resolved.parts
-                if "recipes" in parts and parts.index("recipes") + 2 < len(parts):
-                    name_for_link = "/".join(parts[parts.index("recipes") + 2:])
-                else:
-                    name_for_link = resolved.name
             except (OSError, ValueError):
                 continue
-            await self._emit(
-                session_id,
-                AgentMessageChunk(
-                    session_update="agent_message_chunk",
-                    content=ResourceContentBlock(
-                        type="resource_link",
-                        uri=uri,
-                        name=name_for_link,
-                    ),
-                ),
-            )
-        return PromptResponse(stop_reason="end_turn")
+            parts = resolved.parts
+            if "recipes" in parts and parts.index("recipes") + 2 < len(parts):
+                name = "/".join(parts[parts.index("recipes") + 2:])
+            else:
+                name = resolved.name
+            await self._emit(session_id, AgentMessageChunk(
+                session_update="agent_message_chunk",
+                content=ResourceContentBlock(type="resource_link", uri=uri, name=name)))
+
+    async def _offer_recipe_copy(self, session_id: str, recipe_id: str) -> None:
+        """An engine recipe is edited as a project copy: ask, then copy it into
+        .mini-ork/recipes/<id> (overriding the engine's) and link its files."""
+        from mini_ork.recipe_author import copy_to_project
+
+        tool_call_id = f"recipe-copy:{recipe_id}"
+        await self._emit(session_id, ToolCallStart(
+            session_update="tool_call", tool_call_id=tool_call_id, kind="edit", status="pending",
+            title=f"Copy recipe {recipe_id} into this project to edit it"))
+        option_id = None
+        if self._conn is not None:
+            try:
+                response = await self._conn.request_permission(
+                    session_id=session_id,
+                    tool_call=ToolCallUpdate(tool_call_id=tool_call_id, status="pending"),
+                    options=[
+                        PermissionOption(option_id="copy", name="Copy into this project", kind="allow_once"),
+                        PermissionOption(option_id="cancel", name="Cancel", kind="reject_once"),
+                    ],
+                )
+                outcome = getattr(response, "outcome", None)
+                option_id = getattr(outcome, "option_id", None) if outcome is not None else None
+            except Exception:  # noqa: BLE001 — treat as cancelled
+                option_id = None
+        if option_id != "copy":
+            await self._emit(session_id, ToolCallProgress(
+                session_update="tool_call_update", tool_call_id=tool_call_id, status="failed"))
+            return
+        home = self._home_for(session_id)
+        result = copy_to_project(home, recipe_id)
+        if not result.get("ok"):
+            await self._emit(session_id, ToolCallProgress(
+                session_update="tool_call_update", tool_call_id=tool_call_id, status="failed"))
+            await self._emit(session_id, self._build_refusal_message(
+                f"Could not copy {recipe_id}: {result.get('error')}"))
+            return
+        await self._emit(session_id, ToolCallProgress(
+            session_update="tool_call_update", tool_call_id=tool_call_id, status="completed"))
+        target = home / "recipes" / recipe_id
+        await self._emit(session_id, self._build_refusal_message(
+            f"Copied to `.mini-ork/recipes/{recipe_id}` — edit its files below; the project "
+            "copy overrides the engine's."))
+        await self._emit_file_links(session_id, [target / rel for rel in result.get("files") or []])
 
     # ── thread-store helpers (Z9c-2) ─────────────────────────────────────────
 

@@ -1001,6 +1001,71 @@ def discard_draft(home: Path, recipe_id: str) -> dict[str, Any]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# copy_to_project
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def copy_to_project(home: Path, recipe_id: str) -> dict[str, Any]:
+    """Copy an engine recipe directory into <home>/recipes/<id>/.
+
+    Resolves recipe_id via recipes_catalog.find_recipe, which honours
+    project-shadowing-engine: when the catalog already lists a project
+    entry under that id the function refuses to clobber it (S3b-2
+    kickoff: error when a project recipe with that id already exists).
+    Unknown ids return a failure dict so the MCP tool never crashes.
+
+    On success the result mirrors commit_draft shape minus the backup
+    field (copy_to_project does NOT preserve an existing project copy;
+    it rejects up front instead):
+
+        {"ok": True, "path": str, "files": [rel path, ...]}
+    """
+    try:
+        from mini_ork.recipes_catalog import find_recipe
+    except Exception as exc:
+        return {"ok": False, "error": f"recipe_catalog unavailable: {exc}"}
+
+    try:
+        entry = find_recipe(recipe_id, home)
+    except Exception as exc:
+        return {"ok": False, "error": f"{exc}"}
+    if entry is None:
+        return {"ok": False, "error": f"unknown recipe: {recipe_id!r}"}
+    if entry.source != "engine":
+        return {
+            "ok": False,
+            "error": (
+                f"recipe {recipe_id!r} is already a project recipe; "
+                "refusing to overwrite"
+            ),
+        }
+
+    target_dir = home / "recipes" / recipe_id
+    if target_dir.exists():
+        return {
+            "ok": False,
+            "error": (
+                f"project recipe {recipe_id!r} already exists at "
+                f"{target_dir}; refusing to overwrite"
+            ),
+        }
+
+    try:
+        target_dir.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(entry.path, target_dir)  # this recipe's directory only
+    except Exception as exc:
+        return {"ok": False, "error": f"copy failed: {exc}"}
+
+    files: list[str] = []
+    try:
+        for child in sorted(target_dir.rglob("*")):
+            if child.is_file():
+                files.append(str(child.relative_to(target_dir)))
+    except OSError:
+        pass
+    return {"ok": True, "path": str(target_dir), "files": files}
+
+# ─────────────────────────────────────────────────────────────────────────────
 # get_spec
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1039,5 +1104,6 @@ __all__ = [
     "draft",
     "commit_draft",
     "discard_draft",
+    "copy_to_project",
     "get_spec",
 ]

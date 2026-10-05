@@ -3830,3 +3830,264 @@ def test_z5_recipe_reply_emits_resource_link_chunks(tmp_path, monkeypatch):
     for c in link_chunks:
         assert c.content.uri.startswith("file://")
         assert c.content.name
+
+
+
+class _StubResult:
+    """Minimal stand-in for the orchestrator turn result tuple."""
+
+    def __init__(self, *, rc=0, session_id=None, cost_usd=0.0,
+                 error="", text=""):
+        self.rc = rc
+        self.session_id = session_id
+        self.cost_usd = cost_usd
+        self.error = error
+        self.text = text
+
+
+class _StubConn:
+    """Stub ACP client connection: accepts session_update + request_permission."""
+
+    def __init__(self, request_permission) -> None:
+        self._rp = request_permission
+
+    async def session_update(self, _sid, _update):
+        return None
+
+    async def request_permission(self, *, session_id, tool_call, options):
+        return await self._rp(session_id, tool_call, options)
+
+
+
+
+
+# ── /recipe new|edit sentinel routing + draft approval (S3b-2) ──────────────
+
+
+class _FakeRequestPermission:
+    """Stub for ``conn.request_permission``; records the tool_call + options.
+
+    The next response is consumed FIFO; tests push the answers they want back.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, list[str]]] = []
+        self.responses: list[Any] = []
+
+    async def __call__(self, session_id: str, tool_call, options):
+        ids = [o.option_id for o in options]
+        self.calls.append((tool_call.tool_call_id, ids))
+        if not self.responses:
+            return _StubOutcome(None)
+        return self.responses.pop(0)
+
+
+class _StubOutcome:
+    """Mimics ACP ``RequestPermissionResponse.outcome`` shape."""
+
+    def __init__(self, option_id: str | None) -> None:
+        self.outcome = (
+            type("_O", (), {"option_id": option_id}) if option_id is not None else None
+        )
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ── S3b-2: guided recipe creation (review rewrite) ──────────────────────────
+
+
+class _PermConn(_SidConn):
+    """Records updates and answers request_permission with scripted choices
+    (an option id, or None for a dismissed dialog)."""
+
+    def __init__(self, choices: list[str | None]) -> None:
+        super().__init__()
+        self.choices = list(choices)
+        self.asked: list[tuple[str, list[str]]] = []
+
+    async def request_permission(self, session_id, tool_call, options, **kw):
+        from acp.schema import AllowedOutcome, DeniedOutcome, RequestPermissionResponse
+
+        self.asked.append((tool_call.tool_call_id, [o.name for o in options]))
+        choice = self.choices.pop(0) if self.choices else None
+        outcome = (DeniedOutcome(outcome="cancelled") if choice is None
+                   else AllowedOutcome(outcome="selected", option_id=choice))
+        return RequestPermissionResponse(outcome=outcome)
+
+
+_AUDIT_SPEC = {
+    "id": "migration-audit", "description": "Audit a SQL migration.",
+    "keywords": ["audit migration"], "input": "A migration file path.",
+    "steps": [
+        {"id": "editor", "type": "implementer", "role": "worker", "instructions": "Fix the migration."},
+        {"id": "check", "type": "verifier", "check": "true", "after": ["editor"]},
+    ],
+    "example_kickoff": "# Audit migration 0042\n\n## Files in scope\n\n- db/0042.sql\n",
+}
+
+
+def _authoring_project(tmp_path, monkeypatch):
+    proj = tmp_path / "proj"
+    home = proj / ".mini-ork"
+    (home / "config").mkdir(parents=True)
+    (home / "config" / "agents.yaml").write_text("lanes:\n  worker: sonnet\n  reviewer: opus\n")
+    monkeypatch.setenv("MINI_ORK_HOME", str(home))
+    engine = tmp_path / "engine"
+    docs = engine / "recipes" / "docs"
+    (docs / "prompts").mkdir(parents=True)
+    (docs / "workflow.yaml").write_text("version: '0.1.0'\ntask_class: docs\nnodes: []\nedges: []\n")
+    (docs / "task_class.yaml").write_text("name: docs\ndescription: Docs edits.\n")
+    (docs / "prompts" / "editor.md").write_text("edit docs\n")
+    monkeypatch.setattr("mini_ork.web.control._mini_ork_root", lambda: engine)
+    return proj, home
+
+
+def _drafting_turn(home, seen_prompts, *, draft=True):
+    """A fake orchestrator turn: optionally calls the real draft_recipe (as the
+    MCP server would) and streams its tool_use + tool_result."""
+    from mini_ork import recipe_author
+
+    def turn(lane, prompt, cwd, home_arg, resume, on_event):
+        async def _run():
+            seen_prompts.append(prompt)
+            if draft:
+                result = recipe_author.draft(home, _AUDIT_SPEC)
+                await on_event({"type": "assistant", "message": {"content": [
+                    {"type": "tool_use", "id": "toolu_d1", "name": "mcp__mini-ork__draft_recipe",
+                     "input": {"spec": _AUDIT_SPEC}}]}})
+                await on_event({"type": "user", "message": {"content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_d1",
+                     "content": [{"type": "text", "text": json.dumps(result)}]}]}})
+            else:
+                await on_event({"type": "assistant", "message": {"content": [
+                    {"type": "text", "text": "What should a run receive?"}]}})
+            return _Turn()
+        return _run()
+    return lambda lane, prompt, cwd, home, resume, on_event: turn(lane, prompt, cwd, home, resume, on_event)
+
+
+def test_a_drafted_recipe_shows_as_diffs_and_create_commits_it(tmp_path, monkeypatch):
+    proj, home = _authoring_project(tmp_path, monkeypatch)
+    prompts: list[str] = []
+    agent, thread = _thread_agent(proj, orchestrator_turn=_drafting_turn(home, prompts))
+    conn = _PermConn(["create", "later"])
+    agent.on_connect(conn)
+    asyncio.run(agent.prompt(thread, [_text_block("I want a recipe that audits migrations")]))
+    updates = [u for _, u in conn.sent]
+    preview = [u for u in updates if isinstance(u, ToolCallProgress) and u.tool_call_id == "toolu_d1" and u.content]
+    diffs = [c for u in preview for c in u.content if isinstance(c, FileEditToolCallContent)]
+    assert any(d.path.endswith("recipes/migration-audit/workflow.yaml") for d in diffs)
+    assert all(d.old_text is None for d in diffs)  # a new recipe
+    assert any("Grade A" in getattr(getattr(c, "content", None), "text", "")
+               for u in preview for c in u.content)
+    assert conn.asked[0] == ("toolu_d1", ["Create recipe", "Change something", "Discard draft"])
+    assert conn.asked[1][1] == ["Test it now", "Not now"]
+    assert (home / "recipes" / "migration-audit" / "workflow.yaml").is_file()
+    assert not (home / "recipe-drafts" / "migration-audit").exists()
+    texts = [getattr(u.content, "text", "") for u in updates if isinstance(u, AgentMessageChunk)]
+    assert any("Created `.mini-ork/recipes/migration-audit`" in t for t in texts)
+    links = [u.content.name for u in updates if isinstance(u, AgentMessageChunk)
+             and isinstance(u.content, ResourceContentBlock)]
+    assert "workflow.yaml" in links and "prompts/editor.md" in links
+
+
+def test_no_draft_means_no_buttons_even_after_recipe_new(tmp_path, monkeypatch):
+    proj, home = _authoring_project(tmp_path, monkeypatch)
+    prompts: list[str] = []
+    agent, thread = _thread_agent(proj, orchestrator_turn=_drafting_turn(home, prompts, draft=False))
+    conn = _PermConn([])
+    agent.on_connect(conn)
+    asyncio.run(agent.prompt(thread, [_text_block("/recipe new audit migrations")]))
+    assert conn.asked == []
+    assert "create a new recipe" in prompts[0] and "audit migrations" in prompts[0]
+    titles = [u.title for _, u in conn.sent if isinstance(u, SessionInfoUpdate)]
+    assert titles and titles[0] == "New recipe: audit migrations"
+    from mini_ork.acp.threads import ThreadStore
+    users = [r["text"] for r in ThreadStore(home).read(thread) if r["type"] == "user"]
+    assert users == ["/recipe new audit migrations"]
+
+
+def test_change_keeps_the_draft_and_the_users_next_message(tmp_path, monkeypatch):
+    proj, home = _authoring_project(tmp_path, monkeypatch)
+    prompts: list[str] = []
+    agent, thread = _thread_agent(proj, orchestrator_turn=_drafting_turn(home, prompts))
+    conn = _PermConn(["change", "discard"])
+    agent.on_connect(conn)
+    asyncio.run(agent.prompt(thread, [_text_block("make me a migration audit recipe")]))
+    assert (home / "recipe-drafts" / "migration-audit").is_dir()
+    asyncio.run(agent.prompt(thread, [_text_block("make the check run alembic check")]))
+    assert prompts[-1] == "make the check run alembic check"
+    assert not (home / "recipe-drafts" / "migration-audit").exists()  # discarded on the 2nd draft
+
+
+def test_dismissing_the_dialog_keeps_the_draft(tmp_path, monkeypatch):
+    proj, home = _authoring_project(tmp_path, monkeypatch)
+    agent, thread = _thread_agent(proj, orchestrator_turn=_drafting_turn(home, []))
+    conn = _PermConn([None])
+    agent.on_connect(conn)
+    asyncio.run(agent.prompt(thread, [_text_block("draft it")]))
+    assert (home / "recipe-drafts" / "migration-audit").is_dir()
+    texts = [getattr(u.content, "text", "") for _, u in conn.sent if isinstance(u, AgentMessageChunk)]
+    assert any("Draft kept" in t for t in texts)
+
+
+def test_test_it_now_runs_the_example_kickoff(tmp_path, monkeypatch):
+    proj, home = _authoring_project(tmp_path, monkeypatch)
+    launched: list[tuple[str, str]] = []
+
+    def launcher(run_id, kickoff):
+        launched.append((run_id, kickoff))
+        return {"ok": True}
+
+    agent, thread = _thread_agent(
+        proj, orchestrator_turn=_drafting_turn(home, []), launcher=launcher,
+        reader=lambda rid: {"status": "published", "events": [], "llm_calls": []})
+    agent.on_connect(_PermConn(["create", "test"]))
+    asyncio.run(agent.prompt(thread, [_text_block("draft it")]))
+    (run_id, kickoff), = launched
+    assert agent._recipes[run_id] == "migration-audit"
+    assert kickoff.startswith("# Audit migration 0042")
+
+
+def test_recipe_edit_of_an_engine_recipe_offers_a_project_copy(tmp_path, monkeypatch):
+    proj, home = _authoring_project(tmp_path, monkeypatch)
+    agent, thread = _thread_agent(proj)
+    conn = _PermConn(["copy"])
+    agent.on_connect(conn)
+    asyncio.run(agent.prompt(thread, [_text_block("/recipe edit docs")]))
+    assert conn.asked[0][1] == ["Copy into this project", "Cancel"]
+    assert (home / "recipes" / "docs" / "workflow.yaml").is_file()
+    links = [u.content.name for _, u in conn.sent if isinstance(u, AgentMessageChunk)
+             and isinstance(u.content, ResourceContentBlock)]
+    assert "prompts/editor.md" in links
+
+
+def test_recipe_edit_of_a_spec_recipe_goes_to_the_orchestrator(tmp_path, monkeypatch):
+    from mini_ork import recipe_author
+
+    proj, home = _authoring_project(tmp_path, monkeypatch)
+    recipe_author.draft(home, _AUDIT_SPEC)
+    recipe_author.commit_draft(home, "migration-audit")
+    prompts: list[str] = []
+    agent, thread = _thread_agent(proj, orchestrator_turn=_drafting_turn(home, prompts, draft=False))
+    agent.on_connect(_PermConn([]))
+    asyncio.run(agent.prompt(thread, [_text_block("/recipe edit migration-audit")]))
+    assert "get_recipe_spec" in prompts[0] and 'base="migration-audit"' in prompts[0]
