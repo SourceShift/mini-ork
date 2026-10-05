@@ -34,6 +34,10 @@
 #   MINI_ORK_RUN_ID      current run id (used in log path)
 #   MO_TEST_BASELINE     set to 0 to disable baseline (revert to absolute gating)
 #   MO_CODEFIX_REPLAY    set to 0 to disable the delta-gate replay (default ON)
+#   MO_SUITE_ADEQUACY               set to 1 to score the suite by mutant kill rate
+#   MO_SUITE_ADEQUACY_MAX_MUTANTS   cap on generated mutants (default 12, 1..50)
+#   MO_SUITE_ADEQUACY_MIN_SCORE     adequacy threshold (default 0.6, 0..1)
+#   MO_SUITE_ADEQUACY_TIMEOUT_S     per-run suite timeout (default 300, >=1)
 
 from __future__ import annotations
 import json
@@ -53,6 +57,13 @@ try:
 except Exception:                       # pragma: no cover — defensive only
     _replay_check = None                # type: ignore[assignment]
     _REPLAY_AVAILABLE = False
+
+try:
+    # Late import — same seam as replay_check above; the verifier must keep
+    # working in environments that do not have mini_ork installed.
+    from mini_ork.gates import suite_adequacy as _suite_adequacy
+except Exception:                       # pragma: no cover — defensive only
+    _suite_adequacy = None              # type: ignore[assignment]
 
 MINI_ORK_HOME = os.environ.get("MINI_ORK_HOME", ".mini-ork")
 MINI_ORK_RUN_ID = os.environ.get("MINI_ORK_RUN_ID", "unknown-run")
@@ -155,6 +166,50 @@ def _overlay_candidate_tests(base_wt: str, candidate_cwd: str) -> list[str]:
     return sorted(overlaid)
 
 
+def _changed_source_files(candidate_cwd: str) -> list[str]:
+    """Changed non-test ``.py`` files from ``git status --porcelain``.
+
+    Mirrors ``_overlay_candidate_tests``: renames resolve to the new path,
+    ignored (``!!``) and deleted (status contains ``D``) paths are skipped,
+    and quoted paths are skipped (they carry git's ``"`` escaping). Only
+    ``.py`` paths that are NOT test paths are kept. Returns a sorted, deduped
+    list; ``[]`` on any git error.
+    """
+    proc = subprocess.run(
+        ["git", "status", "--porcelain", "--untracked-files=all"],
+        cwd=candidate_cwd,
+        capture_output=True, text=True,
+    )
+    if proc.returncode != 0:
+        return []
+
+    changed: list[str] = []
+    for line in proc.stdout.splitlines():
+        if not line or len(line) < 3:
+            continue
+        if " -> " in line:
+            prefix, _, new_part = line.partition(" -> ")
+            status = prefix[:2]
+            rel_path = new_part.strip()
+        else:
+            status = line[:2]
+            rel_path = line[3:].strip()
+        if not rel_path:
+            continue
+        if status == "!!":
+            continue
+        if "D" in status:
+            continue
+        if rel_path.startswith('"'):
+            continue
+        if not rel_path.endswith(".py"):
+            continue
+        if _is_test_path(rel_path):
+            continue
+        changed.append(rel_path)
+    return sorted(set(changed))
+
+
 def _package_scripts():
     try:
         with open("package.json", encoding="utf-8") as f:
@@ -230,7 +285,7 @@ def first_fail_line(log):
     return "see log"
 
 
-def emit(passed, reason, post_rc, replay=None):
+def emit(passed, reason, post_rc, replay=None, adequacy=None):
     summary = reason if passed else f"{reason}: {first_fail_line(LOG_PATH)}"
     payload = {
         "verifier": "test", "pass": passed, "evidence_path": LOG_PATH,
@@ -239,30 +294,62 @@ def emit(passed, reason, post_rc, replay=None):
     }
     if replay is not None:
         payload["replay"] = replay
+    if adequacy is not None:
+        payload["suite_adequacy"] = adequacy
     print(json.dumps(payload, separators=(",", ":"), ensure_ascii=False))
     return 0 if passed else 1
 
 
-def emit_unverified(post_rc, reason, replay=None):
+def emit_unverified(post_rc, reason, replay=None, adequacy=None, flag="replay_unverified"):
     """Emit an abstention (gate treats as 'no roll-back, no certify'). Exits 0.
 
     The payload carries `pass: False` so any caller that only reads `pass`
     does not silently certify a non-verified patch, plus
-    `replay_unverified: True` so a gate that knows about abstention can
-    route it cleanly. The reason is prefixed with `unverified:` so an
-    operator scanning the verifier log sees the abstention immediately.
+    `<flag>: True` so a gate that knows about abstention can route it cleanly.
+    The reason is prefixed with `unverified:` so an operator scanning the
+    verifier log sees the abstention immediately. ``adequacy`` (when present)
+    is the LAST key so the knob-off bytes are unchanged.
     """
     payload = {
         "verifier": "test", "pass": False, "evidence_path": LOG_PATH,
         "error_summary": f"unverified: {reason}",
         "post_rc": post_rc,
         "base_rc": str(BASE_RC) if BASE_RC != "" else "",
-        "replay_unverified": True,
     }
+    payload[flag] = True
     if replay is not None:
         payload["replay"] = replay
+    if adequacy is not None:
+        payload["suite_adequacy"] = adequacy
     print(json.dumps(payload, separators=(",", ":"), ensure_ascii=False))
     return 0
+
+
+def _green_pass(reason, post_rc, replay=None):
+    """Route a green post-patch suite through the (optional) adequacy audit.
+
+    Knob off: byte-identical to the pre-audit ``emit(True, …)``.
+    Knob on: run ``audit_suite`` against the changed source files and downgrade
+    a green that cannot kill its mutants to UNVERIFIED (pass:false, exit 0) —
+    the existing abstention contract, never a rollback.
+    """
+    if os.environ.get("MO_SUITE_ADEQUACY", "0") != "1":
+        return emit(True, reason, post_rc, replay=replay)
+
+    if _suite_adequacy is None:
+        a = {"verdict": "UNVERIFIED", "reason": "module-unavailable"}
+    else:
+        a = _suite_adequacy.audit_suite(
+            os.getcwd(), CMD, _changed_source_files(os.getcwd()),
+            report_path=os.path.join(LOG_DIR, "suite_adequacy.json"),
+        )
+    if a["verdict"] == "ADEQUATE":
+        return emit(True, f"{reason}; suite adequacy ADEQUATE (score {a['score']:.3f})",
+                    post_rc, replay=replay, adequacy=a)
+    return emit_unverified(
+        post_rc, f"suite-{a['verdict'].lower()}: {a['reason']}",
+        replay=replay, adequacy=a, flag="adequacy_unverified",
+    )
 
 
 def _attach_git_worktree_base():
@@ -376,16 +463,16 @@ def main():
     if post_rc == 0:
         # ── Delta-gate replay: a green suite that doesn't exercise the bug is theatre ──
         if os.environ.get("MO_CODEFIX_REPLAY", "1") == "0":
-            return emit(True, "post-patch suite green (replay opt-out: MO_CODEFIX_REPLAY=0)", post_rc)
+            return _green_pass("post-patch suite green (replay opt-out: MO_CODEFIX_REPLAY=0)", post_rc)
         replay_result = _run_replay_check()
         if replay_result is None:
-            return emit(True, "post-patch suite green (replay skipped: certify unavailable or not a git repo)", post_rc)
+            return _green_pass("post-patch suite green (replay skipped: certify unavailable or not a git repo)", post_rc)
         if replay_result.get("unverified"):
             return emit_unverified(post_rc, replay_result["reason"],
                                    replay=replay_result.get("replay"))
         if replay_result["passed"]:
-            return emit(True, "post-patch suite green; replay: tests exercise the change",
-                        post_rc, replay=replay_result["replay"])
+            return _green_pass("post-patch suite green; replay: tests exercise the change",
+                               post_rc, replay=replay_result["replay"])
         return emit(False, replay_result["reason"], post_rc, replay=replay_result["replay"])
 
     # ── Post-patch failed → establish a baseline to attribute blame ───────
