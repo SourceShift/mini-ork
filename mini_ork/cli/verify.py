@@ -80,7 +80,9 @@ def _find_verifier_script(raw, root, home):
     # (and vice versa for not-yet-repointed contracts).
     exts = [".py", ".sh"] if raw.endswith(".py") else [".sh", ".py"]
     recipe = os.environ.get("MINI_ORK_RECIPE")
-    bases = ([os.path.join(root, "recipes", recipe, "verifiers")] if recipe else []) + [
+    # A project recipe (home overlay) first, as runs resolve recipes, then the engine's.
+    bases = ([os.path.join(home, "recipes", recipe, "verifiers"),
+              os.path.join(root, "recipes", recipe, "verifiers")] if recipe else []) + [
         os.path.join(home, "verifiers"),
         os.path.join(root, "verifiers")]
     for ext in exts:

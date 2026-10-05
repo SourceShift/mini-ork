@@ -12,6 +12,26 @@ import os
 from pathlib import Path
 
 
+def recipe_dir(recipe, root, workflow_path=None) -> Path | None:
+    """The recipe's directory, resolved the way a run resolves it: the
+    directory of the workflow being run when known, else the project home's
+    ``recipes/`` (MINI_ORK_HOME), else the engine's — so a project recipe's
+    contract is read from the project, not looked up in the engine."""
+    if workflow_path and os.path.isfile(workflow_path):
+        return Path(workflow_path).parent
+    if not recipe:
+        return None
+    from mini_ork.context import context_env
+
+    bases = [b for b in (context_env("MINI_ORK_HOME", ""), str(root)) if b]
+    for base in bases:
+        for name in (recipe, recipe.replace("_", "-")):
+            candidate = Path(base) / "recipes" / name
+            if (candidate / "workflow.yaml").is_file() or (candidate / "artifact_contract.yaml").is_file():
+                return candidate
+    return None
+
+
 def recipe_fallback_plan(recipe, workflow_path, root, kickoff) -> str | None:
     if not recipe or not workflow_path or not os.path.isfile(workflow_path):
         return None
@@ -19,7 +39,7 @@ def recipe_fallback_plan(recipe, workflow_path, root, kickoff) -> str | None:
     workflow = yaml.safe_load(Path(workflow_path).read_text(encoding="utf-8")) or {}
     nodes = workflow.get("nodes") or []
     edges = workflow.get("edges") or []
-    contract_path = Path(root) / "recipes" / recipe / "artifact_contract.yaml"
+    contract_path = (recipe_dir(recipe, root, workflow_path) or Path(root) / "recipes" / recipe) / "artifact_contract.yaml"
     contract = {}
     if contract_path.exists():
         contract = yaml.safe_load(contract_path.read_text(encoding="utf-8")) or {}
@@ -65,7 +85,8 @@ def overlay_plan(plan_json, task_class, profile_path, root) -> str:
             recipe = (json.load(open(profile_path)).get("recipe") or "").strip()
         except Exception:
             recipe = ""
-    contract_yaml = os.path.join(root, "recipes", recipe, "artifact_contract.yaml") if recipe else ""
+    rdir = recipe_dir(recipe, root) if recipe else None
+    contract_yaml = str(rdir / "artifact_contract.yaml") if rdir else ""
     if contract_yaml and os.path.isfile(contract_yaml):
         try:
             import yaml
