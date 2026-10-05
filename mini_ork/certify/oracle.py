@@ -42,6 +42,7 @@ from pathlib import Path
 
 from mini_ork.certify import invariants as mr
 from mini_ork.certify import probe as poc_plus
+from mini_ork.certify import relations
 from mini_ork.certify.context import CodeContext
 from mini_ork.certify.verdict import (
     PROVEN,
@@ -331,9 +332,15 @@ def judge(
         context=context,
     )
     if not cands:
-        return Verdict(UNVERIFIED,
-                       "the probe passes, but no invariant that reproduces the bug could be built "
-                       "-> cannot rule out a special-cased patch", poc_plus=poc_src)
+        no_cands_reason = ("the probe passes, but no invariant that reproduces the bug could be built "
+                           "-> cannot rule out a special-cased patch")
+        if relations.enabled() and relations.rescue_enabled():
+            rec = relations.check(poc_src, issue, patch, runner=runner,
+                                  dispatch=d_fn, context=context, rescue=True)
+            return Verdict(rec["verdict"] or UNVERIFIED,
+                           rec["reason"] or no_cands_reason,
+                           poc_plus=poc_src, detail={"relations": rec})
+        return Verdict(UNVERIFIED, no_cands_reason, poc_plus=poc_src)
 
     kept, dropped, holds, broken, inconclusive = [], [], 0, 0, 0
     for name, src in cands:                               # already validated informative
@@ -412,10 +419,24 @@ def judge(
             verdict = UNVERIFIED
         # else: keep mr.score's UNVERIFIED reason verbatim.
 
+    # ── Term 4: metamorphic relations (veto a would-be PROVEN) ──────────────
+    # A special-cased patch passes every invariant yet breaks a relation BETWEEN two
+    # executions. This can only turn PROVEN -> REFUTED (it cannot create PROVEN, and it
+    # never runs on a would-be REFUTED/UNVERIFIED). Knobs off => no dispatch, no key.
+    detail = {"invariants": kept, "dropped": dropped,
+              "n_effective": n_eff, "inconclusive": inconclusive}
+    if verdict == PROVEN and relations.enabled():
+        rec = relations.check(poc_src, issue, patch, runner=runner,
+                              dispatch=d_fn, context=context,
+                              k=relations.k_from_env())
+        detail["relations"] = rec
+        if rec["verdict"] == REFUTED:
+            verdict = REFUTED
+            reason = rec["reason"]
+
     return Verdict(verdict, reason, poc_plus=poc_src,
                    mr_pass_rate=(rate if n else None), mr_n=n,
-                   detail={"invariants": kept, "dropped": dropped,
-                           "n_effective": n_eff, "inconclusive": inconclusive})
+                   detail=detail)
 
 
 __all__ = ["judge", "replay_check"]
