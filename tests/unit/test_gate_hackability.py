@@ -295,6 +295,10 @@ def test_lane_proposer(db, monkeypatch):
     assert result["cost_usd"] == pytest.approx(0.42)
     assert result["status"] == "ok"
 
+    # The dispatch tempfiles are cleaned up after the call.
+    out = argv[argv.index("--out") + 1]
+    assert not os.path.exists(out) and not os.path.exists(f"{out}.cost")
+
     # budget_usd=0 ⇒ budget_exhausted with no call.
     p0 = hackability.lane_proposer("glm", budget_usd=0.0)
     r0 = p0(ctx, 4)
@@ -490,3 +494,34 @@ def test_cli_usage_errors(db, capsys):
     # An unknown gate exits 2 and writes no record.
     assert gate_fuzz.main(["--hackability", "--gate", "nope", "--db", str(db)]) == 2
     assert not os.path.isdir(hackability.records_dir(str(db)))
+
+
+def test_lane_proposer_passes_cwd_guard_from_framework_checkout(monkeypatch):
+    """Live smoke regression (2026-10-05): run from a mini-ork checkout, the
+    proposer's lane cwd resolved INSIDE the framework tree, so the dispatcher's
+    real cwd guard refused every call (proposer_status=dispatch_failed). The
+    proposer must hand the lane a throwaway MO_TARGET_CWD outside the tree."""
+    from mini_ork.dispatch.providers import cwd_guard
+
+    engine = str(hackability.ENGINE_ROOT)
+    monkeypatch.chdir(engine)                       # gate-fuzz's real cwd
+    monkeypatch.delenv("MO_TARGET_CWD", raising=False)
+    monkeypatch.delenv("MO_ALLOW_FRAMEWORK_CWD", raising=False)
+    seen = {}
+
+    def fake_llm_dispatch(argv=None, *, root=None, dispatch_fn=None):
+        target = os.environ.get("MO_TARGET_CWD") or os.getcwd()
+        seen["target"] = target
+        seen["guard"] = cwd_guard(target, engine, env=dict(os.environ))
+        out = argv[argv.index("--out") + 1]
+        with open(out, "w", encoding="utf-8") as f:
+            f.write('["{}"]')
+        return 0
+
+    monkeypatch.setattr("mini_ork.dispatch.llm_dispatch.llm_dispatch", fake_llm_dispatch)
+    result = hackability.lane_proposer("glm", budget_usd=1.0)({"gate_type": "x"}, 1)
+
+    assert seen["guard"].ok, seen["guard"]
+    assert result["status"] == "ok"
+    assert not os.path.exists(seen["target"])       # scratch dir removed
+    assert os.environ.get("MO_TARGET_CWD") is None  # env restored

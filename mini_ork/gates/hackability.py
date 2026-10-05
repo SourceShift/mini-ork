@@ -65,6 +65,7 @@ import io
 import json
 import os
 import re
+import shutil
 import sqlite3
 import tempfile
 import time
@@ -312,14 +313,22 @@ def lane_proposer(lane: str, budget_usd: Optional[float] = None) -> Proposer:
         ]
         stdout = io.StringIO()
         stderr = io.StringIO()
+        # `gate-fuzz` runs from a mini-ork checkout, and the dispatcher's cwd guard
+        # refuses any lane whose cwd lands inside the framework tree. The proposer
+        # only writes text, so — like certify.llm.default_dispatch — it gets a
+        # throwaway target dir: the guard passes and the lane cannot touch a repo.
+        scratch = tempfile.mkdtemp(prefix="mo-hk-lane-")
         try:
-            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            with scoped_environ({"MO_TARGET_CWD": scratch}), \
+                    contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
                 rc = native_dispatch.llm_dispatch(
                     argv,
                     root=os.environ.get("MINI_ORK_ROOT") or os.getcwd(),
                 )
         except Exception:
             rc = 1
+        finally:
+            shutil.rmtree(scratch, ignore_errors=True)
         cost = 0.0
         try:
             with open(f"{out}.cost", encoding="utf-8") as f:
@@ -327,13 +336,18 @@ def lane_proposer(lane: str, budget_usd: Optional[float] = None) -> Proposer:
         except (OSError, ValueError):
             cost = 0.0
         state["spent"] += cost
-        if rc != 0:
-            return {"documents": [], "cost_usd": cost, "status": "dispatch_failed"}
         try:
             with open(out, encoding="utf-8") as f:
                 text = f.read()
         except OSError:
             text = ""
+        for suffix in ("", ".cost", ".model", ".tokens", ".err.log"):
+            try:
+                os.remove(out + suffix)
+            except OSError:
+                pass
+        if rc != 0:
+            return {"documents": [], "cost_usd": cost, "status": "dispatch_failed"}
         docs = parse_proposals(text, n)
         if docs is None:
             return {"documents": [], "cost_usd": cost, "status": "unparseable"}
