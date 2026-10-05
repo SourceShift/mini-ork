@@ -1048,10 +1048,10 @@ def _automation_home(home: Path) -> Path:
     return home
 
 
-def test_automations_table_lists_one_row(home):
+def test_automations_table_lists_one_row(home, monkeypatch):
     """``/automations`` renders a markdown row per automation."""
     _automation_home(home)
-    monkeypatch_scheduler(home, installed=False)
+    monkeypatch_scheduler(monkeypatch, home, installed=False)
     agent = _agent(home)
     out = asyncio.run(cmds.handle_automations(agent, "run-1-abc", ""))
     assert "| automation |" in out
@@ -1066,10 +1066,10 @@ def test_automations_empty_returns_kickoff_copy(home):
     assert "No automations yet" in out
 
 
-def test_automation_card_for_known_id(home):
+def test_automation_card_for_known_id(home, monkeypatch):
     """``/automation <id>`` → card with heading + metadata line."""
     _automation_home(home)
-    monkeypatch_scheduler(home, installed=True, last_tick="2026-01-01T09:00:00")
+    monkeypatch_scheduler(monkeypatch, home, installed=True, last_tick="2026-01-01T09:00:00")
     agent = _agent(home)
     out = asyncio.run(cmds.handle_automation(agent, "run-1-abc", "weekday"))
     assert "### " in out
@@ -1085,9 +1085,9 @@ def test_automation_unknown_id_message(home):
     assert "/automations" in out
 
 
-def test_automation_empty_arg_falls_back_to_table(home):
+def test_automation_empty_arg_falls_back_to_table(home, monkeypatch):
     _automation_home(home)
-    monkeypatch_scheduler(home, installed=False)
+    monkeypatch_scheduler(monkeypatch, home, installed=False)
     agent = _agent(home)
     out = asyncio.run(cmds.handle_automation(agent, "run-1-abc", ""))
     assert "| automation |" in out
@@ -1164,7 +1164,7 @@ def test_automation_delete_returns_confirmation(home, monkeypatch):
 
 def test_automation_scheduler_status_paragraph(home, monkeypatch):
     """``/automation scheduler`` returns one paragraph (off + log path)."""
-    monkeypatch_scheduler(home, installed=False)
+    monkeypatch_scheduler(monkeypatch, home, installed=False)
     agent = _agent(home)
     out = asyncio.run(cmds.handle_automation_scheduler(
         agent, "run-1-abc", ""))
@@ -1239,15 +1239,14 @@ def test_merge_uses_merge_message_helper(home):
     assert msg == "Fix the bug (mini-ork run-m-1)"
 
 
-def monkeypatch_scheduler(home: Path, *, installed: bool, last_tick=None) -> None:
-    """Replace ``automations.scheduler_status`` with a stub.
+def monkeypatch_scheduler(monkeypatch: pytest.MonkeyPatch, home: Path, *, installed: bool,
+                          last_tick=None) -> None:
+    """Replace ``automations.scheduler_status`` with a stub for this test only.
 
-    Tests that need a known scheduler state should call this from their
-    fixture; the handler picks up the monkeypatched function via the
-    module-level import in ``mini_ork.acp.commands``.
+    Through ``monkeypatch`` so it is undone at teardown: an unstopped
+    ``mock.patch`` leaked the stub into every later test file in the process.
     """
     import mini_ork.automations as _auto
-    from unittest import mock
     payload = {
         "platform": "macos",
         "installed": installed,
@@ -1255,5 +1254,4 @@ def monkeypatch_scheduler(home: Path, *, installed: bool, last_tick=None) -> Non
         "log_path": str(home / "automations-tick.log"),
         "last_tick": last_tick,
     }
-    mock.patch.object(_auto, "scheduler_status",
-                      lambda _h: payload).start()
+    monkeypatch.setattr(_auto, "scheduler_status", lambda _h: payload)
