@@ -224,6 +224,20 @@ def status(ws: Workspace) -> dict[str, Any]:
             added += a
             removed += r
             files.append({"path": parts[2], "added": a, "removed": r})
+    # ``git diff`` never sees untracked files, so a run that only creates
+    # files would read +0 −0; count their lines too (merge commits them).
+    rc, untracked, _ = _git(["ls-files", "--others", "--exclude-standard"], ws.path)
+    if rc == 0:
+        for rel in untracked.splitlines():
+            if not rel.strip():
+                continue
+            try:
+                data = (ws.path / rel).read_bytes()
+            except OSError:
+                continue
+            a = 0 if b"\0" in data[:8192] else data.count(b"\n") + (0 if data.endswith(b"\n") or not data else 1)
+            added += a
+            files.append({"path": rel, "added": a, "removed": 0})
     return {
         "exists": True,
         "commits_ahead": commits_ahead,

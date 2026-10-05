@@ -307,3 +307,16 @@ def test_merge_uses_the_repos_identity_and_refuses_a_non_ff_merge_over_local_edi
     assert out["ok"] is False and "uncommitted changes" in out["error"]
     assert git("log", "-1", "--format=%ae", "mini-ork/run-x") .strip() == "ada@example.com"
     assert (proj / "b.txt").read_text() == "local edit\n"   # untouched
+
+
+def test_status_counts_files_the_run_created(tmp_path: Path) -> None:
+    """A run that only adds files is a change: untracked files count."""
+    project = _init_repo(tmp_path)
+    home = _init_home(tmp_path)
+    ws = ws_mod.create(project, home, "run-new-files")
+    (ws.path / "notes.md").write_text("one\ntwo\nthree\n", encoding="utf-8")
+    (ws.path / "pkg").mkdir()
+    (ws.path / "pkg" / "mod.py").write_text("x = 1", encoding="utf-8")  # no trailing newline
+    st = ws_mod.status(ws)
+    assert (st["added"], st["removed"]) == (4, 0)
+    assert {f["path"] for f in st["files"]} == {"notes.md", "pkg/mod.py"}
