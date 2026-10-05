@@ -221,19 +221,29 @@ def test_runs_returns_markdown_table(home: Path):
     seed_run(home, run_id="run-aaa-002", recipe="framework-edit", recipe_pretty="Edit scope")
     agent = _agent(home)
     out = asyncio.run(cmds.handle_runs(agent, "run-1-abc", ""))
-    assert "run id" in out  # header row (space, not underscore)
-    assert "run-aaa-002" in out or "run-aaa-001" in out
-    assert "Open any of these from Thread History" in out
+    # Tabs line leads with the active filter bolded (All, since no arg).
+    assert "**All**" in out
+    for label in ("Working", "Needs you", "Done", "Failed"):
+        assert label in out
+    # At least one seeded run shows up in the table.
+    assert "run-aaa-001" in out or "run-aaa-002" in out
+    # Filter hint footer.
+    assert "details: `/status <run id>`" in out
 
 
 def test_runs_caps_count(home: Path):
-    """/runs N — N clamped to [1, 50], default 10."""
+    """/runs N — N clamped to [1, 50], default 20."""
     for i in range(20):
         seed_run(home, run_id=f"run-many-{i:03d}")
     agent = _agent(home)
     out = asyncio.run(cmds.handle_runs(agent, "run-1-abc", "5"))
-    # Only 5 task_run rows requested → 5 body rows + 2 header rows.
-    body_rows = [ln for ln in out.splitlines() if ln.startswith("| run-")]
+    # Only 5 task_run rows requested → 5 body rows in the table. Body rows
+    # begin with the gutter cell "| <mark> <title> `run-id` |" — match the
+    # backtick-quoted id pattern the kickoff mandates.
+    body_rows = [
+        ln for ln in out.splitlines()
+        if ln.startswith("|") and "`run-many-" in ln
+    ]
     assert len(body_rows) == 5
 
 
@@ -241,14 +251,34 @@ def test_runs_rejects_invalid_count(home: Path):
     seed_run(home, run_id="run-bad-001")
     agent = _agent(home)
     out = asyncio.run(cmds.handle_runs(agent, "run-1-abc", "not-a-number"))
-    # Falls back to default 10; the row is shown.
+    # Falls back to default 20; the row is shown.
     assert "run-bad-001" in out
 
 
 def test_runs_empty(home: Path):
     agent = _agent(home)
     out = asyncio.run(cmds.handle_runs(agent, "run-1-abc", ""))
-    assert "No runs recorded yet" in out
+    assert "No runs match." in out
+
+
+def test_runs_state_filter(home: Path):
+    """/runs <state> — only matching rows; tabs line bolds the active filter."""
+    seed_run(home, run_id="run-done-001", status="published")
+    seed_run(home, run_id="run-exec-001", status="executing")
+    agent = _agent(home)
+    out = asyncio.run(cmds.handle_runs(agent, "run-1-abc", "done"))
+    assert "run-done-001" in out
+    assert "run-exec-001" not in out
+
+
+def test_runs_recipe_filter(home: Path):
+    """/runs recipe:<id> — exact recipe id match."""
+    seed_run(home, run_id="run-cf-001", recipe="code-fix")
+    seed_run(home, run_id="run-fe-001", recipe="framework-edit")
+    agent = _agent(home)
+    out = asyncio.run(cmds.handle_runs(agent, "run-1-abc", "recipe:code-fix"))
+    assert "run-cf-001" in out
+    assert "run-fe-001" not in out
 
 
 # ── /status ──────────────────────────────────────────────────────────────────
@@ -258,8 +288,8 @@ def test_status_run_session(home: Path):
     seed_run(home, run_id="run-st-001", recipe="code-fix")
     agent = _agent(home)
     out = asyncio.run(cmds.handle_status(agent, "run-st-001", ""))
-    assert "status" in out
     assert "run-st-001" in out
+    assert "code-fix" in out
 
 
 def test_status_thread_with_run(home: Path):
@@ -613,7 +643,16 @@ def test_status_counts_a_finished_node_as_done_not_running(home: Path):
     seed_run(home, run_id="run-nodes-001", status="executing")
     _seed_events(home, "run-nodes-001", [("node_start", "n1"), ("node_end", "n1"), ("node_start", "n2")])
     out = asyncio.run(cmds.handle_status(_agent(home), "run-nodes-001", ""))
-    assert "1 done · 1 running · 0 failed" in out
+    # New shape: steps table with one row per node. ``n1`` has a matching
+    # node_end (``done``); ``n2`` is the running node (no node_end yet).
+    assert "| `n1` |" in out
+    assert "| `n2` |" in out
+    # The result column carries "done" for the finished node and
+    # "running" for the still-open one.
+    n1_done = [ln for ln in out.splitlines() if ln.startswith("| `n1` |") and "done" in ln]
+    n2_running = [ln for ln in out.splitlines() if ln.startswith("| `n2` |") and "running" in ln]
+    assert n1_done, f"expected done row for n1, got:\n{out}"
+    assert n2_running, f"expected running row for n2, got:\n{out}"
 
 
 def test_cost_window_is_days_not_rows(home: Path):

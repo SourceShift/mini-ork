@@ -14,10 +14,10 @@ from __future__ import annotations
 
 import asyncio
 import datetime as _dt
-import json
 import os
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -63,10 +63,14 @@ COMMANDS: list[AvailableCommand] = [
     ),
     _cmd(
         "runs",
-        "List recent runs (newest first).",
-        "count (default 10, max 50)",
+        "List every run with state, recipe, step, time, cost, change; filters replace tabs.",
+        "[state] [recipe:<id>] [n] — default 20, max 50",
     ),
-    _cmd("status", "Show the current run's status.", "optional run id"),
+    _cmd(
+        "status",
+        "Run card: state, steps, cost by stage, files changed, verdict, learnings.",
+        "optional run id",
+    ),
     _cmd(
         "learnings",
         "Show failure-mode gradients, learning records, and emergent patterns.",
@@ -164,16 +168,6 @@ Handler = Callable[[Any, str, str], Awaitable[str]]
 # ── helpers shared by handlers ───────────────────────────────────────────────
 
 
-def _payload(ev: dict[str, Any]) -> dict[str, Any]:
-    payload = ev.get("payload_json") or {}
-    if isinstance(payload, str):
-        try:
-            payload = json.loads(payload)
-        except ValueError:
-            payload = {}
-    return payload if isinstance(payload, dict) else {}
-
-
 def _current_run_id(agent: Any, session_id: str, arg: str) -> str | None:
     """Resolve "the run this command acts on".
 
@@ -209,6 +203,35 @@ def _resolve_run_row(agent: Any, run_id: str) -> dict[str, Any] | None:
         return None
 
 
+def _parse_runs_arg(arg: str) -> tuple[str, str | None, int]:
+    """Parse ``/runs [state] [recipe:<id>] [n]`` — order-independent.
+
+    Each token is consumed exactly once: a ``recipe:<id>`` prefix wins,
+    a parseable int wins as ``n``, the remaining state token must match
+    the filter set (with ``needs-you`` accepted alongside ``needs_you``).
+    Unknown tokens fall through; the caller treats the resulting state as
+    ``"all"`` rather than erroring. ``limit`` is clamped to ``[1, 50]``;
+    the default matches the kickoff's ``n=20``.
+    """
+    state = "all"
+    recipe: str | None = None
+    limit = 20
+    for tok in arg.strip().split():
+        if tok.startswith("recipe:"):
+            rest = tok[len("recipe:"):].strip()
+            if rest:
+                recipe = rest
+            continue
+        if tok in ("all", "working", "needs-you", "needs_you", "done", "failed"):
+            state = tok.replace("-", "_")
+            continue
+        try:
+            limit = max(1, min(50, int(tok)))
+        except ValueError:
+            continue
+    return state, recipe, limit
+
+
 # ── handlers ─────────────────────────────────────────────────────────────────
 
 
@@ -225,91 +248,41 @@ async def handle_help(agent: Any, session_id: str, arg: str) -> str:
 
 
 async def handle_runs(agent: Any, session_id: str, arg: str) -> str:
-    """Newest-first table of recent runs (default 10, max 50)."""
-    from mini_ork.acp import history
+    """Fleet view: tab counts + filtered table + filter-hint footer."""
+    from mini_ork.acp import fleet
 
-    tokens = arg.strip().split()
-    try:
-        count = int(tokens[0]) if tokens else 10
-    except (TypeError, ValueError):
-        count = 10
-    count = max(1, min(50, count))
+    state_filter, recipe_filter, limit_n = _parse_runs_arg(arg)
     home = agent._home_for(session_id)
+    now = int(time.time())
     try:
-        rows, _ = history.list_runs(home, limit=count, offset=0)
+        rows, counts = fleet.fleet_rows(
+            home, state=state_filter, recipe=recipe_filter, limit=limit_n
+        )
     except Exception as exc:  # noqa: BLE001 — handler must never raise
         return f"`/runs` failed: {exc}"
-    if not rows:
-        return "No runs recorded yet."
-    headers = ("run id", "status", "recipe", "cost", "age", "title")
-    body = [
-        f"| {' | '.join(headers)} |",
-        f"| {' | '.join('---' for _ in headers)} |",
-    ]
-    for row in rows:
-        body.append(
-            "| "
-            + " | ".join(
-                [
-                    str(row.get("run_id") or ""),
-                    str(row.get("status") or ""),
-                    str(row.get("recipe") or ""),
-                    f"${float(row.get('cost_usd') or 0.0):.2f}",
-                    str(row.get("updated_at") or row.get("created_at") or ""),
-                    (str(row.get("title") or "")).replace("|", "\\|"),
-                ]
-            )
-            + " |"
-        )
-    body.append("")
-    body.append("Open any of these from Thread History → Import Threads.")
-    return "\n".join(body)
+    return fleet.render_fleet(rows, counts, state=state_filter, now=now)
 
 
 async def handle_status(agent: Any, session_id: str, arg: str) -> str:
-    """Current run snapshot: status, recipe, nodes, cost, run dir."""
-    from mini_ork.acp import history
+    """Run card: state, steps, cost by stage, files changed, verdict, learnings."""
+    from mini_ork.acp import fleet
 
     run_id = _current_run_id(agent, session_id, arg)
     if not run_id:
         return "No run in this thread yet — `/runs` lists the project's runs."
     home = agent._home_for(run_id)
     try:
-        snapshot = history.read_snapshot(home, run_id)
+        card = fleet.run_card(home, run_id)
     except Exception as exc:  # noqa: BLE001
         return f"`/status` failed: {exc}"
-    status = snapshot.get("status")
-    row = _resolve_run_row(agent, run_id)
-    recipe = (row or {}).get("recipe") or "—"
-    # Node lifecycle tally: done when state has node_end, running on node_start,
-    # failed when node_end's payload reports ``status=failed``.
-    nodes_done: set[str] = set()
-    nodes_started: set[str] = set()
-    nodes_failed: set[str] = set()
-    for ev in snapshot.get("events") or []:
-        payload = _payload(ev)
-        nid = str(payload.get("node_id") or "")
-        if not nid:
-            continue
-        if ev.get("event_type") == "node_start":
-            nodes_started.add(nid)
-        elif ev.get("event_type") == "node_end":
-            (nodes_failed if payload.get("status") == "failed" else nodes_done).add(nid)
-    nodes_running = nodes_started - nodes_done - nodes_failed
-    cost = sum(float(c.get("cost_usd") or 0.0) for c in snapshot.get("llm_calls") or [])
-    run_dir = home / "runs" / run_id
-    lines = [
-        f"**run**: `{run_id}`",
-        f"**status**: `{status}`",
-        f"**recipe**: `{recipe}`",
-        f"**nodes**: {len(nodes_done)} done · {len(nodes_running)} running · {len(nodes_failed)} failed",
-        f"**cost so far**: ${cost:.2f}",
-        f"**run dir**: `{run_dir}`",
-    ]
-    if not row:
-        lines.append("")
-        lines.append("_(no task_run row yet — the launcher is still staging the kickoff)_")
-    return "\n".join(lines)
+    if card is None:
+        return f"No run {run_id} in this project."
+    serve_url: str | None = None
+    port = int(os.environ.get("MO_SERVE_PORT", "7090") or 7090)
+    if _probe(f"http://127.0.0.1:{port}/health", timeout=1.0):
+        serve_url = f"http://127.0.0.1:{port}"
+    now = int(time.time())
+    return fleet.render_card(card, now=now, serve_url=serve_url)
 
 
 async def handle_learnings(agent: Any, session_id: str, arg: str) -> str:
