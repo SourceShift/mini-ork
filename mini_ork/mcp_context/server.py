@@ -382,6 +382,10 @@ def _list_recipes(home: Path, args: dict[str, Any]) -> dict[str, Any]:
     ``recipes.mini_ork_root()`` cannot silently shift the list the
     orchestrator sees. The catalog never raises; a missing home / engine
     / recipes dir degrades to the entries that can be read.
+
+    The ``grade`` and ``runs`` fields are computed by the same projection
+    that powers ``/recipes`` (``mini_ork.acp.recipe_view.recipe_rows``)
+    so the orchestrator's picker and the ACP surface stay coherent.
     """
     del args
     try:
@@ -392,6 +396,61 @@ def _list_recipes(home: Path, args: dict[str, Any]) -> dict[str, Any]:
         entries = recipes_catalog.list_recipes(home)
     except Exception as exc:
         return {"error": f"could not list recipes: {exc}"}
+    # Cheap aggregate fields: ``grade`` from the static eval module and
+    # ``runs`` from the ``task_runs`` table grouped by recipe. Both lookups
+    # are wrapped — a missing db / eval module degrades to zeros so the
+    # picker stays usable.
+    grade_by_id: dict[str, tuple[str, int]] = {}
+    runs_by_id: dict[str, int] = {}
+    engine_root: Path | None = None
+    eval_recipe_fn: Any = None
+    grade_fn: Any = None
+    try:
+        from mini_ork.cli.recipe_eval import _grade, eval_recipe
+        from mini_ork.web.control import _mini_ork_root
+
+        engine_root = _mini_ork_root()
+        eval_recipe_fn = eval_recipe
+        grade_fn = _grade
+    except Exception:
+        pass
+    for entry in entries:
+        if engine_root is None or eval_recipe_fn is None or grade_fn is None:
+            grade_by_id[entry.id] = ("—", 0)
+            continue
+        try:
+            root = entry.path.parent.parent
+            res = eval_recipe_fn(root, entry.id)
+        except Exception:
+            grade_by_id[entry.id] = ("—", 0)
+            continue
+        score = res.get("score") if isinstance(res, dict) else None
+        if not isinstance(score, (int, float)):
+            score = 0
+        try:
+            grade_by_id[entry.id] = (grade_fn(int(score)), int(score))
+        except Exception:
+            grade_by_id[entry.id] = ("—", 0)
+    try:
+        from mini_ork.web.deps import db_for
+
+        db = db_for(home) if home is not None else None
+    except Exception:
+        db = None
+    if db is not None and getattr(db, "has_table", None) and db.has_table("task_runs"):
+        try:
+            agg_rows = db.rows(
+                "SELECT recipe, COUNT(*) AS runs FROM task_runs GROUP BY recipe"
+            )
+            for row in agg_rows or []:
+                rid = row.get("recipe")
+                if isinstance(rid, str) and rid:
+                    try:
+                        runs_by_id[rid] = int(row.get("runs") or 0)
+                    except (TypeError, ValueError):
+                        pass
+        except Exception:
+            pass
     out: list[dict[str, Any]] = []
     for entry in entries:
         item: dict[str, Any] = {
@@ -399,11 +458,40 @@ def _list_recipes(home: Path, args: dict[str, Any]) -> dict[str, Any]:
             "description": entry.description,
             "source": entry.source,
             "nodes": entry.node_count,
+            "grade": grade_by_id.get(entry.id, ("—", 0))[0],
+            "grade_score": grade_by_id.get(entry.id, ("—", 0))[1],
+            "runs": runs_by_id.get(entry.id, 0),
         }
         if entry.shadows_engine:
             item["overrides_engine"] = True
         out.append(item)
     return {"recipes": out}
+
+
+# ── read-only tool: describe_recipe ───────────────────────────────────────
+
+
+def _describe_recipe(home: Path, args: dict[str, Any]) -> dict[str, Any]:
+    """Card payload for one recipe (read-only MCP tool).
+
+    Returns the full card as a serialisable dict; unknown id → ``{"error"}``.
+    Wrapped in a try/except so a broken recipe file or missing eval module
+    degrades to a structured error rather than crashing the JSON-RPC layer.
+    """
+    rid = args.get("id")
+    if not isinstance(rid, str) or not rid.strip():
+        return {"error": "id is required"}
+    try:
+        from mini_ork.acp import recipe_view
+    except Exception as exc:
+        return {"error": f"could not import recipe view: {exc}"}
+    try:
+        payload = recipe_view.describe_recipe_payload(home, rid.strip())
+    except Exception as exc:
+        return {"error": f"describe_recipe failed: {exc}"}
+    if payload is None:
+        return {"error": f"recipe not found: {rid}"}
+    return {"recipe": payload}
 
 
 # ── control tool: start_run ────────────────────────────────────────────────
@@ -737,6 +825,19 @@ TOOL_DEFS: list[dict[str, Any]] = [
         "description": "lane_name → family map from the active agents config.",
         "inputSchema": {"type": "object", "properties": {}},
     },
+    {
+        "name": "describe_recipe",
+        "description": (
+            "Everything about one recipe: purpose, request keywords, steps "
+            "with their model roles, checks, grade with fix hints, track "
+            "record, files. Returns the card dict; unknown id → error object."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {"id": {"type": "string"}},
+            "required": ["id"],
+        },
+    },
 ]
 
 
@@ -976,6 +1077,8 @@ def _call_tool(
             return _cost(home, args)
         if name == "lanes":
             return _lanes(home, args)
+        if name == "describe_recipe":
+            return _describe_recipe(home, args)
         if control:
             if name == "list_recipes":
                 return _list_recipes(home, args)

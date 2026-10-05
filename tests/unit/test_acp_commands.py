@@ -195,6 +195,7 @@ def test_help_lists_every_announced_command():
     out = asyncio.run(cmds.handle_help(agent, "run-1-abc", ""))
     assert "Available slash commands" in out
     for name in ("help", "runs", "status", "learnings", "cost", "lanes",
+                 "recipes", "recipe",
                  "stop", "kill", "resume", "recover", "certify", "serve"):
         assert f"`/{name}`" in out
 
@@ -613,8 +614,11 @@ def test_handler_error_returns_one_line(home: Path, monkeypatch: pytest.MonkeyPa
     monkeypatch.setitem(cmds.HANDLERS, "lanes", boom)
     agent = _agent(home)
     out = asyncio.run(cmds.handle(agent, "run-1", "lanes", ""))
-    assert "kaboom" in out
-    assert "`/lanes` failed" in out
+    # ``cmds.handle`` widens to ``str | CommandReply``; the error path here
+    # always returns ``str`` so we coerce for the assertion.
+    text = out.text if isinstance(out, cmds.CommandReply) else out
+    assert "kaboom" in text
+    assert "`/lanes` failed" in text
 
 
 def test_unknown_command_via_handle_returns_one_line():
@@ -622,7 +626,128 @@ def test_unknown_command_via_handle_returns_one_line():
     direct calls with an unknown name still degrade gracefully."""
     agent = _agent(Path.cwd())
     out = asyncio.run(cmds.handle(agent, "run-1", "nope", ""))
-    assert "Unknown command" in out or "/nope" in out
+    text = out.text if isinstance(out, cmds.CommandReply) else out
+    assert "Unknown command" in text or "/nope" in text
+
+# ── /recipes / /recipe (Zed S3a) ────────────────────────────────────────────
+
+
+def test_recipes_table_lists_engine_and_project(
+    monkeypatch, tmp_path, home: Path
+):
+    """``/recipes`` returns a Project/Engine summary line plus a markdown
+    table that names every visible recipe."""
+    engine = tmp_path / "engine"
+    engine.mkdir()
+    (engine / "recipes").mkdir()
+    (engine / "recipes" / "alpha").mkdir()
+    (engine / "recipes" / "alpha" / "workflow.yaml").write_text(
+        "name: alpha\n", encoding="utf-8"
+    )
+    (engine / "recipes" / "alpha" / "task_class.yaml").write_text(
+        "name: alpha\ndescription: Engine alpha\n", encoding="utf-8"
+    )
+    monkeypatch.setattr("mini_ork.web.control._mini_ork_root", lambda: engine)
+    # A project recipe under the home.
+    (home / "recipes").mkdir(parents=True, exist_ok=True)
+    (home / "recipes" / "docs").mkdir()
+    (home / "recipes" / "docs" / "workflow.yaml").write_text(
+        "name: docs\n", encoding="utf-8"
+    )
+    (home / "recipes" / "docs" / "task_class.yaml").write_text(
+        "name: docs\ndescription: Project docs\n", encoding="utf-8"
+    )
+
+    agent = _agent(home)
+    out = asyncio.run(cmds.handle_recipes(agent, "run-1-abc", ""))
+    assert "Project 1 · Engine 1" in out
+    assert "`alpha` |" in out
+    assert "`docs` |" in out
+    # Filter hint footer.
+    assert "Filter: `/recipes project`" in out
+
+
+def test_recipes_filter_project(monkeypatch, tmp_path, home: Path):
+    """``/recipes project`` returns only the project entries."""
+    engine = tmp_path / "engine"
+    engine.mkdir()
+    (engine / "recipes" / "alpha").mkdir(parents=True)
+    (engine / "recipes" / "alpha" / "workflow.yaml").write_text(
+        "name: alpha\n", encoding="utf-8"
+    )
+    (engine / "recipes" / "alpha" / "task_class.yaml").write_text(
+        "name: alpha\ndescription: Engine\n", encoding="utf-8"
+    )
+    monkeypatch.setattr("mini_ork.web.control._mini_ork_root", lambda: engine)
+    (home / "recipes").mkdir(parents=True, exist_ok=True)
+    (home / "recipes" / "docs").mkdir()
+    (home / "recipes" / "docs" / "workflow.yaml").write_text(
+        "name: docs\n", encoding="utf-8"
+    )
+    (home / "recipes" / "docs" / "task_class.yaml").write_text(
+        "name: docs\ndescription: Project\n", encoding="utf-8"
+    )
+
+    agent = _agent(home)
+    out = asyncio.run(cmds.handle_recipes(agent, "run-1-abc", "project"))
+    assert "`docs` |" in out
+    assert "`alpha`" not in out
+
+
+def test_recipes_empty_returns_no_match(home: Path, monkeypatch: pytest.MonkeyPatch):
+    """No recipes in either source → ``No recipes match.``"""
+    empty = home / "empty-engine"
+    empty.mkdir(exist_ok=True)
+    monkeypatch.setattr("mini_ork.web.control._mini_ork_root", lambda: empty)
+    agent = _agent(home)
+    out = asyncio.run(cmds.handle_recipes(agent, "run-1-abc", ""))
+    assert "No recipes match." in out
+
+
+def test_recipe_returns_command_reply_with_links(monkeypatch, tmp_path, home: Path):
+    """``/recipe <id>`` returns a ``CommandReply`` carrying the recipe
+    markdown + the file paths that should be emitted as resource links."""
+    engine = tmp_path / "engine"
+    engine.mkdir()
+    (engine / "recipes" / "docs").mkdir(parents=True)
+    (engine / "recipes" / "docs" / "workflow.yaml").write_text(
+        "name: docs\n", encoding="utf-8"
+    )
+    (engine / "recipes" / "docs" / "task_class.yaml").write_text(
+        "name: docs\ndescription: Project docs\n", encoding="utf-8"
+    )
+    (engine / "recipes" / "docs" / "artifact_contract.yaml").write_text(
+        "expected_artifact: diff\n", encoding="utf-8"
+    )
+    monkeypatch.setattr("mini_ork.web.control._mini_ork_root", lambda: engine)
+
+    agent = _agent(home)
+    reply = asyncio.run(cmds.handle_recipe(agent, "run-1-abc", "docs"))
+    assert isinstance(reply, cmds.CommandReply)
+    assert "**docs**" in reply.text
+    assert reply.links, "recipe card must carry at least one file link"
+    assert any(p.name == "workflow.yaml" for p in reply.links)
+
+
+def test_recipe_unknown_id_returns_one_line(home: Path):
+    """An unknown id → plain ``str`` reply with the kickoff's wording."""
+    agent = _agent(home)
+    out = asyncio.run(cmds.handle_recipe(agent, "run-1-abc", "does-not-exist"))
+    # Either a bare string or a ``CommandReply`` whose text matches; the
+    # contract is "No recipe <id>" either way.
+    text = out.text if isinstance(out, cmds.CommandReply) else out
+    assert "No recipe does-not-exist" in text
+    if isinstance(out, cmds.CommandReply):
+        assert out.links == []
+
+
+def test_recipe_missing_arg_returns_usage(home: Path):
+    """``/recipe`` alone → usage hint."""
+    agent = _agent(home)
+    out = asyncio.run(cmds.handle_recipe(agent, "run-1-abc", ""))
+    text = out.text if isinstance(out, cmds.CommandReply) else out
+    assert "Usage" in text
+
 
 # ── review regressions ───────────────────────────────────────────────────────
 

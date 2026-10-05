@@ -154,7 +154,15 @@ def test_tools_list_returns_five_definitions(server_home):
     resp = _call("tools/list")
     names = sorted(t["name"] for t in resp["result"]["tools"])
     assert names == sorted(TOOL_DEFS[i]["name"] for i in range(len(TOOL_DEFS)))
-    assert names == ["cost", "lanes", "learnings", "list_runs", "run_detail"]
+    # Six read-only tools (added ``describe_recipe`` for the S3a recipe card).
+    assert names == [
+        "cost",
+        "describe_recipe",
+        "lanes",
+        "learnings",
+        "list_runs",
+        "run_detail",
+    ]
 
 
 def test_unknown_method_returns_minus_32601(server_home):
@@ -411,7 +419,15 @@ def test_subprocess_round_trip(server_home):
     assert len(lines) == 3
     assert lines[0]["result"]["serverInfo"]["name"] == "mini-ork-context"
     names = sorted(t["name"] for t in lines[1]["result"]["tools"])
-    assert names == ["cost", "lanes", "learnings", "list_runs", "run_detail"]
+    # Six read-only tools (added ``describe_recipe`` for S3a).
+    assert names == [
+        "cost",
+        "describe_recipe",
+        "lanes",
+        "learnings",
+        "list_runs",
+        "run_detail",
+    ]
     body = json.loads(lines[2]["result"]["content"][0]["text"])
     assert len(body["runs"]) >= 1
 
@@ -448,8 +464,9 @@ def test_subprocess_round_trip_with_control(server_home):
     lines = [json.loads(l) for l in proc.stdout.splitlines() if l.strip()]
     assert len(lines) == 3
     names = sorted(t["name"] for t in lines[1]["result"]["tools"])
+    # Six read-only + nine control = 15 tools (added ``describe_recipe``).
     expected = [
-        "certify", "cost", "draft_recipe", "get_recipe_spec",
+        "certify", "cost", "describe_recipe", "draft_recipe", "get_recipe_spec",
         "lanes", "learnings", "list_recipes", "list_runs",
         "recipe_guide", "run_detail", "run_status", "start_run",
         "stop_run", "wait_for_run",
@@ -514,13 +531,13 @@ def test_default_mode_rejects_control_tools(server_home):
     assert "unknown tool" in body["error"]
 
 
-def test_control_mode_lists_fourteen_tools(server_home):
-    """With control=True, tools/list returns 5 + 9 = 14 names."""
+def test_control_mode_lists_fifteen_tools(server_home):
+    """With control=True, tools/list returns 6 + 9 = 15 names (S3a adds ``describe_recipe``)."""
     resp = _call_control("tools/list")
     names = sorted(t["name"] for t in resp["result"]["tools"])
-    assert len(names) == 14
+    assert len(names) == 15
     assert names == sorted([
-        "certify", "cost", "draft_recipe", "get_recipe_spec",
+        "certify", "cost", "describe_recipe", "draft_recipe", "get_recipe_spec",
         "lanes", "learnings", "list_recipes", "list_runs",
         "recipe_guide", "run_detail", "run_status", "start_run",
         "stop_run", "wait_for_run",
@@ -657,6 +674,68 @@ def test_list_recipes_marks_shadowing_project_entry(server_home, monkeypatch, tm
     # Project-only entry surfaces, source=project.
     assert by_id["my-add"]["source"] == "project"
     assert by_id["my-add"].get("overrides_engine") is None
+    # ``grade`` + ``runs`` are projected by the S3a extension; both default
+    # to ``—`` / 0 when the eval module or db are unreachable.
+    for entry in body["recipes"]:
+        assert "grade" in entry and "grade_score" in entry and "runs" in entry
+        assert isinstance(entry["runs"], int)
+        assert entry["runs"] >= 0
+
+
+# ── describe_recipe ────────────────────────────────────────────────────
+
+
+def test_describe_recipe_hit(server_home, monkeypatch, tmp_path):
+    """``describe_recipe`` returns the card dict for a known recipe; the
+    card carries ``files`` (string paths) and the steps/keywords."""
+    recipes_dir = tmp_path / "recipes"
+    recipes_dir.mkdir()
+    rd = recipes_dir / "docs"
+    rd.mkdir()
+    (rd / "workflow.yaml").write_text(
+        "name: docs\nnodes:\n  - id: planner\n    type: planner\n",
+        encoding="utf-8",
+    )
+    (rd / "task_class.yaml").write_text(
+        "name: docs\ndescription: Doc this\n"
+        "matches:\n  keywords: [\"docs\", \"documentation\"]\n",
+        encoding="utf-8",
+    )
+    (rd / "artifact_contract.yaml").write_text(
+        "expected_artifact: diff\n", encoding="utf-8"
+    )
+    monkeypatch.setattr("mini_ork.web.control._mini_ork_root", lambda: tmp_path)
+
+    # ``describe_recipe`` is in the read-only list — no ``_control`` flag.
+    resp = _call_args({"name": "describe_recipe", "arguments": {"id": "docs"}})
+    body = json.loads(resp["result"]["content"][0]["text"])
+    assert resp["result"]["isError"] is False
+    assert "recipe" in body
+    card = body["recipe"]
+    assert card["id"] == "docs"
+    assert isinstance(card["files"], list)
+    assert any("workflow.yaml" in f for f in card["files"])
+    assert card["task_class"] == "docs"
+    assert "docs" in card["keywords"]
+
+
+def test_describe_recipe_miss(server_home, monkeypatch, tmp_path):
+    """Unknown id → ``{"error": ...}``; the tool is also read-only."""
+    monkeypatch.setattr("mini_ork.web.control._mini_ork_root", lambda: tmp_path)
+    resp = _call_args({"name": "describe_recipe", "arguments": {"id": "nope"}})
+    body = json.loads(resp["result"]["content"][0]["text"])
+    assert resp["result"]["isError"] is True
+    assert "error" in body
+    assert "not found" in body["error"].lower()
+
+
+def test_describe_recipe_requires_id(server_home, monkeypatch, tmp_path):
+    """Missing ``id`` arg → ``{"error": "id is required"}``."""
+    monkeypatch.setattr("mini_ork.web.control._mini_ork_root", lambda: tmp_path)
+    resp = _call_args({"name": "describe_recipe", "arguments": {}})
+    body = json.loads(resp["result"]["content"][0]["text"])
+    assert resp["result"]["isError"] is True
+    assert "required" in body["error"]
 
 
 # ── start_run ───────────────────────────────────────────────────────────

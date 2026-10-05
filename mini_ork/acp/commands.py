@@ -20,6 +20,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
@@ -30,6 +31,26 @@ from acp.schema import (
 )
 
 from mini_ork.web.control import _is_safe_token
+
+
+# ── command reply envelope (Zed S3a) ─────────────────────────────────────
+# ``Handler`` returns ``str`` for text-only replies and ``CommandReply``
+# when the reply carries file links. The dispatcher in
+# ``MiniOrkAcpAgent._dispatch_slash`` walks the envelope and emits one
+# ``AgentMessageChunk`` (text) plus one ``ResourceContentBlock`` per link.
+@dataclass(frozen=True)
+class CommandReply:
+    """A handler's reply: markdown text plus file paths to surface as links.
+
+    The dispatcher emits the text first, then one
+    ``ResourceContentBlock(type="resource_link", uri=..., name=...)`` chunk
+    per ``Path`` — Zed renders these as clickable file mentions. Existing
+    handlers keep returning plain strings; the dataclass only kicks in for
+    ``/recipe`` (and any future surface that wants to attach files).
+    """
+
+    text: str
+    links: list[Path]
 
 # ── announcement table ─────────────────────────────────────────────────────────
 # ``COMMANDS`` is the same list the agent pushes to clients via
@@ -100,6 +121,16 @@ COMMANDS: list[AvailableCommand] = [
         "bug-report text (required)",
     ),
     _cmd("serve", "Probe the local mini-ork serve health endpoint.", None),
+    _cmd(
+        "recipes",
+        "Recipe table: source, steps, grade, runs, success, avg cost.",
+        "[project|engine] [text]",
+    ),
+    _cmd(
+        "recipe",
+        "Recipe card: description, steps, flow, contract, grade, track record.",
+        "recipe id",
+    ),
 ]
 
 
@@ -158,11 +189,14 @@ def _probe(url: str, *, timeout: float = 1.0) -> bool:
 
 
 # ── handler signature ────────────────────────────────────────────────────────
-# Each handler returns markdown; failures return a one-line explanation, never
-# raise. ``agent`` is the ``MiniOrkAcpAgent`` instance; ``session_id`` is the
-# ACP session id (a run id for run sessions, a thread id for thread sessions).
-# ``arg`` is the text the user typed after the command (may be empty).
-Handler = Callable[[Any, str, str], Awaitable[str]]
+# Each handler returns ``str`` (text-only reply) or ``CommandReply`` (text +
+# file paths the dispatcher emits as ``ResourceContentBlock`` chunks). A
+# handler that raises is reported as a one-line markdown string and never
+# propagates. ``agent`` is the ``MiniOrkAcpAgent`` instance; ``session_id``
+# is the ACP session id (a run id for run sessions, a thread id for thread
+# sessions); ``arg`` is the text the user typed after the command (may be
+# empty).
+Handler = Callable[[Any, str, str], Awaitable[str | CommandReply]]
 
 
 # ── helpers shared by handlers ───────────────────────────────────────────────
@@ -230,6 +264,25 @@ def _parse_runs_arg(arg: str) -> tuple[str, str | None, int]:
         except ValueError:
             continue
     return state, recipe, limit
+
+
+def _parse_recipes_arg(arg: str) -> tuple[str, str]:
+    """Parse ``/recipes [project|engine] [text]`` — order-independent.
+
+    The first token wins as the source filter when it matches
+    ``project|engine|all``; the remaining tokens are joined as the
+    case-insensitive free-text needle. An empty arg → ``("all", "")``.
+    """
+    source = "all"
+    text_tokens: list[str] = []
+    state_seen = False
+    for tok in arg.strip().split():
+        if not state_seen and tok in ("project", "engine", "all"):
+            source = tok
+            state_seen = True
+            continue
+        text_tokens.append(tok)
+    return source, " ".join(text_tokens)
 
 
 # ── handlers ─────────────────────────────────────────────────────────────────
@@ -412,6 +465,46 @@ async def handle_lanes(agent: Any, session_id: str, arg: str) -> str:
     for role, family in sorted(lanes.items()):
         lines.append(f"| `{role}` | `{family}` |")
     return "\n".join(lines)
+
+
+async def handle_recipes(agent: Any, session_id: str, arg: str) -> str:
+    """Recipe table: source, steps, grade, runs, success %, avg cost."""
+    from mini_ork.acp import recipe_view
+
+    source, text = _parse_recipes_arg(arg)
+    home = agent._home_for(session_id)
+    try:
+        rows = recipe_view.recipe_rows(home, source=source, text=text)
+        return recipe_view.render_recipes(rows, source=source)
+    except Exception as exc:  # noqa: BLE001 — handler must never raise
+        return f"`/recipes` failed: {exc}"
+
+
+async def handle_recipe(agent: Any, session_id: str, arg: str) -> CommandReply:
+    """Recipe card + file links. Unknown id returns a one-line ``str``."""
+    from mini_ork.acp import recipe_view
+
+    recipe_id = arg.strip()
+    if not recipe_id:
+        return CommandReply(
+            text="Usage: `/recipe <id>` (try `/recipes` to list them).",
+            links=[],
+        )
+    home = agent._home_for(session_id)
+    try:
+        card = recipe_view.recipe_card(home, recipe_id)
+    except Exception as exc:  # noqa: BLE001
+        return CommandReply(text=f"`/recipe` failed: {exc}", links=[])
+    if card is None:
+        return CommandReply(
+            text=f"No recipe {recipe_id}. `/recipes` lists them.",
+            links=[],
+        )
+    try:
+        text, files = recipe_view.render_recipe_card(card)
+    except Exception as exc:  # noqa: BLE001
+        return CommandReply(text=f"`/recipe` failed: {exc}", links=[])
+    return CommandReply(text=text, links=files)
 
 
 async def _act_on_run(
@@ -598,6 +691,8 @@ HANDLERS: dict[str, Handler] = {
     "learnings": handle_learnings,
     "cost": handle_cost,
     "lanes": handle_lanes,
+    "recipes": handle_recipes,
+    "recipe": handle_recipe,
     "stop": handle_stop,
     "kill": handle_kill,
     "resume": handle_resume,
@@ -607,8 +702,13 @@ HANDLERS: dict[str, Handler] = {
 }
 
 
-async def handle(agent: Any, session_id: str, name: str, arg: str) -> str:
-    """Look up ``name`` in ``HANDLERS`` and return the handler's markdown.
+async def handle(agent: Any, session_id: str, name: str, arg: str) -> str | CommandReply:
+    """Look up ``name`` in ``HANDLERS`` and return the handler's reply.
+
+    The return type widens to ``str | CommandReply`` so a handler that wants
+    to attach file links (e.g. ``/recipe``) can return them via the
+    envelope; existing text-only handlers continue to return ``str``. The
+    dispatcher in ``MiniOrkAcpAgent._dispatch_slash`` walks the envelope.
 
     Unknown names are a programmer error in this module — ``MiniOrkAcpAgent``
     already short-circuits unknowns with a fixed user-facing string.
@@ -624,6 +724,7 @@ async def handle(agent: Any, session_id: str, name: str, arg: str) -> str:
 
 __all__ = [
     "COMMANDS",
+    "CommandReply",
     "HANDLERS",
     "handle",
     "_spawn",

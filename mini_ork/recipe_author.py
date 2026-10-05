@@ -734,20 +734,21 @@ def render(spec: dict[str, Any]) -> dict[str, str]:
     # ── artifact_contract.yaml ──
     artifact_contract: dict[str, Any] = {
         "task_class": task_class_name,
-        "expected_artifact": "data",
+        # schema enum: a recipe that implements changes delivers a patch,
+        # an analysis/review-only one delivers prose.
+        "expected_artifact": "patch" if any(s["type"] == "implementer" for s in steps) else "prose",
         "success_verifiers": [
             f"verifiers/{s['id']}.py"
             for s in steps
             if s["type"] == "verifier"
         ],
         "failure_policy": "request_changes",
-        "rollback_policy": (
+    }
+    if rollback_on_failure:
+        artifact_contract["rollback_policy"] = (
             "git checkout HEAD -- <changed-files>\n"
             "if reviewer rejects after 3 iterations."
-            if rollback_on_failure
-            else ""
-        ),
-    }
+        )
 
     files: dict[str, str] = {
         "task_class.yaml": _yaml_dump(task_class),

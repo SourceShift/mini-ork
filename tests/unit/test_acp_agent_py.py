@@ -36,6 +36,7 @@ from acp.schema import (  # noqa: E402
     AgentMessageChunk,
     AgentPlanUpdate,
     FileEditToolCallContent,
+    ResourceContentBlock,
     SessionInfoUpdate,
     TextContentBlock,
     ToolCallProgress,
@@ -3768,3 +3769,64 @@ def test_list_sessions_marks_run_rows_with_run_mark(tmp_path):
     # The run row's title is NOT just the bare kickoff line — the mark
     # glyph must be present.
     assert "✓" in by_id["run-list-2"].title
+
+
+# ── /recipe reply emits ResourceContentBlock chunks (Zed S3a) ────────────
+
+
+def test_z5_recipe_reply_emits_resource_link_chunks(tmp_path, monkeypatch):
+    """A ``/recipe <id>`` reply emits ONE text chunk first, then one
+    ``ResourceContentBlock(type="resource_link")`` chunk per linked path.
+    The order matters — Zed renders the resource links under the markdown."""
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    # Engine recipes catalog: a single recipe with one workflow.yaml +
+    # one task_class.yaml + one artifact_contract.yaml. Two prompt files
+    # + one verifier, so the resource-link chunk count is deterministic.
+    engine = tmp_path / "engine"
+    engine.mkdir()
+    rd = engine / "recipes" / "docs"
+    rd.mkdir(parents=True)
+    (rd / "workflow.yaml").write_text("name: docs\n", encoding="utf-8")
+    (rd / "task_class.yaml").write_text(
+        "name: docs\ndescription: Project docs\n", encoding="utf-8"
+    )
+    (rd / "artifact_contract.yaml").write_text(
+        "expected_artifact: diff\n", encoding="utf-8"
+    )
+    prompts = rd / "prompts"
+    prompts.mkdir()
+    (prompts / "planner.md").write_text("# planner\n", encoding="utf-8")
+    (prompts / "implementer.md").write_text("# impl\n", encoding="utf-8")
+    verifiers = rd / "verifiers"
+    verifiers.mkdir()
+    (verifiers / "test.py").write_text("pass\n", encoding="utf-8")
+    (rd / "example-kickoff.md").write_text("# Example\n\nbody\n", encoding="utf-8")
+    monkeypatch.setattr("mini_ork.web.control._mini_ork_root", lambda: engine)
+
+    captured, conn = _capturing_conn()
+    agent = MiniOrkAcpAgent()
+    agent.on_connect(conn)
+    resp = asyncio.run(agent.new_session(cwd=str(proj)))
+    sid = resp.session_id
+    captured.clear()
+    turn = asyncio.run(agent.prompt(sid, [_text_block("/recipe docs")]))
+    assert turn.stop_reason == "end_turn"
+
+    chunks = [u for u in captured if isinstance(u, AgentMessageChunk)]
+    # Exactly one text chunk first, then one ResourceContentBlock per file.
+    assert len(chunks) >= 2, f"expected text + resource chunks, got {len(chunks)}"
+    first = chunks[0]
+    assert isinstance(first.content, TextContentBlock)
+    assert "**docs**" in first.content.text
+    # The remaining chunks are ``ResourceContentBlock`` with the file links.
+    link_chunks = [
+        c for c in chunks[1:]
+        if isinstance(c.content, ResourceContentBlock)
+        and c.content.type == "resource_link"
+    ]
+    assert len(link_chunks) >= 1
+    # Each link chunk carries a ``file://`` URI and a name.
+    for c in link_chunks:
+        assert c.content.uri.startswith("file://")
+        assert c.content.name

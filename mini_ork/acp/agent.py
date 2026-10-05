@@ -57,6 +57,7 @@ from acp.schema import (
     NewSessionResponse,
     PlanEntry,
     PromptResponse,
+    ResourceContentBlock,
     SessionCapabilities,
     SessionConfigOptionSelect,
     SessionConfigSelectOption,
@@ -2295,7 +2296,19 @@ class MiniOrkAcpAgent:
                 ),
             )
             return PromptResponse(stop_reason="end_turn")
-        markdown = await _commands.handle(self, session_id, name, arg)
+        reply = await _commands.handle(self, session_id, name, arg)
+        # ``reply`` is either ``str`` (text-only handler) or ``CommandReply``
+        # (markdown + file paths). Walk the envelope and emit one text chunk
+        # first, then one ``ResourceContentBlock(type="resource_link")`` per
+        # path — Zed renders those as clickable file mentions. ``path.resolve()
+        # `` collapses symlinks so a macOS ``/private/var/...`` resolves to the
+        # volume form ``file:///Volumes/...``.
+        if isinstance(reply, _commands.CommandReply):
+            markdown = reply.text
+            links = reply.links
+        else:
+            markdown = reply
+            links = []
         await self._emit(
             session_id,
             AgentMessageChunk(
@@ -2303,6 +2316,29 @@ class MiniOrkAcpAgent:
                 content=TextContentBlock(type="text", text=markdown),
             ),
         )
+        for path in links:
+            try:
+                resolved = Path(path).resolve()
+                uri = resolved.as_uri()
+                # Inside a recipe: the path within it (prompts/editor.md).
+                parts = resolved.parts
+                if "recipes" in parts and parts.index("recipes") + 2 < len(parts):
+                    name_for_link = "/".join(parts[parts.index("recipes") + 2:])
+                else:
+                    name_for_link = resolved.name
+            except (OSError, ValueError):
+                continue
+            await self._emit(
+                session_id,
+                AgentMessageChunk(
+                    session_update="agent_message_chunk",
+                    content=ResourceContentBlock(
+                        type="resource_link",
+                        uri=uri,
+                        name=name_for_link,
+                    ),
+                ),
+            )
         return PromptResponse(stop_reason="end_turn")
 
     # ── thread-store helpers (Z9c-2) ─────────────────────────────────────────
