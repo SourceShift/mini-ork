@@ -197,14 +197,27 @@ def _resolve_launcher_path(launcher: str | None) -> str:
     return str(engine_bin.resolve())
 
 
-def _write_mcp_config(home: Path, launcher: str) -> Path:
-    """Write the per-turn MCP config JSON. Caller is responsible for cleanup."""
+def _write_mcp_config(
+    home: Path, launcher: str, extra_env: Mapping[str, str] | None = None
+) -> Path:
+    """Write the per-turn MCP config JSON. Caller is responsible for cleanup.
+
+    ``extra_env`` is merged into ``mcpServers.mini-ork.env`` so a thread
+    session's workspace mode (e.g. ``MO_WORKSPACE_MODE=worktree``) reaches
+    the spawned ``mini-ork mcp-context --control`` subprocess. The MCP
+    server's own defaults (``MINI_ORK_HOME``) win on key conflict so a
+    caller cannot accidentally override the contract.
+    """
+    env = {"MINI_ORK_HOME": str(home)}
+    if extra_env:
+        for key, value in extra_env.items():
+            env.setdefault(str(key), str(value))
     payload = {
         "mcpServers": {
             "mini-ork": {
                 "command": launcher,
                 "args": ["mcp-context", "--control"],
-                "env": {"MINI_ORK_HOME": str(home)},
+                "env": env,
             }
         }
     }
@@ -314,6 +327,7 @@ async def run_turn(
     on_event: Callable[[dict], Awaitable[None]],
     timeout_s: float = 3600,
     launcher: str | None = None,
+    extra_mcp_env: Mapping[str, str] | None = None,
 ) -> TurnResult:
     """Run one conversational turn and return its outcome.
 
@@ -322,6 +336,10 @@ async def run_turn(
     to ``on_event`` as they arrive, and returns the parsed result envelope
     (session id, final text, cost). The temp MCP config is always removed,
     even on cancellation or timeout. The prompt is fed on stdin, never argv.
+
+    ``extra_mcp_env`` is forwarded into the temp MCP config's ``env`` block
+    (e.g. ``MO_WORKSPACE_MODE=worktree`` from the thread's stored config).
+    Callers cannot override ``MINI_ORK_HOME`` — the harness owns that key.
 
     Cancellation: if the awaiting task is cancelled, terminate the process
     group (SIGTERM, SIGKILL after ``_SIGTERM_GRACE_S``) and re-raise.
@@ -348,7 +366,7 @@ async def run_turn(
         )
         # Build the real temp MCP config + system prompt path now (avoids
         # leaking them on the ``build_command`` error path).
-        mcp_config_path = _write_mcp_config(home, launcher_path)
+        mcp_config_path = _write_mcp_config(home, launcher_path, extra_env=extra_mcp_env)
         # Patch the placeholders the builder planted.
         argv[argv.index("--mcp-config") + 1] = str(mcp_config_path)
         argv[argv.index("--append-system-prompt-file") + 1] = str(

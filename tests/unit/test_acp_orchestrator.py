@@ -446,6 +446,51 @@ def test_run_turn_missing_binary_yields_rc_127(tmp_path, monkeypatch):
     assert "spawn failed" in result.error or "No such file" in result.error
 
 
+def test_run_turn_forwards_extra_mcp_env_into_mcp_config(tmp_path, monkeypatch):
+    """``extra_mcp_env`` lands in the per-turn MCP server's env block (Zed S4)."""
+    import json as _json
+
+    shim_dir = _claude_shim(
+        tmp_path,
+        body_lines=[
+            {"type": "result", "session_id": "s1", "result": "ok", "total_cost_usd": 0.0},
+        ],
+    )
+    miniork_dir = _fake_miniork_shim(tmp_path)
+    monkeypatch.setenv("PATH", f"{shim_dir}:{miniork_dir}:{os.environ.get('PATH', '')}")
+    monkeypatch.delenv("MINI_ORK_VENV_ACTIVE", raising=False)
+
+    seen: dict = {}
+    original_unlink = Path.unlink
+
+    def track_unlink(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+        if "mcp-" in self.name and str(self).endswith(".json"):
+            seen["mcp_path"] = str(self)
+            try:
+                seen["payload"] = _json.loads(self.read_text(encoding="utf-8"))
+            except OSError:
+                pass
+        return original_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", track_unlink)
+
+    asyncio.run(run_turn(
+        lane="opus",
+        prompt="x",
+        cwd=tmp_path,
+        home=tmp_path,
+        resume=None,
+        on_event=lambda _: asyncio.sleep(0),
+        timeout_s=10,
+        extra_mcp_env={"MO_WORKSPACE_MODE": "worktree"},
+    ))
+
+    assert "payload" in seen, f"mcp config was not captured; seen={seen!r}"
+    env = seen["payload"]["mcpServers"]["mini-ork"]["env"]
+    assert env.get("MO_WORKSPACE_MODE") == "worktree"
+    assert env.get("MINI_ORK_HOME") == str(tmp_path)
+
+
 # Make ``shutil`` available for any future test that needs it (lint sanity).
 _ = shutil
 

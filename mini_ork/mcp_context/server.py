@@ -511,17 +511,92 @@ def _start_run(home: Path, args: dict[str, Any]) -> dict[str, Any]:
     # (e.g. a worktree overlay under tests/).
     project_root_env = os.environ.get("MINI_ORK_PROJECT_HOME")
     project_root = Path(project_root_env).resolve() if project_root_env else home.parent
-    extra_env = {"MO_TARGET_CWD": str(project_root)}
+    workspace_mode = str(args.get("workspace") or os.environ.get("MO_WORKSPACE_MODE") or "worktree")
+    if workspace_mode not in ("worktree", "in-place"):
+        return {"error": f"unknown workspace: {workspace_mode!r}"}
 
     from mini_ork.web.control import launch_run
 
-    result = launch_run(home, recipe.strip(), kickoff_markdown, extra_env=extra_env)
+    extra_env: dict[str, str] = {"MO_TARGET_CWD": str(project_root)}
+    note: str | None = None
+    workspace_meta: dict[str, str] = {"workspace": workspace_mode}
+    pre_minted_run_id: str | None = None
+
+    if workspace_mode == "worktree":
+        # Mint the run id up front so workspaces.create can use it as the
+        # branch + record key. launch_run accepts a caller-supplied run_id
+        # (the safe-token shape is the same one it would mint internally).
+        from mini_ork.acp.agent import mint_run_id
+        from mini_ork import workspaces as _workspaces
+
+        pre_minted_run_id = mint_run_id()
+        try:
+            ws = _workspaces.create(project_root, home, pre_minted_run_id)
+            extra_env["MO_TARGET_CWD"] = str(ws.path)
+            workspace_meta = {
+                "workspace": "worktree",
+                "worktree": str(ws.path),
+                "branch": ws.branch,
+            }
+        except RuntimeError as exc:
+            # Non-git repo (or a transient git failure) — fall back to
+            # in-place so a fresh checkout can still kick a run.
+            note = f"workspace=worktree unavailable ({exc}); falling back to in-place"
+            workspace_mode = "in-place"
+            pre_minted_run_id = None
+            workspace_meta = {"workspace": "in-place"}
+
+    result = launch_run(
+        home,
+        recipe.strip(),
+        kickoff_markdown,
+        run_id=pre_minted_run_id,
+        extra_env=extra_env,
+    )
     if not isinstance(result, dict):
         return {"error": f"launch_run returned non-dict: {result!r}"}
     if not result.get("ok"):
         err = result.get("error") or "launch_run failed"
         return {"error": err, "launch_result": result}
+    if workspace_meta:
+        result.update(workspace_meta)
+    if note:
+        result["note"] = note
     return result
+
+
+# ── control tool: workspaces ───────────────────────────────────────────────
+
+
+def _workspaces(home: Path, args: dict[str, Any]) -> dict[str, Any]:
+    """List open task-isolation workspaces + a status snapshot per row.
+
+    Read-only. A missing or empty ``<home>/worktrees/`` directory is not an
+    error: ``workspaces: []`` is the right answer. Broken git status calls
+    on a single row surface as ``status: {"exists": false}`` so one bad
+    worktree does not poison the whole list.
+    """
+    from mini_ork import workspaces as _workspaces
+
+    rows: list[dict[str, Any]] = []
+    try:
+        for ws in _workspaces.list_open(home):
+            try:
+                snap = _workspaces.status(ws)
+            except Exception as exc:  # noqa: BLE001 — one bad row must not poison the list
+                snap = {"exists": False, "error": str(exc)}
+            rows.append({
+                "run_id": ws.run_id,
+                "path": str(ws.path),
+                "branch": ws.branch,
+                "base_branch": ws.base_branch,
+                "base_sha": ws.base_sha,
+                "project": str(ws.project),
+                "status": snap,
+            })
+    except Exception as exc:  # noqa: BLE001
+        return {"error": f"list_open failed: {exc}"}
+    return {"workspaces": rows}
 
 
 # ── control tool: run_status ───────────────────────────────────────────────
@@ -867,9 +942,30 @@ _CONTROL_TOOL_DEFS: list[dict[str, Any]] = [
             "properties": {
                 "recipe": {"type": "string"},
                 "kickoff_markdown": {"type": "string"},
+                "workspace": {
+                    "type": "string",
+                    "enum": ["worktree", "in-place"],
+                    "description": (
+                        "Per-run workspace: 'worktree' isolates the run on "
+                        "its own git branch under <home>/worktrees/<run_id>; "
+                        "'in-place' runs against the project checkout. "
+                        "Default: MO_WORKSPACE_MODE env, else 'worktree'. "
+                        "A non-git project falls back to 'in-place' with a note."
+                    ),
+                },
             },
             "required": ["recipe", "kickoff_markdown"],
         },
+    },
+    {
+        "name": "workspaces",
+        "description": (
+            "List open task-isolation workspaces (Zed S4). Each row carries "
+            "the workspace's branch / base / path plus a status snapshot "
+            "(commits_ahead, uncommitted, added, removed, files). "
+            "Read-only — Merge / Discard live in a later slice."
+        ),
+        "inputSchema": {"type": "object", "properties": {}},
     },
     {
         "name": "run_status",
@@ -1084,6 +1180,8 @@ def _call_tool(
                 return _list_recipes(home, args)
             if name == "start_run":
                 return _start_run(home, args)
+            if name == "workspaces":
+                return _workspaces(home, args)
             if name == "run_status":
                 return _run_status(home, args)
             if name == "wait_for_run":

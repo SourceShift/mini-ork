@@ -464,12 +464,13 @@ def test_subprocess_round_trip_with_control(server_home):
     lines = [json.loads(l) for l in proc.stdout.splitlines() if l.strip()]
     assert len(lines) == 3
     names = sorted(t["name"] for t in lines[1]["result"]["tools"])
-    # Six read-only + nine control = 15 tools (added ``describe_recipe``).
+    # Six read-only + ten control = 16 tools (S3a added ``describe_recipe``,
+    # S4 added ``workspaces``).
     expected = [
         "certify", "cost", "describe_recipe", "draft_recipe", "get_recipe_spec",
         "lanes", "learnings", "list_recipes", "list_runs",
         "recipe_guide", "run_detail", "run_status", "start_run",
-        "stop_run", "wait_for_run",
+        "stop_run", "wait_for_run", "workspaces",
     ]
     assert names == expected
     # `start_run` with empty args → error object (recipe required).
@@ -531,16 +532,16 @@ def test_default_mode_rejects_control_tools(server_home):
     assert "unknown tool" in body["error"]
 
 
-def test_control_mode_lists_fifteen_tools(server_home):
-    """With control=True, tools/list returns 6 + 9 = 15 names (S3a adds ``describe_recipe``)."""
+def test_control_mode_lists_sixteen_tools(server_home):
+    """With control=True, tools/list returns 6 + 10 = 16 names (S4 adds ``workspaces``)."""
     resp = _call_control("tools/list")
     names = sorted(t["name"] for t in resp["result"]["tools"])
-    assert len(names) == 15
+    assert len(names) == 16
     assert names == sorted([
         "certify", "cost", "describe_recipe", "draft_recipe", "get_recipe_spec",
         "lanes", "learnings", "list_recipes", "list_runs",
         "recipe_guide", "run_detail", "run_status", "start_run",
-        "stop_run", "wait_for_run",
+        "stop_run", "wait_for_run", "workspaces",
     ])
     # Kickoff is explicit: no commit-shaped tool must be exposed.
     for forbidden in ("commit", "commit_draft", "commit_recipe", "publish_recipe"):
@@ -828,6 +829,155 @@ def test_start_run_requires_recipe(server_home):
     body = json.loads(resp["result"]["content"][0]["text"])
     assert resp["result"]["isError"] is True
     assert "recipe is required" in body["error"]
+
+
+# ── start_run · workspace (Zed S4) ───────────────────────────────────────
+
+
+def _git_repo(tmp_path: Path) -> Path:
+    """Make a real git repo under ``tmp_path`` so workspaces.create succeeds."""
+    repo = tmp_path / "git_repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-b", "main"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "t@x"], cwd=repo, check=True, capture_output=True)
+    (repo / "f.txt").write_text("x\n", encoding="utf-8")
+    subprocess.run(["git", "add", "f.txt"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "i"], cwd=repo, check=True, capture_output=True)
+    return repo
+
+
+def test_start_run_workspace_worktree_creates_and_passes_path(server_home, tmp_path, monkeypatch):
+    """``workspace=worktree`` mints a worktree and routes MO_TARGET_CWD into it."""
+    repo = _git_repo(tmp_path)
+    monkeypatch.setenv("MINI_ORK_PROJECT_HOME", str(repo))
+    captured: dict = {}
+
+    def fake_launch(home, recipe, kickoff, run_id=None, extra_env=None):
+        captured["run_id"] = run_id
+        captured["extra_env"] = extra_env
+        return {
+            "ok": True,
+            "run_id": run_id or "rid",
+            "recipe": recipe,
+            "pid": 1,
+            "kickoff_path": "k",
+            "log_path": "l",
+        }
+
+    monkeypatch.setattr("mini_ork.web.control.launch_run", fake_launch)
+    resp = _call_args_control({
+        "name": "start_run",
+        "arguments": {"recipe": "framework-edit", "kickoff_markdown": "k", "workspace": "worktree"},
+    })
+    body = json.loads(resp["result"]["content"][0]["text"])
+    assert resp["result"]["isError"] is False
+    assert body["ok"] is True
+    # The mint happened before launch_run, so the result carries the same run id.
+    assert captured["run_id"] == body["run_id"]
+    assert body["workspace"] == "worktree"
+    assert body["branch"].startswith("mini-ork/")
+    worktree_path = Path(body["worktree"])
+    assert worktree_path.is_dir()
+    assert captured["extra_env"]["MO_TARGET_CWD"] == str(worktree_path)
+
+
+def test_start_run_workspace_in_place_keeps_project_root(server_home, tmp_path, monkeypatch):
+    """``workspace=in-place`` skips worktree creation; MO_TARGET_CWD points at the project root."""
+    repo = _git_repo(tmp_path)
+    monkeypatch.setenv("MINI_ORK_PROJECT_HOME", str(repo))
+    captured: dict = {}
+
+    def fake_launch(home, recipe, kickoff, run_id=None, extra_env=None):
+        captured["extra_env"] = extra_env
+        captured["run_id"] = run_id
+        return {
+            "ok": True,
+            "run_id": run_id or "rid",
+            "recipe": recipe,
+            "pid": 1,
+            "kickoff_path": "k",
+            "log_path": "l",
+        }
+
+    monkeypatch.setattr("mini_ork.web.control.launch_run", fake_launch)
+    resp = _call_args_control({
+        "name": "start_run",
+        "arguments": {"recipe": "framework-edit", "kickoff_markdown": "k", "workspace": "in-place"},
+    })
+    body = json.loads(resp["result"]["content"][0]["text"])
+    assert resp["result"]["isError"] is False
+    assert body["workspace"] == "in-place"
+    assert captured["extra_env"] == {"MO_TARGET_CWD": str(repo)}
+
+
+def test_start_run_non_git_project_falls_back_with_note(server_home, tmp_path, monkeypatch):
+    """A non-git project under MINI_ORK_PROJECT_HOME falls back to in-place + note."""
+    not_a_repo = tmp_path / "no_git"
+    not_a_repo.mkdir()
+    (not_a_repo / "f.txt").write_text("x\n", encoding="utf-8")
+    monkeypatch.setenv("MINI_ORK_PROJECT_HOME", str(not_a_repo))
+    captured: dict = {}
+
+    def fake_launch(home, recipe, kickoff, run_id=None, extra_env=None):
+        captured["run_id"] = run_id
+        captured["extra_env"] = extra_env
+        return {
+            "ok": True,
+            "run_id": "rid",
+            "recipe": recipe,
+            "pid": 1,
+            "kickoff_path": "k",
+            "log_path": "l",
+        }
+
+    monkeypatch.setattr("mini_ork.web.control.launch_run", fake_launch)
+    resp = _call_args_control({
+        "name": "start_run",
+        "arguments": {"recipe": "framework-edit", "kickoff_markdown": "k"},
+    })
+    body = json.loads(resp["result"]["content"][0]["text"])
+    assert resp["result"]["isError"] is False
+    assert body["workspace"] == "in-place"
+    assert "note" in body
+    assert captured["extra_env"] == {"MO_TARGET_CWD": str(not_a_repo)}
+
+
+def test_start_run_rejects_unknown_workspace_value(server_home):
+    resp = _call_args_control({
+        "name": "start_run",
+        "arguments": {"recipe": "x", "kickoff_markdown": "k", "workspace": "bogus"},
+    })
+    body = json.loads(resp["result"]["content"][0]["text"])
+    assert resp["result"]["isError"] is True
+    assert "unknown workspace" in body["error"]
+
+
+# ── workspaces tool (Zed S4) ────────────────────────────────────────────
+
+
+def test_workspaces_tool_lists_empty_when_no_records(server_home):
+    resp = _call_args_control({"name": "workspaces", "arguments": {}})
+    body = json.loads(resp["result"]["content"][0]["text"])
+    assert resp["result"]["isError"] is False
+    assert body == {"workspaces": []}
+
+
+def test_workspaces_tool_lists_existing_with_status(server_home, tmp_path):
+    """A real workspace created under ``<home>/worktrees`` shows up with status."""
+    from mini_ork import workspaces as _workspaces
+
+    repo = _git_repo(tmp_path)
+    _workspaces.create(repo, server_home, "run-z-listing")
+    resp = _call_args_control({"name": "workspaces", "arguments": {}})
+    body = json.loads(resp["result"]["content"][0]["text"])
+    assert resp["result"]["isError"] is False
+    assert len(body["workspaces"]) == 1
+    row = body["workspaces"][0]
+    assert row["run_id"] == "run-z-listing"
+    assert row["branch"] == "mini-ork/run-z-listing"
+    assert row["base_branch"] == "main"
+    assert row["status"]["exists"] is True
 
 
 # ── run_status ──────────────────────────────────────────────────────────

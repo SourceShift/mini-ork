@@ -184,12 +184,20 @@ def _mint_thread_id() -> str:
 # Per-session config a thread session carries alongside its cwd binding.
 # Populated by ``new_session`` + ``set_config_option`` and consumed by
 # ``prompt`` when routing the orchestrator vs direct paths.
-_THREAD_CONFIG_KEYS = ("mode", "model", "recipe")
+_THREAD_CONFIG_KEYS = ("mode", "model", "recipe", "workspace")
 
 # Mode ids the kickoff mandates. Anything else is rejected by
 # ``set_config_option`` as ``invalid_params``.
 _MODE_ORCHESTRATE = "orchestrate"
 _MODE_DIRECT = "direct"
+
+# Workspace mode ids (Zed S4). ``worktree`` isolates the run on its own
+# git branch under ``<home>/worktrees/<run_id>``; ``in-place`` runs
+# against the user's checkout. Default honours ``MO_WORKSPACE_MODE`` so
+# operators can opt out per-process.
+_WORKSPACE_WORKTREE = "worktree"
+_WORKSPACE_IN_PLACE = "in-place"
+_WORKSPACE_VALUES = (_WORKSPACE_WORKTREE, _WORKSPACE_IN_PLACE)
 
 # Slash command that triggers direct-mode behaviour for a single prompt
 # regardless of the session's stored mode. The text after the prefix is
@@ -280,6 +288,7 @@ class MiniOrkAcpAgent:
         default_mode: str | None = None,
         default_model: str | None = None,
         default_recipe: str | None = None,
+        default_workspace: str | None = None,
     ) -> None:
         # launcher: callable(run_id, kickoff_text) -> dict; reader: callable(run_id)
         # -> {"status", "events", "llm_calls"}; stopper/killer: callable(run_id) -> dict.
@@ -314,6 +323,17 @@ class MiniOrkAcpAgent:
             or os.environ.get("MO_ACP_RECIPE")
             or self._recipe
         )
+        # Workspace mode (Zed S4). ``worktree`` isolates each run on its own
+        # git branch; ``in-place`` runs against the user's checkout. The
+        # ``MO_WORKSPACE_MODE`` env wins the same way ``MO_ACP_DEFAULT_MODE``
+        # does, then the ctor arg, then the literal ``"worktree"`` default.
+        # Invalid values fall back to ``worktree`` rather than raise — the
+        # picker rejects them on the way out, but the ctor must not crash.
+        env_ws = os.environ.get("MO_WORKSPACE_MODE")
+        ws = default_workspace or env_ws or _WORKSPACE_WORKTREE
+        if ws not in _WORKSPACE_VALUES:
+            ws = _WORKSPACE_WORKTREE
+        self._default_workspace = ws
         # The AgentSideConnection handed to on_connect; session_update pushes
         # projected read-model updates back to the ACP client.
         self._conn: Any | None = None
@@ -620,6 +640,7 @@ class MiniOrkAcpAgent:
                 "mode": self._thread_config[thread_id]["mode"],
                 "model": self._thread_config[thread_id]["model"],
                 "recipe": self._thread_config[thread_id]["recipe"],
+                "workspace": self._thread_config[thread_id].get("workspace", ""),
             },
         )
         await self._emit_available_commands(thread_id)
@@ -638,6 +659,7 @@ class MiniOrkAcpAgent:
         ``recipe`` falls back to the agent's default recipe; ``mode`` falls
         back to ``_default_mode``; ``model`` falls back to ``_default_model``
         (or the orchestrator's lane-map default for this session's home).
+        ``workspace`` falls back to ``_default_workspace`` (Zed S4).
         """
         home = self._home_for_for_cwd(cwd)
         model = self._default_model or self._default_orchestrator_lane(home)
@@ -645,6 +667,7 @@ class MiniOrkAcpAgent:
             "mode": self._default_mode,
             "model": model,
             "recipe": self._default_recipe,
+            "workspace": self._default_workspace,
             "claude_session_id": "",
         }
 
@@ -705,13 +728,14 @@ class MiniOrkAcpAgent:
     def _build_config_options(
         self, session_id: str, home: Path
     ) -> list[SessionConfigOptionSelect]:
-        """Materialise the three Zed-rendered pickers in kickoff order.
+        """Materialise the four Zed-rendered pickers in kickoff order.
 
         Order: mode (category="mode"), model (category="model"), recipe (no
-        category). Each option carries the current stored value as
-        ``current_value``. Picker sources: ``acp_orchestrator.config`` for
-        model lanes; ``web.recipes.list_recipes`` for recipes; the literal
-        ``{"orchestrate", "direct"}`` for mode.
+        category), workspace (no category — Zed S4). Each option carries
+        the current stored value as ``current_value``. Picker sources:
+        ``acp_orchestrator.config`` for model lanes; ``web.recipes.list_recipes``
+        for recipes; the literal ``{"orchestrate", "direct"}`` for mode;
+        the literal ``{"worktree", "in-place"}`` for workspace.
         """
         cfg = self._thread_config.get(session_id) or {}
         return [
@@ -737,6 +761,7 @@ class MiniOrkAcpAgent:
             ),
             self._build_model_config_option(session_id, home),
             self._build_recipe_config_option(session_id, home),
+            self._build_workspace_config_option(session_id, home),
         ]
 
     def _build_model_config_option(
@@ -830,6 +855,40 @@ class MiniOrkAcpAgent:
             options=options,
         )
 
+    def _build_workspace_config_option(
+        self, session_id: str, home: Path
+    ) -> SessionConfigOptionSelect:
+        """Zed S4 — workspace mode picker (worktree vs in-place).
+
+        Mirrors ``_build_recipe_config_option``'s "no category" pattern
+        (``agent.py:798-831``) so the picker renders as a free pick rather
+        than a mode / model group. ``current_value`` falls back to the
+        stored config, then ``_default_workspace``.
+        """
+        cfg = self._thread_config.get(session_id) or {}
+        current = str(cfg.get("workspace") or self._default_workspace)
+        if current not in _WORKSPACE_VALUES:
+            current = _WORKSPACE_WORKTREE
+        return SessionConfigOptionSelect(
+            type="select",
+            id="workspace",
+            name="Workspace",
+            description="How each run in this thread touches the project checkout.",
+            current_value=current,
+            options=[
+                SessionConfigSelectOption(
+                    value=_WORKSPACE_WORKTREE,
+                    name="New worktree per task",
+                    description="Each run edits and commits on its own branch.",
+                ),
+                SessionConfigSelectOption(
+                    value=_WORKSPACE_IN_PLACE,
+                    name="In place (this checkout)",
+                    description="Runs operate against the user's checkout.",
+                ),
+            ],
+        )
+
     def _recipe_entries(self, home: Path | None) -> list[Any]:
         """The project + engine recipe catalog; [] on any failure (the picker
         must never crash new_session)."""
@@ -919,6 +978,10 @@ class MiniOrkAcpAgent:
                 raise RequestError.invalid_params(
                     {"message": f"unknown recipe: {value!r}"}
                 )
+        if config_id == "workspace" and value not in _WORKSPACE_VALUES:
+            raise RequestError.invalid_params(
+                {"message": f"unknown workspace: {value!r}"}
+            )
         cfg[config_id] = value
         # Z9c-2: persist the full current config snapshot so a later
         # ``load_session`` can rebuild the picker. Only after the value is
@@ -930,6 +993,7 @@ class MiniOrkAcpAgent:
                 "mode": cfg.get("mode", ""),
                 "model": cfg.get("model", ""),
                 "recipe": cfg.get("recipe", ""),
+                "workspace": cfg.get("workspace", ""),
             },
         )
         options = self._current_config_options(session_id)
@@ -1226,13 +1290,40 @@ class MiniOrkAcpAgent:
         with the thread session's stored recipe. The new run id is a fresh
         mint; the thread session id is NOT a run id and is never passed to
         ``_reader`` / ``_stopper`` / ``_killer``.
+
+        Zed S4 workspace handling: when ``cfg["workspace"] == "worktree"``
+        and the project is a git repo, mint the worktree BEFORE launching
+        and bind the new run id to the worktree path so ``_launch`` picks
+        it up via ``self._sessions[new_run_id]``. A non-git project falls
+        back to in-place (the user's checkout is unchanged). The run
+        marker title gains the `` · worktree mini-ork/<run_id>`` suffix
+        so the thread UI surfaces isolation at a glance.
         """
         if not text:
             return PromptResponse(stop_reason="refusal")
         cfg = self._thread_config.get(session_id) or {}
         recipe = recipe or str(cfg.get("recipe") or self._recipe)
         new_run_id = mint_run_id()
-        self._sessions[new_run_id] = self._sessions.get(session_id, os.getcwd())
+        thread_cwd = self._sessions.get(session_id, os.getcwd())
+        workspace_mode = str(
+            cfg.get("workspace") or self._default_workspace or _WORKSPACE_WORKTREE
+        )
+        if workspace_mode not in _WORKSPACE_VALUES:
+            workspace_mode = _WORKSPACE_WORKTREE
+        ws_branch: str | None = None
+        run_cwd = thread_cwd
+        if workspace_mode == _WORKSPACE_WORKTREE:
+            from mini_ork import workspaces as _workspaces
+            try:
+                ws = _workspaces.create(
+                    Path(thread_cwd), self._home_for(session_id), new_run_id
+                )
+                run_cwd = str(ws.path)
+                ws_branch = ws.branch
+            except RuntimeError:
+                # Non-git project (or transient git error): stay in-place.
+                workspace_mode = _WORKSPACE_IN_PLACE
+        self._sessions[new_run_id] = run_cwd
         self._recipes[new_run_id] = recipe
         self._launch_count += 1
         launcher = self._launcher or self._launch
@@ -1253,7 +1344,9 @@ class MiniOrkAcpAgent:
         # recorded (``_load_thread_session`` rebuilds from the marker and
         # would dedupe-by-id).
         self._thread_runs.setdefault(session_id, []).append(new_run_id)
-        await self._open_run_marker(session_id, new_run_id, recipe)
+        await self._open_run_marker(
+            session_id, new_run_id, recipe, worktree_branch=ws_branch
+        )
         self._direct_runs[session_id] = new_run_id
         try:
             stop = await self._follow_in_thread(session_id, new_run_id)
@@ -1315,6 +1408,13 @@ class MiniOrkAcpAgent:
                 await self._emit_draft_preview(session_id, home, draft)
 
         async def _run() -> Any:
+            kwargs: dict[str, Any] = {}
+            # Zed S4: pass workspace_mode to the harness so the spawned MCP
+            # server inside the orchestrator subprocess defaults to the
+            # thread's mode. Test-injected ``turn`` fakes use a fixed
+            # signature, so only forward when we're calling our own default.
+            if turn is self._default_orchestrator_turn:
+                kwargs["workspace_mode"] = str(cfg.get("workspace") or _WORKSPACE_WORKTREE)
             return await turn(
                 lane=lane,
                 prompt=text,
@@ -1322,6 +1422,7 @@ class MiniOrkAcpAgent:
                 home=home,
                 resume=resume,
                 on_event=on_event,
+                **kwargs,
             )
 
         task = asyncio.create_task(_run())
@@ -1654,13 +1755,23 @@ class MiniOrkAcpAgent:
         finally:
             self._followers.pop(child_run_id, None)
 
-    async def _open_run_marker(self, thread_id: str, run_id: str, recipe: str) -> None:
+    async def _open_run_marker(
+        self,
+        thread_id: str,
+        run_id: str,
+        recipe: str,
+        *,
+        worktree_branch: str | None = None,
+    ) -> None:
+        title = f"run {run_id} ({recipe})"
+        if worktree_branch:
+            title = f"{title} · worktree {worktree_branch}"
         await self._emit(
             thread_id,
             ToolCallStart(
                 session_update="tool_call",
                 tool_call_id=f"{run_id}:parent",
-                title=f"run {run_id} ({recipe})",
+                title=title,
                 status="in_progress",
                 kind="other",
             ),
@@ -1695,6 +1806,7 @@ class MiniOrkAcpAgent:
         home: Path,
         resume: str | None,
         on_event: Callable[[dict[str, Any]], Awaitable[None]],
+        workspace_mode: str | None = None,
     ) -> Any:
         """Default ``orchestrator_turn`` — delegates to the orchestrator harness.
 
@@ -1702,9 +1814,17 @@ class MiniOrkAcpAgent:
         provider registry) only land when an orchestrator turn actually runs,
         not at agent construction time. The CLI process spawns a real
         ``claude`` subprocess here; tests inject a fake.
+
+        ``workspace_mode`` (Zed S4) is forwarded to the spawned MCP server
+        subprocess via ``MO_WORKSPACE_MODE`` so ``start_run`` inside the
+        orchestrator's own tool calls lands on the same workspace choice as
+        the parent thread. ``None`` falls through to the harness default.
         """
         from mini_ork.acp_orchestrator.harness import run_turn
 
+        extra_mcp_env: dict[str, str] | None = None
+        if workspace_mode:
+            extra_mcp_env = {"MO_WORKSPACE_MODE": workspace_mode}
         return await run_turn(
             lane=lane,
             prompt=prompt,
@@ -1712,6 +1832,7 @@ class MiniOrkAcpAgent:
             home=home,
             resume=resume,
             on_event=on_event,
+            extra_mcp_env=extra_mcp_env,
         )
 
     async def cancel(self, session_id: str, **kwargs: Any) -> None:
@@ -2789,7 +2910,7 @@ class MiniOrkAcpAgent:
         )
         for rec in records:
             if rec.get("type") == "config":
-                for key in ("mode", "model", "recipe"):
+                for key in ("mode", "model", "recipe", "workspace"):
                     if rec.get(key):
                         cfg[key] = str(rec[key])
             elif rec.get("type") == "claude_session" and rec.get("id"):

@@ -117,9 +117,10 @@ def test_new_session_mints_thread_session_when_no_run_id_added():
     assert agent._sessions[sid] == "/tmp/proj"
     assert sid in agent._thread_sessions
     assert agent._thread_config[sid]["mode"] == "orchestrate"
-    # The picker list carries three Zed-rendered options in the mandated order.
+    # The picker list carries four Zed-rendered options in the mandated order.
+    # (Z4 added workspace; the option list ends with it.)
     assert resp.config_options is not None
-    assert [opt.id for opt in resp.config_options] == ["mode", "model", "recipe"]
+    assert [opt.id for opt in resp.config_options] == ["mode", "model", "recipe", "workspace"]
     assert resp.config_options[0].category == "mode"
     assert resp.config_options[1].category == "model"
     assert resp.modes is not None
@@ -1032,7 +1033,7 @@ def test_set_config_option_stores_and_returns_full_list(tmp_path):
     ):
         resp = asyncio.run(agent.set_config_option("model", sid, "sonnet"))
     assert resp.config_options is not None
-    assert [opt.id for opt in resp.config_options] == ["mode", "model", "recipe"]
+    assert [opt.id for opt in resp.config_options] == ["mode", "model", "recipe", "workspace"]
     assert resp.config_options[1].current_value == "sonnet"
     assert agent._thread_config[sid]["model"] == "sonnet"
     # The emission lands on the wire.
@@ -2444,7 +2445,7 @@ def test_fresh_process_load_puts_each_run_after_its_marker(tmp_path):
     ids = [getattr(u, "tool_call_id", None) for _, u in conn.sent]
     assert ids.index(f"{child}:parent") < ids.index(f"{child}:n1")
     assert {sid for sid, _ in conn.sent} == {thread}
-    assert [o.id for o in resp.config_options] == ["mode", "model", "recipe"]
+    assert [o.id for o in resp.config_options] == ["mode", "model", "recipe", "workspace"]
 
 
 # ── Z4 implementer diff surface ──────────────────────────────────────────────
@@ -4091,3 +4092,185 @@ def test_recipe_edit_of_a_spec_recipe_goes_to_the_orchestrator(tmp_path, monkeyp
     agent.on_connect(_PermConn([]))
     asyncio.run(agent.prompt(thread, [_text_block("/recipe edit migration-audit")]))
     assert "get_recipe_spec" in prompts[0] and 'base="migration-audit"' in prompts[0]
+
+
+# ── workspace config + direct-mode worktree (Zed S4) ───────────────────────
+
+
+def test_workspace_option_default_is_worktree(tmp_path):
+    """A fresh thread session carries ``workspace="worktree"`` by default."""
+    agent, _conn, sid = _make_thread_agent(tmp_path)
+    assert agent._thread_config[sid]["workspace"] == "worktree"
+
+
+def test_workspace_option_appears_in_picker_order(tmp_path):
+    """The picker list ends with the workspace option (after mode/model/recipe)."""
+    from unittest.mock import patch
+
+    agent, _conn, sid = _make_thread_agent(tmp_path)
+    with patch(
+        "mini_ork.acp_orchestrator.config.orchestrator_lanes",
+        return_value=[{"id": "opus", "name": "Opus"}],
+    ), patch(
+        "mini_ork.recipes_catalog.list_recipes",
+        return_value=[_recipe("code-fix")],
+    ):
+        resp = asyncio.run(agent.set_config_option("workspace", sid, "in-place"))
+    assert resp.config_options is not None
+    ids = [opt.id for opt in resp.config_options]
+    assert ids == ["mode", "model", "recipe", "workspace"]
+    ws = next(opt for opt in resp.config_options if opt.id == "workspace")
+    assert ws.current_value == "in-place"
+    assert {opt.value for opt in ws.options} == {"worktree", "in-place"}
+    assert agent._thread_config[sid]["workspace"] == "in-place"
+
+
+def test_set_config_option_rejects_unknown_workspace(tmp_path):
+    agent, _conn, sid = _make_thread_agent(tmp_path)
+    try:
+        asyncio.run(agent.set_config_option("workspace", sid, "ssh-tunnel"))
+    except Exception as exc:
+        assert getattr(exc, "code", None) == -32602
+        assert "unknown workspace" in str(getattr(exc, "data", None))
+    else:
+        raise AssertionError("expected invalid_params")
+
+
+def test_workspace_default_honors_mo_workspace_mode_env(tmp_path, monkeypatch):
+    """``MO_WORKSPACE_MODE=in-place`` is the default until the user changes it."""
+    from unittest.mock import patch
+
+    monkeypatch.setenv("MO_WORKSPACE_MODE", "in-place")
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    with patch(
+        "mini_ork.acp_orchestrator.config.orchestrator_lanes",
+        return_value=[{"id": "opus", "name": "Opus"}],
+    ), patch(
+        "mini_ork.recipes_catalog.list_recipes",
+        return_value=[_recipe("code-fix")],
+    ):
+        agent = MiniOrkAcpAgent()
+        resp = asyncio.run(agent.new_session(cwd=str(proj)))
+    sid = resp.session_id
+    assert agent._thread_config[sid]["workspace"] == "in-place"
+
+
+def test_direct_mode_worktree_creates_and_routes_to_worktree_path(tmp_path, monkeypatch):
+    """``workspace=worktree`` mints a worktree (create monkeypatched) and the
+    default launcher reads its path through ``self._sessions[new_run_id]``."""
+    from unittest.mock import patch
+
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    fake_lanes = [{"id": "opus", "name": "Opus"}]
+    fake_recipes = ["code-fix"]
+
+    # ``workspaces.create`` is monkeypatched to a stub that records the
+    # args and returns a fake workspace with a sentinel path.
+    captured: dict = {}
+
+    class _FakeWS:
+        def __init__(self, path, branch):
+            self.path = path
+            self.branch = branch
+
+    def fake_create(project, home, run_id):
+        captured["project"] = str(project)
+        captured["home"] = str(home)
+        captured["run_id"] = run_id
+        return _FakeWS(path=tmp_path / "ws", branch=f"mini-ork/{run_id}")
+
+    launched: dict = {}
+
+    def fake_launch(self, run_id, kickoff_text):
+        launched["run_id"] = run_id
+        launched["cwd"] = self._sessions.get(run_id)
+        launched["recipe"] = self._recipes.get(run_id)
+        return {"ok": True, "run_id": run_id}
+
+    with patch(
+        "mini_ork.acp_orchestrator.config.orchestrator_lanes",
+        return_value=fake_lanes,
+    ), patch(
+        "mini_ork.recipes_catalog.list_recipes",
+        return_value=[_recipe(n) for n in fake_recipes],
+    ), patch(
+        "mini_ork.workspaces.create", fake_create
+    ), patch.object(MiniOrkAcpAgent, "_launch", fake_launch):
+        agent = MiniOrkAcpAgent(reader=lambda _r: {"status": "published", "events": [], "llm_calls": []}, poll_interval=0)
+        resp = asyncio.run(agent.new_session(cwd=str(proj)))
+        sid = resp.session_id
+        asyncio.run(agent.set_config_option("mode", sid, "direct"))
+        turn_resp = asyncio.run(agent.prompt(sid, [_text_block("do it")]))
+
+    assert turn_resp.stop_reason == "end_turn"
+    # workspaces.create was called with the project root and the thread's home.
+    assert captured["project"] == str(proj)
+    assert captured["run_id"] == launched["run_id"]
+    # The launcher received the worktree path, NOT the project root.
+    assert launched["cwd"] == str(tmp_path / "ws")
+    assert launched["cwd"] != str(proj)
+
+
+def test_direct_mode_in_place_skips_workspaces_create(tmp_path, monkeypatch):
+    """``workspace=in-place`` MUST NOT call ``workspaces.create``."""
+    from unittest.mock import patch
+
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    fake_lanes = [{"id": "opus", "name": "Opus"}]
+    fake_recipes = ["code-fix"]
+
+    create_calls: list = []
+
+    def fake_create(project, home, run_id):
+        create_calls.append(run_id)
+        raise AssertionError("workspaces.create must not run for in-place")
+
+    launched: dict = {}
+
+    def fake_launch(self, run_id, kickoff_text):
+        launched["cwd"] = self._sessions.get(run_id)
+        return {"ok": True, "run_id": run_id}
+
+    with patch(
+        "mini_ork.acp_orchestrator.config.orchestrator_lanes",
+        return_value=fake_lanes,
+    ), patch(
+        "mini_ork.recipes_catalog.list_recipes",
+        return_value=[_recipe(n) for n in fake_recipes],
+    ), patch(
+        "mini_ork.workspaces.create", fake_create
+    ), patch.object(MiniOrkAcpAgent, "_launch", fake_launch):
+        agent = MiniOrkAcpAgent(reader=lambda _r: {"status": "published", "events": [], "llm_calls": []}, poll_interval=0)
+        resp = asyncio.run(agent.new_session(cwd=str(proj)))
+        sid = resp.session_id
+        asyncio.run(agent.set_config_option("mode", sid, "direct"))
+        asyncio.run(agent.set_config_option("workspace", sid, "in-place"))
+        turn_resp = asyncio.run(agent.prompt(sid, [_text_block("do it")]))
+
+    assert turn_resp.stop_reason == "end_turn"
+    assert create_calls == []
+    assert launched["cwd"] == str(proj)
+
+
+def test_workspace_round_trips_through_load_session(tmp_path):
+    """A persisted ``workspace`` value is replayed on ``load_session``."""
+    from unittest.mock import patch
+
+    agent, _conn, sid = _make_thread_agent(tmp_path)
+    with patch(
+        "mini_ork.acp_orchestrator.config.orchestrator_lanes",
+        return_value=[{"id": "opus", "name": "Opus"}],
+    ), patch(
+        "mini_ork.recipes_catalog.list_recipes",
+        return_value=[_recipe("code-fix")],
+    ):
+        asyncio.run(agent.set_config_option("workspace", sid, "in-place"))
+
+    # Build a second agent that re-loads the same store; expect the same value.
+    agent2 = MiniOrkAcpAgent()
+    cwd = list(agent._sessions.values())[0]
+    asyncio.run(agent2.load_session(cwd, sid))
+    assert agent2._thread_config[sid]["workspace"] == "in-place"
