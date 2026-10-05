@@ -46,6 +46,15 @@ Two common extension selectors are:
 | `MO_ROUTING_POLICY` | Chooses a registered native routing policy. |
 | `MO_EMBED_PROVIDER` | Chooses a registered semantic-memory embedder. |
 
+Gate-hackability audit knobs (G09-T05):
+
+| Variable | Default | Effect |
+|---|---|---|
+| `MO_GATE_HACKABILITY_N` | `4` | Proposer documents per gate for the gate-hackability audit (clamped 0..16; `0` never calls the proposer). |
+| `MO_GATE_HACKABILITY_BUDGET_USD` | `0.50` | Per-audit LLM budget for the gate-hackability proposer. |
+| `MO_GATE_HACKABILITY_MAX` | `0.25` | Hackability threshold above which the promotion gate refuses a promote. |
+| `MO_PROMOTION_GATE_HACKABILITY` | `"1"` | Master switch for the promotion gate-hackability check; `"0"` disables it. |
+
 Do not use the retired `MINI_ORK_RUNTIME` selector. The supported framework
 runtime is native Python; shell execution remains available only for declared
 recipe verifier, target-repository, migration, and sandbox boundaries.

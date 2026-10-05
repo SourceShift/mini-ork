@@ -74,6 +74,18 @@ caching):
                                         a would-be promote to "quarantined"
                                         with reason ``verifier-audit:<flags>``;
                                         never turns a reject into a promote.
+    MO_PROMOTION_GATE_HACKABILITY    → gate-hackability consumer (G09-T05):
+                                        default ON ("1"); opt-out with "0".
+                                        When ON, a would-be promote is refused
+                                        ("rejected") when a gate it depends on
+                                        was measured above
+                                        ``MO_GATE_HACKABILITY_MAX`` (default
+                                        0.25); unmeasured gates never reject.
+                                        (The audit-side knobs
+                                        ``MO_GATE_HACKABILITY_N``,
+                                        ``MO_GATE_HACKABILITY_BUDGET_USD`` and
+                                        ``MO_GATE_HACKABILITY_MAX`` configure
+                                        the measurement, not this consumer.)
     MINI_ORK_ROOT                    → legacy: where to find ``lib/cw_por.sh``
                                         (WS4: CW-POR is computed natively via
                                         ``mini_ork.gates.cw_por``; the env var
@@ -312,6 +324,17 @@ def promotion_evaluate(
         # the audit did not act.
         audit_result: dict[str, Any] | None = None
 
+        # The gate-hackability check (G09-T05) is initialised next to the audit
+        # result so the final ``result`` dict can reference it on every branch.
+        # It runs only on the promote branch and only when the knob is on; the
+        # key is added to ``result`` only when the knob is on (test 12 pins the
+        # 10-key legacy shape when the knob is off).
+        gate_hk: dict[str, Any] | None = None
+        try:
+            hk_enabled = os.environ.get("MO_PROMOTION_GATE_HACKABILITY", "1") != "0"
+        except Exception:
+            hk_enabled = True
+
         # ── Decision logic (mirrors bash lines 123-140) ──
         if brun is None:
             # Zero benchmark_results rows: nothing was measured. The old
@@ -404,6 +427,35 @@ def promotion_evaluate(
                     f"all benchmark tasks passed."
                 )
 
+                # ── Gate-hackability consumer (G09-T05) ──────────────────
+                # A promote that depends on a gate measured above
+                # MO_GATE_HACKABILITY_MAX is refused: the defect is in the
+                # instrument (the gate accepted known-bad inputs), not the
+                # candidate, so it is a reject — never a quarantine, which
+                # `mini-ork promote` treats as permanent.
+                if hk_enabled:
+                    try:
+                        from mini_ork.gates import hackability
+
+                        candidate_task_class = _candidate_task_class(con, candidate_id)
+                        gate_hk = hackability.promotion_check(db_path, candidate_task_class)
+                    except Exception as exc:  # noqa: BLE001 — fail-open
+                        # A check that could not even run must not break a
+                        # legitimate promote; the decision stays unchanged.
+                        print(
+                            f"promotion_evaluate: gate-hackability check "
+                            f"failed: {exc}",
+                            file=sys.stderr,
+                        )
+                        gate_hk = {"error": str(exc)}
+                    if gate_hk is not None and gate_hk.get("over_threshold"):
+                        over = gate_hk["over_threshold"]
+                        decision = "rejected"
+                        parts = ",".join(
+                            f"{o['gate_id']}={o['hackability']:.3f}" for o in over
+                        )
+                        rationale += f" gate-hackability:{parts}>{gate_hk['max']:g}"
+
         # The evidence pointer: which runs the decision actually rested on.
         # Before this the row stored a bare NULL, so the audit trail could not
         # answer the one question a promotion decision has to answer — how much
@@ -426,6 +478,10 @@ def promotion_evaluate(
             "safety_violations": safety_violations,
             "verifier_audit": audit_result,
         }
+        # The gate-hackability result is carried only when the knob is on, so
+        # the legacy 10-key shape is preserved when the consumer is disabled.
+        if hk_enabled:
+            result["gate_hackability"] = gate_hk
 
         # ── INSERT into promotion_records (mirrors bash lines 152-183) ──
         record_id = f"pr-{uuid.uuid4().hex[:16]}"
