@@ -449,8 +449,10 @@ def test_subprocess_round_trip_with_control(server_home):
     assert len(lines) == 3
     names = sorted(t["name"] for t in lines[1]["result"]["tools"])
     expected = [
-        "certify", "cost", "lanes", "learnings", "list_recipes", "list_runs",
-        "run_detail", "run_status", "start_run", "stop_run", "wait_for_run",
+        "certify", "cost", "draft_recipe", "get_recipe_spec",
+        "lanes", "learnings", "list_recipes", "list_runs",
+        "recipe_guide", "run_detail", "run_status", "start_run",
+        "stop_run", "wait_for_run",
     ]
     assert names == expected
     # `start_run` with empty args → error object (recipe required).
@@ -512,15 +514,29 @@ def test_default_mode_rejects_control_tools(server_home):
     assert "unknown tool" in body["error"]
 
 
-def test_control_mode_lists_eleven_tools(server_home):
-    """With control=True, tools/list returns 5 + 6 = 11 names."""
+def test_control_mode_lists_fourteen_tools(server_home):
+    """With control=True, tools/list returns 5 + 9 = 14 names."""
     resp = _call_control("tools/list")
     names = sorted(t["name"] for t in resp["result"]["tools"])
-    assert len(names) == 11
+    assert len(names) == 14
     assert names == sorted([
-        "certify", "cost", "lanes", "learnings", "list_recipes", "list_runs",
-        "run_detail", "run_status", "start_run", "stop_run", "wait_for_run",
+        "certify", "cost", "draft_recipe", "get_recipe_spec",
+        "lanes", "learnings", "list_recipes", "list_runs",
+        "recipe_guide", "run_detail", "run_status", "start_run",
+        "stop_run", "wait_for_run",
     ])
+    # Kickoff is explicit: no commit-shaped tool must be exposed.
+    for forbidden in ("commit", "commit_draft", "commit_recipe", "publish_recipe"):
+        assert forbidden not in names, f"forbidden tool exposed: {forbidden}"
+
+
+def test_default_mode_does_not_expose_recipe_tools(server_home):
+    """recipe_guide / draft_recipe / get_recipe_spec are control-only."""
+    resp = _call("tools/list")
+    names = {t["name"] for t in resp["result"]["tools"]}
+    assert "recipe_guide" not in names
+    assert "draft_recipe" not in names
+    assert "get_recipe_spec" not in names
 
 
 # ── list_recipes ────────────────────────────────────────────────────────
@@ -940,3 +956,155 @@ def test_certify_requires_issue(server_home):
     body = json.loads(resp["result"]["content"][0]["text"])
     assert resp["result"]["isError"] is True
     assert "issue is required" in body["error"]
+
+
+# ── recipe_guide / draft_recipe / get_recipe_spec ────────────────────────────
+
+
+_VALID_SPEC: dict = {
+    "id": "demo-recipe",
+    "description": "Demo recipe used by MCP server tests.",
+    "keywords": ["demo", "test"],
+    "input": "The path to inspect.",
+    "steps": [
+        {
+            "id": "scanner",
+            "type": "researcher",
+            "role": "planner",
+            "instructions": "Read the file at the path in the kickoff.",
+        },
+        {
+            "id": "smoke",
+            "type": "verifier",
+            "check": "true",
+            "after": ["scanner"],
+        },
+    ],
+    "publish": False,
+    "rollback_on_failure": False,
+}
+
+
+def _recipe_home(monkeypatch, tmp_path) -> Path:
+    """Fresh mini-ork home (separate from ``server_home``) with a lane map.
+
+    Lives under a sibling path (``recipe-home``) so it does NOT collide with
+    the ``server_home`` fixture, which already created ``.mini-ork`` in
+    ``tmp_path``. The two homes point at different paths and we override
+    ``MINI_ORK_HOME`` per test.
+    """
+    h = tmp_path / "recipe-home"
+    (h / "config").mkdir(parents=True)
+    (h / "config" / "agents.yaml").write_text(
+        "lanes:\n  planner: opus\n  reviewer: sonnet\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("MINI_ORK_HOME", str(h))
+    return h
+
+
+def test_recipe_guide_returns_schema_roles_and_example(server_home, monkeypatch, tmp_path):
+    h = _recipe_home(monkeypatch, tmp_path)
+    resp = _call_args_control({"name": "recipe_guide", "arguments": {}})
+    body = json.loads(resp["result"]["content"][0]["text"])
+    assert resp["result"]["isError"] is False
+    assert "spec_schema" in body
+    assert "step_types" in body
+    assert body["step_types"]["verifier"].startswith("Runs a shell check")
+    assert body["roles"] == {"planner": "opus", "reviewer": "sonnet"}
+    assert any("Use the fewest steps" in r for r in body["rules"])
+    assert body["example"]["id"] == "sql-migration-audit"
+    # The home env was set to the recipe home, not the global server_home.
+    assert os.environ["MINI_ORK_HOME"] == str(h)
+
+
+def test_draft_recipe_writes_under_recipe_drafts(server_home, monkeypatch, tmp_path):
+    h = _recipe_home(monkeypatch, tmp_path)
+    resp = _call_args_control({
+        "name": "draft_recipe",
+        "arguments": {"spec": _VALID_SPEC},
+    })
+    body = json.loads(resp["result"]["content"][0]["text"])
+    assert resp["result"]["isError"] is False
+    assert body["ok"] is True
+    assert body["draft_id"] == "demo-recipe"
+    assert body["target"].endswith("/recipes/demo-recipe")
+    assert body["exists"] is False
+    # Files were written only under recipe-drafts/, NOT recipes/.
+    drafts = h / "recipe-drafts" / "demo-recipe"
+    assert drafts.is_dir()
+    assert (drafts / "task_class.yaml").is_file()
+    assert (drafts / "workflow.yaml").is_file()
+    assert (drafts / "artifact_contract.yaml").is_file()
+    assert (drafts / "prompts" / "scanner.md").is_file()
+    assert (drafts / "verifiers" / "smoke.py").is_file()
+    assert (drafts / "recipe.spec.json").is_file()
+    assert (drafts / "draft.json").is_file()
+    assert not (h / "recipes" / "demo-recipe").exists()
+    # Grade payload shape.
+    assert "score" in body["grade"]
+    assert body["grade"]["letter"] in {"A", "B", "C", "D", "F"}
+    assert isinstance(body["grade"]["findings"], list)
+    assert isinstance(body["files"], list)
+    paths = {f["path"] for f in body["files"]}
+    assert "task_class.yaml" in paths
+    # recipe.spec.json IS rendered (it's how later edits round-trip); draft.json
+    # is the staging-only metadata and stays in recipe-drafts/ alongside it.
+
+
+def test_draft_recipe_invalid_spec_returns_errors(server_home, monkeypatch, tmp_path):
+    h = _recipe_home(monkeypatch, tmp_path)
+    bad = dict(_VALID_SPEC)
+    bad["id"] = "BadID"  # uppercase violates the id pattern
+    resp = _call_args_control({
+        "name": "draft_recipe",
+        "arguments": {"spec": bad},
+    })
+    body = json.loads(resp["result"]["content"][0]["text"])
+    assert resp["result"]["isError"] is False
+    assert body["ok"] is False
+    assert isinstance(body["errors"], list) and body["errors"]
+    # Nothing was written.
+    assert not (h / "recipe-drafts").exists()
+
+
+def test_draft_recipe_rejects_non_object_spec(server_home, monkeypatch, tmp_path):
+    _recipe_home(monkeypatch, tmp_path)
+    resp = _call_args_control({
+        "name": "draft_recipe",
+        "arguments": {"spec": "not-a-dict"},
+    })
+    body = json.loads(resp["result"]["content"][0]["text"])
+    assert resp["result"]["isError"] is True
+    assert "spec object is required" in body["error"]
+
+
+def test_get_recipe_spec_returns_404_style_error_for_unknown(server_home, monkeypatch, tmp_path):
+    _recipe_home(monkeypatch, tmp_path)
+    resp = _call_args_control({
+        "name": "get_recipe_spec",
+        "arguments": {"id": "no-such-recipe"},
+    })
+    body = json.loads(resp["result"]["content"][0]["text"])
+    assert resp["result"]["isError"] is True
+    assert "no-such-recipe" in body["error"]
+    assert "not authored from a spec" in body["error"]
+
+
+def test_get_recipe_spec_requires_id(server_home, monkeypatch, tmp_path):
+    _recipe_home(monkeypatch, tmp_path)
+    resp = _call_args_control({
+        "name": "get_recipe_spec",
+        "arguments": {},
+    })
+    body = json.loads(resp["result"]["content"][0]["text"])
+    assert resp["result"]["isError"] is True
+    assert "id is required" in body["error"]
+
+
+def test_recipe_tools_are_rejected_in_default_mode(server_home, monkeypatch, tmp_path):
+    _recipe_home(monkeypatch, tmp_path)
+    resp = _call_args({"name": "draft_recipe", "arguments": {"spec": _VALID_SPEC}})
+    body = json.loads(resp["result"]["content"][0]["text"])
+    assert resp["result"]["isError"] is True
+    assert "unknown tool" in body["error"]

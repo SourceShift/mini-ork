@@ -834,17 +834,112 @@ _CONTROL_TOOL_DEFS: list[dict[str, Any]] = [
             "required": ["issue"],
         },
     },
+    {
+        "name": "recipe_guide",
+        "description": (
+            "Describe what a recipe spec looks like: JSON schema, step "
+            "types, the home's lane map, short authoring rules, and an "
+            "example. Read-only; no project state changes. Returns "
+            "{spec_schema, step_types, roles, rules, example}."
+        ),
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "draft_recipe",
+        "description": (
+            "Render a recipe spec into <home>/recipe-drafts/<id>/ "
+            "WITHOUT writing into <home>/recipes/. The user must approve "
+            "before any commit (no commit tool is exposed via MCP). "
+            "Returns {ok, draft_id, target, exists, files, warnings, grade} "
+            "on success; {ok: false, errors} on validation failure. The "
+            "spec object follows recipe_guide().spec_schema; `base` is "
+            "optional and, when given, must equal the spec's id (editing "
+            "an existing project recipe)."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "spec": {"type": "object"},
+                "base": {"type": "string"},
+            },
+            "required": ["spec"],
+        },
+    },
+    {
+        "name": "get_recipe_spec",
+        "description": (
+            "Return the spec a project or engine recipe was authored from "
+            "(the parsed <recipe>/recipe.spec.json). Returns {error: ...} "
+            "when the recipe was hand-edited and not authored from a spec; "
+            "copy it into the project first to edit it via draft_recipe."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {"id": {"type": "string"}},
+            "required": ["id"],
+        },
+    },
 ]
 
 
 def _all_tool_defs(control: bool) -> list[dict[str, Any]]:
-    """Tool list for ``tools/list``. Additive: read-only 5 + control 6 when
+    """Tool list for ``tools/list``. Additive: read-only 5 + control 9 when
     ``control=True``; the read-only 5 only by default — default mode MUST
     stay byte-identical to the pre-`--control` schema.
     """
     if control:
         return list(TOOL_DEFS) + list(_CONTROL_TOOL_DEFS)
     return list(TOOL_DEFS)
+
+
+# ── tool: recipe_guide / draft_recipe / get_recipe_spec ───────────────────────
+
+
+def _recipe_guide(home: Path, args: dict[str, Any]) -> dict[str, Any]:
+    from mini_ork.recipe_author import guide
+
+    return guide(home)
+
+
+def _draft_recipe(home: Path, args: dict[str, Any]) -> dict[str, Any]:
+    spec = args.get("spec")
+    if not isinstance(spec, dict):
+        return {"error": "spec object is required"}
+    base = args.get("base")
+    if base is not None and not isinstance(base, str):
+        return {"error": "base must be a string when provided"}
+    from mini_ork.recipe_author import draft
+
+    try:
+        return draft(home, spec, base=base)
+    except Exception as exc:
+        _log(f"draft_recipe raised: {exc}")
+        return {"error": f"draft_recipe: {exc}"}
+
+
+def _get_recipe_spec(home: Path, args: dict[str, Any]) -> dict[str, Any]:
+    recipe_id = args.get("id")
+    if not isinstance(recipe_id, str) or not recipe_id.strip():
+        return {"error": "id is required"}
+    rid = recipe_id.strip()
+    from mini_ork.recipe_author import get_spec
+
+    try:
+        spec = get_spec(home, rid)
+    except Exception as exc:
+        _log(f"get_recipe_spec raised: {exc}")
+        return {"error": f"get_recipe_spec: {exc}"}
+    if spec is None:
+        return {
+            "error": (
+                f"recipe {rid!r} was not authored from a spec; "
+                "copy it into the project to edit via draft_recipe"
+            )
+        }
+    return spec
+
+
+# ── tool: dispatch ───────────────────────────────────────────────────────────
 
 
 def _call_tool(
@@ -894,6 +989,12 @@ def _call_tool(
                 return _stop_run(home, args)
             if name == "certify":
                 return _certify(home, args)
+            if name == "recipe_guide":
+                return _recipe_guide(home, args)
+            if name == "draft_recipe":
+                return _draft_recipe(home, args)
+            if name == "get_recipe_spec":
+                return _get_recipe_spec(home, args)
     except Exception as exc:  # defensive — kickoff says no exception ever
         _log(f"tool {name} raised: {exc}")
         return {"error": f"{name}: {exc}"}
