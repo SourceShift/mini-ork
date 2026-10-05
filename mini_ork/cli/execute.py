@@ -1400,6 +1400,15 @@ def _run_verifier_ref(script, evidence_path, *, plan_path="", artifact_path="", 
     # the executor-to-verifier boundary explicit instead of relying on an
     # outer CLI process to have populated it.
     verifier_env.setdefault("MINI_ORK_RUN_DIR", os.path.dirname(evidence_path))
+    # A ``.py`` verifier runs in the TARGET repo, where ``mini_ork`` resolves to
+    # whatever the interpreter finds (a venv editable install, or nothing in a
+    # vendored install) — not necessarily the engine running this executor. Live
+    # smoke (2026-10-05): the code-fix verifier imported a stale checkout, so the
+    # new suite-adequacy audit abstained as `module-unavailable`. Put the
+    # executing engine first so verifiers judge with the code that dispatched them.
+    engine_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+    inherited = verifier_env.get("PYTHONPATH", "")
+    verifier_env["PYTHONPATH"] = (engine_root + os.pathsep + inherited) if inherited else engine_root
     # ``run_check`` handles the local-vs-remote routing; the legacy
     # ``subprocess.run(..., stdout=fh, stderr=STDOUT)`` shape is preserved
     # on the local branch. Under remote placement, the helper writes the
