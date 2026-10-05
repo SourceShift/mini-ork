@@ -86,6 +86,7 @@ from mini_ork.runtime.run_roots import (  # noqa: F401
 )
 from mini_ork.runtime.contract import run_check  # noqa: F401 -- routing helper
 from mini_ork.execute_compat import normalize_implementer_summary, write_json_atomic
+from mini_ork.verify import levels as _levels
 
 _SEP = "\x1f"
 _NODE_TYPE_ORDER = ("planner", "researcher", "transform", "implementer", "reviewer", "verifier",
@@ -314,7 +315,7 @@ def _resolve_dispatch_mode(override, wf_path) -> str:
     return "serial"
 
 
-def _emit_run_verdict(run_dir, fail_count, dispatched, *, dry_run=False):
+def _emit_run_verdict(run_dir, fail_count, dispatched, *, dry_run=False, task_class=""):
     # A rehearsal must not occupy the run's own record. A nested lifecycle that
     # inherits MINI_ORK_RUN_ID shares the run dir; when the rehearsal wrote
     # verdict.json first, this guard skipped the live run and the run dir kept a
@@ -337,6 +338,26 @@ def _emit_run_verdict(run_dir, fail_count, dispatched, *, dry_run=False):
             # A recipe may own verdict.json as a detailed deliverable. Keep that
             # evidence intact and put executor bookkeeping beside it.
             verdict_path = os.path.join(run_dir, "run-verdict.json")
+    # Level-vector stamp (MO_LEVEL_VECTOR=1, live only): append the five report
+    # keys after the four byte-stable pairs. Knob off or dry_run keep today's
+    # bytes (the byte-stability invariant tests 8 / 11 enforce).
+    if _levels.enabled() and not dry_run:
+        report = _levels.level_report(run_dir, task_class)
+        payload = {
+            "verdict": verdict,
+            "failed_nodes": fail_count,
+            "dispatched": dispatched,
+            "source": "execute@run-level",
+        }
+        payload.update(report)
+        try:
+            open(verdict_path, "w").write(
+                json.dumps(payload, separators=(",", ":"), ensure_ascii=False) + "\n")
+        except OSError:
+            return
+        print(f"  [verdict] run-level {os.path.basename(verdict_path)}: {verdict} "
+              f"(failed_nodes={fail_count}) levels_ok={str(report['levels_ok']).lower()}")
+        return
     try:
         open(verdict_path, "w").write(
             '{"verdict":"%s","failed_nodes":%d,"dispatched":%d,"source":"execute@run-level"}\n'
@@ -982,7 +1003,7 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
                 _dispatch_serial(field)
         elif rollback_fields:
             print("  [skip] rollback — no failures (escalates_to edge not triggered)")
-        _emit_run_verdict(live_run_dir, fail_count, len(fields_list))
+        _emit_run_verdict(live_run_dir, fail_count, len(fields_list), task_class=task_class)
         _post_run_learning(db, live_run_dir, run_id, task_class, fail_count=fail_count)
         if fail_count > 0:
             set_status(db, run_id, "failed")

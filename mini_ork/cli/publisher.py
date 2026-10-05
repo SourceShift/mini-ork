@@ -16,6 +16,7 @@ import sys
 
 from mini_ork.context import context_env, publish_env
 from mini_ork.runtime.run_roots import load_run_roots
+from mini_ork.verify import levels as _levels
 
 
 def set_status(db, run_id, new_status):  # late binding — avoids the execute<->publisher cycle
@@ -181,6 +182,23 @@ def publisher_node(root, run_dir, db, run_id, recipe, task_class, review_file=""
         if not ok:
             print("  [BLOCK] publisher: panel verdict is not approved — publish refused", file=sys.stderr)
             return 1, "verdict_fail"
+    # ── level-vector gate (MO_LEVEL_VECTOR): publish only when every required
+    # level is PROVEN. `refute` fails the run (the rollback it triggers is the
+    # right compensation); `abstain` withholds the commit WITHOUT rolling back
+    # the edit (rc 0 so fail_count is not bumped — rc≠0 triggers revert_branch,
+    # which DESTROYS the abstained edit and breaks test.py's abstention contract).
+    if _levels.enabled():
+        rep = _levels.level_report(run_dir, task_class)
+        detail = " ".join(f"{k}={v}" for k, v in rep["levels"].items())
+        decision = rep["levels_decision"]
+        if decision == "refute":
+            print(f"  [BLOCK] publisher: level vector REFUTED ({detail})")
+            return 1, "levels_refuted"
+        if decision == "abstain":
+            print(f"  [ABSTAIN] publisher: level vector not proven ({detail}) — publish withheld")
+            set_status(db, run_id, "failed")
+            return 0, "levels_unverified"
+        print(f"  [ok] publisher: level gate pass (required={rep['levels_required'] or None})")
     # ── artifact contract
     contract = (os.path.join(_recipe_root(root), "recipes", recipe, "artifact_contract.yaml")
                 if recipe else "")
