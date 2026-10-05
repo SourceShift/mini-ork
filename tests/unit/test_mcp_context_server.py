@@ -780,8 +780,8 @@ def test_start_run_passes_to_launch_run(server_home, monkeypatch):
     assert captured["extra_env"] == {"MO_TARGET_CWD": str(server_home.parent)}
 
 
-def test_start_run_passes_project_home_when_set(server_home, monkeypatch):
-    """MINI_ORK_PROJECT_HOME wins over home.parent for MO_TARGET_CWD."""
+def test_start_run_targets_project_not_launcher_project_home(server_home, monkeypatch):
+    """bin/mini-ork sets MINI_ORK_PROJECT_HOME to the HOME; the run still targets home.parent."""
     captured: dict = {}
 
     def fake_launch(home, recipe, kickoff, run_id=None, extra_env=None):
@@ -796,15 +796,15 @@ def test_start_run_passes_project_home_when_set(server_home, monkeypatch):
         }
 
     monkeypatch.setattr("mini_ork.web.control.launch_run", fake_launch)
-    monkeypatch.setenv("MINI_ORK_PROJECT_HOME", "/custom/project")
+    monkeypatch.setenv("MINI_ORK_PROJECT_HOME", str(server_home))
 
     resp = _call_args_control({
         "name": "start_run",
-        "arguments": {"recipe": "code-fix", "kickoff_markdown": "body"},
+        "arguments": {"recipe": "code-fix", "kickoff_markdown": "body", "workspace": "in-place"},
     })
     body = json.loads(resp["result"]["content"][0]["text"])
     assert body["ok"] is True
-    assert captured["extra_env"] == {"MO_TARGET_CWD": "/custom/project"}
+    assert captured["extra_env"] == {"MO_TARGET_CWD": str(server_home.parent)}
 
 
 def test_start_run_returns_error_object_on_failure(server_home, monkeypatch):
@@ -850,7 +850,9 @@ def _git_repo(tmp_path: Path) -> Path:
 def test_start_run_workspace_worktree_creates_and_passes_path(server_home, tmp_path, monkeypatch):
     """``workspace=worktree`` mints a worktree and routes MO_TARGET_CWD into it."""
     repo = _git_repo(tmp_path)
-    monkeypatch.setenv("MINI_ORK_PROJECT_HOME", str(repo))
+    # The project owns the home: <project>/.mini-ork, as `mini-ork init` lays it out.
+    (repo / ".mini-ork").mkdir()
+    monkeypatch.setenv("MINI_ORK_HOME", str(repo / ".mini-ork"))
     captured: dict = {}
 
     def fake_launch(home, recipe, kickoff, run_id=None, extra_env=None):
@@ -885,7 +887,9 @@ def test_start_run_workspace_worktree_creates_and_passes_path(server_home, tmp_p
 def test_start_run_workspace_in_place_keeps_project_root(server_home, tmp_path, monkeypatch):
     """``workspace=in-place`` skips worktree creation; MO_TARGET_CWD points at the project root."""
     repo = _git_repo(tmp_path)
-    monkeypatch.setenv("MINI_ORK_PROJECT_HOME", str(repo))
+    # The project owns the home: <project>/.mini-ork, as `mini-ork init` lays it out.
+    (repo / ".mini-ork").mkdir()
+    monkeypatch.setenv("MINI_ORK_HOME", str(repo / ".mini-ork"))
     captured: dict = {}
 
     def fake_launch(home, recipe, kickoff, run_id=None, extra_env=None):
@@ -916,7 +920,9 @@ def test_start_run_non_git_project_falls_back_with_note(server_home, tmp_path, m
     not_a_repo = tmp_path / "no_git"
     not_a_repo.mkdir()
     (not_a_repo / "f.txt").write_text("x\n", encoding="utf-8")
-    monkeypatch.setenv("MINI_ORK_PROJECT_HOME", str(not_a_repo))
+    # The project owns the home: <project>/.mini-ork, as `mini-ork init` lays it out.
+    (not_a_repo / ".mini-ork").mkdir()
+    monkeypatch.setenv("MINI_ORK_HOME", str(not_a_repo / ".mini-ork"))
     captured: dict = {}
 
     def fake_launch(home, recipe, kickoff, run_id=None, extra_env=None):

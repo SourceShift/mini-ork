@@ -505,12 +505,10 @@ def _start_run(home: Path, args: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(kickoff_markdown, str) or not kickoff_markdown.strip():
         return {"error": "kickoff_markdown is required"}
 
-    # Project root = the directory that OWNS .mini-ork/. Honor
-    # MINI_ORK_PROJECT_HOME so tests + orchestrators can override without
-    # binding to <home>.parent when the operator pinned a different root
-    # (e.g. a worktree overlay under tests/).
-    project_root_env = os.environ.get("MINI_ORK_PROJECT_HOME")
-    project_root = Path(project_root_env).resolve() if project_root_env else home.parent
+    # Project root = the directory that OWNS .mini-ork/. Not
+    # MINI_ORK_PROJECT_HOME: the launcher sets that to the home itself, so an
+    # in-place run would target <project>/.mini-ork.
+    project_root = home.absolute().parent
     workspace_mode = str(args.get("workspace") or os.environ.get("MO_WORKSPACE_MODE") or "worktree")
     if workspace_mode not in ("worktree", "in-place"):
         return {"error": f"unknown workspace: {workspace_mode!r}"}
