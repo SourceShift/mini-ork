@@ -77,16 +77,51 @@ failure exactly as from the CLI. The conversation continues across prompts.
 
 ### The pickers
 
-The thread header has three pickers, like other Zed agents:
+The thread header has four pickers, like other Zed agents:
 
 | Picker | Values | Default |
 |---|---|---|
 | **Mode** | *Orchestrate* (talk to the orchestrator) or *Direct run* (each prompt is a run kickoff) | `MO_ACP_DEFAULT_MODE`, else Orchestrate |
 | **Model** | the lane the orchestrator runs on: Opus and Sonnet through your Claude subscription, plus every other `claude`-CLI lane in `providers.yaml` (GLM-5.3, MiniMax-M3, deepseek, …) | `MO_ORCHESTRATOR_LANE`, else the `orchestrator` role in `.mini-ork/config/agents.yaml`, else Opus |
 | **Recipe** | every recipe (`code-fix`, `docs`, audits, research, …) — used by Direct run and `/run` | `MO_ACP_RECIPE`, else `code-fix` |
+| **Workspace** | *New worktree per task* or *In place (this checkout)* | `MO_WORKSPACE_MODE`, else a new worktree |
 
 `/run <task>` skips the conversation for one prompt and starts the selected
 recipe directly.
+
+### The thread list shows each task's state
+
+Every thread and run title starts with its state, updated live:
+
+| Mark | Meaning |
+|---|---|
+| ● | working — the title also names the current step |
+| ✋ | needs you — a cost pause, or a finished change waiting for your review |
+| ✓ | done — with the size of the change, e.g. `✓ Fix login redirect +12 −3` |
+| ✗ | failed |
+
+So the thread list in the Agent Panel works as a task board: start several
+threads, and the ✋ ones are the ones waiting for you.
+
+### Every task in its own worktree
+
+With **Workspace** set to *New worktree per task* (the default), each run
+started from a thread works in its own git worktree,
+`.mini-ork/worktrees/<run id>`, on its own branch, `mini-ork/<run id>`. Your
+checkout is never touched, so several tasks can run at once without
+stepping on each other. If `.mini-ork/worktree-setup.sh` exists it runs in
+each new worktree first — the place to copy `.env` or install
+dependencies. A project that is not a git repo runs in place.
+
+When a run finishes with changes, its thread shows **✋ … — ready to
+review +a −r**, the change is already in the thread as diffs, and you
+decide with the buttons under the run: **Merge into `<branch>`**,
+**Discard changes** or **Keep for later**. Merge fast-forwards when it can
+and uses the task's title as the commit message; it refuses, and keeps
+the worktree, when your checkout has uncommitted edits to the same files.
+Any time later: `/workspaces` lists the open ones, `/merge [run]` and
+`/discard [run]` act on one. The orchestrator never merges or discards for
+you.
 
 ### Runs stream into the thread
 
@@ -110,11 +145,65 @@ going — ask the orchestrator to stop one. Stopping a Direct run stops the run.
 - **Live plan.** The run's workflow shows as a checklist above the thread —
   each node pending, in progress, completed. In a thread with several runs it
   follows the latest one.
-- **Slash commands.** Type `/` for `/runs`, `/status`, `/learnings`, `/cost`,
-  `/lanes`, `/stop`, `/kill`, `/resume`, `/recover`, `/certify <bug report>`,
-  `/serve`, `/help` and `/run <task>`. Commands answer in the thread and never
-  start a run (except `/run`); those that act on a run use the thread's latest
-  run unless you name one.
+- **Slash commands.** Type `/` for the list; `/help` prints it. Commands
+  answer in the thread and never start a run (except `/run` and
+  `/automation run`); those that act on a run use the thread's latest run
+  unless you name one.
+
+### Runs at a glance
+
+- **`/runs`** — every run of the project: state, recipe, current step,
+  age, cost and the size of its change. Filter by typing what you want:
+  `/runs needs-you`, `/runs failed recipe:code-fix 50`. The header counts
+  each state.
+- **`/status [run]`** — one run's card: state, steps, cost by stage, the
+  files it changed, the verifier's verdict and what it learned.
+- `/cost`, `/learnings`, `/lanes`, and `/stop`, `/kill`, `/resume`,
+  `/recover`, `/certify <bug report>` for a run.
+
+### Recipes
+
+- **`/recipes [project|engine] [text]`** — every recipe with its source,
+  steps, grade, number of runs, success rate and average cost. Project
+  recipes (`.mini-ork/recipes/`) override engine recipes of the same name.
+- **`/recipe <id>`** — the recipe card: what it does, its steps and flow,
+  what it must produce, its grade and track record, with links to its files.
+- **Create one by asking**: "I want a recipe that audits our SQL
+  migrations", or `/recipe new <what it should do>`. The orchestrator asks a
+  few questions — what a run receives, the steps, the command that proves
+  success, which models — then shows the draft: every file as a diff, plus
+  its grade. You decide with **Create recipe**, **Change something** or
+  **Discard draft**. A created recipe lands in `.mini-ork/recipes/<id>/`,
+  appears in the Recipe picker, and **Test it now** runs it once on its
+  example kickoff.
+- **`/recipe edit <id>`** — changes a recipe the same way. An engine recipe
+  is first copied into the project (**Copy into this project**); the copy
+  overrides the engine's.
+
+### Automations
+
+Recipes that run on a schedule — a nightly dependency check, a weekday
+changelog entry, a weekly dead-code sweep — whether or not Zed is open.
+
+- **Create one by asking**: "run changelog-entry every weekday at 9", or
+  `/automation new <what and when>`. The orchestrator picks the recipe,
+  says the schedule back in words, writes what each run should do, and
+  shows a proposal: the recipe, when, the next three times, the kickoff.
+  **Create automation** saves it; if the scheduler is off you are asked to
+  turn it on.
+- **The scheduler** is one small background job per project that checks
+  every minute — a LaunchAgent on macOS, a crontab line on Linux. It is
+  installed only when you say so (**Turn on the scheduler**, or
+  `/automation scheduler on`) and removed with `/automation scheduler off`.
+  A firing missed while the machine sleeps is skipped, not caught up.
+- **`/automations`** — every automation: when, next run, last run and its
+  state, and whether the scheduler is on. **`/automation <id>`** — its card
+  with recent runs. `/automation run <id>` fires it now; `pause`, `resume`,
+  `delete` do what they say.
+- Each firing is an ordinary run in its own worktree, so it shows up in the
+  thread list and waits for your review like any other task.
+- The same from the terminal: `mini-ork automations list|add|remove|pause|resume|run|tick`
+  and `mini-ork automations scheduler status|install|uninstall`.
 
 ### History
 
@@ -129,9 +218,13 @@ follows it live if it is still going.
 
 `mini-ork mcp-context` gives every MCP-aware agent in the editor (Zed's own
 agent, Claude, Codex, …) read-only tools: `list_runs`, `run_detail`,
-`learnings`, `cost`, `lanes`. The orchestrator runs it with `--control`, which
-adds `list_recipes`, `start_run`, `run_status`, `wait_for_run`, `stop_run` and
-`certify`; the default server stays read-only.
+`learnings`, `cost`, `lanes`, `describe_recipe` and `list_automations`. The
+orchestrator runs it with `--control`, which adds `list_recipes`,
+`start_run`, `workspaces`, `run_status`, `wait_for_run`, `stop_run`,
+`certify`, and the authoring tools `recipe_guide`, `draft_recipe`,
+`get_recipe_spec` and `propose_automation`. Drafts and proposals never take
+effect on their own: you create them with the buttons in the thread. The
+default server stays read-only.
 
 ---
 
@@ -174,6 +267,12 @@ adds `list_recipes`, `start_run`, `run_status`, `wait_for_run`, `stop_run` and
   settings and `CLAUDE.md` apply, your personal `~/.claude` ones (hooks,
   global instructions) do not. Set `MO_ORCHESTRATOR_SETTING_SOURCES` to
   change that (empty = everything, like plain `claude`).
+- **An automation does not fire.** `/automation scheduler` says whether
+  the scheduler is on and when it last ticked; its output goes to
+  `.mini-ork/automations-tick.log`, and each firing is a line in
+  `.mini-ork/automations.log`. The scheduled job keeps the `PATH` of the
+  shell that installed it (launchd and cron start with a bare one); after
+  installing a new CLI, turn the scheduler off and on again.
 - **macOS GUI cannot find `mini-ork`.** The launcher path is always
   absolute in the settings file; if you moved the binary, run
   `mini-ork zed setup` again to rewire.
