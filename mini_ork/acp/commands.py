@@ -182,6 +182,16 @@ COMMANDS: list[AvailableCommand] = [
         "Discard a task workspace (worktree + branch + record).",
         "optional run id",
     ),
+    _cmd(
+        "automations",
+        "Scheduled recipe runs: when, next, last run, scheduler.",
+        None,
+    ),
+    _cmd(
+        "automation",
+        "Automation card, or run|pause|resume|delete <id>, scheduler on|off.",
+        "<id> | run <id> | resume <id> | scheduler on|off",
+    ),
 ]
 
 
@@ -815,6 +825,25 @@ def _format_merge_message(base_branch: str, result: dict[str, Any]) -> str:
     return f"Merged into {base_branch} ({wording} {sha})."
 
 
+def _merge_message(agent: Any, session_id: str, run_id: str) -> str:
+    """The commit message used by ``/merge`` (Zed S6b-1 / S5).
+
+    Reads ``agent._thread_titles[session_id]`` (thread title) and
+    ``agent._run_base_titles[run_id]`` (kickoff-derived title); falls
+    back to ``""`` when both are absent. The agent's
+    ``_handle_review_decision`` builds the same string inline (see
+    ``agent.py:1908-1909``); this helper centralises the logic for
+    :func:`handle_merge` so the agent file stays untouched.
+
+    Both attributes are read via :func:`getattr` with a default of
+    ``{}`` so a partial-mock agent in tests does not blow up.
+    """
+    titles_by_thread = getattr(agent, "_thread_titles", {}) or {}
+    titles_by_run = getattr(agent, "_run_base_titles", {}) or {}
+    base = titles_by_thread.get(session_id) or titles_by_run.get(run_id) or ""
+    return f"{base} (mini-ork {run_id})" if base else f"mini-ork run {run_id}"
+
+
 async def handle_workspaces(agent: Any, session_id: str, arg: str) -> str:
     """``/workspaces`` — table of every open task workspace.
 
@@ -859,7 +888,7 @@ async def handle_merge(agent: Any, session_id: str, arg: str) -> str:
     ws = _workspaces.load(home, run_id)
     if ws is None:
         return f"Run {run_id} has no open workspace."
-    message = f"merge run {run_id}"
+    message = _merge_message(agent, session_id, run_id)
     try:
         result = _workspaces.merge(ws, message=message)
     except Exception as exc:  # noqa: BLE001
@@ -891,6 +920,250 @@ async def handle_discard(agent: Any, session_id: str, arg: str) -> str:
     return f"Discarded {run_id} — its worktree and branch are gone."
 
 
+# ── /automations / /automation … (Zed S6b-1) ─────────────────────────────────
+#
+# ``HANDLERS`` keys must be explicit so the longest-match dispatcher in
+# ``MiniOrkAcpAgent._dispatch_slash`` does not let a bare key shadow a
+# compound one (e.g. ``automation scheduler`` would otherwise eat
+# ``/automation scheduler on`` because ``body.startswith("automation scheduler ")``
+# is true).
+
+
+def _automation_id_from_arg(arg: str) -> str | None:
+    """Extract the first non-flag token from ``arg`` (or ``None`` when empty)."""
+    for tok in arg.strip().split():
+        if not tok.startswith("-"):
+            return tok
+    return None
+
+
+async def handle_automations(agent: Any, session_id: str, arg: str) -> str:
+    """``/automations`` — table of every automation + scheduler footer."""
+    del arg
+    from mini_ork.acp import automation_view as av
+
+    home = agent._home_for(session_id)
+    try:
+        return av.render_automations(home)
+    except Exception as exc:  # noqa: BLE001 — handler must never raise
+        return f"`/automations` failed: {exc}"
+
+
+async def handle_automation(agent: Any, session_id: str, arg: str) -> str:
+    """``/automation <id>`` — card, or empty → table fallback."""
+    from mini_ork.acp import automation_view as av
+    from mini_ork import automations as _auto
+
+    home = agent._home_for(session_id)
+    aid = arg.strip()
+    if not aid:
+        try:
+            return av.render_automations(home)
+        except Exception as exc:  # noqa: BLE001
+            return f"`/automation` failed: {exc}"
+    try:
+        items = _auto.load(home)
+    except Exception as exc:  # noqa: BLE001
+        return f"`/automation` failed: {exc}"
+    if not any(a.get("id") == aid for a in items):
+        return f"No automation {aid}. `/automations` lists them."
+    try:
+        card = av.automation_card(home, aid)
+    except Exception as exc:  # noqa: BLE001
+        return f"`/automation` failed: {exc}"
+    if card is None:
+        return f"No automation {aid}. `/automations` lists them."
+    try:
+        return av.render_automation_card(card)
+    except Exception as exc:  # noqa: BLE001
+        return f"`/automation` failed: {exc}"
+
+
+async def handle_automation_run(agent: Any, session_id: str, arg: str) -> str:
+    """``/automation run <id>`` — fire immediately."""
+    from mini_ork import automations as _auto
+
+    aid = _automation_id_from_arg(arg)
+    if not aid:
+        return "Which automation? `/automations` lists them."
+    home = agent._home_for(session_id)
+    try:
+        # Off the event loop: creating the worktree (and its setup script) can
+        # take minutes, and the agent must keep serving other threads.
+        result = await asyncio.to_thread(_auto.fire, home, aid)
+    except Exception as exc:  # noqa: BLE001
+        return f"Could not start {aid}: {exc}"
+    if not isinstance(result, dict) or not result.get("ok"):
+        err = (result.get("error") if isinstance(result, dict) else None) or "unknown error"
+        return f"Could not start {aid}: {err}"
+    rid = result.get("run_id", "")
+    workspace = result.get("workspace") or "worktree"
+    where = (
+        f"in worktree `mini-ork/{rid}`" if workspace == "worktree" else "in place"
+    )
+    items = []
+    try:
+        items = _auto.load(home)
+    except Exception:  # noqa: BLE001
+        items = []
+    name = next(
+        (a.get("name") for a in items if a.get("id") == aid),
+        aid,
+    )
+    return (
+        f"Started {rid} for {name} — {where}. It is in the thread list; "
+        f"`/status {rid}` shows it."
+    )
+
+
+async def handle_automation_pause(agent: Any, session_id: str, arg: str) -> str:
+    """``/automation pause <id>`` — disable; ``enabled=False`` keeps history."""
+    from mini_ork import automations as _auto
+
+    aid = _automation_id_from_arg(arg)
+    if not aid:
+        return "Which automation? `/automations` lists them."
+    home = agent._home_for(session_id)
+    try:
+        result = _auto.pause(home, aid)
+    except Exception as exc:  # noqa: BLE001
+        return f"`/automation pause` failed: {exc}"
+    if not isinstance(result, dict) or not result.get("ok"):
+        err = (result.get("error") if isinstance(result, dict) else None) or "unknown error"
+        return f"`/automation pause` failed: {err}"
+    items = []
+    try:
+        items = _auto.load(home)
+    except Exception:  # noqa: BLE001
+        items = []
+    name = next(
+        (a.get("name") for a in items if a.get("id") == aid),
+        aid,
+    )
+    return (
+        f"Paused {name} — it will not fire until `/automation resume {aid}`."
+    )
+
+
+async def handle_automation_resume(agent: Any, session_id: str, arg: str) -> str:
+    """``/automation resume <id>`` — re-enable; report the next fire."""
+    from mini_ork import automations as _auto
+
+    aid = _automation_id_from_arg(arg)
+    if not aid:
+        return "Which automation? `/automations` lists them."
+    home = agent._home_for(session_id)
+    try:
+        result = _auto.resume(home, aid)
+    except Exception as exc:  # noqa: BLE001
+        return f"`/automation resume` failed: {exc}"
+    if not isinstance(result, dict) or not result.get("ok"):
+        err = (result.get("error") if isinstance(result, dict) else None) or "unknown error"
+        return f"`/automation resume` failed: {err}"
+    items = []
+    try:
+        items = _auto.load(home)
+    except Exception:  # noqa: BLE001
+        items = []
+    record = next((a for a in items if a.get("id") == aid), None)
+    name = (record or {}).get("name") or aid
+    from mini_ork.acp.automation_view import _format_next_fire
+
+    now = _dt.datetime.now()
+    fires = _auto.next_fires(str((record or {}).get("schedule") or ""), n=1, after=now)
+    when_text = _format_next_fire(fires[0], now) if fires else "never (the schedule has no future time)"
+    return f"Resumed {name} — next run {when_text}."
+
+
+async def handle_automation_delete(agent: Any, session_id: str, arg: str) -> str:
+    """``/automation delete <id>`` — remove; past runs stay in ``/runs``."""
+    from mini_ork import automations as _auto
+
+    aid = _automation_id_from_arg(arg)
+    if not aid:
+        return "Which automation? `/automations` lists them."
+    home = agent._home_for(session_id)
+    try:
+        items = _auto.load(home)
+    except Exception:  # noqa: BLE001
+        items = []
+    name = next(
+        (a.get("name") for a in items if a.get("id") == aid),
+        aid,
+    )
+    try:
+        result = _auto.remove(home, aid)
+    except Exception as exc:  # noqa: BLE001
+        return f"`/automation delete` failed: {exc}"
+    if not isinstance(result, dict) or not result.get("ok"):
+        err = (result.get("error") if isinstance(result, dict) else None) or "unknown error"
+        return f"`/automation delete` failed: {err}"
+    return f"Deleted {name}. Its past runs stay in `/runs`."
+
+
+async def handle_automation_scheduler(agent: Any, session_id: str, arg: str) -> str:
+    """``/automation scheduler`` (bare) — one paragraph of scheduler state."""
+    from mini_ork import automations as _auto
+
+    home = agent._home_for(session_id)
+    try:
+        status = _auto.scheduler_status(home)
+    except Exception as exc:  # noqa: BLE001
+        return f"`/automation scheduler` failed: {exc}"
+    command = status.get("command") or "(unknown)"
+    log_path = status.get("log_path") or "(unknown)"
+    if status.get("installed"):
+        tick = status.get("last_tick")
+        head = f"Scheduler on — last tick {tick}." if tick else "Scheduler on — no tick yet."
+        return (f"{head} Every minute it runs `{command}` (log: `{log_path}`). "
+                "`/automation scheduler off` removes it.")
+    return ("Scheduler off — automations in this project do not fire on their own. "
+            f"`/automation scheduler on` installs a job that runs `{command}` every "
+            f"minute (log: `{log_path}`).")
+
+
+async def handle_automation_scheduler_status(agent: Any, session_id: str, arg: str) -> str:
+    """``/automation scheduler status`` — same shape as bare ``/automation scheduler``."""
+    del arg
+    return await handle_automation_scheduler(agent, session_id, "")
+
+
+async def handle_automation_scheduler_on(agent: Any, session_id: str, arg: str) -> str:
+    """``/automation scheduler on`` — install the LaunchAgent / crontab."""
+    from mini_ork import automations as _auto
+
+    del arg
+    home = agent._home_for(session_id)
+    try:
+        result = _auto.install_scheduler(home)
+    except Exception as exc:  # noqa: BLE001
+        return f"Could not turn the scheduler on: {exc}"
+    if not isinstance(result, dict) or not result.get("ok"):
+        err = (result.get("error") if isinstance(result, dict) else None) or "unknown error"
+        return f"Could not turn the scheduler on: {err}"
+    return (
+        "Scheduler on — automations in this project fire even when Zed is "
+        "closed (a LaunchAgent / crontab line ticks every minute). "
+        "`/automation scheduler off` removes it."
+    )
+
+
+async def handle_automation_scheduler_off(agent: Any, session_id: str, arg: str) -> str:
+    """``/automation scheduler off`` — remove the LaunchAgent / crontab."""
+    from mini_ork import automations as _auto
+
+    del arg
+    home = agent._home_for(session_id)
+    try:
+        result = _auto.uninstall_scheduler(home)
+    except Exception as exc:  # noqa: BLE001
+        return f"Could not turn the scheduler off: {exc}"
+    if not isinstance(result, dict) or not result.get("ok"):
+        err = (result.get("error") if isinstance(result, dict) else None) or "unknown error"
+        return f"Could not turn the scheduler off: {err}"
+    return "Scheduler off."
+
+
 # ── dispatch table ───────────────────────────────────────────────────────────
 # Maps the bare command name to its handler. ``/run`` is intentionally absent:
 # ``MiniOrkAcpAgent`` routes ``/run <task>`` through ``_strip_slash_run``
@@ -916,6 +1189,16 @@ HANDLERS: dict[str, Handler] = {
     "workspaces": handle_workspaces,
     "merge": handle_merge,
     "discard": handle_discard,
+    "automations": handle_automations,
+    "automation": handle_automation,
+    "automation run": handle_automation_run,
+    "automation pause": handle_automation_pause,
+    "automation resume": handle_automation_resume,
+    "automation delete": handle_automation_delete,
+    "automation scheduler": handle_automation_scheduler,
+    "automation scheduler status": handle_automation_scheduler_status,
+    "automation scheduler on": handle_automation_scheduler_on,
+    "automation scheduler off": handle_automation_scheduler_off,
 }
 
 

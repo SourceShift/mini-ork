@@ -154,12 +154,14 @@ def test_tools_list_returns_five_definitions(server_home):
     resp = _call("tools/list")
     names = sorted(t["name"] for t in resp["result"]["tools"])
     assert names == sorted(TOOL_DEFS[i]["name"] for i in range(len(TOOL_DEFS)))
-    # Six read-only tools (added ``describe_recipe`` for the S3a recipe card).
+    # Seven read-only tools (S3a added ``describe_recipe``; S6b-1 added
+    # ``list_automations``).
     assert names == [
         "cost",
         "describe_recipe",
         "lanes",
         "learnings",
+        "list_automations",
         "list_runs",
         "run_detail",
     ]
@@ -419,12 +421,13 @@ def test_subprocess_round_trip(server_home):
     assert len(lines) == 3
     assert lines[0]["result"]["serverInfo"]["name"] == "mini-ork-context"
     names = sorted(t["name"] for t in lines[1]["result"]["tools"])
-    # Six read-only tools (added ``describe_recipe`` for S3a).
+    # Seven read-only tools (S3a: ``describe_recipe``; S6b-1: ``list_automations``).
     assert names == [
         "cost",
         "describe_recipe",
         "lanes",
         "learnings",
+        "list_automations",
         "list_runs",
         "run_detail",
     ]
@@ -464,12 +467,12 @@ def test_subprocess_round_trip_with_control(server_home):
     lines = [json.loads(l) for l in proc.stdout.splitlines() if l.strip()]
     assert len(lines) == 3
     names = sorted(t["name"] for t in lines[1]["result"]["tools"])
-    # Six read-only + ten control = 16 tools (S3a added ``describe_recipe``,
-    # S4 added ``workspaces``).
+    # Seven read-only + eleven control = 18 tools (S3a: ``describe_recipe``;
+    # S4: ``workspaces``; S6b-1: ``list_automations`` + ``propose_automation``).
     expected = [
         "certify", "cost", "describe_recipe", "draft_recipe", "get_recipe_spec",
-        "lanes", "learnings", "list_recipes", "list_runs",
-        "recipe_guide", "run_detail", "run_status", "start_run",
+        "lanes", "learnings", "list_automations", "list_recipes", "list_runs",
+        "propose_automation", "recipe_guide", "run_detail", "run_status", "start_run",
         "stop_run", "wait_for_run", "workspaces",
     ]
     assert names == expected
@@ -532,15 +535,16 @@ def test_default_mode_rejects_control_tools(server_home):
     assert "unknown tool" in body["error"]
 
 
-def test_control_mode_lists_sixteen_tools(server_home):
-    """With control=True, tools/list returns 6 + 10 = 16 names (S4 adds ``workspaces``)."""
+def test_control_mode_lists_eighteen_tools(server_home):
+    """With control=True, tools/list returns 7 + 11 = 18 names (S6b-1 adds
+    ``list_automations`` + ``propose_automation``)."""
     resp = _call_control("tools/list")
     names = sorted(t["name"] for t in resp["result"]["tools"])
-    assert len(names) == 16
+    assert len(names) == 18
     assert names == sorted([
         "certify", "cost", "describe_recipe", "draft_recipe", "get_recipe_spec",
-        "lanes", "learnings", "list_recipes", "list_runs",
-        "recipe_guide", "run_detail", "run_status", "start_run",
+        "lanes", "learnings", "list_automations", "list_recipes", "list_runs",
+        "propose_automation", "recipe_guide", "run_detail", "run_status", "start_run",
         "stop_run", "wait_for_run", "workspaces",
     ])
     # Kickoff is explicit: no commit-shaped tool must be exposed.
@@ -1343,3 +1347,129 @@ def test_recipe_tools_are_rejected_in_default_mode(server_home, monkeypatch, tmp
     body = json.loads(resp["result"]["content"][0]["text"])
     assert resp["result"]["isError"] is True
     assert "unknown tool" in body["error"]
+
+
+# ── list_automations / propose_automation (Zed S6b-1) ──────────────────────
+
+
+def _automation_home(monkeypatch, tmp_path):
+    """A bare ``.mini-ork`` home — enough for the list / propose paths."""
+    h = tmp_path / "home"
+    h.mkdir()
+    monkeypatch.setattr(
+        "mini_ork.mcp_context.server._resolve_home", lambda: h
+    )
+    # Recipe catalog needs at least one stub so ``propose`` validation passes.
+    recipe_dir = h / "recipes" / "code-fix"
+    recipe_dir.mkdir(parents=True, exist_ok=True)
+    (recipe_dir / "workflow.yaml").write_text(
+        "name: code-fix\nnodes: []\n", encoding="utf-8"
+    )
+    (recipe_dir / "task_class.yaml").write_text(
+        "name: code-fix\n", encoding="utf-8"
+    )
+    return h
+
+
+def test_list_automations_returns_automations_block(server_home, monkeypatch, tmp_path):
+    """``list_automations`` returns the per-automation rows + scheduler."""
+    from mini_ork import automations as _auto
+
+    h = _automation_home(monkeypatch, tmp_path)
+    _auto.add(
+        h, id="nightly", name="Nightly",
+        recipe="code-fix", kickoff="# k",
+        schedule="0 3 * * *",
+    )
+    monkeypatch.setattr(
+        "mini_ork.automations.scheduler_status",
+        lambda _h: {"platform": "macos", "installed": False, "command": "x",
+                    "log_path": "/tmp/x.log", "last_tick": None},
+    )
+    resp = _call_args({"name": "list_automations", "arguments": {}})
+    body = json.loads(resp["result"]["content"][0]["text"])
+    assert len(body["automations"]) == 1
+    a = body["automations"][0]
+    assert a["id"] == "nightly"
+    assert a["name"] == "Nightly"
+    assert a["enabled"] is True
+    assert a["schedule"] == "0 3 * * *"
+    assert a["next_fire"] is not None  # cron has a future firing
+    assert "scheduler" in body
+
+
+def test_list_automations_paused_has_null_next_fire(server_home, monkeypatch, tmp_path):
+    """Paused automations carry ``next_fire=None`` (the kickoff spec)."""
+    from mini_ork import automations as _auto
+
+    h = _automation_home(monkeypatch, tmp_path)
+    _auto.add(
+        h, id="daily", name="Daily",
+        recipe="code-fix", kickoff="# k",
+        schedule="0 9 * * *",
+    )
+    _auto.pause(h, "daily")
+    monkeypatch.setattr(
+        "mini_ork.automations.scheduler_status",
+        lambda _h: {"installed": False},
+    )
+    resp = _call_args({"name": "list_automations", "arguments": {}})
+    body = json.loads(resp["result"]["content"][0]["text"])
+    assert body["automations"][0]["enabled"] is False
+    assert body["automations"][0]["next_fire"] is None
+
+
+def test_propose_automation_writes_only_to_drafts(
+    server_home, monkeypatch, tmp_path
+):
+    """``propose_automation`` writes the draft and never touches the store."""
+    h = _automation_home(monkeypatch, tmp_path)
+    resp = _call_args_control({
+        "name": "propose_automation",
+        "arguments": {
+            "id": "weekly",
+            "name": "Weekly",
+            "recipe": "code-fix",
+            "schedule": "0 9 * * 1",
+            "kickoff_markdown": "# k",
+        },
+    })
+    body = json.loads(resp["result"]["content"][0]["text"])
+    assert body["ok"] is True
+    assert body["exists"] is False
+    assert (h / "automation-drafts" / "weekly.json").is_file()
+    # The store file does NOT exist yet (no add happened).
+    assert not (h / "automations.json").exists()
+
+
+def test_propose_automation_only_in_control_mode(
+    server_home, monkeypatch, tmp_path
+):
+    """``propose_automation`` is rejected in default mode (kickoff §MCP)."""
+    _automation_home(monkeypatch, tmp_path)
+    resp = _call_args({
+        "name": "propose_automation",
+        "arguments": {
+            "id": "weekly", "name": "Weekly",
+            "recipe": "code-fix", "schedule": "0 9 * * 1",
+            "kickoff_markdown": "# k",
+        },
+    })
+    body = json.loads(resp["result"]["content"][0]["text"])
+    assert resp["result"]["isError"] is True
+    assert "unknown tool" in body["error"]
+
+
+def test_propose_automation_missing_required_returns_error(
+    server_home, monkeypatch, tmp_path
+):
+    """Empty required args → ``error`` listing the missing fields."""
+    _automation_home(monkeypatch, tmp_path)
+    resp = _call_args_control({
+        "name": "propose_automation",
+        "arguments": {"id": "weekly"},  # missing name/recipe/schedule/kickoff
+    })
+    body = json.loads(resp["result"]["content"][0]["text"])
+    assert "error" in body
+    for field in ("name", "recipe", "schedule", "kickoff_markdown"):
+        assert field in body["error"]

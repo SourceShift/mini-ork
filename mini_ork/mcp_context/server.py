@@ -911,6 +911,16 @@ TOOL_DEFS: list[dict[str, Any]] = [
             "required": ["id"],
         },
     },
+    {
+        "name": "list_automations",
+        "description": (
+            "List every automation in the project: id, name, recipe, "
+            "schedule, when (human description), enabled, workspace, "
+            "next_fire (ISO, null when paused), last_run, runs (audit). "
+            "Plus the OS scheduler status. Read-only."
+        ),
+        "inputSchema": {"type": "object", "properties": {}},
+    },
 ]
 
 
@@ -1074,6 +1084,34 @@ _CONTROL_TOOL_DEFS: list[dict[str, Any]] = [
             "required": ["id"],
         },
     },
+    {
+        "name": "propose_automation",
+        "description": (
+            "Propose a scheduled run of a recipe. This does NOT schedule "
+            "anything: the user sees the proposal and creates it with a "
+            "button. Schedule is a 5-field cron string in local time "
+            "(minute hour day-of-month month day-of-week; 0 = Sunday), e.g. "
+            "`0 9 * * 1-5` = every weekday at 09:00. Calling it again with "
+            "the same id replaces the proposal."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "id": {"type": "string"},
+                "name": {"type": "string"},
+                "recipe": {"type": "string"},
+                "schedule": {"type": "string"},
+                "kickoff_markdown": {"type": "string"},
+                "workspace": {
+                    "type": "string",
+                    "enum": ["worktree", "in-place"],
+                },
+            },
+            "required": [
+                "id", "name", "recipe", "schedule", "kickoff_markdown",
+            ],
+        },
+    },
 ]
 
 
@@ -1134,6 +1172,101 @@ def _get_recipe_spec(home: Path, args: dict[str, Any]) -> dict[str, Any]:
     return spec
 
 
+# ── tool: list_automations / propose_automation (Zed S6b-1) ──────────────────
+
+
+def _list_automations(home: Path, args: dict[str, Any]) -> dict[str, Any]:
+    """Read-only view of every automation + scheduler status."""
+    del args
+    from mini_ork import automations as _auto
+
+    items: list[dict[str, Any]] = []
+    try:
+        automations = _auto.load(home)
+    except Exception as exc:  # noqa: BLE001
+        return {"error": f"list_automations: {exc}"}
+    statuses = _auto.run_statuses(home) if automations else {}
+    for a in automations:
+        aid = a.get("id")
+        if not isinstance(aid, str):
+            continue
+        schedule = str(a.get("schedule") or "")
+        next_fire: str | None
+        if not a.get("enabled", True):
+            next_fire = None
+        else:
+            try:
+                fires = _auto.next_fires(schedule, n=1)
+            except Exception:  # noqa: BLE001
+                fires = []
+            next_fire = fires[0].isoformat() if fires else None
+        runs = list(a.get("runs") or [])
+        last_run: str
+        last_run = _auto.last_run_status(home, a, statuses=statuses)
+        items.append({
+            "id": aid,
+            "name": a.get("name") or aid,
+            "recipe": a.get("recipe") or "",
+            "schedule": schedule,
+            "when": _auto.describe(schedule),
+            "enabled": bool(a.get("enabled", True)),
+            "workspace": a.get("workspace") or "worktree",
+            "next_fire": next_fire,
+            "last_run": last_run,
+            "runs": runs,
+        })
+    scheduler: dict[str, Any]
+    try:
+        scheduler = _auto.scheduler_status(home)
+    except Exception as exc:  # noqa: BLE001
+        scheduler = {"error": str(exc)}
+    return {"automations": items, "scheduler": scheduler}
+
+
+def _propose_automation(home: Path, args: dict[str, Any]) -> dict[str, Any]:
+    """Validate + write a draft automation; never touches the store."""
+    from mini_ork import automations as _auto
+
+    if not isinstance(args, dict):
+        return {"error": "propose_automation: arguments must be an object"}
+
+    def _str(key: str) -> str | None:
+        v = args.get(key)
+        if isinstance(v, str):
+            return v
+        return None
+
+    aid = _str("id")
+    name = _str("name")
+    recipe = _str("recipe")
+    schedule = _str("schedule")
+    kickoff = _str("kickoff_markdown")
+    workspace = _str("workspace") or "worktree"
+    missing = [
+        k for k, v in (
+            ("id", aid), ("name", name), ("recipe", recipe),
+            ("schedule", schedule), ("kickoff_markdown", kickoff),
+        ) if not v
+    ]
+    if missing:
+        return {"error": f"propose_automation: required: {', '.join(missing)}"}
+
+    try:
+        result = _auto.propose(
+            home,
+            id=aid,  # type: ignore[arg-type]
+            name=name,  # type: ignore[arg-type]
+            recipe=recipe,  # type: ignore[arg-type]
+            kickoff=kickoff,  # type: ignore[arg-type]
+            schedule=schedule,  # type: ignore[arg-type]
+            workspace=workspace,
+        )
+    except Exception as exc:  # noqa: BLE001
+        _log(f"propose_automation raised: {exc}")
+        return {"error": f"propose_automation: {exc}"}
+    return result
+
+
 # ── tool: dispatch ───────────────────────────────────────────────────────────
 
 
@@ -1173,6 +1306,8 @@ def _call_tool(
             return _lanes(home, args)
         if name == "describe_recipe":
             return _describe_recipe(home, args)
+        if name == "list_automations":
+            return _list_automations(home, args)
         if control:
             if name == "list_recipes":
                 return _list_recipes(home, args)
@@ -1194,6 +1329,8 @@ def _call_tool(
                 return _draft_recipe(home, args)
             if name == "get_recipe_spec":
                 return _get_recipe_spec(home, args)
+            if name == "propose_automation":
+                return _propose_automation(home, args)
     except Exception as exc:  # defensive — kickoff says no exception ever
         _log(f"tool {name} raised: {exc}")
         return {"error": f"{name}: {exc}"}

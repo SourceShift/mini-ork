@@ -469,6 +469,17 @@ class TestStore:
         assert auto.load(home) == []  # reads stay forgiving
 
 
+def test_proposal_ids_cannot_escape_the_drafts_dir(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    auto.add(home, id="keep", name="k", recipe="code-fix", kickoff="# k", schedule="0 3 * * *")
+    before = (home / "automations.json").read_text()
+    assert auto.discard_proposal(home, "../automations")["ok"] is False
+    assert auto.get_proposal(home, "../automations") is None
+    assert auto.commit_proposal(home, "../automations")["ok"] is False
+    assert (home / "automations.json").read_text() == before
+
+
 # ── fire / tick ──────────────────────────────────────────────────────────────
 
 
@@ -1085,3 +1096,226 @@ def test_automations_in_exact_set_guard():
     from mini_ork.cli.main import _NATIVE_MODULE_SUBS
     assert "automations" in _NATIVE_MODULE_SUBS
     assert _NATIVE_MODULE_SUBS["automations"] == "mini_ork.cli.automations_cmd"
+
+
+# ── next_fires (Zed S6b-1) ────────────────────────────────────────────────────
+
+
+class TestNextFires:
+    """``next_fires`` returns the next ``n`` firing times after ``after``."""
+
+    def test_returns_three_times_after_now(self) -> None:
+        base = _dt.datetime(2026, 1, 1, 9, 0, 0)
+        out = auto.next_fires("0 9 * * *", n=3, after=base)
+        assert len(out) == 3
+        assert [t.hour for t in out] == [9, 9, 9]
+        # Day deltas: 1, 2, 3.
+        assert (out[0].date() - base.date()).days == 1
+        assert (out[2].date() - base.date()).days == 3
+
+    def test_bad_expression_returns_empty_list(self) -> None:
+        # Unparseable cron → [] (NOT a raise).
+        assert auto.next_fires("not a cron", n=3) == []
+        # 6 fields instead of 5 → ValueError from parse_cron → [].
+        assert auto.next_fires("0 0 * * * 0", n=3) == []
+
+    def test_zero_n_returns_empty(self) -> None:
+        # Defensive: n<=0 is a no-op.
+        assert auto.next_fires("0 9 * * *", n=0) == []
+        assert auto.next_fires("0 9 * * *", n=-1) == []
+
+    def test_every_minute_returns_increasing_seconds(self) -> None:
+        base = _dt.datetime(2026, 1, 1, 9, 0, 30)
+        out = auto.next_fires("* * * * *", n=3, after=base)
+        # Each next_fire is strictly after the previous.
+        for a, b in zip(out, out[1:]):
+            assert a < b
+        # Seconds reset to 0 (cron fires on the minute).
+        for t in out:
+            assert t.second == 0
+            assert t.microsecond == 0
+
+
+# ── Proposals (Zed S6b-1) ─────────────────────────────────────────────────────
+
+
+class TestProposals:
+    """``propose`` / ``get_proposal`` / ``commit_proposal`` / ``discard_proposal``."""
+
+    def test_propose_writes_a_draft(self, tmp_path: Path) -> None:
+        home = tmp_path / "home"
+        home.mkdir()
+        # Make sure ``_validate_recipe_exists`` does not require a real recipe
+        # catalog: add() of any name works because parse_cron + name checks
+        # happen in the order captured by ``add``. We seed a recipe first
+        # via the same path the CLI uses.
+        _seed_recipe_catalog(home)
+        result = auto.propose(
+            home, id="nightly", name="Nightly build",
+            recipe="code-fix", kickoff="# nightly",
+            schedule="0 3 * * *", workspace="worktree",
+        )
+        assert result["ok"] is True
+        assert result["exists"] is False
+        assert "next_fires" in result and len(result["next_fires"]) == 3
+        # File exists on disk.
+        assert (home / "automation-drafts" / "nightly.json").is_file()
+
+    def test_propose_validates_like_add(self, tmp_path: Path) -> None:
+        home = tmp_path / "home"
+        home.mkdir()
+        # Empty kickoff → ok=False, nothing written.
+        result = auto.propose(
+            home, id="bad", name="bad", recipe="x",
+            kickoff="", schedule="0 9 * * *",
+        )
+        assert result["ok"] is False
+        assert "kickoff" in result["error"].lower()
+        assert not (home / "automation-drafts").exists()
+
+        # Bad cron.
+        result = auto.propose(
+            home, id="bad", name="bad", recipe="x",
+            kickoff="# k", schedule="not a cron",
+        )
+        assert result["ok"] is False
+        assert "cron" in result["error"].lower()
+
+    def test_propose_on_existing_id_sets_exists_true(self, tmp_path: Path) -> None:
+        home = tmp_path / "home"
+        home.mkdir()
+        _seed_recipe_catalog(home)
+        auto.add(
+            home, id="daily", name="Daily", recipe="code-fix",
+            kickoff="# k", schedule="0 9 * * *",
+        )
+        result = auto.propose(
+            home, id="daily", name="Daily v2",
+            recipe="code-fix", kickoff="# k v2",
+            schedule="0 10 * * *",
+        )
+        assert result["ok"] is True
+        assert result["exists"] is True
+        # The original automation is unchanged.
+        items = auto.load(home)
+        assert items[0]["name"] == "Daily"
+        assert items[0]["schedule"] == "0 9 * * *"
+
+    def test_get_proposal_returns_parsed_dict(self, tmp_path: Path) -> None:
+        home = tmp_path / "home"
+        home.mkdir()
+        _seed_recipe_catalog(home)
+        auto.propose(
+            home, id="xx", name="XX", recipe="code-fix",
+            kickoff="# k", schedule="0 9 * * *",
+        )
+        out = auto.get_proposal(home, "xx")
+        assert isinstance(out, dict)
+        assert out["id"] == "xx"
+        assert out["schedule"] == "0 9 * * *"
+
+    def test_get_proposal_missing_returns_none(self, tmp_path: Path) -> None:
+        home = tmp_path / "home"
+        home.mkdir()
+        assert auto.get_proposal(home, "absent") is None
+
+    def test_commit_proposal_adds_when_new(self, tmp_path: Path) -> None:
+        home = tmp_path / "home"
+        home.mkdir()
+        _seed_recipe_catalog(home)
+        auto.propose(
+            home, id="weekly", name="Weekly",
+            recipe="code-fix", kickoff="# k",
+            schedule="0 9 * * 1", workspace="worktree",
+        )
+        result = auto.commit_proposal(home, "weekly")
+        assert result["ok"] is True
+        assert result["created"] is True
+        # Proposal file gone.
+        assert auto.get_proposal(home, "weekly") is None
+        # Store has it.
+        items = auto.load(home)
+        assert any(a.get("id") == "weekly" for a in items)
+
+    def test_commit_proposal_updates_when_existing(self, tmp_path: Path) -> None:
+        home = tmp_path / "home"
+        home.mkdir()
+        _seed_recipe_catalog(home)
+        auto.add(
+            home, id="daily", name="Daily",
+            recipe="code-fix", kickoff="# k",
+            schedule="0 9 * * *", workspace="worktree",
+        )
+        # Disable + record history so we can verify it survives.
+        auto.pause(home, "daily")
+        # Set last_run_id manually (no fire — that needs git).
+        def mutate(items):
+            for a in items:
+                if a.get("id") == "daily":
+                    a["last_run_id"] = "run-old-001"
+                    a["last_fired_at"] = "2026-01-01T09:00:00"
+                    a["runs"] = ["run-old-001"]
+            return {"ok": True}
+        from mini_ork.automations import _write_locked  # noqa: PLC0415
+        _write_locked(home, mutate)
+
+        auto.propose(
+            home, id="daily", name="Daily v2",
+            recipe="code-fix", kickoff="# k v2",
+            schedule="0 10 * * *", workspace="worktree",
+        )
+        result = auto.commit_proposal(home, "daily")
+        assert result["ok"] is True
+        assert result["created"] is False
+        # ``enabled``, ``last_run_id``, ``runs`` are preserved.
+        items = auto.load(home)
+        rec = next(a for a in items if a.get("id") == "daily")
+        assert rec["enabled"] is False
+        assert rec["last_run_id"] == "run-old-001"
+        assert rec["runs"] == ["run-old-001"]
+        # Name + schedule updated.
+        assert rec["name"] == "Daily v2"
+        assert rec["schedule"] == "0 10 * * *"
+
+    def test_commit_proposal_no_proposal_returns_error(self, tmp_path: Path) -> None:
+        home = tmp_path / "home"
+        home.mkdir()
+        result = auto.commit_proposal(home, "ghost")
+        assert result["ok"] is False
+        assert "no proposal" in result["error"]
+
+    def test_discard_proposal_removes_file(self, tmp_path: Path) -> None:
+        home = tmp_path / "home"
+        home.mkdir()
+        _seed_recipe_catalog(home)
+        auto.propose(
+            home, id="tmp", name="Tmp", recipe="code-fix",
+            kickoff="# k", schedule="0 9 * * *",
+        )
+        result = auto.discard_proposal(home, "tmp")
+        assert result["ok"] is True
+        assert auto.get_proposal(home, "tmp") is None
+
+    def test_discard_proposal_missing_is_ok(self, tmp_path: Path) -> None:
+        home = tmp_path / "home"
+        home.mkdir()
+        result = auto.discard_proposal(home, "never-existed")
+        assert result["ok"] is True
+
+
+def _seed_recipe_catalog(home: Path) -> None:
+    """Write a minimal ``<home>/recipes/code-fix/`` so the proposal
+    validator's ``_validate_recipe_exists`` returns True.
+
+    The validator only checks ``find_recipe`` (which scans a recipes dir);
+    the workflow.yaml body is irrelevant to ``propose``.
+    """
+    recipe_dir = home / "recipes" / "code-fix"
+    recipe_dir.mkdir(parents=True, exist_ok=True)
+    (recipe_dir / "workflow.yaml").write_text(
+        "name: code-fix\nnodes:\n  - id: n1\n    type: verifier\n",
+        encoding="utf-8",
+    )
+    (recipe_dir / "task_class.yaml").write_text(
+        "name: code-fix\n", encoding="utf-8",
+    )

@@ -202,6 +202,37 @@ def next_fire(spec: CronSpec, after: _dt.datetime) -> _dt.datetime:
     raise ValueError(f"no fire time within 5 years for {spec.original!r}")
 
 
+def next_fires(
+    expr: str, n: int = 3, after: _dt.datetime | None = None
+) -> list[_dt.datetime]:
+    """The next ``n`` firing times after ``after`` (default = now).
+
+    Thin loop over :func:`next_fire`. ``expr`` is a raw 5-field cron string,
+    not a :class:`CronSpec` — the S6b-1 MCP ``propose_automation`` tool and
+    the ``/automation <id>`` card both work in cron-string space (matches
+    the kickoff copy). Returns ``[]`` when ``expr`` does not parse or never
+    fires within the ~5-year horizon of :func:`next_fire`. Each entry is a
+    naive local-time ``datetime`` with second=0, microsecond=0.
+    """
+    try:
+        spec = parse_cron(expr)
+    except ValueError:
+        return []
+    if n <= 0:
+        return []
+    start = after or _dt.datetime.now()
+    out: list[_dt.datetime] = []
+    cursor = start
+    for _ in range(n):
+        try:
+            fired = next_fire(spec, cursor)
+        except ValueError:
+            break
+        out.append(fired)
+        cursor = fired
+    return out
+
+
 def describe(expr: str) -> str:
     """Human-friendly description: ``every 15 minutes``, ``every weekday at
     09:00``, ``every day at HH:MM``, else the raw expression.
@@ -418,6 +449,26 @@ def _validate_recipe_exists(recipe: str, home: Path) -> None:
         raise ValueError(f"recipe not found: {recipe!r}")
 
 
+def _validate_fields(home: Path, *, id: Any, name: Any, recipe: Any, kickoff: Any,
+                     schedule: Any, workspace: Any) -> str | None:
+    """The error message for the first invalid field, or None (``add`` and ``propose``)."""
+    try:
+        if not isinstance(id, str) or not _ID_RE.match(id):
+            raise ValueError(f"id must match {_ID_RE.pattern!r}, got {id!r}")
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("name is required")
+        if not isinstance(kickoff, str) or not kickoff.strip():
+            raise ValueError("kickoff is required")
+        if not isinstance(recipe, str) or not recipe.strip():
+            raise ValueError("recipe is required")
+        _validate_workspace(workspace)
+        parse_cron(schedule)  # raises ValueError with the parse message
+        _validate_recipe_exists(recipe, home)
+    except ValueError as exc:
+        return str(exc)
+    return None
+
+
 def add(
     home: Path | str,
     *,
@@ -432,22 +483,10 @@ def add(
     ``{"ok": False, "error": "..."}`` (kickoff §add).
     """
     home = Path(home)
-    try:
-        if not isinstance(id, str) or not _ID_RE.match(id):
-            raise ValueError(
-                f"id must match {_ID_RE.pattern!r}, got {id!r}"
-            )
-        if not isinstance(name, str) or not name.strip():
-            raise ValueError("name is required")
-        if not isinstance(kickoff, str) or not kickoff.strip():
-            raise ValueError("kickoff is required")
-        if not isinstance(recipe, str) or not recipe.strip():
-            raise ValueError("recipe is required")
-        _validate_workspace(workspace)
-        parse_cron(schedule)  # raises ValueError with the parse message
-        _validate_recipe_exists(recipe, home)
-    except ValueError as exc:
-        return {"ok": False, "error": str(exc)}
+    error = _validate_fields(home, id=id, name=name, recipe=recipe, kickoff=kickoff,
+                             schedule=schedule, workspace=workspace)
+    if error:
+        return {"ok": False, "error": error}
 
     def mutate(items: list[dict[str, Any]]) -> dict[str, Any]:
         if any(a.get("id") == id for a in items):
@@ -547,6 +586,185 @@ def pause(home: Path | str, automation_id: str) -> dict[str, Any]:
 def resume(home: Path | str, automation_id: str) -> dict[str, Any]:
     """Convenience wrapper over :func:`update` with ``enabled=True``."""
     return update(home, automation_id, enabled=True)
+
+
+# ── Proposals ────────────────────────────────────────────────────────────────
+#
+# A proposal is an automation the user has not approved yet:
+# ``<home>/automation-drafts/<id>.json``. Only ``commit_proposal`` (the user's
+# button) turns it into an entry of ``automations.json``; the tick never reads
+# proposals.
+
+
+_PROPOSALS_DIRNAME = "automation-drafts"
+
+
+def _drafts_dir(home: Path) -> Path:
+    return Path(home) / _PROPOSALS_DIRNAME
+
+
+def _proposal_path(home: Path, automation_id: str) -> Path:
+    # The id becomes a file name: never let one step outside the drafts dir.
+    if not isinstance(automation_id, str) or not _ID_RE.match(automation_id):
+        raise ValueError(f"invalid automation id: {automation_id!r}")
+    return _drafts_dir(home) / f"{automation_id}.json"
+
+
+def _write_proposal_atomic(
+    home: Path, automation_id: str, payload: dict[str, Any]
+) -> Path:
+    """Write a proposal file atomically (temp + rename in the drafts dir)."""
+    target = _proposal_path(home, automation_id)
+    drafts = _drafts_dir(home)
+    drafts.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=".automation-draft.", suffix=".json.tmp", dir=str(drafts)
+    )
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(payload, f, indent=2, sort_keys=True)
+            f.write("\n")
+        os.replace(tmp_name, target)
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+    return target
+
+
+def get_proposal(home: Path | str, automation_id: str) -> dict[str, Any] | None:
+    """Return the parsed proposal payload, or ``None`` when absent.
+
+    A proposal is just a JSON file under ``automation-drafts/``; the
+    fields are whatever :func:`propose` wrote (id, name, recipe,
+    kickoff, schedule, workspace, created_at). A malformed file is
+    treated as absent — the caller renders an empty state instead of
+    crashing the ``/automation <id>`` card.
+    """
+    try:
+        path = _proposal_path(Path(home), automation_id)
+    except ValueError:
+        return None
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def propose(
+    home: Path | str,
+    *,
+    id: str,
+    name: str,
+    recipe: str,
+    kickoff: str,
+    schedule: str,
+    workspace: str = "worktree",
+) -> dict[str, Any]:
+    """Validate + write a draft automation.
+
+    Mirrors :func:`add`'s validation block verbatim — same id regex,
+    same non-empty checks, same cron parse, same recipe-existence
+    check, same workspace enum. Two relaxations: (1) ``id`` may
+    already exist (the proposal edits it instead of rejecting); (2)
+    failures do NOT raise — they return ``{"ok": False, "error"}`` and
+    write nothing. Returns ``{"ok": True, "proposal", "exists",
+    "when", "next_fires"}`` on success.
+    """
+    home = Path(home)
+    error = _validate_fields(home, id=id, name=name, recipe=recipe, kickoff=kickoff,
+                             schedule=schedule, workspace=workspace)
+    if error:
+        return {"ok": False, "error": error}
+
+    payload = {
+        "id": id,
+        "name": name.strip(),
+        "recipe": recipe.strip(),
+        "kickoff": kickoff,
+        "schedule": schedule.strip(),
+        "workspace": workspace,
+        "created_at": _now_iso(),
+    }
+    try:
+        _write_proposal_atomic(home, id, payload)
+    except OSError as exc:
+        return {"ok": False, "error": f"could not save the proposal: {exc}"}
+    exists = any(a.get("id") == id for a in load(home))
+    nexts = next_fires(schedule, n=3)
+    return {
+        "ok": True,
+        "proposal": payload,
+        "exists": exists,
+        "when": describe(schedule),
+        "next_fires": [t.isoformat() for t in nexts],
+    }
+
+
+def commit_proposal(home: Path | str, automation_id: str) -> dict[str, Any]:
+    """Apply a draft to the live ``automations.json`` store.
+
+    No proposal → ``{"ok": False, "error": "no proposal <id>"}``.
+    Existing automation → :func:`update` (keeps ``enabled``, history);
+    otherwise → :func:`add`. On success the proposal file is deleted;
+    a leftover file (commit succeeded but unlink failed) is
+    idempotent: the next :func:`commit_proposal` simply rewrites the
+    same automation. Returns ``{"ok", "created", "automation"}`` (the
+    ``add`` / ``update`` payload plus ``created``).
+    """
+    home = Path(home)
+    proposal = get_proposal(home, automation_id)
+    if proposal is None:
+        return {"ok": False, "error": f"no proposal {automation_id}"}
+
+    existing = any(a.get("id") == automation_id for a in load(home))
+    if existing:
+        result = update(
+            home,
+            automation_id,
+            name=str(proposal.get("name", "")),
+            recipe=str(proposal.get("recipe", "")),
+            kickoff=str(proposal.get("kickoff", "")),
+            schedule=str(proposal.get("schedule", "")),
+            workspace=str(proposal.get("workspace", "worktree")),
+        )
+    else:
+        result = add(
+            home,
+            id=automation_id,
+            name=str(proposal.get("name", "")),
+            recipe=str(proposal.get("recipe", "")),
+            kickoff=str(proposal.get("kickoff", "")),
+            schedule=str(proposal.get("schedule", "")),
+            workspace=str(proposal.get("workspace", "worktree")),
+        )
+
+    if not isinstance(result, dict) or not result.get("ok"):
+        return result
+    try:
+        _proposal_path(home, automation_id).unlink()
+    except OSError:
+        pass  # a leftover proposal only re-applies the same automation
+    out = dict(result)
+    out["created"] = not existing
+    return out
+
+
+def discard_proposal(home: Path | str, automation_id: str) -> dict[str, Any]:
+    """Delete a proposal file; ``{"ok": True}`` even when absent."""
+    home = Path(home)
+    try:
+        _proposal_path(home, automation_id).unlink()
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError) as exc:
+        return {"ok": False, "error": str(exc)}
+    return {"ok": True}
 
 
 # ── Firing ───────────────────────────────────────────────────────────────────
@@ -677,7 +895,20 @@ def fire(
             "branch": ws.branch if ws is not None else None}
 
 
-def last_run_status(home: Path | str, automation: dict[str, Any]) -> str:
+def run_statuses(home: Path | str) -> dict[str, str]:
+    """``{run id: status}`` for the project's recent runs — one history read,
+    shared by every row of a list."""
+    from mini_ork.acp.history import list_runs
+
+    try:
+        rows, _ = list_runs(Path(home), limit=200)
+    except Exception:  # noqa: BLE001 — a status column must not break `list`
+        return {}
+    return {str(r["run_id"]): str(r.get("status") or "") for r in rows if r.get("run_id")}
+
+
+def last_run_status(home: Path | str, automation: dict[str, Any], *,
+                    statuses: dict[str, str] | None = None) -> str:
     """``"<run id> <status>"`` for the latest firing, ``"not started: <why>"``
     when the latest firing failed to launch, ``"never"`` before the first."""
     rid = automation.get("last_run_id")
@@ -685,14 +916,9 @@ def last_run_status(home: Path | str, automation: dict[str, Any]) -> str:
         return f"not started: {automation['last_error']}"
     if not rid:
         return "never"
-    from mini_ork.acp.history import list_runs
-
-    try:
-        rows, _ = list_runs(Path(home), limit=200)
-    except Exception:  # noqa: BLE001 — a status column must not break `list`
-        rows = []
-    status = next((r.get("status") for r in rows if r.get("run_id") == rid), None)
-    return f"{rid} {status or 'starting'}"
+    if statuses is None:
+        statuses = run_statuses(home)
+    return f"{rid} {statuses.get(rid) or 'starting'}"
 
 
 def tick(

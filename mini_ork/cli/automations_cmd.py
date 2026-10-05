@@ -83,6 +83,7 @@ def _format_next_fire(schedule: str) -> str:
 def _cmd_list(args: argparse.Namespace) -> int:
     home = Path(args.home)
     items = _auto.load(home)
+    statuses = _auto.run_statuses(home) if items else {}
     if args.json:
         sys.stdout.write(json.dumps({"automations": items}, indent=2) + "\n")
         return 0
@@ -94,7 +95,7 @@ def _cmd_list(args: argparse.Namespace) -> int:
             "recipe": a.get("recipe", ""),
             "schedule": _auto.describe(str(a.get("schedule", ""))),
             "enabled": "yes" if a.get("enabled", True) else "no",
-            "last_run": _auto.last_run_status(home, a),
+            "last_run": _auto.last_run_status(home, a, statuses=statuses),
             "next_fire": (_format_next_fire(str(a.get("schedule", "")))
                           if a.get("enabled", True) else "paused"),
         })
