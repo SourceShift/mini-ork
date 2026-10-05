@@ -40,6 +40,7 @@ import subprocess
 from collections.abc import Callable
 from pathlib import Path
 
+from mini_ork.certify import differential
 from mini_ork.certify import invariants as mr
 from mini_ork.certify import probe as poc_plus
 from mini_ork.certify import relations
@@ -425,6 +426,7 @@ def judge(
     # never runs on a would-be REFUTED/UNVERIFIED). Knobs off => no dispatch, no key.
     detail = {"invariants": kept, "dropped": dropped,
               "n_effective": n_eff, "inconclusive": inconclusive}
+    proven_before_vetoes = verdict == PROVEN
     if verdict == PROVEN and relations.enabled():
         rec = relations.check(poc_src, issue, patch, runner=runner,
                               dispatch=d_fn, context=context,
@@ -433,6 +435,14 @@ def judge(
         if rec["verdict"] == REFUTED:
             verdict = REFUTED
             reason = rec["reason"]
+    if proven_before_vetoes and differential.enabled():
+        drec = differential.check(poc_src, issue, patch, runner=runner,
+                                  dispatch=d_fn, context=context,
+                                  n=differential.n_from_env())
+        detail["differential"] = drec
+        if drec["verdict"] == REFUTED and verdict == PROVEN:
+            verdict = REFUTED
+            reason = drec["reason"]
 
     return Verdict(verdict, reason, poc_plus=poc_src,
                    mr_pass_rate=(rate if n else None), mr_n=n,
