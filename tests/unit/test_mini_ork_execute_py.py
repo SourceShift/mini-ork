@@ -706,6 +706,34 @@ def test_live_reviewer_verdict_gate(tmp_path):
     assert rc_synth == 0
 
 
+def test_plain_reviewer_prompt_names_its_review_file(tmp_path):
+    # Consumer RSI campaign (2026-10-06). The panel/synth branches name a file
+    # (`Write strict JSON to: {review_file}`); the plain-reviewer branch asked
+    # only for an inline answer. The capture (`claude_result_text`) keeps the
+    # lane's FINAL assistant message, and a nested claude CLI appends its own
+    # `<z-insight>` block plus a closing line — so a judge that emitted the
+    # verdict object mid-conversation and then a sign-off was captured with no
+    # brace in the file at all, and the RSI runner reported
+    # `failed:judge_evidence_missing` on a judge that had run correctly (the
+    # 3.2 kB object was assistant message #12; the 271 B sign-off was #13).
+    # Naming the file restores the plain branch to the panel/synth contract.
+    db = _seed_db(tmp_path, "revp"); _seed_task_run(db)
+    rd = tmp_path / "run"; rd.mkdir()
+    seen: dict[str, str] = {}
+
+    def capture(_task_class, _node_type, prompt):
+        seen["prompt"] = prompt
+        return 0, '{"verdict": "pass"}'
+
+    ex.dispatch_node(_fields("revp", "reviewer", "opus"), root=str(REPO),
+                     run_dir=str(rd), plan_path=_plan(tmp_path, outputs=()),
+                     task_class="code_fix", db=db, run_id="r1", dispatch_fn=capture)
+    p = seen["prompt"]
+    assert "Respond with JSON:" in p                        # inline answer kept
+    assert "write that exact JSON object to" in p           # AND the named file
+    assert os.path.join(str(rd), "review-revp.json") in p   # the resolved path
+
+
 def test_live_verifier_hollow_artifact_fails(tmp_path):
     # Hollow-run guard: a plan that requires a concrete absolute run-local artifact
     # which is missing → the verifier node fails before any verifier runs. A real,

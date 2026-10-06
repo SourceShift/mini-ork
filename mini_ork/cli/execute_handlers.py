@@ -1039,9 +1039,24 @@ def _handle_reviewer(ctx: NodeDispatch):
                   "(review-diff-noop.json)", file=sys.stderr)
             ctx.trace(ctx.node_id, "failure", "reviewer", "", "no_op", "no_op")
             return 1, "no_op"
+        # The panel/synth branches above hand the reviewer a FILE to write
+        # (`Write strict JSON to: {review_file}`); this branch asked only for an
+        # inline answer, and that is the branch that loses verdicts. The capture
+        # (`claude_result_text`) keeps the lane's FINAL assistant message, and a
+        # nested claude CLI appends its own `<z-insight>` block + closing prose —
+        # so a judge that emitted the JSON object mid-conversation and then a
+        # sign-off is captured with no brace in it at all. Measured 2026-10-06 on a
+        # consumer RSI campaign: the 3.2 kB verdict object was assistant message #12, the
+        # 271 B prose sign-off was #13, `review-opus_judge.json` held #13, and the
+        # runner reported `failed:judge_evidence_missing` on a judge that had run
+        # correctly. Naming the file restores the branch to the same contract as
+        # panel/synth: the agent writes it, and `write_preserving_agent` keeps an
+        # agent-written output (routing the captured text to `.stdout.md`).
         prompt = (f"{ctx.prepend()}Review the implementation for: {ctx.node_desc}{ctx.learned}\n\n"
                   f"Plan:\n{ctx.plan_content}{ctx.artifact_context}{ctx.scope_guard()}\n\n{reviewer_inputs}\n"
-                  'Respond with JSON: {"verdict": "pass|fail|needs_revision", "notes": []}')
+                  'Respond with JSON: {"verdict": "pass|fail|needs_revision", "notes": []}\n'
+                  f'AND write that exact JSON object to {review_file} — a Bash heredoc is fine. '
+                  'That file is the artifact the runtime reads; an answer that is prose only is discarded.')
     marker = os.path.join(ctx.run_dir, f".dispatch-marker-{ctx.node_id}")
     open(marker, "w").write("")
     rc, result = ctx.dispatch(prompt)
