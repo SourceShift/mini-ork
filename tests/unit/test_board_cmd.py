@@ -70,3 +70,25 @@ def test_cli_usage_and_actions(home: Path, capsys) -> None:
     assert "no open workspace" in json.loads(capsys.readouterr().out)["error"]
     assert board_cmd.main(["--home", str(home), "--json"], "") == 0
     assert "runs" in json.loads(capsys.readouterr().out)
+
+
+def test_card_files_map_onto_the_project_when_the_worktree_is_gone(tmp_path: Path) -> None:
+    project = tmp_path / "proj"
+    (project / "docs").mkdir(parents=True)
+    (project / "docs" / "guide.md").write_text("x\n")
+    gone = str(tmp_path / "worktrees" / "proj" / "task-abc123" / "docs" / "guide.md")
+    fields = board_cmd._card_fields(
+        {"files": [{"path": gone, "added": 3, "removed": 1},
+                   {"path": str(tmp_path / "nowhere" / "x.py"), "added": 1, "removed": 0}],
+         "steps": [{"node_id": "editor", "node_type": "implementer", "lane": "worker",
+                    "duration": 44, "state": "done"}],
+         "cost_by_stage": {"worker": 0.37, "learning": 0.0}, "cost_total": 0.37,
+         "verdict": {"verdict": "pass"}},
+        project)
+    assert fields["files"][0] == {"path": "docs/guide.md", "abs": str(project / "docs" / "guide.md"),
+                                  "added": 3, "removed": 1}
+    assert fields["files"][1]["abs"] is None
+    assert fields["steps"] == [{"name": "editor", "type": "implementer", "lane": "worker",
+                                "seconds": 44, "state": "done"}]
+    assert fields["cost_by_stage"] == {"worker": 0.37}
+    assert fields["verdict"] == "pass"

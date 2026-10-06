@@ -197,7 +197,54 @@ def run_card(home: Path, run_id: str) -> dict[str, Any]:
                      "added": st.get("added", 0), "removed": st.get("removed", 0),
                      "files": st.get("files") or []}
     markdown = render_card(card, now=int(time.time()), serve_url=None)
-    return {"ok": True, "run_id": run_id, "markdown": markdown, "workspace": workspace}
+    return {"ok": True, "run_id": run_id, "markdown": markdown, "workspace": workspace,
+            "card": _card_fields(card, home.absolute().parent)}
+
+
+def _project_file(path: str, project: Path) -> tuple[str, str | None]:
+    """``(display path, existing absolute path or None)`` for a changed file.
+
+    A delivered run's worktree is gone, so its recorded path is mapped onto the
+    project: the longest tail of the path that exists in the project wins.
+    """
+    p = Path(path)
+    if p.is_file():
+        try:
+            return str(p.relative_to(project)), str(p)
+        except ValueError:
+            pass
+    parts = p.parts
+    for start in range(1, len(parts)):
+        candidate = project.joinpath(*parts[start:])
+        if candidate.is_file():
+            return str(Path(*parts[start:])), str(candidate)
+    return p.name, None
+
+
+def _card_fields(card: dict[str, Any], project: Path) -> dict[str, Any]:
+    files = []
+    for f in card.get("files") or []:
+        display, absolute = _project_file(str(f.get("path") or ""), project)
+        files.append({"path": display, "abs": absolute,
+                      "added": int(f.get("added") or 0), "removed": int(f.get("removed") or 0)})
+    verdict = card.get("verdict") or {}
+    return {
+        "title": card.get("title") or "",
+        "recipe": card.get("recipe") or "",
+        "status": card.get("status") or "",
+        "detail": card.get("detail") or "",
+        "steps": [
+            {"name": s.get("node_id") or "", "type": s.get("node_type") or "",
+             "lane": s.get("lane") or "", "seconds": s.get("duration"),
+             "state": s.get("state") or ""}
+            for s in card.get("steps") or []
+        ],
+        "cost_by_stage": {k: round(float(v or 0.0), 4)
+                          for k, v in (card.get("cost_by_stage") or {}).items() if v},
+        "cost_total": round(float(card.get("cost_total") or 0.0), 4),
+        "files": files,
+        "verdict": verdict.get("verdict") if isinstance(verdict, dict) else None,
+    }
 
 
 def _title_for(home: Path, run_id: str) -> str:
