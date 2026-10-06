@@ -10,6 +10,7 @@ import contextlib
 import functools
 import json
 import os
+import sqlite3
 import time
 from collections.abc import Iterator
 from pathlib import Path
@@ -42,7 +43,7 @@ def _rows(home: Path, sql: str, params: tuple = ()) -> list[dict[str, Any]]:
     state = db_for(home)
     try:
         return state.rows(sql, params)
-    except Exception:
+    except sqlite3.OperationalError:
         return []
 
 

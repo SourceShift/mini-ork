@@ -102,8 +102,10 @@ def _worktrees(home: Path, ctx: dict[str, Any]) -> list[dict[str, Any]]:
             sub += f" · {len(st['uncommitted'])} uncommitted"
         if ws.adopted:
             sub += " · this is a Zed worktree (kept after merge)"
+        merge_confirm = (f"Merge this run's branch into {ws.base_branch}?" if ws.base_branch
+                         else "Merge this run's branch?")
         acts = [S.btn(f"Merge into {ws.base_branch}" if ws.base_branch else "Merge",
-                      S.cli("board", "merge", ws.run_id, confirm="Merge"), "primary"),
+                      S.cli("board", "merge", ws.run_id, confirm=merge_confirm), "primary"),
                 S.btn("Discard", S.cli("board", "discard", ws.run_id,
                                        confirm=f"Discard {ws.branch}? Its changes are deleted."), "danger"),
                 S.btn("Open run", S.open_run(ws.run_id, title), "ghost")]

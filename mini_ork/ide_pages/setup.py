@@ -11,6 +11,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import sqlite3
 import time
 from pathlib import Path
 from typing import Any
@@ -38,7 +39,7 @@ def _rows(home: Path, sql: str, params: tuple = ()) -> list[dict[str, Any]]:
     state = db_for(home)
     try:
         return state.rows(sql, params)
-    except Exception:
+    except sqlite3.OperationalError:
         return []
 
 

@@ -168,6 +168,22 @@ def _workspaces(home: Path) -> list[dict[str, Any]]:
     return out
 
 
+_SHELL_KEYS: tuple[str, ...] = ("version", "project", "home", "generated_at", "header",
+                        "runs", "counts", "errors")
+
+
+def _shell_subset(payload: dict[str, Any]) -> dict[str, Any]:
+    """The IDE shell's view — only what the always-on panels render.
+
+    The full payload carries learnings, automations, scheduler, recipes and
+    workspaces; the shell never reads them. Projecting to ``_SHELL_KEYS`` keeps
+    ``board --json --shell`` cheap and lets the IDE poll at 5 s without a
+    Python process always running. ``errors`` is preserved so a header or runs
+    failure still surfaces in the shell.
+    """
+    return {k: payload.get(k) for k in _SHELL_KEYS}
+
+
 def board(home: Path) -> dict[str, Any]:
     """The whole board for ``home`` — see the module docstring."""
     errors: dict[str, str] = {}
@@ -418,6 +434,9 @@ def main(rest: list[str], root: str) -> int:
     parser.add_argument("target", nargs="?")
     parser.add_argument("--home", default=None)
     parser.add_argument("--json", action="store_true")
+    parser.add_argument("--shell", action="store_true",
+                        help="project the payload to the IDE shell's keys only "
+                             "(version, project, home, generated_at, header, runs, counts, errors)")
     parser.add_argument("--tab", default=None)
     parser.add_argument("--arg", action="append", default=[])
     parser.add_argument("--note", default=None)
@@ -427,6 +446,11 @@ def main(rest: list[str], root: str) -> int:
         sys.stderr.write("usage: mini-ork board [run|merge|discard|stop|kill|resume <run_id>] "
                          "[gate approve|reject <inbox_id> [--note TEXT]] "
                          "[page <key> [--tab T] [--arg k=v]] [--home H] [--json]\n")
+        return 2
+    # The third positional is only meaningful for `gate approve|reject <inbox_id>`.
+    # Any other verb that gets one is a usage error, not a silent extra.
+    if args.target and args.verb != "gate":
+        sys.stderr.write(f"mini-ork board {args.verb}: unexpected extra argument {args.target!r}\n")
         return 2
     home = (Path(args.home) if args.home else _default_home()).expanduser().absolute()
     if args.verb == "gate":
@@ -447,6 +471,8 @@ def main(rest: list[str], root: str) -> int:
         payload = build_page(home, args.run_id, args.tab, page_args)
     elif args.verb == "show":
         payload = board(home)
+        if args.shell:
+            payload = _shell_subset(payload)
     elif args.verb == "run":
         payload = run_card(home, args.run_id)
     elif args.verb == "kill":

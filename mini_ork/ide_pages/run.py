@@ -190,19 +190,37 @@ def _time_columns(steps: list[dict[str, Any]]) -> list[list[str]]:
 
 def _attribute_calls(nodes: dict[str, Node], calls: list[dict[str, Any]], now: int) -> None:
     """Give each llm_call to the node whose role lane and time window match."""
+    # Index nodes by role_lane once — without it every call walked all N nodes,
+    # turning a long run into O(N·M) when callers typically have hundreds of calls.
+    nodes_by_lane_started: dict[str, list[Node]] = {}
+    nodes_by_lane_idle: dict[str, list[Node]] = {}
+    for node in nodes.values():
+        if node.role_lane:
+            if node.start is not None:
+                nodes_by_lane_started.setdefault(node.role_lane, []).append(node)
+            else:
+                nodes_by_lane_idle.setdefault(node.role_lane, []).append(node)
     for call in calls:
         actor = str(call.get("actor") or "")
-        ts = _epoch(call.get("ts"))
-        cands = [n for n in nodes.values() if n.role_lane == actor and n.start is not None]
+        ts_raw = _epoch(call.get("ts"))
+        cands = nodes_by_lane_started.get(actor, [])
         best: Node | None = None
-        if ts is not None and cands:
-            inside = [n for n in cands if n.start - 2 <= ts <= (n.end or now) + 5]
+        if ts_raw is not None and cands:
+            ts = ts_raw  # narrow to int for the lambda capture below
+            inside: list[tuple[Node, int]] = []
+            for n in cands:
+                start = n.start if n.start is not None else 0
+                end = n.end if n.end is not None else now
+                if n.start is None:
+                    continue
+                if start - 2 <= ts <= end + 5:
+                    inside.append((n, end))
             if inside:
-                best = min(inside, key=lambda n: abs((n.end or now) - ts))
+                best = min(inside, key=lambda pair: abs(pair[1] - ts))[0]
         if best is None:
             # A node the executor ran outside the lifecycle stream (the Python
             # plan runtime's planner): the one never-started node on that lane.
-            idle = [n for n in nodes.values() if n.role_lane == actor and n.start is None]
+            idle = nodes_by_lane_idle.get(actor, [])
             if len(idle) == 1:
                 best = idle[0]
         if best is None:

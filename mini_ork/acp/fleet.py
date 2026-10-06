@@ -22,7 +22,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from mini_ork.acp.diffs import cached_or_computed
+from mini_ork.acp.diffs import CACHE_NAME, cached_or_computed
 from mini_ork.acp.history import list_runs
 from mini_ork.acp.task_state import MARKS, run_mark, task_state
 
@@ -196,6 +196,74 @@ def _diff_counts(run_dir: Path) -> tuple[int, int]:
         except Exception:  # noqa: BLE001
             continue
     return added, removed
+
+
+def _diff_counts_cached(run_dir: Path) -> tuple[int, int] | None:
+    """``(added, removed)`` from the cached diff list only — ``None`` when no cache.
+
+    ``_diff_counts`` falls through to ``run_diffs`` on a miss, which costs a
+    ``git show`` per file. On a 200-row ``board --json`` we already paid for
+    the candidates; never pay for diffs we cannot render cheaply.
+    """
+    cache = run_dir / CACHE_NAME
+    if not cache.is_file():
+        return None
+    try:
+        raw = json.loads(cache.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+    entries = raw.get("diffs") if isinstance(raw, dict) else None
+    if not isinstance(entries, list) or not entries:
+        return None
+    added = 0
+    removed = 0
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        old_text = entry.get("old_text") or ""
+        new_text = entry.get("new_text") or ""
+        try:
+            for line in difflib.unified_diff(
+                old_text.splitlines(), new_text.splitlines(), lineterm=""
+            ):
+                if line.startswith("+++") or line.startswith("---"):
+                    continue
+                if line.startswith("+"):
+                    added += 1
+                elif line.startswith("-"):
+                    removed += 1
+        except Exception:  # noqa: BLE001
+            continue
+    return added, removed
+
+
+def _events_by_run(home: Path, run_ids: list[str]) -> dict[str, list[dict[str, Any]]]:
+    """All node-lifecycle events for the listed ``run_ids`` in one ``IN`` query.
+
+    ``read_snapshot`` fans out per run (``fetch_node_lifecycle_events`` is one
+    query per run). On ``board --json`` we have ≤ 50 shown runs, so this saves
+    ~ 50 SELECTs. Returns ``{run_id: events}``; missing rows are absent.
+    """
+    if not run_ids:
+        return {}
+    state_db = Path(home) / "state.db"
+    if not state_db.is_file():
+        return {}
+    placeholders = ",".join("?" for _ in run_ids)
+    sql = (f"SELECT run_id, event_type, payload_json, created_at "
+           f"FROM run_events WHERE run_id IN ({placeholders}) "
+           f"ORDER BY created_at ASC")
+    out_map: dict[str, list[dict[str, Any]]] = {rid: [] for rid in run_ids}
+    try:
+        from mini_ork.web.deps import db_for
+        rows = db_for(Path(home)).rows(sql, tuple(run_ids))
+    except Exception:  # noqa: BLE001 — best-effort batch read
+        return out_map
+    for row in rows or []:
+        rid = str(row.get("run_id") or "")
+        if rid in out_map:
+            out_map[rid].append(row)
+    return out_map
 
 
 def _file_changes(run_dir: Path) -> tuple[list[dict[str, Any]], bool]:
@@ -421,8 +489,6 @@ def fleet_rows(
         state_norm = "all"
     bounded_limit = max(1, min(MAX_LIMIT, int(limit) if isinstance(limit, int) else DEFAULT_LIMIT))
 
-    from mini_ork.acp import history as _history
-
     try:
         candidates, _ = list_runs(Path(home), limit=CANDIDATE_LIMIT, offset=0)
     except Exception:  # noqa: BLE001
@@ -467,6 +533,8 @@ def fleet_rows(
         filtered = [row for row in filtered if (row.get("recipe") or "") == recipe]
 
     shown = filtered[:bounded_limit]
+    shown_run_ids = [str(r.get("run_id") or "") for r in shown if r.get("run_id")]
+    events_by_run = _events_by_run(Path(home), shown_run_ids)
 
     rows: list[FleetRow] = []
     for row in shown:
@@ -479,11 +547,14 @@ def fleet_rows(
         ended_at = _iso_to_epoch(updated_iso)
 
         run_dir = _run_dir(home, run_id)
-        snapshot: dict[str, Any] = {"status": None, "events": [], "llm_calls": []}
-        try:
-            snapshot = _history.read_snapshot(Path(home), run_id)
-        except Exception:  # noqa: BLE001
-            snapshot = {"status": row.get("status"), "events": [], "llm_calls": []}
+        # Build the snapshot fleet_rows needs (status + events) from the list_runs
+        # row and the batched events lookup — llm_calls is unused here, so we
+        # avoid ``read_snapshot``'s 2 extra queries per row (≤ 50 shown).
+        snapshot: dict[str, Any] = {
+            "status": row.get("status"),
+            "events": events_by_run.get(run_id, []),
+            "llm_calls": [],
+        }
 
         ts = task_state(run_dir, snapshot)
         precise_state = ts.state
@@ -491,7 +562,14 @@ def fleet_rows(
         added = 0
         removed = 0
         if precise_state == "done":
-            added, removed = _diff_counts(run_dir)
+            # Use the cached diff when present; only fall through to the full
+            # computation (which costs a ``git show`` per file) when no cache
+            # exists. The cache is written by run_diffs on first read.
+            cached_counts = _diff_counts_cached(run_dir)
+            if cached_counts is not None:
+                added, removed = cached_counts
+            else:
+                added, removed = _diff_counts(run_dir)
 
         mark = MARKS.get(precise_state, MARKS["working"])
 

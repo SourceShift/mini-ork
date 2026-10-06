@@ -103,6 +103,42 @@ def _live_node(home: Path, run_id: str) -> dict[str, Any]:
         "ORDER BY created_at ASC",
         (run_id,),
     )
+    return _live_node_from_events(events)
+
+
+def _live_nodes_bulk(home: Path, run_ids: list[str]) -> dict[str, dict[str, Any]]:
+    """One ``IN``-query for the active tab's open-node state across many runs.
+
+    The ``active`` tab calls ``_live_node`` once per row, which fans out as N
+    SQLite queries — the dominant per-render cost on a busy home. This batched
+    variant keeps the rendering logic identical to ``_live_node`` while doing
+    a single SELECT for the whole visible set.
+    """
+    db = _db(home)
+    if not run_ids or not db.has_table("run_events"):
+        return {rid: {} for rid in run_ids}
+    placeholders = ",".join("?" for _ in run_ids)
+    rows = db.rows(
+        "SELECT run_id, event_type, payload_json, created_at, last_heartbeat_at "
+        f"FROM run_events WHERE run_id IN ({placeholders}) "
+        "AND event_type IN ('node_start','node_heartbeat','node_end') "
+        "ORDER BY created_at ASC",
+        tuple(run_ids),
+    )
+    events_by_run: dict[str, list[dict[str, Any]]] = {rid: [] for rid in run_ids}
+    for row in rows or []:
+        rid = str(row.get("run_id") or "")
+        if rid in events_by_run:
+            events_by_run[rid].append(row)
+    return {rid: _live_node_from_events(events_by_run[rid]) for rid in run_ids}
+
+
+def _live_node_from_events(events: list[dict[str, Any]]) -> dict[str, Any]:
+    """Reduce a single run's event list to its open node + last heartbeat.
+
+    Pulled out of ``_live_node`` so ``_live_nodes_bulk`` can reuse it without
+    paying for a per-run ``IN`` query.
+    """
     open_nodes: dict[str, dict[str, Any]] = {}
     last_beat = 0
     for e in events:
@@ -144,9 +180,11 @@ def _active(home: Path, now: int) -> list[dict[str, Any]]:
     # A cost-paused run reads as "needs you" in the fleet but is still in flight.
     waiting, _ = _fleet(home, "needs_you", _ACTIVE_LIMIT)
     rows = list(rows) + [r for r in waiting if _cost_paused(home, r.run_id)]
+    # One IN-query for the open-node state of every active row, then map back.
+    live_by_run = _live_nodes_bulk(home, [r.run_id for r in rows])
     table_rows = []
     for r in rows:
-        live = _live_node(home, r.run_id)
+        live = live_by_run.get(r.run_id) or _live_node(home, r.run_id)
         beat = live.get("beat") or 0
         if _cost_paused(home, r.run_id):
             heartbeat = S.cell("paused · cost", "yellow")

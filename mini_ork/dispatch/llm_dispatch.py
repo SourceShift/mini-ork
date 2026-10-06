@@ -165,8 +165,14 @@ def glm_fair_usage_retryable(model, message, attempt=1, max_attempts=1) -> bool:
 def _effective_lanes(root: str, home: str) -> dict | None:
     """``lanes`` of the policy a resolver should read, or None when there is none.
 
-    Template: ``<home>/config/agents.yaml``, else ``<root>/config/agents.yaml``;
-    an empty home/root is a clean miss, never a CWD lookup. The per-user overlay
+    Template precedence (matches ``config_resolve.resolve_agents_yaml``):
+      1. ``$MINI_ORK_RUN_DIR/config/agents.yaml`` — the launch-time snapshot,
+         written by ``snapshot_run_config`` so a run honours the lanes it was
+         seeded with even after the home's agents.yaml moves.
+      2. ``<home>/config/agents.yaml`` (current behaviour)
+      3. ``<root>/config/agents.yaml`` (current behaviour)
+
+    An empty home/root is a clean miss, never a CWD lookup. The per-user overlay
     (``$MINI_ORK_AGENTS`` or ``<home>/config/agents.local.yaml``) is merged on
     top in memory with ``agents_config.merge`` — the same policy
     ``agents_config.effective_path`` materialises for every other reader, but
@@ -179,11 +185,20 @@ def _effective_lanes(root: str, home: str) -> dict | None:
     """
     from mini_ork.dispatch import agents_config
 
-    tmpl = os.path.join(home, "config", "agents.yaml") if home else ""
-    if not (tmpl and os.path.isfile(tmpl)):
-        tmpl = os.path.join(root, "config", "agents.yaml") if root else ""
-    if not (tmpl and os.path.isfile(tmpl)):
-        tmpl = ""
+    tmpl = ""
+    run_dir = os.environ.get("MINI_ORK_RUN_DIR", "")
+    if run_dir:
+        candidate = os.path.join(run_dir, "config", "agents.yaml")
+        if os.path.isfile(candidate):
+            tmpl = candidate
+    if not tmpl and home:
+        candidate = os.path.join(home, "config", "agents.yaml")
+        if os.path.isfile(candidate):
+            tmpl = candidate
+    if not tmpl and root:
+        candidate = os.path.join(root, "config", "agents.yaml")
+        if os.path.isfile(candidate):
+            tmpl = candidate
     over_p = agents_config.personal_path(home=home) if home else None
     if not tmpl and over_p is None:
         return None
