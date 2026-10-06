@@ -211,8 +211,6 @@ def _attribute_calls(nodes: dict[str, Node], calls: list[dict[str, Any]], now: i
             for n in cands:
                 start = n.start if n.start is not None else 0
                 end = n.end if n.end is not None else now
-                if n.start is None:
-                    continue
                 if start - 2 <= ts <= end + 5:
                     inside.append((n, end))
             if inside:

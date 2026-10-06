@@ -184,6 +184,31 @@ def _shell_subset(payload: dict[str, Any]) -> dict[str, Any]:
     return {k: payload.get(k) for k in _SHELL_KEYS}
 
 
+def _board_shell_payload(home: Path) -> dict[str, Any]:
+    """The IDE shell's document — ``_SHELL_KEYS`` only, no full-board I/O.
+
+    Bypasses ``board()`` so the shell skips ``_learnings``/``_automations``/
+    ``_scheduler``/``_recipes``/``_workspaces`` and stays under the 1.5 s warm
+    budget. ``header`` stays in (kickoff keeps ContextNest + cost), so the
+    0.5 s ``CN_TIMEOUT_SEC`` ceiling dominates — the win comes from dropping
+    the five full-board sections, not from the header.
+    """
+    errors: dict[str, str] = {}
+    runs, counts = _section(errors, "runs", lambda: _runs(home), ([], {}))
+    from mini_ork.ide_pages.header import header
+
+    return {
+        "version": 1,
+        "project": home.absolute().parent.name,
+        "home": str(home.absolute()),
+        "generated_at": int(time.time()),
+        "header": _section(errors, "header", lambda: header(home, counts), {}),
+        "runs": runs,
+        "counts": counts,
+        "errors": errors,
+    }
+
+
 def board(home: Path) -> dict[str, Any]:
     """The whole board for ``home`` — see the module docstring."""
     errors: dict[str, str] = {}
@@ -426,20 +451,7 @@ def _default_home() -> Path:
 
 def main(rest: list[str], root: str) -> int:
     del root
-    parser = argparse.ArgumentParser(prog="mini-ork board", add_help=False)
-    parser.add_argument("verb", nargs="?", default="show",
-                        choices=["show", "run", "merge", "discard", "stop", "kill", "resume", "gate", "page"])
-    parser.add_argument("run_id", nargs="?")
-    # `gate approve|reject <inbox_id>` puts the action in run_id and the id here.
-    parser.add_argument("target", nargs="?")
-    parser.add_argument("--home", default=None)
-    parser.add_argument("--json", action="store_true")
-    parser.add_argument("--shell", action="store_true",
-                        help="project the payload to the IDE shell's keys only "
-                             "(version, project, home, generated_at, header, runs, counts, errors)")
-    parser.add_argument("--tab", default=None)
-    parser.add_argument("--arg", action="append", default=[])
-    parser.add_argument("--note", default=None)
+    parser = build_parser()
     try:
         args = parser.parse_args(rest)
     except SystemExit:
@@ -470,9 +482,14 @@ def main(rest: list[str], root: str) -> int:
         page_args = dict(a.split("=", 1) for a in args.arg if "=" in a)
         payload = build_page(home, args.run_id, args.tab, page_args)
     elif args.verb == "show":
-        payload = board(home)
         if args.shell:
-            payload = _shell_subset(payload)
+            # Skip ``board()`` entirely so ``_learnings``/``_automations``/
+            # ``_scheduler``/``_recipes``/``_workspaces`` never run for the
+            # shell poll. ``_shell_subset`` stays as the shared key projection
+            # for any caller that already built a full payload.
+            payload = _board_shell_payload(home)
+        else:
+            payload = board(home)
     elif args.verb == "run":
         payload = run_card(home, args.run_id)
     elif args.verb == "kill":
@@ -485,6 +502,27 @@ def main(rest: list[str], root: str) -> int:
         payload = act(home, args.verb, args.run_id)
     sys.stdout.write(json.dumps(payload, default=str) + "\n")
     return 0 if payload.get("ok", True) is not False else 1
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """The ``board`` subcommand's argparse — factored out so the IDE action test
+    can route ``board``-verb CLI lists through the same parser that ``main``
+    uses (no hand-copied parser drifting out of sync)."""
+    parser = argparse.ArgumentParser(prog="mini-ork board", add_help=False)
+    parser.add_argument("verb", nargs="?", default="show",
+                        choices=["show", "run", "merge", "discard", "stop", "kill", "resume", "gate", "page"])
+    parser.add_argument("run_id", nargs="?")
+    # `gate approve|reject <inbox_id>` puts the action in run_id and the id here.
+    parser.add_argument("target", nargs="?")
+    parser.add_argument("--home", default=None)
+    parser.add_argument("--json", action="store_true")
+    parser.add_argument("--shell", action="store_true",
+                        help="project the payload to the IDE shell's keys only "
+                             "(version, project, home, generated_at, header, runs, counts, errors)")
+    parser.add_argument("--tab", default=None)
+    parser.add_argument("--arg", action="append", default=[])
+    parser.add_argument("--note", default=None)
+    return parser
 
 
 if __name__ == "__main__":

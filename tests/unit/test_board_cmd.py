@@ -171,3 +171,254 @@ def test_artifacts_are_grouped_for_the_run_tab(tmp_path: Path) -> None:
         ("Evidence", "evidence/test-1.log"), ("Other", "notes.txt"),
     ]
     assert board_cmd._artifacts(tmp_path / "missing") == []
+
+
+# ── kickoff ide-board-perf-r2 — Part B tests ──────────────────────────────
+
+
+def test_shell_payload_skips_full_board_sections(home: Path, monkeypatch) -> None:
+    """``_board_shell_payload`` builds only ``_SHELL_KEYS`` and never touches
+    ``_recipes``/``_learnings``/``_automations``/``_scheduler``/``_workspaces``.
+
+    A raise on those helpers would otherwise abort the shell poll, so they
+    must not even be called. The shape contract is exact equality, not subset.
+    """
+    _seed_run(home, "run-1791000000-aaaaaa", "published")
+
+    def _boom(*_args, **_kwargs):
+        raise AssertionError("shell must not reach full-board sections")
+
+    monkeypatch.setattr(board_cmd, "_recipes", _boom)
+    monkeypatch.setattr(board_cmd, "_learnings", _boom)
+    monkeypatch.setattr(board_cmd, "_automations", _boom)
+    monkeypatch.setattr(board_cmd, "_scheduler", _boom)
+    monkeypatch.setattr(board_cmd, "_workspaces", _boom)
+
+    payload = board_cmd._board_shell_payload(home)
+    assert set(payload) == {
+        "version", "project", "home", "generated_at", "header", "runs", "counts", "errors"
+    }
+    assert payload["version"] == 1
+    assert payload["project"] == home.absolute().parent.name
+    assert payload["home"] == str(home.absolute())
+    assert isinstance(payload["generated_at"], int) and payload["generated_at"] > 0
+    assert isinstance(payload["runs"], list)
+    assert isinstance(payload["counts"], dict)
+    assert isinstance(payload["errors"], dict)
+
+
+def test_shell_payload_uses_build_parser_when_invoked_via_main(
+    home: Path, monkeypatch, capsys,
+) -> None:
+    """``mini-ork board --json --shell`` runs ``_board_shell_payload``, not
+    ``board()`` — verified end-to-end via ``main()`` and the real parser."""
+    _seed_run(home, "run-1791000000-aaaaaa", "published")
+
+    def _boom(*_args, **_kwargs):
+        raise AssertionError("shell path must not reach full-board sections")
+
+    monkeypatch.setattr(board_cmd, "_recipes", _boom)
+    monkeypatch.setattr(board_cmd, "_learnings", _boom)
+
+    rc = board_cmd.main(["--json", "--shell", "--home", str(home)], "")
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert set(payload) == {
+        "version", "project", "home", "generated_at", "header", "runs", "counts", "errors"
+    }
+
+
+def test_worktree_count_uses_common_dir_when_git_worktree_list_fails(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """``_worktree_count`` returns 1 + entries of ``<common>/worktrees/`` even
+    when ``git worktree list`` would fail. Two linked worktree dirs on disk +
+    the main checkout itself → 3."""
+    from mini_ork.ide_pages import header
+
+    project = tmp_path / "proj"
+    project.mkdir()
+    common = tmp_path / "common.git"
+    (common / "worktrees" / "wt-a").mkdir(parents=True)
+    (common / "worktrees" / "wt-b").mkdir(parents=True)
+
+    def _fake_common_dir(_project):
+        return common
+
+    def _fake_git(_project, *args, **_kwargs):
+        # header.py also calls ``git rev-parse --abbrev-ref HEAD`` as a
+        # fallback for the branch line; we don't care here, but make sure it
+        # returns empty so the test does not depend on a real git binary.
+        return ""
+
+    monkeypatch.setattr(header, "_git_common_dir", _fake_common_dir)
+    monkeypatch.setattr(header, "_git", _fake_git)
+
+    assert header._worktree_count(project) == 3
+
+
+def test_worktree_count_resolves_relative_common_dir(tmp_path: Path, monkeypatch) -> None:
+    """The fix-2 regression: ``git rev-parse --git-common-dir`` historically
+    printed a relative ``.git`` for the main checkout, which made the absolute
+    check drop the count to zero. After the patch, the helper returns the
+    project root, and the count is ``1 + len(worktrees/)`` again."""
+    from mini_ork.ide_pages import header
+
+    project = tmp_path / "proj"
+    project.mkdir()
+    common_rel = Path(".git")  # the relative shape before --path-format=absolute
+    real_common = tmp_path / ".git"
+    (real_common / "worktrees" / "wt-1").mkdir(parents=True)
+
+    def _fake_common_dir(_project):
+        return real_common  # already resolved against project by the patched path
+
+    monkeypatch.setattr(header, "_git_common_dir", _fake_common_dir)
+    monkeypatch.setattr(header, "_git", lambda *_a, **_k: "")
+    del common_rel  # silence linters; kept only to anchor the regression intent
+
+    assert header._worktree_count(project) == 2  # main + wt-1
+
+
+def test_runs_output_is_stable_against_frozen_list(home: Path) -> None:
+    """``_runs`` output is identical before/after — pin the exact row shape.
+
+    The run was seeded with no kickoff on disk; ``history._title_from_kickoff``
+    therefore falls back to ``f"{recipe} run"``. Pin the shape so a future
+    change to that fallback shows up as a single-line update here.
+    """
+    _seed_run(home, "run-1791000000-aaaaaa", "published")
+    runs, counts = board_cmd._runs(home)
+    assert counts == {"working": 0, "needs_you": 0, "done": 1, "failed": 0}
+    assert runs == [
+        {
+            "id": "run-1791000000-aaaaaa",
+            "title": "code-fix run",
+            "recipe": "code-fix",
+            "state": "done",
+            "mark": "✓",
+            "step": "",
+            "started_at": runs[0]["started_at"],
+            "ended_at": runs[0]["ended_at"],
+            "cost_usd": 0.5,
+            "added": 0,
+            "removed": 0,
+            "has_workspace": False,
+        },
+    ]
+
+
+def test_import_acp_fleet_does_not_pull_in_agent_module():
+    """``mini_ork.acp.fleet`` is import-lazy: pulling it in a fresh interpreter
+    must NOT import ``mini_ork.acp.agent`` (which depends on the LLM client
+    surface and would otherwise load on every board poll).
+    """
+    import subprocess
+    import sys
+
+    code = (
+        "import mini_ork.acp.fleet as f\n"
+        "import sys\n"
+        "assert 'mini_ork.acp.agent' not in sys.modules, "
+        f"{sorted(m for m in sys.modules if m.startswith('mini_ork.acp'))!r}\n"
+    )
+    proc = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=20)
+    assert proc.returncode == 0, proc.stderr
+
+
+def test_effective_lanes_honours_run_dir_agents_yaml(tmp_path: Path, monkeypatch) -> None:
+    """``_effective_lanes`` honours ``$MINI_ORK_RUN_DIR/config/agents.yaml``
+    before the home's policy — the run-snapshot wins. Inside pytest the env
+    may carry a real ``MINI_ORK_RUN_DIR``; clear it for a deterministic read.
+    """
+    from mini_ork.dispatch import llm_dispatch
+
+    monkeypatch.delenv("MINI_ORK_RUN_DIR", raising=False)
+
+    run_dir = tmp_path / "run"
+    (run_dir / "config").mkdir(parents=True)
+    (run_dir / "config" / "agents.yaml").write_text(
+        "lanes:\n  opus_lens: opus\n  glm_lens: glm\n"
+    )
+
+    # Home policy disagrees — must NOT win.
+    home = tmp_path / "home"
+    (home / "config").mkdir(parents=True)
+    (home / "config" / "agents.yaml").write_text(
+        "lanes:\n  opus_lens: glm\n"
+    )
+
+    monkeypatch.setenv("MINI_ORK_RUN_DIR", str(run_dir))
+    lanes = llm_dispatch._effective_lanes(str(home), str(home))
+    assert lanes is not None
+    assert lanes["opus_lens"] == "opus"  # run-snapshot wins over home's glm
+    assert lanes["glm_lens"] == "glm"
+
+
+def test_diff_counts_cached_reads_list_shape(home: Path) -> None:
+    """Regression guard for fix 3: the diff cache is a bare JSON list, and
+    ``_diff_counts_cached`` must parse it (the old ``raw.get("diffs")`` shape
+    always returned ``None`` and fell through to ``_diff_counts``).
+    """
+    from mini_ork.acp import fleet as acp_fleet
+
+    run_id = "r-cache"
+    _seed_run(home, run_id, "published")
+    run_dir = home / "runs" / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    # ``CACHE_NAME = "acp-diffs.json"`` — the same name ``diffs._write_cache``
+    # uses (``json.dump(diffs, handle)``).
+    cache_path = run_dir / acp_fleet.CACHE_NAME
+    cache_path.write_text(
+        json.dumps([{"path": "f.py", "old_text": "a\n", "new_text": "a\nb\nc\n"}])
+    )
+
+    counts = acp_fleet._diff_counts_cached(run_dir)
+    assert counts == (2, 0)
+
+
+def test_events_by_run_filters_to_lifecycle_events(home: Path) -> None:
+    """Fix 4: the batched lifecycle query must mirror the per-run read at
+    ``fetch_node_lifecycle_events`` and drop ``run_events`` whose type is not
+    in ``('node_start','node_end')``.
+    """
+    import sqlite3 as _sqlite3
+
+    from mini_ork.acp import fleet as acp_fleet
+
+    con = _sqlite3.connect(home / "state.db")
+    now = int(time.time())
+    con.execute(
+        "INSERT INTO task_runs (id, recipe, status, cost_usd, created_at, updated_at, "
+        "task_class, kickoff_path, workflow_version) VALUES (?,?,?,?,?,?,?,?,?)",
+        ("r-evt", "code-fix", "published", 0.0, now, now, "code_fix", "", "latest"),
+    )
+    # Lifecycle events: must survive the filter.
+    con.execute(
+        "INSERT INTO run_events (event_id, run_id, event_type, payload_json, created_at) "
+        "VALUES (?,?,?,?,?)",
+        ("e1", "r-evt", "node_start", json.dumps({"node_id": "p"}), now - 5),
+    )
+    con.execute(
+        "INSERT INTO run_events (event_id, run_id, event_type, payload_json, created_at) "
+        "VALUES (?,?,?,?,?)",
+        ("e2", "r-evt", "node_end", json.dumps({"node_id": "p", "finish_reason": "done"}), now),
+    )
+    # Non-lifecycle noise: must NOT survive.
+    con.execute(
+        "INSERT INTO run_events (event_id, run_id, event_type, payload_json, created_at) "
+        "VALUES (?,?,?,?,?)",
+        ("e3", "r-evt", "llm_call", json.dumps({"foo": 1}), now - 3),
+    )
+    con.execute(
+        "INSERT INTO run_events (event_id, run_id, event_type, payload_json, created_at) "
+        "VALUES (?,?,?,?,?)",
+        ("e4", "r-evt", "user_prompt", json.dumps({"foo": 2}), now - 2),
+    )
+    con.commit()
+    con.close()
+
+    events_by_run = acp_fleet._events_by_run(home, ["r-evt"])
+    events = events_by_run["r-evt"]
+    types = sorted(e["event_type"] for e in events)
+    assert types == ["node_end", "node_start"]

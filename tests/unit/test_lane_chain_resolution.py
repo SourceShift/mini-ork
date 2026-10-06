@@ -1,7 +1,22 @@
 import textwrap
 
+import pytest
+
 from mini_ork.dispatch.llm_dispatch import resolve_lane_family
 from mini_ork.dispatch.routing import dispatch_chain
+
+
+@pytest.fixture(autouse=True)
+def _no_run_dir(monkeypatch):
+    """pytest inherits ``MINI_ORK_RUN_DIR`` from a wrapping mini-ork launcher;
+    ``_effective_lanes`` reads its snapshot ``config/agents.yaml`` first and
+    the suite would otherwise pick up this run's lane policy. The launcher
+    also leaks ``MINI_ORK_AGENTS`` (overlay YAML from a previous run) which
+    the per-user merge overrides the test's temp home with. Clear BOTH so
+    every test sees the same no-snapshot / no-overlay baseline.
+    """
+    monkeypatch.delenv("MINI_ORK_RUN_DIR", raising=False)
+    monkeypatch.delenv("MINI_ORK_AGENTS", raising=False)
 
 
 def _write_agents(tmp_path):

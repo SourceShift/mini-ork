@@ -212,8 +212,19 @@ def _diff_counts_cached(run_dir: Path) -> tuple[int, int] | None:
         raw = json.loads(cache.read_text(encoding="utf-8"))
     except (OSError, ValueError, json.JSONDecodeError):
         return None
-    entries = raw.get("diffs") if isinstance(raw, dict) else None
-    if not isinstance(entries, list) or not entries:
+    # The cache writer at ``diffs._write_cache`` dumps a bare list, NOT a dict
+    # with a ``"diffs"`` key — so the old ``raw.get("diffs")`` always returned
+    # ``None`` and the function fell through to ``_diff_counts`` for every run.
+    # Accept both shapes (a stale dict-shaped cache from older versions still
+    # degrades to "no cache" instead of crashing).
+    if isinstance(raw, list):
+        entries: list[Any] = raw
+    elif isinstance(raw, dict):
+        raw_entries = raw.get("diffs")
+        entries = raw_entries if isinstance(raw_entries, list) else []
+    else:
+        entries = []
+    if not entries:
         return None
     added = 0
     removed = 0
@@ -252,6 +263,7 @@ def _events_by_run(home: Path, run_ids: list[str]) -> dict[str, list[dict[str, A
     placeholders = ",".join("?" for _ in run_ids)
     sql = (f"SELECT run_id, event_type, payload_json, created_at "
            f"FROM run_events WHERE run_id IN ({placeholders}) "
+           f"AND event_type IN ('node_start','node_end') "
            f"ORDER BY created_at ASC")
     out_map: dict[str, list[dict[str, Any]]] = {rid: [] for rid in run_ids}
     try:
