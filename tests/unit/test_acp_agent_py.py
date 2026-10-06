@@ -6009,6 +6009,28 @@ def test_finished_run_is_handed_to_the_client_as_agent_edits(tmp_path, monkeypat
     assert conn.calls == []  # no Merge / Discard question: Zed's review takes over
     assert ws_mod.load(home, run_id) is None  # the run's worktree is gone
     assert (project / "new.txt").read_text() == "x\n"
+    texts = [getattr(getattr(u, "content", None), "text", "") or "" for _sid, u in conn.sent]
+    titles = [getattr(u, "title", None) for _sid, u in conn.sent
+              if type(u).__name__ == "SessionInfoUpdate"]
+    assert not any(t.startswith("Ready to review:") for t in texts)  # delivery decides, not ✋
+    assert titles and titles[-1].startswith("✓")  # the row ends on the delivered state
+    assert any(t.endswith("\n\n") and "in your project now" in t for t in texts)
+
+
+def test_workspace_picker_in_a_main_checkout_offers_a_new_worktree(tmp_path):
+    from unittest.mock import patch
+
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    with patch("mini_ork.acp_orchestrator.config.orchestrator_lanes",
+               return_value=[{"id": "opus", "name": "Opus"}]), \
+         patch("mini_ork.recipes_catalog.list_recipes", return_value=[_recipe("code-fix")]):
+        agent = MiniOrkAcpAgent(poll_interval=0)
+        agent._client_capabilities = _fs_write_caps()
+        resp = asyncio.run(agent.new_session(cwd=str(proj)))
+    names = [o.name for opt in (resp.config_options or []) if getattr(opt, "id", "") == "workspace"
+             for o in (getattr(opt, "options", None) or [])]
+    assert "New worktree per task" in names and not any("This worktree" in n for n in names)
 
 
 def test_a_file_the_user_changed_blocks_delivery_and_keeps_the_buttons(tmp_path, monkeypatch):

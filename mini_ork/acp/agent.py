@@ -1047,7 +1047,9 @@ class MiniOrkAcpAgent:
             current = _WORKSPACE_WORKTREE
         cwd = self._sessions.get(session_id) or ""
         wt_label = self._worktree_picker_label(Path(cwd)) if cwd else _WORKSPACE_WORKTREE
-        wt_name = "This worktree" if wt_label is None else f"This worktree ({wt_label})"
+        if wt_label is not None and self.client_supports("fs.write"):
+            wt_label = None  # runs are delivered as agent edits; they never adopt
+        wt_name = "New worktree per task" if wt_label is None else f"This worktree ({wt_label})"
         wt_description = (
             "Run commits onto the worktree's existing branch (no new worktree)."
             if wt_label is not None
@@ -3203,6 +3205,7 @@ class MiniOrkAcpAgent:
                 tool_call_id=f"{run_id}:parent",
                 status="completed",
             ))
+            await self._reemit_title_after_review(run_id)
             return stop
         ws_ready = await self._offer_run_review(thread_id, run_id)
         if not ws_ready:
@@ -3286,7 +3289,7 @@ class MiniOrkAcpAgent:
             f"\n\nThe change is in your project now: {n} file{'s' if n != 1 else ''}"
             + (f" ({added} new)" if added else "")
             + ". Review it like any agent edit — **Review Changes**, or the changed-files"
-            " bar above the message box — and Keep or Reject each change."))
+            " bar above the message box — and Keep or Reject each change.\n\n"))
         return True
 
     async def _offer_run_review(self, thread_id: str, run_id: str, *, force: bool = False) -> bool:
@@ -4279,7 +4282,9 @@ class MiniOrkAcpAgent:
         # ``needs_you`` detail fires once per (destination, detail) —
         # a state flip back to working clears the entry so a later
         # flip into needs_you emits again.
-        if ts.state == "needs_you":
+        if ts.state == "needs_you" and not (
+            ts.detail.startswith("Ready to review:") and self.client_supports("fs.write")
+        ):
             if self._last_needs_you_sent.get(dest) != ts.detail:
                 self._last_needs_you_sent[dest] = ts.detail
                 await self._emit(
