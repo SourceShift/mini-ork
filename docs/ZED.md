@@ -150,6 +150,30 @@ going — ask the orchestrator to stop one. Stopping a Direct run stops the run.
   `/automation run`); those that act on a run use the thread's latest run
   unless you name one.
 
+### Check the kickoff first: `/kickoff`
+
+`/kickoff <task>` (or "write me a kickoff for …, I want to check it
+first") has the orchestrator read the recipe and the code and draft the
+kickoff a run will receive — what to do, the real files in scope (new
+ones marked `(new)`), and the commands that prove success. The thread shows
+it as a new file plus mini-ork's own checks: paths that do not exist, no
+success section, sections the recipe's examples have and yours lacks. If
+another recipe fits better, the orchestrator says so. You decide with
+**Start run**, **Save only** (to `.mini-ork/kickoffs/`), **Change
+something** or **Discard**.
+
+### Race models: `/race`
+
+`/race <task>` runs the thread's recipe on several models at once —
+`sonnet`, `glm` and `minimax` unless you name them (`/race sonnet,glm
+<task>`; `MO_RACE_LANES` sets your default). Each works in its own
+worktree and goes through the recipe's checks, so "best" means verified.
+When all finish, one table shows each model's result, change, cost and
+time, and you pick: **Keep <model> (+a −r, $cost)** merges that change and
+discards the others, **Decide later** keeps them all (`/merge`,
+`/discard`), **Discard all** removes them. It costs about one run per
+model. Stopping the turn stops every model.
+
 ### Runs at a glance
 
 - **`/runs`** — every run of the project: state, recipe, current step,
@@ -273,6 +297,10 @@ default server stays read-only.
   `.mini-ork/automations.log`. The scheduled job keeps the `PATH` of the
   shell that installed it (launchd and cron start with a bare one); after
   installing a new CLI, turn the scheduler off and on again.
+- **"claude CLI not found" when Zed is opened from the Dock.** Apps
+  started from the Dock get a bare `PATH`. `mini-ork zed setup` writes the
+  `PATH` of the shell you run it from into both Zed entries; run it again
+  (and restart Zed) after installing a new CLI.
 - **macOS GUI cannot find `mini-ork`.** The launcher path is always
   absolute in the settings file; if you moved the binary, run
   `mini-ork zed setup` again to rewire.
