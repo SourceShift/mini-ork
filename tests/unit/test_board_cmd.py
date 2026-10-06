@@ -92,3 +92,19 @@ def test_card_files_map_onto_the_project_when_the_worktree_is_gone(tmp_path: Pat
                                 "seconds": 44, "state": "done"}]
     assert fields["cost_by_stage"] == {"worker": 0.37}
     assert fields["verdict"] == "pass"
+
+
+def test_artifacts_are_grouped_for_the_run_tab(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run-x"
+    (run_dir / "evidence").mkdir(parents=True)
+    for rel in ("kickoff.md", "plan.json", "verdict.json", "framework-edit.diff",
+                "agent-editor.live.jsonl", "execute.log", "evidence/test-1.log", "notes.txt"):
+        (run_dir / rel).write_text("x")
+    groups = [(a["group"], a["path"]) for a in board_cmd._artifacts(run_dir)]
+    assert groups == [
+        ("Kickoff & plan", "kickoff.md"), ("Kickoff & plan", "plan.json"),
+        ("Results", "verdict.json"), ("Diffs", "framework-edit.diff"),
+        ("Agent output", "agent-editor.live.jsonl"), ("Logs", "execute.log"),
+        ("Evidence", "evidence/test-1.log"), ("Other", "notes.txt"),
+    ]
+    assert board_cmd._artifacts(tmp_path / "missing") == []

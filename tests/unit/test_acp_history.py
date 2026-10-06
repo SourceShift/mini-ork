@@ -284,3 +284,21 @@ def test_read_snapshot_legacy_bridge_when_no_run_id_rows(home):
     snap = history.read_snapshot(home, "run-a")
     assert len(snap["llm_calls"]) == 1
     assert snap["llm_calls"][0]["cost_usd"] == 2.5
+
+
+def test_kickoff_titles_skip_front_matter_and_rules() -> None:
+    from mini_ork.acp.history import _title_from_kickoff
+
+    assert _title_from_kickoff("---\nrecipe: x\ntitle: Fix the login\n---\n# Body\n") == "Fix the login"
+    assert _title_from_kickoff("---\nrecipe: x\n---\n\n# Ship it\n") == "Ship it"
+    assert _title_from_kickoff("***\n\n## Real title\n") == "Real title"
+    assert _title_from_kickoff("# Plain\n") == "Plain"
+    assert _title_from_kickoff("---\n") == ""
+
+
+def test_kickoff_title_prefers_a_heading_over_a_preamble() -> None:
+    from mini_ork.acp.history import _title_from_kickoff
+
+    text = "---\nrecipe: x\n---\n> **RULE (binding): every jest run…**\n\n# acq-wave5 — step W5-40\n"
+    assert _title_from_kickoff(text) == "acq-wave5 — step W5-40"
+    assert _title_from_kickoff("> **Note:** keep it short\n") == "Note: keep it short"

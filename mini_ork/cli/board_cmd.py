@@ -197,8 +197,95 @@ def run_card(home: Path, run_id: str) -> dict[str, Any]:
                      "added": st.get("added", 0), "removed": st.get("removed", 0),
                      "files": st.get("files") or []}
     markdown = render_card(card, now=int(time.time()), serve_url=None)
+    run_dir = home / "runs" / run_id
     return {"ok": True, "run_id": run_id, "markdown": markdown, "workspace": workspace,
-            "card": _card_fields(card, home.absolute().parent)}
+            "card": _card_fields(card, home.absolute().parent),
+            "kickoff": _kickoff(home, run_id),
+            "artifacts": _artifacts(run_dir),
+            "diff": _unified_diff(run_dir)}
+
+
+_KICKOFF_LIMIT = 20_000
+_DIFF_LIMIT = 300_000
+_ARTIFACT_LIMIT = 400
+
+
+def _kickoff(home: Path, run_id: str) -> dict[str, Any]:
+    from mini_ork.acp.history import _read_kickoff
+    from mini_ork.web.deps import db_for
+
+    path = None
+    try:
+        rows = db_for(home).rows("SELECT kickoff_path FROM task_runs WHERE id = ?", (run_id,))
+        path = (rows[0].get("kickoff_path") if rows else None) or None
+    except Exception:  # noqa: BLE001
+        path = None
+    text = _read_kickoff(home, run_id, path)
+    if not path:
+        inbox = home / "runs-inbox" / f"{run_id}.md"
+        path = str(inbox) if inbox.is_file() else None
+    return {"path": path, "text": text[:_KICKOFF_LIMIT], "truncated": len(text) > _KICKOFF_LIMIT}
+
+
+def _artifact_group(rel: str) -> str:
+    name = rel.rsplit("/", 1)[-1].lower()
+    if rel.startswith("evidence/"):
+        return "Evidence"
+    if name.endswith((".diff", ".patch")) or name == "acp-diffs.json":
+        return "Diffs"
+    if "kickoff" in name or name in {"plan.json", "run_profile.json", "profile-answers.json",
+                                     "context-pack.json"}:
+        return "Kickoff & plan"
+    if name == "verdict.json" or name.startswith(("verifier_", "review", "implementer-summary")):
+        return "Results"
+    if name.startswith(("agent-", "lens-", "impl-")) or rel.startswith("sessions/"):
+        return "Agent output"
+    if name.endswith(".log"):
+        return "Logs"
+    return "Other"
+
+
+_GROUP_ORDER = ["Kickoff & plan", "Results", "Diffs", "Agent output", "Logs", "Evidence", "Other"]
+
+
+def _artifacts(run_dir: Path) -> list[dict[str, Any]]:
+    """Every file the run wrote, grouped and ordered for the run tab."""
+    if not run_dir.is_dir():
+        return []
+    out: list[dict[str, Any]] = []
+    for path in sorted(run_dir.rglob("*")):
+        if len(out) >= _ARTIFACT_LIMIT:
+            break
+        if not path.is_file():
+            continue
+        rel = path.relative_to(run_dir).as_posix()
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        out.append({"path": rel, "abs": str(path), "size": stat.st_size,
+                    "modified": int(stat.st_mtime), "group": _artifact_group(rel)})
+    out.sort(key=lambda a: (_GROUP_ORDER.index(a["group"]), a["path"]))
+    return out
+
+
+def _unified_diff(run_dir: Path) -> str:
+    """The run's change as a unified diff (its recorded diff when there is one)."""
+    import difflib
+
+    from mini_ork.acp import diffs
+
+    try:
+        entries, _cached = diffs.cached_or_computed(run_dir)
+    except Exception:  # noqa: BLE001
+        return ""
+    chunks: list[str] = []
+    for entry in entries or []:
+        path = str(entry.get("path") or "")
+        old = (entry.get("old_text") or "").splitlines(keepends=True)
+        new = (entry.get("new_text") or "").splitlines(keepends=True)
+        chunks.extend(difflib.unified_diff(old, new, fromfile=f"a/{path}", tofile=f"b/{path}"))
+    return "".join(chunks)[:_DIFF_LIMIT]
 
 
 def _project_file(path: str, project: Path) -> tuple[str, str | None]:

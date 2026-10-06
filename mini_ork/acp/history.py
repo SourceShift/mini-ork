@@ -74,11 +74,37 @@ def _read_kickoff(home: Path, run_id: str, kickoff_path: str | None) -> str:
 
 
 def _title_from_kickoff(text: str) -> str:
-    """First non-empty line, stripped of leading ``#``, capped at 80 chars."""
-    for line in text.splitlines():
+    """The kickoff's title, capped at 80 chars.
+
+    A leading front-matter block (``---`` … ``---``) is skipped — its
+    ``title:`` is used when it has one — and separator lines (``---``,
+    ``***``, ``===``) are never a title. Then the first heading in the first
+    60 lines, else the first non-empty line (``#``, ``>`` and ``**`` stripped).
+    """
+    lines = text.splitlines()
+    i = 0
+    while i < len(lines) and not lines[i].strip():
+        i += 1
+    if i < len(lines) and lines[i].strip() == "---":
+        end = next((j for j in range(i + 1, len(lines)) if lines[j].strip() == "---"), None)
+        if end is not None:
+            for line in lines[i + 1:end]:
+                key, sep, value = line.partition(":")
+                if sep and key.strip().lower() == "title" and value.strip():
+                    return value.strip().strip("'\"")[:80]
+            i = end + 1
+    body = lines[i:]
+    # A heading near the top names the task better than a preamble line
+    # (kickoffs often open with a quoted rule or a note).
+    for line in body[:60]:
         stripped = line.strip()
-        if stripped:
+        if stripped.startswith("#") and stripped.lstrip("#").strip():
             return stripped.lstrip("#").strip()[:80]
+    for line in body:
+        stripped = line.strip().lstrip(">").strip().replace("**", "")
+        if not stripped or set(stripped) <= set("-*=_~#` "):
+            continue
+        return stripped.lstrip("#").strip()[:80]
     return ""
 
 
