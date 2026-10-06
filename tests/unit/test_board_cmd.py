@@ -596,28 +596,6 @@ def test_effective_lanes_honours_run_dir_agents_yaml(tmp_path: Path, monkeypatch
     assert lanes["glm_lens"] == "glm"
 
 
-def test_diff_counts_cached_reads_list_shape(home: Path) -> None:
-    """Regression guard for fix 3: the diff cache is a bare JSON list, and
-    ``_diff_counts_cached`` must parse it (the old ``raw.get("diffs")`` shape
-    always returned ``None`` and fell through to ``_diff_counts``).
-    """
-    from mini_ork.acp import fleet as acp_fleet
-
-    run_id = "r-cache"
-    _seed_run(home, run_id, "published")
-    run_dir = home / "runs" / run_id
-    run_dir.mkdir(parents=True, exist_ok=True)
-    # ``CACHE_NAME = "acp-diffs.json"`` — the same name ``diffs._write_cache``
-    # uses (``json.dump(diffs, handle)``).
-    cache_path = run_dir / acp_fleet.CACHE_NAME
-    cache_path.write_text(
-        json.dumps([{"path": "f.py", "old_text": "a\n", "new_text": "a\nb\nc\n"}])
-    )
-
-    counts = acp_fleet._diff_counts_cached(run_dir)
-    assert counts == (2, 0)
-
-
 def test_events_by_run_filters_to_lifecycle_events(home: Path) -> None:
     """Fix 4: the batched lifecycle query must mirror the per-run read at
     ``fetch_node_lifecycle_events`` and drop ``run_events`` whose type is not
@@ -673,7 +651,12 @@ def test_diffstat_written_on_first_runs_then_serves_second_call(
 ) -> None:
     """First ``_runs`` writes ``diffstat.json``; a second ``_runs`` with
     ``mini_ork.acp.diffs.run_diffs`` monkeypatched to raise still returns
-    identical counts — proves the cache short-circuits before git.
+    identical counts — proves the diffstat cache short-circuits before git.
+
+    The pre-r5 version never deleted ``acp-diffs.json`` between calls, so
+    ``cached_or_computed`` answered from that file and the test never
+    actually exercised the diffstat fast path. r5 fix 2 deletes
+    ``acp-diffs.json`` so only ``diffstat.json`` can answer 4/2.
     """
     import mini_ork.acp.diffs as acp_diffs
 
@@ -687,6 +670,14 @@ def test_diffstat_written_on_first_runs_then_serves_second_call(
     payload = json.loads(cache_path.read_text(encoding="utf-8"))
     assert payload == {"added": 4, "removed": 2, "v": 1}
 
+    # Remove the OTHER cache (``acp-diffs.json``) so only ``diffstat.json``
+    # can answer on the second call. Without this, ``cached_or_computed``
+    # reads ``acp-diffs.json`` directly and the test never exercises the
+    # diffstat path.
+    acp_cache = home / "runs" / run_id / "acp-diffs.json"
+    assert acp_cache.is_file()  # sanity: it was written by _write_diff_cache
+    acp_cache.unlink()
+
     # Second call — break the slow path so the cache MUST answer.
     def boom(*_args, **_kwargs):
         raise RuntimeError("git show forbidden")
@@ -698,6 +689,51 @@ def test_diffstat_written_on_first_runs_then_serves_second_call(
     assert len(matching) == 1
     assert matching[0]["added"] == 4
     assert matching[0]["removed"] == 2
+
+
+def test_diffstat_not_written_when_compute_fails(home: Path, monkeypatch) -> None:
+    """r5 fix 1: a compute failure in ``_diff_counts`` must NOT poison the cache.
+
+    Poll 1: ``mini_ork.acp.diffs.run_diffs`` raised — ``diffstat.json`` must
+    NOT be written (the row shows (0, 0) for this poll only).
+    Poll 2: ``run_diffs`` unpatched, real diffs in the seed — ``diffstat.json``
+    is written with real counts.
+    """
+    import mini_ork.acp.diffs as acp_diffs
+
+    run_id = "r-ds-fail-then-ok"
+    _seed_run(home, run_id, "published")
+    _write_diff_cache(home, run_id, added=7, removed=3)
+
+    cache_path = home / "runs" / run_id / "diffstat.json"
+
+    # Poll 1: slow path blows up; cache must NOT be written.
+    def boom(*_args, **_kwargs):
+        raise RuntimeError("git show forbidden")
+
+    monkeypatch.setattr(acp_diffs, "run_diffs", boom)
+    board_cmd._runs(home)
+    assert not cache_path.exists(), (
+        "compute failure must not persist (0, 0) — that poisons the cache "
+        "and hides future real counts"
+    )
+
+    # Poll 2: drop the patch AND the OTHER cache so ``cached_or_computed``
+    # must run ``run_diffs`` and succeed. ``diffstat.json`` appears with
+    # real counts.
+    monkeypatch.undo()
+    acp_cache = home / "runs" / run_id / "acp-diffs.json"
+    if acp_cache.is_file():
+        acp_cache.unlink()
+
+    # Seed a real diff cache so ``cached_or_computed`` can answer via
+    # ``run_diffs(write_cache=False)`` without needing a git repo.
+    _write_diff_cache(home, run_id, added=7, removed=3)
+
+    board_cmd._runs(home)
+    assert cache_path.is_file()
+    payload = json.loads(cache_path.read_text(encoding="utf-8"))
+    assert payload == {"added": 7, "removed": 3, "v": 1}
 
 
 def test_diffstat_never_written_for_working_run(home: Path) -> None:

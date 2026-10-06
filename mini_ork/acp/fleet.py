@@ -22,7 +22,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from mini_ork.acp.diffs import CACHE_NAME, cached_or_computed
+from mini_ork.acp.diffs import cached_or_computed
 from mini_ork.acp.history import list_runs
 from mini_ork.acp.task_state import MARKS, run_mark, task_state
 
@@ -162,90 +162,6 @@ def _format_duration(seconds: int) -> str:
     if hours > 0:
         return f"{hours}h{minutes:02d}m"
     return f"{minutes}m{secs:02d}s"
-
-
-def _diff_counts(run_dir: Path) -> tuple[int, int]:
-    """``(added, removed)`` from the cached diff list; ``(0, 0)`` on any miss.
-
-    Reuses ``task_state._diff_counts``'s contract: only the ``+``/``-``
-    content lines count, ``+++``/``---`` headers are filtered, and a per-file
-    failure is silent. We do NOT call ``cached_or_computed`` directly here —
-    callers that need ``from_cache`` should call it once and pass the bool.
-    """
-    try:
-        diffs, _ = cached_or_computed(run_dir)
-    except Exception:  # noqa: BLE001 — best-effort
-        return 0, 0
-    added = 0
-    removed = 0
-    for entry in diffs:
-        if not isinstance(entry, dict):
-            continue
-        old_text = entry.get("old_text") or ""
-        new_text = entry.get("new_text") or ""
-        try:
-            for line in difflib.unified_diff(
-                old_text.splitlines(), new_text.splitlines(), lineterm=""
-            ):
-                if line.startswith("+++") or line.startswith("---"):
-                    continue
-                if line.startswith("+"):
-                    added += 1
-                elif line.startswith("-"):
-                    removed += 1
-        except Exception:  # noqa: BLE001
-            continue
-    return added, removed
-
-
-def _diff_counts_cached(run_dir: Path) -> tuple[int, int] | None:
-    """``(added, removed)`` from the cached diff list only — ``None`` when no cache.
-
-    ``_diff_counts`` falls through to ``run_diffs`` on a miss, which costs a
-    ``git show`` per file. On a 200-row ``board --json`` we already paid for
-    the candidates; never pay for diffs we cannot render cheaply.
-    """
-    cache = run_dir / CACHE_NAME
-    if not cache.is_file():
-        return None
-    try:
-        raw = json.loads(cache.read_text(encoding="utf-8"))
-    except (OSError, ValueError, json.JSONDecodeError):
-        return None
-    # The cache writer at ``diffs._write_cache`` dumps a bare list, NOT a dict
-    # with a ``"diffs"`` key — so the old ``raw.get("diffs")`` always returned
-    # ``None`` and the function fell through to ``_diff_counts`` for every run.
-    # Accept both shapes (a stale dict-shaped cache from older versions still
-    # degrades to "no cache" instead of crashing).
-    if isinstance(raw, list):
-        entries: list[Any] = raw
-    elif isinstance(raw, dict):
-        raw_entries = raw.get("diffs")
-        entries = raw_entries if isinstance(raw_entries, list) else []
-    else:
-        entries = []
-    if not entries:
-        return None
-    added = 0
-    removed = 0
-    for entry in entries:
-        if not isinstance(entry, dict):
-            continue
-        old_text = entry.get("old_text") or ""
-        new_text = entry.get("new_text") or ""
-        try:
-            for line in difflib.unified_diff(
-                old_text.splitlines(), new_text.splitlines(), lineterm=""
-            ):
-                if line.startswith("+++") or line.startswith("---"):
-                    continue
-                if line.startswith("+"):
-                    added += 1
-                elif line.startswith("-"):
-                    removed += 1
-        except Exception:  # noqa: BLE001
-            continue
-    return added, removed
 
 
 def _events_by_run(home: Path, run_ids: list[str]) -> dict[str, list[dict[str, Any]]]:
@@ -574,21 +490,12 @@ def fleet_rows(
         added = 0
         removed = 0
         if precise_state == "done":
-            # ``task_state`` rule 4 (``mini_ork/acp/task_state.py``) already
-            # consulted the per-run ``diffstat.json`` cache before computing
-            # counts and wrote it on a miss. Reusing ``ts.added/removed`` is
-            # therefore a sub-millisecond read on the second poll — no
-            # ``git show``, no ``cached_or_computed`` fallback. The cache
-            # read happens in ``task_state`` so both projection call sites
-            # (``task_state`` rule 4 and ``fleet_rows``) spawn zero ``git``
-            # processes for a cached terminal row. The pre-r4 fallback that
-            # re-ran ``_diff_counts(run_dir)`` on a zero result was the
-            # dominant cost on the researcher home (~92 subprocesses per
-            # poll); it is gone. ``run_diffs(write_cache=False)`` (the
-            # ``cached_or_computed`` caller at ``diffs.py:272``) is
-            # distinct from ``run_diffs(write_cache=True)`` (the page-build
-            # path at ``diffs.py:190``); only the latter populates the
-            # run-produced ``acp-diffs.json``.
+            # ``task_state`` rule 4 already read or wrote the per-run
+            # ``diffstat.json`` cache, so ``ts.added/removed`` is a sub-ms
+            # read on the second poll — no git, no ``cached_or_computed``
+            # fallback. ``run_diffs`` defaults to ``write_cache=True``;
+            # ``cached_or_computed`` (``diffs.py:272``) passes
+            # ``write_cache=False``.
             added, removed = ts.added, ts.removed
 
         mark = MARKS.get(precise_state, MARKS["working"])

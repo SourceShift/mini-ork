@@ -19,6 +19,7 @@ from __future__ import annotations
 import difflib
 import json
 import os
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -159,8 +160,7 @@ def _failing_node(events: list[dict[str, Any]]) -> tuple[str, str] | None:
 def _diffstat_cached(run_dir: Path) -> tuple[int, int] | None:
     """``(added, removed)`` from the persisted diffstat cache; ``None`` on miss.
 
-    Mirrors the ``_diff_counts_cached`` shape (``fleet.py:201-248``) but
-    reads the per-run ``diffstat.json`` we write below. Three swallow
+    Reads the per-run ``diffstat.json`` we write below. Three swallow
     cases — missing file, parse failure, wrong schema version — all
     degrade to a slow-path recompute in the caller. The ``v: 1`` gate
     lets a future writer bump the version and silently retire the old
@@ -186,37 +186,56 @@ def _diffstat_cached(run_dir: Path) -> tuple[int, int] | None:
 def _write_diffstat(run_dir: Path, added: int, removed: int) -> None:
     """Best-effort atomic write of ``diffstat.json`` for a terminal run.
 
-    Temp file + ``os.replace`` so a concurrent poll never reads a
-    half-written cache. ``OSError`` swallowed so a read-only home
-    degrades to "no cache" — the next poll falls through to the slow
-    path. Never raises. Never writes for working/needs_you rows; the
-    caller (``task_state`` rule 4) guards on the terminal-state
-    branch.
+    Per-writer temp file (``tempfile.mkstemp`` in the run dir) + ``os.replace``
+    so a concurrent poll never reads a half-written cache AND two polls racing
+    on the same run never collide on a shared ``diffstat.json.tmp`` name.
+    ``dir=str(run_dir)`` keeps the rename atomic (same filesystem). ``OSError``
+    swallowed so a read-only home degrades to "no cache" — the next poll falls
+    through to the slow path. Never raises. Never writes for working /
+    needs_you rows; the caller (``task_state`` rule 4) guards on the
+    terminal-state branch.
     """
     target = Path(run_dir) / DIFFSTAT_NAME
     payload = {"added": int(added), "removed": int(removed), "v": DIFFSTAT_VERSION}
+    fd: int | None = None
+    tmp_path: str | None = None
     try:
-        tmp = target.with_name(target.name + ".tmp")
-        tmp.write_text(json.dumps(payload), encoding="utf-8")
-        os.replace(tmp, target)
+        fd, tmp_path = tempfile.mkstemp(
+            dir=str(run_dir), prefix=".diffstat-", suffix=".tmp"
+        )
+        with os.fdopen(fd, "w", encoding="utf-8") as h:
+            h.write(json.dumps(payload))
+        os.replace(tmp_path, target)
     except OSError:
-        pass
+        # Best-effort: drop the temp file if it survived, so the next poll
+        # does not inherit a stale ``.diffstat-XXXX.tmp`` blob.
+        if tmp_path is not None:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
 
 
-def _diff_counts(run_dir: Path) -> tuple[int, int]:
-    """``(added, removed)`` from the cached diff list; ``(0, 0)`` on any miss.
+def _diff_counts(run_dir: Path) -> tuple[int, int] | None:
+    """``(added, removed)`` from the cached diff list; ``None`` on a hard failure.
 
     ``cached_or_computed`` swallows every failure (no DB, no cache,
     no git) and returns ``(diffs, from_cache)``; the count loop is
     defensive against a per-file failure inside ``difflib``. Filters
     the ``+++``/``---`` headers so they do not count as content lines.
+
+    Returns ``None`` when the OUTER compute path (DB / git / cache
+    parse) fails so the caller can leave the row at ``(0, 0)`` for
+    this poll only and retry next poll — *never* persist a
+    failure as ``(0, 0)`` (r5 fix 1, the r4 cache-poisoning trap).
+    A successful zero diff returns ``(0, 0)`` legitimately.
     """
     try:
         from mini_ork.acp.diffs import cached_or_computed
 
         diffs, _ = cached_or_computed(Path(run_dir))
-    except Exception:  # noqa: BLE001 — count is best-effort
-        return 0, 0
+    except Exception:  # noqa: BLE001 — outer compute failure → no cache
+        return None
     added = 0
     removed = 0
     for entry in diffs:
@@ -340,8 +359,15 @@ def task_state(run_dir: Path, snapshot: dict[str, Any]) -> TaskState:
             if cached_counts is not None:
                 added, removed = cached_counts
             else:
-                added, removed = _diff_counts(path)
-                _write_diffstat(path, added, removed)
+                # Only cache a *successful* computation (r5 fix 1): a
+                # compute failure (None) leaves the row at (0, 0) for
+                # this poll only and is retried next poll — the r4
+                # cache-poisoning trap was that (0, 0) was persisted
+                # as a real result.
+                computed = _diff_counts(path)
+                if computed is not None:
+                    added, removed = computed
+                    _write_diffstat(path, added, removed)
         return TaskState(
             state="done",
             detail=PUBLISHED_DETAIL,
