@@ -103,25 +103,38 @@ Every thread and run title starts with its state, updated live:
 So the thread list in the Agent Panel works as a task board: start several
 threads, and the ✋ ones are the ones waiting for you.
 
-### Every task in its own worktree
+### The task board: one task = one thread in one worktree
 
-With **Workspace** set to *New worktree per task* (the default), each run
-started from a thread works in its own git worktree,
-`.mini-ork/worktrees/<run id>`, on its own branch, `mini-ork/<run id>`. Your
-checkout is never touched, so several tasks can run at once without
-stepping on each other. If `.mini-ork/worktree-setup.sh` exists it runs in
-each new worktree first — the place to copy `.env` or install
-dependencies. A project that is not a git repo runs in place.
+Zed already has the panels for working on several tasks at once — the
+**Threads Sidebar** (one row per thread, with its status), the **worktree
+picker** in the title bar, and the **Git panel** with the files and changes
+of the worktree you are in. mini-ork works inside them:
 
-When a run finishes with changes, its thread shows **✋ … — ready to
-review +a −r**, the change is already in the thread as diffs, and you
-decide with the buttons under the run: **Merge into `<branch>`**,
-**Discard changes** or **Keep for later**. Merge fast-forwards when it can
-and uses the task's title as the commit message; it refuses, and keeps
-the worktree, when your checkout has uncommitted edits to the same files.
-Any time later: `/workspaces` lists the open ones, `/merge [run]` and
-`/discard [run]` act on one. The orchestrator never merges or discards for
-you.
+1. Run `mini-ork zed setup --layout` once (then restart Zed): threads and
+   the agent dock on the left, the Git and Project panels on the right. In an
+   open window, **Panel Layout > Agentic** does the same.
+2. For each task, open the **worktree picker** in the title bar → new
+   worktree, and start a **mini-ork** thread there.
+3. Ask for the task. The run works in that worktree: the thread's row in the
+   sidebar shows ● while it works, the Git panel on the right shows the files
+   and +/− as they change, and the row turns **✋ … — ready to review +a −r**
+   when it is done.
+4. Decide with the buttons under the run: **Merge into `<branch>`**,
+   **Discard changes** or **Keep for later**. Merge lands the change on your
+   main checkout's branch (fast-forward when it can, the task's title as the
+   commit message) and keeps the worktree — Zed owns it; archive the thread
+   to remove it. Discard resets the worktree, but only if it was clean when
+   the run started.
+
+A thread in the main checkout with **Workspace** set to *New worktree per
+task* creates the worktree itself, where Zed keeps its own
+(`git.worktree_directory`, default `../worktrees/<project>/`; set
+`MO_WORKTREE_DIR` to change it), named after the task — open it from the
+worktree picker to see its changes. *In place* edits your checkout. If
+`.mini-ork/worktree-setup.sh` exists it runs in each new worktree first (copy
+`.env`, install dependencies). `/workspaces` lists the open ones; `/merge
+[run]` and `/discard [run]` act on one. The orchestrator never merges or
+discards for you.
 
 ### Runs stream into the thread
 
