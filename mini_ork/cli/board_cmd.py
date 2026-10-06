@@ -10,6 +10,8 @@ truth.
   board run <run_id> [--home H]       one run's card (markdown) + its open workspace
   board merge|discard <run_id>        act on a run's workspace
   board stop <run_id>                 soft-stop a running run
+  board page <key> [--tab T] [--arg k=v ...]
+                                      one IDE page as data (mini_ork.ide_pages)
 
 Every section is computed independently: a section that fails comes back
 empty with its error in ``errors`` instead of failing the whole board.
@@ -166,8 +168,11 @@ def board(home: Path) -> dict[str, Any]:
     """The whole board for ``home`` — see the module docstring."""
     errors: dict[str, str] = {}
     runs, counts = _section(errors, "runs", lambda: _runs(home), ([], {}))
+    from mini_ork.ide_pages.header import header
+
     return {
         "version": 1,
+        "header": _section(errors, "header", lambda: header(home, counts), {}),
         "project": home.absolute().parent.name,
         "home": str(home.absolute()),
         "generated_at": int(time.time()),
@@ -370,20 +375,29 @@ def main(rest: list[str], root: str) -> int:
     del root
     parser = argparse.ArgumentParser(prog="mini-ork board", add_help=False)
     parser.add_argument("verb", nargs="?", default="show",
-                        choices=["show", "run", "merge", "discard", "stop"])
+                        choices=["show", "run", "merge", "discard", "stop", "page"])
     parser.add_argument("run_id", nargs="?")
     parser.add_argument("--home", default=None)
     parser.add_argument("--json", action="store_true")
+    parser.add_argument("--tab", default=None)
+    parser.add_argument("--arg", action="append", default=[])
     try:
         args = parser.parse_args(rest)
     except SystemExit:
-        sys.stderr.write("usage: mini-ork board [run|merge|discard|stop <run_id>] [--home H] [--json]\n")
+        sys.stderr.write("usage: mini-ork board [run|merge|discard|stop <run_id>] "
+                         "[page <key> [--tab T] [--arg k=v]] [--home H] [--json]\n")
         return 2
     home = (Path(args.home) if args.home else _default_home()).expanduser().absolute()
     if args.verb != "show" and not args.run_id:
-        sys.stderr.write(f"mini-ork board {args.verb}: a run id is required\n")
+        what = "a page key" if args.verb == "page" else "a run id"
+        sys.stderr.write(f"mini-ork board {args.verb}: {what} is required\n")
         return 2
-    if args.verb == "show":
+    if args.verb == "page":
+        from mini_ork.ide_pages import build_page
+
+        page_args = dict(a.split("=", 1) for a in args.arg if "=" in a)
+        payload = build_page(home, args.run_id, args.tab, page_args)
+    elif args.verb == "show":
         payload = board(home)
     elif args.verb == "run":
         payload = run_card(home, args.run_id)
