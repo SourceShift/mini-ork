@@ -16,6 +16,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass
 from typing import Callable
 
@@ -1498,6 +1499,206 @@ def _revert_inplace_diff(run_dir: str, root: str) -> bool:
     return True
 
 
+def _run_git(args: list[str], cwd: str, *, env: dict | None = None) -> subprocess.CompletedProcess:
+    """Non-raising git runner for the salvage path.
+
+    ``_salvage_before_revert``'s failure policy must catch EVERY git failure and
+    log it — nothing there may raise out of ``_handle_rollback``. This seam also
+    gives the failure-policy test a single injection point (monkeypatch it to
+    make ``commit-tree``/``diff`` fail while the rest of the capture succeeds).
+    """
+    return subprocess.run(["git", "-C", cwd, *args], capture_output=True,
+                          env={**os.environ, **(env or {})})
+
+
+def _review_diff_paths(diff_path: str) -> list[str]:
+    """The paths named by a ``git diff`` patch's ``diff --git a/X b/Y`` headers.
+
+    Best-effort, mirroring ``_revert_inplace_diff``'s numstat parsing: the
+    destination always begins with `` b/`` and the source with ``a/``, so the
+    split is stable even when a path contains spaces.
+    """
+    paths: list[str] = []
+    try:
+        with open(diff_path, errors="surrogateescape") as fh:
+            for line in fh:
+                if not line.startswith("diff --git "):
+                    continue
+                rest = line[len("diff --git "):].rstrip("\n")
+                if " b/" in rest:
+                    lhs, rhs = rest.split(" b/", 1)
+                    if lhs.startswith("a/"):
+                        paths.append(lhs[2:])
+                    if rhs:
+                        paths.append(rhs)
+                elif rest.startswith("a/"):
+                    paths.append(rest[2:])
+    except OSError:
+        pass
+    return paths
+
+
+def _pre_untracked_set(untracked_path: str) -> set[str]:
+    """The run-start untracked inventory (one path per line, ``surrogateescape``)."""
+    try:
+        with open(untracked_path, errors="surrogateescape") as fh:
+            return {ln.rstrip("\n") for ln in fh if ln.strip()}
+    except OSError:
+        return set()
+
+
+def _untracked_now(repo: str) -> set[str]:
+    """Untracked paths in the target repo right now, ``\\0``-split like the
+    preflight inventory (``git ls-files -z --others --exclude-standard``)."""
+    r = _run_git(["ls-files", "-z", "--others", "--exclude-standard"], repo)
+    if r.returncode != 0:
+        return set()
+    return {p for p in r.stdout.decode("utf-8", "surrogateescape").split("\0") if p}
+
+
+def _salvage_before_revert(root: str, run_dir: str, run_id: str) -> dict | None:
+    """Snapshot the run's change set into a restorable git object, BEFORE a
+    revert destroys it. Operator rule: a failed run must never throw the
+    agent's work away.
+
+    Captures exactly the run's paths — ``files_changed``, the ``review-diff.patch``
+    headers, and files untracked now that were not untracked at run start —
+    into ``refs/mini-ork/salvage/<run_id>`` (a commit parented on HEAD) via a
+    TEMP index so the real index, working tree, HEAD and every branch stay
+    untouched. Writes ``salvage.patch`` and ``salvage.json`` to the run dir.
+
+    Returns:
+        ``None`` when there is nothing to capture (normal revert proceeds).
+        A dict when capture was attempted, with ``saved`` True when either the
+        ref or a non-empty patch exists — False means the caller must skip the
+        revert rather than destroy unsaved work.
+    """
+    def log(msg):
+        print(msg, file=sys.stderr, flush=True)
+
+    target_repo = context_env("MO_TARGET_CWD", "")
+    if not target_repo:
+        try:
+            target_repo = subprocess.check_output(
+                ["git", "-C", root or ".", "rev-parse", "--show-toplevel"],
+                stderr=subprocess.DEVNULL).decode().strip()
+        except Exception:
+            target_repo = root or "."
+    real_root = os.path.realpath(target_repo)
+
+    # 1. Gather candidate paths from all three sources.
+    paths: list[str] = list(_run_changed_files(run_dir))
+    review = os.path.join(run_dir, "review-diff.patch") if run_dir else ""
+    if review and os.path.isfile(review):
+        paths.extend(_review_diff_paths(review))
+    pre_unt = os.path.join(run_dir, "pre-implementer-untracked") if run_dir else ""
+    if pre_unt and os.path.isfile(pre_unt):
+        pre = _pre_untracked_set(pre_unt)
+        paths.extend(sorted(_untracked_now(real_root) - pre))
+
+    # 2. Keep only paths strictly inside the target repo; drop run-dir and git
+    #    internals so unrelated dirt is never captured.
+    rels: list[str] = []
+    for raw in sorted({p for p in paths if p}):
+        ap = raw if os.path.isabs(raw) else os.path.join(real_root, raw)
+        real = os.path.realpath(ap)
+        if real == real_root or not real.startswith(real_root + os.sep):
+            log(f"  [rollback] salvage: skipping path outside target repo: {raw}")
+            continue
+        rel = os.path.relpath(real, real_root)
+        if rel.startswith(".mini-ork/runs" + os.sep) or rel == ".mini-ork/runs":
+            continue
+        if rel.startswith(".git" + os.sep) or rel == ".git":
+            continue
+        rels.append(rel)
+    if not rels:
+        return None
+
+    # 3. Base = HEAD (deliberate: the temp index is seeded from HEAD, so a
+    #    concurrent session's pre-existing dirt is naturally absent).
+    base = _run_git(["rev-parse", "HEAD"], real_root).stdout.decode(errors="replace").strip()
+    if not base:
+        log("  [warn] rollback: salvage could not resolve HEAD — nothing saved")
+        return {"saved": False, "ref": "", "sha": "", "base": "", "files": rels, "restore": []}
+
+    # 4. Temp index → read-tree HEAD → add -A -- <paths> → write-tree →
+    #    commit-tree (explicit identity: CI runners have none) → update-ref.
+    sha, ref = "", ""
+    try:
+        with tempfile.TemporaryDirectory(prefix="mo-salvage-idx-") as td:
+            env = {"GIT_INDEX_FILE": os.path.join(td, "index")}
+            if _run_git(["read-tree", "HEAD"], real_root, env=env).returncode != 0:
+                raise RuntimeError("read-tree failed")
+            if _run_git(["add", "-A", "--", *rels], real_root, env=env).returncode != 0:
+                raise RuntimeError("git add failed")
+            tree = _run_git(["write-tree"], real_root, env=env).stdout.decode(errors="replace").strip()
+            if not tree:
+                raise RuntimeError("write-tree produced no tree")
+            msg = f"mini-ork salvage: run {run_id} ({len(rels)} files)"
+            commit = _run_git(
+                ["-c", "user.name=mini-ork", "-c", "user.email=mini-ork@localhost",
+                 "commit-tree", tree, "-p", "HEAD", "-m", msg],
+                real_root).stdout.decode(errors="replace").strip()
+            if not commit:
+                raise RuntimeError("commit-tree produced no commit")
+            sha = commit
+            ref = f"refs/mini-ork/salvage/{run_id}"
+            up = _run_git(["update-ref", ref, sha], real_root)
+            if up.returncode != 0:
+                ref = ""
+                log(f"  [warn] rollback: salvage ref update refused: "
+                    f"{up.stderr.decode(errors='replace').strip()}")
+    except Exception as exc:
+        log(f"  [warn] rollback: salvage ref not created: {exc}")
+        sha = ""
+
+    # 5. salvage.patch — from the commit when one exists, else a scoped
+    #    ``git diff --binary HEAD -- <paths>`` (created files are already copied
+    #    under rolled-back-created/ by _preserve_created during the revert).
+    patch_path = os.path.join(run_dir, "salvage.patch") if run_dir else ""
+    patch_saved = False
+    if patch_path:
+        try:
+            diff_args = ["diff", "--binary", "HEAD", sha] if sha else \
+                ["diff", "--binary", "HEAD", "--", *rels]
+            d = _run_git(diff_args, real_root)
+            if d.returncode == 0 and d.stdout.strip():
+                with open(patch_path, "wb") as fh:
+                    fh.write(d.stdout)
+                patch_saved = os.path.getsize(patch_path) > 0
+            elif d.returncode != 0:
+                log(f"  [warn] rollback: salvage.patch diff failed: "
+                    f"{d.stderr.decode(errors='replace').strip()}")
+        except Exception as exc:
+            log(f"  [warn] rollback: salvage.patch not written: {exc}")
+
+    saved = bool(ref) or patch_saved
+    restore: list[str] = []
+    if sha:
+        restore.append(f"git checkout {sha} -- {' '.join(rels)}")
+    if patch_saved:
+        restore.append(f"git apply {patch_path}")
+
+    # 6. salvage.json — the operator-facing restore instructions.
+    if saved:
+        doc = {"ref": ref, "sha": sha, "base": base, "files": rels, "restore": restore}
+        try:
+            with open(os.path.join(run_dir, "salvage.json"), "w", encoding="utf-8") as fh:
+                json.dump(doc, fh, indent=2)
+        except OSError as exc:
+            log(f"  [warn] rollback: salvage.json not written: {exc}")
+
+    if ref:
+        short = sha[:12]
+        print(f"[salvage] {len(rels)} file(s) from run {run_id} saved before rollback "
+              f"→ {ref} ({short}). Restore: git checkout {short} -- <files>  |  "
+              f"git apply {patch_path}", file=sys.stderr, flush=True)
+    elif saved:
+        print(f"[salvage] {len(rels)} file(s) from run {run_id} saved as a patch only "
+              f"(no ref) → {patch_path}", file=sys.stderr, flush=True)
+    return {"saved": saved, "ref": ref, "sha": sha, "base": base, "files": rels, "restore": restore}
+
+
 def _handle_rollback(ctx: NodeDispatch):
     # F4: bash (:3205-3223) does a best-effort version_rollback (workflow then
     # agent), succeeds regardless of whether a prior version exists, sets
@@ -1512,6 +1713,7 @@ def _handle_rollback(ctx: NodeDispatch):
     # was a guaranteed no-op that still set reverted=True and printed success.
     reverted = False
     run_dir = ctx.run_dir_eff or ctx.run_dir
+    run_id = ctx.run_id or (os.path.basename(run_dir.rstrip(os.sep)) if run_dir else "")
     changed = _run_changed_files(run_dir)
     try:
         rows = _vr.targets_for_paths(changed, db=ctx.db)
@@ -1555,7 +1757,12 @@ def _handle_rollback(ctx: NodeDispatch):
                   "edit (an outer loop owns verification; an in-sandbox revert would destroy the fix)",
                   file=sys.stderr, flush=True)
         else:
-            _revert_working_tree(ctx.root, ctx.run_dir_eff or ctx.run_dir)
+            salvage = _salvage_before_revert(ctx.root, run_dir, run_id)
+            if salvage is not None and not salvage.get("saved"):
+                print("  [warn] rollback: work could not be saved — leaving the working tree as-is",
+                      file=sys.stderr, flush=True)
+            else:
+                _revert_working_tree(ctx.root, run_dir)
     elif strategy == "keep_run_artifacts_discard_worktree":
         # Declared by recipes/framework-edit/workflow.yaml and
         # recipes/self-migrate/workflow.yaml, implemented nowhere before this:
@@ -1566,7 +1773,12 @@ def _handle_rollback(ctx: NodeDispatch):
                   "edit (an outer loop owns verification; an in-sandbox revert would destroy the fix)",
                   file=sys.stderr, flush=True)
         else:
-            _revert_inplace_diff(ctx.run_dir_eff or ctx.run_dir, ctx.root)
+            salvage = _salvage_before_revert(ctx.root, run_dir, run_id)
+            if salvage is not None and not salvage.get("saved"):
+                print("  [warn] rollback: work could not be saved — leaving the working tree as-is",
+                      file=sys.stderr, flush=True)
+            else:
+                _revert_inplace_diff(run_dir, ctx.root)
     print("  [ok] rollback complete")
     # NOTE: bash traces NO rollback node (:3205-3223 has no _trace_write_node_rich).
     # Tracing it with status=success would write a spurious +1-reward execution_traces
