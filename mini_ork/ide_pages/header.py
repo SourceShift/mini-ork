@@ -22,8 +22,10 @@ def _git(project: Path, *args: str) -> str:
 
 def _git_common_dir(project: Path) -> Path | None:
     """The shared git dir for ``project`` — its worktrees' ``.git/worktrees/<name>/``
-    siblings live under this path. ``None`` when ``git rev-parse`` fails or returns
-    a relative path (avoids CWD lookups)."""
+    siblings live under this path. ``None`` only when ``git rev-parse`` fails. A
+    relative common dir is resolved against the project root as a defensive
+    fallback for ancient git (pre-2.31) that ignores ``--path-format=absolute``;
+    otherwise the absolute path is returned."""
     # ``--path-format=absolute`` (git 2.31+) keeps a main-checkout ``.git`` from
     # coming back relative to the project — without it, ``header.worktrees``
     # counts zero because the relative path fails the ``is_absolute()`` check.

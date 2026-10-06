@@ -89,20 +89,27 @@ def _parser_for_action(head: str) -> argparse.ArgumentParser | None:
     per-subcommand modules (``mini_ork.cli.board_cmd.build_parser``,
     ``mini_ork.cli.automations_cmd._build_parser``, …). Look up the registry
     for the dispatch contract, then import the module and use ITS parser.
+
+    The subcommand→module wiring comes from
+    ``mini_ork.cli.main._NATIVE_MODULE_SUBS`` (read lazily here so importing
+    this test file does NOT pull the full registry at module import time and
+    break order-independence — that was the original reason the map was
+    hand-copied). The lazy import keeps the property; reading
+    ``_NATIVE_MODULE_SUBS`` directly removes the drift hazard.
     """
     from mini_ork.cli import main as cli_main
 
     registry = getattr(cli_main, "SUBCOMMAND_REGISTRY", None) or {}
     if head not in registry:
         return None
-    # Map a sub name to its parser factory. ``board`` uses the explicit
-    # ``build_parser`` (factored out for this test); every other native
-    # subcommand exposes ``_build_parser`` on its module. Built-ins like
-    # ``run``/``doctor``/``install``/``help`` don't parse IDE action argv
-    # (they don't appear as heads in any page action), so we accept a miss.
-    module_name = _SUBCOMMAND_MODULE.get(head)
+    # Authoritative map: ``mini_ork.cli.main._NATIVE_MODULE_SUBS``. Built-ins
+    # like ``run``/``doctor``/``install``/``help`` don't appear there; we
+    # fall back to the conventional ``mini_ork.cli.<head>`` path so the
+    # test still surfaces legacy module paths if the dispatcher ships a
+    # built-in that is not in ``_NATIVE_MODULE_SUBS``.
+    module_map = getattr(cli_main, "_NATIVE_MODULE_SUBS", None) or {}
+    module_name = module_map.get(head)
     if module_name is None:
-        # Best-effort: try the conventional ``mini_ork.cli.<head>`` path.
         module_name = f"mini_ork.cli.{head.replace('-', '_')}"
     try:
         module = importlib.import_module(module_name)
@@ -115,19 +122,6 @@ def _parser_for_action(head: str) -> argparse.ArgumentParser | None:
     if isinstance(parser, argparse.ArgumentParser):
         return parser
     return None
-
-
-# Maps subcommand name → module path. Mirrors the wiring in
-# ``mini_ork.cli.main._NATIVE_MODULE_SUBS``; kept inline so the test does
-# not import the dispatcher (which would pull the full registry at import
-# time and break order-independence).
-_SUBCOMMAND_MODULE: dict[str, str] = {
-    "board": "mini_ork.cli.board_cmd",
-    "automations": "mini_ork.cli.automations_cmd",
-    "nodes": "mini_ork.cli.nodes",
-    "recipe-eval": "mini_ork.cli.recipe_eval",
-    "sandbox-gc": "mini_ork.cli.sandbox_gc",
-}
 
 
 def test_every_page_builds_with_ok_true(home: Path) -> None:

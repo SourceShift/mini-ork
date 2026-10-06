@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import subprocess
 import time
 from pathlib import Path
 
@@ -36,6 +37,70 @@ def _seed_run(home: Path, run_id: str, status: str) -> None:
         (f"gr-{run_id}", "verifier.code_fix", "checks unclear", "record the checks", "{}", 0.4, now, "code_fix"))
     con.commit()
     con.close()
+
+
+def _git(args: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
+    """Real ``git`` invocation — the worktree tests run the real ``git`` binary."""
+    return subprocess.run(
+        ["git", *args],
+        cwd=str(cwd),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def _init_repo(tmp_path: Path, *, name: str = "proj") -> Path:
+    """Make a fresh temp git repo with one commit, return its path.
+
+    Mirrors ``tests/unit/test_workspaces.py:_init_repo`` so the kickoff's
+    "real temp git repos" requirement is met without sharing fixtures.
+    """
+    project = tmp_path / name
+    project.mkdir()
+    assert _git(["init", "-b", "main"], project).returncode == 0
+    _git(["config", "user.name", "Test"], project)
+    _git(["config", "user.email", "test@example.com"], project)
+    (project / "README.md").write_text("hi\n", encoding="utf-8")
+    assert _git(["add", "README.md"], project).returncode == 0
+    assert _git(["commit", "-m", "init"], project).returncode == 0
+    return project
+
+
+def _seed_run_at(home: Path, run_id: str, status: str, *, created_at: int,
+                 updated_at: int) -> None:
+    """Like ``_seed_run`` but with explicit ``created_at``/``updated_at``.
+
+    The frozen-list ``_runs`` test pins the SQL ORDER BY ``created_at DESC``
+    with equal spacing; ``int(time.time())`` would jitter between rows and
+    destroy the deterministic ordering.
+    """
+    con = sqlite3.connect(home / "state.db")
+    con.execute(
+        "INSERT INTO task_runs (id, recipe, status, cost_usd, created_at, updated_at, "
+        "task_class, kickoff_path, workflow_version) VALUES (?,?,?,?,?,?,?,?,?)",
+        (run_id, "code-fix", status, 0.5, created_at, updated_at,
+         "code_fix", "", "latest"),
+    )
+    con.commit()
+    con.close()
+
+
+def _write_diff_cache(home: Path, run_id: str, *, added: int, removed: int) -> None:
+    """Write ``<home>/runs/<id>/acp-diffs.json`` with a known ``(added, removed)``.
+
+    ``task_state._diff_counts`` reads the cache via ``cached_or_computed``;
+    each entry's ``old_text``/``new_text`` feeds ``difflib.unified_diff``
+    and counts non-``+++``/``---`` lines. ``added`` ``+`` lines and
+    ``removed`` ``-`` lines.
+    """
+    plus_lines = "\n".join(f"line{j}" for j in range(added))
+    minus_lines = "\n".join(f"old{j}" for j in range(removed))
+    run_dir = home / "runs" / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "acp-diffs.json").write_text(
+        json.dumps([{"path": "f.py", "old_text": minus_lines, "new_text": plus_lines}])
+    )
 
 
 def test_board_has_every_section(home: Path) -> None:
@@ -231,81 +296,187 @@ def test_shell_payload_uses_build_parser_when_invoked_via_main(
 def test_worktree_count_uses_common_dir_when_git_worktree_list_fails(
     tmp_path: Path, monkeypatch,
 ) -> None:
-    """``_worktree_count`` returns 1 + entries of ``<common>/worktrees/`` even
-    when ``git worktree list`` would fail. Two linked worktree dirs on disk +
-    the main checkout itself → 3."""
+    """``header.header`` reports ``worktrees == 3`` from a real temp git repo
+    even when ``git worktree list`` would fail.
+
+    The fix counts ``<common>/worktrees/`` instead of shelling out; the test
+    stands up ``git init`` + one commit + two ``git worktree add`` calls so
+    ``_git_common_dir`` discovers the real common dir through ``git rev-parse``.
+    ``subprocess.run`` is patched to raise only on argv containing ``worktree``
+    AND ``list`` — every other ``git`` call (rev-parse, branch detection)
+    runs for real. Asserts end-to-end via ``header.header(home, {})`` so the
+    real integration path is exercised (not just ``_worktree_count`` in
+    isolation). Two linked worktree dirs on disk + the main checkout itself
+    → 3.
+    """
     from mini_ork.ide_pages import header
 
-    project = tmp_path / "proj"
-    project.mkdir()
-    common = tmp_path / "common.git"
-    (common / "worktrees" / "wt-a").mkdir(parents=True)
-    (common / "worktrees" / "wt-b").mkdir(parents=True)
+    project = _init_repo(tmp_path, name="proj")
+    for name in ("wt-a", "wt-b"):
+        assert _git(["worktree", "add", "-q", "--detach", name, "HEAD"],
+                    project).returncode == 0
+    # ``header.header`` sets ``project = home.parent`` (header.py:129); the
+    # home is the project's ``.mini-ork`` so the integration runs against a
+    # real git repo while the rest of header (cost_ledger, scheduler, …)
+    # degrades gracefully via its broad except clauses.
+    home = project / ".mini-ork"
+    home.mkdir()
 
-    def _fake_common_dir(_project):
-        return common
+    real_run = subprocess.run
 
-    def _fake_git(_project, *args, **_kwargs):
-        # header.py also calls ``git rev-parse --abbrev-ref HEAD`` as a
-        # fallback for the branch line; we don't care here, but make sure it
-        # returns empty so the test does not depend on a real git binary.
-        return ""
+    def _guarded_run(argv, *args, **kwargs):
+        # Block only ``git worktree list`` — every other ``git`` call must
+        # run so ``_git_common_dir`` discovers the real common dir.
+        if isinstance(argv, (list, tuple)) and len(argv) >= 3 \
+                and argv[0] == "git" and "worktree" in argv and "list" in argv:
+            raise RuntimeError("git worktree list must not be called")
+        return real_run(argv, *args, **kwargs)
 
-    monkeypatch.setattr(header, "_git_common_dir", _fake_common_dir)
-    monkeypatch.setattr(header, "_git", _fake_git)
+    monkeypatch.setattr("subprocess.run", _guarded_run)
 
-    assert header._worktree_count(project) == 3
+    payload = header.header(home, {})
+    assert payload["worktrees"] == 3
 
 
-def test_worktree_count_resolves_relative_common_dir(tmp_path: Path, monkeypatch) -> None:
-    """The fix-2 regression: ``git rev-parse --git-common-dir`` historically
+def test_worktree_count_resolves_relative_common_dir(tmp_path, monkeypatch) -> None:
+    """The r2 fix-2 regression: ``git rev-parse --git-common-dir`` historically
     printed a relative ``.git`` for the main checkout, which made the absolute
-    check drop the count to zero. After the patch, the helper returns the
-    project root, and the count is ``1 + len(worktrees/)`` again."""
+    check drop the count to zero. After the patch, ``_git_common_dir`` resolves
+    a relative common dir against the project root and the count is
+    ``1 + len(worktrees/)`` again.
+
+    Modern git emits absolute paths under ``--path-format=absolute``, so to
+    force the relative branch we intercept ``rev-parse --git-common-dir`` and
+    return a relative ``.git`` (pre-2.31 behaviour). The test then exercises
+    the ``if not p.is_absolute()`` resolve-at-project branch in
+    ``_git_common_dir`` (header.py:34-37).
+    """
     from mini_ork.ide_pages import header
 
-    project = tmp_path / "proj"
-    project.mkdir()
-    common_rel = Path(".git")  # the relative shape before --path-format=absolute
-    real_common = tmp_path / ".git"
-    (real_common / "worktrees" / "wt-1").mkdir(parents=True)
+    project = _init_repo(tmp_path, name="proj")
+    # A single linked worktree; total expected = 2.
+    assert _git(["worktree", "add", "-q", "--detach", "wt-1", "HEAD"],
+                project).returncode == 0
 
-    def _fake_common_dir(_project):
-        return real_common  # already resolved against project by the patched path
+    home = project / ".mini-ork"
+    home.mkdir()
 
-    monkeypatch.setattr(header, "_git_common_dir", _fake_common_dir)
-    monkeypatch.setattr(header, "_git", lambda *_a, **_k: "")
-    del common_rel  # silence linters; kept only to anchor the regression intent
+    real_run = subprocess.run
 
-    assert header._worktree_count(project) == 2  # main + wt-1
+    def _guarded_run(argv, *args, **kwargs):
+        if isinstance(argv, (list, tuple)) and len(argv) >= 3 \
+                and argv[0] == "git" and "rev-parse" in argv \
+                and "--git-common-dir" in argv:
+            # Pre-historic git behaviour: emit a relative ``.git``.
+            return subprocess.CompletedProcess(argv, 0, ".git\n", "")
+        if isinstance(argv, (list, tuple)) and len(argv) >= 3 \
+                and argv[0] == "git" and "worktree" in argv and "list" in argv:
+            raise RuntimeError("git worktree list must not be called")
+        return real_run(argv, *args, **kwargs)
+
+    monkeypatch.setattr("subprocess.run", _guarded_run)
+
+    payload = header.header(home, {})
+    assert payload["worktrees"] == 2  # main + wt-1
 
 
 def test_runs_output_is_stable_against_frozen_list(home: Path) -> None:
     """``_runs`` output is identical before/after — pin the exact row shape.
 
-    The run was seeded with no kickoff on disk; ``history._title_from_kickoff``
-    therefore falls back to ``f"{recipe} run"``. Pin the shape so a future
-    change to that fallback shows up as a single-line update here.
+    Seeds 30 runs across the three observable ``task_state`` buckets
+    (done/failed/working) plus a mix of with-diffs/without-diffs, then
+    asserts against a literal expected list. The expected values are NOT
+    derived from the function's own output — that pattern let earlier
+    regressions pass silently. ``started_at``/``ended_at`` come straight
+    from the seed epoch ints (round-trip through ``_normalize_ts`` →
+    ``_iso_to_epoch`` is identity); ``added``/``removed`` come from the
+    ``acp-diffs.json`` we wrote with a known shape.
     """
-    _seed_run(home, "run-1791000000-aaaaaa", "published")
+    # ``(run_id, status, added, removed)`` — 30 rows. Insertion order
+    # doubles as ASC ``created_at``; the SQL ``ORDER BY created_at DESC``
+    # returns them reversed. Names are lexically distinct so a column
+    # swap fails loud.
+    seeds: list[tuple[str, str, int, int]] = [
+        # 11 done (published → done) — alternating with/without diffs
+        ("run-1791000001-aaaaa1", "published",  3, 1),
+        ("run-1791000002-aaaaa2", "published",  0, 0),
+        ("run-1791000003-aaaaa3", "published",  2, 2),
+        ("run-1791000004-aaaaa4", "published",  0, 0),
+        ("run-1791000005-aaaaa5", "published",  1, 1),
+        ("run-1791000006-aaaaa6", "published",  0, 0),
+        ("run-1791000007-aaaaa7", "published",  4, 0),
+        # 4 failed
+        ("run-1791000008-bbbbb1", "failed",     0, 0),
+        ("run-1791000009-bbbbb2", "failed",     0, 0),
+        ("run-1791000010-bbbbb3", "failed",     0, 0),
+        ("run-1791000011-bbbbb4", "failed",     0, 0),
+        # 15 working (executing/classified → working)
+        ("run-1791000012-ccccc1", "executing",  0, 0),
+        ("run-1791000013-ccccc2", "executing",  0, 0),
+        ("run-1791000014-ccccc3", "executing",  0, 0),
+        ("run-1791000015-ccccc4", "executing",  0, 0),
+        ("run-1791000016-ccccc5", "executing",  0, 0),
+        ("run-1791000017-ccccc6", "executing",  0, 0),
+        ("run-1791000018-ddddd1", "classified", 0, 0),
+        ("run-1791000019-ddddd2", "classified", 0, 0),
+        ("run-1791000020-ddddd3", "classified", 0, 0),
+        ("run-1791000021-ddddd4", "classified", 0, 0),
+        ("run-1791000022-ddddd5", "classified", 0, 0),
+        ("run-1791000023-eeeee1", "executing",  0, 0),
+        ("run-1791000024-eeeee2", "executing",  0, 0),
+        ("run-1791000025-eeeee3", "executing",  0, 0),
+        ("run-1791000026-eeeee4", "executing",  0, 0),
+        # 4 more done rows with diffs (deterministic tail)
+        ("run-1791000027-fffff1", "published",  5, 2),
+        ("run-1791000028-fffff2", "published",  1, 0),
+        ("run-1791000029-fffff3", "published",  0, 3),
+        ("run-1791000030-fffff4", "published",  0, 0),
+    ]
+
+    base = 1_791_000_000
+    # ``created_at``/``updated_at`` are INTEGER unix timestamps; spacing
+    # 60 s apart so DESC ordering is unambiguous.
+    for i, (run_id, status, added, removed) in enumerate(seeds):
+        ts = base + i * 60
+        _seed_run_at(home, run_id, status, created_at=ts, updated_at=ts)
+        if added or removed:
+            _write_diff_cache(home, run_id, added=added, removed=removed)
+
     runs, counts = board_cmd._runs(home)
-    assert counts == {"working": 0, "needs_you": 0, "done": 1, "failed": 0}
-    assert runs == [
-        {
-            "id": "run-1791000000-aaaaaa",
+
+    # DESC by ``created_at`` + ``rowid`` → seeds reversed.
+    expected: list[dict] = []
+    for run_id, status, added, removed in reversed(seeds):
+        ts = base + (len(seeds) - 1 - len(expected)) * 60  # newest = seeds[-1]
+        if status == "published":
+            state = "done"
+            mark = "✓"
+            ended_at: int | None = ts
+        elif status == "failed":
+            state = "failed"
+            mark = "✗"
+            ended_at = ts
+        else:
+            state = "working"
+            mark = "●"
+            ended_at = None
+        expected.append({
+            "id": run_id,
             "title": "code-fix run",
             "recipe": "code-fix",
-            "state": "done",
-            "mark": "✓",
+            "state": state,
+            "mark": mark,
             "step": "",
-            "started_at": runs[0]["started_at"],
-            "ended_at": runs[0]["ended_at"],
+            "started_at": ts,
+            "ended_at": ended_at,
             "cost_usd": 0.5,
-            "added": 0,
-            "removed": 0,
+            "added": added,
+            "removed": removed,
             "has_workspace": False,
-        },
-    ]
+        })
+
+    assert counts == {"working": 15, "needs_you": 0, "done": 11, "failed": 4}
+    assert runs == expected
 
 
 def test_import_acp_fleet_does_not_pull_in_agent_module():

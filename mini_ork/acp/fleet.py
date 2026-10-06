@@ -574,13 +574,22 @@ def fleet_rows(
         added = 0
         removed = 0
         if precise_state == "done":
-            # Use the cached diff when present; only fall through to the full
-            # computation (which costs a ``git show`` per file) when no cache
-            # exists. The cache is written by run_diffs on first read.
-            cached_counts = _diff_counts_cached(run_dir)
-            if cached_counts is not None:
-                added, removed = cached_counts
-            else:
+            # ``task_state`` rule 4 (``mini_ork/acp/task_state.py:267-278``)
+            # already called ``_diff_counts(path)`` for ``published`` rows and
+            # stored the counts on ``TaskState.added/removed``. Recomputing
+            # here paid for one ``git show`` per file via
+            # ``cached_or_computed`` → ``run_diffs(write_cache=False)`` on
+            # cold-cache rows — that was the dominant cost of ``board
+            # --shell`` (204 subprocesses per poll on the researcher home).
+            # Reuse the values already in hand. Fall back to ``_diff_counts``
+            # only when the task_state run returned zeros AND no
+            # ``acp-diffs.json`` exists — the one shape where the helper's
+            # exception swallow could mask a non-zero result that the
+            # page-build path's ``run_diffs(write_cache=True)`` had not yet
+            # written. ``_diff_counts_cached`` and ``run_diffs`` both pass
+            # ``write_cache=False``, so they never populate the cache.
+            added, removed = ts.added, ts.removed
+            if added == 0 and removed == 0 and not (run_dir / CACHE_NAME).is_file():
                 added, removed = _diff_counts(run_dir)
 
         mark = MARKS.get(precise_state, MARKS["working"])
