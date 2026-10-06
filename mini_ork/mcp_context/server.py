@@ -568,13 +568,14 @@ def _start_run(home: Path, args: dict[str, Any]) -> dict[str, Any]:
             break
         thread_cwd = Path(os.environ.get("MO_THREAD_CWD") or project_root)
         try:
-            if _workspaces.is_linked_worktree(thread_cwd):
+            if (_workspaces.is_linked_worktree(thread_cwd)
+                    and not os.environ.get("MO_DELIVER_VIA_CLIENT")):
                 # The thread runs in a (Zed) linked worktree: that worktree IS
                 # the task's workspace — the Git panel shows its changes.
                 ws = _workspaces.adopt(thread_cwd, home, pre_minted_run_id)
             else:
                 ws = _workspaces.create(
-                    project_root,
+                    thread_cwd,  # the thread's own checkout is the base
                     home,
                     pre_minted_run_id,
                     name=_workspaces.task_name(title_line, pre_minted_run_id),

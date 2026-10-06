@@ -366,6 +366,35 @@ def create(
     return ws
 
 
+def changed_paths(ws: Workspace) -> list[tuple[str, str]]:
+    """``(status, path)`` for every file the run changed against ``base_sha`` —
+    committed, uncommitted and new files alike; status ``M``, ``A`` or ``D``.
+    Paths are relative to the worktree root, sorted."""
+    found: dict[str, str] = {}
+    rc, text, _ = _git(["diff", "--name-status", "--no-renames", ws.base_sha], ws.path)
+    if rc == 0:
+        for line in text.splitlines():
+            parts = line.split("\t")
+            if len(parts) >= 2 and parts[-1]:
+                found[parts[-1]] = parts[0][:1]
+    rc, untracked, _ = _git(["ls-files", "--others", "--exclude-standard"], ws.path)
+    if rc == 0:
+        for rel in untracked.splitlines():
+            if rel.strip():
+                found[rel] = "A"
+    return [(found[p], p) for p in sorted(found)]
+
+
+def base_text(ws: Workspace, rel: str) -> str | None:
+    """The file's text at ``base_sha``; None when it did not exist there (or is
+    not text)."""
+    try:
+        rc, out, _ = _git(["show", f"{ws.base_sha}:{rel}"], ws.path)
+    except UnicodeDecodeError:
+        return None
+    return out if rc == 0 else None
+
+
 def adopt(cwd: Path, home: Path, run_id: str) -> Workspace:
     """Adopt an already-checked-out linked worktree as the run's workspace.
 

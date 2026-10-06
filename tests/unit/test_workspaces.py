@@ -560,3 +560,18 @@ def test_legacy_record_with_old_path_still_loads(tmp_path):
     assert ws.path == legacy_path
     assert ws.adopted is False  # default
     assert ws.clean_at_start is False
+
+
+def test_changed_paths_and_base_text(tmp_path: Path) -> None:
+    project = _init_repo(tmp_path)
+    home = _init_home(tmp_path)
+    (project / "gone.txt").write_text("bye\n")
+    assert _git(["add", "gone.txt"], project).returncode == 0
+    assert _git(["commit", "-m", "gone"], project).returncode == 0
+    ws = ws_mod.create(project, home, "run-changes")
+    (ws.path / "README.md").write_text("hi\nmore\n")
+    (ws.path / "fresh.md").write_text("new\n")
+    (ws.path / "gone.txt").unlink()
+    assert ws_mod.changed_paths(ws) == [("M", "README.md"), ("A", "fresh.md"), ("D", "gone.txt")]
+    assert ws_mod.base_text(ws, "README.md") == "hi\n"
+    assert ws_mod.base_text(ws, "fresh.md") is None

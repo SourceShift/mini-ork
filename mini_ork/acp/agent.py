@@ -1538,7 +1538,8 @@ class MiniOrkAcpAgent:
         if workspace_mode == _WORKSPACE_WORKTREE:
             from mini_ork import workspaces as _workspaces
             try:
-                if _workspaces.is_linked_worktree(Path(thread_cwd)):
+                if (_workspaces.is_linked_worktree(Path(thread_cwd))
+                        and not self.client_supports("fs.write")):
                     ws = _workspaces.adopt(
                         Path(thread_cwd), self._home_for(session_id), new_run_id
                     )
@@ -3196,6 +3197,13 @@ class MiniOrkAcpAgent:
         if stop == "cancelled":
             return stop  # the run may still be going; leave its marker open
         ok = stop == "end_turn" and self._run_status.get(run_id) == "published"
+        if ok and await self._deliver_to_zed(thread_id, run_id):
+            await self._emit(thread_id, ToolCallProgress(
+                session_update="tool_call_update",
+                tool_call_id=f"{run_id}:parent",
+                status="completed",
+            ))
+            return stop
         ws_ready = await self._offer_run_review(thread_id, run_id)
         if not ws_ready:
             await self._emit(
@@ -3207,6 +3215,79 @@ class MiniOrkAcpAgent:
                 ),
             )
         return stop
+
+    async def _deliver_to_zed(self, thread_id: str, run_id: str) -> bool:
+        """Hand a finished run's change to Zed as agent edits.
+
+        Each changed file is written into the thread's project through the
+        client (ACP ``fs/write_text_file``). Zed applies it as an agent edit
+        and records it in the thread's action log, so the change shows up
+        where Zed shows its own agents' work: the Threads Sidebar row's +/−,
+        the changed-files bar above the message box, Review Changes (Keep /
+        Reject per hunk), the Git panel. The run's worktree is then removed.
+
+        All or nothing: a file the user changed during the run, a binary file
+        or a deletion (ACP cannot delete) leaves the project untouched and
+        returns False, so the Merge / Discard buttons take over.
+        """
+        if self._conn is None or not self.client_supports("fs.write"):
+            return False
+        if run_id in self._skip_review:
+            return False
+        from mini_ork import workspaces as _workspaces
+
+        ws = _workspaces.load(self._home_for(run_id), run_id)
+        if ws is None or ws.adopted:
+            return False
+        thread_cwd = Path(self._sessions.get(thread_id) or ws.project)
+        rc, top, _ = _workspaces._git(["rev-parse", "--show-toplevel"], thread_cwd)
+        project = Path(top.strip()) if rc == 0 and top.strip() else thread_cwd
+        changes = _workspaces.changed_paths(ws)
+        if not changes:
+            return False
+        writes: list[tuple[Path, str]] = []
+        blocked: list[str] = []
+        for status, rel in changes:
+            if status == "D":
+                blocked.append(f"`{rel}` (the run deleted it)")
+                continue
+            try:
+                new_text = (ws.path / rel).read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                blocked.append(f"`{rel}` (not a text file)")
+                continue
+            target = project / rel
+            try:
+                current = target.read_text(encoding="utf-8") if target.is_file() else None
+            except (OSError, UnicodeDecodeError):
+                current = ""
+            if current != _workspaces.base_text(ws, rel):
+                blocked.append(f"`{rel}` (you changed it while the run worked)")
+                continue
+            writes.append((target, new_text))
+        if blocked:
+            await self._emit(thread_id, self._build_refusal_message(
+                "\n\nNot handed to your project, so nothing in it changed: "
+                + ", ".join(blocked) + ". Use the buttons below instead."))
+            return False
+        for target, new_text in writes:
+            try:
+                await self._conn.write_text_file(
+                    session_id=thread_id, path=str(target), content=new_text)
+            except Exception as exc:  # noqa: BLE001 — report and keep the worktree
+                await self._emit(thread_id, self._build_refusal_message(
+                    f"\n\nZed did not accept `{target}`: {exc}. The run's worktree is kept: "
+                    f"/merge {run_id} or /discard {run_id}."))
+                return False
+        _workspaces.discard(ws)
+        added = sum(1 for s, _ in changes if s == "A")
+        n = len(writes)
+        await self._emit(thread_id, self._build_refusal_message(
+            f"\n\nThe change is in your project now: {n} file{'s' if n != 1 else ''}"
+            + (f" ({added} new)" if added else "")
+            + ". Review it like any agent edit — **Review Changes**, or the changed-files"
+            " bar above the message box — and Keep or Reject each change."))
+        return True
 
     async def _offer_run_review(self, thread_id: str, run_id: str, *, force: bool = False) -> bool:
         """Offer Merge / Discard / Keep buttons on the run's marker when the
@@ -3477,9 +3558,13 @@ class MiniOrkAcpAgent:
         if workspace_mode:
             extra_mcp_env["MO_WORKSPACE_MODE"] = workspace_mode
         if cwd:
-            # start_run adopts the thread's worktree when it is a linked one;
-            # the MCP server only knows the home, i.e. the main checkout.
+            # start_run works from the thread's own checkout; the MCP server
+            # only knows the home, i.e. the main checkout.
             extra_mcp_env["MO_THREAD_CWD"] = str(cwd)
+        if self.client_supports("fs.write"):
+            # The agent hands finished runs to the client as agent edits, so
+            # runs must not edit the thread's checkout in place.
+            extra_mcp_env["MO_DELIVER_VIA_CLIENT"] = "1"
         return await run_turn(
             lane=lane,
             prompt=prompt,
@@ -3622,7 +3707,7 @@ class MiniOrkAcpAgent:
         run = f"run {run_id}" if run_id else "run"
         return AgentMessageChunk(
             session_update="agent_message_chunk",
-            content=TextContentBlock(type="text", text=f"mini-ork {run} finished: {status}"),
+            content=TextContentBlock(type="text", text=f"mini-ork {run} finished: {status}\n\n"),
         )
 
     def _thread_usage_update(self, thread_id: str) -> UsageUpdate:
@@ -3765,7 +3850,7 @@ class MiniOrkAcpAgent:
                     content=TextContentBlock(
                         type="text",
                         text=(
-                            f"Run {session_id}: showing the files as they are now — "
+                            f"\n\nRun {session_id}: showing the files as they are now — "
                             "they may have changed since the run."
                         ),
                     ),

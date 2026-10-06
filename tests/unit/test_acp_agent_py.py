@@ -1850,7 +1850,7 @@ def test_child_run_streams_agent_output_into_the_thread(tmp_path):
               and u.tool_call_id == f"{child}:parent"]
     assert [u.status for u in closes] == ["completed"]
     messages = [u.content.text for u in updates if isinstance(u, AgentMessageChunk)]
-    assert f"mini-ork run {child} finished: published" in messages
+    assert f"mini-ork run {child} finished: published" in [m.strip() for m in messages]
     costs = [u.cost.amount for u in updates if isinstance(u, UsageUpdate)]
     assert costs[-1] == pytest.approx(0.75)
 
@@ -5949,3 +5949,95 @@ def test_new_task_worktree_is_named_after_the_task_not_the_raw_title(tmp_path, m
     assert ws is not None
     assert ws.path.name == f"fix-the-login-redirect-{launched['rid'][-6:]}"
     assert ws.path.parent == (tmp_path / "wts" / "proj").resolve()  # Zed appends the project name
+
+
+# ── Zed: finished runs are handed to the client as agent edits ───────────────
+
+
+class _WriteConn(_ReviewConn):
+    """A client that applies ``fs/write_text_file`` like Zed and records it."""
+
+    def __init__(self, outcome_id: str | None = "keep") -> None:
+        super().__init__(outcome_id=outcome_id)
+        self.writes: list[tuple[str, str, str]] = []
+
+    async def write_text_file(self, session_id: str, path: str, content: str, **_kw):
+        self.writes.append((session_id, path, content))
+        Path(path).write_text(content, encoding="utf-8")
+        return None
+
+
+def _fs_write_caps():
+    from types import SimpleNamespace
+
+    return SimpleNamespace(fs=SimpleNamespace(read_text_file=True, write_text_file=True),
+                           terminal=False, elicitation=None)
+
+
+def _direct_run_agent(project: Path, run_id: str, monkeypatch):
+    from unittest.mock import patch
+
+    monkeypatch.setattr("mini_ork.acp.agent.mint_run_id", lambda: run_id)
+    with patch("mini_ork.acp_orchestrator.config.orchestrator_lanes",
+               return_value=[{"id": "opus", "name": "Opus"}]), \
+         patch("mini_ork.recipes_catalog.list_recipes", return_value=[_recipe("code-fix")]):
+        agent = MiniOrkAcpAgent(
+            reader=lambda _r: {"status": "published", "events": [], "llm_calls": []},
+            poll_interval=0,
+            launcher=lambda rid, _kick: {"ok": True, "run_id": rid},
+        )
+        resp = asyncio.run(agent.new_session(cwd=str(project)))
+    return agent, resp.session_id
+
+
+def test_finished_run_is_handed_to_the_client_as_agent_edits(tmp_path, monkeypatch):
+    from mini_ork import workspaces as ws_mod
+
+    run_id = "run-deliver-001"
+    project, home, ws = _init_repo_with_worktree(tmp_path, run_id=run_id)
+    (ws.path / "README.md").write_text("hi\nmore\n", encoding="utf-8")  # uncommitted edit too
+    (home / "runs" / run_id).mkdir(parents=True, exist_ok=True)
+    agent, thread = _direct_run_agent(project, run_id, monkeypatch)
+    agent._client_capabilities = _fs_write_caps()
+    conn = _WriteConn()
+    agent.on_connect(conn)
+    asyncio.run(agent.prompt(thread, [_text_block("/run do it")]))
+
+    written = {Path(p).name: c for _sid, p, c in conn.writes}
+    assert written == {"README.md": "hi\nmore\n", "new.txt": "x\n"}
+    assert all(sid == thread for sid, _p, _c in conn.writes)
+    assert conn.calls == []  # no Merge / Discard question: Zed's review takes over
+    assert ws_mod.load(home, run_id) is None  # the run's worktree is gone
+    assert (project / "new.txt").read_text() == "x\n"
+
+
+def test_a_file_the_user_changed_blocks_delivery_and_keeps_the_buttons(tmp_path, monkeypatch):
+    from mini_ork import workspaces as ws_mod
+
+    run_id = "run-deliver-002"
+    project, home, ws = _init_repo_with_worktree(tmp_path, run_id=run_id)
+    (ws.path / "README.md").write_text("from the run\n", encoding="utf-8")
+    (project / "README.md").write_text("the user's own edit\n", encoding="utf-8")
+    (home / "runs" / run_id).mkdir(parents=True, exist_ok=True)
+    agent, thread = _direct_run_agent(project, run_id, monkeypatch)
+    agent._client_capabilities = _fs_write_caps()
+    conn = _WriteConn(outcome_id="keep")
+    agent.on_connect(conn)
+    asyncio.run(agent.prompt(thread, [_text_block("/run do it")]))
+
+    assert conn.writes == []
+    assert (project / "README.md").read_text() == "the user's own edit\n"
+    assert [c["option_ids"] for c in conn.calls] == [["merge", "discard", "keep"]]
+    assert ws_mod.load(home, run_id) is not None
+
+
+def test_a_client_without_file_writing_gets_the_merge_buttons(tmp_path, monkeypatch):
+    run_id = "run-deliver-003"
+    project, home, _ws = _init_repo_with_worktree(tmp_path, run_id=run_id)
+    (home / "runs" / run_id).mkdir(parents=True, exist_ok=True)
+    agent, thread = _direct_run_agent(project, run_id, monkeypatch)
+    conn = _WriteConn(outcome_id="keep")
+    agent.on_connect(conn)
+    asyncio.run(agent.prompt(thread, [_text_block("/run do it")]))
+    assert conn.writes == []
+    assert len(conn.calls) == 1
