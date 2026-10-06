@@ -180,13 +180,17 @@ def test_coalition_missing_context_defers(db):
 # ═════════════════════════════════════════════════════════════════════════════
 
 
-def test_liveness_unknown_run_proceeds(db):
-    assert_native("liveness", json.dumps({"run_id": "run-not-in-db"}), db, "pass")
+def test_liveness_unknown_run_defers(db):
+    # The breaker still fails OPEN for an unknown run (circuit_breaker reason
+    # run_unknown_default_proceed); the CERTIFYING gate reads that as no
+    # evidence → defer. It passed hollow probes at hackability 0.8 (2026-10-05).
+    assert_native("liveness", json.dumps({"run_id": "run-not-in-db"}), db, "defer")
 
 
 def test_liveness_panel_run_id_backcompat_key(db):
-    # The shim accepts panel_run_id as a fallback key for run_id.
-    assert_native("liveness", json.dumps({"panel_run_id": "run-not-in-db"}), db, "pass")
+    # The shim accepts panel_run_id as a fallback key for run_id (an unknown
+    # run defers — see test_liveness_unknown_run_defers).
+    assert_native("liveness", json.dumps({"panel_run_id": "run-not-in-db"}), db, "defer")
 
 
 def test_liveness_missing_run_id_defers(db):
@@ -320,9 +324,11 @@ def test_stability_below_min_rounds_continues(db):
     assert_native("stability", ctx, db, "pass")
 
 
-def test_stability_no_traces_fail_open(db):
+def test_stability_no_traces_defers(db):
+    # adaptive_stability still defaults to CONTINUE with zero traces; as a
+    # certifying gate that is nothing measured → defer, not pass.
     ctx = json.dumps({"panel_run_id": "run-ab-stab-none", "current_round": 3})
-    assert_native("stability", ctx, db, "pass")
+    assert_native("stability", ctx, db, "defer")
 
 
 def test_stability_missing_panel_run_id_defers(db):

@@ -107,10 +107,11 @@ def test_native_condition_shape_and_registered_at(db):
 
 def test_native_conditions_evaluate_without_bash(db, tmp_path):
     """End-to-end: python bootstrap rows evaluate through the native
-    evaluators — no gate-condition bash script is executed. A single-node
-    context fail-opens (coalition: single_agent_run → pass; liveness:
-    unknown run → PROCEED; stability/panel-health/synthesis-promote:
-    missing inputs → defer), so no safety violation may fire."""
+    evaluators — no gate-condition bash script is executed. A context with
+    no panel evidence defers everywhere (coalition: zero lenses; liveness:
+    unknown run; stability: zero traces; panel-health/synthesis-promote:
+    missing inputs) — absent evidence is never a pass — and no safety
+    violation may fire."""
     from mini_ork.gates import gate_registry as gr
 
     assert gb.bootstrap_oracle_gates(db=db, root=str(REPO)) == 0
@@ -124,9 +125,9 @@ def test_native_conditions_evaluate_without_bash(db, tmp_path):
     # about the oracle five evaluating natively, not about the registry size.
     assert {"oracle-coalition", "oracle-liveness", "oracle-stability",
             "oracle-panel-health", "oracle-synthesis-promote"} <= set(verdicts)
-    assert verdicts["oracle-coalition"] == "pass"
-    assert verdicts["oracle-liveness"] == "pass"
-    assert verdicts["oracle-stability"] == "pass"
+    assert verdicts["oracle-coalition"] == "defer"
+    assert verdicts["oracle-liveness"] == "defer"
+    assert verdicts["oracle-stability"] == "defer"
     # panel-health + synthesis-promote need verdict_file inputs → defer.
     assert verdicts["oracle-panel-health"] == "defer"
     assert verdicts["oracle-synthesis-promote"] == "defer"
@@ -160,8 +161,8 @@ def test_legacy_script_path_conditions_still_evaluate_natively(db):
     summary = gr.gate_run_all(db, "code_fix", ctx, mini_ork_root=str(REPO))
     assert summary["safety_violation"] is False
     verdicts = {g["gate_id"]: g["verdict"] for g in summary["gates"]}
-    assert verdicts["oracle-coalition"] == "pass"
-    assert verdicts["oracle-liveness"] == "pass"
+    assert verdicts["oracle-coalition"] == "defer"
+    assert verdicts["oracle-liveness"] == "defer"
 
 
 def test_task_class_filter_is_sql_null(db):

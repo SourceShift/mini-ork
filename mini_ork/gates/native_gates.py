@@ -130,7 +130,14 @@ def _eval_coalition(
             panel_run_id, recipe, rho=rho, db=db_path, agents_yaml=agents_yaml
         )
         verdict = payload.get("verdict", "indeterminate")
+        lens_count = payload.get("lens_count")
     except Exception:
+        return "defer"
+    # No lens traces at all = no panel to certify. coalition_verdict answers
+    # "not applicable" (panel_diverse) for the pipeline, but a certifying gate
+    # must not read absence as diversity: a nonexistent panel_run_id passed
+    # 4/5 hollow probes (hackability 0.8, gate-fuzz --hackability, 2026-10-05).
+    if lens_count == 0:
         return "defer"
     if verdict == "panel_diverse":
         return "pass"
@@ -169,7 +176,12 @@ def _eval_oracle_liveness(
             cooldown_s=int(os.environ.get("MO_CB_COOLDOWN_S", "1800")),
         )
         verdict = payload.get("verdict", "PROCEED")
+        reason = payload.get("reason", "")
     except Exception:
+        return "defer"
+    # The breaker fails OPEN for an unknown run (its pipeline caller may not have
+    # written task_runs yet); as a certifying gate that is no evidence → defer.
+    if reason == "run_unknown_default_proceed":
         return "defer"
     if verdict in ("PROCEED", "PROBE"):
         return "pass"
@@ -239,7 +251,12 @@ def _eval_stability(
             max_rounds=int(os.environ.get("MO_PANEL_MAX_ROUNDS", "5")),
         )
         recommendation = payload.get("recommendation", "CONTINUE")
+        rounds_seen = payload.get("rounds_seen")
     except Exception:
+        return "defer"
+    # Zero traces for the panel = nothing measured; CONTINUE there is a default,
+    # not an observation of stability → defer.
+    if rounds_seen == 0:
         return "defer"
     if recommendation == "CONTINUE":
         return "pass"
